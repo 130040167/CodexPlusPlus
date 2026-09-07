@@ -841,10 +841,75 @@ fn injection_script_times_out_backend_bridge_calls_and_falls_back_to_helper() {
     let script = assets::injection_script(57321);
 
     assert!(script.contains("bridgeWithBackendTimeout"));
+    assert!(script.contains("AbortController"));
+    assert!(script.contains("recordCodexPlusBridgeSuccess"));
+    assert!(script.contains("lastSuccessAt"));
+    assert!(script.contains("codexPlusBackendCheckInFlight"));
+    assert!(script.contains("CODEX_PLUS_BACKEND_FAILURE_THRESHOLD = 3"));
+    assert!(script.contains("codexPlusBackendGeneration !== window.__codexPlusBackendGeneration"));
+    assert!(script.contains("__codexPlusBackendHeartbeatGeneration"));
+    assert!(script.contains("clearInterval(window.__codexPlusBackendHeartbeat)"));
+    assert!(!script.contains("await withBackendTimeout(postJson(\"/backend/status\", {}))"));
     assert!(script.contains("backend_bridge_timeout"));
     assert!(!script.contains("/backend/repair"));
     assert!(script.contains("backend_status_bridge_failed_http_fallback_ok"));
     assert!(script.contains("backend_status_bridge_and_http_failed"));
+}
+
+#[test]
+fn injection_script_keeps_one_backend_heartbeat_per_generation() {
+    let script = assets::injection_script(57321);
+    let start = script
+        .find("function scheduleBackendHeartbeat()")
+        .expect("backend heartbeat scheduler should exist");
+    let end = script[start..]
+        .find("\n  function userScriptStatusLabel")
+        .map(|offset| start + offset)
+        .expect("backend heartbeat scheduler should have an end marker");
+    let scheduler = &script[start..end];
+    let scheduler_json = serde_json::to_string(scheduler).expect("scheduler should serialize");
+    let harness = format!(
+        r#"
+const vm = require("node:vm");
+const source = {scheduler};
+const runCase = (generation, heartbeat, heartbeatGeneration, expected) => {{
+  let timers = 0;
+  let clears = 0;
+  let checks = 0;
+  const context = {{
+    window: {{
+      __codexPlusBackendGeneration: generation,
+      __codexPlusBackendHeartbeat: heartbeat,
+      __codexPlusBackendHeartbeatGeneration: heartbeatGeneration,
+    }},
+    codexPlusBackendGeneration: generation,
+    setInterval: () => ++timers,
+    clearInterval: () => ++clears,
+    checkBackendStatus: () => ++checks,
+  }};
+  vm.runInNewContext(source + "\nthis.run = scheduleBackendHeartbeat;", context);
+  context.run();
+  context.run();
+  const actual = {{ timers, clears, checks }};
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) process.exit(1);
+}};
+runCase(1, null, null, {{ timers: 1, clears: 0, checks: 1 }});
+runCase(1, 99, 1, {{ timers: 0, clears: 0, checks: 0 }});
+runCase(2, 99, 1, {{ timers: 1, clears: 1, checks: 1 }});
+"#,
+        scheduler = scheduler_json
+    );
+    let output = Command::new("node")
+        .arg("-e")
+        .arg(harness)
+        .output()
+        .expect("node should run heartbeat scheduler harness");
+    assert!(
+        output.status.success(),
+        "heartbeat scheduler harness failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -2141,7 +2206,7 @@ fn injection_script_keeps_plugin_marketplace_unlock_separate_from_entry_unlock()
     assert!(script.contains("pluginMarketplaceUnlock: true"));
     assert!(script.contains("pluginMarketplaceUnlock: \"codexAppPluginMarketplaceUnlock\""));
     assert!(script.contains("if (!codexPlusSettings().pluginMarketplaceUnlock) return"));
-    assert!(script.contains("installPluginBuildFlavorFilterPatch"));
+    assert!(script.contains("restoreHistoricalPluginArrayFilterPatch"));
     assert!(script.contains("installPluginMarketplaceRequestPatch"));
 }
 
@@ -2193,14 +2258,10 @@ fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
     let script = assets::injection_script(57321);
 
     assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"15\""));
-    assert!(script.contains("codexPluginFilterSourceCache = new WeakMap()"));
-    assert!(script.contains("function codexPluginFilterCallbackSource(callback)"));
-    assert!(script.contains("isCodexPluginBuildFlavorFilter"));
-    assert!(script.contains("source.includes(\"!u(e.marketplaceName)||e.marketplaceName===r\")"));
-    assert!(script.contains("source.includes(\"!Eu(e.marketplaceName)||e.marketplaceName===n\")"));
-    assert!(script.contains("source.includes(\"!t.includes(e.name)\")"));
-    assert!(!script.contains("if (!source.includes(\"marketplaceName\")) return false"));
-    assert!(!script.contains("if (!source.includes(\"name\")) return false"));
+    assert!(!script.contains("function isCodexPluginBuildFlavorFilter"));
+    assert!(!script.contains("function isCodexPluginMarketplaceHiddenFilter"));
+    assert!(!script.contains("Array.prototype.filter = patchedFilter"));
+    assert!(script.contains("Array.prototype.filter = originalFilter"));
 }
 
 #[test]
@@ -2210,14 +2271,8 @@ fn injection_script_expands_api_key_plugin_marketplace_requests() {
     assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"15\""));
     assert!(script.contains("installPluginMarketplaceRequestPatch"));
     assert!(script.contains("installPluginMarketplaceBridgePatch"));
-    assert!(script.contains("installPluginBuildFlavorFilterPatch"));
-    assert!(script.contains("Array.prototype.filter"));
-    assert!(script.contains("codexPluginBuildFlavorFilterPatch"));
-    assert!(script.contains("isCodexPluginBuildFlavorFilter"));
-    assert!(script.contains("!filtered.includes(plugin) : !callback(plugin)"));
-    assert!(script.contains("isCodexPluginMarketplaceHiddenFilter"));
-    assert!(script.contains("!filtered.includes(marketplace) : !callback(marketplace)"));
-    assert!(script.contains("plugin_marketplace_hidden_filter_bypassed"));
+    assert!(script.contains("restoreHistoricalPluginArrayFilterPatch"));
+    assert!(!script.contains("plugin_marketplace_hidden_filter_bypassed"));
     assert!(script.contains("method === \"list-plugins\""));
     assert!(script.contains("method === \"vscode://codex/list-plugins\""));
     assert!(script.contains("message.type === \"fetch\""));
@@ -2264,7 +2319,7 @@ fn injection_script_expands_api_key_plugin_marketplace_requests() {
     assert!(script.contains("OpenAI插件3(Codex++)"));
     assert!(script.contains("method === \"install-plugin\""));
     assert!(script.contains("plugin_marketplace_response_expanded"));
-    assert!(script.contains("plugin_build_flavor_filter_bypassed"));
+    assert!(!script.contains("plugin_build_flavor_filter_bypassed"));
     assert!(script.contains("plugin_install_request_debug"));
     assert!(script.contains("plugin_install_request_failed"));
     assert!(!script.contains("marketplace.path ="));
@@ -2297,12 +2352,10 @@ fn injection_script_logs_marketplace_grouping_diagnostics() {
 fn injection_script_recovers_plugin_search_from_remote_auth_errors() {
     let cases = run_plugin_marketplace_search_contract_harness();
 
-    assert_eq!(cases["ordinaryBuildMatched"], false);
-    assert_eq!(cases["ordinaryHiddenMatched"], false);
-    assert_eq!(cases["ordinaryFunctionToStringCalls"], 0);
-    assert_eq!(cases["buildFlavorMatched"], true);
-    assert_eq!(cases["buildFlavorMatchedAgain"], true);
-    assert_eq!(cases["cachedFunctionToStringCalls"], 1);
+    assert_eq!(cases["nativeFilterPreserved"], true);
+    assert_eq!(cases["legacyFilterRestored"], true);
+    assert_eq!(cases["ordinaryFiltered"], json!([2, 3]));
+    assert_eq!(cases["hiddenMarketplaces"], json!([]));
     assert_eq!(cases["initialKinds"], json!(["local", "vertical"]));
     assert_eq!(cases["latestBroadOmittedHasKinds"], false);
     assert_eq!(cases["latestBroadOmittedKinds"], serde_json::Value::Null);
@@ -2389,25 +2442,18 @@ window.__CODEX_PLUS_PLUGIN_MARKETPLACES__ = [{{
 }}];
 const api = window.__codexPlusPluginMarketplaceTest;
 api.reset();
-const nativeFunctionToString = Function.prototype.toString;
-let functionToStringCalls = 0;
-Function.prototype.toString = function(...args) {{
-  functionToStringCalls += 1;
-  return nativeFunctionToString.apply(this, args);
-}};
-const ordinaryFilter = (value) => value > 1;
-const ordinaryBuildMatched = api.isBuildFlavorFilter(ordinaryFilter, [1, 2, 3]);
-const ordinaryHiddenMatched = api.isHiddenMarketplaceFilter(ordinaryFilter, [1, 2, 3]);
-const ordinaryFunctionToStringCalls = functionToStringCalls;
-const buildFlavorFilter = function(e) {{
-  /* !u(e.marketplaceName)||e.marketplaceName===r */
-  return false;
-}};
-const officialPlugins = [{{ name: "product-design", marketplaceName: "openai-bundled" }}];
-const buildFlavorMatched = api.isBuildFlavorFilter(buildFlavorFilter, officialPlugins);
-const buildFlavorMatchedAgain = api.isBuildFlavorFilter(buildFlavorFilter, officialPlugins);
-const cachedFunctionToStringCalls = functionToStringCalls - ordinaryFunctionToStringCalls;
-Function.prototype.toString = nativeFunctionToString;
+const nativeFilter = Array.prototype.filter;
+api.restoreHistoricalArrayFilterPatch();
+const nativeFilterPreserved = Array.prototype.filter === nativeFilter;
+const legacyFilter = function() {{ return Array.from(this); }};
+legacyFilter.__codexPluginBuildFlavorPatched = "15";
+Object.defineProperty(Array.prototype, "__codexPluginBuildFlavorOriginalFilter", {{ value: nativeFilter, configurable: true }});
+Array.prototype.filter = legacyFilter;
+api.restoreHistoricalArrayFilterPatch();
+const legacyFilterRestored = Array.prototype.filter === nativeFilter;
+const ordinaryFiltered = [1, 2, 3].filter(value => value > 1);
+const t = ["openai-curated"];
+const hiddenMarketplaces = [{{ name: "openai-curated" }}].filter(e => !t.includes(e.name));
 const initial = api.patchRequestParams("list-plugins", {{ cwds: ["C:/workspace"] }});
 api.setCodexAppVersion("26.803.41515");
 const latestBroadOmitted = api.patchRequestParams("list-plugins", {{ cwds: ["C:/workspace"] }});
@@ -2438,12 +2484,10 @@ const remoteUnavailable = api.remoteCatalogUnavailable();
 api.reset();
 const chatGpt = api.patchRequestParams("list-plugins", {{ marketplaceKinds: ["created-by-me-remote"] }});
 const cases = {{
-  ordinaryBuildMatched,
-  ordinaryHiddenMatched,
-  ordinaryFunctionToStringCalls,
-  buildFlavorMatched,
-  buildFlavorMatchedAgain,
-  cachedFunctionToStringCalls,
+  nativeFilterPreserved,
+  legacyFilterRestored,
+  ordinaryFiltered,
+  hiddenMarketplaces,
   initialKinds: initial.marketplaceKinds,
   latestBroadOmittedHasKinds: Object.prototype.hasOwnProperty.call(latestBroadOmitted, "marketplaceKinds"),
   latestBroadOmittedKinds: latestBroadOmitted.marketplaceKinds ?? null,
@@ -4113,6 +4157,23 @@ fn injection_script_installs_upstream_branch_dropdown_adapter() {
 }
 
 #[test]
+fn injection_script_replaces_historical_renderer_resources() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("__codexDictationDomEnforcementTimer"));
+    assert!(script.contains("__codexPlusImageOverlayDOMContentLoadedHandler"));
+    assert!(script.contains("__codexPlusImageOverlayTimer"));
+    assert!(script.contains("__codexUpstreamBranchDropdownClickHandler"));
+    assert!(script.contains("__codexUpstreamBranchDropdownInjectTimer"));
+    assert!(script.contains("__codexUpstreamWorktreeNativeAdapterHandler"));
+    assert!(script.contains("__codexPluginMarketplaceResponseListener"));
+    assert!(script.contains("__codexPlusModelRequestHandler"));
+    assert!(script.contains("__codexPlusModelResponseHandler"));
+    assert!(script.contains("__codexPasteFixHandler"));
+    assert!(script.contains("window.removeEventListener(\"message\", window.__codexPlusModelResponseHandler, true)"));
+}
+
+#[test]
 fn injection_script_prevents_switching_to_branches_used_by_other_worktrees() {
     let script = assets::injection_script(57321);
 
@@ -4202,13 +4263,49 @@ fn runtime_evaluate_params_can_await_promise_for_bridge_health_checks() {
 }
 
 #[test]
-fn bridge_health_check_script_uses_real_backend_round_trip() {
+fn bridge_health_check_script_checks_binding_presence() {
     let script = bridge::bridge_health_check_script();
 
     assert!(script.contains("__codexSessionDeleteBridge"));
-    assert!(script.contains("/backend/status"));
-    assert!(script.contains("Promise.race"));
-    assert!(script.contains("setTimeout"));
+    assert!(script.contains("typeof window.__codexSessionDeleteBridge === \"function\""));
+    assert!(!script.contains("lastSuccessAt"));
+    assert!(!script.contains("lastInjectionAt"));
+    assert!(!script.contains("/backend/status"));
+}
+
+#[test]
+fn bridge_health_check_script_does_not_reinject_when_background_timers_are_throttled() {
+    let script = serde_json::to_string(bridge::bridge_health_check_script())
+        .expect("health script should serialize");
+    let harness = format!(
+        r#"
+const vm = require("node:vm");
+const source = {script};
+const bridge = () => Promise.resolve({{ status: "failed" }});
+const run = (health, hasBridge = true) => vm.runInNewContext(source, {{
+  window: {{ __codexSessionDeleteBridge: hasBridge ? bridge : null, __codexPlusBridgeHealth: health }},
+}});
+const now = Date.now();
+if (run({{ lastInjectionAt: 0, lastSuccessAt: 1 }}) !== true) process.exit(1);
+if (run({{ lastInjectionAt: 0, lastSuccessAt: now }}) !== true) process.exit(2);
+if (run({{ lastInjectionAt: now, lastSuccessAt: 0 }}) !== true) process.exit(3);
+if (run({{ lastInjectionAt: now - 6000, lastSuccessAt: 0 }}) !== true) process.exit(4);
+if (run({{ lastInjectionAt: 1, lastSuccessAt: now - 16000 }}) !== true) process.exit(5);
+if (run({{ lastInjectionAt: now, lastSuccessAt: now }}, false) !== false) process.exit(6);
+"#,
+        script = script
+    );
+    let output = Command::new("node")
+        .arg("-e")
+        .arg(harness)
+        .output()
+        .expect("node should run bridge health harness");
+    assert!(
+        output.status.success(),
+        "bridge health harness failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -4806,6 +4903,108 @@ async fn install_bridge_immediately_evaluates_new_document_scripts() {
     request_rx
         .await
         .expect("server task should finish without panicking");
+}
+
+#[tokio::test]
+async fn reinstall_replaces_registered_new_document_scripts() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener should bind");
+    let address = listener.local_addr().expect("listener should have address");
+    let server = tokio::spawn(async move {
+        let (first_stream, _) = listener
+            .accept()
+            .await
+            .expect("first bridge client should connect");
+        let mut first = accept_async(first_stream)
+            .await
+            .expect("first websocket should upgrade");
+        for expected_id in 1..=3 {
+            let command = recv_json(&mut first).await;
+            assert_eq!(command["id"], expected_id);
+            send_json(&mut first, json!({ "id": expected_id, "result": {} })).await;
+        }
+        let bridge_add = recv_json(&mut first).await;
+        assert_eq!(bridge_add["method"], "Page.addScriptToEvaluateOnNewDocument");
+        send_json(
+            &mut first,
+            json!({ "id": bridge_add["id"], "result": { "identifier": "bridge-v1" } }),
+        )
+        .await;
+        let bridge_eval = recv_json(&mut first).await;
+        assert_eq!(bridge_eval["method"], "Runtime.evaluate");
+        send_json(&mut first, json!({ "id": bridge_eval["id"], "result": {} })).await;
+        let renderer_add = recv_json(&mut first).await;
+        assert_eq!(renderer_add["method"], "Page.addScriptToEvaluateOnNewDocument");
+        send_json(
+            &mut first,
+            json!({ "id": renderer_add["id"], "result": { "identifier": "renderer-v1" } }),
+        )
+        .await;
+        let renderer_eval = recv_json(&mut first).await;
+        assert_eq!(renderer_eval["method"], "Runtime.evaluate");
+        send_json(&mut first, json!({ "id": renderer_eval["id"], "result": {} })).await;
+
+        let (second_stream, _) = listener
+            .accept()
+            .await
+            .expect("second bridge client should connect");
+        let mut second = accept_async(second_stream)
+            .await
+            .expect("second websocket should upgrade");
+        for expected_id in 1..=3 {
+            let command = recv_json(&mut second).await;
+            assert_eq!(command["id"], expected_id);
+            send_json(&mut second, json!({ "id": expected_id, "result": {} })).await;
+        }
+        for identifier in ["bridge-v1", "renderer-v1"] {
+            let remove = recv_json(&mut second).await;
+            assert_eq!(remove["method"], "Page.removeScriptToEvaluateOnNewDocument");
+            assert_eq!(remove["params"]["identifier"], identifier);
+            send_json(&mut second, json!({ "id": remove["id"], "result": {} })).await;
+        }
+        let bridge_add = recv_json(&mut second).await;
+        assert_eq!(bridge_add["method"], "Page.addScriptToEvaluateOnNewDocument");
+        send_json(
+            &mut second,
+            json!({ "id": bridge_add["id"], "result": { "identifier": "bridge-v2" } }),
+        )
+        .await;
+        let bridge_eval = recv_json(&mut second).await;
+        assert_eq!(bridge_eval["method"], "Runtime.evaluate");
+        send_json(&mut second, json!({ "id": bridge_eval["id"], "result": {} })).await;
+        let renderer_add = recv_json(&mut second).await;
+        assert_eq!(renderer_add["method"], "Page.addScriptToEvaluateOnNewDocument");
+        send_json(
+            &mut second,
+            json!({ "id": renderer_add["id"], "result": { "identifier": "renderer-v2" } }),
+        )
+        .await;
+        let renderer_eval = recv_json(&mut second).await;
+        assert_eq!(renderer_eval["method"], "Runtime.evaluate");
+        send_json(&mut second, json!({ "id": renderer_eval["id"], "result": {} })).await;
+        close_socket(&mut first).await;
+        close_socket(&mut second).await;
+    });
+
+    let url = websocket_url(address);
+    bridge::install_bridge(
+        &url,
+        BRIDGE_BINDING_NAME,
+        noop_handler(),
+        &["window.rendererV1 = true;".to_string()],
+    )
+    .await
+    .expect("first bridge install should succeed");
+    bridge::install_bridge(
+        &url,
+        BRIDGE_BINDING_NAME,
+        noop_handler(),
+        &["window.rendererV2 = true;".to_string()],
+    )
+    .await
+    .expect("second bridge install should replace old registrations");
+    server.await.expect("server task should finish without panicking");
 }
 
 #[tokio::test]

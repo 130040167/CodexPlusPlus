@@ -1,6 +1,110 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { readFile } from "node:fs/promises";
+import { runInNewContext } from "node:vm";
+
+describe("renderer lifecycle under repeated injection", () => {
+  const rendererPath = new URL("../../../assets/inject/renderer-inject.js", import.meta.url);
+
+  it("shares pending dictation discovery across bundle evaluations and stops after repeated misses", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const start = renderer.indexOf('  const codexDictationSupportVersion = ');
+    const end = renderer.indexOf('  async function loadBackendSettingsState()', start);
+    assert.ok(start >= 0 && end > start);
+    const source = renderer.slice(start, end);
+    const window: Record<string, any> = {};
+    let loads = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const diagnostics: string[] = [];
+    const timers = new Set<unknown>();
+    const frozenModule = Object.freeze({ supported: function(authMethod: string) { return authMethod === "chatgpt"; } });
+    const makeInstall = () => runInNewContext(`${source}\ninstallDictationSupportPatch`, {
+      window,
+      document: { querySelectorAll: () => [] },
+      loadOptionalCodexAppModule: async () => { loads += 1; await gate; return frozenModule; },
+      codexPlusSettings: () => ({ serviceTierControls: false }),
+      sendCodexPlusDiagnostic: (event: string) => diagnostics.push(event),
+      setInterval: () => { const id = {}; timers.add(id); return id; },
+      clearInterval: (id: unknown) => timers.delete(id),
+    }) as () => Promise<void>;
+    const first = makeInstall();
+    const second = makeInstall();
+    const pending = Array.from({ length: 20 }, (_, i) => i % 2 ? first() : second());
+    assert.equal(loads, 1);
+    release();
+    await Promise.all(pending);
+    assert.equal(loads, 5);
+    assert.equal(window.__codexDictationSupportPatched, undefined);
+    for (let i = 0; i < 20; i++) await first();
+    assert.equal(loads, 40);
+    assert.equal(timers.size, 1);
+    assert.deepEqual(diagnostics, ["dictation_support_patch_skipped"]);
+    // A settings reinjection retires the fallback timer; the disabled probe
+    // must still be able to install exactly one replacement fallback.
+    timers.delete(window.__codexDictationDomEnforcementTimer);
+    window.__codexDictationDomEnforcementTimer = null;
+    window.__codexDictationDomPatched = false;
+    await second();
+    assert.equal(timers.size, 1);
+    assert.equal(loads, 40);
+  });
+
+  it("does not call a patched dictation hook twice when it throws", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const start = renderer.indexOf('  const codexDictationSupportVersion = ');
+    const end = renderer.indexOf('  async function loadBackendSettingsState()', start);
+    let calls = 0;
+    const failure = new Error("hook failed");
+    const module = { supported: function(authMethod: string) { calls += 1; if (authMethod === "chatgpt") throw failure; return false; } };
+    const window: Record<string, unknown> = {};
+    const install = runInNewContext(`${renderer.slice(start, end)}\ninstallDictationSupportPatch`, {
+      window,
+      loadOptionalCodexAppModule: async () => module,
+      codexPlusSettings: () => ({ serviceTierControls: false }),
+      sendCodexPlusDiagnostic: () => {},
+      clearInterval: () => {},
+    });
+    await install();
+    assert.equal(window.__codexDictationSupportPatched, "1");
+    assert.throws(() => module.supported("chatgpt"), (error) => error === failure);
+    assert.equal(calls, 1);
+  });
+
+  it("replaces paste handlers and removes them when the feature is disabled", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const start = renderer.lastIndexOf("\n(() => {\n  document.removeEventListener('paste'");
+    assert.ok(start >= 0);
+    const handlers = new Set<unknown>();
+    const window = { __CODEX_PLUS_PASTE_FIX__: { enabled: true } };
+    const context = {
+      window,
+      document: {
+        addEventListener: (_event: string, handler: unknown) => handlers.add(handler),
+        removeEventListener: (_event: string, handler: unknown) => handlers.delete(handler),
+      },
+      console: { log() {} },
+    };
+    for (let i = 0; i < 20; i++) runInNewContext(renderer.slice(start), context);
+    assert.equal(handlers.size, 1);
+    window.__CODEX_PLUS_PASTE_FIX__.enabled = false;
+    runInNewContext(renderer.slice(start), context);
+    assert.equal(handlers.size, 0);
+  });
+
+  it("bounds repeated diagnostic failures by count and message length", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const start = renderer.indexOf("  function recordCodexPlusFailure(");
+    const end = renderer.indexOf("\n  }", start) + 4;
+    assert.ok(start >= 0 && end > start);
+    const window: Record<string, string[]> = {};
+    const record = runInNewContext(`${renderer.slice(start, end)}\nrecordCodexPlusFailure`, { window });
+    for (let i = 0; i < 100; i++) record("failures", `${i}:` + "x".repeat(10000));
+    assert.equal(window.failures.length, 32);
+    assert.ok(window.failures[0].startsWith("68:"));
+    assert.ok(window.failures.every((message) => message.length <= 4096));
+  });
+});
 
 const STEPWISE_FRAGMENT_PATHS = [
   "floating-panel/runtime/state.js",

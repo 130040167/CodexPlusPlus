@@ -15,6 +15,9 @@ use serde_json::{Value, json};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
+type CdpWebSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
 pub const BRIDGE_BINDING_NAME: &str = "codexSessionDeleteV2";
 const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -34,6 +37,14 @@ static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(100);
 static NEXT_BRIDGE_GENERATION: AtomicU64 = AtomicU64::new(1);
 static CURRENT_BRIDGE_GENERATIONS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// CDP keeps scripts registered through Page.addScriptToEvaluateOnNewDocument
+/// until the target closes. Retain their identifiers so a bridge reinstall
+/// replaces the old registrations instead of making every later navigation run
+/// another complete renderer bundle.
+static NEW_DOCUMENT_SCRIPT_REGISTRATIONS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, Vec<String>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 #[derive(Clone)]
 struct BridgeGeneration {
@@ -96,6 +107,8 @@ pub fn build_bridge_script(binding_name: &str) -> String {
 (() => {{
   window.__codexSessionDeleteCallbacks = new Map();
   window.__codexSessionDeleteSeq = 0;
+  window.__codexPlusBridgeHealth = window.__codexPlusBridgeHealth || {{}};
+  window.__codexPlusBridgeHealth.lastInjectionAt = Date.now();
   window.__codexSessionDeleteResolve = (id, result) => {{
     const callback = window.__codexSessionDeleteCallbacks.get(id);
     if (!callback) return;
@@ -121,18 +134,93 @@ pub fn build_bridge_script(binding_name: &str) -> String {
 pub fn bridge_health_check_script() -> &'static str {
     r#"
 (() => {
-  const bridge = window.__codexSessionDeleteBridge;
-  if (typeof bridge !== "function") return false;
-  try {
-    return Promise.race([
-      Promise.resolve(bridge("/backend/status", {})).then((result) => !!result && result.status === "ok"),
-      new Promise((resolve) => setTimeout(() => resolve(false), 2000)),
-    ]);
-  } catch (error) {
-    return false;
-  }
+  // Background renderers can throttle timers for longer than the old
+  // heartbeat window. Treating that delay as a broken bridge causes the
+  // watchdog to reinject the whole renderer bundle repeatedly, leaking the
+  // old closures and listeners. The binding's presence is the safe signal;
+  // health timestamps remain diagnostic data only.
+  return typeof window.__codexSessionDeleteBridge === "function";
 })()
 "#
+}
+
+fn take_new_document_script_registrations(target: &str) -> Vec<String> {
+    NEW_DOCUMENT_SCRIPT_REGISTRATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(target)
+        .unwrap_or_default()
+}
+
+fn restore_new_document_script_registrations(target: &str, identifiers: Vec<String>) {
+    if identifiers.is_empty() {
+        return;
+    }
+    NEW_DOCUMENT_SCRIPT_REGISTRATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(target.to_string())
+        .or_default()
+        .extend(identifiers);
+}
+
+fn register_new_document_script(target: &str, response: &Value) {
+    let Some(identifier) = response
+        .get("result")
+        .and_then(|result| result.get("identifier"))
+        .and_then(Value::as_str)
+        .filter(|identifier| !identifier.is_empty())
+    else {
+        return;
+    };
+    NEW_DOCUMENT_SCRIPT_REGISTRATIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(target.to_string())
+        .or_default()
+        .push(identifier.to_string());
+}
+
+async fn remove_registered_new_document_scripts(
+    session: &mut CdpSession<CdpWebSocket>,
+    target: &str,
+) -> anyhow::Result<()> {
+    let identifiers = take_new_document_script_registrations(target);
+    let mut remaining = identifiers.into_iter();
+    while let Some(identifier) = remaining.next() {
+        if let Err(error) = session
+            .send_command(
+                next_message_id(),
+                "Page.removeScriptToEvaluateOnNewDocument",
+                json!({ "identifier": identifier }),
+            )
+            .await
+        {
+            let mut unresolved = vec![identifier];
+            unresolved.extend(remaining);
+            restore_new_document_script_registrations(target, unresolved);
+            return Err(error)
+                .context("failed to remove a previously registered new-document script");
+        }
+    }
+    Ok(())
+}
+
+async fn add_new_document_script(
+    session: &mut CdpSession<CdpWebSocket>,
+    target: &str,
+    message_id: u64,
+    script: &str,
+) -> anyhow::Result<()> {
+    let response = session
+        .send_command(
+            message_id,
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({ "source": script }),
+        )
+        .await?;
+    register_new_document_script(target, &response);
+    Ok(())
 }
 
 pub async fn evaluate_script(websocket_url: &str, script: &str) -> anyhow::Result<Value> {
@@ -267,14 +355,14 @@ pub async fn install_bridge(
         .send_command(3, "Runtime.addBinding", json!({ "name": binding_name }))
         .await?;
 
+    // A reinjection must replace, rather than accumulate, the scripts that
+    // run on every future navigation. Do this only after the new binding has
+    // been installed so a failed binding setup leaves the existing page
+    // registration untouched.
+    remove_registered_new_document_scripts(&mut session, websocket_url).await?;
+
     let bridge_script = build_bridge_script(binding_name);
-    session
-        .send_command(
-            4,
-            "Page.addScriptToEvaluateOnNewDocument",
-            json!({ "source": bridge_script }),
-        )
-        .await?;
+    add_new_document_script(&mut session, websocket_url, 4, &bridge_script).await?;
     session
         .send_command(
             5,
@@ -285,13 +373,7 @@ pub async fn install_bridge(
 
     for script in new_document_scripts {
         let message_id = next_message_id();
-        session
-            .send_command(
-                message_id,
-                "Page.addScriptToEvaluateOnNewDocument",
-                json!({ "source": script }),
-            )
-            .await?;
+        add_new_document_script(&mut session, websocket_url, message_id, script).await?;
         let message_id = next_message_id();
         session
             .send_command(

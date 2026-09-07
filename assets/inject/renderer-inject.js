@@ -3,6 +3,13 @@
   // so this bundle cannot create UI in embedded browser documents.
   const codexPlusIsNodeTestHarness = typeof process === "object" && !!process.versions?.node;
   if (!codexPlusIsNodeTestHarness && (window.top !== window || window.self !== window || !window.electronBridge || !/^app:\/\/\-\//i.test(window.location.href))) return;
+  // Keep the bundle re-entrant for live setting changes, but retire resources
+  // retained by an earlier evaluation before installing their replacements.
+  if (window.__codexDictationDomEnforcementTimer) {
+    clearInterval(window.__codexDictationDomEnforcementTimer);
+    window.__codexDictationDomEnforcementTimer = null;
+    window.__codexDictationDomPatched = false;
+  }
   const codexPlusIsWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent || "");
 
   function installCodexPlusFastStartup() {
@@ -552,12 +559,22 @@
   }
 
   function scheduleCodexPlusImageOverlay() {
+    if (window.__codexPlusImageOverlayDOMContentLoadedHandler) {
+      document.removeEventListener("DOMContentLoaded", window.__codexPlusImageOverlayDOMContentLoadedHandler);
+      window.__codexPlusImageOverlayDOMContentLoadedHandler = null;
+    }
+    clearTimeout(window.__codexPlusImageOverlayTimer);
+    window.__codexPlusImageOverlayTimer = null;
     if (document.readyState === "loading") {
-      document.addEventListener("DOMContentLoaded", installCodexPlusImageOverlay, { once: true });
+      window.__codexPlusImageOverlayDOMContentLoadedHandler = installCodexPlusImageOverlay;
+      document.addEventListener("DOMContentLoaded", window.__codexPlusImageOverlayDOMContentLoadedHandler, { once: true });
       return;
     }
     installCodexPlusImageOverlay();
-    setTimeout(installCodexPlusImageOverlay, 250);
+    window.__codexPlusImageOverlayTimer = setTimeout(() => {
+      window.__codexPlusImageOverlayTimer = null;
+      installCodexPlusImageOverlay();
+    }, 250);
   }
 
   scheduleCodexPlusImageOverlay();
@@ -3746,67 +3763,93 @@
 
   // --- Dictation / Voice patch for apikey (ported from v1.2.34 preload) ---
   const codexDictationSupportVersion = "1";
+  const codexDictationSupportPatchMaxMisses = 8;
   function codexDictationSupportModuleCandidates() {
     const prefixes = ["use-is-dictation-supported-", "use-dictation-", "app-initial-", "setting-storage-", "vscode-api-"];
     return prefixes;
   }
   async function installDictationSupportPatch() {
     if (window.__codexDictationSupportPatched === codexDictationSupportVersion) return;
-    for (const prefix of codexDictationSupportModuleCandidates()) {
-      try {
-        const module = await loadOptionalCodexAppModule(prefix);
-        if (!module) continue;
-        for (const key of Object.keys(module)) {
-          const fn = module[key];
-          if (typeof fn !== "function") continue;
-          let src = "";
-          try { src = String(fn); } catch {}
-          if (!src.includes("authMethod") || !src.includes("chatgpt")) continue;
-          if (fn.__codexDictationPatched === codexDictationSupportVersion) continue;
-          const original = fn;
-          const wrapped = function(...args) {
-            try {
+    if (window.__codexDictationSupportPatchDisabled) {
+      installDictationDomFallback();
+      return;
+    }
+    if (window.__codexDictationSupportPatchPromise) {
+      return await window.__codexDictationSupportPatchPromise;
+    }
+    const patchPromise = (async () => {
+      for (const prefix of codexDictationSupportModuleCandidates()) {
+        try {
+          const module = await loadOptionalCodexAppModule(prefix);
+          if (!module) continue;
+          for (const key of Object.keys(module)) {
+            const fn = module[key];
+            if (typeof fn !== "function") continue;
+            let src = "";
+            try { src = String(fn); } catch {}
+            if (!src.includes("authMethod") || !src.includes("chatgpt")) continue;
+            if (fn.__codexDictationPatched === codexDictationSupportVersion) continue;
+            const original = fn;
+            const wrapped = function(...args) {
               const result = original.apply(this, args);
               if (result === false) {
                 const hasApikey = args.some(arg => arg && typeof arg === "object" && (arg.authMethod === "apikey" || arg.authMethod === "apiKey"));
                 if (hasApikey) return true;
-                if (typeof codexPlusSettings === "function" && codexPlusSettings().serviceTierControls) return true;
+                if (codexPlusSettings().serviceTierControls) return true;
               }
               return result;
-            } catch (e) {
-              return original.apply(this, args);
-            }
-          };
-          wrapped.__codexDictationPatched = codexDictationSupportVersion;
-          try { module[key] = wrapped; } catch {}
-          sendCodexPlusDiagnostic("dictation_support_patched", { prefix, key, version: codexDictationSupportVersion });
-          window.__codexDictationSupportPatched = codexDictationSupportVersion;
-          return;
-        }
-      } catch {}
-    }
-    // Fallback: DOM enforcement for voice button when module patch not found
-    try {
-      if (!window.__codexDictationDomPatched) {
-        window.__codexDictationDomPatched = true;
-        const enforceVoice = () => {
-          const selectors = ['button[aria-label*="Voice"]','button[aria-label*="Dictation"]','button[aria-label*="voice"]','[data-testid*="voice"]','[data-testid*="dictation"]','button:has(svg)'];
-          // generic: find buttons with microphone icon
-          document.querySelectorAll('button').forEach(btn => {
-            const label = (btn.getAttribute("aria-label") || btn.textContent || "").toLowerCase();
-            if (label.includes("voice") || label.includes("dictation") || label.includes("microphone") || label.includes("mic")) {
-              if (btn.hasAttribute("disabled")) {
-                btn.removeAttribute("disabled");
-                btn.setAttribute("aria-disabled","false");
-                btn.style.opacity = "";
-                btn.style.pointerEvents = "";
-              }
-            }
-          });
-        };
-        setInterval(enforceVoice, 1500);
-        enforceVoice();
+            };
+            wrapped.__codexDictationPatched = codexDictationSupportVersion;
+            try { module[key] = wrapped; } catch {}
+            if (module[key] !== wrapped) continue;
+            clearInterval(window.__codexDictationDomEnforcementTimer);
+            window.__codexDictationDomEnforcementTimer = null;
+            sendCodexPlusDiagnostic("dictation_support_patched", { prefix, key, version: codexDictationSupportVersion });
+            window.__codexDictationSupportPatched = codexDictationSupportVersion;
+            window.__codexDictationSupportPatchMissCount = 0;
+            return;
+          }
+        } catch {}
       }
+      installDictationDomFallback();
+      window.__codexDictationSupportPatchMissCount = (window.__codexDictationSupportPatchMissCount || 0) + 1;
+      if (window.__codexDictationSupportPatchMissCount >= codexDictationSupportPatchMaxMisses) {
+        window.__codexDictationSupportPatchDisabled = true;
+        sendCodexPlusDiagnostic("dictation_support_patch_skipped", {
+          misses: window.__codexDictationSupportPatchMissCount,
+        });
+      }
+    })();
+    window.__codexDictationSupportPatchPromise = patchPromise;
+    try {
+      return await patchPromise;
+    } finally {
+      if (window.__codexDictationSupportPatchPromise === patchPromise) {
+        window.__codexDictationSupportPatchPromise = null;
+      }
+    }
+  }
+
+  function installDictationDomFallback() {
+    try {
+        if (!window.__codexDictationDomPatched) {
+          window.__codexDictationDomPatched = true;
+          const enforceVoice = () => {
+            document.querySelectorAll('button').forEach(btn => {
+              const label = (btn.getAttribute("aria-label") || btn.textContent || "").toLowerCase();
+              if (label.includes("voice") || label.includes("dictation") || label.includes("microphone") || label.includes("mic")) {
+                if (btn.hasAttribute("disabled")) {
+                  btn.removeAttribute("disabled");
+                  btn.setAttribute("aria-disabled","false");
+                  btn.style.opacity = "";
+                  btn.style.pointerEvents = "";
+                }
+              }
+            });
+          };
+          window.__codexDictationDomEnforcementTimer = setInterval(enforceVoice, 1500);
+          enforceVoice();
+        }
     } catch {}
   }
 
@@ -3875,8 +3918,19 @@
   }
 
   let codexPlusUserScripts = { enabled: true, builtin_dir: "", user_dir: "", scripts: [] };
-  let codexPlusBackendStatus = { status: "checking", message: "正在检查后端…" };
+  let codexPlusBackendStatus = window.__codexPlusBackendStatus || { status: "checking", message: "正在检查后端…" };
   let codexPlusBackendCheckSeq = 0;
+  let codexPlusBackendCheckInFlight = false;
+  let codexPlusBackendFailureCount = 0;
+  const CODEX_PLUS_BACKEND_FAILURE_THRESHOLD = 3;
+  const codexPlusBackendGeneration = (Number(window.__codexPlusBackendGeneration) || 0) + 1;
+  window.__codexPlusBackendGeneration = codexPlusBackendGeneration;
+
+  function recordCodexPlusBridgeSuccess() {
+    if (codexPlusBackendGeneration !== window.__codexPlusBackendGeneration) return;
+    const health = window.__codexPlusBridgeHealth || (window.__codexPlusBridgeHealth = {});
+    health.lastSuccessAt = Date.now();
+  }
 
   function renderBackendStatus() {
     const status = codexPlusBackendStatus.status || "failed";
@@ -3911,22 +3965,35 @@
   }
 
   async function checkBackendStatus() {
+    if (codexPlusBackendCheckInFlight) return;
+    codexPlusBackendCheckInFlight = true;
     const seq = ++codexPlusBackendCheckSeq;
-    const nextStatus = await withBackendTimeout(postJson("/backend/status", {}));
-    if (seq !== codexPlusBackendCheckSeq) return;
-    codexPlusBackendStatus = nextStatus;
-    if (nextStatus?.status === "ok" && typeof nextStatus.hideOfficialUsageAlert === "boolean") {
-      window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = nextStatus.hideOfficialUsageAlert;
-      refreshOfficialUsageAlertVisibility();
+    try {
+      const nextStatus = await postJson("/backend/status", {});
+      if (seq !== codexPlusBackendCheckSeq || codexPlusBackendGeneration !== window.__codexPlusBackendGeneration) return;
+      if (nextStatus?.status === "ok") {
+        codexPlusBackendFailureCount = 0;
+        codexPlusBackendStatus = window.__codexPlusBackendStatus = nextStatus;
+        if (typeof nextStatus.hideOfficialUsageAlert === "boolean") {
+          window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = nextStatus.hideOfficialUsageAlert;
+          refreshOfficialUsageAlertVisibility();
+        }
+      } else {
+        codexPlusBackendFailureCount += 1;
+        sendCodexPlusDiagnostic("backend_check_failed", {
+          status: nextStatus?.status || "unknown",
+          message: nextStatus?.message || "",
+          timeout: !!nextStatus?.timeout,
+          consecutiveFailures: codexPlusBackendFailureCount,
+        });
+        if (codexPlusBackendFailureCount >= CODEX_PLUS_BACKEND_FAILURE_THRESHOLD) {
+          codexPlusBackendStatus = window.__codexPlusBackendStatus = nextStatus;
+        }
+      }
+      renderBackendStatus();
+    } finally {
+      codexPlusBackendCheckInFlight = false;
     }
-    if (nextStatus?.status !== "ok") {
-      sendCodexPlusDiagnostic("backend_check_failed", {
-        status: nextStatus?.status || "unknown",
-        message: nextStatus?.message || "",
-        timeout: !!nextStatus?.timeout,
-      });
-    }
-    renderBackendStatus();
   }
 
   async function openManagerFromCodex() {
@@ -3939,7 +4006,11 @@
   }
 
   function scheduleBackendHeartbeat() {
-    if (window.__codexPlusBackendHeartbeat) return;
+    if (codexPlusBackendGeneration !== window.__codexPlusBackendGeneration) return;
+    if (window.__codexPlusBackendHeartbeat &&
+        window.__codexPlusBackendHeartbeatGeneration === codexPlusBackendGeneration) return;
+    if (window.__codexPlusBackendHeartbeat) clearInterval(window.__codexPlusBackendHeartbeat);
+    window.__codexPlusBackendHeartbeatGeneration = codexPlusBackendGeneration;
     window.__codexPlusBackendHeartbeat = setInterval(checkBackendStatus, 5000);
     checkBackendStatus();
   }
@@ -4777,77 +4848,18 @@
     return restored === "openai-bundled" || restored === "openai-curated" || restored === "openai-primary-runtime" || restored === "openai-api-curated" || restored === "openai-curated-remote";
   }
 
-  const codexPluginFilterSourceCache = new WeakMap();
-
-  function codexPluginFilterCallbackSource(callback) {
-    if (codexPluginFilterSourceCache.has(callback)) {
-      return codexPluginFilterSourceCache.get(callback);
+  function restoreHistoricalPluginArrayFilterPatch() {
+    const originalFilter = Array.prototype.__codexPluginBuildFlavorOriginalFilter;
+    const activeFilter = Array.prototype.filter;
+    if (typeof originalFilter === "function" && activeFilter?.__codexPluginBuildFlavorPatched) {
+      Array.prototype.filter = originalFilter;
+      sendCodexPlusDiagnostic("plugin_global_array_filter_patch_removed", {});
     }
-    let source = "";
     try {
-      source = Function.prototype.toString.call(callback);
+      delete Array.prototype.__codexPluginBuildFlavorOriginalFilter;
     } catch {
     }
-    codexPluginFilterSourceCache.set(callback, source);
-    return source;
-  }
-
-  function isCodexPluginBuildFlavorFilter(callback, sample, filtered = null) {
-    if (!Array.isArray(sample) || sample.length === 0 || typeof callback !== "function") return false;
-    if (!sample.some((plugin) => codexPluginOfficialMarketplaceName(plugin?.marketplaceName))) return false;
-    const source = codexPluginFilterCallbackSource(callback);
-    if (!source) return false;
-    const isKnownFilterSource = source.includes("!u(e.marketplaceName)||e.marketplaceName===r")
-      || source.includes("!ne(e.marketplaceName)||e.marketplaceName===n")
-      || source.includes("!Eu(e.marketplaceName)||e.marketplaceName===n");
-    if (!isKnownFilterSource) return false;
-    return sample.some((plugin) => codexPluginOfficialMarketplaceName(plugin?.marketplaceName)
-      && (Array.isArray(filtered) ? !filtered.includes(plugin) : !callback(plugin)));
-  }
-
-  function isCodexPluginMarketplaceHiddenFilter(callback, sample, filtered = null) {
-    if (!Array.isArray(sample) || sample.length === 0 || typeof callback !== "function") return false;
-    if (!sample.some((marketplace) => codexPluginOfficialMarketplaceName(marketplace?.name))) return false;
-    const source = codexPluginFilterCallbackSource(callback);
-    if (!source) return false;
-    if (!source.includes("!t.includes(e.name)")) return false;
-    return sample.some((marketplace) => codexPluginOfficialMarketplaceName(marketplace?.name)
-      && (Array.isArray(filtered) ? !filtered.includes(marketplace) : !callback(marketplace)));
-  }
-
-  function installPluginBuildFlavorFilterPatch() {
-    if (window.__codexPluginBuildFlavorFilterPatch === codexPluginMarketplaceUnlockVersion) return;
-    if (pluginPatchDisabledInRelayMode()) return;
-    if (!codexPlusSettings().pluginMarketplaceUnlock) return;
-    const originalFilter = Array.prototype.__codexPluginBuildFlavorOriginalFilter || Array.prototype.filter;
-    if (!Array.prototype.__codexPluginBuildFlavorOriginalFilter) {
-      Object.defineProperty(Array.prototype, "__codexPluginBuildFlavorOriginalFilter", {
-        value: originalFilter,
-        configurable: true,
-        writable: true,
-      });
-    }
-    if (Array.prototype.filter.__codexPluginBuildFlavorPatched === codexPluginMarketplaceUnlockVersion) {
-      window.__codexPluginBuildFlavorFilterPatch = codexPluginMarketplaceUnlockVersion;
-      return;
-    }
-    const patchedFilter = function codexPluginBuildFlavorFilterPatch(callback, thisArg) {
-      const filtered = originalFilter.call(this, callback, thisArg);
-      if (filtered.length === this.length) return filtered;
-      if (isCodexPluginBuildFlavorFilter(callback, this, filtered)) {
-        sendCodexPlusDiagnostic("plugin_build_flavor_filter_bypassed", { pluginCount: this.length });
-        return Array.from(this);
-      }
-      if (isCodexPluginMarketplaceHiddenFilter(callback, this, filtered)) {
-        sendCodexPlusDiagnostic("plugin_marketplace_hidden_filter_bypassed", { marketplaceCount: this.length });
-        return Array.from(this);
-      }
-      return filtered;
-    };
-    patchedFilter.__codexPluginBuildFlavorPatched = codexPluginMarketplaceUnlockVersion;
-    Array.prototype.filter = patchedFilter;
-    window.__codexPluginBuildFlavorFilterPatch = codexPluginMarketplaceUnlockVersion;
-    sendCodexPlusDiagnostic("plugin_build_flavor_filter_patch_installed", {});
+    window.__codexPluginBuildFlavorFilterPatch = null;
   }
 
   function restorePluginMarketplaceRequestParams(params, method = "") {
@@ -5161,8 +5173,7 @@
       localFallback: localPluginMarketplaceFallbackResult,
       remoteOnlyFallback: remoteOnlyPluginMarketplaceFallbackResult,
       requestProfile: pluginMarketplaceRequestProfile,
-      isBuildFlavorFilter: isCodexPluginBuildFlavorFilter,
-      isHiddenMarketplaceFilter: isCodexPluginMarketplaceHiddenFilter,
+      restoreHistoricalArrayFilterPatch: restoreHistoricalPluginArrayFilterPatch,
       setCodexAppVersion: (version) => {
         codexPlusBackendSettings.codexAppVersion = String(version || "");
       },
@@ -5246,9 +5257,13 @@
         return originalDispatchEvent.call(this, event);
       };
     }
-    if (!window.__codexPluginMarketplaceResponseListenerInstalled) {
-      window.__codexPluginMarketplaceResponseListenerInstalled = true;
-      window.addEventListener("message", (event) => {
+    const responseListenerInstalled = window.__codexPluginMarketplaceResponseListenerInstalled;
+    // Legacy bundles did not retain the callback reference. Keep their single
+    // listener until navigation instead of adding an unremovable duplicate.
+    if (responseListenerInstalled && !window.__codexPluginMarketplaceResponseListener) return;
+    if (responseListenerInstalled !== codexPluginMarketplaceUnlockVersion) {
+      window.removeEventListener("message", window.__codexPluginMarketplaceResponseListener, true);
+      window.__codexPluginMarketplaceResponseListener = (event) => {
         try {
           patchPluginMarketplaceResponseData(event?.data);
         } catch (error) {
@@ -5257,7 +5272,9 @@
             errorMessage: error?.message || String(error),
           });
         }
-      }, true);
+      };
+      window.addEventListener("message", window.__codexPluginMarketplaceResponseListener, true);
+      window.__codexPluginMarketplaceResponseListenerInstalled = codexPluginMarketplaceUnlockVersion;
     }
     window.__codexPluginMarketplaceWindowEventPatch = codexPluginMarketplaceUnlockVersion;
   }
@@ -5596,6 +5613,13 @@
       body,
       keepalive: true,
     }).catch(() => {});
+  }
+
+  function recordCodexPlusFailure(key, error) {
+    const failures = Array.isArray(window[key]) ? window[key] : [];
+    if (failures.length >= 32) failures.splice(0, failures.length - 31);
+    failures.push(String(error?.stack || error).slice(0, 4096));
+    window[key] = failures;
   }
 
   sendCodexPlusDiagnostic("script_loaded", {
@@ -6223,44 +6247,50 @@
   }
 
   async function postJson(path, payload) {
-    if (!window.__codexSessionDeleteBridge) {
-      if (path === "/backend/status") {
-        try {
-          const response = await fetch(`${helperBase}${path}`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload || {}),
-          });
-          return await response.json();
-        } catch (error) {
-          return { status: "failed", message: "未连接" };
-        }
-      }
-      sendCodexPlusDiagnostic("bridge_missing_for_route", { path });
-      return { status: "failed", message: "桥接不可用，请重启启动器" };
-    }
-    function bridgeWithBackendTimeout(path, payload) {
-      return Promise.race([
-        window.__codexSessionDeleteBridge(path, payload),
-        new Promise((resolve) => setTimeout(() => resolve({ status: "failed", message: "后端检查超时", timeout: true }), 2000)),
-      ]);
-    }
     async function fetchBackendStatusFromHelper(path, payload) {
+      const controller = typeof AbortController === "function" ? new AbortController() : null;
+      const timeoutId = setTimeout(() => controller?.abort(), 2000);
       try {
         const response = await fetch(`${helperBase}${path}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload || {}),
+          ...(controller ? { signal: controller.signal } : {}),
         });
         return await response.json();
       } catch (error) {
-        return { status: "failed", message: "未连接" };
+        return {
+          status: "failed",
+          message: error?.name === "AbortError" ? "后端检查超时" : "未连接",
+          timeout: error?.name === "AbortError",
+        };
+      } finally {
+        clearTimeout(timeoutId);
       }
+    }
+    if (!window.__codexSessionDeleteBridge) {
+      if (path === "/backend/status") {
+        return await fetchBackendStatusFromHelper(path, payload);
+      }
+      sendCodexPlusDiagnostic("bridge_missing_for_route", { path });
+      return { status: "failed", message: "桥接不可用，请重启启动器" };
+    }
+    function bridgeWithBackendTimeout(path, payload) {
+      let request;
+      try {
+        request = window.__codexSessionDeleteBridge(path, payload);
+      } catch (error) {
+        return Promise.resolve({ status: "failed", message: error?.message || "未连接" });
+      }
+      return withBackendTimeout(request);
     }
     try {
       if (path === "/backend/status") {
         const result = await bridgeWithBackendTimeout(path, payload);
-        if (result?.status === "ok") return result;
+        if (result?.status === "ok") {
+          recordCodexPlusBridgeSuccess();
+          return result;
+        }
         if (result?.timeout) sendCodexPlusDiagnostic("backend_bridge_timeout", { path });
         const fallback = await fetchBackendStatusFromHelper(path, payload);
         if (fallback?.status === "ok") {
@@ -6745,8 +6775,7 @@
     try {
       patchModelContainer(payload);
     } catch (error) {
-      window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
-      window.__codexPlusModelPatchFailures.push(String(error?.stack || error));
+      recordCodexPlusFailure("__codexPlusModelPatchFailures", error);
     }
     return payload;
   }
@@ -6813,9 +6842,12 @@
   }
 
   function patchAppServerModelMessages() {
-    if (window.__codexPlusModelMessagePatchInstalled) return;
-    window.__codexPlusModelMessagePatchInstalled = true;
-    window.addEventListener("codex-message-from-view", (event) => {
+    const patchVersion = "renderer-lifecycle-20260907-v1";
+    if (window.__codexPlusModelMessagePatchInstalled && !window.__codexPlusModelRequestHandler) return;
+    if (window.__codexPlusModelMessagePatchInstalled === patchVersion) return;
+    window.removeEventListener("codex-message-from-view", window.__codexPlusModelRequestHandler, true);
+    window.removeEventListener("message", window.__codexPlusModelResponseHandler, true);
+    window.__codexPlusModelRequestHandler = (event) => {
       try {
         const detail = event?.detail;
         const request = detail?.request;
@@ -6831,19 +6863,19 @@
           }
         }
       } catch (error) {
-        window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
-        window.__codexPlusModelPatchFailures.push(String(error?.stack || error));
+        recordCodexPlusFailure("__codexPlusModelPatchFailures", error);
       }
-    }, true);
-
-    window.addEventListener("message", (event) => {
+    };
+    window.__codexPlusModelResponseHandler = (event) => {
       try {
         patchMcpModelResponseData(event?.data);
       } catch (error) {
-        window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
-        window.__codexPlusModelPatchFailures.push(String(error?.stack || error));
+        recordCodexPlusFailure("__codexPlusModelPatchFailures", error);
       }
-    }, true);
+    };
+    window.addEventListener("codex-message-from-view", window.__codexPlusModelRequestHandler, true);
+    window.addEventListener("message", window.__codexPlusModelResponseHandler, true);
+    window.__codexPlusModelMessagePatchInstalled = patchVersion;
   }
 
   function patchMcpModelResponseData(data) {
@@ -6881,8 +6913,7 @@
         modelCount: Array.isArray(result?.data) ? result.data.length : Array.isArray(result?.models) ? result.models.length : Array.isArray(result) ? result.length : null,
       });
     } catch (error) {
-      window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
-      window.__codexPlusModelPatchFailures.push(String(error?.stack || error));
+      recordCodexPlusFailure("__codexPlusModelPatchFailures", error);
     }
     return result;
   }
@@ -7091,8 +7122,7 @@
       patchStatsigModelWhitelist();
       installAppServerModelRequestPatch();
     } catch (error) {
-      window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
-      window.__codexPlusModelPatchFailures.push(String(error?.stack || error));
+      recordCodexPlusFailure("__codexPlusModelPatchFailures", error);
     }
     return false;
   }
@@ -8122,15 +8152,18 @@
     window.__codexUpstreamBranchDropdownAdapterVersion = adapterVersion;
     if (window.__codexUpstreamBranchDropdownAdapterInstalled === adapterVersion) return;
     window.__codexUpstreamBranchDropdownObserver?.disconnect?.();
+    document.removeEventListener("click", window.__codexUpstreamBranchDropdownClickHandler, true);
+    clearTimeout(window.__codexUpstreamBranchDropdownInjectTimer);
+    window.__codexUpstreamBranchDropdownInjectTimer = null;
     window.__codexUpstreamBranchDropdownAdapterInstalled = adapterVersion;
-    let upstreamBranchInjectTimer = null;
     const schedule = () => {
-      clearTimeout(upstreamBranchInjectTimer);
-      upstreamBranchInjectTimer = setTimeout(() => {
+      clearTimeout(window.__codexUpstreamBranchDropdownInjectTimer);
+      window.__codexUpstreamBranchDropdownInjectTimer = setTimeout(() => {
+        window.__codexUpstreamBranchDropdownInjectTimer = null;
         injectUpstreamBranchOptions().catch((error) => reportDiagnostic("upstream_branch_inject_failed", { error: error?.message || String(error) }));
       }, 80);
     };
-    document.addEventListener("click", (event) => {
+    const clickHandler = (event) => {
       rememberStartNewChatProjectContext(event);
       const target = event.target instanceof Element ? event.target : event.target?.parentElement;
       const control = target?.closest?.('button, [role="button"]');
@@ -8154,7 +8187,9 @@
       syncUpstreamBranchTriggerLabel();
       syncUpstreamBranchMenuSelection(option.closest?.('[role="menu"], [data-radix-menu-content], [cmdk-list]'));
       showToast(`将从 ${upstreamBranchOptionLabel(option) || "upstream/main"} 创建新 worktree`, null);
-    }, true);
+    };
+    window.__codexUpstreamBranchDropdownClickHandler = clickHandler;
+    document.addEventListener("click", clickHandler, true);
     const branchMenuSelector = '[role="menu"], [data-radix-menu-content], [cmdk-list]';
     const addedNodeContainsBranchMenu = (node) => {
       if (!(node instanceof Element)) return false;
@@ -8287,10 +8322,12 @@
   function installUpstreamWorktreeNativeAdapter() {
     const adapterVersion = "2";
     if (window.__codexUpstreamWorktreeNativeAdapterInstalled === adapterVersion) return;
+    document.removeEventListener("click", window.__codexUpstreamWorktreeNativeAdapterHandler, true);
     window.__codexUpstreamWorktreeNativeAdapterInstalled = adapterVersion;
-    document.addEventListener("click", (event) => {
+    window.__codexUpstreamWorktreeNativeAdapterHandler = (event) => {
       handleUpstreamWorktreeNativeCreate(event);
-    }, true);
+    };
+    document.addEventListener("click", window.__codexUpstreamWorktreeNativeAdapterHandler, true);
   }
 
   function setUpstreamWorktreeMessage(dialog, message, status = "idle") {
@@ -10362,6 +10399,7 @@
   }
 
   function scanDeferred() {
+    restoreHistoricalPluginArrayFilterPatch();
     if (pluginPatchDisabledInRelayMode()) {
       clearPluginPatchArtifacts();
     } else {
@@ -10370,7 +10408,6 @@
       logCodexPluginUnlockStrategy(pluginUnlockStrategy);
       if ((pluginUnlockStrategy === "modern" || pluginUnlockStrategy === "unknown") && settings.pluginMarketplaceUnlock) {
         const marketplaceRequestPatchStrategy = codexPluginMarketplaceRequestPatchStrategy();
-        installPluginBuildFlavorFilterPatch();
         if (marketplaceRequestPatchStrategy === "bridge") {
           installPluginMarketplaceBridgePatch();
         } else if (marketplaceRequestPatchStrategy === "client") {
@@ -10398,8 +10435,7 @@
     try {
       step();
     } catch (error) {
-      window.__codexSessionDeleteScanFailures = window.__codexSessionDeleteScanFailures || [];
-      window.__codexSessionDeleteScanFailures.push(String(error?.stack || error));
+      recordCodexPlusFailure("__codexSessionDeleteScanFailures", error);
     }
   }
 
@@ -10565,16 +10601,14 @@
 // 关闭时不进入 if 体，行为与原 Codex 完全一致；开启时在 document 捕获阶段
 // 拦截 paste，若 text/plain 非空则阻止默认行为并调用 execCommand('insertText')
 // 插入纯文本，避免 Codex 把 Word 复制的内容识别为附件。
-// SENTINEL 保证多次执行（页面刷新、脚本重注入）只装一次 handler。
-if (window.__CODEX_PLUS_PASTE_FIX__ && window.__CODEX_PLUS_PASTE_FIX__.enabled === true) {
-  (() => {
-    const SENTINEL = '__codexPasteFixInstalled__';
-    if (window[SENTINEL]) return;
-    window[SENTINEL] = true;
-
+// 重入时先卸载旧 handler；设置关闭后也不会留下捕获阶段监听器。
+(() => {
+  document.removeEventListener('paste', window.__codexPasteFixHandler, true);
+  window.__codexPasteFixHandler = null;
+  if (window.__CODEX_PLUS_PASTE_FIX__ && window.__CODEX_PLUS_PASTE_FIX__.enabled === true) {
     const TAG = '[PasteFix]';
 
-    const handler = (e) => {
+    window.__codexPasteFixHandler = (e) => {
       const cd = e.clipboardData;
       if (!cd) return;
 
@@ -10595,7 +10629,7 @@ if (window.__CODEX_PLUS_PASTE_FIX__ && window.__CODEX_PLUS_PASTE_FIX__.enabled =
       }
     };
 
-    document.addEventListener('paste', handler, { capture: true });
+    document.addEventListener('paste', window.__codexPasteFixHandler, { capture: true });
     console.log(TAG, 'paste handler installed (capture phase)');
-  })();
-}
+  }
+})();
