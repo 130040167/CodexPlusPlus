@@ -1,5 +1,6 @@
 use codex_plus_core::assets::{force_chinese_locale_config, injection_script_with_settings};
 use codex_plus_core::settings::BackendSettings;
+use std::process::Command;
 
 #[test]
 fn force_chinese_locale_defaults_to_true() {
@@ -84,13 +85,69 @@ fn injection_script_includes_force_chinese_locale_global_and_patch() {
     assert!(script.contains("enable_i18n"));
     assert!(script.contains("locale_source"));
     assert!(script.contains("vscode://codex/${method}"));
+    assert!(script.contains("callCodexSettingApiOnce"));
     assert!(script.contains("\"get-setting\""));
     assert!(script.contains("\"set-setting\""));
+    assert!(script.contains("official_locale_api_envelope_fallback"));
     assert!(script.contains("{ key: \"localeOverride\", value: locale }"));
     assert!(script.contains("window.location.reload()"));
     assert!(script.contains("if (window.sessionStorage.getItem(localeReloadStorageKey) !== marker) return;"));
     assert!(script.contains("codexPlus.forceChineseLocale.managed.v1"));
+    assert!(script.contains("codexPlus.forceChineseLocale.startup.v1"));
+    assert!(script.contains("official_locale_startup_reload"));
+    assert!(script.contains("official_locale_sync_failed"));
+    assert!(script.contains("getSentryInitOptions"));
     assert!(!script.contains("setItem(\"localeOverride\""));
+
+    let functions = script
+        .split("    const callCodexSettingApiOnce =")
+        .nth(1)
+        .and_then(|tail| tail.split("    const readStartupReloadMarker").next())
+        .map(|body| format!("const callCodexSettingApiOnce ={body}"))
+        .expect("locale API functions");
+    let harness = format!(
+        r#"
+const assert = require('node:assert/strict');
+const listeners = new Set();
+const calls = [];
+global.window = {{
+  addEventListener: (_type, listener) => listeners.add(listener),
+  removeEventListener: (_type, listener) => listeners.delete(listener),
+  setTimeout,
+  clearTimeout,
+}};
+const emit = (data) => listeners.forEach((listener) => listener({{ data }}));
+function buildApi() {{
+  const sendCodexPlusDiagnostic = () => {{}};
+  {functions}
+  return callCodexSettingApi;
+}}
+const api = buildApi();
+const bridge = {{
+  sendMessageFromView(message) {{
+    const body = JSON.parse(message.body);
+    calls.push(body);
+    queueMicrotask(() => emit(calls.length === 1
+      ? {{ type: 'fetch-response', requestId: message.requestId, responseType: 'error', error: 'legacy envelope rejected' }}
+      : {{ type: 'fetch-response', requestId: message.requestId, responseType: 'success', bodyJsonString: '{{"value":"zh-CN"}}' }}));
+  }},
+}};
+api(bridge, 'get-setting', {{ key: 'localeOverride' }}).then((result) => {{
+  assert.deepEqual(calls, [{{ params: {{ key: 'localeOverride' }} }}, {{ key: 'localeOverride' }}]);
+  assert.deepEqual(result, {{ value: 'zh-CN' }});
+}}).catch((error) => {{ console.error(error); process.exitCode = 1; }});
+"#,
+        functions = functions
+    );
+    let output = Command::new("node")
+        .args(["-e", &harness])
+        .output()
+        .expect("run locale envelope harness");
+    assert!(
+        output.status.success(),
+        "locale envelope fallback failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     settings.codex_app_force_chinese_locale = false;
     let script = injection_script_with_settings(0, &settings);
