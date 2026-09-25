@@ -1,9 +1,40 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::sync::Mutex;
 
 use codex_plus_core::model_suffix::{
     build_model_catalog_json, build_model_catalog_json_with_template, collect_catalog_entries,
     model_ui_metadata, parse_model_suffix,
 };
+
+/// CODEX_HOME 环境变量是进程级全局，运行时缓存测试必须串行执行。
+static RUNTIME_CACHE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// 保存并恢复 CODEX_HOME 的守卫，参照 codex_home.rs 内部测试的模式。
+struct CodexHomeEnvGuard {
+    previous: Option<OsString>,
+}
+
+impl CodexHomeEnvGuard {
+    fn set(path: &std::path::Path) -> Self {
+        let previous = std::env::var_os("CODEX_HOME");
+        unsafe {
+            std::env::set_var("CODEX_HOME", path);
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for CodexHomeEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var("CODEX_HOME", value),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+    }
+}
 
 #[test]
 fn parse_suffix_extracts_k_and_m_units() {
@@ -218,6 +249,66 @@ fn astra_metadata_exposes_max_ultra_in_catalog_and_ui() {
 }
 
 #[test]
+fn gpt6_sol_luna_metadata_matches_official_efforts_fast_and_default_window() {
+    use codex_plus_core::model_suffix::requires_bundled_metadata_catalog;
+
+    let entries = collect_catalog_entries(
+        "gpt-6-sol\ngpt-6-luna",
+        &HashMap::new(),
+        &HashMap::new(),
+        "gpt-6-sol",
+    );
+    let catalog: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
+    for slug in ["gpt-6-sol", "gpt-6-luna"] {
+        let mut expected_efforts = vec!["none", "low", "medium", "high", "xhigh", "max"];
+        if slug == "gpt-6-sol" {
+            expected_efforts.push("ultra");
+        }
+        assert!(requires_bundled_metadata_catalog(slug));
+        let model = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["slug"] == slug)
+            .unwrap();
+        let ui = model_ui_metadata(slug).unwrap();
+        for (levels, key) in [
+            (&model["supported_reasoning_levels"], "effort"),
+            (&ui["supportedReasoningEfforts"], "reasoningEffort"),
+        ] {
+            let efforts = levels
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|level| level[key].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(efforts, expected_efforts);
+        }
+        assert_eq!(ui["displayName"], model["display_name"]);
+        assert_eq!(model["default_reasoning_level"], "medium");
+        assert_eq!(ui["defaultReasoningEffort"], "medium");
+        assert_eq!(model["context_window"], 272_000);
+        assert_eq!(model["max_context_window"], 872_000);
+        assert_eq!(model["additional_speed_tiers"], serde_json::json!(["fast"]));
+        assert_eq!(ui["additionalSpeedTiers"], model["additional_speed_tiers"]);
+        assert_eq!(model["service_tiers"][0]["id"], "priority");
+        assert_eq!(ui["serviceTiers"], model["service_tiers"]);
+        assert_eq!(model["supports_search_tool"], true);
+        assert_eq!(model["use_responses_lite"], false);
+    }
+
+    assert!(!requires_bundled_metadata_catalog("gpt-6-sol-custom"));
+    assert!(model_ui_metadata("gpt-6-luna-custom").is_none());
+    let overridden: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&entries, Some(200_000))).unwrap();
+    for model in overridden["models"].as_array().unwrap() {
+        assert_eq!(model["context_window"], 200_000);
+        assert_eq!(model["max_context_window"], 200_000);
+    }
+}
+
+#[test]
 fn model_ui_metadata_exposes_fast_service_tier_capability() {
     let metadata = model_ui_metadata("gpt-5.6-sol").expect("Sol metadata should exist");
 
@@ -287,4 +378,191 @@ fn migrate_model_list_with_suffixes_splits_slug_and_window() {
     );
     assert_eq!(windows.get("deepseek-v4-pro"), None);
     assert_eq!(windows.get("nvidia/...:free"), Some(&"200000".to_string()));
+}
+
+#[test]
+fn build_catalog_json_prefers_runtime_models_cache_entry() {
+    let _lock = RUNTIME_CACHE_ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let cache = serde_json::json!({
+        "models": [{
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5 Runtime",
+            "description": "runtime cache wins",
+            "context_window": 272000u64,
+            "max_context_window": 872000u64,
+            "shell_type": "unified_exec"
+        }]
+    });
+    std::fs::create_dir_all(&temp).unwrap();
+    std::fs::write(
+        temp.path().join("models_cache.json"),
+        serde_json::to_string(&cache).unwrap(),
+    )
+    .unwrap();
+    let _guard = CodexHomeEnvGuard::set(temp.path());
+
+    let entries = collect_catalog_entries("gpt-5.5", &HashMap::new(), &HashMap::new(), "");
+    let catalog: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
+    let model = &catalog["models"][0];
+
+    assert_eq!(model["slug"], "gpt-5.5");
+    // 运行时缓存命中：display_name / shell_type 来自 models_cache.json（issue #2141）
+    assert_eq!(model["display_name"], "GPT-5.5 Runtime");
+    assert_eq!(model["shell_type"], "unified_exec");
+    // 窗口仍由 builder 权威生成：未显式配置时保留缓存的上限（#2191 语义）
+    assert_eq!(model["context_window"], 272_000);
+    assert_eq!(model["max_context_window"], 872_000);
+}
+
+#[test]
+fn build_catalog_json_falls_back_to_bundled_without_runtime_cache() {
+    let _lock = RUNTIME_CACHE_ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(&temp).unwrap();
+    let _guard = CodexHomeEnvGuard::set(temp.path());
+
+    let entries = collect_catalog_entries("gpt-5.5", &HashMap::new(), &HashMap::new(), "");
+    let catalog: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
+    let model = &catalog["models"][0];
+
+    // 无运行时缓存时回落静态资产，字段仍然齐全
+    assert_eq!(model["slug"], "gpt-5.5");
+    assert_eq!(model["display_name"], "GPT-5.5");
+    assert_eq!(model["context_window"], 272_000);
+    assert!(model["supported_reasoning_levels"].as_array().is_some());
+}
+
+#[test]
+fn catalog_metadata_matches_slug_case_insensitively() {
+    use codex_plus_core::model_suffix::requires_bundled_metadata_catalog;
+
+    // 供应商 Model Key 大小写不统一（GLM-5.3-FlashX），界面填大写也应命中内置元数据。
+    assert!(requires_bundled_metadata_catalog("GPT-6-Astra"));
+    assert!(!requires_bundled_metadata_catalog("gpt-6-astra-custom"));
+    let metadata = model_ui_metadata("GPT-5.6-SOL").expect("Sol metadata should exist");
+    assert_eq!(metadata["displayName"], "GPT-5.6-Sol");
+}
+
+#[test]
+fn bundled_template_matches_slug_case_insensitively() {
+    // codex bundled catalog 全小写 slug，界面填大写（GPT-5.4）也应命中模板：
+    // 命中时保留官方 max_context_window 1000000，未命中回落首条模板的 272000。
+    // 隔离 CODEX_HOME：否则查找链会先命中本机官方 models_cache.json，机器相关。
+    let _lock = RUNTIME_CACHE_ENV_LOCK.lock().unwrap();
+    let _guard = CodexHomeEnvGuard::set(tempfile::tempdir().unwrap().path());
+    let entries = collect_catalog_entries("GPT-5.4", &HashMap::new(), &HashMap::new(), "GPT-5.4");
+    let catalog: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
+    assert_eq!(catalog["models"][0]["slug"], "GPT-5.4");
+    assert_eq!(catalog["models"][0]["context_window"], 272_000);
+    assert_eq!(catalog["models"][0]["max_context_window"], 1_000_000);
+}
+
+#[test]
+fn vendor_metadata_chain_matches_all_providers() {
+    use codex_plus_core::model_suffix::requires_bundled_metadata_catalog;
+
+    // 未配置窗口时，供应商元数据直接提供窗口与展示字段（#2191：未显式配置
+    // 保留官方 max 上限），不再回落 272000 裸模板。
+    assert!(requires_bundled_metadata_catalog("kimi-k3"));
+    let entries = collect_catalog_entries(
+        "kimi-k3\nglm-5.3\nqwen3.8-max\ngrok-4.7\nMiniMax-M3",
+        &HashMap::new(),
+        &HashMap::new(),
+        "",
+    );
+    let catalog: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
+    let models = catalog["models"].as_array().unwrap();
+    let find = |slug: &str| {
+        models
+            .iter()
+            .find(|model| model["slug"] == slug)
+            .expect(slug)
+            .clone()
+    };
+
+    let k3 = find("kimi-k3");
+    assert_eq!(k3["display_name"], "Kimi K3");
+    assert_eq!(k3["context_window"], 1_048_576);
+    assert_eq!(k3["max_context_window"], 1_048_576);
+    assert_eq!(k3["apply_patch_tool_type"], "freeform");
+    let efforts = effort_list(&k3);
+    assert_eq!(efforts, vec!["low", "high", "max"]);
+
+    let glm = find("glm-5.3");
+    assert_eq!(glm["display_name"], "glm-5.3");
+    assert_eq!(glm["context_window"], 1_048_576);
+    assert_eq!(effort_list(&glm), vec!["low", "high", "max"]);
+
+    let qwen = find("qwen3.8-max");
+    assert_eq!(qwen["context_window"], 1_000_000);
+    assert_eq!(qwen["max_context_window"], 1_000_000);
+    assert_eq!(effort_list(&qwen), vec!["low", "medium", "xhigh"]);
+
+    let grok = find("grok-4.7");
+    assert_eq!(grok["display_name"], "Grok 4.7");
+    assert_eq!(grok["context_window"], 500_000);
+    assert_eq!(effort_list(&grok), vec!["low", "medium", "high", "xhigh"]);
+
+    let minimax = find("MiniMax-M3");
+    assert_eq!(minimax["display_name"], "MiniMax-M3");
+    assert_eq!(minimax["context_window"], 1_048_576);
+    assert_eq!(effort_list(&minimax), vec!["none", "high"]);
+}
+
+fn effort_list(model: &serde_json::Value) -> Vec<&str> {
+    model["supported_reasoning_levels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|level| level["effort"].as_str())
+        .collect()
+}
+
+#[test]
+fn vendor_metadata_chain_matches_case_insensitively() {
+    // 界面填大写供应商 slug（GLM-5.3）也应命中内置供应商元数据。
+    let entries = collect_catalog_entries("GLM-5.3", &HashMap::new(), &HashMap::new(), "GLM-5.3");
+    let catalog: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
+    assert_eq!(catalog["models"][0]["slug"], "GLM-5.3");
+    assert_eq!(catalog["models"][0]["display_name"], "glm-5.3");
+    assert_eq!(catalog["models"][0]["context_window"], 1_048_576);
+}
+
+#[test]
+fn compat_overlay_composes_with_runtime_cache_base() {
+    // 精调层与官方 App 热更新的冲突裁决：官方缓存做基座（未被精调覆盖的字段
+    // 流入官方最新值），精调字段覆盖其上（产品特性不被官方数据冲掉）。
+    let _lock = RUNTIME_CACHE_ENV_LOCK.lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let cache = serde_json::json!({
+        "models": [{
+            "slug": "gpt-5.6-sol",
+            "display_name": "GPT-5.6 Sol Runtime",
+            "context_window": 400_000u64,
+            "max_context_window": 400_000u64,
+            "shell_type": "shell_command",
+            // 精调文件未定义的字段：官方热更新应原样流入
+            "truncation_policy": { "mode": "tokens", "limit": 999 }
+        }]
+    });
+    std::fs::create_dir_all(temp.path()).unwrap();
+    std::fs::write(temp.path().join("models_cache.json"), cache.to_string()).unwrap();
+    let _guard = CodexHomeEnvGuard::set(temp.path());
+
+    let entries = collect_catalog_entries("gpt-5.6-sol", &HashMap::new(), &HashMap::new(), "");
+    let catalog: serde_json::Value =
+        serde_json::from_str(&build_model_catalog_json(&entries, None)).unwrap();
+    let model = &catalog["models"][0];
+    // 精调覆盖：窗口与 Fast 档保持产品级取值
+    assert_eq!(model["context_window"], 272_000);
+    assert_eq!(model["max_context_window"], 872_000);
+    assert_eq!(model["additional_speed_tiers"], serde_json::json!(["fast"]));
+    // 官方流入：精调未定义的截断策略取缓存最新值
+    assert_eq!(model["truncation_policy"]["limit"], 999);
 }

@@ -25,6 +25,8 @@ struct ModelSource {
     name: String,
     base_url: String,
     api_key: String,
+    /// 供应商自定义请求头（issue #1685）。非供应商来源为空。
+    headers: Vec<crate::settings::RelayHeaderKeyValue>,
 }
 
 #[derive(Debug, Default)]
@@ -429,6 +431,7 @@ fn model_sources_from_environment(
         } else {
             api_key
         },
+        headers: Vec::new(),
     }]
 }
 
@@ -465,6 +468,7 @@ fn model_source_from_config(
         },
         base_url,
         api_key,
+        headers: Vec::new(),
     })
 }
 
@@ -543,9 +547,11 @@ async fn fetch_models_from_source_with_timeout(
     let mut request = client
         .get(&endpoint)
         .header(reqwest::header::ACCEPT, "application/json");
-    if !source.api_key.is_empty() {
+    // 与协议代理、供应商测试共用 relay_headers：显式 Authorization 优先于 API Key。
+    if !source.api_key.is_empty() && !crate::relay_headers::has_authorization(&source.headers) {
         request = request.bearer_auth(&source.api_key);
     }
+    request = crate::relay_headers::apply_headers(request, &source.headers);
 
     match tokio::time::timeout(timeout, async move {
         let response = request.send().await?;
@@ -588,14 +594,19 @@ fn interpret_models_response(
             ),
         );
     };
+    // 业务错误信封优先于模型列表判定：网关在错误态下可能回一个占位或部分
+    // 列表（issue 复现：{"code":401,"success":false,"data":[{"id":"..."}]}），
+    // 先看列表会把它当成「获取成功」，用户看到成功但实际令牌已失效。
+    // 反过来不会误伤正常响应——business_error_message 只认 success=false /
+    // code∉{0,200} / error 非空，标准 OpenAI 响应三者都没有。
+    if let Some(message) = business_error_message(&payload) {
+        return failed_source(safe_source, message);
+    }
     let models = unique_strings(parse_model_payload(&payload));
     if !models.is_empty() {
         safe_source["status"] = json!("ok");
         safe_source["models"] = json!(models.len());
         return (models, safe_source);
-    }
-    if let Some(message) = business_error_message(&payload) {
-        return failed_source(safe_source, message);
     }
     // HTTP 200 且无业务错误信封：维持既有语义，按“网关可达但 0 个模型”处理
     safe_source["status"] = json!("ok");
@@ -716,6 +727,7 @@ pub async fn fetch_relay_profile_model_ids(
             profile.upstream_base_url.trim().to_string()
         },
         api_key: profile.api_key.trim().to_string(),
+        headers: profile.custom_headers.clone(),
     };
     if source.base_url.is_empty() {
         anyhow::bail!("Base URL 不能为空");
@@ -1072,6 +1084,36 @@ mod model_fetch_tests {
     }
 
     #[test]
+    fn interpret_models_response_prefers_business_error_over_a_returned_model_list() {
+        // 网关在错误态下回了一个列表时，错误必须优先——否则用户看到「获取成功」
+        // 但令牌其实已失效，排查会往错误方向走。
+        let (models, status) = interpret_models_response(
+            200,
+            r#"{"code":401,"msg":"令牌已过期","success":false,"data":[{"id":"glm-5.3"}]}"#,
+            json!({"id": "t"}),
+        );
+        assert!(models.is_empty(), "错误态下的列表不应被当作可用模型");
+        assert_eq!(status["status"], "failed");
+        assert_eq!(status["message"], "令牌已过期");
+        assert_eq!(status["models"], 0);
+    }
+
+    #[test]
+    fn interpret_models_response_keeps_normal_lists_working_without_an_envelope() {
+        // 反向保护：标准 OpenAI 响应没有 success/code/error 字段，
+        // 提前检查业务错误不能把它误判成失败。
+        for body in [
+            r#"{"object":"list","data":[{"id":"gpt-5.6-sol"},{"id":"gpt-5.6-terra"}]}"#,
+            r#"{"code":200,"success":true,"data":[{"id":"glm-5.3"}]}"#,
+            r#"{"code":0,"msg":"ok","data":[{"id":"deepseek-v4"}]}"#,
+        ] {
+            let (models, status) = interpret_models_response(200, body, json!({"id": "t"}));
+            assert!(!models.is_empty(), "{body}");
+            assert_eq!(status["status"], "ok", "{body}");
+        }
+    }
+
+    #[test]
     fn interpret_models_response_appends_upstream_reason_on_http_error() {
         let (_, status) = interpret_models_response(
             401,
@@ -1139,6 +1181,7 @@ mod model_fetch_tests {
             name: "Test".to_string(),
             base_url: format!("http://{address}"),
             api_key: "key".to_string(),
+            headers: Vec::new(),
         };
         let (_, status) = fetch_models_from_source_with_timeout(
             &client,

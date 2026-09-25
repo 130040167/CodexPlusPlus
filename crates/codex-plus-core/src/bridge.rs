@@ -18,6 +18,10 @@ use tokio_tungstenite::tungstenite::Message;
 pub const BRIDGE_BINDING_NAME: &str = "codexSessionDeleteV2";
 const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+/// 陈旧会话的 generation 轮询间隔。旧会话只会在"socket 再收到消息"时走到循环顶部的
+/// generation 检查；bridge 失效场景下旧 socket 不会再有任何消息，没有这个轮询，
+/// 被顶替的会话会带着 Runtime.enable 订阅和脚本注册无限期滞留。
+pub const BRIDGE_GENERATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 pub type BridgeHandler = Arc<
     dyn Fn(String, Value) -> Pin<Box<dyn Future<Output = anyhow::Result<Value>> + Send>>
@@ -141,8 +145,12 @@ pub fn bridge_health_check_script() -> &'static str {
   const now = Date.now();
   const lastSuccessAt = Number(health.lastSuccessAt) || 0;
   const lastInjectionAt = Number(health.lastInjectionAt) || 0;
+  const lastAttemptAt = Number(health.lastAttemptAt) || 0;
   if (lastInjectionAt > 0 && now - lastInjectionAt <= 5000) return true;
-  return lastSuccessAt > 0 && now - lastSuccessAt <= 15000;
+  if (lastSuccessAt > 0 && now - lastSuccessAt <= 15000) return true;
+  // 页面忙碌时状态请求会超时，但心跳仍在调用桥接。最近一次尝试也算活着，
+  // 避免看门狗把整份脚本反复注入并触发整页刷新。
+  return lastAttemptAt > 0 && now - lastAttemptAt <= 15000;
 })()
 "#
 }
@@ -308,6 +316,204 @@ fn spawn_app_server_client_capture(websocket_url: &str, generation: BridgeGenera
     });
 }
 
+pub fn external_api_quota_breakpoint_condition(value: &Value) -> Option<String> {
+    let quota = value.get("quotaVariable")?.as_str()?;
+    let host = value.get("hostVariable")?.as_str()?;
+    let identifier = |text: &str| {
+        !text.is_empty()
+            && text.chars().enumerate().all(|(index, ch)| {
+                ch == '_'
+                    || ch == '$'
+                    || ch.is_ascii_alphabetic()
+                    || (index > 0 && ch.is_ascii_digit())
+            })
+    };
+    if !identifier(quota) || !identifier(host) {
+        return None;
+    }
+    Some(format!(
+        "({quota}&&window.__codexPlusExternalApiQuotaAllowed?.({host})===true&&({quota}=false),false)"
+    ))
+}
+
+fn spawn_external_api_quota_gate(websocket_url: &str, generation: BridgeGeneration) {
+    let websocket_url = websocket_url.to_string();
+    tokio::spawn(async move {
+        supervise_external_api_quota_gate(&websocket_url, generation).await;
+    });
+}
+
+async fn supervise_external_api_quota_gate(websocket_url: &str, generation: BridgeGeneration) {
+    let mut retry_seconds = 2;
+    while bridge_generation_is_current(&generation) {
+        let started = std::time::Instant::now();
+        match run_external_api_quota_gate(websocket_url, generation.clone()).await {
+            Ok(()) => break,
+            Err(error) => {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "bridge.external_api_quota_gate_failed",
+                    json!({ "message": error.to_string(), "retry_seconds": retry_seconds }),
+                );
+            }
+        }
+        if !bridge_generation_is_current(&generation) {
+            break;
+        }
+        if started.elapsed() > Duration::from_secs(30) {
+            retry_seconds = 2;
+        }
+        tokio::time::sleep(Duration::from_secs(retry_seconds)).await;
+        retry_seconds = (retry_seconds * 2).min(30);
+    }
+}
+
+#[cfg(test)]
+mod external_api_quota_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn quota_gate_reconnects_after_timeout_and_stops_when_superseded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://{}/devtools/page/quota-test",
+            listener.local_addr().unwrap()
+        );
+        let generation = next_bridge_generation(&url);
+        assert!(publish_bridge_generation(&generation));
+        let task_generation = generation.clone();
+        let task = tokio::spawn(async move {
+            supervise_external_api_quota_gate(&url, task_generation).await;
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut first = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let command = tokio::time::timeout(Duration::from_secs(5), first.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let command: Value = serde_json::from_str(command.to_text().unwrap()).unwrap();
+        assert_eq!(command["method"], "Runtime.evaluate");
+        // 模拟启动繁忙：连接保持，但首个 CDP 命令不返回。
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(12), listener.accept())
+            .await
+            .expect("quota gate should reconnect after command timeout")
+            .unwrap();
+        let _second = tokio_tungstenite::accept_async(stream).await.unwrap();
+        release_bridge_generation(&generation);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("superseded supervisor must stop")
+            .unwrap();
+    }
+}
+
+async fn run_external_api_quota_gate(
+    websocket_url: &str,
+    generation: BridgeGeneration,
+) -> anyhow::Result<()> {
+    let socket = connect_cdp_websocket(websocket_url).await?;
+    let mut session = CdpSession::new(socket);
+    let mut installed: Option<(Value, String)> = None;
+    let mut debugger_enabled = false;
+    while bridge_generation_is_current(&generation) {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if !bridge_generation_is_current(&generation) {
+            break;
+        }
+        let expression = if installed.is_some() {
+            "window.__codexPlusApiQuotaGate?.refreshComposers?.(window.__codexPlusApiQuotaBreakpoint); JSON.stringify(window.__codexPlusApiQuotaBreakpoint || null)"
+        } else {
+            "JSON.stringify(window.__codexPlusApiQuotaBreakpoint || null)"
+        };
+        let response = session
+            .send_command(
+                next_message_id(),
+                "Runtime.evaluate",
+                runtime_evaluate_params(expression),
+            )
+            .await?;
+        let Some(text) = response
+            .pointer("/result/result/value")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        if installed
+            .as_ref()
+            .is_some_and(|(previous, _)| previous == &value)
+        {
+            continue;
+        }
+        let Some(condition) = external_api_quota_breakpoint_condition(&value) else {
+            continue;
+        };
+        let Some((url_regex, line_number, column_number)) =
+            parse_app_server_client_capture_location(&Value::String(text.to_string()))
+        else {
+            continue;
+        };
+        if !debugger_enabled {
+            session
+                .send_command(next_message_id(), "Debugger.enable", json!({}))
+                .await?;
+            debugger_enabled = true;
+        }
+        if let Some((_, id)) = installed.take() {
+            session
+                .send_command(
+                    next_message_id(),
+                    "Debugger.removeBreakpoint",
+                    json!({ "breakpointId": id }),
+                )
+                .await?;
+        }
+        let result = session
+            .send_command(
+                next_message_id(),
+                "Debugger.setBreakpointByUrl",
+                json!({
+                    "urlRegex": url_regex,
+                    "lineNumber": line_number,
+                    "columnNumber": column_number,
+                    "condition": condition,
+                }),
+            )
+            .await?;
+        let Some(id) = result.pointer("/result/breakpointId").and_then(Value::as_str) else {
+            bail!("external API quota gate breakpoint was not installed");
+        };
+        installed = Some((value, id.to_string()));
+        // 断点不会重跑已经完成的 render。安装后必须触发等价状态重绘。
+        session
+            .send_command(
+                next_message_id(),
+                "Runtime.evaluate",
+                runtime_evaluate_params(
+                    "window.__codexPlusApiQuotaGate?.refreshComposers?.(window.__codexPlusApiQuotaBreakpoint, true)",
+                ),
+            )
+            .await?;
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "bridge.external_api_quota_gate_armed",
+            json!({}),
+        );
+    }
+    if let Some((_, id)) = installed {
+        let _ = session
+            .send_command(
+                next_message_id(),
+                "Debugger.removeBreakpoint",
+                json!({ "breakpointId": id }),
+            )
+            .await;
+    }
+    session.close().await;
+    Ok(())
+}
+
 async fn run_app_server_client_capture(
     websocket_url: &str,
     generation: BridgeGeneration,
@@ -459,48 +665,62 @@ pub async fn install_bridge(
     let mut session = CdpSession::new(socket).with_handler(handler);
     let generation = next_bridge_generation(websocket_url);
     session = session.with_generation(generation.clone());
+    let mut registered_script_ids = Vec::new();
 
-    session.send_command(1, "Runtime.enable", json!({})).await?;
-    session
-        .send_command(2, "Runtime.removeBinding", json!({ "name": binding_name }))
-        .await?;
-    session
-        .send_command(3, "Runtime.addBinding", json!({ "name": binding_name }))
-        .await?;
-
-    let bridge_script = build_bridge_script(binding_name);
-    session
-        .send_command(
-            4,
-            "Page.addScriptToEvaluateOnNewDocument",
-            json!({ "source": bridge_script }),
-        )
-        .await?;
-    session
-        .send_command(
-            5,
-            "Runtime.evaluate",
-            runtime_evaluate_params(&bridge_script),
-        )
-        .await?;
-
-    for script in new_document_scripts {
-        let message_id = next_message_id();
+    let install_result: anyhow::Result<()> = async {
+        session.send_command(1, "Runtime.enable", json!({})).await?;
         session
+            .send_command(2, "Runtime.removeBinding", json!({ "name": binding_name }))
+            .await?;
+        session
+            .send_command(3, "Runtime.addBinding", json!({ "name": binding_name }))
+            .await?;
+
+        let bridge_script = build_bridge_script(binding_name);
+        let response = session
             .send_command(
-                message_id,
+                4,
                 "Page.addScriptToEvaluateOnNewDocument",
-                json!({ "source": script }),
+                json!({ "source": bridge_script }),
             )
             .await?;
-        let message_id = next_message_id();
+        collect_script_identifier(&response, &mut registered_script_ids);
         session
             .send_command(
-                message_id,
+                5,
                 "Runtime.evaluate",
-                runtime_evaluate_params(script),
+                runtime_evaluate_params(&bridge_script),
             )
             .await?;
+
+        for script in new_document_scripts {
+            let message_id = next_message_id();
+            let response = session
+                .send_command(
+                    message_id,
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    json!({ "source": script }),
+                )
+                .await?;
+            collect_script_identifier(&response, &mut registered_script_ids);
+            let message_id = next_message_id();
+            session
+                .send_command(
+                    message_id,
+                    "Runtime.evaluate",
+                    runtime_evaluate_params(script),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = install_result {
+        session
+            .remove_registered_scripts(&registered_script_ids)
+            .await;
+        session.close().await;
+        return Err(error);
     }
 
     if !publish_bridge_generation(&generation) {
@@ -508,6 +728,9 @@ pub async fn install_bridge(
             "bridge.generation_superseded_before_publish",
             json!({ "generation": generation.id }),
         );
+        session
+            .remove_registered_scripts(&registered_script_ids)
+            .await;
         session.close().await;
         return Ok(());
     }
@@ -517,6 +740,7 @@ pub async fn install_bridge(
     );
 
     spawn_app_server_client_capture(websocket_url, generation.clone());
+    spawn_external_api_quota_gate(websocket_url, generation.clone());
 
     let mut pending_calls = FuturesUnordered::new();
     session.enqueue_binding_calls(&mut pending_calls);
@@ -546,13 +770,30 @@ pub async fn install_bridge(
                         Ok(None) | Err(_) => break,
                     }
                 }
+                // 不依赖 socket 消息也能发现 generation 过期：旧会话最多
+                // 一个轮询间隔内主动退出，避免失效场景下会话无限堆积。
+                _ = tokio::time::sleep(BRIDGE_GENERATION_POLL_INTERVAL) => {}
             }
         }
+        session
+            .remove_registered_scripts(&registered_script_ids)
+            .await;
         session.close().await;
         release_bridge_generation(&generation);
     });
 
     Ok(())
+}
+
+fn collect_script_identifier(response: &Value, identifiers: &mut Vec<String>) {
+    if let Some(identifier) = response
+        .get("result")
+        .and_then(|result| result.get("identifier"))
+        .and_then(Value::as_str)
+        && !identifier.is_empty()
+    {
+        identifiers.push(identifier.to_string());
+    }
 }
 
 pub fn runtime_evaluate_params(script: &str) -> Value {
@@ -651,6 +892,18 @@ where
     async fn close(&mut self) {
         let _ = self.socket.send(Message::Close(None)).await;
         let _ = self.socket.close().await;
+    }
+
+    async fn remove_registered_scripts(&mut self, identifiers: &[String]) {
+        for identifier in identifiers {
+            let _ = self
+                .send_command_without_wait(
+                    next_message_id(),
+                    "Page.removeScriptToEvaluateOnNewDocument",
+                    json!({ "identifier": identifier }),
+                )
+                .await;
+        }
     }
 
     async fn send_command(

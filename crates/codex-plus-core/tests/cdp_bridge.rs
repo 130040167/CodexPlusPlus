@@ -610,13 +610,227 @@ fn official_login_usage_alert_setting_controls_renderer_injection() {
 }
 
 #[test]
-fn usage_alert_hider_uses_sidebar_semantics_instead_of_percentage_copy() {
+fn usage_status_rewrite_targets_the_main_rate_limit_cache() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("officialUsageAlertCards"));
-    assert!(script.contains("progress[max=\"100\"]"));
-    assert!(script.contains("dismiss usage alert|关闭使用量提醒"));
-    assert!(script.contains("codexPlusUsageAlertHidden"));
+    assert!(script.contains("function syncOfficialUsagePolicy"));
+    assert!(script.contains("image_generation_limit_reached"));
+    assert!(script.contains("queryKey[1] !== \"image-generation\""));
+    assert!(!script.contains("officialUsageAlertCards"));
+    assert!(!script.contains("codex-plus-hide-usage-alert"));
+    assert!(!script.contains("refreshOfficialUsageAlertVisibility"));
+}
+
+#[test]
+fn official_usage_status_unlocks_every_official_login_and_hides_alerts_only_when_enabled() {
+    let cases = run_official_usage_status_harness();
+
+    assert_eq!(cases["pureApiAllowed"], false);
+    assert_eq!(cases["pureApiWarning"], "low");
+    assert_eq!(cases["officialAllowed"], true);
+    assert_eq!(cases["officialMixAllowed"], true);
+    assert_eq!(cases["officialWarning"], "low");
+    assert!(cases["officialModelPicker"].is_null());
+    assert!(cases["hiddenTextUpsell"].is_null());
+    assert_eq!(cases["officialPercent"], 100);
+    assert!(cases["hiddenWarning"].is_null());
+    assert_eq!(cases["hiddenAllowed"], true);
+    assert_eq!(cases["hiddenPercent"], 100);
+    assert_eq!(cases["hiddenResetAt"], 1_700_000_000);
+    assert_eq!(cases["hiddenImageUpsell"], "image_generation_limit_reached");
+    assert!(cases["hiddenModelPicker"].is_null());
+    assert_eq!(cases["hiddenSpendReached"], true);
+    assert_eq!(cases["hiddenCredits"], false);
+    assert_eq!(cases["streamAllowed"], true);
+    assert_eq!(cases["streamId"], "stream-1");
+    assert_eq!(cases["unrelatedAllowed"], false);
+    assert!(cases["openUnchanged"].as_bool().unwrap());
+    assert_eq!(cases["imageQueryAllowed"], false);
+    assert_eq!(cases["mainQueryAllowed"], true);
+    assert!(cases["mainQueryWarning"].is_null());
+    assert_eq!(cases["mainQueryPercent"], 100);
+    assert_eq!(cases["invalidatedMain"], 1);
+    assert_eq!(cases["invalidatedImage"], 0);
+    assert_eq!(cases["imageKeyIgnored"], true);
+    assert_eq!(cases["plainKeyMatched"], true);
+    assert_eq!(cases["scopedKeyMatched"], true);
+}
+
+fn run_official_usage_status_harness() -> serde_json::Value {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let script_path = temp.path().join("renderer-inject.js");
+    let harness_path = temp.path().join("usage-status-harness.cjs");
+    std::fs::write(&script_path, assets::injection_script(57321))
+        .expect("injection script should be written");
+    let mut harness = std::fs::File::create(&harness_path).expect("harness should be created");
+    write!(
+        harness,
+        r#"
+const scriptPath = {script_path};
+function node() {{
+  return {{
+    appendChild() {{}}, prepend() {{}}, remove() {{}}, setAttribute() {{}}, removeAttribute() {{}},
+    addEventListener() {{}}, querySelector() {{ return null; }}, querySelectorAll() {{ return []; }},
+    closest() {{ return null; }}, getAttribute() {{ return null; }},
+    classList: {{ add() {{}}, remove() {{}}, toggle() {{}}, contains() {{ return false; }} }},
+    dataset: {{}}, style: {{}}, children: [], isConnected: true, textContent: "", innerHTML: "",
+  }};
+}}
+globalThis.window = globalThis;
+window.__CODEX_PLUS_TEST_RATE_LIMIT_UNLOCK__ = true;
+window.addEventListener = () => {{}};
+window.removeEventListener = () => {{}};
+window.dispatchEvent = () => true;
+globalThis.MutationObserver = class {{ observe() {{}} disconnect() {{}} }};
+globalThis.ResizeObserver = class {{ observe() {{}} disconnect() {{}} }};
+globalThis.IntersectionObserver = class {{ observe() {{}} disconnect() {{}} }};
+globalThis.requestAnimationFrame = (callback) => setTimeout(callback, 0);
+globalThis.cancelAnimationFrame = (id) => clearTimeout(id);
+globalThis.document = {{
+  scripts: [], documentElement: node(), body: node(), createElement: () => node(),
+  getElementById: () => null, querySelector: () => null, querySelectorAll: () => [],
+  addEventListener() {{}}, removeEventListener() {{}},
+}};
+globalThis.localStorage = {{ getItem: () => null, setItem() {{}}, removeItem() {{}} }};
+globalThis.location = {{ href: "app://-/index.html", pathname: "/", search: "", hash: "" }};
+window.location = globalThis.location;
+globalThis.navigator = {{ userAgent: "node-test" }};
+globalThis.performance = {{ getEntriesByType: () => [] }};
+require(scriptPath);
+const api = window.__codexPlusRateLimitUnlockTest;
+if (!api) throw new Error("usage status test api missing");
+
+const status = () => ({{
+  plan_type: "plus",
+  user_id: "user-1",
+  account_id: "acct-1",
+  rate_limit_reached_type: {{ type: "rate_limit_reached" }},
+  sidebar_usage_warnings: {{ default: {{ title: "low" }} }},
+  rate_limit_warning: {{ title: "low" }},
+  rate_limit_upsell: {{ banner_type: "image_generation_limit_reached", title: "image" }},
+  model_picker_upsell: {{ title: "picker" }},
+  spend_control: {{ reached: true }},
+  credits: {{ has_credits: false }},
+  rate_limit: {{
+    allowed: false,
+    limit_reached: true,
+    primary_window: {{ used_percent: 100, reset_at: 1700000000 }},
+  }},
+}});
+const profile = (relayMode, officialMixApiKey) => ({{
+  relayProfilesEnabled: true,
+  activeRelayId: "active",
+  relayProfiles: [{{ id: "active", relayMode, officialMixApiKey }}],
+}});
+const warningTitle = (value) => value?.rate_limit_warning?.title ?? null;
+
+api.setBackendSettings(profile("pureApi", true));
+api.setHideAlerts(true);
+const pureApi = api.rewrite(status());
+
+api.setBackendSettings(profile("official", false));
+api.setHideAlerts(false);
+const official = api.rewrite(status());
+api.setBackendSettings(profile("official", true));
+const officialMix = api.rewrite(status());
+api.setHideAlerts(true);
+const hidden = api.rewrite(status());
+const textBanner = api.rewrite({{
+  ...status(),
+  rate_limit_upsell: {{ banner_type: "plus_rate_limit_reached", title: "upgrade" }},
+}});
+const stream = api.rewrite({{ stream_id: "stream-1", usage: status() }});
+const unrelated = api.rewrite({{ ok: true, allowed: false }});
+const openStatus = {{
+  plan_type: "plus",
+  user_id: "user-1",
+  account_id: "acct-1",
+  rate_limit: {{ allowed: true, limit_reached: false, primary_window: {{ used_percent: 12, reset_at: 10 }} }},
+}};
+const openUnchanged = api.rewrite(openStatus) === openStatus;
+
+let invalidatedMain = 0;
+let invalidatedImage = 0;
+const queries = [
+  {{ queryKey: ["rate-limit-status", "user-1", "acct-1"], state: {{ data: status() }} }},
+  {{ queryKey: ["rate-limit-status", "image-generation", "sig"], state: {{ data: status() }} }},
+];
+const client = {{
+  getQueryCache() {{
+    return {{
+      findAll() {{ return queries; }},
+      subscribe() {{ return () => {{}}; }},
+    }};
+  }},
+  setQueryData(queryKey, updater) {{
+    const query = queries.find((item) => JSON.stringify(item.queryKey) === JSON.stringify(queryKey));
+    if (!query) return;
+    query.state.data = typeof updater === "function" ? updater(query.state.data) : updater;
+  }},
+  invalidateQueries(filter) {{
+    const key = filter?.queryKey || [];
+    if (key[1] === "image-generation") invalidatedImage += 1;
+    else invalidatedMain += 1;
+  }},
+}};
+window.__REACT_QUERY_CLIENT__ = client;
+api.setBackendSettings(profile("official", false));
+api.setHideAlerts(true);
+api.install();
+api.setBackendSettings(profile("pureApi", false));
+api.setHideAlerts(false);
+api.install();
+
+console.log(JSON.stringify({{
+  pureApiAllowed: pureApi.rate_limit.allowed,
+  pureApiWarning: warningTitle(pureApi),
+  officialAllowed: official.rate_limit.allowed,
+  officialMixAllowed: officialMix.rate_limit.allowed,
+  officialWarning: warningTitle(official),
+  officialModelPicker: official.model_picker_upsell,
+  hiddenTextUpsell: textBanner.rate_limit_upsell,
+  officialPercent: official.rate_limit.primary_window.used_percent,
+  hiddenWarning: warningTitle(hidden),
+  hiddenAllowed: hidden.rate_limit.allowed,
+  hiddenPercent: hidden.rate_limit.primary_window.used_percent,
+  hiddenResetAt: hidden.rate_limit.primary_window.reset_at,
+  hiddenImageUpsell: hidden.rate_limit_upsell?.banner_type ?? null,
+  hiddenModelPicker: hidden.model_picker_upsell,
+  hiddenSpendReached: hidden.spend_control.reached,
+  hiddenCredits: hidden.credits.has_credits,
+  streamAllowed: stream.usage.rate_limit.allowed,
+  streamId: stream.stream_id,
+  unrelatedAllowed: unrelated.allowed,
+  openUnchanged,
+  imageQueryAllowed: queries[1].state.data.rate_limit.allowed,
+  mainQueryAllowed: queries[0].state.data.rate_limit.allowed,
+  mainQueryWarning: warningTitle(queries[0].state.data),
+  mainQueryPercent: queries[0].state.data.rate_limit.primary_window.used_percent,
+  invalidatedMain,
+  invalidatedImage,
+  imageKeyIgnored: api.isRateLimitQueryKey(["rate-limit-status", "image-generation"]) === false,
+  plainKeyMatched: api.isRateLimitQueryKey(["rate-limit-status"]) === true,
+  scopedKeyMatched: api.isRateLimitQueryKey(["rate-limit-status", "user-1", "acct-1"]) === true,
+}}));
+process.exit(0);
+"#,
+        script_path = serde_json::to_string(&script_path.to_string_lossy().to_string())
+            .expect("script path should serialize")
+    )
+    .expect("harness should be written");
+    drop(harness);
+
+    let output = Command::new("node")
+        .arg(&harness_path)
+        .output()
+        .expect("node should run official usage status harness");
+    assert!(
+        output.status.success(),
+        "node harness failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("harness stdout should be JSON")
 }
 
 #[test]
@@ -4208,6 +4422,7 @@ fn injection_script_restores_thread_scroll_positions() {
     assert!(script.contains("codexThreadScroll"));
     assert!(script.contains("installThreadScrollRouteHooks"));
     assert!(script.contains("scheduleThreadScrollSync"));
+    assert!(script.contains("localStorage.removeItem(codexThreadScrollKey)"));
 }
 
 #[test]
@@ -4372,6 +4587,7 @@ fn bridge_health_check_script_uses_persisted_real_probe_result() {
     assert!(script.contains("__codexPlusBridgeHealth"));
     assert!(script.contains("lastSuccessAt"));
     assert!(script.contains("lastInjectionAt"));
+    assert!(script.contains("lastAttemptAt"));
     assert!(!script.contains("/backend/status"));
 }
 
@@ -4393,6 +4609,8 @@ if (run({{ lastInjectionAt: 0, lastSuccessAt: now }}) !== true) process.exit(2);
 if (run({{ lastInjectionAt: now, lastSuccessAt: 0 }}) !== true) process.exit(3);
 if (run({{ lastInjectionAt: now - 6000, lastSuccessAt: 0 }}) !== false) process.exit(4);
 if (run({{ lastInjectionAt: 1, lastSuccessAt: now - 16000 }}) !== false) process.exit(5);
+if (run({{ lastInjectionAt: 0, lastSuccessAt: 0, lastAttemptAt: now }}) !== true) process.exit(7);
+if (run({{ lastInjectionAt: 1, lastSuccessAt: now - 16000, lastAttemptAt: now - 16000 }}) !== false) process.exit(8);
 if (run({{ lastInjectionAt: now, lastSuccessAt: now }}, false) !== false) process.exit(6);
 "#,
         script = script
@@ -5450,6 +5668,106 @@ async fn superseded_bridge_session_stops_answering_binding_calls() {
         .expect("fresh server task should finish without panicking");
 }
 
+/// 被顶替的旧会话不能依赖"socket 再收到消息"来发现 generation 过期：
+/// bridge 失效场景下旧 socket 不会再有任何消息（binding 事件只投递给最新会话），
+/// 旧会话必须靠 generation 轮询在一个间隔内主动关闭，否则会带着
+/// Runtime.enable 订阅与脚本注册无限期滞留（issue #2169 的会话堆积来源）。
+#[tokio::test]
+async fn superseded_bridge_session_closes_socket_without_incoming_messages() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener should bind");
+    let address = listener.local_addr().expect("listener should have address");
+    let url = websocket_url(address);
+    let (stale_closed_tx, stale_closed_rx) = oneshot::channel();
+    let (fresh_alive_tx, fresh_alive_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let (stale_stream, _) = listener
+            .accept()
+            .await
+            .expect("stale client should connect");
+        let mut stale = accept_async(stale_stream)
+            .await
+            .expect("stale websocket should upgrade");
+        acknowledge_bridge_install(&mut stale).await;
+
+        let (fresh_stream, _) = listener
+            .accept()
+            .await
+            .expect("fresh client should connect");
+        let mut fresh = accept_async(fresh_stream)
+            .await
+            .expect("fresh websocket should upgrade");
+        acknowledge_bridge_install(&mut fresh).await;
+
+        // 旧会话会先移除自己注册的 new-document 脚本，再由 generation 轮询关闭 socket。
+        let stale_cleanup = tokio::time::timeout(
+            bridge::BRIDGE_GENERATION_POLL_INTERVAL + Duration::from_millis(1500),
+            async {
+                let mut removed = false;
+                loop {
+                    match recv_text_message(&mut stale).await {
+                        Some(text) => {
+                            let message: serde_json::Value = serde_json::from_str(&text)
+                                .expect("bridge cleanup message should be JSON");
+                            if message["method"] == "Page.removeScriptToEvaluateOnNewDocument" {
+                                removed = true;
+                            }
+                        }
+                        None => break removed,
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap_or(false);
+        let _ = stale_closed_tx.send(stale_cleanup);
+
+        // 新会话不受影响，仍应正常应答 binding 调用。
+        send_json(
+            &mut fresh,
+            json!({
+                "method": "Runtime.bindingCalled",
+                "params": {
+                    "payload": serde_json::to_string(&json!({
+                        "id": "fresh",
+                        "path": "/backend/status",
+                        "payload": {},
+                    })).unwrap(),
+                },
+            }),
+        )
+        .await;
+        let fresh_resolved = tokio::time::timeout(Duration::from_secs(2), recv_text_message(&mut fresh))
+            .await
+            .is_ok_and(|message| {
+                message.is_some_and(|text| text.contains("__codexSessionDeleteResolve"))
+            });
+        let _ = fresh_alive_tx.send(fresh_resolved);
+    });
+
+    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+        .await
+        .expect("first bridge install should succeed");
+    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+        .await
+        .expect("second bridge install should succeed");
+
+    assert!(
+        stale_closed_rx
+            .await
+            .expect("stale server task should finish without panicking"),
+        "superseded session must close its socket without any incoming message"
+    );
+    assert!(
+        fresh_alive_rx
+            .await
+            .expect("fresh server task should finish without panicking"),
+        "fresh session must keep resolving bridge requests"
+    );
+}
+
 #[tokio::test]
 async fn failed_bridge_reinstall_keeps_existing_session_current() {
     let (url, active_rx, failed_rx) = spawn_failed_reinstall_cdp_server().await;
@@ -5609,7 +5927,12 @@ async fn acknowledge_bridge_install(socket: &mut TestSocket) {
     for expected_id in 1..=5 {
         let command = recv_json(socket).await;
         assert_eq!(command["id"], expected_id);
-        send_json(socket, json!({ "id": expected_id, "result": {} })).await;
+        let result = if expected_id == 4 {
+            json!({ "identifier": "bridge-script-test" })
+        } else {
+            json!({})
+        };
+        send_json(socket, json!({ "id": expected_id, "result": result })).await;
     }
 }
 

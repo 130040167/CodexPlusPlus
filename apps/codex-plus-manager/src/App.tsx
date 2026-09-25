@@ -114,6 +114,7 @@ import {
 } from "./model-windows";
 import { clampAggregateRoutePriority, normalizeAggregateRoutes, validateAggregateRoutes } from "./aggregate-routes";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
+import { relayHeadersValidationMessage, serializeRelayHeaders } from "./relay-headers";
 import { resolveProviderName } from "./provider-name";
 import {
   providerSyncStreamPercent,
@@ -372,6 +373,7 @@ export type RelayProfile = {
   vlmModel: string;
   vlmBaseUrl: string;
   userAgent: string;
+  customHeaders: { key: string; value: string }[];
   sub2apiEnabled: boolean;
   sub2apiMultiplier: string;
   noAuth: boolean;
@@ -1110,6 +1112,7 @@ const defaultSettings: BackendSettings = {
       vlmModel: "",
       vlmBaseUrl: "",
       userAgent: "",
+      customHeaders: [],
       sub2apiEnabled: false,
       noAuth: false,
       sub2apiMultiplier: "",
@@ -1355,6 +1358,15 @@ export function App() {
       setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
     }
     return result;
+  };
+
+  const reloadUserScripts = async () => {
+    const result = await run(() => call<SettingsResult>("reload_user_scripts"));
+    if (result) {
+      setSettings(result);
+      setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
+      showResultNotice(t("本地脚本"), result);
+    }
   };
 
   const installMarketScript = async (id: string) => {
@@ -3437,6 +3449,7 @@ export function App() {
       refreshAds,
       refreshScriptMarket,
       refreshUserScriptInventory,
+      reloadUserScripts,
       installMarketScript,
       setUserScriptEnabled,
       deleteUserScript,
@@ -3861,6 +3874,7 @@ type Actions = {
   refreshAds: () => Promise<void>;
   refreshScriptMarket: () => Promise<void>;
   refreshUserScriptInventory: () => Promise<SettingsResult | null>;
+  reloadUserScripts: () => Promise<void>;
   installMarketScript: (id: string) => Promise<void>;
   setUserScriptEnabled: (key: string, enabled: boolean) => Promise<void>;
   deleteUserScript: (key: string) => Promise<void>;
@@ -6100,6 +6114,16 @@ function ZedRemoteProjectSection({
 }
 
 function UserScriptsScreen({ settings, market, actions }: { settings: SettingsResult | null; market: ScriptMarketResult | null; actions: Actions }) {
+  const [reloading, setReloading] = useState(false);
+  const reload = async () => {
+    if (reloading) return;
+    setReloading(true);
+    try {
+      await actions.reloadUserScripts();
+    } finally {
+      setReloading(false);
+    }
+  };
   const inventory = settings?.user_scripts;
   const scripts = inventory?.scripts ?? [];
   const marketScripts = market?.market.scripts ?? [];
@@ -6147,6 +6171,10 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
             <Button onClick={() => void actions.refreshCurrent()} variant="secondary">
               <RefreshCw className="h-4 w-4" />
               {t("刷新本地")}
+            </Button>
+            <Button onClick={() => void reload()} disabled={reloading} variant="secondary" title={t("应用本地脚本及开关；旧脚本可能需要刷新 Codex 页面")}>
+              <RefreshCw className={reloading ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
+              {t("热重载脚本")}
             </Button>
           </Toolbar>
         </CardContent>
@@ -7435,6 +7463,7 @@ function RelayProfileDetail({
       ? aggregateRelayProfileValidation(draft)
       : relayModelRoutesSettingsValidation(validationSettings));
   const modelRowsError = modelWindowRowsValidationMessage(modelWindowRowsValidationError(modelWindowRows));
+  const customHeadersError = relayHeadersValidationMessage(profile.customHeaders || []);
   const draftWithModelRows = () => {
     const serializedRows = serializeModelWindowRows(modelWindowRows);
     const validSlugs = serializedRows.modelList.split("\n").map((slug) => slug.trim()).filter(Boolean);
@@ -7444,6 +7473,7 @@ function RelayProfileDetail({
       modelWindows: serializedRows.modelWindows,
       modelAutoCompact: serializedRows.modelAutoCompact,
       modelMetadata: retainModelMetadataForSlugs(draft.modelMetadata, validSlugs),
+      customHeaders: serializeRelayHeaders(draft.customHeaders || []),
       modelVlm: serializedRows.modelVlm,
     };
   };
@@ -7840,6 +7870,7 @@ function RelayProfileEditor({
     setModelWindowRows([...modelWindowRows, { model: "", window: "", autoCompact: "", imageHandling: "" }]);
   };
   const modelRowsError = modelWindowRowsValidationMessage(modelWindowRowsValidationError(modelWindowRows));
+  const customHeadersError = relayHeadersValidationMessage(profile.customHeaders || []);
   const fetchSub2ApiRate = async () => {
     const result = await actions.fetchSub2ApiBilling(deriveRelayProfileFromFiles(profile));
     if (!result) return;
@@ -7914,7 +7945,7 @@ function RelayProfileEditor({
               <span>{t("关闭官方低额度提示")}</span>
             </label>
             <p className="field-hint">
-              {t("关闭后仍可从 Codex 左下角账户菜单查看官方剩余额度。")}
+              {t("只隐藏低额度和已用完提示，不改变发送限制。左下角账户菜单仍显示官方剩余额度。")}
             </p>
           </Field>
         ) : null}
@@ -8434,6 +8465,73 @@ function RelayProfileEditor({
               onChange={(event) => updateDraft({ userAgent: event.currentTarget.value })}
               placeholder={t("留空使用默认值")}
             />
+          </Field>
+        ) : null}
+        {showApiFields ? (
+          <Field className="relay-field-custom-headers" label={t("自定义请求头")}>
+            <div className="relay-custom-headers">
+              {(profile.customHeaders || []).map((row, index) => (
+                <div className="relay-custom-header-row" key={`custom-header-${index}`}>
+                  <Input
+                    aria-label={t("请求头名称")}
+                    value={row.key}
+                    onChange={(event) => {
+                      const next = (profile.customHeaders || []).slice();
+                      next[index] = { ...next[index], key: event.currentTarget.value };
+                      updateDraft({ customHeaders: next });
+                    }}
+                    placeholder="X-Tenant"
+                  />
+                  <Input
+                    aria-label={t("请求头值")}
+                    value={row.value}
+                    onChange={(event) => {
+                      const next = (profile.customHeaders || []).slice();
+                      next[index] = { ...next[index], value: event.currentTarget.value };
+                      updateDraft({ customHeaders: next });
+                    }}
+                    placeholder={t("请求头值")}
+                  />
+                  <Button
+                    aria-label={t("删除这一项")}
+                    onClick={() =>
+                      updateDraft({
+                        customHeaders: (profile.customHeaders || []).filter((_, i) => i !== index),
+                      })
+                    }
+                    size="sm"
+                    type="button"
+                    variant="secondary"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
+              ))}
+              <div className="relay-custom-headers-actions">
+                <Button
+                  onClick={() =>
+                    updateDraft({
+                      customHeaders: [...(profile.customHeaders || []), { key: "", value: "" }],
+                    })
+                  }
+                  size="sm"
+                  type="button"
+                  variant="secondary"
+                >
+                  <Plus className="h-4 w-4" />
+                  {t("添加请求头")}
+                </Button>
+              </div>
+              <span className="hint-line">
+                {t("自定义请求头会同时用于测试连接、模型列表与实际代理请求。")}
+              </span>
+              <span className="hint-line">
+                {t("Host、Content-Length 等传输头由协议层掌控，不能覆盖；配置 Authorization 时以它为准，不再注入 API Key。")}
+              </span>
+              {customHeadersError ? (
+                <span className="hint-line relay-custom-headers-error">{customHeadersError}</span>
+              ) : null}
+            </div>
           </Field>
         ) : null}
       </div>
@@ -11145,6 +11243,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             vlmModel: "",
             vlmBaseUrl: "",
             userAgent: "",
+            customHeaders: [],
             sub2apiEnabled: false,
             noAuth: false,
             sub2apiMultiplier: "",
@@ -11283,6 +11382,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     modelMetadata: profile.modelMetadata || "",
     modelRoutes: relayMode === "official" && !officialMixApiKey ? [] : normalizeRelayModelRoutes(profile.modelRoutes),
     userAgent: profile.userAgent || "",
+    customHeaders: profile.customHeaders || [],
     sub2apiEnabled: profile.noAuth ? false : profile.sub2apiEnabled === true,
     sub2apiMultiplier: !profile.noAuth && profile.sub2apiEnabled === true ? profile.sub2apiMultiplier || "" : "",
     standardOpenaiProtocol: profile.standardOpenaiProtocol === true,
@@ -12089,6 +12189,7 @@ function createRelayProfile(settings: BackendSettings): RelayProfile {
     vlmModel: "",
     vlmBaseUrl: "",
     userAgent: "",
+    customHeaders: [],
     sub2apiEnabled: false,
     noAuth: false,
     sub2apiMultiplier: "",
@@ -12132,6 +12233,7 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
       vlmModel: "",
       vlmBaseUrl: "",
       userAgent: "",
+      customHeaders: [],
       sub2apiEnabled: false,
       noAuth: false,
       sub2apiMultiplier: "",

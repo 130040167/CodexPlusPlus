@@ -84,6 +84,7 @@ async fn launcher_main(args: Vec<String>, helper_only: bool, options: LaunchOpti
         hooks.shutdown_helper(options.helper_port).await;
         return Ok(());
     }
+    ensure_weixin_manager_started();
     let Some(_guard) = acquire_single_instance_guard(options.debug_port)? else {
         activate_existing_codex_app(&options).await?;
         options.status_store.save_latest(&LaunchStatus {
@@ -154,6 +155,42 @@ fn current_timestamp_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn ensure_weixin_manager_started() {
+    let result = (|| -> anyhow::Result<()> {
+        let settings = codex_plus_core::settings::SettingsStore::default().load()?;
+        if should_start_weixin_manager(settings.weixin_connect_enabled, &settings.weixin_connect_token) {
+            codex_plus_core::install::spawn_companion(
+                codex_plus_core::install::MANAGER_BINARY,
+                ["--background"],
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.weixin_manager_start_failed",
+            serde_json::json!({ "error": error.to_string() }),
+        );
+    }
+}
+
+fn should_start_weixin_manager(enabled: bool, token: &str) -> bool {
+    enabled && !token.trim().is_empty()
+}
+
+#[cfg(test)]
+mod weixin_startup_tests {
+    use super::should_start_weixin_manager;
+
+    #[test]
+    fn only_enabled_and_authenticated_connections_start_manager() {
+        assert!(should_start_weixin_manager(true, "test-token"));
+        assert!(!should_start_weixin_manager(false, "test-token"));
+        assert!(!should_start_weixin_manager(true, ""));
+        assert!(!should_start_weixin_manager(true, "   "));
+    }
 }
 
 fn acquire_single_instance_guard(
@@ -330,7 +367,7 @@ async fn notify_manager_when_update_available() -> anyhow::Result<bool> {
 fn open_manager_with_update_prompt() -> anyhow::Result<()> {
     codex_plus_core::install::spawn_companion(
         codex_plus_core::install::MANAGER_BINARY,
-        ["--show-update"],
+        ["--show-update", "--background"],
     )
     .map(|_| ())
     .map_err(|error| anyhow::anyhow!("启动管理工具失败：{error}"))
@@ -915,13 +952,24 @@ impl BridgeRuntimeService for LauncherRuntimeService {
         self.user_scripts.inventory()
     }
 
+    async fn load_user_scripts(&self) -> anyhow::Result<Value> {
+        let websocket_url = self
+            .websocket_url
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Codex 页面尚未连接"))?;
+        codex_plus_core::user_scripts::load_scripts_at(&websocket_url, &self.user_scripts).await
+    }
+
     async fn reload_user_scripts(&self) -> anyhow::Result<Value> {
-        let bundle = self.user_scripts.build_enabled_bundle()?;
-        let websocket_url = self.websocket_url.lock().unwrap().clone();
-        if let Some(websocket_url) = websocket_url.filter(|_| !bundle.trim().is_empty()) {
-            codex_plus_core::bridge::evaluate_script(&websocket_url, &bundle).await?;
-        }
-        self.user_scripts.inventory()
+        let websocket_url = self
+            .websocket_url
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Codex 页面尚未连接"))?;
+        codex_plus_core::user_scripts::reload_scripts_at(&websocket_url, &self.user_scripts).await
     }
 
     async fn open_devtools(&self) -> anyhow::Result<Value> {
@@ -1095,15 +1143,10 @@ async fn try_inject_with_context(
         .load()
         .unwrap_or_default();
     let script = codex_plus_core::assets::injection_script_with_settings(helper_port, &settings);
-    let user_bundle = runtime
-        .user_scripts
-        .build_enabled_bundle()
-        .unwrap_or_default();
-    let new_document_scripts = if user_bundle.is_empty() {
-        vec![script]
-    } else {
-        vec![script, user_bundle]
-    };
+    let new_document_scripts = vec![
+        script,
+        codex_plus_core::user_scripts::BOOTSTRAP_SCRIPT.to_string(),
+    ];
     codex_plus_core::bridge::install_bridge(
         websocket_url,
         codex_plus_core::bridge::BRIDGE_BINDING_NAME,

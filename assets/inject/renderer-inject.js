@@ -191,7 +191,10 @@
       try {
         if (window.sessionStorage.getItem(localeReloadStorageKey) === marker) return;
         window.sessionStorage.setItem(localeReloadStorageKey, marker);
+        // 标记写不进去就不要刷新，否则下次加载读不到标记，会再次刷新。
+        if (window.sessionStorage.getItem(localeReloadStorageKey) !== marker) return;
       } catch {
+        return;
       }
       window.location.reload();
     };
@@ -407,7 +410,7 @@
   const zedRemoteOpenInMenuVersion = "1";
   const zedRemoteOpenInMenuActivationWindowMs = 600;
   const styleId = "codex-delete-style";
-  const codexDeleteStyleVersion = "17";
+  const codexDeleteStyleVersion = "20";
   const codexPlusMenuId = "codex-plus-menu";
   const codexPlusMenuFloatingClass = "codex-plus-menu-floating";
   const codexPlusSidebarNavId = "codex-plus-sidebar-nav";
@@ -831,7 +834,6 @@
         pointer-events: none;
         white-space: nowrap;
       }
-      [data-codex-plus-usage-alert-hidden="true"] { display: none !important; }
       .codex-archive-delete-all {
         border: 1px solid var(--color-border-danger, #dc2626);
         border-radius: var(--border-radius-sm, 6px);
@@ -957,6 +959,7 @@
       .codex-plus-backend-indicator[data-status="ok"] { background: var(--codex-plus-success); }
       .codex-plus-backend-indicator[data-status="failed"] { background: var(--codex-plus-danger); }
       .codex-plus-backend-indicator[data-status="checking"] { background: var(--codex-plus-warning); }
+      .codex-plus-backend-indicator[data-status="degraded"] { background: var(--codex-plus-warning); }
       #${codexPlusSidebarNavId} {
         position: relative;
         flex: 0 0 auto;
@@ -1191,6 +1194,7 @@
       .codex-plus-backend-label { color: #a1a1aa; font-size: 12px; }
       .codex-plus-backend-label[data-status="ok"] { color: #34d399; }
       .codex-plus-backend-label[data-status="failed"] { color: #f87171; }
+      .codex-plus-backend-label[data-status="degraded"] { color: #fbbf24; }
       .codex-plus-user-script-warning { margin-top: 4px; color: #fbbf24; font-size: 12px; }
       .codex-plus-user-script-dirs { margin-top: 6px; color: #a1a1aa; font-size: 11px; line-height: 1.4; word-break: break-all; }
       .codex-plus-user-script-list { margin-top: 8px; display: grid; gap: 6px; }
@@ -1370,6 +1374,8 @@
       .codex-plus-backend-indicator[data-status="failed"] { background: var(--codex-plus-danger); }
       #${codexPlusSidebarNavId} .codex-plus-sidebar-nav-status[data-status="checking"],
       .codex-plus-backend-indicator[data-status="checking"] { background: var(--codex-plus-warning); }
+      #${codexPlusSidebarNavId} .codex-plus-sidebar-nav-status[data-status="degraded"],
+      .codex-plus-backend-indicator[data-status="degraded"] { background: var(--codex-plus-warning); }
       .${codexServiceTierBadgeClass} {
         height: 24px;
         border-color: var(--codex-plus-border);
@@ -1393,6 +1399,7 @@
       .codex-plus-ad-empty { border-color: var(--codex-plus-border); border-radius: var(--border-radius-lg, 8px); color: var(--codex-plus-text-tertiary); }
       .codex-plus-form-message[data-status="ok"], .codex-plus-service-tier-status[data-status="ok"], .codex-plus-backend-label[data-status="ok"] { color: var(--codex-plus-success); }
       .codex-plus-form-message[data-status="failed"], .codex-plus-service-tier-status[data-status="failed"], .codex-plus-backend-label[data-status="failed"], .codex-plus-user-script-error { color: var(--codex-plus-danger); }
+      .codex-plus-backend-label[data-status="degraded"] { color: var(--codex-plus-warning); }
       .codex-plus-form-message[data-status="loading"], .codex-plus-service-tier-status[data-status="unsupported"], .codex-plus-user-script-warning, .codex-plus-model-compat-warning { color: var(--codex-plus-warning); }
     `;
     document.documentElement.appendChild(style);
@@ -2513,7 +2520,7 @@
     const urls = codexAppAssetCandidateUrls();
     const preferred = urls.filter((url) => {
       const name = (url.split("/").pop() || "").toLowerCase();
-      return /use-host-config|app-server-manager-signals|app-initial|app-main|page-|chatg|signals|server-manager|gwqc41kz|c1urrgy0|hsvsqcnf/.test(name);
+      return /use-host-config|app-server-manager-signals|app-initial|app-main|page-|chatg|signals|server-manager/.test(name);
     });
     // Prefer known request-client modules, then the larger application bundles.
     preferred.sort((left, right) => {
@@ -2521,7 +2528,6 @@
         const name = (url.split("/").pop() || "").toLowerCase();
         if (name.includes("use-host-config")) return 0;
         if (name.includes("app-server-manager-signals")) return 1;
-        if (name.includes("gwqc41kz") || name.includes("c1urrgy0") || name.includes("hsvsqcnf")) return 2;
         if (name.includes("app-initial") && name.includes("app-main")) return 3;
         if (name.includes("app-main")) return 4;
         return 5;
@@ -3873,7 +3879,32 @@
       void loadCodexModelCatalog();
     }
     refreshCodexPlusBackendToggles();
+    if (loaded) syncOfficialUsagePolicy();
+    if (loaded) void installExternalApiQuotaGate();
     return loaded;
+  }
+
+  let externalApiQuotaGateAttempted = false;
+  async function installExternalApiQuotaGate() {
+    window.__codexPlusExternalApiQuotaAllowed = (hostId) =>
+      codexPlusBackendSettingsLoaded
+      && window.__codexPlusApiQuotaGate?.permitsExternalApi(codexPlusBackendSettings, hostId) === true;
+    if (externalApiQuotaGateAttempted || !window.__codexPlusApiQuotaGate) return;
+    externalApiQuotaGateAttempted = true;
+    try {
+      const url = codexAppAssetUrl("app-primary-") || await codexAppAssetUrlFromScriptText("app-primary-");
+      if (!url) return;
+      const response = await fetch(url);
+      if (!response.ok) return;
+      const location = window.__codexPlusApiQuotaGate.locate(await response.text(), url);
+      if (!location) return;
+      window.__codexPlusApiQuotaBreakpoint = {
+        ...location,
+        condition: window.__codexPlusApiQuotaGate.condition(location),
+      };
+    } catch {
+      // 客户端结构变更时保留原始门禁，不循环扫描或强行启用按钮。
+    }
   }
 
   function loadBackendSettingsForStartup(attempt = 0) {
@@ -3895,8 +3926,11 @@
     try {
       const previousConversationView = !!codexPlusSettings().conversationView;
       const loaded = await loadBackendSettingsState();
-      if (loaded && previousConversationView !== !!codexPlusSettings().conversationView) {
-        refreshConversationView();
+      if (loaded) {
+        syncOfficialUsagePolicy();
+        if (previousConversationView !== !!codexPlusSettings().conversationView) {
+          refreshConversationView();
+        }
       }
     } finally {
       syncBackendSettingsInFlight = false;
@@ -3934,36 +3968,56 @@
   let codexPlusBackendCheckInFlight = false;
   let codexPlusBackendFailureCount = 0;
   const CODEX_PLUS_BACKEND_FAILURE_THRESHOLD = 3;
+  // 桥接通道（binding）与后端可用性分开统计：HTTP 回落成功会让后端状态保持绿色，
+  // 但桥接持续失败时必须把降级呈现出来，否则启动器侧的重注入修复循环对用户完全不可见（issue #2169）。
+  let codexPlusBridgeFailureCount = 0;
+  const CODEX_PLUS_BRIDGE_FAILURE_THRESHOLD = 3;
   const codexPlusBackendGeneration = (Number(window.__codexPlusBackendGeneration) || 0) + 1;
   window.__codexPlusBackendGeneration = codexPlusBackendGeneration;
 
-  function recordCodexPlusBridgeSuccess() {
+  function recordCodexPlusBridgeHealth(field) {
     if (codexPlusBackendGeneration !== window.__codexPlusBackendGeneration) return;
     const health = window.__codexPlusBridgeHealth || (window.__codexPlusBridgeHealth = {});
-    health.lastSuccessAt = Date.now();
+    health[field] = Date.now();
+  }
+
+  function recordCodexPlusBridgeSuccess() {
+    recordCodexPlusBridgeHealth("lastSuccessAt");
+    codexPlusBridgeFailureCount = 0;
+  }
+
+  function recordCodexPlusBridgeAttempt() {
+    recordCodexPlusBridgeHealth("lastAttemptAt");
+  }
+
+  function recordCodexPlusBridgeFailure() {
+    codexPlusBridgeFailureCount += 1;
   }
 
   function renderBackendStatus() {
-    const status = codexPlusBackendStatus.status || "failed";
+    const bridgeDegraded = codexPlusBridgeFailureCount >= CODEX_PLUS_BRIDGE_FAILURE_THRESHOLD;
+    const rawStatus = codexPlusBackendStatus.status || "failed";
+    const status = bridgeDegraded && rawStatus === "ok" ? "degraded" : rawStatus;
     if (codexPlusBackendStatus.version) {
       codexPlusVersion = codexPlusBackendStatus.version;
       document.querySelectorAll("[data-codex-plus-version]").forEach((node) => {
         node.textContent = `Codex++ ${codexPlusVersion}`;
       });
     }
+    const labelFallback = status === "ok" ? "后端已连接" : status === "degraded" ? "桥接降级，自动修复中" : status === "checking" ? "正在检查后端…" : "未连接";
     const label = document.querySelector("[data-codex-backend-status]");
     if (label) {
       label.dataset.status = status;
-      label.textContent = codexPlusBackendStatus.message || (status === "ok" ? "后端已连接" : "未连接");
+      label.textContent = status === "degraded" ? labelFallback : (codexPlusBackendStatus.message || labelFallback);
     }
     document.querySelectorAll("[data-codex-backend-indicator]").forEach((indicator) => {
       indicator.dataset.status = status;
-      indicator.title = status === "ok" ? "后端已连接" : status === "checking" ? "正在检查后端" : "未连接";
+      indicator.title = status === "ok" ? "后端已连接" : status === "degraded" ? "后端可达，桥接降级，正在自动修复" : status === "checking" ? "正在检查后端" : "未连接";
     });
     const sidebarStatus = document.querySelector(`#${codexPlusSidebarNavId} .codex-plus-sidebar-nav-status`);
     if (sidebarStatus) {
       sidebarStatus.dataset.status = status;
-      sidebarStatus.title = status === "ok" ? "后端已连接" : status === "checking" ? "正在检查后端" : "未连接";
+      sidebarStatus.title = status === "ok" ? "后端已连接" : status === "degraded" ? "后端可达，桥接降级，正在自动修复" : status === "checking" ? "正在检查后端" : "未连接";
     }
     refreshCodexServiceTierControls();
   }
@@ -3987,7 +4041,7 @@
         codexPlusBackendStatus = window.__codexPlusBackendStatus = nextStatus;
         if (typeof nextStatus.hideOfficialUsageAlert === "boolean") {
           window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = nextStatus.hideOfficialUsageAlert;
-          refreshOfficialUsageAlertVisibility();
+          syncOfficialUsagePolicy();
         }
         void syncBackendSettingsFromHeartbeat();
       } else {
@@ -5759,7 +5813,22 @@
         if (safeKey) pruned[safeKey] = value;
       });
     window.__codexThreadScrollEntries = pruned;
-    localStorage.setItem(codexThreadScrollKey, JSON.stringify({ version: codexThreadScrollVersion, entries: pruned }));
+    const payload = JSON.stringify({ version: codexThreadScrollVersion, entries: pruned });
+    try {
+      localStorage.setItem(codexThreadScrollKey, payload);
+    } catch {
+      // 本地存储配额已满时不能把异常抛到页面全局，否则滚动保存会把渲染进程打进刷新循环。
+      try {
+        const newestKey = Object.keys(pruned)[0];
+        const emergency = Object.create(null);
+        if (newestKey) emergency[newestKey] = pruned[newestKey];
+        window.__codexThreadScrollEntries = emergency;
+        localStorage.removeItem(codexThreadScrollKey);
+        localStorage.setItem(codexThreadScrollKey, JSON.stringify({ version: codexThreadScrollVersion, entries: emergency }));
+      } catch {
+        try { localStorage.removeItem(codexThreadScrollKey); } catch { /* 放弃持久化，内存副本仍可用 */ }
+      }
+    }
   }
 
   function currentThreadScroller() {
@@ -6328,6 +6397,7 @@
       }
     }
     if (!window.__codexSessionDeleteBridge) {
+      recordCodexPlusBridgeFailure();
       if (path === "/backend/status") {
         return await fetchBackendStatusFromHelper(path, payload);
       }
@@ -6339,6 +6409,7 @@
       try {
         request = window.__codexSessionDeleteBridge(path, payload);
       } catch (error) {
+        recordCodexPlusBridgeFailure();
         return Promise.resolve({ status: "failed", message: error?.message || "未连接" });
       }
       return withBackendTimeout(request);
@@ -6350,7 +6421,13 @@
           recordCodexPlusBridgeSuccess();
           return result;
         }
-        if (result?.timeout) sendCodexPlusDiagnostic("backend_bridge_timeout", { path });
+        recordCodexPlusBridgeFailure();
+        if (result?.timeout) {
+          // 超时也要记 lastAttemptAt：15 秒内的尝试视为桥还活着，
+          // 避免页面忙碌时被看门狗误判为桥已死而重复注入整份脚本（issue #2169 / #2274）。
+          recordCodexPlusBridgeAttempt();
+          sendCodexPlusDiagnostic("backend_bridge_timeout", { path });
+        }
         const fallback = await fetchBackendStatusFromHelper(path, payload);
         if (fallback?.status === "ok") {
           sendCodexPlusDiagnostic("backend_status_bridge_failed_http_fallback_ok", {
@@ -6367,8 +6444,11 @@
         });
         return fallback;
       }
-      return await window.__codexSessionDeleteBridge(path, payload);
+      const bridgeResult = await window.__codexSessionDeleteBridge(path, payload);
+      recordCodexPlusBridgeSuccess();
+      return bridgeResult;
     } catch (error) {
+      recordCodexPlusBridgeFailure();
       sendCodexPlusDiagnostic("bridge_call_failed", {
         path,
         errorName: error?.name || "",
@@ -7243,18 +7323,23 @@
   }
 
   const appServerModelRequestPatchMaxMisses = 8;
+  const appServerModelRequestPatchMaxRetryDelayMs = 30000;
   let appServerModelRequestPatchMissCount = 0;
   let appServerModelRequestPatchDisabled = false;
   let appServerModelRequestPatchPromise = null;
   let appServerModelRequestPatchRetryTimer = 0;
+  let appServerModelRequestPatchRetryDelayMs = 250;
 
   function scheduleAppServerModelRequestPatchRetry() {
     if (!codexRemoteSessionProviderPatchEnabled()) return;
     if (appServerModelRequestPatchRetryTimer) return;
+    // issue #2256/#2255：固定 250ms 重试在 Codex 改 asset 命名后变成每秒 4 轮的全量
+    // rescan（每轮 fetch 全部 app asset）。改为指数退避， miss 计满后由熔断停掉。
     appServerModelRequestPatchRetryTimer = window.setTimeout(() => {
       appServerModelRequestPatchRetryTimer = 0;
       installAppServerModelRequestPatch();
-    }, 250);
+    }, appServerModelRequestPatchRetryDelayMs);
+    appServerModelRequestPatchRetryDelayMs = Math.min(appServerModelRequestPatchRetryDelayMs * 4, appServerModelRequestPatchMaxRetryDelayMs);
   }
 
   function noteAppServerModelRequestPatchMiss(event, detail) {
@@ -7271,16 +7356,21 @@
     if (appServerModelRequestPatchMissCount === 1) {
       sendCodexPlusDiagnostic(event, detail);
     }
-    if (codexRemoteSessionProviderPatchEnabled()) {
-      scheduleAppServerModelRequestPatchRetry();
-      return;
-    }
+    // issue #2256：provider 重试路径以前在这里提前 return，绕过下面的 maxMisses
+    // 熔断，失败变成 250ms 无限重试（每轮全量 rescan 全部 app assets）。
+    // 现在两个路径统一计数：先按 maxMisses 熔断，未熔断时再走指数退避重试。
     if (appServerModelRequestPatchMissCount >= appServerModelRequestPatchMaxMisses && !appServerModelRequestPatchDisabled) {
       appServerModelRequestPatchDisabled = true;
+      clearTimeout(appServerModelRequestPatchRetryTimer);
+      appServerModelRequestPatchRetryTimer = 0;
       sendCodexPlusDiagnostic("model_app_server_request_patch_skipped", {
         misses: appServerModelRequestPatchMissCount,
         lastEvent: event,
       });
+      return;
+    }
+    if (!appServerModelRequestPatchDisabled) {
+      scheduleAppServerModelRequestPatchRetry();
     }
   }
 
@@ -7305,6 +7395,7 @@
           clearTimeout(appServerModelRequestPatchRetryTimer);
           appServerModelRequestPatchRetryTimer = 0;
           appServerModelRequestPatchMissCount = 0;
+          appServerModelRequestPatchRetryDelayMs = 250;
           window.__codexPlusAppServerModelRequestPatchInstalled = codexAppServerModelRequestPatchVersion;
           sendCodexPlusDiagnostic("model_app_server_request_patch_installed", {
             moduleCount: modules.length,
@@ -9696,7 +9787,6 @@
 
   function scanLightweight() {
     installStyle();
-    refreshOfficialUsageAlertVisibility();
     installCodexServiceTierDispatcherPatch();
     installCodexAppServerClientPrototypePatch();
     installCodexRemoteSessionRecoveryListener();
@@ -9721,38 +9811,268 @@
     refreshCodexServiceTierControls();
   }
 
-  function officialUsageAlertHidden() {
-    return window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ === true;
+  function officialUsagePolicy() {
+    const profile = codexRemoteSessionActiveProfile();
+    const official = String(profile?.relayMode || "") === "official";
+    return {
+      official,
+      hideAlerts: official && window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ === true,
+    };
   }
 
-  function officialUsageAlertCards(scope = document) {
-    const root = scope?.querySelectorAll ? scope : document;
-    return Array.from(root.querySelectorAll('aside.app-shell-left-panel [role="status"][aria-live="polite"]')).filter((card) => {
-      if (!(card instanceof HTMLElement)) return false;
-      const progress = card.querySelector('progress[max="100"]');
-      if (!progress) return false;
-      const dismissButton = Array.from(card.querySelectorAll("button")).find((button) =>
-        /dismiss usage alert|关闭使用量提醒/i.test(button.getAttribute("aria-label") || ""),
-      );
-      return !!dismissButton;
-    });
+  function officialUsagePolicyKey(policy = officialUsagePolicy()) {
+    if (!policy.official) return "off";
+    return policy.hideAlerts ? "official-hide" : "official";
   }
 
-  function officialUsageAlertContainer(card) {
-    const parent = card.parentElement;
-    return parent?.children.length === 1 && parent.matches("div.w-full") ? parent : card;
+  function isOfficialUsageStatus(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const rateLimit = value.rate_limit;
+    if (!rateLimit || typeof rateLimit !== "object" || typeof rateLimit.allowed !== "boolean") return false;
+    return typeof value.plan_type === "string"
+      || typeof value.user_id === "string"
+      || typeof value.account_id === "string";
   }
 
-  function refreshOfficialUsageAlertVisibility() {
-    const hidden = officialUsageAlertHidden();
-    document.querySelectorAll('[data-codex-plus-usage-alert-hidden="true"]').forEach((container) => {
-      delete container.dataset.codexPlusUsageAlertHidden;
-    });
-    if (!hidden) return;
-    officialUsageAlertCards().forEach((card) => {
-      const container = officialUsageAlertContainer(card);
-      container.dataset.codexPlusUsageAlertHidden = "true";
-    });
+  function isImageGenerationUpsell(value) {
+    return String(value?.banner_type || "") === "image_generation_limit_reached";
+  }
+
+  function isMainRateLimitQueryKey(queryKey) {
+    return Array.isArray(queryKey)
+      && queryKey[0] === "rate-limit-status"
+      && queryKey[1] !== "image-generation";
+  }
+
+  // 低额度卡片、输入框横幅和发送锁都读 /wham/usage 这份状态。
+  // 官登模式一律放开功能锁；提示字段只在勾选「关闭官方低额度提示」时清掉。
+  // 百分比、重置时间、账号、积分和消费上限不动。图片额度横幅单独留下。
+  function rewriteOfficialUsageStatus(value, policy = officialUsagePolicy()) {
+    if (!policy.official || !isOfficialUsageStatus(value)) return null;
+    const next = { ...value };
+    let changed = false;
+    if (value.rate_limit_reached_type != null) {
+      next.rate_limit_reached_type = null;
+      changed = true;
+    }
+    if (value.model_picker_upsell != null) {
+      next.model_picker_upsell = null;
+      changed = true;
+    }
+    const rateLimit = value.rate_limit;
+    if (rateLimit.allowed !== true || rateLimit.limit_reached === true) {
+      next.rate_limit = {
+        ...rateLimit,
+        allowed: true,
+        limit_reached: false,
+      };
+      changed = true;
+    }
+    if (policy.hideAlerts) {
+      if (value.sidebar_usage_warnings != null) {
+        next.sidebar_usage_warnings = null;
+        changed = true;
+      }
+      if (value.rate_limit_warning != null) {
+        next.rate_limit_warning = null;
+        changed = true;
+      }
+      if (value.rate_limit_upsell != null && !isImageGenerationUpsell(value.rate_limit_upsell)) {
+        next.rate_limit_upsell = null;
+        changed = true;
+      }
+    }
+    return changed ? next : null;
+  }
+
+  function rewriteOfficialUsagePayload(value, policy = officialUsagePolicy()) {
+    if (!value || typeof value !== "object") return value;
+    if (isOfficialUsageStatus(value)) return rewriteOfficialUsageStatus(value, policy) || value;
+    if (value.usage && value.usage !== value && isOfficialUsageStatus(value.usage)) {
+      const usage = rewriteOfficialUsageStatus(value.usage, policy);
+      return usage ? { ...value, usage } : value;
+    }
+    return value;
+  }
+
+  function looksLikeQueryClient(value) {
+    return !!value
+      && typeof value.getQueryCache === "function"
+      && typeof value.setQueryData === "function";
+  }
+
+  // 图片额度使用同一条 /wham/usage，只能靠查询键 image-generation 排除。
+  // 这里只在第一次挂上缓存时找客户端，不进每轮 DOM 扫描。
+  function queryClientFromFiber(fiber) {
+    const seen = new Set();
+    const stack = [fiber];
+    let visited = 0;
+    while (stack.length && visited < 8000) {
+      const node = stack.pop();
+      if (!node || typeof node !== "object" || seen.has(node)) continue;
+      seen.add(node);
+      visited += 1;
+      const props = node.memoizedProps || node.pendingProps;
+      if (looksLikeQueryClient(props?.client)) return props.client;
+      if (looksLikeQueryClient(props?.value)) return props.value;
+      if (looksLikeQueryClient(node.stateNode)) return node.stateNode;
+      const state = node.memoizedState;
+      if (state && typeof state === "object" && looksLikeQueryClient(state.memoizedState)) return state.memoizedState;
+      if (node.child) stack.push(node.child);
+      if (node.sibling) stack.push(node.sibling);
+    }
+    return null;
+  }
+
+  let officialUsageClient = null;
+
+  function findCodexQueryClient() {
+    const explicit = window.__REACT_QUERY_CLIENT__ || window.__codexQueryClient;
+    if (looksLikeQueryClient(explicit)) return explicit;
+    if (looksLikeQueryClient(officialUsageClient)) return officialUsageClient;
+    const roots = [document.getElementById?.("root"), document.body, document.documentElement].filter(Boolean);
+    for (const root of roots) {
+      let key = "";
+      try {
+        key = Object.keys(root).find((name) => name.startsWith("__reactContainer$") || name.startsWith("__reactFiber$")) || "";
+      } catch {
+        key = "";
+      }
+      if (!key) continue;
+      let fiber = root[key];
+      if (fiber?.stateNode?.current) fiber = fiber.stateNode.current;
+      const client = queryClientFromFiber(fiber);
+      if (client) {
+        officialUsageClient = client;
+        return client;
+      }
+    }
+    return null;
+  }
+
+  function mainRateLimitQueries(client) {
+    const cache = client.getQueryCache?.();
+    if (cache && typeof cache.findAll === "function") {
+      return cache.findAll({ queryKey: ["rate-limit-status"] }).filter((query) => isMainRateLimitQueryKey(query?.queryKey));
+    }
+    if (typeof client.getQueriesData === "function") {
+      return client.getQueriesData({ queryKey: ["rate-limit-status"] })
+        .filter(([queryKey]) => isMainRateLimitQueryKey(queryKey))
+        .map(([queryKey, data]) => ({ queryKey, state: { data } }));
+    }
+    return [];
+  }
+
+  let officialUsageRewriteDepth = 0;
+
+  function patchOfficialUsageQueryClient(client) {
+    if (!client || client.__codexPlusUsageRewrite || typeof client.setQueryData !== "function") return;
+    const original = client.setQueryData;
+    client.setQueryData = function codexPlusSetUsageQueryData(queryKey, updater, ...rest) {
+      if (officialUsageRewriteDepth > 0 || !isMainRateLimitQueryKey(queryKey) || !officialUsagePolicy().official) {
+        return original.call(this, queryKey, updater, ...rest);
+      }
+      const nextUpdater = typeof updater === "function"
+        ? (previous) => rewriteOfficialUsagePayload(updater(previous))
+        : rewriteOfficialUsagePayload(updater);
+      officialUsageRewriteDepth += 1;
+      try {
+        return original.call(this, queryKey, nextUpdater, ...rest);
+      } finally {
+        officialUsageRewriteDepth -= 1;
+      }
+    };
+    const cache = client.getQueryCache?.();
+    if (cache && typeof cache.subscribe === "function") {
+      cache.subscribe((event) => {
+        if (officialUsageRewriteDepth > 0 || !officialUsagePolicy().official) return;
+        const query = event?.query;
+        if (!isMainRateLimitQueryKey(query?.queryKey)) return;
+        const current = query.state?.data;
+        const next = rewriteOfficialUsagePayload(current);
+        if (next === current) return;
+        client.setQueryData(query.queryKey, next);
+      });
+    }
+    client.__codexPlusUsageRewrite = true;
+  }
+
+  function rewriteCachedOfficialUsage(client) {
+    if (!client || !officialUsagePolicy().official) return;
+    for (const query of mainRateLimitQueries(client)) {
+      const current = query.state?.data;
+      const next = rewriteOfficialUsagePayload(current);
+      if (next !== current) client.setQueryData(query.queryKey, next);
+    }
+  }
+
+  function invalidateMainRateLimitQueries(client) {
+    if (!client || typeof client.invalidateQueries !== "function") return;
+    for (const query of mainRateLimitQueries(client)) {
+      try {
+        client.invalidateQueries({ queryKey: query.queryKey });
+      } catch {
+      }
+    }
+  }
+
+  let officialUsagePolicyApplied = "";
+  let officialUsageClientTimer = null;
+
+  function syncOfficialUsagePolicy() {
+    const key = officialUsagePolicyKey();
+    const client = findCodexQueryClient();
+    if (client) {
+      officialUsageClient = client;
+      patchOfficialUsageQueryClient(client);
+      if (officialUsageClientTimer) {
+        clearTimeout(officialUsageClientTimer);
+        officialUsageClientTimer = null;
+      }
+    } else if (!officialUsageClientTimer) {
+      let attempts = 0;
+      const retry = () => {
+        attempts += 1;
+        officialUsageClientTimer = null;
+        if (findCodexQueryClient()) {
+          syncOfficialUsagePolicy();
+          return;
+        }
+        if (attempts < 20) officialUsageClientTimer = setTimeout(retry, 300);
+      };
+      officialUsageClientTimer = setTimeout(retry, 300);
+      return;
+    } else {
+      return;
+    }
+    if (key === officialUsagePolicyApplied) {
+      if (key !== "off") rewriteCachedOfficialUsage(client);
+      return;
+    }
+    const previous = officialUsagePolicyApplied;
+    officialUsagePolicyApplied = key;
+    if (key === "off") {
+      if (previous) invalidateMainRateLimitQueries(client);
+      return;
+    }
+    rewriteCachedOfficialUsage(client);
+    if (previous) invalidateMainRateLimitQueries(client);
+  }
+
+  if (window.__CODEX_PLUS_TEST_RATE_LIMIT_UNLOCK__) {
+    window.__codexPlusRateLimitUnlockTest = {
+      setBackendSettings: (settings) => {
+        codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
+        codexPlusBackendSettingsLoaded = true;
+      },
+      setHideAlerts: (hidden) => {
+        window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = hidden === true;
+      },
+      install: () => syncOfficialUsagePolicy(),
+      policyKey: () => officialUsagePolicyKey(),
+      isRateLimitQueryKey: (queryKey) => isMainRateLimitQueryKey(queryKey),
+      rewrite: (value) => rewriteOfficialUsagePayload(value),
+    };
   }
 
   let zedRemoteStatusPromise = null;
@@ -10687,7 +11007,6 @@
   function scanRelevantSelector() {
     return [
       selectors.sidebarThread,
-      'aside.app-shell-left-panel [role="status"][aria-live="polite"]',
       '[data-app-action-sidebar-section-heading="Chats"]',
       '[data-app-action-sidebar-section-heading="Projects"]',
       '[data-codex-archive-page-row="true"]',
@@ -10796,6 +11115,7 @@
   installUpstreamBranchDropdownAdapter();
   installUpstreamWorktreeNativeAdapter();
   scan();
+  syncOfficialUsagePolicy();
   scheduleSidebarNavStartupRetry();
   window.removeEventListener("resize", window.__codexPlusResizeHandler);
   let codexPlusResizeRafId = 0;

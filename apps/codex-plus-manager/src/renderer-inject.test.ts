@@ -55,82 +55,6 @@ it("only reveals floating-panel content after the shell has settled open", async
   }
 });
 
-type FakeElementOptions = {
-  className?: string;
-  dismissLabel?: string;
-  hasProgress?: boolean;
-  styleDisplay?: string;
-};
-
-class FakeElement {
-  children: FakeElement[] = [];
-  dataset: Record<string, string> = {};
-  parentElement: FakeElement | null = null;
-  style: { display: string };
-  private readonly className: string;
-  private readonly dismissLabel: string;
-  private readonly hasProgress: boolean;
-
-  constructor(options: FakeElementOptions = {}) {
-    this.className = options.className ?? "";
-    this.dismissLabel = options.dismissLabel ?? "";
-    this.hasProgress = options.hasProgress ?? false;
-    this.style = { display: options.styleDisplay ?? "" };
-  }
-
-  appendChild(child: FakeElement) {
-    child.parentElement = this;
-    this.children.push(child);
-  }
-
-  getAttribute(name: string) {
-    return name === "aria-label" ? this.dismissLabel : null;
-  }
-
-  matches(selector: string) {
-    return selector === "div.w-full" && this.className.split(/\s+/).includes("w-full");
-  }
-
-  querySelector(selector: string) {
-    return selector === 'progress[max="100"]' && this.hasProgress ? new FakeElement() : null;
-  }
-
-  querySelectorAll(selector: string) {
-    return selector === "button" && this.dismissLabel ? [this] : [];
-  }
-}
-
-function usageAlertRuntime(renderer: string, cards: FakeElement[], managed: FakeElement[]) {
-  const start = renderer.indexOf("  function officialUsageAlertHidden(");
-  const end = renderer.indexOf("\n  let zedRemoteStatusPromise", start);
-  assert.ok(start >= 0 && end > start);
-  const source = renderer.slice(start, end);
-  const selectors: string[] = [];
-  const document = {
-    querySelectorAll(selector: string) {
-      selectors.push(selector);
-      return selector === '[data-codex-plus-usage-alert-hidden="true"]'
-        ? managed.filter((node) => node.dataset.codexPlusUsageAlertHidden === "true")
-        : cards;
-    },
-  };
-  const windowValue: Record<string, unknown> = {};
-  const create = new Function(
-    "window",
-    "document",
-    "HTMLElement",
-    `${source}\nreturn { officialUsageAlertHidden, refreshOfficialUsageAlertVisibility };`,
-  ) as (
-    windowValue: Record<string, unknown>,
-    documentValue: typeof document,
-    elementType: typeof FakeElement,
-  ) => {
-    officialUsageAlertHidden: () => boolean;
-    refreshOfficialUsageAlertVisibility: () => void;
-  };
-  return { runtime: create(windowValue, document, FakeElement), selectors, windowValue };
-}
-
 function installRendererStyle(renderer: string) {
   const start = renderer.indexOf("  function installStyle()");
   const end = renderer.indexOf("\n  function defaultCodexPlusSettings", start);
@@ -285,41 +209,47 @@ describe("renderer injection header compatibility", () => {
     assert.match(css, /:where\([^)]*codex-plus-modal-overlay[^)]*\)\s*\{[^}]*font-family:\s*inherit;/s);
   });
 
-  it("hides only the official usage alert and restores it without changing upstream styles", async () => {
+  it("rewrites official usage status at the cache boundary instead of scanning alerts", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
-    const wrapper = new FakeElement({ className: "w-full", styleDisplay: "grid" });
-    const usageAlert = new FakeElement({ dismissLabel: "Dismiss usage alert", hasProgress: true });
-    const otherStatus = new FakeElement({ dismissLabel: "Dismiss sync status", hasProgress: true });
-    wrapper.appendChild(usageAlert);
-    const { runtime, selectors, windowValue } = usageAlertRuntime(renderer, [usageAlert, otherStatus], [wrapper]);
+    const scanStart = renderer.indexOf("  function scanLightweight()");
+    const scanEnd = renderer.indexOf("  function officialUsagePolicy()", scanStart);
+    assert.ok(scanStart >= 0 && scanEnd > scanStart);
+    const scan = renderer.slice(scanStart, scanEnd);
 
-    windowValue.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = true;
-    runtime.refreshOfficialUsageAlertVisibility();
-
-    assert.equal(wrapper.dataset.codexPlusUsageAlertHidden, "true");
-    assert.equal(wrapper.style.display, "grid");
-    assert.equal(otherStatus.dataset.codexPlusUsageAlertHidden, undefined);
-    assert.deepEqual(selectors, [
-      '[data-codex-plus-usage-alert-hidden="true"]',
-      'aside.app-shell-left-panel [role="status"][aria-live="polite"]',
-    ]);
-
-    windowValue.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = false;
-    runtime.refreshOfficialUsageAlertVisibility();
-
-    assert.equal(wrapper.dataset.codexPlusUsageAlertHidden, undefined);
-    assert.equal(wrapper.style.display, "grid");
-    assert.equal(wrapper.children[0], usageAlert);
-    assert.equal(selectors.at(-1), '[data-codex-plus-usage-alert-hidden="true"]');
-  });
-
-  it("refreshes active-profile usage alert settings through the existing backend heartbeat", async () => {
-    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
-
+    assert.doesNotMatch(scan, /syncOfficialUsagePolicy|refreshOfficialUsageAlert/);
     assert.match(renderer, /typeof nextStatus\.hideOfficialUsageAlert === "boolean"/);
     assert.match(renderer, /window\.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = nextStatus\.hideOfficialUsageAlert/);
-    assert.match(renderer, /\[data-codex-plus-usage-alert-hidden="true"\] \{ display: none !important; \}/);
-    assert.doesNotMatch(renderer, /container\.style\.(?:setProperty|removeProperty)\("display"/);
+    assert.match(renderer, /function syncOfficialUsagePolicy\(\)/);
+    assert.match(renderer, /queryKey\[1\] !== "image-generation"/);
+    assert.match(renderer, /image_generation_limit_reached/);
+    assert.match(renderer, /if \(loaded\) syncOfficialUsagePolicy\(\);/);
+    assert.doesNotMatch(renderer, /officialUsageAlertCards|refreshOfficialUsageAlertVisibility|codex-plus-hide-usage-alert/);
+    assert.doesNotMatch(renderer, /mutationTouchesUsageAlert/);
+  });
+
+  // issue #2169：HTTP 回落成功不得掩盖桥接通道故障。桥接失败计数独立于后端状态，
+  // 连续失败时状态灯降级呈现；回落路径绝不能清零计数或刷新 bridge 健康时间戳，
+  // 否则启动器侧健康检查失去修复动力，重注入风暴对用户完全静默。
+  it("surfaces persistent bridge degradation while the http fallback keeps the backend reachable", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+
+    assert.match(renderer, /const CODEX_PLUS_BRIDGE_FAILURE_THRESHOLD = 3;/);
+    assert.match(
+      renderer,
+      /function recordCodexPlusBridgeFailure\(\) \{\s*codexPlusBridgeFailureCount \+= 1;\s*\}/,
+    );
+    // 降级渲染：桥接连续失败 + 后端 ok → degraded
+    assert.match(renderer, /bridgeDegraded && rawStatus === "ok" \? "degraded" : rawStatus/);
+    assert.match(renderer, /桥接降级，自动修复中/);
+    // 回落分支只记失败，不得触碰成功路径
+    const fallbackBlock = renderer.match(
+      /const fallback = await fetchBackendStatusFromHelper\(path, payload\);[\s\S]*?return fallback;\s*\}/,
+    );
+    assert.ok(fallbackBlock, "http fallback block not found in postJson");
+    assert.doesNotMatch(fallbackBlock[0], /recordCodexPlusBridgeSuccess\(\)/);
+    // 降级状态有专属样式（指示灯与文本）
+    assert.match(renderer, /\.codex-plus-backend-indicator\[data-status="degraded"\]/);
+    assert.match(renderer, /\.codex-plus-backend-label\[data-status="degraded"\]/);
   });
 
   it("keeps Windows Dream Skin compatible with the modern Codex main surface", async () => {
@@ -956,5 +886,119 @@ describe("Stepwise generation mode contracts", () => {
       styles,
       /\.stepwise-settings-block input[^,]*,[\s\S]*?\.stepwise-settings-block \.app-select-trigger,[\s\S]*?\.stepwise-settings-block \.field-select,[\s\S]*?\.stepwise-settings-block \.select-input\s*\{[\s\S]*?height:\s*var\(--stepwise-control-height\);[\s\S]*?min-height:\s*var\(--stepwise-control-height\);/,
     );
+  });
+});
+
+// issue #2256/#2255：app-server model request patch 的 miss 熔断以前被 provider
+// 重试路径提前 return 绕过，失败变成 250ms 无限重试（每轮全量 fetch 全部 app asset）。
+describe("renderer injection app-server model request patch", () => {
+  const rendererPath = new URL("../../../assets/inject/renderer-inject.js", import.meta.url);
+
+  interface AppServerPatchHarness {
+    install: () => void;
+    sweeps: () => number;
+    diagnostics: () => string[];
+    settle: () => Promise<void>;
+  }
+
+  function appServerPatchRuntime(renderer: string, patchSucceeds: boolean): AppServerPatchHarness {
+    const start = renderer.indexOf("  const appServerModelRequestPatchMaxMisses = ");
+    const end = renderer.indexOf("\n  function ensureCodexModelWhitelistInstalls(", start);
+    assert.ok(start >= 0 && end > start, "app-server model request patch block not found");
+    const source = renderer.slice(start, end);
+
+    let sweeps = 0;
+    let pending: Array<() => void> = [];
+    const diagnostics: string[] = [];
+    const timers: Array<number> = [];
+    const fakeWindow: Record<string, unknown> = {
+      setTimeout: ((fn: () => void) => {
+        timers.push(0);
+        pending.push(fn);
+        return 0;
+      }) as unknown,
+      clearTimeout: () => {},
+    };
+
+    const factory = new Function(
+      "window",
+      "codexAppServerModelRequestPatchVersion",
+      "codexRemoteSessionProviderPatchEnabled",
+      "loadAppServerRequestCandidates",
+      "patchAppServerModelRequestClient",
+      "sendCodexPlusDiagnostic",
+      "Date",
+      `${source}\nreturn installAppServerModelRequestPatch;`,
+    );
+
+    const install = factory(
+      fakeWindow,
+      1,
+      // provider patch 开关两态都要测：以前 enabled 时走提前 return 绕过熔断。
+      () => true,
+      () =>
+        new Promise((resolve) => {
+          sweeps += 1;
+          pending.push(() => resolve({ modules: [{}], candidates: [{}], sources: [], discovery: "fallback" }));
+        }),
+      () => patchSucceeds,
+      (event: string) => diagnostics.push(event),
+      Date,
+    ) as () => void;
+
+    const settle = async () => {
+      // 重试定时器是挂起的回调：排空 sweep 再触发到期的 retry，直到没有新定时器。
+      for (let round = 0; round < 32; round += 1) {
+        if (!pending.length) break;
+        const flushSweeps = pending;
+        pending = [];
+        flushSweeps.forEach((resolve) => resolve());
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      }
+    };
+
+    return { install, sweeps: () => sweeps, diagnostics: () => diagnostics, settle };
+  }
+
+  it("does not start a new sweep while the previous one is still running", async () => {
+    const harness = appServerPatchRuntime(await readFile(rendererPath, "utf8"), false);
+
+    for (let i = 0; i < 20; i += 1) harness.install();
+
+    assert.equal(harness.sweeps(), 1);
+    await harness.settle();
+  });
+
+  it("stops retrying via the provider path once maxMisses is reached", async () => {
+    const harness = appServerPatchRuntime(await readFile(rendererPath, "utf8"), false);
+
+    // 反复 install + settle，让每轮 miss 走完 provider 重试调度。
+    for (let i = 0; i < 40; i += 1) {
+      harness.install();
+      await harness.settle();
+    }
+
+    // 关键回归断言：以前 provider 路径无限重试（40 轮 = 40 次 sweep），
+    // 现在到 maxMisses(8) 就熔断停手。
+    assert.equal(harness.sweeps(), 8);
+    assert.equal(harness.diagnostics().filter((e) => e === "model_app_server_request_patch_not_found").length, 1);
+    assert.deepEqual(harness.diagnostics().at(-1), "model_app_server_request_patch_skipped");
+    const settled = harness.sweeps();
+    harness.install();
+    await harness.settle();
+    assert.equal(harness.sweeps(), settled);
+  });
+
+  it("keeps working normally when the patch actually lands", async () => {
+    const harness = appServerPatchRuntime(await readFile(rendererPath, "utf8"), true);
+
+    harness.install();
+    await harness.settle();
+    for (let i = 0; i < 10; i += 1) harness.install();
+
+    assert.equal(harness.sweeps(), 1);
+    assert.deepEqual(harness.diagnostics(), ["model_app_server_request_patch_installed"]);
   });
 });
