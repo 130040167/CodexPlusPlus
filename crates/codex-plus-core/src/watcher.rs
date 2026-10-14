@@ -891,6 +891,43 @@ pub fn find_codex_processes() -> Vec<u32> {
     find_codex_processes_from_snapshot(&processes)
 }
 
+/// 主实例没有 CDP 时，只允许选择未带隔离目录的 Electron 主进程。
+#[cfg(windows)]
+pub fn find_main_codex_processes_without_debug_port() -> Vec<u32> {
+    find_codex_processes()
+        .into_iter()
+        .filter(|pid| {
+            crate::windows_integration::process_command_line(*pid)
+                .is_some_and(|line| is_unisolated_codex_main_command(&line))
+        })
+        .collect()
+}
+
+#[cfg(any(windows, test))]
+fn is_unisolated_codex_main_command(line: &str) -> bool {
+    let line = line.to_ascii_lowercase();
+    !line.contains("--type=")
+        && !line.contains("--user-data-dir")
+        && !line.contains("--remote-debugging-port")
+}
+
+#[cfg(test)]
+mod main_restart_target_tests {
+    use super::is_unisolated_codex_main_command;
+
+    #[test]
+    fn fallback_excludes_children_and_isolated_instances() {
+        assert!(is_unisolated_codex_main_command(r#""C:\app\ChatGPT.exe""#));
+        for args in [
+            "--type=renderer",
+            "--user-data-dir=C:\\instance",
+            "--remote-debugging-port=9231",
+        ] {
+            assert!(!is_unisolated_codex_main_command(&format!("ChatGPT.exe {args}")));
+        }
+    }
+}
+
 /// Filter the list of already enumerated Windows processes for Codex processes.
 /// Exposed so the Windows-specific logic can be unit-tested without scanning the live system.
 #[cfg(windows)]
@@ -1542,7 +1579,7 @@ pub fn stop_codex_processes_for_debug_port_with_fallback(
 ) {
     let process_ids = select_stop_targets(
         codex_instance_processes_for_debug_port(debug_port),
-        || find_codex_processes(),
+        find_main_codex_processes_without_debug_port,
         allow_global_fallback,
     );
     terminate_and_wait_for_exit(

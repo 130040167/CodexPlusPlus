@@ -85,6 +85,8 @@ impl BridgeReinjectBackoff {
 }
 const MACOS_DEBUG_TAKEOVER_WAIT_MS: u64 = 5_000;
 const MACOS_DEBUG_TAKEOVER_INTERVAL_MS: u64 = 100;
+/// 冷启动可以很慢，但 CDP 始终缺席时必须在有界时间内写入最终状态。
+const ENSURE_INJECTION_TIMEOUT_SECS: u64 = 120;
 
 /// 协议代理的端口写死在 `config.toml` 的 `base_url = "http://127.0.0.1:57321/v1"` 里，
 /// 不能像普通 helper 端口那样临时换一个空闲的，否则 Codex CLI 会连到没人监听的地址。
@@ -409,28 +411,48 @@ pub trait LaunchHooks: Send + Sync {
         self.inject(debug_port, helper_port).await
     }
     async fn ensure_injection(&self, debug_port: u16, helper_port: u16, app_dir: &Path) -> bool {
-        for attempt in 1..=120 {
-            let result = match self.bridge_context(debug_port, app_dir).await {
-                Ok(Some(ctx)) => self.inject_bridge(debug_port, helper_port, ctx).await,
-                Ok(None) => self.inject(debug_port, helper_port).await,
-                Err(error) => Err(error),
-            };
-            match result {
-                Ok(()) => return true,
-                Err(error) => {
-                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "launcher.ensure_injection_retry_failed",
-                        serde_json::json!({
-                            "debug_port": debug_port,
-                            "helper_port": helper_port,
-                            "attempt": attempt,
-                            "message": error.to_string()
-                        }),
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let injection = async {
+            for attempt in 1..=120 {
+                let result = match self.bridge_context(debug_port, app_dir).await {
+                    Ok(Some(ctx)) => self.inject_bridge(debug_port, helper_port, ctx).await,
+                    Ok(None) => self.inject(debug_port, helper_port).await,
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(()) => return true,
+                    Err(error) => {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.ensure_injection_retry_failed",
+                            serde_json::json!({
+                                "debug_port": debug_port,
+                                "helper_port": helper_port,
+                                "attempt": attempt,
+                                "message": error.to_string()
+                            }),
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
                 }
             }
+            false
+        };
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(ENSURE_INJECTION_TIMEOUT_SECS),
+            injection,
+        )
+        .await
+        .unwrap_or(false)
+        {
+            return true;
         }
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "launcher.ensure_injection_timeout",
+            serde_json::json!({
+                "debug_port": debug_port,
+                "helper_port": helper_port,
+                "timeout_secs": ENSURE_INJECTION_TIMEOUT_SECS,
+            }),
+        );
         false
     }
     /// 初次启动初始化结束时固定身份（包含注入降级）；watchdog 不能重新绑定实例。
@@ -818,6 +840,11 @@ where
                 )
                 .await;
             } else {
+                if !crate::cdp::endpoint_available(debug_port) {
+                    anyhow::bail!(
+                        "Codex 启动后未在调试端口 {debug_port} 提供页面连接；请确认旧实例已退出后重试"
+                    );
+                }
                 let degraded = launch_status(
                     "running_degraded",
                     "Codex launched; Codex++ enhancements are still waiting for the page bridge.",

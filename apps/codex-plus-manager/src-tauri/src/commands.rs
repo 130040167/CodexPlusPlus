@@ -2046,8 +2046,12 @@ enum RestartDisposition {
     StopAndRestart,
 }
 
-fn restart_disposition(sync_active_relay: bool, app_running: bool) -> RestartDisposition {
-    if !sync_active_relay && !app_running {
+fn restart_disposition(
+    sync_active_relay: bool,
+    cdp_available: bool,
+    desktop_process_running: bool,
+) -> RestartDisposition {
+    if !sync_active_relay && !cdp_available && !desktop_process_running {
         RestartDisposition::LaunchOnly
     } else {
         RestartDisposition::StopAndRestart
@@ -2060,12 +2064,19 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
         Err(message) => return failed(message, json!({})),
     };
     let request = normalize_launch_request(request);
-    // 按本实例的调试端口判定是否在跑。
-    // 早先用 `find_codex_processes_for_debug_port`，但它在非 macOS 上返回全部
-    // Codex 进程：Windows 上只要有多开实例在跑，就会把「主 Codex 没开」误判成
-    // 「已运行」，进而走进重启分支去停进程。
-    let app_running = codex_plus_core::cdp::endpoint_available(request.debug_port);
-    if restart_disposition(request.sync_active_relay, app_running) == RestartDisposition::LaunchOnly
+    // AUMID 激活的 Windows 主实例可能仍在运行，却没有监听调试端口。
+    // 此时直接启动只会激活旧实例，新的 CDP 参数不会生效。
+    let cdp_available = codex_plus_core::cdp::endpoint_available(request.debug_port);
+    #[cfg(windows)]
+    let desktop_process_running =
+        !codex_plus_core::watcher::find_main_codex_processes_without_debug_port().is_empty();
+    #[cfg(not(windows))]
+    let desktop_process_running = false;
+    if restart_disposition(
+        request.sync_active_relay,
+        cdp_available,
+        desktop_process_running,
+    ) == RestartDisposition::LaunchOnly
     {
         return spawn_codex_plus_launch(request, "Codex 未运行，已按直接启动方式在后台唤起。");
     }
@@ -8320,12 +8331,18 @@ base_url = "https://example.invalid/v1"
     #[test]
     fn restart_absent_app_uses_launch_but_explicit_sync_still_restarts() {
         assert_eq!(
-            restart_disposition(false, false),
+            restart_disposition(false, false, false),
             RestartDisposition::LaunchOnly
         );
-        for (sync, running) in [(true, false), (false, true), (true, true)] {
+        // Windows 打包实例仍在但 CDP 未监听：必须结束旧进程后重新激活。
+        for (sync, cdp, process) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
             assert_eq!(
-                restart_disposition(sync, running),
+                restart_disposition(sync, cdp, process),
                 RestartDisposition::StopAndRestart
             );
         }

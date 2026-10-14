@@ -121,11 +121,76 @@ fn recall_tool_call_extra_content(call_id: &str) -> Option<Value> {
 /// 动态端口排除区间，bind 报 os error 10013 永远起不来，只能整体挪一个端口。
 /// 写入 base_url 与读取校验必须都走本函数，保证同一进程内一致。
 pub fn protocol_proxy_port() -> u16 {
-    std::env::var("CODEX_PLUS_PROTOCOL_PROXY_PORT")
+    if let Some(port) = std::env::var("CODEX_PLUS_PROTOCOL_PROXY_PORT")
         .ok()
         .and_then(|value| value.trim().parse::<u16>().ok())
         .filter(|port| *port > 0)
-        .unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT)
+    {
+        return port;
+    }
+    #[cfg(windows)]
+    {
+        static PORT: OnceLock<u16> = OnceLock::new();
+        *PORT.get_or_init(|| {
+            let path = crate::paths::default_app_state_dir().join("protocol-proxy-port");
+            let saved = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| text.trim().parse::<u16>().ok())
+                .filter(|port| *port > 0);
+            let port = select_proxy_port(
+                saved.unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT),
+                |port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+                || {
+                    std::net::TcpListener::bind(("127.0.0.1", 0))
+                        .ok()
+                        .and_then(|listener| listener.local_addr().ok())
+                        .map(|address| address.port())
+                        .unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT)
+                },
+            );
+            if saved != Some(port) {
+                let persisted = std::fs::create_dir_all(crate::paths::default_app_state_dir())
+                    .and_then(|_| std::fs::write(&path, port.to_string()))
+                    .is_ok();
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "protocol_proxy.port_selected",
+                    json!({"port": port, "persisted": persisted}),
+                );
+            }
+            // 配置生成和监听必须共享这个值；服务启动后不能再探测并换端口。
+            port
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        DEFAULT_PROTOCOL_PROXY_PORT
+    }
+}
+
+#[cfg(any(windows, test))]
+fn select_proxy_port(
+    preferred: u16,
+    can_bind: impl FnOnce(u16) -> bool,
+    available: impl FnOnce() -> u16,
+) -> u16 {
+    if can_bind(preferred) { preferred } else { available() }
+}
+
+#[cfg(test)]
+mod proxy_port_selection_tests {
+    use super::select_proxy_port;
+
+    #[test]
+    fn preserves_the_saved_port_when_available() {
+        assert_eq!(select_proxy_port(60000, |_| true, || panic!("unused")), 60000);
+    }
+
+    #[test]
+    fn unavailable_default_or_saved_port_uses_available_port() {
+        for preferred in [57321, 60000] {
+            assert_eq!(select_proxy_port(preferred, |_| false, || 62000), 62000);
+        }
+    }
 }
 pub const NO_AUTH_PROXY_BEARER_TOKEN: &str = "codex-plus-no-auth";
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
