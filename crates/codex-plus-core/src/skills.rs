@@ -369,7 +369,7 @@ impl SkillsManager {
         skills
     }
 
-    /// 从外部 Skill 目录导入到 Codex++ 的受控源目录，并默认启用。
+    /// 从外部 Skill 目录导入到 Codex++ 的受控源目录，并默认停用。
     pub fn import_from_directory(
         &self,
         id: &str,
@@ -405,7 +405,7 @@ impl SkillsManager {
         );
         self.save_state_unlocked(&state)?;
         drop(_guard);
-        self.set_enabled(id, true)?;
+        self.set_enabled(id, false)?;
         Ok(self.load_state())
     }
 

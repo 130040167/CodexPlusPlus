@@ -17,3 +17,30 @@
 .screen.management-screen .mg-page>.mg-content>.mg-session-list{flex:1 1 auto;min-height:0;overflow-x:hidden;overflow-y:auto}
 /* Skill repository inventory */
 .mg-repo-panel{margin-top:12px;border:1px solid hsl(var(--border));border-radius:9px;background:hsl(var(--card));overflow:hidden}.mg-repo-panel-head,.mg-repo-row{display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:1px solid hsl(var(--border))}.mg-repo-panel-head{background:hsl(var(--muted));font-size:12px}.mg-repo-panel-head span{margin-left:auto;color:hsl(var(--muted-foreground))}.mg-repo-row>div{min-width:0;flex:1;display:flex;flex-direction:column;gap:3px}.mg-repo-row small{color:hsl(var(--muted-foreground));font-size:11px}.mg-repo-row:last-child{border-bottom:0}
+
+/* Skills: fixed two-line rows, with status split into toggle and state. */
+.mg-skill-head,.mg-skill-row{grid-template-columns:minmax(260px,1fr) minmax(180px,260px) 190px minmax(150px,220px)}
+.mg-skill-row{min-height:68px;height:68px}
+.mg-skill-name{min-width:0;width:100%;height:48px;display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:3px;border:0;background:transparent;color:inherit;text-align:left;overflow:hidden;cursor:pointer}
+.mg-skill-name strong,.mg-skill-name small{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mg-skill-name strong{width:100%}
+.mg-skill-name small{width:100%;font-size:11px;color:hsl(var(--muted-foreground))}
+.mg-skill-source{padding-left:4px}
+.mg-skill-status{display:flex;align-items:center;gap:10px;min-width:0}
+.mg-status-toggle{width:48px;display:flex;align-items:center;justify-content:flex-start}
+.mg-status-toggle .mg-readonly + .mg-readonly{display:none}
+.mg-skill-status .mg-badge{max-width:110px;overflow:hidden;text-overflow:ellipsis}
+.mg-skill-row .mg-row-actions{gap:5px}
+.mg-repo-manager{border:1px solid hsl(var(--border));border-radius:9px;overflow:hidden;background:hsl(var(--card))}
+.mg-repo-manager-head{display:flex;align-items:center;justify-content:space-between;padding:11px 13px;background:hsl(var(--muted));font-size:12px}
+.mg-repo-manager-head span{color:hsl(var(--muted-foreground))}
+.mg-repo-manager .mg-repo-row{padding:10px 12px}
+.mg-repo-form{display:flex;flex-direction:column;gap:10px;padding-top:4px}
+.mg-repo-form h3{margin:0;font-size:14px}
+.mg-repo-quick{display:flex;gap:7px}
+.mg-repo-quick input{min-width:0;flex:1;font:inherit;color:hsl(var(--foreground));background:hsl(var(--input)/.35);border:1px solid hsl(var(--input));border-radius:6px;padding:7px 9px;outline:0}
+.mg-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.mg-muted{margin:0;color:hsl(var(--muted-foreground));font-size:11px}
+.mg-link-button{display:inline-flex;align-items:center;gap:5px;padding:0;border:0;background:transparent;color:hsl(var(--brand-accent));font:inherit;text-align:left;cursor:pointer;overflow-wrap:anywhere}
+@media (max-width:900px){.mg-skill-head,.mg-skill-row{grid-template-columns:minmax(210px,1fr) 150px 170px minmax(120px,180px)}}
+@media (max-width:680px){.mg-skill-head,.mg-skill-row{grid-template-columns:minmax(170px,1fr) 110px 145px 120px;gap:7px;padding-inline:9px}.mg-form-grid{grid-template-columns:1fr}.mg-skill-row .mg-button{padding-inline:6px}}
