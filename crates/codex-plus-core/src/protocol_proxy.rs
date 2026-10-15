@@ -130,36 +130,18 @@ pub fn protocol_proxy_port() -> u16 {
     }
     #[cfg(windows)]
     {
+        // 配置生成和监听必须共享这个值；服务启动后不能再探测并换端口。
         static PORT: OnceLock<u16> = OnceLock::new();
         *PORT.get_or_init(|| {
             let path = crate::paths::default_app_state_dir().join("protocol-proxy-port");
-            let saved = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| text.trim().parse::<u16>().ok())
-                .filter(|port| *port > 0);
-            let port = select_proxy_port(
-                saved.unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT),
-                |port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
-                proxy_helper_available,
-                || {
-                    std::net::TcpListener::bind(("127.0.0.1", 0))
-                        .ok()
-                        .and_then(|listener| listener.local_addr().ok())
-                        .map(|address| address.port())
-                        .unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT)
-                },
-            );
-            if saved != Some(port) {
-                let persisted = std::fs::create_dir_all(crate::paths::default_app_state_dir())
-                    .and_then(|_| std::fs::write(&path, port.to_string()))
-                    .is_ok();
+            resolve_proxy_port(&path).unwrap_or_else(|error| {
+                // 无法协调或持久化时不返回一个其他进程无法获知的临时端口。
                 let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "protocol_proxy.port_selected",
-                    json!({"port": port, "persisted": persisted}),
+                    "protocol_proxy.port_selection_failed",
+                    json!({"message": error.to_string()}),
                 );
-            }
-            // 配置生成和监听必须共享这个值；服务启动后不能再探测并换端口。
-            port
+                read_saved_proxy_port(&path).unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT)
+            })
         })
     }
     #[cfg(not(windows))]
@@ -168,30 +150,98 @@ pub fn protocol_proxy_port() -> u16 {
     }
 }
 
+#[cfg(windows)]
+fn read_saved_proxy_port(path: &std::path::Path) -> Option<u16> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+}
+
+#[cfg(windows)]
+fn resolve_proxy_port(path: &std::path::Path) -> anyhow::Result<u16> {
+    use fs2::FileExt;
+
+    let parent = path.parent().context("proxy port path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))?;
+    // 锁住读取、选择和原子替换整个事务；后来的进程须读取前一个进程的结果。
+    FileExt::lock_exclusive(&lock)?;
+    let saved = read_saved_proxy_port(path);
+    let port = select_proxy_port(
+        saved.unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT),
+        |port| std::net::TcpListener::bind(("127.0.0.1", port)).map(|_| ()),
+        probe_proxy_helper,
+        || {
+            std::net::TcpListener::bind(("127.0.0.1", 0))
+                .ok()
+                .and_then(|listener| listener.local_addr().ok())
+                .map(|address| address.port())
+                .unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT)
+        },
+    );
+    if saved != Some(port) {
+        crate::settings::atomic_write(path, port.to_string().as_bytes())?;
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "protocol_proxy.port_selected",
+            json!({"port": port, "persisted": true}),
+        );
+    }
+    Ok(port)
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProxyHelperIdentity {
+    Healthy,
+    Foreign,
+    Unavailable,
+    Unknown,
+}
+
 #[cfg(any(windows, test))]
 fn select_proxy_port(
     preferred: u16,
-    can_bind: impl FnOnce(u16) -> bool,
-    is_healthy_helper: impl FnOnce(u16) -> bool,
+    try_bind: impl FnOnce(u16) -> std::io::Result<()>,
+    helper_identity: impl FnOnce(u16) -> ProxyHelperIdentity,
     available: impl FnOnce() -> u16,
 ) -> u16 {
-    // 另一个 launcher 可能已监听保存端口；读取概览不能把它迁走。
-    if can_bind(preferred) || is_healthy_helper(preferred) {
-        preferred
-    } else {
-        available()
+    match try_bind(preferred) {
+        Ok(()) => preferred,
+        Err(error) => match helper_identity(preferred) {
+            ProxyHelperIdentity::Foreign => available(),
+            // 排除区间与独占 socket 都可能返回 PermissionDenied，须先排除已有监听者。
+            ProxyHelperIdentity::Unavailable
+                if error.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                available()
+            }
+            // 超时、断连或未就绪不是外部服务的证据，不能改写正在使用的端口。
+            ProxyHelperIdentity::Healthy
+            | ProxyHelperIdentity::Unavailable
+            | ProxyHelperIdentity::Unknown => preferred,
+        },
     }
 }
 
 #[cfg(windows)]
-fn proxy_helper_available(port: u16) -> bool {
+fn probe_proxy_helper(port: u16) -> ProxyHelperIdentity {
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 
     let timeout = Duration::from_secs(1);
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
-        return false;
+    let mut stream = match TcpStream::connect_timeout(&address, timeout) {
+        Ok(stream) => stream,
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+            return ProxyHelperIdentity::Unavailable;
+        }
+        Err(_) => return ProxyHelperIdentity::Unknown,
     };
     if stream.set_read_timeout(Some(timeout)).is_err()
         || stream.set_write_timeout(Some(timeout)).is_err()
@@ -201,39 +251,63 @@ fn proxy_helper_available(port: u16) -> bool {
         )
         .is_err()
     {
-        return false;
+        return ProxyHelperIdentity::Unknown;
     }
+    let deadline = std::time::Instant::now() + timeout;
     let mut response = Vec::new();
-    if stream.take(32 * 1024).read_to_end(&mut response).is_err() {
-        return false;
+    let mut buffer = [0; 4096];
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() || stream.set_read_timeout(Some(remaining)).is_err() {
+            return ProxyHelperIdentity::Unknown;
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) if response.len() + count <= 32 * 1024 => {
+                response.extend_from_slice(&buffer[..count]);
+            }
+            _ => return ProxyHelperIdentity::Unknown,
+        }
+    }
+    if response.is_empty() {
+        return ProxyHelperIdentity::Unknown;
     }
     let Some(end) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
-        return false;
+        return ProxyHelperIdentity::Foreign;
     };
     let headers = String::from_utf8_lossy(&response[..end]);
     if !headers.lines().next().is_some_and(|line| {
         line.starts_with("HTTP/") && line.split_whitespace().nth(1) == Some("200")
     }) {
-        return false;
+        return ProxyHelperIdentity::Foreign;
     }
     // 与管理器概览的 helper 身份检查一致，普通 HTTP 服务不能被误认。
-    serde_json::from_slice::<Value>(&response[end + 4..])
+    if serde_json::from_slice::<Value>(&response[end + 4..])
         .ok()
         .is_some_and(|body| {
             body["status"] == "ok"
                 && body["transport"] == "http-helper"
                 && body["version"].is_string()
         })
+    {
+        ProxyHelperIdentity::Healthy
+    } else {
+        ProxyHelperIdentity::Foreign
+    }
 }
 
 #[cfg(test)]
 mod proxy_port_selection_tests {
-    use super::select_proxy_port;
+    use super::{ProxyHelperIdentity, select_proxy_port};
+
+    fn occupied(_: u16) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::AddrInUse.into())
+    }
 
     #[test]
     fn preserves_the_saved_port_when_available() {
         assert_eq!(
-            select_proxy_port(60000, |_| true, |_| panic!("unused"), || panic!("unused")),
+            select_proxy_port(60000, |_| Ok(()), |_| panic!("unused"), || panic!("unused")),
             60000
         );
     }
@@ -241,7 +315,12 @@ mod proxy_port_selection_tests {
     #[test]
     fn preserves_the_saved_port_when_another_launcher_is_healthy() {
         assert_eq!(
-            select_proxy_port(60000, |_| false, |_| true, || panic!("must not migrate")),
+            select_proxy_port(
+                60000,
+                occupied,
+                |_| ProxyHelperIdentity::Healthy,
+                || panic!("must not migrate")
+            ),
             60000
         );
     }
@@ -250,10 +329,50 @@ mod proxy_port_selection_tests {
     fn unavailable_default_or_saved_port_uses_available_port() {
         for preferred in [57321, 60000] {
             assert_eq!(
-                select_proxy_port(preferred, |_| false, |_| false, || 62000),
+                select_proxy_port(
+                    preferred,
+                    occupied,
+                    |_| ProxyHelperIdentity::Foreign,
+                    || 62000
+                ),
                 62000
             );
         }
+    }
+
+    #[test]
+    fn uncertain_helper_identity_does_not_migrate_an_occupied_port() {
+        assert_eq!(
+            select_proxy_port(
+                60000,
+                occupied,
+                |_| ProxyHelperIdentity::Unknown,
+                || panic!("must not migrate")
+            ),
+            60000
+        );
+    }
+
+    #[test]
+    fn windows_excluded_port_is_replaced_only_when_no_helper_is_listening() {
+        assert_eq!(
+            select_proxy_port(
+                57321,
+                |_| Err(std::io::ErrorKind::PermissionDenied.into()),
+                |_| ProxyHelperIdentity::Unavailable,
+                || 62000
+            ),
+            62000
+        );
+        assert_eq!(
+            select_proxy_port(
+                57321,
+                |_| Err(std::io::ErrorKind::PermissionDenied.into()),
+                |_| ProxyHelperIdentity::Healthy,
+                || panic!("must not migrate")
+            ),
+            57321
+        );
     }
 }
 pub const NO_AUTH_PROXY_BEARER_TOKEN: &str = "codex-plus-no-auth";

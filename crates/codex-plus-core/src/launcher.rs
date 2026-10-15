@@ -88,6 +88,15 @@ const MACOS_DEBUG_TAKEOVER_INTERVAL_MS: u64 = 100;
 /// 冷启动可以很慢，但 CDP 始终缺席时必须在有界时间内写入最终状态。
 const ENSURE_INJECTION_TIMEOUT_SECS: u64 = 120;
 
+async fn await_injection_with_timeout(
+    timeout: std::time::Duration,
+    injection: impl Future<Output = bool>,
+) -> bool {
+    tokio::time::timeout(timeout, injection)
+        .await
+        .unwrap_or(false)
+}
+
 /// 协议代理的端口写死在 `config.toml` 的 `base_url = "http://127.0.0.1:57321/v1"` 里，
 /// 不能像普通 helper 端口那样临时换一个空闲的，否则 Codex CLI 会连到没人监听的地址。
 /// 而管理器的「重启」是先强杀旧 launcher 再拉新的，旧 helper 交还监听要一小会儿；
@@ -440,12 +449,11 @@ pub trait LaunchHooks: Send + Sync {
             }
             false
         };
-        if tokio::time::timeout(
+        if await_injection_with_timeout(
             std::time::Duration::from_secs(ENSURE_INJECTION_TIMEOUT_SECS),
             injection,
         )
         .await
-        .unwrap_or(false)
         {
             return true;
         }
@@ -476,6 +484,31 @@ pub trait LaunchHooks: Send + Sync {
     ) -> anyhow::Result<()>;
     async fn shutdown_helper(&self, helper_port: u16);
     async fn terminate_codex(&self, launch: &CodexLaunch);
+}
+
+#[cfg(test)]
+mod injection_timeout_tests {
+    use super::await_injection_with_timeout;
+
+    #[tokio::test]
+    async fn injection_deadline_is_bounded_without_waiting_for_production_timeout() {
+        let result = await_injection_with_timeout(
+            std::time::Duration::from_millis(5),
+            async {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                true
+            },
+        )
+        .await;
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn injection_success_before_deadline_is_preserved() {
+        assert!(
+            await_injection_with_timeout(std::time::Duration::from_secs(1), async { true }).await
+        );
+    }
 }
 
 #[derive(Default)]
@@ -845,6 +878,14 @@ where
                 .await;
             } else {
                 if !hooks.debug_endpoint_available(debug_port) {
+                    keep_launched_on_error = !(cfg!(windows)
+                        && matches!(
+                            &launch,
+                            CodexLaunch::Process {
+                                wait_strategy: ProcessWaitStrategy::TrackedChild,
+                                ..
+                            }
+                        ));
                     anyhow::bail!(
                         "Codex 启动后未在调试端口 {debug_port} 提供页面连接；请确认旧实例已退出后重试"
                     );

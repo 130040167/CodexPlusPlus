@@ -2068,8 +2068,10 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
     // 此时直接启动只会激活旧实例，新的 CDP 参数不会生效。
     let cdp_available = codex_plus_core::cdp::endpoint_available(request.debug_port);
     #[cfg(windows)]
-    let desktop_process_running =
-        !codex_plus_core::watcher::find_main_codex_processes_without_debug_port().is_empty();
+    let desktop_process_running = !codex_plus_core::watcher::find_codex_processes_for_restart(
+        request.debug_port,
+    )
+    .is_empty();
     #[cfg(not(windows))]
     let desktop_process_running = false;
     if restart_disposition(
@@ -2127,7 +2129,7 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
             codex_plus_core::watcher::stop_codex_processes_for_debug_port_with_fallback(
                 request.debug_port,
                 true,
-            );
+            )?;
             #[cfg(not(windows))]
             codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(
                 request.debug_port,

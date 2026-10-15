@@ -903,6 +903,19 @@ pub fn find_main_codex_processes_without_debug_port() -> Vec<u32> {
         .collect()
 }
 
+/// 重启主实例时，既要识别尚未开放 CDP 的无参数主进程，也要识别已经带上目标
+/// 调试端口、但端点仍在启动或已经失去响应的实例。
+#[cfg(windows)]
+pub fn find_codex_processes_for_restart(debug_port: u16) -> Vec<u32> {
+    find_codex_processes()
+        .into_iter()
+        .filter(|pid| {
+            crate::windows_integration::process_command_line(*pid)
+                .is_some_and(|line| is_restart_target_command(&line, debug_port))
+        })
+        .collect()
+}
+
 #[cfg(any(windows, test))]
 fn is_unisolated_codex_main_command(line: &str) -> bool {
     let line = line.to_ascii_lowercase();
@@ -911,9 +924,15 @@ fn is_unisolated_codex_main_command(line: &str) -> bool {
         && !line.contains("--remote-debugging-port")
 }
 
+#[cfg(any(windows, test))]
+fn is_restart_target_command(line: &str, debug_port: u16) -> bool {
+    debug_port_from_command_line(line) == Some(debug_port)
+        || is_unisolated_codex_main_command(line)
+}
+
 #[cfg(test)]
 mod main_restart_target_tests {
-    use super::is_unisolated_codex_main_command;
+    use super::{is_restart_target_command, is_unisolated_codex_main_command};
 
     #[test]
     fn fallback_excludes_children_and_isolated_instances() {
@@ -925,6 +944,20 @@ mod main_restart_target_tests {
         ] {
             assert!(!is_unisolated_codex_main_command(&format!("ChatGPT.exe {args}")));
         }
+    }
+
+    #[test]
+    fn restart_detects_the_requested_debug_port_before_cdp_is_ready() {
+        for command in [
+            r#"Codex.exe --remote-debugging-port=9229"#,
+            r#"Codex.exe --type=renderer --remote-debugging-port 9229"#,
+        ] {
+            assert!(is_restart_target_command(command, 9229));
+        }
+        assert!(!is_restart_target_command(
+            r#"Codex.exe --user-data-dir=C:\instance --remote-debugging-port=9230"#,
+            9229,
+        ));
     }
 }
 
@@ -1055,7 +1088,7 @@ pub fn stop_launcher_processes_and_wait() {
         }),
         std::process::id(),
     );
-    terminate_and_wait_for_exit(
+    let _ = terminate_and_wait_for_exit(
         killable,
         RESTART_STOP_WAIT_TIMEOUT_MS,
         RESTART_STOP_WAIT_INTERVAL_MS,
@@ -1426,7 +1459,7 @@ pub fn stop_codex_processes() {
 
 #[cfg(windows)]
 pub fn stop_codex_processes_and_wait() {
-    terminate_and_wait_for_exit(
+    let _ = terminate_and_wait_for_exit(
         find_codex_processes(),
         RESTART_STOP_WAIT_TIMEOUT_MS,
         RESTART_STOP_WAIT_INTERVAL_MS,
@@ -1561,7 +1594,7 @@ pub fn stop_codex_processes_for_debug_port_and_wait(debug_port: u16) {
 /// 多开必须用这个语义：同机每个实例各带各的调试端口，按端口过滤才不会误杀。
 #[cfg(windows)]
 pub fn stop_codex_processes_for_debug_port_and_wait(debug_port: u16) {
-    stop_codex_processes_for_debug_port_with_fallback(debug_port, false);
+    let _ = stop_codex_processes_for_debug_port_with_fallback(debug_port, false);
 }
 
 /// Windows：结束指定调试端口的 Codex，允许在「按端口一个都没匹配到」时退回全局结束。
@@ -1576,17 +1609,37 @@ pub fn stop_codex_processes_for_debug_port_and_wait(debug_port: u16) {
 pub fn stop_codex_processes_for_debug_port_with_fallback(
     debug_port: u16,
     allow_global_fallback: bool,
-) {
+) -> anyhow::Result<()> {
     let process_ids = select_stop_targets(
         codex_instance_processes_for_debug_port(debug_port),
         find_main_codex_processes_without_debug_port,
         allow_global_fallback,
     );
-    terminate_and_wait_for_exit(
+    let remaining = terminate_and_wait_for_exit(
         process_ids,
         RESTART_STOP_WAIT_TIMEOUT_MS,
         RESTART_STOP_WAIT_INTERVAL_MS,
     );
+    ensure_processes_stopped(remaining, RESTART_STOP_WAIT_TIMEOUT_MS)
+}
+
+#[cfg(any(windows, test))]
+fn ensure_processes_stopped(
+    mut remaining: Vec<u32>,
+    timeout_ms: u64,
+) -> anyhow::Result<()> {
+    remaining.sort_unstable();
+    anyhow::ensure!(
+        remaining.is_empty(),
+        "Codex 进程未能在 {} 毫秒内退出，仍在运行：{}",
+        timeout_ms,
+        remaining
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(())
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -1596,7 +1649,7 @@ pub fn stop_codex_processes_for_debug_port_and_wait(_debug_port: u16) {
 
 #[cfg(test)]
 mod select_stop_targets_tests {
-    use super::select_stop_targets;
+    use super::{ensure_processes_stopped, select_stop_targets};
 
     // 多开：不允许退回全局，否则「结束一个实例」会杀掉全部 Codex（本次修的 P0）。
     #[test]
@@ -1638,6 +1691,15 @@ mod select_stop_targets_tests {
             true,
         );
         assert!(!called);
+    }
+
+    #[test]
+    fn remaining_stop_targets_are_reported_as_an_error() {
+        let error = ensure_processes_stopped(vec![42, 7], 500).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("500"));
+        assert!(message.contains("7, 42"));
+        assert!(ensure_processes_stopped(Vec::new(), 500).is_ok());
     }
 }
 
@@ -1932,9 +1994,13 @@ fn is_macos_codex_desktop_main_with(
 }
 
 #[cfg(windows)]
-fn terminate_and_wait_for_exit(process_ids: Vec<u32>, timeout_ms: u64, interval_ms: u64) {
+fn terminate_and_wait_for_exit(
+    process_ids: Vec<u32>,
+    timeout_ms: u64,
+    interval_ms: u64,
+) -> Vec<u32> {
     if process_ids.is_empty() {
-        return;
+        return Vec::new();
     }
     for process_id in &process_ids {
         let _ = crate::windows_integration::terminate_process(*process_id);
@@ -1955,7 +2021,7 @@ fn terminate_and_wait_for_exit(process_ids: Vec<u32>, timeout_ms: u64, interval_
                     }),
                 );
             }
-            break;
+            return remaining;
         }
         std::thread::sleep(Duration::from_millis(interval_ms));
     }

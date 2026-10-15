@@ -22,7 +22,7 @@ fn proxy_port_reader_child() {
     if mode == "healthy" {
         assert_eq!(selected, preferred, "健康的跨进程代理端口不能迁移");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
-    } else {
+    } else if mode != "concurrent" {
         assert_ne!(selected, preferred, "真正被其他服务占用时应选择可用端口");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -33,9 +33,14 @@ fn proxy_port_reader_child() {
         codex_plus_core::protocol_proxy::protocol_proxy_port(),
         selected
     );
+    println!("selected-port:{selected}");
 }
 
 fn check_running_service(mode: &str, status: &str, body: &str) {
+    check_running_service_with_delay(mode, status, body, Duration::ZERO);
+}
+
+fn check_running_service_with_delay(mode: &str, status: &str, body: &str, delay: Duration) {
     let temp = tempfile::tempdir().unwrap();
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -78,6 +83,7 @@ fn check_running_service(mode: &str, status: &str, body: &str) {
                         String::from_utf8_lossy(&request)
                     );
                     thread_requests.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(delay);
                     let _ = stream.write_all(response.as_bytes());
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -89,21 +95,41 @@ fn check_running_service(mode: &str, status: &str, body: &str) {
     });
     // 显式复现无 HTTP 请求的连接，验证它不会阻止后续真实健康检查。
     drop(TcpStream::connect(("127.0.0.1", port)).unwrap());
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "proxy_port_reader_child", "--nocapture"])
-        .env(CHILD_MODE, mode)
-        .env("CODEX_PLUS_STATE_DIR", temp.path())
-        .env_remove("CODEX_PLUS_PROTOCOL_PROXY_PORT")
-        .output();
+    let child_count = if mode == "concurrent" { 8 } else { 1 };
+    let children = (0..child_count)
+        .map(|_| {
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "proxy_port_reader_child", "--nocapture"])
+                .env(CHILD_MODE, mode)
+                .env("CODEX_PLUS_STATE_DIR", temp.path())
+                .env_remove("CODEX_PLUS_PROTOCOL_PROXY_PORT")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let outputs = children
+        .into_iter()
+        .map(|child| child.wait_with_output().unwrap())
+        .collect::<Vec<_>>();
     stop.store(true, Ordering::Relaxed);
     server.join().unwrap();
-    let output = output.unwrap();
-    assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let persisted = std::fs::read_to_string(&path).unwrap();
+    for output in outputs {
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == format!("selected-port:{persisted}")),
+            "每个读取进程必须使用同一个原子保存的端口"
+        );
+    }
     assert!(
         requests.load(Ordering::Relaxed) > 0,
         "必须实际探测 helper 身份"
@@ -136,4 +162,19 @@ fn unhealthy_helper_does_not_keep_the_occupied_port() {
 #[test]
 fn malformed_helper_response_does_not_keep_the_occupied_port() {
     check_running_service("malformed", "200 OK", "invalid json");
+}
+
+#[test]
+fn slow_healthy_helper_keeps_the_saved_port_on_probe_timeout() {
+    check_running_service_with_delay(
+        "healthy",
+        "200 OK",
+        r#"{"status":"ok","transport":"http-helper","version":"1.9.0"}"#,
+        Duration::from_millis(1600),
+    );
+}
+
+#[test]
+fn concurrent_readers_coordinate_a_single_port_migration() {
+    check_running_service("concurrent", "200 OK", r#"{"status":"ok"}"#);
 }

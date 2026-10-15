@@ -1820,8 +1820,14 @@ async fn launch_lifecycle_fails_and_cleans_up_when_debug_endpoint_is_unavailable
         assert!(error.to_string().contains("未在调试端口 9229 提供页面连接"));
         let events = events.lock().unwrap().clone();
         assert!(events.contains(&"shutdown-helper:57321".to_string()));
-        // 未确认实例身份时不能误杀其他 Codex，只清理本次启动的 helper。
-        assert!(!events.iter().any(|event| event.starts_with("terminate-")));
+        if packaged || !cfg!(windows) {
+            // AUMID 可能只是激活已有实例，不能把返回的 PID 当成本次独占所有权。
+            assert!(!events.iter().any(|event| event.starts_with("terminate-")));
+        } else {
+            // TrackedChild 是本次 launcher 明确创建的，失败后必须清理，避免留下无 helper
+            // 且无法通过 CDP 接管的残留实例。
+            assert!(events.contains(&"terminate-codex".to_string()));
+        }
         assert!(!events.contains(&"status:running_degraded".to_string()));
         assert_eq!(
             status_store.load_latest().unwrap().unwrap().status,
