@@ -11162,6 +11162,8 @@
             ? codexModelCatalogPromise
             : codexModelCatalog;
         }
+        // 在目录替换前记录选中模型的供应商；裸 ID 在新目录中可能已经代表另一家。
+        captureCodexAggregateSelectedModels();
         codexModelCatalog = nextCatalog;
         codexModelCatalogAppliedEpoch += 1;
         codexModelCatalogLoadedAt = Date.now();
@@ -11177,6 +11179,7 @@
             ? codexModelCatalogPromise
             : codexModelCatalog;
         }
+        captureCodexAggregateSelectedModels();
         codexModelCatalog = { status: "failed", message: String(error?.message || error), model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
         codexModelCatalogAppliedEpoch += 1;
         codexModelCatalogLoadedAt = Date.now();
@@ -11396,11 +11399,18 @@
     return belongsToProfile ? new Set(codexPlusModelNames()) : null;
   }
 
-  function codexAggregateSelectedModelTarget(model, hostId) {
+  function codexAggregateSelectedModelTarget(model, hostId, groupId = "") {
     const allowed = codexAggregateAllowedModelSet(hostId);
-    if (!allowed || typeof model !== "string" || allowed.has(model)) return "";
+    if (!allowed || typeof model !== "string") return "";
     const defaultGroup = codexModelCatalog.codex_plus_default_group_id;
     if (typeof defaultGroup !== "string" || !defaultGroup) return "";
+    if (groupId) {
+      const base = model.startsWith("cpx-") ? model.slice(model.indexOf("/") + 1) : model;
+      const target = groupId === defaultGroup ? base : `cpx-${groupId}/${base}`;
+      return target !== model && allowed.has(target)
+        && codexPlusModelMetadata(target)?.codex_plus_group_id === groupId ? target : "";
+    }
+    if (allowed.has(model)) return "";
     const prefix = `cpx-${defaultGroup}/`;
     if (!model.startsWith(prefix)) return "";
     const target = model.slice(prefix.length);
@@ -11409,28 +11419,58 @@
       ? target : "";
   }
 
-  function syncCodexAggregateSelectedModel() {
-    if (!codexAggregateAllowedModelSet("local")) return false;
-    const attempts = window.__codexPlusAggregateModelSelectionAttempts
-      || (window.__codexPlusAggregateModelSelectionAttempts = new WeakMap());
-    let changed = false;
+  function codexAggregateModelPickers() {
+    const pickers = [];
     for (const node of document.querySelectorAll("[data-codex-intelligence-trigger]")) {
       const key = Object.keys(node).find((name) => name.startsWith("__reactFiber$"));
       let fiber = key ? node[key] : null;
       let picker = null;
       let hostId = "";
-      for (let depth = 0; fiber && depth < 64; depth += 1, fiber = fiber.return) {
+      let owner = "";
+      for (let depth = 0; fiber && depth < 128; depth += 1, fiber = fiber.return) {
         const props = fiber.memoizedProps || {};
         if (!picker && typeof props.model === "string" && typeof props.onSelectModel === "function"
             && Array.isArray(props.models)) picker = props;
-        if (typeof props.permissionsHostId === "string" && props.permissionsHostId.trim()) {
+        if (!hostId && typeof props.permissionsHostId === "string" && props.permissionsHostId.trim()) {
           hostId = props.permissionsHostId.trim();
-          break;
         }
+        if (!owner && typeof props.threadId === "string") owner = props.threadId;
       }
-      if (!picker || hostId !== "local" || picker.lockedModelSlug || picker.modelOptionsDisabled
-          || picker.modelSelectionDisabled) continue;
-      const target = codexAggregateSelectedModelTarget(picker.model, hostId);
+      if (picker && hostId === "local" && !picker.lockedModelSlug && !picker.modelOptionsDisabled
+          && !picker.modelSelectionDisabled) pickers.push({ node, picker, owner });
+    }
+    return pickers;
+  }
+
+  function captureCodexAggregateSelectedModels() {
+    if (!codexAggregateAllowedModelSet("local")) return;
+    const identities = window.__codexPlusAggregateModelSelectionIdentities
+      || (window.__codexPlusAggregateModelSelectionIdentities = new WeakMap());
+    const profileId = codexRemoteSessionActiveProfile()?.id;
+    for (const { node, picker, owner } of codexAggregateModelPickers()) {
+      const previous = identities.get(node);
+      // 连续保存时 React 可能尚未消费上一次迁移，保留最初的供应商身份。
+      if (previous && previous.model === picker.model && previous.owner === owner
+          && previous.profileId === profileId) continue;
+      const groupId = codexPlusModelMetadata(picker.model)?.codex_plus_group_id;
+      if (typeof groupId === "string" && groupId) {
+        identities.set(node, { model: picker.model, groupId, owner, profileId });
+      }
+    }
+  }
+
+  function syncCodexAggregateSelectedModel() {
+    if (!codexAggregateAllowedModelSet("local")) return false;
+    const attempts = window.__codexPlusAggregateModelSelectionAttempts
+      || (window.__codexPlusAggregateModelSelectionAttempts = new WeakMap());
+    let changed = false;
+    for (const { node, picker, owner } of codexAggregateModelPickers()) {
+      const identities = window.__codexPlusAggregateModelSelectionIdentities;
+      const identity = identities?.get(node);
+      const retained = identity?.model === picker.model && identity?.owner === owner
+        && identity?.profileId === codexRemoteSessionActiveProfile()?.id;
+      if (identity && !retained) identities.delete(node);
+      const target = codexAggregateSelectedModelTarget(picker.model, "local", retained ? identity.groupId : "");
       // 等 React 消费新列表后再调用原生选择入口，保留当前思考等级。
       if (!target || !picker.models.some((entry) => entry?.model === target)) continue;
       const signature = `${codexModelCatalogAppliedEpoch}:${picker.model}:${target}:${picker.reasoningEffort || ""}`;

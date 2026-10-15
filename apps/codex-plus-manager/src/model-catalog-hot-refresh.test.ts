@@ -41,6 +41,7 @@ async function catalogRuntime() {
     sendCodexPlusDiagnostic: () => undefined,
     codexPlusModelPickerCatalogChanged: () => undefined,
     refreshCachedLocalModelQueries: () => undefined,
+    captureCodexAggregateSelectedModels: () => undefined,
   });
   const api = vm.runInContext(
     `(function () {${source.slice(start, end)}\nreturn { observeCodexModelCatalogRevision, state: () => ({ revision: codexModelCatalogRevision, models: [...codexModelCatalog.models], epoch: codexModelCatalogAppliedEpoch }) };})()`,
@@ -187,7 +188,8 @@ async function aggregateQueryRuntime() {
     "codexPlusModelDescriptor", "modelArrayLooksPatchable", "modelFilterPolicy",
     "sameModelCollection", "prepareModelCollection", "finishModelCollection",
     "codexPureApiAllowedModelSet", "codexAggregateAllowedModelSet", "patchModelArray",
-    "codexAggregateSelectedModelTarget", "syncCodexAggregateSelectedModel",
+    "codexAggregateSelectedModelTarget", "codexAggregateModelPickers",
+    "captureCodexAggregateSelectedModels", "syncCodexAggregateSelectedModel",
     "codexPlusLocalModelQuery", "cloneCodexPlusModelCollection",
     "patchCachedLocalModelQueryData", "codexPlusModelQueryCollection",
     "refreshCachedLocalModelQueries", "installCodexPlusModelQueryPublication",
@@ -246,7 +248,7 @@ async function aggregateQueryRuntime() {
     return {
       refresh: refreshCachedLocalModelQueries,
       install: () => installCodexPlusModelQueryPublication(client),
-      catalog: value => { codexModelCatalog = value; codexModelCatalogAppliedEpoch++; },
+      catalog: value => { captureCodexAggregateSelectedModels(); codexModelCatalog = value; codexModelCatalogAppliedEpoch++; },
       profile: value => { profile = value; },
       unlock: value => { unlocked = value; },
       syncSelection: syncCodexAggregateSelectedModel,
@@ -346,7 +348,9 @@ it("a newly default member's retired prefix migrates through the native picker w
   props.model = "model-0";
   assert.equal(runtime.syncSelection(), false, "a canonical ID remains unchanged");
   runtime.catalog(catalog("b"));
-  assert.equal(runtime.syncSelection(), false, "bare selections follow the new default as agreed");
+  props.models = catalog("b").models.map((model) => ({ model }));
+  assert.equal(runtime.syncSelection(), true, "the previous default keeps its provider");
+  assert.deepEqual(selections.at(-1), ["cpx-a/model-0", "high"]);
   props.model = "cpx-b/model-2";
   props.models = catalog("b").models.map((model) => ({ model }));
   assert.equal(runtime.syncSelection(), true);
@@ -391,4 +395,59 @@ it("selection migration requires the same provider, current models, local host a
   props.modelSelectionDisabled = false;
   assert.equal(runtime.syncSelection(), true);
   assert.equal(calls, 1);
+});
+
+it("default changes preserve provider identity through stale lists, rerenders and repeated switches", async () => {
+  const { runtime, catalog, nodes } = await aggregateQueryRuntime();
+  runtime.catalog(catalog("a"));
+  const selections: unknown[][] = [];
+  const props = {
+    model: "model-0", reasoningEffort: "ultra",
+    models: catalog("a").models.map((model) => ({ model })),
+    onSelectModel: (...args: unknown[]) => { selections.push(args); },
+  };
+  nodes.push({ __reactFiber$test: { memoizedProps: props, return: { memoizedProps: { permissionsHostId: "local", threadId: "thread-a" } } } });
+  runtime.catalog(catalog("b"));
+  assert.equal(runtime.syncSelection(), false, "wait until the target exists in React's list");
+  props.onSelectModel = (...args: unknown[]) => { selections.push(args); };
+  runtime.catalog(catalog("b"));
+  props.models = catalog("b").models.map((model) => ({ model }));
+  assert.equal(runtime.syncSelection(), true, "a rerender must not lose the old provider");
+  assert.deepEqual(selections.at(-1), ["cpx-a/model-0", "ultra"]);
+  props.model = "cpx-a/model-0";
+  assert.equal(runtime.syncSelection(), false);
+  runtime.catalog(catalog("a"));
+  props.models = catalog("a").models.map((model) => ({ model }));
+  assert.equal(runtime.syncSelection(), true);
+  assert.deepEqual(selections.at(-1), ["model-0", "ultra"]);
+  props.model = "model-0";
+  runtime.syncSelection();
+  props.model = "cpx-b/model-2";
+  runtime.catalog(catalog("b"));
+  props.models = catalog("b").models.map((model) => ({ model }));
+  assert.equal(runtime.syncSelection(), true);
+  assert.deepEqual(selections.at(-1), ["model-2", "ultra"], "an explicit new selection uses its own provider");
+});
+
+it("removed models and reused composer nodes cannot reroute a selection to another provider", async () => {
+  const { runtime, catalog, nodes } = await aggregateQueryRuntime();
+  runtime.catalog(catalog("a"));
+  const selections: unknown[][] = [];
+  const props = {
+    model: "model-0", reasoningEffort: "high",
+    models: catalog("a").models.map((model) => ({ model })),
+    onSelectModel: (...args: unknown[]) => { selections.push(args); },
+  };
+  const owner = { permissionsHostId: "local", threadId: "one" };
+  nodes.push({ __reactFiber$test: { memoizedProps: props, return: { memoizedProps: owner } } });
+  const after = catalog("b");
+  after.models = after.models.filter((model) => model !== "cpx-a/model-0");
+  runtime.catalog(after);
+  props.models = after.models.map((model) => ({ model }));
+  assert.equal(runtime.syncSelection(), false, "do not substitute the new default's same-name model");
+  owner.threadId = "two";
+  runtime.catalog(catalog("b"));
+  props.models = catalog("b").models.map((model) => ({ model }));
+  assert.equal(runtime.syncSelection(), false, "a reused DOM node is a different session");
+  assert.deepEqual(selections, []);
 });
