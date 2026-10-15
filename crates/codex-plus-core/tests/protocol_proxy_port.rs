@@ -2,10 +2,10 @@
 #![cfg(windows)]
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 const CHILD_MODE: &str = "CODEX_PLUS_TEST_PROXY_PORT_MODE";
@@ -48,6 +48,8 @@ fn check_running_service(mode: &str, status: &str, body: &str) {
     );
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let thread_requests = requests.clone();
     let server = std::thread::spawn(move || {
         while !thread_stop.load(Ordering::Relaxed) {
             match listener.accept() {
@@ -66,7 +68,16 @@ fn check_running_service(mode: &str, status: &str, body: &str) {
                         }
                         request.push(byte[0]);
                     }
-                    assert!(request.starts_with(b"GET /backend/status HTTP/1.1\r\n"));
+                    // Windows runner 的端口探测可能只连接后立即断开，不应终止 fixture。
+                    if request.is_empty() {
+                        continue;
+                    }
+                    assert!(
+                        request.starts_with(b"GET /backend/status HTTP/1.1\r\n"),
+                        "unexpected fixture request: {:?}",
+                        String::from_utf8_lossy(&request)
+                    );
+                    thread_requests.fetch_add(1, Ordering::Relaxed);
                     let _ = stream.write_all(response.as_bytes());
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -76,6 +87,8 @@ fn check_running_service(mode: &str, status: &str, body: &str) {
             }
         }
     });
+    // 显式复现无 HTTP 请求的连接，验证它不会阻止后续真实健康检查。
+    drop(TcpStream::connect(("127.0.0.1", port)).unwrap());
     let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "proxy_port_reader_child", "--nocapture"])
         .env(CHILD_MODE, mode)
@@ -90,6 +103,10 @@ fn check_running_service(mode: &str, status: &str, body: &str) {
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        requests.load(Ordering::Relaxed) > 0,
+        "必须实际探测 helper 身份"
     );
 }
 
