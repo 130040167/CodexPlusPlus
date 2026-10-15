@@ -185,6 +185,7 @@ pub fn run() {
             commands::delete_user_script,
             commands::refresh_skill_catalog,
             commands::list_installed_skills,
+            commands::import_ccs_skills,
             commands::install_skill,
             commands::update_skill,
             commands::set_skill_enabled,

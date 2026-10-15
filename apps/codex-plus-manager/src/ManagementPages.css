@@ -15,3 +15,5 @@
 .screen.management-screen .mg-page>.mg-content>.mg-matrix,
 .screen.management-screen .mg-page>.mg-content>.mg-skill-list,
 .screen.management-screen .mg-page>.mg-content>.mg-session-list{flex:1 1 auto;min-height:0;overflow-x:hidden;overflow-y:auto}
+/* Skill repository inventory */
+.mg-repo-panel{margin-top:12px;border:1px solid hsl(var(--border));border-radius:9px;background:hsl(var(--card));overflow:hidden}.mg-repo-panel-head,.mg-repo-row{display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:1px solid hsl(var(--border))}.mg-repo-panel-head{background:hsl(var(--muted));font-size:12px}.mg-repo-panel-head span{margin-left:auto;color:hsl(var(--muted-foreground))}.mg-repo-row>div{min-width:0;flex:1;display:flex;flex-direction:column;gap:3px}.mg-repo-row small{color:hsl(var(--muted-foreground));font-size:11px}.mg-repo-row:last-child{border-bottom:0}

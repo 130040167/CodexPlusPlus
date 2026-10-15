@@ -358,8 +358,8 @@ impl SkillsManager {
                 description,
                 repo_key: String::new(),
                 repo_path: String::new(),
-                installed: false,
-                enabled: true,
+                installed: true,
+                enabled: is_linked(&path),
                 bundled: false,
                 content_hash: String::new(),
                 remote_hash: String::new(),
@@ -367,6 +367,46 @@ impl SkillsManager {
             });
         }
         skills
+    }
+
+    /// 从外部 Skill 目录导入到 Codex++ 的受控源目录，并默认启用。
+    pub fn import_from_directory(
+        &self,
+        id: &str,
+        external_dir: &Path,
+    ) -> anyhow::Result<SkillsState> {
+        validate_skill_id(id)?;
+        let manifest = external_dir.join(SKILL_MANIFEST_FILE);
+        if !manifest.is_file() {
+            anyhow::bail!("{} 下没有 SKILL.md，不是有效的 Skill", external_dir.display());
+        }
+        let destination = self.source_dir.join(id);
+        if destination.exists() || std::fs::symlink_metadata(&destination).is_ok() {
+            remove_link(&destination)?;
+        }
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("创建目录失败：{}", parent.display()))?;
+        }
+        copy_dir_all(external_dir, &destination)?;
+        let (name, description) = read_skill_manifest(&manifest, id);
+        let _guard = self.state_lock.lock().unwrap();
+        let mut state = self.load_state_unlocked();
+        state.installed.insert(
+            id.to_string(),
+            InstalledSkill {
+                id: id.to_string(),
+                name,
+                description,
+                repo_key: "cc-switch".to_string(),
+                content_hash: String::new(),
+                installed_at: current_unix_timestamp_string(),
+            },
+        );
+        self.save_state_unlocked(&state)?;
+        drop(_guard);
+        self.set_enabled(id, true)?;
+        Ok(self.load_state())
     }
 
     /// codex 随包附带的 `.system` skill，只列出来让用户知道有这些，不参与安装。
@@ -489,6 +529,30 @@ impl SkillsManager {
         let source = self.source_dir.join(id);
         let link = self.linked_dir().join(id);
         if !enabled {
+            if !source.is_dir() && link.is_dir() && !std::fs::symlink_metadata(&link)?.file_type().is_symlink() {
+                if let Some(parent) = source.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if std::fs::rename(&link, &source).is_err() {
+                    copy_dir_all(&link, &source)
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    std::fs::remove_dir_all(&link)?;
+                }
+                let manifest = source.join(SKILL_MANIFEST_FILE);
+                let (name, description) = read_skill_manifest(&manifest, id);
+                let _guard = self.state_lock.lock().unwrap();
+                let mut state = self.load_state_unlocked();
+                state.installed.entry(id.to_string()).or_insert(InstalledSkill {
+                    id: id.to_string(),
+                    name,
+                    description,
+                    repo_key: String::new(),
+                    content_hash: String::new(),
+                    installed_at: current_unix_timestamp_string(),
+                });
+                self.save_state_unlocked(&state)?;
+                return Ok(());
+            }
             return remove_link(&link);
         }
         if !source.is_dir() {
@@ -1563,7 +1627,26 @@ mod tests {
         assert_eq!(entry.name, "我的技能");
         assert_eq!(entry.description, "本地自建");
         assert!(!entry.bundled);
+        assert!(entry.installed);
         assert!(entry.enabled);
+    }
+
+    #[test]
+    fn locally_created_skill_can_be_disabled_without_deleting_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let local = manager.linked_dir().join("my-own-skill");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join(SKILL_MANIFEST_FILE), "---\nname: local\n---\n").unwrap();
+
+        manager.set_enabled("my-own-skill", false).unwrap();
+
+        assert!(!manager.linked_dir().join("my-own-skill").exists());
+        assert!(manager.source_dir().join("my-own-skill").join(SKILL_MANIFEST_FILE).exists());
+        assert!(!manager.merge_entries(&[]).iter().find(|entry| entry.id == "my-own-skill").unwrap().enabled);
+
+        manager.set_enabled("my-own-skill", true).unwrap();
+        assert!(manager.linked_dir().join("my-own-skill").exists());
     }
 
     /// 没有 SKILL.md 的目录、以及 `.system` 自带目录，都不应被当成「本地自建」重复收录。

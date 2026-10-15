@@ -5287,6 +5287,44 @@ pub fn list_installed_skills() -> CommandResult<SkillsPayload> {
     ok("已加载本地 Skills。", payload)
 }
 
+/// 导入 cc-switch 已安装的 Skills。cc-switch 的 Skill 文件位于
+/// `%USERPROFILE%/.cc-switch/skills/<id>/SKILL.md`，不在其 SQLite 数据库中。
+#[tauri::command]
+pub fn import_ccs_skills() -> CommandResult<SkillsPayload> {
+    let manager = default_skills_manager();
+    let root = codex_plus_core::ccs_import::default_ccs_skills_dir();
+    let Ok(dir) = std::fs::read_dir(&root) else {
+        return failed(
+            &format!("未找到 cc-switch Skills 目录：{}", root.display()),
+            current_skills_payload(&manager),
+        );
+    };
+    let mut imported = 0usize;
+    let mut errors = Vec::new();
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        match manager.import_from_directory(&id, &path) {
+            Ok(_) => imported += 1,
+            Err(error) => errors.push(format!("{id}：{error}")),
+        }
+    }
+    let payload = current_skills_payload(&manager);
+    if errors.is_empty() {
+        ok(&format!("已从 cc-switch 导入 {imported} 个 Skill。"), payload)
+    } else {
+        failed(
+            &format!("已从 cc-switch 导入 {imported} 个 Skill，{} 个失败：{}", errors.len(), errors.join("；")),
+            payload,
+        )
+    }
+}
+
 #[tauri::command]
 pub async fn install_skill(repo_key: String, id: String) -> CommandResult<SkillsPayload> {
     install_or_update_skill(&repo_key, &id, "Skill 已安装。", "安装 Skill 失败").await
