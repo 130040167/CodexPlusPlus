@@ -11014,6 +11014,11 @@
     || (window.__codexPlusModelDescriptorSnapshots = new WeakMap());
   const codexPlusModelContainerSnapshots = window.__codexPlusModelContainerSnapshots
     || (window.__codexPlusModelContainerSnapshots = new WeakMap());
+  const codexPlusModelDescriptorFields = [
+    "hidden", "displayName", "description", "defaultReasoningEffort",
+    "contextWindow", "maxContextWindow", "context_window", "max_context_window",
+    "supportedReasoningEfforts",
+  ];
 
   if (window.__CODEX_PLUS_TEST_SERVICE_TIER__) {
     window.__codexPlusServiceTierTest = {
@@ -11224,12 +11229,6 @@
   function stringArrayLooksPatchable(value) {
     return Array.isArray(value) && value.every((item) => typeof item === "string");
   }
-
-  const codexPlusModelDescriptorFields = [
-    "hidden", "displayName", "description", "defaultReasoningEffort",
-    "contextWindow", "maxContextWindow", "context_window", "max_context_window",
-    "supportedReasoningEfforts",
-  ];
 
   function patchCodexPlusModelDescriptor(descriptor, modelName) {
     const before = new Map(codexPlusModelDescriptorFields.map((key) => [key, {

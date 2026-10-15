@@ -3430,6 +3430,14 @@ fn injection_script_unlocks_custom_model_catalog() {
 #[test]
 fn model_whitelist_never_claims_the_host_default_model() {
     let script = assets::injection_script(57321);
+    let state_start = script
+        .find("  const codexPlusModelCollectionSnapshots =")
+        .expect("model snapshot state should exist");
+    let state_end = script[state_start..]
+        .find("\n  if (window.__CODEX_PLUS_TEST_SERVICE_TIER__)")
+        .map(|offset| state_start + offset)
+        .expect("model state should initialize before the test entry point");
+    let state_source = &script[state_start..state_end];
     let start = script
         .find("function codexPlusModelDescriptor(modelName)")
         .expect("model descriptor patch should exist");
@@ -3457,25 +3465,25 @@ const codexPlusModelNames = () => ["supplier-default", "extra-model"];
 const codexRemoteSessionActiveProfile = () => ({{ id: "custom", relayMode: "official" }});
 const codexPlusModelUnlockEnabled = () => true;
 const codexPlusBackendSettingsLoaded = true;
-const codexPlusModelCollectionSnapshots = new WeakMap();
-const codexPlusModelDefaultSnapshots = new WeakMap();
+const window = {{}};
+{state_source}
 {function_source}
 
 const missingDefault = {{ value: {{ available_models: ["native-model"] }} }};
-const patchedMissingDefault = patchStatsigModelDynamicConfig(missingDefault);
+const patchedMissingDefault = patchStatsigModelDynamicConfig(missingDefault, "local");
 if (Object.prototype.hasOwnProperty.call(patchedMissingDefault.value, "default_model")) process.exit(2);
 if (!patchedMissingDefault.value.available_models.includes("supplier-default")) process.exit(3);
 if (!patchedMissingDefault.value.available_models.includes("extra-model")) process.exit(4);
 
 const existingDefault = {{ value: {{ available_models: ["native-model"], default_model: "thread-model" }} }};
-const patchedExistingDefault = patchStatsigModelDynamicConfig(existingDefault);
+const patchedExistingDefault = patchStatsigModelDynamicConfig(existingDefault, "local");
 if (patchedExistingDefault.value.default_model !== "thread-model") process.exit(5);
 
 const missingContainerDefault = {{
   models: [{{ model: "native-model", isDefault: true }}],
   availableModels: ["native-model"],
 }};
-patchModelContainer(missingContainerDefault);
+patchModelContainer(missingContainerDefault, "local");
 if (Object.prototype.hasOwnProperty.call(missingContainerDefault, "defaultModel")) process.exit(6);
 if (Object.prototype.hasOwnProperty.call(missingContainerDefault, "model")) process.exit(7);
 const injectedDefault = missingContainerDefault.models.find((item) => item.model === "supplier-default");
@@ -3489,9 +3497,22 @@ const existingContainerDefault = {{
   defaultModel: hostDefault,
   model: hostModel,
 }};
-patchModelContainer(existingContainerDefault);
+patchModelContainer(existingContainerDefault, "local");
 if (existingContainerDefault.defaultModel !== hostDefault) process.exit(9);
 if (existingContainerDefault.model !== hostModel) process.exit(10);
+
+// 未知与远程主机不能借用本地目录，也不能修改主机默认值。
+for (const hostId of ["", "ssh:test"]) {{
+  const native = {{ value: {{ available_models: ["native-model"], default_model: "native-model" }} }};
+  const patched = patchStatsigModelDynamicConfig(native, hostId);
+  if (patched.value.available_models.join(",") !== "native-model") process.exit(11);
+  if (patched.value.default_model !== "native-model") process.exit(12);
+  const descriptor = {{ model: "supplier-default", hidden: true }};
+  const container = {{ models: [descriptor], defaultModel: hostDefault }};
+  patchModelContainer(container, hostId);
+  if (container.models.length !== 1 || descriptor.hidden !== true) process.exit(13);
+  if (container.defaultModel !== hostDefault) process.exit(14);
+}}
 "#
         ),
     )
