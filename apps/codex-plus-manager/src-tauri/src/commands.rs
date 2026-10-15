@@ -5447,10 +5447,25 @@ pub fn delete_skill_backup(backup_id: String) -> CommandResult<SkillsPayload> {
 }
 
 #[tauri::command]
-pub fn upsert_skill_repo(repo: codex_plus_core::skills::SkillRepo, previous_key: Option<String>) -> CommandResult<SkillsPayload> {
+pub async fn upsert_skill_repo(repo: codex_plus_core::skills::SkillRepo, previous_key: Option<String>) -> CommandResult<SkillsPayload> {
     let manager = default_skills_manager();
+    let repo_key = repo.key();
+    let cached = cached_repo_skills(&repo_key);
+    let skills = match codex_plus_core::skills::fetch_repo_skills(&repo, &cached).await {
+        Ok(skills) => skills,
+        Err(error) => {
+            return failed(
+                &format!("仓库不可访问或不存在，未保存：{error}"),
+                current_skills_payload(&manager),
+            );
+        }
+    };
     match manager.save_repo(repo, previous_key.as_deref()) {
-        Ok(_) => ok("仓库源已保存。", current_skills_payload(&manager)),
+        Ok(_) => {
+            store_repo_skills(&repo_key, &skills);
+            let count = skills.len();
+            ok(&format!("仓库已验证并保存，发现 {count} 个 Skill。"), current_skills_payload(&manager))
+        }
         Err(error) => failed(
             &format!("保存仓库源失败：{error}"),
             current_skills_payload(&manager),
