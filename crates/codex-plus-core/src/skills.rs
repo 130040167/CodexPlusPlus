@@ -835,6 +835,95 @@ pub fn parse_skills_from_tree(repo: &SkillRepo, tree: &Value) -> Vec<RemoteSkill
         .collect()
 }
 
+/// GitHub API 限流时，从公开仓库的 codeload 压缩包构造同样的文件树。
+/// codeload 不占 GitHub API 配额，且能同时读取 SKILL.md 的元数据。
+async fn fetch_repo_skills_from_zip(
+    repo: &SkillRepo,
+    cached: &BTreeMap<String, RemoteSkill>,
+    client: &reqwest::Client,
+) -> anyhow::Result<Vec<RemoteSkill>> {
+    let response = with_github_auth(client.get(repo_zip_url(repo)))
+        .header(reqwest::header::ACCEPT, "application/zip")
+        .send()
+        .await
+        .with_context(|| format!("下载 {}/{} 的仓库压缩包失败", repo.owner, repo.name))?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!(
+            "下载 {}/{} 的仓库压缩包失败：HTTP {}{}",
+            repo.owner,
+            repo.name,
+            status.as_u16(),
+            github_status_hint(status.as_u16())
+        );
+    }
+    let bytes = response.bytes().await.context("读取仓库压缩包内容失败")?;
+    if bytes.len() > REPO_ZIP_DOWNLOAD_LIMIT_BYTES {
+        anyhow::bail!("仓库压缩包太大：{} 字节", bytes.len());
+    }
+
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(bytes.as_ref())).context("skill 仓库压缩包无法解析")?;
+    let root = (0..archive.len())
+        .find_map(|index| {
+            let file = archive.by_index(index).ok()?;
+            file.name().split('/').next().map(str::to_string)
+        })
+        .context("仓库压缩包为空")?;
+    let prefix = if repo.subdir.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", repo.subdir.trim_matches('/'))
+    };
+    let mut tree_items = Vec::new();
+    let mut manifests = BTreeMap::new();
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index)?;
+        let name = file.name().trim_start_matches('/').to_string();
+        let Some(relative) = name.strip_prefix(format!("{root}/").as_str()) else {
+            continue;
+        };
+        let relative = relative.to_string();
+        if relative.is_empty() || file.is_dir() {
+            continue;
+        }
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)?;
+        let mut hasher = Sha256::new();
+        hasher.update(&contents);
+        let sha = format!("{:x}", hasher.finalize());
+        tree_items.push(serde_json::json!({
+            "type": "blob",
+            "path": relative,
+            "sha": sha,
+        }));
+        let is_manifest = relative == format!("{prefix}{SKILL_MANIFEST_FILE}")
+            || relative
+                .strip_prefix(prefix.as_str())
+                .is_some_and(|path| path.ends_with(&format!("/{SKILL_MANIFEST_FILE}")));
+        if is_manifest {
+            manifests.insert(relative.to_string(), String::from_utf8_lossy(&contents).into_owned());
+        }
+    }
+    let tree = serde_json::json!({ "tree": tree_items });
+    let mut skills = parse_skills_from_tree(repo, &tree);
+    for skill in &mut skills {
+        if let Some(hit) = cached.get(&skill.id) {
+            if hit.content_hash == skill.content_hash && !hit.description.is_empty() {
+                skill.name = hit.name.clone();
+                skill.description = hit.description.clone();
+                continue;
+            }
+        }
+        if let Some(text) = manifests.get(&format!("{}/{SKILL_MANIFEST_FILE}", skill.repo_path)) {
+            let (name, description) = parse_skill_frontmatter(text, &skill.id);
+            skill.name = name;
+            skill.description = description;
+        }
+    }
+    Ok(skills)
+}
+
 /// 解析 SKILL.md 的 YAML frontmatter。只取 `name` 和 `description` 两个标量，
 /// 不引 YAML 依赖——codex 自己也只读这两个字段。
 pub fn parse_skill_frontmatter(text: &str, fallback_id: &str) -> (String, String) {
@@ -1053,6 +1142,9 @@ pub async fn fetch_repo_skills(
     // 无效，处理方式完全不同，但用户只会看到「返回错误状态」，没法自助也没法报障
     // （#1989 里四个仓库全失败，看不出到底是限流还是网络）。
     let status = response.status();
+    if !status.is_success() && matches!(status.as_u16(), 403 | 429) {
+        return fetch_repo_skills_from_zip(repo, cached, &client).await;
+    }
     if !status.is_success() {
         anyhow::bail!(
             "{}/{} 的文件树请求失败：HTTP {}{}",
