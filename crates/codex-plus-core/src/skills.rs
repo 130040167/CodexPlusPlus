@@ -233,10 +233,23 @@ impl SkillsManager {
 
     /// 按 key 覆盖或追加一个仓库源。
     pub fn upsert_repo(&self, repo: SkillRepo) -> anyhow::Result<Vec<SkillRepo>> {
+        self.save_repo(repo, None)
+    }
+
+    pub fn save_repo(&self, repo: SkillRepo, previous_key: Option<&str>) -> anyhow::Result<Vec<SkillRepo>> {
         let repo = normalize_repo(repo)?;
         let _guard = self.state_lock.lock().unwrap();
         let mut state = self.load_state_unlocked();
         let key = repo.key();
+        if let Some(previous_key) = previous_key.filter(|previous| *previous != key) {
+            if !state.repos.iter().any(|item| item.key() == previous_key) {
+                anyhow::bail!("原仓库已不存在，请刷新后重试");
+            }
+            if state.repos.iter().any(|item| item.key() == key) {
+                anyhow::bail!("目标仓库已存在");
+            }
+            state.repos.retain(|item| item.key() != previous_key);
+        }
         match state.repos.iter_mut().find(|item| item.key() == key) {
             Some(existing) => *existing = repo,
             None => state.repos.push(repo),
@@ -453,6 +466,8 @@ impl SkillsManager {
         zip_bytes: &[u8],
     ) -> anyhow::Result<SkillsState> {
         validate_skill_id(&skill.id)?;
+        let enable_after_install = !self.load_state().installed.contains_key(&skill.id)
+            || is_linked(&self.linked_dir().join(&skill.id));
         let staging = self.staging_dir(&skill.id);
         if staging.exists() {
             std::fs::remove_dir_all(&staging)
@@ -519,7 +534,7 @@ impl SkillsManager {
         self.save_state_unlocked(&state)?;
         drop(_guard);
 
-        self.set_enabled(&skill.id, true)?;
+        self.set_enabled(&skill.id, enable_after_install)?;
         Ok(self.load_state())
     }
 
@@ -1233,6 +1248,53 @@ mod tests {
             temp.path().join("skills.json"),
             temp.path().join("codex-home"),
         )
+    }
+
+    #[test]
+    fn ccs_import_keeps_source_but_defaults_to_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("SKILL.md"), "---\nname: imported\n---\n").unwrap();
+        manager.import_from_directory("imported", &external).unwrap();
+        let entries = manager.local_inventory();
+        let skill = entries.iter().find(|skill| skill.id == "imported").unwrap();
+        assert!(skill.installed);
+        assert!(!skill.enabled);
+        assert_eq!(skill.repo_key, "cc-switch");
+        assert!(manager.source_dir().join("imported/SKILL.md").is_file());
+        assert!(external.join("SKILL.md").is_file());
+        manager.set_enabled("imported", true).unwrap();
+        assert!(manager.local_inventory().iter().find(|skill| skill.id == "imported").unwrap().enabled);
+    }
+
+    #[test]
+    fn editing_repository_replaces_identity_and_rejects_duplicates() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let original = parse_repo_key("acme/old@main").unwrap();
+        manager.upsert_repo(original.clone()).unwrap();
+        let replacement = parse_repo_key("acme/new@dev:skills").unwrap();
+        let repos = manager.save_repo(replacement.clone(), Some(&original.key())).unwrap();
+        assert!(!repos.iter().any(|repo| repo.key() == original.key()));
+        assert_eq!(repos.iter().filter(|repo| repo.key() == replacement.key()).count(), 1);
+        assert!(manager.save_repo(parse_repo_key("openai/skills@main:skills/.curated").unwrap(), Some(&replacement.key())).is_err());
+        assert!(manager.list_repos().iter().any(|repo| repo.key() == replacement.key()));
+    }
+
+    #[test]
+    fn updating_disabled_skill_preserves_disabled_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let zip = repo_zip(&[("kit-main/alpha/SKILL.md", "---\nname: alpha\n---\n")]);
+        manager.install_from_zip(&sample_skill("alpha", "alpha", "v1"), &zip).unwrap();
+        manager.set_enabled("alpha", false).unwrap();
+        manager.install_from_zip(&sample_skill("alpha", "alpha", "v2"), &zip).unwrap();
+        let skills = manager.local_inventory();
+        let skill = skills.iter().find(|skill| skill.id == "alpha").unwrap();
+        assert!(!skill.enabled);
+        assert_eq!(skill.content_hash, "v2");
     }
 
     /// 造一个 GitHub 风格的仓库 zip：最外层带 `repo-ref/` 前缀。

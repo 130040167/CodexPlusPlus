@@ -5447,9 +5447,9 @@ pub fn delete_skill_backup(backup_id: String) -> CommandResult<SkillsPayload> {
 }
 
 #[tauri::command]
-pub fn upsert_skill_repo(repo: codex_plus_core::skills::SkillRepo) -> CommandResult<SkillsPayload> {
+pub fn upsert_skill_repo(repo: codex_plus_core::skills::SkillRepo, previous_key: Option<String>) -> CommandResult<SkillsPayload> {
     let manager = default_skills_manager();
-    match manager.upsert_repo(repo) {
+    match manager.save_repo(repo, previous_key.as_deref()) {
         Ok(_) => ok("仓库源已保存。", current_skills_payload(&manager)),
         Err(error) => failed(
             &format!("保存仓库源失败：{error}"),
@@ -5478,13 +5478,17 @@ fn skills_payload(
     remote: &[codex_plus_core::skills::RemoteSkill],
     repo_errors: Vec<String>,
 ) -> SkillsPayload {
+    let repos = manager.list_repos();
+    let remote: Vec<_> = remote.iter().filter(|skill| {
+        repos.iter().any(|repo| repo.enabled && repo.key() == skill.repo_key)
+    }).cloned().collect();
     SkillsPayload {
         skills: if remote.is_empty() {
             manager.local_inventory()
         } else {
-            manager.merge_entries(remote)
+            manager.merge_entries(&remote)
         },
-        repos: manager.list_repos(),
+        repos,
         backups: manager.list_backups(),
         repo_errors,
         skills_dir: manager.source_dir().to_string_lossy().to_string(),
@@ -7947,6 +7951,25 @@ fn default_log_lines() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skills_payload_hides_disabled_repository_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = codex_plus_core::skills::SkillsManager::new(
+            temp.path().join("skills"), temp.path().join("backups"),
+            temp.path().join("skills.json"), temp.path().join("home"),
+        );
+        let mut repo = codex_plus_core::skills::parse_repo_key("acme/kit@main").unwrap();
+        let remote = vec![codex_plus_core::skills::RemoteSkill {
+            id: "alpha".to_string(), name: "alpha".to_string(), description: String::new(),
+            repo_key: repo.key(), repo_path: "alpha".to_string(), content_hash: "v1".to_string(),
+        }];
+        manager.upsert_repo(repo.clone()).unwrap();
+        assert_eq!(skills_payload(&manager, &remote, Vec::new()).skills.len(), 1);
+        repo.enabled = false;
+        manager.upsert_repo(repo).unwrap();
+        assert!(skills_payload(&manager, &remote, Vec::new()).skills.is_empty());
+    }
 
     /// 进程级全局状态的测试锁。
     ///
