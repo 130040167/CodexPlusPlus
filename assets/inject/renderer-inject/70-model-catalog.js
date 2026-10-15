@@ -23,6 +23,9 @@
   let codexModelCatalog = { status: "loading", model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
   let codexModelCatalogLoadedAt = 0;
   let codexModelCatalogPromise = null;
+  let codexModelCatalogLoadSeq = 0;
+  let codexModelCatalogRevision = "";
+  let codexModelCatalogAppliedEpoch = 0;
   let codexModelWhitelistRefreshTimer = 0;
   let codexModelWhitelistRefreshUntil = 0;
   const codexPlusModelListRequestIds = new Set();
@@ -32,6 +35,7 @@
     || (window.__codexPlusModelCollectionSnapshots = new WeakMap());
   const codexPlusModelDefaultSnapshots = window.__codexPlusModelDefaultSnapshots
     || (window.__codexPlusModelDefaultSnapshots = new WeakMap());
+  const codexPlusModelQueryRefreshEpochs = new WeakMap();
 
   if (window.__CODEX_PLUS_TEST_SERVICE_TIER__) {
     window.__codexPlusServiceTierTest = {
@@ -73,12 +77,21 @@
           ...catalog,
         };
         codexModelCatalogLoadedAt = Date.now();
+        codexModelCatalogAppliedEpoch += 1;
         codexModelCatalogPromise = null;
       },
       loadModelCatalog: (force = false) => loadCodexModelCatalog(force),
+      observeModelCatalogRevision: (revision) => observeCodexModelCatalogRevision(revision),
+      modelCatalogState: () => ({
+        revision: codexModelCatalogRevision,
+        loadSeq: codexModelCatalogLoadSeq,
+        appliedEpoch: codexModelCatalogAppliedEpoch,
+        models: [...(codexModelCatalog.models || [])],
+      }),
       patchModelContainer: (value, hostId = "local") => patchModelContainer(value, hostId),
       patchModelArray: (models, allowEmpty = false, hostId = "local") => patchModelArray(models, allowEmpty, hostId),
       patchStatsigModelDynamicConfig: (config, hostId = "local") => patchStatsigModelDynamicConfig(config, hostId),
+      refreshCachedLocalModelQueries: () => refreshCachedLocalModelQueries(),
       patchModelJsonResponse,
       patchMcpModelResponseData,
       recordModelListRequest,
@@ -126,13 +139,22 @@
     ]);
   }
 
+  function observeCodexModelCatalogRevision(revision) {
+    if (typeof revision !== "string" || !revision || revision === codexModelCatalogRevision) return false;
+    codexModelCatalogRevision = revision;
+    void loadCodexModelCatalog(true);
+    return true;
+  }
+
   async function loadCodexModelCatalog(force = false) {
     if (!force && codexModelCatalogPromise) return codexModelCatalogPromise;
     if (!force && codexModelCatalogLoadedAt && Date.now() - codexModelCatalogLoadedAt < 10000) return codexModelCatalog;
-    codexModelCatalogPromise = readCodexAppServerPreparation("/codex-model-catalog", {})
+    const seq = ++codexModelCatalogLoadSeq;
+    const revision = codexModelCatalogRevision;
+    const request = readCodexAppServerPreparation("/codex-model-catalog", {})
       .then(async (result) => {
-        codexModelCatalog = result && typeof result === "object" ? result : { status: "failed", model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
-        if ((!codexModelCatalog.models || codexModelCatalog.models.length === 0) && codexModelCatalog.status === "not_configured") {
+        const nextCatalog = result && typeof result === "object" ? result : { status: "failed", model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
+        if ((!nextCatalog.models || nextCatalog.models.length === 0) && nextCatalog.status === "not_configured") {
           try {
             const settingsResp = await readCodexAppServerPreparation("/settings/get", {});
             if (settingsResp && settingsResp.relayProfiles && Array.isArray(settingsResp.relayProfiles)) {
@@ -141,8 +163,8 @@
               if (profile && profile.modelList) {
                 const extraModels = profile.modelList.split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean);
                 if (extraModels.length > 0) {
-                  codexModelCatalog.models = extraModels;
-                  codexModelCatalog.default_model = codexModelCatalog.default_model || extraModels[0];
+                  nextCatalog.models = extraModels;
+                  nextCatalog.default_model = nextCatalog.default_model || extraModels[0];
                   sendCodexPlusDiagnostic("model_catalog_fallback_applied", { count: extraModels.length });
                 }
               }
@@ -151,20 +173,37 @@
             sendCodexPlusDiagnostic("model_catalog_fallback_error", { error: String(fallbackError?.message || fallbackError) });
           }
         }
+        if (seq !== codexModelCatalogLoadSeq || revision !== codexModelCatalogRevision) {
+          return codexModelCatalogPromise && codexModelCatalogPromise !== request
+            ? codexModelCatalogPromise
+            : codexModelCatalog;
+        }
+        codexModelCatalog = nextCatalog;
+        codexModelCatalogAppliedEpoch += 1;
         codexModelCatalogLoadedAt = Date.now();
+        if (!window.__CODEX_PLUS_TEST_SERVICE_TIER__) refreshCachedLocalModelQueries();
+        if (typeof codexPlusModelPickerCatalogChanged === "function") codexPlusModelPickerCatalogChanged();
         renderCodexPlusMenu();
         scheduleCodexModelWhitelistRefresh();
         return codexModelCatalog;
       })
       .catch((error) => {
+        if (seq !== codexModelCatalogLoadSeq || revision !== codexModelCatalogRevision) {
+          return codexModelCatalogPromise && codexModelCatalogPromise !== request
+            ? codexModelCatalogPromise
+            : codexModelCatalog;
+        }
         codexModelCatalog = { status: "failed", message: String(error?.message || error), model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
+        codexModelCatalogAppliedEpoch += 1;
         codexModelCatalogLoadedAt = Date.now();
+        if (typeof codexPlusModelPickerCatalogChanged === "function") codexPlusModelPickerCatalogChanged();
         return codexModelCatalog;
       })
       .finally(() => {
-        codexModelCatalogPromise = null;
+        if (codexModelCatalogPromise === request) codexModelCatalogPromise = null;
       });
-    return codexModelCatalogPromise;
+    codexModelCatalogPromise = request;
+    return request;
   }
 
   function codexPlusModelMetadata(modelName) {
@@ -267,7 +306,7 @@
   }
 
   function modelFilterPolicy(allowed) {
-    return allowed ? `${codexRemoteSessionActiveProfile()?.id || ""}:${codexModelCatalog.model || ""}:${JSON.stringify([...allowed].sort())}` : "";
+    return allowed ? `${codexRemoteSessionActiveProfile()?.id || ""}:${codexModelCatalogAppliedEpoch}:${JSON.stringify([...allowed].sort())}` : "";
   }
 
   function sameModelCollection(left, right) {
@@ -362,12 +401,24 @@
     return belongsToProfile && names.length ? new Set(names) : null;
   }
 
+  function codexAggregateAllowedModelSet(hostId) {
+    if (hostId !== "local" || !codexPlusBackendSettingsLoaded
+        || codexModelCatalog.status !== "ok") return null;
+    const profile = codexRemoteSessionActiveProfile();
+    if (profile?.relayMode !== "aggregate") return null;
+    const belongsToProfile = Array.isArray(codexModelCatalog.sources)
+      && codexModelCatalog.sources.some((source) =>
+        source?.id === `aggregate:${profile.id}` && source?.type === "aggregate_model_catalog");
+    return belongsToProfile ? new Set(codexPlusModelNames()) : null;
+  }
+
   function patchModelArray(models, allowEmpty = false, hostId) {
     if (!modelArrayLooksPatchable(models, allowEmpty)) return false;
-    const allowed = codexPureApiAllowedModelSet(hostId);
+    const aggregateModels = codexAggregateAllowedModelSet(hostId);
+    const allowed = aggregateModels || codexPureApiAllowedModelSet(hostId);
     let changed = prepareModelCollection(models, allowed);
     const customModels = codexPlusModelNames();
-    if (!customModels.length) return changed;
+    if (!customModels.length && !allowed) return changed;
     if (allowed) {
       const retained = models.filter((item) => allowed.has(item.model));
       if (retained.length !== models.length) {
@@ -391,6 +442,21 @@
         changed = true;
       }
     });
+    if (aggregateModels) {
+      // app-server 可能仍缓存旧 catalog。默认成员变化会重命名 slug，必须撤掉旧前缀，
+      // 并按新目录排列；只做追加会留下旧标签、重复组及找不到新选中模型的问题。
+      const byModel = new Map(models.map((item) => [item.model, item]));
+      const ordered = [...aggregateModels].map((name) => byModel.get(name));
+      if (!sameModelCollection(models, ordered)) {
+        models.splice(0, models.length, ...ordered);
+        changed = true;
+      }
+      const defaultModel = codexModelCatalog.model || codexModelCatalog.default_model;
+      models.forEach((item) => {
+        const isDefault = item.model === defaultModel;
+        if (item.isDefault !== isDefault) { item.isDefault = isDefault; changed = true; }
+      });
+    }
     finishModelCollection(models);
     return changed;
   }
@@ -526,6 +592,110 @@
       return { ...config, value: nextValue };
     }
     return config;
+  }
+
+  function codexPlusLocalModelQuery(query) {
+    const key = query?.queryKey;
+    return Array.isArray(key)
+      && key[0] === "models"
+      && key[1] === "list"
+      && key[2] === "local";
+  }
+
+  function cloneCodexPlusModelCollection(models) {
+    const next = models.map((model) => model && typeof model === "object" ? { ...model } : model);
+    const snapshot = codexPlusModelCollectionSnapshots.get(models);
+    if (snapshot) {
+      codexPlusModelCollectionSnapshots.set(next, {
+        ...snapshot,
+        original: [...snapshot.original],
+        patched: snapshot.patched ? [...snapshot.patched] : null,
+      });
+    }
+    return next;
+  }
+
+  function patchCachedLocalModelQueryData(current) {
+    if (Array.isArray(current)) {
+      const next = cloneCodexPlusModelCollection(current);
+      return patchModelArray(next, true, "local") ? next : current;
+    }
+    if (!current || typeof current !== "object" || !Array.isArray(current.data)) return current;
+    const data = cloneCodexPlusModelCollection(current.data);
+    return patchModelArray(data, true, "local") ? { ...current, data } : current;
+  }
+
+  function codexPlusModelQueryCollection(value) {
+    if (Array.isArray(value)) return value;
+    return value && typeof value === "object" && Array.isArray(value.data) ? value.data : null;
+  }
+
+  function refreshCachedLocalModelQueries() {
+    if (!codexPlusModelUnlockEnabled() && !codexAggregateAllowedModelSet("local")) return false;
+    const client = typeof findCodexQueryClient === "function"
+      ? findCodexQueryClient()
+      : (window.__REACT_QUERY_CLIENT__ || window.__codexQueryClient);
+    if (!client || typeof client.setQueryData !== "function") return false;
+    installCodexPlusModelQueryPublication(client);
+    if (codexPlusModelQueryRefreshEpochs.get(client) === codexModelCatalogAppliedEpoch) return false;
+    const cache = client.getQueryCache?.();
+    const queries = (typeof cache?.findAll === "function"
+      ? cache.findAll({ queryKey: ["models", "list"] })
+      : (typeof cache?.getAll === "function" ? cache.getAll() : []))
+      .filter(codexPlusLocalModelQuery);
+    if (!queries.length) return false;
+    let published = false;
+    for (const query of queries) {
+      try {
+        let nextCollection = null;
+        const stored = client.setQueryData(query.queryKey, (current) => {
+          const next = patchCachedLocalModelQueryData(current);
+          nextCollection = next !== current ? codexPlusModelQueryCollection(next) : null;
+          return next;
+        });
+        const storedCollection = codexPlusModelQueryCollection(stored);
+        const snapshot = nextCollection && codexPlusModelCollectionSnapshots.get(nextCollection);
+        if (snapshot && storedCollection && storedCollection !== nextCollection) {
+          codexPlusModelCollectionSnapshots.set(storedCollection, {
+            ...snapshot,
+            original: [...snapshot.original],
+            patched: snapshot.patched ? [...snapshot.patched] : null,
+          });
+        }
+        published = true;
+      } catch {
+      }
+      if (typeof client.invalidateQueries === "function") {
+        try {
+          Promise.resolve(client.invalidateQueries({ queryKey: query.queryKey, exact: true })).catch(() => {});
+          published = true;
+        } catch {
+        }
+      }
+    }
+    if (!published) return false;
+    codexPlusModelQueryRefreshEpochs.set(client, codexModelCatalogAppliedEpoch);
+    sendCodexPlusDiagnostic("model_query_cache_refreshed", { queryCount: queries.length });
+    return true;
+  }
+
+  function installCodexPlusModelQueryPublication(client) {
+    // 保存后 exact invalidate 仍可能从 app-server 拿回旧目录。在通知 React 之前投影，
+    // 保证晚到响应不能把新列表覆盖回去。跨重注入复用钩子，不层层包裹 Query 原型。
+    const runtime = window.__codexPlusModelQueryPublication
+      || (window.__codexPlusModelQueryPublication = { prototypes: new WeakSet() });
+    runtime.rewrite = (query, data) => codexPlusLocalModelQuery(query)
+      && (codexPlusModelUnlockEnabled() || codexAggregateAllowedModelSet("local"))
+      ? patchCachedLocalModelQueryData(data) : data;
+    for (const query of client.getQueryCache?.()?.getAll?.() || []) {
+      const proto = Object.getPrototypeOf(query);
+      if (!proto || typeof proto.setData !== "function" || runtime.prototypes.has(proto)) continue;
+      const original = proto.setData;
+      proto.setData = function codexPlusPublishModelQuery(data, ...rest) {
+        return original.call(this, runtime.rewrite(this, data), ...rest);
+      };
+      runtime.prototypes.add(proto);
+    }
   }
 
   function statsigClients() {
@@ -1091,9 +1261,13 @@
   }
 
   function runCodexModelWhitelistRefreshPass() {
-    if (!codexPlusModelUnlockEnabled() || !codexPlusModelNames().length) return false;
+    if (!codexPlusModelUnlockEnabled()) {
+      if (codexAggregateAllowedModelSet("local")) refreshCachedLocalModelQueries();
+      return false;
+    }
     try {
       patchStatsigModelWhitelist();
+      refreshCachedLocalModelQueries();
       installAppServerModelRequestPatch();
     } catch (error) {
       window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
@@ -1103,7 +1277,7 @@
   }
 
   function scheduleCodexModelWhitelistRefresh(durationMs = 2500) {
-    if (!codexPlusModelUnlockEnabled()) return;
+    if (!codexPlusModelUnlockEnabled() && !codexAggregateAllowedModelSet("local")) return;
     codexModelWhitelistRefreshUntil = Math.max(codexModelWhitelistRefreshUntil, Date.now() + durationMs);
     if (codexModelWhitelistRefreshTimer) return;
     sendCodexPlusDiagnostic("model_whitelist_refresh_scheduled", { durationMs });
@@ -1121,6 +1295,7 @@
     ensureCodexModelWhitelistInstalls();
     if (!codexPlusModelNames().length) {
       loadCodexModelCatalog();
+      runCodexModelWhitelistRefreshPass();
       return;
     }
     runCodexModelWhitelistRefreshPass();

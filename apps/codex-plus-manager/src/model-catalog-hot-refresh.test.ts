@@ -1,0 +1,317 @@
+import assert from "node:assert/strict";
+import { it } from "node:test";
+import { readFile } from "node:fs/promises";
+import vm from "node:vm";
+
+const CATALOG_URL = new URL(
+  "../../../assets/inject/renderer-inject/70-model-catalog.js",
+  import.meta.url,
+);
+const SETTINGS_URL = new URL(
+  "../../../assets/inject/renderer-inject/30-service-tier.js",
+  import.meta.url,
+);
+const BACKEND_SETTINGS_URL = new URL(
+  "../../../assets/inject/renderer-inject/40-backend-settings.js",
+  import.meta.url,
+);
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function catalogRuntime() {
+  const source = await readFile(CATALOG_URL, "utf8");
+  const start = source.indexOf("  let codexModelCatalog = ");
+  const end = source.indexOf("\n  function codexPlusModelMetadata", start);
+  assert.ok(start >= 0 && end > start, "model catalog loader block not found");
+  const reads: Array<ReturnType<typeof deferred<Record<string, unknown>>>> = [];
+  const context = vm.createContext({
+    window: {}, Date, WeakMap, Set, Map, Promise,
+    readCodexAppServerPreparation: (path: string) => {
+      assert.equal(path, "/codex-model-catalog");
+      const read = deferred<Record<string, unknown>>();
+      reads.push(read);
+      return read.promise;
+    },
+    renderCodexPlusMenu: () => undefined,
+    scheduleCodexModelWhitelistRefresh: () => undefined,
+    sendCodexPlusDiagnostic: () => undefined,
+    codexPlusModelPickerCatalogChanged: () => undefined,
+    refreshCachedLocalModelQueries: () => undefined,
+  });
+  const api = vm.runInContext(
+    `(function () {${source.slice(start, end)}\nreturn { observeCodexModelCatalogRevision, state: () => ({ revision: codexModelCatalogRevision, models: [...codexModelCatalog.models], epoch: codexModelCatalogAppliedEpoch }) };})()`,
+    context,
+  ) as {
+    observeCodexModelCatalogRevision: (revision: unknown) => boolean;
+    state: () => { revision: string; models: string[]; epoch: number };
+  };
+  return { api, reads };
+}
+
+it("first modelCatalogRevision refreshes once and repeated reads are deduplicated", async () => {
+  const { api, reads } = await catalogRuntime();
+  assert.equal(api.observeCodexModelCatalogRevision("rev-a"), true);
+  assert.equal(api.observeCodexModelCatalogRevision("rev-a"), false);
+  assert.equal(reads.length, 1);
+  reads[0].resolve({ status: "ok", models: ["model-a"] });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(JSON.parse(JSON.stringify(api.state())), { revision: "rev-a", models: ["model-a"], epoch: 1 });
+});
+
+it("a late catalog response cannot replace a newer revision", async () => {
+  const { api, reads } = await catalogRuntime();
+  api.observeCodexModelCatalogRevision("rev-a");
+  api.observeCodexModelCatalogRevision("rev-b");
+  assert.equal(reads.length, 2);
+  reads[1].resolve({ status: "ok", models: ["model-b"] });
+  await Promise.resolve();
+  await Promise.resolve();
+  reads[0].resolve({ status: "ok", models: ["model-a"] });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(JSON.parse(JSON.stringify(api.state())), { revision: "rev-b", models: ["model-b"], epoch: 1 });
+});
+
+it("settings loader observes the optional revision only after accepting the response", async () => {
+  const source = await readFile(SETTINGS_URL, "utf8");
+  const installed = source.indexOf("codexPlusBackendSettingsLoaded = true;");
+  const observed = source.indexOf("observeCodexModelCatalogRevision(settings.modelCatalogRevision)", installed);
+  assert.ok(installed >= 0 && observed > installed);
+  assert.match(source.slice(installed, observed + 80), /typeof observeCodexModelCatalogRevision === "function"/);
+});
+
+it("renderer settings saves consume the returned revision without waiting for heartbeat", async () => {
+  const source = await readFile(BACKEND_SETTINGS_URL, "utf8");
+  const start = source.indexOf("  async function setBackendSetting(");
+  const end = source.indexOf("\n  function refreshCodexPlusBackendToggles", start);
+  const setter = source.slice(start, end);
+  assert.match(setter, /seq === codexPlusBackendSettingsSeq/);
+  assert.match(setter, /observeCodexModelCatalogRevision\(settings\?\.modelCatalogRevision\)/);
+});
+
+it("catalog refresh publishes local model query data, invalidates it once, and preserves remote caches", async () => {
+  const source = await readFile(CATALOG_URL, "utf8");
+  const start = source.indexOf("  function codexPlusLocalModelQuery(");
+  const end = source.indexOf("\n  function statsigClients", start);
+  assert.ok(start >= 0 && end > start, "model query cache refresh block not found");
+  let catalogModels = ["model-new"];
+  const localKey = ["models", "list", "local", "no-auth", 100, "custom", "catalog.json"];
+  const remoteKey = ["models", "list", "ssh:test", "no-auth", 100, "custom", "catalog.json"];
+  const data = new Map<unknown, unknown>([
+    [localKey, { data: [{ model: "model-old" }], nextCursor: null }],
+    [remoteKey, { data: [{ model: "remote-model" }], nextCursor: null }],
+  ]);
+  const queries = [localKey, remoteKey].map((queryKey) => ({ queryKey }));
+  const invalidations: unknown[] = [];
+  let publications = 0;
+  const snapshots = new WeakMap<object, unknown>();
+  const client = {
+    getQueryCache: () => ({ findAll: () => queries }),
+    setQueryData: (queryKey: unknown, updater: (current: unknown) => unknown) => {
+      const current = data.get(queryKey);
+      const next = updater(current);
+      if (next !== current) publications += 1;
+      const stored = next && typeof next === "object" && !Array.isArray(next) && Array.isArray((next as { data?: unknown }).data)
+        ? { ...next, data: [...(next as { data: unknown[] }).data] }
+        : next;
+      data.set(queryKey, stored);
+      return stored;
+    },
+    invalidateQueries: (filter: unknown) => { invalidations.push(filter); },
+  };
+  const create = new Function(
+    "window",
+    "findCodexQueryClient",
+    "codexPlusModelCollectionSnapshots",
+    "patchModelArray",
+    "codexPlusModelQueryRefreshEpochs",
+    "codexModelCatalogAppliedEpoch",
+    "sendCodexPlusDiagnostic",
+    "codexPlusModelUnlockEnabled",
+    `${source.slice(start, end)}\nreturn { refreshCachedLocalModelQueries, setEpoch: (value) => { codexModelCatalogAppliedEpoch = value; } };`,
+  ) as (...args: unknown[]) => {
+    refreshCachedLocalModelQueries: () => boolean;
+    setEpoch: (value: number) => void;
+  };
+  const api = create(
+    {},
+    () => client,
+    snapshots,
+    (models: Array<{ model: string }>, _allowEmpty: boolean, hostId: string) => {
+      assert.equal(hostId, "local");
+      if (!snapshots.has(models)) snapshots.set(models, { original: [...models], patched: null, policy: "test" });
+      const current = models.map((item) => item.model);
+      if (JSON.stringify(current) === JSON.stringify(catalogModels)) return false;
+      models.splice(0, models.length, ...catalogModels.map((model) => ({ model })));
+      return true;
+    },
+    new WeakMap(),
+    1,
+    () => undefined,
+    () => true,
+  );
+
+  assert.equal(api.refreshCachedLocalModelQueries(), true);
+  assert.deepEqual(data.get(localKey), { data: [{ model: "model-new" }], nextCursor: null });
+  assert.deepEqual(data.get(remoteKey), { data: [{ model: "remote-model" }], nextCursor: null });
+  assert.equal(snapshots.has((data.get(localKey) as { data: object }).data), true, "snapshot follows TanStack's stored array");
+  assert.equal(publications, 1);
+  assert.deepEqual(invalidations, [{ queryKey: localKey, exact: true }]);
+  assert.equal(api.refreshCachedLocalModelQueries(), false, "same catalog epoch must not refetch repeatedly");
+
+  catalogModels = ["model-newer"];
+  api.setEpoch(2);
+  assert.equal(api.refreshCachedLocalModelQueries(), true);
+  assert.deepEqual(data.get(localKey), { data: [{ model: "model-newer" }], nextCursor: null });
+  assert.equal(publications, 2);
+  assert.equal(invalidations.length, 2);
+
+  catalogModels = [];
+  api.setEpoch(3);
+  assert.equal(api.refreshCachedLocalModelQueries(), true);
+  assert.deepEqual(data.get(localKey), { data: [], nextCursor: null }, "empty catalogs must withdraw stale models");
+  assert.match(source, /patchStatsigModelWhitelist\(\);\s*refreshCachedLocalModelQueries\(\);/);
+  assert.doesNotMatch(source, /if \(!codexPlusModelUnlockEnabled\(\) \|\| !codexPlusModelNames\(\)\.length\) return false/);
+});
+
+async function aggregateQueryRuntime() {
+  const source = await readFile(CATALOG_URL, "utf8");
+  const names = [
+    "uniqueValues", "codexPlusModelUnlockEnabled", "codexPlusModelNames",
+    "codexPlusModelMetadata", "modelReasoningEfforts", "applyCodexPlusModelMetadata",
+    "codexPlusModelDescriptor", "modelArrayLooksPatchable", "modelFilterPolicy",
+    "sameModelCollection", "prepareModelCollection", "finishModelCollection",
+    "codexPureApiAllowedModelSet", "codexAggregateAllowedModelSet", "patchModelArray",
+    "codexPlusLocalModelQuery", "cloneCodexPlusModelCollection",
+    "patchCachedLocalModelQueryData", "codexPlusModelQueryCollection",
+    "refreshCachedLocalModelQueries", "installCodexPlusModelQueryPublication",
+  ];
+  const functions = names.map((name) => {
+    const start = source.indexOf(`  function ${name}(`);
+    const end = source.indexOf("\n  }\n", start) + "\n  }\n".length;
+    assert.ok(start >= 0 && end > start, `${name} not found`);
+    return source.slice(start, end);
+  }).join("\n");
+  type Model = { model: string; displayName?: string; isDefault?: boolean };
+  type Catalog = {
+    status: string; model: string; models: string[];
+    sources: Array<{ id: string; type: string }>;
+    modelMetadata: Record<string, { displayName: string }>;
+  };
+  class Query {
+    queryKey: string[];
+    data: { data: Model[] };
+    constructor(queryKey: string[], data: { data: Model[] }) {
+      this.queryKey = queryKey;
+      this.data = data;
+    }
+    setData(data: { data: Model[] }) { this.data = data; return data; }
+  }
+  const local = new Query(["models", "list", "local"], { data: [] });
+  const remote = new Query(["models", "list", "ssh:test"], { data: [{ model: "remote" }] });
+  const queries = [local, remote];
+  let lateResponse: Model[] | null = null;
+  const client = {
+    getQueryCache: () => ({ getAll: () => queries, findAll: () => queries }),
+    setQueryData: (key: string[], updater: (current: unknown) => unknown) => {
+      const query = queries.find((q) => q.queryKey === key)!;
+      return query.setData(updater(query.data) as { data: Model[] });
+    },
+    invalidateQueries: () => {
+      if (lateResponse) local.setData({ data: lateResponse.map((model) => ({ ...model })) });
+    },
+  };
+  const runtime = new Function("client", `
+    const window = {};
+    let codexModelCatalog = {}, codexModelCatalogAppliedEpoch = 0;
+    let codexPlusBackendSettingsLoaded = true, unlocked = false;
+    let profile = { id: "agg", relayMode: "aggregate" };
+    const codexPlusModelCollectionSnapshots = new WeakMap();
+    const codexPlusModelQueryRefreshEpochs = new WeakMap();
+    const codexPlusSettings = () => ({ modelWhitelistUnlock: unlocked });
+    const codexRemoteSessionActiveProfile = () => profile;
+    const codexServiceTierModelFromValue = value => String(value || "");
+    const findCodexQueryClient = () => client;
+    const sendCodexPlusDiagnostic = () => {};
+    ${functions}
+    return {
+      refresh: refreshCachedLocalModelQueries,
+      install: () => installCodexPlusModelQueryPublication(client),
+      catalog: value => { codexModelCatalog = value; codexModelCatalogAppliedEpoch++; },
+      profile: value => { profile = value; },
+      unlock: value => { unlocked = value; },
+    };
+  `)(client) as {
+    refresh: () => boolean; install: () => void;
+    catalog: (value: Catalog) => void;
+    profile: (value: { id: string; relayMode: string }) => void;
+    unlock: (value: boolean) => void;
+  };
+  const catalog = (defaultProvider: "a" | "b"): Catalog => {
+    const models = ["a", "b"].flatMap((provider) =>
+      Array.from({ length: provider === "a" ? 4 : 7 }, (_, i) =>
+        provider === defaultProvider ? `model-${i}` : `cpx-${provider}/model-${i}`));
+    return {
+      status: "ok", model: models[0], models,
+      sources: [{ id: "aggregate:agg", type: "aggregate_model_catalog" }],
+      modelMetadata: Object.fromEntries(models.map((model) => [model, { displayName: `Label ${model}` }])),
+    };
+  };
+  return { runtime, local, remote, catalog, setLate: (models: Model[]) => { lateResponse = models; } };
+}
+
+it("aggregate default changes replace stale slugs and keep display names even with whitelist unlock disabled", async () => {
+  const { runtime, local, remote, catalog, setLate } = await aggregateQueryRuntime();
+  const before = catalog("a"), after = catalog("b");
+  local.data = { data: before.models.map((model) => ({ model, displayName: `Old ${model}` })) };
+  setLate(local.data.data);
+  runtime.catalog(after);
+  const remoteData = remote.data;
+  assert.equal(runtime.refresh(), true);
+  assert.deepEqual(local.data.data.map((m) => m.model), after.models, "late invalidation must not restore old slugs");
+  assert.equal(local.data.data.filter((m) => m.model.startsWith("cpx-a/")).length, 4);
+  assert.equal(local.data.data.filter((m) => !m.model.startsWith("cpx-")).length, 7);
+  for (const model of local.data.data) assert.equal(model.displayName, after.modelMetadata[model.model].displayName);
+  assert.equal(local.data.data.find((m) => m.model === after.model)?.displayName, `Label ${after.model}`, "selected model must resolve instead of Custom");
+  assert.deepEqual(local.data.data.filter((m) => m.isDefault).map((m) => m.model), [after.model]);
+  assert.equal(remote.data, remoteData);
+  const installed = Object.getPrototypeOf(local).setData;
+  runtime.install();
+  assert.equal(Object.getPrototypeOf(local).setData, installed, "reinstallation must not stack wrappers");
+  local.setData({ data: before.models.map((model) => ({ model })) });
+  assert.deepEqual(local.data.data.map((m) => m.model), after.models);
+  runtime.catalog(before);
+  assert.equal(runtime.refresh(), true);
+  assert.deepEqual(local.data.data.map((m) => m.model), before.models, "switching back must work");
+  remote.setData(remoteData);
+  assert.equal(remote.data, remoteData, "remote publications stay untouched");
+});
+
+it("aggregate projection requires a successful catalog owned by the active profile", async () => {
+  const { runtime, local, catalog } = await aggregateQueryRuntime();
+  const original = { data: [{ model: "native" }] };
+  local.data = original;
+  const wrong = catalog("b");
+  wrong.sources[0].id = "aggregate:other";
+  runtime.catalog(wrong);
+  assert.equal(runtime.refresh(), false);
+  assert.equal(local.data, original);
+  runtime.catalog({ ...catalog("b"), status: "failed" });
+  assert.equal(runtime.refresh(), false);
+  runtime.catalog(catalog("b"));
+  runtime.profile({ id: "agg", relayMode: "pureApi" });
+  assert.equal(runtime.refresh(), false, "pure API still respects the whitelist switch");
+});
+
+it("an empty authoritative aggregate catalog withdraws all stale models", async () => {
+  const { runtime, local, catalog } = await aggregateQueryRuntime();
+  local.data = { data: [{ model: "old" }] };
+  runtime.catalog({ ...catalog("b"), model: "", models: [], modelMetadata: {} });
+  assert.equal(runtime.refresh(), true);
+  assert.deepEqual(local.data.data, []);
+});
