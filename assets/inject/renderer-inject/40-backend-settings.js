@@ -924,6 +924,7 @@
     window.__codexPlusPageResizeHandler = reposition;
     window.addEventListener("resize", reposition);
     positionCodexPlusPage(overlay);
+    syncCodexPlusPageBackButton();
   }
 
   function codexPlusHostUsesLightTheme() {
@@ -1654,6 +1655,47 @@
     window.__codexPlusPageLayoutTargets = null;
     document.querySelectorAll(`.${codexPlusPageClass}`).forEach((node) => node.remove());
     setCodexPlusSidebarNavActive(false);
+    restoreCodexPlusPageBackButton();
+  }
+
+  function codexPlusNativeBackButton() {
+    const labels = new Set(["back", "go back", "返回", "后退"]);
+    const selector = selectors.appHeader.split(",").map((header) => `${header.trim()} button`).join(", ");
+    return Array.from(document.querySelectorAll(selector))
+      .find((button) => !button.closest(`.${codexPlusPageClass}, [data-codex-plus-ext]`) &&
+        labels.has(String(button.getAttribute("aria-label") || button.title || "").trim().toLowerCase())) || null;
+  }
+
+  function restoreCodexPlusPageBackButton() {
+    const state = window.__codexPlusPageBackButtonState;
+    window.__codexPlusPageBackButtonState = null;
+    if (!state) return;
+    for (const [name, value] of state.attributes) {
+      if (value === null) state.button.removeAttribute(name);
+      else state.button.setAttribute(name, value);
+    }
+  }
+
+  function syncCodexPlusPageBackButton() {
+    if (!document.querySelector(`.${codexPlusPageClass}`)) {
+      restoreCodexPlusPageBackButton();
+      return;
+    }
+    const button = codexPlusNativeBackButton();
+    if (!button) return;
+    if (window.__codexPlusPageBackButtonState?.button !== button) {
+      restoreCodexPlusPageBackButton();
+      window.__codexPlusPageBackButtonState = {
+        button,
+        attributes: ["disabled", "aria-disabled", "tabindex", "data-disabled"]
+          .map((name) => [name, button.getAttribute(name)]),
+      };
+    }
+    // 覆盖页自身可返回，即使原生历史尚无上一页也必须能点击。
+    button.removeAttribute("disabled");
+    button.removeAttribute("aria-disabled");
+    button.removeAttribute("data-disabled");
+    if (button.getAttribute("tabindex") === "-1") button.removeAttribute("tabindex");
   }
 
   function closeCodexPlusPageAfterNativeNavigation() {
@@ -1665,15 +1707,25 @@
   }
 
   function installCodexPlusPageNavigationCloseHandler() {
+    syncCodexPlusPageBackButton();
     document.removeEventListener("click", window.__codexPlusPageNavigationCloseHandler, true);
+    window.removeEventListener("click", window.__codexPlusPageNavigationCloseHandler, true);
     window.__codexPlusPageNavigationCloseHandler = (event) => {
       if (!document.querySelector(`.${codexPlusPageClass}`)) return;
       const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+      const backButton = codexPlusNativeBackButton();
+      if (backButton && target?.closest("button") === backButton) {
+        // 原生界面仍在覆盖页下方，关闭即可；继续后退会跳过进入前的界面。
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        closeCodexPlusPage();
+        return;
+      }
       if (!target?.closest(selectors.sidebarThread)) return;
       // Let Codex's own click handler update its route before removing our page.
       closeCodexPlusPageAfterNativeNavigation();
     };
-    document.addEventListener("click", window.__codexPlusPageNavigationCloseHandler, true);
+    window.addEventListener("click", window.__codexPlusPageNavigationCloseHandler, true);
   }
 
   function installCodexPlusSidebarNavigation() {

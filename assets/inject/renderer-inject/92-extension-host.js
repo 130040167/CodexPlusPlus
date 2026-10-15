@@ -150,6 +150,7 @@
     window.__codexPlusPageLayoutTargets = null;
     document.querySelectorAll(`.${codexPlusPageClass}`).forEach((node) => node.remove());
     setCodexPlusSidebarNavActive(false);
+    restoreCodexPlusPageBackButton();
   }
 
   /** 拓展入口的 DOM 标记：用它反查注册表项，dispose 后据此清理。 */
