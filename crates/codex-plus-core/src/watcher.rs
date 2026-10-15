@@ -1580,21 +1580,22 @@ fn select_stop_targets(
 }
 
 #[cfg(target_os = "macos")]
-pub fn stop_codex_processes_for_debug_port_and_wait(debug_port: u16) {
+pub fn stop_codex_processes_for_debug_port_and_wait(debug_port: u16) -> anyhow::Result<()> {
     terminate_macos_processes_and_wait(
         find_macos_codex_processes_for_debug_port(debug_port),
         || find_macos_codex_processes_for_debug_port(debug_port),
         RESTART_STOP_WAIT_TIMEOUT_MS,
         RESTART_STOP_WAIT_INTERVAL_MS,
     );
+    Ok(())
 }
 
 /// Windows：只结束该端口对应的实例，禁止退化成全局 `stop_codex_processes_and_wait()`。
 ///
 /// 多开必须用这个语义：同机每个实例各带各的调试端口，按端口过滤才不会误杀。
 #[cfg(windows)]
-pub fn stop_codex_processes_for_debug_port_and_wait(debug_port: u16) {
-    let _ = stop_codex_processes_for_debug_port_with_fallback(debug_port, false);
+pub fn stop_codex_processes_for_debug_port_and_wait(debug_port: u16) -> anyhow::Result<()> {
+    stop_codex_processes_for_debug_port_with_fallback(debug_port, false)
 }
 
 /// Windows：结束指定调试端口的 Codex，允许在「按端口一个都没匹配到」时退回全局结束。
@@ -1643,8 +1644,9 @@ fn ensure_processes_stopped(
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-pub fn stop_codex_processes_for_debug_port_and_wait(_debug_port: u16) {
+pub fn stop_codex_processes_for_debug_port_and_wait(_debug_port: u16) -> anyhow::Result<()> {
     stop_codex_processes_and_wait();
+    Ok(())
 }
 
 #[cfg(test)]

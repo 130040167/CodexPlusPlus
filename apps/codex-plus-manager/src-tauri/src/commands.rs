@@ -1485,7 +1485,16 @@ fn stop_codex_multi_instance_blocking(
             },
         );
     }
-    codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(instance.debug_port);
+    if let Err(error) =
+        codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(instance.debug_port)
+    {
+        return failed(
+            &format!("结束多开 Codex 进程失败：{error}"),
+            CodexMultiInstancesPayload {
+                instances: Vec::new(),
+            },
+        );
+    }
     if codex_plus_core::cdp::endpoint_available(instance.debug_port) {
         return failed(
             "该实例的调试端口仍可访问，Codex 进程尚未退出，未结束多开实例。",
@@ -2133,7 +2142,7 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
             #[cfg(not(windows))]
             codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(
                 request.debug_port,
-            );
+            )?;
             anyhow::ensure!(
                 !codex_plus_core::cdp::endpoint_available(request.debug_port),
                 "Codex 进程尚未退出；未启动新实例"
