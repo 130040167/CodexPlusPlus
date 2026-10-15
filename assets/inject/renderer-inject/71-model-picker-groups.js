@@ -235,6 +235,14 @@
     return list;
   }
 
+  /** Portal 菜单没有 host 属性，复用当前会话已经校验过的成对 thread/host 身份。 */
+  function codexPlusModelPickerHostId() {
+    let ref = null;
+    try { ref = currentSessionRef(); } catch {}
+    const hostId = typeof ref?.host_id === "string" ? ref.host_id.trim() : "";
+    return hostId;
+  }
+
   /**
    * 拆 `DeepSeek-V4-Pro（DeepSeek）` 这种"展示名（供应商）"。
    * 返回 `{ name, provider }`；没有后缀或后缀不像供应商名时 `provider` 为空。
@@ -402,9 +410,9 @@
    * 已打过补丁的行直接读我们留下的标记，避免反复解析。
    */
   function codexPlusModelPickerRows(list) {
-    const providers = codexPlusModelPickerCatalogProviderMap();
-    const providerNames = codexPlusModelPickerCatalogProviderNames();
-    const filteredCatalog = codexPlusModelPickerFilteredCatalog();
+    const filteredCatalog = codexPlusModelPickerFilteredCatalog(list);
+    const providers = filteredCatalog ? codexPlusModelPickerCatalogProviderMap() : new Map();
+    const providerNames = filteredCatalog ? codexPlusModelPickerCatalogProviderNames() : new Set();
     const rows = [];
     const items = list.querySelectorAll('[role="menuitemradio"]');
     items.forEach((row) => {
@@ -436,9 +444,9 @@
     return rows;
   }
 
-  function codexPlusModelPickerFilteredCatalog() {
-    return codexModelCatalog?.status === "ok"
-      && Array.isArray(codexModelCatalog.models) && codexModelCatalog.models.length > 0
+  function codexPlusModelPickerFilteredCatalog(list) {
+    const hostId = codexPlusModelPickerHostId(list);
+    return !!codexPureApiAllowedModelSet(hostId)
       && codexModelCatalog.sources?.some((source) => source?.type === "aggregate_model_catalog");
   }
 
@@ -783,6 +791,13 @@
     });
   }
 
+  function codexPlusModelPickerSyncCatalogVisibility(list, included, filteredCatalog) {
+    list.querySelectorAll('[role="menuitemradio"]').forEach((row) => {
+      row.classList.toggle("codex-plus-model-outside-catalog",
+        filteredCatalog && !!codexPlusModelPickerRowIdentity(row)?.groupable && !included.has(row));
+    });
+  }
+
   /**
    * 打补丁主流程。返回是否改动了原生列表。
    */
@@ -791,11 +806,8 @@
     codexPlusModelPickerStore();
     const rows = codexPlusModelPickerRows(list);
     const included = new Set(rows.map((entry) => entry.row));
-    const filteredCatalog = codexPlusModelPickerFilteredCatalog();
-    const syncCatalogVisibility = () => list.querySelectorAll('[role="menuitemradio"]').forEach((row) => {
-      row.classList.toggle("codex-plus-model-outside-catalog",
-        filteredCatalog && !!codexPlusModelPickerRowIdentity(row)?.groupable && !included.has(row));
-    });
+    const filteredCatalog = codexPlusModelPickerFilteredCatalog(list);
+    const syncCatalogVisibility = () => codexPlusModelPickerSyncCatalogVisibility(list, included, filteredCatalog);
     const groups = codexPlusModelPickerUniqueGroupIds(
       codexPlusModelPickerGroups(rows, codexPlusModelPickerDefaultProviderName()),
     );

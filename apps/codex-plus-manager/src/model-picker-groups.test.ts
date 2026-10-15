@@ -5,9 +5,9 @@ import { readFile } from "node:fs/promises";
 /**
  * 模型选择器分组折叠（聚合供应商场景）的契约测试。
  *
- * 这层跑不了真 DOM（仓库的注入层测试都是"读取分片源码 + 断言结构"这种风格，
- * 浏览器行为由 renderer-inject.test.ts 里的静态契约 + 人工/CDP 实测覆盖）。
- * 所以这里钉死三件事：
+ * 除静态契约外，这里用最小 DOM 夹具执行菜单行 classList 与 React fiber 归属逻辑，
+ * 覆盖本地/远程菜单切换后实际可见行数的回归。
+ * 这里钉死三件事：
  *   1. 与后端约定的字段名不能漂（`codex_plus_group` / `codex_plus_group_id`）；
  *   2. 影响别人的行为约束：不搬动 React 管理的行、隐藏原生标签要退出无障碍树、
  *      单供应商不接管、聚合目录里"默认成员"那一组要能看懂；
@@ -25,6 +25,31 @@ const MANIFEST_URL = new URL(
 
 async function readShard() {
   return await readFile(SHARD_URL, "utf8");
+}
+
+function extractFunction(source: string, name: string) {
+  const start = source.indexOf(`  function ${name}(`);
+  assert.ok(start >= 0, name);
+  const brace = source.indexOf("{", start);
+  let depth = 0;
+  let quote = "";
+  let escaped = false;
+  for (let index = brace; index < source.length; index += 1) {
+    const char = source[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === quote) quote = "";
+      continue;
+    }
+    if (char === '"' || char === "'" || char === "`") {
+      quote = char;
+      continue;
+    }
+    if (char === "{") depth += 1;
+    else if (char === "}" && --depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`unterminated function: ${name}`);
 }
 
 it("分组折叠分片在 manifest 里排在模型目录之后、并在组装产物里", async () => {
@@ -194,7 +219,9 @@ it("Sol 是模型变体；两家供应商的数量和默认标签不被切碎", 
     "codexPlusModelPickerDefaultProviderName",
     "list",
     `const codexPlusModelPickerGroupNameMaxLength = 64;
-     const codexModelCatalog = {};
+     const codexModelCatalog = { sources: [{ type: "aggregate_model_catalog" }] };
+     const codexPlusModelPickerHostId = () => "local";
+     const codexPureApiAllowedModelSet = () => new Set(["6.1", "6.1 (Sol)", "6.1（浮生）"]);
      ${functions}
      return codexPlusModelPickerUniqueGroupIds(
        codexPlusModelPickerGroups(codexPlusModelPickerRows(list)));`,
@@ -249,6 +276,8 @@ async function catalogGroupingHarness() {
     const codexPlusModelPickerGroupNameMaxLength = 24;
     const codexPlusModelPickerGroupsState = { defaultGroupId: "obsolete" };
     const codexPlusModelPickerRowIdentity = row => ({ text: row.text, groupable: true });
+    const codexPlusModelPickerHostId = () => "local";
+    const codexPureApiAllowedModelSet = () => new Set(catalog.models || []);
     ${functions}
     const list = { querySelectorAll: () => labels.map(text => ({text})) };
     return codexPlusModelPickerUniqueGroupIds(
@@ -260,10 +289,17 @@ function supplierCatalog(reverse = false) {
   const entries = [
     ["cpx-a/gpt-6.1-sol", { displayName: "GPT-6.1-Sol（浮生（ccswitch））",
       codex_plus_group: "浮生（ccswitch）", codex_plus_group_id: "a" }],
+    ["cpx-a/codex-auto-review", { displayName: "Codex Auto Review（浮生（ccswitch））",
+      codex_plus_group: "浮生（ccswitch）", codex_plus_group_id: "a" }],
     ["gpt-6.1-sol", { displayName: "GPT-6.1-Sol",
       codex_plus_group: "寒鹤的小破站（ccswitch）", codex_plus_group_id: "b", codex_plus_default: true }],
+    ["gpt-6-sol", { displayName: "GPT-6 (Sol)",
+      codex_plus_group: "寒鹤的小破站（ccswitch）", codex_plus_group_id: "b" }],
+    ["gpt-6-astra", { displayName: "GPT-6 Astra",
+      codex_plus_group: "寒鹤的小破站（ccswitch）", codex_plus_group_id: "b" }],
   ] as const;
   return { status: "ok", models: entries.map(([slug]) => slug),
+    sources: [{ type: "aggregate_model_catalog" }],
     codex_plus_default_group_id: "b",
     modelMetadata: Object.fromEntries(reverse ? [...entries].reverse() : entries) };
 }
@@ -302,7 +338,7 @@ it("默认身份随目录更新，过期模型元数据不会抢占有效别名"
 
 it("聚合目录筛选过的模型不会被原生缓存或另一供应商的同名模型补回", async () => {
   const run = await catalogGroupingHarness();
-  const catalog = { ...supplierCatalog(),
+  const catalog = { ...supplierCatalog(), models: ["cpx-a/gpt-6.1-sol", "gpt-6.1-sol"],
     sources: [{ type: "aggregate_model_catalog" }] };
   const groups = run(catalog, [
     "6.1 Sol（浮生（ccswitch））", "Codex Auto Review（浮生（ccswitch））",
@@ -312,15 +348,132 @@ it("聚合目录筛选过的模型不会被原生缓存或另一供应商的同�
     [group.id, group.entries.length]), [["a", 1], ["b", 1]]);
 });
 
+it("当前会话切到远程或 host 未知后恢复旧隐藏类和原生计数", async () => {
+  const source = await readShard();
+  const catalogSource = await readFile(new URL(
+    "../../../assets/inject/renderer-inject/70-model-catalog.js", import.meta.url), "utf8");
+  const functions = [
+    "codexPlusModelPickerHostId",
+    "codexPlusModelPickerFilteredCatalog",
+    "codexPlusModelPickerSyncCatalogVisibility",
+  ].map((name) => extractFunction(source, name)).join("\n");
+  const allowedModelSet = extractFunction(catalogSource, "codexPureApiAllowedModelSet");
+
+  class Tokens {
+    values = new Set<string>();
+    toggle(name: string, force: boolean) {
+      if (force) this.values.add(name);
+      else this.values.delete(name);
+      return force;
+    }
+    contains(name: string) { return this.values.has(name); }
+  }
+  class Row {
+    classList = new Tokens();
+  }
+  class List {
+    rows: Row[];
+    constructor(rows: Row[]) { this.rows = rows; }
+    querySelectorAll(selector: string) {
+      assert.equal(selector, '[role="menuitemradio"]');
+      return this.rows;
+    }
+  }
+
+  const run = new Function("catalog", "setup", `
+    const codexModelCatalog = catalog;
+    let activeProfile = { id: "agg", relayMode: "aggregate" };
+    let unlockEnabled = true;
+    let codexPlusBackendSettingsLoaded = true;
+    let currentHostId = "local";
+    let currentSessionError = false;
+    const codexRemoteSessionActiveProfile = () => activeProfile;
+    const codexPlusModelUnlockEnabled = () => unlockEnabled;
+    const codexPlusModelNames = () => catalog.models;
+    const codexPlusModelPickerRowIdentity = () => ({ groupable: true });
+    const currentSessionRef = () => {
+      if (currentSessionError) throw new Error("session unavailable");
+      return currentHostId ? { host_id: currentHostId } : {};
+    };
+    ${allowedModelSet}
+    ${functions}
+    return setup({
+      policy: (profile, unlock, loaded) => {
+        activeProfile = profile;
+        unlockEnabled = unlock;
+        codexPlusBackendSettingsLoaded = loaded;
+      },
+      sessionHost: hostId => { currentHostId = hostId; },
+      sessionError: value => { currentSessionError = value; },
+      filtered: list => codexPlusModelPickerFilteredCatalog(list),
+      sync: (list, included, filtered) => codexPlusModelPickerSyncCatalogVisibility(list, included, filtered),
+      host: () => codexPlusModelPickerHostId(),
+    });
+  `);
+  const catalog = { status: "ok", model_provider: "agg", models: ["first", "second"],
+    sources: [{ type: "aggregate_model_catalog", id: "aggregate:agg" }] };
+  run(catalog, ({ policy, sessionHost, sessionError, filtered, sync, host }: {
+    policy: (profile: object, unlock: boolean, loaded: boolean) => void;
+    sessionHost: (hostId: string) => void;
+    sessionError: (value: boolean) => void;
+    filtered: (list: List) => boolean;
+    sync: (list: List, included: Set<Row>, filtered: boolean) => void;
+    host: () => string;
+  }) => {
+    const rows = [new Row(), new Row(), new Row()];
+    const list = new List(rows);
+    assert.equal(host(), "local");
+    sync(list, new Set(rows.slice(0, 2)), filtered(list));
+    assert.deepEqual(rows.map((row) => row.classList.contains("codex-plus-model-outside-catalog")), [false, false, true]);
+    assert.equal(rows.filter((row) => !row.classList.contains("codex-plus-model-outside-catalog")).length, 2);
+
+    policy({ id: "agg", relayMode: "aggregate" }, false, true);
+    sync(list, new Set(rows), filtered(list));
+    assert.equal(rows.filter((row) => !row.classList.contains("codex-plus-model-outside-catalog")).length, 3,
+      "关闭解锁后应恢复原生计数");
+    rows[2].classList.toggle("codex-plus-model-outside-catalog", true);
+    policy({ id: "old-profile", relayMode: "aggregate" }, true, true);
+    sync(list, new Set(rows), filtered(list));
+    assert.equal(rows.filter((row) => !row.classList.contains("codex-plus-model-outside-catalog")).length, 3,
+      "catalog 属于旧 profile 时应恢复原生计数");
+    rows[2].classList.toggle("codex-plus-model-outside-catalog", true);
+    policy({ id: "agg", relayMode: "aggregate" }, true, false);
+    sync(list, new Set(rows), filtered(list));
+    assert.equal(rows.filter((row) => !row.classList.contains("codex-plus-model-outside-catalog")).length, 3,
+      "设置未加载时应恢复原生计数");
+    policy({ id: "agg", relayMode: "aggregate" }, true, true);
+
+    sessionHost("ssh:build-host");
+    const remote = rows;
+    assert.equal(host(), "ssh:build-host");
+    assert.equal(filtered(list), false);
+    sync(list, new Set(remote), false);
+    assert.equal(remote.filter((row) => !row.classList.contains("codex-plus-model-outside-catalog")).length, 3);
+
+    sessionHost("");
+    remote[2].classList.toggle("codex-plus-model-outside-catalog", true);
+    assert.equal(host(), "");
+    sync(list, new Set(remote), filtered(list));
+    assert.equal(remote.filter((row) => !row.classList.contains("codex-plus-model-outside-catalog")).length, 3);
+
+    remote[2].classList.toggle("codex-plus-model-outside-catalog", true);
+    sessionError(true);
+    assert.equal(host(), "");
+    sync(list, new Set(remote), filtered(list));
+    assert.equal(remote.filter((row) => !row.classList.contains("codex-plus-model-outside-catalog")).length, 3,
+      "当前会话读取异常时应恢复原生计数");
+  });
+});
+
 it("聚合名单同时应用到本地模型数据层，远程主机和失效目录保留原列表", async () => {
   const source = await readFile(new URL(
     "../../../assets/inject/renderer-inject/70-model-catalog.js", import.meta.url), "utf8");
   const start = source.indexOf("  function codexPureApiAllowedModelSet(");
   const end = source.indexOf("\n  }\n", start);
-  const resolve = new Function("profile", "catalog", "host", `
+  const resolve = new Function("profile", "catalog", "host", "unlock", "loaded", `
     const codexRemoteSessionActiveProfile = () => profile;
-    const codexPlusModelUnlockEnabled = () => true;
-    const codexPlusBackendSettingsLoaded = true;
+    const codexPlusModelUnlockEnabled = () => unlock;
+    const codexPlusBackendSettingsLoaded = loaded;
     const codexModelCatalog = catalog;
     const codexPlusModelNames = () => catalog.models;
     ${source.slice(start, end + 5)}
@@ -328,8 +481,11 @@ it("聚合名单同时应用到本地模型数据层，远程主机和失效目�
   `);
   const catalog = { status: "ok", model_provider: "agg", models: ["first", "second"],
     sources: [{ id: "aggregate:agg" }] };
-  assert.deepEqual([...resolve({ id: "agg", relayMode: "aggregate" }, catalog, "local")], catalog.models);
-  assert.equal(resolve({ id: "agg", relayMode: "aggregate" }, catalog, "remote"), null);
-  assert.equal(resolve({ id: "other", relayMode: "aggregate" }, catalog, "local"), null);
-  assert.equal(resolve({ id: "agg", relayMode: "aggregate" }, { ...catalog, status: "failed" }, "local"), null);
+  assert.deepEqual([...resolve({ id: "agg", relayMode: "aggregate" }, catalog, "local", true, true)], catalog.models);
+  assert.equal(resolve({ id: "agg", relayMode: "aggregate" }, catalog, "remote", true, true), null);
+  assert.equal(resolve({ id: "agg", relayMode: "aggregate" }, catalog, "", true, true), null);
+  assert.equal(resolve({ id: "other", relayMode: "aggregate" }, catalog, "local", true, true), null);
+  assert.equal(resolve({ id: "agg", relayMode: "aggregate" }, catalog, "local", false, true), null);
+  assert.equal(resolve({ id: "agg", relayMode: "aggregate" }, catalog, "local", true, false), null);
+  assert.equal(resolve({ id: "agg", relayMode: "aggregate" }, { ...catalog, status: "failed" }, "local", true, true), null);
 });
