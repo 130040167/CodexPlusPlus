@@ -11010,6 +11010,10 @@
     || (window.__codexPlusModelCollectionSnapshots = new WeakMap());
   const codexPlusModelDefaultSnapshots = window.__codexPlusModelDefaultSnapshots
     || (window.__codexPlusModelDefaultSnapshots = new WeakMap());
+  const codexPlusModelDescriptorSnapshots = window.__codexPlusModelDescriptorSnapshots
+    || (window.__codexPlusModelDescriptorSnapshots = new WeakMap());
+  const codexPlusModelContainerSnapshots = window.__codexPlusModelContainerSnapshots
+    || (window.__codexPlusModelContainerSnapshots = new WeakMap());
 
   if (window.__CODEX_PLUS_TEST_SERVICE_TIER__) {
     window.__codexPlusServiceTierTest = {
@@ -11221,10 +11225,76 @@
     return Array.isArray(value) && value.every((item) => typeof item === "string");
   }
 
+  const codexPlusModelDescriptorFields = [
+    "hidden", "displayName", "description", "defaultReasoningEffort",
+    "contextWindow", "maxContextWindow", "context_window", "max_context_window",
+    "supportedReasoningEfforts",
+  ];
+
+  function patchCodexPlusModelDescriptor(descriptor, modelName) {
+    const before = new Map(codexPlusModelDescriptorFields.map((key) => [key, {
+      own: Object.prototype.hasOwnProperty.call(descriptor, key), value: descriptor[key],
+    }]));
+    let changed = false;
+    if (descriptor.hidden !== false) { descriptor.hidden = false; changed = true; }
+    if (applyCodexPlusModelMetadata(descriptor, modelName)) changed = true;
+    if (!changed) return false;
+    const snapshot = codexPlusModelDescriptorSnapshots.get(descriptor) || { fields: {} };
+    for (const key of codexPlusModelDescriptorFields) {
+      const previous = before.get(key);
+      if (descriptor[key] === previous.value && Object.prototype.hasOwnProperty.call(descriptor, key) === previous.own) continue;
+      if (!snapshot.fields[key]) snapshot.fields[key] = { original: previous };
+      snapshot.fields[key].patched = descriptor[key];
+    }
+    codexPlusModelDescriptorSnapshots.set(descriptor, snapshot);
+    return true;
+  }
+
+  function restoreCodexPlusModelDescriptor(descriptor) {
+    const snapshot = codexPlusModelDescriptorSnapshots.get(descriptor);
+    if (!snapshot) return false;
+    let changed = false;
+    for (const [key, state] of Object.entries(snapshot.fields)) {
+      if (descriptor[key] !== state.patched) continue;
+      if (state.original.own) descriptor[key] = state.original.value;
+      else delete descriptor[key];
+      changed = true;
+    }
+    codexPlusModelDescriptorSnapshots.delete(descriptor);
+    return changed;
+  }
+
+  function restoreCodexPlusModelContainerFields(value) {
+    const snapshot = codexPlusModelContainerSnapshots.get(value);
+    if (!snapshot) return false;
+    let changed = false;
+    for (const [key, state] of Object.entries(snapshot.fields)) {
+      if (value[key] !== state.patched) continue;
+      value[key] = state.original;
+      changed = true;
+    }
+    codexPlusModelContainerSnapshots.delete(value);
+    return changed;
+  }
+
+  function filterCodexPlusHiddenModels(value, key, names) {
+    if (!Array.isArray(value[key])) return false;
+    const original = value[key];
+    const patched = original.filter((name) => !names.includes(name));
+    if (patched.length === original.length) return false;
+    const snapshot = codexPlusModelContainerSnapshots.get(value) || { fields: {} };
+    if (!snapshot.fields[key]) snapshot.fields[key] = { original };
+    snapshot.fields[key].patched = patched;
+    codexPlusModelContainerSnapshots.set(value, snapshot);
+    value[key] = patched;
+    return true;
+  }
+
   function patchModelNameArray(models, hostId) {
     if (!stringArrayLooksPatchable(models)) return false;
     const allowed = codexPureApiAllowedModelSet(hostId);
-    let changed = prepareModelCollection(models, allowed);
+    let changed = prepareModelCollection(models, allowed, hostId);
+    if (hostId !== "local") return changed;
     const customModels = codexPlusModelNames();
     if (!customModels.length) return changed;
     if (allowed) {
@@ -11252,8 +11322,10 @@
     return !!right && left.length === right.length && left.every((item, index) => item === right[index]);
   }
 
-  function prepareModelCollection(collection, allowed) {
-    const policy = modelFilterPolicy(allowed);
+  function prepareModelCollection(collection, allowed, hostId) {
+    // 本地仅增补（没有过滤名单）也要记录，切远程时才能撤回自己的修改。
+    const policy = modelFilterPolicy(allowed) || (hostId === "local"
+      ? `local:${codexRemoteSessionActiveProfile()?.id || ""}:${JSON.stringify(codexPlusModelNames())}` : "");
     const previous = codexPlusModelCollectionSnapshots.get(collection);
     let current = [...collection];
     let changed = false;
@@ -11265,7 +11337,7 @@
         changed = true;
       }
     }
-    if (!allowed) codexPlusModelCollectionSnapshots.delete(collection);
+    if (!policy) codexPlusModelCollectionSnapshots.delete(collection);
     else if (!previous || previous.policy !== policy || !sameModelCollection(current, previous.patched)) {
       codexPlusModelCollectionSnapshots.set(collection, { policy, original: current, patched: null });
     }
@@ -11344,7 +11416,13 @@
   function patchModelArray(models, allowEmpty = false, hostId) {
     if (!modelArrayLooksPatchable(models, allowEmpty)) return false;
     const allowed = codexPureApiAllowedModelSet(hostId);
-    let changed = prepareModelCollection(models, allowed);
+    let changed = prepareModelCollection(models, allowed, hostId);
+    if (hostId !== "local") {
+      models.forEach((item) => {
+        if (restoreCodexPlusModelDescriptor(item)) changed = true;
+      });
+      return changed;
+    }
     const customModels = codexPlusModelNames();
     if (!customModels.length) return changed;
     if (allowed) {
@@ -11357,11 +11435,7 @@
     const existing = new Map(models.map((item) => [item.model, item]));
     models.forEach((item) => {
       if (customModels.includes(item.model)) {
-        if (item.hidden !== false) {
-          item.hidden = false;
-          changed = true;
-        }
-        if (applyCodexPlusModelMetadata(item, item.model)) changed = true;
+        if (patchCodexPlusModelDescriptor(item, item.model)) changed = true;
       }
     });
     customModels.forEach((modelName) => {
@@ -11378,6 +11452,7 @@
     if (!value || typeof value !== "object") return false;
     hostId = modelResponseHostId(hostId, value, value.message, value.result);
     let changed = false;
+    if (hostId !== "local" && restoreCodexPlusModelContainerFields(value)) changed = true;
     if (patchModelArray(value.models, "defaultModel" in value || "availableModels" in value, hostId)) changed = true;
     if (patchModelNameArray(value.models, hostId)) changed = true;
     if (patchModelArray(value.data, false, hostId)) changed = true;
@@ -11387,14 +11462,15 @@
     if (patchModelArray(value.result?.models, false, hostId)) changed = true;
     if (patchModelArray(value.message?.result?.data, false, hostId)) changed = true;
     if (patchModelArray(value.message?.result?.models, false, hostId)) changed = true;
-    const names = codexPlusModelNames();
+    const localHost = hostId === "local";
+    const names = localHost ? codexPlusModelNames() : [];
     const allowed = codexPureApiAllowedModelSet(hostId);
     if (value.availableModels instanceof Set) {
-      if (prepareModelCollection(value.availableModels, allowed)) changed = true;
+      if (prepareModelCollection(value.availableModels, allowed, hostId)) changed = true;
       if (allowed) for (const name of value.availableModels) {
         if (!allowed.has(name)) { value.availableModels.delete(name); changed = true; }
       }
-      names.forEach((name) => {
+      if (localHost) names.forEach((name) => {
         if (!value.availableModels.has(name)) {
           value.availableModels.add(name);
           changed = true;
@@ -11403,11 +11479,11 @@
       finishModelCollection(value.availableModels);
     }
     if (value.available_models instanceof Set) {
-      if (prepareModelCollection(value.available_models, allowed)) changed = true;
+      if (prepareModelCollection(value.available_models, allowed, hostId)) changed = true;
       if (allowed) for (const name of value.available_models) {
         if (!allowed.has(name)) { value.available_models.delete(name); changed = true; }
       }
-      names.forEach((name) => {
+      if (localHost) names.forEach((name) => {
         if (!value.available_models.has(name)) {
           value.available_models.add(name);
           changed = true;
@@ -11421,16 +11497,8 @@
     if (Array.isArray(value.available_models)) {
       if (patchModelNameArray(value.available_models, hostId)) changed = true;
     }
-    if (Array.isArray(value.hiddenModels)) {
-      const before = value.hiddenModels.length;
-      value.hiddenModels = value.hiddenModels.filter((name) => !names.includes(name));
-      if (value.hiddenModels.length !== before) changed = true;
-    }
-    if (Array.isArray(value.hidden_models)) {
-      const before = value.hidden_models.length;
-      value.hidden_models = value.hidden_models.filter((name) => !names.includes(name));
-      if (value.hidden_models.length !== before) changed = true;
-    }
+    if (localHost && filterCodexPlusHiddenModels(value, "hiddenModels", names)) changed = true;
+    if (localHost && filterCodexPlusHiddenModels(value, "hidden_models", names)) changed = true;
     if (patchModelDefaults(value, allowed)) changed = true;
     return changed;
   }
@@ -12361,12 +12429,61 @@
     return list;
   }
 
-  /** Portal 菜单没有 host 属性，复用当前会话已经校验过的成对 thread/host 身份。 */
-  function codexPlusModelPickerHostId() {
-    let ref = null;
-    try { ref = currentSessionRef(); } catch {}
-    const hostId = typeof ref?.host_id === "string" ? ref.host_id.trim() : "";
+  /** 当前可见 composer 的模型按钮；多个可见按钮时无法证明菜单归属。 */
+  function codexPlusModelPickerComposerTrigger() {
+    const triggers = [...document.querySelectorAll("[data-codex-intelligence-trigger]")]
+      .filter((node) => node?.isConnected && visibleElement(node) && !node.closest?.("[data-codex-plus-ext]"));
+    return triggers.length === 1 ? triggers[0] : null;
+  }
+
+  /**
+   * Portal 菜单没有 host 属性，从当前 composer 模型按钮的 React 祖先读取原生权限 host。
+   * 只检查祖先 props 的直接字段；当前 thread 的 conversationId 必须与路由一致。
+   */
+  function codexPlusModelPickerComposerHostId() {
+    const trigger = codexPlusModelPickerComposerTrigger();
+    if (!trigger) return "";
+    const fiberKey = Object.getOwnPropertyNames(trigger).find((key) => key.startsWith("__reactFiber$"));
+    const permissionHosts = new Set();
+    const scopedHosts = new Set();
+    const conversationIds = new Set();
+    const add = (set, value) => {
+      if (typeof value === "string" && value.trim()) set.add(value.trim());
+    };
+    let fiber = fiberKey ? trigger[fiberKey] : null;
+    for (let depth = 0; fiber && depth < 64; depth += 1, fiber = fiber.return) {
+      for (const props of [fiber.pendingProps, fiber.memoizedProps]) {
+        if (!props || typeof props !== "object") continue;
+        add(permissionHosts, props.permissionsHostId);
+        if (Object.prototype.hasOwnProperty.call(props, "conversationId")
+            || Object.prototype.hasOwnProperty.call(props, "permissionsCwdOverride")) add(scopedHosts, props.hostId);
+        const conversationId = typeof props.conversationId === "string" ? props.conversationId.trim() : "";
+        add(conversationIds, normalizedCodexThreadUuid(conversationId) || conversationId);
+      }
+    }
+    const hosts = permissionHosts.size ? permissionHosts : scopedHosts;
+    if (hosts.size !== 1 || conversationIds.size > 1) return "";
+    const hostId = [...hosts][0];
+    const routeThreadId = locationThreadId();
+    if (routeThreadId) {
+      const conversationId = [...conversationIds][0] || "";
+      // 临时新聊天仍有明确 composer host；其路由可能只暴露 client-new-thread 后的 UUID。
+      const threadUuid = (value) => normalizedCodexThreadUuid(value)
+        || (/^(?:local:)?client-new-thread:/i.test(value)
+          ? normalizedCodexThreadUuid(value.replace(/^(?:local:)?client-new-thread:/i, "")) : "");
+      const routeUuid = threadUuid(routeThreadId);
+      if (!conversationId || !routeUuid || threadUuid(conversationId) !== routeUuid) return "";
+      let ref = null;
+      try { ref = currentSessionRef(); } catch {}
+      const refHostId = typeof ref?.host_id === "string" ? ref.host_id.trim() : "";
+      const refThreadId = normalizedCodexThreadUuid(ref?.session_id);
+      if (refThreadId === routeUuid && refHostId && refHostId !== hostId) return "";
+    }
     return hostId;
+  }
+
+  function codexPlusModelPickerHostId() {
+    return codexPlusModelPickerComposerHostId();
   }
 
   /**
@@ -12557,11 +12674,7 @@
           || providers.get(codexPlusModelPickerNormalize(modelName))));
       // 聚合筛选是完整名单；原生缓存里的旧模型不能靠默认供应商兜底重新混进来。
       if (filteredCatalog && !known) return;
-      const matchingProvider = trustedProvider
-        ? [...providers.values()].find((value) =>
-          codexPlusModelPickerNormalizeStrict(value.provider) === codexPlusModelPickerNormalizeStrict(trustedProvider))
-        : null;
-      const groupId = (trustedProvider ? matchingProvider?.groupId : known?.groupId)
+      const groupId = known?.groupId
         || (trustedProvider ? trustedProvider : codexPlusModelPickerDefaultGroupId());
       // 后缀匹配供应商身份，目录匹配模型身份；未命中的裸名归到明确指定的默认成员。
       const provider = trustedProvider || known?.provider || codexPlusModelPickerDefaultProviderName();

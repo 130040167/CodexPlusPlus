@@ -235,12 +235,61 @@
     return list;
   }
 
-  /** Portal 菜单没有 host 属性，复用当前会话已经校验过的成对 thread/host 身份。 */
-  function codexPlusModelPickerHostId() {
-    let ref = null;
-    try { ref = currentSessionRef(); } catch {}
-    const hostId = typeof ref?.host_id === "string" ? ref.host_id.trim() : "";
+  /** 当前可见 composer 的模型按钮；多个可见按钮时无法证明菜单归属。 */
+  function codexPlusModelPickerComposerTrigger() {
+    const triggers = [...document.querySelectorAll("[data-codex-intelligence-trigger]")]
+      .filter((node) => node?.isConnected && visibleElement(node) && !node.closest?.("[data-codex-plus-ext]"));
+    return triggers.length === 1 ? triggers[0] : null;
+  }
+
+  /**
+   * Portal 菜单没有 host 属性，从当前 composer 模型按钮的 React 祖先读取原生权限 host。
+   * 只检查祖先 props 的直接字段；当前 thread 的 conversationId 必须与路由一致。
+   */
+  function codexPlusModelPickerComposerHostId() {
+    const trigger = codexPlusModelPickerComposerTrigger();
+    if (!trigger) return "";
+    const fiberKey = Object.getOwnPropertyNames(trigger).find((key) => key.startsWith("__reactFiber$"));
+    const permissionHosts = new Set();
+    const scopedHosts = new Set();
+    const conversationIds = new Set();
+    const add = (set, value) => {
+      if (typeof value === "string" && value.trim()) set.add(value.trim());
+    };
+    let fiber = fiberKey ? trigger[fiberKey] : null;
+    for (let depth = 0; fiber && depth < 64; depth += 1, fiber = fiber.return) {
+      for (const props of [fiber.pendingProps, fiber.memoizedProps]) {
+        if (!props || typeof props !== "object") continue;
+        add(permissionHosts, props.permissionsHostId);
+        if (Object.prototype.hasOwnProperty.call(props, "conversationId")
+            || Object.prototype.hasOwnProperty.call(props, "permissionsCwdOverride")) add(scopedHosts, props.hostId);
+        const conversationId = typeof props.conversationId === "string" ? props.conversationId.trim() : "";
+        add(conversationIds, normalizedCodexThreadUuid(conversationId) || conversationId);
+      }
+    }
+    const hosts = permissionHosts.size ? permissionHosts : scopedHosts;
+    if (hosts.size !== 1 || conversationIds.size > 1) return "";
+    const hostId = [...hosts][0];
+    const routeThreadId = locationThreadId();
+    if (routeThreadId) {
+      const conversationId = [...conversationIds][0] || "";
+      // 临时新聊天仍有明确 composer host；其路由可能只暴露 client-new-thread 后的 UUID。
+      const threadUuid = (value) => normalizedCodexThreadUuid(value)
+        || (/^(?:local:)?client-new-thread:/i.test(value)
+          ? normalizedCodexThreadUuid(value.replace(/^(?:local:)?client-new-thread:/i, "")) : "");
+      const routeUuid = threadUuid(routeThreadId);
+      if (!conversationId || !routeUuid || threadUuid(conversationId) !== routeUuid) return "";
+      let ref = null;
+      try { ref = currentSessionRef(); } catch {}
+      const refHostId = typeof ref?.host_id === "string" ? ref.host_id.trim() : "";
+      const refThreadId = normalizedCodexThreadUuid(ref?.session_id);
+      if (refThreadId === routeUuid && refHostId && refHostId !== hostId) return "";
+    }
     return hostId;
+  }
+
+  function codexPlusModelPickerHostId() {
+    return codexPlusModelPickerComposerHostId();
   }
 
   /**
@@ -431,11 +480,7 @@
           || providers.get(codexPlusModelPickerNormalize(modelName))));
       // 聚合筛选是完整名单；原生缓存里的旧模型不能靠默认供应商兜底重新混进来。
       if (filteredCatalog && !known) return;
-      const matchingProvider = trustedProvider
-        ? [...providers.values()].find((value) =>
-          codexPlusModelPickerNormalizeStrict(value.provider) === codexPlusModelPickerNormalizeStrict(trustedProvider))
-        : null;
-      const groupId = (trustedProvider ? matchingProvider?.groupId : known?.groupId)
+      const groupId = known?.groupId
         || (trustedProvider ? trustedProvider : codexPlusModelPickerDefaultGroupId());
       // 后缀匹配供应商身份，目录匹配模型身份；未命中的裸名归到明确指定的默认成员。
       const provider = trustedProvider || known?.provider || codexPlusModelPickerDefaultProviderName();

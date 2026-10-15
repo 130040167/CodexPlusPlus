@@ -170,13 +170,13 @@ it("默认供应商带「默认」标志，身份来自目录而不是猜名字"
   assert.match(source, /keep = groups\.find\(\(group\) => group\.isDefault\)\?\.id/);
 });
 
-it("目录条目按别名匹配，供应商后缀优先定位分组 id", async () => {
+it("目录条目按别名匹配，权威模型身份优先定位分组 id", async () => {
   const source = await readShard();
   // 目录的展示名（GPT-6.1-Sol）与选择器里的行（6.1 Sol）不一样，必须登记别名。
   assert.match(source, /codexPlusModelPickerCatalogAliases/);
   assert.match(source, /replace\(\/\^gpt\[-\\s\]\*\/iu, ""\)/);
   // 早期版本的教训：拿目录展示名去拟合行文本会把同一家切成好几段。
-  assert.match(source, /trustedProvider \? matchingProvider\?\.groupId : known\?\.groupId/);
+  assert.match(source, /const groupId = known\?\.groupId/);
   assert.match(source, /const provider = trustedProvider \|\| known\?\.provider/);
   // 组内任意一行命中默认分组即认定该组是默认（裸名行的 id 可能来自目录）。
   assert.match(source, /group\.entries\.some\(\(entry\) => entry\.groupId === defaultGroupId/);
@@ -324,6 +324,26 @@ it("真实目录形式：嵌套括号、原生空格标签及同名裸 slug 均�
   }
 });
 
+it("同名供应商仍按权威 group id 分组，默认成员不会被第一项抢走", async () => {
+  const run = await catalogGroupingHarness();
+  const catalog = {
+    status: "ok",
+    models: ["model-a", "cpx-b/model-b"],
+    sources: [{ type: "aggregate_model_catalog" }],
+    codex_plus_default_group_id: "a",
+    modelMetadata: {
+      "model-a": { displayName: "Model A", codex_plus_group: "同名", codex_plus_group_id: "a", codex_plus_default: true },
+      "cpx-b/model-b": { displayName: "Model B（同名）", codex_plus_group: "同名", codex_plus_group_id: "b" },
+    },
+  };
+  const groups = run(catalog, ["Model A", "Model B（同名）"]);
+  assert.deepEqual(groups.map((group: { id: string; name: string; isDefault: boolean }) =>
+    [group.id, group.name, group.isDefault]), [
+    ["a", "同名", true],
+    ["b", "同名", false],
+  ]);
+});
+
 it("默认身份随目录更新，过期模型元数据不会抢占有效别名", async () => {
   const run = await catalogGroupingHarness();
   const catalog = supplierCatalog();
@@ -386,15 +406,11 @@ it("当前会话切到远程或 host 未知后恢复旧隐藏类和原生计数"
     let unlockEnabled = true;
     let codexPlusBackendSettingsLoaded = true;
     let currentHostId = "local";
-    let currentSessionError = false;
     const codexRemoteSessionActiveProfile = () => activeProfile;
     const codexPlusModelUnlockEnabled = () => unlockEnabled;
     const codexPlusModelNames = () => catalog.models;
     const codexPlusModelPickerRowIdentity = () => ({ groupable: true });
-    const currentSessionRef = () => {
-      if (currentSessionError) throw new Error("session unavailable");
-      return currentHostId ? { host_id: currentHostId } : {};
-    };
+    const codexPlusModelPickerComposerHostId = () => currentHostId;
     ${allowedModelSet}
     ${functions}
     return setup({
@@ -403,8 +419,7 @@ it("当前会话切到远程或 host 未知后恢复旧隐藏类和原生计数"
         unlockEnabled = unlock;
         codexPlusBackendSettingsLoaded = loaded;
       },
-      sessionHost: hostId => { currentHostId = hostId; },
-      sessionError: value => { currentSessionError = value; },
+      composerHost: hostId => { currentHostId = hostId; },
       filtered: list => codexPlusModelPickerFilteredCatalog(list),
       sync: (list, included, filtered) => codexPlusModelPickerSyncCatalogVisibility(list, included, filtered),
       host: () => codexPlusModelPickerHostId(),
@@ -412,10 +427,9 @@ it("当前会话切到远程或 host 未知后恢复旧隐藏类和原生计数"
   `);
   const catalog = { status: "ok", model_provider: "agg", models: ["first", "second"],
     sources: [{ type: "aggregate_model_catalog", id: "aggregate:agg" }] };
-  run(catalog, ({ policy, sessionHost, sessionError, filtered, sync, host }: {
+  run(catalog, ({ policy, composerHost, filtered, sync, host }: {
     policy: (profile: object, unlock: boolean, loaded: boolean) => void;
-    sessionHost: (hostId: string) => void;
-    sessionError: (value: boolean) => void;
+    composerHost: (hostId: string) => void;
     filtered: (list: List) => boolean;
     sync: (list: List, included: Set<Row>, filtered: boolean) => void;
     host: () => string;
@@ -443,26 +457,88 @@ it("当前会话切到远程或 host 未知后恢复旧隐藏类和原生计数"
       "设置未加载时应恢复原生计数");
     policy({ id: "agg", relayMode: "aggregate" }, true, true);
 
-    sessionHost("ssh:build-host");
+    composerHost("ssh:build-host");
     const remote = rows;
     assert.equal(host(), "ssh:build-host");
     assert.equal(filtered(list), false);
     sync(list, new Set(remote), false);
     assert.equal(remote.filter((row) => !row.classList.contains("codex-plus-model-outside-catalog")).length, 3);
 
-    sessionHost("");
+    composerHost("");
     remote[2].classList.toggle("codex-plus-model-outside-catalog", true);
     assert.equal(host(), "");
     sync(list, new Set(remote), filtered(list));
     assert.equal(remote.filter((row) => !row.classList.contains("codex-plus-model-outside-catalog")).length, 3);
-
-    remote[2].classList.toggle("codex-plus-model-outside-catalog", true);
-    sessionError(true);
-    assert.equal(host(), "");
-    sync(list, new Set(remote), filtered(list));
-    assert.equal(remote.filter((row) => !row.classList.contains("codex-plus-model-outside-catalog")).length, 3,
-      "当前会话读取异常时应恢复原生计数");
   });
+});
+
+it("模型菜单 host 只来自当前 composer 的明确祖先证据", async () => {
+  const source = await readShard();
+  const catalogSource = await readFile(new URL(
+    "../../../assets/inject/renderer-inject/70-model-catalog.js", import.meta.url), "utf8");
+  const functions = [
+    "codexPlusModelPickerComposerTrigger",
+    "codexPlusModelPickerComposerHostId",
+    "codexPlusModelPickerHostId",
+  ].map((name) => extractFunction(source, name)).join("\n");
+
+  const run = new Function("triggers", "routeThreadId", "sessionRef", "backgroundHost", `
+    const window = { __codexPlusModelPickerHostEvidence: { hostId: backgroundHost } };
+    const document = { querySelectorAll: () => triggers };
+    const visibleElement = node => node.visible;
+    const locationThreadId = () => routeThreadId;
+    const normalizedCodexThreadUuid = value => {
+      const normalized = String(value || "").replace(/^local:/i, "");
+      return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(normalized) ? normalized : "";
+    };
+    const currentSessionRef = () => sessionRef;
+    ${functions}
+    return codexPlusModelPickerHostId();
+  `);
+
+  const trigger = (props: object[], visible = true, extension = false) => {
+    let fiber: any = null;
+    for (const value of [...props].reverse()) fiber = { pendingProps: value, memoizedProps: value, return: fiber };
+    return {
+      visible, isConnected: true,
+      closest: (selector: string) => selector === "[data-codex-plus-ext]" && extension ? {} : null,
+      __reactFiber$fixture: fiber,
+    };
+  };
+  const uuid = "01a133b6-fec1-7641-a1d1-f27100cee5b6";
+  const local = trigger([{ permissionsHostId: "local" }, { permissionsHostId: "local" }]);
+  assert.equal(run([local], "", {}, "ssh:late-response"), "local",
+    "并行后台响应不能覆盖当前 composer host");
+  assert.equal(run([trigger([{ permissionsHostId: "ssh:build-host" }])], "", {}, "local"), "ssh:build-host");
+  assert.equal(run([trigger([{ hostId: "ssh:fallback", permissionsCwdOverride: "C:/repo" }])],
+    "", {}, "local"), "ssh:fallback");
+  assert.equal(run([trigger([{ permissionsHostId: "local" }, { hostId: "ssh:provider" }])],
+    "", {}, ""), "local", "通用 provider hostId 不能污染 composer 权限 host");
+  assert.equal(run([trigger([{ permissionsHostId: "local" },
+    { hostId: "ssh:other", conversationId: "draft" }])], "", {}, ""), "local",
+  "存在 permissionsHostId 时不降级到作用域 hostId");
+  assert.equal(run([trigger([{ permissionsHostId: "local" }, { permissionsHostId: "ssh:other" }])],
+    "", {}, ""), "");
+  assert.equal(run([local, trigger([{ permissionsHostId: "local" }])], "", {}, ""), "",
+    "多个可见 composer 时不能猜菜单归属");
+  assert.equal(run([trigger([{ permissionsHostId: "ssh:hidden" }], false), local], "", {}, ""), "local");
+  assert.equal(run([trigger([{ permissionsHostId: "local" }], true, true)], "", {}, ""), "");
+
+  const matching = trigger([{ permissionsHostId: "local", conversationId: `local:${uuid}` }]);
+  assert.equal(run([matching], uuid, { session_id: uuid, host_id: "local" }, "ssh:late-response"), "local");
+  assert.equal(run([matching], uuid, { session_id: uuid, host_id: "ssh:stale" }, ""), "",
+    "当前 thread 的 sidebar host 与 composer 冲突时保持 unknown");
+  assert.equal(run([trigger([{ permissionsHostId: "local", conversationId: "local:11111111-1111-4111-8111-111111111111" }])],
+    uuid, { session_id: uuid, host_id: "local" }, ""), "", "conversationId 与路由不一致时拒绝");
+  assert.equal(run([trigger([{ permissionsHostId: "local" }])], uuid,
+    { session_id: uuid, host_id: "local" }, ""), "", "thread 路由缺少 conversationId 时拒绝");
+  assert.equal(run([trigger([{ permissionsHostId: "local", conversationId: `local:client-new-thread:${uuid}` }])],
+    uuid, {}, "ssh:late-response"), "local", "临时新聊天使用当前 composer host");
+  assert.equal(run([trigger([{ permissionsHostId: "ssh:build-host", conversationId: `client-new-thread:${uuid}` }])],
+    uuid, {}, "local"), "ssh:build-host");
+  assert.equal(run([trigger([{ permissionsHostId: "local", conversationId: "client-new-thread:invalid" }])],
+    "invalid", {}, ""), "", "无效临时ID不能用两个空UUID判等");
+  assert.doesNotMatch(catalogSource, /__codexPlusModelPickerHostEvidence|recordCodexPlusModelPickerHost/);
 });
 
 it("聚合名单同时应用到本地模型数据层，远程主机和失效目录保留原列表", async () => {
@@ -488,4 +564,90 @@ it("聚合名单同时应用到本地模型数据层，远程主机和失效目�
   assert.equal(resolve({ id: "agg", relayMode: "aggregate" }, catalog, "local", false, true), null);
   assert.equal(resolve({ id: "agg", relayMode: "aggregate" }, catalog, "local", true, false), null);
   assert.equal(resolve({ id: "agg", relayMode: "aggregate" }, { ...catalog, status: "failed" }, "local", true, true), null);
+});
+
+it("模型数据从本地切到远程或未知 host 时完整恢复，且不注入本地目录", async () => {
+  const source = await readFile(new URL(
+    "../../../assets/inject/renderer-inject/70-model-catalog.js", import.meta.url), "utf8");
+  const functions = [
+    "modelArrayLooksPatchable",
+    "stringArrayLooksPatchable",
+    "patchCodexPlusModelDescriptor",
+    "restoreCodexPlusModelDescriptor",
+    "restoreCodexPlusModelContainerFields",
+    "filterCodexPlusHiddenModels",
+    "patchModelNameArray",
+    "modelFilterPolicy",
+    "sameModelCollection",
+    "prepareModelCollection",
+    "finishModelCollection",
+    "patchModelDefaults",
+    "modelResponseHostId",
+    "codexPureApiAllowedModelSet",
+    "patchModelArray",
+    "patchModelContainer",
+  ].map((name) => extractFunction(source, name)).join("\n");
+  const run = new Function("targetHost", "relayMode", `
+    const codexPlusModelCollectionSnapshots = new WeakMap();
+    const codexPlusModelDefaultSnapshots = new WeakMap();
+    const codexPlusModelDescriptorSnapshots = new WeakMap();
+    const codexPlusModelContainerSnapshots = new WeakMap();
+    const codexPlusModelDescriptorFields = ["hidden", "displayName", "description",
+      "defaultReasoningEffort", "contextWindow", "maxContextWindow", "context_window",
+      "max_context_window", "supportedReasoningEfforts"];
+    const codexModelCatalog = { status: "ok", model: "local-model", default_model: "local-model",
+      model_provider: "agg", models: ["local-model"], sources: [{ id: "aggregate:agg" }] };
+    const codexRemoteSessionActiveProfile = () => ({ id: "agg", relayMode });
+    const codexPlusModelUnlockEnabled = () => true;
+    const codexPlusBackendSettingsLoaded = true;
+    const codexPlusModelNames = () => ["local-model"];
+    const applyCodexPlusModelMetadata = descriptor => {
+      let changed = false;
+      if (descriptor.displayName !== "Catalog Local") { descriptor.displayName = "Catalog Local"; changed = true; }
+      if (descriptor.description !== "Local metadata") { descriptor.description = "Local metadata"; changed = true; }
+      return changed;
+    };
+    const codexPlusModelDescriptor = model => ({ model, hidden: false, displayName: "Catalog Local", description: "Local metadata" });
+    ${functions}
+    const remoteDescriptor = { model: "remote-model", hidden: true, displayName: "Remote" };
+    const localDescriptor = { model: "local-model", hidden: true, displayName: "Native Local" };
+    const value = {
+      hostId: "local",
+      models: [remoteDescriptor, localDescriptor],
+      availableModels: ["remote-model"],
+      available_models: new Set(["remote-model"]),
+      hiddenModels: ["remote-model", "local-model"],
+      hidden_models: ["remote-model", "local-model"],
+      defaultModel: "remote-model",
+      default_model: { model: "remote-model" },
+    };
+    patchModelContainer(value, "local");
+    value.hostId = targetHost;
+    patchModelContainer(value, targetHost);
+    return {
+      models: value.models.map(item => ({ ...item })),
+      availableModels: [...value.availableModels],
+      available_models: [...value.available_models],
+      hiddenModels: value.hiddenModels,
+      hidden_models: value.hidden_models,
+      defaultModel: value.defaultModel,
+      default_model: value.default_model,
+    };
+  `);
+  const expected = {
+    models: [
+      { model: "remote-model", hidden: true, displayName: "Remote" },
+      { model: "local-model", hidden: true, displayName: "Native Local" },
+    ],
+    availableModels: ["remote-model"],
+    available_models: ["remote-model"],
+    hiddenModels: ["remote-model", "local-model"],
+    hidden_models: ["remote-model", "local-model"],
+    defaultModel: "remote-model",
+    default_model: { model: "remote-model" },
+  };
+  for (const mode of ["aggregate", "official"]) {
+    assert.deepEqual(run("ssh:build-host", mode), expected);
+    assert.deepEqual(run("", mode), expected);
+  }
 });
