@@ -1788,6 +1788,49 @@ experimental_bearer_token = "sk-test"
 }
 
 #[tokio::test]
+async fn launch_lifecycle_fails_and_cleans_up_when_debug_endpoint_is_unavailable() {
+    for packaged in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let app_dir = temp.path().join("Codex.app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut hooks = FakeHooks::new(events.clone()).with_inject_error("inject failed");
+        hooks.debug_endpoint_available = false;
+        if packaged {
+            hooks = hooks.with_launch_result(CodexLaunch::PackagedActivation {
+                app_user_model_id: "OpenAI.Codex_2p2nqsd0c76g0!App".to_string(),
+                arguments: "--remote-debugging-port=9229".to_string(),
+                process_id: Some(4242),
+            });
+        }
+        let error = launch_and_inject_with_hooks(
+            LaunchOptions {
+                app_dir: Some(app_dir),
+                debug_port: 9229,
+                helper_port: 57321,
+                status_store: status_store.clone(),
+                ..Default::default()
+            },
+            &hooks,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("未在调试端口 9229 提供页面连接"));
+        let events = events.lock().unwrap().clone();
+        assert!(events.contains(&"shutdown-helper:57321".to_string()));
+        // 未确认实例身份时不能误杀其他 Codex，只清理本次启动的 helper。
+        assert!(!events.iter().any(|event| event.starts_with("terminate-")));
+        assert!(!events.contains(&"status:running_degraded".to_string()));
+        assert_eq!(
+            status_store.load_latest().unwrap().unwrap().status,
+            "failed"
+        );
+    }
+}
+
+#[tokio::test]
 async fn launch_lifecycle_enters_degraded_mode_and_retries_when_injection_fails() {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("Codex.app");
@@ -2558,6 +2601,7 @@ struct FakeHooks {
     launch_result: CodexLaunch,
     launch_error: Option<String>,
     inject_error: Option<String>,
+    debug_endpoint_available: bool,
     provider_sync_unsupported: bool,
     has_pending_remote_control_session_recoveries: bool,
     /// 还需要让 `start_helper` 报几次「端口被占用」，用来模拟旧 helper 尚未交还监听。
@@ -2585,6 +2629,7 @@ impl FakeHooks {
             },
             launch_error: None,
             inject_error: None,
+            debug_endpoint_available: true,
             provider_sync_unsupported: false,
             has_pending_remote_control_session_recoveries: false,
             remaining_helper_bind_conflicts: Arc::new(Mutex::new(0)),
@@ -2653,6 +2698,10 @@ impl FakeHooks {
 
 #[async_trait::async_trait(?Send)]
 impl LaunchHooks for FakeHooks {
+    fn debug_endpoint_available(&self, _debug_port: u16) -> bool {
+        self.debug_endpoint_available
+    }
+
     fn resolve_app_dir(
         &self,
         app_dir: Option<&Path>,

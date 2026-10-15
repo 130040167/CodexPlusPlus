@@ -402,6 +402,10 @@ pub trait LaunchHooks: Send + Sync {
         Ok(None)
     }
     async fn inject(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()>;
+    /// 注入失败后区分页面桥接降级与根本没有启动调试实例；测试可模拟连接状态。
+    fn debug_endpoint_available(&self, debug_port: u16) -> bool {
+        crate::cdp::endpoint_available(debug_port)
+    }
     async fn inject_bridge(
         &self,
         debug_port: u16,
@@ -840,7 +844,7 @@ where
                 )
                 .await;
             } else {
-                if !crate::cdp::endpoint_available(debug_port) {
+                if !hooks.debug_endpoint_available(debug_port) {
                     anyhow::bail!(
                         "Codex 启动后未在调试端口 {debug_port} 提供页面连接；请确认旧实例已退出后重试"
                     );
