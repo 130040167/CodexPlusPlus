@@ -140,6 +140,7 @@ pub fn protocol_proxy_port() -> u16 {
             let port = select_proxy_port(
                 saved.unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT),
                 |port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+                proxy_helper_available,
                 || {
                     std::net::TcpListener::bind(("127.0.0.1", 0))
                         .ok()
@@ -171,9 +172,58 @@ pub fn protocol_proxy_port() -> u16 {
 fn select_proxy_port(
     preferred: u16,
     can_bind: impl FnOnce(u16) -> bool,
+    is_healthy_helper: impl FnOnce(u16) -> bool,
     available: impl FnOnce() -> u16,
 ) -> u16 {
-    if can_bind(preferred) { preferred } else { available() }
+    // 另一个 launcher 可能已监听保存端口；读取概览不能把它迁走。
+    if can_bind(preferred) || is_healthy_helper(preferred) {
+        preferred
+    } else {
+        available()
+    }
+}
+
+#[cfg(windows)]
+fn proxy_helper_available(port: u16) -> bool {
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+
+    let timeout = Duration::from_secs(1);
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
+        return false;
+    };
+    if stream.set_read_timeout(Some(timeout)).is_err()
+        || stream.set_write_timeout(Some(timeout)).is_err()
+        || write!(
+            stream,
+            "GET /backend/status HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let mut response = Vec::new();
+    if stream.take(32 * 1024).read_to_end(&mut response).is_err() {
+        return false;
+    }
+    let Some(end) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+        return false;
+    };
+    let headers = String::from_utf8_lossy(&response[..end]);
+    if !headers.lines().next().is_some_and(|line| {
+        line.starts_with("HTTP/") && line.split_whitespace().nth(1) == Some("200")
+    }) {
+        return false;
+    }
+    // 与管理器概览的 helper 身份检查一致，普通 HTTP 服务不能被误认。
+    serde_json::from_slice::<Value>(&response[end + 4..])
+        .ok()
+        .is_some_and(|body| {
+            body["status"] == "ok"
+                && body["transport"] == "http-helper"
+                && body["version"].is_string()
+        })
 }
 
 #[cfg(test)]
@@ -182,13 +232,27 @@ mod proxy_port_selection_tests {
 
     #[test]
     fn preserves_the_saved_port_when_available() {
-        assert_eq!(select_proxy_port(60000, |_| true, || panic!("unused")), 60000);
+        assert_eq!(
+            select_proxy_port(60000, |_| true, |_| panic!("unused"), || panic!("unused")),
+            60000
+        );
+    }
+
+    #[test]
+    fn preserves_the_saved_port_when_another_launcher_is_healthy() {
+        assert_eq!(
+            select_proxy_port(60000, |_| false, |_| true, || panic!("must not migrate")),
+            60000
+        );
     }
 
     #[test]
     fn unavailable_default_or_saved_port_uses_available_port() {
         for preferred in [57321, 60000] {
-            assert_eq!(select_proxy_port(preferred, |_| false, || 62000), 62000);
+            assert_eq!(
+                select_proxy_port(preferred, |_| false, |_| false, || 62000),
+                62000
+            );
         }
     }
 }
