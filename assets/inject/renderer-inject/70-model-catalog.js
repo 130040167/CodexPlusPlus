@@ -330,7 +330,7 @@
     return changed;
   }
 
-  // 只收窄当前纯 API 供应商的有效目录；名单里的 GPT 也是可用模型，不能按前缀删。
+  // 收窄当前纯 API 或聚合供应商的有效目录；名单里的 GPT 也是可用模型。
   // 目录失败/未配置/仍属于上一个供应商时继续保留原生列表。
   function modelResponseHostId(...values) {
     let local = false;
@@ -352,11 +352,12 @@
     if (hostId !== "local") return null;
     const profile = codexRemoteSessionActiveProfile();
     if (!codexPlusModelUnlockEnabled() || !codexPlusBackendSettingsLoaded
-        || profile?.relayMode !== "pureApi" || codexModelCatalog.status !== "ok") return null;
+        || !["pureApi", "aggregate"].includes(profile?.relayMode) || codexModelCatalog.status !== "ok") return null;
     const profileId = String(profile.id || "").trim();
     const belongsToProfile = profileId && (codexModelCatalog.model_provider === profileId
       || (Array.isArray(codexModelCatalog.sources)
-        && codexModelCatalog.sources.some((source) => source?.id === `relay-profile:${profileId}`)));
+        && codexModelCatalog.sources.some((source) => source?.id === `relay-profile:${profileId}`
+          || (profile.relayMode === "aggregate" && source?.id === `aggregate:${profileId}`))));
     const names = codexPlusModelNames();
     return belongsToProfile && names.length ? new Set(names) : null;
   }
