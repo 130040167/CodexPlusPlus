@@ -11396,6 +11396,57 @@
     return belongsToProfile ? new Set(codexPlusModelNames()) : null;
   }
 
+  function codexAggregateSelectedModelTarget(model, hostId) {
+    const allowed = codexAggregateAllowedModelSet(hostId);
+    if (!allowed || typeof model !== "string" || allowed.has(model)) return "";
+    const defaultGroup = codexModelCatalog.codex_plus_default_group_id;
+    if (typeof defaultGroup !== "string" || !defaultGroup) return "";
+    const prefix = `cpx-${defaultGroup}/`;
+    if (!model.startsWith(prefix)) return "";
+    const target = model.slice(prefix.length);
+    // 只迁移晋升为默认成员的旧前缀，不能凭同名模型切到另一家。
+    return allowed.has(target) && codexPlusModelMetadata(target)?.codex_plus_group_id === defaultGroup
+      ? target : "";
+  }
+
+  function syncCodexAggregateSelectedModel() {
+    if (!codexAggregateAllowedModelSet("local")) return false;
+    const attempts = window.__codexPlusAggregateModelSelectionAttempts
+      || (window.__codexPlusAggregateModelSelectionAttempts = new WeakMap());
+    let changed = false;
+    for (const node of document.querySelectorAll("[data-codex-intelligence-trigger]")) {
+      const key = Object.keys(node).find((name) => name.startsWith("__reactFiber$"));
+      let fiber = key ? node[key] : null;
+      let picker = null;
+      let hostId = "";
+      for (let depth = 0; fiber && depth < 64; depth += 1, fiber = fiber.return) {
+        const props = fiber.memoizedProps || {};
+        if (!picker && typeof props.model === "string" && typeof props.onSelectModel === "function"
+            && Array.isArray(props.models)) picker = props;
+        if (typeof props.permissionsHostId === "string" && props.permissionsHostId.trim()) {
+          hostId = props.permissionsHostId.trim();
+          break;
+        }
+      }
+      if (!picker || hostId !== "local" || picker.lockedModelSlug || picker.modelOptionsDisabled
+          || picker.modelSelectionDisabled) continue;
+      const target = codexAggregateSelectedModelTarget(picker.model, hostId);
+      // 等 React 消费新列表后再调用原生选择入口，保留当前思考等级。
+      if (!target || !picker.models.some((entry) => entry?.model === target)) continue;
+      const signature = `${codexModelCatalogAppliedEpoch}:${picker.model}:${target}:${picker.reasoningEffort || ""}`;
+      if (attempts.get(picker.onSelectModel) === signature) continue;
+      attempts.set(picker.onSelectModel, signature);
+      try {
+        picker.onSelectModel(target, picker.reasoningEffort);
+        changed = true;
+      } catch (error) {
+        attempts.delete(picker.onSelectModel);
+        sendCodexPlusDiagnostic("aggregate_model_selection_refresh_failed", { error: String(error?.message || error) });
+      }
+    }
+    return changed;
+  }
+
   function patchModelArray(models, allowEmpty = false, hostId) {
     if (!modelArrayLooksPatchable(models, allowEmpty)) return false;
     const aggregateModels = codexAggregateAllowedModelSet(hostId);
@@ -12247,11 +12298,13 @@
   function runCodexModelWhitelistRefreshPass() {
     if (!codexPlusModelUnlockEnabled()) {
       if (codexAggregateAllowedModelSet("local")) refreshCachedLocalModelQueries();
+      syncCodexAggregateSelectedModel();
       return false;
     }
     try {
       patchStatsigModelWhitelist();
       refreshCachedLocalModelQueries();
+      syncCodexAggregateSelectedModel();
       installAppServerModelRequestPatch();
     } catch (error) {
       window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];

@@ -187,9 +187,11 @@ async function aggregateQueryRuntime() {
     "codexPlusModelDescriptor", "modelArrayLooksPatchable", "modelFilterPolicy",
     "sameModelCollection", "prepareModelCollection", "finishModelCollection",
     "codexPureApiAllowedModelSet", "codexAggregateAllowedModelSet", "patchModelArray",
+    "codexAggregateSelectedModelTarget", "syncCodexAggregateSelectedModel",
     "codexPlusLocalModelQuery", "cloneCodexPlusModelCollection",
     "patchCachedLocalModelQueryData", "codexPlusModelQueryCollection",
     "refreshCachedLocalModelQueries", "installCodexPlusModelQueryPublication",
+    "runCodexModelWhitelistRefreshPass",
   ];
   const functions = names.map((name) => {
     const start = source.indexOf(`  function ${name}(`);
@@ -200,8 +202,9 @@ async function aggregateQueryRuntime() {
   type Model = { model: string; displayName?: string; isDefault?: boolean };
   type Catalog = {
     status: string; model: string; models: string[];
+    codex_plus_default_group_id: string;
     sources: Array<{ id: string; type: string }>;
-    modelMetadata: Record<string, { displayName: string }>;
+    modelMetadata: Record<string, { displayName: string; codex_plus_group_id: string }>;
   };
   class Query {
     queryKey: string[];
@@ -226,7 +229,8 @@ async function aggregateQueryRuntime() {
       if (lateResponse) local.setData({ data: lateResponse.map((model) => ({ ...model })) });
     },
   };
-  const runtime = new Function("client", `
+  const nodes: object[] = [];
+  const runtime = new Function("client", "document", `
     const window = {};
     let codexModelCatalog = {}, codexModelCatalogAppliedEpoch = 0;
     let codexPlusBackendSettingsLoaded = true, unlocked = false;
@@ -245,12 +249,18 @@ async function aggregateQueryRuntime() {
       catalog: value => { codexModelCatalog = value; codexModelCatalogAppliedEpoch++; },
       profile: value => { profile = value; },
       unlock: value => { unlocked = value; },
+      syncSelection: syncCodexAggregateSelectedModel,
+      selectionTarget: codexAggregateSelectedModelTarget,
+      runRefreshPass: runCodexModelWhitelistRefreshPass,
     };
-  `)(client) as {
+  `)(client, { querySelectorAll: () => nodes }) as {
     refresh: () => boolean; install: () => void;
     catalog: (value: Catalog) => void;
     profile: (value: { id: string; relayMode: string }) => void;
     unlock: (value: boolean) => void;
+    syncSelection: () => boolean;
+    selectionTarget: (model: string, host: string) => string;
+    runRefreshPass: () => boolean;
   };
   const catalog = (defaultProvider: "a" | "b"): Catalog => {
     const models = ["a", "b"].flatMap((provider) =>
@@ -258,11 +268,14 @@ async function aggregateQueryRuntime() {
         provider === defaultProvider ? `model-${i}` : `cpx-${provider}/model-${i}`));
     return {
       status: "ok", model: models[0], models,
+      codex_plus_default_group_id: defaultProvider,
       sources: [{ id: "aggregate:agg", type: "aggregate_model_catalog" }],
-      modelMetadata: Object.fromEntries(models.map((model) => [model, { displayName: `Label ${model}` }])),
+      modelMetadata: Object.fromEntries(models.map((model) => [model, {
+        displayName: `Label ${model}`, codex_plus_group_id: model.startsWith("cpx-") ? model.slice(4, 5) : defaultProvider,
+      }])),
     };
   };
-  return { runtime, local, remote, catalog, setLate: (models: Model[]) => { lateResponse = models; } };
+  return { runtime, local, remote, catalog, nodes, setLate: (models: Model[]) => { lateResponse = models; } };
 }
 
 it("aggregate default changes replace stale slugs and keep display names even with whitelist unlock disabled", async () => {
@@ -314,4 +327,68 @@ it("an empty authoritative aggregate catalog withdraws all stale models", async 
   runtime.catalog({ ...catalog("b"), model: "", models: [], modelMetadata: {} });
   assert.equal(runtime.refresh(), true);
   assert.deepEqual(local.data.data, []);
+});
+
+it("a newly default member's retired prefix migrates through the native picker without changing effort", async () => {
+  const { runtime, catalog, nodes } = await aggregateQueryRuntime();
+  runtime.catalog(catalog("a"));
+  const selections: unknown[][] = [];
+  const props = {
+    model: "cpx-a/model-0", reasoningEffort: "high",
+    models: catalog("a").models.map((model) => ({ model })),
+    onSelectModel: (...args: unknown[]) => { selections.push(args); },
+  };
+  nodes.push({ __reactFiber$test: { memoizedProps: props, return: { memoizedProps: { permissionsHostId: "local" } } } });
+  runtime.refresh();
+  runtime.runRefreshPass();
+  assert.deepEqual(selections, [["model-0", "high"]]);
+  assert.equal(runtime.syncSelection(), false, "same pending selection is not repeated");
+  props.model = "model-0";
+  assert.equal(runtime.syncSelection(), false, "a canonical ID remains unchanged");
+  runtime.catalog(catalog("b"));
+  assert.equal(runtime.syncSelection(), false, "bare selections follow the new default as agreed");
+  props.model = "cpx-b/model-2";
+  props.models = catalog("b").models.map((model) => ({ model }));
+  assert.equal(runtime.syncSelection(), true);
+  assert.deepEqual(selections.at(-1), ["model-2", "high"]);
+});
+
+it("selection migration requires the same provider, current models, local host and an unlocked picker", async () => {
+  const { runtime, catalog, nodes } = await aggregateQueryRuntime();
+  const current = catalog("a");
+  runtime.catalog(current);
+  assert.equal(runtime.selectionTarget("cpx-b/model-0", "local"), "", "other member stays explicitly routed");
+  assert.equal(runtime.selectionTarget("cpx-other/model-0", "local"), "", "removed member is not guessed");
+  assert.equal(runtime.selectionTarget("cpx-a/missing", "local"), "", "unavailable model is not replaced");
+  assert.equal(runtime.selectionTarget("cpx-a/model-0", "ssh:test"), "", "remote catalog is not local");
+  current.modelMetadata["model-0"].codex_plus_group_id = "b";
+  assert.equal(runtime.selectionTarget("cpx-a/model-0", "local"), "", "bare metadata must confirm ownership");
+  current.modelMetadata["model-0"].codex_plus_group_id = "a";
+  let calls = 0;
+  const props = {
+    model: "cpx-a/model-0", reasoningEffort: "ultra",
+    models: [] as Array<{ model: string }>, lockedModelSlug: "",
+    modelOptionsDisabled: false, modelSelectionDisabled: false,
+    onSelectModel: () => { calls++; },
+  };
+  const host = { permissionsHostId: "local" };
+  nodes.push({ __reactFiber$test: { memoizedProps: props, return: { memoizedProps: host } } });
+  assert.equal(runtime.syncSelection(), false, "wait for React's model list");
+  props.models = current.models.map((model) => ({ model }));
+  host.permissionsHostId = "ssh:test";
+  assert.equal(runtime.syncSelection(), false);
+  host.permissionsHostId = "";
+  assert.equal(runtime.syncSelection(), false, "unknown host is not guessed");
+  host.permissionsHostId = "local";
+  props.lockedModelSlug = props.model;
+  assert.equal(runtime.syncSelection(), false);
+  props.lockedModelSlug = "";
+  props.modelOptionsDisabled = true;
+  assert.equal(runtime.syncSelection(), false);
+  props.modelOptionsDisabled = false;
+  props.modelSelectionDisabled = true;
+  assert.equal(runtime.syncSelection(), false);
+  props.modelSelectionDisabled = false;
+  assert.equal(runtime.syncSelection(), true);
+  assert.equal(calls, 1);
 });
