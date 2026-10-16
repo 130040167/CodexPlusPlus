@@ -6317,6 +6317,9 @@
       }
       codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
       codexPlusBackendSettingsLoaded = true;
+      if (typeof observeCodexModelCatalogRevision === "function") {
+        observeCodexModelCatalogRevision(settings.modelCatalogRevision);
+      }
     } catch (_) {
       return false;
     }
@@ -11178,6 +11181,7 @@
         codexModelCatalogAppliedEpoch += 1;
         codexModelCatalogLoadedAt = Date.now();
         if (typeof codexPlusModelPickerCatalogChanged === "function") codexPlusModelPickerCatalogChanged();
+        if (!window.__CODEX_PLUS_TEST_SERVICE_TIER__) refreshCachedLocalModelQueries();
         return codexModelCatalog;
       })
       .finally(() => {
@@ -11428,10 +11432,15 @@
         if (!hostId && typeof props.permissionsHostId === "string" && props.permissionsHostId.trim()) {
           hostId = props.permissionsHostId.trim();
         }
-        if (!owner && typeof props.threadId === "string") owner = props.threadId;
+        if (!owner) {
+          const conversationId = typeof props.conversationId === "string" ? props.conversationId.trim() : "";
+          const threadId = typeof props.threadId === "string" ? props.threadId.trim() : "";
+          owner = conversationId || threadId;
+        }
       }
       if (picker && hostId === "local" && !picker.lockedModelSlug && !picker.modelOptionsDisabled
-          && !picker.modelSelectionDisabled) pickers.push({ node, picker, owner });
+          && !picker.modelSelectionDisabled) pickers.push({ node, picker, owner, hostId });
+      else window.__codexPlusAggregateModelSelectionIdentities?.delete(node);
     }
     return pickers;
   }
@@ -11441,14 +11450,15 @@
     const identities = window.__codexPlusAggregateModelSelectionIdentities
       || (window.__codexPlusAggregateModelSelectionIdentities = new WeakMap());
     const profileId = codexRemoteSessionActiveProfile()?.id;
-    for (const { node, picker, owner } of codexAggregateModelPickers()) {
+    for (const { node, picker, owner, hostId } of codexAggregateModelPickers()) {
+      if (!owner) { identities.delete(node); continue; }
       const previous = identities.get(node);
       // 连续保存时 React 可能尚未消费上一次迁移，保留最初的供应商身份。
       if (previous && previous.model === picker.model && previous.owner === owner
-          && previous.profileId === profileId) continue;
+          && previous.hostId === hostId && previous.profileId === profileId) continue;
       const groupId = codexPlusModelMetadata(picker.model)?.codex_plus_group_id;
       if (typeof groupId === "string" && groupId) {
-        identities.set(node, { model: picker.model, groupId, owner, profileId });
+        identities.set(node, { model: picker.model, groupId, owner, hostId, profileId });
       }
     }
   }
@@ -11458,10 +11468,10 @@
     const attempts = window.__codexPlusAggregateModelSelectionAttempts
       || (window.__codexPlusAggregateModelSelectionAttempts = new WeakMap());
     let changed = false;
-    for (const { node, picker, owner } of codexAggregateModelPickers()) {
+    for (const { node, picker, owner, hostId } of codexAggregateModelPickers()) {
       const identities = window.__codexPlusAggregateModelSelectionIdentities;
       const identity = identities?.get(node);
-      const retained = identity?.model === picker.model && identity?.owner === owner
+      const retained = identity?.model === picker.model && identity?.owner === owner && identity?.hostId === hostId
         && identity?.profileId === codexRemoteSessionActiveProfile()?.id;
       if (identity && !retained) identities.delete(node);
       const target = codexAggregateSelectedModelTarget(picker.model, "local", retained ? identity.groupId : "");
@@ -11673,15 +11683,19 @@
 
   function cloneCodexPlusModelCollection(models) {
     const next = models.map((model) => model && typeof model === "object" ? { ...model } : model);
+    transferCodexPlusModelCollectionSnapshot(models, next);
+    return next;
+  }
+
+  function transferCodexPlusModelCollectionSnapshot(models, next) {
     const snapshot = codexPlusModelCollectionSnapshots.get(models);
-    if (snapshot) {
+    if (snapshot && sameModelCollection(models, snapshot.patched)) {
       codexPlusModelCollectionSnapshots.set(next, {
         ...snapshot,
         original: [...snapshot.original],
-        patched: snapshot.patched ? [...snapshot.patched] : null,
+        patched: [...next],
       });
     }
-    return next;
   }
 
   function patchCachedLocalModelQueryData(current) {
@@ -11700,7 +11714,6 @@
   }
 
   function refreshCachedLocalModelQueries() {
-    if (!codexPlusModelUnlockEnabled() && !codexAggregateAllowedModelSet("local")) return false;
     const client = typeof findCodexQueryClient === "function"
       ? findCodexQueryClient()
       : (window.__REACT_QUERY_CLIENT__ || window.__codexQueryClient);
@@ -11715,6 +11728,9 @@
     if (!queries.length) return false;
     let published = false;
     for (const query of queries) {
+      const currentCollection = codexPlusModelQueryCollection(query.state?.data || query.data);
+      if (!codexPlusModelUnlockEnabled() && !codexAggregateAllowedModelSet("local")
+          && (!currentCollection || !codexPlusModelCollectionSnapshots.has(currentCollection))) continue;
       try {
         let nextCollection = null;
         const stored = client.setQueryData(query.queryKey, (current) => {
@@ -11723,14 +11739,8 @@
           return next;
         });
         const storedCollection = codexPlusModelQueryCollection(stored);
-        const snapshot = nextCollection && codexPlusModelCollectionSnapshots.get(nextCollection);
-        if (snapshot && storedCollection && storedCollection !== nextCollection) {
-          codexPlusModelCollectionSnapshots.set(storedCollection, {
-            ...snapshot,
-            original: [...snapshot.original],
-            patched: snapshot.patched ? [...snapshot.patched] : null,
-          });
-        }
+        if (nextCollection && storedCollection && storedCollection !== nextCollection)
+          transferCodexPlusModelCollectionSnapshot(nextCollection, storedCollection);
         published = true;
       } catch {
       }
@@ -11756,12 +11766,20 @@
     runtime.rewrite = (query, data) => codexPlusLocalModelQuery(query)
       && (codexPlusModelUnlockEnabled() || codexAggregateAllowedModelSet("local"))
       ? patchCachedLocalModelQueryData(data) : data;
+    runtime.transfer = (next, stored) => {
+      const source = codexPlusModelQueryCollection(next);
+      const target = codexPlusModelQueryCollection(stored);
+      if (source && target && source !== target) transferCodexPlusModelCollectionSnapshot(source, target);
+    };
     for (const query of client.getQueryCache?.()?.getAll?.() || []) {
       const proto = Object.getPrototypeOf(query);
       if (!proto || typeof proto.setData !== "function" || runtime.prototypes.has(proto)) continue;
       const original = proto.setData;
       proto.setData = function codexPlusPublishModelQuery(data, ...rest) {
-        return original.call(this, runtime.rewrite(this, data), ...rest);
+        const next = runtime.rewrite(this, data);
+        const stored = original.call(this, next, ...rest);
+        runtime.transfer(next, stored);
+        return stored;
       };
       runtime.prototypes.add(proto);
     }

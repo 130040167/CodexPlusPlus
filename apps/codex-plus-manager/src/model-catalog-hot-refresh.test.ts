@@ -69,6 +69,47 @@ it("a late catalog response cannot replace a newer revision", async () => {
   assert.deepEqual(JSON.parse(JSON.stringify(api.state())), { revision: "rev-b", models: ["model-b"], epoch: 1 });
 });
 
+it("the production settings heartbeat reloads changed catalogs with Fast and whitelist unlock disabled", async () => {
+  const catalog = await readFile(CATALOG_URL, "utf8");
+  const service = await readFile(new URL("../../../assets/inject/renderer-inject/30-service-tier.js", import.meta.url), "utf8");
+  const backend = await readFile(new URL("../../../assets/inject/renderer-inject/40-backend-settings.js", import.meta.url), "utf8");
+  const loader = catalog.slice(catalog.indexOf("  let codexModelCatalog = "), catalog.indexOf("\n  function codexPlusModelMetadata"));
+  const stateLoader = service.slice(service.indexOf("  async function loadBackendSettingsState("));
+  const heartbeat = backend.slice(backend.indexOf("  let syncBackendSettingsInFlight ="), backend.indexOf("\n  async function setBackendSetting("));
+  let revision = "a";
+  let reads = 0;
+  const context = vm.createContext({
+    window: {}, Date, WeakMap, Set, Map, Promise,
+    postJson: async (path: string) => {
+      assert.equal(path, "/settings/get");
+      return { enhancementsEnabled: true, modelCatalogRevision: revision };
+    },
+    readCodexAppServerPreparation: async () => { reads++; return { status: "ok", models: [revision] }; },
+    renderCodexPlusMenu: () => {}, scheduleCodexModelWhitelistRefresh: () => {},
+    sendCodexPlusDiagnostic: () => {}, codexPlusModelPickerCatalogChanged: () => {},
+    refreshCachedLocalModelQueries: () => {}, captureCodexAggregateSelectedModels: () => {},
+    codexPlusSettings: () => ({ modelWhitelistUnlock: false, fastMode: false }),
+    runScanStep: () => {}, syncOfficialUsagePolicy: () => {}, syncCodexPlusTypingEffects: () => {},
+    installCodexPlusDictation: () => {}, refreshConversationView: () => {},
+  });
+  const api = vm.runInContext(`(function () {
+    let codexPlusBackendSettingsSeq = 0, codexPlusBackendSettings = {}, codexPlusBackendSettingsLoaded = false;
+    ${loader}\n${stateLoader}\n${heartbeat}
+    return { heartbeat: syncBackendSettingsFromHeartbeat, models: () => [...codexModelCatalog.models] };
+  })()`, context) as { heartbeat: () => Promise<void>; models: () => string[] };
+  await api.heartbeat();
+  await Promise.resolve();
+  assert.equal(reads, 1);
+  assert.deepEqual(Array.from(api.models()), ["a"]);
+  await api.heartbeat();
+  assert.equal(reads, 1, "unchanged settings do not refetch");
+  revision = "b";
+  await api.heartbeat();
+  await Promise.resolve();
+  assert.equal(reads, 2);
+  assert.deepEqual(Array.from(api.models()), ["b"]);
+});
+
 it("catalog refresh publishes local model query data, invalidates it once, and preserves remote caches", async () => {
   const source = await readFile(CATALOG_URL, "utf8");
   const start = source.indexOf("  function codexPlusLocalModelQuery(");
@@ -108,7 +149,8 @@ it("catalog refresh publishes local model query data, invalidates it once, and p
     "codexModelCatalogAppliedEpoch",
     "sendCodexPlusDiagnostic",
     "codexPlusModelUnlockEnabled",
-    `${source.slice(start, end)}\nreturn { refreshCachedLocalModelQueries, setEpoch: (value) => { codexModelCatalogAppliedEpoch = value; } };`,
+    `const sameModelCollection = (a, b) => !!b && a.length === b.length && a.every((item, i) => item === b[i]);
+    ${source.slice(start, end)}\nreturn { refreshCachedLocalModelQueries, setEpoch: (value) => { codexModelCatalogAppliedEpoch = value; } };`,
   ) as (...args: unknown[]) => {
     refreshCachedLocalModelQueries: () => boolean;
     setEpoch: (value: number) => void;
@@ -123,6 +165,7 @@ it("catalog refresh publishes local model query data, invalidates it once, and p
       const current = models.map((item) => item.model);
       if (JSON.stringify(current) === JSON.stringify(catalogModels)) return false;
       models.splice(0, models.length, ...catalogModels.map((model) => ({ model })));
+      (snapshots.get(models) as { patched: unknown }).patched = [...models];
       return true;
     },
     new WeakMap(),
@@ -154,7 +197,27 @@ it("catalog refresh publishes local model query data, invalidates it once, and p
   assert.doesNotMatch(source, /if \(!codexPlusModelUnlockEnabled\(\) \|\| !codexPlusModelNames\(\)\.length\) return false/);
 });
 
-async function aggregateQueryRuntime() {
+// TanStack默认的JSON结构共享：深相等节点保留旧引用，变更容器重新分配。
+function replaceEqualDeep<T>(previous: T, next: T): T {
+  if (previous === next) return previous;
+  const array = Array.isArray(previous) && Array.isArray(next);
+  if (array || (previous && next && typeof previous === "object" && typeof next === "object"
+      && !Array.isArray(previous) && !Array.isArray(next))) {
+    const a = previous as Record<string, unknown>;
+    const b = next as Record<string, unknown>;
+    const keys = Object.keys(b);
+    const copy: Record<string, unknown> = array ? [] as unknown as Record<string, unknown> : {};
+    let equal = Object.keys(a).length === keys.length;
+    for (const key of keys) {
+      copy[key] = replaceEqualDeep(a[key], b[key]);
+      if (copy[key] !== a[key] || !Object.hasOwn(a, key)) equal = false;
+    }
+    return equal ? previous : copy as T;
+  }
+  return next;
+}
+
+async function aggregateQueryRuntime(structuralSharing = false) {
   const source = await readFile(CATALOG_URL, "utf8");
   const names = [
     "uniqueValues", "codexPlusModelUnlockEnabled", "codexPlusModelNames",
@@ -165,6 +228,7 @@ async function aggregateQueryRuntime() {
     "codexAggregateSelectedModelTarget", "codexAggregateModelPickers",
     "captureCodexAggregateSelectedModels", "syncCodexAggregateSelectedModel",
     "codexPlusLocalModelQuery", "cloneCodexPlusModelCollection",
+    "transferCodexPlusModelCollectionSnapshot",
     "patchCachedLocalModelQueryData", "codexPlusModelQueryCollection",
     "refreshCachedLocalModelQueries", "installCodexPlusModelQueryPublication",
     "runCodexModelWhitelistRefreshPass",
@@ -189,7 +253,10 @@ async function aggregateQueryRuntime() {
       this.queryKey = queryKey;
       this.data = data;
     }
-    setData(data: { data: Model[] }) { this.data = data; return data; }
+    setData(data: { data: Model[] }) {
+      this.data = structuralSharing ? replaceEqualDeep(this.data, data) : data;
+      return this.data;
+    }
   }
   const local = new Query(["models", "list", "local"], { data: [] });
   const remote = new Query(["models", "list", "ssh:test"], { data: [{ model: "remote" }] });
@@ -305,6 +372,25 @@ it("an empty authoritative aggregate catalog withdraws all stale models", async 
   assert.deepEqual(local.data.data, []);
 });
 
+for (const late of [false, true]) for (const exitAggregate of [false, true]) {
+  it(`native models recover after catalog failure with structural sharing (late=${late}, exit=${exitAggregate})`, async () => {
+    const { runtime, local, catalog } = await aggregateQueryRuntime(true);
+    const native = [{ model: "native-one" }, { model: "native-two" }];
+    local.data = { data: native.map((model) => ({ ...model })) };
+    runtime.catalog(catalog("a"));
+    runtime.refresh();
+    assert.equal(local.data.data.length, 11);
+    runtime.catalog(catalog("b"));
+    runtime.refresh();
+    if (late) local.setData({ data: native.map((model) => ({ ...model })) });
+    if (exitAggregate) runtime.profile({ id: "official", relayMode: "official" });
+    runtime.catalog({ ...catalog("b"), status: "failed", model: "", models: [], modelMetadata: {}, sources: [] });
+    assert.equal(runtime.refresh(), true);
+    assert.deepEqual(local.data.data, native);
+    assert.equal(runtime.refresh(), false);
+  });
+}
+
 it("a newly default member's retired prefix migrates through the native picker without changing effort", async () => {
   const { runtime, catalog, nodes } = await aggregateQueryRuntime();
   runtime.catalog(catalog("a"));
@@ -314,7 +400,7 @@ it("a newly default member's retired prefix migrates through the native picker w
     models: catalog("a").models.map((model) => ({ model })),
     onSelectModel: (...args: unknown[]) => { selections.push(args); },
   };
-  nodes.push({ __reactFiber$test: { memoizedProps: props, return: { memoizedProps: { permissionsHostId: "local" } } } });
+  nodes.push({ __reactFiber$test: { memoizedProps: props, return: { memoizedProps: { permissionsHostId: "local", conversationId: "one" } } } });
   runtime.refresh();
   runtime.runRefreshPass();
   assert.deepEqual(selections, [["model-0", "high"]]);
@@ -412,16 +498,59 @@ it("removed models and reused composer nodes cannot reroute a selection to anoth
     models: catalog("a").models.map((model) => ({ model })),
     onSelectModel: (...args: unknown[]) => { selections.push(args); },
   };
-  const owner = { permissionsHostId: "local", threadId: "one" };
+  const owner = { permissionsHostId: "local", conversationId: "one" };
   nodes.push({ __reactFiber$test: { memoizedProps: props, return: { memoizedProps: owner } } });
   const after = catalog("b");
   after.models = after.models.filter((model) => model !== "cpx-a/model-0");
   runtime.catalog(after);
   props.models = after.models.map((model) => ({ model }));
   assert.equal(runtime.syncSelection(), false, "do not substitute the new default's same-name model");
-  owner.threadId = "two";
+  owner.conversationId = "two";
   runtime.catalog(catalog("b"));
   props.models = catalog("b").models.map((model) => ({ model }));
   assert.equal(runtime.syncSelection(), false, "a reused DOM node is a different session");
   assert.deepEqual(selections, []);
+});
+
+it("conversation changes before a pending migration cannot inherit the old supplier", async () => {
+  const { runtime, catalog, nodes } = await aggregateQueryRuntime();
+  runtime.catalog(catalog("a"));
+  const selections: unknown[][] = [];
+  const props = {
+    model: "model-0", reasoningEffort: "high",
+    models: catalog("a").models.map((model) => ({ model })),
+    onSelectModel: (...args: unknown[]) => { selections.push(args); },
+  };
+  const owner = { permissionsHostId: "local", conversationId: "one" };
+  nodes.push({ __reactFiber$test: { memoizedProps: props, return: { memoizedProps: owner } } });
+  runtime.catalog(catalog("b"));
+  owner.conversationId = "two";
+  props.models = catalog("b").models.map((model) => ({ model }));
+  assert.equal(runtime.syncSelection(), false);
+  assert.deepEqual(selections, []);
+});
+
+it("a reused remote or unidentified picker clears a pending local supplier identity", async () => {
+  for (const kind of ["remote", "unknown-conversation"]) {
+    const { runtime, catalog, nodes } = await aggregateQueryRuntime();
+    runtime.catalog(catalog("a"));
+    const selections: unknown[][] = [];
+    const props = {
+      model: "model-0", reasoningEffort: "high",
+      models: catalog("a").models.map((model) => ({ model })),
+      onSelectModel: (...args: unknown[]) => { selections.push(args); },
+    };
+    const owner = { permissionsHostId: "local", conversationId: "one" };
+    nodes.push({ __reactFiber$test: { memoizedProps: props, return: { memoizedProps: owner } } });
+    runtime.catalog(catalog("b"));
+    if (kind === "remote") owner.permissionsHostId = "ssh:test";
+    else owner.conversationId = "";
+    runtime.catalog(catalog("b"));
+    assert.equal(runtime.syncSelection(), false);
+    owner.permissionsHostId = "local";
+    owner.conversationId = "one";
+    props.models = catalog("b").models.map((model) => ({ model }));
+    assert.equal(runtime.syncSelection(), false);
+    assert.deepEqual(selections, []);
+  }
 });
