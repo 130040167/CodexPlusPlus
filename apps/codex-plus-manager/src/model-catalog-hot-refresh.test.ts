@@ -623,3 +623,51 @@ for (const sharing of [false, true]) for (const late of [false, true]) {
     assert.equal(runtime.refresh(), false);
   });
 }
+
+it("callback reuse across conversations does not suppress ID migration", async () => {
+  const { runtime, catalog, nodes } = await aggregateQueryRuntime();
+  runtime.catalog(catalog("a"));
+  const selections: unknown[][] = [];
+  const props = {
+    model: "cpx-a/model-0", reasoningEffort: "high",
+    models: catalog("a").models.map(model => ({ model })),
+    onSelectModel: (...args: unknown[]) => { selections.push(args); },
+  };
+  const owner = { permissionsHostId: "local", conversationId: "one" };
+  nodes.push({ __reactFiber$test: { memoizedProps: props, return: { memoizedProps: owner } } });
+  assert.equal(runtime.syncSelection(), true);
+  assert.equal(runtime.syncSelection(), false, "one pending migration per conversation");
+  owner.conversationId = "two";
+  assert.equal(runtime.syncSelection(), true);
+  assert.equal(runtime.syncSelection(), false, "the second conversation also deduplicates");
+  assert.deepEqual(selections, [["model-0", "high"], ["model-0", "high"]]);
+});
+
+it("migration attempts are scoped to picker nodes, profiles and host lifetimes", async () => {
+  const { runtime, catalog, nodes } = await aggregateQueryRuntime();
+  const current = catalog("a");
+  runtime.catalog(current);
+  let calls = 0;
+  const props = {
+    model: "cpx-a/model-0", reasoningEffort: "high",
+    models: current.models.map(model => ({ model })),
+    onSelectModel: () => { calls++; },
+  };
+  const owner = { permissionsHostId: "local", conversationId: "one" };
+  const picker = () => ({ __reactFiber$test: { memoizedProps: props, return: { memoizedProps: owner } } });
+  nodes.push(picker());
+  assert.equal(runtime.syncSelection(), true);
+  assert.equal(runtime.syncSelection(), false);
+  nodes.push(picker());
+  assert.equal(runtime.syncSelection(), true, "a separate picker is not suppressed by a shared callback");
+  assert.equal(calls, 2);
+  current.sources[0].id = "aggregate:other";
+  runtime.profile({ id: "other", relayMode: "aggregate" });
+  assert.equal(runtime.syncSelection(), true, "a different profile has its own attempt state");
+  assert.equal(calls, 4);
+  owner.permissionsHostId = "ssh:test";
+  assert.equal(runtime.syncSelection(), false);
+  owner.permissionsHostId = "local";
+  assert.equal(runtime.syncSelection(), true, "remote reuse clears old local attempts");
+  assert.equal(calls, 6);
+});

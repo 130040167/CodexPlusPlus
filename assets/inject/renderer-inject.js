@@ -11447,7 +11447,10 @@
       const owner = conversationId || threadId;
       if (picker && hostId === "local" && !picker.lockedModelSlug && !picker.modelOptionsDisabled
           && !picker.modelSelectionDisabled) pickers.push({ node, picker, owner, hostId });
-      else window.__codexPlusAggregateModelSelectionIdentities?.delete(node);
+      else {
+        window.__codexPlusAggregateModelSelectionIdentities?.delete(node);
+        window.__codexPlusAggregateModelSelectionAttempts?.delete(node);
+      }
     }
     return pickers;
   }
@@ -11484,14 +11487,17 @@
       const target = codexAggregateSelectedModelTarget(picker.model, "local", retained ? identity.groupId : "");
       // 等 React 消费新列表后再调用原生选择入口，保留当前思考等级。
       if (!target || !picker.models.some((entry) => entry?.model === target)) continue;
-      const signature = `${codexModelCatalogAppliedEpoch}:${picker.model}:${target}:${picker.reasoningEffort || ""}`;
-      if (attempts.get(picker.onSelectModel) === signature) continue;
-      attempts.set(picker.onSelectModel, signature);
+      const signature = JSON.stringify([codexModelCatalogAppliedEpoch,
+        codexRemoteSessionActiveProfile()?.id || "", hostId, owner,
+        picker.model, target, picker.reasoningEffort || ""]);
+      const previous = attempts.get(node);
+      if (previous?.callback === picker.onSelectModel && previous.signature === signature) continue;
+      attempts.set(node, { callback: picker.onSelectModel, signature });
       try {
         picker.onSelectModel(target, picker.reasoningEffort);
         changed = true;
       } catch (error) {
-        attempts.delete(picker.onSelectModel);
+        attempts.delete(node);
         sendCodexPlusDiagnostic("aggregate_model_selection_refresh_failed", { error: String(error?.message || error) });
       }
     }
