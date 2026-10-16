@@ -5369,12 +5369,23 @@ async fn install_or_update_skill(
             );
         }
     };
-    let Some(skill) = skills.iter().find(|skill| skill.id == id) else {
+    let installed = manager.load_state().installed.get(id).cloned();
+    if installed.as_ref().is_some_and(|item| item.repo_key != repo_key || item.repo_path.is_empty()) {
+        return failed(
+            &format!("{failure_prefix}：旧安装记录缺少来源路径或来源不同，请先备份卸载原项后重新安装。"),
+            current_skills_payload(&manager),
+        );
+    }
+    let Some(mut skill) = skills.iter().find(|skill| match &installed {
+        Some(item) => skill.repo_path == item.repo_path,
+        None => skill.id == id,
+    }).cloned() else {
         return failed(
             &format!("{failure_prefix}：仓库里没有找到 {id}。"),
             current_skills_payload(&manager),
         );
     };
+    if installed.is_some() { skill.id = id.to_string(); }
 
     let zip = match codex_plus_core::skills::download_repo_zip(&repo).await {
         Ok(bytes) => bytes,
@@ -5385,7 +5396,7 @@ async fn install_or_update_skill(
             );
         }
     };
-    match manager.install_from_zip(skill, &zip) {
+    match manager.install_from_zip(&skill, &zip) {
         Ok(_) => ok(success_message, current_skills_payload(&manager)),
         Err(error) => failed(
             &format!("{failure_prefix}：{error}"),

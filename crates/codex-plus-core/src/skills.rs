@@ -76,6 +76,8 @@ pub struct InstalledSkill {
     #[serde(default)]
     pub repo_key: String,
     #[serde(default)]
+    pub repo_path: String,
+    #[serde(default)]
     pub content_hash: String,
     #[serde(default)]
     pub installed_at: String,
@@ -273,18 +275,19 @@ impl SkillsManager {
         let mut entries: BTreeMap<(String, String), SkillEntry> = BTreeMap::new();
 
         for skill in remote {
-            let installed = state.installed.get(&skill.id)
-                .filter(|item| item.repo_key == skill.repo_key);
+            let installed = state.installed.values().find(|item|
+                item.repo_key == skill.repo_key && item.repo_path == skill.repo_path);
+            let id = installed.map(|item| item.id.clone()).unwrap_or_else(|| skill.id.clone());
             entries.insert(
-                (skill.repo_key.clone(), skill.id.clone()),
+                (skill.repo_key.clone(), id.clone()),
                 SkillEntry {
-                    id: skill.id.clone(),
+                    id: id.clone(),
                     name: skill.name.clone(),
                     description: skill.description.clone(),
                     repo_key: skill.repo_key.clone(),
                     repo_path: skill.repo_path.clone(),
                     installed: installed.is_some(),
-                    enabled: is_linked(&linked.join(&skill.id)),
+                    enabled: installed.is_some() && is_linked(&linked.join(&id)),
                     bundled: false,
                     content_hash: installed
                         .map(|item| item.content_hash.clone())
@@ -312,7 +315,7 @@ impl SkillsManager {
                 },
                 description: installed.description.clone(),
                 repo_key: installed.repo_key.clone(),
-                repo_path: String::new(),
+                repo_path: installed.repo_path.clone(),
                 installed: true,
                 enabled: is_linked(&linked.join(id)),
                 bundled: false,
@@ -416,6 +419,7 @@ impl SkillsManager {
                 name,
                 description,
                 repo_key: "cc-switch".to_string(),
+                repo_path: String::new(),
                 content_hash: String::new(),
                 installed_at: current_unix_timestamp_string(),
             },
@@ -503,6 +507,11 @@ impl SkillsManager {
         zip_bytes: &[u8],
     ) -> anyhow::Result<SkillsState> {
         validate_skill_id(&skill.id)?;
+        if let Some(installed) = self.load_state().installed.get(&skill.id) {
+            if installed.repo_key != skill.repo_key || installed.repo_path != skill.repo_path {
+                anyhow::bail!("同名 Skill 的来源路径不同或旧记录缺少路径，不能覆盖；请先备份卸载原项");
+            }
+        }
         let enable_after_install = !self.load_state().installed.contains_key(&skill.id)
             || is_linked(&self.linked_dir().join(&skill.id));
         let staging = self.staging_dir(&skill.id);
@@ -564,6 +573,7 @@ impl SkillsManager {
                 name: skill.name.clone(),
                 description: skill.description.clone(),
                 repo_key: skill.repo_key.clone(),
+                repo_path: skill.repo_path.clone(),
                 content_hash: skill.content_hash.clone(),
                 installed_at: current_unix_timestamp_string(),
             },
@@ -599,6 +609,7 @@ impl SkillsManager {
                     name,
                     description,
                     repo_key: String::new(),
+                    repo_path: String::new(),
                     content_hash: String::new(),
                     installed_at: current_unix_timestamp_string(),
                 });
@@ -712,6 +723,7 @@ impl SkillsManager {
                     name,
                     description,
                     repo_key: String::new(),
+                    repo_path: String::new(),
                     content_hash: String::new(),
                     installed_at: current_unix_timestamp_string(),
                 },
@@ -858,22 +870,14 @@ pub fn parse_skills_from_tree(repo: &SkillRepo, tree: &Value) -> Vec<RemoteSkill
             }
         }
     }
-    let mut ids = std::collections::BTreeSet::new();
     subtrees
         .into_iter()
         .filter_map(|(repo_path, mut files)| {
             let base = if repo_path.is_empty() { repo.name.clone() } else { repo_path.rsplit('/').next()?.to_string() };
-            let mut id = base.clone();
-            if ids.contains(&id) {
-                id = repo_path.replace('/', "--");
-            }
-            let mut suffix = 2;
-            while ids.contains(&id) {
-                id = format!("{}--{suffix}", repo_path.replace('/', "--"));
-                suffix += 1;
-            }
+            // 嵌套路径始终使用稳定身份，不依赖当前同名目录的数量或排序。
+            let identity = format!("{repo_key}\0{repo_path}");
+            let id = format!("{base}--{:x}", Sha256::digest(identity.as_bytes()));
             validate_skill_id(&id).ok()?;
-            ids.insert(id.clone());
             files.sort();
             let mut hasher = Sha256::new();
             for (path, sha) in &files {
@@ -1654,9 +1658,42 @@ mod tests {
         let skills = parse_skills_from_tree(&repo, &tree);
 
         assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].id, "alpha");
+        assert!(skills[0].id.starts_with("alpha--"));
         assert_eq!(skills[0].repo_path, "skills/.curated/alpha");
         assert!(!skills[0].content_hash.is_empty());
+    }
+
+    #[test]
+    fn adding_same_named_directory_does_not_reassign_installed_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let repo = parse_repo_key("acme/kit@main").unwrap();
+        let before = parse_skills_from_tree(&repo, &json!({"tree":[{"type":"blob","path":"z/alpha/SKILL.md","sha":"one"}]}));
+        manager.install_from_zip(&before[0], &repo_zip(&[("kit-main/z/alpha/SKILL.md", "original")])).unwrap();
+        let after = parse_skills_from_tree(&repo, &json!({"tree":[
+            {"type":"blob","path":"a/alpha/SKILL.md","sha":"new"},
+            {"type":"blob","path":"z/alpha/SKILL.md","sha":"changed"}
+        ]}));
+        assert_eq!(before[0].id, after.iter().find(|s| s.repo_path == "z/alpha").unwrap().id);
+        let entries = manager.merge_entries(&after);
+        assert!(entries.iter().any(|s| s.repo_path == "z/alpha" && s.installed && s.update_available));
+        assert!(entries.iter().any(|s| s.repo_path == "a/alpha" && !s.installed && !s.update_available));
+        assert_eq!(manager.load_state().installed[&before[0].id].repo_path, "z/alpha");
+    }
+
+    #[test]
+    fn legacy_install_without_path_is_not_assigned_to_a_remote_skill() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let original = sample_skill("alpha", "z/alpha", "one");
+        manager.install_from_zip(&original, &repo_zip(&[("kit-main/z/alpha/SKILL.md", "original")])).unwrap();
+        let mut state = manager.load_state();
+        state.installed.get_mut("alpha").unwrap().repo_path.clear();
+        manager.save_state_unlocked(&state).unwrap();
+        let remote = sample_skill("alpha", "a/alpha", "new");
+        assert!(!manager.merge_entries(&[remote.clone()]).iter().any(|s| s.repo_path == "a/alpha" && s.update_available));
+        assert!(manager.install_from_zip(&remote, &repo_zip(&[("kit-main/a/alpha/SKILL.md", "wrong")])).is_err());
+        assert_eq!(std::fs::read_to_string(manager.source_dir.join("alpha/SKILL.md")).unwrap(), "original");
     }
 
     #[test]
@@ -1676,7 +1713,7 @@ mod tests {
         assert!(skills.iter().any(|s| s.repo_path == "skills/.curated/alpha"));
         let scoped = parse_skills_from_tree(&parse_repo_key("acme/kit@main:plugins/a").unwrap(), &tree);
         assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0].id, "alpha");
+        assert!(scoped[0].id.starts_with("alpha--"));
     }
 
     #[test]
@@ -1724,7 +1761,7 @@ mod tests {
         let skills = parse_skills_from_zip(&repo, &zip, &BTreeMap::new()).unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].repo_path, ".");
-        assert_eq!(skills[0].id, "single-skill");
+        assert!(skills[0].id.starts_with("single-skill--"));
         let temp = tempfile::tempdir().unwrap();
         extract_skill_subtree(&zip, ".", temp.path()).unwrap();
         assert!(temp.path().join("SKILL.md").is_file());
