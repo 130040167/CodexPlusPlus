@@ -505,6 +505,24 @@ describe("managed aggregate session connection", () => {
     }
   });
 
+  it("bounds migration reads and ignores late provider results after native resume continues", async () => {
+    const api = runtime();
+    api.state.profile.relayMode = "pureApi";
+    const params = { threadId: "thread", model: "provider/k3" };
+    let finish!: (value: any) => void, reads = 0;
+    const patched = await api.prepare("thread/resume", params, "local",
+      async (method: string, received: any, options: any) => {
+        reads++;
+        assert.equal(method, "thread/read"); assert.equal(received.threadId, "thread");
+        assert.equal(options.timeoutMs, 800);
+        return new Promise(resolve => { finish = resolve; });
+      });
+    assert.equal(patched, params); assert.equal(reads, 1);
+    finish({ thread: { modelProvider: "codex_plus_managed" } });
+    await Promise.resolve();
+    assert.deepEqual(params, { threadId: "thread", model: "provider/k3" });
+  });
+
   it("patches a local host envelope at the nested request and preserves remote envelopes", async () => {
     const api = runtime();
     const params = { hostId: "local", method: "thread/start", params: { model: "chosen" } };
