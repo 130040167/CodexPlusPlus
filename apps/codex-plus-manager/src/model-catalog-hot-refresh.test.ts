@@ -135,6 +135,76 @@ it("production settings heartbeat and save reload changed catalogs with Fast and
   assert.equal(reads, 3, "the following heartbeat deduplicates the saved revision");
 });
 
+it("a heartbeat started during save cannot roll settings and catalog revision back after save succeeds", async () => {
+  const catalog = await readFile(CATALOG_URL, "utf8");
+  const service = await readFile(new URL("../../../assets/inject/renderer-inject/30-service-tier.js", import.meta.url), "utf8");
+  const backend = await readFile(new URL("../../../assets/inject/renderer-inject/40-backend-settings.js", import.meta.url), "utf8");
+  const loader = catalog.slice(catalog.indexOf("  let codexModelCatalog = "), catalog.indexOf("\n  function codexPlusModelMetadata"));
+  const stateLoader = service.slice(service.indexOf("  async function loadBackendSettingsState("));
+  const heartbeat = backend.slice(backend.indexOf("  let syncBackendSettingsInFlight ="), backend.indexOf("\n  async function setBackendSetting("));
+  const setter = backend.slice(backend.indexOf("  async function setBackendSetting("), backend.indexOf("\n  function refreshCodexPlusBackendToggles("));
+  const settingReads: Array<ReturnType<typeof deferred<Record<string, unknown>>>> = [];
+  const settingWrites: Array<ReturnType<typeof deferred<Record<string, unknown>>>> = [];
+  const catalogReads: Array<ReturnType<typeof deferred<Record<string, unknown>>>> = [];
+  const context = vm.createContext({
+    window: {}, Date, WeakMap, Set, Map, Promise,
+    postJson: (path: string) => {
+      const request = deferred<Record<string, unknown>>();
+      if (path === "/settings/get") settingReads.push(request);
+      else if (path === "/settings/set") settingWrites.push(request);
+      else assert.fail(`unexpected settings path: ${path}`);
+      return request.promise;
+    },
+    readCodexAppServerPreparation: (path: string) => {
+      assert.equal(path, "/codex-model-catalog");
+      const request = deferred<Record<string, unknown>>();
+      catalogReads.push(request);
+      return request.promise;
+    },
+    renderCodexPlusMenu: () => {}, scheduleCodexModelWhitelistRefresh: () => {},
+    sendCodexPlusDiagnostic: () => {}, codexPlusModelPickerCatalogChanged: () => {},
+    refreshCachedLocalModelQueries: () => {}, captureCodexAggregateSelectedModels: () => {},
+    codexPlusSettings: () => ({ modelWhitelistUnlock: false, fastMode: false }),
+    runScanStep: () => {}, syncOfficialUsagePolicy: () => {}, syncCodexPlusTypingEffects: () => {},
+    installCodexPlusDictation: () => {}, refreshConversationView: () => {},
+    refreshCodexPlusBackendToggles: () => {},
+  });
+  const api = vm.runInContext(`(function () {
+    let codexPlusBackendSettingsSeq = 0, codexPlusBackendSettings = { providerSyncEnabled: false }, codexPlusBackendSettingsLoaded = false;
+    ${loader}\n${stateLoader}\n${heartbeat}\n${setter}
+    return {
+      heartbeat: syncBackendSettingsFromHeartbeat,
+      save: () => setBackendSetting("providerSyncEnabled", true),
+      settings: () => ({ ...codexPlusBackendSettings }),
+      catalogState: () => ({ revision: codexModelCatalogRevision, models: [...codexModelCatalog.models] }),
+    };
+  })()`, context) as {
+    heartbeat: () => Promise<void>;
+    save: () => Promise<void>;
+    settings: () => Record<string, unknown>;
+    catalogState: () => { revision: string; models: string[] };
+  };
+
+  const save = api.save();
+  const heartbeatRead = api.heartbeat();
+  assert.equal(settingWrites.length, 1);
+  assert.equal(settingReads.length, 1);
+
+  settingWrites[0].resolve({ providerSyncEnabled: true, enhancementsEnabled: true, modelCatalogRevision: "new" });
+  await save;
+  assert.equal(catalogReads.length, 1);
+  catalogReads[0].resolve({ status: "ok", models: ["new"] });
+  await Promise.resolve();
+  await Promise.resolve();
+
+  settingReads[0].resolve({ providerSyncEnabled: false, enhancementsEnabled: true, modelCatalogRevision: "old" });
+  await heartbeatRead;
+  await Promise.resolve();
+  assert.equal(catalogReads.length, 1, "stale heartbeat must not observe the old revision");
+  assert.equal(api.settings().providerSyncEnabled, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(api.catalogState())), { revision: "new", models: ["new"] });
+});
+
 it("catalog refresh publishes local model query data, invalidates it once, and preserves remote caches", async () => {
   const source = await readFile(CATALOG_URL, "utf8");
   const start = source.indexOf("  function codexPlusLocalModelQuery(");
@@ -415,6 +485,26 @@ for (const structuralSharing of [false, true]) for (const late of [false, true])
     assert.deepEqual(local.data.data, native);
     assert.equal(remote.data, remoteData);
     assert.equal(runtime.refresh(), false);
+  });
+}
+
+for (const sharing of [false, true]) {
+  it(`aggregate exit restores native metadata even for overlapping model IDs (sharing=${sharing})`, async () => {
+    const { runtime, local, catalog } = await aggregateQueryRuntime(sharing);
+    const native = [{
+      model: "model-0", displayName: "Native Original", hidden: true,
+      isDefault: false, description: "Native description",
+    }, { model: "native-other", displayName: "Other native" }];
+    local.data = { data: native.map((model) => ({ ...model })) };
+    runtime.catalog(catalog("a"));
+    runtime.refresh();
+    assert.equal(local.data.data[0].displayName, "Label model-0");
+    runtime.catalog(catalog("b"));
+    runtime.refresh();
+    runtime.profile({ id: "official", relayMode: "official" });
+    runtime.catalog({ ...catalog("b"), status: "not_configured", model: "", models: [], modelMetadata: {}, sources: [] });
+    assert.equal(runtime.refresh(), true);
+    assert.deepEqual(local.data.data, native);
   });
 }
 
