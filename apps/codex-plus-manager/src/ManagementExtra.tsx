@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ArrowLeft, ArrowRight, BookOpen, ChevronDown, Copy, Edit3, ExternalLink, History, Link, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
 import { t } from "./i18n";
@@ -6,6 +6,7 @@ import { matchesManagementQuery, sessionGroups, type ManagedSession } from "./ma
 import { ManagementDrawer } from "./ManagementPages";
 import "./ManagementPages.css";
 import { parseSkillRepository } from "./skill-repository";
+import { SkillListViewport } from "./SkillListViewport";
 
 type Result = { status: string; message: string };
 type Notify = (title: string, message: string, status?: "ok" | "failed") => Promise<void>;
@@ -53,17 +54,23 @@ function SkillRepoDrawer({ repos, catalog, counts, initialKey, busy, onClose, on
   }, [formOpen, editing]);
   const [query, setQuery] = useState("");
   const [scanning, setScanning] = useState(false);
+  const scanRequest = useRef(0);
+  useEffect(() => () => { scanRequest.current++; }, []);
   const [feedback, setFeedback] = useState("");
+  const cancelScan = () => { scanRequest.current++; setScanning(false); };
   const set = (v: Partial<Repo>) => setDraft((old) => ({ ...old, ...v }));
   const inspect = async (repo: Repo, updateDraft = false) => {
+    const request = ++scanRequest.current;
     setScanning(true); setFeedback(""); setSelected(repo); setPreview(null); setQuery("");
     try {
       const result = await onInspect(repo);
+      if (request !== scanRequest.current) return;
       if (ok(result)) {
         setSelected(result.repo); setPreview(result); setFeedback(result.message);
         if (updateDraft) setDraft(result.repo);
       } else setFeedback(result.message);
-    } catch (e) { setFeedback(String(e)); } finally { setScanning(false); }
+    } catch (e) { if (request === scanRequest.current) setFeedback(String(e)); }
+    finally { if (request === scanRequest.current) setScanning(false); }
   };
   const parse = async () => {
     const parsed = parseRepoInput(input, draft);
@@ -71,13 +78,17 @@ function SkillRepoDrawer({ repos, catalog, counts, initialKey, busy, onClose, on
     else setParseError(t("无法识别仓库地址，请输入 GitHub 链接或 owner/repo。"));
   };
   const view = (repo: Repo) => {
+    cancelScan();
     setSelected(repo); setPreview(null); setFeedback(""); setQuery("");
     if (counts[repoKey(repo)] === undefined) void inspect(repo);
   };
   useEffect(() => { if (selected && counts[repoKey(selected)] === undefined) void inspect(selected); }, []);
+  useEffect(() => { if (!selected && repos[0]) view(repos[0]); }, [repos, selected]);
   const edit = (repo: Repo) => { setFormOpen(true); setEditing(repo); setDraft(repo); setInput(`https://github.com/${repo.owner}/${repo.name}/tree/${repo.branch}${repo.subdir ? `/${repo.subdir}` : ""}`); view(repo); };
   const save = async () => {
-    if (await onSave(draft, editing ? repoKey(editing) : undefined)) {
+    const request = ++scanRequest.current;
+    setScanning(false);
+    if (await onSave(draft, editing ? repoKey(editing) : undefined) && request === scanRequest.current) {
       setSelected(draft); setPreview(null); setFeedback(""); setFormOpen(false);
       setEditing(null);
       setDraft({ owner: "", name: "", branch: "main", subdir: "", enabled: true });
@@ -89,19 +100,21 @@ function SkillRepoDrawer({ repos, catalog, counts, initialKey, busy, onClose, on
     || repos.find((r) => selected && r.owner === selected.owner && r.name === selected.name && r.subdir === selected.subdir)
     || selected;
   const savedCatalog = active && counts[repoKey(active)] !== undefined;
-  const skills = savedCatalog ? catalog.filter((s) => active && s.repoKey === repoKey(active)) : preview?.skills || [];
+  const activeKey = active ? repoKey(active) : "";
+  const skills = useMemo(() => savedCatalog ? catalog.filter((s) => s.repoKey === activeKey) : preview?.skills || [], [savedCatalog, catalog, activeKey, preview]);
   const count = preview?.skillCount ?? (active ? counts[repoKey(active)] : undefined);
-  const filtered = skills.filter((s) => matchesManagementQuery([s.id, s.name, s.description, s.repoPath || ""], query));
+  const deferredQuery = useDeferredValue(query);
+  const filtered = useMemo(() => skills.filter((s) => matchesManagementQuery([s.id, s.name, s.description, s.repoPath || ""], deferredQuery)), [skills, deferredQuery]);
   const locked = busy || scanning;
-  return <ManagementDrawer wide dismissOnBackdrop={false} title={t("管理 Skills 仓库")} onClose={() => { if (!locked) onClose(); }} footer={<Button onClick={onClose} disabled={locked}>{t("关闭")}</Button>}>
+  return <ManagementDrawer wide dismissOnBackdrop={false} title={t("管理 Skills 仓库")} onClose={onClose} footer={<Button onClick={onClose}>{t("关闭")}</Button>}>
     <div className="mg-repo-workspace" data-editing={formOpen}><aside className="mg-repo-sidebar">
-    <div className="mg-repo-manager"><div className="mg-repo-manager-head"><strong>{t("已添加仓库")} <span className="mg-repo-total">{repos.length}</span></strong><button className="mg-icon-button" title={t("添加仓库")} aria-label={t("添加仓库")} disabled={locked} onClick={() => { setEditing(null); setFormOpen(true); setInput(""); setDraft({ owner: "", name: "", branch: "main", subdir: "", enabled: true }); }}><Plus size={16}/></button></div>
+    <div className="mg-repo-manager"><div className="mg-repo-manager-head"><strong>{t("已添加仓库")} <span className="mg-repo-total">{repos.length}</span></strong><button className="mg-icon-button" title={t("添加仓库")} aria-label={t("添加仓库")} onClick={() => { cancelScan(); setEditing(null); setFormOpen(true); setInput(""); setParseError(""); setDraft({ owner: "", name: "", branch: "main", subdir: "", enabled: true }); }}><Plus size={16}/></button></div>
       {!repos.length && <p className="mg-muted">{t("还没有添加仓库。")}</p>}
       {repos.map((repo) => <div className="mg-repo-row" data-selected={active && repoKey(active) === repoKey(repo)} key={repoKey(repo)}>
-        <button type="button" className="mg-repo-select" disabled={locked} onClick={() => view(repo)}><strong title={`${repo.owner}/${repo.name}`}>{repo.owner}/{repo.name}</strong><small title={`${repo.branch}${repo.subdir ? ` · ${repo.subdir}` : ""}`}>{repo.branch}{repo.subdir ? ` · ${repo.subdir}` : ""}<span>{counts[repoKey(repo)] === undefined ? t("待扫描") : `${counts[repoKey(repo)]} Skills`}{!repo.enabled ? ` · ${t("已停用")}` : ""}</span></small></button>
-        <div className="mg-repo-row-actions"><button className={"mg-switch " + (repo.enabled ? "is-on" : "")} type="button" role="switch" aria-checked={repo.enabled} disabled={locked} aria-label={`${repo.owner}/${repo.name} ${t("启用仓库")}`} onClick={() => void onSave({ ...repo, enabled: !repo.enabled })}><span /></button>
-        <button type="button" className="mg-icon-button" title={t("编辑仓库")} aria-label={`${t("编辑仓库")} ${repo.owner}/${repo.name}`} onClick={() => edit(repo)} disabled={locked}><Edit3 size={14}/></button>
-        <button className="mg-icon-button" title={t("删除仓库")} aria-label={`${t("删除仓库")} ${repo.owner}/${repo.name}`} disabled={locked} onClick={() => { onDelete(repo); if (active && repoKey(active) === repoKey(repo)) { setSelected(repos.find((r) => repoKey(r) !== repoKey(repo)) || null); setPreview(null); } }}><Trash2 size={14}/></button></div></div>)}
+        <button type="button" className="mg-repo-select" onClick={() => view(repo)}><strong title={`${repo.owner}/${repo.name}`}>{repo.owner}/{repo.name}</strong><small title={`${repo.branch}${repo.subdir ? ` · ${repo.subdir}` : ""}`}>{repo.branch}{repo.subdir ? ` · ${repo.subdir}` : ""}<span>{counts[repoKey(repo)] === undefined ? t("待扫描") : `${counts[repoKey(repo)]} Skills`}{!repo.enabled ? ` · ${t("已停用")}` : ""}</span></small></button>
+        <div className="mg-repo-row-actions"><button className={"mg-switch " + (repo.enabled ? "is-on" : "")} type="button" role="switch" aria-checked={repo.enabled} disabled={busy} aria-label={`${repo.owner}/${repo.name} ${t("启用仓库")}`} onClick={() => void onSave({ ...repo, enabled: !repo.enabled })}><span /></button>
+        <button type="button" className="mg-icon-button" title={t("编辑仓库")} aria-label={`${t("编辑仓库")} ${repo.owner}/${repo.name}`} onClick={() => edit(repo)}><Edit3 size={14}/></button>
+        <button className="mg-icon-button" title={t("删除仓库")} aria-label={`${t("删除仓库")} ${repo.owner}/${repo.name}`} disabled={busy} onClick={() => { cancelScan(); onDelete(repo); if (active && repoKey(active) === repoKey(repo)) { setSelected(repos.find((r) => repoKey(r) !== repoKey(repo)) || null); setPreview(null); } }}><Trash2 size={14}/></button></div></div>)}
     </div>
 
     </aside><section className="mg-repo-browser">
@@ -111,13 +124,38 @@ function SkillRepoDrawer({ repos, catalog, counts, initialKey, busy, onClose, on
         {feedback && <p className="mg-notice" role="status">{feedback}</p>}
         {count === 0 && <p className="mg-muted">{t("当前分支和目录中没有 SKILL.md。")}</p>}
         <SearchBox value={query} onChange={setQuery} placeholder={t("搜索此仓库的 Skills")} />
-        <div className="mg-repo-results" aria-busy={scanning}>
-          {filtered.map((s) => <div className="mg-repo-skill" key={s.repoKey + ":" + s.id}><button type="button" className="mg-skill-name" onClick={() => onOpenSkill(s)}><strong>{s.name || s.id}</strong><small title={s.description}>{s.description || s.repoPath}</small></button><div className="mg-repo-skill-actions"><Button onClick={() => onOpenSkill(s)}>{t("详情")}</Button><div className="mg-repo-install-slot">{repos.some((r) => repoKey(r) === s.repoKey) && (s.installed ? <span className="mg-repo-install-state">{t("已安装")}</span> : <Button primary disabled={locked} onClick={() => onRun("install_skill", { repoKey: s.repoKey, id: s.id })}>{t("安装")}</Button>)}</div></div></div>)}
-          {!filtered.length && !scanning && <p className="mg-muted">{count ? t("没有匹配的 Skill") : t("暂无 Skills")}</p>}
-        </div>
+        <SkillListViewport className="mg-repo-results" items={filtered} rowHeight={64} resetKey={`${activeKey}:${deferredQuery}`} busy={scanning}
+          empty={<p className="mg-muted" role="status">{scanning ? t("正在扫描…") : count ? t("没有匹配的 Skill") : t("暂无 Skills")}</p>}
+          renderRow={(s) => <div className="mg-repo-skill" key={s.repoKey + ":" + s.id}><button type="button" className="mg-skill-name" onClick={() => onOpenSkill(s)}><strong>{s.name || s.id}</strong><small title={s.description}>{s.description || s.repoPath}</small></button><div className="mg-repo-skill-actions"><Button onClick={() => onOpenSkill(s)}>{t("详情")}</Button><div className="mg-repo-install-slot">{repos.some((r) => repoKey(r) === s.repoKey) && (s.installed ? <span className="mg-repo-install-state">{t("已安装")}</span> : <Button primary disabled={busy} onClick={() => onRun("install_skill", { repoKey: s.repoKey, id: s.id })}>{t("安装")}</Button>)}</div></div></div>} />
       </> : <p className="mg-muted">{t("还没有添加仓库。")}</p>}
     </section>
-    {formOpen && <div className="mg-repo-form" ref={editorRef} role="region" aria-label={editing ? t("编辑仓库") : t("添加仓库")} onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); event.preventDefault(); if (!locked) setFormOpen(false); } }}><div className="mg-repo-manager-head"><h3><Edit3 size={15}/>{editing ? t("编辑仓库") : t("添加仓库")}</h3><button className="mg-icon-button" title={t("取消编辑")} aria-label={t("取消编辑")} disabled={locked} onClick={() => setFormOpen(false)}><X size={14}/></button></div><div className="mg-repo-form-content"><div className="mg-repo-quick"><input disabled={locked} value={input} onChange={(e) => { setInput(e.target.value); setParseError(""); }} aria-label={t("仓库地址")} placeholder="https://github.com/owner/repo" /><Button onClick={() => void parse()} disabled={locked || !input.trim()}><Search size={14}/>{scanning ? t("解析中…") : t("解析")}</Button></div>{parseError && <p className="mg-form-error">{parseError}</p>}<fieldset disabled={locked} className="mg-form-grid"><Field label={t("所有者")}><input value={draft.owner} onChange={(e) => set({ owner: e.target.value })} /></Field><Field label={t("仓库名")}><input value={draft.name} onChange={(e) => set({ name: e.target.value })} /></Field><Field label={t("分支")}><input value={draft.branch} onChange={(e) => set({ branch: e.target.value })} /></Field><Field label={t("子目录")}><input value={draft.subdir} onChange={(e) => set({ subdir: e.target.value })} placeholder={t("可选")} /></Field></fieldset></div><div className="mg-repo-form-footer"><label className="mg-check-line"><input type="checkbox" disabled={locked} checked={draft.enabled} onChange={(e) => set({ enabled: e.target.checked })}/>{t("启用仓库")}</label><div className="mg-row-actions"><Button disabled={locked || !draft.owner.trim() || !draft.name.trim()} onClick={() => void inspect(draft, true)}>{t("检查仓库")}</Button><Button primary disabled={locked || !draft.owner.trim() || !draft.name.trim()} onClick={() => void save()}>{editing ? t("保存修改") : t("添加仓库")}</Button></div></div></div>}
+    {formOpen && <div className="mg-repo-form" ref={editorRef} role="region" aria-label={editing ? t("编辑仓库") : t("添加仓库")}
+      onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); event.preventDefault(); cancelScan(); setFormOpen(false); } }}>
+      <div className="mg-repo-manager-head">
+        <h3><Edit3 size={15}/>{editing ? t("编辑仓库") : t("添加仓库")}</h3>
+        <button className="mg-icon-button" title={t("取消编辑")} aria-label={t("取消编辑")} onClick={() => { cancelScan(); setFormOpen(false); }}><X size={14}/></button>
+      </div>
+      <div className="mg-repo-form-content">
+        <div className="mg-repo-quick">
+          <input disabled={locked} value={input} onChange={(e) => { setInput(e.target.value); setParseError(""); }} aria-label={t("仓库地址")} placeholder="https://github.com/owner/repo" />
+          <Button onClick={() => void parse()} disabled={locked || !input.trim()}><Search size={14}/>{scanning ? t("解析中…") : t("解析")}</Button>
+        </div>
+        {parseError && <p className="mg-form-error">{parseError}</p>}
+        <fieldset disabled={locked} className="mg-form-grid">
+          <Field label={t("所有者")}><input value={draft.owner} onChange={(e) => set({ owner: e.target.value })} /></Field>
+          <Field label={t("仓库名")}><input value={draft.name} onChange={(e) => set({ name: e.target.value })} /></Field>
+          <Field label={t("分支")}><input value={draft.branch} onChange={(e) => set({ branch: e.target.value })} /></Field>
+          <Field label={t("子目录")}><input value={draft.subdir} onChange={(e) => set({ subdir: e.target.value })} placeholder={t("可选")} /></Field>
+        </fieldset>
+      </div>
+      <div className="mg-repo-form-footer">
+        <label className="mg-check-line"><input type="checkbox" disabled={locked} checked={draft.enabled} onChange={(e) => set({ enabled: e.target.checked })}/>{t("启用仓库")}</label>
+        <div className="mg-row-actions">
+          <Button disabled={locked || !draft.owner.trim() || !draft.name.trim()} onClick={() => void inspect(draft, true)}>{t("检查仓库")}</Button>
+          <Button primary disabled={locked || !draft.owner.trim() || !draft.name.trim()} onClick={() => void save()}>{editing ? t("保存修改") : t("添加仓库")}</Button>
+        </div>
+      </div>
+    </div>}
     </div>
   </ManagementDrawer>;
 }
@@ -128,7 +166,8 @@ function SkillDetailDrawer({ skill, count, onClose, onOpenUrl, onOpenRepo }: { s
 export function SkillsPage({ notify }: { notify: Notify }) {
   const [data, setData] = useState<SkillPayload | null>(null); const [tab, setTab] = useState<"discover" | "installed">("discover"); const [query, setQuery] = useState(""); const [busy, setBusy] = useState(false); const [repoOpen, setRepoOpen] = useState(false); const [detail, setDetail] = useState<Skill | null>(null);
   const [repoSelection, setRepoSelection] = useState<string | null>(null);
-  const load = async (command = "refresh_skill_catalog") => { setBusy(true); try { const r = await invoke<SkillPayload>(command); setData(r); if (!ok(r)) await notify("Skills", r.message, "failed"); } catch (e) { await notify("Skills", String(e), "failed"); } finally { setBusy(false); } };
+  const [loading, setLoading] = useState(false);
+  const load = async (command = "refresh_skill_catalog") => { setLoading(true); try { const r = await invoke<SkillPayload>(command); startTransition(() => setData(r)); if (!ok(r)) await notify("Skills", r.message, "failed"); } catch (e) { await notify("Skills", String(e), "failed"); } finally { setLoading(false); } };
   useEffect(() => { let active = true; void (async () => {
     await load("list_installed_skills");
     if (active) await load();
@@ -147,15 +186,19 @@ export function SkillsPage({ notify }: { notify: Notify }) {
   const deleteRepo = async (repo: Repo) => { await run("delete_skill_repo", { key: repoKey(repo) }); };
   const inspectRepo = async (repo: Repo) => {
     const result = await invoke<RepoInspection>("inspect_skill_repo", { repo });
-    if (ok(result)) setData(await invoke<SkillPayload>("list_installed_skills"));
+    if (ok(result)) {
+      const payload = await invoke<SkillPayload>("list_installed_skills");
+      startTransition(() => setData(payload));
+    }
     return result;
   };
   const openRepo = (key: string) => { setRepoSelection(key); setDetail(null); setRepoOpen(true); };
-  const items = (data?.skills || []).filter((s) => (tab === "installed" ? s.installed : !s.installed || s.bundled)).filter((s) => matchesManagementQuery([s.id, s.name, s.description, s.repoKey, sourceLabel(s)], query));
+  const deferredQuery = useDeferredValue(query);
+  const items = useMemo(() => (data?.skills || []).filter((s) => (tab === "installed" ? s.installed : !s.installed || s.bundled)).filter((s) => matchesManagementQuery([s.id, s.name, s.description, s.repoKey, sourceLabel(s)], deferredQuery)), [data, tab, deferredQuery]);
   const openUrl = async (url: string) => { try { await invoke("open_external_url", { url }); } catch (e) { await notify("Skills", String(e), "failed"); } };
   return <div className="mg-page mg-skills-page">
     <Header icon={<BookOpen size={20}/>} title="Skills" actions={<>
-      <Button onClick={() => void load()} disabled={busy}><RefreshCw size={14}/>{t("刷新目录")}</Button>
+      <Button onClick={() => void load()} disabled={busy || loading}><RefreshCw size={14}/>{t("刷新目录")}</Button>
       <Button onClick={() => void run("import_ccs_skills", {})} disabled={busy}><BookOpen size={14}/>{t("从 cc-switch 导入")}</Button>
       <Button onClick={() => setRepoOpen(true)}><Link size={14}/>{t("管理仓库")}</Button>
     </>} />
@@ -167,9 +210,10 @@ export function SkillsPage({ notify }: { notify: Notify }) {
       <SearchBox value={query} onChange={setQuery} placeholder={t("搜索 Skills 或仓库")} />
     </div>
     <div className="mg-content">
-      <div className="mg-skill-list">
-        <div className="mg-skill-head"><span>{t("技能")}</span><span>{t("来源")}</span><span>{t("状态")}</span><span /></div>
-        {items.map((s) => <div className="mg-skill-row" key={s.repoKey + ":" + s.id}>
+      <SkillListViewport className="mg-skill-list" items={items} rowHeight={68} resetKey={`${tab}:${deferredQuery}`} busy={loading}
+        header={<div className="mg-skill-head"><span>{t("技能")}</span><span>{t("来源")}</span><span>{t("状态")}</span><span /></div>}
+        empty={<div className="mg-empty"><h2>{loading ? t("正在扫描…") : t("没有匹配的 Skill")}</h2></div>}
+        renderRow={(s) => <div className="mg-skill-row" key={s.repoKey + ":" + s.id}>
           <button type="button" className="mg-skill-name" onClick={() => setDetail(s)}>
             <strong title={s.name || s.id}>{s.name || s.id}</strong>
             <small title={s.description}>{s.description || t("暂无描述")}</small>
@@ -191,13 +235,11 @@ export function SkillsPage({ notify }: { notify: Notify }) {
               {!s.bundled && <Button onClick={() => void run("uninstall_skill", { id: s.id })} disabled={busy}>{t("卸载")}</Button>}
             </> : !s.bundled && <Button primary onClick={() => void run("install_skill", { repoKey: s.repoKey, id: s.id })} disabled={busy}>{t("安装")}</Button>}
           </div>
-        </div>)}
-        {!items.length && <div className="mg-empty"><h2>{t("没有匹配的 Skill")}</h2><p>{t("刷新目录后从 GitHub 仓库发现 Skills。")}</p></div>}
-      </div>
+        </div>} />
       {data?.repoErrors?.length ? <div className="mg-notice mg-warning">{data.repoErrors.map((e) => <p key={e}>{e}</p>)}</div> : null}
     </div>
-    {repoOpen && <SkillRepoDrawer repos={data?.repos || []} catalog={data?.repositorySkills || []} counts={data?.repoCounts || {}} initialKey={repoSelection} busy={busy} onClose={() => setRepoOpen(false)} onSave={saveRepo} onDelete={(r) => void deleteRepo(r)} onInspect={inspectRepo} onOpenUrl={(url) => void openUrl(url)} onOpenSkill={(s) => { setRepoOpen(false); setDetail(s); }} onRun={(cmd, args) => void run(cmd, args)} />}
-    {detail && <SkillDetailDrawer skill={detail} count={data?.repoCounts?.[detail.repoKey]} onClose={() => setDetail(null)} onOpenUrl={(url) => void openUrl(url)} onOpenRepo={() => openRepo(detail.repoKey)} />}
+    {repoOpen && <SkillRepoDrawer repos={data?.repos || []} catalog={data?.repositorySkills || []} counts={data?.repoCounts || {}} initialKey={repoSelection} busy={busy} onClose={() => setRepoOpen(false)} onSave={saveRepo} onDelete={(r) => void deleteRepo(r)} onInspect={inspectRepo} onOpenUrl={(url) => void openUrl(url)} onOpenSkill={setDetail} onRun={(cmd, args) => void run(cmd, args)} />}
+    {detail && <SkillDetailDrawer skill={detail} count={data?.repoCounts?.[detail.repoKey]} onClose={() => setDetail(null)} onOpenUrl={(url) => void openUrl(url)} onOpenRepo={() => repoOpen ? setDetail(null) : openRepo(detail.repoKey)} />}
   </div>;
 }
 export function SessionPage({ sessions, onRefresh, onDelete, onDeleteMany, notify }: { sessions: { sessions: ManagedSession[]; totalCount: number; hasMore: boolean; offset: number; limit: number } | null; onRefresh: (offset?: number) => Promise<void>; onDelete: (s: ManagedSession) => Promise<void>; onDeleteMany: (s: ManagedSession[]) => Promise<void>; notify: Notify }) { const [query, setQuery] = useState(""); const [mode, setMode] = useState<"project" | "time">("project"); const [expanded, setExpanded] = useState<Set<string>>(new Set()); const [selection, setSelection] = useState(false); const [selected, setSelected] = useState<Set<string>>(new Set()); const [detail, setDetail] = useState<ManagedSession | null>(null); const all = sessions?.sessions || []; const visible = all.filter((s) => matchesManagementQuery([s.title, s.cwd, s.id, s.modelProvider], query)); const groups = sessionGroups(visible, mode); const selectedRows = all.filter((s) => selected.has(s.id)); const toggle = (id: string) => setSelected((old) => { const next = new Set(old); next.has(id) ? next.delete(id) : next.add(id); return next; }); return <div className="mg-page mg-session-page"><Header icon={<History size={20}/>} title={t("会话")} actions={<><Button onClick={() => void onRefresh()}><RefreshCw size={14}/>{t("刷新列表")}</Button><Button onClick={() => setSelection(!selection)}>{t("选择多个…")}</Button></>} /><div className="mg-session-controls"><SearchBox value={query} onChange={setQuery} placeholder={t("搜索标题、目录或会话 ID")} /><div className="mg-segmented"><button type="button" data-active={mode === "project"} onClick={() => setMode("project")}>{t("按项目")}</button><button type="button" data-active={mode === "time"} onClick={() => setMode("time")}>{t("按时间")}</button></div>{selection && <><Button onClick={() => setSelected(new Set(visible.map((s) => s.id)))}>{t("全选当前列表")}</Button><Button primary disabled={!selectedRows.length} onClick={() => void onDeleteMany(selectedRows)}><Trash2 size={14}/>{t("删除已选")}</Button></>}</div><div className="mg-content"><div className="mg-session-list">{!visible.length ? <div className="mg-empty"><h2>{t("还没有匹配的会话")}</h2><Button onClick={() => void onRefresh()}>{t("刷新")}</Button></div> : groups.map((g) => { const open = query.trim() || expanded.has(g.key) || groups.length === 1; return <section key={g.key}><button type="button" className="mg-group-head" onClick={() => setExpanded((old) => { const next = new Set(old); next.has(g.key) ? next.delete(g.key) : next.add(g.key); return next; })}><ChevronDown size={15} className={open ? "" : "mg-chevron-collapsed"}/><strong>{g.label}</strong><span>{g.path}</span><small>{g.sessions.length} {t("个会话")}</small></button>{open && g.sessions.map((s) => <article className="mg-session-row" key={s.id}><div className="mg-session-check">{selection && <input type="checkbox" checked={selected.has(s.id)} onChange={() => toggle(s.id)}/>}</div><button type="button" className="mg-session-main" onClick={() => setDetail(s)}><strong>{s.title || t("未命名会话")}</strong><small>{s.cwd || t("未记录项目路径")}</small><code>{s.id}</code></button><div className="mg-session-meta"><span>{s.modelProvider || "Codex"}</span><time>{s.updatedAtMs ? new Date(s.updatedAtMs).toLocaleString() : t("未知时间")}</time></div><div className="mg-row-actions"><button type="button" className="mg-icon-button" onClick={() => void onDelete(s)} aria-label={t("删除会话")}><Trash2 size={15}/></button></div></article>)}</section>; })}</div></div><div className="mg-pagination"><Button onClick={() => void onRefresh(Math.max(0, (sessions?.offset || 0) - (sessions?.limit || 50)))} disabled={!sessions || !sessions.offset}><ArrowLeft size={14}/>{t("上一页")}</Button><span>{sessions ? String(Math.floor(sessions.offset / sessions.limit) + 1) + " · " + sessions.totalCount : "—"}</span><Button onClick={() => void onRefresh((sessions?.offset || 0) + (sessions?.limit || 50))} disabled={!sessions?.hasMore}><ArrowRight size={14}/>{t("下一页")}</Button></div>{detail && <ManagementDrawer title={detail.title || t("未命名会话")} onClose={() => setDetail(null)} footer={<><Button onClick={() => navigator.clipboard.writeText(detail.id)}><Copy size={14}/>{t("复制会话 ID")}</Button><Button primary onClick={() => void onDelete(detail)}><Trash2 size={14}/>{t("删除会话")}</Button></>}><dl className="mg-detail"><dt>{t("项目目录")}</dt><dd>{detail.cwd || "—"}</dd><dt>{t("模型供应商")}</dt><dd>{detail.modelProvider || "Codex"}</dd><dt>{t("数据库")}</dt><dd>{detail.dbPath || "—"}</dd></dl></ManagementDrawer>}</div>; }

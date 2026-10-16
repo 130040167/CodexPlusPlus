@@ -49,6 +49,9 @@ export function ManagementDrawer({ title, onClose, children, footer, wide = fals
     const root = ref.current;
     root?.querySelector<HTMLElement>("button, input, textarea, select")?.focus();
     const keyboard = (e: KeyboardEvent) => {
+      // 多层抽屉只让最上层处理 Escape/Tab，保留下层页面的状态。
+      const layers = document.querySelectorAll(".mg-drawer-backdrop");
+      if (e.defaultPrevented || layers.item(layers.length - 1) !== root?.parentElement) return;
       if (e.key === "Escape") { e.preventDefault(); closeRef.current(); }
       if (e.key !== "Tab" || !root) return;
       const nodes = [...root.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [tabindex="0"]')];
@@ -57,7 +60,7 @@ export function ManagementDrawer({ title, onClose, children, footer, wide = fals
       else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus(); }
     };
     document.addEventListener("keydown", keyboard);
-    return () => { document.removeEventListener("keydown", keyboard); previous?.focus(); };
+    return () => { document.removeEventListener("keydown", keyboard); previous?.focus({ preventScroll: true }); };
   }, []);
   return <div className="mg-drawer-backdrop" onMouseDown={(e) => { if (dismissOnBackdrop && e.target === e.currentTarget) onClose(); }}><section className={"mg-drawer" + (wide ? " mg-drawer-wide" : "")} role="dialog" aria-modal="true" aria-label={title} ref={ref}><header><h2>{title}</h2><IconAction label={t("关闭窗口")} onClick={onClose}><X size={18} /></IconAction></header><div className="mg-drawer-body">{children}</div>{footer && <footer>{footer}</footer>}</section></div>;
 }

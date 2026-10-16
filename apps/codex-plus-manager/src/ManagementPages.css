@@ -102,7 +102,7 @@
 .mg-repo-browser .mg-notice { margin:0; font-size:12px; overflow-wrap:anywhere; border-color:var(--mg-divider); }
 .mg-repo-results { min-height:0; flex:1; overflow:auto; border-top:1px solid var(--mg-divider); scrollbar-gutter:stable; }
 .mg-repo-results>.mg-muted { padding-block:20px; }
-.mg-repo-skill { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:16px; min-height:64px; border-bottom:1px solid var(--mg-divider); }
+.mg-repo-skill { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:16px; height:64px; min-height:64px; box-sizing:border-box; border-bottom:1px solid var(--mg-divider); }
 .mg-repo-skill:hover { background:hsl(var(--brand-accent)/.035); }
 .mg-repo-skill .mg-skill-name { min-width:0; padding:0 6px; }
 .mg-repo-skill .mg-skill-name strong { font-size:13px; font-weight:550; }
