@@ -324,15 +324,19 @@
     let changed = false;
     if (previous && previous.policy !== policy && sameModelCollection(current, previous.patched)) {
       if (!sameModelCollection(current, previous.original)) {
-        if (Array.isArray(collection)) collection.splice(0, collection.length, ...previous.original);
-        else { collection.clear(); previous.original.forEach((item) => collection.add(item)); }
+        // 恢复的描述符也要独立，后续重新投影不能反过来污染历史快照。
+        const restored = previous.original.map((item) => item && typeof item === "object" ? { ...item } : item);
+        if (Array.isArray(collection)) collection.splice(0, collection.length, ...restored);
+        else { collection.clear(); restored.forEach((item) => collection.add(item)); }
         current = [...collection];
         changed = true;
       }
     }
     if (!allowed) codexPlusModelCollectionSnapshots.delete(collection);
     else if (!previous || previous.policy !== policy || !sameModelCollection(current, previous.patched)) {
-      codexPlusModelCollectionSnapshots.set(collection, { policy, original: current, patched: null });
+      // 元数据补丁只替换顶层字段，独立描述符可保留字段原值及原有数组引用。
+      const original = current.map((item) => item && typeof item === "object" ? { ...item } : item);
+      codexPlusModelCollectionSnapshots.set(collection, { policy, original, patched: null });
     }
     return changed;
   }

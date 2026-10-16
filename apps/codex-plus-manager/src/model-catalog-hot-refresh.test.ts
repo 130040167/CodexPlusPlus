@@ -599,3 +599,27 @@ it("a reused remote or unidentified picker clears a pending local supplier ident
     assert.deepEqual(selections, []);
   }
 });
+
+for (const sharing of [false, true]) for (const late of [false, true]) {
+  it(`overlapping native model metadata survives aggregate refresh and exit (sharing=${sharing}, late=${late})`, async () => {
+    const { runtime, local, catalog } = await aggregateQueryRuntime(sharing);
+    const original = [{ model: "model-0", displayName: "Native display", hidden: true, isDefault: false,
+      defaultReasoningEffort: "low", supportedReasoningEfforts: [{ reasoningEffort: "low" }], contextWindow: 100 }];
+    local.data = { data: original.map(item => ({ ...item })) };
+    for (const provider of ["a", "b", "a"] as const) {
+      const next = catalog(provider);
+      if (next.modelMetadata["model-0"]) Object.assign(next.modelMetadata["model-0"], {
+        defaultReasoningEffort: "high", contextWindow: 200,
+        supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+      });
+      runtime.catalog(next);
+      runtime.refresh();
+    }
+    if (late) local.setData({ data: original.map(item => ({ ...item })) });
+    runtime.profile({ id: "official", relayMode: "official" });
+    runtime.catalog({ ...catalog("a"), status: "failed", model: "", models: [], modelMetadata: {}, sources: [] });
+    runtime.refresh();
+    assert.deepEqual(local.data.data, original);
+    assert.equal(runtime.refresh(), false);
+  });
+}
