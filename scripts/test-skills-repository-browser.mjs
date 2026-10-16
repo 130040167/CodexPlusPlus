@@ -327,6 +327,22 @@ try {
   assert.equal((await invoke("uninstall_skill", { id:"local-uninstall-regression" })).status, "ok");
   const backup = (await invoke("list_installed_skills")).backups.find(b=>b.skillId==="local-uninstall-regression");
   assert.ok(backup);
+  const restoreStateFile = path.join(state,"skills.json");
+  const beforeRestoreFailure = await readFile(restoreStateFile,"utf8");
+  try {
+    await chmod(restoreStateFile, 0o444);
+    assert.equal((await invoke("restore_skill_backup", { backupId:backup.id })).status, "failed");
+    assert.equal(await readFile(path.join(state,"skill-backups",backup.id,"SKILL.md"),"utf8"), "user original content");
+    assert.equal(await readFile(restoreStateFile,"utf8"), beforeRestoreFailure);
+    assert.ok((await invoke("list_installed_skills")).backups.some(b=>b.id===backup.id));
+  } finally { await chmod(restoreStateFile, 0o666); }
+  await mkdir(local);
+  await writeFile(path.join(local,"notes.txt"), "keep local notes");
+  assert.equal((await invoke("restore_skill_backup", { backupId:backup.id })).status, "failed");
+  assert.equal(await readFile(path.join(local,"notes.txt"),"utf8"), "keep local notes");
+  await unlink(path.join(local,"notes.txt"));
+  await rmdir(local);
+  report.checks.restoreFailuresPreserveBackupAndLocalContent = true;
   assert.equal((await invoke("restore_skill_backup", { backupId:backup.id })).status, "ok");
   assert.equal(await readFile(path.join(local,"SKILL.md"),"utf8"), "user original content");
   report.checks.localUninstallRestoresOriginal = true;

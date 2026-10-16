@@ -599,13 +599,19 @@ impl SkillsManager {
         if link.join(SKILL_MANIFEST_FILE).is_file() {
             return Ok(());
         }
+        if std::fs::symlink_metadata(&link).is_ok() {
+            anyhow::bail!("启用位置已存在其他内容，未覆盖：{}", link.display());
+        }
         if !source.is_dir() {
             anyhow::bail!("skill 源目录不存在：{}", source.display());
         }
         std::fs::create_dir_all(self.linked_dir())
             .with_context(|| format!("创建 {} 失败", self.linked_dir().display()))?;
-        remove_link(&link)?;
-        link_or_copy(&source, &link)
+        if let Err(error) = link_or_copy(&source, &link) {
+            remove_link(&link).context(format!("启用失败且清理未完成：{error:#}"))?;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// 卸载：删软链，源目录整体移进备份目录。不做自动轮转删除。
@@ -697,35 +703,38 @@ impl SkillsManager {
         let (skill_id, _) = split_backup_id(backup_id);
         validate_skill_id(&skill_id)?;
         let destination = self.source_dir.join(&skill_id);
-        if destination.exists() {
+        if std::fs::symlink_metadata(&destination).is_ok()
+            || std::fs::symlink_metadata(self.linked_dir().join(&skill_id)).is_ok()
+        {
             anyhow::bail!("{skill_id} 已经装着了，先卸载再从备份恢复");
         }
         std::fs::create_dir_all(&self.source_dir)
             .with_context(|| format!("创建目录失败：{}", self.source_dir.display()))?;
-        std::fs::rename(&backup, &destination)
-            .with_context(|| format!("恢复到 {} 失败", destination.display()))?;
-
-        let (name, description) =
-            read_skill_manifest(&destination.join(SKILL_MANIFEST_FILE), &skill_id);
-        {
-            let _guard = self.state_lock.lock().unwrap();
-            let mut state = self.load_state_unlocked();
-            state.installed.insert(
-                skill_id.clone(),
-                InstalledSkill {
-                    id: skill_id.clone(),
-                    name,
-                    description,
-                    repo_key: String::new(),
-                    repo_path: String::new(),
-                    content_hash: String::new(),
-                    installed_at: current_unix_timestamp_string(),
-                },
-            );
-            self.save_state_unlocked(&state)?;
+        let staging = self.staging_dir(&skill_id);
+        if let Err(error) = copy_dir_all(&backup, &staging) {
+            let _ = remove_link(&staging);
+            return Err(error);
         }
-        self.set_enabled(&skill_id, true)?;
-        Ok(self.load_state())
+        let (name, description) =
+            read_skill_manifest(&staging.join(SKILL_MANIFEST_FILE), &skill_id);
+        let state = self.commit_staged_skill(
+            &staging,
+            InstalledSkill {
+                id: skill_id.clone(),
+                name,
+                description,
+                repo_key: String::new(),
+                repo_path: String::new(),
+                content_hash: String::new(),
+                installed_at: current_unix_timestamp_string(),
+            },
+            true,
+        )?;
+        // 提交前始终保留原备份；提交后清理失败也不撤销已恢复的安装。
+        if let Err(error) = remove_link(&backup) {
+            eprintln!("清理已恢复的 Skill 备份失败：{error:#}");
+        }
+        Ok(state)
     }
 
     /// 显式删除单个备份。AGENTS.md 禁止批量删除，所以只删指定的这一个。

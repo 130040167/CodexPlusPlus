@@ -2,6 +2,84 @@
 use codex_plus_core::skills::SkillsManager;
 
 #[test]
+fn enabling_does_not_delete_a_directory_without_a_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let home = temp.path().join("home");
+    let local = home.join("skills/alpha");
+    std::fs::create_dir_all(source.join("alpha")).unwrap();
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::write(source.join("alpha/SKILL.md"), "managed").unwrap();
+    std::fs::write(local.join("notes.txt"), "user notes").unwrap();
+    let manager = SkillsManager::new(&source, temp.path().join("backups"), temp.path().join("skills.json"), &home);
+    assert!(manager.set_enabled("alpha", true).is_err());
+    assert_eq!(std::fs::read_to_string(local.join("notes.txt")).unwrap(), "user notes");
+    assert!(!local.join("SKILL.md").exists());
+}
+
+#[test]
+fn restore_link_failure_preserves_the_backup_and_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let backup = temp.path().join("backups/alpha-123");
+    let source = temp.path().join("source");
+    std::fs::create_dir_all(&backup).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(backup.join("SKILL.md"), "original backup").unwrap();
+    std::fs::write(home.join("skills"), "block directory creation").unwrap();
+    let manager = SkillsManager::new(&source, temp.path().join("backups"), temp.path().join("skills.json"), &home);
+    let before = manager.load_state();
+    assert!(manager.restore_backup("alpha-123").is_err());
+    assert_eq!(manager.load_state(), before);
+    assert_eq!(std::fs::read_to_string(backup.join("SKILL.md")).unwrap(), "original backup");
+    assert!(!source.join("alpha").exists());
+}
+
+#[test]
+fn restore_does_not_replace_an_existing_local_skill() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let backup = temp.path().join("backups/alpha-123");
+    let local = home.join("skills/alpha");
+    std::fs::create_dir_all(&backup).unwrap();
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::write(backup.join("SKILL.md"), "backup").unwrap();
+    std::fs::write(local.join("SKILL.md"), "local edits").unwrap();
+    let manager = SkillsManager::new(temp.path().join("source"), temp.path().join("backups"), temp.path().join("skills.json"), &home);
+    assert!(manager.restore_backup("alpha-123").is_err());
+    assert_eq!(std::fs::read_to_string(local.join("SKILL.md")).unwrap(), "local edits");
+    assert_eq!(std::fs::read_to_string(backup.join("SKILL.md")).unwrap(), "backup");
+}
+
+#[test]
+#[cfg(windows)]
+fn failed_restore_preserves_the_original_backup() {
+    let temp = tempfile::tempdir().unwrap();
+    let backup = temp.path().join("backups/alpha-123");
+    let state = temp.path().join("skills.json");
+    let source = temp.path().join("source");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&backup).unwrap();
+    std::fs::write(backup.join("SKILL.md"), "original backup").unwrap();
+    std::fs::write(&state, r#"{"repos":[],"installed":{}}"#).unwrap();
+    let manager = SkillsManager::new(&source, temp.path().join("backups"), &state, &home);
+    let before = manager.load_state();
+    let mut permissions = std::fs::metadata(&state).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&state, permissions).unwrap();
+    let result = manager.restore_backup("alpha-123");
+    let mut permissions = std::fs::metadata(&state).unwrap().permissions();
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&state, permissions).unwrap();
+    assert!(result.is_err());
+    assert_eq!(manager.load_state(), before);
+    assert_eq!(std::fs::read_to_string(backup.join("SKILL.md")).unwrap(), "original backup");
+    assert!(!source.join("alpha").exists());
+    assert!(!home.join("skills/alpha").exists());
+    assert_eq!(manager.list_backups().len(), 1);
+}
+
+#[test]
 fn disabling_rejects_staging_inside_the_original_skill() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
