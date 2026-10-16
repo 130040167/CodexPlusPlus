@@ -397,14 +397,15 @@ impl SkillsManager {
             anyhow::bail!("{} 下没有 SKILL.md，不是有效的 Skill", external_dir.display());
         }
         let destination = self.source_dir.join(id);
-        if destination.exists() || std::fs::symlink_metadata(&destination).is_ok() {
-            remove_link(&destination)?;
+        std::fs::create_dir_all(&self.source_dir)?;
+        if self.source_dir.canonicalize()?.starts_with(external_dir.canonicalize()?) {
+            anyhow::bail!("导入目录不能包含受控源目录");
         }
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("创建目录失败：{}", parent.display()))?;
+        let staging = self.source_dir.join(format!(".import-{id}-{}", uuid::Uuid::new_v4()));
+        if let Err(error) = copy_dir_all(external_dir, &staging) {
+            let _ = remove_link(&staging);
+            return Err(error);
         }
-        copy_dir_all(external_dir, &destination)?;
         let (name, description) = read_skill_manifest(&manifest, id);
         let _guard = self.state_lock.lock().unwrap();
         let mut state = self.load_state_unlocked();
@@ -419,10 +420,43 @@ impl SkillsManager {
                 installed_at: current_unix_timestamp_string(),
             },
         );
-        self.save_state_unlocked(&state)?;
-        drop(_guard);
-        self.set_enabled(id, false)?;
-        Ok(self.load_state())
+        let link = self.linked_dir().join(id);
+        let mut displaced = Vec::new();
+        let mut published = false;
+        let result = (|| -> anyhow::Result<()> {
+            // 两处原内容都先保留，成功后仍作为可恢复备份，不覆盖同名用户目录。
+            for original in [&link, &destination] {
+                if std::fs::symlink_metadata(original).is_ok() {
+                    let backup = self.backup_directory(id, original)?;
+                    displaced.push((original.clone(), backup));
+                }
+            }
+            std::fs::rename(&staging, &destination)?;
+            published = true;
+            self.save_state_unlocked(&state)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let rollback = (|| -> anyhow::Result<()> {
+                if published { std::fs::rename(&destination, &staging)?; }
+                for (original, backup) in displaced.iter().rev() {
+                    std::fs::rename(backup, original)?;
+                }
+                Ok(())
+            })();
+            if let Err(rollback_error) = rollback {
+                return Err(error.context(format!("回滚失败，原内容保留在备份目录：{rollback_error:#}")));
+            }
+            let _ = remove_link(&staging);
+            return Err(error);
+        }
+        // 旧安装软链不含独立内容，实体目录备份则必须保留。
+        for (_, backup) in &displaced {
+            if std::fs::symlink_metadata(backup)?.file_type().is_symlink() {
+                remove_link(backup)?;
+            }
+        }
+        Ok(state)
     }
 
     /// codex 随包附带的 `.system` skill，只列出来让用户知道有这些，不参与安装。
@@ -1459,6 +1493,41 @@ mod tests {
             temp.path().join("skills.json"),
             temp.path().join("codex-home"),
         )
+    }
+
+    #[test]
+    fn ccs_import_preserves_both_conflicting_user_copies() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let external = temp.path().join("external");
+        for (directory, content) in [(&external, "imported"), (&manager.source_dir.join("alpha"), "old source"), (&manager.linked_dir().join("alpha"), "user local")] {
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::write(directory.join("SKILL.md"), content).unwrap();
+        }
+        manager.import_from_directory("alpha", &external).unwrap();
+        assert!(!manager.linked_dir().join("alpha").exists());
+        assert_eq!(std::fs::read_to_string(manager.source_dir.join("alpha/SKILL.md")).unwrap(), "imported");
+        let contents: std::collections::BTreeSet<_> = manager.list_backups().iter()
+            .map(|backup| std::fs::read_to_string(manager.backups_dir.join(&backup.id).join("SKILL.md")).unwrap()).collect();
+        assert_eq!(contents, ["old source".to_string(), "user local".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn ccs_import_save_failure_rolls_back_content_and_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let external = temp.path().join("external");
+        for (directory, content) in [(&external, "imported"), (&manager.source_dir.join("alpha"), "old source"), (&manager.linked_dir().join("alpha"), "user local")] {
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::write(directory.join("SKILL.md"), content).unwrap();
+        }
+        std::fs::create_dir_all(&manager.state_path).unwrap();
+        let before = manager.load_state();
+        assert!(manager.import_from_directory("alpha", &external).is_err());
+        assert_eq!(manager.load_state(), before);
+        assert_eq!(std::fs::read_to_string(manager.source_dir.join("alpha/SKILL.md")).unwrap(), "old source");
+        assert_eq!(std::fs::read_to_string(manager.linked_dir().join("alpha/SKILL.md")).unwrap(), "user local");
+        assert!(manager.list_backups().is_empty());
     }
 
     #[test]
