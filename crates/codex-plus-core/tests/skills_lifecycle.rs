@@ -2,6 +2,21 @@
 use codex_plus_core::skills::SkillsManager;
 
 #[test]
+fn disabling_rejects_staging_inside_the_original_skill() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let local = home.join("skills/alpha");
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::write(local.join("SKILL.md"), "original").unwrap();
+    let source = local.join("managed");
+    let manager = SkillsManager::new(&source, temp.path().join("backups"), temp.path().join("skills.json"), &home);
+    assert!(manager.set_enabled("alpha", false).is_err());
+    assert_eq!(std::fs::read_to_string(local.join("SKILL.md")).unwrap(), "original");
+    assert!(manager.list_backups().is_empty());
+    assert_eq!(std::fs::read_dir(source).unwrap().count(), 0);
+}
+
+#[test]
 fn disabling_a_copied_installation_must_preserve_user_edits() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");

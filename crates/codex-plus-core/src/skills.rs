@@ -572,6 +572,10 @@ impl SkillsManager {
                 .is_ok_and(|metadata| !metadata.file_type().is_symlink());
             if link.is_dir() && (physical_copy || !source.is_dir() || !state.installed.contains_key(id)) {
                 // 复制回退后的安装位置可能已有用户修改；未纳管软链也需要保留可再启用的源。
+                std::fs::create_dir_all(&self.source_dir)?;
+                if self.source_dir.canonicalize()?.starts_with(link.canonicalize()?) {
+                    anyhow::bail!("Skill 目录不能包含受控源目录，未执行停用");
+                }
                 let staging = self.staging_dir(id);
                 if let Err(error) = copy_dir_all(&link, &staging) {
                     let _ = remove_link(&staging);
