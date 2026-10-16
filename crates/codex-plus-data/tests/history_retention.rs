@@ -485,3 +485,35 @@ fn grouped_finish_failure_can_retry_completed_databases_without_accepting_stale_
     f.delete("a");
     assert_eq!(adapter.undo(&token).status, DeleteStatus::Failed);
 }
+
+#[cfg(windows)]
+#[test]
+fn extended_length_home_preserves_dependencies_and_undo() {
+    let f = Fixture::new();
+    f.add("a", None);
+    f.add("b", Some("a"));
+    let home = fs::canonicalize(f.home()).unwrap();
+    assert!(home.to_string_lossy().starts_with(r"\\?\"));
+    let adapter = SQLiteStorageAdapter::new(&f.db, BackupStore::new(f.home().join("backups")))
+        .with_codex_home(&home);
+    let delete = |id: &str| {
+        let result = adapter.delete_local(&SessionRef::new(format!("local:{id}"), id).unwrap());
+        assert_eq!(
+            result.status,
+            DeleteStatus::LocalDeleted,
+            "{}",
+            result.message
+        );
+        result.undo_token.unwrap()
+    };
+    delete("a");
+    assert!(f.path("a").exists());
+    let token = delete("b");
+    assert!(!f.path("a").exists());
+    let result = adapter.undo(&token);
+    assert_eq!(result.status, DeleteStatus::Undone, "{}", result.message);
+    assert!(f.path("a").exists());
+    assert!(f.path("b").exists());
+    assert!(!f.visible("a"));
+    assert!(f.visible("b"));
+}

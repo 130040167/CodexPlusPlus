@@ -268,7 +268,7 @@ impl HistoryRetention {
                 .into_iter()
                 .flatten()
                 .filter_map(|row| row["rollout_path"].as_str())
-                .map(|path| PathBuf::from(path.trim_start_matches("\\\\?\\")))
+                .map(|path| comparable_history_path(Path::new(path)))
                 .collect::<BTreeSet<_>>();
             let current_token = if has_table(&db, TABLE)? {
                 db.query_row(
@@ -366,12 +366,11 @@ impl HistoryRetention {
                         bail!("unexpected backup file path: {path}");
                     }
                     if key == "__history_files"
-                        && !target_paths
-                            .contains(&PathBuf::from(path.trim_start_matches("\\\\?\\")))
+                        && !target_paths.contains(&comparable_history_path(Path::new(path)))
                     {
                         self.validate_history_path(Path::new(path))?;
                     }
-                    let normalized = PathBuf::from(path.trim_start_matches("\\\\?\\"));
+                    let normalized = comparable_history_path(Path::new(path));
                     let bytes = base64::Engine::decode(
                         &base64::engine::general_purpose::STANDARD,
                         file["content_b64"]
@@ -417,11 +416,11 @@ impl HistoryRetention {
     fn validate_history_path(&self, path: &Path) -> anyhow::Result<()> {
         let home = fs::canonicalize(&self.home)?;
         // canonicalize 在 Windows 上增加合法的扩展路径前缀。
-        let normalized = PathBuf::from(path.to_string_lossy().trim_start_matches("\\\\?\\"));
+        let normalized = comparable_history_path(path);
         let path = normalized.as_path();
         // 路径必须来自本 home 的两个原生历史目录；拒绝 .. 与逃逸链接。
         for root in ["sessions", "archived_sessions"] {
-            let root = self.home.join(root);
+            let root = comparable_history_path(&self.home).join(root);
             if path.starts_with(&root)
                 && !path
                     .components()
@@ -467,6 +466,21 @@ impl HistoryRetention {
         }
         Ok(())
     }
+}
+
+/// Windows 的扩展路径与普通路径必须在同一命名空间内比较；UNC 仍保留服务器前缀。
+fn comparable_history_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix("\\\\?\\UNC\\") {
+            return PathBuf::from(format!("\\\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix("\\\\?\\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
 }
 
 fn has_native_history(graph: &HistoryGraph) -> bool {
