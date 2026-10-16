@@ -279,7 +279,7 @@ try {
   await fill(".mg-repo-browser .mg-search input", "skill-creator");
   await click("安装", "document.querySelector('.mg-repo-browser')");
   await until("[...document.querySelectorAll('.mg-repo-browser .mg-repo-install-state')].some(e=>e.textContent==='已安装')", "installed badge updates", 180000);
-  const installed = (await invoke("list_installed_skills")).skills.find(s=>s.id==="skill-creator" && s.installed);
+  const installed = (await invoke("list_installed_skills")).skills.find(s=>s.repoPath==="skills/.system/skill-creator" && s.installed);
   assert.ok(installed && installed.enabled);
   report.checks.nativeRepositoryInstall = true;
   await fill(".mg-repo-browser .mg-search input", "");
@@ -310,6 +310,25 @@ try {
   assert.equal(Object.values(restored.repoCounts).reduce((a,b)=>a+b,0), expected);
   assert.ok(restored.skills.length>10);
   report.checks.persistedAfterRestart = expected;
+  const local = path.join(home, "skills", "local-uninstall-regression");
+  await mkdir(local, { recursive: true });
+  await writeFile(path.join(local, "SKILL.md"), "user original content");
+  assert.ok((await invoke("list_installed_skills")).skills.some(s=>s.id==="local-uninstall-regression" && s.installed));
+  assert.equal((await invoke("uninstall_skill", { id:"local-uninstall-regression" })).status, "ok");
+  const backup = (await invoke("list_installed_skills")).backups.find(b=>b.skillId==="local-uninstall-regression");
+  assert.ok(backup);
+  assert.equal((await invoke("restore_skill_backup", { backupId:backup.id })).status, "ok");
+  assert.equal(await readFile(path.join(local,"SKILL.md"),"utf8"), "user original content");
+  report.checks.localUninstallRestoresOriginal = true;
+  const savedState = JSON.parse(await readFile(path.join(state,"skills.json"),"utf8"));
+  const absent = { owner:"codex-skill-verification-nonexistent",name:"absent-repository-20261016",branch:"main",subdir:"",enabled:true };
+  savedState.repos.push(absent);
+  await writeFile(path.join(state,"skills.json"), JSON.stringify(savedState));
+  const startToggle = performance.now();
+  assert.equal((await invoke("upsert_skill_repo",{repo:{...absent,enabled:false}})).status,"ok");
+  assert.ok(performance.now()-startToggle < 3000);
+  assert.equal(JSON.parse(await readFile(path.join(state,"skills.json"),"utf8")).repos.find(r=>r.owner===absent.owner).enabled,false);
+  report.checks.inaccessibleRepositoryCanDisable = true;
   console.log("Native repository checks passed.");
 } catch (error) {
   report.error = String(error.stack || error); process.exitCode = 1;
