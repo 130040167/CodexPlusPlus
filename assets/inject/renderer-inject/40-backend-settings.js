@@ -1677,6 +1677,7 @@
   }
 
   function syncCodexPlusPageBackButton() {
+    if (window.__codexPlusPageNavigationCloseTimer != null) return;
     if (!document.querySelector(`.${codexPlusPageClass}`)) {
       restoreCodexPlusPageBackButton();
       return;
@@ -1700,6 +1701,8 @@
 
   function closeCodexPlusPageAfterNativeNavigation() {
     clearTimeout(window.__codexPlusPageNavigationCloseTimer);
+    // 原生导航前撤销临时属性，避免延迟关闭覆盖导航提交后的返回状态。
+    restoreCodexPlusPageBackButton();
     window.__codexPlusPageNavigationCloseTimer = setTimeout(() => {
       window.__codexPlusPageNavigationCloseTimer = null;
       closeCodexPlusPage();

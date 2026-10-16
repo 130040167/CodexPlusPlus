@@ -7,6 +7,7 @@ const source = readFileSync(new URL("../../../assets/inject/renderer-inject/40-b
 const functions = [
   "codexPlusNativeBackButton", "restoreCodexPlusPageBackButton",
   "syncCodexPlusPageBackButton", "installCodexPlusPageNavigationCloseHandler",
+  "closeCodexPlusPageAfterNativeNavigation",
 ].map((name) => {
   const match = source.match(new RegExp(`^  function ${name}\\([^]*?^  \\}`, "m"));
   assert.ok(match, name);
@@ -42,7 +43,11 @@ function harness(disabled = false, label = "返回") {
   button.button = button;
   let current: Element | null = button;
   const listeners = new Set<Function>();
+  const timers = new Map<number, Function>();
+  let timerId = 0;
   const context = vm.createContext({
+    setTimeout: (callback: Function) => { navigations++; timers.set(++timerId, callback); return timerId; },
+    clearTimeout: (id: number) => timers.delete(id),
     window: {
       addEventListener: (_: string, handler: Function) => listeners.add(handler),
       removeEventListener: (_: string, handler: Function) => listeners.delete(handler),
@@ -62,7 +67,6 @@ function harness(disabled = false, label = "返回") {
       pageOpen = false;
       vm.runInContext("restoreCodexPlusPageBackButton()", context);
     },
-    closeCodexPlusPageAfterNativeNavigation: () => { navigations++; },
   });
   vm.runInContext(functions, context);
   const install = () => vm.runInContext("installCodexPlusPageNavigationCloseHandler()", context);
@@ -75,6 +79,7 @@ function harness(disabled = false, label = "返回") {
     return event;
   };
   return { button, install, click, listeners, context,
+    flushTimers: () => { const pending = [...timers.values()]; timers.clear(); pending.forEach((callback) => callback()); },
     setPage: (open: boolean) => { pageOpen = open; },
     setButton: (next: Element | null) => { current = next; },
     counts: () => ({ closes, navigations }),
@@ -132,4 +137,31 @@ test("all page implementations restore Back on close and synchronize it on openi
   const extension = readFileSync(new URL("../../../assets/inject/renderer-inject/92-extension-host.js", import.meta.url), "utf8");
   assert.match(extension.match(/^  function closeCodexPlusPage\([^]*?^  \}/m)?.[0] ?? "", /restoreCodexPlusPageBackButton\(\)/);
   assert.match(source.match(/^  function observeCodexPlusPageLayout\([^]*?^  \}/m)?.[0] ?? "", /syncCodexPlusPageBackButton\(\)/);
+});
+
+test("native navigation keeps its new Back state after deferred page close and intervening scans", () => {
+  const h = harness(true);
+  h.install();
+  const thread = new Element();
+  thread.thread = true;
+  assert.equal(h.click(thread).prevented, false);
+  assert.equal(h.button.getAttribute("disabled"), "");
+  for (const name of ["disabled", "aria-disabled", "tabindex", "data-disabled"]) h.button.removeAttribute(name);
+  h.install();
+  assert.equal(h.context.window.__codexPlusPageBackButtonState, null);
+  h.flushTimers();
+  assert.deepEqual([...h.button.attributes], [["aria-label", "返回"]]);
+  assert.deepEqual(h.counts(), { closes: 1, navigations: 1 });
+});
+
+test("pending native navigation does not override a replacement Back button", () => {
+  const h = harness();
+  h.install();
+  vm.runInContext("closeCodexPlusPageAfterNativeNavigation()", h.context);
+  const replacement = new Element({ "aria-label": "Back", disabled: "", "aria-disabled": "true" });
+  h.setButton(replacement);
+  h.install();
+  h.flushTimers();
+  assert.equal(replacement.getAttribute("disabled"), "");
+  assert.equal(replacement.getAttribute("aria-disabled"), "true");
 });
