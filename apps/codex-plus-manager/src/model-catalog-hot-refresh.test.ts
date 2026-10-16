@@ -7,15 +7,6 @@ const CATALOG_URL = new URL(
   "../../../assets/inject/renderer-inject/70-model-catalog.js",
   import.meta.url,
 );
-const SETTINGS_URL = new URL(
-  "../../../assets/inject/renderer-inject/30-service-tier.js",
-  import.meta.url,
-);
-const BACKEND_SETTINGS_URL = new URL(
-  "../../../assets/inject/renderer-inject/40-backend-settings.js",
-  import.meta.url,
-);
-
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => { resolve = done; });
