@@ -7,6 +7,9 @@ const root = `${__dirname}/renderer-inject`;
 const adapter = readFileSync(`${root}/62-plugin-market-adapter.js`, "utf8");
 const model = readFileSync(`${root}/70-model-catalog.js`, "utf8");
 const native = readFileSync(`${root}/60-plugin-marketplace.js`, "utf8");
+const serviceTier = readFileSync(`${root}/30-service-tier.js`, "utf8");
+const sessionConnection = serviceTier.slice(serviceTier.indexOf("  function codexManagedSessionConnection("),
+  serviceTier.indexOf("  function codexRemoteSessionStartedThreadId("));
 const methodFunction = model.slice(model.indexOf("  function appServerModelRequestMethod("), model.indexOf("  function patchAppServerModelResult("));
 const clientPatch = native.slice(native.indexOf("  function patchPluginMarketplaceRequestClient("), native.indexOf("  function patchPluginMarketplaceRequestMessage("));
 const transportPatch = native.slice(native.indexOf("  function installPluginMarketplaceBridgePatch("), native.indexOf("  const pluginMarketplaceRequestPatchMaxMisses"));
@@ -38,6 +41,8 @@ function fixture(handler, { enabled = true } = {}) {
     window, MessageEvent, Error, console, Date,
     codexPlusIsWindowsPlatform: false, codexAppServerModelRequestPatchVersion: "11", codexPluginMarketplaceUnlockVersion: "17",
     codexPlusBackendSettingsLoaded: true,
+    codexPlusBackendSettings: {},
+    codexRemoteSessionActiveProfile: () => null,
     setTimeout: (callback, delay) => { const id = ++timerId; timers.set(id, { callback, delay }); return id; },
     clearTimeout: (id) => timers.delete(id),
     codexPluginMarketplacePatchEnabled: () => enabled,
@@ -69,7 +74,7 @@ function fixture(handler, { enabled = true } = {}) {
       throw new Error(`Unexpected request: ${path}`);
     },
   });
-  vm.runInContext(`${methodFunction}\n${adapter}\n${clientPatch}\n${transportPatch}\n${prototypePatch}\nglobalThis.api = {
+  vm.runInContext(`${methodFunction}\n${sessionConnection}\n${adapter}\n${clientPatch}\n${transportPatch}\n${prototypePatch}\nglobalThis.api = {
     intercept: codexPlusPluginNativeInterceptClient, operation: codexPlusPluginNativeOperation,
     outgoing: codexPlusPluginNativeInterceptOutgoing, incoming: codexPlusPluginNativeInterceptIncoming,
     patchClient: patchPluginMarketplaceRequestClient, patchBridge: installPluginMarketplaceBridgePatch,
@@ -231,6 +236,23 @@ test("捕获原型 client 以及嵌套send-cli请求也接管；多层适配不�
   assert.equal(read.plugin.summary.codexPlusIndexId, "original-id");
   assert.equal(client.calls.length, 1);
   assert.equal(f.api.normalize("send-cli-request-for-host", { method: "plugin/installed", params: {} }), "installed-plugins");
+});
+
+test("未启用聚合保护时，模型与插件原型包装共同保留原生请求", async () => {
+  const f = fixture();
+  f.window.__codexPlusAppServerClientClass = f.context.NativeClient;
+  assert.equal(f.api.patchPrototype(), true);
+  const client = new f.context.NativeClient();
+  f.api.patchClient(client);
+  const modelParams = { includeHidden: false };
+  const turnParams = { threadId: "fixture-thread", model: "fixture-model", input: [] };
+  await client.sendRequest("model/list", modelParams);
+  await client.sendRequest("turn/start", turnParams);
+  assert.deepEqual(client.calls, [
+    { method: "model/list", params: modelParams },
+    { method: "turn/start", params: turnParams },
+  ]);
+  assert.equal(f.calls.length, 0, "无关请求不访问插件索引");
 });
 
 test("fetch JSONRPC封装、原生非鉴权错误和无关message分别保留", async () => {
