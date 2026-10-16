@@ -517,3 +517,34 @@ fn extended_length_home_preserves_dependencies_and_undo() {
     assert!(!f.visible("a"));
     assert!(f.visible("b"));
 }
+
+#[cfg(windows)]
+#[test]
+fn differently_cased_home_preserves_dependencies_and_undo() {
+    let f = Fixture::new();
+    f.add("a", None);
+    f.add("b", Some("a"));
+    let home = PathBuf::from(f.home().to_string_lossy().to_uppercase());
+    let adapter = SQLiteStorageAdapter::new(&f.db, BackupStore::new(f.home().join("backups")))
+        .with_codex_home(home);
+    for id in ["a", "b"] {
+        let result = adapter.delete_local(&SessionRef::new(format!("local:{id}"), id).unwrap());
+        assert_eq!(
+            result.status,
+            DeleteStatus::LocalDeleted,
+            "{}",
+            result.message
+        );
+        if id == "a" {
+            assert!(f.path("a").exists());
+        } else {
+            assert!(!f.path("a").exists());
+            let result = adapter.undo(&result.undo_token.unwrap());
+            assert_eq!(result.status, DeleteStatus::Undone, "{}", result.message);
+        }
+    }
+    assert!(f.path("a").exists());
+    assert!(f.path("b").exists());
+    assert!(!f.visible("a"));
+    assert!(f.visible("b"));
+}

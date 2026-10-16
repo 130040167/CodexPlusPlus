@@ -420,8 +420,10 @@ impl HistoryRetention {
         let path = normalized.as_path();
         // 路径必须来自本 home 的两个原生历史目录；拒绝 .. 与逃逸链接。
         for root in ["sessions", "archived_sessions"] {
-            let root = comparable_history_path(&self.home).join(root);
-            if path.starts_with(&root)
+            // 扫描返回规范路径；原始 home 可能含 Windows 短文件名、不同大小写或链接。
+            let original_root = comparable_history_path(&self.home).join(root);
+            let canonical_root = comparable_history_path(&home).join(root);
+            if (path.starts_with(&original_root) || path.starts_with(&canonical_root))
                 && !path
                     .components()
                     .any(|part| matches!(part, std::path::Component::ParentDir))
