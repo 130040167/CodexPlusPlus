@@ -135,7 +135,7 @@ pub fn default_skill_repos() -> Vec<SkillRepo> {
 }
 
 /// 远端仓库里的一个可安装 skill。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteSkill {
     pub id: String,
@@ -270,12 +270,13 @@ impl SkillsManager {
     pub fn merge_entries(&self, remote: &[RemoteSkill]) -> Vec<SkillEntry> {
         let state = self.load_state();
         let linked = self.linked_dir();
-        let mut entries: BTreeMap<String, SkillEntry> = BTreeMap::new();
+        let mut entries: BTreeMap<(String, String), SkillEntry> = BTreeMap::new();
 
         for skill in remote {
-            let installed = state.installed.get(&skill.id);
+            let installed = state.installed.get(&skill.id)
+                .filter(|item| item.repo_key == skill.repo_key);
             entries.insert(
-                skill.id.clone(),
+                (skill.repo_key.clone(), skill.id.clone()),
                 SkillEntry {
                     id: skill.id.clone(),
                     name: skill.name.clone(),
@@ -302,7 +303,7 @@ impl SkillsManager {
 
         // 已安装但远端清单里没有的（仓库删了、或本地手工放的），仍要能看见和卸载。
         for (id, installed) in &state.installed {
-            entries.entry(id.clone()).or_insert_with(|| SkillEntry {
+            entries.entry((installed.repo_key.clone(), id.clone())).or_insert_with(|| SkillEntry {
                 id: id.clone(),
                 name: if installed.name.is_empty() {
                     id.clone()
@@ -322,13 +323,15 @@ impl SkillsManager {
         }
 
         for skill in self.list_bundled_skills() {
-            entries.entry(skill.id.clone()).or_insert(skill);
+            entries.entry((skill.repo_key.clone(), skill.id.clone())).or_insert(skill);
         }
 
         // 用户让 Codex 自己建的 skill（或手工放进 skills 目录的）不会进 state.installed，
         // 也不在远端清单里，此前因此完全不显示（issue #862）。这里扫描 linked_dir 补上。
         for skill in self.list_local_skills() {
-            entries.entry(skill.id.clone()).or_insert(skill);
+            if !entries.values().any(|item| item.id == skill.id && item.installed) {
+                entries.entry((skill.repo_key.clone(), skill.id.clone())).or_insert(skill);
+            }
         }
 
         entries.into_values().collect()
@@ -714,7 +717,7 @@ pub fn parse_repo_key(key: &str) -> Option<SkillRepo> {
     })
 }
 
-fn normalize_repo(repo: SkillRepo) -> anyhow::Result<SkillRepo> {
+pub fn normalize_repo(repo: SkillRepo) -> anyhow::Result<SkillRepo> {
     let owner = repo.owner.trim().to_string();
     let name = repo.name.trim().to_string();
     let branch = {
@@ -774,8 +777,23 @@ pub fn parse_skills_from_tree(repo: &SkillRepo, tree: &Value) -> Vec<RemoteSkill
     };
     let repo_key = repo.key();
 
-    // skill 目录 -> (相对路径, blob sha) 列表
-    let mut subtrees: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    // 先定位所有清单，允许 skills/.curated、插件目录等任意层级。
+    let mut directories = std::collections::BTreeSet::new();
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("blob") {
+            continue;
+        }
+        let Some(path) = item.get("path").and_then(Value::as_str) else { continue };
+        let Some(rest) = path.strip_prefix(&prefix) else { continue };
+        if rest == SKILL_MANIFEST_FILE || rest.ends_with("/SKILL.md") {
+            let directory = path.strip_suffix(SKILL_MANIFEST_FILE).unwrap().trim_end_matches('/');
+            if directory.is_empty() || safe_relative_path(directory).is_ok() {
+                directories.insert(directory.to_string());
+            }
+        }
+    }
+    let mut subtrees: BTreeMap<String, Vec<(String, String)>> =
+        directories.iter().map(|dir| (dir.clone(), Vec::new())).collect();
     for item in items {
         if item.get("type").and_then(Value::as_str) != Some("blob") {
             continue;
@@ -783,33 +801,34 @@ pub fn parse_skills_from_tree(repo: &SkillRepo, tree: &Value) -> Vec<RemoteSkill
         let Some(path) = item.get("path").and_then(Value::as_str) else {
             continue;
         };
-        let Some(rest) = path.strip_prefix(prefix.as_str()) else {
-            continue;
-        };
-        let Some((skill_dir, relative)) = rest.split_once('/') else {
-            continue;
-        };
-        if skill_dir.is_empty() || skill_dir.starts_with('.') {
-            continue;
-        }
         let sha = item
             .get("sha")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        subtrees
-            .entry(skill_dir.to_string())
-            .or_default()
-            .push((relative.to_string(), sha));
+        for (directory, files) in &mut subtrees {
+            let directory_prefix = if directory.is_empty() { String::new() } else { format!("{directory}/") };
+            if let Some(relative) = path.strip_prefix(&directory_prefix) {
+                files.push((relative.to_string(), sha.clone()));
+            }
+        }
     }
-
+    let mut ids = std::collections::BTreeSet::new();
     subtrees
         .into_iter()
-        .filter_map(|(id, mut files)| {
-            // 只有直接放着 SKILL.md 的目录才是 skill，嵌套更深的忽略。
-            if !files.iter().any(|(path, _)| path == SKILL_MANIFEST_FILE) {
-                return None;
+        .filter_map(|(repo_path, mut files)| {
+            let base = if repo_path.is_empty() { repo.name.clone() } else { repo_path.rsplit('/').next()?.to_string() };
+            let mut id = base.clone();
+            if ids.contains(&id) {
+                id = repo_path.replace('/', "--");
             }
+            let mut suffix = 2;
+            while ids.contains(&id) {
+                id = format!("{}--{suffix}", repo_path.replace('/', "--"));
+                suffix += 1;
+            }
+            validate_skill_id(&id).ok()?;
+            ids.insert(id.clone());
             files.sort();
             let mut hasher = Sha256::new();
             for (path, sha) in &files {
@@ -818,17 +837,12 @@ pub fn parse_skills_from_tree(repo: &SkillRepo, tree: &Value) -> Vec<RemoteSkill
                 hasher.update(sha.as_bytes());
                 hasher.update([0]);
             }
-            let repo_path = if prefix.is_empty() {
-                id.clone()
-            } else {
-                format!("{prefix}{id}")
-            };
             Some(RemoteSkill {
                 id: id.clone(),
-                name: id.clone(),
+                name: base,
                 description: String::new(),
                 repo_key: repo_key.clone(),
-                repo_path,
+                repo_path: if repo_path.is_empty() { ".".into() } else { repo_path },
                 content_hash: format!("{:x}", hasher.finalize()),
             })
         })
@@ -862,8 +876,16 @@ async fn fetch_repo_skills_from_zip(
         anyhow::bail!("仓库压缩包太大：{} 字节", bytes.len());
     }
 
+    parse_skills_from_zip(repo, &bytes, cached)
+}
+
+fn parse_skills_from_zip(
+    repo: &SkillRepo,
+    bytes: &[u8],
+    cached: &BTreeMap<String, RemoteSkill>,
+) -> anyhow::Result<Vec<RemoteSkill>> {
     let mut archive =
-        zip::ZipArchive::new(Cursor::new(bytes.as_ref())).context("skill 仓库压缩包无法解析")?;
+        zip::ZipArchive::new(Cursor::new(bytes)).context("skill 仓库压缩包无法解析")?;
     let root = (0..archive.len())
         .find_map(|index| {
             let file = archive.by_index(index).ok()?;
@@ -877,6 +899,7 @@ async fn fetch_repo_skills_from_zip(
     };
     let mut tree_items = Vec::new();
     let mut manifests = BTreeMap::new();
+    let mut total_size = 0u64;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index)?;
         let name = file.name().trim_start_matches('/').to_string();
@@ -887,9 +910,15 @@ async fn fetch_repo_skills_from_zip(
         if relative.is_empty() || file.is_dir() {
             continue;
         }
+        total_size = total_size.saturating_add(file.size());
+        if total_size > 256 * 1024 * 1024 {
+            anyhow::bail!("仓库解压内容超过 256 MiB");
+        }
         let mut contents = Vec::new();
         file.read_to_end(&mut contents)?;
-        let mut hasher = Sha256::new();
+        // 与 trees API 的 Git blob ID 保持一致，避免切换传输路径后误报更新。
+        let mut hasher = sha1::Sha1::new();
+        hasher.update(format!("blob {}\0", contents.len()).as_bytes());
         hasher.update(&contents);
         let sha = format!("{:x}", hasher.finalize());
         tree_items.push(serde_json::json!({
@@ -909,13 +938,15 @@ async fn fetch_repo_skills_from_zip(
     let mut skills = parse_skills_from_tree(repo, &tree);
     for skill in &mut skills {
         if let Some(hit) = cached.get(&skill.id) {
-            if hit.content_hash == skill.content_hash && !hit.description.is_empty() {
+            if hit.content_hash == skill.content_hash && !hit.description.is_empty()
+                && !matches!(hit.description.as_str(), ">" | ">-" | ">+" | "|" | "|-" | "|+")
+            {
                 skill.name = hit.name.clone();
                 skill.description = hit.description.clone();
                 continue;
             }
         }
-        if let Some(text) = manifests.get(&format!("{}/{SKILL_MANIFEST_FILE}", skill.repo_path)) {
+        if let Some(text) = manifests.get(&skill_manifest_path(&skill.repo_path)) {
             let (name, description) = parse_skill_frontmatter(text, &skill.id);
             skill.name = name;
             skill.description = description;
@@ -924,12 +955,18 @@ async fn fetch_repo_skills_from_zip(
     Ok(skills)
 }
 
+fn skill_manifest_path(repo_path: &str) -> String {
+    if repo_path == "." { SKILL_MANIFEST_FILE.into() }
+    else { format!("{repo_path}/{SKILL_MANIFEST_FILE}") }
+}
+
 /// 解析 SKILL.md 的 YAML frontmatter。只取 `name` 和 `description` 两个标量，
 /// 不引 YAML 依赖——codex 自己也只读这两个字段。
 pub fn parse_skill_frontmatter(text: &str, fallback_id: &str) -> (String, String) {
     let mut name = String::new();
     let mut description = String::new();
     let mut in_frontmatter = false;
+    let mut description_block: Option<bool> = None;
     for (index, line) in text.lines().enumerate() {
         let trimmed = line.trim_end();
         if trimmed.trim() == "---" {
@@ -945,6 +982,16 @@ pub fn parse_skill_frontmatter(text: &str, fallback_id: &str) -> (String, String
         if !in_frontmatter {
             continue;
         }
+        if let Some(literal) = description_block {
+            if line.starts_with(' ') || line.starts_with('\t') || line.trim().is_empty() {
+                if !description.is_empty() {
+                    description.push(if literal { '\n' } else { ' ' });
+                }
+                description.push_str(line.trim());
+                continue;
+            }
+            description_block = None;
+        }
         // 嵌套字段（如 metadata 下的键）缩进了，跳过，只认顶层。
         if line.starts_with(' ') || line.starts_with('\t') {
             continue;
@@ -952,7 +999,13 @@ pub fn parse_skill_frontmatter(text: &str, fallback_id: &str) -> (String, String
         if let Some(value) = trimmed.strip_prefix("name:") {
             name = unquote_scalar(value);
         } else if let Some(value) = trimmed.strip_prefix("description:") {
-            description = unquote_scalar(value);
+            let value = value.trim();
+            if matches!(value, ">" | ">-" | ">+" | "|" | "|-" | "|+") {
+                description_block = Some(value.starts_with('|'));
+                description.clear();
+            } else {
+                description = unquote_scalar(value);
+            }
         }
     }
     if name.is_empty() {
@@ -1014,7 +1067,7 @@ pub fn extract_skill_subtree(
     if repo_path.is_empty() {
         anyhow::bail!("skill 在仓库中的路径不能为空");
     }
-    let prefix = format!("{repo_path}/");
+    let prefix = if repo_path == "." { String::new() } else { format!("{repo_path}/") };
     let mut archive =
         zip::ZipArchive::new(Cursor::new(zip_bytes)).context("skill 仓库压缩包无法解析")?;
     let mut wrote_manifest = false;
@@ -1105,8 +1158,48 @@ fn raw_file_url(repo: &SkillRepo, path: &str) -> String {
     )
 }
 
-fn github_client() -> anyhow::Result<reqwest::Client> {
-    crate::http_client::proxied_client(&format!("Codex++/{}", crate::version::VERSION))
+async fn github_client() -> anyhow::Result<reqwest::Client> {
+    tokio::task::spawn_blocking(|| {
+        let agent = format!("Codex++/{}", crate::version::VERSION);
+        if ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"]
+            .iter().any(|key| std::env::var(key).is_ok_and(|v| !v.trim().is_empty()))
+        {
+            return crate::http_client::proxied_client(&agent);
+        }
+        let mut proxies = BTreeMap::new();
+        for host in ["api.github.com", "codeload.github.com", "raw.githubusercontent.com"] {
+            if let Some(proxy) = crate::proxy::detect_system_proxy_for_url(&format!("https://{host}/")) {
+                proxies.insert(host.to_string(), proxy);
+            }
+        }
+        Ok(reqwest::Client::builder().user_agent(agent)
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(90))
+            .proxy(reqwest::Proxy::custom(move |url| {
+                url.host_str().and_then(|host| proxies.get(host).cloned())
+            })).build()?)
+    }).await?
+}
+
+pub async fn resolve_repo_skills(
+    repo: SkillRepo,
+    cached: &BTreeMap<String, RemoteSkill>,
+) -> anyhow::Result<(SkillRepo, Vec<RemoteSkill>)> {
+    let repo = normalize_repo(repo)?;
+    match fetch_repo_skills(&repo, cached).await {
+        Ok(skills) => Ok((repo, skills)),
+        Err(error) if format!("{error:#}").contains("HTTP 404")
+            && matches!(repo.branch.as_str(), "main" | "master") =>
+        {
+            let mut alternative = repo.clone();
+            alternative.branch = if repo.branch == "main" { "master" } else { "main" }.into();
+            match fetch_repo_skills(&alternative, &BTreeMap::new()).await {
+                Ok(skills) => Ok((alternative, skills)),
+                Err(_) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// 私有仓库和限流都靠这个救。与 codex 内置 skill-installer 读同样的两个变量。
@@ -1132,17 +1225,22 @@ pub async fn fetch_repo_skills(
     repo: &SkillRepo,
     cached: &BTreeMap<String, RemoteSkill>,
 ) -> anyhow::Result<Vec<RemoteSkill>> {
-    let client = github_client()?;
+    let client = github_client().await?;
     let response = with_github_auth(client.get(repo_tree_url(repo)))
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .timeout(std::time::Duration::from_secs(20))
         .send()
-        .await
-        .with_context(|| format!("请求 {}/{} 的文件树失败", repo.owner, repo.name))?;
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => return fetch_repo_skills_from_zip(repo, cached, &client).await
+            .with_context(|| format!("文件树请求失败（{error}），压缩包回退也失败")),
+    };
     // 不要用 error_for_status() 一把带过：403 限流、404 仓库/分支不存在、401 令牌
     // 无效，处理方式完全不同，但用户只会看到「返回错误状态」，没法自助也没法报障
     // （#1989 里四个仓库全失败，看不出到底是限流还是网络）。
     let status = response.status();
-    if !status.is_success() && matches!(status.as_u16(), 403 | 429) {
+    if !status.is_success() && (matches!(status.as_u16(), 403 | 429) || status.is_server_error()) {
         return fetch_repo_skills_from_zip(repo, cached, &client).await;
     }
     if !status.is_success() {
@@ -1158,27 +1256,37 @@ pub async fn fetch_repo_skills(
         .json::<Value>()
         .await
         .context("解析 GitHub 文件树响应失败")?;
-
-    let mut skills = parse_skills_from_tree(repo, &tree);
-    for skill in &mut skills {
-        if let Some(hit) = cached.get(&skill.id) {
-            if hit.content_hash == skill.content_hash && !hit.description.is_empty() {
-                skill.name = hit.name.clone();
-                skill.description = hit.description.clone();
-                continue;
-            }
-        }
-        let manifest_url =
-            raw_file_url(repo, &format!("{}/{SKILL_MANIFEST_FILE}", skill.repo_path));
-        if let Ok(response) = with_github_auth(client.get(manifest_url)).send().await
-            && let Ok(response) = response.error_for_status()
-            && let Ok(text) = response.text().await
-        {
-            let (name, description) = parse_skill_frontmatter(&text, &skill.id);
-            skill.name = name;
-            skill.description = description;
-        }
+    if tree.get("truncated").and_then(Value::as_bool) == Some(true) {
+        return fetch_repo_skills_from_zip(repo, cached, &client).await;
     }
+
+    let skills = parse_skills_from_tree(repo, &tree);
+    use futures_util::{StreamExt, stream};
+    let skills = stream::iter(skills.into_iter().map(|mut skill| {
+        let client = &client;
+        async move {
+            if let Some(hit) = cached.get(&skill.id) {
+                if hit.content_hash == skill.content_hash && !hit.description.is_empty()
+                    && !matches!(hit.description.as_str(), ">" | ">-" | ">+" | "|" | "|-" | "|+")
+                {
+                    skill.name = hit.name.clone();
+                    skill.description = hit.description.clone();
+                    return skill;
+                }
+            }
+            let manifest_url = raw_file_url(repo, &skill_manifest_path(&skill.repo_path));
+            if let Ok(response) = with_github_auth(client.get(manifest_url))
+                .timeout(std::time::Duration::from_secs(15)).send().await
+                && let Ok(response) = response.error_for_status()
+                && let Ok(text) = response.text().await
+            {
+                let (name, description) = parse_skill_frontmatter(&text, &skill.id);
+                skill.name = name;
+                skill.description = description;
+            }
+            skill
+        }
+    })).buffer_unordered(8).collect().await;
     Ok(skills)
 }
 
@@ -1199,7 +1307,7 @@ fn github_status_hint(status: u16) -> &'static str {
 }
 
 pub async fn download_repo_zip(repo: &SkillRepo) -> anyhow::Result<Vec<u8>> {
-    let client = github_client()?;
+    let client = github_client().await?;
     let response = with_github_auth(client.get(repo_zip_url(repo)))
         .header(reqwest::header::ACCEPT, "application/zip")
         .send()
@@ -1436,6 +1544,15 @@ mod tests {
     }
 
     #[test]
+    fn frontmatter_reads_folded_and_literal_descriptions() {
+        let (_, folded) = parse_skill_frontmatter(
+            "---\nname: example\ndescription: >-\n  First line.\n  Second line.\nmetadata:\n  short-description: ignored\n---\n", "example");
+        assert_eq!(folded, "First line. Second line.");
+        let (_, literal) = parse_skill_frontmatter("---\ndescription: |\n  First\n  Second\n---\n", "example");
+        assert_eq!(literal, "First\nSecond");
+    }
+
+    #[test]
     fn tree_listing_keeps_only_directories_with_a_manifest() {
         let repo = SkillRepo {
             owner: "openai".to_string(),
@@ -1460,6 +1577,78 @@ mod tests {
         assert_eq!(skills[0].id, "alpha");
         assert_eq!(skills[0].repo_path, "skills/.curated/alpha");
         assert!(!skills[0].content_hash.is_empty());
+    }
+
+    #[test]
+    fn discovers_nested_skills_and_same_named_directories_without_loss() {
+        let repo = parse_repo_key("acme/kit@main").unwrap();
+        let tree = json!({ "tree": [
+            {"type":"blob","path":"skills/.curated/alpha/SKILL.md","sha":"a"},
+            {"type":"blob","path":"plugins/a/skills/alpha/SKILL.md","sha":"b"},
+            {"type":"blob","path":"plugins/a/skills/alpha/scripts/run.py","sha":"c"},
+            {"type":"blob","path":"beta/SKILL.md","sha":"d"},
+            {"type":"blob","path":"ignored/README.md","sha":"e"}
+        ]});
+        let skills = parse_skills_from_tree(&repo, &tree);
+        assert_eq!(skills.len(), 3);
+        let ids: std::collections::BTreeSet<_> = skills.iter().map(|s| &s.id).collect();
+        assert_eq!(ids.len(), 3);
+        assert!(skills.iter().any(|s| s.repo_path == "skills/.curated/alpha"));
+        let scoped = parse_skills_from_tree(&parse_repo_key("acme/kit@main:plugins/a").unwrap(), &tree);
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].id, "alpha");
+    }
+
+    #[test]
+    fn zip_catalog_reads_nested_manifests_and_root_of_selected_subdirectory() {
+        let repo = parse_repo_key("acme/kit@main:plugins").unwrap();
+        let zip = repo_zip(&[
+            ("kit-main/plugins/alpha/SKILL.md", "---\nname: Actual alpha\ndescription: Nested skill\n---\n"),
+            ("kit-main/plugins/alpha/scripts/run.py", "print('ok')"),
+            ("kit-main/outside/beta/SKILL.md", "---\nname: beta\n---\n"),
+        ]);
+        let skills = parse_skills_from_zip(&repo, &zip, &BTreeMap::new()).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "Actual alpha");
+        assert_eq!(skills[0].description, "Nested skill");
+        assert_eq!(skills[0].repo_path, "plugins/alpha");
+        let exact = parse_repo_key("acme/kit@main:plugins/alpha").unwrap();
+        assert_eq!(parse_skills_from_zip(&exact, &zip, &BTreeMap::new()).unwrap().len(), 1);
+        // Git 对 "hello\n" 的 blob ID；API 和 ZIP 的子树标识必须一致。
+        let bytes = repo_zip(&[("kit-main/alpha/SKILL.md", "hello\n")]);
+        let root = parse_repo_key("acme/kit@main").unwrap();
+        let zipped = parse_skills_from_zip(&root, &bytes, &BTreeMap::new()).unwrap();
+        let tree = json!({"tree":[{"type":"blob","path":"alpha/SKILL.md",
+            "sha":"ce013625030ba8dba906f756967f9e9ca394464a"}]});
+        assert_eq!(zipped[0].content_hash, parse_skills_from_tree(&root, &tree)[0].content_hash);
+    }
+
+    #[test]
+    fn merging_same_ids_from_different_repositories_preserves_both() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let first = sample_skill("alpha", "skills/alpha", "one");
+        let mut second = first.clone();
+        second.repo_key = "another/kit@main".into();
+        let entries = manager.merge_entries(&[first, second]);
+        assert_eq!(entries.iter().filter(|s| s.id == "alpha").count(), 2);
+    }
+
+    #[test]
+    fn root_skill_is_discovered_and_installable() {
+        let repo = parse_repo_key("acme/single-skill@main").unwrap();
+        let zip = repo_zip(&[
+            ("single-main/SKILL.md", "---\nname: Root skill\n---\n"),
+            ("single-main/scripts/run.py", "print('ok')"),
+        ]);
+        let skills = parse_skills_from_zip(&repo, &zip, &BTreeMap::new()).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].repo_path, ".");
+        assert_eq!(skills[0].id, "single-skill");
+        let temp = tempfile::tempdir().unwrap();
+        extract_skill_subtree(&zip, ".", temp.path()).unwrap();
+        assert!(temp.path().join("SKILL.md").is_file());
+        assert!(temp.path().join("scripts/run.py").is_file());
     }
 
     #[test]

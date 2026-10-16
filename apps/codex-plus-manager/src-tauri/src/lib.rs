@@ -193,6 +193,7 @@ pub fn run() {
             commands::restore_skill_backup,
             commands::delete_skill_backup,
             commands::upsert_skill_repo,
+            commands::inspect_skill_repo,
             commands::delete_skill_repo,
             commands::open_external_url,
             commands::repair_shortcuts,

@@ -662,6 +662,8 @@ pub struct ScriptMarketPayload {
 pub struct SkillsPayload {
     pub skills: Vec<codex_plus_core::skills::SkillEntry>,
     pub repos: Vec<codex_plus_core::skills::SkillRepo>,
+    pub repository_skills: Vec<codex_plus_core::skills::SkillEntry>,
+    pub repo_counts: std::collections::BTreeMap<String, usize>,
     pub backups: Vec<codex_plus_core::skills::SkillBackup>,
     /// 单个仓库拉取失败不该让整块面板空掉，把错误单独带回前端提示。
     pub repo_errors: Vec<String>,
@@ -5253,13 +5255,17 @@ pub async fn refresh_skill_catalog() -> CommandResult<SkillsPayload> {
 
     for repo in repos.iter().filter(|repo| repo.enabled) {
         let cached = cached_repo_skills(&repo.key());
-        match codex_plus_core::skills::fetch_repo_skills(repo, &cached).await {
-            Ok(skills) => {
-                store_repo_skills(&repo.key(), &skills);
+        match codex_plus_core::skills::resolve_repo_skills(repo.clone(), &cached).await {
+            Ok((resolved, skills)) => {
+                if resolved.key() != repo.key() {
+                    let _ = manager.save_repo(resolved.clone(), Some(&repo.key()));
+                    forget_repo_skills(&repo.key());
+                }
+                store_repo_skills(&resolved.key(), &skills);
                 remote.extend(skills);
             }
             Err(error) => {
-                repo_errors.push(format!("{}/{}：{error}", repo.owner, repo.name));
+                repo_errors.push(format!("{}/{}：{error:#}", repo.owner, repo.name));
                 // 拉不动就先用上一次的结果撑着，别让已知的 skill 从列表里消失
                 remote.extend(cached.into_values());
             }
@@ -5283,7 +5289,7 @@ pub async fn refresh_skill_catalog() -> CommandResult<SkillsPayload> {
 #[tauri::command]
 pub fn list_installed_skills() -> CommandResult<SkillsPayload> {
     let manager = default_skills_manager();
-    let payload = skills_payload(&manager, &[], Vec::new());
+    let payload = current_skills_payload(&manager);
     ok("已加载本地 Skills。", payload)
 }
 
@@ -5451,18 +5457,25 @@ pub async fn upsert_skill_repo(repo: codex_plus_core::skills::SkillRepo, previou
     let manager = default_skills_manager();
     let repo_key = repo.key();
     let cached = cached_repo_skills(&repo_key);
-    let skills = match codex_plus_core::skills::fetch_repo_skills(&repo, &cached).await {
-        Ok(skills) => skills,
+    let (repo, skills) = match codex_plus_core::skills::resolve_repo_skills(repo, &cached).await {
+        Ok(result) => result,
         Err(error) => {
             return failed(
-                &format!("仓库不可访问或不存在，未保存：{error}"),
+                &format!("仓库验证失败，未保存：{error:#}"),
                 current_skills_payload(&manager),
             );
         }
     };
-    match manager.save_repo(repo, previous_key.as_deref()) {
+    let resolved_key = repo.key();
+    let old_key = previous_key.as_deref().or_else(|| {
+        manager.list_repos().iter().any(|r| r.key() == repo_key).then_some(repo_key.as_str())
+    });
+    match manager.save_repo(repo, old_key) {
         Ok(_) => {
-            store_repo_skills(&repo_key, &skills);
+            if let Some(old_key) = old_key {
+                if old_key != resolved_key { forget_repo_skills(old_key); }
+            }
+            store_repo_skills(&resolved_key, &skills);
             let count = skills.len();
             ok(&format!("仓库已验证并保存，发现 {count} 个 Skill。"), current_skills_payload(&manager))
         }
@@ -5470,6 +5483,37 @@ pub async fn upsert_skill_repo(repo: codex_plus_core::skills::SkillRepo, previou
             &format!("保存仓库源失败：{error}"),
             current_skills_payload(&manager),
         ),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRepositoryPayload {
+    repo: codex_plus_core::skills::SkillRepo,
+    skills: Vec<codex_plus_core::skills::SkillEntry>,
+    skill_count: usize,
+}
+
+#[tauri::command]
+pub async fn inspect_skill_repo(repo: codex_plus_core::skills::SkillRepo) -> CommandResult<SkillRepositoryPayload> {
+    let manager = default_skills_manager();
+    let cached = cached_repo_skills(&repo.key());
+    match codex_plus_core::skills::resolve_repo_skills(repo.clone(), &cached).await {
+        Ok((resolved, skills)) => {
+            let count = skills.len();
+            // 预览未保存仓库不会修改仓库设置。
+            if manager.list_repos().iter().any(|r| r.key() == resolved.key()) {
+                store_repo_skills(&resolved.key(), &skills);
+            }
+            ok(&format!("已解析仓库，发现 {count} 个 Skill。"), SkillRepositoryPayload {
+                repo: resolved, skills: manager.merge_entries(&skills).into_iter()
+                    .filter(|s| skills.iter().any(|r| r.id == s.id && r.repo_key == s.repo_key)).collect(),
+                skill_count: count,
+            })
+        }
+        Err(error) => failed(&format!("解析仓库失败：{error:#}"), SkillRepositoryPayload {
+            repo, skills: Vec::new(), skill_count: 0,
+        }),
     }
 }
 
@@ -5494,6 +5538,14 @@ fn skills_payload(
     repo_errors: Vec<String>,
 ) -> SkillsPayload {
     let repos = manager.list_repos();
+    let all_remote = all_cached_repo_skills();
+    let repository_skills = manager.merge_entries(&all_remote).into_iter()
+        .filter(|skill| all_remote.iter().any(|r| r.id == skill.id && r.repo_key == skill.repo_key))
+        .collect();
+    let repo_counts = repo_skill_cache().lock().ok().map(|cache| {
+        repos.iter().filter_map(|repo| cache.get(&repo.key())
+            .map(|skills| (repo.key(), skills.len()))).collect()
+    }).unwrap_or_default();
     let remote: Vec<_> = remote.iter().filter(|skill| {
         repos.iter().any(|repo| repo.enabled && repo.key() == skill.repo_key)
     }).cloned().collect();
@@ -5504,6 +5556,8 @@ fn skills_payload(
             manager.merge_entries(&remote)
         },
         repos,
+        repository_skills,
+        repo_counts,
         backups: manager.list_backups(),
         repo_errors,
         skills_dir: manager.source_dir().to_string_lossy().to_string(),
@@ -5536,7 +5590,11 @@ type RepoSkillCache = std::collections::HashMap<
 fn repo_skill_cache() -> &'static std::sync::Mutex<RepoSkillCache> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<RepoSkillCache>> =
         std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(RepoSkillCache::new()))
+    CACHE.get_or_init(|| {
+        let cache = std::fs::read(codex_plus_core::paths::default_app_state_dir().join("skill-catalog.json"))
+            .ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+        std::sync::Mutex::new(cache)
+    })
 }
 
 fn cached_repo_skills(
@@ -5571,12 +5629,21 @@ fn store_repo_skills(repo_key: &str, skills: &[codex_plus_core::skills::RemoteSk
                 .map(|skill| (skill.id.clone(), skill.clone()))
                 .collect(),
         );
+        persist_repo_skill_cache(&cache);
     }
 }
 
 fn forget_repo_skills(repo_key: &str) {
     if let Ok(mut cache) = repo_skill_cache().lock() {
         cache.remove(repo_key);
+        persist_repo_skill_cache(&cache);
+    }
+}
+
+fn persist_repo_skill_cache(cache: &RepoSkillCache) {
+    if let Ok(bytes) = serde_json::to_vec(cache) {
+        let path = codex_plus_core::paths::default_app_state_dir().join("skill-catalog.json");
+        let _ = codex_plus_core::settings::atomic_write(&path, &bytes);
     }
 }
 
