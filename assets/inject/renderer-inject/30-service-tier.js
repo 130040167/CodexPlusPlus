@@ -691,7 +691,7 @@
     let provider = params.modelProvider || params.model_provider || "";
     if (!provider) {
       try {
-        const result = await sendRequest("thread/read", { threadId: params.threadId, includeTurns: false });
+        const result = await readCodexManagedSessionForCheck(params.threadId, sendRequest);
         provider = result?.thread?.modelProvider || "";
       } catch {
         // 按路径恢复等原生情形允许 read 尚不可用，保留原始 resume 语义。
@@ -869,7 +869,7 @@
     return result;
   }
 
-  async function sendCodexManagedSessionTurn(client, sendRequest, method, params, options) {
+  async function sendCodexManagedSessionTurn(client, sendRequest, method, params, options, modelContextRefresh) {
     if (client.hostId !== "local") return null;
     if (method === "send-cli-request-for-host" && params?.method) {
       if ([params.hostId, params.host_id].some((host) => typeof host === "string" && host !== "local")) {
@@ -878,7 +878,7 @@
       return await sendCodexManagedSessionTurn(client,
         (nestedMethod, nestedParams, nestedOptions) => sendRequest(method,
           { ...params, method: nestedMethod, params: nestedParams }, nestedOptions),
-        String(params.method), params.params, options);
+        String(params.method), params.params, options, modelContextRefresh);
     }
     if (method !== "turn/start" || !codexManagedSessionConnection() || !params?.threadId) return null;
     const connection = codexManagedSessionConnection();
@@ -902,7 +902,7 @@
       try {
         const response = await sendRequest(method, params, options);
         rememberSuccessfulTurn();
-        if (params.model) client.__codexPlusThreadModels?.set(params.threadId, params.model);
+        if (modelContextRefresh !== false && params.model) client.__codexPlusThreadModels?.set(params.threadId, params.model);
         return { result: response };
       } catch (error) {
         // 只把明确的连接类错误标成待检查；当前消息不自动重发。
@@ -919,7 +919,7 @@
       try {
         const response = await sendRequest(method, params, options);
         // turn/start 的确认只代表任务入队，不能证明后续流连接使用了受管供应商。
-        if (params.model) client.__codexPlusThreadModels?.set(params.threadId, params.model);
+        if (modelContextRefresh !== false && params.model) client.__codexPlusThreadModels?.set(params.threadId, params.model);
         return { result: response };
       } catch (error) {
         if (codexManagedSessionConnectionError(error)) {
@@ -955,7 +955,7 @@
     try {
       const response = await sendRequest(method, params, options);
       rememberSuccessfulTurn();
-      if (params.model) client.__codexPlusThreadModels?.set(params.threadId, params.model);
+      if (modelContextRefresh !== false && params.model) client.__codexPlusThreadModels?.set(params.threadId, params.model);
       return { result: response };
     } catch (error) {
       if (codexManagedSessionConnectionError(error)) {

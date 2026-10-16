@@ -282,11 +282,18 @@ describe("managed aggregate session connection", () => {
       catalog.indexOf("  const appServerModelRequestPatchMaxMisses"));
     for (const mode of ["instance", "prototype", "envelope"]) {
       const calls: string[] = [];
+      let allowContextResume = false;
+      let rejectContextResume = false;
       const nativeSend = async function(this: any, method: string, params: any): Promise<any> {
         assert.equal(this.hostId, "local", "preserve the native method receiver during upgrade");
         if (method === "send-cli-request-for-host") return nativeSend.call(this, params.method, params.params);
         calls.push(method);
-        if (method === "thread/resume") throw new Error("no rollout found for thread id fresh");
+        if (method === "thread/resume") {
+          if (!allowContextResume) throw new Error("no rollout found for thread id fresh");
+          assert.equal(params.model, "new");
+          assert.equal(params.modelProvider, "codex_plus_managed");
+          if (rejectContextResume) throw new Error("context refresh failed");
+        }
         return method === "thread/start" ? { thread: { id: "fresh" } } : { turn: { id: "first" } };
       };
       class Client {
@@ -310,6 +317,7 @@ describe("managed aggregate session connection", () => {
         __codexPlusModelOriginalSendRequest: nativeSend,
         __codexPlusModelRequestPatch: "16",
       });
+      const profile: any = { id: "aggregate", relayMode: "aggregate" };
       const context = vm.createContext({
         window: { __codexPlusAppServerClientClass: Client,
           __codexPlusAppServerClientPrototypePatchInstalled: "16", __codexSessionDeleteBridge: {} },
@@ -317,7 +325,7 @@ describe("managed aggregate session connection", () => {
         codexPlusBackendSettings: { managedSessionConnection: {
           profileId: "aggregate", provider: "codex_plus_managed", baseUrl: "http://127.0.0.1:62021/v1",
         } },
-        codexRemoteSessionActiveProfile: () => ({ id: "aggregate", relayMode: "aggregate" }),
+        codexRemoteSessionActiveProfile: () => profile,
         codexPlusBackendSettingsLoaded: true,
         registerNativeHostClient() {}, codexPlusPluginNativeInterceptClient: () => null,
         appServerModelRequestMethod: (method: string, params: any) =>
@@ -331,10 +339,12 @@ describe("managed aggregate session connection", () => {
         codexAppServerPreparationTimeoutMs: 1500,
         sendCodexPlusDiagnostic() {}, codexPlusModelUnlockEnabled: () => false,
         codexPluginMarketplacePatchEnabled: () => false, codexPlusSettings: () => ({}),
-        refreshCodexThreadModelBeforeTurn: async () => null,
-        codexThreadModelRequestState: () => ({}),
+        setTimeout, clearTimeout,
+        codexRemoteSessionTargetProvider: () => "openai",
       });
-      vm.runInContext(source + instancePatch + prototypePatch, context);
+      const contextHelpers = catalog.slice(catalog.indexOf("  function codexPerModelContextEnabled("),
+        catalog.indexOf("  function patchAppServerModelRequestClient("));
+      vm.runInContext(source + contextHelpers + instancePatch + prototypePatch, context);
       vm.runInContext(mode === "prototype" ? "installCodexAppServerClientPrototypePatch()"
         : "patchAppServerModelRequestClient(client)", context);
       const send = (method: string, params: any) => mode === "envelope"
@@ -346,6 +356,36 @@ describe("managed aggregate session connection", () => {
       await send("turn/start", { threadId: "fresh", model: "selected" });
       assert.deepEqual(calls, ["turn/start"], mode);
       assert.equal((client as any).__codexPlusModelRequestPatch, version);
+      allowContextResume = true;
+      // 使用真实刷新函数，分别覆盖窗口、压缩和 metadata 配置。
+      for (const key of ["modelWindows", "modelAutoCompact", "modelMetadata"]) {
+        profile[key] = '{"old":200000,"new":1000000}';
+        await send("thread/start", { model: "old" });
+        calls.length = 0;
+        await send("turn/start", { threadId: "fresh", model: "new" });
+        assert.deepEqual(calls, ["thread/resume", "turn/start"], `${mode}:${key}`);
+        calls.length = 0;
+        await send("turn/start", { threadId: "fresh", model: "new" });
+        assert.deepEqual(calls, ["turn/start"], `${mode}:unchanged`);
+        // 同线程正在恢复时不得抢先刷新上下文或发送消息。
+        await send("thread/start", { model: "old" });
+        (context.window as any).__codexPlusConnectionRecoveryPending = new Set(["fresh"]);
+        calls.length = 0;
+        await assert.rejects(send("turn/start", { threadId: "fresh", model: "new" }), /正在检查连接/);
+        assert.deepEqual(calls, []);
+        (context.window as any).__codexPlusConnectionRecoveryPending.clear();
+        // 刷新失败不能由受管发送覆盖缓存，下一条消息仍应重试刷新。
+        await send("thread/start", { model: "old" });
+        rejectContextResume = true;
+        calls.length = 0;
+        await send("turn/start", { threadId: "fresh", model: "new" });
+        assert.deepEqual(calls, ["thread/resume", "turn/start"]);
+        rejectContextResume = false;
+        calls.length = 0;
+        await send("turn/start", { threadId: "fresh", model: "new" });
+        assert.deepEqual(calls, ["thread/resume", "turn/start"], `${mode}:retry`);
+        delete profile[key];
+      }
     }
   });
 
@@ -438,6 +478,31 @@ describe("managed aggregate session connection", () => {
     const ordinary = await api.prepare("thread/resume", params, "local",
       async () => ({ thread: { modelProvider: "other" } }));
     assert.equal(ordinary, params);
+  });
+
+  it("bounds identity probes for official and formerly managed resumes and preserves native fallback", async () => {
+    for (const mode of ["official", "pureApi"]) {
+      for (const failure of ["pending", "reject"]) {
+        const api = runtime();
+        if (mode === "pureApi") api.note("thread/start", api.apply("thread/start", {}, "local"),
+          { thread: { id: "thread" }, modelProvider: "codex_plus_managed" }, "local");
+        api.state.profile.relayMode = mode;
+        const params = { threadId: "thread", cwd: "workspace" };
+        let reads = 0;
+        const result = await api.prepare("thread/resume", params, "local",
+          async (method: string, received: any, options: any) => {
+            reads++;
+            assert.equal(method, "thread/read");
+            assert.equal(received.includeTurns, false);
+            assert.equal(options.timeoutMs, 800);
+            assert.equal(options.onOutcomeUnknown, undefined);
+            if (failure === "reject") throw new Error("read unavailable");
+            return new Promise(() => {});
+          });
+        assert.equal(result, params);
+        assert.equal(reads, 1);
+      }
+    }
   });
 
   it("patches a local host envelope at the nested request and preserves remote envelopes", async () => {
