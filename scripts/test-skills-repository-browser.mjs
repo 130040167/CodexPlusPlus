@@ -310,6 +310,16 @@ try {
   assert.equal(Object.values(restored.repoCounts).reduce((a,b)=>a+b,0), expected);
   assert.ok(restored.skills.length>10);
   report.checks.persistedAfterRestart = expected;
+  const updateTarget = restored.skills.find(s=>s.installed && s.repoPath==="skills/.system/skill-creator");
+  assert.ok(updateTarget);
+  const updatedManifest = path.join(home,"skills",updateTarget.id,"SKILL.md");
+  await writeFile(updatedManifest, (await readFile(updatedManifest,"utf8"))+"\nlocal-update-regression-marker\n");
+  assert.equal((await invoke("update_skill", {repoKey:updateTarget.repoKey,id:updateTarget.id})).status,"ok");
+  assert.ok(!(await readFile(updatedManifest,"utf8")).includes("local-update-regression-marker"));
+  const updateBackups = (await invoke("list_installed_skills")).backups.filter(b=>b.skillId===updateTarget.id);
+  const backupContents = await Promise.all(updateBackups.map(b=>readFile(path.join(state,"skill-backups",b.id,"SKILL.md"),"utf8")));
+  assert.ok(backupContents.some(content=>content.includes("local-update-regression-marker")));
+  report.checks.updatePreservesLocalEditsInBackups = true;
   const local = path.join(home, "skills", "local-uninstall-regression");
   await mkdir(local, { recursive: true });
   await writeFile(path.join(local, "SKILL.md"), "user original content");
