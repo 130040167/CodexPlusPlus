@@ -380,6 +380,7 @@ async function aggregateQueryRuntime(structuralSharing = false) {
     const codexServiceTierModelFromValue = value => String(value || "");
     const findCodexQueryClient = () => client;
     const sendCodexPlusDiagnostic = () => {};
+    const syncCodexRetainedThreadModels = () => {};
     ${functions}
     return {
       refresh: refreshCachedLocalModelQueries,
