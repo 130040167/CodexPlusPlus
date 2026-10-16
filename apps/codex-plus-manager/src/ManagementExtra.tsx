@@ -1,6 +1,6 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowLeft, ArrowRight, BookOpen, ChevronDown, Copy, ExternalLink, History, Link, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
+import { ArrowLeft, ArrowRight, BookOpen, ChevronDown, Copy, Edit3, ExternalLink, History, Link, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
 import { t } from "./i18n";
 import { matchesManagementQuery, sessionGroups, type ManagedSession } from "./management-model";
 import { ManagementDrawer } from "./ManagementPages";
@@ -47,6 +47,10 @@ function SkillRepoDrawer({ repos, catalog, counts, initialKey, busy, onClose, on
   const [selected, setSelected] = useState<Repo | null>(() => repos.find((r) => repoKey(r) === initialKey) || repoFromKey(initialKey) || repos[0] || null);
   const [preview, setPreview] = useState<RepoInspection | null>(null);
   const [formOpen, setFormOpen] = useState(false);
+  const editorRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (formOpen) editorRef.current?.querySelector<HTMLInputElement>("input")?.focus({ preventScroll: true });
+  }, [formOpen, editing]);
   const [query, setQuery] = useState("");
   const [scanning, setScanning] = useState(false);
   const [feedback, setFeedback] = useState("");
@@ -90,16 +94,16 @@ function SkillRepoDrawer({ repos, catalog, counts, initialKey, busy, onClose, on
   const filtered = skills.filter((s) => matchesManagementQuery([s.id, s.name, s.description, s.repoPath || ""], query));
   const locked = busy || scanning;
   return <ManagementDrawer wide dismissOnBackdrop={false} title={t("管理 Skills 仓库")} onClose={() => { if (!locked) onClose(); }} footer={<Button onClick={onClose} disabled={locked}>{t("关闭")}</Button>}>
-    <div className="mg-repo-workspace"><aside className="mg-repo-sidebar">
-    <div className="mg-repo-manager"><div className="mg-repo-manager-head"><strong>{t("已添加仓库")} · {repos.length}</strong><button className="mg-icon-button" title={t("添加仓库")} aria-label={t("添加仓库")} disabled={locked} onClick={() => { setEditing(null); setFormOpen(true); setInput(""); setDraft({ owner: "", name: "", branch: "main", subdir: "", enabled: true }); }}><Plus size={16}/></button></div>
+    <div className="mg-repo-workspace" data-editing={formOpen}><aside className="mg-repo-sidebar">
+    <div className="mg-repo-manager"><div className="mg-repo-manager-head"><strong>{t("已添加仓库")} <span className="mg-repo-total">{repos.length}</span></strong><button className="mg-icon-button" title={t("添加仓库")} aria-label={t("添加仓库")} disabled={locked} onClick={() => { setEditing(null); setFormOpen(true); setInput(""); setDraft({ owner: "", name: "", branch: "main", subdir: "", enabled: true }); }}><Plus size={16}/></button></div>
       {!repos.length && <p className="mg-muted">{t("还没有添加仓库。")}</p>}
       {repos.map((repo) => <div className="mg-repo-row" data-selected={active && repoKey(active) === repoKey(repo)} key={repoKey(repo)}>
-        <button type="button" className="mg-repo-select" disabled={locked} onClick={() => view(repo)}><strong>{repo.owner}/{repo.name}</strong><small>{repo.branch}{repo.subdir ? ` · ${repo.subdir}` : ""}</small><span>{counts[repoKey(repo)] === undefined ? t("待扫描") : `${counts[repoKey(repo)]} Skills`}{!repo.enabled ? ` · ${t("已停用")}` : ""}</span></button>
-        <button className={"mg-switch " + (repo.enabled ? "is-on" : "")} type="button" role="switch" aria-checked={repo.enabled} disabled={locked} aria-label={`${repo.owner}/${repo.name} ${t("启用仓库")}`} onClick={() => void onSave({ ...repo, enabled: !repo.enabled })}><span /></button>
-        <Button onClick={() => edit(repo)} disabled={locked}>{t("编辑")}</Button>
-        <button className="mg-icon-button" title={t("删除仓库")} aria-label={`${t("删除仓库")} ${repo.owner}/${repo.name}`} disabled={locked} onClick={() => { onDelete(repo); if (active && repoKey(active) === repoKey(repo)) { setSelected(repos.find((r) => repoKey(r) !== repoKey(repo)) || null); setPreview(null); } }}><Trash2 size={14}/></button></div>)}
+        <button type="button" className="mg-repo-select" disabled={locked} onClick={() => view(repo)}><strong title={`${repo.owner}/${repo.name}`}>{repo.owner}/{repo.name}</strong><small title={`${repo.branch}${repo.subdir ? ` · ${repo.subdir}` : ""}`}>{repo.branch}{repo.subdir ? ` · ${repo.subdir}` : ""}<span>{counts[repoKey(repo)] === undefined ? t("待扫描") : `${counts[repoKey(repo)]} Skills`}{!repo.enabled ? ` · ${t("已停用")}` : ""}</span></small></button>
+        <div className="mg-repo-row-actions"><button className={"mg-switch " + (repo.enabled ? "is-on" : "")} type="button" role="switch" aria-checked={repo.enabled} disabled={locked} aria-label={`${repo.owner}/${repo.name} ${t("启用仓库")}`} onClick={() => void onSave({ ...repo, enabled: !repo.enabled })}><span /></button>
+        <button type="button" className="mg-icon-button" title={t("编辑仓库")} aria-label={`${t("编辑仓库")} ${repo.owner}/${repo.name}`} onClick={() => edit(repo)} disabled={locked}><Edit3 size={14}/></button>
+        <button className="mg-icon-button" title={t("删除仓库")} aria-label={`${t("删除仓库")} ${repo.owner}/${repo.name}`} disabled={locked} onClick={() => { onDelete(repo); if (active && repoKey(active) === repoKey(repo)) { setSelected(repos.find((r) => repoKey(r) !== repoKey(repo)) || null); setPreview(null); } }}><Trash2 size={14}/></button></div></div>)}
     </div>
-    {formOpen && <div className="mg-repo-form"><div className="mg-repo-manager-head"><h3>{editing ? t("编辑仓库") : t("添加仓库")}</h3><button className="mg-icon-button" title={t("取消编辑")} aria-label={t("取消编辑")} disabled={locked} onClick={() => setFormOpen(false)}><X size={14}/></button></div><div className="mg-repo-quick"><input disabled={locked} value={input} onChange={(e) => { setInput(e.target.value); setParseError(""); }} placeholder="https://github.com/owner/repo" /><Button onClick={() => void parse()} disabled={locked || !input.trim()}><Search size={14}/>{scanning ? t("解析中…") : t("解析")}</Button></div>{parseError && <p className="mg-form-error">{parseError}</p>}<fieldset disabled={locked} className="mg-form-grid"><Field label={t("所有者")}><input value={draft.owner} onChange={(e) => set({ owner: e.target.value })} /></Field><Field label={t("仓库名")}><input value={draft.name} onChange={(e) => set({ name: e.target.value })} /></Field><Field label={t("分支")}><input value={draft.branch} onChange={(e) => set({ branch: e.target.value })} /></Field><Field label={t("子目录")}><input value={draft.subdir} onChange={(e) => set({ subdir: e.target.value })} placeholder={t("可选")} /></Field></fieldset><label className="mg-check-line"><input type="checkbox" disabled={locked} checked={draft.enabled} onChange={(e) => set({ enabled: e.target.checked })}/>{t("启用仓库")}</label><div className="mg-row-actions"><Button disabled={locked || !draft.owner.trim() || !draft.name.trim()} onClick={() => void inspect(draft, true)}>{t("检查仓库")}</Button><Button primary disabled={locked || !draft.owner.trim() || !draft.name.trim()} onClick={() => void save()}>{editing ? t("保存修改") : t("添加仓库")}</Button></div></div>}
+
     </aside><section className="mg-repo-browser">
       {active ? <>
         <div className="mg-repo-detail-head"><h3>{active.owner}/{active.name}</h3><div className="mg-row-actions"><Button disabled={locked} onClick={() => void inspect(active)}><RefreshCw size={14}/>{t("刷新仓库")}</Button><Button onClick={() => onOpenUrl(`https://github.com/${active.owner}/${active.name}`)}><ExternalLink size={14}/>GitHub</Button></div></div>
@@ -108,11 +112,13 @@ function SkillRepoDrawer({ repos, catalog, counts, initialKey, busy, onClose, on
         {count === 0 && <p className="mg-muted">{t("当前分支和目录中没有 SKILL.md。")}</p>}
         <SearchBox value={query} onChange={setQuery} placeholder={t("搜索此仓库的 Skills")} />
         <div className="mg-repo-results" aria-busy={scanning}>
-          {filtered.map((s) => <div className="mg-repo-skill" key={s.repoKey + ":" + s.id}><button type="button" className="mg-skill-name" onClick={() => onOpenSkill(s)}><strong>{s.name || s.id}</strong><small title={s.description}>{s.description || s.repoPath}</small></button><div className="mg-row-actions"><Button onClick={() => onOpenSkill(s)}>{t("详情")}</Button>{repos.some((r) => repoKey(r) === s.repoKey) && (s.installed ? <span className="mg-badge">{t("已安装")}</span> : <Button primary disabled={locked} onClick={() => onRun("install_skill", { repoKey: s.repoKey, id: s.id })}>{t("安装")}</Button>)}</div></div>)}
+          {filtered.map((s) => <div className="mg-repo-skill" key={s.repoKey + ":" + s.id}><button type="button" className="mg-skill-name" onClick={() => onOpenSkill(s)}><strong>{s.name || s.id}</strong><small title={s.description}>{s.description || s.repoPath}</small></button><div className="mg-repo-skill-actions"><Button onClick={() => onOpenSkill(s)}>{t("详情")}</Button><div className="mg-repo-install-slot">{repos.some((r) => repoKey(r) === s.repoKey) && (s.installed ? <span className="mg-repo-install-state">{t("已安装")}</span> : <Button primary disabled={locked} onClick={() => onRun("install_skill", { repoKey: s.repoKey, id: s.id })}>{t("安装")}</Button>)}</div></div></div>)}
           {!filtered.length && !scanning && <p className="mg-muted">{count ? t("没有匹配的 Skill") : t("暂无 Skills")}</p>}
         </div>
       </> : <p className="mg-muted">{t("还没有添加仓库。")}</p>}
-    </section></div>
+    </section>
+    {formOpen && <div className="mg-repo-form" ref={editorRef} role="region" aria-label={editing ? t("编辑仓库") : t("添加仓库")} onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); event.preventDefault(); if (!locked) setFormOpen(false); } }}><div className="mg-repo-manager-head"><h3><Edit3 size={15}/>{editing ? t("编辑仓库") : t("添加仓库")}</h3><button className="mg-icon-button" title={t("取消编辑")} aria-label={t("取消编辑")} disabled={locked} onClick={() => setFormOpen(false)}><X size={14}/></button></div><div className="mg-repo-form-content"><div className="mg-repo-quick"><input disabled={locked} value={input} onChange={(e) => { setInput(e.target.value); setParseError(""); }} aria-label={t("仓库地址")} placeholder="https://github.com/owner/repo" /><Button onClick={() => void parse()} disabled={locked || !input.trim()}><Search size={14}/>{scanning ? t("解析中…") : t("解析")}</Button></div>{parseError && <p className="mg-form-error">{parseError}</p>}<fieldset disabled={locked} className="mg-form-grid"><Field label={t("所有者")}><input value={draft.owner} onChange={(e) => set({ owner: e.target.value })} /></Field><Field label={t("仓库名")}><input value={draft.name} onChange={(e) => set({ name: e.target.value })} /></Field><Field label={t("分支")}><input value={draft.branch} onChange={(e) => set({ branch: e.target.value })} /></Field><Field label={t("子目录")}><input value={draft.subdir} onChange={(e) => set({ subdir: e.target.value })} placeholder={t("可选")} /></Field></fieldset></div><div className="mg-repo-form-footer"><label className="mg-check-line"><input type="checkbox" disabled={locked} checked={draft.enabled} onChange={(e) => set({ enabled: e.target.checked })}/>{t("启用仓库")}</label><div className="mg-row-actions"><Button disabled={locked || !draft.owner.trim() || !draft.name.trim()} onClick={() => void inspect(draft, true)}>{t("检查仓库")}</Button><Button primary disabled={locked || !draft.owner.trim() || !draft.name.trim()} onClick={() => void save()}>{editing ? t("保存修改") : t("添加仓库")}</Button></div></div></div>}
+    </div>
   </ManagementDrawer>;
 }
 function SkillDetailDrawer({ skill, count, onClose, onOpenUrl, onOpenRepo }: { skill: Skill; count?: number; onClose: () => void; onOpenUrl: (url: string) => void; onOpenRepo: () => void }) {
