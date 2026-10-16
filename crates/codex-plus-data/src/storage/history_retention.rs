@@ -6,6 +6,7 @@ use fs2::FileExt;
 use std::collections::{BTreeMap, BTreeSet};
 
 const TABLE: &str = "codex_plus_deleted_threads";
+const RESTORED_TABLE: &str = "codex_plus_restored_threads";
 
 pub(super) struct HistoryRetention {
     _lock: File,
@@ -109,6 +110,12 @@ impl HistoryRetention {
     }
 
     pub fn mark_deleted(db: &Connection, id: &str, token: &str) -> anyhow::Result<()> {
+        if has_table(db, RESTORED_TABLE)? {
+            db.execute(
+                &format!("DELETE FROM {RESTORED_TABLE} WHERE thread_id=?1"),
+                [id],
+            )?;
+        }
         db.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {TABLE} (thread_id TEXT PRIMARY KEY, backup_token TEXT NOT NULL)"))?;
         db.execute(&format!("INSERT INTO {TABLE} (thread_id, backup_token) VALUES (?1,?2) ON CONFLICT(thread_id) DO UPDATE SET backup_token=excluded.backup_token"), [id, token])?;
         Ok(())
@@ -149,15 +156,51 @@ impl HistoryRetention {
         graph: HistoryGraph,
         deleted: &BTreeSet<String>,
     ) -> anyhow::Result<usize> {
-        let reachable = graph.reachable_from(
-            graph
-                .files
-                .keys()
-                .filter(|id| !deleted.contains(*id))
-                .cloned(),
-        );
+        let mut roots: BTreeSet<String> = graph
+            .files
+            .keys()
+            .filter(|id| !deleted.contains(*id))
+            .cloned()
+            .collect();
+        // 部分数据库删除失败时，另一库的未删除行仍然拥有历史。
+        for path in &self.databases {
+            if !path.is_file() {
+                continue;
+            }
+            let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            if !has_columns(&db, "threads", &["id", "rollout_path"])? {
+                continue;
+            }
+            let mut stmt = db.prepare("SELECT id, rollout_path FROM threads")?;
+            for row in stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })? {
+                let (id, rollout) = row?;
+                if Self::is_deleted(&db, &id)? {
+                    continue;
+                }
+                if graph.files.contains_key(&id) {
+                    roots.insert(id);
+                }
+                if let Some(rollout) = rollout {
+                    let resolved = fs::canonicalize(&rollout).or_else(|_| {
+                        wsl_path_alternative(&rollout)
+                            .map(fs::canonicalize)
+                            .unwrap_or_else(|| fs::canonicalize(&rollout))
+                    });
+                    if let Ok(resolved) = resolved {
+                        for (physical_id, files) in &graph.files {
+                            if files.contains(&resolved) {
+                                roots.insert(physical_id.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let reachable = graph.reachable_from(roots.iter().cloned());
         // 任一保留会话的闭包不完整时，先停止回收，避免把损坏的索引当作无引用。
-        for id in graph.files.keys().filter(|id| !deleted.contains(*id)) {
+        for id in &roots {
             graph.closure_files(id)?;
         }
         let mut removed = 0;
@@ -206,7 +249,8 @@ impl HistoryRetention {
 
     /// 新备份允许保留中的同一文件存在，但绝不覆盖追加后的历史。
     pub fn prepare_undo(&self, backups: &mut [Value]) -> anyhow::Result<()> {
-        for backup in backups {
+        let mut all_files = BTreeMap::<PathBuf, (Vec<u8>, Value)>::new();
+        for backup in backups.iter_mut() {
             let db_path = backup_source_db(backup, &self.databases[0], &self.databases)?;
             let db = Connection::open(&db_path)?;
             let id = backup["session_id"].as_str().unwrap_or("").to_string();
@@ -236,9 +280,22 @@ impl HistoryRetention {
             } else {
                 None
             };
-            if current_token.as_deref() != Some(&token) {
+            let completed_token = if current_token.is_none() && has_table(&db, RESTORED_TABLE)? {
+                db.query_row(
+                    &format!("SELECT backup_token FROM {RESTORED_TABLE} WHERE thread_id=?1"),
+                    [&id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            } else {
+                None
+            };
+            if current_token.as_deref() != Some(&token)
+                && completed_token.as_deref() != Some(&token)
+            {
                 bail!("restore conflict: deletion state changed for {id}");
             }
+            let allowed_paths = allowed_backup_file_paths(tables);
             let mut archived = Vec::new();
             for (table, rows) in tables
                 .iter_mut()
@@ -256,8 +313,13 @@ impl HistoryRetention {
                         if table == "threads" && row["id"].as_str() == Some(&id) {
                             let current =
                                 select_dicts(&db, "SELECT * FROM threads WHERE id=?1", &[&id])?;
-                            if current[0].get("archived").and_then(Value::as_i64) != Some(1) {
-                                bail!("restore conflict: thread is no longer soft deleted");
+                            let mut original = row.clone();
+                            original["archived"] = current[0]["archived"].clone();
+                            if object.contains_key("archived_at") {
+                                original["archived_at"] = current[0]["archived_at"].clone();
+                            }
+                            if original != current[0] {
+                                bail!("restore conflict: thread changed since deletion");
                             }
                             archived.push(row.clone());
                         } else {
@@ -290,7 +352,6 @@ impl HistoryRetention {
                 *rows = retained;
             }
             tables.insert("__restore_archived".into(), Value::Array(archived));
-            let mut files = BTreeMap::new();
             for key in ["__files", "__history_files"] {
                 for file in tables
                     .get(key)
@@ -301,31 +362,54 @@ impl HistoryRetention {
                     let path = file["path"]
                         .as_str()
                         .ok_or_else(|| anyhow::anyhow!("invalid history backup path"))?;
+                    if key == "__files" && !allowed_paths.contains(path) {
+                        bail!("unexpected backup file path: {path}");
+                    }
                     if key == "__history_files"
                         && !target_paths
                             .contains(&PathBuf::from(path.trim_start_matches("\\\\?\\")))
                     {
                         self.validate_history_path(Path::new(path))?;
                     }
-                    files.insert(path.to_string(), file.clone());
-                }
-            }
-            let mut missing = Vec::new();
-            for (path, file) in files {
-                let bytes = base64::Engine::decode(
-                    &base64::engine::general_purpose::STANDARD,
-                    file["content_b64"].as_str().unwrap_or(""),
-                )?;
-                match fs::read(&path) {
-                    Ok(current) if current.starts_with(&bytes) => {}
-                    Ok(_) => bail!("restore conflict: history file changed: {path}"),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        missing.push(file)
+                    let normalized = PathBuf::from(path.trim_start_matches("\\\\?\\"));
+                    let bytes = base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        file["content_b64"]
+                            .as_str()
+                            .ok_or_else(|| anyhow::anyhow!("invalid history backup content"))?,
+                    )?;
+                    if let Some((previous, _)) = all_files.get(&normalized) {
+                        if !previous.starts_with(&bytes) && !bytes.starts_with(previous) {
+                            bail!("restore conflict: incompatible history snapshots: {path}");
+                        }
+                        if previous.len() >= bytes.len() {
+                            continue;
+                        }
                     }
-                    Err(error) => return Err(error.into()),
+                    all_files.insert(normalized, (bytes, file.clone()));
                 }
             }
-            tables.insert("__files".into(), Value::Array(missing));
+            tables.insert("__files".into(), Value::Array(Vec::new()));
+        }
+        let shared_manifest = all_files
+            .values()
+            .map(|(_, file)| file.clone())
+            .collect::<Vec<_>>();
+        let mut missing = Vec::new();
+        for (path, (bytes, file)) in all_files {
+            match fs::read(&path) {
+                Ok(current) if current.starts_with(&bytes) => {}
+                Ok(_) => bail!("restore conflict: history file changed: {}", path.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing.push(file),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if let Some(backup) = backups
+            .iter_mut()
+            .find(|b| b["tables"].get("__history_files").is_some())
+        {
+            backup["tables"]["__files"] = Value::Array(missing);
+            backup["tables"]["__history_files"] = Value::Array(shared_manifest);
         }
         Ok(())
     }
@@ -364,14 +448,18 @@ impl HistoryRetention {
                 continue;
             }
             let db_path = backup_source_db(backup, &self.databases[0], &self.databases)?;
-            let db = Connection::open(db_path)?;
-            db.execute(
+            let mut db = Connection::open(db_path)?;
+            let tx = db.transaction()?;
+            tx.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {RESTORED_TABLE} (thread_id TEXT PRIMARY KEY, backup_token TEXT NOT NULL)"))?;
+            tx.execute(&format!("INSERT INTO {RESTORED_TABLE}(thread_id, backup_token) VALUES (?1,?2) ON CONFLICT(thread_id) DO UPDATE SET backup_token=excluded.backup_token"), [backup["session_id"].as_str().unwrap_or(""), backup["token"].as_str().unwrap_or("")])?;
+            tx.execute(
                 &format!("DELETE FROM {TABLE} WHERE thread_id=?1 AND backup_token=?2"),
                 [
                     backup["session_id"].as_str().unwrap_or(""),
                     backup["token"].as_str().unwrap_or(""),
                 ],
             )?;
+            tx.commit()?;
             crate::provider_sync::clear_thread_tombstones(
                 &self.home,
                 &HashSet::from([backup["session_id"].as_str().unwrap_or("").to_string()]),

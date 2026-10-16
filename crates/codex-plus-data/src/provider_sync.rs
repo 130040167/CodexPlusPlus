@@ -3729,8 +3729,7 @@ fn remove_thread_from_catalog_dbs(codex_home: &Path, thread_id: &str) -> anyhow:
 
 /// Append previously removed `session_index.jsonl` lines back (undo flow).
 /// Lines whose `id` already exists are skipped. Returns the number of
-/// appended lines. Best-effort: returns `Ok(0)` without writing when the
-/// file changed since it was read.
+/// appended lines. Concurrent changes return an error so undo can be retried.
 pub fn restore_session_index_entries(
     codex_home: &Path,
     lines: &[String],
@@ -3739,11 +3738,12 @@ pub fn restore_session_index_entries(
         return Ok(0);
     }
     let path = codex_home.join("session_index.jsonl");
-    let original_bytes = if path.exists() {
-        fs::read(&path)?
-    } else {
-        Vec::new()
+    let original = match fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
     };
+    let original_bytes = original.clone().unwrap_or_default();
     let original_text = String::from_utf8(original_bytes.clone())?;
     let mut existing_ids = HashSet::new();
     for segment in original_text.split_inclusive('\n') {
@@ -3775,8 +3775,13 @@ pub fn restore_session_index_entries(
     if appended == 0 {
         return Ok(0);
     }
-    if fs::read(&path)? != original_bytes {
-        return Ok(0);
+    let current = match fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if current != original {
+        anyhow::bail!("session index changed during restore; retry undo");
     }
     codex_plus_core::settings::atomic_write(&path, next_text.as_bytes())?;
     clear_thread_tombstones(codex_home, &restored_ids);

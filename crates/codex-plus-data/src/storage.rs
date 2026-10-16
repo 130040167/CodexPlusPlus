@@ -1270,8 +1270,6 @@ fn restore_backups(
         let Some(tables) = backup["tables"].as_object() else {
             continue;
         };
-        let source_db = backup_source_db(backup, fallback_db_path, allowed_db_paths)?;
-        let mut db = Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         if let Some(files) = tables.get("__files").and_then(Value::as_array) {
             for file in files {
                 let Some(path) = file.get("path").and_then(Value::as_str) else {
@@ -1302,6 +1300,14 @@ fn restore_backups(
                 }
             }
         }
+    }
+    // 整组文件持久化后才激活任何数据库中的会话。
+    for backup in backups {
+        let Some(tables) = backup["tables"].as_object() else {
+            continue;
+        };
+        let source_db = backup_source_db(backup, fallback_db_path, allowed_db_paths)?;
+        let mut db = Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         let tx = db.transaction()?;
         restore_rows(&tx, tables)?;
         tx.commit()?;
@@ -1313,7 +1319,7 @@ fn restore_backups(
                 .collect::<Vec<_>>();
             if !lines.is_empty() {
                 if let Some(home) = codex_home {
-                    let _ = crate::provider_sync::restore_session_index_entries(home, &lines);
+                    crate::provider_sync::restore_session_index_entries(home, &lines)?;
                 }
             }
         }

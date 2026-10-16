@@ -344,3 +344,144 @@ fn malformed_history_base_and_missing_ancestor_stop_deletion() {
         assert!(f.path("a").exists());
     }
 }
+
+fn duplicate_db(f: &Fixture) -> PathBuf {
+    let other = f.home().join("sqlite/codex-dev.db");
+    fs::create_dir_all(other.parent().unwrap()).unwrap();
+    let db = Connection::open(&f.db).unwrap();
+    db.execute("ATTACH DATABASE ?1 AS other", [other.to_str().unwrap()])
+        .unwrap();
+    db.execute_batch("CREATE TABLE other.threads AS SELECT * FROM threads; DETACH DATABASE other;")
+        .unwrap();
+    other
+}
+
+#[test]
+fn partial_database_delete_keeps_live_duplicate_and_its_history() {
+    let f = Fixture::new();
+    f.add("a", None);
+    let other = duplicate_db(&f);
+    Connection::open(&other).unwrap().execute_batch("CREATE TRIGGER reject_delete BEFORE UPDATE ON threads BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+    let r = delete_local_from_paths(
+        [f.db.clone(), other.clone()],
+        BackupStore::new(f.home().join("backups")),
+        &SessionRef::new("local:a", "a").unwrap(),
+        Some(f.home()),
+    );
+    assert_eq!(r.status, DeleteStatus::LocalDeleted, "{}", r.message);
+    assert!(
+        f.path("a").exists(),
+        "undeleted duplicate still owns rollout"
+    );
+    Connection::open(&other)
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_delete")
+        .unwrap();
+    let r = delete_local_from_paths(
+        [f.db.clone(), other],
+        BackupStore::new(f.home().join("backups")),
+        &SessionRef::new("local:a", "a").unwrap(),
+        Some(f.home()),
+    );
+    assert_eq!(r.status, DeleteStatus::LocalDeleted, "{}", r.message);
+    assert!(!f.path("a").exists());
+}
+
+#[test]
+fn grouped_snapshots_choose_longest_and_reject_divergence_before_restore() {
+    use base64::Engine;
+    for divergent in [false, true] {
+        let f = Fixture::new();
+        f.add("a", None);
+        let original = fs::read(f.path("a")).unwrap();
+        let other = duplicate_db(&f);
+        let store = BackupStore::new(f.home().join("backups"));
+        let r = delete_local_from_paths(
+            [f.db.clone(), other.clone()],
+            store.clone(),
+            &SessionRef::new("local:a", "a").unwrap(),
+            Some(f.home()),
+        );
+        let token = r.undo_token.unwrap();
+        let tokens: Vec<String> = serde_json::from_str(&token).unwrap();
+        let mut second = store.read_backup(&tokens[1]).unwrap();
+        let mut longer = original.clone();
+        if divergent {
+            longer[0] = b'!';
+        } else {
+            longer.extend_from_slice(b"{\"type\":\"event_msg\"}\n");
+        }
+        for key in ["__files", "__history_files"] {
+            for file in second["tables"][key].as_array_mut().unwrap() {
+                file["content_b64"] =
+                    json!(base64::engine::general_purpose::STANDARD.encode(&longer));
+            }
+        }
+        fs::write(
+            store.path_for(&tokens[1]),
+            serde_json::to_vec(&second).unwrap(),
+        )
+        .unwrap();
+        let result = f
+            .adapter()
+            .with_allowed_db_paths([f.db.clone(), other])
+            .undo(&token);
+        if divergent {
+            assert_eq!(result.status, DeleteStatus::Failed);
+            assert!(!f.path("a").exists());
+            assert!(!f.visible("a"));
+        } else {
+            assert_eq!(result.status, DeleteStatus::Undone, "{}", result.message);
+            assert_eq!(fs::read(f.path("a")).unwrap(), longer);
+        }
+    }
+}
+
+#[test]
+fn failed_index_restore_keeps_marker_and_can_retry_after_rows_restored() {
+    let f = Fixture::new();
+    f.add("a", None);
+    f.add("b", Some("a"));
+    let index = f.home().join("session_index.jsonl");
+    fs::write(&index, "{\"id\":\"a\"}\n").unwrap();
+    let token = f.delete("a");
+    let store = BackupStore::new(f.home().join("backups"));
+    let mut backup = store.read_backup(&token).unwrap();
+    backup["tables"]["__session_index"] = json!(["{\"id\":\"a\"}"]);
+    fs::write(store.path_for(&token), serde_json::to_vec(&backup).unwrap()).unwrap();
+    fs::write(&index, [0xff]).unwrap();
+    let r = f.adapter().undo(&token);
+    assert_eq!(r.status, DeleteStatus::Failed, "{}", r.message);
+    assert!(!f.visible("a"));
+    fs::rename(&index, index.with_extension("invalid-backup")).unwrap();
+    f.undo(&token);
+    assert!(f.visible("a"));
+    assert!(fs::read_to_string(index).unwrap().contains("a"));
+}
+
+#[test]
+fn grouped_finish_failure_can_retry_completed_databases_without_accepting_stale_delete() {
+    let f = Fixture::new();
+    f.add("a", None);
+    let other = duplicate_db(&f);
+    let r = delete_local_from_paths(
+        [f.db.clone(), other.clone()],
+        BackupStore::new(f.home().join("backups")),
+        &SessionRef::new("local:a", "a").unwrap(),
+        Some(f.home()),
+    );
+    let token = r.undo_token.unwrap();
+    Connection::open(&other).unwrap().execute_batch("CREATE TRIGGER reject_finish BEFORE DELETE ON codex_plus_deleted_threads BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+    let adapter = f
+        .adapter()
+        .with_allowed_db_paths([f.db.clone(), other.clone()]);
+    assert_eq!(adapter.undo(&token).status, DeleteStatus::Failed);
+    Connection::open(&other)
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_finish")
+        .unwrap();
+    let r = adapter.undo(&token);
+    assert_eq!(r.status, DeleteStatus::Undone, "{}", r.message);
+    f.delete("a");
+    assert_eq!(adapter.undo(&token).status, DeleteStatus::Failed);
+}
