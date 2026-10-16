@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 // Run from the repository root: node scripts/test-skills-repository-browser.mjs <release-executable>
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdir, writeFile, readFile, readdir, lstat, unlink, rmdir, copyFile } from "node:fs/promises";
+import { mkdir, writeFile, readFile, readdir, lstat, unlink, rmdir, copyFile, chmod, symlink } from "node:fs/promises";
 import path from "node:path";
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -330,6 +330,38 @@ try {
   assert.equal((await invoke("restore_skill_backup", { backupId:backup.id })).status, "ok");
   assert.equal(await readFile(path.join(local,"SKILL.md"),"utf8"), "user original content");
   report.checks.localUninstallRestoresOriginal = true;
+  await writeFile(path.join(local,"SKILL.md"), "local disable edits");
+  assert.equal((await invoke("set_skill_enabled", {id:"local-uninstall-regression",enabled:false})).status,"ok");
+  assert.equal(await readFile(path.join(state,"skills","local-uninstall-regression","SKILL.md"),"utf8"),"local disable edits");
+  assert.equal((await invoke("set_skill_enabled", {id:"local-uninstall-regression",enabled:true})).status,"ok");
+  assert.equal(await readFile(path.join(local,"SKILL.md"),"utf8"),"local disable edits");
+  report.checks.disableReenablePreservesLocalEdits = true;
+  const stateFile = path.join(state,"skills.json");
+  const rollbackLocal = path.join(home,"skills","local-disable-rollback");
+  await mkdir(rollbackLocal);
+  await writeFile(path.join(rollbackLocal,"SKILL.md"), "original unmanaged content");
+  const beforeFailure = await readFile(stateFile,"utf8");
+  try {
+    await chmod(stateFile, 0o444);
+    assert.equal((await invoke("set_skill_enabled", {id:"local-disable-rollback",enabled:false})).status,"failed");
+    assert.equal(await readFile(path.join(rollbackLocal,"SKILL.md"),"utf8"),"original unmanaged content");
+    assert.ok((await invoke("list_installed_skills")).skills.some(s=>s.id==="local-disable-rollback" && s.installed && s.enabled));
+    assert.equal((await invoke("uninstall_skill", {id:"local-uninstall-regression"})).status,"failed");
+    assert.equal(await readFile(path.join(local,"SKILL.md"),"utf8"),"local disable edits");
+    assert.equal(await readFile(stateFile,"utf8"),beforeFailure);
+  } finally { await chmod(stateFile, 0o666); }
+  report.checks.stateWriteFailuresRestoreDirectories = true;
+  const externalSkill = path.join(state,"external-skill");
+  await mkdir(externalSkill);
+  await writeFile(path.join(externalSkill,"SKILL.md"),"external skill content");
+  const externalLink = path.join(home,"skills","external-link");
+  await symlink(externalSkill,externalLink,"junction");
+  assert.equal((await invoke("set_skill_enabled",{id:"external-link",enabled:false})).status,"ok");
+  assert.ok((await invoke("list_installed_skills")).skills.some(s=>s.id==="external-link" && s.installed && !s.enabled));
+  assert.equal((await invoke("set_skill_enabled",{id:"external-link",enabled:true})).status,"ok");
+  assert.equal(await readFile(path.join(externalLink,"SKILL.md"),"utf8"),"external skill content");
+  assert.equal(await readFile(path.join(externalSkill,"SKILL.md"),"utf8"),"external skill content");
+  report.checks.externalLinkDisableReenable = true;
   const savedState = JSON.parse(await readFile(path.join(state,"skills.json"),"utf8"));
   const absent = { owner:"codex-skill-verification-nonexistent",name:"absent-repository-20261016",branch:"main",subdir:"",enabled:true };
   savedState.repos.push(absent);

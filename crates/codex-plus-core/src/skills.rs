@@ -476,8 +476,10 @@ impl SkillsManager {
         }
         // 旧安装软链不含独立内容，实体目录备份则必须保留。
         for (_, backup) in &displaced {
-            if std::fs::symlink_metadata(backup)?.file_type().is_symlink() {
-                remove_link(backup)?;
+            if std::fs::symlink_metadata(backup).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+                if let Err(error) = remove_link(backup) {
+                    eprintln!("清理已提交的 Skill 软链备份失败：{error:#}");
+                }
             }
         }
         Ok(state)
@@ -565,20 +567,18 @@ impl SkillsManager {
         let source = self.source_dir.join(id);
         let link = self.linked_dir().join(id);
         if !enabled {
-            if !source.is_dir() && link.is_dir() && !std::fs::symlink_metadata(&link)?.file_type().is_symlink() {
-                if let Some(parent) = source.parent() {
-                    std::fs::create_dir_all(parent)?;
+            let state = self.load_state();
+            let physical_copy = std::fs::symlink_metadata(&link)
+                .is_ok_and(|metadata| !metadata.file_type().is_symlink());
+            if link.is_dir() && (physical_copy || !source.is_dir() || !state.installed.contains_key(id)) {
+                // 复制回退后的安装位置可能已有用户修改；未纳管软链也需要保留可再启用的源。
+                let staging = self.staging_dir(id);
+                if let Err(error) = copy_dir_all(&link, &staging) {
+                    let _ = remove_link(&staging);
+                    return Err(error);
                 }
-                if std::fs::rename(&link, &source).is_err() {
-                    copy_dir_all(&link, &source)
-                        .map_err(|error| std::io::Error::other(error.to_string()))?;
-                    std::fs::remove_dir_all(&link)?;
-                }
-                let manifest = source.join(SKILL_MANIFEST_FILE);
-                let (name, description) = read_skill_manifest(&manifest, id);
-                let _guard = self.state_lock.lock().unwrap();
-                let mut state = self.load_state_unlocked();
-                state.installed.entry(id.to_string()).or_insert(InstalledSkill {
+                let (name, description) = read_skill_manifest(&link.join(SKILL_MANIFEST_FILE), id);
+                let installed = state.installed.get(id).cloned().unwrap_or(InstalledSkill {
                     id: id.to_string(),
                     name,
                     description,
@@ -587,10 +587,13 @@ impl SkillsManager {
                     content_hash: String::new(),
                     installed_at: current_unix_timestamp_string(),
                 });
-                self.save_state_unlocked(&state)?;
+                self.commit_staged_skill(&staging, installed, false)?;
                 return Ok(());
             }
             return remove_link(&link);
+        }
+        if link.join(SKILL_MANIFEST_FILE).is_file() {
+            return Ok(());
         }
         if !source.is_dir() {
             anyhow::bail!("skill 源目录不存在：{}", source.display());
@@ -605,23 +608,36 @@ impl SkillsManager {
     pub fn uninstall(&self, id: &str) -> anyhow::Result<SkillsState> {
         validate_skill_id(id)?;
         let link = self.linked_dir().join(id);
-        // 实体安装目录可能是唯一副本，也可能包含复制回退后产生的用户修改。
-        // 必须在移除安装位置之前备份，软链则由源目录备份覆盖。
-        if let Ok(metadata) = std::fs::symlink_metadata(&link) {
-            if metadata.is_dir() && !metadata.file_type().is_symlink() {
-                self.backup_directory(id, &link)?;
-            }
-        }
         let source = self.source_dir.join(id);
-        if source.is_dir() {
-            self.backup_directory(id, &source)?;
-        }
-        remove_link(&link)?;
-
         let _guard = self.state_lock.lock().unwrap();
         let mut state = self.load_state_unlocked();
         state.installed.remove(id);
-        self.save_state_unlocked(&state)?;
+        let mut displaced = Vec::new();
+        let result = (|| -> anyhow::Result<()> {
+            for original in [&link, &source] {
+                if std::fs::symlink_metadata(original).is_ok() {
+                    let backup = self.backup_directory(id, original)?;
+                    displaced.push((original.clone(), backup));
+                }
+            }
+            self.save_state_unlocked(&state)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            for (original, backup) in displaced.iter().rev() {
+                if let Err(rollback_error) = std::fs::rename(backup, original) {
+                    return Err(error.context(format!("卸载回滚失败，原内容保留在备份目录：{rollback_error}")));
+                }
+            }
+            return Err(error);
+        }
+        for (_, backup) in &displaced {
+            if std::fs::symlink_metadata(backup).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+                if let Err(error) = remove_link(backup) {
+                    eprintln!("清理已卸载的 Skill 软链备份失败：{error:#}");
+                }
+            }
+        }
         Ok(state)
     }
 
