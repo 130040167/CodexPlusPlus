@@ -158,7 +158,7 @@ try {
   await until("document.querySelector('.mg-repo-sidebar .mg-repo-select')?.textContent.includes('44 Skills')", "stale real inspection completed", 180000);
   assert.equal(await evaluate("document.querySelector('.mg-repo-detail-head h3').textContent"), "Yuan1z0825/nature-skills");
   report.checks.staleInspectionPreservesSelection = true;
-  await click("关闭", "document.querySelector('.mg-drawer')");
+  await evaluate("document.querySelector('.mg-drawer>header button[aria-label=\"关闭窗口\"]').click()");
   assert.equal(await evaluate("!!document.querySelector('.mg-repo-workspace')"), false);
   report.checks.closeDuringFirstLoad = true;
   await evaluate("window.__skillsTest.hold=false;window.__skillsTest.refresh.splice(0).forEach(run=>run());window.__skillsTest.inspections.splice(0).forEach(run=>run());void 0");
@@ -183,6 +183,8 @@ try {
   assert.ok(Math.abs(geometry.height - geometry.viewportHeight) < 2);
   assert.ok(geometry.rowHeight <= 66);
   report.checks.wideGeometry = geometry;
+  assert.ok(await evaluate("!document.querySelector('.mg-drawer>footer') && Math.abs(document.querySelector('.mg-repo-workspace').getBoundingClientRect().bottom-innerHeight)<2"));
+  report.checks.noRedundantFooter = true;
   await evaluate("document.querySelector('.mg-drawer-backdrop').dispatchEvent(new MouseEvent('mousedown',{bubbles:true}))");
   assert.equal(await evaluate("!!document.querySelector('.mg-repo-workspace')"), true);
   report.checks.backdropPreservesDrawer = true;
