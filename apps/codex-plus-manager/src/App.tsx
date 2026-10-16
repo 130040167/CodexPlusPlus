@@ -8249,6 +8249,11 @@ function SortableRelayProfileCard({
             disabled={form.relayProfiles.length <= 1}
             onClick={(event) => {
               event.stopPropagation();
+              const deleteIssue = relayProfileDeleteIssue(form, profile.id);
+              if (deleteIssue) {
+                void actions.showMessage(t("删除供应商"), deleteIssue, "failed");
+                return;
+              }
               onFormChange(removeRelayProfile(form, profile.id));
             }}
             size="icon"
@@ -14658,6 +14663,7 @@ function reorderRelayProfiles(settings: BackendSettings, sourceId: string, targe
 }
 
 function removeRelayProfile(settings: BackendSettings, id: string): BackendSettings {
+  if (relayProfileDeleteIssue(settings, id)) return settings;
   const profiles = settings.relayProfiles.filter((profile) => profile.id !== id);
   const scrubbedProfiles = profiles.map((profile) =>
     isAggregateRelayProfile(profile)
@@ -14686,6 +14692,30 @@ function removeRelayProfile(settings: BackendSettings, id: string): BackendSetti
     relayProfiles: scrubbedProfiles.length ? scrubbedProfiles : defaultSettings.relayProfiles,
     activeRelayId: settings.activeRelayId === id ? scrubbedProfiles[0]?.id || "default" : settings.activeRelayId,
   });
+}
+
+function relayProfileDeleteIssue(settings: BackendSettings, id: string): string | null {
+  if (settings.activeRelayId === id) {
+    return t("当前正在使用该供应商，请先切换到其他供应商后再删除。");
+  }
+  const existingProfileIds = new Set(settings.relayProfiles.map((profile) => profile.id));
+  for (const aggregateProfile of settings.relayProfiles.filter(isAggregateRelayProfile)) {
+    const aggregate = normalizeAggregateConfig(aggregateProfile.aggregate, [], existingProfileIds);
+    if (!aggregate.members.some((member) => member.profileId === id)) continue;
+    if (aggregate.defaultRelayId === id) {
+      return tf("供应商「{0}」是聚合配置「{1}」的默认成员，请先调整聚合配置后再删除。", [
+        settings.relayProfiles.find((profile) => profile.id === id)?.name || id,
+        aggregateProfile.name || aggregateProfile.id,
+      ]);
+    }
+    if (aggregate.members.length <= 1) {
+      return tf("供应商「{0}」是聚合配置「{1}」的最后成员，请先调整聚合配置后再删除。", [
+        settings.relayProfiles.find((profile) => profile.id === id)?.name || id,
+        aggregateProfile.name || aggregateProfile.id,
+      ]);
+    }
+  }
+  return null;
 }
 
 const aggregateStrategyOptions: Array<{ value: RelayAggregateStrategy; label: string; description: string }> = [
