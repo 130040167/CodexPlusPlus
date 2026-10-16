@@ -36,6 +36,12 @@
   const codexPlusModelDefaultSnapshots = window.__codexPlusModelDefaultSnapshots
     || (window.__codexPlusModelDefaultSnapshots = new WeakMap());
   const codexPlusModelQueryRefreshEpochs = new WeakMap();
+  // 看门狗可能重注入；复用进行中的读取与退避链，回调始终使用最新目录闭包。
+  const codexPlusNativeConfigRefreshRuntime = window.__codexPlusNativeConfigRefreshRuntime
+    || (window.__codexPlusNativeConfigRefreshRuntime = { states: new WeakMap() });
+  const codexPlusNativeConfigRefreshStates = codexPlusNativeConfigRefreshRuntime.states;
+  codexPlusNativeConfigRefreshRuntime.signature = codexPlusNativeConfigCatalogSignature;
+  codexPlusNativeConfigRefreshRuntime.refresh = refreshCodexNativeLocalUserConfig;
 
   if (window.__CODEX_PLUS_TEST_SERVICE_TIER__) {
     window.__codexPlusServiceTierTest = {
@@ -702,6 +708,79 @@
     return config;
   }
 
+  function codexPlusNativeConfigCatalogSignature() {
+    if (codexModelCatalog.status !== "ok") return "";
+    // epoch 会随轮询增长；只对目录/配置版本变化重新读原生配置。
+    return JSON.stringify([
+      codexModelCatalogRevision, codexModelCatalog.model_provider,
+      codexModelCatalog.codex_model_provider, codexModelCatalog.model,
+      codexModelCatalog.default_model, codexModelCatalog.models,
+      codexModelCatalog.modelMetadata || codexModelCatalog.model_metadata,
+      (codexModelCatalog.sources || []).map((source) => [source.id, source.type]),
+    ]);
+  }
+
+  function refreshCodexNativeLocalUserConfig(client) {
+    if (!codexPlusModelUnlockEnabled() && !codexAggregateAllowedModelSet("local")) return false;
+    const signature = codexPlusNativeConfigCatalogSignature();
+    if (!signature) return false;
+    // 原生模型 observer 依赖这个禁用自动读取的查询来决定目录和白名单。
+    // invalidateQueries 不会重新读取 disabled observer，必须复用其原生 queryFn。
+    const queries = client.getQueryCache?.()?.getAll?.() || [];
+    let requested = false;
+    for (const query of queries) {
+      const key = query?.queryKey;
+      if (!Array.isArray(key) || key.length !== 3 || key[0] !== "config"
+        || key[1] !== "user" || key[2] !== "local"
+        || typeof query.fetch !== "function" || typeof query.options?.queryFn !== "function") continue;
+      let state = codexPlusNativeConfigRefreshStates.get(query);
+      if (!state) {
+        state = { completed: "", pending: null, changedWhilePending: false, failed: "", failures: 0, retryAfter: 0, retryTimer: 0 };
+        codexPlusNativeConfigRefreshStates.set(query, state);
+      }
+      if (state.pending) {
+        if (state.pending !== signature) state.changedWhilePending = true;
+        continue;
+      }
+      if (state.completed === signature || (state.failed === signature && Date.now() < state.retryAfter)) continue;
+      requested = true;
+      if (state.retryTimer) window.clearTimeout(state.retryTimer);
+      state.retryTimer = 0;
+      // 先登记 pending，防止 fetch 同步通知 React 后再次进入扫描。
+      state.completed = "";
+      state.changedWhilePending = false;
+      state.pending = signature;
+      Promise.resolve().then(() => query.fetch(undefined, { cancelRefetch: true }))
+        .then((data) => {
+          if (data?.readSucceeded !== true || !data.response?.config) throw new Error("native config read failed");
+          state.completed = signature;
+          state.failures = 0;
+          state.retryAfter = 0;
+          sendCodexPlusDiagnostic("model_native_config_refreshed", {});
+        })
+        .catch(() => {
+          state.failures = state.failed === signature ? state.failures + 1 : 1;
+          state.failed = signature;
+          const delay = Math.min(30000, 1000 * 2 ** Math.min(state.failures - 1, 5));
+          state.retryAfter = Date.now() + delay;
+          state.retryTimer = window.setTimeout(() => {
+            state.retryTimer = 0;
+            codexPlusNativeConfigRefreshRuntime.refresh(client);
+          }, delay);
+        })
+        .finally(() => {
+          state.pending = null;
+          // 连续切换期间的旧请求结束后，再读一次最新配置，不能把旧结果视作已更新。
+          if (state.changedWhilePending || signature !== codexPlusNativeConfigRefreshRuntime.signature()) {
+            state.completed = "";
+            state.retryAfter = 0;
+            codexPlusNativeConfigRefreshRuntime.refresh(client);
+          }
+        });
+    }
+    return requested;
+  }
+
   function codexPlusLocalModelQuery(query) {
     const key = query?.queryKey;
     return Array.isArray(key)
@@ -749,6 +828,7 @@
       : (window.__REACT_QUERY_CLIENT__ || window.__codexQueryClient);
     if (!client || typeof client.setQueryData !== "function") return false;
     installCodexPlusModelQueryPublication(client);
+    refreshCodexNativeLocalUserConfig(client);
     if (codexPlusModelQueryRefreshEpochs.get(client) === codexModelCatalogAppliedEpoch) return false;
     const cache = client.getQueryCache?.();
     const queries = (typeof cache?.findAll === "function"

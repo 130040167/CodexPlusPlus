@@ -35,6 +35,8 @@ async function catalogRuntime() {
     codexPlusModelPickerCatalogChanged: () => undefined,
     refreshCachedLocalModelQueries: () => { refreshes++; },
     captureCodexAggregateSelectedModels: () => undefined,
+    codexPlusNativeConfigCatalogSignature: () => "",
+    refreshCodexNativeLocalUserConfig: () => false,
   });
   const api = vm.runInContext(
     `(function () {${source.slice(start, end)}\nreturn { observeCodexModelCatalogRevision, load: loadCodexModelCatalog, state: () => ({ revision: codexModelCatalogRevision, models: [...codexModelCatalog.models], epoch: codexModelCatalogAppliedEpoch }) };})()`,
@@ -105,6 +107,7 @@ it("production settings heartbeat and save reload changed catalogs with Fast and
     renderCodexPlusMenu: () => {}, scheduleCodexModelWhitelistRefresh: () => {},
     sendCodexPlusDiagnostic: () => {}, codexPlusModelPickerCatalogChanged: () => {},
     refreshCachedLocalModelQueries: () => {}, captureCodexAggregateSelectedModels: () => {},
+    codexPlusNativeConfigCatalogSignature: () => "", refreshCodexNativeLocalUserConfig: () => false,
     codexPlusSettings: () => ({ modelWhitelistUnlock: false, fastMode: false }),
     runScanStep: () => {}, syncOfficialUsagePolicy: () => {}, syncCodexPlusTypingEffects: () => {},
     installCodexPlusDictation: () => {}, refreshConversationView: () => {},
@@ -164,6 +167,7 @@ it("a heartbeat started during save cannot roll settings and catalog revision ba
     renderCodexPlusMenu: () => {}, scheduleCodexModelWhitelistRefresh: () => {},
     sendCodexPlusDiagnostic: () => {}, codexPlusModelPickerCatalogChanged: () => {},
     refreshCachedLocalModelQueries: () => {}, captureCodexAggregateSelectedModels: () => {},
+    codexPlusNativeConfigCatalogSignature: () => "", refreshCodexNativeLocalUserConfig: () => false,
     codexPlusSettings: () => ({ modelWhitelistUnlock: false, fastMode: false }),
     runScanStep: () => {}, syncOfficialUsagePolicy: () => {}, syncCodexPlusTypingEffects: () => {},
     installCodexPlusDictation: () => {}, refreshConversationView: () => {},
@@ -244,6 +248,7 @@ it("catalog refresh publishes local model query data, invalidates it once, and p
     "codexModelCatalogAppliedEpoch",
     "sendCodexPlusDiagnostic",
     "codexPlusModelUnlockEnabled",
+    "refreshCodexNativeLocalUserConfig",
     `const sameModelCollection = (a, b) => !!b && a.length === b.length && a.every((item, i) => item === b[i]);
     ${source.slice(start, end)}\nreturn { refreshCachedLocalModelQueries, setEpoch: (value) => { codexModelCatalogAppliedEpoch = value; } };`,
   ) as (...args: unknown[]) => {
@@ -267,6 +272,7 @@ it("catalog refresh publishes local model query data, invalidates it once, and p
     1,
     () => undefined,
     () => true,
+    () => false,
   );
 
   assert.equal(api.refreshCachedLocalModelQueries(), true);
@@ -326,6 +332,7 @@ async function aggregateQueryRuntime(structuralSharing = false) {
     "transferCodexPlusModelCollectionSnapshot",
     "patchCachedLocalModelQueryData", "codexPlusModelQueryCollection",
     "refreshCachedLocalModelQueries", "installCodexPlusModelQueryPublication",
+    "codexPlusNativeConfigCatalogSignature", "refreshCodexNativeLocalUserConfig",
     "runCodexModelWhitelistRefreshPass",
   ];
   const functions = names.map((name) => {
@@ -370,11 +377,13 @@ async function aggregateQueryRuntime(structuralSharing = false) {
   const nodes: object[] = [];
   const runtime = new Function("client", "document", `
     const window = {};
-    let codexModelCatalog = {}, codexModelCatalogAppliedEpoch = 0;
+    let codexModelCatalog = {}, codexModelCatalogAppliedEpoch = 0, codexModelCatalogRevision = "";
     let codexPlusBackendSettingsLoaded = true, unlocked = false;
     let profile = { id: "agg", relayMode: "aggregate" };
     const codexPlusModelCollectionSnapshots = new WeakMap();
     const codexPlusModelQueryRefreshEpochs = new WeakMap();
+    const codexPlusNativeConfigRefreshStates = new WeakMap();
+    const codexPlusNativeConfigRefreshRuntime = {};
     const codexPlusSettings = () => ({ modelWhitelistUnlock: unlocked });
     const codexRemoteSessionActiveProfile = () => profile;
     const codexServiceTierModelFromValue = value => String(value || "");
