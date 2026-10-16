@@ -585,29 +585,40 @@ impl SkillsManager {
     /// 卸载：删软链，源目录整体移进备份目录。不做自动轮转删除。
     pub fn uninstall(&self, id: &str) -> anyhow::Result<SkillsState> {
         validate_skill_id(id)?;
-        remove_link(&self.linked_dir().join(id))?;
-
+        let link = self.linked_dir().join(id);
+        // 实体安装目录可能是唯一副本，也可能包含复制回退后产生的用户修改。
+        // 必须在移除安装位置之前备份，软链则由源目录备份覆盖。
+        if let Ok(metadata) = std::fs::symlink_metadata(&link) {
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                self.backup_directory(id, &link)?;
+            }
+        }
         let source = self.source_dir.join(id);
         if source.is_dir() {
-            std::fs::create_dir_all(&self.backups_dir)
-                .with_context(|| format!("创建备份目录失败：{}", self.backups_dir.display()))?;
-            let backup = self
-                .backups_dir
-                .join(format!("{id}-{}", current_unix_timestamp_string()));
-            std::fs::rename(&source, &backup).with_context(|| {
-                format!(
-                    "备份 skill 到 {} 失败（源 {}）",
-                    backup.display(),
-                    source.display()
-                )
-            })?;
+            self.backup_directory(id, &source)?;
         }
+        remove_link(&link)?;
 
         let _guard = self.state_lock.lock().unwrap();
         let mut state = self.load_state_unlocked();
         state.installed.remove(id);
         self.save_state_unlocked(&state)?;
         Ok(state)
+    }
+
+    fn backup_directory(&self, id: &str, source: &Path) -> anyhow::Result<PathBuf> {
+        std::fs::create_dir_all(&self.backups_dir)?;
+        let mut timestamp = current_unix_timestamp_string().parse::<u128>()?;
+        let backup = loop {
+            let candidate = self.backups_dir.join(format!("{id}-{timestamp}"));
+            if std::fs::symlink_metadata(&candidate).is_err() {
+                break candidate;
+            }
+            timestamp += 1;
+        };
+        std::fs::rename(source, &backup)
+            .with_context(|| format!("备份 {} 到 {} 失败", source.display(), backup.display()))?;
+        Ok(backup)
     }
 
     pub fn list_backups(&self) -> Vec<SkillBackup> {
@@ -1833,6 +1844,48 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_local_only_skill_preserves_and_restores_original_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let local = manager.linked_dir().join("custom");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("SKILL.md"), "user original").unwrap();
+        assert!(manager.local_inventory().iter().any(|skill| skill.id == "custom" && skill.installed));
+        manager.uninstall("custom").unwrap();
+        let backups = manager.list_backups();
+        assert_eq!(backups.len(), 1);
+        assert!(!local.exists());
+        manager.restore_backup(&backups[0].id).unwrap();
+        assert_eq!(std::fs::read_to_string(local.join("SKILL.md")).unwrap(), "user original");
+    }
+
+    #[test]
+    fn uninstall_preserves_distinct_source_and_local_copies() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        for (directory, content) in [(manager.source_dir.join("custom"), "source"), (manager.linked_dir().join("custom"), "edited local")] {
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("SKILL.md"), content).unwrap();
+        }
+        manager.uninstall("custom").unwrap();
+        let contents: std::collections::BTreeSet<_> = manager.list_backups().iter()
+            .map(|backup| std::fs::read_to_string(manager.backups_dir.join(&backup.id).join("SKILL.md")).unwrap()).collect();
+        assert_eq!(contents, ["source".to_string(), "edited local".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn uninstall_backup_failure_leaves_local_content_intact() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let local = manager.linked_dir().join("custom");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("SKILL.md"), "original").unwrap();
+        std::fs::write(&manager.backups_dir, "blocked").unwrap();
+        assert!(manager.uninstall("custom").is_err());
+        assert_eq!(std::fs::read_to_string(local.join("SKILL.md")).unwrap(), "original");
+    }
+
+    #[test]
     fn uninstall_backs_up_the_source_and_can_restore_it() {
         let temp = tempfile::tempdir().unwrap();
         let manager = manager(&temp);
@@ -1844,13 +1897,16 @@ mod tests {
             .install_from_zip(&sample_skill("alpha", "alpha", "hash-1"), &zip)
             .unwrap();
 
+        let physical_copy = !std::fs::symlink_metadata(manager.linked_dir().join("alpha"))
+            .unwrap().file_type().is_symlink();
+
         let state = manager.uninstall("alpha").unwrap();
         assert!(!state.installed.contains_key("alpha"));
         assert!(!manager.source_dir().join("alpha").exists());
         assert!(!manager.linked_dir().join("alpha").exists());
 
         let backups = manager.list_backups();
-        assert_eq!(backups.len(), 1);
+        assert_eq!(backups.len(), if physical_copy { 2 } else { 1 });
         assert_eq!(backups[0].skill_id, "alpha");
 
         let restored = manager.restore_backup(&backups[0].id).unwrap();
@@ -1862,7 +1918,7 @@ mod tests {
                 .join("SKILL.md")
                 .is_file()
         );
-        assert!(manager.list_backups().is_empty());
+        assert_eq!(manager.list_backups().len(), usize::from(physical_copy));
     }
 
     #[test]
