@@ -483,6 +483,38 @@ fn comparable_history_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+#[cfg(all(test, windows))]
+mod windows_path_tests {
+    use super::*;
+
+    #[test]
+    fn extended_paths_compare_with_regular_paths_without_losing_unc_server() {
+        for (extended, regular) in [
+            (
+                r"\\?\C:\codex\sessions\history.jsonl",
+                r"C:\codex\sessions\history.jsonl",
+            ),
+            (
+                r"\\?\UNC\server\share\codex\sessions",
+                r"\\server\share\codex\sessions",
+            ),
+        ] {
+            assert_eq!(
+                comparable_history_path(Path::new(extended)),
+                PathBuf::from(regular)
+            );
+            assert_eq!(
+                comparable_history_path(Path::new(regular)),
+                PathBuf::from(regular)
+            );
+        }
+        assert!(
+            !comparable_history_path(Path::new(r"\\?\UNC\other\share\sessions"))
+                .starts_with(comparable_history_path(Path::new(r"\\?\UNC\server\share")))
+        );
+    }
+}
+
 fn has_native_history(graph: &HistoryGraph) -> bool {
     graph
         .files
