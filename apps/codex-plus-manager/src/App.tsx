@@ -316,6 +316,7 @@ type BackendSettings = WhaleBalanceSettings & {
   providerSyncManualProviders: string[];
   providerSyncLastSelectedProvider: string;
   relayProfilesEnabled: boolean;
+  localConfigProviderImported: boolean;
   enhancementsEnabled: boolean;
   codexAppStandaloneQuotaUnlock: boolean;
   codexAppPluginMarketplaceUnlock: boolean;
@@ -1126,6 +1127,7 @@ const defaultSettings: BackendSettings = {
   providerSyncManualProviders: [],
   providerSyncLastSelectedProvider: "",
   relayProfilesEnabled: true,
+  localConfigProviderImported: false,
   enhancementsEnabled: true,
   codexAppStandaloneQuotaUnlock: false,
   codexAppPluginMarketplaceUnlock: true,
@@ -14456,7 +14458,7 @@ function relaySettingsWithDraft(
 }
 
 function relayProfileUsesLiveFiles(profile: RelayProfile): boolean {
-  return profile.relayMode !== "official" || profile.officialMixApiKey;
+  return profile.relayMode !== "official" || profile.officialMixApiKey || !!profile.configContents.trim();
 }
 
 function authJsonHasOpenAiApiKey(contents: string): boolean {
