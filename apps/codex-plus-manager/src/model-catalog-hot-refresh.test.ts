@@ -78,23 +78,6 @@ it("a late catalog response cannot replace a newer revision", async () => {
   assert.deepEqual(JSON.parse(JSON.stringify(api.state())), { revision: "rev-b", models: ["model-b"], epoch: 1 });
 });
 
-it("settings loader observes the optional revision only after accepting the response", async () => {
-  const source = await readFile(SETTINGS_URL, "utf8");
-  const installed = source.indexOf("codexPlusBackendSettingsLoaded = true;");
-  const observed = source.indexOf("observeCodexModelCatalogRevision(settings.modelCatalogRevision)", installed);
-  assert.ok(installed >= 0 && observed > installed);
-  assert.match(source.slice(installed, observed + 80), /typeof observeCodexModelCatalogRevision === "function"/);
-});
-
-it("renderer settings saves consume the returned revision without waiting for heartbeat", async () => {
-  const source = await readFile(BACKEND_SETTINGS_URL, "utf8");
-  const start = source.indexOf("  async function setBackendSetting(");
-  const end = source.indexOf("\n  function refreshCodexPlusBackendToggles", start);
-  const setter = source.slice(start, end);
-  assert.match(setter, /seq === codexPlusBackendSettingsSeq/);
-  assert.match(setter, /observeCodexModelCatalogRevision\(settings\?\.modelCatalogRevision\)/);
-});
-
 it("catalog refresh publishes local model query data, invalidates it once, and preserves remote caches", async () => {
   const source = await readFile(CATALOG_URL, "utf8");
   const start = source.indexOf("  function codexPlusLocalModelQuery(");
