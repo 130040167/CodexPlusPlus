@@ -5210,6 +5210,149 @@ async fn aggregate_default_provider_forwards_unbound_model() {
     other_server.abort();
 }
 
+#[tokio::test]
+async fn aggregate_live_settings_updates_preserve_selected_model_and_failover() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let settings_path = temp.path().join("settings.json");
+    let _guard = SettingsPathGuard::set(settings_path.clone());
+    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let mut servers = Vec::new();
+    let mut urls = Vec::new();
+    let failing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hold_next = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    for name in ["a", "b", "c"] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        urls.push(format!("http://{}/v1", listener.local_addr().unwrap()));
+        let events = events.clone();
+        let failing = failing.clone();
+        let hold_next = hold_next.clone();
+        let release = release.clone();
+        servers.push(tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+                let body: Value = serde_json::from_str(body).unwrap();
+                let authorization = headers.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("authorization").then(|| value.trim().to_string())
+                });
+                events.send((name, body["model"].as_str().unwrap().to_string(), authorization)).unwrap();
+                if name == "b" && hold_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    release.notified().await;
+                }
+                let response = if name == "c" && failing.load(std::sync::atomic::Ordering::SeqCst) {
+                    "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 2\r\nconnection: close\r\ncontent-type: application/json\r\n\r\n{}"
+                } else {
+                    "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\ncontent-type: application/json\r\n\r\n{}"
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        }));
+    }
+    let mut settings = aggregate_proxy_settings("live-settings", urls[0].clone(), urls[1].clone());
+    for (index, relay) in settings.relay_profiles.iter_mut().take(2).enumerate() {
+        relay.relay_mode = RelayMode::MixedApi;
+        relay.model = format!("model-{index}");
+        relay.model_list = relay.model.clone();
+    }
+    settings.aggregate_relay_profiles[0].strategy = AggregateRelayStrategy::Failover;
+    settings.aggregate_relay_profiles[0].model_aggregation_enabled = true;
+    let first_id = settings.relay_profiles[0].id.clone();
+    let second_id = settings.relay_profiles[1].id.clone();
+    settings.aggregate_relay_profiles[0].default_relay_id = first_id.clone();
+
+    // 每次均走实际文件读取入口，保持同一代理运行时、同一会话标识。
+    fn persist(path: &Path, settings: &BackendSettings) {
+        let mut stored = settings.clone();
+        for relay in stored.relay_profiles.iter_mut().take(2) {
+            // model / URL / Key 扁平字段不参与序列化；使用真实存储快照格式。
+            relay.config_contents = format!(
+                "model = {:?}\nmodel_provider = \"custom\"\n[model_providers.custom]\nname = \"mock\"\nbase_url = {:?}\nwire_api = \"responses\"\n",
+                relay.model, relay.base_url,
+            );
+            relay.auth_contents = json!({"OPENAI_API_KEY": relay.api_key}).to_string();
+        }
+        std::fs::write(path, serde_json::to_vec(&stored).unwrap()).unwrap();
+    }
+    async fn request(path: &Path, settings: &BackendSettings, model: &str) -> u16 {
+        persist(path, settings);
+        let body = json!({"model": model, "input": "hi", "stream": false,
+            "conversation_id": "same-live-session"}).to_string();
+        let mut response = open_responses_proxy_request(&body, None).await.unwrap();
+        let status = response.status_code;
+        let body = response.read_body().await.unwrap();
+        if status != 200 {
+            eprintln!("mock request status {status}: {}", String::from_utf8_lossy(&body));
+        }
+        status
+    }
+    macro_rules! expect {
+        ($model:expr, $target:expr, $upstream_model:expr, $key:expr) => {{
+            assert_eq!(request(&settings_path, &settings, $model).await, 200);
+            let event = tokio::time::timeout(Duration::from_secs(2), received.recv())
+                .await.unwrap().unwrap();
+            assert_eq!(event, ($target, $upstream_model.to_string(), Some($key.to_string())));
+            assert!(received.try_recv().is_err(), "不能产生额外上游请求");
+        }};
+    }
+    let first_model = format!("cpx-{first_id}/model-0");
+    let second_model = format!("cpx-{second_id}/model-1");
+    expect!(&first_model, "a", "model-0", "Bearer sk-first");
+    // 只改成员 URL / Key，下次请求即采用新值。
+    settings.relay_profiles[0].base_url = urls[2].clone();
+    settings.relay_profiles[0].api_key = "synthetic-new-key".to_string();
+    expect!(&first_model, "c", "model-0", "Bearer synthetic-new-key");
+    // 重设默认成员不改派已经明确选择的成员模型。
+    settings.aggregate_relay_profiles[0].default_relay_id = second_id.clone();
+    expect!(&first_model, "c", "model-0", "Bearer synthetic-new-key");
+    expect!("model-1", "b", "model-1", "Bearer sk-second");
+    // 重设成员默认模型不覆盖本次显式选择。
+    settings.relay_profiles[0].model = "new-default".to_string();
+    settings.relay_profiles[0].model_list = "model-0,new-default".to_string();
+    expect!(&first_model, "c", "model-0", "Bearer synthetic-new-key");
+    // 移除成员只使其模型失效；不能静默改派给默认成员。
+    settings.aggregate_relay_profiles[0].members.remove(0);
+    assert_eq!(request(&settings_path, &settings, &first_model).await, 400);
+    assert!(received.try_recv().is_err());
+    expect!(&second_model, "b", "model-1", "Bearer sk-second");
+    settings.aggregate_relay_profiles[0].members.insert(0, AggregateRelayMember {
+        relay_id: first_id, weight: 1,
+    });
+    expect!(&first_model, "c", "model-0", "Bearer synthetic-new-key");
+
+    // 关闭按模型聚合后，故障转移遵循成员默认模型，并按新成员列表即时生效。
+    settings.aggregate_relay_profiles[0].model_aggregation_enabled = false;
+    failing.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(request(&settings_path, &settings, "client-model").await, 200);
+    assert_eq!(received.recv().await.unwrap(),
+        ("c", "new-default".to_string(), Some("Bearer synthetic-new-key".to_string())));
+    assert_eq!(received.recv().await.unwrap(),
+        ("b", "model-1".to_string(), Some("Bearer sk-second".to_string())));
+    assert!(received.try_recv().is_err());
+    settings.aggregate_relay_profiles[0].members.remove(0);
+    expect!("client-model", "b", "model-1", "Bearer sk-second");
+    // 保存设置不能中断已经发出的请求；新地址 / Key 从下一次请求起生效。
+    hold_next.store(true, std::sync::atomic::Ordering::SeqCst);
+    let old_settings = settings.clone();
+    let old_path = settings_path.clone();
+    let in_flight = tokio::spawn(async move { request(&old_path, &old_settings, "client-model").await });
+    let event = tokio::time::timeout(Duration::from_secs(2), received.recv()).await.unwrap().unwrap();
+    assert_eq!(event, ("b", "model-1".to_string(), Some("Bearer sk-second".to_string())));
+    settings.relay_profiles[1].base_url = urls[0].clone();
+    settings.relay_profiles[1].api_key = "synthetic-next-key".to_string();
+    settings.relay_profiles[1].model = "next-default-model".to_string();
+    persist(&settings_path, &settings);
+    release.notify_one();
+    assert_eq!(in_flight.await.unwrap(), 200);
+    expect!("client-model", "a", "next-default-model", "Bearer synthetic-next-key");
+    for server in servers {
+        server.abort();
+    }
+}
+
 async fn respond_once(listener: tokio::net::TcpListener, response: &'static str) {
     let (mut stream, _) = listener.accept().await.unwrap();
     let mut buffer = [0; 1024];
