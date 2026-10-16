@@ -268,8 +268,8 @@ impl HistoryRetention {
                 .into_iter()
                 .flatten()
                 .filter_map(|row| row["rollout_path"].as_str())
-                .map(|path| comparable_history_path(Path::new(path)))
-                .collect::<BTreeSet<_>>();
+                .map(|path| resolved_history_path(Path::new(path)))
+                .collect::<anyhow::Result<BTreeSet<_>>>()?;
             let current_token = if has_table(&db, TABLE)? {
                 db.query_row(
                     &format!("SELECT backup_token FROM {TABLE} WHERE thread_id=?1"),
@@ -483,6 +483,30 @@ fn comparable_history_path(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+// 回收后的文件可能已不存在；从最近的现存祖先解析短路径与目录大小写。
+fn resolved_history_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match fs::canonicalize(ancestor) {
+            Ok(mut resolved) => {
+                for name in missing.into_iter().rev() {
+                    resolved.push(name);
+                }
+                return Ok(comparable_history_path(&resolved));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = ancestor.file_name().ok_or_else(|| {
+                    anyhow::anyhow!("cannot resolve history path: {}", path.display())
+                })?;
+                missing.push(name.to_os_string());
+                ancestor = ancestor.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 #[cfg(all(test, windows))]
