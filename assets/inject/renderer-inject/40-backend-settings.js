@@ -59,6 +59,9 @@
       const settings = await postJson("/settings/set", { [key]: value });
       if (seq === codexPlusBackendSettingsSeq) {
         codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
+        if (typeof observeCodexModelCatalogRevision === "function") {
+          observeCodexModelCatalogRevision(settings?.modelCatalogRevision);
+        }
         globalThis.__CODEX_PLUS_ACTIVITY_OVERLAY_SYNC__?.();
       }
     } finally {

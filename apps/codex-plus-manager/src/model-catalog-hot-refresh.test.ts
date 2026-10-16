@@ -9,8 +9,9 @@ const CATALOG_URL = new URL(
 );
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
-  return { promise, resolve };
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 async function catalogRuntime() {
@@ -19,6 +20,7 @@ async function catalogRuntime() {
   const end = source.indexOf("\n  function codexPlusModelMetadata", start);
   assert.ok(start >= 0 && end > start, "model catalog loader block not found");
   const reads: Array<ReturnType<typeof deferred<Record<string, unknown>>>> = [];
+  let refreshes = 0;
   const context = vm.createContext({
     window: {}, Date, WeakMap, Set, Map, Promise,
     readCodexAppServerPreparation: (path: string) => {
@@ -31,18 +33,32 @@ async function catalogRuntime() {
     scheduleCodexModelWhitelistRefresh: () => undefined,
     sendCodexPlusDiagnostic: () => undefined,
     codexPlusModelPickerCatalogChanged: () => undefined,
-    refreshCachedLocalModelQueries: () => undefined,
+    refreshCachedLocalModelQueries: () => { refreshes++; },
     captureCodexAggregateSelectedModels: () => undefined,
   });
   const api = vm.runInContext(
-    `(function () {${source.slice(start, end)}\nreturn { observeCodexModelCatalogRevision, state: () => ({ revision: codexModelCatalogRevision, models: [...codexModelCatalog.models], epoch: codexModelCatalogAppliedEpoch }) };})()`,
+    `(function () {${source.slice(start, end)}\nreturn { observeCodexModelCatalogRevision, load: loadCodexModelCatalog, state: () => ({ revision: codexModelCatalogRevision, models: [...codexModelCatalog.models], epoch: codexModelCatalogAppliedEpoch }) };})()`,
     context,
   ) as {
     observeCodexModelCatalogRevision: (revision: unknown) => boolean;
+    load: (force?: boolean) => Promise<{ status: string }>;
     state: () => { revision: string; models: string[]; epoch: number };
   };
-  return { api, reads };
+  return { api, reads, refreshes: () => refreshes };
 }
+
+it("a rejected catalog read triggers native cache restoration", async () => {
+  const { api, reads, refreshes } = await catalogRuntime();
+  const initial = api.load(true);
+  reads[0].resolve({ status: "ok", models: ["aggregate-model"] });
+  await initial;
+  assert.equal(refreshes(), 1);
+  const failed = api.load(true);
+  reads[1].reject(new Error("catalog unavailable"));
+  assert.equal((await failed).status, "failed");
+  assert.equal(refreshes(), 2, "failure must publish restoration, not just update catalog state");
+  assert.deepEqual(Array.from(api.state().models), []);
+});
 
 it("first modelCatalogRevision refreshes once and repeated reads are deduplicated", async () => {
   const { api, reads } = await catalogRuntime();
@@ -69,19 +85,20 @@ it("a late catalog response cannot replace a newer revision", async () => {
   assert.deepEqual(JSON.parse(JSON.stringify(api.state())), { revision: "rev-b", models: ["model-b"], epoch: 1 });
 });
 
-it("the production settings heartbeat reloads changed catalogs with Fast and whitelist unlock disabled", async () => {
+it("production settings heartbeat and save reload changed catalogs with Fast and whitelist unlock disabled", async () => {
   const catalog = await readFile(CATALOG_URL, "utf8");
   const service = await readFile(new URL("../../../assets/inject/renderer-inject/30-service-tier.js", import.meta.url), "utf8");
   const backend = await readFile(new URL("../../../assets/inject/renderer-inject/40-backend-settings.js", import.meta.url), "utf8");
   const loader = catalog.slice(catalog.indexOf("  let codexModelCatalog = "), catalog.indexOf("\n  function codexPlusModelMetadata"));
   const stateLoader = service.slice(service.indexOf("  async function loadBackendSettingsState("));
   const heartbeat = backend.slice(backend.indexOf("  let syncBackendSettingsInFlight ="), backend.indexOf("\n  async function setBackendSetting("));
+  const setter = backend.slice(backend.indexOf("  async function setBackendSetting("), backend.indexOf("\n  function refreshCodexPlusBackendToggles("));
   let revision = "a";
   let reads = 0;
   const context = vm.createContext({
     window: {}, Date, WeakMap, Set, Map, Promise,
     postJson: async (path: string) => {
-      assert.equal(path, "/settings/get");
+      assert.ok(["/settings/get", "/settings/set"].includes(path));
       return { enhancementsEnabled: true, modelCatalogRevision: revision };
     },
     readCodexAppServerPreparation: async () => { reads++; return { status: "ok", models: [revision] }; },
@@ -91,12 +108,13 @@ it("the production settings heartbeat reloads changed catalogs with Fast and whi
     codexPlusSettings: () => ({ modelWhitelistUnlock: false, fastMode: false }),
     runScanStep: () => {}, syncOfficialUsagePolicy: () => {}, syncCodexPlusTypingEffects: () => {},
     installCodexPlusDictation: () => {}, refreshConversationView: () => {},
+    refreshCodexPlusBackendToggles: () => {},
   });
   const api = vm.runInContext(`(function () {
     let codexPlusBackendSettingsSeq = 0, codexPlusBackendSettings = {}, codexPlusBackendSettingsLoaded = false;
-    ${loader}\n${stateLoader}\n${heartbeat}
-    return { heartbeat: syncBackendSettingsFromHeartbeat, models: () => [...codexModelCatalog.models] };
-  })()`, context) as { heartbeat: () => Promise<void>; models: () => string[] };
+    ${loader}\n${stateLoader}\n${heartbeat}\n${setter}
+    return { heartbeat: syncBackendSettingsFromHeartbeat, save: () => setBackendSetting("providerSyncEnabled", true), models: () => [...codexModelCatalog.models] };
+  })()`, context) as { heartbeat: () => Promise<void>; save: () => Promise<void>; models: () => string[] };
   await api.heartbeat();
   await Promise.resolve();
   assert.equal(reads, 1);
@@ -108,6 +126,13 @@ it("the production settings heartbeat reloads changed catalogs with Fast and whi
   await Promise.resolve();
   assert.equal(reads, 2);
   assert.deepEqual(Array.from(api.models()), ["b"]);
+  revision = "c";
+  await api.save();
+  await Promise.resolve();
+  assert.equal(reads, 3, "saving settings reloads immediately");
+  assert.deepEqual(Array.from(api.models()), ["c"]);
+  await api.heartbeat();
+  assert.equal(reads, 3, "the following heartbeat deduplicates the saved revision");
 });
 
 it("catalog refresh publishes local model query data, invalidates it once, and preserves remote caches", async () => {
@@ -372,21 +397,23 @@ it("an empty authoritative aggregate catalog withdraws all stale models", async 
   assert.deepEqual(local.data.data, []);
 });
 
-for (const late of [false, true]) for (const exitAggregate of [false, true]) {
-  it(`native models recover after catalog failure with structural sharing (late=${late}, exit=${exitAggregate})`, async () => {
-    const { runtime, local, catalog } = await aggregateQueryRuntime(true);
+for (const structuralSharing of [false, true]) for (const late of [false, true]) for (const exit of ["official", "failed", "unconfigured"]) {
+  it(`native models are restored after aggregate exit (sharing=${structuralSharing}, late=${late}, exit=${exit})`, async () => {
+    const { runtime, local, remote, catalog } = await aggregateQueryRuntime(structuralSharing);
     const native = [{ model: "native-one" }, { model: "native-two" }];
     local.data = { data: native.map((model) => ({ ...model })) };
+    const remoteData = remote.data;
     runtime.catalog(catalog("a"));
     runtime.refresh();
     assert.equal(local.data.data.length, 11);
     runtime.catalog(catalog("b"));
     runtime.refresh();
     if (late) local.setData({ data: native.map((model) => ({ ...model })) });
-    if (exitAggregate) runtime.profile({ id: "official", relayMode: "official" });
-    runtime.catalog({ ...catalog("b"), status: "failed", model: "", models: [], modelMetadata: {}, sources: [] });
+    if (exit === "official") runtime.profile({ id: "official", relayMode: "official" });
+    runtime.catalog({ ...catalog("b"), status: exit === "unconfigured" ? "not_configured" : "failed", model: "", models: [], modelMetadata: {}, sources: [] });
     assert.equal(runtime.refresh(), true);
     assert.deepEqual(local.data.data, native);
+    assert.equal(remote.data, remoteData);
     assert.equal(runtime.refresh(), false);
   });
 }
@@ -466,7 +493,7 @@ it("default changes preserve provider identity through stale lists, rerenders an
     models: catalog("a").models.map((model) => ({ model })),
     onSelectModel: (...args: unknown[]) => { selections.push(args); },
   };
-  nodes.push({ __reactFiber$test: { memoizedProps: props, return: { memoizedProps: { permissionsHostId: "local", threadId: "thread-a" } } } });
+  nodes.push({ __reactFiber$test: { memoizedProps: props, return: { memoizedProps: { permissionsHostId: "local", conversationId: "thread-a" } } } });
   runtime.catalog(catalog("b"));
   assert.equal(runtime.syncSelection(), false, "wait until the target exists in React's list");
   props.onSelectModel = (...args: unknown[]) => { selections.push(args); };
@@ -518,6 +545,24 @@ it("conversation changes before a pending migration cannot inherit the old suppl
   const selections: unknown[][] = [];
   const props = {
     model: "model-0", reasoningEffort: "high",
+    models: catalog("a").models.map((model) => ({ model })),
+    onSelectModel: (...args: unknown[]) => { selections.push(args); },
+  };
+  const owner = { permissionsHostId: "local", conversationId: "one" };
+  nodes.push({ __reactFiber$test: { memoizedProps: props, return: { memoizedProps: owner } } });
+  runtime.catalog(catalog("b"));
+  owner.conversationId = "two";
+  props.models = catalog("b").models.map((model) => ({ model }));
+  assert.equal(runtime.syncSelection(), false);
+  assert.deepEqual(selections, []);
+});
+
+it("the host conversationId takes priority over a stale nearer threadId", async () => {
+  const { runtime, catalog, nodes } = await aggregateQueryRuntime();
+  runtime.catalog(catalog("a"));
+  const selections: unknown[][] = [];
+  const props = {
+    threadId: "stale-thread", model: "model-0", reasoningEffort: "high",
     models: catalog("a").models.map((model) => ({ model })),
     onSelectModel: (...args: unknown[]) => { selections.push(args); },
   };

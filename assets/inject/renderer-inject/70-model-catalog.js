@@ -443,7 +443,8 @@
       let fiber = key ? node[key] : null;
       let picker = null;
       let hostId = "";
-      let owner = "";
+      let conversationId = "";
+      let threadId = "";
       for (let depth = 0; fiber && depth < 128; depth += 1, fiber = fiber.return) {
         const props = fiber.memoizedProps || {};
         if (!picker && typeof props.model === "string" && typeof props.onSelectModel === "function"
@@ -451,12 +452,11 @@
         if (!hostId && typeof props.permissionsHostId === "string" && props.permissionsHostId.trim()) {
           hostId = props.permissionsHostId.trim();
         }
-        if (!owner) {
-          const conversationId = typeof props.conversationId === "string" ? props.conversationId.trim() : "";
-          const threadId = typeof props.threadId === "string" ? props.threadId.trim() : "";
-          owner = conversationId || threadId;
-        }
+        if (!conversationId && typeof props.conversationId === "string") conversationId = props.conversationId.trim();
+        if (!threadId && typeof props.threadId === "string") threadId = props.threadId.trim();
       }
+      // 宿主以 conversationId 标识当前会话；不能被更近层的旧 threadId 遮蔽。
+      const owner = conversationId || threadId;
       if (picker && hostId === "local" && !picker.lockedModelSlug && !picker.modelOptionsDisabled
           && !picker.modelSelectionDisabled) pickers.push({ node, picker, owner, hostId });
       else window.__codexPlusAggregateModelSelectionIdentities?.delete(node);
@@ -709,6 +709,7 @@
   function transferCodexPlusModelCollectionSnapshot(models, next) {
     const snapshot = codexPlusModelCollectionSnapshots.get(models);
     if (snapshot && sameModelCollection(models, snapshot.patched)) {
+      // 克隆与 TanStack 结构共享都可能替换元素引用；恢复时必须匹配最终存储的元素。
       codexPlusModelCollectionSnapshots.set(next, {
         ...snapshot,
         original: [...snapshot.original],

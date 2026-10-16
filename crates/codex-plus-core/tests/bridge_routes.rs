@@ -340,10 +340,12 @@ async fn settings_set_does_not_persist_runtime_codex_app_version() {
 
     assert_eq!(result["codexAppVersion"], json!("26.601.21317"));
     assert_eq!(result["codexAppPluginMarketplaceUnlock"], json!(false));
+    assert_eq!(result["modelCatalogRevision"], json!("fixture-revision"));
 
     let persisted = settings.settings.lock().unwrap().clone();
     let persisted_value = serde_json::to_value(persisted).unwrap();
     assert!(persisted_value.get("codexAppVersion").is_none());
+    assert!(persisted_value.get("modelCatalogRevision").is_none());
 }
 
 #[tokio::test]
