@@ -238,6 +238,20 @@ impl SkillsManager {
         self.save_repo(repo, None)
     }
 
+    /// 仅启停既有源不依赖网络；身份变更必须由调用方验证后保存。
+    pub fn update_repo_enabled_if_unchanged(&self, repo: &SkillRepo, previous_key: Option<&str>) -> anyhow::Result<bool> {
+        let repo = normalize_repo(repo.clone())?;
+        let key = repo.key();
+        if previous_key.is_some_and(|previous| previous != key) { return Ok(false); }
+        let _guard = self.state_lock.lock().unwrap();
+        let mut state = self.load_state_unlocked();
+        let Some(existing) = state.repos.iter_mut().find(|item| item.key() == key) else { return Ok(false) };
+        if existing.enabled == repo.enabled { return Ok(false); }
+        existing.enabled = repo.enabled;
+        self.save_state_unlocked(&state)?;
+        Ok(true)
+    }
+
     pub fn save_repo(&self, repo: SkillRepo, previous_key: Option<&str>) -> anyhow::Result<Vec<SkillRepo>> {
         let repo = normalize_repo(repo)?;
         let _guard = self.state_lock.lock().unwrap();
@@ -1551,6 +1565,26 @@ mod tests {
         assert!(external.join("SKILL.md").is_file());
         manager.set_enabled("imported", true).unwrap();
         assert!(manager.local_inventory().iter().find(|skill| skill.id == "imported").unwrap().enabled);
+    }
+
+    #[test]
+    fn saved_repository_toggle_is_local_but_identity_changes_need_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let mut repo = parse_repo_key("unreachable-owner/absent-repo@main").unwrap();
+        manager.upsert_repo(repo.clone()).unwrap();
+        repo.enabled = false;
+        assert!(manager.update_repo_enabled_if_unchanged(&repo, None).unwrap());
+        assert!(!manager.list_repos().iter().find(|item| item.key() == repo.key()).unwrap().enabled);
+        let old = repo.key();
+        for field in ["other-owner/absent-repo@main", "unreachable-owner/other-repo@main", "unreachable-owner/absent-repo@dev", "unreachable-owner/absent-repo@main:other"] {
+            let changed = parse_repo_key(field).unwrap();
+            assert!(!manager.update_repo_enabled_if_unchanged(&changed, Some(&old)).unwrap());
+            assert!(!manager.list_repos().iter().any(|item| item.key() == changed.key()));
+        }
+        repo.enabled = true;
+        assert!(manager.update_repo_enabled_if_unchanged(&repo, Some(&old)).unwrap());
+        assert!(manager.list_repos().iter().find(|item| item.key() == old).unwrap().enabled);
     }
 
     #[test]
