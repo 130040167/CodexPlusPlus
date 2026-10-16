@@ -19,12 +19,14 @@ class Element {
   title = "";
   button: Element | null = null;
   thread = false;
+  backIcon = false;
   constructor(attributes: Record<string, string> = {}) {
     Object.entries(attributes).forEach(([key, value]) => this.attributes.set(key, value));
   }
   getAttribute(name: string) { return this.attributes.get(name) ?? null; }
   setAttribute(name: string, value: string) { this.attributes.set(name, value); }
   removeAttribute(name: string) { this.attributes.delete(name); }
+  querySelector(_selector: string) { return this.backIcon ? {} : null; }
   closest(selector: string) {
     if (selector === "button") return this.button;
     if (selector === "[data-thread]") return this.thread ? this : null;
@@ -34,6 +36,7 @@ class Element {
 
 function harness(disabled = false, label = "返回") {
   let pageOpen = true;
+  let pageNode = {};
   let closes = 0;
   let navigations = 0;
   const button = new Element({
@@ -54,7 +57,7 @@ function harness(disabled = false, label = "返回") {
     }, Element, codexPlusPageClass: "page",
     selectors: { appHeader: ".header, .tint", sidebarThread: "[data-thread]" },
     document: {
-      querySelector: () => pageOpen ? {} : null,
+      querySelector: () => pageOpen ? pageNode : null,
       querySelectorAll: (selector: string) => {
         assert.equal(selector, ".header button, .tint button");
         return current ? [current] : [];
@@ -65,6 +68,8 @@ function harness(disabled = false, label = "返回") {
     closeCodexPlusPage: () => {
       closes++;
       pageOpen = false;
+      timers.delete(context.window.__codexPlusPageNavigationCloseTimer);
+      context.window.__codexPlusPageNavigationCloseTimer = null;
       vm.runInContext("restoreCodexPlusPageBackButton()", context);
     },
   });
@@ -80,7 +85,7 @@ function harness(disabled = false, label = "返回") {
   };
   return { button, install, click, listeners, context,
     flushTimers: () => { const pending = [...timers.values()]; timers.clear(); pending.forEach((callback) => callback()); },
-    setPage: (open: boolean) => { pageOpen = open; },
+    setPage: (open: boolean) => { pageOpen = open; pageNode = {}; },
     setButton: (next: Element | null) => { current = next; },
     counts: () => ({ closes, navigations }),
   };
@@ -164,4 +169,58 @@ test("pending native navigation does not override a replacement Back button", ()
   h.flushTimers();
   assert.equal(replacement.getAttribute("disabled"), "");
   assert.equal(replacement.getAttribute("aria-disabled"), "true");
+});
+
+test("a navigation timer cannot close a replacement page", () => {
+  const h = harness(true);
+  h.install();
+  vm.runInContext("closeCodexPlusPageAfterNativeNavigation()", h.context);
+  h.setPage(true);
+  h.flushTimers();
+  assert.equal(h.counts().closes, 0);
+  h.install();
+  assert.equal(h.button.getAttribute("disabled"), null);
+});
+
+test("closing and reopening a page cancels pending navigation close", () => {
+  const h = harness(true);
+  h.install();
+  vm.runInContext("closeCodexPlusPageAfterNativeNavigation();closeCodexPlusPage()", h.context);
+  h.setPage(true);
+  h.install();
+  assert.equal(h.button.getAttribute("disabled"), null);
+  h.flushTimers();
+  assert.equal(h.counts().closes, 1);
+});
+
+test("localized Back is identified by its native unmirrored arrow", () => {
+  for (const label of ["戻る", "Zurück"]) {
+    const h = harness(true, label);
+    h.button.backIcon = true;
+    h.install();
+    assert.equal(h.button.getAttribute("disabled"), null);
+    assert.equal(h.click(h.button).stopped, true);
+    assert.equal(h.button.getAttribute("disabled"), "");
+  }
+});
+
+test("both actual close implementations cancel timers before reopening", () => {
+  const extension = readFileSync(new URL("../../../assets/inject/renderer-inject/92-extension-host.js", import.meta.url), "utf8");
+  for (const implementation of [source, extension]) {
+    const h = harness(true);
+    const queryAll = h.context.document.querySelectorAll;
+    h.context.document.querySelectorAll = (selector: string) => selector === ".page"
+      ? [{ remove: () => h.setPage(false) }] : queryAll(selector);
+    h.context.closeCodexPlusTypingEffectDropdown = () => {};
+    h.context.setCodexPlusSidebarNavActive = () => {};
+    vm.runInContext(implementation.match(/^  function closeCodexPlusPage\([^]*?^  \}/m)![0], h.context);
+    h.install();
+    vm.runInContext("closeCodexPlusPageAfterNativeNavigation();closeCodexPlusPage()", h.context);
+    assert.equal(h.context.window.__codexPlusPageNavigationCloseTimer, null);
+    h.setPage(true);
+    h.install();
+    h.flushTimers();
+    assert.ok(h.context.document.querySelector(".page"));
+    assert.equal(h.button.getAttribute("disabled"), null);
+  }
 });

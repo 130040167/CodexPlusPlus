@@ -7986,6 +7986,8 @@
   }
 
   function closeCodexPlusPage() {
+    clearTimeout(window.__codexPlusPageNavigationCloseTimer);
+    window.__codexPlusPageNavigationCloseTimer = null;
     closeCodexPlusTypingEffectDropdown();
     window.removeEventListener("resize", window.__codexPlusPageResizeHandler);
     window.__codexPlusPageResizeHandler = null;
@@ -8000,9 +8002,12 @@
   function codexPlusNativeBackButton() {
     const labels = new Set(["back", "go back", "返回", "后退"]);
     const selector = selectors.appHeader.split(",").map((header) => `${header.trim()} button`).join(", ");
-    return Array.from(document.querySelectorAll(selector))
-      .find((button) => !button.closest(`.${codexPlusPageClass}, [data-codex-plus-ext]`) &&
-        labels.has(String(button.getAttribute("aria-label") || button.title || "").trim().toLowerCase())) || null;
+    const buttons = Array.from(document.querySelectorAll(selector))
+      .filter((button) => !button.closest(`.${codexPlusPageClass}, [data-codex-plus-ext]`));
+    // 宿主的前进按钮复用返回箭头并水平翻转；路径识别不依赖界面语言。
+    const backIcon = 'svg:not([class~="-scale-x-100"]) path[d^="M6.96231 2.96214C7.16727 2.7574"]';
+    return buttons.find((button) => button.querySelector(backIcon)) || buttons.find((button) =>
+      labels.has(String(button.getAttribute("aria-label") || button.title || "").trim().toLowerCase())) || null;
   }
 
   function restoreCodexPlusPageBackButton() {
@@ -8039,13 +8044,17 @@
   }
 
   function closeCodexPlusPageAfterNativeNavigation() {
+    const page = document.querySelector(`.${codexPlusPageClass}`);
+    if (!page) return;
     clearTimeout(window.__codexPlusPageNavigationCloseTimer);
     // 原生导航前撤销临时属性，避免延迟关闭覆盖导航提交后的返回状态。
     restoreCodexPlusPageBackButton();
-    window.__codexPlusPageNavigationCloseTimer = setTimeout(() => {
+    const timer = setTimeout(() => {
+      if (window.__codexPlusPageNavigationCloseTimer !== timer) return;
       window.__codexPlusPageNavigationCloseTimer = null;
-      closeCodexPlusPage();
+      if (document.querySelector(`.${codexPlusPageClass}`) === page) closeCodexPlusPage();
     }, 0);
+    window.__codexPlusPageNavigationCloseTimer = timer;
   }
 
   function installCodexPlusPageNavigationCloseHandler() {
@@ -16240,6 +16249,8 @@
 
   /** 关闭当前拓展页面并执行其 onCleanup。 */
   function closeCodexPlusPage() {
+    clearTimeout(window.__codexPlusPageNavigationCloseTimer);
+    window.__codexPlusPageNavigationCloseTimer = null;
     const cleanup = window.__codexPlusExtensionPageCleanup;
     window.__codexPlusExtensionPageCleanup = null;
     if (typeof cleanup === "function") {

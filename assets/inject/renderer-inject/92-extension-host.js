@@ -136,6 +136,8 @@
 
   /** 关闭当前拓展页面并执行其 onCleanup。 */
   function closeCodexPlusPage() {
+    clearTimeout(window.__codexPlusPageNavigationCloseTimer);
+    window.__codexPlusPageNavigationCloseTimer = null;
     const cleanup = window.__codexPlusExtensionPageCleanup;
     window.__codexPlusExtensionPageCleanup = null;
     if (typeof cleanup === "function") {
