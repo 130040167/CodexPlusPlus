@@ -92,6 +92,8 @@ import { NativeBrowserStatusView, nativeBrowserConsent } from "./native-browser-
 import { AgentCachePanel } from "./agent-cache";
 import { AgentCollaborationPage } from "./AgentCollaborationPage";
 import { PluginMarketScreen } from "./PluginMarketScreen";
+import { ReleaseNotes } from "./ReleaseNotes";
+import { UPDATE_CHECK_INTERVAL_MS, UpdateNotifications } from "./update-notification";
 import { McpPage, PageHeader } from "./ManagementPages";
 import { SkillsPage, SessionPage } from "./ManagementExtra";
 import { ENHANCEMENT_SECTION_IDS, managerNavigationDestination, type EnhancementTab, type ManagerNavigationIntent } from "./enhancement-navigation";
@@ -853,6 +855,7 @@ type TaskProgress = {
   percent: number;
   message: string;
   indeterminate?: boolean;
+  failed?: boolean;
 };
 
 type UpdateStage = "downloading" | "writing" | "launching";
@@ -1293,6 +1296,10 @@ export function App() {
   const [dreamSkinUnsavedDialog, setDreamSkinUnsavedDialog] = useState(false);
   const dreamSkinPendingActionRef = useRef<(() => void) | null>(null);
   const [update, setUpdate] = useState<UpdateResult | null>(null);
+  const [updatePrompt, setUpdatePrompt] = useState<UpdateResult | null>(null);
+  const updateNotifications = useRef(new UpdateNotifications());
+  const updateCheckPending = useRef<{ manual: boolean } | null>(null);
+  const updateInstallPending = useRef(false);
   const [updateInstallProgress, setUpdateInstallProgress] = useState<TaskProgress>({
     active: false,
     percent: 0,
@@ -2493,27 +2500,52 @@ export function App() {
   };
 
   const checkUpdate = async (silent = false) => {
-    const result = await run(() => call<UpdateResult>("check_update"));
-    if (result) {
-      setUpdate(result);
-      if (!silent || result.updateAvailable) {
+    if (updateInstallPending.current) return;
+    if (updateCheckPending.current) {
+      // 手动检查复用正在进行的后台请求，但仍按用户主动检查显示结果。
+      if (!silent) updateCheckPending.current.manual = true;
+      return;
+    }
+    const request = { manual: !silent };
+    updateCheckPending.current = request;
+    try {
+      const result = await call<UpdateResult>("check_update");
+      // 后台检查失败时保留上次可用的安装包，手动检查仍显示错误。
+      if (request.manual || result.status !== "failed") setUpdate(result);
+      if (updateNotifications.current.shouldPrompt(result, request.manual)) {
+        setUpdatePrompt(result);
+      } else if (request.manual) {
         showNotice(t("GitHub Release 检查"), result.message, result.status);
       }
+    } catch (error) {
+      if (request.manual) showNotice(t("GitHub Release 检查"), stringifyError(error), "failed");
+    } finally {
+      updateCheckPending.current = null;
     }
   };
 
-  const performUpdate = async () => {
-    if (updateInstallProgress.active) return;
+  const closeUpdatePrompt = () => {
+    if (updatePrompt?.latestVersion) updateNotifications.current.dismiss(updatePrompt.latestVersion);
+    setUpdatePrompt(null);
+  };
+
+  const performUpdate = async (selectedUpdate = update) => {
+    if (updateInstallPending.current) return;
     const release =
-      update?.latestVersion && update.assetName && update.assetUrl
+      selectedUpdate?.latestVersion && selectedUpdate.assetName && selectedUpdate.assetUrl
         ? {
-            version: update.latestVersion,
+            version: selectedUpdate.latestVersion,
             url: "",
-            body: update.releaseSummary ?? "",
-            asset_name: update.assetName,
-            asset_url: update.assetUrl,
+            body: selectedUpdate.releaseSummary ?? "",
+            asset_name: selectedUpdate.assetName,
+            asset_url: selectedUpdate.assetUrl,
           }
         : null;
+    if (!release) {
+      showNotice(t("更新安装"), t("请先检查更新并选择可下载的 Release asset。"), "failed");
+      return;
+    }
+    updateInstallPending.current = true;
     setUpdateInstallProgress({
       active: true,
       percent: 0,
@@ -2546,12 +2578,13 @@ export function App() {
       });
       const result = await run(() => call<UpdateResult>("perform_update", { release }));
       if (result) {
-        setUpdate(result);
+        setUpdate({ ...selectedUpdate!, ...result });
         setUpdateInstallProgress({
           active: false,
           percent: result.progress ?? 100,
           indeterminate: false,
           message: result.message,
+          failed: result.status === "failed",
         });
         showNotice(t("更新安装"), result.message, result.status);
       } else {
@@ -2560,9 +2593,15 @@ export function App() {
           percent: 100,
           indeterminate: false,
           message: t("安装包更新失败，请查看错误提示后重试。"),
+          failed: true,
         });
       }
+    } catch (error) {
+      const message = stringifyError(error);
+      setUpdateInstallProgress({ active: false, percent: 0, indeterminate: false, message, failed: true });
+      showNotice(t("更新安装"), message, "failed");
     } finally {
+      updateInstallPending.current = false;
       window.clearTimeout(fallbackTimer);
       unlisten?.();
     }
@@ -3254,6 +3293,12 @@ export function App() {
       await refreshPendingProviderImport(true);
       await refreshPendingDreamSkinCommunity();
     })();
+  }, []);
+
+  useEffect(() => {
+    // 长期开着管理器也能发现更新；后台检查失败不打扰当前操作。
+    const timer = window.setInterval(() => void checkUpdate(true), UPDATE_CHECK_INTERVAL_MS);
+    return () => window.clearInterval(timer);
   }, []);
 
   // 主题卡片的「更多操作」是原生 details 弹层：原生不会因为点了别处就收起，
@@ -3953,6 +3998,19 @@ export function App() {
           ) : null}
         </section>
       </main>
+      {updatePrompt ? (
+        <UpdateDialog
+          update={updatePrompt}
+          progress={updateInstallProgress}
+          onClose={closeUpdatePrompt}
+          onMuteToday={() => {
+            updateNotifications.current.muteToday();
+            setUpdatePrompt(null);
+          }}
+          onUpdate={() => void performUpdate(updatePrompt)}
+          onOpenUrl={(url) => void openExternalUrl(url)}
+        />
+      ) : null}
       {notice ? (
         <NoticeDialog
           key={`${notice.title}-${notice.message}-${notice.status ?? ""}`}
@@ -7951,7 +8009,7 @@ function AboutScreen({
             <Metric label={t("资源")} value={update?.assetName ?? "-"} />
             <Metric label={t("进度")} value={`${formatProgressPercent(update?.progress ?? 0)}%`} />
           </div>
-          <Textarea className="log-view" readOnly value={update?.releaseSummary || update?.message || t("尚未检查 GitHub Release；更新会下载并启动安装包。")} />
+          <ReleaseNotes markdown={update?.releaseSummary || update?.message || t("尚未检查 GitHub Release；更新会下载并启动安装包。")} onOpenUrl={(url) => void actions.openExternalUrl(url)} />
           <TaskProgressBox completedTitle={t("上次更新结果")} progress={updateInstallProgress} title={t("安装包更新进度")} />
           <Toolbar>
             <Button onClick={() => void actions.checkUpdate()}>{t("检查更新")}</Button>
@@ -11578,6 +11636,48 @@ function DreamSkinUnsavedDialog({
   );
 }
 
+function UpdateDialog({ update, progress, onClose, onMuteToday, onUpdate, onOpenUrl }: {
+  update: UpdateResult;
+  progress: TaskProgress;
+  onClose: () => void;
+  onMuteToday: () => void;
+  onUpdate: () => void;
+  onOpenUrl: (url: string) => void;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (dialog && !dialog.open) dialog.showModal();
+    return () => { if (dialog?.open) dialog.close(); };
+  }, []);
+
+  return (
+    <dialog className="modal-card update-dialog" ref={dialogRef} aria-labelledby="update-dialog-title" aria-describedby="update-dialog-description" onCancel={(event) => { event.preventDefault(); onClose(); }}>
+      <div className="modal-head">
+        <div>
+          <h2 id="update-dialog-title">{tf("发现新版本 {0}", [update.latestVersion ?? ""])}</h2>
+          <p id="update-dialog-description">{tf("当前版本 {0}", [update.currentVersion])}</p>
+        </div>
+        <button className="toast-close" onClick={onClose} type="button" aria-label={t("关闭更新提示")}>×</button>
+      </div>
+      <div className="update-dialog-body">
+        <ReleaseNotes markdown={update.releaseSummary || t("发现可用更新。")} onOpenUrl={onOpenUrl} />
+      </div>
+      <TaskProgressBox completedTitle={t("上次更新结果")} progress={progress} title={t("安装包更新进度")} />
+      <p className="update-dialog-hint">{t("也可随时在“关于”页面检查和安装更新。")}</p>
+      {!update.assetName || !update.assetUrl ? <p className="update-dialog-hint">{t("此版本暂未提供适用于当前系统的安装包。")}</p> : null}
+      <Toolbar className="update-dialog-actions">
+        <Button autoFocus disabled={progress.active || !update.assetName || !update.assetUrl} onClick={onUpdate}>
+          <Download className="h-4 w-4" />
+          {progress.active ? t("正在下载安装包…") : t("立即更新")}
+        </Button>
+        <Button variant="secondary" onClick={onClose}>{t("关闭提示")}</Button>
+        <Button variant="ghost" onClick={onMuteToday}>{t("今日不再提示")}</Button>
+      </Toolbar>
+    </dialog>
+  );
+}
+
 function NoticeDialog({
   notice,
   onClose,
@@ -11790,14 +11890,14 @@ function DreamSkinCommunityLinkDialog({
 }
 
 function TaskProgressBox({ progress, title, completedTitle = t("上次修复结果") }: { progress: TaskProgress; title: string; completedTitle?: string }) {
-  if (!progress.active && progress.percent <= 0) return null;
+  if (!progress.active && progress.percent <= 0 && !progress.failed) return null;
   return (
     <div className="provider-sync-progress task-progress" data-active={progress.active}>
       <div className="provider-sync-progress-head">
         <strong>{progress.active ? title : completedTitle}</strong>
-        <span>{progress.indeterminate ? null : `${formatProgressPercent(progress.percent)}%`}</span>
+        <span>{progress.indeterminate || progress.failed ? null : `${formatProgressPercent(progress.percent)}%`}</span>
       </div>
-      <div
+      {!progress.failed ? <div
         aria-valuemax={100}
         aria-valuemin={0}
         aria-valuenow={progress.indeterminate ? undefined : progress.percent}
@@ -11809,7 +11909,7 @@ function TaskProgressBox({ progress, title, completedTitle = t("上次修复结�
           className="provider-sync-progress-fill"
           style={progress.indeterminate ? undefined : { width: `${progress.percent}%` }}
         />
-      </div>
+      </div> : null}
       <small>{progress.message}</small>
     </div>
   );

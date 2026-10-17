@@ -5,6 +5,14 @@
 
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
+  "发现可用更新。": "Update available.",
+  "请先检查更新并选择可下载的 Release asset。": "Check for updates first and select a downloadable release asset.",
+  "关闭更新提示": "Close update notification",
+  "也可随时在“关于”页面检查和安装更新。": "You can also check for and install updates on the About page at any time.",
+  "此版本暂未提供适用于当前系统的安装包。": "An installer for your system is not available for this version yet.",
+  "立即更新": "Update now",
+  "关闭提示": "Close",
+  "今日不再提示": "Don't remind me today",
   "设为当前 Key": "Select this key",
   "Key 名称": "Key name",
   "删除 Key": "Delete key",
