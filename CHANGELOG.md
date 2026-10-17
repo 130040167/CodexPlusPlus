@@ -2,11 +2,39 @@
 
 ## 未发布
 
-- 调整「Codex增强」页的独立模式额度解锁：不再把「独立额度解锁」和增强总开关并排放，改为收进「常用增强 → 独立模式」分组（关闭增强时自动置顶），并改名为「官方额度解锁」。开关说明会按总开关状态区分——增强开启时说明该能力已自动生效、此开关只在关闭增强后生效；关闭增强时说明它是官方登录 + API 供应商的额度发送锁补丁、只改客户端发送状态且需重启 Codex 生效。
-- 新增「Anthropic Messages 上游」协议（供应商编辑页 →「上游协议」第三项，卡片标注「Anthropic Messages 转 Responses」）：Codex 只认 Responses API，而 Claude 系中转网关、企业内部网关常常只暴露 `/v1/messages`，过去把这类地址填进供应商只能得到 `/responses` 404。现在选这个协议后 Codex 照旧连本机 `127.0.0.1:57321`，由本地协议代理把请求转成 Anthropic Messages 发给上游、再把响应（含 SSE 流）转回 Responses——工具调用、多轮 `tool_result`、图片（data URL 与 http(s) 链接）、思考内容、用量与缓存字段都在转换范围内。实现走「Responses → Chat → Anthropic」两跳，复用既有 Chat 链路上已经过测试的工具配对修复、`custom` 工具与 `tool_search` 命名空间、图片搬迁等映射，新增代码集中在 `anthropic_bridge.rs` 一层，便于对拍定位。认证默认发 `x-api-key`（Anthropic 原生），可在供应商表单切到 `Authorization: Bearer`（多数中转网关），`anthropic-version: 2023-06-01` 始终带上；`max_tokens` 是 Anthropic 的必填项，Codex 请求没带输出上限时用表单里的「最大输出 tokens」（默认 8192）兜底，`temperature` 超过 1.0 会被夹到 1.0。已知边界：不注入提示缓存断点（`cache_control`），也不回放思考块签名（Anthropic 要求签名完整，缺签名整轮 400，宁可不发）；`message_stop` 缺失时按流被掐断上报，不伪装成成功。供应商导入会把 Codex 供应商的 `anthropic` 上游格式识别成该协议，不再退化成 Responses 直连。详见 `docs/specs/2026-10-15-anthropic-messages-upstream.md`。
+## 1.10.0 - 2026-10-17
 
-- 「Anthropic Messages 上游」补齐协议专有能力：**思考（extended thinking）**按 Codex 的 `reasoning.effort` 折算成 `thinking` 预算（low 2048 / medium 8192 / high 16384 / xhigh·max·ultra 24576），并按 `max_tokens` 的一半夹取给可见回答留余量，夹取后不足 1024 就不开思考；开启时自动去掉 `temperature`/`top_p`。**签名回放**：Anthropic 的思考块签名在 Chat 形态里没有落点，改为把整组签名块编码进 Responses reasoning item 的 `encrypted_content`（前缀 `codex-plus-anthropic-thinking-v1:`），Codex 下一轮原样回放、桥接层解出来插回助手消息最前面，代理保持无状态；历史里已有工具调用却拿不到签名时**不开启**思考——缺签名上游必然 400，宁可不思考也不发一个失败请求。**提示缓存**默认开启：给工具定义、系统提示、最新一轮对话（及更早一条 user 锚点）打 `cache_control` 断点，最多 4 个、调用方已有标记一律不动。模型声明窗口 ≥ 1M（复用本仓的 `modelWindows` / `contextWindow`）时自动附 `context-1m-2025-08-07` beta 头并剥掉模型名里的 `[1m]` 标记。新增「模拟 Claude Code 客户端」开关（默认关）：UA 换成 `claude-cli/1.0.119 (external, cli)`、附 `x-app: cli` 与 `anthropic-beta: claude-code-20250219`、系统提示首行注入官方身份串，仅用于网关限制“只能通过 Claude Code 使用”的场景。另外把 `max_tokens` 优先级改成「表单显式填写 > 请求自带 > 内置 8192」，并修正非流式压缩会拿 Anthropic 响应体当 chat/Responses 结构解析导致的空摘要失败。
-- 「Anthropic Messages 上游」的**思考等级改为可原样透传**：新增「思考模式」四档（自动 / 等级透传 / 经典预算 / 关闭）。自动模式按模型能力分流——新代模型（opus-5、sonnet-5、haiku-5、fable-5、mythos-5 及 4.6 以后的家族）发 `thinking: {type: adaptive}` + `output_config: {effort}`，把 Codex 的 `reasoning.effort` 按 Anthropic 的四档（low/medium/high/max，`xhigh`/`ultra` 归到 max）原样传下去，不再受 `max_tokens / 2` 的预算夹取压制；旧代模型回落经典 `budget_tokens`。依据是真机实测：`claude-sonnet-4-6` / `sonnet-5` / `opus-5` / `opus-5-5` / `fable-5-1` 收到 adaptive 会真的产出 thinking 块，而 `haiku-4-5` / `opus-4-5` 会静默忽略（不报错），所以给旧代保留预算路径更可控。签名的跨轮回放两种模式都走同一条链路，不受影响。
+本次更新带来原生 Fast 解锁、外部 Agent 协作和 Anthropic Messages 上游支持，同时改进供应商管理、会话加载与数据保护。
+
+### 新增
+
+- **原生 Fast 解锁**：纯 API Key 模式下可恢复 Codex 原生 Fast 开关。默认关闭，保存后需重启 Codex；实际支持情况与计费由供应商决定。
+- **外部 Agent 协作**：支持在 Codex 对话中委派任务给 DeepSeek Harness、Claude Code 或另一个 Codex，并查询进度、收取结果、取消或继续任务。提供一键 MCP 接入与工具刷新，支持复用 DSH 原生认证。
+- **Anthropic Messages 上游**：支持接入仅提供 `/v1/messages` 的网关，覆盖流式输出、工具调用、图片、思考等级、思考签名跨轮回放和提示缓存，并兼容 1M 上下文窗口声明。
+- **命名 API Key 管理**：同一供应商可保存多个命名 Key，并选择当前使用项，兼容旧版单 Key 配置。
+- **本机配置快照**：将当前本机配置保存为可编辑、可切换的“系统默认”供应商，方便切换后恢复原配置。
+
+### 修复
+
+- 修复模型目录路径、上下文窗口覆盖与导入，以及聚合模型前缀、供应商分组和默认成员标记问题。
+- 修复供应商配置保存冲突，以及会话备份、同步、删除和撤销相关的数据安全问题。
+- 修复部分多代理场景中的请求内容丢失、工具映射和会话连接问题，加强压缩完成校验。
+- 修复 MCP 接入后的工具与列表缓存刷新问题，区分配置接入、工具就绪和列表待刷新状态。
+- 修复 Claude 路径检测、Windows 多开隔离及微信 CLI 路径失效问题。
+- 修复页面遮挡、返回导航、用量状态栏稳定性及 API Key 控件布局问题。
+- 修复保存设置时重新写回已退役布局开关的问题。
+
+### 优化
+
+- **会话加载**：缓存会话索引，翻页时只读取当前页详情，改善大量历史会话下的浏览体验。
+- **Skills 管理**：改进仓库浏览、列表展示和管理操作。
+- **主题兼容**：适配 Dream Skin v1.5.20 社区主题。
+- **Fast 控件**：移除旧版自定义 Fast 控件，统一使用原生 Fast 入口。
+- **官方额度解锁**：入口调整至“常用增强 → 独立模式”，明确增强开启与关闭时的生效方式。此功能只解除客户端发送锁，不改变账户额度。
+- **更新进度**：下载与安装按真实阶段展示，区分待恢复提示与实际修复进度。
+
+Agent 协作默认关闭，需要先安装并登录对应 CLI，再启用和接入。已有协作接入的用户，升级后可点击“一键接入并刷新”更新工具连接。
+
 ## 1.9.0 - 2026-10-15
 
 - 新增「Claude 增强」页（左侧工具条第二位，原「Claude 汉化」）：把「受管副本」提为**所有增强共同的前置条件**，单独一张卡片承载状态、官方/副本版本、外壳语言、官方词条与「准备 / 启动 / 检查」操作，并配带编号的上手步骤（准备副本 → 启动 Claude 副本 → 在左边开启增强），完成的一步打勾变绿、当前该做的一步高亮；「界面汉化」与「语音输入」移到左栏，是两个各自独立的开关，互不影响，也都与「准备副本」解绑——副本没准备时开关照样先存下来，准备好并启动后才生效。
