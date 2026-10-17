@@ -70,7 +70,14 @@ fn legacy_configuration_gets_a_default_without_enabling_workers_or_changing_mode
         config
             .agents
             .iter()
-            .all(|agent| agent.model.is_empty() && !agent.enabled)
+            .all(|agent| agent.model.is_empty() && !agent.enabled && !agent.reuse_saved_auth)
+    );
+    assert!(
+        serde_json::to_value(&config).unwrap()["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|agent| agent.get("reuseSavedAuth").is_none())
     );
     let temp = tempfile::tempdir().unwrap();
     let store = store(&temp);
@@ -79,8 +86,101 @@ fn legacy_configuration_gets_a_default_without_enabling_workers_or_changing_mode
     invalid.default_agent_id = "unknown".to_string();
     assert!(store.save_config(invalid).is_err());
     let mut invalid = config.clone();
-    invalid.agents[1].model = "not-supported-as-a-headless-flag".to_string();
+    invalid.agents[1].model = "missing-provider".to_string();
     assert!(store.save_config(invalid).is_err());
+    assert_eq!(store.config().unwrap(), config);
+}
+
+#[test]
+fn dsh_saved_auth_is_opt_in_and_round_trips_without_serializing_disabled_flags() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(&temp);
+    let mut config = CollaborationConfig::default();
+    config.agents[1].reuse_saved_auth = true;
+    store.save_config(config.clone()).unwrap();
+    assert_eq!(store.config().unwrap(), config);
+    let serialized = serde_json::to_value(&config).unwrap();
+    assert_eq!(serialized["agents"][1]["reuseSavedAuth"], true);
+    assert!(serialized["agents"][0].get("reuseSavedAuth").is_none());
+    assert!(serialized["agents"][2].get("reuseSavedAuth").is_none());
+
+    config.agents[1].reuse_saved_auth = false;
+    store.save_config(config.clone()).unwrap();
+    assert_eq!(store.config().unwrap(), config);
+    assert!(
+        store.snapshot().unwrap()["config"]["agents"][1]
+            .get("reuseSavedAuth")
+            .is_none()
+    );
+}
+
+#[test]
+fn saved_auth_for_other_agents_is_rejected_without_overwriting_saved_choice() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(&temp);
+    let mut config = CollaborationConfig::default();
+    config.agents[1].reuse_saved_auth = true;
+    store.save_config(config.clone()).unwrap();
+    for index in [0, 2] {
+        let mut invalid = config.clone();
+        invalid.agents[index].reuse_saved_auth = true;
+        assert!(store.save_config(invalid).is_err());
+        assert_eq!(store.config().unwrap(), config);
+    }
+}
+
+#[test]
+fn dsh_model_routes_round_trip_without_changing_other_agents_or_native_defaults() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(&temp);
+    let mut config = CollaborationConfig::default();
+    for route in [
+        "deepseek-account/deepseek-flash",
+        "deepseek-official/deepseek-v4-pro",
+        "provider.custom_v2/nested/model",
+        "",
+    ] {
+        config.agents[1].model = route.to_string();
+        store.save_config(config.clone()).unwrap();
+        assert_eq!(store.config().unwrap(), config);
+        assert_eq!(
+            store.snapshot().unwrap()["config"]["agents"][1]["model"],
+            route
+        );
+    }
+    config.agents[1].model = "  deepseek-account/deepseek-flash  ".to_string();
+    store.save_config(config).unwrap();
+    assert_eq!(
+        store.config().unwrap().agents[1].model,
+        "deepseek-account/deepseek-flash"
+    );
+}
+
+#[test]
+fn invalid_dsh_model_routes_preserve_saved_configuration() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(&temp);
+    let mut config = CollaborationConfig::default();
+    config.agents[1].model = "deepseek-account/deepseek-flash".to_string();
+    store.save_config(config.clone()).unwrap();
+    for route in [
+        "model-only",
+        "/deepseek-flash",
+        "deepseek-account/",
+        "provider name/model",
+        "供应商/model",
+        "provider:custom/model",
+        "provider/-model",
+        "provider/model\nother",
+    ] {
+        let mut invalid = config.clone();
+        invalid.agents[1].model = route.to_string();
+        assert!(store.save_config(invalid).is_err(), "accepted {route:?}");
+        assert_eq!(store.config().unwrap(), config);
+    }
+    let mut oversized = config.clone();
+    oversized.agents[1].model = format!("provider/{}", "x".repeat(256));
+    assert!(store.save_config(oversized).is_err());
     assert_eq!(store.config().unwrap(), config);
 }
 

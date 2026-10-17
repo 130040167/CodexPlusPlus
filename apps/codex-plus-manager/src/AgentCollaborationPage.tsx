@@ -4,7 +4,7 @@ import { ArrowRightLeft, Check, Copy, Loader2, Play, RefreshCw, Save, Square } f
 import { PageHeader } from "./ManagementPages";
 import "./AgentCollaborationPage.css";
 
-type Agent = { id: string; name: string; executable: string; enabled: boolean; model: string };
+type Agent = { id: string; name: string; executable: string; enabled: boolean; model: string; reuseSavedAuth: boolean };
 type CollaborationConfig = { enabled: boolean; defaultAgentId: string; agents: Agent[] };
 type Integration = { status: "connected" | "not_connected" | "conflict"; message: string; home?: string; configPath?: string };
 type CodexRuntime = {
@@ -45,9 +45,9 @@ const defaultConfig = (): CollaborationConfig => ({
   enabled: false,
   defaultAgentId: "deepseek",
   agents: [
-    { id: "codex", name: "Codex", executable: "", enabled: false, model: "" },
-    { id: "deepseek", name: "DeepSeek Harness", executable: "", enabled: false, model: "" },
-    { id: "claude", name: "Claude Code", executable: "", enabled: false, model: "" },
+    { id: "codex", name: "Codex", executable: "", enabled: false, model: "", reuseSavedAuth: false },
+    { id: "deepseek", name: "DeepSeek Harness", executable: "", enabled: false, model: "", reuseSavedAuth: false },
+    { id: "claude", name: "Claude Code", executable: "", enabled: false, model: "", reuseSavedAuth: false },
   ],
 });
 const statusLabels: Record<TaskStatus, string> = {
@@ -58,11 +58,11 @@ const absolutePath = (value: string) => /^(?:\/|[a-zA-Z]:[\\/]|\\\\)/.test(value
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 const runtimeReady = (runtime?: CodexRuntime | null) => runtime?.status === "ready"
   && runtime.reloadSucceeded === true && runtime.toolsReady === true && runtime.cacheRefreshed === true;
-// 旧版本快照没有默认 Agent 与模型字段，读取后补齐，保存时发送完整配置。
+// 旧版本快照和默认关闭的认证字段可能省略，读取后补齐，保存时发送完整配置。
 const copyConfig = (config: CollaborationConfig): CollaborationConfig => ({
   ...config,
   defaultAgentId: config.defaultAgentId || "deepseek",
-  agents: config.agents.map((agent) => ({ ...agent, model: agent.id === "deepseek" ? "" : agent.model || "" })),
+  agents: config.agents.map((agent) => ({ ...agent, model: agent.model || "", reuseSavedAuth: agent.reuseSavedAuth === true })),
 });
 const formatTime = (value: number) => Number.isFinite(value) && value > 0
   ? new Date(value).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false })
@@ -199,7 +199,7 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
   const saveConfig = () => {
     const invalid = draft.agents.find((agent) => agent.executable.trim() && !absolutePath(agent.executable));
     if (invalid) { setActionError(`请填写 ${invalid.name} 可执行文件的绝对路径。`); return; }
-    void mutate("save_config", { ...draft, agents: draft.agents.map((agent) => ({ ...agent, executable: agent.executable.trim(), model: agent.id === "deepseek" ? "" : agent.model.trim() })) }, () => {
+    void mutate("save_config", { ...draft, agents: draft.agents.map((agent) => ({ ...agent, executable: agent.executable.trim(), model: agent.model.trim() })) }, () => {
       setNotice("子 Agent 设置已保存。");
       setMcpConfig(null);
       setCopied("");
@@ -347,9 +347,12 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
             return <div className="agent-collaboration-agent" key={agent.id}>
               <label className="agent-collaboration-agent-title"><input type="checkbox" checked={agent.enabled} disabled={!snapshot || busy === "save_config"} onChange={(event) => editAgent(agent.id, { enabled: event.target.checked })} /><strong>{agent.name}</strong></label>
               <label className="mg-field" htmlFor={`agent-collaboration-path-${agent.id}`}><span>可执行文件路径（可选）</span><input id={`agent-collaboration-path-${agent.id}`} value={agent.executable} disabled={!snapshot || busy === "save_config"} placeholder={availability?.path || "留空自动查找已安装的 CLI"} spellCheck={false} autoCapitalize="off" autoCorrect="off" onChange={(event) => editAgent(agent.id, { executable: event.target.value })} /></label>
-              <label className="mg-field" htmlFor={`agent-collaboration-model-${agent.id}`}><span>{agent.id === "deepseek" ? "默认模型" : "模型（可选）"}</span><input id={`agent-collaboration-model-${agent.id}`} value={agent.id === "deepseek" ? "" : agent.model} disabled={agent.id === "deepseek" || !snapshot || busy === "save_config"} placeholder={agent.id === "deepseek" ? "沿用 DeepSeek Harness CLI 默认模型" : "留空沿用该 CLI 默认模型"} spellCheck={false} autoCapitalize="off" autoCorrect="off" aria-describedby={agent.id === "deepseek" ? "agent-collaboration-deepseek-model-hint" : undefined} onChange={(event) => editAgent(agent.id, { model: event.target.value })} />{agent.id === "deepseek" && <small id="agent-collaboration-deepseek-model-hint">在 DeepSeek Harness CLI 中配置默认模型。</small>}</label>
+              <label className="mg-field" htmlFor={`agent-collaboration-model-${agent.id}`}><span>{agent.id === "deepseek" ? "模型路由（可选）" : "模型（可选）"}</span><input id={`agent-collaboration-model-${agent.id}`} value={agent.model} disabled={!snapshot || busy === "save_config"} placeholder={agent.id === "deepseek" ? "deepseek-account/deepseek-flash" : "留空沿用该 CLI 默认模型"} spellCheck={false} autoCapitalize="off" autoCorrect="off" aria-describedby={agent.id === "deepseek" ? "agent-collaboration-deepseek-model-hint" : undefined} onChange={(event) => editAgent(agent.id, { model: event.target.value })} />{agent.id === "deepseek" && <small id="agent-collaboration-deepseek-model-hint">使用 provider/model 格式。账户登录用 deepseek-account，API 密钥用 deepseek-official；留空沿用 headless 默认模型。</small>}</label>
               <small className="agent-collaboration-agent-state" data-unavailable={available === false}>{!savedPath ? "路径尚未保存" : available === true ? "已找到 CLI 文件" : available === false ? "未找到 CLI 文件" : agent.executable.trim() ? "已配置，执行任务时验证" : "留空自动查找已安装的 CLI"}{availability?.path && <code>{availability.path}</code>}</small>
-              {agent.id === "deepseek" && <small className="agent-collaboration-agent-note">DSH 使用 headless 配置；如提示未登录，需先配置其 CLI。</small>}
+              {agent.id === "deepseek" && <>
+                <label className="agent-collaboration-auth"><input type="checkbox" checked={agent.reuseSavedAuth} disabled={!snapshot || busy === "save_config"} aria-describedby="agent-collaboration-deepseek-auth-hint" onChange={(event) => editAgent(agent.id, { reuseSavedAuth: event.target.checked })} /><span>复用 DSH 已保存的登录与密钥</span></label>
+                <small id="agent-collaboration-deepseek-auth-hint" className="agent-collaboration-agent-note">默认关闭。开启后由 dsh 自行读取已保存的认证，Codex++ 不读取或保存登录与密钥；不会自动选择桌面当前使用的模型。</small>
+              </>}
             </div>;
           })}
         </div>

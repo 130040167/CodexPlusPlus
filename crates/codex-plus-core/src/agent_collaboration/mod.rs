@@ -1,5 +1,6 @@
 //! 本机 CLI 协作记录。每次状态转换均在 SQLite 写事务中完成；读取不会启动 agent。
 
+mod dsh;
 pub mod executor;
 pub mod integration;
 pub mod mcp;
@@ -29,6 +30,34 @@ pub struct AgentConfig {
     /// 空值沿用原生 CLI 的模型配置，不修改供应商配置。
     #[serde(default)]
     pub model: String,
+    /// 仅 DSH 可选择由原生 CLI 复用已保存的认证，本工具不保存凭据。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reuse_saved_auth: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// DSH 的临时模型配置需要同时指定供应商与模型，不能推测桌面当前选中的路由。
+pub(super) fn parse_deepseek_model(value: &str) -> anyhow::Result<Option<(&str, &str)>> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let (provider, model) = value
+        .split_once('/')
+        .context("DeepSeek 模型路由必须为 provider/model；留空沿用 headless 默认模型")?;
+    if provider.is_empty()
+        || !provider
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || model.is_empty()
+        || model.starts_with('-')
+        || model.chars().any(char::is_control)
+    {
+        bail!("DeepSeek 模型路由格式无效，需填写有效的 provider/model");
+    }
+    Ok(Some((provider, model)))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -61,6 +90,7 @@ impl Default for CollaborationConfig {
                 executable: String::new(),
                 enabled: false,
                 model: String::new(),
+                reuse_saved_auth: false,
             })
             .collect(),
         }
@@ -511,6 +541,9 @@ fn normalize_config(config: CollaborationConfig) -> anyhow::Result<Collaboration
         agent.name = agent.name.trim().to_string();
         agent.executable = agent.executable.trim().to_string();
         agent.model = agent.model.trim().to_string();
+        if agent.id != "deepseek" && agent.reuse_saved_auth {
+            bail!("仅 DeepSeek Harness 支持复用 DSH 已保存的认证");
+        }
         if agent.name.len() > 160 || agent.name.chars().any(|value| value.is_control()) {
             bail!("agent 名称格式无效");
         }
@@ -527,8 +560,8 @@ fn normalize_config(config: CollaborationConfig) -> anyhow::Result<Collaboration
         {
             bail!("模型名称格式无效，不能超过 256 字节或包含控制字符");
         }
-        if agent.id == "deepseek" && !agent.model.is_empty() {
-            bail!("当前 DSH headless 不支持临时模型参数，请在 DeepSeek Harness CLI 中配置默认模型");
+        if agent.id == "deepseek" {
+            parse_deepseek_model(&agent.model)?;
         }
         if agent.name.is_empty() {
             agent.name.clone_from(&target.name);

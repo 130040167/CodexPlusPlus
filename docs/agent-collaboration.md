@@ -28,8 +28,9 @@ Codex 获得异步任务 ID 后可以继续独立工作，再通过等待或查�
 - 支持 Codex、DeepSeek Harness、Claude Code；任务实际在对应 CLI 内执行。
 - 保存总开关和各 Agent 的启用状态后才能派任务。
 - 默认 Agent 仅影响未明确指定目标的委派。默认目标未启用时会报错，显式点名其他已启用目标仍然可用。
-- Codex、Claude Code 可选填模型；留空沿用原生 CLI 默认模型。DSH headless 没有临时模型参数，其模型在 DSH CLI 中配置。
+- Codex、Claude Code 可选填模型；留空沿用原生 CLI 默认模型。DeepSeek 可填写 `provider/model` 模型路由，例如 `deepseek-account/deepseek-flash`；账户登录使用 `deepseek-account`，API 密钥使用 `deepseek-official`。模型名称需在对应供应商中可用，留空沿用 DSH headless 的默认路由。
 - 可执行文件路径留空时自动发现，填写时必须是绝对路径。检测到文件不代表已登录或模型可用。
+- DeepSeek 可选择「复用 DSH 已保存的登录与密钥」，默认关闭。开启后由 dsh 自行读取原生认证，Codex++ 只保存此开关，不读取或保存登录与密钥；此开关不会自动选择 DeepSeek 桌面当前使用的模型。
 - 每个 Agent 同时执行一个任务。不同 Agent 可以并行，调用方需要安排好工作目录，避免同时修改相同文件。
 - 新任务创建独立会话；已完成且记录了原生会话 ID 的任务可选择「继续该任务」，续聊固定原 Agent 与工作目录。
 - 提示词经 stdin 传入，不通过 shell 拼接。协作服务不会读取、复制或改写各 CLI 的凭据和供应商配置。
@@ -37,7 +38,11 @@ Codex 获得异步任务 ID 后可以继续独立工作，再通过等待或查�
 - 任务由发起它的管理器或 MCP 进程托管；正常退出该进程会中断其尚未完成的任务，其他客户端进程的任务不受影响。
 - 中断、失败或通信结果不确定时不会自动重试；请先检查结果。
 
-DSH headless 默认使用自己的环境凭据配置，可能无法直接使用桌面应用保存的登录。若任务报告认证失败，请先完成 DSH CLI 的配置。Codex 和 Claude Code 同样需要可用的原生登录与模型设置。
+DSH headless 默认使用环境凭据。若已在 DeepSeek Harness 中登录或保存密钥，可在子 Agent 设置中开启「复用 DSH 已保存的登录与密钥」，并明确选择与认证方式匹配的模型路由。协作服务通过本次任务专用的 `--patch` 文件启用 DSH 原生保存认证能力及可选的模型路由，不修改 DSH 的持久配置。只有显式选择 `deepseek-account` 路由时才启用账户服务，API 密钥路由不初始化账户登录。生成的无凭据 JSON 保存在协作状态目录的 `agent-collaboration-overlays/<taskId>.json`，用于排查本次参数。
+
+复用认证不会导入 desktop profile 的其他设置。自定义账户服务地址需先在 DSH headless profile 中配置正确；思考强度等参数沿用 headless 配置。更改模型路由用于新任务，继续已有原生会话时仍由 DSH 使用该会话的模型。若仍报告认证失败，请检查 DSH 原生登录是否有效以及所选模型使用的供应商路由。Codex 和 Claude Code 同样需要可用的原生登录与模型设置。
+
+升级后若 Codex 仍连接旧版 MCP 进程，请在新版管理器中点击「一键接入并刷新」，让后续委派使用新版执行器及配置。
 
 ## 手动接入及其他客户端
 

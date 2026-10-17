@@ -253,9 +253,6 @@ async fn run_task(store: &Store, id: &str) -> anyhow::Result<Outcome> {
         .find(|agent| agent.id == task.agent_id && agent.enabled)
         .context("协作 Agent 已停用或不存在")?;
     let provider = Provider::from_id(&agent.id)?;
-    if provider == Provider::DeepSeek && !agent.model.trim().is_empty() {
-        bail!("DSH 的模型需在其原生 CLI 中配置");
-    }
     let executable =
         resolve_executable(agent).context("未找到原生 CLI，请在协作设置中填写可执行文件路径")?;
     if task.prompt.trim().is_empty() || task.prompt.len() > MAX_PROMPT_BYTES {
@@ -275,9 +272,20 @@ async fn run_task(store: &Store, id: &str) -> anyhow::Result<Outcome> {
         validate_session_id(&task.session_id)?;
     }
 
+    let overlay = if provider == Provider::DeepSeek {
+        super::dsh::prepare_overlay(store, &task, agent)?
+    } else {
+        None
+    };
     let mut command = Command::new(executable);
+    configure_cli(
+        &mut command,
+        provider,
+        &task.session_id,
+        &agent.model,
+        overlay.as_deref(),
+    );
     command
-        .args(cli_args(provider, &task.session_id, &agent.model))
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -292,6 +300,26 @@ async fn run_task(store: &Store, id: &str) -> anyhow::Result<Outcome> {
         .spawn()
         .context("无法启动原生 CLI，请检查路径和执行权限")?;
     supervise(store, &task, provider, child, MAX_RUNTIME).await
+}
+
+fn configure_cli(
+    command: &mut Command,
+    provider: Provider,
+    session_id: &str,
+    model: &str,
+    overlay: Option<&Path>,
+) {
+    let args = cli_args(provider, session_id, model);
+    if let Some(overlay) = overlay.filter(|_| provider == Provider::DeepSeek) {
+        // --patch 是 launcher 参数，必须位于 headless 的 --json 之前。
+        command
+            .args(&args[..2])
+            .arg("--patch")
+            .arg(overlay)
+            .args(&args[2..]);
+    } else {
+        command.args(args);
+    }
 }
 
 fn cli_args(provider: Provider, session_id: &str, model: &str) -> Vec<String> {
@@ -547,7 +575,7 @@ async fn supervise(
     let error = state.failure.unwrap_or_else(|| {
         let diagnostic = String::from_utf8_lossy(stderr_tail.make_contiguous()).to_lowercase();
         if diagnostic.contains("auth") || diagnostic.contains("login") || diagnostic.contains("api key") || diagnostic.contains("sign in") {
-            "CLI 未成功完成，请先在该原生 CLI 中登录并检查模型配置。DeepSeek headless 默认使用环境凭据，不继承桌面保存的登录。".to_owned()
+            "CLI 未成功完成，请检查原生登录与模型路由。DeepSeek 账户登录可在子 Agent 设置中启用复用 DSH 已保存认证，并指定 deepseek-account 模型路由。".to_owned()
         } else if !success_exit {
             format!("CLI 异常退出（{}），请检查原生登录、模型配置和权限；已执行的工作区操作可能仍然保留", exit_status.map(|status| status.to_string()).unwrap_or_else(|| "未知退出状态".to_owned()))
         } else {
@@ -674,6 +702,10 @@ impl ProtocolState {
         if text.is_empty() {
             return Ok(());
         }
+        // 当前 DSH 账户适配器会把这一条模型列表诊断写入 stdout；其余内容仍须为 NDJSON。
+        if self.provider == Provider::DeepSeek && is_deepseek_model_listing_diagnostic(text) {
+            return Ok(());
+        }
         let event: Value = serde_json::from_str(text)?;
         let kind = event
             .get("type")
@@ -785,6 +817,36 @@ impl ProtocolState {
         }
         Ok(())
     }
+}
+
+fn is_deepseek_model_listing_diagnostic(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix("[llm-deepseek-account] model listing from ") else {
+        return false;
+    };
+    let Some((address, counts)) = rest.rsplit_once(" loaded ") else {
+        return false;
+    };
+    let Ok(address) = reqwest::Url::parse(address) else {
+        return false;
+    };
+    if !matches!(address.scheme(), "https" | "http")
+        || !address.has_host()
+        || !address.username().is_empty()
+        || address.password().is_some()
+    {
+        return false;
+    }
+    let Some((loaded, skipped)) = counts.split_once(" model(s), skipped ") else {
+        return false;
+    };
+    let Some(skipped) = skipped.strip_suffix(" row(s)") else {
+        return false;
+    };
+    [loaded, skipped].iter().all(|count| {
+        !count.is_empty()
+            && count.bytes().all(|byte| byte.is_ascii_digit())
+            && count.parse::<u64>().is_ok()
+    })
 }
 
 fn error_text(value: &Value, fallback: &str) -> String {
@@ -936,6 +998,84 @@ mod tests {
                 .iter()
                 .any(|value| value == "--model")
         );
+    }
+
+    #[test]
+    fn deepseek_overlay_is_a_single_launcher_argument_for_new_and_resumed_sessions() {
+        let patch = Path::new("/private/task with spaces/overlay.json");
+        for session in ["", "session-123"] {
+            let mut command = Command::new("dsh");
+            configure_cli(
+                &mut command,
+                Provider::DeepSeek,
+                session,
+                "deepseek-account/deepseek-flash",
+                Some(patch),
+            );
+            let args: Vec<_> = command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                &args[..5],
+                [
+                    "--profile",
+                    "headless",
+                    "--patch",
+                    patch.to_str().unwrap(),
+                    "--json"
+                ]
+            );
+            assert_eq!(args.last().unwrap(), "-");
+            assert!(!args.iter().any(|arg| arg == "--model"));
+            if !session.is_empty() {
+                assert_eq!(&args[5..7], ["--session-id", session]);
+            }
+            let mut unpatched = Command::new("dsh");
+            configure_cli(&mut unpatched, Provider::DeepSeek, session, "", None);
+            assert_eq!(
+                unpatched
+                    .as_std()
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+                cli_args(Provider::DeepSeek, session, "")
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_exact_deepseek_account_model_listing_diagnostic_can_bypass_json() {
+        let diagnostic = "[llm-deepseek-account] model listing from https://api.deepseek.com/models loaded 3 model(s), skipped 0 row(s)";
+        let mut dsh = ProtocolState::new(Provider::DeepSeek, "session-123".to_owned());
+        dsh.parse_line(diagnostic.as_bytes()).unwrap();
+        assert_eq!(dsh.session_id, "session-123");
+        assert!(!dsh.succeeded);
+        assert!(dsh.answer.is_empty());
+        for other in [Provider::Codex, Provider::Claude] {
+            assert!(
+                ProtocolState::new(other, String::new())
+                    .parse_line(diagnostic.as_bytes())
+                    .is_err()
+            );
+        }
+        for invalid in [
+            "[llm-deepseek-account] something else",
+            "[llm-deepseek-account] model listing from https://api.deepseek.com/models loaded bad model(s), skipped 0 row(s)",
+            "[llm-deepseek-account] model listing from https://api.deepseek.com/models loaded 3 model(s), skipped 0 row(s) extra",
+            "[llm-deepseek-account] model listing from file:///models loaded 3 model(s), skipped 0 row(s)",
+            "[llm-deepseek-account] model listing from https://user:pass@example.invalid/models loaded 3 model(s), skipped 0 row(s)",
+        ] {
+            assert!(dsh.parse_line(invalid.as_bytes()).is_err());
+        }
+        parse(&mut dsh, serde_json::json!({"type":"final","text":"2"}));
+        parse(
+            &mut dsh,
+            serde_json::json!({"type":"status","phase":"turn_end","reason":{"kind":"completed"}}),
+        );
+        assert!(dsh.succeeded);
+        assert_eq!(dsh.answer, "2");
     }
 
     #[test]

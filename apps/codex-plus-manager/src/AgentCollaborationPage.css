@@ -57,6 +57,8 @@
 .agent-collaboration-agent-state { font-size:11px; color:hsl(var(--muted-foreground)); }
 .agent-collaboration-agent-state code { display:block; margin-top:5px; font-size:10px; overflow-wrap:anywhere; }
 .agent-collaboration-agent-note { color:hsl(var(--muted-foreground)); font-size:11px; line-height:1.6; }
+.agent-collaboration-auth { display:flex; align-items:flex-start; gap:8px; font-size:11px; line-height:1.6; cursor:pointer; }
+.agent-collaboration-auth input { margin-top:3px; flex-shrink:0; }
 .agent-collaboration-agent-state[data-unavailable=true] { color:hsl(var(--status-warning)); }
 .agent-collaboration-form { display:flex; flex-direction:column; gap:14px; }
 .agent-collaboration-form-row { display:grid; grid-template-columns:minmax(160px,1fr) minmax(0,2fr); gap:14px; }
@@ -112,5 +114,5 @@
 .agent-collaboration-spin { animation:agent-collaboration-spin 1s linear infinite; }
 @keyframes agent-collaboration-spin { to { transform:rotate(360deg); } }
 @media (prefers-reduced-motion:reduce) { .agent-collaboration-spin { animation:none; } }
-@media(max-width:1000px) { .agent-collaboration-agents { grid-template-columns:1fr; } .agent-collaboration-agent { display:grid; grid-template-columns:170px minmax(0,1fr); align-items:start; } .agent-collaboration-agent-title { grid-column:1; grid-row:1/span 2; padding-top:4px; } .agent-collaboration-agent>.mg-field,.agent-collaboration-agent-state,.agent-collaboration-agent-note { grid-column:2; } }
+@media(max-width:1000px) { .agent-collaboration-agents { grid-template-columns:1fr; } .agent-collaboration-agent { display:grid; grid-template-columns:170px minmax(0,1fr); align-items:start; } .agent-collaboration-agent-title { grid-column:1; grid-row:1/span 2; padding-top:4px; } .agent-collaboration-agent>.mg-field,.agent-collaboration-agent-state,.agent-collaboration-agent-note,.agent-collaboration-auth { grid-column:2; } }
 @media(max-width:760px) { .agent-collaboration-content { padding:16px; gap:14px; } .agent-collaboration-section { padding:14px; } .agent-collaboration-section-head { flex-wrap:wrap; } .agent-collaboration-agent { display:flex; align-items:stretch; } .agent-collaboration-default,.agent-collaboration-form-row,.agent-collaboration-task-workspace,.agent-collaboration-mcp-configs { grid-template-columns:1fr; } .agent-collaboration-task-list { max-height:240px; border-right:0; border-bottom:1px solid hsl(var(--border)); } .agent-collaboration-task-detail { max-height:600px; } .agent-collaboration-continuation,.agent-collaboration-form-footer { align-items:flex-start; flex-direction:column; } .agent-collaboration-form-footer>.mg-button { align-self:flex-end; } .agent-collaboration-debug-body { padding-inline:10px; } }
