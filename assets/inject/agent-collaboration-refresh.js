@@ -86,7 +86,7 @@
     return !!value && typeof value.getQueryCache === "function" && typeof value.setQueryData === "function"
       && typeof value.invalidateQueries === "function" && typeof value.refetchQueries === "function";
   }
-  function queryClientFromFiber(fiber) {
+  function queryClientFromFiber(fiber, inspect) {
     const seen = new Set();
     const stack = [fiber];
     while (stack.length && seen.size < 8000) {
@@ -94,8 +94,9 @@
       if (!node || typeof node !== "object" || seen.has(node)) continue;
       seen.add(node);
       const props = node.memoizedProps || node.pendingProps;
-      for (const value of [props?.client, props?.value, node.stateNode, node.memoizedState?.memoizedState]) {
-        if (isQueryClient(value)) return value;
+      for (const value of [props?.client, props?.queryClient, props?.value, node.stateNode, node.memoizedState?.memoizedState]) {
+        const client = inspect(value);
+        if (client) return client;
       }
       if (node.child) stack.push(node.child);
       if (node.sibling) stack.push(node.sibling);
@@ -103,8 +104,17 @@
     return null;
   }
   function findQueryClient() {
+    let sawQueryClient = false;
+    const seen = new Set();
+    const inspect = value => {
+      if (!isQueryClient(value) || seen.has(value)) return null;
+      seen.add(value);
+      sawQueryClient = true;
+      return exactQuery(value) ? value : null;
+    };
     for (const value of [window.__REACT_QUERY_CLIENT__, window.__codexQueryClient]) {
-      if (isQueryClient(value)) return value;
+      const client = inspect(value);
+      if (client) return { client, sawQueryClient };
     }
     const roots = [document.getElementById?.("root"), document.body, document.documentElement].filter(Boolean);
     for (const root of roots) {
@@ -114,31 +124,41 @@
       if (!key) continue;
       let fiber = root[key];
       if (fiber?.stateNode?.current) fiber = fiber.stateNode.current;
-      const client = queryClientFromFiber(fiber);
-      if (client) return client;
+      const client = queryClientFromFiber(fiber, inspect);
+      if (client) return { client, sawQueryClient };
     }
-    return null;
+    return { client: null, sawQueryClient };
   }
   function exactQuery(client) {
     const cache = client.getQueryCache();
-    if (typeof cache?.find === "function") return cache.find({ queryKey, exact: true });
-    if (typeof cache?.getAll !== "function") return null;
-    return cache.getAll().find(query => Array.isArray(query?.queryKey) && query.queryKey.length === queryKey.length
-      && query.queryKey.every((value, index) => value === queryKey[index])) || null;
+    const matches = query => Array.isArray(query?.queryKey) && query.queryKey.length === queryKey.length
+      && query.queryKey.every((value, index) => value === queryKey[index]);
+    if (typeof cache?.find === "function") {
+      const query = cache.find({ queryKey, exact: true });
+      return matches(query) ? query : null;
+    }
+    return typeof cache?.getAll === "function" ? cache.getAll().find(matches) || null : null;
   }
+  let cacheFailure = "";
   try {
-    const client = findQueryClient();
-    if (client && exactQuery(client)) {
+    const { client, sawQueryClient } = findQueryClient();
+    if (!client) {
+      cacheFailure = sawQueryClient
+        ? "尚未建立列表查询，请先在 Codex 中打开 /mcp，再点击刷新。"
+        : "未找到 QueryClient，无法刷新 MCP 列表缓存。";
+    } else {
       await bounded((async () => {
         await client.invalidateQueries({ queryKey, exact: true, refetchType: "none" });
-        await client.refetchQueries({ queryKey, exact: true, type: "all" });
+        await client.refetchQueries({ queryKey, exact: true, type: "all" }, { throwOnError: true });
       })(), 1800);
       const query = exactQuery(client);
       const cached = typeof client.getQueryData === "function" ? client.getQueryData(queryKey) : query?.state?.data;
       report.cacheRefreshed = query?.state?.isInvalidated !== true && toolsReady(entryFromPayload(cached));
+      if (!report.cacheRefreshed) cacheFailure = "列表数据尚未更新，请稍后再次检查 /mcp。";
     }
   } catch {
     report.cacheRefreshed = false;
+    cacheFailure = "重读列表失败，请稍后重试刷新。";
   }
   if (threadId && currentThreadId() !== threadId) {
     report.threadVerified = false;
@@ -147,6 +167,7 @@
   report.status = report.toolsReady && report.cacheRefreshed ? "ready" : "partial";
   report.message = report.status === "ready"
     ? threadId ? "本机 MCP 配置已整体重读，当前会话工具与 MCP 列表均已刷新。" : "本机 MCP 配置已整体重读，工具与 MCP 列表已刷新；当前页面没有可核验的会话。"
-    : report.toolsReady ? "本机 MCP 配置已整体重读，工具已就绪，但 MCP 列表缓存尚未确认刷新。" : "本机 MCP 配置已整体重读，但当前会话工具尚未确认就绪，请稍后检查。";
+    : report.toolsReady ? `本机 MCP 配置已整体重读，工具已就绪；${cacheFailure}`
+      : `本机 MCP 配置已整体重读，但当前会话工具尚未确认就绪。${cacheFailure}`;
   return result();
 })()

@@ -17,12 +17,22 @@ const calls = [];
 const cacheCalls = [];
 const query = {queryKey:key,state:{data:{data:[]},isInvalidated:false}};
 const otherQuery = {queryKey:['mcp','servers','status','remote','full'],state:{data:{keep:true}}};
+const unrelatedQueryClient = {
+  getQueryCache() { return {find() { return undefined; },getAll() { return [otherQuery]; }}; },
+  setQueryData() { throw new Error('Unrelated cache must not be changed'); },
+  invalidateQueries() { throw new Error('Unrelated cache must not be invalidated'); },
+  refetchQueries() { throw new Error('Unrelated cache must not be refreshed'); },
+};
 const queryClient = {
-  getQueryCache() { return {find(filter) { assert.equal(filter.exact,true); assert.deepEqual(Array.from(filter.queryKey),key); return query; }}; },
+  getQueryCache() { return {find(filter) { assert.equal(filter.exact,true); assert.deepEqual(Array.from(filter.queryKey),key); return mode==='missing-full-query' ? undefined : query; }}; },
   setQueryData() { throw new Error('The diagnostic must never synthesize cache data'); },
   getQueryData(requested) { assert.deepEqual(Array.from(requested),key); return query.state.data; },
   async invalidateQueries(filter) { cacheCalls.push(['invalidate',filter]); assert.equal(filter.exact,true); assert.equal(filter.refetchType,'none'); assert.deepEqual(Array.from(filter.queryKey),key); query.state.isInvalidated=true; },
-  async refetchQueries(filter) { cacheCalls.push(['refetch',filter]); assert.equal(filter.exact,true); assert.equal(filter.type,'all'); assert.deepEqual(Array.from(filter.queryKey),key); query.state.data={data:[item(null)]}; query.state.isInvalidated=false; },
+  async refetchQueries(filter,options) {
+    cacheCalls.push(['refetch',filter]); assert.equal(filter.exact,true); assert.equal(filter.type,'all'); assert.deepEqual(Array.from(filter.queryKey),key); assert.equal(options.throwOnError,true);
+    if (mode==='refetch-error') throw new Error('FAKE_SECRET_CACHE must never escape');
+    query.state.data={data:[mode==='stale-cache' ? {name:'codex_plus_collaboration',tools:{get_task:{name:'get_task'}}} : item(null)]}; query.state.isInvalidated=false;
+  },
 };
 const client = {
   hostId:'local', disposed:false,
@@ -54,11 +64,16 @@ if (mode==='mismatched-entry') entry.hostId='remote';
 if (mode==='disposed') client.disposed=true;
 if (mode==='getter-bound') entry.getterBound=true;
 if (mode==='missing-query-client') delete window.__codexQueryClient;
+if (mode==='wrong-explicit-client-first') window.__REACT_QUERY_CLIENT__=unrelatedQueryClient;
 if (mode==='no-thread') window.location.pathname='/home';
 if (mode==='temporary-thread') window.location.pathname='/thread/client-new-thread:temporary';
 if (mode==='fiber-query-client') {
   delete window.__codexQueryClient;
   root.__reactFiber$fixture={memoizedProps:{client:queryClient}};
+}
+if (mode==='wrong-fiber-client-first') {
+  delete window.__codexQueryClient;
+  root.__reactFiber$fixture={child:{memoizedProps:{client:unrelatedQueryClient},sibling:{memoizedProps:{queryClient}}}};
 }
 const document = {body:root,documentElement:{},getElementById:id=>id==='root'?root:null,createElement(){throw new Error('DOM mutation forbidden');}};
 const context = {window,document,Map,Set,Promise,JSON,Object,Array,Error,setTimeout,clearTimeout};
@@ -76,6 +91,14 @@ const context = {window,document,Map,Set,Promise,JSON,Object,Array,Error,setTime
    assert.equal(report.toolCount,10);
    if (mode==='missing-query-client') {
      assert.equal(report.status,'partial'); assert.equal(report.cacheRefreshed,false); assert.equal(report.toolsReady,true); assert.equal(cacheCalls.length,0);
+     assert.equal(report.message,'本机 MCP 配置已整体重读，工具已就绪；未找到 QueryClient，无法刷新 MCP 列表缓存。');
+   } else if (mode==='missing-full-query') {
+     assert.equal(report.status,'partial'); assert.equal(report.cacheRefreshed,false); assert.equal(report.toolsReady,true); assert.equal(cacheCalls.length,0);
+     assert.equal(report.message,'本机 MCP 配置已整体重读，工具已就绪；尚未建立列表查询，请先在 Codex 中打开 /mcp，再点击刷新。');
+   } else if (mode==='refetch-error' || mode==='stale-cache') {
+     assert.equal(report.status,'partial'); assert.equal(report.cacheRefreshed,false); assert.equal(report.toolsReady,true);
+     assert.deepEqual(cacheCalls.map(call=>call[0]),['invalidate','refetch']);
+     assert.equal(report.message,mode==='refetch-error' ? '本机 MCP 配置已整体重读，工具已就绪；重读列表失败，请稍后重试刷新。' : '本机 MCP 配置已整体重读，工具已就绪；列表数据尚未更新，请稍后再次检查 /mcp。');
    } else {
      assert.deepEqual(cacheCalls.map(call=>call[0]),['invalidate','refetch']);
      assert.equal(report.cacheRefreshed,true);
@@ -89,6 +112,7 @@ const context = {window,document,Map,Set,Promise,JSON,Object,Array,Error,setTime
  }
  assert.deepEqual(Object.keys(report).sort(),['status','message','reloadSucceeded','toolsReady','toolCount','threadVerified','cacheRefreshed'].sort());
  assert.ok(!JSON.stringify(report).includes('FAKE_SECRET_PREFLIGHT'));
+ assert.ok(!JSON.stringify(report).includes('FAKE_SECRET_CACHE'));
  console.log('fixture passed: '+mode);
 })().catch(error=>{console.error(error);process.exitCode=1;});
 "#;
@@ -125,6 +149,8 @@ fn native_refresh_uses_only_fixed_rpc_sequence_and_refreshes_exact_global_full_c
     fixture("fiber-query-client");
     fixture("no-thread");
     fixture("temporary-thread");
+    fixture("wrong-explicit-client-first");
+    fixture("wrong-fiber-client-first");
 }
 
 #[test]
@@ -136,7 +162,10 @@ fn native_refresh_does_not_require_the_old_global_catalog_to_already_see_new_too
 #[test]
 fn native_refresh_reports_partial_without_cache_or_connected_current_thread() {
     fixture("missing-query-client");
+    fixture("missing-full-query");
     fixture("thread-not-ready");
+    fixture("refetch-error");
+    fixture("stale-cache");
 }
 
 #[test]
