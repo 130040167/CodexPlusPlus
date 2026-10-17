@@ -705,8 +705,6 @@ pub struct BackendSettings {
     pub codex_app_native_menu_placement: bool,
     #[serde(rename = "codexAppNativeBrowserRequireIdentification", default)]
     pub codex_app_native_browser_require_identification: bool,
-    #[serde(rename = "codexAppServiceTierControls", default)]
-    pub codex_app_service_tier_controls: bool,
     #[serde(rename = "codexAppNativeFastUnlock", default)]
     pub codex_app_native_fast_unlock: bool,
     #[serde(rename = "codexAppPetRealMouseLook", default)]
@@ -914,7 +912,6 @@ impl Default for BackendSettings {
             codex_app_thread_scroll_restore: true,
             codex_app_native_menu_placement: true,
             codex_app_native_browser_require_identification: false,
-            codex_app_service_tier_controls: false,
             codex_app_native_fast_unlock: false,
             codex_app_pet_real_mouse_look: false,
             codex_app_activity_overlay_right: false,
@@ -1793,6 +1790,7 @@ impl SettingsStore {
             "zedRemoteSyncToZedSettings",
             "codexAppUpstreamWorktreeCreate",
             "codexAppNativeMenuLocalization",
+            "codexAppServiceTierControls",
         ] {
             raw.remove(key);
         }
@@ -1997,7 +1995,6 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "codexAppThreadScrollRestore");
     merge_bool_setting(target, source, "codexAppNativeMenuPlacement");
     merge_bool_setting(target, source, "codexAppNativeBrowserRequireIdentification");
-    merge_bool_setting(target, source, "codexAppServiceTierControls");
     merge_bool_setting(target, source, "codexAppNativeFastUnlock");
     merge_bool_setting(target, source, "codexAppPetRealMouseLook");
     merge_bool_setting(target, source, "codexAppActivityOverlayRight");
@@ -2576,6 +2573,7 @@ fn preserve_unknown_settings_fields(
         "zedRemoteSyncToZedSettings",
         "codexAppUpstreamWorktreeCreate",
         "codexAppNativeMenuLocalization",
+        "codexAppServiceTierControls",
         "codexAppPluginAutoExpand",
         "computerUseGuardEnabled",
     ] {
@@ -3898,7 +3896,7 @@ experimental_bearer_token = "sk-existing""#
             "codexAppSessionDelete": false,
             "codexAppConversationView": true,
             "codexAppThreadIdBadge": true,
-            "codexAppServiceTierControls": true,
+            "codexAppNativeFastUnlock": true,
             "codexAppPetRealMouseLook": true,
             "codexGoalsEnabled": true,
             "relayBaseUrl": "https://relay.example.test/v1",
@@ -3914,7 +3912,7 @@ experimental_bearer_token = "sk-existing""#
         assert!(!updated.codex_app_session_delete);
         assert!(updated.codex_app_conversation_view);
         assert!(updated.codex_app_thread_id_badge);
-        assert!(updated.codex_app_service_tier_controls);
+        assert!(updated.codex_app_native_fast_unlock);
         assert!(updated.codex_app_pet_real_mouse_look);
         assert!(updated.codex_goals_enabled);
         assert_eq!(updated.relay_base_url, "https://relay.example.test/v1");

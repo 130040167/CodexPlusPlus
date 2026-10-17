@@ -473,14 +473,15 @@ async fn settings_routes_use_settings_service() {
     let updated = handle_bridge_request(
         ctx.clone(),
         "/settings/set",
-        json!({"providerSyncEnabled": true, "codexAppSessionDelete": false, "codexAppServiceTierControls": true, "codexAppPetRealMouseLook": true, "codexAppActivityOverlayRight": true}),
+        json!({"providerSyncEnabled": true, "codexAppSessionDelete": false, "codexAppNativeFastUnlock": true, "codexAppPetRealMouseLook": true, "codexAppActivityOverlayRight": true}),
     )
     .await;
     let loaded = handle_bridge_request(ctx, "/settings/get", json!({})).await;
 
     assert_eq!(updated["providerSyncEnabled"], true);
     assert_eq!(updated["codexAppSessionDelete"], false);
-    assert_eq!(updated["codexAppServiceTierControls"], true);
+    assert_eq!(updated["codexAppNativeFastUnlock"], true);
+    assert!(updated.get("codexAppServiceTierControls").is_none());
     assert_eq!(updated["codexAppPetRealMouseLook"], true);
     assert_eq!(updated["codexAppActivityOverlayRight"], true);
     assert_eq!(loaded, updated);
@@ -1246,7 +1247,7 @@ impl BridgeSettingsService for FakeSettings {
             "codexAppConversationView",
             "codexAppThreadScrollRestore",
             "codexAppNativeMenuPlacement",
-            "codexAppServiceTierControls",
+            "codexAppNativeFastUnlock",
             "codexAppPetRealMouseLook",
             "codexAppActivityOverlayRight",
             "codexAppWhaleWidgetEnabled",

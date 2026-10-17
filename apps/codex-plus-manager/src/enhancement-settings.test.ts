@@ -76,6 +76,7 @@ test("retired enhancements have no settings, navigation or command references in
     "codexAppZedRemoteOpen", "zedRemoteOpenStrategy", "zedRemoteProjectRegistryEnabled", "zedRemoteSyncToZedSettings",
     "codexAppUpstreamWorktreeCreate", "codexAppNativeMenuLocalization",
     "codexAppFastStartup", "快速启动",
+    "codexAppServiceTierControls", "Fast 按钮",
     "ZedRemoteScreen", "ZedRemoteProjectSection", "zedRemote", "list_zed_remote_projects", "open_zed_remote", "forget_zed_remote_project",
     "launchMode", "LaunchMode", "ModeSelector", "saveLaunchMode", "setLaunchMode", "patchMode",
     "repairPluginMarketplace", "refreshRemotePluginMarketplace", "repairRemotePluginMarketplace",
@@ -244,7 +245,7 @@ test("standalone quota unlock remains editable below the master switch when enha
   assert.ok(handler.some((node) => ts.isStringLiteral(node) && node.text === "codexAppStandaloneQuotaUnlock"));
 });
 
-test("native Fast unlock has its own enhancement toggle and keeps the provider support notice", () => {
+test("native Fast unlock is the only Fast enhancement toggle and keeps the provider support notice", () => {
   const enhance = component("EnhanceScreen");
   const nativeFast = fieldControl(enhance, "form.codexAppNativeFastUnlock");
   assert.equal(nativeFast.tagName.getText(app), "FeatureToggle");
@@ -253,6 +254,6 @@ test("native Fast unlock has its own enhancement toggle and keeps the provider s
   assert.match(attribute(nativeFast, "detail") || "", /纯 API Key.*原生 Fast.*供应商决定/);
   const handler = eventHandlerNodes(enhance, nativeFast, "onChange");
   assert.ok(handler.some((node) => ts.isStringLiteral(node) && node.text === "codexAppNativeFastUnlock"));
-  assert.ok(!handler.some((node) => ts.isStringLiteral(node) && node.text === "codexAppServiceTierControls"));
-  fieldControl(enhance, "form.codexAppServiceTierControls");
+  assert.match(appSource, /codexAppNativeFastUnlock: false,/);
+  assert.ok(!elements(enhance).some((element) => attribute(element, "checked") === "form.codexAppServiceTierControls"));
 });

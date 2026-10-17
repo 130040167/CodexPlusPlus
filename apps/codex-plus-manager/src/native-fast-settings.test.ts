@@ -28,7 +28,7 @@ test("native Fast renderer preference defaults off, follows backend settings and
   assert.equal(context.codexPlusSettings().nativeFastUnlock, false);
   backend.codexAppNativeFastUnlock = true;
   assert.equal(context.codexPlusSettings().nativeFastUnlock, true);
-  assert.equal(context.codexPlusSettings().serviceTierControls, false);
+  assert.equal(context.codexPlusSettings().serviceTierControls, undefined);
   backend.codexAppNativeFastUnlock = false;
   stored.nativeFastUnlock = true;
   assert.equal(context.codexPlusSettings().nativeFastUnlock, false, "the backend value must override a stale browser preference");
@@ -39,11 +39,11 @@ test("native Fast renderer preference defaults off, follows backend settings and
   assert.equal(context.codexPlusSettings().nativeFastUnlock, true);
 });
 
-test("in-app settings expose native Fast unlock independently of the service tier badge", () => {
+test("in-app settings expose native Fast unlock without the retired service tier badge", () => {
   assert.match(settingsPage, /data-codex-plus-setting="nativeFastUnlock"/);
   assert.match(settingsPage, /原生 Fast 强制解锁/);
   assert.match(settingsPage, /纯 API Key 模式恢复原生 Fast 开关；保存后重新启动 Codex 生效，实际支持与计费由供应商决定。/);
-  assert.match(settingsPage, /data-codex-plus-setting="serviceTierControls"/);
+  assert.doesNotMatch(settingsPage, /data-codex-plus-setting="serviceTierControls"/);
 });
 
 test("backend loads and saves publish only native Fast policy flags and tolerate an absent helper", async () => {

@@ -513,7 +513,7 @@ describe("renderer injection header compatibility", () => {
     const renderEnd = renderer.indexOf("\n  let codexPlusBackendSettings =", renderStart);
     assert.ok(renderStart >= 0 && renderEnd > renderStart);
     const settings: Record<string, boolean> = { pluginMarketplaceUnlock: true, threadScrollRestore: true, modelWhitelistUnlock: true };
-    const render = new Function("document", "codexPlusSettings", "codexPlusBackendMappedSettings", "refreshConversationViewControls", "refreshCodexServiceTierControls",
+    const render = new Function("document", "codexPlusSettings", "codexPlusBackendMappedSettings", "refreshConversationViewControls",
       `let codexPlusBackendSettingsLoaded = false; const codexPlusBackendSettings = {};
 ${renderer.slice(renderStart, renderEnd)}
 return (loaded) => { codexPlusBackendSettingsLoaded = loaded; renderCodexPlusMenu(); };`,
@@ -2120,7 +2120,7 @@ describe("拓展菜单项", () => {
  */
 function conversationViewRuntime(renderer: string) {
   const start = renderer.indexOf("  // 旧版（26.9xx 之前）内容容器类名清单");
-  const end = renderer.indexOf("  function codexServiceTierBadgeVisibleElement(", start);
+  const end = renderer.indexOf("  function removeLegacyCodexServiceTierBadges(", start);
   assert.ok(start >= 0 && end > start, "conversation view target finder block not found");
   const finderSource = renderer.slice(start, end);
   // 宽度计算与目标查找在文件里不相邻，单独切一段。

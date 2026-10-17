@@ -3400,7 +3400,7 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"23\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"24\""));
 
     assert!(script.contains("list-models-for-host"));
     assert!(script.contains("appServerModelRequestMethod"));
@@ -3510,105 +3510,23 @@ if (existingContainerDefault.model !== hostModel) process.exit(10);
 }
 
 #[test]
-fn injection_script_exposes_fast_service_tier_control() {
+fn injection_script_retires_legacy_fast_controls_and_preserves_native_unlock() {
     let script = assets::injection_script(57321);
-
-    assert!(script.contains("default-service-tier"));
-    assert!(script.contains("setting-storage-"));
-    assert!(script.contains("codexAppAssetUrl"));
-    assert!(script.contains("codexThreadServiceTierOverrides"));
-    assert!(script.contains("setCodexThreadServiceTierMode"));
-    assert!(script.contains("codexServiceTierRequestOverride"));
-    assert!(script.contains("codexServiceTierSupportedFastModels"));
-    assert!(script.contains("\"gpt-5.4\""));
-    assert!(script.contains("\"gpt-5.5\""));
-    assert!(script.contains("\"gpt-5.6-sol\""));
-    assert!(script.contains("\"gpt-5.6-terra\""));
-    assert!(script.contains("\"gpt-5.6-luna\""));
-    assert!(script.contains("codexServiceTierFastSupportedForModel"));
-    assert!(script.contains("codexServiceTierModelForRequest"));
-    assert!(script.contains("codexServiceTierMaybeLoadModelCatalog"));
-    assert!(script.contains("fastBlocked"));
-    assert!(script.contains("data-tier=\"unsupported\""));
-    assert!(script.contains("nextParams.service_tier = override.serviceTier"));
-    assert!(script.contains("serviceTierControls: false"));
-    assert!(script.contains("data-codex-plus-setting=\"serviceTierControls\""));
-    assert!(script.contains("data-codex-service-tier-controls"));
-    assert!(script.contains("removeCodexServiceTierBadges"));
-    assert!(script.contains("installCodexServiceTierDispatcherPatch"));
-    assert!(script.contains("codexServiceTierDispatcherPatchable"));
-    assert!(script.contains("dispatcher is a non-writable RPC stub"));
-    assert!(script.contains("Object.isExtensible(dispatcher)"));
-    assert!(script.contains("applyCodexServiceTierRequestOnly"));
-    assert!(script.contains("codexPlusServiceTierPrewarmThreadStart"));
-    assert!(script.contains("Object.isExtensible(client)"));
+    for retired in [
+        "data-codex-plus-setting=\"serviceTierControls\"",
+        "data-codex-service-tier-global-fast",
+        "toggleCodexServiceTierFromBadge",
+        "setCodexThreadServiceTierMode",
+        "applyCodexServiceTierRequestOnly",
+    ] {
+        assert!(!script.contains(retired), "retired legacy Fast behavior: {retired}");
+    }
+    assert!(script.contains("data-codex-plus-setting=\"nativeFastUnlock\""));
+    assert!(script.contains("__codexPlusNativeFastUnlock"));
+    assert!(script.contains("codexAppNativeFastUnlock"));
+    assert!(script.contains("serviceTiers"));
     assert!(script.contains("locateCodexAppServerClientBreakpoint"));
-    assert!(script.contains("installCodexAppServerClientCapture"));
-    assert!(script.contains("__codexPlusAppServerClientCapture"));
     assert!(script.contains("installCodexAppServerClientPrototypePatch"));
-    assert!(script.contains("__codexPlusAppServerClientClass"));
-    assert!(script.contains("app_server_client_prototype_patch_installed"));
-    assert!(script.contains("服务模式"));
-    assert!(script.contains("data-codex-service-tier-status"));
-    assert!(script.contains("data-codex-service-tier-inherit"));
-    assert!(script.contains("data-codex-service-tier-standard"));
-    assert!(script.contains("data-codex-service-tier-fast"));
-    assert!(script.contains("data-codex-service-tier-custom"));
-    assert!(script.contains("data-codex-service-tier-thread-inherit"));
-    assert!(script.contains("data-codex-service-tier-thread-standard"));
-    assert!(script.contains("data-codex-service-tier-thread-fast"));
-    assert!(script.contains("global-standard"));
-    assert!(script.contains("global-fast"));
-    assert!(script.contains("defaultMode"));
-    assert!(script.contains("codexServiceTierEffectiveThreadMode"));
-    assert!(script.contains("codexServiceTierDefaultModeForControlMode"));
-    assert!(script.contains("normalizeCodexServiceTierControlMode(state.mode) !== \"custom\""));
-    assert!(script.contains("state.draft = null"));
-    assert!(script.contains("后端未连接，无法切换服务模式"));
-    assert!(script.contains("未连接"));
-    assert!(script.contains("thread/start"));
-    assert!(script.contains("thread/resume"));
-    assert!(script.contains("turn/start"));
-    assert!(script.contains("send-cli-request-for-host"));
-    assert!(script.contains("start-conversation"));
-    assert!(script.contains("applyCodexServiceTierRequestOverride(\"thread/start\", message)"));
-    assert!(script.contains("codex-service-tier-badge"));
-    assert!(script.contains("installCodexServiceTierBadge"));
-    assert!(script.contains("toggleCodexServiceTierFromBadge"));
-    assert!(script.contains("wireCodexServiceTierBadge"));
-    assert!(script.contains("codexServiceTierBadgePlacement"));
-    assert!(script.contains("codexServiceTierBadgeFooterGroup"));
-    assert!(script.contains("codexServiceTierFindComposerEl"));
-    assert!(script.contains("codexServiceTierVisibleComposerFooters"));
-    assert!(script.contains("codexServiceTierBestComposerFooter"));
-    assert!(script.contains("codexServiceTierComposerCandidates"));
-    assert!(script.contains("codexServiceTierComposerScore"));
-    assert!(script.contains("data-codex-service-tier-badge"));
-    assert!(script.contains("codexServiceTierBadgeWired"));
-    assert!(script.contains("setAttribute(\"role\", \"button\")"));
-    assert!(script.contains("setAttribute(\"tabindex\", \"0\")"));
-    assert!(script.contains("继承 Codex 默认设置"));
-    assert!(script.contains("继承 config.toml"));
-    assert!(script.contains("serviceTierInheritSourceLabel"));
-    assert!(script.contains("resolveInheritedServiceTier"));
-    assert!(script.contains("getConfigTomlServiceTier"));
-    assert!(script.contains("catalog.service_tier"));
-    assert!(script.contains("service_tier=\\\"priority\\\""));
-    assert!(script.contains("Fast 仅支持"));
-    assert!(script.contains("当前 thread"));
-    assert!(script.contains("standard"));
-    assert!(script.contains("fast"));
-    assert!(script.contains("[\"setting-storage-\", \"app-initial-\"]"));
-    assert!(script.contains("[\"setting-storage-\", \"vscode-api-\", \"app-initial-\"]"));
-    assert!(script.contains("[\"vscode-api-\", \"app-initial-\"]"));
-    assert!(script.contains("codexSettingStorageFromModule"));
-    assert!(script.contains("codexStateApiFromModule"));
-    assert!(script.contains("message.type === \"fetch\""));
-    assert!(script.contains("vscode://codex/"));
-    assert!(script.contains("./(?:assets/)?"));
-    assert!(script.contains("dispatcher export unavailable"));
-    assert!(!script.contains("data-codex-max-reasoning-control"));
-    assert!(!script.contains("codexAppMaxReasoningOverride"));
 }
 
 #[test]
@@ -3675,66 +3593,17 @@ fn injection_script_refreshes_sidebar_after_undo_without_stale_asset_exports() {
 }
 
 #[test]
-fn injection_script_applies_fast_service_tier_contract() {
-    let cases = run_service_tier_contract_harness();
+fn injection_script_preserves_native_tiers_and_shared_provider_contracts() {
+    let cases = run_native_tier_and_provider_contract_harness();
 
-    assert_eq!(cases["supportedFast"]["serviceTier"], "priority");
-    assert_eq!(cases["supportedFast"]["service_tier"], "priority");
-
-    assert_eq!(
-        cases["unsupportedModel"]["serviceTier"],
-        serde_json::Value::Null
-    );
-    assert_eq!(
-        cases["unsupportedModel"]["service_tier"],
-        serde_json::Value::Null
-    );
-
-    assert_eq!(cases["turnWithoutModel"]["serviceTier"], "priority");
-    assert_eq!(cases["turnWithoutModelDiagnosticModel"], "gpt-5.4");
-
-    assert_eq!(
-        cases["customInheritUnsupported"]["serviceTier"],
-        serde_json::Value::Null
-    );
-    assert_eq!(
-        cases["customInheritUnsupported"]["service_tier"],
-        serde_json::Value::Null
-    );
-
-    assert_eq!(cases["inheritUnsetStatus"], "继承 Codex 默认设置：默认");
-    assert_eq!(cases["inheritFastStatus"], "继承 Codex 默认设置：fast");
-    assert_eq!(
-        cases["inheritStandardStatus"],
-        "继承 Codex 默认设置：standard"
-    );
-    assert_eq!(
-        cases["inheritConfigTomlFastStatus"],
-        "继承 config.toml：fast"
-    );
-    assert_eq!(cases["resolvedConfigTomlTier"]["configServiceTier"], "fast");
-    assert_eq!(
-        cases["resolvedConfigTomlTier"]["serviceTierSource"],
-        "config-toml"
-    );
-    assert_eq!(
-        cases["resolvedUnsetTier"]["configServiceTier"],
-        serde_json::Value::Null
-    );
-    assert_eq!(
-        cases["resolvedUnsetTier"]["serviceTierSource"],
-        serde_json::Value::Null
-    );
-    assert_eq!(
-        cases["inheritedConfigFastBlocked"]["serviceTier"],
-        serde_json::Value::Null
-    );
-    assert_eq!(
-        cases["inheritedConfigFastBlocked"]["service_tier"],
-        serde_json::Value::Null
-    );
-
-    assert_eq!(cases["startConversation"]["serviceTier"], "priority");
+    // 旧浏览器开关和线程模式残留不能再注入或剥离原生 service tier。
+    assert_eq!(cases["withoutNativeTier"]["serviceTier"], serde_json::Value::Null);
+    assert_eq!(cases["withoutNativeTier"]["service_tier"], serde_json::Value::Null);
+    assert_eq!(cases["customModelNativeTier"]["serviceTier"], serde_json::Value::Null);
+    assert_eq!(cases["customModelNativeTier"]["service_tier"], "priority");
+    assert_eq!(cases["threadOnlyRequest"]["serviceTier"], serde_json::Value::Null);
+    assert_eq!(cases["customModelNativeSnakeTier"]["service_tier"], "priority");
+    assert_eq!(cases["startConversation"]["serviceTier"], serde_json::Value::Null);
     assert_eq!(
         cases["explicitProjectStartConversation"]["workspaceKind"],
         "project"
@@ -3754,14 +3623,14 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert!(cases["projectlessStartConversation"]
         .get("projectAssignment")
         .is_none());
-    assert_eq!(cases["fetchStartConversation"]["serviceTier"], "priority");
+    assert_eq!(cases["fetchStartConversation"]["serviceTier"], serde_json::Value::Null);
     assert_eq!(
         cases["fetchSendCliRequest"]["params"]["serviceTier"],
-        "priority"
+        serde_json::Value::Null
     );
     assert_eq!(
         cases["fetchSendCliRequest"]["params"]["service_tier"],
-        "priority"
+        serde_json::Value::Null
     );
     assert_eq!(cases["solFastAvailability"]["supported"], true);
     assert_eq!(cases["solDescriptor"]["defaultReasoningEffort"], "low");
@@ -3787,6 +3656,7 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["serviceTierClientPatched"], true);
     assert_eq!(cases["serviceTierClientSendTier"], "priority");
     assert_eq!(cases["serviceTierClientPrewarmTier"], "priority");
+    assert_eq!(cases["retiredClientPatchReplaced"], true);
     assert_eq!(cases["frozenClientPatchSkipped"], true);
     assert_eq!(cases["captureLine"], 1);
     assert_eq!(cases["captureColumn"], 24);
@@ -3803,7 +3673,7 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["providerFromOtherUnchanged"], true);
     assert_eq!(cases["nonThreadProviderUnchanged"], true);
     assert_eq!(
-        cases["providerWithServiceTierControlsDisabled"]["modelProvider"],
+        cases["providerWithLegacyControlsIgnored"]["modelProvider"],
         "vendor_alpha"
     );
     assert_eq!(cases["appServerProviderOverride"], "vendor_alpha");
@@ -3910,7 +3780,7 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["globalStatsigWithoutHostPreserved"], true);
 }
 
-fn run_service_tier_contract_harness() -> serde_json::Value {
+fn run_native_tier_and_provider_contract_harness() -> serde_json::Value {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let script_path = temp.path().join("renderer-inject.js");
     let harness_path = temp.path().join("service-tier-harness.cjs");
@@ -3923,6 +3793,7 @@ fn run_service_tier_contract_harness() -> serde_json::Value {
 const scriptPath = {script_path};
 const store = new Map();
 store.set("codexPlusSettings", JSON.stringify({{ serviceTierControls: true }}));
+store.set("codexThreadServiceTierOverrides", JSON.stringify({{ version: "1", mode: "global-fast", defaultMode: "fast", entries: {{}} }}));
 function node() {{
   return {{
     appendChild() {{}},
@@ -3973,67 +3844,31 @@ globalThis.navigator = {{ userAgent: "node-test" }};
 globalThis.performance = {{ getEntriesByType: () => [] }};
 require(scriptPath);
 const api = window.__codexPlusServiceTierTest;
-api.setServiceTierState({{ status: "ok", serviceTier: "priority", fastTierValue: "priority" }});
 api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4", "gpt-5.5"] }});
-const inheritUnsetStatus = api.statusSummary({{
-  controlMode: "inherit",
-  threadMode: "inherit",
-  defaultMode: "inherit",
-  effectiveMode: "standard",
-  effectiveServiceTier: null,
-}});
-const inheritFastStatus = api.statusSummary({{
-  controlMode: "inherit",
-  threadMode: "inherit",
-  defaultMode: "inherit",
-  effectiveMode: "fast",
-  effectiveServiceTier: "priority",
-}});
-const inheritStandardStatus = api.statusSummary({{
-  controlMode: "inherit",
-  threadMode: "inherit",
-  defaultMode: "inherit",
-  effectiveMode: "standard",
-  effectiveServiceTier: "standard",
-}});
-const inheritConfigTomlFastStatus = api.statusSummary({{
-  controlMode: "inherit",
-  threadMode: "inherit",
-  defaultMode: "inherit",
-  effectiveMode: "fast",
-  effectiveServiceTier: "fast",
-  serviceTierSource: "config-toml",
-}});
-
-api.setThreadState({{ mode: "global-fast", defaultMode: "fast", entries: {{}} }});
-const supportedFast = api.applyServiceTierOverride("turn/start", {{
+const withoutNativeTier = api.applyServiceTierOverride("turn/start", {{
   threadId: "thread-12345678",
   model: "gpt-5.4",
   service_tier: null,
 }}, "conv-should-not-be-model");
 
-const unsupportedModel = api.applyServiceTierOverride("turn/start", {{
+const customModelNativeTier = api.applyServiceTierOverride("turn/start", {{
   threadId: "thread-12345678",
   model: "gpt-4.1",
   service_tier: "priority",
 }}, "conv-should-not-be-model");
 
-const turnWithoutModel = api.applyServiceTierOverride("turn/start", {{
+const threadOnlyRequest = api.applyServiceTierOverride("turn/start", {{
   threadId: "thread-12345678",
   service_tier: null,
 }}, "conversation-should-not-be-model");
-const turnWithoutModelDiagnosticModel = api.diagnostics().at(-1)?.detail?.model;
 
 api.setModelCatalog({{ status: "ok", model: "gpt-4.1", default_model: "gpt-4.1", models: ["gpt-4.1"] }});
-api.setThreadState({{ mode: "custom", defaultMode: "inherit", entries: {{}}, draft: {{ mode: "inherit", at: Date.now() }} }});
-api.setServiceTierState({{ serviceTier: "priority" }});
-const customInheritUnsupported = api.applyServiceTierOverride("turn/start", {{
+const customModelNativeSnakeTier = api.applyServiceTierOverride("turn/start", {{
   threadId: "thread-12345678",
   service_tier: "priority",
 }}, "");
 
 api.setModelCatalog({{ status: "ok", model: "gpt-5.5", default_model: "gpt-5.5", models: ["gpt-5.5"] }});
-api.setThreadState({{ mode: "global-fast", defaultMode: "fast", entries: {{}} }});
 const startConversation = api.requestOverride({{
   type: "start-conversation",
   threadId: "thread-12345678",
@@ -4199,7 +4034,6 @@ await appServerClient.sendRequest(
   nativeProjectlessAppServerParams,
   {{ signal: "native-projectless" }}
 );
-api.setThreadState({{ mode: "global-fast", defaultMode: "fast", entries: {{}} }});
 api.setBackendSettings({{ codexAppServiceTierControls: true }});
 localStorage.setItem("codexPlusSettings", JSON.stringify({{ serviceTierControls: true }}));
 const serviceTierClientCalls = [];
@@ -4208,10 +4042,23 @@ const serviceTierClient = {{
   async prewarmThreadStart(params) {{ serviceTierClientCalls.push({{ method: "prewarm", params }}); return {{ ok: true }}; }},
 }};
 const serviceTierClientPatched = api.patchAppServerClient(serviceTierClient);
-await serviceTierClient.sendRequest("turn/start", {{ threadId: "thread-service-tier", model: "gpt-5.4" }});
-await serviceTierClient.prewarmThreadStart({{ threadId: "thread-service-tier", model: "gpt-5.4" }});
+await serviceTierClient.sendRequest("turn/start", {{ threadId: "thread-service-tier", model: "gpt-5.4", serviceTier: "priority" }});
+await serviceTierClient.prewarmThreadStart({{ threadId: "thread-service-tier", model: "gpt-5.4", serviceTier: "priority" }});
 const serviceTierClientSendTier = serviceTierClientCalls[0]?.params?.serviceTier;
 const serviceTierClientPrewarmTier = serviceTierClientCalls[1]?.params?.serviceTier;
+// 运行中升级必须替换旧闭包，不能因为旧版本标记而保留旧 Fast 请求覆盖。
+const retiredCalls = [];
+const retiredOriginal = async (method, params) => {{ retiredCalls.push(params); return params; }};
+const retiredClient = {{
+  __codexPlusModelRequestPatch: "23",
+  __codexPlusModelOriginalSendRequest: retiredOriginal,
+  sendRequest: async (method, params) => retiredOriginal(method, {{ ...params, serviceTier: "legacy-forced-fast" }}),
+}};
+const retiredNativeParams = {{ threadId: "thread-retired-fast", model: "gpt-5.4", serviceTier: "default", service_tier: "priority" }};
+api.patchAppServerClient(retiredClient);
+await retiredClient.sendRequest("turn/start", retiredNativeParams);
+const retiredClientPatchReplaced = retiredCalls[0] === retiredNativeParams
+  && retiredCalls[0].serviceTier === "default" && retiredCalls[0].service_tier === "priority";
 const frozenClient = Object.preventExtensions({{ async sendRequest() {{ return {{ ok: true }}; }} }});
 const frozenClientPatchSkipped = api.patchAppServerClient(frozenClient) === false;
 const captureSample = "x" + String.fromCharCode(10) + "async sendRequest(e,t,n){{if(this.dispatchMessage==null)throw Error(`AppServerRequestClient is missing a message dispatcher`);}}";
@@ -4225,25 +4072,11 @@ window.__codexPlusAppServerClientClass = class CodexPlusTestClient {{
 }};
 const prototypePatched = api.installAppServerClientPrototypePatch();
 const protoClient = new window.__codexPlusAppServerClientClass();
-const protoTurn = await protoClient.sendRequest("turn/start", {{ threadId: "thread-prototype", model: "gpt-5.4" }});
-const protoPrewarm = await protoClient.prewarmThreadStart({{ threadId: "thread-prototype", model: "gpt-5.4" }});
+const protoTurn = await protoClient.sendRequest("turn/start", {{ threadId: "thread-prototype", model: "gpt-5.4", serviceTier: "priority" }});
+const protoPrewarm = await protoClient.prewarmThreadStart({{ threadId: "thread-prototype", model: "gpt-5.4", serviceTier: "priority" }});
 const prototypeSendTier = protoTurn && protoTurn.params ? protoTurn.params.serviceTier : null;
 const prototypePrewarmTier = protoPrewarm && protoPrewarm.prewarm ? protoPrewarm.prewarm.serviceTier : null;
 const prototypeState = api.appServerClientPrototypeState();
-api.setThreadState({{ mode: "inherit", defaultMode: "inherit", entries: {{}} }});
-api.setBackendSettings({{ codexAppServiceTierControls: false }});
-api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4"], service_tier: "fast" }});
-const resolvedConfigTomlTier = await api.resolveInheritedServiceTier();
-api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4"] }});
-const resolvedUnsetTier = await api.resolveInheritedServiceTier();
-api.setModelCatalog({{ status: "ok", model: "gpt-4.1", default_model: "gpt-4.1", models: ["gpt-4.1"] }});
-api.setThreadState({{ mode: "inherit", defaultMode: "inherit", entries: {{}} }});
-api.setServiceTierState({{ status: "ok", serviceTier: null, configServiceTier: "fast", serviceTierSource: "config-toml" }});
-const inheritedConfigFastBlocked = api.applyServiceTierOverride("turn/start", {{
-  threadId: "thread-12345678",
-  model: "gpt-4.1",
-  service_tier: null,
-}}, "");
 const appServerParamsUnchanged = appServerCalls[0]?.params === nativeAppServerParams
   && appServerCalls[0]?.params?.workspaceKind === "project"
   && appServerCalls[0]?.params?.cwd === "C:/native/work"
@@ -4275,7 +4108,7 @@ const explicitOtherProvider = {{ cwd: "C:/mobile", modelProvider: "other" }};
 const providerFromOther = api.applyProviderOverride("thread/start", explicitOtherProvider);
 const nonThreadParams = {{ cwd: "C:/mobile", modelProvider: "openai" }};
 const nonThreadProviderUnchanged = api.applyProviderOverride("turn/start", nonThreadParams) === nonThreadParams;
-const providerWithServiceTierControlsDisabled = api.requestOverride({{
+const providerWithLegacyControlsIgnored = api.requestOverride({{
   type: "start-conversation",
   cwd: "C:/mobile",
   modelProvider: "openai",
@@ -4823,18 +4656,10 @@ await deleteOnlyClient.sendRequest("ping", {{}});
 const sessionDeleteOnlyRegistersNativeClient = deleteOnlyInstalled
   && window.__codexPlusNativeHostClients.get("ssh:delete-only")?.ref?.deref() === deleteOnlyClient;
 process.stdout.write(JSON.stringify({{
-  supportedFast,
-  unsupportedModel,
-  turnWithoutModel,
-  turnWithoutModelDiagnosticModel,
-  customInheritUnsupported,
-  inheritUnsetStatus,
-  inheritFastStatus,
-  inheritStandardStatus,
-  inheritConfigTomlFastStatus,
-  resolvedConfigTomlTier,
-  resolvedUnsetTier,
-  inheritedConfigFastBlocked,
+  withoutNativeTier,
+  customModelNativeTier,
+  threadOnlyRequest,
+  customModelNativeSnakeTier,
   startConversation,
   explicitProjectStartConversation,
   projectlessStartConversation,
@@ -4856,6 +4681,7 @@ process.stdout.write(JSON.stringify({{
   serviceTierClientPatched,
   serviceTierClientSendTier,
   serviceTierClientPrewarmTier,
+  retiredClientPatchReplaced,
   frozenClientPatchSkipped,
   captureLine,
   captureColumn,
@@ -4869,7 +4695,7 @@ process.stdout.write(JSON.stringify({{
   providerFromOpenAi,
   providerFromOtherUnchanged: providerFromOther === explicitOtherProvider,
   nonThreadProviderUnchanged,
-  providerWithServiceTierControlsDisabled,
+  providerWithLegacyControlsIgnored,
   appServerProviderOverride,
   directThreadStartedId,
   nestedThreadStartedId,
