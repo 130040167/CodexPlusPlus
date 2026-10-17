@@ -4983,24 +4983,11 @@ function RelayScreen({
       setProviderView("routing");
     }
   }, [normalized.relayProfiles, providerView]);
-  // 分页过滤只作用于列表展示：活动归属与 legacy 根字段保持完整设置的值。
-  // 修复：过去对过滤后的列表跑 syncLegacyRelayFields，当前供应商不在本分页时
-  // activeRelayId 会被改写成列表第一项（假「使用中」）；卡片切换还会把这份缺成员
-  // 的子集直接提交后端——模型聚合因此报「成员不存在」，普通切换则可能用子集覆盖
-  // settings.json，丢掉其它分页的供应商。
-  const listForm: BackendSettings = { ...normalized, relayProfiles: visibleProfiles };
+  // 分页仅控制渲染。卡片的删除、复制和排序必须基于完整配置，避免隐藏的
+  // 当前供应商被 syncLegacyRelayFields 当成不存在，改写成直连列表第一项。
   const switchRelayProfileFromList = (profileId: string) => {
     const next = syncLegacyRelayFields({ ...normalized, activeRelayId: profileId });
     void actions.switchRelayProfile(next, normalized.activeRelayId);
-  };
-  const saveVisibleRelaySettings = async (next: BackendSettings) => {
-    const hiddenProfiles = normalized.relayProfiles.filter((profile) => (
-      relayProviderView(profile) !== providerView
-    ));
-    return saveRelaySettings(syncLegacyRelayFields({
-      ...next,
-      relayProfiles: [...next.relayProfiles, ...hiddenProfiles],
-    }));
   };
   const editRelayProfile = async (profileId: string) => {
     setNewProfileDraft(null);
@@ -5229,9 +5216,10 @@ function RelayScreen({
             </div>
           ) : null}
           <RelayProfileList
-            form={listForm}
+            form={normalized}
+            visibleProfiles={visibleProfiles}
             onEdit={(profileId) => void editRelayProfile(profileId)}
-            onFormChange={saveVisibleRelaySettings}
+            onFormChange={saveRelaySettings}
             onSwitchProfile={switchRelayProfileFromList}
             disabled={actions.relaySwitching}
             actions={actions}
@@ -8092,6 +8080,7 @@ function DiagnosticsPanel({ diagnostics, actions }: { diagnostics: DiagnosticsRe
 
 function RelayProfileList({
   form,
+  visibleProfiles = form.relayProfiles,
   onFormChange,
   onEdit,
   onSwitchProfile,
@@ -8099,6 +8088,7 @@ function RelayProfileList({
   actions,
 }: {
   form: BackendSettings;
+  visibleProfiles?: RelayProfile[];
   onFormChange: (value: BackendSettings) => void;
   onEdit: (id: string) => void;
   onSwitchProfile: (id: string) => void;
@@ -8121,9 +8111,9 @@ function RelayProfileList({
   };
   return (
     <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-      <SortableContext items={form.relayProfiles.map((profile) => profile.id)} strategy={verticalListSortingStrategy}>
+      <SortableContext items={visibleProfiles.map((profile) => profile.id)} strategy={verticalListSortingStrategy}>
         <div className="relay-profile-list">
-          {form.relayProfiles.map((profile, index) => (
+          {visibleProfiles.map((profile, index) => (
             <SortableRelayProfileCard
               actions={actions}
               form={form}
@@ -8278,6 +8268,11 @@ function SortableRelayProfileCard({
             disabled={form.relayProfiles.length <= 1}
             onClick={(event) => {
               event.stopPropagation();
+              const deleteIssue = relayProfileDeleteIssue(form, profile.id);
+              if (deleteIssue) {
+                void actions.showMessage(t("删除供应商"), deleteIssue, "failed");
+                return;
+              }
               onFormChange(removeRelayProfile(form, profile.id));
             }}
             size="icon"
@@ -14758,6 +14753,7 @@ function reorderRelayProfiles(settings: BackendSettings, sourceId: string, targe
 }
 
 function removeRelayProfile(settings: BackendSettings, id: string): BackendSettings {
+  if (relayProfileDeleteIssue(settings, id)) return settings;
   const profiles = settings.relayProfiles.filter((profile) => profile.id !== id);
   const scrubbedProfiles = profiles.map((profile) =>
     isAggregateRelayProfile(profile)
@@ -14786,6 +14782,30 @@ function removeRelayProfile(settings: BackendSettings, id: string): BackendSetti
     relayProfiles: scrubbedProfiles.length ? scrubbedProfiles : defaultSettings.relayProfiles,
     activeRelayId: settings.activeRelayId === id ? scrubbedProfiles[0]?.id || "default" : settings.activeRelayId,
   });
+}
+
+function relayProfileDeleteIssue(settings: BackendSettings, id: string): string | null {
+  if (settings.activeRelayId === id) {
+    return t("当前正在使用该供应商，请先切换到其他供应商后再删除。");
+  }
+  const existingProfileIds = new Set(settings.relayProfiles.map((profile) => profile.id));
+  for (const aggregateProfile of settings.relayProfiles.filter(isAggregateRelayProfile)) {
+    const aggregate = normalizeAggregateConfig(aggregateProfile.aggregate, [], existingProfileIds);
+    if (!aggregate.members.some((member) => member.profileId === id)) continue;
+    if (aggregate.defaultRelayId === id) {
+      return tf("供应商「{0}」是聚合配置「{1}」的默认成员，请先调整聚合配置后再删除。", [
+        settings.relayProfiles.find((profile) => profile.id === id)?.name || id,
+        aggregateProfile.name || aggregateProfile.id,
+      ]);
+    }
+    if (aggregate.members.length <= 1) {
+      return tf("供应商「{0}」是聚合配置「{1}」的最后成员，请先调整聚合配置后再删除。", [
+        settings.relayProfiles.find((profile) => profile.id === id)?.name || id,
+        aggregateProfile.name || aggregateProfile.id,
+      ]);
+    }
+  }
+  return null;
 }
 
 const aggregateStrategyOptions: Array<{ value: RelayAggregateStrategy; label: string; description: string }> = [
