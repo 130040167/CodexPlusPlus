@@ -1,6 +1,7 @@
 //! 本机 CLI 协作记录。每次状态转换均在 SQLite 写事务中完成；读取不会启动 agent。
 
 pub mod executor;
+pub mod integration;
 pub mod mcp;
 
 use std::path::{Path, PathBuf};
@@ -24,19 +25,29 @@ pub struct AgentConfig {
     pub name: String,
     pub executable: String,
     pub enabled: bool,
+    /// 空值沿用原生 CLI 的模型配置，不修改供应商配置。
+    #[serde(default)]
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CollaborationConfig {
     pub enabled: bool,
+    #[serde(default = "default_agent_id")]
+    pub default_agent_id: String,
     pub agents: Vec<AgentConfig>,
+}
+
+fn default_agent_id() -> String {
+    "deepseek".to_string()
 }
 
 impl Default for CollaborationConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            default_agent_id: default_agent_id(),
             agents: [
                 ("codex", "Codex"),
                 ("deepseek", "DeepSeek Harness"),
@@ -48,6 +59,7 @@ impl Default for CollaborationConfig {
                 name: name.to_string(),
                 executable: String::new(),
                 enabled: false,
+                model: String::new(),
             })
             .collect(),
         }
@@ -478,6 +490,13 @@ fn find_task<'a>(state: &'a mut State, id: &str) -> anyhow::Result<&'a mut TaskR
 fn normalize_config(config: CollaborationConfig) -> anyhow::Result<CollaborationConfig> {
     let mut normalized = CollaborationConfig::default();
     normalized.enabled = config.enabled;
+    normalized.default_agent_id = config.default_agent_id.trim().to_string();
+    if !matches!(
+        normalized.default_agent_id.as_str(),
+        "codex" | "deepseek" | "claude"
+    ) {
+        bail!("默认子 Agent 必须是 Codex、DeepSeek Harness 或 Claude Code");
+    }
     let mut seen = std::collections::HashSet::new();
     for mut agent in config.agents {
         if !seen.insert(agent.id.clone()) {
@@ -490,6 +509,7 @@ fn normalize_config(config: CollaborationConfig) -> anyhow::Result<Collaboration
             .context("不支持的 agent 配置")?;
         agent.name = agent.name.trim().to_string();
         agent.executable = agent.executable.trim().to_string();
+        agent.model = agent.model.trim().to_string();
         if agent.name.len() > 160 || agent.name.chars().any(|value| value.is_control()) {
             bail!("agent 名称格式无效");
         }
@@ -499,6 +519,15 @@ fn normalize_config(config: CollaborationConfig) -> anyhow::Result<Collaboration
         }
         if !agent.executable.is_empty() && !Path::new(&agent.executable).is_absolute() {
             bail!("CLI 只能填写绝对可执行文件路径；留空自动探测，不能包含参数或 shell 表达式");
+        }
+        if agent.model.len() > 256
+            || agent.model.starts_with('-')
+            || agent.model.chars().any(char::is_control)
+        {
+            bail!("模型名称格式无效，不能超过 256 字节或包含控制字符");
+        }
+        if agent.id == "deepseek" && !agent.model.is_empty() {
+            bail!("当前 DSH headless 不支持临时模型参数，请在 DeepSeek Harness CLI 中配置默认模型");
         }
         if agent.name.is_empty() {
             agent.name.clone_from(&target.name);

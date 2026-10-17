@@ -58,6 +58,33 @@ fn default_is_opt_in_and_never_accepts_work_before_both_switches_are_enabled() {
 }
 
 #[test]
+fn legacy_configuration_gets_a_default_without_enabling_workers_or_changing_models() {
+    let config: CollaborationConfig = serde_json::from_value(json!({"enabled":false,"agents":[
+        {"id":"codex","name":"Codex","executable":"","enabled":false},
+        {"id":"deepseek","name":"DeepSeek Harness","executable":"","enabled":false},
+        {"id":"claude","name":"Claude Code","executable":"","enabled":false}
+    ]}))
+    .unwrap();
+    assert_eq!(config.default_agent_id, "deepseek");
+    assert!(
+        config
+            .agents
+            .iter()
+            .all(|agent| agent.model.is_empty() && !agent.enabled)
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(&temp);
+    store.save_config(config.clone()).unwrap();
+    let mut invalid = config.clone();
+    invalid.default_agent_id = "unknown".to_string();
+    assert!(store.save_config(invalid).is_err());
+    let mut invalid = config.clone();
+    invalid.agents[1].model = "not-supported-as-a-headless-flag".to_string();
+    assert!(store.save_config(invalid).is_err());
+    assert_eq!(store.config().unwrap(), config);
+}
+
+#[test]
 fn config_rejects_shell_commands_and_unknown_workers_without_overwriting_saved_choice() {
     let temp = tempfile::tempdir().unwrap();
     let store = store(&temp);
@@ -296,7 +323,12 @@ fn mcp_protocol_keeps_errors_per_request_and_never_exposes_configuration_mutatio
         names,
         [
             "list_agents",
+            "delegate_to_deepseek",
+            "delegate_to_claude_code",
+            "delegate_to_codex",
+            "delegate_task",
             "send_task",
+            "wait_task",
             "get_task",
             "list_tasks",
             "cancel_task"

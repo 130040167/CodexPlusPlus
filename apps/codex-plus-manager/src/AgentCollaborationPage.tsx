@@ -4,8 +4,9 @@ import { ArrowRightLeft, Check, Copy, Loader2, Play, RefreshCw, Save, Square } f
 import { PageHeader } from "./ManagementPages";
 import "./AgentCollaborationPage.css";
 
-type Agent = { id: string; name: string; executable: string; enabled: boolean };
-type CollaborationConfig = { enabled: boolean; agents: Agent[] };
+type Agent = { id: string; name: string; executable: string; enabled: boolean; model: string };
+type CollaborationConfig = { enabled: boolean; defaultAgentId: string; agents: Agent[] };
+type Integration = { status: "connected" | "not_connected" | "conflict"; message: string; home?: string; configPath?: string };
 type TaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted";
 type TaskRecord = {
   id: string;
@@ -26,15 +27,17 @@ type Snapshot = {
   config: CollaborationConfig;
   tasks: TaskRecord[];
   availability?: { id: string; available: boolean; path?: string | null }[];
+  integration?: Integration;
 };
 type McpConfig = { codexToml: string; claudeJson: string; command: string; args: string[] };
 
 const defaultConfig = (): CollaborationConfig => ({
   enabled: false,
+  defaultAgentId: "deepseek",
   agents: [
-    { id: "codex", name: "Codex", executable: "", enabled: false },
-    { id: "deepseek", name: "DeepSeek Harness", executable: "", enabled: false },
-    { id: "claude", name: "Claude Code", executable: "", enabled: false },
+    { id: "codex", name: "Codex", executable: "", enabled: false, model: "" },
+    { id: "deepseek", name: "DeepSeek Harness", executable: "", enabled: false, model: "" },
+    { id: "claude", name: "Claude Code", executable: "", enabled: false, model: "" },
   ],
 });
 const statusLabels: Record<TaskStatus, string> = {
@@ -43,7 +46,12 @@ const statusLabels: Record<TaskStatus, string> = {
 const unfinished = (task: TaskRecord) => task.status === "queued" || task.status === "running";
 const absolutePath = (value: string) => /^(?:\/|[a-zA-Z]:[\\/]|\\\\)/.test(value.trim());
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
-const copyConfig = (config: CollaborationConfig): CollaborationConfig => ({ ...config, agents: config.agents.map((agent) => ({ ...agent })) });
+// 旧版本快照没有默认 Agent 与模型字段，读取后补齐，保存时发送完整配置。
+const copyConfig = (config: CollaborationConfig): CollaborationConfig => ({
+  ...config,
+  defaultAgentId: config.defaultAgentId || "deepseek",
+  agents: config.agents.map((agent) => ({ ...agent, model: agent.id === "deepseek" ? "" : agent.model || "" })),
+});
 const formatTime = (value: number) => Number.isFinite(value) && value > 0
   ? new Date(value).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false })
   : "—";
@@ -57,7 +65,7 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
   const [readError, setReadError] = useState("");
   const [actionError, setActionError] = useState("");
   const [notice, setNotice] = useState("");
-  const [agentId, setAgentId] = useState("codex");
+  const [agentId, setAgentId] = useState("");
   const [cwd, setCwd] = useState(defaultCwd);
   const [prompt, setPrompt] = useState("");
   const [selectedId, setSelectedId] = useState("");
@@ -76,10 +84,11 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
   const mcpInFlight = useRef(false);
 
   const applySnapshot = useCallback((next: Snapshot, saved = false) => {
-    setSnapshot(next);
+    const normalized = { ...next, config: copyConfig(next.config) };
+    setSnapshot(normalized);
     // 后台轮询只更新执行状态，保留用户尚未保存的配置。
     if (saved || !dirtyRef.current) {
-      setDraft(copyConfig(next.config));
+      setDraft(copyConfig(normalized.config));
       dirtyRef.current = false;
       setDirty(false);
     }
@@ -169,8 +178,8 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
   const saveConfig = () => {
     const invalid = draft.agents.find((agent) => agent.executable.trim() && !absolutePath(agent.executable));
     if (invalid) { setActionError(`请填写 ${invalid.name} 可执行文件的绝对路径。`); return; }
-    void mutate("save_config", { ...draft, agents: draft.agents.map((agent) => ({ ...agent, executable: agent.executable.trim() })) }, () => {
-      setNotice("协作配置已保存。");
+    void mutate("save_config", { ...draft, agents: draft.agents.map((agent) => ({ ...agent, executable: agent.executable.trim(), model: agent.id === "deepseek" ? "" : agent.model.trim() })) }, () => {
+      setNotice("子 Agent 设置已保存。");
       setMcpConfig(null);
       setCopied("");
     });
@@ -180,19 +189,30 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
   const selected = tasks.find((task) => task.id === selectedId);
   const continuation = tasks.find((task) => task.id === continueTaskId);
   const enabledAgents = snapshot?.config.agents.filter((agent) => agent.enabled) ?? [];
-  const targetId = continuation?.agentId ?? (enabledAgents.some((agent) => agent.id === agentId) ? agentId : enabledAgents[0]?.id ?? "");
+  const targetId = continuation?.agentId ?? (enabledAgents.some((agent) => agent.id === agentId) ? agentId
+    : enabledAgents.find((agent) => agent.id === snapshot?.config.defaultAgentId)?.id ?? enabledAgents[0]?.id ?? "");
   const targetAgent = enabledAgents.find((agent) => agent.id === targetId);
   const targetUnavailable = snapshot?.availability?.find((item) => item.id === targetId)?.available === false;
   const targetBusy = tasks.some((task) => task.agentId === targetId && unfinished(task));
   const targetCwd = continuation?.cwd ?? cwd;
   const formDisabledReason = !snapshot ? "正在读取协作配置。"
-    : !snapshot.config.enabled ? "请先启用 Agent 协作并保存配置。"
+    : !snapshot.config.enabled ? "请先启用外部子 Agent 并保存设置。"
     : !targetAgent ? "请先启用至少一个 CLI 并保存配置。"
     : targetUnavailable ? "目标 CLI 的可执行文件不可用，请检查路径并保存。"
     : targetBusy ? "此 Agent 已有排队或执行中的任务，请等待结束后再提交。"
     : continuation && (continuation.status !== "completed" || !continuation.sessionId) ? "该任务目前无法续聊，请创建新任务。"
     : "";
   const agentName = (id: string) => snapshot?.config.agents.find((agent) => agent.id === id)?.name ?? id;
+  const connectCodex = () => {
+    if (dirtyRef.current) { setActionError("请先保存子 Agent 设置，再接入 Codex。"); return; }
+    void mutate("connect_codex", {}, (next) => {
+      if (next.integration?.status === "connected") {
+        setNotice(`${next.integration.message || "已接入配置。"} 在 Codex 重新加载 MCP 或开启新对话后，直接说“让 DeepSeek 实现…”或“让 Claude Code 审核…”。`);
+      } else {
+        setActionError(next.integration?.message || "尚未完成 Codex 接入，请检查配置后重试。");
+      }
+    });
+  };
 
   const submitTask = (event: FormEvent) => {
     event.preventDefault();
@@ -253,16 +273,16 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
   };
 
   return <div className="mg-page agent-collaboration-page">
-    <PageHeader icon={<ArrowRightLeft size={20} strokeWidth={1.5} />} title="Agent 协作（实验）" actions={
+    <PageHeader icon={<ArrowRightLeft size={20} strokeWidth={1.5} />} title="子 Agent 设置" actions={
       <button className="mg-button" type="button" onClick={() => void refresh()} disabled={refreshing || Boolean(busy)}>
         <RefreshCw size={15} className={refreshing ? "agent-collaboration-spin" : ""} />{refreshing ? "刷新中…" : "刷新"}
       </button>
     } />
     <div className="agent-collaboration-content" aria-busy={!snapshot && refreshing}>
       <div className="agent-collaboration-intro">
-        <p>把任务交给 Codex、DeepSeek Harness 或 Claude Code，在这里查看进度、读取结果和继续对话。</p>
-        <div className="agent-collaboration-stages"><span>阶段 1 · CLI 任务协作</span><span data-pending="true">阶段 2 · 已有桌面会话接入：待实现</span></div>
-        <p className="agent-collaboration-hint">当前会启动 CLI 执行任务；已经打开的桌面 Code 会话和自动唤醒将在后续阶段接入。</p>
+        <p>在 Codex 对话里调用外部子 Agent，结果由 Codex 在原对话中汇总。</p>
+        <div className="agent-collaboration-examples" aria-label="在 Codex 对话中的用法"><span>“让 DeepSeek 实现这个功能”</span><span>“让 Claude Code 审核这次改动”</span><span>“交给默认子 Agent 调查这个报错”</span></div>
+        <p className="agent-collaboration-hint">在这里选好默认子 Agent，保存设置并接入 Codex，然后回到对话中分派任务。</p>
       </div>
 
       {readError && <p className="agent-collaboration-error" role="alert">读取协作状态失败：{readError}</p>}
@@ -272,16 +292,20 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
 
       <section className="agent-collaboration-section" aria-labelledby="agent-collaboration-config-title">
         <div className="agent-collaboration-section-head">
-          <div><h2 id="agent-collaboration-config-title">协作设置</h2><p>可填写可执行文件的绝对路径，或留空自动查找已安装的 CLI。路径检测只确认文件存在，登录状态在执行任务时验证。</p></div>
+          <div><h2 id="agent-collaboration-config-title">子 Agent 配置</h2><p>选择可调用的 CLI 与默认模型。CLI 路径留空时自动查找已安装的程序。</p></div>
           <button type="button" className="mg-button mg-primary" disabled={!snapshot || !dirty || Boolean(busy)} onClick={saveConfig}>
             {busy === "save_config" ? <Loader2 size={15} className="agent-collaboration-spin" /> : <Save size={15} />}{busy === "save_config" ? "保存中…" : "保存配置"}
           </button>
         </div>
         <label className="agent-collaboration-enable">
           <input type="checkbox" checked={draft.enabled} disabled={!snapshot || busy === "save_config"} onChange={(event) => editConfig({ ...draft, enabled: event.target.checked })} />
-          <span><strong>启用 Agent 协作</strong><small>默认关闭，保存后生效。</small></span>
+          <span><strong>启用外部子 Agent</strong><small>默认关闭，保存后生效。</small></span>
           <span className="mg-badge">{snapshot?.config.enabled ? "已启用" : "未启用"}</span>
         </label>
+        <div className="agent-collaboration-default">
+          <label className="mg-field" htmlFor="agent-collaboration-default"><span>默认子 Agent</span><select id="agent-collaboration-default" value={draft.defaultAgentId} disabled={!snapshot || busy === "save_config"} onChange={(event) => editConfig({ ...draft, defaultAgentId: event.target.value })}>{draft.agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}{agent.enabled ? "" : "（未启用）"}</option>)}</select></label>
+          <p className="agent-collaboration-hint">说“交给默认子 Agent”时使用此选择；直接说“让 DeepSeek”或“让 Claude Code”时使用指定的子 Agent。{draft.enabled && !draft.agents.some((agent) => agent.id === draft.defaultAgentId && agent.enabled) && " 所选默认子 Agent 尚未启用，默认分派不可用；仍可点名调用其他已启用的子 Agent。"}</p>
+        </div>
         <div className="agent-collaboration-agents">
           {draft.agents.map((agent) => {
             const savedAgent = snapshot?.config.agents.find((item) => item.id === agent.id);
@@ -291,16 +315,36 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
             return <div className="agent-collaboration-agent" key={agent.id}>
               <label className="agent-collaboration-agent-title"><input type="checkbox" checked={agent.enabled} disabled={!snapshot || busy === "save_config"} onChange={(event) => editAgent(agent.id, { enabled: event.target.checked })} /><strong>{agent.name}</strong></label>
               <label className="mg-field" htmlFor={`agent-collaboration-path-${agent.id}`}><span>可执行文件路径（可选）</span><input id={`agent-collaboration-path-${agent.id}`} value={agent.executable} disabled={!snapshot || busy === "save_config"} placeholder={availability?.path || "留空自动查找已安装的 CLI"} spellCheck={false} autoCapitalize="off" autoCorrect="off" onChange={(event) => editAgent(agent.id, { executable: event.target.value })} /></label>
+              <label className="mg-field" htmlFor={`agent-collaboration-model-${agent.id}`}><span>{agent.id === "deepseek" ? "默认模型" : "模型（可选）"}</span><input id={`agent-collaboration-model-${agent.id}`} value={agent.id === "deepseek" ? "" : agent.model} disabled={agent.id === "deepseek" || !snapshot || busy === "save_config"} placeholder={agent.id === "deepseek" ? "沿用 DeepSeek Harness CLI 默认模型" : "留空沿用该 CLI 默认模型"} spellCheck={false} autoCapitalize="off" autoCorrect="off" aria-describedby={agent.id === "deepseek" ? "agent-collaboration-deepseek-model-hint" : undefined} onChange={(event) => editAgent(agent.id, { model: event.target.value })} />{agent.id === "deepseek" && <small id="agent-collaboration-deepseek-model-hint">在 DeepSeek Harness CLI 中配置默认模型。</small>}</label>
               <small className="agent-collaboration-agent-state" data-unavailable={available === false}>{!savedPath ? "路径尚未保存" : available === true ? "已找到 CLI 文件" : available === false ? "未找到 CLI 文件" : agent.executable.trim() ? "已配置，执行任务时验证" : "留空自动查找已安装的 CLI"}{availability?.path && <code>{availability.path}</code>}</small>
               {agent.id === "deepseek" && <small className="agent-collaboration-agent-note">DSH 使用 headless 配置；如提示未登录，需先配置其 CLI。</small>}
             </div>;
           })}
         </div>
-        {dirty && <p className="agent-collaboration-hint">有未保存的修改。任务使用已保存的配置。</p>}
+        <p className="agent-collaboration-hint">路径检测只确认 CLI 文件存在，登录状态在执行任务时验证。{dirty && " 有未保存的修改；子 Agent 使用已保存的配置。"}</p>
       </section>
 
+      <section className="agent-collaboration-section agent-collaboration-integration" aria-labelledby="agent-collaboration-mcp-title">
+        <div className="agent-collaboration-section-head"><div><h2 id="agent-collaboration-mcp-title">在 Codex 对话中使用</h2><p>点击接入后，为 Codex 注册默认分派、指定子 Agent 和等待结果的工具。</p></div><button type="button" className="mg-button mg-primary" disabled={!snapshot || Boolean(busy) || dirty} onClick={connectCodex}>{busy === "connect_codex" ? <Loader2 size={15} className="agent-collaboration-spin" /> : <ArrowRightLeft size={15} />}{busy === "connect_codex" ? "接入中…" : "一键接入 Codex"}</button></div>
+        <div className="agent-collaboration-integration-state" data-status={snapshot?.integration?.status ?? "not_connected"} role="status"><strong>{!snapshot ? "正在读取接入状态…" : snapshot.integration?.status === "connected" ? "已接入配置" : snapshot.integration?.status === "conflict" ? "接入配置有冲突" : snapshot.integration?.status === "not_connected" ? "尚未接入 Codex" : "尚未检测到接入配置"}</strong><span>{snapshot?.integration?.message || "保存子 Agent 设置后，点击“一键接入 Codex”。"}</span></div>
+        {(snapshot?.integration?.home || snapshot?.integration?.configPath) && <p className="agent-collaboration-hint">{snapshot?.integration?.home ? "Codex 配置目录：" : "Codex 配置文件："}<code>{snapshot?.integration?.home || snapshot?.integration?.configPath}</code></p>}
+        <p className="agent-collaboration-hint">接入后请重新加载 Codex 的 MCP，或开启新会话，再使用上方的自然语言指令。已运行的对话不会即时增加工具。{dirty && " 请先保存设置，再接入。"}</p>
+        <details className="agent-collaboration-manual"><summary>手动接入与配置导出</summary><div className="agent-collaboration-manual-body">
+          <p className="agent-collaboration-hint">也可以复制配置，合并到对应客户端的 MCP 设置后重新连接。</p>
+          <button type="button" className="mg-button" disabled={mcpLoading || !snapshot || Boolean(busy)} onClick={() => void loadMcpConfig()}>{mcpLoading ? <Loader2 size={15} className="agent-collaboration-spin" /> : <Copy size={15} />}{mcpLoading ? "读取中…" : mcpConfig ? "重新生成配置" : "生成手动配置"}</button>
+          {mcpError && <p className="agent-collaboration-error" role="alert">{mcpError}</p>}
+          {copied && <p className="agent-collaboration-notice" role="status">{copied}已复制。</p>}
+          {mcpConfig && <div className="agent-collaboration-mcp-configs">
+            {[{ label: "Codex 配置", value: mcpConfig.codexToml }, { label: "Claude 配置", value: mcpConfig.claudeJson }].map((item) => <div className="agent-collaboration-mcp-code" key={item.label}><div><h3>{item.label}</h3><button type="button" className="mg-button" onClick={() => void copyText(item.value, item.label)}>{copied === item.label ? <Check size={14} /> : <Copy size={14} />}复制</button></div><pre tabIndex={0} aria-label={item.label}>{item.value}</pre></div>)}
+            <details className="agent-collaboration-mcp-command"><summary>其他 MCP 客户端的启动参数</summary><pre tabIndex={0}>{JSON.stringify({ command: mcpConfig.command, args: mcpConfig.args }, null, 2)}</pre></details>
+          </div>}
+        </div></details>
+      </section>
+
+      <details className="agent-collaboration-debug"><summary>调试与任务记录 <span className="agent-collaboration-count">{tasks.length}</span>{hasUnfinishedTasks && <span className="agent-collaboration-status" data-status="running">有任务执行中</span>}</summary><div className="agent-collaboration-debug-body">
+      <p className="agent-collaboration-hint">日常任务直接在 Codex 对话中交给子 Agent。这里用于检查执行情况，或单独发送调试任务。</p>
       <section className="agent-collaboration-section" aria-labelledby="agent-collaboration-create-title">
-        <div className="agent-collaboration-section-head"><div><h2 id="agent-collaboration-create-title">{continuation ? "继续对话" : "派发任务"}</h2><p>任务可以访问所选工作目录，请先完成目标 CLI 的登录。</p></div></div>
+        <div className="agent-collaboration-section-head"><div><h2 id="agent-collaboration-create-title">{continuation ? "继续调试对话" : "发送调试任务"}</h2><p>任务可以访问所选工作目录，请先完成目标 CLI 的登录。</p></div></div>
         {continuation && <div className="agent-collaboration-continuation"><div><strong>续聊 {agentName(continuation.agentId)} 的任务</strong><span>{continuation.prompt}</span><small>任务 {continuation.id} · 沿用原会话与工作目录</small></div><button type="button" className="mg-button" disabled={busy === "submit"} onClick={() => { setContinueTaskId(""); setPrompt(""); }}>返回新任务</button></div>}
         <form className="agent-collaboration-form" onSubmit={submitTask}>
           <div className="agent-collaboration-form-row">
@@ -316,7 +360,7 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
 
       <section className="agent-collaboration-section" aria-labelledby="agent-collaboration-tasks-title">
         <div className="agent-collaboration-section-head"><div><h2 id="agent-collaboration-tasks-title">任务与结果 <span className="agent-collaboration-count">{tasks.length}</span></h2><p role="status">{hasUnfinishedTasks ? "任务执行期间每 2 秒更新状态。" : "每 10 秒检查新任务，可接收其他客户端派发的任务。"}</p></div></div>
-        {!tasks.length ? <div className="agent-collaboration-empty">还没有协作任务。从上方提交第一个任务。</div> : <div className="agent-collaboration-task-workspace">
+        {!tasks.length ? <div className="agent-collaboration-empty">还没有子 Agent 任务。接入后，在 Codex 对话中分派第一个任务。</div> : <div className="agent-collaboration-task-workspace">
           <ul className="agent-collaboration-task-list" aria-label="协作任务">
             {tasks.map((task) => <li key={task.id}><button type="button" className="agent-collaboration-task-select" aria-pressed={task.id === selectedId} onClick={() => setSelectedId(task.id)}><span className="agent-collaboration-task-title"><strong>{agentName(task.agentId)}</strong><span className="agent-collaboration-status" data-status={task.status}>{statusLabels[task.status] ?? task.status}</span></span><span className="agent-collaboration-task-prompt">{task.prompt}</span><small>{formatTime(task.createdAtMs)}{task.parentTaskId ? " · 续聊" : ""}</small></button></li>)}
           </ul>
@@ -335,17 +379,8 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
         </div>}
       </section>
 
-      <section className="agent-collaboration-section" aria-labelledby="agent-collaboration-mcp-title">
-        <div className="agent-collaboration-section-head"><div><h2 id="agent-collaboration-mcp-title">从其他 Agent 调用</h2><p>通过 MCP 接入协作工具，让支持 MCP 的客户端派发任务并查询结果。</p></div><button type="button" className="mg-button" disabled={mcpLoading || !snapshot || Boolean(busy)} onClick={() => void loadMcpConfig()}>{mcpLoading ? <Loader2 size={15} className="agent-collaboration-spin" /> : <Copy size={15} />}{mcpLoading ? "读取中…" : mcpConfig ? "重新生成配置" : "生成接入配置"}</button></div>
-        <p className="agent-collaboration-hint">提供 list_agents、send_task、get_task、list_tasks、cancel_task。客户端通过查询获取进度与结果；当前不支持向已有桌面会话自动推送结果。</p>
-        {mcpError && <p className="agent-collaboration-error" role="alert">{mcpError}</p>}
-        {copied && <p className="agent-collaboration-notice" role="status">{copied}已复制。</p>}
-        {mcpConfig && <div className="agent-collaboration-mcp-configs">
-          <p className="agent-collaboration-hint">将配置合并到对应客户端的 MCP 设置后重新连接。这里只复制配置。</p>
-          {[{ label: "Codex 配置", value: mcpConfig.codexToml }, { label: "Claude 配置", value: mcpConfig.claudeJson }].map((item) => <div className="agent-collaboration-mcp-code" key={item.label}><div><h3>{item.label}</h3><button type="button" className="mg-button" onClick={() => void copyText(item.value, item.label)}>{copied === item.label ? <Check size={14} /> : <Copy size={14} />}复制</button></div><pre tabIndex={0} aria-label={item.label}>{item.value}</pre></div>)}
-          <details className="agent-collaboration-mcp-command"><summary>其他 MCP 客户端的启动参数</summary><pre tabIndex={0}>{JSON.stringify({ command: mcpConfig.command, args: mcpConfig.args }, null, 2)}</pre></details>
-        </div>}
-      </section>
+      </div></details>
+      <p className="agent-collaboration-hint agent-collaboration-footnote">外部 CLI 子 Agent，不接管已经打开的桌面会话。</p>
     </div>
   </div>;
 }

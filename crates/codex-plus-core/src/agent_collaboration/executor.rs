@@ -253,6 +253,9 @@ async fn run_task(store: &Store, id: &str) -> anyhow::Result<Outcome> {
         .find(|agent| agent.id == task.agent_id && agent.enabled)
         .context("协作 Agent 已停用或不存在")?;
     let provider = Provider::from_id(&agent.id)?;
+    if provider == Provider::DeepSeek && !agent.model.trim().is_empty() {
+        bail!("DSH 的模型需在其原生 CLI 中配置");
+    }
     let executable =
         resolve_executable(agent).context("未找到原生 CLI，请在协作设置中填写可执行文件路径")?;
     if task.prompt.trim().is_empty() || task.prompt.len() > MAX_PROMPT_BYTES {
@@ -274,7 +277,7 @@ async fn run_task(store: &Store, id: &str) -> anyhow::Result<Outcome> {
 
     let mut command = Command::new(executable);
     command
-        .args(cli_args(provider, &task.session_id))
+        .args(cli_args(provider, &task.session_id, &agent.model))
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -291,7 +294,7 @@ async fn run_task(store: &Store, id: &str) -> anyhow::Result<Outcome> {
     supervise(store, &task, provider, child, MAX_RUNTIME).await
 }
 
-fn cli_args(provider: Provider, session_id: &str) -> Vec<String> {
+fn cli_args(provider: Provider, session_id: &str, model: &str) -> Vec<String> {
     let values: Vec<&str> = match provider {
         Provider::Codex if session_id.is_empty() => vec![
             "exec",
@@ -334,7 +337,19 @@ fn cli_args(provider: Provider, session_id: &str) -> Vec<String> {
             args
         }
     };
-    values.into_iter().map(str::to_owned).collect()
+    let mut args: Vec<String> = values.into_iter().map(str::to_owned).collect();
+    if !model.is_empty() && provider != Provider::DeepSeek {
+        let position = if provider == Provider::Codex && !session_id.is_empty() {
+            2
+        } else {
+            1
+        };
+        args.splice(
+            position..position,
+            ["--model".to_string(), model.to_string()],
+        );
+    }
+    args
 }
 
 fn validate_session_id(value: &str) -> anyhow::Result<()> {
@@ -885,7 +900,7 @@ mod tests {
     #[test]
     fn resume_uses_the_exact_session_and_stdin_without_bypass_flags() {
         for provider in [Provider::Codex, Provider::Claude, Provider::DeepSeek] {
-            let args = cli_args(provider, "session-123");
+            let args = cli_args(provider, "session-123", "");
             assert!(args.iter().any(|arg| arg == "session-123"));
             assert!(
                 !args
@@ -894,12 +909,33 @@ mod tests {
             );
         }
         assert_eq!(
-            cli_args(Provider::Codex, "session-123")[..3],
+            cli_args(Provider::Codex, "session-123", "")[..3],
             ["exec", "resume", "--json"]
         );
         assert!(validate_session_id("--last").is_err());
         assert!(validate_session_id("session with space").is_err());
         assert!(validate_session_id("session-123").is_ok());
+    }
+
+    #[test]
+    fn configured_models_are_single_arguments_and_empty_models_preserve_native_defaults() {
+        for provider in [Provider::Codex, Provider::Claude] {
+            for session in ["", "session-123"] {
+                let original = cli_args(provider, session, "");
+                assert!(!original.iter().any(|value| value == "--model"));
+                let custom = cli_args(provider, session, "provider/custom model");
+                let index = custom.iter().position(|value| value == "--model").unwrap();
+                assert_eq!(custom[index + 1], "provider/custom model");
+                let mut stripped = custom.clone();
+                stripped.drain(index..index + 2);
+                assert_eq!(stripped, original);
+            }
+        }
+        assert!(
+            !cli_args(Provider::DeepSeek, "", "")
+                .iter()
+                .any(|value| value == "--model")
+        );
     }
 
     #[test]
