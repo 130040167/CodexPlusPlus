@@ -3293,7 +3293,7 @@ export function App() {
     let disposed = false;
     void call<CommandResult<ProviderSyncPayload>>("load_provider_sync_recovery").then((result) => {
       if (disposed || !result.recoveryJournalPath) return;
-      setProviderSyncProgress((current) => current.active ? current : ({ active: false, percent: 100, message: result.message, result }));
+      setProviderSyncProgress((current) => current.active ? current : ({ active: false, percent: 0, message: result.message, result }));
     }).catch(() => {});
     return () => { disposed = true; };
   }, [route]);
@@ -7445,13 +7445,14 @@ function SessionRepairPanel({ form, providerSyncProgress, sessionIndexRepairActi
             <span>{t("删除会创建本地备份；如果 Codex App 正在使用该会话，建议先关闭对应会话窗口再操作。")}</span>
           </div>
     {providerSyncProgress.result?.recoveryJournalPath ? <div>
+      {!providerSyncProgress.active && providerSyncProgress.percent === 0 ? <p role="alert">{providerSyncProgress.message}</p> : null}
       <p role="alert" className="break-all">{t("恢复记录：")}{providerSyncProgress.result.recoveryJournalPath}</p>
       {providerSyncProgress.result.syncStatus === "partial_failure" && providerSyncProgress.result.backupDir && providerSyncProgress.result.recoveryAvailable !== false ? <Button
         disabled={providerSyncProgress.active || sessionIndexRepairActive}
         onClick={() => void actions.recoverProviderSync()}>{t("恢复未完成修复")}</Button> : null}
     </div> : null}
     {providerSyncProgress.result?.recoveryErrors?.map((error, index) => <p role="alert" key={index}>{error}</p>)}
-    {providerSyncProgress.result?.syncStatus === "partial_failure" ? <p role="status">
+    {providerSyncProgress.result?.syncStatus === "partial_failure" && Boolean(providerSyncProgress.result.databaseOutcomes?.length || (providerSyncProgress.result.changedSessionFiles ?? 0) > 0 || (providerSyncProgress.result.sqliteRowsUpdated ?? 0) > 0) ? <p role="status">
       {t("仍有改动：")}{providerSyncProgress.result.changedSessionFiles ?? 0} {t("个会话文件，")}
       {providerSyncProgress.result.sqliteRowsUpdated ?? 0} {t("行索引。请查看恢复记录处理剩余冲突。")}
     </p> : null}

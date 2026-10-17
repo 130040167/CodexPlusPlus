@@ -64,6 +64,7 @@ test("active SessionPage owns repair panel and enabled actions call existing cal
   collect(context.SessionRepairPanel({ ...props, providerSyncProgress: { active: false, percent: 0,
     result: { syncStatus: "partial_failure", backupDir: "/artificial/unreadable", recoveryJournalPath: "/artificial/unreadable", recoveryAvailable: false } } }));
   assert.equal(button("恢复未完成修复"), undefined);
+  assert.equal(nodes.some((node) => node.children?.includes("仍有改动：")), false);
 });
 
 test("all full saves require their own revision and conflicts preserve the caller draft", async () => {
