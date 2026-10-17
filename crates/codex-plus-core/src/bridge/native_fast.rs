@@ -836,9 +836,18 @@ mod tests {
             assert!(!is_local_asset(url), "{url}");
         }
         let bootstrap = bootstrap_script(true, false);
-        assert!(bootstrap.contains(
-            r#"runtime.update({"codexAppNativeFastUnlock":false,"enhancementsEnabled":true})"#
-        ));
+        let (_, update) = bootstrap
+            .rsplit_once("\n;window.__codexPlusNativeFastUnlock.runtime.update(")
+            .unwrap();
+        let (settings, _) = update.split_once(");\n").unwrap();
+        // 核对完整字段和值，不依赖 serde_json 的对象字段序列化顺序。
+        assert_eq!(
+            serde_json::from_str::<Value>(settings).unwrap(),
+            json!({
+                "codexAppNativeFastUnlock": false,
+                "enhancementsEnabled": true,
+            })
+        );
         assert!(bootstrap.contains("__codexPlusNativeFastPatchState='armed'"));
     }
 
