@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use codex_plus_core::agent_collaboration::{
-    CollaborationConfig, Store, TaskRequest, executor, integration, mcp,
+    CollaborationConfig, Store, TaskRequest, executor, integration, mcp, native_refresh,
 };
 use codex_plus_core::settings::SettingsStore;
 use serde_json::{Value, json};
@@ -23,51 +23,101 @@ pub async fn agent_collaboration_request(
         )
         .map_err(|e| e.to_string());
     }
+    let refresh_requested = matches!(action.as_str(), "connect_codex" | "refresh_codex");
     let task_store = store.clone();
-    let (snapshot, task_id) = tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<_> {
-        let payload = payload.unwrap_or(Value::Null);
-        let executable = std::env::current_exe().context("无法定位子 Agent MCP 程序")?;
-        let home = codex_plus_core::codex_home::default_codex_home_dir();
-        let state_dir = codex_plus_core::paths::default_app_state_dir();
-        let task_id = match action.as_str() {
-            "snapshot" => None,
-            "connect_codex" => {
-                connect_codex(&SettingsStore::default(), &home, &executable, &state_dir)?;
-                None
-            }
-            "save_config" => {
-                let config: CollaborationConfig =
-                    serde_json::from_value(payload).context("协作配置格式无效")?;
-                store.save_config(config)?;
-                None
-            }
-            "submit" => {
-                let request: TaskRequest =
-                    serde_json::from_value(payload).context("任务参数格式无效")?;
-                Some(store.submit(request)?.id)
-            }
-            "cancel" => {
-                let id = payload
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.trim().is_empty())
-                    .context("缺少任务 ID")?;
-                store.cancel(id)?;
-                None
-            }
-            _ => bail!("不支持的协作操作"),
-        };
-        let mut snapshot = store.snapshot()?;
-        snapshot["integration"] = registration_view(&home, &executable, &state_dir);
-        Ok((snapshot, task_id))
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())?;
+    let (mut snapshot, task_id, debug_ports) =
+        tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<_> {
+            let payload = payload.unwrap_or(Value::Null);
+            let executable = std::env::current_exe().context("无法定位子 Agent MCP 程序")?;
+            let home = codex_plus_core::codex_home::default_codex_home_dir();
+            let state_dir = codex_plus_core::paths::default_app_state_dir();
+            let task_id = match action.as_str() {
+                "snapshot" => None,
+                "refresh_codex" => {
+                    require_owned_registration(&home, &executable, &state_dir)?;
+                    None
+                }
+                "connect_codex" => {
+                    connect_codex(&SettingsStore::default(), &home, &executable, &state_dir)?;
+                    None
+                }
+                "save_config" => {
+                    let config: CollaborationConfig =
+                        serde_json::from_value(payload).context("协作配置格式无效")?;
+                    store.save_config(config)?;
+                    None
+                }
+                "submit" => {
+                    let request: TaskRequest =
+                        serde_json::from_value(payload).context("任务参数格式无效")?;
+                    Some(store.submit(request)?.id)
+                }
+                "cancel" => {
+                    let id = payload
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.trim().is_empty())
+                        .context("缺少任务 ID")?;
+                    store.cancel(id)?;
+                    None
+                }
+                _ => bail!("不支持的协作操作"),
+            };
+            let mut snapshot = store.snapshot()?;
+            snapshot["integration"] = registration_view(&home, &executable, &state_dir);
+            let debug_ports = if refresh_requested {
+                codex_refresh_ports()
+            } else {
+                Vec::new()
+            };
+            Ok((snapshot, task_id, debug_ports))
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
     if let Some(task_id) = task_id {
         executor::spawn_task(task_store, task_id);
     }
+    if refresh_requested {
+        snapshot["runtime"] =
+            serde_json::to_value(native_refresh::refresh_in_codex(&debug_ports).await)
+                .map_err(|_| "无法读取 Codex MCP 刷新结果".to_string())?;
+    }
     Ok(snapshot)
+}
+
+/// 本实例状态、常规安装状态和标准端口；实际操作前仍严格验证 Codex 页面身份。
+fn codex_refresh_ports() -> Vec<u16> {
+    let mut ports = Vec::new();
+    let mut push = |port: Option<u16>| {
+        if let Some(port) = port.filter(|port| *port > 0) {
+            if !ports.contains(&port) {
+                ports.push(port);
+            }
+        }
+    };
+    push(
+        codex_plus_core::status::StatusStore::default()
+            .load_latest()
+            .ok()
+            .flatten()
+            .and_then(|status| status.debug_port),
+    );
+    // 本地测试包隔离了自身状态，但接入的仍然是正常运行的 Codex App。
+    if let Some(base) = directories::BaseDirs::new() {
+        let path = base
+            .home_dir()
+            .join(".codex-session-delete/latest-status.json");
+        push(
+            codex_plus_core::status::StatusStore::new(path)
+                .load_latest()
+                .ok()
+                .flatten()
+                .and_then(|status| status.debug_port),
+        );
+    }
+    push(Some(9229));
+    ports
 }
 
 fn registration_view(home: &Path, executable: &Path, state_dir: &Path) -> Value {
@@ -80,6 +130,19 @@ fn registration_view(home: &Path, executable: &Path, state_dir: &Path) -> Value 
         }),
         Err(error) => json!({"status": "not_connected", "message": error.to_string()}),
     }
+}
+
+/// 刷新只能用于已明确接入的本工具配置；旧测试包路径不一致仍可重读。
+fn require_owned_registration(
+    home: &Path,
+    executable: &Path,
+    state_dir: &Path,
+) -> anyhow::Result<()> {
+    let registration = integration::status(home, executable, state_dir)?;
+    if !registration.owned || registration.status == "conflict" {
+        bail!("请先一键接入 Codex，再刷新工具；当前协作 MCP 未登记或归属不符");
+    }
+    Ok(())
 }
 
 /// 只更新协作 MCP 这一条。使用既有局部更新 API，保留其他设置与供应商数据。
@@ -268,6 +331,45 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.path().join("settings.json")).unwrap())
                 .unwrap();
         assert_eq!(persisted["futurePreference"], json!({"keep": true}));
+    }
+
+    #[test]
+    fn refresh_rejects_missing_unowned_and_conflicting_registration_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let state_dir = dir.path().join("state");
+        assert!(require_owned_registration(dir.path(), &executable, &state_dir).is_err());
+        assert!(!dir.path().join("config.toml").exists());
+        for contents in [
+            "[mcp_servers.codex_plus_collaboration]\ncommand = 'other'\n",
+            "[mcp_servers.codex_plus_collaboration]\ncommand = 'other'\nargs = ['--codex-plus-agent-mcp']\nurl = 'https://example.invalid/mcp'\n",
+        ] {
+            std::fs::write(dir.path().join("config.toml"), contents).unwrap();
+            assert!(require_owned_registration(dir.path(), &executable, &state_dir).is_err());
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+                contents
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_accepts_owned_registration_from_a_previous_test_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let previous_state = dir.path().join("previous-state");
+        let current_state = dir.path().join("current-state");
+        integration::install(dir.path(), &executable, &previous_state).unwrap();
+        let contents = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        let status = integration::status(dir.path(), &executable, &current_state).unwrap();
+        assert_eq!(status.status, "needs_update");
+        assert!(status.owned);
+        assert!(!status.registered);
+        require_owned_registration(dir.path(), &executable, &current_state).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.toml")).unwrap(),
+            contents
+        );
     }
 
     #[cfg(unix)]

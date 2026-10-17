@@ -3,6 +3,7 @@
 pub mod executor;
 pub mod integration;
 pub mod mcp;
+pub mod native_refresh;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

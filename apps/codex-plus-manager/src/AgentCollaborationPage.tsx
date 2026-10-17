@@ -7,6 +7,15 @@ import "./AgentCollaborationPage.css";
 type Agent = { id: string; name: string; executable: string; enabled: boolean; model: string };
 type CollaborationConfig = { enabled: boolean; defaultAgentId: string; agents: Agent[] };
 type Integration = { status: "connected" | "not_connected" | "conflict"; message: string; home?: string; configPath?: string };
+type CodexRuntime = {
+  status: "ready" | "partial" | "unavailable" | "error";
+  message: string;
+  reloadSucceeded: boolean;
+  toolsReady: boolean;
+  toolCount: number;
+  threadVerified: boolean;
+  cacheRefreshed: boolean;
+};
 type TaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted";
 type TaskRecord = {
   id: string;
@@ -28,6 +37,7 @@ type Snapshot = {
   tasks: TaskRecord[];
   availability?: { id: string; available: boolean; path?: string | null }[];
   integration?: Integration;
+  runtime?: CodexRuntime;
 };
 type McpConfig = { codexToml: string; claudeJson: string; command: string; args: string[] };
 
@@ -46,6 +56,8 @@ const statusLabels: Record<TaskStatus, string> = {
 const unfinished = (task: TaskRecord) => task.status === "queued" || task.status === "running";
 const absolutePath = (value: string) => /^(?:\/|[a-zA-Z]:[\\/]|\\\\)/.test(value.trim());
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
+const runtimeReady = (runtime?: CodexRuntime | null) => runtime?.status === "ready"
+  && runtime.reloadSucceeded === true && runtime.toolsReady === true && runtime.cacheRefreshed === true;
 // 旧版本快照没有默认 Agent 与模型字段，读取后补齐，保存时发送完整配置。
 const copyConfig = (config: CollaborationConfig): CollaborationConfig => ({
   ...config,
@@ -58,6 +70,7 @@ const formatTime = (value: number) => Number.isFinite(value) && value > 0
 
 export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: string } = {}) {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [runtime, setRuntime] = useState<CodexRuntime | null>(null);
   const [draft, setDraft] = useState<CollaborationConfig>(defaultConfig);
   const [dirty, setDirty] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -86,6 +99,9 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
   const applySnapshot = useCallback((next: Snapshot, saved = false) => {
     const normalized = { ...next, config: copyConfig(next.config) };
     setSnapshot(normalized);
+    // 普通快照不触发运行时检查，也不能抹掉用户最近一次显式刷新的结果。
+    if (saved) setRuntime(null);
+    else if (next.runtime) setRuntime(next.runtime);
     // 后台轮询只更新执行状态，保留用户尚未保存的配置。
     if (saved || !dirtyRef.current) {
       setDraft(copyConfig(normalized.config));
@@ -152,6 +168,8 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
     setBusy(action);
     setActionError("");
     setNotice("");
+    const refreshesCodex = action === "connect_codex" || action === "refresh_codex";
+    if (refreshesCodex) setRuntime(null);
     try {
       const next = await invoke<Snapshot>("agent_collaboration_request", { action, payload });
       if (!mounted.current || lifecycle.current !== epoch || sequence !== requestSequence.current) return;
@@ -159,7 +177,10 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
       setReadError("");
       onSuccess?.(next);
     } catch (error) {
-      if (mounted.current && lifecycle.current === epoch) setActionError(errorText(error));
+      if (mounted.current && lifecycle.current === epoch) {
+        setActionError(errorText(error));
+        if (refreshesCodex) setRuntime({ status: "error", message: errorText(error), reloadSucceeded: false, toolsReady: false, toolCount: 0, threadVerified: false, cacheRefreshed: false });
+      }
     } finally {
       if (mounted.current && lifecycle.current === epoch) {
         busyRef.current = false;
@@ -203,14 +224,25 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
     : continuation && (continuation.status !== "completed" || !continuation.sessionId) ? "该任务目前无法续聊，请创建新任务。"
     : "";
   const agentName = (id: string) => snapshot?.config.agents.find((agent) => agent.id === id)?.name ?? id;
+  const runtimeRefreshing = busy === "connect_codex" || busy === "refresh_codex";
+  const runtimeSucceeded = runtimeReady(runtime);
   const connectCodex = () => {
     if (dirtyRef.current) { setActionError("请先保存子 Agent 设置，再接入 Codex。"); return; }
     void mutate("connect_codex", {}, (next) => {
       if (next.integration?.status === "connected") {
-        setNotice(`${next.integration.message || "已接入配置。"} 在 Codex 重新加载 MCP 或开启新对话后，直接说“让 DeepSeek 实现…”或“让 Claude Code 审核…”。`);
+        setNotice(runtimeReady(next.runtime)
+          ? "已接入配置，Codex 工具已刷新。刷新后的工具从下一轮消息起可用。"
+          : "已接入配置；运行中的 Codex 工具是否已刷新，请查看下方运行状态。");
       } else {
         setActionError(next.integration?.message || "尚未完成 Codex 接入，请检查配置后重试。");
       }
+    });
+  };
+  const refreshCodex = () => {
+    if (dirtyRef.current) { setActionError("请先保存子 Agent 设置，再刷新 Codex 工具。"); return; }
+    void mutate("refresh_codex", {}, (next) => {
+      if (runtimeReady(next.runtime)) setNotice("Codex 工具已刷新。刷新后的工具从下一轮消息起可用。");
+      else if (!next.runtime) setActionError("未取得 Codex 工具刷新结果，请重试或手动重新加载 MCP。");
     });
   };
 
@@ -325,10 +357,21 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
       </section>
 
       <section className="agent-collaboration-section agent-collaboration-integration" aria-labelledby="agent-collaboration-mcp-title">
-        <div className="agent-collaboration-section-head"><div><h2 id="agent-collaboration-mcp-title">在 Codex 对话中使用</h2><p>点击接入后，为 Codex 注册默认分派、指定子 Agent 和等待结果的工具。</p></div><button type="button" className="mg-button mg-primary" disabled={!snapshot || Boolean(busy) || dirty} onClick={connectCodex}>{busy === "connect_codex" ? <Loader2 size={15} className="agent-collaboration-spin" /> : <ArrowRightLeft size={15} />}{busy === "connect_codex" ? "接入中…" : "一键接入 Codex"}</button></div>
-        <div className="agent-collaboration-integration-state" data-status={snapshot?.integration?.status ?? "not_connected"} role="status"><strong>{!snapshot ? "正在读取接入状态…" : snapshot.integration?.status === "connected" ? "已接入配置" : snapshot.integration?.status === "conflict" ? "接入配置有冲突" : snapshot.integration?.status === "not_connected" ? "尚未接入 Codex" : "尚未检测到接入配置"}</strong><span>{snapshot?.integration?.message || "保存子 Agent 设置后，点击“一键接入 Codex”。"}</span></div>
+        <div className="agent-collaboration-section-head"><div><h2 id="agent-collaboration-mcp-title">在 Codex 对话中使用</h2><p>接入会登记子 Agent 工具，并尝试在本机 Codex 中刷新。已登记配置可单独刷新工具。</p></div><div className="agent-collaboration-integration-actions">
+          <button type="button" className="mg-button" disabled={!snapshot || Boolean(busy) || dirty} onClick={refreshCodex}>{busy === "refresh_codex" ? <Loader2 size={15} className="agent-collaboration-spin" /> : <RefreshCw size={15} />}{busy === "refresh_codex" ? "刷新中…" : "刷新 Codex 工具"}</button>
+          <button type="button" className="mg-button mg-primary" disabled={!snapshot || Boolean(busy) || dirty} onClick={connectCodex}>{busy === "connect_codex" ? <Loader2 size={15} className="agent-collaboration-spin" /> : <ArrowRightLeft size={15} />}{busy === "connect_codex" ? "接入并刷新中…" : "一键接入并刷新"}</button>
+        </div></div>
+        <div className="agent-collaboration-integration-state" data-status={snapshot?.integration?.status ?? "not_connected"} role="status"><strong>{!snapshot ? "正在读取接入状态…" : snapshot.integration?.status === "connected" ? "已接入配置" : snapshot.integration?.status === "conflict" ? "接入配置有冲突" : snapshot.integration?.status === "not_connected" ? "尚未接入 Codex" : "尚未检测到接入配置"}</strong><span>{snapshot?.integration?.message || "保存子 Agent 设置后，点击“一键接入并刷新”。"}</span></div>
         {(snapshot?.integration?.home || snapshot?.integration?.configPath) && <p className="agent-collaboration-hint">{snapshot?.integration?.home ? "Codex 配置目录：" : "Codex 配置文件："}<code>{snapshot?.integration?.home || snapshot?.integration?.configPath}</code></p>}
-        <p className="agent-collaboration-hint">接入后请重新加载 Codex 的 MCP，或开启新会话，再使用上方的自然语言指令。已运行的对话不会即时增加工具。{dirty && " 请先保存设置，再接入。"}</p>
+        <div className="agent-collaboration-runtime-state" data-status={runtimeRefreshing ? "refreshing" : runtimeSucceeded ? "ready" : runtime?.status === "ready" ? "partial" : runtime?.status ?? "unchecked"} role="status" aria-busy={runtimeRefreshing}>
+          <small>运行中的 Codex · 最近一次工具刷新</small>
+          <strong>{runtimeRefreshing ? "正在刷新 Codex 工具…" : runtimeSucceeded ? "Codex 工具已刷新" : runtime?.status === "unavailable" ? "暂未连接到 Codex 运行时" : runtime?.status === "error" ? "工具刷新失败" : runtime ? "工具刷新尚未完成" : "尚未检查运行中的 Codex 工具"}</strong>
+          <span>{runtimeRefreshing ? "正在重新加载本机 MCP 配置、检查子 Agent 工具并刷新列表缓存。" : runtime?.message || "点击“刷新 Codex 工具”，检查子 Agent 工具是否已在本机 Codex 中加载。"}</span>
+          {runtime && !runtimeRefreshing && <div className="agent-collaboration-runtime-steps"><span data-complete={runtime.reloadSucceeded === true}>{runtime.reloadSucceeded ? "MCP 已重载" : "MCP 重载未确认"}</span><span data-complete={runtime.toolsReady === true}>{runtime.toolsReady ? `已找到子 Agent 工具${runtime.toolCount > 0 ? `（${runtime.toolCount} 个）` : ""}` : "子 Agent 工具未确认"}</span><span data-complete={runtime.cacheRefreshed === true}>{runtime.cacheRefreshed ? "工具列表缓存已刷新" : "工具列表缓存未刷新"}</span></div>}
+          {runtime?.status === "unavailable" && !runtimeRefreshing && <span>请用 Codex++ 启动或接管 Codex 后重试，也可在 Codex 中手动重新加载 MCP。</span>}
+        </div>
+        <p className="agent-collaboration-hint">Codex 的 MCP 工具列表可能缓存约 5 分钟，刷新会重新加载配置并更新列表缓存。</p>
+        <p className="agent-collaboration-hint">刷新后的工具从下一轮消息起可用，当前正在进行的回合不会中途增加工具。也可手动重新加载 MCP 或开启新对话。{dirty && " 请先保存设置，再接入或刷新。"}</p>
         <details className="agent-collaboration-manual"><summary>手动接入与配置导出</summary><div className="agent-collaboration-manual-body">
           <p className="agent-collaboration-hint">也可以复制配置，合并到对应客户端的 MCP 设置后重新连接。</p>
           <button type="button" className="mg-button" disabled={mcpLoading || !snapshot || Boolean(busy)} onClick={() => void loadMcpConfig()}>{mcpLoading ? <Loader2 size={15} className="agent-collaboration-spin" /> : <Copy size={15} />}{mcpLoading ? "读取中…" : mcpConfig ? "重新生成配置" : "生成手动配置"}</button>

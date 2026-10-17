@@ -5,8 +5,8 @@ Codex++ 最左侧的「Agent 协作」入口提供「子 Agent 设置」。日�
 ## 日常用法
 
 1. 打开「子 Agent 设置」，启用协作及需要使用的 Agent，选择默认 Agent，保存配置。
-2. 点击「一键接入 Codex」。这只管理 `codex_plus_collaboration` MCP 条目，并同步到 Codex++ 的托管 MCP 配置，后续切换供应商仍会保留。
-3. 在 Codex 重新加载 MCP，或开启新对话。
+2. 点击「一键接入并刷新」。配置只管理 `codex_plus_collaboration` 条目，并同步到 Codex++ 的托管 MCP 配置，后续切换供应商仍会保留。
+3. 检查独立的运行刷新状态。存在 Codex++ 原生连接时会重载本机 MCP 配置、检查子 Agent 工具并刷新 `/mcp` 的列表缓存；刷新后的工具从下一轮消息起可用。缺少连接时，先用 Codex++ 启动或接管 Codex，再点「刷新 Codex 工具」，也可在 Codex 手动重新加载 MCP。
 4. 直接向 Codex 说明任务，例如：
 
    - 「让 DeepSeek 实现这个功能，你负责检查结果。」
@@ -16,6 +16,8 @@ Codex++ 最左侧的「Agent 协作」入口提供「子 Agent 设置」。日�
 明确点名 DeepSeek、Claude Code 或另一个 Codex 时，委派到对应 Agent；未点名时才使用默认 Agent。目标不可用时不会擅自换成其他 Agent。
 
 Codex 获得异步任务 ID 后可以继续独立工作，再通过等待或查询工具取得终态和答案，在原对话中向用户汇报。仅提交成功不能当作执行成功。
+
+`/mcp` 面板缓存的是全局列表，原生客户端当前会缓存 5 分钟。新聊天的 MCP 就绪不一定会更新这份列表，旧聊天也不一定自动获得新工具。因此「已接入配置」「工具已发现」「列表缓存已刷新」分开显示；刷新入口会重读本机全部 MCP 配置，仅检查本服务，不会发起聊天回合或调用模型。
 
 ## 子 Agent 配置
 
@@ -35,7 +37,7 @@ DSH headless 默认使用自己的环境凭据配置，可能无法直接使用�
 
 ## 手动接入及其他客户端
 
-「手动接入与配置导出」中保留 MCP 配置。Codex 使用 TOML 片段，Claude Code 及兼容客户端可使用 `mcpServers` JSON；DSH 按其 MCP 配置格式填写同一 command/args。只有显式点击「一键接入 Codex」才会修改 Codex 的接入配置，保存子 Agent 参数不会自动改外部客户端。
+「手动接入与配置导出」中保留 MCP 配置。Codex 使用 TOML 片段，Claude Code 及兼容客户端可使用 `mcpServers` JSON；DSH 按其 MCP 配置格式填写同一 command/args。只有显式点击「一键接入并刷新」才会修改 Codex 的接入配置，保存子 Agent 参数不会自动改外部客户端；单独的「刷新 Codex 工具」不写配置文件。
 
 配置指向当前运行的 Codex++ 可执行文件，参数为：
 
