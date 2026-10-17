@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Codex++ — Make Codex nicer to use</title>
-<meta name="description" content="Codex++ is a unified manager for the Codex desktop app: providers and models, per-model context windows, session management, interface enhancements, extensions and desktop pets.">
+<meta name="description" content="Codex++ is a unified manager for the Codex desktop app: providers and models, per-model context windows, sub-agent collaboration, session management, interface enhancements, extensions and desktop pets.">
 <link rel="icon" type="image/png" href="assets/logo.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -155,7 +155,13 @@
       <h3>WeChat connect</h3>
       <p>Scan a QR code to reach your local Codex. Each contact maps to an isolated session, with an allow-list of WeChat users. Hand off work from anywhere.</p>
     </article>
+    <article class="fcard tilt" id="agent-feature">
+      <span class="fcard-no mono">10</span>
+      <h3>Delegate in a sentence</h3>
+      <p>Ask your current Codex chat to delegate to DeepSeek Harness (dsh), Claude Code or another Codex. The selected CLI runs the task and returns results to the same chat. Configure the default agent, CLI paths and models; naming an agent selects that target.</p>
+    </article>
   </div>
+  <p class="agent-setup"><b>Get started with sub-agents:</b> Confirm the target CLI works and is signed in. Open Agent Collaboration → Sub-agent Settings, enable your target, configure its CLI and model, select a default agent and save. Click “Connect &amp; refresh”; in your next message, say “Ask DeepSeek to investigate this issue.” DSH can optionally reuse saved authentication with a matching model route. <a href="https://github.com/BigPizzaV3/CodexPlusPlus/blob/main/docs/agent-collaboration.md" target="_blank" rel="noopener">Configuration guide (Chinese) ↗</a></p>
 </section>
 
 <section class="modes" id="modes">
@@ -199,6 +205,12 @@
       <p class="section-sub">All screenshots below are the real Codex++ interface. Scroll sideways, take your time.</p>
     </div>
     <div class="showcase-track" id="showcaseTrack">
+      <figure class="shot shot-wide shot-agent tilt" id="agent-collaboration">
+        <a class="shot-frame shot-preview" href="assets/agent-collaboration.png" target="_blank" rel="noopener" aria-label="Open the full-size sub-agent collaboration screenshot">
+          <img src="assets/agent-collaboration.png" width="1766" height="630" loading="lazy" alt="A Codex chat asks DeepSeek what 1+1 is, uses Codex Plus Collaboration, then shows DeepSeek's answer: 1+1 equals 2">
+        </a>
+        <figcaption><b>Sub-agents, in action</b><span>Codex delegates to DeepSeek via dsh and returns the result in the same chat. Click to view full size.</span></figcaption>
+      </figure>
       <figure class="shot tilt">
         <div class="shot-frame"><img src="assets/manager-enhancements.png" alt="Codex++ Manager: models, sessions, input behavior and widget settings in one place"></div>
         <figcaption><b>Enhancements hub</b><span>Plugins &amp; models, dialogs &amp; input, widgets &amp; pets — one page of switches.</span></figcaption>

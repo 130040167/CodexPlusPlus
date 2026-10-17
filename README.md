@@ -181,6 +181,12 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的统一管理应用，通
       为每个供应商身份启动相互隔离的 Codex 实例：独立配置、会话和用户数据目录，可与其他单一供应商同时运行；运行中的实例集中列出，可单独重启或结束。
     </td>
   </tr>
+  <tr>
+    <td colspan="2" valign="top">
+      <h3>🤝 子 Agent 协作</h3>
+      在 Codex 对话中用自然语言委派 Codex CLI、DeepSeek Harness（dsh）或 Claude Code，执行结果回到当前对话。可配置默认 Agent、模型路由，并按需复用 DSH 已保存的登录与密钥。
+    </td>
+  </tr>
 </table>
 
 另外，微信连接支持扫码连接本机 Codex，每个联系人映射到独立会话，并可配置允许访问的微信用户。
@@ -217,6 +223,22 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的统一管理应用，通
 <p align="center">
   <img src="docs/images/codex-multi-launch.png" alt="Codex 多开：列出运行中的 DeepSeek 与 Zhipu GLM 实例，可单独重启或结束" width="100%">
 </p>
+
+### 在 Codex 对话里，直接请其他 Agent 帮忙
+
+对 Codex 说「让 DeepSeek 实现这个功能」或「让 Claude Code 审核改动」，Codex++ 会通过 MCP 启动对应的原生 CLI，执行结果回到当前对话。支持 Codex CLI、DeepSeek Harness（`dsh`）与 Claude Code；明确点名时使用对应 Agent，未点名时使用配置的默认 Agent。
+
+管理器中可设置默认 Agent、CLI 路径、模型与 DeepSeek 的 `provider/model` 路由。DeepSeek 可选开启「复用 DSH 已保存的登录与密钥」，由 dsh 使用原生认证，无需在 Codex++ 中另存凭据。
+
+1. 打开「Agent 协作」，启用协作及要使用的 Agent，选择默认 Agent 并保存。
+2. 点击「一键接入并刷新」，将协作工具接入 Codex。
+3. 回到 Codex 对话，直接点名分派任务，等待结果返回。
+
+<p align="center">
+  <img src="docs/images/agent-collaboration.png" alt="实测：问问 DeepSeek 1+1 是多少，通过 Codex Plus Collaboration 协作集成返回 2" width="100%">
+</p>
+
+实测示例：「问问 DeepSeek 1+1 是多少」→ 通过协作集成取得 DeepSeek 回答「1+1 等于 2」。更多模型路由、认证与任务配置见 [子 Agent 协作指南](docs/agent-collaboration.md)。
 
 ### 让拓展适应你的工作流
 

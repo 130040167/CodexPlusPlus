@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Codex++ — 让 Codex 更顺手</title>
-<meta name="description" content="Codex++ 是面向 Codex 桌面应用的统一管理工具：供应商与模型、上下文窗口、会话管理、界面增强、拓展与桌宠。给 Codex 桌面应用加一点「++」。">
+<meta name="description" content="Codex++ 是面向 Codex 桌面应用的统一管理工具：供应商与模型、上下文窗口、子 Agent 协作、会话管理、界面增强、拓展与桌宠。给 Codex 桌面应用加一点「++」。">
 <link rel="icon" type="image/png" href="assets/logo.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -159,7 +159,13 @@
       <h3>微信连接</h3>
       <p>扫码连接本机 Codex，每个联系人映射到独立会话，并可配置允许访问的微信用户。出门在外，也能远程派活。</p>
     </article>
+    <article class="fcard tilt" id="agent-feature">
+      <span class="fcard-no mono">10</span>
+      <h3>一句话，派给子 Agent</h3>
+      <p>在当前 Codex 对话中委派 DeepSeek Harness（dsh）、Claude Code 或另一个 Codex，由对应 CLI 执行，再把结果带回原对话。管理器可配置默认 Agent、CLI 路径和模型；点名时交给指定对象。</p>
+    </article>
   </div>
+  <p class="agent-setup"><b>子 Agent 上手：</b>先确认目标 CLI 可用并完成原生登录；打开「Agent 协作 → 子 Agent 设置」，启用目标、配置 CLI 与模型，选择默认 Agent 并保存；点击「一键接入并刷新」，下一轮直接说「让 DeepSeek 检查这个问题」。DSH 可按需开启复用已保存认证，并选择匹配的模型路由。<a href="https://github.com/BigPizzaV3/CodexPlusPlus/blob/main/docs/agent-collaboration.md" target="_blank" rel="noopener">查看配置说明 ↗</a></p>
 </section>
 
 <!-- ========== 供应商接入方式 ========== -->
@@ -205,6 +211,12 @@
       <p class="section-sub">以下全部是 Codex++ 的真实界面。横向滚动，慢慢看。</p>
     </div>
     <div class="showcase-track" id="showcaseTrack">
+      <figure class="shot shot-wide shot-agent tilt" id="agent-collaboration">
+        <a class="shot-frame shot-preview" href="assets/agent-collaboration.png" target="_blank" rel="noopener" aria-label="打开子 Agent 协作实测截图原图">
+          <img src="assets/agent-collaboration.png" width="1766" height="630" loading="lazy" alt="Codex 对话中请求问问 DeepSeek 1+1 是多少，调用 Codex Plus Collaboration 后，DeepSeek 回答 1+1 等于 2">
+        </a>
+        <figcaption><b>子 Agent 协作实测</b><span>Codex 通过 dsh 委派 DeepSeek，结果回到同一对话。点击截图查看原图。</span></figcaption>
+      </figure>
       <figure class="shot tilt">
         <div class="shot-frame"><img src="assets/manager-enhancements.png" alt="Codex++ 管理工具：集中管理模型、会话、输入体验和挂件设置"></div>
         <figcaption><b>增强集中管理</b><span>插件与模型、对话与输入、挂件与桌宠，一页开关。</span></figcaption>

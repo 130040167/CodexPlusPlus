@@ -467,6 +467,18 @@ body::after {
 }
 .fcard p { font-size: 13.5px; color: var(--txt-2); line-height: 1.85; }
 .fcard p .mono { font-size: 0.85em; color: var(--amber); }
+.agent-setup {
+  max-width: 1280px;
+  margin: 24px auto 0;
+  padding: 18px 22px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--txt-2);
+  font-size: 13.5px;
+  line-height: 1.85;
+}
+.agent-setup b { color: var(--txt-1); }
+.agent-setup a { color: var(--cyan); text-decoration: underline; text-underline-offset: 3px; }
 
 /* ============ 横向实拍 ============ */
 
@@ -504,6 +516,8 @@ body::after {
   transform-style: preserve-3d;
 }
 .shot-frame img { width: 100%; height: auto; }
+.shot-preview { display: block; cursor: zoom-in; }
+.shot-preview:focus-visible { outline: 2px solid var(--cyan); outline-offset: 5px; }
 .shot-dark { background: #0c0e14; }
 .shot:hover .shot-frame {
   border-color: rgba(148, 163, 255, 0.4);
@@ -518,6 +532,7 @@ body::after {
 }
 .shot figcaption b { font-size: 16px; white-space: nowrap; }
 .shot figcaption span { color: var(--txt-2); font-size: 13px; }
+.shot-agent figcaption { flex-wrap: wrap; row-gap: 4px; }
 
 /* 最后一卡与右缘对齐，滚动到头正好停住 */
 .shot-end {

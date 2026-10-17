@@ -51,6 +51,7 @@ Friendly link: <a href="https://linux.do">LINUX DO</a>
 | Development workflow | Project move and thread IDs |
 | Usage status line | Live generation speed, cache hit rate, and context usage below the composer, read from local Codex session records; the context share follows the per-model window Codex sees |
 | Codex multi-launch | Start an isolated Codex instance per provider identity, each with its own config, sessions, and user data directory; running instances are listed together and can be restarted or stopped individually |
+| Sub-agent collaboration | Delegate in natural language from a Codex chat to Codex CLI, DeepSeek Harness (dsh), or Claude Code and receive results in the same chat; configure a default agent, model routes, and optional reuse of saved DSH authentication |
 | Scripts and maintenance | User script installation and toggles, app detection, shortcuts, Watcher, environment cleanup, logs, diagnostics, health checks, and Release updates |
 
 Every UI enhancement is independently configurable. Disabling the global enhancement switch still leaves Codex++ available as a provider and launch manager.
@@ -66,6 +67,20 @@ Every UI enhancement is independently configurable. Disabling the global enhance
 <p align="center">
   <img src="docs/images/codex-multi-launch.png" alt="Codex multi-launch: running DeepSeek and Zhipu GLM instances with restart and stop actions" width="100%">
 </p>
+
+**Sub-agent collaboration** lets you say “Have DeepSeek implement this feature” or “Ask Claude Code to review the changes” directly in a Codex chat. Codex++ starts the corresponding native CLI through MCP and returns its results to the same chat. It supports Codex CLI, DeepSeek Harness (`dsh`), and Claude Code; naming an agent selects that agent, while an unspecified delegation uses your configured default.
+
+Configure the default agent, CLI paths, models, and DeepSeek's `provider/model` route in the manager. You can optionally enable reuse of DSH's saved login and keys, letting dsh use its native authentication without storing another copy in Codex++.
+
+1. Open **Agent collaboration**, enable collaboration and the agents you want to use, select a default agent, and save.
+2. Click **Connect and refresh** (「一键接入并刷新」) to add the collaboration tools to Codex.
+3. Return to the Codex chat, name an agent and its task, and wait for the result.
+
+<p align="center">
+  <img src="docs/images/agent-collaboration.png" alt="Verified DeepSeek example: ask what 1+1 equals and receive 2 through the Codex Plus Collaboration integration" width="100%">
+</p>
+
+Verified example: “Ask DeepSeek what 1+1 equals” → the collaboration integration returns DeepSeek's answer, “1+1 equals 2.” See the [sub-agent collaboration guide](docs/agent-collaboration.md) for model routes, authentication, and task settings.
 
 Enable the optional Codex usage widget under Codex Enhancements → General → Widgets and pets. It includes the original character, modular bubble editor, sound library and waveform trimming, character/image/audio management, edge snapping and alerts. View session and local usage, observed subscription windows and costs estimated from configured prices, or connect provider balance and quota templates. See the [widget guide](docs/whale-widget.md) and [feature verification](docs/whale-parity.md).
 
