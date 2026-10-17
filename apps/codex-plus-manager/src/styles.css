@@ -1889,11 +1889,14 @@ body {
 .relay-api-key-list {
   display: grid;
   gap: 8px;
+  min-width: 0;
+  container-type: inline-size;
+  container-name: relay-api-keys;
 }
 
 .relay-api-key-row {
   display: grid;
-  grid-template-columns: 36px minmax(120px, 0.55fr) minmax(220px, 1.45fr) 36px;
+  grid-template-columns: 36px minmax(0, 0.55fr) minmax(0, 1.45fr) 36px;
   align-items: center;
   gap: 8px;
   min-width: 0;
@@ -1901,6 +1904,37 @@ body {
   border: 1px solid hsl(var(--border) / 0.8);
   border-radius: var(--radius-md);
   background: hsl(var(--surface-raised) / 0.35);
+}
+
+.relay-api-key-row > input {
+  min-width: 0;
+}
+
+/* Key 区可能只占表单半列，按它自身的宽度换行，避免宽窗口内仍挤出边框。 */
+@container relay-api-keys (max-width: 440px) {
+  .relay-api-key-row {
+    grid-template-columns: 36px minmax(0, 1fr) 36px;
+  }
+
+  .relay-api-key-select {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .relay-api-key-row > input:not([type="password"]) {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .relay-api-key-row > input[type="password"] {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .relay-api-key-row > button:last-child {
+    grid-column: 3;
+    grid-row: 1;
+  }
 }
 
 .relay-api-key-row.active {
@@ -7074,14 +7108,6 @@ select {
   .relay-config-section-head {
     align-items: stretch;
     flex-direction: column;
-  }
-
-  .relay-api-key-row {
-    grid-template-columns: 36px minmax(0, 1fr) 36px;
-  }
-
-  .relay-api-key-row > input[type="password"] {
-    grid-column: 2 / 4;
   }
 
   .relay-model-list-tools {
