@@ -32,6 +32,10 @@ pub fn default_ccs_db_path() -> PathBuf {
         .join(format!("{}-{}.db", "cc", "switch"))
 }
 
+pub fn default_ccs_skills_dir() -> PathBuf {
+    home_dir().join(".cc-switch").join("skills")
+}
+
 pub fn list_codex_providers_from_default_db() -> anyhow::Result<Vec<CcsProviderImport>> {
     list_codex_providers_from_db(&default_ccs_db_path())
 }
