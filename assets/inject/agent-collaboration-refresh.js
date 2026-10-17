@@ -11,8 +11,9 @@
     reloadSucceeded: false, toolsReady: false, toolCount: 0, threadVerified: false, cacheRefreshed: false,
   };
   const result = () => JSON.stringify(report);
+  const timeoutCode = "CODEX_PLUS_REFRESH_TIMEOUT";
   const bounded = (promise, milliseconds) => new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("operation timeout")), milliseconds);
+    const timer = setTimeout(() => reject(Object.assign(new Error("operation timeout"), { code: timeoutCode })), milliseconds);
     Promise.resolve(promise).then(
       value => { clearTimeout(timer); resolve(value); },
       () => { clearTimeout(timer); reject(new Error("operation failed")); },
@@ -105,16 +106,23 @@
   }
   function findQueryClient() {
     let sawQueryClient = false;
+    let lookupFailed = false;
     const seen = new Set();
     const inspect = value => {
-      if (!isQueryClient(value) || seen.has(value)) return null;
-      seen.add(value);
-      sawQueryClient = true;
-      return exactQuery(value) ? value : null;
+      if (seen.has(value)) return null;
+      try {
+        if (!isQueryClient(value)) return null;
+        seen.add(value);
+        sawQueryClient = true;
+        return exactQuery(value) ? value : null;
+      } catch {
+        lookupFailed = true;
+        return null;
+      }
     };
     for (const value of [window.__REACT_QUERY_CLIENT__, window.__codexQueryClient]) {
       const client = inspect(value);
-      if (client) return { client, sawQueryClient };
+      if (client) return { client, sawQueryClient, lookupFailed };
     }
     const roots = [document.getElementById?.("root"), document.body, document.documentElement].filter(Boolean);
     for (const root of roots) {
@@ -125,9 +133,9 @@
       let fiber = root[key];
       if (fiber?.stateNode?.current) fiber = fiber.stateNode.current;
       const client = queryClientFromFiber(fiber, inspect);
-      if (client) return { client, sawQueryClient };
+      if (client) return { client, sawQueryClient, lookupFailed };
     }
-    return { client: null, sawQueryClient };
+    return { client: null, sawQueryClient, lookupFailed };
   }
   function exactQuery(client) {
     const cache = client.getQueryCache();
@@ -140,25 +148,34 @@
     return typeof cache?.getAll === "function" ? cache.getAll().find(matches) || null : null;
   }
   let cacheFailure = "";
+  let cachePhase = "find";
   try {
-    const { client, sawQueryClient } = findQueryClient();
+    const { client, sawQueryClient, lookupFailed } = findQueryClient();
     if (!client) {
-      cacheFailure = sawQueryClient
+      cacheFailure = lookupFailed ? "无法定位 MCP 列表缓存，请重新打开 /mcp 后重试。" : sawQueryClient
         ? "尚未建立列表查询，请先在 Codex 中打开 /mcp，再点击刷新。"
         : "未找到 QueryClient，无法刷新 MCP 列表缓存。";
     } else {
       await bounded((async () => {
+        cachePhase = "invalidate";
         await client.invalidateQueries({ queryKey, exact: true, refetchType: "none" });
-        await client.refetchQueries({ queryKey, exact: true, type: "all" }, { throwOnError: true });
+        cachePhase = "refetch";
+        await client.refetchQueries({ queryKey, exact: true, type: "all" }, { throwOnError: true, cancelRefetch: false });
       })(), 1800);
+      cachePhase = "verify";
       const query = exactQuery(client);
       const cached = typeof client.getQueryData === "function" ? client.getQueryData(queryKey) : query?.state?.data;
       report.cacheRefreshed = query?.state?.isInvalidated !== true && toolsReady(entryFromPayload(cached));
       if (!report.cacheRefreshed) cacheFailure = "列表数据尚未更新，请稍后再次检查 /mcp。";
     }
-  } catch {
+  } catch (error) {
     report.cacheRefreshed = false;
-    cacheFailure = "重读列表失败，请稍后重试刷新。";
+    cacheFailure = error?.code === timeoutCode
+      ? "列表仍在后台刷新，请稍后重新打开 /mcp 查看，无需重新接入。"
+      : cachePhase === "find" ? "无法定位 MCP 列表缓存，请重新打开 /mcp 后重试。"
+        : cachePhase === "invalidate" ? "无法准备列表刷新，请重新打开 /mcp 后重试。"
+          : cachePhase === "verify" ? "无法核验列表更新，请重新打开 /mcp 查看。"
+            : "重读列表失败，请稍后重试刷新。";
   }
   if (threadId && currentThreadId() !== threadId) {
     report.threadVerified = false;

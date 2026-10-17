@@ -23,14 +23,16 @@ const unrelatedQueryClient = {
   invalidateQueries() { throw new Error('Unrelated cache must not be invalidated'); },
   refetchQueries() { throw new Error('Unrelated cache must not be refreshed'); },
 };
+const brokenQueryClient = {...unrelatedQueryClient,getQueryCache() { throw new Error('FAKE_SECRET_CACHE brand mismatch'); }};
 const queryClient = {
   getQueryCache() { return {find(filter) { assert.equal(filter.exact,true); assert.deepEqual(Array.from(filter.queryKey),key); return mode==='missing-full-query' ? undefined : query; }}; },
   setQueryData() { throw new Error('The diagnostic must never synthesize cache data'); },
-  getQueryData(requested) { assert.deepEqual(Array.from(requested),key); return query.state.data; },
-  async invalidateQueries(filter) { cacheCalls.push(['invalidate',filter]); assert.equal(filter.exact,true); assert.equal(filter.refetchType,'none'); assert.deepEqual(Array.from(filter.queryKey),key); query.state.isInvalidated=true; },
+  getQueryData(requested) { assert.deepEqual(Array.from(requested),key); if (mode==='verify-error') throw new Error('FAKE_SECRET_CACHE verify failed'); return query.state.data; },
+  async invalidateQueries(filter) { cacheCalls.push(['invalidate',filter]); assert.equal(filter.exact,true); assert.equal(filter.refetchType,'none'); assert.deepEqual(Array.from(filter.queryKey),key); if (mode==='invalidate-error') throw new Error('FAKE_SECRET_CACHE invalidation failed'); query.state.isInvalidated=true; },
   async refetchQueries(filter,options) {
-    cacheCalls.push(['refetch',filter]); assert.equal(filter.exact,true); assert.equal(filter.type,'all'); assert.deepEqual(Array.from(filter.queryKey),key); assert.equal(options.throwOnError,true);
+    cacheCalls.push(['refetch',filter]); assert.equal(filter.exact,true); assert.equal(filter.type,'all'); assert.deepEqual(Array.from(filter.queryKey),key); assert.equal(options.throwOnError,true); assert.equal(options.cancelRefetch,false);
     if (mode==='refetch-error') throw new Error('FAKE_SECRET_CACHE must never escape');
+    if (mode==='refetch-timeout') return new Promise(()=>{});
     query.state.data={data:[mode==='stale-cache' ? {name:'codex_plus_collaboration',tools:{get_task:{name:'get_task'}}} : item(null)]}; query.state.isInvalidated=false;
   },
 };
@@ -65,6 +67,8 @@ if (mode==='disposed') client.disposed=true;
 if (mode==='getter-bound') entry.getterBound=true;
 if (mode==='missing-query-client') delete window.__codexQueryClient;
 if (mode==='wrong-explicit-client-first') window.__REACT_QUERY_CLIENT__=unrelatedQueryClient;
+if (mode==='broken-explicit-client-first') window.__REACT_QUERY_CLIENT__=brokenQueryClient;
+if (mode==='find-cache-error') window.__codexQueryClient=brokenQueryClient;
 if (mode==='no-thread') window.location.pathname='/home';
 if (mode==='temporary-thread') window.location.pathname='/thread/client-new-thread:temporary';
 if (mode==='fiber-query-client') {
@@ -95,6 +99,17 @@ const context = {window,document,Map,Set,Promise,JSON,Object,Array,Error,setTime
    } else if (mode==='missing-full-query') {
      assert.equal(report.status,'partial'); assert.equal(report.cacheRefreshed,false); assert.equal(report.toolsReady,true); assert.equal(cacheCalls.length,0);
      assert.equal(report.message,'本机 MCP 配置已整体重读，工具已就绪；尚未建立列表查询，请先在 Codex 中打开 /mcp，再点击刷新。');
+   } else if (['find-cache-error','invalidate-error','verify-error','refetch-timeout'].includes(mode)) {
+     assert.equal(report.status,'partial'); assert.equal(report.cacheRefreshed,false); assert.equal(report.toolsReady,true);
+     assert.deepEqual(cacheCalls.map(call=>call[0]),mode==='find-cache-error' ? [] : mode==='invalidate-error' ? ['invalidate'] : ['invalidate','refetch']);
+     const reason = {
+       'find-cache-error':'无法定位 MCP 列表缓存，请重新打开 /mcp 后重试。',
+       'invalidate-error':'无法准备列表刷新，请重新打开 /mcp 后重试。',
+       'verify-error':'无法核验列表更新，请重新打开 /mcp 查看。',
+       'refetch-timeout':'列表仍在后台刷新，请稍后重新打开 /mcp 查看，无需重新接入。',
+     }[mode];
+     assert.equal(report.message,'本机 MCP 配置已整体重读，工具已就绪；'+reason);
+     if (mode==='refetch-timeout') assert.equal(cacheCalls.filter(call=>call[0]==='refetch').length,1);
    } else if (mode==='refetch-error' || mode==='stale-cache') {
      assert.equal(report.status,'partial'); assert.equal(report.cacheRefreshed,false); assert.equal(report.toolsReady,true);
      assert.deepEqual(cacheCalls.map(call=>call[0]),['invalidate','refetch']);
@@ -113,6 +128,7 @@ const context = {window,document,Map,Set,Promise,JSON,Object,Array,Error,setTime
  assert.deepEqual(Object.keys(report).sort(),['status','message','reloadSucceeded','toolsReady','toolCount','threadVerified','cacheRefreshed'].sort());
  assert.ok(!JSON.stringify(report).includes('FAKE_SECRET_PREFLIGHT'));
  assert.ok(!JSON.stringify(report).includes('FAKE_SECRET_CACHE'));
+ assert.ok(!JSON.stringify(report).includes('CODEX_PLUS_REFRESH_TIMEOUT'));
  console.log('fixture passed: '+mode);
 })().catch(error=>{console.error(error);process.exitCode=1;});
 "#;
@@ -150,6 +166,7 @@ fn native_refresh_uses_only_fixed_rpc_sequence_and_refreshes_exact_global_full_c
     fixture("no-thread");
     fixture("temporary-thread");
     fixture("wrong-explicit-client-first");
+    fixture("broken-explicit-client-first");
     fixture("wrong-fiber-client-first");
 }
 
@@ -171,6 +188,14 @@ fn native_refresh_reports_partial_without_cache_or_connected_current_thread() {
 #[test]
 fn native_refresh_failure_does_not_echo_provider_or_transport_details() {
     fixture("reload-error");
+}
+
+#[test]
+fn native_refresh_distinguishes_background_timeout_and_fixed_cache_failure_phases() {
+    fixture("refetch-timeout");
+    fixture("find-cache-error");
+    fixture("invalidate-error");
+    fixture("verify-error");
 }
 
 #[tokio::test]
