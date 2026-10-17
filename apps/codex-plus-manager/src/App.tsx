@@ -9450,13 +9450,27 @@ function RelayProfileEditor({
                   </UiBadge>
                 </div>
                 <div className="relay-api-fields">
-                  <Field className="relay-field-base-url" label="Base URL">
-                    <Input
-                      value={profile.baseUrl}
-                      onChange={(event) => updateDraft({ baseUrl: event.currentTarget.value })}
-                      placeholder={t("填写供应商的 Base URL")}
-                    />
-                  </Field>
+                  <div className="relay-api-connection-fields">
+                    <Field className="relay-field-base-url" label="Base URL">
+                      <Input
+                        value={profile.baseUrl}
+                        onChange={(event) => updateDraft({ baseUrl: event.currentTarget.value })}
+                        placeholder={t("填写供应商的 Base URL")}
+                      />
+                    </Field>
+                    <Field className="relay-field-protocol" label={t("上游协议")}>
+                      <AppSelect
+                        ariaLabel={t("上游协议")}
+                        value={profile.protocol}
+                        onChange={(protocol) => updateDraft({ protocol })}
+                        options={[
+                          { value: "responses", label: "Responses API" },
+                          { value: "chatCompletions", label: "Chat Completions" },
+                          { value: "anthropicMessages", label: "Anthropic Messages" },
+                        ]}
+                      />
+                    </Field>
+                  </div>
                   <Field className="relay-field-key" label="API Keys">
                     <div className="relay-api-key-list">
                       {normalizedApiKeys.apiKeys.map((entry) => {
@@ -9509,18 +9523,6 @@ function RelayProfileEditor({
                         {t("添加 Key")}
                       </Button>
                     </div>
-                  </Field>
-                  <Field className="relay-field-protocol" label={t("上游协议")}>
-                    <AppSelect
-                      ariaLabel={t("上游协议")}
-                      value={profile.protocol}
-                      onChange={(protocol) => updateDraft({ protocol })}
-                      options={[
-                        { value: "responses", label: "Responses API" },
-                        { value: "chatCompletions", label: "Chat Completions" },
-                        { value: "anthropicMessages", label: "Anthropic Messages" },
-                      ]}
-                    />
                   </Field>
                   {profile.protocol === "anthropicMessages" ? (
                     <>

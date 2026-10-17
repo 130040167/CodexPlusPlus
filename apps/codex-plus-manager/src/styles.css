@@ -1477,6 +1477,14 @@ body {
   align-items: start;
 }
 
+/* 左侧端点与协议独立排列，不随右侧 Key 列表的高度拉开间距。 */
+.relay-api-connection-fields {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  min-width: 0;
+}
+
 /* 已在 .relay-advanced-block 里，不再需要跨列。左右内边距由自己负责：
    外层盒子的 padding 已经移到 trigger 上，好让收起态整块可点 */
 .relay-advanced-fields {
@@ -2194,8 +2202,7 @@ details.relay-fold[open] > .relay-fold-body {
   min-width: 0;
 }
 
-.relay-options-grid > .relay-field-config-model,
-.relay-connection-section .relay-api-fields > .relay-field-protocol {
+.relay-options-grid > .relay-field-config-model {
   grid-column: 1 / -1;
 }
 
