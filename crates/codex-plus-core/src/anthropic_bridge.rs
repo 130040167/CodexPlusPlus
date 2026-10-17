@@ -1215,6 +1215,9 @@ pub struct AnthropicSseToChatSse {
     next_tool_index: u64,
     stopped: bool,
     failed: bool,
+    compaction_stop_reason: bool,
+    message_stopped: bool,
+    compaction_stream_valid: bool,
     /// 正在累积的思考块（text + signature），content_block_stop 时收口。
     pending_thinking: Option<PendingThinking>,
     /// 已收口、带签名的思考块，供 Responses 侧回放。
@@ -1254,6 +1257,9 @@ impl Default for AnthropicSseToChatSse {
             next_tool_index: 0,
             stopped: false,
             failed: false,
+            compaction_stop_reason: false,
+            message_stopped: false,
+            compaction_stream_valid: true,
             pending_thinking: None,
             thinking_blocks: Vec::new(),
         }
@@ -1261,6 +1267,13 @@ impl Default for AnthropicSseToChatSse {
 }
 
 impl AnthropicSseToChatSse {
+    /// 摘要必须满足原始 Anthropic 完成契约，不能只信转换后的 finish_reason。
+    pub(crate) fn has_successful_compaction_completion(&self) -> bool {
+        self.message_stopped && self.compaction_stop_reason && !self.failed
+            && self.compaction_stream_valid && self.utf8_remainder.is_empty()
+            && self.buffer.lines().all(|line| line.trim().is_empty() || line.starts_with(':'))
+    }
+
     pub fn has_failed(&self) -> bool {
         self.failed
     }
@@ -1276,6 +1289,11 @@ impl AnthropicSseToChatSse {
     }
 
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut utf8 = self.utf8_remainder.clone();
+        utf8.extend_from_slice(bytes);
+        if std::str::from_utf8(&utf8).is_err_and(|error| error.error_len().is_some()) {
+            self.compaction_stream_valid = false;
+        }
         append_utf8_safe(&mut self.buffer, &mut self.utf8_remainder, bytes);
         let mut output = String::new();
         while let Some(block) = take_sse_block(&mut self.buffer) {
@@ -1321,6 +1339,7 @@ impl AnthropicSseToChatSse {
             return;
         }
         let Ok(data) = serde_json::from_str::<Value>(&data_text) else {
+            self.compaction_stream_valid = false;
             return;
         };
         // 部分网关不写 `event:` 行，只把类型放在 JSON 的 `type` 字段里。
@@ -1460,6 +1479,7 @@ impl AnthropicSseToChatSse {
             "content_block_stop" => self.finalize_pending_thinking(),
             "message_delta" => {
                 let stop_reason = data.pointer("/delta/stop_reason").and_then(Value::as_str);
+                self.compaction_stop_reason = matches!(stop_reason, Some("end_turn" | "stop_sequence"));
                 let finish_reason = anthropic_stop_reason_to_finish_reason(stop_reason);
                 let usage = data
                     .get("usage")
@@ -1467,7 +1487,10 @@ impl AnthropicSseToChatSse {
                 let chunk = self.base_chunk(json!({}), Some(finish_reason), usage);
                 emit_chat_chunk(output, &chunk);
             }
-            "message_stop" => self.emit_done(output),
+            "message_stop" => {
+                self.message_stopped = true;
+                self.emit_done(output);
+            }
             "error" => {
                 let error = data
                     .get("error")

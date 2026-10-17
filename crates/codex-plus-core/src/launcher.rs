@@ -2172,7 +2172,10 @@ async fn handle_protocol_proxy_connection(
                     error.downcast_ref::<crate::protocol_proxy::UnsupportedEncryptedAgentContent>();
                 let search_unsupported =
                     error.downcast_ref::<crate::protocol_proxy::UnsupportedNativeWebSearch>();
-                let status = if unsupported.is_some() || search_unsupported.is_some() {
+                let file_unsupported = error.downcast_ref::<crate::protocol_proxy::UnsupportedInputFile>();
+                let vlm_failure = error.downcast_ref::<crate::vision::VlmPreprocessError>();
+                let status = if unsupported.is_some() || search_unsupported.is_some() || file_unsupported.is_some()
+                    || matches!(vlm_failure, Some(crate::vision::VlmPreprocessError::MissingConfiguration)) {
                     "400 Bad Request"
                 } else {
                     "502 Bad Gateway"
@@ -2181,6 +2184,8 @@ async fn handle_protocol_proxy_connection(
                     &unsupported
                         .map(|error| error.response_body())
                         .or_else(|| search_unsupported.map(|error| error.response_body()))
+                        .or_else(|| file_unsupported.map(|error| error.response_body()))
+                        .or_else(|| vlm_failure.map(|error| error.response_body()))
                         .unwrap_or_else(
                             || serde_json::json!({"status":"failed","message":error.to_string()}),
                         ),
@@ -2280,10 +2285,17 @@ async fn handle_protocol_proxy_connection(
                     }
                 }
             }
-            let payload = converter.finish();
-            stream.write_all(&payload).await?;
+            if let Some(bridge) = anthropic_bridge.as_mut() {
+                let tail = bridge.finish();
+                converter.push_upstream_bytes(&tail);
+                if !bridge.has_successful_compaction_completion() {
+                    converter.fail("Anthropic 压缩流缺少正常 message_stop".to_string(), Some("compaction_incomplete".to_string()));
+                }
+            }
+            let outcome = converter.finish_with_outcome();
+            stream.write_all(&outcome.payload).await?;
             log_helper_response(
-                "helper.protocol_proxy_compaction_ok",
+                if outcome.succeeded { "helper.protocol_proxy_compaction_ok" } else { "helper.protocol_proxy_compaction_failed" },
                 method,
                 path,
                 "200 OK",
@@ -2361,6 +2373,16 @@ async fn handle_protocol_proxy_connection(
     };
     if upstream.compaction {
         // v2 远程压缩非流式路径：同样重组为单个 compaction 输出项。
+        if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages {
+            let original: serde_json::Value = serde_json::from_slice(&upstream_body)?;
+            if let Err(error) = crate::protocol_proxy::validate_compaction_json_completion(&original, upstream.wire_api) {
+                let mut converter = crate::protocol_proxy::CompactionSseConverter::new("");
+                converter.fail(error.to_string(), Some("compaction_incomplete".to_string()));
+                write_http_response(stream, "200 OK", "text/event-stream; charset=utf-8", &converter.finish()).await?;
+                stream.shutdown().await?;
+                return Ok(());
+            }
+        }
         let compaction_input = crate::anthropic_bridge::normalize_non_stream_body_for_compaction(
             upstream.wire_api,
             &upstream_body,
@@ -5573,6 +5595,83 @@ mod tests {
             serde_json::from_slice(&upstream_request[header_end + 4..]).unwrap();
         assert_eq!(upstream_body["model"], "gpt-5.6-sol");
         crate::paths::set_settings_path_for_tests(previous_settings_path);
+    }
+
+    #[tokio::test]
+    async fn helper_protocol_safety_rejects_files_before_upstream_and_checks_original_compaction_wire()
+     {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        struct Restore(Option<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::paths::set_settings_path_for_tests(self.0.take());
+            }
+        }
+        let _restore = Restore(crate::paths::set_settings_path_for_tests(Some(
+            path.clone(),
+        )));
+        async fn request(body: serde_json::Value) -> String {
+            let body = body.to_string();
+            let raw = format!(
+                "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            String::from_utf8(send_raw_helper_request(raw.as_bytes()).await).unwrap()
+        }
+        let write_profile = |protocol: &str, url: &str| {
+            std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"relayProfilesEnabled":true,
+                "activeRelayId":"safety", "relayProfiles":[{"id":"safety","name":"Safety fixture","baseUrl":format!("{url}/v1"),
+                "apiKey":"fixture-only","protocol":protocol,"relayMode":"pureApi"}]})).unwrap()).unwrap();
+        };
+        for protocol in ["chatCompletions", "anthropicMessages"] {
+            let upstream = MockServer::start().await;
+            write_profile(protocol, &upstream.uri());
+            let response = request(
+                serde_json::json!({"model":"fixture","input":[{"role":"user","content":[
+                {"type":"input_file","file_data":"private-file-payload"}]}]}),
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request"),
+                "{response}"
+            );
+            assert!(response.contains("unsupported_input_file"));
+            assert!(response.contains("input[0].content[0]"));
+            assert!(!response.contains("private-file-payload"));
+            assert!(upstream.received_requests().await.unwrap().is_empty());
+        }
+        let anthropic_prefix = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"fixture\",\"model\":\"fixture\",\"usage\":{}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"summary\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n"
+        );
+        for (protocol, stream, payload, complete) in [
+            ("chatCompletions",false,serde_json::json!({"choices":[{"message":{"content":"summary"},"finish_reason":"stop"}]}).to_string(),true),
+            ("chatCompletions",false,serde_json::json!({"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}).to_string(),false),
+            ("anthropicMessages",false,serde_json::json!({"type":"message","content":[{"type":"text","text":"summary"}],"stop_reason":"end_turn"}).to_string(),true),
+            ("anthropicMessages",false,serde_json::json!({"type":"message","content":[{"type":"text","text":"partial"}],"stop_reason":null}).to_string(),false),
+            ("chatCompletions",true,"data: {\"choices\":[{\"delta\":{\"content\":\"summary\"},\"finish_reason\":\"stop\"}]}\n\n".to_string(),true),
+            ("chatCompletions",true,"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: [DONE]\n\n".to_string(),false),
+            ("anthropicMessages",true,format!("{anthropic_prefix}data: {{\"type\":\"message_stop\"}}\n\n"),true),
+            ("anthropicMessages",true,anthropic_prefix.to_string(),false),
+            ("anthropicMessages",true,format!("{anthropic_prefix}data: [DONE]\n\n"),false),
+        ] {
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)
+                .set_body_string(payload).insert_header("Content-Type", if stream {"text/event-stream"} else {"application/json"}))
+                .mount(&upstream).await;
+            write_profile(protocol, &upstream.uri());
+            let response = request(serde_json::json!({"model":"fixture","stream":stream,"input":[{"type":"compaction_trigger"}]})).await;
+            assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+            assert_eq!(response.contains("event: response.completed"), complete, "{protocol}: {response}");
+            assert_eq!(response.contains("event: response.output_item.done"), complete, "{protocol}: {response}");
+            assert_eq!(response.contains("event: response.failed"), !complete, "{protocol}: {response}");
+            assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+        }
     }
 
     #[tokio::test]

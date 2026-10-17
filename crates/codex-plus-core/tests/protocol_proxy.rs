@@ -189,7 +189,7 @@ async fn web_search_history_proxy_declares_only_for_standard_responses() {
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
-        let response_body = if trigger {
+        let response_body = if trigger || is_responses_compact_proxy_path(path) {
             json!({
                 "id": "resp_native_compaction",
                 "object": "response",
@@ -591,6 +591,7 @@ async fn responses_upstream_preserves_encrypted_agent_content() {
 fn compaction_stream_emits_one_done_item_before_completed() {
     let mut converter = CompactionSseConverter::new("custom-model");
     converter.push_summary_text("Preserve this summary.");
+    converter.push_upstream_bytes(b"data: {\"type\":\"response.completed\"}\n\n");
     let events = compaction_sse_events(&converter.finish());
     let mut items = Vec::new();
     let mut completed = None;
@@ -650,6 +651,7 @@ fn compaction_sse_events(payload: &[u8]) -> Vec<Value> {
 fn local_compaction_item(summary: &str) -> Value {
     let mut converter = CompactionSseConverter::new("model");
     converter.push_summary_text(summary);
+    converter.push_upstream_bytes(b"data: {\"type\":\"response.completed\"}\n\n");
     compaction_sse_events(&converter.finish())
         .into_iter()
         .find(|event| event["type"] == "response.output_item.done")
@@ -690,6 +692,7 @@ fn wrap_non_stream_response_produces_single_compaction_item() {
     let upstream = json!({
         "id": "resp_up",
         "object": "response",
+        "status": "completed",
         "output": [
             { "type": "reasoning", "summary": [] },
             { "type": "message", "role": "assistant",
@@ -716,7 +719,7 @@ fn wrap_non_stream_response_produces_single_compaction_item() {
 fn wrap_non_stream_chat_response_produces_single_compaction_item() {
     let upstream = json!({
         "choices": [
-            { "message": { "role": "assistant", "content": "SUMMARYfromCHAT" } }
+            { "message": { "role": "assistant", "content": "SUMMARYfromCHAT" }, "finish_reason": "stop" }
         ]
     })
     .to_string();
@@ -768,6 +771,7 @@ fn compaction_converter_accepts_data_only_responses_events() {
         b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Summary\"}\n\n",
     );
     assert_eq!(converter.summary_text(), "Summary");
+    converter.push_upstream_bytes(b"data: {\"type\":\"response.completed\"}\n\n");
     let events = compaction_sse_events(&converter.finish());
     let item = &events
         .iter()
@@ -826,7 +830,7 @@ fn summary_converter_does_not_relabel_native_compaction_as_local_text() {
 
 #[test]
 fn compaction_converter_accepts_complete_chat_message_without_delta() {
-    let upstream = b"data: {\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Chat summary\"}}]}\n\n";
+    let upstream = b"data: {\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Chat summary\"},\"finish_reason\":\"stop\"}]}\n\n";
     let mut converter = CompactionSseConverter::new("custom-model").with_chat_upstream();
     converter.push_upstream_bytes(upstream);
     let events = compaction_sse_events(&converter.finish());
@@ -875,7 +879,7 @@ fn compaction_converter_buffers_sse_events_across_chunks() {
 #[test]
 fn compaction_converter_strips_leading_think_block_from_chat_stream() {
     // DeepSeek 类 thinking 模型把推理塞在 delta.content 的 <think> 块里。
-    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"<think>step by step\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" reasoning...\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"</think>\\n真实摘要内容\"}}]}\n\ndata: [DONE]\n\n";
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"<think>step by step\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" reasoning...\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"</think>\\n真实摘要内容\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
     let mut converter = CompactionSseConverter::new("deepseek").with_chat_upstream();
     converter.push_upstream_bytes(sse.as_bytes());
     let payload = String::from_utf8(converter.finish()).unwrap();
@@ -889,6 +893,7 @@ fn compaction_converter_strips_think_block_from_direct_text() {
     // 非流式路径直接 push 文本，think 剥离同样在 finish 生效。
     let mut converter = CompactionSseConverter::new("deepseek");
     converter.push_summary_text("<think>internal reasoning</think>\nSUMMARY_BODY");
+    converter.push_upstream_bytes(b"data: {\"type\":\"response.completed\"}\n\n");
     let payload = String::from_utf8(converter.finish()).unwrap();
     assert!(payload.contains("SUMMARY_BODY"));
     assert!(!payload.contains("internal reasoning"));
@@ -1518,7 +1523,9 @@ data: {"type":"response.output_item.done","item":{"id":"cmp_empty","type":"compa
 
 event: response.completed
 
-data: {"type":"response.completed","response":{"id":"resp_empty","status":"completed"}}"#,
+data: {"type":"response.completed","response":{"id":"resp_empty","status":"completed"}}
+
+"#,
                 )
                 .await;
             } else {
@@ -1795,12 +1802,8 @@ async fn responses_compact_request_keeps_compact_path_upstream() {
         let (mut stream, _) = listener.accept().await.unwrap();
         let request =
             String::from_utf8_lossy(&read_async_http_request(&mut stream).await).to_string();
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-length: 35\r\ncontent-type: application/json\r\n\r\n{\"id\":\"resp_1\",\"object\":\"response\"}",
-            )
-            .await
-            .unwrap();
+        write_remote_compaction_response(&mut stream, "200 OK",
+            r#"{"id":"resp_1","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque-fixture"}]}"#).await;
         request
     });
     let settings = BackendSettings {
@@ -5031,7 +5034,8 @@ async fn model_route_preserves_responses_compact_endpoint() {
         .await
         .unwrap();
     let target_addr = target.local_addr().unwrap();
-    let target_server = tokio::spawn(capture_json_request_once(target));
+    let target_server = tokio::spawn(capture_request_with_response(target, "application/json",
+        json!({"id":"compact","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque-fixture"}]}).to_string()));
     let request = json!({
         "model": "gpt-5.6-luna",
         "input": [{ "role": "user", "content": "compact this conversation" }],
