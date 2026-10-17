@@ -1392,6 +1392,10 @@
       }
       codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
       codexPlusBackendSettingsLoaded = true;
+      globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
+        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
+        codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
+      });
     } catch (_) {
       return false;
     }

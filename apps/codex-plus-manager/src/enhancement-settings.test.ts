@@ -243,3 +243,16 @@ test("standalone quota unlock remains editable below the master switch when enha
   assert.ok(handler.some((node) => ts.isCallExpression(node) && node.expression.getText(app) === "onFormChange"));
   assert.ok(handler.some((node) => ts.isStringLiteral(node) && node.text === "codexAppStandaloneQuotaUnlock"));
 });
+
+test("native Fast unlock has its own enhancement toggle and keeps the provider support notice", () => {
+  const enhance = component("EnhanceScreen");
+  const nativeFast = fieldControl(enhance, "form.codexAppNativeFastUnlock");
+  assert.equal(nativeFast.tagName.getText(app), "FeatureToggle");
+  assert.equal(attribute(nativeFast, "title"), 't("原生 Fast 强制解锁")');
+  assert.equal(attribute(nativeFast, "disabled"), "!masterEnabled");
+  assert.match(attribute(nativeFast, "detail") || "", /纯 API Key.*原生 Fast.*供应商决定/);
+  const handler = eventHandlerNodes(enhance, nativeFast, "onChange");
+  assert.ok(handler.some((node) => ts.isStringLiteral(node) && node.text === "codexAppNativeFastUnlock"));
+  assert.ok(!handler.some((node) => ts.isStringLiteral(node) && node.text === "codexAppServiceTierControls"));
+  fieldControl(enhance, "form.codexAppServiceTierControls");
+});

@@ -420,6 +420,9 @@ pub trait LaunchHooks: Send + Sync {
         Ok(None)
     }
     async fn inject(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()>;
+    async fn apply_native_fast_unlock_on_launch(&self, _debug_port: u16) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn inject_bridge(
         &self,
         debug_port: u16,
@@ -841,6 +844,14 @@ where
             timeline.mark("ensure_injection_done", 95);
             if injection_ready {
                 keep_launched_on_error = false;
+                if settings.codex_app_native_fast_unlock
+                    && let Err(error) = hooks.apply_native_fast_unlock_on_launch(debug_port).await
+                {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "launcher.native_fast_unlock_failed",
+                        serde_json::json!({ "message": error.to_string() }),
+                    );
+                }
                 // 注入成功后页面已加载，此时可以通过 CDP 清理 Electron Local Storage
                 // 中残留的带后缀模型名，避免模型选择器继续显示废弃项。
                 crate::codex_local_storage::sanitize_local_storage_model_suffixes_nonfatal(
@@ -1345,6 +1356,11 @@ impl LaunchHooks for DefaultLaunchHooks {
     async fn inject(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
         retry_injection(debug_port, helper_port).await
     }
+
+    async fn apply_native_fast_unlock_on_launch(&self, debug_port: u16) -> anyhow::Result<()> {
+        apply_native_fast_unlock_on_launch(debug_port).await
+    }
+
     async fn capture_injected_launch_identity(&self, debug_port: u16) {
         #[cfg(windows)]
         {
@@ -4104,6 +4120,66 @@ async fn try_inject(debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
         &[script],
     )
     .await
+}
+
+// 仅在用户启动 Codex 的流程里重载一次；心跳重注入不重载正在使用的页面。
+async fn apply_native_fast_unlock_on_launch(debug_port: u16) -> anyhow::Result<()> {
+    let targets = crate::cdp::list_targets(debug_port).await?;
+    let target = crate::cdp::pick_injectable_codex_page_target(&targets)?;
+    let websocket_url = target
+        .web_socket_debugger_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("selected CDP target has no websocket URL"))?;
+    let probe = "JSON.stringify({ready:window.__codexPlusNativeFastAssetPatchReady===true,compiled:window.__codexPlusNativeFastCompiled==='v1',failed:['unsupported','failed'].includes(window.__codexPlusNativeFastPatchState)})";
+    let state = crate::bridge::evaluate_script(websocket_url, probe).await?;
+    let state = native_fast_launch_state(&state);
+    if state.1 {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !state.2,
+        "当前 Codex 资产不支持原生 Fast 补丁，保留原生身份限制"
+    );
+    anyhow::ensure!(state.0, "原生 Fast 资源补丁未就绪，保留原生界面");
+    crate::bridge::send_cdp_command(
+        websocket_url,
+        "Page.reload",
+        serde_json::json!({ "ignoreCache": true }),
+    )
+    .await?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if let Ok(result) = crate::bridge::evaluate_script(websocket_url, probe).await {
+            let state = native_fast_launch_state(&result);
+            anyhow::ensure!(
+                !state.2,
+                "当前 Codex 资产不支持原生 Fast 补丁，保留原生身份限制"
+            );
+            if state.1 {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.native_fast_unlock_ready",
+                    serde_json::json!({ "debug_port": debug_port }),
+                );
+                return Ok(());
+            }
+        }
+    }
+    anyhow::bail!("当前 Codex 版本未完成原生 Fast 补丁加载，保留原生身份限制")
+}
+
+fn native_fast_launch_state(result: &Value) -> (bool, bool, bool) {
+    let Some(text) = result.pointer("/result/result/value").and_then(Value::as_str) else {
+        return (false, false, false);
+    };
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return (false, false, false);
+    };
+    (
+        value.get("ready").and_then(Value::as_bool) == Some(true),
+        value.get("compiled").and_then(Value::as_bool) == Some(true),
+        value.get("failed").and_then(Value::as_bool) == Some(true),
+    )
 }
 
 async fn confirmed_pet_overlay_targets(

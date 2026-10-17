@@ -117,6 +117,8 @@ const DREAM_SKIN_DEFAULT_IMAGE: &[u8] =
     include_bytes!("../../../assets/inject/upstream/dream-skin/macos/portal-hero.png");
 const PET_REAL_MOUSE_SCRIPT: &str = include_str!("../../../assets/inject/pet-real-mouse-inject.js");
 const API_QUOTA_GATE_SCRIPT: &str = include_str!("../../../assets/inject/api-quota-gate.js");
+const NATIVE_FAST_UNLOCK_SCRIPT: &str =
+    include_str!("../../../assets/inject/native-fast-unlock.js");
 const STEPWISE_SCRIPT: &str = concat!(
     "(() => {\n",
     include_str!("../../../assets/inject/floating-panel/runtime/state.js"),
@@ -396,6 +398,10 @@ pub fn api_quota_gate_script() -> &'static str {
     API_QUOTA_GATE_SCRIPT
 }
 
+pub fn native_fast_unlock_script() -> &'static str {
+    NATIVE_FAST_UNLOCK_SCRIPT
+}
+
 const PET_V2_SPRITE_DETECTION_SCRIPT: &str = r#"
   const isV2Sprite = async (mascot) => {
     if (!mascot) return false;
@@ -567,11 +573,19 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
         serde_json::to_string(&hide_official_usage_alert)
             .expect("usage alert config should serialize"),
         format!(
-            "window.__CODEX_PLUS_WHALE_IMAGE__ = {};\n{}\n{}\n{}",
+            "window.__CODEX_PLUS_WHALE_IMAGE__ = {};\n{}\n{}\n{}\n{}",
             serde_json::to_string(&image_data_uri("image/png", WHALE_DEFAULT_IMAGE))
                 .expect("whale image should serialize"),
             whale_runtime_script(),
             include_str!("../../../assets/inject/composer-readiness.js"),
+            format!(
+                "{}\nwindow.__codexPlusNativeFastUnlock.runtime.update({});",
+                native_fast_unlock_script(),
+                json!({
+                    "enhancementsEnabled": settings.enhancements_enabled,
+                    "codexAppNativeFastUnlock": settings.codex_app_native_fast_unlock,
+                }),
+            ),
             renderer_script()
         ),
         stepwise_runtime,

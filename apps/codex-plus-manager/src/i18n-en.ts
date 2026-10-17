@@ -266,6 +266,9 @@ export const EN_PLAIN: Record<string, string> = {
   "Codex增强": "Codex enhancements",
   "Debug 端口": "Debug port",
   "Fast 按钮": "Fast button",
+  "原生 Fast 强制解锁": "Force unlock native Fast",
+  "纯 API Key 模式恢复原生 Fast 开关；保存后重新启动 Codex 生效，实际支持与计费由供应商决定。":
+    "Restore the native Fast switch in API key mode; save and restart Codex to apply. Actual support and billing depend on the provider.",
   "GitHub Release 更新": "GitHub Release update",
   "GitHub Release 检查": "GitHub Release check",
   "Helper 端口": "Helper port",

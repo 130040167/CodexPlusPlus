@@ -1192,6 +1192,57 @@ async fn launch_lifecycle_runs_enabled_maintenance_without_applying_relay_profil
 }
 
 #[tokio::test]
+async fn native_fast_reload_runs_only_after_successful_opt_in_launch_injection() {
+    for (enhancements, native_fast, injection_ok) in [
+        (true, true, true),
+        (true, false, true),
+        (false, true, true),
+        (true, true, false),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let app_dir = temp.path().join("Codex.app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut hooks = FakeHooks::new(events.clone()).with_settings(BackendSettings {
+            enhancements_enabled: enhancements,
+            codex_app_native_fast_unlock: native_fast,
+            relay_profiles_enabled: false,
+            ..BackendSettings::default()
+        });
+        if !injection_ok {
+            hooks = hooks.with_inject_error("fixture injection unavailable");
+        }
+        let handle = launch_and_inject_with_hooks(
+            LaunchOptions {
+                app_dir: Some(app_dir),
+                debug_port: 9229,
+                helper_port: 57321,
+                status_store: StatusStore::new(temp.path().join("status.json")),
+                ..Default::default()
+            },
+            &hooks,
+        )
+        .await
+        .unwrap();
+        handle.wait_for_codex_exit().await.unwrap();
+        let events = events.lock().unwrap();
+        let reload = events.iter().position(|event| event == "native-fast:9229");
+        assert_eq!(reload.is_some(), enhancements && native_fast && injection_ok);
+        if let Some(reload) = reload {
+            let injection = events
+                .iter()
+                .position(|event| event == "inject:9229:57321")
+                .unwrap();
+            assert!(injection < reload);
+            assert_eq!(
+                events.iter().filter(|event| *event == "native-fast:9229").count(),
+                1
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn launch_lifecycle_passes_configured_extra_args_to_codex_launch() {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("Codex.app");
@@ -2864,6 +2915,11 @@ impl LaunchHooks for FakeHooks {
     async fn ensure_injection(&self, debug_port: u16, helper_port: u16, _app_dir: &Path) -> bool {
         self.event(format!("inject:{debug_port}:{helper_port}"));
         self.inject_error.is_none()
+    }
+
+    async fn apply_native_fast_unlock_on_launch(&self, debug_port: u16) -> anyhow::Result<()> {
+        self.event(format!("native-fast:{debug_port}"));
+        Ok(())
     }
 
     async fn capture_injected_launch_identity(&self, debug_port: u16) {

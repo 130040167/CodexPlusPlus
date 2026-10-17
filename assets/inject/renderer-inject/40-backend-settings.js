@@ -59,6 +59,10 @@
       const settings = await postJson("/settings/set", { [key]: value });
       if (seq === codexPlusBackendSettingsSeq) {
         codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
+        globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
+          enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
+          codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
+        });
         globalThis.__CODEX_PLUS_ACTIVITY_OVERLAY_SYNC__?.();
       }
     } finally {
@@ -1223,6 +1227,10 @@
             <section class="codex-plus-settings-section" aria-label="模型与服务">
               <h2 class="codex-plus-settings-section-title">模型与服务</h2>
               <div class="codex-plus-settings-card">
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">原生 Fast 强制解锁</div><div class="codex-plus-row-description">纯 API Key 模式恢复原生 Fast 开关；保存后重新启动 Codex 生效，实际支持与计费由供应商决定。</div></div>
+                  <button type="button" class="codex-plus-toggle" data-codex-plus-setting="nativeFastUnlock"><span></span></button>
+                </div>
                 <div class="codex-plus-row">
                   <div><div class="codex-plus-row-title">Fast 按钮</div><div class="codex-plus-row-description">显示服务模式切换按钮；Fast 仅支持 ${codexServiceTierFastModelListLabel()}，其他模型按 Standard 发送。</div></div>
                   <button type="button" class="codex-plus-toggle" data-codex-plus-setting="serviceTierControls"><span></span></button>
