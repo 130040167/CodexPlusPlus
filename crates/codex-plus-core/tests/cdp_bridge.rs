@@ -15,7 +15,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -5445,7 +5445,7 @@ async fn install_bridge_routes_binding_while_waiting_for_command_response() {
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+        install_test_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
     )
     .await
     .expect("bridge should not hang while processing interleaved binding call")
@@ -5501,7 +5501,7 @@ async fn install_bridge_immediately_evaluates_new_document_scripts() {
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(
+        install_test_bridge(
             &url,
             BRIDGE_BINDING_NAME,
             noop_handler(),
@@ -5583,7 +5583,7 @@ async fn install_bridge_returns_after_installing_and_keeps_message_pump_alive() 
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(
+        install_test_bridge(
             &url,
             BRIDGE_BINDING_NAME,
             handler,
@@ -5620,7 +5620,7 @@ async fn install_bridge_command_error_mentions_method_and_id() {
     let handler = noop_handler();
     let error = tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+        install_test_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
     )
     .await
     .expect("bridge should not hang on CDP error response")
@@ -5702,7 +5702,7 @@ async fn install_bridge_rejects_bad_payload_with_id_and_continues_after_unparsea
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[]),
+        install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[]),
     )
     .await
     .expect("bridge should not hang after bad payload")
@@ -5763,7 +5763,7 @@ async fn install_bridge_queues_consecutive_bindings_without_recursive_dispatch()
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+        install_test_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
     )
     .await
     .expect("bridge should not hang while draining queued binding calls")
@@ -5833,7 +5833,7 @@ async fn install_bridge_does_not_wait_for_resolve_runtime_evaluate_ack() {
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+        install_test_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
     )
     .await
     .expect("bridge install should not wait for resolve ack")
@@ -5919,7 +5919,7 @@ async fn install_bridge_keeps_status_responsive_while_generate_is_pending() {
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+        install_test_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
     )
     .await
     .expect("bridge install should return while generate is pending")
@@ -5933,10 +5933,10 @@ async fn install_bridge_keeps_status_responsive_while_generate_is_pending() {
 async fn superseded_bridge_session_stops_answering_binding_calls() {
     let (url, stale_rx, fresh_rx) = spawn_two_session_cdp_server().await;
 
-    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+    install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
         .await
         .expect("first bridge install should succeed");
-    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+    install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
         .await
         .expect("second bridge install should succeed");
 
@@ -6032,10 +6032,10 @@ async fn superseded_bridge_session_closes_socket_without_incoming_messages() {
         let _ = fresh_alive_tx.send(fresh_resolved);
     });
 
-    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+    install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
         .await
         .expect("first bridge install should succeed");
-    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+    install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
         .await
         .expect("second bridge install should succeed");
 
@@ -6057,10 +6057,10 @@ async fn superseded_bridge_session_closes_socket_without_incoming_messages() {
 async fn failed_bridge_reinstall_keeps_existing_session_current() {
     let (url, active_rx, failed_rx) = spawn_failed_reinstall_cdp_server().await;
 
-    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+    install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
         .await
         .expect("first bridge install should succeed");
-    let error = bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+    let error = install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
         .await
         .expect_err("second bridge install should fail");
     assert!(error.to_string().contains("Runtime.addBinding"));
@@ -6368,6 +6368,23 @@ fn assert_expression_contains_request(command: &serde_json::Value, request_id: &
 async fn close_socket(socket: &mut TestSocket) {
     socket.close(None).await.expect("websocket should close");
     let _ = tokio::time::timeout(Duration::from_millis(200), socket.next()).await;
+}
+
+async fn install_test_bridge(
+    websocket_url: &str,
+    binding_name: &str,
+    handler: bridge::BridgeHandler,
+    new_document_scripts: &[String],
+) -> anyhow::Result<()> {
+    // 桥接模拟协议使用缺省开关，不能受本机用户已开启的 Fast 等设置影响。
+    // 目录保留到进程结束，供安装后启动的后台任务继续读取。
+    static SETTINGS_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    SETTINGS_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        codex_plus_core::paths::set_settings_path_for_tests(Some(dir.path().join("settings.json")));
+        dir
+    });
+    bridge::install_bridge(websocket_url, binding_name, handler, new_document_scripts).await
 }
 
 fn noop_handler() -> bridge::BridgeHandler {

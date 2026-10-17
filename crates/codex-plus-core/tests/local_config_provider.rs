@@ -154,6 +154,7 @@ fn keeps_a_previously_imported_default_and_legacy_credentials() {
     existing_default.name = "系统默认配置".to_string();
     store
         .save(&BackendSettings {
+            settings_revision: store.revision().unwrap(),
             relay_profiles: vec![existing_default.clone()],
             active_relay_id: existing_default.id.clone(),
             ..BackendSettings::default()

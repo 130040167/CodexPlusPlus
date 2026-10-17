@@ -1224,16 +1224,19 @@ mod tests {
         let worker_store = store.clone();
         let worker_task = task.clone();
         let handle = tokio::spawn(async move {
-            let _ = supervise(
+            let outcome = supervise(
                 &worker_store,
                 &worker_task,
                 Provider::Codex,
                 child,
-                Duration::from_secs(5),
+                Duration::from_secs(10),
             )
-            .await;
+            .await
+            .expect("受控 CLI 应持续运行直到退出测试取消它");
+            panic!("受控 CLI 提前结束：{}（{}）", outcome.status, outcome.error);
         });
-        tokio::time::timeout(Duration::from_secs(2), async {
+        // 等待 CLI 启动就绪，不把高负载下的进程调度延迟误判为退出清理失败。
+        tokio::time::timeout(Duration::from_secs(5), async {
             while !directory.path().join("input.txt").exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

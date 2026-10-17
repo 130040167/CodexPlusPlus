@@ -1791,6 +1791,7 @@ impl SettingsStore {
             "codexAppUpstreamWorktreeCreate",
             "codexAppNativeMenuLocalization",
             "codexAppServiceTierControls",
+            "codexAppCustomLayoutEnabled",
         ] {
             raw.remove(key);
         }
@@ -2574,6 +2575,7 @@ fn preserve_unknown_settings_fields(
         "codexAppUpstreamWorktreeCreate",
         "codexAppNativeMenuLocalization",
         "codexAppServiceTierControls",
+        "codexAppCustomLayoutEnabled",
         "codexAppPluginAutoExpand",
         "computerUseGuardEnabled",
     ] {
