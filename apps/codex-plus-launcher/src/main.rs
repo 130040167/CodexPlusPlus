@@ -46,10 +46,9 @@ struct StartupReply {
 impl StartupReply {
     fn send(self, result: Result<()>) -> std::result::Result<(), mpsc::SendError<Result<()>>> {
         if result.is_ok() {
-            self.state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .ready = true;
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.ready = true;
+            record_session_probe(&state.options, state.status_started_at_ms);
         }
         self.reply.send(result)
     }
@@ -88,6 +87,8 @@ static SESSION_PROBE: OnceLock<Mutex<Option<SessionProbe>>> = OnceLock::new();
 #[derive(Clone)]
 struct SessionProbe {
     debug_port: u16,
+    helper_port: u16,
+    app_dir: Option<std::path::PathBuf>,
     started_at_ms: u64,
 }
 
@@ -98,6 +99,8 @@ fn session_probe_slot() -> &'static Mutex<Option<SessionProbe>> {
 fn record_session_probe(options: &LaunchOptions, started_at_ms: u64) {
     let probe = SessionProbe {
         debug_port: options.debug_port,
+        helper_port: options.helper_port,
+        app_dir: options.app_dir.clone(),
         started_at_ms,
     };
     *session_probe_slot()
@@ -334,6 +337,29 @@ pub fn start(options: LaunchOptions) -> Result<()> {
         record_launch_failure(&status_options, requested_at_ms, error);
     }
     result
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchReceipt {
+    pub debug_port: u16,
+    pub helper_port: u16,
+    pub app_dir: std::path::PathBuf,
+    pub started_at_ms: u64,
+}
+
+/// 与 start 相同，但只从已就绪的本进程会话返回实际端口，不读取旧状态文件猜测。
+pub fn start_with_receipt(options: LaunchOptions) -> Result<LaunchReceipt> {
+    start(options)?;
+    let probe = session_probe_slot()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let probe = probe.as_ref().context("Codex 启动完成后缺少会话回执")?;
+    Ok(LaunchReceipt {
+        debug_port: probe.debug_port,
+        helper_port: probe.helper_port,
+        app_dir: probe.app_dir.clone().context("Codex 会话缺少应用目录")?,
+        started_at_ms: probe.started_at_ms,
+    })
 }
 
 /// 只恢复已有 Codex 的后台服务。调试端点不存在时不启动或重启官方应用。

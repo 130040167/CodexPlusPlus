@@ -305,6 +305,7 @@ type MultiLaunchInstancesResult = CommandResult<{
 }>;
 
 type BackendSettings = WhaleBalanceSettings & {
+  revision?: string;
   codexAppPath: string;
   /** 自动接管官方 App（与 Rust `codex_app_auto_takeover` 对应）。 */
   codexAppAutoTakeover: boolean;
@@ -376,6 +377,7 @@ type BackendSettings = WhaleBalanceSettings & {
   aggregateRelayProfiles: AggregateRelayProfile[];
   activeAggregateRelayId: string;
   relayCommonConfigContents: string;
+  relayPreserveNonproviderSettings: boolean;
   relayContextConfigContents: string;
   activeRelayId: string;
   relayTestModel: string;
@@ -561,6 +563,7 @@ type UserScriptInventory = {
 };
 
 type SettingsResult = CommandResult<{
+  revision: string;
   settings: BackendSettings;
   settings_path: string;
   user_scripts: UserScriptInventory;
@@ -672,6 +675,8 @@ type RelayProfileTestResult = CommandResult<{
   httpStatus: number;
   endpoint: string;
   responsePreview: string;
+  protocolValid: boolean;
+  completionStatus: "completed" | "incomplete" | "failed";
 }>;
 
 type StepwiseTestResult = CommandResult<{
@@ -775,6 +780,10 @@ type RemoveEnvConflictsResult = CommandResult<{
 type ProviderSyncPayload = {
   syncStatus?: string;
   syncMessage?: string;
+  recoveryJournalPath?: string | null;
+  recoveryAvailable?: boolean;
+  recoveryErrors?: string[];
+  databaseOutcomes?: Array<{ database: string; attemptedRows: number; restoredRows: number; remainingRows: number }>;
   targetProvider?: string;
   changedSessionFiles?: number;
   skippedLockedRolloutFiles?: string[];
@@ -1088,6 +1097,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "recommendations", label: t("推荐内容"), icon: ExternalLink },
   // 缓存清理覆盖多个 AI 应用，属于应用级页面，在各工具下均可访问。
   { id: "agentCache", label: t("AI Agent 缓存清理"), icon: Trash2 },
+  // 跨客户端协作属于应用级能力，各工具下共用同一组任务。
   { id: "maintenance", label: t("安装维护"), icon: Wrench, tool: "codex" },
   { id: "about", label: t("关于"), icon: Info },
   { id: "settings", label: t("设置"), icon: Settings },
@@ -1223,6 +1233,7 @@ const defaultSettings: BackendSettings = {
     },
   ],
   relayCommonConfigContents: "",
+  relayPreserveNonproviderSettings: false,
   relayContextConfigContents: "",
   activeRelayId: "default",
   aggregateRelayProfiles: [],
@@ -1331,7 +1342,19 @@ export function App() {
     [settings, settingsForm],
   );
 
-  const call = <T,>(command: string, args?: Record<string, unknown>) => invoke<T>(command, args);
+  const call = <T,>(command: string, args?: Record<string, unknown>) => {
+    const snapshot = args?.settings as BackendSettings | undefined;
+    return invoke<T>(command, command === "save_settings"
+      ? { ...args, expectedRevision: snapshot?.revision || "" }
+      : args).then((result) => {
+        const response = result as { message?: string };
+        if (command === "save_settings" && response?.message?.includes("settings_revision_conflict")) {
+          // 所有保存调用都保留当前草稿，不能把失败响应当成新表单回填。
+          throw new Error(response.message);
+        }
+        return result;
+      });
+  };
 
   const logDiagnostic = (event: string, detail: Record<string, unknown> = {}) => {
     void invoke("write_diagnostic_event", { event, detail }).catch(() => {});
@@ -1581,8 +1604,8 @@ export function App() {
     return result;
   };
 
-  const importCcsProviders = async () => {
-    const result = await run(() => call<SettingsResult>("import_ccs_providers"));
+  const importCcsProviders = async (bindings: Record<string, string> = {}) => {
+    const result = await run(() => call<SettingsResult>("import_ccs_providers", { bindings }));
     if (result) {
       setSettings(result);
       setSettingsForm(normalizeSettings(result.settings));
@@ -2557,8 +2580,10 @@ export function App() {
     }
     const result = await run(() => call<SettingsResult>("save_settings", { settings: next }));
     if (result) {
-      setSettings(result);
-      setSettingsForm(normalizeSettings(result.settings));
+      if (isSuccessStatus(result.status)) {
+        setSettings(result);
+        setSettingsForm(normalizeSettings(result.settings));
+      }
       showNotice(t("设置保存"), result.message, result.status);
     }
   };
@@ -2584,7 +2609,7 @@ export function App() {
       return saved;
     }
     if (result) showNotice(t("设置保存"), result.message, result.status);
-    await refreshSettings(true);
+    // 保留草稿供用户重载后合并，不能拿最新版本号自动重试旧快照。
     return null;
   };
 
@@ -2728,6 +2753,23 @@ export function App() {
     } finally {
       sessionIndexRepairRunning.current = false;
       setSessionIndexRepairActive(false);
+    }
+  };
+
+  const recoverProviderSync = async () => {
+    const backupDir = providerSyncProgress.result?.backupDir;
+    if (providerSyncProgress.active || !backupDir) return;
+    if (!window.confirm(t("恢复这次未完成的修复？期间被其他操作修改的数据会保留，并报告冲突。"))) return;
+    setProviderSyncProgress((current) => ({ ...current, active: true, message: t("正在恢复…") }));
+    try {
+      const result = await run(() => call<CommandResult<ProviderSyncPayload>>("recover_provider_sync", { backupDir }));
+      if (result) {
+        setProviderSyncProgress({ active: false, percent: 100, message: result.message, result });
+        showNotice(t("恢复历史会话修复"), result.message, result.status);
+        await refreshLocalSessions(true);
+      }
+    } finally {
+      setProviderSyncProgress((current) => ({ ...current, active: false }));
     }
   };
 
@@ -3089,6 +3131,7 @@ export function App() {
       }
       const selectedSettings = normalizeSettings(result.settings);
       setSettings({
+        revision: selectedSettings.revision || "",
         status: result.status,
         message: result.message,
         settings: selectedSettings,
@@ -3242,6 +3285,16 @@ export function App() {
       stopListening?.();
     };
   }, []);
+
+  useEffect(() => {
+    if (route !== "sessions") return;
+    let disposed = false;
+    void call<CommandResult<ProviderSyncPayload>>("load_provider_sync_recovery").then((result) => {
+      if (disposed || !result.recoveryJournalPath) return;
+      setProviderSyncProgress((current) => current.active ? current : ({ active: false, percent: 100, message: result.message, result }));
+    }).catch(() => {});
+    return () => { disposed = true; };
+  }, [route]);
 
   useEffect(() => {
     if (route !== "sessions") return;
@@ -3587,6 +3640,7 @@ export function App() {
         }
       },
       syncProvidersNow,
+      recoverProviderSync,
       repairSessionIndex,
       refreshProviderSyncTargets,
       setProviderSyncTarget: (provider: string) => {
@@ -3775,6 +3829,10 @@ export function App() {
               onDelete={actions.deleteLocalSession}
               onDeleteMany={actions.deleteLocalSessions}
               notify={actions.showMessage}
+              repairPanel={<SessionRepairPanel form={settingsForm} providerSyncProgress={providerSyncProgress}
+                sessionIndexRepairActive={sessionIndexRepairActive} sessionIndexRepairReport={sessionIndexRepairReport}
+                sessionIndexRepairReportError={sessionIndexRepairReportError} providerSyncTargets={providerSyncTargets}
+                selectedProviderSyncTarget={selectedProviderSyncTarget} onFormChange={setSettingsForm} actions={actions} />}
             />
           ) : null}
           {route === "context" ? (
@@ -4120,6 +4178,7 @@ type Actions = {
   saveDreamSkinScreenshot: () => Promise<void>;
   saveManualCodexAppPath: () => Promise<void>;
   syncProvidersNow: () => Promise<void>;
+  recoverProviderSync: () => Promise<void>;
   repairSessionIndex: () => Promise<void>;
   refreshProviderSyncTargets: (silent?: boolean) => Promise<ProviderSyncTargetsResult | null>;
   setProviderSyncTarget: (provider: string) => void;
@@ -4129,7 +4188,7 @@ type Actions = {
   refreshRelayEnvironment: (silent?: boolean) => Promise<RelayEnvironmentResult | null>;
   removeEnvConflicts: (names: string[]) => Promise<void>;
   refreshCcsProviders: (silent?: boolean) => Promise<CcsProvidersResult | null>;
-  importCcsProviders: () => Promise<void>;
+  importCcsProviders: (bindings?: Record<string, string>) => Promise<void>;
   refreshLiveContextEntries: () => Promise<LiveContextEntriesResult | null>;
   syncLiveContextEntries: (settings: BackendSettings, silent?: boolean) => Promise<LiveContextEntriesResult | null>;
   refreshAds: () => Promise<void>;
@@ -4913,6 +4972,7 @@ function RelayScreen({
   const [thirdPartyImportPosition, setThirdPartyImportPosition] = useState<{ top: number; right: number } | null>(null);
   const [ccsDbPathDraft, setCcsDbPathDraft] = useState(normalized.ccsDbPath);
   const [ccsPathSaving, setCcsPathSaving] = useState(false);
+  const [ccsBindings, setCcsBindings] = useState<Record<string, string>>({});
   useEffect(() => setCcsDbPathDraft(normalized.ccsDbPath), [normalized.ccsDbPath]);
   const saveCcsDbPath = async (path = ccsDbPathDraft) => {
     setCcsPathSaving(true);
@@ -5131,11 +5191,18 @@ function RelayScreen({
                   <button disabled={ccsPathSaving} onClick={() => void saveCcsDbPath()} type="button">{t("保存路径并刷新")}</button>
                   {ccsProviders && isSuccessStatus(ccsProviders.status) ? <span className="text-xs break-all">{t("实际来源")}：{ccsProviders.dbPath}</span> : null}
                   {ccsProviders?.fallbackReason ? <span className="text-xs break-all">{ccsProviders.fallbackReason}</span> : null}
+                  {ccsProviders?.providers.map((provider) => <label key={provider.sourceId}>
+                    {provider.name}
+                    <select value={ccsBindings[provider.sourceId] || ""} onChange={(event) => setCcsBindings((current) => ({ ...current, [provider.sourceId]: event.currentTarget.value }))}>
+                      <option value="">{t("自动识别来源或新增")}</option>
+                      {normalized.relayProfiles.map((profile) => <option key={profile.id} value={profile.id}>{t("关联已有")}：{profile.name}</option>)}
+                    </select>
+                  </label>)}
                   <button
                     disabled={ccsPathSaving || ccsDbPathDraft.trim() !== normalized.ccsDbPath || !ccsProviders?.providers.length}
                     onClick={() => {
                       setThirdPartyImportOpen(false);
-                      void actions.importCcsProviders();
+                      void actions.importCcsProviders(ccsBindings);
                     }}
                     type="button"
                   >
@@ -7218,22 +7285,8 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
   );
 }
 
-function SessionsScreen({
-  settings,
-  form,
-  sessions,
-  providerSyncProgress,
-  sessionIndexRepairActive,
-  sessionIndexRepairReport,
-  sessionIndexRepairReportError,
-  providerSyncTargets,
-  selectedProviderSyncTarget,
-  onFormChange,
-  actions,
-}: {
-  settings: SettingsResult | null;
+function SessionRepairPanel({ form, providerSyncProgress, sessionIndexRepairActive, sessionIndexRepairReport, sessionIndexRepairReportError, providerSyncTargets, selectedProviderSyncTarget, onFormChange, actions }: {
   form: BackendSettings;
-  sessions: LocalSessionsResult | null;
   providerSyncProgress: ProviderSyncProgress;
   sessionIndexRepairActive: boolean;
   sessionIndexRepairReport: SessionIndexRepairReport | null;
@@ -7243,97 +7296,10 @@ function SessionsScreen({
   onFormChange: (value: BackendSettings) => void;
   actions: Actions;
 }) {
-  const items = sessions?.sessions ?? [];
-  const pageOffset = sessions?.offset ?? 0;
-  const pageSize = sessions?.limit ?? 50;
-  const currentPage = Math.floor(pageOffset / pageSize) + 1;
-  const hasPreviousPage = pageOffset > 0;
-  const hasNextPage = sessions?.hasMore === true;
-  const activeCount = items.filter((item) => !item.archived).length;
-  const archivedCount = items.length - activeCount;
-  const totalCount = sessions?.totalCount ?? items.length;
-  const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(() => new Set());
-  const [selectionMode, setSelectionMode] = useState(false);
-  const [bulkDeleting, setBulkDeleting] = useState(false);
-  const selectedSessions = useMemo(() => items.filter((session) => selectedSessionIds.has(session.id)), [items, selectedSessionIds]);
-  const selectedCount = selectedSessions.length;
-  const allSelected = items.length > 0 && selectedCount === items.length;
   const providerTargets = providerSyncTargets?.targets ?? [];
-  const selectedProviderTarget = providerTargets.find(
-    (target) => target.id === selectedProviderSyncTarget,
-  );
-  const canRepairProviderSessions = selectedProviderTarget
-    ? isProviderSyncTargetSelectable(selectedProviderTarget)
-    : false;
-
-  useEffect(() => {
-    const itemIds = new Set(items.map((session) => session.id));
-    setSelectedSessionIds((current) => {
-      const next = new Set(Array.from(current).filter((id) => itemIds.has(id)));
-      return next.size === current.size ? current : next;
-    });
-  }, [items]);
-
-  const toggleSessionSelection = (sessionId: string, checked: boolean) => {
-    setSelectedSessionIds((current) => {
-      const next = new Set(current);
-      if (checked) {
-        next.add(sessionId);
-      } else {
-        next.delete(sessionId);
-      }
-      return next;
-    });
-  };
-
-  const selectAllSessions = () => {
-    setSelectionMode(true);
-    setSelectedSessionIds(new Set(items.map((session) => session.id)));
-  };
-
-  const clearSelectedSessions = () => setSelectedSessionIds(new Set());
-
-  const deleteSelectedSessions = async () => {
-    if (!selectionMode) {
-      setSelectionMode(true);
-      return;
-    }
-    setBulkDeleting(true);
-    try {
-      await actions.deleteLocalSessions(selectedSessions);
-    } finally {
-      setBulkDeleting(false);
-    }
-  };
-
-  return (
-    <>
-      <Panel className="sessions-overview-panel">
-        <CardHead title={t("会话管理")} detail={t("读取 Codex 本地 SQLite 会话库，会删除数据库记录和对应 rollout 文件")} />
-        <CardContent className="sessions-overview-content">
-          <div className="session-summary-bar">
-            <div>
-              <span>{t("会话总数")}</span>
-              <strong>{tf("{0} 个", [totalCount])}</strong>
-            </div>
-            <div>
-              <span>{t("当前页会话")}</span>
-              <strong>{tf("{0} 个", [items.length])}</strong>
-            </div>
-            <div>
-              <span>{t("当前页未归档")}</span>
-              <strong>{tf("{0} 个", [activeCount])}</strong>
-            </div>
-            <div>
-              <span>{t("当前页已归档")}</span>
-              <strong>{tf("{0} 个", [archivedCount])}</strong>
-            </div>
-            <div className="session-summary-path">
-              <span>{t("数据库")}</span>
-              <code>{sessions?.dbPath ?? "~/.codex/sqlite/*.db"}</code>
-            </div>
-          </div>
-
+  const selectedProviderTarget = providerTargets.find((target) => target.id === selectedProviderSyncTarget);
+  const canRepairProviderSessions = Boolean(selectedProviderTarget && isProviderSyncTargetSelectable(selectedProviderTarget));
+  return <Panel className="sessions-overview-panel"><CardHead title={t("会话修复")} detail={t("预览并修复本地会话与索引")} /><CardContent>
           <div className="session-repair-tools">
             <Field className="session-sync-target" label={t("同步目标")}>
               <AppSelect
@@ -7475,6 +7441,137 @@ function SessionsScreen({
             <Info className="h-4 w-4" />
             <span>{t("删除会创建本地备份；如果 Codex App 正在使用该会话，建议先关闭对应会话窗口再操作。")}</span>
           </div>
+    {providerSyncProgress.result?.recoveryJournalPath ? <div>
+      <p role="alert" className="break-all">{t("恢复记录：")}{providerSyncProgress.result.recoveryJournalPath}</p>
+      {providerSyncProgress.result.syncStatus === "partial_failure" && providerSyncProgress.result.backupDir && providerSyncProgress.result.recoveryAvailable !== false ? <Button
+        disabled={providerSyncProgress.active || sessionIndexRepairActive}
+        onClick={() => void actions.recoverProviderSync()}>{t("恢复未完成修复")}</Button> : null}
+    </div> : null}
+    {providerSyncProgress.result?.recoveryErrors?.map((error, index) => <p role="alert" key={index}>{error}</p>)}
+    {providerSyncProgress.result?.syncStatus === "partial_failure" ? <p role="status">
+      {t("仍有改动：")}{providerSyncProgress.result.changedSessionFiles ?? 0} {t("个会话文件，")}
+      {providerSyncProgress.result.sqliteRowsUpdated ?? 0} {t("行索引。请查看恢复记录处理剩余冲突。")}
+    </p> : null}
+  </CardContent></Panel>;
+}
+
+function SessionsScreen({
+  settings,
+  form,
+  sessions,
+  providerSyncProgress,
+  sessionIndexRepairActive,
+  sessionIndexRepairReport,
+  sessionIndexRepairReportError,
+  providerSyncTargets,
+  selectedProviderSyncTarget,
+  onFormChange,
+  actions,
+}: {
+  settings: SettingsResult | null;
+  form: BackendSettings;
+  sessions: LocalSessionsResult | null;
+  providerSyncProgress: ProviderSyncProgress;
+  sessionIndexRepairActive: boolean;
+  sessionIndexRepairReport: SessionIndexRepairReport | null;
+  sessionIndexRepairReportError: string | null;
+  providerSyncTargets: ProviderSyncTargetsResult | null;
+  selectedProviderSyncTarget: string;
+  onFormChange: (value: BackendSettings) => void;
+  actions: Actions;
+}) {
+  const items = sessions?.sessions ?? [];
+  const pageOffset = sessions?.offset ?? 0;
+  const pageSize = sessions?.limit ?? 50;
+  const currentPage = Math.floor(pageOffset / pageSize) + 1;
+  const hasPreviousPage = pageOffset > 0;
+  const hasNextPage = sessions?.hasMore === true;
+  const activeCount = items.filter((item) => !item.archived).length;
+  const archivedCount = items.length - activeCount;
+  const totalCount = sessions?.totalCount ?? items.length;
+  const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(() => new Set());
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const selectedSessions = useMemo(() => items.filter((session) => selectedSessionIds.has(session.id)), [items, selectedSessionIds]);
+  const selectedCount = selectedSessions.length;
+  const allSelected = items.length > 0 && selectedCount === items.length;
+  const providerTargets = providerSyncTargets?.targets ?? [];
+  const selectedProviderTarget = providerTargets.find(
+    (target) => target.id === selectedProviderSyncTarget,
+  );
+  const canRepairProviderSessions = selectedProviderTarget
+    ? isProviderSyncTargetSelectable(selectedProviderTarget)
+    : false;
+
+  useEffect(() => {
+    const itemIds = new Set(items.map((session) => session.id));
+    setSelectedSessionIds((current) => {
+      const next = new Set(Array.from(current).filter((id) => itemIds.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [items]);
+
+  const toggleSessionSelection = (sessionId: string, checked: boolean) => {
+    setSelectedSessionIds((current) => {
+      const next = new Set(current);
+      if (checked) {
+        next.add(sessionId);
+      } else {
+        next.delete(sessionId);
+      }
+      return next;
+    });
+  };
+
+  const selectAllSessions = () => {
+    setSelectionMode(true);
+    setSelectedSessionIds(new Set(items.map((session) => session.id)));
+  };
+
+  const clearSelectedSessions = () => setSelectedSessionIds(new Set());
+
+  const deleteSelectedSessions = async () => {
+    if (!selectionMode) {
+      setSelectionMode(true);
+      return;
+    }
+    setBulkDeleting(true);
+    try {
+      await actions.deleteLocalSessions(selectedSessions);
+    } finally {
+      setBulkDeleting(false);
+    }
+  };
+
+  return (
+    <>
+      <Panel className="sessions-overview-panel">
+        <CardHead title={t("会话管理")} detail={t("读取 Codex 本地 SQLite 会话库，会删除数据库记录和对应 rollout 文件")} />
+        <CardContent className="sessions-overview-content">
+          <div className="session-summary-bar">
+            <div>
+              <span>{t("会话总数")}</span>
+              <strong>{tf("{0} 个", [totalCount])}</strong>
+            </div>
+            <div>
+              <span>{t("当前页会话")}</span>
+              <strong>{tf("{0} 个", [items.length])}</strong>
+            </div>
+            <div>
+              <span>{t("当前页未归档")}</span>
+              <strong>{tf("{0} 个", [activeCount])}</strong>
+            </div>
+            <div>
+              <span>{t("当前页已归档")}</span>
+              <strong>{tf("{0} 个", [archivedCount])}</strong>
+            </div>
+            <div className="session-summary-path">
+              <span>{t("数据库")}</span>
+              <code>{sessions?.dbPath ?? "~/.codex/sqlite/*.db"}</code>
+            </div>
+          </div>
+
+          <SessionRepairPanel form={form} providerSyncProgress={providerSyncProgress} sessionIndexRepairActive={sessionIndexRepairActive} sessionIndexRepairReport={sessionIndexRepairReport} sessionIndexRepairReportError={sessionIndexRepairReportError} providerSyncTargets={providerSyncTargets} selectedProviderSyncTarget={selectedProviderSyncTarget} onFormChange={onFormChange} actions={actions} />
         </CardContent>
       </Panel>
       <Panel className="sessions-list-panel">
@@ -11195,6 +11292,11 @@ function RelayFileEditors({
               <Download className="h-4 w-4" />
               {t("提取当前供应商配置")}
             </Button>
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={form.relayPreserveNonproviderSettings === true}
+              onChange={(event) => onFormChange({ ...form, relayPreserveNonproviderSettings: event.currentTarget.checked })} />
+            {t("切换时保留缺失的项目信任设置与通知命令")}
+          </label>
           <SyncedTextarea
             className="relay-file-textarea"
             value={form.relayCommonConfigContents}
@@ -13458,7 +13560,9 @@ function normalizeStepwiseProtocol(value: StepwiseProtocol | undefined): Stepwis
 }
 
 function backendSettingsEqual(left: BackendSettings, right: BackendSettings): boolean {
-  return JSON.stringify(normalizeSettings(left)) === JSON.stringify(normalizeSettings(right));
+  const { revision: _leftRevision, ...leftValues } = normalizeSettings(left);
+  const { revision: _rightRevision, ...rightValues } = normalizeSettings(right);
+  return JSON.stringify(leftValues) === JSON.stringify(rightValues);
 }
 
 function clampNumber(value: number, min: number, max: number): number {
@@ -13850,11 +13954,13 @@ function buildOfficialRelayAuthJson(contents: string): string {
   if (!trimmed) return "";
   try {
     const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "";
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return contents;
+    const knownOAuth = String(parsed.auth_mode || "").toLowerCase() === "chatgpt" && parsed.tokens && typeof parsed.tokens === "object";
+    if (!knownOAuth && Object.keys(parsed).some((key) => key !== "OPENAI_API_KEY")) return contents;
     delete parsed.OPENAI_API_KEY;
     return `${JSON.stringify(parsed, null, 2)}\n`;
   } catch {
-    return "";
+    return contents;
   }
 }
 

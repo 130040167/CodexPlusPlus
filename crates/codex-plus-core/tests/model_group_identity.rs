@@ -120,6 +120,23 @@ fn default_member_models_publish_bare_names_with_group_identity() {
     );
 }
 
+#[test]
+fn imported_default_marker_cannot_override_the_actual_aggregate_default() {
+    let aggregate=aggregate(&["relay-b","relay-a"],"relay-a");
+    let mut stale=member("relay-b","Other");
+    stale.model_metadata=json!({"relay-b-main":{"codex_plus_default":true}}).to_string();
+    let settings=settings(vec![stale,member("relay-a","Default")],&aggregate);
+    let payload=catalog(&settings,&aggregate);
+    let marked:Vec<_>=payload["models"].as_array().unwrap().iter().filter(|model|model["codex_plus_default"]==true)
+        .filter_map(|model|model["codex_plus_group_id"].as_str()).collect();
+    assert!(!marked.is_empty());assert!(marked.iter().all(|id|*id=="relay-a"),"{marked:?}");
+    let home=tempfile::tempdir().unwrap();std::fs::create_dir(home.path().join("model-catalogs")).unwrap();
+    let path=home.path().join("model-catalogs/agg.json");std::fs::write(&path,payload.to_string()).unwrap();
+    std::fs::write(home.path().join("config.toml"),format!("model_catalog_json = {:?}\n",path.to_str().unwrap())).unwrap();
+    let summary=catalog_summary(home.path(),&settings,&aggregate).unwrap();
+    assert_eq!(summary["codex_plus_default_group_id"],"relay-a");
+}
+
 /// 非默认成员：`display_name` 仍带「（供应商）」后缀（前端兜底还要用），
 /// 两个分组键同时给出权威身份。
 #[test]

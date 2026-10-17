@@ -156,7 +156,7 @@ pub fn initialize_local_config_provider(
     }
     settings.local_config_provider_imported = true;
     store.save(&settings)?;
-    Ok(settings)
+    store.load()
 }
 
 pub fn import_provider_from_url(url: &str) -> anyhow::Result<ProviderImportResult> {

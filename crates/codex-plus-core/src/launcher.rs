@@ -148,6 +148,26 @@ pub fn windows_process_control_strategy() -> WindowsProcessControlStrategy {
 }
 
 impl CodexLaunch {
+    /// 启动命令携带的最终端口；包上下文 wrapper 可能改选过端口。
+    pub fn debug_port(&self) -> Option<u16> {
+        let tokens = match self {
+            Self::Process { command, .. } => command.iter().map(String::as_str).collect::<Vec<_>>(),
+            Self::PackagedActivation { arguments, .. } => arguments.split_whitespace().collect(),
+        };
+        let mut ports = tokens.iter().enumerate().filter_map(|(index, token)| {
+            token
+                .strip_prefix("--remote-debugging-port=")
+                .or_else(|| {
+                    (*token == "--remote-debugging-port")
+                        .then(|| tokens.get(index + 1).copied())
+                        .flatten()
+                })
+                .and_then(|value| value.parse::<u16>().ok())
+        });
+        let first = ports.next()?;
+        (first != 0 && ports.all(|port| port == first)).then_some(first)
+    }
+
     pub fn process_id(&self) -> Option<u32> {
         match self {
             Self::PackagedActivation { process_id, .. } => *process_id,
@@ -660,7 +680,7 @@ where
     H: IntoLaunchHooks,
 {
     let hooks = hooks.into_launch_hooks();
-    let debug_port = hooks.select_debug_port(options.debug_port);
+    let mut debug_port = hooks.select_debug_port(options.debug_port);
     let mut helper_port = hooks.select_helper_port(options.helper_port);
     let settings = hooks.load_settings().await?;
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
@@ -807,6 +827,7 @@ where
                 &LaunchInstance::from_options(&options),
             )
             .await?;
+        debug_port = launch.debug_port().unwrap_or(debug_port);
         launched = Some(launch.clone());
         keep_launched_on_error = true;
         timeline.mark("launch_codex_done", 80);
@@ -1071,18 +1092,8 @@ impl LaunchHooks for DefaultLaunchHooks {
             .collect::<Vec<_>>()
             .join("\n\n"),
         );
-        if profile.relay_mode == crate::settings::RelayMode::Official
-            && !profile.official_mix_api_key
-        {
-            let auth_contents = (!profile.auth_contents.trim().is_empty())
-                .then_some(profile.auth_contents.as_str());
-            crate::relay_config::clear_relay_config_to_home_with_auth(&home, auth_contents)?;
-            return Ok(());
-        }
-        crate::relay_config::apply_relay_profile_to_home_with_switch_rules(
-            &home,
-            &profile,
-            &common_config,
+        crate::relay_config::apply_relay_profile_with_preservation(
+            &home, &profile, &common_config, crate::protocol_proxy::protocol_proxy_port(), settings.relay_preserve_nonprovider_settings,
         )?;
         Ok(())
     }
@@ -3571,20 +3582,17 @@ async fn launch_packaged_multi_instance(
     // 端口选择在写脚本之前定：脚本里的端口就是实例身份的一部分，必须能让调用方
     // 知道（否则注入会打到旧端口）。
     let known_ports = [debug_port, crate::ports::find_available_loopback_port()];
-    let Some(actual_port) = crate::packaged_launch::select_debug_port(debug_port, &known_ports)
-    else {
-        anyhow::bail!("找不到可用的回环调试端口（请求 {debug_port}）");
-    };
-
-    let wrapper_path = crate::packaged_launch::prepare_wrapper_script(
+    let wrapper = crate::packaged_launch::prepare_wrapper_script_with_port(
         state_dir,
         &executable,
         &resolved_codex_home,
         &resolved_sqlite_home,
         &user_data_dir,
-        actual_port,
+        debug_port,
         &known_ports,
     )?;
+    let actual_port = wrapper.debug_port;
+    let wrapper_path = wrapper.path;
     match crate::packaged_launch::activate_in_package_context(&app_user_model_id, &wrapper_path)
         .await
     {

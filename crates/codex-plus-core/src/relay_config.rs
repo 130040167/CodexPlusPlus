@@ -76,6 +76,8 @@ pub struct RelayProfileTestResult {
     pub http_status: u16,
     pub endpoint: String,
     pub response_preview: String,
+    pub protocol_valid: bool,
+    pub completion_status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -757,6 +759,39 @@ pub fn apply_relay_profile_to_home_with_switch_rules(
     )
 }
 
+/// 全局保留偏好由调用者显式传入；旧入口保持默认关闭。
+pub fn apply_relay_profile_with_preservation(
+    home: &Path,
+    profile: &RelayProfile,
+    common: &str,
+    proxy_port: u16,
+    preserve_nonprovider: bool,
+) -> anyhow::Result<RelayApplyResult> {
+    if !preserve_nonprovider {
+        return apply_relay_profile_to_home_with_switch_rules_and_proxy_port(home, profile, common, proxy_port);
+    }
+    let mut effective = profile.clone();
+    let config = if profile.use_common_config {
+        merge_common_config_into_config(&profile.config_contents, &prepare_common_config_for_apply(common)?)?
+    } else { profile.config_contents.clone() };
+    effective.config_contents = preserve_live_nonprovider_settings(home, &config)?;
+    effective.use_common_config = false;
+    apply_relay_profile_to_home_with_switch_rules_and_proxy_port(home, &effective, common, proxy_port)
+}
+
+pub fn preserve_live_nonprovider_settings(home: &Path, config: &str) -> anyhow::Result<String> {
+    let mut target = parse_toml_document(config)?;
+    let live = read_optional_text(&home.join("config.toml"))?;
+    if live.trim().is_empty() { return Ok(normalize_optional_toml(target)); }
+    let live = parse_toml_document(&live)?;
+    // 按项目补缺，不递归提升一个已有项目的 trust 权限。
+    preserve_missing_table_keys(&mut target, &live, "projects");
+    if target.get("notify").is_none() {
+        if let Some(notify) = live.get("notify") { target["notify"] = notify.clone(); }
+    }
+    Ok(normalize_optional_toml(target))
+}
+
 /// 与 [`apply_relay_profile_to_home_with_switch_rules`] 相同，但允许调用方指定
 /// 协议代理端口。多开实例各自运行一个 helper，必须在写入 config.toml 时使用
 /// 实例自己的端口，不能先写默认 57321 再依赖启动器补救。
@@ -972,10 +1007,14 @@ pub async fn test_relay_profile(
         anyhow::bail!("API Key 不能为空");
     }
 
-    let client = crate::http_client::proxied_client("CodexPlusPlus/RelayTest")?;
+    let user_agent = if profile.protocol == RelayProtocol::AnthropicMessages && profile.anthropic_impersonate_claude_code {
+        crate::anthropic_bridge::CLAUDE_CODE_USER_AGENT
+    } else if !profile.user_agent.trim().is_empty() { profile.user_agent.trim() }
+    else { "CodexPlusPlus/RelayTest" };
+    let client = crate::http_client::proxied_client(user_agent)?;
     let endpoint = match profile.protocol {
-        RelayProtocol::Responses => format!("{base_url}/responses"),
-        RelayProtocol::ChatCompletions => format!("{base_url}/chat/completions"),
+        RelayProtocol::Responses => crate::protocol_proxy::responses_url(base_url),
+        RelayProtocol::ChatCompletions => crate::protocol_proxy::chat_completions_url(base_url),
         RelayProtocol::AnthropicMessages => {
             crate::anthropic_bridge::anthropic_messages_url(base_url)
         }
@@ -994,11 +1033,13 @@ pub async fn test_relay_profile(
     // 如果 404 且 base_url 末尾没有 /v1，尝试自动补 /v1 后再发一次。
     // 许多上游（中转站、自建代理）暴露的路径以 /v1/ 开头，
     // 用户容易遗漏这个前缀，导致 /responses 或 /chat/completions 404。
-    if http_status == 404 && !base_url.ends_with("/v1") {
+    let complete_endpoint = ["/responses", "/chat/completions", "/messages"].iter()
+        .any(|suffix| base_url.trim_end_matches('#').to_ascii_lowercase().ends_with(suffix));
+    if http_status == 404 && !base_url.ends_with("/v1") && !base_url.ends_with('#') && !complete_endpoint {
         let v1_url = format!("{base_url}/v1");
         let v1_endpoint = match profile.protocol {
-            RelayProtocol::Responses => format!("{v1_url}/responses"),
-            RelayProtocol::ChatCompletions => format!("{v1_url}/chat/completions"),
+            RelayProtocol::Responses => crate::protocol_proxy::responses_url(&v1_url),
+            RelayProtocol::ChatCompletions => crate::protocol_proxy::chat_completions_url(&v1_url),
             RelayProtocol::AnthropicMessages => {
                 crate::anthropic_bridge::anthropic_messages_url(&v1_url)
             }
@@ -1009,23 +1050,63 @@ pub async fn test_relay_profile(
         let v1_status = v1_response.status().as_u16();
         if v1_status < 400 {
             let response_text = v1_response.text().await.unwrap_or_default();
-            return Ok(RelayProfileTestResult {
+            let (protocol_valid, completion_status) = validate_relay_test_response(profile.protocol, v1_status, &response_text);
+            if protocol_valid { return Ok(RelayProfileTestResult {
+                protocol_valid,
+                completion_status,
                 http_status: v1_status,
                 endpoint: v1_endpoint,
                 response_preview: format!(
                     "（Base URL 建议加上 /v1 前缀）{}",
                     response_text.chars().take(280).collect::<String>()
                 ),
-            });
+            }); }
         }
     }
 
     let response_text = response.text().await.unwrap_or_default();
+    let (protocol_valid, completion_status) = validate_relay_test_response(profile.protocol, http_status, &response_text);
     Ok(RelayProfileTestResult {
         http_status,
         endpoint,
         response_preview: response_text.chars().take(320).collect(),
+        protocol_valid,
+        completion_status,
     })
+}
+
+/// 模型协议验收与 HTTP 连通分开；合法但被 token 预算截断的响应显示警告。
+pub fn validate_relay_test_response(protocol: RelayProtocol, status: u16, text: &str) -> (bool, String) {
+    let failed = || (false, "failed".to_string());
+    if !(200..300).contains(&status) { return failed(); }
+    let Ok(value) = serde_json::from_str::<Value>(text) else { return failed(); };
+    if value.get("error").is_some_and(|v| !v.is_null()) { return failed(); }
+    let state = match protocol {
+        RelayProtocol::Responses => {
+            if value.get("output").and_then(Value::as_array).is_none() { return failed(); }
+            match value.get("status").and_then(Value::as_str) {
+                Some("completed") => "completed",
+                Some("incomplete") => "incomplete",
+                _ => return failed(),
+            }
+        },
+        RelayProtocol::ChatCompletions => {
+            let Some(choices) = value.get("choices").and_then(Value::as_array).filter(|v| !v.is_empty()) else { return failed(); };
+            if choices.iter().any(|c| !c.get("message").is_some_and(Value::is_object)) { return failed(); }
+            if choices.iter().all(|c| matches!(c.get("finish_reason").and_then(Value::as_str), Some("stop" | "tool_calls" | "function_call"))) { "completed" }
+            else if choices.iter().all(|c| matches!(c.get("finish_reason").and_then(Value::as_str), Some("stop" | "tool_calls" | "function_call" | "length" | "content_filter"))) { "incomplete" }
+            else { return failed(); }
+        },
+        RelayProtocol::AnthropicMessages => {
+            if value.get("type").and_then(Value::as_str) != Some("message") || value.get("content").and_then(Value::as_array).is_none() { return failed(); }
+            match value.get("stop_reason").and_then(Value::as_str) {
+                Some("end_turn" | "stop_sequence" | "tool_use") => "completed",
+                Some("max_tokens" | "pause_turn" | "refusal") => "incomplete",
+                _ => return failed(),
+            }
+        },
+    };
+    (true, state.to_string())
 }
 
 /// 供应商测试请求：Content-Type + 认证 + 供应商自定义请求头。
@@ -1602,6 +1683,7 @@ pub(crate) fn apply_official_profile_to_home(
     profile: &RelayProfile,
     common_config: &str,
 ) -> anyhow::Result<RelayApplyResult> {
+    normalize_relay_profile_for_storage(&mut profile.clone())?;
     let auth = (!profile.auth_contents.trim().is_empty()).then_some(profile.auth_contents.as_str());
     let has_explicit_model_settings = [
         &profile.model,
@@ -3040,7 +3122,8 @@ fn apply_model_catalog_to_config_with_live_policy(
         if let Some(parent) = catalog_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        crate::settings::atomic_write(&catalog_path, catalog_json.as_bytes())?;
+        validate_managed_model_catalog(&catalog_json)?;
+    crate::settings::atomic_write(&catalog_path, catalog_json.as_bytes())?;
         let mut doc = parse_toml_document(&config_text)?;
         if root_key_string(&config_text, "model").is_none()
             && let Ok(catalog) = serde_json::from_str::<Value>(&catalog_json)
@@ -3233,6 +3316,7 @@ fn apply_model_catalog_to_config_with_live_policy(
     } else {
         catalog_json
     };
+    validate_managed_model_catalog(&catalog_json)?;
     crate::settings::atomic_write(&catalog_path, catalog_json.as_bytes())?;
     let mut doc = parse_toml_document(&config_text)?;
     doc["model_catalog_json"] = toml_edit::value(catalog_absolute);
@@ -3314,6 +3398,7 @@ pub(crate) fn parse_model_metadata_map(metadata_json: &str) -> anyhow::Result<se
         if !metadata.is_object() {
             anyhow::bail!("model_metadata 的模型 {slug} 值必须是对象");
         }
+        validate_catalog_model_fields(slug, metadata, false)?;
         let normalized = crate::model_suffix::parse_model_suffix(slug).0;
         if normalized.is_empty() {
             continue;
@@ -3571,6 +3656,32 @@ pub(crate) fn apply_model_metadata_overrides(
         crate::model_suffix::apply_model_fast_support(model, user_override.get("codex_plus_fast_support"));
     }
     Ok(serde_json::to_string_pretty(&catalog)?)
+}
+
+fn validate_catalog_model_fields(slug: &str, model: &Value, require_fields: bool) -> anyhow::Result<()> {
+    for (field, valid) in [
+        ("base_instructions", Value::is_string as fn(&Value) -> bool),
+        ("supports_parallel_tool_calls", Value::is_boolean as fn(&Value) -> bool),
+    ] {
+        match model.get(field) {
+            Some(value) if valid(value) => {},
+            None if !require_fields => {},
+            _ => anyhow::bail!("模型 {slug} 的 {field} 类型无效（期望 {}），原目录未修改", if field == "base_instructions" { "string" } else { "boolean" }),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_managed_model_catalog(catalog: &str) -> anyhow::Result<()> {
+    let catalog: Value = serde_json::from_str(catalog)?;
+    let models = catalog.get("models").and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("受管模型目录缺少 models 数组"))?;
+    for model in models {
+        let slug = model.get("slug").and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("受管模型目录缺少模型 slug"))?;
+        validate_catalog_model_fields(slug, model, true)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn uses_official_deepseek_responses(profile: &RelayProfile) -> bool {
@@ -3843,7 +3954,9 @@ fn copy_standard_responses_catalog(
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(target, serde_json::to_string_pretty(&catalog)?)?;
+    let catalog = serde_json::to_string_pretty(&catalog)?;
+    validate_managed_model_catalog(&catalog)?;
+    crate::settings::atomic_write(&target, catalog.as_bytes())?;
     Ok(true)
 }
 
@@ -3895,7 +4008,7 @@ fn is_codex_plus_managed_model_catalog(home: &Path, path: &str) -> bool {
                 .is_some_and(|byte| *byte == b'/')
 }
 
-fn sanitize_catalog_filename(id: &str) -> String {
+pub(crate) fn sanitize_catalog_filename(id: &str) -> String {
     id.chars()
         .map(|char| {
             if char.is_ascii_alphanumeric() || char == '-' || char == '_' {
@@ -4810,6 +4923,19 @@ fn complete_relay_profile_config_with_proxy_port(
 }
 
 pub fn normalize_relay_profile_for_storage(profile: &mut RelayProfile) -> anyhow::Result<()> {
+    if profile.relay_mode == crate::settings::RelayMode::Official
+        && !profile.official_mix_api_key
+        && !profile.auth_contents.trim().is_empty()
+        && !auth_contents_looks_like_chatgpt_auth(&profile.auth_contents)
+    {
+        // 保留合法的显式退出/旧 API-only 快照清理语义，其余未知格式不能静默删除。
+        let value: Value = serde_json::from_str(&profile.auth_contents)
+            .context("认证存档不是有效 JSON，原内容未修改")?;
+        let object = value.as_object().ok_or_else(|| anyhow::anyhow!("认证存档必须是 JSON 对象，原内容未修改"))?;
+        if object.keys().any(|key| key != "OPENAI_API_KEY") {
+            anyhow::bail!("不支持的官方认证存档格式，原内容未修改；请使用受支持的登录流程");
+        }
+    }
     if profile.api_keys.is_empty()
         && !profile.uses_no_auth()
         && (profile.relay_mode != crate::settings::RelayMode::Official || profile.official_mix_api_key)
