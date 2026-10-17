@@ -524,6 +524,12 @@ pub fn force_chinese_locale_config(settings: &BackendSettings) -> Value {
     json!({ "enabled": settings.codex_app_force_chinese_locale, "locale": "zh-CN" })
 }
 
+fn renderer_after_document_ready(script: &str) -> String {
+    format!(
+        "(()=>{{const start=()=>{{{script}\n}};if(document.body)start();else document.addEventListener('DOMContentLoaded',start,{{once:true}});}})();"
+    )
+}
+
 pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettings) -> String {
     let helper_url = format!("http://127.0.0.1:{helper_port}");
     let instance_label = std::env::var("CODEX_PLUS_INSTANCE_LABEL")
@@ -547,6 +553,12 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
     let paste_fix = paste_fix_enabled_config(settings);
     let force_chinese_locale = force_chinese_locale_config(settings);
     let hide_official_usage_alert = hide_official_usage_alert_config(settings);
+    // Fast 的新文档脚本需要 Page.enable；DOM 增强必须等正常文档就绪，不能访问空的根节点。
+    let renderer_runtime = if settings.enhancements_enabled && settings.codex_app_native_fast_unlock {
+        renderer_after_document_ready(renderer_script())
+    } else {
+        renderer_script().to_string()
+    };
     let stepwise_runtime =
         if settings.codex_app_stepwise_enabled || settings.codex_app_answer_outline_enabled {
             stepwise_script()
@@ -586,7 +598,7 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
                     "codexAppNativeFastUnlock": settings.codex_app_native_fast_unlock,
                 }),
             ),
-            renderer_script()
+            renderer_runtime
         ),
         stepwise_runtime,
         dream_skin_target_runtime,
@@ -692,6 +704,25 @@ fn image_content_type(path: &Path) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_fast_renderer_waits_for_dom_and_reinjection_runs_immediately() {
+        let wrapped = renderer_after_document_ready("window.started=(window.started||0)+1;");
+        let test = format!(r#"
+          const vm=require('node:vm'),assert=require('node:assert/strict');
+          for(const ready of [false,true]){{
+            let listener;
+            const window={{}},document={{body:ready?{{}}:null,addEventListener:(name,callback,options)=>{{
+              assert.equal(name,'DOMContentLoaded');assert.equal(options.once,true);listener=callback;
+            }}}};
+            vm.runInNewContext({},{{window,document}});
+            assert.equal(window.started,ready?1:undefined);
+            if(!ready){{document.body={{}};listener();assert.equal(window.started,1);}}
+          }}
+        "#, serde_json::to_string(&wrapped).unwrap());
+        let output = std::process::Command::new("node").arg("-e").arg(test).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
 
     #[test]
     fn native_shell_compatibility_is_present_without_managed_safe_css() {
