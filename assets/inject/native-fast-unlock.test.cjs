@@ -215,7 +215,8 @@ async function runNativeFastTests() {
   assert.equal(await env.queue().readServiceTier("model"), null);
   assert.equal((await env.explicit("priority")).serviceTier, null);
 
-  return "Native Fast structure matching, four auth paths, requirements, local scope, opt-in and queue behavior passed";
+  await require("./native-fast-module.test.cjs")({ source, url });
+  return "Native Fast structure matching, four auth paths, requirements, local scope, opt-in, queue and module transport behavior passed";
 }
 
 module.exports = runNativeFastTests;

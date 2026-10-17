@@ -1,4 +1,4 @@
-//! 原生 Fast 的资源响应补丁。仅修改本机应用资产，不暂停 JS，也不改写安装包。
+//! 原生 Fast 的模块补丁。仅修改本机应用资产，不暂停 JS，也不改写安装包。
 
 use super::{
     BridgeGeneration, CdpSession, bridge_generation_is_current, connect_cdp_websocket,
@@ -48,9 +48,32 @@ pub(super) async fn install(
     let mut session = CdpSession::new(socket);
     let mut state = InterceptorState::default();
     let bootstrap = bootstrap_script(true, true);
-    if let Err(error) = initialize(&mut session, &mut state, &bootstrap).await {
+    let initialized = async {
+        let location = evaluate(&mut session, "location.protocol").await?;
+        if location
+            .pointer("/result/result/value")
+            .and_then(Value::as_str)
+            == Some("app:")
+        {
+            initialize_module(&mut session, &mut state, &bootstrap, &generation).await
+        } else {
+            initialize(&mut session, &mut state, &bootstrap).await
+        }
+    }
+    .await;
+    if let Err(error) = initialized {
+        if bridge_generation_is_current(&generation) {
+            publish_patch_state(&mut session, "failed").await;
+        }
         cleanup(&mut session, &generation, &state).await;
+        if !bridge_generation_is_current(&generation) {
+            return Ok(());
+        }
         return Err(error);
+    }
+    if !bridge_generation_is_current(&generation) {
+        cleanup(&mut session, &generation, &state).await;
+        return Ok(());
     }
     diagnostic("bridge.native_fast_interceptor_ready", json!({}));
     tokio::spawn(async move {
@@ -64,6 +87,104 @@ pub(super) async fn install(
             );
         }
     });
+    Ok(())
+}
+
+// Electron 的 app:// 自定义协议不经过 Chromium Fetch 拦截器。
+// 在新文档的 meta CSP 解析前预载同源模块的补丁副本，原始模块图通过 import map 复用它。
+// 不修改 CSP，也不在后台注入时刷新页面；真正应用仍由显式启动流程负责。
+async fn initialize_module(
+    session: &mut Session,
+    state: &mut InterceptorState,
+    bootstrap: &str,
+    generation: &BridgeGeneration,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bridge_generation_is_current(generation),
+        "native Fast generation expired"
+    );
+    command(session, "Runtime.enable", json!({})).await?;
+    command(session, "Page.enable", json!({})).await?;
+    anyhow::ensure!(
+        bridge_generation_is_current(generation),
+        "native Fast generation expired"
+    );
+    let current_bootstrap =
+        bootstrap.replace("window.__codexPlusNativeFastAssetPatchReady=true;", "");
+    evaluate(session, &current_bootstrap).await?;
+    let prepared = evaluate_with_timeout(session, r#"(async()=>{
+      if(location.protocol!=='app:'||location.host!=='-')return {ok:false};
+      const urls=new Set();
+      const entries=[...document.scripts].map(s=>s.src).filter(s=>{
+        try{const u=new URL(s);return u.origin===location.origin&&/^\/assets\/index-[\w-]+\.js$/.test(u.pathname)}catch{return false}
+      });
+      for(const entry of entries.slice(0,4)){
+        const response=await fetch(entry);if(!response.ok)continue;
+        const source=await response.text();if(source.length>24*1024*1024)return {ok:false};
+        for(const match of source.matchAll(/["'`]\.\/app-initial-([\w-]+)\.js["'`]/g)){
+          urls.add(new URL('./app-initial-'+match[1]+'.js',entry).href);
+        }
+      }
+      if(urls.size!==1)return {ok:false};
+      const url=[...urls][0],response=await fetch(url);if(!response.ok)return {ok:false};
+      const source=await response.text();if(source.length>24*1024*1024)return {ok:false};
+      const result=window.__codexPlusNativeFastUnlock.prepareModule(source,url);
+      return result.ok?{ok:true,url,patchedSource:result.patchedSource}:{ok:false};
+    })()"#, Duration::from_secs(20)).await?;
+    let value = prepared
+        .pointer("/result/result/value")
+        .context("native Fast module preparation returned no value")?;
+    anyhow::ensure!(
+        value["ok"] == true,
+        "当前 Codex 资产不支持原生 Fast 模块补丁"
+    );
+    let url = value["url"]
+        .as_str()
+        .context("native Fast module URL is missing")?;
+    anyhow::ensure!(
+        is_local_asset(url),
+        "native Fast module must be a local asset"
+    );
+    let source = value["patchedSource"]
+        .as_str()
+        .context("native Fast module source is missing")?;
+    anyhow::ensure!(
+        source.len() <= SOURCE_LIMIT,
+        "native Fast module is too large"
+    );
+    anyhow::ensure!(
+        bridge_generation_is_current(generation),
+        "native Fast generation expired"
+    );
+    let script = format!(
+        "{bootstrap}\n;window.__codexPlusNativeFastUnlock.installModule({},{});",
+        json!(source),
+        json!(url)
+    );
+    let reply = command(
+        session,
+        "Page.addScriptToEvaluateOnNewDocument",
+        json!({"source":script}),
+    )
+    .await?;
+    state.script_id = reply
+        .pointer("/result/identifier")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    anyhow::ensure!(
+        state.script_id.is_some(),
+        "native Fast module bootstrap was not registered"
+    );
+    anyhow::ensure!(
+        bridge_generation_is_current(generation),
+        "native Fast generation expired"
+    );
+    evaluate(session, "window.__codexPlusNativeFastAssetPatchReady=true").await?;
+    diagnostic(
+        "bridge.native_fast_module_ready",
+        json!({"transport":"import_map"}),
+    );
     Ok(())
 }
 
@@ -115,9 +236,19 @@ async fn command(session: &mut Session, method: &str, params: Value) -> anyhow::
 }
 
 async fn evaluate(session: &mut Session, expression: &str) -> anyhow::Result<Value> {
+    evaluate_with_timeout(session, expression, COMMAND_TIMEOUT).await
+}
+
+async fn evaluate_with_timeout(
+    session: &mut Session,
+    expression: &str,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
     let mut params = runtime_evaluate_params_return_by_value(expression);
     params["awaitPromise"] = json!(true);
-    let reply = command(session, "Runtime.evaluate", params).await?;
+    let reply = session
+        .send_command_with_timeout(next_message_id(), "Runtime.evaluate", params, timeout)
+        .await?;
     anyhow::ensure!(
         reply.pointer("/result/exceptionDetails").is_none(),
         "native Fast evaluation failed"
@@ -411,6 +542,87 @@ mod tests {
     };
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
+
+    #[tokio::test]
+    async fn app_modules_register_preload_without_fetch_interception_or_csp_bypass() {
+        for (prepared, superseded) in [(true, false), (false, false), (true, true)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let generation = next_bridge_generation(&format!("native-fast-module-{address}"));
+            assert!(publish_bridge_generation(&generation));
+            let server_generation = generation.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut commands = Vec::new();
+                while let Some(Ok(message)) = socket.next().await {
+                    let Message::Text(message) = message else {
+                        continue;
+                    };
+                    let request: Value = serde_json::from_str(&message).unwrap();
+                    let result = match request["method"].as_str().unwrap() {
+                        "Runtime.enable" | "Page.enable" => json!({}),
+                        "Runtime.evaluate" => {
+                            let expression = request["params"]["expression"].as_str().unwrap();
+                            if expression.contains("prepareModule(source,url)") {
+                                if superseded {
+                                    release_bridge_generation(&server_generation);
+                                }
+                                json!({"result":{"value":if prepared {
+                                    json!({"ok":true,"url":"app://-/assets/app-initial-test.js","patchedSource":"patched-module"})
+                                } else {json!({"ok":false})}}})
+                            } else {
+                                json!({"result":{"value":true}})
+                            }
+                        }
+                        "Page.addScriptToEvaluateOnNewDocument" => {
+                            json!({"identifier":"module-script"})
+                        }
+                        method => panic!("unexpected module transport command {method}"),
+                    };
+                    socket
+                        .send(Message::Text(
+                            json!({"id":request["id"],"result":result})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    commands.push(request);
+                }
+                commands
+            });
+            let socket = connect_cdp_websocket(&format!("ws://{address}/devtools/page/module"))
+                .await
+                .unwrap();
+            let mut session = CdpSession::new(socket);
+            let mut state = InterceptorState::default();
+            let result = initialize_module(
+                &mut session,
+                &mut state,
+                &bootstrap_script(true, true),
+                &generation,
+            )
+            .await;
+            assert_eq!(result.is_ok(), prepared && !superseded);
+            assert_eq!(state.script_id.is_some(), prepared && !superseded);
+            assert!(!state.fetch_attempted);
+            session.close().await;
+            release_bridge_generation(&generation);
+            let commands = server.await.unwrap();
+            let registration = commands
+                .iter()
+                .find(|c| c["method"] == "Page.addScriptToEvaluateOnNewDocument");
+            assert_eq!(registration.is_some(), prepared && !superseded);
+            if let Some(registration) = registration {
+                let source = registration["params"]["source"].as_str().unwrap();
+                assert!(source.contains(
+                    "installModule(\"patched-module\",\"app://-/assets/app-initial-test.js\")"
+                ));
+                assert!(source.contains("\"codexAppNativeFastUnlock\":true"));
+            }
+        }
+    }
 
     #[derive(Clone, Copy)]
     enum Case {

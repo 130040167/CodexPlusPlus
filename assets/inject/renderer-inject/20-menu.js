@@ -125,6 +125,8 @@
 
   function codexAppAssetCandidateUrls() {
     return uniqueCodexAppAssetUrls([
+      // Fast 的 import map 让实际加载记录指向 Blob；定位原生类仍需要原资产 URL。
+      window.__codexPlusNativeFastCompiled === "v1" ? window.__codexPlusNativeFastModuleDiagnostics?.url : null,
       ...Array.from(document.scripts || []).map((script) => script.src),
       ...Array.from(document.querySelectorAll("link[href]") || []).map((link) => link.href),
       ...performance.getEntriesByType("resource").map((entry) => entry.name),
