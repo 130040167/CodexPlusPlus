@@ -119,26 +119,17 @@
       label.textContent = shot.querySelector("figcaption b").textContent;
       button.appendChild(image);
       button.appendChild(label);
-      button.addEventListener("click", function () { selectShot(index, true); });
+      button.addEventListener("click", function () { selectShot(index); });
       controls.appendChild(button);
       return button;
     });
 
-    function selectShot(index, reveal) {
+    function selectShot(index) {
       shots.forEach(function (shot, i) {
         shot.hidden = i !== index;
         buttons[i].setAttribute("aria-pressed", i === index ? "true" : "false");
       });
       shots[index].querySelector("img").loading = "eager";
-      if (reveal) {
-        var frame = shots[index].querySelector(".shot-frame");
-        var bounds = frame.getBoundingClientRect();
-        var visibleTop = Math.max(16, nav.getBoundingClientRect().bottom + 16);
-        // 手机上点选下方缩略图后，将更新的大图带回可见区域。
-        if (bounds.top < visibleTop || bounds.bottom > window.innerHeight - 16) {
-          frame.scrollIntoView({ behavior: REDUCED ? "auto" : "smooth", block: "center" });
-        }
-      }
     }
 
     // 控件完整创建并绑定后再收起其余截图，脚本不可用时仍可阅读全部图片。
