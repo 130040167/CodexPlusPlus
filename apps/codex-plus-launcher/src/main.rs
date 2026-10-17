@@ -1141,6 +1141,9 @@ impl LaunchHooks for LauncherHooks {
                             skipped_locked_rollout_files: Vec::new(),
                             encrypted_content_warning: None,
                             repair_audit: codex_plus_data::ProviderSyncAudit::default(),
+                            recovery_journal_path: None,
+                            recovery_errors: Vec::new(),
+                            database_outcomes: Vec::new(),
                         },
                         completion_error,
                     ));
@@ -1172,6 +1175,9 @@ impl LaunchHooks for LauncherHooks {
                             skipped_locked_rollout_files: Vec::new(),
                             encrypted_content_warning: None,
                             repair_audit: codex_plus_data::ProviderSyncAudit::default(),
+                            recovery_journal_path: None,
+                            recovery_errors: Vec::new(),
+                            database_outcomes: Vec::new(),
                         },
                         None,
                     ));
