@@ -309,6 +309,29 @@ impl HistoryRetention {
                     let Some(object) = row.as_object() else {
                         continue;
                     };
+                    // 软删除保留任务关联；只跳过按主键核对后完全未变化的行。
+                    // 已清空的关联仍交给原恢复流程，已改派或修改的行不能覆盖。
+                    if table == "agent_job_items"
+                        && let Some(job_id) = object.get("id")
+                        && has_table(&db, table)?
+                    {
+                        let job_id = OwnedSqlValue(json_to_sql_value(job_id));
+                        let current = select_dicts(
+                            &db,
+                            "SELECT * FROM agent_job_items WHERE id=?1",
+                            &[&job_id as &dyn ToSql],
+                        )?;
+                        if let Some(current) = current.first()
+                            && current
+                                .get("assigned_thread_id")
+                                .is_some_and(|value| !value.is_null())
+                        {
+                            if current != &row {
+                                bail!("restore conflict: agent_job_items row changed");
+                            }
+                            continue;
+                        }
+                    }
                     if restore_row_conflicts(&db, table, object)? {
                         if table == "threads" && row["id"].as_str() == Some(&id) {
                             let current =

@@ -71,6 +71,72 @@ impl Fixture {
 }
 
 #[test]
+fn soft_deleted_job_assignment_undo_is_idempotent_but_rejects_changes() {
+    for change in [None, Some("assignment"), Some("content")] {
+        let f = Fixture::new();
+        f.add("a", None);
+        f.add("b", Some("a"));
+        let db = Connection::open(&f.db).unwrap();
+        db.execute_batch("CREATE TABLE agent_job_items(id TEXT PRIMARY KEY, assigned_thread_id TEXT, status TEXT); INSERT INTO agent_job_items VALUES ('job1', 'a', 'pending')").unwrap();
+        let token = f.delete("a");
+        assert!(f.path("a").exists());
+        assert!(!f.visible("a"));
+        match change {
+            Some("assignment") => {
+                db.execute("UPDATE agent_job_items SET assigned_thread_id='other'", [])
+                    .unwrap();
+            }
+            Some("content") => {
+                db.execute("UPDATE agent_job_items SET status='changed'", [])
+                    .unwrap();
+            }
+            _ => {}
+        }
+        let result = f.adapter().undo(&token);
+        if change.is_none() {
+            assert_eq!(result.status, DeleteStatus::Undone, "{}", result.message);
+            f.undo(&token);
+        } else {
+            assert_eq!(result.status, DeleteStatus::Failed, "{}", result.message);
+            assert!(!f.visible("a"));
+        }
+        let deleted: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM codex_plus_deleted_threads WHERE thread_id='a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deleted, i64::from(change.is_some()));
+        let row = db
+            .query_row(
+                "SELECT assigned_thread_id, status FROM agent_job_items WHERE id='job1'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row.0,
+            if change == Some("assignment") {
+                "other"
+            } else {
+                "a"
+            }
+        );
+        assert_eq!(
+            row.1,
+            if change == Some("content") {
+                "changed"
+            } else {
+                "pending"
+            }
+        );
+        assert!(f.path("a").exists());
+        assert!(f.visible("b"));
+    }
+}
+
+#[test]
 fn chain_is_retained_until_last_reference_and_leaf_undo_restores_ancestors_hidden() {
     let f = Fixture::new();
     f.add("a", None);
