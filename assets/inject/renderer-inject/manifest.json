@@ -43,7 +43,7 @@
     {
       "name": "60-plugin-marketplace.js",
       "description": "插件市场请求/响应补丁、本地兜底与合并",
-      "lines": 1874
+      "lines": 1877
     },
     {
       "name": "61-plugin-market-ui.js",
@@ -63,7 +63,7 @@
     {
       "name": "71-model-picker-groups.js",
       "description": "原生模型选择器按供应商分组折叠（聚合供应商场景）",
-      "lines": 1027
+      "lines": 1036
     },
     {
       "name": "80-session-share.js",
@@ -113,7 +113,7 @@
     {
       "name": "95-conversation-view.js",
       "description": "会话视图运行时、官方用量策略重写、扫描主循环",
-      "lines": 925
+      "lines": 939
     },
     {
       "name": "96-whale-compat.js",

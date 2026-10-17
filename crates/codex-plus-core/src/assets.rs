@@ -207,7 +207,9 @@ fn dream_skin_target_runtime_script(settings: &BackendSettings, include_art: boo
 
     let (engine, renderer, base_css) = dream_skin_target_assets(settings);
     let managed_css = managed_dream_skin_css(settings);
-    let css = format!("{base_css}\n{managed_css}");
+    // 原生 shell 兼容属于基础主题：内置图片和没有 Safe CSS 的图片也必须可达。
+    let native_shell_css = include_str!("../../../assets/inject/dream-skin-native-shell-compat.css");
+    let css = format!("{base_css}\n{native_shell_css}\n{managed_css}");
     let theme = serde_json::to_string(&settings.codex_app_dream_skin_theme_config)
         .expect("dream skin target theme should serialize");
     let style_revision = dream_skin_content_signature(css.as_bytes());
@@ -676,6 +678,21 @@ fn image_content_type(path: &Path) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_shell_compatibility_is_present_without_managed_safe_css() {
+        let temp = tempfile::tempdir().unwrap();
+        for image in [String::new(), temp.path().join("selected.png").to_string_lossy().into_owned()] {
+            let mut settings = BackendSettings::default();
+            settings.codex_app_dream_skin_enabled = true;
+            settings.codex_app_dream_skin_image_path = image;
+            assert!(managed_dream_skin_css(&settings).is_empty());
+            let script = dream_skin_target_runtime_script(&settings, false);
+            assert!(script.contains("全尺寸 shell"));
+            settings.codex_app_dream_skin_paused = true;
+            assert!(dream_skin_target_runtime_script(&settings, false).is_empty());
+        }
+    }
 
     #[test]
     fn injection_does_not_project_retired_plugin_cache() {

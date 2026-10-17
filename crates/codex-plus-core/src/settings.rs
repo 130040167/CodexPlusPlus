@@ -1,10 +1,12 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use fs2::FileExt;
+use sha2::{Digest, Sha256};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use toml_edit::{DocumentMut, Item};
@@ -620,6 +622,9 @@ impl DictationSettings {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BackendSettings {
+    /// 读取快照的版本，只用于条件保存，不写入 settings.json。
+    #[serde(rename = "revision", default, skip_serializing_if = "String::is_empty")]
+    pub settings_revision: String,
     #[serde(default)]
     pub dictation: DictationSettings,
     #[serde(rename = "codexAppPath", default)]
@@ -649,6 +654,8 @@ pub struct BackendSettings {
     pub provider_sync_last_selected_provider: String,
     #[serde(rename = "ccsDbPath", default)]
     pub ccs_db_path: String,
+    #[serde(rename = "ccsImportSources", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ccs_import_sources: BTreeMap<String, crate::ccs_import::CcsImportOrigin>,
     #[serde(rename = "relayProfilesEnabled", default = "default_true")]
     pub relay_profiles_enabled: bool,
     #[serde(rename = "enhancementsEnabled", default = "default_true")]
@@ -850,6 +857,8 @@ pub struct BackendSettings {
     pub local_config_provider_imported: bool,
     #[serde(rename = "relayCommonConfigContents", default)]
     pub relay_common_config_contents: String,
+    #[serde(rename = "relayPreserveNonproviderSettings", default)]
+    pub relay_preserve_nonprovider_settings: bool,
     #[serde(rename = "relayContextConfigContents", default)]
     pub relay_context_config_contents: String,
     #[serde(rename = "activeRelayId", default = "default_active_relay_id")]
@@ -872,6 +881,7 @@ pub struct BackendSettings {
 impl Default for BackendSettings {
     fn default() -> Self {
         Self {
+            settings_revision: String::new(),
             dictation: DictationSettings::default(),
             codex_app_path: String::new(),
             codex_app_auto_takeover: false,
@@ -882,6 +892,7 @@ impl Default for BackendSettings {
             provider_sync_manual_providers: Vec::new(),
             provider_sync_last_selected_provider: String::new(),
             ccs_db_path: String::new(),
+            ccs_import_sources: BTreeMap::new(),
             relay_profiles_enabled: true,
             enhancements_enabled: true,
             codex_app_standalone_quota_unlock: false,
@@ -949,6 +960,7 @@ impl Default for BackendSettings {
             relay_profiles: default_relay_profiles(),
             local_config_provider_imported: false,
             relay_common_config_contents: String::new(),
+            relay_preserve_nonprovider_settings: false,
             relay_context_config_contents: String::new(),
             active_relay_id: default_active_relay_id(),
             aggregate_relay_profiles: Vec::new(),
@@ -1578,6 +1590,27 @@ impl SettingsStore {
         Self { path }
     }
 
+    fn write_lock(&self) -> anyhow::Result<File> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // 锁文件保持稳定，不能锁会被 atomic rename 替换的 settings inode。
+        let path = self.path.with_extension("json.lock");
+        let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
+        file.lock_exclusive().context("获取设置写锁失败")?;
+        Ok(file)
+    }
+
+    pub fn revision(&self) -> anyhow::Result<String> {
+        Ok(settings_revision(self.read_contents()?.as_deref().map(str::as_bytes)))
+    }
+
+    pub(crate) fn with_current_revision<T>(&self, expected: &str, operation: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let _lock = self.write_lock()?;
+        if self.revision()? != expected { anyhow::bail!("settings_revision_conflict：恢复前设置已更新"); }
+        operation()
+    }
+
     /// 读取设置。**嵌套调用只解析、不再归一化**。
     ///
     /// 归一化会走到 `complete_relay_profile_config`，它对聚合供应商会回头读全量设置
@@ -1591,16 +1624,18 @@ impl SettingsStore {
             None => {
                 let mut settings = BackendSettings::default();
                 settings.sync_tool_shards();
+                settings.settings_revision = settings_revision(None);
                 return Ok(settings);
             }
         };
 
-        let parsed = serde_json::from_str(&contents).with_context(|| {
+        let mut parsed: BackendSettings = serde_json::from_str(&contents).with_context(|| {
             format!(
                 "settings {} 解析失败，拒绝退回默认设置以免覆盖用户配置",
                 self.path.display()
             )
         })?;
+        parsed.settings_revision = settings_revision(Some(contents.as_bytes()));
         if settings_normalize_depth() > 0 {
             // 外层已经在归一化了：这里再归一化就会递归回本函数。
             return Ok(parsed);
@@ -1610,12 +1645,61 @@ impl SettingsStore {
     }
 
     pub fn save(&self, settings: &BackendSettings) -> anyhow::Result<()> {
+        self.save_versioned(settings).map(|_| ())
+    }
+
+    pub fn save_versioned(&self, settings: &BackendSettings) -> anyhow::Result<String> {
+        self.save_with_commit(settings, |_| Ok(()))
+    }
+
+    /// 持有同一个跨进程锁发布关联产物；失败时仅恢复仍属于本提交的设置。
+    pub fn save_with_commit(
+        &self,
+        settings: &BackendSettings,
+        publish: impl FnOnce(&str) -> anyhow::Result<()>,
+    ) -> anyhow::Result<String> {
+        self.save_with_prepared_commit(settings, |_| Ok(()), publish)
+    }
+
+    pub(crate) fn save_with_prepared_commit(
+        &self,
+        settings: &BackendSettings,
+        prepare: impl FnOnce(&str) -> anyhow::Result<()>,
+        publish: impl FnOnce(&str) -> anyhow::Result<()>,
+    ) -> anyhow::Result<String> {
+        let _lock = self.write_lock()?;
+        let revision = self.revision()?;
+        if settings.settings_revision != revision
+            && !(settings.settings_revision.is_empty() && revision == "missing")
+        {
+            anyhow::bail!("settings_revision_conflict：设置已被其他操作更新，请重载后合并；原文件未修改");
+        }
+        let before = self.snapshot_raw_bytes()?;
+        let bytes = self.prepare_save_bytes(settings)?;
+        let committed = settings_revision(Some(&bytes));
+        prepare(&committed)?;
+        atomic_write(&self.path, &bytes)?;
+        if let Err(error) = publish(&committed) {
+            if self.revision()? != committed {
+                anyhow::bail!("关联产物发布失败：{error}；设置已被外部修改，未覆盖新数据");
+            }
+            match before {
+                Some(bytes) => atomic_write(&self.path, &bytes)?,
+                None => { fs::remove_file(&self.path)?; },
+            }
+            return Err(error).context("关联产物发布失败，设置已恢复");
+        }
+        Ok(committed)
+    }
+
+    fn prepare_save_bytes(&self, settings: &BackendSettings) -> anyhow::Result<Vec<u8>> {
         // `save()` 是整体覆盖写，manager 的 save_settings 走的就是这条路。
         // 历史事故：load 失败退回默认设置（只剩 1 条默认 profile），前端把它原样
         // 回写，用户的 N 条供应商配置被清空。这里在写盘前比一次条数。
         // 旧文件超限、不可读或 JSON 损坏时拒绝写入，不能把读取失败当成空配置。
-        let existing_profile_count = self
-            .load_raw_object()?
+        let raw = self.load_raw_object()?;
+        validate_profile_updates(settings, &raw)?;
+        let existing_profile_count = raw
             .get("relayProfiles")
             .and_then(Value::as_array)
             .map(|items| items.len())
@@ -1636,8 +1720,12 @@ impl SettingsStore {
         serialize_settings_bounded(settings)?;
         let mut settings = normalize_settings_config_sections(settings.clone());
         settings.codex_extra_args = normalize_codex_extra_args(&settings.codex_extra_args);
-        let bytes = serialize_settings_bounded(&settings)?;
-        atomic_write(&self.path, &bytes)
+        let mut next = settings_to_object(&settings);
+        next.remove("revision");
+        // 完整表单不能擦除新版本或拓展写入的未知字段；profile 以稳定 ID 对齐。
+        preserve_unknown_settings_fields(&mut next, &raw)?;
+        next.remove("revision");
+        serialize_settings_bounded(&Value::Object(next))
     }
 
     /// 切换事务的原始字节快照，保留未识别字段；不得把读错伪装成缺失文件。
@@ -1652,7 +1740,11 @@ impl SettingsStore {
 
     /// 仅供已捕获原始状态的内部事务回滚，不经过普通保存的供应商塌缩判断。
     /// None 只能来自事务开始时文件不存在的快照，删除本次新建的 settings 文件。
-    pub(crate) fn restore_raw_snapshot(&self, snapshot: Option<&[u8]>) -> anyhow::Result<()> {
+    pub(crate) fn restore_raw_snapshot(&self, snapshot: Option<&[u8]>, expected_revision: &str) -> anyhow::Result<()> {
+        let _lock = self.write_lock()?;
+        if self.revision()? != expected_revision {
+            anyhow::bail!("settings_revision_conflict：回滚期间设置已有新变化，未覆盖新数据");
+        }
         // 本操作写出的文件也受预算约束；超限的当前文件可能是外部新写入，不能覆盖。
         self.read_contents()?;
         match snapshot {
@@ -1672,9 +1764,17 @@ impl SettingsStore {
         let Value::Object(payload) = payload else {
             return self.load();
         };
+        let _lock = self.write_lock()?;
+        if let Some(expected) = payload.get("revision") {
+            let expected = expected.as_str().ok_or_else(|| anyhow::anyhow!("revision 必须是字符串"))?;
+            if expected != self.revision()? {
+                anyhow::bail!("settings_revision_conflict：设置已被其他操作更新，补丁未应用");
+            }
+        }
 
         serialize_settings_bounded(&payload)?;
         let mut raw = self.load_raw_object()?;
+        let original_raw = raw.clone();
         let existing_profile_count = raw
             .get("relayProfiles")
             .and_then(Value::as_array)
@@ -1695,8 +1795,10 @@ impl SettingsStore {
         }
         merge_known_setting_fields(&mut raw, &payload);
         serialize_settings_bounded(&raw)?;
-        let settings = normalize_settings_config_sections(
-            serde_json::from_value(Value::Object(raw.clone())).unwrap_or_default(),
+        let candidate: BackendSettings = serde_json::from_value(Value::Object(raw.clone()))?;
+        validate_profile_updates(&candidate, &self.load_raw_object()?)?;
+        let mut settings = normalize_settings_config_sections(
+            candidate,
         );
         raw.insert(
             "relayCommonConfigContents".to_string(),
@@ -1712,6 +1814,7 @@ impl SettingsStore {
             "tools".to_string(),
             serde_json::to_value(&settings.tools).unwrap_or_else(|_| Value::Object(Map::new())),
         );
+        preserve_unknown_settings_fields(&mut raw, &original_raw)?;
         let new_profile_count = raw
             .get("relayProfiles")
             .and_then(Value::as_array)
@@ -1723,8 +1826,10 @@ impl SettingsStore {
                 existing_profile_count
             );
         }
+        raw.remove("revision");
         let bytes = serialize_settings_bounded(&Value::Object(raw))?;
         atomic_write(&self.path, &bytes)?;
+        settings.settings_revision = settings_revision(Some(&bytes));
         Ok(settings)
     }
 
@@ -1814,6 +1919,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
         }
         target.insert("dictation".to_string(), Value::Object(dictation));
     }
+    merge_bool_setting(target, source, "relayPreserveNonproviderSettings");
     target.remove("codexAppPluginAutoExpand");
     target.remove("computerUseGuardEnabled");
     if let Some(value) = source.get("codexAppPath").and_then(Value::as_str) {
@@ -2303,6 +2409,180 @@ fn settings_to_object(settings: &BackendSettings) -> Map<String, Value> {
     }
 }
 
+fn settings_revision(bytes: Option<&[u8]>) -> String {
+    bytes.map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)))
+        .unwrap_or_else(|| "missing".to_string())
+}
+
+fn validate_profile_updates(settings: &BackendSettings, raw: &Map<String, Value>) -> anyhow::Result<()> {
+    let previous: BackendSettings = serde_json::from_value(Value::Object(raw.clone()))?;
+    for profile in &settings.relay_profiles {
+        let mut normalized = profile.clone();
+        if let Err(error) = crate::relay_config::normalize_relay_profile_for_storage(&mut normalized) {
+            // 旧的不支持快照允许原样保留，不能阻断用户修改无关设置。
+            if previous.relay_profiles.iter().any(|old| old.id == profile.id && old == profile) {
+                continue;
+            }
+            if profile.relay_mode == RelayMode::Official && !profile.official_mix_api_key
+                && previous.relay_profiles.iter().any(|old| old.id == profile.id && old.auth_contents == profile.auth_contents)
+            {
+                let mut without_legacy_auth = profile.clone();
+                without_legacy_auth.auth_contents.clear();
+                crate::relay_config::normalize_relay_profile_for_storage(&mut without_legacy_auth)?;
+                continue;
+            }
+            return Err(error).with_context(|| format!("供应商 {} 配置无效，原存档未修改", profile.id));
+        }
+    }
+    Ok(())
+}
+
+fn preserve_unknown_settings_fields(
+    next: &mut Map<String, Value>,
+    old: &Map<String, Value>,
+) -> anyhow::Result<()> {
+    const KNOWN: &[&str] = &[
+        "id",
+        "name",
+        "model",
+        "baseUrl",
+        "upstreamBaseUrl",
+        "apiKey",
+        "apiKeys",
+        "activeApiKeyId",
+        "protocol",
+        "relayMode",
+        "officialMixApiKey",
+        "noAuth",
+        "hideOfficialUsageAlert",
+        "testModel",
+        "configContents",
+        "authContents",
+        "useCommonConfig",
+        "contextWindow",
+        "autoCompactLimit",
+        "modelInsertMode",
+        "modelList",
+        "modelWindows",
+        "modelAutoCompact",
+        "modelMetadata",
+        "modelVlm",
+        "vlmApiKey",
+        "vlmModel",
+        "vlmBaseUrl",
+        "userAgent",
+        "sub2apiEnabled",
+        "sub2apiMultiplier",
+        "modelRoutes",
+        "customHeaders",
+        "standardOpenaiProtocol",
+        "webSearchHistoryCompat",
+        "anthropicAuthHeader",
+        "anthropicMaxTokens",
+        "anthropicPromptCache",
+        "anthropicImpersonateClaudeCode",
+        "anthropicThinkingMode",
+    ];
+    fn mark_profiles(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                if let Some(profiles) = object
+                    .get_mut("relayProfiles")
+                    .and_then(Value::as_array_mut)
+                {
+                    for profile in profiles.iter_mut().filter_map(Value::as_object_mut) {
+                        // skip_serializing 的旧凭据/地址也是已知字段，绝不能当扩展字段补回。
+                        for key in KNOWN {
+                            profile.entry((*key).to_string()).or_insert(Value::Null);
+                        }
+                    }
+                }
+                for child in object.values_mut() {
+                    mark_profiles(child);
+                }
+            }
+            Value::Array(values) => {
+                for child in values {
+                    mark_profiles(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn identity(value: &Value) -> Option<String> {
+        if let Some(id) = value.get("id").and_then(Value::as_str) {
+            return Some(format!("id:{id}"));
+        }
+        let relay = value.get("relayId").and_then(Value::as_str)?;
+        Some(format!(
+            "relay:{relay}:{}",
+            value.get("pattern").and_then(Value::as_str).unwrap_or("")
+        ))
+    }
+    fn merge(target: &mut Value, old: &Value, known: &Value) {
+        match (target, old, known) {
+            (Value::Object(target), Value::Object(old), Value::Object(known)) => {
+                for (key, original) in old {
+                    if let Some(shape) = known.get(key) {
+                        if let Some(value) = target.get_mut(key) {
+                            merge(value, original, shape);
+                        }
+                    } else {
+                        target
+                            .entry(key.clone())
+                            .or_insert_with(|| original.clone());
+                    }
+                }
+            }
+            (Value::Array(target), Value::Array(old), Value::Array(known)) => {
+                for row in target {
+                    let Some(id) = identity(row) else {
+                        continue;
+                    };
+                    let matches: Vec<_> = old
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, old)| identity(old).as_ref() == Some(&id))
+                        .collect();
+                    if matches.len() != 1 {
+                        continue;
+                    }
+                    let (index, original) = matches[0];
+                    if let Some(shape) = known.get(index) {
+                        merge(row, original, shape);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let previous: BackendSettings = serde_json::from_value(Value::Object(old.clone()))?;
+    let mut known = serde_json::to_value(previous)?;
+    known["ccsImportSources"] = known
+        .get("ccsImportSources")
+        .cloned()
+        .unwrap_or(Value::Null);
+    known["revision"] = Value::Null;
+    for key in [
+        "launchMode",
+        "codexAppFastStartup",
+        "codexAppZedRemoteOpen",
+        "zedRemoteOpenStrategy",
+        "zedRemoteProjectRegistryEnabled",
+        "zedRemoteSyncToZedSettings",
+        "codexAppUpstreamWorktreeCreate",
+        "codexAppNativeMenuLocalization",
+        "codexAppPluginAutoExpand",
+        "computerUseGuardEnabled",
+    ] {
+        known[key] = Value::Null;
+    }
+    mark_profiles(&mut known);
+    let mut target = Value::Object(std::mem::take(next));
+    merge(&mut target, &Value::Object(old.clone()), &known);
+    *next = target.as_object_mut().expect("settings object").clone();
+    Ok(())
+}
 fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendSettings {
     settings.dictation.normalize();
     settings.codex_app_whale_balance_protocol =
@@ -2325,6 +2605,7 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
     }
     settings.codex_app_typing_effect = normalize_typing_effect(&settings.codex_app_typing_effect);
     settings.ccs_db_path = settings.ccs_db_path.trim().to_string();
+    settings.ccs_import_sources.retain(|id, _| settings.relay_profiles.iter().any(|profile| &profile.id == id));
     let (common, extracted_context) =
         split_context_config_sections(&settings.relay_common_config_contents);
     let context = join_config_sections(&[
@@ -2336,7 +2617,10 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
         &crate::relay_config::normalize_config_text(&context),
     );
     for profile in &mut settings.relay_profiles {
-        let _ = crate::relay_config::normalize_relay_profile_for_storage(profile);
+        let mut normalized = profile.clone();
+        if crate::relay_config::normalize_relay_profile_for_storage(&mut normalized).is_ok() {
+            *profile = normalized;
+        }
     }
     settings.codex_app_image_overlay_opacity =
         clamp_image_overlay_opacity(settings.codex_app_image_overlay_opacity);
@@ -3198,7 +3482,9 @@ experimental_bearer_token = "sk-existing""#
         let dir = temp_dir();
         let store = SettingsStore::new(dir.join("settings.json"));
 
-        assert_eq!(store.load().unwrap(), normalized_default_settings());
+        let mut expected = normalized_default_settings();
+        expected.settings_revision = "missing".into();
+        assert_eq!(store.load().unwrap(), expected);
     }
 
     /// 坏 JSON 不再静默退回默认设置：解析失败必须报错，避免拿默认值把磁盘上的
@@ -3240,7 +3526,7 @@ experimental_bearer_token = "sk-existing""#
                 .unwrap_err(),
             store.snapshot_raw_bytes().unwrap_err(),
             store
-                .restore_raw_snapshot(Some(b"{}".as_slice()))
+                .restore_raw_snapshot(Some(b"{}".as_slice()), "invalid")
                 .unwrap_err(),
         ] {
             assert!(error.to_string().contains("16 MiB"));
@@ -3261,7 +3547,7 @@ experimental_bearer_token = "sk-existing""#
         let original = r#"{"providerSyncEnabled":false,"customField":"keep"}"#;
         fs::write(&path, original).unwrap();
         let store = SettingsStore::new(path.clone());
-        let mut settings = BackendSettings::default();
+        let mut settings = store.load().unwrap();
         settings.codex_app_image_overlay_path = "\\".repeat(MAX_SETTINGS_FILE_BYTES / 2);
 
         assert!(
@@ -3376,7 +3662,7 @@ experimental_bearer_token = "sk-existing""#
 
         let collapsed = BackendSettings {
             relay_profiles: vec![RelayProfile::default()],
-            ..BackendSettings::default()
+            ..store.load().unwrap()
         };
         let error = store
             .save(&collapsed)
@@ -3405,6 +3691,7 @@ experimental_bearer_token = "sk-existing""#
         store.save(&settings).unwrap();
 
         let mut expected = settings;
+        expected.settings_revision = store.revision().unwrap();
         expected.tools.insert(ToolId::Codex, ToolConfig::default());
         assert_eq!(store.load().unwrap(), expected);
     }
@@ -3545,7 +3832,8 @@ experimental_bearer_token = "sk-existing""#
         store.save(&settings).unwrap();
 
         let loaded = store.load().unwrap();
-        let expected = normalize_settings_config_sections(settings);
+        let mut expected = normalize_settings_config_sections(settings);
+        expected.settings_revision = store.revision().unwrap();
         let active_aggregate = loaded.active_aggregate_relay_profile().unwrap();
         assert_eq!(loaded, expected);
         assert_eq!(
@@ -4216,14 +4504,14 @@ experimental_bearer_token = "sk-existing""#
         let store = SettingsStore::new(path.clone());
         let snapshot = store.snapshot_raw_bytes().unwrap();
         fs::write(&path, b"{\"providerSyncEnabled\":true}").unwrap();
-        store.restore_raw_snapshot(snapshot.as_deref()).unwrap();
+        store.restore_raw_snapshot(snapshot.as_deref(), &store.revision().unwrap()).unwrap();
         assert_eq!(fs::read(&path).unwrap(), original);
         for invalid in [b"{broken".as_slice(), b"[]".as_slice()] {
-            assert!(store.restore_raw_snapshot(Some(invalid)).is_err());
+            assert!(store.restore_raw_snapshot(Some(invalid), &store.revision().unwrap()).is_err());
             assert_eq!(fs::read(&path).unwrap(), original);
         }
         let oversized = vec![b' '; MAX_SETTINGS_FILE_BYTES + 1];
-        assert!(store.restore_raw_snapshot(Some(&oversized)).is_err());
+        assert!(store.restore_raw_snapshot(Some(&oversized), &store.revision().unwrap()).is_err());
         assert_eq!(fs::read(&path).unwrap(), original);
     }
 
@@ -4234,7 +4522,7 @@ experimental_bearer_token = "sk-existing""#
         let store = SettingsStore::new(path.clone());
         assert!(store.snapshot_raw_bytes().unwrap().is_none());
         store.save(&BackendSettings::default()).unwrap();
-        store.restore_raw_snapshot(None).unwrap();
+        store.restore_raw_snapshot(None, &store.revision().unwrap()).unwrap();
         assert!(!path.exists());
     }
 
@@ -4281,7 +4569,8 @@ experimental_bearer_token = "sk-existing""#
         let dir = temp_dir();
         let store = SettingsStore::new(dir.join("settings.json"));
         store.save(&settings).unwrap();
-        assert!(store.load().unwrap().relay_profiles[1].web_search_history_compat);
+        settings = store.load().unwrap();
+        assert!(settings.relay_profiles[1].web_search_history_compat);
         settings.relay_profiles[0].web_search_history_compat = true;
         settings.relay_profiles[1].web_search_history_compat = false;
         store.save(&settings).unwrap();

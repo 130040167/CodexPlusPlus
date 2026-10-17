@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Context;
+use sha2::{Digest, Sha256};
 use serde_json::{json, Map, Value};
 
 use crate::model_suffix::{
@@ -389,6 +390,8 @@ pub fn build_catalog_json(
             model["codex_plus_group_id"] = json!(relay.id);
             if is_default_member {
                 model["codex_plus_default"] = json!(true);
+            } else if let Some(model) = model.as_object_mut() {
+                model.remove("codex_plus_default");
             }
             model["comp_hash"] = json!("codex-plus-aggregate");
             // 聚合会切换上游；经典子代理任务使用明文，避免跨成员解密失败。
@@ -422,13 +425,225 @@ pub fn build_catalog_for_profile(profile: &RelayProfile) -> anyhow::Result<Optio
     Ok(Some(build_catalog_json(&settings, aggregate)?))
 }
 
+fn aggregate_publication_key(id: &str) -> String {
+    format!("{:x}", Sha256::digest(id.as_bytes()))[..16].to_string()
+}
+
+fn refresh_journal_path(home: &Path, aggregate: &str) -> std::path::PathBuf {
+    home.join("model-catalogs").join(format!(
+        "refresh-{}.json",
+        aggregate_publication_key(aggregate)
+    ))
+}
+
+fn owned_catalog_path(home: &Path, aggregate: &str, pointer: &str) -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(pointer);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        home.join(path)
+    };
+    let path = path.canonicalize().ok()?;
+    let root = home.join("model-catalogs").canonicalize().ok()?;
+    if path.parent()? != root || !path.is_file() {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    let legacy = format!(
+        "{}.json",
+        crate::relay_config::sanitize_catalog_filename(aggregate)
+    );
+    let prefix = format!("aggregate-{}-", aggregate_publication_key(aggregate));
+    (name == legacy || (name.starts_with(&prefix) && name.ends_with(".json"))).then_some(path)
+}
+
+fn config_catalog_pointer(config: &str) -> Option<String> {
+    config
+        .parse::<toml_edit::DocumentMut>()
+        .ok()?
+        .get("model_catalog_json")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// 在读取/保存入口恢复崩溃时已提交 settings、尚未发布的目录。不会覆盖外部改动。
+pub fn recover_pending_catalog_refresh(store: &SettingsStore, home: &Path) -> anyhow::Result<bool> {
+    let settings = store.load()?;
+    let Some(aggregate) = active_model_aggregation(&settings) else {
+        return Ok(false);
+    };
+    let journal = refresh_journal_path(home, &aggregate.id);
+    let text = match std::fs::read_to_string(&journal) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let Ok(mut pending) = serde_json::from_str::<Value>(&text) else {
+        return Ok(false);
+    };
+    if !matches!(
+        pending["status"].as_str(),
+        Some("prepared" | "settings_committed")
+    ) || pending["settingsRevision"].as_str() != Some(settings.settings_revision.as_str())
+        || pending["aggregateId"].as_str() != Some(aggregate.id.as_str())
+    {
+        return Ok(false);
+    }
+    store.with_current_revision(&settings.settings_revision, || {
+        let Some(path) = pending["catalogPath"]
+            .as_str()
+            .and_then(|p| owned_catalog_path(home, &aggregate.id, p))
+        else {
+            return Ok(false);
+        };
+        let catalog = std::fs::read_to_string(&path)?;
+        crate::relay_config::validate_managed_model_catalog(&catalog)?;
+        if pending["catalogHash"].as_str()
+            != Some(format!("{:x}", Sha256::digest(catalog.as_bytes())).as_str())
+        {
+            return Ok(false);
+        }
+        let config_path = home.join("config.toml");
+        let config = std::fs::read_to_string(&config_path)?;
+        let already_published = config_catalog_pointer(&config)
+            .and_then(|pointer| owned_catalog_path(home, &aggregate.id, &pointer))
+            == Some(path.clone());
+        if !already_published {
+            if pending["previousConfigHash"].as_str()
+                != Some(format!("{:x}", Sha256::digest(config.as_bytes())).as_str())
+            {
+                pending["status"] = json!("external_config_changed");
+                crate::settings::atomic_write(&journal, &serde_json::to_vec_pretty(&pending)?)?;
+                return Ok(false);
+            }
+            let mut doc: toml_edit::DocumentMut = config.parse()?;
+            doc["model_catalog_json"] = toml_edit::value(path.to_string_lossy().as_ref());
+            crate::settings::atomic_write(&config_path, doc.to_string().as_bytes())?;
+        }
+        pending["status"] = json!("completed");
+        crate::settings::atomic_write(&journal, &serde_json::to_vec_pretty(&pending)?)?;
+        Ok(true)
+    })
+}
+
+/// 成员编辑只发布新的不可变目录及配置指针，不执行供应商切换或重启。
+pub fn save_with_active_catalog_refresh(
+    store: &SettingsStore,
+    home: &Path,
+    next: &BackendSettings,
+) -> anyhow::Result<String> {
+    save_with_catalog_publisher(store, home, next, |path, content| {
+        crate::settings::atomic_write(path, content)
+    })
+}
+
+fn save_with_catalog_publisher(
+    store: &SettingsStore,
+    home: &Path,
+    next: &BackendSettings,
+    publish: impl FnOnce(&Path, &[u8]) -> anyhow::Result<()>,
+) -> anyhow::Result<String> {
+    recover_pending_catalog_refresh(store, home)?;
+    let previous = store.load()?;
+    let Some(aggregate) = active_model_aggregation(next) else {
+        return store.save_versioned(next);
+    };
+    if !next.relay_profiles_enabled
+        || previous.active_relay_id != next.active_relay_id
+        || previous.active_aggregate_relay_id != next.active_aggregate_relay_id
+    {
+        return store.save_versioned(next);
+    }
+    let catalog = build_catalog_json(next, &aggregate)?;
+    crate::relay_config::validate_managed_model_catalog(&catalog)?;
+    let config_path = home.join("config.toml");
+    let config = match std::fs::read_to_string(&config_path) {
+        Ok(config) => config,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return store.save_versioned(next);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let Some(pointer) = config_catalog_pointer(&config)
+        .and_then(|pointer| owned_catalog_path(home, &aggregate.id, &pointer))
+    else {
+        return store.save_versioned(next);
+    };
+    if std::fs::read_to_string(&pointer)? == catalog {
+        return store.save_versioned(next);
+    }
+    let digest = format!("{:x}", Sha256::digest(catalog.as_bytes()));
+    let staged = home.join("model-catalogs").join(format!(
+        "aggregate-{}-{digest}.json",
+        aggregate_publication_key(&aggregate.id)
+    ));
+    let journal = refresh_journal_path(home, &aggregate.id);
+    let write_journal = |status: &str, revision: &str| -> anyhow::Result<()> {
+        crate::settings::atomic_write(
+            &journal,
+            &serde_json::to_vec_pretty(&json!({
+                "status": status, "settingsRevision": revision, "aggregateId": aggregate.id,
+                "catalogPath": std::path::absolute(&staged)?, "catalogHash": digest,
+                "previousConfigHash": format!("{:x}", Sha256::digest(config.as_bytes())),
+            }))?,
+        )
+    };
+    let mut doc: toml_edit::DocumentMut = config.parse()?;
+    doc["model_catalog_json"] =
+        toml_edit::value(std::path::absolute(&staged)?.to_string_lossy().as_ref());
+    let result = store.save_with_prepared_commit(
+        next,
+        |revision| {
+            if std::fs::read_to_string(&config_path)? != config {
+                anyhow::bail!("实时配置已变更，未准备目录发布");
+            }
+            if staged.exists() {
+                anyhow::ensure!(
+                    std::fs::read(&staged)? == catalog.as_bytes(),
+                    "不可变目录内容与哈希不一致"
+                );
+            } else {
+                crate::settings::atomic_write(&staged, catalog.as_bytes())?;
+            }
+            write_journal("prepared", revision)
+        },
+        |revision| {
+            anyhow::ensure!(store.revision()? == revision, "目录发布前设置已被外部修改");
+            write_journal("settings_committed", revision)?;
+            if std::fs::read_to_string(&config_path)? != config {
+                anyhow::bail!("实时配置已被其他操作修改，未发布目录指针");
+            }
+            publish(&config_path, doc.to_string().as_bytes())
+        },
+    );
+    match result {
+        Ok(revision) => {
+            let _ = write_journal("completed", &revision);
+            Ok(revision)
+        }
+        // prepare 未执行时（例如 CAS 冲突）不能在锁外覆盖其他事务的 journal。
+        // 已 prepare 但发布失败时 settings 会回滚，目标 revision 不匹配即可阻止恢复。
+        Err(error) => Err(error),
+    }
+}
 /// 注入层读取与原生 Codex 相同的目录条目，显示名与能力仍属于对应成员。
 pub fn catalog_summary(
     home: &Path,
     settings: &BackendSettings,
     aggregate: &AggregateRelayProfile,
 ) -> anyhow::Result<Value> {
-    let payload: Value = serde_json::from_str(&build_catalog_json(settings, aggregate)?)?;
+    let config = std::fs::read_to_string(home.join("config.toml")).unwrap_or_default();
+    let published = config_catalog_pointer(&config)
+        .and_then(|pointer| owned_catalog_path(home, &aggregate.id, &pointer))
+        .and_then(|path| std::fs::read_to_string(path).ok());
+    let applied = published.is_some();
+    // 不急切求值候选目录：即使当前编辑无效，已发布的安全快照仍然可展示。
+    let desired = build_catalog_json(settings, aggregate);
+    let pending_changes = published.as_ref().is_some_and(|catalog| desired.as_ref().ok() != Some(catalog));
+    let payload: Value = match published {
+        Some(catalog) => serde_json::from_str(&catalog)?,
+        None => serde_json::from_str(&desired?)?,
+    };
     let mut metadata = Map::new();
     let models = payload["models"]
         .as_array()
@@ -447,7 +662,9 @@ pub fn catalog_summary(
         .find(|profile| profile.id == aggregate.id)
         .context("聚合供应商不存在")?;
     Ok(json!({
-        "status": "ok",
+        "status": if applied { "ok" } else { "not_applied" },
+        "applied": applied,
+        "pending_changes": pending_changes,
         "path": home.join("config.toml").to_string_lossy(),
         "service_tier": Value::Null,
         "model": ids.first().cloned().unwrap_or_default(),
@@ -455,7 +672,10 @@ pub fn catalog_summary(
         "codex_model_provider": crate::model_catalog::codex_model_provider_for_relay_profile(home, profile),
         "provider_name": aggregate.name,
         // 默认成员的 relay id：模型选择器用它给默认那一组打「默认」标志。
-        "codex_plus_default_group_id": aggregate.default_relay_id.trim(),
+        "codex_plus_default_group_id": if applied {
+            models.iter().find(|model| model["codex_plus_default"].as_bool() == Some(true))
+                .and_then(|model| model["codex_plus_group_id"].as_str()).unwrap_or("")
+        } else { aggregate.default_relay_id.trim() },
         "default_model": ids.first().cloned().unwrap_or_default(),
         "models": ids,
         "modelMetadata": metadata,
@@ -573,6 +793,51 @@ pub fn subagent_conflict_warning(home: &Path, settings: &BackendSettings) -> Opt
 mod tests {
     use super::*;
     use crate::settings::{AggregateRelayMember, AggregateRelayStrategy, RelayMode};
+
+    fn publication_fixture() -> (tempfile::TempDir, SettingsStore, std::path::PathBuf) {
+        let temp=tempfile::tempdir().unwrap();let store=SettingsStore::new(temp.path().join("settings.json"));
+        store.save(&settings()).unwrap();let loaded=store.load().unwrap();let aggregate=active_model_aggregation(&loaded).unwrap();
+        let home=temp.path().join("home");std::fs::create_dir_all(home.join("model-catalogs")).unwrap();
+        let path=home.join("model-catalogs/agg.json");std::fs::write(&path,build_catalog_json(&loaded,&aggregate).unwrap()).unwrap();
+        std::fs::write(home.join("config.toml"),format!("model_catalog_json = {:?}\n",path.to_str().unwrap())).unwrap();
+        (temp,store,home)
+    }
+
+    #[test]
+    fn catalog_publication_failure_restores_settings_and_keeps_old_pointer() {
+        let (_temp,store,home)=publication_fixture();let before=store.snapshot_raw_bytes().unwrap().unwrap();
+        let config=std::fs::read(home.join("config.toml")).unwrap();let mut next=store.load().unwrap();next.relay_profiles[0].model_list.push_str("\nnew-fixture-model");
+        let error=save_with_catalog_publisher(&store,&home,&next,|_,_|anyhow::bail!("injected publication failure")).unwrap_err();
+        assert!(error.to_string().contains("发布失败"));assert_eq!(store.snapshot_raw_bytes().unwrap().unwrap(),before);
+        assert_eq!(std::fs::read(home.join("config.toml")).unwrap(),config);
+        assert!(!recover_pending_catalog_refresh(&store,&home).unwrap());
+    }
+
+    #[test]
+    fn prepared_catalog_recovers_after_settings_commit_but_respects_external_config_changes() {
+        for external_change in [false,true] {
+            let (_temp,store,home)=publication_fixture();let mut next=store.load().unwrap();next.relay_profiles[0].model_list.push_str("\nnew-fixture-model");
+            let aggregate=active_model_aggregation(&next).unwrap();let catalog=build_catalog_json(&next,&aggregate).unwrap();
+            let digest=format!("{:x}",Sha256::digest(catalog.as_bytes()));let staged=home.join("model-catalogs").join(format!("aggregate-{}-{digest}.json",aggregate_publication_key(&aggregate.id)));
+            let config=std::fs::read_to_string(home.join("config.toml")).unwrap();let journal=refresh_journal_path(&home,&aggregate.id);
+            // 人工构造实际崩溃窗口：prepare已落盘、settings已提交，publish尚未执行。
+            store.save_with_prepared_commit(&next,|revision| {
+                std::fs::write(&staged,&catalog)?;
+                std::fs::write(&journal,serde_json::to_vec(&json!({"status":"prepared","aggregateId":aggregate.id,
+                    "settingsRevision":revision,"catalogPath":staged,"catalogHash":digest,
+                    "previousConfigHash":format!("{:x}",Sha256::digest(config.as_bytes()))}))?)?;
+                Ok(())
+            },|_|Ok(())).unwrap();
+            if external_change {std::fs::write(home.join("config.toml"),format!("{config}external_setting = true\n")).unwrap();}
+            let before_recovery=std::fs::read(home.join("config.toml")).unwrap();
+            assert_eq!(recover_pending_catalog_refresh(&store,&home).unwrap(),!external_change);
+            if external_change {assert_eq!(std::fs::read(home.join("config.toml")).unwrap(),before_recovery);}
+            else {
+                assert_eq!(config_catalog_pointer(&std::fs::read_to_string(home.join("config.toml")).unwrap()),Some(staged.canonicalize().unwrap().to_string_lossy().to_string()));
+                assert!(!recover_pending_catalog_refresh(&store,&home).unwrap());
+            }
+        }
+    }
 
     fn settings() -> BackendSettings {
         let mut settings = BackendSettings::default();
