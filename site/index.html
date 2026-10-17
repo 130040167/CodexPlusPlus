@@ -164,8 +164,12 @@
       <h3>一句话，派给子 Agent</h3>
       <p>在当前 Codex 对话中委派 DeepSeek Harness（dsh）、Claude Code 或另一个 Codex，由对应 CLI 执行，再把结果带回原对话。管理器可配置默认 Agent、CLI 路径和模型；点名时交给指定对象。</p>
     </article>
+    <article class="fcard tilt" id="native-fast-feature">
+      <span class="fcard-no mono">11</span>
+      <h3>API Key 也能用原生 Fast</h3>
+      <p>纯 API Key 模式恢复 Codex 的原生 Fast 开关，沿用 Standard / ⚡ Fast 控件。默认关闭，模型需声明 Fast（priority）支持；实际可用性与计费由供应商决定。</p>
+    </article>
   </div>
-  <p class="agent-setup"><b>子 Agent 上手：</b>先确认目标 CLI 可用并完成原生登录；打开「Agent 协作 → 子 Agent 设置」，启用目标、配置 CLI 与模型，选择默认 Agent 并保存；点击「一键接入并刷新」，下一轮直接说「让 DeepSeek 检查这个问题」。DSH 可按需开启复用已保存认证，并选择匹配的模型路由。<a href="https://github.com/BigPizzaV3/CodexPlusPlus/blob/main/docs/agent-collaboration.md" target="_blank" rel="noopener">查看配置说明 ↗</a></p>
 </section>
 
 <!-- ========== 供应商接入方式 ========== -->
@@ -347,6 +351,10 @@ your-model<span class="t-hl">[128000]</span>
     <details class="faq-item">
       <summary>切换供应商后，请求为什么失败？<span class="faq-x" aria-hidden="true"></span></summary>
       <div class="faq-a"><p>先在供应商详情中运行模型测试或 Provider Doctor，确认协议、Base URL、Key 与模型匹配。纯 API 和官方登录 + API 使用不同的认证位置，不要手工复制两种模式的 <span class="mono">auth.json</span>。</p></div>
+    </details>
+    <details class="faq-item" id="faq-native-fast">
+      <summary>开启原生 Fast 后，为什么仍然看不到开关？<span class="faq-x" aria-hidden="true"></span></summary>
+      <div class="faq-a"><p>先确认已经保存，并通过 Codex++ 重启 Codex。当前模型还需要声明 Fast 服务等级：在「供应商配置」中打开该模型的配置，设置「Fast（priority）支持」，保存模型与供应商后重启。请按供应商实际能力声明；此功能只恢复客户端入口，服务限制与计费仍以供应商为准。</p></div>
     </details>
     <details class="faq-item">
       <summary>增强功能可以关闭吗？官方应用更新后还能用吗？<span class="faq-x" aria-hidden="true"></span></summary>

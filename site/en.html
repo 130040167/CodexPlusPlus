@@ -160,8 +160,12 @@
       <h3>Delegate in a sentence</h3>
       <p>Ask your current Codex chat to delegate to DeepSeek Harness (dsh), Claude Code or another Codex. The selected CLI runs the task and returns results to the same chat. Configure the default agent, CLI paths and models; naming an agent selects that target.</p>
     </article>
+    <article class="fcard tilt" id="native-fast-feature">
+      <span class="fcard-no mono">11</span>
+      <h3>Native Fast with an API key</h3>
+      <p>Restore the native Fast switch in API-only mode and use Codex's own Standard / ⚡ Fast controls. Off by default; the model must declare Fast (priority) support. Availability and billing depend on your provider.</p>
+    </article>
   </div>
-  <p class="agent-setup"><b>Get started with sub-agents:</b> Confirm the target CLI works and is signed in. Open Agent Collaboration → Sub-agent Settings, enable your target, configure its CLI and model, select a default agent and save. Click “Connect &amp; refresh”; in your next message, say “Ask DeepSeek to investigate this issue.” DSH can optionally reuse saved authentication with a matching model route. <a href="https://github.com/BigPizzaV3/CodexPlusPlus/blob/main/docs/agent-collaboration.md" target="_blank" rel="noopener">Configuration guide (Chinese) ↗</a></p>
 </section>
 
 <section class="modes" id="modes">
@@ -337,6 +341,10 @@ your-model<span class="t-hl">[128000]</span>
     <details class="faq-item">
       <summary>Why do requests fail after switching providers?<span class="faq-x" aria-hidden="true"></span></summary>
       <div class="faq-a"><p>Run a model test or Provider Doctor in the provider details first: verify protocol, Base URL, key and model. API-only and official+API modes store credentials differently — don't hand-copy <span class="mono">auth.json</span> between them.</p></div>
+    </details>
+    <details class="faq-item" id="faq-native-fast">
+      <summary>Why is the native Fast switch still missing?<span class="faq-x" aria-hidden="true"></span></summary>
+      <div class="faq-a"><p>Confirm that you saved and restarted Codex through Codex++. In your provider's model settings, set “Fast (priority) support”, then save both the model and provider before restarting. Only declare support that your provider actually offers; unlocking the client control does not change service limits or billing.</p></div>
     </details>
     <details class="faq-item">
       <summary>Can enhancements be disabled? Will they survive official app updates?<span class="faq-x" aria-hidden="true"></span></summary>

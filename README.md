@@ -171,6 +171,12 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的统一管理应用，通
   </tr>
   <tr>
     <td colspan="2" valign="top">
+      <h3>⚡ 纯 API Key 也能选择原生 Fast</h3>
+      按需解锁 Codex 原生 Standard / Fast 控件。默认关闭；为模型配置 Fast（priority）支持后，使用供应商提供的优先服务等级，实际支持与计费以供应商为准。
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2" valign="top">
       <h3>📊 用量状态栏</h3>
       在输入框下方实时显示生成速度、缓存命中率和上下文占用；数据取自本机 Codex 会话记录，上下文占比按 Codex 识别到的每模型窗口计算。默认开启，可在「Codex 增强 → 常用增强 → 用量状态栏」关闭。
     </td>
@@ -197,16 +203,24 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的统一管理应用，通
 
 在管理工具中集中配置，在 Codex 内直接使用。插件市场与模型列表、会话操作、输入行为和阅读布局，都可以按自己的习惯开关。
 
-纯 API Key 用户可在「Codex 增强 → 原生 Fast 强制解锁」恢复模型选择器中的原生 Fast 开关。此选项默认关闭，保存后重新启动 Codex 生效；模型仍需声明 Fast 服务等级，实际支持和计费由供应商决定。补丁在前端资源加载时应用，不改写安装包；关闭选项后恢复原生身份判断。
-
 <details>
   <summary><strong>展开查看 Codex 内的增强设置</strong></summary>
 
 <p align="center">
-  <img src="docs/images/readme-preview/in-app-settings.png" alt="Codex 内的增强设置：后端状态、模型列表、Fast 按钮与会话操作" width="100%">
+  <img src="docs/images/readme-preview/in-app-settings.png" alt="Codex 内的增强设置示例：后端状态、模型列表与会话操作" width="100%">
 </p>
 
 </details>
+
+### 纯 API Key，也能使用原生 Fast 控件
+
+「原生 Fast 强制解锁」让纯 API Key 模式可以在支持的模型上使用 Codex 原生 **Standard / ⚡ Fast** 控件，沿用原生的模型与推理强度菜单。
+
+1. 打开管理器「Codex 增强 → 常用增强」，开启增强总开关与「原生 Fast 强制解锁」（默认关闭）。
+2. 确认模型已声明 Fast 服务等级；需要手动配置时，在「供应商配置」中打开对应模型的配置，设置「Fast（priority）支持」，保存模型与供应商。
+3. 保存增强设置，从 Codex++ 重新启动 Codex，再打开模型或推理强度菜单，选择 **⚡ Fast**；需要恢复时选择 **Standard**。
+
+实际可用性、提速效果与计费由供应商决定，开启此功能不会让所有模型自动提速。关闭选项并重启 Codex 即可恢复原生身份判断。
 
 ### 输入框下方，用量一目了然
 
