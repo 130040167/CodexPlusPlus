@@ -758,8 +758,14 @@ export const EN_PLAIN: Record<string, string> = {
   "启用": "Enable",
   "启用 Codex 图片覆盖层": "Enable Codex image overlay",
   "启用 Codex增强": "Enable Codex enhancements",
-  "独立额度解锁": "Standalone quota unlock",
-  "官方登录 + 混入 API Key": "Official login + mixed API key",
+  "独立模式": "Standalone mode",
+  "增强总开关关闭后仍会生效的补丁。":
+    "Patches that still apply after the enhancement master switch is turned off.",
+  "官方额度解锁": "Official quota unlock",
+  "增强开启时此能力已自动生效；此开关只在关闭增强后生效。":
+    "This capability is already active while enhancements are on; the switch only applies after enhancements are turned off.",
+  "官方登录 + API 供应商在官方订阅额度耗尽后仍可发送；只改客户端发送状态，不改变真实用量与计费。保存后重启 Codex 生效。":
+    "Official login + API providers can still send after the official subscription quota runs out. Only the client send state changes; real usage and billing are untouched. Restart Codex after saving.",
   "启用供应商配置切换": "Enable provider configuration switching",
   "启用此扩展项": "Enable this entry",
   "包含测试模型、上下文大小与压缩阈值；留空即沿用全局默认值。":

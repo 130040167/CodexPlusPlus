@@ -5944,32 +5944,18 @@ function EnhanceScreen({
     <div className="settings-page enhance-page">
       <div className="enhance-page-controls" id="enhance-page-controls">
         <div className="enhance-page-toolbar">
-          <div className="enhance-primary-switches">
-            <label className="switch-row compact enhance-master-switch">
-              <input
-                checked={form.enhancementsEnabled}
-                onChange={(event) => onFormChange({ ...form, enhancementsEnabled: event.currentTarget.checked })}
-                type="checkbox"
-              />
-              <span>
-                <strong>{t("启用 Codex增强")}</strong>
-                <small>{t("关闭后暂停增强功能，服务配置会保留。")}</small>
-              </span>
-              <ToggleVisual />
-            </label>
-            <label className="switch-row compact enhance-master-switch">
-              <input
-                checked={form.codexAppStandaloneQuotaUnlock}
-                onChange={(event) => setEnhanceFlag("codexAppStandaloneQuotaUnlock", event.currentTarget.checked)}
-                type="checkbox"
-              />
-              <span>
-                <strong>{t("独立额度解锁")}</strong>
-                <small>{t("官方登录 + 混入 API Key")}</small>
-              </span>
-              <ToggleVisual />
-            </label>
-          </div>
+          <label className="switch-row compact enhance-master-switch">
+            <input
+              checked={form.enhancementsEnabled}
+              onChange={(event) => onFormChange({ ...form, enhancementsEnabled: event.currentTarget.checked })}
+              type="checkbox"
+            />
+            <span>
+              <strong>{t("启用 Codex增强")}</strong>
+              <small>{t("关闭后暂停增强功能，服务配置会保留。")}</small>
+            </span>
+            <ToggleVisual />
+          </label>
           <div className="enhance-save-actions">
             <span className={dirty ? "is-dirty" : ""} role="status">{dirty ? t("有未保存修改") : t("已保存")}</span>
             <Button disabled={!dirty} onClick={() => void actions.saveSettings()}>
@@ -6009,6 +5995,10 @@ function EnhanceScreen({
         <Panel className="enhance-panel">
           <CardContent className="enhance-content">
             <div className="enhance-feature-groups">
+              {/* 关闭增强时这组是唯一仍会生效的补丁，因此提到最前面；开启增强时它排在最后。 */}
+              {masterEnabled ? null : (
+                <StandaloneModeGroup form={form} onFormChange={onFormChange} masterEnabled={masterEnabled} />
+              )}
               <FeatureGroup title={t("插件与模型")} detail={t("管理插件市场、模型列表和服务档位相关增强。")}>
                 {isWindowsPlatform ? <>
                   <FeatureToggle
@@ -6069,6 +6059,9 @@ function EnhanceScreen({
                 {/* 余额配置独占一整行（CSS: > .settings-block），展开时不会牵动上面的开关卡。 */}
                 <WhaleBalanceSettingsFields form={form} onFormChange={onFormChange} />
               </FeatureGroup>
+              {masterEnabled ? (
+                <StandaloneModeGroup form={form} onFormChange={onFormChange} masterEnabled={masterEnabled} />
+              ) : null}
             </div>
             <div className="hint-line enhance-footer-hint">
               <Info className="h-4 w-4" />
@@ -6084,6 +6077,31 @@ function EnhanceScreen({
         <StepwiseSettingsPanel form={form} onFormChange={onFormChange} actions={actions} />
       </div>
     </div>
+  );
+}
+
+// 增强总开关关闭后仍生效的独立补丁。不受总开关禁用，所以不放进 FeatureGroup 的
+// masterEnabled 门控里；位置在该页「常用增强」标签内，关闭增强时提到最前面。
+function StandaloneModeGroup({
+  form,
+  onFormChange,
+  masterEnabled,
+}: {
+  form: BackendSettings;
+  onFormChange: (value: BackendSettings) => void;
+  masterEnabled: boolean;
+}) {
+  return (
+    <FeatureGroup title={t("独立模式")} detail={t("增强总开关关闭后仍会生效的补丁。")}>
+      <FeatureToggle
+        title={t("官方额度解锁")}
+        detail={masterEnabled
+          ? t("增强开启时此能力已自动生效；此开关只在关闭增强后生效。")
+          : t("官方登录 + API 供应商在官方订阅额度耗尽后仍可发送；只改客户端发送状态，不改变真实用量与计费。保存后重启 Codex 生效。")}
+        checked={form.codexAppStandaloneQuotaUnlock}
+        onChange={(value) => onFormChange({ ...form, codexAppStandaloneQuotaUnlock: value })}
+      />
+    </FeatureGroup>
   );
 }
 

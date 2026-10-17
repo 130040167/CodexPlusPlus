@@ -8859,14 +8859,6 @@ select {
   padding: 14px 18px;
 }
 
-.enhance-primary-switches {
-  display: grid;
-  gap: 14px;
-  flex: 1;
-  min-width: 0;
-  max-width: 480px;
-}
-
 .enhance-master-switch.switch-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
