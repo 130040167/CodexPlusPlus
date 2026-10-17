@@ -378,17 +378,119 @@ fn compaction_history_item_expands_to_user_message_in_chat_conversion() {
 }
 
 #[test]
-fn chat_conversion_rejects_encrypted_agent_content_without_echoing_payload() {
+fn chat_conversion_forwards_plaintext_encrypted_agent_content_in_order() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-flash",
+        "input": [
+            { "type": "agent_message", "id": "amsg_real_shape",
+              "author": "/root/orchestrator", "recipient": "/root/worker",
+              "content": [
+                  { "type": "input_text",
+                    "text": "Message Type: NEW_TASK Task name: /root/worker Payload:" },
+                  { "type": "encrypted_content",
+                    "encrypted_content": "收到任务：请核对改动并把结论整理成三段发回。" }
+              ] }
+        ]
+    }))
+    .unwrap();
+
+    let messages = converted["messages"].as_array().unwrap();
+    let forwarded = messages
+        .iter()
+        .find(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("收到任务"))
+        })
+        .expect("agent_message 内的明文 encrypted_content 片段应透传为文本");
+    assert_eq!(forwarded["role"], "user");
+    let content = forwarded["content"].as_str().unwrap();
+    let header_pos = content.find("Payload:").expect("头部文本应保留");
+    let payload_pos = content.find("收到任务").unwrap();
+    assert!(
+        payload_pos > header_pos,
+        "片段顺序必须保持 header 在前、payload 在后"
+    );
+}
+
+#[test]
+fn chat_conversion_rejects_plaintext_encrypted_content_outside_agent_message() {
+    let error = responses_to_chat_completions(json!({
+        "model": "custom-model",
+        "input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "Payload:"},
+            {"type": "encrypted_content", "text": "private-agent-payload"}
+        ]}]
+    }))
+    .expect_err("普通 message 里的 encrypted_content 必须 fail closed");
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("unsupported_encrypted_agent_content"));
+    assert!(!diagnostic.contains("private-agent-payload"));
+}
+
+#[test]
+fn chat_conversion_rejects_agent_message_without_confirmed_payload_header() {
+    let error = responses_to_chat_completions(json!({
+        "model": "custom-model",
+        "input": [{"type": "agent_message", "content": [
+            {"type": "encrypted_content", "encrypted_content": "private-agent-payload"}
+        ]}]
+    }))
+    .expect_err("缺少 Payload: 头部的 agent_message 不得透传 encrypted_content");
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("unsupported_encrypted_agent_content"));
+    assert!(!diagnostic.contains("private-agent-payload"));
+}
+
+#[test]
+fn chat_conversion_rejects_url_safe_base64_agent_payload_as_opaque() {
+    // 合法的 base64url 密文：含 `_`，解码后可打印 ASCII 占比明显低于阈值。
+    // 字母表归一化写错时这里会退化成「解码失败 → 当明文转发」，上游收到无意义载荷。
+    let opaque = "BU6X4ClyuwRNlt8ocboDTJXeJ3C5AkuU3SZvuAFKk9wlbrcASZLbJG22_0iR2iNs";
+    let error = responses_to_chat_completions(json!({
+        "model": "custom-model",
+        "input": [{"type": "agent_message", "content": [
+            {"type": "input_text", "text": "Message Type: NEW_TASK Payload:"},
+            {"type": "encrypted_content", "encrypted_content": opaque}
+        ]}]
+    }))
+    .expect_err("base64url 密文不得按明文转发给 Chat 上游");
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("unsupported_encrypted_agent_content"));
+    assert!(!diagnostic.contains(opaque));
+}
+
+#[test]
+fn chat_conversion_rejects_object_shaped_encrypted_content() {
+    let error = responses_to_chat_completions(json!({
+        "model": "x",
+        "input": [{"type": "message", "role": "user", "content": {
+            "type": "encrypted_content", "encrypted_content": "private-agent-payload"
+        }}]
+    }))
+    .expect_err("content 为对象形态时同样必须拒绝 encrypted_content");
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("unsupported_encrypted_agent_content"));
+    assert!(!diagnostic.contains("private-agent-payload"));
+}
+
+#[test]
+fn chat_conversion_rejects_opaque_encrypted_agent_content_without_echoing_payload() {
+    let opaque = "mMn9x0Kc2QvZ7LtR4bYwJpE1sH6dGfUgA0TiOeNkVXqBcD9ylZsKmWrT3uPh";
     for input in [
         json!([{"type":"message","role":"user","content":[
             {"type":"input_text","text":"Payload:"},
-            {"type":"encrypted_content","text":"private-agent-payload"}
+            {"type":"encrypted_content","text":opaque}
         ]}]),
-        json!([{"type":"encrypted_content","encrypted_content":"private-agent-payload"}]),
+        json!([{"type":"encrypted_content","encrypted_content":opaque}]),
         json!([{"type":"agent_message","content":[
-            {"type":"encrypted_content","encrypted_content":"private-agent-payload"}
+            {"type":"encrypted_content","encrypted_content":opaque}
         ]}]),
-        json!({"type":"encrypted_content","encrypted_content":"private-agent-payload"}),
+        json!([{"type":"agent_message","content":[
+            {"type":"input_text","text":"Payload:"},
+            {"type":"encrypted_content","encrypted_content":opaque}
+        ]}]),
+        json!({"type":"encrypted_content","encrypted_content":opaque}),
         json!([{"type":"message","role":"user","content":[{"type":"encrypted_content"}]}]),
     ] {
         for standard in [false, true] {
@@ -396,10 +498,10 @@ fn chat_conversion_rejects_encrypted_agent_content_without_echoing_payload() {
                 json!({"model":"custom-model","input":input}),
                 standard,
             )
-            .expect_err("加密 agent 内容必须明确拒绝，不能静默丢弃或视为明文");
+            .expect_err("opaque encrypted agent 内容必须明确拒绝，不能静默丢弃或当作文本转发");
             let diagnostic = format!("{error:#}");
             assert!(diagnostic.contains("unsupported_encrypted_agent_content"));
-            assert!(!diagnostic.contains("private-agent-payload"));
+            assert!(!diagnostic.contains(opaque));
         }
     }
 }
@@ -431,33 +533,36 @@ fn chat_conversion_keeps_plaintext_and_existing_reasoning_compaction_contracts()
 
 #[tokio::test]
 async fn encrypted_agent_content_is_rejected_before_contacting_chat_upstream() {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
-    let address = listener.local_addr().unwrap();
-    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let upstream = tokio::spawn(async move {
-        tokio::select! {
-            request = capture_json_request_once(listener) => Some(request),
-            _ = stopped => None,
-        }
-    });
-    let settings = session_header_settings(
-        RelayProtocol::ChatCompletions,
-        format!("http://{address}/v1"),
-    );
-    let result = open_responses_proxy_request_with_settings(
-        &json!({"model":"custom-model","stream":false,"input":[
-            {"type":"encrypted_content","encrypted_content":"private-agent-payload"}
-        ]})
-        .to_string(),
-        settings,
-    )
-    .await;
-    let _ = stop.send(());
-    let request = upstream.await.unwrap();
-    assert!(result.is_err(), "必须在发送上游请求前拒绝不支持的加密内容");
-    assert!(request.is_none(), "不得向 Chat 上游发送删掉 payload 的请求");
+    for body in [
+        json!({"model":"custom-model","stream":false,"input":[
+            {"type":"encrypted_content","encrypted_content":"mMn9x0Kc2QvZ7LtR4bYwJpE1sH6dGfUgA0TiOeNkVXqBcD9ylZsKmWrT3uPh"}
+        ]}),
+        json!({"model":"x","stream":false,"input":[
+            {"type":"message","role":"user","content":{
+                "type":"encrypted_content","encrypted_content":"private-agent-payload"}}
+        ]}),
+    ] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let upstream = tokio::spawn(async move {
+            tokio::select! {
+                request = capture_json_request_once(listener) => Some(request),
+                _ = stopped => None,
+            }
+        });
+        let settings = session_header_settings(
+            RelayProtocol::ChatCompletions,
+            format!("http://{address}/v1"),
+        );
+        let result = open_responses_proxy_request_with_settings(&body.to_string(), settings).await;
+        let _ = stop.send(());
+        let request = upstream.await.unwrap();
+        assert!(result.is_err(), "必须在发送上游请求前拒绝不支持的加密内容");
+        assert!(request.is_none(), "不得向 Chat 上游发送删掉 payload 的请求");
+    }
 }
 
 #[tokio::test]
