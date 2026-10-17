@@ -280,7 +280,8 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /function installCodexPlusPageNavigationCloseHandler\(\)/);
     assert.match(renderer, /target\?\.closest\(selectors\.sidebarThread\)/);
     assert.match(renderer, /closeCodexPlusPageAfterNativeNavigation\(\)/);
-    assert.match(renderer, /setTimeout\(\(\) => \{\s*window\.__codexPlusPageNavigationCloseTimer = null;\s*closeCodexPlusPage\(\);/);
+    assert.match(renderer, /const timer = setTimeout\(\(\) => \{\s*if \(window\.__codexPlusPageNavigationCloseTimer !== timer\) return;/);
+    assert.match(renderer, /if \(document\.querySelector\(`\.\$\{codexPlusPageClass\}`\) === page\) closeCodexPlusPage\(\);/);
     assert.match(renderer, /installCodexPlusNavigationEntries\(\);/);
     assert.match(renderer, /document\.querySelectorAll\(`#\$\{codexPlusMenuId\}/);
   });
