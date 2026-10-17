@@ -264,3 +264,33 @@ test("已有旧版桥接wrapper的当前窗口重新注入后也先截获托管�
   f.api.patchBridge();
   assert.equal(f.window.electronBridge.sendMessageFromView, original, "scans must not accumulate wrappers");
 });
+
+test("配置读取超时与插件传输同时安装时只取消读取并透传原生错误", async () => {
+  for (const guardFirst of [true, false]) {
+    const f = fixture();
+    f.window.setTimeout = f.context.setTimeout;
+    f.window.clearTimeout = f.context.clearTimeout;
+    const installGuard = () => vm.runInContext(
+      readFileSync(`${root}/31-config-read-deadline.js`, "utf8") + "\ninstallCodexConfigReadDeadline();", f.context);
+    if (guardFirst) installGuard();
+    f.api.patchBridge();
+    if (!guardFirst) installGuard();
+    const config = { type: "fetch", method: "POST", requestId: "config",
+      url: "vscode://codex/mcp-codex-config", body: '{"cwd":"/fixture"}' };
+    await f.window.electronBridge.sendMessageFromView(config);
+    f.outboundEvent(config, true);
+    const turn = { type: "mcp-request", request: { id: "turn", method: "turn/start", params: {} } };
+    await f.window.electronBridge.sendMessageFromView(turn);
+    f.outboundEvent(turn, true);
+    const [timerId, timer] = [...f.timers].find(([, timer]) => timer.delay === 15_000);
+    f.timers.delete(timerId);
+    timer.callback();
+    await flush();
+    const replies = f.delivered.filter((event) => event.data?.requestId === "config");
+    assert.equal(replies.length, 1);
+    assert.equal(replies[0].data.responseType, "error");
+    assert.equal(replies[0].data.status, 408);
+    assert.deepEqual(f.originalMessages.map(({ type }) => type), ["fetch", "mcp-request", "cancel-fetch"]);
+    assert.equal(f.calls.length, 0, "不访问插件索引或重发用户请求");
+  }
+});
