@@ -32,6 +32,10 @@ pub fn default_ccs_db_path() -> PathBuf {
         .join(format!("{}-{}.db", "cc", "switch"))
 }
 
+pub fn default_ccs_skills_dir() -> PathBuf {
+    home_dir().join(".cc-switch").join("skills")
+}
+
 pub fn list_codex_providers_from_default_db() -> anyhow::Result<Vec<CcsProviderImport>> {
     list_codex_providers_from_db(&default_ccs_db_path())
 }
@@ -146,6 +150,12 @@ pub fn relay_profile_from_ccs(
         base_url: provider.base_url.clone(),
         upstream_base_url: provider.base_url.clone(),
         api_key: provider.api_key.clone(),
+        api_keys: vec![crate::settings::RelayApiKey {
+            id: "default".to_string(),
+            name: "默认".to_string(),
+            api_key: provider.api_key.clone(),
+        }],
+        active_api_key_id: "default".to_string(),
         protocol: provider.protocol,
         relay_mode: RelayMode::PureApi,
         official_mix_api_key: false,

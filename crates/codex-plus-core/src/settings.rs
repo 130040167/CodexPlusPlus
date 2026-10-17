@@ -36,6 +36,10 @@ pub struct RelayProfile {
         deserialize_with = "deserialize_profile_api_key"
     )]
     pub api_key: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub api_keys: Vec<RelayApiKey>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub active_api_key_id: String,
     #[serde(default)]
     pub protocol: RelayProtocol,
     #[serde(rename = "relayMode", default)]
@@ -170,6 +174,15 @@ pub struct RelayProfile {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RelayApiKey {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub api_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RelayModelRoute {
     pub model: String,
     #[serde(rename = "targetRelayId")]
@@ -286,6 +299,8 @@ impl Default for RelayProfile {
             base_url: default_relay_base_url(),
             upstream_base_url: String::new(),
             api_key: String::new(),
+            api_keys: Vec::new(),
+            active_api_key_id: String::new(),
             protocol: RelayProtocol::Responses,
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
@@ -323,6 +338,11 @@ impl Default for RelayProfile {
 }
 
 impl RelayProfile {
+    pub fn selected_api_key(&self) -> Option<&RelayApiKey> {
+        self.api_keys.iter().find(|entry| entry.id == self.active_api_key_id)
+            .or_else(|| self.api_keys.first())
+    }
+
     pub fn uses_no_auth(&self) -> bool {
         self.relay_mode == RelayMode::PureApi && self.no_auth
     }
@@ -825,6 +845,9 @@ pub struct BackendSettings {
     pub relay_api_key: String,
     #[serde(rename = "relayProfiles", default = "default_relay_profiles")]
     pub relay_profiles: Vec<RelayProfile>,
+    /// 本机配置只自动导入一次，删除或重命名后不再补回。
+    #[serde(rename = "localConfigProviderImported", default)]
+    pub local_config_provider_imported: bool,
     #[serde(rename = "relayCommonConfigContents", default)]
     pub relay_common_config_contents: String,
     #[serde(rename = "relayContextConfigContents", default)]
@@ -924,6 +947,7 @@ impl Default for BackendSettings {
             relay_base_url: default_relay_base_url(),
             relay_api_key: String::new(),
             relay_profiles: default_relay_profiles(),
+            local_config_provider_imported: false,
             relay_common_config_contents: String::new(),
             relay_context_config_contents: String::new(),
             active_relay_id: default_active_relay_id(),
@@ -958,6 +982,8 @@ impl BackendSettings {
                     self.relay_base_url.clone()
                 },
                 api_key: self.relay_api_key.clone(),
+                api_keys: Vec::new(),
+                active_api_key_id: String::new(),
                 protocol: RelayProtocol::Responses,
                 relay_mode: RelayMode::MixedApi,
                 official_mix_api_key: true,
@@ -1020,6 +1046,8 @@ impl BackendSettings {
                 self.relay_base_url.clone()
             },
             api_key: self.relay_api_key.clone(),
+            api_keys: Vec::new(),
+            active_api_key_id: String::new(),
             protocol: RelayProtocol::Responses,
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,

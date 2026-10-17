@@ -175,6 +175,7 @@ import {
   normalizeAggregateDefaultRelayId,
 } from "./aggregate-members";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
+import { createRelayApiKey, normalizeRelayApiKeys, relayProfileWithNormalizedApiKeys, relayProfileWithUpdatedApiKey, type RelayApiKey } from "./provider-api-keys";
 import { relayHeadersValidationMessage, serializeRelayHeaders } from "./relay-headers";
 import { sessionProviderForProtocol } from "./relay-session";
 import { usePopoverLayer } from "./use-popover-layer";
@@ -317,6 +318,7 @@ type BackendSettings = WhaleBalanceSettings & {
   providerSyncManualProviders: string[];
   providerSyncLastSelectedProvider: string;
   relayProfilesEnabled: boolean;
+  localConfigProviderImported: boolean;
   enhancementsEnabled: boolean;
   codexAppStandaloneQuotaUnlock: boolean;
   codexAppPluginMarketplaceUnlock: boolean;
@@ -422,6 +424,8 @@ export type RelayProfile = {
   baseUrl: string;
   upstreamBaseUrl: string;
   apiKey: string;
+  apiKeys?: RelayApiKey[];
+  activeApiKeyId?: string;
   protocol: RelayProtocol;
   relayMode: RelayMode;
   sessionProvider?: RelaySessionProvider;
@@ -839,6 +843,17 @@ type TaskProgress = {
   active: boolean;
   percent: number;
   message: string;
+  indeterminate?: boolean;
+};
+
+type UpdateStage = "downloading" | "writing" | "launching";
+
+type UpdateProgressEvent = {
+  stage: UpdateStage;
+  downloadedBytes: number;
+  totalBytes: number | null;
+  percent: number | null;
+  elapsedMs: number;
 };
 
 type SessionIndexRepairReport = {
@@ -1116,6 +1131,7 @@ const defaultSettings: BackendSettings = {
   providerSyncManualProviders: [],
   providerSyncLastSelectedProvider: "",
   relayProfilesEnabled: true,
+  localConfigProviderImported: false,
   enhancementsEnabled: true,
   codexAppStandaloneQuotaUnlock: false,
   codexAppPluginMarketplaceUnlock: true,
@@ -2498,40 +2514,41 @@ export function App() {
         : null;
     setUpdateInstallProgress({
       active: true,
-      percent: 8,
-      message: t("正在准备安装包下载…"),
+      percent: 0,
+      indeterminate: true,
+      message: t("正在准备下载安装包…"),
     });
-    const startedAt = Date.now();
-    const progressTimer = window.setInterval(() => {
-      setUpdateInstallProgress((current) => {
-        if (!current.active) return current;
-        const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1000);
-        const nextPercent =
-          elapsedSeconds < 3
-            ? Math.min(24, current.percent + 4)
-            : elapsedSeconds < 15
-              ? Math.min(68, current.percent + 3)
-              : elapsedSeconds < 45
-                ? Math.min(86, current.percent + 1)
-                : Math.min(99, current.percent + 0.2);
-        const message =
-          elapsedSeconds < 3
-            ? t("正在获取 GitHub Release 信息…")
-            : elapsedSeconds < 15
-              ? t("正在下载安装包…")
-              : elapsedSeconds < 45
-                ? t("正在写入安装包…")
-                : t("下载或启动耗时较长，请保持窗口打开；完成或失败后会自动更新状态。");
-        return { ...current, percent: nextPercent, message };
-      });
-    }, 500);
+    const fallbackTimer = window.setTimeout(() => {
+      setUpdateInstallProgress((current) =>
+        current.active && current.indeterminate
+          ? { ...current, message: t("更新包仍在处理中，请保持窗口打开；完成后会自动更新状态。") }
+          : current,
+      );
+    }, 15_000);
+    let unlisten: (() => void) | null = null;
     try {
+      unlisten = await listen<UpdateProgressEvent>("update-progress", (event) => {
+        const progress = event.payload;
+        const message =
+          progress.stage === "downloading"
+            ? t("正在下载安装包…")
+            : progress.stage === "writing"
+              ? t("正在写入安装包并准备安装…")
+              : t("正在启动安装器…");
+        setUpdateInstallProgress({
+          active: true,
+          percent: progress.stage === "downloading" ? (progress.percent ?? 0) : 0,
+          indeterminate: progress.stage !== "downloading" || progress.percent == null,
+          message,
+        });
+      });
       const result = await run(() => call<UpdateResult>("perform_update", { release }));
       if (result) {
         setUpdate(result);
         setUpdateInstallProgress({
           active: false,
           percent: result.progress ?? 100,
+          indeterminate: false,
           message: result.message,
         });
         showNotice(t("更新安装"), result.message, result.status);
@@ -2539,11 +2556,13 @@ export function App() {
         setUpdateInstallProgress({
           active: false,
           percent: 100,
+          indeterminate: false,
           message: t("安装包更新失败，请查看错误提示后重试。"),
         });
       }
     } finally {
-      window.clearInterval(progressTimer);
+      window.clearTimeout(fallbackTimer);
+      unlisten?.();
     }
   };
 
@@ -4993,24 +5012,11 @@ function RelayScreen({
       setProviderView("routing");
     }
   }, [normalized.relayProfiles, providerView]);
-  // 分页过滤只作用于列表展示：活动归属与 legacy 根字段保持完整设置的值。
-  // 修复：过去对过滤后的列表跑 syncLegacyRelayFields，当前供应商不在本分页时
-  // activeRelayId 会被改写成列表第一项（假「使用中」）；卡片切换还会把这份缺成员
-  // 的子集直接提交后端——模型聚合因此报「成员不存在」，普通切换则可能用子集覆盖
-  // settings.json，丢掉其它分页的供应商。
-  const listForm: BackendSettings = { ...normalized, relayProfiles: visibleProfiles };
+  // 分页仅控制渲染。卡片的删除、复制和排序必须基于完整配置，避免隐藏的
+  // 当前供应商被 syncLegacyRelayFields 当成不存在，改写成直连列表第一项。
   const switchRelayProfileFromList = (profileId: string) => {
     const next = syncLegacyRelayFields({ ...normalized, activeRelayId: profileId });
     void actions.switchRelayProfile(next, normalized.activeRelayId);
-  };
-  const saveVisibleRelaySettings = async (next: BackendSettings) => {
-    const hiddenProfiles = normalized.relayProfiles.filter((profile) => (
-      relayProviderView(profile) !== providerView
-    ));
-    return saveRelaySettings(syncLegacyRelayFields({
-      ...next,
-      relayProfiles: [...next.relayProfiles, ...hiddenProfiles],
-    }));
   };
   const editRelayProfile = async (profileId: string) => {
     setNewProfileDraft(null);
@@ -5239,9 +5245,10 @@ function RelayScreen({
             </div>
           ) : null}
           <RelayProfileList
-            form={listForm}
+            form={normalized}
+            visibleProfiles={visibleProfiles}
             onEdit={(profileId) => void editRelayProfile(profileId)}
-            onFormChange={saveVisibleRelaySettings}
+            onFormChange={saveRelaySettings}
             onSwitchProfile={switchRelayProfileFromList}
             disabled={actions.relaySwitching}
             actions={actions}
@@ -8102,6 +8109,7 @@ function DiagnosticsPanel({ diagnostics, actions }: { diagnostics: DiagnosticsRe
 
 function RelayProfileList({
   form,
+  visibleProfiles = form.relayProfiles,
   onFormChange,
   onEdit,
   onSwitchProfile,
@@ -8109,6 +8117,7 @@ function RelayProfileList({
   actions,
 }: {
   form: BackendSettings;
+  visibleProfiles?: RelayProfile[];
   onFormChange: (value: BackendSettings) => void;
   onEdit: (id: string) => void;
   onSwitchProfile: (id: string) => void;
@@ -8131,9 +8140,9 @@ function RelayProfileList({
   };
   return (
     <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-      <SortableContext items={form.relayProfiles.map((profile) => profile.id)} strategy={verticalListSortingStrategy}>
+      <SortableContext items={visibleProfiles.map((profile) => profile.id)} strategy={verticalListSortingStrategy}>
         <div className="relay-profile-list">
-          {form.relayProfiles.map((profile, index) => (
+          {visibleProfiles.map((profile, index) => (
             <SortableRelayProfileCard
               actions={actions}
               form={form}
@@ -8288,6 +8297,11 @@ function SortableRelayProfileCard({
             disabled={form.relayProfiles.length <= 1}
             onClick={(event) => {
               event.stopPropagation();
+              const deleteIssue = relayProfileDeleteIssue(form, profile.id);
+              if (deleteIssue) {
+                void actions.showMessage(t("删除供应商"), deleteIssue, "failed");
+                return;
+              }
               onFormChange(removeRelayProfile(form, profile.id));
             }}
             size="icon"
@@ -8935,6 +8949,11 @@ function RelayProfileEditor({
   const updateDraft = (patch: Partial<RelayProfile>) => {
     onProfileChange(applyRelayProfilePatchToFiles(profile, patch, { allowGenerateFiles: isNew }));
   };
+  const normalizedApiKeys = normalizeRelayApiKeys(profile);
+  const updateApiKeys = (apiKeys: RelayApiKey[], activeApiKeyId = normalizedApiKeys.activeApiKeyId) => {
+    const selected = apiKeys.find((entry) => entry.id === activeApiKeyId) || apiKeys[0];
+    updateDraft({ apiKeys, activeApiKeyId: selected?.id || "", apiKey: selected?.apiKey || "" });
+  };
   const selectEditorMode = (mode: RelayEditorMode) => {
     if (mode === "official") {
       updateDraft({ relayMode: "official", officialMixApiKey: false });
@@ -9379,13 +9398,58 @@ function RelayProfileEditor({
                       placeholder={t("填写供应商的 Base URL")}
                     />
                   </Field>
-                  <Field className="relay-field-key" label="API Key">
-                    <Input
-                      type="password"
-                      value={profile.apiKey}
-                      onChange={(event) => updateDraft({ apiKey: event.currentTarget.value })}
-                      placeholder={t("输入供应商的 API Key")}
-                    />
+                  <Field className="relay-field-key" label="API Keys">
+                    <div className="relay-api-key-list">
+                      {normalizedApiKeys.apiKeys.map((entry) => {
+                        const active = entry.id === normalizedApiKeys.activeApiKeyId;
+                        return (
+                          <div className={`relay-api-key-row ${active ? "active" : ""}`} key={entry.id}>
+                            <button
+                              aria-label={t("设为当前 Key")}
+                              aria-pressed={active}
+                              className="relay-api-key-select"
+                              onClick={() => updateApiKeys(normalizedApiKeys.apiKeys, entry.id)}
+                              title={t("设为当前 Key")}
+                              type="button"
+                            >
+                              <CheckCircle2 className="h-4 w-4" />
+                            </button>
+                            <Input
+                              aria-label={t("Key 名称")}
+                              value={entry.name}
+                              onChange={(event) => updateApiKeys(normalizedApiKeys.apiKeys.map((key) =>
+                                key.id === entry.id ? { ...key, name: event.currentTarget.value } : key))}
+                            />
+                            <Input
+                              aria-label={tf("{0} 的 API Key", [entry.name])}
+                              type="password"
+                              value={entry.apiKey}
+                              onChange={(event) => updateApiKeys(normalizedApiKeys.apiKeys.map((key) =>
+                                key.id === entry.id ? { ...key, apiKey: event.currentTarget.value } : key))}
+                              placeholder={t("输入供应商的 API Key")}
+                            />
+                            <Button
+                              aria-label={t("删除 Key")}
+                              disabled={normalizedApiKeys.apiKeys.length === 1}
+                              onClick={() => updateApiKeys(normalizedApiKeys.apiKeys.filter((key) => key.id !== entry.id))}
+                              size="icon"
+                              title={t("删除 Key")}
+                              type="button"
+                              variant="ghost"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          </div>
+                        );
+                      })}
+                      <Button onClick={() => {
+                        const key = createRelayApiKey(normalizedApiKeys.apiKeys);
+                        updateApiKeys([...normalizedApiKeys.apiKeys, key]);
+                      }} size="sm" type="button" variant="secondary">
+                        <Plus className="h-4 w-4" />
+                        {t("添加 Key")}
+                      </Button>
+                    </div>
                   </Field>
                   <Field className="relay-field-protocol" label={t("上游协议")}>
                     <AppSelect
@@ -11132,7 +11196,7 @@ function RelayFileEditors({
             onProfileChange(deriveRelayProfileFromFiles({
               ...profile,
               configContents,
-            }));
+            }, "config"));
           }}
         />
       </RelayFold>
@@ -11193,7 +11257,7 @@ function RelayFileEditors({
         <SyncedTextarea
           className="relay-file-textarea"
           value={profile.authContents}
-          onValueChange={(value) => onProfileChange(deriveRelayProfileFromFiles({ ...profile, authContents: value }))}
+          onValueChange={(value) => onProfileChange(deriveRelayProfileFromFiles({ ...profile, authContents: value }, "auth"))}
         />
       </RelayFold>
     </div>
@@ -11655,16 +11719,20 @@ function TaskProgressBox({ progress, title, completedTitle = t("上次修复结�
     <div className="provider-sync-progress task-progress" data-active={progress.active}>
       <div className="provider-sync-progress-head">
         <strong>{progress.active ? title : completedTitle}</strong>
-        <span>{formatProgressPercent(progress.percent)}%</span>
+        <span>{progress.indeterminate ? null : `${formatProgressPercent(progress.percent)}%`}</span>
       </div>
       <div
         aria-valuemax={100}
         aria-valuemin={0}
-        aria-valuenow={progress.percent}
+        aria-valuenow={progress.indeterminate ? undefined : progress.percent}
         className="provider-sync-progress-bar"
+        data-indeterminate={progress.indeterminate ? "true" : undefined}
         role="progressbar"
       >
-        <div className="provider-sync-progress-fill" style={{ width: `${progress.percent}%` }} />
+        <div
+          className="provider-sync-progress-fill"
+          style={progress.indeterminate ? undefined : { width: `${progress.percent}%` }}
+        />
       </div>
       <small>{progress.message}</small>
     </div>
@@ -13550,7 +13618,9 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     anthropicImpersonateClaudeCode: profile.anthropicImpersonateClaudeCode === true,
     anthropicThinkingMode: normalizeAnthropicThinkingMode(profile.anthropicThinkingMode),
   };
-  return relayProfileUsesLiveFiles(normalized) ? deriveRelayProfileFromFiles(normalized) : normalized;
+  const derived = relayProfileUsesLiveFiles(normalized) ? deriveRelayProfileFromFiles(normalized) : normalized;
+  return derived.noAuth || (derived.relayMode === "official" && !derived.officialMixApiKey)
+    ? derived : relayProfileWithNormalizedApiKeys(derived);
 }
 
 function hydrateAggregateRelayProfile(profile: RelayProfile, aggregate: AggregateRelayProfile | undefined): RelayProfile {
@@ -13838,18 +13908,27 @@ function buildOfficialRelayAuthJson(contents: string): string {
   }
 }
 
-function deriveRelayProfileFromFiles(profile: RelayProfile): RelayProfile {
+function deriveRelayProfileFromFiles(profile: RelayProfile, editedFile?: "config" | "auth"): RelayProfile {
   if (isAggregateRelayProfile(profile)) {
     return normalizeAggregateRelayProfile(profile, null);
   }
+  if (editedFile === "auth") {
+    try {
+      JSON.parse(profile.authContents || "{}");
+    } catch {
+      return profile;
+    }
+  }
   let configContents = profile.configContents || "";
-  const authContents = profile.relayMode === "official" ? buildOfficialRelayAuthJson(profile.authContents || "") : profile.authContents || "";
+  let authContents = profile.relayMode === "official" ? buildOfficialRelayAuthJson(profile.authContents || "") : profile.authContents || "";
   const configBaseUrl = codexBaseUrlFromConfig(configContents);
   const chatUpstreamBaseUrl = rootTomlStringValue(configContents, CHAT_UPSTREAM_BASE_URL_KEY);
   const isProxyConfig = configBaseUrl === PROTOCOL_PROXY_BASE_URL;
   const upstreamBaseUrl = profile.upstreamBaseUrl || chatUpstreamBaseUrl || (configBaseUrl && !isProxyConfig ? configBaseUrl : profile.baseUrl || "");
   const configApiKey = codexExperimentalBearerTokenFromConfig(configContents);
-  const apiKey = profile.relayMode === "official"
+  const apiKey = editedFile === "config" ? configApiKey
+    : editedFile === "auth" && profile.relayMode === "pureApi" ? codexApiKeyFromAuth(authContents)
+    : profile.relayMode === "official"
     ? configApiKey || profile.apiKey || ""
     : codexApiKeyFromAuth(authContents) || configApiKey || "";
   if (profile.relayMode === "pureApi") {
@@ -13859,12 +13938,16 @@ function deriveRelayProfileFromFiles(profile: RelayProfile): RelayProfile {
       : apiKey && configContents.trim()
         ? setCodexExperimentalBearerToken(configContents, apiKey, { requiresOpenAiAuth: false })
         : configContents;
+    if (editedFile && !profile.noAuth) {
+      if (editedFile === "config") authContents = setAuthOpenAiApiKey(authContents, apiKey);
+      if (!apiKey) configContents = removeCodexExperimentalBearerToken(configContents);
+    }
   }
   const configModel = codexModelFromConfig(configContents);
   // 如果用户输入了带后缀的模型名，优先保留在界面的「配置模型」字段中；
   // config.toml 里实际写的是剥离后缀的 slug（由 applyRelayProfilePatchToFiles 处理）。
   const model = /\[.+\]$/.test(profile.model.trim()) ? profile.model.trim() : configModel;
-  return {
+  const derived = {
     ...profile,
     model,
     sessionProvider: relaySessionProviderFromConfig(configContents),
@@ -13876,6 +13959,7 @@ function deriveRelayProfileFromFiles(profile: RelayProfile): RelayProfile {
     configContents,
     authContents,
   };
+  return editedFile ? relayProfileWithUpdatedApiKey(derived, apiKey) : derived;
 }
 
 function applyRelayProfilePatchToFiles(
@@ -13916,6 +14000,7 @@ function applyRelayProfilePatchToFiles(
     next.configContents = setRootTomlStringKey(next.configContents, "model", slug);
   }
   if ("apiKey" in patch) {
+    next = relayProfileWithUpdatedApiKey(next, patch.apiKey || "");
     if (next.relayMode === "pureApi") {
       next.authContents = setAuthOpenAiApiKey(next.authContents, patch.apiKey || "");
       next.configContents = setCodexExperimentalBearerToken(next.configContents, patch.apiKey || "", { requiresOpenAiAuth: false });
@@ -14488,7 +14573,7 @@ function relaySettingsWithDraft(
 }
 
 function relayProfileUsesLiveFiles(profile: RelayProfile): boolean {
-  return profile.relayMode !== "official" || profile.officialMixApiKey;
+  return profile.relayMode !== "official" || profile.officialMixApiKey || !!profile.configContents.trim();
 }
 
 function authJsonHasOpenAiApiKey(contents: string): boolean {
@@ -14718,6 +14803,7 @@ function reorderRelayProfiles(settings: BackendSettings, sourceId: string, targe
 }
 
 function removeRelayProfile(settings: BackendSettings, id: string): BackendSettings {
+  if (relayProfileDeleteIssue(settings, id)) return settings;
   const profiles = settings.relayProfiles.filter((profile) => profile.id !== id);
   const scrubbedProfiles = profiles.map((profile) =>
     isAggregateRelayProfile(profile)
@@ -14746,6 +14832,30 @@ function removeRelayProfile(settings: BackendSettings, id: string): BackendSetti
     relayProfiles: scrubbedProfiles.length ? scrubbedProfiles : defaultSettings.relayProfiles,
     activeRelayId: settings.activeRelayId === id ? scrubbedProfiles[0]?.id || "default" : settings.activeRelayId,
   });
+}
+
+function relayProfileDeleteIssue(settings: BackendSettings, id: string): string | null {
+  if (settings.activeRelayId === id) {
+    return t("当前正在使用该供应商，请先切换到其他供应商后再删除。");
+  }
+  const existingProfileIds = new Set(settings.relayProfiles.map((profile) => profile.id));
+  for (const aggregateProfile of settings.relayProfiles.filter(isAggregateRelayProfile)) {
+    const aggregate = normalizeAggregateConfig(aggregateProfile.aggregate, [], existingProfileIds);
+    if (!aggregate.members.some((member) => member.profileId === id)) continue;
+    if (aggregate.defaultRelayId === id) {
+      return tf("供应商「{0}」是聚合配置「{1}」的默认成员，请先调整聚合配置后再删除。", [
+        settings.relayProfiles.find((profile) => profile.id === id)?.name || id,
+        aggregateProfile.name || aggregateProfile.id,
+      ]);
+    }
+    if (aggregate.members.length <= 1) {
+      return tf("供应商「{0}」是聚合配置「{1}」的最后成员，请先调整聚合配置后再删除。", [
+        settings.relayProfiles.find((profile) => profile.id === id)?.name || id,
+        aggregateProfile.name || aggregateProfile.id,
+      ]);
+    }
+  }
+  return null;
 }
 
 const aggregateStrategyOptions: Array<{ value: RelayAggregateStrategy; label: string; description: string }> = [

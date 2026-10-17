@@ -387,7 +387,7 @@
   const codexAppServerModelRequestPatchVersion = "24";
   const codexAppServerClientCaptureMarker = "AppServerRequestClient is missing a message dispatcher";
   const codexAppServerClientCaptureAnchor = "async sendRequest(";
-  const codexRemoteSessionRecoveryVersion = "5";
+  const codexRemoteSessionRecoveryVersion = "8";
   const codexPluginMarketplaceUnlockVersion = "17";
   const codexThreadScrollMaxEntries = 120;
   const codexThreadScrollSaveThrottleMs = 120;
