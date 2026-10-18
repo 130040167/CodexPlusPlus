@@ -8957,12 +8957,12 @@
     };
     const canonicalWanted = normalizedCodexThreadUuid(sessionId);
     const wanted = canonicalWanted ? canonicalWanted.toLowerCase() : sessionId || "";
-    const identities = (record) => [record?.conversationId, record?.threadId, record?.id].map(identity).filter(Boolean);
+    const identities = (record) => [record?.conversationId, record?.threadId, record?.id, record?.sessionId].map(identity).filter(Boolean);
     const collect = (record) => {
       if (!record || typeof record !== "object") return;
       const ownIds = identities(record);
       const matched = ownIds.some((candidate) => candidate.id === wanted);
-      const nested = [record.threadSummary, record.thread, record.target].filter((value) => value && typeof value === "object");
+      const nested = [record.threadSummary, record.thread, record.target, record.archivedThread].filter((value) => value && typeof value === "object");
       const allIds = [...ownIds, ...nested.flatMap(identities)];
       if (allIds.some((candidate) => candidate.id === wanted) && allIds.some((candidate) => candidate.id !== wanted)) {
         identityConflict = true;
@@ -8994,6 +8994,14 @@
     for (let depth = 0; fiber && depth < 16; depth += 1, fiber = fiber.return) {
       for (const props of [fiber.pendingProps, fiber.memoizedProps, fiber.pendingProps?.children?.props, fiber.memoizedProps?.children?.props]) {
         collect(props);
+        // 原生归档行的 key 为 local:<hostId>:<threadId>，thread 本身可能没有 hostId。
+        const archivedId = identity(props?.archivedThread?.id || props?.archivedThread?.sessionId);
+        if (archivedId?.id === wanted && typeof fiber.key === "string") {
+          const suffix = `:${props.archivedThread.id || props.archivedThread.sessionId}`;
+          if (fiber.key.startsWith("local:") && fiber.key.endsWith(suffix)) {
+            add(fiber.key.slice("local:".length, -suffix.length));
+          }
+        }
       }
     }
     const conflict = identityConflict || hosts.size > 1;
@@ -13646,6 +13654,8 @@
     },
   };
   const deletedLocalSessions = window.__codexPlusDeletedLocalSessions ||= { ids: new Set(), revision: 0 };
+  // 升级重注入时释放旧版本没有超时保护的布尔锁。
+  if (deletedLocalSessions.pending === true) deletedLocalSessions.pending = false;
 
   function applyDeletedLocalSessions() {
     let style = document.getElementById("codex-plus-deleted-local-style");
@@ -13656,8 +13666,10 @@
       style.textContent = '[data-codex-plus-deleted-local="true"] { display: none !important; }';
       (document.head || document.documentElement).appendChild(style);
     }
-    for (const row of sessionRows(true)) {
-      const ref = sessionRefFromRow(row);
+    const sidebarRows = sessionRows(true);
+    const archiveRows = new Set(typeof archivedPageRows === "function" ? archivedPageRows() : []);
+    for (const row of new Set([...sidebarRows, ...archiveRows])) {
+      const ref = archiveRows.has(row) ? archivedRefFromRow(row) : sessionRefFromRow(row);
       const hidden = ref.host_id === "local" && deletedLocalSessions.ids.has(ref.session_id);
       if (hidden) row.setAttribute("data-codex-plus-deleted-local", "true");
       else row.removeAttribute("data-codex-plus-deleted-local");
@@ -13667,15 +13679,21 @@
   async function refreshDeletedLocalSessions() {
     // 删除/撤销期间取得的旧快照不能覆盖新状态。
     if (deletedLocalSessions.pending) return;
-    deletedLocalSessions.pending = true;
+    const request = {};
+    deletedLocalSessions.pending = request;
     const revision = deletedLocalSessions.revision;
+    let timeout;
     try {
-      const result = await postJson("/sessions/deleted-local", {});
-      if (revision !== deletedLocalSessions.revision || result?.status !== "ok" || !Array.isArray(result.thread_ids)) return;
+      const result = await Promise.race([
+        postJson("/sessions/deleted-local", {}),
+        new Promise((resolve) => { timeout = setTimeout(() => resolve(null), 4000); }),
+      ]);
+      if (deletedLocalSessions.pending !== request || revision !== deletedLocalSessions.revision || result?.status !== "ok" || !Array.isArray(result.thread_ids)) return;
       deletedLocalSessions.ids = new Set(result.thread_ids.filter((id) => typeof id === "string"));
       applyDeletedLocalSessions();
     } catch {} finally {
-      deletedLocalSessions.pending = false;
+      clearTimeout(timeout);
+      if (deletedLocalSessions.pending === request) deletedLocalSessions.pending = false;
     }
   }
 
@@ -15592,9 +15610,9 @@
     let fiber = reactKey ? node[reactKey] : null;
     for (let depth = 0; fiber && depth < 20; depth += 1, fiber = fiber.return) {
       const props = fiber.memoizedProps || fiber.pendingProps || {};
-      if (props.archivedThread?.id) return props.archivedThread;
+      if (props.archivedThread?.id || props.archivedThread?.sessionId) return props.archivedThread;
       const childThread = props.children?.props?.archivedThread;
-      if (childThread?.id) return childThread;
+      if (childThread?.id || childThread?.sessionId) return childThread;
     }
     return null;
   }
@@ -15610,7 +15628,9 @@
   function archivedRefFromRow(row) {
     const archivedThread = archivedThreadFromRow(row);
     if (archivedThread?.id || archivedThread?.sessionId) {
-      return { session_id: archivedThread.id || archivedThread.sessionId, title: archivedThread.title || row.querySelector(".truncate.text-base")?.textContent?.trim() || "Untitled session" };
+      const id = archivedThread.id || archivedThread.sessionId;
+      const host = sessionHostEvidenceFromRow(row, id).hostId;
+      return { session_id: id, host_id: host, title: archivedThread.title || row.querySelector(".truncate.text-base")?.textContent?.trim() || "Untitled session" };
     }
     const sidebarRef = sessionRefFromRow(row);
     if (sidebarRef.session_id) return sidebarRef;

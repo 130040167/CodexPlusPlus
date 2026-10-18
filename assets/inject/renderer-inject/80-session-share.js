@@ -1,4 +1,6 @@
   const deletedLocalSessions = window.__codexPlusDeletedLocalSessions ||= { ids: new Set(), revision: 0 };
+  // 升级重注入时释放旧版本没有超时保护的布尔锁。
+  if (deletedLocalSessions.pending === true) deletedLocalSessions.pending = false;
 
   function applyDeletedLocalSessions() {
     let style = document.getElementById("codex-plus-deleted-local-style");
@@ -9,8 +11,10 @@
       style.textContent = '[data-codex-plus-deleted-local="true"] { display: none !important; }';
       (document.head || document.documentElement).appendChild(style);
     }
-    for (const row of sessionRows(true)) {
-      const ref = sessionRefFromRow(row);
+    const sidebarRows = sessionRows(true);
+    const archiveRows = new Set(typeof archivedPageRows === "function" ? archivedPageRows() : []);
+    for (const row of new Set([...sidebarRows, ...archiveRows])) {
+      const ref = archiveRows.has(row) ? archivedRefFromRow(row) : sessionRefFromRow(row);
       const hidden = ref.host_id === "local" && deletedLocalSessions.ids.has(ref.session_id);
       if (hidden) row.setAttribute("data-codex-plus-deleted-local", "true");
       else row.removeAttribute("data-codex-plus-deleted-local");
@@ -20,15 +24,21 @@
   async function refreshDeletedLocalSessions() {
     // 删除/撤销期间取得的旧快照不能覆盖新状态。
     if (deletedLocalSessions.pending) return;
-    deletedLocalSessions.pending = true;
+    const request = {};
+    deletedLocalSessions.pending = request;
     const revision = deletedLocalSessions.revision;
+    let timeout;
     try {
-      const result = await postJson("/sessions/deleted-local", {});
-      if (revision !== deletedLocalSessions.revision || result?.status !== "ok" || !Array.isArray(result.thread_ids)) return;
+      const result = await Promise.race([
+        postJson("/sessions/deleted-local", {}),
+        new Promise((resolve) => { timeout = setTimeout(() => resolve(null), 4000); }),
+      ]);
+      if (deletedLocalSessions.pending !== request || revision !== deletedLocalSessions.revision || result?.status !== "ok" || !Array.isArray(result.thread_ids)) return;
       deletedLocalSessions.ids = new Set(result.thread_ids.filter((id) => typeof id === "string"));
       applyDeletedLocalSessions();
     } catch {} finally {
-      deletedLocalSessions.pending = false;
+      clearTimeout(timeout);
+      if (deletedLocalSessions.pending === request) deletedLocalSessions.pending = false;
     }
   }
 

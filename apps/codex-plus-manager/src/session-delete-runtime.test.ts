@@ -6,6 +6,7 @@ import vm from "node:vm";
 const shard = (name: string) => readFileSync(new URL(`../../../assets/inject/renderer-inject/${name}`, import.meta.url), "utf8");
 const refs = shard("60-plugin-marketplace.js");
 const deletion = shard("80-session-share.js");
+const actions = shard("90-action-groups.js");
 const refHelpers = refs.slice(refs.indexOf("  function isClientNewThreadId(value)"), refs.indexOf("  if (window.__CODEX_PLUS_TEST_SESSION_REF__)"));
 const singleFunction = (source: string, name: string) => source.match(new RegExp(`^  (?:async )?function ${name}\\([^]*?^  \\}`, "m"))?.[0] ?? "";
 const uuid = "11111111-1111-4111-8111-111111111111";
@@ -25,6 +26,7 @@ class Element {
   setAttribute(key: string, value: string) { this.attributes.set(key, value); }
   removeAttribute(key: string) { this.attributes.delete(key); }
   querySelector() { return null; }
+  querySelectorAll() { return []; }
   get isConnected() { return !this.removed; }
   closest(selector: string): Element | null {
     if (selector.includes("data-codex-plus-ext") && this.getAttribute("data-codex-plus-ext")) return this;
@@ -49,6 +51,46 @@ function refFixture() {
   vm.runInContext(refHelpers, context);
   return (element: Element) => JSON.parse(JSON.stringify(context.sessionRefFromRow(element)));
 }
+
+test("native archive rows resolve paired hosts and regain visibility after undo or reuse", async () => {
+  const archiveRows: Element[] = [];
+  const context = vm.createContext({
+    window: {}, selectors: { threadTitle: ".title" },
+    document: { getElementById: () => ({}), querySelectorAll: () => [] },
+    sessionRows: () => [], archivedPageRows: () => archiveRows,
+    setTimeout, clearTimeout,
+    postJson: async () => ({ status: "ok", thread_ids: [uuid] }),
+  });
+  vm.runInContext(`${refHelpers}\n${["reactArchivedThreadFromNode", "archivedThreadFromRow", "archivedRefFromRow"].map((name) => singleFunction(actions, name)).join("\n")}\n${deletion.slice(0, deletion.indexOf("  function normalizeWorkspacePath("))}`, context);
+  for (const hostId of ["local", "ssh:fixture", undefined]) {
+    const element = new Element();
+    element.__reactFiber$fixture = { memoizedProps: { archivedThread: { id: uuid, hostId } }, return: null };
+    archiveRows.push(element);
+  }
+  const legacy = new Element();
+  legacy.__reactFiber$fixture = { memoizedProps: { children: { props: { archivedThread: { sessionId: uuid, hostId: "local" } } } }, return: null };
+  archiveRows.push(legacy);
+  const keyedLocal = new Element(), keyedRemote = new Element();
+  for (const [element, host] of [[keyedLocal, "local"], [keyedRemote, "ssh:fixture"]] as const) {
+    element.__reactFiber$fixture = { key: `local:${host}:${uuid}`, memoizedProps: { archivedThread: { id: uuid } }, return: null };
+    archiveRows.push(element);
+  }
+  const conflicting = row(uuid, "ssh:fixture", { archivedThread: { id: uuid, hostId: "local" } });
+  archiveRows.push(conflicting);
+  await context.refreshDeletedLocalSessions();
+  assert.equal(archiveRows[0].getAttribute("data-codex-plus-deleted-local"), "true");
+  assert.equal(legacy.getAttribute("data-codex-plus-deleted-local"), "true");
+  assert.equal(keyedLocal.getAttribute("data-codex-plus-deleted-local"), "true");
+  for (const element of [archiveRows[1], archiveRows[2], keyedRemote, conflicting]) {
+    assert.equal(element.getAttribute("data-codex-plus-deleted-local"), null);
+  }
+  archiveRows[0].__reactFiber$fixture.memoizedProps.archivedThread.id = otherUuid;
+  context.applyDeletedLocalSessions();
+  assert.equal(archiveRows[0].getAttribute("data-codex-plus-deleted-local"), null);
+  context.postJson = async () => ({ status: "ok", thread_ids: [] });
+  await context.refreshDeletedLocalSessions();
+  assert.equal(legacy.getAttribute("data-codex-plus-deleted-local"), null);
+});
 
 // 26.930 静态原生合同：sidebarThreadRow({id,hostId,active})；kDo 的
 // {conversationId,hostId,threadSummary} 以 hostId ?? threadSummary?.hostId 配对；
@@ -125,6 +167,7 @@ function deleteFixture() {
     showToast: (text: string) => { toasts.push(text); },
     sendCodexPlusDiagnostic: (event: string, details: any) => { diagnostics.push({ event, details }); },
     setTimeout: (_fn: Function, delay: number) => { timers.push(delay); return 1; },
+    clearTimeout() {},
     rpc: { sendRequest: (method: string, params: any) => { refreshes.push({ method, params }); return Promise.resolve({}); } },
   });
   vm.runInContext(`${deletion.slice(0, deletion.indexOf("  function normalizeWorkspacePath("))}\n${refHelpers}\n${singleFunction(refs, "locationThreadId")}\n${singleFunction(refs, "currentSessionRef")}\n${deletion.slice(deletion.indexOf("  function rowHref(row)"), deletion.indexOf("  async function exportMarkdown(ref)"))}\n${singleFunction(deletion, "refreshRecentConversationsForHost")}\nfunction signal(e,t){return rpc.sendRequest(e,t)}; loadOptionalCodexAppModule=async()=>({signal});`, context);
