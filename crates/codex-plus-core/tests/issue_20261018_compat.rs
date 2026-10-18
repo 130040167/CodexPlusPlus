@@ -233,7 +233,7 @@ fn mcp_path_inspection_only_suggests_verified_cli_files_and_preserves_configurat
     let cli = temp.path().join("codex.exe");
     std::fs::write(&cli, b"fixture is deliberately not an executable").unwrap();
     let mut form = McpServerForm {
-        command: r"C:\Program Files\WindowsApps\OpenAI.Codex_26.1007_x64__publisher\app\resources\codex.exe".into(),
+        command: r"C:\Program Files\WindowsApps\OpenAI.Codex_26.1007_x64__2p2nqsd0c76g0\app\resources\codex.exe".into(),
         args: vec!["mcp-server".into()],
         extra_toml: "custom = 'kept'\n".into(),
         ..Default::default()
@@ -243,6 +243,26 @@ fn mcp_path_inspection_only_suggests_verified_cli_files_and_preserves_configurat
     assert_eq!(result.code, "replacement_available");
     assert_eq!(result.replacement_command.as_deref(), cli.to_str());
     assert_eq!(form, original);
+    for unknown in [
+        original
+            .command
+            .replace("OpenAI.Codex_", "OtherPublisher.Codex_"),
+        original.command.replace("2p2nqsd0c76g0", "otherpublisher"),
+        original.command.replace(
+            r"app\resources\codex.exe",
+            r"app\resources\..\other\codex.exe",
+        ),
+    ] {
+        let untrusted = McpServerForm {
+            command: unknown,
+            ..original.clone()
+        };
+        assert!(
+            inspect_mcp_startup(&untrusted, Some(&cli))
+                .replacement_command
+                .is_none()
+        );
+    }
     assert_eq!(
         std::fs::read(&cli).unwrap(),
         b"fixture is deliberately not an executable"

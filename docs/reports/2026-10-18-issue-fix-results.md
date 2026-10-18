@@ -31,9 +31,9 @@
 
 #2583 新增“检查启动路径”，后台执行且有三秒响应时限。检查不启动命令、不写配置、不重启服务器。
 
-已知 WindowsApps Codex CLI 且使用 `mcp-server` 时，可从桌面版当前维护的 CLI 找到替代文件，用户可将其放入草稿后自行保存。普通 PATH 命令、未知包运行时和无参数的 `ChatGPT.exe` 明确区分，不只替换版本号。
+仅当 WindowsApps 路径匹配已知官方包名、publisher 和固定 CLI 布局，且使用 `mcp-server` 时，可从桌面版当前维护的 CLI 找到替代文件，用户可将其放入草稿后自行保存。普通 PATH 命令、未知包运行时和无参数的 `ChatGPT.exe` 明确区分，不只替换版本号。
 
-原报告 `cua_repl / stdio / ChatGPT.exe / 无 args` 仍缺真实插件运行时清单，不能据此自动生成 Node/worker/环境映射。文件存在也不代表 MCP 握手或工具就绪；完整 CUA 入口恢复仍需提供相应清单的脱敏结构。
+原报告 `cua_repl / stdio / ChatGPT.exe / 无 args` 仍缺真实插件运行时清单，不能据此自动生成 Node/worker/环境映射。其他 publisher、同名程序和逃逸布局不会被识别为可替换的 CLI。文件存在也不代表 MCP 握手或工具就绪；完整 CUA 入口恢复仍需提供相应清单的脱敏结构。
 
 ## 默认行为与设置安全
 
