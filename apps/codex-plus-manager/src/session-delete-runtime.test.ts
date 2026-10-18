@@ -23,6 +23,7 @@ class Element {
   constructor(attributes: Record<string, string> = {}) { for (const [key, value] of Object.entries(attributes)) this.attributes.set(key, value); }
   getAttribute(key: string) { return this.attributes.get(key) ?? null; }
   setAttribute(key: string, value: string) { this.attributes.set(key, value); }
+  removeAttribute(key: string) { this.attributes.delete(key); }
   querySelector() { return null; }
   get isConnected() { return !this.removed; }
   closest(selector: string): Element | null {
@@ -108,8 +109,14 @@ function deleteFixture() {
     rows.forEach((element) => element.setAttribute("data-app-action-sidebar-thread-active", String(element.getAttribute("data-app-action-sidebar-thread-id") === id)));
   };
   activate(uuid);
+  const styles = new Map<string, any>();
   const context = vm.createContext({ Element, HTMLElement: Element, URL, window: { location },
-    document: { activeElement: null, querySelectorAll: () => buttons }, selectors: { threadTitle: ".title" },
+    document: {
+      activeElement: null, querySelectorAll: () => buttons,
+      getElementById: (id: string) => styles.get(id),
+      createElement: () => new Element(),
+      head: { appendChild: (node: any) => styles.set(node.id, node) },
+    }, selectors: { threadTitle: ".title" },
     sessionRows: () => rows.filter((element) => element.isConnected),
     visibleElement: (element: Element) => element.visible && element.isConnected,
     isExtensionUiNode: (element: Element) => !!element.getAttribute("data-codex-plus-ext"),
@@ -120,7 +127,7 @@ function deleteFixture() {
     setTimeout: (_fn: Function, delay: number) => { timers.push(delay); return 1; },
     rpc: { sendRequest: (method: string, params: any) => { refreshes.push({ method, params }); return Promise.resolve({}); } },
   });
-  vm.runInContext(`${refHelpers}\n${singleFunction(refs, "locationThreadId")}\n${singleFunction(refs, "currentSessionRef")}\n${deletion.slice(deletion.indexOf("  function rowHref(row)"), deletion.indexOf("  async function exportMarkdown(ref)"))}\n${singleFunction(deletion, "refreshRecentConversationsForHost")}\nfunction signal(e,t){return rpc.sendRequest(e,t)}; loadOptionalCodexAppModule=async()=>({signal});`, context);
+  vm.runInContext(`${deletion.slice(0, deletion.indexOf("  function normalizeWorkspacePath("))}\n${refHelpers}\n${singleFunction(refs, "locationThreadId")}\n${singleFunction(refs, "currentSessionRef")}\n${deletion.slice(deletion.indexOf("  function rowHref(row)"), deletion.indexOf("  async function exportMarkdown(ref)"))}\n${singleFunction(deletion, "refreshRecentConversationsForHost")}\nfunction signal(e,t){return rpc.sendRequest(e,t)}; loadOptionalCodexAppModule=async()=>({signal});`, context);
   const begin = async (element = rows[0]) => { context.openDeleteConfirmForRow(element, button, context.sessionRefFromRow(element), { preventDefault() {}, stopPropagation() {}, stopImmediatePropagation() {} }); await flush(); };
   const finish = async (result = { status: "local_deleted", session_id: requests[0]?.session_id, message: "deleted" }) => { request.resolve(result); await flush(); };
   return { context, rows, native, buttons, requests, confirmations, diagnostics, timers, toasts, refreshes, begin, finish, activate, setLocation, reloads: () => reloads };
@@ -133,6 +140,47 @@ test("local current deletion uses native navigation and refresh without a page r
   assert.equal(f.refreshes.length, 1);
   assert.equal(f.timers.length, 0);
   assert.equal(f.reloads(), 0);
+});
+
+test("durable deletion survives row replacement and only hides the local host", async () => {
+  const f = deleteFixture();
+  f.context.postJson = async () => ({ status: "ok", thread_ids: [uuid] });
+  await f.context.refreshDeletedLocalSessions();
+  assert.equal(f.rows[0].getAttribute("data-codex-plus-deleted-local"), "true");
+  f.rows[0] = row(uuid, "local");
+  f.context.applyDeletedLocalSessions();
+  assert.equal(f.rows[0].getAttribute("data-codex-plus-deleted-local"), "true");
+  f.rows[0].setAttribute("data-app-action-sidebar-thread-host-id", "ssh:fixture");
+  f.context.applyDeletedLocalSessions();
+  assert.equal(f.rows[0].getAttribute("data-codex-plus-deleted-local"), null);
+  f.rows[0].setAttribute("data-app-action-sidebar-thread-host-id", "local");
+  f.rows[0].setAttribute("data-app-action-sidebar-thread-id", otherUuid);
+  f.context.applyDeletedLocalSessions();
+  assert.equal(f.rows[0].getAttribute("data-codex-plus-deleted-local"), null);
+});
+
+test("late deletion snapshots cannot hide a restored conversation", async () => {
+  const f = deleteFixture(), snapshot = deferred<any>();
+  f.context.postJson = () => snapshot.promise;
+  const pending = f.context.refreshDeletedLocalSessions();
+  vm.runInContext("deletedLocalSessions.revision++; deletedLocalSessions.ids.delete(" + JSON.stringify(uuid) + ");", f.context);
+  snapshot.resolve({ status: "ok", thread_ids: [uuid] });
+  await pending;
+  f.context.applyDeletedLocalSessions();
+  assert.equal(f.rows[0].getAttribute("data-codex-plus-deleted-local"), null);
+});
+
+test("unavailable deletion snapshots preserve known markers until confirmed undo", async () => {
+  const f = deleteFixture();
+  await f.begin(); await f.finish();
+  f.rows[0] = row(uuid, "local");
+  f.context.postJson = async () => ({ status: "failed" });
+  await f.context.refreshDeletedLocalSessions();
+  f.context.applyDeletedLocalSessions();
+  assert.equal(f.rows[0].getAttribute("data-codex-plus-deleted-local"), "true");
+  f.context.postJson = async () => ({ status: "ok", thread_ids: [] });
+  await f.context.refreshDeletedLocalSessions();
+  assert.equal(f.rows[0].getAttribute("data-codex-plus-deleted-local"), null);
 });
 
 test("async deletion cannot navigate away from a conversation selected in the meantime", async () => {

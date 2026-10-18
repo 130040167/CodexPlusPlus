@@ -245,6 +245,33 @@ fn archived_dependency_and_unrelated_fork_are_handled_by_history_base() {
 }
 
 #[test]
+fn repeated_delete_repairs_native_reappearance_and_preserves_original_undo() {
+    let f = Fixture::new();
+    f.add("a", None);
+    f.add("b", Some("a"));
+    let token = f.delete("a");
+    let original = fs::read(f.path("a")).unwrap();
+    let db = Connection::open(&f.db).unwrap();
+    db.execute("UPDATE threads SET archived=0 WHERE id='a'", []).unwrap();
+    fs::write(f.home().join("session_index.jsonl"), "{\"id\":\"a\",\"thread_name\":\"A\",\"updated_at\":\"2026-10-19T00:00:00Z\"}\n").unwrap();
+    assert_eq!(codex_plus_data::storage::deleted_local_thread_ids(&[f.db.clone()]).unwrap(), vec!["a"]);
+    let result = delete_local_from_paths(
+        [f.db.clone()],
+        BackupStore::new(f.home().join("backups")),
+        &SessionRef::new("a", "a").unwrap(),
+        Some(f.home()),
+    );
+    assert_eq!(result.status, DeleteStatus::LocalDeleted, "{}", result.message);
+    assert_eq!(result.undo_token.as_deref(), Some(token.as_str()));
+    assert_eq!(db.query_row("SELECT archived FROM threads WHERE id='a'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    assert!(!fs::read_to_string(f.home().join("session_index.jsonl")).unwrap().contains("\"a\""));
+    assert_eq!(fs::read(f.path("a")).unwrap(), original);
+    f.undo(&token);
+    assert!(f.visible("a"));
+    assert!(codex_plus_data::storage::deleted_local_thread_ids(&[f.db.clone()]).unwrap().is_empty());
+}
+
+#[test]
 fn stale_undo_and_changed_history_are_rejected() {
     let f = Fixture::new();
     f.add("a", None);
@@ -439,6 +466,7 @@ fn partial_database_delete_keeps_live_duplicate_and_its_history() {
         f.path("a").exists(),
         "undeleted duplicate still owns rollout"
     );
+    assert!(codex_plus_data::storage::deleted_local_thread_ids(&[f.db.clone(), other.clone()]).unwrap().is_empty());
     Connection::open(&other)
         .unwrap()
         .execute_batch("DROP TRIGGER reject_delete")

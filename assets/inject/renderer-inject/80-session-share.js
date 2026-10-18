@@ -1,3 +1,37 @@
+  const deletedLocalSessions = window.__codexPlusDeletedLocalSessions ||= { ids: new Set(), revision: 0 };
+
+  function applyDeletedLocalSessions() {
+    let style = document.getElementById("codex-plus-deleted-local-style");
+    if (!style) {
+      style = document.createElement("style");
+      style.id = "codex-plus-deleted-local-style";
+      style.setAttribute("data-codex-plus-ext", "deleted-local");
+      style.textContent = '[data-codex-plus-deleted-local="true"] { display: none !important; }';
+      (document.head || document.documentElement).appendChild(style);
+    }
+    for (const row of sessionRows(true)) {
+      const ref = sessionRefFromRow(row);
+      const hidden = ref.host_id === "local" && deletedLocalSessions.ids.has(ref.session_id);
+      if (hidden) row.setAttribute("data-codex-plus-deleted-local", "true");
+      else row.removeAttribute("data-codex-plus-deleted-local");
+    }
+  }
+
+  async function refreshDeletedLocalSessions() {
+    // 删除/撤销期间取得的旧快照不能覆盖新状态。
+    if (deletedLocalSessions.pending) return;
+    deletedLocalSessions.pending = true;
+    const revision = deletedLocalSessions.revision;
+    try {
+      const result = await postJson("/sessions/deleted-local", {});
+      if (revision !== deletedLocalSessions.revision || result?.status !== "ok" || !Array.isArray(result.thread_ids)) return;
+      deletedLocalSessions.ids = new Set(result.thread_ids.filter((id) => typeof id === "string"));
+      applyDeletedLocalSessions();
+    } catch {} finally {
+      deletedLocalSessions.pending = false;
+    }
+  }
+
   function normalizeWorkspacePath(path) {
     const normalized = String(path || "").trim().replace(/\\/g, "/").replace(/\/+$/, "");
     return normalized || String(path || "").trim();
@@ -105,6 +139,10 @@
         const result = await postJson("/undo", { undo_token: undoToken });
         toast.textContent = result.message || "撤销完成";
         if (result.status === "undone") {
+          deletedLocalSessions.revision++;
+          if (result.session_id) deletedLocalSessions.ids.delete(result.session_id);
+          await refreshDeletedLocalSessions();
+          applyDeletedLocalSessions();
           const refreshed = await refreshRecentConversationsForHost();
           if (!refreshed) window.location.reload();
         }
@@ -569,7 +607,10 @@
         // 远端由原生同主机 thread/deleted 通知更新，不能移除可能已重用的本地 DOM。
         let navigationNotice = null;
         if (ref.host_id === "local") {
+          deletedLocalSessions.revision++;
+          deletedLocalSessions.ids.add(ref.session_id);
           navigationNotice = removeDeletedRow(row, button, ref, requestContext);
+          applyDeletedLocalSessions();
           await refreshRecentConversationsForHost();
         }
         showToast(navigationNotice || result.message || "删除成功", result.undo_token);

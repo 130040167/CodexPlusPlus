@@ -21,6 +21,34 @@ pub fn collect_deleted_history(home: &Path) -> anyhow::Result<usize> {
     history_retention::collect_deleted_history(home)
 }
 
+/// 原生列表不认识删除标记；供内置侧边栏按本地主机身份过滤保留的历史。
+pub fn deleted_local_thread_ids(paths: &[PathBuf]) -> anyhow::Result<Vec<String>> {
+    let mut ids = std::collections::BTreeSet::new();
+    let mut live = HashSet::new();
+    for path in paths.iter().filter(|path| path.is_file()) {
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let has_deleted = has_table(&db, "codex_plus_deleted_threads")?;
+        if has_deleted {
+            let mut stmt = db.prepare("SELECT thread_id FROM codex_plus_deleted_threads")?;
+            for id in stmt.query_map([], |row| row.get::<_, String>(0))? {
+                ids.insert(id?);
+            }
+        }
+        if has_table(&db, "threads")? {
+            let query = if has_deleted {
+                "SELECT id FROM threads WHERE NOT EXISTS (SELECT 1 FROM codex_plus_deleted_threads d WHERE d.thread_id=threads.id)"
+            } else {
+                "SELECT id FROM threads"
+            };
+            let mut stmt = db.prepare(query)?;
+            for id in stmt.query_map([], |row| row.get::<_, String>(0))? {
+                live.insert(id?);
+            }
+        }
+    }
+    Ok(ids.into_iter().filter(|id| !live.contains(id)).collect())
+}
+
 pub fn delete_local_from_paths(
     db_paths: impl IntoIterator<Item = PathBuf>,
     backup_store: BackupStore,
@@ -738,10 +766,18 @@ impl SQLiteStorageAdapter {
             ));
         }
         if HistoryRetention::is_deleted(db, &thread_id)? {
-            return Ok(failed(
-                &thread_id,
-                "此会话已删除，引用中的历史仍被保留".to_string(),
-            ));
+            let token: String = db.query_row(
+                "SELECT backup_token FROM codex_plus_deleted_threads WHERE thread_id=?1",
+                [&thread_id],
+                |row| row.get(0),
+            )?;
+            if has_columns(db, "threads", &["archived"])? {
+                db.execute("UPDATE threads SET archived=1 WHERE id=?1", [&thread_id])?;
+            }
+            let backup_path = self.backup_store.path_for(&token);
+            let mut result = local_deleted(&thread_id, &token, &backup_path);
+            result.message = "此会话已从列表删除；引用中的历史仍被保留".to_string();
+            return Ok(result);
         }
         let mut tables = Map::new();
         tables.insert("threads".to_string(), Value::Array(thread_rows));
