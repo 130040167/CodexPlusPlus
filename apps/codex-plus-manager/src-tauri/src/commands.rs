@@ -5469,6 +5469,25 @@ pub fn set_user_scripts_enabled(enabled: bool) -> CommandResult<SettingsPayload>
 }
 
 #[tauri::command]
+pub fn set_user_scripts_skip_next_start(skip: bool) -> CommandResult<SettingsPayload> {
+    let manager = default_user_script_manager();
+    match manager.set_skip_next_start(skip) {
+        Ok(_) => settings_payload(
+            if skip {
+                "下次启动将跳过本地拓展。"
+            } else {
+                "已取消下次启动跳过本地拓展。"
+            },
+            "设置下次启动安全模式失败",
+        ),
+        Err(error) => failed(
+            &format!("设置下次启动安全模式失败：{error}"),
+            fallback_settings_payload(),
+        ),
+    }
+}
+
+#[tauri::command]
 pub fn set_user_script_enabled(key: String, enabled: bool) -> CommandResult<SettingsPayload> {
     let trimmed = key.trim();
     if trimmed.is_empty() {

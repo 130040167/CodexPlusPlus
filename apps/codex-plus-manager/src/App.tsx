@@ -557,6 +557,7 @@ const emptyContextSelection = (): RelayContextSelection => ({
 
 type UserScriptInventory = {
   enabled?: boolean;
+  skip_next_start?: boolean;
   scripts?: Array<{
     key: string;
     name: string;
@@ -1537,6 +1538,14 @@ export function App() {
     setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
     showResultNotice(t("本地拓展"), result);
     if (isSuccessStatus(result.status)) await reloadUserScripts();
+  };
+
+  const setUserScriptsSkipNextStart = async (skip: boolean) => {
+    const result = await run(() => call<SettingsResult>("set_user_scripts_skip_next_start", { skip }));
+    if (!result) return;
+    setSettings(result);
+    setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
+    showResultNotice(t("本地拓展"), result);
   };
 
   const setUserScriptEnabled = async (key: string, enabled: boolean) => {
@@ -3716,6 +3725,7 @@ export function App() {
       reloadUserScripts,
       installMarketScript,
       setUserScriptsEnabled,
+      setUserScriptsSkipNextStart,
       setUserScriptEnabled,
       deleteUserScript,
       refreshLocalSessions,
@@ -4282,6 +4292,7 @@ type Actions = {
   reloadUserScripts: () => Promise<void>;
   installMarketScript: (id: string) => Promise<void>;
   setUserScriptsEnabled: (enabled: boolean) => Promise<void>;
+  setUserScriptsSkipNextStart: (skip: boolean) => Promise<void>;
   setUserScriptEnabled: (key: string, enabled: boolean) => Promise<void>;
   deleteUserScript: (key: string) => Promise<void>;
   refreshLocalSessions: (silent?: boolean, offset?: number) => Promise<LocalSessionsResult | null>;
@@ -7294,6 +7305,14 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
               title={t("整体开关不改变单个拓展的启停设置")}
             >
               {inventory?.enabled === false ? t("开启本地拓展") : t("关闭本地拓展")}
+            </Button>
+            <Button
+              onClick={() => void actions.setUserScriptsSkipNextStart(!inventory?.skip_next_start)}
+              disabled={!inventory}
+              variant={inventory?.skip_next_start ? "secondary" : "outline"}
+              title={t("脚本导致黑屏或卡死时，下一次启动先跳过脚本；脚本启停设置不会改变")}
+            >
+              {inventory?.skip_next_start ? t("取消下次启动安全模式") : t("下次启动跳过拓展")}
             </Button>
             <Button onClick={() => void actions.refreshScriptMarket()}>
               <RefreshCw className="h-4 w-4" />

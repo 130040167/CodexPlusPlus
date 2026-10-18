@@ -189,6 +189,7 @@ pub fn run() {
             commands::reload_user_scripts,
             commands::install_market_script,
             commands::set_user_scripts_enabled,
+            commands::set_user_scripts_skip_next_start,
             commands::set_user_script_enabled,
             commands::delete_user_script,
             commands::refresh_skill_catalog,
