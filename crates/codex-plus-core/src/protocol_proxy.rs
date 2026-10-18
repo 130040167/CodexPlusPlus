@@ -573,6 +573,123 @@ pub fn responses_to_chat_completions_with_options(
     Ok(result)
 }
 
+fn prompt_prefix_stabilizer_enabled(relay: &crate::settings::RelayProfile) -> bool {
+    let suffix = relay
+        .id
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_uppercase() } else { '_' })
+        .collect::<String>();
+    matches!(
+        std::env::var(format!("CODEX_PLUS_STABILIZE_PROMPT_PREFIX_{suffix}"))
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+fn strip_complete_image_resize_notice(text: &str) -> String {
+    const OPEN: &str = "<image_resize_notice>";
+    const CLOSE: &str = "</image_resize_notice>";
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(open_offset) = text[cursor..].find(OPEN) {
+        let open = cursor + open_offset;
+        output.push_str(&text[cursor..open]);
+        let content_start = open + OPEN.len();
+        let Some(close_offset) = text[content_start..].find(CLOSE) else {
+            output.push_str(&text[open..]);
+            return output;
+        };
+        cursor = content_start + close_offset + CLOSE.len();
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn rewrite_prompt_prefix_value(value: &mut Value) {
+    match value {
+        Value::String(text) => *text = strip_complete_image_resize_notice(text),
+        Value::Array(values) => values.iter_mut().for_each(rewrite_prompt_prefix_value),
+        Value::Object(object) => object.values_mut().for_each(rewrite_prompt_prefix_value),
+        _ => {}
+    }
+}
+
+fn canonicalize_system_text(text: &str) -> String {
+    let mut ordinary = String::new();
+    let mut blocks = Vec::<(String, String)>::new();
+    let mut cursor = 0;
+    while let Some(open_offset) = text[cursor..].find('<') {
+        let open = cursor + open_offset;
+        let Some(name_end) = text[open + 1..].find('>') else {
+            ordinary.push_str(&text[cursor..]);
+            cursor = text.len();
+            break;
+        };
+        let name_end = open + 1 + name_end;
+        let name = &text[open + 1..name_end];
+        if name.is_empty()
+            || !name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        {
+            ordinary.push_str(&text[cursor..open + 1]);
+            cursor = open + 1;
+            continue;
+        }
+        let close = format!("</{name}>");
+        let content_start = name_end + 1;
+        let Some(close_offset) = text[content_start..].find(&close) else {
+            ordinary.push_str(&text[cursor..]);
+            cursor = text.len();
+            break;
+        };
+        let end = content_start + close_offset + close.len();
+        ordinary.push_str(&text[cursor..open]);
+        blocks.push((name.to_string(), text[open..end].to_string()));
+        cursor = end;
+    }
+    if cursor >= text.len() && blocks.is_empty() {
+        return text.to_string();
+    }
+    if cursor < text.len() {
+        ordinary.push_str(&text[cursor..]);
+    }
+    blocks.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut output = ordinary.trim().to_string();
+    for (_, block) in blocks {
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
+        output.push_str(&block);
+    }
+    output
+}
+
+fn stabilize_chat_prompt_prefix(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages.iter_mut() {
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+        if matches!(role, "system" | "user" | "developer" | "tool") {
+            if let Some(content) = message.get_mut("content") {
+                rewrite_prompt_prefix_value(content);
+            }
+        }
+    }
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(Value::as_str) == Some("system") {
+            let content = message
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let Some(content) = content {
+                *message.get_mut("content").unwrap() = json!(canonicalize_system_text(&content));
+            }
+        }
+    }
+}
+
 pub fn chat_completion_to_response(body: Value) -> anyhow::Result<Value> {
     chat_completion_to_response_with_context(body, &CodexToolContext::default(), None)
 }
@@ -3273,6 +3390,11 @@ async fn upstream_request_parts(
             )?
         }
     };
+    if relay.protocol == RelayProtocol::ChatCompletions
+        && prompt_prefix_stabilizer_enabled(relay)
+    {
+        stabilize_chat_prompt_prefix(&mut body);
+    }
     if reasoning_mode == "omit" {
         strip_reasoning_parameters(&mut body);
     } else if reasoning_mode == "passthrough" && relay.protocol == RelayProtocol::ChatCompletions {
@@ -8074,6 +8196,33 @@ fn is_openai_o_series(model: &str) -> bool {
 #[cfg(test)]
 mod response_compatibility_tests {
     use super::*;
+
+    #[test]
+    fn opt_in_prompt_prefix_stabilizer_is_deterministic_and_idempotent() {
+        let mut first = json!({
+            "messages": [{
+                "role": "system",
+                "content": "head <z_block>z</z_block> middle <image_resize_notice>drop</image_resize_notice> <a_block>a</a_block> tail"
+            }]
+        });
+        stabilize_chat_prompt_prefix(&mut first);
+        assert_eq!(
+            first["messages"][0]["content"],
+            "head  middle   tail\n\n<a_block>a</a_block>\n\n<z_block>z</z_block>"
+        );
+        let once = first.clone();
+        stabilize_chat_prompt_prefix(&mut first);
+        assert_eq!(first, once, "前缀规范化必须幂等");
+
+        let mut second = json!({
+            "messages": [{
+                "role": "system",
+                "content": "head  middle   tail\n\n<a_block>a</a_block>\n\n<z_block>z</z_block>"
+            }]
+        });
+        stabilize_chat_prompt_prefix(&mut second);
+        assert_eq!(first, second, "同一组块的到达顺序规范化后应一致");
+    }
 
     #[test]
     fn chat_search_filter_preserves_client_tools_and_rejects_forced_native_search() {
