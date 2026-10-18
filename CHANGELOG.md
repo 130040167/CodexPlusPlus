@@ -2,10 +2,50 @@
 
 ## 未发布
 
-- 新增「Anthropic Messages 上游」协议（供应商编辑页 →「上游协议」第三项，卡片标注「Anthropic Messages 转 Responses」）：Codex 只认 Responses API，而 Claude 系中转网关、企业内部网关常常只暴露 `/v1/messages`，过去把这类地址填进供应商只能得到 `/responses` 404。现在选这个协议后 Codex 照旧连本机 `127.0.0.1:57321`，由本地协议代理把请求转成 Anthropic Messages 发给上游、再把响应（含 SSE 流）转回 Responses——工具调用、多轮 `tool_result`、图片（data URL 与 http(s) 链接）、思考内容、用量与缓存字段都在转换范围内。实现走「Responses → Chat → Anthropic」两跳，复用既有 Chat 链路上已经过测试的工具配对修复、`custom` 工具与 `tool_search` 命名空间、图片搬迁等映射，新增代码集中在 `anthropic_bridge.rs` 一层，便于对拍定位。认证默认发 `x-api-key`（Anthropic 原生），可在供应商表单切到 `Authorization: Bearer`（多数中转网关），`anthropic-version: 2023-06-01` 始终带上；`max_tokens` 是 Anthropic 的必填项，Codex 请求没带输出上限时用表单里的「最大输出 tokens」（默认 8192）兜底，`temperature` 超过 1.0 会被夹到 1.0。已知边界：不注入提示缓存断点（`cache_control`），也不回放思考块签名（Anthropic 要求签名完整，缺签名整轮 400，宁可不发）；`message_stop` 缺失时按流被掐断上报，不伪装成成功。供应商导入会把 Codex 供应商的 `anthropic` 上游格式识别成该协议，不再退化成 Responses 直连。详见 `docs/specs/2026-10-15-anthropic-messages-upstream.md`。
+- macOS 补上「桌宠跟随真实鼠标」：用 CoreGraphics `CGEventGetLocation` 读取 DIP 屏幕坐标（主屏左上原点，与 Electron `screenX/screenY` 一致），按 Windows 同样的约 100ms 周期经 CDP 调用 overlay 的 `updateScreenPoint`。推点不再绑死 V2 精灵图 / vscode-api dispatcher 探针；只要 overlay 上有该函数就会推，用户脚本 stub 与官方 Computer Use 映射可以并存。设置开关对 macOS 开放。
+- 修复 WSL 运行模式下模型目录被重写成宿主绝对路径；原生 Windows 继续使用绝对路径，启动迁移仅处理当前 home 内的受管目录。
+- 修复 Windows 窗口图标与任务栏属性部分成功即停止重试的问题；按窗口分别跟踪结果。
+- 思考参数新增逐模型“自动兼容 / 原样传等级（Chat）/ 不发送”选择，保留档位草稿；请求与目录声明同步，其他模型不受影响。
+- 外部模型目录新增默认关闭的 Lite 信任选项，逐模型元数据编辑器提供可见的 Lite 声明入口。
+- 新增默认关闭的严格 Responses 推理历史兼容，仅投影可识别的加密信封；占位密文明确拒绝，不改本地历史，也不处理跨账号解密。
+- 修复获取模型时为 `/v1beta/openai` 等已有路径重复追加 `/v1`。
+- 管理器语言切换改为原地更新，保留当前工具、页面及未保存草稿，默认供应商名称保持创建时快照；会话多选新增取消选择，搜索/翻页不删除隐藏的选中项，并明确页码与会话总数。
+- MCP 编辑器新增有时限的启动路径检查：已知 Codex CLI 可将当前入口放入草稿，未知运行时与桌面程序明确提示；检查不执行命令或重启服务器。
+- Windows Claude 脚本宿主补隐藏控制台标志，副本校验改用流式 SHA-256，保持 Claude 窗口与注入行为。
 
-- 「Anthropic Messages 上游」补齐协议专有能力：**思考（extended thinking）**按 Codex 的 `reasoning.effort` 折算成 `thinking` 预算（low 2048 / medium 8192 / high 16384 / xhigh·max·ultra 24576），并按 `max_tokens` 的一半夹取给可见回答留余量，夹取后不足 1024 就不开思考；开启时自动去掉 `temperature`/`top_p`。**签名回放**：Anthropic 的思考块签名在 Chat 形态里没有落点，改为把整组签名块编码进 Responses reasoning item 的 `encrypted_content`（前缀 `codex-plus-anthropic-thinking-v1:`），Codex 下一轮原样回放、桥接层解出来插回助手消息最前面，代理保持无状态；历史里已有工具调用却拿不到签名时**不开启**思考——缺签名上游必然 400，宁可不思考也不发一个失败请求。**提示缓存**默认开启：给工具定义、系统提示、最新一轮对话（及更早一条 user 锚点）打 `cache_control` 断点，最多 4 个、调用方已有标记一律不动。模型声明窗口 ≥ 1M（复用本仓的 `modelWindows` / `contextWindow`）时自动附 `context-1m-2025-08-07` beta 头并剥掉模型名里的 `[1m]` 标记。新增「模拟 Claude Code 客户端」开关（默认关）：UA 换成 `claude-cli/1.0.119 (external, cli)`、附 `x-app: cli` 与 `anthropic-beta: claude-code-20250219`、系统提示首行注入官方身份串，仅用于网关限制“只能通过 Claude Code 使用”的场景。另外把 `max_tokens` 优先级改成「表单显式填写 > 请求自带 > 内置 8192」，并修正非流式压缩会拿 Anthropic 响应体当 chat/Responses 结构解析导致的空摘要失败。
-- 「Anthropic Messages 上游」的**思考等级改为可原样透传**：新增「思考模式」四档（自动 / 等级透传 / 经典预算 / 关闭）。自动模式按模型能力分流——新代模型（opus-5、sonnet-5、haiku-5、fable-5、mythos-5 及 4.6 以后的家族）发 `thinking: {type: adaptive}` + `output_config: {effort}`，把 Codex 的 `reasoning.effort` 按 Anthropic 的四档（low/medium/high/max，`xhigh`/`ultra` 归到 max）原样传下去，不再受 `max_tokens / 2` 的预算夹取压制；旧代模型回落经典 `budget_tokens`。依据是真机实测：`claude-sonnet-4-6` / `sonnet-5` / `opus-5` / `opus-5-5` / `fable-5-1` 收到 adaptive 会真的产出 thinking 块，而 `haiku-4-5` / `opus-4-5` 会静默忽略（不报错），所以给旧代保留预算路径更可控。签名的跨轮回放两种模式都走同一条链路，不受影响。
+## 1.10.0 - 2026-10-17
+
+本次更新带来原生 Fast 解锁、外部 Agent 协作和 Anthropic Messages 上游支持，同时改进供应商管理、会话加载与数据保护。
+
+### 新增
+
+- **原生 Fast 解锁**：纯 API Key 模式下可恢复 Codex 原生 Fast 开关。默认关闭，保存后需重启 Codex；实际支持情况与计费由供应商决定。
+- **外部 Agent 协作**：支持在 Codex 对话中委派任务给 DeepSeek Harness、Claude Code 或另一个 Codex，并查询进度、收取结果、取消或继续任务。提供一键 MCP 接入与工具刷新，支持复用 DSH 原生认证。
+- **Anthropic Messages 上游**：支持接入仅提供 `/v1/messages` 的网关，覆盖流式输出、工具调用、图片、思考等级、思考签名跨轮回放和提示缓存，并兼容 1M 上下文窗口声明。
+- **命名 API Key 管理**：同一供应商可保存多个命名 Key，并选择当前使用项，兼容旧版单 Key 配置。
+- **本机配置快照**：将当前本机配置保存为可编辑、可切换的“系统默认”供应商，方便切换后恢复原配置。
+
+### 修复
+
+- 修复模型目录路径、上下文窗口覆盖与导入，以及聚合模型前缀、供应商分组和默认成员标记问题。
+- 修复供应商配置保存冲突，以及会话备份、同步、删除和撤销相关的数据安全问题。
+- 修复部分多代理场景中的请求内容丢失、工具映射和会话连接问题，加强压缩完成校验。
+- 修复 MCP 接入后的工具与列表缓存刷新问题，区分配置接入、工具就绪和列表待刷新状态。
+- 修复 Claude 路径检测、Windows 多开隔离及微信 CLI 路径失效问题。
+- 修复页面遮挡、返回导航、用量状态栏稳定性及 API Key 控件布局问题。
+- 修复保存设置时重新写回已退役布局开关的问题。
+
+### 优化
+
+- **会话加载**：缓存会话索引，翻页时只读取当前页详情，改善大量历史会话下的浏览体验。
+- **Skills 管理**：改进仓库浏览、列表展示和管理操作。
+- **主题兼容**：适配 Dream Skin v1.5.20 社区主题。
+- **Fast 控件**：移除旧版自定义 Fast 控件，统一使用原生 Fast 入口。
+- **官方额度解锁**：入口调整至“常用增强 → 独立模式”，明确增强开启与关闭时的生效方式。此功能只解除客户端发送锁，不改变账户额度。
+- **更新进度**：下载与安装按真实阶段展示，区分待恢复提示与实际修复进度。
+
+Agent 协作默认关闭，需要先安装并登录对应 CLI，再启用和接入。已有协作接入的用户，升级后可点击“一键接入并刷新”更新工具连接。
+
 ## 1.9.0 - 2026-10-15
 
 - 新增「Claude 增强」页（左侧工具条第二位，原「Claude 汉化」）：把「受管副本」提为**所有增强共同的前置条件**，单独一张卡片承载状态、官方/副本版本、外壳语言、官方词条与「准备 / 启动 / 检查」操作，并配带编号的上手步骤（准备副本 → 启动 Claude 副本 → 在左边开启增强），完成的一步打勾变绿、当前该做的一步高亮；「界面汉化」与「语音输入」移到左栏，是两个各自独立的开关，互不影响，也都与「准备副本」解绑——副本没准备时开关照样先存下来，准备好并启动后才生效。
@@ -21,6 +61,7 @@
 
 ## 1.8.0 - 2026-10-14
 
+- 拓展接口显式开放 `/cdp/targets` 与 `/cdp/evaluate`：用户脚本可通过桥接列出并注入 Codex 独立页面（主窗口 / 宠物 overlay / 快捷聊天），不必再另起 Node 去连调试端口。只开放 `Runtime.evaluate`，不返回 WebSocket URL，管理页与 ChatGPT 网页不在目标里。
 - 模型聚合新增「把默认成员的官方登录同步到 Codex」（默认关，聚合编辑页在「默认供应商」提示下方）：聚合的请求都发往本地代理，过去切换时只往 live `auth.json` 写一个代理 Key，于是 Codex 侧显示未登录、官方成员的账号态与额度都不体现。开启后切换聚合会把默认成员的 ChatGPT 凭据一并写进 Codex 的 `auth.json`（`tokens` + `auth_mode`，代理 Key 与用户其它字段保留），账号在 Codex 里就是登录态；同时聚合 provider 改为与「官方 + API」混合模式一致的 `requires_openai_auth = true`（为 `false` 时 Codex 不读登录态，账号菜单只显示 provider 名），请求仍用代理 Key 发往本地聚合代理。同一账号时优先采纳 live 里更新的一代 refresh token（Codex 运行时也会刷新轮换），live 里是**另一个账号**时不覆盖；只有「官方登录」类型的成员才有凭据，默认成员是普通 API 供应商时界面会直接说明无效。
 - 新增输入框下方「用量状态栏」（默认开启，管理器「常用增强 → 用量状态栏」可关）：显示生成速度、缓存命中率与上下文占用。数据取自 Codex 自己写入的本机 rollout（`event_msg.token_count`），口径与 Codex 一致——缓存命中 = `cached_input_tokens / input_tokens`，上下文占用 = `last_token_usage.total_tokens / model_context_window`，而这里的 `model_context_window` 正是注入 `model_catalog_json` 之后 Codex 认到的每模型窗口，所以按模型配窗口的效果会直接反映在这一项上。为扛住秒级轮询，新增 `/thread-usage-live` 只读 rollout 文件尾部（512 KB 起，拿不到两条事件再按 4 倍放大，8 MB 封顶），不复用按会话整读的 `/thread-usage-history`；该路由不开放给第三方拓展。速度按同一轮内相邻事件的累计输出差除以时间差算，换轮即切段，取最近三个区间平均，本轮结束超过 2 分钟只淡化速度项。三项居中布局与字号对齐 DSH，语音输入空闲态同步改为 28×28 麦克风图标，文字降级到 aria-label / title。
 - 模型选择器的聚合模型按供应商分组折叠：按模型聚合后一份目录里会混进多个成员的模型，原先只能靠展示名尾部的「（供应商）」辨认，四十多个模型平铺下来满屏后缀。现在原生选择器里每个供应商一个可折叠分组，表头显示供应商名与模型数量，模型名不再重复后缀；**默认成员那一组带「默认」标志**（默认成员的模型是裸名发布的，光看名字分不出是哪一家，身份由目录发布的 `codex_plus_default` / `codex_plus_default_group_id` 给出）；右上角「全部展开 / 全部折叠」一键切换，折叠状态按供应商记忆。打开时若已选中某个模型则只展开它所在的分组，没有选中模型时展开默认供应商；单供应商（直连供应商）完全不动原生列表。

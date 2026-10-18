@@ -189,7 +189,7 @@ async fn web_search_history_proxy_declares_only_for_standard_responses() {
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
-        let response_body = if trigger {
+        let response_body = if trigger || is_responses_compact_proxy_path(path) {
             json!({
                 "id": "resp_native_compaction",
                 "object": "response",
@@ -378,17 +378,119 @@ fn compaction_history_item_expands_to_user_message_in_chat_conversion() {
 }
 
 #[test]
-fn chat_conversion_rejects_encrypted_agent_content_without_echoing_payload() {
+fn chat_conversion_forwards_plaintext_encrypted_agent_content_in_order() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-flash",
+        "input": [
+            { "type": "agent_message", "id": "amsg_real_shape",
+              "author": "/root/orchestrator", "recipient": "/root/worker",
+              "content": [
+                  { "type": "input_text",
+                    "text": "Message Type: NEW_TASK Task name: /root/worker Payload:" },
+                  { "type": "encrypted_content",
+                    "encrypted_content": "收到任务：请核对改动并把结论整理成三段发回。" }
+              ] }
+        ]
+    }))
+    .unwrap();
+
+    let messages = converted["messages"].as_array().unwrap();
+    let forwarded = messages
+        .iter()
+        .find(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("收到任务"))
+        })
+        .expect("agent_message 内的明文 encrypted_content 片段应透传为文本");
+    assert_eq!(forwarded["role"], "user");
+    let content = forwarded["content"].as_str().unwrap();
+    let header_pos = content.find("Payload:").expect("头部文本应保留");
+    let payload_pos = content.find("收到任务").unwrap();
+    assert!(
+        payload_pos > header_pos,
+        "片段顺序必须保持 header 在前、payload 在后"
+    );
+}
+
+#[test]
+fn chat_conversion_rejects_plaintext_encrypted_content_outside_agent_message() {
+    let error = responses_to_chat_completions(json!({
+        "model": "custom-model",
+        "input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "Payload:"},
+            {"type": "encrypted_content", "text": "private-agent-payload"}
+        ]}]
+    }))
+    .expect_err("普通 message 里的 encrypted_content 必须 fail closed");
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("unsupported_encrypted_agent_content"));
+    assert!(!diagnostic.contains("private-agent-payload"));
+}
+
+#[test]
+fn chat_conversion_rejects_agent_message_without_confirmed_payload_header() {
+    let error = responses_to_chat_completions(json!({
+        "model": "custom-model",
+        "input": [{"type": "agent_message", "content": [
+            {"type": "encrypted_content", "encrypted_content": "private-agent-payload"}
+        ]}]
+    }))
+    .expect_err("缺少 Payload: 头部的 agent_message 不得透传 encrypted_content");
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("unsupported_encrypted_agent_content"));
+    assert!(!diagnostic.contains("private-agent-payload"));
+}
+
+#[test]
+fn chat_conversion_rejects_url_safe_base64_agent_payload_as_opaque() {
+    // 合法的 base64url 密文：含 `_`，解码后可打印 ASCII 占比明显低于阈值。
+    // 字母表归一化写错时这里会退化成「解码失败 → 当明文转发」，上游收到无意义载荷。
+    let opaque = "BU6X4ClyuwRNlt8ocboDTJXeJ3C5AkuU3SZvuAFKk9wlbrcASZLbJG22_0iR2iNs";
+    let error = responses_to_chat_completions(json!({
+        "model": "custom-model",
+        "input": [{"type": "agent_message", "content": [
+            {"type": "input_text", "text": "Message Type: NEW_TASK Payload:"},
+            {"type": "encrypted_content", "encrypted_content": opaque}
+        ]}]
+    }))
+    .expect_err("base64url 密文不得按明文转发给 Chat 上游");
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("unsupported_encrypted_agent_content"));
+    assert!(!diagnostic.contains(opaque));
+}
+
+#[test]
+fn chat_conversion_rejects_object_shaped_encrypted_content() {
+    let error = responses_to_chat_completions(json!({
+        "model": "x",
+        "input": [{"type": "message", "role": "user", "content": {
+            "type": "encrypted_content", "encrypted_content": "private-agent-payload"
+        }}]
+    }))
+    .expect_err("content 为对象形态时同样必须拒绝 encrypted_content");
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("unsupported_encrypted_agent_content"));
+    assert!(!diagnostic.contains("private-agent-payload"));
+}
+
+#[test]
+fn chat_conversion_rejects_opaque_encrypted_agent_content_without_echoing_payload() {
+    let opaque = "mMn9x0Kc2QvZ7LtR4bYwJpE1sH6dGfUgA0TiOeNkVXqBcD9ylZsKmWrT3uPh";
     for input in [
         json!([{"type":"message","role":"user","content":[
             {"type":"input_text","text":"Payload:"},
-            {"type":"encrypted_content","text":"private-agent-payload"}
+            {"type":"encrypted_content","text":opaque}
         ]}]),
-        json!([{"type":"encrypted_content","encrypted_content":"private-agent-payload"}]),
+        json!([{"type":"encrypted_content","encrypted_content":opaque}]),
         json!([{"type":"agent_message","content":[
-            {"type":"encrypted_content","encrypted_content":"private-agent-payload"}
+            {"type":"encrypted_content","encrypted_content":opaque}
         ]}]),
-        json!({"type":"encrypted_content","encrypted_content":"private-agent-payload"}),
+        json!([{"type":"agent_message","content":[
+            {"type":"input_text","text":"Payload:"},
+            {"type":"encrypted_content","encrypted_content":opaque}
+        ]}]),
+        json!({"type":"encrypted_content","encrypted_content":opaque}),
         json!([{"type":"message","role":"user","content":[{"type":"encrypted_content"}]}]),
     ] {
         for standard in [false, true] {
@@ -396,10 +498,10 @@ fn chat_conversion_rejects_encrypted_agent_content_without_echoing_payload() {
                 json!({"model":"custom-model","input":input}),
                 standard,
             )
-            .expect_err("加密 agent 内容必须明确拒绝，不能静默丢弃或视为明文");
+            .expect_err("opaque encrypted agent 内容必须明确拒绝，不能静默丢弃或当作文本转发");
             let diagnostic = format!("{error:#}");
             assert!(diagnostic.contains("unsupported_encrypted_agent_content"));
-            assert!(!diagnostic.contains("private-agent-payload"));
+            assert!(!diagnostic.contains(opaque));
         }
     }
 }
@@ -431,33 +533,36 @@ fn chat_conversion_keeps_plaintext_and_existing_reasoning_compaction_contracts()
 
 #[tokio::test]
 async fn encrypted_agent_content_is_rejected_before_contacting_chat_upstream() {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .unwrap();
-    let address = listener.local_addr().unwrap();
-    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let upstream = tokio::spawn(async move {
-        tokio::select! {
-            request = capture_json_request_once(listener) => Some(request),
-            _ = stopped => None,
-        }
-    });
-    let settings = session_header_settings(
-        RelayProtocol::ChatCompletions,
-        format!("http://{address}/v1"),
-    );
-    let result = open_responses_proxy_request_with_settings(
-        &json!({"model":"custom-model","stream":false,"input":[
-            {"type":"encrypted_content","encrypted_content":"private-agent-payload"}
-        ]})
-        .to_string(),
-        settings,
-    )
-    .await;
-    let _ = stop.send(());
-    let request = upstream.await.unwrap();
-    assert!(result.is_err(), "必须在发送上游请求前拒绝不支持的加密内容");
-    assert!(request.is_none(), "不得向 Chat 上游发送删掉 payload 的请求");
+    for body in [
+        json!({"model":"custom-model","stream":false,"input":[
+            {"type":"encrypted_content","encrypted_content":"mMn9x0Kc2QvZ7LtR4bYwJpE1sH6dGfUgA0TiOeNkVXqBcD9ylZsKmWrT3uPh"}
+        ]}),
+        json!({"model":"x","stream":false,"input":[
+            {"type":"message","role":"user","content":{
+                "type":"encrypted_content","encrypted_content":"private-agent-payload"}}
+        ]}),
+    ] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let upstream = tokio::spawn(async move {
+            tokio::select! {
+                request = capture_json_request_once(listener) => Some(request),
+                _ = stopped => None,
+            }
+        });
+        let settings = session_header_settings(
+            RelayProtocol::ChatCompletions,
+            format!("http://{address}/v1"),
+        );
+        let result = open_responses_proxy_request_with_settings(&body.to_string(), settings).await;
+        let _ = stop.send(());
+        let request = upstream.await.unwrap();
+        assert!(result.is_err(), "必须在发送上游请求前拒绝不支持的加密内容");
+        assert!(request.is_none(), "不得向 Chat 上游发送删掉 payload 的请求");
+    }
 }
 
 #[tokio::test]
@@ -486,6 +591,7 @@ async fn responses_upstream_preserves_encrypted_agent_content() {
 fn compaction_stream_emits_one_done_item_before_completed() {
     let mut converter = CompactionSseConverter::new("custom-model");
     converter.push_summary_text("Preserve this summary.");
+    converter.push_upstream_bytes(b"data: {\"type\":\"response.completed\"}\n\n");
     let events = compaction_sse_events(&converter.finish());
     let mut items = Vec::new();
     let mut completed = None;
@@ -545,6 +651,7 @@ fn compaction_sse_events(payload: &[u8]) -> Vec<Value> {
 fn local_compaction_item(summary: &str) -> Value {
     let mut converter = CompactionSseConverter::new("model");
     converter.push_summary_text(summary);
+    converter.push_upstream_bytes(b"data: {\"type\":\"response.completed\"}\n\n");
     compaction_sse_events(&converter.finish())
         .into_iter()
         .find(|event| event["type"] == "response.output_item.done")
@@ -585,6 +692,7 @@ fn wrap_non_stream_response_produces_single_compaction_item() {
     let upstream = json!({
         "id": "resp_up",
         "object": "response",
+        "status": "completed",
         "output": [
             { "type": "reasoning", "summary": [] },
             { "type": "message", "role": "assistant",
@@ -611,7 +719,7 @@ fn wrap_non_stream_response_produces_single_compaction_item() {
 fn wrap_non_stream_chat_response_produces_single_compaction_item() {
     let upstream = json!({
         "choices": [
-            { "message": { "role": "assistant", "content": "SUMMARYfromCHAT" } }
+            { "message": { "role": "assistant", "content": "SUMMARYfromCHAT" }, "finish_reason": "stop" }
         ]
     })
     .to_string();
@@ -663,6 +771,7 @@ fn compaction_converter_accepts_data_only_responses_events() {
         b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Summary\"}\n\n",
     );
     assert_eq!(converter.summary_text(), "Summary");
+    converter.push_upstream_bytes(b"data: {\"type\":\"response.completed\"}\n\n");
     let events = compaction_sse_events(&converter.finish());
     let item = &events
         .iter()
@@ -721,7 +830,7 @@ fn summary_converter_does_not_relabel_native_compaction_as_local_text() {
 
 #[test]
 fn compaction_converter_accepts_complete_chat_message_without_delta() {
-    let upstream = b"data: {\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Chat summary\"}}]}\n\n";
+    let upstream = b"data: {\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Chat summary\"},\"finish_reason\":\"stop\"}]}\n\n";
     let mut converter = CompactionSseConverter::new("custom-model").with_chat_upstream();
     converter.push_upstream_bytes(upstream);
     let events = compaction_sse_events(&converter.finish());
@@ -770,7 +879,7 @@ fn compaction_converter_buffers_sse_events_across_chunks() {
 #[test]
 fn compaction_converter_strips_leading_think_block_from_chat_stream() {
     // DeepSeek 类 thinking 模型把推理塞在 delta.content 的 <think> 块里。
-    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"<think>step by step\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" reasoning...\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"</think>\\n真实摘要内容\"}}]}\n\ndata: [DONE]\n\n";
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"<think>step by step\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" reasoning...\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"</think>\\n真实摘要内容\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
     let mut converter = CompactionSseConverter::new("deepseek").with_chat_upstream();
     converter.push_upstream_bytes(sse.as_bytes());
     let payload = String::from_utf8(converter.finish()).unwrap();
@@ -784,6 +893,7 @@ fn compaction_converter_strips_think_block_from_direct_text() {
     // 非流式路径直接 push 文本，think 剥离同样在 finish 生效。
     let mut converter = CompactionSseConverter::new("deepseek");
     converter.push_summary_text("<think>internal reasoning</think>\nSUMMARY_BODY");
+    converter.push_upstream_bytes(b"data: {\"type\":\"response.completed\"}\n\n");
     let payload = String::from_utf8(converter.finish()).unwrap();
     assert!(payload.contains("SUMMARY_BODY"));
     assert!(!payload.contains("internal reasoning"));
@@ -1413,7 +1523,9 @@ data: {"type":"response.output_item.done","item":{"id":"cmp_empty","type":"compa
 
 event: response.completed
 
-data: {"type":"response.completed","response":{"id":"resp_empty","status":"completed"}}"#,
+data: {"type":"response.completed","response":{"id":"resp_empty","status":"completed"}}
+
+"#,
                 )
                 .await;
             } else {
@@ -1690,12 +1802,8 @@ async fn responses_compact_request_keeps_compact_path_upstream() {
         let (mut stream, _) = listener.accept().await.unwrap();
         let request =
             String::from_utf8_lossy(&read_async_http_request(&mut stream).await).to_string();
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-length: 35\r\ncontent-type: application/json\r\n\r\n{\"id\":\"resp_1\",\"object\":\"response\"}",
-            )
-            .await
-            .unwrap();
+        write_remote_compaction_response(&mut stream, "200 OK",
+            r#"{"id":"resp_1","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque-fixture"}]}"#).await;
         request
     });
     let settings = BackendSettings {
@@ -4491,6 +4599,49 @@ async fn upstream_request_returns_when_provider_accepts_but_never_sends_headers(
     server.abort();
 }
 
+/// 系统代理/链路抖动经常表现为 TLS 握手阶段被对端断开
+/// （`client error (Connect): tls handshake eof`）。这类失败发生在请求送达
+/// 上游之前，必须在本地重试，不能把瞬时故障直接暴露成 502。
+#[tokio::test]
+async fn upstream_connect_failures_are_retried_before_reporting_502() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            // 握手阶段直接断开，复现 tls handshake eof。
+            drop(stream);
+        }
+    });
+
+    let started = Instant::now();
+    let error = send_upstream_request_with_header_timeout(
+        upstream_http_client()
+            .unwrap()
+            .post(format!("https://{addr}/v1/responses"))
+            .json(&json!({"model": "m", "input": "hi"})),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_err();
+    let text = format!("{error:#}");
+    assert!(text.contains("上游请求失败"), "{text}");
+    assert!(
+        accepted.load(Ordering::SeqCst) >= 3,
+        "expected initial attempt plus 2 connect retries"
+    );
+    // 两次退避合计 550ms，证明不是一次失败就立刻返回。
+    assert!(started.elapsed() >= Duration::from_millis(500));
+    server.abort();
+}
+
 #[tokio::test]
 async fn aggregate_proxy_fails_over_to_next_member_in_same_request() {
     let _lock = settings_path_test_lock().lock().unwrap();
@@ -4638,6 +4789,148 @@ async fn aggregate_official_member_forwards_with_oauth_credentials() {
     assert!(headers_lower.contains("originator: codex_cli_rs"), "{headers}");
     assert!(!headers_lower.contains("sk-"), "{headers}");
     assert_eq!(body["model"], "gpt-5.6-sol");
+}
+
+/// 官方登录成员 + 单成员聚合外壳，用于验证官方登录通道的请求重写。
+fn official_aggregate_test_settings(official_id: &str, aggregate_id: &str) -> BackendSettings {
+    BackendSettings {
+        relay_profiles: vec![
+            RelayProfile {
+                id: official_id.to_string(),
+                name: "官方登录".to_string(),
+                relay_mode: RelayMode::Official,
+                auth_contents: json!({
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "access_token": "official-access",
+                        "refresh_token": "official-refresh",
+                        "account_id": "acct-official"
+                    }
+                })
+                .to_string(),
+                ..RelayProfile::default()
+            },
+            RelayProfile {
+                id: aggregate_id.to_string(),
+                name: "aggregate".to_string(),
+                relay_mode: RelayMode::Aggregate,
+                ..RelayProfile::default()
+            },
+        ],
+        active_relay_id: aggregate_id.to_string(),
+        active_aggregate_relay_id: aggregate_id.to_string(),
+        aggregate_relay_profiles: vec![AggregateRelayProfile {
+            id: aggregate_id.to_string(),
+            name: "aggregate".to_string(),
+            session_provider: RelaySessionProvider::Custom,
+            model_aggregation_enabled: false,
+            strategy: AggregateRelayStrategy::Failover,
+            members: vec![AggregateRelayMember {
+                relay_id: official_id.to_string(),
+                weight: 1,
+            }],
+            routes: Vec::new(),
+            default_relay_id: String::new(),
+            sync_default_member_login: false,
+        }],
+        ..BackendSettings::default()
+    }
+}
+
+/// 官方登录上游要求：回放 web_search_call 历史时必须声明 web_search 工具，
+/// 否则流式返回 `response protection is unavailable`。Codex 的本地压缩请求
+/// `tools` 为空，必须由代理补齐声明（且不能改写历史）。
+#[tokio::test]
+async fn aggregate_official_member_declares_web_search_for_tool_less_history() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+    // 隔离真实 ~/.codex/auth.json，避免 live 登录快照影响凭据解析。
+    let _codex_home = EnvVarGuard::set(
+        "CODEX_HOME",
+        temp.path().to_str().unwrap(),
+    );
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(capture_json_request_once(listener));
+    let _env_guard = EnvVarGuard::set(
+        "CODEX_PLUS_OFFICIAL_BASE_URL",
+        &format!("http://{address}/backend-api/codex"),
+    );
+
+    let request = json!({
+        "model": "gpt-6.1-sol",
+        "stream": false,
+        "tools": [],
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "web_search_call", "id": "ws_test", "status": "completed",
+                "action": {"type": "search", "query": "example"}},
+            {"type": "message", "role": "user", "content": [{"type": "input_text",
+                "text": "You are performing a CONTEXT CHECKPOINT COMPACTION."}]}
+        ]
+    });
+    let settings = official_aggregate_test_settings("proxy-official-web", "proxy-official-web-agg");
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+
+    let (headers, sent) = server.await.unwrap();
+    assert!(
+        headers.starts_with("POST /backend-api/codex/responses HTTP/1.1"),
+        "{headers}"
+    );
+    let mut expected = request;
+    expected["tools"] = json!([{"type": "web_search", "external_web_access": false}]);
+    expected["tool_choice"] = json!("none");
+    assert_eq!(sent, expected, "只补搜索声明，历史内容必须原样保留");
+}
+
+/// 官方登录通道只修「没有声明任何工具」的请求；带工具的普通轮次保持原样。
+#[tokio::test]
+async fn aggregate_official_member_leaves_tool_declaring_requests_unchanged() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+    let _codex_home = EnvVarGuard::set(
+        "CODEX_HOME",
+        temp.path().to_str().unwrap(),
+    );
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(capture_json_request_once(listener));
+    let _env_guard = EnvVarGuard::set(
+        "CODEX_PLUS_OFFICIAL_BASE_URL",
+        &format!("http://{address}/backend-api/codex"),
+    );
+
+    let request = json!({
+        "model": "gpt-6.1-sol",
+        "stream": false,
+        "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+        "tool_choice": "auto",
+        "input": [
+            {"type": "web_search_call", "id": "ws_test", "status": "completed",
+                "action": {"type": "search", "query": "example"}},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+        ]
+    });
+    let settings =
+        official_aggregate_test_settings("proxy-official-tools", "proxy-official-tools-agg");
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+
+    let (_, sent) = server.await.unwrap();
+    assert_eq!(sent, request, "带工具的请求不应被改写");
 }
 
 /// 官方登录 token 被提前撤销：第一次 401 后强制刷新一次并原样重试，
@@ -4926,7 +5219,8 @@ async fn model_route_preserves_responses_compact_endpoint() {
         .await
         .unwrap();
     let target_addr = target.local_addr().unwrap();
-    let target_server = tokio::spawn(capture_json_request_once(target));
+    let target_server = tokio::spawn(capture_request_with_response(target, "application/json",
+        json!({"id":"compact","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque-fixture"}]}).to_string()));
     let request = json!({
         "model": "gpt-5.6-luna",
         "input": [{ "role": "user", "content": "compact this conversation" }],
@@ -5208,6 +5502,149 @@ async fn aggregate_default_provider_forwards_unbound_model() {
         "默认供应商原样转发请求里的 model id（不做去前缀/去后缀的静默改名）"
     );
     other_server.abort();
+}
+
+#[tokio::test]
+async fn aggregate_live_settings_updates_preserve_selected_model_and_failover() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let settings_path = temp.path().join("settings.json");
+    let _guard = SettingsPathGuard::set(settings_path.clone());
+    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let mut servers = Vec::new();
+    let mut urls = Vec::new();
+    let failing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hold_next = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    for name in ["a", "b", "c"] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        urls.push(format!("http://{}/v1", listener.local_addr().unwrap()));
+        let events = events.clone();
+        let failing = failing.clone();
+        let hold_next = hold_next.clone();
+        let release = release.clone();
+        servers.push(tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+                let body: Value = serde_json::from_str(body).unwrap();
+                let authorization = headers.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("authorization").then(|| value.trim().to_string())
+                });
+                events.send((name, body["model"].as_str().unwrap().to_string(), authorization)).unwrap();
+                if name == "b" && hold_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    release.notified().await;
+                }
+                let response = if name == "c" && failing.load(std::sync::atomic::Ordering::SeqCst) {
+                    "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 2\r\nconnection: close\r\ncontent-type: application/json\r\n\r\n{}"
+                } else {
+                    "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\ncontent-type: application/json\r\n\r\n{}"
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        }));
+    }
+    let mut settings = aggregate_proxy_settings("live-settings", urls[0].clone(), urls[1].clone());
+    for (index, relay) in settings.relay_profiles.iter_mut().take(2).enumerate() {
+        relay.relay_mode = RelayMode::MixedApi;
+        relay.model = format!("model-{index}");
+        relay.model_list = relay.model.clone();
+    }
+    settings.aggregate_relay_profiles[0].strategy = AggregateRelayStrategy::Failover;
+    settings.aggregate_relay_profiles[0].model_aggregation_enabled = true;
+    let first_id = settings.relay_profiles[0].id.clone();
+    let second_id = settings.relay_profiles[1].id.clone();
+    settings.aggregate_relay_profiles[0].default_relay_id = first_id.clone();
+
+    // 每次均走实际文件读取入口，保持同一代理运行时、同一会话标识。
+    fn persist(path: &Path, settings: &BackendSettings) {
+        let mut stored = settings.clone();
+        for relay in stored.relay_profiles.iter_mut().take(2) {
+            // model / URL / Key 扁平字段不参与序列化；使用真实存储快照格式。
+            relay.config_contents = format!(
+                "model = {:?}\nmodel_provider = \"custom\"\n[model_providers.custom]\nname = \"mock\"\nbase_url = {:?}\nwire_api = \"responses\"\n",
+                relay.model, relay.base_url,
+            );
+            relay.auth_contents = json!({"OPENAI_API_KEY": relay.api_key}).to_string();
+        }
+        std::fs::write(path, serde_json::to_vec(&stored).unwrap()).unwrap();
+    }
+    async fn request(path: &Path, settings: &BackendSettings, model: &str) -> u16 {
+        persist(path, settings);
+        let body = json!({"model": model, "input": "hi", "stream": false,
+            "conversation_id": "same-live-session"}).to_string();
+        let mut response = open_responses_proxy_request(&body, None).await.unwrap();
+        let status = response.status_code;
+        let body = response.read_body().await.unwrap();
+        if status != 200 {
+            eprintln!("mock request status {status}: {}", String::from_utf8_lossy(&body));
+        }
+        status
+    }
+    macro_rules! expect {
+        ($model:expr, $target:expr, $upstream_model:expr, $key:expr) => {{
+            assert_eq!(request(&settings_path, &settings, $model).await, 200);
+            let event = tokio::time::timeout(Duration::from_secs(2), received.recv())
+                .await.unwrap().unwrap();
+            assert_eq!(event, ($target, $upstream_model.to_string(), Some($key.to_string())));
+            assert!(received.try_recv().is_err(), "不能产生额外上游请求");
+        }};
+    }
+    let first_model = format!("cpx-{first_id}/model-0");
+    let second_model = format!("cpx-{second_id}/model-1");
+    expect!(&first_model, "a", "model-0", "Bearer sk-first");
+    // 只改成员 URL / Key，下次请求即采用新值。
+    settings.relay_profiles[0].base_url = urls[2].clone();
+    settings.relay_profiles[0].api_key = "synthetic-new-key".to_string();
+    expect!(&first_model, "c", "model-0", "Bearer synthetic-new-key");
+    // 重设默认成员不改派已经明确选择的成员模型。
+    settings.aggregate_relay_profiles[0].default_relay_id = second_id.clone();
+    expect!(&first_model, "c", "model-0", "Bearer synthetic-new-key");
+    expect!("model-1", "b", "model-1", "Bearer sk-second");
+    // 重设成员默认模型不覆盖本次显式选择。
+    settings.relay_profiles[0].model = "new-default".to_string();
+    settings.relay_profiles[0].model_list = "model-0,new-default".to_string();
+    expect!(&first_model, "c", "model-0", "Bearer synthetic-new-key");
+    // 移除成员只使其模型失效；不能静默改派给默认成员。
+    settings.aggregate_relay_profiles[0].members.remove(0);
+    assert_eq!(request(&settings_path, &settings, &first_model).await, 400);
+    assert!(received.try_recv().is_err());
+    expect!(&second_model, "b", "model-1", "Bearer sk-second");
+    settings.aggregate_relay_profiles[0].members.insert(0, AggregateRelayMember {
+        relay_id: first_id, weight: 1,
+    });
+    expect!(&first_model, "c", "model-0", "Bearer synthetic-new-key");
+
+    // 关闭按模型聚合后，故障转移遵循成员默认模型，并按新成员列表即时生效。
+    settings.aggregate_relay_profiles[0].model_aggregation_enabled = false;
+    failing.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(request(&settings_path, &settings, "client-model").await, 200);
+    assert_eq!(received.recv().await.unwrap(),
+        ("c", "new-default".to_string(), Some("Bearer synthetic-new-key".to_string())));
+    assert_eq!(received.recv().await.unwrap(),
+        ("b", "model-1".to_string(), Some("Bearer sk-second".to_string())));
+    assert!(received.try_recv().is_err());
+    settings.aggregate_relay_profiles[0].members.remove(0);
+    expect!("client-model", "b", "model-1", "Bearer sk-second");
+    // 保存设置不能中断已经发出的请求；新地址 / Key 从下一次请求起生效。
+    hold_next.store(true, std::sync::atomic::Ordering::SeqCst);
+    let old_settings = settings.clone();
+    let old_path = settings_path.clone();
+    let in_flight = tokio::spawn(async move { request(&old_path, &old_settings, "client-model").await });
+    let event = tokio::time::timeout(Duration::from_secs(2), received.recv()).await.unwrap().unwrap();
+    assert_eq!(event, ("b", "model-1".to_string(), Some("Bearer sk-second".to_string())));
+    settings.relay_profiles[1].base_url = urls[0].clone();
+    settings.relay_profiles[1].api_key = "synthetic-next-key".to_string();
+    settings.relay_profiles[1].model = "next-default-model".to_string();
+    persist(&settings_path, &settings);
+    release.notify_one();
+    assert_eq!(in_flight.await.unwrap(), 200);
+    expect!("client-model", "a", "next-default-model", "Bearer synthetic-next-key");
+    for server in servers {
+        server.abort();
+    }
 }
 
 async fn respond_once(listener: tokio::net::TcpListener, response: &'static str) {

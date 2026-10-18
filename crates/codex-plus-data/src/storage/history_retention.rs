@@ -248,7 +248,11 @@ impl HistoryRetention {
     }
 
     /// 新备份允许保留中的同一文件存在，但绝不覆盖追加后的历史。
-    pub fn prepare_undo(&self, backups: &mut [Value]) -> anyhow::Result<()> {
+    pub fn prepare_undo(
+        &self,
+        backups: &mut [Value],
+        backup_store: &BackupStore,
+    ) -> anyhow::Result<()> {
         let mut all_files = BTreeMap::<PathBuf, (Vec<u8>, Value)>::new();
         for backup in backups.iter_mut() {
             let db_path = backup_source_db(backup, &self.databases[0], &self.databases)?;
@@ -393,13 +397,22 @@ impl HistoryRetention {
                     {
                         self.validate_history_path(Path::new(path))?;
                     }
-                    let normalized = comparable_history_path(Path::new(path));
-                    let bytes = base64::Engine::decode(
-                        &base64::engine::general_purpose::STANDARD,
-                        file["content_b64"]
-                            .as_str()
-                            .ok_or_else(|| anyhow::anyhow!("invalid history backup content"))?,
-                    )?;
+                    let normalized = resolved_history_path(Path::new(path))?;
+                    let bytes = backup_store.read_file_backup(&token, file)?;
+                    let mut portable = file.clone();
+                    let object = portable
+                        .as_object_mut()
+                        .ok_or_else(|| anyhow::anyhow!("invalid history backup entry"))?;
+                    object.remove("blob_ref");
+                    object.remove("size_bytes");
+                    object.remove("sha256");
+                    object.insert(
+                        "content_b64".to_string(),
+                        Value::String(base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            &bytes,
+                        )),
+                    );
                     if let Some((previous, _)) = all_files.get(&normalized) {
                         if !previous.starts_with(&bytes) && !bytes.starts_with(previous) {
                             bail!("restore conflict: incompatible history snapshots: {path}");
@@ -408,7 +421,7 @@ impl HistoryRetention {
                             continue;
                         }
                     }
-                    all_files.insert(normalized, (bytes, file.clone()));
+                    all_files.insert(normalized, (bytes, portable));
                 }
             }
             tables.insert("__files".into(), Value::Array(Vec::new()));
@@ -491,6 +504,20 @@ impl HistoryRetention {
         }
         Ok(())
     }
+}
+
+fn rollout_file_backup_entry(path: &str, source_path: &str, bytes: Vec<u8>) -> Value {
+    let mut entry = json!({
+        "path": path,
+        "content_b64": base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            bytes,
+        ),
+    });
+    if path != source_path {
+        entry["source_path"] = Value::String(source_path.to_string());
+    }
+    entry
 }
 
 /// Windows 的扩展路径与普通路径必须在同一命名空间内比较；UNC 仍保留服务器前缀。

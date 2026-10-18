@@ -20,6 +20,7 @@ use crate::settings::{BackendSettings, SettingsStore, normalize_codex_extra_args
 use crate::status::{LaunchStatus, StatusStore};
 
 static PET_OVERLAY_SYNC_FAILED: AtomicBool = AtomicBool::new(false);
+#[cfg(any(windows, target_os = "macos"))]
 static PET_CURSOR_DRIVER_FAILED: AtomicBool = AtomicBool::new(false);
 const BRIDGE_HEALTH_FAILURE_THRESHOLD: u8 = 2;
 /// 重注入退避：首次重注入立即执行，此后若桥仍不健康，重注入间隔按
@@ -148,6 +149,26 @@ pub fn windows_process_control_strategy() -> WindowsProcessControlStrategy {
 }
 
 impl CodexLaunch {
+    /// 启动命令携带的最终端口；包上下文 wrapper 可能改选过端口。
+    pub fn debug_port(&self) -> Option<u16> {
+        let tokens = match self {
+            Self::Process { command, .. } => command.iter().map(String::as_str).collect::<Vec<_>>(),
+            Self::PackagedActivation { arguments, .. } => arguments.split_whitespace().collect(),
+        };
+        let mut ports = tokens.iter().enumerate().filter_map(|(index, token)| {
+            token
+                .strip_prefix("--remote-debugging-port=")
+                .or_else(|| {
+                    (*token == "--remote-debugging-port")
+                        .then(|| tokens.get(index + 1).copied())
+                        .flatten()
+                })
+                .and_then(|value| value.parse::<u16>().ok())
+        });
+        let first = ports.next()?;
+        (first != 0 && ports.all(|port| port == first)).then_some(first)
+    }
+
     pub fn process_id(&self) -> Option<u32> {
         match self {
             Self::PackagedActivation { process_id, .. } => *process_id,
@@ -400,6 +421,9 @@ pub trait LaunchHooks: Send + Sync {
         Ok(None)
     }
     async fn inject(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()>;
+    async fn apply_native_fast_unlock_on_launch(&self, _debug_port: u16) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn inject_bridge(
         &self,
         debug_port: u16,
@@ -660,7 +684,7 @@ where
     H: IntoLaunchHooks,
 {
     let hooks = hooks.into_launch_hooks();
-    let debug_port = hooks.select_debug_port(options.debug_port);
+    let mut debug_port = hooks.select_debug_port(options.debug_port);
     let mut helper_port = hooks.select_helper_port(options.helper_port);
     let settings = hooks.load_settings().await?;
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
@@ -807,6 +831,7 @@ where
                 &LaunchInstance::from_options(&options),
             )
             .await?;
+        debug_port = launch.debug_port().unwrap_or(debug_port);
         launched = Some(launch.clone());
         keep_launched_on_error = true;
         timeline.mark("launch_codex_done", 80);
@@ -820,6 +845,14 @@ where
             timeline.mark("ensure_injection_done", 95);
             if injection_ready {
                 keep_launched_on_error = false;
+                if settings.codex_app_native_fast_unlock
+                    && let Err(error) = hooks.apply_native_fast_unlock_on_launch(debug_port).await
+                {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "launcher.native_fast_unlock_failed",
+                        serde_json::json!({ "message": error.to_string() }),
+                    );
+                }
                 // 注入成功后页面已加载，此时可以通过 CDP 清理 Electron Local Storage
                 // 中残留的带后缀模型名，避免模型选择器继续显示废弃项。
                 crate::codex_local_storage::sanitize_local_storage_model_suffixes_nonfatal(
@@ -924,10 +957,12 @@ fn apply_codexplusplus_window_icon_after_launch(process_id: u32) {
     let icon_resource_path =
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("codex-plus-plus.exe"));
     tokio::spawn(async move {
+        let mut state = crate::windows_integration::WindowIconApplyState::default();
         for attempt in 1..=30 {
-            if crate::windows_apply_codexplusplus_icon_to_process_window(
+            if crate::windows_integration::apply_codexplusplus_icon_attempt(
                 process_id,
-                icon_resource_path.clone(),
+                &icon_resource_path,
+                &mut state,
             ) {
                 return;
             }
@@ -1071,18 +1106,8 @@ impl LaunchHooks for DefaultLaunchHooks {
             .collect::<Vec<_>>()
             .join("\n\n"),
         );
-        if profile.relay_mode == crate::settings::RelayMode::Official
-            && !profile.official_mix_api_key
-        {
-            let auth_contents = (!profile.auth_contents.trim().is_empty())
-                .then_some(profile.auth_contents.as_str());
-            crate::relay_config::clear_relay_config_to_home_with_auth(&home, auth_contents)?;
-            return Ok(());
-        }
-        crate::relay_config::apply_relay_profile_to_home_with_switch_rules(
-            &home,
-            &profile,
-            &common_config,
+        crate::relay_config::apply_relay_profile_with_preservation(
+            &home, &profile, &common_config, crate::protocol_proxy::protocol_proxy_port(), settings.relay_preserve_nonprovider_settings,
         )?;
         Ok(())
     }
@@ -1334,6 +1359,11 @@ impl LaunchHooks for DefaultLaunchHooks {
     async fn inject(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
         retry_injection(debug_port, helper_port).await
     }
+
+    async fn apply_native_fast_unlock_on_launch(&self, debug_port: u16) -> anyhow::Result<()> {
+        apply_native_fast_unlock_on_launch(debug_port).await
+    }
+
     async fn capture_injected_launch_identity(&self, debug_port: u16) {
         #[cfg(windows)]
         {
@@ -1413,7 +1443,7 @@ impl LaunchHooks for DefaultLaunchHooks {
         let bridge_reinjector = self.bridge_reinjector.lock().await.clone();
         let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             let pet_cursor_task = tokio::spawn(run_pet_real_mouse_cursor_driver(debug_port));
             let mut observed_browser_id: Option<String> = None;
             let mut bridge_health_failures = 0u8;
@@ -1450,7 +1480,7 @@ impl LaunchHooks for DefaultLaunchHooks {
                     }
                 }
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             {
                 pet_cursor_task.abort();
                 let _ = pet_cursor_task.await;
@@ -1950,10 +1980,11 @@ fn decode_protocol_proxy_request_body(
         body.to_vec()
     } else if encoding.eq_ignore_ascii_case("zstd") {
         let decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(body))?;
-        let mut limited = decoder.take((MAX_HTTP_BODY_BYTES + 1) as u64);
+        let max_body_bytes = configured_http_body_bytes();
+        let mut limited = decoder.take((max_body_bytes + 1) as u64);
         let mut decoded = Vec::new();
         limited.read_to_end(&mut decoded)?;
-        if decoded.len() > MAX_HTTP_BODY_BYTES {
+        if decoded.len() > max_body_bytes {
             anyhow::bail!("解压后的请求体超过大小限制");
         }
         decoded
@@ -2039,6 +2070,56 @@ fn dream_skin_image_response() -> (String, Vec<u8>, String, &'static str) {
         ),
         Err(_) => not_found(),
     }
+}
+
+fn logical_cursor_position() -> anyhow::Result<(i32, i32)> {
+    #[cfg(windows)]
+    {
+        return windows_logical_cursor_position();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return macos_logical_cursor_position();
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        anyhow::bail!("logical cursor position is only available on Windows and macOS")
+    }
+}
+
+/// CoreGraphics 全局坐标：主屏左上为原点、Y 向下、单位是点（DIP），
+/// 与 Electron 的 window.screenX/screenY 一致。不要用 NSEvent.mouseLocation（左下原点）。
+#[cfg(target_os = "macos")]
+fn macos_logical_cursor_position() -> anyhow::Result<(i32, i32)> {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+        fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPoint;
+        fn CFRelease(cf: *mut std::ffi::c_void);
+    }
+    unsafe {
+        let event = CGEventCreate(std::ptr::null());
+        if event.is_null() {
+            anyhow::bail!("CGEventCreate failed");
+        }
+        let point = CGEventGetLocation(event);
+        CFRelease(event);
+        Ok((point.x.round() as i32, point.y.round() as i32))
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn macos_logical_cursor_position_uses_points_from_core_graphics() {
+    let (x, y) = macos_logical_cursor_position().expect("CGEventGetLocation should succeed");
+    let _ = (x, y);
 }
 
 #[cfg(windows)]
@@ -2172,17 +2253,24 @@ async fn handle_protocol_proxy_connection(
                     error.downcast_ref::<crate::protocol_proxy::UnsupportedEncryptedAgentContent>();
                 let search_unsupported =
                     error.downcast_ref::<crate::protocol_proxy::UnsupportedNativeWebSearch>();
-                let status = if unsupported.is_some() || search_unsupported.is_some() {
+                let file_unsupported = error.downcast_ref::<crate::protocol_proxy::UnsupportedInputFile>();
+                let vlm_failure = error.downcast_ref::<crate::vision::VlmPreprocessError>();
+                let status = if unsupported.is_some() || search_unsupported.is_some() || file_unsupported.is_some()
+                    || matches!(vlm_failure, Some(crate::vision::VlmPreprocessError::MissingConfiguration)) {
                     "400 Bad Request"
                 } else {
                     "502 Bad Gateway"
                 };
+                // 502 响应与诊断日志都带上完整错误链，便于直接看到真实失败原因。
+                let error_chain = crate::protocol_proxy::error_chain(&error);
                 let body = serde_json::to_vec(
                     &unsupported
                         .map(|error| error.response_body())
                         .or_else(|| search_unsupported.map(|error| error.response_body()))
+                        .or_else(|| file_unsupported.map(|error| error.response_body()))
+                        .or_else(|| vlm_failure.map(|error| error.response_body()))
                         .unwrap_or_else(
-                            || serde_json::json!({"status":"failed","message":error.to_string()}),
+                            || serde_json::json!({"status":"failed","message":error_chain.clone()}),
                         ),
                 )?;
                 write_http_response(stream, status, "application/json; charset=utf-8", &body)
@@ -2191,7 +2279,7 @@ async fn handle_protocol_proxy_connection(
                     "helper.protocol_proxy_failed",
                     method,
                     path,
-                    &error.to_string(),
+                    &error_chain,
                     remote_addr_text,
                 );
                 stream.shutdown().await?;
@@ -2280,10 +2368,17 @@ async fn handle_protocol_proxy_connection(
                     }
                 }
             }
-            let payload = converter.finish();
-            stream.write_all(&payload).await?;
+            if let Some(bridge) = anthropic_bridge.as_mut() {
+                let tail = bridge.finish();
+                converter.push_upstream_bytes(&tail);
+                if !bridge.has_successful_compaction_completion() {
+                    converter.fail("Anthropic 压缩流缺少正常 message_stop".to_string(), Some("compaction_incomplete".to_string()));
+                }
+            }
+            let outcome = converter.finish_with_outcome();
+            stream.write_all(&outcome.payload).await?;
             log_helper_response(
-                "helper.protocol_proxy_compaction_ok",
+                if outcome.succeeded { "helper.protocol_proxy_compaction_ok" } else { "helper.protocol_proxy_compaction_failed" },
                 method,
                 path,
                 "200 OK",
@@ -2361,6 +2456,16 @@ async fn handle_protocol_proxy_connection(
     };
     if upstream.compaction {
         // v2 远程压缩非流式路径：同样重组为单个 compaction 输出项。
+        if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages {
+            let original: serde_json::Value = serde_json::from_slice(&upstream_body)?;
+            if let Err(error) = crate::protocol_proxy::validate_compaction_json_completion(&original, upstream.wire_api) {
+                let mut converter = crate::protocol_proxy::CompactionSseConverter::new("");
+                converter.fail(error.to_string(), Some("compaction_incomplete".to_string()));
+                write_http_response(stream, "200 OK", "text/event-stream; charset=utf-8", &converter.finish()).await?;
+                stream.shutdown().await?;
+                return Ok(());
+            }
+        }
         let compaction_input = crate::anthropic_bridge::normalize_non_stream_body_for_compaction(
             upstream.wire_api,
             &upstream_body,
@@ -2922,17 +3027,22 @@ async fn forward_protocol_proxy_stream(
 ) -> anyhow::Result<Option<String>> {
     let mut chunks = response.bytes_stream();
     if wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
-        let mut observer = crate::protocol_proxy::NativeResponsesSseObserver::default();
+        let mut transformer = crate::protocol_proxy::ResponsesSseTransformer::default();
         while let Some(chunk) = chunks.next().await {
             match chunk {
                 Ok(bytes) => {
-                    stream.write_all(&bytes).await?;
-                    observer.push_bytes(&bytes);
+                    let out = transformer.push_bytes(&bytes);
+                    stream.write_all(&out).await?;
+                    // 超限等终态失败要立即结束流，不能等上游 EOF；
+                    // 否则上游保持连接时失败迟迟不上报，残片也会继续被转发。
+                    if transformer.has_failed() {
+                        return Ok(transformer.finish());
+                    }
                 }
                 Err(error) => return Ok(Some(error.without_url().to_string())),
             }
         }
-        return Ok(observer.finish());
+        return Ok(transformer.finish());
     }
     if wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages {
         // Anthropic SSE → chat SSE → Responses SSE，终端事件语义与 chat 上游一致。
@@ -3087,7 +3197,30 @@ mod computer_use_tests {
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
-const MAX_HTTP_ENCODED_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CONFIGURED_HTTP_BODY_BYTES: usize = 512 * 1024 * 1024;
+
+fn configured_http_body_bytes() -> usize {
+    std::env::var("CODEX_PLUS_MAX_HTTP_BODY_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value >= MAX_HTTP_BODY_BYTES)
+        .map(|value| value.min(MAX_CONFIGURED_HTTP_BODY_BYTES))
+        .unwrap_or(MAX_HTTP_BODY_BYTES)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HttpBodyLimits {
+    decoded: usize,
+    encoded: usize,
+}
+
+fn http_body_limits() -> HttpBodyLimits {
+    let decoded = configured_http_body_bytes();
+    HttpBodyLimits {
+        decoded,
+        encoded: decoded.saturating_mul(2).min(MAX_CONFIGURED_HTTP_BODY_BYTES),
+    }
+}
 
 struct HttpRequest {
     headers: Vec<u8>,
@@ -3108,10 +3241,12 @@ impl HttpRequestReadError {
         }
     }
 
-    fn payload_too_large() -> Self {
+    fn payload_too_large_with_limit(limit: usize) -> Self {
         Self {
             status: "413 Payload Too Large",
-            message: format!("HTTP 请求体超过 {MAX_HTTP_BODY_BYTES} 字节限制"),
+            message: format!(
+                "HTTP 请求体超过 {limit} 字节限制（可通过 CODEX_PLUS_MAX_HTTP_BODY_BYTES 调大）"
+            ),
         }
     }
 
@@ -3162,6 +3297,14 @@ struct ChunkedScanState {
 
 impl ChunkedScanState {
     fn advance(&mut self, encoded: &[u8]) -> Result<ChunkedBodyScan, HttpRequestReadError> {
+        self.advance_with_limit(encoded, MAX_HTTP_BODY_BYTES)
+    }
+
+    fn advance_with_limit(
+        &mut self,
+        encoded: &[u8],
+        max_body_bytes: usize,
+    ) -> Result<ChunkedBodyScan, HttpRequestReadError> {
         if self.complete {
             return Ok(ChunkedBodyScan::Complete);
         }
@@ -3213,13 +3356,13 @@ impl ChunkedScanState {
             let next_decoded_len = self
                 .decoded_len
                 .checked_add(chunk_size)
-                .ok_or_else(HttpRequestReadError::payload_too_large)?;
-            if next_decoded_len > MAX_HTTP_BODY_BYTES {
-                return Err(HttpRequestReadError::payload_too_large());
+                .ok_or_else(|| HttpRequestReadError::payload_too_large_with_limit(max_body_bytes))?;
+            if next_decoded_len > max_body_bytes {
+                return Err(HttpRequestReadError::payload_too_large_with_limit(max_body_bytes));
             }
             let chunk_end = data_start
                 .checked_add(chunk_size)
-                .ok_or_else(HttpRequestReadError::payload_too_large)?;
+                .ok_or_else(|| HttpRequestReadError::payload_too_large_with_limit(max_body_bytes))?;
             if encoded.len() < chunk_end + 2 {
                 return Ok(ChunkedBodyScan::Incomplete);
             }
@@ -3235,6 +3378,7 @@ impl ChunkedScanState {
 async fn read_http_request(
     stream: &mut tokio::net::TcpStream,
 ) -> Result<HttpRequest, HttpRequestReadError> {
+    let limits = http_body_limits();
     let mut buffer = Vec::new();
     let mut chunk = vec![0_u8; 4096];
     let mut header_end = None;
@@ -3260,20 +3404,20 @@ async fn read_http_request(
         }
         if let Some(end) = header_end {
             let body = &buffer[end + 4..];
-            if body.len() > MAX_HTTP_ENCODED_BODY_BYTES {
-                return Err(HttpRequestReadError::payload_too_large());
+            if body.len() > limits.encoded {
+                return Err(HttpRequestReadError::payload_too_large_with_limit(limits.decoded));
             }
             match framing {
                 HttpBodyFraming::Empty => break,
                 HttpBodyFraming::ContentLength(content_length) => {
-                    if content_length > MAX_HTTP_BODY_BYTES {
-                        return Err(HttpRequestReadError::payload_too_large());
+                    if content_length > limits.decoded {
+                        return Err(HttpRequestReadError::payload_too_large_with_limit(limits.decoded));
                     }
                     if body.len() >= content_length {
                         break;
                     }
                 }
-                HttpBodyFraming::Chunked => match chunked_scan.advance(body)? {
+                HttpBodyFraming::Chunked => match chunked_scan.advance_with_limit(body, limits.decoded)? {
                     ChunkedBodyScan::Incomplete => {}
                     ChunkedBodyScan::Complete => break,
                 },
@@ -3288,9 +3432,9 @@ async fn read_http_request(
     let body = match framing {
         HttpBodyFraming::Empty => Vec::new(),
         HttpBodyFraming::ContentLength(content_length) => {
-            content_length_body(encoded_body, content_length)?
+            content_length_body_with_limit(encoded_body, content_length, limits.decoded)?
         }
-        HttpBodyFraming::Chunked => match decode_chunked_body(encoded_body)? {
+        HttpBodyFraming::Chunked => match decode_chunked_body_with_limit(encoded_body, limits.decoded)? {
             ChunkedBody::Complete(body) => body,
             ChunkedBody::Incomplete => {
                 return Err(HttpRequestReadError::bad_request(
@@ -3359,8 +3503,16 @@ fn content_length_body(
     encoded: &[u8],
     content_length: usize,
 ) -> Result<Vec<u8>, HttpRequestReadError> {
-    if content_length > MAX_HTTP_BODY_BYTES {
-        return Err(HttpRequestReadError::payload_too_large());
+    content_length_body_with_limit(encoded, content_length, MAX_HTTP_BODY_BYTES)
+}
+
+fn content_length_body_with_limit(
+    encoded: &[u8],
+    content_length: usize,
+    max_body_bytes: usize,
+) -> Result<Vec<u8>, HttpRequestReadError> {
+    if content_length > max_body_bytes {
+        return Err(HttpRequestReadError::payload_too_large_with_limit(max_body_bytes));
     }
     if encoded.len() < content_length {
         return Err(HttpRequestReadError::bad_request("HTTP 请求体不完整"));
@@ -3369,6 +3521,13 @@ fn content_length_body(
 }
 
 fn decode_chunked_body(encoded: &[u8]) -> Result<ChunkedBody, HttpRequestReadError> {
+    decode_chunked_body_with_limit(encoded, MAX_HTTP_BODY_BYTES)
+}
+
+fn decode_chunked_body_with_limit(
+    encoded: &[u8],
+    max_body_bytes: usize,
+) -> Result<ChunkedBody, HttpRequestReadError> {
     let mut decoded = Vec::new();
     let mut position = 0;
     loop {
@@ -3412,12 +3571,12 @@ fn decode_chunked_body(encoded: &[u8]) -> Result<ChunkedBody, HttpRequestReadErr
                 position += trailer_end_offset + 2;
             }
         }
-        if decoded.len().saturating_add(chunk_size) > MAX_HTTP_BODY_BYTES {
-            return Err(HttpRequestReadError::payload_too_large());
+        if decoded.len().saturating_add(chunk_size) > max_body_bytes {
+            return Err(HttpRequestReadError::payload_too_large_with_limit(max_body_bytes));
         }
         let chunk_end = position
             .checked_add(chunk_size)
-            .ok_or_else(HttpRequestReadError::payload_too_large)?;
+            .ok_or_else(|| HttpRequestReadError::payload_too_large_with_limit(max_body_bytes))?;
         if encoded.len() < chunk_end + 2 {
             return Ok(ChunkedBody::Incomplete);
         }
@@ -3549,20 +3708,17 @@ async fn launch_packaged_multi_instance(
     // 端口选择在写脚本之前定：脚本里的端口就是实例身份的一部分，必须能让调用方
     // 知道（否则注入会打到旧端口）。
     let known_ports = [debug_port, crate::ports::find_available_loopback_port()];
-    let Some(actual_port) = crate::packaged_launch::select_debug_port(debug_port, &known_ports)
-    else {
-        anyhow::bail!("找不到可用的回环调试端口（请求 {debug_port}）");
-    };
-
-    let wrapper_path = crate::packaged_launch::prepare_wrapper_script(
+    let wrapper = crate::packaged_launch::prepare_wrapper_script_with_port(
         state_dir,
         &executable,
         &resolved_codex_home,
         &resolved_sqlite_home,
         &user_data_dir,
-        actual_port,
+        debug_port,
         &known_ports,
     )?;
+    let actual_port = wrapper.debug_port;
+    let wrapper_path = wrapper.path;
     match crate::packaged_launch::activate_in_package_context(&app_user_model_id, &wrapper_path)
         .await
     {
@@ -4076,6 +4232,66 @@ async fn try_inject(debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
     .await
 }
 
+// 仅在用户启动 Codex 的流程里重载一次；心跳重注入不重载正在使用的页面。
+async fn apply_native_fast_unlock_on_launch(debug_port: u16) -> anyhow::Result<()> {
+    let targets = crate::cdp::list_targets(debug_port).await?;
+    let target = crate::cdp::pick_injectable_codex_page_target(&targets)?;
+    let websocket_url = target
+        .web_socket_debugger_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("selected CDP target has no websocket URL"))?;
+    let probe = "JSON.stringify({ready:window.__codexPlusNativeFastAssetPatchReady===true,compiled:window.__codexPlusNativeFastCompiled==='v1',failed:['unsupported','failed'].includes(window.__codexPlusNativeFastPatchState)})";
+    let state = crate::bridge::evaluate_script(websocket_url, probe).await?;
+    let state = native_fast_launch_state(&state);
+    if state.1 {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !state.2,
+        "当前 Codex 资产不支持原生 Fast 补丁，保留原生身份限制"
+    );
+    anyhow::ensure!(state.0, "原生 Fast 资源补丁未就绪，保留原生界面");
+    crate::bridge::send_cdp_command(
+        websocket_url,
+        "Page.reload",
+        serde_json::json!({ "ignoreCache": true }),
+    )
+    .await?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if let Ok(result) = crate::bridge::evaluate_script(websocket_url, probe).await {
+            let state = native_fast_launch_state(&result);
+            anyhow::ensure!(
+                !state.2,
+                "当前 Codex 资产不支持原生 Fast 补丁，保留原生身份限制"
+            );
+            if state.1 {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.native_fast_unlock_ready",
+                    serde_json::json!({ "debug_port": debug_port }),
+                );
+                return Ok(());
+            }
+        }
+    }
+    anyhow::bail!("当前 Codex 版本未完成原生 Fast 补丁加载，保留原生身份限制")
+}
+
+fn native_fast_launch_state(result: &Value) -> (bool, bool, bool) {
+    let Some(text) = result.pointer("/result/result/value").and_then(Value::as_str) else {
+        return (false, false, false);
+    };
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return (false, false, false);
+    };
+    (
+        value.get("ready").and_then(Value::as_bool) == Some(true),
+        value.get("compiled").and_then(Value::as_bool) == Some(true),
+        value.get("failed").and_then(Value::as_bool) == Some(true),
+    )
+}
+
 async fn confirmed_pet_overlay_targets(
     debug_port: u16,
 ) -> anyhow::Result<Vec<crate::cdp::CdpTarget>> {
@@ -4088,7 +4304,10 @@ async fn confirmed_pet_overlay_targets(
         let Some(websocket_url) = target.web_socket_debugger_url.as_deref() else {
             continue;
         };
-        if pet_overlay_supports_v2_cursor(websocket_url)
+        // 推点只要求 overlay 上已经有 updateScreenPoint。
+        // V2 精灵图 + vscode-api dispatcher 探针经常失败（modulepreload），
+        // 用户脚本的 stub 也会让官方 inject skip，但不能因此停止推坐标。
+        if pet_overlay_has_screen_point_hook(websocket_url)
             .await
             .unwrap_or(false)
         {
@@ -4098,11 +4317,10 @@ async fn confirmed_pet_overlay_targets(
     Ok(confirmed)
 }
 
-async fn pet_overlay_supports_v2_cursor(websocket_url: &str) -> anyhow::Result<bool> {
-    let result = crate::bridge::evaluate_script_with_await_promise(
+async fn pet_overlay_has_screen_point_hook(websocket_url: &str) -> anyhow::Result<bool> {
+    let result = crate::bridge::evaluate_script(
         websocket_url,
-        &crate::assets::pet_real_mouse_capability_probe_script(),
-        true,
+        crate::assets::pet_real_mouse_hook_probe_script(),
     )
     .await?;
     Ok(runtime_evaluate_result_is_true(&result))
@@ -4120,19 +4338,20 @@ async fn sync_pet_real_mouse_overlay(debug_port: u16, _helper_port: u16) -> anyh
             continue;
         };
         let script = if !enabled {
-            crate::assets::pet_real_mouse_stop_script()
-        } else if pet_overlay_supports_v2_cursor(websocket_url)
+            Some(crate::assets::pet_real_mouse_stop_script())
+        } else if pet_overlay_has_screen_point_hook(websocket_url)
             .await
-            .with_context(|| {
-                format!(
-                    "failed to probe pet overlay capability in target {} ({})",
-                    target.id, target.url
-                )
-            })?
+            .unwrap_or(false)
         {
-            crate::assets::pet_real_mouse_script()
+            // 已有官方 runtime 或用户脚本 stub 时保留它，避免重置其 dispatcher。
+            None
         } else {
-            crate::assets::pet_real_mouse_stop_script()
+            // 旧的 V2 dispatcher 探针可能因 modulepreload 时序失败；先安装 runtime，
+            // 后续 driver 会再次确认 hook，runtime 自己负责判断 dispatcher 是否可用。
+            Some(crate::assets::pet_real_mouse_script())
+        };
+        let Some(script) = script else {
+            continue;
         };
         crate::bridge::evaluate_script(websocket_url, script)
             .await
@@ -4146,7 +4365,7 @@ async fn sync_pet_real_mouse_overlay(debug_port: u16, _helper_port: u16) -> anyh
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn run_pet_real_mouse_cursor_driver(debug_port: u16) {
     loop {
         let settings = SettingsStore::default().load().unwrap_or_default();
@@ -4183,16 +4402,16 @@ async fn run_pet_real_mouse_cursor_driver(debug_port: u16) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn run_pet_real_mouse_target_driver(debug_port: u16, target: crate::cdp::CdpTarget) {
     let Some(websocket_url) = target.web_socket_debugger_url.as_deref() else {
         return;
     };
+    // 官方 inject 失败或被用户脚本 stub skip 都不能阻止后续推点。
     if let Err(error) =
         crate::bridge::evaluate_script(websocket_url, crate::assets::pet_real_mouse_script()).await
     {
         record_pet_cursor_driver_failure(debug_port, &target, error);
-        return;
     }
 
     let mut ticks_until_settings_check = 10_u8;
@@ -4208,7 +4427,7 @@ async fn run_pet_real_mouse_target_driver(debug_port: u16, target: crate::cdp::C
                 ticks_until_settings_check = 10;
             }
             ticks_until_settings_check -= 1;
-            let (x, y) = windows_logical_cursor_position()?;
+            let (x, y) = logical_cursor_position()?;
             Ok(Some(crate::assets::pet_real_mouse_update_script(x, y)))
         },
     )
@@ -4229,7 +4448,7 @@ async fn run_pet_real_mouse_target_driver(debug_port: u16, target: crate::cdp::C
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn record_pet_cursor_driver_failure(
     debug_port: u16,
     target: &crate::cdp::CdpTarget,
@@ -5576,6 +5795,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn helper_protocol_safety_rejects_files_before_upstream_and_checks_original_compaction_wire()
+     {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        struct Restore(Option<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::paths::set_settings_path_for_tests(self.0.take());
+            }
+        }
+        let _restore = Restore(crate::paths::set_settings_path_for_tests(Some(
+            path.clone(),
+        )));
+        async fn request(body: serde_json::Value) -> String {
+            let body = body.to_string();
+            let raw = format!(
+                "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            String::from_utf8(send_raw_helper_request(raw.as_bytes()).await).unwrap()
+        }
+        let write_profile = |protocol: &str, url: &str| {
+            std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"relayProfilesEnabled":true,
+                "activeRelayId":"safety", "relayProfiles":[{"id":"safety","name":"Safety fixture","baseUrl":format!("{url}/v1"),
+                "apiKey":"fixture-only","protocol":protocol,"relayMode":"pureApi"}]})).unwrap()).unwrap();
+        };
+        for protocol in ["chatCompletions", "anthropicMessages"] {
+            let upstream = MockServer::start().await;
+            write_profile(protocol, &upstream.uri());
+            let response = request(
+                serde_json::json!({"model":"fixture","input":[{"role":"user","content":[
+                {"type":"input_file","file_data":"private-file-payload"}]}]}),
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request"),
+                "{response}"
+            );
+            assert!(response.contains("unsupported_input_file"));
+            assert!(response.contains("input[0].content[0]"));
+            assert!(!response.contains("private-file-payload"));
+            assert!(upstream.received_requests().await.unwrap().is_empty());
+        }
+        let anthropic_prefix = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"fixture\",\"model\":\"fixture\",\"usage\":{}}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"summary\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{}}\n\n"
+        );
+        for (protocol, stream, payload, complete) in [
+            ("chatCompletions",false,serde_json::json!({"choices":[{"message":{"content":"summary"},"finish_reason":"stop"}]}).to_string(),true),
+            ("chatCompletions",false,serde_json::json!({"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}).to_string(),false),
+            ("anthropicMessages",false,serde_json::json!({"type":"message","content":[{"type":"text","text":"summary"}],"stop_reason":"end_turn"}).to_string(),true),
+            ("anthropicMessages",false,serde_json::json!({"type":"message","content":[{"type":"text","text":"partial"}],"stop_reason":null}).to_string(),false),
+            ("chatCompletions",true,"data: {\"choices\":[{\"delta\":{\"content\":\"summary\"},\"finish_reason\":\"stop\"}]}\n\n".to_string(),true),
+            ("chatCompletions",true,"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: [DONE]\n\n".to_string(),false),
+            ("anthropicMessages",true,format!("{anthropic_prefix}data: {{\"type\":\"message_stop\"}}\n\n"),true),
+            ("anthropicMessages",true,anthropic_prefix.to_string(),false),
+            ("anthropicMessages",true,format!("{anthropic_prefix}data: [DONE]\n\n"),false),
+        ] {
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)
+                .set_body_string(payload).insert_header("Content-Type", if stream {"text/event-stream"} else {"application/json"}))
+                .mount(&upstream).await;
+            write_profile(protocol, &upstream.uri());
+            let response = request(serde_json::json!({"model":"fixture","stream":stream,"input":[{"type":"compaction_trigger"}]})).await;
+            assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+            assert_eq!(response.contains("event: response.completed"), complete, "{protocol}: {response}");
+            assert_eq!(response.contains("event: response.output_item.done"), complete, "{protocol}: {response}");
+            assert_eq!(response.contains("event: response.failed"), !complete, "{protocol}: {response}");
+            assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn helper_rejects_encrypted_agent_content_as_bad_request_before_upstream_send() {
         let _settings_guard = crate::paths::settings_path_test_guard();
         let temp = tempfile::tempdir().unwrap();
@@ -6194,5 +6490,78 @@ mod proxy_stream_tests {
             forward_fixture(&without_stop, false, UpstreamWireApi::AnthropicMessages).await;
         assert!(failure.is_none(), "{failure:?}");
         assert!(output.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn native_overflow_ends_stream_while_upstream_stays_open() {
+        use std::time::Duration;
+        use tokio::time::{sleep, timeout};
+
+        // 调用方回归：上游发送超过事件上限且不含分隔符的数据后保持连接不关闭。
+        // 转发层必须在超限的那个 chunk 上立即上报失败终态，而不是阻塞等待 EOF，
+        // 也不能把被截断事件的后半段继续转发给客户端。
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let byte = socket.read_u8().await.unwrap();
+                request.push(byte);
+                if request.ends_with(b"\r\n\r\n") { break; }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            // 20 * 256 KiB = 5 MiB，超过 4 MiB 上限
+            let block = vec![b'a'; 256 * 1024];
+            for _ in 0..20 {
+                socket
+                    .write_all(format!("{:X}\r\n", block.len()).as_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(&block).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+            }
+            // 不写终止块也不 shutdown：模拟上游保持连接
+            sleep(Duration::from_secs(60)).await;
+        });
+
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/stream?key=fixture-secret"))
+            .send()
+            .await
+            .unwrap();
+        let downstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut reader = tokio::net::TcpStream::connect(downstream.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut writer, _) = downstream.accept().await.unwrap();
+
+        let forwarded = timeout(
+            Duration::from_secs(20),
+            forward_protocol_proxy_stream(&mut writer, response, UpstreamWireApi::Responses, None),
+        )
+        .await
+        .expect("超限后必须立即结束流，而不是等待上游 EOF")
+        .unwrap();
+        writer.shutdown().await.unwrap();
+
+        let failure = forwarded.expect("超限必须被记成流失败");
+        assert!(failure.contains("上限"), "unexpected failure: {}", failure);
+        assert!(!failure.contains("fixture-secret"), "failure must not leak the URL");
+
+        let mut forwarded_bytes = Vec::new();
+        reader.read_to_end(&mut forwarded_bytes).await.unwrap();
+        assert!(
+            forwarded_bytes.is_empty(),
+            "被截断的超限事件不得转发给客户端，收到 {} 字节",
+            forwarded_bytes.len()
+        );
+        upstream_task.abort();
     }
 }

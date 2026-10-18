@@ -461,7 +461,7 @@ fn partial_database_delete_keeps_live_duplicate_and_its_history() {
         &SessionRef::new("local:a", "a").unwrap(),
         Some(f.home()),
     );
-    assert_eq!(r.status, DeleteStatus::LocalDeleted, "{}", r.message);
+    assert_eq!(r.status, DeleteStatus::Failed, "{}", r.message);
     assert!(
         f.path("a").exists(),
         "undeleted duplicate still owns rollout"

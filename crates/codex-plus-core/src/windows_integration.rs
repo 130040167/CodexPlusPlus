@@ -87,12 +87,7 @@ pub fn close_process_tree(process_id: u32, force: bool) -> bool {
         return request_process_close(process_id);
     }
     let output = std::process::Command::new("taskkill")
-        .args([
-            "/PID",
-            process_id.to_string().as_str(),
-            "/T",
-            "/F",
-        ])
+        .args(["/PID", process_id.to_string().as_str(), "/T", "/F"])
         .output();
     matches!(output, Ok(output) if output.status.success())
 }
@@ -499,10 +494,17 @@ pub(crate) fn terminate_verified_multi_worker(
         return Ok(false);
     }
     let Ok(handle) = (unsafe {
-        OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
-            false, process_id)
-    }) else { return Ok(false); };
-    if handle.is_invalid() { return Ok(false); }
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+            false,
+            process_id,
+        )
+    }) else {
+        return Ok(false);
+    };
+    if handle.is_invalid() {
+        return Ok(false);
+    }
     let _guard = HandleGuard(handle);
     let actual_birth = process_birth_id_from_handle(handle);
     if actual_birth != expected_birth { return Ok(false); }
@@ -517,8 +519,15 @@ pub(crate) fn terminate_verified_multi_worker(
     } else { None };
     // CommandLineToArgvW 分配的 argv 必须用 LocalFree 释放。
     unsafe { LocalFree(HLOCAL(argv.cast())) };
-    let Some(arguments) = arguments else { return Ok(false); };
-    if !crate::multi_worker::worker_identity_matches(expected_birth, actual_birth, &arguments, options_path) {
+    let Some(arguments) = arguments else {
+        return Ok(false);
+    };
+    if !crate::multi_worker::worker_identity_matches(
+        expected_birth,
+        actual_birth,
+        &arguments,
+        options_path,
+    ) {
         return Ok(false);
     }
     let Some(image) = process_image_path_from_handle(handle) else { return Ok(false); };
@@ -526,6 +535,86 @@ pub(crate) fn terminate_verified_multi_worker(
         else { return Ok(false); };
     if image.canonicalize().ok().as_ref() != Some(&expected_image) { return Ok(false); }
     unsafe { TerminateProcess(handle, 0) }.context("结束已验证的多开 worker 失败")?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn command_line_arguments(command_line: &str) -> Option<Vec<String>> {
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::UI::Shell::CommandLineToArgvW;
+    let wide = wide_null(command_line);
+    let mut count = 0;
+    let argv = unsafe { CommandLineToArgvW(PCWSTR(wide.as_ptr()), &mut count) };
+    if argv.is_null() {
+        return None;
+    }
+    let arguments = if (1..=32768).contains(&count) {
+        unsafe { std::slice::from_raw_parts(argv, count as usize) }
+            .iter()
+            .map(|value| unsafe { value.to_string() }.ok())
+            .collect()
+    } else {
+        None
+    };
+    unsafe { LocalFree(HLOCAL(argv.cast())) };
+    arguments
+}
+
+#[cfg(windows)]
+pub(crate) fn process_arguments(process_id: u32) -> Option<Vec<String>> {
+    command_line_arguments(&process_command_line(process_id)?)
+}
+
+/// 命令行、创建时间、映像与终止共用同一句柄，拒绝按端口或 PID 猜测归属。
+#[cfg(windows)]
+pub(crate) fn terminate_verified_codex_instance(
+    identity: &crate::multi_worker::CodexInstanceIdentity,
+) -> anyhow::Result<bool> {
+    if identity.process_id == std::process::id() || identity.process_birth_id == 0 {
+        return Ok(false);
+    }
+    let Ok(handle) = (unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+            false,
+            identity.process_id,
+        )
+    }) else {
+        return Ok(false);
+    };
+    if handle.is_invalid() {
+        return Ok(false);
+    }
+    let _guard = HandleGuard(handle);
+    if process_birth_id_from_handle(handle) != Some(identity.process_birth_id) {
+        return Ok(false);
+    }
+    let Some(image) = process_image_path_from_handle(handle) else {
+        return Ok(false);
+    };
+    let normalize = |path: &std::path::Path| {
+        path.to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .to_ascii_lowercase()
+    };
+    if normalize(&image) != normalize(&identity.executable) {
+        return Ok(false);
+    }
+    let Some(arguments) =
+        process_command_line_from_handle(handle).and_then(|line| command_line_arguments(&line))
+    else {
+        return Ok(false);
+    };
+    if !crate::multi_worker::codex_arguments_match(
+        &arguments,
+        &identity.user_data_dir,
+        identity.debug_port,
+    ) || unique_listener_process_id(&loopback_listener_process_ids(identity.debug_port)?)?
+        != Some(identity.process_id)
+    {
+        return Ok(false);
+    }
+    unsafe { TerminateProcess(handle, 0) }.context("结束已验证的多开 Codex 实例失败")?;
     Ok(true)
 }
 
@@ -1050,22 +1139,66 @@ pub fn activate_process_window(process_id: u32) -> bool {
     }
 }
 
+/// 同一窗口分别确认图标与任务栏属性；换 HWND 后不能沿用上一窗口的成功状态。
+#[cfg(any(windows, test))]
+#[derive(Default)]
+pub(crate) struct WindowIconApplyState {
+    target: Option<usize>,
+    window_icon: bool,
+    taskbar: bool,
+}
+
+#[cfg(any(windows, test))]
+impl WindowIconApplyState {
+    fn apply(&mut self, target: usize, icon: impl FnOnce() -> bool, taskbar: impl FnOnce() -> bool) -> bool {
+        if self.target != Some(target) {
+            *self = Self { target: Some(target), ..Self::default() };
+        }
+        if !self.window_icon { self.window_icon = icon(); }
+        if !self.taskbar { self.taskbar = taskbar(); }
+        self.window_icon && self.taskbar
+    }
+}
+
 #[cfg(windows)]
 pub fn apply_codexplusplus_icon_to_process_window(
     process_id: u32,
     icon_resource_path: PathBuf,
 ) -> bool {
+    apply_codexplusplus_icon_attempt(process_id, &icon_resource_path, &mut WindowIconApplyState::default())
+}
+
+#[cfg(windows)]
+pub(crate) fn apply_codexplusplus_icon_attempt(
+    process_id: u32,
+    icon_resource_path: &PathBuf,
+    state: &mut WindowIconApplyState,
+) -> bool {
     let Some(hwnd) = visible_window_for_process(process_id) else {
         return false;
     };
-    let mut applied = false;
-    if apply_window_icons(hwnd, &icon_resource_path) {
-        applied = true;
+    let complete = state.apply(hwnd.0 as usize,
+        || apply_window_icons(hwnd, icon_resource_path),
+        || apply_taskbar_properties(hwnd, icon_resource_path).is_ok());
+    if !complete {
+        let _ = crate::diagnostic_log::append_diagnostic_log("launcher.window_icon.partial", serde_json::json!({
+            "process_id": process_id, "window_icon": state.window_icon, "taskbar": state.taskbar,
+        }));
     }
-    if apply_taskbar_properties(hwnd, &icon_resource_path).is_ok() {
-        applied = true;
+    complete
+}
+
+#[cfg(test)]
+mod icon_retry_tests {
+    use super::WindowIconApplyState;
+    #[test]
+    fn partial_success_retries_only_failed_steps_and_resets_for_a_new_window() {
+        let mut state = WindowIconApplyState::default();
+        assert!(!state.apply(1, || false, || true));
+        assert!(state.apply(1, || true, || panic!("任务栏已经成功，不应重复设置")));
+        assert!(!state.apply(2, || true, || false));
+        assert!(state.apply(2, || panic!("图标已经成功，不应重复设置"), || true));
     }
-    applied
 }
 
 #[cfg(windows)]

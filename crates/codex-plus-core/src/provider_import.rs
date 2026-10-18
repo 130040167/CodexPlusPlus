@@ -156,7 +156,7 @@ pub fn initialize_local_config_provider(
     }
     settings.local_config_provider_imported = true;
     store.save(&settings)?;
-    Ok(settings)
+    store.load()
 }
 
 pub fn import_provider_from_url(url: &str) -> anyhow::Result<ProviderImportResult> {
@@ -353,6 +353,8 @@ fn relay_profile_from_request(
         custom_headers: Vec::new(),
         standard_openai_protocol: false,
         web_search_history_compat: false,
+        trust_upstream_catalog_lite: false,
+        strict_responses_reasoning: false,
         anthropic_auth_header: String::new(),
         anthropic_max_tokens: 0,
         anthropic_prompt_cache: true,
