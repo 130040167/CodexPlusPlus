@@ -14,7 +14,7 @@ use codex_plus_core::settings::{
 };
 use codex_plus_core::status::{LaunchStatus, StatusStore};
 use codex_plus_core::user_scripts::UserScriptManager;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tauri::Emitter;
 
@@ -680,6 +680,13 @@ pub struct LogsPayload {
 #[derive(Debug, Clone, Serialize)]
 pub struct DiagnosticsPayload {
     pub report: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SettingsExportDocument {
+    schema: u8,
+    exported_at_ms: u64,
+    settings: BackendSettings,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6295,6 +6302,77 @@ pub fn copy_diagnostics() -> CommandResult<DiagnosticsPayload> {
         "诊断报告已生成。",
         DiagnosticsPayload {
             report: diagnostics_report(),
+        },
+    )
+}
+
+#[tauri::command]
+pub fn export_settings(path: String, settings: BackendSettings) -> CommandResult<Value> {
+    let path = PathBuf::from(path.trim());
+    if path.as_os_str().is_empty() {
+        return failed("导出路径为空。", json!({}));
+    }
+    let document = SettingsExportDocument {
+        schema: 1,
+        exported_at_ms: current_timestamp_ms(),
+        settings,
+    };
+    let contents = match serde_json::to_vec_pretty(&document) {
+        Ok(contents) => contents,
+        Err(error) => return failed(&format!("序列化配置失败：{error}"), json!({})),
+    };
+    if let Some(parent) = path.parent()
+        && let Err(error) = fs::create_dir_all(parent)
+    {
+        return failed(&format!("创建导出目录失败：{error}"), json!({}));
+    }
+    match fs::write(&path, contents) {
+        Ok(()) => ok(
+            "配置已导出。导出文件包含供应商密钥等敏感信息，请妥善保管。",
+            json!({ "path": path.to_string_lossy() }),
+        ),
+        Err(error) => failed(&format!("写入配置导出文件失败：{error}"), json!({})),
+    }
+}
+
+#[tauri::command]
+pub fn preview_import_settings(path: String) -> CommandResult<SettingsPayload> {
+    let path = PathBuf::from(path.trim());
+    let bytes = match fs::read(&path) {
+        Ok(bytes) if bytes.len() <= 8 * 1024 * 1024 => bytes,
+        Ok(_) => return failed("配置导入文件超过 8 MiB 上限。", fallback_settings_payload()),
+        Err(error) => return failed(&format!("读取配置导入文件失败：{error}"), fallback_settings_payload()),
+    };
+    let value: Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(error) => return failed(&format!("配置导入文件不是有效 JSON：{error}"), fallback_settings_payload()),
+    };
+    let mut settings: BackendSettings = if value.get("settings").is_some() {
+        match serde_json::from_value(value.get("settings").cloned().unwrap_or_default()) {
+            Ok(settings) => settings,
+            Err(error) => return failed(&format!("配置导入文件中的 settings 无效：{error}"), fallback_settings_payload()),
+        }
+    } else {
+        match serde_json::from_value(value) {
+            Ok(settings) => settings,
+            Err(error) => return failed(&format!("配置导入文件格式无效：{error}"), fallback_settings_payload()),
+        }
+    };
+    let current = match SettingsStore::default().load() {
+        Ok(current) => current,
+        Err(error) => return failed(&format!("读取当前设置失败：{error}"), fallback_settings_payload()),
+    };
+    settings.settings_revision = current.settings_revision;
+    settings.sync_tool_shards();
+    ok(
+        "配置已读入草稿，请检查后点击“保存设置”写入本机。",
+        SettingsPayload {
+            revision: settings.settings_revision.clone(),
+            settings,
+            settings_path: codex_plus_core::paths::default_settings_path()
+                .to_string_lossy()
+                .to_string(),
+            user_scripts: user_script_inventory(),
         },
     )
 }

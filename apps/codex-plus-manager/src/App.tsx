@@ -2757,6 +2757,46 @@ export function App() {
     }
   };
 
+  const exportSettings = async () => {
+    try {
+      const selected = await saveDialog({
+        title: t("导出 Codex++ 配置"),
+        defaultPath: "codex-plus-plus-settings.json",
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!selected) return;
+      const result = await run(() => call<CommandResult<{ path: string }>>("export_settings", {
+        path: selected,
+        settings: normalizeSettings(settingsForm),
+      }));
+      if (result) showNotice(t("导出 Codex++ 配置"), result.message, result.status);
+    } catch (error) {
+      showNotice(t("导出 Codex++ 配置"), stringifyError(error), "failed");
+    }
+  };
+
+  const importSettings = async () => {
+    try {
+      const selected = await open({
+        title: t("导入 Codex++ 配置"),
+        multiple: false,
+        directory: false,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (typeof selected !== "string" || !selected.trim()) return;
+      const result = await run(() => call<SettingsResult>("preview_import_settings", { path: selected }));
+      if (!result || !isSuccessStatus(result.status)) {
+        if (result) showNotice(t("导入 Codex++ 配置"), result.message, result.status);
+        return;
+      }
+      setSettings(settings ?? result);
+      setSettingsForm(normalizeSettings(result.settings));
+      showNotice(t("导入 Codex++ 配置"), result.message, "ok");
+    } catch (error) {
+      showNotice(t("导入 Codex++ 配置"), stringifyError(error), "failed");
+    }
+  };
+
   const resetImageOverlaySettings = async () => {
     const result = await run(() => call<SettingsResult>("reset_image_overlay_settings"));
     if (result) {
@@ -3606,6 +3646,8 @@ export function App() {
       saveSettingsValue,
       refreshSettings,
       resetSettings,
+      exportSettings,
+      importSettings,
       resetImageOverlaySettings,
       chooseCodexAppPath: async (mode: "folder" | "file") => {
         let selected: unknown;
@@ -4270,6 +4312,8 @@ type Actions = {
   saveSettingsValue: (settings: BackendSettings, silent?: boolean) => Promise<BackendSettings | null>;
   refreshSettings: (silent?: boolean) => Promise<BackendSettings | null>;
   resetSettings: () => Promise<void>;
+  exportSettings: () => Promise<void>;
+  importSettings: () => Promise<void>;
   resetImageOverlaySettings: () => Promise<void>;
   chooseCodexAppPath: (mode: "folder" | "file") => Promise<void>;
   clearCodexAppPath: () => Promise<void>;
@@ -8198,6 +8242,14 @@ function SettingsScreen({
               <span>{t("当前为")}{theme === "dark" ? t("深色") : t("浅色")}{t("模式。")}</span>
             </div>
             <Button variant="secondary" onClick={actions.toggleTheme}>{t("切换主题")}</Button>
+          </div>
+          <div className="settings-block">
+            <strong>{t("配置备份与迁移")}</strong>
+            <p className="field-hint">{t("导出文件包含供应商 API Key 等敏感信息；导入只会读入草稿，检查后仍需点击保存设置。")}</p>
+            <Toolbar>
+              <Button variant="secondary" onClick={() => void actions.exportSettings()}>{t("导出完整配置")}</Button>
+              <Button variant="secondary" onClick={() => void actions.importSettings()}>{t("导入配置草稿")}</Button>
+            </Toolbar>
           </div>
         </CardContent>
       </Panel>

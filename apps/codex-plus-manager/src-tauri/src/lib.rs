@@ -242,6 +242,8 @@ pub fn run() {
             commands::scan_agent_cache,
             commands::clean_agent_cache,
             commands::copy_diagnostics,
+            commands::export_settings,
+            commands::preview_import_settings,
             commands::reset_settings,
             commands::reset_image_overlay_settings,
             commands::relay_status,

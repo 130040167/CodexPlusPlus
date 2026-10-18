@@ -50,6 +50,15 @@ test("maintenance retains application entrypoint checks and repairs", () => {
   assert.match(screen, /actions\.repairShortcuts\(\)/);
 });
 
+test("settings exposes reviewed configuration export and draft import", () => {
+  const screen = functionSource("SettingsScreen");
+  assert.match(screen, /actions\.exportSettings\(\)/);
+  assert.match(screen, /actions\.importSettings\(\)/);
+  const entry = functionSource("App");
+  assert.match(entry, /call<CommandResult<\{ path: string \}>>\("export_settings"/);
+  assert.match(entry, /call<SettingsResult>\("preview_import_settings"/);
+});
+
 test("maintenance no longer offers the removed entrypoint management panel", () => {
   const screen = functionSource("MaintenanceScreen");
   assert.doesNotMatch(screen, /入口管理|安装入口|卸载入口|修复入口|卸载时移除 Codex\+\+ 托管数据/);
