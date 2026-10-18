@@ -7989,13 +7989,12 @@ impl ResponsesSseTransformer {
         match event_type {
             "response.completed" => self.completed = true,
             "response.failed" => {
-                self.failure = Some("原生 Responses 上游返回 response.failed".to_string())
+                self.fail("原生 Responses 上游返回 response.failed".to_string())
             }
             "response.incomplete" => {
-                self.failure =
-                    Some("原生 Responses 上游返回 response.incomplete".to_string())
+                self.fail("原生 Responses 上游返回 response.incomplete".to_string())
             }
-            "error" => self.failure = Some("原生 Responses 上游返回 error 事件".to_string()),
+            "error" => self.fail("原生 Responses 上游返回 error 事件".to_string()),
             _ => {}
         }
 
@@ -8309,6 +8308,16 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","name":
     fn test_failed_detection() {
         let mut t = ResponsesSseTransformer::default();
         t.push_bytes(b"data:{\"type\":\"response.failed\",\"error\":{\"message\":\"x\"}}\n\n");
+        assert!(t.finish().is_some());
+    }
+
+    #[test]
+    fn test_terminal_failure_stops_forwarding_until_eof() {
+        let mut t = ResponsesSseTransformer::default();
+        let failure = b"data:{\"type\":\"response.failed\"}\n\n";
+        assert_eq!(t.push_bytes(failure), failure.to_vec());
+        assert!(t.has_failed());
+        assert!(t.push_bytes(b"data:{\"type\":\"response.completed\"}\n\n").is_empty());
         assert!(t.finish().is_some());
     }
 
