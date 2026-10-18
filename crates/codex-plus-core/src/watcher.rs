@@ -36,8 +36,44 @@ pub fn watcher_disabled_flag(root: &Path) -> PathBuf {
     root.join("watcher.disabled")
 }
 
+pub fn watcher_start_minimized_flag(root: &Path) -> PathBuf {
+    root.join("watcher.start-minimized")
+}
+
 pub fn default_watcher_disabled_flag() -> PathBuf {
     watcher_disabled_flag(&crate::paths::default_app_state_dir())
+}
+
+pub fn default_watcher_start_minimized_flag() -> PathBuf {
+    watcher_start_minimized_flag(&crate::paths::default_app_state_dir())
+}
+
+pub fn set_watcher_start_minimized_at(root: &Path, minimized: bool) -> std::io::Result<()> {
+    let flag = watcher_start_minimized_flag(root);
+    if minimized {
+        if let Some(parent) = flag.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(flag, b"enabled")
+    } else {
+        match std::fs::remove_file(flag) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+pub fn set_watcher_start_minimized(minimized: bool) -> std::io::Result<()> {
+    set_watcher_start_minimized_at(&crate::paths::default_app_state_dir(), minimized)
+}
+
+pub fn watcher_start_minimized_at(root: &Path) -> bool {
+    watcher_start_minimized_flag(root).is_file()
+}
+
+pub fn watcher_start_minimized() -> bool {
+    watcher_start_minimized_at(&crate::paths::default_app_state_dir())
 }
 
 pub fn enable_watcher_at(root: &Path) -> std::io::Result<()> {

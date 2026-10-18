@@ -916,6 +916,7 @@ type DiagnosticsResult = CommandResult<{
 type WatcherResult = CommandResult<{
   enabled: boolean;
   disabled_flag: string;
+  start_minimized: boolean;
 }>;
 
 // 与 Rust 侧 `auto_takeover::AutoTakeoverPayload`（rename_all = "camelCase"）逐字段对齐。
@@ -2516,6 +2517,14 @@ export function App() {
     }
   };
 
+  const setWatcherStartMinimized = async (minimized: boolean) => {
+    const result = await run(() => call<WatcherResult>("set_watcher_start_minimized", { minimized }));
+    if (result) {
+      setWatcher(result);
+      showNotice(t("开机启动自动最小化"), result.message, result.status);
+    }
+  };
+
   const checkUpdate = async (silent = false) => {
     if (updateInstallPending.current) return;
     if (updateCheckPending.current) {
@@ -3763,6 +3772,7 @@ export function App() {
         showNotice(t("检查完成"), t("已刷新 Codex 应用、入口和 Watcher 状态。"), "ok");
       },
       setWatcherEnabled,
+      setWatcherStartMinimized,
       setAutoTakeover,
       refreshAutoTakeover: () => refreshAutoTakeover(false),
       takeOverNow: () => runAutoTakeoverCommand("take_over_codex_now"),
@@ -4329,6 +4339,7 @@ type Actions = {
   copyDiagnostics: () => Promise<void>;
   goLogs: () => Promise<void>;
   setWatcherEnabled: (enabled: boolean) => Promise<void>;
+  setWatcherStartMinimized: (minimized: boolean) => Promise<void>;
   setAutoTakeover: (enabled: boolean) => Promise<void>;
   refreshAutoTakeover: () => Promise<void>;
   takeOverNow: () => Promise<void>;
@@ -7888,6 +7899,19 @@ function MaintenanceScreen({
             <span>
               <strong>{t("登录时自动打开")}</strong>
               <small>{t("开启后注册系统登录项，关闭时移除；Codex 仍需你手动点击启动。")}</small>
+            </span>
+            <ToggleVisual />
+          </label>
+          <label className="switch-row">
+            <input
+              checked={Boolean(watcher?.start_minimized)}
+              disabled={!watcher}
+              onChange={(event) => void actions.setWatcherStartMinimized(event.currentTarget.checked)}
+              type="checkbox"
+            />
+            <span>
+              <strong>{t("启动时自动最小化")}</strong>
+              <small>{t("仅登录启动时隐藏到托盘；手动打开 Codex++ 仍显示主窗口。")}</small>
             </span>
             <ToggleVisual />
           </label>

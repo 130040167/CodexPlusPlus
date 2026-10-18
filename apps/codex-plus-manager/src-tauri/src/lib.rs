@@ -70,6 +70,8 @@ pub fn run() {
         );
     }
     let show_update = commands::startup_should_show_update();
+    let start_minimized = std::env::args().any(|arg| arg == "--autostart")
+        && codex_plus_core::watcher::watcher_start_minimized();
     let app_result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
@@ -81,8 +83,8 @@ pub fn run() {
             let mut main_window_builder =
                 tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App(url.into()))
                     .title("Codex++")
-                    .visible(true)
-                    .focused(true)
+                    .visible(!start_minimized)
+                    .focused(!start_minimized)
                     .inner_size(1180.0, 820.0)
                     .min_inner_size(960.0, 720.0);
             if let Some(icon) = app.default_window_icon().cloned() {
@@ -90,6 +92,9 @@ pub fn run() {
             }
             let main_window = main_window_builder.build()?;
             install_tray(app)?;
+            if start_minimized {
+                set_manager_activation_policy(app.handle(), false);
+            }
             let navigation_app = app.handle().clone();
             codex_plus_launcher::set_navigation_handler(move |_payload| {
                 let app = navigation_app.clone();
@@ -210,6 +215,7 @@ pub fn run() {
             commands::perform_update,
             commands::load_watcher_state,
             commands::set_watcher_enabled,
+            commands::set_watcher_start_minimized,
             // 自动接管官方 App：前端 invoke 找不到命令时是运行期静默失败，
             // 没有编译期兜底，所以这三个必须注册在这里（契约测试会守）。
             commands::load_auto_takeover_state,

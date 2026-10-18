@@ -4,7 +4,7 @@ use codex_plus_core::watcher::{
     macos_launcher_process_names, macos_launch_agent_installed_at, macos_launch_agent_path_at,
     macos_launch_agent_plist, process_id_is_running, process_ids_still_running,
     remove_macos_launch_agent_at, should_recover_stale_launcher, watcher_disabled_flag,
-    write_macos_launch_agent_at,
+    set_watcher_start_minimized_at, watcher_start_minimized_at, write_macos_launch_agent_at,
 };
 
 #[cfg(windows)]
@@ -49,6 +49,18 @@ fn watcher_enable_and_disable_toggle_flag() {
 
     enable_watcher_at(dir.path()).unwrap();
     assert!(!flag.exists());
+}
+
+#[test]
+fn watcher_start_minimized_is_a_separate_persistent_preference() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!watcher_start_minimized_at(dir.path()));
+
+    set_watcher_start_minimized_at(dir.path(), true).unwrap();
+    assert!(watcher_start_minimized_at(dir.path()));
+
+    set_watcher_start_minimized_at(dir.path(), false).unwrap();
+    assert!(!watcher_start_minimized_at(dir.path()));
 }
 
 #[test]

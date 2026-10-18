@@ -658,6 +658,7 @@ pub struct DiagnosticsPayload {
 pub struct WatcherPayload {
     pub enabled: bool,
     pub disabled_flag: String,
+    pub start_minimized: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6102,6 +6103,18 @@ pub fn set_watcher_enabled(enabled: bool) -> CommandResult<WatcherPayload> {
 }
 
 #[tauri::command]
+pub fn set_watcher_start_minimized(minimized: bool) -> CommandResult<WatcherPayload> {
+    match codex_plus_core::watcher::set_watcher_start_minimized(minimized) {
+        Ok(()) if minimized => ok("开机启动时将自动最小化。", watcher_payload()),
+        Ok(()) => ok("已取消开机启动自动最小化。", watcher_payload()),
+        Err(error) => failed(
+            &format!("设置开机启动自动最小化失败：{error}"),
+            watcher_payload(),
+        ),
+    }
+}
+
+#[tauri::command]
 pub fn read_latest_logs(request: LogRequest) -> CommandResult<LogsPayload> {
     let path = codex_plus_core::paths::default_diagnostic_log_path();
     match read_tail(&path, request.lines) {
@@ -8151,6 +8164,7 @@ fn watcher_payload() -> WatcherPayload {
     WatcherPayload {
         enabled: codex_plus_core::watcher::watcher_is_installed() && !flag.exists(),
         disabled_flag: flag.to_string_lossy().to_string(),
+        start_minimized: codex_plus_core::watcher::watcher_start_minimized(),
     }
 }
 
