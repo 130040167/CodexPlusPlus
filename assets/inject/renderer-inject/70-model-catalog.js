@@ -270,7 +270,7 @@
 
   function patchModelNameArray(models, hostId) {
     if (!stringArrayLooksPatchable(models)) return false;
-    const allowed = codexPureApiAllowedModelSet(hostId);
+    const allowed = codexAggregateAllowedModelSet(hostId) || codexPureApiAllowedModelSet(hostId);
     let changed = prepareModelCollection(models, allowed);
     const customModels = codexPlusModelNames();
     if (!customModels.length) return changed;

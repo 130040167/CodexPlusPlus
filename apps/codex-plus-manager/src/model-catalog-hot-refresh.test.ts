@@ -14,6 +14,23 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+it("string model collections withdraw models from the previous aggregate", async () => {
+  const source = await readFile(CATALOG_URL, "utf8");
+  const block = source.match(/  function patchModelNameArray\([^]*?\n  \}/)?.[0];
+  assert.ok(block);
+  const patch = vm.runInNewContext(`(() => {${block}; return patchModelNameArray;})()`, {
+    stringArrayLooksPatchable: Array.isArray,
+    codexAggregateAllowedModelSet: () => new Set(["cpx-current/sol"]),
+    codexPureApiAllowedModelSet: () => null,
+    prepareModelCollection: () => false,
+    finishModelCollection: () => {},
+    codexPlusModelNames: () => ["cpx-current/sol"],
+  });
+  const models = ["cpx-old/kimi", "cpx-current/sol"];
+  assert.equal(patch(models, "local"), true);
+  assert.deepEqual(models, ["cpx-current/sol"]);
+});
+
 async function catalogRuntime() {
   const source = await readFile(CATALOG_URL, "utf8");
   const start = source.indexOf("  let codexModelCatalog = ");
