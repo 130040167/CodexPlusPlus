@@ -1322,6 +1322,10 @@
                   <button type="button" class="codex-plus-action-button" data-codex-open-manager="true">打开管理工具</button>
                 </div>
                 <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">刷新 UI 配置</div><div class="codex-plus-row-description">手动请求当前 Statsig 客户端重新评估远程配置，并显示 enable_i18n 的结果。</div></div>
+                  <button type="button" class="codex-plus-action-button" data-codex-refresh-statsig="true">刷新 UI 配置</button>
+                </div>
+                <div class="codex-plus-row">
                   <div><div class="codex-plus-row-title">打开 DevTools</div><div class="codex-plus-row-description">打开当前 Codex 页面开发者工具，方便查看用户拓展报错。</div></div>
                   <button type="button" class="codex-plus-action-button" data-codex-open-devtools="true">打开 DevTools</button>
                 </div>
@@ -1469,6 +1473,32 @@
       }
       if (target?.closest("[data-codex-open-manager]")) {
         openManagerFromCodex();
+        return;
+      }
+      const refreshStatsigButton = target?.closest("[data-codex-refresh-statsig]");
+      if (refreshStatsigButton) {
+        const button = refreshStatsigButton;
+        if (button.dataset.pending === "true") return;
+        button.dataset.pending = "true";
+        const originalLabel = button.textContent;
+        button.textContent = "刷新中…";
+        Promise.resolve(window.__codexPlusRefreshStatsigUiConfig?.())
+          .then((result) => {
+            if (!result || result.status === "unsupported") {
+              showToast("当前 Codex 构建没有可用的 Statsig 刷新接口", null);
+            } else if (result.status === "ok" && result.enable_i18n === true) {
+              showToast("UI 配置已刷新，enable_i18n=true", null);
+            } else if (result.status === "ok" && result.enable_i18n === false) {
+              showToast("UI 配置已刷新，enable_i18n=false", null);
+            } else {
+              showToast(`UI 配置刷新${result.status === "partial" ? "部分完成" : "失败"}`, result.errors?.join("；") || null);
+            }
+          })
+          .catch((error) => showToast("UI 配置刷新失败", error?.message || String(error)))
+          .finally(() => {
+            button.dataset.pending = "false";
+            button.textContent = originalLabel || "刷新 UI 配置";
+          });
         return;
       }
       // 推荐卡片用 window.open 而非原生 <a target="_blank">：Codex 是 Electron

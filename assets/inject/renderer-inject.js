@@ -7,6 +7,62 @@
   const codexPlusIsMacPlatform = /\bMacintosh\b/i.test(navigator.userAgent || "");
   const codexPlusSupportsPetRealMouseLook = codexPlusIsWindowsPlatform || codexPlusIsMacPlatform;
 
+  function codexPlusStatsigClients() {
+    const root = window.__STATSIG__ || globalThis.__STATSIG__;
+    if (!root || typeof root !== "object") return [];
+    const clients = [root.firstInstance, typeof root.instance === "function" ? root.instance() : null];
+    if (root.instances && typeof root.instances === "object") clients.push(...Object.values(root.instances));
+    return clients.filter((client, index, array) => client && typeof client === "object" && array.indexOf(client) === index);
+  }
+
+  /**
+   * User-triggered Statsig refresh. SDK versions expose different refresh
+   * methods, so only invoke methods proven to exist on the live client and
+   * report unsupported when none is available.
+   */
+  window.__codexPlusRefreshStatsigUiConfig = async () => {
+    const clients = codexPlusStatsigClients();
+    const methods = [];
+    const errors = [];
+    for (const client of clients) {
+      try {
+        if (typeof client.updateUserAsync === "function") {
+          const user = typeof client.getUser === "function" ? client.getUser() : client.user;
+          await client.updateUserAsync(user);
+          methods.push("updateUserAsync");
+        } else if (typeof client.initializeAsync === "function") {
+          await client.initializeAsync();
+          methods.push("initializeAsync");
+        } else if (typeof client.fetchValues === "function") {
+          await client.fetchValues();
+          methods.push("fetchValues");
+        }
+      } catch (error) {
+        errors.push(String(error?.message || error));
+      }
+    }
+    const current = clients[0];
+    let enableI18n = null;
+    try {
+      const layer = typeof current?.getLayer === "function" ? current.getLayer("72216192") : null;
+      if (layer && typeof layer.get === "function") enableI18n = layer.get("enable_i18n", null);
+      if (enableI18n === null && typeof current?.getDynamicConfig === "function") {
+        enableI18n = current.getDynamicConfig("72216192", { disableExposureLog: true })?.get?.("enable_i18n", null) ?? null;
+      }
+    } catch (error) {
+      errors.push(String(error?.message || error));
+    }
+    const result = {
+      status: methods.length ? (errors.length ? "partial" : "ok") : "unsupported",
+      methods: Array.from(new Set(methods)),
+      clientCount: clients.length,
+      enable_i18n: typeof enableI18n === "boolean" ? enableI18n : null,
+      errors,
+    };
+    window.dispatchEvent(new CustomEvent("codex-plus-statsig-refreshed", { detail: result }));
+    return result;
+  };
+
   function installCodexPlusForceChineseLocale() {
     const config = window.__CODEX_PLUS_FORCE_CHINESE_LOCALE__;
     if (!config) return;
@@ -7368,6 +7424,10 @@
                   <button type="button" class="codex-plus-action-button" data-codex-open-manager="true">打开管理工具</button>
                 </div>
                 <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">刷新 UI 配置</div><div class="codex-plus-row-description">手动请求当前 Statsig 客户端重新评估远程配置，并显示 enable_i18n 的结果。</div></div>
+                  <button type="button" class="codex-plus-action-button" data-codex-refresh-statsig="true">刷新 UI 配置</button>
+                </div>
+                <div class="codex-plus-row">
                   <div><div class="codex-plus-row-title">打开 DevTools</div><div class="codex-plus-row-description">打开当前 Codex 页面开发者工具，方便查看用户拓展报错。</div></div>
                   <button type="button" class="codex-plus-action-button" data-codex-open-devtools="true">打开 DevTools</button>
                 </div>
@@ -7515,6 +7575,32 @@
       }
       if (target?.closest("[data-codex-open-manager]")) {
         openManagerFromCodex();
+        return;
+      }
+      const refreshStatsigButton = target?.closest("[data-codex-refresh-statsig]");
+      if (refreshStatsigButton) {
+        const button = refreshStatsigButton;
+        if (button.dataset.pending === "true") return;
+        button.dataset.pending = "true";
+        const originalLabel = button.textContent;
+        button.textContent = "刷新中…";
+        Promise.resolve(window.__codexPlusRefreshStatsigUiConfig?.())
+          .then((result) => {
+            if (!result || result.status === "unsupported") {
+              showToast("当前 Codex 构建没有可用的 Statsig 刷新接口", null);
+            } else if (result.status === "ok" && result.enable_i18n === true) {
+              showToast("UI 配置已刷新，enable_i18n=true", null);
+            } else if (result.status === "ok" && result.enable_i18n === false) {
+              showToast("UI 配置已刷新，enable_i18n=false", null);
+            } else {
+              showToast(`UI 配置刷新${result.status === "partial" ? "部分完成" : "失败"}`, result.errors?.join("；") || null);
+            }
+          })
+          .catch((error) => showToast("UI 配置刷新失败", error?.message || String(error)))
+          .finally(() => {
+            button.dataset.pending = "false";
+            button.textContent = originalLabel || "刷新 UI 配置";
+          });
         return;
       }
       // 推荐卡片用 window.open 而非原生 <a target="_blank">：Codex 是 Electron

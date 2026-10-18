@@ -3,7 +3,7 @@
     {
       "name": "00-prelude.js",
       "description": "IIFE 开头、环境守卫、平台探测、常量与图片覆盖层",
-      "lines": 1734
+      "lines": 1788
     },
     {
       "name": "01-registry.js",
@@ -33,7 +33,7 @@
     {
       "name": "40-backend-settings.js",
       "description": "后端设置读写、心跳同步、用户脚本与市场状态、拓展 UI",
-      "lines": 1912
+      "lines": 1942
     },
     {
       "name": "50-navigation.js",
