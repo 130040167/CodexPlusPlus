@@ -1836,9 +1836,10 @@ fn output_compaction_count(output: Option<&Value>) -> Option<usize> {
     Some(compactions.count())
 }
 
-async fn read_limited_upstream_body(
+async fn read_limited_native_compaction_body(
     response: &mut reqwest::Response,
     limit: usize,
+    content_type: &str,
 ) -> anyhow::Result<Vec<u8>> {
     if let Some(content_length) = response.content_length()
         && content_length > limit as u64
@@ -1847,7 +1848,19 @@ async fn read_limited_upstream_body(
     }
 
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_)
+                if response.status().is_success()
+                    && upstream_compaction_item_count(&body, content_type) == Some(1) =>
+            {
+                // checkpoint 与终态已完整到达；后续传输错误不应丢弃不透明压缩态。
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        };
         if body.len().saturating_add(chunk.len()) > limit {
             anyhow::bail!("上游响应体超过 {limit} 字节限制");
         }
@@ -2894,9 +2907,10 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         }
 
         if legacy_native_compaction {
-            let body = match read_limited_upstream_body(
+            let body = match read_limited_native_compaction_body(
                 &mut upstream,
                 MAX_NATIVE_COMPACTION_PROBE_BODY_BYTES,
+                &content_type,
             ).await {
                 Ok(body) => body,
                 Err(error) => {
@@ -2938,9 +2952,10 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         }
         if probe_native_compaction {
             let success = (200..300).contains(&status_code);
-            let probed = match read_limited_upstream_body(
+            let probed = match read_limited_native_compaction_body(
                 &mut upstream,
                 MAX_NATIVE_COMPACTION_PROBE_BODY_BYTES,
+                &content_type,
             )
             .await
             {
@@ -9388,7 +9403,7 @@ mod compaction_probe_body_limit_tests {
             .await;
 
         let mut response = reqwest::get(server.uri()).await.unwrap();
-        let error = read_limited_upstream_body(&mut response, 0)
+        let error = read_limited_native_compaction_body(&mut response, 0, "application/json")
             .await
             .unwrap_err();
         assert!(error.to_string().contains("上游响应体超过"));

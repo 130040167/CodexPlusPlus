@@ -7697,6 +7697,63 @@ fn preserve_live_app_settings_does_not_invent_mcp_servers() {
 }
 
 #[tokio::test]
+async fn buffered_native_compaction_keeps_only_complete_checkpoint_after_transport_error() {
+    use codex_plus_core::protocol_proxy::open_responses_proxy_request_with_settings_for_path_and_beta;
+    for legacy in [false, true] {
+        for ending in ["complete", "missing", "empty", "late_failure", "trailing_data"] {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let item = json!({
+                "id": "cmp_done", "type": "compaction",
+                "encrypted_content": if ending == "empty" { "" } else { "opaque-checkpoint" }
+            });
+            let mut body = format!(
+                "data: {}\n\n",
+                json!({"type":"response.output_item.done","output_index":0,"item":item})
+            );
+            if ending != "missing" {
+                body.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({"type":"response.completed","response":{"id":"resp_done","status":"completed","output":[item]}})
+                ));
+            }
+            if ending == "late_failure" {
+                body.push_str("data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n");
+            }
+            if ending == "trailing_data" {
+                body.push_str("data: {");
+            }
+            let expected = body.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _ = read_async_http_request(&mut stream).await;
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+                stream.write_all(format!("{:x}\r\n{body}\r\n", body.len()).as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                // 不发送 chunked 的结束块，强制在完整语义事件后出现传输错误。
+                stream.shutdown().await.unwrap();
+                tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_ok()
+            });
+            let opened = open_responses_proxy_request_with_settings_for_path_and_beta(
+                &json!({"model":"model","stream":true,"input":[{"type":"compaction_trigger"}]}).to_string(),
+                remote_compaction_settings(&format!("http://{address}/v1"), RelayProtocol::Responses),
+                if legacy { "/v1/responses/compact" } else { "/v1/responses" },
+                None,
+            ).await;
+            assert!(!server.await.unwrap(), "断流后不能自动重放压缩请求");
+            if ending == "complete" {
+                let mut response = opened.expect("完整 checkpoint 后的传输错误不能丢弃已完成结果");
+                assert!(response.native_compaction_passthrough);
+                assert_eq!(response.read_body().await.unwrap(), expected.as_bytes());
+            } else {
+                assert!(opened.is_err(), "不能把不完整或失败的 checkpoint 判为成功: {ending}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn native_compaction_preserves_protocol_and_opaque_state() {
     use codex_plus_core::protocol_proxy::open_responses_proxy_request_with_settings_for_path_and_beta;
     let item = json!({"id":"cmp_native", "type":"compaction", "encrypted_content":"opaque-native-state", "future":{"kept":true}});
