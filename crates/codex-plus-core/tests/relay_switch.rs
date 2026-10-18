@@ -143,6 +143,159 @@ base_url = "https://b.example/v1"
 }
 
 #[test]
+fn switch_catalog_directory_failure_restores_all_original_bytes() {
+    for live_files_exist in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        std::fs::create_dir(&home).unwrap();
+        let path = temp.path().join("settings.json");
+        let store = SettingsStore::new(path.clone());
+        let mut target = pure_profile("b", "https://b.example/v1", "sk-b");
+        target.model_list = "fixture-model[128K]".into();
+        store
+            .save(&BackendSettings {
+                active_relay_id: "a".into(),
+                relay_profiles: vec![
+                    pure_profile("a", "https://a.example/v1", "sk-a"),
+                    target,
+                ],
+                ..BackendSettings::default()
+            })
+            .unwrap();
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        raw["futureSetting"] = serde_json::json!({"keep": true});
+        raw["relayProfiles"][0]["futureProfileSetting"] = serde_json::json!(["preserve"]);
+        let before_settings =
+            format!(" \r\n{}\r\n ", serde_json::to_string_pretty(&raw).unwrap()).into_bytes();
+        std::fs::write(&path, &before_settings).unwrap();
+        let before_config = b"# exact live bytes\r\nmodel_provider = \"custom\"\r\n\r\n[model_providers.custom]\r\nname = \"custom\"\r\nwire_api = \"responses\"\r\nrequires_openai_auth = true\r\nbase_url = \"https://a.example/v1\"\r\n";
+        let before_auth = b" \r\n{ \"OPENAI_API_KEY\" : \"sk-a\" }\r\n";
+        if live_files_exist {
+            std::fs::write(home.join("config.toml"), before_config).unwrap();
+            std::fs::write(home.join("auth.json"), before_auth).unwrap();
+        }
+        // 使用真实文件系统失败，不向生产切换流程注入暂停或失败入口。
+        let blocked_catalog = home.join("model-catalogs").join("b.json");
+        std::fs::create_dir_all(&blocked_catalog).unwrap();
+        let original = store.load().unwrap();
+        let mut next = original.clone();
+        next.active_relay_id = "b".into();
+
+        switch_relay_profile_in_home(&store, &home, next, "a")
+            .expect_err("catalog 路径被目录占用时必须失败");
+
+        assert!(blocked_catalog.is_dir());
+        assert_eq!(std::fs::read(&path).unwrap(), before_settings);
+        assert_eq!(store.load().unwrap(), original);
+        if live_files_exist {
+            assert_eq!(std::fs::read(home.join("config.toml")).unwrap(), before_config);
+            assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), before_auth);
+        } else {
+            assert!(!home.join("config.toml").exists());
+            assert!(!home.join("auth.json").exists());
+        }
+    }
+}
+
+#[test]
+fn stale_switch_does_not_capture_backfill_or_restore_newer_live_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex");
+    std::fs::create_dir(&home).unwrap();
+    let path = temp.path().join("settings.json");
+    let store = SettingsStore::new(path.clone());
+    store
+        .save(&BackendSettings {
+            active_relay_id: "a".into(),
+            relay_profiles: vec![
+                pure_profile("a", "https://a.example/v1", "sk-a"),
+                pure_profile("b", "https://b.example/v1", "sk-b"),
+            ],
+            ..BackendSettings::default()
+        })
+        .unwrap();
+    let mut stale = store.load().unwrap();
+    stale.active_relay_id = "b".into();
+    // 另一个写入者完成切换；本次请求仍带旧 revision。
+    let mut current = store.load().unwrap();
+    current.active_relay_id = "b".into();
+    store.save(&current).unwrap();
+    let before_settings = std::fs::read(&path).unwrap();
+    let live_config = b"# newer writer\r\nthis is intentionally not valid TOML\r\n";
+    let live_auth = b"{ newer writer owns these bytes }";
+    std::fs::write(home.join("config.toml"), live_config).unwrap();
+    std::fs::write(home.join("auth.json"), live_auth).unwrap();
+
+    let error = switch_relay_profile_in_home(&store, &home, stale, "missing-previous")
+        .expect_err("CAS 必须先于回填验证");
+    assert!(error.to_string().contains("settings_revision_conflict"));
+    assert_eq!(std::fs::read(&path).unwrap(), before_settings);
+    assert_eq!(std::fs::read(home.join("config.toml")).unwrap(), live_config);
+    assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), live_auth);
+
+    // 即使 live 无法捕获，也应先报告请求过期，而不是读取实时文件错误。
+    let stale = BackendSettings {
+        settings_revision: "outdated".into(),
+        ..store.load().unwrap()
+    };
+    let unreadable_home = temp.path().join("unreadable-live");
+    std::fs::create_dir_all(unreadable_home.join("config.toml")).unwrap();
+    let error = switch_relay_profile_in_home(&store, &unreadable_home, stale, "")
+        .expect_err("过期请求不能先尝试读取 live");
+    assert!(error.to_string().contains("settings_revision_conflict"));
+    assert!(unreadable_home.join("config.toml").is_dir());
+    assert!(!unreadable_home.join("auth.json").exists());
+}
+
+#[test]
+fn switch_early_capture_or_save_failure_keeps_settings_and_live_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex");
+    std::fs::create_dir(&home).unwrap();
+    let path = temp.path().join("settings.json");
+    let store = SettingsStore::new(path.clone());
+    store
+        .save(&BackendSettings {
+            active_relay_id: "a".into(),
+            relay_profiles: vec![
+                pure_profile("a", "https://a.example/v1", "sk-a"),
+                pure_profile("b", "https://b.example/v1", "sk-b"),
+            ],
+            ..BackendSettings::default()
+        })
+        .unwrap();
+    let before_settings = std::fs::read(&path).unwrap();
+    let before_auth = b" \n{ \"OPENAI_API_KEY\" : \"sk-a\" }\n";
+    std::fs::write(home.join("auth.json"), before_auth).unwrap();
+    // capture 失败时不能删除或重写另一份 live 文件。
+    let unreadable_home = temp.path().join("unreadable-live");
+    std::fs::create_dir_all(unreadable_home.join("config.toml")).unwrap();
+    std::fs::write(unreadable_home.join("auth.json"), before_auth).unwrap();
+    let mut next = store.load().unwrap();
+    next.active_relay_id = "b".into();
+    let error = switch_relay_profile_in_home(&store, &unreadable_home, next, "")
+        .expect_err("config 是目录时捕获必须失败");
+    assert!(error.to_string().contains("读取当前 Codex 实时配置失败"));
+    assert!(unreadable_home.join("config.toml").is_dir());
+    assert_eq!(
+        std::fs::read(unreadable_home.join("auth.json")).unwrap(),
+        before_auth
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before_settings);
+
+    // live 捕获成功但保存准备失败，也不能进入 apply 或恢复不存在的 config。
+    let mut next = store.load().unwrap();
+    next.active_relay_id = "b".into();
+    next.relay_profiles[1].model_windows = "{invalid model windows".into();
+    switch_relay_profile_in_home(&store, &home, next, "")
+        .expect_err("损坏的目标 model_windows 必须在写入前拒绝");
+    assert_eq!(std::fs::read(&path).unwrap(), before_settings);
+    assert!(!home.join("config.toml").exists());
+    assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), before_auth);
+}
+
+#[test]
 fn switch_backfills_previous_profile_from_live_before_selecting_target() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex");
