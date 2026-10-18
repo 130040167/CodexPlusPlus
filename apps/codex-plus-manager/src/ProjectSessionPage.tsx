@@ -21,6 +21,7 @@ export function ProjectSessionPage({
   onRefresh,
   onDelete,
   onDeleteMany,
+  onArchiveMany,
   onListProjectSessions,
   repairPanel,
 }: {
@@ -28,6 +29,7 @@ export function ProjectSessionPage({
   onRefresh: (offset?: number) => Promise<void>;
   onDelete: (session: ManagedSession) => Promise<void>;
   onDeleteMany: (sessions: ManagedSession[]) => Promise<void>;
+  onArchiveMany: (sessions: ManagedSession[], archived?: boolean) => Promise<void>;
   onListProjectSessions: (cwd: string) => Promise<ManagedSession[]>;
   repairPanel?: ReactNode;
 }) {
@@ -71,6 +73,11 @@ export function ProjectSessionPage({
     await onDeleteMany(selectedRows);
     setSelected(new Map());
   };
+  const archiveSelected = async () => {
+    if (!selectedRows.length) return;
+    await onArchiveMany(selectedRows, true);
+    setSelected(new Map());
+  };
   const pageSize = sessions?.limit || 50;
   const page = sessions ? Math.floor(sessions.offset / pageSize) + 1 : 0;
   return <div className="mg-page mg-session-page">
@@ -91,6 +98,7 @@ export function ProjectSessionPage({
       {selection ? <>
         <Button onClick={selectCurrentPage}>{t("全选当前列表")}</Button>
         <Button disabled={!selectedRows.length} onClick={() => setSelected(new Map())}>{t("取消全部选择")}</Button>
+        <Button disabled={!selectedRows.length} onClick={() => void archiveSelected()}>{t("归档已选")}</Button>
         <Button primary disabled={!selectedRows.length} onClick={() => void deleteSelected()}><Trash2 size={14} />{tf("删除已选 ({0})", [selectedRows.length])}</Button>
       </> : null}
     </div>

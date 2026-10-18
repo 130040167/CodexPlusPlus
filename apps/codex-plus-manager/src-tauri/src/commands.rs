@@ -357,6 +357,15 @@ pub struct DeleteLocalSessionRequest {
     pub db_path: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveLocalSessionsRequest {
+    #[serde(default)]
+    pub sessions: Vec<codex_plus_data::LocalSession>,
+    #[serde(default)]
+    pub archived: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RelayPayload {
@@ -4660,6 +4669,84 @@ pub fn delete_local_session(request: DeleteLocalSessionRequest) -> CommandResult
         message: result.message.clone(),
         payload: result,
     }
+}
+
+#[tauri::command]
+pub async fn archive_local_sessions(
+    request: ArchiveLocalSessionsRequest,
+) -> CommandResult<Value> {
+    match tauri::async_runtime::spawn_blocking(move || archive_local_sessions_blocking(request)).await {
+        Ok(result) => result,
+        Err(error) => failed(&format!("批量归档后台任务失败：{error}"), json!({})),
+    }
+}
+
+fn archive_local_sessions_blocking(request: ArchiveLocalSessionsRequest) -> CommandResult<Value> {
+    if request.sessions.is_empty() {
+        return failed("没有选择要归档的会话。", json!({ "succeeded": 0, "failed": 0 }));
+    }
+    let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+    let allowed_paths = codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(&home)
+        .into_iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .collect::<std::collections::HashSet<_>>();
+    let mut succeeded = 0usize;
+    let mut failures = Vec::new();
+    for session in request.sessions {
+        let path = PathBuf::from(&session.db_path);
+        let canonical = match std::fs::canonicalize(&path) {
+            Ok(path) => path,
+            Err(error) => {
+                failures.push(format!("{}：数据库不可用：{error}", session.id));
+                continue;
+            }
+        };
+        if !allowed_paths.contains(&canonical) {
+            failures.push(format!("{}：数据库不属于当前 Codex 会话库", session.id));
+            continue;
+        }
+        match archive_one_local_session(&canonical, &session.id, request.archived) {
+            Ok(()) => succeeded += 1,
+            Err(error) => failures.push(format!("{}：{error}", session.id)),
+        }
+    }
+    let failed_count = failures.len();
+    let status = if failed_count == 0 { "ok" } else if succeeded > 0 { "ok" } else { "failed" };
+    let message = if failed_count == 0 {
+        format!("已{} {} 个会话。", if request.archived { "归档" } else { "取消归档" }, succeeded)
+    } else {
+        format!("已{} {} 个，失败 {} 个：{}", if request.archived { "归档" } else { "取消归档" }, succeeded, failed_count, failures.iter().take(3).cloned().collect::<Vec<_>>().join("；"))
+    };
+    CommandResult {
+        status: status.to_string(),
+        message,
+        payload: json!({ "succeeded": succeeded, "failed": failed_count, "errors": failures }),
+    }
+}
+
+fn archive_one_local_session(path: &Path, session_id: &str, archived: bool) -> anyhow::Result<()> {
+    let mut connection = rusqlite::Connection::open(path)?;
+    let columns = connection
+        .prepare("PRAGMA table_info(threads)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+    anyhow::ensure!(columns.contains("archived"), "当前数据库不支持归档字段");
+    let has_archived_at = columns.contains("archived_at");
+    let transaction = connection.transaction()?;
+    let changed = if has_archived_at {
+        transaction.execute(
+            "UPDATE threads SET archived = ?1, archived_at = ?2 WHERE id = ?3",
+            rusqlite::params![archived as i64, if archived { Some(current_timestamp_ms() as i64) } else { None }, session_id],
+        )?
+    } else {
+        transaction.execute(
+            "UPDATE threads SET archived = ?1 WHERE id = ?2",
+            rusqlite::params![archived as i64, session_id],
+        )?
+    };
+    anyhow::ensure!(changed > 0, "未找到会话记录");
+    transaction.commit()?;
+    Ok(())
 }
 
 /// 归一化「Codex 应用路径」。**无效路径一律丢弃，不落库。**

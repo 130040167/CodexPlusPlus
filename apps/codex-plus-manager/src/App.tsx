@@ -2160,6 +2160,21 @@ export function App() {
     await refreshLocalSessions(true, localSessions?.offset ?? 0);
   };
 
+  const archiveLocalSessions = async (sessions: LocalSession[], archived = true) => {
+    const uniqueSessions = Array.from(new Map(sessions.map((session) => [session.id, session])).values());
+    if (!uniqueSessions.length) return;
+    const confirmed = await confirmSessionDelete(
+      archived ? t("归档会话") : t("取消归档会话"),
+      tf("{0} 个会话？这只更新本地归档状态，不删除 rollout 文件。", [uniqueSessions.length]),
+    );
+    if (!confirmed) return;
+    const result = await run(() => call<CommandResult<{ succeeded: number; failed: number }>>("archive_local_sessions", {
+      request: { sessions: uniqueSessions, archived },
+    }));
+    if (result) showNotice(archived ? t("归档会话") : t("取消归档会话"), result.message, result.status);
+    await refreshLocalSessions(true, localSessions?.offset ?? 0);
+  };
+
   const refreshLiveContextEntries = async (silent = false) => {
     const result = await run(() => call<LiveContextEntriesResult>("read_live_context_entries"));
     if (result) {
@@ -3848,6 +3863,7 @@ export function App() {
       listProjectSessions,
       deleteLocalSession,
       deleteLocalSessions,
+      archiveLocalSessions,
       openExternalUrl,
       applyRelayInjection,
       applyPureApiInjection,
@@ -4013,6 +4029,7 @@ export function App() {
               onRefresh={async (offset) => { await actions.refreshLocalSessions(false, offset ?? 0); }}
               onDelete={actions.deleteLocalSession}
               onDeleteMany={actions.deleteLocalSessions}
+              onArchiveMany={actions.archiveLocalSessions}
               onListProjectSessions={actions.listProjectSessions}
               repairPanel={<SessionRepairPanel form={settingsForm} providerSyncProgress={providerSyncProgress}
                 sessionIndexRepairActive={sessionIndexRepairActive} sessionIndexRepairReport={sessionIndexRepairReport}
@@ -4423,6 +4440,7 @@ type Actions = {
   listProjectSessions: (cwd: string) => Promise<LocalSession[]>;
   deleteLocalSession: (session: LocalSession) => Promise<void>;
   deleteLocalSessions: (sessions: LocalSession[]) => Promise<void>;
+  archiveLocalSessions: (sessions: LocalSession[], archived?: boolean) => Promise<void>;
   openExternalUrl: (url: string) => Promise<void>;
   applyRelayInjection: () => Promise<boolean>;
   applyPureApiInjection: () => Promise<boolean>;
