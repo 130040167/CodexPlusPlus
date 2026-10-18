@@ -734,6 +734,8 @@ export const EN_PLAIN: Record<string, string> = {
   "内置和用户自定义拓展清单": "Built-in and user-defined extension inventory",
   "供应商独立代理": "Provider-specific proxy",
   "留空表示使用系统代理；仅影响当前供应商的模型拉取、测试和请求。": "Leave empty to use the system proxy; this affects model fetching, tests, and requests for the current provider only.",
+  "前缀稳定层": "Prompt prefix stabilizer",
+  "按供应商稳定可选历史块的顺序并移除成对 image_resize_notice；默认关闭，适合已确认上游支持的缓存场景。": "Stabilizes selected historical block ordering per provider and removes paired image_resize_notice blocks; off by default for upstreams with confirmed cache support.",
   "全部折叠": "Collapse all",
   "全部展开": "Expand all",
   "个 Skill": "skill(s)",

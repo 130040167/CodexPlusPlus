@@ -9015,12 +9015,22 @@ function RelayProfileEditor({
   const [vlmTestOpen, setVlmTestOpen] = useState(false);
   const [relayProxyUrl, setRelayProxyUrl] = useState("");
   const [relayProxyBusy, setRelayProxyBusy] = useState(false);
+  const [stabilizePromptPrefix, setStabilizePromptPrefix] = useState(false);
+  const [stabilizePromptPrefixBusy, setStabilizePromptPrefixBusy] = useState(false);
   const useCommonConfig = profile.useCommonConfig !== false;
   useEffect(() => {
     let cancelled = false;
     setRelayProxyUrl("");
     void invoke<{ status: string; proxyUrl?: string }>("load_relay_proxy", { profileId: profile.id })
       .then((result) => { if (!cancelled) setRelayProxyUrl(result.proxyUrl || ""); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [profile.id]);
+  useEffect(() => {
+    let cancelled = false;
+    setStabilizePromptPrefix(false);
+    void invoke<{ stabilizePromptPrefix?: boolean }>("load_relay_feature", { profileId: profile.id })
+      .then((result) => { if (!cancelled) setStabilizePromptPrefix(result.stabilizePromptPrefix === true); })
       .catch(() => {});
     return () => { cancelled = true; };
   }, [profile.id]);
@@ -9036,6 +9046,22 @@ function RelayProfileEditor({
       await actions.showMessage(t("供应商独立代理"), String(error), "failed");
     } finally {
       setRelayProxyBusy(false);
+    }
+  };
+  const saveStabilizePromptPrefix = async (enabled: boolean) => {
+    setStabilizePromptPrefix(enabled);
+    setStabilizePromptPrefixBusy(true);
+    try {
+      const result = await invoke<{ status: string; message: string }>("set_relay_feature", {
+        profileId: profile.id,
+        stabilizePromptPrefix: enabled,
+      });
+      await actions.showMessage(t("前缀稳定层"), result.message, result.status === "ok" ? "ok" : "failed");
+    } catch (error) {
+      setStabilizePromptPrefix(!enabled);
+      await actions.showMessage(t("前缀稳定层"), String(error), "failed");
+    } finally {
+      setStabilizePromptPrefixBusy(false);
     }
   };
   const [activeImportDraft, setActiveImportDraft] = useState<ActiveImportDraft | null>(null);
@@ -10397,6 +10423,18 @@ function RelayProfileEditor({
                 </div>
                 <span className="hint-line">{t("留空表示使用系统代理；仅影响当前供应商的模型拉取、测试和请求。")}</span>
               </Field>
+            ) : null}
+            {showApiFields ? (
+              <label className="switch-row compact relay-switch-row">
+                <input
+                  checked={stabilizePromptPrefix}
+                  disabled={stabilizePromptPrefixBusy}
+                  onChange={(event) => void saveStabilizePromptPrefix(event.currentTarget.checked)}
+                  type="checkbox"
+                />
+                <span><strong>{t("前缀稳定层")}</strong><small>{t("按供应商稳定可选历史块的顺序并移除成对 image_resize_notice；默认关闭，适合已确认上游支持的缓存场景。")}</small></span>
+                <ToggleVisual />
+              </label>
             ) : null}
             {showApiFields ? (
               <label

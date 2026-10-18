@@ -218,6 +218,8 @@ pub fn run() {
             commands::set_watcher_start_minimized,
             commands::load_relay_proxy,
             commands::set_relay_proxy,
+            commands::load_relay_feature,
+            commands::set_relay_feature,
             // 自动接管官方 App：前端 invoke 找不到命令时是运行期静默失败，
             // 没有编译期兜底，所以这三个必须注册在这里（契约测试会守）。
             commands::load_auto_takeover_state,

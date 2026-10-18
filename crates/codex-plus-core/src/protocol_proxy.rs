@@ -574,6 +574,9 @@ pub fn responses_to_chat_completions_with_options(
 }
 
 fn prompt_prefix_stabilizer_enabled(relay: &crate::settings::RelayProfile) -> bool {
+    if crate::relay_features::stabilize_prompt_prefix(&relay.id) {
+        return true;
+    }
     let suffix = relay
         .id
         .chars()

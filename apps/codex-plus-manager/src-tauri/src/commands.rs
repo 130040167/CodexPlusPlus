@@ -6145,6 +6145,39 @@ pub fn set_relay_proxy(profile_id: String, proxy_url: String) -> CommandResult<V
 }
 
 #[tauri::command]
+pub fn load_relay_feature(profile_id: String) -> CommandResult<Value> {
+    let profile_id = profile_id.trim().to_string();
+    ok(
+        "供应商功能开关已读取。",
+        json!({
+            "profileId": profile_id,
+            "stabilizePromptPrefix": codex_plus_core::relay_features::stabilize_prompt_prefix(&profile_id)
+        }),
+    )
+}
+
+#[tauri::command]
+pub fn set_relay_feature(profile_id: String, stabilize_prompt_prefix: bool) -> CommandResult<Value> {
+    match codex_plus_core::relay_features::set_stabilize_prompt_prefix(
+        &profile_id,
+        stabilize_prompt_prefix,
+    ) {
+        Ok(()) => ok(
+            if stabilize_prompt_prefix {
+                "供应商前缀稳定层已开启。"
+            } else {
+                "供应商前缀稳定层已关闭。"
+            },
+            json!({
+                "profileId": profile_id.trim(),
+                "stabilizePromptPrefix": stabilize_prompt_prefix
+            }),
+        ),
+        Err(error) => failed(&format!("保存供应商功能开关失败：{error}"), json!({})),
+    }
+}
+
+#[tauri::command]
 pub fn read_latest_logs(request: LogRequest) -> CommandResult<LogsPayload> {
     let path = codex_plus_core::paths::default_diagnostic_log_path();
     match read_tail(&path, request.lines) {
