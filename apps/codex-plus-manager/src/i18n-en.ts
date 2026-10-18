@@ -5,6 +5,12 @@
 
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
+  "其他主题正在安装，请等待完成后再安装此主题。": "Another theme is being installed. Wait for it to finish before installing this theme.",
+  "网页一键换肤主题": "Theme from a website link",
+  "本地主题包": "Local theme package",
+  "导入中…": "Importing…",
+  "正在导入并校验本地主题包…": "Importing and validating the local theme package…",
+  "正在下载、校验并安装主题包…": "Downloading, validating, and installing the theme package…",
   "请求不发送思考参数；档位草稿保留，切回自动兼容后可恢复。": "No reasoning parameters are sent. Saved levels remain available when automatic compatibility is restored.",
   "Chat 上游按原值接收 reasoning_effort，不按模型名改写档位。": "Send reasoning_effort unchanged to Chat upstreams without mapping levels by model name.",
   "不发送思考参数": "Omit reasoning parameters",
@@ -1574,6 +1580,7 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "正在下载、校验并安装“{0}”…": "Downloading, validating, and installing “{0}”…",
   "第 {0} 页 · 共 {1} 个会话": "Page {0} · {1} sessions",
   "{0} 的 API Key": "API key for {0}",
   "文档里的上下文窗口是 {0}，当前列填的是 {1}，已保留当前值；要用文档的值请先清空窗口。": "The document's context window is {0}, but the column holds {1}. The current value was kept; clear the window to use the document's value.",
