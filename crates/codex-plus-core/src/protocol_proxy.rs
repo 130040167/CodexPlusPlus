@@ -3810,6 +3810,7 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
         } else {
             upstream_body.to_vec()
         };
+        let body = reject_invalid_native_web_search_response(&body, &upstream_content_type)?;
         return Ok(ProxyHttpResponse {
             status: "200 OK".to_string(),
             content_type: if upstream_content_type.is_empty() {
@@ -7431,6 +7432,155 @@ fn web_search_action_has_target(action: &Value) -> bool {
             .is_some_and(|value| !value.trim().is_empty())
 }
 
+/// 兼容上游可能把空的原生搜索调用标成 completed（issue #2486）。
+fn invalid_native_web_search_output_item(item: &Value) -> bool {
+    if item.get("type").and_then(Value::as_str) != Some("web_search_call") {
+        return false;
+    }
+    if item.get("status").and_then(Value::as_str) == Some("failed") {
+        return false;
+    }
+    !item.get("action").is_some_and(web_search_action_has_target)
+}
+
+fn responses_output_items(body: &Value) -> Option<&[Value]> {
+    let response = if body.get("output").is_some() {
+        body
+    } else {
+        body.get("response")?
+    };
+    response
+        .get("output")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+}
+
+fn responses_body_has_invalid_native_web_search(body: &Value) -> bool {
+    responses_output_items(body)
+        .is_some_and(|items| items.iter().any(invalid_native_web_search_output_item))
+}
+
+fn invalid_native_web_search_error() -> Value {
+    json!({
+        "type": "invalid_upstream_tool_call",
+        "code": "invalid_web_search_call",
+        "message": "Responses 上游返回了未执行的原生 web_search 调用，请检查搜索工具兼容性"
+    })
+}
+
+fn response_object_mut(body: &mut Value) -> Option<&mut Value> {
+    if body.get("output").is_some() {
+        Some(body)
+    } else {
+        body.get_mut("response")
+    }
+}
+
+fn mark_responses_body_failed(body: &mut Value) -> bool {
+    let Some(response) = response_object_mut(body) else {
+        return false;
+    };
+    response["status"] = json!("failed");
+    response["error"] = invalid_native_web_search_error();
+    true
+}
+
+fn sse_block_json(block: &str) -> Option<Value> {
+    let data = extract_sse_data(block)?;
+    if data.trim() == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str(&data).ok()
+}
+
+fn rewrite_invalid_native_web_search_sse(body: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(body).ok()?;
+    let mut remaining = text.to_string();
+    let mut blocks = Vec::new();
+    while let Some(block) = take_sse_block(&mut remaining) {
+        blocks.push(block);
+    }
+    if !remaining.trim().is_empty() {
+        blocks.push(remaining);
+    }
+
+    let mut invalid = false;
+    let mut has_terminal_failure = false;
+    let mut completed_response = None;
+    let mut saw_done = false;
+    for block in &blocks {
+        if extract_sse_data(block).is_some_and(|data| data.trim() == "[DONE]") {
+            saw_done = true;
+            continue;
+        }
+        let Some(value) = sse_block_json(block) else {
+            continue;
+        };
+        match sse_block_type(block).as_deref() {
+            Some("response.output_item.done") => {
+                invalid |= value
+                    .get("item")
+                    .is_some_and(invalid_native_web_search_output_item);
+            }
+            Some("response.completed") => {
+                completed_response = value.get("response").cloned();
+            }
+            Some("response.failed" | "response.incomplete" | "error") => {
+                has_terminal_failure = true;
+            }
+            _ => {}
+        }
+    }
+    if !invalid || has_terminal_failure {
+        return None;
+    }
+
+    let mut output = String::new();
+    for block in blocks {
+        let is_done = extract_sse_data(&block).is_some_and(|data| data.trim() == "[DONE]");
+        let is_completed = sse_block_type(&block).as_deref() == Some("response.completed");
+        if is_done || is_completed {
+            continue;
+        }
+        output.push_str(&block);
+        output.push_str("\n\n");
+    }
+
+    let mut response = completed_response.unwrap_or_else(|| json!({"output": []}));
+    response["status"] = json!("failed");
+    response["error"] = invalid_native_web_search_error();
+    push_sse(
+        &mut output,
+        "response.failed",
+        json!({
+            "type": "response.failed",
+            "response": response
+        }),
+    );
+    if saw_done {
+        output.push_str("data: [DONE]\n\n");
+    }
+    Some(output.into_bytes())
+}
+
+fn reject_invalid_native_web_search_response(
+    body: &[u8],
+    content_type: &str,
+) -> anyhow::Result<Vec<u8>> {
+    if response_body_is_stream(content_type, body) {
+        return Ok(rewrite_invalid_native_web_search_sse(body).unwrap_or_else(|| body.to_vec()));
+    }
+    let Ok(mut json) = serde_json::from_slice::<Value>(body) else {
+        return Ok(body.to_vec());
+    };
+    if !responses_body_has_invalid_native_web_search(&json)
+        || !mark_responses_body_failed(&mut json)
+    {
+        return Ok(body.to_vec());
+    }
+    Ok(serde_json::to_vec(&json)?)
+}
+
 fn invalid_web_search_output_item(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("web_search_call")
 }
@@ -8456,6 +8606,65 @@ mod response_compatibility_tests {
         assert!(web_search_action_has_target(
             &json!({ "type": "open_page", "url": "https://example.com" })
         ));
+    }
+
+    #[test]
+    fn empty_native_responses_web_search_call_is_failed() {
+        let body = json!({
+            "id": "resp_search",
+            "status": "completed",
+            "output": [{
+                "type": "web_search_call",
+                "status": "completed",
+                "action": { "type": "search", "query": "", "queries": null }
+            }]
+        });
+        let body = reject_invalid_native_web_search_response(
+            &serde_json::to_vec(&body).unwrap(),
+            "application/json",
+        )
+        .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["error"]["code"], "invalid_web_search_call");
+    }
+
+    #[test]
+    fn valid_native_responses_web_search_call_passes_through() {
+        let body = json!({
+            "id": "resp_search",
+            "status": "completed",
+            "output": [{
+                "type": "web_search_call",
+                "status": "completed",
+                "action": { "type": "search", "query": "Codex" }
+            }]
+        });
+        let encoded = serde_json::to_vec(&body).unwrap();
+        let result =
+            reject_invalid_native_web_search_response(&encoded, "application/json").unwrap();
+        assert_eq!(result, encoded);
+    }
+
+    #[test]
+    fn empty_native_responses_web_search_sse_becomes_failed() {
+        let body = concat!(
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"web_search_call\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"\"}}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_search\",\"status\":\"completed\",\"output\":[]}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let result = reject_invalid_native_web_search_response(
+            body.as_bytes(),
+            "text/event-stream",
+        )
+        .unwrap();
+        let result = String::from_utf8(result).unwrap();
+        assert!(result.contains("response.failed"), "{result}");
+        assert!(!result.contains("response.completed"), "{result}");
+        assert!(result.contains("invalid_web_search_call"), "{result}");
+        assert!(result.ends_with("data: [DONE]\n\n"), "{result}");
     }
 }
 
