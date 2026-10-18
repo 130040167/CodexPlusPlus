@@ -4,6 +4,8 @@
   const codexPlusIsNodeTestHarness = typeof process === "object" && !!process.versions?.node;
   if (!codexPlusIsNodeTestHarness && (window.top !== window || window.self !== window || !window.electronBridge || !/^app:\/\/\-\//i.test(window.location.href))) return;
   const codexPlusIsWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent || "");
+  const codexPlusIsMacPlatform = /\bMacintosh\b/i.test(navigator.userAgent || "");
+  const codexPlusSupportsPetRealMouseLook = codexPlusIsWindowsPlatform || codexPlusIsMacPlatform;
 
   function installCodexPlusForceChineseLocale() {
     const config = window.__CODEX_PLUS_FORCE_CHINESE_LOCALE__;
@@ -7316,7 +7318,7 @@
             <section class="codex-plus-settings-section" aria-label="外观与布局">
               <h2 class="codex-plus-settings-section-title">外观与布局</h2>
               <div class="codex-plus-settings-card">
-                ${codexPlusIsWindowsPlatform ? `<div class="codex-plus-row">
+                ${codexPlusSupportsPetRealMouseLook ? `<div class="codex-plus-row">
                   <div><div class="codex-plus-row-title">桌宠跟随真实鼠标</div><div class="codex-plus-row-description">仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。</div></div>
                   <button type="button" class="codex-plus-toggle" data-codex-plus-setting="petRealMouseLook"><span></span></button>
                 </div>` : ""}
