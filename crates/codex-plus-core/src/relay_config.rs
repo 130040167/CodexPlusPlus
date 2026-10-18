@@ -210,10 +210,18 @@ pub fn relay_config_status_from_home(home: &Path) -> RelayConfigStatus {
     let config_path = home.join("config.toml");
     let contents = std::fs::read_to_string(&config_path).unwrap_or_default();
     let auth_contents = std::fs::read_to_string(home.join("auth.json")).unwrap_or_default();
-    let has_auth_api_key = codex_auth_api_key(&auth_contents).is_some();
-    let root_provider = root_key_string(&contents, "model_provider");
+    relay_config_status_from_contents(&config_path, &contents, &auth_contents)
+}
+
+fn relay_config_status_from_contents(
+    config_path: &Path,
+    contents: &str,
+    auth_contents: &str,
+) -> RelayConfigStatus {
+    let has_auth_api_key = codex_auth_api_key(auth_contents).is_some();
+    let root_provider = root_key_string(contents, "model_provider");
     let provider = root_provider.as_ref().and_then(|provider| {
-        let active = table_values(&contents, &format!("model_providers.{provider}"));
+        let active = table_values(contents, &format!("model_providers.{provider}"));
         if provider != "openai" {
             return active;
         }
@@ -225,13 +233,13 @@ pub fn relay_config_status_from_home(home: &Path) -> RelayConfigStatus {
             return active;
         }
 
-        let uses_managed_openai_identity = root_key_string(&contents, OPENAI_BASE_URL_KEY)
+        let uses_managed_openai_identity = root_key_string(contents, OPENAI_BASE_URL_KEY)
             .is_some_and(|value| value.trim() == managed_openai_base_url());
         if !uses_managed_openai_identity {
             return active;
         }
 
-        table_values(&contents, &format!("model_providers.{RELAY_PROVIDER}"))
+        table_values(contents, &format!("model_providers.{RELAY_PROVIDER}"))
             .filter(|values| provider_values_are_configured(values, has_auth_api_key))
             .or(active)
     });
@@ -767,8 +775,39 @@ pub fn apply_relay_profile_with_preservation(
     proxy_port: u16,
     preserve_nonprovider: bool,
 ) -> anyhow::Result<RelayApplyResult> {
+    apply_relay_profile_with_validation(
+        home, profile, common, proxy_port, preserve_nonprovider, false,
+    )
+}
+
+pub(crate) fn apply_relay_profile_for_switch(
+    home: &Path,
+    profile: &RelayProfile,
+    common: &str,
+    proxy_port: u16,
+    preserve_nonprovider: bool,
+) -> anyhow::Result<RelayApplyResult> {
+    apply_relay_profile_with_validation(
+        home, profile, common, proxy_port, preserve_nonprovider, true,
+    )
+}
+
+fn apply_relay_profile_with_validation(
+    home: &Path,
+    profile: &RelayProfile,
+    common: &str,
+    proxy_port: u16,
+    preserve_nonprovider: bool,
+    require_configured_api: bool,
+) -> anyhow::Result<RelayApplyResult> {
     if !preserve_nonprovider {
-        return apply_relay_profile_to_home_with_switch_rules_and_proxy_port(home, profile, common, proxy_port);
+        return apply_relay_profile_with_switch_rules(
+            home,
+            profile,
+            common,
+            proxy_port,
+            require_configured_api,
+        );
     }
     let mut effective = profile.clone();
     let config = if profile.use_common_config {
@@ -776,7 +815,13 @@ pub fn apply_relay_profile_with_preservation(
     } else { profile.config_contents.clone() };
     effective.config_contents = preserve_live_nonprovider_settings(home, &config)?;
     effective.use_common_config = false;
-    apply_relay_profile_to_home_with_switch_rules_and_proxy_port(home, &effective, common, proxy_port)
+    apply_relay_profile_with_switch_rules(
+        home,
+        &effective,
+        common,
+        proxy_port,
+        require_configured_api,
+    )
 }
 
 pub fn preserve_live_nonprovider_settings(home: &Path, config: &str) -> anyhow::Result<String> {
@@ -800,6 +845,16 @@ pub fn apply_relay_profile_to_home_with_switch_rules_and_proxy_port(
     profile: &RelayProfile,
     common_config_contents: &str,
     proxy_port: u16,
+) -> anyhow::Result<RelayApplyResult> {
+    apply_relay_profile_with_switch_rules(home, profile, common_config_contents, proxy_port, false)
+}
+
+fn apply_relay_profile_with_switch_rules(
+    home: &Path,
+    profile: &RelayProfile,
+    common_config_contents: &str,
+    proxy_port: u16,
+    require_configured_api: bool,
 ) -> anyhow::Result<RelayApplyResult> {
     if profile.relay_mode == RelayMode::Official && !profile.official_mix_api_key {
         return apply_official_profile_to_home(home, profile, common_config_contents);
@@ -834,6 +889,18 @@ pub fn apply_relay_profile_to_home_with_switch_rules_and_proxy_port(
             // 用户表现为「本来能用，某天开始报 unsupported Codex auth method: apikey」，
             // 且没有任何配置报错。
             let auth_contents = pure_api_auth_contents_with_live_login(home, profile)?;
+            if require_configured_api {
+                validate_auth_json(auth_contents.as_bytes(), &home.join("auth.json"))?;
+                anyhow::ensure!(
+                    relay_config_status_from_contents(
+                        &home.join("config.toml"),
+                        &compatible_config,
+                        &auth_contents,
+                    )
+                    .configured,
+                    "纯 API 配置未检测到完整 custom provider，未写入实时文件，请检查 config.toml 和供应商 API Key。"
+                );
+            }
             apply_relay_files_to_home(home, &compatible_config, &auth_contents)
         } else if profile.relay_mode == crate::settings::RelayMode::Aggregate {
             // 聚合模式的实际请求发往本地代理，它需要 API 模式的凭据。
@@ -2148,9 +2215,20 @@ fn write_codex_live_atomic(
     config_text: Option<&str>,
     auth_bytes: Option<&[u8]>,
 ) -> anyhow::Result<Option<String>> {
+    write_codex_live_atomic_with(home, config_text, auth_bytes, crate::settings::atomic_write)
+}
+
+fn write_codex_live_atomic_with(
+    home: &Path,
+    config_text: Option<&str>,
+    auth_bytes: Option<&[u8]>,
+    mut write: impl FnMut(&Path, &[u8]) -> anyhow::Result<()>,
+) -> anyhow::Result<Option<String>> {
     std::fs::create_dir_all(home)?;
     let config_path = home.join("config.toml");
     let auth_path = home.join("auth.json");
+    let old_config = read_optional_bytes(&config_path)?;
+    let old_auth = read_optional_bytes(&auth_path)?;
     #[cfg(windows)]
     let normalized_config_text = config_text.map(normalize_config_text_for_write);
     #[cfg(windows)]
@@ -2172,29 +2250,68 @@ fn write_codex_live_atomic(
         validate_auth_json(auth_bytes, &auth_path)?;
     }
 
-    let old_config = read_optional_bytes(&config_path)?;
-    let old_auth = read_optional_bytes(&auth_path)?;
     let backup_path = create_live_backup(home, old_config.as_deref(), old_auth.as_deref())?;
     let mut auth_written = false;
-
-    if let Some(auth_bytes) = auth_bytes {
-        if let Err(error) = crate::settings::atomic_write(&auth_path, auth_bytes) {
-            return Err(error.context("写入 auth.json 失败"));
+    let mut config_written = false;
+    let result = (|| -> anyhow::Result<()> {
+        ensure_live_file_unchanged(&config_path, old_config.as_deref())?;
+        ensure_live_file_unchanged(&auth_path, old_auth.as_deref())?;
+        if let Some(auth_bytes) = auth_bytes {
+            write(&auth_path, auth_bytes).context("写入 auth.json 失败")?;
+            auth_written = true;
         }
-        auth_written = true;
-    }
-
-    if let Some(config_text) = config_text {
-        if let Err(error) = crate::settings::atomic_write(&config_path, config_text.as_bytes()) {
-            if auth_written {
-                let _ = restore_optional_file(&auth_path, old_auth.as_deref());
+        ensure_live_file_unchanged(&config_path, old_config.as_deref())?;
+        ensure_live_file_unchanged(&auth_path, auth_bytes.or(old_auth.as_deref()))?;
+        if let Some(config_text) = config_text {
+            write(&config_path, config_text.as_bytes()).context("写入 config.toml 失败")?;
+            config_written = true;
+        }
+        ensure_live_file_unchanged(
+            &config_path,
+            config_text.map(str::as_bytes).or(old_config.as_deref()),
+        )?;
+        ensure_live_file_unchanged(&auth_path, auth_bytes.or(old_auth.as_deref()))?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let mut rollback_errors = Vec::new();
+        // 原子替换失败的文件没有被本次写入，不能恢复它；成功替换的文件也只
+        // 在内容仍属于本次写入时恢复，避免覆盖绕过设置锁的外部管理器。
+        for (written, path, expected, previous) in [
+            (
+                config_written,
+                &config_path,
+                config_text.map(str::as_bytes),
+                old_config.as_deref(),
+            ),
+            (auth_written, &auth_path, auth_bytes, old_auth.as_deref()),
+        ] {
+            if written {
+                let restore = ensure_live_file_unchanged(path, expected)
+                    .and_then(|_| restore_optional_file(path, previous));
+                if let Err(error) = restore {
+                    rollback_errors.push(format!("{error:#}"));
+                }
             }
-            let _ = restore_optional_file(&config_path, old_config.as_deref());
-            return Err(error.context("写入 config.toml 失败"));
         }
+        if !rollback_errors.is_empty() {
+            return Err(error.context(format!(
+                "实时文件回滚未完成：{}",
+                rollback_errors.join("；")
+            )));
+        }
+        return Err(error);
     }
-
     Ok(backup_path)
+}
+
+fn ensure_live_file_unchanged(path: &Path, expected: Option<&[u8]>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        read_optional_bytes(path)?.as_deref() == expected,
+        "{} 在应用期间发生变化，已停止写入并保留外部修改",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    Ok(())
 }
 
 fn with_model_catalog_rollback<T>(
@@ -5661,6 +5778,111 @@ mod tests {
         // 管理员进程从不改写。
         std::fs::write(home.path().join("config.toml"), config).unwrap();
         assert!(!ensure_windows_sandbox_usable_with(home.path(), true).unwrap());
+    }
+
+    #[test]
+    fn failed_live_write_preserves_external_replacement() {
+        for changed in ["none", "config", "auth", "both"] {
+            let home = tempfile::tempdir().unwrap();
+            let config_path = home.path().join("config.toml");
+            let auth_path = home.path().join("auth.json");
+            let old_config = "model = \"old\"\n";
+            let old_auth = br#"{"OPENAI_API_KEY":"fixture-old"}"#;
+            let external_config = "model = \"external\"\n";
+            let external_auth = br#"{"OPENAI_API_KEY":"fixture-external"}"#;
+            std::fs::write(&config_path, old_config).unwrap();
+            std::fs::write(&auth_path, old_auth).unwrap();
+            let error = write_codex_live_atomic_with(
+                home.path(),
+                Some("model = \"target\"\n"),
+                Some(br#"{"OPENAI_API_KEY":"fixture-target"}"#),
+                |path, bytes| {
+                    if path == config_path {
+                        if matches!(changed, "config" | "both") {
+                            std::fs::write(&config_path, external_config)?;
+                        }
+                        if matches!(changed, "auth" | "both") {
+                            std::fs::write(&auth_path, external_auth)?;
+                        }
+                        anyhow::bail!("injected config write failure");
+                    }
+                    crate::settings::atomic_write(path, bytes)
+                },
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("injected config write failure"));
+            assert_eq!(
+                std::fs::read_to_string(&config_path).unwrap(),
+                if matches!(changed, "none" | "auth") {
+                    old_config
+                } else {
+                    external_config
+                },
+                "config replacement lost: {changed}"
+            );
+            assert_eq!(
+                std::fs::read(&auth_path).unwrap(),
+                if matches!(changed, "none" | "config") {
+                    old_auth.as_slice()
+                } else {
+                    external_auth.as_slice()
+                },
+                "auth replacement lost: {changed}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_write_detects_takeover_between_commits_and_after_commit() {
+        for after_config in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let config_path = home.path().join("config.toml");
+            let auth_path = home.path().join("auth.json");
+            let external_config = b"model = \"external\"\n";
+            let external_auth = br#"{"OPENAI_API_KEY":"fixture-external"}"#;
+            let mut config_writes = 0;
+            let error = write_codex_live_atomic_with(
+                home.path(),
+                Some("model = \"target\"\n"),
+                Some(br#"{"OPENAI_API_KEY":"fixture-target"}"#),
+                |path, bytes| {
+                    crate::settings::atomic_write(path, bytes)?;
+                    if path == config_path {
+                        config_writes += 1;
+                    }
+                    if (path == config_path) == after_config {
+                        std::fs::write(&config_path, external_config)?;
+                        std::fs::write(&auth_path, external_auth)?;
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("保留外部修改"));
+            assert_eq!(config_writes, usize::from(after_config));
+            assert_eq!(std::fs::read(&config_path).unwrap(), external_config);
+            assert_eq!(std::fs::read(&auth_path).unwrap(), external_auth);
+        }
+    }
+
+    #[test]
+    fn failed_live_write_restores_missing_auth_without_touching_config() {
+        let home = tempfile::tempdir().unwrap();
+        let error = write_codex_live_atomic_with(
+            home.path(),
+            Some("model = \"target\"\n"),
+            Some(b"{}"),
+            |path, bytes| {
+                if path.ends_with("config.toml") {
+                    anyhow::bail!("injected write failure");
+                }
+                crate::settings::atomic_write(path, bytes)
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("injected write failure"));
+        assert!(!home.path().join("config.toml").exists());
+        assert!(!home.path().join("auth.json").exists());
     }
 
     /// 回归 09-23 现场故障：裸的 [mcp_servers] 父表头把切块锚点钉在 mcp_servers，

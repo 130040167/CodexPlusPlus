@@ -65,7 +65,7 @@ base_url = "https://a.example/v1"
 }
 
 #[test]
-fn switch_rolls_back_live_files_when_post_write_status_check_fails() {
+fn switch_rejects_incomplete_rendered_config_before_writing_live_files() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex");
     std::fs::create_dir(&home).unwrap();
@@ -120,12 +120,12 @@ base_url = "https://b.example/v1"
     };
 
     let error = switch_current_relay_profile(&store, &home, next, "a")
-        .expect_err("missing api key should fail post-write status check");
+        .expect_err("missing api key should fail before writing live files");
 
     assert!(
         error
             .to_string()
-            .contains("纯 API 配置写入后未检测到完整 custom provider")
+            .contains("纯 API 配置未检测到完整 custom provider，未写入实时文件")
     );
     assert_eq!(store.load().unwrap(), persisted_original);
     assert_eq!(
@@ -140,6 +140,7 @@ base_url = "https://b.example/v1"
         std::fs::read_to_string(home.join("auth.json")).unwrap(),
         original_auth
     );
+    assert!(!home.join("backups").exists(), "无效目标不能进入实时文件写入");
 }
 
 #[test]
