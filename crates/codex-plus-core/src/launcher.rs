@@ -2345,51 +2345,17 @@ async fn handle_protocol_proxy_connection(
         if upstream.compaction {
             // v2 远程压缩：无论上游协议都重组为恰好一个 compaction 输出项，
             // 压缩无增量展示诉求，收齐上游文本后一次性下发。
-            // SSE 事件可能跨网络 chunk 拆开，converter 内部按事件边界缓冲。
-            let mut converter = crate::protocol_proxy::CompactionSseConverter::new(
+            let response = take_protocol_proxy_response(&mut upstream)?;
+            let outcome = collect_protocol_proxy_compaction(
+                response,
+                upstream.wire_api,
                 request_json
                     .as_ref()
                     .and_then(|request| request.get("model"))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or(""),
-            );
-            let is_anthropic_upstream =
-                upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages;
-            if upstream.wire_api != crate::protocol_proxy::UpstreamWireApi::Responses {
-                converter = converter.with_chat_upstream();
-            }
-            // Anthropic 事件流先落成 chat 事件流，再进既有的 chat 压缩聚合器。
-            let mut anthropic_bridge =
-                is_anthropic_upstream.then(crate::anthropic_bridge::AnthropicSseToChatSse::default);
-            let mut bytes_stream = take_protocol_proxy_response(&mut upstream)?.bytes_stream();
-            while let Some(chunk) = bytes_stream.next().await {
-                match chunk {
-                    Ok(bytes) => {
-                        let payload = match anthropic_bridge.as_mut() {
-                            Some(bridge) => bridge.push_bytes(&bytes),
-                            None => bytes.to_vec(),
-                        };
-                        if !payload.is_empty() {
-                            converter.push_upstream_bytes(&payload);
-                        }
-                    }
-                    Err(error) => {
-                        converter.fail(format!("Stream error: {error}"), None);
-                        break;
-                    }
-                }
-            }
-            if let Some(bridge) = anthropic_bridge.as_mut() {
-                let tail = bridge.finish();
-                converter.push_upstream_bytes(&tail);
-                if !bridge.has_successful_compaction_completion() {
-                    converter.fail(
-                        "Anthropic 压缩流缺少正常 message_stop".to_string(),
-                        Some("compaction_incomplete".to_string()),
-                    );
-                }
-            }
-            let outcome = converter.finish_with_outcome();
+            )
+            .await;
             upstream.finish_outcome(outcome.succeeded);
             stream.write_all(&outcome.payload).await?;
             log_helper_response(
@@ -2527,6 +2493,46 @@ async fn read_protocol_proxy_body(
             Err(error)
         }
     }
+}
+
+async fn collect_protocol_proxy_compaction(
+    response: reqwest::Response,
+    wire_api: crate::protocol_proxy::UpstreamWireApi,
+    model: &str,
+) -> crate::protocol_proxy::CompactionSseOutcome {
+    let mut converter = crate::protocol_proxy::CompactionSseConverter::new(model);
+    if wire_api != crate::protocol_proxy::UpstreamWireApi::Responses {
+        converter = converter.with_chat_upstream();
+    }
+    let mut anthropic_bridge =
+        (wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages)
+            .then(crate::anthropic_bridge::AnthropicSseToChatSse::default);
+    let mut bytes_stream = response.bytes_stream();
+    while let Some(chunk) = bytes_stream.next().await {
+        let bytes = match chunk {
+            Ok(bytes) => bytes,
+            // 由收尾统一校验终态、摘要及残片；完成后的传输错误不能覆盖有效结果。
+            Err(_) => break,
+        };
+        let payload = match anthropic_bridge.as_mut() {
+            Some(bridge) => bridge.push_bytes(&bytes),
+            None => bytes.to_vec(),
+        };
+        if !payload.is_empty() {
+            converter.push_upstream_bytes(&payload);
+        }
+    }
+    if let Some(bridge) = anthropic_bridge.as_mut() {
+        let tail = bridge.finish();
+        converter.push_upstream_bytes(&tail);
+        if !bridge.has_successful_compaction_completion() {
+            converter.fail(
+                "Anthropic 压缩流缺少正常 message_stop".to_string(),
+                Some("compaction_incomplete".to_string()),
+            );
+        }
+    }
+    converter.finish_with_outcome()
 }
 
 fn take_protocol_proxy_response(
@@ -6805,6 +6811,63 @@ mod proxy_stream_tests {
     use crate::protocol_proxy::UpstreamWireApi;
     use futures_util::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn compaction_completion_survives_read_error_without_accepting_incomplete_streams() {
+        for (wire, partial, terminal, failure) in [
+            (
+                UpstreamWireApi::Responses,
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"fixture-summary\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+                "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n",
+            ),
+            (
+                UpstreamWireApi::ChatCompletions,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"fixture-summary\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"error\":{\"message\":\"late failure\"}}\n\n",
+            ),
+            (
+                UpstreamWireApi::AnthropicMessages,
+                concat!(
+                    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"fixture\"}}\n\n",
+                    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"fixture-summary\"}}\n\n",
+                ),
+                concat!(
+                    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+                    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                ),
+                "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"late failure\"}}\n\n",
+            ),
+        ] {
+            for (body, succeeded) in [
+                (format!("{partial}{terminal}"), true),
+                (partial.to_string(), false),
+                (terminal.to_string(), false),
+                (format!("{partial}{terminal}{failure}"), false),
+                (format!("{partial}{terminal}data: {{"), false),
+            ] {
+                let chunks = [
+                    Ok(body),
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "fixture reset after received events",
+                    )),
+                ];
+                let response = http::Response::builder()
+                    .status(200)
+                    .body(reqwest::Body::wrap_stream(futures_util::stream::iter(chunks)))
+                    .unwrap();
+                let outcome =
+                    super::collect_protocol_proxy_compaction(response.into(), wire, "fixture")
+                        .await;
+                assert_eq!(outcome.succeeded, succeeded, "{wire:?}");
+                let output = String::from_utf8(outcome.payload).unwrap();
+                assert_eq!(output.contains("response.completed"), succeeded, "{wire:?}");
+                assert_eq!(output.contains("response.failed"), !succeeded, "{wire:?}");
+            }
+        }
+    }
 
     #[test]
     fn json_success_requires_a_protocol_specific_completion() {
