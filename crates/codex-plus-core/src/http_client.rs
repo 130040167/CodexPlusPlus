@@ -23,14 +23,21 @@ fn apply_configured_ca_certificate(
     Ok(builder)
 }
 
-pub fn proxied_client(user_agent: &str) -> anyhow::Result<reqwest::Client> {
+fn build_proxied_client(
+    user_agent: &str,
+    proxy_override: Option<&str>,
+) -> anyhow::Result<reqwest::Client> {
     let ua = if user_agent.trim().is_empty() {
         format!("CodexPlusPlus/{}", env!("CARGO_PKG_VERSION"))
     } else {
         user_agent.trim().to_string()
     };
     let mut builder = reqwest::Client::builder().user_agent(ua);
-    if let Some(proxy) = crate::proxy::detect_system_proxy()
+    if let Some(proxy) = proxy_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| crate::proxy::detect_system_proxy())
         .or_else(|| std::env::var("HTTPS_PROXY").ok())
         .or_else(|| std::env::var("https_proxy").ok())
         .or_else(|| std::env::var("ALL_PROXY").ok())
@@ -39,6 +46,28 @@ pub fn proxied_client(user_agent: &str) -> anyhow::Result<reqwest::Client> {
         builder = builder.proxy(reqwest::Proxy::all(proxy)?);
     }
     Ok(apply_configured_ca_certificate(builder)?.build()?)
+}
+
+pub fn proxied_client(user_agent: &str) -> anyhow::Result<reqwest::Client> {
+    build_proxied_client(user_agent, None)
+}
+
+/// Provider-specific proxy override for opt-in routing. Set
+/// `CODEX_PLUS_PROXY_<PROFILE_ID>` (non-alphanumeric characters become `_`),
+/// or use `CODEX_PLUS_PROXY` as a process-wide fallback.
+pub fn proxied_client_for_profile(
+    user_agent: &str,
+    profile_id: &str,
+) -> anyhow::Result<reqwest::Client> {
+    let suffix = profile_id
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_uppercase() } else { '_' })
+        .collect::<String>();
+    let key = format!("CODEX_PLUS_PROXY_{suffix}");
+    let proxy = std::env::var(key)
+        .ok()
+        .or_else(|| std::env::var("CODEX_PLUS_PROXY").ok());
+    build_proxied_client(user_agent, proxy.as_deref())
 }
 
 /// VLM 专用 HTTP client（带超时）。

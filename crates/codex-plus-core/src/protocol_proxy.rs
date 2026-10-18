@@ -2832,10 +2832,10 @@ pub async fn open_models_proxy_request(
             "wireApi": UpstreamWireApi::Responses
         }),
     );
-    let request = crate::http_client::proxied_client(&effective_user_agent(
+    let request = crate::http_client::proxied_client_for_profile(&effective_user_agent(
         &relay.user_agent,
         original_user_agent,
-    ))?
+    ), &relay.id)?
     .get(endpoint);
     let request = match &official_credential {
         Some(credential) => with_official_login_auth(request, &relay, credential),
@@ -2891,10 +2891,10 @@ pub async fn open_audio_transcriptions_proxy_request(
             "bodyBytes": body.len()
         }),
     );
-    let request = crate::http_client::proxied_client(&effective_user_agent(
+    let request = crate::http_client::proxied_client_for_profile(&effective_user_agent(
         &relay.user_agent,
         original_user_agent,
-    ))?
+    ), &relay.id)?
     .post(endpoint)
     .header(reqwest::header::CONTENT_TYPE, content_type)
     .body(body.to_vec());
@@ -3026,10 +3026,10 @@ async fn open_image_proxy_request(
             "endpointKind": endpoint_kind.name()
         }),
     );
-    let request = crate::http_client::proxied_client(&effective_user_agent(
+    let request = crate::http_client::proxied_client_for_profile(&effective_user_agent(
         &relay.user_agent,
         original_user_agent,
-    ))?
+    ), &relay.id)?
     .post(endpoint)
     .header(reqwest::header::CONTENT_TYPE, content_type)
     .body(body.to_vec());
@@ -3090,10 +3090,10 @@ pub async fn open_chat_completions_proxy_request(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let request = crate::http_client::proxied_client(&effective_user_agent(
+    let request = crate::http_client::proxied_client_for_profile(&effective_user_agent(
         &relay.user_agent,
         original_user_agent,
-    ))?
+    ), &relay.id)?
     .post(chat_completions_url(&relay.base_url))
     .header(reqwest::header::CONTENT_TYPE, "application/json")
     .json(&request_json);
@@ -3421,7 +3421,7 @@ fn build_responses_upstream_request(
         effective_user_agent(&relay.user_agent, original_user_agent)
     };
     let mut builder = upstream_request_builder(
-        crate::http_client::proxied_client(&user_agent)?,
+        crate::http_client::proxied_client_for_profile(&user_agent, &relay.id)?,
         endpoint,
         relay,
         is_stream,
