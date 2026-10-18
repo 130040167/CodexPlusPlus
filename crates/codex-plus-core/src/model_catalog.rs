@@ -91,7 +91,12 @@ fn relay_profile_model_catalog_value(home: &Path, profile: &RelayProfile) -> Val
     let models = relay_profile_model_ids(profile);
     let model = profile.model.trim().to_string();
     let codex_model_provider = codex_model_provider_for_relay_profile(home, profile);
-    let default_model = models.first().cloned().unwrap_or_default();
+    let configured_model = crate::relay_config::relay_profile_model(profile);
+    let default_model = if models.iter().any(|item| item == &configured_model) {
+        configured_model
+    } else {
+        models.first().cloned().unwrap_or_default()
+    };
     let provider_name = if profile.name.trim().is_empty() {
         profile.id.trim()
     } else {
@@ -1209,6 +1214,20 @@ fn unquote_toml_string(value: &str) -> String {
 #[cfg(test)]
 mod model_fetch_tests {
     use super::*;
+
+    #[test]
+    fn relay_profile_model_catalog_keeps_configured_default_after_model_list_sorting() {
+        let profile = RelayProfile {
+            model: "qwen3-coder".into(),
+            model_list: "deepseek-coder\nqwen3-coder\nclaude-compatible".into(),
+            config_contents: "model = \"qwen3-coder\"\n".into(),
+            ..RelayProfile::default()
+        };
+        let home = tempfile::tempdir().unwrap();
+        let catalog = relay_profile_model_catalog_value(home.path(), &profile);
+
+        assert_eq!(catalog["default_model"], "qwen3-coder");
+    }
 
     #[test]
     fn model_list_endpoint_preserves_custom_prefixes_and_removes_credentials() {
