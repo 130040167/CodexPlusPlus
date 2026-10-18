@@ -4260,16 +4260,6 @@ async fn confirmed_pet_overlay_targets(
     Ok(confirmed)
 }
 
-async fn pet_overlay_supports_v2_cursor(websocket_url: &str) -> anyhow::Result<bool> {
-    let result = crate::bridge::evaluate_script_with_await_promise(
-        websocket_url,
-        &crate::assets::pet_real_mouse_capability_probe_script(),
-        true,
-    )
-    .await?;
-    Ok(runtime_evaluate_result_is_true(&result))
-}
-
 async fn pet_overlay_has_screen_point_hook(websocket_url: &str) -> anyhow::Result<bool> {
     let result = crate::bridge::evaluate_script(
         websocket_url,
@@ -4292,19 +4282,16 @@ async fn sync_pet_real_mouse_overlay(debug_port: u16, _helper_port: u16) -> anyh
         };
         let script = if !enabled {
             Some(crate::assets::pet_real_mouse_stop_script())
-        } else if pet_overlay_supports_v2_cursor(websocket_url)
+        } else if pet_overlay_has_screen_point_hook(websocket_url)
             .await
-            .with_context(|| {
-                format!(
-                    "failed to probe pet overlay capability in target {} ({})",
-                    target.id, target.url
-                )
-            })?
+            .unwrap_or(false)
         {
-            Some(crate::assets::pet_real_mouse_script())
-        } else {
-            // 探针失败时不要 stop：用户脚本 stub 可能已经挂好 updateScreenPoint。
+            // 已有官方 runtime 或用户脚本 stub 时保留它，避免重置其 dispatcher。
             None
+        } else {
+            // 旧的 V2 dispatcher 探针可能因 modulepreload 时序失败；先安装 runtime，
+            // 后续 driver 会再次确认 hook，runtime 自己负责判断 dispatcher 是否可用。
+            Some(crate::assets::pet_real_mouse_script())
         };
         let Some(script) = script else {
             continue;
