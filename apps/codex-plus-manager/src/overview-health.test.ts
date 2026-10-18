@@ -57,6 +57,8 @@ test("settings exposes reviewed configuration export and draft import", () => {
   const entry = functionSource("App");
   assert.match(entry, /call<CommandResult<\{ path: string \}>>\("export_settings"/);
   assert.match(entry, /call<SettingsResult>\("preview_import_settings"/);
+  assert.match(entry, /call<SettingsResult>\("set_settings_path"/);
+  assert.match(entry, /call<SettingsResult>\("reset_settings_path"/);
 });
 
 test("maintenance no longer offers the removed entrypoint management panel", () => {

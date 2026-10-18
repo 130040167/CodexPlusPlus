@@ -6378,6 +6378,73 @@ pub fn preview_import_settings(path: String) -> CommandResult<SettingsPayload> {
 }
 
 #[tauri::command]
+pub fn set_settings_path(path: String) -> CommandResult<SettingsPayload> {
+    let target = PathBuf::from(path.trim());
+    if !target.is_absolute() {
+        return failed("配置文件路径必须是绝对路径。", fallback_settings_payload());
+    }
+    let current = codex_plus_core::paths::default_settings_path();
+    if current != target && target.exists() {
+        return failed("目标配置文件已存在，为避免覆盖文件请先选择新路径。", fallback_settings_payload());
+    }
+    if current != target {
+        let contents = match fs::read(&current) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let settings = match SettingsStore::default().load() {
+                    Ok(settings) => settings,
+                    Err(error) => return failed(&format!("读取当前设置失败：{error}"), fallback_settings_payload()),
+                };
+                match serde_json::to_vec_pretty(&settings) {
+                    Ok(contents) => contents,
+                    Err(error) => return failed(&format!("序列化当前设置失败：{error}"), fallback_settings_payload()),
+                }
+            }
+            Err(error) => return failed(&format!("读取当前设置失败：{error}"), fallback_settings_payload()),
+        };
+        if let Some(parent) = target.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            return failed(&format!("创建配置目录失败：{error}"), fallback_settings_payload());
+        }
+        if let Err(error) = fs::write(&target, contents) {
+            return failed(&format!("复制配置文件失败：{error}"), fallback_settings_payload());
+        }
+    }
+    if let Err(error) = codex_plus_core::paths::set_settings_path_pointer(Some(&target)) {
+        if current != target {
+            let _ = fs::remove_file(&target);
+        }
+        return failed(&format!("保存配置路径失败：{error}"), fallback_settings_payload());
+    }
+    settings_payload("配置文件路径已更新；重新打开管理器后所有组件都会使用新路径。", "路径更新后重新读取失败")
+}
+
+#[tauri::command]
+pub fn reset_settings_path() -> CommandResult<SettingsPayload> {
+    let current = codex_plus_core::paths::default_settings_path();
+    let target = codex_plus_core::paths::default_app_state_dir().join("settings.json");
+    if current != target && target.exists() {
+        return failed("默认配置文件已存在，为避免覆盖文件请先处理该文件。", fallback_settings_payload());
+    }
+    if current != target {
+        let contents = match fs::read(&current) {
+            Ok(contents) => contents,
+            Err(error) => return failed(&format!("读取当前设置失败：{error}"), fallback_settings_payload()),
+        };
+        if let Err(error) = fs::create_dir_all(target.parent().unwrap_or(Path::new(".")))
+            .and_then(|_| fs::write(&target, contents))
+        {
+            return failed(&format!("恢复默认配置路径失败：{error}"), fallback_settings_payload());
+        }
+    }
+    if let Err(error) = codex_plus_core::paths::set_settings_path_pointer(None) {
+        return failed(&format!("清除配置路径失败：{error}"), fallback_settings_payload());
+    }
+    settings_payload("已恢复默认配置文件路径。", "恢复默认路径后重新读取失败")
+}
+
+#[tauri::command]
 pub fn reset_settings() -> CommandResult<SettingsPayload> {
     let settings = BackendSettings::default();
     match SettingsStore::default().save(&settings) {

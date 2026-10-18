@@ -2797,6 +2797,38 @@ export function App() {
     }
   };
 
+  const chooseSettingsPath = async () => {
+    try {
+      const selected = await saveDialog({
+        title: t("选择配置文件路径"),
+        defaultPath: "settings.json",
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!selected) return;
+      const result = await run(() => call<SettingsResult>("set_settings_path", { path: selected }));
+      if (result) {
+        if (isSuccessStatus(result.status)) {
+          setSettings(result);
+          setSettingsForm(normalizeSettings(result.settings));
+        }
+        showNotice(t("配置文件路径"), result.message, result.status);
+      }
+    } catch (error) {
+      showNotice(t("配置文件路径"), stringifyError(error), "failed");
+    }
+  };
+
+  const resetSettingsPath = async () => {
+    const result = await run(() => call<SettingsResult>("reset_settings_path"));
+    if (result) {
+      if (isSuccessStatus(result.status)) {
+        setSettings(result);
+        setSettingsForm(normalizeSettings(result.settings));
+      }
+      showNotice(t("配置文件路径"), result.message, result.status);
+    }
+  };
+
   const resetImageOverlaySettings = async () => {
     const result = await run(() => call<SettingsResult>("reset_image_overlay_settings"));
     if (result) {
@@ -3648,6 +3680,8 @@ export function App() {
       resetSettings,
       exportSettings,
       importSettings,
+      chooseSettingsPath,
+      resetSettingsPath,
       resetImageOverlaySettings,
       chooseCodexAppPath: async (mode: "folder" | "file") => {
         let selected: unknown;
@@ -4314,6 +4348,8 @@ type Actions = {
   resetSettings: () => Promise<void>;
   exportSettings: () => Promise<void>;
   importSettings: () => Promise<void>;
+  chooseSettingsPath: () => Promise<void>;
+  resetSettingsPath: () => Promise<void>;
   resetImageOverlaySettings: () => Promise<void>;
   chooseCodexAppPath: (mode: "folder" | "file") => Promise<void>;
   clearCodexAppPath: () => Promise<void>;
@@ -8249,6 +8285,15 @@ function SettingsScreen({
             <Toolbar>
               <Button variant="secondary" onClick={() => void actions.exportSettings()}>{t("导出完整配置")}</Button>
               <Button variant="secondary" onClick={() => void actions.importSettings()}>{t("导入配置草稿")}</Button>
+            </Toolbar>
+          </div>
+          <div className="settings-block">
+            <strong>{t("配置文件路径")}</strong>
+            <Input readOnly value={settings?.settings_path ?? ""} />
+            <p className="field-hint">{t("只迁移 settings.json；日志、备份、Skills 和运行状态仍留在原状态目录。更换后建议重新打开管理器。")}</p>
+            <Toolbar>
+              <Button variant="secondary" onClick={() => void actions.chooseSettingsPath()}>{t("选择路径")}</Button>
+              <Button variant="secondary" onClick={() => void actions.resetSettingsPath()}>{t("恢复默认路径")}</Button>
             </Toolbar>
           </div>
         </CardContent>

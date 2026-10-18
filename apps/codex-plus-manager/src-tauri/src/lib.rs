@@ -244,6 +244,8 @@ pub fn run() {
             commands::copy_diagnostics,
             commands::export_settings,
             commands::preview_import_settings,
+            commands::set_settings_path,
+            commands::reset_settings_path,
             commands::reset_settings,
             commands::reset_image_overlay_settings,
             commands::relay_status,
