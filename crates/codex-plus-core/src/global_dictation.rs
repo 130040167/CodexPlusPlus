@@ -115,7 +115,7 @@ where F: Fn() + Send + 'static {
         fn PeekMessageW(msg: *mut Msg, hwnd: *mut c_void, min: u32, max: u32, remove: u32) -> i32;
     }
     let (modifiers, key) = parse_hotkey(hotkey)?;
-    let id = 0xC0D3_0001_i32;
+    let id = 0xC0D3_0001_u32 as i32;
     if unsafe { RegisterHotKey(std::ptr::null_mut(), id, modifiers, key) } == 0 {
         anyhow::bail!("全局热键注册失败，可能已被其他程序占用：{hotkey}");
     }
