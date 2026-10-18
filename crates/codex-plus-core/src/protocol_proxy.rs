@@ -626,6 +626,7 @@ fn strip_notice_blocks_in_text(text: &str) -> (String, bool, bool) {
                 }
                 _ => {
                     output.push_str(&rest[..open]);
+                    output.push_str(&rest[open + IMAGE_RESIZE_NOTICE_OPEN.len()..]);
                     removed = true;
                     unpaired = true;
                     break;
@@ -633,6 +634,7 @@ fn strip_notice_blocks_in_text(text: &str) -> (String, bool, bool) {
             }
         } else {
             let close = close_at.expect("close marker must exist");
+            output.push_str(&rest[..close]);
             rest = &rest[close + IMAGE_RESIZE_NOTICE_CLOSE.len()..];
             removed = true;
             unpaired = true;
@@ -4001,9 +4003,14 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
         } else {
             upstream_body.to_vec()
         };
-        let body = reject_invalid_native_web_search_response(&body, &upstream_content_type)?;
+        let (body, invalid_native_web_search) =
+            reject_invalid_native_web_search_response(&body, &upstream_content_type)?;
         return Ok(ProxyHttpResponse {
-            status: "200 OK".to_string(),
+            status: if invalid_native_web_search {
+                "502 Bad Gateway".to_string()
+            } else {
+                "200 OK".to_string()
+            },
             content_type: if upstream_content_type.is_empty() {
                 "application/json; charset=utf-8".to_string()
             } else {
@@ -7757,19 +7764,22 @@ fn rewrite_invalid_native_web_search_sse(body: &[u8]) -> Option<Vec<u8>> {
 fn reject_invalid_native_web_search_response(
     body: &[u8],
     content_type: &str,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<(Vec<u8>, bool)> {
     if response_body_is_stream(content_type, body) {
-        return Ok(rewrite_invalid_native_web_search_sse(body).unwrap_or_else(|| body.to_vec()));
+        return Ok(match rewrite_invalid_native_web_search_sse(body) {
+            Some(body) => (body, true),
+            None => (body.to_vec(), false),
+        });
     }
     let Ok(mut json) = serde_json::from_slice::<Value>(body) else {
-        return Ok(body.to_vec());
+        return Ok((body.to_vec(), false));
     };
     if !responses_body_has_invalid_native_web_search(&json)
         || !mark_responses_body_failed(&mut json)
     {
-        return Ok(body.to_vec());
+        return Ok((body.to_vec(), false));
     }
-    Ok(serde_json::to_vec(&json)?)
+    Ok((serde_json::to_vec(&json)?, true))
 }
 
 fn invalid_web_search_output_item(item: &Value) -> bool {
@@ -8660,7 +8670,22 @@ mod response_compatibility_tests {
         let once = body.clone();
         stabilize_chat_prompt_prefix(&mut body);
         assert_eq!(body, once, "孤儿 notice 清理必须幂等");
-        assert_eq!(body["messages"][0]["content"], "before ");
+        assert_eq!(body["messages"][0]["content"], "before stale fragment");
+    }
+
+    #[test]
+    fn prompt_prefix_stabilizer_preserves_text_around_orphan_close_marker() {
+        let mut body = json!({
+            "messages": [{
+                "role": "user",
+                "content": "stale fragment</image_resize_notice>after"
+            }]
+        });
+        stabilize_chat_prompt_prefix(&mut body);
+        assert_eq!(
+            body["messages"][0]["content"],
+            "stale fragmentafter"
+        );
     }
 
     #[test]
@@ -8854,12 +8879,13 @@ mod response_compatibility_tests {
                 "action": { "type": "search", "query": "", "queries": null }
             }]
         });
-        let body = reject_invalid_native_web_search_response(
+        let (body, invalid) = reject_invalid_native_web_search_response(
             &serde_json::to_vec(&body).unwrap(),
             "application/json",
         )
         .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(invalid);
         assert_eq!(body["status"], "failed");
         assert_eq!(body["error"]["code"], "invalid_web_search_call");
     }
@@ -8876,8 +8902,9 @@ mod response_compatibility_tests {
             }]
         });
         let encoded = serde_json::to_vec(&body).unwrap();
-        let result =
+        let (result, invalid) =
             reject_invalid_native_web_search_response(&encoded, "application/json").unwrap();
+        assert!(!invalid);
         assert_eq!(result, encoded);
     }
 
@@ -8890,11 +8917,12 @@ mod response_compatibility_tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_search\",\"status\":\"completed\",\"output\":[]}}\n\n",
             "data: [DONE]\n\n"
         );
-        let result = reject_invalid_native_web_search_response(
+        let (result, invalid) = reject_invalid_native_web_search_response(
             body.as_bytes(),
             "text/event-stream",
         )
         .unwrap();
+        assert!(invalid);
         let result = String::from_utf8(result).unwrap();
         assert!(result.contains("response.failed"), "{result}");
         assert!(!result.contains("response.completed"), "{result}");
