@@ -39,6 +39,34 @@ pub async fn download_dictation_local_model() -> CommandResult<Value> {
 }
 
 #[tauri::command]
+pub fn load_global_dictation_hotkey() -> CommandResult<Value> {
+    ok(
+        "全局听写热键设置已读取。",
+        serde_json::to_value(codex_plus_core::global_dictation::load_config()).unwrap_or_else(|_| json!({})),
+    )
+}
+
+#[tauri::command]
+pub fn set_global_dictation_hotkey(enabled: bool, hotkey: String) -> CommandResult<Value> {
+    let mut config = codex_plus_core::global_dictation::load_config();
+    config.enabled = enabled;
+    config.hotkey = hotkey.trim().to_string();
+    if let Err(error) = codex_plus_core::global_dictation::validate_hotkey(&config.hotkey) {
+        return failed(&error.to_string(), json!({}));
+    }
+    if let Err(error) = codex_plus_core::global_dictation::save_config(&config) {
+        return failed(&format!("保存全局听写热键失败：{error}"), json!({}));
+    }
+    match crate::global_dictation::apply_config() {
+        Ok(()) => ok(
+            if enabled { "全局听写热键已开启。" } else { "全局听写热键已关闭。" },
+            serde_json::to_value(config).unwrap_or_else(|_| json!({})),
+        ),
+        Err(error) => failed(&format!("注册全局听写热键失败：{error}"), serde_json::to_value(config).unwrap_or_else(|_| json!({}))),
+    }
+}
+
+#[tauri::command]
 pub async fn claude_localization_status() -> CommandResult<Value> {
     match tauri::async_runtime::spawn_blocking(codex_plus_core::claude_localization::status).await {
         Ok(Ok(status)) => ok("Claude 增强状态已读取。", serde_json::to_value(status).unwrap_or_else(|_| json!({}))),

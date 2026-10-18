@@ -1,5 +1,6 @@
 mod auto_takeover;
 mod agent_collaboration_commands;
+mod global_dictation;
 pub mod commands;
 pub mod install;
 mod runtime_health;
@@ -110,6 +111,12 @@ pub fn run() {
             commands::resume_existing_codex_background(app.handle().clone());
             // 自动接管官方 App（默认关闭）：设置里开着才起守护线程。
             auto_takeover::start_supervisor();
+            if let Err(error) = global_dictation::apply_config() {
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "dictation.global_hotkey_start_failed",
+                    serde_json::json!({ "message": error.to_string() }),
+                );
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -127,6 +134,8 @@ pub fn run() {
             commands::load_settings,
             commands::dictation_local_model_status,
             commands::download_dictation_local_model,
+            commands::load_global_dictation_hotkey,
+            commands::set_global_dictation_hotkey,
             commands::claude_localization_status,
             commands::claude_localization_action,
             commands::claude_localization_set_voice_input,

@@ -5736,6 +5736,11 @@ type DictationLocalModelState = {
   message?: string;
 };
 
+type GlobalDictationHotkeyState = {
+  enabled: boolean;
+  hotkey: string;
+};
+
 function DictationSettingsPanel({ form, onFormChange }: {
   form: BackendSettings;
   onFormChange: (value: BackendSettings) => void;
@@ -5745,6 +5750,13 @@ function DictationSettingsPanel({ form, onFormChange }: {
   const [localModelState, setLocalModelState] = useState<DictationLocalModelState | null>(null);
   const [localModelDownloading, setLocalModelDownloading] = useState(false);
   const [localModelError, setLocalModelError] = useState("");
+  const [globalHotkey, setGlobalHotkey] = useState<GlobalDictationHotkeyState>({ enabled: false, hotkey: "Ctrl+Shift+Space" });
+  const [globalHotkeyBusy, setGlobalHotkeyBusy] = useState(false);
+  useEffect(() => {
+    void invoke<CommandResult<GlobalDictationHotkeyState>>("load_global_dictation_hotkey")
+      .then((result) => { if (result) setGlobalHotkey(result); })
+      .catch(() => {});
+  }, []);
   useEffect(() => {
     if (form.dictation.provider !== "sensevoice") return;
     let active = true;
@@ -5769,6 +5781,18 @@ function DictationSettingsPanel({ form, onFormChange }: {
     }
   };
   const downloading = localModelDownloading || localModelState?.phase === "downloading";
+  const saveGlobalHotkey = async () => {
+    setGlobalHotkeyBusy(true);
+    try {
+      const result = await invoke<CommandResult<GlobalDictationHotkeyState>>("set_global_dictation_hotkey", globalHotkey);
+      if (result) setGlobalHotkey(result);
+      window.alert(result.message);
+    } catch (error) {
+      window.alert(String(error));
+    } finally {
+      setGlobalHotkeyBusy(false);
+    }
+  };
   const updateDictation = (patch: Partial<DictationSettings>) => onFormChange({
     ...form,
     dictation: { ...form.dictation, ...patch },
@@ -5786,6 +5810,23 @@ function DictationSettingsPanel({ form, onFormChange }: {
             checked={form.dictation.enabled}
             onChange={(enabled) => updateDictation({ enabled })}
           />
+          <label className="switch-row compact">
+            <input
+              checked={globalHotkey.enabled}
+              disabled={globalHotkeyBusy || !form.enhancementsEnabled}
+              onChange={(event) => setGlobalHotkey((current) => ({ ...current, enabled: event.currentTarget.checked }))}
+              type="checkbox"
+            />
+            <span><strong>{t("全局听写热键")}</strong><small>{t("Windows 首版：按一次开始录音，再按一次停止并插入文字。")}</small></span>
+            <ToggleVisual />
+          </label>
+          <div className="form-row">
+            <Field label={t("全局热键") }>
+              <Input value={globalHotkey.hotkey} onChange={(event) => setGlobalHotkey((current) => ({ ...current, hotkey: event.currentTarget.value }))} placeholder="Ctrl+Shift+Space" />
+            </Field>
+            <Button disabled={globalHotkeyBusy} onClick={() => void saveGlobalHotkey()} type="button" variant="secondary">{t("保存全局热键")}</Button>
+          </div>
+          <p className="field-hint">{t("热键冲突会在保存时明确报告；macOS 首版暂不注册系统级热键。")}</p>
           <div className="form-row">
             <Field label={t("语音服务预设")}>
               <AppSelect
