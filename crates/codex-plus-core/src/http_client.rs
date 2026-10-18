@@ -1,3 +1,28 @@
+use anyhow::Context;
+
+fn apply_configured_ca_certificate(
+    mut builder: reqwest::ClientBuilder,
+) -> anyhow::Result<reqwest::ClientBuilder> {
+    let Some(value) = std::env::var_os("CODEX_CA_CERTIFICATE") else {
+        return Ok(builder);
+    };
+    let value = value.to_string_lossy().trim().to_string();
+    if value.is_empty() {
+        return Ok(builder);
+    }
+    let pem = if value.contains("BEGIN CERTIFICATE") {
+        value.into_bytes()
+    } else {
+        std::fs::read(&value).with_context(|| {
+            format!("读取 CODEX_CA_CERTIFICATE 指定的证书文件失败：{value}")
+        })?
+    };
+    let certificate = reqwest::Certificate::from_pem(&pem)
+        .context("CODEX_CA_CERTIFICATE 不是有效的 PEM 证书")?;
+    builder = builder.add_root_certificate(certificate);
+    Ok(builder)
+}
+
 pub fn proxied_client(user_agent: &str) -> anyhow::Result<reqwest::Client> {
     let ua = if user_agent.trim().is_empty() {
         format!("CodexPlusPlus/{}", env!("CARGO_PKG_VERSION"))
@@ -13,7 +38,7 @@ pub fn proxied_client(user_agent: &str) -> anyhow::Result<reqwest::Client> {
     {
         builder = builder.proxy(reqwest::Proxy::all(proxy)?);
     }
-    Ok(builder.build()?)
+    Ok(apply_configured_ca_certificate(builder)?.build()?)
 }
 
 /// VLM 专用 HTTP client（带超时）。
@@ -29,9 +54,9 @@ pub(crate) fn vlm_http_client_with_timeout(
     connect: std::time::Duration,
     total: std::time::Duration,
 ) -> anyhow::Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+    Ok(apply_configured_ca_certificate(reqwest::Client::builder()
         .user_agent(format!("CodexPlusPlus-VLM/{}", env!("CARGO_PKG_VERSION")))
         .connect_timeout(connect)
-        .timeout(total)
+        .timeout(total))?
         .build()?)
 }
