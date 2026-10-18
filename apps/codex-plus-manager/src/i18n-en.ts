@@ -63,9 +63,11 @@ export const EN_PLAIN: Record<string, string> = {
   "开机启动自动最小化": "Minimize Codex++ on login",
   "启动时自动最小化": "Minimize on startup",
   "仅登录启动时隐藏到托盘；手动打开 Codex++ 仍显示主窗口。": "Hide to the tray only when started at login; manually opening Codex++ still shows the main window.",
-  "登录系统后打开 Codex++ 界面，Codex 仍需点击启动": "Open the Codex++ window at login. Start Codex from this window.",
+  "登录系统后打开 Codex++ 界面，可选择自动启动 Codex": "Open the Codex++ window at login; Codex can also be started automatically.",
   "登录时自动打开": "Open automatically at login",
-  "开启后注册系统登录项，关闭时移除；Codex 仍需你手动点击启动。": "Turning this on registers a system login item and turning it off removes it; you still start Codex manually.",
+  "开启后注册系统登录项，关闭时移除；是否自动启动 Codex 由下面的独立开关决定。": "Turning this on registers a system login item and turning it off removes it; the separate switch below controls whether Codex starts automatically.",
+  "登录时自动启动 Codex": "Start Codex automatically at login",
+  "仅登录启动 Codex++ 时自动启动 Codex；手动打开 Codex++ 仍不会自动启动。": "Start Codex only when Codex++ is opened by the login item; manually opening Codex++ will not start it automatically.",
   "检查 Codex++ 入口、Codex 应用和开机启动状态": "Check the Codex++ shortcut, Codex app and login startup status",
 
   "Fast（priority）支持": "Fast (priority) support",

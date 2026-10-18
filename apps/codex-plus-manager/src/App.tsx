@@ -919,6 +919,7 @@ type WatcherResult = CommandResult<{
   enabled: boolean;
   disabled_flag: string;
   start_minimized: boolean;
+  start_codex: boolean;
 }>;
 
 // 与 Rust 侧 `auto_takeover::AutoTakeoverPayload`（rename_all = "camelCase"）逐字段对齐。
@@ -2527,6 +2528,14 @@ export function App() {
     }
   };
 
+  const setWatcherStartCodex = async (startCodex: boolean) => {
+    const result = await run(() => call<WatcherResult>("set_watcher_start_codex", { startCodex }));
+    if (result) {
+      setWatcher(result);
+      showNotice(t("登录时自动启动 Codex"), result.message, result.status);
+    }
+  };
+
   const checkUpdate = async (silent = false) => {
     if (updateInstallPending.current) return;
     if (updateCheckPending.current) {
@@ -3775,6 +3784,7 @@ export function App() {
       },
       setWatcherEnabled,
       setWatcherStartMinimized,
+      setWatcherStartCodex,
       setAutoTakeover,
       refreshAutoTakeover: () => refreshAutoTakeover(false),
       takeOverNow: () => runAutoTakeoverCommand("take_over_codex_now"),
@@ -4342,6 +4352,7 @@ type Actions = {
   goLogs: () => Promise<void>;
   setWatcherEnabled: (enabled: boolean) => Promise<void>;
   setWatcherStartMinimized: (minimized: boolean) => Promise<void>;
+  setWatcherStartCodex: (startCodex: boolean) => Promise<void>;
   setAutoTakeover: (enabled: boolean) => Promise<void>;
   refreshAutoTakeover: () => Promise<void>;
   takeOverNow: () => Promise<void>;
@@ -7930,7 +7941,7 @@ function MaintenanceScreen({
         </CardContent>
       </Panel>
       <Panel>
-        <CardHead title={t("开机打开 Codex++")} detail={t("登录系统后打开 Codex++ 界面，Codex 仍需点击启动")} />
+        <CardHead title={t("开机打开 Codex++")} detail={t("登录系统后打开 Codex++ 界面，可选择自动启动 Codex")} />
         <CardContent>
           <label className="switch-row">
             <input
@@ -7941,7 +7952,20 @@ function MaintenanceScreen({
             />
             <span>
               <strong>{t("登录时自动打开")}</strong>
-              <small>{t("开启后注册系统登录项，关闭时移除；Codex 仍需你手动点击启动。")}</small>
+              <small>{t("开启后注册系统登录项，关闭时移除；是否自动启动 Codex 由下面的独立开关决定。")}</small>
+            </span>
+            <ToggleVisual />
+          </label>
+          <label className="switch-row">
+            <input
+              checked={Boolean(watcher?.start_codex)}
+              disabled={!watcher}
+              onChange={(event) => void actions.setWatcherStartCodex(event.currentTarget.checked)}
+              type="checkbox"
+            />
+            <span>
+              <strong>{t("登录时自动启动 Codex")}</strong>
+              <small>{t("仅登录启动 Codex++ 时自动启动 Codex；手动打开 Codex++ 仍不会自动启动。")}</small>
             </span>
             <ToggleVisual />
           </label>

@@ -687,6 +687,7 @@ pub struct WatcherPayload {
     pub enabled: bool,
     pub disabled_flag: String,
     pub start_minimized: bool,
+    pub start_codex: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2887,7 +2888,7 @@ fn start_embedded_launcher(request: &LaunchRequest) -> anyhow::Result<()> {
 }
 
 /// 重新打开管理界面时恢复已有 Codex 的 Helper、代理和注入，不启动官方应用。
-pub fn resume_existing_codex_background(app: tauri::AppHandle) {
+pub fn resume_existing_codex_background(app: tauri::AppHandle, start_if_missing: bool) {
     tauri::async_runtime::spawn_blocking(move || {
         if crate::app_is_exiting() {
             return;
@@ -2913,11 +2914,28 @@ pub fn resume_existing_codex_background(app: tauri::AppHandle) {
             status_store: StatusStore::default(),
             ..Default::default()
         };
-        if let Err(error) = codex_plus_launcher::resume_if_running(options) {
-            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-                "manager.resume_existing_failed",
-                json!({ "message": error.to_string() }),
-            );
+        match codex_plus_launcher::resume_if_running(options.clone()) {
+            Ok(true) => {}
+            Ok(false) if start_if_missing => {
+                if let Err(error) = codex_plus_launcher::start(options) {
+                    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                        "manager.autostart_codex_failed",
+                        json!({ "message": error.to_string() }),
+                    );
+                } else {
+                    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                        "manager.autostart_codex_started",
+                        json!({}),
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "manager.resume_existing_failed",
+                    json!({ "message": error.to_string() }),
+                );
+            }
         }
         let _ = tauri::Emitter::emit(&app, "runtime-health-changed", ());
     });
@@ -6143,6 +6161,18 @@ pub fn set_watcher_start_minimized(minimized: bool) -> CommandResult<WatcherPayl
 }
 
 #[tauri::command]
+pub fn set_watcher_start_codex(start_codex: bool) -> CommandResult<WatcherPayload> {
+    match codex_plus_core::watcher::set_watcher_start_codex(start_codex) {
+        Ok(()) if start_codex => ok("登录时将自动启动 Codex。", watcher_payload()),
+        Ok(()) => ok("已取消登录时自动启动 Codex。", watcher_payload()),
+        Err(error) => failed(
+            &format!("设置登录时自动启动 Codex 失败：{error}"),
+            watcher_payload(),
+        ),
+    }
+}
+
+#[tauri::command]
 pub fn load_relay_proxy(profile_id: String) -> CommandResult<Value> {
     let profile_id = profile_id.trim().to_string();
     ok(
@@ -8256,6 +8286,7 @@ fn watcher_payload() -> WatcherPayload {
         enabled: codex_plus_core::watcher::watcher_is_installed() && !flag.exists(),
         disabled_flag: flag.to_string_lossy().to_string(),
         start_minimized: codex_plus_core::watcher::watcher_start_minimized(),
+        start_codex: codex_plus_core::watcher::watcher_start_codex(),
     }
 }
 
