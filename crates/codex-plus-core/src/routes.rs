@@ -507,7 +507,7 @@ impl BridgeSettingsService for CoreSettingsService {
     }
 
     async fn get_settings(&self) -> anyhow::Result<BackendSettings> {
-        self.store.load()
+        self.store.with_snapshot(Ok)
     }
 
     async fn set_settings(&self, payload: Value) -> anyhow::Result<BackendSettings> {
