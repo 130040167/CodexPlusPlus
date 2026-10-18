@@ -322,6 +322,7 @@ describe("managed aggregate session connection", () => {
         window: { __codexPlusAppServerClientClass: Client,
           __codexPlusAppServerClientPrototypePatchInstalled: "16", __codexSessionDeleteBridge: {} },
         client, codexAppServerModelRequestPatchVersion: version,
+        sendCodexRetainedModelRequest: (_client: any, send: any, ...args: any[]) => send(...args),
         codexPlusBackendSettings: { managedSessionConnection: {
           profileId: "aggregate", provider: "codex_plus_managed", baseUrl: "http://127.0.0.1:62021/v1",
         } },
