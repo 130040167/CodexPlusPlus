@@ -1210,7 +1210,7 @@ const defaultSettings: BackendSettings = {
   relayProfiles: [
     {
       id: "default",
-      get name() { return t("默认中转"); },
+      name: t("默认中转"),
       model: "",
       baseUrl: "",
       upstreamBaseUrl: "",

@@ -13,7 +13,7 @@
 | #2549 | 模型行思考菜单提供自动兼容、原样传等级（Chat）、不发送参数；保留档位草稿 | 实际回环请求覆盖 Responses、Chat、Anthropic 的省略行为，其他模型不变；Chat 原样等级不再按模型名改写。Responses 的请求规则会正确启用本地代理。 |
 | #2554 | 请求设置增加“保留外部目录的 Lite 声明”，元数据编辑器增加逐模型 Lite 控件 | 默认关闭；只保留来源中的显式声明，不批量开启 Lite，不改外部原文件。单模型控件保留同文档其他模型及未知字段。 |
 | #2506 | 获取模型与实际代理复用端点规则 | 覆盖 `/v1beta/openai/models`、`/api/coding/v3/models`、裸 origin 和完整 `/models`，状态 URL 不暴露 userinfo/query 凭据。 |
-| #2559 | 语言切换通过外部 store 原地通知 React；模块级标签改为 getter，相关 memo 随语言更新 | 不 reload、不卸载 App，不把含凭据的草稿写入浏览器存储；实际语言 store、标签求值、前端全量回归与类型检查通过。 |
+| #2559 | 语言切换通过外部 store 原地通知 React；模块级界面标签改为 getter，相关 memo 随语言更新；默认供应商名称保持创建时的数据快照 | 不 reload、不卸载 App，不把含凭据的草稿写入浏览器存储；实际语言 store、标签求值、前端全量回归与类型检查通过。 |
 | #2559 | 会话页增加取消全部选择，明确页码与总会话数；搜索/翻页收窄选择 | 执行实际 SessionPage 组件及删除回调，确认隐藏行不进入删除参数、取消后禁用删除、翻页不沿用旧页选择；测试没有删除真实会话。 |
 | #2556 / #2517 / #2560 | Windows Claude 脚本父进程补 CREATE_NO_WINDOW；副本校验改用流式 .NET SHA-256 | 保留 BOM、失败提示与流关闭，不给 Claude 加 WindowStyle Hidden；源码契约与已有副本回滚回归通过，真实 Windows prepare/check/launch 仍需验证。 |
 
