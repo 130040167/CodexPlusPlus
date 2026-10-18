@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
 import { readFile } from "node:fs/promises";
+import vm from "node:vm";
 
 /**
  * 模型选择器分组折叠（聚合供应商场景）的契约测试。
@@ -173,4 +174,64 @@ it("默认标志不改变无障碍语义：读屏会念出「默认供应商」"
   const source = await readShard();
   assert.match(source, /（默认供应商）/);
   assert.match(source, /\(default provider\)/);
+});
+
+async function groupingRuntime(catalog: any) {
+  const source = await readShard();
+  const names = [
+    "providerNameOf", "codexPlusModelPickerSplitLabel",
+    "codexPlusModelPickerNormalizeStrict", "codexPlusModelPickerNormalize",
+    "codexPlusModelPickerCatalogAliases", "codexPlusModelPickerCatalogProviderMap",
+    "codexPlusModelPickerRows", "codexPlusModelPickerGroups",
+  ];
+  const functions = names.map((name) => {
+    const match = source.match(new RegExp(`  function ${name}\\([^]*?\\n  \\}`));
+    assert.ok(match, name);
+    return match[0];
+  }).join("\n");
+  return vm.runInNewContext(`(() => {${functions}; return {
+    rows: (labels) => codexPlusModelPickerRows({querySelectorAll: () => labels}),
+    groups: codexPlusModelPickerGroups,
+    providers: codexPlusModelPickerCatalogProviderMap
+  };})()`, {
+    codexModelCatalog: catalog,
+    codexPlusModelPickerGroupsState: { providerNames: new Map([["5.5", { name: "Old", parsed: false }]]) },
+    codexPlusModelPickerGroupNameMaxLength: 24,
+    codexPlusModelPickerRememberProvider: () => {},
+    codexPlusModelPickerRowIdentity: (text: string) => ({ text, groupable: true }),
+    codexPlusModelPickerDefaultGroupId: () => "a",
+    codexPlusModelPickerDefaultProviderName: () => "Alpha",
+  });
+}
+
+it("display aliases and newly added models share their authoritative provider group", async () => {
+  const metadata = (displayName: string) => ({
+    displayName, codex_plus_group: "Beta", codex_plus_group_id: "b",
+  });
+  const runtime = await groupingRuntime({
+    models: ["cpx-b/gpt-6.1-sol", "cpx-b/gpt-5.5", "cpx-b/gpt-test"],
+    modelMetadata: {
+      "cpx-b/gpt-6.1-sol": metadata("GPT-6.1-Sol (Beta)"),
+      "cpx-b/gpt-5.5": metadata("GPT-5.5 (Beta)"),
+      "cpx-b/gpt-test": metadata("gpt-test (Beta)"),
+    },
+  });
+  const groups = runtime.groups(runtime.rows(["6.1 Sol (Beta)", "5.5 (Beta)", "gpt-test (Beta)"]));
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].id, "b");
+  assert.equal(groups[0].entries.length, 3);
+});
+
+it("same model names resolve by provider and stale metadata outside the catalog is ignored", async () => {
+  const runtime = await groupingRuntime({
+    models: ["gpt-5.5", "cpx-b/gpt-5.5"],
+    modelMetadata: {
+      "gpt-5.5": { displayName: "GPT-5.5", codex_plus_group: "Alpha", codex_plus_group_id: "a" },
+      "cpx-b/gpt-5.5": { displayName: "GPT-5.5 (Beta)", codex_plus_group: "Beta", codex_plus_group_id: "b" },
+      "cpx-old/kimi": { displayName: "Kimi (Old)", codex_plus_group: "Old", codex_plus_group_id: "old" },
+    },
+  });
+  const rows = runtime.rows(["5.5 (Alpha)", "5.5 (Beta)"]);
+  assert.deepEqual(Array.from(rows, (row: any) => row.groupId), ["a", "b"]);
+  assert.equal(runtime.providers().has("kimi"), false);
 });

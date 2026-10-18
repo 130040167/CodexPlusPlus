@@ -291,7 +291,7 @@
 
   /** 归一化：比较时忽略大小写、`gpt-` 前缀和空白。 */
   function codexPlusModelPickerNormalize(value) {
-    return codexPlusModelPickerNormalizeStrict(value).replace(/^gpt-/u, "");
+    return codexPlusModelPickerNormalizeStrict(value).replace(/^gpt-/u, "").replace(/[-_]/g, "");
   }
 
   /**
@@ -327,16 +327,15 @@
    */
   function codexPlusModelPickerCatalogProviderMap() {
     const modelMetadata = codexModelCatalog?.modelMetadata || codexModelCatalog?.model_metadata;
-    // 会话内已记下的归属先铺一层：目录快照可能被整体替换（重连 / 重新生成），
-    // 只认当前快照会让默认供应商的分组名在某一刻变空。
-    const map = new Map(codexPlusModelPickerGroupsState.providerNames);
+    // 分组 ID 只从当前目录解析；展示名缓存没有 ID，也可能属于旧聚合。
+    const map = new Map();
     if (!modelMetadata || typeof modelMetadata !== "object") return map;
     const slugList = Array.isArray(codexModelCatalog?.models)
       ? codexModelCatalog.models.filter((slug) => typeof slug === "string" && slug)
       : [];
     const entries = Object.entries(modelMetadata);
     // `models` 是权威切片：优先按它逐个取元数据（键能对上就用真实 slug 做别名）。
-    // 取不到（切片缺失 / 键不一致）时退回遍历全部元数据，保证不漏分组。
+    // 仅在切片缺失时遍历全部元数据；明确撤下的模型不能从旧元数据复活。
     const seenEntries = new Set();
     const registerEntry = (entry, slug) => {
       if (!entry || typeof entry !== "object" || seenEntries.has(entry)) return;
@@ -347,15 +346,20 @@
       const groupId = typeof entry.codex_plus_group_id === "string" ? entry.codex_plus_group_id.trim() : "";
       if (!provider || !groupId) return;
       for (const key of codexPlusModelPickerCatalogAliases(displayName, entry, slug)) {
+        const value = { provider, groupId, parsed: false };
+        // 同名模型可属于多个成员；带供应商的查询必须优先于裸名别名。
+        map.set(`${key}\0${provider}`, value);
         const remembered = map.get(key);
-        // 权威来源可以覆盖行文本猜出来的；已经有权威值就不动。
-        if (!remembered || remembered.parsed) map.set(key, { provider, groupId, parsed: false });
+        if (!map.has(key) || remembered?.groupId === groupId) map.set(key, value);
+        else map.set(key, null);
       }
       codexPlusModelPickerRememberProvider(displayName, provider, false);
     };
     const bySlug = new Map(entries);
     for (const slug of slugList) registerEntry(bySlug.get(slug), slug);
-    for (const [key, entry] of entries) registerEntry(entry, key);
+    if (!Array.isArray(codexModelCatalog?.models)) {
+      for (const [key, entry] of entries) registerEntry(entry, key);
+    }
     return map;
   }
 
@@ -416,8 +420,13 @@
       // 分组键：只信"行上有后缀"和"目录里的权威分组 id"这两个来源。
       // 早期版本拿目录展示名去拟合行文本，别名一多就把模型分到了错的组（同一家被切成
       // 好几段），所以目录查询只用来补 **分组 id**，不用来决定显示成哪一组。
-      const known = providers.get(codexPlusModelPickerNormalizeStrict(split.name))
-        || providers.get(codexPlusModelPickerNormalize(split.name));
+      const keys = [
+        codexPlusModelPickerNormalizeStrict(split.name),
+        codexPlusModelPickerNormalize(split.name),
+      ];
+      const known = split.provider
+        ? keys.map((key) => providers.get(`${key}\0${split.provider}`)).find(Boolean)
+        : keys.map((key) => providers.get(key)).find(Boolean);
       const groupId = known?.groupId
         || (split.provider ? split.provider : codexPlusModelPickerDefaultGroupId());
       // 显示名按行文本：有后缀就是那一家；裸名（默认成员的模型）用默认供应商的名字。
