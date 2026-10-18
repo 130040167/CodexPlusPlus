@@ -3,7 +3,7 @@
     {
       "name": "00-prelude.js",
       "description": "IIFE 开头、环境守卫、平台探测、常量与图片覆盖层",
-      "lines": 1788
+      "lines": 1790
     },
     {
       "name": "01-registry.js",
@@ -33,7 +33,7 @@
     {
       "name": "40-backend-settings.js",
       "description": "后端设置读写、心跳同步、用户脚本与市场状态、拓展 UI",
-      "lines": 1942
+      "lines": 1945
     },
     {
       "name": "50-navigation.js",
@@ -103,7 +103,7 @@
     {
       "name": "93-dictation.js",
       "description": "独立 ASR 听写入口、录音、取消重试与原生输入框回填",
-      "lines": 583
+      "lines": 604
     },
     {
       "name": "94-typing-effects.js",

@@ -7590,6 +7590,9 @@
               showToast("当前 Codex 构建没有可用的 Statsig 刷新接口", null);
             } else if (result.status === "ok" && result.enable_i18n === true) {
               showToast("UI 配置已刷新，enable_i18n=true", null);
+              // 只有用户主动点击且远端明确返回 true 时刷新页面，让 Codex
+              // 重新走语言包加载 gate；不在启动/网络恢复路径自动触发。
+              window.setTimeout(() => window.location.reload(), 150);
             } else if (result.status === "ok" && result.enable_i18n === false) {
               showToast("UI 配置已刷新，enable_i18n=false", null);
             } else {
