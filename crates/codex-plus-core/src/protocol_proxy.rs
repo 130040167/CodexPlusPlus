@@ -3427,6 +3427,7 @@ async fn upstream_request_parts(
                 }),
             );
         }
+        dedupe_responses_tool_search_outputs(&mut body);
         normalize_responses_item_ids(&mut body);
     }
 
@@ -4990,6 +4991,44 @@ fn normalize_responses_item_ids(body: &mut Value) {
         }
         Value::Object(_) => normalize_responses_item_id(input),
         _ => {}
+    }
+}
+
+/// Responses 上游要求同一请求里的 namespace 名称唯一。
+/// Codex 客户端在多轮 tool_search 后可能把多个历史 `tool_search_output` 都回放到
+/// 下一请求；合并同名 namespace 的子工具后保留第一个 output 外壳，避免严格上游
+/// 报 duplicate namespace，同时不丢掉后一次检索新增的工具（#2156 / #2166）。
+fn dedupe_responses_tool_search_outputs(body: &mut Value) {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut first_output_index = None;
+    let mut merged_namespaces = Vec::new();
+    let mut remove_indices = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        if item.get("type").and_then(Value::as_str) != Some("tool_search_output") {
+            continue;
+        }
+        if first_output_index.is_none() {
+            first_output_index = Some(index);
+        } else {
+            remove_indices.push(index);
+        }
+        for tool in item
+            .get("tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            merge_namespace_definition(&mut merged_namespaces, tool);
+        }
+    }
+    let Some(first_output_index) = first_output_index else {
+        return;
+    };
+    items[first_output_index]["tools"] = json!(merged_namespaces);
+    for index in remove_indices.into_iter().rev() {
+        items.remove(index);
     }
 }
 
@@ -8199,6 +8238,47 @@ fn is_openai_o_series(model: &str) -> bool {
 #[cfg(test)]
 mod response_compatibility_tests {
     use super::*;
+
+    #[test]
+    fn responses_tool_search_outputs_merge_duplicate_namespaces() {
+        let mut body = json!({
+            "input": [
+                {
+                    "type": "tool_search_output",
+                    "call_id": "first",
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "mcp__memory",
+                        "tools": [{"type": "function", "name": "search_code", "parameters": {"type": "object"}}]
+                    }]
+                },
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+                {
+                    "type": "tool_search_output",
+                    "call_id": "second",
+                    "tools": [{
+                        "type": "namespace",
+                        "name": "mcp__memory",
+                        "tools": [
+                            {"type": "function", "name": "search_code", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}},
+                            {"type": "function", "name": "read_context", "parameters": {"type": "object"}}
+                        ]
+                    }]
+                }
+            ]
+        });
+
+        dedupe_responses_tool_search_outputs(&mut body);
+
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "tool_search_output");
+        let tools = input[0]["tools"][0]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], "search_code");
+        assert_eq!(tools[1]["name"], "read_context");
+        assert_eq!(input[1]["type"], "message");
+    }
 
     #[test]
     fn opt_in_prompt_prefix_stabilizer_is_deterministic_and_idempotent() {
