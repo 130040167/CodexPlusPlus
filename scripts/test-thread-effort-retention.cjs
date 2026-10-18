@@ -12,21 +12,31 @@ const html = `<!doctype html><meta charset="utf-8"><title>Thread effort regressi
 <button data-reasoning-slider>Power</button><output id="effort"></output>
 <script>
 const codexPlusBackendSettingsLoaded = true;
-const codexRemoteSessionActiveProfile = () => ({ id: "fixture" });
-const codexModelCatalog = { status: "ok", codex_plus_default_group_id: "a" };
-const codexPlusModelNames = () => ["sol"];
-const codexPlusModelMetadata = () => ({ codex_plus_group_id: "a" });
+const scenario = new URLSearchParams(location.search).get("profile") || "a";
+const aggregate = scenario.startsWith("aggregate");
+const codexPlusBackendSettings = { relayProfiles: [{ id: "a", relayMode: "pureApi" }] };
+const codexRemoteSessionActiveProfile = () => ({ id: scenario, relayMode: aggregate ? "aggregate" : "pureApi" });
+const codexModelCatalog = { status: "ok", codex_plus_default_group_id: "b" };
+const names = scenario === "missing" ? ["other"] : aggregate ? ["sol", "cpx-a/sol"] : ["sol"];
+const codexPlusModelNames = () => names;
+const modelReasoningEfforts = () => (scenario === "limited" ? ["low", "medium"] : ["low", "high", "xhigh"])
+  .map(reasoningEffort => ({ reasoningEffort }));
+const codexPlusModelMetadata = model => ({ defaultReasoningEffort: "medium",
+  codex_plus_group_id: aggregate ? (model.startsWith("cpx-a/") ? "a" : "b") : undefined });
 ${functions}
 const owner = { conversationId: location.pathname, permissionsHostId: "local" };
 const picker = {
-  model: "sol", reasoningEffort: "low", models: [{ model: "sol" }],
+  model: names[0], reasoningEffort: "low", models: names.map(model => ({ model })),
   onSelectModel(model, effort) {
     this.model = model; this.reasoningEffort = effort; render();
   }
 };
 const fiber = { memoizedProps: picker, return: { memoizedProps: owner } };
 for (const node of document.querySelectorAll("button")) node.__reactFiber$fixture = fiber;
-function render() { document.querySelector("output").textContent = picker.reasoningEffort; }
+function render() {
+  document.querySelector("output").textContent = picker.reasoningEffort;
+  document.querySelector("output").dataset.model = picker.model;
+}
 const slider = document.querySelector("[data-reasoning-slider]");
 slider.addEventListener("pointerup", () => picker.onSelectModel("sol", "high"));
 slider.addEventListener("keydown", event => {
@@ -43,11 +53,19 @@ syncCodexRetainedThreadModels();
   });
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   let browser;
+  let attachedPage, attachedUrl;
   try {
     const origin = `http://127.0.0.1:${server.address().port}`;
-    browser = await chromium.launch({ channel: "msedge", headless: true });
-    let context = await browser.newContext();
-    let page = await context.newPage();
+    const endpoint = process.env.CODEX_TEST_CDP_ENDPOINT;
+    browser = endpoint ? await chromium.connectOverCDP(endpoint)
+      : await chromium.launch({ channel: "msedge", headless: true });
+    let context = endpoint ? browser.contexts()[0] : await browser.newContext();
+    let page = endpoint ? context.pages()[0] : await context.newPage();
+    if (endpoint) {
+      attachedPage = page;
+      attachedUrl = page.url();
+      if (!attachedUrl.startsWith("http://tauri.localhost/")) throw new Error("Expected isolated manager WebView");
+    }
     const errors = [];
     page.on("pageerror", error => errors.push(error.message));
     await page.goto(origin + "/one");
@@ -61,7 +79,17 @@ syncCodexRetainedThreadModels();
     assert.equal(await page.locator("output").textContent(), "low");
     await page.goto(origin + "/one");
     await page.waitForFunction(() => document.querySelector("output").textContent === "xhigh");
+    for (const profile of ["aggregate-1", "aggregate-2", "a", "b", "limited", "missing", "a"]) {
+      await page.goto(origin + "/one?profile=" + profile);
+      const effort = profile === "limited" ? "medium" : profile === "missing" ? "low" : "xhigh";
+      const model = profile.startsWith("aggregate") ? "cpx-a/sol" : profile === "missing" ? "other" : "sol";
+      await page.waitForFunction(({ effort, model }) => {
+        const output = document.querySelector("output");
+        return output.textContent === effort && output.dataset.model === model;
+      }, { effort, model });
+    }
     const storageState = await context.storageState();
+    if (attachedPage) await attachedPage.goto(attachedUrl);
     await browser.close();
     browser = await chromium.launch({ channel: "msedge", headless: true });
     context = await browser.newContext({ storageState });
@@ -70,9 +98,13 @@ syncCodexRetainedThreadModels();
     await page.goto(origin + "/one");
     await page.waitForFunction(() => document.querySelector("output").textContent === "xhigh");
     assert.deepEqual(errors, []);
-    console.log("PASS: native-shaped slider pointer/keyboard events, reload, thread navigation, browser recreation with serialized storage");
+    console.log("PASS: pointer/keyboard, reload, navigation, direct/aggregate/source/name/effort/default fallbacks, browser recreation");
   } finally {
+    if (attachedPage && !attachedPage.isClosed() && attachedPage.url() !== attachedUrl) {
+      await attachedPage.goto(attachedUrl).catch(() => {});
+    }
     await browser?.close();
+    server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -1007,21 +1007,56 @@
   function codexRetainedThreadModel(hostId, threadId) {
     const key = codexThreadModelStorageKey(hostId, threadId);
     if (!key || codexModelCatalog.status !== "ok") return null;
-    const saved = codexRememberedThreadModels().find((entry) => entry.key === key);
+    const profile = codexRemoteSessionActiveProfile();
+    if (Array.isArray(codexModelCatalog.sources) && codexModelCatalog.sources.length
+        && !codexModelCatalog.sources.some((source) =>
+          source?.id === `${profile?.relayMode === "aggregate" ? "aggregate" : "relay-profile"}:${profile?.id}`)) return null;
+    const saved = codexLatestThreadModel(hostId, threadId);
     if (!saved) return null;
     const model = resolveCodexThreadModelSelection(saved);
-    return model ? { ...saved, model } : null;
+    if (!model) return null;
+    const metadata = codexPlusModelMetadata(model);
+    const efforts = modelReasoningEfforts(model).map((entry) => entry.reasoningEffort);
+    const effort = saved.effort == null || efforts.includes(saved.effort) ? saved.effort
+      : efforts.includes(metadata?.defaultReasoningEffort) ? metadata.defaultReasoningEffort : null;
+    return { ...saved, model, effort };
+  }
+
+  function codexLatestThreadModel(hostId, threadId) {
+    // 兼容旧的按配置保存记录；跨直连/聚合读取同一对话最近一次选择。
+    return codexRememberedThreadModels().filter((entry) => {
+      try {
+        const scope = JSON.parse(entry.key);
+        return Array.isArray(scope) && scope[0] === hostId && scope[2] === threadId;
+      } catch { return false; }
+    }).sort((a, b) => b.at - a.at)[0] || null;
+  }
+
+  function codexThreadModelSourceGroup(model) {
+    const profile = codexRemoteSessionActiveProfile();
+    return codexPlusModelMetadata(model)?.codex_plus_group_id
+      || (profile?.relayMode === "pureApi" ? profile.id : "");
   }
 
   function resolveCodexThreadModelSelection(saved) {
-    let model = saved.model;
-    if (saved.groupId) {
-      const base = model.startsWith("cpx-") ? model.slice(model.indexOf("/") + 1) : model;
-      model = saved.groupId === codexModelCatalog.codex_plus_default_group_id
-        ? base : `cpx-${saved.groupId}/${base}`;
-      if (codexPlusModelMetadata(model)?.codex_plus_group_id !== saved.groupId) return "";
+    if (codexModelCatalog.status !== "ok") return "";
+    const names = codexPlusModelNames();
+    const baseName = (model) => model.startsWith("cpx-") ? model.slice(model.indexOf("/") + 1) : model;
+    const matches = names.filter((model) => baseName(model) === baseName(saved.model));
+    let groupId = saved.groupId;
+    if (!groupId) {
+      try {
+        const profileId = JSON.parse(saved.key)[1];
+        const profile = codexPlusBackendSettings.relayProfiles?.find((entry) => entry.id === profileId);
+        if (profile?.relayMode === "pureApi") groupId = profile.id;
+      } catch { /* 无来源的旧记录仍可按模型名匹配。 */ }
     }
-    return codexModelCatalog.status === "ok" && codexPlusModelNames().includes(model) ? model : "";
+    const sameSource = groupId && matches.find((model) => codexThreadModelSourceGroup(model) === groupId);
+    if (sameSource) return sameSource;
+    const compatible = saved.effort == null ? matches : matches.filter((model) =>
+      modelReasoningEfforts(model).some((entry) => entry.reasoningEffort === saved.effort));
+    const candidates = compatible.length ? compatible : matches;
+    return candidates.find((model) => model === baseName(saved.model)) || candidates[0] || "";
   }
 
   function captureCodexThreadModelSelection(params) {
@@ -1030,7 +1065,7 @@
         || !codexPlusModelNames().includes(model)) return null;
     return { model, effort: params?.effort ?? params?.reasoningEffort
       ?? params?.collaborationMode?.settings?.reasoning_effort ?? null,
-      groupId: codexPlusModelMetadata(model)?.codex_plus_group_id || "" };
+      groupId: codexThreadModelSourceGroup(model) };
   }
 
   function rememberCodexThreadModel(method, params, result, hostId, selection, explicit = false) {
@@ -1043,7 +1078,12 @@
         || !resolveCodexThreadModelSelection(selection)) return;
     const previous = codexRememberedThreadModels();
     // 发消息可能携带原生回退值；已有明确选择时不能用它覆盖。
-    if (String(method) === "turn/start" && !explicit && previous.some((item) => item.key === key)) return;
+    const latest = codexLatestThreadModel(hostId, threadId);
+    if (String(method) === "turn/start" && !explicit && latest) return;
+    // 自动恢复到替代供应商不能覆盖原始来源，否则切回时将无法找回原选择。
+    const retained = latest && codexRetainedThreadModel(hostId, threadId);
+    if (!explicit && latest && latest.key !== key && !retained) return;
+    if (!explicit && retained && retained.model === selection.model && retained.effort === selection.effort) return;
     const remembered = previous.find((item) => item.key === key);
     // 自动恢复的重复确认不改变记录版本，否则会把三次重试额度不断重置。
     if (remembered && remembered.groupId === selection.groupId && remembered.effort === selection.effort
@@ -1059,8 +1099,10 @@
   function retainCodexThreadResumeModel(method, params, hostId) {
     if (String(method) !== "thread/resume") return params;
     const saved = codexRetainedThreadModel(hostId, params?.threadId);
-    if (!saved || (params?.model && params.model !== saved.model)) return params;
-    return { ...params, model: saved.model, reasoningEffort: params?.reasoningEffort ?? saved.effort };
+    if (!saved) return params;
+    const crossProfile = saved.key !== codexThreadModelStorageKey(hostId, params?.threadId);
+    if (!crossProfile && params?.model && params.model !== saved.model) return params;
+    return { ...params, model: saved.model, reasoningEffort: crossProfile ? saved.effort : params?.reasoningEffort ?? saved.effort };
   }
 
   async function sendCodexRetainedModelRequest(client, send, method, params, options) {
@@ -1202,7 +1244,7 @@
             window.setTimeout?.(syncCodexRetainedThreadModels, 300);
           } else if (Date.now() - intent.confirmedSince >= 250) {
             rememberCodexThreadModel("thread/settings/update", { threadId: owner }, {}, hostId,
-              { ...intent.selection, effort: picker.reasoningEffort ?? null });
+              { ...intent.selection, effort: picker.reasoningEffort ?? null }, true);
             selections.delete(key);
           }
         } else intent.confirmedSince = 0;

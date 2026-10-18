@@ -6,21 +6,30 @@ const source = await readFile(new URL("../../../assets/inject/renderer-inject/70
 function runtime(storage = new Map<string,string>(), sharedWindow: any = {}) {
   let profile = "aggregate", now = 10000;
   const catalog = { status: "ok", codex_plus_default_group_id: "a" };
+  let names = ["gpt-5.5", "sol", "cpx-b/sol", "cpx-a/sol"];
+  let mode = "aggregate";
+  let supported = ["low", "medium", "high", "xhigh", "max", "ultra"];
+  const effortByModel: Record<string,string[]> = {};
   const nodes: any[] = [];
   const context = vm.createContext({
     window: sharedWindow, document: { querySelectorAll: () => nodes },
     localStorage: { getItem: (k: string) => storage.get(k), setItem: (k:string,v:string) => storage.set(k,v) },
     Date: { now: () => now }, Map, WeakMap, Promise, Set,
     codexPlusBackendSettingsLoaded: true,
-    codexRemoteSessionActiveProfile: () => ({ id: profile }),
+    codexPlusBackendSettings: { relayProfiles: [{id:"a",relayMode:"pureApi"}] },
+    codexRemoteSessionActiveProfile: () => ({ id: profile, relayMode: mode }),
     codexModelCatalog: catalog,
-    codexPlusModelNames: () => ["gpt-5.5", "sol", "cpx-b/sol", "cpx-a/sol"],
-    codexPlusModelMetadata: (model:string) => ({ codex_plus_group_id: model.startsWith("cpx-") ? model.slice(4,model.indexOf("/")) : catalog.codex_plus_default_group_id }),
+    codexPlusModelNames: () => names,
+    modelReasoningEfforts: (model:string) => (effortByModel[model] || supported).map(reasoningEffort=>({reasoningEffort})),
+    codexPlusModelMetadata: (model:string) => ({ defaultReasoningEffort:"medium",
+      codex_plus_group_id: mode==="pureApi" ? undefined : model.startsWith("cpx-") ? model.slice(4,model.indexOf("/")) : catalog.codex_plus_default_group_id }),
   });
   const start = source.indexOf("  function codexRememberedThreadModels()");
   const end = source.indexOf("  function codexPerModelContextEnabled()", start);
   const api = vm.runInContext(`(()=>{${source.slice(start,end)};return {rememberCodexThreadModel,codexRetainedThreadModel,retainCodexThreadResumeModel,sendCodexRetainedModelRequest,syncCodexRetainedThreadModels,observeCodexThreadModelSelection}})()`,context);
-  return { api, storage, catalog, nodes, profile: (v:string) => { profile=v; }, tick: () => { now+=2000; } };
+  return { api, storage, catalog, nodes, effortByModel, profile: (v:string) => { profile=v; },
+    configure: (id:string,relayMode:string,models:string[],efforts=supported) => {profile=id;mode=relayMode;names=models;supported=efforts;},
+    tick: () => { now+=2000; } };
 }
 function pickerFixture(r: ReturnType<typeof runtime>, model = "gpt-5.5") {
   const picker: any = { model, reasoningEffort: "low", models: [{model:"sol"},{model:"gpt-5.5"}], onSelectModel: () => {} };
@@ -39,6 +48,69 @@ function pickerFixture(r: ReturnType<typeof runtime>, model = "gpt-5.5") {
   };
   return {picker,owner,choose};
 }
+it("source provider survives direct to aggregate to another aggregate and back",()=>{
+  const r=runtime();
+  r.configure("a","pureApi",["sol"]);
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
+  r.configure("aggregate-1","aggregate",["sol","cpx-a/sol"]);
+  r.catalog.codex_plus_default_group_id="b";
+  assert.equal(r.api.codexRetainedThreadModel("local","one").model,"cpx-a/sol");
+  const resume=r.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one",model:"sol",reasoningEffort:"low"},"local");
+  assert.equal(resume.model,"cpx-a/sol");assert.equal(resume.reasoningEffort,"high");
+  r.configure("aggregate-2","aggregate",["sol","cpx-a/sol"]);
+  assert.equal(r.api.codexRetainedThreadModel("local","one").model,"cpx-a/sol");
+  r.configure("a","pureApi",["sol"]);
+  assert.equal(r.api.codexRetainedThreadModel("local","one").model,"sol");
+});
+it("when source is absent a same-name candidate supporting the saved effort precedes model defaults",()=>{
+  const r=runtime();
+  r.configure("a","pureApi",["sol"]);
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"ultra"},{},"local");
+  r.configure("aggregate-new","aggregate",["sol","cpx-c/sol"]);
+  r.catalog.codex_plus_default_group_id="b";
+  r.effortByModel.sol=["low","medium"];
+  assert.equal(r.api.codexRetainedThreadModel("local","one").model,"cpx-c/sol");
+  assert.equal(r.api.codexRetainedThreadModel("local","one").effort,"ultra");
+});
+it("missing source uses same-name model and supported effort before native defaults",()=>{
+  const r=runtime();
+  r.configure("a","pureApi",["sol"]);
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"ultra"},{},"local");
+  r.configure("b","pureApi",["sol"]);
+  assert.equal(r.api.codexRetainedThreadModel("local","one").effort,"ultra");
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"ultra"},{},"local");
+  r.configure("c","pureApi",["sol"],["low","medium","high"]);
+  assert.equal(r.api.codexRetainedThreadModel("local","one").effort,"medium");
+  r.configure("d","pureApi",["different"]);
+  assert.equal(r.api.codexRetainedThreadModel("local","one"),null);
+  const original={threadId:"one",model:"different",reasoningEffort:"low"};
+  assert.equal(r.api.retainCodexThreadResumeModel("thread/resume",original,"local"),original);
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"different",effort:"low"},{},"local");
+  r.configure("a","pureApi",["sol"],["low","medium","high","ultra"]);
+  assert.equal(r.api.codexRetainedThreadModel("local","one").groupId,"a");
+  assert.equal(r.api.codexRetainedThreadModel("local","one").effort,"ultra");
+});
+it("a profile change waits for its own catalog instead of restoring with stale member identities",()=>{
+  const r=runtime();
+  r.configure("a","pureApi",["sol"]);
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
+  r.configure("aggregate-new","aggregate",["sol","cpx-a/sol"]);
+  (r.catalog as any).sources=[{id:"aggregate:aggregate-old"}];
+  assert.equal(r.api.codexRetainedThreadModel("local","one"),null);
+  (r.catalog as any).sources=[{id:"aggregate:aggregate-new"}];
+  assert.equal(r.api.codexRetainedThreadModel("local","one").effort,"high");
+});
+it("latest explicit cross-profile choice wins and old pureApi records migrate by source id",()=>{
+  const r=runtime();
+  r.configure("a","pureApi",["sol"]);
+  r.storage.set("codexPlus.threadModels.v1",JSON.stringify([{key:JSON.stringify(["local","a","one"]),model:"sol",effort:"high",groupId:"",at:9000}]));
+  r.configure("aggregate","aggregate",["sol","cpx-a/sol"]);r.catalog.codex_plus_default_group_id="b";
+  assert.equal(r.api.codexRetainedThreadModel("local","one").model,"cpx-a/sol");
+  r.tick();
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"low"},{},"local",undefined,true);
+  r.configure("a","pureApi",["sol"]);
+  assert.equal(r.api.codexRetainedThreadModel("local","one").effort,"low");
+});
 it("successful per-thread settings survive a fresh renderer and retain provider identity", async () => {
   const r=runtime();
   await r.api.sendCodexRetainedModelRequest({hostId:"local"},async()=>({}),"thread/settings/update",{threadId:"one",model:"sol",effort:"high"});
@@ -49,7 +121,7 @@ it("successful per-thread settings survive a fresh renderer and retain provider 
   assert.equal(next.api.codexRetainedThreadModel("local","two"),null);
   assert.equal(next.api.codexRetainedThreadModel("ssh","one"),null);
   next.profile("other");
-  assert.equal(next.api.codexRetainedThreadModel("local","one"),null);
+  assert.equal(next.api.codexRetainedThreadModel("local","one").model,"cpx-a/sol");
 });
 it("failed settings, read/resume fallback, and late responses after profile change do not overwrite", async()=>{
   const r=runtime(); const send=r.api.sendCodexRetainedModelRequest;
@@ -61,7 +133,7 @@ it("failed settings, read/resume fallback, and late responses after profile chan
   let done:any;
   const p=send({hostId:"local"},()=>new Promise(resolve=>{done=resolve}),"thread/settings/update",{threadId:"one",model:"gpt-5.5"});
   r.profile("other");done({});await p;
-  assert.equal(r.api.codexRetainedThreadModel("local","one"),null);
+  assert.equal(r.api.codexRetainedThreadModel("local","one").model,"sol");
 });
 it("resume fills missing model but respects an explicit context/model switch",()=>{
   const r=runtime();r.api.rememberCodexThreadModel("turn/start",{threadId:"one",model:"sol",effort:"low"},{},"local");
