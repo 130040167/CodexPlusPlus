@@ -159,3 +159,4 @@
 .mg-skill-group-head .mg-group-head { flex:1; border-bottom:0; background:transparent; }
 .mg-skill-group-head .mg-row-actions { padding-right:8px; }
 .mg-skill-group .mg-skill-list { border-radius:0 0 9px 9px; }
+.mg-skill-group-select { display:block; max-width:100%; margin-top:4px; border:1px solid hsl(var(--border)); border-radius:5px; background:transparent; color:inherit; font:inherit; font-size:10px; padding:2px 4px; }
