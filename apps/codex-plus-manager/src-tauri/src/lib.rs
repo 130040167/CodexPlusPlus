@@ -190,6 +190,7 @@ pub fn run() {
             commands::confirm_pending_provider_import,
             commands::dismiss_pending_provider_import,
             commands::list_local_sessions,
+            commands::list_project_sessions,
             commands::delete_local_session,
             commands::load_provider_sync_targets,
             commands::repair_session_index,

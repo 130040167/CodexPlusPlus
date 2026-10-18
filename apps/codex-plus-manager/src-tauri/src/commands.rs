@@ -342,6 +342,13 @@ pub struct ListLocalSessionsRequest {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ListProjectSessionsRequest {
+    #[serde(default)]
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeleteLocalSessionRequest {
     pub session_id: String,
     #[serde(default)]
@@ -4448,6 +4455,77 @@ pub async fn list_local_sessions(
                 total_count: 0,
             },
         ),
+    }
+}
+
+#[tauri::command]
+pub async fn list_project_sessions(
+    request: ListProjectSessionsRequest,
+) -> CommandResult<LocalSessionsPayload> {
+    match tauri::async_runtime::spawn_blocking(move || list_project_sessions_blocking(request.cwd)).await {
+        Ok(result) => result,
+        Err(error) => failed(
+            &format!("项目会话查询后台任务失败：{error}"),
+            LocalSessionsPayload {
+                db_path: String::new(),
+                db_paths: Vec::new(),
+                sessions: Vec::new(),
+                offset: 0,
+                limit: 1,
+                has_more: false,
+                total_count: 0,
+            },
+        ),
+    }
+}
+
+fn normalized_project_path(path: &str) -> String {
+    path.trim()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn list_project_sessions_blocking(cwd: String) -> CommandResult<LocalSessionsPayload> {
+    let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+    let db_paths = codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(&home);
+    static PROJECT_PAGER: std::sync::OnceLock<std::sync::Mutex<codex_plus_data::LocalSessionPager>> =
+        std::sync::OnceLock::new();
+    let page = match PROJECT_PAGER.get_or_init(Default::default).lock() {
+        Ok(mut pager) => pager.list_page(&db_paths, 0, usize::MAX),
+        Err(_) => codex_plus_data::LocalSessionPage {
+            errors: vec!["项目会话查询缓存不可用，请重启管理窗口。".to_string()],
+            ..Default::default()
+        },
+    };
+    let target = normalized_project_path(&cwd);
+    let sessions = page
+        .sessions
+        .into_iter()
+        .filter(|session| normalized_project_path(&session.cwd) == target)
+        .collect::<Vec<_>>();
+    let payload = LocalSessionsPayload {
+        db_path: db_paths
+            .first()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        db_paths: db_paths
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect(),
+        limit: sessions.len().max(1),
+        total_count: sessions.len(),
+        sessions,
+        offset: 0,
+        has_more: false,
+    };
+    if page.errors.is_empty() {
+        ok(&format!("已读取项目全部 {} 个会话。", payload.total_count), payload)
+    } else {
+        failed(
+            &format!("读取项目会话时出现部分错误：{}", page.errors.join("; ")),
+            payload,
+        )
     }
 }
 
