@@ -466,6 +466,102 @@ fn switch_from_aggregate_backfills_aggregate_auth_state() {
     );
 }
 
+#[test]
+fn switch_after_external_takeover_keeps_old_aggregate_and_restores_selected_profile() {
+    for target in ["api", "agg"] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex");
+        std::fs::create_dir(&home).unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let proxy = codex_plus_core::protocol_proxy::local_responses_proxy_base_url(
+            codex_plus_core::protocol_proxy::protocol_proxy_port(),
+        );
+        let mut previous = pure_profile("old-agg", &proxy, "codex-plus-aggregate");
+        previous.relay_mode = RelayMode::Aggregate;
+        let mut settings = aggregate_target_settings(
+            pure_profile("api", "https://api.example/v1", "sk-api"),
+            aggregate_profile("agg"),
+        );
+        settings.relay_profiles.push(previous);
+        settings.active_relay_id = "old-agg".into();
+        store.save(&settings).unwrap();
+        let mut next = store.load().unwrap();
+        let previous = next
+            .relay_profiles
+            .iter()
+            .find(|p| p.id == "old-agg")
+            .unwrap()
+            .clone();
+        let external = pure_profile("external", "http://127.0.0.1:15721/v1", "fixture-external");
+        std::fs::write(home.join("config.toml"), &external.config_contents).unwrap();
+        std::fs::write(home.join("auth.json"), &external.auth_contents).unwrap();
+        next.active_relay_id = target.into();
+        let result = switch_current_relay_profile(&store, &home, next, "old-agg").unwrap();
+        assert!(result.configured);
+        let saved = store.load().unwrap();
+        assert_eq!(saved.active_relay_id, target);
+        assert_eq!(
+            saved
+                .relay_profiles
+                .iter()
+                .find(|p| p.id == "old-agg")
+                .unwrap(),
+            &previous
+        );
+        let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(config.contains(if target == "api" {
+            "https://api.example/v1"
+        } else {
+            &proxy
+        }));
+        assert!(!config.contains("15721"));
+        let auth = std::fs::read_to_string(home.join("auth.json")).unwrap();
+        assert!(!auth.contains("fixture-external"));
+    }
+}
+
+#[test]
+fn failed_switch_after_external_takeover_keeps_settings_and_live_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex");
+    std::fs::create_dir(&home).unwrap();
+    let store = SettingsStore::new(temp.path().join("settings.json"));
+    let proxy = codex_plus_core::protocol_proxy::local_responses_proxy_base_url(
+        codex_plus_core::protocol_proxy::protocol_proxy_port(),
+    );
+    let mut previous = pure_profile("old-agg", &proxy, "codex-plus-aggregate");
+    previous.relay_mode = RelayMode::Aggregate;
+    let mut invalid = pure_profile("invalid", "https://invalid.example/v1", "fixture-invalid");
+    invalid.auth_contents = "{bad json".into();
+    store
+        .save(&BackendSettings {
+            active_relay_id: "old-agg".into(),
+            relay_profiles: vec![previous, invalid],
+            ..BackendSettings::default()
+        })
+        .unwrap();
+    let before = std::fs::read(temp.path().join("settings.json")).unwrap();
+    let external = pure_profile("external", "https://external.example/v1", "fixture-external");
+    std::fs::write(home.join("config.toml"), &external.config_contents).unwrap();
+    std::fs::write(home.join("auth.json"), &external.auth_contents).unwrap();
+    let mut next = store.load().unwrap();
+    next.active_relay_id = "invalid".into();
+    let error = switch_current_relay_profile(&store, &home, next, "old-agg").unwrap_err();
+    assert!(error.to_string().contains("auth.json"));
+    assert_eq!(
+        std::fs::read(temp.path().join("settings.json")).unwrap(),
+        before
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("config.toml")).unwrap(),
+        external.config_contents
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("auth.json")).unwrap(),
+        external.auth_contents
+    );
+}
+
 /// 聚合供应商 profile：config_contents 故意留空，模拟从单供应商新建聚合后直接切换
 /// 回归（issue #1604）：live auth.json 损坏，但聚合 profile 里有已验证的合法快照时，
 /// 应该用快照修复 live（对应“或退回已验证的 profile 快照”），既不能中止也不能写空。

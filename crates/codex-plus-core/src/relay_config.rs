@@ -1352,6 +1352,15 @@ pub fn backfill_relay_profile_from_home_with_common_and_policy(
         }
         return Ok(());
     }
+    // 聚合的上游由成员定义；外部工具接管后的直连/路由配置不属于聚合快照。
+    // 保留快照即可继续显式切换，不能把外部 URL/Key 采纳为聚合的配置。
+    if policy == RelayBackfillPolicy::PreserveIdentity
+        && profile.relay_mode == RelayMode::Aggregate
+        && !recognized_managed_proxy_endpoint(profile, &live_config)
+    {
+        parse_toml_document(&live_config)?;
+        return Ok(());
+    }
     if policy == RelayBackfillPolicy::PreserveIdentity {
         validate_backfill_endpoint_identity(profile, &live_config)?;
     } else if !(profile.relay_mode == RelayMode::Official && !profile.official_mix_api_key) {
