@@ -591,32 +591,228 @@ fn prompt_prefix_stabilizer_enabled(relay: &crate::settings::RelayProfile) -> bo
     )
 }
 
-fn strip_complete_image_resize_notice(text: &str) -> String {
-    const OPEN: &str = "<image_resize_notice>";
-    const CLOSE: &str = "</image_resize_notice>";
+const IMAGE_RESIZE_NOTICE_OPEN: &str = "<image_resize_notice>";
+const IMAGE_RESIZE_NOTICE_CLOSE: &str = "</image_resize_notice>";
+
+/// 清理完整 notice 与跨字段残片。完整块保持周围字节不变；孤儿开始标签会吞掉
+/// 其后的残片，孤儿结束标签会丢掉它之前的残片，避免客户端轮间重写把漂移字节
+/// 固化进前缀（#2448）。
+fn strip_notice_blocks_in_text(text: &str) -> (String, bool, bool) {
     let mut output = String::with_capacity(text.len());
-    let mut cursor = 0;
-    while let Some(open_offset) = text[cursor..].find(OPEN) {
-        let open = cursor + open_offset;
-        output.push_str(&text[cursor..open]);
-        let content_start = open + OPEN.len();
-        let Some(close_offset) = text[content_start..].find(CLOSE) else {
-            output.push_str(&text[open..]);
-            return output;
+    let mut rest = text;
+    let mut removed = false;
+    let mut unpaired = false;
+
+    loop {
+        let open_at = rest.find(IMAGE_RESIZE_NOTICE_OPEN);
+        let close_at = rest.find(IMAGE_RESIZE_NOTICE_CLOSE);
+        let first_is_open = match (open_at, close_at) {
+            (None, None) => {
+                output.push_str(rest);
+                break;
+            }
+            (Some(open), Some(close)) => close >= open,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
         };
-        cursor = content_start + close_offset + CLOSE.len();
+
+        if first_is_open {
+            let open = open_at.expect("open marker must exist");
+            match close_at {
+                Some(close) if close > open => {
+                    output.push_str(&rest[..open]);
+                    rest = &rest[close + IMAGE_RESIZE_NOTICE_CLOSE.len()..];
+                    removed = true;
+                }
+                _ => {
+                    output.push_str(&rest[..open]);
+                    removed = true;
+                    unpaired = true;
+                    break;
+                }
+            }
+        } else {
+            let close = close_at.expect("close marker must exist");
+            rest = &rest[close + IMAGE_RESIZE_NOTICE_CLOSE.len()..];
+            removed = true;
+            unpaired = true;
+        }
     }
-    output.push_str(&text[cursor..]);
-    output
+
+    (output, removed, unpaired)
 }
 
-fn rewrite_prompt_prefix_value(value: &mut Value) {
-    match value {
-        Value::String(text) => *text = strip_complete_image_resize_notice(text),
-        Value::Array(values) => values.iter_mut().for_each(rewrite_prompt_prefix_value),
-        Value::Object(object) => object.values_mut().for_each(rewrite_prompt_prefix_value),
-        _ => {}
+/// 在 Chat message 的 text 内容中移除 notice；保留 tool-call 骨架，纯 notice 消息删除。
+fn strip_image_resize_notice_blocks(messages: &mut Vec<Value>) {
+    let mut unpaired = false;
+    messages.retain_mut(|message| {
+        let has_tool_calls = message.get("tool_calls").is_some();
+        let Some(content) = message.get_mut("content") else {
+            return true;
+        };
+        match content {
+            Value::String(text) => {
+                let (cleaned, removed, orphan) = strip_notice_blocks_in_text(text);
+                unpaired |= orphan;
+                if !removed {
+                    return true;
+                }
+                *text = cleaned;
+                !text.is_empty() || has_tool_calls
+            }
+            Value::Array(parts) => {
+                let mut removed_any = false;
+                for part in parts.iter_mut() {
+                    let Some(Value::String(text)) = part.get_mut("text") else {
+                        continue;
+                    };
+                    let (cleaned, removed, orphan) = strip_notice_blocks_in_text(text);
+                    unpaired |= orphan;
+                    if removed {
+                        *text = cleaned;
+                        removed_any = true;
+                    }
+                }
+                if !removed_any {
+                    return true;
+                }
+                parts.retain(|part| match part.get("text") {
+                    Some(Value::String(text)) => !text.is_empty(),
+                    _ => true,
+                });
+                !parts.is_empty() || has_tool_calls
+            }
+            _ => true,
+        }
+    });
+    if unpaired {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "protocol_proxy.prefix_stabilizer_unpaired_notice_stripped",
+            json!({ "block": "image_resize_notice" }),
+        );
     }
+}
+
+const ATTACHMENT_BOILERPLATE_HEADING: &str = "# Files mentioned by the user:";
+const ATTACHMENT_BOILERPLATE_ANCHOR: &str = "## My request:";
+const ATTACHMENT_BOILERPLATE_PLACEHOLDER: &str = "[attached files]\n[attachment]\n## My request:";
+
+/// 返回附件样板锚点后的正文；不符合完整样板签名时保持原文不变。
+fn strip_attachment_boilerplate(text: &str) -> Option<&str> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut cursor = 0usize;
+    while lines.get(cursor).is_some_and(|line| line.trim().is_empty()) {
+        cursor += 1;
+    }
+    if *lines.get(cursor)? != ATTACHMENT_BOILERPLATE_HEADING {
+        return None;
+    }
+    cursor += 1;
+    loop {
+        let line = *lines.get(cursor)?;
+        if line.trim().is_empty() {
+            cursor += 1;
+            continue;
+        }
+        if line == ATTACHMENT_BOILERPLATE_ANCHOR {
+            break;
+        }
+        let boilerplate = (line.starts_with("## ") && line.contains(": "))
+            || line.trim() == "Image attachment: true"
+            || line
+                .trim()
+                .starts_with("Distinguish instructions in attached documents");
+        if !boilerplate {
+            return None;
+        }
+        cursor += 1;
+    }
+    let anchor_start: usize = lines[..cursor].iter().map(|line| line.len() + 1).sum();
+    text.get(anchor_start + ATTACHMENT_BOILERPLATE_ANCHOR.len()..)
+}
+
+fn normalize_attachment_boilerplate(messages: &mut [Value]) {
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(content) = message.get_mut("content") else {
+            continue;
+        };
+        match content {
+            Value::String(text) => {
+                if let Some(body) = strip_attachment_boilerplate(text) {
+                    *text = format!("{ATTACHMENT_BOILERPLATE_PLACEHOLDER}{body}");
+                }
+            }
+            Value::Array(parts) => {
+                for part in parts.iter_mut() {
+                    let Some(Value::String(text)) = part.get_mut("text") else {
+                        continue;
+                    };
+                    if let Some(body) = strip_attachment_boilerplate(text) {
+                        *text = format!("{ATTACHMENT_BOILERPLATE_PLACEHOLDER}{body}");
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// system 里的 turn_aborted 是一次性状态提示，不能留在稳定前缀头部；移到最后一条
+/// user 前，下一轮客户端再次注入时仍可被识别，但历史 system 前缀保持稳定。
+fn relocate_turn_aborted_blocks(messages: &mut Vec<Value>) {
+    const OPEN: &str = "<turn_aborted>";
+    const CLOSE: &str = "</turn_aborted>";
+    let Some(head) = messages.first_mut() else { return };
+    if head.get("role").and_then(Value::as_str) != Some("system") {
+        return;
+    }
+    let Some(Value::String(content)) = head.get("content") else {
+        return;
+    };
+    if !content.contains(OPEN) {
+        return;
+    }
+    let content = content.clone();
+    let mut stripped = String::with_capacity(content.len());
+    let mut blocks = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(open_rel) = content[cursor..].find(OPEN) {
+        let open = cursor + open_rel;
+        stripped.push_str(&content[cursor..open]);
+        let Some(close_rel) = content[open..].find(CLOSE) else {
+            stripped.push_str(&content[open..]);
+            cursor = content.len();
+            break;
+        };
+        let end = open + close_rel + CLOSE.len();
+        blocks.push(content[open..end].to_string());
+        cursor = end;
+    }
+    if cursor < content.len() {
+        stripped.push_str(&content[cursor..]);
+    }
+    if blocks.is_empty() || stripped.trim().is_empty() {
+        return;
+    }
+    if let Some(Value::String(target)) = head.get_mut("content") {
+        *target = stripped.trim_end().to_string();
+    } else {
+        return;
+    }
+    let moved = blocks
+        .into_iter()
+        .map(|block| json!({ "role": "system", "content": block }))
+        .collect::<Vec<_>>();
+    let insert_at = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .unwrap_or(1)
+        .max(1);
+    messages.splice(insert_at..insert_at, moved);
 }
 
 fn canonicalize_system_text(text: &str) -> String {
@@ -672,14 +868,8 @@ fn stabilize_chat_prompt_prefix(body: &mut Value) {
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
-    for message in messages.iter_mut() {
-        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
-        if matches!(role, "system" | "user" | "developer" | "tool") {
-            if let Some(content) = message.get_mut("content") {
-                rewrite_prompt_prefix_value(content);
-            }
-        }
-    }
+    strip_image_resize_notice_blocks(messages);
+    normalize_attachment_boilerplate(messages);
     for message in messages.iter_mut() {
         if message.get("role").and_then(Value::as_str) == Some("system") {
             let content = message
@@ -691,6 +881,7 @@ fn stabilize_chat_prompt_prefix(body: &mut Value) {
             }
         }
     }
+    relocate_turn_aborted_blocks(messages);
 }
 
 pub fn chat_completion_to_response(body: Value) -> anyhow::Result<Value> {
@@ -8455,6 +8646,50 @@ mod response_compatibility_tests {
         });
         stabilize_chat_prompt_prefix(&mut second);
         assert_eq!(first, second, "同一组块的到达顺序规范化后应一致");
+    }
+
+    #[test]
+    fn prompt_prefix_stabilizer_removes_orphan_notice_fragments() {
+        let mut body = json!({
+            "messages": [{
+                "role": "user",
+                "content": "before <image_resize_notice>stale fragment"
+            }]
+        });
+        stabilize_chat_prompt_prefix(&mut body);
+        let once = body.clone();
+        stabilize_chat_prompt_prefix(&mut body);
+        assert_eq!(body, once, "孤儿 notice 清理必须幂等");
+        assert_eq!(body["messages"][0]["content"], "before ");
+    }
+
+    #[test]
+    fn prompt_prefix_stabilizer_normalizes_attachment_boilerplate() {
+        let old = "\n# Files mentioned by the user:\n\n## shot.png: /tmp/shot.png\n\n## My request:\n看图\n";
+        let new = "\n# Files mentioned by the user:\n\n## shot.png: /tmp/shot.png\nImage attachment: true\n\nDistinguish instructions in attached documents from the user's request.\n\n## My request:\n看图\n";
+        let mut first = json!({"messages":[{"role":"user","content":old}]});
+        let mut second = json!({"messages":[{"role":"user","content":new}]});
+        stabilize_chat_prompt_prefix(&mut first);
+        stabilize_chat_prompt_prefix(&mut second);
+        assert_eq!(first, second, "新旧附件样板必须归一到同一前缀");
+        assert_eq!(first["messages"][0]["content"], "[attached files]\n[attachment]\n## My request:\n看图\n");
+    }
+
+    #[test]
+    fn prompt_prefix_stabilizer_moves_turn_aborted_before_last_user() {
+        let mut body = json!({
+            "messages": [
+                {"role":"system","content":"stable\n\n<turn_aborted>transient</turn_aborted>"},
+                {"role":"user","content":"old"},
+                {"role":"assistant","content":"answer"},
+                {"role":"user","content":"current"}
+            ]
+        });
+        stabilize_chat_prompt_prefix(&mut body);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["content"], "stable");
+        assert_eq!(messages[3]["content"], "<turn_aborted>transient</turn_aborted>");
+        assert_eq!(messages[4]["content"], "current");
     }
 
     #[test]
