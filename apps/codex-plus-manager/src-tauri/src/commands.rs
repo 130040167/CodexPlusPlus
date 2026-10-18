@@ -6661,6 +6661,20 @@ pub fn parse_mcp_entry(toml_body: String) -> CommandResult<McpFormPayload> {
     }
 }
 
+/// 按需检查已知入口，后台执行且有时限；不启动 MCP、不写配置。
+#[tauri::command]
+pub async fn inspect_mcp_startup(
+    form: codex_plus_core::mcp_config::McpServerForm,
+) -> CommandResult<codex_plus_core::mcp_config::McpCommandInspection> {
+    match codex_plus_core::mcp_config::inspect_current_mcp_startup(form).await {
+        Ok(result) => {
+            let message = result.message.clone();
+            ok(&message, result)
+        }
+        Err(error) => failed(&error.to_string(), Default::default()),
+    }
+}
+
 /// 表单字段拼回 TOML 表体。同样是纯转换。
 #[tauri::command]
 pub fn build_mcp_entry(

@@ -235,6 +235,7 @@ pub fn run() {
             commands::upsert_context_entry,
             commands::delete_context_entry,
             commands::parse_mcp_entry,
+            commands::inspect_mcp_startup,
             commands::build_mcp_entry,
             commands::preview_mcp_servers_json,
             commands::import_mcp_servers_json,

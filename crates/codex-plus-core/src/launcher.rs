@@ -956,10 +956,12 @@ fn apply_codexplusplus_window_icon_after_launch(process_id: u32) {
     let icon_resource_path =
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("codex-plus-plus.exe"));
     tokio::spawn(async move {
+        let mut state = crate::windows_integration::WindowIconApplyState::default();
         for attempt in 1..=30 {
-            if crate::windows_apply_codexplusplus_icon_to_process_window(
+            if crate::windows_integration::apply_codexplusplus_icon_attempt(
                 process_id,
-                icon_resource_path.clone(),
+                &icon_resource_path,
+                &mut state,
             ) {
                 return;
             }

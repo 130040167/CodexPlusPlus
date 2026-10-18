@@ -966,24 +966,12 @@ fn preferred_responses_api_status(sources: &[Value]) -> Value {
 }
 
 fn models_endpoint(base_url: &str) -> String {
-    let cleaned = safe_url_for_status(base_url)
-        .trim_end_matches('/')
-        .to_string();
+    let cleaned = safe_url_for_status(base_url).trim_end_matches('/').to_string();
     if cleaned.is_empty() {
         return String::new();
     }
-    if cleaned.ends_with("/models") {
-        return cleaned;
-    }
-    // Only append the default `/v1` version prefix when the base URL does not
-    // already carry a version segment. Providers such as Volcano Engine ARK use
-    // a versioned base (e.g. `.../api/coding/v3`), so blindly appending
-    // `/v1/models` produced `.../api/coding/v3/v1/models` and 404'd. This mirrors
-    // the version handling already used by the protocol proxy. See issue #1349.
-    if crate::protocol_proxy::has_version_suffix(&cleaned) {
-        return format!("{cleaned}/models");
-    }
-    format!("{cleaned}/v1/models")
+    // 与实际代理共用规则，保留 /v1beta/openai 等已有路径；清理后的 URL 不含凭据。
+    crate::protocol_proxy::models_url(&cleaned)
 }
 
 fn parse_model_payload(payload: &Value) -> Vec<String> {
@@ -1221,6 +1209,16 @@ fn unquote_toml_string(value: &str) -> String {
 #[cfg(test)]
 mod model_fetch_tests {
     use super::*;
+
+    #[test]
+    fn model_list_endpoint_preserves_custom_prefixes_and_removes_credentials() {
+        for (base, expected) in [
+            ("https://example.test/v1beta/openai/", "https://example.test/v1beta/openai/models"),
+            ("https://example.test", "https://example.test/v1/models"),
+            ("https://example.test/api/coding/v3", "https://example.test/api/coding/v3/models"),
+            ("https://user:secret@example.test/v1/models?token=secret", "https://example.test/v1/models"),
+        ] { assert_eq!(models_endpoint(base), expected); }
+    }
 
     #[test]
     fn relay_model_priority_declaration_reaches_ui_without_enabling_other_models() {

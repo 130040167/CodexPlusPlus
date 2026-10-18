@@ -5,6 +5,33 @@
 
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
+  "请求不发送思考参数；档位草稿保留，切回自动兼容后可恢复。": "No reasoning parameters are sent. Saved levels remain available when automatic compatibility is restored.",
+  "Chat 上游按原值接收 reasoning_effort，不按模型名改写档位。": "Send reasoning_effort unchanged to Chat upstreams without mapping levels by model name.",
+  "不发送思考参数": "Omit reasoning parameters",
+  "请求参数": "Request parameters",
+  "原样传等级（Chat）": "Pass effort through (Chat)",
+  "不发送": "Omit",
+  "Responses Lite 支持": "Responses Lite support",
+  "明确支持 Lite": "Supports Lite",
+  "标准 Responses": "Standard Responses",
+  "请先修正当前模型的 JSON 配置。": "Fix the model JSON before changing this option.",
+  "保存此模型后还需保存并使用供应商；只为已核实支持 Lite 的上游选择支持。": "Save this model, then save and apply the provider. Enable Lite only when the upstream supports it.",
+  "保留外部目录的 Lite 声明": "Trust Lite declarations in the external catalog",
+  "仅在已确认上游支持时启用；保留每个模型的显式声明，不会为全部模型开启 Lite。": "Enable only after verifying upstream support. Preserve explicit per-model declarations without enabling Lite for every model.",
+  "严格 Responses 推理历史兼容": "Strict Responses reasoning history",
+  "仅当目标上游接受当前账号的加密历史时启用。混合推理只发送可识别的加密信封；占位或无效密文会明确报错。本地记录不变。": "Enable only when the upstream accepts encrypted history for this account. Mixed reasoning sends only recognized encrypted envelopes; placeholders fail explicitly. Local history is unchanged.",
+  "正在检查…": "Checking…",
+  "检查启动路径": "Check startup path",
+  "将新入口放入草稿": "Use new path in draft",
+  "检查不会重启 MCP；确认草稿后再保存。": "Checking does not restart MCP. Review the draft before saving.",
+  "取消全部选择": "Clear selection",
+  "HTTP MCP 不使用本地启动命令。": "HTTP MCP does not use a local startup command.",
+  "这是桌面程序，不是已验证的 stdio MCP 入口。请从插件运行时清单恢复 Node/worker 与配套参数，不要仅替换版本号。": "This is a desktop application, not a verified stdio MCP entry point. Restore Node/worker and arguments from the plugin runtime manifest instead of replacing a version number.",
+  "已找到桌面版当前维护的 Codex CLI，可将新入口放入草稿。尚未验证 MCP 握手，不会重启服务器。": "Found the CLI currently managed by Codex Desktop. You can put it in the draft; the MCP handshake has not been verified and checking will not restart the server.",
+  "启动命令依赖 WindowsApps 包版本。当前无法确认可替换的运行时，请从原插件重新接入；不会猜测程序或自动重启。": "The command depends on a WindowsApps package version. Reconnect through the original plugin; no replacement runtime has been verified and checking will not restart it.",
+  "此命令依赖 PATH 或网络路径，未执行命令，也未验证 MCP 握手。": "This command uses PATH or a network path. It was not executed and its MCP handshake was not verified.",
+  "启动文件存在；这不代表 MCP 握手或工具列表已就绪。": "The startup file exists; this does not verify the MCP handshake or tools.",
+  "启动文件不存在，请核对安装来源与入口；不会自动改写未知程序。": "The startup file is missing. Check its installation source and entry point; unknown commands are not rewritten.",
   "发现可用更新。": "Update available.",
   "请先检查更新并选择可下载的 Release asset。": "Check for updates first and select a downloadable release asset.",
   "关闭更新提示": "Close update notification",
@@ -1493,6 +1520,7 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "第 {0} 页 · 共 {1} 个会话": "Page {0} · {1} sessions",
   "{0} 的 API Key": "API key for {0}",
   "文档里的上下文窗口是 {0}，当前列填的是 {1}，已保留当前值；要用文档的值请先清空窗口。": "The document's context window is {0}, but the column holds {1}. The current value was kept; clear the window to use the document's value.",
   "{0} 个插件": "{0} plugins",
