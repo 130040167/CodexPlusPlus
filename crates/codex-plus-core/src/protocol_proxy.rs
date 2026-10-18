@@ -133,6 +133,11 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 const UPSTREAM_IMAGE_HEADER_TIMEOUT: Duration = Duration::from_secs(600);
+/// 连接/TLS 握手阶段的失败发生在请求送达上游之前，可以安全重试。
+/// 系统代理抖动时（如 `client error (Connect): tls handshake eof`）直接返回 502
+/// 会让采样/压缩无故失败，两次短退避能把大部分瞬时故障挡在本地。
+const UPSTREAM_CONNECT_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(150), Duration::from_millis(400)];
 const MAX_NATIVE_COMPACTION_PROBE_BODY_BYTES: usize = 32 * 1024 * 1024;
 const THINK_OPEN_TAG: &str = "<think>";
 const THINK_CLOSE_TAG: &str = "</think>";
@@ -746,10 +751,73 @@ pub async fn send_upstream_request_with_header_timeout(
     request: reqwest::RequestBuilder,
     timeout: Duration,
 ) -> anyhow::Result<reqwest::Response> {
-    tokio::time::timeout(timeout, request.send())
-        .await
-        .with_context(|| format!("上游请求超过 {} 秒未返回响应头", timeout.as_secs()))?
-        .context("上游请求失败")
+    // RequestBuilder 只有在 body 可克隆时才能重试；不可克隆时保持单次请求。
+    let retry_source = request.try_clone();
+    let mut pending = Some(request);
+    let mut retries = 0_usize;
+    loop {
+        let builder = pending.take().expect("upstream request builder missing");
+        match tokio::time::timeout(timeout, builder.send()).await {
+            Ok(Ok(response)) => return Ok(response),
+            Ok(Err(error)) => {
+                // 只重试连接/TLS 握手失败：此时请求体尚未送达上游，重试是幂等的。
+                // 超时和其它错误可能已经在上游产生副作用，原样返回。
+                let retry_delay = error
+                    .is_connect()
+                    .then(|| UPSTREAM_CONNECT_RETRY_DELAYS.get(retries))
+                    .flatten()
+                    .copied();
+                if let Some(delay) = retry_delay
+                    && let Some(source) = retry_source.as_ref()
+                    && let Some(retry) = source.try_clone()
+                {
+                    let retry_error = anyhow::Error::new(error);
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "protocol_proxy.upstream_connect_retry",
+                        json!({
+                            "attempt": retries + 1,
+                            "delayMs": delay.as_millis(),
+                            "error": error_chain(&retry_error)
+                        }),
+                    );
+                    tokio::time::sleep(delay).await;
+                    retries += 1;
+                    pending = Some(retry);
+                    continue;
+                }
+                return Err(anyhow::Error::new(error).context("上游请求失败"));
+            }
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "上游请求超过 {} 秒未返回响应头",
+                    timeout.as_secs()
+                ));
+            }
+        }
+    }
+}
+
+/// anyhow 的 `Display` 只打印最外层上下文；诊断日志和 502 响应体需要完整错误链
+/// （连接被拒/重置、超时、TLS、代理错误等真实原因），否则只能看到
+/// 「请求上游失败」这种没有任何可操作信息的文案。
+pub(crate) fn error_chain(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+}
+
+#[cfg(test)]
+mod error_chain_tests {
+    use super::error_chain;
+
+    #[test]
+    fn error_chain_keeps_every_cause_for_diagnostics() {
+        let error = anyhow::anyhow!("连接被对端重置")
+            .context("上游请求失败")
+            .context("供应商「供应商 4」请求上游失败");
+        let text = error_chain(&error);
+        assert!(text.contains("供应商「供应商 4」请求上游失败"), "{text}");
+        assert!(text.contains("上游请求失败"), "{text}");
+        assert!(text.contains("连接被对端重置"), "{text}");
+    }
 }
 
 pub struct ChatSseToResponsesConverter {
@@ -2094,7 +2162,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         json!({
                             "relayId": relay.id,
                             "relayName": relay.name,
-                            "error": error.to_string()
+                            "error": error_chain(&error)
                         }),
                     );
                     if !strict_aggregate_model {
@@ -2211,7 +2279,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         "candidateCount": relay_count,
                         "headerTimeoutSeconds": header_timeout.as_secs(),
                         "willFailover": has_more_candidates,
-                        "error": error.to_string()
+                        "error": error_chain(&error)
                     }),
                 );
                 if !strict_aggregate_model {
@@ -2309,7 +2377,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         json!({
                             "relayId": relay.id,
                             "relayName": relay.name,
-                            "error": error.to_string()
+                            "error": error_chain(&error)
                         }),
                     );
                 }
@@ -2580,7 +2648,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                             "relayId": relay.id,
                             "endpoint": endpoint,
                             "compactionFallback": true,
-                            "error": error.to_string()
+                            "error": error_chain(&error)
                         }),
                     );
                     if !strict_aggregate_model {

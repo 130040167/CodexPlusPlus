@@ -2209,6 +2209,8 @@ async fn handle_protocol_proxy_connection(
                 } else {
                     "502 Bad Gateway"
                 };
+                // 502 响应与诊断日志都带上完整错误链，便于直接看到真实失败原因。
+                let error_chain = crate::protocol_proxy::error_chain(&error);
                 let body = serde_json::to_vec(
                     &unsupported
                         .map(|error| error.response_body())
@@ -2216,7 +2218,7 @@ async fn handle_protocol_proxy_connection(
                         .or_else(|| file_unsupported.map(|error| error.response_body()))
                         .or_else(|| vlm_failure.map(|error| error.response_body()))
                         .unwrap_or_else(
-                            || serde_json::json!({"status":"failed","message":error.to_string()}),
+                            || serde_json::json!({"status":"failed","message":error_chain.clone()}),
                         ),
                 )?;
                 write_http_response(stream, status, "application/json; charset=utf-8", &body)
@@ -2225,7 +2227,7 @@ async fn handle_protocol_proxy_connection(
                     "helper.protocol_proxy_failed",
                     method,
                     path,
-                    &error.to_string(),
+                    &error_chain,
                     remote_addr_text,
                 );
                 stream.shutdown().await?;
