@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- macOS 补上「桌宠跟随真实鼠标」：用 CoreGraphics `CGEventGetLocation` 读取 DIP 屏幕坐标（主屏左上原点，与 Electron `screenX/screenY` 一致），按 Windows 同样的约 100ms 周期经 CDP 调用 overlay 的 `updateScreenPoint`。推点不再绑死 V2 精灵图 / vscode-api dispatcher 探针；只要 overlay 上有该函数就会推，用户脚本 stub 与官方 Computer Use 映射可以并存。设置开关对 macOS 开放。
 - 修复 WSL 运行模式下模型目录被重写成宿主绝对路径；原生 Windows 继续使用绝对路径，启动迁移仅处理当前 home 内的受管目录。
 - 修复 Windows 窗口图标与任务栏属性部分成功即停止重试的问题；按窗口分别跟踪结果。
 - 思考参数新增逐模型“自动兼容 / 原样传等级（Chat）/ 不发送”选择，保留档位草稿；请求与目录声明同步，其他模型不受影响。

@@ -20,6 +20,7 @@ use crate::settings::{BackendSettings, SettingsStore, normalize_codex_extra_args
 use crate::status::{LaunchStatus, StatusStore};
 
 static PET_OVERLAY_SYNC_FAILED: AtomicBool = AtomicBool::new(false);
+#[cfg(any(windows, target_os = "macos"))]
 static PET_CURSOR_DRIVER_FAILED: AtomicBool = AtomicBool::new(false);
 const BRIDGE_HEALTH_FAILURE_THRESHOLD: u8 = 2;
 /// 重注入退避：首次重注入立即执行，此后若桥仍不健康，重注入间隔按
@@ -1442,7 +1443,7 @@ impl LaunchHooks for DefaultLaunchHooks {
         let bridge_reinjector = self.bridge_reinjector.lock().await.clone();
         let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             let pet_cursor_task = tokio::spawn(run_pet_real_mouse_cursor_driver(debug_port));
             let mut observed_browser_id: Option<String> = None;
             let mut bridge_health_failures = 0u8;
@@ -1479,7 +1480,7 @@ impl LaunchHooks for DefaultLaunchHooks {
                     }
                 }
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             {
                 pet_cursor_task.abort();
                 let _ = pet_cursor_task.await;
@@ -2069,6 +2070,56 @@ fn dream_skin_image_response() -> (String, Vec<u8>, String, &'static str) {
         ),
         Err(_) => not_found(),
     }
+}
+
+fn logical_cursor_position() -> anyhow::Result<(i32, i32)> {
+    #[cfg(windows)]
+    {
+        return windows_logical_cursor_position();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return macos_logical_cursor_position();
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        anyhow::bail!("logical cursor position is only available on Windows and macOS")
+    }
+}
+
+/// CoreGraphics 全局坐标：主屏左上为原点、Y 向下、单位是点（DIP），
+/// 与 Electron 的 window.screenX/screenY 一致。不要用 NSEvent.mouseLocation（左下原点）。
+#[cfg(target_os = "macos")]
+fn macos_logical_cursor_position() -> anyhow::Result<(i32, i32)> {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+        fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPoint;
+        fn CFRelease(cf: *mut std::ffi::c_void);
+    }
+    unsafe {
+        let event = CGEventCreate(std::ptr::null());
+        if event.is_null() {
+            anyhow::bail!("CGEventCreate failed");
+        }
+        let point = CGEventGetLocation(event);
+        CFRelease(event);
+        Ok((point.x.round() as i32, point.y.round() as i32))
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn macos_logical_cursor_position_uses_points_from_core_graphics() {
+    let (x, y) = macos_logical_cursor_position().expect("CGEventGetLocation should succeed");
+    let _ = (x, y);
 }
 
 #[cfg(windows)]
@@ -4253,7 +4304,10 @@ async fn confirmed_pet_overlay_targets(
         let Some(websocket_url) = target.web_socket_debugger_url.as_deref() else {
             continue;
         };
-        if pet_overlay_supports_v2_cursor(websocket_url)
+        // 推点只要求 overlay 上已经有 updateScreenPoint。
+        // V2 精灵图 + vscode-api dispatcher 探针经常失败（modulepreload），
+        // 用户脚本的 stub 也会让官方 inject skip，但不能因此停止推坐标。
+        if pet_overlay_has_screen_point_hook(websocket_url)
             .await
             .unwrap_or(false)
         {
@@ -4263,11 +4317,10 @@ async fn confirmed_pet_overlay_targets(
     Ok(confirmed)
 }
 
-async fn pet_overlay_supports_v2_cursor(websocket_url: &str) -> anyhow::Result<bool> {
-    let result = crate::bridge::evaluate_script_with_await_promise(
+async fn pet_overlay_has_screen_point_hook(websocket_url: &str) -> anyhow::Result<bool> {
+    let result = crate::bridge::evaluate_script(
         websocket_url,
-        &crate::assets::pet_real_mouse_capability_probe_script(),
-        true,
+        crate::assets::pet_real_mouse_hook_probe_script(),
     )
     .await?;
     Ok(runtime_evaluate_result_is_true(&result))
@@ -4285,19 +4338,20 @@ async fn sync_pet_real_mouse_overlay(debug_port: u16, _helper_port: u16) -> anyh
             continue;
         };
         let script = if !enabled {
-            crate::assets::pet_real_mouse_stop_script()
-        } else if pet_overlay_supports_v2_cursor(websocket_url)
+            Some(crate::assets::pet_real_mouse_stop_script())
+        } else if pet_overlay_has_screen_point_hook(websocket_url)
             .await
-            .with_context(|| {
-                format!(
-                    "failed to probe pet overlay capability in target {} ({})",
-                    target.id, target.url
-                )
-            })?
+            .unwrap_or(false)
         {
-            crate::assets::pet_real_mouse_script()
+            // 已有官方 runtime 或用户脚本 stub 时保留它，避免重置其 dispatcher。
+            None
         } else {
-            crate::assets::pet_real_mouse_stop_script()
+            // 旧的 V2 dispatcher 探针可能因 modulepreload 时序失败；先安装 runtime，
+            // 后续 driver 会再次确认 hook，runtime 自己负责判断 dispatcher 是否可用。
+            Some(crate::assets::pet_real_mouse_script())
+        };
+        let Some(script) = script else {
+            continue;
         };
         crate::bridge::evaluate_script(websocket_url, script)
             .await
@@ -4311,7 +4365,7 @@ async fn sync_pet_real_mouse_overlay(debug_port: u16, _helper_port: u16) -> anyh
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn run_pet_real_mouse_cursor_driver(debug_port: u16) {
     loop {
         let settings = SettingsStore::default().load().unwrap_or_default();
@@ -4348,16 +4402,16 @@ async fn run_pet_real_mouse_cursor_driver(debug_port: u16) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn run_pet_real_mouse_target_driver(debug_port: u16, target: crate::cdp::CdpTarget) {
     let Some(websocket_url) = target.web_socket_debugger_url.as_deref() else {
         return;
     };
+    // 官方 inject 失败或被用户脚本 stub skip 都不能阻止后续推点。
     if let Err(error) =
         crate::bridge::evaluate_script(websocket_url, crate::assets::pet_real_mouse_script()).await
     {
         record_pet_cursor_driver_failure(debug_port, &target, error);
-        return;
     }
 
     let mut ticks_until_settings_check = 10_u8;
@@ -4373,7 +4427,7 @@ async fn run_pet_real_mouse_target_driver(debug_port: u16, target: crate::cdp::C
                 ticks_until_settings_check = 10;
             }
             ticks_until_settings_check -= 1;
-            let (x, y) = windows_logical_cursor_position()?;
+            let (x, y) = logical_cursor_position()?;
             Ok(Some(crate::assets::pet_real_mouse_update_script(x, y)))
         },
     )
@@ -4394,7 +4448,7 @@ async fn run_pet_real_mouse_target_driver(debug_port: u16, target: crate::cdp::C
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn record_pet_cursor_driver_failure(
     debug_port: u16,
     target: &crate::cdp::CdpTarget,
