@@ -4996,23 +4996,21 @@ fn normalize_responses_item_ids(body: &mut Value) {
 
 /// Responses 上游要求同一请求里的 namespace 名称唯一。
 /// Codex 客户端在多轮 tool_search 后可能把多个历史 `tool_search_output` 都回放到
-/// 下一请求；合并同名 namespace 的子工具后保留第一个 output 外壳，避免严格上游
+/// 下一请求；将同名 namespace 的子工具合并到第一个 output，避免严格上游
 /// 报 duplicate namespace，同时不丢掉后一次检索新增的工具（#2156 / #2166）。
+/// 后续 output 只清空 tools，保留调用配对及顺序，否则上游会报缺少搜索结果。
 fn dedupe_responses_tool_search_outputs(body: &mut Value) {
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return;
     };
     let mut first_output_index = None;
     let mut merged_namespaces = Vec::new();
-    let mut remove_indices = Vec::new();
-    for (index, item) in items.iter().enumerate() {
+    for (index, item) in items.iter_mut().enumerate() {
         if item.get("type").and_then(Value::as_str) != Some("tool_search_output") {
             continue;
         }
         if first_output_index.is_none() {
             first_output_index = Some(index);
-        } else {
-            remove_indices.push(index);
         }
         for tool in item
             .get("tools")
@@ -5022,14 +5020,12 @@ fn dedupe_responses_tool_search_outputs(body: &mut Value) {
         {
             merge_namespace_definition(&mut merged_namespaces, tool);
         }
+        item["tools"] = json!([]);
     }
     let Some(first_output_index) = first_output_index else {
         return;
     };
     items[first_output_index]["tools"] = json!(merged_namespaces);
-    for index in remove_indices.into_iter().rev() {
-        items.remove(index);
-    }
 }
 
 fn normalize_responses_item_id(item: &mut Value) {
@@ -8271,13 +8267,77 @@ mod response_compatibility_tests {
         dedupe_responses_tool_search_outputs(&mut body);
 
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input.len(), 2);
+        assert_eq!(input.len(), 3);
         assert_eq!(input[0]["type"], "tool_search_output");
+        assert_eq!(input[0]["call_id"], "first");
         let tools = input[0]["tools"][0]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["name"], "search_code");
         assert_eq!(tools[1]["name"], "read_context");
+        assert_eq!(
+            tools[0]["parameters"]["properties"]["query"]["type"],
+            "string"
+        );
         assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[2]["type"], "tool_search_output");
+        assert_eq!(input[2]["call_id"], "second");
+        assert_eq!(input[2]["tools"], json!([]));
+
+        let once = body.clone();
+        dedupe_responses_tool_search_outputs(&mut body);
+        assert_eq!(body, once, "重复转发不能再改变历史");
+    }
+
+    #[test]
+    fn responses_tool_search_dedupe_preserves_empty_and_hosted_output_envelopes() {
+        let mut body = json!({
+            "input": [
+                {
+                    "type": "tool_search_call", "id": "tsc_hosted",
+                    "execution": "server", "call_id": null,
+                    "status": "completed", "arguments": {"paths": ["repo"]}
+                },
+                {
+                    "type": "tool_search_output", "id": "tso_hosted",
+                    "execution": "server", "call_id": null,
+                    "status": "completed", "tools": []
+                },
+                {
+                    "type": "tool_search_call", "id": "tsc_empty",
+                    "execution": "client", "call_id": "empty",
+                    "status": "completed", "arguments": {"query": "absent"}
+                },
+                {
+                    "type": "tool_search_output", "id": "tso_empty",
+                    "execution": "client", "call_id": "empty",
+                    "status": "completed", "tools": []
+                }
+            ]
+        });
+        let original = body.clone();
+        dedupe_responses_tool_search_outputs(&mut body);
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn responses_tool_search_dedupe_leaves_other_history_untouched() {
+        for mut body in [
+            json!({"input": "continue"}),
+            json!({}),
+            json!({"input": [
+                {"type": "function_call", "call_id": "read", "name": "read", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "read", "output": "result"}
+            ]}),
+            json!({"input": [{
+                "type": "tool_search_output", "call_id": "single", "tools": [{
+                    "type": "function", "name": "read", "parameters": {"type": "object"}
+                }]
+            }]}),
+        ] {
+            let original = body.clone();
+            dedupe_responses_tool_search_outputs(&mut body);
+            assert_eq!(body, original);
+        }
     }
 
     #[test]
