@@ -1069,6 +1069,7 @@ pub struct UpstreamProxyResponse {
     /// 上游请求是否使用了 Responses exec 兼容包装。
     pub exec_adapted: bool,
     pub(crate) exec_outcome: Option<crate::responses_exec_transport::ExecOutcome>,
+    rotation_snapshot: Option<crate::relay_rotation::RelayRotationSnapshot>,
     pub response: Option<reqwest::Response>,
 }
 
@@ -1118,6 +1119,20 @@ impl UpstreamProxyResponse {
 
     pub fn take_response(&mut self) -> anyhow::Result<reqwest::Response> {
         self.response.take().context("缺少上游响应")
+    }
+
+    pub(crate) fn finish_outcome(&mut self, succeeded: bool) {
+        if let Some(outcome) = self.exec_outcome.as_mut() {
+            outcome.finish(succeeded);
+        }
+        record_rotation_event(
+            self.rotation_snapshot.as_ref(),
+            if succeeded {
+                RotationEvent::Success
+            } else {
+                RotationEvent::Failure
+            },
+        );
     }
 }
 
@@ -2125,6 +2140,7 @@ fn native_compaction_unsupported_result(
             buffered_body: Some(serde_json::to_vec(&body).unwrap_or_default()),
             exec_adapted: false,
             exec_outcome: None,
+            rotation_snapshot: None,
             response: None,
         })
     } else {
@@ -2354,6 +2370,34 @@ pub fn is_image_edits_proxy_path(path: &str) -> bool {
     )
 }
 
+fn load_stable_settings_snapshot() -> anyhow::Result<(
+    crate::settings::BackendSettings,
+    crate::relay_rotation::RelaySettingsSnapshot,
+)> {
+    // 与设置发布使用同一个跨进程锁；内容及代次必须在释放锁前一起取得。
+    SettingsStore::default().with_snapshot(|settings| {
+        let snapshot = crate::relay_rotation::admit_settings_snapshot(&settings);
+        Ok((settings, snapshot))
+    })
+}
+
+fn record_rotation_event(
+    snapshot: Option<&crate::relay_rotation::RelayRotationSnapshot>,
+    event: RotationEvent,
+) {
+    if let Some(snapshot) = snapshot {
+        crate::relay_rotation::record_relay_request_event_for_snapshot(snapshot, event);
+    }
+}
+
+fn record_rotation_failure(
+    snapshot: Option<&crate::relay_rotation::RelayRotationSnapshot>,
+) {
+    if let Some(snapshot) = snapshot {
+        crate::relay_rotation::record_relay_request_failure_for_snapshot(snapshot);
+    }
+}
+
 pub async fn open_responses_proxy_request(
     body: &str,
     original_user_agent: Option<&str>,
@@ -2394,10 +2438,11 @@ pub async fn open_responses_proxy_request_for_path_with_session_headers(
     beta_features: Option<&str>,
     session_headers: ProxySessionHeaders<'_>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    let settings = SettingsStore::default().load().unwrap_or_default();
+    let (settings, snapshot) = load_stable_settings_snapshot()?;
     open_responses_proxy_request_with_settings_and_user_agent(
         body,
         settings,
+        Some(snapshot),
         original_user_agent,
         request_path,
         beta_features,
@@ -2474,6 +2519,7 @@ pub async fn open_responses_proxy_request_with_settings_for_path_and_session_hea
 async fn open_responses_proxy_request_with_settings_and_user_agent(
     body: &str,
     settings: crate::settings::BackendSettings,
+    settings_snapshot: Option<crate::relay_rotation::RelaySettingsSnapshot>,
     original_user_agent: Option<&str>,
     request_path: &str,
     beta_features: Option<&str>,
@@ -2510,6 +2556,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 }))?),
                 exec_adapted: false,
                 exec_outcome: None,
+                rotation_snapshot: None,
                 response: None,
             });
         }
@@ -2532,12 +2579,21 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         conversation_id: conversation_id_from_responses_request(&request_json),
         model,
     };
+    let mut request_rotation_snapshot = None;
     let (relay, relays) = if let Some(binding) = &aggregate_model {
         (binding.relay.clone(), vec![binding.relay.clone()])
     } else if let Some(route) = &model_route {
         (route.relay.clone(), vec![route.relay.clone()])
     } else {
-        let relay = crate::relay_rotation::select_relay_for_request(&settings, context)?;
+        let (relay, snapshot) = match settings_snapshot.as_ref() {
+            Some(snapshot) => crate::relay_rotation::select_relay_for_request_with_snapshot(
+                &settings, context, snapshot,
+            )?,
+            None => crate::relay_rotation::select_relay_for_request_with_revision(
+                &settings, context, "",
+            )?,
+        };
+        request_rotation_snapshot = Some(snapshot);
         let mut relays = vec![relay.clone()];
         relays.extend(crate::relay_rotation::fallback_relays_after(
             &settings, &relay.id,
@@ -2552,6 +2608,9 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     let relay_count = relays.len();
     let mut exec_negotiation_used = false;
     for (attempt, relay) in relays.iter().cloned().enumerate() {
+        let rotation_snapshot = request_rotation_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.for_attempt(&relay.id));
         let has_more_candidates = attempt + 1 < relay_count;
         validate_upstream(&relay)?;
         // 官方登录成员：用该账号 OAuth 凭据发往 chatgpt.com，而不是 API Key。
@@ -2835,12 +2894,29 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         }
 
         if legacy_native_compaction {
-            let body = read_limited_upstream_body(&mut upstream, MAX_NATIVE_COMPACTION_PROBE_BODY_BYTES).await?;
+            let body = match read_limited_upstream_body(
+                &mut upstream,
+                MAX_NATIVE_COMPACTION_PROBE_BODY_BYTES,
+            ).await {
+                Ok(body) => body,
+                Err(error) => {
+                    record_rotation_failure(rotation_snapshot.as_ref());
+                    return Err(error.into());
+                }
+            };
             let stream_response = response_body_is_stream(&content_type, &body);
             let success = (200..300).contains(&status_code);
             let terminal_failure = upstream_has_terminal_failure(&body, &content_type);
             let valid = !success || terminal_failure
                 || upstream_compaction_item_count(&body, &content_type) == Some(1);
+            record_rotation_event(
+                rotation_snapshot.as_ref(),
+                if success && valid && !terminal_failure {
+                    RotationEvent::Success
+                } else {
+                    RotationEvent::Failure
+                },
+            );
             let (code, body, response_type) = if valid {
                 let body = if success && terminal_failure && stream_response {
                     let mut converter = CompactionSseConverter::new("");
@@ -2856,7 +2932,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             return Ok(UpstreamProxyResponse {
                 status_code: code, content_type: response_type, is_stream: valid && stream_response,
                 wire_api, compaction: false, native_compaction_passthrough: valid && success,
-                buffered_body: Some(body), exec_adapted: false, exec_outcome: None, response: None,
+                buffered_body: Some(body), exec_adapted: false, exec_outcome: None,
+                rotation_snapshot: None, response: None,
             });
         }
         if probe_native_compaction {
@@ -2869,6 +2946,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             {
                 Ok(body) => body.to_vec(),
                 Err(error) => {
+                    record_rotation_failure(rotation_snapshot.as_ref());
                     return Err(error.into());
                 }
             };
@@ -2896,6 +2974,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     buffered_body: Some(probed),
                     exec_adapted: false,
                     exec_outcome: None,
+                    rotation_snapshot: None,
                     response: None,
                 });
             }
@@ -2918,6 +2997,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                             buffered_body: Some(probed),
                             exec_adapted: false,
                             exec_outcome: None,
+                            rotation_snapshot: None,
                             response: None,
                         });
                     }
@@ -2935,6 +3015,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                             buffered_body: Some(incomplete_compaction_stream(&probed)),
                             exec_adapted: false,
                             exec_outcome: None,
+                            rotation_snapshot: None,
                             response: None,
                         });
                     }
@@ -2960,6 +3041,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         buffered_body: Some(probed),
                         exec_adapted: false,
                         exec_outcome: None,
+                        rotation_snapshot: None,
                         response: None,
                     });
                 }
@@ -2974,6 +3056,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         buffered_body: Some(sse),
                         exec_adapted: false,
                         exec_outcome: None,
+                        rotation_snapshot: None,
                         response: None,
                     });
                 }
@@ -2995,6 +3078,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     buffered_body: Some(probed),
                     exec_adapted: false,
                     exec_outcome: None,
+                    rotation_snapshot: None,
                     response: None,
                 });
             }
@@ -3098,15 +3182,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         {
             crate::responses_exec_transport::evict(key);
         }
-        if !strict_aggregate_model && (!exec_adapted || !(200..300).contains(&status_code)) {
-            crate::relay_rotation::record_relay_request_event(
-                &settings,
-                if (200..300).contains(&status_code) {
-                    RotationEvent::Success
-                } else {
-                    RotationEvent::Failure
-                },
-            );
+        if !(200..300).contains(&status_code) {
+            record_rotation_failure(rotation_snapshot.as_ref());
         }
         if (200..300).contains(&status_code) || !has_more_candidates {
             // 请求了 SSE 的兼容上游也可能返回 JSON 摘要；让调用方选择 JSON 包装器。
@@ -3127,9 +3204,10 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 exec_adapted,
                 exec_outcome: (exec_adapted && (200..300).contains(&status_code)).then(|| {
                     crate::responses_exec_transport::ExecOutcome::new(
-                        key.expect("adapted request has a cache identity"), &settings,
+                        key.expect("adapted request has a cache identity"), rotation_snapshot.clone(),
                     )
                 }),
+                rotation_snapshot,
                 response: Some(upstream),
             });
         }
@@ -3210,8 +3288,8 @@ fn aggregate_upstream_model_override(
 pub async fn open_models_proxy_request(
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    let settings = SettingsStore::default().load().unwrap_or_default();
-    let relay = crate::relay_rotation::select_relay_for_probe(&settings)?;
+    let (settings, snapshot) = load_stable_settings_snapshot()?;
+    let relay = crate::relay_rotation::select_relay_for_probe_with_snapshot(&settings, &snapshot)?;
     validate_upstream(&relay)?;
 
     // 官方登录成员没有 base_url：模型列表同样发往 chatgpt.com 后端并带账号身份。
@@ -3264,6 +3342,7 @@ pub async fn open_models_proxy_request(
         buffered_body: None,
         exec_adapted: false,
         exec_outcome: None,
+        rotation_snapshot: None,
         response: Some(upstream),
     })
 }
@@ -3273,8 +3352,8 @@ pub async fn open_audio_transcriptions_proxy_request(
     content_type: &str,
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    let settings = SettingsStore::default().load().unwrap_or_default();
-    let relay = crate::relay_rotation::select_relay_for_probe(&settings)?;
+    let (settings, snapshot) = load_stable_settings_snapshot()?;
+    let relay = crate::relay_rotation::select_relay_for_probe_with_snapshot(&settings, &snapshot)?;
     validate_upstream(&relay)?;
     if crate::official_login::member_uses_official_login_transport(&relay) {
         anyhow::bail!("音频转写暂不支持官方登录成员「{}」", relay.name);
@@ -3321,6 +3400,7 @@ pub async fn open_audio_transcriptions_proxy_request(
         buffered_body: None,
         exec_adapted: false,
         exec_outcome: None,
+        rotation_snapshot: None,
         response: Some(upstream),
     })
 }
@@ -3387,8 +3467,8 @@ async fn open_image_proxy_request(
     original_user_agent: Option<&str>,
     endpoint_kind: ImageProxyEndpoint,
 ) -> anyhow::Result<UpstreamProxyResponse> {
-    let settings = SettingsStore::default().load().unwrap_or_default();
-    let relay = crate::relay_rotation::select_relay_for_probe(&settings)?;
+    let (settings, snapshot) = load_stable_settings_snapshot()?;
+    let relay = crate::relay_rotation::select_relay_for_probe_with_snapshot(&settings, &snapshot)?;
     if crate::official_login::member_uses_official_login_transport(&relay) {
         anyhow::bail!("图片请求暂不支持官方登录成员「{}」", relay.name);
     }
@@ -3460,6 +3540,7 @@ async fn open_image_proxy_request(
         buffered_body: None,
         exec_adapted: false,
         exec_outcome: None,
+        rotation_snapshot: None,
         response: Some(upstream),
     })
 }
@@ -3520,6 +3601,7 @@ pub async fn open_chat_completions_proxy_request(
         buffered_body: None,
         exec_adapted: false,
         exec_outcome: None,
+        rotation_snapshot: None,
         response: Some(upstream),
     })
 }
@@ -9362,6 +9444,10 @@ impl ResponsesSseTransformer {
         self.failed
     }
 
+    pub(crate) fn has_completed(&self) -> bool {
+        self.completed && !self.failed
+    }
+
     /// Flush after stream EOF. Returns failure reason if any.
     pub(crate) fn finish(mut self) -> Option<String> {
         self.buf.clear();
@@ -9416,7 +9502,22 @@ impl ResponsesSseTransformer {
         let event_type = event_type_owned.as_deref().unwrap_or("");
         
         match event_type {
-            "response.completed" => self.completed = true,
+            "response.completed" => {
+                let invalid = [Some(&data_json), data_json.get("response")]
+                    .into_iter()
+                    .flatten()
+                    .any(|response| {
+                        response.get("error").is_some_and(|error| !error.is_null())
+                            || response.get("status").is_some_and(|status| {
+                                status.as_str() != Some("completed")
+                            })
+                    });
+                if invalid {
+                    self.fail("原生 Responses 完成事件包含失败或不完整状态".to_string());
+                } else {
+                    self.completed = true;
+                }
+            }
             "response.failed" => {
                 self.fail("原生 Responses 上游返回 response.failed".to_string())
             }
@@ -9731,6 +9832,33 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","name":
         let mut t = ResponsesSseTransformer::default();
         t.push_bytes(b"data:{\"type\":\"response.completed\"}\n\n");
         assert!(t.finish().is_none());
+    }
+
+    #[test]
+    fn completed_event_with_failed_payload_never_counts_as_success() {
+        for response in [
+            json!({"status": "failed"}),
+            json!({"status": "incomplete"}),
+            json!({"status": "in_progress"}),
+            json!({"status": "completed", "error": {"message": "private-detail"}}),
+        ] {
+            let mut transformer = ResponsesSseTransformer::default();
+            let event = format!(
+                "data:{}\n\n",
+                json!({"type": "response.completed", "response": response}),
+            );
+            assert_eq!(transformer.push_bytes(event.as_bytes()), event.as_bytes());
+            assert!(transformer.has_failed());
+            assert!(!transformer.has_completed());
+            let reason = transformer.finish().expect("invalid terminal must fail");
+            assert!(!reason.contains("private-detail"));
+        }
+        let mut transformer = ResponsesSseTransformer::default();
+        transformer.push_bytes(
+            b"data:{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"error\":null}}\n\n",
+        );
+        assert!(transformer.has_completed());
+        assert!(transformer.finish().is_none());
     }
 
     #[test]
