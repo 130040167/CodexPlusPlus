@@ -154,7 +154,12 @@ impl BackupStore {
             &serde_json::to_vec_pretty(&payload)?,
         )?;
         pending.committed = true;
-        File::open(self.path_for(&token))?.sync_all()?;
+        // Windows 刷盘需要可写句柄；失败仍向上传播，阻止后续删除。
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.path_for(&token))?
+            .sync_all()?;
         Ok((token, entries))
     }
 
