@@ -4,8 +4,9 @@ use codex_plus_core::watcher::{
     macos_launcher_process_names, macos_launch_agent_installed_at, macos_launch_agent_path_at,
     macos_launch_agent_plist, process_id_is_running, process_ids_still_running,
     remove_macos_launch_agent_at, should_recover_stale_launcher, watcher_disabled_flag,
-    set_watcher_start_codex_at, set_watcher_start_minimized_at, watcher_start_codex_at,
-    watcher_start_minimized_at, write_macos_launch_agent_at,
+    set_watcher_start_codex_at, set_watcher_start_codex_on_open_at, set_watcher_start_minimized_at,
+    watcher_start_codex_at, watcher_start_codex_on_open_at, watcher_start_minimized_at,
+    write_macos_launch_agent_at,
 };
 
 #[cfg(windows)]
@@ -74,6 +75,18 @@ fn watcher_start_codex_is_a_separate_persistent_preference() {
 
     set_watcher_start_codex_at(dir.path(), false).unwrap();
     assert!(!watcher_start_codex_at(dir.path()));
+}
+
+#[test]
+fn watcher_start_codex_on_open_is_a_separate_persistent_preference() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!watcher_start_codex_on_open_at(dir.path()));
+
+    set_watcher_start_codex_on_open_at(dir.path(), true).unwrap();
+    assert!(watcher_start_codex_on_open_at(dir.path()));
+
+    set_watcher_start_codex_on_open_at(dir.path(), false).unwrap();
+    assert!(!watcher_start_codex_on_open_at(dir.path()));
 }
 
 #[test]

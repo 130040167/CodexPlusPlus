@@ -74,6 +74,7 @@ test("maintenance drives login startup and auto-takeover with switches", () => {
   assert.match(screen, /switch-row/);
   assert.match(screen, /actions\.setWatcherEnabled\(event\.currentTarget\.checked\)/);
   assert.match(screen, /actions\.setWatcherStartCodex\(event\.currentTarget\.checked\)/);
+  assert.match(screen, /actions\.setWatcherStartCodexOnOpen\(event\.currentTarget\.checked\)/);
   assert.match(screen, /actions\.setAutoTakeover\(event\.currentTarget\.checked\)/);
   // 开关取代了这两组按钮，别再退回去。
   assert.doesNotMatch(
@@ -90,5 +91,7 @@ test("watcher switch command is wired through invoke, handler and backend", () =
   const commands = readFileSync(new URL("../src-tauri/src/commands.rs", import.meta.url), "utf8");
   assert.match(commands, /pub fn set_watcher_enabled\(enabled: bool\)/);
   assert.match(commands, /pub fn set_watcher_start_codex\(start_codex: bool\)/);
+  assert.match(commands, /pub fn set_watcher_start_codex_on_open\(enabled: bool\)/);
   assert.match(lib, /commands::set_watcher_start_codex,/);
+  assert.match(lib, /commands::set_watcher_start_codex_on_open,/);
 });

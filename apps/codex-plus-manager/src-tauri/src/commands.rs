@@ -695,6 +695,7 @@ pub struct WatcherPayload {
     pub disabled_flag: String,
     pub start_minimized: bool,
     pub start_codex: bool,
+    pub start_codex_on_open: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6180,6 +6181,18 @@ pub fn set_watcher_start_codex(start_codex: bool) -> CommandResult<WatcherPayloa
 }
 
 #[tauri::command]
+pub fn set_watcher_start_codex_on_open(enabled: bool) -> CommandResult<WatcherPayload> {
+    match codex_plus_core::watcher::set_watcher_start_codex_on_open(enabled) {
+        Ok(()) if enabled => ok("打开 Codex++ 时将自动启动 Codex。", watcher_payload()),
+        Ok(()) => ok("已取消打开 Codex++ 时自动启动 Codex。", watcher_payload()),
+        Err(error) => failed(
+            &format!("设置打开 Codex++ 时自动启动失败：{error}"),
+            watcher_payload(),
+        ),
+    }
+}
+
+#[tauri::command]
 pub fn load_relay_proxy(profile_id: String) -> CommandResult<Value> {
     let profile_id = profile_id.trim().to_string();
     ok(
@@ -8432,6 +8445,7 @@ fn watcher_payload() -> WatcherPayload {
         disabled_flag: flag.to_string_lossy().to_string(),
         start_minimized: codex_plus_core::watcher::watcher_start_minimized(),
         start_codex: codex_plus_core::watcher::watcher_start_codex(),
+        start_codex_on_open: codex_plus_core::watcher::watcher_start_codex_on_open(),
     }
 }
 

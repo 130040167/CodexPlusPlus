@@ -75,6 +75,7 @@ pub fn run() {
     let start_minimized = autostart
         && codex_plus_core::watcher::watcher_start_minimized();
     let start_codex_at_login = autostart && codex_plus_core::watcher::watcher_start_codex();
+    let start_codex_on_open = !autostart && codex_plus_core::watcher::watcher_start_codex_on_open();
     let app_result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
@@ -110,7 +111,10 @@ pub fn run() {
             start_window_activation_listener(app.handle().clone());
             commands::start_weixin_connect_from_saved_settings();
             register_main_window_events(main_window);
-            commands::resume_existing_codex_background(app.handle().clone(), start_codex_at_login);
+            commands::resume_existing_codex_background(
+                app.handle().clone(),
+                start_codex_at_login || start_codex_on_open,
+            );
             // 自动接管官方 App（默认关闭）：设置里开着才起守护线程。
             auto_takeover::start_supervisor();
             if let Err(error) = global_dictation::apply_config() {
@@ -228,6 +232,7 @@ pub fn run() {
             commands::set_watcher_enabled,
             commands::set_watcher_start_minimized,
             commands::set_watcher_start_codex,
+            commands::set_watcher_start_codex_on_open,
             commands::load_relay_proxy,
             commands::set_relay_proxy,
             commands::load_relay_feature,

@@ -920,6 +920,7 @@ type WatcherResult = CommandResult<{
   disabled_flag: string;
   start_minimized: boolean;
   start_codex: boolean;
+  start_codex_on_open: boolean;
 }>;
 
 // 与 Rust 侧 `auto_takeover::AutoTakeoverPayload`（rename_all = "camelCase"）逐字段对齐。
@@ -2536,6 +2537,14 @@ export function App() {
     }
   };
 
+  const setWatcherStartCodexOnOpen = async (enabled: boolean) => {
+    const result = await run(() => call<WatcherResult>("set_watcher_start_codex_on_open", { enabled }));
+    if (result) {
+      setWatcher(result);
+      showNotice(t("打开 Codex++ 时自动启动 Codex"), result.message, result.status);
+    }
+  };
+
   const checkUpdate = async (silent = false) => {
     if (updateInstallPending.current) return;
     if (updateCheckPending.current) {
@@ -3861,6 +3870,7 @@ export function App() {
       setWatcherEnabled,
       setWatcherStartMinimized,
       setWatcherStartCodex,
+      setWatcherStartCodexOnOpen,
       setAutoTakeover,
       refreshAutoTakeover: () => refreshAutoTakeover(false),
       takeOverNow: () => runAutoTakeoverCommand("take_over_codex_now"),
@@ -4433,6 +4443,7 @@ type Actions = {
   setWatcherEnabled: (enabled: boolean) => Promise<void>;
   setWatcherStartMinimized: (minimized: boolean) => Promise<void>;
   setWatcherStartCodex: (startCodex: boolean) => Promise<void>;
+  setWatcherStartCodexOnOpen: (enabled: boolean) => Promise<void>;
   setAutoTakeover: (enabled: boolean) => Promise<void>;
   refreshAutoTakeover: () => Promise<void>;
   takeOverNow: () => Promise<void>;
@@ -8033,6 +8044,19 @@ function MaintenanceScreen({
             <span>
               <strong>{t("登录时自动打开")}</strong>
               <small>{t("开启后注册系统登录项，关闭时移除；是否自动启动 Codex 由下面的独立开关决定。")}</small>
+            </span>
+            <ToggleVisual />
+          </label>
+          <label className="switch-row">
+            <input
+              checked={Boolean(watcher?.start_codex_on_open)}
+              disabled={!watcher}
+              onChange={(event) => void actions.setWatcherStartCodexOnOpen(event.currentTarget.checked)}
+              type="checkbox"
+            />
+            <span>
+              <strong>{t("打开 Codex++ 时自动启动 Codex")}</strong>
+              <small>{t("仅手动打开 Codex++ 时生效；已有 Codex 会先恢复，不会重复启动。")}</small>
             </span>
             <ToggleVisual />
           </label>

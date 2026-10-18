@@ -44,6 +44,10 @@ pub fn watcher_start_codex_flag(root: &Path) -> PathBuf {
     root.join("watcher.start-codex")
 }
 
+pub fn watcher_start_codex_on_open_flag(root: &Path) -> PathBuf {
+    root.join("watcher.start-codex-on-open")
+}
+
 pub fn default_watcher_disabled_flag() -> PathBuf {
     watcher_disabled_flag(&crate::paths::default_app_state_dir())
 }
@@ -54,6 +58,10 @@ pub fn default_watcher_start_minimized_flag() -> PathBuf {
 
 pub fn default_watcher_start_codex_flag() -> PathBuf {
     watcher_start_codex_flag(&crate::paths::default_app_state_dir())
+}
+
+pub fn default_watcher_start_codex_on_open_flag() -> PathBuf {
+    watcher_start_codex_on_open_flag(&crate::paths::default_app_state_dir())
 }
 
 pub fn set_watcher_start_minimized_at(root: &Path, minimized: bool) -> std::io::Result<()> {
@@ -110,6 +118,34 @@ pub fn watcher_start_codex_at(root: &Path) -> bool {
 
 pub fn watcher_start_codex() -> bool {
     watcher_start_codex_at(&crate::paths::default_app_state_dir())
+}
+
+pub fn set_watcher_start_codex_on_open_at(root: &Path, enabled: bool) -> std::io::Result<()> {
+    let flag = watcher_start_codex_on_open_flag(root);
+    if enabled {
+        if let Some(parent) = flag.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(flag, b"enabled")
+    } else {
+        match std::fs::remove_file(flag) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+pub fn set_watcher_start_codex_on_open(enabled: bool) -> std::io::Result<()> {
+    set_watcher_start_codex_on_open_at(&crate::paths::default_app_state_dir(), enabled)
+}
+
+pub fn watcher_start_codex_on_open_at(root: &Path) -> bool {
+    watcher_start_codex_on_open_flag(root).is_file()
+}
+
+pub fn watcher_start_codex_on_open() -> bool {
+    watcher_start_codex_on_open_at(&crate::paths::default_app_state_dir())
 }
 
 pub fn enable_watcher_at(root: &Path) -> std::io::Result<()> {

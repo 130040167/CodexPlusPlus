@@ -79,6 +79,8 @@ export const EN_PLAIN: Record<string, string> = {
   "开启后注册系统登录项，关闭时移除；是否自动启动 Codex 由下面的独立开关决定。": "Turning this on registers a system login item and turning it off removes it; the separate switch below controls whether Codex starts automatically.",
   "登录时自动启动 Codex": "Start Codex automatically at login",
   "仅登录启动 Codex++ 时自动启动 Codex；手动打开 Codex++ 仍不会自动启动。": "Start Codex only when Codex++ is opened by the login item; manually opening Codex++ will not start it automatically.",
+  "打开 Codex++ 时自动启动 Codex": "Start Codex when opening Codex++",
+  "仅手动打开 Codex++ 时生效；已有 Codex 会先恢复，不会重复启动。": "Only applies when Codex++ is opened manually; an existing Codex is resumed and never started twice.",
   "检查 Codex++ 入口、Codex 应用和开机启动状态": "Check the Codex++ shortcut, Codex app and login startup status",
 
   "Fast（priority）支持": "Fast (priority) support",
