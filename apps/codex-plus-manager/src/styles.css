@@ -3167,7 +3167,38 @@ details.relay-fold[open] > .relay-fold-body {
   gap: 8px;
 }
 
+.aggregate-member-sortable {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.aggregate-member-sortable.dragging {
+  z-index: 1;
+  opacity: 0.85;
+}
+
+.aggregate-member-drag {
+  flex: 0 0 24px;
+  touch-action: none;
+}
+
+.aggregate-member-drag:disabled {
+  opacity: 0.25;
+}
+
+.aggregate-members-head > .aggregate-members-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
 .aggregate-member-row {
+  flex: 1;
+  min-width: 0;
   display: grid;
   grid-template-columns: 18px minmax(0, 1fr) 118px;
   gap: 10px;

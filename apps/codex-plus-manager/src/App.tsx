@@ -21,6 +21,8 @@ import {
   ArrowLeft,
   ArrowRight,
   ArrowRightLeft,
+  ArrowDownAZ,
+  ArrowUpAZ,
   Bell,
   Blocks,
   Cable,
@@ -179,6 +181,8 @@ import { clampAggregateRoutePriority, normalizeAggregateRoutes, validateAggregat
 import {
   aggregateMemberCandidates,
   normalizeAggregateMembers,
+  reorderAggregateMembers,
+  sortAggregateMembers,
   isAggregateProfile,
   isOfficialLoginMemberProfile,
   normalizeAggregateDefaultRelayId,
@@ -11071,6 +11075,31 @@ function AggregateModeChooser({ onSelect }: { onSelect: (mode: AggregateMode) =>
   );
 }
 
+function SortableAggregateMemberRow({
+  id, selected, children,
+}: { id: string; selected: boolean; children: ReactNode }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id, disabled: !selected });
+  return (
+    <div
+      className={`aggregate-member-sortable ${isDragging ? "dragging" : ""}`}
+      data-member-id={id}
+      ref={setNodeRef}
+      style={{ transform: CSS.Transform.toString(transform), transition }}
+    >
+      <button
+        {...attributes}
+        {...listeners}
+        aria-label={t("拖动排序成员供应商")}
+        className="relay-drag aggregate-member-drag"
+        disabled={!selected}
+        title={t("拖动排序成员供应商")}
+        type="button"
+      ><GripVertical size={16} /></button>
+      <label className={`aggregate-member-row ${selected ? "selected" : ""}`}>{children}</label>
+    </div>
+  );
+}
+
 function AggregateRelayProfileEditor({
   profile,
   form,
@@ -11082,8 +11111,18 @@ function AggregateRelayProfileEditor({
 }) {
   const candidates = aggregateMemberCandidates(form.relayProfiles, profile.id);
   const aggregate = normalizeAggregateConfig(profile.aggregate, candidates);
+  const [descending, setDescending] = useState(false);
+  const memberSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
   const modelMode = aggregate.modelAggregationEnabled === true;
   const memberIds = new Set(aggregate.members.map((member) => member.profileId));
+  const candidateMap = new Map(candidates.map(candidate => [candidate.id, candidate]));
+  const orderedCandidates = [
+    ...aggregate.members.map(member => candidateMap.get(member.profileId)).filter((item): item is RelayProfile => !!item),
+    ...candidates.filter(candidate => !memberIds.has(candidate.id)),
+  ];
   const sessionProvider = normalizeRelaySessionProvider(profile.sessionProvider);
   const updateAggregate = (nextAggregate: RelayAggregateConfig) => {
     onProfileChange(normalizeAggregateRelayProfile({ ...profile, aggregate: nextAggregate }, form));
@@ -11199,11 +11238,30 @@ function AggregateRelayProfileEditor({
             <strong>{t("成员供应商")}</strong>
             <span>{t("可勾选 API 供应商或已完成 ChatGPT 登录的官方账号；聚合供应商不会作为成员。")}</span>
           </div>
-          <UiBadge variant="outline">{aggregate.members.length} / {candidates.length}</UiBadge>
+          <div className="aggregate-members-actions">
+            <Button
+              aria-label={descending ? t("按名称降序排序") : t("按名称升序排序")}
+              disabled={aggregate.members.length < 2}
+              onClick={() => {
+                updateAggregate({ ...aggregate, members: sortAggregateMembers(aggregate.members, form.relayProfiles, descending) });
+                setDescending(!descending);
+              }}
+              size="icon"
+              title={descending ? t("按名称降序排序") : t("按名称升序排序")}
+              type="button"
+              variant="ghost"
+            >{descending ? <ArrowUpAZ size={16} /> : <ArrowDownAZ size={16} />}</Button>
+            <UiBadge variant="outline">{aggregate.members.length} / {candidates.length}</UiBadge>
+          </div>
         </div>
         {candidates.length ? (
+          <DndContext sensors={memberSensors} collisionDetection={closestCenter} onDragEnd={({ active, over }) => {
+            if (!over || active.id === over.id) return;
+            updateAggregate({ ...aggregate, members: reorderAggregateMembers(aggregate.members, String(active.id), String(over.id)) });
+          }}>
+          <SortableContext items={aggregate.members.map(member => member.profileId)} strategy={verticalListSortingStrategy}>
           <div className="aggregate-member-list">
-            {candidates.map((candidate) => {
+            {orderedCandidates.map((candidate) => {
               const member = aggregate.members.find((item) => item.profileId === candidate.id);
               const checked = memberIds.has(candidate.id);
               const isDefaultMember = !!aggregate.defaultRelayId && aggregate.defaultRelayId === candidate.id;
@@ -11214,7 +11272,7 @@ function AggregateRelayProfileEditor({
                 ...(candidate.model.trim() ? [candidate.model.trim()] : []),
               ])];
               return (
-                <label className={`aggregate-member-row ${checked ? "selected" : ""}`} key={candidate.id}>
+                <SortableAggregateMemberRow id={candidate.id} selected={checked} key={candidate.id}>
                   <input
                     checked={checked}
                     onChange={(event) => toggleMember(candidate.id, event.currentTarget.checked)}
@@ -11277,10 +11335,12 @@ function AggregateRelayProfileEditor({
                       />
                     </span>
                   )}
-                </label>
+                </SortableAggregateMemberRow>
               );
             })}
           </div>
+          </SortableContext>
+          </DndContext>
         ) : (
           <div className="empty">{t("先添加至少 1 个可用的 API 供应商或官方登录账号，再创建聚合供应商。")}</div>
         )}
