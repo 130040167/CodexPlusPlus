@@ -38,7 +38,7 @@
     {
       "name": "60-plugin-marketplace.js",
       "description": "插件市场请求/响应补丁、本地兜底与合并",
-      "lines": 1874
+      "lines": 1882
     },
     {
       "name": "61-plugin-market-ui.js",
@@ -63,7 +63,7 @@
     {
       "name": "80-session-share.js",
       "description": "会话运行时工具；分享入口已撤出管理器扫描",
-      "lines": 739
+      "lines": 749
     },
     {
       "name": "81-capacity-auto-retry.js",
@@ -83,7 +83,7 @@
     {
       "name": "90-action-groups.js",
       "description": "会话行操作按钮布局、更多菜单、工具提示",
-      "lines": 1079
+      "lines": 1081
     },
     {
       "name": "91-extension-api.js",

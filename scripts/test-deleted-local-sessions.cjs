@@ -6,6 +6,9 @@ const vm = require("node:vm");
 const source = fs.readFileSync(path.join(__dirname, "../assets/inject/renderer-inject/80-session-share.js"), "utf8");
 const code = source.slice(0, source.indexOf("  function normalizeWorkspacePath("));
 const rows = [];
+const archiveRows = [];
+const timers = new Map();
+let timerId = 0;
 const styles = new Map();
 function row(id, host) {
   const attributes = new Map();
@@ -25,6 +28,10 @@ const context = vm.createContext({
   sessionRows() { return rows; },
   sessionRefFromRow(r) { return { session_id: r.id, host_id: r.host }; },
   async postJson() { return response; },
+  archivedPageRows() { return archiveRows; },
+  archivedRefFromRow(r) { return { session_id: r.id, host_id: r.host }; },
+  setTimeout(callback) { timers.set(++timerId, callback); return timerId; },
+  clearTimeout(id) { timers.delete(id); },
 });
 vm.runInContext(`${code}\nthis.api = { applyDeletedLocalSessions, refreshDeletedLocalSessions, state: deletedLocalSessions };`, context);
 async function run() {
@@ -62,6 +69,37 @@ async function run() {
   response = { status: "ok", thread_ids: [] };
   await api.refreshDeletedLocalSessions();
   assert.equal(api.state.ids.size, 0);
-  console.log("deleted local sessions: replacement, reuse, host isolation, reinjection, undo race passed");
+  response = { status: "ok", thread_ids: ["a"] };
+  archiveRows.push(row("a", "local"), row("a", "remote"), row("a", null));
+  await api.refreshDeletedLocalSessions();
+  assert.equal(archiveRows[0].attributes.size, 1);
+  assert.equal(archiveRows[1].attributes.size, 0);
+  assert.equal(archiveRows[2].attributes.size, 0);
+  archiveRows[0].id = "b";
+  api.applyDeletedLocalSessions();
+  assert.equal(archiveRows[0].attributes.size, 0);
+
+  let resolveOld, resolveNew;
+  context.postJson = () => new Promise((resolve) => { resolveOld = resolve; });
+  const stalled = api.refreshDeletedLocalSessions();
+  assert.equal(timers.size, 1);
+  [...timers.values()][0]();
+  await stalled;
+  assert.equal(api.state.pending, false);
+  assert.equal(timers.size, 0);
+  context.postJson = () => new Promise((resolve) => { resolveNew = resolve; });
+  const retry = api.refreshDeletedLocalSessions();
+  resolveOld({ status: "ok", thread_ids: ["stale"] });
+  await Promise.resolve();
+  assert.equal(api.state.ids.has("stale"), false);
+  assert.ok(api.state.pending);
+  resolveNew({ status: "ok", thread_ids: [] });
+  await retry;
+  assert.equal(api.state.ids.size, 0);
+  assert.equal(timers.size, 0);
+  api.state.pending = true;
+  vm.runInContext(`(() => {${code}})();`, context);
+  assert.equal(api.state.pending, false);
+  console.log("deleted local sessions: sidebar/archive isolation, replacement, undo, timeout retry and late response passed");
 }
 run().catch((error) => { console.error(error); process.exitCode = 1; });
