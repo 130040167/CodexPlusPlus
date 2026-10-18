@@ -73,6 +73,37 @@ fn parse_hotkey(value: &str) -> anyhow::Result<(u32, u32)> {
     Ok((modifiers, key.unwrap()))
 }
 
+#[cfg(target_os = "macos")]
+fn parse_hotkey(value: &str) -> anyhow::Result<(u32, u32)> {
+    let mut modifiers = 0_u32;
+    let mut key = None;
+    for part in value.split('+').map(str::trim).filter(|part| !part.is_empty()) {
+        match part.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => modifiers |= 1 << 12,
+            "shift" => modifiers |= 1 << 9,
+            "alt" | "option" => modifiers |= 1 << 11,
+            "cmd" | "command" | "meta" | "win" => modifiers |= 1 << 8,
+            "space" => key = Some(49),
+            value if value.len() == 1 && value.as_bytes()[0].is_ascii_alphabetic() => {
+                key = Some(match value.as_bytes()[0].to_ascii_lowercase() {
+                    b'a' => 0, b's' => 1, b'd' => 2, b'f' => 3, b'h' => 4,
+                    b'g' => 5, b'z' => 6, b'x' => 7, b'c' => 8, b'v' => 9,
+                    b'b' => 11, b'q' => 12, b'w' => 13, b'e' => 14, b'r' => 15,
+                    b'y' => 16, b't' => 17, b'1' => 18, b'2' => 19, b'3' => 20,
+                    b'4' => 21, b'6' => 22, b'5' => 23, b'=' => 24, b'9' => 25,
+                    b'7' => 26, b'-' => 27, b'8' => 28, b'0' => 29,
+                    b']' => 30, b'o' => 31, b'u' => 32, b'[' => 33, b'i' => 34,
+                    b'p' => 35, b'l' => 37, b'j' => 38, b'k' => 40, b'n' => 45,
+                    b'm' => 46, _ => anyhow::bail!("不支持的 macOS 热键按键：{part}"),
+                });
+            }
+            _ => anyhow::bail!("不支持的 macOS 热键按键：{part}"),
+        }
+    }
+    anyhow::ensure!(modifiers != 0 && key.is_some(), "全局热键需要修饰键和按键，例如 Ctrl+Shift+Space");
+    Ok((modifiers, key.unwrap()))
+}
+
 #[cfg(windows)]
 pub fn start<F>(hotkey: &str, callback: F) -> anyhow::Result<GlobalHotkeyHandle>
 where F: Fn() + Send + 'static {
@@ -106,7 +137,87 @@ where F: Fn() + Send + 'static {
 #[cfg(not(windows))]
 pub fn start<F>(_hotkey: &str, _callback: F) -> anyhow::Result<GlobalHotkeyHandle>
 where F: Fn() + Send + 'static {
-    anyhow::bail!("全局听写热键首版仅支持 Windows");
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::c_void;
+
+        type EventRef = *mut c_void;
+        type EventTargetRef = *mut c_void;
+        type EventHandlerRef = *mut c_void;
+        type EventHotKeyRef = *mut c_void;
+        type Status = i32;
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct EventTypeSpec { event_class: u32, event_kind: u32 }
+
+        type EventHandlerCallRef = *mut c_void;
+        type EventHandlerProc = unsafe extern "C" fn(EventHandlerCallRef, EventRef, *mut c_void) -> Status;
+
+        #[link(name = "Carbon", kind = "framework")]
+        unsafe extern "C" {
+            fn GetApplicationEventTarget() -> EventTargetRef;
+            fn RegisterEventHotKey(key_code: u32, modifiers: u32, id: u32, target: EventTargetRef, options: u32, out_ref: *mut EventHotKeyRef) -> Status;
+            fn UnregisterEventHotKey(hot_key: EventHotKeyRef) -> Status;
+            fn InstallEventHandler(target: EventTargetRef, handler: Option<EventHandlerProc>, count: u32, types: *const EventTypeSpec, user_data: *mut c_void, out_ref: *mut EventHandlerRef) -> Status;
+            fn RemoveEventHandler(handler: EventHandlerRef) -> Status;
+            fn ReceiveNextEvent(count: u32, types: *const EventTypeSpec, timeout: f64, pull: u8, out_event: *mut EventRef) -> Status;
+            fn SendEventToEventTarget(event: EventRef, target: EventTargetRef) -> Status;
+            fn ReleaseEvent(event: EventRef);
+        }
+
+        let (modifiers, key_code) = parse_hotkey(_hotkey)?;
+        let target = unsafe { GetApplicationEventTarget() };
+        let event_type = EventTypeSpec { event_class: u32::from_be_bytes(*b"keyb"), event_kind: 5 };
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let callback: Box<dyn Fn() + Send> = Box::new(_callback);
+        let callback_ptr = Box::into_raw(Box::new(callback));
+        unsafe extern "C" fn carbon_handler(_call: EventHandlerCallRef, _event: EventRef, user_data: *mut c_void) -> Status {
+            // SAFETY: user_data is the boxed callback allocated for this handler and is
+            // freed only after the event loop and handler are removed.
+            unsafe { (&*user_data.cast::<Box<dyn Fn() + Send>>())(); }
+            0
+        }
+        let handler_proc: EventHandlerProc = carbon_handler;
+        let mut handler: EventHandlerRef = std::ptr::null_mut();
+        let install_status = unsafe { InstallEventHandler(target, Some(handler_proc), 1, &event_type, callback_ptr.cast(), &mut handler) };
+        if install_status != 0 {
+            unsafe { drop(Box::from_raw(callback_ptr)); }
+            anyhow::bail!("macOS 全局热键事件处理器初始化失败：{install_status}");
+        }
+        let mut hot_key: EventHotKeyRef = std::ptr::null_mut();
+        let register_status = unsafe { RegisterEventHotKey(key_code, modifiers, 0xC0D30001, target, 0, &mut hot_key) };
+        if register_status != 0 {
+            unsafe { RemoveEventHandler(handler); drop(Box::from_raw(callback_ptr)); }
+            anyhow::bail!("macOS 全局热键注册失败，可能已被其他程序占用：{_hotkey}");
+        }
+        let target_addr = target as usize;
+        let hot_key_addr = hot_key as usize;
+        let handler_addr = handler as usize;
+        let callback_addr = callback_ptr as usize;
+        let thread = std::thread::Builder::new().name("codex-plus-global-dictation".into()).spawn(move || {
+            let target = target_addr as EventTargetRef;
+            let hot_key = hot_key_addr as EventHotKeyRef;
+            let handler = handler_addr as EventHandlerRef;
+            let callback_ptr = callback_addr as *mut Box<dyn Fn() + Send>;
+            while !thread_stop.load(Ordering::SeqCst) {
+                let mut event: EventRef = std::ptr::null_mut();
+                let status = unsafe { ReceiveNextEvent(1, &event_type, 0.1, 1, &mut event) };
+                if status == 0 && !event.is_null() {
+                    unsafe { SendEventToEventTarget(event, target); ReleaseEvent(event); }
+                }
+            }
+            unsafe {
+                UnregisterEventHotKey(hot_key);
+                RemoveEventHandler(handler);
+                drop(Box::from_raw(callback_ptr));
+            }
+        })?;
+        return Ok(GlobalHotkeyHandle { stop, thread: Some(thread) });
+    }
+    #[cfg(not(target_os = "macos"))]
+    anyhow::bail!("全局听写热键首版仅支持 Windows 和 macOS");
 }
 
 static HANDLE: OnceLock<Mutex<Option<GlobalHotkeyHandle>>> = OnceLock::new();
@@ -117,7 +228,7 @@ pub fn replace_handle(handle: Option<GlobalHotkeyHandle>) {
 }
 
 pub fn validate_hotkey(value: &str) -> anyhow::Result<()> {
-    #[cfg(windows)] { let _ = parse_hotkey(value)?; }
-    #[cfg(not(windows))] { anyhow::ensure!(!value.trim().is_empty(), "热键不能为空"); }
+    #[cfg(any(windows, target_os = "macos"))] { let _ = parse_hotkey(value)?; }
+    #[cfg(not(any(windows, target_os = "macos")))] { anyhow::ensure!(!value.trim().is_empty(), "热键不能为空"); }
     Ok(())
 }
