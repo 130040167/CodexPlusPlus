@@ -11894,9 +11894,10 @@
   }
 
   function retainCodexThreadResumeModel(method, params, hostId) {
-    if (String(method) !== "thread/resume" || params?.model) return params;
+    if (String(method) !== "thread/resume") return params;
     const saved = codexRetainedThreadModel(hostId, params?.threadId);
-    return saved ? { ...params, model: saved.model, reasoningEffort: saved.effort } : params;
+    if (!saved || (params?.model && params.model !== saved.model)) return params;
+    return { ...params, model: saved.model, reasoningEffort: params?.reasoningEffort ?? saved.effort };
   }
 
   async function sendCodexRetainedModelRequest(client, send, method, params, options) {
@@ -11922,7 +11923,8 @@
         if (explicit && window.__codexPlusThreadModelSelections?.get(key) === intent) window.__codexPlusThreadModelSelections.delete(key);
       }
       if (profileId === codexRemoteSessionActiveProfile()?.id) {
-        rememberCodexThreadModel(method, next, result, client.hostId, explicit ? intent.selection : selection, !!explicit);
+        const confirmedSelection = explicit && !intent.powerSelection ? intent.selection : selection;
+        rememberCodexThreadModel(method, next, result, client.hostId, confirmedSelection, !!explicit);
       }
       return result;
     } catch (error) {
@@ -11958,19 +11960,30 @@
 
   function observeCodexThreadModelSelection(event) {
     if (!codexThreadModelObserverActive()) return;
-    if (event.type === "keydown" && !["Enter", " "].includes(event.key)) return;
-    const row = event.target?.closest?.('[role="menuitemradio"]');
+    if (!["click", "keydown", "pointerup"].includes(event.type)) return;
+    const slider = event.target?.closest?.("[data-reasoning-slider]");
+    if (slider && event.type === "click") return;
+    if (event.type === "pointerup" && !slider) return;
+    if (event.type === "keydown" && !(slider
+      ? ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)
+      : ["Enter", " "].includes(event.key))) return;
+    const row = slider || event.target?.closest?.('[role="menuitemradio"]');
     if (!row || row.getAttribute("aria-disabled") === "true"
         || row.closest('[inert], [hidden], [aria-hidden="true"]')) return;
     const { picker, owner, hostId, selectedModel, selectedEffort } = codexThreadModelPickerContext(row);
     const key = codexThreadModelStorageKey(hostId, owner);
-    if (!key || !picker || picker.lockedModelSlug || picker.modelOptionsDisabled || picker.modelSelectionDisabled) return;
-    if (!selectedEffort && !row.closest("[data-model-picker-view]")) return;
-    const selection = captureCodexThreadModelSelection({ model: selectedModel || (selectedEffort ? picker.model : ""), effort: selectedEffort || null });
+    if (!key || !picker || picker.lockedModelSlug || picker.modelOptionsDisabled || picker.modelSelectionDisabled
+        || (slider && (picker.disabled || picker.reasoningEffortDisabled))) return;
+    if (!slider && !selectedEffort && !row.closest("[data-model-picker-view]")) return;
+    const selection = captureCodexThreadModelSelection({
+      model: slider ? picker.model : selectedModel || (selectedEffort ? picker.model : ""),
+      effort: slider ? picker.reasoningEffort : selectedEffort || null,
+    });
     if (!selection) return;
     const selections = window.__codexPlusThreadModelSelections || (window.__codexPlusThreadModelSelections = new Map());
     // 只记用户激活原生模型行的意图；原生实际选中后才持久化，取消和自动回退不算选择。
-    selections.set(key, { selection, effortOnly: !selectedModel, at: Date.now(), confirmedSince: 0 });
+    selections.set(key, { selection, powerSelection: !!slider, awaitPowerChange: !!slider && event.type === "keydown",
+      effortOnly: !selectedModel, at: Date.now(), confirmedSince: 0 });
     for (const [entryKey, value] of selections) if (Date.now() - value.at >= 30000) selections.delete(entryKey);
     window.setTimeout?.(syncCodexRetainedThreadModels, 300);
   }
@@ -11984,7 +11997,7 @@
     if (!codexThreadModelObserverActive()) return;
     if (window.__codexPlusThreadModelSelectionObserver === observeCodexThreadModelSelection) return;
     const previous = window.__codexPlusThreadModelSelectionObserver;
-    for (const type of ["click", "keydown"]) {
+    for (const type of ["click", "keydown", "pointerup"]) {
       if (previous) document.removeEventListener?.(type, previous, true);
       document.addEventListener?.(type, observeCodexThreadModelSelection, true);
     }
@@ -12004,6 +12017,21 @@
       const selections = window.__codexPlusThreadModelSelections;
       const intent = selections?.get(key);
       if (intent && Date.now() - intent.at < 30000) {
+        // 滑杆组合选择由原生事件提交后读取；不能把拖动预览当成最终选择。
+        if (intent.powerSelection && picker) {
+          const selection = captureCodexThreadModelSelection({ model: picker.model, effort: picker.reasoningEffort });
+          if (selection && (selection.model !== intent.selection.model || selection.effort !== intent.selection.effort)) {
+            intent.selection = selection;
+            intent.awaitPowerChange = false;
+            intent.confirmedSince = 0;
+          }
+          if (intent.awaitPowerChange) {
+            selections.delete(key);
+            states.delete(node);
+            window.setTimeout?.(syncCodexRetainedThreadModels, 300);
+            continue;
+          }
+        }
         const target = resolveCodexThreadModelSelection(intent.selection);
         if (picker?.model === target && (!intent.effortOnly || picker.reasoningEffort === intent.selection.effort)) {
           if (!intent.confirmedSince) {

@@ -35,7 +35,7 @@ function pickerFixture(r: ReturnType<typeof runtime>, model = "gpt-5.5") {
   });
   const choose = (selected: string) => {
     const target = row(selected);
-    r.api.observeCodexThreadModelSelection({type:"click",target:{closest:()=>target}});
+    r.api.observeCodexThreadModelSelection({type:"click",target:{closest:(selector:string)=>selector === '[role="menuitemradio"]' ? target : null}});
   };
   return {picker,owner,choose};
 }
@@ -67,6 +67,67 @@ it("resume fills missing model but respects an explicit context/model switch",()
   const r=runtime();r.api.rememberCodexThreadModel("turn/start",{threadId:"one",model:"sol",effort:"low"},{},"local");
   assert.equal(r.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one"},"local").model,"sol");
   assert.equal(r.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one",model:"gpt-5.5"},"local").model,"gpt-5.5");
+});
+it("same-model resumes restore saved effort while explicit efforts and other models stay intact",()=>{
+  const r=runtime();
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
+  const restarted=runtime(r.storage);
+  assert.equal(restarted.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one",model:"sol"},"local").reasoningEffort,"high");
+  assert.equal(restarted.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one",model:"sol",reasoningEffort:"low"},"local").reasoningEffort,"low");
+  assert.equal(restarted.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one",model:"gpt-5.5"},"local").reasoningEffort,undefined);
+});
+it("native power slider pointer and keyboard commits survive renderer restart and thread unload",async()=>{
+  for (const type of ["pointerup","keydown"]) {
+    const r=runtime(),f=pickerFixture(r,"sol");
+    const slider={__reactFiber$test:{memoizedProps:{},return:r.nodes[0].__reactFiber$test},
+      getAttribute:()=>null,closest:()=>null};
+    r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"low"},{},"local");
+    if(type==="pointerup")f.picker.reasoningEffort="high";
+    r.api.observeCodexThreadModelSelection({type,key:"ArrowRight",
+      target:{closest:(selector:string)=>selector==="[data-reasoning-slider]"?slider:null}});
+    f.picker.reasoningEffort="high";
+    r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();
+    const next=runtime(r.storage),fresh=pickerFixture(next,"sol");
+    assert.equal(next.api.codexRetainedThreadModel("local","one").effort,"high");
+    const calls:any[]=[];
+    fresh.picker.onSelectModel=(model:string,effort:string)=>{calls.push([model,effort]);fresh.picker.reasoningEffort=effort};
+    next.api.syncCodexRetainedThreadModels();next.tick();next.api.syncCodexRetainedThreadModels();
+    assert.deepEqual(calls,[["sol","high"]]);
+    await Promise.resolve();
+    fresh.owner.conversationId="two";next.api.syncCodexRetainedThreadModels();
+    fresh.owner.conversationId="one";fresh.picker.reasoningEffort="low";
+    next.api.syncCodexRetainedThreadModels();next.tick();next.api.syncCodexRetainedThreadModels();
+    assert.equal(calls.length,2);
+  }
+});
+it("power-slider settings acknowledgements save the submitted effort, not the previous effort",async()=>{
+  const r=runtime(),f=pickerFixture(r,"sol");
+  const slider={__reactFiber$test:r.nodes[0].__reactFiber$test,getAttribute:()=>null,closest:()=>null};
+  r.api.observeCodexThreadModelSelection({type:"keydown",key:"ArrowRight",
+    target:{closest:(selector:string)=>selector==="[data-reasoning-slider]"?slider:null}});
+  await r.api.sendCodexRetainedModelRequest({hostId:"local"},async()=>({}),
+    "thread/settings/update",{threadId:"one",model:"sol",effort:"high"});
+  assert.equal(r.api.codexRetainedThreadModel("local","one").effort,"high");
+});
+it("slider previews, cancellation, disabled controls and unrelated arrow keys do not save choices",()=>{
+  for(const type of ["pointermove","pointercancel","keydown","pointerup"]) {
+    const r=runtime(),f=pickerFixture(r,"sol");
+    const slider={__reactFiber$test:r.nodes[0].__reactFiber$test,getAttribute:()=>null,closest:()=>null};
+    f.picker.reasoningEffortDisabled=type==="pointerup";
+    r.api.observeCodexThreadModelSelection({type,key:"Escape",
+      target:{closest:(selector:string)=>selector==="[data-reasoning-slider]"?slider:null}});
+    r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();
+    assert.equal(r.api.codexRetainedThreadModel("local","one"),null);
+  }
+});
+it("an arrow at the slider boundary does not confirm a native fallback as a new choice",()=>{
+  const r=runtime(),f=pickerFixture(r,"sol");
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
+  const slider={__reactFiber$test:r.nodes[0].__reactFiber$test,getAttribute:()=>null,closest:()=>null};
+  r.api.observeCodexThreadModelSelection({type:"keydown",key:"ArrowLeft",
+    target:{closest:(selector:string)=>selector==="[data-reasoning-slider]"?slider:null}});
+  r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();
+  assert.equal(r.api.codexRetainedThreadModel("local","one").effort,"high");
 });
 it("stable native fallback restores once; pending user selection and locked pickers are respected",async()=>{
   const r=runtime(); const calls:any[]=[];
