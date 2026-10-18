@@ -6115,6 +6115,36 @@ pub fn set_watcher_start_minimized(minimized: bool) -> CommandResult<WatcherPayl
 }
 
 #[tauri::command]
+pub fn load_relay_proxy(profile_id: String) -> CommandResult<Value> {
+    let profile_id = profile_id.trim().to_string();
+    ok(
+        "供应商代理已读取。",
+        json!({
+            "profileId": profile_id,
+            "proxyUrl": codex_plus_core::relay_proxy::proxy_for_profile(&profile_id).unwrap_or_default()
+        }),
+    )
+}
+
+#[tauri::command]
+pub fn set_relay_proxy(profile_id: String, proxy_url: String) -> CommandResult<Value> {
+    match codex_plus_core::relay_proxy::set_proxy_for_profile(&profile_id, &proxy_url) {
+        Ok(()) => ok(
+            if proxy_url.trim().is_empty() {
+                "供应商独立代理已清除。"
+            } else {
+                "供应商独立代理已保存。"
+            },
+            json!({
+                "profileId": profile_id.trim(),
+                "proxyUrl": proxy_url.trim()
+            }),
+        ),
+        Err(error) => failed(&format!("保存供应商代理失败：{error}"), json!({})),
+    }
+}
+
+#[tauri::command]
 pub fn read_latest_logs(request: LogRequest) -> CommandResult<LogsPayload> {
     let path = codex_plus_core::paths::default_diagnostic_log_path();
     match read_tail(&path, request.lines) {

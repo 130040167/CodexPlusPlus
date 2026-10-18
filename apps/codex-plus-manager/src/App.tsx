@@ -9011,7 +9011,31 @@ function RelayProfileEditor({
   setModelWindowRows: (value: ModelWindowRow[]) => void;
 }) {
   const [vlmTestOpen, setVlmTestOpen] = useState(false);
+  const [relayProxyUrl, setRelayProxyUrl] = useState("");
+  const [relayProxyBusy, setRelayProxyBusy] = useState(false);
   const useCommonConfig = profile.useCommonConfig !== false;
+  useEffect(() => {
+    let cancelled = false;
+    setRelayProxyUrl("");
+    void invoke<{ status: string; proxyUrl?: string }>("load_relay_proxy", { profileId: profile.id })
+      .then((result) => { if (!cancelled) setRelayProxyUrl(result.proxyUrl || ""); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [profile.id]);
+  const saveRelayProxy = async () => {
+    setRelayProxyBusy(true);
+    try {
+      const result = await invoke<{ status: string; message: string }>("set_relay_proxy", {
+        profileId: profile.id,
+        proxyUrl: relayProxyUrl,
+      });
+      await actions.showMessage(t("供应商独立代理"), result.message, result.status === "ok" ? "ok" : "failed");
+    } catch (error) {
+      await actions.showMessage(t("供应商独立代理"), String(error), "failed");
+    } finally {
+      setRelayProxyBusy(false);
+    }
+  };
   const [activeImportDraft, setActiveImportDraft] = useState<ActiveImportDraft | null>(null);
   const [metadataImportError, setMetadataImportError] = useState("");
   const [builtinMatch, setBuiltinMatch] = useState<BuiltinModelMetadataMatch | null>(null);
@@ -10355,6 +10379,21 @@ function RelayProfileEditor({
                   onChange={(event) => updateDraft({ userAgent: event.currentTarget.value })}
                   placeholder={t("留空使用默认值")}
                 />
+              </Field>
+            ) : null}
+            {showApiFields ? (
+              <Field className="relay-field-proxy" label={t("供应商独立代理")}>
+                <div className="relay-inline-field">
+                  <Input
+                    value={relayProxyUrl}
+                    onChange={(event) => setRelayProxyUrl(event.currentTarget.value)}
+                    placeholder="http://127.0.0.1:7890"
+                  />
+                  <Button disabled={relayProxyBusy} onClick={() => void saveRelayProxy()} size="sm" type="button" variant="secondary">
+                    {t("保存")}
+                  </Button>
+                </div>
+                <span className="hint-line">{t("留空表示使用系统代理；仅影响当前供应商的模型拉取、测试和请求。")}</span>
               </Field>
             ) : null}
             {showApiFields ? (

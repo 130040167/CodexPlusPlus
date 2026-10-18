@@ -64,8 +64,8 @@ pub fn proxied_client_for_profile(
         .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_uppercase() } else { '_' })
         .collect::<String>();
     let key = format!("CODEX_PLUS_PROXY_{suffix}");
-    let proxy = std::env::var(key)
-        .ok()
+    let proxy = crate::relay_proxy::proxy_for_profile(profile_id)
+        .or_else(|| std::env::var(key).ok())
         .or_else(|| std::env::var("CODEX_PLUS_PROXY").ok());
     build_proxied_client(user_agent, proxy.as_deref())
 }

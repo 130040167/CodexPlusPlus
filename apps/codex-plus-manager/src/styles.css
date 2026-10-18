@@ -7221,8 +7221,16 @@ select {
 }
 
 .relay-vlm-section > .field-hint,
-.relay-field-user-agent {
+.relay-field-user-agent,
+.relay-field-proxy {
   grid-column: 1 / -1;
+}
+
+.relay-inline-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
 }
 
 .relay-field-custom-headers {
