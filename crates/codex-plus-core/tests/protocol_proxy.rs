@@ -4599,6 +4599,49 @@ async fn upstream_request_returns_when_provider_accepts_but_never_sends_headers(
     server.abort();
 }
 
+/// 系统代理/链路抖动经常表现为 TLS 握手阶段被对端断开
+/// （`client error (Connect): tls handshake eof`）。这类失败发生在请求送达
+/// 上游之前，必须在本地重试，不能把瞬时故障直接暴露成 502。
+#[tokio::test]
+async fn upstream_connect_failures_are_retried_before_reporting_502() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            // 握手阶段直接断开，复现 tls handshake eof。
+            drop(stream);
+        }
+    });
+
+    let started = Instant::now();
+    let error = send_upstream_request_with_header_timeout(
+        upstream_http_client()
+            .unwrap()
+            .post(format!("https://{addr}/v1/responses"))
+            .json(&json!({"model": "m", "input": "hi"})),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_err();
+    let text = format!("{error:#}");
+    assert!(text.contains("上游请求失败"), "{text}");
+    assert!(
+        accepted.load(Ordering::SeqCst) >= 3,
+        "expected initial attempt plus 2 connect retries"
+    );
+    // 两次退避合计 550ms，证明不是一次失败就立刻返回。
+    assert!(started.elapsed() >= Duration::from_millis(500));
+    server.abort();
+}
+
 #[tokio::test]
 async fn aggregate_proxy_fails_over_to_next_member_in_same_request() {
     let _lock = settings_path_test_lock().lock().unwrap();
