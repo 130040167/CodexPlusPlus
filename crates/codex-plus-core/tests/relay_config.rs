@@ -4637,6 +4637,34 @@ command = "old"
 }
 
 #[test]
+fn disabling_one_managed_plugin_keeps_every_other_live_plugin() {
+    // #675：在管理器里停用一个插件，其余插件（含 Codex 自己装的、未被托管的）必须原样保留。
+    let live = r#"model = "gpt-5"
+
+[plugins."github@openai-curated"]
+enabled = true
+
+[plugins."figma@openai-curated"]
+enabled = true
+
+[plugins."notion@codex-plus-market"]
+enabled = true
+"#;
+    let context = r#"[plugins."notion@codex-plus-market"]
+enabled = false
+
+[plugins."figma@openai-curated"]
+enabled = true
+"#;
+
+    let updated = sync_live_config_context_entries(live, context).unwrap();
+
+    assert!(updated.contains(r#"[plugins."github@openai-curated"]"#), "{updated}");
+    assert!(updated.contains(r#"[plugins."figma@openai-curated"]"#), "{updated}");
+    assert!(!updated.contains(r#"[plugins."notion@codex-plus-market"]"#), "{updated}");
+}
+
+#[test]
 fn apply_relay_profile_to_home_with_switch_rules_writes_provider_even_when_auth_has_no_api_key() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {
