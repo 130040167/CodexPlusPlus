@@ -157,7 +157,7 @@ impl BackupStore {
             &serde_json::to_vec_pretty(&payload)?,
         )?;
         pending.committed = true;
-        File::open(self.path_for(&token))?.sync_all()?;
+        sync_file(&self.path_for(&token))?;
         // 删除会话的撤销只发生在删除之后，旧备份没有长期价值；但历史上这里
         // 从不清理，单份会话备份含全部消息时可以到 GB 级（issue #2544）。
         // 清理失败不影响本次备份：调用方已拿到可用 token。
@@ -398,6 +398,15 @@ pub(crate) fn private_atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<
     Ok(())
 }
 
+/// 把已写好的文件刷到磁盘。
+///
+/// 必须用可写句柄：Windows 的 `FlushFileBuffers` 要求 `GENERIC_WRITE`，
+/// `File::open` 拿到的只读句柄刷盘必然返回 `ERROR_ACCESS_DENIED (5)`，
+/// provider 同步因此整次 skipped（#2612）。不截断、不创建，只为刷盘而打开。
+pub(crate) fn sync_file(path: &Path) -> std::io::Result<()> {
+    OpenOptions::new().read(true).write(true).open(path)?.sync_all()
+}
+
 pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -538,6 +547,17 @@ mod tests {
             assert!(path.is_dir());
             assert_eq!(fs::read_dir(path).unwrap().count(), 0);
         }
+    }
+
+    #[test]
+    fn sync_file_flushes_through_a_writable_handle_without_changing_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("manifest.json");
+        fs::write(&path, b"{\"version\":2}").unwrap();
+        sync_file(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"{\"version\":2}", "刷盘不能截断或改写内容");
+        assert!(sync_file(&temp.path().join("missing.json")).is_err(), "不存在的文件不能被创建");
+        assert!(!temp.path().join("missing.json").exists());
     }
 
     #[test]

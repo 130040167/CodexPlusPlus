@@ -4440,7 +4440,7 @@ fn backup_sqlite_database(source: &Path, root: &Path, relative: &Path) -> anyhow
         anyhow::bail!("SQLite backup integrity check failed: {integrity}");
     }
     drop(target_db);
-    File::open(&target)?.sync_all()?;
+    crate::backup::sync_file(&target)?;
     crate::backup::sync_directory(parent)?;
     Ok(())
 }
