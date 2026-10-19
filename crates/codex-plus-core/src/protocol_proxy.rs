@@ -9931,3 +9931,71 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","name":
         );
     }
 }
+
+#[cfg(test)]
+mod parallel_tool_call_pairing_tests {
+    use super::*;
+
+    /// #2185：同一轮并行两个带图片的 view_image 与一个 exec 之后，出站请求里每个
+    /// 工具输出都必须仍能找到对应调用；exec 适配器只改写 exec 那一对。
+    #[tokio::test]
+    async fn parallel_image_custom_tool_calls_keep_pairing_on_responses_path() {
+        let relay = crate::settings::RelayProfile {
+            protocol: RelayProtocol::Responses,
+            base_url: "https://relay.example.test/v1".into(),
+            api_key: "sk-test".into(),
+            ..Default::default()
+        };
+        let image_output = json!([
+            {"type": "input_text", "text": "img"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+        ]);
+        let body = json!({"model": "gpt-5.6-sol", "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "look"}]},
+            {"type": "custom_tool_call", "id": "ctc_a", "call_id": "call_a", "name": "view_image", "input": "a.png"},
+            {"type": "custom_tool_call", "id": "ctc_b", "call_id": "call_b", "name": "view_image", "input": "b.png"},
+            {"type": "custom_tool_call", "id": "ctc_c", "call_id": "call_c", "name": "exec", "input": "ls"},
+            {"type": "custom_tool_call_output", "id": "ctco_a", "call_id": "call_a", "output": image_output.clone()},
+            {"type": "custom_tool_call_output", "id": "ctco_b", "call_id": "call_b", "output": image_output},
+            {"type": "custom_tool_call_output", "id": "ctco_c", "call_id": "call_c", "output": "ok"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]}
+        ], "tools": [{"type": "custom", "name": "view_image"}, {"type": "custom", "name": "exec"}]});
+
+        let (_, out, _, _) =
+            upstream_request_parts(&relay, body, "/v1/responses", None, false, None)
+                .await
+                .unwrap();
+        assert_pairing(&out, 3);
+        let adapted = crate::responses_exec::adapt_request(out).unwrap();
+        assert_pairing(&adapted, 3);
+        let input = adapted["input"].as_array().unwrap();
+        assert_eq!(input[4]["type"], "custom_tool_call_output", "图片输出不应被改成 function_call_output");
+        assert_eq!(input[6]["type"], "function_call_output");
+    }
+
+    fn assert_pairing(body: &Value, expected: usize) {
+        let input = body["input"].as_array().unwrap();
+        let ids = |suffix: &str| -> Vec<(String, String)> {
+            input
+                .iter()
+                .filter_map(|item| {
+                    let kind = item["type"].as_str()?;
+                    kind.ends_with(suffix).then(|| {
+                        (kind.to_string(), item["call_id"].as_str().unwrap_or("").to_string())
+                    })
+                })
+                .collect()
+        };
+        let calls = ids("_call");
+        let outputs = ids("_output");
+        assert_eq!(calls.len(), expected, "{body}");
+        assert_eq!(outputs.len(), expected, "{body}");
+        for (kind, call_id) in &outputs {
+            let call_kind = kind.trim_end_matches("_output");
+            assert!(
+                calls.iter().any(|(k, id)| id == call_id && k == call_kind),
+                "{kind} {call_id} 找不到同类型调用：{body}"
+            );
+        }
+    }
+}
