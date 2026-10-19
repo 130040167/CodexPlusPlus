@@ -28,6 +28,32 @@ async function readShard() {
   return await readFile(SHARD_URL, "utf8");
 }
 
+it("未发布聚合目录仅提供默认行显示和显式选择，不放宽自动迁移", async () => {
+  const source = await readShard();
+  const block = source.match(/  function codexPlusModelPickerDefaultModel\(\)[^]*?\n  \}/)?.[0];
+  assert.ok(block);
+  const catalog = {
+    status: "not_applied", model: "configured", default_model: "configured", models: ["configured"],
+    sources: [{ id: "aggregate:active", type: "aggregate_model_catalog" }],
+  };
+  let profile = { id: "active", relayMode: "aggregate" };
+  const resolve = vm.runInNewContext(`(() => { ${block}; return codexPlusModelPickerDefaultModel; })()`, {
+    codexPlusConfiguredDefaultModel: () => "",
+    codexModelCatalog: catalog, codexPlusBackendSettingsLoaded: true,
+    codexRemoteSessionActiveProfile: () => profile,
+    codexPlusModelNames: () => ["configured"],
+  });
+  assert.equal(resolve(), "configured");
+  profile = { id: "other", relayMode: "aggregate" };
+  assert.equal(resolve(), "", "旧供应商目录不能污染新配置");
+  profile = { id: "active", relayMode: "aggregate" };
+  catalog.status = "failed";
+  assert.equal(resolve(), "", "失败目录不能用于默认项");
+  catalog.status = "not_applied";
+  catalog.model = catalog.default_model = "unknown";
+  assert.equal(resolve(), "", "配置默认值必须属于当前目录");
+});
+
 it("分组折叠分片在 manifest 里排在模型目录之后、并在组装产物里", async () => {
   const manifest = JSON.parse(await readFile(MANIFEST_URL, "utf8")) as {
     fragments: Array<{ name: string }>;

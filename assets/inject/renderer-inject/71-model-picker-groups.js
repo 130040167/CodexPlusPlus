@@ -420,11 +420,26 @@
     return codexPlusModelPickerRowIdentity(row)?.text || "";
   }
 
+  function codexPlusModelPickerDefaultModel() {
+    const configured = codexPlusConfiguredDefaultModel();
+    if (configured) return configured;
+    // 目录尚未发布时仍可展示配置值；不放宽请求归一化和自动模型迁移的准入。
+    if (codexModelCatalog.status !== "not_applied" || !codexPlusBackendSettingsLoaded) return "";
+    const profile = codexRemoteSessionActiveProfile();
+    if (profile?.relayMode !== "aggregate" || !profile.id
+        || !codexModelCatalog.sources?.some((source) =>
+          source?.id === `aggregate:${profile.id}`
+          && ["aggregate_model_catalog", "aggregate_pool_catalog"].includes(source.type))) return "";
+    const models = new Set(Array.isArray(codexModelCatalog.models) ? codexModelCatalog.models : []);
+    return [codexModelCatalog.model, codexModelCatalog.default_model]
+      .find((model) => typeof model === "string" && models.has(model)) || "";
+  }
+
   function codexPlusModelPickerSelectConfiguredDefault(event) {
     if (event.type === "keydown" && !["Enter", " "].includes(event.key)) return;
     const row = event.target?.closest?.(".codex-plus-model-default-row");
     if (!row || codexPlusModelPickerGroupsState.disposed || row.getAttribute("aria-disabled") === "true") return;
-    const target = codexPlusConfiguredDefaultModel();
+    const target = codexPlusModelPickerDefaultModel();
     if (!target) return;
     const menu = row.closest('[role="menu"]');
     const triggerIds = (menu?.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean);
@@ -434,6 +449,7 @@
     if (!selected || selected.picker.disabled) return;
     event.preventDefault();
     event.stopImmediatePropagation();
+    if (!selected.picker.models.some((entry) => entry?.model === target)) return;
     if (event.repeat) return;
     const { picker } = selected;
     const efforts = modelReasoningEfforts(target);
@@ -453,7 +469,7 @@
   }
 
   function codexPlusModelPickerSyncDefaultRow(list) {
-    const model = codexPlusConfiguredDefaultModel();
+    const model = codexPlusModelPickerDefaultModel();
     if (!model) {
       list.querySelectorAll(".codex-plus-model-default-row").forEach(codexPlusModelPickerRestoreLabel);
       return;
@@ -1109,6 +1125,9 @@
       id: codexPlusModelPickerGroupsState.defaultGroupId,
       resolved: codexPlusModelPickerDefaultGroupId(),
       catalogStatus: codexModelCatalog?.status || "",
+      displayModel: codexPlusModelPickerDefaultModel(),
+      settingsLoaded: codexPlusBackendSettingsLoaded,
+      activeProfileId: codexRemoteSessionActiveProfile()?.id || "",
       catalogModels: codexModelCatalog?.models?.length || 0,
       catalogDefaultId: codexModelCatalog?.codex_plus_default_group_id ?? null,
       metaEntries: codexModelCatalog?.modelMetadata ? Object.keys(codexModelCatalog.modelMetadata).length : 0,

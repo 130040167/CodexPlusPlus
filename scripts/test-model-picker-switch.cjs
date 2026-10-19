@@ -90,6 +90,13 @@ syncCodexConfiguredDefaultModel();
 window.fixture = {
   state:()=>({model:picker.model,effort:picker.reasoningEffort,nativeDefaultCalls,models:picker.models.map(m=>m.model)}),
   selectOther:()=>picker.onSelectModel(beta,"high"),
+  unpublished:()=>{
+    codexModelCatalog.status="not_applied";
+    window.__codexPlusModelPickerGroupsRuntime.scan();
+    return {automaticDefault:codexPlusConfiguredDefaultModel(),allowed:codexAggregateAllowedModelSet("local")};
+  },
+  published:()=>{codexModelCatalog.status="ok";},
+  available:(enabled)=>{picker.models=enabled?[{model:alpha},{model:beta}]:[{model:beta}];},
   changeDefault:(other)=>{
     codexModelCatalog.model=codexModelCatalog.default_model=other?beta:alpha;
     window.__codexPlusModelPickerGroupsRuntime.scan();
@@ -158,6 +165,20 @@ window.__codexPlusModelPickerGroupsRuntime.scan();
     await defaultRow.click();
     await page.evaluate(() => window.fixture.send());
     assert.equal(requests[0].model, "gpt-6.1-sol", "actual HTTP body follows the configured default action");
+    assert.deepEqual(await page.evaluate(() => window.fixture.unpublished()), { automaticDefault: "", allowed: null });
+    assert.equal((await defaultRow.innerText()).replace(/\s+/g, " "), "默认模型 GPT-6.1-Sol");
+    await page.evaluate(() => window.fixture.selectOther());
+    await defaultRow.click();
+    assert.equal(await page.locator("#result").textContent(), "gpt-6.1-sol");
+    assert.equal(await page.evaluate(() => window.fixture.state().nativeDefaultCalls), 0);
+    await page.evaluate(() => { window.fixture.selectOther(); window.fixture.available(false); });
+    await defaultRow.click();
+    assert.equal(await page.locator("#result").textContent(), "cpx-b/gpt-6.1-sol");
+    assert.equal(await page.evaluate(() => window.fixture.state().nativeDefaultCalls), 0,
+      "unavailable configured model must not fall through to stale native default");
+    await page.evaluate(() => window.fixture.available(true));
+    await defaultRow.click();
+    await page.evaluate(() => window.fixture.published());
     fs.mkdirSync(path.join(__dirname, "../output/playwright"), { recursive: true });
     for (const width of [480, 320]) {
       await page.setViewportSize({ width, height: 500 });
