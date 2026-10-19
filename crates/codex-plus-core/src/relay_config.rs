@@ -3251,10 +3251,9 @@ pub fn refresh_active_model_catalog_in_home(
             .filter(|aggregate| aggregate.model_aggregation_enabled)
         {
             let catalog_json = crate::aggregate_catalog::build_catalog_json(settings, &aggregate)?;
-            let catalog_absolute = std::path::absolute(&catalog_path)
-                .context("解析受管模型 catalog 绝对路径失败")?;
+            validate_managed_model_catalog(&catalog_json)?;
             doc["model_catalog_json"] =
-                toml_edit::value(catalog_absolute.to_string_lossy().as_ref());
+                toml_edit::value(managed_catalog_pointer(home, &catalog_relative, &current_config)?);
             pending_catalog = Some((catalog_path.clone(), catalog_json));
         } else if root_key_string(&current_config, "model_catalog_json").is_some_and(|pointer| {
             pointer == catalog_relative

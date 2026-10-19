@@ -3242,12 +3242,6 @@ mod tests {
         assert_eq!(writer.revision().unwrap(), second);
     }
 
-    use super::*;
-    use serde_json::json;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
-
     fn temp_dir() -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "codex-plus-core-settings-test-{}-{}",
