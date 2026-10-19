@@ -1216,7 +1216,7 @@ fn launch_codex_multi_instance_blocking(request: CodexMultiLaunchRequest) -> Com
     );
     let codex_home = root.join("codex-home");
     let sqlite_home = root.join("sqlite-home");
-    let user_data_dir = multi_instance_user_data_dir(&slug);
+    let user_data_dir = multi_instance_user_data_dir(&root, previous.as_ref());
     if let Err(error) = std::fs::create_dir_all(&codex_home)
         .and_then(|_| std::fs::create_dir_all(&sqlite_home))
         .and_then(|_| std::fs::create_dir_all(&user_data_dir))
@@ -1424,6 +1424,7 @@ fn launch_codex_multi_instance_blocking(request: CodexMultiLaunchRequest) -> Com
         .env("HOME", &worker_home)
         .env("CODEX_HOME", &codex_home)
         .env("CODEX_SQLITE_HOME", &sqlite_home)
+        .env("CODEX_ELECTRON_USER_DATA_PATH", &user_data_dir)
         .env("CODEX_PLUS_MULTI_INSTANCE", "1")
         .env("CODEX_PLUS_INSTANCE_ID", &instance_id)
         .env("CODEX_PLUS_INSTANCE_LABEL", &profile.name)
@@ -2102,19 +2103,13 @@ fn multi_instance_slug(value: &str) -> String {
     }
 }
 
-fn multi_instance_user_data_dir(slug: &str) -> PathBuf {
-    directories::BaseDirs::new()
-        .map(|dirs| {
-            dirs.data_local_dir()
-                .join("CodexPlusPlus")
-                .join("multi")
-                .join(slug)
-        })
-        .unwrap_or_else(|| {
-            codex_plus_core::paths::default_app_state_dir()
-                .join("user-data")
-                .join(slug)
-        })
+fn multi_instance_user_data_dir(root: &Path, previous: Option<&CodexMultiInstance>) -> PathBuf {
+    // 已有实例保留原目录；新实例随管理器状态隔离，避免不同状态下的同名实例共用 Electron 数据。
+    previous
+        .and_then(|instance| instance.user_data_dir.as_deref())
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("user-data"))
 }
 
 fn multi_instance_extra_args(args: &[String]) -> Vec<String> {
@@ -11062,6 +11057,19 @@ model_reasoning_effort = "high"
     }
 
     #[test]
+    fn multi_instance_user_data_is_scoped_to_manager_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("manager-a/codex-multi/same-name");
+        let second = temp.path().join("manager-b/codex-multi/same-name");
+        assert_eq!(multi_instance_user_data_dir(&first, None), first.join("user-data"));
+        assert_eq!(multi_instance_user_data_dir(&second, None), second.join("user-data"));
+        assert_ne!(
+            multi_instance_user_data_dir(&first, None),
+            multi_instance_user_data_dir(&second, None)
+        );
+    }
+
+    #[test]
     fn multi_instance_manifest_roundtrips_runtime_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let instance = CodexMultiInstance {
@@ -11096,6 +11104,21 @@ model_reasoning_effort = "high"
                 .unwrap()
                 .debug_port,
             9456
+        );
+        assert_eq!(
+            multi_instance_user_data_dir(temp.path(), Some(&instance)),
+            PathBuf::from("/tmp/user-data")
+        );
+        let mut without_path = instance;
+        without_path.user_data_dir = None;
+        assert_eq!(
+            multi_instance_user_data_dir(temp.path(), Some(&without_path)),
+            temp.path().join("user-data")
+        );
+        without_path.user_data_dir = Some(" ".into());
+        assert_eq!(
+            multi_instance_user_data_dir(temp.path(), Some(&without_path)),
+            temp.path().join("user-data")
         );
     }
 
