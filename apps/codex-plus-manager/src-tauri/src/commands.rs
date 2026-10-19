@@ -4739,7 +4739,9 @@ fn archive_one_local_session(path: &Path, session_id: &str, archived: bool) -> a
     let changed = if has_archived_at {
         transaction.execute(
             "UPDATE threads SET archived = ?1, archived_at = ?2 WHERE id = ?3",
-            rusqlite::params![archived as i64, if archived { Some(current_timestamp_ms() as i64) } else { None }, session_id],
+            // Codex 的 threads.archived_at 与 created_at/updated_at 一样是秒（带 _ms 后缀的列才是毫秒）；
+            // 写毫秒会被解析成远未来的时间。
+            rusqlite::params![archived as i64, if archived { Some((current_timestamp_ms() / 1000) as i64) } else { None }, session_id],
         )?
     } else {
         transaction.execute(
@@ -10443,6 +10445,27 @@ base_url = "https://example.invalid/v1"
         assert!(applied.contains("model_provider = \"ai\""));
         assert!(applied.contains("[model_providers.ai]"));
         assert!(!applied.contains("[model_providers.custom]"));
+    }
+
+    #[test]
+    fn archiving_writes_archived_at_in_seconds_like_codex() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("state_5.sqlite");
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection
+            .execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, archived INTEGER NOT NULL DEFAULT 0, archived_at INTEGER); INSERT INTO threads(id) VALUES('t1');")
+            .unwrap();
+        drop(connection);
+        archive_one_local_session(&db, "t1", true).unwrap();
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        let (archived, archived_at): (i64, i64) = connection
+            .query_row("SELECT archived, archived_at FROM threads WHERE id='t1'", [], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        assert_eq!(archived, 1);
+        assert!((archived_at - now).abs() < 60, "archived_at 必须是秒：{archived_at}");
+        drop(connection);
+        archive_one_local_session(&db, "t1", false).unwrap();
     }
 
     #[test]

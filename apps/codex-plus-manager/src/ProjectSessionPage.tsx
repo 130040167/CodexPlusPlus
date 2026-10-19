@@ -27,9 +27,10 @@ export function ProjectSessionPage({
 }: {
   sessions: SessionPageData | null;
   onRefresh: (offset?: number) => Promise<void>;
-  onDelete: (session: ManagedSession) => Promise<void>;
-  onDeleteMany: (sessions: ManagedSession[]) => Promise<void>;
-  onArchiveMany: (sessions: ManagedSession[], archived?: boolean) => Promise<void>;
+  onDelete: (session: ManagedSession) => Promise<boolean | void>;
+  // 返回 false 表示用户取消或没有执行，此时保留当前选择。
+  onDeleteMany: (sessions: ManagedSession[]) => Promise<boolean | void>;
+  onArchiveMany: (sessions: ManagedSession[], archived?: boolean) => Promise<boolean | void>;
   onListProjectSessions: (cwd: string) => Promise<ManagedSession[]>;
   repairPanel?: ReactNode;
 }) {
@@ -70,13 +71,23 @@ export function ProjectSessionPage({
   };
   const deleteSelected = async () => {
     if (!selectedRows.length) return;
-    await onDeleteMany(selectedRows);
-    setSelected(new Map());
+    if ((await onDeleteMany(selectedRows)) !== false) setSelected(new Map());
   };
   const archiveSelected = async () => {
     if (!selectedRows.length) return;
-    await onArchiveMany(selectedRows, true);
-    setSelected(new Map());
+    if ((await onArchiveMany(selectedRows, true)) !== false) setSelected(new Map());
+  };
+  // 选择可以跨分页（整项目选择），不能按当前页修剪；单删成功的会话要移出选择，
+  // 否则随后的批量操作会把已删除的会话再提交一次并报失败。
+  const deleteOne = async (session: ManagedSession) => {
+    if ((await onDelete(session)) === true) {
+      setSelected((old) => {
+        if (!old.has(session.id)) return old;
+        const next = new Map(old);
+        next.delete(session.id);
+        return next;
+      });
+    }
   };
   const pageSize = sessions?.limit || 50;
   const page = sessions ? Math.floor(sessions.offset / pageSize) + 1 : 0;
@@ -116,7 +127,7 @@ export function ProjectSessionPage({
             <div className="mg-session-check">{selection ? <input type="checkbox" checked={selected.has(session.id)} onChange={() => toggle(session)} /> : null}</div>
             <button type="button" className="mg-session-main" onClick={() => setDetail(session)}><strong>{session.title || t("未命名会话")}</strong><small>{session.cwd || t("未记录项目路径")}</small><code>{session.id}</code></button>
             <div className="mg-session-meta"><span>{session.modelProvider || "Codex"}</span><time>{session.updatedAtMs ? new Date(session.updatedAtMs).toLocaleString() : t("未知时间")}</time></div>
-            <div className="mg-row-actions"><button type="button" className="mg-icon-button" onClick={() => void onDelete(session)} aria-label={t("删除会话")}><Trash2 size={15} /></button></div>
+            <div className="mg-row-actions"><button type="button" className="mg-icon-button" onClick={() => void deleteOne(session)} aria-label={t("删除会话")}><Trash2 size={15} /></button></div>
           </article>)}
         </section>;
       })}
@@ -126,6 +137,6 @@ export function ProjectSessionPage({
       <span>{sessions ? tf("第 {0} 页 · 共 {1} 个会话", [page, sessions.totalCount]) : "—"}</span>
       <Button onClick={() => void onRefresh((sessions?.offset || 0) + pageSize)} disabled={!sessions?.hasMore}><ArrowRight size={14} />{t("下一页")}</Button>
     </div>
-    {detail ? <ManagementDrawer title={detail.title || t("未命名会话")} onClose={() => setDetail(null)} footer={<><Button onClick={() => navigator.clipboard.writeText(detail.id)}><Copy size={14} />{t("复制会话 ID")}</Button><Button primary onClick={() => void onDelete(detail)}><Trash2 size={14} />{t("删除会话")}</Button></>}><dl className="mg-detail"><dt>{t("项目目录")}</dt><dd>{detail.cwd || "—"}</dd><dt>{t("模型供应商")}</dt><dd>{detail.modelProvider || "Codex"}</dd><dt>{t("数据库")}</dt><dd>{detail.dbPath || "—"}</dd></dl></ManagementDrawer> : null}
+    {detail ? <ManagementDrawer title={detail.title || t("未命名会话")} onClose={() => setDetail(null)} footer={<><Button onClick={() => navigator.clipboard.writeText(detail.id)}><Copy size={14} />{t("复制会话 ID")}</Button><Button primary onClick={() => void deleteOne(detail)}><Trash2 size={14} />{t("删除会话")}</Button></>}><dl className="mg-detail"><dt>{t("项目目录")}</dt><dd>{detail.cwd || "—"}</dd><dt>{t("模型供应商")}</dt><dd>{detail.modelProvider || "Codex"}</dd><dt>{t("数据库")}</dt><dd>{detail.dbPath || "—"}</dd></dl></ManagementDrawer> : null}
   </div>;
 }

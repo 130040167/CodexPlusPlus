@@ -2112,19 +2112,20 @@ export function App() {
   const deleteLocalSession = async (session: LocalSession) => {
     const title = session.title || session.id;
     const confirmed = await confirmSessionDelete(t("删除会话"), tf("删除会话“{0}”？此操作会删除本地数据库记录和 rollout 文件，并创建备份。", [title]));
-    if (!confirmed) return;
+    if (!confirmed) return false;
     const result = await run(() => requestDeleteLocalSession(session));
     if (result) {
       showResultNotice(t("会话删除"), result);
       await refreshLocalSessions(true, localSessions?.offset ?? 0);
     }
+    return !!result && isSuccessStatus(result.status);
   };
 
   const deleteLocalSessions = async (sessions: LocalSession[]) => {
     const uniqueSessions = Array.from(new Map(sessions.map((session) => [session.id, session])).values());
     if (!uniqueSessions.length) {
       showNotice(t("批量删除会话"), t("请先选择要删除的会话。"), "failed");
-      return;
+      return false;
     }
     const preview = uniqueSessions
       .slice(0, 6)
@@ -2135,7 +2136,7 @@ export function App() {
       t("批量删除会话"),
       tf("删除选中的 {0} 个会话？此操作会删除本地数据库记录和 rollout 文件，并为每个会话创建备份。\n\n{1}{2}", [uniqueSessions.length, preview, extraCount]),
     );
-    if (!confirmed) return;
+    if (!confirmed) return false;
 
     let succeeded = 0;
     const failed: string[] = [];
@@ -2158,21 +2159,23 @@ export function App() {
       showNotice(t("批量删除会话"), tf("已删除 {0} 个会话。", [succeeded]), "ok");
     }
     await refreshLocalSessions(true, localSessions?.offset ?? 0);
+    return true;
   };
 
   const archiveLocalSessions = async (sessions: LocalSession[], archived = true) => {
     const uniqueSessions = Array.from(new Map(sessions.map((session) => [session.id, session])).values());
-    if (!uniqueSessions.length) return;
+    if (!uniqueSessions.length) return false;
     const confirmed = await confirmSessionDelete(
       archived ? t("归档会话") : t("取消归档会话"),
       tf("{0} 个会话？这只更新本地归档状态，不删除 rollout 文件。", [uniqueSessions.length]),
     );
-    if (!confirmed) return;
+    if (!confirmed) return false;
     const result = await run(() => call<CommandResult<{ succeeded: number; failed: number }>>("archive_local_sessions", {
       request: { sessions: uniqueSessions, archived },
     }));
     if (result) showNotice(archived ? t("归档会话") : t("取消归档会话"), result.message, result.status);
     await refreshLocalSessions(true, localSessions?.offset ?? 0);
+    return true;
   };
 
   const refreshLiveContextEntries = async (silent = false) => {
@@ -4438,9 +4441,10 @@ type Actions = {
   deleteUserScript: (key: string) => Promise<void>;
   refreshLocalSessions: (silent?: boolean, offset?: number) => Promise<LocalSessionsResult | null>;
   listProjectSessions: (cwd: string) => Promise<LocalSession[]>;
-  deleteLocalSession: (session: LocalSession) => Promise<void>;
-  deleteLocalSessions: (sessions: LocalSession[]) => Promise<void>;
-  archiveLocalSessions: (sessions: LocalSession[], archived?: boolean) => Promise<void>;
+  // 返回是否真正执行（用户取消时为 false），调用方据此决定是否清空选择。
+  deleteLocalSession: (session: LocalSession) => Promise<boolean>;
+  deleteLocalSessions: (sessions: LocalSession[]) => Promise<boolean>;
+  archiveLocalSessions: (sessions: LocalSession[], archived?: boolean) => Promise<boolean>;
   openExternalUrl: (url: string) => Promise<void>;
   applyRelayInjection: () => Promise<boolean>;
   applyPureApiInjection: () => Promise<boolean>;
@@ -5873,6 +5877,11 @@ type GlobalDictationHotkeyState = {
   enabled: boolean;
   hotkey: string;
 };
+// 后端失败分支的 payload 是 `{}`：只在确实带有热键字段时才当作新状态。
+function hotkeyStateFrom(result: Partial<GlobalDictationHotkeyState> | null | undefined): GlobalDictationHotkeyState | null {
+  if (!result || typeof result.hotkey !== "string") return null;
+  return { enabled: result.enabled === true, hotkey: result.hotkey };
+}
 
 function DictationSettingsPanel({ form, onFormChange }: {
   form: BackendSettings;
@@ -5887,7 +5896,7 @@ function DictationSettingsPanel({ form, onFormChange }: {
   const [globalHotkeyBusy, setGlobalHotkeyBusy] = useState(false);
   useEffect(() => {
     void invoke<CommandResult<GlobalDictationHotkeyState>>("load_global_dictation_hotkey")
-      .then((result) => { if (result) setGlobalHotkey(result); })
+      .then((result) => { const next = hotkeyStateFrom(result); if (next) setGlobalHotkey(next); })
       .catch(() => {});
   }, []);
   useEffect(() => {
@@ -5918,7 +5927,9 @@ function DictationSettingsPanel({ form, onFormChange }: {
     setGlobalHotkeyBusy(true);
     try {
       const result = await invoke<CommandResult<GlobalDictationHotkeyState>>("set_global_dictation_hotkey", globalHotkey);
-      if (result) setGlobalHotkey(result);
+      // 校验/保存失败时后端 payload 为空对象，不能用它覆盖用户刚输入的热键。
+      const next = hotkeyStateFrom(result);
+      if (next) setGlobalHotkey(next);
       window.alert(result.message);
     } catch (error) {
       window.alert(String(error));
