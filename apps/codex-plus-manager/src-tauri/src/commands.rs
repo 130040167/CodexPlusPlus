@@ -6697,7 +6697,9 @@ pub fn read_relay_files() -> CommandResult<RelayFilesPayload> {
 
 #[tauri::command]
 pub fn check_env_conflicts() -> CommandResult<EnvConflictsPayload> {
-    let conflicts = codex_plus_core::env_conflicts::detect_env_conflicts();
+    let conflicts = codex_plus_core::env_conflicts::detect_env_conflicts_for_home(
+        &codex_plus_core::relay_config::default_codex_home_dir(),
+    );
     let message = if conflicts.is_empty() {
         "未检测到会覆盖 Codex 供应商配置的 OPENAI 环境变量。"
     } else {
@@ -6724,7 +6726,9 @@ pub fn remove_env_conflicts(
     let backup_dir = codex_plus_core::paths::default_app_state_dir().join("backups");
     match codex_plus_core::env_conflicts::remove_env_conflicts(&request.names, backup_dir) {
         Ok(result) => {
-            let remaining = codex_plus_core::env_conflicts::detect_env_conflicts();
+            let remaining = codex_plus_core::env_conflicts::detect_env_conflicts_for_home(
+                &codex_plus_core::relay_config::default_codex_home_dir(),
+            );
             ok(
                 "环境变量已按确认项删除；重新启动 Codex 后生效。",
                 RemoveEnvConflictsPayload {
@@ -6739,7 +6743,9 @@ pub fn remove_env_conflicts(
             RemoveEnvConflictsPayload {
                 removed: Vec::new(),
                 backup_path: None,
-                remaining: codex_plus_core::env_conflicts::detect_env_conflicts(),
+                remaining: codex_plus_core::env_conflicts::detect_env_conflicts_for_home(
+                    &codex_plus_core::relay_config::default_codex_home_dir(),
+                ),
             },
         ),
     }

@@ -4707,6 +4707,26 @@ fn merge_proxy_key_into_auth_json(source: &str, bearer_token: &str) -> Option<St
         .map(|text| format!("{text}\n"))
 }
 
+/// 当前 live 配置里实际生效的 API 凭据：`auth.json` 的 `OPENAI_API_KEY` 与
+/// 当前 provider 的 `experimental_bearer_token`。读不到或解析失败时返回空列表。
+pub fn active_api_credentials_in_home(home: &Path) -> Vec<String> {
+    let mut credentials = Vec::new();
+    if let Ok(auth) = read_optional_text(&home.join("auth.json"))
+        && let Some(key) = codex_auth_api_key(&auth)
+    {
+        credentials.push(key);
+    }
+    if let Ok(config) = read_optional_text(&home.join("config.toml"))
+        && let Ok(Some(token)) = experimental_bearer_token_from_config(&config)
+    {
+        let token = token.trim().to_string();
+        if !token.is_empty() && !credentials.contains(&token) {
+            credentials.push(token);
+        }
+    }
+    credentials
+}
+
 fn codex_auth_api_key(auth_contents: &str) -> Option<String> {
     let auth: Value = serde_json::from_str(auth_contents).ok()?;
     auth.get("OPENAI_API_KEY")
