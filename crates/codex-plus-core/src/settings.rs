@@ -2905,6 +2905,25 @@ fn temp_path_for(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn settings_revision_observes_another_store_without_exposing_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let writer = super::SettingsStore::new(path.clone());
+        let reader = super::SettingsStore::new(path);
+        assert_eq!(reader.revision().unwrap(), "");
+        let mut settings = super::BackendSettings::default();
+        writer.save(&settings).unwrap();
+        let first = reader.revision().unwrap();
+        assert!(!first.is_empty());
+        settings.relay_profiles[0].name = "fixture-private-value".to_string();
+        writer.save(&settings).unwrap();
+        let second = reader.revision().unwrap();
+        assert_ne!(first, second);
+        assert!(!second.contains("fixture-private-value"));
+        assert_eq!(writer.revision().unwrap(), second);
+    }
+
     use super::*;
     use serde_json::json;
     use std::sync::atomic::{AtomicU64, Ordering};
