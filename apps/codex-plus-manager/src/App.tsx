@@ -159,6 +159,7 @@ import {
 import { relaySettingsSaveRestartReason, relaySettingsSaveCapabilityProfileNames, type RelaySaveRestartReason, type RelaySaveChoice } from "./relay-save";
 import {
   mergeModelWindowRows,
+  normalizeModelWindowInput,
   modelWindowRowsFromProfile,
   modelWindowRowsValidationError,
   serializeModelWindowRows,
@@ -10294,9 +10295,10 @@ function RelayProfileEditor({
                           </div>
                           <div className="relay-model-cell relay-model-cell-window">
                             <span className="relay-model-cell-label">{t("上下文窗口")}</span>
-                            <Input
+                            <ModelWindowInput
                               aria-label={t("上下文窗口")}
                               value={row.window}
+                              onBlur={() => updateModelWindowRow(index, { window: normalizeModelWindowInput(row.window) })}
                               onChange={(event) => {
                                 const window = event.currentTarget.value;
                                 updateModelWindowRow(index, { window });
@@ -13300,6 +13302,16 @@ function Field({ label, children, className = "" }: { label: string; children: R
       {children}
     </Label>
   );
+}
+
+function ModelWindowInput(props: React.ComponentProps<typeof Input>) {
+  const [editing, setEditing] = useState(false);
+  const value = String(props.value ?? "");
+  const normalized = normalizeModelWindowInput(value);
+  const display = /^\d+$/.test(normalized) ? normalized.replace(/\B(?=(\d{3})+(?!\d))/g, ",") : value;
+  return <Input {...props} value={editing ? value : display}
+    onFocus={(event) => { setEditing(true); props.onFocus?.(event); }}
+    onBlur={(event) => { setEditing(false); props.onBlur?.(event); }} />;
 }
 
 function ModelNameInput({
