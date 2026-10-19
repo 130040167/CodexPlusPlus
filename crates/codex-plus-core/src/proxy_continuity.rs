@@ -203,13 +203,17 @@ impl ProxyEndpoints {
         anyhow::ensure!(port > 0, "cannot remember an unbound proxy port");
         if let Ok(contents) = std::fs::read(&self.path) {
             // 新版本格式不能被旧程序覆盖；损坏文件则保留现场后从副本恢复。
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&contents) {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&contents)
+                && let Some(version) = value["version"].as_u64()
+            {
                 anyhow::ensure!(
-                    value["version"].as_u64() == Some(1),
+                    version <= 1,
                     "unsupported proxy endpoint history version"
                 );
             }
-            if serde_json::from_slice::<History>(&contents).is_err() {
+            if !serde_json::from_slice::<History>(&contents)
+                .is_ok_and(|history| history.version == 1)
+            {
                 let stamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)?
                     .as_nanos();
@@ -354,6 +358,37 @@ mod tests {
                 .contains("invalid")
                 && std::fs::read(path).unwrap() == b"interrupted write"
         }));
+    }
+
+    #[test]
+    fn continuity_repairs_valid_json_corruption_from_backup_and_remembers_new_ports() {
+        for contents in [
+            "{}",
+            "null",
+            r#"{"version":null}"#,
+            r#"{"version":"damaged","homes":[]}"#,
+            r#"{"version":1,"homes":"damaged"}"#,
+            r#"{"version":0,"homes":[]}"#,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let endpoints = ProxyEndpoints::new(temp.path().into(), home.clone(), false);
+            endpoints.remember(41001).unwrap();
+            std::fs::write(&endpoints.path, contents).unwrap();
+            assert_eq!(endpoints.ports().unwrap(), BTreeSet::from([41001]));
+            endpoints.remember(41002).unwrap();
+            let restarted = ProxyEndpoints::new(temp.path().into(), home, false);
+            assert_eq!(restarted.ports().unwrap(), BTreeSet::from([41001, 41002]));
+            assert_eq!(
+                ProxyEndpoints::read_history(&restarted.backup_path()).unwrap().version,
+                1
+            );
+            assert!(std::fs::read_dir(temp.path()).unwrap().any(|entry| {
+                let path = entry.unwrap().path();
+                path.file_name().unwrap().to_string_lossy().contains("invalid-")
+                    && std::fs::read(path).unwrap() == contents.as_bytes()
+            }));
+        }
     }
 
     #[test]
