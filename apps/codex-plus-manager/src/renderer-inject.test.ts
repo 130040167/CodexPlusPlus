@@ -10,6 +10,7 @@ describe("session more menu lifecycle", () => {
     const menus: ReturnType<typeof fixture>[] = [];
     const timers = new Map<number, () => void>();
     let timerId = 0;
+    let menuQueries = 0;
     const events = () => {
       const listeners = new Map<string, () => void>();
       return {
@@ -21,23 +22,36 @@ describe("session more menu lifecycle", () => {
     function fixture() {
       const classes = new Set(["codex-session-more-open"]);
       const button = { expanded: "true", setAttribute: (_: string, value: string) => { button.expanded = value; } };
-      const group = { ...events(), isConnected: true, querySelector: () => button, matches: () => false };
-      const row = { isConnected: true, contains: (node: unknown) => node === group, classList: { remove: (name: string) => classes.delete(name) } };
+      const deleteButton = { dataset: { codexDeleteVersion: "7" } };
+      const group = {
+        ...events(), isConnected: true, hasDelete: true, dataset: { codexActionGroupVersion: "7" },
+        __codexSessionMoreMenu: null as unknown,
+        querySelector: (selector: string) => selector === ".more-button" ? button
+          : selector === ".delete-button" && group.hasDelete ? deleteButton : null,
+        matches: () => false, remove: () => { group.isConnected = false; },
+      };
+      const row = {
+        isConnected: true, dataset: {}, querySelectorAll: () => [group],
+        contains: (node: unknown) => node === group, classList: { remove: (name: string) => classes.delete(name) },
+      };
       const menu = {
-        ...events(), hidden: false, removed: false, classes, row, group, button,
+        ...events(), hidden: false, removed: false, isConnected: true, classes, row, group, button,
         __codexSessionMoreRow: row as typeof row | null,
         __codexSessionMoreGroup: group as typeof group | null,
         __codexSessionMoreCleanup: null as (() => void) | null,
-        remove: () => { menu.removed = true; },
+        remove: () => { menu.removed = true; menu.isConnected = false; },
         matches: () => false, contains: () => false,
       };
+      group.__codexSessionMoreMenu = menu;
       return menu;
     }
-    const api = new Function("document", "window", "moreMenuClass", "moreButtonClass",
+    const api = new Function("document", "window", "codexPlusSettings", "codexPlusBackendSettings",
+      "moreMenuClass", "moreButtonClass", "buttonClass", "actionGroupClass", "exportButtonClass",
+      "codexDeleteVersion", "codexActionGroupVersion", "actionGroupFromRow", "sessionRefFromRow",
       `${source.split("  function tryAttachButton(row)")[0]}
-       return { pruneSessionMoreMenus, closeSessionMoreMenus, installSessionMoreMenuAutoClose };`,
+       return { pruneSessionMoreMenus, pruneRemovedSessionActions, attachButton, closeSessionMoreMenus, installSessionMoreMenuAutoClose };`,
     )(
-      { querySelectorAll: () => menus.filter((menu) => !menu.removed), activeElement: null },
+      { querySelectorAll: () => { menuQueries++; return menus.filter((menu) => !menu.removed); }, activeElement: null },
       {
         setTimeout: (callback: () => void) => {
           const id = ++timerId;
@@ -46,10 +60,12 @@ describe("session more menu lifecycle", () => {
         },
         clearTimeout: (id: number) => timers.delete(id),
       },
-      "codex-session-more-menu", "codex-session-more-button",
+      () => ({ sessionDelete: true, markdownExport: true }), { enhancementsEnabled: true },
+      "more-menu", "more-button", "delete-button", "actions", "export-button", "7", "7",
+      (row: { querySelectorAll: () => unknown[] }) => row.querySelectorAll()[0], () => ({}),
     );
     return {
-      ...api, timers,
+      ...api, timers, menuQueries: () => menuQueries,
       fixture: () => {
         const menu = fixture();
         menus.push(menu);
@@ -80,9 +96,60 @@ describe("session more menu lifecycle", () => {
       assert.equal(menu.classes.has("codex-session-more-open"), false);
       assert.equal(menu.__codexSessionMoreRow, null);
       assert.equal(menu.__codexSessionMoreGroup, null);
+      assert.equal(menu.group.__codexSessionMoreMenu, null);
     }
     assert.equal(api.pruneSessionMoreMenus(), false);
     assert.equal(live.removed, false);
+  });
+
+  it("only reuses action groups with a connected menu owned by the same row and group", async () => {
+    const api = await runtime();
+    const live = api.fixture();
+    api.attachButton(live.row);
+    assert.equal(live.group.isConnected, true);
+    for (const damage of ["disposed", "menu-removed", "different-owner", "different-group"]) {
+      const menu = api.fixture();
+      if (damage === "disposed") {
+        menu.row.isConnected = false;
+        api.pruneSessionMoreMenus();
+        menu.row.isConnected = true;
+      } else if (damage === "menu-removed") menu.isConnected = false;
+      else if (damage === "different-owner") menu.__codexSessionMoreRow = live.row;
+      else menu.__codexSessionMoreGroup = live.group;
+      api.attachButton(menu.row);
+      assert.equal(menu.group.isConnected, false, `${damage} must rebuild the retained group`);
+    }
+  });
+
+  it("requests repair for a missing delete button but leaves complete action groups alone", async () => {
+    const api = await runtime();
+    const menu = api.fixture();
+    assert.equal(api.pruneSessionMoreMenus(), false);
+    menu.group.hasDelete = false;
+    assert.equal(api.pruneSessionMoreMenus(), true);
+    assert.equal(menu.removed, true);
+    assert.equal(api.pruneSessionMoreMenus(), false);
+  });
+
+  it("ignores unrelated removals and checks action ancestors and removed body menus", async () => {
+    const api = await runtime();
+    const menu = api.fixture();
+    const node = (matches: boolean, descendant: boolean) => ({
+      nodeType: 1, matches: () => matches, querySelector: () => descendant ? {} : null,
+      querySelectorAll: () => [],
+    });
+    for (let i = 0; i < 200; i++) api.pruneRemovedSessionActions([{ removedNodes: [node(false, false)] }]);
+    assert.equal(api.menuQueries(), 0, "streamed prose must not sweep body menus");
+    assert.equal(api.pruneRemovedSessionActions([{ removedNodes: [node(false, true)] }]), false);
+    assert.equal(api.menuQueries(), 1, "a synchronous move still checks final owner state");
+    menu.row.isConnected = false;
+    api.pruneRemovedSessionActions([{ removedNodes: [node(false, true)] }]);
+    assert.equal(menu.removed, true, "sidebar ancestor removal must release owner references");
+    const removed = api.fixture();
+    removed.remove();
+    Object.assign(removed, node(true, false));
+    assert.equal(api.pruneRemovedSessionActions([{ removedNodes: [removed] }]), true);
+    assert.equal(removed.__codexSessionMoreRow, null, "body menu removal must also be disposed");
   });
 
   it("resets expansion state when another menu opens or all menus close", async () => {
@@ -125,9 +192,11 @@ describe("session more menu lifecycle", () => {
     let pruned = 0;
     let relevanceChecks = 0;
     const window = { __codexSessionDeleteScanPending: true };
-    const scheduleScan = new Function("window", "document", "pruneSessionMoreMenus", "shouldScheduleScan",
+    const scheduleScan = new Function("window", "document", "pruneRemovedSessionActions", "shouldScheduleScan",
       `${source}\nreturn scheduleScan;`,
-    )(window, { hidden: true }, () => { pruned++; }, () => { relevanceChecks++; return false; });
+    )(window, { hidden: true }, (mutations: Array<{ removedNodes: Array<{ nodeType: number }> }>) => {
+      if (mutations.some((mutation) => mutation.removedNodes.some((node) => node.nodeType === 1))) pruned++;
+    }, () => { relevanceChecks++; return false; });
     scheduleScan([{ removedNodes: [{ nodeType: 1 }] }]);
     assert.equal(pruned, 1);
     assert.equal(relevanceChecks, 0);
@@ -151,7 +220,7 @@ describe("session more menu lifecycle", () => {
     const window = { __codexSessionDeleteScanPending: false };
     const timers: Array<() => void> = [];
     let needsScan = true;
-    const scheduleScan = new Function("window", "document", "pruneSessionMoreMenus", "shouldScheduleScan",
+    const scheduleScan = new Function("window", "document", "pruneRemovedSessionActions", "shouldScheduleScan",
       "setTimeout", "runScheduledScan", `${source}\nreturn scheduleScan;`,
     )(window, { hidden: false }, () => needsScan, () => false,
       (callback: () => void) => { timers.push(callback); return timers.length; },

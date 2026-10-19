@@ -21,25 +21,47 @@
   function disposeSessionMoreMenu(menu) {
     closeSessionMoreMenu(menu);
     menu.__codexSessionMoreCleanup?.();
+    const group = menu.__codexSessionMoreGroup;
+    if (group?.__codexSessionMoreMenu === menu) group.__codexSessionMoreMenu = null;
     menu.__codexSessionMoreCleanup = null;
     menu.__codexSessionMoreRow = null;
     menu.__codexSessionMoreGroup = null;
     menu.remove();
   }
 
-  function pruneSessionMoreMenus() {
+  function pruneSessionMoreMenus(removedMenus = []) {
     let needsScan = false;
+    const needsDelete = codexPlusSettings().sessionDelete;
     // 菜单挂在 body 下，不会随 React 会话行一起卸载；复用现有观察器及时释放。
-    document.querySelectorAll(`.${moreMenuClass}`).forEach((menu) => {
+    const menus = new Set([...document.querySelectorAll(`.${moreMenuClass}`), ...removedMenus]);
+    menus.forEach((menu) => {
       const row = menu.__codexSessionMoreRow;
       const group = menu.__codexSessionMoreGroup;
-      if (!row?.isConnected || !group?.isConnected || !row.contains(group)
-          || !group.querySelector(`.${moreButtonClass}`)) {
+      if (!menu.isConnected || !row?.isConnected || !group?.isConnected || !row.contains(group)
+          || !group.querySelector(`.${moreButtonClass}`)
+          || (needsDelete && !group.querySelector(`.${buttonClass}`))) {
         if (row?.isConnected) needsScan = true;
         disposeSessionMoreMenu(menu);
       }
     });
     return needsScan;
+  }
+
+  function pruneRemovedSessionActions(mutations) {
+    let relevantRemoval = false;
+    const removedMenus = new Set();
+    const menuSelector = `.${moreMenuClass}`;
+    const actionSelector = `.${actionGroupClass}, .${moreButtonClass}, .${buttonClass}, ${menuSelector}`;
+    for (const mutation of mutations || []) {
+      for (const node of mutation.removedNodes) {
+        if (node.nodeType !== 1 || (!node.matches(actionSelector) && !node.querySelector(actionSelector))) continue;
+        relevantRemoval = true;
+        if (node.matches(menuSelector)) removedMenus.add(node);
+        node.querySelectorAll(menuSelector).forEach((menu) => removedMenus.add(menu));
+      }
+    }
+    // 同步移动和按钮克隆替换在观察器回调前已完成，只依据最终连接状态判断。
+    return relevantRemoval && pruneSessionMoreMenus(removedMenus);
   }
 
   function stopActionButtonEvent(row, button, event) {
@@ -222,7 +244,10 @@
     const missingMore = needsMoreMenu && !existingMoreButton;
     const deleteReady = !settings.sessionDelete || existingDeleteButton?.dataset.codexDeleteVersion === codexDeleteVersion;
     const groupReady = existingGroup?.dataset.codexActionGroupVersion === codexActionGroupVersion;
-    if (groupReady && deleteReady && !hasUnexpectedDelete && !hasUnexpectedMore && !hasUnexpectedExport && !missingDelete && !missingMore) {
+    const existingMenu = existingGroup?.__codexSessionMoreMenu;
+    const menuReady = !needsMoreMenu || (existingMenu?.isConnected
+      && existingMenu.__codexSessionMoreRow === row && existingMenu.__codexSessionMoreGroup === existingGroup);
+    if (groupReady && deleteReady && menuReady && !hasUnexpectedDelete && !hasUnexpectedMore && !hasUnexpectedExport && !missingDelete && !missingMore) {
       return;
     }
     removeActionGroups(row);
@@ -280,6 +305,7 @@
       group.appendChild(moreButton);
       moreMenu.__codexSessionMoreRow = row;
       moreMenu.__codexSessionMoreGroup = group;
+      group.__codexSessionMoreMenu = moreMenu;
       document.body.appendChild(moreMenu);
       installSessionMoreMenuAutoClose(row, moreMenu);
     }
