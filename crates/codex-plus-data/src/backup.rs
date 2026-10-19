@@ -9,6 +9,9 @@ use uuid::Uuid;
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
+/// 备份根目录最多保留的份数。被删除会话的撤销入口是一次性的，旧备份只占磁盘。
+const RETAINED_BACKUP_MANIFESTS: usize = 10;
+
 #[derive(Debug, Clone)]
 pub struct BackupStore {
     root: PathBuf,
@@ -155,7 +158,54 @@ impl BackupStore {
         )?;
         pending.committed = true;
         File::open(self.path_for(&token))?.sync_all()?;
+        // 删除会话的撤销只发生在删除之后，旧备份没有长期价值；但历史上这里
+        // 从不清理，单份会话备份含全部消息时可以到 GB 级（issue #2544）。
+        // 清理失败不影响本次备份：调用方已拿到可用 token。
+        let _ = self.prune_retained_backups();
         Ok((token, entries))
+    }
+
+    /// 只保留最近 [`RETAINED_BACKUP_MANIFESTS`] 份备份（manifest + blob 目录）。
+    ///
+    /// 备份根目录是 Codex++ 独占的私有目录，但仍然逐条删除而不 `remove_dir_all`：
+    /// 目录里若混入了用户或其它工具放的条目，不应连带删除。
+    fn prune_retained_backups(&self) -> anyhow::Result<()> {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return Ok(());
+        };
+        let mut manifests: Vec<(SystemTime, String)> = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let file_type = entry.file_type().ok()?;
+                if !file_type.is_file() || file_type.is_symlink() {
+                    return None;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                let token = name.strip_suffix(".json")?;
+                if token.is_empty()
+                    || !token
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+                {
+                    return None;
+                }
+                let modified = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .unwrap_or(UNIX_EPOCH);
+                Some((modified, token.to_string()))
+            })
+            .collect();
+        if manifests.len() <= RETAINED_BACKUP_MANIFESTS {
+            return Ok(());
+        }
+        manifests.sort_by(|left, right| right.0.cmp(&left.0));
+        for (_, token) in manifests.into_iter().skip(RETAINED_BACKUP_MANIFESTS) {
+            let _ = fs::remove_file(self.path_for(&token));
+            remove_backup_blob_directory(&self.root, &token);
+        }
+        Ok(())
     }
 
     pub fn read_backup(&self, token: &str) -> anyhow::Result<Value> {
@@ -386,6 +436,25 @@ fn hash_file(path: &Path) -> anyhow::Result<(u64, String)> {
     copy_hashed(&mut File::open(path)?, &mut std::io::sink(), u64::MAX)
 }
 
+/// 删除某份备份的 blob 目录。逐条删除、不递归到符号链接目标。
+fn remove_backup_blob_directory(root: &Path, token: &str) {
+    let directory = root.join(format!("{token}.files"));
+    let Ok(metadata) = fs::symlink_metadata(&directory) else {
+        return;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return;
+    }
+    if let Ok(entries) = fs::read_dir(&directory) {
+        for entry in entries.filter_map(Result::ok) {
+            if entry.file_type().is_ok_and(|file_type| file_type.is_file()) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    let _ = fs::remove_dir(&directory);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,5 +538,50 @@ mod tests {
             assert!(path.is_dir());
             assert_eq!(fs::read_dir(path).unwrap().count(), 0);
         }
+    }
+
+    #[test]
+    fn old_backups_are_pruned_after_the_retention_limit() {
+        // issue #2544：删除会话的备份从不清理，长期使用后目录可达 GB 级。
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("backups");
+        let store = BackupStore::new(&root);
+        let source = temp.path().join("rollout.jsonl");
+        fs::write(&source, b"synthetic rollout").unwrap();
+        let total = RETAINED_BACKUP_MANIFESTS + 2;
+        let mut tokens = Vec::new();
+        for _ in 0..total {
+            let (token, _) = store
+                .write_backup_with_files(
+                    "fixture",
+                    Path::new("fake.db"),
+                    json!({}),
+                    &[BackupFileSource {
+                        path: source.clone(),
+                        original_path: source.to_string_lossy().into(),
+                    }],
+                )
+                .unwrap();
+            tokens.push(token);
+            // 保留顺序按 mtime 判定，写太快会同毫秒。
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let manifests = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .count();
+        assert_eq!(manifests, RETAINED_BACKUP_MANIFESTS, "备份份数未收敛");
+        let newest = tokens.last().unwrap();
+        assert!(store.path_for(newest).exists(), "最新备份必须保留");
+        assert!(
+            !store.path_for(&tokens[0]).exists(),
+            "最旧备份应被清理"
+        );
+        assert!(
+            !root.join(format!("{}.files", tokens[0])).exists(),
+            "最旧备份的 blob 目录也应清理"
+        );
+        assert!(root.join(format!("{newest}.files")).is_dir(), "最新 blob 目录必须保留");
     }
 }
