@@ -2417,6 +2417,7 @@ async fn handle_protocol_proxy_connection(
             upstream.take_response()?,
             upstream.wire_api,
             request_json.as_ref(),
+            session_headers.thread_id,
         )
         .await?;
         if let Some(reason) = failure {
@@ -3024,6 +3025,7 @@ async fn forward_protocol_proxy_stream(
     response: reqwest::Response,
     wire_api: crate::protocol_proxy::UpstreamWireApi,
     request: Option<&Value>,
+    thread_id: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
     let mut chunks = response.bytes_stream();
     if wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
@@ -3115,7 +3117,17 @@ async fn forward_protocol_proxy_stream(
         return Ok(Some("上游缺少完成事件".to_string()));
     }
     stream.write_all(&converter.finish()).await?;
+    record_chat_converter_usage(thread_id, &converter);
     Ok(None)
+}
+
+fn record_chat_converter_usage(
+    thread_id: Option<&str>,
+    converter: &crate::protocol_proxy::ChatSseToResponsesConverter,
+) {
+    if let Some(usage) = converter.latest_usage() {
+        crate::context_usage::record_usage(thread_id, converter.model(), usage);
+    }
 }
 
 fn log_helper_response(
@@ -6352,7 +6364,7 @@ mod proxy_stream_tests {
             .unwrap();
         let (mut writer, _) = downstream.accept().await.unwrap();
         let forwarded = tokio::spawn(async move {
-            let result = forward_protocol_proxy_stream(&mut writer, response, wire, None)
+            let result = forward_protocol_proxy_stream(&mut writer, response, wire, None, None)
                 .await
                 .unwrap();
             writer.shutdown().await.unwrap();
@@ -6544,7 +6556,13 @@ mod proxy_stream_tests {
 
         let forwarded = timeout(
             Duration::from_secs(20),
-            forward_protocol_proxy_stream(&mut writer, response, UpstreamWireApi::Responses, None),
+            forward_protocol_proxy_stream(
+                &mut writer,
+                response,
+                UpstreamWireApi::Responses,
+                None,
+                None,
+            ),
         )
         .await
         .expect("超限后必须立即结束流，而不是等待上游 EOF")
