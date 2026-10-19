@@ -489,13 +489,14 @@ impl SQLiteStorageAdapter {
                 }
             };
             for view in std::iter::once(path.clone()).chain(wsl_path_alternative(&path)) {
-                let rollout = PathBuf::from(&view);
+                let rollout = crate::rollout_source::resolve(Path::new(&view))
+                    .unwrap_or_else(|| PathBuf::from(&view));
                 match fs::metadata(&rollout) {
                     Ok(metadata) if metadata.is_file() => match File::open(&rollout) {
                         Ok(_) => {
                             return Ok(CodexThreadRollout::Ready {
                                 thread_id,
-                                rollout_path: view,
+                                rollout_path: rollout.to_string_lossy().into_owned(),
                                 rollout,
                             });
                         }
@@ -979,7 +980,7 @@ fn local_deleted(session_id: &str, token: &str, backup_path: &Path) -> DeleteRes
 }
 
 fn read_rollout_usage_history(rollout_path: &Path, thread_id: &str) -> anyhow::Result<Vec<Value>> {
-    let file = File::open(rollout_path)?;
+    let file = crate::rollout_source::open(rollout_path)?;
     let reader = BufReader::new(file);
     let mut current_turn_id = String::new();
     let mut history = Vec::new();
@@ -1099,6 +1100,25 @@ const USAGE_TAIL_EVENT_LIMIT: usize = 24;
 
 /// 只读 rollout 尾部，取出最近的 `token_count` 事件。
 fn read_rollout_usage_tail(rollout: &Path, limit: usize) -> anyhow::Result<Vec<Value>> {
+    if crate::rollout_source::is_compressed(rollout) {
+        // 压缩流不能随机 seek；流式遍历且仅保留最近事件。
+        let mut events = std::collections::VecDeque::new();
+        for line in BufReader::new(crate::rollout_source::open(rollout)?).lines() {
+            let line = line?;
+            if !line.contains("\"token_count\"") {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(&line)
+                && let Some(event) = rollout_usage_event(&value)
+            {
+                events.push_back(event);
+                if events.len() > limit {
+                    events.pop_front();
+                }
+            }
+        }
+        return Ok(events.into_iter().collect());
+    }
     let file = File::open(rollout)?;
     let len = file.metadata()?.len();
     let mut window = USAGE_TAIL_INITIAL_BYTES;
@@ -1695,6 +1715,18 @@ fn detect_file_restore_conflicts(
                 anyhow::bail!("restore conflict: file already exists: {path}");
             }
             backup_store.validate_file_backup(token, file)?;
+            if crate::rollout_source::is_compressed(Path::new(path)) {
+                let bytes = backup_store.read_file_backup(token, file)?;
+                let mut reader = crate::rollout_source::decode_reader(Path::new(path), &bytes[..])?;
+                std::io::copy(&mut reader, &mut std::io::sink())?;
+                let logical = Path::new(path).with_extension("");
+                if logical.exists() {
+                    anyhow::bail!(
+                        "restore conflict: uncompressed history now exists: {}",
+                        logical.display()
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -1715,6 +1747,16 @@ fn allowed_backup_file_paths(tables: &Map<String, Value>) -> HashSet<String> {
             if let Some(alternative) = wsl_path_alternative(path) {
                 views.push(alternative);
             }
+            let compressed = views
+                .iter()
+                .filter(|view| {
+                    Path::new(view)
+                        .extension()
+                        .is_some_and(|ext| ext == "jsonl")
+                })
+                .map(|view| format!("{view}.zst"))
+                .collect::<Vec<_>>();
+            views.extend(compressed);
             views
         })
         .collect()
@@ -1833,11 +1875,23 @@ fn rollout_file_sources(thread_rows: Option<&Vec<Value>>) -> (Vec<BackupFileSour
             continue;
         };
         for view in std::iter::once(path.to_string()).chain(wsl_path_alternative(path)) {
-            match File::open(&view) {
+            let resolved = crate::rollout_source::resolve(Path::new(&view));
+            let source = resolved.as_deref().unwrap_or_else(|| Path::new(&view));
+            // 备份保存原始压缩字节；解码仅用于删除前的完整性检查。
+            if crate::rollout_source::is_compressed(source) && source.is_file() {
+                let valid = crate::rollout_source::open(source).and_then(|mut reader| {
+                    std::io::copy(&mut reader, &mut std::io::sink()).map_err(Into::into)
+                });
+                if valid.is_err() {
+                    unreadable.push(source.to_string_lossy().into_owned());
+                    break;
+                }
+            }
+            match File::open(source) {
                 Ok(file) => match file.metadata() {
                     Ok(metadata) if metadata.is_file() => {
                         sources.push(BackupFileSource {
-                            path: PathBuf::from(view),
+                            path: source.to_path_buf(),
                             original_path: path.to_string(),
                         });
                         break;
