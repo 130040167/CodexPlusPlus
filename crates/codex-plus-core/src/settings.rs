@@ -3234,6 +3234,7 @@ mod tests {
         writer.save(&settings).unwrap();
         let first = reader.revision().unwrap();
         assert!(!first.is_empty());
+        settings = writer.load().unwrap();
         settings.relay_profiles[0].name = "fixture-private-value".to_string();
         writer.save(&settings).unwrap();
         let second = reader.revision().unwrap();
