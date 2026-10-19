@@ -427,7 +427,10 @@ fn switch_to_aggregate_relay_allows_empty_config_snapshot() {
 
     assert!(result.configured);
     assert_eq!(store.load().unwrap().active_relay_id, "agg");
-    assert!(live.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
+    let proxy_url = codex_plus_core::protocol_proxy::local_responses_proxy_base_url(
+        codex_plus_core::protocol_proxy::protocol_proxy_port(),
+    );
+    assert!(live.contains(&format!("base_url = \"{proxy_url}\"")));
 }
 
 #[test]

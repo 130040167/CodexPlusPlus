@@ -2472,6 +2472,7 @@ pub async fn open_responses_proxy_request_with_settings(
         body,
         settings,
         None,
+        None,
         "/responses",
         None,
         ProxySessionHeaders::default(),
@@ -2487,6 +2488,7 @@ pub async fn open_responses_proxy_request_with_settings_for_path(
     open_responses_proxy_request_with_settings_and_user_agent(
         body,
         settings,
+        None,
         None,
         request_path,
         None,
@@ -2521,6 +2523,7 @@ pub async fn open_responses_proxy_request_with_settings_for_path_and_session_hea
     open_responses_proxy_request_with_settings_and_user_agent(
         body,
         settings,
+        None,
         None,
         request_path,
         beta_features,
@@ -2642,7 +2645,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         }),
                     );
                     if !strict_aggregate_model {
-                        crate::relay_rotation::record_relay_request_failure(&settings);
+                        record_rotation_failure(rotation_snapshot.as_ref());
                     }
                     if has_more_candidates {
                         continue;
@@ -2681,7 +2684,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         && !strict_aggregate_model
                         && error.is::<NativeCompactionUnsupported>()
                     {
-                        crate::relay_rotation::record_relay_request_failure(&settings);
+                        record_rotation_failure(rotation_snapshot.as_ref());
                         continue;
                     }
                     return native_compaction_unsupported_result(error);
@@ -2759,7 +2762,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     }),
                 );
                 if !strict_aggregate_model {
-                    crate::relay_rotation::record_relay_request_failure(&settings);
+                    record_rotation_failure(rotation_snapshot.as_ref());
                 }
                 if has_more_candidates {
                     continue;
@@ -2833,7 +2836,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                                 crate::responses_exec_transport::evict(key);
                             }
                             if !strict_aggregate_model {
-                                crate::relay_rotation::record_relay_request_failure(&settings);
+                                record_rotation_failure(rotation_snapshot.as_ref());
                             }
                             if has_more_candidates {
                                 continue;
@@ -2893,7 +2896,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         crate::responses_exec_transport::evict(key);
                     }
                     if !strict_aggregate_model {
-                        crate::relay_rotation::record_relay_request_failure(&settings);
+                        record_rotation_failure(rotation_snapshot.as_ref());
                     }
                     if has_more_candidates {
                         continue;
@@ -2969,7 +2972,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
 
             if success && upstream_has_terminal_failure(&probed, &content_type) {
                 if !strict_aggregate_model {
-                    crate::relay_rotation::record_relay_request_failure(&settings);
+                    record_rotation_failure(rotation_snapshot.as_ref());
                 }
                 let probed = if stream_response && String::from_utf8_lossy(&probed)
                     .replace("\r\n", "\n").split("\n\n").any(|block|
@@ -2997,10 +3000,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 match upstream_compaction_item_count(&probed, &content_type) {
                     Some(1) => {
                         if !strict_aggregate_model {
-                            crate::relay_rotation::record_relay_request_event(
-                                &settings,
-                                RotationEvent::Success,
-                            );
+                            record_rotation_event(rotation_snapshot.as_ref(), RotationEvent::Success);
                         }
                         return Ok(UpstreamProxyResponse {
                             status_code,
@@ -3018,7 +3018,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     }
                     None => {
                         if !strict_aggregate_model {
-                            crate::relay_rotation::record_relay_request_failure(&settings);
+                            record_rotation_failure(rotation_snapshot.as_ref());
                         }
                         return Ok(UpstreamProxyResponse {
                             status_code,
@@ -3040,10 +3040,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 && upstream_compaction_item_count(&probed, &content_type) == Some(1)
             {
                 if !strict_aggregate_model {
-                    crate::relay_rotation::record_relay_request_event(
-                        &settings,
-                        RotationEvent::Success,
-                    );
+                    record_rotation_event(rotation_snapshot.as_ref(), RotationEvent::Success);
                 }
                 if !is_stream {
                     return Ok(UpstreamProxyResponse {
@@ -3078,7 +3075,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             }
             if !success && !compaction_input_rejected(status_code, &probed) {
                 if !strict_aggregate_model {
-                    crate::relay_rotation::record_relay_request_failure(&settings);
+                    record_rotation_failure(rotation_snapshot.as_ref());
                 }
                 if has_more_candidates {
                     continue;
@@ -3121,7 +3118,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         && !strict_aggregate_model
                         && error.is::<NativeCompactionUnsupported>()
                     {
-                        crate::relay_rotation::record_relay_request_failure(&settings);
+                        record_rotation_failure(rotation_snapshot.as_ref());
                         continue;
                     }
                     return native_compaction_unsupported_result(error);
@@ -3155,7 +3152,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         }),
                     );
                     if !strict_aggregate_model {
-                        crate::relay_rotation::record_relay_request_failure(&settings);
+                        record_rotation_failure(rotation_snapshot.as_ref());
                     }
                     if has_more_candidates {
                         continue;
