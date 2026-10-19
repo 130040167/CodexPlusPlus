@@ -3029,7 +3029,7 @@ async fn forward_protocol_proxy_stream(
 ) -> anyhow::Result<Option<String>> {
     let mut chunks = response.bytes_stream();
     if wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
-        let mut transformer = crate::protocol_proxy::ResponsesSseTransformer::default();
+        let mut transformer = crate::protocol_proxy::ResponsesSseTransformer::for_request(request);
         while let Some(chunk) = chunks.next().await {
             match chunk {
                 Ok(bytes) => {
@@ -6495,13 +6495,14 @@ mod proxy_stream_tests {
     }
 
     #[tokio::test]
-    async fn native_overflow_ends_stream_while_upstream_stays_open() {
+    async fn native_oversized_event_is_forwarded_and_stream_completes() {
         use std::time::Duration;
         use tokio::time::{sleep, timeout};
 
-        // 调用方回归：上游发送超过事件上限且不含分隔符的数据后保持连接不关闭。
-        // 转发层必须在超限的那个 chunk 上立即上报失败终态，而不是阻塞等待 EOF，
-        // 也不能把被截断事件的后半段继续转发给客户端。
+        // 超过改写缓冲上限的事件（高分辨率生图等）必须完整转发，随后的
+        // response.completed 照常让流以成功结束；过去在这里截断会让 Codex
+        // 收不到终态事件，按断流重试并重复计费。上游发完后保持连接，转发层
+        // 在收到完成事件后不必等 EOF 也能正确上报成功。
         let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = upstream.local_addr().unwrap();
         let upstream_task = tokio::spawn(async move {
@@ -6516,17 +6517,22 @@ mod proxy_stream_tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
                 .await
                 .unwrap();
-            // 20 * 256 KiB = 5 MiB，超过 4 MiB 上限
-            let block = vec![b'a'; 256 * 1024];
+            let mut chunks = vec![b"data:{\"type\":\"response.output_item.done\",\"image\":\"".to_vec()];
+            // 20 * 256 KiB = 5 MiB，超过 4 MiB 改写缓冲上限
             for _ in 0..20 {
+                chunks.push(vec![b'A'; 256 * 1024]);
+            }
+            chunks.push(b"\"}\n\n".to_vec());
+            chunks.push(b"data:{\"type\":\"response.completed\"}\n\n".to_vec());
+            for chunk in chunks {
                 socket
-                    .write_all(format!("{:X}\r\n", block.len()).as_bytes())
+                    .write_all(format!("{:X}\r\n", chunk.len()).as_bytes())
                     .await
                     .unwrap();
-                socket.write_all(&block).await.unwrap();
+                socket.write_all(&chunk).await.unwrap();
                 socket.write_all(b"\r\n").await.unwrap();
             }
-            // 不写终止块也不 shutdown：模拟上游保持连接
+            socket.write_all(b"0\r\n\r\n").await.unwrap();
             sleep(Duration::from_secs(60)).await;
         });
 
@@ -6543,27 +6549,26 @@ mod proxy_stream_tests {
             .await
             .unwrap();
         let (mut writer, _) = downstream.accept().await.unwrap();
+        // 下游必须并发读取：5 MiB 会塞满 TCP 缓冲区，否则转发端写入阻塞。
+        let reader_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        });
 
         let forwarded = timeout(
             Duration::from_secs(20),
             forward_protocol_proxy_stream(&mut writer, response, UpstreamWireApi::Responses, None),
         )
         .await
-        .expect("超限后必须立即结束流，而不是等待上游 EOF")
+        .expect("上游发完终止块后转发必须结束")
         .unwrap();
         writer.shutdown().await.unwrap();
+        assert!(forwarded.is_none(), "超大事件后有 response.completed，流应判为成功：{forwarded:?}");
 
-        let failure = forwarded.expect("超限必须被记成流失败");
-        assert!(failure.contains("上限"), "unexpected failure: {}", failure);
-        assert!(!failure.contains("fixture-secret"), "failure must not leak the URL");
-
-        let mut forwarded_bytes = Vec::new();
-        reader.read_to_end(&mut forwarded_bytes).await.unwrap();
-        assert!(
-            forwarded_bytes.is_empty(),
-            "被截断的超限事件不得转发给客户端，收到 {} 字节",
-            forwarded_bytes.len()
-        );
+        let forwarded_bytes = reader_task.await.unwrap();
+        assert!(forwarded_bytes.len() > 5 * 1024 * 1024, "超大事件必须完整转发，收到 {} 字节", forwarded_bytes.len());
+        assert!(forwarded_bytes.ends_with(b"data:{\"type\":\"response.completed\"}\n\n"));
         upstream_task.abort();
     }
 }

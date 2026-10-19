@@ -115,22 +115,33 @@ where F: Fn() + Send + 'static {
         fn PeekMessageW(msg: *mut Msg, hwnd: *mut c_void, min: u32, max: u32, remove: u32) -> i32;
     }
     let (modifiers, key) = parse_hotkey(hotkey)?;
-    let id = 0xC0D3_0001_i32;
-    if unsafe { RegisterHotKey(std::ptr::null_mut(), id, modifiers, key) } == 0 {
-        anyhow::bail!("全局热键注册失败，可能已被其他程序占用：{hotkey}");
-    }
+    // 应用程序热键 ID 只能在 0x0000..=0xBFFF；原来的 0xC0D3_0001 超出 i32 范围，Windows 上编译不过。
+    const HOTKEY_ID: i32 = 0x0C0D;
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
+    // RegisterHotKey(NULL, ..) 把 WM_HOTKEY 投递到「注册线程」的消息队列，
+    // UnregisterHotKey 也必须由注册线程调用：注册、收消息、注销都放在同一个线程里。
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
     let thread = std::thread::Builder::new().name("codex-plus-global-dictation".into()).spawn(move || {
+        let registered = unsafe { RegisterHotKey(std::ptr::null_mut(), HOTKEY_ID, modifiers, key) } != 0;
+        let _ = ready_tx.send(registered);
+        if !registered {
+            return;
+        }
         while !thread_stop.load(Ordering::SeqCst) {
             let mut msg = Msg { hwnd: std::ptr::null_mut(), message: 0, w_param: 0, l_param: 0, time: 0, point: [0, 0], private: 0 };
             while unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, 1) } != 0 {
-                if msg.message == 0x0312 && msg.w_param == id as usize { callback(); }
+                if msg.message == 0x0312 && msg.w_param == HOTKEY_ID as usize { callback(); }
             }
             std::thread::sleep(Duration::from_millis(30));
         }
-        unsafe { UnregisterHotKey(std::ptr::null_mut(), id); }
+        unsafe { UnregisterHotKey(std::ptr::null_mut(), HOTKEY_ID); }
     })?;
+    if !ready_rx.recv_timeout(Duration::from_secs(2)).unwrap_or(false) {
+        stop.store(true, Ordering::SeqCst);
+        let _ = thread.join();
+        anyhow::bail!("全局热键注册失败，可能已被其他程序占用：{hotkey}");
+    }
     Ok(GlobalHotkeyHandle { stop, thread: Some(thread) })
 }
 

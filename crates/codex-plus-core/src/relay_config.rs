@@ -1171,18 +1171,31 @@ fn managed_openai_base_url() -> String {
 }
 
 fn update_remote_control_openai_base_url(doc: &mut DocumentMut, enabled: bool) {
-    let managed = managed_openai_base_url();
+    update_remote_control_openai_base_url_with(doc, enabled, managed_openai_base_url());
+}
+
+fn update_remote_control_openai_base_url_with(doc: &mut DocumentMut, enabled: bool, managed: String) {
     let current = doc
         .get(OPENAI_BASE_URL_KEY)
         .and_then(Item::as_str)
         .map(str::trim)
         .map(ToString::to_string);
 
+    // 默认端口的本地代理地址同样算作 Codex++ 写入的值：端口因 Windows 保留区间
+    // 迁移后（#1163），旧值必须换成新端口，否则 Codex 仍连旧端口、所有请求失败。
+    // 其它回环地址（例如 CC Switch 的本地代理）视为用户自定义，原样保留。
+    let ours = |value: &str| {
+        value == managed
+            || value
+                == crate::protocol_proxy::local_responses_proxy_base_url(
+                    crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+                )
+    };
     if enabled {
-        if current.as_deref().is_none_or(|value| value == managed) {
+        if current.as_deref().is_none_or(ours) {
             doc[OPENAI_BASE_URL_KEY] = toml_edit::value(managed);
         }
-    } else if current.as_deref() == Some(managed.as_str()) {
+    } else if current.as_deref().is_some_and(ours) {
         doc.as_table_mut().remove(OPENAI_BASE_URL_KEY);
     }
 }
@@ -5610,6 +5623,24 @@ fn account_label_from_jwt(token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrated_proxy_port_rewrites_default_port_openai_base_url_only() {
+        // #1163：端口迁移后，根级 openai_base_url 必须跟到新端口；用户自己的本地代理不动。
+        let migrated = crate::protocol_proxy::local_responses_proxy_base_url(58077);
+        let mut doc: DocumentMut = "openai_base_url = \"http://127.0.0.1:57321/v1\"\n".parse().unwrap();
+        update_remote_control_openai_base_url_with(&mut doc, true, migrated.clone());
+        assert_eq!(doc[OPENAI_BASE_URL_KEY].as_str(), Some(migrated.as_str()));
+
+        let mut doc: DocumentMut = "openai_base_url = \"http://127.0.0.1:15721/v1\"\n".parse().unwrap();
+        update_remote_control_openai_base_url_with(&mut doc, true, migrated.clone());
+        assert_eq!(doc[OPENAI_BASE_URL_KEY].as_str(), Some("http://127.0.0.1:15721/v1"));
+
+        // 关闭时旧端口的托管值也要清掉。
+        let mut doc: DocumentMut = "openai_base_url = \"http://127.0.0.1:57321/v1\"\n".parse().unwrap();
+        update_remote_control_openai_base_url_with(&mut doc, false, migrated);
+        assert!(doc.get(OPENAI_BASE_URL_KEY).is_none());
+    }
 
     #[test]
     fn elevated_windows_sandbox_is_kept_once_setup_is_complete() {

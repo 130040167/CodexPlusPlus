@@ -2548,9 +2548,12 @@ fn prepare_fixed_helper_port_for_restart(settings: Option<&BackendSettings>) -> 
             Err(_) => return Ok(()),
         },
     };
-    let Some(port) = codex_plus_core::launcher::required_fixed_helper_port(settings) else {
+    if codex_plus_core::launcher::required_fixed_helper_port(settings).is_none() {
         return Ok(());
-    };
+    }
+    // 与 launcher 启动时同一套迁移：端口落在 Windows 保留区间（10013）时先换端口，
+    // 否则下面会对着永远绑不上的旧端口等满超时，重启必然失败（#1163）。
+    let port = codex_plus_core::protocol_proxy::ensure_protocol_proxy_port_available();
     codex_plus_core::launcher::wait_for_fixed_helper_port(
         port,
         codex_plus_core::launcher::protocol_proxy_bind_retry_timeout_ms(),
