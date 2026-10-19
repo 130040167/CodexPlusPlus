@@ -7,27 +7,46 @@ const path = require("node:path");
 const net = require("node:net");
 const http = require("node:http");
 const { spawn, execFileSync } = require("node:child_process");
+const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+// Windows FILETIME 超过 JS 安全整数范围；编辑清单时必须保留原始数字。
+function editableJson(contents) {
+  return JSON.parse(contents, (_key, value, context) =>
+    typeof value === "number" && !Number.isSafeInteger(value) ? JSON.rawJSON(context.source) : value);
+}
+let interrupted = "", cleaning = false;
+for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => {
+  interrupted = signal;
+  process.exitCode = 1;
+});
+if (process.argv[2] === "--self-test") {
+  selfTest().catch(error => { console.error(error); process.exitCode = 1; });
+  return;
+}
 const { chromium } = require("playwright");
 
 assert.equal(process.platform, "win32");
 assert.equal(process.argv.length, 5, "Usage: node verify-desktop-continuity.cjs <manager.exe> <Codex app dir> <output dir>");
 const [executable, appDir, outputDir] = process.argv.slice(2).map(value => path.resolve(value));
-const token = `desktop-continuity-${Date.now()}`;
+const token = `desktop-continuity-${Date.now()}-${process.pid}`;
 const temporary = path.join(os.tmpdir(), token);
-const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
-async function bounded(promise, ms) {
-  let timer;
+async function bounded(promise, ms = 10000, reason = "operation timed out") {
+  let timer, interruptTimer;
   try {
     return await Promise.race([promise, new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error("operation timed out")), ms);
+      const check = () => {
+        if (interrupted && !cleaning) reject(new Error(`acceptance interrupted: ${interrupted}`));
+      };
+      check();
+      timer = setTimeout(() => reject(new Error(reason)), ms);
+      interruptTimer = setInterval(check, 50);
     })]);
-  } finally { clearTimeout(timer); }
+  } finally { clearTimeout(timer); clearInterval(interruptTimer); }
 }
 const powershell = (script, env = process.env) => execFileSync("powershell.exe",
   ["-NoProfile", "-NonInteractive", "-Command", script],
-  { env, encoding: "utf8", windowsHide: true, maxBuffer: 12e6 });
+  { env, encoding: "utf8", windowsHide: true, maxBuffer: 12e6, timeout: 30000 });
 const inventory = () => JSON.parse(powershell(
-  "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,@{Name='CreationDate';Expression={$_.CreationDate.ToUniversalTime().ToString('o')}},CommandLine | ConvertTo-Json -Compress"));
+  "ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,@{Name='CreationDate';Expression={$_.CreationDate.ToUniversalTime().ToString('o')}},CommandLine)"));
 const identity = process => ({
   ProcessId: process.ProcessId, ParentProcessId: process.ParentProcessId,
   Name: process.Name, ExecutablePath: process.ExecutablePath, CreationDate: process.CreationDate,
@@ -37,13 +56,14 @@ const sameProcess = (a, b) => a && b && a.ProcessId === b.ProcessId
 const before = inventory();
 const protectedProcesses = before.filter(process => /^(codex-plus-plus|codex|ChatGPT|cc-switch)\.exe$/i.test(process.Name));
 const children = [], contexts = [], desktops = [], owned = new Map(), servers = new Set(), ports = new Set();
-const report = { temporary, executable, appDir, checks: {}, events: [], managers: [], desktops: [], cleanup: false };
+const report = { temporary, executable, appDir, checks: {}, events: [], managers: [], desktops: [],
+  protectedProcesses: protectedProcesses.map(identity), cleanup: false };
 const protectedFiles = new Map();
 let mode = "complete", attempts = 0, held = [];
 
 async function save() {
-  await fs.mkdir(outputDir, { recursive: true });
-  await fs.writeFile(path.join(outputDir, "desktop-verification.json"), JSON.stringify(report, null, 2));
+  await bounded(fs.mkdir(outputDir, { recursive: true }));
+  await bounded(fs.writeFile(path.join(outputDir, "desktop-verification.json"), JSON.stringify(report, null, 2)));
 }
 async function pass(name, detail = {}) {
   report.checks[name] = true;
@@ -54,37 +74,39 @@ async function pass(name, detail = {}) {
 async function until(check, message, timeout = 45000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
-    if (await check()) return;
-    await pause(150);
+    if (interrupted && !cleaning) throw new Error(`acceptance interrupted: ${interrupted}`);
+    if (await bounded(Promise.resolve().then(check), Math.max(1, deadline - Date.now()), message)) return;
+    await bounded(pause(Math.min(150, Math.max(1, deadline - Date.now()))));
   }
   throw new Error(message);
 }
 async function listen(server, port = 0) {
-  await new Promise((resolve, reject) => {
+  servers.add(server);
+  await bounded(new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, "127.0.0.1", resolve);
-  });
-  servers.add(server);
+  }));
   ports.add(server.address().port);
   return server.address().port;
 }
 async function close(server) {
   if (!server?.listening) return;
   server.closeAllConnections?.();
-  await new Promise(resolve => server.close(resolve));
+  await bounded(new Promise(resolve => server.close(resolve)), 3000);
   servers.delete(server);
 }
 async function freePort() {
   const server = net.createServer();
-  const port = await listen(server);
-  await close(server);
-  return port;
+  try {
+    const port = await listen(server);
+    return port;
+  } finally { await close(server); }
 }
 function captureOwned() {
   const processes = inventory();
   for (const child of children) if (child.exitCode === null && !owned.has(child.pid)) {
     const candidate = processes.find(process => process.ProcessId === child.pid);
-    if (candidate?.ParentProcessId === process.pid && candidate.ExecutablePath === executable) {
+    if (candidate?.ParentProcessId === process.pid && candidate.ExecutablePath === child.testExecutable) {
       owned.set(candidate.ProcessId, identity(candidate));
     }
   }
@@ -139,11 +161,14 @@ async function protectOriginalFiles() {
 }
 async function originalsIntact() {
   const current = inventory();
-  assert.ok(protectedProcesses.every(original => current.some(process => sameProcess(original, process))),
-    "original application process identities changed");
+  const missing = protectedProcesses.filter(original => !current.some(process => sameProcess(original, process)));
+  if (missing.length) report.originalProcessChanges = missing.map(identity);
+  assert.equal(missing.length, 0, `original application process identities changed: ${missing.map(p => `${p.Name}:${p.ProcessId}`).join(", ")}`);
   for (const [file, original] of protectedFiles) {
     const current = await fs.readFile(file).catch(() => null);
-    assert.ok(original === null ? current === null : current?.equals(original), "original configuration changed");
+    const unchanged = original === null ? current === null : current?.equals(original);
+    if (!unchanged) report.originalFileChanges = [...new Set([...(report.originalFileChanges || []), file])];
+    assert.ok(unchanged, `original configuration changed: ${file}`);
   }
 }
 async function supplier() {
@@ -220,6 +245,7 @@ function environment(context) {
     CODEX_PLUS_STATE_DIR: context.state, CODEX_PLUS_MANAGER_GUARD_PORT: String(context.guard),
     CODEX_PLUS_LAUNCHER_GUARD_PORT: String(context.launcherGuard), CODEX_PLUS_PROTOCOL_PROXY_PORT: String(context.port),
     WEBVIEW2_USER_DATA_FOLDER: path.join(context.state, "test-webview"),
+    CODEX_ELECTRON_USER_DATA_PATH: path.join(context.state, "unused-electron"),
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${context.debug}`,
     CODEX_PLUS_HELPER_BIND: "127.0.0.1", OTEL_SDK_DISABLED: "true" };
   for (const name of ["CODEX_PLUS_GUARD_PORT", "CODEX_PLUS_MULTI_INSTANCE", "CODEX_PLUS_INSTANCE_ID",
@@ -228,28 +254,74 @@ function environment(context) {
 }
 async function startManager(context) {
   const started = Date.now();
-  context.current = spawn(executable, [], { env: environment(context), windowsHide: true, stdio: "ignore" });
+  const binary = context.executable || executable;
+  context.current = spawn(binary, [], { env: environment(context), windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"] });
+  context.current.testExecutable = binary;
   children.push(context.current);
+  context.spawnError = null;
+  context.current.once("error", error => { context.spawnError = error; });
+  const launch = { state: context.state, executable: binary, pid: context.current.pid,
+    started, helperPort: context.port, debugPort: context.debug, guardPort: context.guard, ready: false };
+  for (const stream of ["stdout", "stderr"]) context.current[stream]?.on("data", data => {
+    launch[stream] = ((launch[stream] || "") + data.toString()).slice(-12000);
+  });
+  report.managers.push(launch);
+  await save();
   await until(async () => {
+    if (context.spawnError) throw context.spawnError;
     assert.equal(context.current.exitCode, null, "manager exited before WebView became ready");
-    try { return (await fetch(`http://127.0.0.1:${context.debug}/json`)).ok; } catch { return false; }
+    captureOwned();
+    try { return (await fetch(`http://127.0.0.1:${context.debug}/json`,
+      { signal: AbortSignal.timeout(1500) })).ok; } catch { return false; }
   }, "manager WebView did not start");
-  context.browser = await chromium.connectOverCDP(`http://127.0.0.1:${context.debug}`);
+  context.browser = await connectBrowser(context.debug);
   context.page = context.browser.contexts()[0].pages()[0];
-  await context.page.waitForFunction(() => window.__TAURI_INTERNALS__?.invoke);
+  await bounded(context.page.waitForFunction(() => window.__TAURI_INTERNALS__?.invoke));
   captureOwned();
-  report.managers.push({ state: context.state, pid: context.current.pid, started, helperPort: context.port });
+  launch.ready = true;
   await save();
 }
-const invoke = (context, command, args = {}) => context.page.evaluate(
-  ({ command, args }) => window.__TAURI_INTERNALS__.invoke(command, args), { command, args });
+async function connectBrowser(port) {
+  const browser = await bounded(chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: 10000 }));
+  for (const context of browser.contexts()) {
+    context.setDefaultTimeout(10000);
+    context.setDefaultNavigationTimeout(10000);
+  }
+  return browser;
+}
+const invoke = (context, command, args = {}) => bounded(context.page.evaluate(
+  ({ command, args }) => window.__TAURI_INTERNALS__.invoke(command, args), { command, args }), 30000);
+async function exitWithFallback(requestExit, hasExited, forceExit, timeout = 5000) {
+  await bounded(Promise.resolve().then(requestExit), timeout).catch(() => {});
+  let forced = false;
+  if (!hasExited()) {
+    try { await until(hasExited, "manager did not exit normally", timeout); }
+    catch (error) {
+      if (interrupted && !cleaning) throw error;
+      await forceExit();
+      forced = true;
+    }
+  }
+  await until(hasExited, "manager did not exit after forced cleanup", timeout);
+  return forced;
+}
 async function stopManager(context, crash = false) {
   if (!context.current || context.current.exitCode !== null) return;
   captureOwned();
   if (crash) killOwned(context.current.pid);
-  else await invoke(context, "manager_exit_app").catch(() => {});
+  else {
+    const forced = await exitWithFallback(
+      () => context.hangExit ? new Promise(() => {}) : invoke(context, "manager_exit_app"),
+      () => context.current.exitCode !== null,
+      () => killOwned(context.current.pid));
+    if (forced) {
+      report.events.push({ name: "managerExitFallback", pid: context.current.pid });
+      assert.ok(cleaning, "normal manager exit required forced termination");
+    }
+  }
   await until(() => context.current.exitCode !== null, "manager did not exit", 15000);
-  await context.browser?.close().catch(() => {});
+  if (context.browser) await bounded(context.browser.close(), 3000).catch(() => {});
   context.browser = context.page = null;
 }
 async function launchDesktop(context) {
@@ -299,7 +371,7 @@ async function launchDesktop(context) {
   await save();
   assert.ok(data.toLowerCase().startsWith(path.resolve(temporary).toLowerCase() + path.sep),
     "new Electron data must stay in the isolated state tree");
-  desktop.browser = await chromium.connectOverCDP(`http://127.0.0.1:${desktop.id.debugPort}`);
+  desktop.browser = await connectBrowser(desktop.id.debugPort);
   const errors = [];
   for (const context of desktop.browser.contexts()) {
     context.on("page", page => page.on("pageerror", error => errors.push(String(error))));
@@ -308,11 +380,11 @@ async function launchDesktop(context) {
   await until(async () => {
     const candidates = [];
     for (const page of desktop.browser.contexts().flatMap(context => context.pages())) {
-      const ui = await page.evaluate(() => ({
+      const ui = await bounded(page.evaluate(() => ({
         title: document.title, text: document.body?.innerText?.slice(0, 1500) || "",
         elements: document.body?.querySelectorAll("*").length,
         composer: !!document.querySelector('[contenteditable="true"]'),
-      })).catch(() => null);
+      })), 3000).catch(() => null);
       candidates.push({ url: page.url(), ...ui });
       if (ui?.composer && page.url().startsWith("app://")) desktop.page = page;
     }
@@ -322,13 +394,13 @@ async function launchDesktop(context) {
     report.events.push({ name: "blankDesktop", candidates: desktop.candidates, errors });
     throw error;
   });
-  await desktop.page.waitForLoadState("domcontentloaded");
-  await desktop.page.screenshot({ path: path.join(outputDir, `desktop-${desktops.length}.png`) });
+  await bounded(desktop.page.waitForLoadState("domcontentloaded"));
+  await bounded(desktop.page.screenshot({ path: path.join(outputDir, `desktop-${desktops.length}.png`) }));
   await pass(`realDesktop${desktops.length}Ready`, { processId: desktop.id.processId, debugPort: desktop.id.debugPort });
   return desktop;
 }
 async function snapshot(desktop, label) {
-  const ui = await desktop.page.evaluate(() => ({
+  const ui = await bounded(desktop.page.evaluate(() => ({
     url: location.href, text: document.body.innerText.slice(-12000),
     fields: [...document.querySelectorAll("input,textarea,[contenteditable=true]")].map(el => ({
       tag: el.tagName, role: el.getAttribute("role"), placeholder: el.getAttribute("placeholder"),
@@ -338,26 +410,26 @@ async function snapshot(desktop, label) {
       text: el.innerText, aria: el.getAttribute("aria-label"), title: el.getAttribute("title"),
       disabled: el.disabled,
     })).filter(button => button.text || button.aria || button.title),
-  }));
+  })), 3000);
   report.events.push({ name: label, ui });
-  await desktop.page.screenshot({ path: path.join(outputDir, `${label}.png`) });
+  await bounded(desktop.page.screenshot({ path: path.join(outputDir, `${label}.png`) }), 3000);
   await save();
 }
 async function sendPrompt(desktop, text) {
   const dismiss = desktop.page.getByRole("button", { name: "继续使用当前模型", exact: true });
-  if (await dismiss.isVisible()) await dismiss.click();
+  if (await bounded(dismiss.isVisible())) await bounded(dismiss.click());
   await until(async () => !await desktop.page.getByText("正在完成 Windows 设置", { exact: true }).isVisible(),
     "isolated desktop sandbox setup did not finish", 60000);
-  if (await dismiss.isVisible()) await dismiss.click();
+  if (await bounded(dismiss.isVisible())) await bounded(dismiss.click());
   await snapshot(desktop, "before-prompt");
   const composer = desktop.page.locator('[contenteditable="true"]').first();
-  await composer.waitFor({ state: "visible", timeout: 15000 });
-  await composer.fill(text);
-  await composer.press("Enter");
+  await bounded(composer.waitFor({ state: "visible", timeout: 15000 }), 16000);
+  await bounded(composer.fill(text));
+  await bounded(composer.press("Enter"));
 }
 async function assertDesktopAlive(desktop) {
-  const browser = await fetch(`http://127.0.0.1:${desktop.id.debugPort}/json/version`,
-    { signal: AbortSignal.timeout(2000) }).then(response => response.json());
+  const browser = await bounded(fetch(`http://127.0.0.1:${desktop.id.debugPort}/json/version`,
+    { signal: AbortSignal.timeout(2000) }).then(response => response.json()), 3000);
   assert.ok(browser.webSocketDebuggerUrl.endsWith(`/devtools/browser/${desktop.id.browserId}`));
   const processes = inventory();
   assert.ok(processes.some(process => sameProcess(process, owned.get(desktop.id.processId))));
@@ -366,10 +438,35 @@ async function closeDesktop(desktop) {
   if (!desktop.id) return;
   try {
     await assertDesktopAlive(desktop);
-    const session = await desktop.browser.newBrowserCDPSession();
+    const session = await bounded(desktop.browser.newBrowserCDPSession(), 3000);
     await bounded(session.send("Browser.close"), 5000).catch(() => {});
   } catch {}
   if (desktop.browser) await bounded(desktop.browser.close(), 3000).catch(() => {});
+}
+
+async function verifyLiveWorkerBlocks(context, desktop) {
+  const manifestPath = path.join(desktop.root, "instance.json");
+  const receiptPath = path.join(desktop.root, "launch-result.json");
+  const manifest = await fs.readFile(manifestPath, "utf8");
+  const receipt = await fs.readFile(receiptPath, "utf8");
+  try {
+    for (const legacy of [false, true]) {
+      const starting = editableJson(manifest);
+      starting.identity = null;
+      if (legacy) delete starting.workerBirthId;
+      await fs.writeFile(manifestPath, JSON.stringify(starting));
+      await fs.writeFile(receiptPath, JSON.stringify({ ...editableJson(receipt), identity: null }));
+      const blocked = await invoke(context, "launch_codex_multi_instance", { request: {
+        instanceId: token, profileId: "fixture", appPath: appDir,
+      } });
+      assert.equal(blocked.status, "failed", "live worker must block a second generation");
+      assert.match(blocked.message, /worker 尚未退出/);
+      await assertDesktopAlive(desktop);
+    }
+  } finally {
+    await fs.writeFile(receiptPath, receipt);
+    await fs.writeFile(manifestPath, manifest);
+  }
 }
 
 (async () => {
@@ -381,6 +478,26 @@ async function closeDesktop(desktop) {
     await startManager(a);
     const first = await launchDesktop(a);
     await originalsIntact();
+    if (process.env.DESKTOP_CONTINUITY_FAULT) {
+      const fault = process.env.DESKTOP_CONTINUITY_FAULT;
+      assert.ok(["cdp-hang", "interrupt"].includes(fault), "unknown fault injection");
+      report.fault = fault;
+      a.hangExit = true;
+      if (fault === "interrupt") setTimeout(() => process.emit("SIGINT"), 200);
+      await until(() => a.page.evaluate(() => new Promise(() => {})), "injected CDP timeout", 2000);
+      assert.fail("injected hanging CDP call unexpectedly completed");
+    }
+    for (const request of [
+      { instanceId: " main ", profileId: "fixture" },
+      { profileId: "main", settings: { relayProfiles: [{ id: "main", name: "Fixture",
+        relayMode: "pureApi", protocol: "responses" }] } },
+    ]) {
+      const rejected = await invoke(a, "launch_codex_multi_instance", { request });
+      assert.equal(rejected.status, "failed");
+      assert.match(rejected.message, /保留名称/);
+      assert.equal(await fs.stat(path.join(a.state, "codex-multi", "main")).catch(() => null), null);
+    }
+    await pass("reservedMainRejectedBeforeLaunch");
     await startManager(b);
     const second = await launchDesktop(b);
     assert.notEqual(first.id.userDataDir, second.id.userDataDir);
@@ -396,16 +513,29 @@ async function closeDesktop(desktop) {
     assert.equal(repeated.pid, first.manifest.pid);
     await assertDesktopAlive(first);
     await pass("repeatedLaunchKeepsOriginalDesktop");
+    await verifyLiveWorkerBlocks(a, first);
+    await pass("liveWorkerBlocksOverwriteIncludingLegacyManifest");
     await sendPrompt(second, "Return a short synthetic response without tools.");
     await second.page.getByText("DESKTOP_RECOVERED_complete", { exact: true }).waitFor({ timeout: 30000 });
     await pass("secondRealDesktopCompletesSyntheticTurn");
     const workerPid = first.manifest.pid;
     await stopManager(a);
     await assertDesktopAlive(first);
+    // 升级常会改变管理器安装路径；旧 worker 仍从原来的 exe 运行。
+    const updated = path.join(temporary, "updated-manager");
+    await fs.mkdir(updated);
+    for (const name of [path.basename(executable), "onnxruntime.dll",
+      "onnxruntime_providers_shared.dll", "sherpa-onnx-c-api.dll", "sherpa-onnx-cxx-api.dll"]) {
+      await bounded(fs.copyFile(path.join(path.dirname(executable), name), path.join(updated, name)));
+    }
+    a.executable = path.join(updated, path.basename(executable));
     await startManager(a);
     const listed = await invoke(a, "list_codex_multi_instances");
     assert.ok(listed.instances.some(instance => instance.instanceId === token && instance.running));
     await pass("managerRestartRediscoversLiveDesktop");
+    await verifyLiveWorkerBlocks(a, first);
+    assert.equal(inventory().find(p => p.ProcessId === workerPid)?.ExecutablePath, executable);
+    await pass("newManagerPathPreservesOldWorker");
     await stopManager(a, true);
     await assertDesktopAlive(first);
     await assertDesktopAlive(second);
@@ -446,18 +576,22 @@ async function closeDesktop(desktop) {
     resume.port = await freePort();
     const history = path.join(resume.state, "proxy-endpoints.json");
     await fs.access(path.join(resume.state, "proxy-endpoints.backup.json"));
-    await fs.writeFile(history, '{"truncated":');
+    await fs.writeFile(history, '{}');
     await startManager(resume);
     await first.page.getByText("DESKTOP_RECOVERED_after_exit", { exact: true }).waitFor({ timeout: 90000 });
     await assertDesktopAlive(first);
     await pass("realDesktopRetriesAfterNormalProxyHostExit");
     const repaired = JSON.parse(await fs.readFile(history, "utf8"));
     assert.ok(repaired.homes.some(home => home.ports.includes(first.id.helperPort)));
+    await until(async () => {
+      const current = JSON.parse(await fs.readFile(history, "utf8"));
+      return current.homes.some(home => home.ports.includes(resume.port));
+    }, "new proxy port was not persisted after JSON corruption", 15000);
     await pass("realDesktopRecoversWithCorruptedPrimaryHistory");
     const manifestPath = path.join(second.root, "instance.json"), receiptPath = path.join(second.root, "launch-result.json");
     const savedManifest = await fs.readFile(manifestPath, "utf8"), savedReceipt = await fs.readFile(receiptPath, "utf8");
     try {
-      const staleManifest = JSON.parse(savedManifest), staleReceipt = JSON.parse(savedReceipt);
+      const staleManifest = editableJson(savedManifest), staleReceipt = editableJson(savedReceipt);
       staleManifest.identity.browserId = staleReceipt.identity.browserId = "stale-test-browser";
       await fs.writeFile(receiptPath, JSON.stringify(staleReceipt));
       await fs.writeFile(manifestPath, JSON.stringify(staleManifest));
@@ -475,6 +609,19 @@ async function closeDesktop(desktop) {
     await assertDesktopAlive(first);
     await originalsIntact();
     await pass("stoppingOneRealInstancePreservesOthers");
+    // Simulate a reused PID using this harness, without terminating or modifying that process.
+    const stale = editableJson(await fs.readFile(manifestPath, "utf8"));
+    stale.pid = process.pid;
+    stale.workerBirthId = 1;
+    stale.identity = null;
+    stale.launchResult = null;
+    await fs.writeFile(manifestPath, JSON.stringify(stale));
+    await fs.writeFile(receiptPath, JSON.stringify({ ...editableJson(savedReceipt), identity: null }));
+    const relaunched = await launchDesktop(b);
+    assert.notEqual(relaunched.id.processId, second.id.processId);
+    await assertDesktopAlive(first);
+    await originalsIntact();
+    await pass("reusedWorkerPidDoesNotBlockRelaunch");
     await snapshot(first, "desktop-recovered");
   } catch (error) {
     report.error = error.stack || String(error);
@@ -483,11 +630,13 @@ async function closeDesktop(desktop) {
       await snapshot(desktop, `failure-${desktops.indexOf(desktop)}`).catch(() => {});
     }
     for (const context of contexts) {
-      const log = await fs.readFile(path.join(context.state, "codex-plus.log"), "utf8").catch(() => "");
+      const log = await bounded(fs.readFile(path.join(context.state, "codex-plus.log"), "utf8"), 3000).catch(() => "");
       report.events.push({ name: "diagnostic", state: context.state, text: log.slice(-20000) });
     }
     process.exitCode = 1;
   } finally {
+    cleaning = true;
+    report.interrupted = interrupted || null;
     for (const desktop of desktops) await closeDesktop(desktop).catch(() => {});
     for (const context of contexts) await stopManager(context).catch(error => {
       report.cleanupErrors = [...(report.cleanupErrors || []), String(error)];
@@ -498,7 +647,9 @@ async function closeDesktop(desktop) {
       catch (error) { report.cleanupErrors = [...(report.cleanupErrors || []), String(error)]; }
     }
     for (const response of held) response.destroy();
-    for (const server of [...servers]) await close(server);
+    for (const server of [...servers]) await close(server).catch(error => {
+      report.cleanupErrors = [...(report.cleanupErrors || []), String(error)];
+    });
     await until(() => !inventory().some(process => sameProcess(process, owned.get(process.ProcessId))),
       "owned test descendants remain alive", 15000).catch(error => {
         report.cleanupErrors = [...(report.cleanupErrors || []), String(error)];
@@ -542,3 +693,38 @@ async function closeDesktop(desktop) {
     if (!report.cleanup || report.cleanupErrors?.length || Object.values(report.checks).some(value => !value)) process.exitCode = 1;
   }
 })();
+
+async function selfTest() {
+  const receipt = '{"birth":134052217980000001,"generation":42}';
+  assert.equal(JSON.stringify(editableJson(receipt)), receipt);
+  const never = () => new Promise(() => {});
+  const watchdog = promise => {
+    let timer;
+    return Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("self-test watchdog expired")), 1000);
+    })]).finally(() => clearTimeout(timer));
+  };
+  await assert.rejects(watchdog(until(never, "hung check", 20)), /hung check/);
+  let exited = false, forced = 0;
+  assert.equal(await exitWithFallback(never, () => exited, () => {
+    forced++;
+    exited = true;
+  }, 20), true);
+  assert.equal(forced, 1);
+  assert.equal(await exitWithFallback(() => Promise.resolve(), () => true,
+    () => assert.fail("already exited manager must not be forced"), 20), false);
+  try {
+    const timer = setTimeout(() => process.emit("SIGTERM"), 20);
+    try { await assert.rejects(until(never, "hung CDP", 2000), /interrupted: SIGTERM/); }
+    finally { clearTimeout(timer); }
+    cleaning = true;
+    await bounded(pause(20), 100);
+    exited = false;
+    assert.equal(await exitWithFallback(never, () => exited, () => { exited = true; }, 20), true);
+  } finally {
+    interrupted = "";
+    cleaning = false;
+    process.exitCode = 0;
+  }
+  console.log("PASS bounded checks, hung exit fallback, interruption, and cleanup after interruption");
+}
