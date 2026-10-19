@@ -2542,6 +2542,105 @@ fn online_catalog_recovery_inserts_only_missing_users_with_original_providers() 
 }
 
 #[test]
+fn online_catalog_source_identity_requires_physical_owner_unless_projected() {
+    const PARENT: &str = "11111111-1111-4111-8111-111111111111";
+    const CHILD: &str = "22222222-2222-4222-8222-222222222222";
+    for compressed in [false, true] {
+        for kind in ["physical-conflict", "history-base", "both"] {
+            for projected in [false, true] {
+                let tmp = tempdir().unwrap();
+                let home = tmp.path();
+                let catalog = paginated_catalog_fixture(home, false);
+                let physical = if kind == "history-base" { PARENT } else { CHILD };
+                let logical = format!("sessions/rollout-{PARENT}_{physical}.jsonl");
+                Connection::open(home.join("state_5.sqlite")).unwrap().execute(
+                    "UPDATE threads SET id=?1,rollout_path=?2",
+                    [PARENT, logical.as_str()],
+                ).unwrap();
+                if projected {
+                    let projection = paginated_projection_fixture(home);
+                    projection.execute("UPDATE thread_turns SET thread_id=?1", [PARENT]).unwrap();
+                    projection.execute("UPDATE thread_items SET thread_id=?1", [PARENT]).unwrap();
+                }
+                let mut meta = json!({"type":"session_meta","payload":{
+                    "id":PARENT,"model_provider":"custom"
+                }});
+                if kind != "physical-conflict" {
+                    meta["payload"]["history_base"] = json!({"thread_id":PARENT});
+                }
+                let text = format!("{meta}\n");
+                fs::create_dir_all(home.join("sessions")).unwrap();
+                let path = home.join(if compressed { format!("{logical}.zst") } else { logical });
+                let bytes = if compressed {
+                    zstd::stream::encode_all(text.as_bytes(), 1).unwrap()
+                } else {
+                    text.into_bytes()
+                };
+                fs::write(&path, &bytes).unwrap();
+                let outcome = codex_plus_data::provider_sync::run_online_session_catalog_recovery(Some(home));
+                assert_eq!(outcome.status, ProviderSyncStatus::Synced, "{compressed}/{kind}/{projected}: {outcome:?}");
+                assert_eq!(outcome.sqlite_catalog_rows_inserted, usize::from(projected),
+                    "{compressed}/{kind}/{projected}: {outcome:?}");
+                assert_eq!(catalog_rows_snapshot(&catalog),
+                    if projected { vec![("local".into(), PARENT.into())] } else { vec![] });
+                if projected {
+                    let provider: String = Connection::open(&catalog).unwrap().query_row(
+                        "SELECT model_provider FROM local_thread_catalog", [], |r| r.get(0),
+                    ).unwrap();
+                    assert_eq!(provider, "custom");
+                }
+                assert_eq!(outcome.sqlite_catalog_rows_removed, 0);
+                assert_eq!(outcome.sqlite_provider_rows_updated, 0);
+                assert_eq!(outcome.changed_session_files, 0);
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+            }
+        }
+    }
+}
+
+#[test]
+fn online_catalog_quarantines_conflicting_source_and_recovers_unrelated_thread() {
+    for corrupt in [false, true] {
+        for existing in [false, true] {
+            let tmp = tempdir().unwrap();
+            let home = tmp.path();
+            let catalog = paginated_catalog_fixture(home, existing);
+            // 即使坏来源有可信投影，也不能从任一冲突副本补建目录。
+            drop(paginated_projection_fixture(home));
+            let state = Connection::open(home.join("state_5.sqlite")).unwrap();
+            state.execute_batch(
+                "INSERT INTO threads SELECT 'good',model_provider,archived,has_user_event,cwd,title,
+                 'sessions/rollout-good.jsonl',source,created_at_ms,updated_at_ms,thread_source,
+                 agent_role,preview,history_mode FROM threads WHERE id='projected'",
+            ).unwrap();
+            drop(state);
+            fs::create_dir_all(home.join("sessions")).unwrap();
+            let plain = home.join("sessions/rollout-projected.jsonl");
+            let text = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"projected\"}}\n";
+            let archive = if corrupt { b"broken zstd".to_vec() } else {
+                zstd::stream::encode_all(text.replace("projected", "other").as_bytes(), 1).unwrap()
+            };
+            fs::write(&plain, text).unwrap();
+            fs::write(plain.with_extension("jsonl.zst"), &archive).unwrap();
+            fs::write(home.join("sessions/rollout-good.jsonl"),
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"good\"}}\n").unwrap();
+            let outcome = codex_plus_data::provider_sync::run_online_session_catalog_recovery(Some(home));
+            assert_eq!(outcome.status, ProviderSyncStatus::Synced, "{outcome:?}");
+            assert_eq!(outcome.sqlite_catalog_rows_inserted, 1, "{outcome:?}");
+            assert_eq!(outcome.repair_audit.quarantined_rollout_sources, 1);
+            assert!(outcome.message.contains("quarantined conflicting rollout sources: 1"));
+            let mut expected = vec![("local".into(), "good".into())];
+            if existing { expected.push(("local".into(), "projected".into())); }
+            assert_eq!(catalog_rows_snapshot(&catalog), expected);
+            assert_eq!(outcome.sqlite_catalog_rows_removed, 0);
+            assert_eq!(outcome.changed_session_files, 0);
+            assert_eq!(fs::read_to_string(&plain).unwrap(), text);
+            assert_eq!(fs::read(plain.with_extension("jsonl.zst")).unwrap(), archive);
+        }
+    }
+}
+
+#[test]
 fn online_catalog_recovery_obeys_lifecycle_guard_without_reentrant_locking() {
     let tmp = tempdir().unwrap();
     let catalog = paginated_catalog_fixture(tmp.path(), false);

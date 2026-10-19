@@ -353,6 +353,9 @@ pub struct ProviderSyncAudit {
     pub scanned_compressed_rollout_files: usize,
     #[serde(default)]
     pub scanned_plain_rollout_files: usize,
+    /// 在线恢复隔离的损坏或内容冲突双副本逻辑源数量。
+    #[serde(default)]
+    pub quarantined_rollout_sources: usize,
     /// 实际存在并被扫描的会话目录名（sessions / archived_sessions）。
     #[serde(default)]
     pub scanned_session_dirs: Vec<String>,
@@ -748,7 +751,13 @@ pub fn run_online_session_catalog_recovery(codex_home: Option<&Path>) -> Provide
         }
         let mut output = result(ProviderSyncStatus::Synced,
             "Online catalog recovery: existing canonical providers preserved", "", None, 0, 0);
-        output.repair_audit = audit_provider_sync_state(&home, &paths)?;
+        output.repair_audit = audit_provider_sync_state_with_source_policy(&home, &paths, true)?;
+        if output.repair_audit.quarantined_rollout_sources > 0 {
+            output.message.push_str(&format!(
+                "; quarantined conflicting rollout sources: {}",
+                output.repair_audit.quarantined_rollout_sources,
+            ));
+        }
         if !missing { return Ok(output); }
         let backup = create_backup(&home, "", &[])?;
         let mut journal = SyncJournal::new(&backup)?;
@@ -1831,6 +1840,14 @@ fn audit_provider_sync_state(
     home: &Path,
     sqlite_paths: &[PathBuf],
 ) -> anyhow::Result<ProviderSyncAudit> {
+    audit_provider_sync_state_with_source_policy(home, sqlite_paths, false)
+}
+
+fn audit_provider_sync_state_with_source_policy(
+    home: &Path,
+    sqlite_paths: &[PathBuf],
+    isolate_conflicts: bool,
+) -> anyhow::Result<ProviderSyncAudit> {
     let mut canonical_thread_ids = HashSet::new();
     let mut catalog_thread_ids = HashSet::new();
     for path in sqlite_paths {
@@ -1847,7 +1864,8 @@ fn audit_provider_sync_state(
         .filter(|dirname| home.join(dirname).exists())
         .map(|dirname| (*dirname).to_string())
         .collect::<Vec<_>>();
-    let rollout_paths = rollout_files(home)?;
+    let mut quarantined_rollout_sources = 0;
+    let rollout_paths = rollout_files_with_source_policy(home, isolate_conflicts, &mut quarantined_rollout_sources)?;
     let scanned_rollout_files = rollout_paths.len();
     let current_rollout_ids = rollout_paths
         .iter()
@@ -1858,6 +1876,7 @@ fn audit_provider_sync_state(
         })
         .collect::<HashSet<_>>();
     let mut audit = ProviderSyncAudit {
+        quarantined_rollout_sources,
         scanned_rollout_files,
         scanned_compressed_rollout_files: rollout_paths.iter()
             .filter(|path| rollout_source::is_compressed(path)).count(),
@@ -3109,6 +3128,14 @@ fn rewrite_rollout_session_meta_providers_for_threads(
 }
 
 fn rollout_files(home: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    rollout_files_with_source_policy(home, false, &mut 0)
+}
+
+fn rollout_files_with_source_policy(
+    home: &Path,
+    isolate_conflicts: bool,
+    quarantined: &mut usize,
+) -> anyhow::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for dirname in SESSION_DIRS {
         let root = home.join(dirname);
@@ -3123,11 +3150,18 @@ fn rollout_files(home: &Path) -> anyhow::Result<Vec<PathBuf>> {
         .filter(|p| !rollout_source::is_compressed(p))
         .cloned()
         .collect::<HashSet<_>>();
+    let mut conflicts = HashSet::new();
     for plain in &plain_paths {
-        ensure_rollout_copies_agree(plain)?;
+        if let Err(error) = ensure_rollout_copies_agree(plain) {
+            if !isolate_conflicts { return Err(error); }
+            conflicts.insert(plain.clone());
+        }
     }
+    *quarantined = conflicts.len();
     files.retain(|p| {
-        !rollout_source::is_compressed(p) || !plain_paths.contains(&p.with_extension(""))
+        let plain = if rollout_source::is_compressed(p) { p.with_extension("") } else { p.clone() };
+        !conflicts.contains(&plain)
+            && (!rollout_source::is_compressed(p) || !plain_paths.contains(&plain))
     });
     Ok(files)
 }
@@ -6054,12 +6088,12 @@ fn catalog_source_stamp(home: &Path, raw: &str) -> anyhow::Result<CatalogSourceS
 
 fn catalog_plan_source_proofs(home: &Path, plan: &CatalogRepairPlan) -> anyhow::Result<CatalogSourceProofs> {
     let mut proofs = HashMap::new();
-    for thread in plan.threads.values().filter(|thread| plan.source_only_thread_ids.contains(&thread.id)) {
+    for thread in plan.threads.values() {
         let before = catalog_source_stamp(home, &thread.source_detail)?;
-        for path in rollout_path_candidates(home, &thread.source_detail) {
-            ensure_rollout_copies_agree(&path)?;
-        }
-        if catalog_source_identity_verified(home, &thread.source_detail, &thread.id)
+        if rollout_path_candidates(home, &thread.source_detail).iter()
+            .any(|path| ensure_rollout_copies_agree(path).is_err()) { continue; }
+        if (!plan.source_only_thread_ids.contains(&thread.id)
+            || catalog_source_identity_verified(home, &thread.source_detail, &thread.id))
             && before == catalog_source_stamp(home, &thread.source_detail)?
         {
             proofs.insert((thread.id.clone(), thread.source_detail.clone()), before);
@@ -6158,9 +6192,13 @@ fn collect_catalog_repair_plan_with_source_proofs(
                 });
             let non_root = is_catalog_non_root_agent(&thread, &spawned_child_ids);
             let source_is_exec = thread.source_kind.trim().eq_ignore_ascii_case("exec");
+            let mut conflicting_source = false;
             if source_proofs.is_none() {
                 for candidate in rollout_path_candidates(home, &thread.source_detail) {
-                    ensure_rollout_copies_agree(&candidate)?;
+                    if let Err(error) = ensure_rollout_copies_agree(&candidate) {
+                        if target_provider.is_some() { return Err(error); }
+                        conflicting_source = true;
+                    }
                 }
             }
             let rollout_exists = (target_provider.is_some() || !thread.source_detail.trim().is_empty())
@@ -6175,7 +6213,12 @@ fn collect_catalog_repair_plan_with_source_proofs(
             let projected = paginated
                 && projection
                     .as_ref()
-                    .is_some_and(|ids| ids.contains(&thread.id));
+                    .is_some_and(|ids| ids.contains(&thread.id))
+                && source_proofs.is_none_or(|proofs| {
+                    proofs.get(&(thread.id.clone(), thread.source_detail.clone()))
+                        .is_some_and(|before| catalog_source_stamp(home, &thread.source_detail)
+                            .is_ok_and(|current| current == *before))
+                });
             let source_verified = rollout_exists
                 && (!user_thread
                     || target_provider.is_some()
@@ -6187,11 +6230,11 @@ fn collect_catalog_repair_plan_with_source_proofs(
                     } else {
                         catalog_source_identity_verified(home, &thread.source_detail, &thread.id)
                     });
-            let eligible = user_thread && (source_verified || projected)
+            let eligible = !conflicting_source && user_thread && (source_verified || projected)
                 && (target_provider.is_some() || !thread.model_provider.trim().is_empty());
             // 无法确认来源只阻止补建，不作为删除现有侧边栏记录的依据。
             let uncertain_source =
-                user_thread && !rollout_exists && (!paginated || projection.is_none());
+                conflicting_source || (user_thread && !rollout_exists && (!paginated || projection.is_none()));
             let replace = observed_threads
                 .get(&thread.id)
                 .map(|current: &CatalogRepairObservedThread| {
@@ -6273,6 +6316,15 @@ fn catalog_source_identity_verified(home: &Path, raw_path: &str, thread_id: &str
             let Some(first) = lines.next() else { return Ok(false); };
             let first: Value = serde_json::from_str(&first?)?;
             if first["type"] != "session_meta" || first["payload"]["id"].as_str() != Some(thread_id) {
+                return Ok(false);
+            }
+            // continuation 首行可能仍属于父线程，不能据此认定物理来源归属。
+            if first["payload"].get("history_base").is_some()
+                || rollout_source::logical_stem(&physical)
+                    .and_then(|stem| stem.get(stem.len().checked_sub(36)?..))
+                    .and_then(|suffix| uuid::Uuid::parse_str(suffix).ok())
+                    .is_some_and(|id| uuid::Uuid::parse_str(thread_id).ok() != Some(id))
+            {
                 return Ok(false);
             }
             for line in lines {
