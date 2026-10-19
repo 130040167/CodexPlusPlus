@@ -4994,7 +4994,6 @@ mod tests {
             matchers::{method, path},
         };
         let _settings_guard = crate::paths::settings_path_test_guard();
-        let _rotation_guard = crate::relay_rotation::rotation_test_guard();
         let temp = tempfile::tempdir().unwrap();
         let settings_path = temp.path().join("settings.json");
         struct Restore(Option<PathBuf>);
