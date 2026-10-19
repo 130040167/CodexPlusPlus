@@ -85,12 +85,14 @@ pub(crate) fn parse_window_token(token: &str) -> Option<u64> {
     if token.is_empty() {
         return None;
     }
-    let (num_part, multiplier) = match token.chars().last() {
+    let (num_part, multiplier) = if token.to_ascii_lowercase().ends_with("kk") {
+        (&token[..token.len() - 2], 1_000_000u64)
+    } else { match token.chars().last() {
         Some('K' | 'k') => (&token[..token.len() - 1], 1_000u64),
         Some('M' | 'm') => (&token[..token.len() - 1], 1_000_000u64),
         Some(_) => (token, 1u64),
         None => return None,
-    };
+    }};
     let (whole, fraction) = num_part.trim().split_once('.').unwrap_or((num_part.trim(), ""));
     if whole.is_empty() || !whole.bytes().all(|c| c.is_ascii_digit())
         || !fraction.bytes().all(|c| c.is_ascii_digit())
@@ -112,7 +114,7 @@ pub(crate) fn parse_window_token(token: &str) -> Option<u64> {
 fn decimal_window_tokens_preserve_integer_token_precision() {
     for (input, expected) in [("1m", 1_000_000), ("200k", 200_000), ("1.2M", 1_200_000),
         ("212.5K", 212_500), ("0.001k", 1), ("212500", 212_500), ("212500.9", 212_500),
-        ("1.0001K", 1_000), ("1.2", 1)] {
+        ("1.0001K", 1_000), ("1.2", 1), ("1kk", 1_000_000), ("1.2Kk", 1_200_000)] {
         assert_eq!(parse_window_token(input), Some(expected), "{input}");
     }
     for input in ["1.M", "0M", "18446744073709551616"] {

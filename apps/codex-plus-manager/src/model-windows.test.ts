@@ -11,6 +11,7 @@ import {
   mergeModelWindowRows,
   reorderModelWindowRows,
   normalizeModelWindowInput,
+  formatModelWindowInput,
   isValidModelWindow,
 } from "./model-windows.ts";
 import { suffixWindowTokens } from "./model-metadata.ts";
@@ -21,6 +22,7 @@ it("decimal K/M windows normalize units and retain numeric spelling", () => {
     ["1.2m", "1200000", 1200000], ["212.5k", "212500", 212500],
     ["212500", "212500", 212500], ["0.001k", "1", 1],
     ["212500.9", "212500", 212500], ["1.2", "1", 1], ["1.0001K", "1000", 1000],
+    ["1kk", "1000000", 1000000], ["1.2Kk", "1200000", 1200000],
   ] as const) {
     assert.equal(normalizeModelWindowInput(input), normalized);
     assert.equal(isValidModelWindow(input), true);
@@ -29,6 +31,14 @@ it("decimal K/M windows normalize units and retain numeric spelling", () => {
   for (const input of ["0M", "1.M"]) {
     assert.equal(isValidModelWindow(input), false);
     assert.equal(suffixWindowTokens(input), null);
+  }
+});
+
+it("compact context display is exact and round trips without rounding", () => {
+  for (const [value, expected] of [["1000000", "1M"], ["1200000", "1.2M"], ["212500", "212.5K"],
+    ["1000001", "1.000001M"], ["999", "999"], ["", ""]]) {
+    assert.equal(formatModelWindowInput(value), expected);
+    assert.equal(normalizeModelWindowInput(expected), value);
   }
 });
 

@@ -183,7 +183,7 @@ export type BuiltinModelMetadataEntry = {
 // 规范 slug 与行名永远对不上（issue #2279 回归）。
 // 这里集中放一处，四个入口（内置预填、parseModelMetadataDocument、
 // synchronize*、metadataMatchesBuiltin）共用，避免各自实现再次分叉。
-const MODEL_SUFFIX_PATTERN = /^(.*?)\[(\d+(?:\.\d+)?(?:[KkMm])?)\]$/;
+const MODEL_SUFFIX_PATTERN = /^(.*?)\[(\d+(?:\.\d+)?(?:[Kk]{2}|[KkMm])?)\]$/;
 
 export type ModelRowIdentity = {
   rawName: string;
@@ -215,9 +215,9 @@ export function modelSlugFromRowName(rowName: string): string {
 /// 把后缀文字换算成 token 数：`[1M]`→1000000、`[256K]`→256000、`[123]`→123。
 /// 支持小数和 K/M 单位，大小写均可；换算后向下截断为正整数 token。
 export function suffixWindowTokens(suffix: string): number | null {
-  const match = /^(\d+)(?:\.(\d+))?([KkMm])?$/.exec(suffix.trim());
+  const match = /^(\d+)(?:\.(\d+))?(kk|k|m)?$/i.exec(suffix.trim());
   if (!match) return null;
-  const multiplier = match[3]?.toLowerCase() === "m" ? 1_000_000n : match[3] ? 1_000n : 1n;
+  const multiplier = /^(m|kk)$/i.test(match[3] || "") ? 1_000_000n : match[3] ? 1_000n : 1n;
   const precision = multiplier === 1_000_000n ? 6 : multiplier === 1_000n ? 3 : 0;
   const fraction = (match[2] || "").slice(0, precision);
   const tokens = BigInt(match[1]) * multiplier

@@ -123,7 +123,6 @@ import {
   metadataSourceTags,
   modelSlugFromRowName,
   suffixWindowString,
-  normalizeTokenCountInput,
   modelMetadataKey,
   modelFastSupportMode,
   synchronizeModelMetadataLiteSupport,
@@ -160,6 +159,7 @@ import { relaySettingsSaveRestartReason, relaySettingsSaveCapabilityProfileNames
 import {
   mergeModelWindowRows,
   normalizeModelWindowInput,
+  formatModelWindowInput,
   modelWindowRowsFromProfile,
   modelWindowRowsValidationError,
   serializeModelWindowRows,
@@ -10948,18 +10948,16 @@ function RelayProfileEditor({
               />
             </Field>
             <Field className="relay-field-context-window" label={t("上下文大小")}>
-              <Input
-                inputMode="numeric"
+              <ModelWindowInput
                 value={profile.contextWindow}
-                onChange={(event) => updateDraft({ contextWindow: normalizeTokenCountInput(event.currentTarget.value) })}
+                onValueCommit={(value) => updateDraft({ contextWindow: value })}
                 placeholder={t("留空不改写，例如 200000")}
               />
             </Field>
             <Field className="relay-field-auto-compact" label={t("压缩上下文大小")}>
-              <Input
-                inputMode="numeric"
+              <ModelWindowInput
                 value={profile.autoCompactLimit}
-                onChange={(event) => updateDraft({ autoCompactLimit: normalizeTokenCountInput(event.currentTarget.value) })}
+                onValueCommit={(value) => updateDraft({ autoCompactLimit: value })}
                 placeholder={t("留空不改写，例如 160000")}
               />
             </Field>
@@ -13304,14 +13302,21 @@ function Field({ label, children, className = "" }: { label: string; children: R
   );
 }
 
-function ModelWindowInput(props: React.ComponentProps<typeof Input>) {
+function ModelWindowInput({ onValueCommit, ...props }: React.ComponentProps<typeof Input> & { onValueCommit?: (value: string) => void }) {
   const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
   const value = String(props.value ?? "");
-  const normalized = normalizeModelWindowInput(value);
-  const display = /^\d+$/.test(normalized) ? normalized.replace(/\B(?=(\d{3})+(?!\d))/g, ",") : value;
-  return <Input {...props} value={editing ? value : display}
-    onFocus={(event) => { setEditing(true); props.onFocus?.(event); }}
-    onBlur={(event) => { setEditing(false); props.onBlur?.(event); }} />;
+  return <Input {...props} value={editing ? onValueCommit ? draft : value : formatModelWindowInput(value)}
+    onFocus={(event) => { setDraft(value); setEditing(true); props.onFocus?.(event); }}
+    onChange={(event) => { setDraft(event.currentTarget.value); props.onChange?.(event); }}
+    onBlur={(event) => {
+      setEditing(false);
+      if (onValueCommit) {
+        const normalized = normalizeModelWindowInput(draft);
+        if (!normalized || /^\d+$/.test(normalized)) onValueCommit(normalized);
+      }
+      props.onBlur?.(event);
+    }} />;
 }
 
 function ModelNameInput({
