@@ -10,6 +10,10 @@ const path = require("node:path");
 const net = require("node:net");
 const http = require("node:http");
 const { spawn, execFileSync } = require("node:child_process");
+if (process.argv[2] === "--self-test") {
+  selfTest().catch(error => { console.error(error); process.exitCode = 1; });
+  return;
+}
 const { chromium } = require("playwright");
 
 assert.equal(process.platform, "win32");
@@ -27,7 +31,7 @@ const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const comparableText = value => value.normalize("NFKC").replace(/[\s\p{P}\p{S}]/gu, "");
 const ps = (script, env = process.env) => execFileSync("powershell.exe",
   ["-NoProfile", "-NonInteractive", "-Command", script],
-  { env, encoding: "utf8", windowsHide: true, maxBuffer: 16e6 });
+  { env, encoding: "utf8", windowsHide: true, maxBuffer: 16e6, timeout: 30000 });
 const inventory = () => JSON.parse(ps(
   "ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process | " +
   "Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine," +
@@ -52,13 +56,13 @@ for (const signal of ["SIGINT", "SIGTERM"]) process.once(signal, () => {
 });
 const report = { token, fixtureRoot, temporary, checks: {}, desktops: [], cleanupErrors: [],
   requests: [], cleanup: false };
-const save = () => fs.writeFile(path.join(outputDir, `${token}.json`), JSON.stringify(report, null, 2));
+const save = () => bounded(fs.writeFile(path.join(outputDir, `${token}.json`), JSON.stringify(report, null, 2)));
 async function until(check, reason, timeout = 60000) {
   const deadline = Date.now() + timeout;
   do {
     if (interrupted && !cleaning) throw Error("Acceptance interrupted; cleaning owned processes");
-    if (await check()) return;
-    await pause(350);
+    if (await bounded(Promise.resolve().then(check), Math.max(1, deadline - Date.now()))) return;
+    await bounded(pause(Math.min(350, Math.max(1, deadline - Date.now()))));
   } while (Date.now() < deadline);
   throw Error(reason);
 }
@@ -66,6 +70,10 @@ async function bounded(promise, ms = 10000) {
   let timer, interruptTimer;
   try {
     return await Promise.race([promise, new Promise((_, reject) => {
+      if (interrupted && !cleaning) {
+        reject(Error("Acceptance interrupted"));
+        return;
+      }
       timer = setTimeout(() => reject(Error("Operation timed out")), ms);
       interruptTimer = setInterval(() => {
         if (interrupted && !cleaning) reject(Error("Acceptance interrupted"));
@@ -74,7 +82,7 @@ async function bounded(promise, ms = 10000) {
   } finally { clearTimeout(timer); clearInterval(interruptTimer); }
 }
 async function rejectLinks(root) {
-  for (const entry of await fs.readdir(root, { withFileTypes: true })) {
+  for (const entry of await bounded(fs.readdir(root, { withFileTypes: true }))) {
     const filename = path.join(root, entry.name);
     assert.ok(!entry.isSymbolicLink(), "Fixture links must be flattened before acceptance");
     if (entry.isDirectory()) await rejectLinks(filename);
@@ -82,12 +90,16 @@ async function rejectLinks(root) {
 }
 async function freePort() {
   const server = net.createServer();
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const port = server.address().port;
-  await new Promise(resolve => server.close(resolve));
+  let port;
+  try {
+    await bounded(new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    }));
+    port = server.address().port;
+  } finally {
+    await bounded(new Promise(resolve => server.close(resolve)));
+  }
   // Avoid reusing a previously selected port, although binding still has a TOCTOU window.
   if (ports.has(port)) return freePort();
   ports.add(port);
@@ -131,8 +143,25 @@ function killOwned(pid) {
   { ...process.env, HISTORY_PID: String(pid), HISTORY_EXE: actual.ExecutablePath,
     HISTORY_BIRTH: actual.CreationDate });
 }
-const invoke = (command, args = {}) => managerPage.evaluate(
-  ({ command, args }) => window.__TAURI_INTERNALS__.invoke(command, args), { command, args });
+const invoke = (command, args = {}, timeout = 30000) => bounded(managerPage.evaluate(
+  ({ command, args }) => window.__TAURI_INTERNALS__.invoke(command, args), { command, args }), timeout);
+
+async function connectBrowser(port) {
+  const connecting = chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: 10000 });
+  // A connection can settle after interruption; close that late transport as well.
+  let abandoned = false;
+  connecting.then(browser => {
+    if (abandoned) bounded(browser.close()).catch(error => report.cleanupErrors.push(String(error)));
+  }, () => {});
+  try {
+    const browser = await bounded(connecting);
+    for (const context of browser.contexts()) context.setDefaultTimeout(10000);
+    return browser;
+  } catch (error) {
+    abandoned = true;
+    throw error;
+  }
+}
 
 // Match CODEX_SQLITE_HOME precedence without ever falling back to the real user home.
 const sqlitePython = String.raw`
@@ -265,7 +294,7 @@ print(json.dumps({"ids":sorted(ids),"catalogRowsRemoved":changed,"present":len(f
 `;
 const python = (code, args) => execFileSync(process.env.HISTORY_PYTHON || "python",
   ["-X", "utf8", "-c", code, JSON.stringify(args)],
-  { encoding: "utf8", windowsHide: true, maxBuffer: 4e6 });
+  { encoding: "utf8", windowsHide: true, maxBuffer: 4e6, timeout: 60000 });
 
 async function openDesktop(desktop) {
   const launchedAt = Date.now();
@@ -296,7 +325,7 @@ async function openDesktop(desktop) {
   assert.ok(manifest?.running, "Desktop manifest is not running");
   assert.equal(path.resolve(manifest.codexHome), desktop.home);
   assert.equal(path.resolve(manifest.sqliteHome), desktop.sqlite);
-  desktop.browser = await chromium.connectOverCDP(`http://127.0.0.1:${id.debugPort}`);
+  desktop.browser = await connectBrowser(id.debugPort);
   await until(async () => {
     desktop.page = desktop.browser.contexts().flatMap(c => c.pages()).find(p => p.url().startsWith("app://"));
     return desktop.page && await desktop.page.locator("body").innerText().then(t => t.length > 100).catch(() => false);
@@ -323,34 +352,34 @@ async function verifyConversation(desktop, target) {
   assert.ok(target.project, `No fixture project for ${target.id}`);
   assert.ok(target.title, `No fixture conversation title for ${target.id}`);
   const continueModel = desktop.page.getByRole("button", { name: "继续使用当前模型", exact: true });
-  if (await continueModel.isVisible()) await continueModel.click();
-  await desktop.page.screenshot({
+  if (await bounded(continueModel.isVisible())) await bounded(continueModel.click());
+  await bounded(desktop.page.screenshot({
     path: path.join(outputDir, `${token}-${desktop.instanceId}-${target.label}-before.png`),
-  });
+  }));
   let link = desktop.page.locator(
     `[data-app-action-sidebar-thread-id="local:${target.id}"]:visible,a[href*="${target.id}"]:visible`,
   ).first();
   let titled = desktop.page.getByText(target.title, { exact: true }).first();
-  for (let attempt = 0; attempt < 8 && !await link.isVisible() && !await titled.isVisible(); attempt++) {
+  for (let attempt = 0; attempt < 8 && !await bounded(link.isVisible()) && !await bounded(titled.isVisible()); attempt++) {
     const expand = desktop.page.getByText("展开显示", { exact: true }).first();
-    if (!await expand.isVisible()) break;
-    await expand.click();
-    await pause(500);
+    if (!await bounded(expand.isVisible())) break;
+    await bounded(expand.click());
+    await bounded(pause(500));
   }
   const evidence = { instanceId: desktop.instanceId, threadId: target.id, project: target.project };
-  if (await link.isVisible() || await titled.isVisible()) {
+  if (await bounded(link.isVisible()) || await bounded(titled.isVisible())) {
     evidence.sidebarVisible = true;
-    evidence.navigation = await link.isVisible() ? "visible-thread-link" : "visible-conversation-title";
-    await desktop.page.screenshot({
+    evidence.navigation = await bounded(link.isVisible()) ? "visible-thread-link" : "visible-conversation-title";
+    await bounded(desktop.page.screenshot({
       path: path.join(outputDir, `${token}-${desktop.instanceId}-${target.label}-list.png`),
-    });
-    await (await link.isVisible() ? link : titled).click();
+    }));
+    await bounded((await bounded(link.isVisible()) ? link : titled).click());
   }
   else {
     evidence.sidebarVisible = false;
     evidence.navigation = "not-discovered";
-    await fs.writeFile(path.join(outputDir, `${token}-${desktop.instanceId}-navigation.txt`),
-      await desktop.page.locator("body").innerText());
+    await bounded(fs.writeFile(path.join(outputDir, `${token}-${desktop.instanceId}-navigation.txt`),
+      await bounded(desktop.page.locator("body").innerText())));
     throw Error(`Conversation title is not discoverable in the isolated sidebar: ${target.label}`);
   }
   await until(async () => {
@@ -365,7 +394,7 @@ async function verifyConversation(desktop, target) {
         return expected.length >= 25 && rendered.includes(expected);
       });
   }, `Desktop did not render project and existing message: ${target.label}`, 90000);
-  await desktop.page.screenshot({ path: path.join(outputDir, `${token}-${desktop.instanceId}-${target.label}.png`) });
+  await bounded(desktop.page.screenshot({ path: path.join(outputDir, `${token}-${desktop.instanceId}-${target.label}.png`) }));
   report.navigation ??= [];
   report.navigation.push(evidence);
   report.sidebarCoverage ??= {};
@@ -389,12 +418,12 @@ async function cleanup() {
     const version = await fetch(`http://127.0.0.1:${desktop.id.debugPort}/json/version`,
       { signal: AbortSignal.timeout(3000) }).then(r => r.json());
     assert.ok(version.webSocketDebuggerUrl.endsWith(`/devtools/browser/${desktop.id.browserId}`));
-    const session = await desktop.browser.newBrowserCDPSession();
+    const session = await bounded(desktop.browser.newBrowserCDPSession());
     // Electron may close the socket before acknowledging Browser.close.
     await bounded(session.send("Browser.close"), 5000).catch(() => {});
   });
   if (managerPage && manager && manager.exitCode === null) await safely(async () => {
-    await bounded(invoke("manager_exit_app"), 5000).catch(() => {});
+    await invoke("manager_exit_app", {}, 5000).catch(() => {});
     await until(() => manager.exitCode !== null, "Manager normal exit timed out", 15000)
       .catch(error => { report.managerExitFallback = String(error); });
   });
@@ -406,7 +435,7 @@ async function cleanup() {
   }
   if (upstream) await safely(async () => {
     upstream.closeAllConnections?.();
-    await new Promise(resolve => upstream.close(resolve));
+    await bounded(new Promise(resolve => upstream.close(resolve)));
   });
   await safely(() => until(() => {
     const remaining = captureOwned().filter(p => same(p, owned.get(p.ProcessId)));
@@ -435,17 +464,95 @@ async function cleanup() {
     && report.checks.portsReleased && report.cleanupErrors.length === 0;
 }
 
+async function selfTest() {
+  const vm = require("node:vm");
+  const source = readFileSync(__filename, "utf8");
+  const helpers = source.slice(source.indexOf("async function until("), source.indexOf("async function rejectLinks("));
+  const context = vm.createContext({
+    setTimeout, clearTimeout, setInterval, clearInterval,
+    pause: ms => new Promise(resolve => setTimeout(resolve, ms)),
+    interrupted: false, cleaning: false,
+  });
+  vm.runInContext(helpers, context);
+  const { EventEmitter } = require("node:events");
+  context.process = new EventEmitter();
+  vm.runInContext(source.slice(source.indexOf('for (const signal of ["SIGINT"'),
+    source.indexOf("const report =")), context);
+  const never = () => new Promise(() => {});
+  const watchdog = async promise => {
+    let timer;
+    try {
+      return await Promise.race([promise, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(Error("self-test watchdog: wait did not finish")), 1000);
+      })]);
+    } finally { clearTimeout(timer); }
+  };
+  await assert.rejects(watchdog(context.until(never, "deadline", 20)), /timed out|deadline/i);
+  let finalized = false;
+  const interrupted = (async () => {
+    try { await context.until(never, "signal", 10000); }
+    finally { finalized = true; }
+  })();
+  setTimeout(() => context.process.emit("SIGINT"), 20);
+  await assert.rejects(watchdog(interrupted), /interrupted/i);
+  assert.ok(finalized, "interruption must reach finally");
+  context.cleaning = true;
+  await assert.rejects(watchdog(context.bounded(never(), 20)), /timed out/i);
+  assert.equal(await context.bounded(Promise.resolve("cleanup"), 20), "cleanup");
+  context.managerPage = { evaluate: () => never() };
+  let completeConnection;
+  let lateClosed = false;
+  context.chromium = { connectOverCDP: (_url, options) => {
+    assert.ok(options.timeout > 0);
+    return new Promise(resolve => { completeConnection = resolve; });
+  } };
+  context.report = { cleanupErrors: [] };
+  vm.runInContext(source.slice(source.indexOf("const invoke ="),
+    source.indexOf("// Match CODEX_SQLITE_HOME")) + "\nglobalThis.testInvoke = invoke;", context);
+  await assert.rejects(watchdog(context.testInvoke("synthetic", {}, 20)), /timed out/i);
+  context.cleaning = false;
+  context.interrupted = false;
+  const ipc = (async () => {
+    try { await context.testInvoke("synthetic"); }
+    finally { finalized = true; }
+  })();
+  finalized = false;
+  setTimeout(() => context.process.emit("SIGTERM"), 20);
+  await assert.rejects(watchdog(ipc), /interrupted/i);
+  assert.ok(finalized);
+  context.interrupted = false;
+  const connecting = context.connectBrowser(12345);
+  setTimeout(() => { context.interrupted = true; }, 20);
+  await assert.rejects(watchdog(connecting), /interrupted/i);
+  context.cleaning = true;
+  completeConnection({ close: async () => { lateClosed = true; } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.ok(lateClosed, "late CDP connection must close after cancellation");
+  // Inspect both synchronous launchers without creating any process.
+  const calls = [];
+  const execContext = vm.createContext({
+    process: { env: {} }, JSON,
+    execFileSync: (...args) => calls.push(args),
+  });
+  vm.runInContext(source.slice(source.indexOf("const ps ="), source.indexOf("const inventory ="))
+    + source.slice(source.indexOf("const python ="), source.indexOf("async function openDesktop("))
+    + '\nps("synthetic"); python("synthetic", {});', execContext);
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every(([, , options]) => options.timeout > 0 && Number.isFinite(options.timeout)));
+  console.log("Synthetic deadline, interruption/finally, and cleanup tests passed");
+}
+
 (async () => {
-  await fs.mkdir(outputDir, { recursive: true });
   try {
+    await bounded(fs.mkdir(outputDir, { recursive: true }));
     assert.ok(!inside(fixtureRoot, outputDir) && outputDir !== fixtureRoot, "Output must be outside source fixture");
-    assert.notEqual(await fs.realpath(path.join(fixtureRoot, "home")),
+    assert.notEqual(await bounded(fs.realpath(path.join(fixtureRoot, "home"))),
       path.resolve(process.env.USERPROFILE, ".codex"), "Production CODEX_HOME is not a fixture");
-    await fs.access(path.join(fixtureRoot, "sqlite-home"));
+    await bounded(fs.access(path.join(fixtureRoot, "sqlite-home")));
     await rejectLinks(fixtureRoot);
-    await fs.access(managerExe);
-    await fs.access(appDir);
-    await fs.mkdir(state, { recursive: true });
+    await bounded(fs.access(managerExe));
+    await bounded(fs.access(appDir));
+    await bounded(fs.mkdir(state, { recursive: true }));
     upstream = http.createServer((request, response) => {
       report.requests.push({ method: request.method, path: request.url });
       // Any model submission is a harness failure, not a synthetic successful completion.
@@ -454,7 +561,10 @@ async function cleanup() {
         ? { object: "list", data: [{ id: "fixture-model", object: "model" }] }
         : { error: { message: "History-only acceptance: model calls forbidden" } }));
     });
-    await new Promise(resolve => upstream.listen(0, "127.0.0.1", resolve));
+    await bounded(new Promise((resolve, reject) => {
+      upstream.once("error", reject);
+      upstream.listen(0, "127.0.0.1", resolve);
+    }));
     ports.add(upstream.address().port);
     const base = `http://127.0.0.1:${upstream.address().port}/v1`;
     for (const suffix of ["a", "b"]) {
@@ -462,8 +572,10 @@ async function cleanup() {
       const desktop = { instanceId, root, home: path.join(root, "codex-home"),
         sqlite: path.join(root, "sqlite-home"), debug: await freePort() };
       desktops.push(desktop); // Register before any process creation or fallible launch.
-      await fs.cp(path.join(fixtureRoot, "home"), desktop.home, { recursive: true, errorOnExist: true, force: false });
-      await fs.cp(path.join(fixtureRoot, "sqlite-home"), desktop.sqlite, { recursive: true, errorOnExist: true, force: false });
+      await bounded(fs.cp(path.join(fixtureRoot, "home"), desktop.home,
+        { recursive: true, errorOnExist: true, force: false }), 120000);
+      await bounded(fs.cp(path.join(fixtureRoot, "sqlite-home"), desktop.sqlite,
+        { recursive: true, errorOnExist: true, force: false }), 120000);
       desktop.preparation = JSON.parse(python(preparePython, {
         fixtureHome: path.join(fixtureRoot, "home"), home: desktop.home, sqlite: desktop.sqlite,
       }));
@@ -473,12 +585,12 @@ async function cleanup() {
       assert.ok(roots.every(root => typeof root === "string" && path.isAbsolute(root)),
         "Canonical workspace roots must be absolute");
       // Construct only the native project roots and display labels; never inherit production state.
-      await fs.writeFile(path.join(desktop.home, ".codex-global-state.json"), JSON.stringify({
+      await bounded(fs.writeFile(path.join(desktop.home, ".codex-global-state.json"), JSON.stringify({
         "electron-saved-workspace-roots": roots,
         "active-workspace-roots": roots,
         "electron-workspace-root-labels": Object.fromEntries(
           desktop.references.map(target => [target.cwd, target.project])),
-      }));
+      })));
       desktop.seed = JSON.parse(python(catalogPython, {
         mode: "seed", home: desktop.home, sqlite: desktop.sqlite, targets,
       }));
@@ -490,12 +602,12 @@ async function cleanup() {
       model: "fixture-model", modelList: "fixture-model", baseUrl: base, upstreamBaseUrl: base,
       apiKey: "synthetic-history-only", authContents: '{"OPENAI_API_KEY":"synthetic-history-only"}',
       configContents: `model="fixture-model"\nmodel_provider="custom"\n[model_providers.custom]\nname="Fixture"\nwire_api="responses"\nbase_url="${base}"\nrequires_openai_auth=false\n` };
-    await fs.writeFile(path.join(state, "settings.json"), JSON.stringify({
+    await bounded(fs.writeFile(path.join(state, "settings.json"), JSON.stringify({
       localConfigProviderImported: true, providerSyncEnabled: false, sessionIndexAutoRepairEnabled: true,
       codexAppAutoTakeover: false, enhancementsEnabled: false, codexAppStandaloneQuotaUnlock: false,
       codexAppPath: appDir, relayProfilesEnabled: true, activeRelayId: "fixture", relayProfiles: [profile],
       relayCommonConfigContents: "analytics.enabled=false\n[features]\nplugins=false\napps=false\nremote_plugin=false\n",
-    }));
+    })));
     const debug = await freePort(), managerGuard = await freePort(), launcherGuard = await freePort();
     const proxy = await freePort();
     const env = { ...process.env, CODEX_PLUS_STATE_DIR: state, CODEX_HOME: desktops[0].home,
@@ -508,20 +620,24 @@ async function cleanup() {
     for (const key of ["CODEX_PLUS_GUARD_PORT", "CODEX_PLUS_MULTI_INSTANCE", "CODEX_PLUS_INSTANCE_ID",
       "CODEX_PLUS_INSTANCE_LABEL", "OPENAI_API_KEY", "OPENAI_BASE_URL"]) delete env[key];
     manager = spawn(managerExe, [], { env, windowsHide: true, stdio: "ignore" });
+    let managerSpawnError;
+    manager.once("error", error => { managerSpawnError = error; });
     await until(async () => {
+      if (managerSpawnError) throw managerSpawnError;
       assert.equal(manager.exitCode, null, "Manager exited");
       captureOwned();
       return fetch(`http://127.0.0.1:${debug}/json`, { signal: AbortSignal.timeout(1000) })
         .then(r => r.ok).catch(() => false);
     }, "Manager WebView unavailable");
-    managerBrowser = await chromium.connectOverCDP(`http://127.0.0.1:${debug}`);
+    managerBrowser = await connectBrowser(debug);
     managerPage = managerBrowser.contexts().flatMap(c => c.pages())[0];
-    await managerPage.waitForFunction(() => window.__TAURI_INTERNALS__?.invoke);
+    await bounded(managerPage.waitForFunction(() => window.__TAURI_INTERNALS__?.invoke,
+      undefined, { timeout: 10000 }));
     for (const desktop of desktops) await openDesktop(desktop);
     for (const desktop of desktops) for (const target of desktop.references) await verifyConversation(desktop, target);
     report.manual = [];
     for (let attempt = 0; attempt < 2; attempt++) {
-      const result = await bounded(invoke("repair_session_index"), 240000);
+      const result = await invoke("repair_session_index", {}, 240000);
       report.manual.push(result);
       assert.equal(result.status, "ok", result.message);
       assert.equal(result.catalogRecovery?.status, "synced", result.message);
@@ -537,7 +653,9 @@ async function cleanup() {
     report.error = String(error.stack || error);
     process.exitCode = 1;
     for (const desktop of desktops) if (desktop.page) {
-      await desktop.page.screenshot({ path: path.join(outputDir, `${token}-${desktop.instanceId}-failure.png`) }).catch(() => {});
+      await bounded(desktop.page.screenshot({
+        path: path.join(outputDir, `${token}-${desktop.instanceId}-failure.png`),
+      })).catch(() => {});
     }
   } finally {
     try { await cleanup(); } catch (error) { report.cleanupErrors.push(String(error)); }
