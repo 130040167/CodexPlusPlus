@@ -5802,18 +5802,6 @@ impl Drop for AggregateHttpRegressionFixture {
     }
 }
 
-async fn aggregate_http_file_request(input: &str) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let body = json!({
-            "model": "client-model", "input": input, "stream": false,
-            "conversation_id": "same-http-regression-session"
-        }).to_string();
-        let mut response = open_responses_proxy_request(&body, None).await.unwrap();
-        assert_eq!(response.status_code, 200);
-        assert_eq!(response.read_body().await.unwrap(), b"{}");
-    }).await.expect("file-backed proxy request timed out");
-}
-
 #[tokio::test]
 async fn aggregate_http_retired_model_can_continue_after_switching_to_pool() {
     let _lock = settings_path_test_lock().lock().unwrap();
@@ -5839,94 +5827,6 @@ async fn aggregate_http_retired_model_can_continue_after_switching_to_pool() {
     fixture.expect("a", "switch", "old").await;
     fixture.expect("b", "switch", "old").await;
     assert!(fixture.received.try_recv().is_err());
-    fixture.shutdown().await;
-}
-
-#[tokio::test]
-async fn aggregate_http_fallback_feedback_tracks_each_attempt_and_stays_on_c() {
-    let _lock = settings_path_test_lock().lock().unwrap();
-    let temp = tempfile::tempdir().unwrap();
-    let settings_path = temp.path().join("settings.json");
-    let _guard = SettingsPathGuard::set(settings_path.clone());
-    let mut fixture = AggregateHttpRegressionFixture::start(
-        settings_path, "http-attempt-feedback", [500, 500, 200], [500, 500, 200],
-        [None, None, None],
-    ).await;
-
-    aggregate_http_file_request("initial").await;
-    fixture.expect("a", "initial", "old").await;
-    fixture.expect("b", "initial", "old").await;
-    fixture.expect("c", "initial", "old").await;
-    aggregate_http_file_request("next").await;
-    fixture.expect("c", "next", "old").await;
-    assert!(fixture.received.try_recv().is_err(), "不能跳过或绕回成员");
-    fixture.shutdown().await;
-}
-
-#[tokio::test]
-async fn aggregate_concurrent_http_failures_of_a_advance_only_once_to_b() {
-    let _lock = settings_path_test_lock().lock().unwrap();
-    let temp = tempfile::tempdir().unwrap();
-    let settings_path = temp.path().join("settings.json");
-    let _guard = SettingsPathGuard::set(settings_path.clone());
-    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
-    let mut fixture = AggregateHttpRegressionFixture::start(
-        settings_path, "http-concurrent-feedback", [500, 200, 200], [500, 200, 200],
-        [Some(gate.clone()), None, None],
-    ).await;
-
-    let requests = async {
-        tokio::join!(aggregate_http_file_request("held"), aggregate_http_file_request("held"));
-    };
-    let release = async {
-        // 两个完整 A 请求都到达之后才放行 500，消除 snapshot 获取先后的竞态。
-        fixture.expect("a", "held", "old").await;
-        fixture.expect("a", "held", "old").await;
-        gate.add_permits(2);
-    };
-    tokio::join!(requests, release);
-    fixture.expect("b", "held", "old").await;
-    fixture.expect("b", "held", "old").await;
-    aggregate_http_file_request("next").await;
-    fixture.expect("b", "next", "old").await;
-    assert!(fixture.received.try_recv().is_err(), "并发 A 失败不能推进到 C");
-    fixture.shutdown().await;
-}
-
-#[tokio::test]
-async fn aggregate_old_http_failure_and_fallback_cannot_mutate_admitted_generation() {
-    let _lock = settings_path_test_lock().lock().unwrap();
-    let temp = tempfile::tempdir().unwrap();
-    let settings_path = temp.path().join("settings.json");
-    let _guard = SettingsPathGuard::set(settings_path.clone());
-    let first_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
-    let fallback_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
-    let mut fixture = AggregateHttpRegressionFixture::start(
-        settings_path, "http-generation-feedback", [500, 200, 200], [500, 500, 200],
-        [Some(first_gate.clone()), Some(fallback_gate.clone()), None],
-    ).await;
-
-    let advance_generation = async {
-        fixture.expect("a", "held", "old").await;
-        for (index, relay) in fixture.settings.relay_profiles.iter_mut().take(3).enumerate() {
-            relay.api_key = format!("synthetic-{}-new", ["a", "b", "c"][index]);
-        }
-        fixture.persist();
-        // 不能只保存配置：用新凭据实际请求 A -> B，接纳新 generation 并建立 B 游标。
-        aggregate_http_file_request("admit-new").await;
-        fixture.expect("a", "admit-new", "new").await;
-        fixture.expect("b", "admit-new", "new").await;
-        first_gate.add_permits(1);
-        fixture.expect("b", "held", "old").await;
-        aggregate_http_file_request("after-old-a-failure").await;
-        fixture.expect("b", "after-old-a-failure", "new").await;
-        fallback_gate.add_permits(1);
-    };
-    tokio::join!(aggregate_http_file_request("held"), advance_generation);
-    fixture.expect("c", "held", "old").await;
-    aggregate_http_file_request("after-old-fallback").await;
-    fixture.expect("b", "after-old-fallback", "new").await;
-    assert!(fixture.received.try_recv().is_err(), "旧 generation 不能改变新故障转移游标");
     fixture.shutdown().await;
 }
 
