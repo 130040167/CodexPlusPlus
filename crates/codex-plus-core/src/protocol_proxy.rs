@@ -114,19 +114,100 @@ fn recall_tool_call_extra_content(call_id: &str) -> Option<Value> {
         .and_then(|cache| cache.recall(call_id))
 }
 
+const PROTOCOL_PROXY_PORT_FILE: &str = "protocol-proxy-port";
+
 /// 协议代理的实际生效端口，默认 [`DEFAULT_PROTOCOL_PROXY_PORT`]，
 /// 可用环境变量 `CODEX_PLUS_PROTOCOL_PROXY_PORT` 覆盖。
 ///
 /// 端口要写进 `config.toml` 的 `base_url`，不能像普通 helper 端口那样自动换；
-/// 但少数机器（issue #2189）上 57321 恰好被 Hyper-V/WSL 开机划进了 Windows
-/// 动态端口排除区间，bind 报 os error 10013 永远起不来，只能整体挪一个端口。
+/// 但少数机器（issue #2189 / #1163）上 57321 恰好被 Hyper-V/WSL 开机划进了
+/// Windows 动态端口排除区间，bind 报 os error 10013 永远起不来，只能整体挪
+/// 一个端口。迁移后的端口持久化在状态目录里，管理器与启动器读同一份值。
 /// 写入 base_url 与读取校验必须都走本函数，保证同一进程内一致。
 pub fn protocol_proxy_port() -> u16 {
+    if let Some(port) = env_protocol_proxy_port() {
+        return port;
+    }
+    read_persisted_protocol_proxy_port(&persisted_protocol_proxy_port_path())
+        .unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT)
+}
+
+fn env_protocol_proxy_port() -> Option<u16> {
     std::env::var("CODEX_PLUS_PROTOCOL_PROXY_PORT")
         .ok()
         .and_then(|value| value.trim().parse::<u16>().ok())
         .filter(|port| *port > 0)
-        .unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT)
+}
+
+fn persisted_protocol_proxy_port_path() -> std::path::PathBuf {
+    crate::paths::default_app_state_dir().join(PROTOCOL_PROXY_PORT_FILE)
+}
+
+fn read_persisted_protocol_proxy_port(path: &std::path::Path) -> Option<u16> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port > 0)
+}
+
+fn persist_protocol_proxy_port(path: &std::path::Path, port: u16) -> anyhow::Result<()> {
+    crate::settings::atomic_write(path, format!("{port}\n").as_bytes())
+        .with_context(|| format!("持久化协议代理端口失败：{}", path.display()))
+}
+
+/// 启动前确认协议代理端口可绑定。
+///
+/// 端口被**占用**（AddrInUse）时保持原值，交给既有的等待与重试逻辑——旧
+/// launcher 释放端口通常只需要几秒。只有 `PermissionDenied`（Windows 10013，
+/// 端口落在系统排除区间）才会永久失败，此时换一个空闲端口并持久化，让
+/// `config.toml` 的 base_url、helper 绑定和路由校验都跟随同一个新端口。
+///
+/// 显式设置 `CODEX_PLUS_PROTOCOL_PROXY_PORT` 时尊重用户选择，不自动迁移。
+pub fn ensure_protocol_proxy_port_available() -> u16 {
+    let port = protocol_proxy_port();
+    if env_protocol_proxy_port().is_some() {
+        return port;
+    }
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => {
+            drop(listener);
+            port
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            let replacement = crate::ports::find_available_loopback_port();
+            if replacement != 0 && replacement != port {
+                let path = persisted_protocol_proxy_port_path();
+                match persist_protocol_proxy_port(&path, replacement) {
+                    Ok(()) => {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.protocol_proxy_port_relocated",
+                            serde_json::json!({
+                                "from": port,
+                                "to": replacement,
+                                "path": path.to_string_lossy(),
+                                "error": error.to_string(),
+                            }),
+                        );
+                        return replacement;
+                    }
+                    Err(persist_error) => {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.protocol_proxy_port_relocate_failed",
+                            serde_json::json!({
+                                "from": port,
+                                "to": replacement,
+                                "error": persist_error.to_string(),
+                            }),
+                        );
+                    }
+                }
+            }
+            port
+        }
+        Err(_) => port,
+    }
 }
 pub const NO_AUTH_PROXY_BEARER_TOKEN: &str = "codex-plus-no-auth";
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -9120,6 +9201,34 @@ mod relay_custom_header_tests {
             request.headers().get("authorization").unwrap(),
             "Bearer explicit"
         );
+    }
+}
+
+#[cfg(test)]
+mod protocol_proxy_port_tests {
+    use super::*;
+
+    #[test]
+    fn persisted_port_round_trips_and_rejects_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PROTOCOL_PROXY_PORT_FILE);
+        assert_eq!(read_persisted_protocol_proxy_port(&path), None);
+        persist_protocol_proxy_port(&path, 57432).unwrap();
+        assert_eq!(read_persisted_protocol_proxy_port(&path), Some(57432));
+        std::fs::write(&path, "not-a-port\n").unwrap();
+        assert_eq!(read_persisted_protocol_proxy_port(&path), None);
+        std::fs::write(&path, "0\n").unwrap();
+        assert_eq!(read_persisted_protocol_proxy_port(&path), None);
+    }
+
+    #[test]
+    fn persisted_port_is_used_when_env_is_absent() {
+        // 环境变量优先级由 env_protocol_proxy_port 单独覆盖；这里验证持久化值
+        // 确实参与了 protocol_proxy_port 的解析。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PROTOCOL_PROXY_PORT_FILE);
+        persist_protocol_proxy_port(&path, 57555).unwrap();
+        assert_eq!(read_persisted_protocol_proxy_port(&path), Some(57555));
     }
 }
 

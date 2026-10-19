@@ -3316,7 +3316,11 @@ fn apply_model_catalog_to_config_with_live_policy(
     // 已经存在的托管 catalog 必须随当前模型列表重建：否则用户在供应商渠道里
     // 增删/重命名模型后，Codex 重启读到的仍是旧 catalog，选择器不刷新
     // （#2081）。「从没生成过 catalog 的平铺 model_list」保持不凭空创建。
+    // 仅限仍有多模型条目时刷新：模型列表收敛回单个无窗口模型时，平铺列表本身
+    // 就够用，继续落 catalog 会架空「关闭每模型覆盖即删除指针」的既有契约
+    // （见 tests/model_catalog_paths.rs）。
     let existing_managed_catalog = catalog_path.exists()
+        && entries.len() > 1
         && root_key_string(&config_text, "model_catalog_json").is_some_and(|pointer| {
             pointer == catalog_relative || pointer == catalog_pointer
         });

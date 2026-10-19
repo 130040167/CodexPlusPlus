@@ -787,8 +787,10 @@ where
         }
         if protocol_proxy_enabled {
             timeline.mark("protocol_proxy_config", 55);
+            // 端口落在 Windows 排除区间（10013）时永久不可绑，先迁移并持久化，
+            // 再写 config.toml，保证 base_url、helper 与路由使用同一个端口（#1163）。
+            helper_port = crate::protocol_proxy::ensure_protocol_proxy_port_available();
             hooks.ensure_active_protocol_proxy_config(&settings).await?;
-            helper_port = crate::protocol_proxy::protocol_proxy_port();
         }
         if settings.enhancements_enabled || protocol_proxy_enabled {
             // macOS 重启时旧 launcher 的 socket 释放可能稍晚于进程退出。
