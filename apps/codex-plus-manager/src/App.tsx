@@ -7656,8 +7656,8 @@ function SessionRepairPanel({ form, providerSyncProgress, sessionIndexRepairActi
                 type="checkbox"
               />
               <span>
-                <strong>{t("自动修复消息索引")}</strong>
-                <small>{t("启动后检查缺失消息，运行期间每 30 分钟复查。保存设置后生效。")}</small>
+                <strong>{t("自动修复会话目录与消息索引")}</strong>
+                <small>{t("启动后补回缺失的会话目录并检查消息，运行期间每 30 分钟复查。保存设置后生效。")}</small>
               </span>
               <ToggleVisual />
             </label>
