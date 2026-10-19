@@ -2826,7 +2826,17 @@ fn preserve_missing_table_keys(
 /// Normal-user launches cannot complete the elevated native Windows sandbox
 /// setup. Downgrade only that case; an elevated process keeps the user's mode.
 pub fn ensure_windows_sandbox_usable_for_current_user(home: &Path) -> anyhow::Result<bool> {
-    if windows_process_is_elevated() {
+    ensure_windows_sandbox_usable_with(home, windows_process_is_elevated())
+}
+
+fn ensure_windows_sandbox_usable_with(home: &Path, process_elevated: bool) -> anyhow::Result<bool> {
+    if process_elevated {
+        return Ok(false);
+    }
+    // elevated 只在「首次初始化」时需要管理员权限；初始化完成后普通进程也能用。
+    // 过去不看初始化状态一律降级，已经完成初始化的用户每次经 Codex++ 启动都被改回
+    // unelevated，反而触发 `CreateProcessSecurityEnvironment failed`（#2615）。
+    if windows_elevated_sandbox_setup_present(home) {
         return Ok(false);
     }
     let config_path = home.join("config.toml");
@@ -2859,6 +2869,24 @@ pub fn ensure_windows_sandbox_usable_for_current_user(home: &Path) -> anyhow::Re
         }),
     );
     Ok(true)
+}
+
+/// Codex 的 Windows 沙箱初始化产物是否齐全：`.sandbox/setup_marker.json` 与
+/// `.sandbox-secrets/sandbox_users.json` 都存在、都带 `version` 且两者一致
+/// （与 Codex `sandbox_setup_is_complete` 的判据一致）。不写死 Codex 的
+/// SETUP_VERSION：版本升级后由 Codex 自己提示重新初始化，这里不替用户改配置。
+fn windows_elevated_sandbox_setup_present(home: &Path) -> bool {
+    let version = |path: PathBuf| -> Option<u64> {
+        let text = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str::<Value>(&text).ok()?.get("version")?.as_u64()
+    };
+    match (
+        version(home.join(".sandbox").join("setup_marker.json")),
+        version(home.join(".sandbox-secrets").join("sandbox_users.json")),
+    ) {
+        (Some(marker), Some(users)) => marker == users,
+        _ => false,
+    }
 }
 
 #[cfg(windows)]
@@ -5582,6 +5610,49 @@ fn account_label_from_jwt(token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elevated_windows_sandbox_is_kept_once_setup_is_complete() {
+        // #2615：已完成 elevated 初始化的用户不能被每次启动降级成 unelevated。
+        let home = tempfile::tempdir().unwrap();
+        let config = "[windows]\nsandbox = \"elevated\"\n";
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+
+        // 未初始化：普通权限进程照旧降级，避免卡在 updateRequired。
+        assert!(ensure_windows_sandbox_usable_with(home.path(), false).unwrap());
+        let downgraded = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(downgraded.contains("sandbox = \"unelevated\""), "{downgraded}");
+
+        // 初始化产物齐全且版本一致：保留用户的 elevated。
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        std::fs::create_dir_all(home.path().join(".sandbox")).unwrap();
+        std::fs::create_dir_all(home.path().join(".sandbox-secrets")).unwrap();
+        std::fs::write(
+            home.path().join(".sandbox").join("setup_marker.json"),
+            r#"{"version":5,"offline_username":"CodexSandboxOffline","online_username":"CodexSandboxOnline"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join(".sandbox-secrets").join("sandbox_users.json"),
+            r#"{"version":5,"offline":{},"online":{}}"#,
+        )
+        .unwrap();
+        assert!(!ensure_windows_sandbox_usable_with(home.path(), false).unwrap());
+        let kept = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert_eq!(kept, config, "初始化完成后不应改写用户配置");
+
+        // 两份产物版本不一致（初始化未完成或被升级打断）：仍按未初始化处理。
+        std::fs::write(
+            home.path().join(".sandbox-secrets").join("sandbox_users.json"),
+            r#"{"version":4}"#,
+        )
+        .unwrap();
+        assert!(ensure_windows_sandbox_usable_with(home.path(), false).unwrap());
+
+        // 管理员进程从不改写。
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        assert!(!ensure_windows_sandbox_usable_with(home.path(), true).unwrap());
+    }
 
     /// 回归 09-23 现场故障：裸的 [mcp_servers] 父表头把切块锚点钉在 mcp_servers，
     /// 之后两个重复的 [mcp_servers.node_repl] 落在同一块里，整块解析失败后退回
