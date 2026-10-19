@@ -1697,6 +1697,18 @@ fn restore_conflict_key_columns<'a>(table: &str, row: &'a Map<String, Value>) ->
     }
 }
 
+fn rollout_counterpart(path: &Path) -> Option<PathBuf> {
+    if crate::rollout_source::is_compressed(path) {
+        Some(path.with_extension(""))
+    } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+        let mut compressed = path.as_os_str().to_os_string();
+        compressed.push(".zst");
+        Some(PathBuf::from(compressed))
+    } else {
+        None
+    }
+}
+
 fn detect_file_restore_conflicts(
     tables: &Map<String, Value>,
     backup_store: &BackupStore,
@@ -1714,18 +1726,19 @@ fn detect_file_restore_conflicts(
             if Path::new(path).exists() {
                 anyhow::bail!("restore conflict: file already exists: {path}");
             }
+            if let Some(other) = rollout_counterpart(Path::new(path))
+                && other.exists()
+            {
+                anyhow::bail!(
+                    "restore conflict: alternate history now exists: {}",
+                    other.display()
+                );
+            }
             backup_store.validate_file_backup(token, file)?;
             if crate::rollout_source::is_compressed(Path::new(path)) {
                 let bytes = backup_store.read_file_backup(token, file)?;
                 let mut reader = crate::rollout_source::decode_reader(Path::new(path), &bytes[..])?;
                 std::io::copy(&mut reader, &mut std::io::sink())?;
-                let logical = Path::new(path).with_extension("");
-                if logical.exists() {
-                    anyhow::bail!(
-                        "restore conflict: uncompressed history now exists: {}",
-                        logical.display()
-                    );
-                }
             }
         }
     }
