@@ -3312,6 +3312,14 @@ fn apply_model_catalog_to_config_with_live_policy(
     // 托管 Responses 传输走 model_routes 时需要 catalog，与会话身份无关；
     // 纯平铺 model_list 且无窗口/元数据的仍保持"不生成"契约（无后缀不落盘，见既有测试）。
     // 上游不认 tool_search 时必须落 catalog 关掉该能力，否则 Codex 照发、整单 400。
+    let catalog_path = home.join(&catalog_relative);
+    // 已经存在的托管 catalog 必须随当前模型列表重建：否则用户在供应商渠道里
+    // 增删/重命名模型后，Codex 重启读到的仍是旧 catalog，选择器不刷新
+    // （#2081）。「从没生成过 catalog 的平铺 model_list」保持不凭空创建。
+    let existing_managed_catalog = catalog_path.exists()
+        && root_key_string(&config_text, "model_catalog_json").is_some_and(|pointer| {
+            pointer == catalog_relative || pointer == catalog_pointer
+        });
     if !should_write_managed_model_catalog(
         &entries,
         has_metadata_overrides,
@@ -3320,6 +3328,7 @@ fn apply_model_catalog_to_config_with_live_policy(
         official_deepseek_responses,
         fallback.is_some(),
     ) && !upstream_rejects_tool_search(profile)
+        && !existing_managed_catalog
     {
         let mut doc = parse_toml_document(&config_text)?;
         if root_key_string(&config_text, "model_catalog_json")
@@ -3329,7 +3338,6 @@ fn apply_model_catalog_to_config_with_live_policy(
         }
         return Ok(normalize_optional_toml(doc));
     }
-    let catalog_path = home.join(&catalog_relative);
     if let Some(parent) = catalog_path.parent() {
         std::fs::create_dir_all(parent)?;
     }

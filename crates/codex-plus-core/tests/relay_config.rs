@@ -5059,6 +5059,50 @@ experimental_bearer_token = "sk-new"
 }
 
 #[test]
+fn apply_relay_profile_refreshes_existing_managed_catalog_when_models_change() {
+    // #2081：供应商渠道的模型列表变化后，已存在的托管 catalog 必须重建，
+    // 否则 Codex 重启后仍显示旧模型列表。
+    let temp = tempfile::tempdir().unwrap();
+    let mut profile = RelayProfile {
+        id: "relay-a".to_string(),
+        name: "Relay A".to_string(),
+        model: "qwen3-coder".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: r#"model = "qwen3-coder"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://relay.example/v1"
+experimental_bearer_token = "sk-new"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-new"}"#.to_string(),
+        model_insert_mode: Default::default(),
+        model_list: "qwen3-coder".to_string(),
+        context_window: "200000".to_string(),
+        ..RelayProfile::default()
+    };
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+    let catalog_path = temp.path().join("model-catalogs").join("relay-a.json");
+    let before = std::fs::read_to_string(&catalog_path).unwrap();
+    assert!(before.contains(r#""slug": "qwen3-coder""#), "{before}");
+    assert!(!before.contains(r#""slug": "kimi-k3""#));
+
+    // 用户更新了渠道模型列表（不再带窗口设置，只有平铺列表）。
+    profile.model_list = "qwen3-coder\nkimi-k3".to_string();
+    profile.context_window = String::new();
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+
+    let after = std::fs::read_to_string(&catalog_path).unwrap();
+    assert!(after.contains(r#""slug": "kimi-k3""#), "catalog 未随模型列表刷新：{after}");
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(config.contains("model_catalog_json"));
+}
+
+#[test]
 fn apply_relay_profile_writes_catalog_for_context_window_without_suffix() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {
