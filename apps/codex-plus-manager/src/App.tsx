@@ -9869,7 +9869,7 @@ function RelayProfileEditor({
   const appendEmptyModelRow = (model = "") => {
     focusNewModelRow.current = true;
     modelSlugOriginsRef.current = [...modelSlugOriginsRef.current, ""];
-    setModelWindowRows([...modelWindowRows, { model, window: "", autoCompact: "", imageHandling: "" }]);
+    setModelWindowRows([...modelWindowRows, { model, window: "", autoCompact: "", imageHandling: "send-as-is" }]);
   };
   const modelRowsError = modelWindowRowsValidationMessage(modelWindowRowsValidationError(modelWindowRows));
   const customHeadersError = relayHeadersValidationMessage(profile.customHeaders || []);
@@ -10597,7 +10597,7 @@ function RelayProfileEditor({
                         <Button disabled={!modelAddSelection.some((model) => modelChoices.includes(model) && !addedModelNames.has(model))}
                           onClick={() => {
                             addModelWindowRows(modelAddSelection.filter((model) => modelChoices.includes(model) && !addedModelNames.has(model))
-                              .map((model) => ({ model, window: "", autoCompact: "", imageHandling: "" })));
+                              .map((model) => ({ model, window: "", autoCompact: "", imageHandling: "send-as-is" })));
                             setModelAddOpen(false);
                           }}>{t("添加模型")}</Button>
                         <Button variant="secondary" onClick={() => setModelAddOpen(false)}>{t("取消")}</Button>
