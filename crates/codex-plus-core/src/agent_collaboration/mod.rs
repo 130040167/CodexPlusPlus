@@ -68,7 +68,9 @@ pub struct CollaborationConfig {
     pub default_agent_id: String,
     pub agents: Vec<AgentConfig>,
     /// 单个子 Agent 任务的运行上限（分钟）。旧配置没有此字段时取默认 10 分钟（#2618）。
-    #[serde(default = "default_max_runtime_minutes")]
+    /// 取默认值时不写出：v1.10.0 的结构带 `deny_unknown_fields`，回退旧版本时
+    /// 多出的字段会让整份协作记录读不出来。
+    #[serde(default = "default_max_runtime_minutes", skip_serializing_if = "is_default_max_runtime_minutes")]
     pub max_runtime_minutes: u32,
 }
 
@@ -82,6 +84,10 @@ pub const MAX_RUNTIME_MINUTES_LIMIT: u32 = 240;
 
 fn default_max_runtime_minutes() -> u32 {
     DEFAULT_MAX_RUNTIME_MINUTES
+}
+
+fn is_default_max_runtime_minutes(value: &u32) -> bool {
+    *value == DEFAULT_MAX_RUNTIME_MINUTES
 }
 
 impl Default for CollaborationConfig {

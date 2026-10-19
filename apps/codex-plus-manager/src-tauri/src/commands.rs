@@ -6560,6 +6560,9 @@ pub fn preview_import_settings(path: String) -> CommandResult<SettingsPayload> {
 
 #[tauri::command]
 pub fn set_settings_path(path: String) -> CommandResult<SettingsPayload> {
+    if codex_plus_core::paths::state_dir_override().is_some() {
+        return failed("多开实例使用独立的状态目录，不支持修改配置文件路径；请在主实例中修改。", fallback_settings_payload());
+    }
     let target = PathBuf::from(path.trim());
     if !target.is_absolute() {
         return failed("配置文件路径必须是绝对路径。", fallback_settings_payload());
@@ -6603,18 +6606,27 @@ pub fn set_settings_path(path: String) -> CommandResult<SettingsPayload> {
 
 #[tauri::command]
 pub fn reset_settings_path() -> CommandResult<SettingsPayload> {
+    if codex_plus_core::paths::state_dir_override().is_some() {
+        return failed("多开实例使用独立的状态目录，不支持修改配置文件路径；请在主实例中修改。", fallback_settings_payload());
+    }
     let current = codex_plus_core::paths::default_settings_path();
     let target = codex_plus_core::paths::default_app_state_dir().join("settings.json");
-    if current != target && target.exists() {
-        return failed("默认配置文件已存在，为避免覆盖文件请先处理该文件。", fallback_settings_payload());
-    }
     if current != target {
         let contents = match fs::read(&current) {
             Ok(contents) => contents,
             Err(error) => return failed(&format!("读取当前设置失败：{error}"), fallback_settings_payload()),
         };
+        // 迁移路径时默认位置会留下一份旧副本；过去这里直接拒绝，迁移过一次就再也
+        // 恢复不了默认路径。现在把旧副本改名备份后再写入当前配置，不丢任何内容。
+        if target.exists() {
+            let backup = target.with_file_name(format!("settings.json.before-reset-{}.bak", current_timestamp_ms()));
+            if let Err(error) = fs::rename(&target, &backup) {
+                return failed(&format!("备份默认位置的旧配置失败：{error}"), fallback_settings_payload());
+            }
+        }
         if let Err(error) = fs::create_dir_all(target.parent().unwrap_or(Path::new(".")))
-            .and_then(|_| fs::write(&target, contents))
+            .map_err(anyhow::Error::from)
+            .and_then(|_| codex_plus_core::settings::atomic_write(&target, &contents))
         {
             return failed(&format!("恢复默认配置路径失败：{error}"), fallback_settings_payload());
         }

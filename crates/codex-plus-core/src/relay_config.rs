@@ -1,6 +1,7 @@
 use anyhow::Context;
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::Digest as _;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -783,7 +784,10 @@ pub fn preserve_live_nonprovider_settings(home: &Path, config: &str) -> anyhow::
     let mut target = parse_toml_document(config)?;
     let live = read_optional_text(&home.join("config.toml"))?;
     if live.trim().is_empty() { return Ok(normalize_optional_toml(target)); }
-    let live = parse_toml_document(&live)?;
+    // 同上：live 损坏时跳过补缺，不阻断切换。
+    let Ok(live) = parse_toml_document(&normalize_duplicate_toml_text(&live)) else {
+        return Ok(normalize_optional_toml(target));
+    };
     // 按项目补缺，不递归提升一个已有项目的 trust 权限。
     preserve_missing_table_keys(&mut target, &live, "projects");
     if target.get("notify").is_none() {
@@ -2232,7 +2236,15 @@ fn preserve_live_marketplace_configs(home: &Path, config_text: &str) -> anyhow::
     }
 
     let mut target = parse_toml_document(config_text)?;
-    let live = parse_toml_document(&live_config)?;
+    // live 文件损坏时不能让整次切换失败（#2478/#2500）：跳过补回，按新配置写出；
+    // 原文件在 write_codex_live_atomic 里已备份。
+    let Ok(live) = parse_toml_document(&normalize_duplicate_toml_text(&live_config)) else {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "relay_config.live_config_unparsable",
+            serde_json::json!({ "home": home.to_string_lossy(), "step": "marketplaces" }),
+        );
+        return Ok(config_text.to_string());
+    };
     let Some(live_marketplaces) = live.get("marketplaces").and_then(Item::as_table_like) else {
         return Ok(ensure_trailing_newline(target.to_string()));
     };
@@ -3360,8 +3372,16 @@ fn apply_model_catalog_to_config_with_live_policy(
     // 仅限仍有多模型条目时刷新：模型列表收敛回单个无窗口模型时，平铺列表本身
     // 就够用，继续落 catalog 会架空「关闭每模型覆盖即删除指针」的既有契约
     // （见 tests/model_catalog_paths.rs）。
+    // 只数模型列表本身：entries 还会把当前 profile.model 放在最前面，
+    // 「列表 a + 默认模型 b」不能算成多模型。
+    let listed_models = model_list
+        .split(['\r', '\n', ','])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<HashSet<_>>()
+        .len();
     let existing_managed_catalog = catalog_path.exists()
-        && entries.len() > 1
+        && listed_models > 1
         && root_key_string(&config_text, "model_catalog_json").is_some_and(|pointer| {
             pointer == catalog_relative || pointer == catalog_pointer
         });
@@ -3371,7 +3391,10 @@ fn apply_model_catalog_to_config_with_live_policy(
         standard_responses,
         profile.has_model_routes(),
         official_deepseek_responses,
-        fallback.is_some(),
+        // 只有用户显式写了模型列表时，供应商级窗口才落 catalog：模型列表留空
+        // （典型是官方登录）时 catalog 里只剩 0~1 个模型，会替换 Codex 内置的
+        // 官方模型列表，选择器变空；这种情况沿用顶层 model_context_window。
+        fallback.is_some() && !model_list.trim().is_empty(),
     ) && !upstream_rejects_tool_search(profile)
         && !existing_managed_catalog
     {
@@ -5431,19 +5454,25 @@ fn read_optional_text(path: &Path) -> anyhow::Result<String> {
         Ok(contents) => Ok(contents),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-            // 上游客户端在中文代码页下可能把 config.toml 写成 GBK/ANSI 字节。
-            // 直接报错会让切换供应商与沙盒初始化整条链路失败（#585）。
-            // 这里不改写原文件：先复制一份带时间戳的 `.invalid-utf8.bak`，
-            // 再按「没有可保留的 live 配置」继续——原字节完整保留在备份里，
-            // 用户可以手工转码后再放回。
+            // 上游客户端在中文代码页下可能把 config.toml 写成 GBK/ANSI 字节（#585）。
+            // 不能按「没有 live 配置」返回空串：那样切换供应商会把 MCP、项目信任、
+            // Windows 沙箱等非供应商设置全部丢掉且毫无提示。这里按 UTF-8 宽松解码——
+            // TOML 结构与 ASCII 内容完整保留，只有无法识别的字节变成 U+FFFD；
+            // 原始字节先按内容哈希备份一次（同一内容重复读取不再重复备份）。
+            let bytes = std::fs::read(path)?;
+            let digest = sha2::Sha256::digest(&bytes);
+            let tag: String = digest.iter().take(6).map(|byte| format!("{byte:02x}")).collect();
             let backup = path.with_file_name(format!(
-                "{}.invalid-utf8-{}.bak",
+                "{}.invalid-utf8-{tag}.bak",
                 path.file_name()
                     .map(|name| name.to_string_lossy().to_string())
                     .unwrap_or_else(|| "config.toml".to_string()),
-                timestamp_millis()
             ));
-            let backup_result = std::fs::copy(path, &backup);
+            let backup_result = if backup.exists() {
+                Ok(())
+            } else {
+                std::fs::write(&backup, &bytes)
+            };
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "relay_config.non_utf8_config",
                 serde_json::json!({
@@ -5458,7 +5487,7 @@ fn read_optional_text(path: &Path) -> anyhow::Result<String> {
                     "config.toml 不是有效 UTF-8，且无法创建备份；原文件未修改",
                 );
             }
-            Ok(String::new())
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
         }
         Err(error) => Err(error.into()),
     }
