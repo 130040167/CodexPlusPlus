@@ -436,11 +436,14 @@ where
 }
 
 fn update_http_client() -> anyhow::Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .user_agent(format!("Codex++/{}", crate::version::VERSION))
-        .connect_timeout(UPDATE_CONNECT_TIMEOUT)
-        .timeout(UPDATE_DOWNLOAD_TIMEOUT)
-        .build()?)
+    // 更新与安装包下载同样要走系统代理：在需要代理才能访问 GitHub 的网络里，
+    // 直连会一直超时，用户看到的是「检查更新成功但下载/安装失败」（#1329）。
+    // 复用统一构造器，保留原有连接/总超时语义。
+    crate::http_client::proxied_client_with_timeouts(
+        &format!("Codex++/{}", crate::version::VERSION),
+        UPDATE_CONNECT_TIMEOUT,
+        UPDATE_DOWNLOAD_TIMEOUT,
+    )
 }
 
 pub fn download_asset_to(

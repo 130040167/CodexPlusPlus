@@ -2635,7 +2635,7 @@ enabled = true
 }
 
 #[test]
-fn apply_relay_profile_does_not_write_model_catalog_json_for_selected_models() {
+fn apply_relay_profile_writes_catalog_for_profile_context_window() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {
         id: "relay-a".to_string(),
@@ -2664,10 +2664,16 @@ experimental_bearer_token = "sk-new"
     apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    assert!(!config.contains("model_catalog_json"));
+    // profile 级窗口必须落进 catalog，否则 Codex 继续按内置 272k 压缩（#2590）。
+    assert!(config.contains("model_catalog_json"));
     assert!(config.contains("model_context_window = 200000"));
     assert!(config.contains("model_auto_compact_token_limit = 160000"));
-    assert!(!temp.path().join("model-catalogs").exists());
+    let catalog = std::fs::read_to_string(
+        temp.path().join("model-catalogs").join("relay-a.json"),
+    )
+    .unwrap();
+    assert!(catalog.contains(r#""context_window": 200000"#), "{catalog}");
+    assert!(catalog.contains(r#""max_context_window": 200000"#), "{catalog}");
 }
 
 #[test]
@@ -5053,7 +5059,7 @@ experimental_bearer_token = "sk-new"
 }
 
 #[test]
-fn apply_relay_profile_no_catalog_when_model_list_has_no_suffix() {
+fn apply_relay_profile_writes_catalog_for_context_window_without_suffix() {
     let temp = tempfile::tempdir().unwrap();
     let profile = RelayProfile {
         id: "relay-a".to_string(),
@@ -5082,9 +5088,13 @@ experimental_bearer_token = "sk-new"
     apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    assert!(!config.contains("model_catalog_json"));
+    assert!(config.contains("model_catalog_json"));
     assert!(config.contains("model_context_window = 200000"));
-    assert!(!temp.path().join("model-catalogs").exists());
+    let catalog = std::fs::read_to_string(
+        temp.path().join("model-catalogs").join("relay-a.json"),
+    )
+    .unwrap();
+    assert!(catalog.contains(r#""context_window": 200000"#), "{catalog}");
 }
 
 #[test]

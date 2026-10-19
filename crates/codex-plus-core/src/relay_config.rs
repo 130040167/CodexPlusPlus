@@ -5357,6 +5357,36 @@ fn read_optional_text(path: &Path) -> anyhow::Result<String> {
     match std::fs::read_to_string(path) {
         Ok(contents) => Ok(contents),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            // 上游客户端在中文代码页下可能把 config.toml 写成 GBK/ANSI 字节。
+            // 直接报错会让切换供应商与沙盒初始化整条链路失败（#585）。
+            // 这里不改写原文件：先复制一份带时间戳的 `.invalid-utf8.bak`，
+            // 再按「没有可保留的 live 配置」继续——原字节完整保留在备份里，
+            // 用户可以手工转码后再放回。
+            let backup = path.with_file_name(format!(
+                "{}.invalid-utf8-{}.bak",
+                path.file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "config.toml".to_string()),
+                timestamp_millis()
+            ));
+            let backup_result = std::fs::copy(path, &backup);
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "relay_config.non_utf8_config",
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "backup": backup.to_string_lossy(),
+                    "backup_ok": backup_result.is_ok(),
+                    "error": error.to_string(),
+                }),
+            );
+            if backup_result.is_err() {
+                return Err(error).context(
+                    "config.toml 不是有效 UTF-8，且无法创建备份；原文件未修改",
+                );
+            }
+            Ok(String::new())
+        }
         Err(error) => Err(error.into()),
     }
 }
