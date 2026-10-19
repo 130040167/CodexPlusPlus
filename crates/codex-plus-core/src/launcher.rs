@@ -1025,6 +1025,28 @@ impl DefaultLaunchHooks {
     pub async fn set_bridge_reinjector(&self, reinjector: BridgeReinjector) {
         *self.bridge_reinjector.lock().await = Some(reinjector);
     }
+
+    /// 仅接续已有 Codex 时允许先恢复旧入口，等待新主端口释放。
+    pub async fn start_helper_for_resume(&self, helper_port: u16) -> anyhow::Result<()> {
+        self.start_helper_runtime(helper_port, true).await
+    }
+
+    async fn start_helper_runtime(
+        &self,
+        helper_port: u16,
+        allow_deferred_primary: bool,
+    ) -> anyhow::Result<()> {
+        let runtimes = start_helper_with_continuity(
+            &helper_bind_host(),
+            helper_port,
+            &crate::proxy_continuity::ProxyEndpoints::current(),
+            allow_deferred_primary,
+        )
+        .await?;
+        write_dictation_helper_receipt(helper_port);
+        *self.helper.lock().await = runtimes;
+        Ok(())
+    }
 }
 
 fn helper_bind_host() -> String {
@@ -1131,16 +1153,7 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
-        let bind_host = helper_bind_host();
-        let runtimes = start_helper_with_continuity(
-            &bind_host,
-            helper_port,
-            &crate::proxy_continuity::ProxyEndpoints::current(),
-        )
-        .await?;
-        write_dictation_helper_receipt(helper_port);
-        *self.helper.lock().await = runtimes;
-        Ok(())
+        self.start_helper_runtime(helper_port, false).await
     }
 
     fn proxy_continuity_required(&self) -> bool {
@@ -1607,6 +1620,7 @@ async fn start_helper_with_continuity(
     bind_host: &str,
     helper_port: u16,
     endpoints: &crate::proxy_continuity::ProxyEndpoints,
+    allow_deferred_primary: bool,
 ) -> anyhow::Result<Vec<HelperRuntime>> {
     let primary = tokio::net::TcpListener::bind((bind_host, helper_port))
         .await
@@ -1630,7 +1644,7 @@ async fn start_helper_with_continuity(
     let (port, listener) = match primary {
         Ok(listener) => (listener.local_addr()?.port(), Some(listener)),
         Err(error)
-            if helper_port > 0
+            if allow_deferred_primary && helper_port > 0
                 && (error_is_address_in_use(&error) || error_is_bind_forbidden(&error))
                 && alias_listeners.iter().any(|(_, listener)| listener.is_some()) =>
         {
@@ -5033,7 +5047,7 @@ mod tests {
             .timeout(std::time::Duration::from_secs(3))
             .build()
             .unwrap();
-        let first = start_helper_with_continuity("127.0.0.1", 0, &endpoints)
+        let first = start_helper_with_continuity("127.0.0.1", 0, &endpoints, false)
             .await
             .unwrap();
         let original_port = *endpoints.ports().unwrap().first().unwrap();
@@ -5045,7 +5059,7 @@ mod tests {
         assert!(client.post(&cached_url).json(&body).send().await.is_err());
 
         // 同一个客户端仍然使用缓存 URL；新管理器选择不同端口。
-        let second = start_helper_with_continuity("127.0.0.1", 0, &endpoints)
+        let second = start_helper_with_continuity("127.0.0.1", 0, &endpoints, false)
             .await
             .unwrap();
         let response = client.post(&cached_url).json(&body).send().await.unwrap();
@@ -5065,7 +5079,7 @@ mod tests {
         let busy = tokio::net::TcpListener::bind(("127.0.0.1", original_port))
             .await
             .unwrap();
-        let third = start_helper_with_continuity("127.0.0.1", 0, &endpoints)
+        let third = start_helper_with_continuity("127.0.0.1", 0, &endpoints, false)
             .await
             .unwrap();
         assert!(endpoints.restore_required());
@@ -5103,14 +5117,17 @@ mod tests {
             temp.path().join("home"),
             false,
         );
-        let original = start_helper_with_continuity("127.0.0.1", 0, &endpoints)
+        let original = start_helper_with_continuity("127.0.0.1", 0, &endpoints, false)
             .await.unwrap();
         let cached_port = *endpoints.ports().unwrap().first().unwrap();
         stop_helper_runtimes(original).await;
         let busy = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await.unwrap();
         let primary_port = busy.local_addr().unwrap().port();
-        let runtime = start_helper_with_continuity("127.0.0.1", primary_port, &endpoints)
+        let strict = start_helper_with_continuity("127.0.0.1", primary_port, &endpoints, false).await;
+        assert!(strict.is_err(), "新客户端启动不能绕过固定主端口冲突");
+        assert!(tokio::net::TcpListener::bind(("127.0.0.1", cached_port)).await.is_ok());
+        let runtime = start_helper_with_continuity("127.0.0.1", primary_port, &endpoints, true)
             .await.unwrap();
         let client = reqwest::Client::builder()
             .no_proxy().timeout(std::time::Duration::from_secs(2)).build().unwrap();
@@ -5137,7 +5154,7 @@ mod tests {
         }
         // 仍在等待端口的任务也必须随实例退出，不能在稍后偷偷重新占端口。
         let busy = tokio::net::TcpListener::bind(("127.0.0.1", primary_port)).await.unwrap();
-        let pending = start_helper_with_continuity("127.0.0.1", primary_port, &endpoints)
+        let pending = start_helper_with_continuity("127.0.0.1", primary_port, &endpoints, true)
             .await.unwrap();
         stop_helper_runtimes(pending).await;
         drop(busy);

@@ -1289,7 +1289,11 @@ impl LaunchHooks for LauncherHooks {
     }
 
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
-        self.core.start_helper(helper_port).await
+        if self.attach_only {
+            self.core.start_helper_for_resume(helper_port).await
+        } else {
+            self.core.start_helper(helper_port).await
+        }
     }
 
     fn proxy_continuity_required(&self) -> bool {
