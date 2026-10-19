@@ -1,3 +1,4 @@
+use crate::rollout_source;
 use anyhow::{Context, bail};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,6 +21,31 @@ pub(super) struct HistoryGraph {
 }
 
 impl HistoryGraph {
+    pub(super) fn add_snapshot(
+        &mut self,
+        path: &Path,
+        bytes: &[u8],
+        mapped_id: Option<String>,
+    ) -> anyhow::Result<()> {
+        if !rollout_source::is_rollout(path) {
+            bail!("历史备份不是 rollout：{}", path.display());
+        }
+        let reader = rollout_source::decode_reader(path, bytes)?;
+        let metadata = read_rollout_metadata_reader(path, reader)?;
+        let id = physical_id_from_filename(path)
+            .or(mapped_id)
+            .or(metadata.meta_id)
+            .ok_or_else(|| anyhow::anyhow!("历史备份缺少线程身份：{}", path.display()))?;
+        self.files
+            .entry(id.clone())
+            .or_default()
+            .push(path.to_path_buf());
+        if let Some(base) = metadata.history_base_id {
+            self.dependencies.entry(id).or_default().insert(base);
+        }
+        Ok(())
+    }
+
     pub fn scan(home: &Path, extra: &[(String, PathBuf)]) -> anyhow::Result<Self> {
         let canonical_home = fs::canonicalize(home)
             .with_context(|| format!("无法解析 Codex home：{}", home.display()))?;
@@ -36,7 +62,9 @@ impl HistoryGraph {
 
         // extra 是数据库明确给出的单文件映射，可以位于 home 外；不得从其父目录扩扫。
         for (thread_id, path) in extra {
-            let canonical = canonical_regular_file(path)
+            let resolved = rollout_source::resolve(path)
+                .ok_or_else(|| anyhow::anyhow!("rollout 不存在：{}", path.display()))?;
+            let canonical = canonical_regular_file(&resolved)
                 .with_context(|| format!("无法读取数据库声明的 rollout：{}", path.display()))?;
             let mapped = normalize_id(thread_id);
             match candidates.entry(canonical) {
@@ -166,9 +194,7 @@ fn collect_standard_files(
             let entry = entry?;
             collect_standard_files(&entry.path(), canonical_home, visited_dirs, output)?;
         }
-    } else if metadata.is_file()
-        && canonical.extension().and_then(|value| value.to_str()) == Some("jsonl")
-    {
+    } else if metadata.is_file() && rollout_source::is_rollout(&canonical) {
         output.entry(canonical).or_insert(None);
     }
     Ok(())
@@ -183,8 +209,11 @@ fn canonical_regular_file(path: &Path) -> anyhow::Result<PathBuf> {
 }
 
 fn read_rollout_metadata(path: &Path) -> anyhow::Result<RolloutMetadata> {
-    let file =
-        fs::File::open(path).with_context(|| format!("无法打开 rollout：{}", path.display()))?;
+    let file = rollout_source::open(path)?;
+    read_rollout_metadata_reader(path, file)
+}
+
+fn read_rollout_metadata_reader(path: &Path, file: impl Read) -> anyhow::Result<RolloutMetadata> {
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     let mut total_read = 0;
@@ -235,6 +264,11 @@ fn read_rollout_metadata(path: &Path) -> anyhow::Result<RolloutMetadata> {
                 })?,
         ),
     };
+    // 压缩帧尾部也必须有效，不能用可读首行掩盖截断或校验失败。
+    if rollout_source::is_compressed(path) {
+        std::io::copy(&mut reader, &mut std::io::sink())
+            .with_context(|| format!("rollout 压缩流损坏：{}", path.display()))?;
+    }
     Ok(RolloutMetadata {
         meta_id,
         history_base_id,
@@ -242,7 +276,7 @@ fn read_rollout_metadata(path: &Path) -> anyhow::Result<RolloutMetadata> {
 }
 
 fn physical_id_from_filename(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
+    let stem = rollout_source::logical_stem(path)?;
     if stem.len() < 36 {
         return None;
     }
@@ -290,6 +324,60 @@ mod tests {
             format!("\n{}\n", json!({"type":"session_meta","payload":payload})),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn compressed_extra_outside_home_and_damaged_frame_tail() {
+        let home = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let logical = outside.path().join("custom.jsonl");
+        let compressed = logical.with_extension("jsonl.zst");
+        let text = format!("{}\n", json!({"type":"session_meta","payload":{"id":BASE}}));
+        let mut bytes = zstd::stream::encode_all(text.as_bytes(), 1).unwrap();
+        fs::write(&compressed, &bytes).unwrap();
+        let graph =
+            HistoryGraph::scan(home.path(), &[(CHILD.to_string(), logical.clone())]).unwrap();
+        assert_eq!(
+            graph.closure_files(CHILD).unwrap(),
+            vec![fs::canonicalize(&compressed).unwrap()]
+        );
+        // 首帧完整且首行可读，尾部损坏仍必须停止删除。
+        bytes.extend_from_slice(b"broken trailing frame");
+        fs::write(&compressed, &bytes).unwrap();
+        assert!(HistoryGraph::scan(home.path(), &[(CHILD.to_string(), logical)]).is_err());
+    }
+
+    #[test]
+    fn compressed_continuation_uses_physical_id_and_plain_extra_resolves() {
+        let temp = tempdir().unwrap();
+        let base = temp
+            .path()
+            .join("sessions")
+            .join(format!("rollout-{BASE}.jsonl"));
+        let child = temp
+            .path()
+            .join("sessions")
+            .join(format!("rollout-{BASE}_{CHILD}.jsonl"));
+        write_meta(&base, BASE, None, None);
+        write_meta(&child, BASE, Some(BASE), None);
+        for plain in [&base, &child] {
+            let bytes = zstd::stream::encode_all(&fs::read(plain).unwrap()[..], 1).unwrap();
+            fs::write(plain.with_extension("jsonl.zst"), bytes).unwrap();
+            fs::remove_file(plain).unwrap();
+        }
+        let graph = HistoryGraph::scan(temp.path(), &[(CHILD.to_string(), child)]).unwrap();
+        assert_eq!(
+            graph.dependencies[CHILD],
+            BTreeSet::from([BASE.to_string()])
+        );
+        assert_eq!(graph.closure_files(CHILD).unwrap().len(), 2);
+        assert!(
+            graph
+                .files
+                .values()
+                .flatten()
+                .all(|p| crate::rollout_source::is_compressed(p))
+        );
     }
 
     #[test]

@@ -8,17 +8,6 @@ use std::collections::{BTreeMap, BTreeSet};
 const TABLE: &str = "codex_plus_deleted_threads";
 const RESTORED_TABLE: &str = "codex_plus_restored_threads";
 
-fn rollout_file_backup_entry(path: &str, source_path: &str, bytes: Vec<u8>) -> Value {
-    let mut entry = json!({
-        "path": path,
-        "content_b64": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
-    });
-    if path != source_path {
-        entry["source_path"] = Value::String(source_path.to_string());
-    }
-    entry
-}
-
 pub(super) struct HistoryRetention {
     _lock: File,
     home: PathBuf,
@@ -84,11 +73,11 @@ impl HistoryRetention {
                 })? {
                     let (id, path) = row?;
                     let original = PathBuf::from(&path);
-                    if original.is_file() {
-                        paths.push((id, original));
+                    if let Some(resolved) = crate::rollout_source::resolve(&original) {
+                        paths.push((id, resolved));
                     } else if let Some(alt) = wsl_path_alternative(&path).map(PathBuf::from) {
-                        if alt.is_file() {
-                            paths.push((id, alt));
+                        if let Some(resolved) = crate::rollout_source::resolve(&alt) {
+                            paths.push((id, resolved));
                         }
                     }
                 }
@@ -194,12 +183,11 @@ impl HistoryRetention {
                     roots.insert(id);
                 }
                 if let Some(rollout) = rollout {
-                    let resolved = fs::canonicalize(&rollout).or_else(|_| {
-                        wsl_path_alternative(&rollout)
-                            .map(fs::canonicalize)
-                            .unwrap_or_else(|| fs::canonicalize(&rollout))
-                    });
-                    if let Ok(resolved) = resolved {
+                    let resolved = std::iter::once(rollout.clone())
+                        .chain(wsl_path_alternative(&rollout))
+                        .filter_map(|view| crate::rollout_source::resolve(Path::new(&view)))
+                        .find_map(|path| fs::canonicalize(path).ok());
+                    if let Some(resolved) = resolved {
                         for (physical_id, files) in &graph.files {
                             if files.contains(&resolved) {
                                 roots.insert(physical_id.clone());
@@ -259,7 +247,11 @@ impl HistoryRetention {
     }
 
     /// 新备份允许保留中的同一文件存在，但绝不覆盖追加后的历史。
-    pub fn prepare_undo(&self, backups: &mut [Value], store: &BackupStore) -> anyhow::Result<()> {
+    pub fn prepare_undo(
+        &self,
+        backups: &mut [Value],
+        backup_store: &BackupStore,
+    ) -> anyhow::Result<()> {
         let mut all_files = BTreeMap::<PathBuf, (Vec<u8>, Value)>::new();
         for backup in backups.iter_mut() {
             let db_path = backup_source_db(backup, &self.databases[0], &self.databases)?;
@@ -279,7 +271,17 @@ impl HistoryRetention {
                 .into_iter()
                 .flatten()
                 .filter_map(|row| row["rollout_path"].as_str())
-                .map(|path| resolved_history_path(Path::new(path)))
+                .flat_map(|path| {
+                    let mut paths = vec![PathBuf::from(path)];
+                    if Path::new(path)
+                        .extension()
+                        .is_some_and(|ext| ext == "jsonl")
+                    {
+                        paths.push(PathBuf::from(format!("{path}.zst")));
+                    }
+                    paths
+                })
+                .map(|path| resolved_history_path(&path))
                 .collect::<anyhow::Result<BTreeSet<_>>>()?;
             let current_token = if has_table(&db, TABLE)? {
                 db.query_row(
@@ -348,9 +350,7 @@ impl HistoryRetention {
                             let current =
                                 select_dicts(&db, "SELECT * FROM threads WHERE id=?1", &[&id])?;
                             let mut original = row.clone();
-                            if object.contains_key("archived") {
-                                original["archived"] = current[0]["archived"].clone();
-                            }
+                            original["archived"] = current[0]["archived"].clone();
                             if object.contains_key("archived_at") {
                                 original["archived_at"] = current[0]["archived_at"].clone();
                             }
@@ -388,6 +388,7 @@ impl HistoryRetention {
                 *rows = retained;
             }
             tables.insert("__restore_archived".into(), Value::Array(archived));
+            let mut backup_graph = HistoryGraph::default();
             for key in ["__files", "__history_files"] {
                 for file in tables
                     .get(key)
@@ -406,8 +407,38 @@ impl HistoryRetention {
                     {
                         self.validate_history_path(Path::new(path))?;
                     }
-                    let normalized = comparable_history_path(Path::new(path));
-                    let bytes = store.read_file_backup(&token, file)?;
+                    let normalized = resolved_history_path(Path::new(path))?;
+                    let bytes = backup_store.read_file_backup(&token, file)?;
+                    if key == "__history_files" {
+                        let logical_target = Path::new(path)
+                            .to_str()
+                            .and_then(|text| text.strip_suffix(".zst"))
+                            .map(PathBuf::from);
+                        let is_target = target_paths.contains(&normalized)
+                            || logical_target.as_deref().is_some_and(|logical| {
+                                resolved_history_path(logical)
+                                    .is_ok_and(|target| target_paths.contains(&target))
+                            });
+                        backup_graph.add_snapshot(
+                            Path::new(path),
+                            &bytes,
+                            is_target.then(|| id.clone()),
+                        )?;
+                    }
+                    let mut portable = file.clone();
+                    let object = portable
+                        .as_object_mut()
+                        .ok_or_else(|| anyhow::anyhow!("invalid history backup entry"))?;
+                    object.remove("blob_ref");
+                    object.remove("size_bytes");
+                    object.remove("sha256");
+                    object.insert(
+                        "content_b64".to_string(),
+                        Value::String(base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            &bytes,
+                        )),
+                    );
                     if let Some((previous, _)) = all_files.get(&normalized) {
                         if !previous.starts_with(&bytes) && !bytes.starts_with(previous) {
                             bail!("restore conflict: incompatible history snapshots: {path}");
@@ -416,13 +447,13 @@ impl HistoryRetention {
                             continue;
                         }
                     }
-                    // 跨备份共享恢复清单不能携带另一个 token 的 blob 引用。
-                    let mut restored = file.clone();
-                    restored["content_b64"] = Value::String(base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        &bytes,
-                    ));
-                    all_files.insert(normalized, (bytes, restored));
+                    all_files.insert(normalized, (bytes, portable));
+                }
+            }
+            if !backup_graph.files.is_empty() {
+                let closure = backup_graph.closure_files(&id)?;
+                if closure.len() != backup_graph.files.values().map(Vec::len).sum::<usize>() {
+                    bail!("unexpected history files outside restore closure: {id}");
                 }
             }
             tables.insert("__files".into(), Value::Array(Vec::new()));
@@ -432,6 +463,17 @@ impl HistoryRetention {
             .map(|(_, file)| file.clone())
             .collect::<Vec<_>>();
         let mut missing = Vec::new();
+        for path in all_files.keys() {
+            if crate::rollout_source::is_compressed(path) {
+                let logical = path.with_extension("");
+                if logical.exists() && !all_files.contains_key(&logical) {
+                    bail!(
+                        "restore conflict: uncompressed history now exists: {}",
+                        logical.display()
+                    );
+                }
+            }
+        }
         for (path, (bytes, file)) in all_files {
             match fs::read(&path) {
                 Ok(current) if current.starts_with(&bytes) => {}
@@ -507,6 +549,20 @@ impl HistoryRetention {
     }
 }
 
+fn rollout_file_backup_entry(path: &str, source_path: &str, bytes: Vec<u8>) -> Value {
+    let mut entry = json!({
+        "path": path,
+        "content_b64": base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            bytes,
+        ),
+    });
+    if path != source_path {
+        entry["source_path"] = Value::String(source_path.to_string());
+    }
+    entry
+}
+
 /// Windows 的扩展路径与普通路径必须在同一命名空间内比较；UNC 仍保留服务器前缀。
 fn comparable_history_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
@@ -524,6 +580,8 @@ fn comparable_history_path(path: &Path) -> PathBuf {
 
 // 回收后的文件可能已不存在；从最近的现存祖先解析短路径与目录大小写。
 fn resolved_history_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let resolved = crate::rollout_source::resolve(path);
+    let path = resolved.as_deref().unwrap_or(path);
     let mut ancestor = path;
     let mut missing = Vec::new();
     loop {

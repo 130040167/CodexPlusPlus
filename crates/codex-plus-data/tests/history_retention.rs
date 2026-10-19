@@ -91,24 +91,100 @@ fn retained_history_undo_supports_legacy_threads_without_archived_columns() {
 }
 
 #[test]
-fn retained_history_undo_validates_upstream_blob_before_restoring() {
+fn compressed_raw_file_delete_and_undo_without_retention_preserve_bytes() {
     let f = Fixture::new();
     f.add("a", None);
-    let original = fs::read(f.path("a")).unwrap();
-    let token = f.delete("a");
+    let compressed = f.path("a").with_extension("jsonl.zst");
+    let bytes = zstd::stream::encode_all(&fs::read(f.path("a")).unwrap()[..], 1).unwrap();
+    fs::write(&compressed, &bytes).unwrap();
+    fs::remove_file(f.path("a")).unwrap();
+    let adapter =
+        SQLiteStorageAdapter::new(&f.db, BackupStore::new(f.home().join("backups")));
+    let deleted = adapter.delete_local(&SessionRef::new("local:a", "a").unwrap());
+    assert_eq!(
+        deleted.status,
+        DeleteStatus::LocalDeleted,
+        "{}",
+        deleted.message
+    );
+    assert!(!compressed.exists());
+    let restored = adapter.undo(&deleted.undo_token.unwrap());
+    assert_eq!(restored.status, DeleteStatus::Undone, "{}", restored.message);
+    assert_eq!(fs::read(compressed).unwrap(), bytes);
     assert!(!f.path("a").exists());
-    let store = BackupStore::new(f.home().join("backups"));
-    let backup = store.read_backup(&token).unwrap();
-    let relative = backup["tables"]["__files"][0]["blob_ref"].as_str().unwrap();
-    let blob = f.home().join("backups").join(relative);
-    fs::write(&blob, b"corrupt fixture").unwrap();
-    let result = f.adapter().undo(&token);
-    assert_eq!(result.status, DeleteStatus::Failed, "{}", result.message);
-    assert!(!f.path("a").exists());
+}
+
+#[test]
+fn compressed_parent_and_child_keep_raw_backups_and_restore_hidden_ancestors() {
+    let f = Fixture::new();
+    f.add("a", None);
+    f.add("b", Some("a"));
+    let mut originals = Vec::new();
+    for id in ["a", "b"] {
+        let plain = f.path(id);
+        let compressed = plain.with_extension("jsonl.zst");
+        let bytes = zstd::stream::encode_all(&fs::read(&plain).unwrap()[..], 1).unwrap();
+        fs::write(&compressed, &bytes).unwrap();
+        fs::remove_file(&plain).unwrap();
+        originals.push((compressed, bytes));
+    }
+    f.delete("a");
+    assert!(originals[0].0.exists());
     assert!(!f.visible("a"));
-    fs::write(&blob, original).unwrap();
+    let token = f.delete("b");
+    assert!(originals.iter().all(|(path, _)| !path.exists()));
     f.undo(&token);
+    for (path, bytes) in originals {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+    assert!(!f.path("a").exists());
+    assert!(!f.path("b").exists());
+    assert!(!f.visible("a"));
+    assert!(f.visible("b"));
+}
+
+#[test]
+fn compressed_undo_rejects_corrupt_snapshot_and_new_plain_source() {
+    use base64::Engine;
+    for corrupt_snapshot in [false, true] {
+        let f = Fixture::new();
+        f.add("a", None);
+        let compressed = f.path("a").with_extension("jsonl.zst");
+        let bytes = zstd::stream::encode_all(&fs::read(f.path("a")).unwrap()[..], 1).unwrap();
+        fs::write(&compressed, bytes).unwrap();
+        fs::remove_file(f.path("a")).unwrap();
+        let token = f.delete("a");
+        if corrupt_snapshot {
+            let store = BackupStore::new(f.home().join("backups"));
+            let mut backup = store.read_backup(&token).unwrap();
+            for file in backup["tables"]["__history_files"].as_array_mut().unwrap() {
+                file["content_b64"] =
+                    json!(base64::engine::general_purpose::STANDARD.encode(b"bad zstd"));
+            }
+            fs::write(store.path_for(&token), serde_json::to_vec(&backup).unwrap()).unwrap();
+        } else {
+            fs::write(f.path("a"), b"new history must not be shadowed").unwrap();
+        }
+        let result = f.adapter().undo(&token);
+        assert_eq!(result.status, DeleteStatus::Failed, "{}", result.message);
+        assert!(!compressed.exists());
+        assert!(!f.visible("a"));
+    }
+}
+
+#[test]
+fn corrupted_compressed_source_blocks_delete_without_changing_rows_or_files() {
+    let f = Fixture::new();
+    f.add("a", None);
+    let compressed = f.path("a").with_extension("jsonl.zst");
+    fs::write(&compressed, b"not a zstd frame").unwrap();
+    fs::remove_file(f.path("a")).unwrap();
+    let result = f
+        .adapter()
+        .delete_local(&SessionRef::new("local:a", "a").unwrap());
+    assert_eq!(result.status, DeleteStatus::Failed, "{}", result.message);
     assert!(f.visible("a"));
+    assert_eq!(fs::read(compressed).unwrap(), b"not a zstd frame");
 }
 
 #[test]
@@ -283,6 +359,33 @@ fn archived_dependency_and_unrelated_fork_are_handled_by_history_base() {
     f.delete("x");
     assert!(!f.path("x").exists());
     assert!(f.path("y").exists());
+}
+
+#[test]
+fn repeated_delete_repairs_native_reappearance_and_preserves_original_undo() {
+    let f = Fixture::new();
+    f.add("a", None);
+    f.add("b", Some("a"));
+    let token = f.delete("a");
+    let original = fs::read(f.path("a")).unwrap();
+    let db = Connection::open(&f.db).unwrap();
+    db.execute("UPDATE threads SET archived=0 WHERE id='a'", []).unwrap();
+    fs::write(f.home().join("session_index.jsonl"), "{\"id\":\"a\",\"thread_name\":\"A\",\"updated_at\":\"2026-10-19T00:00:00Z\"}\n").unwrap();
+    assert_eq!(codex_plus_data::storage::deleted_local_thread_ids(&[f.db.clone()]).unwrap(), vec!["a"]);
+    let result = delete_local_from_paths(
+        [f.db.clone()],
+        BackupStore::new(f.home().join("backups")),
+        &SessionRef::new("a", "a").unwrap(),
+        Some(f.home()),
+    );
+    assert_eq!(result.status, DeleteStatus::LocalDeleted, "{}", result.message);
+    assert_eq!(result.undo_token.as_deref(), Some(token.as_str()));
+    assert_eq!(db.query_row("SELECT archived FROM threads WHERE id='a'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    assert!(!fs::read_to_string(f.home().join("session_index.jsonl")).unwrap().contains("\"a\""));
+    assert_eq!(fs::read(f.path("a")).unwrap(), original);
+    f.undo(&token);
+    assert!(f.visible("a"));
+    assert!(codex_plus_data::storage::deleted_local_thread_ids(&[f.db.clone()]).unwrap().is_empty());
 }
 
 #[test]
@@ -476,11 +579,11 @@ fn partial_database_delete_keeps_live_duplicate_and_its_history() {
         Some(f.home()),
     );
     assert_eq!(r.status, DeleteStatus::Failed, "{}", r.message);
-    assert!(r.undo_token.is_some(), "partial deletion must remain recoverable");
     assert!(
         f.path("a").exists(),
         "undeleted duplicate still owns rollout"
     );
+    assert!(codex_plus_data::storage::deleted_local_thread_ids(&[f.db.clone(), other.clone()]).unwrap().is_empty());
     Connection::open(&other)
         .unwrap()
         .execute_batch("DROP TRIGGER reject_delete")
