@@ -2,6 +2,171 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { readFile } from "node:fs/promises";
 
+describe("session more menu lifecycle", () => {
+  async function runtime() {
+    const source = await readFile(
+      new URL("../../../assets/inject/renderer-inject/90-action-groups.js", import.meta.url), "utf8",
+    );
+    const menus: ReturnType<typeof fixture>[] = [];
+    const timers = new Map<number, () => void>();
+    let timerId = 0;
+    const events = () => {
+      const listeners = new Map<string, () => void>();
+      return {
+        listeners,
+        addEventListener: (name: string, callback: () => void) => listeners.set(name, callback),
+        removeEventListener: (name: string) => listeners.delete(name),
+      };
+    };
+    function fixture() {
+      const classes = new Set(["codex-session-more-open"]);
+      const button = { expanded: "true", setAttribute: (_: string, value: string) => { button.expanded = value; } };
+      const group = { ...events(), isConnected: true, querySelector: () => button, matches: () => false };
+      const row = { isConnected: true, contains: (node: unknown) => node === group, classList: { remove: (name: string) => classes.delete(name) } };
+      const menu = {
+        ...events(), hidden: false, removed: false, classes, row, group, button,
+        __codexSessionMoreRow: row as typeof row | null,
+        __codexSessionMoreGroup: group as typeof group | null,
+        __codexSessionMoreCleanup: null as (() => void) | null,
+        remove: () => { menu.removed = true; },
+        matches: () => false, contains: () => false,
+      };
+      return menu;
+    }
+    const api = new Function("document", "window", "moreMenuClass", "moreButtonClass",
+      `${source.split("  function tryAttachButton(row)")[0]}
+       return { pruneSessionMoreMenus, closeSessionMoreMenus, installSessionMoreMenuAutoClose };`,
+    )(
+      { querySelectorAll: () => menus.filter((menu) => !menu.removed), activeElement: null },
+      {
+        setTimeout: (callback: () => void) => {
+          const id = ++timerId;
+          timers.set(id, () => { timers.delete(id); callback(); });
+          return id;
+        },
+        clearTimeout: (id: number) => timers.delete(id),
+      },
+      "codex-session-more-menu", "codex-session-more-button",
+    );
+    return {
+      ...api, timers,
+      fixture: () => {
+        const menu = fixture();
+        menus.push(menu);
+        return menu;
+      },
+    };
+  }
+
+  it("disposes detached owners and groups without removing connected or synchronously moved rows", async () => {
+    const api = await runtime();
+    const live = api.fixture();
+    const detachedRow = api.fixture();
+    const detachedGroup = api.fixture();
+    const unrelatedGroup = api.fixture();
+    const moved = api.fixture();
+    detachedRow.row.isConnected = false;
+    detachedGroup.group.isConnected = false;
+    unrelatedGroup.row.contains = () => false;
+    moved.row.isConnected = false;
+    moved.row.isConnected = true;
+    assert.equal(api.pruneSessionMoreMenus(), true);
+    assert.equal(live.removed, false);
+    assert.equal(moved.removed, false);
+    for (const menu of [detachedRow, detachedGroup, unrelatedGroup]) {
+      assert.equal(menu.removed, true);
+      assert.equal(menu.hidden, true);
+      assert.equal(menu.button.expanded, "false");
+      assert.equal(menu.classes.has("codex-session-more-open"), false);
+      assert.equal(menu.__codexSessionMoreRow, null);
+      assert.equal(menu.__codexSessionMoreGroup, null);
+    }
+    assert.equal(api.pruneSessionMoreMenus(), false);
+    assert.equal(live.removed, false);
+  });
+
+  it("resets expansion state when another menu opens or all menus close", async () => {
+    const api = await runtime();
+    const first = api.fixture();
+    const second = api.fixture();
+    api.closeSessionMoreMenus(second);
+    assert.equal(first.hidden, true);
+    assert.equal(first.button.expanded, "false");
+    assert.equal(second.hidden, false);
+    api.closeSessionMoreMenus();
+    assert.equal(second.hidden, true);
+    assert.equal(second.button.expanded, "false");
+  });
+
+  it("coalesces auto-close timers and cancels listeners and timers on disposal", async () => {
+    const api = await runtime();
+    const menu = api.fixture();
+    api.installSessionMoreMenuAutoClose(menu.row, menu);
+    menu.group.listeners.get("pointerleave")!();
+    menu.listeners.get("focusout")!();
+    assert.equal(api.timers.size, 1);
+    for (const callback of api.timers.values()) callback();
+    assert.equal(menu.hidden, true);
+    assert.equal(menu.button.expanded, "false");
+    menu.listeners.get("pointerleave")!();
+    menu.row.isConnected = false;
+    api.pruneSessionMoreMenus();
+    assert.equal(api.timers.size, 0);
+    assert.equal(menu.group.listeners.size, 0);
+    assert.equal(menu.listeners.size, 0);
+    assert.equal(menu.__codexSessionMoreCleanup, null);
+  });
+
+  it("prunes removed elements before pending, hidden and relevance scan guards", async () => {
+    const schedule = await readFile(
+      new URL("../../../assets/inject/renderer-inject/98-scan-schedule.js", import.meta.url), "utf8",
+    );
+    const source = schedule.slice(schedule.indexOf("  function scheduleScan("), schedule.indexOf("  const onScanVisibilityChange"));
+    let pruned = 0;
+    let relevanceChecks = 0;
+    const window = { __codexSessionDeleteScanPending: true };
+    const scheduleScan = new Function("window", "document", "pruneSessionMoreMenus", "shouldScheduleScan",
+      `${source}\nreturn scheduleScan;`,
+    )(window, { hidden: true }, () => { pruned++; }, () => { relevanceChecks++; return false; });
+    scheduleScan([{ removedNodes: [{ nodeType: 1 }] }]);
+    assert.equal(pruned, 1);
+    assert.equal(relevanceChecks, 0);
+    window.__codexSessionDeleteScanPending = false;
+    scheduleScan([{ removedNodes: [{ nodeType: 1 }] }]);
+    assert.equal(pruned, 2);
+    assert.equal(relevanceChecks, 1);
+    scheduleScan([{ removedNodes: [{ nodeType: 3 }] }]);
+    assert.equal(pruned, 2);
+    const view = await readFile(
+      new URL("../../../assets/inject/renderer-inject/95-conversation-view.js", import.meta.url), "utf8",
+    );
+    assert.match(view, /function scan\(\) \{\s*pruneSessionMoreMenus\(\);\s*if \(document.hidden\)/);
+  });
+
+  it("schedules one repair for a removed owned group even when normal relevance filtering skips it", async () => {
+    const schedule = await readFile(
+      new URL("../../../assets/inject/renderer-inject/98-scan-schedule.js", import.meta.url), "utf8",
+    );
+    const source = schedule.slice(schedule.indexOf("  function scheduleScan("), schedule.indexOf("  const onScanVisibilityChange"));
+    const window = { __codexSessionDeleteScanPending: false };
+    const timers: Array<() => void> = [];
+    let needsScan = true;
+    const scheduleScan = new Function("window", "document", "pruneSessionMoreMenus", "shouldScheduleScan",
+      "setTimeout", "runScheduledScan", `${source}\nreturn scheduleScan;`,
+    )(window, { hidden: false }, () => needsScan, () => false,
+      (callback: () => void) => { timers.push(callback); return timers.length; },
+      () => { window.__codexSessionDeleteScanPending = false; });
+    const removed = [{ removedNodes: [{ nodeType: 1 }] }];
+    scheduleScan(removed);
+    scheduleScan(removed);
+    assert.equal(timers.length, 1);
+    timers[0]();
+    needsScan = false;
+    scheduleScan(removed);
+    assert.equal(timers.length, 1, "normal removal of owned UI must not feed a scan loop");
+  });
+});
+
 it("keeps background-resume scan scheduling bounded and independent of retired features", async () => {
   const schedule = await readFile(
     new URL("../../../assets/inject/renderer-inject/98-scan-schedule.js", import.meta.url),

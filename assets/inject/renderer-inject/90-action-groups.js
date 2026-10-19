@@ -6,9 +6,40 @@
 
   function removeActionGroups(row) {
     document.querySelectorAll(`.${moreMenuClass}`).forEach((menu) => {
-      if (menu.__codexSessionMoreRow === row) menu.remove();
+      if (menu.__codexSessionMoreRow === row) disposeSessionMoreMenu(menu);
     });
     row.querySelectorAll(`.${actionGroupClass}`).forEach((group) => group.remove());
+  }
+
+  function closeSessionMoreMenu(menu) {
+    menu.hidden = true;
+    const row = menu.__codexSessionMoreRow || menu.closest?.("[data-codex-delete-row]");
+    row?.classList?.remove("codex-session-more-open");
+    menu.__codexSessionMoreGroup?.querySelector?.(`.${moreButtonClass}`)?.setAttribute("aria-expanded", "false");
+  }
+
+  function disposeSessionMoreMenu(menu) {
+    closeSessionMoreMenu(menu);
+    menu.__codexSessionMoreCleanup?.();
+    menu.__codexSessionMoreCleanup = null;
+    menu.__codexSessionMoreRow = null;
+    menu.__codexSessionMoreGroup = null;
+    menu.remove();
+  }
+
+  function pruneSessionMoreMenus() {
+    let needsScan = false;
+    // 菜单挂在 body 下，不会随 React 会话行一起卸载；复用现有观察器及时释放。
+    document.querySelectorAll(`.${moreMenuClass}`).forEach((menu) => {
+      const row = menu.__codexSessionMoreRow;
+      const group = menu.__codexSessionMoreGroup;
+      if (!row?.isConnected || !group?.isConnected || !row.contains(group)
+          || !group.querySelector(`.${moreButtonClass}`)) {
+        if (row?.isConnected) needsScan = true;
+        disposeSessionMoreMenu(menu);
+      }
+    });
+    return needsScan;
   }
 
   function stopActionButtonEvent(row, button, event) {
@@ -50,9 +81,7 @@
   function closeSessionMoreMenus(exceptMenu = null) {
     document.querySelectorAll(`.${moreMenuClass}`).forEach((menu) => {
       if (menu !== exceptMenu) {
-        menu.hidden = true;
-        menu.closest?.("[data-codex-delete-row]")?.classList.remove("codex-session-more-open");
-        menu.__codexSessionMoreRow?.classList?.remove("codex-session-more-open");
+        closeSessionMoreMenu(menu);
       }
     });
   }
@@ -67,19 +96,27 @@
 
   function installSessionMoreMenuAutoClose(row, menu) {
     const group = menu.__codexSessionMoreGroup || menu.closest?.(`.${actionGroupClass}`);
+    let closeTimer = null;
     const closeIfOutside = () => {
-      window.setTimeout(() => {
+      window.clearTimeout(closeTimer);
+      closeTimer = window.setTimeout(() => {
+        closeTimer = null;
         if (menu.hidden) return;
         const active = document.activeElement;
         if (group?.matches?.(":hover") || menu.matches?.(":hover") || menu.contains(active)) return;
-        menu.hidden = true;
-        row.classList.remove("codex-session-more-open");
-        group?.querySelector?.(`.${moreButtonClass}`)?.setAttribute("aria-expanded", "false");
+        closeSessionMoreMenu(menu);
       }, 80);
     };
     group?.addEventListener("pointerleave", closeIfOutside, true);
     menu.addEventListener("pointerleave", closeIfOutside, true);
     menu.addEventListener("focusout", closeIfOutside, true);
+    menu.__codexSessionMoreCleanup = () => {
+      window.clearTimeout(closeTimer);
+      closeTimer = null;
+      group?.removeEventListener("pointerleave", closeIfOutside, true);
+      menu.removeEventListener("pointerleave", closeIfOutside, true);
+      menu.removeEventListener("focusout", closeIfOutside, true);
+    };
   }
 
   function updateSessionMoreMenuDirection(button, menu) {
@@ -195,6 +232,7 @@
     row.dataset.codexDeleteRow = "true";
     const group = document.createElement("div");
     group.className = actionGroupClass;
+    group.setAttribute("data-codex-plus-ext", "session-actions");
     group.dataset.codexActionGroupVersion = codexActionGroupVersion;
     if (needsMoreMenu) {
       const moreButton = document.createElement("button");
@@ -205,6 +243,7 @@
       configureActionButton(moreButton, "更多操作", "…");
       const moreMenu = document.createElement("div");
       moreMenu.className = moreMenuClass;
+      moreMenu.setAttribute("data-codex-plus-ext", "session-more-menu");
       moreMenu.setAttribute("role", "menu");
       moreMenu.hidden = true;
       if (settings.markdownExport) {
