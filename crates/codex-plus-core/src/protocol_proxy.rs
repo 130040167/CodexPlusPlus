@@ -546,7 +546,17 @@ pub fn responses_to_chat_completions_with_options(
     let mut has_chat_tools = false;
     if !converted.is_empty() {
         has_chat_tools = true;
-        result["tools"] = json!(converted);
+        let mut tools = converted;
+        // Gemini 的 function_declarations 只接受字符串枚举值：Codex 工具 schema
+        // 里出现 `enum: [true, false]` 这类布尔/数字值时会整轮 400
+        // （`enum[0] (TYPE_STRING)`，issue #2404）。只对 Gemini 系上游改写，
+        // 其他上游保持原始 JSON Schema 语义。
+        if upstream_requires_string_enums(model) {
+            for tool in tools.iter_mut() {
+                coerce_enum_values_to_strings(tool);
+            }
+        }
+        result["tools"] = json!(tools);
     }
 
     if has_chat_tools {
@@ -6614,6 +6624,44 @@ fn namespace_tool_to_chat_tools(namespace_tool: &Value, context: &CodexToolConte
     converted
 }
 
+/// Gemini 系上游（含中转暴露的 google/gemini-*）要求 function declaration 的
+/// `enum` 全部是字符串，布尔/数字枚举会被整轮拒绝（#2404）。
+fn upstream_requires_string_enums(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("gemini") || model.starts_with("google/") || model.starts_with("models/gemini")
+}
+
+/// 递归把 schema 中 `enum` 数组的非字符串值转成字符串。
+fn coerce_enum_values_to_strings(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::Array(entries)) = map.get_mut("enum") {
+                for entry in entries.iter_mut() {
+                    let coerced = match entry {
+                        Value::String(_) => None,
+                        Value::Bool(flag) => Some(flag.to_string()),
+                        Value::Number(number) => Some(number.to_string()),
+                        Value::Null => Some("null".to_string()),
+                        _ => None,
+                    };
+                    if let Some(coerced) = coerced {
+                        *entry = Value::String(coerced);
+                    }
+                }
+            }
+            for child in map.values_mut() {
+                coerce_enum_values_to_strings(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values.iter_mut() {
+                coerce_enum_values_to_strings(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn normalize_chat_tool_parameters(parameters: &Value) -> Value {
     let mut normalized = if parameters.is_object() {
         parameters.clone()
@@ -8773,6 +8821,51 @@ mod response_compatibility_tests {
         .unwrap();
         assert_eq!(response["status"], "failed");
         assert_eq!(response["output"][0]["status"], "failed");
+    }
+
+    #[test]
+    fn gemini_tool_enum_values_are_coerced_to_strings() {
+        // #2404：Gemini 只接受字符串枚举值，布尔/数字枚举会导致整轮 400。
+        let body = json!({
+            "model": "gemini-3.8-flash",
+            "input": "hi",
+            "tools": [{
+                "type": "function",
+                "name": "set_flag",
+                "description": "",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean", "enum": [true, false]},
+                        "level": {"type": "integer", "enum": [1, 2]}
+                    }
+                }
+            }]
+        });
+        let converted = responses_to_chat_completions(body).unwrap();
+        let parameters = &converted["tools"][0]["function"]["parameters"]["properties"];
+        assert_eq!(parameters["enabled"]["enum"][0], "true");
+        assert_eq!(parameters["enabled"]["enum"][1], "false");
+        assert_eq!(parameters["level"]["enum"][0], "1");
+
+        // 非 Gemini 上游保持原始 JSON Schema 语义。
+        let body = json!({
+            "model": "glm-5.3",
+            "input": "hi",
+            "tools": [{
+                "type": "function",
+                "name": "set_flag",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"enabled": {"type": "boolean", "enum": [true, false]}}
+                }
+            }]
+        });
+        let converted = responses_to_chat_completions(body).unwrap();
+        assert_eq!(
+            converted["tools"][0]["function"]["parameters"]["properties"]["enabled"]["enum"][0],
+            true
+        );
     }
 
     #[test]
