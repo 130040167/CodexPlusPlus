@@ -237,9 +237,13 @@ fn scan_source(path: &Path) -> anyhow::Result<(ScanResult, String)> {
     Ok((scanned, reader.stamp(&metadata)))
 }
 
-fn verify_duplicate_sources(files: &[PathBuf]) -> anyhow::Result<HashMap<PathBuf, String>> {
+fn verify_duplicate_sources(
+    files: &mut Vec<PathBuf>,
+    report: &mut SessionIndexRepairReport,
+) -> anyhow::Result<HashMap<PathBuf, String>> {
     let paths: HashSet<_> = files.iter().cloned().collect();
     let mut fingerprints = HashMap::new();
+    let mut isolated = HashSet::new();
     for plain in files
         .iter()
         .filter(|path| !crate::rollout_source::is_compressed(path))
@@ -250,8 +254,26 @@ fn verify_duplicate_sources(files: &[PathBuf]) -> anyhow::Result<HashMap<PathBuf
         if !paths.contains(&compressed) {
             continue;
         }
-        let (left, left_stamp) = scan_source(plain)?;
-        let (right, right_stamp) = scan_source(&compressed)?;
+        let pair = (|| -> anyhow::Result<_> {
+            Ok((scan_source(plain)?, scan_source(&compressed)?))
+        })();
+        let ((left, left_stamp), (right, right_stamp)) = match pair {
+            Ok(pair) => pair,
+            Err(error) => {
+                // 任一副本不可核验时，两个路径都不能成为恢复或缓存证据。
+                isolated.insert(plain.clone());
+                isolated.insert(compressed.clone());
+                issue(
+                    report,
+                    format!(
+                        "{} / {}：副本核验失败，已隔离两个来源，未写入：{error:#}",
+                        plain.display(),
+                        compressed.display()
+                    ),
+                );
+                continue;
+            }
+        };
         // 同一逻辑来源的两个物理副本必须给出一致证据，不能由目标去重选择赢家。
         if serde_json::to_value(left)? != serde_json::to_value(right)? {
             bail!(
@@ -262,6 +284,7 @@ fn verify_duplicate_sources(files: &[PathBuf]) -> anyhow::Result<HashMap<PathBuf
         fingerprints.insert(plain.clone(), left_stamp);
         fingerprints.insert(compressed, right_stamp);
     }
+    files.retain(|path| !isolated.contains(path));
     Ok(fingerprints)
 }
 
@@ -1173,7 +1196,7 @@ fn repair_session_index_in_roots(
             collect_files(&home.join(dir), &mut files)?;
         }
         files.sort();
-        let duplicate_sources = verify_duplicate_sources(&files)?;
+        let duplicate_sources = verify_duplicate_sources(&mut files, &mut report)?;
         let mut candidates = Vec::new();
         let owners = rollout_owners(sqlite_home, home)?;
         let mut turn_owners: HashMap<String, HashSet<String>> = HashMap::new();
@@ -2109,6 +2132,46 @@ mod tests {
             .unwrap(),
             (None, None)
         );
+    }
+
+    #[test]
+    fn corrupt_duplicate_sources_are_isolated_while_independent_history_recovers() {
+        let home = home_with_rollout();
+        let sessions = home.path().join("sessions");
+        let raw = fs::read_to_string(sessions.join("rollout.jsonl")).unwrap();
+        fs::rename(sessions.join("rollout.jsonl"), sessions.join("a.jsonl")).unwrap();
+        fs::write(sessions.join("a.jsonl.zst"), b"invalid compressed source").unwrap();
+        fs::write(
+            sessions.join("b.jsonl"),
+            raw.replace("\"thread\"", "\"independent\"")
+                .replace("\"turn\"", "\"b-turn\""),
+        )
+        .unwrap();
+        let db = Connection::open(home.path().join("thread_history_1.sqlite")).unwrap();
+        db.execute(
+            "INSERT INTO thread_turns VALUES('independent','b-turn','completed',NULL)",
+            [],
+        )
+        .unwrap();
+        for attempt in 0..2 {
+            let report = repair_session_index(Some(home.path())).unwrap();
+            assert!(report.aborted_reason.is_none());
+            assert_eq!(report.repaired_items, usize::from(attempt == 0));
+            assert!(report.issues.iter().any(|message| {
+                message.contains("a.jsonl")
+                    && message.contains("a.jsonl.zst")
+                    && message.contains("隔离")
+            }));
+            let recovered: Vec<String> = db
+                .prepare("SELECT thread_id FROM thread_items")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(recovered, vec!["independent"]);
+            assert_eq!(counts(&db).1, None);
+        }
     }
 
     #[test]
