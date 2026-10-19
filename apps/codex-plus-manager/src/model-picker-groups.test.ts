@@ -54,6 +54,56 @@ it("未发布聚合目录仅提供默认行显示和显式选择，不放宽自�
   assert.equal(resolve(), "", "配置默认值必须属于当前目录");
 });
 
+it("默认行通过菜单关联的触发器匹配本地选择器，不猜测无标识菜单", async () => {
+  const source = await readShard();
+  const block = source.match(/  function codexPlusModelPickerLocalPickerForList\(list\)[^]*?\n  \}/)?.[0];
+  assert.ok(block);
+  const picker = { node: { id: "local-trigger" }, picker: {} };
+  const resolve = vm.runInNewContext(`(() => { ${block}; return codexPlusModelPickerLocalPickerForList; })()`, {
+    codexAggregateModelPickers: () => [picker],
+  });
+  const list = (label: string) => ({ closest: () => ({ getAttribute: () => label }) });
+  assert.equal(resolve(list("local-trigger")), picker);
+  assert.equal(resolve(list("other-label local-trigger")), picker);
+  assert.equal(resolve(list("remote-trigger")), null);
+  assert.equal(resolve(list("")), null);
+  assert.equal(resolve(null), null);
+});
+
+it("补丁默认行在目录失败或归属不明时阻止旧推荐动作，未打补丁的行保持原生行为", async () => {
+  const source = await readShard();
+  const block = source.match(/  function codexPlusModelPickerSelectConfiguredDefault\(event\)[^]*?\n  \}/)?.[0];
+  assert.ok(block);
+  let target = "";
+  let selected: unknown = { picker: { disabled: false, models: [{ model: "configured" }] } };
+  const handle = vm.runInNewContext(`(() => { ${block}; return codexPlusModelPickerSelectConfiguredDefault; })()`, {
+    codexPlusModelPickerGroupsState: { disposed: false },
+    codexPlusModelPickerDefaultModel: () => target,
+    codexPlusModelPickerLocalPickerForList: () => selected,
+  });
+  const row = { getAttribute: () => null, closest: () => ({}) };
+  const event = (type: string, key?: string, patched = true) => {
+    const calls = { prevented: 0, stopped: 0 };
+    return { type, key, target: { closest: () => patched ? row : null },
+      preventDefault: () => calls.prevented++, stopImmediatePropagation: () => calls.stopped++, calls };
+  };
+  for (const type of ["click", "keydown"]) {
+    const failed = event(type, "Enter");
+    handle(failed);
+    assert.deepEqual(failed.calls, { prevented: 1, stopped: 1 });
+    selected = null;
+    target = "configured";
+    const remote = event(type, " ");
+    handle(remote);
+    assert.deepEqual(remote.calls, { prevented: 1, stopped: 1 });
+    const native = event(type, "Enter", false);
+    handle(native);
+    assert.deepEqual(native.calls, { prevented: 0, stopped: 0 });
+    target = "";
+    selected = { picker: { disabled: false, models: [{ model: "configured" }] } };
+  }
+});
+
 it("分组折叠分片在 manifest 里排在模型目录之后、并在组装产物里", async () => {
   const manifest = JSON.parse(await readFile(MANIFEST_URL, "utf8")) as {
     fragments: Array<{ name: string }>;

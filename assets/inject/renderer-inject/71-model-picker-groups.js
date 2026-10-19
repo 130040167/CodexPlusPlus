@@ -435,22 +435,28 @@
       .find((model) => typeof model === "string" && models.has(model)) || "";
   }
 
+  function codexPlusModelPickerLocalPickerForList(list) {
+    const menu = list?.closest?.('[role="menu"]');
+    const triggerIds = (menu?.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean);
+    if (!triggerIds.length) return null;
+    const pickers = codexAggregateModelPickers();
+    return pickers.find(({ node }) => triggerIds.includes(node.id)) || null;
+  }
+
   function codexPlusModelPickerSelectConfiguredDefault(event) {
     if (event.type === "keydown" && !["Enter", " "].includes(event.key)) return;
     const row = event.target?.closest?.(".codex-plus-model-default-row");
     if (!row || codexPlusModelPickerGroupsState.disposed || row.getAttribute("aria-disabled") === "true") return;
-    const target = codexPlusModelPickerDefaultModel();
-    if (!target) return;
-    const menu = row.closest('[role="menu"]');
-    const triggerIds = (menu?.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean);
-    const pickers = codexAggregateModelPickers();
-    const selected = triggerIds.length ? pickers.find(({ node }) => triggerIds.includes(node.id))
-      : pickers.length === 1 ? pickers[0] : null;
-    if (!selected || selected.picker.disabled) return;
+    // 已展示具体型号的补丁行不能落回原生推荐动作，包括目录失效及菜单归属变化的瞬间。
     event.preventDefault();
     event.stopImmediatePropagation();
-    if (!selected.picker.models.some((entry) => entry?.model === target)) return;
     if (event.repeat) return;
+    const list = row.closest('[class*="_ModelList_"]');
+    const selected = codexPlusModelPickerLocalPickerForList(list);
+    if (!selected || selected.picker.disabled) return;
+    const target = codexPlusModelPickerDefaultModel();
+    if (!target || !selected.picker.models.some((entry) => entry?.model === target)) return;
+    const menu = row.closest('[role="menu"]');
     const { picker } = selected;
     const efforts = modelReasoningEfforts(target);
     const preferred = codexPlusModelMetadata(target)?.defaultReasoningEffort
@@ -469,6 +475,11 @@
   }
 
   function codexPlusModelPickerSyncDefaultRow(list) {
+    const selected = codexPlusModelPickerLocalPickerForList(list);
+    if (!selected || selected.picker.disabled) {
+      list.querySelectorAll(".codex-plus-model-default-row").forEach(codexPlusModelPickerRestoreLabel);
+      return;
+    }
     const model = codexPlusModelPickerDefaultModel();
     if (!model) {
       list.querySelectorAll(".codex-plus-model-default-row").forEach(codexPlusModelPickerRestoreLabel);

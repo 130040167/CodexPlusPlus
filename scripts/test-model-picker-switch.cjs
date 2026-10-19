@@ -30,7 +30,7 @@ button{font:inherit} [data-model-picker-view]{width:100%;max-width:390px}
 .truncate{display:flex;flex-direction:column}.subtitle{font-size:13px}
 #trigger{margin-bottom:12px} output{display:block;margin-top:12px}
 </style><button id="trigger" data-codex-intelligence-trigger>Custom</button>
-<div data-model-picker-view="simple"><div class="_ModelList_fixture"></div></div>
+<div role="menu" aria-labelledby="trigger"><div data-model-picker-view="simple"><div class="_ModelList_fixture"></div></div></div>
 <output id="result"></output>
 <script>
 let codexModelCatalogAppliedEpoch = 1;
@@ -96,6 +96,18 @@ window.fixture = {
     return {automaticDefault:codexPlusConfiguredDefaultModel(),allowed:codexAggregateAllowedModelSet("local")};
   },
   published:()=>{codexModelCatalog.status="ok";},
+  failBeforeClick:(key)=>{
+    codexModelCatalog.status="failed";
+    const row=document.querySelector(".codex-plus-model-default-row");
+    if(key)row.dispatchEvent(new KeyboardEvent("keydown",{key,bubbles:true,cancelable:true}));
+    else row.click();
+  },
+  menuOwner:(label,scan=true)=>{
+    const menu=document.querySelector('[role="menu"]');
+    if(label===null)menu.removeAttribute("aria-labelledby");
+    else menu.setAttribute("aria-labelledby",label);
+    if(scan)window.__codexPlusModelPickerGroupsRuntime.scan();
+  },
   available:(enabled)=>{picker.models=enabled?[{model:alpha},{model:beta}]:[{model:beta}];},
   changeDefault:(other)=>{
     codexModelCatalog.model=codexModelCatalog.default_model=other?beta:alpha;
@@ -179,6 +191,34 @@ window.__codexPlusModelPickerGroupsRuntime.scan();
     await page.evaluate(() => window.fixture.available(true));
     await defaultRow.click();
     await page.evaluate(() => window.fixture.published());
+    for (const key of [null, "Enter", " "]) {
+      await page.evaluate(key => {
+        window.fixture.selectOther();
+        window.fixture.failBeforeClick(key);
+      }, key);
+      assert.equal(await page.locator("#result").textContent(), "cpx-b/gpt-6.1-sol");
+      assert.equal(await page.evaluate(() => window.fixture.state().nativeDefaultCalls), 0,
+        "catalog failure before rescan must not fall through to the native default");
+      await page.evaluate(() => window.fixture.published());
+    }
+    await page.evaluate(() => window.fixture.menuOwner("remote-trigger", false));
+    await defaultRow.click();
+    assert.equal(await page.evaluate(() => window.fixture.state().nativeDefaultCalls), 0,
+      "stale local row cannot invoke a remote menu's native action before rescan");
+    for (const owner of ["remote-trigger", null]) {
+      await page.evaluate(owner => window.fixture.menuOwner(owner), owner);
+      assert.equal(await page.locator(".codex-plus-model-default-row").count(), 0);
+      const nativeRow = page.locator('[role="menuitemradio"]').filter({ hasText: "推荐模型集" });
+      assert.equal(await nativeRow.locator(".subtitle").isVisible(), true);
+      const before = await page.evaluate(() => window.fixture.state().nativeDefaultCalls);
+      await nativeRow.click();
+      assert.equal(await page.evaluate(() => window.fixture.state().nativeDefaultCalls), before + 1,
+        "unpatched remote or unidentified menu keeps its native default action");
+      assert.equal(await page.locator("#result").textContent(), "gpt-5.6-sol");
+    }
+    await page.evaluate(() => { window.fixture.menuOwner("trigger"); window.fixture.selectOther(); });
+    assert.equal((await defaultRow.innerText()).replace(/\s+/g, " "), "默认模型 GPT-6.1-Sol");
+    await defaultRow.click();
     fs.mkdirSync(path.join(__dirname, "../output/playwright"), { recursive: true });
     for (const width of [480, 320]) {
       await page.setViewportSize({ width, height: 500 });
