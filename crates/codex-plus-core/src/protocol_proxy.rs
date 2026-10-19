@@ -5283,6 +5283,10 @@ fn append_responses_input(input: &Value, messages: &mut Vec<Value>) -> anyhow::R
             let mut pending_tool_calls = Vec::new();
             let mut pending_reasoning = Vec::new();
             let mut seen_tool_call_ids = BTreeSet::new();
+            // 同一个 call_id 的输出在历史里出现多次时，Chat 上游会以
+            // `duplicate tool output for call_id` 拒绝整轮请求（#1533）。
+            // 历史回放只保留第一次出现的输出，其余丢弃。
+            let mut seen_tool_output_ids = BTreeSet::new();
             for item in items {
                 append_responses_item(
                     item,
@@ -5290,6 +5294,7 @@ fn append_responses_input(input: &Value, messages: &mut Vec<Value>) -> anyhow::R
                     &mut pending_tool_calls,
                     &mut pending_reasoning,
                     &mut seen_tool_call_ids,
+                    &mut seen_tool_output_ids,
                 )?;
             }
             flush_tool_calls(messages, &mut pending_tool_calls, &mut pending_reasoning);
@@ -5299,12 +5304,14 @@ fn append_responses_input(input: &Value, messages: &mut Vec<Value>) -> anyhow::R
             let mut pending_tool_calls = Vec::new();
             let mut pending_reasoning = Vec::new();
             let mut seen_tool_call_ids = BTreeSet::new();
+            let mut seen_tool_output_ids = BTreeSet::new();
             append_responses_item(
                 input,
                 messages,
                 &mut pending_tool_calls,
                 &mut pending_reasoning,
                 &mut seen_tool_call_ids,
+                &mut seen_tool_output_ids,
             )?;
             flush_tool_calls(messages, &mut pending_tool_calls, &mut pending_reasoning);
             flush_reasoning(messages, &mut pending_reasoning);
@@ -5320,6 +5327,7 @@ fn append_responses_item(
     pending_tool_calls: &mut Vec<Value>,
     pending_reasoning: &mut Vec<String>,
     seen_tool_call_ids: &mut BTreeSet<String>,
+    seen_tool_output_ids: &mut BTreeSet<String>,
 ) -> anyhow::Result<()> {
     match item.get("type").and_then(Value::as_str) {
         Some("function_call") => {
@@ -5355,6 +5363,10 @@ fn append_responses_item(
         Some("function_call_output") => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
             if call_id.is_empty() {
+                return Ok(());
+            }
+            if !seen_tool_output_ids.insert(call_id.to_string()) {
+                // 重复的 tool output：保留第一次，避免上游 duplicate call_id 400。
                 return Ok(());
             }
             if !seen_tool_call_ids.contains(call_id) {
@@ -5424,6 +5436,9 @@ fn append_responses_item(
         Some("tool_search_output") => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
             if call_id.is_empty() {
+                return Ok(());
+            }
+            if !seen_tool_output_ids.insert(call_id.to_string()) {
                 return Ok(());
             }
             let output = item.get("tools").unwrap_or(&Value::Null);
@@ -8758,6 +8773,30 @@ mod response_compatibility_tests {
         .unwrap();
         assert_eq!(response["status"], "failed");
         assert_eq!(response["output"][0]["status"], "failed");
+    }
+
+    #[test]
+    fn duplicate_function_call_output_keeps_first_and_avoids_upstream_400() {
+        // #1533：历史里同一 call_id 的 tool output 出现两次时，Chat 上游会以
+        // `duplicate tool output for call_id` 拒绝整轮请求。转换后只保留第一条。
+        let body = json!({
+            "model": "glm-5.3",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "exec_command",
+                 "arguments": "{\"cmd\":\"pwd\"}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "first"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "second"}
+            ]
+        });
+        let converted = responses_to_chat_completions(body).unwrap();
+        let messages = converted["messages"].as_array().unwrap();
+        let tool_messages: Vec<_> = messages
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .collect();
+        assert_eq!(tool_messages.len(), 1, "同一 call_id 的输出只能保留一条");
+        assert_eq!(tool_messages[0]["tool_call_id"], "call_1");
+        assert_eq!(tool_messages[0]["content"], "first");
     }
 
     #[test]

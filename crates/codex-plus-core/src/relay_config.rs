@@ -1994,7 +1994,16 @@ fn preserve_unmanaged_live_context_entries(
         return Ok(ensure_trailing_newline(config_text.to_string()));
     }
     let mut target_doc = parse_toml_document(config_text)?;
-    let live_doc = parse_toml_document(&live_config)?;
+    // live config.toml 已被上游/人工改坏时，切换供应商不应整次失败（#2478/#2500）：
+    // 无法从坏文件里捞用户托管条目，就直接按新配置写出；原文件已在 write_codex_live_atomic
+    // 的 create_live_backup 中备份，可手工恢复。
+    let Ok(live_doc) = parse_toml_document(&live_config) else {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "relay_config.live_config_unparsable",
+            serde_json::json!({ "home": home.to_string_lossy() }),
+        );
+        return Ok(ensure_trailing_newline(config_text.to_string()));
+    };
     let managed_doc =
         parse_toml_document(&sanitize_common_config_contents(managed_context_config))?;
     preserve_unmanaged_context_tables(
@@ -3309,6 +3318,7 @@ fn apply_model_catalog_to_config_with_live_policy(
         standard_responses,
         profile.has_model_routes(),
         official_deepseek_responses,
+        fallback.is_some(),
     ) && !upstream_rejects_tool_search(profile)
     {
         let mut doc = parse_toml_document(&config_text)?;
@@ -3471,8 +3481,13 @@ fn should_write_managed_model_catalog(
     standard_responses: bool,
     has_model_routes: bool,
     official_deepseek_responses: bool,
+    has_profile_window: bool,
 ) -> bool {
+    // profile 级窗口（`context_window`）也必须落 catalog：只配全局窗口、模型列表
+    // 不带后缀时，过去不会生成 catalog，Codex 继续用内置默认窗口，用户看到的仍是
+    // 272k（issue #2590）。有全局窗口时把每模型条目写成该窗口即可。
     metadata_overrides
+        || has_profile_window
         || entries.iter().any(|entry| {
             entry.suffix_window.is_some()
                 || entry.auto_compact_percent.is_some()
@@ -3536,6 +3551,21 @@ mod managed_catalog_predicate_tests {
             false,
             false,
             false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn predicate_writes_for_profile_level_window_without_suffixes() {
+        // #2590：只配 profile 级 context_window、模型列表不带 [1M] 后缀时，
+        // 也必须生成 catalog，否则 Codex 继续按内置 272k 窗口压缩。
+        assert!(should_write_managed_model_catalog(
+            &[entry("custom-model")],
+            false,
+            false,
+            false,
+            false,
+            true,
         ));
     }
 
@@ -3544,17 +3574,18 @@ mod managed_catalog_predicate_tests {
         let mut window = entry("custom-model");
         window.suffix_window = Some(1_000_000);
         assert!(should_write_managed_model_catalog(
-            &[window], false, false, false, false
+            &[window], false, false, false, false, false
         ));
 
         let mut compact = entry("custom-model");
         compact.auto_compact_percent = Some(80_000_000);
         assert!(should_write_managed_model_catalog(
-            &[compact], false, false, false, false
+            &[compact], false, false, false, false, false
         ));
         assert!(should_write_managed_model_catalog(
             &[entry("custom-model")],
             true,
+            false,
             false,
             false,
             false,
@@ -3569,6 +3600,7 @@ mod managed_catalog_predicate_tests {
             true,
             true,
             false,
+            false,
         ));
         assert!(should_write_managed_model_catalog(
             &[entry("deepseek-v4-pro")],
@@ -3576,6 +3608,7 @@ mod managed_catalog_predicate_tests {
             false,
             false,
             true,
+            false,
         ));
     }
 
