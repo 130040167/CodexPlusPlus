@@ -404,6 +404,9 @@ pub trait LaunchHooks: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+    fn proxy_continuity_required(&self) -> bool {
+        false
+    }
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()>;
     async fn launch_codex(
         &self,
@@ -479,7 +482,7 @@ pub trait LaunchHooks: Send + Sync {
 #[derive(Default)]
 pub struct DefaultLaunchHooks {
     child: Mutex<Option<Child>>,
-    helper: Mutex<Option<HelperRuntime>>,
+    helper: Mutex<Vec<HelperRuntime>>,
     bridge_watchdog: Mutex<Option<BridgeWatchdogRuntime>>,
     bridge_reinjector: Mutex<Option<BridgeReinjector>>,
     #[cfg(windows)]
@@ -792,7 +795,10 @@ where
             helper_port = crate::protocol_proxy::ensure_protocol_proxy_port_available();
             hooks.ensure_active_protocol_proxy_config(&settings).await?;
         }
-        if settings.enhancements_enabled || protocol_proxy_enabled {
+        if settings.enhancements_enabled
+            || protocol_proxy_enabled
+            || hooks.proxy_continuity_required()
+        {
             // macOS 重启时旧 launcher 的 socket 释放可能稍晚于进程退出。
             timeline.mark("helper_bind", 60);
             let bind_retry_timeout_ms =
@@ -1119,47 +1125,26 @@ impl LaunchHooks for DefaultLaunchHooks {
         settings: &BackendSettings,
     ) -> anyhow::Result<()> {
         let home = crate::relay_config::default_codex_home_dir();
+        crate::proxy_continuity::ProxyEndpoints::current().remember_live_proxy(settings);
         crate::relay_config::ensure_active_protocol_proxy_config_in_home(&home, settings)?;
         Ok(())
     }
 
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
         let bind_host = helper_bind_host();
-        let listener = tokio::net::TcpListener::bind((bind_host.as_str(), helper_port))
-            .await
-            .with_context(|| {
-                format!("failed to bind helper runtime on {bind_host}:{helper_port}")
-            })?;
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "helper.listening",
-            serde_json::json!({
-                "helper_port": helper_port,
-                "bind_host": bind_host,
-                "address": format!("http://{bind_host}:{helper_port}")
-            }),
-        );
-        // 端口绑定成功后立刻落凭据：Claude 汉化注入的 hook 靠它调用听写路由。
+        let runtimes = start_helper_with_continuity(
+            &bind_host,
+            helper_port,
+            &crate::proxy_continuity::ProxyEndpoints::current(),
+        )
+        .await?;
         write_dictation_helper_receipt(helper_port);
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = &mut shutdown_rx => break,
-                    accepted = listener.accept() => {
-                        if let Ok((stream, addr)) = accepted {
-                            tokio::spawn(async move {
-                                let _ = handle_helper_connection(stream, Some(addr)).await;
-                            });
-                        }
-                    }
-                }
-            }
-        });
-        *self.helper.lock().await = Some(HelperRuntime {
-            shutdown: shutdown_tx,
-            task,
-        });
+        *self.helper.lock().await = runtimes;
         Ok(())
+    }
+
+    fn proxy_continuity_required(&self) -> bool {
+        crate::proxy_continuity::ProxyEndpoints::current().restore_required()
     }
 
     async fn launch_codex(
@@ -1580,10 +1565,7 @@ impl LaunchHooks for DefaultLaunchHooks {
             let _ = runtime.shutdown.send(());
             let _ = runtime.task.await;
         }
-        if let Some(runtime) = self.helper.lock().await.take() {
-            let _ = runtime.shutdown.send(());
-            let _ = runtime.task.await;
-        }
+        stop_helper_runtimes(std::mem::take(&mut *self.helper.lock().await)).await;
     }
 
     async fn terminate_codex(&self, launch: &CodexLaunch) {
@@ -1618,6 +1600,119 @@ impl LaunchHooks for DefaultLaunchHooks {
                 process_id: None, ..
             } => {}
         }
+    }
+}
+
+async fn start_helper_with_continuity(
+    bind_host: &str,
+    helper_port: u16,
+    endpoints: &crate::proxy_continuity::ProxyEndpoints,
+) -> anyhow::Result<Vec<HelperRuntime>> {
+    let listener = tokio::net::TcpListener::bind((bind_host, helper_port))
+        .await
+        .with_context(|| format!("failed to bind helper runtime on {bind_host}:{helper_port}"))?;
+    let port = listener.local_addr()?.port();
+    let aliases = endpoints.ports().unwrap_or_else(|error| {
+        crate::proxy_continuity::log_failure("history_read", &error);
+        Default::default()
+    });
+    if let Err(error) = endpoints.remember(port) {
+        crate::proxy_continuity::log_failure("history_write", &error);
+    }
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "helper.listening",
+        serde_json::json!({
+            "helper_port": port,
+            "bind_host": bind_host,
+            "address": format!("http://{bind_host}:{port}"),
+        }),
+    );
+    let mut runtimes = vec![spawn_helper_runtime(
+        bind_host.into(),
+        port,
+        Some(listener),
+        false,
+    )];
+    for alias in aliases.into_iter().filter(|alias| *alias != port) {
+        if let Err(error) = endpoints.remember(alias) {
+            crate::proxy_continuity::log_failure("alias_history_write", &error);
+        }
+        // 历史入口只在 loopback 上提供代理，不能额外暴露管理路由。
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", alias)).await;
+        let listener = match listener {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "helper.proxy_alias_waiting",
+                    serde_json::json!({ "port": alias, "message": error.to_string() }),
+                );
+                None
+            }
+        };
+        runtimes.push(spawn_helper_runtime(
+            "127.0.0.1".into(),
+            alias,
+            listener,
+            true,
+        ));
+    }
+    Ok(runtimes)
+}
+
+fn spawn_helper_runtime(
+    host: String,
+    port: u16,
+    listener: Option<tokio::net::TcpListener>,
+    proxy_only: bool,
+) -> HelperRuntime {
+    let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let listener = match listener {
+            Some(listener) => listener,
+            None => loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        if let Ok(listener) = tokio::net::TcpListener::bind((host.as_str(), port)).await {
+                            break listener;
+                        }
+                    }
+                }
+            },
+        };
+        if proxy_only {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "helper.proxy_alias_listening",
+                serde_json::json!({ "port": port }),
+            );
+        }
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                _ = connections.join_next(), if !connections.is_empty() => {}
+                accepted = listener.accept() => {
+                    if let Ok((stream, addr)) = accepted {
+                        connections.spawn(async move {
+                            let _ = handle_helper_connection_mode(stream, Some(addr), proxy_only).await;
+                        });
+                    }
+                }
+            }
+        }
+        connections.shutdown().await;
+    });
+    HelperRuntime { shutdown, task }
+}
+
+async fn stop_helper_runtimes(runtimes: Vec<HelperRuntime>) {
+    let mut tasks = Vec::new();
+    for runtime in runtimes {
+        let _ = runtime.shutdown.send(());
+        tasks.push(runtime.task);
+    }
+    for task in tasks {
+        let _ = task.await;
     }
 }
 
@@ -1678,9 +1773,18 @@ fn remove_dictation_helper_receipt_at(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
+#[cfg(test)]
 async fn handle_helper_connection(
+    stream: tokio::net::TcpStream,
+    remote_addr: Option<SocketAddr>,
+) -> anyhow::Result<()> {
+    handle_helper_connection_mode(stream, remote_addr, false).await
+}
+
+async fn handle_helper_connection_mode(
     mut stream: tokio::net::TcpStream,
     remote_addr: Option<SocketAddr>,
+    proxy_only: bool,
 ) -> anyhow::Result<()> {
     let request = match read_http_request(&mut stream).await {
         Ok(request) => request,
@@ -1706,6 +1810,16 @@ async fn handle_helper_connection(
     let method = parts.next().unwrap_or_default();
     let raw_path = parts.next().unwrap_or_default();
     let path = raw_path.split('?').next().unwrap_or(raw_path);
+    if proxy_only
+        && !(crate::protocol_proxy::is_responses_proxy_path(path)
+            || crate::protocol_proxy::is_audio_transcriptions_proxy_path(path)
+            || crate::protocol_proxy::is_image_generations_proxy_path(path)
+            || crate::protocol_proxy::is_image_edits_proxy_path(path))
+    {
+        write_http_response(&mut stream, "404 Not Found", "application/json", b"{}").await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
     let request_user_agent = header_value_from_headers(&request_headers, "user-agent");
     let request_beta_features =
         header_value_from_headers(&request_headers, "x-codex-beta-features");
@@ -4844,6 +4958,128 @@ fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> a
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test]
+    async fn proxy_continuity_recovers_cached_clients_across_restarts_and_provider_switches() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let _rotation_guard = crate::relay_rotation::rotation_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        struct Restore(Option<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::paths::set_settings_path_for_tests(self.0.take());
+            }
+        }
+        let _restore = Restore(crate::paths::set_settings_path_for_tests(Some(
+            settings_path.clone(),
+        )));
+        let first_upstream = MockServer::start().await;
+        let second_upstream = MockServer::start().await;
+        for (server, id) in [(&first_upstream, "before"), (&second_upstream, "after")] {
+            Mock::given(method("POST"))
+                .and(path("/v1/responses"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"id": id, "object": "response"})),
+                )
+                .mount(server)
+                .await;
+        }
+        let write_settings = |upstream: &str, mode: &str| {
+            std::fs::write(
+                &settings_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "relayProfilesEnabled": true,
+                    "enhancementsEnabled": false,
+                    "relayProfiles": [{
+                        "id": "local", "name": "local",
+                        "baseUrl": format!("{upstream}/v1"),
+                        "upstreamBaseUrl": format!("{upstream}/v1"),
+                        "apiKey": "test-key", "protocol": "responses", "relayMode": mode
+                    }],
+                    "activeRelayId": "local"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        write_settings(&first_upstream.uri(), "mixedApi");
+        let endpoints = crate::proxy_continuity::ProxyEndpoints::new(
+            temp.path().join("state"),
+            temp.path().join("home"),
+            false,
+        );
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let first = start_helper_with_continuity("127.0.0.1", 0, &endpoints)
+            .await
+            .unwrap();
+        let original_port = *endpoints.ports().unwrap().first().unwrap();
+        let cached_url = format!("http://127.0.0.1:{original_port}/v1/responses");
+        let body = serde_json::json!({"model": "test-model", "input": "probe", "stream": false});
+        let response = client.post(&cached_url).json(&body).send().await.unwrap();
+        assert_eq!(response.json::<Value>().await.unwrap()["id"], "before");
+        stop_helper_runtimes(first).await;
+        assert!(client.post(&cached_url).json(&body).send().await.is_err());
+
+        // 同一个客户端仍然使用缓存 URL；新管理器选择不同端口。
+        let second = start_helper_with_continuity("127.0.0.1", 0, &endpoints)
+            .await
+            .unwrap();
+        let response = client.post(&cached_url).json(&body).send().await.unwrap();
+        assert_eq!(response.json::<Value>().await.unwrap()["id"], "before");
+        write_settings(&second_upstream.uri(), "pureApi");
+        let response = client.post(&cached_url).json(&body).send().await.unwrap();
+        assert_eq!(response.json::<Value>().await.unwrap()["id"], "after");
+        let response = client
+            .get(format!("http://127.0.0.1:{original_port}/backend/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
+        stop_helper_runtimes(second).await;
+
+        // 历史端口暂时被占用时，不阻塞当前入口；释放后自动接续。
+        let busy = tokio::net::TcpListener::bind(("127.0.0.1", original_port))
+            .await
+            .unwrap();
+        let third = start_helper_with_continuity("127.0.0.1", 0, &endpoints)
+            .await
+            .unwrap();
+        assert!(endpoints.restore_required());
+        drop(busy);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(response) = client.post(&cached_url).json(&body).send().await {
+                    assert_eq!(response.json::<Value>().await.unwrap()["id"], "after");
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        stop_helper_runtimes(third).await;
+        for port in endpoints.ports().unwrap() {
+            assert!(
+                tokio::net::TcpListener::bind(("127.0.0.1", port))
+                    .await
+                    .is_ok()
+            );
+        }
+        assert!(
+            endpoints.restore_required(),
+            "shutdown must retain endpoint history"
+        );
+    }
 
     #[test]
     fn standalone_quota_unlock_is_opt_in_and_does_not_duplicate_full_enhancements() {

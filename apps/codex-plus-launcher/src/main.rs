@@ -1292,6 +1292,10 @@ impl LaunchHooks for LauncherHooks {
         self.core.start_helper(helper_port).await
     }
 
+    fn proxy_continuity_required(&self) -> bool {
+        self.core.proxy_continuity_required()
+    }
+
     async fn launch_codex(
         &self,
         app_dir: &Path,
