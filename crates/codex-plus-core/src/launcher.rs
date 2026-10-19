@@ -1608,36 +1608,12 @@ async fn start_helper_with_continuity(
     helper_port: u16,
     endpoints: &crate::proxy_continuity::ProxyEndpoints,
 ) -> anyhow::Result<Vec<HelperRuntime>> {
-    let listener = tokio::net::TcpListener::bind((bind_host, helper_port))
+    let primary = tokio::net::TcpListener::bind((bind_host, helper_port))
         .await
-        .with_context(|| format!("failed to bind helper runtime on {bind_host}:{helper_port}"))?;
-    let port = listener.local_addr()?.port();
-    let aliases = endpoints.ports().unwrap_or_else(|error| {
-        crate::proxy_continuity::log_failure("history_read", &error);
-        Default::default()
-    });
-    if let Err(error) = endpoints.remember(port) {
-        crate::proxy_continuity::log_failure("history_write", &error);
-    }
-    let _ = crate::diagnostic_log::append_diagnostic_log(
-        "helper.listening",
-        serde_json::json!({
-            "helper_port": port,
-            "bind_host": bind_host,
-            "address": format!("http://{bind_host}:{port}"),
-        }),
-    );
-    let mut runtimes = vec![spawn_helper_runtime(
-        bind_host.into(),
-        port,
-        Some(listener),
-        false,
-    )];
-    for alias in aliases.into_iter().filter(|alias| *alias != port) {
-        if let Err(error) = endpoints.remember(alias) {
-            crate::proxy_continuity::log_failure("alias_history_write", &error);
-        }
-        // 历史入口只在 loopback 上提供代理，不能额外暴露管理路由。
+        .with_context(|| format!("failed to bind helper runtime on {bind_host}:{helper_port}"));
+    let aliases = endpoints.ports_for_restore();
+    let mut alias_listeners = Vec::new();
+    for alias in aliases.into_iter().filter(|alias| *alias != helper_port) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", alias)).await;
         let listener = match listener {
             Ok(listener) => Some(listener),
@@ -1649,6 +1625,36 @@ async fn start_helper_with_continuity(
                 None
             }
         };
+        alias_listeners.push((alias, listener));
+    }
+    let (port, listener) = match primary {
+        Ok(listener) => (listener.local_addr()?.port(), Some(listener)),
+        Err(error)
+            if helper_port > 0
+                && (error_is_address_in_use(&error) || error_is_bind_forbidden(&error))
+                && alias_listeners.iter().any(|(_, listener)| listener.is_some()) =>
+        {
+            // 主端口冲突不能拖垮仍在使用的旧客户端；先恢复旧入口，主端口后台等释放。
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "helper.proxy_primary_waiting",
+                serde_json::json!({ "port": helper_port, "message": error.to_string() }),
+            );
+            (helper_port, None)
+        }
+        Err(error) => return Err(error),
+    };
+    alias_listeners.retain(|(alias, _)| *alias != port);
+    if let Err(error) = endpoints.remember(port) {
+        crate::proxy_continuity::log_failure("history_write", &error);
+    }
+    let mut runtimes = vec![spawn_helper_runtime(
+        bind_host.into(),
+        port,
+        listener,
+        false,
+    )];
+    for (alias, listener) in alias_listeners {
+        // 历史入口只在 loopback 上提供代理，不能额外暴露管理路由。
         runtimes.push(spawn_helper_runtime(
             "127.0.0.1".into(),
             alias,
@@ -1684,6 +1690,14 @@ fn spawn_helper_runtime(
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "helper.proxy_alias_listening",
                 serde_json::json!({ "port": port }),
+            );
+        } else {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "helper.listening",
+                serde_json::json!({
+                    "helper_port": port, "bind_host": host,
+                    "address": format!("http://{host}:{port}"),
+                }),
             );
         }
         let mut connections = tokio::task::JoinSet::new();
@@ -5079,6 +5093,58 @@ mod tests {
             endpoints.restore_required(),
             "shutdown must retain endpoint history"
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_continuity_restores_alias_while_primary_port_is_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let endpoints = crate::proxy_continuity::ProxyEndpoints::new(
+            temp.path().join("state"),
+            temp.path().join("home"),
+            false,
+        );
+        let original = start_helper_with_continuity("127.0.0.1", 0, &endpoints)
+            .await.unwrap();
+        let cached_port = *endpoints.ports().unwrap().first().unwrap();
+        stop_helper_runtimes(original).await;
+        let busy = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await.unwrap();
+        let primary_port = busy.local_addr().unwrap().port();
+        let runtime = start_helper_with_continuity("127.0.0.1", primary_port, &endpoints)
+            .await.unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy().timeout(std::time::Duration::from_secs(2)).build().unwrap();
+        let response = client
+            .get(format!("http://127.0.0.1:{cached_port}/backend/status"))
+            .send().await.unwrap();
+        assert_eq!(response.status(), 404);
+        drop(busy);
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                if let Ok(response) = client
+                    .get(format!("http://127.0.0.1:{primary_port}/v1/responses"))
+                    .send().await
+                {
+                    assert_eq!(response.status(), 426);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }).await.unwrap();
+        stop_helper_runtimes(runtime).await;
+        for port in [cached_port, primary_port] {
+            assert!(tokio::net::TcpListener::bind(("127.0.0.1", port)).await.is_ok());
+        }
+        // 仍在等待端口的任务也必须随实例退出，不能在稍后偷偷重新占端口。
+        let busy = tokio::net::TcpListener::bind(("127.0.0.1", primary_port)).await.unwrap();
+        let pending = start_helper_with_continuity("127.0.0.1", primary_port, &endpoints)
+            .await.unwrap();
+        stop_helper_runtimes(pending).await;
+        drop(busy);
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        for port in [cached_port, primary_port] {
+            assert!(tokio::net::TcpListener::bind(("127.0.0.1", port)).await.is_ok());
+        }
     }
 
     #[test]
