@@ -7298,7 +7298,11 @@ pub fn sync_live_context_entries(
             );
         }
     }
-    if let Err(error) = std::fs::write(&config_path, &updated_config) {
+    // 必须原子替换：`fs::write` 先截断再写，Codex 若在这一瞬间读 config.toml
+    // 会拿到空文件或半截内容，对话中报「无法加载 config.toml」（#2621）。
+    if let Err(error) =
+        codex_plus_core::settings::atomic_write(&config_path, updated_config.as_bytes())
+    {
         return failed(
             &format!("写入 live config.toml 失败：{error}"),
             LiveContextEntriesPayload {
@@ -8314,7 +8318,8 @@ fn save_relay_file_in_home(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, contents)?;
+    // 与供应商切换同一写法：原子替换，避免运行中的 Codex 读到半截文件（#2621）。
+    codex_plus_core::settings::atomic_write(&path, contents.as_bytes())?;
     Ok(())
 }
 
