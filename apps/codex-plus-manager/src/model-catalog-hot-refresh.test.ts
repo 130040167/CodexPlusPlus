@@ -24,6 +24,7 @@ it("string model collections withdraw models from the previous aggregate", async
     codexPureApiAllowedModelSet: () => null,
     prepareModelCollection: () => false,
     finishModelCollection: () => {},
+    sameModelCollection: (left: unknown[], right: unknown[]) => JSON.stringify(left) === JSON.stringify(right),
     codexPlusModelNames: () => ["cpx-current/sol"],
   });
   const models = ["cpx-old/kimi", "cpx-current/sol"];
@@ -77,6 +78,26 @@ it("a rejected catalog read triggers native cache restoration", async () => {
   assert.equal((await failed).status, "failed");
   assert.equal(refreshes(), 2, "failure must publish restoration, not just update catalog state");
   assert.deepEqual(Array.from(api.state().models), []);
+});
+
+it("configured default replaces a stale native default even when both models are available", async () => {
+  const source = await readFile(CATALOG_URL, "utf8");
+  const block = source.match(/  function patchModelDefaults\([^]*?\n  \}/)?.[0];
+  assert.ok(block);
+  const patch = vm.runInNewContext(`(() => {${block}; return patchModelDefaults;})()`, {
+    codexPlusModelDefaultSnapshots: new WeakMap(),
+    modelFilterPolicy: (allowed: Set<string> | null) => allowed ? "configured" : "",
+    codexModelCatalog: { model: "configured-model" },
+    codexPlusModelDescriptor: (model: string) => ({ model }),
+  });
+  const config = { defaultModel: "old-model", default_model: { model: "old-model" } };
+  const allowed = new Set(["old-model", "configured-model"]);
+  assert.equal(patch(config, allowed), true);
+  assert.equal(config.defaultModel, "configured-model");
+  assert.equal(config.default_model.model, "configured-model");
+  assert.equal(patch(config, allowed), false);
+  assert.equal(patch(config, null), true);
+  assert.equal(config.defaultModel, "old-model", "leaving the managed catalog restores native defaults");
 });
 
 it("first modelCatalogRevision refreshes once and repeated reads are deduplicated", async () => {
@@ -345,6 +366,8 @@ async function aggregateQueryRuntime(structuralSharing = false) {
     "codexPureApiAllowedModelSet", "codexAggregateAllowedModelSet", "patchModelArray",
     "codexAggregateSelectedModelTarget", "codexAggregateModelPickers",
     "captureCodexAggregateSelectedModels", "syncCodexAggregateSelectedModel",
+    "codexPlusConfiguredDefaultModel", "syncCodexConfiguredDefaultModel",
+    "normalizeCodexConfiguredModelRequest", "modelResponseHostId",
     "codexPlusLocalModelQuery", "cloneCodexPlusModelCollection",
     "transferCodexPlusModelCollectionSnapshot",
     "patchCachedLocalModelQueryData", "codexPlusModelQueryCollection",
@@ -417,6 +440,8 @@ async function aggregateQueryRuntime(structuralSharing = false) {
       syncSelection: syncCodexAggregateSelectedModel,
       selectionTarget: codexAggregateSelectedModelTarget,
       runRefreshPass: runCodexModelWhitelistRefreshPass,
+      syncDefault: syncCodexConfiguredDefaultModel,
+      normalize: normalizeCodexConfiguredModelRequest,
     };
   `)(client, { querySelectorAll: () => nodes }) as {
     refresh: () => boolean; install: () => void;
@@ -426,6 +451,8 @@ async function aggregateQueryRuntime(structuralSharing = false) {
     syncSelection: () => boolean;
     selectionTarget: (model: string, host: string) => string;
     runRefreshPass: () => boolean;
+    syncDefault: () => void;
+    normalize: (method: string, params: any, host: string) => any;
   };
   const catalog = (defaultProvider: "a" | "b"): Catalog => {
     const models = ["a", "b"].flatMap((provider) =>
@@ -468,6 +495,53 @@ it("aggregate default changes replace stale slugs and keep display names even wi
   assert.deepEqual(local.data.data.map((m) => m.model), before.models, "switching back must work");
   remote.setData(remoteData);
   assert.equal(remote.data, remoteData, "remote publications stay untouched");
+});
+
+it("new local composers replace an unlisted native default with a named configured model, while existing sessions stay intact", async () => {
+  const { runtime, catalog, nodes } = await aggregateQueryRuntime();
+  const current = catalog("b");
+  current.model = "model-0";
+  runtime.catalog(current);
+  const calls: unknown[][] = [];
+  const props = { model: "unconfigured-compat", reasoningEffort: "low",
+    models: current.models.map(model => ({ model })),
+    onSelectModel: (...args: unknown[]) => calls.push(args) };
+  const owner = { permissionsHostId: "local", conversationId: "existing" };
+  nodes.push({ __reactFiber$test: { memoizedProps: props, return: { memoizedProps: owner } } });
+  runtime.syncDefault();
+  assert.equal(calls.length, 0, "existing conversations use their saved model identity");
+  owner.conversationId = "";
+  runtime.syncDefault();
+  assert.deepEqual(calls, [["model-0", "low"]]);
+  runtime.syncDefault();
+  assert.equal(calls.length, 1, "do not repeatedly select while React settles");
+  props.model = "model-1";
+  runtime.syncDefault();
+  assert.equal(calls.length, 1, "an explicit available model remains selected");
+});
+
+it("pool catalogs withdraw aggregate prefixes and unconfigured compat models, preserve member order, and normalize actual requests", async () => {
+  const { runtime, local, catalog } = await aggregateQueryRuntime();
+  runtime.catalog(catalog("a"));
+  local.data = { data: [{ model: "cpx-a/model-0" }, { model: "unconfigured-compat" }] };
+  const pool = { ...catalog("b"), codex_plus_default_group_id: "",
+    model: "model-0", models: ["model-1", "model-0"],
+    sources: [{ id: "aggregate:agg", type: "aggregate_pool_catalog" }] };
+  runtime.catalog(pool);
+  runtime.refresh();
+  assert.deepEqual(local.data.data.map(m => m.model), ["model-1", "model-0"]);
+  assert.deepEqual(local.data.data.filter(m => m.isDefault).map(m => m.model), ["model-0"]);
+  const params = { threadId: "one", model: "cpx-a/model-0", effort: "high",
+    collaborationMode: { settings: { model: "cpx-a/model-0", reasoning_effort: "high" } } };
+  const next = runtime.normalize("turn/start", params, "local");
+  assert.equal(next.model, "model-0");
+  assert.equal(next.collaborationMode.settings.model, "model-0");
+  assert.equal(next.effort, "high");
+  assert.equal(params.model, "cpx-a/model-0", "do not mutate the saved request");
+  assert.equal(runtime.normalize("turn/start", params, "ssh:test"), params);
+  assert.equal(runtime.normalize("thread/start", { model: "unconfigured-compat" }, "local").model, "model-0");
+  assert.equal(runtime.normalize("thread/start", {}, "local").model, "model-0");
+  assert.equal(runtime.normalize("send-cli-request-for-host", { hostId: "ssh:test", method: "turn/start", params }, "local").params, params);
 });
 
 it("aggregate projection requires a successful catalog owned by the active profile", async () => {

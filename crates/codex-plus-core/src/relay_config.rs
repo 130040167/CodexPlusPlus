@@ -3432,16 +3432,11 @@ fn render_model_catalog_to_config_with_live_policy(
         validate_managed_model_catalog(&catalog_json)?;
         *pending_catalog = Some((catalog_path, catalog_json.clone()));
         let mut doc = parse_toml_document(&config_text)?;
-        if root_key_string(&config_text, "model").is_none()
-            && let Ok(catalog) = serde_json::from_str::<Value>(&catalog_json)
-            && let Some(default_model) = catalog
-                .get("models")
-                .and_then(Value::as_array)
-                .and_then(|models| models.first())
-                .and_then(|model| model.get("slug"))
-                .and_then(Value::as_str)
+        if let Ok(catalog) = serde_json::from_str::<Value>(&catalog_json)
+            && !catalog["models"].as_array().is_some_and(|models| models.iter().any(|model|
+                model["slug"].as_str() == root_key_string(&config_text, "model").as_deref()))
         {
-            doc["model"] = toml_edit::value(default_model);
+            doc["model"] = toml_edit::value(crate::aggregate_catalog::catalog_default_model(&catalog));
         }
         doc["model_catalog_json"] = toml_edit::value(catalog_pointer);
         return Ok(normalize_optional_toml(doc));

@@ -115,9 +115,9 @@
 
   function codexPlusModelNames() {
     return uniqueValues([
+      ...(Array.isArray(codexModelCatalog.models) ? codexModelCatalog.models : []),
       codexModelCatalog.default_model,
       codexModelCatalog.model,
-      ...(Array.isArray(codexModelCatalog.models) ? codexModelCatalog.models : []),
     ]);
   }
 
@@ -287,6 +287,13 @@
         changed = true;
       }
     });
+    if (allowed) {
+      const ordered = [...allowed];
+      if (!sameModelCollection(models, ordered)) {
+        models.splice(0, models.length, ...ordered);
+        changed = true;
+      }
+    }
     finishModelCollection(models);
     return changed;
   }
@@ -348,7 +355,7 @@
     for (const key of ["defaultModel", "default_model"]) {
       const original = value[key];
       const name = typeof original === "string" ? original : original?.model || original?.id || original?.slug;
-      if (!name || allowed.has(name)) continue;
+      if (!name || !fallback || name === fallback) continue;
       const patched = typeof original === "string" ? fallback : codexPlusModelDescriptor(fallback);
       if (!snapshot.fields[key] || original !== snapshot.fields[key].patched) {
         snapshot.fields[key] = { original, patched };
@@ -398,13 +405,19 @@
     if (profile?.relayMode !== "aggregate") return null;
     const belongsToProfile = Array.isArray(codexModelCatalog.sources)
       && codexModelCatalog.sources.some((source) =>
-        source?.id === `aggregate:${profile.id}` && source?.type === "aggregate_model_catalog");
+        source?.id === `aggregate:${profile.id}`
+        && ["aggregate_model_catalog", "aggregate_pool_catalog"].includes(source?.type));
     return belongsToProfile ? new Set(codexPlusModelNames()) : null;
   }
 
   function codexAggregateSelectedModelTarget(model, hostId, groupId = "") {
     const allowed = codexAggregateAllowedModelSet(hostId);
     if (!allowed || typeof model !== "string") return "";
+    const pool = codexModelCatalog.sources?.some((source) => source?.type === "aggregate_pool_catalog");
+    if (pool) {
+      const bare = model.startsWith("cpx-") ? model.slice(model.indexOf("/") + 1) : model;
+      return bare !== model && allowed.has(bare) ? bare : "";
+    }
     const defaultGroup = codexModelCatalog.codex_plus_default_group_id;
     if (typeof defaultGroup !== "string" || !defaultGroup) return "";
     if (groupId) {
@@ -502,6 +515,56 @@
     return changed;
   }
 
+  function codexPlusConfiguredDefaultModel() {
+    if (codexModelCatalog.status !== "ok") return "";
+    const allowed = codexAggregateAllowedModelSet("local") || codexPureApiAllowedModelSet("local");
+    if (!allowed) return "";
+    return [codexModelCatalog.model, codexModelCatalog.default_model, ...allowed]
+      .find((model) => typeof model === "string" && allowed.has(model)) || "";
+  }
+
+  function syncCodexConfiguredDefaultModel() {
+    const target = codexPlusConfiguredDefaultModel();
+    if (!target) return;
+    const attempts = window.__codexPlusDefaultModelAttempts ||= new WeakMap();
+    for (const { node, picker, owner } of codexAggregateModelPickers()) {
+      // 已有会话交给其保存的模型身份恢复；新会话不能沿用原生目录外的默认值。
+      if (owner || picker.disabled || codexPlusModelNames().includes(picker.model)
+          || codexAggregateSelectedModelTarget(picker.model, "local")
+          || !picker.models.some((entry) => entry?.model === target)) continue;
+      const signature = `${codexModelCatalogAppliedEpoch}:${picker.model}:${target}`;
+      if (attempts.get(node) === signature) continue;
+      attempts.set(node, signature);
+      const efforts = modelReasoningEfforts(target);
+      const effort = efforts.some((entry) => entry.reasoningEffort === picker.reasoningEffort)
+        ? picker.reasoningEffort : codexPlusModelMetadata(target)?.defaultReasoningEffort || "medium";
+      try { Promise.resolve(picker.onSelectModel(target, effort)).catch(() => {}); } catch {}
+    }
+  }
+
+  function normalizeCodexConfiguredModelRequest(method, params, hostId) {
+    if (hostId !== "local" || !params || typeof params !== "object") return params;
+    if (method === "send-cli-request-for-host" && params.method) {
+      if (modelResponseHostId(params) !== "local") return params;
+      const next = normalizeCodexConfiguredModelRequest(String(params.method), params.params, hostId);
+      return next === params.params ? params : { ...params, params: next };
+    }
+    if (!["thread/start", "thread/resume", "turn/start"].includes(method)) return params;
+    const allowed = codexAggregateAllowedModelSet(hostId) || codexPureApiAllowedModelSet(hostId);
+    if (!allowed) return params;
+    const model = params.model || params.collaborationMode?.settings?.model;
+    if (model && allowed.has(model)) return params;
+    const mapped = model && codexAggregateSelectedModelTarget(model, hostId);
+    const target = mapped || (method === "thread/start" ? codexPlusConfiguredDefaultModel() : "");
+    if (!target || target === model) return params;
+    const next = { ...params, model: target };
+    if (params.collaborationMode?.settings?.model) {
+      next.collaborationMode = { ...params.collaborationMode,
+        settings: { ...params.collaborationMode.settings, model: target } };
+    }
+    return next;
+  }
+
   function patchModelArray(models, allowEmpty = false, hostId) {
     if (!modelArrayLooksPatchable(models, allowEmpty)) return false;
     const aggregateModels = codexAggregateAllowedModelSet(hostId);
@@ -532,11 +595,11 @@
         changed = true;
       }
     });
-    if (aggregateModels) {
+    if (allowed) {
       // app-server 可能仍缓存旧 catalog。默认成员变化会重命名 slug，必须撤掉旧前缀，
       // 并按新目录排列；只做追加会留下旧标签、重复组及找不到新选中模型的问题。
       const byModel = new Map(models.map((item) => [item.model, item]));
-      const ordered = [...aggregateModels].map((name) => byModel.get(name));
+      const ordered = [...allowed].map((name) => byModel.get(name));
       if (!sameModelCollection(models, ordered)) {
         models.splice(0, models.length, ...ordered);
         changed = true;
@@ -565,7 +628,7 @@
     if (patchModelArray(value.message?.result?.data, false, hostId)) changed = true;
     if (patchModelArray(value.message?.result?.models, false, hostId)) changed = true;
     const names = codexPlusModelNames();
-    const allowed = codexPureApiAllowedModelSet(hostId);
+    const allowed = codexAggregateAllowedModelSet(hostId) || codexPureApiAllowedModelSet(hostId);
     if (value.availableModels instanceof Set) {
       if (prepareModelCollection(value.availableModels, allowed)) changed = true;
       if (allowed) for (const name of value.availableModels) {
@@ -674,7 +737,7 @@
     if (defaultSnapshot) codexPlusModelDefaultSnapshots.set(nextValue, { ...defaultSnapshot, fields: { ...defaultSnapshot.fields } });
     hostId = modelResponseHostId(hostId, value);
     const listChanged = patchModelNameArray(availableModels, hostId);
-    const defaultsChanged = patchModelDefaults(nextValue, codexPureApiAllowedModelSet(hostId));
+    const defaultsChanged = patchModelDefaults(nextValue, codexAggregateAllowedModelSet(hostId) || codexPureApiAllowedModelSet(hostId));
     if (!listChanged && !defaultsChanged) return config;
     try {
       config.value = nextValue;
@@ -1396,9 +1459,11 @@
           && !codexRemoteSessionTargetProvider()) {
         providerRefreshFailed = (await loadCodexModelCatalog())?.status === "failed";
       }
+      const configuredParams = providerRefreshFailed ? params
+        : normalizeCodexConfiguredModelRequest(String(method || ""), params, client.hostId);
       const providerParams = providerRefreshFailed
         ? params
-        : applyCodexRemoteSessionProviderOverride(requestMethod, params);
+        : applyCodexRemoteSessionProviderOverride(requestMethod, configuredParams);
       const nextParams = await prepareCodexManagedSessionConnection(String(method || ""),
         providerParams, client.hostId, originalSendRequest);
       const modelContextRefresh = await refreshCodexThreadModelBeforeTurn(
@@ -1604,9 +1669,11 @@
           && !codexRemoteSessionTargetProvider()) {
         providerRefreshFailed = (await loadCodexModelCatalog())?.status === "failed";
       }
+      const configuredParams = providerRefreshFailed ? params
+        : normalizeCodexConfiguredModelRequest(String(method || ""), params, client.hostId);
       const providerParams = providerRefreshFailed
         ? params
-        : applyCodexRemoteSessionProviderOverride(requestMethod, params);
+        : applyCodexRemoteSessionProviderOverride(requestMethod, configuredParams);
       const nextParams = await prepareCodexManagedSessionConnection(String(method || ""),
         providerParams, client.hostId, originalSendRequest.bind(client));
       const modelContextRefresh = await refreshCodexThreadModelBeforeTurn(
@@ -1762,6 +1829,7 @@
   }
 
   function runCodexModelWhitelistRefreshPass() {
+    syncCodexConfiguredDefaultModel();
     syncCodexRetainedThreadModels();
     if (!codexPlusModelUnlockEnabled()) {
       if (codexAggregateAllowedModelSet("local")) refreshCachedLocalModelQueries();
