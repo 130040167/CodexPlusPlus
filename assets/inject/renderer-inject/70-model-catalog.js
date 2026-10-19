@@ -398,16 +398,19 @@
     return belongsToProfile && names.length ? new Set(names) : null;
   }
 
-  function codexAggregateAllowedModelSet(hostId) {
+  function codexAggregateAllowedModelSet(hostId, allowUnpublished = false) {
     if (hostId !== "local" || !codexPlusBackendSettingsLoaded
-        || codexModelCatalog.status !== "ok") return null;
+        || (codexModelCatalog.status !== "ok"
+          && !(allowUnpublished && codexModelCatalog.status === "not_applied"
+            && Array.isArray(codexModelCatalog.models)))) return null;
     const profile = codexRemoteSessionActiveProfile();
     if (profile?.relayMode !== "aggregate") return null;
     const belongsToProfile = Array.isArray(codexModelCatalog.sources)
       && codexModelCatalog.sources.some((source) =>
         source?.id === `aggregate:${profile.id}`
         && ["aggregate_model_catalog", "aggregate_pool_catalog"].includes(source?.type));
-    return belongsToProfile ? new Set(codexPlusModelNames()) : null;
+    return belongsToProfile ? new Set(codexModelCatalog.status === "not_applied"
+      ? uniqueValues(codexModelCatalog.models) : codexPlusModelNames()) : null;
   }
 
   function codexAggregateSelectedModelTarget(model, hostId, groupId = "") {
@@ -568,9 +571,12 @@
   function patchModelArray(models, allowEmpty = false, hostId) {
     if (!modelArrayLooksPatchable(models, allowEmpty)) return false;
     const aggregateModels = codexAggregateAllowedModelSet(hostId);
-    const allowed = aggregateModels || codexPureApiAllowedModelSet(hostId);
+    // 未发布目录只撤下原生列表里的旧模型，不新增型号、修改默认值或触发自动迁移。
+    const unpublishedModels = codexModelCatalog.status === "not_applied"
+      ? codexAggregateAllowedModelSet(hostId, true) : null;
+    const allowed = aggregateModels || codexPureApiAllowedModelSet(hostId) || unpublishedModels;
     let changed = prepareModelCollection(models, allowed);
-    const customModels = codexPlusModelNames();
+    const customModels = unpublishedModels ? [] : codexPlusModelNames();
     if (!customModels.length && !allowed) return changed;
     if (allowed) {
       const retained = models.filter((item) => allowed.has(item.model));
@@ -599,16 +605,18 @@
       // app-server 可能仍缓存旧 catalog。默认成员变化会重命名 slug，必须撤掉旧前缀，
       // 并按新目录排列；只做追加会留下旧标签、重复组及找不到新选中模型的问题。
       const byModel = new Map(models.map((item) => [item.model, item]));
-      const ordered = [...allowed].map((name) => byModel.get(name));
+      const ordered = [...allowed].map((name) => byModel.get(name)).filter(Boolean);
       if (!sameModelCollection(models, ordered)) {
         models.splice(0, models.length, ...ordered);
         changed = true;
       }
-      const defaultModel = codexModelCatalog.model || codexModelCatalog.default_model;
-      models.forEach((item) => {
-        const isDefault = item.model === defaultModel;
-        if (item.isDefault !== isDefault) { item.isDefault = isDefault; changed = true; }
-      });
+      if (!unpublishedModels) {
+        const defaultModel = codexModelCatalog.model || codexModelCatalog.default_model;
+        models.forEach((item) => {
+          const isDefault = item.model === defaultModel;
+          if (item.isDefault !== isDefault) { item.isDefault = isDefault; changed = true; }
+        });
+      }
     }
     finishModelCollection(models);
     return changed;
@@ -878,7 +886,7 @@
     let published = false;
     for (const query of queries) {
       const currentCollection = codexPlusModelQueryCollection(query.state?.data || query.data);
-      if (!codexPlusModelUnlockEnabled() && !codexAggregateAllowedModelSet("local")
+      if (!codexPlusModelUnlockEnabled() && !codexAggregateAllowedModelSet("local", true)
           && (!currentCollection || !codexPlusModelCollectionSnapshots.has(currentCollection))) continue;
       try {
         let nextCollection = null;
@@ -913,7 +921,7 @@
     const runtime = window.__codexPlusModelQueryPublication
       || (window.__codexPlusModelQueryPublication = { prototypes: new WeakSet() });
     runtime.rewrite = (query, data) => codexPlusLocalModelQuery(query)
-      && (codexPlusModelUnlockEnabled() || codexAggregateAllowedModelSet("local"))
+      && (codexPlusModelUnlockEnabled() || codexAggregateAllowedModelSet("local", true))
       ? patchCachedLocalModelQueryData(data) : data;
     runtime.transfer = (next, stored) => {
       const source = codexPlusModelQueryCollection(next);
@@ -1832,7 +1840,7 @@
     syncCodexConfiguredDefaultModel();
     syncCodexRetainedThreadModels();
     if (!codexPlusModelUnlockEnabled()) {
-      if (codexAggregateAllowedModelSet("local")) refreshCachedLocalModelQueries();
+      if (codexAggregateAllowedModelSet("local", true)) refreshCachedLocalModelQueries();
       syncCodexAggregateSelectedModel();
       return false;
     }
@@ -1849,7 +1857,7 @@
   }
 
   function scheduleCodexModelWhitelistRefresh(durationMs = 2500) {
-    if (!codexPlusModelUnlockEnabled() && !codexAggregateAllowedModelSet("local")) return;
+    if (!codexPlusModelUnlockEnabled() && !codexAggregateAllowedModelSet("local", true)) return;
     codexModelWhitelistRefreshUntil = Math.max(codexModelWhitelistRefreshUntil, Date.now() + durationMs);
     if (codexModelWhitelistRefreshTimer) return;
     sendCodexPlusDiagnostic("model_whitelist_refresh_scheduled", { durationMs });

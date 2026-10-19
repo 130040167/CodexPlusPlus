@@ -1364,6 +1364,8 @@ export const EN_PLAIN: Record<string, string> = {
   "通用配置文件": "Common config file",
   "关闭窗口": "Close",
   "选择模型": "Pick a model",
+  "选择模型（尚未获取到上游模型列表，请先点击“从上游获取”）":
+    "Pick a model (no upstream model list available; click \"Fetch from upstream\" first)",
   "搜索模型…": "Search models…",
   "没有匹配的模型。": "No matching models.",
   "还没有模型列表，先点左边的按钮从上游获取。":

@@ -13333,6 +13333,7 @@ function ModelNameInput({
     maxHeight: 260,
   });
   const choices = models.filter((model) => model.toLowerCase().includes(filter.toLowerCase()));
+  const selectorTitle = models.length ? t("选择模型") : t("选择模型（尚未获取到上游模型列表，请先点击“从上游获取”）");
   return (
     <div className="relative flex min-w-0 items-center" ref={rootRef}>
       <Input
@@ -13353,18 +13354,20 @@ function ModelNameInput({
           }
         }}
       />
-      <button
-        aria-label={t("选择模型")}
-        aria-expanded={open}
-        aria-haspopup="listbox"
-        className="absolute right-1 flex h-6 w-6 items-center justify-center rounded hover:bg-accent disabled:opacity-40"
-        disabled={props.disabled || !models.length}
-        title={t("选择模型")}
-        type="button"
-        onClick={() => { setFilter(""); setOpen(!open); }}
-      >
-        <ChevronDown className="h-4 w-4" />
-      </button>
+      <span className="absolute right-1 flex h-6 w-6 items-center justify-center" title={selectorTitle}>
+        <button
+          aria-label={t("选择模型")}
+          aria-expanded={open}
+          aria-haspopup="listbox"
+          className="flex h-6 w-6 items-center justify-center rounded hover:bg-accent disabled:pointer-events-none disabled:opacity-40"
+          disabled={props.disabled || !models.length}
+          title={selectorTitle}
+          type="button"
+          onClick={() => { setFilter(""); setOpen(!open); }}
+        >
+          <ChevronDown className="h-4 w-4" />
+        </button>
+      </span>
       {open && choices.length ? createPortal(
         <div className="app-select-menu app-select-menu-portal" ref={menuRef} role="listbox" style={menuStyle}
           onKeyDown={(event) => {

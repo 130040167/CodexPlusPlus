@@ -608,6 +608,65 @@ for (const sharing of [false, true]) {
     assert.deepEqual(local.data.data, native);
   });
 }
+it("unpublished aggregate edits withdraw deleted models from local queries and late responses without adding new models", async () => {
+  const { runtime, local, remote, catalog, nodes, setLate } = await aggregateQueryRuntime();
+  const before = catalog("a");
+  local.data = { data: before.models.map((model) => ({ model, isDefault: model === before.model })) };
+  runtime.catalog(before);
+  runtime.refresh();
+  const deleted = before.models.at(-1)!;
+  const retainedDefault = local.data.data.find((model) => model.isDefault)!.model;
+  const stale = local.data.data.map((model) => ({ ...model }));
+  setLate(stale);
+  const remoteData = remote.data;
+  const after = { ...before, status: "not_applied", model: "new-unpublished",
+    models: ["new-unpublished", ...before.models.filter((model) => model !== deleted)] };
+  const selections: unknown[][] = [];
+  nodes.push({ __reactFiber$test: { memoizedProps: { model: deleted, reasoningEffort: "high",
+    models: stale, onSelectModel: (...args: unknown[]) => selections.push(args) },
+    return: { memoizedProps: { permissionsHostId: "local" } } } });
+  runtime.catalog(after);
+  assert.equal(runtime.refresh(), true);
+  const expected = after.models.filter((model) => model !== "new-unpublished");
+  assert.deepEqual(local.data.data.map((model) => model.model), expected, "late response cannot reintroduce the deleted model");
+  assert.deepEqual(local.data.data.filter((model) => model.isDefault).map((model) => model.model), [retainedDefault],
+    "unpublished edits cannot rewrite native defaults");
+  assert.equal(remote.data, remoteData);
+  runtime.syncDefault();
+  runtime.syncSelection();
+  assert.deepEqual(selections, []);
+  const params = { model: deleted };
+  assert.equal(runtime.normalize("thread/start", params, "local"), params);
+  local.setData({ data: stale });
+  assert.deepEqual(local.data.data.map((model) => model.model), expected);
+  runtime.unlock(true);
+  runtime.catalog(after);
+  runtime.refresh();
+  assert.deepEqual(local.data.data.map((model) => model.model), expected,
+    "whitelist unlock must not add unavailable unpublished models either");
+  runtime.catalog({ ...after, models: [], model: "" });
+  runtime.refresh();
+  assert.deepEqual(local.data.data, [], "deleting the last model must also withdraw stale rows");
+});
+
+it("unpublished deletion projection requires current aggregate identity and a concrete models slice", async () => {
+  const { runtime, local, catalog } = await aggregateQueryRuntime();
+  const original = { data: [{ model: "native" }] };
+  local.data = original;
+  const desired = { ...catalog("b"), status: "not_applied" };
+  desired.sources[0].id = "aggregate:other";
+  runtime.catalog(desired);
+  assert.equal(runtime.refresh(), false);
+  assert.equal(local.data, original);
+  const missing = { ...catalog("b"), status: "not_applied" };
+  Reflect.deleteProperty(missing, "models");
+  runtime.catalog(missing);
+  assert.equal(runtime.refresh(), false, "a missing model list is not an empty authoritative catalog");
+  assert.equal(local.data, original);
+  runtime.catalog({ ...catalog("b"), status: "failed" });
+  assert.equal(runtime.refresh(), false);
+  assert.equal(local.data, original);
+});
 
 it("a newly default member's retired prefix migrates through the native picker without changing effort", async () => {
   const { runtime, catalog, nodes } = await aggregateQueryRuntime();

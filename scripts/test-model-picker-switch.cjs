@@ -13,6 +13,8 @@ const names = [
   "codexPureApiAllowedModelSet", "codexAggregateAllowedModelSet", "codexAggregateSelectedModelTarget",
   "codexAggregateModelPickers", "codexPlusConfiguredDefaultModel", "syncCodexConfiguredDefaultModel",
   "normalizeCodexConfiguredModelRequest", "modelResponseHostId", "patchModelArray",
+  "cloneCodexPlusModelCollection", "patchCachedLocalModelQueryData",
+  "transferCodexPlusModelCollectionSnapshot",
 ];
 const functions = names.map(name => {
   const start = catalogSource.indexOf(`  function ${name}(`);
@@ -59,8 +61,8 @@ const picker = {model:"unconfigured-compat",reasoningEffort:"high",models:[],
     document.querySelector("#result").textContent=model;}};
 const owner = {permissionsHostId:"local",conversationId:""};
 document.querySelector("#trigger").__reactFiber$fixture = {memoizedProps:picker,return:{memoizedProps:owner}};
-function renderNative() {
-  const native = [{model:"unconfigured-compat"},{model:beta},{model:alpha}];
+function renderNative(current = null) {
+  const native = current || [{model:"unconfigured-compat"},{model:beta},{model:alpha}];
   patchModelArray(native,true,"local");picker.models=native;
   const list=document.querySelector("._ModelList_fixture"); list.replaceChildren();
   const heading=document.createElement("div");heading.setAttribute("data-menu-section-label","");heading.textContent="选择模型";list.append(heading);
@@ -95,7 +97,7 @@ window.fixture = {
     window.__codexPlusModelPickerGroupsRuntime.scan();
     return {automaticDefault:codexPlusConfiguredDefaultModel(),allowed:codexAggregateAllowedModelSet("local")};
   },
-  published:()=>{codexModelCatalog.status="ok";},
+  published:()=>{codexModelCatalog.status="ok";window.__codexPlusModelPickerGroupsRuntime.scan();},
   failBeforeClick:(key)=>{
     codexModelCatalog.status="failed";
     const row=document.querySelector(".codex-plus-model-default-row");
@@ -111,6 +113,21 @@ window.fixture = {
   available:(enabled)=>{picker.models=enabled?[{model:alpha},{model:beta}]:[{model:beta}];},
   changeDefault:(other)=>{
     codexModelCatalog.model=codexModelCatalog.default_model=other?beta:alpha;
+    window.__codexPlusModelPickerGroupsRuntime.scan();
+  },
+  addTemporaryModel:()=>{
+    const model="cpx-b/test";
+    codexModelCatalog.models.splice(1,0,model);
+    codexModelCatalog.modelMetadata[model]={displayName:"Test（Beta）",codex_plus_group:"Beta",codex_plus_group_id:"b"};
+    codexModelCatalogAppliedEpoch++;
+    renderNative();window.__codexPlusModelPickerGroupsRuntime.scan();
+  },
+  deleteTemporaryModel:()=>{
+    codexModelCatalog.models=codexModelCatalog.models.filter(model=>model!=="cpx-b/test");
+    delete codexModelCatalog.modelMetadata["cpx-b/test"];
+    codexModelCatalog.status="not_applied";
+    codexModelCatalogAppliedEpoch++;codexPlusModelPickerCatalogChanged();
+    renderNative(patchCachedLocalModelQueryData(picker.models));
     window.__codexPlusModelPickerGroupsRuntime.scan();
   },
   switchPool:()=>{
@@ -201,8 +218,10 @@ window.__codexPlusModelPickerGroupsRuntime.scan();
         "catalog failure before rescan must not fall through to the native default");
       await page.evaluate(() => window.fixture.published());
     }
-    await page.evaluate(() => window.fixture.menuOwner("remote-trigger", false));
-    await defaultRow.click();
+    await page.evaluate(() => {
+      window.fixture.menuOwner("remote-trigger", false);
+      document.querySelector(".codex-plus-model-default-row").click();
+    });
     assert.equal(await page.evaluate(() => window.fixture.state().nativeDefaultCalls), 0,
       "stale local row cannot invoke a remote menu's native action before rescan");
     for (const owner of ["remote-trigger", null]) {
@@ -241,8 +260,17 @@ window.__codexPlusModelPickerGroupsRuntime.scan();
     await page.evaluate(() => window.fixture.send());
     assert.equal(requests.length, 2); assert.equal(requests[1].model, "gpt-6.1-sol");
     assert.equal(requests[1].effort, "high");
+    await page.reload();
+    await page.evaluate(() => window.fixture.addTemporaryModel());
+    assert.equal(await page.locator(".codex-plus-model-group-own-label").filter({ hasText: /^Test$/ }).count(), 1);
+    await page.evaluate(() => window.fixture.deleteTemporaryModel());
+    assert.equal(await page.locator('[role="menuitemradio"]').filter({ hasText: /Test/ }).count(), 0);
+    assert.equal(await page.locator(".codex-plus-model-group-header").filter({ hasText: "Beta" }).count(), 1,
+      "deleted model must not create an extra legacy provider group");
+    assert.deepEqual(await page.evaluate(() => window.fixture.state().models), ["cpx-b/gpt-6.1-sol", "gpt-6.1-sol"]);
+    await page.screenshot({ path: path.join(__dirname, "../output/playwright/model-picker-deleted-model.png") });
     assert.deepEqual(errors, []);
-    console.log("PASS: named new composer, default model/group, consistent row metrics, member order, pool withdrawal and HTTP request");
+    console.log("PASS: model/default/group layout, member order, pool withdrawal, unpublished deletion and HTTP request");
   } finally {
     if (attachedPage && !attachedPage.isClosed()) await attachedPage.goto(originalUrl).catch(() => {});
     await browser?.close();
