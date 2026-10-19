@@ -5,7 +5,9 @@ import { PageHeader } from "./ManagementPages";
 import "./AgentCollaborationPage.css";
 
 type Agent = { id: string; name: string; executable: string; enabled: boolean; model: string; reuseSavedAuth: boolean };
-type CollaborationConfig = { enabled: boolean; defaultAgentId: string; agents: Agent[] };
+type CollaborationConfig = { enabled: boolean; defaultAgentId: string; agents: Agent[]; maxRuntimeMinutes: number };
+const defaultMaxRuntimeMinutes = 10;
+const maxRuntimeMinutesLimit = 240;
 type Integration = { status: "connected" | "not_connected" | "conflict"; message: string; home?: string; configPath?: string };
 type CodexRuntime = {
   status: "ready" | "partial" | "unavailable" | "error";
@@ -49,6 +51,7 @@ const defaultConfig = (): CollaborationConfig => ({
     { id: "deepseek", name: "DeepSeek Harness", executable: "", enabled: false, model: "", reuseSavedAuth: false },
     { id: "claude", name: "Claude Code", executable: "", enabled: false, model: "", reuseSavedAuth: false },
   ],
+  maxRuntimeMinutes: defaultMaxRuntimeMinutes,
 });
 const statusLabels: Record<TaskStatus, string> = {
   queued: "排队中", running: "执行中", completed: "已完成", failed: "失败", cancelled: "已取消", interrupted: "已中断",
@@ -62,6 +65,8 @@ const runtimeReady = (runtime?: CodexRuntime | null) => runtime?.status === "rea
 const copyConfig = (config: CollaborationConfig): CollaborationConfig => ({
   ...config,
   defaultAgentId: config.defaultAgentId || "deepseek",
+  maxRuntimeMinutes: Number.isInteger(config.maxRuntimeMinutes) && config.maxRuntimeMinutes > 0
+    ? config.maxRuntimeMinutes : defaultMaxRuntimeMinutes,
   agents: config.agents.map((agent) => ({ ...agent, model: agent.model || "", reuseSavedAuth: agent.reuseSavedAuth === true })),
 });
 const formatTime = (value: number) => Number.isFinite(value) && value > 0
@@ -336,7 +341,8 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
         </label>
         <div className="agent-collaboration-default">
           <label className="mg-field" htmlFor="agent-collaboration-default"><span>默认子 Agent</span><select id="agent-collaboration-default" value={draft.defaultAgentId} disabled={!snapshot || busy === "save_config"} onChange={(event) => editConfig({ ...draft, defaultAgentId: event.target.value })}>{draft.agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}{agent.enabled ? "" : "（未启用）"}</option>)}</select></label>
-          <p className="agent-collaboration-hint">说“交给默认子 Agent”时使用此选择；直接说“让 DeepSeek”或“让 Claude Code”时使用指定的子 Agent。{draft.enabled && !draft.agents.some((agent) => agent.id === draft.defaultAgentId && agent.enabled) && " 所选默认子 Agent 尚未启用，默认分派不可用；仍可点名调用其他已启用的子 Agent。"}</p>
+          <label className="mg-field" htmlFor="agent-collaboration-runtime"><span>单个任务运行上限（分钟）</span><input id="agent-collaboration-runtime" type="number" min={1} max={maxRuntimeMinutesLimit} step={1} value={draft.maxRuntimeMinutes} disabled={!snapshot || busy === "save_config"} onChange={(event) => { const value = Math.trunc(Number(event.target.value)); editConfig({ ...draft, maxRuntimeMinutes: Number.isFinite(value) ? Math.min(Math.max(value, 1), maxRuntimeMinutesLimit) : defaultMaxRuntimeMinutes }); }} /></label>
+          <p className="agent-collaboration-hint">说“交给默认子 Agent”时使用此选择；直接说“让 DeepSeek”或“让 Claude Code”时使用指定的子 Agent。子 Agent 任务超过运行上限（1–240 分钟，默认 10）会被终止。{draft.enabled && !draft.agents.some((agent) => agent.id === draft.defaultAgentId && agent.enabled) && " 所选默认子 Agent 尚未启用，默认分派不可用；仍可点名调用其他已启用的子 Agent。"}</p>
         </div>
         <div className="agent-collaboration-agents">
           {draft.agents.map((agent) => {
