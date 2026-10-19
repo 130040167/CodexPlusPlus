@@ -1138,10 +1138,9 @@ fn launch_codex_multi_instance_blocking(request: CodexMultiLaunchRequest) -> Com
         );
     }
 
-    let instance_id = if request.instance_id.trim().is_empty() {
-        profile_id.clone()
-    } else {
-        request.instance_id.trim().to_string()
+    let instance_id = match multi_instance_launch_id(&request.instance_id, &profile_id) {
+        Ok(id) => id,
+        Err(message) => return failed(message, json!({ "profileId": profile_id })),
     };
     let slug = multi_instance_slug(&instance_id);
     let root = multi_instance_root(&slug);
@@ -1157,12 +1156,7 @@ fn launch_codex_multi_instance_blocking(request: CodexMultiLaunchRequest) -> Com
     }
     if previous.as_ref().is_some_and(|previous| {
         !multi_instance_is_running(previous)
-            && previous.pid.is_some_and(|pid| {
-                matches!(
-                    codex_plus_core::watcher::inspect_process_instance(pid),
-                    codex_plus_core::watcher::ProcessInstanceState::Running { .. }
-                )
-            })
+            && multi_instance_worker_may_be_running(previous, &root)
     }) {
         return failed(
             "已有多开 worker 尚未退出，请等待其退出后重试。",
@@ -1172,12 +1166,7 @@ fn launch_codex_multi_instance_blocking(request: CodexMultiLaunchRequest) -> Com
     if previous.as_ref().is_some_and(|instance| {
         instance.identity.is_none()
             && (codex_plus_core::cdp::endpoint_available(instance.debug_port)
-                || instance.pid.is_some_and(|pid| {
-                    matches!(
-                        codex_plus_core::watcher::inspect_process_instance(pid),
-                        codex_plus_core::watcher::ProcessInstanceState::Running { .. }
-                    )
-                }))
+                || multi_instance_worker_may_be_running(instance, &root))
     }) {
         return failed(
             "旧多开清单无法确认进程身份，请手动关闭该实例后重新启动。",
@@ -1777,6 +1766,16 @@ fn multi_instance_root(slug: &str) -> PathBuf {
         .join(slug)
 }
 
+fn multi_instance_worker_may_be_running(instance: &CodexMultiInstance, root: &Path) -> bool {
+    instance.pid.is_some_and(|pid| {
+        codex_plus_core::multi_worker::worker_may_be_running(
+            pid,
+            &root.join("worker-options.json"),
+            instance.worker_birth_id,
+        )
+    })
+}
+
 fn multi_instance_manifest_path(root: &Path) -> PathBuf {
     root.join("instance.json")
 }
@@ -2079,6 +2078,18 @@ fn write_multi_launch_result(path: &Path, result: &CodexMultiLaunchResult) -> an
 fn load_multi_launch_result(root: &Path) -> Option<CodexMultiLaunchResult> {
     let contents = std::fs::read_to_string(root.join(MULTI_LAUNCH_RESULT_FILE)).ok()?;
     serde_json::from_str(&contents).ok()
+}
+
+fn multi_instance_launch_id(requested: &str, profile_id: &str) -> Result<String, &'static str> {
+    let id = if requested.trim().is_empty() {
+        profile_id.trim()
+    } else {
+        requested.trim()
+    };
+    if id == "main" {
+        return Err("main 是主实例的保留名称，请为多开实例指定其他名称。");
+    }
+    Ok(id.to_string())
 }
 
 fn multi_instance_slug(value: &str) -> String {
@@ -11035,6 +11046,14 @@ model_reasoning_effort = "high"
 
         assert_eq!(result.status, "failed");
         assert!(result.message.contains("只允许打开 http 或 https 链接"));
+    }
+
+    #[test]
+    fn multi_instance_launch_rejects_reserved_main_before_creating_an_instance() {
+        assert!(multi_instance_launch_id(" main ", "fixture").is_err());
+        assert!(multi_instance_launch_id("", "main").is_err());
+        assert_eq!(multi_instance_launch_id("other", "main").unwrap(), "other");
+        assert_eq!(multi_instance_launch_id("", "fixture").unwrap(), "fixture");
     }
 
     #[test]

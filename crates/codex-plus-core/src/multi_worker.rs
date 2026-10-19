@@ -368,19 +368,12 @@ pub async fn terminate_verified_codex_instance(
     crate::windows_integration::terminate_verified_codex_instance(identity)
 }
 
-#[cfg(any(windows, test))]
-pub(crate) fn worker_identity_matches(
-    expected_birth: Option<u64>,
-    actual_birth: Option<u64>,
+#[cfg(any(windows, target_os = "macos", test))]
+pub(crate) fn worker_arguments_match(
     arguments: &[String],
     options_path: &Path,
 ) -> bool {
-    // 旧清单没有创建身份，或者 PID 已复用时，宁可留下 worker 也不猜测归属。
-    if expected_birth.is_none()
-        || expected_birth != actual_birth
-        || arguments.len() != 3
-        || arguments[1] != "--codex-plus-multi-worker"
-    {
+    if arguments.len() != 3 || arguments[1] != "--codex-plus-multi-worker" {
         return false;
     }
     let Ok(expected) = options_path.canonicalize() else {
@@ -390,6 +383,52 @@ pub(crate) fn worker_identity_matches(
         return false;
     };
     expected == actual
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn worker_identity_matches(
+    expected_birth: Option<u64>,
+    actual_birth: Option<u64>,
+    arguments: &[String],
+    options_path: &Path,
+) -> bool {
+    // 停止仍必须有创建身份；只读启动检查不能授予终止权限。
+    expected_birth.is_some()
+        && expected_birth == actual_birth
+        && worker_arguments_match(arguments, options_path)
+}
+
+/// 判断旧 worker 是否仍可能存活；身份无法读取时保守阻止覆盖其目录。
+pub fn worker_may_be_running(
+    pid: u32,
+    options_path: &std::path::Path,
+    expected_birth: Option<u64>,
+) -> bool {
+    if matches!(
+        crate::watcher::inspect_process_instance(pid),
+        crate::watcher::ProcessInstanceState::NotRunning
+    ) {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        crate::windows_integration::multi_worker_may_be_running(pid, options_path, expected_birth)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // 旧版 macOS 清单没有创建身份，使用原始 argv 核对实例 options 文件。
+        let _ = expected_birth;
+        macos_process_arguments(pid)
+            .map(|args| {
+                !options_path.exists() || worker_arguments_match(&args, options_path)
+            })
+            .unwrap_or(true)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (options_path, expected_birth);
+        true
+    }
 }
 
 /// 直接从仍由父进程持有的 Child 句柄读取创建身份，避免按 PID 重新打开另一进程。
@@ -495,6 +534,19 @@ mod tests {
             &extra_arg,
             &options
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn worker_start_check_rejects_reused_pid_and_legacy_non_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let options = temp.path().join("worker-options.json");
+        std::fs::write(&options, "{}").unwrap();
+        let pid = std::process::id();
+        let birth = crate::windows_integration::process_birth_id(pid).unwrap();
+        assert!(!worker_may_be_running(pid, &options, Some(birth + 1)));
+        assert!(!worker_may_be_running(pid, &options, None));
+        assert!(!worker_may_be_running(pid, &options, Some(birth)));
     }
 
     #[test]
