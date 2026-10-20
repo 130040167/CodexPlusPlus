@@ -91,8 +91,10 @@
   }
 
   function codexPlusProxyStatusEnsureNode(card) {
-    const host = card?.parentElement;
-    if (!host) return null;
+    // 挂在 composer root 之前，而不是输入卡片之前：切会话时卡片会被 React
+    // 放进只包住输入框的 relative 容器里，插在卡片前会跑到输入框内部。
+    const anchor = card?.closest("[data-codex-composer-root]") || card;
+    if (!anchor?.parentElement) return null;
     let node = codexPlusProxyStatusState.node;
     if (!node) {
       node = document.createElement("div");
@@ -101,8 +103,8 @@
       node.setAttribute("role", "status");
       codexPlusProxyStatusState.node = node;
     }
-    if (!node.isConnected || node.nextElementSibling !== card) {
-      card.insertAdjacentElement("beforebegin", node);
+    if (!node.isConnected || node.nextElementSibling !== anchor) {
+      anchor.insertAdjacentElement("beforebegin", node);
     }
     return node;
   }
