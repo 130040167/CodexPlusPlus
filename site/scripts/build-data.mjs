@@ -19,7 +19,8 @@ const outDir = join(root, "site", "data");
 
 const AD_SOURCES = [
   "https://ads.codexpp.cc/ads.json",
-  "https://codexpp-ads-test-20261021.pages.dev/ads.json",
+  "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/ads.json",
+  "https://cdn.jsdelivr.net/gh/BigPizzaV3/Ad-List@main/ads.json",
 ];
 
 const fetchText = async (url, timeoutMs = 10000) => {
