@@ -7935,3 +7935,37 @@ async fn proxy_auto_retry_recovers_from_overload_during_reasoning() {
     assert_eq!(server.await.unwrap().len(), 2);
     assert!(started.elapsed() >= Duration::from_millis(200));
 }
+
+#[tokio::test]
+async fn buffered_mode_retries_overload_and_returns_complete_stream() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = vec![
+        proxy_sse_response(&capacity_failed_stream()),
+        proxy_sse_response(&success_stream()),
+    ];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_mode = "buffered".to_string();
+    settings.protocol_proxy_auto_retry_max_attempts = 2;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 200);
+    assert!(result.is_stream);
+    assert!(result.buffered_body.is_some(), "buffered 模式应整段收齐后再返回");
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 2);
+    assert_eq!(trace.auto_retries, 1);
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("resp_ok"));
+    assert!(!body.contains("server_overloaded"));
+    assert_eq!(server.await.unwrap().len(), 2);
+}

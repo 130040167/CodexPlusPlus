@@ -2488,6 +2488,44 @@ async fn handle_protocol_proxy_connection(
     }
     if upstream.is_stream {
         write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
+        if let Some(body) = upstream.buffered_body.take() {
+            // buffered 模式：整段 SSE 已由协议代理收齐并重试完成，这里一次性转发。
+            let mut transformer =
+                crate::protocol_proxy::ResponsesSseTransformer::for_request(request_json.as_ref());
+            let out = transformer.push_bytes(&body);
+            stream.write_all(&out).await?;
+            let usage = transformer.take_usage();
+            let detail = transformer.take_failure_detail();
+            let failure = transformer.finish();
+            let detail_for_log = detail.clone();
+            request_log.record_stream(failure.as_deref(), usage, detail);
+            if let Some(reason) = failure {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "helper.protocol_proxy_stream_failed",
+                    serde_json::json!({
+                        "method": method,
+                        "path": path,
+                        "status": "200 OK",
+                        "stream_outcome": "failed",
+                        "wireApi": upstream.wire_api,
+                        "buffered": true,
+                        "error": reason,
+                        "detail": detail_for_log,
+                        "remote_addr": remote_addr_text
+                    }),
+                );
+            } else {
+                log_helper_response(
+                    "helper.protocol_proxy_stream_ok",
+                    method,
+                    path,
+                    "200 OK",
+                    remote_addr_text,
+                );
+            }
+            stream.shutdown().await?;
+            return Ok(());
+        }
         if upstream.compaction {
             // v2 远程压缩：无论上游协议都重组为恰好一个 compaction 输出项，
             // 压缩无增量展示诉求，收齐上游文本后一次性下发。
@@ -6100,6 +6138,123 @@ mod tests {
         assert_eq!(usage.output_tokens, 30);
         assert_eq!(usage.cached_tokens, 100);
         assert_eq!(entry.cache_hit_ratio, Some(100.0 / 120.0));
+
+        crate::request_log::set_request_log_path_for_tests(None);
+        crate::paths::set_settings_path_for_tests(previous_settings_path);
+    }
+
+    #[tokio::test]
+    async fn helper_buffered_mode_retries_overload_and_hides_error() {
+        let _log_guard = crate::request_log::request_log_test_guard();
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let log_path = temp.path().join("request-log.jsonl");
+        let previous_settings_path =
+            crate::paths::set_settings_path_for_tests(Some(settings_path.clone()));
+        crate::request_log::set_request_log_path_for_tests(Some(log_path.clone()));
+
+        let upstream_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let settings = serde_json::json!({
+            "relayProfilesEnabled": true,
+            "relayProfiles": [{
+                "id": "buffered-overload-relay",
+                "name": "缓冲重试供应商",
+                "baseUrl": format!("http://{upstream_addr}/v1"),
+                "upstreamBaseUrl": format!("http://{upstream_addr}/v1"),
+                "apiKey": "sk-upstream",
+                "protocol": "responses",
+                "relayMode": "pureApi"
+            }],
+            "activeRelayId": "buffered-overload-relay",
+            "protocolProxyAutoRetryMode": "buffered",
+            "protocolProxyAutoRetryMaxAttempts": 2,
+            "protocolProxyAutoRetryIntervalSeconds": 0
+        });
+        std::fs::write(settings_path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+
+        let upstream = tokio::spawn(async move {
+            let overloaded = concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_bad\",\"status\":\"in_progress\"}}\n\n",
+                "event: error\n",
+                "data: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n\n",
+            );
+            let ok = concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ok\",\"status\":\"in_progress\"}}\n\n",
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}}\n\n",
+            );
+            for body in [overloaded, ok] {
+                let (mut stream, _) = upstream_listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let mut expected_len = None;
+                loop {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&buffer[..read]);
+                    if expected_len.is_none() {
+                        if let Some(header_end) = find_header_end(&request) {
+                            let headers = String::from_utf8_lossy(&request[..header_end]);
+                            let content_length = header_value_from_headers(&headers, "content-length")
+                                .unwrap()
+                                .parse::<usize>()
+                                .unwrap();
+                            expected_len = Some(header_end + 4 + content_length);
+                        }
+                    }
+                    if expected_len.is_some_and(|length| request.len() >= length) {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(body.as_bytes()).await.unwrap();
+            }
+        });
+
+        let helper_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let helper_addr = helper_listener.local_addr().unwrap();
+        let helper = tokio::spawn(async move {
+            let (stream, remote_addr) = helper_listener.accept().await.unwrap();
+            handle_helper_connection(stream, Some(remote_addr))
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(helper_addr).await.unwrap();
+        let body = br#"{"model":"gpt-6.1-sol","input":"probe","stream":true}"#;
+        let headers = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: {helper_addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        client.write_all(headers.as_bytes()).await.unwrap();
+        client.write_all(body).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        helper.await.unwrap();
+        upstream.await.unwrap();
+
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.contains("resp_ok"), "{text}");
+        assert!(!text.contains("server_is_overloaded"), "buffered 模式不应把过载错误交给客户端");
+        let entries = crate::request_log::read_request_logs_at(&log_path, 10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].success);
+        assert_eq!(entries[0].attempts, 2);
+        assert_eq!(entries[0].auto_retries, 1);
+        assert_eq!(entries[0].usage.as_ref().map(|u| u.input_tokens), Some(12));
 
         crate::request_log::set_request_log_path_for_tests(None);
         crate::paths::set_settings_path_for_tests(previous_settings_path);

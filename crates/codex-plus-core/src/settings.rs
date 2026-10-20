@@ -933,6 +933,14 @@ pub struct BackendSettings {
         default = "default_protocol_proxy_auto_retry_interval_seconds"
     )]
     pub protocol_proxy_auto_retry_interval_seconds: u64,
+    /// 过载错误处理模式：`streaming`（默认，流式；首字前由代理重试，
+    /// 首字后把过载错误规范成 Codex 可识别的容量错误）或 `buffered`
+    /// （整段缓冲后转发；任何时点的过载都由代理重试，但失去流式）。
+    #[serde(
+        rename = "protocolProxyAutoRetryMode",
+        default = "default_protocol_proxy_auto_retry_mode"
+    )]
+    pub protocol_proxy_auto_retry_mode: String,
     /// 按工具分区的配置。`tools.codex` 是上面那批扁平字段的镜像（写盘时同步），
     /// 其它工具（Grok / 后续工具）只存在这里。见 `crate::tools`。
     #[serde(rename = "tools", default)]
@@ -1035,6 +1043,7 @@ impl Default for BackendSettings {
                 default_protocol_proxy_auto_retry_max_attempts(),
             protocol_proxy_auto_retry_interval_seconds:
                 default_protocol_proxy_auto_retry_interval_seconds(),
+            protocol_proxy_auto_retry_mode: default_protocol_proxy_auto_retry_mode(),
             tools: BTreeMap::new(),
             active_tool: ToolId::Codex,
         }
@@ -1480,6 +1489,17 @@ pub fn default_protocol_proxy_auto_retry_interval_seconds() -> u64 {
 
 pub fn clamp_protocol_proxy_auto_retry_interval_seconds(value: u64) -> u64 {
     value.min(30)
+}
+
+pub fn default_protocol_proxy_auto_retry_mode() -> String {
+    "streaming".to_string()
+}
+
+pub fn normalize_protocol_proxy_auto_retry_mode(value: &str) -> String {
+    match value.trim() {
+        "buffered" => "buffered".to_string(),
+        _ => default_protocol_proxy_auto_retry_mode(),
+    }
 }
 
 pub fn default_relay_profiles() -> Vec<RelayProfile> {
@@ -2084,6 +2104,15 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
         target.insert(
             "protocolProxyAutoRetryIntervalSeconds".to_string(),
             Value::from(clamp_protocol_proxy_auto_retry_interval_seconds(value)),
+        );
+    }
+    if let Some(value) = source
+        .get("protocolProxyAutoRetryMode")
+        .and_then(Value::as_str)
+    {
+        target.insert(
+            "protocolProxyAutoRetryMode".to_string(),
+            Value::String(normalize_protocol_proxy_auto_retry_mode(value)),
         );
     }
     if let Some(value) = source.get("enhancementsEnabled").and_then(Value::as_bool) {
@@ -2814,6 +2843,8 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
         clamp_protocol_proxy_auto_retry_interval_seconds(
             settings.protocol_proxy_auto_retry_interval_seconds,
         );
+    settings.protocol_proxy_auto_retry_mode =
+        normalize_protocol_proxy_auto_retry_mode(&settings.protocol_proxy_auto_retry_mode);
     // 扁平字段始终是 Codex 的唯一事实来源，这里把它镜像进 tools.codex；
     // 其它工具的分片原样保留。放在函数末尾，所有 load / save / update 路径
     // 都会经过，两边不会漂移。

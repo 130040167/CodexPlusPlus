@@ -653,12 +653,19 @@ export const EN_PLAIN: Record<string, string> = {
   "在本地协议代理内部自动重试上游过载/容量错误（含推理阶段），不把错误交给 Codex":
     "Retry upstream overload/capacity errors inside the local protocol proxy (including the reasoning phase) instead of handing the error to Codex",
   "启用协议代理自动重试": "Enable protocol proxy auto-retry",
-  "只对经过本地协议代理、且以 200 流式响应返回的上游过载/容量错误（server_overloaded、server_is_overloaded、at capacity 等）生效。代理会在正文/工具调用开始前先缓冲推理事件，此阶段遇到过载会退避重试；连接失败、429/5xx、限流等其它错误不重试；一旦正文已开始输出，后续失败仍交给 Codex 自己的重连。":
-    "Only applies to upstream overload/capacity errors delivered inside a 200 streaming response through the local protocol proxy (server_overloaded, server_is_overloaded, at capacity, ...). The proxy buffers reasoning events until message text or a tool call starts, and retries overload errors during that phase; connection failures, 429/5xx, rate limits, and other errors are not retried, and once visible output has started later failures are left to Codex's own reconnect.",
+  "只对经过本地协议代理、且以 200 流式响应返回的上游过载/容量错误（server_overloaded、server_is_overloaded、at capacity 等）生效。流式模式下：正文/工具调用开始前先缓冲推理事件，此阶段遇到过载由代理退避重试；首字之后遇到同类过载，会改写成 Codex 可识别的容量错误，由 Codex 自己重试；连接失败、429/5xx、限流等其它错误不重试。整段缓冲模式下，任何时点的过载都由代理重试，但失去流式。":
+    "Only applies to upstream overload/capacity errors delivered inside a 200 streaming response through the local protocol proxy (server_overloaded, server_is_overloaded, at capacity, ...). In streaming mode the proxy buffers reasoning events until message text or a tool call starts and retries overloads during that phase; after the first output, overload errors are normalized into capacity errors Codex recognizes so Codex retries natively; connection failures, 429/5xx, rate limits, and other errors are not retried. In buffered mode the proxy retries overload errors at any point, at the cost of losing streaming.",
   "最多自动重试次数": "Maximum automatic retries",
   "首次重试间隔（秒）": "Initial retry interval (seconds)",
   "之后按 2 倍指数退避，单次最长 30 秒；上游返回 Retry-After 时优先采用（同样受上限约束）。":
     "Later retries use 2x exponential backoff with a 30-second cap per wait; an upstream Retry-After header takes precedence (also subject to that cap).",
+  "过载错误处理模式": "Overload handling mode",
+  "流式：首字前代理重试，首字后把过载错误交给 Codex 原生重试":
+    "Streaming: retry inside the proxy before the first output, and normalize later overload errors for Codex's native retry",
+  "整段缓冲：任何时点过载都由代理重试（失去流式）":
+    "Buffered: retry overload errors at any point inside the proxy (loses streaming)",
+  "流式模式保留实时输出；整段缓冲模式在所有情况下都不会把过载错误交给 Codex，但回复要等整段生成完才显示。":
+    "Streaming keeps live output; buffered never hands overload errors to Codex, but the reply only appears after the whole response completes.",
   "代理设置": "Proxy settings",
   "请求日志": "Request log",
   "进行中": "In progress",

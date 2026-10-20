@@ -354,6 +354,7 @@ type BackendSettings = WhaleBalanceSettings & {
   protocolProxyAutoRetry: boolean;
   protocolProxyAutoRetryMaxAttempts: number;
   protocolProxyAutoRetryIntervalSeconds: number;
+  protocolProxyAutoRetryMode: "streaming" | "buffered";
   codexAppCapacityAutoRetry: boolean;
   codexAppStepwiseEnabled: boolean;
   codexAppAnswerOutlineEnabled: boolean;
@@ -1229,6 +1230,7 @@ const defaultSettings: BackendSettings = {
   protocolProxyAutoRetry: true,
   protocolProxyAutoRetryMaxAttempts: 5,
   protocolProxyAutoRetryIntervalSeconds: 2,
+  protocolProxyAutoRetryMode: "streaming",
   codexAppCapacityAutoRetry: false,
   codexAppStepwiseEnabled: false,
   codexAppAnswerOutlineEnabled: false,
@@ -5309,7 +5311,7 @@ function ProxySettingsScreen({
               <span>{t("启用协议代理自动重试")}</span>
             </label>
             <p className="field-hint">
-              {t("只对经过本地协议代理、且以 200 流式响应返回的上游过载/容量错误（server_overloaded、server_is_overloaded、at capacity 等）生效。代理会在正文/工具调用开始前先缓冲推理事件，此阶段遇到过载会退避重试；连接失败、429/5xx、限流等其它错误不重试；一旦正文已开始输出，后续失败仍交给 Codex 自己的重连。")}
+              {t("只对经过本地协议代理、且以 200 流式响应返回的上游过载/容量错误（server_overloaded、server_is_overloaded、at capacity 等）生效。流式模式下：正文/工具调用开始前先缓冲推理事件，此阶段遇到过载由代理退避重试；首字之后遇到同类过载，会改写成 Codex 可识别的容量错误，由 Codex 自己重试；连接失败、429/5xx、限流等其它错误不重试。整段缓冲模式下，任何时点的过载都由代理重试，但失去流式。")}
             </p>
             <div className="form-row">
               <Field label={t("最多自动重试次数")}>
@@ -5351,6 +5353,24 @@ function ProxySettingsScreen({
             </div>
             <p className="field-hint">
               {t("之后按 2 倍指数退避，单次最长 30 秒；上游返回 Retry-After 时优先采用（同样受上限约束）。")}
+            </p>
+            <Field label={t("过载错误处理模式")}>
+              <select
+                className="request-log-filter"
+                value={form.protocolProxyAutoRetryMode}
+                onChange={(event) =>
+                  onFormChange({
+                    ...form,
+                    protocolProxyAutoRetryMode: event.currentTarget.value === "buffered" ? "buffered" : "streaming",
+                  })
+                }
+              >
+                <option value="streaming">{t("流式：首字前代理重试，首字后把过载错误交给 Codex 原生重试")}</option>
+                <option value="buffered">{t("整段缓冲：任何时点过载都由代理重试（失去流式）")}</option>
+              </select>
+            </Field>
+            <p className="field-hint">
+              {t("流式模式保留实时输出；整段缓冲模式在所有情况下都不会把过载错误交给 Codex，但回复要等整段生成完才显示。")}
             </p>
           </div>
         </CardContent>
@@ -14674,6 +14694,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     relayProfilesEnabled: settings.relayProfilesEnabled !== false,
     protocolProxyAutoRetry: settings.protocolProxyAutoRetry !== false,
     protocolProxyAutoRetryMaxAttempts: clampNumber(settings.protocolProxyAutoRetryMaxAttempts ?? 5, 0, 20),
+    protocolProxyAutoRetryMode: settings.protocolProxyAutoRetryMode === "buffered" ? "buffered" : "streaming",
     protocolProxyAutoRetryIntervalSeconds: clampNumber(settings.protocolProxyAutoRetryIntervalSeconds ?? 2, 0, 30),
     codexAppImageOverlayOpacity: clampNumber(settings.codexAppImageOverlayOpacity || 35, 1, 100),
     codexAppImageOverlayFitMode: normalizeImageOverlayFitMode(settings.codexAppImageOverlayFitMode),

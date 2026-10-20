@@ -366,6 +366,89 @@ async fn schedule_proxy_auto_retry(
 const STREAM_RETRY_PEEK_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// 预读最长等待：等待正文/工具调用出现；超时后放行，之后不再具备重试条件。
 const STREAM_RETRY_PEEK_MAX_WAIT: Duration = Duration::from_secs(120);
+/// 整段缓冲模式的上限：超过后回退为流式（已读部分作为前缀转发）。
+const BUFFERED_STREAM_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// 整段缓冲模式的最长等待，避免客户端请求无限挂起。
+const BUFFERED_STREAM_MAX_WAIT: Duration = Duration::from_secs(300);
+
+/// 整段缓冲模式的读取结果。
+enum BufferedResponsesStream {
+    /// 已读到终态事件或 EOF：body 是完整的 SSE 文本。
+    Complete {
+        body: Vec<u8>,
+        first_output_at_ms: Option<u64>,
+        terminal_failure: Option<(Option<String>, Option<String>)>,
+    },
+    /// 超过容量/时间上限：把已读部分作为流式前缀交给调用方继续转发。
+    Overflow {
+        prefix: Vec<u8>,
+        first_output_at_ms: Option<u64>,
+    },
+}
+
+/// 整段读取 Responses SSE：用于 buffered 模式在转发前识别过载并整段重试。
+async fn read_responses_stream_for_buffering(
+    upstream: &mut reqwest::Response,
+) -> BufferedResponsesStream {
+    let started = Instant::now();
+    let mut buffered: Vec<u8> = Vec::new();
+    let mut scanned = 0usize;
+    let mut first_output_at_ms: Option<u64> = None;
+    loop {
+        let remaining = BUFFERED_STREAM_MAX_WAIT.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return BufferedResponsesStream::Overflow {
+                prefix: buffered,
+                first_output_at_ms,
+            };
+        }
+        let chunk = match tokio::time::timeout(remaining, upstream.chunk()).await {
+            Ok(Ok(Some(chunk))) => chunk,
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
+                return BufferedResponsesStream::Complete {
+                    body: buffered,
+                    first_output_at_ms,
+                    terminal_failure: None,
+                };
+            }
+        };
+        buffered.extend_from_slice(&chunk);
+        if buffered.len() > BUFFERED_STREAM_MAX_BYTES {
+            return BufferedResponsesStream::Overflow {
+                prefix: buffered,
+                first_output_at_ms,
+            };
+        }
+        while let Some(boundary) = next_sse_boundary(&buffered, scanned) {
+            let block = String::from_utf8_lossy(&buffered[scanned..boundary]).into_owned();
+            scanned = boundary;
+            let Some(event) = sse_block_type(&block) else {
+                continue;
+            };
+            if !is_pre_output_stream_event(&event) && first_output_at_ms.is_none() {
+                first_output_at_ms = Some(current_epoch_ms());
+            }
+            match event.as_str() {
+                "response.completed" => {
+                    return BufferedResponsesStream::Complete {
+                        body: buffered,
+                        first_output_at_ms,
+                        terminal_failure: None,
+                    };
+                }
+                "response.failed" | "response.incomplete" | "error" => {
+                    let (code, message) = stream_failure_payload(&block);
+                    return BufferedResponsesStream::Complete {
+                        body: buffered,
+                        first_output_at_ms,
+                        terminal_failure: Some((code, message)),
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+}
 
 /// 预读 200 SSE 开头后的结果。
 enum StreamStartPeek {
@@ -432,6 +515,45 @@ fn stream_event_is_retry_safe(block: &str, event: &str) -> bool {
             .unwrap_or(false),
         _ => false,
     }
+}
+
+/// 把上游过载错误规范成 Codex 能识别的 `response.failed` 事件。
+///
+/// 官方有时用 `error` 事件 + `server_is_overloaded`，Codex 只把它当普通流错误
+/// （显示 stream disconnected 并走重连）。改写成 `response.failed` 且 code 使用
+/// Codex 已登记过的 `server_overloaded`，客户端会按容量错误走自己的重试阶梯。
+fn normalized_overload_failure_event(data_json: &Value) -> Option<String> {
+    let (code, message) = (
+        data_json
+            .pointer("/error/code")
+            .or_else(|| data_json.pointer("/response/error/code"))
+            .and_then(Value::as_str),
+        data_json
+            .pointer("/error/message")
+            .or_else(|| data_json.pointer("/response/error/message"))
+            .and_then(Value::as_str),
+    );
+    let message = message.unwrap_or("Our servers are currently overloaded. Please try again later.");
+    let response_id = data_json
+        .pointer("/response/id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let payload = json!({
+        "type": "response.failed",
+        "response": {
+            "id": response_id,
+            "status": "failed",
+            "error": {
+                "code": "server_overloaded",
+                "message": message,
+            }
+        }
+    });
+    let _ = code;
+    Some(format!(
+        "event: response.failed\ndata: {}\n\n",
+        serde_json::to_string(&payload).ok()?
+    ))
 }
 
 /// 找到 `from` 之后第一个完整 SSE 事件边界（返回边界之后的字节下标）。
@@ -2964,6 +3086,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     let mut exec_negotiation_used = false;
     let mut auto_retry = ProxyAutoRetry::from_settings(&settings);
     let mut request_attempt = 0_usize;
+    let buffered_mode = settings.protocol_proxy_auto_retry_mode == "buffered";
     let mut retry_reasons: Vec<String> = Vec::new();
     let mut request_trace = crate::request_log::RequestTrace {
         model: source_model.clone(),
@@ -3586,6 +3709,76 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         // 非输出事件；若识别到容量失败就退避后重发同一次上游请求。
         let mut stream_prefix = Vec::new();
         if is_stream
+            && (200..300).contains(&status_code)
+            && wire_api == UpstreamWireApi::Responses
+            && content_type.contains("text/event-stream")
+            && !is_compaction_request
+            && !exec_adapted
+            && auto_retry.is_some()
+            && buffered_mode
+        {
+            match read_responses_stream_for_buffering(&mut upstream).await {
+                BufferedResponsesStream::Complete {
+                    body,
+                    first_output_at_ms,
+                    terminal_failure,
+                } => {
+                    if let Some(first_output_at_ms) = first_output_at_ms {
+                        request_trace.first_output_at_ms = Some(first_output_at_ms);
+                    }
+                    if let Some((code, message)) = terminal_failure
+                        && stream_failure_is_retryable(code.as_deref(), message.as_deref())
+                    {
+                        let reason = format!(
+                            "upstream_buffered_overload:{}",
+                            code.clone().unwrap_or_default()
+                        );
+                        if schedule_proxy_auto_retry(
+                            &mut auto_retry,
+                            &relay,
+                            request_attempt,
+                            &reason,
+                            None,
+                            &mut retry_reasons,
+                        )
+                        .await
+                        {
+                            if !strict_aggregate_model {
+                                crate::relay_rotation::record_relay_request_failure(&settings);
+                            }
+                            candidate_index = 0;
+                            continue 'request_attempts;
+                        }
+                    }
+                    request_trace.attempts = request_attempt as u32;
+                    request_trace.auto_retries = retry_reasons.len() as u32;
+                    request_trace.retry_reasons = retry_reasons.clone();
+                    return Ok(UpstreamProxyResponse {
+                        status_code,
+                        is_stream: true,
+                        content_type,
+                        wire_api,
+                        compaction: false,
+                        native_compaction_passthrough: false,
+                        buffered_body: Some(body),
+                        stream_prefix: Vec::new(),
+                        request_trace: Some(request_trace),
+                        exec_adapted: false,
+                        exec_outcome: None,
+                        response: None,
+                    });
+                }
+                BufferedResponsesStream::Overflow {
+                    prefix,
+                    first_output_at_ms,
+                } => {
+                    stream_prefix = prefix;
+                    if let Some(first_output_at_ms) = first_output_at_ms {
+                        request_trace.first_output_at_ms = Some(first_output_at_ms);
+                    }
+                }
+            }
+        } else if is_stream
             && (200..300).contains(&status_code)
             && wire_api == UpstreamWireApi::Responses
             && content_type.contains("text/event-stream")
@@ -10078,6 +10271,17 @@ mod proxy_auto_retry_tests {
     }
 
     #[test]
+    fn overload_error_event_is_rewritten_for_codex_native_retry() {
+        let mut t = ResponsesSseTransformer::default();
+        let out = t.push_bytes(b"event: error\ndata:{\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n\n");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("event: response.failed"), "{text}");
+        assert!(text.contains("\"code\":\"server_overloaded\""), "{text}");
+        assert!(!text.contains("server_is_overloaded"), "{text}");
+        assert!(t.finish().is_some());
+    }
+
+    #[test]
     fn reasoning_events_stay_safe_to_replay_until_real_output() {
         let reasoning_item = concat!(
             "event: response.output_item.added\n",
@@ -10361,6 +10565,11 @@ impl ResponsesSseTransformer {
             let detail = stream_failure_detail(code.as_deref(), message.as_deref());
             if !detail.is_empty() && self.failure_detail.is_none() {
                 self.failure_detail = Some(detail);
+            }
+            if stream_failure_is_retryable(code.as_deref(), message.as_deref())
+                && let Some(normalized) = normalized_overload_failure_event(&data_json)
+            {
+                return normalized.into_bytes();
             }
         }
 
