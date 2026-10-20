@@ -340,6 +340,7 @@ async fn schedule_proxy_auto_retry(
     reason: &str,
     retry_after: Option<Duration>,
     retry_reasons: &mut Vec<String>,
+    live_request_id: Option<&str>,
 ) -> bool {
     let Some(state) = state.as_mut() else {
         return false;
@@ -358,6 +359,16 @@ async fn schedule_proxy_auto_retry(
             "retriesRemaining": state.remaining,
         }),
     );
+    if let Some(id) = live_request_id {
+        let mut next_reasons = retry_reasons.clone();
+        next_reasons.push(reason.to_string());
+        crate::request_log::update_running_retry(
+            id,
+            request_attempt as u32,
+            next_reasons.len() as u32,
+            next_reasons,
+        );
+    }
     tokio::time::sleep(delay).await;
     retry_reasons.push(reason.to_string());
     true
@@ -3159,6 +3170,14 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         candidate_index += 1;
         let relay = relays[attempt].clone();
         request_attempt += 1;
+        if let Some(id) = live_request_id {
+            crate::request_log::update_running_retry(
+                id,
+                request_attempt as u32,
+                retry_reasons.len() as u32,
+                retry_reasons.clone(),
+            );
+        }
         let has_more_candidates = attempt + 1 < relay_count;
         validate_upstream(&relay)?;
         // 官方登录成员：用该账号 OAuth 凭据发往 chatgpt.com，而不是 API Key。
@@ -3798,6 +3817,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                             &reason,
                             None,
                             &mut retry_reasons,
+                            live_request_id,
                         )
                         .await
                         {
@@ -3885,8 +3905,9 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                             request_attempt,
                             "upstream_stream_failed",
                             None,
-                        
-                            &mut retry_reasons,)
+                            &mut retry_reasons,
+                            live_request_id,
+                        )
                         .await
                         {
                             candidate_index = 0;

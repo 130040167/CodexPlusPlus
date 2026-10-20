@@ -168,6 +168,22 @@ pub fn update_running(entry: &RequestLogEntry) {
     }
 }
 
+/// 请求重试时实时更新进行中记录，管理器无需等请求结束就能看到重试次数递增。
+pub fn update_running_retry(
+    id: &str,
+    attempts: u32,
+    auto_retries: u32,
+    retry_reasons: Vec<String>,
+) {
+    if let Ok(mut live) = live_requests().lock()
+        && let Some(entry) = live.get_mut(id)
+    {
+        entry.attempts = attempts;
+        entry.auto_retries = auto_retries;
+        entry.retry_reasons = retry_reasons;
+    }
+}
+
 /// 运行中请求的输出 token 粗估（按已收到的流式 delta 字符数 / 4 计算）。
 pub fn update_running_output_estimate(id: &str, tokens: u64) {
     if let Ok(mut live) = live_requests().lock()
@@ -409,9 +425,11 @@ mod tests {
         running.success = false;
         start_request(&running);
         update_running_output_estimate("live-1", 42);
+        update_running_retry("live-1", 2, 1, vec!["upstream_buffered_overload".to_string()]);
         let visible = read_request_logs(10).unwrap();
         assert!(visible.iter().any(|item| item.id == "live-1" && item.state.as_deref() == Some("running")));
         assert!(visible.iter().any(|item| item.estimated_output_tokens == Some(42)));
+        assert!(visible.iter().any(|item| item.attempts == 2 && item.auto_retries == 1));
 
         let mut finished = running.clone();
         finished.success = true;

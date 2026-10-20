@@ -5512,7 +5512,7 @@ function RequestLogScreen() {
     if (!autoRefresh) return;
     const timer = window.setInterval(() => {
       if (!document.hidden) void load(true);
-    }, 2000);
+    }, 1000);
     return () => window.clearInterval(timer);
   }, [autoRefresh]);
 
