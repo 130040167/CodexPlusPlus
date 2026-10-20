@@ -6046,6 +6046,122 @@ async fn image_edits_proxy_preserves_multipart_body_and_content_type() {
     assert_eq!(&request[header_end + 4..], body.as_slice());
 }
 
+/// 官方登录成员的生图请求：Codex CLI 的 imagegen 扩展按 provider base_url 拼
+/// `images/generations`；聚合代理要像 /responses、/models 一样用 OAuth 凭据
+/// 转发到 chatgpt.com 后端，不能因为成员是官方登录就直接拒绝。
+#[tokio::test]
+async fn image_generations_for_official_login_member_uses_oauth_backend() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+    let _codex_home = EnvVarGuard::set("CODEX_HOME", temp.path().to_str().unwrap());
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(capture_request_with_response(
+        listener,
+        "application/json",
+        r#"{"created":1,"data":[{"b64_json":"AAAA"}]}"#.to_string(),
+    ));
+    let _env_guard = EnvVarGuard::set(
+        "CODEX_PLUS_OFFICIAL_BASE_URL",
+        &format!("http://{address}/backend-api/codex"),
+    );
+    write_official_image_relay_settings(temp.path());
+
+    let body = br#"{"model":"gpt-image-2","prompt":"draw a square"}"#;
+    let mut upstream = open_image_generations_proxy_request(body, Some("Image-Client/1.0"))
+        .await
+        .unwrap();
+    assert_eq!(upstream.status_code, 200);
+    assert_eq!(
+        upstream.read_body().await.unwrap(),
+        br#"{"created":1,"data":[{"b64_json":"AAAA"}]}"#.to_vec()
+    );
+
+    let (headers, sent) = server.await.unwrap();
+    let headers_lower = headers.to_ascii_lowercase();
+    assert!(
+        headers.starts_with("POST /backend-api/codex/images/generations HTTP/1.1"),
+        "{headers}"
+    );
+    assert!(
+        headers_lower.contains("authorization: bearer official-access"),
+        "{headers}"
+    );
+    assert!(
+        headers_lower.contains("chatgpt-account-id: acct-official"),
+        "{headers}"
+    );
+    assert!(
+        headers_lower.contains("originator: codex_cli_rs"),
+        "{headers}"
+    );
+    assert_eq!(
+        sent,
+        json!({"model":"gpt-image-2","prompt":"draw a square"})
+    );
+}
+
+/// 编辑接口走同一条官方登录通道，路径是 `images/edits`，请求体原样透传。
+#[tokio::test]
+async fn image_edits_for_official_login_member_uses_oauth_backend() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+    let _codex_home = EnvVarGuard::set("CODEX_HOME", temp.path().to_str().unwrap());
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(capture_request_with_response(
+        listener,
+        "application/json",
+        r#"{"created":2,"data":[{"b64_json":"BBBB"}]}"#.to_string(),
+    ));
+    let _env_guard = EnvVarGuard::set(
+        "CODEX_PLUS_OFFICIAL_BASE_URL",
+        &format!("http://{address}/backend-api/codex"),
+    );
+    write_official_image_relay_settings(temp.path());
+
+    let body = br#"{"images":[{"image_url":"data:image/png;base64,AAAA"}],"model":"gpt-image-2","prompt":"make it blue"}"#;
+    let mut upstream = open_image_edits_proxy_request(body, "application/json", None)
+        .await
+        .unwrap();
+    assert_eq!(upstream.status_code, 200);
+    assert_eq!(
+        upstream.read_body().await.unwrap(),
+        br#"{"created":2,"data":[{"b64_json":"BBBB"}]}"#.to_vec()
+    );
+
+    let (headers, sent) = server.await.unwrap();
+    let headers_lower = headers.to_ascii_lowercase();
+    assert!(
+        headers.starts_with("POST /backend-api/codex/images/edits HTTP/1.1"),
+        "{headers}"
+    );
+    assert!(
+        headers_lower.contains("authorization: bearer official-access"),
+        "{headers}"
+    );
+    assert!(
+        headers_lower.contains("chatgpt-account-id: acct-official"),
+        "{headers}"
+    );
+    assert_eq!(
+        sent,
+        json!({
+            "images":[{"image_url":"data:image/png;base64,AAAA"}],
+            "model":"gpt-image-2",
+            "prompt":"make it blue"
+        })
+    );
+}
+
 #[tokio::test]
 async fn chat_completions_proxy_uses_configured_user_agent() {
     let _lock = settings_path_test_lock().lock().unwrap();
@@ -6419,6 +6535,31 @@ fn write_image_relay_settings(settings_dir: &Path, upstream_base_url: &str) {
             "relayMode": "mixedApi"
         }],
         "activeRelayId": "images"
+    });
+    std::fs::write(
+        settings_dir.join("settings.json"),
+        serde_json::to_vec_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+}
+
+fn write_official_image_relay_settings(settings_dir: &Path) {
+    let settings = json!({
+        "relayProfiles": [{
+            "id": "official-image",
+            "name": "官方登录",
+            "relayMode": "official",
+            "protocol": "responses",
+            "authContents": json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "official-access",
+                    "refresh_token": "official-refresh",
+                    "account_id": "acct-official"
+                }
+            }).to_string()
+        }],
+        "activeRelayId": "official-image"
     });
     std::fs::write(
         settings_dir.join("settings.json"),

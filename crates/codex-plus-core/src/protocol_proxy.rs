@@ -4413,6 +4413,15 @@ impl ImageProxyEndpoint {
             Self::Edits => "image_edits",
         }
     }
+
+    /// Codex CLI 的图片扩展按 `{provider base_url}/{path}` 拼接上游地址；
+    /// 官方登录通道同样复用这两个相对路径。
+    fn path(self) -> &'static str {
+        match self {
+            Self::Generations => "images/generations",
+            Self::Edits => "images/edits",
+        }
+    }
 }
 
 async fn open_image_proxy_request(
@@ -4423,8 +4432,19 @@ async fn open_image_proxy_request(
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
     let relay = crate::relay_rotation::select_relay_for_probe(&settings)?;
+    let content_type = normalize_image_content_type(content_type, endpoint_kind)?;
+    // 官方登录成员：Codex CLI 的 imagegen 扩展会把图片请求发给当前 provider 的
+    // base_url；聚合代理下该地址是本地协议代理，这里要像 /responses、/models 一样
+    // 用该账号的 OAuth 凭据转发到 chatgpt.com 后端，而不是直接拒绝。
     if crate::official_login::member_uses_official_login_transport(&relay) {
-        anyhow::bail!("图片请求暂不支持官方登录成员「{}」", relay.name);
+        return open_official_image_proxy_request(
+            body,
+            content_type,
+            original_user_agent,
+            endpoint_kind,
+            &relay,
+        )
+        .await;
     }
     let base_url = if relay.upstream_base_url.trim().is_empty() {
         crate::relay_config::relay_profile_base_url(&relay)
@@ -4440,17 +4460,6 @@ async fn open_image_proxy_request(
     if relay.api_key.trim().is_empty() && !relay.uses_no_auth() {
         anyhow::bail!("图片上游 Key 不能为空");
     }
-    let content_type = content_type.trim();
-    let content_type = if content_type.is_empty() {
-        match endpoint_kind {
-            ImageProxyEndpoint::Generations => "application/json",
-            ImageProxyEndpoint::Edits => {
-                anyhow::bail!("图片 edits 请求缺少 Content-Type");
-            }
-        }
-    } else {
-        content_type
-    };
     let endpoint = endpoint_kind.url(&base_url);
     let wire_api = endpoint_kind.wire_api();
     let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -4473,6 +4482,89 @@ async fn open_image_proxy_request(
     .body(body.to_vec());
     let upstream = send_upstream_request_with_header_timeout(
         with_relay_auth(request, &relay),
+        UPSTREAM_IMAGE_HEADER_TIMEOUT,
+    )
+    .await?;
+    let status_code = upstream.status().as_u16();
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json; charset=utf-8")
+        .to_string();
+
+    Ok(UpstreamProxyResponse {
+        status_code,
+        is_stream: false,
+        content_type,
+        wire_api,
+        compaction: false,
+        native_compaction_passthrough: false,
+        buffered_body: None,
+        stream_prefix: Vec::new(),
+        request_trace: None,
+        exec_adapted: false,
+        exec_outcome: None,
+        response: Some(upstream),
+    })
+}
+
+/// 图片接口的 Content-Type 归一化：官方登录通道和 API 通道共用。
+fn normalize_image_content_type<'a>(
+    content_type: &'a str,
+    endpoint_kind: ImageProxyEndpoint,
+) -> anyhow::Result<&'a str> {
+    let content_type = content_type.trim();
+    Ok(if content_type.is_empty() {
+        match endpoint_kind {
+            ImageProxyEndpoint::Generations => "application/json",
+            ImageProxyEndpoint::Edits => {
+                anyhow::bail!("图片 edits 请求缺少 Content-Type");
+            }
+        }
+    } else {
+        content_type
+    })
+}
+
+/// 官方登录成员的生图上游：Codex CLI 的 imagegen 扩展对官方 provider 会请求
+/// `{chatgpt backend}/images/{generations|edits}`，凭据是 ChatGPT OAuth，
+/// 不是本地代理 Key。这里按同样的相对路径和认证头转发。
+async fn open_official_image_proxy_request(
+    body: &[u8],
+    content_type: &str,
+    original_user_agent: Option<&str>,
+    endpoint_kind: ImageProxyEndpoint,
+    relay: &crate::settings::RelayProfile,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    let credential = crate::official_login::resolve_official_credential(relay, false).await?;
+    let endpoint = format!(
+        "{}/{}",
+        crate::official_login::official_base_url().trim_end_matches('/'),
+        endpoint_kind.path()
+    );
+    let wire_api = endpoint_kind.wire_api();
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "protocol_proxy.image_request",
+        json!({
+            "relayId": relay.id,
+            "relayName": relay.name,
+            "endpoint": endpoint,
+            "wireApi": wire_api,
+            "bodyBytes": body.len(),
+            "endpointKind": endpoint_kind.name(),
+            "officialLogin": true
+        }),
+    );
+    let request = crate::http_client::proxied_client_for_profile(
+        &effective_user_agent(&relay.user_agent, original_user_agent),
+        &relay.id,
+    )?
+    .post(endpoint)
+    .header(reqwest::header::CONTENT_TYPE, content_type)
+    .body(body.to_vec());
+    let upstream = send_upstream_request_with_header_timeout(
+        with_official_login_auth(request, relay, &credential),
         UPSTREAM_IMAGE_HEADER_TIMEOUT,
     )
     .await?;

@@ -2,6 +2,8 @@
 
 ## 未发布
 
+- 修复请求避震状态条在首页/新会话「串会话」：没有当前会话 id 时不再退化成显示所有运行中请求，直接隐藏；首页（输入框不在 thread 容器里）也不会再把别的会话的请求显示出来。
+- 修复聚合供应商默认成员是官方登录账号时内置生图失败：图片请求（`/images/generations`、`/images/edits`）不再以「暂不支持官方登录成员」拒绝，而是和官方 Responses 通道一样用该账号的 OAuth 凭据转发到 `chatgpt.com/backend-api/codex/images/*`；纯 API 供应商的图片代理行为不变。
 - 请求日志支持按会话筛选：工具栏新增会话下拉（按最近活跃排序，优先显示 Codex 会话库里的会话标题，取不到标题时退回会话 id 末 8 位，并显示请求条数）；详情里可看到会话标题与完整会话 ID，搜索也支持会话 ID。
 - 请求日志可观测性：自动重试原因带上根因 code（如 `upstream_stream_failed:server_is_overloaded`），详情新增「尝试明细」，逐次列出失败尝试的错误 code/message 与退避毫秒；进行中的请求也能实时看到明细。
 - 请求避震新增「首字提交延迟」（`protocolProxyAutoRetryCommitDelayMs`，默认 1000 毫秒）：流式避震下推理与工具调用参数等不可见阶段整项缓冲，工具调用完成或首段可见输出出现后再等该时长才提交；窗口内遇到 `server_is_overloaded` 等过载仍由代理丢弃重试，提交后照旧交给 Codex 原生重试。短回复在 `response.completed` 到达时立即提交，不白等满窗口。

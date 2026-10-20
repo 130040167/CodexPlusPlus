@@ -14753,6 +14753,10 @@
   /** 当前输入框所属会话 id，用于只显示本会话的请求。 */
   function codexPlusProxyStatusThreadId(card) {
     const composerRoot = card?.closest("[data-codex-composer-root]");
+    const placement = composerRoot?.getAttribute("data-composer-placement");
+    // 首页/新会话的输入框也是 composer，但没有会话归属；必须返回空让状态条隐藏，
+    // 不能退化成“显示所有运行中的请求”，否则别的会话的请求会串到这里。
+    if (placement && placement !== "thread") return "";
     const fromComposer = composerRoot
       ?.querySelector("[data-above-composer-conversation-id]")
       ?.getAttribute("data-above-composer-conversation-id");
@@ -14847,13 +14851,17 @@
   function codexPlusProxyStatusRender() {
     const card = codexPlusProxyStatusComposerCard();
     const threadId = card ? codexPlusProxyStatusThreadId(card) : "";
-    const visibleRequests = threadId
-      ? codexPlusProxyStatusState.requests.filter(
-        (item) => codexPlusProxyStatusNormalizeThreadId(item?.threadId) === threadId,
-      )
-      : codexPlusProxyStatusState.requests;
+    // 首页/新会话没有当前会话 id：不能把“没有会话”当成“不过滤”，
+    // 否则会把别的会话里正在运行的请求显示到首页（串会话）。
+    if (!card || !threadId) {
+      codexPlusProxyStatusHide();
+      return;
+    }
+    const visibleRequests = codexPlusProxyStatusState.requests.filter(
+      (item) => codexPlusProxyStatusNormalizeThreadId(item?.threadId) === threadId,
+    );
     const request = visibleRequests[0];
-    if (!request || !card) {
+    if (!request) {
       codexPlusProxyStatusHide();
       return;
     }
