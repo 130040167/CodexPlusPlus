@@ -14,6 +14,58 @@ use std::path::{Path, PathBuf};
 mod session_paging;
 pub use session_paging::{LocalSessionPage, LocalSessionPager};
 
+/// 按线程/会话 id 批量查询标题（只读、best-effort，供请求日志等展示用）。
+///
+/// 只用于展示：库打不开、schema 不支持或字段缺失都跳过，返回已查到的部分。
+pub fn local_session_titles(
+    db_paths: &[PathBuf],
+    ids: &[String],
+) -> std::collections::HashMap<String, String> {
+    let wanted: Vec<&str> = ids
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let mut titles = std::collections::HashMap::new();
+    if wanted.is_empty() {
+        return titles;
+    }
+    for db_path in db_paths {
+        if !db_path.exists() {
+            continue;
+        }
+        let Ok(db) = Connection::open(db_path) else {
+            continue;
+        };
+        let Ok(query) = session_paging::session_query(&db) else {
+            continue;
+        };
+        for chunk in wanted.chunks(200) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!("SELECT id, title FROM ({query}) WHERE id IN ({placeholders})");
+            let Ok(mut statement) = db.prepare(&sql) else {
+                continue;
+            };
+            let Ok(rows) = statement.query_map(
+                rusqlite::params_from_iter(chunk.iter().copied()),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            ) else {
+                continue;
+            };
+            for row in rows.flatten() {
+                let (id, title) = row;
+                let title = title.trim();
+                if !title.is_empty() {
+                    titles.entry(id).or_insert_with(|| title.to_string());
+                }
+            }
+        }
+    }
+    titles
+}
+
 pub fn delete_local_from_paths(
     db_paths: impl IntoIterator<Item = PathBuf>,
     backup_store: BackupStore,
@@ -1981,6 +2033,65 @@ pub(crate) fn json_to_sql_value(value: &Value) -> SqlValue {
         }
         Value::String(value) => SqlValue::Text(value.clone()),
         other => SqlValue::Text(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod local_session_title_tests {
+    use super::*;
+
+    #[test]
+    fn looks_up_titles_by_thread_id_across_databases() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("state_5.sqlite");
+        let second = temp.path().join("other.sqlite");
+        {
+            let db = Connection::open(&first).unwrap();
+            db.execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    cwd TEXT,
+                    model_provider TEXT,
+                    archived INTEGER DEFAULT 0,
+                    updated_at_ms INTEGER,
+                    rollout_path TEXT
+                 );
+                 INSERT INTO threads (id, title, updated_at_ms) VALUES
+                    ('t-1', '会话标题一', 1),
+                    ('t-2', '', 2);",
+            )
+            .unwrap();
+        }
+        {
+            let db = Connection::open(&second).unwrap();
+            db.execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    updated_at_ms INTEGER,
+                    rollout_path TEXT
+                 );
+                 INSERT INTO threads (id, title, updated_at_ms) VALUES ('t-3', '会话标题三', 3);",
+            )
+            .unwrap();
+        }
+
+        let titles = local_session_titles(
+            &[first, second],
+            &[
+                "t-1".to_string(),
+                "t-2".to_string(),
+                "t-3".to_string(),
+                "missing".to_string(),
+            ],
+        );
+        assert_eq!(titles.get("t-1").map(String::as_str), Some("会话标题一"));
+        // 空标题视为未知，让前端继续显示短 id。
+        assert!(!titles.contains_key("t-2"));
+        assert_eq!(titles.get("t-3").map(String::as_str), Some("会话标题三"));
+        assert!(!titles.contains_key("missing"));
+        assert!(local_session_titles(&[], &[]).is_empty());
     }
 }
 

@@ -616,6 +616,8 @@ type RequestLogEntry = {
   wireApi: string;
   /** Codex 会话/线程 id（来自请求头；旧日志没有该字段）。 */
   threadId?: string | null;
+  /** 会话标题（后端按 threadId 从 Codex 本地会话库补齐；可能缺失）。 */
+  threadTitle?: string | null;
   attempts: number;
   autoRetries: number;
   retryReasons?: string[];
@@ -5596,14 +5598,21 @@ function RequestLogScreen() {
   };
 
   const sessions = useMemo(() => {
-    const counts = new Map<string, number>();
+    const found = new Map<string, { id: string; title: string; count: number }>();
     for (const entry of entries) {
       const id = (entry.threadId ?? "").trim();
       if (!id) continue;
-      counts.set(id, (counts.get(id) ?? 0) + 1);
+      const title = (entry.threadTitle ?? "").trim();
+      const session = found.get(id);
+      if (session) {
+        session.count += 1;
+        if (!session.title && title) session.title = title;
+      } else {
+        found.set(id, { id, title, count: 1 });
+      }
     }
     // entries 本身按时间倒序，Map 的插入顺序即「最近活跃的会话优先」。
-    return [...counts.entries()].map(([id, count]) => ({ id, count }));
+    return [...found.values()];
   }, [entries]);
 
   const hasUnknownSession = useMemo(
@@ -5688,7 +5697,10 @@ function RequestLogScreen() {
             <option value="all">{t("全部会话")}</option>
             {sessions.map((session) => (
               <option key={session.id} value={session.id}>
-                {tf("会话 {0}（{1} 条）", [formatRequestLogSession(session.id), String(session.count)])}
+                {tf("{0}（{1} 条）", [
+                  session.title || tf("会话 {0}", [formatRequestLogSession(session.id)]),
+                  String(session.count),
+                ])}
               </option>
             ))}
             {hasUnknownSession ? <option value="__none__">{t("未记录会话")}</option> : null}
@@ -5819,7 +5831,13 @@ function RequestLogScreen() {
                   <div className="request-log-detail">
                     <dl>
                       <div><dt>{t("请求 ID")}</dt><dd><code>{entry.id}</code></dd></div>
-                      <div><dt>{t("会话 ID")}</dt><dd><code>{entry.threadId || "-"}</code></dd></div>
+                      <div>
+                        <dt>{t("会话 ID")}</dt>
+                        <dd>
+                          {entry.threadTitle ? <strong className="request-log-session-title">{entry.threadTitle}</strong> : null}
+                          <code>{entry.threadId || "-"}</code>
+                        </dd>
+                      </div>
                       <div><dt>{t("路径")}</dt><dd><code>{entry.method} {entry.path}</code></dd></div>
                       <div><dt>{t("上游协议")}</dt><dd>{entry.wireApi || "-"}</dd></div>
                       <div><dt>{t("上游模型")}</dt><dd>{entry.upstreamModel || "-"}</dd></div>

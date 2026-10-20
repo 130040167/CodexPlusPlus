@@ -6377,10 +6377,39 @@ pub fn load_relay_proxy(profile_id: String) -> CommandResult<Value> {
 pub fn load_request_logs(limit: Option<usize>) -> CommandResult<Value> {
     let limit = limit.unwrap_or(200).clamp(1, 1000);
     match codex_plus_core::request_log::read_request_logs(limit) {
-        Ok(entries) => ok(
-            &format!("已读取 {} 条请求日志。", entries.len()),
-            json!({ "entries": entries }),
-        ),
+        Ok(entries) => {
+            // 会话标题来自 Codex 本地会话库，只用于展示；查不到时前端退回短 id。
+            let thread_ids: Vec<String> = entries
+                .iter()
+                .filter_map(|entry| entry.thread_id.clone())
+                .collect();
+            let titles = if thread_ids.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+                let db_paths = codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(&home);
+                codex_plus_data::local_session_titles(&db_paths, &thread_ids)
+            };
+            let entries: Vec<Value> = entries
+                .iter()
+                .map(|entry| {
+                    let mut value = serde_json::to_value(entry).unwrap_or_else(|_| json!({}));
+                    if let Some(title) = entry
+                        .thread_id
+                        .as_ref()
+                        .and_then(|thread_id| titles.get(thread_id))
+                        && let Some(object) = value.as_object_mut()
+                    {
+                        object.insert("threadTitle".to_string(), json!(title));
+                    }
+                    value
+                })
+                .collect();
+            ok(
+                &format!("已读取 {} 条请求日志。", entries.len()),
+                json!({ "entries": entries }),
+            )
+        }
         Err(error) => failed(
             &format!("读取请求日志失败：{error}"),
             json!({ "entries": [] }),

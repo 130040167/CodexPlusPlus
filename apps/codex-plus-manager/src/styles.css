@@ -10796,6 +10796,10 @@ select {
   font-size: 12px;
 }
 
+.request-log-session-filter {
+  max-width: 260px;
+}
+
 .request-log-auto {
   margin: 0;
   font-size: 12px;
@@ -10936,6 +10940,15 @@ select {
   flex-wrap: wrap;
   align-items: baseline;
   gap: 8px;
+}
+
+.request-log-session-title {
+  display: block;
+  overflow: hidden;
+  color: hsl(var(--foreground));
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .request-log-attempts code {
