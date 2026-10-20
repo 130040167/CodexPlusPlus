@@ -2296,6 +2296,7 @@ impl ProxyRequestLog {
                     Some(first_output_at_ms.saturating_sub(self.entry.started_at_ms));
             }
         }
+        crate::request_log::update_running(&self.entry);
     }
 
     fn record_error(&mut self, status: &str, error: String) {
@@ -2343,6 +2344,7 @@ impl ProxyRequestLog {
         if self.entry.first_token_ms.is_none() {
             self.entry.first_token_ms =
                 Some(current_time_ms().saturating_sub(self.entry.started_at_ms));
+            crate::request_log::update_running(&self.entry);
         }
     }
 

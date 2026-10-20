@@ -155,6 +155,15 @@ pub fn finish_request(entry: &RequestLogEntry) {
     let _ = append_request_log(entry);
 }
 
+/// 更新进行中请求的快照（例如上游地址/首字耗时在请求结束前就已知）。
+pub fn update_running(entry: &RequestLogEntry) {
+    if let Ok(mut live) = live_requests().lock()
+        && live.contains_key(&entry.id)
+    {
+        live.insert(entry.id.clone(), entry.clone());
+    }
+}
+
 pub fn running_requests() -> Vec<RequestLogEntry> {
     live_requests()
         .lock()
