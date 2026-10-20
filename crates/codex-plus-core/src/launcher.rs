@@ -1904,6 +1904,7 @@ async fn handle_helper_connection(
                     "phase": entry.phase,
                     "firstTokenMs": entry.first_token_ms,
                     "estimatedOutputTokens": entry.estimated_output_tokens,
+                    "attemptDetails": entry.attempt_details,
                 })
             })
             .collect::<Vec<_>>();

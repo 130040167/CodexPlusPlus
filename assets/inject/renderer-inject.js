@@ -14760,6 +14760,7 @@
           retrying: (count) => `正在重试 ×${count}`,
           generating: "正在生成",
           fallback: "请求进行中",
+          lastError: "上次",
           aria: "请求避震状态",
         }
       : {
@@ -14768,6 +14769,7 @@
           retrying: (count) => `Retrying ×${count}`,
           generating: "Generating",
           fallback: "Request in progress",
+          lastError: "Last",
           aria: "Request shock absorption status",
         };
   }
@@ -14786,6 +14788,7 @@
       #${codexPlusProxyStatusId}[data-phase="waiting"] .codex-plus-proxy-dot{background:#60a5fa}
       #${codexPlusProxyStatusId} .codex-plus-proxy-phase{font-weight:500;white-space:nowrap}
       #${codexPlusProxyStatusId} .codex-plus-proxy-meta{opacity:.65;white-space:nowrap;font-variant-numeric:tabular-nums}
+      #${codexPlusProxyStatusId} .codex-plus-proxy-error{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f87171;opacity:.85}
       @keyframes codex-plus-proxy-pulse{0%{box-shadow:0 0 0 0 rgba(245,158,11,.35)}70%{box-shadow:0 0 0 5px rgba(245,158,11,0)}100%{box-shadow:0 0 0 0 rgba(245,158,11,0)}}
     `;
     document.head?.appendChild(style);
@@ -14840,6 +14843,12 @@
     else if (phase === "generating") label = text.generating;
     else if (retries > 0) label = text.retrying(retries);
 
+    const attemptDetails = Array.isArray(request.attemptDetails) ? request.attemptDetails : [];
+    const lastAttempt = attemptDetails.length ? attemptDetails[attemptDetails.length - 1] : null;
+    const lastErrorCode = String(lastAttempt?.code || "").trim();
+    const lastErrorMessage = String(lastAttempt?.message || "").trim();
+    const lastError = lastErrorCode || lastErrorMessage.slice(0, 80);
+
     const meta = [];
     if (request.model) meta.push(String(request.model));
     const startedAtMs = Number(request.startedAtMs) || 0;
@@ -14864,6 +14873,13 @@
       metaNode.className = "codex-plus-proxy-meta";
       metaNode.textContent = meta.join(" · ");
       node.appendChild(metaNode);
+    }
+    if (lastError) {
+      const errorNode = document.createElement("span");
+      errorNode.className = "codex-plus-proxy-error";
+      errorNode.textContent = `${text.lastError} ${lastError}`;
+      errorNode.title = lastErrorMessage || lastErrorCode;
+      node.appendChild(errorNode);
     }
   }
 
