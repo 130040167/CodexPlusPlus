@@ -1151,7 +1151,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   // 概览在两个工具下都可见：它承载共用的置顶推荐位，以及各自的状态。
   { id: "overview", get label() { return t("概览"); }, icon: LayoutDashboard },
   { id: "relay", get label() { return t("供应商配置"); }, icon: KeyRound, tool: "codex" },
-  { id: "multiLaunch", get label() { return t("Codex多开"); }, icon: Layers3, badge: "NEW", tool: "codex" },
+  { id: "multiLaunch", get label() { return t("Codex多开"); }, icon: Layers3, tool: "codex" },
   { id: "grok", get label() { return t("Grok 配置"); }, icon: Blocks, tool: "grok" },
   { id: "claude", get label() { return t("Claude 增强"); }, icon: Languages, tool: "claude" },
   { id: "sessions", get label() { return t("会话管理"); }, icon: MessageCircle, tool: "codex" },
