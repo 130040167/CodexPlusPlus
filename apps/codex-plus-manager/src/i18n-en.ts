@@ -650,11 +650,11 @@ export const EN_PLAIN: Record<string, string> = {
   "Codex 图片覆盖层": "Codex image overlay",
   "在当前 Codex 会话上叠加一张背景图": "Overlay a background image on the current Codex session",
   "协议代理自动重试": "Protocol proxy auto-retry",
-  "在本地协议代理内部自动重试上游容量错误，不把错误交给 Codex":
-    "Retry upstream capacity errors inside the local protocol proxy instead of handing the error to Codex",
+  "在本地协议代理内部自动重试上游过载/容量错误，不把错误交给 Codex":
+    "Retry upstream overload/capacity errors inside the local protocol proxy instead of handing the error to Codex",
   "启用协议代理自动重试": "Enable protocol proxy auto-retry",
-  "只对经过本地协议代理、且以 200 流式响应返回的模型容量错误（server_overloaded / at capacity，response.failed）生效。连接失败、429/5xx 等其它错误不会重试，直接返回给 Codex。":
-    "Only applies to model capacity errors delivered inside a 200 streaming response (server_overloaded / at capacity, response.failed) through the local protocol proxy. Connection failures, 429/5xx, and other errors are returned to Codex immediately without retrying.",
+  "只对经过本地协议代理、且以 200 流式响应返回的上游过载/容量错误（server_overloaded、server_is_overloaded、at capacity 等）生效；连接失败、429/5xx、限流等其它错误不会重试，直接返回给 Codex。":
+    "Only applies to upstream overload/capacity errors delivered inside a 200 streaming response through the local protocol proxy (server_overloaded, server_is_overloaded, at capacity, ...). Connection failures, 429/5xx, rate limits, and other errors are returned to Codex immediately without retrying.",
   "最多自动重试次数": "Maximum automatic retries",
   "首次重试间隔（秒）": "Initial retry interval (seconds)",
   "之后按 2 倍指数退避，单次最长 30 秒；上游返回 Retry-After 时优先采用（同样受上限约束）。":

@@ -365,7 +365,7 @@ async fn schedule_proxy_auto_retry(
 /// 流式响应预读上限：超限说明已有大量内容（不可能还是空转失败），直接放行。
 const STREAM_RETRY_PEEK_MAX_BYTES: usize = 512 * 1024;
 /// 预读最长等待：上游收到请求后迟迟不产出事件时不能一直扣着响应头。
-const STREAM_RETRY_PEEK_MAX_WAIT: Duration = Duration::from_secs(10);
+const STREAM_RETRY_PEEK_MAX_WAIT: Duration = Duration::from_secs(30);
 
 /// 预读 200 SSE 开头后的结果。
 enum StreamStartPeek {
@@ -456,17 +456,19 @@ fn stream_failure_detail(code: Option<&str>, message: Option<&str>) -> String {
 /// 流内终态失败是否值得重试。只认容量/过载，避免把上下文超限等永久错误重放。
 fn stream_failure_is_retryable(code: Option<&str>, message: Option<&str>) -> bool {
     let code = code.unwrap_or("").trim().to_ascii_lowercase();
-    if matches!(
-        code.as_str(),
-        "server_overloaded" | "overloaded" | "capacity" | "server_overload"
-    ) {
+    // 官方至少见过两种拼法：server_overloaded 与 server_is_overloaded；
+    // 其它上游也会用 capacity / overloaded 系列 code。
+    if code.contains("overload")
+        || code.contains("capacity")
+        || matches!(code.as_str(), "server_overloaded" | "server_is_overloaded")
+    {
         return true;
     }
     let message = message.unwrap_or("").trim().to_ascii_lowercase();
     message.contains("selected model is at capacity")
         || message.contains("model is at capacity")
-        || message.contains("server is overloaded")
-        || message.contains("server overloaded")
+        || message.contains("at capacity")
+        || message.contains("overloaded")
 }
 
 /// 预读 Responses 流开头：识别「200 + 流内 response.failed」的容量错误。
@@ -10049,6 +10051,22 @@ mod proxy_auto_retry_tests {
             Some("capacity field is invalid")
         ));
         assert!(stream_failure_is_retryable(Some("server_overloaded"), None));
+    }
+
+    #[test]
+    fn official_server_is_overloaded_error_is_retryable() {
+        assert!(stream_failure_is_retryable(
+            Some("server_is_overloaded"),
+            Some("Our servers are currently overloaded. Please try again later.")
+        ));
+        assert!(stream_failure_is_retryable(
+            None,
+            Some("Our servers are currently overloaded. Please try again later.")
+        ));
+        assert!(!stream_failure_is_retryable(
+            Some("rate_limit_exceeded"),
+            Some("Rate limit reached for requests")
+        ));
     }
 
 

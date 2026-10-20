@@ -7826,6 +7826,45 @@ async fn proxy_auto_retry_can_be_disabled_for_stream_failures() {
 }
 
 #[tokio::test]
+async fn proxy_auto_retry_recovers_from_server_is_overloaded_error_event() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let overloaded = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_overloaded\",\"status\":\"in_progress\"}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n\n",
+    );
+    let responses = vec![
+        proxy_sse_response(overloaded),
+        proxy_sse_response(&success_stream()),
+    ];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 2;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+
+    let started = Instant::now();
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 200);
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 2);
+    assert_eq!(trace.auto_retries, 1);
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("resp_ok"));
+    assert!(!body.contains("server_is_overloaded"), "重试成功后不应泄露失败事件");
+    assert_eq!(server.await.unwrap().len(), 2);
+    assert!(started.elapsed() >= Duration::from_millis(200));
+}
+
+#[tokio::test]
 async fn proxy_auto_retry_stream_stops_after_configured_attempts() {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let address = listener.local_addr().unwrap();
