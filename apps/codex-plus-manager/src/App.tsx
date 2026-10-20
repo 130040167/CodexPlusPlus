@@ -8439,7 +8439,7 @@ function SettingsScreen({
                   <span>{t("启用协议代理自动重试")}</span>
                 </label>
                 <p className="field-hint">
-                  {t("只对经过本地协议代理的请求生效（聚合供应商、协议转换、模型路由）。代理会在把错误交给 Codex 之前，自行等待并重试连接失败与 429/5xx；重试期间 Codex 不会出现失败提示。")}
+                  {t("只对经过本地协议代理的请求生效（聚合供应商、协议转换、模型路由）。代理会在把错误交给 Codex 之前，自行等待并重试连接失败、429/5xx，以及 200 流式响应里的容量错误（response.failed）；重试期间 Codex 不会出现失败提示。")}
                 </p>
                 <div className="form-row">
                   <Field label={t("最多自动重试次数")}>

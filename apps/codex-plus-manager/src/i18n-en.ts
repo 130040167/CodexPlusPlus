@@ -653,8 +653,8 @@ export const EN_PLAIN: Record<string, string> = {
   "在本地协议代理内部自动重试上游瞬时失败，不把错误交给 Codex":
     "Retry transient upstream failures inside the local protocol proxy instead of handing the error to Codex",
   "启用协议代理自动重试": "Enable protocol proxy auto-retry",
-  "只对经过本地协议代理的请求生效（聚合供应商、协议转换、模型路由）。代理会在把错误交给 Codex 之前，自行等待并重试连接失败与 429/5xx；重试期间 Codex 不会出现失败提示。":
-    "Applies only to requests routed through the local protocol proxy (aggregate providers, protocol conversion, model routing). Before handing an error to Codex, the proxy waits and retries connection failures and 429/5xx responses on its own; Codex sees no failure notice while retries are in progress.",
+  "只对经过本地协议代理的请求生效（聚合供应商、协议转换、模型路由）。代理会在把错误交给 Codex 之前，自行等待并重试连接失败、429/5xx，以及 200 流式响应里的容量错误（response.failed）；重试期间 Codex 不会出现失败提示。":
+    "Applies only to requests routed through the local protocol proxy (aggregate providers, protocol conversion, model routing). Before handing an error to Codex, the proxy waits and retries connection failures, 429/5xx responses, and capacity errors delivered inside a 200 streaming response (response.failed); Codex sees no failure notice while retries are in progress.",
   "最多自动重试次数": "Maximum automatic retries",
   "首次重试间隔（秒）": "Initial retry interval (seconds)",
   "之后按 2 倍指数退避，单次最长 30 秒；上游返回 Retry-After 时优先采用（同样受上限约束）。":

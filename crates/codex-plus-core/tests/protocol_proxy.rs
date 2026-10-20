@@ -7678,3 +7678,157 @@ async fn proxy_auto_retry_does_not_retry_client_errors() {
     assert_eq!(result.status_code, 400);
     assert_eq!(server.await.unwrap().len(), 1, "400 不应触发自动重试");
 }
+
+// ---------------------------------------------------------------------------
+// 200 流内 response.failed（官方 server_overloaded/capacity）也要先由代理重试。
+// ---------------------------------------------------------------------------
+
+fn proxy_sse_response(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/event-stream\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn capacity_failed_stream() -> String {
+    concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_capacity\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.in_progress\n",
+        "data: {\"type\":\"response.in_progress\"}\n\n",
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_capacity\",\"status\":\"failed\",\"error\":{\"code\":\"server_overloaded\",\"message\":\"Selected model is at capacity. Please try a different model.\"}}}\n\n",
+    )
+    .to_string()
+}
+
+fn success_stream() -> String {
+    concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ok\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"status\":\"completed\"}}\n\n",
+    )
+    .to_string()
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_recovers_from_capacity_error_inside_200_stream() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = vec![
+        proxy_sse_response(&capacity_failed_stream()),
+        proxy_sse_response(&success_stream()),
+    ];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 3;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+
+    let started = Instant::now();
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 200);
+    assert!(result.is_stream);
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("resp_ok"));
+    assert!(
+        !body.contains("server_overloaded"),
+        "容量失败不能在已经重试成功的情况下泄露给 Codex"
+    );
+    assert_eq!(server.await.unwrap().len(), 2, "应在 200 流内失败后重发一次");
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "流内重试也要有最小退避"
+    );
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_does_not_retry_after_stream_output_started() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let failed_after_output = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_overloaded\",\"message\":\"Selected model is at capacity.\"}}}\n\n",
+    );
+    let responses = vec![proxy_sse_response(failed_after_output)];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 3;
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("partial"));
+    assert!(body.contains("server_overloaded"));
+    assert_eq!(server.await.unwrap().len(), 1, "已经写出输出后不能再重放流");
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_does_not_retry_non_capacity_stream_failures() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let permanent_failure = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_bad\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"bad input\"}}}\n\n",
+    );
+    let responses = vec![proxy_sse_response(permanent_failure)];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 3;
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("invalid_request_error"));
+    assert_eq!(server.await.unwrap().len(), 1, "非容量类流内失败不得重试");
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_can_be_disabled_for_stream_failures() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = vec![proxy_sse_response(&capacity_failed_stream())];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry = false;
+    settings.protocol_proxy_auto_retry_max_attempts = 5;
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("server_overloaded"));
+    assert_eq!(server.await.unwrap().len(), 1, "关闭后不得重试流内失败");
+}

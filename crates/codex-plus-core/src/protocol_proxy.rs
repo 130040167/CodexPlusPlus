@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 use base64::Engine as _;
@@ -388,6 +388,147 @@ async fn schedule_proxy_auto_retry(
     tokio::time::sleep(delay).await;
     true
 }
+/// 流式响应预读上限：超限说明已有大量内容（不可能还是空转失败），直接放行。
+const STREAM_RETRY_PEEK_MAX_BYTES: usize = 512 * 1024;
+/// 预读最长等待：上游收到请求后迟迟不产出事件时不能一直扣着响应头。
+const STREAM_RETRY_PEEK_MAX_WAIT: Duration = Duration::from_secs(10);
+
+/// 预读 200 SSE 开头后的结果。
+enum StreamStartPeek {
+    /// 放行：`prefix` 是已经读出的字节，必须原样写给 Codex，剩余部分继续流式转发。
+    Forward(Vec<u8>),
+    /// 在产生任何输出前收到终态失败（response.failed / incomplete / error）。
+    Failed {
+        prefix: Vec<u8>,
+        code: Option<String>,
+        message: Option<String>,
+    },
+}
+
+/// 只有「还没有开始产出可见内容」的事件才按住不发。
+///
+/// 官方后端在容量不足时先回 200 和 response.created/in_progress，再在流里发
+/// response.failed（Codex 映射为 server_overloaded）。这些事件本身没有内容，
+/// 暂存它们不影响正常流式的首 token 延迟：一旦出现真正的事件就立即放行。
+fn is_pre_output_stream_event(event: &str) -> bool {
+    matches!(
+        event,
+        "response.created" | "response.in_progress" | "response.queued" | "response.metadata"
+    )
+}
+
+/// 找到 `from` 之后第一个完整 SSE 事件边界（返回边界之后的字节下标）。
+fn next_sse_boundary(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut index = from;
+    while index < bytes.len() {
+        if bytes[index] == b'\n' {
+            if bytes.get(index + 1) == Some(&b'\n') {
+                return Some(index + 2);
+            }
+            if bytes.get(index + 1) == Some(&b'\r') && bytes.get(index + 2) == Some(&b'\n') {
+                return Some(index + 3);
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+/// 从 response.failed / error 事件里提取 (code, message)，兼容几种常见包裹层级。
+fn stream_failure_payload(block: &str) -> (Option<String>, Option<String>) {
+    let mut data_parts = Vec::new();
+    for line in block.lines() {
+        if let Some(data) = strip_sse_field(line.trim_end_matches('\r'), "data") {
+            data_parts.push(data);
+        }
+    }
+    let data = data_parts.join("\n");
+    let Ok(json) = serde_json::from_str::<Value>(data.trim()) else {
+        return (None, None);
+    };
+    let error = json
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .or_else(|| json.get("error"));
+    let code = error
+        .and_then(|error| error.get("code").or_else(|| error.get("type")))
+        .and_then(Value::as_str)
+        .or_else(|| json.get("code").and_then(Value::as_str))
+        .map(ToString::to_string);
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| json.get("message").and_then(Value::as_str))
+        .map(ToString::to_string);
+    (code, message)
+}
+
+/// 流内终态失败是否值得重试。只认容量/过载，避免把上下文超限等永久错误重放。
+fn stream_failure_is_retryable(code: Option<&str>, message: Option<&str>) -> bool {
+    let code = code.unwrap_or("").trim().to_ascii_lowercase();
+    if matches!(
+        code.as_str(),
+        "server_overloaded" | "overloaded" | "capacity" | "server_overload"
+    ) {
+        return true;
+    }
+    let message = message.unwrap_or("").trim().to_ascii_lowercase();
+    message.contains("selected model is at capacity")
+        || message.contains("model is at capacity")
+        || message.contains("server is overloaded")
+        || message.contains("server overloaded")
+}
+
+/// 预读 Responses 流开头：识别「200 + 流内 response.failed」的容量错误。
+///
+/// 只在看到第一个非输出事件之前缓冲；出现输出事件、预读超限、超时或读失败时
+/// 都原样放行已读前缀，之后仍按普通流式转发。
+async fn peek_responses_stream_start(upstream: &mut reqwest::Response) -> StreamStartPeek {
+    let started = Instant::now();
+    let mut buffered: Vec<u8> = Vec::new();
+    let mut scanned = 0usize;
+    loop {
+        if buffered.len() > STREAM_RETRY_PEEK_MAX_BYTES {
+            return StreamStartPeek::Forward(buffered);
+        }
+        let remaining = STREAM_RETRY_PEEK_MAX_WAIT.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return StreamStartPeek::Forward(buffered);
+        }
+        let chunk = match tokio::time::timeout(remaining, upstream.chunk()).await {
+            Ok(Ok(Some(chunk))) => chunk,
+            // EOF、读失败或超时：没有足够证据重试，原样放行已缓冲前缀。
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
+                return StreamStartPeek::Forward(buffered);
+            }
+        };
+        buffered.extend_from_slice(&chunk);
+        while let Some(boundary) = next_sse_boundary(&buffered, scanned) {
+            let block = String::from_utf8_lossy(&buffered[scanned..boundary]).into_owned();
+            scanned = boundary;
+            let Some(event) = sse_block_type(&block) else {
+                continue;
+            };
+            if is_pre_output_stream_event(&event) {
+                continue;
+            }
+            if matches!(
+                event.as_str(),
+                "response.failed" | "response.incomplete" | "error"
+            ) {
+                let (code, message) = stream_failure_payload(&block);
+                return StreamStartPeek::Failed {
+                    prefix: buffered,
+                    code,
+                    message,
+                };
+            }
+            // 出现任何真正的输出事件：立即放行，后续流不再延迟。
+            return StreamStartPeek::Forward(buffered);
+        }
+    }
+}
+
 const MAX_NATIVE_COMPACTION_PROBE_BODY_BYTES: usize = 32 * 1024 * 1024;
 const THINK_OPEN_TAG: &str = "<think>";
 const THINK_CLOSE_TAG: &str = "</think>";
@@ -1255,6 +1396,9 @@ pub struct UpstreamProxyResponse {
     pub native_compaction_passthrough: bool,
     /// 响应体已经读完。为 Some 时不要再读 response。
     pub buffered_body: Option<Vec<u8>>,
+    /// 流式响应开头已被代理预读的字节。调用方必须先原样转发这段前缀，
+    /// 再消费 `response` 的剩余部分；为空表示没有预读。
+    pub stream_prefix: Vec<u8>,
     /// 上游请求是否使用了 Responses exec 兼容包装。
     pub exec_adapted: bool,
     pub(crate) exec_outcome: Option<crate::responses_exec_transport::ExecOutcome>,
@@ -1298,11 +1442,19 @@ impl UpstreamProxyResponse {
     }
 
     pub async fn read_body(&mut self) -> anyhow::Result<Vec<u8>> {
+        let prefix = std::mem::take(&mut self.stream_prefix);
         if let Some(body) = &self.buffered_body {
-            return Ok(body.clone());
+            if prefix.is_empty() {
+                return Ok(body.clone());
+            }
+            let mut bytes = prefix;
+            bytes.extend_from_slice(body);
+            return Ok(bytes);
         }
         let response = self.response.take().context("缺少上游响应")?;
-        Ok(response.bytes().await?.to_vec())
+        let mut bytes = prefix;
+        bytes.extend_from_slice(&response.bytes().await?);
+        Ok(bytes)
     }
 
     pub fn take_response(&mut self) -> anyhow::Result<reqwest::Response> {
@@ -2312,6 +2464,7 @@ fn native_compaction_unsupported_result(
             compaction: false,
             native_compaction_passthrough: false,
             buffered_body: Some(serde_json::to_vec(&body).unwrap_or_default()),
+            stream_prefix: Vec::new(),
             exec_adapted: false,
             exec_outcome: None,
             response: None,
@@ -2697,6 +2850,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         "message": error.to_string()
                     }
                 }))?),
+                stream_prefix: Vec::new(),
                 exec_adapted: false,
                 exec_outcome: None,
                 response: None,
@@ -3100,6 +3254,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 status_code: code, content_type: response_type, is_stream: valid && stream_response,
                 wire_api, compaction: false, native_compaction_passthrough: valid && success,
                 buffered_body: Some(body), exec_adapted: false, exec_outcome: None, response: None,
+                stream_prefix: Vec::new(),
             });
         }
         if probe_native_compaction {
@@ -3137,6 +3292,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     compaction: false,
                     native_compaction_passthrough: stream_response,
                     buffered_body: Some(probed),
+                    stream_prefix: Vec::new(),
                     exec_adapted: false,
                     exec_outcome: None,
                     response: None,
@@ -3159,6 +3315,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                             compaction: false,
                             native_compaction_passthrough: true,
                             buffered_body: Some(probed),
+                            stream_prefix: Vec::new(),
                             exec_adapted: false,
                             exec_outcome: None,
                             response: None,
@@ -3176,6 +3333,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                             compaction: false,
                             native_compaction_passthrough: true,
                             buffered_body: Some(incomplete_compaction_stream(&probed)),
+                            stream_prefix: Vec::new(),
                             exec_adapted: false,
                             exec_outcome: None,
                             response: None,
@@ -3201,6 +3359,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         compaction: false,
                         native_compaction_passthrough: true,
                         buffered_body: Some(probed),
+                        stream_prefix: Vec::new(),
                         exec_adapted: false,
                         exec_outcome: None,
                         response: None,
@@ -3215,6 +3374,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         compaction: false,
                         native_compaction_passthrough: true,
                         buffered_body: Some(sse),
+                        stream_prefix: Vec::new(),
                         exec_adapted: false,
                         exec_outcome: None,
                         response: None,
@@ -3236,6 +3396,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     compaction: false,
                     native_compaction_passthrough: false,
                     buffered_body: Some(probed),
+                    stream_prefix: Vec::new(),
                     exec_adapted: false,
                     exec_outcome: None,
                     response: None,
@@ -3389,6 +3550,63 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 }
             }
         }
+        // 200 的流式响应也可能带着 response.failed（官方 server_overloaded
+        // 就是先回 200 再在流里失败）。在向 Codex 写出任何字节前按住开头的
+        // 非输出事件；若识别到容量失败就退避后重发同一次上游请求。
+        let mut stream_prefix = Vec::new();
+        if is_stream
+            && (200..300).contains(&status_code)
+            && wire_api == UpstreamWireApi::Responses
+            && content_type.contains("text/event-stream")
+            && !is_compaction_request
+            && !exec_adapted
+            && auto_retry.is_some()
+        {
+            match peek_responses_stream_start(&mut upstream).await {
+                StreamStartPeek::Forward(prefix) => stream_prefix = prefix,
+                StreamStartPeek::Failed {
+                    prefix,
+                    code,
+                    message,
+                } => {
+                    let retryable =
+                        stream_failure_is_retryable(code.as_deref(), message.as_deref());
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "protocol_proxy.upstream_stream_failed",
+                        json!({
+                            "relayId": relay.id,
+                            "relayName": relay.name,
+                            "code": code,
+                            "message": message,
+                            "retryable": retryable,
+                            "requestAttempt": request_attempt,
+                        }),
+                    );
+                    if retryable {
+                        if !strict_aggregate_model {
+                            crate::relay_rotation::record_relay_request_failure(&settings);
+                        }
+                        // 聚合还有候选成员时先立即换下一个，别让同一个过载成员占住等待时间。
+                        if has_more_candidates {
+                            continue;
+                        }
+                        if schedule_proxy_auto_retry(
+                            &mut auto_retry,
+                            &relay,
+                            request_attempt,
+                            "upstream_stream_failed",
+                            None,
+                        )
+                        .await
+                        {
+                            candidate_index = 0;
+                            continue 'request_attempts;
+                        }
+                    }
+                    stream_prefix = prefix;
+                }
+            }
+        }
         // 成功，或重试预算用尽：把（最后一个）上游响应交给 Codex。
         // 请求了 SSE 的兼容上游也可能返回 JSON 摘要；让调用方选择 JSON 包装器。
         let json_compaction = is_compaction_request
@@ -3405,6 +3623,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             compaction: is_compaction_request,
             native_compaction_passthrough: false,
             buffered_body: None,
+            stream_prefix,
             exec_adapted,
             exec_outcome: (exec_adapted && (200..300).contains(&status_code)).then(|| {
                 crate::responses_exec_transport::ExecOutcome::new(
@@ -3527,6 +3746,7 @@ pub async fn open_models_proxy_request(
         compaction: false,
         native_compaction_passthrough: false,
         buffered_body: None,
+        stream_prefix: Vec::new(),
         exec_adapted: false,
         exec_outcome: None,
         response: Some(upstream),
@@ -3584,6 +3804,7 @@ pub async fn open_audio_transcriptions_proxy_request(
         compaction: false,
         native_compaction_passthrough: false,
         buffered_body: None,
+        stream_prefix: Vec::new(),
         exec_adapted: false,
         exec_outcome: None,
         response: Some(upstream),
@@ -3723,6 +3944,7 @@ async fn open_image_proxy_request(
         compaction: false,
         native_compaction_passthrough: false,
         buffered_body: None,
+        stream_prefix: Vec::new(),
         exec_adapted: false,
         exec_outcome: None,
         response: Some(upstream),
@@ -3783,6 +4005,7 @@ pub async fn open_chat_completions_proxy_request(
         compaction: false,
         native_compaction_passthrough: false,
         buffered_body: None,
+        stream_prefix: Vec::new(),
         exec_adapted: false,
         exec_outcome: None,
         response: Some(upstream),
@@ -9783,6 +10006,71 @@ mod proxy_auto_retry_tests {
             assert_eq!(state.schedule(None), Some(PROXY_AUTO_RETRY_MAX_DELAY));
         }
         assert_eq!(state.schedule(None), None);
+    }
+
+    #[test]
+    fn pre_output_events_are_buffered_and_output_events_release() {
+        for event in [
+            "response.created",
+            "response.in_progress",
+            "response.queued",
+            "response.metadata",
+        ] {
+            assert!(is_pre_output_stream_event(event), "{event}");
+        }
+        for event in [
+            "response.output_item.added",
+            "response.output_text.delta",
+            "response.reasoning_summary_text.delta",
+            "response.completed",
+            "response.failed",
+        ] {
+            assert!(!is_pre_output_stream_event(event), "{event}");
+        }
+    }
+
+    #[test]
+    fn sse_boundary_supports_lf_and_crlf() {
+        let lf = b"event: x\ndata: {}\n\ndata: tail";
+        assert_eq!(next_sse_boundary(lf, 0), Some(19));
+        let crlf = b"event: x\r\ndata: {}\r\n\r\ndata: tail";
+        assert_eq!(next_sse_boundary(crlf, 0), Some(22));
+        assert_eq!(next_sse_boundary(b"partial", 0), None);
+    }
+
+    #[test]
+    fn stream_failure_payload_reads_nested_response_error() {
+        let block = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_overloaded\",\"message\":\"Selected model is at capacity. Please try a different model.\"}}}";
+        let (code, message) = stream_failure_payload(block);
+        assert_eq!(code.as_deref(), Some("server_overloaded"));
+        assert!(message.unwrap_or_default().contains("at capacity"));
+        assert!(stream_failure_is_retryable(
+            code.as_deref(),
+            Some("Selected model is at capacity. Please try a different model.")
+        ));
+    }
+
+    #[test]
+    fn stream_failure_payload_reads_top_level_error_shape() {
+        let block = "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad input\"}}";
+        let (code, message) = stream_failure_payload(block);
+        assert_eq!(code.as_deref(), Some("invalid_request_error"));
+        assert_eq!(message.as_deref(), Some("bad input"));
+        assert!(!stream_failure_is_retryable(code.as_deref(), message.as_deref()));
+    }
+
+    #[test]
+    fn permanent_stream_failures_are_not_retried() {
+        assert!(!stream_failure_is_retryable(
+            Some("context_length_exceeded"),
+            Some("Your input exceeds the context window")
+        ));
+        assert!(!stream_failure_is_retryable(None, None));
+        assert!(!stream_failure_is_retryable(
+            Some("invalid_request_error"),
+            Some("capacity field is invalid")
+        ));
+        assert!(stream_failure_is_retryable(Some("server_overloaded"), None));
     }
 
     #[test]

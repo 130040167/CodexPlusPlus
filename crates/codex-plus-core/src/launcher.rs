@@ -2414,8 +2414,10 @@ async fn handle_protocol_proxy_connection(
             stream.shutdown().await?;
             return Ok(());
         }
+        let stream_prefix = std::mem::take(&mut upstream.stream_prefix);
         let failure = forward_protocol_proxy_stream(
             stream,
+            &stream_prefix,
             upstream.take_response()?,
             upstream.wire_api,
             request_json.as_ref(),
@@ -3023,6 +3025,7 @@ async fn write_http_stream_headers(
 // 返回流失败原因，HTTP 响应头已经发送，不能再把失败伪装成第二个 HTTP 502。
 async fn forward_protocol_proxy_stream(
     stream: &mut tokio::net::TcpStream,
+    prefix: &[u8],
     response: reqwest::Response,
     wire_api: crate::protocol_proxy::UpstreamWireApi,
     request: Option<&Value>,
@@ -3030,6 +3033,14 @@ async fn forward_protocol_proxy_stream(
     let mut chunks = response.bytes_stream();
     if wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
         let mut transformer = crate::protocol_proxy::ResponsesSseTransformer::for_request(request);
+        // 代理预读过的开头必须先原样补写，否则 Codex 会丢掉 response.created 等事件。
+        if !prefix.is_empty() {
+            let out = transformer.push_bytes(prefix);
+            stream.write_all(&out).await?;
+            if transformer.has_failed() {
+                return Ok(transformer.finish());
+            }
+        }
         while let Some(chunk) = chunks.next().await {
             match chunk {
                 Ok(bytes) => {
@@ -6317,9 +6328,19 @@ mod proxy_stream_tests {
         truncated: bool,
         wire: UpstreamWireApi,
     ) -> (Option<String>, String) {
+        forward_fixture_with_prefix(&[], body, truncated, wire).await
+    }
+
+    async fn forward_fixture_with_prefix(
+        prefix: &[u8],
+        body: &str,
+        truncated: bool,
+        wire: UpstreamWireApi,
+    ) -> (Option<String>, String) {
         let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = upstream.local_addr().unwrap();
         let body = body.to_owned();
+        let prefix = prefix.to_vec();
         let upstream_task = tokio::spawn(async move {
             let (mut socket, _) = upstream.accept().await.unwrap();
             let mut request = Vec::new();
@@ -6354,7 +6375,7 @@ mod proxy_stream_tests {
             .unwrap();
         let (mut writer, _) = downstream.accept().await.unwrap();
         let forwarded = tokio::spawn(async move {
-            let result = forward_protocol_proxy_stream(&mut writer, response, wire, None)
+            let result = forward_protocol_proxy_stream(&mut writer, &prefix, response, wire, None)
                 .await
                 .unwrap();
             writer.shutdown().await.unwrap();
@@ -6495,6 +6516,31 @@ mod proxy_stream_tests {
     }
 
     #[tokio::test]
+    async fn stream_prefix_is_forwarded_before_remaining_body() {
+        // 代理预读过的 response.created 必须原样补写，不能丢；
+        // 剩余 response.completed 继续透传。
+        let prefix = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        );
+        let remainder = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        );
+        let (failure, output) = forward_fixture_with_prefix(
+            prefix.as_bytes(),
+            remainder,
+            false,
+            UpstreamWireApi::Responses,
+        )
+        .await;
+        assert!(failure.is_none(), "{failure:?}");
+        assert!(output.starts_with(prefix), "前缀必须原样先行转发: {output}");
+        assert!(output.contains("response.completed"), "{output}");
+        assert_eq!(output.matches("event: response.created").count(), 1);
+    }
+
+    #[tokio::test]
     async fn native_oversized_event_is_forwarded_and_stream_completes() {
         use std::time::Duration;
         use tokio::time::{sleep, timeout};
@@ -6558,7 +6604,7 @@ mod proxy_stream_tests {
 
         let forwarded = timeout(
             Duration::from_secs(20),
-            forward_protocol_proxy_stream(&mut writer, response, UpstreamWireApi::Responses, None),
+            forward_protocol_proxy_stream(&mut writer, &[], response, UpstreamWireApi::Responses, None),
         )
         .await
         .expect("上游发完终止块后转发必须结束")
