@@ -350,6 +350,10 @@ type BackendSettings = WhaleBalanceSettings & {
   codexAppNativeFastUnlock: boolean;
   codexAppPetRealMouseLook: boolean;
   codexAppActivityOverlayRight: boolean;
+  /** 协议代理内部自动重试（与 Rust `protocol_proxy_auto_retry` 对应）。 */
+  protocolProxyAutoRetry: boolean;
+  protocolProxyAutoRetryMaxAttempts: number;
+  protocolProxyAutoRetryIntervalSeconds: number;
   codexAppCapacityAutoRetry: boolean;
   codexAppStepwiseEnabled: boolean;
   codexAppAnswerOutlineEnabled: boolean;
@@ -1180,6 +1184,9 @@ const defaultSettings: BackendSettings = {
   codexAppNativeFastUnlock: false,
   codexAppPetRealMouseLook: false,
   codexAppActivityOverlayRight: false,
+  protocolProxyAutoRetry: true,
+  protocolProxyAutoRetryMaxAttempts: 5,
+  protocolProxyAutoRetryIntervalSeconds: 2,
   codexAppCapacityAutoRetry: false,
   codexAppStepwiseEnabled: false,
   codexAppAnswerOutlineEnabled: false,
@@ -7621,7 +7628,43 @@ function SessionRepairPanel({ form, providerSyncProgress, sessionIndexRepairActi
   const providerTargets = providerSyncTargets?.targets ?? [];
   const selectedProviderTarget = providerTargets.find((target) => target.id === selectedProviderSyncTarget);
   const canRepairProviderSessions = Boolean(selectedProviderTarget && isProviderSyncTargetSelectable(selectedProviderTarget));
-  return <Panel className="sessions-overview-panel"><CardHead title={t("会话修复")} detail={t("预览并修复本地会话与索引")} /><CardContent>
+  const maintenanceBusy = providerSyncProgress.active || sessionIndexRepairActive;
+  const maintenanceHasError = Boolean(
+    sessionIndexRepairReportError
+    || providerSyncProgress.result?.status === "failed"
+    || providerSyncProgress.result?.syncStatus === "partial_failure"
+    || providerSyncProgress.result?.recoveryErrors?.length
+    || sessionIndexRepairReport?.abortedReason
+    || sessionIndexRepairReport?.warnings?.length,
+  );
+  const maintenanceNeedsAttention = maintenanceBusy || maintenanceHasError;
+  const [maintenanceExpanded, setMaintenanceExpanded] = useState(maintenanceNeedsAttention);
+
+  useEffect(() => {
+    if (maintenanceNeedsAttention) setMaintenanceExpanded(true);
+  }, [maintenanceNeedsAttention, providerSyncProgress.active, sessionIndexRepairActive, sessionIndexRepairReportError]);
+
+  return <details
+    className="session-maintenance"
+    open={maintenanceExpanded}
+    onToggle={(event) => setMaintenanceExpanded(event.currentTarget.open)}
+  >
+    <summary className="session-maintenance-summary">
+      <Wrench aria-hidden="true" className="h-4 w-4" />
+      <strong>{t("修复与维护")}</strong>
+      <span className="session-maintenance-auto-state" data-enabled={form.providerSyncEnabled}>
+        {form.providerSyncEnabled ? t("自动修复已开启") : t("自动修复已关闭")}
+      </span>
+      <span className="session-maintenance-status" data-error={maintenanceHasError} role="status" aria-live="polite">
+        {providerSyncProgress.active
+          ? <>{t("正在修复历史会话")} {formatProgressPercent(providerSyncProgress.percent)}%</>
+          : sessionIndexRepairActive
+            ? t("正在检查索引…")
+            : maintenanceHasError ? t("需要处理") : null}
+      </span>
+      <ChevronDown aria-hidden="true" className="session-maintenance-chevron h-4 w-4" />
+    </summary>
+    <div className="session-maintenance-content">
           <div className="session-repair-tools">
             <Field className="session-sync-target" label={t("同步目标")}>
               <AppSelect
@@ -7660,10 +7703,6 @@ function SessionRepairPanel({ form, providerSyncProgress, sessionIndexRepairActi
             </label>
 
             <div className="session-repair-actions">
-              <Button onClick={() => void actions.refreshLocalSessions()} variant="outline">
-                <RefreshCw className="h-4 w-4" />
-                {t("刷新会话")}
-              </Button>
               <Button
                 disabled={providerSyncProgress.active || sessionIndexRepairActive || !canRepairProviderSessions}
                 onClick={() => void actions.syncProvidersNow()}
@@ -7759,10 +7798,6 @@ function SessionRepairPanel({ form, providerSyncProgress, sessionIndexRepairActi
             </div>
           ) : null}
 
-          <div className="hint-line session-delete-hint">
-            <Info className="h-4 w-4" />
-            <span>{t("删除会创建本地备份；如果 Codex App 正在使用该会话，建议先关闭对应会话窗口再操作。")}</span>
-          </div>
     {providerSyncProgress.result?.recoveryJournalPath ? <div>
       {!providerSyncProgress.active && providerSyncProgress.percent === 0 ? <p role="alert">{providerSyncProgress.message}</p> : null}
       <p role="alert" className="break-all">{t("恢复记录：")}{providerSyncProgress.result.recoveryJournalPath}</p>
@@ -7775,7 +7810,8 @@ function SessionRepairPanel({ form, providerSyncProgress, sessionIndexRepairActi
       {t("仍有改动：")}{providerSyncProgress.result.changedSessionFiles ?? 0} {t("个会话文件，")}
       {providerSyncProgress.result.sqliteRowsUpdated ?? 0} {t("行索引。请查看恢复记录处理剩余冲突。")}
     </p> : null}
-  </CardContent></Panel>;
+    </div>
+  </details>;
 }
 
 function SessionsScreen({
@@ -8382,6 +8418,63 @@ function SettingsScreen({
               <p className="field-hint">
                 {t("「测试供应商」按钮用这个模型发起一次真实请求，用于判断 Key 与端点是否可用。")}
               </p>
+            </CardContent>
+          </Panel>
+
+          <Panel>
+            <CardHead
+              title={t("协议代理自动重试")}
+              detail={t("在本地协议代理内部自动重试上游瞬时失败，不把错误交给 Codex")}
+            />
+            <CardContent className="settings-content">
+              <div className="settings-block">
+                <label className="check-row">
+                  <input
+                    checked={form.protocolProxyAutoRetry}
+                    onChange={(event) =>
+                      onFormChange({ ...form, protocolProxyAutoRetry: event.currentTarget.checked })
+                    }
+                    type="checkbox"
+                  />
+                  <span>{t("启用协议代理自动重试")}</span>
+                </label>
+                <p className="field-hint">
+                  {t("只对经过本地协议代理的请求生效（聚合供应商、协议转换、模型路由）。代理会在把错误交给 Codex 之前，自行等待并重试连接失败与 429/5xx；重试期间 Codex 不会出现失败提示。")}
+                </p>
+                <div className="form-row">
+                  <Field label={t("最多自动重试次数")}>
+                    <Input
+                      max={20}
+                      min={0}
+                      type="number"
+                      value={form.protocolProxyAutoRetryMaxAttempts}
+                      onChange={(event) =>
+                        onFormChange({
+                          ...form,
+                          protocolProxyAutoRetryMaxAttempts: clampNumber(Number(event.currentTarget.value), 0, 20),
+                        })
+                      }
+                    />
+                  </Field>
+                  <Field label={t("首次重试间隔（秒）")}>
+                    <Input
+                      max={30}
+                      min={0}
+                      type="number"
+                      value={form.protocolProxyAutoRetryIntervalSeconds}
+                      onChange={(event) =>
+                        onFormChange({
+                          ...form,
+                          protocolProxyAutoRetryIntervalSeconds: clampNumber(Number(event.currentTarget.value), 0, 30),
+                        })
+                      }
+                    />
+                  </Field>
+                </div>
+                <p className="field-hint">
+                  {t("之后按 2 倍指数退避，单次最长 30 秒；上游返回 Retry-After 时优先采用（同样受上限约束）。")}
+                </p>
+              </div>
             </CardContent>
           </Panel>
 
@@ -14069,6 +14162,9 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     dictation: normalizeDictationSettings(settings.dictation),
     codexAppTypingEffect: normalizeTypingEffect(settings.codexAppTypingEffect),
     relayProfilesEnabled: settings.relayProfilesEnabled !== false,
+    protocolProxyAutoRetry: settings.protocolProxyAutoRetry !== false,
+    protocolProxyAutoRetryMaxAttempts: clampNumber(settings.protocolProxyAutoRetryMaxAttempts ?? 5, 0, 20),
+    protocolProxyAutoRetryIntervalSeconds: clampNumber(settings.protocolProxyAutoRetryIntervalSeconds ?? 2, 0, 30),
     codexAppImageOverlayOpacity: clampNumber(settings.codexAppImageOverlayOpacity || 35, 1, 100),
     codexAppImageOverlayFitMode: normalizeImageOverlayFitMode(settings.codexAppImageOverlayFitMode),
     codexAppDreamSkinPaused: settings.codexAppDreamSkinPaused === true,

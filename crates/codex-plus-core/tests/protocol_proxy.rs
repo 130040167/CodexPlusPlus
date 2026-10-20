@@ -7514,3 +7514,167 @@ async fn native_compaction_preserves_protocol_and_opaque_state() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 协议代理自动重试：上游瞬时失败在本地代理内部消化，不把失败交给 Codex。
+// ---------------------------------------------------------------------------
+
+/// 单供应商直连设置：非聚合路径下 relays 只有一个候选，重试只会打同一个上游。
+fn single_relay_proxy_settings(base_url: &str) -> BackendSettings {
+    let relay_id = format!(
+        "auto-retry-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    BackendSettings {
+        active_relay_id: relay_id.clone(),
+        relay_profiles: vec![RelayProfile {
+            id: relay_id,
+            name: "auto retry relay".to_string(),
+            protocol: RelayProtocol::Responses,
+            base_url: base_url.to_string(),
+            api_key: "sk-auto-retry".to_string(),
+            relay_mode: RelayMode::PureApi,
+            ..RelayProfile::default()
+        }],
+        ..BackendSettings::default()
+    }
+}
+
+fn proxy_http_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+async fn serve_scripted_responses(
+    listener: tokio::net::TcpListener,
+    responses: Vec<String>,
+) -> Vec<String> {
+    let mut requests = Vec::new();
+    for response in responses {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        requests.push(read_http_request(&mut stream).await);
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
+    requests
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_recovers_from_upstream_capacity_error() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = vec![
+        proxy_http_response(
+            "429 Too Many Requests",
+            r#"{"error":{"message":"Selected model is at capacity. Please try a different model."}}"#,
+        ),
+        proxy_http_response("200 OK", r#"{"id":"resp_retried","object":"response"}"#),
+    ];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 3;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+
+    let started = Instant::now();
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5.6-luna","input":"hi","stream":false}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 200);
+    let body: Value = serde_json::from_slice(&result.read_body().await.unwrap()).unwrap();
+    assert_eq!(body["id"], "resp_retried");
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 2, "容量错误应在代理内部重试一次后成功");
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "重试必须有最小退避，不能变成热循环"
+    );
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_stops_after_configured_attempts() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let capacity_body = r#"{"error":{"message":"capacity exceeded"}}"#;
+    let responses = vec![
+        proxy_http_response("503 Service Unavailable", capacity_body),
+        proxy_http_response("503 Service Unavailable", capacity_body),
+    ];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 1;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5.6-luna","input":"hi","stream":false}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 503, "预算用尽后应把最后一个上游错误交给 Codex");
+    assert!(
+        String::from_utf8(result.read_body().await.unwrap())
+            .unwrap()
+            .contains("capacity exceeded")
+    );
+    assert_eq!(server.await.unwrap().len(), 2, "max attempts=1 表示只额外重试一次");
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_can_be_disabled() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = vec![proxy_http_response(
+        "429 Too Many Requests",
+        r#"{"error":{"message":"rate limited"}}"#,
+    )];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry = false;
+    settings.protocol_proxy_auto_retry_max_attempts = 5;
+
+    let result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5.6-luna","input":"hi","stream":false}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 429);
+    assert_eq!(server.await.unwrap().len(), 1, "关闭后不得自动重试");
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_does_not_retry_client_errors() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = vec![proxy_http_response(
+        "400 Bad Request",
+        r#"{"error":{"message":"invalid request"}}"#,
+    )];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 3;
+
+    let result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5.6-luna","input":"hi","stream":false}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 400);
+    assert_eq!(server.await.unwrap().len(), 1, "400 不应触发自动重试");
+}

@@ -5,6 +5,10 @@
 
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
+  "修复与维护": "Repair and maintenance",
+  "自动修复已开启": "Automatic repair on",
+  "自动修复已关闭": "Automatic repair off",
+  "会话视图": "Session view",
   "请求不发送思考参数；档位草稿保留，切回自动兼容后可恢复。": "No reasoning parameters are sent. Saved levels remain available when automatic compatibility is restored.",
   "Chat 上游按原值接收 reasoning_effort，不按模型名改写档位。": "Send reasoning_effort unchanged to Chat upstreams without mapping levels by model name.",
   "不发送思考参数": "Omit reasoning parameters",
@@ -645,6 +649,16 @@ export const EN_PLAIN: Record<string, string> = {
     "The Test provider button sends one real request with this model to check that the key and endpoint work.",
   "Codex 图片覆盖层": "Codex image overlay",
   "在当前 Codex 会话上叠加一张背景图": "Overlay a background image on the current Codex session",
+  "协议代理自动重试": "Protocol proxy auto-retry",
+  "在本地协议代理内部自动重试上游瞬时失败，不把错误交给 Codex":
+    "Retry transient upstream failures inside the local protocol proxy instead of handing the error to Codex",
+  "启用协议代理自动重试": "Enable protocol proxy auto-retry",
+  "只对经过本地协议代理的请求生效（聚合供应商、协议转换、模型路由）。代理会在把错误交给 Codex 之前，自行等待并重试连接失败与 429/5xx；重试期间 Codex 不会出现失败提示。":
+    "Applies only to requests routed through the local protocol proxy (aggregate providers, protocol conversion, model routing). Before handing an error to Codex, the proxy waits and retries connection failures and 429/5xx responses on its own; Codex sees no failure notice while retries are in progress.",
+  "最多自动重试次数": "Maximum automatic retries",
+  "首次重试间隔（秒）": "Initial retry interval (seconds)",
+  "之后按 2 倍指数退避，单次最长 30 秒；上游返回 Retry-After 时优先采用（同样受上限约束）。":
+    "Later retries use 2x exponential backoff with a 30-second cap per wait; an upstream Retry-After header takes precedence (also subject to that cap).",
   "这个工具目前没有独立设置项": "This tool has no settings of its own yet",
   "该工具的配置在它自己的页签里管理；上面的基础设置对所有工具通用。":
     "This tool is configured on its own tab; the basic settings above apply to every tool.",

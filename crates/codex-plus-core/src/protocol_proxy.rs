@@ -277,6 +277,117 @@ const UPSTREAM_IMAGE_HEADER_TIMEOUT: Duration = Duration::from_secs(600);
 /// 会让采样/压缩无故失败，两次短退避能把大部分瞬时故障挡在本地。
 const UPSTREAM_CONNECT_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_millis(150), Duration::from_millis(400)];
+
+/// 协议代理自动重试：单次等待上限。上游给的 Retry-After 也受此约束，
+/// 避免一个长退避把 Codex 的请求挂太久。
+const PROXY_AUTO_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+/// 单次请求内的总等待预算；用完后把最后一个上游错误原样交给 Codex。
+const PROXY_AUTO_RETRY_TOTAL_BUDGET: Duration = Duration::from_secs(120);
+/// 即使用户把间隔设成 0 秒，也给一个短地板值，避免容量错误被打成热循环。
+const PROXY_AUTO_RETRY_MIN_DELAY: Duration = Duration::from_millis(250);
+
+/// 上游状态码是否值得在代理层重试。
+///
+/// 408/429 与大多数 5xx 表示请求没有被上游处理，或只是网关瞬时故障；
+/// 501/505 属于协议/配置错误，重试不会改变结果。
+fn is_retryable_upstream_status(status: u16) -> bool {
+    matches!(status, 408 | 429)
+        || ((500..600).contains(&status) && !matches!(status, 501 | 505))
+}
+
+/// 发送阶段错误是否值得重试。
+///
+/// 连接/TLS/请求发送失败通常发生在请求被上游处理之前；超时可能已经在上游
+/// 产生副作用，构造/编码错误重试也会得到同样结果，都不重试。
+fn is_retryable_upstream_send_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .is_some_and(|error| {
+            !error.is_timeout()
+                && !error.is_builder()
+                && !error.is_body()
+                && !error.is_decode()
+                && !error.is_redirect()
+                && !error.is_status()
+        })
+}
+
+/// 单次请求的退避状态。只用于把瞬时失败挡在 Codex 之前，不跨请求持久化。
+struct ProxyAutoRetry {
+    remaining: u32,
+    next_delay: Duration,
+    waited: Duration,
+}
+
+impl ProxyAutoRetry {
+    fn from_settings(settings: &crate::settings::BackendSettings) -> Option<Self> {
+        if !settings.protocol_proxy_auto_retry {
+            return None;
+        }
+        let attempts = settings.protocol_proxy_auto_retry_max_attempts;
+        if attempts == 0 {
+            return None;
+        }
+        let base = Duration::from_secs(settings.protocol_proxy_auto_retry_interval_seconds)
+            .max(PROXY_AUTO_RETRY_MIN_DELAY);
+        Some(Self {
+            remaining: attempts,
+            next_delay: base,
+            waited: Duration::ZERO,
+        })
+    }
+
+    /// 返回本次应等待的时长；None 表示重试预算已用尽。
+    /// Retry-After 优先，但同样受单次上限与总预算约束。
+    fn schedule(&mut self, retry_after: Option<Duration>) -> Option<Duration> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let delay = retry_after
+            .unwrap_or(self.next_delay)
+            .clamp(PROXY_AUTO_RETRY_MIN_DELAY, PROXY_AUTO_RETRY_MAX_DELAY);
+        if self.waited.saturating_add(delay) > PROXY_AUTO_RETRY_TOTAL_BUDGET {
+            return None;
+        }
+        self.remaining -= 1;
+        self.waited += delay;
+        self.next_delay = self
+            .next_delay
+            .saturating_mul(2)
+            .min(PROXY_AUTO_RETRY_MAX_DELAY);
+        Some(delay)
+    }
+}
+
+/// 等待并在诊断日志里留痕；返回 false 表示本次不重试。
+async fn schedule_proxy_auto_retry(
+    state: &mut Option<ProxyAutoRetry>,
+    relay: &crate::settings::RelayProfile,
+    request_attempt: usize,
+    reason: &str,
+    retry_after: Option<Duration>,
+) -> bool {
+    let Some(state) = state.as_mut() else {
+        return false;
+    };
+    let Some(delay) = state.schedule(retry_after) else {
+        return false;
+    };
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "protocol_proxy.upstream_auto_retry",
+        json!({
+            "relayId": relay.id,
+            "relayName": relay.name,
+            "reason": reason,
+            "requestAttempt": request_attempt,
+            "delayMs": delay.as_millis(),
+            "retriesRemaining": state.remaining,
+        }),
+    );
+    tokio::time::sleep(delay).await;
+    true
+}
 const MAX_NATIVE_COMPACTION_PROBE_BODY_BYTES: usize = 32 * 1024 * 1024;
 const THINK_OPEN_TAG: &str = "<think>";
 const THINK_CLOSE_TAG: &str = "</think>";
@@ -2629,7 +2740,19 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     let strict_aggregate_model = aggregate_model.is_some();
     let relay_count = relays.len();
     let mut exec_negotiation_used = false;
-    for (attempt, relay) in relays.iter().cloned().enumerate() {
+    let mut auto_retry = ProxyAutoRetry::from_settings(&settings);
+    let mut request_attempt = 0_usize;
+    // 外层循环负责两件事：按候选成员顺序尝试（成员间失败切换仍是立即的），
+    // 以及全部候选都失败且错误可重试时退避后从第一个成员重新开始一轮。
+    let mut candidate_index = 0_usize;
+    'request_attempts: loop {
+        if candidate_index >= relay_count {
+            anyhow::bail!("未找到可用的聚合供应商成员")
+        }
+        let attempt = candidate_index;
+        candidate_index += 1;
+        let relay = relays[attempt].clone();
+        request_attempt += 1;
         let has_more_candidates = attempt + 1 < relay_count;
         validate_upstream(&relay)?;
         // 官方登录成员：用该账号 OAuth 凭据发往 chatgpt.com，而不是 API Key。
@@ -2770,6 +2893,20 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 if has_more_candidates {
                     continue;
                 }
+                if !is_compaction_request
+                    && is_retryable_upstream_send_error(&error)
+                    && schedule_proxy_auto_retry(
+                        &mut auto_retry,
+                        &relay,
+                        request_attempt,
+                        "upstream_send_error",
+                        None,
+                    )
+                    .await
+                {
+                    candidate_index = 0;
+                    continue 'request_attempts;
+                }
                 return Err(error).with_context(|| {
                     format!(
                         "供应商「{}」请求上游失败，endpoint: {}",
@@ -2844,6 +2981,20 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                             if has_more_candidates {
                                 continue;
                             }
+                            if !is_compaction_request
+                                && is_retryable_upstream_send_error(&error)
+                                && schedule_proxy_auto_retry(
+                                    &mut auto_retry,
+                                    &relay,
+                                    request_attempt,
+                                    "official_login_retry_send_error",
+                                    None,
+                                )
+                                .await
+                            {
+                                candidate_index = 0;
+                                continue 'request_attempts;
+                            }
                             return Err(error).with_context(|| {
                                 format!(
                                     "供应商「{}」请求上游失败，endpoint: {}",
@@ -2903,6 +3054,20 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     }
                     if has_more_candidates {
                         continue;
+                    }
+                    if !is_compaction_request
+                        && is_retryable_upstream_send_error(&error)
+                        && schedule_proxy_auto_retry(
+                            &mut auto_retry,
+                            &relay,
+                            request_attempt,
+                            "exec_compatibility_retry_send_error",
+                            None,
+                        )
+                        .await
+                    {
+                        candidate_index = 0;
+                        continue 'request_attempts;
                     }
                     return Err(error);
                 }
@@ -3186,47 +3351,69 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 },
             );
         }
-        if (200..300).contains(&status_code) || !has_more_candidates {
-            // 请求了 SSE 的兼容上游也可能返回 JSON 摘要；让调用方选择 JSON 包装器。
-            let json_compaction = is_compaction_request
-                && content_type
-                    .split(';')
-                    .next()
-                    .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"));
-            return Ok(UpstreamProxyResponse {
-                status_code,
-                is_stream: (is_stream && !json_compaction)
-                    || content_type.contains("text/event-stream"),
-                content_type,
-                wire_api,
-                compaction: is_compaction_request,
-                native_compaction_passthrough: false,
-                buffered_body: None,
-                exec_adapted,
-                exec_outcome: (exec_adapted && (200..300).contains(&status_code)).then(|| {
-                    crate::responses_exec_transport::ExecOutcome::new(
-                        key.expect("adapted request has a cache identity"), &settings,
-                    )
-                }),
-                response: Some(upstream),
-            });
+        if !(200..300).contains(&status_code) {
+            if has_more_candidates {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "protocol_proxy.upstream_failover",
+                    json!({
+                        "relayId": relay.id,
+                        "relayName": relay.name,
+                        "endpoint": endpoint,
+                        "wireApi": wire_api,
+                        "stream": is_stream,
+                        "statusCode": status_code,
+                        "attempt": attempt + 1,
+                        "candidateCount": relay_count,
+                        "headerTimeoutSeconds": header_timeout.as_secs()
+                    }),
+                );
+                continue;
+            }
+            // 容量/限流/网关类错误：先在本地代理退避重试，Codex 看不到这次失败。
+            // 压缩请求不参与自动重试：压缩重复执行代价高，且既有语义是错误直接透传。
+            if !is_compaction_request && is_retryable_upstream_status(status_code) {
+                let reason = format!("upstream_status_{status_code}");
+                let retry_after =
+                    exec_retry_after_duration(upstream.headers(), SystemTime::now());
+                if schedule_proxy_auto_retry(
+                    &mut auto_retry,
+                    &relay,
+                    request_attempt,
+                    &reason,
+                    retry_after,
+                )
+                .await
+                {
+                    candidate_index = 0;
+                    continue 'request_attempts;
+                }
+            }
         }
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "protocol_proxy.upstream_failover",
-            json!({
-                "relayId": relay.id,
-                "relayName": relay.name,
-                "endpoint": endpoint,
-                "wireApi": wire_api,
-                "stream": is_stream,
-                "statusCode": status_code,
-                "attempt": attempt + 1,
-                "candidateCount": relay_count,
-                "headerTimeoutSeconds": header_timeout.as_secs()
+        // 成功，或重试预算用尽：把（最后一个）上游响应交给 Codex。
+        // 请求了 SSE 的兼容上游也可能返回 JSON 摘要；让调用方选择 JSON 包装器。
+        let json_compaction = is_compaction_request
+            && content_type
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"));
+        return Ok(UpstreamProxyResponse {
+            status_code,
+            is_stream: (is_stream && !json_compaction)
+                || content_type.contains("text/event-stream"),
+            content_type,
+            wire_api,
+            compaction: is_compaction_request,
+            native_compaction_passthrough: false,
+            buffered_body: None,
+            exec_adapted,
+            exec_outcome: (exec_adapted && (200..300).contains(&status_code)).then(|| {
+                crate::responses_exec_transport::ExecOutcome::new(
+                    key.expect("adapted request has a cache identity"), &settings,
+                )
             }),
-        );
+            response: Some(upstream),
+        });
     }
-    anyhow::bail!("未找到可用的聚合供应商成员")
 }
 
 fn select_model_route(
@@ -9535,6 +9722,76 @@ mod exec_retry_after_tests {
                 None,
                 "{value}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod proxy_auto_retry_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_enabled_with_five_retries_and_two_second_backoff() {
+        let state = ProxyAutoRetry::from_settings(&crate::settings::BackendSettings::default())
+            .expect("默认开启自动重试");
+        assert_eq!(state.remaining, 5);
+        assert_eq!(state.next_delay, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn disabled_switch_or_zero_attempts_disables_retry() {
+        let mut settings = crate::settings::BackendSettings::default();
+        settings.protocol_proxy_auto_retry = false;
+        assert!(ProxyAutoRetry::from_settings(&settings).is_none());
+        settings.protocol_proxy_auto_retry = true;
+        settings.protocol_proxy_auto_retry_max_attempts = 0;
+        assert!(ProxyAutoRetry::from_settings(&settings).is_none());
+    }
+
+    #[test]
+    fn schedule_uses_exponential_backoff_and_stops_at_attempt_limit() {
+        let mut settings = crate::settings::BackendSettings::default();
+        settings.protocol_proxy_auto_retry_interval_seconds = 1;
+        settings.protocol_proxy_auto_retry_max_attempts = 3;
+        let mut state = ProxyAutoRetry::from_settings(&settings).unwrap();
+        assert_eq!(state.schedule(None), Some(Duration::from_secs(1)));
+        assert_eq!(state.schedule(None), Some(Duration::from_secs(2)));
+        assert_eq!(state.schedule(None), Some(Duration::from_secs(4)));
+        assert_eq!(state.schedule(None), None);
+    }
+
+    #[test]
+    fn schedule_prefers_retry_after_but_caps_single_wait() {
+        let mut settings = crate::settings::BackendSettings::default();
+        settings.protocol_proxy_auto_retry_max_attempts = 2;
+        let mut state = ProxyAutoRetry::from_settings(&settings).unwrap();
+        assert_eq!(
+            state.schedule(Some(Duration::from_secs(120))),
+            Some(PROXY_AUTO_RETRY_MAX_DELAY)
+        );
+        // Retry-After 不参与指数序列：下一次仍按设置的基数退避。
+        assert_eq!(state.schedule(None), Some(Duration::from_secs(4)));
+    }
+
+    #[test]
+    fn schedule_respects_total_wait_budget() {
+        let mut settings = crate::settings::BackendSettings::default();
+        settings.protocol_proxy_auto_retry_interval_seconds = 30;
+        settings.protocol_proxy_auto_retry_max_attempts = 20;
+        let mut state = ProxyAutoRetry::from_settings(&settings).unwrap();
+        for _ in 0..4 {
+            assert_eq!(state.schedule(None), Some(PROXY_AUTO_RETRY_MAX_DELAY));
+        }
+        assert_eq!(state.schedule(None), None);
+    }
+
+    #[test]
+    fn retryable_statuses_exclude_protocol_failures() {
+        for status in [408, 429, 500, 502, 503, 504, 520, 529] {
+            assert!(is_retryable_upstream_status(status), "{status}");
+        }
+        for status in [400, 401, 403, 404, 422, 501, 505] {
+            assert!(!is_retryable_upstream_status(status), "{status}");
         }
     }
 }
