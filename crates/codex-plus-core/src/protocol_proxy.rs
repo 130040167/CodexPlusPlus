@@ -10199,7 +10199,15 @@ mod parallel_tool_call_pairing_tests {
         ], "tools": [{"type": "custom", "name": "view_image"}, {"type": "custom", "name": "exec"}]});
 
         let (_, out, _, _) =
-            upstream_request_parts(&relay, body, "/v1/responses", None, false, None)
+            upstream_request_parts(
+                &relay,
+                body,
+                "/v1/responses",
+                None,
+                false,
+                None,
+                ProxySessionHeaders::default(),
+            )
                 .await
                 .unwrap();
         assert_pairing(&out, 3);
