@@ -88,7 +88,7 @@
     {
       "name": "84-proxy-request-status.js",
       "description": "输入框上方的请求避震状态条：正在请求 / 等待上游 / 正在重试 / 正在生成",
-      "lines": 218
+      "lines": 206
     },
     {
       "name": "90-action-groups.js",
