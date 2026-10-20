@@ -1888,7 +1888,9 @@ async fn handle_helper_connection(
             "helper.backend_status_ok",
         )
     } else if path == "/proxy-status" && matches!(method, "GET" | "POST" | "OPTIONS") {
-        let requests = crate::request_log::running_requests()
+        let mut active = crate::request_log::running_requests();
+        active.sort_by_key(|entry| std::cmp::Reverse(entry.started_at_ms));
+        let requests = active
             .into_iter()
             .map(|entry| {
                 serde_json::json!({
