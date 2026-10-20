@@ -5456,6 +5456,21 @@ function formatRequestLogTokens(value?: number | null) {
   return String(value);
 }
 
+/** 缓存命中率展示：≥99% 保留一位小数，只有完全命中才显示 100%。 */
+function formatRequestLogCacheHitRatio(
+  inputTokens?: number | null,
+  cachedTokens?: number | null,
+  ratio?: number | null,
+) {
+  const input = inputTokens ?? 0;
+  const cached = cachedTokens ?? 0;
+  if (input <= 0 || cached <= 0) return "-";
+  if (cached >= input) return "100%";
+  const percent = (ratio ?? cached / input) * 100;
+  if (percent >= 99) return `${percent.toFixed(1)}%`;
+  return `${Math.round(percent)}%`;
+}
+
 function formatRequestLogDuration(durationMs: number) {
   if (!Number.isFinite(durationMs) || durationMs < 0) return "-";
   if (durationMs < 1000) return `${durationMs}ms`;
@@ -5680,7 +5695,14 @@ function RequestLogScreen() {
                     ) : entry.usage?.cachedTokens ? (
                       <>
                         {formatRequestLogTokens(entry.usage.cachedTokens)}
-                        <small> · {Math.round((entry.cacheHitRatio ?? 0) * 100)}%</small>
+                        <small>
+                          {" · "}
+                          {formatRequestLogCacheHitRatio(
+                            entry.usage.inputTokens,
+                            entry.usage.cachedTokens,
+                            entry.cacheHitRatio,
+                          )}
+                        </small>
                       </>
                     ) : "-"}
                   </span>
