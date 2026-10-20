@@ -177,6 +177,12 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的统一管理应用，通
   </tr>
   <tr>
     <td colspan="2" valign="top">
+      <h3>🛡️ 请求避震</h3>
+      在代理层吸收上游过载：模型容量/过载错误（server_overloaded、server_is_overloaded、at capacity 等）自动退避重试，不再把 Codex 的会话频繁打断。可在「代理设置 → 请求避震」切换两种模式：<strong>流式避震</strong>保留实时输出，首字后把过载错误交给 Codex 原生重试；<strong>整段缓冲避震</strong>先收完整段响应再转发，任何时点的过载都由代理重试（代价是失去流式）。请求日志会实时显示进行中的请求、首字耗时与完整耗时。
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2" valign="top">
       <h3>📊 用量状态栏</h3>
       在输入框下方实时显示生成速度、缓存命中率和上下文占用；数据取自本机 Codex 会话记录，上下文占比按 Codex 识别到的每模型窗口计算。默认开启，可在「Codex 增强 → 常用增强 → 用量状态栏」关闭。
     </td>

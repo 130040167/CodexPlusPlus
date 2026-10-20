@@ -5657,10 +5657,16 @@ function RequestLogScreen() {
                   >
                     {requestLogRetryLabel(entry)}
                   </span>
-                  <span>{formatRequestLogTokens(entry.usage?.inputTokens)}</span>
-                  <span>{formatRequestLogTokens(entry.usage?.outputTokens)}</span>
+                  <span className="request-log-muted" title={entry.state === "running" ? t("token 用量由上游在请求完成时返回，流式过程中无法准确统计") : ""}>
+                    {entry.state === "running" ? t("流式中") : formatRequestLogTokens(entry.usage?.inputTokens)}
+                  </span>
+                  <span className="request-log-muted" title={entry.state === "running" ? t("token 用量由上游在请求完成时返回，流式过程中无法准确统计") : ""}>
+                    {entry.state === "running" ? t("流式中") : formatRequestLogTokens(entry.usage?.outputTokens)}
+                  </span>
                   <span>
-                    {entry.usage?.cachedTokens ? (
+                    {entry.state === "running" ? (
+                      <span className="request-log-muted">{t("流式中")}</span>
+                    ) : entry.usage?.cachedTokens ? (
                       <>
                         {formatRequestLogTokens(entry.usage.cachedTokens)}
                         <small> · {Math.round((entry.cacheHitRatio ?? 0) * 100)}%</small>

@@ -169,6 +169,11 @@
       <h3>API Key 也能用原生 Fast</h3>
       <p>纯 API Key 模式恢复 Codex 的原生 Fast 开关，沿用 Standard / ⚡ Fast 控件。默认关闭，模型需声明 Fast（priority）支持；实际可用性与计费由供应商决定。</p>
     </article>
+    <article class="fcard tilt">
+      <span class="fcard-no mono">12</span>
+      <h3>请求避震</h3>
+      <p>模型容量/过载错误（server_overloaded、server_is_overloaded、at capacity）在代理层自动退避重试，不再频繁打断 Codex 会话。流式避震保留实时输出；整段缓冲避震先收完整段响应再转发，任何时点的过载都由代理吸收。请求日志实时显示进行中请求、首字耗时与完整耗时。</p>
+    </article>
   </div>
 </section>
 

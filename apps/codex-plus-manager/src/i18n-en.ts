@@ -669,6 +669,9 @@ export const EN_PLAIN: Record<string, string> = {
   "代理设置": "Proxy settings",
   "请求日志": "Request log",
   "进行中": "In progress",
+  "流式中": "Streaming…",
+  "token 用量由上游在请求完成时返回，流式过程中无法准确统计":
+    "Token usage is returned by the upstream when the request completes; it cannot be measured accurately mid-stream",
   "首字耗时": "Time to first token",
   "首字 {0}": "First token {0}",
   "查看代理请求的状态、模型、重试、token 用量与缓存命中":
