@@ -278,42 +278,14 @@ const UPSTREAM_IMAGE_HEADER_TIMEOUT: Duration = Duration::from_secs(600);
 const UPSTREAM_CONNECT_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_millis(150), Duration::from_millis(400)];
 
-/// 协议代理自动重试：单次等待上限。上游给的 Retry-After 也受此约束，
-/// 避免一个长退避把 Codex 的请求挂太久。
+/// 容量错误自动重试：单次等待上限，避免把 Codex 的请求挂太久。
 const PROXY_AUTO_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
-/// 单次请求内的总等待预算；用完后把最后一个上游错误原样交给 Codex。
+/// 容量错误重试的总等待预算；用完后把最后一个上游错误原样交给 Codex。
 const PROXY_AUTO_RETRY_TOTAL_BUDGET: Duration = Duration::from_secs(120);
 /// 即使用户把间隔设成 0 秒，也给一个短地板值，避免容量错误被打成热循环。
 const PROXY_AUTO_RETRY_MIN_DELAY: Duration = Duration::from_millis(250);
 
-/// 上游状态码是否值得在代理层重试。
-///
-/// 408/429 与大多数 5xx 表示请求没有被上游处理，或只是网关瞬时故障；
-/// 501/505 属于协议/配置错误，重试不会改变结果。
-fn is_retryable_upstream_status(status: u16) -> bool {
-    matches!(status, 408 | 429)
-        || ((500..600).contains(&status) && !matches!(status, 501 | 505))
-}
-
-/// 发送阶段错误是否值得重试。
-///
-/// 连接/TLS/请求发送失败通常发生在请求被上游处理之前；超时可能已经在上游
-/// 产生副作用，构造/编码错误重试也会得到同样结果，都不重试。
-fn is_retryable_upstream_send_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
-        .is_some_and(|error| {
-            !error.is_timeout()
-                && !error.is_builder()
-                && !error.is_body()
-                && !error.is_decode()
-                && !error.is_redirect()
-                && !error.is_status()
-        })
-}
-
-/// 单次请求的退避状态。只用于把瞬时失败挡在 Codex 之前，不跨请求持久化。
+/// 容量错误的退避状态。只用于官方 server_overloaded 的 200 流内失败，不跨请求持久化。
 struct ProxyAutoRetry {
     remaining: u32,
     next_delay: Duration,
@@ -3078,21 +3050,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 if has_more_candidates {
                     continue;
                 }
-                if !is_compaction_request
-                    && is_retryable_upstream_send_error(&error)
-                    && schedule_proxy_auto_retry(
-                        &mut auto_retry,
-                        &relay,
-                        request_attempt,
-                        "upstream_send_error",
-                        None,
-                    
-                        &mut retry_reasons,)
-                    .await
-                {
-                    candidate_index = 0;
-                    continue 'request_attempts;
-                }
+
                 return Err(error).with_context(|| {
                     format!(
                         "供应商「{}」请求上游失败，endpoint: {}",
@@ -3167,21 +3125,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                             if has_more_candidates {
                                 continue;
                             }
-                            if !is_compaction_request
-                                && is_retryable_upstream_send_error(&error)
-                                && schedule_proxy_auto_retry(
-                                    &mut auto_retry,
-                                    &relay,
-                                    request_attempt,
-                                    "official_login_retry_send_error",
-                                    None,
-                                
-                                    &mut retry_reasons,)
-                                .await
-                            {
-                                candidate_index = 0;
-                                continue 'request_attempts;
-                            }
+
                             return Err(error).with_context(|| {
                                 format!(
                                     "供应商「{}」请求上游失败，endpoint: {}",
@@ -3242,21 +3186,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     if has_more_candidates {
                         continue;
                     }
-                    if !is_compaction_request
-                        && is_retryable_upstream_send_error(&error)
-                        && schedule_proxy_auto_retry(
-                            &mut auto_retry,
-                            &relay,
-                            request_attempt,
-                            "exec_compatibility_retry_send_error",
-                            None,
-                        
-                            &mut retry_reasons,)
-                        .await
-                    {
-                        candidate_index = 0;
-                        continue 'request_attempts;
-                    }
+
                     return Err(error);
                 }
             };
@@ -3571,26 +3501,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 );
                 continue;
             }
-            // 容量/限流/网关类错误：先在本地代理退避重试，Codex 看不到这次失败。
-            // 压缩请求不参与自动重试：压缩重复执行代价高，且既有语义是错误直接透传。
-            if !is_compaction_request && is_retryable_upstream_status(status_code) {
-                let reason = format!("upstream_status_{status_code}");
-                let retry_after =
-                    exec_retry_after_duration(upstream.headers(), SystemTime::now());
-                if schedule_proxy_auto_retry(
-                    &mut auto_retry,
-                    &relay,
-                    request_attempt,
-                    &reason,
-                    retry_after,
-                
-                    &mut retry_reasons,)
-                .await
-                {
-                    candidate_index = 0;
-                    continue 'request_attempts;
-                }
-            }
+                        
         }
         // 200 的流式响应也可能带着 response.failed（官方 server_overloaded
         // 就是先回 200 再在流里失败）。在向 Codex 写出任何字节前按住开头的
@@ -10124,15 +10035,7 @@ mod proxy_auto_retry_tests {
         assert!(stream_failure_is_retryable(Some("server_overloaded"), None));
     }
 
-    #[test]
-    fn retryable_statuses_exclude_protocol_failures() {
-        for status in [408, 429, 500, 502, 503, 504, 520, 529] {
-            assert!(is_retryable_upstream_status(status), "{status}");
-        }
-        for status in [400, 401, 403, 404, 422, 501, 505] {
-            assert!(!is_retryable_upstream_status(status), "{status}");
-        }
-    }
+
 }
 
 #[cfg(test)]

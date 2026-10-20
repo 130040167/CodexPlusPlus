@@ -10725,14 +10725,24 @@ select {
 }
 
 /* ── 请求日志页 ──────────────────────────────────────────────── */
+.request-log-panel {
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+
 .request-log-content {
   display: flex;
+  min-width: 0;
+  max-width: 100%;
   flex-direction: column;
   gap: 12px;
+  overflow: hidden;
 }
 
 .request-log-toolbar {
   display: flex;
+  min-width: 0;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
@@ -10740,10 +10750,10 @@ select {
 
 .request-log-search {
   display: flex;
-  flex: 1;
+  flex: 1 1 260px;
   align-items: center;
   gap: 6px;
-  min-width: 220px;
+  min-width: 180px;
 }
 
 .request-log-search svg {
@@ -10771,6 +10781,8 @@ select {
 }
 
 .request-log-table {
+  width: 100%;
+  max-width: 100%;
   overflow-x: auto;
   border: 1px solid hsl(var(--border));
   border-radius: 10px;
@@ -10778,11 +10790,11 @@ select {
 
 .request-log-row {
   display: grid;
-  grid-template-columns: 92px 56px 130px minmax(150px, 1.4fr) 92px 72px 72px 100px 72px 52px;
+  grid-template-columns: 74px 44px 100px minmax(110px, 1.4fr) 74px 54px 54px 80px 54px;
   gap: 8px;
   align-items: center;
   width: 100%;
-  min-width: 1020px;
+  min-width: 760px;
   border: 0;
   padding: 8px 12px;
   color: inherit;

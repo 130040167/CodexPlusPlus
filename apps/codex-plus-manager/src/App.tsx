@@ -5290,7 +5290,7 @@ function ProxySettingsScreen({
       <Panel>
         <CardHead
           title={t("协议代理自动重试")}
-          detail={t("在本地协议代理内部自动重试上游瞬时失败，不把错误交给 Codex")}
+          detail={t("在本地协议代理内部自动重试上游容量错误，不把错误交给 Codex")}
         />
         <CardContent className="settings-content">
           <div className="settings-block">
@@ -5305,7 +5305,7 @@ function ProxySettingsScreen({
               <span>{t("启用协议代理自动重试")}</span>
             </label>
             <p className="field-hint">
-              {t("只对经过本地协议代理的请求生效（聚合供应商、协议转换、模型路由）。代理会在把错误交给 Codex 之前，自行等待并重试连接失败、429/5xx，以及 200 流式响应里的容量错误（response.failed）；重试期间 Codex 不会出现失败提示。")}
+              {t("只对经过本地协议代理、且以 200 流式响应返回的模型容量错误（server_overloaded / at capacity，response.failed）生效。连接失败、429/5xx 等其它错误不会重试，直接返回给 Codex。")}
             </p>
             <div className="form-row">
               <Field label={t("最多自动重试次数")}>
@@ -5518,7 +5518,7 @@ function RequestLogScreen() {
   }, [entries, filter, query]);
 
   return (
-    <Panel>
+    <Panel className="request-log-panel">
       <CardHead
         title={t("请求日志")}
         detail={tf("最近 {0} 条代理请求，含状态、模型、重试与 token 用量", [String(entries.length)])}
@@ -5581,7 +5581,6 @@ function RequestLogScreen() {
               <span>{t("输出")}</span>
               <span>{t("缓存")}</span>
               <span>{t("耗时")}</span>
-              <span>{t("协议")}</span>
             </div>
             {filtered.map((entry) => (
               <Fragment key={entry.id}>
@@ -5620,7 +5619,6 @@ function RequestLogScreen() {
                     ) : "-"}
                   </span>
                   <span>{formatRequestLogDuration(entry.durationMs)}</span>
-                  <span>{entry.stream ? "SSE" : "JSON"}</span>
                 </button>
                 {expanded === entry.id ? (
                   <div className="request-log-detail">
@@ -5632,6 +5630,7 @@ function RequestLogScreen() {
                       <div><dt>{t("尝试次数")}</dt><dd>{entry.attempts || "-"}</dd></div>
                       <div><dt>{t("自动重试")}</dt><dd>{entry.autoRetries}</dd></div>
                       <div><dt>{t("重试原因")}</dt><dd>{(entry.retryReasons ?? []).join("、") || "-"}</dd></div>
+                      <div><dt>{t("流式")}</dt><dd>{entry.stream ? "SSE" : "JSON"}</dd></div>
                       <div><dt>{t("流结果")}</dt><dd>{entry.streamOutcome || "-"}</dd></div>
                       <div><dt>{t("推理 tokens")}</dt><dd>{formatRequestLogTokens(entry.usage?.reasoningTokens)}</dd></div>
                       <div><dt>{t("错误")}</dt><dd>{entry.error || "-"}</dd></div>
