@@ -3663,6 +3663,9 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 "wireApi": wire_api,
                 "stream": is_stream,
                 "statusCode": status_code,
+                "contentType": content_type,
+                "autoRetryMode": settings.protocol_proxy_auto_retry_mode,
+                "bufferedMode": buffered_mode,
                 "attempt": attempt + 1,
                 "candidateCount": relay_count,
                 "headerTimeoutSeconds": header_timeout.as_secs(),
@@ -3711,7 +3714,6 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         if is_stream
             && (200..300).contains(&status_code)
             && wire_api == UpstreamWireApi::Responses
-            && content_type.contains("text/event-stream")
             && !is_compaction_request
             && !exec_adapted
             && auto_retry.is_some()
@@ -3781,7 +3783,6 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         } else if is_stream
             && (200..300).contains(&status_code)
             && wire_api == UpstreamWireApi::Responses
-            && content_type.contains("text/event-stream")
             && !is_compaction_request
             && !exec_adapted
             && auto_retry.is_some()
