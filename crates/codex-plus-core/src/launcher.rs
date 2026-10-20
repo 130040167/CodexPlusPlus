@@ -2381,10 +2381,10 @@ impl ProxyRequestLog {
     }
 
     /// 记录首字耗时（从请求开始到第一段上游输出）。只记第一次。
-    fn mark_first_token(&mut self) {
+    fn mark_first_token_at(&mut self, first_output_at_ms: u64) {
         if self.entry.first_token_ms.is_none() {
             self.entry.first_token_ms =
-                Some(current_time_ms().saturating_sub(self.entry.started_at_ms));
+                Some(first_output_at_ms.saturating_sub(self.entry.started_at_ms));
             self.entry.phase = Some("generating".to_string());
             crate::request_log::update_running(&self.entry);
         }
@@ -2665,9 +2665,8 @@ async fn handle_protocol_proxy_connection(
             stream.shutdown().await?;
             return Ok(());
         }
-        request_log.mark_first_token();
         let stream_prefix = std::mem::take(&mut upstream.stream_prefix);
-        let (failure, usage, failure_detail) = forward_protocol_proxy_stream(
+        let (failure, usage, failure_detail, first_output_at_ms) = forward_protocol_proxy_stream(
             stream,
             &stream_prefix,
             upstream.take_response()?,
@@ -2675,6 +2674,9 @@ async fn handle_protocol_proxy_connection(
             request_json.as_ref(),
         )
         .await?;
+        if let Some(first_output_at_ms) = first_output_at_ms {
+            request_log.mark_first_token_at(first_output_at_ms);
+        }
         let failure_detail_for_log = failure_detail.clone();
         request_log.record_stream(failure.as_deref(), usage, failure_detail);
         if let Some(reason) = failure {
@@ -3293,8 +3295,10 @@ async fn forward_protocol_proxy_stream(
     Option<String>,
     Option<crate::request_log::RequestUsage>,
     Option<String>,
+    Option<u64>,
 )> {
     let mut chunks = response.bytes_stream();
+    let mut first_output_at_ms = None;
     if wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
         let mut transformer = crate::protocol_proxy::ResponsesSseTransformer::for_request(request);
         // 代理预读过的开头必须先原样补写，否则 Codex 会丢掉 response.created 等事件。
@@ -3304,12 +3308,15 @@ async fn forward_protocol_proxy_stream(
             if transformer.has_failed() {
                 let usage = transformer.take_usage();
                 let detail = transformer.take_failure_detail();
-                return Ok((transformer.finish(), usage, detail));
+                return Ok((transformer.finish(), usage, detail, first_output_at_ms));
             }
         }
         while let Some(chunk) = chunks.next().await {
             match chunk {
                 Ok(bytes) => {
+                    if !bytes.is_empty() && first_output_at_ms.is_none() {
+                        first_output_at_ms = Some(current_time_ms());
+                    }
                     let out = transformer.push_bytes(&bytes);
                     stream.write_all(&out).await?;
                     // 超限等终态失败要立即结束流，不能等上游 EOF；
@@ -3317,19 +3324,24 @@ async fn forward_protocol_proxy_stream(
                     if transformer.has_failed() {
                         let usage = transformer.take_usage();
                         let detail = transformer.take_failure_detail();
-                        return Ok((transformer.finish(), usage, detail));
+                        return Ok((transformer.finish(), usage, detail, first_output_at_ms));
                     }
                 }
                 Err(error) => {
                     let usage = transformer.take_usage();
                     let detail = transformer.take_failure_detail();
-                    return Ok((Some(error.without_url().to_string()), usage, detail));
+                    return Ok((
+                        Some(error.without_url().to_string()),
+                        usage,
+                        detail,
+                        first_output_at_ms,
+                    ));
                 }
             }
         }
         let usage = transformer.take_usage();
         let detail = transformer.take_failure_detail();
-        return Ok((transformer.finish(), usage, detail));
+        return Ok((transformer.finish(), usage, detail, first_output_at_ms));
     }
     if wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages {
         // Anthropic SSE → chat SSE → Responses SSE，终端事件语义与 chat 上游一致。
@@ -3339,12 +3351,20 @@ async fn forward_protocol_proxy_stream(
         while let Some(chunk) = chunks.next().await {
             match chunk {
                 Ok(bytes) => {
+                    if !bytes.is_empty() && first_output_at_ms.is_none() {
+                        first_output_at_ms = Some(current_time_ms());
+                    }
                     let converted = converter.push_bytes(&bytes);
                     if !converted.is_empty() {
                         stream.write_all(&converted).await?;
                     }
                     if converter.has_failed() {
-                        return Ok((Some("上游返回了流式错误事件".to_string()), None, None));
+                        return Ok((
+                            Some("上游返回了流式错误事件".to_string()),
+                            None,
+                            None,
+                            first_output_at_ms,
+                        ));
                     }
                 }
                 Err(error) => {
@@ -3353,7 +3373,12 @@ async fn forward_protocol_proxy_stream(
                         Some("stream_error".to_string()),
                     );
                     stream.write_all(&failed).await?;
-                    return Ok((Some(error.without_url().to_string()), None, None));
+                    return Ok((
+                        Some(error.without_url().to_string()),
+                        None,
+                        None,
+                        first_output_at_ms,
+                    ));
                 }
             }
         }
@@ -3365,10 +3390,15 @@ async fn forward_protocol_proxy_stream(
                 Some("stream_incomplete".to_string()),
             );
             stream.write_all(&failed).await?;
-            return Ok((Some("上游缺少完成事件".to_string()), None, None));
+            return Ok((
+                Some("上游缺少完成事件".to_string()),
+                None,
+                None,
+                first_output_at_ms,
+            ));
         }
         stream.write_all(&converter.finish()).await?;
-        return Ok((None, None, None));
+        return Ok((None, None, None, first_output_at_ms));
     }
     let mut converter = request
         .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
@@ -3376,10 +3406,18 @@ async fn forward_protocol_proxy_stream(
     while let Some(chunk) = chunks.next().await {
         match chunk {
             Ok(bytes) => {
+                if !bytes.is_empty() && first_output_at_ms.is_none() {
+                    first_output_at_ms = Some(current_time_ms());
+                }
                 let converted = converter.push_bytes(&bytes);
                 stream.write_all(&converted).await?;
                 if converter.has_failed() {
-                    return Ok((Some("上游返回了流式错误事件".to_string()), None, None));
+                    return Ok((
+                        Some("上游返回了流式错误事件".to_string()),
+                        None,
+                        None,
+                        first_output_at_ms,
+                    ));
                 }
             }
             Err(error) => {
@@ -3388,7 +3426,12 @@ async fn forward_protocol_proxy_stream(
                     Some("stream_error".to_string()),
                 );
                 stream.write_all(&failed).await?;
-                return Ok((Some(error.without_url().to_string()), None, None));
+                return Ok((
+                    Some(error.without_url().to_string()),
+                    None,
+                    None,
+                    first_output_at_ms,
+                ));
             }
         }
     }
@@ -3399,10 +3442,15 @@ async fn forward_protocol_proxy_stream(
             Some("stream_incomplete".to_string()),
         );
         stream.write_all(&failed).await?;
-        return Ok((Some("上游缺少完成事件".to_string()), None, None));
+        return Ok((
+            Some("上游缺少完成事件".to_string()),
+            None,
+            None,
+            first_output_at_ms,
+        ));
     }
     stream.write_all(&converter.finish()).await?;
-    Ok((None, None, None))
+    Ok((None, None, None, first_output_at_ms))
 }
 
 fn log_helper_response(
@@ -6933,6 +6981,7 @@ mod tests {
 mod proxy_stream_tests {
     use super::forward_protocol_proxy_stream;
     use crate::protocol_proxy::UpstreamWireApi;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn forward_fixture(
@@ -6940,7 +6989,10 @@ mod proxy_stream_tests {
         truncated: bool,
         wire: UpstreamWireApi,
     ) -> (Option<String>, String) {
-        forward_fixture_with_prefix(&[], body, truncated, wire).await
+        let (failure, output, _) =
+            forward_fixture_with_prefix_and_delay(&[], body, truncated, wire, Duration::ZERO)
+                .await;
+        (failure, output)
     }
 
     async fn forward_fixture_with_prefix(
@@ -6949,6 +7001,19 @@ mod proxy_stream_tests {
         truncated: bool,
         wire: UpstreamWireApi,
     ) -> (Option<String>, String) {
+        let (failure, output, _) =
+            forward_fixture_with_prefix_and_delay(prefix, body, truncated, wire, Duration::ZERO)
+                .await;
+        (failure, output)
+    }
+
+    async fn forward_fixture_with_prefix_and_delay(
+        prefix: &[u8],
+        body: &str,
+        truncated: bool,
+        wire: UpstreamWireApi,
+        initial_delay: Duration,
+    ) -> (Option<String>, String, Option<u64>) {
         let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = upstream.local_addr().unwrap();
         let body = body.to_owned();
@@ -6964,6 +7029,7 @@ mod proxy_stream_tests {
                 }
             }
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+            tokio::time::sleep(initial_delay).await;
             socket
                 .write_all(format!("{:X}\r\n{}\r\n", body.len(), body).as_bytes())
                 .await
@@ -6987,18 +7053,39 @@ mod proxy_stream_tests {
             .unwrap();
         let (mut writer, _) = downstream.accept().await.unwrap();
         let forwarded = tokio::spawn(async move {
-            let (result, _usage, _detail) =
+            let (result, _usage, _detail, first_output_at_ms) =
                 forward_protocol_proxy_stream(&mut writer, &prefix, response, wire, None)
                     .await
                     .unwrap();
             writer.shutdown().await.unwrap();
-            result
+            (result, first_output_at_ms)
         });
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await.unwrap();
-        let result = forwarded.await.unwrap();
+        let (result, first_output_at_ms) = forwarded.await.unwrap();
         upstream_task.await.unwrap();
-        (result, String::from_utf8(bytes).unwrap())
+        (result, String::from_utf8(bytes).unwrap(), first_output_at_ms)
+    }
+
+    #[tokio::test]
+    async fn first_output_timestamp_is_recorded_after_upstream_sends_data() {
+        let started_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let (_, _, first_output_at_ms) = forward_fixture_with_prefix_and_delay(
+            &[],
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n",
+            false,
+            UpstreamWireApi::ChatCompletions,
+            Duration::from_millis(80),
+        )
+        .await;
+        let first_output_at_ms = first_output_at_ms.expect("应记录上游首个数据块时间");
+        assert!(
+            first_output_at_ms >= started_at_ms + 50,
+            "首字时间不应在上游发送数据前记录: started={started_at_ms}, first={first_output_at_ms}"
+        );
     }
 
     #[tokio::test]
