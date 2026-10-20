@@ -670,6 +670,7 @@ export const EN_PLAIN: Record<string, string> = {
   "请求日志": "Request log",
   "进行中": "In progress",
   "流式中": "Streaming…",
+  "按流式增量估算，完成后会更新为准确值": "Estimated from streaming deltas; replaced with the exact value on completion",
   "token 用量由上游在请求完成时返回，流式过程中无法准确统计":
     "Token usage is returned by the upstream when the request completes; it cannot be measured accurately mid-stream",
   "首字耗时": "Time to first token",

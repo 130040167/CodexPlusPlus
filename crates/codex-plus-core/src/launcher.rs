@@ -2268,6 +2268,7 @@ impl ProxyRequestLog {
                 retry_reasons: Vec::new(),
                 state: Some("running".to_string()),
                 first_token_ms: None,
+                estimated_output_tokens: None,
                 error: None,
                 stream_outcome: None,
                 usage: None,
@@ -2389,13 +2390,15 @@ async fn handle_protocol_proxy_connection(
 ) -> anyhow::Result<()> {
     let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
     let mut request_log = ProxyRequestLog::begin(method, path, request_json.as_ref());
+    let live_request_id = request_log.entry.id.clone();
     let mut upstream =
-        match crate::protocol_proxy::open_responses_proxy_request_for_path_with_session_headers(
+        match crate::protocol_proxy::open_responses_proxy_request_for_path_with_session_headers_and_live_id(
             request_body,
             request_user_agent,
             path,
             request_beta_features,
             session_headers,
+            Some(live_request_id.as_str()),
         )
         .await
         {

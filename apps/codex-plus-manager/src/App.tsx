@@ -612,6 +612,8 @@ type RequestLogEntry = {
   state?: string | null;
   /** 首字耗时（毫秒）。 */
   firstTokenMs?: number | null;
+  /** 运行中按流式增量粗估的输出 token。 */
+  estimatedOutputTokens?: number | null;
   error?: string | null;
   streamOutcome?: string | null;
   usage?: RequestLogUsage | null;
@@ -5660,8 +5662,17 @@ function RequestLogScreen() {
                   <span className="request-log-muted" title={entry.state === "running" ? t("token 用量由上游在请求完成时返回，流式过程中无法准确统计") : ""}>
                     {entry.state === "running" ? t("流式中") : formatRequestLogTokens(entry.usage?.inputTokens)}
                   </span>
-                  <span className="request-log-muted" title={entry.state === "running" ? t("token 用量由上游在请求完成时返回，流式过程中无法准确统计") : ""}>
-                    {entry.state === "running" ? t("流式中") : formatRequestLogTokens(entry.usage?.outputTokens)}
+                  <span
+                    className="request-log-muted"
+                    title={entry.state === "running"
+                      ? t("按流式增量估算，完成后会更新为准确值")
+                      : ""}
+                  >
+                    {entry.state === "running"
+                      ? entry.estimatedOutputTokens
+                        ? `~${formatRequestLogTokens(entry.estimatedOutputTokens)}`
+                        : t("流式中")
+                      : formatRequestLogTokens(entry.usage?.outputTokens)}
                   </span>
                   <span>
                     {entry.state === "running" ? (

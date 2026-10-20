@@ -386,14 +386,21 @@ enum BufferedResponsesStream {
     },
 }
 
+fn estimated_tokens_from_chars(chars: usize) -> u64 {
+    ((chars as u64) + 3) / 4
+}
+
 /// 整段读取 Responses SSE：用于 buffered 模式在转发前识别过载并整段重试。
 async fn read_responses_stream_for_buffering(
     upstream: &mut reqwest::Response,
+    live_request_id: Option<&str>,
 ) -> BufferedResponsesStream {
     let started = Instant::now();
     let mut buffered: Vec<u8> = Vec::new();
     let mut scanned = 0usize;
     let mut first_output_at_ms: Option<u64> = None;
+    let mut estimated_delta_chars = 0usize;
+    let mut last_estimate_update = Instant::now();
     loop {
         let remaining = BUFFERED_STREAM_MAX_WAIT.saturating_sub(started.elapsed());
         if remaining.is_zero() {
@@ -428,8 +435,29 @@ async fn read_responses_stream_for_buffering(
             if !is_pre_output_stream_event(&event) && first_output_at_ms.is_none() {
                 first_output_at_ms = Some(current_epoch_ms());
             }
+            if event.ends_with(".delta")
+                && let Some(delta) = sse_block_json(&block)
+                    .and_then(|json| json.get("delta").and_then(Value::as_str).map(str::to_string))
+            {
+                estimated_delta_chars += delta.chars().count();
+                if let Some(id) = live_request_id
+                    && last_estimate_update.elapsed() >= Duration::from_millis(300)
+                {
+                    crate::request_log::update_running_output_estimate(
+                        id,
+                        estimated_tokens_from_chars(estimated_delta_chars),
+                    );
+                    last_estimate_update = Instant::now();
+                }
+            }
             match event.as_str() {
                 "response.completed" => {
+                    if let Some(id) = live_request_id {
+                        crate::request_log::update_running_output_estimate(
+                            id,
+                            estimated_tokens_from_chars(estimated_delta_chars),
+                        );
+                    }
                     return BufferedResponsesStream::Complete {
                         body: buffered,
                         first_output_at_ms,
@@ -2933,6 +2961,30 @@ pub async fn open_responses_proxy_request_for_path_with_session_headers(
         request_path,
         beta_features,
         session_headers,
+        None,
+    )
+    .await
+}
+
+/// 与 `open_responses_proxy_request_for_path_with_session_headers` 相同，
+/// 额外带上请求日志 ID，用于在整段缓冲时实时更新输出 token 估算。
+pub async fn open_responses_proxy_request_for_path_with_session_headers_and_live_id(
+    body: &str,
+    original_user_agent: Option<&str>,
+    request_path: &str,
+    beta_features: Option<&str>,
+    session_headers: ProxySessionHeaders<'_>,
+    live_request_id: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    open_responses_proxy_request_with_settings_and_user_agent(
+        body,
+        settings,
+        original_user_agent,
+        request_path,
+        beta_features,
+        session_headers,
+        live_request_id,
     )
     .await
 }
@@ -2948,6 +3000,7 @@ pub async fn open_responses_proxy_request_with_settings(
         "/responses",
         None,
         ProxySessionHeaders::default(),
+        None,
     )
     .await
 }
@@ -2964,6 +3017,7 @@ pub async fn open_responses_proxy_request_with_settings_for_path(
         request_path,
         None,
         ProxySessionHeaders::default(),
+        None,
     )
     .await
 }
@@ -2998,6 +3052,7 @@ pub async fn open_responses_proxy_request_with_settings_for_path_and_session_hea
         request_path,
         beta_features,
         session_headers,
+        None,
     )
     .await
 }
@@ -3009,6 +3064,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     request_path: &str,
     beta_features: Option<&str>,
     session_headers: ProxySessionHeaders<'_>,
+    live_request_id: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let mut request_json: Value = serde_json::from_str(body)?;
     expand_local_compaction_history(&mut request_json);
@@ -3719,7 +3775,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             && auto_retry.is_some()
             && buffered_mode
         {
-            match read_responses_stream_for_buffering(&mut upstream).await {
+            match read_responses_stream_for_buffering(&mut upstream, live_request_id).await {
                 BufferedResponsesStream::Complete {
                     body,
                     first_output_at_ms,

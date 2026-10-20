@@ -88,6 +88,9 @@ pub struct RequestLogEntry {
     /// 首字耗时（从请求开始到第一段上游输出），毫秒。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_token_ms: Option<u64>,
+    /// 请求进行中按流式 delta 粗估的输出 token，完成后清空并写入准确 usage。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_output_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -109,6 +112,7 @@ impl RequestLogEntry {
         self.duration_ms = finished_at_ms.saturating_sub(self.started_at_ms);
         self.cache_hit_ratio = self.usage.as_ref().and_then(RequestUsage::cache_hit_ratio);
         self.state = Some(if self.success { "success" } else { "failed" }.to_string());
+        self.estimated_output_tokens = None;
     }
 }
 
@@ -161,6 +165,15 @@ pub fn update_running(entry: &RequestLogEntry) {
         && live.contains_key(&entry.id)
     {
         live.insert(entry.id.clone(), entry.clone());
+    }
+}
+
+/// 运行中请求的输出 token 粗估（按已收到的流式 delta 字符数 / 4 计算）。
+pub fn update_running_output_estimate(id: &str, tokens: u64) {
+    if let Ok(mut live) = live_requests().lock()
+        && let Some(entry) = live.get_mut(id)
+    {
+        entry.estimated_output_tokens = Some(tokens);
     }
 }
 
@@ -348,6 +361,7 @@ mod tests {
             retry_reasons: vec!["upstream_stream_failed".to_string()],
             state: None,
             first_token_ms: Some(120),
+            estimated_output_tokens: None,
             error: None,
             stream_outcome: None,
             usage: Some(RequestUsage {
@@ -394,8 +408,10 @@ mod tests {
         running.state = Some("running".to_string());
         running.success = false;
         start_request(&running);
+        update_running_output_estimate("live-1", 42);
         let visible = read_request_logs(10).unwrap();
         assert!(visible.iter().any(|item| item.id == "live-1" && item.state.as_deref() == Some("running")));
+        assert!(visible.iter().any(|item| item.estimated_output_tokens == Some(42)));
 
         let mut finished = running.clone();
         finished.success = true;
