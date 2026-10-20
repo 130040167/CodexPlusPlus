@@ -29,6 +29,7 @@ body{margin:16px;font:14px Arial;background:white;color:#252525}
 button{font:inherit} [data-model-picker-view]{width:100%;max-width:390px}
 [role=menuitemradio]{display:flex;width:100%;box-sizing:border-box;padding:8px;border:0;background:none;text-align:left}
 [data-menu-row-content]{display:flex;width:100%}.flex-1{flex:1;min-width:0}
+.native-check{width:12px;height:12px}
 .truncate{display:flex;flex-direction:column}.subtitle{font-size:13px}
 #trigger{margin-bottom:12px} output{display:block;margin-top:12px}
 </style><button id="trigger" data-codex-intelligence-trigger>Custom</button>
@@ -81,6 +82,9 @@ function renderNative(current = null) {
     nativeDefaultCalls++;
     picker.onSelectModel("gpt-5.6-sol","low");
   });
+  defaultRow.setAttribute("data-model-selected","");
+  defaultRow.setAttribute("aria-checked","true");
+  defaultRow.querySelector("[data-menu-row-content]").insertAdjacentHTML("beforeend",'<svg class="native-check" viewBox="0 0 12 12"><path d="m2 6 3 3 5-6"/></svg>');
   defaultRow.addEventListener("keydown",event=>{
     if(["Enter"," "].includes(event.key))defaultRow.click();
   });
@@ -171,6 +175,10 @@ window.__codexPlusModelPickerGroupsRuntime.scan();
     const defaultRow = page.locator(".codex-plus-model-default-row");
     assert.equal((await defaultRow.innerText()).replace(/\s+/g, " "), "默认模型 GPT-6.1-Sol");
     assert.equal(await defaultRow.locator(".subtitle").isVisible(), false);
+    assert.equal(await defaultRow.locator(".native-check").isVisible(), false,
+      "configured default action must not inherit the native default selection mark");
+    await page.waitForFunction(() => document.querySelectorAll(".codex-plus-model-current-row").length === 1);
+    assert.match(await page.locator(".codex-plus-model-current-row").innerText(), /GPT-6\.1-Sol/);
     const metrics = await page.evaluate(() => {
       const a=document.querySelector(".codex-plus-model-default-row");
       const b=document.querySelector(".codex-plus-model-group-header");
@@ -197,6 +205,8 @@ window.__codexPlusModelPickerGroupsRuntime.scan();
     assert.deepEqual(await page.evaluate(() => window.fixture.unpublished()), { automaticDefault: "", allowed: null });
     assert.equal((await defaultRow.innerText()).replace(/\s+/g, " "), "默认模型 GPT-6.1-Sol");
     await page.evaluate(() => window.fixture.selectOther());
+    await page.waitForFunction(() => document.querySelector(".codex-plus-model-current-row")?.textContent?.includes("Beta"));
+    assert.equal(await defaultRow.locator(".native-check").isVisible(), false);
     await defaultRow.click();
     assert.equal(await page.locator("#result").textContent(), "gpt-6.1-sol");
     assert.equal(await page.evaluate(() => window.fixture.state().nativeDefaultCalls), 0);
@@ -268,6 +278,9 @@ window.__codexPlusModelPickerGroupsRuntime.scan();
     assert.equal(await page.locator(".codex-plus-model-group-header").filter({ hasText: "Beta" }).count(), 1,
       "deleted model must not create an extra legacy provider group");
     assert.deepEqual(await page.evaluate(() => window.fixture.state().models), ["cpx-b/gpt-6.1-sol", "gpt-6.1-sol"]);
+    assert.equal(await defaultRow.locator(".native-check").isVisible(), false);
+    assert.equal(await page.locator(".codex-plus-model-current-row").count(), 1,
+      "catalog deletion must keep exactly one concrete current-model marker");
     await page.screenshot({ path: path.join(__dirname, "../output/playwright/model-picker-deleted-model.png") });
     assert.deepEqual(errors, []);
     console.log("PASS: model/default/group layout, member order, pool withdrawal, unpublished deletion and HTTP request");

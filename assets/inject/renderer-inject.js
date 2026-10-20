@@ -13183,6 +13183,65 @@
     return pickers.find(({ node }) => triggerIds.includes(node.id)) || null;
   }
 
+  function codexPlusModelPickerCurrentIdentity(picker) {
+    const model = typeof picker?.model === "string" ? picker.model : "";
+    if (!model) return null;
+    const descriptor = picker.models?.find((entry) => entry?.model === model);
+    const metadata = codexPlusModelMetadata(model);
+    const labels = [descriptor?.displayName, descriptor?.display_name, metadata?.displayName, metadata?.display_name];
+    const names = new Set();
+    const addName = (value) => {
+      if (typeof value !== "string" || !value.trim()) return;
+      const split = codexPlusModelPickerSplitLabel(value);
+      for (const candidate of [split.name, value]) {
+        const strict = codexPlusModelPickerNormalizeStrict(candidate);
+        const relaxed = codexPlusModelPickerNormalize(candidate);
+        if (strict) names.add(strict);
+        if (relaxed) names.add(relaxed);
+      }
+    };
+    labels.forEach(addName);
+    const bare = model.includes("/") ? model.slice(model.lastIndexOf("/") + 1) : model;
+    addName(bare);
+    const labelled = labels.map((value) => codexPlusModelPickerSplitLabel(value)).find((entry) => entry.provider);
+    return {
+      names,
+      provider: labelled?.provider || providerNameOf(metadata || {}),
+      groupId: typeof metadata?.codex_plus_group_id === "string" ? metadata.codex_plus_group_id.trim() : "",
+    };
+  }
+
+  /**
+   * “默认模型”是切回配置默认值的动作，不是当前会话模型本身。
+   *
+   * Codex 原生默认行会按它自己的默认目录决定勾号；我们替换了这行文字后，若不同时
+   * 修正视觉状态，就会出现“文字是 6.1、勾号却代表当前 5.6”的假象。这里始终压掉
+   * 默认动作行的原生勾号，再按 picker.model 把当前会话标在具体模型行上。
+   */
+  function codexPlusModelPickerSyncCurrentRow(list, selected) {
+    list.querySelectorAll(".codex-plus-model-current-row").forEach((row) => {
+      row.classList.remove("codex-plus-model-current-row", "codex-plus-model-current-synthetic");
+    });
+    list.querySelectorAll(".codex-plus-model-default-row").forEach((row) => {
+      row.classList.add("codex-plus-model-default-suppress-selection");
+    });
+    const identity = codexPlusModelPickerCurrentIdentity(selected?.picker);
+    if (!identity?.names.size) return;
+    const matches = codexPlusModelPickerRows(list).filter((entry) => {
+      const strict = codexPlusModelPickerNormalizeStrict(entry.name);
+      const relaxed = codexPlusModelPickerNormalize(entry.name);
+      if (!identity.names.has(strict) && !identity.names.has(relaxed)) return false;
+      if (identity.groupId && entry.groupId) return identity.groupId === entry.groupId;
+      if (identity.provider && entry.provider) return identity.provider === entry.provider;
+      return true;
+    });
+    if (matches.length !== 1) return;
+    const row = matches[0].row;
+    row.classList.add("codex-plus-model-current-row");
+    const nativeSelected = row.hasAttribute("data-model-selected") || row.getAttribute("aria-checked") === "true";
+    row.classList.toggle("codex-plus-model-current-synthetic", !nativeSelected);
+  }
+
   function codexPlusModelPickerSelectConfiguredDefault(event) {
     if (event.type === "keydown" && !["Enter", " "].includes(event.key)) return;
     const row = event.target?.closest?.(".codex-plus-model-default-row");
@@ -13263,6 +13322,7 @@
         child.setAttribute("aria-hidden", "true");
       }
     }
+    codexPlusModelPickerSyncCurrentRow(list, selected);
   }
 
   /**
@@ -13415,7 +13475,7 @@
     if (groups.length < 2) return;
     if (state.touched.size > 0) return;
     let keep = "";
-    const selected = list.querySelector("[data-model-selected]");
+    const selected = list.querySelector(".codex-plus-model-current-row") || list.querySelector("[data-model-selected]");
     if (selected) {
       const split = codexPlusModelPickerSplitLabel(codexPlusModelPickerRowLabel(selected));
       const desired = split.provider || "";
@@ -13527,6 +13587,7 @@
       node.removeAttribute("aria-hidden");
     });
     row.classList.remove("codex-plus-model-default-row");
+    row.classList.remove("codex-plus-model-default-suppress-selection", "codex-plus-model-current-row", "codex-plus-model-current-synthetic");
     row.classList.remove(codexPlusModelPickerItemClass, "codex-plus-model-group-collapsed");
     row.removeAttribute(codexPlusModelPickerGroupAttr);
     if (row.getAttribute("data-codex-plus-ext") === codexPlusModelPickerGroupsExtMark) {
@@ -13752,6 +13813,8 @@
       .codex-plus-model-default-caption{flex:0 0 auto}
       .codex-plus-model-default-value{flex:0 1 auto;min-width:0;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right;color:var(--color-token-text-primary,#dfdfdf);font-weight:500}
       .codex-plus-model-default-subtitle{display:none!important}
+      .codex-plus-model-default-suppress-selection svg{display:none!important}
+      [role="menuitemradio"].codex-plus-model-current-synthetic [data-menu-row-content]::after{content:"";flex:0 0 auto;width:5px;height:9px;margin:1px 5px 0 10px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;opacity:.8;transform:rotate(45deg)}
       [role="menuitemradio"][data-codex-plus-model-group]{padding-left:30px!important;padding-right:8px!important}
       .codex-plus-model-group-header:hover{background:var(--color-token-bg-secondary,rgba(255,255,255,.04));color:var(--color-token-text-primary,#dfdfdf)}
       .codex-plus-model-group-header:focus-visible{outline:1px solid color-mix(in srgb,var(--color-token-text-primary,#dfdfdf) 35%,transparent);outline-offset:1px}

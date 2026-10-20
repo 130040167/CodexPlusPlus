@@ -70,6 +70,16 @@ it("默认行通过菜单关联的触发器匹配本地选择器，不猜测无�
   assert.equal(resolve(null), null);
 });
 
+it("默认动作行不继承原生默认勾号，当前会话标记落在具体模型行", async () => {
+  const source = await readShard();
+  assert.match(source, /codexPlusModelPickerCurrentIdentity/);
+  assert.match(source, /codexPlusModelPickerSyncCurrentRow/);
+  assert.match(source, /codex-plus-model-default-suppress-selection svg\{display:none!important\}/);
+  assert.match(source, /codex-plus-model-current-synthetic/);
+  assert.match(source, /selected\?\.picker/);
+  assert.match(source, /\.codex-plus-model-current-row"\) \|\| list\.querySelector\("\[data-model-selected\]"\)/);
+});
+
 it("补丁默认行在目录失败或归属不明时阻止旧推荐动作，未打补丁的行保持原生行为", async () => {
   const source = await readShard();
   const block = source.match(/  function codexPlusModelPickerSelectConfiguredDefault\(event\)[^]*?\n  \}/)?.[0];
