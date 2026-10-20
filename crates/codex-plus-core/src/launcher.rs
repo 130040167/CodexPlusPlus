@@ -1896,6 +1896,7 @@ async fn handle_helper_connection(
                 serde_json::json!({
                     "id": entry.id,
                     "model": entry.model,
+                    "threadId": entry.thread_id,
                     "relayName": entry.relay_name,
                     "startedAtMs": entry.started_at_ms,
                     "attempts": entry.attempts,
@@ -2269,7 +2270,12 @@ struct ProxyRequestLog {
 }
 
 impl ProxyRequestLog {
-    fn begin(method: &str, path: &str, request: Option<&Value>) -> Self {
+    fn begin(
+        method: &str,
+        path: &str,
+        request: Option<&Value>,
+        thread_id: Option<String>,
+    ) -> Self {
         let started_at_ms = current_time_ms();
         let model = request
             .and_then(|request| request.get("model"))
@@ -2289,6 +2295,7 @@ impl ProxyRequestLog {
                 success: false,
                 stream: false,
                 model,
+                thread_id,
                 upstream_model: String::new(),
                 relay_id: String::new(),
                 relay_name: String::new(),
@@ -2423,7 +2430,14 @@ async fn handle_protocol_proxy_connection(
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
     let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
-    let mut request_log = ProxyRequestLog::begin(method, path, request_json.as_ref());
+    let request_thread_id = session_headers
+        .thread_id
+        .or(session_headers.session_id)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let mut request_log =
+        ProxyRequestLog::begin(method, path, request_json.as_ref(), request_thread_id);
     let live_request_id = request_log.entry.id.clone();
     let mut upstream =
         match crate::protocol_proxy::open_responses_proxy_request_for_path_with_session_headers_and_live_id(

@@ -94,6 +94,9 @@ pub struct RequestLogEntry {
     pub success: bool,
     pub stream: bool,
     pub model: String,
+    /// Codex 的会话/线程 id（来自请求头），用于把状态条限定在当前会话。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     pub upstream_model: String,
     pub relay_id: String,
     pub relay_name: String,
@@ -434,6 +437,7 @@ mod tests {
             success: true,
             stream: true,
             model: "gpt-6.1-sol".to_string(),
+            thread_id: Some("thread-1".to_string()),
             upstream_model: "gpt-6.1-sol".to_string(),
             relay_id: "relay-a".to_string(),
             relay_name: "供应商 4".to_string(),

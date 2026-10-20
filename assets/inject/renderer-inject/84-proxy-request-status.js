@@ -46,6 +46,25 @@
     return fallback;
   }
 
+  /** 当前输入框所属会话 id，用于只显示本会话的请求。 */
+  function codexPlusProxyStatusThreadId(card) {
+    const composerRoot = card?.closest("[data-codex-composer-root]");
+    const fromComposer = composerRoot
+      ?.querySelector("[data-above-composer-conversation-id]")
+      ?.getAttribute("data-above-composer-conversation-id");
+    const inThread = composerRoot?.getAttribute("data-composer-placement") === "thread";
+    const fromSidebar = inThread
+      ? document
+        .querySelector('[data-app-action-sidebar-thread-selected="true"][data-app-action-sidebar-thread-id]')
+        ?.getAttribute("data-app-action-sidebar-thread-id")
+      : null;
+    return String(fromComposer || fromSidebar || "").replace(/^local:/, "").trim();
+  }
+
+  function codexPlusProxyStatusNormalizeThreadId(value) {
+    return String(value || "").replace(/^local:/, "").trim();
+  }
+
   function codexPlusProxyStatusText() {
     const language = (document.documentElement?.lang || navigator.language || "").toLowerCase();
     const zh = language.startsWith("zh");
@@ -122,8 +141,14 @@
   }
 
   function codexPlusProxyStatusRender() {
-    const request = codexPlusProxyStatusState.requests[0];
     const card = codexPlusProxyStatusComposerCard();
+    const threadId = card ? codexPlusProxyStatusThreadId(card) : "";
+    const visibleRequests = threadId
+      ? codexPlusProxyStatusState.requests.filter(
+        (item) => codexPlusProxyStatusNormalizeThreadId(item?.threadId) === threadId,
+      )
+      : codexPlusProxyStatusState.requests;
+    const request = visibleRequests[0];
     if (!request || !card) {
       codexPlusProxyStatusHide();
       return;
@@ -154,7 +179,7 @@
     const estimated = Number(request.estimatedOutputTokens) || 0;
     if (phase === "generating" && estimated > 0) meta.push(`~${estimated > 999 ? `${(estimated / 1000).toFixed(1)}k` : estimated} tok`);
     else if (attempts > 1) meta.push(`第 ${attempts} 次`);
-    if (codexPlusProxyStatusState.requests.length > 1) meta.push(`+${codexPlusProxyStatusState.requests.length - 1}`);
+    if (visibleRequests.length > 1) meta.push(`+${visibleRequests.length - 1}`);
 
     node.dataset.hidden = "false";
     node.dataset.phase = phase || "requesting";
