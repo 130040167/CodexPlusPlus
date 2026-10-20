@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- 请求日志可观测性：自动重试原因带上根因 code（如 `upstream_stream_failed:server_is_overloaded`），详情新增「尝试明细」，逐次列出失败尝试的错误 code/message 与退避毫秒；进行中的请求也能实时看到明细。
 - 请求避震新增「首字提交延迟」（`protocolProxyAutoRetryCommitDelayMs`，默认 1000 毫秒）：流式避震下推理与工具调用参数等不可见阶段整项缓冲，工具调用完成或首段可见输出出现后再等该时长才提交；窗口内遇到 `server_is_overloaded` 等过载仍由代理丢弃重试，提交后照旧交给 Codex 原生重试。短回复在 `response.completed` 到达时立即提交，不白等满窗口。
 - 管理器「避震模式」保留原「流式避震（旧行为）」选项（`streaming-legacy`）：第一个输出事件立即提交，不做工具参数/首字缓冲，随时可退回旧逻辑；默认仍为新的流式避震。
 - 修复流式预读边界：可见输出后遇到终态失败时补记真实首字耗时（不再记成提交时刻）；重试预算耗尽后不再为首字白等宽限窗口；只在 `output_text.done`/`refusal.done` 等 done 事件里给内容的兼容上游也会被识别为可见输出。

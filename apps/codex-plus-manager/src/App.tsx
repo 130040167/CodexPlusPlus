@@ -592,6 +592,13 @@ type RequestLogUsage = {
   reasoningTokens?: number;
 };
 
+type RequestLogAttemptDetail = {
+  attempt: number;
+  code?: string | null;
+  message?: string | null;
+  delayMs?: number | null;
+};
+
 type RequestLogEntry = {
   id: string;
   timestampMs: number;
@@ -610,6 +617,8 @@ type RequestLogEntry = {
   attempts: number;
   autoRetries: number;
   retryReasons?: string[];
+  /** 每次自动重试前的失败尝试摘要；旧日志没有该字段。 */
+  attemptDetails?: RequestLogAttemptDetail[] | null;
   /** 请求进行中时为 running；旧日志没有该字段。 */
   state?: string | null;
   /** 首字耗时（毫秒）。 */
@@ -5758,6 +5767,25 @@ function RequestLogScreen() {
                       <div><dt>{t("尝试次数")}</dt><dd>{entry.attempts || "-"}</dd></div>
                       <div><dt>{t("自动重试")}</dt><dd>{entry.autoRetries}</dd></div>
                       <div><dt>{t("重试原因")}</dt><dd>{(entry.retryReasons ?? []).join("、") || "-"}</dd></div>
+                      {entry.attemptDetails?.length ? (
+                        <div className="request-log-attempts">
+                          <dt>{t("尝试明细")}</dt>
+                          <dd>
+                            <ul>
+                              {entry.attemptDetails.map((detail) => (
+                                <li key={`${detail.attempt}-${detail.code ?? ""}`}>
+                                  <strong>{tf("第 {0} 次", [detail.attempt])}</strong>
+                                  <code>{detail.code || "-"}</code>
+                                  {detail.delayMs != null ? (
+                                    <small>{tf("退避 {0}", [formatRequestLogDuration(detail.delayMs)])}</small>
+                                  ) : null}
+                                  {detail.message ? <small title={detail.message}>{detail.message}</small> : null}
+                                </li>
+                              ))}
+                            </ul>
+                          </dd>
+                        </div>
+                      ) : null}
                       <div><dt>{t("流式")}</dt><dd>{entry.stream ? "SSE" : "JSON"}</dd></div>
                       <div><dt>{t("流结果")}</dt><dd>{entry.streamOutcome || "-"}</dd></div>
                       <div><dt>{t("推理 tokens")}</dt><dd>{formatRequestLogTokens(entry.usage?.reasoningTokens)}</dd></div>

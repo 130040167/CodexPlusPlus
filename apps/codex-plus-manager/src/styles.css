@@ -10890,6 +10890,35 @@ select {
   word-break: break-all;
 }
 
+.request-log-detail dl > .request-log-attempts {
+  grid-column: 1 / -1;
+}
+
+.request-log-attempts ul {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.request-log-attempts li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.request-log-attempts code {
+  color: hsl(var(--foreground));
+}
+
+.request-log-attempts small {
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+}
+
 .request-log-status small {
   display: block;
   font-size: 10px;

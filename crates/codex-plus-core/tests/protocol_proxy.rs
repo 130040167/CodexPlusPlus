@@ -7729,7 +7729,16 @@ async fn proxy_auto_retry_recovers_from_capacity_error_inside_200_stream() {
     let trace = result.request_trace.clone().expect("请求日志 trace");
     assert_eq!(trace.attempts, 2);
     assert_eq!(trace.auto_retries, 1);
-    assert_eq!(trace.retry_reasons, vec!["upstream_stream_failed".to_string()]);
+    assert_eq!(
+        trace.retry_reasons,
+        vec!["upstream_stream_failed:server_overloaded".to_string()]
+    );
+    // 重试明细：第 1 次尝试因 server_overloaded 失败，记录根因与退避。
+    assert_eq!(trace.attempt_details.len(), 1);
+    let detail = &trace.attempt_details[0];
+    assert_eq!(detail.attempt, 1);
+    assert_eq!(detail.code.as_deref(), Some("server_overloaded"));
+    assert!(detail.delay_ms.is_some_and(|delay| delay >= 250));
     let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
     assert!(body.contains("resp_ok"));
     assert!(
@@ -8263,6 +8272,16 @@ async fn proxy_auto_retry_recovers_from_overload_during_reasoning() {
     let trace = result.request_trace.clone().expect("请求日志 trace");
     assert_eq!(trace.attempts, 2);
     assert_eq!(trace.auto_retries, 1);
+    assert_eq!(
+        trace.retry_reasons,
+        vec!["upstream_stream_failed:server_is_overloaded".to_string()]
+    );
+    assert_eq!(trace.attempt_details.len(), 1);
+    assert_eq!(trace.attempt_details[0].attempt, 1);
+    assert_eq!(
+        trace.attempt_details[0].code.as_deref(),
+        Some("server_is_overloaded")
+    );
     let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
     assert!(body.contains("resp_ok"));
     assert!(!body.contains("server_is_overloaded"), "推理阶段失败不应泄露给 Codex");

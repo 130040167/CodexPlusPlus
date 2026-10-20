@@ -332,7 +332,7 @@ impl ProxyAutoRetry {
     }
 }
 
-/// 等待并在诊断日志里留痕；返回 false 表示本次不重试。
+/// 等待并在诊断日志里留痕；返回本次退避时长，None 表示不重试。
 async fn schedule_proxy_auto_retry(
     state: &mut Option<ProxyAutoRetry>,
     relay: &crate::settings::RelayProfile,
@@ -341,12 +341,12 @@ async fn schedule_proxy_auto_retry(
     retry_after: Option<Duration>,
     retry_reasons: &mut Vec<String>,
     live_request_id: Option<&str>,
-) -> bool {
+) -> Option<Duration> {
     let Some(state) = state.as_mut() else {
-        return false;
+        return None;
     };
     let Some(delay) = state.schedule(retry_after) else {
-        return false;
+        return None;
     };
     let _ = crate::diagnostic_log::append_diagnostic_log(
         "protocol_proxy.upstream_auto_retry",
@@ -372,7 +372,22 @@ async fn schedule_proxy_auto_retry(
     }
     tokio::time::sleep(delay).await;
     retry_reasons.push(reason.to_string());
-    true
+    Some(delay)
+}
+
+/// 构造一次失败尝试的日志摘要；message 只保留前 200 字符，避免日志膨胀。
+fn attempt_detail(
+    request_attempt: usize,
+    code: Option<&str>,
+    message: Option<&str>,
+    delay: Duration,
+) -> crate::request_log::RequestAttemptDetail {
+    crate::request_log::RequestAttemptDetail {
+        attempt: request_attempt as u32,
+        code: code.map(str::to_string),
+        message: message.map(|message| message.chars().take(200).collect()),
+        delay_ms: Some(delay.as_millis() as u64),
+    }
 }
 /// 流式响应预读上限：推理阶段可能带加密推理内容，留足空间；超过则直接放行。
 const STREAM_RETRY_PEEK_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -3975,7 +3990,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                             "upstream_buffered_overload:{}",
                             code.clone().unwrap_or_default()
                         );
-                        if schedule_proxy_auto_retry(
+                        if let Some(delay) = schedule_proxy_auto_retry(
                             &mut auto_retry,
                             &relay,
                             request_attempt,
@@ -3986,6 +4001,16 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         )
                         .await
                         {
+                            let detail = attempt_detail(
+                                request_attempt,
+                                code.as_deref(),
+                                message.as_deref(),
+                                delay,
+                            );
+                            if let Some(id) = live_request_id {
+                                crate::request_log::update_running_attempt_detail(id, detail.clone());
+                            }
+                            request_trace.attempt_details.push(detail);
                             if !strict_aggregate_model {
                                 crate::relay_rotation::record_relay_request_failure(&settings);
                             }
@@ -4081,17 +4106,36 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         if has_more_candidates {
                             continue;
                         }
-                        if schedule_proxy_auto_retry(
+                        // 重试原因带上根因 code，请求日志里能直接看出为什么重试。
+                        let retry_reason = match code
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|code| !code.is_empty())
+                        {
+                            Some(code) => format!("upstream_stream_failed:{code}"),
+                            None => "upstream_stream_failed:unknown".to_string(),
+                        };
+                        if let Some(delay) = schedule_proxy_auto_retry(
                             &mut auto_retry,
                             &relay,
                             request_attempt,
-                            "upstream_stream_failed",
+                            &retry_reason,
                             None,
                             &mut retry_reasons,
                             live_request_id,
                         )
                         .await
                         {
+                            let detail = attempt_detail(
+                                request_attempt,
+                                code.as_deref(),
+                                message.as_deref(),
+                                delay,
+                            );
+                            if let Some(id) = live_request_id {
+                                crate::request_log::update_running_attempt_detail(id, detail.clone());
+                            }
+                            request_trace.attempt_details.push(detail);
                             candidate_index = 0;
                             continue 'request_attempts;
                         }

@@ -38,6 +38,23 @@ impl RequestUsage {
     }
 }
 
+/// 一次被代理自动重试的上游尝试摘要（请求日志详情用）。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestAttemptDetail {
+    /// 第几次上游尝试（从 1 开始）。
+    pub attempt: u32,
+    /// 触发重试的上游错误 code（若有）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// 上游错误 message（最多 200 字符）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// 本次重试前的退避等待（毫秒）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u64>,
+}
+
 /// 代理内部的重试/路由痕迹，随 `UpstreamProxyResponse` 交给启动器写日志。
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,6 +75,9 @@ pub struct RequestTrace {
     pub first_output_at_ms: Option<u64>,
     #[serde(default)]
     pub retry_reasons: Vec<String>,
+    /// 每次自动重试前的失败尝试摘要。
+    #[serde(default)]
+    pub attempt_details: Vec<RequestAttemptDetail>,
 }
 
 /// 管理器「请求日志」页展示的一条记录。
@@ -82,6 +102,9 @@ pub struct RequestLogEntry {
     pub auto_retries: u32,
     #[serde(default)]
     pub retry_reasons: Vec<String>,
+    /// 每次自动重试前的失败尝试摘要（旧日志没有该字段）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempt_details: Vec<RequestAttemptDetail>,
     /// `running` 表示请求还在进行中；旧日志没有该字段时按已完成处理。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
@@ -224,6 +247,15 @@ pub fn update_running_output_estimate(id: &str, tokens: u64) {
         && let Some(entry) = live.get_mut(id)
     {
         entry.estimated_output_tokens = Some(tokens);
+    }
+}
+
+/// 记录一次失败尝试摘要；进行中的请求详情即可看到重试原因。
+pub fn update_running_attempt_detail(id: &str, detail: RequestAttemptDetail) {
+    if let Ok(mut live) = live_requests().lock()
+        && let Some(entry) = live.get_mut(id)
+    {
+        entry.attempt_details.push(detail);
     }
 }
 
@@ -408,7 +440,8 @@ mod tests {
             wire_api: "Responses".to_string(),
             attempts: 2,
             auto_retries: 1,
-            retry_reasons: vec!["upstream_stream_failed".to_string()],
+            retry_reasons: vec!["upstream_stream_failed:server_is_overloaded".to_string()],
+            attempt_details: Vec::new(),
             state: None,
             first_token_ms: Some(120),
             estimated_output_tokens: None,
@@ -423,6 +456,34 @@ mod tests {
             }),
             cache_hit_ratio: None,
         }
+    }
+
+    #[test]
+    fn attempt_details_round_trip_and_legacy_entries_default_empty() {
+        let mut retried = entry("retried");
+        retried.attempt_details.push(RequestAttemptDetail {
+            attempt: 1,
+            code: Some("server_is_overloaded".to_string()),
+            message: Some("Our servers are currently overloaded.".to_string()),
+            delay_ms: Some(250),
+        });
+        let raw = serde_json::to_value(&retried).unwrap();
+        assert_eq!(raw["attemptDetails"][0]["attempt"], json!(1));
+        assert_eq!(
+            raw["attemptDetails"][0]["code"],
+            json!("server_is_overloaded")
+        );
+        assert_eq!(raw["attemptDetails"][0]["delayMs"], json!(250));
+        let parsed: RequestLogEntry = serde_json::from_value(raw).unwrap();
+        assert_eq!(parsed.attempt_details, retried.attempt_details);
+
+        // 旧日志没有 attemptDetails：读入后为空，且空明细不写盘。
+        let mut legacy = serde_json::to_value(entry("legacy")).unwrap();
+        legacy.as_object_mut().unwrap().remove("attemptDetails");
+        let parsed: RequestLogEntry = serde_json::from_value(legacy).unwrap();
+        assert!(parsed.attempt_details.is_empty());
+        let empty = serde_json::to_value(entry("empty")).unwrap();
+        assert!(empty.get("attemptDetails").is_none());
     }
 
     #[test]

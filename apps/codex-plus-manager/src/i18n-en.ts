@@ -676,6 +676,7 @@ export const EN_PLAIN: Record<string, string> = {
   "按流式增量估算，完成后会更新为准确值": "Estimated from streaming deltas; replaced with the exact value on completion",
   "token 用量由上游在请求完成时返回，流式过程中无法准确统计":
     "Token usage is returned by the upstream when the request completes; it cannot be measured accurately mid-stream",
+  "尝试明细": "Attempt details",
   "首字耗时": "Time to first token",
   "首字 {0}": "First token {0}",
   "查看代理请求的状态、模型、重试、token 用量与缓存命中":
@@ -1660,6 +1661,8 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "第 {0} 次": "Attempt {0}",
+  "退避 {0}": "Backoff {0}",
   "第 {0} 页 · 共 {1} 个会话": "Page {0} · {1} sessions",
   "{0} 的 API Key": "API key for {0}",
   "文档里的上下文窗口是 {0}，当前列填的是 {1}，已保留当前值；要用文档的值请先清空窗口。": "The document's context window is {0}, but the column holds {1}. The current value was kept; clear the window to use the document's value.",
