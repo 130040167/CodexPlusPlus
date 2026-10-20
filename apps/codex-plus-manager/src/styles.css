@@ -10725,6 +10725,34 @@ select {
 }
 
 /* ── 请求日志页 ──────────────────────────────────────────────── */
+/* 铺满可视区域：卡片撑到页面底部，列表在卡片内部滚动，避免大片留白。 */
+.screen.request-log-screen {
+  align-content: stretch;
+  overflow-y: hidden;
+}
+
+.screen.request-log-screen > * {
+  width: 100%;
+}
+
+.screen.request-log-screen > .request-log-panel {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.screen.request-log-screen .request-log-content {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.screen.request-log-screen .request-log-table {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+
 .request-log-panel {
   width: 100%;
   min-width: 0;

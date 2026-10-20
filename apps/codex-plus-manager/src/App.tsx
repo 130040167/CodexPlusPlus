@@ -4063,7 +4063,10 @@ export function App() {
             ) : null}
           </div>
         </header>
-        <section className={`screen ${isManagementScreen ? "management-screen" : ""}`} key={route}>
+        <section
+          className={`screen ${isManagementScreen ? "management-screen" : ""} ${route === "requestLog" ? "request-log-screen" : ""}`.trim()}
+          key={route}
+        >
           {route === "overview" ? (
             <OverviewScreen
               overview={overview}
