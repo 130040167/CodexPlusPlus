@@ -79,6 +79,12 @@ pub struct RequestLogEntry {
     pub auto_retries: u32,
     #[serde(default)]
     pub retry_reasons: Vec<String>,
+    /// `running` 表示请求还在进行中；旧日志没有该字段时按已完成处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// 首字耗时（从请求开始到第一段上游输出），毫秒。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,6 +105,7 @@ impl RequestLogEntry {
         self.timestamp_ms = finished_at_ms;
         self.duration_ms = finished_at_ms.saturating_sub(self.started_at_ms);
         self.cache_hit_ratio = self.usage.as_ref().and_then(RequestUsage::cache_hit_ratio);
+        self.state = Some(if self.success { "success" } else { "failed" }.to_string());
     }
 }
 
@@ -112,6 +119,52 @@ fn log_path_override() -> Option<PathBuf> {
 
 pub fn request_log_path() -> PathBuf {
     log_path_override().unwrap_or_else(|| crate::paths::default_app_state_dir().join(REQUEST_LOG_FILE))
+}
+
+fn live_requests() -> &'static std::sync::Mutex<std::collections::BTreeMap<String, RequestLogEntry>> {
+    static LIVE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<String, RequestLogEntry>>,
+    > = std::sync::OnceLock::new();
+    LIVE.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// 请求开始：先登记到内存里的进行中列表，管理器即可显示「运行中」并计时。
+pub fn start_request(entry: &RequestLogEntry) {
+    let mut live = live_requests()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    live.insert(entry.id.clone(), entry.clone());
+    // 防止异常退出前请求堆积；只保留最近的 64 条进行中记录。
+    while live.len() > 64 {
+        if let Some(oldest) = live.keys().next().cloned() {
+            live.remove(&oldest);
+        } else {
+            break;
+        }
+    }
+}
+
+/// 请求结束：从进行中列表移除并写入 JSONL。
+pub fn finish_request(entry: &RequestLogEntry) {
+    if let Ok(mut live) = live_requests().lock() {
+        live.remove(&entry.id);
+    }
+    let _ = append_request_log(entry);
+}
+
+pub fn running_requests() -> Vec<RequestLogEntry> {
+    live_requests()
+        .lock()
+        .map(|live| live.values().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// 串行化会改全局日志路径/进行中列表的测试（Rust 测试默认并行）。
+pub fn request_log_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// 测试用：覆盖请求日志路径（传 None 恢复默认）。
@@ -161,9 +214,13 @@ fn trim_request_log_to_tail(path: &Path, keep_bytes: u64) -> std::io::Result<()>
     std::fs::write(path, &contents[start..])
 }
 
-/// 读取最近 `limit` 条请求日志，按时间倒序返回。
+/// 读取最近 `limit` 条请求日志（含正在进行的请求），按开始时间倒序返回。
 pub fn read_request_logs(limit: usize) -> std::io::Result<Vec<RequestLogEntry>> {
-    read_request_logs_at(&request_log_path(), limit)
+    let mut entries = read_request_logs_at(&request_log_path(), limit)?;
+    entries.extend(running_requests());
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.started_at_ms));
+    entries.truncate(limit);
+    Ok(entries)
 }
 
 pub fn read_request_logs_at(path: &Path, limit: usize) -> std::io::Result<Vec<RequestLogEntry>> {
@@ -277,6 +334,8 @@ mod tests {
             attempts: 2,
             auto_retries: 1,
             retry_reasons: vec!["upstream_stream_failed".to_string()],
+            state: None,
+            first_token_ms: Some(120),
             error: None,
             stream_outcome: None,
             usage: Some(RequestUsage {
@@ -310,6 +369,32 @@ mod tests {
         clear_request_logs_at(&path).unwrap();
         assert!(read_request_logs_at(&path, 10).unwrap().is_empty());
         assert!(clear_request_logs_at(&path).is_ok());
+    }
+
+    #[test]
+    fn live_requests_are_visible_until_finished() {
+        let _guard = request_log_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(REQUEST_LOG_FILE);
+        set_request_log_path_for_tests(Some(path.clone()));
+
+        let mut running = entry("live-1");
+        running.state = Some("running".to_string());
+        running.success = false;
+        start_request(&running);
+        let visible = read_request_logs(10).unwrap();
+        assert!(visible.iter().any(|item| item.id == "live-1" && item.state.as_deref() == Some("running")));
+
+        let mut finished = running.clone();
+        finished.success = true;
+        finished.finish(200);
+        finish_request(&finished);
+        assert!(running_requests().is_empty());
+        let entries = read_request_logs(10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].state.as_deref(), Some("success"));
+
+        set_request_log_path_for_tests(None);
     }
 
     #[test]

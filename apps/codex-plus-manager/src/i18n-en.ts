@@ -661,6 +661,9 @@ export const EN_PLAIN: Record<string, string> = {
     "Later retries use 2x exponential backoff with a 30-second cap per wait; an upstream Retry-After header takes precedence (also subject to that cap).",
   "代理设置": "Proxy settings",
   "请求日志": "Request log",
+  "进行中": "In progress",
+  "首字耗时": "Time to first token",
+  "首字 {0}": "First token {0}",
   "查看代理请求的状态、模型、重试、token 用量与缓存命中":
     "Inspect proxy requests: status, model, retries, token usage, and cache hits",
   "最近 {0} 条代理请求，含状态、模型、重试与 token 用量":

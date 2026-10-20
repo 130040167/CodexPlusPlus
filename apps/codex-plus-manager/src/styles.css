@@ -10893,3 +10893,17 @@ select {
   font-weight: 500;
   opacity: 0.9;
 }
+
+.request-log-status.running {
+  color: hsl(var(--primary));
+}
+
+.request-log-duration {
+  font-variant-numeric: tabular-nums;
+}
+
+.request-log-duration small {
+  display: block;
+  color: hsl(var(--muted-foreground));
+  font-size: 10px;
+}

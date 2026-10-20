@@ -2246,7 +2246,7 @@ impl ProxyRequestLog {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        Self {
+        let log = Self {
             started: std::time::Instant::now(),
             entry: crate::request_log::RequestLogEntry {
                 id: crate::request_log::RequestLogEntry::new_id(started_at_ms),
@@ -2266,13 +2266,17 @@ impl ProxyRequestLog {
                 attempts: 0,
                 auto_retries: 0,
                 retry_reasons: Vec::new(),
+                state: Some("running".to_string()),
+                first_token_ms: None,
                 error: None,
                 stream_outcome: None,
                 usage: None,
                 cache_hit_ratio: None,
             },
             written: false,
-        }
+        };
+        crate::request_log::start_request(&log.entry);
+        log
     }
 
     fn record_upstream(&mut self, upstream: &crate::protocol_proxy::UpstreamProxyResponse) {
@@ -2330,6 +2334,14 @@ impl ProxyRequestLog {
         }
     }
 
+    /// 记录首字耗时（从请求开始到第一段上游输出）。只记第一次。
+    fn mark_first_token(&mut self) {
+        if self.entry.first_token_ms.is_none() {
+            self.entry.first_token_ms =
+                Some(current_time_ms().saturating_sub(self.entry.started_at_ms));
+        }
+    }
+
     fn write(&mut self) {
         if self.written {
             return;
@@ -2337,7 +2349,11 @@ impl ProxyRequestLog {
         self.written = true;
         let finished_at_ms = current_time_ms();
         self.entry.finish(finished_at_ms);
-        let _ = crate::request_log::append_request_log(&self.entry);
+        // 非流式响应没有首字概念，用总耗时作为首字耗时展示。
+        if !self.entry.stream && self.entry.first_token_ms.is_none() {
+            self.entry.first_token_ms = Some(self.entry.duration_ms);
+        }
+        crate::request_log::finish_request(&self.entry);
         let _ = self.started; // 时长由 entry.finish 统一计算，保留 Instant 供调试断点。
     }
 }
@@ -2554,6 +2570,7 @@ async fn handle_protocol_proxy_connection(
             stream.shutdown().await?;
             return Ok(());
         }
+        request_log.mark_first_token();
         let stream_prefix = std::mem::take(&mut upstream.stream_prefix);
         let (failure, usage, failure_detail) = forward_protocol_proxy_stream(
             stream,
@@ -5971,6 +5988,7 @@ mod tests {
 
     #[tokio::test]
     async fn helper_writes_request_log_with_usage_and_trace() {
+        let _log_guard = crate::request_log::request_log_test_guard();
         let _settings_guard = crate::paths::settings_path_test_guard();
         let temp = tempfile::tempdir().unwrap();
         let settings_path = temp.path().join("settings.json");
@@ -6066,6 +6084,11 @@ mod tests {
         assert_eq!(entry.relay_name, "请求日志供应商");
         assert_eq!(entry.attempts, 1);
         assert_eq!(entry.auto_retries, 0);
+        assert_eq!(
+            entry.first_token_ms,
+            Some(entry.duration_ms),
+            "非流式请求用总耗时作为首字耗时"
+        );
         let usage = entry.usage.as_ref().expect("usage");
         assert_eq!(usage.input_tokens, 120);
         assert_eq!(usage.output_tokens, 30);
@@ -6078,6 +6101,7 @@ mod tests {
 
     #[tokio::test]
     async fn helper_records_upstream_stream_error_detail_in_request_log() {
+        let _log_guard = crate::request_log::request_log_test_guard();
         let _settings_guard = crate::paths::settings_path_test_guard();
         let temp = tempfile::tempdir().unwrap();
         let settings_path = temp.path().join("settings.json");

@@ -607,6 +607,10 @@ type RequestLogEntry = {
   attempts: number;
   autoRetries: number;
   retryReasons?: string[];
+  /** 请求进行中时为 running；旧日志没有该字段。 */
+  state?: string | null;
+  /** 首字耗时（毫秒）。 */
+  firstTokenMs?: number | null;
   error?: string | null;
   streamOutcome?: string | null;
   usage?: RequestLogUsage | null;
@@ -5448,10 +5452,18 @@ function RequestLogScreen() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState<"all" | "success" | "failed" | "retried">("all");
+  const [filter, setFilter] = useState<"all" | "running" | "success" | "failed" | "retried">("all");
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  const hasRunning = entries.some((entry) => entry.state === "running");
+  useEffect(() => {
+    if (!hasRunning) return;
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [hasRunning]);
 
   const load = async (silent = false) => {
     if (!silent) setLoading(true);
@@ -5478,7 +5490,7 @@ function RequestLogScreen() {
     if (!autoRefresh) return;
     const timer = window.setInterval(() => {
       if (!document.hidden) void load(true);
-    }, 5000);
+    }, 2000);
     return () => window.clearInterval(timer);
   }, [autoRefresh]);
 
@@ -5499,8 +5511,10 @@ function RequestLogScreen() {
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return entries.filter((entry) => {
-      if (filter === "success" && !entry.success) return false;
-      if (filter === "failed" && entry.success) return false;
+      const running = entry.state === "running";
+      if (filter === "running" && !running) return false;
+      if (filter === "success" && (running || !entry.success)) return false;
+      if (filter === "failed" && (running || entry.success)) return false;
       if (filter === "retried" && entry.autoRetries === 0 && entry.attempts <= 1) return false;
       if (!needle) return true;
       return [
@@ -5541,6 +5555,7 @@ function RequestLogScreen() {
             onChange={(event) => setFilter(event.currentTarget.value as typeof filter)}
           >
             <option value="all">{t("全部")}</option>
+            <option value="running">{t("进行中")}</option>
             <option value="success">{t("仅成功")}</option>
             <option value="failed">{t("仅失败")}</option>
             <option value="retried">{t("含重试")}</option>
@@ -5586,23 +5601,29 @@ function RequestLogScreen() {
               <Fragment key={entry.id}>
                 <button
                   aria-expanded={expanded === entry.id}
-                  className={`request-log-row request-log-entry ${entry.success ? "ok" : "bad"}`}
+                  className={`request-log-row request-log-entry ${entry.state === "running" ? "running" : entry.success ? "ok" : "bad"}`}
                   onClick={() => setExpanded(expanded === entry.id ? null : entry.id)}
                   role="row"
                   type="button"
                 >
-                  <span>{formatRequestLogTime(entry.timestampMs)}</span>
-                  <span
-                    className={`request-log-status ${entry.success ? "ok" : "bad"}`}
-                    title={entry.error ?? ""}
-                  >
-                    {entry.statusCode || "ERR"}
-                    {!entry.success ? (
-                      <small className="request-log-stream-failed">
-                        {entry.stream ? t("流失败") : t("失败")}
-                      </small>
-                    ) : null}
-                  </span>
+                  <span>{formatRequestLogTime(entry.startedAtMs || entry.timestampMs)}</span>
+                  {entry.state === "running" ? (
+                    <span className="request-log-status running">
+                      {t("运行中")}
+                    </span>
+                  ) : (
+                    <span
+                      className={`request-log-status ${entry.success ? "ok" : "bad"}`}
+                      title={entry.error ?? ""}
+                    >
+                      {entry.statusCode || "ERR"}
+                      {!entry.success ? (
+                        <small className="request-log-stream-failed">
+                          {entry.stream ? t("流失败") : t("失败")}
+                        </small>
+                      ) : null}
+                    </span>
+                  )}
                   <span className="request-log-ellipsis" title={entry.relayName}>{entry.relayName || "-"}</span>
                   <span className="request-log-ellipsis" title={entry.upstreamModel ? `${entry.model} → ${entry.upstreamModel}` : entry.model}>
                     {entry.model || "-"}
@@ -5626,7 +5647,18 @@ function RequestLogScreen() {
                       </>
                     ) : "-"}
                   </span>
-                  <span>{formatRequestLogDuration(entry.durationMs)}</span>
+                  <span className="request-log-duration">
+                    {formatRequestLogDuration(
+                      entry.state === "running"
+                        ? Math.max(0, nowMs - entry.startedAtMs)
+                        : entry.durationMs,
+                    )}
+                    {entry.state === "running" ? (
+                      <small>{t("进行中")}</small>
+                    ) : entry.firstTokenMs != null ? (
+                      <small>{tf("首字 {0}", [formatRequestLogDuration(entry.firstTokenMs)])}</small>
+                    ) : null}
+                  </span>
                 </button>
                 {expanded === entry.id ? (
                   <div className="request-log-detail">
@@ -5635,6 +5667,7 @@ function RequestLogScreen() {
                       <div><dt>{t("路径")}</dt><dd><code>{entry.method} {entry.path}</code></dd></div>
                       <div><dt>{t("上游协议")}</dt><dd>{entry.wireApi || "-"}</dd></div>
                       <div><dt>{t("上游模型")}</dt><dd>{entry.upstreamModel || "-"}</dd></div>
+                      <div><dt>{t("首字耗时")}</dt><dd>{entry.firstTokenMs == null ? (entry.state === "running" ? t("进行中") : "-") : formatRequestLogDuration(entry.firstTokenMs)}</dd></div>
                       <div><dt>{t("尝试次数")}</dt><dd>{entry.attempts || "-"}</dd></div>
                       <div><dt>{t("自动重试")}</dt><dd>{entry.autoRetries}</dd></div>
                       <div><dt>{t("重试原因")}</dt><dd>{(entry.retryReasons ?? []).join("、") || "-"}</dd></div>
