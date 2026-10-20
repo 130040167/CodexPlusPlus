@@ -2310,13 +2310,14 @@ impl ProxyRequestLog {
         &mut self,
         failure: Option<&str>,
         usage: Option<crate::request_log::RequestUsage>,
+        failure_detail: Option<String>,
     ) {
         match failure {
             Some(reason) => {
                 self.entry.success = false;
                 self.entry.stream_outcome = Some(reason.to_string());
                 if self.entry.error.is_none() {
-                    self.entry.error = Some(reason.to_string());
+                    self.entry.error = Some(failure_detail.unwrap_or_else(|| reason.to_string()));
                 }
             }
             None => {
@@ -2442,7 +2443,7 @@ async fn handle_protocol_proxy_connection(
     if upstream.native_compaction_passthrough {
         let body = upstream.read_body().await?;
         request_log.record_usage_json(&body);
-        request_log.record_stream(None, None);
+        request_log.record_stream(None, None, None);
         let content_type = if upstream.content_type.is_empty() {
             if upstream.is_stream {
                 "text/event-stream; charset=utf-8"
@@ -2513,6 +2514,7 @@ async fn handle_protocol_proxy_connection(
             request_log.record_stream(
                 (!outcome.succeeded).then_some("compaction stream failed"),
                 None,
+                None,
             );
             stream.write_all(&outcome.payload).await?;
             log_helper_response(
@@ -2548,12 +2550,12 @@ async fn handle_protocol_proxy_connection(
             if let Some(outcome) = upstream.exec_outcome.as_mut() {
                 outcome.finish(exec_succeeded);
             }
-            request_log.record_stream((!exec_succeeded).then_some("exec stream failed"), None);
+            request_log.record_stream((!exec_succeeded).then_some("exec stream failed"), None, None);
             stream.shutdown().await?;
             return Ok(());
         }
         let stream_prefix = std::mem::take(&mut upstream.stream_prefix);
-        let (failure, usage) = forward_protocol_proxy_stream(
+        let (failure, usage, failure_detail) = forward_protocol_proxy_stream(
             stream,
             &stream_prefix,
             upstream.take_response()?,
@@ -2561,7 +2563,8 @@ async fn handle_protocol_proxy_connection(
             request_json.as_ref(),
         )
         .await?;
-        request_log.record_stream(failure.as_deref(), usage);
+        let failure_detail_for_log = failure_detail.clone();
+        request_log.record_stream(failure.as_deref(), usage, failure_detail);
         if let Some(reason) = failure {
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "helper.protocol_proxy_stream_failed",
@@ -2573,6 +2576,7 @@ async fn handle_protocol_proxy_connection(
                     "wireApi": upstream.wire_api,
                     "compactV2": request_json.as_ref().is_some_and(crate::protocol_proxy::request_has_compaction_trigger),
                     "error": reason,
+                    "detail": failure_detail_for_log,
                     "remote_addr": remote_addr_text
                 }),
             );
@@ -2623,7 +2627,7 @@ async fn handle_protocol_proxy_connection(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or(""),
         )?;
-        request_log.record_stream(None, None);
+        request_log.record_stream(None, None, None);
         write_http_response(stream, "200 OK", "text/event-stream; charset=utf-8", &body).await?;
         log_helper_response(
             "helper.protocol_proxy_compaction_ok",
@@ -3173,7 +3177,11 @@ async fn forward_protocol_proxy_stream(
     response: reqwest::Response,
     wire_api: crate::protocol_proxy::UpstreamWireApi,
     request: Option<&Value>,
-) -> anyhow::Result<(Option<String>, Option<crate::request_log::RequestUsage>)> {
+) -> anyhow::Result<(
+    Option<String>,
+    Option<crate::request_log::RequestUsage>,
+    Option<String>,
+)> {
     let mut chunks = response.bytes_stream();
     if wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
         let mut transformer = crate::protocol_proxy::ResponsesSseTransformer::for_request(request);
@@ -3183,7 +3191,8 @@ async fn forward_protocol_proxy_stream(
             stream.write_all(&out).await?;
             if transformer.has_failed() {
                 let usage = transformer.take_usage();
-                return Ok((transformer.finish(), usage));
+                let detail = transformer.take_failure_detail();
+                return Ok((transformer.finish(), usage, detail));
             }
         }
         while let Some(chunk) = chunks.next().await {
@@ -3195,17 +3204,20 @@ async fn forward_protocol_proxy_stream(
                     // 否则上游保持连接时失败迟迟不上报，残片也会继续被转发。
                     if transformer.has_failed() {
                         let usage = transformer.take_usage();
-                        return Ok((transformer.finish(), usage));
+                        let detail = transformer.take_failure_detail();
+                        return Ok((transformer.finish(), usage, detail));
                     }
                 }
                 Err(error) => {
                     let usage = transformer.take_usage();
-                    return Ok((Some(error.without_url().to_string()), usage));
+                    let detail = transformer.take_failure_detail();
+                    return Ok((Some(error.without_url().to_string()), usage, detail));
                 }
             }
         }
         let usage = transformer.take_usage();
-        return Ok((transformer.finish(), usage));
+        let detail = transformer.take_failure_detail();
+        return Ok((transformer.finish(), usage, detail));
     }
     if wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages {
         // Anthropic SSE → chat SSE → Responses SSE，终端事件语义与 chat 上游一致。
@@ -3220,7 +3232,7 @@ async fn forward_protocol_proxy_stream(
                         stream.write_all(&converted).await?;
                     }
                     if converter.has_failed() {
-                        return Ok((Some("上游返回了流式错误事件".to_string()), None));
+                        return Ok((Some("上游返回了流式错误事件".to_string()), None, None));
                     }
                 }
                 Err(error) => {
@@ -3229,7 +3241,7 @@ async fn forward_protocol_proxy_stream(
                         Some("stream_error".to_string()),
                     );
                     stream.write_all(&failed).await?;
-                    return Ok((Some(error.without_url().to_string()), None));
+                    return Ok((Some(error.without_url().to_string()), None, None));
                 }
             }
         }
@@ -3241,10 +3253,10 @@ async fn forward_protocol_proxy_stream(
                 Some("stream_incomplete".to_string()),
             );
             stream.write_all(&failed).await?;
-            return Ok((Some("上游缺少完成事件".to_string()), None));
+            return Ok((Some("上游缺少完成事件".to_string()), None, None));
         }
         stream.write_all(&converter.finish()).await?;
-        return Ok((None, None));
+        return Ok((None, None, None));
     }
     let mut converter = request
         .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
@@ -3255,7 +3267,7 @@ async fn forward_protocol_proxy_stream(
                 let converted = converter.push_bytes(&bytes);
                 stream.write_all(&converted).await?;
                 if converter.has_failed() {
-                    return Ok((Some("上游返回了流式错误事件".to_string()), None));
+                    return Ok((Some("上游返回了流式错误事件".to_string()), None, None));
                 }
             }
             Err(error) => {
@@ -3264,7 +3276,7 @@ async fn forward_protocol_proxy_stream(
                     Some("stream_error".to_string()),
                 );
                 stream.write_all(&failed).await?;
-                return Ok((Some(error.without_url().to_string()), None));
+                return Ok((Some(error.without_url().to_string()), None, None));
             }
         }
     }
@@ -3275,10 +3287,10 @@ async fn forward_protocol_proxy_stream(
             Some("stream_incomplete".to_string()),
         );
         stream.write_all(&failed).await?;
-        return Ok((Some("上游缺少完成事件".to_string()), None));
+        return Ok((Some("上游缺少完成事件".to_string()), None, None));
     }
     stream.write_all(&converter.finish()).await?;
-    Ok((None, None))
+    Ok((None, None, None))
 }
 
 fn log_helper_response(
@@ -6632,7 +6644,7 @@ mod proxy_stream_tests {
             .unwrap();
         let (mut writer, _) = downstream.accept().await.unwrap();
         let forwarded = tokio::spawn(async move {
-            let (result, _usage) =
+            let (result, _usage, _detail) =
                 forward_protocol_proxy_stream(&mut writer, &prefix, response, wire, None)
                     .await
                     .unwrap();

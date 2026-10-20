@@ -5592,8 +5592,16 @@ function RequestLogScreen() {
                   type="button"
                 >
                   <span>{formatRequestLogTime(entry.timestampMs)}</span>
-                  <span className={`request-log-status ${entry.success ? "ok" : "bad"}`}>
+                  <span
+                    className={`request-log-status ${entry.success ? "ok" : "bad"}`}
+                    title={entry.error ?? ""}
+                  >
                     {entry.statusCode || "ERR"}
+                    {!entry.success ? (
+                      <small className="request-log-stream-failed">
+                        {entry.stream ? t("流失败") : t("失败")}
+                      </small>
+                    ) : null}
                   </span>
                   <span className="request-log-ellipsis" title={entry.relayName}>{entry.relayName || "-"}</span>
                   <span className="request-log-ellipsis" title={entry.upstreamModel ? `${entry.model} → ${entry.upstreamModel}` : entry.model}>

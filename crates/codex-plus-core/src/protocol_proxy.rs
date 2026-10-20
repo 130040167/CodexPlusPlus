@@ -437,6 +437,22 @@ fn stream_failure_payload(block: &str) -> (Option<String>, Option<String>) {
     (code, message)
 }
 
+/// 把流内失败事件的 code/message 压成一行，写进请求日志与错误原因。
+fn stream_failure_detail(code: Option<&str>, message: Option<&str>) -> String {
+    let message = message
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(|message| message.chars().take(200).collect::<String>());
+    let mut parts = Vec::new();
+    if let Some(code) = code.map(str::trim).filter(|code| !code.is_empty()) {
+        parts.push(format!("code={code}"));
+    }
+    if let Some(message) = message {
+        parts.push(format!("message={message}"));
+    }
+    parts.join("，")
+}
+
 /// 流内终态失败是否值得重试。只认容量/过载，避免把上下文超限等永久错误重放。
 fn stream_failure_is_retryable(code: Option<&str>, message: Option<&str>) -> bool {
     let code = code.unwrap_or("").trim().to_ascii_lowercase();
@@ -10071,6 +10087,9 @@ pub(crate) struct ResponsesSseTransformer {
     apply_patch_declared_as_function: bool,
     /// 从 `response.completed` 里抓到的 usage，供请求日志使用。
     usage: Option<crate::request_log::RequestUsage>,
+    /// 终态失败事件里的 code/message 摘要。只进请求日志与诊断日志，
+    /// 不拼进 failure 原因（原因会随 SSE 回给客户端，不能泄露上游 payload）。
+    failure_detail: Option<String>,
 }
 
 /// 单个事件参与改写的最大缓冲字节数（4 MiB）。
@@ -10167,6 +10186,11 @@ impl ResponsesSseTransformer {
         self.usage.take()
     }
 
+    /// 取出终态失败的 code/message 摘要（请求日志/诊断日志用，不发给客户端）。
+    pub(crate) fn take_failure_detail(&mut self) -> Option<String> {
+        self.failure_detail.take()
+    }
+
     /// Flush after stream EOF. Returns failure reason if any.
     pub(crate) fn finish(mut self) -> Option<String> {
         self.buf.clear();
@@ -10224,6 +10248,13 @@ impl ResponsesSseTransformer {
         if event_type == "response.completed" {
             if let Some(usage) = crate::request_log::usage_from_response_json(&data_json) {
                 self.usage = Some(usage);
+            }
+        }
+        if matches!(event_type, "response.failed" | "response.incomplete" | "error") {
+            let (code, message) = stream_failure_payload(event_str);
+            let detail = stream_failure_detail(code.as_deref(), message.as_deref());
+            if !detail.is_empty() && self.failure_detail.is_none() {
+                self.failure_detail = Some(detail);
             }
         }
 
@@ -10652,6 +10683,17 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","name":
         assert_eq!(usage.reasoning_tokens, 9);
         assert!(t.take_usage().is_none(), "usage 只取一次");
         assert!(t.finish().is_none());
+    }
+
+    #[test]
+    fn error_event_failure_detail_is_kept_out_of_client_facing_reason() {
+        let mut t = ResponsesSseTransformer::default();
+        t.push_bytes(b"event: error\ndata:{\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"message\":\"upstream exploded\"}}\n\n");
+        let detail = t.take_failure_detail().expect("error event detail");
+        assert!(detail.contains("server_error"), "{detail}");
+        assert!(detail.contains("upstream exploded"), "{detail}");
+        let failure = t.finish().expect("error event must fail");
+        assert_eq!(failure, "原生 Responses 上游返回 error 事件");
     }
 
     #[test]

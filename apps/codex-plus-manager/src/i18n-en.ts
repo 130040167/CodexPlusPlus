@@ -689,6 +689,7 @@ export const EN_PLAIN: Record<string, string> = {
   "重试原因": "Retry reasons",
   "流结果": "Stream outcome",
   "流式": "Streaming",
+  "流失败": "stream failed",
   "推理 tokens": "Reasoning tokens",
   "错误": "Error",
   "自动重试 ×{0}": "Auto retries ×{0}",

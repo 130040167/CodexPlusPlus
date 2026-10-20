@@ -10886,3 +10886,10 @@ select {
   font-size: 12px;
   word-break: break-all;
 }
+
+.request-log-status small {
+  display: block;
+  font-size: 10px;
+  font-weight: 500;
+  opacity: 0.9;
+}
