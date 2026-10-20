@@ -2228,6 +2228,132 @@ async fn handle_models_proxy_connection(
     stream.shutdown().await?;
     Ok(())
 }
+/// 单次协议代理请求的日志草稿。
+///
+/// 用 Drop 兜底写盘：这个函数分支很多（错误、非 2xx、原生压缩、流式、协议转换），
+/// 每个分支都手写一遍落盘容易漏；字段在分支里按需补齐，析构时统一写一条记录。
+struct ProxyRequestLog {
+    started: std::time::Instant,
+    entry: crate::request_log::RequestLogEntry,
+    written: bool,
+}
+
+impl ProxyRequestLog {
+    fn begin(method: &str, path: &str, request: Option<&Value>) -> Self {
+        let started_at_ms = current_time_ms();
+        let model = request
+            .and_then(|request| request.get("model"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Self {
+            started: std::time::Instant::now(),
+            entry: crate::request_log::RequestLogEntry {
+                id: crate::request_log::RequestLogEntry::new_id(started_at_ms),
+                timestamp_ms: started_at_ms,
+                started_at_ms,
+                duration_ms: 0,
+                method: method.to_string(),
+                path: path.to_string(),
+                status_code: 0,
+                success: false,
+                stream: false,
+                model,
+                upstream_model: String::new(),
+                relay_id: String::new(),
+                relay_name: String::new(),
+                wire_api: String::new(),
+                attempts: 0,
+                auto_retries: 0,
+                retry_reasons: Vec::new(),
+                error: None,
+                stream_outcome: None,
+                usage: None,
+                cache_hit_ratio: None,
+            },
+            written: false,
+        }
+    }
+
+    fn record_upstream(&mut self, upstream: &crate::protocol_proxy::UpstreamProxyResponse) {
+        self.entry.status_code = upstream.status_code;
+        self.entry.success = upstream.is_success();
+        self.entry.stream = upstream.is_stream;
+        if let Some(trace) = &upstream.request_trace {
+            self.entry.relay_id = trace.relay_id.clone();
+            self.entry.relay_name = trace.relay_name.clone();
+            self.entry.upstream_model = trace.upstream_model.clone();
+            self.entry.wire_api = trace.wire_api.clone();
+            self.entry.attempts = trace.attempts;
+            self.entry.auto_retries = trace.auto_retries;
+            self.entry.retry_reasons = trace.retry_reasons.clone();
+        }
+    }
+
+    fn record_error(&mut self, status: &str, error: String) {
+        self.entry.status_code = status
+            .split_whitespace()
+            .next()
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(0);
+        self.entry.success = false;
+        self.entry.error = Some(error);
+    }
+
+    fn record_usage_json(&mut self, body: &[u8]) {
+        if self.entry.usage.is_none() {
+            self.entry.usage = crate::request_log::usage_from_body_bytes(body);
+        }
+    }
+
+    fn record_stream(
+        &mut self,
+        failure: Option<&str>,
+        usage: Option<crate::request_log::RequestUsage>,
+    ) {
+        match failure {
+            Some(reason) => {
+                self.entry.success = false;
+                self.entry.stream_outcome = Some(reason.to_string());
+                if self.entry.error.is_none() {
+                    self.entry.error = Some(reason.to_string());
+                }
+            }
+            None => {
+                self.entry.success = true;
+                self.entry.stream_outcome = Some("ok".to_string());
+            }
+        }
+        if usage.is_some() {
+            self.entry.usage = usage;
+        }
+    }
+
+    fn write(&mut self) {
+        if self.written {
+            return;
+        }
+        self.written = true;
+        let finished_at_ms = current_time_ms();
+        self.entry.finish(finished_at_ms);
+        let _ = crate::request_log::append_request_log(&self.entry);
+        let _ = self.started; // 时长由 entry.finish 统一计算，保留 Instant 供调试断点。
+    }
+}
+
+impl Drop for ProxyRequestLog {
+    fn drop(&mut self) {
+        self.write();
+    }
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 async fn handle_protocol_proxy_connection(
     stream: &mut tokio::net::TcpStream,
     request_body: &str,
@@ -2239,6 +2365,7 @@ async fn handle_protocol_proxy_connection(
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
     let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
+    let mut request_log = ProxyRequestLog::begin(method, path, request_json.as_ref());
     let mut upstream =
         match crate::protocol_proxy::open_responses_proxy_request_for_path_with_session_headers(
             request_body,
@@ -2284,14 +2411,17 @@ async fn handle_protocol_proxy_connection(
                     &error_chain,
                     remote_addr_text,
                 );
+                request_log.record_error(status, error_chain.clone());
                 stream.shutdown().await?;
                 return Ok(());
             }
         };
+    request_log.record_upstream(&upstream);
     if !upstream.is_success() {
         let status = upstream.status();
         let upstream_content_type = upstream.content_type.clone();
         let upstream_body = upstream.read_body().await?;
+        request_log.record_usage_json(&upstream_body);
         let error = crate::protocol_proxy::responses_error_from_upstream(
             upstream.status_code,
             &upstream_content_type,
@@ -2311,6 +2441,8 @@ async fn handle_protocol_proxy_connection(
     }
     if upstream.native_compaction_passthrough {
         let body = upstream.read_body().await?;
+        request_log.record_usage_json(&body);
+        request_log.record_stream(None, None);
         let content_type = if upstream.content_type.is_empty() {
             if upstream.is_stream {
                 "text/event-stream; charset=utf-8"
@@ -2378,6 +2510,10 @@ async fn handle_protocol_proxy_connection(
                 }
             }
             let outcome = converter.finish_with_outcome();
+            request_log.record_stream(
+                (!outcome.succeeded).then_some("compaction stream failed"),
+                None,
+            );
             stream.write_all(&outcome.payload).await?;
             log_helper_response(
                 if outcome.succeeded { "helper.protocol_proxy_compaction_ok" } else { "helper.protocol_proxy_compaction_failed" },
@@ -2408,14 +2544,16 @@ async fn handle_protocol_proxy_connection(
                 }
             }
             stream.write_all(&converter.finish()?).await?;
+            let exec_succeeded = converter.succeeded();
             if let Some(outcome) = upstream.exec_outcome.as_mut() {
-                outcome.finish(converter.succeeded());
+                outcome.finish(exec_succeeded);
             }
+            request_log.record_stream((!exec_succeeded).then_some("exec stream failed"), None);
             stream.shutdown().await?;
             return Ok(());
         }
         let stream_prefix = std::mem::take(&mut upstream.stream_prefix);
-        let failure = forward_protocol_proxy_stream(
+        let (failure, usage) = forward_protocol_proxy_stream(
             stream,
             &stream_prefix,
             upstream.take_response()?,
@@ -2423,6 +2561,7 @@ async fn handle_protocol_proxy_connection(
             request_json.as_ref(),
         )
         .await?;
+        request_log.record_stream(failure.as_deref(), usage);
         if let Some(reason) = failure {
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "helper.protocol_proxy_stream_failed",
@@ -2455,9 +2594,11 @@ async fn handle_protocol_proxy_connection(
             if let Some(outcome) = upstream.exec_outcome.as_mut() {
                 outcome.finish(false);
             }
+            request_log.record_error("502 Bad Gateway", error.to_string());
             return Err(error);
         }
     };
+    request_log.record_usage_json(&upstream_body);
     if upstream.compaction {
         // v2 远程压缩非流式路径：同样重组为单个 compaction 输出项。
         if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages {
@@ -2482,6 +2623,7 @@ async fn handle_protocol_proxy_connection(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or(""),
         )?;
+        request_log.record_stream(None, None);
         write_http_response(stream, "200 OK", "text/event-stream; charset=utf-8", &body).await?;
         log_helper_response(
             "helper.protocol_proxy_compaction_ok",
@@ -2505,6 +2647,7 @@ async fn handle_protocol_proxy_connection(
         } else {
             upstream_body
         };
+        request_log.record_usage_json(&body);
         write_http_response(
             stream,
             "200 OK",
@@ -2549,6 +2692,7 @@ async fn handle_protocol_proxy_connection(
         crate::anthropic_bridge::attach_thinking_to_responses(&mut response_json, &thinking_blocks);
     }
     let body = serde_json::to_vec(&response_json)?;
+    request_log.record_usage_json(&body);
     write_http_response(stream, "200 OK", "application/json; charset=utf-8", &body).await?;
     log_helper_response(
         "helper.protocol_proxy_ok",
@@ -3022,14 +3166,14 @@ async fn write_http_stream_headers(
     Ok(())
 }
 
-// 返回流失败原因，HTTP 响应头已经发送，不能再把失败伪装成第二个 HTTP 502。
+// 返回流失败原因与（可选的）usage；HTTP 响应头已经发送，不能再把失败伪装成第二个 HTTP 502。
 async fn forward_protocol_proxy_stream(
     stream: &mut tokio::net::TcpStream,
     prefix: &[u8],
     response: reqwest::Response,
     wire_api: crate::protocol_proxy::UpstreamWireApi,
     request: Option<&Value>,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<(Option<String>, Option<crate::request_log::RequestUsage>)> {
     let mut chunks = response.bytes_stream();
     if wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
         let mut transformer = crate::protocol_proxy::ResponsesSseTransformer::for_request(request);
@@ -3038,7 +3182,8 @@ async fn forward_protocol_proxy_stream(
             let out = transformer.push_bytes(prefix);
             stream.write_all(&out).await?;
             if transformer.has_failed() {
-                return Ok(transformer.finish());
+                let usage = transformer.take_usage();
+                return Ok((transformer.finish(), usage));
             }
         }
         while let Some(chunk) = chunks.next().await {
@@ -3049,13 +3194,18 @@ async fn forward_protocol_proxy_stream(
                     // 超限等终态失败要立即结束流，不能等上游 EOF；
                     // 否则上游保持连接时失败迟迟不上报，残片也会继续被转发。
                     if transformer.has_failed() {
-                        return Ok(transformer.finish());
+                        let usage = transformer.take_usage();
+                        return Ok((transformer.finish(), usage));
                     }
                 }
-                Err(error) => return Ok(Some(error.without_url().to_string())),
+                Err(error) => {
+                    let usage = transformer.take_usage();
+                    return Ok((Some(error.without_url().to_string()), usage));
+                }
             }
         }
-        return Ok(transformer.finish());
+        let usage = transformer.take_usage();
+        return Ok((transformer.finish(), usage));
     }
     if wire_api == crate::protocol_proxy::UpstreamWireApi::AnthropicMessages {
         // Anthropic SSE → chat SSE → Responses SSE，终端事件语义与 chat 上游一致。
@@ -3070,7 +3220,7 @@ async fn forward_protocol_proxy_stream(
                         stream.write_all(&converted).await?;
                     }
                     if converter.has_failed() {
-                        return Ok(Some("上游返回了流式错误事件".to_string()));
+                        return Ok((Some("上游返回了流式错误事件".to_string()), None));
                     }
                 }
                 Err(error) => {
@@ -3079,7 +3229,7 @@ async fn forward_protocol_proxy_stream(
                         Some("stream_error".to_string()),
                     );
                     stream.write_all(&failed).await?;
-                    return Ok(Some(error.without_url().to_string()));
+                    return Ok((Some(error.without_url().to_string()), None));
                 }
             }
         }
@@ -3091,10 +3241,10 @@ async fn forward_protocol_proxy_stream(
                 Some("stream_incomplete".to_string()),
             );
             stream.write_all(&failed).await?;
-            return Ok(Some("上游缺少完成事件".to_string()));
+            return Ok((Some("上游缺少完成事件".to_string()), None));
         }
         stream.write_all(&converter.finish()).await?;
-        return Ok(None);
+        return Ok((None, None));
     }
     let mut converter = request
         .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
@@ -3105,7 +3255,7 @@ async fn forward_protocol_proxy_stream(
                 let converted = converter.push_bytes(&bytes);
                 stream.write_all(&converted).await?;
                 if converter.has_failed() {
-                    return Ok(Some("上游返回了流式错误事件".to_string()));
+                    return Ok((Some("上游返回了流式错误事件".to_string()), None));
                 }
             }
             Err(error) => {
@@ -3114,7 +3264,7 @@ async fn forward_protocol_proxy_stream(
                     Some("stream_error".to_string()),
                 );
                 stream.write_all(&failed).await?;
-                return Ok(Some(error.without_url().to_string()));
+                return Ok((Some(error.without_url().to_string()), None));
             }
         }
     }
@@ -3125,10 +3275,10 @@ async fn forward_protocol_proxy_stream(
             Some("stream_incomplete".to_string()),
         );
         stream.write_all(&failed).await?;
-        return Ok(Some("上游缺少完成事件".to_string()));
+        return Ok((Some("上游缺少完成事件".to_string()), None));
     }
     stream.write_all(&converter.finish()).await?;
-    Ok(None)
+    Ok((None, None))
 }
 
 fn log_helper_response(
@@ -5808,6 +5958,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn helper_writes_request_log_with_usage_and_trace() {
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let log_path = temp.path().join("request-log.jsonl");
+        let previous_settings_path =
+            crate::paths::set_settings_path_for_tests(Some(settings_path.clone()));
+        crate::request_log::set_request_log_path_for_tests(Some(log_path.clone()));
+
+        let upstream_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let settings = serde_json::json!({
+            "relayProfilesEnabled": true,
+            "relayProfiles": [{
+                "id": "request-log-relay",
+                "name": "请求日志供应商",
+                "baseUrl": format!("http://{upstream_addr}/v1"),
+                "upstreamBaseUrl": format!("http://{upstream_addr}/v1"),
+                "apiKey": "sk-upstream",
+                "protocol": "responses",
+                "relayMode": "pureApi"
+            }],
+            "activeRelayId": "request-log-relay"
+        });
+        std::fs::write(settings_path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let mut expected_len = None;
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "upstream request ended before body completed");
+                request.extend_from_slice(&buffer[..read]);
+                if expected_len.is_none() {
+                    if let Some(header_end) = find_header_end(&request) {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_length = header_value_from_headers(&headers, "content-length")
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap();
+                        expected_len = Some(header_end + 4 + content_length);
+                    }
+                }
+                if expected_len.is_some_and(|length| request.len() >= length) {
+                    break;
+                }
+            }
+            let response_body = br#"{"id":"resp_logged","object":"response","usage":{"input_tokens":120,"output_tokens":30,"input_tokens_details":{"cached_tokens":100}}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(response_body).await.unwrap();
+            request
+        });
+
+        let helper_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let helper_addr = helper_listener.local_addr().unwrap();
+        let helper = tokio::spawn(async move {
+            let (stream, remote_addr) = helper_listener.accept().await.unwrap();
+            handle_helper_connection(stream, Some(remote_addr))
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(helper_addr).await.unwrap();
+        let body = br#"{"model":"gpt-6.1-sol","input":"probe","stream":false}"#;
+        let headers = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: {helper_addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        client.write_all(headers.as_bytes()).await.unwrap();
+        client.write_all(body).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+
+        helper.await.unwrap();
+        upstream.await.unwrap();
+
+        let entries = crate::request_log::read_request_logs_at(&log_path, 10).unwrap();
+        assert_eq!(entries.len(), 1, "每次代理请求写一条请求日志");
+        let entry = &entries[0];
+        assert_eq!(entry.status_code, 200);
+        assert!(entry.success);
+        assert_eq!(entry.model, "gpt-6.1-sol");
+        assert_eq!(entry.upstream_model, "gpt-6.1-sol");
+        assert_eq!(entry.relay_name, "请求日志供应商");
+        assert_eq!(entry.attempts, 1);
+        assert_eq!(entry.auto_retries, 0);
+        let usage = entry.usage.as_ref().expect("usage");
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 30);
+        assert_eq!(usage.cached_tokens, 100);
+        assert_eq!(entry.cache_hit_ratio, Some(100.0 / 120.0));
+
+        crate::request_log::set_request_log_path_for_tests(None);
+        crate::paths::set_settings_path_for_tests(previous_settings_path);
+    }
+
+    #[tokio::test]
     async fn helper_protocol_safety_rejects_files_before_upstream_and_checks_original_compaction_wire()
      {
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
@@ -6375,9 +6632,10 @@ mod proxy_stream_tests {
             .unwrap();
         let (mut writer, _) = downstream.accept().await.unwrap();
         let forwarded = tokio::spawn(async move {
-            let result = forward_protocol_proxy_stream(&mut writer, &prefix, response, wire, None)
-                .await
-                .unwrap();
+            let (result, _usage) =
+                forward_protocol_proxy_stream(&mut writer, &prefix, response, wire, None)
+                    .await
+                    .unwrap();
             writer.shutdown().await.unwrap();
             result
         });
@@ -6608,7 +6866,8 @@ mod proxy_stream_tests {
         )
         .await
         .expect("上游发完终止块后转发必须结束")
-        .unwrap();
+        .unwrap()
+        .0;
         writer.shutdown().await.unwrap();
         assert!(forwarded.is_none(), "超大事件后有 response.completed，流应判为成功：{forwarded:?}");
 

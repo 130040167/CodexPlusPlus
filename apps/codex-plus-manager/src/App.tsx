@@ -79,7 +79,7 @@ import {
 import { createPresetPatch } from "@/components/ProviderPresetSelector";
 import { PRESETS, type ProviderPreset } from "./presets";
 import { createPortal } from "react-dom";
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
 
 import { Badge as UiBadge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -580,6 +580,43 @@ type UserScriptInventory = {
     source_url?: string;
     homepage?: string;
   }>;
+};
+
+type RequestLogUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens?: number;
+  reasoningTokens?: number;
+};
+
+type RequestLogEntry = {
+  id: string;
+  timestampMs: number;
+  startedAtMs: number;
+  durationMs: number;
+  method: string;
+  path: string;
+  statusCode: number;
+  success: boolean;
+  stream: boolean;
+  model: string;
+  upstreamModel: string;
+  relayId: string;
+  relayName: string;
+  wireApi: string;
+  attempts: number;
+  autoRetries: number;
+  retryReasons?: string[];
+  error?: string | null;
+  streamOutcome?: string | null;
+  usage?: RequestLogUsage | null;
+  cacheHitRatio?: number | null;
+};
+
+type RequestLogsResult = {
+  status: Status;
+  message: string;
+  entries: RequestLogEntry[];
 };
 
 type SettingsResult = CommandResult<{
@@ -1089,7 +1126,7 @@ const TOOL_ICONS: Record<string, string> = {
   claude: new URL("./assets/agents/claude.svg", import.meta.url).href,
 };
 
-type Route = "overview" | "relay" | "multiLaunch" | "grok" | "claude" | "relayEnvironment" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "maintenance" | "about" | "settings";
+type Route = "overview" | "relay" | "multiLaunch" | "grok" | "claude" | "relayEnvironment" | "requestLog" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "maintenance" | "about" | "settings";
 type Theme = "dark" | "light";
 
 const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
@@ -1127,12 +1164,13 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "about", get label() { return t("关于"); }, icon: Info },
   { id: "settings", get label() { return t("设置"); }, icon: Settings },
   { id: "relayEnvironment", get label() { return t("代理设置"); }, icon: ShieldCheck, tool: "codex" },
+  { id: "requestLog", get label() { return t("请求日志"); }, icon: List, tool: "codex" },
 ];
 
 const navigationSections: Array<{ label: string; routes: Route[]; placement?: "bottom" }> = [
   {
     get label() { return t("工作区"); },
-    routes: ["overview", "relay", "relayEnvironment", "multiLaunch", "grok", "claude"],
+    routes: ["overview", "relay", "relayEnvironment", "requestLog", "multiLaunch", "grok", "claude"],
   },
   {
     get label() { return t("全局管理"); },
@@ -4038,6 +4076,9 @@ export function App() {
               actions={actions}
             />
           ) : null}
+          {route === "requestLog" ? (
+            <RequestLogScreen />
+          ) : null}
           {route === "grok" ? (
             <GrokScreen settings={settings} form={settingsForm} actions={actions} />
           ) : null}
@@ -5367,6 +5408,248 @@ function ProxySettingsScreen({
         </div>
       ) : null}
     </div>
+  );
+}
+
+function formatRequestLogTime(timestampMs: number) {
+  if (!Number.isFinite(timestampMs) || timestampMs <= 0) return "-";
+  const date = new Date(timestampMs);
+  const now = new Date();
+  const sameDay =
+    date.getFullYear() === now.getFullYear()
+    && date.getMonth() === now.getMonth()
+    && date.getDate() === now.getDate();
+  const time = date.toLocaleTimeString("zh-CN", { hour12: false });
+  return sameDay ? time : `${date.getMonth() + 1}/${date.getDate()} ${time}`;
+}
+
+function formatRequestLogTokens(value?: number | null) {
+  if (value == null) return "-";
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return String(value);
+}
+
+function formatRequestLogDuration(durationMs: number) {
+  if (!Number.isFinite(durationMs) || durationMs < 0) return "-";
+  if (durationMs < 1000) return `${durationMs}ms`;
+  if (durationMs < 60_000) return `${(durationMs / 1000).toFixed(1)}s`;
+  return `${Math.floor(durationMs / 60_000)}m${Math.round((durationMs % 60_000) / 1000)}s`;
+}
+
+function requestLogRetryLabel(entry: RequestLogEntry) {
+  if (entry.autoRetries > 0) return tf("自动重试 ×{0}", [String(entry.autoRetries)]);
+  if (entry.attempts > 1) return tf("切换 ×{0}", [String(entry.attempts)]);
+  return "-";
+}
+
+function RequestLogScreen() {
+  const [entries, setEntries] = useState<RequestLogEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<"all" | "success" | "failed" | "retried">("all");
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [clearing, setClearing] = useState(false);
+
+  const load = async (silent = false) => {
+    if (!silent) setLoading(true);
+    try {
+      const result = await invoke<RequestLogsResult>("load_request_logs", { limit: 300 });
+      if (result.status === "ok") {
+        setEntries(result.entries ?? []);
+        setError("");
+      } else {
+        setError(result.message || t("读取请求日志失败。"));
+      }
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void load(true);
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [autoRefresh]);
+
+  const clearLogs = async () => {
+    if (!window.confirm(t("清空全部请求日志？此操作不可撤销。"))) return;
+    setClearing(true);
+    try {
+      const result = await invoke<{ status: Status; message: string }>("clear_request_logs");
+      if (result.status !== "ok") setError(result.message);
+      await load(true);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  const filtered = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return entries.filter((entry) => {
+      if (filter === "success" && !entry.success) return false;
+      if (filter === "failed" && entry.success) return false;
+      if (filter === "retried" && entry.autoRetries === 0 && entry.attempts <= 1) return false;
+      if (!needle) return true;
+      return [
+        entry.model,
+        entry.upstreamModel,
+        entry.relayName,
+        entry.path,
+        entry.error ?? "",
+        entry.wireApi,
+      ]
+        .join(" ")
+        .toLowerCase()
+        .includes(needle);
+    });
+  }, [entries, filter, query]);
+
+  return (
+    <Panel>
+      <CardHead
+        title={t("请求日志")}
+        detail={tf("最近 {0} 条代理请求，含状态、模型、重试与 token 用量", [String(entries.length)])}
+      />
+      <CardContent className="request-log-content">
+        <div className="request-log-toolbar">
+          <div className="request-log-search">
+            <Search className="h-4 w-4" aria-hidden="true" />
+            <Input
+              aria-label={t("搜索模型 / 供应商 / 路径 / 错误")}
+              placeholder={t("搜索模型 / 供应商 / 路径 / 错误")}
+              value={query}
+              onChange={(event) => setQuery(event.currentTarget.value)}
+            />
+          </div>
+          <select
+            aria-label={t("状态筛选")}
+            className="request-log-filter"
+            value={filter}
+            onChange={(event) => setFilter(event.currentTarget.value as typeof filter)}
+          >
+            <option value="all">{t("全部")}</option>
+            <option value="success">{t("仅成功")}</option>
+            <option value="failed">{t("仅失败")}</option>
+            <option value="retried">{t("含重试")}</option>
+          </select>
+          <label className="check-row request-log-auto">
+            <input
+              checked={autoRefresh}
+              onChange={(event) => setAutoRefresh(event.currentTarget.checked)}
+              type="checkbox"
+            />
+            <span>{t("自动刷新")}</span>
+          </label>
+          <Button variant="secondary" onClick={() => void load()}>
+            <RefreshCw className="h-4 w-4" />
+            {t("刷新")}
+          </Button>
+          <Button disabled={clearing || entries.length === 0} variant="secondary" onClick={() => void clearLogs()}>
+            <Trash2 className="h-4 w-4" />
+            {t("清空")}
+          </Button>
+        </div>
+
+        {error ? (
+          <p className="field-hint request-log-error" role="alert">{error}</p>
+        ) : null}
+
+        {loading && entries.length === 0 ? (
+          <div className="empty">{t("正在读取请求日志…")}</div>
+        ) : filtered.length ? (
+          <div className="request-log-table" role="table" aria-label={t("请求日志")}>
+            <div className="request-log-row request-log-head" role="row">
+              <span>{t("时间")}</span>
+              <span>{t("状态")}</span>
+              <span>{t("来源")}</span>
+              <span>{t("模型")}</span>
+              <span>{t("重试")}</span>
+              <span>{t("输入")}</span>
+              <span>{t("输出")}</span>
+              <span>{t("缓存")}</span>
+              <span>{t("耗时")}</span>
+              <span>{t("协议")}</span>
+            </div>
+            {filtered.map((entry) => (
+              <Fragment key={entry.id}>
+                <button
+                  aria-expanded={expanded === entry.id}
+                  className={`request-log-row request-log-entry ${entry.success ? "ok" : "bad"}`}
+                  onClick={() => setExpanded(expanded === entry.id ? null : entry.id)}
+                  role="row"
+                  type="button"
+                >
+                  <span>{formatRequestLogTime(entry.timestampMs)}</span>
+                  <span className={`request-log-status ${entry.success ? "ok" : "bad"}`}>
+                    {entry.statusCode || "ERR"}
+                  </span>
+                  <span className="request-log-ellipsis" title={entry.relayName}>{entry.relayName || "-"}</span>
+                  <span className="request-log-ellipsis" title={entry.upstreamModel ? `${entry.model} → ${entry.upstreamModel}` : entry.model}>
+                    {entry.model || "-"}
+                    {entry.upstreamModel && entry.upstreamModel !== entry.model ? (
+                      <small> → {entry.upstreamModel}</small>
+                    ) : null}
+                  </span>
+                  <span
+                    className={entry.autoRetries > 0 ? "request-log-retry" : "request-log-muted"}
+                    title={(entry.retryReasons ?? []).join("、")}
+                  >
+                    {requestLogRetryLabel(entry)}
+                  </span>
+                  <span>{formatRequestLogTokens(entry.usage?.inputTokens)}</span>
+                  <span>{formatRequestLogTokens(entry.usage?.outputTokens)}</span>
+                  <span>
+                    {entry.usage?.cachedTokens ? (
+                      <>
+                        {formatRequestLogTokens(entry.usage.cachedTokens)}
+                        <small> · {Math.round((entry.cacheHitRatio ?? 0) * 100)}%</small>
+                      </>
+                    ) : "-"}
+                  </span>
+                  <span>{formatRequestLogDuration(entry.durationMs)}</span>
+                  <span>{entry.stream ? "SSE" : "JSON"}</span>
+                </button>
+                {expanded === entry.id ? (
+                  <div className="request-log-detail">
+                    <dl>
+                      <div><dt>{t("请求 ID")}</dt><dd><code>{entry.id}</code></dd></div>
+                      <div><dt>{t("路径")}</dt><dd><code>{entry.method} {entry.path}</code></dd></div>
+                      <div><dt>{t("上游协议")}</dt><dd>{entry.wireApi || "-"}</dd></div>
+                      <div><dt>{t("上游模型")}</dt><dd>{entry.upstreamModel || "-"}</dd></div>
+                      <div><dt>{t("尝试次数")}</dt><dd>{entry.attempts || "-"}</dd></div>
+                      <div><dt>{t("自动重试")}</dt><dd>{entry.autoRetries}</dd></div>
+                      <div><dt>{t("重试原因")}</dt><dd>{(entry.retryReasons ?? []).join("、") || "-"}</dd></div>
+                      <div><dt>{t("流结果")}</dt><dd>{entry.streamOutcome || "-"}</dd></div>
+                      <div><dt>{t("推理 tokens")}</dt><dd>{formatRequestLogTokens(entry.usage?.reasoningTokens)}</dd></div>
+                      <div><dt>{t("错误")}</dt><dd>{entry.error || "-"}</dd></div>
+                    </dl>
+                  </div>
+                ) : null}
+              </Fragment>
+            ))}
+          </div>
+        ) : (
+          <div className="empty">
+            {entries.length
+              ? t("没有匹配当前筛选条件的请求。")
+              : t("还没有请求日志。启动 Codex 发起一次对话后即可看到。")}
+          </div>
+        )}
+      </CardContent>
+    </Panel>
   );
 }
 
@@ -13596,6 +13879,7 @@ function routeSubtitle(route: Route) {
     grok: t("管理 Grok CLI 的模型与 API 端点"),
     claude: t("保留官方 Claude.app 原样，通过受管副本为 Claude 应用增强功能"),
     relayEnvironment: t("统一管理本地协议代理、供应商代理与重试策略"),
+    requestLog: t("查看代理请求的状态、模型、重试、token 用量与缓存命中"),
     sessions: t("查看、删除和修复 Codex 本地会话"),
     context: t("独立管理 MCP 服务器与插件"),
     skills: t("从 GitHub 仓库安装 Skill 到 Codex"),

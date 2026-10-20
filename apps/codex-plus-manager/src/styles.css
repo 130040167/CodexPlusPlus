@@ -10723,3 +10723,154 @@ select {
     grid-column: 1 / -1;
   }
 }
+
+/* ── 请求日志页 ──────────────────────────────────────────────── */
+.request-log-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.request-log-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.request-log-search {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  min-width: 220px;
+}
+
+.request-log-search svg {
+  color: hsl(var(--muted-foreground));
+}
+
+.request-log-filter {
+  height: 32px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--background));
+  color: inherit;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.request-log-auto {
+  margin: 0;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.request-log-error {
+  color: hsl(0 72% 60%);
+}
+
+.request-log-table {
+  overflow-x: auto;
+  border: 1px solid hsl(var(--border));
+  border-radius: 10px;
+}
+
+.request-log-row {
+  display: grid;
+  grid-template-columns: 92px 56px 130px minmax(150px, 1.4fr) 92px 72px 72px 100px 72px 52px;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  min-width: 1020px;
+  border: 0;
+  padding: 8px 12px;
+  color: inherit;
+  font-size: 12px;
+  text-align: left;
+}
+
+.request-log-head {
+  background: hsl(var(--muted) / 0.5);
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+.request-log-entry {
+  border-top: 1px solid hsl(var(--border));
+  background: transparent;
+  cursor: pointer;
+}
+
+.request-log-entry:hover {
+  background: hsl(var(--accent) / 0.45);
+}
+
+.request-log-entry[aria-expanded="true"] {
+  background: hsl(var(--accent) / 0.35);
+}
+
+.request-log-status {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.request-log-status.ok {
+  color: hsl(142 60% 46%);
+}
+
+.request-log-status.bad {
+  color: hsl(0 72% 62%);
+}
+
+.request-log-retry {
+  color: hsl(38 92% 58%);
+  font-weight: 600;
+}
+
+.request-log-muted {
+  color: hsl(var(--muted-foreground));
+}
+
+.request-log-ellipsis {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.request-log-ellipsis small {
+  color: hsl(var(--muted-foreground));
+  font-size: 10px;
+}
+
+.request-log-detail {
+  padding: 10px 14px 14px;
+  border-top: 1px dashed hsl(var(--border));
+  background: hsl(var(--muted) / 0.25);
+}
+
+.request-log-detail dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 8px 18px;
+  margin: 0;
+}
+
+.request-log-detail dl > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.request-log-detail dt {
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+}
+
+.request-log-detail dd {
+  margin: 0;
+  font-size: 12px;
+  word-break: break-all;
+}

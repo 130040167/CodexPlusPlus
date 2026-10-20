@@ -7589,6 +7589,10 @@ async fn proxy_auto_retry_recovers_from_upstream_capacity_error() {
     .unwrap();
 
     assert_eq!(result.status_code, 200);
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 2);
+    assert_eq!(trace.auto_retries, 1);
+    assert!(trace.retry_reasons.into_iter().any(|reason| reason.starts_with("upstream_status_")));
     let body: Value = serde_json::from_slice(&result.read_body().await.unwrap()).unwrap();
     assert_eq!(body["id"], "resp_retried");
     let requests = server.await.unwrap();
@@ -7738,6 +7742,10 @@ async fn proxy_auto_retry_recovers_from_capacity_error_inside_200_stream() {
 
     assert_eq!(result.status_code, 200);
     assert!(result.is_stream);
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 2);
+    assert_eq!(trace.auto_retries, 1);
+    assert_eq!(trace.retry_reasons, vec!["upstream_stream_failed".to_string()]);
     let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
     assert!(body.contains("resp_ok"));
     assert!(

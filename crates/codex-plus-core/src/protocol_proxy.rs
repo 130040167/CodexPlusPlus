@@ -367,6 +367,7 @@ async fn schedule_proxy_auto_retry(
     request_attempt: usize,
     reason: &str,
     retry_after: Option<Duration>,
+    retry_reasons: &mut Vec<String>,
 ) -> bool {
     let Some(state) = state.as_mut() else {
         return false;
@@ -386,6 +387,7 @@ async fn schedule_proxy_auto_retry(
         }),
     );
     tokio::time::sleep(delay).await;
+    retry_reasons.push(reason.to_string());
     true
 }
 /// 流式响应预读上限：超限说明已有大量内容（不可能还是空转失败），直接放行。
@@ -526,6 +528,18 @@ async fn peek_responses_stream_start(upstream: &mut reqwest::Response) -> Stream
             // 出现任何真正的输出事件：立即放行，后续流不再延迟。
             return StreamStartPeek::Forward(buffered);
         }
+    }
+}
+
+/// 请求日志里使用的上游协议名。
+fn upstream_wire_api_label(api: UpstreamWireApi) -> &'static str {
+    match api {
+        UpstreamWireApi::Responses => "responses",
+        UpstreamWireApi::ChatCompletions => "chatCompletions",
+        UpstreamWireApi::AnthropicMessages => "anthropicMessages",
+        UpstreamWireApi::AudioTranscriptions => "audioTranscriptions",
+        UpstreamWireApi::ImageGenerations => "imageGenerations",
+        UpstreamWireApi::ImageEdits => "imageEdits",
     }
 }
 
@@ -1399,6 +1413,8 @@ pub struct UpstreamProxyResponse {
     /// 流式响应开头已被代理预读的字节。调用方必须先原样转发这段前缀，
     /// 再消费 `response` 的剩余部分；为空表示没有预读。
     pub stream_prefix: Vec<u8>,
+    /// 代理内部的重试与路由痕迹；启动器用它写请求日志。
+    pub request_trace: Option<crate::request_log::RequestTrace>,
     /// 上游请求是否使用了 Responses exec 兼容包装。
     pub exec_adapted: bool,
     pub(crate) exec_outcome: Option<crate::responses_exec_transport::ExecOutcome>,
@@ -2465,6 +2481,7 @@ fn native_compaction_unsupported_result(
             native_compaction_passthrough: false,
             buffered_body: Some(serde_json::to_vec(&body).unwrap_or_default()),
             stream_prefix: Vec::new(),
+            request_trace: None,
             exec_adapted: false,
             exec_outcome: None,
             response: None,
@@ -2851,6 +2868,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     }
                 }))?),
                 stream_prefix: Vec::new(),
+                request_trace: None,
                 exec_adapted: false,
                 exec_outcome: None,
                 response: None,
@@ -2896,6 +2914,11 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     let mut exec_negotiation_used = false;
     let mut auto_retry = ProxyAutoRetry::from_settings(&settings);
     let mut request_attempt = 0_usize;
+    let mut retry_reasons: Vec<String> = Vec::new();
+    let mut request_trace = crate::request_log::RequestTrace {
+        model: source_model.clone(),
+        ..Default::default()
+    };
     // 外层循环负责两件事：按候选成员顺序尝试（成员间失败切换仍是立即的），
     // 以及全部候选都失败且错误可重试时退避后从第一个成员重新开始一轮。
     let mut candidate_index = 0_usize;
@@ -2973,6 +2996,14 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         let legacy_native_compaction = relay.protocol == RelayProtocol::Responses
             && is_responses_compact_proxy_path(request_path);
         let is_compaction_request = compaction || probe_native_compaction || legacy_native_compaction;
+        request_trace.relay_id = relay.id.clone();
+        request_trace.relay_name = relay.name.clone();
+        request_trace.wire_api = upstream_wire_api_label(wire_api).to_string();
+        request_trace.upstream_model = upstream_body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let header_timeout = response_header_timeout(is_stream);
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "protocol_proxy.upstream_request",
@@ -3055,7 +3086,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         request_attempt,
                         "upstream_send_error",
                         None,
-                    )
+                    
+                        &mut retry_reasons,)
                     .await
                 {
                     candidate_index = 0;
@@ -3143,7 +3175,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                                     request_attempt,
                                     "official_login_retry_send_error",
                                     None,
-                                )
+                                
+                                    &mut retry_reasons,)
                                 .await
                             {
                                 candidate_index = 0;
@@ -3217,7 +3250,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                             request_attempt,
                             "exec_compatibility_retry_send_error",
                             None,
-                        )
+                        
+                            &mut retry_reasons,)
                         .await
                     {
                         candidate_index = 0;
@@ -3255,6 +3289,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 wire_api, compaction: false, native_compaction_passthrough: valid && success,
                 buffered_body: Some(body), exec_adapted: false, exec_outcome: None, response: None,
                 stream_prefix: Vec::new(),
+                request_trace: None,
             });
         }
         if probe_native_compaction {
@@ -3293,6 +3328,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     native_compaction_passthrough: stream_response,
                     buffered_body: Some(probed),
                     stream_prefix: Vec::new(),
+                    request_trace: None,
                     exec_adapted: false,
                     exec_outcome: None,
                     response: None,
@@ -3316,6 +3352,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                             native_compaction_passthrough: true,
                             buffered_body: Some(probed),
                             stream_prefix: Vec::new(),
+                            request_trace: None,
                             exec_adapted: false,
                             exec_outcome: None,
                             response: None,
@@ -3334,6 +3371,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                             native_compaction_passthrough: true,
                             buffered_body: Some(incomplete_compaction_stream(&probed)),
                             stream_prefix: Vec::new(),
+                            request_trace: None,
                             exec_adapted: false,
                             exec_outcome: None,
                             response: None,
@@ -3360,6 +3398,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         native_compaction_passthrough: true,
                         buffered_body: Some(probed),
                         stream_prefix: Vec::new(),
+                        request_trace: None,
                         exec_adapted: false,
                         exec_outcome: None,
                         response: None,
@@ -3375,6 +3414,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         native_compaction_passthrough: true,
                         buffered_body: Some(sse),
                         stream_prefix: Vec::new(),
+                        request_trace: None,
                         exec_adapted: false,
                         exec_outcome: None,
                         response: None,
@@ -3397,6 +3437,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     native_compaction_passthrough: false,
                     buffered_body: Some(probed),
                     stream_prefix: Vec::new(),
+                    request_trace: None,
                     exec_adapted: false,
                     exec_outcome: None,
                     response: None,
@@ -3542,7 +3583,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     request_attempt,
                     &reason,
                     retry_after,
-                )
+                
+                    &mut retry_reasons,)
                 .await
                 {
                     candidate_index = 0;
@@ -3596,7 +3638,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                             request_attempt,
                             "upstream_stream_failed",
                             None,
-                        )
+                        
+                            &mut retry_reasons,)
                         .await
                         {
                             candidate_index = 0;
@@ -3609,6 +3652,9 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         }
         // 成功，或重试预算用尽：把（最后一个）上游响应交给 Codex。
         // 请求了 SSE 的兼容上游也可能返回 JSON 摘要；让调用方选择 JSON 包装器。
+        request_trace.attempts = request_attempt as u32;
+        request_trace.auto_retries = retry_reasons.len() as u32;
+        request_trace.retry_reasons = retry_reasons.clone();
         let json_compaction = is_compaction_request
             && content_type
                 .split(';')
@@ -3624,6 +3670,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             native_compaction_passthrough: false,
             buffered_body: None,
             stream_prefix,
+            request_trace: Some(request_trace),
             exec_adapted,
             exec_outcome: (exec_adapted && (200..300).contains(&status_code)).then(|| {
                 crate::responses_exec_transport::ExecOutcome::new(
@@ -3747,6 +3794,7 @@ pub async fn open_models_proxy_request(
         native_compaction_passthrough: false,
         buffered_body: None,
         stream_prefix: Vec::new(),
+        request_trace: None,
         exec_adapted: false,
         exec_outcome: None,
         response: Some(upstream),
@@ -3805,6 +3853,7 @@ pub async fn open_audio_transcriptions_proxy_request(
         native_compaction_passthrough: false,
         buffered_body: None,
         stream_prefix: Vec::new(),
+        request_trace: None,
         exec_adapted: false,
         exec_outcome: None,
         response: Some(upstream),
@@ -3945,6 +3994,7 @@ async fn open_image_proxy_request(
         native_compaction_passthrough: false,
         buffered_body: None,
         stream_prefix: Vec::new(),
+        request_trace: None,
         exec_adapted: false,
         exec_outcome: None,
         response: Some(upstream),
@@ -4006,6 +4056,7 @@ pub async fn open_chat_completions_proxy_request(
         native_compaction_passthrough: false,
         buffered_body: None,
         stream_prefix: Vec::new(),
+        request_trace: None,
         exec_adapted: false,
         exec_outcome: None,
         response: Some(upstream),
@@ -10115,6 +10166,8 @@ pub(crate) struct ResponsesSseTransformer {
     passthrough_event: Option<String>,
     /// 请求把 `apply_patch` 声明成了 function 工具：此时 JSON 参数就是正确格式，不能解包。
     apply_patch_declared_as_function: bool,
+    /// 从 `response.completed` 里抓到的 usage，供请求日志使用。
+    usage: Option<crate::request_log::RequestUsage>,
 }
 
 /// 单个事件参与改写的最大缓冲字节数（4 MiB）。
@@ -10206,6 +10259,11 @@ impl ResponsesSseTransformer {
         self.failed
     }
 
+    /// 取出 `response.completed` 里捕获的 usage（请求日志用）。
+    pub(crate) fn take_usage(&mut self) -> Option<crate::request_log::RequestUsage> {
+        self.usage.take()
+    }
+
     /// Flush after stream EOF. Returns failure reason if any.
     pub(crate) fn finish(mut self) -> Option<String> {
         self.buf.clear();
@@ -10260,6 +10318,11 @@ impl ResponsesSseTransformer {
         let event_type = event_type_owned.as_deref().unwrap_or("");
         
         self.observe_event_type(event_type);
+        if event_type == "response.completed" {
+            if let Some(usage) = crate::request_log::usage_from_response_json(&data_json) {
+                self.usage = Some(usage);
+            }
+        }
 
         if event_type != "response.output_item.done" {
             return event_bytes.to_vec();
@@ -10672,6 +10735,20 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","name":
         let event = b"event: response.failed\ndata:{\"error\":{\"message\":\"x\"}}\n\n";
         t.push_bytes(event);
         assert!(t.finish().is_some(), "should detect failed via event: fallback");
+    }
+
+    #[test]
+    fn completed_event_usage_is_captured_for_request_log() {
+        let mut t = ResponsesSseTransformer::default();
+        let event = b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":123,\"output_tokens\":45,\"input_tokens_details\":{\"cached_tokens\":100},\"output_tokens_details\":{\"reasoning_tokens\":9}}}}\n\n";
+        t.push_bytes(event);
+        let usage = t.take_usage().expect("completed 事件应捕获 usage");
+        assert_eq!(usage.input_tokens, 123);
+        assert_eq!(usage.output_tokens, 45);
+        assert_eq!(usage.cached_tokens, 100);
+        assert_eq!(usage.reasoning_tokens, 9);
+        assert!(t.take_usage().is_none(), "usage 只取一次");
+        assert!(t.finish().is_none());
     }
 
     #[test]

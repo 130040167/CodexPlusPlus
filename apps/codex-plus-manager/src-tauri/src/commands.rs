@@ -6374,6 +6374,29 @@ pub fn load_relay_proxy(profile_id: String) -> CommandResult<Value> {
 }
 
 #[tauri::command]
+pub fn load_request_logs(limit: Option<usize>) -> CommandResult<Value> {
+    let limit = limit.unwrap_or(200).clamp(1, 1000);
+    match codex_plus_core::request_log::read_request_logs(limit) {
+        Ok(entries) => ok(
+            &format!("已读取 {} 条请求日志。", entries.len()),
+            json!({ "entries": entries }),
+        ),
+        Err(error) => failed(
+            &format!("读取请求日志失败：{error}"),
+            json!({ "entries": [] }),
+        ),
+    }
+}
+
+#[tauri::command]
+pub fn clear_request_logs() -> CommandResult<Value> {
+    match codex_plus_core::request_log::clear_request_logs() {
+        Ok(()) => ok("请求日志已清空。", json!({})),
+        Err(error) => failed(&format!("清空请求日志失败：{error}"), json!({})),
+    }
+}
+
+#[tauri::command]
 pub fn set_relay_proxy(profile_id: String, proxy_url: String) -> CommandResult<Value> {
     match codex_plus_core::relay_proxy::set_proxy_for_profile(&profile_id, &proxy_url) {
         Ok(()) => ok(

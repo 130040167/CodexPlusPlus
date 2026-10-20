@@ -1,0 +1,359 @@
+//! 请求日志：按请求记录代理转发的状态、模型、重试、token 用量与缓存命中。
+//!
+//! 存储为 `<state dir>/request-log.jsonl`，只保留最近的若干条（追加时按大小裁剪），
+//! 管理器「请求日志」页通过 Tauri 命令读取。日志里不保存提示词/回复正文，
+//! 只保存模型名、token 计数和错误摘要，避免把会话内容写进明文日志。
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub const REQUEST_LOG_FILE: &str = "request-log.jsonl";
+/// 日志文件达到该大小后裁剪到约一半，避免无限增长。
+const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+const KEEP_LOG_BYTES: u64 = 1024 * 1024;
+
+static ENTRY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static LOG_PATH_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+/// 一次上游请求的 token 用量。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+}
+
+impl RequestUsage {
+    /// 缓存命中率（cached / input），没有输入 token 时为 None。
+    pub fn cache_hit_ratio(&self) -> Option<f64> {
+        (self.input_tokens > 0).then(|| self.cached_tokens as f64 / self.input_tokens as f64)
+    }
+}
+
+/// 代理内部的重试/路由痕迹，随 `UpstreamProxyResponse` 交给启动器写日志。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestTrace {
+    pub relay_id: String,
+    pub relay_name: String,
+    /// 客户端请求的模型名（聚合前缀/后缀原样）。
+    pub model: String,
+    /// 真正发给上游的模型名。
+    pub upstream_model: String,
+    pub wire_api: String,
+    /// 上游请求总次数（含失败切换与自动重试）。
+    pub attempts: u32,
+    /// 代理自动重试次数（不含成员间失败切换）。
+    pub auto_retries: u32,
+    #[serde(default)]
+    pub retry_reasons: Vec<String>,
+}
+
+/// 管理器「请求日志」页展示的一条记录。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestLogEntry {
+    pub id: String,
+    pub timestamp_ms: u64,
+    pub started_at_ms: u64,
+    pub duration_ms: u64,
+    pub method: String,
+    pub path: String,
+    pub status_code: u16,
+    pub success: bool,
+    pub stream: bool,
+    pub model: String,
+    pub upstream_model: String,
+    pub relay_id: String,
+    pub relay_name: String,
+    pub wire_api: String,
+    pub attempts: u32,
+    pub auto_retries: u32,
+    #[serde(default)]
+    pub retry_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<RequestUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit_ratio: Option<f64>,
+}
+
+impl RequestLogEntry {
+    pub fn new_id(started_at_ms: u64) -> String {
+        let sequence = ENTRY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        format!("{started_at_ms}-{sequence}")
+    }
+
+    pub fn finish(&mut self, finished_at_ms: u64) {
+        self.timestamp_ms = finished_at_ms;
+        self.duration_ms = finished_at_ms.saturating_sub(self.started_at_ms);
+        self.cache_hit_ratio = self.usage.as_ref().and_then(RequestUsage::cache_hit_ratio);
+    }
+}
+
+fn log_path_override() -> Option<PathBuf> {
+    LOG_PATH_OVERRIDE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+pub fn request_log_path() -> PathBuf {
+    log_path_override().unwrap_or_else(|| crate::paths::default_app_state_dir().join(REQUEST_LOG_FILE))
+}
+
+/// 测试用：覆盖请求日志路径（传 None 恢复默认）。
+pub fn set_request_log_path_for_tests(path: Option<PathBuf>) {
+    *LOG_PATH_OVERRIDE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+/// 追加一条请求日志；达到大小上限时保留最近的约一半。
+pub fn append_request_log(entry: &RequestLogEntry) -> std::io::Result<()> {
+    // 单元测试里默认路径指向真实用户状态目录，不让测试数据污染正式日志。
+    if cfg!(test) && log_path_override().is_none() {
+        return Ok(());
+    }
+    append_request_log_at(&request_log_path(), entry)
+}
+
+pub fn append_request_log_at(path: &Path, entry: &RequestLogEntry) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let line = serde_json::to_string(entry)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(file, "{line}")?;
+    drop(file);
+    if std::fs::metadata(path).map(|meta| meta.len() > MAX_LOG_BYTES).unwrap_or(false) {
+        trim_request_log_to_tail(path, KEEP_LOG_BYTES)?;
+    }
+    Ok(())
+}
+
+fn trim_request_log_to_tail(path: &Path, keep_bytes: u64) -> std::io::Result<()> {
+    let contents = std::fs::read(path)?;
+    let keep_from = contents.len().saturating_sub(keep_bytes as usize);
+    let start = contents[keep_from..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|offset| keep_from + offset + 1)
+        .unwrap_or(keep_from);
+    std::fs::write(path, &contents[start..])
+}
+
+/// 读取最近 `limit` 条请求日志，按时间倒序返回。
+pub fn read_request_logs(limit: usize) -> std::io::Result<Vec<RequestLogEntry>> {
+    read_request_logs_at(&request_log_path(), limit)
+}
+
+pub fn read_request_logs_at(path: &Path, limit: usize) -> std::io::Result<Vec<RequestLogEntry>> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut entries = VecDeque::with_capacity(limit.min(1024));
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<RequestLogEntry>(line) {
+            entries.push_back(entry);
+            if entries.len() > limit {
+                entries.pop_front();
+            }
+        }
+    }
+    Ok(entries.into_iter().rev().collect())
+}
+
+pub fn clear_request_logs() -> std::io::Result<()> {
+    clear_request_logs_at(&request_log_path())
+}
+
+pub fn clear_request_logs_at(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// 从非流式 Responses JSON（或 `response.completed` 的 data）里提取 usage。
+pub fn usage_from_response_json(value: &Value) -> Option<RequestUsage> {
+    let usage = value
+        .get("response")
+        .and_then(|response| response.get("usage"))
+        .or_else(|| value.get("usage"))?;
+    let input_tokens = usage.get("input_tokens").and_then(Value::as_u64)?;
+    let output_tokens = usage.get("output_tokens").and_then(Value::as_u64)?;
+    let cached_tokens = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64))
+        .unwrap_or(0);
+    let reasoning_tokens = usage
+        .pointer("/output_tokens_details/reasoning_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Some(RequestUsage {
+        input_tokens,
+        output_tokens,
+        cached_tokens,
+        reasoning_tokens,
+    })
+}
+
+/// 从任意响应 JSON 里尽力提取 usage（含 chat completions 的 prompt/completion 字段）。
+pub fn usage_from_body_bytes(body: &[u8]) -> Option<RequestUsage> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    if let Some(usage) = usage_from_response_json(&value) {
+        return Some(usage);
+    }
+    let usage = value.get("usage")?;
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(Value::as_u64)?;
+    let output_tokens = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(Value::as_u64)?;
+    let cached_tokens = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| usage.pointer("/input_tokens_details/cached_tokens").and_then(Value::as_u64))
+        .unwrap_or(0);
+    Some(RequestUsage {
+        input_tokens,
+        output_tokens,
+        cached_tokens,
+        reasoning_tokens: 0,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn entry(id: &str) -> RequestLogEntry {
+        RequestLogEntry {
+            id: id.to_string(),
+            timestamp_ms: 0,
+            started_at_ms: 0,
+            duration_ms: 0,
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            status_code: 200,
+            success: true,
+            stream: true,
+            model: "gpt-6.1-sol".to_string(),
+            upstream_model: "gpt-6.1-sol".to_string(),
+            relay_id: "relay-a".to_string(),
+            relay_name: "供应商 4".to_string(),
+            wire_api: "Responses".to_string(),
+            attempts: 2,
+            auto_retries: 1,
+            retry_reasons: vec!["upstream_stream_failed".to_string()],
+            error: None,
+            stream_outcome: None,
+            usage: Some(RequestUsage {
+                input_tokens: 1000,
+                output_tokens: 200,
+                cached_tokens: 900,
+                reasoning_tokens: 50,
+            }),
+            cache_hit_ratio: None,
+        }
+    }
+
+    #[test]
+    fn appends_reads_and_clears_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(REQUEST_LOG_FILE);
+        let mut first = entry("first");
+        first.finish(120);
+        assert_eq!(first.duration_ms, 120);
+        assert_eq!(first.cache_hit_ratio, Some(0.9));
+        append_request_log_at(&path, &first).unwrap();
+        append_request_log_at(&path, &entry("second")).unwrap();
+
+        let logs = read_request_logs_at(&path, 10).unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].id, "second", "按时间倒序");
+        assert_eq!(logs[1].id, "first");
+        assert_eq!(logs[1].duration_ms, 120);
+        assert_eq!(read_request_logs_at(&path, 1).unwrap().len(), 1);
+
+        clear_request_logs_at(&path).unwrap();
+        assert!(read_request_logs_at(&path, 10).unwrap().is_empty());
+        assert!(clear_request_logs_at(&path).is_ok());
+    }
+
+    #[test]
+    fn oversized_log_keeps_only_recent_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(REQUEST_LOG_FILE);
+        let padding = "x".repeat(64 * 1024);
+        for index in 0..40 {
+            let mut item = entry(&format!("entry-{index}"));
+            item.relay_name = format!("{padding}-{index}");
+            append_request_log_at(&path, &item).unwrap();
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() <= MAX_LOG_BYTES);
+        let logs = read_request_logs_at(&path, 1000).unwrap();
+        assert!(!logs.is_empty());
+        assert_eq!(logs[0].id, "entry-39");
+        assert!(logs.len() < 40, "裁剪后不应保留全部记录: {}", logs.len());
+    }
+
+    #[test]
+    fn usage_is_extracted_from_completed_response() {
+        let completed = json!({
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 111,
+                    "output_tokens": 22,
+                    "input_tokens_details": {"cached_tokens": 100},
+                    "output_tokens_details": {"reasoning_tokens": 7}
+                }
+            }
+        });
+        let usage = usage_from_response_json(&completed).unwrap();
+        assert_eq!(usage.input_tokens, 111);
+        assert_eq!(usage.output_tokens, 22);
+        assert_eq!(usage.cached_tokens, 100);
+        assert_eq!(usage.reasoning_tokens, 7);
+        assert_eq!(usage.cache_hit_ratio(), Some(100.0 / 111.0));
+
+        let chat = br#"{"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":4}}}"#;
+        let usage = usage_from_body_bytes(chat).unwrap();
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.cached_tokens, 4);
+        assert!(usage_from_body_bytes(b"not-json").is_none());
+    }
+}
