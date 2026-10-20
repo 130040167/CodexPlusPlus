@@ -357,6 +357,12 @@ impl RelayProfile {
         self.relay_mode == RelayMode::PureApi && self.no_auth
     }
 
+    /// 独立代理由本地转发层消费；纯官方 OAuth 不接管其网络请求。
+    pub fn uses_independent_proxy(&self) -> bool {
+        (self.relay_mode != RelayMode::Official || self.official_mix_api_key)
+            && crate::relay_proxy::configured_proxy_for_profile(&self.id).is_some()
+    }
+
     pub fn web_search_history_compat_enabled(&self) -> bool {
         self.web_search_history_compat
             && self.protocol == RelayProtocol::Responses
@@ -1192,6 +1198,7 @@ impl BackendSettings {
             || self.active_relay_profile().requires_protocol_proxy_conversion()
             || self.active_relay_profile().has_model_routes()
             || self.active_relay_profile().uses_no_auth()
+            || self.active_relay_profile().uses_independent_proxy()
             || self.active_relay_profile().web_search_history_compat_enabled()
             || self.active_relay_profile().request_compatibility_enabled()
     }

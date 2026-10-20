@@ -2,6 +2,11 @@
 
 ## 未发布
 
+- 修复项目全选忽略路径大小写、可能跨项目选中会话的问题。
+- 修复普通 Responses 供应商的独立代理未作用于实际会话请求，以及代理端口再次迁移后部分会话仍连接旧端口的问题。
+- 前缀稳定层保留工具结果与模型输出中的原文标签，避免清理图片提示时破坏工具调用配对。
+- 更换全局听写热键失败时保留原有配置与可用热键；Windows 长按热键不再重复切换录音。
+- 用量状态栏按真实轮次统计缓存命中率，避免把前几轮混入当前轮。
 - macOS 补上「桌宠跟随真实鼠标」：用 CoreGraphics `CGEventGetLocation` 读取 DIP 屏幕坐标（主屏左上原点，与 Electron `screenX/screenY` 一致），按 Windows 同样的约 100ms 周期经 CDP 调用 overlay 的 `updateScreenPoint`。推点不再绑死 V2 精灵图 / vscode-api dispatcher 探针；只要 overlay 上有该函数就会推，用户脚本 stub 与官方 Computer Use 映射可以并存。设置开关对 macOS 开放。
 - 修复 WSL 运行模式下模型目录被重写成宿主绝对路径；原生 Windows 继续使用绝对路径，启动迁移仅处理当前 home 内的受管目录。
 - 修复 Windows 窗口图标与任务栏属性部分成功即停止重试的问题；按窗口分别跟踪结果。

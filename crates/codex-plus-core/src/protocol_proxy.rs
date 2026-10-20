@@ -115,6 +115,7 @@ fn recall_tool_call_extra_content(call_id: &str) -> Option<Value> {
 }
 
 const PROTOCOL_PROXY_PORT_FILE: &str = "protocol-proxy-port";
+const PROTOCOL_PROXY_PORT_HISTORY_FILE: &str = "protocol-proxy-port-history";
 
 /// 协议代理的实际生效端口，默认 [`DEFAULT_PROTOCOL_PROXY_PORT`]，
 /// 可用环境变量 `CODEX_PLUS_PROTOCOL_PROXY_PORT` 覆盖。
@@ -153,8 +154,65 @@ fn read_persisted_protocol_proxy_port(path: &std::path::Path) -> Option<u16> {
 }
 
 fn persist_protocol_proxy_port(path: &std::path::Path, port: u16) -> anyhow::Result<()> {
+    // 在覆盖当前值前保存迁移链。只记录本工具实际使用过的端口，不能把任意
+    // loopback URL 当成自己的代理，否则会覆盖用户配置的其它本地服务。
+    let history_path = path.with_file_name(PROTOCOL_PROXY_PORT_HISTORY_FILE);
+    let mut ports = read_protocol_proxy_port_history(&history_path);
+    ports.extend(read_persisted_protocol_proxy_port(path));
+    ports.insert(port);
+    let history = ports.iter().map(u16::to_string).collect::<Vec<_>>().join("\n") + "\n";
+    crate::settings::atomic_write(&history_path, history.as_bytes())
+        .context("持久化协议代理历史端口失败")?;
     crate::settings::atomic_write(path, format!("{port}\n").as_bytes())
         .with_context(|| format!("持久化协议代理端口失败：{}", path.display()))
+}
+
+fn read_protocol_proxy_port_history(path: &std::path::Path) -> BTreeSet<u16> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .collect()
+}
+
+pub(crate) fn managed_protocol_proxy_base_urls() -> Vec<String> {
+    let path = persisted_protocol_proxy_port_path();
+    let mut ports = read_protocol_proxy_port_history(&path.with_file_name(PROTOCOL_PROXY_PORT_HISTORY_FILE));
+    ports.insert(DEFAULT_PROTOCOL_PROXY_PORT);
+    ports.insert(protocol_proxy_port());
+    // 即使显式环境覆盖了当前端口，之前持久化的端口也仍是本工具写入过的值。
+    ports.extend(read_persisted_protocol_proxy_port(&path));
+    ports.into_iter().map(local_responses_proxy_base_url).collect()
+}
+
+pub(crate) fn is_managed_protocol_proxy_base_url(value: &str) -> bool {
+    let Ok(mut parsed) = reqwest::Url::parse(value.trim()) else {
+        return false;
+    };
+    let path = parsed.path().trim_end_matches('/').to_string();
+    parsed.set_path(&path);
+    managed_protocol_proxy_base_urls().iter().any(|url| parsed.as_str() == url)
+}
+
+#[cfg(test)]
+mod managed_port_history_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_port_migrations_keep_every_managed_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PROTOCOL_PROXY_PORT_FILE);
+        // 模拟旧版本只有当前端口文件；首次升级迁移也要保留该端口。
+        std::fs::write(&path, "58077\n").unwrap();
+        persist_protocol_proxy_port(&path, 58088).unwrap();
+        persist_protocol_proxy_port(&path, 58099).unwrap();
+        assert_eq!(read_persisted_protocol_proxy_port(&path), Some(58099));
+        assert_eq!(
+            read_protocol_proxy_port_history(&dir.path().join(PROTOCOL_PROXY_PORT_HISTORY_FILE)),
+            BTreeSet::from([58077, 58088, 58099]),
+        );
+    }
 }
 
 /// 启动前确认协议代理端口可绑定。
@@ -735,10 +793,16 @@ fn strip_notice_blocks_in_text(text: &str) -> (String, bool, bool) {
     (output, removed, unpaired)
 }
 
-/// 在 Chat message 的 text 内容中移除 notice；保留 tool-call 骨架，纯 notice 消息删除。
+/// 只清理指令与用户消息中的客户端 notice；工具结果和模型输出可能包含同名标签原文。
 fn strip_image_resize_notice_blocks(messages: &mut Vec<Value>) {
     let mut unpaired = false;
     messages.retain_mut(|message| {
+        if !matches!(
+            message.get("role").and_then(Value::as_str),
+            Some("system" | "developer" | "user")
+        ) {
+            return true;
+        }
         let has_tool_calls = message.get("tool_calls").is_some();
         let Some(content) = message.get_mut("content") else {
             return true;
@@ -8918,6 +8982,57 @@ mod response_compatibility_tests {
             body["messages"][0]["content"],
             "stale fragmentafter"
         );
+    }
+
+    #[test]
+    fn prompt_prefix_stabilizer_preserves_tool_output_pairing() {
+        for output in [
+            json!("<image_resize_notice>file content</image_resize_notice>"),
+            json!([{"type": "input_text", "text": "<image_resize_notice>file content</image_resize_notice>"}]),
+        ] {
+            let mut body = responses_to_chat_completions(json!({
+                "model": "test-model",
+                "input": [
+                    {"type": "function_call", "call_id": "call_read", "name": "read_file", "arguments": "{}"},
+                    {"type": "function_call_output", "call_id": "call_read", "output": output},
+                    {"role": "user", "content": "continue<image_resize_notice>resize hint</image_resize_notice>"}
+                ]
+            }))
+            .unwrap();
+            let before = body["messages"].as_array().unwrap().clone();
+            stabilize_chat_prompt_prefix(&mut body);
+            let messages = body["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), before.len(), "不能删除工具调用的结果消息");
+            let result = messages
+                .iter()
+                .find(|message| message["role"] == "tool")
+                .unwrap();
+            let original = before
+                .iter()
+                .find(|message| message["role"] == "tool")
+                .unwrap();
+            assert_eq!(result, original, "工具输出中的标签属于原文，必须完整保留");
+            assert_eq!(result["tool_call_id"], "call_read");
+            assert!(messages
+                .iter()
+                .any(|message| message["tool_calls"][0]["id"] == "call_read"));
+            assert_eq!(messages.last().unwrap()["content"], "continue");
+        }
+    }
+
+    #[test]
+    fn prompt_prefix_stabilizer_preserves_model_and_legacy_function_content() {
+        for role in ["assistant", "function"] {
+            for content in [
+                json!("<image_resize_notice>literal content</image_resize_notice>"),
+                json!([{"type": "text", "text": "literal</image_resize_notice>content"}]),
+            ] {
+                let mut body = json!({"messages": [{"role": role, "content": content}]});
+                let original = body.clone();
+                stabilize_chat_prompt_prefix(&mut body);
+                assert_eq!(body, original, "模型和工具返回不是客户端通知的来源");
+            }
+        }
     }
 
     #[test]

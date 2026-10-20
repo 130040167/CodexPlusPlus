@@ -146,6 +146,8 @@ import {
   type ImportedModelMetadata,
 } from "./model-metadata";
 import {
+  independentProxyEnabled,
+  setIndependentProxyConfigured,
   requestCompatibilityEnabled,
   findRelayModelRouteIssue,
   modelRouteSaveRequiresRestart,
@@ -9243,14 +9245,24 @@ function RelayProfileEditor({
   const [vlmTestOpen, setVlmTestOpen] = useState(false);
   const [relayProxyUrl, setRelayProxyUrl] = useState("");
   const [relayProxyBusy, setRelayProxyBusy] = useState(false);
+  const relayProxyProfileRef = useRef(profile);
+  relayProxyProfileRef.current = profile;
+  const relayProxyRevisionRef = useRef(0);
   const [stabilizePromptPrefix, setStabilizePromptPrefix] = useState(false);
   const [stabilizePromptPrefixBusy, setStabilizePromptPrefixBusy] = useState(false);
   const useCommonConfig = profile.useCommonConfig !== false;
   useEffect(() => {
     let cancelled = false;
+    const revision = ++relayProxyRevisionRef.current;
     setRelayProxyUrl("");
-    void invoke<{ status: string; proxyUrl?: string }>("load_relay_proxy", { profileId: profile.id })
-      .then((result) => { if (!cancelled) setRelayProxyUrl(result.proxyUrl || ""); })
+    setIndependentProxyConfigured(profile.id, false);
+    void invoke<{ status: string; proxyUrl?: string; configured?: boolean }>("load_relay_proxy", { profileId: profile.id })
+      .then((result) => {
+        if (!cancelled && revision === relayProxyRevisionRef.current && result.status === "ok") {
+          setIndependentProxyConfigured(profile.id, result.configured ?? Boolean(result.proxyUrl?.trim()));
+          setRelayProxyUrl(result.proxyUrl || "");
+        }
+      })
       .catch(() => {});
     return () => { cancelled = true; };
   }, [profile.id]);
@@ -9263,12 +9275,22 @@ function RelayProfileEditor({
     return () => { cancelled = true; };
   }, [profile.id]);
   const saveRelayProxy = async () => {
+    const profileId = profile.id;
+    ++relayProxyRevisionRef.current;
     setRelayProxyBusy(true);
     try {
-      const result = await invoke<{ status: string; message: string }>("set_relay_proxy", {
-        profileId: profile.id,
+      const result = await invoke<{ status: string; message: string; configured?: boolean }>("set_relay_proxy", {
+        profileId,
         proxyUrl: relayProxyUrl,
       });
+      if (result.status === "ok") {
+        setIndependentProxyConfigured(profileId, result.configured ?? Boolean(relayProxyUrl.trim()));
+        const current = relayProxyProfileRef.current;
+        if (current.id === profileId) {
+          // 保存响应返回时从最新草稿重算，保留期间编辑的其它字段。
+          onProfileChange(applyRelayProfilePatchToFiles(current, { baseUrl: current.baseUrl }, { allowGenerateFiles: isNew }));
+        }
+      }
       await actions.showMessage(t("供应商独立代理"), result.message, result.status === "ok" ? "ok" : "failed");
     } catch (error) {
       await actions.showMessage(t("供应商独立代理"), String(error), "failed");
@@ -14435,14 +14457,14 @@ function withGeneratedRelayFiles(profile: RelayProfile): RelayProfile {
 }
 
 function buildRelayConfigToml(
-  profile: Pick<RelayProfile, "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider" | "relayMode" | "officialMixApiKey" | "webSearchHistoryCompat" | "strictResponsesReasoning" | "modelMetadata">,
+  profile: Pick<RelayProfile, "id" | "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider" | "relayMode" | "officialMixApiKey" | "webSearchHistoryCompat" | "strictResponsesReasoning" | "modelMetadata">,
   options: { includeBearerToken: boolean; requiresOpenAiAuth?: boolean },
 ): string {
   const searchHistoryCompat = profile.webSearchHistoryCompat === true
     && profile.protocol === "responses"
     && profile.relayMode !== "aggregate"
     && (profile.relayMode !== "official" || profile.officialMixApiKey);
-  const baseUrl = profile.protocol !== "responses" || searchHistoryCompat || requestCompatibilityEnabled(profile)
+  const baseUrl = profile.protocol !== "responses" || independentProxyEnabled(profile) || searchHistoryCompat || requestCompatibilityEnabled(profile)
     ? PROTOCOL_PROXY_BASE_URL
     : profile.baseUrl.trim();
   const apiKey = profile.apiKey.trim();
@@ -14598,7 +14620,7 @@ function applyRelayProfilePatchToFiles(
       && next.protocol === "responses"
       && next.relayMode !== "aggregate"
       && (next.relayMode !== "official" || next.officialMixApiKey);
-    const baseUrlForConfig = next.protocol !== "responses" || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat || requestCompatibilityEnabled(next)
+    const baseUrlForConfig = next.protocol !== "responses" || independentProxyEnabled(next) || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat || requestCompatibilityEnabled(next)
       ? PROTOCOL_PROXY_BASE_URL
       : next.upstreamBaseUrl || next.baseUrl;
     next.configContents = setCodexProviderStringKey(next.configContents, "base_url", baseUrlForConfig, {

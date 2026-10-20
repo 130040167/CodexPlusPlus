@@ -1106,9 +1106,15 @@ fn read_rollout_usage_tail(rollout: &Path, limit: usize) -> anyhow::Result<Vec<V
         let start = len.saturating_sub(window);
         let mut events = Vec::new();
         read_rollout_usage_window(&file, start, limit, &mut events)?;
-        // 至少两条事件渲染侧才算得出生成速度；不够就放大窗口重读一次。
+        // 至少两条事件渲染侧才算得出生成速度。还要找到真实轮边界：
+        // total_token_usage 是会话累计，不能靠输出计数回落判断换轮。
+        let latest_turn_known = events
+            .last()
+            .and_then(|event| event.get("turn_id"))
+            .and_then(Value::as_str)
+            .is_some();
         // 到顶或已经从头开始读时不再尝试，避免退化成整文件解析。
-        if events.len() >= 2 || start == 0 || window >= USAGE_TAIL_MAX_BYTES {
+        if events.len() >= 2 && latest_turn_known || start == 0 || window >= USAGE_TAIL_MAX_BYTES {
             return Ok(events);
         }
         window = (window * 4).min(USAGE_TAIL_MAX_BYTES);
@@ -1131,16 +1137,67 @@ fn read_rollout_usage_window(
     if start > 0 {
         lines.next();
     }
+    let mut current_turn_id: Option<String> = None;
+    let mut segment_start = 0;
     for line in lines {
         let line = line.trim();
         // 先做子串预筛，避免为每条 response_item 付 serde 解析成本。
-        if line.is_empty() || !line.contains("\"token_count\"") {
+        if line.is_empty()
+            || !["\"event_msg\"", "\"turn_context\""]
+                .iter()
+                .any(|kind| line.contains(kind))
+        {
             continue;
         }
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if let Some(event) = rollout_usage_event(&value) {
+        let kind = value.get("type").and_then(Value::as_str);
+        let payload = &value["payload"];
+        let event_type = payload.get("type").and_then(Value::as_str);
+        let turn_id = payload
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        if kind == Some("turn_context") {
+            // 老版本上下文没有 id 时，保留本轮 task_started 已经确认的归属。
+            if let Some(id) = turn_id {
+                if current_turn_id.as_deref() != Some(id) {
+                    segment_start = out.len();
+                    current_turn_id = Some(id.to_owned());
+                }
+            }
+            continue;
+        }
+        if kind != Some("event_msg") {
+            continue;
+        }
+        match event_type {
+            // Codex v1 持久化名称为 task_*，turn_* 是新版协议的别名。
+            Some("task_started" | "turn_started") => {
+                segment_start = out.len();
+                current_turn_id = turn_id.map(str::to_owned);
+                continue;
+            }
+            Some(
+                "task_complete" | "turn_complete" | "turn_completed" | "task_failed"
+                | "turn_aborted" | "task_aborted",
+            ) => {
+                // 起始标记可能在尾部窗口之外，结束标记仍可确认它前面的用量归属。
+                if let Some(id) = turn_id {
+                    for event in &mut out[segment_start..] {
+                        if event.get("turn_id").is_none() {
+                            event["turn_id"] = json!(id);
+                        }
+                    }
+                }
+                segment_start = out.len();
+                current_turn_id = None;
+                continue;
+            }
+            _ => {}
+        }
+        if let Some(event) = rollout_usage_event(&value, current_turn_id.as_deref()) {
             out.push(event);
         }
     }
@@ -1150,7 +1207,7 @@ fn read_rollout_usage_window(
     Ok(())
 }
 
-fn rollout_usage_event(value: &Value) -> Option<Value> {
+fn rollout_usage_event(value: &Value, turn_id: Option<&str>) -> Option<Value> {
     if value.get("type").and_then(Value::as_str) != Some("event_msg") {
         return None;
     }
@@ -1173,7 +1230,7 @@ fn rollout_usage_event(value: &Value) -> Option<Value> {
     if input_tokens <= 0 && output_tokens <= 0 && total_tokens <= 0 {
         return None;
     }
-    Some(json!({
+    let mut event = json!({
         "t": value.get("timestamp").and_then(Value::as_str).unwrap_or_default(),
         // 本次模型调用的用量：上下文占用取 total_tokens / context_window。
         "input_tokens": input_tokens,
@@ -1182,9 +1239,13 @@ fn rollout_usage_event(value: &Value) -> Option<Value> {
         "reasoning_output_tokens": field(Some(last), "reasoning_output_tokens"),
         "total_tokens": total_tokens,
         "context_window": field(Some(info), "model_context_window"),
-        // 本轮累计输出：换轮时它会回落，渲染侧靠这个切段算生成速度。
+        // 历史字段名，实际是会话累计输出；必须结合 turn_id 才能计算同轮速度。
         "turn_output_tokens": field(total, "output_tokens"),
-    }))
+    });
+    if let Some(id) = turn_id {
+        event["turn_id"] = json!(id);
+    }
+    Some(event)
 }
 
 fn failed_with_undo(
