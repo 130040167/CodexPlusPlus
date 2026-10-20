@@ -7965,6 +7965,150 @@ async fn proxy_auto_retry_short_reply_commits_on_completion_without_full_grace_w
 }
 
 #[tokio::test]
+async fn legacy_streaming_mode_keeps_old_immediate_commit() {
+    // 旧「流式避震」行为保留为独立模式：工具调用参数一开始输出就提交，
+    // 之后的过载交给 Codex，代理不再重试。
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let overloaded_tool_arguments = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_legacy\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"name\":\"shell\",\"arguments\":\"\"}}\n\n",
+        "event: response.function_call_arguments.delta\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"command\\\":\"}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n\n",
+    );
+    let responses = vec![proxy_sse_response(overloaded_tool_arguments)];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 2;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+    settings.protocol_proxy_auto_retry_mode = "streaming-legacy".to_string();
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 1, "旧模式不应再重放已经开始输出的流");
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("server_is_overloaded"), "{body}");
+    assert_eq!(server.await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn failed_after_visible_output_keeps_first_token_timing() {
+    // 首段正文已缓冲但未提交时遇到不可重试的终态失败：不重试、把前缀交回
+    // Codex，同时保留真实的首字时间（不能记成提交时刻）。
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let visible_then_permanent_failure = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_bad_after_text\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"bad input\"}}}\n\n",
+    );
+    let responses = vec![proxy_sse_response(visible_then_permanent_failure)];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 3;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 1);
+    assert!(
+        trace.first_output_at_ms.is_some(),
+        "可见输出之后失败也要保留首字时间"
+    );
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("partial"));
+    assert!(body.contains("invalid_request_error"), "{body}");
+    assert_eq!(server.await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn retry_budget_exhausted_commits_without_waiting_grace() {
+    // 第一次尝试失败并重试后预算用尽：第二次尝试不再为首字白等宽限窗口。
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let first_part = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_budget\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+    );
+    // content-length 故意大于实际发送的字节，且连接保持 12 秒不结束：
+    // 宽限若生效，预读必须等满窗口；预算耗尽退回旧时机则会立即提交。
+    let declared_len = first_part.len() + 128;
+    let first_attempt_failure = capacity_failed_stream();
+    let server = tokio::spawn(async move {
+        // 第一次尝试：首字前过载，触发一次代理重试。
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_http_request(&mut stream).await;
+        stream
+            .write_all(proxy_sse_response(&first_attempt_failure).as_bytes())
+            .await
+            .unwrap();
+        // 第二次尝试：写出首段正文后挂住连接。
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_http_request(&mut stream).await;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {declared_len}\r\ncontent-type: text/event-stream\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        stream.write_all(first_part.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(12)).await;
+    });
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 1;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+    // 宽限远大于测试阈值：预算耗尽后如果不退回旧提交时机，这里会等满窗口。
+    settings.protocol_proxy_auto_retry_commit_delay_ms = 20_000;
+
+    let started = Instant::now();
+    let result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 2);
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "重试预算耗尽后不应再等首字宽限窗口"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn proxy_auto_retry_does_not_retry_non_capacity_stream_failures() {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let address = listener.local_addr().unwrap();

@@ -113,3 +113,27 @@ fn proxy_auto_retry_ranges_are_clamped_on_load_and_update() {
     assert_eq!(raw["protocolProxyAutoRetryIntervalSeconds"], json!(30));
     assert_eq!(raw["protocolProxyAutoRetryCommitDelayMs"], json!(10000));
 }
+
+#[test]
+fn legacy_streaming_mode_is_preserved_and_unknown_modes_fall_back() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("settings.json");
+    let store = SettingsStore::new(path);
+
+    store
+        .update(json!({"protocolProxyAutoRetryMode": "streaming-legacy"}))
+        .unwrap();
+    assert_eq!(
+        store.load().unwrap().protocol_proxy_auto_retry_mode,
+        "streaming-legacy"
+    );
+
+    // 未知/旧值一律回落到默认的新流式模式，不能写坏配置。
+    store
+        .update(json!({"protocolProxyAutoRetryMode": "bogus"}))
+        .unwrap();
+    assert_eq!(
+        store.load().unwrap().protocol_proxy_auto_retry_mode,
+        "streaming"
+    );
+}

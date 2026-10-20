@@ -653,20 +653,22 @@ export const EN_PLAIN: Record<string, string> = {
   "代理层吸收上游过载冲击：自动重试模型容量/过载错误（含推理与工具调用阶段），尽量不把错误交给 Codex":
     "Absorb upstream overload at the proxy: retry model capacity/overload errors (including reasoning and tool-call phases) so Codex rarely sees them",
   "启用请求避震": "Enable request shock absorption",
-  "请求避震只处理经过本地协议代理、且以 200 流式响应返回的上游过载/容量错误（server_overloaded、server_is_overloaded、at capacity 等）。流式避震下：推理、工具调用参数等不可见阶段先缓冲，工具调用整项完成或首段可见输出后再等「首字提交延迟」；这段窗口内遇到过载由代理退避重试；提交之后遇到同类过载，会改写成 Codex 可识别的容量错误，由 Codex 自己重试；连接失败、429/5xx、限流等其它错误不重试。整段缓冲避震下，任何时点的过载都由代理重试，但失去流式。":
-    "Request shock absorption only handles upstream overload/capacity errors that arrive inside a 200 streaming response through the local protocol proxy (server_overloaded, server_is_overloaded, at capacity, ...). In streaming mode the proxy first buffers invisible phases such as reasoning and tool-call arguments; it waits until the whole tool call completes or the first visible output appears, then applies the first-token commit delay and retries overloads with backoff during that window. After commit, the same overloads are rewritten into capacity errors Codex recognizes so Codex retries them itself; connection failures, 429/5xx, rate limits, and other errors are not retried. In buffered mode the proxy retries overloads at any point, but streaming is lost.",
+  "请求避震只处理经过本地协议代理、且以 200 流式响应返回的上游过载/容量错误（server_overloaded、server_is_overloaded、at capacity 等）。流式避震下：推理、工具调用参数等不可见阶段先缓冲，工具调用整项完成或首段可见输出后再等「首字提交延迟」；这段窗口内遇到过载由代理退避重试；提交之后遇到同类过载，会改写成 Codex 可识别的容量错误，由 Codex 自己重试；连接失败、429/5xx、限流等其它错误不重试。保留的「流式避震（旧行为）」模式仍按旧逻辑：第一个输出事件就交给 Codex。整段缓冲避震下，任何时点的过载都由代理重试，但失去流式。":
+    "Request shock absorption only handles upstream overload/capacity errors that arrive inside a 200 streaming response through the local protocol proxy (server_overloaded, server_is_overloaded, at capacity, ...). In streaming mode the proxy first buffers invisible phases such as reasoning and tool-call arguments; it waits until the whole tool call completes or the first visible output appears, then applies the first-token commit delay and retries overloads with backoff during that window. After commit, the same overloads are rewritten into capacity errors Codex recognizes so Codex retries them itself; connection failures, 429/5xx, rate limits, and other errors are not retried. The retained Streaming (legacy) mode keeps the old logic and hands the first output event to Codex immediately. In buffered mode the proxy retries overloads at any point, but streaming is lost.",
   "最多自动重试次数": "Maximum automatic retries",
   "首次重试间隔（秒）": "Initial retry interval (seconds)",
   "之后按 2 倍指数退避，单次最长 30 秒；上游返回 Retry-After 时优先采用（同样受上限约束）。":
     "Later retries use 2x exponential backoff with a 30-second cap per wait; an upstream Retry-After header takes precedence (also subject to that cap).",
   "避震模式": "Shock absorption mode",
   "首字提交延迟（毫秒）": "First-token commit delay (ms)",
-  "流式避震：首字（含工具调用参数）前由代理重试，首字后交给 Codex 原生重试":
-    "Streaming: retry inside the proxy before the first token (including tool-call arguments), then let Codex retry natively",
+  "流式避震：工具调用参数与首字宽限内由代理重试，提交后交给 Codex 原生重试":
+    "Streaming: retry inside the proxy for tool-call arguments and during the first-token grace window, then hand off to Codex after commit",
+  "流式避震（旧行为）：首个输出事件立即提交，之后交给 Codex 原生重试":
+    "Streaming (legacy): commit as soon as the first output event arrives, then let Codex retry natively",
   "整段缓冲避震：任何时点过载都由代理重试（失去流式）":
     "Buffered shock absorption: retry overload errors at any point inside the proxy (loses streaming)",
-  "流式避震保留实时输出；「首字提交延迟」把首段可见输出也算进可重试窗口：0 = 一出现正文就提交，1000 = 再缓冲 1 秒，期间过载仍由代理重试；工具调用的参数生成阶段始终整项缓冲，不额外增加首字延迟。整段缓冲避震在所有情况下都不会把过载错误交给 Codex，但回复要等整段生成完才显示。":
-    "Streaming keeps live output; the first-token commit delay also counts the first visible output toward the retry window: 0 commits as soon as text appears, 1000 buffers one more second while the proxy still retries overloads; tool-call argument generation is always buffered as a whole and adds no extra first-token delay. Buffered mode never hands overload errors to Codex, but the reply only appears after the whole response completes.",
+  "流式避震保留实时输出；「首字提交延迟」把首段可见输出也算进可重试窗口：0 = 一出现正文就提交，1000 = 再缓冲 1 秒，期间过载仍由代理重试；工具调用的参数生成阶段始终整项缓冲，不额外增加首字延迟。选「旧行为」则不做这些缓冲，完全回到旧逻辑。整段缓冲避震在所有情况下都不会把过载错误交给 Codex，但回复要等整段生成完才显示。":
+    "Streaming keeps live output; the first-token commit delay also counts the first visible output toward the retry window: 0 commits as soon as text appears, 1000 buffers one more second while the proxy still retries overloads; tool-call argument generation is always buffered as a whole and adds no extra first-token delay. Choosing Streaming (legacy) skips this buffering and restores the old behavior. Buffered mode never hands overload errors to Codex, but the reply only appears after the whole response completes.",
   "代理设置": "Proxy settings",
   "请求日志": "Request log",
   "进行中": "In progress",

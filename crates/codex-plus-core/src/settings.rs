@@ -933,9 +933,12 @@ pub struct BackendSettings {
         default = "default_protocol_proxy_auto_retry_interval_seconds"
     )]
     pub protocol_proxy_auto_retry_interval_seconds: u64,
-    /// 过载错误处理模式：`streaming`（默认，流式；首字前由代理重试，
-    /// 首字后把过载错误规范成 Codex 可识别的容量错误）或 `buffered`
-    /// （整段缓冲后转发；任何时点的过载都由代理重试，但失去流式）。
+    /// 过载错误处理模式：
+    /// - `streaming`（默认，流式；推理/工具调用参数先缓冲，首段可见输出后再等
+    ///   `protocolProxyAutoRetryCommitDelayMs`，窗口内仍由代理重试）；
+    /// - `streaming-legacy`（旧流式：遇到第一个输出事件立即提交，不再为工具
+    ///   参数或首字窗口缓冲）；
+    /// - `buffered`（整段缓冲后转发；任何时点的过载都由代理重试，但失去流式）。
     #[serde(
         rename = "protocolProxyAutoRetryMode",
         default = "default_protocol_proxy_auto_retry_mode"
@@ -943,8 +946,9 @@ pub struct BackendSettings {
     pub protocol_proxy_auto_retry_mode: String,
     /// 流式避震的「首字提交延迟」：出现第一段可见输出后，代理继续缓冲多少毫秒
     /// 再交给 Codex。窗口内遇到容量/过载错误仍可丢弃重试；0 表示一出现可见输出
-    /// 就提交（旧行为）。推理与工具调用参数阶段本来就不向客户端提交，不占这个
-    /// 延迟，所以工具调用可以整项缓冲到完成后再提交。
+    /// 就提交。推理与工具调用参数阶段本来就不向客户端提交，不占这个延迟，所以
+    /// 工具调用可以整项缓冲到完成后再提交。注意 `streaming-legacy` 模式忽略该
+    /// 字段，始终保持旧行为。
     #[serde(
         rename = "protocolProxyAutoRetryCommitDelayMs",
         default = "default_protocol_proxy_auto_retry_commit_delay_ms"
@@ -1509,6 +1513,8 @@ pub fn default_protocol_proxy_auto_retry_mode() -> String {
 pub fn normalize_protocol_proxy_auto_retry_mode(value: &str) -> String {
     match value.trim() {
         "buffered" => "buffered".to_string(),
+        // 旧版「流式」行为保留为独立选项，方便随时退回。
+        "streaming-legacy" => "streaming-legacy".to_string(),
         _ => default_protocol_proxy_auto_retry_mode(),
     }
 }

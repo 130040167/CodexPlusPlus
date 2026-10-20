@@ -376,7 +376,7 @@ async fn schedule_proxy_auto_retry(
 }
 /// 流式响应预读上限：推理阶段可能带加密推理内容，留足空间；超过则直接放行。
 const STREAM_RETRY_PEEK_MAX_BYTES: usize = 8 * 1024 * 1024;
-/// 预读最长等待：等待正文/工具调用出现；超时后放行，之后不再具备重试条件。
+/// 预读最长等待：超时后放行已读前缀，之后不再具备重试条件。
 const STREAM_RETRY_PEEK_MAX_WAIT: Duration = Duration::from_secs(120);
 /// 整段缓冲模式的上限：超过后回退为流式（已读部分作为前缀转发）。
 const BUFFERED_STREAM_MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -493,22 +493,50 @@ async fn read_responses_stream_for_buffering(
     }
 }
 
+/// 流式预读的提交模式。旧模式保留给需要「退回旧行为」的用户。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamCommitMode {
+    /// 旧行为：遇到第一个不可安全重放的事件就立即提交，工具调用参数不缓冲。
+    Immediate,
+    /// 工具调用参数整项缓冲，首段可见输出后再等宽限窗口才提交。
+    VisibleGrace,
+}
+
 /// 流式预读的提交策略：决定什么时候把已缓冲字节交给 Codex。
 ///
 /// 「提交」之后响应就不可回滚，上游再报过载只能交给 Codex 原生重试；所以
-/// 预读会尽量把提交点往后挪，且只在不影响可见延迟的阶段多缓冲。
+/// 新模式下预读会尽量把提交点往后挪，且只在不影响可见延迟的阶段多缓冲。
 #[derive(Debug, Clone, Copy)]
 struct StreamStartCommitPolicy {
-    /// 首段可见输出出现后继续缓冲的时长；0 表示立即提交（旧行为）。
+    mode: StreamCommitMode,
+    /// 首段可见输出出现后继续缓冲的时长；0 表示一出现可见输出就提交。
     first_visible_grace: Duration,
 }
 
 impl StreamStartCommitPolicy {
     fn from_settings(settings: &crate::settings::BackendSettings) -> Self {
+        let mode = if settings.protocol_proxy_auto_retry_mode == "streaming-legacy" {
+            StreamCommitMode::Immediate
+        } else {
+            StreamCommitMode::VisibleGrace
+        };
         Self {
+            mode,
+            // 设置加载/部分更新都会夹取；这里再兜一层，避免直接构造的设置
+            // 让 `Instant + Duration` 溢出。
             first_visible_grace: Duration::from_millis(
-                settings.protocol_proxy_auto_retry_commit_delay_ms,
+                settings
+                    .protocol_proxy_auto_retry_commit_delay_ms
+                    .min(10_000),
             ),
+        }
+    }
+
+    /// 重试预算已用尽时退回旧提交时机：继续缓冲不会带来任何重试收益。
+    fn without_retry_budget(self) -> Self {
+        Self {
+            mode: StreamCommitMode::Immediate,
+            ..self
         }
     }
 }
@@ -527,7 +555,21 @@ enum StreamStartEventKind {
 /// 判断事件属于哪一类。默认「继续按住」：未知事件宁可多缓冲（最坏退化成
 /// 接近整段缓冲），也不要把还能重试的窗口提前关掉；总长度仍受 8 MiB / 120 秒
 /// 预读上限约束，不会无限期扣住响应。
-fn stream_start_event_kind(block: &str, event: &str) -> StreamStartEventKind {
+///
+/// `event` 应使用 data JSON 里的 `type`（没有时回退 SSE `event:` 名），与
+/// `ResponsesSseTransformer` 的判定顺序保持一致。
+fn stream_start_event_kind(
+    block: &str,
+    event: &str,
+    mode: StreamCommitMode,
+) -> StreamStartEventKind {
+    if stream_event_is_retry_safe(block, event) {
+        return StreamStartEventKind::Hold;
+    }
+    // 旧行为：任何不可安全重放的事件（正文、工具调用参数、图片等）都立即提交。
+    if mode == StreamCommitMode::Immediate {
+        return StreamStartEventKind::Terminal;
+    }
     match event {
         "response.completed" | "response.failed" | "response.incomplete" | "error" => {
             return StreamStartEventKind::Terminal;
@@ -551,14 +593,17 @@ fn stream_start_event_kind(block: &str, event: &str) -> StreamStartEventKind {
         }
         _ => {}
     }
-    if stream_event_is_retry_safe(block, event) {
-        return StreamStartEventKind::Hold;
-    }
     match event {
+        // 正常流式上游会先发 delta；部分兼容上游只在 done 事件里带完整文本，
+        // 这里也算可见输出，避免白等预读上限。
         "response.output_text.delta"
+        | "response.output_text.done"
         | "response.refusal.delta"
+        | "response.refusal.done"
         | "response.audio.delta"
+        | "response.audio.done"
         | "response.audio.transcript.delta"
+        | "response.audio.transcript.done"
         | "response.image_generation_call.partial_image" => StreamStartEventKind::Visible,
         _ => StreamStartEventKind::Hold,
     }
@@ -578,11 +623,16 @@ enum StreamStartPeek {
         prefix: Vec<u8>,
         first_output_at_ms: Option<u64>,
     },
-    /// 在产生任何输出前收到终态失败（response.failed / incomplete / error）。
+    /// 收到终态失败（response.failed / incomplete / error），尚未提交给 Codex。
+    ///
+    /// 即使之前已经缓冲了可见输出（宽限窗口内），只要还没提交就仍可重试；
+    /// 不能重试时把 `prefix` 和首字时间一起交回，避免请求日志把首字耗时
+    /// 记成提交时刻。
     Failed {
         prefix: Vec<u8>,
         code: Option<String>,
         message: Option<String>,
+        first_output_at_ms: Option<u64>,
     },
 }
 
@@ -759,6 +809,7 @@ fn stream_failure_is_retryable(code: Option<&str>, message: Option<&str>) -> boo
 /// 并尽量推迟不可回滚的提交点，给代理重试多留窗口。
 ///
 /// 提交时机：
+/// - `streaming-legacy`：遇到第一个不可安全重放的事件立即提交（旧行为）；
 /// - 推理、工具调用参数等不可见阶段一直按住，随时可以整体丢弃重发；
 /// - 非消息输出项完成（例如 function_call 参数收齐）立即提交：Codex 本来就要
 ///   等参数完整才会执行工具，这里没有可见延迟；
@@ -805,9 +856,15 @@ async fn peek_responses_stream_start(
         while let Some(boundary) = next_sse_boundary(&buffered, scanned) {
             let block = String::from_utf8_lossy(&buffered[scanned..boundary]).into_owned();
             scanned = boundary;
-            let Some(event) = sse_block_type(&block) else {
+            let Some(sse_event) = sse_block_type(&block) else {
                 continue;
             };
+            // 与 ResponsesSseTransformer 一致：data JSON 的 type 优先，回退 SSE
+            // event: 名。少数上游两者不一致，只认 event: 会把可见内容当成未知事件。
+            let event = sse_block_json(&block)
+                .and_then(|json| json.get("type").and_then(Value::as_str).map(str::to_string))
+                .filter(|event| !event.is_empty())
+                .unwrap_or_else(|| sse_event.clone());
             if first_output_at_ms.is_none() && !is_pre_output_stream_event(&event) {
                 first_output_at_ms = Some(current_epoch_ms());
                 // 请求日志的「首字耗时」仍按上游第一段输出计；预读可能还要
@@ -816,7 +873,7 @@ async fn peek_responses_stream_start(
                     crate::request_log::update_running_first_token(id);
                 }
             }
-            match stream_start_event_kind(&block, &event) {
+            match stream_start_event_kind(&block, &event, policy.mode) {
                 StreamStartEventKind::Terminal => {
                     if matches!(
                         event.as_str(),
@@ -827,6 +884,7 @@ async fn peek_responses_stream_start(
                             prefix: buffered,
                             code,
                             message,
+                            first_output_at_ms,
                         };
                     }
                     return forward_replay_safe(buffered, first_output_at_ms);
@@ -3890,8 +3948,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         
         }
         // 200 的流式响应也可能带着 response.failed（官方 server_overloaded
-        // 就是先回 200 再在流里失败）。在向 Codex 写出任何字节前按住开头的
-        // 非输出事件；若识别到容量失败就退避后重发同一次上游请求。
+        // 就是先回 200 再在流里失败）。在向 Codex 写出任何字节前先预读；
+        // 若识别到容量失败就退避后重发同一次上游请求。
         let mut stream_prefix = Vec::new();
         if is_stream
             && (200..300).contains(&status_code)
@@ -3970,7 +4028,23 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             && !exec_adapted
             && auto_retry.is_some()
         {
-            match peek_responses_stream_start(&mut upstream, commit_policy, live_request_id).await {
+            // 重试预算已用尽时再缓冲没有收益，直接退回旧提交时机，
+            // 避免为首字白等一个宽限窗口。
+            let attempt_commit_policy = if auto_retry
+                .as_ref()
+                .is_some_and(|retry| retry.remaining > 0)
+            {
+                commit_policy
+            } else {
+                commit_policy.without_retry_budget()
+            };
+            match peek_responses_stream_start(
+                &mut upstream,
+                attempt_commit_policy,
+                live_request_id,
+            )
+            .await
+            {
                 StreamStartPeek::Forward {
                     prefix,
                     first_output_at_ms,
@@ -3984,6 +4058,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     prefix,
                     code,
                     message,
+                    first_output_at_ms,
                 } => {
                     let retryable =
                         stream_failure_is_retryable(code.as_deref(), message.as_deref());
@@ -4021,7 +4096,12 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                             continue 'request_attempts;
                         }
                     }
+                    // 不重试时把预读前缀连同首字时间交回；否则请求日志会把
+                    // 首字耗时记成开始转发的时刻，宽限窗口会虚增这段耗时。
                     stream_prefix = prefix;
+                    if first_output_at_ms.is_some() {
+                        request_trace.first_output_at_ms = first_output_at_ms;
+                    }
                 }
             }
         }
@@ -10477,10 +10557,6 @@ mod proxy_auto_retry_tests {
                 "response.output_item.added",
                 "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}",
             ),
-            commit_test_block(
-                "response.output_text.done",
-                "{\"type\":\"response.output_text.done\",\"text\":\"hello\"}",
-            ),
             // 推理摘要 part 的 done 此前不在 retry-safe 白名单里；新分类按
             // 「未知事件继续按住」处理，不再提前结束重试窗口。
             commit_test_block(
@@ -10498,7 +10574,7 @@ mod proxy_auto_retry_tests {
         ] {
             let event = sse_block_type(&block).expect("event type");
             assert_eq!(
-                stream_start_event_kind(&block, &event),
+                stream_start_event_kind(&block, &event, StreamCommitMode::VisibleGrace),
                 StreamStartEventKind::Hold,
                 "{event}"
             );
@@ -10520,10 +10596,23 @@ mod proxy_auto_retry_tests {
                 "response.image_generation_call.partial_image",
                 "{\"type\":\"response.image_generation_call.partial_image\",\"partial_image_b64\":\"AAAA\"}",
             ),
+            // 不吐 delta、只在 done 里给完整文本的兼容上游也算可见输出。
+            commit_test_block(
+                "response.output_text.done",
+                "{\"type\":\"response.output_text.done\",\"text\":\"hello\"}",
+            ),
+            commit_test_block(
+                "response.refusal.done",
+                "{\"type\":\"response.refusal.done\",\"refusal\":\"no\"}",
+            ),
+            commit_test_block(
+                "response.audio.transcript.done",
+                "{\"type\":\"response.audio.transcript.done\",\"transcript\":\"hi\"}",
+            ),
         ] {
             let event = sse_block_type(&block).expect("event type");
             assert_eq!(
-                stream_start_event_kind(&block, &event),
+                stream_start_event_kind(&block, &event, StreamCommitMode::VisibleGrace),
                 StreamStartEventKind::Visible,
                 "{event}"
             );
@@ -10531,6 +10620,7 @@ mod proxy_auto_retry_tests {
         for block in [
             commit_test_block("response.completed", "{\"type\":\"response.completed\"}"),
             commit_test_block("response.failed", "{\"type\":\"response.failed\"}"),
+            commit_test_block("response.incomplete", "{\"type\":\"response.incomplete\"}"),
             commit_test_block("error", "{\"type\":\"error\"}"),
             // 非消息输出项完成 = 工具调用参数收齐，提交不会延迟 Codex 执行。
             commit_test_block(
@@ -10544,7 +10634,7 @@ mod proxy_auto_retry_tests {
         ] {
             let event = sse_block_type(&block).expect("event type");
             assert_eq!(
-                stream_start_event_kind(&block, &event),
+                stream_start_event_kind(&block, &event, StreamCommitMode::VisibleGrace),
                 StreamStartEventKind::Terminal,
                 "{event}"
             );
@@ -10552,17 +10642,68 @@ mod proxy_auto_retry_tests {
     }
 
     #[test]
-    fn commit_policy_reads_grace_window_from_settings() {
+    fn commit_policy_reads_mode_and_grace_window_from_settings() {
         let defaults = StreamStartCommitPolicy::from_settings(
             &crate::settings::BackendSettings::default(),
         );
+        assert_eq!(defaults.mode, StreamCommitMode::VisibleGrace);
         assert_eq!(defaults.first_visible_grace, Duration::from_millis(1000));
+
         let mut settings = crate::settings::BackendSettings::default();
         settings.protocol_proxy_auto_retry_commit_delay_ms = 0;
         assert!(
             StreamStartCommitPolicy::from_settings(&settings)
                 .first_visible_grace
                 .is_zero()
+        );
+
+        settings.protocol_proxy_auto_retry_mode = "streaming-legacy".to_string();
+        let legacy = StreamStartCommitPolicy::from_settings(&settings);
+        assert_eq!(legacy.mode, StreamCommitMode::Immediate);
+
+        // 重试预算用尽时退回旧提交时机。
+        assert_eq!(
+            defaults.without_retry_budget().mode,
+            StreamCommitMode::Immediate
+        );
+    }
+
+    #[test]
+    fn legacy_commit_mode_releases_on_first_unreplayable_event() {
+        // 旧模式：工具调用参数与正文都在第一个事件立即提交。
+        for block in [
+            commit_test_block(
+                "response.output_item.added",
+                "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\"}}",
+            ),
+            commit_test_block(
+                "response.output_item.added",
+                "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}",
+            ),
+            commit_test_block(
+                "response.output_text.delta",
+                "{\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}",
+            ),
+        ] {
+            let event = sse_block_type(&block).expect("event type");
+            assert_eq!(
+                stream_start_event_kind(&block, &event, StreamCommitMode::Immediate),
+                StreamStartEventKind::Terminal,
+                "{event}"
+            );
+        }
+        // 推理事件仍然可安全重放，旧模式也先按住。
+        let reasoning_delta = commit_test_block(
+            "response.reasoning_summary_text.delta",
+            "{\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\"}",
+        );
+        assert_eq!(
+            stream_start_event_kind(
+                &reasoning_delta,
+                "response.reasoning_summary_text.delta",
+                StreamCommitMode::Immediate,
+            ),
+            StreamStartEventKind::Hold
         );
     }
 
