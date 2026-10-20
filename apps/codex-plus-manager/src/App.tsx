@@ -614,6 +614,8 @@ type RequestLogEntry = {
   relayId: string;
   relayName: string;
   wireApi: string;
+  /** Codex 会话/线程 id（来自请求头；旧日志没有该字段）。 */
+  threadId?: string | null;
   attempts: number;
   autoRetries: number;
   retryReasons?: string[];
@@ -5511,6 +5513,13 @@ function formatRequestLogCacheHitRatio(
   return `${Math.round(percent)}%`;
 }
 
+/** 会话 id 展示：UUIDv7 前缀按时间递增、容易重名，这里取末 8 位区分。 */
+function formatRequestLogSession(threadId?: string | null): string {
+  const value = (threadId ?? "").trim();
+  if (!value) return "-";
+  return value.length > 12 ? `…${value.slice(-8)}` : value;
+}
+
 function formatRequestLogDuration(durationMs: number) {
   if (!Number.isFinite(durationMs) || durationMs < 0) return "-";
   if (durationMs < 1000) return `${durationMs}ms`;
@@ -5530,6 +5539,7 @@ function RequestLogScreen() {
   const [error, setError] = useState("");
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | "running" | "success" | "failed" | "retried">("all");
+  const [sessionFilter, setSessionFilter] = useState("all");
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
@@ -5585,6 +5595,30 @@ function RequestLogScreen() {
     }
   };
 
+  const sessions = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const entry of entries) {
+      const id = (entry.threadId ?? "").trim();
+      if (!id) continue;
+      counts.set(id, (counts.get(id) ?? 0) + 1);
+    }
+    // entries 本身按时间倒序，Map 的插入顺序即「最近活跃的会话优先」。
+    return [...counts.entries()].map(([id, count]) => ({ id, count }));
+  }, [entries]);
+
+  const hasUnknownSession = useMemo(
+    () => entries.some((entry) => !(entry.threadId ?? "").trim()),
+    [entries],
+  );
+
+  // 日志被清空/切换后，避免筛选项停留在已不存在的会话上。
+  useEffect(() => {
+    if (sessionFilter === "all" || sessionFilter === "__none__") return;
+    if (!sessions.some((session) => session.id === sessionFilter)) {
+      setSessionFilter("all");
+    }
+  }, [sessionFilter, sessions]);
+
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return entries.filter((entry) => {
@@ -5593,12 +5627,19 @@ function RequestLogScreen() {
       if (filter === "success" && (running || !entry.success)) return false;
       if (filter === "failed" && (running || entry.success)) return false;
       if (filter === "retried" && entry.autoRetries === 0 && entry.attempts <= 1) return false;
+      const threadId = (entry.threadId ?? "").trim();
+      if (sessionFilter === "__none__") {
+        if (threadId) return false;
+      } else if (sessionFilter !== "all" && threadId !== sessionFilter) {
+        return false;
+      }
       if (!needle) return true;
       return [
         entry.model,
         entry.upstreamModel,
         entry.relayName,
         entry.path,
+        entry.threadId ?? "",
         entry.error ?? "",
         entry.wireApi,
       ]
@@ -5636,6 +5677,21 @@ function RequestLogScreen() {
             <option value="success">{t("仅成功")}</option>
             <option value="failed">{t("仅失败")}</option>
             <option value="retried">{t("含重试")}</option>
+          </select>
+          <select
+            aria-label={t("按会话筛选")}
+            className="request-log-filter request-log-session-filter"
+            onChange={(event) => setSessionFilter(event.currentTarget.value)}
+            title={t("按会话筛选")}
+            value={sessionFilter}
+          >
+            <option value="all">{t("全部会话")}</option>
+            {sessions.map((session) => (
+              <option key={session.id} value={session.id}>
+                {tf("会话 {0}（{1} 条）", [formatRequestLogSession(session.id), String(session.count)])}
+              </option>
+            ))}
+            {hasUnknownSession ? <option value="__none__">{t("未记录会话")}</option> : null}
           </select>
           <label className="check-row request-log-auto">
             <input
@@ -5763,6 +5819,7 @@ function RequestLogScreen() {
                   <div className="request-log-detail">
                     <dl>
                       <div><dt>{t("请求 ID")}</dt><dd><code>{entry.id}</code></dd></div>
+                      <div><dt>{t("会话 ID")}</dt><dd><code>{entry.threadId || "-"}</code></dd></div>
                       <div><dt>{t("路径")}</dt><dd><code>{entry.method} {entry.path}</code></dd></div>
                       <div><dt>{t("上游协议")}</dt><dd>{entry.wireApi || "-"}</dd></div>
                       <div><dt>{t("上游模型")}</dt><dd>{entry.upstreamModel || "-"}</dd></div>
