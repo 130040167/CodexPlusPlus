@@ -1,4 +1,5 @@
 import { createRoot } from "react-dom/client";
+import "./tailwind-source.css";
 import "../src/styles.css";
 import "@fontsource/jetbrains-mono";
 
