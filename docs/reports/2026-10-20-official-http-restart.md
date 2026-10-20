@@ -23,3 +23,12 @@
 - `npm run vite:build` 与 `cargo build --release -p codex-plus-manager` 通过。
 - 固定测试应用 `dist/local-build/Codex++.app` 已签名启动，进程与 `manager.start` 日志正常。
   测试实例使用独立状态和 Codex 配置目录；真实网络对话仍需用户在使用环境中复测。
+
+## PR 的 Windows CI 修正
+
+首次 CI（run `39370111077`）在原有单元测试
+`paths::tests::settings_path_pointer_accepts_only_absolute_targets` 失败：
+测试写死 `/tmp/codex-settings.json`，该路径在 Windows 上不满足 `is_absolute()`。
+改为使用 `tempfile::tempdir()` 下的目标文件，保留末尾换行和相对路径拒绝断言。
+本次仅修正跨平台测试数据，不改变路径解析或 HTTP 修复的运行行为。
+本地 `cargo test --offline -p codex-plus-core --lib paths::tests` 的 10 项测试通过。
