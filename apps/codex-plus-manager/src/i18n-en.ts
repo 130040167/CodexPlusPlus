@@ -740,8 +740,8 @@ export const EN_PLAIN: Record<string, string> = {
   "该工具的配置在它自己的页签里管理；上面的基础设置对所有工具通用。":
     "This tool is configured on its own tab; the basic settings above apply to every tool.",
   "赞助商推荐": "Sponsor recommendations",
-  "内容来自 BigPizzaV3/Ad-List，含置顶推荐与普通推荐。":
-    "Content comes from BigPizzaV3/Ad-List, including the pinned and regular recommendations.",
+  "内容来自 Codex++ 广告源，含置顶推荐与普通推荐。":
+    "Content comes from the Codex++ ad source, including pinned and regular recommendations.",
   "普通推荐内容": "General recommendations",
   "有未保存修改。": "Unsaved changes.",
   "每个供应商对应一套 Base URL + API Key + 模型列表。":

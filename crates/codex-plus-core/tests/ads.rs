@@ -8,12 +8,12 @@ use codex_plus_core::ads::{
 use serde_json::json;
 
 #[test]
-fn default_ad_urls_match_legacy_helper_sources() {
+fn default_ad_urls_prefer_codexpp_pages_sources() {
     assert_eq!(
         DEFAULT_AD_LIST_URLS,
         [
-            "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/ads.json",
-            "https://cdn.jsdelivr.net/gh/BigPizzaV3/Ad-List@main/ads.json",
+            "https://ads.codexpp.cc/ads.json",
+            "https://codexpp-ads-test-20261021.pages.dev/ads.json",
         ]
     );
 }

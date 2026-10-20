@@ -4,8 +4,8 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 
 const source = fs.readFileSync(require.resolve("./site.js"), "utf8");
-const primaryUrl = "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/ads.json";
-const fallbackUrl = "https://cdn.jsdelivr.net/gh/BigPizzaV3/Ad-List@main/ads.json";
+const primaryUrl = "https://ads.codexpp.cc/ads.json";
+const fallbackUrl = "https://codexpp-ads-test-20261021.pages.dev/ads.json";
 const now = Date.parse("2026-10-09T00:00:00Z");
 const sponsor = (title, url = `https://example.com/${encodeURIComponent(title)}`) => ({
   type: "sponsor",
@@ -186,7 +186,7 @@ test("primary fetch uses fresh credential-free requests and returns the live pay
   assert.equal(api.timers.size, 0);
 });
 
-test("a failed primary source falls back to jsDelivr", async () => {
+test("a failed primary source falls back to the Pages hostname", async () => {
   const payload = { ads: [sponsor("Fallback sponsor")] };
   const api = fixture(async (url) => url.startsWith(primaryUrl)
     ? { ok: false, status: 503 }
@@ -259,7 +259,7 @@ test("relative sponsor images resolve from the live source and failures get a te
   const card = api.createSponsorCard(ad, false);
   const image = card.children[0];
   assert.equal(image.tagName, "IMG");
-  assert.equal(image.src, "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/logos/logo.svg");
+  assert.equal(image.src, "https://ads.codexpp.cc/logos/logo.svg");
   image.dispatch("error");
   assert.equal(card.children[0].tagName, "SPAN");
   assert.equal(card.children[0].textContent, "I");

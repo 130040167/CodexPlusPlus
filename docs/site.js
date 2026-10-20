@@ -390,8 +390,8 @@ const updateRepositoryStats = async () => {
 
 // 与管理工具共用远端清单，不保留需要单独维护的品牌名单或图片映射。
 const sponsorSources = [
-  "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/ads.json",
-  "https://cdn.jsdelivr.net/gh/BigPizzaV3/Ad-List@main/ads.json",
+  "https://ads.codexpp.cc/ads.json",
+  "https://codexpp-ads-test-20261021.pages.dev/ads.json",
 ];
 
 const sponsorUrl = (value, sourceUrl) => {

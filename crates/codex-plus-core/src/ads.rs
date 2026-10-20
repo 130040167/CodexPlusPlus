@@ -14,8 +14,8 @@ const FENNO_AI_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-fenno
 const QINIU_AI_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-qiniu-ai.png");
 
 pub const DEFAULT_AD_LIST_URLS: [&str; 2] = [
-    "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/ads.json",
-    "https://cdn.jsdelivr.net/gh/BigPizzaV3/Ad-List@main/ads.json",
+    "https://ads.codexpp.cc/ads.json",
+    "https://codexpp-ads-test-20261021.pages.dev/ads.json",
 ];
 
 pub fn normalize_ad_payload(payload: Value) -> Value {
