@@ -916,23 +916,6 @@ pub struct BackendSettings {
     pub active_aggregate_relay_id: String,
     #[serde(rename = "relayTestModel", default = "default_relay_test_model")]
     pub relay_test_model: String,
-    /// 协议代理自动重试：上游瞬时失败（连接失败、408/429/5xx）先在本地代理内部
-    /// 退避重试，不立刻把错误交给 Codex。只影响经过本地协议代理的请求。
-    /// 默认开启：用户看到的失败横幅会显著减少；关闭后恢复「失败立即返回」行为。
-    #[serde(rename = "protocolProxyAutoRetry", default = "default_true")]
-    pub protocol_proxy_auto_retry: bool,
-    /// 最多自动重试次数（不含首次请求）。0 与关闭开关等价。
-    #[serde(
-        rename = "protocolProxyAutoRetryMaxAttempts",
-        default = "default_protocol_proxy_auto_retry_max_attempts"
-    )]
-    pub protocol_proxy_auto_retry_max_attempts: u32,
-    /// 首次重试等待秒数；之后按 2 倍指数退避，单次上限 30 秒。
-    #[serde(
-        rename = "protocolProxyAutoRetryIntervalSeconds",
-        default = "default_protocol_proxy_auto_retry_interval_seconds"
-    )]
-    pub protocol_proxy_auto_retry_interval_seconds: u64,
     /// 按工具分区的配置。`tools.codex` 是上面那批扁平字段的镜像（写盘时同步），
     /// 其它工具（Grok / 后续工具）只存在这里。见 `crate::tools`。
     #[serde(rename = "tools", default)]
@@ -1030,11 +1013,6 @@ impl Default for BackendSettings {
             aggregate_relay_profiles: Vec::new(),
             active_aggregate_relay_id: String::new(),
             relay_test_model: default_relay_test_model(),
-            protocol_proxy_auto_retry: true,
-            protocol_proxy_auto_retry_max_attempts:
-                default_protocol_proxy_auto_retry_max_attempts(),
-            protocol_proxy_auto_retry_interval_seconds:
-                default_protocol_proxy_auto_retry_interval_seconds(),
             tools: BTreeMap::new(),
             active_tool: ToolId::Codex,
         }
@@ -1463,23 +1441,6 @@ pub fn default_active_relay_id() -> String {
 
 pub fn default_relay_test_model() -> String {
     "gpt-5.4-mini".to_string()
-}
-
-/// 协议代理默认最多自动重试 5 次：2+4+8+16+30 秒封顶，合计约 60 秒。
-pub fn default_protocol_proxy_auto_retry_max_attempts() -> u32 {
-    5
-}
-
-pub fn clamp_protocol_proxy_auto_retry_max_attempts(value: u32) -> u32 {
-    value.min(20)
-}
-
-pub fn default_protocol_proxy_auto_retry_interval_seconds() -> u64 {
-    2
-}
-
-pub fn clamp_protocol_proxy_auto_retry_interval_seconds(value: u64) -> u64 {
-    value.min(30)
 }
 
 pub fn default_relay_profiles() -> Vec<RelayProfile> {
@@ -2062,29 +2023,6 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     }
     if let Some(value) = source.get("relayProfilesEnabled").and_then(Value::as_bool) {
         target.insert("relayProfilesEnabled".to_string(), Value::Bool(value));
-    }
-    // 协议代理自动重试：管理器整份保存也会经过 normalize，这里补上部分更新路径，
-    // 保证任何走 /settings/set 的调用都不会被静默丢弃。
-    merge_bool_setting(target, source, "protocolProxyAutoRetry");
-    if let Some(value) = source
-        .get("protocolProxyAutoRetryMaxAttempts")
-        .and_then(Value::as_u64)
-    {
-        target.insert(
-            "protocolProxyAutoRetryMaxAttempts".to_string(),
-            Value::from(clamp_protocol_proxy_auto_retry_max_attempts(
-                value as u32,
-            )),
-        );
-    }
-    if let Some(value) = source
-        .get("protocolProxyAutoRetryIntervalSeconds")
-        .and_then(Value::as_u64)
-    {
-        target.insert(
-            "protocolProxyAutoRetryIntervalSeconds".to_string(),
-            Value::from(clamp_protocol_proxy_auto_retry_interval_seconds(value)),
-        );
     }
     if let Some(value) = source.get("enhancementsEnabled").and_then(Value::as_bool) {
         target.insert("enhancementsEnabled".to_string(), Value::Bool(value));
@@ -2808,12 +2746,6 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
         clamp_stepwise_max_output_tokens(settings.codex_app_stepwise_max_output_tokens);
     settings.codex_app_stepwise_timeout_ms =
         clamp_stepwise_timeout_ms(settings.codex_app_stepwise_timeout_ms);
-    settings.protocol_proxy_auto_retry_max_attempts =
-        clamp_protocol_proxy_auto_retry_max_attempts(settings.protocol_proxy_auto_retry_max_attempts);
-    settings.protocol_proxy_auto_retry_interval_seconds =
-        clamp_protocol_proxy_auto_retry_interval_seconds(
-            settings.protocol_proxy_auto_retry_interval_seconds,
-        );
     // 扁平字段始终是 Codex 的唯一事实来源，这里把它镜像进 tools.codex；
     // 其它工具的分片原样保留。放在函数末尾，所有 load / save / update 路径
     // 都会经过，两边不会漂移。
