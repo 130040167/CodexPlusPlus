@@ -1887,6 +1887,33 @@ async fn handle_helper_connection(
             "application/json; charset=utf-8".to_string(),
             "helper.backend_status_ok",
         )
+    } else if path == "/proxy-status" && matches!(method, "GET" | "POST" | "OPTIONS") {
+        let requests = crate::request_log::running_requests()
+            .into_iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "id": entry.id,
+                    "model": entry.model,
+                    "relayName": entry.relay_name,
+                    "startedAtMs": entry.started_at_ms,
+                    "attempts": entry.attempts,
+                    "autoRetries": entry.auto_retries,
+                    "retryReasons": entry.retry_reasons,
+                    "phase": entry.phase,
+                    "firstTokenMs": entry.first_token_ms,
+                    "estimatedOutputTokens": entry.estimated_output_tokens,
+                })
+            })
+            .collect::<Vec<_>>();
+        (
+            "200 OK".to_string(),
+            serde_json::to_vec(&serde_json::json!({
+                "status": "ok",
+                "requests": requests
+            }))?,
+            "application/json; charset=utf-8".to_string(),
+            "helper.proxy_status_ok",
+        )
     } else if path == "/diagnostics/log" && matches!(method, "POST" | "OPTIONS") {
         if method == "POST" {
             let detail =
@@ -2269,6 +2296,7 @@ impl ProxyRequestLog {
                 state: Some("running".to_string()),
                 first_token_ms: None,
                 estimated_output_tokens: None,
+                phase: Some("requesting".to_string()),
                 error: None,
                 stream_outcome: None,
                 usage: None,
@@ -2345,6 +2373,7 @@ impl ProxyRequestLog {
         if self.entry.first_token_ms.is_none() {
             self.entry.first_token_ms =
                 Some(current_time_ms().saturating_sub(self.entry.started_at_ms));
+            self.entry.phase = Some("generating".to_string());
             crate::request_log::update_running(&self.entry);
         }
     }

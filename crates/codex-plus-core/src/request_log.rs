@@ -91,6 +91,9 @@ pub struct RequestLogEntry {
     /// 请求进行中按流式 delta 粗估的输出 token，完成后清空并写入准确 usage。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_output_tokens: Option<u64>,
+    /// 请求进行中的阶段：requesting / waiting / retrying / generating。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,6 +169,37 @@ pub fn update_running(entry: &RequestLogEntry) {
     {
         live.insert(entry.id.clone(), entry.clone());
     }
+}
+
+/// 更新进行中请求的阶段（供 Codex 应用内的状态条展示）。
+pub fn update_running_phase(id: &str, phase: &str) {
+    if let Ok(mut live) = live_requests().lock()
+        && let Some(entry) = live.get_mut(id)
+    {
+        if entry.first_token_ms.is_some() && phase == "waiting" {
+            return;
+        }
+        entry.phase = Some(phase.to_string());
+    }
+}
+
+/// 缓冲读取到第一段输出时，立刻更新首字耗时与阶段。
+pub fn update_running_first_token(id: &str) {
+    if let Ok(mut live) = live_requests().lock()
+        && let Some(entry) = live.get_mut(id)
+    {
+        if entry.first_token_ms.is_none() {
+            entry.first_token_ms = Some(crate::request_log::current_time_ms_since(entry.started_at_ms));
+        }
+        entry.phase = Some("generating".to_string());
+    }
+}
+
+fn current_time_ms_since(started_at_ms: u64) -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| (duration.as_millis() as u64).saturating_sub(started_at_ms))
+        .unwrap_or(0)
 }
 
 /// 请求重试时实时更新进行中记录，管理器无需等请求结束就能看到重试次数递增。
@@ -378,6 +412,7 @@ mod tests {
             state: None,
             first_token_ms: Some(120),
             estimated_output_tokens: None,
+            phase: None,
             error: None,
             stream_outcome: None,
             usage: Some(RequestUsage {

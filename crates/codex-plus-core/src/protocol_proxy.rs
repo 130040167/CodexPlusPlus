@@ -368,6 +368,7 @@ async fn schedule_proxy_auto_retry(
             next_reasons.len() as u32,
             next_reasons,
         );
+        crate::request_log::update_running_phase(id, "retrying");
     }
     tokio::time::sleep(delay).await;
     retry_reasons.push(reason.to_string());
@@ -445,6 +446,9 @@ async fn read_responses_stream_for_buffering(
             };
             if !is_pre_output_stream_event(&event) && first_output_at_ms.is_none() {
                 first_output_at_ms = Some(current_epoch_ms());
+                if let Some(id) = live_request_id {
+                    crate::request_log::update_running_first_token(id);
+                }
             }
             if event.ends_with(".delta")
                 && let Some(delta) = sse_block_json(&block)
@@ -3177,6 +3181,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 retry_reasons.len() as u32,
                 retry_reasons.clone(),
             );
+            crate::request_log::update_running_phase(id, "requesting");
         }
         let has_more_candidates = attempt + 1 < relay_count;
         validate_upstream(&relay)?;
@@ -3729,6 +3734,9 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 .to_string();
         }
 
+        if let Some(id) = live_request_id {
+            crate::request_log::update_running_phase(id, "waiting");
+        }
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "protocol_proxy.upstream_response",
             json!({
