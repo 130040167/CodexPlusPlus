@@ -32,3 +32,10 @@
 改为使用 `tempfile::tempdir()` 下的目标文件，保留末尾换行和相对路径拒绝断言。
 本次仅修正跨平台测试数据，不改变路径解析或 HTTP 修复的运行行为。
 本地 `cargo test --offline -p codex-plus-core --lib paths::tests` 的 10 项测试通过。
+
+第二轮 CI（run `39371606043`）已通过上述路径断言与 HTTP 回归测试，随后在
+`provider_sync_skips_rollout_locked_after_planning` 失败。扫描后被锁定的 rollout
+在恢复记录预计算阶段重新读取时，通过 `?` 提前返回错误，绕过了原有锁定文件跳过机制。
+回归验证：Windows 保留真实独占锁用例；Unix 在 Planning 阶段撤销文件读取权限，
+验证受阻文件保持原样并被报告跳过，同时可写文件仍完成同步。
+新增 Unix 用例修复前返回 `Failed`，修复后会话同步测试组 60 项全部通过。
