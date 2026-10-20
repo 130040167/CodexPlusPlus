@@ -1024,7 +1024,8 @@ fn provider_sync_skips_rollout_locked_after_planning() {
 
     assert!(held_rollout.is_some());
     drop(held_rollout);
-    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    assert_eq!(result.status, ProviderSyncStatus::Synced, "{result:?}");
+    assert_eq!(result.changed_session_files, 0);
     assert!(result.skipped_locked_rollout_files.contains(&rollout));
     assert_eq!(fs::read(&rollout).unwrap(), original_rollout);
 }
