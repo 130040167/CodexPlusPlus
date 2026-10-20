@@ -362,10 +362,10 @@ async fn schedule_proxy_auto_retry(
     retry_reasons.push(reason.to_string());
     true
 }
-/// 流式响应预读上限：超限说明已有大量内容（不可能还是空转失败），直接放行。
-const STREAM_RETRY_PEEK_MAX_BYTES: usize = 512 * 1024;
-/// 预读最长等待：上游收到请求后迟迟不产出事件时不能一直扣着响应头。
-const STREAM_RETRY_PEEK_MAX_WAIT: Duration = Duration::from_secs(30);
+/// 流式响应预读上限：推理阶段可能带加密推理内容，留足空间；超过则直接放行。
+const STREAM_RETRY_PEEK_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// 预读最长等待：等待正文/工具调用出现；超时后放行，之后不再具备重试条件。
+const STREAM_RETRY_PEEK_MAX_WAIT: Duration = Duration::from_secs(120);
 
 /// 预读 200 SSE 开头后的结果。
 enum StreamStartPeek {
@@ -389,6 +389,39 @@ fn is_pre_output_stream_event(event: &str) -> bool {
         event,
         "response.created" | "response.in_progress" | "response.queued" | "response.metadata"
     )
+}
+
+/// 该事件是否还处于「可以安全重放」的阶段：还没有给 Codex 看过正文。
+///
+/// 除了响应创建类事件，推理摘要与加密推理项也先按住——官方过载错误经常在
+/// 模型思考阶段才返回；此时客户端还没收到正文，重放不会出现重复内容。
+/// 一旦出现正文文字、工具调用、图片等真正输出，就必须立即放行。
+fn stream_event_is_retry_safe(block: &str, event: &str) -> bool {
+    if is_pre_output_stream_event(event) {
+        return true;
+    }
+    match event {
+        "response.output_item.added" | "response.output_item.done" => sse_block_json(block)
+            .and_then(|json| {
+                json.pointer("/item/type")
+                    .and_then(Value::as_str)
+                    .map(|item_type| item_type == "reasoning")
+            })
+            .unwrap_or(false),
+        "response.reasoning_summary_part.added"
+        | "response.reasoning_summary_text.delta"
+        | "response.reasoning_summary_text.done"
+        | "response.reasoning_text.delta"
+        | "response.reasoning_text.done" => true,
+        "response.content_part.added" => sse_block_json(block)
+            .and_then(|json| {
+                json.pointer("/part/type")
+                    .and_then(Value::as_str)
+                    .map(|part_type| part_type.starts_with("reasoning"))
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 /// 找到 `from` 之后第一个完整 SSE 事件边界（返回边界之后的字节下标）。
@@ -501,7 +534,7 @@ async fn peek_responses_stream_start(upstream: &mut reqwest::Response) -> Stream
             let Some(event) = sse_block_type(&block) else {
                 continue;
             };
-            if is_pre_output_stream_event(&event) {
+            if stream_event_is_retry_safe(&block, &event) {
                 continue;
             }
             if matches!(
@@ -10007,6 +10040,26 @@ mod proxy_auto_retry_tests {
         ] {
             assert!(!is_pre_output_stream_event(event), "{event}");
         }
+    }
+
+    #[test]
+    fn reasoning_events_stay_safe_to_replay_until_real_output() {
+        let reasoning_item = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}\n\n",
+        );
+        assert!(stream_event_is_retry_safe(reasoning_item, "response.output_item.added"));
+        let message_item = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n",
+        );
+        assert!(!stream_event_is_retry_safe(message_item, "response.output_item.added"));
+        let reasoning_delta = "event: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\"}\n\n";
+        assert!(stream_event_is_retry_safe(reasoning_delta, "response.reasoning_summary_text.delta"));
+        let text_delta = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
+        assert!(!stream_event_is_retry_safe(text_delta, "response.output_text.delta"));
+        let reasoning_part = "event: response.content_part.added\ndata: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"reasoning_text\"}}\n\n";
+        assert!(stream_event_is_retry_safe(reasoning_part, "response.content_part.added"));
     }
 
     #[test]

@@ -5290,7 +5290,7 @@ function ProxySettingsScreen({
       <Panel>
         <CardHead
           title={t("协议代理自动重试")}
-          detail={t("在本地协议代理内部自动重试上游过载/容量错误，不把错误交给 Codex")}
+          detail={t("在本地协议代理内部自动重试上游过载/容量错误（含推理阶段），不把错误交给 Codex")}
         />
         <CardContent className="settings-content">
           <div className="settings-block">
@@ -5305,7 +5305,7 @@ function ProxySettingsScreen({
               <span>{t("启用协议代理自动重试")}</span>
             </label>
             <p className="field-hint">
-              {t("只对经过本地协议代理、且以 200 流式响应返回的上游过载/容量错误（server_overloaded、server_is_overloaded、at capacity 等）生效；连接失败、429/5xx、限流等其它错误不会重试，直接返回给 Codex。")}
+              {t("只对经过本地协议代理、且以 200 流式响应返回的上游过载/容量错误（server_overloaded、server_is_overloaded、at capacity 等）生效。代理会在正文/工具调用开始前先缓冲推理事件，此阶段遇到过载会退避重试；连接失败、429/5xx、限流等其它错误不重试；一旦正文已开始输出，后续失败仍交给 Codex 自己的重连。")}
             </p>
             <div className="form-row">
               <Field label={t("最多自动重试次数")}>
