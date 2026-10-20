@@ -10728,7 +10728,6 @@ select {
 .request-log-panel {
   width: 100%;
   min-width: 0;
-  overflow: hidden;
 }
 
 .request-log-content {
@@ -10737,7 +10736,6 @@ select {
   max-width: 100%;
   flex-direction: column;
   gap: 12px;
-  overflow: hidden;
 }
 
 .request-log-toolbar {
@@ -10783,9 +10781,11 @@ select {
 .request-log-table {
   width: 100%;
   max-width: 100%;
-  overflow-x: auto;
+  max-height: calc(100vh - 320px);
+  overflow: auto;
   border: 1px solid hsl(var(--border));
   border-radius: 10px;
+  overscroll-behavior: contain;
 }
 
 .request-log-row {
@@ -10803,7 +10803,10 @@ select {
 }
 
 .request-log-head {
-  background: hsl(var(--muted) / 0.5);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: hsl(var(--card));
   color: hsl(var(--muted-foreground));
   font-size: 11px;
   letter-spacing: 0.02em;
