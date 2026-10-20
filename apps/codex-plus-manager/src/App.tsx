@@ -355,6 +355,8 @@ type BackendSettings = WhaleBalanceSettings & {
   protocolProxyAutoRetryMaxAttempts: number;
   protocolProxyAutoRetryIntervalSeconds: number;
   protocolProxyAutoRetryMode: "streaming" | "buffered";
+  /** 流式避震下首段可见输出后到提交的延迟（毫秒）；0 表示一出现可见输出立即提交。与 Rust `protocol_proxy_auto_retry_commit_delay_ms` 对应。 */
+  protocolProxyAutoRetryCommitDelayMs: number;
   codexAppCapacityAutoRetry: boolean;
   codexAppStepwiseEnabled: boolean;
   codexAppAnswerOutlineEnabled: boolean;
@@ -1233,6 +1235,7 @@ const defaultSettings: BackendSettings = {
   protocolProxyAutoRetryMaxAttempts: 5,
   protocolProxyAutoRetryIntervalSeconds: 2,
   protocolProxyAutoRetryMode: "streaming",
+  protocolProxyAutoRetryCommitDelayMs: 1000,
   codexAppCapacityAutoRetry: false,
   codexAppStepwiseEnabled: false,
   codexAppAnswerOutlineEnabled: false,
@@ -5298,7 +5301,7 @@ function ProxySettingsScreen({
       <Panel>
         <CardHead
           title={t("请求避震")}
-          detail={t("代理层吸收上游过载冲击：自动重试模型容量/过载错误（含推理阶段），尽量不把错误交给 Codex")}
+          detail={t("代理层吸收上游过载冲击：自动重试模型容量/过载错误（含推理与工具调用阶段），尽量不把错误交给 Codex")}
         />
         <CardContent className="settings-content">
           <div className="settings-block">
@@ -5313,7 +5316,7 @@ function ProxySettingsScreen({
               <span>{t("启用请求避震")}</span>
             </label>
             <p className="field-hint">
-              {t("请求避震只处理经过本地协议代理、且以 200 流式响应返回的上游过载/容量错误（server_overloaded、server_is_overloaded、at capacity 等）。流式避震下：正文/工具调用开始前先缓冲推理事件，此阶段遇到过载由代理退避重试；首字之后遇到同类过载，会改写成 Codex 可识别的容量错误，由 Codex 自己重试；连接失败、429/5xx、限流等其它错误不重试。整段缓冲避震下，任何时点的过载都由代理重试，但失去流式。")}
+              {t("请求避震只处理经过本地协议代理、且以 200 流式响应返回的上游过载/容量错误（server_overloaded、server_is_overloaded、at capacity 等）。流式避震下：推理、工具调用参数等不可见阶段先缓冲，工具调用整项完成或首段可见输出后再等「首字提交延迟」；这段窗口内遇到过载由代理退避重试；提交之后遇到同类过载，会改写成 Codex 可识别的容量错误，由 Codex 自己重试；连接失败、429/5xx、限流等其它错误不重试。整段缓冲避震下，任何时点的过载都由代理重试，但失去流式。")}
             </p>
             <div className="form-row">
               <Field label={t("最多自动重试次数")}>
@@ -5356,23 +5359,42 @@ function ProxySettingsScreen({
             <p className="field-hint">
               {t("之后按 2 倍指数退避，单次最长 30 秒；上游返回 Retry-After 时优先采用（同样受上限约束）。")}
             </p>
-            <Field label={t("避震模式")}>
-              <select
-                className="request-log-filter"
-                value={form.protocolProxyAutoRetryMode}
-                onChange={(event) =>
-                  onFormChange({
-                    ...form,
-                    protocolProxyAutoRetryMode: event.currentTarget.value === "buffered" ? "buffered" : "streaming",
-                  })
-                }
-              >
-                <option value="streaming">{t("流式避震：首字前由代理重试，首字后交给 Codex 原生重试")}</option>
-                <option value="buffered">{t("整段缓冲避震：任何时点过载都由代理重试（失去流式）")}</option>
-              </select>
-            </Field>
+            <div className="form-row">
+              <Field label={t("避震模式")}>
+                <select
+                  className="request-log-filter"
+                  value={form.protocolProxyAutoRetryMode}
+                  onChange={(event) =>
+                    onFormChange({
+                      ...form,
+                      protocolProxyAutoRetryMode: event.currentTarget.value === "buffered" ? "buffered" : "streaming",
+                    })
+                  }
+                >
+                  <option value="streaming">{t("流式避震：首字（含工具调用参数）前由代理重试，首字后交给 Codex 原生重试")}</option>
+                  <option value="buffered">{t("整段缓冲避震：任何时点过载都由代理重试（失去流式）")}</option>
+                </select>
+              </Field>
+              {form.protocolProxyAutoRetryMode === "streaming" ? (
+                <Field label={t("首字提交延迟（毫秒）")}>
+                  <Input
+                    max={10000}
+                    min={0}
+                    step={100}
+                    type="number"
+                    value={form.protocolProxyAutoRetryCommitDelayMs}
+                    onChange={(event) =>
+                      onFormChange({
+                        ...form,
+                        protocolProxyAutoRetryCommitDelayMs: clampNumber(Number(event.currentTarget.value), 0, 10000),
+                      })
+                    }
+                  />
+                </Field>
+              ) : null}
+            </div>
             <p className="field-hint">
-              {t("流式避震保留实时输出；整段缓冲避震在所有情况下都不会把过载错误交给 Codex，但回复要等整段生成完才显示。")}
+              {t("流式避震保留实时输出；「首字提交延迟」把首段可见输出也算进可重试窗口：0 = 一出现正文就提交，1000 = 再缓冲 1 秒，期间过载仍由代理重试；工具调用的参数生成阶段始终整项缓冲，不额外增加首字延迟。整段缓冲避震在所有情况下都不会把过载错误交给 Codex，但回复要等整段生成完才显示。")}
             </p>
           </div>
         </CardContent>
@@ -14734,6 +14756,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     protocolProxyAutoRetry: settings.protocolProxyAutoRetry !== false,
     protocolProxyAutoRetryMaxAttempts: clampNumber(settings.protocolProxyAutoRetryMaxAttempts ?? 5, 0, 20),
     protocolProxyAutoRetryMode: settings.protocolProxyAutoRetryMode === "buffered" ? "buffered" : "streaming",
+    protocolProxyAutoRetryCommitDelayMs: clampNumber(settings.protocolProxyAutoRetryCommitDelayMs ?? 1000, 0, 10000),
     protocolProxyAutoRetryIntervalSeconds: clampNumber(settings.protocolProxyAutoRetryIntervalSeconds ?? 2, 0, 30),
     codexAppImageOverlayOpacity: clampNumber(settings.codexAppImageOverlayOpacity || 35, 1, 100),
     codexAppImageOverlayFitMode: normalizeImageOverlayFitMode(settings.codexAppImageOverlayFitMode),

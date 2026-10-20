@@ -13,10 +13,12 @@ fn proxy_auto_retry_defaults_to_on_for_old_settings() {
     assert_eq!(defaults.protocol_proxy_auto_retry_max_attempts, 5);
     assert_eq!(defaults.protocol_proxy_auto_retry_interval_seconds, 2);
     assert_eq!(defaults.protocol_proxy_auto_retry_mode, "streaming");
+    assert_eq!(defaults.protocol_proxy_auto_retry_commit_delay_ms, 1000);
     let raw = serde_json::to_value(&defaults).unwrap();
     assert_eq!(raw["protocolProxyAutoRetry"], json!(true));
     assert_eq!(raw["protocolProxyAutoRetryMaxAttempts"], json!(5));
     assert_eq!(raw["protocolProxyAutoRetryIntervalSeconds"], json!(2));
+    assert_eq!(raw["protocolProxyAutoRetryCommitDelayMs"], json!(1000));
 
     // 旧 settings.json 没有这些键时必须补默认值，而不是报错或落成 0。
     let settings: BackendSettings = serde_json::from_value(json!({
@@ -28,6 +30,7 @@ fn proxy_auto_retry_defaults_to_on_for_old_settings() {
     assert_eq!(settings.protocol_proxy_auto_retry_max_attempts, 5);
     assert_eq!(settings.protocol_proxy_auto_retry_interval_seconds, 2);
     assert_eq!(settings.protocol_proxy_auto_retry_mode, "streaming");
+    assert_eq!(settings.protocol_proxy_auto_retry_commit_delay_ms, 1000);
     assert!(settings.codex_app_thread_id_badge);
 }
 
@@ -41,19 +44,22 @@ fn proxy_auto_retry_round_trips_through_partial_updates() {
     settings.protocol_proxy_auto_retry = false;
     settings.protocol_proxy_auto_retry_max_attempts = 3;
     settings.protocol_proxy_auto_retry_interval_seconds = 0;
+    settings.protocol_proxy_auto_retry_commit_delay_ms = 2500;
     store.save(&settings).unwrap();
     let loaded = store.load().unwrap();
     assert!(!loaded.protocol_proxy_auto_retry);
     assert_eq!(loaded.protocol_proxy_auto_retry_max_attempts, 3);
     assert_eq!(loaded.protocol_proxy_auto_retry_interval_seconds, 0);
+    assert_eq!(loaded.protocol_proxy_auto_retry_commit_delay_ms, 2500);
 
-    // 三个键都要真正写进去，证明 merge 白名单里都有。
+    // 四个键都要真正写进去，证明 merge 白名单里都有。
     store
         .update(json!({
             "protocolProxyAutoRetry": true,
             "protocolProxyAutoRetryMaxAttempts": 7,
             "protocolProxyAutoRetryIntervalSeconds": 9,
             "protocolProxyAutoRetryMode": "buffered",
+            "protocolProxyAutoRetryCommitDelayMs": 0,
         }))
         .unwrap();
     let updated = store.load().unwrap();
@@ -61,6 +67,7 @@ fn proxy_auto_retry_round_trips_through_partial_updates() {
     assert_eq!(updated.protocol_proxy_auto_retry_max_attempts, 7);
     assert_eq!(updated.protocol_proxy_auto_retry_interval_seconds, 9);
     assert_eq!(updated.protocol_proxy_auto_retry_mode, "buffered");
+    assert_eq!(updated.protocol_proxy_auto_retry_commit_delay_ms, 0);
 
     let raw: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -68,6 +75,7 @@ fn proxy_auto_retry_round_trips_through_partial_updates() {
     assert_eq!(raw["protocolProxyAutoRetryMaxAttempts"], json!(7));
     assert_eq!(raw["protocolProxyAutoRetryIntervalSeconds"], json!(9));
     assert_eq!(raw["protocolProxyAutoRetryMode"], json!("buffered"));
+    assert_eq!(raw["protocolProxyAutoRetryCommitDelayMs"], json!(0));
     // 只改这三个键不该动到别的字段。
     assert!(raw["codexAppThreadScrollRestore"].as_bool().unwrap());
 }
@@ -79,24 +87,29 @@ fn proxy_auto_retry_ranges_are_clamped_on_load_and_update() {
     let mut raw = serde_json::to_value(BackendSettings::default()).unwrap();
     raw["protocolProxyAutoRetryMaxAttempts"] = json!(999);
     raw["protocolProxyAutoRetryIntervalSeconds"] = json!(999);
+    raw["protocolProxyAutoRetryCommitDelayMs"] = json!(99999);
     std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
 
     let store = SettingsStore::new(path.clone());
     let loaded = store.load().unwrap();
     assert_eq!(loaded.protocol_proxy_auto_retry_max_attempts, 20);
     assert_eq!(loaded.protocol_proxy_auto_retry_interval_seconds, 30);
+    assert_eq!(loaded.protocol_proxy_auto_retry_commit_delay_ms, 10000);
 
     let updated = store
         .update(json!({
             "protocolProxyAutoRetryMaxAttempts": 1000,
             "protocolProxyAutoRetryIntervalSeconds": 1000,
+            "protocolProxyAutoRetryCommitDelayMs": 100000,
         }))
         .unwrap();
     assert_eq!(updated.protocol_proxy_auto_retry_max_attempts, 20);
     assert_eq!(updated.protocol_proxy_auto_retry_interval_seconds, 30);
+    assert_eq!(updated.protocol_proxy_auto_retry_commit_delay_ms, 10000);
 
     let raw: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(raw["protocolProxyAutoRetryMaxAttempts"], json!(20));
     assert_eq!(raw["protocolProxyAutoRetryIntervalSeconds"], json!(30));
+    assert_eq!(raw["protocolProxyAutoRetryCommitDelayMs"], json!(10000));
 }

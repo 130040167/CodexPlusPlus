@@ -941,6 +941,15 @@ pub struct BackendSettings {
         default = "default_protocol_proxy_auto_retry_mode"
     )]
     pub protocol_proxy_auto_retry_mode: String,
+    /// 流式避震的「首字提交延迟」：出现第一段可见输出后，代理继续缓冲多少毫秒
+    /// 再交给 Codex。窗口内遇到容量/过载错误仍可丢弃重试；0 表示一出现可见输出
+    /// 就提交（旧行为）。推理与工具调用参数阶段本来就不向客户端提交，不占这个
+    /// 延迟，所以工具调用可以整项缓冲到完成后再提交。
+    #[serde(
+        rename = "protocolProxyAutoRetryCommitDelayMs",
+        default = "default_protocol_proxy_auto_retry_commit_delay_ms"
+    )]
+    pub protocol_proxy_auto_retry_commit_delay_ms: u64,
     /// 按工具分区的配置。`tools.codex` 是上面那批扁平字段的镜像（写盘时同步），
     /// 其它工具（Grok / 后续工具）只存在这里。见 `crate::tools`。
     #[serde(rename = "tools", default)]
@@ -1044,6 +1053,8 @@ impl Default for BackendSettings {
             protocol_proxy_auto_retry_interval_seconds:
                 default_protocol_proxy_auto_retry_interval_seconds(),
             protocol_proxy_auto_retry_mode: default_protocol_proxy_auto_retry_mode(),
+            protocol_proxy_auto_retry_commit_delay_ms:
+                default_protocol_proxy_auto_retry_commit_delay_ms(),
             tools: BTreeMap::new(),
             active_tool: ToolId::Codex,
         }
@@ -1500,6 +1511,17 @@ pub fn normalize_protocol_proxy_auto_retry_mode(value: &str) -> String {
         "buffered" => "buffered".to_string(),
         _ => default_protocol_proxy_auto_retry_mode(),
     }
+}
+
+/// 流式避震默认在首段可见输出后再缓冲 1 秒：能覆盖「刚开始吐字上游就过载」
+/// 这一大类，首字延迟仍控制在 1 秒内；短回复在 response.completed 到达时
+/// 立即提交，不会白等满 1 秒。
+pub fn default_protocol_proxy_auto_retry_commit_delay_ms() -> u64 {
+    1000
+}
+
+pub fn clamp_protocol_proxy_auto_retry_commit_delay_ms(value: u64) -> u64 {
+    value.min(10_000)
 }
 
 pub fn default_relay_profiles() -> Vec<RelayProfile> {
@@ -2113,6 +2135,15 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
         target.insert(
             "protocolProxyAutoRetryMode".to_string(),
             Value::String(normalize_protocol_proxy_auto_retry_mode(value)),
+        );
+    }
+    if let Some(value) = source
+        .get("protocolProxyAutoRetryCommitDelayMs")
+        .and_then(Value::as_u64)
+    {
+        target.insert(
+            "protocolProxyAutoRetryCommitDelayMs".to_string(),
+            Value::from(clamp_protocol_proxy_auto_retry_commit_delay_ms(value)),
         );
     }
     if let Some(value) = source.get("enhancementsEnabled").and_then(Value::as_bool) {
@@ -2845,6 +2876,10 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
         );
     settings.protocol_proxy_auto_retry_mode =
         normalize_protocol_proxy_auto_retry_mode(&settings.protocol_proxy_auto_retry_mode);
+    settings.protocol_proxy_auto_retry_commit_delay_ms =
+        clamp_protocol_proxy_auto_retry_commit_delay_ms(
+            settings.protocol_proxy_auto_retry_commit_delay_ms,
+        );
     // 扁平字段始终是 Codex 的唯一事实来源，这里把它镜像进 tools.codex；
     // 其它工具的分片原样保留。放在函数末尾，所有 load / save / update 路径
     // 都会经过，两边不会漂移。

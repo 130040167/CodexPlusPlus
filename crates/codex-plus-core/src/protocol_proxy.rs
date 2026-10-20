@@ -493,6 +493,84 @@ async fn read_responses_stream_for_buffering(
     }
 }
 
+/// 流式预读的提交策略：决定什么时候把已缓冲字节交给 Codex。
+///
+/// 「提交」之后响应就不可回滚，上游再报过载只能交给 Codex 原生重试；所以
+/// 预读会尽量把提交点往后挪，且只在不影响可见延迟的阶段多缓冲。
+#[derive(Debug, Clone, Copy)]
+struct StreamStartCommitPolicy {
+    /// 首段可见输出出现后继续缓冲的时长；0 表示立即提交（旧行为）。
+    first_visible_grace: Duration,
+}
+
+impl StreamStartCommitPolicy {
+    fn from_settings(settings: &crate::settings::BackendSettings) -> Self {
+        Self {
+            first_visible_grace: Duration::from_millis(
+                settings.protocol_proxy_auto_retry_commit_delay_ms,
+            ),
+        }
+    }
+}
+
+/// 预读阶段单个事件的分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamStartEventKind {
+    /// 预读可以结束：正常完成、终态失败、或非消息输出项已完成。
+    Terminal,
+    /// 用户可见内容（正文/拒绝/音频/图片）：开始或继续首字提交宽限。
+    Visible,
+    /// 不可见阶段（推理、工具调用参数、工具项生命周期、未知事件）：继续缓冲。
+    Hold,
+}
+
+/// 判断事件属于哪一类。默认「继续按住」：未知事件宁可多缓冲（最坏退化成
+/// 接近整段缓冲），也不要把还能重试的窗口提前关掉；总长度仍受 8 MiB / 120 秒
+/// 预读上限约束，不会无限期扣住响应。
+fn stream_start_event_kind(block: &str, event: &str) -> StreamStartEventKind {
+    match event {
+        "response.completed" | "response.failed" | "response.incomplete" | "error" => {
+            return StreamStartEventKind::Terminal;
+        }
+        // 非消息输出项完成（function_call / custom_tool_call / web_search_call …）：
+        // Codex 要等参数完整才会执行工具，此时提交没有可见延迟损失；后续事件
+        // 按普通流式转发，也不再占用重试窗口。
+        "response.output_item.done" => {
+            let item_type = sse_block_json(block)
+                .and_then(|json| {
+                    json.pointer("/item/type")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            return if !item_type.is_empty() && item_type != "reasoning" && item_type != "message" {
+                StreamStartEventKind::Terminal
+            } else {
+                StreamStartEventKind::Hold
+            };
+        }
+        _ => {}
+    }
+    if stream_event_is_retry_safe(block, event) {
+        return StreamStartEventKind::Hold;
+    }
+    match event {
+        "response.output_text.delta"
+        | "response.refusal.delta"
+        | "response.audio.delta"
+        | "response.audio.transcript.delta"
+        | "response.image_generation_call.partial_image" => StreamStartEventKind::Visible,
+        _ => StreamStartEventKind::Hold,
+    }
+}
+
+fn forward_replay_safe(prefix: Vec<u8>, first_output_at_ms: Option<u64>) -> StreamStartPeek {
+    StreamStartPeek::Forward {
+        prefix,
+        first_output_at_ms,
+    }
+}
+
 /// 预读 200 SSE 开头后的结果。
 enum StreamStartPeek {
     /// 放行：`prefix` 是已经读出的字节，必须原样写给 Codex，剩余部分继续流式转发。
@@ -515,11 +593,9 @@ fn current_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// 只有「还没有开始产出可见内容」的事件才按住不发。
-///
-/// 官方后端在容量不足时先回 200 和 response.created/in_progress，再在流里发
-/// response.failed（Codex 映射为 server_overloaded）。这些事件本身没有内容，
-/// 暂存它们不影响正常流式的首 token 延迟：一旦出现真正的事件就立即放行。
+/// 响应生命周期事件：既没有内容，也不代表模型开始产出。官方后端在容量不足时
+/// 先回 200 和 response.created/in_progress，再在流里发 response.failed
+/// （Codex 映射为 server_overloaded）。这些事件留在预读缓冲里不影响正确性。
 fn is_pre_output_stream_event(event: &str) -> bool {
     matches!(
         event,
@@ -527,11 +603,11 @@ fn is_pre_output_stream_event(event: &str) -> bool {
     )
 }
 
-/// 该事件是否还处于「可以安全重放」的阶段：还没有给 Codex 看过正文。
+/// 该事件是否还处于「可以安全重放」的阶段：没有给 Codex 看过可见内容。
 ///
 /// 除了响应创建类事件，推理摘要与加密推理项也先按住——官方过载错误经常在
 /// 模型思考阶段才返回；此时客户端还没收到正文，重放不会出现重复内容。
-/// 一旦出现正文文字、工具调用、图片等真正输出，就必须立即放行。
+/// 可见正文/图片等由 [`stream_start_event_kind`] 单独判定，不再「一出现就放行」。
 fn stream_event_is_retry_safe(block: &str, event: &str) -> bool {
     if is_pre_output_stream_event(event) {
         return true;
@@ -679,37 +755,50 @@ fn stream_failure_is_retryable(code: Option<&str>, message: Option<&str>) -> boo
         || message.contains("overloaded")
 }
 
-/// 预读 Responses 流开头：识别「200 + 流内 response.failed」的容量错误。
+/// 预读 Responses 流开头：识别「200 + 流内 response.failed」的容量错误，
+/// 并尽量推迟不可回滚的提交点，给代理重试多留窗口。
 ///
-/// 只在看到第一个非输出事件之前缓冲；出现输出事件、预读超限、超时或读失败时
-/// 都原样放行已读前缀，之后仍按普通流式转发。
-async fn peek_responses_stream_start(upstream: &mut reqwest::Response) -> StreamStartPeek {
+/// 提交时机：
+/// - 推理、工具调用参数等不可见阶段一直按住，随时可以整体丢弃重发；
+/// - 非消息输出项完成（例如 function_call 参数收齐）立即提交：Codex 本来就要
+///   等参数完整才会执行工具，这里没有可见延迟；
+/// - 第一段可见输出（正文/拒绝/音频/图片）后，再等
+///   [`StreamStartCommitPolicy::first_visible_grace`]；窗口内遇到容量错误仍丢弃
+///   重试，窗口到期才提交；
+/// - response.completed、失败事件、EOF/读失败、8 MiB/120 秒上限都结束预读。
+async fn peek_responses_stream_start(
+    upstream: &mut reqwest::Response,
+    policy: StreamStartCommitPolicy,
+    live_request_id: Option<&str>,
+) -> StreamStartPeek {
     let started = Instant::now();
     let mut buffered: Vec<u8> = Vec::new();
     let mut scanned = 0usize;
     let mut first_output_at_ms: Option<u64> = None;
+    let mut visible_deadline: Option<Instant> = None;
     loop {
         if buffered.len() > STREAM_RETRY_PEEK_MAX_BYTES {
-            return StreamStartPeek::Forward {
-                prefix: buffered,
-                first_output_at_ms,
-            };
+            return forward_replay_safe(buffered, first_output_at_ms);
+        }
+        let now = Instant::now();
+        if visible_deadline.is_some_and(|deadline| now >= deadline) {
+            return forward_replay_safe(buffered, first_output_at_ms);
         }
         let remaining = STREAM_RETRY_PEEK_MAX_WAIT.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            return StreamStartPeek::Forward {
-                prefix: buffered,
-                first_output_at_ms,
-            };
+            return forward_replay_safe(buffered, first_output_at_ms);
         }
-        let chunk = match tokio::time::timeout(remaining, upstream.chunk()).await {
+        // 同时受预读总超时和首字提交宽限约束：宽限到期也要醒来提交，
+        // 不能等上游再发 chunk 才检查。
+        let wait = match visible_deadline {
+            Some(deadline) => remaining.min(deadline.saturating_duration_since(now)),
+            None => remaining,
+        };
+        let chunk = match tokio::time::timeout(wait, upstream.chunk()).await {
             Ok(Ok(Some(chunk))) => chunk,
-            // EOF、读失败或超时：没有足够证据重试，原样放行已缓冲前缀。
+            // EOF、读失败、宽限到期或预读超时：原样放行已缓冲前缀。
             Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
-                return StreamStartPeek::Forward {
-                    prefix: buffered,
-                    first_output_at_ms,
-                };
+                return forward_replay_safe(buffered, first_output_at_ms);
             }
         };
         buffered.extend_from_slice(&chunk);
@@ -719,29 +808,38 @@ async fn peek_responses_stream_start(upstream: &mut reqwest::Response) -> Stream
             let Some(event) = sse_block_type(&block) else {
                 continue;
             };
-            let event_at_ms = current_epoch_ms();
-            if !is_pre_output_stream_event(&event) && first_output_at_ms.is_none() {
-                first_output_at_ms = Some(event_at_ms);
+            if first_output_at_ms.is_none() && !is_pre_output_stream_event(&event) {
+                first_output_at_ms = Some(current_epoch_ms());
+                // 请求日志的「首字耗时」仍按上游第一段输出计；预读可能还要
+                // 继续按住一段时间，这里先让进行中的日志行看到首字。
+                if let Some(id) = live_request_id {
+                    crate::request_log::update_running_first_token(id);
+                }
             }
-            if stream_event_is_retry_safe(&block, &event) {
-                continue;
+            match stream_start_event_kind(&block, &event) {
+                StreamStartEventKind::Terminal => {
+                    if matches!(
+                        event.as_str(),
+                        "response.failed" | "response.incomplete" | "error"
+                    ) {
+                        let (code, message) = stream_failure_payload(&block);
+                        return StreamStartPeek::Failed {
+                            prefix: buffered,
+                            code,
+                            message,
+                        };
+                    }
+                    return forward_replay_safe(buffered, first_output_at_ms);
+                }
+                StreamStartEventKind::Visible => {
+                    if policy.first_visible_grace.is_zero() {
+                        return forward_replay_safe(buffered, first_output_at_ms);
+                    }
+                    visible_deadline
+                        .get_or_insert_with(|| Instant::now() + policy.first_visible_grace);
+                }
+                StreamStartEventKind::Hold => {}
             }
-            if matches!(
-                event.as_str(),
-                "response.failed" | "response.incomplete" | "error"
-            ) {
-                let (code, message) = stream_failure_payload(&block);
-                return StreamStartPeek::Failed {
-                    prefix: buffered,
-                    code,
-                    message,
-                };
-            }
-            // 出现任何真正的输出事件：立即放行，后续流不再延迟。
-            return StreamStartPeek::Forward {
-                prefix: buffered,
-                first_output_at_ms,
-            };
         }
     }
 }
@@ -3158,6 +3256,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     let mut auto_retry = ProxyAutoRetry::from_settings(&settings);
     let mut request_attempt = 0_usize;
     let buffered_mode = settings.protocol_proxy_auto_retry_mode == "buffered";
+    let commit_policy = StreamStartCommitPolicy::from_settings(&settings);
     let mut retry_reasons: Vec<String> = Vec::new();
     let mut request_trace = crate::request_log::RequestTrace {
         model: source_model.clone(),
@@ -3871,7 +3970,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             && !exec_adapted
             && auto_retry.is_some()
         {
-            match peek_responses_stream_start(&mut upstream).await {
+            match peek_responses_stream_start(&mut upstream, commit_policy, live_request_id).await {
                 StreamStartPeek::Forward {
                     prefix,
                     first_output_at_ms,
@@ -10354,6 +10453,117 @@ mod proxy_auto_retry_tests {
         ] {
             assert!(!is_pre_output_stream_event(event), "{event}");
         }
+    }
+
+    fn commit_test_block(event: &str, data: &str) -> String {
+        format!("event: {event}\ndata: {data}\n\n")
+    }
+
+    #[test]
+    fn stream_start_commit_boundary_holds_reasoning_and_tool_work() {
+        // 不可见阶段（推理、工具参数、工具项生命周期、未知/非标准事件）都继续
+        // 缓冲：此时丢弃重发不会让 Codex 看到重复内容。
+        for block in [
+            commit_test_block("response.created", "{\"type\":\"response.created\"}"),
+            commit_test_block(
+                "response.output_item.added",
+                "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\"}}",
+            ),
+            commit_test_block(
+                "response.function_call_arguments.delta",
+                "{\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\"}",
+            ),
+            commit_test_block(
+                "response.output_item.added",
+                "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}",
+            ),
+            commit_test_block(
+                "response.output_text.done",
+                "{\"type\":\"response.output_text.done\",\"text\":\"hello\"}",
+            ),
+            // 推理摘要 part 的 done 此前不在 retry-safe 白名单里；新分类按
+            // 「未知事件继续按住」处理，不再提前结束重试窗口。
+            commit_test_block(
+                "response.reasoning_summary_part.done",
+                "{\"type\":\"response.reasoning_summary_part.done\"}",
+            ),
+            commit_test_block(
+                "response.output_item.done",
+                "{\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}",
+            ),
+            commit_test_block(
+                "response.output_item.done",
+                "{\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}",
+            ),
+        ] {
+            let event = sse_block_type(&block).expect("event type");
+            assert_eq!(
+                stream_start_event_kind(&block, &event),
+                StreamStartEventKind::Hold,
+                "{event}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_start_commit_boundary_releases_visible_output_and_terminal_events() {
+        for block in [
+            commit_test_block(
+                "response.output_text.delta",
+                "{\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}",
+            ),
+            commit_test_block(
+                "response.refusal.delta",
+                "{\"type\":\"response.refusal.delta\",\"delta\":\"no\"}",
+            ),
+            commit_test_block(
+                "response.image_generation_call.partial_image",
+                "{\"type\":\"response.image_generation_call.partial_image\",\"partial_image_b64\":\"AAAA\"}",
+            ),
+        ] {
+            let event = sse_block_type(&block).expect("event type");
+            assert_eq!(
+                stream_start_event_kind(&block, &event),
+                StreamStartEventKind::Visible,
+                "{event}"
+            );
+        }
+        for block in [
+            commit_test_block("response.completed", "{\"type\":\"response.completed\"}"),
+            commit_test_block("response.failed", "{\"type\":\"response.failed\"}"),
+            commit_test_block("error", "{\"type\":\"error\"}"),
+            // 非消息输出项完成 = 工具调用参数收齐，提交不会延迟 Codex 执行。
+            commit_test_block(
+                "response.output_item.done",
+                "{\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\"}}",
+            ),
+            commit_test_block(
+                "response.output_item.done",
+                "{\"type\":\"response.output_item.done\",\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\"}}",
+            ),
+        ] {
+            let event = sse_block_type(&block).expect("event type");
+            assert_eq!(
+                stream_start_event_kind(&block, &event),
+                StreamStartEventKind::Terminal,
+                "{event}"
+            );
+        }
+    }
+
+    #[test]
+    fn commit_policy_reads_grace_window_from_settings() {
+        let defaults = StreamStartCommitPolicy::from_settings(
+            &crate::settings::BackendSettings::default(),
+        );
+        assert_eq!(defaults.first_visible_grace, Duration::from_millis(1000));
+        let mut settings = crate::settings::BackendSettings::default();
+        settings.protocol_proxy_auto_retry_commit_delay_ms = 0;
+        assert!(
+            StreamStartCommitPolicy::from_settings(&settings)
+                .first_visible_grace
+                .is_zero()
+        );
     }
 
     #[test]
