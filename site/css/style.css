@@ -347,6 +347,7 @@ body::after {
 .manager-live .section-head { margin-bottom: 42px; }
 .manager-live-frame {
   overflow: auto;
+  height: clamp(720px, 68vw, 920px);
   border: 1px solid rgba(148, 163, 255, 0.22);
   border-radius: 16px;
   background: #080a10;
@@ -356,7 +357,7 @@ body::after {
   display: block;
   width: 100%;
   min-width: 760px;
-  height: 740px;
+  height: 100%;
   border: 0;
   background: #0a0c12;
 }
@@ -370,6 +371,10 @@ body::after {
   font-size: 12px;
 }
 .manager-live-note .pulse-dot { width: 6px; height: 6px; }
+
+@media (max-width: 640px) {
+  .manager-live-frame { height: 720px; }
+}
 
 /* ============ 打字特效现场 ============ */
 
