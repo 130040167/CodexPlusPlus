@@ -168,22 +168,10 @@
     if (document.hidden) return;
     codexPlusProxyStatusState.inFlight = true;
     try {
-      const controller = typeof AbortController === "function" ? new AbortController() : null;
-      const timeoutId = window.setTimeout(() => controller?.abort(), 1500);
-      try {
-        const response = await fetch(`${helperBase}/proxy-status`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: "{}",
-          ...(controller ? { signal: controller.signal } : {}),
-        });
-        const result = await response.json();
-        if (result?.status === "ok" && Array.isArray(result.requests)) {
-          codexPlusProxyStatusState.requests = result.requests;
-          codexPlusProxyStatusState.failures = 0;
-        }
-      } finally {
-        window.clearTimeout(timeoutId);
+      const result = await postJson("/proxy-status", {});
+      if (result?.status === "ok" && Array.isArray(result.requests)) {
+        codexPlusProxyStatusState.requests = result.requests;
+        codexPlusProxyStatusState.failures = 0;
       }
     } catch {
       codexPlusProxyStatusState.failures += 1;
