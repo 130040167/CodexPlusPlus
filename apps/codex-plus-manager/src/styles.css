@@ -10676,3 +10676,50 @@ select {
   .update-dialog-actions > :last-child { margin-left: 0; }
   .release-notes { padding: 12px 14px; }
 }
+
+/* ── 代理设置页：供应商独立代理列表 ───────────────────────────── */
+.proxy-provider-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.proxy-provider-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 220px) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.proxy-provider-meta {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.proxy-provider-meta strong {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.proxy-provider-meta small {
+  overflow: hidden;
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 900px) {
+  .proxy-provider-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .proxy-provider-meta {
+    grid-column: 1 / -1;
+  }
+}

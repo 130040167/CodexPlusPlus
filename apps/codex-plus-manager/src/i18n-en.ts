@@ -659,6 +659,27 @@ export const EN_PLAIN: Record<string, string> = {
   "首次重试间隔（秒）": "Initial retry interval (seconds)",
   "之后按 2 倍指数退避，单次最长 30 秒；上游返回 Retry-After 时优先采用（同样受上限约束）。":
     "Later retries use 2x exponential backoff with a 30-second cap per wait; an upstream Retry-After header takes precedence (also subject to that cap).",
+  "代理设置": "Proxy settings",
+  "统一管理本地协议代理、供应商代理与重试策略":
+    "Manage the local protocol proxy, provider proxies, and retry policy in one place",
+  "本地协议代理": "Local protocol proxy",
+  "从 Codex++ 启动 Codex 时承载协议转换、聚合与自动重试":
+    "Handles protocol conversion, aggregation, and automatic retries when Codex is launched from Codex++",
+  "协议转换": "Protocol conversion",
+  "未启用": "Not enabled",
+  "本地代理地址由 Codex++ 写入 config.toml；切换供应商或修改协议后重启 Codex 生效。":
+    "Codex++ writes the local proxy address into config.toml; restart Codex after switching providers or changing the protocol.",
+  "为单个供应商单独指定 HTTP 代理；留空表示沿用系统代理":
+    "Set a dedicated HTTP proxy for one provider; leave empty to use the system proxy",
+  "已配置独立代理": "Dedicated proxy configured",
+  "未配置独立代理": "No dedicated proxy",
+  "例如 http://127.0.0.1:7890，留空表示使用系统代理":
+    "e.g. http://127.0.0.1:7890; leave empty to use the system proxy",
+  "{0} 的独立代理": "Dedicated proxy for {0}",
+  "保存中…": "Saving…",
+  "还没有可配置独立代理的供应商。": "No providers available for a dedicated proxy yet.",
+  "保存后需重新应用该供应商并重启 Codex，独立代理才会作用于会话请求。":
+    "After saving, re-apply the provider and restart Codex for the dedicated proxy to take effect on conversation requests.",
   "这个工具目前没有独立设置项": "This tool has no settings of its own yet",
   "该工具的配置在它自己的页签里管理；上面的基础设置对所有工具通用。":
     "This tool is configured on its own tab; the basic settings above apply to every tool.",

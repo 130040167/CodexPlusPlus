@@ -1126,13 +1126,13 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "maintenance", get label() { return t("安装维护"); }, icon: Wrench, tool: "codex" },
   { id: "about", get label() { return t("关于"); }, icon: Info },
   { id: "settings", get label() { return t("设置"); }, icon: Settings },
-  { id: "relayEnvironment", get label() { return t("中转站环境配置检测"); }, icon: ShieldCheck, tool: "codex" },
+  { id: "relayEnvironment", get label() { return t("代理设置"); }, icon: ShieldCheck, tool: "codex" },
 ];
 
 const navigationSections: Array<{ label: string; routes: Route[]; placement?: "bottom" }> = [
   {
     get label() { return t("工作区"); },
-    routes: ["overview", "relay", "multiLaunch", "grok", "claude"],
+    routes: ["overview", "relay", "relayEnvironment", "multiLaunch", "grok", "claude"],
   },
   {
     get label() { return t("全局管理"); },
@@ -4029,7 +4029,14 @@ export function App() {
             <CodexMultiLaunchScreen form={settingsForm} actions={actions} />
           ) : null}
           {route === "relayEnvironment" ? (
-            <RelayEnvironmentScreen result={relayEnvironment} actions={actions} />
+            <ProxySettingsScreen
+              dirty={settingsDirty}
+              overview={overview}
+              form={settingsForm}
+              relayEnvironment={relayEnvironment}
+              onFormChange={setSettingsForm}
+              actions={actions}
+            />
           ) : null}
           {route === "grok" ? (
             <GrokScreen settings={settings} form={settingsForm} actions={actions} />
@@ -5124,6 +5131,242 @@ function OverviewScreen({
         </Panel>
       )}
     </>
+  );
+}
+
+function ProxySettingsScreen({
+  dirty,
+  overview,
+  form,
+  relayEnvironment,
+  onFormChange,
+  actions,
+}: {
+  dirty: boolean;
+  overview: OverviewResult | null;
+  form: BackendSettings;
+  relayEnvironment: RelayEnvironmentResult | null;
+  onFormChange: (value: BackendSettings) => void;
+  actions: Actions;
+}) {
+  const proxyProfiles = useMemo(
+    () => (form.relayProfiles ?? []).filter((profile) => profile.relayMode !== "aggregate"),
+    [form.relayProfiles],
+  );
+  const proxyProfileKey = proxyProfiles.map((profile) => profile.id).join("|");
+  const [proxyUrls, setProxyUrls] = useState<Record<string, string>>({});
+  const [proxyConfigured, setProxyConfigured] = useState<Record<string, boolean>>({});
+  const [proxyBusyId, setProxyBusyId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const ids = proxyProfileKey ? proxyProfileKey.split("|") : [];
+    void Promise.all(
+      ids.map(async (id) => {
+        try {
+          const result = await invoke<{ status: string; proxyUrl?: string; configured?: boolean }>(
+            "load_relay_proxy",
+            { profileId: id },
+          );
+          return { id, url: result.status === "ok" ? result.proxyUrl ?? "" : "", configured: result.configured === true };
+        } catch {
+          return { id, url: "", configured: false };
+        }
+      }),
+    ).then((entries) => {
+      if (cancelled) return;
+      const urls: Record<string, string> = {};
+      const configured: Record<string, boolean> = {};
+      entries.forEach((entry) => {
+        urls[entry.id] = entry.url;
+        configured[entry.id] = entry.configured;
+      });
+      setProxyUrls(urls);
+      setProxyConfigured(configured);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [proxyProfileKey]);
+
+  const saveProviderProxy = async (profile: RelayProfile) => {
+    const profileId = profile.id;
+    setProxyBusyId(profileId);
+    try {
+      const result = await invoke<{
+        status: string;
+        message: string;
+        proxyUrl?: string;
+        configured?: boolean;
+      }>("set_relay_proxy", { profileId, proxyUrl: proxyUrls[profileId] ?? "" });
+      if (result.status === "ok") {
+        setProxyUrls((current) => ({ ...current, [profileId]: result.proxyUrl ?? "" }));
+        setProxyConfigured((current) => ({ ...current, [profileId]: result.configured === true }));
+      }
+      await actions.showMessage(t("供应商独立代理"), result.message, result.status === "ok" ? "ok" : "failed");
+    } catch (error) {
+      await actions.showMessage(t("供应商独立代理"), String(error), "failed");
+    } finally {
+      setProxyBusyId(null);
+    }
+  };
+
+  const localServer = overview?.runtime_health?.local_server;
+  const debuggerState = overview?.runtime_health?.debugger;
+  const conversionEnabled = overview?.runtime_health?.protocol_conversion_enabled === true;
+
+  return (
+    <div className="settings-page">
+      <Panel>
+        <CardHead
+          title={t("本地协议代理")}
+          detail={t("从 Codex++ 启动 Codex 时承载协议转换、聚合与自动重试")}
+        />
+        <CardContent className="settings-content">
+          <div className="status-table">
+            <StatusRow
+              title={t("本地服务器状态")}
+              status={localServer?.status ?? "not_checked"}
+              path={localServer?.address || "http://127.0.0.1:57321"}
+            />
+            <StatusRow
+              title={t("协议转换")}
+              status={conversionEnabled ? "ok" : "disabled"}
+              path={conversionEnabled ? t("协议转换已启用") : t("未启用")}
+            />
+            <StatusRow
+              title={t("调试连接状态")}
+              status={debuggerState?.status ?? "not_checked"}
+              path={debuggerState?.address ?? null}
+            />
+          </div>
+          <p className="field-hint">
+            {t("本地代理地址由 Codex++ 写入 config.toml；切换供应商或修改协议后重启 Codex 生效。")}
+          </p>
+        </CardContent>
+      </Panel>
+
+      <Panel>
+        <CardHead
+          title={t("协议代理自动重试")}
+          detail={t("在本地协议代理内部自动重试上游瞬时失败，不把错误交给 Codex")}
+        />
+        <CardContent className="settings-content">
+          <div className="settings-block">
+            <label className="check-row">
+              <input
+                checked={form.protocolProxyAutoRetry}
+                onChange={(event) =>
+                  onFormChange({ ...form, protocolProxyAutoRetry: event.currentTarget.checked })
+                }
+                type="checkbox"
+              />
+              <span>{t("启用协议代理自动重试")}</span>
+            </label>
+            <p className="field-hint">
+              {t("只对经过本地协议代理的请求生效（聚合供应商、协议转换、模型路由）。代理会在把错误交给 Codex 之前，自行等待并重试连接失败、429/5xx，以及 200 流式响应里的容量错误（response.failed）；重试期间 Codex 不会出现失败提示。")}
+            </p>
+            <div className="form-row">
+              <Field label={t("最多自动重试次数")}>
+                <Input
+                  max={20}
+                  min={0}
+                  type="number"
+                  value={form.protocolProxyAutoRetryMaxAttempts}
+                  onChange={(event) =>
+                    onFormChange({
+                      ...form,
+                      protocolProxyAutoRetryMaxAttempts: clampNumber(
+                        Number(event.currentTarget.value),
+                        0,
+                        20,
+                      ),
+                    })
+                  }
+                />
+              </Field>
+              <Field label={t("首次重试间隔（秒）")}>
+                <Input
+                  max={30}
+                  min={0}
+                  type="number"
+                  value={form.protocolProxyAutoRetryIntervalSeconds}
+                  onChange={(event) =>
+                    onFormChange({
+                      ...form,
+                      protocolProxyAutoRetryIntervalSeconds: clampNumber(
+                        Number(event.currentTarget.value),
+                        0,
+                        30,
+                      ),
+                    })
+                  }
+                />
+              </Field>
+            </div>
+            <p className="field-hint">
+              {t("之后按 2 倍指数退避，单次最长 30 秒；上游返回 Retry-After 时优先采用（同样受上限约束）。")}
+            </p>
+          </div>
+        </CardContent>
+      </Panel>
+
+      <Panel>
+        <CardHead
+          title={t("供应商独立代理")}
+          detail={t("为单个供应商单独指定 HTTP 代理；留空表示沿用系统代理")}
+        />
+        <CardContent className="settings-content">
+          {proxyProfiles.length ? (
+            <div className="proxy-provider-list">
+              {proxyProfiles.map((profile) => (
+                <div className="proxy-provider-row" key={profile.id}>
+                  <div className="proxy-provider-meta">
+                    <strong>{profile.name || t("未命名供应商")}</strong>
+                    <small>
+                      {relayProtocolLabel(profile.protocol)} ·{" "}
+                      {proxyConfigured[profile.id] ? t("已配置独立代理") : t("未配置独立代理")}
+                    </small>
+                  </div>
+                  <Input
+                    aria-label={tf("{0} 的独立代理", [profile.name || t("未命名供应商")])}
+                    placeholder={t("例如 http://127.0.0.1:7890，留空表示使用系统代理")}
+                    value={proxyUrls[profile.id] ?? ""}
+                    onChange={(event) =>
+                      setProxyUrls((current) => ({ ...current, [profile.id]: event.currentTarget.value }))
+                    }
+                  />
+                  <Button
+                    disabled={proxyBusyId === profile.id}
+                    onClick={() => void saveProviderProxy(profile)}
+                    variant="secondary"
+                  >
+                    {proxyBusyId === profile.id ? t("保存中…") : t("保存")}
+                  </Button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="field-hint">{t("还没有可配置独立代理的供应商。")}</p>
+          )}
+          <p className="field-hint">
+            {t("保存后需重新应用该供应商并重启 Codex，独立代理才会作用于会话请求。")}
+          </p>
+        </CardContent>
+      </Panel>
+
+      <RelayEnvironmentScreen result={relayEnvironment} actions={actions} />
+
+      {dirty ? (
+        <div className="settings-save-bar">
+          <span>{t("设置有修改时，保存后才会写入本地配置。")}</span>
+          <Button onClick={() => void actions.saveSettings()}>
+            <Save className="h-4 w-4" />
+            {t("保存设置")}
+          </Button>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -8418,63 +8661,6 @@ function SettingsScreen({
               <p className="field-hint">
                 {t("「测试供应商」按钮用这个模型发起一次真实请求，用于判断 Key 与端点是否可用。")}
               </p>
-            </CardContent>
-          </Panel>
-
-          <Panel>
-            <CardHead
-              title={t("协议代理自动重试")}
-              detail={t("在本地协议代理内部自动重试上游瞬时失败，不把错误交给 Codex")}
-            />
-            <CardContent className="settings-content">
-              <div className="settings-block">
-                <label className="check-row">
-                  <input
-                    checked={form.protocolProxyAutoRetry}
-                    onChange={(event) =>
-                      onFormChange({ ...form, protocolProxyAutoRetry: event.currentTarget.checked })
-                    }
-                    type="checkbox"
-                  />
-                  <span>{t("启用协议代理自动重试")}</span>
-                </label>
-                <p className="field-hint">
-                  {t("只对经过本地协议代理的请求生效（聚合供应商、协议转换、模型路由）。代理会在把错误交给 Codex 之前，自行等待并重试连接失败、429/5xx，以及 200 流式响应里的容量错误（response.failed）；重试期间 Codex 不会出现失败提示。")}
-                </p>
-                <div className="form-row">
-                  <Field label={t("最多自动重试次数")}>
-                    <Input
-                      max={20}
-                      min={0}
-                      type="number"
-                      value={form.protocolProxyAutoRetryMaxAttempts}
-                      onChange={(event) =>
-                        onFormChange({
-                          ...form,
-                          protocolProxyAutoRetryMaxAttempts: clampNumber(Number(event.currentTarget.value), 0, 20),
-                        })
-                      }
-                    />
-                  </Field>
-                  <Field label={t("首次重试间隔（秒）")}>
-                    <Input
-                      max={30}
-                      min={0}
-                      type="number"
-                      value={form.protocolProxyAutoRetryIntervalSeconds}
-                      onChange={(event) =>
-                        onFormChange({
-                          ...form,
-                          protocolProxyAutoRetryIntervalSeconds: clampNumber(Number(event.currentTarget.value), 0, 30),
-                        })
-                      }
-                    />
-                  </Field>
-                </div>
-                <p className="field-hint">
-                  {t("之后按 2 倍指数退避，单次最长 30 秒；上游返回 Retry-After 时优先采用（同样受上限约束）。")}
-                </p>
-              </div>
             </CardContent>
           </Panel>
 
@@ -13409,7 +13595,7 @@ function routeSubtitle(route: Route) {
     multiLaunch: t("为不同供应商启动相互隔离的 Codex 实例"),
     grok: t("管理 Grok CLI 的模型与 API 端点"),
     claude: t("保留官方 Claude.app 原样，通过受管副本为 Claude 应用增强功能"),
-    relayEnvironment: t("排查可能干扰中转站配置的本机环境"),
+    relayEnvironment: t("统一管理本地协议代理、供应商代理与重试策略"),
     sessions: t("查看、删除和修复 Codex 本地会话"),
     context: t("独立管理 MCP 服务器与插件"),
     skills: t("从 GitHub 仓库安装 Skill 到 Codex"),
