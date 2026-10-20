@@ -2548,9 +2548,12 @@ fn prepare_fixed_helper_port_for_restart(settings: Option<&BackendSettings>) -> 
             Err(_) => return Ok(()),
         },
     };
-    let Some(port) = codex_plus_core::launcher::required_fixed_helper_port(settings) else {
+    if codex_plus_core::launcher::required_fixed_helper_port(settings).is_none() {
         return Ok(());
-    };
+    }
+    // 与 launcher 启动时同一套迁移：端口落在 Windows 保留区间（10013）时先换端口，
+    // 否则下面会对着永远绑不上的旧端口等满超时，重启必然失败（#1163）。
+    let port = codex_plus_core::protocol_proxy::ensure_protocol_proxy_port_available();
     codex_plus_core::launcher::wait_for_fixed_helper_port(
         port,
         codex_plus_core::launcher::protocol_proxy_bind_retry_timeout_ms(),
@@ -4736,7 +4739,9 @@ fn archive_one_local_session(path: &Path, session_id: &str, archived: bool) -> a
     let changed = if has_archived_at {
         transaction.execute(
             "UPDATE threads SET archived = ?1, archived_at = ?2 WHERE id = ?3",
-            rusqlite::params![archived as i64, if archived { Some(current_timestamp_ms() as i64) } else { None }, session_id],
+            // Codex 的 threads.archived_at 与 created_at/updated_at 一样是秒（带 _ms 后缀的列才是毫秒）；
+            // 写毫秒会被解析成远未来的时间。
+            rusqlite::params![archived as i64, if archived { Some((current_timestamp_ms() / 1000) as i64) } else { None }, session_id],
         )?
     } else {
         transaction.execute(
@@ -6557,6 +6562,9 @@ pub fn preview_import_settings(path: String) -> CommandResult<SettingsPayload> {
 
 #[tauri::command]
 pub fn set_settings_path(path: String) -> CommandResult<SettingsPayload> {
+    if codex_plus_core::paths::state_dir_override().is_some() {
+        return failed("多开实例使用独立的状态目录，不支持修改配置文件路径；请在主实例中修改。", fallback_settings_payload());
+    }
     let target = PathBuf::from(path.trim());
     if !target.is_absolute() {
         return failed("配置文件路径必须是绝对路径。", fallback_settings_payload());
@@ -6600,18 +6608,27 @@ pub fn set_settings_path(path: String) -> CommandResult<SettingsPayload> {
 
 #[tauri::command]
 pub fn reset_settings_path() -> CommandResult<SettingsPayload> {
+    if codex_plus_core::paths::state_dir_override().is_some() {
+        return failed("多开实例使用独立的状态目录，不支持修改配置文件路径；请在主实例中修改。", fallback_settings_payload());
+    }
     let current = codex_plus_core::paths::default_settings_path();
     let target = codex_plus_core::paths::default_app_state_dir().join("settings.json");
-    if current != target && target.exists() {
-        return failed("默认配置文件已存在，为避免覆盖文件请先处理该文件。", fallback_settings_payload());
-    }
     if current != target {
         let contents = match fs::read(&current) {
             Ok(contents) => contents,
             Err(error) => return failed(&format!("读取当前设置失败：{error}"), fallback_settings_payload()),
         };
+        // 迁移路径时默认位置会留下一份旧副本；过去这里直接拒绝，迁移过一次就再也
+        // 恢复不了默认路径。现在把旧副本改名备份后再写入当前配置，不丢任何内容。
+        if target.exists() {
+            let backup = target.with_file_name(format!("settings.json.before-reset-{}.bak", current_timestamp_ms()));
+            if let Err(error) = fs::rename(&target, &backup) {
+                return failed(&format!("备份默认位置的旧配置失败：{error}"), fallback_settings_payload());
+            }
+        }
         if let Err(error) = fs::create_dir_all(target.parent().unwrap_or(Path::new(".")))
-            .and_then(|_| fs::write(&target, contents))
+            .map_err(anyhow::Error::from)
+            .and_then(|_| codex_plus_core::settings::atomic_write(&target, &contents))
         {
             return failed(&format!("恢复默认配置路径失败：{error}"), fallback_settings_payload());
         }
@@ -6697,7 +6714,9 @@ pub fn read_relay_files() -> CommandResult<RelayFilesPayload> {
 
 #[tauri::command]
 pub fn check_env_conflicts() -> CommandResult<EnvConflictsPayload> {
-    let conflicts = codex_plus_core::env_conflicts::detect_env_conflicts();
+    let conflicts = codex_plus_core::env_conflicts::detect_env_conflicts_for_home(
+        &codex_plus_core::relay_config::default_codex_home_dir(),
+    );
     let message = if conflicts.is_empty() {
         "未检测到会覆盖 Codex 供应商配置的 OPENAI 环境变量。"
     } else {
@@ -6724,7 +6743,9 @@ pub fn remove_env_conflicts(
     let backup_dir = codex_plus_core::paths::default_app_state_dir().join("backups");
     match codex_plus_core::env_conflicts::remove_env_conflicts(&request.names, backup_dir) {
         Ok(result) => {
-            let remaining = codex_plus_core::env_conflicts::detect_env_conflicts();
+            let remaining = codex_plus_core::env_conflicts::detect_env_conflicts_for_home(
+                &codex_plus_core::relay_config::default_codex_home_dir(),
+            );
             ok(
                 "环境变量已按确认项删除；重新启动 Codex 后生效。",
                 RemoveEnvConflictsPayload {
@@ -6739,7 +6760,9 @@ pub fn remove_env_conflicts(
             RemoveEnvConflictsPayload {
                 removed: Vec::new(),
                 backup_path: None,
-                remaining: codex_plus_core::env_conflicts::detect_env_conflicts(),
+                remaining: codex_plus_core::env_conflicts::detect_env_conflicts_for_home(
+                    &codex_plus_core::relay_config::default_codex_home_dir(),
+                ),
             },
         ),
     }
@@ -7292,7 +7315,11 @@ pub fn sync_live_context_entries(
             );
         }
     }
-    if let Err(error) = std::fs::write(&config_path, &updated_config) {
+    // 必须原子替换：`fs::write` 先截断再写，Codex 若在这一瞬间读 config.toml
+    // 会拿到空文件或半截内容，对话中报「无法加载 config.toml」（#2621）。
+    if let Err(error) =
+        codex_plus_core::settings::atomic_write(&config_path, updated_config.as_bytes())
+    {
         return failed(
             &format!("写入 live config.toml 失败：{error}"),
             LiveContextEntriesPayload {
@@ -8308,7 +8335,8 @@ fn save_relay_file_in_home(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, contents)?;
+    // 与供应商切换同一写法：原子替换，避免运行中的 Codex 读到半截文件（#2621）。
+    codex_plus_core::settings::atomic_write(&path, contents.as_bytes())?;
     Ok(())
 }
 
@@ -10417,6 +10445,27 @@ base_url = "https://example.invalid/v1"
         assert!(applied.contains("model_provider = \"ai\""));
         assert!(applied.contains("[model_providers.ai]"));
         assert!(!applied.contains("[model_providers.custom]"));
+    }
+
+    #[test]
+    fn archiving_writes_archived_at_in_seconds_like_codex() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("state_5.sqlite");
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection
+            .execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, archived INTEGER NOT NULL DEFAULT 0, archived_at INTEGER); INSERT INTO threads(id) VALUES('t1');")
+            .unwrap();
+        drop(connection);
+        archive_one_local_session(&db, "t1", true).unwrap();
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        let (archived, archived_at): (i64, i64) = connection
+            .query_row("SELECT archived, archived_at FROM threads WHERE id='t1'", [], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        assert_eq!(archived, 1);
+        assert!((archived_at - now).abs() < 60, "archived_at 必须是秒：{archived_at}");
+        drop(connection);
+        archive_one_local_session(&db, "t1", false).unwrap();
     }
 
     #[test]

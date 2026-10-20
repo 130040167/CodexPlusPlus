@@ -1,6 +1,7 @@
 use anyhow::Context;
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::Digest as _;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -783,7 +784,10 @@ pub fn preserve_live_nonprovider_settings(home: &Path, config: &str) -> anyhow::
     let mut target = parse_toml_document(config)?;
     let live = read_optional_text(&home.join("config.toml"))?;
     if live.trim().is_empty() { return Ok(normalize_optional_toml(target)); }
-    let live = parse_toml_document(&live)?;
+    // 同上：live 损坏时跳过补缺，不阻断切换。
+    let Ok(live) = parse_toml_document(&normalize_duplicate_toml_text(&live)) else {
+        return Ok(normalize_optional_toml(target));
+    };
     // 按项目补缺，不递归提升一个已有项目的 trust 权限。
     preserve_missing_table_keys(&mut target, &live, "projects");
     if target.get("notify").is_none() {
@@ -1171,18 +1175,31 @@ fn managed_openai_base_url() -> String {
 }
 
 fn update_remote_control_openai_base_url(doc: &mut DocumentMut, enabled: bool) {
-    let managed = managed_openai_base_url();
+    update_remote_control_openai_base_url_with(doc, enabled, managed_openai_base_url());
+}
+
+fn update_remote_control_openai_base_url_with(doc: &mut DocumentMut, enabled: bool, managed: String) {
     let current = doc
         .get(OPENAI_BASE_URL_KEY)
         .and_then(Item::as_str)
         .map(str::trim)
         .map(ToString::to_string);
 
+    // 默认端口的本地代理地址同样算作 Codex++ 写入的值：端口因 Windows 保留区间
+    // 迁移后（#1163），旧值必须换成新端口，否则 Codex 仍连旧端口、所有请求失败。
+    // 其它回环地址（例如 CC Switch 的本地代理）视为用户自定义，原样保留。
+    let ours = |value: &str| {
+        value == managed
+            || value
+                == crate::protocol_proxy::local_responses_proxy_base_url(
+                    crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+                )
+    };
     if enabled {
-        if current.as_deref().is_none_or(|value| value == managed) {
+        if current.as_deref().is_none_or(ours) {
             doc[OPENAI_BASE_URL_KEY] = toml_edit::value(managed);
         }
-    } else if current.as_deref() == Some(managed.as_str()) {
+    } else if current.as_deref().is_some_and(ours) {
         doc.as_table_mut().remove(OPENAI_BASE_URL_KEY);
     }
 }
@@ -1994,7 +2011,16 @@ fn preserve_unmanaged_live_context_entries(
         return Ok(ensure_trailing_newline(config_text.to_string()));
     }
     let mut target_doc = parse_toml_document(config_text)?;
-    let live_doc = parse_toml_document(&live_config)?;
+    // live config.toml 已被上游/人工改坏时，切换供应商不应整次失败（#2478/#2500）：
+    // 无法从坏文件里捞用户托管条目，就直接按新配置写出；原文件已在 write_codex_live_atomic
+    // 的 create_live_backup 中备份，可手工恢复。
+    let Ok(live_doc) = parse_toml_document(&live_config) else {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "relay_config.live_config_unparsable",
+            serde_json::json!({ "home": home.to_string_lossy() }),
+        );
+        return Ok(ensure_trailing_newline(config_text.to_string()));
+    };
     let managed_doc =
         parse_toml_document(&sanitize_common_config_contents(managed_context_config))?;
     preserve_unmanaged_context_tables(
@@ -2210,7 +2236,15 @@ fn preserve_live_marketplace_configs(home: &Path, config_text: &str) -> anyhow::
     }
 
     let mut target = parse_toml_document(config_text)?;
-    let live = parse_toml_document(&live_config)?;
+    // live 文件损坏时不能让整次切换失败（#2478/#2500）：跳过补回，按新配置写出；
+    // 原文件在 write_codex_live_atomic 里已备份。
+    let Ok(live) = parse_toml_document(&normalize_duplicate_toml_text(&live_config)) else {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "relay_config.live_config_unparsable",
+            serde_json::json!({ "home": home.to_string_lossy(), "step": "marketplaces" }),
+        );
+        return Ok(config_text.to_string());
+    };
     let Some(live_marketplaces) = live.get("marketplaces").and_then(Item::as_table_like) else {
         return Ok(ensure_trailing_newline(target.to_string()));
     };
@@ -2817,7 +2851,17 @@ fn preserve_missing_table_keys(
 /// Normal-user launches cannot complete the elevated native Windows sandbox
 /// setup. Downgrade only that case; an elevated process keeps the user's mode.
 pub fn ensure_windows_sandbox_usable_for_current_user(home: &Path) -> anyhow::Result<bool> {
-    if windows_process_is_elevated() {
+    ensure_windows_sandbox_usable_with(home, windows_process_is_elevated())
+}
+
+fn ensure_windows_sandbox_usable_with(home: &Path, process_elevated: bool) -> anyhow::Result<bool> {
+    if process_elevated {
+        return Ok(false);
+    }
+    // elevated 只在「首次初始化」时需要管理员权限；初始化完成后普通进程也能用。
+    // 过去不看初始化状态一律降级，已经完成初始化的用户每次经 Codex++ 启动都被改回
+    // unelevated，反而触发 `CreateProcessSecurityEnvironment failed`（#2615）。
+    if windows_elevated_sandbox_setup_present(home) {
         return Ok(false);
     }
     let config_path = home.join("config.toml");
@@ -2850,6 +2894,24 @@ pub fn ensure_windows_sandbox_usable_for_current_user(home: &Path) -> anyhow::Re
         }),
     );
     Ok(true)
+}
+
+/// Codex 的 Windows 沙箱初始化产物是否齐全：`.sandbox/setup_marker.json` 与
+/// `.sandbox-secrets/sandbox_users.json` 都存在、都带 `version` 且两者一致
+/// （与 Codex `sandbox_setup_is_complete` 的判据一致）。不写死 Codex 的
+/// SETUP_VERSION：版本升级后由 Codex 自己提示重新初始化，这里不替用户改配置。
+fn windows_elevated_sandbox_setup_present(home: &Path) -> bool {
+    let version = |path: PathBuf| -> Option<u64> {
+        let text = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str::<Value>(&text).ok()?.get("version")?.as_u64()
+    };
+    match (
+        version(home.join(".sandbox").join("setup_marker.json")),
+        version(home.join(".sandbox-secrets").join("sandbox_users.json")),
+    ) {
+        (Some(marker), Some(users)) => marker == users,
+        _ => false,
+    }
 }
 
 #[cfg(windows)]
@@ -3303,13 +3365,38 @@ fn apply_model_catalog_to_config_with_live_policy(
     // 托管 Responses 传输走 model_routes 时需要 catalog，与会话身份无关；
     // 纯平铺 model_list 且无窗口/元数据的仍保持"不生成"契约（无后缀不落盘，见既有测试）。
     // 上游不认 tool_search 时必须落 catalog 关掉该能力，否则 Codex 照发、整单 400。
+    let catalog_path = home.join(&catalog_relative);
+    // 已经存在的托管 catalog 必须随当前模型列表重建：否则用户在供应商渠道里
+    // 增删/重命名模型后，Codex 重启读到的仍是旧 catalog，选择器不刷新
+    // （#2081）。「从没生成过 catalog 的平铺 model_list」保持不凭空创建。
+    // 仅限仍有多模型条目时刷新：模型列表收敛回单个无窗口模型时，平铺列表本身
+    // 就够用，继续落 catalog 会架空「关闭每模型覆盖即删除指针」的既有契约
+    // （见 tests/model_catalog_paths.rs）。
+    // 只数模型列表本身：entries 还会把当前 profile.model 放在最前面，
+    // 「列表 a + 默认模型 b」不能算成多模型。
+    let listed_models = model_list
+        .split(['\r', '\n', ','])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<HashSet<_>>()
+        .len();
+    let existing_managed_catalog = catalog_path.exists()
+        && listed_models > 1
+        && root_key_string(&config_text, "model_catalog_json").is_some_and(|pointer| {
+            pointer == catalog_relative || pointer == catalog_pointer
+        });
     if !should_write_managed_model_catalog(
         &entries,
         has_metadata_overrides,
         standard_responses,
         profile.has_model_routes(),
         official_deepseek_responses,
+        // 只有用户显式写了模型列表时，供应商级窗口才落 catalog：模型列表留空
+        // （典型是官方登录）时 catalog 里只剩 0~1 个模型，会替换 Codex 内置的
+        // 官方模型列表，选择器变空；这种情况沿用顶层 model_context_window。
+        fallback.is_some() && !model_list.trim().is_empty(),
     ) && !upstream_rejects_tool_search(profile)
+        && !existing_managed_catalog
     {
         let mut doc = parse_toml_document(&config_text)?;
         if root_key_string(&config_text, "model_catalog_json")
@@ -3319,7 +3406,6 @@ fn apply_model_catalog_to_config_with_live_policy(
         }
         return Ok(normalize_optional_toml(doc));
     }
-    let catalog_path = home.join(&catalog_relative);
     if let Some(parent) = catalog_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -3471,8 +3557,13 @@ fn should_write_managed_model_catalog(
     standard_responses: bool,
     has_model_routes: bool,
     official_deepseek_responses: bool,
+    has_profile_window: bool,
 ) -> bool {
+    // profile 级窗口（`context_window`）也必须落 catalog：只配全局窗口、模型列表
+    // 不带后缀时，过去不会生成 catalog，Codex 继续用内置默认窗口，用户看到的仍是
+    // 272k（issue #2590）。有全局窗口时把每模型条目写成该窗口即可。
     metadata_overrides
+        || has_profile_window
         || entries.iter().any(|entry| {
             entry.suffix_window.is_some()
                 || entry.auto_compact_percent.is_some()
@@ -3536,6 +3627,21 @@ mod managed_catalog_predicate_tests {
             false,
             false,
             false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn predicate_writes_for_profile_level_window_without_suffixes() {
+        // #2590：只配 profile 级 context_window、模型列表不带 [1M] 后缀时，
+        // 也必须生成 catalog，否则 Codex 继续按内置 272k 窗口压缩。
+        assert!(should_write_managed_model_catalog(
+            &[entry("custom-model")],
+            false,
+            false,
+            false,
+            false,
+            true,
         ));
     }
 
@@ -3544,17 +3650,18 @@ mod managed_catalog_predicate_tests {
         let mut window = entry("custom-model");
         window.suffix_window = Some(1_000_000);
         assert!(should_write_managed_model_catalog(
-            &[window], false, false, false, false
+            &[window], false, false, false, false, false
         ));
 
         let mut compact = entry("custom-model");
         compact.auto_compact_percent = Some(80_000_000);
         assert!(should_write_managed_model_catalog(
-            &[compact], false, false, false, false
+            &[compact], false, false, false, false, false
         ));
         assert!(should_write_managed_model_catalog(
             &[entry("custom-model")],
             true,
+            false,
             false,
             false,
             false,
@@ -3569,6 +3676,7 @@ mod managed_catalog_predicate_tests {
             true,
             true,
             false,
+            false,
         ));
         assert!(should_write_managed_model_catalog(
             &[entry("deepseek-v4-pro")],
@@ -3576,6 +3684,7 @@ mod managed_catalog_predicate_tests {
             false,
             false,
             true,
+            false,
         ));
     }
 
@@ -4662,6 +4771,26 @@ fn merge_proxy_key_into_auth_json(source: &str, bearer_token: &str) -> Option<St
         .map(|text| format!("{text}\n"))
 }
 
+/// 当前 live 配置里实际生效的 API 凭据：`auth.json` 的 `OPENAI_API_KEY` 与
+/// 当前 provider 的 `experimental_bearer_token`。读不到或解析失败时返回空列表。
+pub fn active_api_credentials_in_home(home: &Path) -> Vec<String> {
+    let mut credentials = Vec::new();
+    if let Ok(auth) = read_optional_text(&home.join("auth.json"))
+        && let Some(key) = codex_auth_api_key(&auth)
+    {
+        credentials.push(key);
+    }
+    if let Ok(config) = read_optional_text(&home.join("config.toml"))
+        && let Ok(Some(token)) = experimental_bearer_token_from_config(&config)
+    {
+        let token = token.trim().to_string();
+        if !token.is_empty() && !credentials.contains(&token) {
+            credentials.push(token);
+        }
+    }
+    credentials
+}
+
 fn codex_auth_api_key(auth_contents: &str) -> Option<String> {
     let auth: Value = serde_json::from_str(auth_contents).ok()?;
     auth.get("OPENAI_API_KEY")
@@ -5324,6 +5453,42 @@ fn read_optional_text(path: &Path) -> anyhow::Result<String> {
     match std::fs::read_to_string(path) {
         Ok(contents) => Ok(contents),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            // 上游客户端在中文代码页下可能把 config.toml 写成 GBK/ANSI 字节（#585）。
+            // 不能按「没有 live 配置」返回空串：那样切换供应商会把 MCP、项目信任、
+            // Windows 沙箱等非供应商设置全部丢掉且毫无提示。这里按 UTF-8 宽松解码——
+            // TOML 结构与 ASCII 内容完整保留，只有无法识别的字节变成 U+FFFD；
+            // 原始字节先按内容哈希备份一次（同一内容重复读取不再重复备份）。
+            let bytes = std::fs::read(path)?;
+            let digest = sha2::Sha256::digest(&bytes);
+            let tag: String = digest.iter().take(6).map(|byte| format!("{byte:02x}")).collect();
+            let backup = path.with_file_name(format!(
+                "{}.invalid-utf8-{tag}.bak",
+                path.file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "config.toml".to_string()),
+            ));
+            let backup_result = if backup.exists() {
+                Ok(())
+            } else {
+                std::fs::write(&backup, &bytes)
+            };
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "relay_config.non_utf8_config",
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "backup": backup.to_string_lossy(),
+                    "backup_ok": backup_result.is_ok(),
+                    "error": error.to_string(),
+                }),
+            );
+            if backup_result.is_err() {
+                return Err(error).context(
+                    "config.toml 不是有效 UTF-8，且无法创建备份；原文件未修改",
+                );
+            }
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -5487,6 +5652,67 @@ fn account_label_from_jwt(token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrated_proxy_port_rewrites_default_port_openai_base_url_only() {
+        // #1163：端口迁移后，根级 openai_base_url 必须跟到新端口；用户自己的本地代理不动。
+        let migrated = crate::protocol_proxy::local_responses_proxy_base_url(58077);
+        let mut doc: DocumentMut = "openai_base_url = \"http://127.0.0.1:57321/v1\"\n".parse().unwrap();
+        update_remote_control_openai_base_url_with(&mut doc, true, migrated.clone());
+        assert_eq!(doc[OPENAI_BASE_URL_KEY].as_str(), Some(migrated.as_str()));
+
+        let mut doc: DocumentMut = "openai_base_url = \"http://127.0.0.1:15721/v1\"\n".parse().unwrap();
+        update_remote_control_openai_base_url_with(&mut doc, true, migrated.clone());
+        assert_eq!(doc[OPENAI_BASE_URL_KEY].as_str(), Some("http://127.0.0.1:15721/v1"));
+
+        // 关闭时旧端口的托管值也要清掉。
+        let mut doc: DocumentMut = "openai_base_url = \"http://127.0.0.1:57321/v1\"\n".parse().unwrap();
+        update_remote_control_openai_base_url_with(&mut doc, false, migrated);
+        assert!(doc.get(OPENAI_BASE_URL_KEY).is_none());
+    }
+
+    #[test]
+    fn elevated_windows_sandbox_is_kept_once_setup_is_complete() {
+        // #2615：已完成 elevated 初始化的用户不能被每次启动降级成 unelevated。
+        let home = tempfile::tempdir().unwrap();
+        let config = "[windows]\nsandbox = \"elevated\"\n";
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+
+        // 未初始化：普通权限进程照旧降级，避免卡在 updateRequired。
+        assert!(ensure_windows_sandbox_usable_with(home.path(), false).unwrap());
+        let downgraded = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(downgraded.contains("sandbox = \"unelevated\""), "{downgraded}");
+
+        // 初始化产物齐全且版本一致：保留用户的 elevated。
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        std::fs::create_dir_all(home.path().join(".sandbox")).unwrap();
+        std::fs::create_dir_all(home.path().join(".sandbox-secrets")).unwrap();
+        std::fs::write(
+            home.path().join(".sandbox").join("setup_marker.json"),
+            r#"{"version":5,"offline_username":"CodexSandboxOffline","online_username":"CodexSandboxOnline"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join(".sandbox-secrets").join("sandbox_users.json"),
+            r#"{"version":5,"offline":{},"online":{}}"#,
+        )
+        .unwrap();
+        assert!(!ensure_windows_sandbox_usable_with(home.path(), false).unwrap());
+        let kept = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert_eq!(kept, config, "初始化完成后不应改写用户配置");
+
+        // 两份产物版本不一致（初始化未完成或被升级打断）：仍按未初始化处理。
+        std::fs::write(
+            home.path().join(".sandbox-secrets").join("sandbox_users.json"),
+            r#"{"version":4}"#,
+        )
+        .unwrap();
+        assert!(ensure_windows_sandbox_usable_with(home.path(), false).unwrap());
+
+        // 管理员进程从不改写。
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        assert!(!ensure_windows_sandbox_usable_with(home.path(), true).unwrap());
+    }
 
     /// 回归 09-23 现场故障：裸的 [mcp_servers] 父表头把切块锚点钉在 mcp_servers，
     /// 之后两个重复的 [mcp_servers.node_repl] 落在同一块里，整块解析失败后退回

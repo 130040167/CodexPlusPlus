@@ -69,7 +69,8 @@ pub trait BridgeSettingsService: Send + Sync {
     }
 
     fn whale_ledger_path(&self) -> PathBuf {
-        crate::paths::default_settings_path().with_file_name("whale-balance.sqlite3")
+        // 账本固定在状态目录：迁移设置文件路径后不能跟着换位置，否则余额历史看似清空。
+        crate::paths::default_app_state_dir().join("whale-balance.sqlite3")
     }
 }
 

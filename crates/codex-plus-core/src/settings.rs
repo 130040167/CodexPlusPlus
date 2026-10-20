@@ -2794,6 +2794,26 @@ fn normalize_text_config(contents: String) -> String {
     }
 }
 
+/// 逐级解析软链接（最多 16 层，防环），返回最终目标路径；不是软链接时返回 None。
+fn resolve_symlink_target(path: &Path) -> Option<PathBuf> {
+    let mut current = path.to_path_buf();
+    let mut resolved = false;
+    for _ in 0..16 {
+        let Ok(metadata) = fs::symlink_metadata(&current) else { break };
+        if !metadata.file_type().is_symlink() {
+            break;
+        }
+        let Ok(target) = fs::read_link(&current) else { break };
+        current = if target.is_absolute() {
+            target
+        } else {
+            current.parent().map(|parent| parent.join(&target)).unwrap_or(target)
+        };
+        resolved = true;
+    }
+    resolved.then_some(current)
+}
+
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     atomic_write_with(path, |file| file.write_all(bytes))
 }
@@ -2804,6 +2824,11 @@ pub fn atomic_write_with(
     path: &Path,
     write_contents: impl FnOnce(&mut File) -> std::io::Result<()>,
 ) -> anyhow::Result<()> {
+    // 目标是软链接时（常见于把 ~/.codex/config.toml 链到 dotfiles 仓库），
+    // 原子替换要落在链接指向的真实文件上；直接 rename 会把链接本身换成普通文件，
+    // 链接被悄悄断开，dotfiles 里的原文件不再更新。
+    let resolved = resolve_symlink_target(path);
+    let path = resolved.as_deref().unwrap_or(path);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
@@ -2870,14 +2895,27 @@ fn replace_file(source: &Path, target: &Path) -> anyhow::Result<()> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    unsafe {
-        MoveFileExW(
-            PCWSTR(source.as_ptr()),
-            PCWSTR(target.as_ptr()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )?;
+    // Codex 客户端 / 杀毒软件可能短暂持有目标文件的读句柄，MoveFileExW 会以
+    // ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION 失败。一次失败就让整次
+    // 供应商切换报错对用户表现为「无法切换和保存供应商」（#2601 / #2500 /
+    // #2612）。短退避重试几次，仍失败再把错误上抛。
+    let mut last_error = None;
+    for attempt in 0..6 {
+        match unsafe {
+            MoveFileExW(
+                PCWSTR(source.as_ptr()),
+                PCWSTR(target.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
     }
-    Ok(())
+    Err(last_error
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("替换文件失败")))
 }
 
 fn temp_path_for(path: &Path) -> PathBuf {
@@ -2894,6 +2932,28 @@ fn temp_path_for(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_keeps_symlink_and_updates_its_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let dotfiles = temp.path().join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let target = dotfiles.join("config.toml");
+        std::fs::write(&target, "model = \"old\"\n").unwrap();
+        let home = temp.path().join(".codex");
+        std::fs::create_dir_all(&home).unwrap();
+        let link = home.join("config.toml");
+        std::os::unix::fs::symlink("../dotfiles/config.toml", &link).unwrap();
+
+        atomic_write(&link, b"model = \"new\"\n").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "软链接不能被替换成普通文件");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "model = \"new\"\n");
+        let leftovers: Vec<_> = std::fs::read_dir(&home).unwrap().filter_map(Result::ok)
+            .map(|entry| entry.file_name()).collect();
+        assert_eq!(leftovers.len(), 1, "链接所在目录不应残留临时文件：{leftovers:?}");
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);

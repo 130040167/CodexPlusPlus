@@ -1494,10 +1494,13 @@
             } else if (result.status === "ok" && result.enable_i18n === false) {
               showToast("UI 配置已刷新，enable_i18n=false", null);
             } else {
-              showToast(`UI 配置刷新${result.status === "partial" ? "部分完成" : "失败"}`, result.errors?.join("；") || null);
+              // showToast 的第二个参数若是字符串会被当成撤销 token（旧签名），
+              // 错误详情必须拼进正文并以对象参数标明类型。
+              const detail = result.errors?.join("；");
+              showToast(`UI 配置刷新${result.status === "partial" ? "部分完成" : "失败"}${detail ? `：${detail}` : ""}`, { type: result.status === "partial" ? "warn" : "error" });
             }
           })
-          .catch((error) => showToast("UI 配置刷新失败", error?.message || String(error)))
+          .catch((error) => showToast(`UI 配置刷新失败：${error?.message || String(error)}`, { type: "error" }))
           .finally(() => {
             button.dataset.pending = "false";
             button.textContent = originalLabel || "刷新 UI 配置";

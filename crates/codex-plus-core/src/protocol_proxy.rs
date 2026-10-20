@@ -114,19 +114,100 @@ fn recall_tool_call_extra_content(call_id: &str) -> Option<Value> {
         .and_then(|cache| cache.recall(call_id))
 }
 
+const PROTOCOL_PROXY_PORT_FILE: &str = "protocol-proxy-port";
+
 /// 协议代理的实际生效端口，默认 [`DEFAULT_PROTOCOL_PROXY_PORT`]，
 /// 可用环境变量 `CODEX_PLUS_PROTOCOL_PROXY_PORT` 覆盖。
 ///
 /// 端口要写进 `config.toml` 的 `base_url`，不能像普通 helper 端口那样自动换；
-/// 但少数机器（issue #2189）上 57321 恰好被 Hyper-V/WSL 开机划进了 Windows
-/// 动态端口排除区间，bind 报 os error 10013 永远起不来，只能整体挪一个端口。
+/// 但少数机器（issue #2189 / #1163）上 57321 恰好被 Hyper-V/WSL 开机划进了
+/// Windows 动态端口排除区间，bind 报 os error 10013 永远起不来，只能整体挪
+/// 一个端口。迁移后的端口持久化在状态目录里，管理器与启动器读同一份值。
 /// 写入 base_url 与读取校验必须都走本函数，保证同一进程内一致。
 pub fn protocol_proxy_port() -> u16 {
+    if let Some(port) = env_protocol_proxy_port() {
+        return port;
+    }
+    read_persisted_protocol_proxy_port(&persisted_protocol_proxy_port_path())
+        .unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT)
+}
+
+fn env_protocol_proxy_port() -> Option<u16> {
     std::env::var("CODEX_PLUS_PROTOCOL_PROXY_PORT")
         .ok()
         .and_then(|value| value.trim().parse::<u16>().ok())
         .filter(|port| *port > 0)
-        .unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT)
+}
+
+fn persisted_protocol_proxy_port_path() -> std::path::PathBuf {
+    crate::paths::default_app_state_dir().join(PROTOCOL_PROXY_PORT_FILE)
+}
+
+fn read_persisted_protocol_proxy_port(path: &std::path::Path) -> Option<u16> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port > 0)
+}
+
+fn persist_protocol_proxy_port(path: &std::path::Path, port: u16) -> anyhow::Result<()> {
+    crate::settings::atomic_write(path, format!("{port}\n").as_bytes())
+        .with_context(|| format!("持久化协议代理端口失败：{}", path.display()))
+}
+
+/// 启动前确认协议代理端口可绑定。
+///
+/// 端口被**占用**（AddrInUse）时保持原值，交给既有的等待与重试逻辑——旧
+/// launcher 释放端口通常只需要几秒。只有 `PermissionDenied`（Windows 10013，
+/// 端口落在系统排除区间）才会永久失败，此时换一个空闲端口并持久化，让
+/// `config.toml` 的 base_url、helper 绑定和路由校验都跟随同一个新端口。
+///
+/// 显式设置 `CODEX_PLUS_PROTOCOL_PROXY_PORT` 时尊重用户选择，不自动迁移。
+pub fn ensure_protocol_proxy_port_available() -> u16 {
+    let port = protocol_proxy_port();
+    if env_protocol_proxy_port().is_some() {
+        return port;
+    }
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => {
+            drop(listener);
+            port
+        }
+        Err(error) if crate::ports::port_bind_forbidden(&error) => {
+            let replacement = crate::ports::find_available_loopback_port();
+            if replacement != 0 && replacement != port {
+                let path = persisted_protocol_proxy_port_path();
+                match persist_protocol_proxy_port(&path, replacement) {
+                    Ok(()) => {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.protocol_proxy_port_relocated",
+                            serde_json::json!({
+                                "from": port,
+                                "to": replacement,
+                                "path": path.to_string_lossy(),
+                                "error": error.to_string(),
+                            }),
+                        );
+                        return replacement;
+                    }
+                    Err(persist_error) => {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.protocol_proxy_port_relocate_failed",
+                            serde_json::json!({
+                                "from": port,
+                                "to": replacement,
+                                "error": persist_error.to_string(),
+                            }),
+                        );
+                    }
+                }
+            }
+            port
+        }
+        Err(_) => port,
+    }
 }
 pub const NO_AUTH_PROXY_BEARER_TOKEN: &str = "codex-plus-no-auth";
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -546,7 +627,17 @@ pub fn responses_to_chat_completions_with_options(
     let mut has_chat_tools = false;
     if !converted.is_empty() {
         has_chat_tools = true;
-        result["tools"] = json!(converted);
+        let mut tools = converted;
+        // Gemini 的 function_declarations 只接受字符串枚举值：Codex 工具 schema
+        // 里出现 `enum: [true, false]` 这类布尔/数字值时会整轮 400
+        // （`enum[0] (TYPE_STRING)`，issue #2404）。只对 Gemini 系上游改写，
+        // 其他上游保持原始 JSON Schema 语义。
+        if upstream_requires_string_enums(model) {
+            for tool in tools.iter_mut() {
+                coerce_enum_values_to_strings(tool);
+            }
+        }
+        result["tools"] = json!(tools);
     }
 
     if has_chat_tools {
@@ -734,8 +825,13 @@ fn strip_attachment_boilerplate(text: &str) -> Option<&str> {
 }
 
 fn normalize_attachment_boilerplate(messages: &mut [Value]) {
-    for message in messages.iter_mut() {
-        if message.get("role").and_then(Value::as_str) != Some("user") {
+    // 最新一条 user 消息保持原样：模型要靠其中的「文件名: 路径」知道这次附带了哪些文件，
+    // 换成占位符会让它无法读取附件。只规范化历史消息，前缀稳定性的收益来自历史部分。
+    let latest_user = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"));
+    for (index, message) in messages.iter_mut().enumerate() {
+        if message.get("role").and_then(Value::as_str) != Some("user") || Some(index) == latest_user {
             continue;
         }
         let Some(content) = message.get_mut("content") else {
@@ -763,8 +859,10 @@ fn normalize_attachment_boilerplate(messages: &mut [Value]) {
     }
 }
 
-/// system 里的 turn_aborted 是一次性状态提示，不能留在稳定前缀头部；移到最后一条
-/// user 前，下一轮客户端再次注入时仍可被识别，但历史 system 前缀保持稳定。
+/// system 里的 turn_aborted 是一次性状态提示，不能留在稳定前缀头部；并入最后一条
+/// user 消息的开头，下一轮客户端再次注入时仍可被识别，但历史 system 前缀保持稳定。
+/// 不能单独插一条 system 消息：MiniMax 等上游要求 system 只出现在最前面，
+/// `collapse_system_messages_to_head` 正是为此而设，中途插入会重新引发 400。
 fn relocate_turn_aborted_blocks(messages: &mut Vec<Value>) {
     const OPEN: &str = "<turn_aborted>";
     const CLOSE: &str = "</turn_aborted>";
@@ -800,21 +898,28 @@ fn relocate_turn_aborted_blocks(messages: &mut Vec<Value>) {
     if blocks.is_empty() || stripped.trim().is_empty() {
         return;
     }
-    if let Some(Value::String(target)) = head.get_mut("content") {
-        *target = stripped.trim_end().to_string();
-    } else {
-        return;
-    }
-    let moved = blocks
-        .into_iter()
-        .map(|block| json!({ "role": "system", "content": block }))
-        .collect::<Vec<_>>();
-    let insert_at = messages
+    let Some(target_index) = messages
         .iter()
         .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"))
-        .unwrap_or(1)
-        .max(1);
-    messages.splice(insert_at..insert_at, moved);
+        .filter(|index| *index > 0)
+    else {
+        return;
+    };
+    let notice = blocks.join("\n");
+    let merged = match messages[target_index].get_mut("content") {
+        Some(Value::String(text)) => {
+            *text = format!("{notice}\n\n{text}");
+            true
+        }
+        Some(Value::Array(parts)) => {
+            parts.insert(0, json!({ "type": "text", "text": notice }));
+            true
+        }
+        _ => false,
+    };
+    if merged && let Some(Value::String(target)) = messages[0].get_mut("content") {
+        *target = stripped.trim_end().to_string();
+    }
 }
 
 fn canonicalize_system_text(text: &str) -> String {
@@ -5212,39 +5317,57 @@ fn normalize_responses_item_ids(body: &mut Value) {
 
 /// Responses 上游要求同一请求里的 namespace 名称唯一。
 /// Codex 客户端在多轮 tool_search 后可能把多个历史 `tool_search_output` 都回放到
-/// 下一请求；合并同名 namespace 的子工具后保留第一个 output 外壳，避免严格上游
-/// 报 duplicate namespace，同时不丢掉后一次检索新增的工具（#2156 / #2166）。
+/// 下一请求（#2156 / #2166）。同名工具/namespace 只在**第一次声明它的 output** 里
+/// 保留一份，并合并后续检索新增的子工具；后面的 output 去掉重复项但**本身保留**，
+/// 否则对应的 `tool_search_call` 没有输出配对，严格上游会换成另一个 400。
 fn dedupe_responses_tool_search_outputs(body: &mut Value) {
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
         return;
     };
-    let mut first_output_index = None;
+    let tool_key = |tool: &Value| -> Option<(String, String)> {
+        let name = tool.get("name").and_then(Value::as_str).filter(|name| !name.is_empty())?;
+        let kind = tool.get("type").and_then(Value::as_str).unwrap_or("");
+        Some((kind.to_string(), name.to_string()))
+    };
     let mut merged_namespaces = Vec::new();
-    let mut remove_indices = Vec::new();
-    for (index, item) in items.iter().enumerate() {
+    let mut output_count = 0;
+    for item in items.iter() {
         if item.get("type").and_then(Value::as_str) != Some("tool_search_output") {
             continue;
         }
-        if first_output_index.is_none() {
-            first_output_index = Some(index);
-        } else {
-            remove_indices.push(index);
-        }
-        for tool in item
-            .get("tools")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
+        output_count += 1;
+        for tool in item.get("tools").and_then(Value::as_array).into_iter().flatten() {
             merge_namespace_definition(&mut merged_namespaces, tool);
         }
     }
-    let Some(first_output_index) = first_output_index else {
+    if output_count < 2 {
         return;
-    };
-    items[first_output_index]["tools"] = json!(merged_namespaces);
-    for index in remove_indices.into_iter().rev() {
-        items.remove(index);
+    }
+    let mut declared = std::collections::HashSet::new();
+    for item in items.iter_mut() {
+        if item.get("type").and_then(Value::as_str) != Some("tool_search_output") {
+            continue;
+        }
+        let Some(tools) = item.get("tools").and_then(Value::as_array).cloned() else {
+            continue;
+        };
+        let mut kept = Vec::new();
+        for tool in tools {
+            let Some(key) = tool_key(&tool) else {
+                kept.push(tool);
+                continue;
+            };
+            if !declared.insert(key.clone()) {
+                continue;
+            }
+            let merged = merged_namespaces
+                .iter()
+                .find(|candidate| tool_key(candidate).as_ref() == Some(&key))
+                .cloned()
+                .unwrap_or(tool);
+            kept.push(merged);
+        }
+        item["tools"] = Value::Array(kept);
     }
 }
 
@@ -5300,6 +5423,11 @@ fn append_responses_input(input: &Value, messages: &mut Vec<Value>) -> anyhow::R
             let mut pending_tool_calls = Vec::new();
             let mut pending_reasoning = Vec::new();
             let mut seen_tool_call_ids = BTreeSet::new();
+            // 同一次调用的输出在历史里出现多次时，Chat 上游会以
+            // `duplicate tool output for call_id` 拒绝整轮请求（#1533）。
+            // 只对「同一次调用」的重复输出去重：不返回 id 的上游每轮都由本代理生成
+            // `call_0`，跨轮复用 id 是合法的，遇到新的同 id 调用时重新计数。
+            let mut seen_tool_output_ids = BTreeSet::new();
             for item in items {
                 append_responses_item(
                     item,
@@ -5307,6 +5435,7 @@ fn append_responses_input(input: &Value, messages: &mut Vec<Value>) -> anyhow::R
                     &mut pending_tool_calls,
                     &mut pending_reasoning,
                     &mut seen_tool_call_ids,
+                    &mut seen_tool_output_ids,
                 )?;
             }
             flush_tool_calls(messages, &mut pending_tool_calls, &mut pending_reasoning);
@@ -5316,12 +5445,14 @@ fn append_responses_input(input: &Value, messages: &mut Vec<Value>) -> anyhow::R
             let mut pending_tool_calls = Vec::new();
             let mut pending_reasoning = Vec::new();
             let mut seen_tool_call_ids = BTreeSet::new();
+            let mut seen_tool_output_ids = BTreeSet::new();
             append_responses_item(
                 input,
                 messages,
                 &mut pending_tool_calls,
                 &mut pending_reasoning,
                 &mut seen_tool_call_ids,
+                &mut seen_tool_output_ids,
             )?;
             flush_tool_calls(messages, &mut pending_tool_calls, &mut pending_reasoning);
             flush_reasoning(messages, &mut pending_reasoning);
@@ -5337,6 +5468,7 @@ fn append_responses_item(
     pending_tool_calls: &mut Vec<Value>,
     pending_reasoning: &mut Vec<String>,
     seen_tool_call_ids: &mut BTreeSet<String>,
+    seen_tool_output_ids: &mut BTreeSet<String>,
 ) -> anyhow::Result<()> {
     match item.get("type").and_then(Value::as_str) {
         Some("function_call") => {
@@ -5353,6 +5485,7 @@ fn append_responses_item(
                 return Ok(());
             }
             seen_tool_call_ids.insert(call_id.to_string());
+            seen_tool_output_ids.remove(call_id);
             pending_tool_calls.push(json!({
                 "id": call_id,
                 "type": "function",
@@ -5372,6 +5505,10 @@ fn append_responses_item(
         Some("function_call_output") => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
             if call_id.is_empty() {
+                return Ok(());
+            }
+            if !seen_tool_output_ids.insert(call_id.to_string()) {
+                // 重复的 tool output：保留第一次，避免上游 duplicate call_id 400。
                 return Ok(());
             }
             if !seen_tool_call_ids.contains(call_id) {
@@ -5406,6 +5543,7 @@ fn append_responses_item(
                 return Ok(());
             }
             seen_tool_call_ids.insert(call_id.to_string());
+            seen_tool_output_ids.remove(call_id);
             pending_tool_calls.push(json!({
                 "id": call_id,
                 "type": "function",
@@ -5427,6 +5565,7 @@ fn append_responses_item(
                 return Ok(());
             }
             seen_tool_call_ids.insert(call_id.to_string());
+            seen_tool_output_ids.remove(call_id);
             pending_tool_calls.push(json!({
                 "id": call_id,
                 "type": "function",
@@ -5441,6 +5580,9 @@ fn append_responses_item(
         Some("tool_search_output") => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
             if call_id.is_empty() {
+                return Ok(());
+            }
+            if !seen_tool_output_ids.insert(call_id.to_string()) {
                 return Ok(());
             }
             let output = item.get("tools").unwrap_or(&Value::Null);
@@ -5490,6 +5632,8 @@ fn append_responses_item(
                     return Ok(());
                 }
                 seen_tool_call_ids.insert(call_id.to_string());
+                seen_tool_output_ids.remove(call_id);
+            seen_tool_output_ids.remove(call_id);
                 pending_tool_calls.push(json!({
                     "id": call_id,
                     "type": "function",
@@ -6614,6 +6758,68 @@ fn namespace_tool_to_chat_tools(namespace_tool: &Value, context: &CodexToolConte
         }));
     }
     converted
+}
+
+/// Gemini 系上游（含中转暴露的 google/gemini-*）要求 function declaration 的
+/// `enum` 全部是字符串，布尔/数字枚举会被整轮拒绝（#2404）。
+fn upstream_requires_string_enums(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("gemini") || model.starts_with("google/") || model.starts_with("models/gemini")
+}
+
+/// 递归把 schema 中 `enum` 数组的非字符串值转成字符串。
+fn coerce_enum_values_to_strings(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            // Gemini 只允许 STRING 类型带 enum。非字符串字段改成 string 会让模型回传
+            // "1" 这种字符串、工具端按 integer 校验失败，所以这类字段去掉 enum、保留原类型，
+            // 可选值写进 description 提示模型。
+            let non_string_type = match map.get("type") {
+                Some(Value::String(kind)) => kind != "string",
+                Some(Value::Array(kinds)) => !kinds.iter().any(|kind| kind == "string"),
+                _ => false,
+            };
+            if non_string_type && let Some(Value::Array(entries)) = map.remove("enum") {
+                let allowed = entries
+                    .iter()
+                    .map(|entry| match entry {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let hint = format!("Allowed values: {allowed}");
+                let description = match map.get("description").and_then(Value::as_str) {
+                    Some(existing) if !existing.trim().is_empty() => format!("{existing} ({hint})"),
+                    _ => hint,
+                };
+                map.insert("description".to_string(), Value::String(description));
+            }
+            if let Some(Value::Array(entries)) = map.get_mut("enum") {
+                for entry in entries.iter_mut() {
+                    let coerced = match entry {
+                        Value::String(_) => None,
+                        Value::Bool(flag) => Some(flag.to_string()),
+                        Value::Number(number) => Some(number.to_string()),
+                        Value::Null => Some("null".to_string()),
+                        _ => None,
+                    };
+                    if let Some(coerced) = coerced {
+                        *entry = Value::String(coerced);
+                    }
+                }
+            }
+            for child in map.values_mut() {
+                coerce_enum_values_to_strings(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values.iter_mut() {
+                coerce_enum_values_to_strings(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn normalize_chat_tool_parameters(parameters: &Value) -> Value {
@@ -8639,13 +8845,39 @@ mod response_compatibility_tests {
         dedupe_responses_tool_search_outputs(&mut body);
 
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input.len(), 2);
+        assert_eq!(input.len(), 3, "每个 tool_search_output 都要保留，否则对应调用失去配对");
         assert_eq!(input[0]["type"], "tool_search_output");
         let tools = input[0]["tools"][0]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["name"], "search_code");
         assert_eq!(tools[1]["name"], "read_context");
         assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[2]["call_id"], "second");
+        assert_eq!(input[2]["tools"], json!([]), "重复的 namespace 只在首次声明处保留");
+    }
+
+    #[test]
+    fn tool_search_outputs_keep_distinct_namespaces_where_first_declared() {
+        let mut body = json!({"input": [
+            {"type": "tool_search_call", "call_id": "first", "arguments": {}},
+            {"type": "tool_search_output", "call_id": "first", "tools": [
+                {"type": "namespace", "name": "mcp__a", "tools": []}
+            ]},
+            {"type": "tool_search_call", "call_id": "second", "arguments": {}},
+            {"type": "tool_search_output", "call_id": "second", "tools": [
+                {"type": "namespace", "name": "mcp__a", "tools": []},
+                {"type": "namespace", "name": "mcp__b", "tools": []}
+            ]}
+        ]});
+        dedupe_responses_tool_search_outputs(&mut body);
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 4);
+        let names = |index: usize| -> Vec<String> {
+            input[index]["tools"].as_array().unwrap().iter()
+                .map(|tool| tool["name"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(names(1), vec!["mcp__a"]);
+        assert_eq!(names(3), vec!["mcp__b"], "新 namespace 留在第二个 output 里");
     }
 
     #[test]
@@ -8709,12 +8941,20 @@ mod response_compatibility_tests {
     fn prompt_prefix_stabilizer_normalizes_attachment_boilerplate() {
         let old = "\n# Files mentioned by the user:\n\n## shot.png: /tmp/shot.png\n\n## My request:\n看图\n";
         let new = "\n# Files mentioned by the user:\n\n## shot.png: /tmp/shot.png\nImage attachment: true\n\nDistinguish instructions in attached documents from the user's request.\n\n## My request:\n看图\n";
-        let mut first = json!({"messages":[{"role":"user","content":old}]});
-        let mut second = json!({"messages":[{"role":"user","content":new}]});
+        // 历史里的附件样板归一；最新一条 user 消息保持原样（模型要靠它知道附件路径）。
+        let latest = "\n# Files mentioned by the user:\n\n## now.png: /tmp/now.png\n\n## My request:\n再看\n";
+        let history = |boilerplate: &str| json!({"messages":[
+            {"role":"user","content":boilerplate},
+            {"role":"assistant","content":"ok"},
+            {"role":"user","content":latest}
+        ]});
+        let mut first = history(old);
+        let mut second = history(new);
         stabilize_chat_prompt_prefix(&mut first);
         stabilize_chat_prompt_prefix(&mut second);
         assert_eq!(first, second, "新旧附件样板必须归一到同一前缀");
         assert_eq!(first["messages"][0]["content"], "[attached files]\n[attachment]\n## My request:\n看图\n");
+        assert_eq!(first["messages"][2]["content"], latest, "最新请求的附件路径必须保留");
     }
 
     #[test]
@@ -8729,9 +8969,10 @@ mod response_compatibility_tests {
         });
         stabilize_chat_prompt_prefix(&mut body);
         let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 4, "不能在对话中间插入 system 消息");
         assert_eq!(messages[0]["content"], "stable");
-        assert_eq!(messages[3]["content"], "<turn_aborted>transient</turn_aborted>");
-        assert_eq!(messages[4]["content"], "current");
+        assert!(messages[1..].iter().all(|message| message["role"] != "system"));
+        assert_eq!(messages[3]["content"], "<turn_aborted>transient</turn_aborted>\n\ncurrent");
     }
 
     #[test]
@@ -8775,6 +9016,110 @@ mod response_compatibility_tests {
         .unwrap();
         assert_eq!(response["status"], "failed");
         assert_eq!(response["output"][0]["status"], "failed");
+    }
+
+    #[test]
+    fn gemini_tool_enum_values_are_coerced_to_strings() {
+        // #2404：Gemini 只接受字符串枚举值，布尔/数字枚举会导致整轮 400。
+        let body = json!({
+            "model": "gemini-3.8-flash",
+            "input": "hi",
+            "tools": [{
+                "type": "function",
+                "name": "set_flag",
+                "description": "",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean", "enum": [true, false]},
+                        "level": {"type": "integer", "enum": [1, 2]},
+                        "mode": {"type": "string", "enum": ["fast", 1]},
+                        "untyped": {"enum": [true, 2]}
+                    }
+                }
+            }]
+        });
+        let converted = responses_to_chat_completions(body).unwrap();
+        let parameters = &converted["tools"][0]["function"]["parameters"]["properties"];
+        // 非字符串类型去掉 enum、保留原类型，可选值进 description。
+        assert!(parameters["enabled"].get("enum").is_none(), "{parameters}");
+        assert_eq!(parameters["enabled"]["type"], "boolean");
+        assert_eq!(parameters["enabled"]["description"], "Allowed values: true, false");
+        assert!(parameters["level"].get("enum").is_none());
+        assert_eq!(parameters["level"]["type"], "integer");
+        assert_eq!(parameters["level"]["description"], "Allowed values: 1, 2");
+        // 字符串类型或未声明类型：非字符串值转成字符串，enum 保留。
+        assert_eq!(parameters["mode"]["enum"], json!(["fast", "1"]));
+        assert_eq!(parameters["mode"]["type"], "string");
+        assert_eq!(parameters["untyped"]["enum"], json!(["true", "2"]));
+
+        // 非 Gemini 上游保持原始 JSON Schema 语义。
+        let body = json!({
+            "model": "glm-5.3",
+            "input": "hi",
+            "tools": [{
+                "type": "function",
+                "name": "set_flag",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"enabled": {"type": "boolean", "enum": [true, false]}}
+                }
+            }]
+        });
+        let converted = responses_to_chat_completions(body).unwrap();
+        assert_eq!(
+            converted["tools"][0]["function"]["parameters"]["properties"]["enabled"]["enum"][0],
+            true
+        );
+    }
+
+    #[test]
+    fn duplicate_function_call_output_keeps_first_and_avoids_upstream_400() {
+        // #1533：历史里同一 call_id 的 tool output 出现两次时，Chat 上游会以
+        // `duplicate tool output for call_id` 拒绝整轮请求。转换后只保留第一条。
+        let body = json!({
+            "model": "glm-5.3",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "exec_command",
+                 "arguments": "{\"cmd\":\"pwd\"}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "first"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "second"}
+            ]
+        });
+        let converted = responses_to_chat_completions(body).unwrap();
+        let messages = converted["messages"].as_array().unwrap();
+        let tool_messages: Vec<_> = messages
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .collect();
+        assert_eq!(tool_messages.len(), 1, "同一 call_id 的输出只能保留一条");
+        assert_eq!(tool_messages[0]["tool_call_id"], "call_1");
+        assert_eq!(tool_messages[0]["content"], "first");
+    }
+
+    #[test]
+    fn call_id_reused_across_turns_keeps_each_turns_output() {
+        // 不返回 id 的上游每轮都由本代理生成 `call_0`；按 call_id 跨轮去重会丢掉第二轮输出。
+        let body = json!({
+            "model": "local-model",
+            "input": [
+                {"type": "message", "role": "user", "content": "turn 1"},
+                {"type": "function_call", "call_id": "call_0", "name": "exec_command", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_0", "output": "turn1-output"},
+                {"type": "message", "role": "user", "content": "turn 2"},
+                {"type": "function_call", "call_id": "call_0", "name": "exec_command", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_0", "output": "turn2-output"}
+            ]
+        });
+        let converted = responses_to_chat_completions(body).unwrap();
+        let outputs: Vec<_> = converted["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .map(|message| message["content"].clone())
+            .collect();
+        assert_eq!(outputs, vec![json!("turn1-output"), json!("turn2-output")], "{converted}");
     }
 
     #[test]
@@ -9009,6 +9354,34 @@ mod relay_custom_header_tests {
 }
 
 #[cfg(test)]
+mod protocol_proxy_port_tests {
+    use super::*;
+
+    #[test]
+    fn persisted_port_round_trips_and_rejects_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PROTOCOL_PROXY_PORT_FILE);
+        assert_eq!(read_persisted_protocol_proxy_port(&path), None);
+        persist_protocol_proxy_port(&path, 57432).unwrap();
+        assert_eq!(read_persisted_protocol_proxy_port(&path), Some(57432));
+        std::fs::write(&path, "not-a-port\n").unwrap();
+        assert_eq!(read_persisted_protocol_proxy_port(&path), None);
+        std::fs::write(&path, "0\n").unwrap();
+        assert_eq!(read_persisted_protocol_proxy_port(&path), None);
+    }
+
+    #[test]
+    fn persisted_port_is_used_when_env_is_absent() {
+        // 环境变量优先级由 env_protocol_proxy_port 单独覆盖；这里验证持久化值
+        // 确实参与了 protocol_proxy_port 的解析。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PROTOCOL_PROXY_PORT_FILE);
+        persist_protocol_proxy_port(&path, 57555).unwrap();
+        assert_eq!(read_persisted_protocol_proxy_port(&path), Some(57555));
+    }
+}
+
+#[cfg(test)]
 mod exec_retry_after_tests {
     use super::*;
     use reqwest::header::{HeaderMap, RETRY_AFTER};
@@ -9095,12 +9468,38 @@ pub(crate) struct ResponsesSseTransformer {
     completed: bool,
     failed: bool,
     failure: Option<String>,
+    /// 当前事件已超过缓冲上限，正在原样透传；值为从事件开头识别出的类型。
+    passthrough_event: Option<String>,
+    /// 请求把 `apply_patch` 声明成了 function 工具：此时 JSON 参数就是正确格式，不能解包。
+    apply_patch_declared_as_function: bool,
 }
 
-/// SSE 事件最大字节数（4 MiB），超限则 fail closed。
+/// 单个事件参与改写的最大缓冲字节数（4 MiB）。
+///
+/// 改写只针对 `apply_patch` 的 output_item.done，这类事件很小；超过上限的事件
+/// （典型是高分辨率生图的 base64、在 response.completed 里回显的 output）一律
+/// 原样透传，不能截断：过去在这里 fail closed 会让客户端收不到终态事件，
+/// Codex 按断流重试，每次重新生图并重复计费。
 const RESPONSES_SSE_MAX_EVENT_BYTES: usize = 4 * 1024 * 1024;
 
 impl ResponsesSseTransformer {
+    /// 按原始请求声明的工具形态创建：只有 freeform（custom）的 `apply_patch`
+    /// 才需要把被模型包成 JSON 的输入解包回补丁文本。
+    pub(crate) fn for_request(request: Option<&Value>) -> Self {
+        let apply_patch_declared_as_function = request
+            .and_then(|request| request.get("tools"))
+            .and_then(Value::as_array)
+            .is_some_and(|tools| {
+                tools.iter().any(|tool| {
+                    tool.get("type").and_then(Value::as_str) == Some("function")
+                        && (tool.get("name").and_then(Value::as_str) == Some("apply_patch")
+                            || tool.pointer("/function/name").and_then(Value::as_str)
+                                == Some("apply_patch"))
+                })
+            });
+        Self { apply_patch_declared_as_function, ..Self::default() }
+    }
+
     /// Push upstream bytes; returns bytes ready to write to the client.
     pub(crate) fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
         // 失败是终态：不再累积、分帧或转发后续字节，否则被截断事件的后半段
@@ -9110,26 +9509,52 @@ impl ResponsesSseTransformer {
         }
         let mut out = Vec::new();
         for &byte in bytes {
-            if self.buf.len() >= RESPONSES_SSE_MAX_EVENT_BYTES {
-                // 丢弃已累积的残片并锁定终态；本次 chunk 中此前已完整分帧的事件
-                // 仍然有效，照常返回给调用方转发。
-                self.fail(format!(
-                    "Responses SSE 事件超过 {} 字节上限",
-                    RESPONSES_SSE_MAX_EVENT_BYTES
-                ));
-                return out;
-            }
-            self.buf.push(byte);
             self.event_tail.rotate_left(1);
             self.event_tail[3] = byte;
-            if self.event_tail.ends_with(b"\n\n") || self.event_tail == *b"\r\n\r\n" {
+            let boundary =
+                self.event_tail.ends_with(b"\n\n") || self.event_tail == *b"\r\n\r\n";
+            if self.passthrough_event.is_some() {
+                out.push(byte);
+                if boundary {
+                    self.event_tail = [0; 4];
+                    let event_type = self.passthrough_event.take().unwrap_or_default();
+                    self.observe_event_type(&event_type);
+                    if self.failed {
+                        return out;
+                    }
+                }
+                continue;
+            }
+            self.buf.push(byte);
+            if boundary {
                 let event: Vec<u8> = self.buf.drain(..).collect();
                 self.event_tail = [0; 4];
                 let processed = self.process_event(&event);
                 out.extend_from_slice(&processed);
+                if self.failed {
+                    return out;
+                }
+            } else if self.buf.len() >= RESPONSES_SSE_MAX_EVENT_BYTES {
+                // 超大事件：识别类型后把已缓冲部分连同后续字节原样转发到事件边界。
+                self.passthrough_event = Some(sse_event_type_from_prefix(&self.buf));
+                out.append(&mut self.buf);
             }
         }
         out
+    }
+
+    fn observe_event_type(&mut self, event_type: &str) {
+        match event_type {
+            "response.completed" => self.completed = true,
+            "response.failed" => {
+                self.fail("原生 Responses 上游返回 response.failed".to_string())
+            }
+            "response.incomplete" => {
+                self.fail("原生 Responses 上游返回 response.incomplete".to_string())
+            }
+            "error" => self.fail("原生 Responses 上游返回 error 事件".to_string()),
+            _ => {}
+        }
     }
 
     /// 是否已进入失败终态。转发层应在每个 chunk 后检查，以便在上游保持连接时
@@ -9191,24 +9616,14 @@ impl ResponsesSseTransformer {
             .or(sse_event_name);
         let event_type = event_type_owned.as_deref().unwrap_or("");
         
-        match event_type {
-            "response.completed" => self.completed = true,
-            "response.failed" => {
-                self.fail("原生 Responses 上游返回 response.failed".to_string())
-            }
-            "response.incomplete" => {
-                self.fail("原生 Responses 上游返回 response.incomplete".to_string())
-            }
-            "error" => self.fail("原生 Responses 上游返回 error 事件".to_string()),
-            _ => {}
-        }
+        self.observe_event_type(event_type);
 
         if event_type != "response.output_item.done" {
             return event_bytes.to_vec();
         }
 
         let mut modified = data_json.clone();
-        if !transform_apply_patch_item(&mut modified) {
+        if !transform_apply_patch_item(&mut modified, self.apply_patch_declared_as_function) {
             return event_bytes.to_vec();
         }
 
@@ -9219,6 +9634,26 @@ impl ResponsesSseTransformer {
         replace_sse_data_line(event_str, &new_data).into_bytes()
     }
 }
+/// 从超大事件的开头识别类型：优先 `event:` 行，否则取 data JSON 里第一个 `"type"`。
+/// OpenAI 的 Responses SSE 两者都放在事件最前面。
+fn sse_event_type_from_prefix(prefix: &[u8]) -> String {
+    let head = String::from_utf8_lossy(&prefix[..prefix.len().min(4096)]);
+    if let Some(name) = head
+        .lines()
+        .find_map(|line| strip_sse_field(line, "event"))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        return name.to_string();
+    }
+    head.split_once("\"type\"")
+        .and_then(|(_, rest)| rest.trim_start().strip_prefix(':'))
+        .and_then(|rest| rest.trim_start().strip_prefix('"'))
+        .and_then(|rest| rest.split_once('"'))
+        .map(|(value, _)| value.to_string())
+        .unwrap_or_default()
+}
+
 fn extract_sse_data(event_str: &str) -> Option<String> {
     let mut parts = Vec::new();
     for line in event_str.lines() {
@@ -9273,7 +9708,7 @@ fn replace_sse_data_line(event_str: &str, new_data_json: &str) -> String {
     result
 }
 
-fn transform_apply_patch_item(json: &mut Value) -> bool {
+fn transform_apply_patch_item(json: &mut Value, declared_as_function: bool) -> bool {
     let item = match json.get_mut("item") {
         Some(i) => i,
         None => {
@@ -9288,11 +9723,13 @@ fn transform_apply_patch_item(json: &mut Value) -> bool {
         return false;
     }
     let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    
-    let is_apply_patch = name == "apply_patch"
-        || name.starts_with("apply_patch_")
-        || name.contains("apply_patch");
-    if !is_apply_patch {
+    // 只认精确的 `apply_patch`：子串匹配会命中 `mcp__gh__apply_patch_to_pr` 这类
+    // MCP 工具，把它们的 JSON 参数改成非 JSON 文本，工具调用直接报废。
+    if name != "apply_patch" {
+        return false;
+    }
+    // function 形态的 apply_patch 要求 arguments 是 `{"input": ...}` JSON，原样保留。
+    if declared_as_function && item_type == Some("function_call") {
         return false;
     }
     
@@ -9603,51 +10040,90 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","name":
         assert!(t.finish().is_none(), "data type should take priority");
     }
 
+    /// 构造一个超过缓冲上限的事件（模拟高分辨率生图的 base64）。
+    fn oversized_event(event_type: &str, secret: &str) -> Vec<u8> {
+        let mut event = format!("event: {event_type}\ndata:{{\"type\":\"{event_type}\",\"note\":\"{secret}\",\"image\":\"").into_bytes();
+        event.extend_from_slice(&vec![b'A'; RESPONSES_SSE_MAX_EVENT_BYTES + 1024]);
+        event.extend_from_slice(b"\"}\n\n");
+        event
+    }
+
     #[test]
-    fn test_event_size_limit_fail_closed() {
+    fn apply_patch_unwrap_skips_mcp_tools_and_function_declared_apply_patch() {
+        let wrapped = |kind: &str, name: &str| {
+            format!("data:{{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"type\":\"{kind}\",\"name\":\"{name}\",\"arguments\":\"{{\\\"input\\\":\\\"*** Begin Patch\\\\n+hi\\\\n*** End Patch\\\"}}\"}}}}\n\n")
+        };
+        // MCP 工具名里带 apply_patch 也不能被改写。
+        let mcp = wrapped("function_call", "mcp__gh__apply_patch_to_pr");
+        let mut t = ResponsesSseTransformer::for_request(None);
+        assert_eq!(t.push_bytes(mcp.as_bytes()), mcp.as_bytes());
+
+        // 声明成 function 的 apply_patch：JSON 参数就是正确格式。
+        let function_request = json!({"tools": [{"type": "function", "name": "apply_patch", "parameters": {}}]});
+        let event = wrapped("function_call", "apply_patch");
+        let mut t = ResponsesSseTransformer::for_request(Some(&function_request));
+        assert_eq!(t.push_bytes(event.as_bytes()), event.as_bytes());
+
+        // 声明成 custom（freeform）时照旧解包（PR #2483 的场景）。
+        let custom_request = json!({"tools": [{"type": "custom", "name": "apply_patch"}]});
+        let mut t = ResponsesSseTransformer::for_request(Some(&custom_request));
+        let out = String::from_utf8(t.push_bytes(event.as_bytes())).unwrap();
+        assert!(!out.contains("\\\"input\\\""), "{out}");
+        assert!(out.contains("*** Begin Patch"), "{out}");
+    }
+
+    #[test]
+    fn oversized_completed_event_is_forwarded_intact_and_completes_the_stream() {
+        // 超大事件不能截断：过去 fail closed 会让客户端收不到 response.completed，
+        // Codex 按断流重试，每次重新生图、重复计费。
         let mut t = ResponsesSseTransformer::default();
-        let chunk = vec![b'a'; 1024];
-        for _ in 0..(RESPONSES_SSE_MAX_EVENT_BYTES / 1024 + 10) {
-            t.push_bytes(&chunk);
+        let event = oversized_event("response.completed", "x");
+        let mut out = Vec::new();
+        for chunk in event.chunks(64 * 1024) {
+            out.extend(t.push_bytes(chunk));
         }
-        assert!(t.has_failed(), "oversized event must lock the failed terminal state");
-        let result = t.finish();
-        assert!(result.is_some(), "should fail closed on oversized event");
-        let reason = result.unwrap_or_default();
-        assert!(reason.contains("上限"), "unexpected failure reason: {}", reason);
+        assert_eq!(out, event, "超大事件必须逐字节原样转发");
+        assert!(!t.has_failed());
+        assert!(t.finish().is_none(), "超大的 response.completed 仍要被识别为完成");
     }
 
     #[test]
-    fn test_overflow_is_terminal_across_chunks() {
-        // 跨 chunk 回归：先推 4 MiB + 1 个不含分隔符的字节触发上限，
-        // 再推一条完整的工具事件，它绝不能被转发（否则客户端会收到残片后续）。
-        let mut t = ResponsesSseTransformer::default();
-        let mut oversized = vec![b'a'; RESPONSES_SSE_MAX_EVENT_BYTES];
-        oversized.push(b'b');
-        t.push_bytes(&oversized);
-        assert!(t.has_failed(), "overflow must be a terminal state");
-
-        let tool_event = b"data:{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"arguments\":\"{\\\"input\\\":\\\"*** Begin Patch\\\\n+hello\\\\n*** End Patch\\\"}\"}}\n\n";
-        let out = t.push_bytes(tool_event);
-        assert!(out.is_empty(), "no bytes may be forwarded after overflow, got: {:?}", String::from_utf8_lossy(&out));
-
-        let completed = b"data:{\"type\":\"response.completed\"}\n\n";
-        assert!(t.push_bytes(completed).is_empty(), "completed event must not be forwarded after overflow");
-
-        let reason = t.finish().unwrap_or_default();
-        assert!(reason.contains("上限"), "overflow failure must win over completed, got: {}", reason);
-    }
-
-    #[test]
-    fn test_overflow_keeps_already_framed_events() {
-        // 超限前已完整分帧的合法事件仍应转发；只有被截断的那个事件被丢弃。
+    fn events_around_an_oversized_event_keep_their_order_and_transforms() {
         let mut t = ResponsesSseTransformer::default();
         let good = b"data:{\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n";
+        let big = oversized_event("response.output_item.done", "img");
+        let tool_event = b"data:{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"custom_tool_call\",\"name\":\"apply_patch\",\"input\":\"{\\\"input\\\":\\\"*** Begin Patch\\\\n+hello\\\\n*** End Patch\\\"}\"}}\n\n";
+        let completed = b"data:{\"type\":\"response.completed\"}\n\n";
         let mut payload = good.to_vec();
-        payload.extend_from_slice(&vec![b'a'; RESPONSES_SSE_MAX_EVENT_BYTES + 1]);
-        let out = t.push_bytes(&payload);
-        assert_eq!(&out[..], &good[..], "events framed before overflow must still be forwarded");
+        payload.extend_from_slice(&big);
+        let mut out = t.push_bytes(&payload);
+        out.extend(t.push_bytes(tool_event));
+        out.extend(t.push_bytes(completed));
+        assert!(out.starts_with(good), "超大事件之前的事件照常转发");
+        assert_eq!(&out[good.len()..good.len() + big.len()], &big[..], "超大事件原样转发");
+        let tail = String::from_utf8_lossy(&out[good.len() + big.len()..]).to_string();
+        assert!(tail.contains("*** Begin Patch\\n+hello"), "超大事件之后的 apply_patch 事件仍被改写：{tail}");
+        assert!(tail.ends_with("data:{\"type\":\"response.completed\"}\n\n"));
+        assert!(t.finish().is_none());
+    }
+
+    #[test]
+    fn oversized_failure_event_is_reported_without_leaking_payload() {
+        let mut t = ResponsesSseTransformer::default();
+        let event = oversized_event("response.failed", "secret-upstream-content");
+        let out = t.push_bytes(&event);
+        assert_eq!(out, event, "失败事件本身也要交给客户端");
         assert!(t.has_failed());
+        let reason = t.finish().expect("超大的 response.failed 要报失败");
+        assert!(reason.contains("response.failed"), "{reason}");
+        assert!(!reason.contains("secret-upstream-content"), "{reason}");
+    }
+
+    #[test]
+    fn event_type_is_read_from_prefix_with_or_without_event_line() {
+        assert_eq!(sse_event_type_from_prefix(b"event: response.completed\ndata:{\"type\":\"x\""), "response.completed");
+        assert_eq!(sse_event_type_from_prefix(b"data: { \"type\" : \"error\", \"a\": 1"), "error");
+        assert_eq!(sse_event_type_from_prefix(b"data:{\"image\":\"AAAA"), "");
     }
 
     #[test]
@@ -9691,19 +10167,72 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","name":
             reason
         );
     }
+}
 
-    #[test]
-    fn test_overflow_reason_does_not_leak_payload() {
-        let mut t = ResponsesSseTransformer::default();
-        let mut oversized = b"data:{\"output\":\"secret-upstream-content".to_vec();
-        oversized.extend_from_slice(&vec![b'y'; RESPONSES_SSE_MAX_EVENT_BYTES]);
-        t.push_bytes(&oversized);
-        let reason = t.finish().expect("overflow must be reported as failure");
-        assert!(reason.contains("上限"), "unexpected reason: {}", reason);
-        assert!(
-            !reason.contains("secret-upstream-content"),
-            "overflow reason must not leak buffered payload: {}",
-            reason
-        );
+#[cfg(test)]
+mod parallel_tool_call_pairing_tests {
+    use super::*;
+
+    /// #2185：同一轮并行两个带图片的 view_image 与一个 exec 之后，出站请求里每个
+    /// 工具输出都必须仍能找到对应调用；exec 适配器只改写 exec 那一对。
+    #[tokio::test]
+    async fn parallel_image_custom_tool_calls_keep_pairing_on_responses_path() {
+        let relay = crate::settings::RelayProfile {
+            protocol: RelayProtocol::Responses,
+            base_url: "https://relay.example.test/v1".into(),
+            api_key: "sk-test".into(),
+            ..Default::default()
+        };
+        let image_output = json!([
+            {"type": "input_text", "text": "img"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+        ]);
+        let body = json!({"model": "gpt-5.6-sol", "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "look"}]},
+            {"type": "custom_tool_call", "id": "ctc_a", "call_id": "call_a", "name": "view_image", "input": "a.png"},
+            {"type": "custom_tool_call", "id": "ctc_b", "call_id": "call_b", "name": "view_image", "input": "b.png"},
+            {"type": "custom_tool_call", "id": "ctc_c", "call_id": "call_c", "name": "exec", "input": "ls"},
+            {"type": "custom_tool_call_output", "id": "ctco_a", "call_id": "call_a", "output": image_output.clone()},
+            {"type": "custom_tool_call_output", "id": "ctco_b", "call_id": "call_b", "output": image_output},
+            {"type": "custom_tool_call_output", "id": "ctco_c", "call_id": "call_c", "output": "ok"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]}
+        ], "tools": [{"type": "custom", "name": "view_image"}, {"type": "custom", "name": "exec"}]});
+
+        let (_, out, _, _) =
+            upstream_request_parts(&relay, body, "/v1/responses", None, false, None)
+                .await
+                .unwrap();
+        assert_pairing(&out, 3);
+        let adapted = crate::responses_exec::adapt_request(out).unwrap();
+        assert_pairing(&adapted, 3);
+        let input = adapted["input"].as_array().unwrap();
+        assert_eq!(input[4]["type"], "custom_tool_call_output", "图片输出不应被改成 function_call_output");
+        assert_eq!(input[6]["type"], "function_call_output");
+    }
+
+    fn assert_pairing(body: &Value, expected: usize) {
+        let input = body["input"].as_array().unwrap();
+        let ids = |suffix: &str| -> Vec<(String, String)> {
+            input
+                .iter()
+                .filter_map(|item| {
+                    let kind = item["type"].as_str()?;
+                    kind.ends_with(suffix).then(|| {
+                        (kind.to_string(), item["call_id"].as_str().unwrap_or("").to_string())
+                    })
+                })
+                .collect()
+        };
+        let calls = ids("_call");
+        let outputs = ids("_output");
+        assert_eq!(calls.len(), expected, "{body}");
+        assert_eq!(outputs.len(), expected, "{body}");
+        for (kind, call_id) in &outputs {
+            let call_kind = kind.trim_end_matches("_output");
+            assert!(
+                calls.iter().any(|(k, id)| id == call_id && k == call_kind),
+                "{kind} {call_id} 找不到同类型调用：{body}"
+            );
+        }
     }
 }

@@ -23,9 +23,11 @@ fn apply_configured_ca_certificate(
     Ok(builder)
 }
 
-fn build_proxied_client(
+fn build_proxied_client_with_timeouts(
     user_agent: &str,
     proxy_override: Option<&str>,
+    connect_timeout: Option<std::time::Duration>,
+    total_timeout: Option<std::time::Duration>,
 ) -> anyhow::Result<reqwest::Client> {
     let ua = if user_agent.trim().is_empty() {
         format!("CodexPlusPlus/{}", env!("CARGO_PKG_VERSION"))
@@ -33,6 +35,12 @@ fn build_proxied_client(
         user_agent.trim().to_string()
     };
     let mut builder = reqwest::Client::builder().user_agent(ua);
+    if let Some(timeout) = connect_timeout {
+        builder = builder.connect_timeout(timeout);
+    }
+    if let Some(timeout) = total_timeout {
+        builder = builder.timeout(timeout);
+    }
     if let Some(proxy) = proxy_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -46,6 +54,28 @@ fn build_proxied_client(
         builder = builder.proxy(reqwest::Proxy::all(proxy)?);
     }
     Ok(apply_configured_ca_certificate(builder)?.build()?)
+}
+
+fn build_proxied_client(
+    user_agent: &str,
+    proxy_override: Option<&str>,
+) -> anyhow::Result<reqwest::Client> {
+    build_proxied_client_with_timeouts(user_agent, proxy_override, None, None)
+}
+
+/// 走系统代理 / 环境变量代理的 client，并显式指定连接与总超时。
+/// 更新下载、插件市场索引这类外部请求都应走这里（#1329）。
+pub fn proxied_client_with_timeouts(
+    user_agent: &str,
+    connect_timeout: std::time::Duration,
+    total_timeout: std::time::Duration,
+) -> anyhow::Result<reqwest::Client> {
+    build_proxied_client_with_timeouts(
+        user_agent,
+        None,
+        Some(connect_timeout),
+        Some(total_timeout),
+    )
 }
 
 pub fn proxied_client(user_agent: &str) -> anyhow::Result<reqwest::Client> {
