@@ -370,13 +370,23 @@ const STREAM_RETRY_PEEK_MAX_WAIT: Duration = Duration::from_secs(120);
 /// 预读 200 SSE 开头后的结果。
 enum StreamStartPeek {
     /// 放行：`prefix` 是已经读出的字节，必须原样写给 Codex，剩余部分继续流式转发。
-    Forward(Vec<u8>),
+    Forward {
+        prefix: Vec<u8>,
+        first_output_at_ms: Option<u64>,
+    },
     /// 在产生任何输出前收到终态失败（response.failed / incomplete / error）。
     Failed {
         prefix: Vec<u8>,
         code: Option<String>,
         message: Option<String>,
     },
+}
+
+fn current_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// 只有「还没有开始产出可见内容」的事件才按住不发。
@@ -512,19 +522,29 @@ async fn peek_responses_stream_start(upstream: &mut reqwest::Response) -> Stream
     let started = Instant::now();
     let mut buffered: Vec<u8> = Vec::new();
     let mut scanned = 0usize;
+    let mut first_output_at_ms: Option<u64> = None;
     loop {
         if buffered.len() > STREAM_RETRY_PEEK_MAX_BYTES {
-            return StreamStartPeek::Forward(buffered);
+            return StreamStartPeek::Forward {
+                prefix: buffered,
+                first_output_at_ms,
+            };
         }
         let remaining = STREAM_RETRY_PEEK_MAX_WAIT.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            return StreamStartPeek::Forward(buffered);
+            return StreamStartPeek::Forward {
+                prefix: buffered,
+                first_output_at_ms,
+            };
         }
         let chunk = match tokio::time::timeout(remaining, upstream.chunk()).await {
             Ok(Ok(Some(chunk))) => chunk,
             // EOF、读失败或超时：没有足够证据重试，原样放行已缓冲前缀。
             Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
-                return StreamStartPeek::Forward(buffered);
+                return StreamStartPeek::Forward {
+                    prefix: buffered,
+                    first_output_at_ms,
+                };
             }
         };
         buffered.extend_from_slice(&chunk);
@@ -534,6 +554,10 @@ async fn peek_responses_stream_start(upstream: &mut reqwest::Response) -> Stream
             let Some(event) = sse_block_type(&block) else {
                 continue;
             };
+            let event_at_ms = current_epoch_ms();
+            if !is_pre_output_stream_event(&event) && first_output_at_ms.is_none() {
+                first_output_at_ms = Some(event_at_ms);
+            }
             if stream_event_is_retry_safe(&block, &event) {
                 continue;
             }
@@ -549,7 +573,10 @@ async fn peek_responses_stream_start(upstream: &mut reqwest::Response) -> Stream
                 };
             }
             // 出现任何真正的输出事件：立即放行，后续流不再延迟。
-            return StreamStartPeek::Forward(buffered);
+            return StreamStartPeek::Forward {
+                prefix: buffered,
+                first_output_at_ms,
+            };
         }
     }
 }
@@ -3567,7 +3594,15 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             && auto_retry.is_some()
         {
             match peek_responses_stream_start(&mut upstream).await {
-                StreamStartPeek::Forward(prefix) => stream_prefix = prefix,
+                StreamStartPeek::Forward {
+                    prefix,
+                    first_output_at_ms,
+                } => {
+                    stream_prefix = prefix;
+                    if first_output_at_ms.is_some() {
+                        request_trace.first_output_at_ms = first_output_at_ms;
+                    }
+                }
                 StreamStartPeek::Failed {
                     prefix,
                     code,

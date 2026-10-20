@@ -2291,6 +2291,10 @@ impl ProxyRequestLog {
             self.entry.attempts = trace.attempts;
             self.entry.auto_retries = trace.auto_retries;
             self.entry.retry_reasons = trace.retry_reasons.clone();
+            if let Some(first_output_at_ms) = trace.first_output_at_ms {
+                self.entry.first_token_ms =
+                    Some(first_output_at_ms.saturating_sub(self.entry.started_at_ms));
+            }
         }
     }
 

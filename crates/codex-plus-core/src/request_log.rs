@@ -53,6 +53,9 @@ pub struct RequestTrace {
     pub attempts: u32,
     /// 代理自动重试次数（不含成员间失败切换）。
     pub auto_retries: u32,
+    /// 上游第一段输出到达的 unix 毫秒时间（用于计算首字耗时）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_output_at_ms: Option<u64>,
     #[serde(default)]
     pub retry_reasons: Vec<String>,
 }
