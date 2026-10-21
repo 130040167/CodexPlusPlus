@@ -184,7 +184,10 @@ pub(crate) fn managed_protocol_proxy_base_urls() -> Vec<String> {
     // 即使显式环境覆盖了当前端口，之前持久化的端口也仍是本工具写入过的值。
     ports.extend(read_persisted_protocol_proxy_port(&path));
     ports.extend(crate::proxy_continuity::ProxyEndpoints::current().ports_for_restore());
-    ports.into_iter().map(local_responses_proxy_base_url).collect()
+    ports
+        .into_iter()
+        .map(local_responses_proxy_base_url)
+        .collect()
 }
 
 pub(crate) fn is_managed_protocol_proxy_base_url(value: &str) -> bool {
