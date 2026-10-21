@@ -1,4 +1,4 @@
-import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { startTransition, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ArrowDownAZ, ArrowDownZA, ArrowLeft, ArrowRight, BookOpen, ChevronDown, ChevronsDownUp, ChevronsUpDown, Copy, Edit3, ExternalLink, GripVertical, History, Link, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
 import { closestCenter, DndContext, KeyboardSensor, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
@@ -11,12 +11,22 @@ import "./ManagementPages.css";
 import { parseSkillRepository } from "./skill-repository";
 import { SkillListViewport } from "./SkillListViewport";
 import { moveSkillGroup, orderedSkillGroups, readSkillGroups } from "./skill-groups";
+import { updatableSkills } from "./skill-updates";
+import { createSkillUpdateQueue } from "./skill-update-queue";
 
 type Result = { status: string; message: string };
 type Notify = (title: string, message: string, status?: "ok" | "failed") => Promise<void>;
 type Skill = { id: string; name: string; description: string; repoKey: string; repoPath?: string; localPath?: string; installed: boolean; enabled: boolean; bundled: boolean; plugin?: boolean; updateAvailable: boolean; localDifference?: boolean; comparisonError?: string };
 type Repo = { owner: string; name: string; branch: string; subdir: string; enabled: boolean };
 type SkillPayload = Result & { skills: Skill[]; repos: Repo[]; repositorySkills: Skill[]; repoCounts: Record<string, number>; repoErrors: string[]; skillsDir: string; codexSkillsDir: string };
+let skillPageView: {
+  data: SkillPayload | null; tab: "discover" | "installed"; query: string;
+  expandedGroups: Set<string>; nameSort: "asc" | "desc" | null;
+} = { data: null, tab: "installed", query: "", expandedGroups: new Set(), nameSort: null };
+let skillPageScrollTop = 0;
+const skillGroupScroll = new Map<string, number>();
+const skillUpdateQueue = createSkillUpdateQueue<SkillPayload>((skill) =>
+  invoke<SkillPayload>("update_skill", { repoKey: skill.repoKey, id: skill.id }));
 type RepoInspection = Result & { repo: Repo; skills: Skill[]; skillCount: number };
 type OriginCandidate = { repo: Repo; skill: { id: string; name: string; repoPath: string }; evidence: string; exactMatch?: boolean };
 type OriginInspection = Result & { candidates: OriginCandidate[] };
@@ -308,45 +318,70 @@ function SkillDetailDrawer({ skill, count, onClose, onOpenUrl, onOpenRepo, group
   </ManagementDrawer>;
 }
 export function SkillsPage({ notify }: { notify: Notify }) {
-  const [data, setData] = useState<SkillPayload | null>(null);
-  const [tab, setTab] = useState<"discover" | "installed">("discover");
-  const [query, setQuery] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [data, setData] = useState<SkillPayload | null>(skillPageView.data);
+  const [tab, setTab] = useState<"discover" | "installed">(skillPageView.tab);
+  const [query, setQuery] = useState(skillPageView.query);
+  const [mutationBusy, setBusy] = useState(false);
+  const updateSnapshot = useSyncExternalStore(skillUpdateQueue.subscribe, skillUpdateQueue.getSnapshot);
+  const busy = mutationBusy || updateSnapshot.active;
+  const currentUpdate = updateSnapshot.tasks.find((task) => task.state === "running");
+  const waitingUpdates = updateSnapshot.tasks.filter((task) => task.state === "queued").length;
+  const updateFailures = updateSnapshot.tasks.filter((task) => task.state === "failed");
+  useEffect(() => {
+    if (updateSnapshot.result) setData(updateSnapshot.result);
+  }, [updateSnapshot.result]);
   const [repoOpen, setRepoOpen] = useState(false);
   const [detail, setDetail] = useState<Skill | null>(null);
   const detailRef = useRef(detail);
   detailRef.current = detail;
   const [repoSelection, setRepoSelection] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  const [refreshing, setRefreshing] = useState(false);
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set(skillPageView.expandedGroups));
   const [storedGroups] = useState(() => readSkillGroups(localStorage.getItem(SKILL_GROUP_STORAGE_KEY)));
   const [customGroupNames, setCustomGroupNames] = useState(storedGroups.names);
   const [customGroupAssignments, setCustomGroupAssignments] = useState(storedGroups.assignments);
   const [groupOrder, setGroupOrder] = useState(storedGroups.order);
-  const [nameSort, setNameSort] = useState<"asc" | "desc" | null>(null);
+  const [nameSort, setNameSort] = useState<"asc" | "desc" | null>(skillPageView.nameSort);
   const contentRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    skillPageView = { data, tab, query, expandedGroups, nameSort };
+  }, [data, tab, query, expandedGroups, nameSort]);
+  useLayoutEffect(() => {
+    if (contentRef.current) contentRef.current.scrollTop = skillPageScrollTop;
+  }, []);
   const [groupDialog, setGroupDialog] = useState<{ mode: "create" | "rename" | "delete"; name: string } | null>(null);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }), useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }));
   useEffect(() => {
     localStorage.setItem(SKILL_GROUP_STORAGE_KEY, JSON.stringify({ names: customGroupNames, assignments: customGroupAssignments, order: groupOrder }));
   }, [customGroupNames, customGroupAssignments, groupOrder]);
   const load = async (command = "refresh_skill_catalog") => {
-    setLoading(true);
+    const setPending = command === "refresh_skill_catalog" ? setRefreshing : setLoading;
+    setPending(true);
+    const previousUpdateResult = skillUpdateQueue.getSnapshot().result;
     try {
       const r = await invoke<SkillPayload>(command);
-      startTransition(() => setData(r));
+      if (skillUpdateQueue.getSnapshot().result === previousUpdateResult) {
+        startTransition(() => setData(r));
+      } else if (command === "refresh_skill_catalog") {
+        const beforeRead = skillUpdateQueue.getSnapshot().result;
+        const latest = await invoke<SkillPayload>("list_installed_skills");
+        if (skillUpdateQueue.getSnapshot().result === beforeRead) {
+          startTransition(() => setData({ ...latest, repoErrors: r.repoErrors }));
+        }
+      }
       if (!ok(r)) await notify("Skills", r.message, "failed");
     } catch (e) {
       await notify("Skills", String(e), "failed");
     } finally {
-      setLoading(false);
+      setPending(false);
     }
   };
   useEffect(() => {
     let active = true;
     void (async () => {
       await load("list_installed_skills");
-      if (active) await load();
+      if (active && !skillUpdateQueue.getSnapshot().active) await load();
     })();
     return () => { active = false; };
   }, []);
@@ -389,6 +424,7 @@ export function SkillsPage({ notify }: { notify: Notify }) {
       setBusy(false);
     }
   };
+  const updateGroup = (source: string, skills: Skill[]) => skillUpdateQueue.enqueue(source, updatableSkills(skills));
   const resolveVersions = async (versionSkills: Skill[], keepLocal: boolean) => {
     setBusy(true);
     try {
@@ -439,7 +475,7 @@ export function SkillsPage({ notify }: { notify: Notify }) {
       const updated = result.skills.find((skill) => skill.id === detail.id);
       if (updated && detailRef.current?.id === detail.id) setDetail(updated);
       setCustomGroupAssignments((old) => { const next = { ...old }; delete next[detail.id]; return next; });
-      setCollapsedGroups((old) => { const next = new Set(old); if (updated) next.delete(sourceGroup(updated)); return next; });
+      setExpandedGroups((old) => { const next = new Set(old); if (updated) next.add(sourceGroup(updated)); return next; });
       await notify("Skills", result.message, "ok");
       return true;
     } catch (error) {
@@ -500,10 +536,18 @@ export function SkillsPage({ notify }: { notify: Notify }) {
       setCustomGroupAssignments((old) => Object.fromEntries(Object.entries(old).filter(([, group]) => group !== name)));
       setGroupOrder(allGroupNames.filter((item) => item !== name));
     }
-    setCollapsedGroups((old) => { const next = new Set(old); next.delete(name); return next; });
+    setExpandedGroups((old) => {
+      const next = new Set(old);
+      next.delete(name);
+      if (mode !== "delete") next.add(normalized);
+      return next;
+    });
     setGroupDialog(null);
   };
-  const renderSkillRow = (s: Skill) => <div className="mg-skill-row" key={s.repoKey + ":" + s.id}>
+  const renderSkillRow = (s: Skill) => {
+    const task = updateSnapshot.tasks.find((task) => task.id === s.id && task.repoKey === s.repoKey);
+    const pending = task?.state === "running" || task?.state === "queued";
+    return <div className="mg-skill-row" key={s.repoKey + ":" + s.id}>
     <button type="button" className="mg-skill-name" onClick={() => setDetail(s)}>
       <strong title={s.name || s.id}>{s.name || s.id}</strong>
       <small title={s.localPath || s.description}>{ambiguousSkillNames.has(`${s.repoKey}:${s.name.toLowerCase()}`) ? s.localPath || s.repoPath || s.description : s.description || t("暂无描述")}</small>
@@ -524,14 +568,15 @@ export function SkillsPage({ notify }: { notify: Notify }) {
       {s.installed ? <>
         {s.localDifference && <SkillVersionMenu label={tf("保留版本：{0}", [s.name || s.id])} disabled={busy} onSelect={(keepLocal) => void resolveVersions([s], keepLocal)}/>}
         {s.comparisonError && <span className="mg-warning" title={s.comparisonError}>{t("比较失败")}</span>}
-        {s.updateAvailable && <Button onClick={() => void run("update_skill", { repoKey: s.repoKey, id: s.id })} disabled={busy || !!s.localDifference || !!s.comparisonError}><RefreshCw size={13}/>{t("更新")}</Button>}
+        {(s.updateAvailable || pending) && <Button onClick={() => updateGroup(customGroupAssignments[s.id] || sourceGroup(s), [s])} disabled={mutationBusy || !!s.localDifference || !!s.comparisonError || pending}><RefreshCw size={13} className={task?.state === "running" ? "mg-skill-update-spin" : undefined}/>{task?.state === "running" ? t("更新中") : task?.state === "queued" ? t("已排队") : t("更新")}</Button>}
         {!s.bundled && !s.plugin && <Button onClick={() => void run("uninstall_skill", { id: s.id })} disabled={busy}>{t("卸载")}</Button>}
       </> : !s.bundled && <Button primary onClick={() => void run("install_skill", { repoKey: s.repoKey, id: s.id })} disabled={busy}>{t("安装")}</Button>}
     </div>
   </div>;
+  };
   return <div className="mg-page mg-skills-page">
     <Header icon={<BookOpen size={20}/>} title="Skills" actions={<>
-      <Button onClick={() => void load()} disabled={busy || loading}><RefreshCw size={14}/>{t("刷新目录")}</Button>
+      <Button onClick={() => void load()} disabled={busy || loading || refreshing}><RefreshCw size={14} className={refreshing ? "mg-skill-update-spin" : undefined}/>{refreshing ? t("正在检查…") : t("刷新目录")}</Button>
       <Button onClick={() => void run("import_ccs_skills", {})} disabled={busy}><BookOpen size={14}/>{t("从 cc-switch 导入")}</Button>
       <Button onClick={() => setRepoOpen(true)}><Link size={14}/>{t("管理仓库")}</Button>
     </>} />
@@ -544,15 +589,23 @@ export function SkillsPage({ notify }: { notify: Notify }) {
       <Button onClick={createCustomGroup}><Plus size={14}/>{t("新建分组")}</Button>
       <button type="button" className="mg-icon-button" aria-label={t("按名称排序")} data-direction={nameSort || "none"} title={nameSort === "asc" ? t("按名称排序：Z–A") : t("按名称排序：A–Z")} disabled={allGroupNames.length < 2} onClick={() => { const direction = nameSort === "asc" ? "desc" : "asc"; setNameSort(direction); setGroupOrder([...allGroupNames].sort((a, b) => direction === "asc" ? a.localeCompare(b) : b.localeCompare(a))); }}>{nameSort === "desc" ? <ArrowDownZA size={16}/> : <ArrowDownAZ size={16}/>}</button>
       {groups.length > 1 ? <>
-        <button type="button" className="mg-icon-button" aria-label={t("全部折叠")} title={t("全部折叠")} onClick={() => setCollapsedGroups(new Set(groups.map(([source]) => source)))}><ChevronsDownUp size={16}/></button>
-        <button type="button" className="mg-icon-button" aria-label={t("全部展开")} title={t("全部展开")} onClick={() => setCollapsedGroups(new Set())}><ChevronsUpDown size={16}/></button>
+        <button type="button" className="mg-icon-button" aria-label={t("全部折叠")} title={t("全部折叠")} onClick={() => setExpandedGroups(new Set())}><ChevronsDownUp size={16}/></button>
+        <button type="button" className="mg-icon-button" aria-label={t("全部展开")} title={t("全部展开")} onClick={() => setExpandedGroups(new Set(groups.map(([source]) => source)))}><ChevronsUpDown size={16}/></button>
       </> : null}
     </div>
-    <div className="mg-content" ref={contentRef}>
+    {updateSnapshot.tasks.length > 0 && <div className="mg-skill-update-summary">
+      <div role="status" aria-live="polite">
+        {currentUpdate ? <><RefreshCw size={13} className="mg-skill-update-spin"/><span>{tf("正在更新：{0}", [currentUpdate.name || currentUpdate.id])}</span></> : <span>{tf("更新完成：成功 {0} 个，失败 {1} 个", [updateSnapshot.tasks.filter((task) => task.state === "succeeded").length, updateFailures.length])}</span>}
+        {waitingUpdates > 0 && <small>{tf("等待更新 {0} 个", [waitingUpdates])}</small>}
+      </div>
+      {updateFailures.length > 0 && <details className="mg-skill-update-errors"><summary>{tf("{0} 个更新失败", [updateFailures.length])}</summary>{updateFailures.map((task) => <p key={`${task.repoKey}:${task.id}`}><strong>{task.name || task.id}</strong> · {task.error}</p>)}</details>}
+    </div>}
+    <div className="mg-content" ref={contentRef} onScroll={(event) => { skillPageScrollTop = event.currentTarget.scrollTop; }}>
       <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={({ active, over }) => { if (over && active.id !== over.id) { setGroupOrder(moveSkillGroup(allGroupNames, String(active.id), String(over.id))); setNameSort(null); } }}>
       <SortableContext items={groups.map(([name]) => name)} strategy={verticalListSortingStrategy}>
       {!groups.length ? <div className="mg-skill-list"><div className="mg-empty"><h2>{loading ? t("正在扫描…") : t("没有匹配的 Skill")}</h2></div></div> : groups.map(([source, groupItems]) => {
-        const collapsed = collapsedGroups.has(source) && !query.trim();
+        const collapsed = !expandedGroups.has(source) && !query.trim();
+        const viewportKey = `${tab}:${source}:${deferredQuery}`;
         const batchItems = groupItems.filter((skill) => skill.installed && !skill.bundled && !skill.plugin);
         const allEnabled = batchItems.length > 0 && batchItems.every((skill) => skill.enabled);
         const mixed = !allEnabled && batchItems.some((skill) => skill.enabled);
@@ -560,11 +613,19 @@ export function SkillsPage({ notify }: { notify: Notify }) {
         const custom = customGroupNames.includes(source);
         const differences = groupItems.filter((skill) => skill.localDifference).length;
         const updates = groupItems.filter((skill) => skill.updateAvailable).length;
+        const updateTargets = updatableSkills(groupItems);
+        const groupUpdates = updateSnapshot.tasks.filter((task) => task.group === source);
+        const groupRunning = groupUpdates.some((task) => task.state === "running");
+        const groupWaiting = groupUpdates.some((task) => task.state === "queued");
+        const groupDone = groupUpdates.filter((task) => task.state === "succeeded" || task.state === "failed").length;
+        const groupPending = groupRunning || groupWaiting;
+        const queuedKeys = new Set(updateSnapshot.tasks.filter((task) => task.state === "queued" || task.state === "running").map((task) => `${task.repoKey}:${task.id}`));
+        const canEnqueue = updateTargets.some((skill) => !queuedKeys.has(`${skill.repoKey}:${skill.id}`));
         const comparisonErrors = groupItems.filter((skill) => skill.comparisonError).length;
         return <SortableSkillGroup key={source} name={source}>{(handle) => <>
           <div className="mg-skill-group-head">
             {handle}
-            <button type="button" className="mg-group-head" onClick={() => setCollapsedGroups((old) => { const next = new Set(old); next.has(source) ? next.delete(source) : next.add(source); return next; })}>
+            <button type="button" className="mg-group-head" aria-expanded={!collapsed} onClick={() => setExpandedGroups((old) => { const next = new Set(old); next.has(source) ? next.delete(source) : next.add(source); return next; })}>
               <ChevronDown size={15} className={collapsed ? "mg-chevron-collapsed" : ""}/><strong>{source}</strong>
             </button>
             <span className="mg-skill-group-notice" role="status">{[
@@ -572,12 +633,14 @@ export function SkillsPage({ notify }: { notify: Notify }) {
               updates ? tf("{0} 个可更新", [updates]) : "",
               comparisonErrors ? tf("{0} 个比较失败", [comparisonErrors]) : "",
             ].filter(Boolean).join(" · ")}</span>
+            {groupUpdates.length > 0 && <span className="mg-skill-update-progress" role="status"><span>{groupRunning ? tf("更新中 {0}/{1}", [groupDone, groupUpdates.length]) : groupWaiting ? t("等待更新") : tf("已完成 {0}/{1}", [groupDone, groupUpdates.length])}</span><progress aria-label={tf("更新进度：{0}", [source])} max={groupUpdates.length} value={groupDone}/></span>}
             <div className="mg-row-actions">
+              {(updates > 0 || groupPending) && <Button onClick={() => updateGroup(source, groupItems)} disabled={mutationBusy || !canEnqueue}><RefreshCw size={13} className={groupRunning ? "mg-skill-update-spin" : undefined}/>{groupPending && !canEnqueue ? groupRunning ? t("更新中") : t("已排队") : t("更新全部")}</Button>}
               {custom ? <><button type="button" className="mg-icon-button" aria-label={tf("重命名分组：{0}", [source])} title={t("重命名分组")} onClick={() => setGroupDialog({ mode: "rename", name: source })}><Edit3 size={14}/></button><button type="button" className="mg-icon-button" aria-label={tf("删除分组：{0}", [source])} title={t("删除分组")} onClick={() => setGroupDialog({ mode: "delete", name: source })}><Trash2 size={14}/></button></> : null}
             </div>
             <small className="mg-skill-group-total">{groupItems.length} {t("个 Skill")}</small>
           </div>
-          {!collapsed ? <SkillListViewport className="mg-skill-list" items={groupItems} rowHeight={68} resetKey={`${tab}:${source}:${deferredQuery}`} busy={loading} header={groupItems.length ? <div className="mg-skill-head"><span>{t("技能")}</span><span>{t("来源")}</span><span>{t("状态")}</span><span className="mg-group-status-control">{batchItems.length > 0 && <button className={"mg-switch " + (allEnabled ? "is-on" : "")} data-mixed={mixed} type="button" role="switch" aria-checked={allEnabled} aria-label={tf("分组状态：{0}", [source])} title={batchTitle} disabled={busy || loading} onClick={() => void runBatch(groupItems, !allEnabled)}><span /></button>}</span></div> : undefined} empty={<div className="mg-group-empty">{t("此分组暂无 Skill")}</div>} renderRow={renderSkillRow} /> : null}
+          {!collapsed ? <SkillListViewport className="mg-skill-list" items={groupItems} rowHeight={68} resetKey={viewportKey} initialScrollTop={skillGroupScroll.get(viewportKey)} onScrollTopChange={(top) => skillGroupScroll.set(viewportKey, top)} busy={loading} header={groupItems.length ? <div className="mg-skill-head"><span>{t("技能")}</span><span>{t("来源")}</span><span>{t("状态")}</span><span className="mg-group-status-control">{batchItems.length > 0 && <button className={"mg-switch " + (allEnabled ? "is-on" : "")} data-mixed={mixed} type="button" role="switch" aria-checked={allEnabled} aria-label={tf("分组状态：{0}", [source])} title={batchTitle} disabled={busy || loading || refreshing} onClick={() => void runBatch(groupItems, !allEnabled)}><span /></button>}</span></div> : undefined} empty={<div className="mg-group-empty">{t("此分组暂无 Skill")}</div>} renderRow={renderSkillRow} /> : null}
         </>}</SortableSkillGroup>;
       })}
       </SortableContext>
@@ -585,7 +648,7 @@ export function SkillsPage({ notify }: { notify: Notify }) {
       {data?.repoErrors?.length ? <div className="mg-notice mg-warning">{data.repoErrors.map((e) => <p key={e}>{e}</p>)}</div> : null}
     </div>
     {repoOpen && <SkillRepoDrawer repos={data?.repos || []} catalog={data?.repositorySkills || []} counts={data?.repoCounts || {}} initialKey={repoSelection} busy={busy} onClose={() => setRepoOpen(false)} onSave={saveRepo} onDelete={(r) => void deleteRepo(r)} onInspect={inspectRepo} onOpenUrl={(url) => void openUrl(url)} onOpenSkill={setDetail} onRun={(cmd, args) => void run(cmd, args)} />}
-    {detail && <SkillDetailDrawer skill={detail} onAssociate={associateOrigin} count={data?.repoCounts?.[detail.repoKey]} onClose={() => setDetail(null)} onOpenUrl={(url) => void openUrl(url)} onOpenRepo={() => repoOpen ? setDetail(null) : openRepo(detail.repoKey)} groups={allGroupNames} group={customGroupAssignments[detail.id] === sourceGroup(detail) ? "" : customGroupAssignments[detail.id]} onAssignGroup={(group) => { setCustomGroupAssignments((old) => { const next = { ...old }; if (group) next[detail.id] = group; else delete next[detail.id]; return next; }); setCollapsedGroups((old) => { const next = new Set(old); next.delete(group || sourceGroup(detail)); return next; }); }} />}
+    {detail && <SkillDetailDrawer skill={detail} onAssociate={associateOrigin} count={data?.repoCounts?.[detail.repoKey]} onClose={() => setDetail(null)} onOpenUrl={(url) => void openUrl(url)} onOpenRepo={() => repoOpen ? setDetail(null) : openRepo(detail.repoKey)} groups={allGroupNames} group={customGroupAssignments[detail.id] === sourceGroup(detail) ? "" : customGroupAssignments[detail.id]} onAssignGroup={(group) => { setCustomGroupAssignments((old) => { const next = { ...old }; if (group) next[detail.id] = group; else delete next[detail.id]; return next; }); setExpandedGroups((old) => { const next = new Set(old); next.add(group || sourceGroup(detail)); return next; }); }} />}
     {groupDialog && <SkillGroupDialog {...groupDialog} names={allGroupNames} onClose={() => setGroupDialog(null)} onSave={saveGroup}/>}
   </div>;
 }

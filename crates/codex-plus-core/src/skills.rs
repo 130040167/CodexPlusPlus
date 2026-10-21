@@ -1189,9 +1189,11 @@ async fn fetch_repo_skills_from_zip(
     repo: &SkillRepo,
     cached: &BTreeMap<String, RemoteSkill>,
     client: &reqwest::Client,
+    zip_url: &str,
 ) -> anyhow::Result<Vec<RemoteSkill>> {
-    let response = with_github_auth(client.get(repo_zip_url(repo)))
+    let response = with_github_auth(client.get(zip_url))
         .header(reqwest::header::ACCEPT, "application/zip")
+        .timeout(std::time::Duration::from_secs(90))
         .send()
         .await
         .with_context(|| format!("下载 {}/{} 的仓库压缩包失败", repo.owner, repo.name))?;
@@ -1213,7 +1215,8 @@ async fn fetch_repo_skills_from_zip(
     parse_skills_from_zip(repo, &bytes, cached)
 }
 
-fn parse_skills_from_zip(
+/// 从同一份下载快照读取清单和内容指纹，供安装/更新复用，避免分支变化造成错配。
+pub fn parse_skills_from_zip(
     repo: &SkillRepo,
     bytes: &[u8],
     cached: &BTreeMap<String, RemoteSkill>,
@@ -1390,8 +1393,8 @@ fn zip_entry_relative_path(name: &str) -> Option<PathBuf> {
 /// 从仓库 zip 里只解出 `repo_path` 这一棵子树。
 ///
 /// GitHub 的 zip 统一带一层 `repo-ref/` 前缀，`zip_entry_relative_path` 会剥掉它
-/// 并同时挡住路径逃逸。符号链接条目一律拒绝——与 codex 内置 skill-installer 的
-/// `_validate_skill` 一致，避免装进来的 skill 指到仓库外面。
+/// 并同时挡住路径逃逸。目标子树内的符号链接一律拒绝，避免装进来的 skill
+/// 指到仓库外面；其他子树的链接不影响当前 skill 的安装。
 pub fn extract_skill_subtree(
     zip_bytes: &[u8],
     repo_path: &str,
@@ -1410,9 +1413,6 @@ pub fn extract_skill_subtree(
         let mut file = archive
             .by_index(index)
             .with_context(|| format!("读取压缩包条目 {index} 失败"))?;
-        if file.is_symlink() {
-            anyhow::bail!("skill 中不允许包含符号链接：{}", file.name());
-        }
         let Some(relative) = zip_entry_relative_path(file.name()) else {
             continue;
         };
@@ -1429,6 +1429,9 @@ pub fn extract_skill_subtree(
         };
         if inner.is_empty() {
             continue;
+        }
+        if file.is_symlink() {
+            anyhow::bail!("skill 中不允许包含符号链接：{}", file.name());
         }
         let output_path = destination.join(safe_relative_path(inner)?);
         if file.is_dir() {
@@ -1561,14 +1564,24 @@ pub async fn fetch_repo_skills(
     cached: &BTreeMap<String, RemoteSkill>,
 ) -> anyhow::Result<Vec<RemoteSkill>> {
     let client = github_client().await?;
-    let response = with_github_auth(client.get(repo_tree_url(repo)))
+    fetch_repo_skills_from_endpoints(repo, cached, &client, &repo_tree_url(repo), &repo_zip_url(repo)).await
+}
+
+async fn fetch_repo_skills_from_endpoints(
+    repo: &SkillRepo,
+    cached: &BTreeMap<String, RemoteSkill>,
+    client: &reqwest::Client,
+    tree_url: &str,
+    zip_url: &str,
+) -> anyhow::Result<Vec<RemoteSkill>> {
+    let response = with_github_auth(client.get(tree_url))
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .timeout(std::time::Duration::from_secs(20))
         .send()
         .await;
     let response = match response {
         Ok(response) => response,
-        Err(error) => return fetch_repo_skills_from_zip(repo, cached, &client).await
+        Err(error) => return fetch_repo_skills_from_zip(repo, cached, client, zip_url).await
             .with_context(|| format!("文件树请求失败（{error}），压缩包回退也失败")),
     };
     // 不要用 error_for_status() 一把带过：403 限流、404 仓库/分支不存在、401 令牌
@@ -1576,7 +1589,7 @@ pub async fn fetch_repo_skills(
     // （#1989 里四个仓库全失败，看不出到底是限流还是网络）。
     let status = response.status();
     if !status.is_success() && (matches!(status.as_u16(), 403 | 429) || status.is_server_error()) {
-        return fetch_repo_skills_from_zip(repo, cached, &client).await;
+        return fetch_repo_skills_from_zip(repo, cached, client, zip_url).await;
     }
     if !status.is_success() {
         anyhow::bail!(
@@ -1587,18 +1600,21 @@ pub async fn fetch_repo_skills(
             github_status_hint(status.as_u16())
         );
     }
-    let tree = response
-        .json::<Value>()
-        .await
-        .context("解析 GitHub 文件树响应失败")?;
+    // 响应头成功后仍可能正文超时、截断或返回非文件树 JSON；同样走 ZIP 回退。
+    let tree = match response.json::<Value>().await {
+        Ok(tree) if tree.get("tree").is_some_and(Value::is_array) => tree,
+        Ok(_) => return fetch_repo_skills_from_zip(repo, cached, client, zip_url).await
+            .context("GitHub 文件树格式无效，压缩包回退也失败"),
+        Err(error) => return fetch_repo_skills_from_zip(repo, cached, client, zip_url).await
+            .with_context(|| format!("解析 GitHub 文件树响应失败（{error}），压缩包回退也失败")),
+    };
     if tree.get("truncated").and_then(Value::as_bool) == Some(true) {
-        return fetch_repo_skills_from_zip(repo, cached, &client).await;
+        return fetch_repo_skills_from_zip(repo, cached, client, zip_url).await;
     }
 
     let skills = parse_skills_from_tree(repo, &tree);
     use futures_util::{StreamExt, stream};
     let skills = stream::iter(skills.into_iter().map(|mut skill| {
-        let client = &client;
         async move {
             if let Some(hit) = cached.get(&skill.id) {
                 if hit.content_hash == skill.content_hash && !hit.description.is_empty()
@@ -1645,6 +1661,7 @@ pub async fn download_repo_zip(repo: &SkillRepo) -> anyhow::Result<Vec<u8>> {
     let client = github_client().await?;
     let response = with_github_auth(client.get(repo_zip_url(repo)))
         .header(reqwest::header::ACCEPT, "application/zip")
+        .timeout(std::time::Duration::from_secs(90))
         .send()
         .await
         .with_context(|| format!("下载 {}/{} 失败", repo.owner, repo.name))?;
@@ -2091,6 +2108,107 @@ mod tests {
         assert_eq!(zipped[0].content_hash, parse_skills_from_tree(&root, &tree)[0].content_hash);
     }
 
+    async fn catalog_response_fixture(
+        status: u16, body: &str, truncated_body: bool, archive: Option<Vec<u8>>,
+    ) -> (anyhow::Result<Vec<RemoteSkill>>, Vec<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.as_bytes().to_vec();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut responses = vec![(status, body.clone(), body.len() + usize::from(truncated_body) * 100)];
+            if let Some(archive) = archive { responses.push((200, archive.clone(), archive.len())); }
+            for (status, bytes, length) in responses {
+                let (mut socket, _) = tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                requests.push(String::from_utf8_lossy(&request).lines().next().unwrap().to_string());
+                socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                socket.write_all(&bytes).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+            requests
+        });
+        let client = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(3)).build().unwrap();
+        let result = fetch_repo_skills_from_endpoints(
+            &parse_repo_key("acme/kit@main").unwrap(), &BTreeMap::new(), &client,
+            &format!("http://{address}/tree"), &format!("http://{address}/archive"),
+        ).await;
+        (result, server.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn invalid_or_incomplete_tree_responses_fall_back_to_zip() {
+        let zip = repo_zip(&[("kit-main/alpha/SKILL.md", "---\nname: alpha\ndescription: ZIP fallback\n---\n")]);
+        for (body, truncated) in [
+            ("<html>proxy error</html>", false),
+            ("{\"tree\":", false),
+            ("{\"message\":\"invalid response\"}", false),
+            ("{\"tree\":[]}", true),
+            ("{\"truncated\":true,\"tree\":[]}", false),
+        ] {
+            let (result, requests) = catalog_response_fixture(200, body, truncated, Some(zip.clone())).await;
+            let skills = result.unwrap();
+            assert_eq!(skills.len(), 1);
+            assert_eq!(skills[0].repo_path, "alpha");
+            assert_eq!(skills[0].description, "ZIP fallback");
+            assert_eq!(requests, ["GET /tree HTTP/1.1", "GET /archive HTTP/1.1"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn tree_authentication_and_missing_repo_errors_do_not_fall_back() {
+        for status in [401, 404] {
+            let (result, requests) = catalog_response_fixture(status, "{}", false, None).await;
+            assert!(result.unwrap_err().to_string().contains(&format!("HTTP {status}")));
+            assert_eq!(requests, ["GET /tree HTTP/1.1"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_tree_and_zip_responses_preserve_both_error_causes() {
+        let (result, _) = catalog_response_fixture(200, "invalid json", false, Some(b"invalid zip".to_vec())).await;
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("解析 GitHub 文件树响应失败"));
+        assert!(error.contains("压缩包回退也失败"));
+        assert!(error.contains("仓库压缩包无法解析"));
+    }
+
+    #[test]
+    fn repository_archive_update_uses_one_snapshot_for_catalog_hash_and_installed_files() {
+        let repo = parse_repo_key("acme/kit@main").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let old_zip = repo_zip(&[("kit-main/alpha/SKILL.md", "---\nname: alpha\ndescription: Old\n---\n")]);
+        let old = parse_skills_from_zip(&repo, &old_zip, &BTreeMap::new()).unwrap().remove(0);
+        manager.install_from_zip(&old, &old_zip).unwrap();
+        manager.set_enabled(&old.id, false).unwrap();
+        let cached = BTreeMap::from([(old.id.clone(), old.clone())]);
+        let new_zip = repo_zip(&[
+            ("kit-main/alpha/SKILL.md", "---\nname: alpha\ndescription: New snapshot\n---\n"),
+            ("kit-main/alpha/references/update.md", "New reference"),
+        ]);
+        let updated = parse_skills_from_zip(&repo, &new_zip, &cached).unwrap().remove(0);
+        assert_eq!(updated.id, old.id);
+        assert_ne!(updated.content_hash, old.content_hash);
+        manager.install_from_zip(&updated, &new_zip).unwrap();
+        let entries = manager.merge_entries(&[updated.clone()]);
+        let installed = entries.iter().find(|entry| entry.id == old.id).unwrap();
+        assert!(installed.installed);
+        assert!(!installed.enabled);
+        assert!(!installed.update_available);
+        assert!(!installed.local_difference);
+        assert!(installed.comparison_error.is_empty());
+        assert_eq!(installed.description, "New snapshot");
+        assert_eq!(skill_directory_hash(&manager.source_dir().join(&old.id)).unwrap(), updated.content_hash);
+    }
+
     #[test]
     fn merging_same_ids_from_different_repositories_preserves_both() {
         let temp = tempfile::tempdir().unwrap();
@@ -2190,6 +2308,58 @@ mod tests {
         let error = extract_skill_subtree(&zip, "alpha", &temp.path().join("alpha")).unwrap_err();
 
         assert!(error.to_string().contains("SKILL.md"));
+    }
+
+    fn zip_with_skill_symlink(path: &str) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        writer.add_symlink(path, "../../outside", options).unwrap();
+        writer.start_file("kit-main/skills/alpha/SKILL.md", options).unwrap();
+        writer.write_all(b"replacement").unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn skill_update_ignores_symlinks_outside_requested_subtree() {
+        for path in [
+            "kit-main/skills/academic-paper",
+            "kit-main/skills/alpha-alias",
+            "kit-main/skills/alpha-other/link",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let manager = manager(&temp);
+            manager.install_from_zip(
+                &sample_skill("alpha", "skills/alpha", "v1"),
+                &repo_zip(&[("kit-main/skills/alpha/SKILL.md", "original")]),
+            ).unwrap();
+            let state = manager.install_from_zip(
+                &sample_skill("alpha", "skills/alpha", "v2"),
+                &zip_with_skill_symlink(path),
+            ).unwrap();
+            assert_eq!(state.installed["alpha"].content_hash, "v2");
+            assert_eq!(std::fs::read_to_string(manager.linked_dir().join("alpha/SKILL.md")).unwrap(), "replacement");
+            assert!(!temp.path().join("outside").exists());
+        }
+    }
+
+    #[test]
+    fn skill_update_rejects_internal_symlinks_and_preserves_installed_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        manager.install_from_zip(
+            &sample_skill("alpha", "skills/alpha", "v1"),
+            &repo_zip(&[("kit-main/skills/alpha/SKILL.md", "original")]),
+        ).unwrap();
+        let before = manager.load_state();
+        let zip = zip_with_skill_symlink("kit-main/skills/alpha/link");
+        let error = manager.install_from_zip(
+            &sample_skill("alpha", "skills/alpha", "v2"), &zip,
+        ).unwrap_err();
+        assert!(error.to_string().contains("符号链接"));
+        assert_eq!(manager.load_state(), before);
+        assert_eq!(std::fs::read_to_string(manager.source_dir().join("alpha/SKILL.md")).unwrap(), "original");
+        assert_eq!(std::fs::read_to_string(manager.linked_dir().join("alpha/SKILL.md")).unwrap(), "original");
+        assert!(extract_skill_subtree(&zip, ".", &temp.path().join("root")).unwrap_err().to_string().contains("符号链接"));
     }
 
     #[test]
