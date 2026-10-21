@@ -291,9 +291,7 @@
   function archivedRefFromRow(row) {
     const archivedThread = archivedThreadFromRow(row);
     if (archivedThread?.id || archivedThread?.sessionId) {
-      const id = archivedThread.id || archivedThread.sessionId;
-      const host = sessionHostEvidenceFromRow(row, id).hostId;
-      return { session_id: id, host_id: host, title: archivedThread.title || row.querySelector(".truncate.text-base")?.textContent?.trim() || "Untitled session" };
+      return { session_id: archivedThread.id || archivedThread.sessionId, host_id: sessionHostEvidenceFromRow(row, archivedThread.id || archivedThread.sessionId).hostId, title: archivedThread.title || row.querySelector(".truncate.text-base")?.textContent?.trim() || "Untitled session" };
     }
     const sidebarRef = sessionRefFromRow(row);
     if (sidebarRef.session_id) return sidebarRef;

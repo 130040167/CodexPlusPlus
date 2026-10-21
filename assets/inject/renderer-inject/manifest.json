@@ -13,7 +13,7 @@
     {
       "name": "10-style.js",
       "description": "样式注入、默认设置、后端设置映射、梦皮主题变量与持久化",
-      "lines": 2730
+      "lines": 2728
     },
     {
       "name": "20-menu.js",
@@ -23,7 +23,7 @@
     {
       "name": "30-service-tier.js",
       "description": "供应商会话适配、请求桥接与原生状态模块定位",
-      "lines": 892
+      "lines": 891
     },
     {
       "name": "31-config-read-deadline.js",
@@ -33,7 +33,7 @@
     {
       "name": "40-backend-settings.js",
       "description": "后端设置读写、心跳同步、用户脚本与市场状态、拓展 UI",
-      "lines": 1946
+      "lines": 1959
     },
     {
       "name": "50-navigation.js",
@@ -58,17 +58,17 @@
     {
       "name": "70-model-catalog.js",
       "description": "全局状态、模型目录、模型白名单与解锁",
-      "lines": 1756
+      "lines": 1150
     },
     {
       "name": "71-model-picker-groups.js",
       "description": "原生模型选择器按供应商分组折叠（聚合供应商场景）",
-      "lines": 1058
+      "lines": 1036
     },
     {
       "name": "80-session-share.js",
       "description": "会话运行时工具；分享入口已撤出管理器扫描",
-      "lines": 749
+      "lines": 751
     },
     {
       "name": "81-capacity-auto-retry.js",
@@ -83,17 +83,22 @@
     {
       "name": "83-usage-statusline.js",
       "description": "输入框下方用量状态栏：生成速度、缓存命中率与上下文占用",
-      "lines": 494
+      "lines": 491
+    },
+    {
+      "name": "84-proxy-request-status.js",
+      "description": "输入框上方的请求避震状态条：正在请求 / 等待上游 / 正在重试 / 正在生成",
+      "lines": 280
     },
     {
       "name": "90-action-groups.js",
       "description": "会话行操作按钮布局、更多菜单、工具提示",
-      "lines": 892
+      "lines": 890
     },
     {
       "name": "91-extension-api.js",
       "description": "对外接口层 window.codexPlus：路由白名单、UI 注册、toast",
-      "lines": 273
+      "lines": 272
     },
     {
       "name": "92-extension-host.js",

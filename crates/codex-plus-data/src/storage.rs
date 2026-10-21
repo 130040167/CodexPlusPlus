@@ -1328,22 +1328,13 @@ const USAGE_TAIL_EVENT_LIMIT: usize = 24;
 fn read_rollout_usage_tail(rollout: &Path, limit: usize) -> anyhow::Result<Vec<Value>> {
     if crate::rollout_source::is_compressed(rollout) {
         // 压缩流不能随机 seek；流式遍历且仅保留最近事件。
-        let mut events = std::collections::VecDeque::new();
-        for line in BufReader::new(crate::rollout_source::open(rollout)?).lines() {
-            let line = line?;
-            if !line.contains("\"token_count\"") {
-                continue;
-            }
-            if let Ok(value) = serde_json::from_str::<Value>(&line)
-                && let Some(event) = rollout_usage_event(&value, None)
-            {
-                events.push_back(event);
-                if events.len() > limit {
-                    events.pop_front();
-                }
-            }
-        }
-        return Ok(events.into_iter().collect());
+        let mut events = Vec::new();
+        read_rollout_usage_lines(
+            BufReader::new(crate::rollout_source::open(rollout)?).lines(),
+            limit,
+            &mut events,
+        )?;
+        return Ok(events);
     }
     let file = File::open(rollout)?;
     let len = file.metadata()?.len();
@@ -1383,9 +1374,18 @@ fn read_rollout_usage_window(
     if start > 0 {
         lines.next();
     }
+    read_rollout_usage_lines(lines.map(|line| Ok(line.to_owned())), limit, out)
+}
+
+fn read_rollout_usage_lines(
+    lines: impl Iterator<Item = std::io::Result<String>>,
+    limit: usize,
+    out: &mut Vec<Value>,
+) -> anyhow::Result<()> {
     let mut current_turn_id: Option<String> = None;
     let mut segment_start = 0;
     for line in lines {
+        let line = line?;
         let line = line.trim();
         // 先做子串预筛，避免为每条 response_item 付 serde 解析成本。
         if line.is_empty()
@@ -1445,10 +1445,12 @@ fn read_rollout_usage_window(
         }
         if let Some(event) = rollout_usage_event(&value, current_turn_id.as_deref()) {
             out.push(event);
+            if out.len() > limit {
+                let removed = out.len() - limit;
+                out.drain(..removed);
+                segment_start = segment_start.saturating_sub(removed);
+            }
         }
-    }
-    if out.len() > limit {
-        out.drain(..out.len() - limit);
     }
     Ok(())
 }
@@ -2056,22 +2058,35 @@ fn detect_file_restore_conflicts(
             if Path::new(path).exists() {
                 anyhow::bail!("restore conflict: file already exists: {path}");
             }
+            if let Some(other) = rollout_counterpart(Path::new(path))
+                && other.exists()
+            {
+                anyhow::bail!(
+                    "restore conflict: alternate history now exists: {}",
+                    other.display()
+                );
+            }
             backup_store.validate_file_backup(token, file)?;
             if crate::rollout_source::is_compressed(Path::new(path)) {
                 let bytes = backup_store.read_file_backup(token, file)?;
                 let mut reader = crate::rollout_source::decode_reader(Path::new(path), &bytes[..])?;
                 std::io::copy(&mut reader, &mut std::io::sink())?;
-                let logical = Path::new(path).with_extension("");
-                if logical.exists() {
-                    anyhow::bail!(
-                        "restore conflict: uncompressed history now exists: {}",
-                        logical.display()
-                    );
-                }
             }
         }
     }
     Ok(())
+}
+
+fn rollout_counterpart(path: &Path) -> Option<PathBuf> {
+    if crate::rollout_source::is_compressed(path) {
+        Some(path.with_extension(""))
+    } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+        let mut compressed = path.as_os_str().to_os_string();
+        compressed.push(".zst");
+        Some(PathBuf::from(compressed))
+    } else {
+        None
+    }
 }
 
 fn allowed_backup_file_paths(tables: &Map<String, Value>) -> HashSet<String> {
