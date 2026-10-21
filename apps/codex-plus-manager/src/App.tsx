@@ -5324,7 +5324,7 @@ function ProxySettingsScreen({
       <Panel>
         <CardHead
           title={t("请求避震")}
-          detail={t("代理层吸收上游过载冲击：自动重试模型容量/过载错误（含推理与工具调用阶段），尽量不把错误交给 Codex")}
+          detail={t("在本地代理内消化上游过载与限流，尽量不把错误交给 Codex")}
         />
         <CardContent className="settings-content">
           <div className="settings-block">
@@ -5339,7 +5339,7 @@ function ProxySettingsScreen({
               <span>{t("启用请求避震")}</span>
             </label>
             <p className="field-hint">
-              {t("请求避震只处理经过本地协议代理、且以 200 流式响应返回的上游过载/容量错误（server_overloaded、server_is_overloaded、at capacity 等）。流式避震下：推理、工具调用参数等不可见阶段先缓冲，工具调用整项完成或首段可见输出后再等「首字提交延迟」；这段窗口内遇到过载由代理退避重试；提交之后遇到同类过载，会改写成 Codex 可识别的容量错误，由 Codex 自己重试；连接失败与其它错误默认不重试；需要重试 429、5xx 等 HTTP 错误时，在下方「重试的 HTTP 状态码」里添加。保留的「流式避震（旧行为）」模式仍按旧逻辑：第一个输出事件就交给 Codex。整段缓冲避震下，任何时点的过载都由代理重试，但失去流式。")}
+              {t("仅作用于经过本地协议代理的请求：自动重试 200 流内的过载/容量错误，以及下方选择的 HTTP 状态码。")}
             </p>
             <div className="form-row">
               <Field label={t("最多自动重试次数")}>
@@ -5380,7 +5380,7 @@ function ProxySettingsScreen({
               </Field>
             </div>
             <p className="field-hint">
-              {t("之后按 2 倍指数退避，单次最长 30 秒；上游返回 Retry-After 时优先采用（同样受上限约束）。")}
+              {t("之后按 2 倍退避，单次最长 30 秒；有 Retry-After 时优先采用。")}
             </p>
             <Field label={t("重试的 HTTP 状态码")}>
               <div className="retry-status-editor">
@@ -5428,7 +5428,7 @@ function ProxySettingsScreen({
               </div>
             </Field>
             <p className="field-hint">
-              {t("上游直接返回这些状态码时，代理退避后重发同一请求（聚合供应商先切换成员，全部失败后再退避），与上面的次数和间隔共用预算；用尽后把最后一次错误交给 Codex。默认不勾选任何状态码。常用：429 限流，500/502/503/504 服务端或网关瞬时故障；400/401/403 等请求或鉴权错误重试也不会成功。")}
+              {t("命中时退避重发，次数用尽后把错误交给 Codex。默认不选；常用 429（限流）和 5xx（服务端故障）。")}
             </p>
             <div className="form-row">
               <Field label={t("避震模式")}>
@@ -5447,9 +5447,9 @@ function ProxySettingsScreen({
                     })
                   }
                 >
-                  <option value="streaming">{t("流式避震：工具调用参数与首字宽限内由代理重试，提交后交给 Codex 原生重试")}</option>
-                  <option value="streaming-legacy">{t("流式避震（旧行为）：首个输出事件立即提交，之后交给 Codex 原生重试")}</option>
-                  <option value="buffered">{t("整段缓冲避震：任何时点过载都由代理重试（失去流式）")}</option>
+                  <option value="streaming">{t("流式（推荐）")}</option>
+                  <option value="streaming-legacy">{t("流式（旧行为）")}</option>
+                  <option value="buffered">{t("整段缓冲")}</option>
                 </select>
               </Field>
               {form.protocolProxyAutoRetryMode === "streaming" ? (
@@ -5471,7 +5471,7 @@ function ProxySettingsScreen({
               ) : null}
             </div>
             <p className="field-hint">
-              {t("流式避震保留实时输出；「首字提交延迟」把首段可见输出也算进可重试窗口：0 = 一出现正文就提交，1000 = 再缓冲 1 秒，期间过载仍由代理重试；工具调用的参数生成阶段始终整项缓冲，不额外增加首字延迟。选「旧行为」则不做这些缓冲，完全回到旧逻辑。整段缓冲避震在所有情况下都不会把过载错误交给 Codex，但回复要等整段生成完才显示。")}
+              {t("流式：保留实时输出，正文提交前遇到过载由代理重试，之后交给 Codex；「首字提交延迟」为出现正文后再缓冲的时长，0 表示立即提交。整段缓冲：始终由代理重试，但要等整段生成完才显示。")}
             </p>
           </div>
         </CardContent>
