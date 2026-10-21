@@ -189,6 +189,7 @@ import { createRelayApiKey, normalizeRelayApiKeys, relayProfileWithNormalizedApi
 import { relayHeadersValidationMessage, serializeRelayHeaders } from "./relay-headers";
 import { sessionProviderForProtocol } from "./relay-session";
 import { usePopoverLayer } from "./use-popover-layer";
+import { resolveAnchoredMenuLayout, type AnchoredMenuLayout } from "./popover-layer";
 import { resolveProviderName } from "./provider-name";
 import {
   providerSyncStreamPercent,
@@ -5937,7 +5938,7 @@ function RelayScreen({
   const [newAggregateMode, setNewAggregateMode] = useState<AggregateMode | null>(null);
   const [thirdPartyImportOpen, setThirdPartyImportOpen] = useState(false);
   const thirdPartyImportTriggerRef = useRef<HTMLDivElement>(null);
-  const [thirdPartyImportPosition, setThirdPartyImportPosition] = useState<{ top: number; right: number } | null>(null);
+  const [thirdPartyImportPosition, setThirdPartyImportPosition] = useState<AnchoredMenuLayout | null>(null);
   const [ccsDbPathDraft, setCcsDbPathDraft] = useState(normalized.ccsDbPath);
   const [ccsPathSaving, setCcsPathSaving] = useState(false);
   const [ccsBindings, setCcsBindings] = useState<Record<string, string>>({});
@@ -6038,10 +6039,12 @@ function RelayScreen({
     if (next) {
       // 菜单改为 fixed 定位：它原本挂在 .mg-content（overflow:auto）里，
       // 面板较矮时后半截会被裁掉（ccswitch 导入按钮、刷新列表都看不到）。
+      // 高度必须按触发按钮的位置收窄，否则 cc-switch 供应商一多（几十行），
+      // 菜单底部会超出窗口下沿，最后那排按钮永远点不到（issue #1906）。
       const rect = thirdPartyImportTriggerRef.current?.getBoundingClientRect();
       setThirdPartyImportPosition(
         rect
-          ? { top: Math.round(rect.bottom + 8), right: Math.round(Math.max(12, window.innerWidth - rect.right)) }
+          ? resolveAnchoredMenuLayout(rect, { width: window.innerWidth, height: window.innerHeight })
           : null,
       );
     }
@@ -6058,12 +6061,18 @@ function RelayScreen({
     };
     document.addEventListener("pointerdown", handlePointerDown, true);
     window.addEventListener("resize", close);
-    // capture 监听内层 .mg-content 的滚动。
-    window.addEventListener("scroll", close, { capture: true, passive: true });
+    // capture 监听内层 .mg-content 的滚动：页面滚了菜单会跟触发按钮错位，得收起。
+    // 但供应商列表自己也会滚（滚轮、拖滚动条），scroll 事件同样会冒到 window 的
+    // capture 阶段——不排除掉它，列表一动菜单就关，等于列表不能滚（issue #1906）。
+    const handleScroll = (event: Event) => {
+      if (thirdPartyImportTriggerRef.current?.contains(event.target as Node)) return;
+      close();
+    };
+    window.addEventListener("scroll", handleScroll, { capture: true, passive: true });
     return () => {
       document.removeEventListener("pointerdown", handlePointerDown, true);
       window.removeEventListener("resize", close);
-      window.removeEventListener("scroll", close, { capture: true });
+      window.removeEventListener("scroll", handleScroll, { capture: true });
     };
   }, [thirdPartyImportOpen]);
   if (detailProfile) {
@@ -6148,7 +6157,12 @@ function RelayScreen({
                 <div
                   className="third-party-import-menu"
                   style={thirdPartyImportPosition
-                    ? { position: "fixed", top: thirdPartyImportPosition.top, right: thirdPartyImportPosition.right }
+                    ? {
+                      position: "fixed",
+                      top: thirdPartyImportPosition.top,
+                      right: thirdPartyImportPosition.right,
+                      maxHeight: thirdPartyImportPosition.maxHeight,
+                    }
                     : undefined}
                 >
                   <label>
@@ -6159,31 +6173,36 @@ function RelayScreen({
                   <button disabled={ccsPathSaving} onClick={() => void saveCcsDbPath()} type="button">{t("保存路径并刷新")}</button>
                   {ccsProviders && isSuccessStatus(ccsProviders.status) ? <span className="text-xs break-all">{t("实际来源")}：{ccsProviders.dbPath}</span> : null}
                   {ccsProviders?.fallbackReason ? <span className="text-xs break-all">{ccsProviders.fallbackReason}</span> : null}
-                  {ccsProviders?.providers.map((provider) => <label key={provider.sourceId}>
-                    {provider.name}
-                    <select value={ccsBindings[provider.sourceId] || ""} onChange={(event) => setCcsBindings((current) => ({ ...current, [provider.sourceId]: event.currentTarget.value }))}>
-                      <option value="">{t("自动识别来源或新增")}</option>
-                      {normalized.relayProfiles.map((profile) => <option key={profile.id} value={profile.id}>{t("关联已有")}：{profile.name}</option>)}
-                    </select>
-                  </label>)}
-                  <button
-                    disabled={ccsPathSaving || ccsDbPathDraft.trim() !== normalized.ccsDbPath || !ccsProviders?.providers.length}
-                    onClick={() => {
-                      setThirdPartyImportOpen(false);
-                      void actions.importCcsProviders(ccsBindings);
-                    }}
-                    type="button"
-                  >
-                    <strong>ccswitch</strong>
-                    <span>{ccsProviderSummary(ccsProviders)}</span>
-                  </button>
-                  <button
-                    onClick={() => void actions.refreshCcsProviders()}
-                    type="button"
-                  >
-                    <RefreshCw className="h-4 w-4" />
-                    {t("刷新列表")}
-                  </button>
+                  {/* 供应商列表单独滚动：cc-switch 里几十个供应商时，底部按钮仍然可见可点（issue #1906）。 */}
+                  <div className="third-party-import-list">
+                    {ccsProviders?.providers.map((provider) => <label key={provider.sourceId}>
+                      {provider.name}
+                      <select value={ccsBindings[provider.sourceId] || ""} onChange={(event) => setCcsBindings((current) => ({ ...current, [provider.sourceId]: event.currentTarget.value }))}>
+                        <option value="">{t("自动识别来源或新增")}</option>
+                        {normalized.relayProfiles.map((profile) => <option key={profile.id} value={profile.id}>{t("关联已有")}：{profile.name}</option>)}
+                      </select>
+                    </label>)}
+                  </div>
+                  <div className="third-party-import-actions">
+                    <button
+                      disabled={ccsPathSaving || ccsDbPathDraft.trim() !== normalized.ccsDbPath || !ccsProviders?.providers.length}
+                      onClick={() => {
+                        setThirdPartyImportOpen(false);
+                        void actions.importCcsProviders(ccsBindings);
+                      }}
+                      type="button"
+                    >
+                      <strong>ccswitch</strong>
+                      <span>{ccsProviderSummary(ccsProviders)}</span>
+                    </button>
+                    <button
+                      onClick={() => void actions.refreshCcsProviders()}
+                      type="button"
+                    >
+                      <RefreshCw className="h-4 w-4" />
+                      {t("刷新列表")}
+                    </button>
+                  </div>
                 </div>
               ) : null}
             </div>
