@@ -458,6 +458,10 @@ fn sub_agent_runtime_limit_defaults_to_ten_minutes_and_is_configurable() {
     }))
     .unwrap();
     assert_eq!(legacy.max_runtime_minutes, 10, "旧配置缺省字段时保持原来的 10 分钟");
+    assert!(
+        serde_json::to_value(&legacy).unwrap().get("maxRuntimeMinutes").is_none(),
+        "默认值不写出，回退到 deny_unknown_fields 的旧版本仍能读取"
+    );
 
     let temp = tempfile::tempdir().unwrap();
     let store = store(&temp);
