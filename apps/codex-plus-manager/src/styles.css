@@ -450,19 +450,66 @@ body {
   color: hsl(var(--brand-accent));
 }
 
-/* 概览的置顶推荐位。
-   卡片内部沿用 .jojocode-overview-layout 的「左信息 / 右标签区」结构。 */
+/* 概览的两个独立置顶广告位。 */
 .sponsor-board {
   display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+}
+
+.sponsor-board-single {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .sponsor-board > .panel {
   min-width: 0;
+  height: 100%;
+}
+
+.sponsor-slot-content {
+  display: grid;
+  height: 100%;
+  grid-template-columns: minmax(0, 1fr) minmax(150px, auto);
+  grid-template-rows: 1fr auto;
+  gap: 14px 16px;
+  align-items: center;
+}
+
+.sponsor-slot-main {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  grid-column: 1;
+  grid-row: 1 / span 2;
+}
+
+.sponsor-slot-copy {
+  min-width: 0;
+}
+
+.sponsor-slot-tags {
+  justify-content: flex-start;
+  max-width: none;
+  margin-top: 0;
+  grid-column: 2;
+  grid-row: 1;
+  justify-content: flex-end;
+}
+
+.sponsor-slot-actions {
+  display: flex;
+  justify-content: flex-end;
+  grid-column: 2;
+  grid-row: 2;
 }
 
 /* 窄屏时「左信息 / 右标签区」并排会挤，改成上下排。 */
 @media (max-width: 1100px) {
+  .sponsor-board {
+    grid-template-columns: 1fr;
+  }
+
   .jojocode-overview-layout {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -474,6 +521,25 @@ body {
   .jojocode-model-tags {
     justify-content: flex-start;
     max-width: none;
+  }
+}
+
+@media (max-width: 700px) {
+  .sponsor-slot-content {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto;
+  }
+
+  .sponsor-slot-main,
+  .sponsor-slot-tags,
+  .sponsor-slot-actions {
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  .sponsor-slot-tags,
+  .sponsor-slot-actions {
+    justify-content: flex-start;
   }
 }
 

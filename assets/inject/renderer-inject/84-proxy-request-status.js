@@ -214,15 +214,38 @@
     }
   }
 
+  async function codexPlusProxyStatusPostWithTimeout() {
+    // 桥接挂死时 __codexSessionDeleteBridge 的 Promise 可能永远不 settle。
+    // 不设超时会让 inFlight 永久为 true，状态条从此不再刷新（只能重启恢复）。
+    let timer = 0;
+    try {
+      return await Promise.race([
+        postJson("/proxy-status", {}),
+        new Promise((resolve) => {
+          timer = window.setTimeout(
+            () => resolve({ status: "failed", message: "桥接请求超时", timeout: true }),
+            2500,
+          );
+        }),
+      ]);
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+
   async function codexPlusProxyStatusRefresh() {
     if (codexPlusProxyStatusState.disposed || codexPlusProxyStatusState.inFlight) return;
     if (document.hidden) return;
     codexPlusProxyStatusState.inFlight = true;
     try {
-      const result = await postJson("/proxy-status", {});
+      const result = await codexPlusProxyStatusPostWithTimeout();
       if (result?.status === "ok" && Array.isArray(result.requests)) {
         codexPlusProxyStatusState.requests = result.requests;
         codexPlusProxyStatusState.failures = 0;
+      } else if (result?.timeout) {
+        // 让看门狗把桥接判定为失效并重注入；桥恢复后下一轮轮询自动接上。
+        recordCodexPlusBridgeFailure();
+        throw new Error("proxy-status bridge timeout");
       }
     } catch {
       codexPlusProxyStatusState.failures += 1;

@@ -6222,6 +6222,10 @@
 
   function recordCodexPlusBridgeSuccess() {
     recordCodexPlusBridgeHealth("lastSuccessAt");
+    if (codexPlusBackendGeneration === window.__codexPlusBackendGeneration) {
+      const health = window.__codexPlusBridgeHealth || (window.__codexPlusBridgeHealth = {});
+      health.failures = 0;
+    }
     codexPlusBridgeFailureCount = 0;
   }
 
@@ -6231,6 +6235,12 @@
 
   function recordCodexPlusBridgeFailure() {
     codexPlusBridgeFailureCount += 1;
+    if (codexPlusBackendGeneration !== window.__codexPlusBackendGeneration) return;
+    // 看门狗只能读到 window 上的 health 快照：不落 failures/lastFailureAt，
+    // CDP 连接断掉后它会一直把“还在尝试”当成桥接存活，永久不重注入。
+    const health = window.__codexPlusBridgeHealth || (window.__codexPlusBridgeHealth = {});
+    health.lastFailureAt = Date.now();
+    health.failures = codexPlusBridgeFailureCount;
   }
 
   function renderBackendStatus() {
@@ -6827,6 +6837,7 @@
 
   async function directFetchCodexPlusAds() {
     const urls = [
+      "https://ads.codexpp.cc/ads.json",
       "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/ads.json",
       "https://cdn.jsdelivr.net/gh/BigPizzaV3/Ad-List@main/ads.json",
     ];
@@ -14918,15 +14929,38 @@
     }
   }
 
+  async function codexPlusProxyStatusPostWithTimeout() {
+    // 桥接挂死时 __codexSessionDeleteBridge 的 Promise 可能永远不 settle。
+    // 不设超时会让 inFlight 永久为 true，状态条从此不再刷新（只能重启恢复）。
+    let timer = 0;
+    try {
+      return await Promise.race([
+        postJson("/proxy-status", {}),
+        new Promise((resolve) => {
+          timer = window.setTimeout(
+            () => resolve({ status: "failed", message: "桥接请求超时", timeout: true }),
+            2500,
+          );
+        }),
+      ]);
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+
   async function codexPlusProxyStatusRefresh() {
     if (codexPlusProxyStatusState.disposed || codexPlusProxyStatusState.inFlight) return;
     if (document.hidden) return;
     codexPlusProxyStatusState.inFlight = true;
     try {
-      const result = await postJson("/proxy-status", {});
+      const result = await codexPlusProxyStatusPostWithTimeout();
       if (result?.status === "ok" && Array.isArray(result.requests)) {
         codexPlusProxyStatusState.requests = result.requests;
         codexPlusProxyStatusState.failures = 0;
+      } else if (result?.timeout) {
+        // 让看门狗把桥接判定为失效并重注入；桥恢复后下一轮轮询自动接上。
+        recordCodexPlusBridgeFailure();
+        throw new Error("proxy-status bridge timeout");
       }
     } catch {
       codexPlusProxyStatusState.failures += 1;

@@ -5006,99 +5006,53 @@ function WeixinConnectScreen({
   );
 }
 
-/// 概览页的置顶推荐位。
+/// 概览页的两个独立广告位。
 ///
-/// 概览页和推荐内容页共用同一份数据、同一个渲染，所以两处看到的赞助商是
-/// 一致的 —— 以前概览页把赞助商内容硬编码在 JSX 里，跟推荐内容页各说各话。
-///
-/// 数据来自广告源里的 sponsor 条目。
-/// 概览页置顶赞助位。
-///
-/// 这个位置**不来自推荐池** —— 广告源里的 `top_ad` 可配置单个对象或数组，
-/// 多条时自动轮播。没有有效条目时不显示置顶赞助位。
+/// 这里只读取广告源的 `top_ad/topAds`，不会读取普通 `ads` 推荐池。
+/// `top_ad` 可以是单个对象，也可以是数组；最多显示前两个有效广告。
 function SponsorBoard({ ads, actions }: { ads: AdsResult | null; actions: Actions }) {
   const sourceAds = ads?.topAds?.length ? ads.topAds : ads?.topAd ? [ads.topAd] : [];
-  const featured = sourceAds.filter((ad) => !isExpiredAd(ad));
-  const [activeIndex, setActiveIndex] = useState(0);
-  const [hovered, setHovered] = useState(false);
-  const [focusWithin, setFocusWithin] = useState(false);
-  const paused = hovered || focusWithin;
-
-  useEffect(() => {
-    if (featured.length < 2 || paused) return;
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === "visible") {
-        setActiveIndex((index) => (index + 1) % featured.length);
-      }
-    }, 6000);
-    return () => window.clearInterval(timer);
-  }, [featured.length, paused]);
+  const featured = sourceAds.filter((ad) => !isExpiredAd(ad)).slice(0, 2);
 
   if (featured.length === 0) return null;
-  const activePosition = activeIndex % featured.length;
-  const ad = featured[activePosition];
-  const move = (offset: number) => {
-    setActiveIndex((index) => (index + offset + featured.length) % featured.length);
-  };
 
   return (
-    <div
-      className="sponsor-board"
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      onFocusCapture={() => setFocusWithin(true)}
-      onBlurCapture={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget)) setFocusWithin(false);
-      }}
-    >
-      <Panel className="jojocode-overview">
-        <CardContent>
-          <div className="jojocode-overview-layout">
-            <div className="jojocode-overview-main">
-              {ad.image ? (
-                <img alt="" className="sponsor-logo" src={ad.image} />
-              ) : (
-                <div className="jojocode-overview-mark">
-                  <Network className="h-5 w-5" />
+    <div className={`sponsor-board ${featured.length === 1 ? "sponsor-board-single" : ""}`}>
+      {featured.map((ad) => (
+        <Panel className="jojocode-overview sponsor-slot" key={ad.id || ad.title}>
+          <CardContent>
+            <div className="sponsor-slot-content">
+              <div className="sponsor-slot-main">
+                {ad.image ? (
+                  <img alt="" className="sponsor-logo" src={ad.image} />
+                ) : (
+                  <div className="jojocode-overview-mark">
+                    <Network className="h-5 w-5" />
+                  </div>
+                )}
+                <div className="sponsor-slot-copy">
+                  <span className="eyebrow">{t("推荐内容")}</span>
+                  <h2>{formatAdTitle(ad.title)}</h2>
+                  <p className="recommendation-description" title={ad.description}>{ad.description}</p>
                 </div>
-              )}
-              <div aria-live={paused ? "polite" : "off"} className="sponsor-carousel-copy" key={ad.id || ad.title}>
-                <span className="eyebrow">{t("推荐内容")}</span>
-                <h2>{formatAdTitle(ad.title)}</h2>
-                <p className="recommendation-description" title={ad.description}>{ad.description}</p>
               </div>
-            </div>
-            <div className="jojocode-overview-side">
               {ad.highlights?.length ? (
-                <div className="jojocode-model-tags">
+                <div className="jojocode-model-tags sponsor-slot-tags">
                   {ad.highlights.map((item) => (
                     <span key={item}>{item}</span>
                   ))}
                 </div>
               ) : null}
-              <div className="sponsor-carousel-actions">
+              <div className="sponsor-slot-actions">
                 <Button onClick={() => void actions.openExternalUrl(ad.url)}>
                   <ExternalLink className="h-4 w-4" />
                   {t("打开推荐内容")}
                 </Button>
-                {featured.length > 1 ? (
-                  <div aria-label={t("赞助商轮播")} className="sponsor-carousel-controls" role="group">
-                    <Button aria-label={t("上一条")} onClick={() => move(-1)} size="icon" variant="outline">
-                      <ArrowLeft className="h-4 w-4" />
-                    </Button>
-                    <span aria-live={paused ? "polite" : "off"} className="sponsor-carousel-count">
-                      {activePosition + 1} / {featured.length}
-                    </span>
-                    <Button aria-label={t("下一条")} onClick={() => move(1)} size="icon" variant="outline">
-                      <ArrowRight className="h-4 w-4" />
-                    </Button>
-                  </div>
-                ) : null}
               </div>
             </div>
-          </div>
-        </CardContent>
-      </Panel>
+          </CardContent>
+        </Panel>
+      ))}
     </div>
   );
 }
@@ -8802,7 +8756,7 @@ function RecommendationsScreen({ ads, actions }: { ads: AdsResult | null; action
           <div className="recommend-hero">
             <div>
               <strong>{ads ? tf("已加载 {0} 条推荐", [ordered.length]) : t("尚未加载推荐内容")}</strong>
-              <span>{t("内容来自 BigPizzaV3/Ad-List，含置顶推荐与普通推荐。")}</span>
+              <span>{t("内容来自 Codex++ 广告源，含置顶推荐与普通推荐。")}</span>
             </div>
             <Button onClick={() => void actions.refreshAds()}>
               <RefreshCw className="h-4 w-4" />
@@ -16484,6 +16438,10 @@ function loadInitialTheme(): Theme {
 function loadInitialRoute(): Route {
   if (typeof window === "undefined") return "overview";
   const params = new URLSearchParams(window.location.search);
+  const previewRoute = params.get("previewRoute");
+  if (previewRoute && routes.some((item) => item.id === previewRoute)) {
+    return previewRoute as Route;
+  }
   if (params.get("showUpdate") === "1" || window.location.hash === "#about") {
     return "about";
   }
