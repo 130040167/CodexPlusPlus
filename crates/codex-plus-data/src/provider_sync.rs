@@ -4011,25 +4011,20 @@ fn thread_tombstone_path(codex_home: &Path) -> PathBuf {
 
 /// 读取删除墓碑（已删除、不得被索引重建复活的 thread id）。
 ///
-/// 兼容旧 JSON 墓碑；若已有持久删除状态，读取失败必须停止重建。
+/// 兼容旧 JSON 墓碑的容错行为。新的 SQLite 删除状态是权威记录，读取失败必须
+/// 停止重建，不能误把软删除历史当作活会话重新加入列表。
 fn load_thread_tombstones(codex_home: &Path) -> anyhow::Result<HashSet<String>> {
     let path = thread_tombstone_path(codex_home);
-    let mut ids: HashSet<String> = fs::read(&path)
-        .ok()
+    let mut ids: HashSet<String> = fs::read(&path).ok()
         .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
+        .unwrap_or_default().into_iter().collect();
+    // 持久删除状态不能受旧 JSON 墓碑的数量上限影响；读失败时停止重建。
     for path in codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(codex_home) {
-        if !path.is_file() {
-            continue;
-        }
+        if !path.is_file() { continue; }
         let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        if has_table(&db, "codex_plus_deleted_threads")? {
+        if crate::storage::has_table(&db, "codex_plus_deleted_threads")? {
             let mut stmt = db.prepare("SELECT thread_id FROM codex_plus_deleted_threads")?;
-            for id in stmt.query_map([], |row| row.get::<_, String>(0))? {
-                ids.insert(id?);
-            }
+            for id in stmt.query_map([], |row| row.get::<_, String>(0))? { ids.insert(id?); }
         }
     }
     Ok(ids)
