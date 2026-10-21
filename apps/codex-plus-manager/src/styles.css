@@ -9244,15 +9244,8 @@ select {
   font-size: 11px;
 }
 
-/* ── ZCode 增强页：对齐「Codex增强」的单列设置页 ───────────────── */
-/* 本页每组都是整行的信息/操作块，固定单列，避免继承增强页首组的三列网格。
-   增强页在 ≤1080px 的媒体查询里把首组改成两列（与这里同优先级），所以选择器
-   多带一个 .enhance-page 提高优先级，保证本页在任何宽度都是单列。 */
-.enhance-page.zcode-enhance-page .enhance-feature-groups .feature-group .feature-switch-grid {
-  grid-template-columns: 1fr;
-}
-
-/* 顶部状态徽标：与增强页其它小徽标同一套语义色。 */
+/* ── ZCode 增强页：结构复用「Codex增强」，这里只补少数组件样式 ───── */
+/* 顶栏状态徽标：与页面内的状态口径一致，语义色与 Codex 页徽标相同。 */
 .zcode-enhance-status {
   display: inline-flex;
   align-items: center;
@@ -9265,86 +9258,70 @@ select {
   font-size: 12px;
   white-space: nowrap;
 }
-.zcode-enhance-page .enhance-save-actions > .zcode-enhance-status {
-  color: hsl(var(--muted-foreground));
-  font-size: 12px;
-}
 .zcode-enhance-status i {
   width: 7px;
   height: 7px;
   border-radius: 50%;
   background: hsl(var(--muted-foreground));
 }
-.zcode-enhance-page .zcode-enhance-status-ok {
+.zcode-enhance-status-ok {
   color: hsl(var(--status-success));
   border-color: hsl(var(--status-success) / 0.4);
   background: hsl(var(--status-success) / 0.08);
 }
-.zcode-enhance-page .zcode-enhance-status-ok i {
+.zcode-enhance-status-ok i {
   background: hsl(var(--status-success));
   box-shadow: 0 0 8px hsl(var(--status-success) / 0.6);
 }
-.zcode-enhance-page .zcode-enhance-status-warn {
+.zcode-enhance-status-warn {
   color: hsl(var(--status-warning));
   border-color: hsl(var(--status-warning) / 0.4);
   background: hsl(var(--status-warning) / 0.08);
 }
-.zcode-enhance-page .zcode-enhance-status-warn i {
+.zcode-enhance-status-warn i {
   background: hsl(var(--status-warning));
 }
 
-/* 信息行：左侧标签、右侧值，沿用增强页开关卡的浅底与圆角。 */
-.zcode-enhance-info-row {
+/* 功能卡右侧的状态值/按钮区：沿用 feature-toggle 的浅底卡片，只接管右侧一列。 */
+.zcode-enhance-card-side {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) max-content;
-  gap: 12px;
-  align-items: baseline;
+  gap: 2px;
+  justify-items: end;
   min-width: 0;
-  padding: 10px 12px;
-  border-radius: 6px;
-  background: hsl(var(--surface-raised) / 0.55);
+  text-align: right;
 }
-.zcode-enhance-info-row > span {
-  color: hsl(var(--muted-foreground));
-  font-size: 12px;
-}
-.zcode-enhance-info-value {
-  min-width: 0;
+.zcode-enhance-card-side strong {
   font-size: 12px;
   font-weight: 550;
-  text-align: right;
-  white-space: nowrap;
 }
-.zcode-enhance-info-value.is-ok { color: hsl(var(--status-success)); }
-.zcode-enhance-info-value.is-warn { color: hsl(var(--status-warning)); }
-
-/* 操作行：左侧说明、右侧按钮，窄窗口自动换行。 */
-.zcode-enhance-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px 16px;
-  padding: 10px 12px;
-  border-radius: 6px;
-  background: hsl(var(--surface-raised) / 0.55);
-}
-.zcode-enhance-actions > small {
-  flex: 1 1 220px;
-  min-width: 0;
+.zcode-enhance-card-side small {
+  margin: 0;
   color: hsl(var(--muted-foreground));
   font-size: 11px;
-  line-height: 1.45;
+  line-height: 1.4;
 }
-.zcode-enhance-action-buttons {
+.zcode-enhance-card-side.is-ok strong { color: hsl(var(--status-success)); }
+.zcode-enhance-card-side.is-warn strong { color: hsl(var(--status-warning)); }
+.zcode-enhance-card-actions { align-items: start; }
+.zcode-enhance-card-buttons {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-left: auto;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
 }
 
-.zcode-enhance-field-hint {
-  margin: 2px 0 0;
+/* 组内整行提示：卡片是网格项，提示和错误块要占满整行。 */
+.zcode-enhance-page .feature-switch-grid > .hint-line,
+.zcode-enhance-page .feature-switch-grid > .field-hint {
+  grid-column: 1 / -1;
+}
+.zcode-enhance-page .feature-switch-grid > .field-hint {
+  margin: 0;
+}
+
+/* 语音输入标签页只有一组两张卡：固定两列，避免落到首组的三列网格里留空。 */
+.zcode-enhance-page .enhance-feature-groups.zcode-enhance-voice-tab .feature-switch-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .zcode-enhance-error {
