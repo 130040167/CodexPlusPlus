@@ -206,6 +206,10 @@ pub(crate) fn is_managed_protocol_proxy_base_url(value: &str) -> bool {
         .any(|url| parsed.as_str() == url)
 }
 
+fn reset_first_output_for_retry(first_output_at_ms: &mut Option<u64>) {
+    *first_output_at_ms = None;
+}
+
 #[cfg(test)]
 mod managed_port_history_tests {
     use super::*;
@@ -223,6 +227,44 @@ mod managed_port_history_tests {
             read_protocol_proxy_port_history(&dir.path().join(PROTOCOL_PROXY_PORT_HISTORY_FILE)),
             BTreeSet::from([58077, 58088, 58099]),
         );
+    }
+
+    #[test]
+    fn local_proxy_detection_accepts_historical_and_rejects_unmanaged_ports() {
+        let managed_urls = [
+            local_responses_proxy_base_url(57321),
+            local_responses_proxy_base_url(58077),
+            local_responses_proxy_base_url(58099),
+        ];
+        for base_url in [
+            "http://127.0.0.1:57321",
+            "http://localhost:58077/v1",
+            "http://[::1]:58099/v1/",
+        ] {
+            assert!(
+                is_local_protocol_proxy_base_url_with_managed_urls(base_url, &managed_urls),
+                "{base_url}"
+            );
+        }
+        for base_url in [
+            "http://127.0.0.1:58078/v1",
+            "http://127.0.0.1:58100/v1",
+        ] {
+            assert!(
+                !is_local_protocol_proxy_base_url_with_managed_urls(base_url, &managed_urls),
+                "{base_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_clears_first_output_time_before_next_attempt() {
+        let mut first_output_at_ms = Some(1_000);
+        reset_first_output_for_retry(&mut first_output_at_ms);
+        assert_eq!(first_output_at_ms, None);
+
+        first_output_at_ms = Some(2_500);
+        assert_eq!(first_output_at_ms, Some(2_500));
     }
 }
 
@@ -4262,7 +4304,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                             }
                             request_trace.attempt_details.push(detail);
                             record_rotation_failure(rotation_snapshot.as_ref());
-                            request_trace.first_output_at_ms = None;
+                            reset_first_output_for_retry(&mut request_trace.first_output_at_ms);
                             candidate_index = 0;
                             continue 'request_attempts;
                         }
@@ -4381,7 +4423,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                                 );
                             }
                             request_trace.attempt_details.push(detail);
-                            request_trace.first_output_at_ms = None;
+                            reset_first_output_for_retry(&mut request_trace.first_output_at_ms);
                             candidate_index = 0;
                             continue 'request_attempts;
                         }
@@ -5680,16 +5722,33 @@ fn image_endpoint_url(base_url: &str, endpoint: &str) -> String {
 }
 
 fn is_local_protocol_proxy_base_url(base_url: &str) -> bool {
+    is_local_protocol_proxy_base_url_with_managed_urls(
+        base_url,
+        &managed_protocol_proxy_base_urls(),
+    )
+}
+
+fn is_local_protocol_proxy_base_url_with_managed_urls(
+    base_url: &str,
+    managed_urls: &[String],
+) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
         return false;
     };
-    if !url.scheme().eq_ignore_ascii_case("http") || url.port() != Some(protocol_proxy_port()) {
+    if !url.scheme().eq_ignore_ascii_case("http") {
         return false;
     }
-    matches!(
+    let is_loopback = matches!(
         url.host_str(),
         Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
-    )
+    );
+    let is_managed_port = managed_urls
+        .iter()
+        .filter_map(|managed| reqwest::Url::parse(managed).ok())
+        .any(|managed| managed.port() == url.port());
+    is_loopback
+        && is_managed_port
+        && matches!(url.path().trim_end_matches('/'), "" | "/v1")
 }
 
 #[cfg(test)]
@@ -5722,6 +5781,39 @@ mod image_proxy_tests {
             "not-a-url",
         ] {
             assert!(!is_local_protocol_proxy_base_url(base_url), "{base_url}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod managed_port_detection_tests {
+    use super::{is_local_protocol_proxy_base_url_with_managed_urls, local_responses_proxy_base_url};
+
+    #[test]
+    fn historical_ports_are_accepted_but_unmanaged_ports_are_rejected() {
+        let managed_urls = [
+            local_responses_proxy_base_url(57321),
+            local_responses_proxy_base_url(58077),
+            local_responses_proxy_base_url(58099),
+        ];
+        for base_url in [
+            "http://127.0.0.1:57321",
+            "http://localhost:58077/v1",
+            "http://[::1]:58099/v1/",
+        ] {
+            assert!(
+                is_local_protocol_proxy_base_url_with_managed_urls(base_url, &managed_urls),
+                "{base_url}"
+            );
+        }
+        for base_url in [
+            "http://127.0.0.1:58078/v1",
+            "http://127.0.0.1:58100/v1",
+        ] {
+            assert!(
+                !is_local_protocol_proxy_base_url_with_managed_urls(base_url, &managed_urls),
+                "{base_url}"
+            );
         }
     }
 }
