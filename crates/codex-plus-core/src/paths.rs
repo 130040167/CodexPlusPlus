@@ -68,6 +68,14 @@ fn read_settings_path_pointer() -> Option<PathBuf> {
 }
 
 pub fn set_settings_path_pointer(target: Option<&Path>) -> std::io::Result<()> {
+    // 指针文件是全局的，而设置了状态目录覆盖的多开实例读取时会忽略它：
+    // 在多开实例里写入只会改掉主实例的配置路径，自己却不生效。
+    if state_dir_override().is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "多开实例使用独立的状态目录，不支持修改配置文件路径；请在主实例中修改",
+        ));
+    }
     let pointer = settings_path_pointer_path();
     match target {
         Some(target) => {
