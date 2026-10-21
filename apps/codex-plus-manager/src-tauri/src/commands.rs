@@ -3542,8 +3542,7 @@ pub fn save_settings(mut settings: BackendSettings, expected_revision: Option<St
             }
             // 自动接管是常驻行为，保存后立刻生效，不必重启管理器。
             crate::auto_takeover::apply_enabled(settings.codex_app_auto_takeover);
-            let mut result = settings_payload("设置已保存。", "设置保存后重新读取失败");
-            result
+            settings_payload("设置已保存。", "设置保存后重新读取失败")
         }
         Err(error) => {
             let _ = codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
