@@ -502,13 +502,66 @@ fn config_catalog_pointer(config: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn direct_catalog_refresh_supported(profile: &RelayProfile) -> bool {
+    matches!(profile.relay_mode, RelayMode::PureApi | RelayMode::MixedApi)
+}
+
+fn direct_catalog_fields_equal(previous: &RelayProfile, next: &RelayProfile) -> bool {
+    crate::relay_config::relay_profile_model(previous)
+        == crate::relay_config::relay_profile_model(next)
+        && previous.model == next.model
+        && previous.model_list == next.model_list
+        && previous.model_windows == next.model_windows
+        && previous.model_auto_compact == next.model_auto_compact
+        && previous.model_metadata == next.model_metadata
+        && previous.context_window == next.context_window
+        && previous.auto_compact_limit == next.auto_compact_limit
+        && previous.protocol == next.protocol
+        && previous.relay_mode == next.relay_mode
+        && previous.base_url == next.base_url
+        && previous.upstream_base_url == next.upstream_base_url
+        && previous.official_mix_api_key == next.official_mix_api_key
+}
+
+fn active_catalog(
+    settings: &BackendSettings,
+) -> anyhow::Result<(String, String, String)> {
+    if let Some(aggregate) = settings.active_aggregate_relay_profile() {
+        let catalog = build_catalog_json(settings, &aggregate)?;
+        let payload: Value = serde_json::from_str(&catalog)?;
+        return Ok((aggregate.id, catalog, catalog_default_model(&payload).to_string()));
+    }
+    let profile = settings.active_relay_profile();
+    let catalog = build_member_catalog_json(
+        &profile,
+        false,
+        crate::relay_config::uses_official_deepseek_responses(&profile),
+    )?;
+    let model = crate::relay_config::relay_profile_model(&profile);
+    Ok((profile.id, catalog, model))
+}
+
+fn configured_default_model(settings: &BackendSettings) -> String {
+    if let Some(aggregate) = settings.active_aggregate_relay_profile() {
+        if let Some(profile) = settings
+            .relay_profiles
+            .iter()
+            .find(|profile| profile.id == aggregate.default_relay_id)
+        {
+            return crate::relay_config::relay_profile_model(profile);
+        }
+    }
+    crate::relay_config::relay_profile_model(&settings.active_relay_profile())
+}
+
 /// 在读取/保存入口恢复崩溃时已提交 settings、尚未发布的目录。不会覆盖外部改动。
 pub fn recover_pending_catalog_refresh(store: &SettingsStore, home: &Path) -> anyhow::Result<bool> {
     let settings = store.load()?;
-    let Some(aggregate) = settings.active_aggregate_relay_profile() else {
+    if !settings.relay_profiles_enabled {
         return Ok(false);
-    };
-    let journal = refresh_journal_path(home, &aggregate.id);
+    }
+    let id = settings.active_relay_profile().id;
+    let journal = refresh_journal_path(home, &id);
     let text = match std::fs::read_to_string(&journal) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -521,14 +574,14 @@ pub fn recover_pending_catalog_refresh(store: &SettingsStore, home: &Path) -> an
         pending["status"].as_str(),
         Some("prepared" | "settings_committed")
     ) || pending["settingsRevision"].as_str() != Some(settings.settings_revision.as_str())
-        || pending["aggregateId"].as_str() != Some(aggregate.id.as_str())
+        || pending["aggregateId"].as_str() != Some(id.as_str())
     {
         return Ok(false);
     }
     store.with_current_revision(&settings.settings_revision, || {
         let Some(path) = pending["catalogPath"]
             .as_str()
-            .and_then(|p| owned_catalog_path(home, &aggregate.id, p))
+            .and_then(|p| owned_catalog_path(home, &id, p))
         else {
             return Ok(false);
         };
@@ -542,7 +595,7 @@ pub fn recover_pending_catalog_refresh(store: &SettingsStore, home: &Path) -> an
         let config_path = home.join("config.toml");
         let config = std::fs::read_to_string(&config_path)?;
         let already_published = config_catalog_pointer(&config)
-            .and_then(|pointer| owned_catalog_path(home, &aggregate.id, &pointer))
+            .and_then(|pointer| owned_catalog_path(home, &id, &pointer))
             == Some(path.clone());
         if !already_published {
             if pending["previousConfigHash"].as_str()
@@ -554,6 +607,9 @@ pub fn recover_pending_catalog_refresh(store: &SettingsStore, home: &Path) -> an
             }
             let mut doc: toml_edit::DocumentMut = config.parse()?;
             doc["model_catalog_json"] = toml_edit::value(path.to_string_lossy().as_ref());
+            if let Some(model) = pending["model"].as_str() {
+                doc["model"] = toml_edit::value(model);
+            }
             crate::settings::atomic_write(&config_path, doc.to_string().as_bytes())?;
         }
         pending["status"] = json!("completed");
@@ -562,7 +618,7 @@ pub fn recover_pending_catalog_refresh(store: &SettingsStore, home: &Path) -> an
     })
 }
 
-/// 成员编辑只发布新的不可变目录及配置指针，不执行供应商切换或重启。
+/// 模型编辑发布新的不可变目录及配置默认，不执行供应商切换或重启。
 pub fn save_with_active_catalog_refresh(
     store: &SettingsStore,
     home: &Path,
@@ -581,17 +637,21 @@ fn save_with_catalog_publisher(
 ) -> anyhow::Result<String> {
     recover_pending_catalog_refresh(store, home)?;
     let previous = store.load()?;
-    let Some(aggregate) = next.active_aggregate_relay_profile() else {
-        return store.save_versioned(next);
-    };
     if !next.relay_profiles_enabled
         || previous.active_relay_id != next.active_relay_id
         || previous.active_aggregate_relay_id != next.active_aggregate_relay_id
     {
         return store.save_versioned(next);
     }
-    let catalog = build_catalog_json(next, &aggregate)?;
-    crate::relay_config::validate_managed_model_catalog(&catalog)?;
+    if next.active_aggregate_relay_profile().is_none() {
+        let previous_profile = previous.active_relay_profile();
+        let next_profile = next.active_relay_profile();
+        if !direct_catalog_refresh_supported(&next_profile)
+            || direct_catalog_fields_equal(&previous_profile, &next_profile)
+        {
+            return store.save_versioned(next);
+        }
+    }
     let config_path = home.join("config.toml");
     let config = match std::fs::read_to_string(&config_path) {
         Ok(config) => config,
@@ -600,31 +660,58 @@ fn save_with_catalog_publisher(
         }
         Err(error) => return Err(error.into()),
     };
+    let active_id = next
+        .active_aggregate_relay_profile()
+        .map(|aggregate| aggregate.id.clone())
+        .unwrap_or_else(|| next.active_relay_profile().id.clone());
     let Some(pointer) = config_catalog_pointer(&config)
-        .and_then(|pointer| owned_catalog_path(home, &aggregate.id, &pointer))
+        .and_then(|pointer| owned_catalog_path(home, &active_id, &pointer))
     else {
         return store.save_versioned(next);
     };
-    if std::fs::read_to_string(&pointer)? == catalog {
+    let profile = previous.active_relay_profile();
+    if !crate::relay_config::live_endpoint_matches_profile(&profile, &config)
+        && !crate::relay_config::recognized_managed_proxy_endpoint(&profile, &config)
+    {
+        return store.save_versioned(next);
+    }
+    let (id, catalog, default_model) = active_catalog(next)?;
+    crate::relay_config::validate_managed_model_catalog(&catalog)?;
+    let mut doc: toml_edit::DocumentMut = config.parse()?;
+    let live_model = doc.get("model").and_then(|item| item.as_str()).unwrap_or("");
+    let old_default = configured_default_model(&previous);
+    let payload: Value = serde_json::from_str(&catalog)?;
+    let live_exists = payload["models"].as_array().is_some_and(|models|
+        models.iter().any(|model| model["slug"].as_str() == Some(live_model)));
+    let update_model = !default_model.is_empty()
+        && (live_model.is_empty() || live_model == old_default || !live_exists);
+    if update_model {
+        doc["model"] = toml_edit::value(default_model.as_str());
+    }
+    let journal_model = doc
+        .get("model")
+        .and_then(|item| item.as_str())
+        .map(str::to_string);
+    if std::fs::read_to_string(&pointer)? == catalog && doc.to_string() == config {
         return store.save_versioned(next);
     }
     let digest = format!("{:x}", Sha256::digest(catalog.as_bytes()));
     let staged = home.join("model-catalogs").join(format!(
         "aggregate-{}-{digest}.json",
-        aggregate_publication_key(&aggregate.id)
+        aggregate_publication_key(&id)
     ));
-    let journal = refresh_journal_path(home, &aggregate.id);
+    let journal = refresh_journal_path(home, &id);
     let write_journal = |status: &str, revision: &str| -> anyhow::Result<()> {
         crate::settings::atomic_write(
             &journal,
             &serde_json::to_vec_pretty(&json!({
-                "status": status, "settingsRevision": revision, "aggregateId": aggregate.id,
+                "status": status, "settingsRevision": revision, "aggregateId": id,
+                "model": journal_model,
                 "catalogPath": std::path::absolute(&staged)?, "catalogHash": digest,
                 "previousConfigHash": format!("{:x}", Sha256::digest(config.as_bytes())),
             }))?,
         )
     };
-    let mut doc: toml_edit::DocumentMut = config.parse()?;
     doc["model_catalog_json"] =
         toml_edit::value(std::path::absolute(&staged)?.to_string_lossy().as_ref());
     let result = store.save_with_prepared_commit(
@@ -738,13 +825,27 @@ pub(crate) fn catalog_default_model(payload: &Value) -> &str {
 }
 
 fn build_member_catalog(profile: &RelayProfile) -> anyhow::Result<Value> {
+    let catalog_json = build_member_catalog_json(profile, false, false)?;
+    Ok(serde_json::from_str(&catalog_json)?)
+}
+
+fn build_member_catalog_json(
+    profile: &RelayProfile,
+    lite_supported: bool,
+    official_deepseek: bool,
+) -> anyhow::Result<String> {
     let entries = profile_catalog_entries(profile)?;
     if entries.is_empty() {
-        return Ok(json!({ "models": [] }));
+        return Ok(r#"{"models":[]}"#.to_string());
     }
     let fallback = parse_window_token(&profile.context_window);
-    let catalog_json =
-        build_model_catalog_json_with_capabilities(&entries, fallback, None, Some(false), false);
+    let catalog_json = build_model_catalog_json_with_capabilities(
+        &entries,
+        fallback,
+        None,
+        (!lite_supported).then_some(false),
+        official_deepseek,
+    );
     let metadata = crate::relay_config::parse_model_metadata_map(&profile.model_metadata)?;
     let catalog_json =
         crate::relay_config::apply_model_metadata_overrides(&catalog_json, &metadata)?;
@@ -755,7 +856,8 @@ fn build_member_catalog(profile: &RelayProfile) -> anyhow::Result<Value> {
     } else {
         catalog_json
     };
-    Ok(serde_json::from_str(&catalog_json)?)
+    crate::relay_config::validate_managed_model_catalog(&catalog_json)?;
+    Ok(catalog_json)
 }
 
 fn parse_string_map(raw: &str, field: &str) -> anyhow::Result<HashMap<String, String>> {
@@ -899,8 +1001,138 @@ mod tests {
         store.save(&settings()).unwrap();let loaded=store.load().unwrap();let aggregate=active_model_aggregation(&loaded).unwrap();
         let home=temp.path().join("home");std::fs::create_dir_all(home.join("model-catalogs")).unwrap();
         let path=home.join("model-catalogs/agg.json");std::fs::write(&path,build_catalog_json(&loaded,&aggregate).unwrap()).unwrap();
-        std::fs::write(home.join("config.toml"),format!("model_catalog_json = {:?}\n",path.to_str().unwrap())).unwrap();
+        std::fs::write(home.join("config.toml"),format!(
+            "model_catalog_json = {:?}\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = {:?}\n",
+            path.to_str().unwrap(),
+            crate::protocol_proxy::local_responses_proxy_base_url(crate::protocol_proxy::protocol_proxy_port()),
+        )).unwrap();
         (temp,store,home)
+    }
+
+    const DIRECT_TRANSPORT: &str = "\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://deepseek.example/v1\"\n";
+
+    fn direct_publication_fixture() -> (tempfile::TempDir, SettingsStore, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        let mut initial = settings();
+        initial.active_relay_id = "deepseek".into();
+        initial.active_aggregate_relay_id.clear();
+        initial.relay_profiles[0].config_contents = "model = \"deepseek-chat\"\n".into();
+        store.save(&initial).unwrap();
+        let loaded = store.load().unwrap();
+        let profile = loaded.active_relay_profile();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(home.join("model-catalogs")).unwrap();
+        let catalog = serde_json::to_string_pretty(&build_member_catalog(&profile).unwrap()).unwrap();
+        let path = home.join("model-catalogs/deepseek.json");
+        std::fs::write(&path, &catalog).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            format!(
+                "model = {:?}\nmodel_catalog_json = {:?}\n{DIRECT_TRANSPORT}",
+                crate::relay_config::relay_profile_model(&profile),
+                path.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        (temp, store, home)
+    }
+
+    #[test]
+    fn direct_catalog_refresh_updates_default_but_preserves_live_choice() {
+        let (_temp, store, home) = direct_publication_fixture();
+        let mut next = store.load().unwrap();
+        next.relay_profiles[0].model_list = "deepseek-chat\ndeepseek-reasoner".into();
+        next.relay_profiles[0].model = "deepseek-reasoner".into();
+        next.relay_profiles[0].config_contents = "model = \"deepseek-reasoner\"\n".into();
+        save_with_active_catalog_refresh(&store, &home, &next).unwrap();
+        let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(config.contains("model = \"deepseek-reasoner\""));
+
+        let mut selected = store.load().unwrap();
+        selected.relay_profiles[0].model_list = "deepseek-chat\ndeepseek-reasoner\nkimi-k3".into();
+        selected.relay_profiles[0].model = "deepseek-reasoner".into();
+        selected.relay_profiles[0].config_contents = "model = \"deepseek-reasoner\"\n".into();
+        std::fs::write(home.join("config.toml"), format!("model = \"deepseek-chat\"\nmodel_catalog_json = \"model-catalogs/deepseek.json\"\n{DIRECT_TRANSPORT}")).unwrap();
+        save_with_active_catalog_refresh(&store, &home, &selected).unwrap();
+        let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(config.contains("model = \"deepseek-chat\""));
+    }
+
+    #[test]
+    fn direct_catalog_refresh_recovers_model_and_pointer_from_journal() {
+        let (_temp, store, home) = direct_publication_fixture();
+        let mut next = store.load().unwrap();
+        next.relay_profiles[0].model_list = "deepseek-reasoner\ndeepseek-chat".into();
+        next.relay_profiles[0].model = "deepseek-reasoner".into();
+        next.relay_profiles[0].config_contents = "model = \"deepseek-reasoner\"\n".into();
+        let id = next.active_relay_profile().id;
+        let catalog = serde_json::to_string_pretty(&build_member_catalog(&next.active_relay_profile()).unwrap()).unwrap();
+        let digest = format!("{:x}", Sha256::digest(catalog.as_bytes()));
+        let staged = home.join("model-catalogs").join(format!("aggregate-{}-{digest}.json", aggregate_publication_key(&id)));
+        std::fs::write(&staged, catalog).unwrap();
+        let revision = store.save_versioned(&next).unwrap();
+        let journal = refresh_journal_path(&home, &id);
+        std::fs::write(&journal, serde_json::to_vec(&json!({
+            "status": "prepared", "settingsRevision": revision, "aggregateId": id,
+            "catalogPath": std::path::absolute(&staged).unwrap(),
+            "catalogHash": digest, "previousConfigHash": format!("{:x}", Sha256::digest(std::fs::read(home.join("config.toml")).unwrap())),
+            "model": "deepseek-reasoner"
+        })).unwrap()).unwrap();
+        assert!(recover_pending_catalog_refresh(&store, &home).unwrap());
+        assert!(std::fs::read_to_string(home.join("config.toml")).unwrap().contains("deepseek-reasoner"));
+    }
+
+    #[test]
+    fn direct_catalog_refresh_preserves_external_transport_even_with_owned_pointer() {
+        let (_temp, store, home) = direct_publication_fixture();
+        let config_path = home.join("config.toml");
+        let mut config: toml_edit::DocumentMut =
+            std::fs::read_to_string(&config_path).unwrap().parse().unwrap();
+        config["model"] = toml_edit::value("external-model");
+        config["model_providers"]["custom"]["base_url"] =
+            toml_edit::value("http://127.0.0.1:58077/v1");
+        std::fs::write(&config_path, config.to_string()).unwrap();
+        let before = std::fs::read(&config_path).unwrap();
+        let catalog_path = home.join("model-catalogs/deepseek.json");
+        let catalog_before = std::fs::read(&catalog_path).unwrap();
+        let mut next = store.load().unwrap();
+        next.relay_profiles[0].model_list.push_str("\nnew-model");
+        save_with_active_catalog_refresh(&store, &home, &next).unwrap();
+        assert_eq!(std::fs::read(&config_path).unwrap(), before);
+        assert_eq!(std::fs::read(&catalog_path).unwrap(), catalog_before);
+        assert!(store.load().unwrap().relay_profiles[0].model_list.contains("new-model"));
+    }
+
+    #[test]
+    fn unrelated_direct_settings_save_preserves_catalog_bytes() {
+        let (_temp, store, home) = direct_publication_fixture();
+        let config_before = std::fs::read(home.join("config.toml")).unwrap();
+        let catalog_before = std::fs::read(home.join("model-catalogs/deepseek.json")).unwrap();
+        let mut next = store.load().unwrap();
+        next.relay_preserve_nonprovider_settings = !next.relay_preserve_nonprovider_settings;
+        save_with_active_catalog_refresh(&store, &home, &next).unwrap();
+        assert_eq!(std::fs::read(home.join("config.toml")).unwrap(), config_before);
+        assert_eq!(std::fs::read(home.join("model-catalogs/deepseek.json")).unwrap(), catalog_before);
+    }
+
+    #[test]
+    fn aggregate_catalog_refresh_preserves_external_transport_with_owned_pointer() {
+        for aggregation in [true, false] {
+            let (_temp, store, home) = publication_fixture();
+            let config_path = home.join("config.toml");
+            let mut config: toml_edit::DocumentMut =
+                std::fs::read_to_string(&config_path).unwrap().parse().unwrap();
+            config["model_providers"]["custom"]["base_url"] =
+                toml_edit::value("http://127.0.0.1:58077/v1");
+            std::fs::write(&config_path, config.to_string()).unwrap();
+            let before = std::fs::read(&config_path).unwrap();
+            let mut next = store.load().unwrap();
+            next.aggregate_relay_profiles[0].model_aggregation_enabled = aggregation;
+            next.relay_profiles[0].model_list.push_str("\nnew-model");
+            save_with_active_catalog_refresh(&store, &home, &next).unwrap();
+            assert_eq!(std::fs::read(&config_path).unwrap(), before);
+        }
     }
 
     #[test]
