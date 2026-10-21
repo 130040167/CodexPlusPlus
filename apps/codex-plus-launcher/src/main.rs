@@ -404,7 +404,8 @@ fn effective_resume_state_dir(options: &LaunchOptions) -> Option<PathBuf> {
 fn effective_resume_codex_home(options: &LaunchOptions) -> PathBuf {
     options
         .codex_home
-        .clone()
+        .as_ref()
+        .cloned()
         .unwrap_or_else(codex_plus_core::relay_config::default_codex_home_dir)
 }
 
@@ -431,7 +432,7 @@ fn normalized_resume_path(path: &Path) -> Result<PathBuf> {
             other => normalized.push(other.as_os_str()),
         }
     }
-    // 目录尚未创建时仍解析已有祖先的符号链接。
+    // 目录尚未创建时仍解析已有祖先的符号链接，避免创建前后的路径身份改变。
     let mut ancestor = normalized.as_path();
     let mut tail = Vec::new();
     let resolved = loop {
@@ -514,7 +515,7 @@ fn write_resume_owner_for_ready_session(
         });
         let path = state_dir.join(RESUME_OWNER_FILE);
         std::fs::create_dir_all(&state_dir)?;
-        // 先使旧归属失效；发布失败时不得接受旧 receipt。
+        // 先使旧归属失效；替换写入失败时不能继续接受原来的有效 receipt。
         std::fs::write(&path, b"null\n")?;
         codex_plus_core::settings::atomic_write(&path, &serde_json::to_vec_pretty(&receipt)?)
     })();
@@ -524,12 +525,14 @@ fn write_resume_owner_for_ready_session(
         .unwrap_or_else(|error| error.into_inner());
     failed.retain(|path| path != &state_key);
     if result.is_err() {
+        // 若权限连旧文件失效都不允许，当前进程仍必须拒绝自动恢复。
         failed.push(state_key);
     }
     result
 }
 
 /// 默认生产目录保留旧行为；隔离实例必须有显式 start 产生的独立归属回执。
+/// 老隔离实例仅有 status（含误接管留下的 9229）不构成归属，须显式启动一次迁移。
 pub fn automatic_resume_allowed(options: &LaunchOptions) -> Result<bool> {
     automatic_resume_allowed_in_state_dir(
         effective_resume_state_dir(options).as_deref(),
@@ -555,6 +558,7 @@ fn automatic_resume_allowed_in_state_dir(
     if debug_port == 0 || resume_owner_write_failed(&state_key) {
         return Ok(false);
     }
+    // status 仅确认端口一致，不能证明这个隔离实例曾显式拥有该端点。
     let latest = codex_plus_core::status::StatusStore::new(state_dir.join("latest-status.json"))
         .load_latest()?;
     if latest.and_then(|status| status.debug_port) != Some(debug_port) {
@@ -583,7 +587,7 @@ fn automatic_resume_allowed_in_state_dir(
     Ok(normalized_resume_path(recorded_home)? == normalized_resume_path(codex_home)?)
 }
 
-/// 只恢复已有 Codex 的后台服务。隔离归属不明或端点不存在时不启动官方应用。
+/// 只恢复已有 Codex 的后台服务。隔离归属不明或调试端点不存在时不启动或重启官方应用。
 pub fn resume_if_running(options: LaunchOptions) -> Result<bool> {
     if !automatic_resume_allowed(&options)? {
         return Ok(false);
@@ -2384,10 +2388,49 @@ mod tests {
         RuntimeCommand::Start(options, 100, false, reply)
     }
 
-    fn test_resume_probe(options: &LaunchOptions) -> SessionProbe {
+    #[test]
+    fn automatic_resume_preserves_production_default_without_a_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let production = dir.path().join(".codex-session-delete");
+        let home = dir.path().join("codex");
+        assert!(automatic_resume_allowed_in_state_dir(None, 9229, &home, &production).unwrap());
+        // 显式默认 override 与无 override 同属生产，不要求 status 或 receipt。
+        std::fs::create_dir_all(production.join("nested")).unwrap();
+        assert!(
+            automatic_resume_allowed_in_state_dir(
+                Some(&production.join("nested").join("..")),
+                9229,
+                &home,
+                &production,
+            )
+            .unwrap()
+        );
+        let options = LaunchOptions {
+            state_dir: Some(production_resume_state_dir().join(".")),
+            codex_home: Some(home),
+            ..Default::default()
+        };
+        assert!(automatic_resume_allowed(&options).unwrap());
+        assert!(!production.join(RESUME_OWNER_FILE).exists());
+    }
+
+    fn write_test_resume_owner(state_dir: &Path, debug_port: u16, home: &Path) {
+        std::fs::write(
+            state_dir.join(RESUME_OWNER_FILE),
+            serde_json::to_vec(&json!({
+                "version": RESUME_OWNER_VERSION,
+                "debug_port": debug_port,
+                "codex_home": normalized_resume_path(home).unwrap(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn test_resume_owner_probe(options: &LaunchOptions, debug_port: u16) -> SessionProbe {
         SessionProbe {
-            debug_port: options.debug_port,
-            helper_port: options.helper_port,
+            debug_port,
+            helper_port: 19402,
             app_dir: None,
             started_at_ms: 100,
             state_dir: effective_resume_state_dir(options),
@@ -2396,106 +2439,31 @@ mod tests {
     }
 
     #[test]
-    fn automatic_resume_preserves_production_and_requires_isolated_ownership() {
+    fn automatic_resume_rejects_isolated_state_without_a_usable_record() {
         let dir = tempfile::tempdir().unwrap();
-        let production = dir.path().join("production");
-        let home = dir.path().join("codex");
-        assert!(automatic_resume_allowed_in_state_dir(None, 9229, &home, &production).unwrap());
-        assert!(
-            automatic_resume_allowed_in_state_dir(Some(&production), 9229, &home, &production,)
-                .unwrap()
-        );
-        let options = LaunchOptions {
-            state_dir: Some(dir.path().to_path_buf()),
-            codex_home: Some(home),
-            debug_port: 19401,
-            ..Default::default()
-        };
-        assert!(!automatic_resume_allowed(&options).unwrap());
-        let store =
-            codex_plus_core::status::StatusStore::new(dir.path().join("latest-status.json"));
-        std::fs::write(dir.path().join("latest-status.json"), b"broken").unwrap();
-        assert!(!automatic_resume_allowed(&options).unwrap());
-        store
-            .save_latest(&LaunchStatus {
-                debug_port: Some(19401),
-                ..Default::default()
-            })
-            .unwrap();
-        // status 本身不构成归属，自动续接不能自行补发回执。
-        assert!(!resume_if_running(options.clone()).unwrap());
-        assert!(!dir.path().join(RESUME_OWNER_FILE).exists());
-        let probe = test_resume_probe(&options);
-        write_resume_owner_for_ready_session(&options, Some(&probe)).unwrap();
-        assert!(automatic_resume_allowed(&options).unwrap());
-        store
-            .save_latest(&LaunchStatus {
-                debug_port: Some(9229),
-                ..Default::default()
-            })
-            .unwrap();
-        assert!(!automatic_resume_allowed(&options).unwrap());
-        let zero_port = LaunchOptions {
-            debug_port: 0,
-            ..options
-        };
-        assert!(!automatic_resume_allowed(&zero_port).unwrap());
-    }
-
-    #[test]
-    fn automatic_resume_checks_receipt_fields_and_uses_only_its_state_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let unrelated = tempfile::tempdir().unwrap();
         let options = LaunchOptions {
             state_dir: Some(dir.path().to_path_buf()),
             codex_home: Some(dir.path().join("codex")),
-            debug_port: 19401,
-            status_store: codex_plus_core::status::StatusStore::new(
-                unrelated.path().join("latest-status.json"),
-            ),
             ..Default::default()
         };
-        options
-            .status_store
-            .save_latest(&LaunchStatus {
-                debug_port: Some(19401),
-                ..Default::default()
-            })
-            .unwrap();
-        let probe = test_resume_probe(&options);
-        write_resume_owner_for_ready_session(&options, Some(&probe)).unwrap();
         assert!(!automatic_resume_allowed(&options).unwrap());
-        codex_plus_core::status::StatusStore::new(dir.path().join("latest-status.json"))
+
+        let path = dir.path().join("latest-status.json");
+        std::fs::write(&path, b"invalid-json").unwrap();
+        assert!(!automatic_resume_allowed(&options).unwrap());
+
+        let store = codex_plus_core::status::StatusStore::new(path);
+        store.save_latest(&LaunchStatus::default()).unwrap();
+        assert!(!automatic_resume_allowed(&options).unwrap());
+        store
             .save_latest(&LaunchStatus {
-                debug_port: Some(19401),
+                debug_port: Some(0),
                 ..Default::default()
             })
             .unwrap();
-        assert!(automatic_resume_allowed(&options).unwrap());
-        let path = dir.path().join(RESUME_OWNER_FILE);
-        let valid: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        for (field, invalid) in [
-            ("version", json!(0)),
-            ("version", json!("1")),
-            ("debug_port", json!(9229)),
-            ("debug_port", json!("19401")),
-            ("codex_home", json!(dir.path().join("other"))),
-            ("codex_home", json!("relative")),
-            ("codex_home", Value::Null),
-        ] {
-            let mut receipt = valid.clone();
-            receipt[field] = invalid;
-            std::fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
-            assert!(!automatic_resume_allowed(&options).unwrap(), "{field}");
-        }
-        for bytes in [b"broken".as_slice(), b"null", b"{}", b"[]"] {
-            std::fs::write(&path, bytes).unwrap();
-            assert!(!automatic_resume_allowed(&options).unwrap());
-        }
-        write_resume_owner_for_ready_session(&options, Some(&probe)).unwrap();
         assert!(
             !automatic_resume_allowed(&LaunchOptions {
-                codex_home: Some(dir.path().join("other")),
+                debug_port: 0,
                 ..options
             })
             .unwrap()
@@ -2503,7 +2471,186 @@ mod tests {
     }
 
     #[test]
-    fn explicit_resume_owner_requires_ready_scope_and_failure_invalidates_old_owner() {
+    fn automatic_resume_uses_only_the_isolated_directorys_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+        let unrelated_store =
+            codex_plus_core::status::StatusStore::new(unrelated.path().join("latest-status.json"));
+        unrelated_store
+            .save_latest(&LaunchStatus {
+                debug_port: Some(9229),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut options = LaunchOptions {
+            state_dir: Some(dir.path().to_path_buf()),
+            codex_home: Some(dir.path().join("codex")),
+            status_store: unrelated_store,
+            ..Default::default()
+        };
+        let home = effective_resume_codex_home(&options);
+        write_test_resume_owner(unrelated.path(), 19401, &home);
+        assert!(!automatic_resume_allowed(&options).unwrap());
+
+        let store =
+            codex_plus_core::status::StatusStore::new(dir.path().join("latest-status.json"));
+        store
+            .save_latest(&LaunchStatus {
+                debug_port: Some(19401),
+                helper_port: Some(19402),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!automatic_resume_allowed(&options).unwrap());
+        options.debug_port = 19401;
+        assert!(!automatic_resume_allowed(&options).unwrap());
+        write_test_resume_owner(dir.path(), 19401, &home);
+        assert!(automatic_resume_allowed(&options).unwrap());
+        assert!(
+            automatic_resume_allowed(&LaunchOptions {
+                codex_home: Some(home.join(".")),
+                ..options.clone()
+            })
+            .unwrap()
+        );
+        // 只通过环境指定隔离目录的 manager 使用同一规则，无需修改进程环境。
+        assert!(
+            automatic_resume_allowed_in_state_dir(
+                Some(dir.path()),
+                options.debug_port,
+                &home,
+                &production_resume_state_dir(),
+            )
+            .unwrap()
+        );
+        // 9229 本身不是禁用端口；必须同时有显式归属，不能仅凭旧 status。
+        store
+            .save_latest(&LaunchStatus {
+                debug_port: Some(9229),
+                ..Default::default()
+            })
+            .unwrap();
+        options.debug_port = 9229;
+        assert!(!automatic_resume_allowed(&options).unwrap());
+        write_test_resume_owner(dir.path(), 9229, &home);
+        assert!(automatic_resume_allowed(&options).unwrap());
+    }
+
+    #[test]
+    fn automatic_resume_rejects_old_polluted_status_and_does_not_mint_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = LaunchOptions {
+            state_dir: Some(dir.path().to_path_buf()),
+            codex_home: Some(dir.path().join("codex")),
+            debug_port: 9229,
+            ..Default::default()
+        };
+        codex_plus_core::status::StatusStore::new(dir.path().join("latest-status.json"))
+            .save_latest(&LaunchStatus {
+                debug_port: Some(9229),
+                status: "running".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!automatic_resume_allowed(&options).unwrap());
+        // 在端点探测/运行时启动前拒绝，恢复路径不会自行补发归属。
+        assert!(!resume_if_running(options).unwrap());
+        assert!(!dir.path().join(RESUME_OWNER_FILE).exists());
+    }
+
+    #[test]
+    fn automatic_resume_requires_matching_receipt_version_port_and_effective_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("codex");
+        let options = LaunchOptions {
+            state_dir: Some(dir.path().to_path_buf()),
+            codex_home: Some(home.clone()),
+            debug_port: 19401,
+            ..Default::default()
+        };
+        codex_plus_core::status::StatusStore::new(dir.path().join("latest-status.json"))
+            .save_latest(&LaunchStatus {
+                debug_port: Some(19401),
+                ..Default::default()
+            })
+            .unwrap();
+        write_test_resume_owner(dir.path(), 19401, &home);
+        assert!(automatic_resume_allowed(&options).unwrap());
+        assert_eq!(effective_resume_codex_home(&options), home);
+        assert_eq!(
+            effective_resume_codex_home(&LaunchOptions::default()),
+            codex_plus_core::relay_config::default_codex_home_dir()
+        );
+        let path = dir.path().join(RESUME_OWNER_FILE);
+        let valid: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for (field, invalid) in [
+            ("version", json!(0)),
+            ("version", json!(RESUME_OWNER_VERSION + 1)),
+            ("version", json!("1")),
+            ("debug_port", json!(9229)),
+            ("debug_port", json!(0)),
+            ("debug_port", json!("19401")),
+            ("codex_home", json!(dir.path().join("other-codex"))),
+            ("codex_home", json!("")),
+            ("codex_home", json!("codex")),
+            ("codex_home", Value::Null),
+        ] {
+            let mut invalid_receipt = valid.clone();
+            invalid_receipt[field] = invalid;
+            std::fs::write(&path, serde_json::to_vec(&invalid_receipt).unwrap()).unwrap();
+            assert!(!automatic_resume_allowed(&options).unwrap(), "{field}");
+        }
+        for bytes in [b"invalid-json".as_slice(), b"null", b"{}", b"[]"] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(!automatic_resume_allowed(&options).unwrap());
+        }
+        write_test_resume_owner(dir.path(), 19401, &home);
+        let other_home = LaunchOptions {
+            codex_home: Some(dir.path().join("other-codex")),
+            ..options
+        };
+        assert!(!automatic_resume_allowed(&other_home).unwrap());
+    }
+
+    #[test]
+    fn explicit_resume_owner_uses_ready_probe_port_and_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = LaunchOptions {
+            state_dir: Some(dir.path().to_path_buf()),
+            codex_home: Some(dir.path().join("codex")),
+            debug_port: 9229,
+            ..Default::default()
+        };
+        assert!(write_resume_owner_for_ready_session(&options, None).is_err());
+        assert!(!dir.path().join(RESUME_OWNER_FILE).exists());
+        let mut probe = test_resume_owner_probe(&options, 19401);
+        probe.state_dir = Some(dir.path().join("other-state"));
+        assert!(write_resume_owner_for_ready_session(&options, Some(&probe)).is_err());
+        assert!(!dir.path().join(RESUME_OWNER_FILE).exists());
+        probe = test_resume_owner_probe(&options, 19401);
+        probe.codex_home = dir.path().join("other-codex");
+        assert!(write_resume_owner_for_ready_session(&options, Some(&probe)).is_err());
+        assert!(!dir.path().join(RESUME_OWNER_FILE).exists());
+        probe = test_resume_owner_probe(&options, 19401);
+        write_resume_owner_for_ready_session(&options, Some(&probe)).unwrap();
+        let receipt: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(RESUME_OWNER_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(receipt["debug_port"], 19401);
+        assert_eq!(receipt["version"], RESUME_OWNER_VERSION);
+        codex_plus_core::status::StatusStore::new(dir.path().join("latest-status.json"))
+            .save_latest(&LaunchStatus {
+                debug_port: Some(19401),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!automatic_resume_allowed(&options).unwrap());
+        options.debug_port = 19401;
+        assert!(automatic_resume_allowed(&options).unwrap());
+    }
+
+    #[test]
+    fn explicit_resume_owner_write_failure_invalidates_old_receipt_and_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let options = LaunchOptions {
             state_dir: Some(dir.path().to_path_buf()),
@@ -2511,70 +2658,105 @@ mod tests {
             debug_port: 19401,
             ..Default::default()
         };
-        assert!(write_resume_owner_for_ready_session(&options, None).is_err());
-        let mut probe = test_resume_probe(&options);
-        probe.state_dir = Some(dir.path().join("other"));
-        assert!(write_resume_owner_for_ready_session(&options, Some(&probe)).is_err());
-        probe = test_resume_probe(&options);
-        probe.codex_home = dir.path().join("other");
-        assert!(write_resume_owner_for_ready_session(&options, Some(&probe)).is_err());
-        probe = test_resume_probe(&options);
+        let probe = test_resume_owner_probe(&options, 19401);
         codex_plus_core::status::StatusStore::new(dir.path().join("latest-status.json"))
             .save_latest(&LaunchStatus {
                 debug_port: Some(19401),
                 ..Default::default()
             })
             .unwrap();
-        write_resume_owner_for_ready_session(&options, Some(&probe)).unwrap();
+        write_test_resume_owner(dir.path(), 19401, &probe.codex_home);
         assert!(automatic_resume_allowed(&options).unwrap());
-        let path = dir.path().join(RESUME_OWNER_FILE);
-        let valid = std::fs::read(&path).unwrap();
-        let blocked = dir.path().join("resume-owner.json.tmp");
-        std::fs::create_dir(&blocked).unwrap();
+        // 原子写入的临时路径被目录占用，失效旧 receipt 后发布必定失败。
+        let blocked_temp = dir.path().join("resume-owner.json.tmp");
+        std::fs::create_dir(&blocked_temp).unwrap();
         assert!(write_resume_owner_for_ready_session(&options, Some(&probe)).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"null\n");
-        std::fs::write(&path, valid).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(RESUME_OWNER_FILE)).unwrap(),
+            b"null\n"
+        );
         assert!(!automatic_resume_allowed(&options).unwrap());
-        std::fs::rename(&blocked, dir.path().join("unused-temp-directory")).unwrap();
+        // 即使有旧内容被恢复，失败标记也要求再次显式启动成功才能解除。
+        write_test_resume_owner(dir.path(), 19401, &probe.codex_home);
+        assert!(!automatic_resume_allowed(&options).unwrap());
+        std::fs::rename(&blocked_temp, dir.path().join("unused-temp-directory")).unwrap();
         write_resume_owner_for_ready_session(&options, Some(&probe)).unwrap();
         assert!(automatic_resume_allowed(&options).unwrap());
     }
 
     #[test]
-    fn automatic_resume_fails_closed_on_io_errors_and_normalizes_paths() {
+    fn resume_owner_paths_normalize_missing_components_and_windows_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            normalized_resume_path(&dir.path().join("missing").join("..").join("codex")).unwrap(),
+            normalized_resume_path(&dir.path().join("codex")).unwrap()
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            normalized_resume_path(dir.path()).unwrap(),
+            normalized_resume_path(&PathBuf::from(
+                dir.path().to_string_lossy().to_uppercase().replace('\\', "/")
+            ))
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn automatic_resume_owner_uses_core_home_only_without_an_explicit_home() {
         let dir = tempfile::tempdir().unwrap();
         let options = LaunchOptions {
             state_dir: Some(dir.path().to_path_buf()),
-            codex_home: Some(dir.path().join("codex")),
+            codex_home: None,
             debug_port: 19401,
             ..Default::default()
         };
-        let status_path = dir.path().join("latest-status.json");
-        std::fs::create_dir(&status_path).unwrap();
-        assert!(automatic_resume_allowed(&options).is_err());
-        std::fs::rename(status_path, dir.path().join("unused-status-directory")).unwrap();
+        let probe = test_resume_owner_probe(&options, 19401);
+        write_resume_owner_for_ready_session(&options, Some(&probe)).unwrap();
         codex_plus_core::status::StatusStore::new(dir.path().join("latest-status.json"))
             .save_latest(&LaunchStatus {
                 debug_port: Some(19401),
                 ..Default::default()
             })
             .unwrap();
-        std::fs::create_dir(dir.path().join(RESUME_OWNER_FILE)).unwrap();
-        assert!(automatic_resume_allowed(&options).is_err());
-        assert_eq!(
-            normalized_resume_path(&dir.path().join("missing/../codex")).unwrap(),
-            normalized_resume_path(&dir.path().join("codex")).unwrap(),
+        assert!(automatic_resume_allowed(&options).unwrap());
+        assert!(
+            !automatic_resume_allowed(&LaunchOptions {
+                codex_home: Some(dir.path().join("other-codex")),
+                ..options
+            })
+            .unwrap()
         );
-        #[cfg(windows)]
-        assert_eq!(
-            normalized_resume_path(dir.path()).unwrap(),
-            normalized_resume_path(&PathBuf::from(
-                dir.path()
-                    .to_string_lossy()
-                    .to_uppercase()
-                    .replace('\\', "/"),
-            ))
-            .unwrap(),
+    }
+
+    #[test]
+    fn automatic_resume_fails_closed_when_isolated_status_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("latest-status.json")).unwrap();
+        assert!(
+            automatic_resume_allowed_in_state_dir(
+                Some(dir.path()),
+                9229,
+                &dir.path().join("codex"),
+                &production_resume_state_dir(),
+            )
+            .is_err()
+        );
+        let receipt_dir = tempfile::tempdir().unwrap();
+        codex_plus_core::status::StatusStore::new(receipt_dir.path().join("latest-status.json"))
+            .save_latest(&LaunchStatus {
+                debug_port: Some(9229),
+                ..Default::default()
+            })
+            .unwrap();
+        std::fs::create_dir(receipt_dir.path().join(RESUME_OWNER_FILE)).unwrap();
+        assert!(
+            automatic_resume_allowed_in_state_dir(
+                Some(receipt_dir.path()),
+                9229,
+                &receipt_dir.path().join("codex"),
+                &production_resume_state_dir(),
+            )
+            .is_err()
         );
     }
 
