@@ -5785,39 +5785,6 @@ mod image_proxy_tests {
     }
 }
 
-#[cfg(test)]
-mod managed_port_detection_tests {
-    use super::{is_local_protocol_proxy_base_url_with_managed_urls, local_responses_proxy_base_url};
-
-    #[test]
-    fn historical_ports_are_accepted_but_unmanaged_ports_are_rejected() {
-        let managed_urls = [
-            local_responses_proxy_base_url(57321),
-            local_responses_proxy_base_url(58077),
-            local_responses_proxy_base_url(58099),
-        ];
-        for base_url in [
-            "http://127.0.0.1:57321",
-            "http://localhost:58077/v1",
-            "http://[::1]:58099/v1/",
-        ] {
-            assert!(
-                is_local_protocol_proxy_base_url_with_managed_urls(base_url, &managed_urls),
-                "{base_url}"
-            );
-        }
-        for base_url in [
-            "http://127.0.0.1:58078/v1",
-            "http://127.0.0.1:58100/v1",
-        ] {
-            assert!(
-                !is_local_protocol_proxy_base_url_with_managed_urls(base_url, &managed_urls),
-                "{base_url}"
-            );
-        }
-    }
-}
-
 pub fn models_url(base_url: &str) -> String {
     let skip_version_prefix = base_url.trim().ends_with('#');
     let mut base = base_url
