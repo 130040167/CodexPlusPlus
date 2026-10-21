@@ -585,18 +585,6 @@ fn comparable_history_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn rollout_counterpart(path: &Path) -> Option<PathBuf> {
-    if crate::rollout_source::is_compressed(path) {
-        Some(path.with_extension(""))
-    } else if path.extension().is_some_and(|ext| ext == "jsonl") {
-        let mut compressed = path.as_os_str().to_os_string();
-        compressed.push(".zst");
-        Some(PathBuf::from(compressed))
-    } else {
-        None
-    }
-}
-
 // 回收后的文件可能已不存在；从最近的现存祖先解析短路径与目录大小写。
 fn resolved_history_path(path: &Path) -> anyhow::Result<PathBuf> {
     let mut ancestor = path;
