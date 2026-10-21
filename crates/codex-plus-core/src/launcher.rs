@@ -5441,6 +5441,26 @@ mod tests {
         );
     }
 
+    async fn assert_listener_ports_released(ports: impl IntoIterator<Item = u16>) {
+        for port in ports {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                    Ok(listener) => {
+                        drop(listener);
+                        break;
+                    }
+                    Err(_) if tokio::time::Instant::now() < deadline => {
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                    Err(error) => {
+                        panic!("helper listener port {port} was not released: {error}");
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn proxy_continuity_restores_alias_while_primary_port_is_busy() {
         let temp = tempfile::tempdir().unwrap();
@@ -5458,7 +5478,7 @@ mod tests {
         let primary_port = busy.local_addr().unwrap().port();
         let strict = start_helper_with_continuity("127.0.0.1", primary_port, &endpoints, false).await;
         assert!(strict.is_err(), "新客户端启动不能绕过固定主端口冲突");
-        assert!(tokio::net::TcpListener::bind(("127.0.0.1", cached_port)).await.is_ok());
+        assert_listener_ports_released([cached_port]).await;
         let runtime = start_helper_with_continuity("127.0.0.1", primary_port, &endpoints, true)
             .await.unwrap();
         let client = reqwest::Client::builder()
@@ -5481,9 +5501,7 @@ mod tests {
             }
         }).await.unwrap();
         stop_helper_runtimes(runtime).await;
-        for port in [cached_port, primary_port] {
-            assert!(tokio::net::TcpListener::bind(("127.0.0.1", port)).await.is_ok());
-        }
+        assert_listener_ports_released([cached_port, primary_port]).await;
         // 仍在等待端口的任务也必须随实例退出，不能在稍后偷偷重新占端口。
         let busy = tokio::net::TcpListener::bind(("127.0.0.1", primary_port)).await.unwrap();
         let pending = start_helper_with_continuity("127.0.0.1", primary_port, &endpoints, true)
@@ -5491,9 +5509,7 @@ mod tests {
         stop_helper_runtimes(pending).await;
         drop(busy);
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        for port in [cached_port, primary_port] {
-            assert!(tokio::net::TcpListener::bind(("127.0.0.1", port)).await.is_ok());
-        }
+        assert_listener_ports_released([cached_port, primary_port]).await;
     }
 
     #[test]
