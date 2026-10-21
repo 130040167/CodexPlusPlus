@@ -5382,7 +5382,10 @@ function ProxySettingsScreen({
             <p className="field-hint">
               {t("之后按 2 倍退避，单次最长 30 秒；有 Retry-After 时优先采用。")}
             </p>
-            <Field label={t("重试的 HTTP 状态码")}>
+            {/* 不能用 Field：它是 <label>。WebKit 里被点的标签按钮已被 React 移除后，
+                label 会把这次点击转发给它的第一个按钮，一次删掉两个状态码。 */}
+            <div className="field text-sm font-medium leading-none" role="group" aria-label={t("重试的 HTTP 状态码")}>
+              <span>{t("重试的 HTTP 状态码")}</span>
               <div className="retry-status-editor">
                 <div className="retry-status-list">
                   {form.protocolProxyAutoRetryStatusCodes.map((status) => (
@@ -5426,7 +5429,7 @@ function ProxySettingsScreen({
                   </Button>
                 </div>
               </div>
-            </Field>
+            </div>
             <p className="field-hint">
               {t("命中时退避重发，次数用尽后把错误交给 Codex。默认不选；常用 429（限流）和 5xx（服务端故障）。")}
             </p>
