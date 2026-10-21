@@ -6968,3 +6968,79 @@ experimental_bearer_token = "sk-test-redacted"
         "{config}"
     );
 }
+
+#[test]
+fn non_utf8_live_config_keeps_non_provider_settings_and_backs_up_once() {
+    // #585 回归：GBK 字节的 live config.toml 不能按「空配置」处理，否则切换供应商
+    // 会悄悄删掉 MCP、沙箱、features 等非供应商设置；同一份原始内容只备份一次。
+    let temp = tempfile::tempdir().unwrap();
+    let live = b"# \xd6\xd0\xce\xc4 comment\nmodel = \"old\"\n\n[mcp_servers.mine]\ncommand = \"node\"\n\n[windows]\nsandbox = \"elevated\"\n\n[features]\nmemories = true\n".to_vec();
+    std::fs::write(temp.path().join("config.toml"), &live).unwrap();
+    let profile = RelayProfile {
+        id: "relay-a".to_string(),
+        name: "Relay A".to_string(),
+        model: "qwen3-coder".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: "model = \"qwen3-coder\"\nmodel_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nbase_url = \"https://relay.example/v1\"\nexperimental_bearer_token = \"sk-new\"\n".to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-new"}"#.to_string(),
+        ..RelayProfile::default()
+    };
+
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(config.contains("[mcp_servers.mine]"), "{config}");
+    assert!(config.contains("sandbox = \"elevated\""), "{config}");
+    assert!(config.contains("memories = true"), "{config}");
+    assert!(config.contains("base_url = \"https://relay.example/v1\""), "{config}");
+    let backups: Vec<_> = std::fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".invalid-utf8-"))
+        .collect();
+    assert_eq!(backups.len(), 1, "同一份原始内容只备份一次");
+    assert_eq!(std::fs::read(backups[0].path()).unwrap(), live, "备份必须是原始字节");
+}
+
+#[test]
+fn official_profile_window_without_model_list_keeps_builtin_models() {
+    // #2590 的修复不能波及官方登录：模型列表留空时不生成只剩 0~1 个模型的 catalog，
+    // 否则 Codex 内置的官方模型列表被替换，选择器变空；窗口改写顶层键。
+    // 带内置元数据的模型（如 gpt-5.5）在 v1.10.0 起就会落 catalog，不属于这里的回归。
+    for model in ["", "custom-official-model"] {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = RelayProfile {
+            id: "official".to_string(),
+            name: "OpenAI Official".to_string(),
+            model: model.to_string(),
+            relay_mode: RelayMode::Official,
+            context_window: "1000000".to_string(),
+            ..RelayProfile::default()
+        };
+        apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+        let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap_or_default();
+        assert!(!config.contains("model_catalog_json"), "model={model:?}\n{config}");
+        assert!(config.contains("model_context_window = 1000000"), "model={model:?}\n{config}");
+    }
+}
+
+#[test]
+fn unparsable_live_config_does_not_block_switching_provider() {
+    // #2478/#2500：live config.toml 被改坏（这里表头缺右括号）时，切换供应商照常写出新配置。
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("config.toml"), "model = \"old\"\n[mcp_servers.a\ncommand = \"x\"\n").unwrap();
+    let profile = RelayProfile {
+        id: "relay-a".to_string(),
+        name: "Relay A".to_string(),
+        model: "qwen3-coder".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: "model = \"qwen3-coder\"\nmodel_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nbase_url = \"https://relay.example/v1\"\nexperimental_bearer_token = \"sk-new\"\n".to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-new"}"#.to_string(),
+        ..RelayProfile::default()
+    };
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(config.contains("base_url = \"https://relay.example/v1\""), "{config}");
+    assert!(config.parse::<toml_edit::DocumentMut>().is_ok(), "写出的配置必须可解析：{config}");
+}
