@@ -128,11 +128,10 @@ fn catalog_read_failure(path: &Path, service_tier: Value, error: &anyhow::Error)
 
 fn relay_profile_model_catalog_value(home: &Path, profile: &RelayProfile) -> Value {
     let models = relay_profile_model_ids(profile);
-    let model = profile.model.trim().to_string();
+    let model = crate::relay_config::relay_profile_model(profile);
     let codex_model_provider = codex_model_provider_for_relay_profile(home, profile);
-    let configured_model = crate::relay_config::relay_profile_model(profile);
-    let default_model = if models.iter().any(|item| item == &configured_model) {
-        configured_model
+    let default_model = if models.iter().any(|item| item == &model) {
+        model.clone()
     } else {
         models.first().cloned().unwrap_or_default()
     };
@@ -1504,6 +1503,20 @@ mod model_fetch_tests {
         let catalog = relay_profile_model_catalog_value(home.path(), &profile);
 
         assert_eq!(catalog["default_model"], "qwen3-coder");
+    }
+
+    #[test]
+    fn relay_profile_catalog_model_and_default_use_the_same_configured_value() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = RelayProfile {
+            model: "old-model".into(),
+            model_list: "old-model\nconfigured-model".into(),
+            config_contents: "model = \"configured-model\"\n".into(),
+            ..RelayProfile::default()
+        };
+        let catalog = relay_profile_model_catalog_value(home.path(), &profile);
+        assert_eq!(catalog["model"], "configured-model");
+        assert_eq!(catalog["default_model"], catalog["model"]);
     }
 
     #[test]
