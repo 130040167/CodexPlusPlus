@@ -41,7 +41,7 @@ function Menu({ label = t("更多操作"), children }: { label?: string; childre
 function MenuItem({ children, onClick, disabled, danger }: { children: ReactNode; onClick: () => void; disabled?: boolean; danger?: boolean }) {
   return <button type="button" role="menuitem" className={danger ? "mg-danger" : ""} disabled={disabled} onClick={onClick}>{children}</button>;
 }
-export function ManagementDrawer({ title, onClose, children, footer }: { title: string; onClose: () => void; children: ReactNode; footer?: ReactNode }) {
+export function ManagementDrawer({ title, onClose, children, footer, wide = false, dismissOnBackdrop = true }: { title: string; onClose: () => void; children: ReactNode; footer?: ReactNode; wide?: boolean; dismissOnBackdrop?: boolean }) {
   const ref = useRef<HTMLElement>(null);
   const closeRef = useRef(onClose); closeRef.current = onClose;
   useEffect(() => {
@@ -49,6 +49,9 @@ export function ManagementDrawer({ title, onClose, children, footer }: { title: 
     const root = ref.current;
     root?.querySelector<HTMLElement>("button, input, textarea, select")?.focus();
     const keyboard = (e: KeyboardEvent) => {
+      // 多层抽屉只让最上层处理 Escape/Tab，保留下层页面的状态。
+      const layers = document.querySelectorAll(".mg-drawer-backdrop");
+      if (e.defaultPrevented || layers.item(layers.length - 1) !== root?.parentElement) return;
       if (e.key === "Escape") { e.preventDefault(); closeRef.current(); }
       if (e.key !== "Tab" || !root) return;
       const nodes = [...root.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [tabindex="0"]')];
@@ -57,9 +60,9 @@ export function ManagementDrawer({ title, onClose, children, footer }: { title: 
       else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus(); }
     };
     document.addEventListener("keydown", keyboard);
-    return () => { document.removeEventListener("keydown", keyboard); previous?.focus(); };
+    return () => { document.removeEventListener("keydown", keyboard); previous?.focus({ preventScroll: true }); };
   }, []);
-  return <div className="mg-drawer-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}><section className="mg-drawer" role="dialog" aria-modal="true" aria-label={title} ref={ref}><header><h2>{title}</h2><IconAction label={t("关闭窗口")} onClick={onClose}><X size={18} /></IconAction></header><div className="mg-drawer-body">{children}</div>{footer && <footer>{footer}</footer>}</section></div>;
+  return <div className="mg-drawer-backdrop" onMouseDown={(e) => { if (dismissOnBackdrop && e.target === e.currentTarget) onClose(); }}><section className={"mg-drawer" + (wide ? " mg-drawer-wide" : "")} role="dialog" aria-modal="true" aria-label={title} ref={ref}><header><h2>{title}</h2><IconAction label={t("关闭窗口")} onClick={onClose}><X size={18} /></IconAction></header><div className="mg-drawer-body">{children}</div>{footer && <footer>{footer}</footer>}</section></div>;
 }
 function Empty({ title, detail, children }: { title: string; detail?: string; children?: ReactNode }) {
   return <div className="mg-empty"><h2>{title}</h2>{detail && <p>{detail}</p>}<div>{children}</div></div>;
@@ -143,7 +146,21 @@ function McpEditor({ entry, kind, onClose, onSave, notify, busy }: { entry?: Con
     if (!succeeded(result)) throw new Error(result.message); setForm(result.form); setBody(value);
   };
   useEffect(() => { if (!entry || kind !== "mcp") return; let active = true; void invoke<Result & { form: McpForm }>("parse_mcp_entry", { tomlBody: entry.tomlBody }).then((result) => { if (!active) return; if (succeeded(result)) setForm(result.form); else { setError(result.message); setMode("toml"); } }).catch((e) => { if (active) { setError(String(e)); setMode("toml"); } }).finally(() => { if (active) setLoading(false); }); return () => { active = false; }; }, []);
-  const update = (patch: Partial<McpForm>) => setForm((old) => ({ ...old, ...patch }));
+  const [commandCheck, setCommandCheck] = useState<{ code: string; message: string; replacementCommand: string | null } | null>(null);
+  const [checkingCommand, setCheckingCommand] = useState(false);
+  const commandSequence = useRef(0);
+  useEffect(() => { commandSequence.current++; setCommandCheck(null); setCheckingCommand(false); }, [form]);
+  useEffect(() => () => { commandSequence.current++; }, []);
+  const update = (patch: Partial<McpForm>) => { commandSequence.current++; setCheckingCommand(false); setCommandCheck(null); setForm((old) => ({ ...old, ...patch })); };
+  const checkCommand = async () => {
+    const sequence = ++commandSequence.current; setCheckingCommand(true); setCommandCheck(null);
+    try {
+      const result = await invoke<Result & { code: string; replacementCommand: string | null }>("inspect_mcp_startup", { form });
+      if (sequence !== commandSequence.current) return;
+      if (succeeded(result)) setCommandCheck(result); else setError(result.message);
+    } catch (e) { if (sequence === commandSequence.current) setError(String(e)); }
+    finally { if (sequence === commandSequence.current) setCheckingCommand(false); }
+  };
   const switchMode = async (next: "form" | "toml") => {
     if (next === mode) return;
     try {
@@ -165,7 +182,8 @@ function McpEditor({ entry, kind, onClose, onSave, notify, busy }: { entry?: Con
     {kind === "mcp" && <div className="mg-tabs"><button type="button" data-active={mode === "form"} disabled={loading || saving} onClick={() => void switchMode("form")}>{t("表单")}</button><button type="button" data-active={mode === "toml"} disabled={loading || saving} onClick={() => void switchMode("toml")}>TOML</button></div>}
     {loading ? <p role="status">{t("正在读取配置…")}</p> : mode === "toml" ? <Field label={t("配置内容")} hint={t("保留自定义字段，保存时由 Codex 配置解析器校验。") }><textarea className="mg-code" value={body} onChange={(e) => setBody(e.target.value)} spellCheck={false} rows={16} /></Field> : <>
       <Field label={t("传输类型")}><select value={form.transport} onChange={(e) => update({ transport: e.target.value as McpForm["transport"] })}><option value="stdio">stdio</option><option value="http">HTTP / SSE</option></select></Field>
-      {form.transport === "stdio" ? <><Field label={t("启动命令")}><input value={form.command} onChange={(e) => update({ command: e.target.value })} placeholder="npx" /></Field><Field label={t("命令参数")} hint={t("每行一个参数。") }><textarea rows={3} value={form.args.join("\n")} onChange={(e) => update({ args: e.target.value.split("\n") })} placeholder={'-y\n@upstash/context7-mcp'} /></Field><PairEditor label={t("环境变量")} pairs={form.env} onChange={(env) => update({ env })} /><Field label={t("工作目录")}><input value={form.cwd} onChange={(e) => update({ cwd: e.target.value })} placeholder={t("可选")} /></Field></> : <><Field label="URL"><input value={form.url} onChange={(e) => update({ url: e.target.value })} placeholder="https://example.com/mcp" /></Field><PairEditor label="HTTP Headers" pairs={form.httpHeaders} onChange={(httpHeaders) => update({ httpHeaders })} /><Field label="Bearer Token"><input type="password" value={form.bearerToken} onChange={(e) => update({ bearerToken: e.target.value })} /></Field></>}
+      {form.transport === "stdio" ? <><Field label={t("启动命令")}><input value={form.command} onChange={(e) => update({ command: e.target.value })} placeholder="npx" /></Field><section className="mg-field"><Action disabled={checkingCommand || saving || busy || !form.command.trim()} onClick={() => void checkCommand()}>{checkingCommand ? t("正在检查…") : t("检查启动路径")}</Action>
+        {commandCheck && <div role="status" className="mg-notice"><p>{t(commandCheck.message)}</p>{commandCheck.replacementCommand && <><code>{commandCheck.replacementCommand}</code><Action onClick={() => update({ command: commandCheck.replacementCommand! })}>{t("将新入口放入草稿")}</Action><small>{t("检查不会重启 MCP；确认草稿后再保存。")}</small></>}</div>}</section><Field label={t("命令参数")} hint={t("每行一个参数。") }><textarea rows={3} value={form.args.join("\n")} onChange={(e) => update({ args: e.target.value.split("\n") })} placeholder={'-y\n@upstash/context7-mcp'} /></Field><PairEditor label={t("环境变量")} pairs={form.env} onChange={(env) => update({ env })} /><Field label={t("工作目录")}><input value={form.cwd} onChange={(e) => update({ cwd: e.target.value })} placeholder={t("可选")} /></Field></> : <><Field label="URL"><input value={form.url} onChange={(e) => update({ url: e.target.value })} placeholder="https://example.com/mcp" /></Field><PairEditor label="HTTP Headers" pairs={form.httpHeaders} onChange={(httpHeaders) => update({ httpHeaders })} /><Field label="Bearer Token"><input type="password" value={form.bearerToken} onChange={(e) => update({ bearerToken: e.target.value })} /></Field></>}
       <Field label={t("启动超时（秒）")}><input inputMode="decimal" value={form.startupTimeoutSec} onChange={(e) => update({ startupTimeoutSec: e.target.value })} placeholder={t("默认")} /></Field>
       <div className="mg-write-to"><span>{t("保存目标")}</span><strong>{t("当前 Codex 配置")}</strong><small>{t("保存后立即落盘；启停请在列表行操作。")}</small></div>
       {form.extraToml && <details><summary>{t("其他配置字段")}</summary><textarea className="mg-code" value={form.extraToml} onChange={(e) => update({ extraToml: e.target.value })} rows={5} /></details>}

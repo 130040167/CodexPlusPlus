@@ -8,6 +8,17 @@ use std::collections::{BTreeMap, BTreeSet};
 const TABLE: &str = "codex_plus_deleted_threads";
 const RESTORED_TABLE: &str = "codex_plus_restored_threads";
 
+fn rollout_file_backup_entry(path: &str, source_path: &str, bytes: Vec<u8>) -> Value {
+    let mut entry = json!({
+        "path": path,
+        "content_b64": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes),
+    });
+    if path != source_path {
+        entry["source_path"] = Value::String(source_path.to_string());
+    }
+    entry
+}
+
 pub(super) struct HistoryRetention {
     _lock: File,
     home: PathBuf,
@@ -248,7 +259,7 @@ impl HistoryRetention {
     }
 
     /// 新备份允许保留中的同一文件存在，但绝不覆盖追加后的历史。
-    pub fn prepare_undo(&self, backups: &mut [Value]) -> anyhow::Result<()> {
+    pub fn prepare_undo(&self, backups: &mut [Value], store: &BackupStore) -> anyhow::Result<()> {
         let mut all_files = BTreeMap::<PathBuf, (Vec<u8>, Value)>::new();
         for backup in backups.iter_mut() {
             let db_path = backup_source_db(backup, &self.databases[0], &self.databases)?;
@@ -337,7 +348,9 @@ impl HistoryRetention {
                             let current =
                                 select_dicts(&db, "SELECT * FROM threads WHERE id=?1", &[&id])?;
                             let mut original = row.clone();
-                            original["archived"] = current[0]["archived"].clone();
+                            if object.contains_key("archived") {
+                                original["archived"] = current[0]["archived"].clone();
+                            }
                             if object.contains_key("archived_at") {
                                 original["archived_at"] = current[0]["archived_at"].clone();
                             }
@@ -394,12 +407,7 @@ impl HistoryRetention {
                         self.validate_history_path(Path::new(path))?;
                     }
                     let normalized = comparable_history_path(Path::new(path));
-                    let bytes = base64::Engine::decode(
-                        &base64::engine::general_purpose::STANDARD,
-                        file["content_b64"]
-                            .as_str()
-                            .ok_or_else(|| anyhow::anyhow!("invalid history backup content"))?,
-                    )?;
+                    let bytes = store.read_file_contents(&token, file)?;
                     if let Some((previous, _)) = all_files.get(&normalized) {
                         if !previous.starts_with(&bytes) && !bytes.starts_with(previous) {
                             bail!("restore conflict: incompatible history snapshots: {path}");
@@ -408,7 +416,13 @@ impl HistoryRetention {
                             continue;
                         }
                     }
-                    all_files.insert(normalized, (bytes, file.clone()));
+                    // 跨备份共享恢复清单不能携带另一个 token 的 blob 引用。
+                    let mut restored = file.clone();
+                    restored["content_b64"] = Value::String(base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        &bytes,
+                    ));
+                    all_files.insert(normalized, (bytes, restored));
                 }
             }
             tables.insert("__files".into(), Value::Array(Vec::new()));

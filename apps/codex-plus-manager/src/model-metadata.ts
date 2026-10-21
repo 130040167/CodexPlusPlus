@@ -740,6 +740,24 @@ export function synchronizeModelMetadataFastSupport(
   return parsed.ok ? { document, preview: parsed.value } : null;
 }
 
+/** 只改目标模型的 Lite 声明，保留同一导入文档的其它模型与未知字段。 */
+export function synchronizeModelMetadataLiteSupport(
+  source: string, targetSlug: string, mode: "inherit" | "supported" | "unsupported",
+): { document: string; preview: ImportedModelMetadata } | null {
+  let root: unknown;
+  try {
+    root = source.trim() ? JSON.parse(unwrapJsonCompatibleDocument(source))
+      : { models: [{ slug: modelSlugFromRowName(targetSlug) }] };
+  } catch { return null; }
+  const matches = documentCandidates(root)?.filter((entry) => slugMatchesIgnoreCase(entry.slug, targetSlug));
+  if (!matches || matches.length !== 1) return null;
+  if (mode === "inherit") delete matches[0].use_responses_lite;
+  else matches[0].use_responses_lite = mode === "supported";
+  const document = JSON.stringify(root, null, 2);
+  const parsed = parseModelMetadataDocument(document, targetSlug);
+  return parsed.ok ? { document, preview: parsed.value } : null;
+}
+
 // 强制管理字段顺序，避免保存后 context_window 跑到压缩字段之后。
 function reorderManagedModelFields(model: ModelMetadata): void {
   const ordered: ModelMetadata = {};
@@ -851,6 +869,12 @@ function positiveIntegerString(value: unknown): string | null {
 }
 
 export function validateModelCapabilities(metadata: ModelMetadata): string | null {
+  if (Object.hasOwn(metadata, "base_instructions") && typeof metadata.base_instructions !== "string") {
+    return "base_instructions 必须是字符串（允许空字符串）。";
+  }
+  if (Object.hasOwn(metadata, "supports_parallel_tool_calls") && typeof metadata.supports_parallel_tool_calls !== "boolean") {
+    return "supports_parallel_tool_calls 必须是 true 或 false。";
+  }
   if (Object.hasOwn(metadata, "supported_reasoning_levels")) {
     if (!Array.isArray(metadata.supported_reasoning_levels)) {
       return "supported_reasoning_levels 必须是数组。";

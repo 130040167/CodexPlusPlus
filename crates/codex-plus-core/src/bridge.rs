@@ -16,6 +16,8 @@ use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
+mod native_fast;
+
 pub const BRIDGE_BINDING_NAME: &str = "codexSessionDeleteV2";
 const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -154,8 +156,13 @@ pub fn bridge_health_check_script() -> &'static str {
   const lastSuccessAt = Number(health.lastSuccessAt) || 0;
   const lastInjectionAt = Number(health.lastInjectionAt) || 0;
   const lastAttemptAt = Number(health.lastAttemptAt) || 0;
+  const failures = Number(health.failures) || 0;
   if (lastInjectionAt > 0 && now - lastInjectionAt <= 5000) return true;
   if (lastSuccessAt > 0 && now - lastSuccessAt <= 15000) return true;
+  // 连续失败且超过 15 秒没有一次成功：CDP 连接可能已经断了。此时不能只看
+  // lastAttemptAt——挂死的 bridge 会一直“尝试”却永远不成功，心跳尝试反而
+  // 会让看门狗永不重注入。重注入会把挂起的 resolver 统一 resolve 掉。
+  if (failures >= 3 && (lastSuccessAt === 0 || now - lastSuccessAt > 15000)) return false;
   // 页面忙碌时状态请求会超时，但心跳仍在调用桥接。最近一次尝试也算活着，
   // 避免看门狗把整份脚本反复注入并触发整页刷新。
   return lastAttemptAt > 0 && now - lastAttemptAt <= 15000;
@@ -163,8 +170,47 @@ pub fn bridge_health_check_script() -> &'static str {
 "#
 }
 
+#[cfg(test)]
+mod bridge_health_script_tests {
+    use super::bridge_health_check_script;
+
+    /// 桥接挂死时 `lastAttemptAt` 仍会被心跳刷新；健康判定必须让「连续失败 +
+    /// 长时间没有成功」优先于「最近尝试过」，否则看门狗永远不会重注入。
+    #[test]
+    fn repeated_failures_without_success_are_unhealthy() {
+        let script = bridge_health_check_script();
+        let failures_guard = script
+            .find("failures >= 3")
+            .expect("健康脚本应包含连续失败判定");
+        let attempt_fallback = script
+            .find("lastAttemptAt > 0")
+            .expect("健康脚本应保留最近尝试兜底");
+        assert!(
+            failures_guard < attempt_fallback,
+            "连续失败判定必须在 lastAttemptAt 兜底之前生效"
+        );
+    }
+}
+
 pub async fn evaluate_script(websocket_url: &str, script: &str) -> anyhow::Result<Value> {
     evaluate_script_with_await_promise(websocket_url, script, false).await
+}
+
+/// 拓展 `/cdp/evaluate` 专用。对象和数组必须按值返回，否则 CDP 只给 objectId。
+pub async fn evaluate_script_return_by_value(
+    websocket_url: &str,
+    script: &str,
+) -> anyhow::Result<Value> {
+    let socket = connect_cdp_websocket(websocket_url).await?;
+    let mut session = CdpSession::new(socket);
+    let response = session
+        .send_command(
+            1,
+            "Runtime.evaluate",
+            runtime_evaluate_params_return_by_value(script),
+        )
+        .await?;
+    ensure_runtime_evaluate_succeeded(response)
 }
 
 pub async fn evaluate_script_with_await_promise(
@@ -657,15 +703,16 @@ async fn run_app_server_client_capture(
     let settings = crate::settings::SettingsStore::default()
         .load()
         .unwrap_or_default();
-    if !settings.codex_app_service_tier_controls
-        && !settings.codex_app_model_whitelist_unlock
-        && !settings.codex_app_session_delete
-    {
+    if !settings.codex_app_model_whitelist_unlock && !settings.codex_app_session_delete {
         return Ok(());
     }
     let socket = connect_cdp_websocket(websocket_url).await?;
     let mut session = CdpSession::new(socket);
-    let probe_script = app_server_client_capture_probe_script();
+    let probe_script = if settings.enhancements_enabled && settings.codex_app_native_fast_unlock {
+        "window.__codexPlusNativeFastAssetPatchReady===true&&['armed','patched'].includes(window.__codexPlusNativeFastPatchState)&&window.__codexPlusNativeFastCompiled!=='v1'?null:JSON.stringify(window.__codexPlusAppServerClientCapture||null)"
+    } else {
+        app_server_client_capture_probe_script()
+    };
     let location_wait = async {
         loop {
             if !bridge_generation_is_current(&generation) {
@@ -919,8 +966,16 @@ pub async fn install_bridge(
     let generation = next_bridge_generation(websocket_url);
     session = session.with_generation(generation.clone());
     let mut registered_script_ids = Vec::new();
+    let native_fast_requested = crate::settings::SettingsStore::default()
+        .load()
+        .is_ok_and(|settings| settings.enhancements_enabled && settings.codex_app_native_fast_unlock);
 
     let install_result: anyhow::Result<()> = async {
+        if native_fast_requested {
+            session
+                .send_command(next_message_id(), "Page.enable", json!({}))
+                .await?;
+        }
         session.send_command(1, "Runtime.enable", json!({})).await?;
         session
             .send_command(2, "Runtime.removeBinding", json!({ "name": binding_name }))
@@ -992,6 +1047,12 @@ pub async fn install_bridge(
         json!({ "generation": generation.id }),
     );
 
+    if let Err(error) = native_fast::install(websocket_url, generation.clone()).await {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "bridge.native_fast_interceptor_failed",
+            json!({ "message": error.to_string() }),
+        );
+    }
     spawn_app_server_client_capture(websocket_url, generation.clone());
 
     let mut pending_calls = FuturesUnordered::new();
@@ -1050,6 +1111,14 @@ fn collect_script_identifier(response: &Value, identifiers: &mut Vec<String>) {
 
 pub fn runtime_evaluate_params(script: &str) -> Value {
     runtime_evaluate_params_with_await_promise(script, false)
+}
+
+pub fn runtime_evaluate_params_return_by_value(script: &str) -> Value {
+    let mut params = runtime_evaluate_params(script);
+    if let Some(object) = params.as_object_mut() {
+        object.insert("returnByValue".to_string(), Value::Bool(true));
+    }
+    params
 }
 
 pub fn runtime_evaluate_params_with_await_promise(script: &str, await_promise: bool) -> Value {
@@ -1112,6 +1181,7 @@ struct CdpSession<S> {
     socket: S,
     responses: HashMap<u64, Value>,
     binding_calls: VecDeque<Value>,
+    fetch_requests: VecDeque<Value>,
     paused_events: VecDeque<(Value, usize, u64)>,
     paused_event_bytes: usize,
     pause_epoch: u64,
@@ -1133,6 +1203,7 @@ where
             socket,
             responses: HashMap::new(),
             binding_calls: VecDeque::new(),
+            fetch_requests: VecDeque::new(),
             paused_events: VecDeque::new(),
             paused_event_bytes: 0,
             pause_epoch: 0,
@@ -1308,6 +1379,13 @@ where
 
         if value.get("method").and_then(Value::as_str) == Some("Runtime.bindingCalled") {
             self.binding_calls.push_back(value.clone());
+        }
+        if value.get("method").and_then(Value::as_str) == Some("Fetch.requestPaused") {
+            anyhow::ensure!(
+                self.fetch_requests.len() < 32,
+                "CDP Fetch event queue exceeded its bounded capacity"
+            );
+            self.fetch_requests.push_back(value.clone());
         }
 
         Ok(Some(value))

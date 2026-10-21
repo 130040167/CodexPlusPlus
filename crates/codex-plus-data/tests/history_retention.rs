@@ -71,6 +71,27 @@ impl Fixture {
 }
 
 #[test]
+fn retained_history_undo_validates_upstream_blob_before_restoring() {
+    let f = Fixture::new();
+    f.add("a", None);
+    let original = fs::read(f.path("a")).unwrap();
+    let token = f.delete("a");
+    assert!(!f.path("a").exists());
+    let store = BackupStore::new(f.home().join("backups"));
+    let backup = store.read_backup(&token).unwrap();
+    let relative = backup["tables"]["__files"][0]["blob_ref"].as_str().unwrap();
+    let blob = f.home().join("backups").join(relative);
+    fs::write(&blob, b"corrupt fixture").unwrap();
+    let result = f.adapter().undo(&token);
+    assert_eq!(result.status, DeleteStatus::Failed, "{}", result.message);
+    assert!(!f.path("a").exists());
+    assert!(!f.visible("a"));
+    fs::write(&blob, original).unwrap();
+    f.undo(&token);
+    assert!(f.visible("a"));
+}
+
+#[test]
 fn soft_deleted_job_assignment_undo_is_idempotent_but_rejects_changes() {
     for change in [None, Some("assignment"), Some("content")] {
         let f = Fixture::new();
@@ -434,7 +455,8 @@ fn partial_database_delete_keeps_live_duplicate_and_its_history() {
         &SessionRef::new("local:a", "a").unwrap(),
         Some(f.home()),
     );
-    assert_eq!(r.status, DeleteStatus::LocalDeleted, "{}", r.message);
+    assert_eq!(r.status, DeleteStatus::Failed, "{}", r.message);
+    assert!(r.undo_token.is_some(), "partial deletion must remain recoverable");
     assert!(
         f.path("a").exists(),
         "undeleted duplicate still owns rollout"
