@@ -1,19 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!--
-  正式（Developer ID + hardened runtime）发布签名用的 entitlements。
-
-  ZCode 语音输入由 Codex++ 管理端自己录音，所以管理端 bundle 需要麦克风权限：
-  hardened runtime 下没有 com.apple.security.device.audio-input，即使 Info.plist
-  里有 NSMicrophoneUsageDescription，CoreAudio 也拿不到输入设备（TCC 直接拒绝）。
-
-  注意：
-  - 只有 Developer ID 正式签名才用这个文件（scripts/installer/macos/package-dmg.sh
-    在设置 MACOS_SIGNING_IDENTITY 时自动 --entitlements 引用）。
-  - 本地 ad-hoc 签名（scripts/relaunch-local.mjs）不要带这个 entitlement：
-    ad-hoc 没有 hardened runtime，带 entitlement 反而会让签名/授权行为更难预测。
-  - 麦克风 TCC 授权仍由系统在首次录音时弹窗，entitlement 只是准入条件，不是授权本身。
--->
 <plist version="1.0">
 <dict>
   <key>com.apple.security.device.audio-input</key>
