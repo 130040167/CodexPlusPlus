@@ -457,6 +457,10 @@ body {
   gap: 12px;
 }
 
+.sponsor-board-single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .sponsor-board > .panel {
   min-width: 0;
   height: 100%;

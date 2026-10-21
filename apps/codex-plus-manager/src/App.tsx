@@ -5017,7 +5017,7 @@ function SponsorBoard({ ads, actions }: { ads: AdsResult | null; actions: Action
   if (featured.length === 0) return null;
 
   return (
-    <div className="sponsor-board">
+    <div className={`sponsor-board ${featured.length === 1 ? "sponsor-board-single" : ""}`}>
       {featured.map((ad) => (
         <Panel className="jojocode-overview sponsor-slot" key={ad.id || ad.title}>
           <CardContent>
