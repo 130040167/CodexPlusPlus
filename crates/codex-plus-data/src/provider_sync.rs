@@ -1223,6 +1223,7 @@ where
             ) {
                 Ok(before) => before,
                 Err(error) if is_locked_io_error(&error) => {
+                    // 规划之后也可能被原生进程占用；未准备日志的文件不能进入改写。
                     scanned_skipped_rollout_files.push(plan.path.clone());
                     continue;
                 }
