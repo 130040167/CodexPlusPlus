@@ -8614,6 +8614,138 @@ mod sync_diagnostics_tests {
 }
 
 #[cfg(test)]
+mod online_catalog_concurrency_tests {
+    use super::*;
+
+    fn fixture(home: &Path, colocated: bool) -> (PathBuf, PathBuf, Vec<PathBuf>) {
+        let state = home.join("state_5.sqlite");
+        fs::create_dir_all(home.join("sqlite")).unwrap();
+        let catalog = if colocated { state.clone() } else { home.join("sqlite/codex-dev.db") };
+        Connection::open(&state).unwrap().execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT, archived INTEGER,
+                has_user_event INTEGER, cwd TEXT, title TEXT, rollout_path TEXT,
+                source TEXT, thread_source TEXT);
+             INSERT INTO threads VALUES('user','custom',0,1,'C:/project','Title',
+                'rollout-user.jsonl','vscode','user');",
+        ).unwrap();
+        Connection::open(&catalog).unwrap().execute_batch(
+            "CREATE TABLE local_thread_catalog(host_id TEXT, thread_id TEXT,
+                display_title TEXT, source_created_at REAL, source_updated_at REAL,
+                cwd TEXT, source_kind TEXT, model_provider TEXT,
+                observation_sequence INTEGER, PRIMARY KEY(host_id,thread_id));",
+        ).unwrap();
+        fs::write(home.join("rollout-user.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"user\"}}\n").unwrap();
+        let paths = if colocated { vec![state.clone()] } else { vec![catalog.clone(), state.clone()] };
+        (state, catalog, paths)
+    }
+
+    #[test]
+    fn online_catalog_rechecks_archives_deletions_and_providers_under_write_fences() {
+        for colocated in [false, true] {
+            for mutation in [
+                "UPDATE threads SET archived=1",
+                "DELETE FROM threads",
+                "CREATE TABLE codex_plus_deleted_threads(thread_id TEXT, backup_token TEXT);
+                 INSERT INTO codex_plus_deleted_threads VALUES('user','deleted')",
+                "UPDATE threads SET model_provider='new-provider'",
+            ] {
+                let home = tempfile::tempdir().unwrap();
+                let (state, catalog, paths) = fixture(home.path(), colocated);
+                let stale = collect_catalog_repair_plan_with_provider(
+                    home.path(), &paths, None, None,
+                ).unwrap();
+                assert_eq!(stale.threads.len(), 1);
+                Connection::open(state).unwrap().execute_batch(mutation).unwrap();
+                let counts = apply_catalog_repair_plan_revalidated(
+                    &paths, &stale, false, None, Some(home.path()),
+                ).unwrap();
+                let changed_provider = mutation.contains("new-provider");
+                assert_eq!(counts.inserted_rows, usize::from(changed_provider));
+                if changed_provider {
+                    let provider: String = Connection::open(catalog).unwrap().query_row(
+                        "SELECT model_provider FROM local_thread_catalog", [], |r| r.get(0),
+                    ).unwrap();
+                    assert_eq!(provider, "new-provider");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wal_canonical_write_fence_blocks_concurrent_archive_and_releases_on_drop() {
+        let home = tempfile::tempdir().unwrap();
+        let (state, catalog, paths) = fixture(home.path(), false);
+        let writer = Connection::open(state).unwrap();
+        writer.busy_timeout(Duration::ZERO).unwrap();
+        let fences = lock_catalog_canonical_databases(&paths, &catalog).unwrap();
+        let failure = writer.execute("UPDATE threads SET archived=1", []).unwrap_err();
+        assert!(matches!(failure, rusqlite::Error::SqliteFailure(ref e, _)
+            if e.code == rusqlite::ErrorCode::DatabaseBusy));
+        drop(fences);
+        assert_eq!(writer.execute("UPDATE threads SET archived=1", []).unwrap(), 1);
+    }
+
+    #[test]
+    fn busy_canonical_writer_defers_online_catalog_without_catalog_changes() {
+        let home = tempfile::tempdir().unwrap();
+        let (state, catalog, _) = fixture(home.path(), false);
+        let writer = Connection::open(state).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let outcome = run_online_session_catalog_recovery(Some(home.path()));
+        assert_eq!(outcome.status, ProviderSyncStatus::Skipped, "{outcome:?}");
+        assert!(outcome.recovery_errors.is_empty());
+        assert_eq!(Connection::open(catalog).unwrap().query_row(
+            "SELECT COUNT(*) FROM local_thread_catalog", [], |r| r.get::<_, i64>(0),
+        ).unwrap(), 0);
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn source_changed_after_validation_is_excluded_without_decompressing_under_lock() {
+        let home = tempfile::tempdir().unwrap();
+        let (_, catalog, paths) = fixture(home.path(), false);
+        let plan = collect_catalog_repair_plan_with_provider(home.path(), &paths, None, None).unwrap();
+        let proofs = catalog_plan_source_proofs(home.path(), &plan).unwrap();
+        assert_eq!(proofs.len(), 1);
+        fs::write(home.path().join("rollout-user.jsonl"), b"replaced source").unwrap();
+        let _fences = lock_catalog_canonical_databases(&paths, &catalog).unwrap();
+        let rechecked = collect_catalog_repair_plan_with_source_proofs(
+            home.path(), &paths, None, None, Some(&proofs),
+        ).unwrap();
+        assert!(rechecked.threads.is_empty());
+    }
+
+    #[test]
+    fn online_source_only_recovery_rejects_wrong_identity_or_corrupt_compression() {
+        for kind in ["wrong-id", "invalid-json", "corrupt-zstd"] {
+            let home = tempfile::tempdir().unwrap();
+            let (_, _, paths) = fixture(home.path(), false);
+            let plain = home.path().join("rollout-user.jsonl");
+            let compressed = home.path().join("source.jsonl.zst");
+            let text = match kind {
+                "wrong-id" => "{\"type\":\"session_meta\",\"payload\":{\"id\":\"other\"}}\n",
+                "invalid-json" => "{\"type\":\"session_meta\",\"payload\":{\"id\":\"user\"}}\ninvalid\n",
+                _ => "{\"type\":\"session_meta\",\"payload\":{\"id\":\"user\"}}\n",
+            };
+            // 原有普通文件保留为无关文件，canonical 只指向本次待验证压缩来源。
+            Connection::open(home.path().join("state_5.sqlite")).unwrap().execute(
+                "UPDATE threads SET rollout_path='source.jsonl.zst'", [],
+            ).unwrap();
+            let encoded = if kind == "corrupt-zstd" { b"invalid zstd".to_vec() }
+                else { zstd::stream::encode_all(text.as_bytes(), 1).unwrap() };
+            fs::write(&compressed, encoded).unwrap();
+            fs::write(&plain, text).unwrap();
+            let plan = collect_catalog_repair_plan_with_provider(
+                home.path(), &paths, None, None,
+            ).unwrap();
+            assert!(plan.threads.is_empty(), "{kind}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod deleted_thread_tombstone_tests {
     use super::*;
 
@@ -8977,134 +9109,3 @@ mod durable_history_deletion_tests {
     }
 }
 
-#[cfg(test)]
-mod online_catalog_concurrency_tests {
-    use super::*;
-
-    fn fixture(home: &Path, colocated: bool) -> (PathBuf, PathBuf, Vec<PathBuf>) {
-        let state = home.join("state_5.sqlite");
-        fs::create_dir_all(home.join("sqlite")).unwrap();
-        let catalog = if colocated { state.clone() } else { home.join("sqlite/codex-dev.db") };
-        Connection::open(&state).unwrap().execute_batch(
-            "PRAGMA journal_mode=WAL;
-             CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT, archived INTEGER,
-                has_user_event INTEGER, cwd TEXT, title TEXT, rollout_path TEXT,
-                source TEXT, thread_source TEXT);
-             INSERT INTO threads VALUES('user','custom',0,1,'C:/project','Title',
-                'rollout-user.jsonl','vscode','user');",
-        ).unwrap();
-        Connection::open(&catalog).unwrap().execute_batch(
-            "CREATE TABLE local_thread_catalog(host_id TEXT, thread_id TEXT,
-                display_title TEXT, source_created_at REAL, source_updated_at REAL,
-                cwd TEXT, source_kind TEXT, model_provider TEXT,
-                observation_sequence INTEGER, PRIMARY KEY(host_id,thread_id));",
-        ).unwrap();
-        fs::write(home.join("rollout-user.jsonl"),
-            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"user\"}}\n").unwrap();
-        let paths = if colocated { vec![state.clone()] } else { vec![catalog.clone(), state.clone()] };
-        (state, catalog, paths)
-    }
-
-    #[test]
-    fn online_catalog_rechecks_archives_deletions_and_providers_under_write_fences() {
-        for colocated in [false, true] {
-            for mutation in [
-                "UPDATE threads SET archived=1",
-                "DELETE FROM threads",
-                "CREATE TABLE codex_plus_deleted_threads(thread_id TEXT, backup_token TEXT);
-                 INSERT INTO codex_plus_deleted_threads VALUES('user','deleted')",
-                "UPDATE threads SET model_provider='new-provider'",
-            ] {
-                let home = tempfile::tempdir().unwrap();
-                let (state, catalog, paths) = fixture(home.path(), colocated);
-                let stale = collect_catalog_repair_plan_with_provider(
-                    home.path(), &paths, None, None,
-                ).unwrap();
-                assert_eq!(stale.threads.len(), 1);
-                Connection::open(state).unwrap().execute_batch(mutation).unwrap();
-                let counts = apply_catalog_repair_plan_revalidated(
-                    &paths, &stale, false, None, Some(home.path()),
-                ).unwrap();
-                let changed_provider = mutation.contains("new-provider");
-                assert_eq!(counts.inserted_rows, usize::from(changed_provider));
-                if changed_provider {
-                    let provider: String = Connection::open(catalog).unwrap().query_row(
-                        "SELECT model_provider FROM local_thread_catalog", [], |r| r.get(0),
-                    ).unwrap();
-                    assert_eq!(provider, "new-provider");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn wal_canonical_write_fence_blocks_concurrent_archive_and_releases_on_drop() {
-        let home = tempfile::tempdir().unwrap();
-        let (state, catalog, paths) = fixture(home.path(), false);
-        let writer = Connection::open(state).unwrap();
-        writer.busy_timeout(Duration::ZERO).unwrap();
-        let fences = lock_catalog_canonical_databases(&paths, &catalog).unwrap();
-        let failure = writer.execute("UPDATE threads SET archived=1", []).unwrap_err();
-        assert!(matches!(failure, rusqlite::Error::SqliteFailure(ref e, _)
-            if e.code == rusqlite::ErrorCode::DatabaseBusy));
-        drop(fences);
-        assert_eq!(writer.execute("UPDATE threads SET archived=1", []).unwrap(), 1);
-    }
-
-    #[test]
-    fn busy_canonical_writer_defers_online_catalog_without_catalog_changes() {
-        let home = tempfile::tempdir().unwrap();
-        let (state, catalog, _) = fixture(home.path(), false);
-        let writer = Connection::open(state).unwrap();
-        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let outcome = run_online_session_catalog_recovery(Some(home.path()));
-        assert_eq!(outcome.status, ProviderSyncStatus::Skipped, "{outcome:?}");
-        assert!(outcome.recovery_errors.is_empty());
-        assert_eq!(Connection::open(catalog).unwrap().query_row(
-            "SELECT COUNT(*) FROM local_thread_catalog", [], |r| r.get::<_, i64>(0),
-        ).unwrap(), 0);
-        writer.execute_batch("ROLLBACK").unwrap();
-    }
-
-    #[test]
-    fn source_changed_after_validation_is_excluded_without_decompressing_under_lock() {
-        let home = tempfile::tempdir().unwrap();
-        let (_, catalog, paths) = fixture(home.path(), false);
-        let plan = collect_catalog_repair_plan_with_provider(home.path(), &paths, None, None).unwrap();
-        let proofs = catalog_plan_source_proofs(home.path(), &plan).unwrap();
-        assert_eq!(proofs.len(), 1);
-        fs::write(home.path().join("rollout-user.jsonl"), b"replaced source").unwrap();
-        let _fences = lock_catalog_canonical_databases(&paths, &catalog).unwrap();
-        let rechecked = collect_catalog_repair_plan_with_source_proofs(
-            home.path(), &paths, None, None, Some(&proofs),
-        ).unwrap();
-        assert!(rechecked.threads.is_empty());
-    }
-
-    #[test]
-    fn online_source_only_recovery_rejects_wrong_identity_or_corrupt_compression() {
-        for kind in ["wrong-id", "invalid-json", "corrupt-zstd"] {
-            let home = tempfile::tempdir().unwrap();
-            let (_, _, paths) = fixture(home.path(), false);
-            let plain = home.path().join("rollout-user.jsonl");
-            let compressed = home.path().join("source.jsonl.zst");
-            let text = match kind {
-                "wrong-id" => "{\"type\":\"session_meta\",\"payload\":{\"id\":\"other\"}}\n",
-                "invalid-json" => "{\"type\":\"session_meta\",\"payload\":{\"id\":\"user\"}}\ninvalid\n",
-                _ => "{\"type\":\"session_meta\",\"payload\":{\"id\":\"user\"}}\n",
-            };
-            // 原有普通文件保留为无关文件，canonical 只指向本次待验证压缩来源。
-            Connection::open(home.path().join("state_5.sqlite")).unwrap().execute(
-                "UPDATE threads SET rollout_path='source.jsonl.zst'", [],
-            ).unwrap();
-            let encoded = if kind == "corrupt-zstd" { b"invalid zstd".to_vec() }
-                else { zstd::stream::encode_all(text.as_bytes(), 1).unwrap() };
-            fs::write(&compressed, encoded).unwrap();
-            fs::write(&plain, text).unwrap();
-            let plan = collect_catalog_repair_plan_with_provider(
-                home.path(), &paths, None, None,
-            ).unwrap();
-            assert!(plan.threads.is_empty(), "{kind}");
-        }
-    }
-}
