@@ -271,9 +271,9 @@ impl SyncJournal {
         &self.path
     }
     pub(crate) fn persist(&self) -> anyhow::Result<()> {
-        // 已由可写临时句柄 sync_all，再以平台原子替换发布。
-        // Windows 的只读句柄不能 FlushFileBuffers，不能在发布后再 File::open().sync_all()。
-        crate::backup::private_atomic_write(&self.path, &serde_json::to_vec(self)?)
+        crate::backup::private_atomic_write(&self.path, &serde_json::to_vec(self)?)?;
+        crate::backup::sync_file(&self.path)?;
+        Ok(())
     }
     pub(crate) fn commit(
         &mut self,

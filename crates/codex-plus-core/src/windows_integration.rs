@@ -218,10 +218,21 @@ pub fn open_url(url: &str) -> anyhow::Result<()> {
         )
     };
     let code = result.0 as isize;
-    if code <= 32 {
-        anyhow::bail!("ShellExecuteW returned {code}");
+    if code > 32 {
+        return Ok(());
     }
-    Ok(())
+    // ShellExecuteW 在目标 URL 没有默认浏览器关联、或默认处理程序失效时返回
+    // <=32（31 = SE_ERR_NOASSOC）。直接把这串数字抛给用户既看不懂也无法处理
+    // （#2101）。退回 explorer.exe 打开，它走独立的外壳解析路径，能覆盖
+    // 「默认浏览器已卸载/关联损坏」的常见场景。
+    match std::process::Command::new("explorer.exe").arg(url).spawn() {
+        Ok(_) => Ok(()),
+        Err(fallback_error) => {
+            anyhow::bail!(
+                "无法打开链接（ShellExecuteW={code}）：{fallback_error}。请在系统设置中为 http/https 选择默认浏览器后重试"
+            )
+        }
+    }
 }
 
 #[cfg(windows)]
