@@ -603,7 +603,7 @@ export function SkillsPage({ notify }: { notify: Notify }) {
     <div className="mg-content" ref={contentRef} onScroll={(event) => { skillPageScrollTop = event.currentTarget.scrollTop; }}>
       <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={({ active, over }) => { if (over && active.id !== over.id) { setGroupOrder(moveSkillGroup(allGroupNames, String(active.id), String(over.id))); setNameSort(null); } }}>
       <SortableContext items={groups.map(([name]) => name)} strategy={verticalListSortingStrategy}>
-      {!groups.length ? <div className="mg-skill-list"><div className="mg-empty"><h2>{loading ? t("正在扫描…") : t("没有匹配的 Skill")}</h2></div></div> : groups.map(([source, groupItems]) => {
+      {!groups.length ? <div className="mg-skill-list"><div className="mg-empty"><h2>{loading || refreshing ? t("正在扫描…") : t("没有匹配的 Skill")}</h2></div></div> : groups.map(([source, groupItems]) => {
         const collapsed = !expandedGroups.has(source) && !query.trim();
         const viewportKey = `${tab}:${source}:${deferredQuery}`;
         const batchItems = groupItems.filter((skill) => skill.installed && !skill.bundled && !skill.plugin);

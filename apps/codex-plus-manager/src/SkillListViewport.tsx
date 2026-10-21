@@ -28,7 +28,7 @@ export function SkillListViewport<T>({ items, rowHeight, resetKey, initialScroll
   useLayoutEffect(() => {
     if (ref.current) ref.current.scrollTop = initialScrollTop;
     setViewport((previous) => ({ ...previous, top: ref.current?.scrollTop || 0 }));
-  }, [resetKey, initialScrollTop]);
+  }, [resetKey]);
   const start = Math.min(items.length, Math.max(0, Math.floor((viewport.top - viewport.header) / rowHeight) - 4));
   const end = Math.min(items.length, Math.ceil((viewport.top + viewport.height) / rowHeight) + 4);
   return <div ref={ref} className={className} aria-busy={busy} data-total={items.length}
