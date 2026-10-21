@@ -407,7 +407,7 @@ impl HistoryRetention {
                         self.validate_history_path(Path::new(path))?;
                     }
                     let normalized = comparable_history_path(Path::new(path));
-                    let bytes = store.read_file_contents(&token, file)?;
+                    let bytes = store.read_file_backup(&token, file)?;
                     if let Some((previous, _)) = all_files.get(&normalized) {
                         if !previous.starts_with(&bytes) && !bytes.starts_with(previous) {
                             bail!("restore conflict: incompatible history snapshots: {path}");

@@ -71,6 +71,26 @@ impl Fixture {
 }
 
 #[test]
+fn retained_history_undo_supports_legacy_threads_without_archived_columns() {
+    let f = Fixture::new();
+    f.add("a", None);
+    f.add("b", Some("a"));
+    Connection::open(&f.db)
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE threads DROP COLUMN archived_at;
+             ALTER TABLE threads DROP COLUMN archived;",
+        )
+        .unwrap();
+    let token = f.delete("a");
+    assert!(f.path("a").exists());
+    f.undo(&token);
+    f.undo(&token);
+    assert!(f.visible("a"));
+    assert!(f.visible("b"));
+}
+
+#[test]
 fn retained_history_undo_validates_upstream_blob_before_restoring() {
     let f = Fixture::new();
     f.add("a", None);

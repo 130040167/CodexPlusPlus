@@ -286,7 +286,7 @@ impl BackupStore {
         Ok(())
     }
 
-    pub(crate) fn read_file_contents(&self, token: &str, entry: &Value) -> anyhow::Result<Vec<u8>> {
+    pub(crate) fn read_file_backup(&self, token: &str, entry: &Value) -> anyhow::Result<Vec<u8>> {
         self.validate_file_backup(token, entry)?;
         if let Some(content) = entry.get("content_b64").and_then(Value::as_str) {
             return Ok(base64::Engine::decode(

@@ -1529,7 +1529,7 @@ fn restore_backups(
         if let Some(files) = tables.get("__files").and_then(Value::as_array) {
             for file in files {
                 if tables.contains_key("__history_files") {
-                    let bytes = backup_store.read_file_contents(
+                    let bytes = backup_store.read_file_backup(
                         backup["token"].as_str().unwrap_or(""),
                         file,
                     )?;
@@ -1553,6 +1553,12 @@ fn restore_backups(
         let tx = db.transaction()?;
         restore_rows(&tx, tables)?;
         tx.commit()?;
+    }
+    // 所有数据库恢复完成后，再恢复侧栏与会话索引。
+    for backup in backups {
+        let Some(tables) = backup["tables"].as_object() else {
+            continue;
+        };
         if let Some(entries) = tables.get("__session_index").and_then(Value::as_array) {
             let lines = entries
                 .iter()
