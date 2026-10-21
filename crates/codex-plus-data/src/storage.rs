@@ -72,6 +72,8 @@ pub fn local_session_titles(
         }
     }
     titles
+}
+
 /// 原生列表不认识删除标记；供内置侧边栏按本地主机身份过滤保留的历史。
 pub fn deleted_local_thread_ids(paths: &[PathBuf]) -> anyhow::Result<Vec<String>> {
     let mut ids = std::collections::BTreeSet::new();
@@ -1333,7 +1335,7 @@ fn read_rollout_usage_tail(rollout: &Path, limit: usize) -> anyhow::Result<Vec<V
                 continue;
             }
             if let Ok(value) = serde_json::from_str::<Value>(&line)
-                && let Some(event) = rollout_usage_event(&value)
+                && let Some(event) = rollout_usage_event(&value, None)
             {
                 events.push_back(event);
                 if events.len() > limit {
