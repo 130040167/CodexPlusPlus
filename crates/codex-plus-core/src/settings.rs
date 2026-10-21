@@ -954,6 +954,16 @@ pub struct BackendSettings {
         default = "default_protocol_proxy_auto_retry_commit_delay_ms"
     )]
     pub protocol_proxy_auto_retry_commit_delay_ms: u64,
+    /// 本地协议代理（helper）单次 HTTP 请求体上限，单位 MiB。
+    ///
+    /// 默认 128 MiB：1M 上下文窗口的长会话（带截图历史）实测请求体可到 ~50 MB，
+    /// 旧的 32 MiB 硬上限会让长会话直接返回 413 并中断对话。范围 32~512 MiB；
+    /// 环境变量 `CODEX_PLUS_MAX_HTTP_BODY_BYTES`（字节）仍可覆盖本设置。
+    #[serde(
+        rename = "helperMaxRequestBodyMib",
+        default = "default_helper_max_request_body_mib"
+    )]
+    pub helper_max_request_body_mib: u32,
     /// 按工具分区的配置。`tools.codex` 是上面那批扁平字段的镜像（写盘时同步），
     /// 其它工具（Grok / 后续工具）只存在这里。见 `crate::tools`。
     #[serde(rename = "tools", default)]
@@ -1059,6 +1069,7 @@ impl Default for BackendSettings {
             protocol_proxy_auto_retry_mode: default_protocol_proxy_auto_retry_mode(),
             protocol_proxy_auto_retry_commit_delay_ms:
                 default_protocol_proxy_auto_retry_commit_delay_ms(),
+            helper_max_request_body_mib: default_helper_max_request_body_mib(),
             tools: BTreeMap::new(),
             active_tool: ToolId::Codex,
         }
@@ -1066,6 +1077,11 @@ impl Default for BackendSettings {
 }
 
 impl BackendSettings {
+    /// 当前设置对应的本地代理请求体上限（字节），已夹取到 32~512 MiB。
+    pub fn helper_max_request_body_bytes(&self) -> usize {
+        clamp_helper_max_request_body_mib(self.helper_max_request_body_mib) as usize * 1024 * 1024
+    }
+
     pub fn active_relay_profile(&self) -> RelayProfile {
         if self.active_relay_id == default_active_relay_id()
             && self.relay_profiles.len() == 1
@@ -1528,6 +1544,28 @@ pub fn default_protocol_proxy_auto_retry_commit_delay_ms() -> u64 {
 
 pub fn clamp_protocol_proxy_auto_retry_commit_delay_ms(value: u64) -> u64 {
     value.min(10_000)
+}
+
+/// 本地协议代理请求体默认上限：128 MiB。
+///
+/// 依据：1M 上下文窗口的长会话（历史里带 Computer Use 截图）实测请求体约 33 MB
+/// 且仍在增长，对应 1M tokens 约 50 MB；旧的 32 MiB 硬上限会在正常长会话里直接
+/// 返回 413 并中断对话。128 MiB 给 1M 窗口留出约 2.5 倍余量。
+pub const DEFAULT_HELPER_MAX_REQUEST_BODY_MIB: u32 = 128;
+/// 请求体上限下限：低于 32 MiB 会误伤正常请求。
+pub const MIN_HELPER_MAX_REQUEST_BODY_MIB: u32 = 32;
+/// 请求体上限上限：helper 会整段缓冲请求体，再高内存开销不可控。
+pub const MAX_HELPER_MAX_REQUEST_BODY_MIB: u32 = 512;
+
+pub fn default_helper_max_request_body_mib() -> u32 {
+    DEFAULT_HELPER_MAX_REQUEST_BODY_MIB
+}
+
+pub fn clamp_helper_max_request_body_mib(value: u32) -> u32 {
+    value.clamp(
+        MIN_HELPER_MAX_REQUEST_BODY_MIB,
+        MAX_HELPER_MAX_REQUEST_BODY_MIB,
+    )
 }
 
 pub fn default_relay_profiles() -> Vec<RelayProfile> {
@@ -2150,6 +2188,14 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
         target.insert(
             "protocolProxyAutoRetryCommitDelayMs".to_string(),
             Value::from(clamp_protocol_proxy_auto_retry_commit_delay_ms(value)),
+        );
+    }
+    // 请求体上限也走同一份 settings.json；漏登记会让「保存了但没生效」。
+    if let Some(value) = source.get("helperMaxRequestBodyMib").and_then(Value::as_u64) {
+        let clamped = value.min(u64::from(MAX_HELPER_MAX_REQUEST_BODY_MIB)) as u32;
+        target.insert(
+            "helperMaxRequestBodyMib".to_string(),
+            Value::from(clamp_helper_max_request_body_mib(clamped)),
         );
     }
     if let Some(value) = source.get("enhancementsEnabled").and_then(Value::as_bool) {
@@ -2886,6 +2932,8 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
         clamp_protocol_proxy_auto_retry_commit_delay_ms(
             settings.protocol_proxy_auto_retry_commit_delay_ms,
         );
+    settings.helper_max_request_body_mib =
+        clamp_helper_max_request_body_mib(settings.helper_max_request_body_mib);
     // 扁平字段始终是 Codex 的唯一事实来源，这里把它镜像进 tools.codex；
     // 其它工具的分片原样保留。放在函数末尾，所有 load / save / update 路径
     // 都会经过，两边不会漂移。

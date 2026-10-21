@@ -3542,6 +3542,11 @@ pub fn save_settings(mut settings: BackendSettings, expected_revision: Option<St
             }
             // 自动接管是常驻行为，保存后立刻生效，不必重启管理器。
             crate::auto_takeover::apply_enabled(settings.codex_app_auto_takeover);
+            // 请求体上限是运行期策略：保存后立刻让正在运行的本地代理按新上限收请求，
+            // 不必重启 Codex++/Codex。等待下一次 helper 启动的路径也会读到同一设置。
+            codex_plus_core::launcher::set_http_body_limit_bytes(
+                settings.helper_max_request_body_bytes(),
+            );
             settings_payload("设置已保存。", "设置保存后重新读取失败")
         }
         Err(error) => {
@@ -4771,6 +4776,11 @@ fn normalized_codex_app_path_for_save(raw: &str) -> String {
 
 fn normalize_settings_before_save(mut settings: BackendSettings) -> BackendSettings {
     settings.codex_app_path = normalized_codex_app_path_for_save(&settings.codex_app_path);
+    // 请求体上限在落盘前夹取到 32~512 MiB，settings.json 永远是可用值。
+    settings.helper_max_request_body_mib =
+        codex_plus_core::settings::clamp_helper_max_request_body_mib(
+            settings.helper_max_request_body_mib,
+        );
     settings.relay_common_config_contents =
         codex_plus_core::relay_config::sanitize_common_config_contents(
             &settings.relay_common_config_contents,
@@ -10653,6 +10663,29 @@ enabled = true
             normalized.codex_app_path.is_empty(),
             "指向 Codex++ 自身的路径不该落库，实际是 {}",
             normalized.codex_app_path
+        );
+    }
+
+    #[test]
+    fn normalize_settings_before_save_clamps_helper_body_limit() {
+        let settings = BackendSettings {
+            helper_max_request_body_mib: 9999,
+            ..BackendSettings::default()
+        };
+        assert_eq!(
+            normalize_settings_before_save(settings)
+                .helper_max_request_body_mib,
+            512
+        );
+
+        let settings = BackendSettings {
+            helper_max_request_body_mib: 1,
+            ..BackendSettings::default()
+        };
+        assert_eq!(
+            normalize_settings_before_save(settings)
+                .helper_max_request_body_mib,
+            32
         );
     }
 
