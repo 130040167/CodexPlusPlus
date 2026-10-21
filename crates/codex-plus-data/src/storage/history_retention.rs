@@ -350,7 +350,9 @@ impl HistoryRetention {
                             let current =
                                 select_dicts(&db, "SELECT * FROM threads WHERE id=?1", &[&id])?;
                             let mut original = row.clone();
-                            original["archived"] = current[0]["archived"].clone();
+                            if object.contains_key("archived") {
+                                original["archived"] = current[0]["archived"].clone();
+                            }
                             if object.contains_key("archived_at") {
                                 original["archived_at"] = current[0]["archived_at"].clone();
                             }
@@ -464,19 +466,24 @@ impl HistoryRetention {
             .collect::<Vec<_>>();
         let mut missing = Vec::new();
         for path in all_files.keys() {
-            if crate::rollout_source::is_compressed(path) {
-                let logical = path.with_extension("");
-                if logical.exists() && !all_files.contains_key(&logical) {
+            if let Some(other) = rollout_counterpart(path) {
+                if other.exists() && !all_files.contains_key(&other) {
                     bail!(
-                        "restore conflict: uncompressed history now exists: {}",
-                        logical.display()
+                        "restore conflict: alternate history now exists: {}",
+                        other.display()
                     );
                 }
             }
         }
         for (path, (bytes, file)) in all_files {
             match fs::read(&path) {
-                Ok(current) if current.starts_with(&bytes) => {}
+                Ok(current) if current.starts_with(&bytes) => {
+                    if crate::rollout_source::is_compressed(&path) {
+                        let mut reader =
+                            crate::rollout_source::decode_reader(&path, &current[..])?;
+                        std::io::copy(&mut reader, &mut std::io::sink())?;
+                    }
+                }
                 Ok(_) => bail!("restore conflict: history file changed: {}", path.display()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing.push(file),
                 Err(error) => return Err(error.into()),
@@ -578,10 +585,20 @@ fn comparable_history_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+fn rollout_counterpart(path: &Path) -> Option<PathBuf> {
+    if crate::rollout_source::is_compressed(path) {
+        Some(path.with_extension(""))
+    } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+        let mut compressed = path.as_os_str().to_os_string();
+        compressed.push(".zst");
+        Some(PathBuf::from(compressed))
+    } else {
+        None
+    }
+}
+
 // 回收后的文件可能已不存在；从最近的现存祖先解析短路径与目录大小写。
 fn resolved_history_path(path: &Path) -> anyhow::Result<PathBuf> {
-    let resolved = crate::rollout_source::resolve(path);
-    let path = resolved.as_deref().unwrap_or(path);
     let mut ancestor = path;
     let mut missing = Vec::new();
     loop {

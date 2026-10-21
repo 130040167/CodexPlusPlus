@@ -623,7 +623,9 @@
           applyDeletedLocalSessions();
           await refreshRecentConversationsForHost();
         }
-        showToast(navigationNotice || result.message || "删除成功", result.undo_token);
+        showToast(navigationNotice || result.message || "删除成功", {
+          undoToken: result.undo_token,
+        });
       } else {
         showToast(result.message || "删除失败", null);
       }
