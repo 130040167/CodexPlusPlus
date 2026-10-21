@@ -99,24 +99,18 @@ fn stale_template_is_sanitized_without_an_existing_live_config() {
 
 #[test]
 fn corrupt_live_config_does_not_bypass_stale_template_cleanup() {
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::write(temp.path().join("config.toml"), "[invalid\n").unwrap();
-    let stale = format!(
-        "model = 'test'\n[marketplaces.openai-api-curated]\nsource_type = 'local'\nsource = '{}'\n\
-         [plugins.'github@openai-curated']\nenabled = true\n",
-        temp.path().join(".tmp/plugins").display()
-    );
-
-    apply_relay_config_file_to_home(temp.path(), &stale).unwrap();
-
-    let written = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    let doc = written.parse::<toml_edit::DocumentMut>().unwrap();
-    assert!(doc
-        .get("marketplaces")
-        .and_then(|item| item.get("openai-api-curated"))
-        .is_none());
-    assert_eq!(
-        doc["plugins"]["github@openai-curated"]["enabled"].as_bool(),
-        Some(true)
-    );
+    for plugin in ["github@openai-api-curated", "github@openai-curated"] {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("config.toml"), "[invalid\n").unwrap();
+        let stale = format!(
+            "model = 'test'\n[marketplaces.openai-api-curated]\nsource_type = 'local'\nsource = '{}'\n\
+             [plugins.'{plugin}']\nenabled = true\n",
+            temp.path().join(".tmp/plugins").display()
+        );
+        apply_relay_config_file_to_home(temp.path(), &stale).unwrap();
+        let written = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+        let doc = written.parse::<toml_edit::DocumentMut>().unwrap();
+        assert!(doc.get("marketplaces").and_then(|item| item.get("openai-api-curated")).is_none());
+        assert_eq!(doc["plugins"][plugin]["enabled"].as_bool(), Some(true));
+    }
 }
