@@ -9302,12 +9302,10 @@ select {
 }
 .zcode-enhance-card-side.is-ok strong { color: hsl(var(--status-success)); }
 .zcode-enhance-card-side.is-warn strong { color: hsl(var(--status-warning)); }
-.zcode-enhance-card-actions { align-items: start; }
-.zcode-enhance-card-buttons {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 6px;
+
+/* 首组现在只有 2 张状态卡：用 2 列，别沿用 Codex 首组的 3 列留空。 */
+.zcode-enhance-page .enhance-feature-groups .feature-group:first-child .feature-switch-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 /* 组内整行提示：卡片是网格项，提示和错误块要占满整行。 */

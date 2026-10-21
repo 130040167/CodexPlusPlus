@@ -13573,9 +13573,6 @@ function ZcodeEnhancementScreen({ onVoiceInputSaved }: { onVoiceInputSaved?: () 
   const portText = s?.debugPort != null ? String(s.debugPort) : t("未启用");
   const injectText = !s ? t("未检测") : s.injected ? t("已注入") : t("未注入");
   const portTone = !s ? "" : s.needsRestart ? "is-warn" : s.injected ? "is-ok" : "";
-  const voiceServerText = !s ? t("未检测") : !s.dictationEnabled ? t("听写未开启") : s.voiceServerReady ? t("已就绪") : t("未就绪");
-  const dictationText = !s ? t("未检测") : s.dictationEnabled ? t("听写已开启") : t("听写已关闭");
-  const voiceServerTone = !s ? "" : !s.dictationEnabled ? "is-warn" : s.voiceServerReady ? "is-ok" : "";
   // 每组只留最要紧的一条提示，避免多行提示堆叠。
   const statusHint = !s
     ? busy !== null
@@ -13602,16 +13599,6 @@ function ZcodeEnhancementScreen({ onVoiceInputSaved }: { onVoiceInputSaved?: () 
         disabled={voiceToggleDisabled}
         onChange={(value) => void toggleVoiceInput(value)}
       />
-      <div className="feature-toggle">
-        <span>
-          <strong>{t("识别服务")}</strong>
-          <small>{t("识别沿用「Codex增强 → 语音输入」的 ASR 配置；首次使用会请求系统麦克风权限。")}</small>
-        </span>
-        <span className={`zcode-enhance-card-side ${voiceServerTone}`}>
-          <strong>{voiceServerText}</strong>
-          <small>{dictationText}</small>
-        </span>
-      </div>
       {voiceHint ? <p className="field-hint">{voiceHint}</p> : null}
     </FeatureGroup>
   );
@@ -13690,25 +13677,6 @@ function ZcodeEnhancementScreen({ onVoiceInputSaved }: { onVoiceInputSaved?: () 
                   <span className={`zcode-enhance-card-side ${portTone}`}>
                     <strong>{portText}</strong>
                     <small>{injectText}</small>
-                  </span>
-                </div>
-                <div className="feature-toggle zcode-enhance-card-actions">
-                  <span>
-                    <strong>{t("启动并注入")}</strong>
-                    <small>{t("会先退出正在运行的 ZCode，再带调试端口重启并注入；官方应用和登录态不受影响。")}</small>
-                  </span>
-                  <span className="zcode-enhance-card-buttons">
-                    <Button disabled={busy !== null || !s?.supported} onClick={() => void act("launch")} size="sm">
-                      <Play className="h-4 w-4" />{busy === "launch" ? t("启动中…") : t("启动并注入")}
-                    </Button>
-                    <Button
-                      disabled={busy !== null || !s?.running || s?.debugPort == null}
-                      onClick={() => void act("reinject")}
-                      size="sm"
-                      variant="secondary"
-                    >
-                      <RotateCcw className="h-4 w-4" />{busy === "reinject" ? t("注入中…") : t("重新注入")}
-                    </Button>
                   </span>
                 </div>
                 {statusHint ? (

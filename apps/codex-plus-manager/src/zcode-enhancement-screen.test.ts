@@ -169,9 +169,8 @@ test("进入 ZCode 页面自动检测一次，控制卡/标签页/多列功能�
   assert.match(text(page), /启动与注入/);
   assert.match(text(page), /ZCode 运行状态/);
   assert.match(text(page), /调试端口与注入状态/);
-  assert.match(text(page), /识别服务/);
-  assert.equal(featureCards(panels[0]).length, 5);
-  assert.equal(featureCards(panels[1]).length, 2);
+  assert.equal(featureCards(panels[0]).length, 3);
+  assert.equal(featureCards(panels[1]).length, 1);
   // 运行/注入数据卡。
   assert.match(text(page), /运行中（PID 26431）/);
   assert.match(text(page), /官方版本 3\.16\.2/);
@@ -183,15 +182,23 @@ test("进入 ZCode 页面自动检测一次，控制卡/标签页/多列功能�
   const voicePanels = byRole(voicePage, "tabpanel");
   assert.equal(voicePanels[0].props.hidden, true);
   assert.equal(voicePanels[1].props.hidden, false);
-  assert.equal(featureCards(voicePanels[1]).length, 2);
+  assert.equal(featureCards(voicePanels[1]).length, 1);
   // 键盘左右键也能切换页签。
   const voiceTabs = byRole(voicePage, "tab");
   voiceTabs[1].props.onKeyDown({ key: "ArrowRight", preventDefault() {} });
   const wrapped = byRole(screen.render(), "tabpanel");
   assert.equal(wrapped[0].props.hidden, false);
-  const launch = buttons(voicePage).find((button) => text(button) === "启动并注入")!;
-  assert.equal(launch.props.disabled, false);
-  assert.equal(buttons(voicePage).find((button) => text(button) === "重新注入")!.props.disabled, false);
+});
+
+test("页面内不再重复启动/重新注入按钮，相关操作统一由顶栏负责", async () => {
+  const screen = harness("ZcodeEnhancementScreen");
+  screen.render();
+  screen.calls[0].resolve(ready);
+  await tick();
+  const page = screen.render();
+  assert.equal(buttons(page).find((button) => text(button) === "启动并注入"), undefined);
+  assert.equal(buttons(page).find((button) => text(button) === "重新注入"), undefined);
+  assert.match(text(page), /检测 ZCode/);
 });
 
 test("顶部总开关和功能卡开关都调用 set_voice_input，成功后广播刷新事件", async () => {
@@ -222,25 +229,6 @@ test("顶部总开关和功能卡开关都调用 set_voice_input，成功后广�
   assert.equal(screen.calls[2].args?.enabled, true);
 });
 
-test("启动并注入按钮调用 action/launch，成功后卡片与提示刷新", async () => {
-  const screen = harness("ZcodeEnhancementScreen");
-  screen.render();
-  screen.calls[0].resolve(ready);
-  await tick();
-  const launch = buttons(screen.render()).find((button) => text(button) === "启动并注入")!;
-  launch.props.onClick();
-  assert.equal(screen.calls.length, 2);
-  assert.equal(screen.calls[1].command, "zcode_enhancement_action");
-  assert.equal(screen.calls[1].args?.action, "launch");
-  assert.match(text(screen.render()), /启动中/);
-  screen.calls[1].resolve({ ...ready, injected: false, needsRestart: true, voiceInput: false });
-  await tick();
-  const page = screen.render();
-  assert.match(text(page), /未注入/);
-  assert.match(text(page), /注入前的进程/);
-  assert.deepEqual(screen.dispatched.map((event) => event.detail?.source), ["page"]);
-});
-
 test("检测失败展示错误，检测按钮走 action/detect；未安装时启动/重新注入与开关禁用", async () => {
   const screen = harness("ZcodeEnhancementScreen");
   screen.render();
@@ -261,8 +249,6 @@ test("检测失败展示错误，检测按钮走 action/detect；未安装时启
   await tick();
   page = screen.render();
   assert.match(text(page), /未检测到官方 ZCode 应用/);
-  assert.equal(buttons(page).find((button) => text(button) === "启动并注入")!.props.disabled, true);
-  assert.equal(buttons(page).find((button) => text(button) === "重新注入")!.props.disabled, true);
   assert.equal(inputs(page).every((node) => node.props.disabled), true);
 });
 
