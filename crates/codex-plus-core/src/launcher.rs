@@ -6382,7 +6382,7 @@ mod tests {
                     break;
                 }
             }
-            let response_body = br#"{"id":"resp_logged","object":"response","usage":{"input_tokens":120,"output_tokens":30,"input_tokens_details":{"cached_tokens":100}}}"#;
+            let response_body = br#"{"id":"resp_logged","object":"response","status":"completed","usage":{"input_tokens":120,"output_tokens":30,"input_tokens_details":{"cached_tokens":100}}}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 response_body.len()

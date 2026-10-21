@@ -28,6 +28,92 @@ async function readShard() {
   return await readFile(SHARD_URL, "utf8");
 }
 
+it("未发布聚合目录仅提供默认行显示和显式选择，不放宽自动迁移", async () => {
+  const source = await readShard();
+  const block = source.match(/  function codexPlusModelPickerDefaultModel\(\)[^]*?\n  \}/)?.[0];
+  assert.ok(block);
+  const catalog = {
+    status: "not_applied", model: "configured", default_model: "configured", models: ["configured"],
+    sources: [{ id: "aggregate:active", type: "aggregate_model_catalog" }],
+  };
+  let profile = { id: "active", relayMode: "aggregate" };
+  const resolve = vm.runInNewContext(`(() => { ${block}; return codexPlusModelPickerDefaultModel; })()`, {
+    codexPlusConfiguredDefaultModel: () => "",
+    codexModelCatalog: catalog, codexPlusBackendSettingsLoaded: true,
+    codexRemoteSessionActiveProfile: () => profile,
+    codexPlusModelNames: () => ["configured"],
+  });
+  assert.equal(resolve(), "configured");
+  profile = { id: "other", relayMode: "aggregate" };
+  assert.equal(resolve(), "", "旧供应商目录不能污染新配置");
+  profile = { id: "active", relayMode: "aggregate" };
+  catalog.status = "failed";
+  assert.equal(resolve(), "", "失败目录不能用于默认项");
+  catalog.status = "not_applied";
+  catalog.model = catalog.default_model = "unknown";
+  assert.equal(resolve(), "", "配置默认值必须属于当前目录");
+});
+
+it("默认行通过菜单关联的触发器匹配本地选择器，不猜测无标识菜单", async () => {
+  const source = await readShard();
+  const block = source.match(/  function codexPlusModelPickerLocalPickerForList\(list\)[^]*?\n  \}/)?.[0];
+  assert.ok(block);
+  const picker = { node: { id: "local-trigger" }, picker: {} };
+  const resolve = vm.runInNewContext(`(() => { ${block}; return codexPlusModelPickerLocalPickerForList; })()`, {
+    codexAggregateModelPickers: () => [picker],
+  });
+  const list = (label: string) => ({ closest: () => ({ getAttribute: () => label }) });
+  assert.equal(resolve(list("local-trigger")), picker);
+  assert.equal(resolve(list("other-label local-trigger")), picker);
+  assert.equal(resolve(list("remote-trigger")), null);
+  assert.equal(resolve(list("")), null);
+  assert.equal(resolve(null), null);
+});
+
+it("默认动作行不继承原生默认勾号，当前会话标记落在具体模型行", async () => {
+  const source = await readShard();
+  assert.match(source, /codexPlusModelPickerCurrentIdentity/);
+  assert.match(source, /codexPlusModelPickerSyncCurrentRow/);
+  assert.match(source, /codex-plus-model-default-suppress-selection svg\{display:none!important\}/);
+  assert.match(source, /codex-plus-model-current-synthetic/);
+  assert.match(source, /selected\?\.picker/);
+  assert.match(source, /\.codex-plus-model-current-row"\) \|\| list\.querySelector\("\[data-model-selected\]"\)/);
+});
+
+it("补丁默认行在目录失败或归属不明时阻止旧推荐动作，未打补丁的行保持原生行为", async () => {
+  const source = await readShard();
+  const block = source.match(/  function codexPlusModelPickerSelectConfiguredDefault\(event\)[^]*?\n  \}/)?.[0];
+  assert.ok(block);
+  let target = "";
+  let selected: unknown = { picker: { disabled: false, models: [{ model: "configured" }] } };
+  const handle = vm.runInNewContext(`(() => { ${block}; return codexPlusModelPickerSelectConfiguredDefault; })()`, {
+    codexPlusModelPickerGroupsState: { disposed: false },
+    codexPlusModelPickerDefaultModel: () => target,
+    codexPlusModelPickerLocalPickerForList: () => selected,
+  });
+  const row = { getAttribute: () => null, closest: () => ({}) };
+  const event = (type: string, key?: string, patched = true) => {
+    const calls = { prevented: 0, stopped: 0 };
+    return { type, key, target: { closest: () => patched ? row : null },
+      preventDefault: () => calls.prevented++, stopImmediatePropagation: () => calls.stopped++, calls };
+  };
+  for (const type of ["click", "keydown"]) {
+    const failed = event(type, "Enter");
+    handle(failed);
+    assert.deepEqual(failed.calls, { prevented: 1, stopped: 1 });
+    selected = null;
+    target = "configured";
+    const remote = event(type, " ");
+    handle(remote);
+    assert.deepEqual(remote.calls, { prevented: 1, stopped: 1 });
+    const native = event(type, "Enter", false);
+    handle(native);
+    assert.deepEqual(native.calls, { prevented: 0, stopped: 0 });
+    target = "";
+    selected = { picker: { disabled: false, models: [{ model: "configured" }] } };
+  }
+});
+
 it("分组折叠分片在 manifest 里排在模型目录之后、并在组装产物里", async () => {
   const manifest = JSON.parse(await readFile(MANIFEST_URL, "utf8")) as {
     fragments: Array<{ name: string }>;
@@ -156,6 +242,16 @@ it("目录条目按别名匹配，且只用它补分组 id、不用它决定显�
   assert.match(source, /const provider = split\.provider \|\| known\?\.provider/);
   // 组内任意一行命中默认分组即认定该组是默认（裸名行的 id 可能来自目录）。
   assert.match(source, /group\.entries\.some\(\(entry\) => entry\.groupId === defaultGroupId/);
+});
+
+it("目录热替换会清除旧默认组和旧供应商映射并安排重扫", async () => {
+  const source = await readShard();
+  const changed = source.match(/function codexPlusModelPickerCatalogChanged\(\) \{[\s\S]*?\n  \}/)?.[0];
+  assert.ok(changed, "要提供目录替换通知入口");
+  assert.match(changed, /state\.defaultGroupId = ""/);
+  assert.match(changed, /state\.providerNames\.clear\(\)/);
+  assert.match(changed, /state\.signature = ""/);
+  assert.match(changed, /codexPlusModelPickerScheduleRescan\(\)/);
 });
 
 it("表头右端对齐：标题撑满剩余空间，不靠 auto 外边距推计数", async () => {

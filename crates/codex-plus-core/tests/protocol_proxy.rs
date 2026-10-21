@@ -5902,6 +5902,34 @@ async fn aggregate_old_http_failure_and_fallback_cannot_mutate_admitted_generati
     fixture.shutdown().await;
 }
 
+#[tokio::test]
+async fn aggregate_http_retired_model_can_continue_after_switching_to_pool() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let settings_path = temp.path().join("settings.json");
+    let _guard = SettingsPathGuard::set(settings_path.clone());
+    let mut fixture = AggregateHttpRegressionFixture::start(
+        settings_path, "retired-model-pool", [500, 200, 200], [500, 200, 200], [None, None, None],
+    ).await;
+    let old_model = format!("cpx-{}/model-a", fixture.settings.relay_profiles[0].id);
+    fixture.settings.aggregate_relay_profiles[0].model_aggregation_enabled = true;
+    fixture.persist();
+    let body = json!({"model": old_model, "input":"switch", "stream":false, "reasoning":{"effort":"high"}}).to_string();
+    let response = open_responses_proxy_request(&body, None).await.unwrap();
+    assert_eq!(response.status_code, 500, "model aggregation stays bound to the selected member");
+    fixture.expect("a", "switch", "old").await;
+    fixture.settings.aggregate_relay_profiles[0].model_aggregation_enabled = false;
+    fixture.persist();
+    let mut response = tokio::time::timeout(Duration::from_secs(5), open_responses_proxy_request(&body, None))
+        .await.unwrap().unwrap();
+    assert_eq!(response.status_code, 200, "retired ID must reach the existing failover strategy");
+    response.read_body().await.unwrap();
+    fixture.expect("a", "switch", "old").await;
+    fixture.expect("b", "switch", "old").await;
+    assert!(fixture.received.try_recv().is_err());
+    fixture.shutdown().await;
+}
+
 async fn respond_once(listener: tokio::net::TcpListener, response: &'static str) {
     let (mut stream, _) = listener.accept().await.unwrap();
     let mut buffer = [0; 1024];

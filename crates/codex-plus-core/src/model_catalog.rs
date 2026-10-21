@@ -90,9 +90,11 @@ fn capture_catalog_read_snapshot(
     settings: &crate::settings::BackendSettings,
 ) -> CatalogReadSnapshot {
     let profile = settings.active_relay_profile();
-    let catalog = if let Some(aggregate) = crate::aggregate_catalog::active_model_aggregation(settings) {
-        crate::aggregate_catalog::catalog_summary(home, settings, &aggregate)
-            .unwrap_or_else(|_| relay_profile_model_catalog_value(home, &profile))
+    let catalog = if let Some(aggregate) = settings.active_aggregate_relay_profile() {
+        let catalog = crate::aggregate_catalog::catalog_summary(home, settings, &aggregate)
+            .unwrap_or_else(|error| catalog_read_failure(&home.join("config.toml"), Value::Null, &error));
+        // 聚合成员目录是权威来源，错误/空目录也不能读回旧的 live 或上游目录。
+        return CatalogReadSnapshot::Ready(catalog);
     } else {
         relay_profile_model_catalog_value(home, &profile)
     };
@@ -1280,6 +1282,25 @@ fn unquote_toml_string(value: &str) -> String {
 #[cfg(test)]
 mod model_fetch_tests {
     use super::*;
+
+    #[test]
+    fn invalid_pool_catalog_does_not_resurrect_live_catalog_or_compat_model() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("config.toml"), "model = \"unconfigured-compat\"\n").unwrap();
+        let settings = crate::settings::BackendSettings {
+            active_relay_id: "pool".into(),
+            active_aggregate_relay_id: "pool".into(),
+            relay_profiles: vec![RelayProfile { id: "pool".into(), relay_mode: crate::settings::RelayMode::Aggregate,
+                ..RelayProfile::default() }],
+            aggregate_relay_profiles: serde_json::from_value(json!([{"id":"pool","name":"Pool","members":[]}])).unwrap(),
+            ..crate::settings::BackendSettings::default()
+        };
+        let CatalogReadSnapshot::Ready(catalog) = capture_catalog_read_snapshot(temp.path(), &HashMap::new(), &settings) else {
+            panic!("pool catalog must remain authoritative");
+        };
+        assert_eq!(catalog["status"], "failed");
+        assert_eq!(catalog["models"], json!([]));
+    }
 
     #[tokio::test]
     async fn empty_profile_fallback_waits_for_failed_publication_rollback() {

@@ -57,6 +57,25 @@ pub fn is_aggregate_model(model: &str) -> bool {
     model.starts_with(AGGREGATE_MODEL_PREFIX) && model.contains('/')
 }
 
+/// 切到供应商池后，旧聚合身份只能映射到池中已声明的同名模型；
+/// 返回裸名让原有轮转/故障转移继续决定成员，不保留旧前缀的绑定语义。
+pub fn pool_model_name(settings: &BackendSettings, model: &str) -> anyhow::Result<Option<String>> {
+    let Some(aggregate) = settings.active_aggregate_relay_profile()
+        .filter(|aggregate| !aggregate.model_aggregation_enabled) else {
+        return Ok(None);
+    };
+    if !is_aggregate_model(model) {
+        return Ok(None);
+    }
+    let bare = model.split_once('/').map(|(_, bare)| bare).unwrap_or("");
+    for relay in member_profiles(settings, &aggregate)? {
+        if member_upstream_catalog_entries(relay)?.iter().any(|entry| entry.slug == bare) {
+            return Ok(Some(bare.to_string()));
+        }
+    }
+    Ok(None)
+}
+
 pub fn active_model_bindings(
     settings: &BackendSettings,
 ) -> anyhow::Result<Vec<AggregateModelBinding>> {
@@ -340,7 +359,12 @@ pub fn build_catalog_json(
 ) -> anyhow::Result<String> {
     let default_relay_id = aggregate.default_relay_id.trim();
     let mut models = Vec::new();
-    for relay in member_profiles(settings, aggregate)? {
+    let mut pool_models = HashSet::new();
+    let members = member_profiles(settings, aggregate)?;
+    let default_model = members.iter().find(|relay| relay.id == default_relay_id)
+        .map(|relay| member_upstream_catalog_entries(relay)).transpose()?
+        .and_then(|entries| entries.into_iter().next()).map(|entry| entry.slug);
+    for relay in members {
         let payload = build_member_catalog(relay)?;
         let is_default_member = !default_relay_id.is_empty() && relay.id.as_str() == default_relay_id;
         // 分组的展示名：成员没起名字时回落 relay id，避免前端渲染出无名分组表头。
@@ -364,31 +388,43 @@ pub fn build_catalog_json(
             if upstream.is_empty() || !seen_upstream.insert(upstream.clone()) {
                 continue;
             }
+            if !aggregate.model_aggregation_enabled && !pool_models.insert(upstream.clone()) {
+                continue;
+            }
             let display = {
                 let raw = model["display_name"].as_str().unwrap_or(&upstream).to_string();
                 strip_member_model_prefix(&relay.id, &raw)
             };
-            model["slug"] = if is_default_member {
+            model["slug"] = if is_default_member || !aggregate.model_aggregation_enabled {
                 json!(upstream)
             } else {
                 json!(aggregate_model_id(&relay.id, &upstream))
             };
             // 默认成员连显示名也保持裸名：它就是"默认"，再缀「（供应商）」只会让人以为
             // 还得再挑一次供应商。其他成员保留后缀，避免同名模型分不清是哪一家。
-            model["display_name"] = if is_default_member {
+            model["display_name"] = if is_default_member || !aggregate.model_aggregation_enabled {
                 json!(display)
             } else {
                 json!(format!("{display}（{}）", relay.name))
             };
             model["description"] = json!(format!("{upstream} · {}", relay.name));
+            model["codex_plus_default_model"] = json!(
+                default_model.as_deref() == Some(upstream.as_str())
+                    && (is_default_member || !aggregate.model_aggregation_enabled)
+            );
             // 供应商分组身份（前端模型选择器按它把连续模型折叠成一组）：
             // - `codex_plus_group_id` 是权威分组键，用持久化 relay id；成员已按 relay_id
             //   去重（member_profiles），同一家不会产生两组，同名成员也各自成组；
             // - `codex_plus_group` 只用于展示，默认成员同样要写，否则它的模型没有归属；
             // - `codex_plus_default` 标出默认成员：只有前端能据此打「默认」标志。
-            model["codex_plus_group"] = json!(group_name);
-            model["codex_plus_group_id"] = json!(relay.id);
-            if is_default_member {
+            if aggregate.model_aggregation_enabled {
+                model["codex_plus_group"] = json!(group_name);
+                model["codex_plus_group_id"] = json!(relay.id);
+            } else if let Some(model) = model.as_object_mut() {
+                model.remove("codex_plus_group");
+                model.remove("codex_plus_group_id");
+            }
+            if is_default_member && aggregate.model_aggregation_enabled {
                 model["codex_plus_default"] = json!(true);
             } else if let Some(model) = model.as_object_mut() {
                 model.remove("codex_plus_default");
@@ -403,13 +439,13 @@ pub fn build_catalog_json(
         }
     }
     if models.is_empty() {
-        anyhow::bail!("按模型聚合至少需要一个成员模型，请先填写成员供应商的模型列表");
+        anyhow::bail!("聚合至少需要一个成员模型，请先填写成员供应商的模型列表");
     }
     Ok(serde_json::to_string_pretty(&json!({ "models": models }))?)
 }
 
 /// apply 流程只拿到活动 RelayProfile；从持久化 settings 取出成员引用，
-/// 旧的直接 apply 调用若没有开启该开关则返回 None，保持原有目录行为。
+/// 模型聚合发布绑定身份，供应商池发布去重裸名；非聚合保持原有目录行为。
 pub fn build_catalog_for_profile(profile: &RelayProfile) -> anyhow::Result<Option<String>> {
     if profile.relay_mode != RelayMode::Aggregate {
         return Ok(None);
@@ -418,7 +454,7 @@ pub fn build_catalog_for_profile(profile: &RelayProfile) -> anyhow::Result<Optio
     let Some(aggregate) = settings
         .aggregate_relay_profiles
         .iter()
-        .find(|aggregate| aggregate.id == profile.id && aggregate.model_aggregation_enabled)
+        .find(|aggregate| aggregate.id == profile.id)
     else {
         return Ok(None);
     };
@@ -469,7 +505,7 @@ fn config_catalog_pointer(config: &str) -> Option<String> {
 /// 在读取/保存入口恢复崩溃时已提交 settings、尚未发布的目录。不会覆盖外部改动。
 pub fn recover_pending_catalog_refresh(store: &SettingsStore, home: &Path) -> anyhow::Result<bool> {
     let settings = store.load()?;
-    let Some(aggregate) = active_model_aggregation(&settings) else {
+    let Some(aggregate) = settings.active_aggregate_relay_profile() else {
         return Ok(false);
     };
     let journal = refresh_journal_path(home, &aggregate.id);
@@ -545,7 +581,7 @@ fn save_with_catalog_publisher(
 ) -> anyhow::Result<String> {
     recover_pending_catalog_refresh(store, home)?;
     let previous = store.load()?;
-    let Some(aggregate) = active_model_aggregation(next) else {
+    let Some(aggregate) = next.active_aggregate_relay_profile() else {
         return store.save_versioned(next);
     };
     if !next.relay_profiles_enabled
@@ -661,13 +697,14 @@ pub fn catalog_summary(
         .iter()
         .find(|profile| profile.id == aggregate.id)
         .context("聚合供应商不存在")?;
+    let default_model = catalog_default_model(&payload);
     Ok(json!({
         "status": if applied { "ok" } else { "not_applied" },
         "applied": applied,
         "pending_changes": pending_changes,
         "path": home.join("config.toml").to_string_lossy(),
         "service_tier": Value::Null,
-        "model": ids.first().cloned().unwrap_or_default(),
+        "model": default_model,
         "model_provider": aggregate.id,
         "codex_model_provider": crate::model_catalog::codex_model_provider_for_relay_profile(home, profile),
         "provider_name": aggregate.name,
@@ -676,12 +713,12 @@ pub fn catalog_summary(
             models.iter().find(|model| model["codex_plus_default"].as_bool() == Some(true))
                 .and_then(|model| model["codex_plus_group_id"].as_str()).unwrap_or("")
         } else { aggregate.default_relay_id.trim() },
-        "default_model": ids.first().cloned().unwrap_or_default(),
+        "default_model": default_model,
         "models": ids,
         "modelMetadata": metadata,
         "sources": [{
             "id": format!("aggregate:{}", aggregate.id),
-            "type": "aggregate_model_catalog",
+            "type": if aggregate.model_aggregation_enabled { "aggregate_model_catalog" } else { "aggregate_pool_catalog" },
             "name": aggregate.name,
             "base_url": "",
             "status": "ok",
@@ -690,6 +727,14 @@ pub fn catalog_summary(
         }],
         "responses_api": { "status": "unknown" }
     }))
+}
+
+pub(crate) fn catalog_default_model(payload: &Value) -> &str {
+    let Some(models) = payload["models"].as_array() else { return ""; };
+    models.iter().find(|model| model["codex_plus_default_model"].as_bool() == Some(true))
+        .or_else(|| models.iter().find(|model| model["codex_plus_default"].as_bool() == Some(true)))
+        .or_else(|| models.first())
+        .and_then(|model| model["slug"].as_str()).unwrap_or("")
 }
 
 fn build_member_catalog(profile: &RelayProfile) -> anyhow::Result<Value> {
@@ -793,6 +838,61 @@ pub fn subagent_conflict_warning(home: &Path, settings: &BackendSettings) -> Opt
 mod tests {
     use super::*;
     use crate::settings::{AggregateRelayMember, AggregateRelayStrategy, RelayMode};
+
+    #[test]
+    fn default_model_follows_default_member_without_reordering_groups() {
+        let mut settings = settings();
+        settings.aggregate_relay_profiles[0].default_relay_id = "openai".into();
+        let aggregate = settings.active_aggregate_relay_profile().unwrap();
+        let payload: Value = serde_json::from_str(&build_catalog_json(&settings, &aggregate).unwrap()).unwrap();
+        assert_eq!(payload["models"][0]["codex_plus_group_id"], "deepseek");
+        assert_eq!(catalog_default_model(&payload), "gpt-5.6-sol");
+        let temp = tempfile::tempdir().unwrap();
+        let summary = catalog_summary(temp.path(), &settings, &aggregate).unwrap();
+        assert_eq!(summary["model"], "gpt-5.6-sol");
+        assert_eq!(summary["default_model"], "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn configured_default_is_independent_of_member_and_model_list_order() {
+        for model_aggregation_enabled in [true, false] {
+            let mut settings = settings();
+            settings.aggregate_relay_profiles[0].default_relay_id = "openai".into();
+            settings.aggregate_relay_profiles[0].model_aggregation_enabled = model_aggregation_enabled;
+            settings.relay_profiles[1].config_contents = "model = \"configured-model\"\n".into();
+            settings.relay_profiles[1].model_list = "list-first\nconfigured-model".into();
+            // 池中同名模型可能先由非默认成员发布，去重不能丢掉真正的默认值。
+            settings.relay_profiles[0].model_list.push_str("\nconfigured-model");
+            for reverse in [false, true] {
+                if reverse { settings.aggregate_relay_profiles[0].members.reverse(); }
+                let aggregate = settings.active_aggregate_relay_profile().unwrap();
+                let payload: Value = serde_json::from_str(&build_catalog_json(&settings, &aggregate).unwrap()).unwrap();
+                assert_eq!(catalog_default_model(&payload), "configured-model");
+                assert_eq!(payload["models"].as_array().unwrap().iter().filter(|model|
+                    model["codex_plus_default_model"].as_bool() == Some(true)).count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn pool_catalog_uses_member_union_and_only_maps_declared_retired_models() {
+        let mut settings = settings();
+        settings.aggregate_relay_profiles[0].model_aggregation_enabled = false;
+        settings.relay_profiles[1].model_list = "deepseek-reasoner".into();
+        let aggregate = settings.active_aggregate_relay_profile().unwrap();
+        let payload: Value = serde_json::from_str(&build_catalog_json(&settings, &aggregate).unwrap()).unwrap();
+        let models = payload["models"].as_array().unwrap();
+        assert_eq!(models.len(), 3);
+        assert!(models.iter().all(|model| !model["slug"].as_str().unwrap().starts_with("cpx-")));
+        assert!(models.iter().all(|model| model.get("codex_plus_group_id").is_none()));
+        assert_eq!(pool_model_name(&settings, "cpx-old/deepseek-reasoner").unwrap().as_deref(), Some("deepseek-reasoner"));
+        assert_eq!(pool_model_name(&settings, "cpx-old/unconfigured").unwrap(), None);
+        let temp = tempfile::tempdir().unwrap();
+        let summary = catalog_summary(temp.path(), &settings, &aggregate).unwrap();
+        assert_eq!(summary["sources"][0]["type"], "aggregate_pool_catalog");
+        settings.aggregate_relay_profiles[0].model_aggregation_enabled = true;
+        assert_eq!(pool_model_name(&settings, "cpx-old/deepseek-reasoner").unwrap(), None);
+    }
 
     fn publication_fixture() -> (tempfile::TempDir, SettingsStore, std::path::PathBuf) {
         let temp=tempfile::tempdir().unwrap();let store=SettingsStore::new(temp.path().join("settings.json"));
