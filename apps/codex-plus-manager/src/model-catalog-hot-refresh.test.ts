@@ -7,6 +7,13 @@ const CATALOG_URL = new URL(
   "../../../assets/inject/renderer-inject/70-model-catalog.js",
   import.meta.url,
 );
+it("manager settings save uses only the transactional catalog publisher", async () => {
+  const source = await readFile(new URL("../src-tauri/src/commands.rs", import.meta.url), "utf8");
+  const save = source.slice(source.indexOf("pub fn save_settings("), source.indexOf("\n#[tauri::command]", source.indexOf("pub fn save_settings(")));
+  assert.match(save, /aggregate_catalog::save_with_active_catalog_refresh/);
+  assert.doesNotMatch(save, /relay_config::refresh_active_model_catalog_in_home/);
+});
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (error: Error) => void;
