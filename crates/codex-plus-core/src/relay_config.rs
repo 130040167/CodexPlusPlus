@@ -1607,7 +1607,7 @@ fn valid_relay_endpoint(endpoint: &str) -> bool {
         .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
 }
 
-fn recognized_managed_proxy_endpoint(profile: &RelayProfile, config: &str) -> bool {
+pub(crate) fn recognized_managed_proxy_endpoint(profile: &RelayProfile, config: &str) -> bool {
     let Some(live) = provider_string_from_config(config, "base_url") else {
         return false;
     };
