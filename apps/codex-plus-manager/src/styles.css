@@ -467,10 +467,12 @@ body {
 }
 
 .sponsor-slot-content {
-  display: flex;
+  display: grid;
   height: 100%;
-  flex-direction: column;
-  gap: 14px;
+  grid-template-columns: minmax(0, 1fr) minmax(150px, auto);
+  grid-template-rows: 1fr auto;
+  gap: 14px 16px;
+  align-items: center;
 }
 
 .sponsor-slot-main {
@@ -478,6 +480,8 @@ body {
   grid-template-columns: 42px minmax(0, 1fr);
   gap: 12px;
   align-items: start;
+  grid-column: 1;
+  grid-row: 1 / span 2;
 }
 
 .sponsor-slot-copy {
@@ -487,12 +491,17 @@ body {
 .sponsor-slot-tags {
   justify-content: flex-start;
   max-width: none;
-  margin-top: auto;
+  margin-top: 0;
+  grid-column: 2;
+  grid-row: 1;
+  justify-content: flex-end;
 }
 
 .sponsor-slot-actions {
   display: flex;
-  justify-content: flex-start;
+  justify-content: flex-end;
+  grid-column: 2;
+  grid-row: 2;
 }
 
 /* 窄屏时「左信息 / 右标签区」并排会挤，改成上下排。 */
@@ -512,6 +521,25 @@ body {
   .jojocode-model-tags {
     justify-content: flex-start;
     max-width: none;
+  }
+}
+
+@media (max-width: 700px) {
+  .sponsor-slot-content {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto;
+  }
+
+  .sponsor-slot-main,
+  .sponsor-slot-tags,
+  .sponsor-slot-actions {
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  .sponsor-slot-tags,
+  .sponsor-slot-actions {
+    justify-content: flex-start;
   }
 }
 
