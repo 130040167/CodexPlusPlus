@@ -653,12 +653,19 @@ export const EN_PLAIN: Record<string, string> = {
   "代理层吸收上游过载冲击：自动重试模型容量/过载错误（含推理与工具调用阶段），尽量不把错误交给 Codex":
     "Absorb upstream overload at the proxy: retry model capacity/overload errors (including reasoning and tool-call phases) so Codex rarely sees them",
   "启用请求避震": "Enable request shock absorption",
-  "请求避震只处理经过本地协议代理、且以 200 流式响应返回的上游过载/容量错误（server_overloaded、server_is_overloaded、at capacity 等）。流式避震下：推理、工具调用参数等不可见阶段先缓冲，工具调用整项完成或首段可见输出后再等「首字提交延迟」；这段窗口内遇到过载由代理退避重试；提交之后遇到同类过载，会改写成 Codex 可识别的容量错误，由 Codex 自己重试；连接失败、429/5xx、限流等其它错误不重试。保留的「流式避震（旧行为）」模式仍按旧逻辑：第一个输出事件就交给 Codex。整段缓冲避震下，任何时点的过载都由代理重试，但失去流式。":
-    "Request shock absorption only handles upstream overload/capacity errors that arrive inside a 200 streaming response through the local protocol proxy (server_overloaded, server_is_overloaded, at capacity, ...). In streaming mode the proxy first buffers invisible phases such as reasoning and tool-call arguments; it waits until the whole tool call completes or the first visible output appears, then applies the first-token commit delay and retries overloads with backoff during that window. After commit, the same overloads are rewritten into capacity errors Codex recognizes so Codex retries them itself; connection failures, 429/5xx, rate limits, and other errors are not retried. The retained Streaming (legacy) mode keeps the old logic and hands the first output event to Codex immediately. In buffered mode the proxy retries overloads at any point, but streaming is lost.",
+  "请求避震只处理经过本地协议代理、且以 200 流式响应返回的上游过载/容量错误（server_overloaded、server_is_overloaded、at capacity 等）。流式避震下：推理、工具调用参数等不可见阶段先缓冲，工具调用整项完成或首段可见输出后再等「首字提交延迟」；这段窗口内遇到过载由代理退避重试；提交之后遇到同类过载，会改写成 Codex 可识别的容量错误，由 Codex 自己重试；连接失败与其它错误默认不重试；需要重试 429、5xx 等 HTTP 错误时，在下方「重试的 HTTP 状态码」里添加。保留的「流式避震（旧行为）」模式仍按旧逻辑：第一个输出事件就交给 Codex。整段缓冲避震下，任何时点的过载都由代理重试，但失去流式。":
+    "Request shock absorption only handles upstream overload/capacity errors that arrive inside a 200 streaming response through the local protocol proxy (server_overloaded, server_is_overloaded, at capacity, ...). In streaming mode the proxy first buffers invisible phases such as reasoning and tool-call arguments; it waits until the whole tool call completes or the first visible output appears, then applies the first-token commit delay and retries overloads with backoff during that window. After commit, the same overloads are rewritten into capacity errors Codex recognizes so Codex retries them itself; connection failures and other errors are not retried by default; to retry HTTP errors such as 429 or 5xx, add them under \"HTTP status codes to retry\" below. The retained Streaming (legacy) mode keeps the old logic and hands the first output event to Codex immediately. In buffered mode the proxy retries overloads at any point, but streaming is lost.",
   "最多自动重试次数": "Maximum automatic retries",
   "首次重试间隔（秒）": "Initial retry interval (seconds)",
   "之后按 2 倍指数退避，单次最长 30 秒；上游返回 Retry-After 时优先采用（同样受上限约束）。":
     "Later retries use 2x exponential backoff with a 30-second cap per wait; an upstream Retry-After header takes precedence (also subject to that cap).",
+  "重试的 HTTP 状态码": "HTTP status codes to retry",
+  "点击移除": "Click to remove",
+  "输入状态码后回车": "Enter a status code and press Enter",
+  "输入状态码后回车，如 429": "Enter a status code and press Enter, e.g. 429",
+  "填入常用": "Add common codes",
+  "上游直接返回这些状态码时，代理退避后重发同一请求（聚合供应商先切换成员，全部失败后再退避），与上面的次数和间隔共用预算；用尽后把最后一次错误交给 Codex。默认不勾选任何状态码。常用：429 限流，500/502/503/504 服务端或网关瞬时故障；400/401/403 等请求或鉴权错误重试也不会成功。":
+    "When the upstream responds with one of these status codes, the proxy backs off and resends the same request (aggregate providers switch members first and back off only after all fail), sharing the attempt and interval budget above; once exhausted, the last error is handed to Codex. No status codes are selected by default. Common choices: 429 for rate limits, 500/502/503/504 for transient server or gateway failures; request or auth errors such as 400/401/403 will not succeed on retry.",
   "避震模式": "Shock absorption mode",
   "首字提交延迟（毫秒）": "First-token commit delay (ms)",
   "流式避震：工具调用参数与首字宽限内由代理重试，提交后交给 Codex 原生重试":

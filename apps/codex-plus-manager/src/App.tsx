@@ -355,6 +355,8 @@ type BackendSettings = WhaleBalanceSettings & {
   protocolProxyAutoRetry: boolean;
   protocolProxyAutoRetryMaxAttempts: number;
   protocolProxyAutoRetryIntervalSeconds: number;
+  /** 命中这些上游 HTTP 状态码时由代理退避重发；空数组表示不重试。与 Rust `protocol_proxy_auto_retry_status_codes` 对应。 */
+  protocolProxyAutoRetryStatusCodes: number[];
   protocolProxyAutoRetryMode: "streaming" | "streaming-legacy" | "buffered";
   /** 流式避震下首段可见输出后到提交的延迟（毫秒）；0 表示一出现可见输出立即提交。与 Rust `protocol_proxy_auto_retry_commit_delay_ms` 对应。 */
   protocolProxyAutoRetryCommitDelayMs: number;
@@ -1254,6 +1256,7 @@ const defaultSettings: BackendSettings = {
   protocolProxyAutoRetry: true,
   protocolProxyAutoRetryMaxAttempts: 5,
   protocolProxyAutoRetryIntervalSeconds: 2,
+  protocolProxyAutoRetryStatusCodes: [],
   protocolProxyAutoRetryMode: "streaming",
   protocolProxyAutoRetryCommitDelayMs: 1000,
   helperMaxRequestBodyMib: 128,
@@ -5200,6 +5203,15 @@ function ProxySettingsScreen({
   const [proxyUrls, setProxyUrls] = useState<Record<string, string>>({});
   const [proxyConfigured, setProxyConfigured] = useState<Record<string, boolean>>({});
   const [proxyBusyId, setProxyBusyId] = useState<string | null>(null);
+  const [retryStatusInput, setRetryStatusInput] = useState("");
+  const setRetryStatusCodes = (codes: number[]) =>
+    onFormChange({ ...form, protocolProxyAutoRetryStatusCodes: normalizeRetryStatusCodes(codes) });
+  const addRetryStatusCodes = () => {
+    const next = retryStatusInput.split(/[,，\s]+/).map(Number);
+    if (!normalizeRetryStatusCodes(next).length) return;
+    setRetryStatusCodes([...form.protocolProxyAutoRetryStatusCodes, ...next]);
+    setRetryStatusInput("");
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -5327,7 +5339,7 @@ function ProxySettingsScreen({
               <span>{t("启用请求避震")}</span>
             </label>
             <p className="field-hint">
-              {t("请求避震只处理经过本地协议代理、且以 200 流式响应返回的上游过载/容量错误（server_overloaded、server_is_overloaded、at capacity 等）。流式避震下：推理、工具调用参数等不可见阶段先缓冲，工具调用整项完成或首段可见输出后再等「首字提交延迟」；这段窗口内遇到过载由代理退避重试；提交之后遇到同类过载，会改写成 Codex 可识别的容量错误，由 Codex 自己重试；连接失败、429/5xx、限流等其它错误不重试。保留的「流式避震（旧行为）」模式仍按旧逻辑：第一个输出事件就交给 Codex。整段缓冲避震下，任何时点的过载都由代理重试，但失去流式。")}
+              {t("请求避震只处理经过本地协议代理、且以 200 流式响应返回的上游过载/容量错误（server_overloaded、server_is_overloaded、at capacity 等）。流式避震下：推理、工具调用参数等不可见阶段先缓冲，工具调用整项完成或首段可见输出后再等「首字提交延迟」；这段窗口内遇到过载由代理退避重试；提交之后遇到同类过载，会改写成 Codex 可识别的容量错误，由 Codex 自己重试；连接失败与其它错误默认不重试；需要重试 429、5xx 等 HTTP 错误时，在下方「重试的 HTTP 状态码」里添加。保留的「流式避震（旧行为）」模式仍按旧逻辑：第一个输出事件就交给 Codex。整段缓冲避震下，任何时点的过载都由代理重试，但失去流式。")}
             </p>
             <div className="form-row">
               <Field label={t("最多自动重试次数")}>
@@ -5369,6 +5381,54 @@ function ProxySettingsScreen({
             </div>
             <p className="field-hint">
               {t("之后按 2 倍指数退避，单次最长 30 秒；上游返回 Retry-After 时优先采用（同样受上限约束）。")}
+            </p>
+            <Field label={t("重试的 HTTP 状态码")}>
+              <div className="retry-status-editor">
+                <div className="retry-status-list">
+                  {form.protocolProxyAutoRetryStatusCodes.map((status) => (
+                    <button
+                      key={status}
+                      className="retry-status-chip"
+                      onClick={() =>
+                        setRetryStatusCodes(
+                          form.protocolProxyAutoRetryStatusCodes.filter((item) => item !== status),
+                        )
+                      }
+                      title={t("点击移除")}
+                      type="button"
+                    >
+                      {status} ×
+                    </button>
+                  ))}
+                </div>
+                <div className="retry-status-input-row">
+                  <Input
+                    aria-label={t("输入状态码后回车")}
+                    inputMode="numeric"
+                    placeholder={t("输入状态码后回车，如 429")}
+                    value={retryStatusInput}
+                    onChange={(event) => setRetryStatusInput(event.currentTarget.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        addRetryStatusCodes();
+                      }
+                    }}
+                  />
+                  <Button
+                    onClick={() =>
+                      setRetryStatusCodes([...form.protocolProxyAutoRetryStatusCodes, ...COMMON_RETRY_STATUS_CODES])
+                    }
+                    type="button"
+                    variant="outline"
+                  >
+                    {t("填入常用")}
+                  </Button>
+                </div>
+              </div>
+            </Field>
+            <p className="field-hint">
+              {t("上游直接返回这些状态码时，代理退避后重发同一请求（聚合供应商先切换成员，全部失败后再退避），与上面的次数和间隔共用预算；用尽后把最后一次错误交给 Codex。默认不勾选任何状态码。常用：429 限流，500/502/503/504 服务端或网关瞬时故障；400/401/403 等请求或鉴权错误重试也不会成功。")}
             </p>
             <div className="form-row">
               <Field label={t("避震模式")}>
@@ -15224,6 +15284,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
           : "streaming",
     protocolProxyAutoRetryCommitDelayMs: clampNumber(settings.protocolProxyAutoRetryCommitDelayMs ?? 1000, 0, 10000),
     protocolProxyAutoRetryIntervalSeconds: clampNumber(settings.protocolProxyAutoRetryIntervalSeconds ?? 2, 0, 30),
+    protocolProxyAutoRetryStatusCodes: normalizeRetryStatusCodes(settings.protocolProxyAutoRetryStatusCodes),
     helperMaxRequestBodyMib: clampNumber(settings.helperMaxRequestBodyMib ?? 128, 32, 512),
     codexAppImageOverlayOpacity: clampNumber(settings.codexAppImageOverlayOpacity || 35, 1, 100),
     codexAppImageOverlayFitMode: normalizeImageOverlayFitMode(settings.codexAppImageOverlayFitMode),
@@ -15262,6 +15323,18 @@ function backendSettingsEqual(left: BackendSettings, right: BackendSettings): bo
   const { revision: _leftRevision, ...leftValues } = normalizeSettings(left);
   const { revision: _rightRevision, ...rightValues } = normalizeSettings(right);
   return JSON.stringify(leftValues) === JSON.stringify(rightValues);
+}
+
+/** 「填入常用」：限流与常见的服务端/网关瞬时错误。 */
+const COMMON_RETRY_STATUS_CODES = [429, 500, 502, 503, 504];
+
+/** 与 Rust `normalize_protocol_proxy_auto_retry_status_codes` 保持一致：400~599、去重升序、最多 20 个。 */
+function normalizeRetryStatusCodes(value: unknown): number[] {
+  if (!Array.isArray(value)) return [];
+  const codes = value
+    .map(Number)
+    .filter((status) => Number.isInteger(status) && status >= 400 && status <= 599);
+  return Array.from(new Set(codes)).sort((a, b) => a - b).slice(0, 20);
 }
 
 function clampNumber(value: number, min: number, max: number): number {

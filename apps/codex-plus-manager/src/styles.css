@@ -10816,6 +10816,49 @@ select {
 }
 
 /* ── 代理设置页：供应商独立代理列表 ───────────────────────────── */
+/* 请求避震：重试的 HTTP 状态码标签编辑器 */
+.retry-status-editor {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.retry-status-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.retry-status-list:empty {
+  display: none;
+}
+.retry-status-chip {
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  background: hsl(var(--muted));
+  color: hsl(var(--foreground));
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  min-height: 28px;
+  padding: 4px 9px;
+}
+.retry-status-chip:hover {
+  border-color: hsl(var(--primary));
+}
+.retry-status-chip:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}
+.retry-status-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.retry-status-input-row > :first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .proxy-provider-list {
   display: flex;
   flex-direction: column;

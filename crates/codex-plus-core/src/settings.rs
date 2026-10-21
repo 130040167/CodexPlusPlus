@@ -921,7 +921,8 @@ pub struct BackendSettings {
     pub active_aggregate_relay_id: String,
     #[serde(rename = "relayTestModel", default = "default_relay_test_model")]
     pub relay_test_model: String,
-    /// 协议代理自动重试：上游瞬时失败（连接失败、408/429/5xx）先在本地代理内部
+    /// 协议代理自动重试：200 流内的过载/容量错误，以及用户在
+    /// `protocolProxyAutoRetryStatusCodes` 里勾选的 HTTP 错误，先在本地代理内部
     /// 退避重试，不立刻把错误交给 Codex。只影响经过本地协议代理的请求。
     /// 默认开启：用户看到的失败横幅会显著减少；关闭后恢复「失败立即返回」行为。
     #[serde(rename = "protocolProxyAutoRetry", default = "default_true")]
@@ -938,6 +939,15 @@ pub struct BackendSettings {
         default = "default_protocol_proxy_auto_retry_interval_seconds"
     )]
     pub protocol_proxy_auto_retry_interval_seconds: u64,
+    /// 上游直接返回这些 HTTP 状态码时由代理退避重发（Retry-After 优先），
+    /// 与重试次数、总等待预算共用。默认空列表：HTTP 错误一律直接交给 Codex，
+    /// 需要的用户自行加入 429 等（issue #2653）。
+    #[serde(
+        rename = "protocolProxyAutoRetryStatusCodes",
+        default = "default_protocol_proxy_auto_retry_status_codes",
+        deserialize_with = "deserialize_protocol_proxy_auto_retry_status_codes"
+    )]
+    pub protocol_proxy_auto_retry_status_codes: Vec<u16>,
     /// 过载错误处理模式：
     /// - `streaming`（默认，流式；推理/工具调用参数先缓冲，首段可见输出后再等
     ///   `protocolProxyAutoRetryCommitDelayMs`，窗口内仍由代理重试）；
@@ -1072,6 +1082,8 @@ impl Default for BackendSettings {
                 default_protocol_proxy_auto_retry_max_attempts(),
             protocol_proxy_auto_retry_interval_seconds:
                 default_protocol_proxy_auto_retry_interval_seconds(),
+            protocol_proxy_auto_retry_status_codes:
+                default_protocol_proxy_auto_retry_status_codes(),
             protocol_proxy_auto_retry_mode: default_protocol_proxy_auto_retry_mode(),
             protocol_proxy_auto_retry_commit_delay_ms:
                 default_protocol_proxy_auto_retry_commit_delay_ms(),
@@ -1526,6 +1538,51 @@ pub fn default_protocol_proxy_auto_retry_interval_seconds() -> u64 {
 
 pub fn clamp_protocol_proxy_auto_retry_interval_seconds(value: u64) -> u64 {
     value.min(30)
+}
+
+/// 默认不重试任何 HTTP 状态码：HTTP 错误重试曾按使用反馈整体下线（bd4e90d1），
+/// 现在改为由用户按需选择，升级不改变既有行为。
+pub fn default_protocol_proxy_auto_retry_status_codes() -> Vec<u16> {
+    Vec::new()
+}
+
+/// 只保留 400~599 的错误码，去重排序，最多 20 个；成功码与非法值直接丢弃。
+pub fn normalize_protocol_proxy_auto_retry_status_codes(values: &[u64]) -> Vec<u16> {
+    let mut codes: Vec<u16> = values
+        .iter()
+        .filter(|code| (400..=599).contains(*code))
+        .map(|code| *code as u16)
+        .collect();
+    codes.sort_unstable();
+    codes.dedup();
+    codes.truncate(20);
+    codes
+}
+
+/// 手改的 settings.json 可能写进字符串、负数或超出 u16 的值；
+/// 这里逐项容错，不能让一个坏值把整份设置读失败。
+fn deserialize_protocol_proxy_auto_retry_status_codes<'de, D>(
+    deserializer: D,
+) -> Result<Vec<u16>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(Value::Array(items)) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(default_protocol_proxy_auto_retry_status_codes());
+    };
+    Ok(normalize_protocol_proxy_auto_retry_status_codes(
+        &status_code_values(&items),
+    ))
+}
+
+fn status_code_values(items: &[Value]) -> Vec<u64> {
+    items
+        .iter()
+        .filter_map(|item| {
+            item.as_u64()
+                .or_else(|| item.as_str().and_then(|text| text.trim().parse().ok()))
+        })
+        .collect()
 }
 
 pub fn default_protocol_proxy_auto_retry_mode() -> String {
@@ -2176,6 +2233,17 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
         target.insert(
             "protocolProxyAutoRetryIntervalSeconds".to_string(),
             Value::from(clamp_protocol_proxy_auto_retry_interval_seconds(value)),
+        );
+    }
+    if let Some(items) = source
+        .get("protocolProxyAutoRetryStatusCodes")
+        .and_then(Value::as_array)
+    {
+        target.insert(
+            "protocolProxyAutoRetryStatusCodes".to_string(),
+            serde_json::json!(normalize_protocol_proxy_auto_retry_status_codes(
+                &status_code_values(items)
+            )),
         );
     }
     if let Some(value) = source
@@ -2934,6 +3002,14 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
         );
     settings.protocol_proxy_auto_retry_mode =
         normalize_protocol_proxy_auto_retry_mode(&settings.protocol_proxy_auto_retry_mode);
+    settings.protocol_proxy_auto_retry_status_codes =
+        normalize_protocol_proxy_auto_retry_status_codes(
+            &settings
+                .protocol_proxy_auto_retry_status_codes
+                .iter()
+                .map(|code| u64::from(*code))
+                .collect::<Vec<_>>(),
+        );
     settings.protocol_proxy_auto_retry_commit_delay_ms =
         clamp_protocol_proxy_auto_retry_commit_delay_ms(
             settings.protocol_proxy_auto_retry_commit_delay_ms,
