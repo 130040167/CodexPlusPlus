@@ -5263,7 +5263,7 @@ function ProxySettingsScreen({
       <Panel>
         <CardHead
           title={t("本地协议代理")}
-          detail={t("从 Codex++ 启动 Codex 时承载协议转换、聚合与请求避震")}
+          detail={t("需要协议转换、聚合或请求避震时随 Codex++ 常驻；Codex 退出不影响，退出 Codex++ 才关闭")}
         />
         <CardContent className="settings-content">
           <div className="status-table">

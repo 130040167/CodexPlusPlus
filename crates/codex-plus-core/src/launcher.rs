@@ -513,7 +513,7 @@ pub async fn launch_and_inject(options: LaunchOptions) -> anyhow::Result<LaunchH
 
 /// 判断错误链里是不是「端口已被占用」。只有这一种失败值得等前任让位重试，
 /// 其余（权限不足、地址非法等）重试多少次都一样，直接冒泡更快也更好排查。
-fn error_is_address_in_use(error: &anyhow::Error) -> bool {
+pub(crate) fn error_is_address_in_use(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<std::io::Error>()
@@ -1127,6 +1127,15 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
+        // 常驻 helper 已经监听同一端口时直接复用：会话不再二次 bind，也不会在
+        // Codex 退出时关掉它（本实例没有持有它的 shutdown 句柄）。
+        if crate::resident_helper::resident_helper_port() == Some(helper_port) {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "helper.reuse_resident",
+                serde_json::json!({ "helper_port": helper_port }),
+            );
+            return Ok(());
+        }
         let bind_host = helper_bind_host();
         let listener = tokio::net::TcpListener::bind((bind_host.as_str(), helper_port))
             .await
@@ -1577,8 +1586,7 @@ impl LaunchHooks for DefaultLaunchHooks {
         Ok(())
     }
 
-    async fn shutdown_helper(&self, _helper_port: u16) {
-        remove_dictation_helper_receipt();
+    async fn shutdown_helper(&self, helper_port: u16) {
         if let Some(runtime) = self.bridge_watchdog.lock().await.take() {
             let _ = runtime.shutdown.send(());
             let _ = runtime.task.await;
@@ -1586,6 +1594,16 @@ impl LaunchHooks for DefaultLaunchHooks {
         if let Some(runtime) = self.helper.lock().await.take() {
             let _ = runtime.shutdown.send(());
             let _ = runtime.task.await;
+            // 只有真正持有 helper 的实例才删除听写凭据：复用了常驻 helper 的
+            // 会话收尾时不能把常驻 helper 的凭据删掉。
+            remove_dictation_helper_receipt_for_port(helper_port);
+        }
+        // 会话 helper 启动时会写凭据并覆盖掉常驻 helper 的；收尾后若常驻实例
+        // 还在监听，把凭据补回常驻端口，避免听写路由因为凭据指向已关闭端口而失效。
+        if let Some(port) = crate::resident_helper::resident_helper_port()
+            && port != helper_port
+        {
+            write_dictation_helper_receipt(port);
         }
     }
 
@@ -1673,12 +1691,24 @@ fn write_dictation_helper_receipt_at(path: &Path, helper_port: u16, token: &str)
     let _ = std::fs::rename(&temporary, path);
 }
 
-fn remove_dictation_helper_receipt() {
-    remove_dictation_helper_receipt_at(&dictation_helper_receipt_path());
+/// 删除属于指定端口的听写 helper 凭据。
+///
+/// 同一进程里可能同时存在常驻 helper 与会话 helper（例如协议转换已关闭但
+/// 常驻实例还没退出）：只删除端口匹配的凭据，避免一方收尾时把另一方的凭据
+/// 误删。凭据整体只在 helper 停止时清理，与旧行为一致。
+fn remove_dictation_helper_receipt_for_port(helper_port: u16) {
+    remove_dictation_helper_receipt_at_for_port(&dictation_helper_receipt_path(), helper_port);
 }
 
-fn remove_dictation_helper_receipt_at(path: &Path) {
-    let _ = std::fs::remove_file(path);
+fn remove_dictation_helper_receipt_at_for_port(path: &Path, helper_port: u16) {
+    let matches = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<Value>(&contents).ok())
+        .and_then(|value| value.get("port").and_then(Value::as_u64))
+        .is_some_and(|port| port == u64::from(helper_port));
+    if matches {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 async fn handle_helper_connection(
@@ -2939,7 +2969,10 @@ mod dictation_receipt_tests {
         assert_eq!(again["port"], 57322);
         assert_eq!(again["token"], "token-def");
         assert!(!path.with_extension("json.tmp").exists(), "临时文件必须被改名走");
-        remove_dictation_helper_receipt_at(&path);
+        // 端口不匹配时不能误删：常驻 helper 与会话 helper 可能同时在跑。
+        remove_dictation_helper_receipt_at_for_port(&path, 57321);
+        assert!(path.exists(), "非本端口的凭据必须保留");
+        remove_dictation_helper_receipt_at_for_port(&path, 57322);
         assert!(!path.exists());
     }
 }

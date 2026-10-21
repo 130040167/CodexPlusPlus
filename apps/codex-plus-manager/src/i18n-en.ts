@@ -719,8 +719,8 @@ export const EN_PLAIN: Record<string, string> = {
   "统一管理本地协议代理、供应商代理与重试策略":
     "Manage the local protocol proxy, provider proxies, and retry policy in one place",
   "本地协议代理": "Local protocol proxy",
-  "从 Codex++ 启动 Codex 时承载协议转换、聚合与自动重试":
-    "Handles protocol conversion, aggregation, and automatic retries when Codex is launched from Codex++",
+  "需要协议转换、聚合或请求避震时随 Codex++ 常驻；Codex 退出不影响，退出 Codex++ 才关闭":
+    "Stays resident with Codex++ while protocol conversion, aggregation, or request shock absorption is needed; quitting Codex does not stop it — only quitting Codex++ does",
   "协议转换": "Protocol conversion",
   "未启用": "Not enabled",
   "本地代理地址由 Codex++ 写入 config.toml；切换供应商或修改协议后重启 Codex 生效。":

@@ -327,6 +327,9 @@ pub fn run() {
                                     serde_json::json!({ "message": error.to_string() }),
                                 );
                             }
+                            // 常驻本地代理只在 Codex++ 退出时停止；Codex 会话结束
+                            // 不会关它（见 core::resident_helper）。
+                            codex_plus_core::resident_helper::stop_resident_helper();
                             SHUTDOWN_COMPLETE.store(true, Ordering::SeqCst);
                             app.exit(0);
                         });
