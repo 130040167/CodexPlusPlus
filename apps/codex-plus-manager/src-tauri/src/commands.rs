@@ -117,6 +117,77 @@ pub async fn claude_localization_set_localization(enabled: bool) -> CommandResul
     }
 }
 
+// ---------------------------------------------------------------- ZCode 增强
+
+fn zcode_status_value(status: &crate::zcode::ZcodeStatus) -> Value {
+    serde_json::to_value(status).unwrap_or_else(|_| json!({}))
+}
+
+#[tauri::command]
+pub async fn zcode_enhancement_status() -> CommandResult<Value> {
+    let status = crate::zcode::probe().await;
+    ok("ZCode 增强状态已读取。", zcode_status_value(&status))
+}
+
+#[tauri::command]
+pub async fn zcode_enhancement_action(action: String) -> CommandResult<Value> {
+    let action = action.trim().to_string();
+    match crate::zcode::action(&action).await {
+        Ok(status) => {
+            let message = match action.as_str() {
+                "launch" if status.injected => "ZCode 已启动并注入语音输入。",
+                "launch" if !status.voice_input => {
+                    "ZCode 已启动（语音输入开关关闭，未注入语音入口）。"
+                }
+                "launch" if status.running => {
+                    "ZCode 已启动，但语音输入入口尚未注入，可稍后重试「重新注入」。"
+                }
+                "launch" => "ZCode 启动指令已发送。",
+                "reinject" if status.injected => "语音输入入口已重新注入。",
+                "reinject" => "已尝试重新注入，但页面健康检查尚未通过。",
+                _ => "ZCode 增强状态已读取。",
+            };
+            ok(message, zcode_status_value(&status))
+        }
+        Err(error) => failed(&format!("ZCode 操作失败：{error:#}"), json!({})),
+    }
+}
+
+#[tauri::command]
+pub async fn zcode_enhancement_set_voice_input(enabled: bool) -> CommandResult<Value> {
+    let save = tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<()> {
+        let store = SettingsStore::default();
+        let mut settings = store.load()?;
+        settings.zcode_app_voice_input = enabled;
+        store.save(&settings)?;
+        Ok(())
+    })
+    .await;
+    match save {
+        Ok(Ok(())) => {
+            if enabled {
+                // 尝试补注入（内部会按需启动本地语音服务拿 endpoint/token）。ZCode 没在
+                // 跑时失败不算错误，等它下次启动时由守护线程安装。
+                let _ = crate::zcode::reinject_if_possible().await;
+            } else {
+                // 关闭时尽量让页面脚本自己清理，不留下一个点了会失败的入口。
+                let _ = crate::zcode::dispose().await;
+            }
+            let status = crate::zcode::probe().await;
+            ok(
+                if enabled {
+                    "ZCode 语音输入已开启。"
+                } else {
+                    "ZCode 语音输入已关闭。"
+                },
+                zcode_status_value(&status),
+            )
+        }
+        Ok(Err(error)) => failed(&format!("保存 ZCode 语音输入设置失败：{error:#}"), json!({})),
+        Err(error) => failed(&format!("保存 ZCode 语音输入设置失败：{error}"), json!({})),
+    }
+}
+
 #[tauri::command]
 pub async fn scan_agent_cache() -> CommandResult<Value> {
     let result = tauri::async_runtime::spawn_blocking(|| -> anyhow::Result<Value> {

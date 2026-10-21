@@ -24,6 +24,7 @@ pub enum ToolId {
     Codex,
     Grok,
     Claude,
+    Zcode,
     Unknown(String),
 }
 
@@ -39,6 +40,7 @@ impl ToolId {
             Self::Codex => "codex",
             Self::Grok => "grok",
             Self::Claude => "claude",
+            Self::Zcode => "zcode",
             Self::Unknown(value) => value.as_str(),
         }
     }
@@ -48,6 +50,7 @@ impl ToolId {
             "codex" => Self::Codex,
             "grok" => Self::Grok,
             "claude" => Self::Claude,
+            "zcode" => Self::Zcode,
             other => Self::Unknown(other.to_string()),
         }
     }
@@ -121,15 +124,21 @@ pub struct ToolSpec {
 pub const TOOL_CODEX_NAME: &str = "Codex";
 pub const TOOL_GROK_NAME: &str = "Grok";
 pub const TOOL_CLAUDE_NAME: &str = "Claude Code";
+pub const TOOL_ZCODE_NAME: &str = "ZCode";
 
-/// 已注册的工具，顺序即 UI 顶栏顺序：Codex、Claude、Grok。
-pub const REGISTERED_TOOLS: &[ToolId] = &[ToolId::Codex, ToolId::Claude, ToolId::Grok];
+/// 已注册的工具，顺序即 UI 顶栏顺序：Codex、Claude、Grok、ZCode。
+///
+/// ZCode 的「供应商切换」尚未接入（它的配置目录留给后续任务），但工具页本身
+/// 可以先打开，所以仍然注册在列表里。
+pub const REGISTERED_TOOLS: &[ToolId] =
+    &[ToolId::Codex, ToolId::Claude, ToolId::Grok, ToolId::Zcode];
 
 pub fn tool_display_name(id: &ToolId) -> &'static str {
     match id {
         ToolId::Codex => TOOL_CODEX_NAME,
         ToolId::Grok => TOOL_GROK_NAME,
         ToolId::Claude => TOOL_CLAUDE_NAME,
+        ToolId::Zcode => TOOL_ZCODE_NAME,
         ToolId::Unknown(_) => "未知工具",
     }
 }
@@ -146,12 +155,20 @@ pub fn default_claude_home_dir() -> PathBuf {
         })
 }
 
+/// ZCode 的配置根目录（默认 `~/.zcode`）。
+pub fn default_zcode_home_dir() -> PathBuf {
+    directories::BaseDirs::new()
+        .map(|dirs| dirs.home_dir().join(".zcode"))
+        .unwrap_or_else(|| PathBuf::from(".zcode"))
+}
+
 /// 供应商 profile 的写入目标目录。
 pub fn tool_home_dir(id: &ToolId) -> PathBuf {
     match id {
         ToolId::Codex => crate::relay_config::default_codex_home_dir(),
         ToolId::Grok => crate::grok_config::default_grok_home_dir(),
         ToolId::Claude => default_claude_home_dir(),
+        ToolId::Zcode => default_zcode_home_dir(),
         // 未注册的工具没有已知 home，退回配置根目录，避免调用方拿到 panic。
         ToolId::Unknown(_) => crate::paths::default_app_state_dir(),
     }
@@ -159,8 +176,12 @@ pub fn tool_home_dir(id: &ToolId) -> PathBuf {
 
 /// 该工具的 profile 是否已经能真正写盘并切换。
 pub fn tool_is_switchable(id: &ToolId) -> bool {
-    // Claude 的供应商切换尚未接入，但工具页本身可以打开并管理本地化副本。
-    matches!(id, ToolId::Codex | ToolId::Grok | ToolId::Claude)
+    // Claude 的供应商切换尚未接入，但工具页本身可以打开并管理本地化副本；
+    // ZCode 同理，先让顶栏能选中它。
+    matches!(
+        id,
+        ToolId::Codex | ToolId::Grok | ToolId::Claude | ToolId::Zcode
+    )
 }
 
 pub fn tool_specs() -> Vec<ToolSpec> {
@@ -238,7 +259,12 @@ mod tests {
 
     #[test]
     fn tool_id_round_trips_through_json() {
-        for id in [ToolId::Codex, ToolId::Grok, ToolId::Claude] {
+        for id in [
+            ToolId::Codex,
+            ToolId::Grok,
+            ToolId::Claude,
+            ToolId::Zcode,
+        ] {
             let encoded = serde_json::to_string(&id).unwrap();
             assert_eq!(encoded, format!("\"{}\"", id.as_str()));
             let decoded: ToolId = serde_json::from_str(&encoded).unwrap();
@@ -338,6 +364,9 @@ mod tests {
         assert!(specs[1].switchable);
         assert_eq!(specs[2].id, ToolId::Grok);
         assert!(specs[2].switchable);
+        assert_eq!(specs[3].id, ToolId::Zcode);
+        assert_eq!(specs[3].name, TOOL_ZCODE_NAME);
+        assert!(specs[3].switchable);
         assert!(specs.iter().all(|spec| !spec.home_dir.is_empty()));
     }
 }

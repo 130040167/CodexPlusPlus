@@ -110,6 +110,8 @@ create_app() {
   <string>APPL</string>
   <key>CodexPlusUnifiedApp</key>
   <true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Codex++ 需要麦克风，为 ZCode 语音输入录音。</string>
   <key>CFBundleSignature</key>
   <string>????</string>
   <key>CFBundleExecutable</key>
