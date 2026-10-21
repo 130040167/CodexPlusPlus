@@ -120,6 +120,10 @@
 
   function recordCodexPlusBridgeSuccess() {
     recordCodexPlusBridgeHealth("lastSuccessAt");
+    if (codexPlusBackendGeneration === window.__codexPlusBackendGeneration) {
+      const health = window.__codexPlusBridgeHealth || (window.__codexPlusBridgeHealth = {});
+      health.failures = 0;
+    }
     codexPlusBridgeFailureCount = 0;
   }
 
@@ -129,6 +133,12 @@
 
   function recordCodexPlusBridgeFailure() {
     codexPlusBridgeFailureCount += 1;
+    if (codexPlusBackendGeneration !== window.__codexPlusBackendGeneration) return;
+    // 看门狗只能读到 window 上的 health 快照：不落 failures/lastFailureAt，
+    // CDP 连接断掉后它会一直把“还在尝试”当成桥接存活，永久不重注入。
+    const health = window.__codexPlusBridgeHealth || (window.__codexPlusBridgeHealth = {});
+    health.lastFailureAt = Date.now();
+    health.failures = codexPlusBridgeFailureCount;
   }
 
   function renderBackendStatus() {
@@ -725,6 +735,7 @@
 
   async function directFetchCodexPlusAds() {
     const urls = [
+      "https://ads.codexpp.cc/ads.json",
       "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/ads.json",
       "https://cdn.jsdelivr.net/gh/BigPizzaV3/Ad-List@main/ads.json",
     ];
@@ -1494,10 +1505,13 @@
             } else if (result.status === "ok" && result.enable_i18n === false) {
               showToast("UI 配置已刷新，enable_i18n=false", null);
             } else {
-              showToast(`UI 配置刷新${result.status === "partial" ? "部分完成" : "失败"}`, result.errors?.join("；") || null);
+              // showToast 的第二个参数若是字符串会被当成撤销 token（旧签名），
+              // 错误详情必须拼进正文并以对象参数标明类型。
+              const detail = result.errors?.join("；");
+              showToast(`UI 配置刷新${result.status === "partial" ? "部分完成" : "失败"}${detail ? `：${detail}` : ""}`, { type: result.status === "partial" ? "warn" : "error" });
             }
           })
-          .catch((error) => showToast("UI 配置刷新失败", error?.message || String(error)))
+          .catch((error) => showToast(`UI 配置刷新失败：${error?.message || String(error)}`, { type: "error" }))
           .finally(() => {
             button.dataset.pending = "false";
             button.textContent = originalLabel || "刷新 UI 配置";

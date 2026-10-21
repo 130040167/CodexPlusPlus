@@ -86,7 +86,6 @@ Section "Install"
   ; 才真正退出（更新入口本身就跑在 manager 里），WaitForProcessExit 看到
   ; 进程名消失时文件锁未必立刻释放，Delete 会静默失败；此处再轮询重试，
   ; 而不是一次失败就把整次安装 Abort 掉（issue #2460）。
-  Var /GLOBAL LegacyDeleteTries
   StrCpy $LegacyDeleteTries 0
   legacy_binary_delete_loop:
   Delete "$INSTDIR\codex-plus-plus-manager.exe"
