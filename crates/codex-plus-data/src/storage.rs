@@ -1154,77 +1154,13 @@ const USAGE_TAIL_EVENT_LIMIT: usize = 24;
 fn read_rollout_usage_tail(rollout: &Path, limit: usize) -> anyhow::Result<Vec<Value>> {
     if crate::rollout_source::is_compressed(rollout) {
         // 压缩流不能随机 seek；流式遍历且仅保留最近事件。
-        let mut events: std::collections::VecDeque<Value> = std::collections::VecDeque::new();
-        let mut current_turn_id: Option<String> = None;
-        let mut segment_start = 0;
-        for line in BufReader::new(crate::rollout_source::open(rollout)?).lines() {
-            let line = line?;
-            if !line.contains("\"token_count\"")
-                && !line.contains("\"turn_context\"")
-                && !line.contains("\"task_started\"")
-                && !line.contains("\"turn_started\"")
-                && !line.contains("\"task_complete\"")
-                && !line.contains("\"turn_complete\"")
-                && !line.contains("\"turn_completed\"")
-                && !line.contains("\"task_failed\"")
-                && !line.contains("\"turn_aborted\"")
-                && !line.contains("\"task_aborted\"")
-            {
-                continue;
-            }
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            let kind = value.get("type").and_then(Value::as_str);
-            let payload = &value["payload"];
-            let event_type = payload.get("type").and_then(Value::as_str);
-            let turn_id = payload
-                .get("turn_id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty());
-            if kind == Some("turn_context") {
-                if let Some(id) = turn_id {
-                    if current_turn_id.as_deref() != Some(id) {
-                        segment_start = events.len();
-                    }
-                    current_turn_id = Some(id.to_owned());
-                }
-            } else if kind == Some("event_msg") {
-                match event_type {
-                    Some("task_started" | "turn_started") => {
-                        segment_start = events.len();
-                        current_turn_id = turn_id.map(str::to_owned);
-                    }
-                    Some(
-                        "task_complete" | "turn_complete" | "turn_completed" | "task_failed"
-                        | "turn_aborted" | "task_aborted",
-                    ) => {
-                        if let Some(id) = turn_id {
-                            for event in events.iter_mut().skip(segment_start) {
-                                if event.get("turn_id").is_none() {
-                                    event["turn_id"] = json!(id);
-                                }
-                            }
-                        }
-                        segment_start = events.len();
-                        current_turn_id = None;
-                    }
-                    Some("token_count") => {
-                        if let Some(event) =
-                            rollout_usage_event(&value, current_turn_id.as_deref())
-                        {
-                            events.push_back(event);
-                            if events.len() > limit {
-                                events.pop_front();
-                                segment_start = segment_start.saturating_sub(1);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        return Ok(events.into_iter().collect());
+        let mut events = Vec::new();
+        read_rollout_usage_lines(
+            BufReader::new(crate::rollout_source::open(rollout)?).lines(),
+            limit,
+            &mut events,
+        )?;
+        return Ok(events);
     }
     let file = File::open(rollout)?;
     let len = file.metadata()?.len();
@@ -1264,9 +1200,18 @@ fn read_rollout_usage_window(
     if start > 0 {
         lines.next();
     }
+    read_rollout_usage_lines(lines.map(|line| Ok(line.to_owned())), limit, out)
+}
+
+fn read_rollout_usage_lines(
+    lines: impl Iterator<Item = std::io::Result<String>>,
+    limit: usize,
+    out: &mut Vec<Value>,
+) -> anyhow::Result<()> {
     let mut current_turn_id: Option<String> = None;
     let mut segment_start = 0;
     for line in lines {
+        let line = line?;
         let line = line.trim();
         // 先做子串预筛，避免为每条 response_item 付 serde 解析成本。
         if line.is_empty()
@@ -1326,16 +1271,18 @@ fn read_rollout_usage_window(
         }
         if let Some(event) = rollout_usage_event(&value, current_turn_id.as_deref()) {
             out.push(event);
+            if out.len() > limit {
+                let removed = out.len() - limit;
+                out.drain(..removed);
+                segment_start = segment_start.saturating_sub(removed);
+            }
         }
-    }
-    if out.len() > limit {
-        out.drain(..out.len() - limit);
     }
     Ok(())
 }
 
 #[cfg(test)]
-mod compressed_usage_merge_tests {
+mod compressed_tail_integration_tests {
     use super::*;
 
     #[test]
