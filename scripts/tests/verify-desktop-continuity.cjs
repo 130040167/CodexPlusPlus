@@ -14,8 +14,10 @@ function editableJson(contents) {
     typeof value === "number" && !Number.isSafeInteger(value) ? JSON.rawJSON(context.source) : value);
 }
 let interrupted = "", cleaning = false;
+const scenarioController = new AbortController();
 for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => {
   interrupted = signal;
+  scenarioController.abort(new Error(`acceptance interrupted: ${signal}`));
   process.exitCode = 1;
 });
 if (process.argv[2] === "--self-test") {
@@ -23,6 +25,10 @@ if (process.argv[2] === "--self-test") {
   return;
 }
 const { chromium } = require("playwright");
+const { installDialogHandling } = require(path.join(
+  process.env.CODEX_ISOLATED_TESTING_SKILL
+    || path.join(process.env.USERPROFILE, ".codex", "skills", "codex-isolated-testing"),
+  "scripts", "playwright-ui.cjs"));
 
 assert.equal(process.platform, "win32");
 assert.equal(process.argv.length, 5, "Usage: node verify-desktop-continuity.cjs <manager.exe> <Codex app dir> <output dir>");
@@ -62,6 +68,8 @@ const report = { temporary, executable, appDir, checks: {}, events: [], managers
   protectedProcesses: protectedProcesses.map(identity), cleanup: false,
   protectionPolicy: "Preserve original manager/Codex/CLI identities and files; record natural renderer replacement separately." };
 const protectedFiles = new Map();
+const pageDialogs = new WeakMap();
+let pageDialogsSequence = 0;
 let mode = "complete", attempts = 0, held = [];
 
 async function save() {
@@ -104,6 +112,23 @@ async function freePort() {
     const port = await listen(server);
     return port;
   } finally { await close(server); }
+}
+async function freeDesktopDebugPort() {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const debug = net.createServer(), helper = net.createServer();
+    try {
+      const port = await listen(debug);
+      if (port >= 65535) continue;
+      await listen(helper, port + 1);
+      return port;
+    } catch (error) {
+      if (!["EADDRINUSE", "EACCES"].includes(error.code)) throw error;
+    } finally {
+      await close(helper);
+      await close(debug);
+    }
+  }
+  throw new Error("No available isolated desktop debug/helper port pair");
 }
 function captureOwned() {
   const processes = inventory();
@@ -157,7 +182,9 @@ async function protectOriginalFiles() {
     path.join(process.env.USERPROFILE, ".codex", "config.toml"),
     path.join(process.env.USERPROFILE, ".codex-session-delete", "settings.json"),
     ...(process.env.CODEX_PLUS_STATE_DIR ? [path.join(process.env.CODEX_PLUS_STATE_DIR, "settings.json")] : []),
-  ]) protectedFiles.set(file, await fs.readFile(file).catch(error => {
+  ]) protectedFiles.set(file, await fs.stat(file).then(stat => ({
+    size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino,
+  })).catch(error => {
     if (error.code !== "ENOENT") throw error;
     return null;
   }));
@@ -172,13 +199,15 @@ async function originalsIntact() {
   if (fixedChanges.length) report.originalProcessChanges = fixedChanges.map(identity);
   assert.equal(fixedChanges.length, 0, `original application process identities changed: ${fixedChanges.map(p => `${p.Name}:${p.ProcessId}`).join(", ")}`);
   for (const [file, original] of protectedFiles) {
-    const current = await fs.readFile(file).catch(() => null);
-    const unchanged = original === null ? current === null : current?.equals(original);
+    const current = await fs.stat(file).then(stat => ({
+      size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino,
+    })).catch(error => { if (error.code === "ENOENT") return null; throw error; });
+    const unchanged = JSON.stringify(original) === JSON.stringify(current);
     if (!unchanged) report.originalFileChanges = [...new Set([...(report.originalFileChanges || []), file])];
     assert.ok(unchanged, `original configuration changed: ${file}`);
   }
 }
-async function supplier() {
+async function supplier(owner = "original") {
   const server = http.createServer(async (request, response) => {
     try {
       if (request.method === "GET") {
@@ -190,9 +219,9 @@ async function supplier() {
       for await (const chunk of request) chunks.push(chunk);
       const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
       report.events.push({ name: "supplierRequest", time: new Date().toISOString(),
-        url: request.url, model: body.model, stream: body.stream });
+        owner, url: request.url, model: body.model, stream: body.stream });
       assert.ok(request.url.endsWith("/responses"), `Unexpected supplier path ${request.url}`);
-      const answer = `DESKTOP_RECOVERED_${mode}`;
+      const answer = owner === "original" ? `DESKTOP_RECOVERED_${mode}` : `EXTERNAL_SUPPLIER_${mode}`;
       const responseId = `resp_${++attempts}`;
       const item = { id: `msg_${attempts}`, type: "message", role: "assistant", status: "completed",
         content: [{ type: "output_text", text: answer, annotations: [] }] };
@@ -208,7 +237,7 @@ async function supplier() {
       send("response.output_item.added", { output_index: 0, item: { ...item, status: "in_progress", content: [] } });
       send("response.content_part.added", { output_index: 0, item_id: item.id, content_index: 0,
         part: { type: "output_text", text: "", annotations: [] } });
-      if (mode === "hold") {
+      if (mode === "hold" && owner === "original") {
         send("response.output_text.delta", { item_id: item.id, output_index: 0, content_index: 0, delta: "PARTIAL" });
         held.push(response);
         return;
@@ -229,16 +258,17 @@ async function supplier() {
 async function context(name, upstream) {
   const state = path.join(temporary, name), home = path.join(state, "home");
   await fs.mkdir(home, { recursive: true });
+  await fs.mkdir(path.join(state, "appdata", "Codex++"), { recursive: true });
   const profile = {
     id: "fixture", name: "Desktop Fixture", relayMode: "pureApi", protocol: "responses",
     webSearchHistoryCompat: true, apiKey: "synthetic-desktop-test", model: "gpt-5.1-codex",
-    modelList: "gpt-5.1-codex", baseUrl: `${upstream}/v1`, upstreamBaseUrl: `${upstream}/v1`,
+    modelList: "gpt-5.1-codex[128K]\ngpt-fixture-secondary[64K]", baseUrl: `${upstream}/v1`, upstreamBaseUrl: `${upstream}/v1`,
     configContents: `model = "gpt-5.1-codex"\nmodel_provider = "custom"\n[model_providers.custom]\nname = "Fixture"\nrequires_openai_auth = false\nwire_api = "responses"\nbase_url = "${upstream}/v1"\n`,
     authContents: '{"OPENAI_API_KEY":"synthetic-desktop-test"}',
   };
   await fs.writeFile(path.join(state, "settings.json"), JSON.stringify({
     localConfigProviderImported: true, providerSyncEnabled: false, codexAppAutoTakeover: false,
-    enhancementsEnabled: false, codexAppStandaloneQuotaUnlock: false, codexAppPath: appDir,
+    enhancementsEnabled: true, codexAppStandaloneQuotaUnlock: false, codexAppPath: appDir,
     relayProfilesEnabled: true, activeRelayId: profile.id, relayProfiles: [profile],
     relayCommonConfigContents: "analytics.enabled=false\nsandbox_mode=\"danger-full-access\"\napproval_policy=\"never\"\n[windows]\nsandbox=\"unelevated\"\n[features]\nplugins=false\napps=false\nremote_plugin=false\n",
   }));
@@ -249,6 +279,7 @@ async function context(name, upstream) {
 }
 function environment(context) {
   const env = { ...process.env, CODEX_HOME: context.home, CODEX_SQLITE_HOME: context.sqlite,
+    APPDATA: path.join(context.state, "appdata"),
     CODEX_PLUS_STATE_DIR: context.state, CODEX_PLUS_MANAGER_GUARD_PORT: String(context.guard),
     CODEX_PLUS_LAUNCHER_GUARD_PORT: String(context.launcherGuard), CODEX_PLUS_PROTOCOL_PROXY_PORT: String(context.port),
     WEBVIEW2_USER_DATA_FOLDER: path.join(context.state, "test-webview"),
@@ -256,10 +287,13 @@ function environment(context) {
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${context.debug}`,
     CODEX_PLUS_HELPER_BIND: "127.0.0.1", OTEL_SDK_DISABLED: "true" };
   for (const name of ["CODEX_PLUS_GUARD_PORT", "CODEX_PLUS_MULTI_INSTANCE", "CODEX_PLUS_INSTANCE_ID",
-    "CODEX_PLUS_INSTANCE_LABEL", "OPENAI_API_KEY", "OPENAI_BASE_URL"]) delete env[name];
+    "CODEX_PLUS_INSTANCE_LABEL", "OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY",
+    "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT",
+    "OPENAI_ORG_ID", "OPENAI_PROJECT_ID"]) delete env[name];
   return env;
 }
 async function startManager(context) {
+  await fs.mkdir(path.join(context.state, "appdata", "Codex++"), { recursive: true });
   const started = Date.now();
   const binary = context.executable || executable;
   context.current = spawn(binary, [], { env: environment(context), windowsHide: true,
@@ -294,8 +328,23 @@ async function connectBrowser(port) {
   for (const context of browser.contexts()) {
     context.setDefaultTimeout(10000);
     context.setDefaultNavigationTimeout(10000);
+    context.on("page", page => { dialogsFor(page).catch(error => {
+      report.dialogError = String(error);
+    }); });
+    for (const page of context.pages()) await dialogsFor(page);
   }
   return browser;
+}
+function dialogsFor(page) {
+  if (!pageDialogs.has(page)) pageDialogs.set(page, installDialogHandling(page, {
+    evidenceDir: path.join(outputDir, `dialogs-${pageDialogsSequence++}`),
+    record: event => report.events.push({ name: "dialog", ...event }),
+  }));
+  return pageDialogs.get(page);
+}
+async function ensureClear(page) {
+  assert.ok(!report.dialogError, report.dialogError);
+  await bounded((await dialogsFor(page)).ensureClear(), 15000);
 }
 const invoke = (context, command, args = {}) => bounded(context.page.evaluate(
   ({ command, args }) => window.__TAURI_INTERNALS__.invoke(command, args), { command, args }), 30000);
@@ -331,8 +380,7 @@ async function stopManager(context, crash = false) {
   if (context.browser) await bounded(context.browser.close(), 3000).catch(() => {});
   context.browser = context.page = null;
 }
-async function launchDesktop(context) {
-  const instanceId = token;
+async function launchDesktop(context, instanceId = token) {
   const root = path.join(context.state, "codex-multi", instanceId);
   const home = path.join(root, "codex-home"), workspace = path.join(context.state, "workspace");
   await fs.mkdir(home, { recursive: true });
@@ -344,7 +392,7 @@ async function launchDesktop(context) {
       last_completed_onboarding: Math.floor(Date.now() / 1000) },
   }));
   const result = await invoke(context, "launch_codex_multi_instance", { request: {
-    instanceId, profileId: "fixture", appPath: appDir, debugPort: await freePort(),
+    instanceId, profileId: "fixture", appPath: appDir, debugPort: await freeDesktopDebugPort(),
   } });
   assert.notEqual(result.status, "failed", result.message);
   const desktop = { context, root, instanceId };
@@ -364,10 +412,12 @@ async function launchDesktop(context) {
   const listed = await invoke(context, "list_codex_multi_instances");
   desktop.manifest = listed.instances.find(instance => instance.instanceId === instanceId);
   assert.ok(desktop.manifest?.running, JSON.stringify(listed));
+  assertWithin(temporary, desktop.manifest.codexHome);
+  assertWithin(temporary, desktop.manifest.sqliteHome);
   const data = path.resolve(desktop.id.userDataDir.replace(/^\\\\\?\\/, ""));
   desktop.actualData = data;
   const browserProcess = inventory().find(process => process.ProcessId === desktop.id.processId);
-  assert.equal(desktop.id.instanceId, token);
+  assert.equal(desktop.id.instanceId, instanceId);
   assert.ok(browserProcess?.CommandLine.includes(data) && browserProcess.CommandLine.includes(
     `--remote-debugging-port=${desktop.id.debugPort}`), "launched browser must match its receipt");
   assert.ok(!protectedProcesses.some(original => sameProcess(original, browserProcess)));
@@ -402,11 +452,14 @@ async function launchDesktop(context) {
     throw error;
   });
   await bounded(desktop.page.waitForLoadState("domcontentloaded"));
+  await ensureClear(desktop.page);
   await bounded(desktop.page.screenshot({ path: path.join(outputDir, `desktop-${desktops.length}.png`) }));
+  await ensureClear(desktop.page);
   await pass(`realDesktop${desktops.length}Ready`, { processId: desktop.id.processId, debugPort: desktop.id.debugPort });
   return desktop;
 }
 async function snapshot(desktop, label) {
+  await ensureClear(desktop.page);
   const ui = await bounded(desktop.page.evaluate(() => ({
     url: location.href, text: document.body.innerText.slice(-12000),
     fields: [...document.querySelectorAll("input,textarea,[contenteditable=true]")].map(el => ({
@@ -420,19 +473,24 @@ async function snapshot(desktop, label) {
   })), 3000);
   report.events.push({ name: label, ui });
   await bounded(desktop.page.screenshot({ path: path.join(outputDir, `${label}.png`) }), 3000);
+  await ensureClear(desktop.page);
   await save();
 }
 async function sendPrompt(desktop, text) {
-  const dismiss = desktop.page.getByRole("button", { name: "继续使用当前模型", exact: true });
-  if (await bounded(dismiss.isVisible())) await bounded(dismiss.click());
   await until(async () => !await desktop.page.getByText("正在完成 Windows 设置", { exact: true }).isVisible(),
-    "isolated desktop sandbox setup did not finish", 60000);
-  if (await bounded(dismiss.isVisible())) await bounded(dismiss.click());
+    "isolated desktop sandbox setup did not finish", 90000);
+  await until(async () => {
+    const trigger = desktop.page.locator("[data-codex-intelligence-trigger]:visible").first();
+    return await trigger.count() > 0 && await trigger.isEnabled()
+      && !/loading model|加载模型/i.test(await trigger.innerText());
+  }, "native model selector did not become ready before sending", 90000);
+  await ensureClear(desktop.page);
   await snapshot(desktop, "before-prompt");
   const composer = desktop.page.locator('[contenteditable="true"]').first();
   await bounded(composer.waitFor({ state: "visible", timeout: 15000 }), 16000);
   await bounded(composer.fill(text));
   await bounded(composer.press("Enter"));
+  await ensureClear(desktop.page);
 }
 async function assertDesktopAlive(desktop) {
   const browser = await bounded(fetch(`http://127.0.0.1:${desktop.id.debugPort}/json/version`,
@@ -741,9 +799,14 @@ async function runWorkerHandoffScenario(first, manager) {
   try {
     await protectOriginalFiles();
     const upstream = await supplier();
+    const externalUpstream = await supplier("external");
     const a = await context("manager-a", upstream), b = await context("manager-b", upstream);
     if (process.env.DESKTOP_BASELINE_MANAGER) a.executable = path.resolve(process.env.DESKTOP_BASELINE_MANAGER);
     await startManager(a);
+    if (process.env.DESKTOP_PROVIDER_SCENARIO) {
+      const providerDesktop = await launchDesktop(a, `${token}-provider`);
+      await runProviderScenario(providerDesktop);
+    }
     const first = await launchDesktop(a);
     await originalsIntact();
     if (process.env.DESKTOP_WORKER_HANDOFF_ONLY) {
@@ -827,16 +890,28 @@ async function runWorkerHandoffScenario(first, manager) {
       home: first.manifest.codexHome, sqlite: first.manifest.sqliteHome, debug: await freePort(),
       guard: await freePort(), launcherGuard: await freePort(), port: await freePort() };
     contexts.push(resume);
+    const baseline = await providerSnapshot(resume.state, resume.home);
+    assert.equal(baseline.activeRelayId, "fixture");
+    assert.equal(baseline.defaultModel, "gpt-5.1-codex");
     mode = "hold";
     await sendPrompt(first, "Return another short synthetic response without tools.");
     await until(() => held.length > 0, "desktop did not start held streaming request");
+    await writeExternalProvider(temporary, resume.home, externalUpstream, "before-crash", baseline.catalog);
+    assert.deepEqual(JSON.parse(await fs.readFile(path.join(resume.state, "settings.json"), "utf8")).relayProfiles,
+      baseline.profiles, "external config edit must leave saved supplier snapshots untouched");
     captureOwned();
     killOwned(workerPid);
+    await writeExternalProvider(temporary, resume.home, externalUpstream, "after-crash", baseline.catalog);
+    const recoveryEvents = report.events.length;
     mode = "after_crash";
     const blocker = http.createServer((_request, response) => response.writeHead(503).end());
     await listen(blocker, resume.port);
     await startManager(resume);
     await first.page.getByText("DESKTOP_RECOVERED_after_crash", { exact: true }).waitFor({ timeout: 90000 });
+    await ensureClear(first.page);
+    assertOriginalOwner(report.events, recoveryEvents);
+    await verifyRecoveredProvider(first, resume.state, resume.home, baseline, "after-crash");
+    await pass("externalCCSwitchBeforeAndAfterCrashPreservesSavedProviderCatalogAndOldEndpoint");
     await assertDesktopAlive(first);
     await pass("realDesktopRetriesAfterProxyHostCrash", { cachedPort: first.id.helperPort, newPort: resume.port });
     const resumeLog = await fs.readFile(path.join(resume.state, "codex-plus.log"), "utf8");
@@ -855,6 +930,9 @@ async function runWorkerHandoffScenario(first, manager) {
     await fs.writeFile(history, '{}');
     await startManager(resume);
     await first.page.getByText("DESKTOP_RECOVERED_after_exit", { exact: true }).waitFor({ timeout: 90000 });
+    await ensureClear(first.page);
+    assertOriginalOwner(report.events, recoveryEvents);
+    await verifyRecoveredProvider(first, resume.state, resume.home, baseline, "after-exit");
     await assertDesktopAlive(first);
     await pass("realDesktopRetriesAfterNormalProxyHostExit");
     const repaired = JSON.parse(await fs.readFile(history, "utf8"));
@@ -913,10 +991,25 @@ async function runWorkerHandoffScenario(first, manager) {
   } finally {
     cleaning = true;
     report.interrupted = interrupted || null;
-    for (const desktop of desktops) await closeDesktop(desktop).catch(() => {});
+    for (const desktop of desktops) {
+      const context = desktop.context;
+      if (!context.page || context.current?.exitCode !== null) continue;
+      try {
+        const stopped = await invoke(context, "stop_codex_multi_instance", {
+          request: { instanceId: desktop.instanceId },
+        });
+        if (stopped.status === "failed") report.events.push({
+          name: "multiStopFallbackRequired", instanceId: desktop.instanceId, message: stopped.message,
+        });
+      } catch (error) {
+        report.events.push({ name: "multiStopFallbackRequired", message: String(error) });
+      }
+    }
     for (const context of contexts) await stopManager(context).catch(error => {
       report.cleanupErrors = [...(report.cleanupErrors || []), String(error)];
     });
+    // A crashed worker can leave its desktop alive: only then use its verified CDP identity.
+    for (const desktop of desktops) await closeDesktop(desktop).catch(() => {});
     captureOwned();
     for (const process of inventory()) if (sameProcess(process, owned.get(process.ProcessId))) {
       try { killOwned(process.ProcessId); }
@@ -967,15 +1060,11 @@ async function runWorkerHandoffScenario(first, manager) {
       assert.equal(path.dirname(temporary), os.tmpdir());
       assert.equal(path.basename(temporary), token);
       try {
-        for (const desktop of desktops) if (desktop.actualData && !desktop.actualData.startsWith(temporary + path.sep)) {
-          assert.equal(desktop.actualData, path.join(process.env.LOCALAPPDATA, "CodexPlusPlus", "multi", token));
-          powershell("$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName Microsoft.VisualBasic; " +
-            "[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($env:DESKTOP_TEST_TEMP, 'OnlyErrorDialogs', 'SendToRecycleBin')",
-          { ...process.env, DESKTOP_TEST_TEMP: desktop.actualData });
-        }
-        powershell("$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName Microsoft.VisualBasic; " +
-          "[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($env:DESKTOP_TEST_TEMP, 'OnlyErrorDialogs', 'SendToRecycleBin')",
-        { ...process.env, DESKTOP_TEST_TEMP: temporary });
+        for (const desktop of desktops) if (desktop.actualData) assertWithin(temporary, desktop.actualData);
+        const archive = path.join(outputDir, `archived-test-data-${token}`);
+        assert.ok(!path.resolve(outputDir).toLowerCase().startsWith(temporary.toLowerCase() + path.sep));
+        await fs.rename(temporary, archive);
+        report.archive = archive;
         report.cleanup = true;
       } catch (error) { report.cleanupErrors = [...(report.cleanupErrors || []), String(error)]; }
     }
@@ -987,6 +1076,32 @@ async function runWorkerHandoffScenario(first, manager) {
 })();
 
 async function selfTest() {
+  assert.equal(fixtureRootString('model = "fixture"\n[x]\nmodel = "other"\n', "model"), "fixture");
+  assert.equal(fixtureRootString("model_catalog_json = 'C:\\fixture\\models.json'\n", "model_catalog_json"),
+    "C:\\fixture\\models.json");
+  assert.throws(() => fixtureRootString('[x]\nmodel = "other"\n', "model"), /quoted root/);
+  assert.throws(() => assertWithin(os.tmpdir(), path.join(os.tmpdir(), "..", "outside")), /inside/);
+  assertOriginalOwner([{ name: "supplierRequest", owner: "original" }], 0);
+  assert.throws(() => assertOriginalOwner([], 0), /real local/);
+  assert.throws(() => assertOriginalOwner([{ name: "supplierRequest", owner: "external" }], 0), /changed supplier/);
+  const evidence = path.resolve("output", `desktop-continuity-self-test-${Date.now()}-${process.pid}`);
+  const runtime = path.join(evidence, "runtime"), home = path.join(runtime, "home");
+  await fs.mkdir(home, { recursive: true });
+  const fixtureCatalog = { models: [{ slug: "original", display_name: "Original" }] };
+  await writeExternalProvider(runtime, home, "http://127.0.0.1:12345", "before-crash", fixtureCatalog);
+  assert.deepEqual(fixtureCatalog.models.map(model => model.slug), ["original"], "fixture must not mutate baseline");
+  await fs.writeFile(path.join(runtime, "settings.json"), JSON.stringify({
+    activeRelayId: "original", relayProfiles: [{ id: "original", model: "original" }],
+  }));
+  const captured = await providerSnapshot(runtime, home);
+  assert.equal(captured.defaultModel, "gpt-fixture-external-before-crash");
+  assert.equal(captured.catalog.models[0].slug, captured.defaultModel);
+  await writeExternalProvider(runtime, home, "http://127.0.0.1:23456", "after-crash", fixtureCatalog);
+  assert.equal((await providerSnapshot(runtime, home)).defaultModel, "gpt-fixture-external-after-crash");
+  await assert.rejects(writeExternalProvider(runtime, home, "https://example.com", "bad", fixtureCatalog), /AssertionError/);
+  await assert.rejects(writeExternalProvider(runtime, evidence, "http://127.0.0.1:12345", "bad", fixtureCatalog), /inside/);
+  await fs.rename(runtime, path.join(evidence, "archived-test-data"));
+  console.log(`PASS synthetic external edits, catalog/default snapshots, owner rejection, and archive: ${evidence}`);
   const receipt = '{"birth":134052217980000001,"generation":42}';
   assert.equal(JSON.stringify(editableJson(receipt)), receipt);
   const never = () => new Promise(() => {});
