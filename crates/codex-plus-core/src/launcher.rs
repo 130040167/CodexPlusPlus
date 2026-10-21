@@ -2030,33 +2030,9 @@ async fn handle_helper_connection_mode(
             "helper.backend_status_ok",
         )
     } else if path == "/proxy-status" && matches!(method, "GET" | "POST" | "OPTIONS") {
-        let mut active = crate::request_log::running_requests();
-        active.sort_by_key(|entry| std::cmp::Reverse(entry.started_at_ms));
-        let requests = active
-            .into_iter()
-            .map(|entry| {
-                serde_json::json!({
-                    "id": entry.id,
-                    "model": entry.model,
-                    "threadId": entry.thread_id,
-                    "relayName": entry.relay_name,
-                    "startedAtMs": entry.started_at_ms,
-                    "attempts": entry.attempts,
-                    "autoRetries": entry.auto_retries,
-                    "retryReasons": entry.retry_reasons,
-                    "phase": entry.phase,
-                    "firstTokenMs": entry.first_token_ms,
-                    "estimatedOutputTokens": entry.estimated_output_tokens,
-                    "attemptDetails": entry.attempt_details,
-                })
-            })
-            .collect::<Vec<_>>();
         (
             "200 OK".to_string(),
-            serde_json::to_vec(&serde_json::json!({
-                "status": "ok",
-                "requests": requests
-            }))?,
+            serde_json::to_vec(&crate::request_log::running_request_status())?,
             "application/json; charset=utf-8".to_string(),
             "helper.proxy_status_ok",
         )
