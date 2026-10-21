@@ -4122,7 +4122,15 @@ export function App() {
             <GrokScreen settings={settings} form={settingsForm} actions={actions} />
           ) : null}
           {route === "claude" ? <ClaudeLocalizationScreen /> : null}
-          {route === "zcode" ? <ZcodeEnhancementScreen onVoiceInputSaved={() => void refreshSettings(true)} /> : null}
+          {route === "zcode" ? (
+            <ZcodeEnhancementScreen
+              dirty={settingsDirty}
+              form={settingsForm}
+              onFormChange={setSettingsForm}
+              onSaveSettings={() => void saveSettings()}
+              onVoiceInputSaved={() => void refreshSettings(true)}
+            />
+          ) : null}
           {route === "sessions" ? (
             <ProjectSessionPage
               sessions={localSessions}
@@ -13488,7 +13496,20 @@ function ZcodeTopbarActions() {
  * 语音开关走 `zcode_enhancement_set_voice_input`。失败响应里的 data 是空对象，直接覆盖
  * 会让下面的渲染读到不存在的字段，所以只有成功时才更新状态。
  */
-function ZcodeEnhancementScreen({ onVoiceInputSaved }: { onVoiceInputSaved?: () => void } = {}) {
+function ZcodeEnhancementScreen({
+  dirty,
+  form,
+  onFormChange,
+  onSaveSettings,
+  onVoiceInputSaved,
+}: {
+  /** 与「Codex增强 → 语音输入」共用同一份 settings；两边改的是同一个 form，保存也走同一入口。 */
+  dirty: boolean;
+  form: BackendSettings;
+  onFormChange: (value: BackendSettings) => void;
+  onSaveSettings: () => void;
+  onVoiceInputSaved?: () => void;
+}) {
   const [status, setStatus] = useState<CommandResult<ZcodeEnhancementStatus> | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -13620,8 +13641,12 @@ function ZcodeEnhancementScreen({ onVoiceInputSaved }: { onVoiceInputSaved?: () 
             <ToggleVisual />
           </label>
           <div className="enhance-save-actions">
-            <span role="status">{t("已保存")}</span>
-            <Button disabled={busy !== null} onClick={() => void act("detect")}>
+            <span className={dirty ? "is-dirty" : ""} role="status">{dirty ? t("有未保存修改") : t("已保存")}</span>
+            <Button disabled={!dirty} onClick={onSaveSettings}>
+              <Save className="h-4 w-4" />
+              {t("保存增强设置")}
+            </Button>
+            <Button disabled={busy !== null} onClick={() => void act("detect")} variant="secondary">
               <RefreshCw className={`h-4 w-4 ${busy === "detect" ? "animate-spin" : ""}`} />
               {busy === "detect" ? t("检测中…") : t("检测 ZCode")}
             </Button>
@@ -13693,12 +13718,9 @@ function ZcodeEnhancementScreen({ onVoiceInputSaved }: { onVoiceInputSaved?: () 
         </Panel>
       </div>
       <div className="enhance-tab-panel" id="zcode-pane-voice" role="tabpanel" aria-labelledby="zcode-tab-voice" hidden={activeTab !== "voice"}>
-        <Panel className="enhance-panel">
-          <CardContent className="enhance-content">
-            <div className="enhance-feature-groups zcode-enhance-voice-tab">{voiceGroup()}</div>
-            {error ? <div className="zcode-enhance-error" role="alert">{error}</div> : null}
-          </CardContent>
-        </Panel>
+        {/* 直接复用 Codex 增强页的语音输入设置面板：同一份 settings，两个页面都能改、共用保存。 */}
+        <DictationSettingsPanel form={form} onFormChange={onFormChange} />
+        {error ? <div className="zcode-enhance-error" role="alert">{error}</div> : null}
       </div>
     </div>
   );

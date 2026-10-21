@@ -69,7 +69,7 @@ function harness(componentName: "ZcodeTopbarActions" | "ZcodeEnhancementScreen")
         return typeof type === "function" ? (type as (value: Record<string, unknown>) => unknown)(merged) : { type, props: merged };
       },
     },
-    ...Object.fromEntries(["Panel", "CardContent", "Button", "Info", "RefreshCw", "Play", "Rocket", "RotateCcw"].map((name) => [name, name])),
+    ...Object.fromEntries(["Panel", "CardContent", "Button", "Info", "RefreshCw", "Play", "Rocket", "RotateCcw", "Save", "DictationSettingsPanel"].map((name) => [name, name])),
     CustomEvent,
     window: windowStub,
     document: documentStub,
@@ -97,7 +97,13 @@ function harness(componentName: "ZcodeTopbarActions" | "ZcodeEnhancementScreen")
     calls,
     dispatched,
     window: windowStub,
-    render: (props?: Record<string, unknown>) => { cursor = 0; return context.render(props) as Element; },
+    render: (props?: Record<string, unknown>) => {
+      cursor = 0;
+      const merged = componentName === "ZcodeEnhancementScreen"
+        ? { dirty: false, form: {}, onFormChange: () => {}, onSaveSettings: () => {}, ...props }
+        : props;
+      return context.render(merged) as Element;
+    },
     unmount: () => cleanups.forEach((cleanup) => cleanup?.()),
     changes: () => changes,
   };
@@ -170,7 +176,8 @@ test("进入 ZCode 页面自动检测一次，控制卡/标签页/多列功能�
   assert.match(text(page), /ZCode 运行状态/);
   assert.match(text(page), /调试端口与注入状态/);
   assert.equal(featureCards(panels[0]).length, 3);
-  assert.equal(featureCards(panels[1]).length, 1);
+  // 「语音输入」页签复用 Codex 的听写设置面板，本身不再放 feature 卡。
+  assert.equal(featureCards(panels[1]).length, 0);
   // 运行/注入数据卡。
   assert.match(text(page), /运行中（PID 26431）/);
   assert.match(text(page), /官方版本 3\.16\.2/);
@@ -182,12 +189,38 @@ test("进入 ZCode 页面自动检测一次，控制卡/标签页/多列功能�
   const voicePanels = byRole(voicePage, "tabpanel");
   assert.equal(voicePanels[0].props.hidden, true);
   assert.equal(voicePanels[1].props.hidden, false);
-  assert.equal(featureCards(voicePanels[1]).length, 1);
+  assert.equal(featureCards(voicePanels[1]).length, 0);
+  const dictationPanel = nodes(voicePanels[1]).find((node) => node.type === "DictationSettingsPanel");
+  assert.ok(dictationPanel, "语音输入页签需要复用 DictationSettingsPanel");
+  assert.equal(typeof dictationPanel.props.onFormChange, "function");
+  assert.deepEqual(dictationPanel.props.form, {});
   // 键盘左右键也能切换页签。
   const voiceTabs = byRole(voicePage, "tab");
   voiceTabs[1].props.onKeyDown({ key: "ArrowRight", preventDefault() {} });
   const wrapped = byRole(screen.render(), "tabpanel");
   assert.equal(wrapped[0].props.hidden, false);
+});
+
+test("语音输入页签复用 Codex 的听写设置面板；有未保存修改时可保存", async () => {
+  let saves = 0;
+  const screen = harness("ZcodeEnhancementScreen");
+  const saveProps = () => ({ dirty: true, onSaveSettings: () => { saves += 1; } });
+  screen.render(saveProps());
+  screen.calls[0].resolve(ready);
+  await tick();
+  const page = screen.render(saveProps());
+  assert.match(text(page), /有未保存修改/);
+  const save = buttons(page).find((button) => text(button) === "保存增强设置")!;
+  assert.equal(save.props.disabled, false);
+  save.props.onClick();
+  assert.equal(saves, 1);
+  // 切到语音页签后仍渲染共享的听写设置面板（与 Codex 增强页同一份 form）。
+  byRole(page, "tab")[1].props.onClick();
+  const voice = screen.render(saveProps());
+  const panels = byRole(voice, "tabpanel");
+  const dictationPanel = nodes(panels[1]).find((node) => node.type === "DictationSettingsPanel");
+  assert.ok(dictationPanel);
+  assert.equal(typeof dictationPanel.props.onFormChange, "function");
 });
 
 test("页面内不再重复启动/重新注入按钮，相关操作统一由顶栏负责", async () => {
@@ -211,7 +244,7 @@ test("顶部总开关和功能卡开关都调用 set_voice_input，成功后广�
   await tick();
   let page = render();
   const toggles = inputs(page);
-  assert.equal(toggles.length, 3, "顶部总开关 + 两个页签里的功能卡开关");
+  assert.equal(toggles.length, 2, "顶部总开关 + 常用增强里的麦克风入口开关");
   assert.equal(toggles.every((toggle) => toggle.props.checked), true);
   toggles[1].props.onChange({ currentTarget: { checked: false } });
   assert.equal(screen.calls.length, 2);
