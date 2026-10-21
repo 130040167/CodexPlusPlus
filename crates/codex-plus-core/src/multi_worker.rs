@@ -398,6 +398,27 @@ pub(crate) fn worker_identity_matches(
         && worker_arguments_match(arguments, options_path)
 }
 
+#[cfg(any(windows, test))]
+pub(crate) fn worker_image_matches(arguments: &[String], image: &Path) -> bool {
+    // 新管理器可以安装在另一目录；被停止进程的 argv[0] 必须仍指向其实际映像。
+    let Some(expected) = arguments.first().and_then(|arg| Path::new(arg).canonicalize().ok()) else {
+        return false;
+    };
+    image.canonicalize().ok().as_ref() == Some(&expected)
+}
+
+pub fn lock_worker_handoff(root: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    use fs2::FileExt;
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join("worker-handoff.lock"))?;
+    file.try_lock_exclusive()?;
+    Ok(file)
+}
+
 /// 判断旧 worker 是否仍可能存活；身份无法读取时保守阻止覆盖其目录。
 pub fn worker_may_be_running(
     pid: u32,
@@ -456,6 +477,29 @@ pub fn terminate_verified_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_handoff_lock_excludes_other_managers_and_releases_on_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = lock_worker_handoff(temp.path()).unwrap();
+        assert!(lock_worker_handoff(temp.path()).is_err());
+        drop(owner);
+        assert!(lock_worker_handoff(temp.path()).is_ok());
+    }
+
+    #[test]
+    fn worker_image_verification_accepts_old_install_path_but_not_another_image() {
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp.path().join("old-manager.exe");
+        let new = temp.path().join("new-manager.exe");
+        std::fs::write(&old, b"old").unwrap();
+        std::fs::write(&new, b"new").unwrap();
+        let args = vec![old.to_string_lossy().into_owned()];
+        assert!(worker_image_matches(&args, &old));
+        assert!(!worker_image_matches(&args, &new));
+        assert!(!worker_image_matches(&[], &old));
+        assert!(!worker_image_matches(&["missing".into()], &old));
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

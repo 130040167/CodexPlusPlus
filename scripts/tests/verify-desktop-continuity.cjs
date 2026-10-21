@@ -55,9 +55,12 @@ const sameProcess = (a, b) => a && b && a.ProcessId === b.ProcessId
   && a.CreationDate === b.CreationDate && a.ExecutablePath === b.ExecutablePath;
 const before = inventory();
 const protectedProcesses = before.filter(process => /^(codex-plus-plus|codex|ChatGPT|cc-switch)\.exe$/i.test(process.Name));
+const originalRenderers = protectedProcesses.filter(process =>
+  /^ChatGPT\.exe$/i.test(process.Name) && /--type=renderer(?:\s|$)/.test(process.CommandLine || ""));
 const children = [], contexts = [], desktops = [], owned = new Map(), servers = new Set(), ports = new Set();
 const report = { temporary, executable, appDir, checks: {}, events: [], managers: [], desktops: [],
-  protectedProcesses: protectedProcesses.map(identity), cleanup: false };
+  protectedProcesses: protectedProcesses.map(identity), cleanup: false,
+  protectionPolicy: "Preserve original manager/Codex/CLI identities and files; record natural renderer replacement separately." };
 const protectedFiles = new Map();
 let mode = "complete", attempts = 0, held = [];
 
@@ -162,8 +165,12 @@ async function protectOriginalFiles() {
 async function originalsIntact() {
   const current = inventory();
   const missing = protectedProcesses.filter(original => !current.some(process => sameProcess(original, process)));
-  if (missing.length) report.originalProcessChanges = missing.map(identity);
-  assert.equal(missing.length, 0, `original application process identities changed: ${missing.map(p => `${p.Name}:${p.ProcessId}`).join(", ")}`);
+  report.originalRendererChanges = missing.filter(original =>
+    originalRenderers.some(renderer => sameProcess(renderer, original))).map(identity);
+  const fixedChanges = missing.filter(original =>
+    !originalRenderers.some(renderer => sameProcess(renderer, original)));
+  if (fixedChanges.length) report.originalProcessChanges = fixedChanges.map(identity);
+  assert.equal(fixedChanges.length, 0, `original application process identities changed: ${fixedChanges.map(p => `${p.Name}:${p.ProcessId}`).join(", ")}`);
   for (const [file, original] of protectedFiles) {
     const current = await fs.readFile(file).catch(() => null);
     const unchanged = original === null ? current === null : current?.equals(original);
@@ -469,15 +476,280 @@ async function verifyLiveWorkerBlocks(context, desktop) {
   }
 }
 
+function assertWithin(root, target) {
+  const relative = path.relative(path.resolve(root), path.resolve(target));
+  assert.ok(relative && !relative.startsWith(`..${path.sep}`) && relative !== ".."
+    && !path.isAbsolute(relative), "fixture path must be inside this test runtime");
+}
+// Only reads generated fixture root strings; reject unsupported TOML rather than guessing.
+function fixtureRootString(config, key) {
+  const root = config.split(/^\s*\[/m)[0];
+  const match = root.match(new RegExp(`^\\s*${key}\\s*=\\s*("(?:[^"\\\\]|\\\\.)*"|'[^']*')\\s*$`, "m"));
+  assert.ok(match, `fixture requires a quoted root ${key}`);
+  return match[1].startsWith("'") ? match[1].slice(1, -1) : JSON.parse(match[1]);
+}
+async function providerSnapshot(state, home) {
+  const settings = JSON.parse(await fs.readFile(path.join(state, "settings.json"), "utf8"));
+  const config = await fs.readFile(path.join(home, "config.toml"), "utf8");
+  const pointer = fixtureRootString(config, "model_catalog_json");
+  const catalogPath = path.resolve(home, pointer);
+  assertWithin(home, catalogPath);
+  return {
+    activeRelayId: settings.activeRelayId,
+    profiles: settings.relayProfiles,
+    defaultModel: fixtureRootString(config, "model"),
+    catalog: JSON.parse(await fs.readFile(catalogPath, "utf8")),
+  };
+}
+async function writeExternalProvider(root, home, upstream, phase, catalogTemplate) {
+  assertWithin(root, home);
+  const url = new URL(upstream);
+  assert.equal(url.hostname, "127.0.0.1");
+  assert.equal(url.protocol, "http:");
+  const model = `gpt-fixture-external-${phase}`;
+  const catalog = structuredClone(catalogTemplate);
+  assert.ok(Array.isArray(catalog.models) && catalog.models.length > 0, "fixture needs a generated catalog");
+  catalog.models = [{ ...catalog.models[0], slug: model, display_name: model }];
+  const catalogPath = path.join(home, "external-ccswitch-catalog.json");
+  await fs.writeFile(catalogPath, JSON.stringify(catalog));
+  await fs.writeFile(path.join(home, "config.toml"),
+    `model = "${model}"\nmodel_provider = "external_fixture"\nmodel_catalog_json = ${JSON.stringify(catalogPath)}\n` +
+    'sandbox_mode = "danger-full-access"\napproval_policy = "never"\n' +
+    '[model_providers.external_fixture]\nname = "Synthetic CC Switch"\nwire_api = "responses"\n' +
+    `requires_openai_auth = false\nbase_url = "${url.origin}/v1"\n` +
+    '[windows]\nsandbox = "unelevated"\n[features]\nplugins = false\napps = false\n');
+  await fs.writeFile(path.join(home, "auth.json"), JSON.stringify({
+    OPENAI_API_KEY: `synthetic-external-${phase}`,
+  }));
+}
+function assertOriginalOwner(events, start) {
+  const requests = events.slice(start).filter(event => event.name === "supplierRequest");
+  assert.ok(requests.length > 0, "native recovery must make a real local synthetic request");
+  assert.ok(requests.every(event => event.owner === "original"), "old endpoint changed supplier owner");
+}
+
+async function verifyRecoveredProvider(desktop, state, home, baseline, label, externalRewrite = true) {
+  const settings = JSON.parse(await fs.readFile(path.join(state, "settings.json"), "utf8"));
+  assert.equal(settings.activeRelayId, baseline.activeRelayId);
+  assert.deepEqual(settings.relayProfiles, baseline.profiles, "recovery must not backfill external supplier data");
+  await until(async () => {
+    const catalog = await bounded(desktop.page.evaluate(() =>
+      window.__codexSessionDeleteBridge("/codex-model-catalog", {})));
+    return catalog.status === "ok" && catalog.model === baseline.defaultModel
+      && catalog.default_model === baseline.defaultModel
+      && JSON.stringify([...catalog.models].sort()) === JSON.stringify(baseline.catalog.models.map(model => model.slug).sort());
+  }, "runtime catalog/default changed after external rewrite");
+  // 多开默认关闭配置接管；恢复后台不能因此覆盖 CC Switch 的实时文件。
+  if (externalRewrite && !settings.relayProfilesEnabled) {
+    const disk = await providerSnapshot(state, home);
+    assert.equal(disk.defaultModel, "gpt-fixture-external-after-crash");
+  } else {
+    assert.deepEqual(await providerSnapshot(state, home), baseline);
+  }
+  await ensureClear(desktop.page);
+  const selector = '[data-model-picker-view]:not([data-model-picker-view="grid"]) [class*="_ModelList_"]';
+  const paintedIndexes = nodes => {
+    const painted = node => {
+      for (let current = node; current; current = current.parentElement) {
+        const style = getComputedStyle(current);
+        if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+      }
+      const rect = node.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+      return hit && node.contains(hit);
+    };
+    return nodes.flatMap((node, index) => painted(node) ? [index] : []);
+  };
+  const listIndex = async () => (await desktop.page.locator(selector).evaluateAll(paintedIndexes))[0] ?? -1;
+  await desktop.page.locator("[data-codex-intelligence-trigger]:visible").first().click();
+  if (await listIndex() < 0) {
+    const title = desktop.page.getByText(/^(?:5\.1 Codex|gpt-5\.1-codex)(?:\s*[›>])?$/);
+    let indexes = [];
+    await until(async () => (indexes = await title.evaluateAll(paintedIndexes)).length > 0,
+      "recovered model title did not become painted");
+    assert.equal(indexes.length, 1, "one painted recovery model title");
+    await title.nth(indexes[0]).click();
+  }
+  let index = -1;
+  await until(async () => (index = await listIndex()) >= 0, "recovered model list did not open");
+  const list = desktop.page.locator(selector).nth(index);
+  const rows = list.locator('[role="menuitemradio"]:visible:not(.codex-plus-model-default-row)');
+  await until(async () => await rows.count() === 2, "recovered model list changed");
+  const texts = await rows.allInnerTexts();
+  assert.ok(texts.some(text => /(?:5\.1 Codex|gpt-5\.1-codex)/.test(text)));
+  assert.ok(texts.some(text => /fixture[- ]secondary/i.test(text)));
+  assert.ok(texts.every(text => !text.includes("external")));
+  await ensureClear(desktop.page);
+  await bounded(desktop.page.screenshot({ path: path.join(outputDir, `${label}-models.png`) }));
+  await desktop.page.keyboard.press("Escape");
+  await until(async () => await listIndex() < 0, "recovered menu did not close");
+  await ensureClear(desktop.page);
+  await pass(`${label}SavedProviderRuntimeCatalogAndVisibleModels`, { models: texts, configuredDefault: baseline.defaultModel });
+}
+
+async function runProviderScenario(desktop) {
+  if (!process.env.DESKTOP_PROVIDER_SCENARIO) return;
+  const scenarioPath = path.resolve(process.env.DESKTOP_PROVIDER_SCENARIO);
+  const scenario = require(scenarioPath);
+  assert.equal(typeof scenario.run, "function", "provider scenario must export run(context)");
+  const companion = {
+    state: path.join(desktop.root, "worker-home", ".codex-session-delete"),
+    home: desktop.manifest.codexHome, sqlite: desktop.manifest.sqliteHome,
+    debug: await freePort(), guard: await freePort(), launcherGuard: await freePort(), port: await freePort(),
+  };
+  contexts.push(companion);
+  const evidenceDir = path.join(outputDir, "provider-scenario");
+  await fs.mkdir(evidenceDir, { recursive: true });
+  try {
+    // 先停止本次 worker，保留它的窗口；恢复管理器成为唯一桥接/代理宿主。
+    captureOwned();
+    killOwned(desktop.manifest.pid);
+    await until(() => !inventory().some(process => process.ProcessId === desktop.manifest.pid),
+      "provider worker did not stop before manager takeover");
+    await startManager(companion);
+    await assertDesktopAlive(desktop);
+    await ensureClear(desktop.page);
+    await bounded(scenario.run({
+      managerPage: companion.page, codexPage: desktop.page,
+      invoke: (command, args) => {
+        scenarioController.signal.throwIfAborted();
+        return invoke(companion, command, args);
+      },
+      paths: { runtime: temporary, state: companion.state, home: companion.home,
+        sqlite: companion.sqlite, appdata: path.join(companion.state, "appdata") },
+      dialogs: { codex: await dialogsFor(desktop.page), manager: await dialogsFor(companion.page) },
+      outputDir: evidenceDir, check: pass, signal: scenarioController.signal,
+    }), 900000, "provider scenario timed out");
+    await ensureClear(desktop.page);
+    const restored = await providerSnapshot(companion.state, companion.home);
+    assert.equal(restored.activeRelayId, "fixture", "scenario must restore original active fixture via real switch");
+    assert.equal(restored.defaultModel, "gpt-5.1-codex");
+    await pass("providerScenarioCompletedBeforeContinuityTests", { scenario: scenarioPath });
+  } catch (error) {
+    scenarioController.abort(error);
+    throw error;
+  } finally {
+    await stopManager(companion);
+    const stopped = await invoke(desktop.context, "stop_codex_multi_instance", {
+      request: { instanceId: desktop.instanceId },
+    });
+    if (stopped.status === "failed") report.events.push({
+      name: "providerDesktopStopFallbackRequired", message: stopped.message,
+    });
+    await closeDesktop(desktop);
+  }
+}
+
+async function waitForWorkerHandoff(desktop, previousPid, binary) {
+  await until(async () => {
+    captureOwned();
+    const current = JSON.parse(await fs.readFile(path.join(desktop.root, "instance.json"), "utf8"));
+    const ready = await fs.readFile(path.join(desktop.root, "worker-ready.json"), "utf8")
+      .then(JSON.parse).catch(() => null);
+    if (!ready || ready.pid === previousPid || ready.pid !== current.pid) return false;
+    const worker = inventory().find(candidate => candidate.ProcessId === ready.pid);
+    if (!worker) return false;
+    assert.equal(worker.ExecutablePath, binary, "replacement must execute the new manager binary");
+    assert.deepEqual(current.identity, desktop.id, "handoff must preserve the exact Codex process and Browser identity");
+    desktop.manifest = current;
+    return true;
+  }, "manager did not hand off the existing worker", 135000);
+  await assertDesktopAlive(desktop);
+}
+
+async function verifyStatusIsolation(active, idle, label) {
+  const status = desktop => bounded(desktop.page.evaluate(() =>
+    window.__codexSessionDeleteBridge("/proxy-status", {})));
+  await until(async () => {
+    const [own, other] = await Promise.all([status(active), status(idle)]);
+    assert.equal(own.status, "ok");
+    assert.equal(other.status, "ok");
+    assert.equal(other.requests.length, 0, "idle worker must not expose another worker's request");
+    return own.requests.length > 0;
+  }, "active worker did not expose its own request");
+  await active.page.bringToFront();
+  await ensureClear(active.page);
+  await until(async () => {
+    await active.page.evaluate(() => window.__codexPlusProxyRequestStatusRuntime.refresh());
+    return active.page.locator('#codex-plus-proxy-request-status[data-hidden="false"]').isVisible();
+  }, "request status bar was not painted");
+  await snapshot(active, `${label}-active-status`);
+  await idle.page.bringToFront();
+  await ensureClear(idle.page);
+  await idle.page.evaluate(() => window.__codexPlusProxyRequestStatusRuntime.refresh());
+  assert.equal(await idle.page.locator('#codex-plus-proxy-request-status[data-hidden="false"]').isVisible(), false);
+  await snapshot(idle, `${label}-idle-status`);
+  await pass(`${label}WorkerStatusDoesNotCrossInstances`);
+}
+
+async function runWorkerHandoffScenario(first, manager) {
+  const second = await launchDesktop(manager, `${token}-sibling`);
+  const baseline = await Promise.all([first, second].map(desktop =>
+    providerSnapshot(path.join(desktop.root, "worker-home", ".codex-session-delete"), desktop.manifest.codexHome)));
+  await pass("twoMultiInstancesReadyBeforeUpgrade");
+  for (const [index, label] of ["legacyUpgrade", "cooperativeRestart", "missingWorkerRecovery"].entries()) {
+    const oldPids = [first.manifest.pid, second.manifest.pid];
+    if (index === 2) {
+      captureOwned();
+      killOwned(oldPids[0]);
+      await until(() => !inventory().some(candidate => candidate.ProcessId === oldPids[0]), "crashed worker remained alive");
+    } else {
+      mode = "hold";
+      const heldBefore = held.length;
+      await sendPrompt(first, "Return a short synthetic response without tools.");
+      await until(() => held.length > heldBefore, "native request did not reach held local supplier");
+      await verifyStatusIsolation(first, second, label);
+    }
+    await stopManager(manager);
+    await assertDesktopAlive(first);
+    await assertDesktopAlive(second);
+    manager.executable = executable;
+    const requestStart = report.events.length;
+    mode = label;
+    await startManager(manager);
+    for (const [i, desktop] of [first, second].entries()) {
+      await waitForWorkerHandoff(desktop, oldPids[i], executable);
+      const settings = JSON.parse(await fs.readFile(
+        path.join(desktop.root, "worker-home", ".codex-session-delete", "settings.json"), "utf8"));
+      assert.equal(settings.activeRelayId, baseline[i].activeRelayId);
+      assert.deepEqual(settings.relayProfiles, baseline[i].profiles);
+      const options = JSON.parse(await fs.readFile(path.join(desktop.root, "worker-options.json"), "utf8"));
+      assert.deepEqual(options.resumeIdentity, desktop.id, "replacement must use attach-only identity");
+    }
+    if (index === 2) await sendPrompt(first, "Return a short synthetic response after recovery without tools.");
+    await first.page.getByText(`DESKTOP_RECOVERED_${label}`, { exact: true }).waitFor({ timeout: 90000 });
+    assertOriginalOwner(report.events, requestStart);
+    await pass(`${label}UsesNewWorkerWithoutRestartingCodex`);
+    if (index === 1) {
+      const requested = JSON.parse(await fs.readFile(path.join(first.root, "worker-handoff.json"), "utf8"));
+      assert.equal(requested.pid, oldPids[0], "new workers must honor cooperative shutdown");
+      await pass("cooperativeWorkerShutdownRequested");
+    }
+    await originalsIntact();
+  }
+  for (const [i, desktop] of [first, second].entries()) {
+    await verifyRecoveredProvider(desktop,
+      path.join(desktop.root, "worker-home", ".codex-session-delete"),
+      desktop.manifest.codexHome, baseline[i], `handoff-${i}`, false);
+  }
+  await pass("handoffPreservesBothSavedSuppliersAndVisibleModelMenus");
+}
+
 (async () => {
   await fs.mkdir(outputDir, { recursive: true });
   try {
     await protectOriginalFiles();
     const upstream = await supplier();
     const a = await context("manager-a", upstream), b = await context("manager-b", upstream);
+    if (process.env.DESKTOP_BASELINE_MANAGER) a.executable = path.resolve(process.env.DESKTOP_BASELINE_MANAGER);
     await startManager(a);
     const first = await launchDesktop(a);
     await originalsIntact();
+    if (process.env.DESKTOP_WORKER_HANDOFF_ONLY) {
+      await runWorkerHandoffScenario(first, a);
+      return;
+    }
     if (process.env.DESKTOP_CONTINUITY_FAULT) {
       const fault = process.env.DESKTOP_CONTINUITY_FAULT;
       assert.ok(["cdp-hang", "interrupt"].includes(fault), "unknown fault injection");
@@ -518,10 +790,10 @@ async function verifyLiveWorkerBlocks(context, desktop) {
     await sendPrompt(second, "Return a short synthetic response without tools.");
     await second.page.getByText("DESKTOP_RECOVERED_complete", { exact: true }).waitFor({ timeout: 30000 });
     await pass("secondRealDesktopCompletesSyntheticTurn");
-    const workerPid = first.manifest.pid;
+    let workerPid = first.manifest.pid;
     await stopManager(a);
     await assertDesktopAlive(first);
-    // 升级常会改变管理器安装路径；旧 worker 仍从原来的 exe 运行。
+    // 升级常会改变管理器安装路径；窗口保留，后台交给新路径的 worker。
     const updated = path.join(temporary, "updated-manager");
     await fs.mkdir(updated);
     for (const name of [path.basename(executable), "onnxruntime.dll",
@@ -530,16 +802,20 @@ async function verifyLiveWorkerBlocks(context, desktop) {
     }
     a.executable = path.join(updated, path.basename(executable));
     await startManager(a);
+    await waitForWorkerHandoff(first, workerPid, a.executable);
+    workerPid = first.manifest.pid;
     const listed = await invoke(a, "list_codex_multi_instances");
     assert.ok(listed.instances.some(instance => instance.instanceId === token && instance.running));
     await pass("managerRestartRediscoversLiveDesktop");
     await verifyLiveWorkerBlocks(a, first);
-    assert.equal(inventory().find(p => p.ProcessId === workerPid)?.ExecutablePath, executable);
-    await pass("newManagerPathPreservesOldWorker");
+    assert.equal(inventory().find(p => p.ProcessId === workerPid)?.ExecutablePath, a.executable);
+    await pass("newManagerPathReplacesWorkerAndPreservesDesktop");
     await stopManager(a, true);
     await assertDesktopAlive(first);
     await assertDesktopAlive(second);
     await startManager(a);
+    await waitForWorkerHandoff(first, workerPid, a.executable);
+    workerPid = first.manifest.pid;
     const afterCrash = await invoke(a, "list_codex_multi_instances");
     assert.ok(afterCrash.instances.some(instance => instance.instanceId === token && instance.running));
     await pass("managerCrashRestartPreservesBothDesktops");
@@ -671,7 +947,23 @@ async function verifyLiveWorkerBlocks(context, desktop) {
       report.remainingListeners = listeners.filter(listener => report.unreleasedPorts.includes(listener.LocalPort));
       report.checks.portsReleased = report.remainingListeners.length === 0;
     }
-    if (report.checks.ownedProcessesExited) {
+    const finalInventory = inventory();
+    // 原正式窗口可自然重建 renderer；必须确认其父进程仍是原身份，且不含测试目录。
+    report.originalRendererDescendants = finalInventory.filter(candidate =>
+      /^ChatGPT\.exe$/i.test(candidate.Name) && /--type=renderer(?:\s|$)/.test(candidate.CommandLine || "")
+      && !candidate.CommandLine.includes(temporary)
+      && protectedProcesses.some(parent => parent.ProcessId === candidate.ParentProcessId
+        && parent.ExecutablePath === candidate.ExecutablePath
+        && finalInventory.some(current => sameProcess(parent, current)))).map(identity);
+    report.unattributed = finalInventory.filter(candidate =>
+      /^(codex-plus-plus|codex|ChatGPT|msedgewebview2)\.exe$/i.test(candidate.Name)
+      && !before.some(prior => sameProcess(prior, candidate))
+      && !sameProcess(candidate, owned.get(candidate.ProcessId))
+      && !report.originalRendererDescendants.some(renderer => sameProcess(renderer, candidate))).map(identity);
+    report.checks.noUnattributedApplicationProcesses = report.unattributed.length === 0;
+    if (report.checks.ownedProcessesExited && report.checks.portsReleased
+      && report.checks.originalsPreserved && report.checks.noUnattributedApplicationProcesses
+      && !report.cleanupErrors?.length) {
       assert.equal(path.dirname(temporary), os.tmpdir());
       assert.equal(path.basename(temporary), token);
       try {

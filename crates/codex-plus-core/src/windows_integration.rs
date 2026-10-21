@@ -584,9 +584,7 @@ pub(crate) fn terminate_verified_multi_worker(
         return Ok(false);
     }
     let Some(image) = process_image_path_from_handle(handle) else { return Ok(false); };
-    let Ok(expected_image) = std::env::current_exe().and_then(|path| path.canonicalize())
-        else { return Ok(false); };
-    if image.canonicalize().ok().as_ref() != Some(&expected_image) { return Ok(false); }
+    if !crate::multi_worker::worker_image_matches(&arguments, &image) { return Ok(false); }
     unsafe { TerminateProcess(handle, 0) }.context("结束已验证的多开 worker 失败")?;
     Ok(true)
 }

@@ -350,6 +350,16 @@ pub struct LaunchReceipt {
 /// 与 start 相同，但只从已就绪的本进程会话返回实际端口，不读取旧状态文件猜测。
 pub fn start_with_receipt(options: LaunchOptions) -> Result<LaunchReceipt> {
     start(options)?;
+    ready_session_receipt()
+}
+
+/// 只续接已有窗口，端点或归属不匹配时直接失败，绝不回退到启动 Codex。
+pub fn resume_with_receipt(options: LaunchOptions) -> Result<LaunchReceipt> {
+    anyhow::ensure!(resume_if_running(options)?, "无法续接已有 Codex 后台服务");
+    ready_session_receipt()
+}
+
+fn ready_session_receipt() -> Result<LaunchReceipt> {
     let probe = session_probe_slot()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
