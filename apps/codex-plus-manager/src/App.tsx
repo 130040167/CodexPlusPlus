@@ -13304,7 +13304,96 @@ function ClaudeLocalizationScreen() {
   const statusText = busy === "detect" ? t("检测中…") : !s ? t("未检测") : !s.supported ? t("未检测到 Claude") : s.prepared ? (s.needsRebuild ? t("需要更新") : t("已准备")) : t("未准备");
   return (
     <div className="claude-localization-page">
-      {/* 左栏：增强项。每一项都跑在右边的受管副本上，汉化只是其中之一。 */}
+      {/* 顶部通栏：所有增强共同的前置条件。状态和操作放在第一屏，不用滚动就能点到。 */}
+      <Panel className="claude-l10n-hero">
+        <CardContent className="claude-l10n-hero-body">
+          <div className="claude-l10n-hero-head">
+            <div className="claude-l10n-hero-title">
+              <span className="claude-l10n-hero-icon"><PackageOpen className="h-5 w-5" /></span>
+              <div>
+                <strong>{t("受管增强版")}</strong>
+                <span className="claude-l10n-hero-subtitle">{t("所有增强的前置条件：官方 Claude.app 与 app.asar 保持原样，功能通过副本和启动时注入生效。")}</span>
+              </div>
+            </div>
+            <span className={`claude-l10n-status claude-l10n-status-${statusTone}`}>
+              <i aria-hidden="true" />
+              {statusText}
+            </span>
+          </div>
+          <div className="claude-l10n-stats">
+            <div className="claude-l10n-stat">
+              <span>{t("官方版本")}</span>
+              <strong title={s?.sourceVersion || undefined}>{!s ? t("未检测") : s.sourceVersion || t("未检测到")}</strong>
+            </div>
+            <div className="claude-l10n-stat">
+              <span>{t("副本版本")}</span>
+              <strong title={s?.copyVersion || undefined}>{s?.copyVersion || t("未准备")}</strong>
+            </div>
+            <div className="claude-l10n-stat">
+              <span>{t("外壳语言")}</span>
+              <strong>{s?.shellLocale || t("未设置")}</strong>
+            </div>
+            <div className="claude-l10n-stat">
+              <span>{t("官方词条")}</span>
+              <strong>{s?.catalogEntries != null ? `${s.catalogEntries.toLocaleString()} ${t("条")}` : t("未检测")}</strong>
+            </div>
+          </div>
+          {!s ? (
+            <p className="claude-l10n-hint">{t("点击“检测 Claude”读取安装状态；进入此页不会自动检测或修改应用。")}</p>
+          ) : !s.supported ? (
+            <p className="claude-l10n-hint">{t("未检测到 Claude，请先安装官方应用。你可以继续使用 Codex++ 的其他功能。")}</p>
+          ) : null}
+          {error ? <div className="claude-l10n-error" role="alert">{error}</div> : null}
+          {progress ? (
+            <div
+              aria-valuemax={100}
+              aria-valuemin={0}
+              aria-valuenow={progress.percent}
+              className="claude-l10n-progress"
+              role="progressbar"
+            >
+              <div className="claude-l10n-progress-head">
+                <span>{progress.message || t("处理中…")}</span>
+                <span className="claude-l10n-progress-pct">{progress.percent}%</span>
+              </div>
+              <div className="claude-l10n-progress-track">
+                <div
+                  className="claude-l10n-progress-fill"
+                  style={{ width: `${Math.min(100, Math.max(2, progress.percent))}%` }}
+                />
+              </div>
+            </div>
+          ) : null}
+          {/* 主操作（制作/启动）在左，检测类的次要操作收在右边，窄时整组换行而不是剩一个按钮掉下去。 */}
+          <div className="claude-l10n-actions">
+            <div className="claude-l10n-actions-primary">
+            <Button disabled={busy !== null || !s?.supported} onClick={() => void act("prepare")}>
+              <PackageOpen className="h-4 w-4" />
+              {busy === "prepare"
+                ? t("制作中…")
+                : s?.needsRebuild
+                  ? t("更新副本")
+                  : s?.prepared
+                    ? t("重新制作增强版")
+                    : t("制作增强版")}
+            </Button>
+            <Button disabled={busy !== null || !canLaunch} onClick={() => void act("launch")}>
+              <Play className="h-4 w-4" />{busy === "launch" ? t("启动中…") : t("启动增强版")}
+            </Button>
+            </div>
+            <div className="claude-l10n-actions-secondary">
+              <Button disabled={busy !== null} onClick={() => void refresh()} variant="secondary">
+                <RefreshCw className={`h-4 w-4 ${busy === "detect" ? "animate-spin" : ""}`} />
+                {busy === "detect" ? t("检测中…") : t("检测 Claude")}
+              </Button>
+              <Button disabled={busy !== null || !s?.prepared} onClick={() => void act("check")} variant="secondary">
+                <ShieldCheck className="h-4 w-4" />{t("检查增强版")}
+              </Button>
+            </div>
+          </div>
+        </CardContent>
+      </Panel>
+      {/* 左栏：增强项。每一项都跑在上方的受管副本上，汉化只是其中之一。 */}
       <div className="claude-l10n-column">
         <Panel>
           <CardHead
@@ -13347,132 +13436,55 @@ function ClaudeLocalizationScreen() {
               />
               <span>
                 <strong>{t("Computer Use")}</strong>
-                <small>{t("解锁桌面控制：订阅与灰度校验已解除，API Key（3p）模式同样可用；会改写副本的 app.asar 并关闭 Electron 的 asar 完整性校验，原件不动。首次使用要在系统里授权辅助功能与屏幕录制。")}</small>
+                <small>{t("解锁桌面控制：订阅与灰度校验已解除，API Key（3p）模式同样可用；会改写副本的 app.asar 并关闭 Electron 的 asar 完整性校验，原件不动。首次启动增强版会提示授权辅助功能与屏幕录制。")}</small>
               </span>
               <ToggleVisual />
             </label>
             {s?.supported && !s.prepared ? (
               <p className="claude-l10n-hint">
-                {t("增强版还没制作：开关会先存下来，等你在右边制作好增强版并启动后生效。")}
+                {t("增强版还没制作：开关会先存下来，等你在上方制作好增强版并启动后生效。")}
               </p>
             ) : null}
           </CardContent>
         </Panel>
       </div>
-      {/* 右栏：所有增强共同的前置条件。 */}
+      {/* 右栏：上手步骤与说明。 */}
       <div className="claude-l10n-column">
-      <Panel className="claude-l10n-hero">
-        <CardContent>
-          <div className="claude-l10n-hero-head">
-            <div className="claude-l10n-hero-title">
-              <span className="claude-l10n-hero-icon"><PackageOpen className="h-5 w-5" /></span>
-              <div>
-                <strong>{t("受管增强版")}</strong>
-                <span className="claude-l10n-hero-subtitle">{t("所有增强的前置条件：官方 Claude.app 与 app.asar 保持原样，功能通过副本和启动时注入生效。")}</span>
+        <Panel className="claude-l10n-guide">
+          <CardHead
+            title={t("上手步骤")}
+            detail={t("增强只在副本里生效，官方版和登录态不受影响。")}
+          />
+          <CardContent className="claude-l10n-guide-body">
+            <div className="claude-l10n-steps" role="list">
+              <div className="claude-l10n-step" data-done={s?.prepared ? "true" : "false"} role="listitem">
+                <span className="claude-l10n-step-no" aria-hidden="true">{s?.prepared ? "✓" : "1"}</span>
+                <div className="claude-l10n-step-body">
+                  <strong>{t("制作增强版")}</strong>
+                  <small>{t("用上方的按钮制作增强版；官方 Claude.app 与 app.asar 保持原样。")}</small>
+                </div>
+              </div>
+              <div className="claude-l10n-step" data-done={s?.running ? "true" : "false"} role="listitem">
+                <span className="claude-l10n-step-no" aria-hidden="true">{s?.running ? "✓" : "2"}</span>
+                <div className="claude-l10n-step-body">
+                  <strong>{t("启动增强版")}</strong>
+                  <small>{t("从 Codex++ 启动副本，增强在启动时注入。")}</small>
+                </div>
+              </div>
+              <div className="claude-l10n-step" role="listitem">
+                <span className="claude-l10n-step-no" aria-hidden="true">3</span>
+                <div className="claude-l10n-step-body">
+                  <strong>{t("在左边开启需要的增强")}</strong>
+                  <small>{t("界面汉化、语音输入与 Computer Use 各自独立，改动在重启副本后应用。")}</small>
+                </div>
               </div>
             </div>
-            <span className={`claude-l10n-status claude-l10n-status-${statusTone}`}>
-              <i aria-hidden="true" />
-              {statusText}
-            </span>
-          </div>
-          <div className="claude-l10n-steps" role="list">
-            <div className="claude-l10n-step" data-done={s?.prepared ? "true" : "false"} role="listitem">
-              <span className="claude-l10n-step-no" aria-hidden="true">{s?.prepared ? "✓" : "1"}</span>
-              <div className="claude-l10n-step-body">
-                <strong>{t("制作增强版")}</strong>
-                <small>{t("用下面的按钮制作增强版；官方 Claude.app 与 app.asar 保持原样。")}</small>
-              </div>
+            <div className="claude-l10n-note" role="note">
+              <Info className="h-4 w-4" />
+              <span>{t("首次制作会创建独立副本并执行完整性校验；官方应用、登录态和 app.asar 不会被改写。macOS 可能需要钥匙串授权，Windows 会使用独立副本启动。")}</span>
             </div>
-            <div className="claude-l10n-step" data-done={s?.running ? "true" : "false"} role="listitem">
-              <span className="claude-l10n-step-no" aria-hidden="true">{s?.running ? "✓" : "2"}</span>
-              <div className="claude-l10n-step-body">
-                <strong>{t("启动增强版")}</strong>
-                <small>{t("增强只在副本里生效，官方版和登录态不受影响。")}</small>
-              </div>
-            </div>
-            <div className="claude-l10n-step" role="listitem">
-              <span className="claude-l10n-step-no" aria-hidden="true">3</span>
-              <div className="claude-l10n-step-body">
-                <strong>{t("在左边开启需要的增强")}</strong>
-                <small>{t("界面汉化与语音输入各自独立，改动在重启副本后应用。")}</small>
-              </div>
-            </div>
-          </div>
-          <div className="claude-l10n-stats">
-            <div className="claude-l10n-stat">
-              <span>{t("官方版本")}</span>
-              <strong title={s?.sourceVersion || undefined}>{!s ? t("未检测") : s.sourceVersion || t("未检测到")}</strong>
-            </div>
-            <div className="claude-l10n-stat">
-              <span>{t("副本版本")}</span>
-              <strong title={s?.copyVersion || undefined}>{s?.copyVersion || t("未准备")}</strong>
-            </div>
-            <div className="claude-l10n-stat">
-              <span>{t("外壳语言")}</span>
-              <strong>{s?.shellLocale || t("未设置")}</strong>
-            </div>
-            <div className="claude-l10n-stat">
-              <span>{t("官方词条")}</span>
-              <strong>{s?.catalogEntries != null ? `${s.catalogEntries.toLocaleString()} ${t("条")}` : t("未检测")}</strong>
-            </div>
-          </div>
-          <div className="claude-l10n-note" role="note">
-            <Info className="h-4 w-4" />
-            <span>{t("首次制作会创建独立副本并执行完整性校验；官方应用、登录态和 app.asar 不会被改写。macOS 可能需要钥匙串授权，Windows 会使用独立副本启动。")}</span>
-          </div>
-          {!s ? (
-            <p className="claude-l10n-hint">{t("点击“检测 Claude”读取安装状态；进入此页不会自动检测或修改应用。")}</p>
-          ) : !s.supported ? (
-            <p className="claude-l10n-hint">{t("未检测到 Claude，请先安装官方应用。你可以继续使用 Codex++ 的其他功能。")}</p>
-          ) : null}
-          {error ? <div className="inline-error">{error}</div> : null}
-          {progress ? (
-            <div
-              aria-valuemax={100}
-              aria-valuemin={0}
-              aria-valuenow={progress.percent}
-              className="claude-l10n-progress"
-              role="progressbar"
-            >
-              <div className="claude-l10n-progress-head">
-                <span>{progress.message || t("处理中…")}</span>
-                <span className="claude-l10n-progress-pct">{progress.percent}%</span>
-              </div>
-              <div className="claude-l10n-progress-track">
-                <div
-                  className="claude-l10n-progress-fill"
-                  style={{ width: `${Math.min(100, Math.max(2, progress.percent))}%` }}
-                />
-              </div>
-            </div>
-          ) : null}
-          <div className="claude-l10n-actions">
-            <Button disabled={busy !== null} onClick={() => void refresh()} variant="secondary">
-              <RefreshCw className={`h-4 w-4 ${busy === "detect" ? "animate-spin" : ""}`} />
-              {busy === "detect" ? t("检测中…") : t("检测 Claude")}
-            </Button>
-            <Button disabled={busy !== null || !s?.supported} onClick={() => void act("prepare")}>
-              <PackageOpen className="h-4 w-4" />
-              {busy === "prepare"
-                ? t("制作中…")
-                : s?.needsRebuild
-                  ? t("更新副本")
-                  : s?.prepared
-                    ? t("重新制作增强版")
-                    : t("制作增强版")}
-            </Button>
-            <Button disabled={busy !== null || !canLaunch} onClick={() => void act("launch")}>
-              <Play className="h-4 w-4" />{busy === "launch" ? t("启动中…") : t("启动增强版")}
-            </Button>
-            <div className="claude-l10n-actions-secondary">
-              <Button disabled={busy !== null || !s?.prepared} onClick={() => void act("check")} variant="secondary">
-                <RefreshCw className="h-4 w-4" />{t("检查增强版")}
-              </Button>
-            </div>
-          </div>
-        </CardContent>
-      </Panel>
+          </CardContent>
+        </Panel>
       </div>
     </div>
   );
