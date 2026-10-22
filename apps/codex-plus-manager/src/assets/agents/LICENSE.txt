@@ -6,9 +6,6 @@ Grok: https://raw.githubusercontent.com/lobehub/lobe-icons/master/packages/stati
 Retrieved: 2026-10-08
 Brand trademarks belong to their respective owners.
 
-ZCode: src/assets/agents/zcode.svg — 自绘极简 Z 形标识（非官方商标文件，未拷贝官方素材）。
-Copyright (c) 2026 CodexPlusPlus contributors. Licensed AGPL-3.0-only, same as this repository.
-
 MIT License
 
 Copyright (c) 2023 LobeHub

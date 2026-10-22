@@ -50,7 +50,6 @@ import {
   Palette,
   Play,
   MessageCircle,
-  Mic,
   MoreHorizontal,
   PackageOpen,
   FileCode2,
@@ -410,8 +409,6 @@ type BackendSettings = WhaleBalanceSettings & {
   tools?: Record<string, ToolShard>;
   /** 侧栏当前聚焦的工具。只影响管理器的展示，不影响 Codex 的启动配置。 */
   activeTool?: string;
-  /** ZCode 增强的语音输入开关；由 `zcode_enhancement_set_voice_input` 写入，读设置时回填。 */
-  zcodeAppVoiceInput: boolean;
 };
 
 /** settings.json 里单个工具的配置分片。Codex 分片由后端从扁平字段镜像生成。 */
@@ -1153,10 +1150,9 @@ const TOOL_ICONS: Record<string, string> = {
   codex: new URL("./assets/agents/chatgpt.svg", import.meta.url).href,
   grok: new URL("./assets/agents/grok.svg", import.meta.url).href,
   claude: new URL("./assets/agents/claude.svg", import.meta.url).href,
-  zcode: new URL("./assets/agents/zcode.svg", import.meta.url).href,
 };
 
-type Route = "overview" | "relay" | "multiLaunch" | "grok" | "claude" | "zcode" | "relayEnvironment" | "requestLog" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "maintenance" | "about" | "settings";
+type Route = "overview" | "relay" | "multiLaunch" | "grok" | "claude" | "relayEnvironment" | "requestLog" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "maintenance" | "about" | "settings";
 type Theme = "dark" | "light";
 
 const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
@@ -1177,7 +1173,6 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "multiLaunch", get label() { return t("Codex多开"); }, icon: Layers3, tool: "codex" },
   { id: "grok", get label() { return t("Grok 配置"); }, icon: Blocks, tool: "grok" },
   { id: "claude", get label() { return t("Claude 增强"); }, icon: Languages, tool: "claude" },
-  { id: "zcode", get label() { return t("ZCode 增强"); }, icon: Mic, tool: "zcode" },
   { id: "sessions", get label() { return t("会话管理"); }, icon: MessageCircle, tool: "codex" },
   { id: "context", label: "MCP", icon: Network, tool: "codex" },
   { id: "skills", label: "Skills", icon: BookOpen, tool: "codex" },
@@ -1201,7 +1196,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
 const navigationSections: Array<{ label: string; routes: Route[]; placement?: "bottom" }> = [
   {
     get label() { return t("工作区"); },
-    routes: ["overview", "relay", "relayEnvironment", "requestLog", "multiLaunch", "grok", "claude", "zcode"],
+    routes: ["overview", "relay", "relayEnvironment", "requestLog", "multiLaunch", "grok", "claude"],
   },
   {
     get label() { return t("全局管理"); },
@@ -1342,7 +1337,6 @@ const defaultSettings: BackendSettings = {
   relayTestModel: "gpt-5.4-mini",
   tools: {},
   activeTool: "codex",
-  zcodeAppVoiceInput: true,
 };
 
 export function App() {
@@ -1506,8 +1500,6 @@ export function App() {
     const currentRoute = routes.find((candidate) => candidate.id === route);
     if (toolId === "claude") {
       setRoute("claude");
-    } else if (toolId === "zcode") {
-      setRoute("zcode");
     } else if (currentRoute?.tool && currentRoute.tool !== toolId) {
       setRoute(toolId === "grok" ? "grok" : "relay");
     }
@@ -4079,7 +4071,6 @@ export function App() {
                 </Button>
               </>
             ) : null}
-            {route === "zcode" && activeTool === "zcode" ? <ZcodeTopbarActions /> : null}
           </div>
         </header>
         <section
@@ -4125,15 +4116,6 @@ export function App() {
             <GrokScreen settings={settings} form={settingsForm} actions={actions} />
           ) : null}
           {route === "claude" ? <ClaudeLocalizationScreen /> : null}
-          {route === "zcode" ? (
-            <ZcodeEnhancementScreen
-              dirty={settingsDirty}
-              form={settingsForm}
-              onFormChange={setSettingsForm}
-              onSaveSettings={() => void saveSettings()}
-              onVoiceInputSaved={() => void refreshSettings(true)}
-            />
-          ) : null}
           {route === "sessions" ? (
             <ProjectSessionPage
               sessions={localSessions}
@@ -13435,360 +13417,6 @@ function ClaudeLocalizationScreen() {
   );
 }
 
-type ZcodeEnhancementStatus = {
-  supported: boolean;
-  appPath: string;
-  sourceVersion: string;
-  running: boolean;
-  pid: number | null;
-  debugPort: number | null;
-  injected: boolean;
-  voiceInput: boolean;
-  voiceServerReady: boolean;
-  needsRestart: boolean;
-  dictationEnabled: boolean;
-};
-
-/** 页面/顶栏任何写操作成功后广播，让另一处刷新状态，保证两处口径一致。 */
-const ZCODE_STATUS_EVENT = "codexplus-zcode-status-changed";
-
-type ZcodeStatusEventDetail = { source?: "page" | "topbar" };
-
-/**
- * ZCode 顶栏操作区：等价于 Codex 页的「Codex 运行中 + 重启 Codex」。
- *
- * 状态进入时探测一次、每 5 秒轮询、窗口重新聚焦时刷新；页面写操作后会广播
- * `ZCODE_STATUS_EVENT`，这里收到后立即刷新。主按钮按状态取最合理的动作：
- * 已注入 → 重启（launch）、运行但没调试端口 → 启动并注入、运行有端口但未注入 →
- * 重新注入、未运行 → 启动。点击后同样广播事件让页面同步。
- */
-function ZcodeTopbarActions() {
-  const [status, setStatus] = useState<CommandResult<ZcodeEnhancementStatus> | null>(null);
-  const [busy, setBusy] = useState(false);
-  const mounted = useRef(true);
-  const pending = useRef(false);
-  const accept = (result: CommandResult<ZcodeEnhancementStatus>) => {
-    if (mounted.current && result.status === "ok") setStatus(result);
-  };
-  const refresh = async () => {
-    if (pending.current) return;
-    pending.current = true;
-    try { accept(await invoke<CommandResult<ZcodeEnhancementStatus>>("zcode_enhancement_status")); }
-    catch { /* 顶栏静默失败；完整错误提示在页面里 */ }
-    finally { pending.current = false; }
-  };
-  const act = async (action: "launch" | "reinject") => {
-    if (pending.current || busy) return;
-    pending.current = true;
-    if (mounted.current) setBusy(true);
-    try {
-      const result = await invoke<CommandResult<ZcodeEnhancementStatus>>("zcode_enhancement_action", { action });
-      accept(result);
-      if (result.status === "ok" && mounted.current) {
-        window.dispatchEvent(new CustomEvent<ZcodeStatusEventDetail>(ZCODE_STATUS_EVENT, { detail: { source: "topbar" } }));
-      }
-    } catch { /* 同上 */ }
-    finally {
-      pending.current = false;
-      if (mounted.current) setBusy(false);
-    }
-  };
-  useEffect(() => {
-    mounted.current = true;
-    void refresh();
-    const timer = window.setInterval(() => { if (!document.hidden) void refresh(); }, 5000);
-    const onFocus = () => void refresh();
-    const onChanged = (event: Event) => {
-      if ((event as CustomEvent<ZcodeStatusEventDetail>).detail?.source !== "topbar") void refresh();
-    };
-    window.addEventListener("focus", onFocus);
-    window.addEventListener(ZCODE_STATUS_EVENT, onChanged);
-    return () => {
-      mounted.current = false;
-      window.clearInterval(timer);
-      window.removeEventListener("focus", onFocus);
-      window.removeEventListener(ZCODE_STATUS_EVENT, onChanged);
-    };
-  }, []);
-  const s = status;
-  const statusTone = !s ? "pending" : !s.supported ? "idle" : s.needsRestart ? "warn" : s.injected ? "ok" : "warn";
-  const statusText = !s
-    ? t("ZCode 检测中")
-    : !s.supported
-      ? t("ZCode 未安装")
-      : s.needsRestart
-        ? t("ZCode 需要重启")
-        : s.injected
-          ? t("ZCode 已注入")
-          : s.running
-            ? t("ZCode 运行中")
-            : t("ZCode 未启动");
-  const primary = !s || !s.supported
-    ? null
-    : s.injected
-      ? { action: "launch" as const, label: t("重启 ZCode"), Icon: Rocket }
-      : s.running && s.debugPort != null
-        ? { action: "reinject" as const, label: t("重新注入"), Icon: RotateCcw }
-        : { action: "launch" as const, label: s.running ? t("启动并注入") : t("启动 ZCode"), Icon: Rocket };
-  const PrimaryIcon = primary?.Icon;
-  return (
-    <>
-      <span
-        aria-live="polite"
-        className={`zcode-enhance-status zcode-enhance-status-${statusTone} zcode-enhance-topbar-status`}
-        role="status"
-      >
-        <i aria-hidden="true" />
-        {statusText}
-      </span>
-      {primary && PrimaryIcon ? (
-        <Button disabled={busy} onClick={() => void act(primary.action)} title={primary.label}>
-          <PrimaryIcon className="h-4 w-4" />
-          {busy ? t("处理中…") : primary.label}
-        </Button>
-      ) : null}
-    </>
-  );
-}
-
-/**
- * ZCode 增强页：结构与「Codex增强」页一致——顶部控制卡（总开关 + 已保存 + 检测按钮 +
- * 标签页），内容是横向组标题 + 多列功能卡网格。
- *
- * 行为不变：进入页面自动检测一次；检测/启动注入/重新注入走 `zcode_enhancement_action`，
- * 语音开关走 `zcode_enhancement_set_voice_input`。失败响应里的 data 是空对象，直接覆盖
- * 会让下面的渲染读到不存在的字段，所以只有成功时才更新状态。
- */
-function ZcodeEnhancementScreen({
-  dirty,
-  form,
-  onFormChange,
-  onSaveSettings,
-  onVoiceInputSaved,
-}: {
-  /** 与「Codex增强 → 语音输入」共用同一份 settings；两边改的是同一个 form，保存也走同一入口。 */
-  dirty: boolean;
-  form: BackendSettings;
-  onFormChange: (value: BackendSettings) => void;
-  onSaveSettings: () => void;
-  onVoiceInputSaved?: () => void;
-}) {
-  const [status, setStatus] = useState<CommandResult<ZcodeEnhancementStatus> | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<"general" | "voice">("general");
-  const mounted = useRef(true);
-  const pending = useRef(false);
-  const accept = (result: CommandResult<ZcodeEnhancementStatus>, broadcast = false) => {
-    if (!mounted.current) return;
-    if (result.status === "ok") {
-      setStatus(result);
-      if (broadcast) {
-        window.dispatchEvent(new CustomEvent<ZcodeStatusEventDetail>(ZCODE_STATUS_EVENT, { detail: { source: "page" } }));
-      }
-    } else setError(result.message);
-  };
-  const load = async (silent = false) => {
-    if (pending.current) return;
-    pending.current = true;
-    if (!silent) { setBusy("status"); setError(null); }
-    try { accept(await invoke<CommandResult<ZcodeEnhancementStatus>>("zcode_enhancement_status")); }
-    catch (cause) { if (!silent && mounted.current) setError(stringifyError(cause)); }
-    finally {
-      pending.current = false;
-      if (!silent && mounted.current) setBusy(null);
-    }
-  };
-  const act = async (action: "detect" | "launch" | "reinject") => {
-    if (pending.current) return;
-    pending.current = true;
-    setBusy(action); setError(null);
-    try {
-      accept(await invoke<CommandResult<ZcodeEnhancementStatus>>("zcode_enhancement_action", { action }), true);
-    } catch (cause) { if (mounted.current) setError(stringifyError(cause)); }
-    finally {
-      pending.current = false;
-      if (mounted.current) setBusy(null);
-    }
-  };
-  const toggleVoiceInput = async (enabled: boolean) => {
-    if (pending.current) return;
-    pending.current = true;
-    setBusy("voiceInput"); setError(null);
-    try {
-      const result = await invoke<CommandResult<ZcodeEnhancementStatus>>(
-        "zcode_enhancement_set_voice_input",
-        { enabled },
-      );
-      accept(result, true);
-      // 开关由命令直接写 settings.json：成功后同步父级表单，
-      // 否则下次别处保存设置会拿旧值把它改回去。
-      if (result.status === "ok" && mounted.current) onVoiceInputSaved?.();
-    } catch (cause) { if (mounted.current) setError(stringifyError(cause)); }
-    finally {
-      pending.current = false;
-      if (mounted.current) setBusy(null);
-    }
-  };
-  // 首次进入自动检测一次；卸载后迟到的结果由 accept 里的 mounted 判断拦掉。
-  useEffect(() => {
-    mounted.current = true;
-    void load();
-    return () => { mounted.current = false; };
-  }, []);
-  // 顶栏做完写操作会广播事件；这里静默刷新，避免按钮状态和页面数据各说各话。
-  useEffect(() => {
-    const onChanged = (event: Event) => {
-      if ((event as CustomEvent<ZcodeStatusEventDetail>).detail?.source !== "page") void load(true);
-    };
-    window.addEventListener(ZCODE_STATUS_EVENT, onChanged);
-    return () => window.removeEventListener(ZCODE_STATUS_EVENT, onChanged);
-  }, []);
-  const s = status;
-  // 顶部总开关和「语音输入」组里的开关都控制同一份设置，共用状态与禁用条件。
-  const voiceToggleDisabled = busy !== null || !s?.supported;
-  const tabs: Array<{ value: "general" | "voice"; label: string }> = [
-    { value: "general", label: t("常用增强") },
-    { value: "voice", label: t("语音输入") },
-  ];
-  const selectTab = (tab: "general" | "voice") => setActiveTab(tab);
-  const versionText = !s ? t("尚未检测") : s.sourceVersion ? tf("官方版本 {0}", [s.sourceVersion]) : t("官方版本未检测到");
-  const runningText = !s ? t("未检测") : s.running ? tf("运行中（PID {0}）", [s.pid ?? t("未知")]) : t("未启动");
-  const portText = s?.debugPort != null ? String(s.debugPort) : t("未启用");
-  const injectText = !s ? t("未检测") : s.injected ? t("已注入") : t("未注入");
-  const portTone = !s ? "" : s.needsRestart ? "is-warn" : s.injected ? "is-ok" : "";
-  // 每组只留最要紧的一条提示，避免多行提示堆叠。
-  const statusHint = !s
-    ? busy !== null
-      ? t("正在检测 ZCode 安装状态…")
-      : t("还没读到 ZCode 状态，点“检测 ZCode”重试。")
-    : !s.supported
-      ? t("未检测到官方 ZCode 应用，请先安装后再回来。你可以继续使用 Codex++ 的其他功能。")
-      : s.needsRestart
-        ? t("ZCode 正在运行的是注入前的进程，点“启动并注入”重启后增强才会生效。")
-        : null;
-  const voiceHint = !s?.supported
-    ? null
-    : !s.dictationEnabled
-      ? t("Codex++ 的语音输入总开关当前是关闭的：请先到「Codex增强 → 语音输入」开启，麦克风才会工作。")
-      : s.voiceInput && !s.voiceServerReady
-        ? t("识别服务还没就绪，首次启用后需要几秒准备时间。")
-        : null;
-  const voiceGroup = () => (
-    <FeatureGroup title={t("语音输入")} detail={t("录音和识别由 Codex++ 负责，结果只写进 ZCode 输入框，不会自动发送。")}>
-      <FeatureToggle
-        title={t("在 ZCode 输入框显示麦克风入口")}
-        detail={t("首次使用会请求系统麦克风权限；识别服务沿用「Codex增强 → 语音输入」的 ASR 配置，结果只写进输入框、不自动发送。")}
-        checked={Boolean(s?.voiceInput)}
-        disabled={voiceToggleDisabled}
-        onChange={(value) => void toggleVoiceInput(value)}
-      />
-      {voiceHint ? <p className="field-hint">{voiceHint}</p> : null}
-    </FeatureGroup>
-  );
-  return (
-    <div className="settings-page enhance-page zcode-enhance-page">
-      <div className="enhance-page-controls" id="zcode-enhance-page-controls">
-        <div className="enhance-page-toolbar">
-          <label className="switch-row compact enhance-master-switch">
-            <input
-              checked={Boolean(s?.voiceInput)}
-              disabled={voiceToggleDisabled}
-              onChange={(event) => void toggleVoiceInput(event.currentTarget.checked)}
-              type="checkbox"
-            />
-            <span>
-              <strong>{t("启用 ZCode 增强")}</strong>
-              <small>{t("关闭后不再注入麦克风入口；已注入的页面在 ZCode 重启或页面重载后恢复原样。")}</small>
-            </span>
-            <ToggleVisual />
-          </label>
-          <div className="enhance-save-actions">
-            <span className={dirty ? "is-dirty" : ""} role="status">{dirty ? t("有未保存修改") : t("已保存")}</span>
-            <Button disabled={!dirty} onClick={onSaveSettings}>
-              <Save className="h-4 w-4" />
-              {t("保存增强设置")}
-            </Button>
-            <Button disabled={busy !== null} onClick={() => void act("detect")} variant="secondary">
-              <RefreshCw className={`h-4 w-4 ${busy === "detect" ? "animate-spin" : ""}`} />
-              {busy === "detect" ? t("检测中…") : t("检测 ZCode")}
-            </Button>
-          </div>
-        </div>
-        <div className="enhance-tabs" role="tablist" aria-label={t("ZCode 增强")}>
-          {tabs.map((tab, index) => (
-            <button
-              key={tab.value}
-              id={`zcode-tab-${tab.value}`}
-              type="button"
-              role="tab"
-              aria-selected={activeTab === tab.value}
-              aria-controls={`zcode-pane-${tab.value}`}
-              tabIndex={activeTab === tab.value ? 0 : -1}
-              onClick={() => selectTab(tab.value)}
-              onKeyDown={(event) => {
-                const nextIndex = event.key === "ArrowRight" ? (index + 1) % tabs.length
-                  : event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length
-                    : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : null;
-                if (nextIndex === null) return;
-                event.preventDefault();
-                const nextTab = tabs[nextIndex].value;
-                selectTab(nextTab);
-                document.getElementById(`zcode-tab-${nextTab}`)?.focus();
-              }}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
-      </div>
-      <div className="enhance-tab-panel" id="zcode-pane-general" role="tabpanel" aria-labelledby="zcode-tab-general" hidden={activeTab !== "general"}>
-        <Panel className="enhance-panel">
-          <CardContent className="enhance-content">
-            <div className="enhance-feature-groups">
-              <FeatureGroup title={t("启动与注入")} detail={t("官方 ZCode.app 保持原样：带调试端口启动后运行时注入增强脚本。")}>
-                <div className="feature-toggle">
-                  <span>
-                    <strong>{t("ZCode 运行状态")}</strong>
-                    <small>{t("读取官方 ZCode.app 的安装与运行状态。")}</small>
-                  </span>
-                  <span className={`zcode-enhance-card-side ${s?.running ? "is-ok" : ""}`}>
-                    <strong>{runningText}</strong>
-                    <small>{versionText}</small>
-                  </span>
-                </div>
-                <div className="feature-toggle">
-                  <span>
-                    <strong>{t("调试端口与注入状态")}</strong>
-                    <small>{t("带调试端口启动后，页面脚本才会被注入；重启或更新 ZCode 后需要重新注入。")}</small>
-                  </span>
-                  <span className={`zcode-enhance-card-side ${portTone}`}>
-                    <strong>{portText}</strong>
-                    <small>{injectText}</small>
-                  </span>
-                </div>
-                {statusHint ? (
-                  <div className="hint-line">
-                    <Info className="h-4 w-4" />
-                    <span>{statusHint}</span>
-                  </div>
-                ) : null}
-              </FeatureGroup>
-              {voiceGroup()}
-            </div>
-            {error ? <div className="zcode-enhance-error" role="alert">{error}</div> : null}
-          </CardContent>
-        </Panel>
-      </div>
-      <div className="enhance-tab-panel" id="zcode-pane-voice" role="tabpanel" aria-labelledby="zcode-tab-voice" hidden={activeTab !== "voice"}>
-        {/* 直接复用 Codex 增强页的语音输入设置面板：同一份 settings，两个页面都能改、共用保存。 */}
-        <DictationSettingsPanel form={form} onFormChange={onFormChange} />
-        {error ? <div className="zcode-enhance-error" role="alert">{error}</div> : null}
-      </div>
-    </div>
-  );
-}
-
 function CardHead({ title, detail }: { title: string; detail: string }) {
   return (
     <CardHeader className="panel-head">
@@ -14522,7 +14150,6 @@ function routeSubtitle(route: Route) {
     multiLaunch: t("为不同供应商启动相互隔离的 Codex 实例"),
     grok: t("管理 Grok CLI 的模型与 API 端点"),
     claude: t("保留官方 Claude.app 原样，通过受管副本为 Claude 应用增强功能"),
-    zcode: t("保留官方 ZCode.app 原样，通过调试端口启动与运行时注入提供增强"),
     relayEnvironment: t("统一管理本地协议代理、供应商代理与重试策略"),
     requestLog: t("查看代理请求的状态、模型、重试、token 用量与缓存命中"),
     sessions: t("查看、删除和修复 Codex 本地会话"),
