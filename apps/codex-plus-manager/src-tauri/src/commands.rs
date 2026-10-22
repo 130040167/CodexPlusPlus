@@ -74,9 +74,18 @@ pub async fn claude_localization_status() -> CommandResult<Value> {
 }
 
 #[tauri::command]
-pub async fn claude_localization_action(action: String) -> CommandResult<Value> {
+pub async fn claude_localization_action(
+    app: tauri::AppHandle,
+    action: String,
+) -> CommandResult<Value> {
+    use tauri::Emitter;
     let result = tauri::async_runtime::spawn_blocking(move || {
-        codex_plus_core::claude_localization::perform(&action)
+        codex_plus_core::claude_localization::perform_with_progress(&action, &move |percent, message| {
+            let _ = app.emit(
+                "claude-localization-progress",
+                json!({ "percent": percent, "message": message }),
+            );
+        })
     })
     .await;
     match result {
@@ -110,6 +119,24 @@ pub async fn claude_localization_set_localization(enabled: bool) -> CommandResul
     }).await {
         Ok(Ok(status)) => ok(
             if enabled { "界面汉化已开启。" } else { "界面汉化已关闭。" },
+            serde_json::to_value(status).unwrap_or_else(|_| json!({})),
+        ),
+        Ok(Err(error)) => failed(&error.to_string(), json!({})),
+        Err(error) => failed(&format!("Claude 设置失败：{error}"), json!({})),
+    }
+}
+
+#[tauri::command]
+pub async fn claude_localization_set_computer_use(enabled: bool) -> CommandResult<Value> {
+    match tauri::async_runtime::spawn_blocking(move || {
+        codex_plus_core::claude_localization::set_computer_use(enabled)
+    }).await {
+        Ok(Ok(status)) => ok(
+            if enabled {
+                "Computer Use 已勾选；重新准备副本后生效。"
+            } else {
+                "Computer Use 已关闭；重新准备副本后移除。"
+            },
             serde_json::to_value(status).unwrap_or_else(|_| json!({})),
         ),
         Ok(Err(error)) => failed(&error.to_string(), json!({})),

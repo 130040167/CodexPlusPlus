@@ -10617,6 +10617,11 @@ select {
 }
 .claude-l10n-note svg { flex: none; margin-top: 2px; color: hsl(var(--brand-accent)); }
 
+.claude-l10n-progress { display: grid; gap: 8px; margin-top: 16px; }
+.claude-l10n-progress-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; color: hsl(var(--muted-foreground)); font-size: 12.5px; }
+.claude-l10n-progress-pct { font-variant-numeric: tabular-nums; color: hsl(var(--brand-accent)); font-weight: 600; }
+.claude-l10n-progress-track { height: 6px; border-radius: 999px; background: hsl(var(--border)); overflow: hidden; }
+.claude-l10n-progress-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, hsl(var(--brand-accent)), hsl(var(--brand-accent) / 0.55)); transition: width 0.25s ease; }
 .claude-l10n-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding-top: 20px; border-top: 1px solid hsl(var(--border)); }
 .claude-l10n-actions-secondary { display: inline-flex; gap: 10px; margin-left: auto; }
 

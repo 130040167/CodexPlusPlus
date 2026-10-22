@@ -730,6 +730,10 @@ pub struct BackendSettings {
     // 与「准备副本」这件事互不影响——副本只是所有增强共同的前置条件。
     #[serde(rename = "claudeAppLocalization", default = "default_true")]
     pub claude_app_localization: bool,
+    // 默认关闭：Computer Use 需要改写副本的 app.asar 并关掉 Electron 的 asar 完整性校验，
+    // 功能本身还受订阅与组织策略约束；误开没有收益，显式勾选才做。
+    #[serde(rename = "claudeAppComputerUse", default)]
+    pub claude_app_computer_use: bool,
     #[serde(rename = "codexAppPasteFix", default)]
     pub codex_app_paste_fix: bool,
     // 默认关闭：撤下的那版会主动从 settings.json 删掉这个键，老用户升级后读不到，
@@ -1009,6 +1013,7 @@ impl Default for BackendSettings {
             codex_app_usage_status_line: true,
             claude_app_voice_input: true,
             claude_app_localization: true,
+            claude_app_computer_use: false,
             codex_app_paste_fix: false,
             codex_app_force_chinese_locale: false,
             codex_app_typing_effect: default_typing_effect(),

@@ -13191,17 +13191,27 @@ type ClaudeLocalizationStatus = {
   catalogEntries: number;
   voiceInput: boolean;
   localization: boolean;
+  computerUse: boolean;
 };
 
 function ClaudeLocalizationScreen() {
   const [status, setStatus] = useState<CommandResult<ClaudeLocalizationStatus> | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** 制作增强版时宿主推送的阶段进度（0-100）。 */
+  const [progress, setProgress] = useState<{ percent: number; message: string } | null>(null);
   const mounted = useRef(true);
   const pending = useRef(false);
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; };
+  }, []);
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<{ percent: number; message: string }>("claude-localization-progress", (event) => {
+      if (mounted.current) setProgress(event.payload);
+    }).then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
   }, []);
   const accept = (result: CommandResult<ClaudeLocalizationStatus>) => {
     if (!mounted.current) return;
@@ -13223,6 +13233,7 @@ function ClaudeLocalizationScreen() {
     if (pending.current) return;
     pending.current = true;
     setBusy(action); setError(null);
+    if (action === "prepare") setProgress({ percent: 0, message: t("准备开始…") });
     try {
       const result = await invoke<CommandResult<ClaudeLocalizationStatus>>("claude_localization_action", { action });
       // 失败响应里的 data 是空对象：直接覆盖状态会让下面的渲染读到不存在的字段
@@ -13232,6 +13243,7 @@ function ClaudeLocalizationScreen() {
     finally {
       pending.current = false;
       if (mounted.current) setBusy(null);
+      if (action === "prepare") setTimeout(() => { if (mounted.current) setProgress(null); }, 1500);
     }
   };
   const toggleVoiceInput = async (enabled: boolean) => {
@@ -13245,6 +13257,22 @@ function ClaudeLocalizationScreen() {
       );
       // 失败响应里的 data 是空对象：直接覆盖状态会让下面的渲染读到不存在的字段
       // （曾经就是这样整页白屏的），所以只有成功时才更新状态。
+      accept(result);
+    } catch (cause) { if (mounted.current) setError(stringifyError(cause)); }
+    finally {
+      pending.current = false;
+      if (mounted.current) setBusy(null);
+    }
+  };
+  const toggleComputerUse = async (enabled: boolean) => {
+    if (pending.current) return;
+    pending.current = true;
+    setBusy("computerUse"); setError(null);
+    try {
+      const result = await invoke<CommandResult<ClaudeLocalizationStatus>>(
+        "claude_localization_set_computer_use",
+        { enabled },
+      );
       accept(result);
     } catch (cause) { if (mounted.current) setError(stringifyError(cause)); }
     finally {
@@ -13310,9 +13338,22 @@ function ClaudeLocalizationScreen() {
               </span>
               <ToggleVisual />
             </label>
+            <label className="switch-row compact">
+              <input
+                checked={Boolean(s?.computerUse)}
+                disabled={busy !== null || !s?.supported}
+                onChange={(event) => void toggleComputerUse(event.currentTarget.checked)}
+                type="checkbox"
+              />
+              <span>
+                <strong>{t("Computer Use")}</strong>
+                <small>{t("解锁桌面控制：订阅与灰度校验已解除，API Key（3p）模式同样可用；会改写副本的 app.asar 并关闭 Electron 的 asar 完整性校验，原件不动。首次使用要在系统里授权辅助功能与屏幕录制。")}</small>
+              </span>
+              <ToggleVisual />
+            </label>
             {s?.supported && !s.prepared ? (
               <p className="claude-l10n-hint">
-                {t("副本还没准备：开关会先存下来，等你在右边准备好副本并启动后生效。")}
+                {t("增强版还没制作：开关会先存下来，等你在右边制作好增强版并启动后生效。")}
               </p>
             ) : null}
           </CardContent>
@@ -13326,7 +13367,7 @@ function ClaudeLocalizationScreen() {
             <div className="claude-l10n-hero-title">
               <span className="claude-l10n-hero-icon"><PackageOpen className="h-5 w-5" /></span>
               <div>
-                <strong>{t("受管副本")}</strong>
+                <strong>{t("受管增强版")}</strong>
                 <span className="claude-l10n-hero-subtitle">{t("所有增强的前置条件：官方 Claude.app 与 app.asar 保持原样，功能通过副本和启动时注入生效。")}</span>
               </div>
             </div>
@@ -13339,14 +13380,14 @@ function ClaudeLocalizationScreen() {
             <div className="claude-l10n-step" data-done={s?.prepared ? "true" : "false"} role="listitem">
               <span className="claude-l10n-step-no" aria-hidden="true">{s?.prepared ? "✓" : "1"}</span>
               <div className="claude-l10n-step-body">
-                <strong>{t("准备副本")}</strong>
-                <small>{t("用下面的按钮创建受管副本；官方 Claude.app 与 app.asar 保持原样。")}</small>
+                <strong>{t("制作增强版")}</strong>
+                <small>{t("用下面的按钮制作增强版；官方 Claude.app 与 app.asar 保持原样。")}</small>
               </div>
             </div>
             <div className="claude-l10n-step" data-done={s?.running ? "true" : "false"} role="listitem">
               <span className="claude-l10n-step-no" aria-hidden="true">{s?.running ? "✓" : "2"}</span>
               <div className="claude-l10n-step-body">
-                <strong>{t("启动 Claude 副本")}</strong>
+                <strong>{t("启动增强版")}</strong>
                 <small>{t("增强只在副本里生效，官方版和登录态不受影响。")}</small>
               </div>
             </div>
@@ -13378,7 +13419,7 @@ function ClaudeLocalizationScreen() {
           </div>
           <div className="claude-l10n-note" role="note">
             <Info className="h-4 w-4" />
-            <span>{t("首次准备会创建独立副本并执行完整性校验；官方应用、登录态和 app.asar 不会被改写。macOS 可能需要钥匙串授权，Windows 会使用独立副本启动。")}</span>
+            <span>{t("首次制作会创建独立副本并执行完整性校验；官方应用、登录态和 app.asar 不会被改写。macOS 可能需要钥匙串授权，Windows 会使用独立副本启动。")}</span>
           </div>
           {!s ? (
             <p className="claude-l10n-hint">{t("点击“检测 Claude”读取安装状态；进入此页不会自动检测或修改应用。")}</p>
@@ -13386,6 +13427,26 @@ function ClaudeLocalizationScreen() {
             <p className="claude-l10n-hint">{t("未检测到 Claude，请先安装官方应用。你可以继续使用 Codex++ 的其他功能。")}</p>
           ) : null}
           {error ? <div className="inline-error">{error}</div> : null}
+          {progress ? (
+            <div
+              aria-valuemax={100}
+              aria-valuemin={0}
+              aria-valuenow={progress.percent}
+              className="claude-l10n-progress"
+              role="progressbar"
+            >
+              <div className="claude-l10n-progress-head">
+                <span>{progress.message || t("处理中…")}</span>
+                <span className="claude-l10n-progress-pct">{progress.percent}%</span>
+              </div>
+              <div className="claude-l10n-progress-track">
+                <div
+                  className="claude-l10n-progress-fill"
+                  style={{ width: `${Math.min(100, Math.max(2, progress.percent))}%` }}
+                />
+              </div>
+            </div>
+          ) : null}
           <div className="claude-l10n-actions">
             <Button disabled={busy !== null} onClick={() => void refresh()} variant="secondary">
               <RefreshCw className={`h-4 w-4 ${busy === "detect" ? "animate-spin" : ""}`} />
@@ -13394,19 +13455,19 @@ function ClaudeLocalizationScreen() {
             <Button disabled={busy !== null || !s?.supported} onClick={() => void act("prepare")}>
               <PackageOpen className="h-4 w-4" />
               {busy === "prepare"
-                ? t("准备中…")
+                ? t("制作中…")
                 : s?.needsRebuild
                   ? t("更新副本")
                   : s?.prepared
-                    ? t("重新准备副本")
-                    : t("准备副本")}
+                    ? t("重新制作增强版")
+                    : t("制作增强版")}
             </Button>
             <Button disabled={busy !== null || !canLaunch} onClick={() => void act("launch")}>
-              <Play className="h-4 w-4" />{busy === "launch" ? t("启动中…") : t("启动 Claude 副本")}
+              <Play className="h-4 w-4" />{busy === "launch" ? t("启动中…") : t("启动增强版")}
             </Button>
             <div className="claude-l10n-actions-secondary">
               <Button disabled={busy !== null || !s?.prepared} onClick={() => void act("check")} variant="secondary">
-                <RefreshCw className="h-4 w-4" />{t("检查副本")}
+                <RefreshCw className="h-4 w-4" />{t("检查增强版")}
               </Button>
             </div>
           </div>
@@ -14149,7 +14210,7 @@ function routeSubtitle(route: Route) {
     relay: t("管理 API 供应商、协议、Key 与配置文件"),
     multiLaunch: t("为不同供应商启动相互隔离的 Codex 实例"),
     grok: t("管理 Grok CLI 的模型与 API 端点"),
-    claude: t("保留官方 Claude.app 原样，通过受管副本为 Claude 应用增强功能"),
+    claude: t("保留官方 Claude.app 原样，通过增强版为 Claude 应用增强功能"),
     relayEnvironment: t("统一管理本地协议代理、供应商代理与重试策略"),
     requestLog: t("查看代理请求的状态、模型、重试、token 用量与缓存命中"),
     sessions: t("查看、删除和修复 Codex 本地会话"),
