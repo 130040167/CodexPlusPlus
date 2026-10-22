@@ -450,19 +450,66 @@ body {
   color: hsl(var(--brand-accent));
 }
 
-/* 概览的置顶推荐位。
-   卡片内部沿用 .jojocode-overview-layout 的「左信息 / 右标签区」结构。 */
+/* 概览的两个独立置顶广告位。 */
 .sponsor-board {
   display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+}
+
+.sponsor-board-single {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .sponsor-board > .panel {
   min-width: 0;
+  height: 100%;
+}
+
+.sponsor-slot-content {
+  display: grid;
+  height: 100%;
+  grid-template-columns: minmax(0, 1fr) minmax(150px, auto);
+  grid-template-rows: 1fr auto;
+  gap: 14px 16px;
+  align-items: center;
+}
+
+.sponsor-slot-main {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  grid-column: 1;
+  grid-row: 1 / span 2;
+}
+
+.sponsor-slot-copy {
+  min-width: 0;
+}
+
+.sponsor-slot-tags {
+  justify-content: flex-start;
+  max-width: none;
+  margin-top: 0;
+  grid-column: 2;
+  grid-row: 1;
+  justify-content: flex-end;
+}
+
+.sponsor-slot-actions {
+  display: flex;
+  justify-content: flex-end;
+  grid-column: 2;
+  grid-row: 2;
 }
 
 /* 窄屏时「左信息 / 右标签区」并排会挤，改成上下排。 */
 @media (max-width: 1100px) {
+  .sponsor-board {
+    grid-template-columns: 1fr;
+  }
+
   .jojocode-overview-layout {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -474,6 +521,25 @@ body {
   .jojocode-model-tags {
     justify-content: flex-start;
     max-width: none;
+  }
+}
+
+@media (max-width: 700px) {
+  .sponsor-slot-content {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto;
+  }
+
+  .sponsor-slot-main,
+  .sponsor-slot-tags,
+  .sponsor-slot-actions {
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  .sponsor-slot-tags,
+  .sponsor-slot-actions {
+    justify-content: flex-start;
   }
 }
 
@@ -9178,9 +9244,93 @@ select {
   font-size: 11px;
 }
 
+/* ── ZCode 增强页：结构复用「Codex增强」，这里只补少数组件样式 ───── */
+/* 顶栏状态徽标：与页面内的状态口径一致，语义色与 Codex 页徽标相同。 */
+.zcode-enhance-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: none;
+  padding: 5px 11px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+  white-space: nowrap;
+}
+.zcode-enhance-status i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: hsl(var(--muted-foreground));
+}
+.zcode-enhance-status-ok {
+  color: hsl(var(--status-success));
+  border-color: hsl(var(--status-success) / 0.4);
+  background: hsl(var(--status-success) / 0.08);
+}
+.zcode-enhance-status-ok i {
+  background: hsl(var(--status-success));
+  box-shadow: 0 0 8px hsl(var(--status-success) / 0.6);
+}
+.zcode-enhance-status-warn {
+  color: hsl(var(--status-warning));
+  border-color: hsl(var(--status-warning) / 0.4);
+  background: hsl(var(--status-warning) / 0.08);
+}
+.zcode-enhance-status-warn i {
+  background: hsl(var(--status-warning));
+}
 
+/* 功能卡右侧的状态值/按钮区：沿用 feature-toggle 的浅底卡片，只接管右侧一列。 */
+.zcode-enhance-card-side {
+  display: grid;
+  gap: 2px;
+  justify-items: end;
+  min-width: 0;
+  text-align: right;
+}
+.zcode-enhance-card-side strong {
+  font-size: 12px;
+  font-weight: 550;
+}
+.zcode-enhance-card-side small {
+  margin: 0;
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+  line-height: 1.4;
+}
+.zcode-enhance-card-side.is-ok strong { color: hsl(var(--status-success)); }
+.zcode-enhance-card-side.is-warn strong { color: hsl(var(--status-warning)); }
 
+/* 首组现在只有 2 张状态卡：用 2 列，别沿用 Codex 首组的 3 列留空。 */
+.zcode-enhance-page .enhance-feature-groups .feature-group:first-child .feature-switch-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
 
+/* 组内整行提示：卡片是网格项，提示和错误块要占满整行。 */
+.zcode-enhance-page .feature-switch-grid > .hint-line,
+.zcode-enhance-page .feature-switch-grid > .field-hint {
+  grid-column: 1 / -1;
+}
+.zcode-enhance-page .feature-switch-grid > .field-hint {
+  margin: 0;
+}
+
+/* 语音输入标签页只有一组两张卡：固定两列，避免落到首组的三列网格里留空。 */
+.zcode-enhance-page .enhance-feature-groups.zcode-enhance-voice-tab .feature-switch-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.zcode-enhance-error {
+  margin-top: 12px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  color: hsl(var(--destructive));
+  background: hsl(var(--destructive) / 0.08);
+  font-size: 12px;
+  line-height: 1.5;
+}
 
 .enhance-footer-hint {
   margin: 4px 0 0;
@@ -10666,6 +10816,49 @@ select {
 }
 
 /* ── 代理设置页：供应商独立代理列表 ───────────────────────────── */
+/* 请求避震：重试的 HTTP 状态码标签编辑器 */
+.retry-status-editor {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.retry-status-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.retry-status-list:empty {
+  display: none;
+}
+.retry-status-chip {
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  background: hsl(var(--muted));
+  color: hsl(var(--foreground));
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  min-height: 28px;
+  padding: 4px 9px;
+}
+.retry-status-chip:hover {
+  border-color: hsl(var(--primary));
+}
+.retry-status-chip:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}
+.retry-status-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.retry-status-input-row > :first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .proxy-provider-list {
   display: flex;
   flex-direction: column;

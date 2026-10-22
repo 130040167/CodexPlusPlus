@@ -9,7 +9,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,600;0,800;1,400&family=Noto+Sans+SC:wght@300;400;500;700;900&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="css/style.css?v=20261017-gallery-2">
+<link rel="stylesheet" href="css/style.css?v=20261021-manager-layout-1">
 </head>
 <body>
 
@@ -20,6 +20,7 @@
       <span class="brand-name">Codex<b>++</b></span>
     </a>
     <nav class="nav-links">
+      <a href="#manager-live" data-nav>Live UI</a>
       <a href="#features" data-nav>Features</a>
       <a href="#modes" data-nav>Modes</a>
       <a href="#showcase" data-nav>Showcase</a>
@@ -51,6 +52,7 @@
   </div>
 
   <div class="hero-inner">
+    <div class="hero-copy">
     <p class="eyebrow reveal"><span class="pulse-dot"></span>YOUR CODEX, UPGRADED — OPEN SOURCE · LOCAL · RUST + TAURI</p>
     <h1 class="hero-title">
       <span class="line"><span class="w">Make</span> <span class="w">Codex</span></span>
@@ -73,6 +75,12 @@
       <div class="stat"><dt class="mono" data-count="1" data-format="m">0</dt><dd>Max per-model context</dd></div>
       <div class="stat"><dt class="mono">0</dt><dd>Files patched in the official app</dd></div>
     </dl>
+    </div>
+    <div class="hero-manager" id="manager-live">
+      <div class="hero-manager-window">
+        <iframe title="Codex++ manager live frontend demo" src="manager-preview/?previewRoute=enhance&amp;lang=en" loading="eager"></iframe>
+      </div>
+    </div>
   </div>
 
   <a class="scroll-cue" href="#demo" data-nav aria-label="Scroll down">
@@ -396,7 +404,7 @@ your-model<span class="t-hl">[128000]</span>
       <p>Refer to each provider's official website for services, prices and offers.</p>
       <p class="sponsor-meta">
         <span data-sponsor-status>Loading sponsors…</span>
-        <a href="https://github.com/BigPizzaV3/Ad-List" target="_blank" rel="noopener">Auto-updated list · View source ↗</a>
+        <a href="https://ads.codexpp.cc/ads.json" target="_blank" rel="noopener">Auto-updated list · View source ↗</a>
       </p>
     </div>
     <div id="sponsorTop"></div>

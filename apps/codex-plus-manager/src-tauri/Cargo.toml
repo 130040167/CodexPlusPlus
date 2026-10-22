@@ -32,6 +32,11 @@ tauri = { version = "2", features = ["protocol-asset", "custom-protocol", "tray-
 tauri-plugin-dialog = "2"
 toml_edit.workspace = true
 
+# ZCode 语音输入的录音端：ZCode 自身缺麦克风 entitlement，改由管理端用系统
+# 默认输入设备录音（详见 src/mic.rs 的说明）。只在 macOS 需要，其它平台不装。
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal = "0.15"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

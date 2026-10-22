@@ -1,6 +1,9 @@
 mod auto_takeover;
 mod agent_collaboration_commands;
 mod global_dictation;
+mod mic;
+mod voice_server;
+mod zcode;
 pub mod commands;
 pub mod install;
 mod runtime_health;
@@ -57,18 +60,23 @@ pub fn run() {
             }
         }
     }
-    if let Ok(settings) = codex_plus_core::settings::SettingsStore::default().load()
-        && let Err(error) = codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
+    if let Ok(settings) = codex_plus_core::settings::SettingsStore::default().load() {
+        // 请求体上限是运行期策略：管理器启动即按设置应用，之后启动的 helper 直接继承，
+        // 不必等完整启动流程。环境变量仍由 launcher 侧统一优先。
+        codex_plus_core::launcher::set_http_body_limit_bytes(
+            settings.helper_max_request_body_bytes(),
+        );
+        if let Err(error) = codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
             settings.enhancements_enabled
                 && settings.codex_app_dream_skin_enabled
                 && !settings.codex_app_dream_skin_paused,
             &settings.codex_app_dream_skin_theme_config,
-        )
-    {
-        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-            "manager.dream_skin_base_theme_sync_failed",
-            serde_json::json!({ "message": error.to_string() }),
-        );
+        ) {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.dream_skin_base_theme_sync_failed",
+                serde_json::json!({ "message": error.to_string() }),
+            );
+        }
     }
     let show_update = commands::startup_should_show_update();
     let autostart = std::env::args().any(|arg| arg == "--autostart");
@@ -123,6 +131,9 @@ pub fn run() {
                     serde_json::json!({ "message": error.to_string() }),
                 );
             }
+            // ZCode 补注入守护：ZCode 已带调试端口运行但页面里没有语音入口（或配置
+            // 因管理器重启而过期）时自动补注入。设置关掉时线程空转跳过。
+            zcode::start_supervisor(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -148,6 +159,11 @@ pub fn run() {
             commands::claude_localization_action,
             commands::claude_localization_set_voice_input,
             commands::claude_localization_set_localization,
+            // ZCode 增强：前端 invoke 找不到命令时是运行期静默失败，没有编译期兜底，
+            // 所以这三个必须注册在这里（契约由前端与 Lead 的端到端测试守护）。
+            commands::zcode_enhancement_status,
+            commands::zcode_enhancement_action,
+            commands::zcode_enhancement_set_voice_input,
             commands::native_browser_status,
             commands::save_settings,
             commands::list_tools,
@@ -298,6 +314,7 @@ pub fn run() {
                     if !SHUTDOWN_STARTED.swap(true, Ordering::SeqCst) {
                         APP_EXITING.store(true, Ordering::SeqCst);
                         auto_takeover::stop_supervisor();
+                        zcode::stop_supervisor();
                         let app = app_handle.clone();
                         tauri::async_runtime::spawn_blocking(move || {
                             // 退出前先等待自有 CLI 任务清理，避免进程退出后遗留执行器。
@@ -310,6 +327,9 @@ pub fn run() {
                                     serde_json::json!({ "message": error.to_string() }),
                                 );
                             }
+                            // 常驻本地代理只在 Codex++ 退出时停止；Codex 会话结束
+                            // 不会关它（见 core::resident_helper）。
+                            codex_plus_core::resident_helper::stop_resident_helper();
                             SHUTDOWN_COMPLETE.store(true, Ordering::SeqCst);
                             app.exit(0);
                         });
