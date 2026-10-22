@@ -44,16 +44,26 @@ def fuses(app):
         candidates.append(root / "Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework")
     candidates.extend([root, root / "Claude.exe", root / "resources/electron.exe"])
     candidates.extend(p for p in root.rglob("*.exe") if p.is_file())
+    found = []
     for binary in candidates:
         if not binary.is_file():
             continue
         data = binary.read_bytes()
-        if data.count(WIRE) != 1:
-            continue
-        start = data.index(WIRE) + len(WIRE)
-        if data[start + 1] < 4:
-            raise RuntimeError("不支持的 Electron fuse 版本")
-        return binary, start + 2, data[start + 2:start + 2 + data[start + 1]]
+        # 新版 Electron 里这段标记可能出现多次（例如多架构拼接），
+        # 逐个校验：后面紧跟版本号、且 flag 全是 '0'/'1' 的才是真 fuse。
+        offset = 0
+        while True:
+            index = data.find(WIRE, offset)
+            if index < 0:
+                break
+            offset = index + len(WIRE)
+            start = index + len(WIRE)
+            version = data[start + 1]
+            flags = data[start + 2:start + 2 + version]
+            if 0 < version <= 16 and all(c in b"01" for c in flags):
+                found.append((binary, start + 2, flags))
+        if found:
+            return found
     raise RuntimeError("Electron fuse 格式已变化，无法安全汉化此版本")
 
 
@@ -205,7 +215,7 @@ def patch_asar(copy):
 
 
 def check(source, copy):
-    _, _, flags = fuses(copy)
+    _, _, flags = fuses(copy)[0]
     if flags[3] != ord("1"):
         raise RuntimeError("副本未启用启动注入")
     # 先比版本：官方更新后 app.asar 必然不一致，这时直接说「请重新准备副本」，
@@ -331,17 +341,20 @@ def build(source, copy):
         except RuntimeError:
             # ditto 可补全非 APFS 上的部分复制；不删除任何现有目录。
             run(["/usr/bin/ditto", str(source), str(copy)])
-    binary, offset, flags = fuses(copy)
+    fuse_sites = fuses(copy)
+    flags = fuse_sites[0][2]
     if flags[3] not in (ord("0"), ord("1")):
         raise RuntimeError("此版本禁用了 Electron inspect fuse，无法汉化")
     if COMPUTER_USE and flags[4] not in (ord("0"), ord("1")):
         raise RuntimeError("此版本缺少 asar 完整性 fuse，无法做 CU 增强")
-    with binary.open("r+b") as f:
-        f.seek(offset + 3)
-        f.write(b"1")   # EnableNodeCliInspectArguments：启动注入需要
-        if COMPUTER_USE:
-            f.seek(offset + 4)
-            f.write(b"0")   # EnableEmbeddedAsarIntegrityValidation：要改 asar 就必须关掉校验
+    # universal binary 每个架构各带一份 fuse，全部改掉，避免只改到不生效的那份。
+    for binary, offset, _flags in fuse_sites:
+        with binary.open("r+b") as f:
+            f.seek(offset + 3)
+            f.write(b"1")   # EnableNodeCliInspectArguments：启动注入需要
+            if COMPUTER_USE:
+                f.seek(offset + 4)
+                f.write(b"0")   # EnableEmbeddedAsarIntegrityValidation：要改 asar 就必须关掉校验
 
     ion = ion_for(copy)
     for rel in ("zh-Hans.json", "dynamic/zh-Hans.json", "zh-Hans.overrides.json"):
