@@ -6222,6 +6222,10 @@
 
   function recordCodexPlusBridgeSuccess() {
     recordCodexPlusBridgeHealth("lastSuccessAt");
+    if (codexPlusBackendGeneration === window.__codexPlusBackendGeneration) {
+      const health = window.__codexPlusBridgeHealth || (window.__codexPlusBridgeHealth = {});
+      health.failures = 0;
+    }
     codexPlusBridgeFailureCount = 0;
   }
 
@@ -6231,6 +6235,12 @@
 
   function recordCodexPlusBridgeFailure() {
     codexPlusBridgeFailureCount += 1;
+    if (codexPlusBackendGeneration !== window.__codexPlusBackendGeneration) return;
+    // 看门狗只能读到 window 上的 health 快照：不落 failures/lastFailureAt，
+    // CDP 连接断掉后它会一直把“还在尝试”当成桥接存活，永久不重注入。
+    const health = window.__codexPlusBridgeHealth || (window.__codexPlusBridgeHealth = {});
+    health.lastFailureAt = Date.now();
+    health.failures = codexPlusBridgeFailureCount;
   }
 
   function renderBackendStatus() {
@@ -6827,6 +6837,7 @@
 
   async function directFetchCodexPlusAds() {
     const urls = [
+      "https://ads.codexpp.cc/ads.json",
       "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/ads.json",
       "https://cdn.jsdelivr.net/gh/BigPizzaV3/Ad-List@main/ads.json",
     ];
@@ -12276,6 +12287,16 @@
     return codexPlusModelPickerNormalizeStrict(value).replace(/^gpt-/u, "");
   }
 
+  /** 宽松归一化：忽略大小写、`gpt-` 前缀、空白以及 `-`/`_` 等分隔符。
+   * 目录里的 slug 是 `deepseek-flash`，原生行文本是 `DeepSeek Flash`，
+   * 先用严格归一化会漏掉这些别名，行就退化成 legacy 分组，同一家被切成好几段。 */
+  function codexPlusModelPickerNormalizeLoose(value) {
+    return String(value || "")
+      .toLowerCase()
+      .replace(/^gpt[\s_-]*/u, "")
+      .replace(/[^\p{L}\p{N}]+/gu, "");
+  }
+
   /**
    * 目录里的键和选择器里的名字不一定逐字相同。
    *
@@ -12342,6 +12363,44 @@
   }
 
   /**
+   * 目录里每一行“完整展示名 -> 权威归属”的精确索引。
+   *
+   * 行的原生文本就是目录的 `displayName`（带 `（供应商）` 后缀）。拿完整文本
+   * 匹配才能区分“多个成员都发布了同名上游模型”（例如三家都有
+   * `DeepSeek-V4-Pro`）的情况；只按裸模型名匹配会命中目录里第一个同名成员，
+   * 把另外两家的行并进错误的组。
+   */
+  function codexPlusModelPickerCatalogExactMap() {
+    const map = new Map();
+    const modelMetadata = codexModelCatalog?.modelMetadata || codexModelCatalog?.model_metadata;
+    if (!modelMetadata || typeof modelMetadata !== "object") return map;
+    const register = (entry) => {
+      if (!entry || typeof entry !== "object") return;
+      const displayName = entry.displayName || entry.display_name;
+      if (typeof displayName !== "string" || !displayName) return;
+      const provider = providerNameOf(entry);
+      const groupId =
+        typeof entry.codex_plus_group_id === "string" ? entry.codex_plus_group_id.trim() : "";
+      if (!provider || !groupId) return;
+      const value = { provider, groupId };
+      const fullKey = codexPlusModelPickerNormalizeLoose(displayName);
+      if (fullKey && !map.has(fullKey)) map.set(fullKey, value);
+      const split = codexPlusModelPickerSplitLabel(displayName);
+      if (split.name && split.provider) {
+        const pairKey = `${codexPlusModelPickerNormalizeLoose(split.name)}\u0000${codexPlusModelPickerNormalizeLoose(split.provider)}`;
+        if (!map.has(pairKey)) map.set(pairKey, value);
+      }
+    };
+    const slugList = Array.isArray(codexModelCatalog?.models)
+      ? codexModelCatalog.models.filter((slug) => typeof slug === "string" && slug)
+      : [];
+    const bySlug = new Map(Object.entries(modelMetadata));
+    for (const slug of slugList) register(bySlug.get(slug));
+    for (const entry of Object.values(modelMetadata)) register(entry);
+    return map;
+  }
+
+  /**
    * 一行的可分组身份。
    *
    * 原生结构（实测 2026-10 Codex 桌面版）：
@@ -12388,6 +12447,8 @@
    */
   function codexPlusModelPickerRows(list) {
     const providers = codexPlusModelPickerCatalogProviderMap();
+    const exact = codexPlusModelPickerCatalogExactMap();
+    const defaultGroupId = codexPlusModelPickerDefaultGroupId();
     const rows = [];
     const items = list.querySelectorAll('[role="menuitemradio"]');
     items.forEach((row) => {
@@ -12395,16 +12456,25 @@
       if (!identity?.groupable) return;
       const split = codexPlusModelPickerSplitLabel(identity.text);
       if (split.provider) codexPlusModelPickerRememberProvider(split.name, split.provider, true);
-      // 分组键：只信"行上有后缀"和"目录里的权威分组 id"这两个来源。
-      // 早期版本拿目录展示名去拟合行文本，别名一多就把模型分到了错的组（同一家被切成
-      // 好几段），所以目录查询只用来补 **分组 id**，不用来决定显示成哪一组。
-      const known = providers.get(codexPlusModelPickerNormalizeStrict(split.name))
-        || providers.get(codexPlusModelPickerNormalize(split.name));
+      // 分组键：优先用「完整展示名」或「模型名 + 后缀供应商」做精确匹配。
+      // 有后缀的行成员归属由后缀决定，不能再拿裸模型名去查目录——三家都发布
+      // `DeepSeek-V4-Pro` 时，裸名别名只会命中目录里第一个成员，把别人的
+      // 模型并进错误的组（同一家被切成好几段 / 同名分组出现多次）。
+      const pairKey = split.provider
+        ? `${codexPlusModelPickerNormalizeLoose(split.name)}\u0000${codexPlusModelPickerNormalizeLoose(split.provider)}`
+        : "";
+      const known = exact.get(codexPlusModelPickerNormalizeLoose(identity.text))
+        || (pairKey ? exact.get(pairKey) : null)
+        || (!split.provider
+          ? providers.get(codexPlusModelPickerNormalizeStrict(split.name))
+            || providers.get(codexPlusModelPickerNormalize(split.name))
+          : null);
       const groupId = known?.groupId
-        || (split.provider ? split.provider : codexPlusModelPickerDefaultGroupId());
+        || (split.provider ? `provider:${split.provider}` : defaultGroupId);
       // 显示名按行文本：有后缀就是那一家；裸名（默认成员的模型）用默认供应商的名字。
       const provider = split.provider || known?.provider || codexPlusModelPickerDefaultProviderName();
-      const authoritativeGroupId = !!known?.groupId || (!split.provider && !!codexPlusModelPickerDefaultGroupId());
+      const authoritativeGroupId = !!known?.groupId
+        || (split.provider ? true : !!defaultGroupId);
       rows.push({ row, label: identity.text, name: split.name, provider, groupId, authoritativeGroupId });
     });
     return rows;
@@ -14431,22 +14501,22 @@
   }
 
   /**
-   * The tail may contain several model calls from the same turn. Use the latest
-   * turn segment and weight cache hits by input tokens instead of averaging
-   * percentages from individual calls.
+   * 只取真实 turn_id 对应的最近一轮。total_token_usage 是会话累计，不会在换轮时
+   * 清零；旧记录或尾部截断缺少轮边界时只用最后一次调用，避免把前几轮混进来。
    */
-  function codexPlusUsageTurnCache(events) {
-    if (!Array.isArray(events) || !events.length) return null;
-    let start = 0;
-    let hasTurnCounters = false;
-    for (let index = 1; index < events.length; index += 1) {
-      const previous = Number(events[index - 1].turn_output_tokens);
-      const current = Number(events[index].turn_output_tokens);
-      if (!Number.isFinite(previous) || !Number.isFinite(current)) continue;
-      hasTurnCounters = true;
-      if (current < previous) start = index;
+  function codexPlusUsageLatestTurn(events) {
+    if (!Array.isArray(events) || !events.length) return [];
+    let start = events.length - 1;
+    const turnId = events[start].turn_id;
+    if (typeof turnId === "string" && turnId) {
+      while (start > 0 && events[start - 1].turn_id === turnId) start -= 1;
     }
-    const segment = events.slice(start);
+    return events.slice(start);
+  }
+
+  /** 同一轮的多次模型调用按输入 token 加权，不能直接平均各次百分比。 */
+  function codexPlusUsageTurnCache(events) {
+    const segment = codexPlusUsageLatestTurn(events);
     let input = 0;
     let cached = 0;
     for (const event of segment) {
@@ -14457,11 +14527,7 @@
         cached += Math.max(0, Math.min(currentCached, currentInput));
       }
     }
-    if (input > 0) return codexPlusUsagePercent(cached, input);
-    return hasTurnCounters ? null : codexPlusUsagePercent(
-      Number(segment[segment.length - 1]?.cached_input_tokens),
-      Number(segment[segment.length - 1]?.input_tokens),
-    );
+    return input > 0 ? codexPlusUsagePercent(cached, input) : null;
   }
 
   /**
@@ -14470,13 +14536,14 @@
    * Codex 只在每次模型调用结束时写一条 token_count，事件间隔里同时包含生成和工具
    * 执行时间，所以这是「吞吐」而不是纯生成速度，会比真实解码速度低。用同一轮内
    * 相邻事件的累计输出差除以时间差得到区间速度，再取最近几个区间平均，避免单次
-   * 抖动。换轮时 turn_output_tokens 会回落，靠这个切段。
+   * 抖动。turn_output_tokens 是历史字段名，实际为会话累计输出，需用真实轮 id 切段。
    */
   function codexPlusUsageRate(events) {
+    const segment = codexPlusUsageLatestTurn(events);
     const rates = [];
-    for (let index = 1; index < events.length; index += 1) {
-      const previous = events[index - 1];
-      const current = events[index];
+    for (let index = 1; index < segment.length; index += 1) {
+      const previous = segment[index - 1];
+      const current = segment[index];
       const previousOutput = Number(previous.turn_output_tokens) || 0;
       const currentOutput = Number(current.turn_output_tokens) || 0;
       if (currentOutput <= previousOutput) continue;
@@ -14705,6 +14772,286 @@
     },
   };
   globalThis.__CODEX_PLUS_USAGE_STATUSLINE_SYNC__ = () => codexPlusUsageSchedule(0);
+  /**
+   * 输入框上方的「请求避震」状态条：直接显示当前代理请求走到了哪一步。
+   *
+   * 状态由代理侧 `/proxy-status` 路由提供（POST），阶段包括：
+   *   requesting（正在请求）、waiting（等待上游返回）、
+   *   retrying（正在重试 ×N）、generating（正在生成，可带输出 token 估算）。
+   *
+   * 节点挂在输入卡片之前、同一父容器内（输入框上方），空闲时 display:none，
+   * 不占位；带 data-codex-plus-ext 让扫描调度器排除自喂循环。
+   */
+  registerCodexPlusExtensionSelector('[data-codex-plus-ext="builtin-proxy-request-status"]');
+  window.__codexPlusProxyRequestStatusRuntime?.dispose?.();
+
+  const codexPlusProxyStatusId = "codex-plus-proxy-request-status";
+  const codexPlusProxyStatusStyleId = "codex-plus-proxy-request-status-style";
+  const codexPlusProxyStatusPollMs = 1200;
+  const codexPlusProxyStatusTickMs = 500;
+
+  const codexPlusProxyStatusState = {
+    disposed: false,
+    pollTimer: 0,
+    tickTimer: 0,
+    node: null,
+    requests: [],
+    nowMs: Date.now(),
+    inFlight: false,
+    failures: 0,
+  };
+
+  function codexPlusProxyStatusVisibleElement(element) {
+    if (!element?.isConnected) return false;
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function codexPlusProxyStatusComposerCard() {
+    const cards = [...document.querySelectorAll("[data-composer-surface-variant]")];
+    let fallback = null;
+    for (const card of cards) {
+      if (!codexPlusProxyStatusVisibleElement(card) || card.closest("[data-codex-plus-ext]")) continue;
+      fallback = card;
+      if (card.querySelector('.ProseMirror[contenteditable="true"], textarea:not(:disabled):not([readonly]), [role="textbox"][contenteditable="true"]')) {
+        return card;
+      }
+    }
+    return fallback;
+  }
+
+  /** 当前输入框所属会话 id，用于只显示本会话的请求。 */
+  function codexPlusProxyStatusThreadId(card) {
+    const composerRoot = card?.closest("[data-codex-composer-root]");
+    const placement = composerRoot?.getAttribute("data-composer-placement");
+    // 首页/新会话的输入框也是 composer，但没有会话归属；必须返回空让状态条隐藏，
+    // 不能退化成“显示所有运行中的请求”，否则别的会话的请求会串到这里。
+    if (placement && placement !== "thread") return "";
+    const fromComposer = composerRoot
+      ?.querySelector("[data-above-composer-conversation-id]")
+      ?.getAttribute("data-above-composer-conversation-id");
+    const inThread = composerRoot?.getAttribute("data-composer-placement") === "thread";
+    const fromSidebar = inThread
+      ? document
+        .querySelector('[data-app-action-sidebar-thread-selected="true"][data-app-action-sidebar-thread-id]')
+        ?.getAttribute("data-app-action-sidebar-thread-id")
+      : null;
+    return String(fromComposer || fromSidebar || "").replace(/^local:/, "").trim();
+  }
+
+  function codexPlusProxyStatusNormalizeThreadId(value) {
+    return String(value || "").replace(/^local:/, "").trim();
+  }
+
+  function codexPlusProxyStatusText() {
+    const language = (document.documentElement?.lang || navigator.language || "").toLowerCase();
+    const zh = language.startsWith("zh");
+    return zh
+      ? {
+          requesting: "正在请求",
+          waiting: "等待上游返回",
+          retrying: (count) => `正在重试 ×${count}`,
+          generating: "正在生成",
+          fallback: "请求进行中",
+          lastError: "上次",
+          aria: "请求避震状态",
+        }
+      : {
+          requesting: "Requesting",
+          waiting: "Waiting for upstream",
+          retrying: (count) => `Retrying ×${count}`,
+          generating: "Generating",
+          fallback: "Request in progress",
+          lastError: "Last",
+          aria: "Request shock absorption status",
+        };
+  }
+
+  function codexPlusProxyStatusInstallStyle() {
+    if (document.getElementById(codexPlusProxyStatusStyleId)) return;
+    const style = document.createElement("style");
+    style.id = codexPlusProxyStatusStyleId;
+    style.dataset.codexPlusExt = "builtin-proxy-request-status";
+    style.textContent = `
+      #${codexPlusProxyStatusId}{display:flex;align-items:center;justify-content:flex-end;gap:8px;box-sizing:border-box;width:100%;margin:0 0 6px;padding:0 12px;font-size:12px;line-height:17px;color:var(--color-token-text-secondary,rgba(205,205,215,.95));color:color-mix(in srgb,var(--color-token-text-primary,#dfdfdf) 82%,transparent);user-select:none;cursor:default}
+      #${codexPlusProxyStatusId}[data-hidden="true"]{display:none}
+      #${codexPlusProxyStatusId} .codex-plus-proxy-dot{width:7px;height:7px;border-radius:50%;flex:0 0 auto;background:#f59e0b;box-shadow:0 0 0 0 rgba(245,158,11,.35);animation:codex-plus-proxy-pulse 1.4s ease-out infinite}
+      #${codexPlusProxyStatusId}[data-phase="retrying"] .codex-plus-proxy-dot{background:#f97316}
+      #${codexPlusProxyStatusId}[data-phase="generating"] .codex-plus-proxy-dot{background:#22c55e}
+      #${codexPlusProxyStatusId}[data-phase="waiting"] .codex-plus-proxy-dot{background:#60a5fa}
+      #${codexPlusProxyStatusId} .codex-plus-proxy-phase{font-weight:500;white-space:nowrap}
+      #${codexPlusProxyStatusId} .codex-plus-proxy-meta{opacity:.65;white-space:nowrap;font-variant-numeric:tabular-nums}
+      #${codexPlusProxyStatusId} .codex-plus-proxy-error{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f87171;opacity:.85}
+      @keyframes codex-plus-proxy-pulse{0%{box-shadow:0 0 0 0 rgba(245,158,11,.35)}70%{box-shadow:0 0 0 5px rgba(245,158,11,0)}100%{box-shadow:0 0 0 0 rgba(245,158,11,0)}}
+    `;
+    document.head?.appendChild(style);
+  }
+
+  function codexPlusProxyStatusEnsureNode(card) {
+    // 挂在 composer root 之前，而不是输入卡片之前：切会话时卡片会被 React
+    // 放进只包住输入框的 relative 容器里，插在卡片前会跑到输入框内部。
+    const anchor = card?.closest("[data-codex-composer-root]") || card;
+    if (!anchor?.parentElement) return null;
+    let node = codexPlusProxyStatusState.node;
+    if (!node) {
+      node = document.createElement("div");
+      node.id = codexPlusProxyStatusId;
+      node.setAttribute("data-codex-plus-ext", "builtin-proxy-request-status");
+      node.setAttribute("role", "status");
+      codexPlusProxyStatusState.node = node;
+    }
+    if (!node.isConnected || node.nextElementSibling !== anchor) {
+      anchor.insertAdjacentElement("beforebegin", node);
+    }
+    return node;
+  }
+
+  function codexPlusProxyStatusHide() {
+    const node = codexPlusProxyStatusState.node;
+    if (node) node.dataset.hidden = "true";
+  }
+
+  function codexPlusProxyStatusFormatDuration(ms) {
+    const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return minutes > 0 ? `${minutes}m${String(seconds).padStart(2, "0")}s` : `${seconds}s`;
+  }
+
+  function codexPlusProxyStatusRender() {
+    const card = codexPlusProxyStatusComposerCard();
+    const threadId = card ? codexPlusProxyStatusThreadId(card) : "";
+    // 首页/新会话没有当前会话 id：不能把“没有会话”当成“不过滤”，
+    // 否则会把别的会话里正在运行的请求显示到首页（串会话）。
+    if (!card || !threadId) {
+      codexPlusProxyStatusHide();
+      return;
+    }
+    const visibleRequests = codexPlusProxyStatusState.requests.filter(
+      (item) => codexPlusProxyStatusNormalizeThreadId(item?.threadId) === threadId,
+    );
+    const request = visibleRequests[0];
+    if (!request) {
+      codexPlusProxyStatusHide();
+      return;
+    }
+    const node = codexPlusProxyStatusEnsureNode(card);
+    if (!node) return;
+    const text = codexPlusProxyStatusText();
+    const phase = String(request.phase || "");
+    const retries = Number(request.autoRetries) || 0;
+    const attempts = Number(request.attempts) || 0;
+    let label = text.fallback;
+    if (phase === "requesting") label = text.requesting;
+    else if (phase === "waiting") label = text.waiting;
+    else if (phase === "retrying") label = text.retrying(Math.max(1, retries));
+    else if (phase === "generating") label = text.generating;
+    else if (retries > 0) label = text.retrying(retries);
+
+    const attemptDetails = Array.isArray(request.attemptDetails) ? request.attemptDetails : [];
+    const lastAttempt = attemptDetails.length ? attemptDetails[attemptDetails.length - 1] : null;
+    const lastErrorCode = String(lastAttempt?.code || "").trim();
+    const lastErrorMessage = String(lastAttempt?.message || "").trim();
+    const lastError = lastErrorCode || lastErrorMessage.slice(0, 80);
+
+    const meta = [];
+    if (request.model) meta.push(String(request.model));
+    const startedAtMs = Number(request.startedAtMs) || 0;
+    if (startedAtMs > 0) meta.push(codexPlusProxyStatusFormatDuration(codexPlusProxyStatusState.nowMs - startedAtMs));
+    const estimated = Number(request.estimatedOutputTokens) || 0;
+    if (phase === "generating" && estimated > 0) meta.push(`~${estimated > 999 ? `${(estimated / 1000).toFixed(1)}k` : estimated} tok`);
+    else if (attempts > 1) meta.push(`第 ${attempts} 次`);
+    if (visibleRequests.length > 1) meta.push(`+${visibleRequests.length - 1}`);
+
+    node.dataset.hidden = "false";
+    node.dataset.phase = phase || "requesting";
+    node.setAttribute("aria-label", text.aria);
+    node.replaceChildren();
+    const dot = document.createElement("span");
+    dot.className = "codex-plus-proxy-dot";
+    const phaseNode = document.createElement("span");
+    phaseNode.className = "codex-plus-proxy-phase";
+    phaseNode.textContent = label;
+    node.append(dot, phaseNode);
+    if (meta.length) {
+      const metaNode = document.createElement("span");
+      metaNode.className = "codex-plus-proxy-meta";
+      metaNode.textContent = meta.join(" · ");
+      node.appendChild(metaNode);
+    }
+    if (lastError) {
+      const errorNode = document.createElement("span");
+      errorNode.className = "codex-plus-proxy-error";
+      errorNode.textContent = `${text.lastError} ${lastError}`;
+      errorNode.title = lastErrorMessage || lastErrorCode;
+      node.appendChild(errorNode);
+    }
+  }
+
+  async function codexPlusProxyStatusPostWithTimeout() {
+    // 桥接挂死时 __codexSessionDeleteBridge 的 Promise 可能永远不 settle。
+    // 不设超时会让 inFlight 永久为 true，状态条从此不再刷新（只能重启恢复）。
+    let timer = 0;
+    try {
+      return await Promise.race([
+        postJson("/proxy-status", {}),
+        new Promise((resolve) => {
+          timer = window.setTimeout(
+            () => resolve({ status: "failed", message: "桥接请求超时", timeout: true }),
+            2500,
+          );
+        }),
+      ]);
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+
+  async function codexPlusProxyStatusRefresh() {
+    if (codexPlusProxyStatusState.disposed || codexPlusProxyStatusState.inFlight) return;
+    if (document.hidden) return;
+    codexPlusProxyStatusState.inFlight = true;
+    try {
+      const result = await codexPlusProxyStatusPostWithTimeout();
+      if (result?.status === "ok" && Array.isArray(result.requests)) {
+        codexPlusProxyStatusState.requests = result.requests;
+        codexPlusProxyStatusState.failures = 0;
+      } else if (result?.timeout) {
+        // 让看门狗把桥接判定为失效并重注入；桥恢复后下一轮轮询自动接上。
+        recordCodexPlusBridgeFailure();
+        throw new Error("proxy-status bridge timeout");
+      }
+    } catch {
+      codexPlusProxyStatusState.failures += 1;
+    } finally {
+      codexPlusProxyStatusState.inFlight = false;
+    }
+    if (!codexPlusProxyStatusState.disposed) codexPlusProxyStatusRender();
+  }
+
+  codexPlusProxyStatusInstallStyle();
+  codexPlusProxyStatusRender();
+  codexPlusProxyStatusState.pollTimer = window.setInterval(
+    () => void codexPlusProxyStatusRefresh(),
+    codexPlusProxyStatusPollMs,
+  );
+  codexPlusProxyStatusState.tickTimer = window.setInterval(() => {
+    codexPlusProxyStatusState.nowMs = Date.now();
+    codexPlusProxyStatusRender();
+  }, codexPlusProxyStatusTickMs);
+  void codexPlusProxyStatusRefresh();
+
+  window.__codexPlusProxyRequestStatusRuntime = {
+    refresh: codexPlusProxyStatusRefresh,
+    dispose() {
+      codexPlusProxyStatusState.disposed = true;
+      window.clearInterval(codexPlusProxyStatusState.pollTimer);
+      window.clearInterval(codexPlusProxyStatusState.tickTimer);
+      codexPlusProxyStatusState.node?.remove();
+      codexPlusProxyStatusState.node = null;
+      document.getElementById(codexPlusProxyStatusStyleId)?.remove();
+    },
+  };
   function syncActionGroupsLayout(force = false) {
     syncActionGroupLayouts(sessionRows().map(row => ({
       row, group: actionGroupFromRow(row),

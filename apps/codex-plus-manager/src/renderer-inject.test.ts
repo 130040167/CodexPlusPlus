@@ -25,6 +25,22 @@ it("keeps background-resume scan scheduling bounded and independent of retired f
   assert.doesNotMatch(scan, /requestAnimationFrame/);
 });
 
+it("groups aggregate models by exact member identity instead of bare model name", async () => {
+  const picker = await readFile(
+    new URL("../../../assets/inject/renderer-inject/71-model-picker-groups.js", import.meta.url),
+    "utf8",
+  );
+  // 同名上游模型（多个成员都发布 deepseek-v4-pro 之类）必须按「模型名 + 供应商」
+  // 或完整展示名精确匹配目录，不能只按裸模型名命中目录里第一个同名成员。
+  assert.match(picker, /function codexPlusModelPickerCatalogExactMap\(\)/);
+  assert.match(picker, /codexPlusModelPickerNormalizeLoose\(split\.name\)/);
+  assert.match(picker, /provider:\$\{split\.provider\}/);
+  assert.doesNotMatch(
+    picker,
+    /const known = providers\.get\(codexPlusModelPickerNormalizeStrict\(split\.name\)\)/,
+  );
+});
+
 const STEPWISE_FRAGMENT_PATHS = [
   "floating-panel/runtime/state.js",
   "floating-panel/core/appearance-runtime.js",
@@ -762,10 +778,9 @@ return (loaded) => { codexPlusBackendSettingsLoaded = loaded; renderCodexPlusMen
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
 
     assert.match(renderer, /const CODEX_PLUS_BRIDGE_FAILURE_THRESHOLD = 3;/);
-    assert.match(
-      renderer,
-      /function recordCodexPlusBridgeFailure\(\) \{\s*codexPlusBridgeFailureCount \+= 1;\s*\}/,
-    );
+    assert.match(renderer, /function recordCodexPlusBridgeFailure\(\) \{\s*codexPlusBridgeFailureCount \+= 1;/);
+    // 失败次数必须落到 window 上的 health 快照，启动器看门狗才能判定桥接挂死。
+    assert.match(renderer, /health\.failures = codexPlusBridgeFailureCount;/);
     // 降级渲染：桥接连续失败 + 后端 ok → degraded
     assert.match(renderer, /bridgeDegraded && rawStatus === "ok" \? "degraded" : rawStatus/);
     assert.match(renderer, /桥接降级，自动修复中/);

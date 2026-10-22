@@ -54,6 +54,8 @@ pub mod relay_headers;
 pub mod relay_rotation;
 pub mod relay_switch;
 pub mod remote_control_recovery;
+pub mod request_log;
+pub mod resident_helper;
 pub(crate) mod responses_exec;
 pub(crate) mod responses_exec_sse;
 pub(crate) mod responses_exec_transport;

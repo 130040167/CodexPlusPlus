@@ -48,21 +48,19 @@ pub fn load_global_dictation_hotkey() -> CommandResult<Value> {
 
 #[tauri::command]
 pub fn set_global_dictation_hotkey(enabled: bool, hotkey: String) -> CommandResult<Value> {
-    let mut config = codex_plus_core::global_dictation::load_config();
-    config.enabled = enabled;
-    config.hotkey = hotkey.trim().to_string();
-    if let Err(error) = codex_plus_core::global_dictation::validate_hotkey(&config.hotkey) {
-        return failed(&error.to_string(), json!({}));
-    }
-    if let Err(error) = codex_plus_core::global_dictation::save_config(&config) {
-        return failed(&format!("保存全局听写热键失败：{error}"), json!({}));
-    }
-    match crate::global_dictation::apply_config() {
+    let config = codex_plus_core::global_dictation::GlobalDictationConfig {
+        enabled,
+        hotkey: hotkey.trim().to_string(),
+    };
+    match crate::global_dictation::save_and_apply_config(&config) {
         Ok(()) => ok(
             if enabled { "全局听写热键已开启。" } else { "全局听写热键已关闭。" },
             serde_json::to_value(config).unwrap_or_else(|_| json!({})),
         ),
-        Err(error) => failed(&format!("注册全局听写热键失败：{error}"), serde_json::to_value(config).unwrap_or_else(|_| json!({}))),
+        Err(error) => failed(
+            &format!("更新全局听写热键失败：{error:#}"),
+            serde_json::to_value(codex_plus_core::global_dictation::load_config()).unwrap_or_else(|_| json!({})),
+        ),
     }
 }
 
@@ -116,6 +114,77 @@ pub async fn claude_localization_set_localization(enabled: bool) -> CommandResul
         ),
         Ok(Err(error)) => failed(&error.to_string(), json!({})),
         Err(error) => failed(&format!("Claude 设置失败：{error}"), json!({})),
+    }
+}
+
+// ---------------------------------------------------------------- ZCode 增强
+
+fn zcode_status_value(status: &crate::zcode::ZcodeStatus) -> Value {
+    serde_json::to_value(status).unwrap_or_else(|_| json!({}))
+}
+
+#[tauri::command]
+pub async fn zcode_enhancement_status() -> CommandResult<Value> {
+    let status = crate::zcode::probe().await;
+    ok("ZCode 增强状态已读取。", zcode_status_value(&status))
+}
+
+#[tauri::command]
+pub async fn zcode_enhancement_action(action: String) -> CommandResult<Value> {
+    let action = action.trim().to_string();
+    match crate::zcode::action(&action).await {
+        Ok(status) => {
+            let message = match action.as_str() {
+                "launch" if status.injected => "ZCode 已启动并注入语音输入。",
+                "launch" if !status.voice_input => {
+                    "ZCode 已启动（语音输入开关关闭，未注入语音入口）。"
+                }
+                "launch" if status.running => {
+                    "ZCode 已启动，但语音输入入口尚未注入，可稍后重试「重新注入」。"
+                }
+                "launch" => "ZCode 启动指令已发送。",
+                "reinject" if status.injected => "语音输入入口已重新注入。",
+                "reinject" => "已尝试重新注入，但页面健康检查尚未通过。",
+                _ => "ZCode 增强状态已读取。",
+            };
+            ok(message, zcode_status_value(&status))
+        }
+        Err(error) => failed(&format!("ZCode 操作失败：{error:#}"), json!({})),
+    }
+}
+
+#[tauri::command]
+pub async fn zcode_enhancement_set_voice_input(enabled: bool) -> CommandResult<Value> {
+    let save = tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<()> {
+        let store = SettingsStore::default();
+        let mut settings = store.load()?;
+        settings.zcode_app_voice_input = enabled;
+        store.save(&settings)?;
+        Ok(())
+    })
+    .await;
+    match save {
+        Ok(Ok(())) => {
+            if enabled {
+                // 尝试补注入（内部会按需启动本地语音服务拿 endpoint/token）。ZCode 没在
+                // 跑时失败不算错误，等它下次启动时由守护线程安装。
+                let _ = crate::zcode::reinject_if_possible().await;
+            } else {
+                // 关闭时尽量让页面脚本自己清理，不留下一个点了会失败的入口。
+                let _ = crate::zcode::dispose().await;
+            }
+            let status = crate::zcode::probe().await;
+            ok(
+                if enabled {
+                    "ZCode 语音输入已开启。"
+                } else {
+                    "ZCode 语音输入已关闭。"
+                },
+                zcode_status_value(&status),
+            )
+        }
+        Ok(Err(error)) => failed(&format!("保存 ZCode 语音输入设置失败：{error:#}"), json!({})),
+        Err(error) => failed(&format!("保存 ZCode 语音输入设置失败：{error}"), json!({})),
     }
 }
 
@@ -2281,6 +2350,8 @@ pub fn run_auto_takeover_launch(request: LaunchRequest) -> Result<(), String> {
         status_store: StatusStore::default(),
         ..Default::default()
     };
+    // 自动接管也走常驻 helper：Codex 之后退出时本地代理仍可被外部客户端使用。
+    sync_resident_helper();
     codex_plus_launcher::start(launch_options).map_err(|error| error.to_string())
 }
 
@@ -2535,6 +2606,65 @@ fn restart_stop_failure_message(error: &RestartStopError) -> String {
     }
 }
 
+/// 让本地协议代理 helper 常驻（见 core `resident_helper`）。
+///
+/// helper 过去只随 `launch_and_inject` 的 Codex 会话启动、Codex 退出即关闭；
+/// 而 live `config.toml` 里写死了本地代理地址，于是终端 `codex`、IDE 插件等
+/// 不经过 Codex++ 启动的客户端会连到一个没人监听的端口。现在只要管理器在跑、
+/// 且当前供应商需要本地代理，就把 helper 托管在管理器进程里：Codex 会话退出
+/// 不影响它，只有 Codex++ 退出才停止。
+///
+/// 返回实际监听的端口；当前配置不需要本地代理或启动失败时返回 `None`。
+/// 失败只记诊断日志，不打断调用方（启动链路会按旧逻辑自行 bind/重试）。
+pub fn sync_resident_helper() -> Option<u16> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let settings = match SettingsStore::default().load() {
+        Ok(settings) => Some(settings),
+        Err(error) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.resident_helper.settings_failed",
+                serde_json::json!({ "message": error.to_string() }),
+            );
+            None
+        }
+    };
+    // 两个信号取并集：
+    // - 设置里当前供应商需要固定协议代理端口（启动流程随后会把 config.toml 指向它）；
+    // - live config.toml 已经指向本地代理（Codex 现在就会把请求发过来，哪怕设置
+    //   尚未同步/更新）。
+    let settings_need_proxy = settings
+        .as_ref()
+        .and_then(codex_plus_core::launcher::required_fixed_helper_port)
+        .is_some();
+    if !settings_need_proxy
+        && !codex_plus_core::relay_config::live_config_uses_managed_protocol_proxy_in_home(&home)
+    {
+        return None;
+    }
+    let port = codex_plus_core::protocol_proxy::protocol_proxy_port();
+    if let Some(settings) = &settings {
+        codex_plus_core::launcher::set_http_body_limit_bytes(
+            settings.helper_max_request_body_bytes(),
+        );
+    }
+    match codex_plus_core::resident_helper::ensure_resident_helper(port) {
+        Ok(()) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.resident_helper.ready",
+                serde_json::json!({ "port": port }),
+            );
+            Some(port)
+        }
+        Err(error) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.resident_helper.failed",
+                serde_json::json!({ "port": port, "message": error.to_string() }),
+            );
+            None
+        }
+    }
+}
+
 fn prepare_fixed_helper_port_for_restart(settings: Option<&BackendSettings>) -> anyhow::Result<()> {
     let loaded;
     let settings = match settings {
@@ -2554,6 +2684,11 @@ fn prepare_fixed_helper_port_for_restart(settings: Option<&BackendSettings>) -> 
     // 与 launcher 启动时同一套迁移：端口落在 Windows 保留区间（10013）时先换端口，
     // 否则下面会对着永远绑不上的旧端口等满超时，重启必然失败（#1163）。
     let port = codex_plus_core::protocol_proxy::ensure_protocol_proxy_port_available();
+    // 常驻 helper 占着该端口是预期状态（它归管理器所有），不是「旧 launcher
+    // 还没释放」，不能按忙等处理，否则重启会白等到超时。
+    if codex_plus_core::resident_helper::resident_helper_port() == Some(port) {
+        return Ok(());
+    }
     codex_plus_core::launcher::wait_for_fixed_helper_port(
         port,
         codex_plus_core::launcher::protocol_proxy_bind_retry_timeout_ms(),
@@ -2904,6 +3039,9 @@ fn current_timestamp_ms() -> u64 {
 
 fn start_embedded_launcher(request: &LaunchRequest) -> anyhow::Result<()> {
     anyhow::ensure!(!crate::app_is_exiting(), "Codex++ 正在退出，未启动 Codex");
+    // 先让常驻 helper 占住协议代理端口：启动链路会识别并复用，Codex 会话退出
+    // 时就不再关闭它，从而实现「Codex++ 在跑，本地代理就一直可用」。
+    sync_resident_helper();
     codex_plus_launcher::start(codex_plus_launcher::LaunchOptions {
         app_dir: (!request.app_path.trim().is_empty())
             .then(|| PathBuf::from(request.app_path.trim())),
@@ -2920,6 +3058,9 @@ pub fn resume_existing_codex_background(app: tauri::AppHandle, start_if_missing:
         if crate::app_is_exiting() {
             return;
         }
+        // 必须先于 resume：resume 会走 launch_and_inject，如果它先 bind 了 helper，
+        // Codex 退出时就把端口带走了；这里先托管常驻实例，会话会复用同一监听。
+        sync_resident_helper();
         let settings = SettingsStore::default().load().unwrap_or_default();
         let latest = StatusStore::default().load_latest().unwrap_or(None);
         let options = codex_plus_launcher::LaunchOptions {
@@ -3544,6 +3685,11 @@ pub fn save_settings(mut settings: BackendSettings, expected_revision: Option<St
             }
             // 自动接管是常驻行为，保存后立刻生效，不必重启管理器。
             crate::auto_takeover::apply_enabled(settings.codex_app_auto_takeover);
+            // 请求体上限是运行期策略：保存后立刻让正在运行的本地代理按新上限收请求，
+            // 不必重启 Codex++/Codex。等待下一次 helper 启动的路径也会读到同一设置。
+            codex_plus_core::launcher::set_http_body_limit_bytes(
+                settings.helper_max_request_body_bytes(),
+            );
             settings_payload("设置已保存。", "设置保存后重新读取失败")
         }
         Err(error) => {
@@ -4492,10 +4638,10 @@ pub async fn list_project_sessions(
 }
 
 fn normalized_project_path(path: &str) -> String {
-    path.trim()
-        .replace('\\', "/")
+    // 与前端 sessionGroups 一致：只统一分隔符和末尾斜杠，保留大小写及路径中的空格。
+    path.replace('\\', "/")
         .trim_end_matches('/')
-        .to_ascii_lowercase()
+        .to_string()
 }
 
 fn list_project_sessions_blocking(cwd: String) -> CommandResult<LocalSessionsPayload> {
@@ -4773,6 +4919,11 @@ fn normalized_codex_app_path_for_save(raw: &str) -> String {
 
 fn normalize_settings_before_save(mut settings: BackendSettings) -> BackendSettings {
     settings.codex_app_path = normalized_codex_app_path_for_save(&settings.codex_app_path);
+    // 请求体上限在落盘前夹取到 32~512 MiB，settings.json 永远是可用值。
+    settings.helper_max_request_body_mib =
+        codex_plus_core::settings::clamp_helper_max_request_body_mib(
+            settings.helper_max_request_body_mib,
+        );
     settings.relay_common_config_contents =
         codex_plus_core::relay_config::sanitize_common_config_contents(
             &settings.relay_common_config_contents,
@@ -6369,9 +6520,62 @@ pub fn load_relay_proxy(profile_id: String) -> CommandResult<Value> {
         "供应商代理已读取。",
         json!({
             "profileId": profile_id,
-            "proxyUrl": codex_plus_core::relay_proxy::proxy_for_profile(&profile_id).unwrap_or_default()
+            "proxyUrl": codex_plus_core::relay_proxy::proxy_for_profile(&profile_id).unwrap_or_default(),
+            "configured": codex_plus_core::relay_proxy::configured_proxy_for_profile(&profile_id).is_some()
         }),
     )
+}
+
+#[tauri::command]
+pub fn load_request_logs(limit: Option<usize>) -> CommandResult<Value> {
+    let limit = limit.unwrap_or(200).clamp(1, 1000);
+    match codex_plus_core::request_log::read_request_logs(limit) {
+        Ok(entries) => {
+            // 会话标题来自 Codex 本地会话库，只用于展示；查不到时前端退回短 id。
+            let thread_ids: Vec<String> = entries
+                .iter()
+                .filter_map(|entry| entry.thread_id.clone())
+                .collect();
+            let titles = if thread_ids.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+                let db_paths = codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(&home);
+                codex_plus_data::local_session_titles(&db_paths, &thread_ids)
+            };
+            let entries: Vec<Value> = entries
+                .iter()
+                .map(|entry| {
+                    let mut value = serde_json::to_value(entry).unwrap_or_else(|_| json!({}));
+                    if let Some(title) = entry
+                        .thread_id
+                        .as_ref()
+                        .and_then(|thread_id| titles.get(thread_id))
+                        && let Some(object) = value.as_object_mut()
+                    {
+                        object.insert("threadTitle".to_string(), json!(title));
+                    }
+                    value
+                })
+                .collect();
+            ok(
+                &format!("已读取 {} 条请求日志。", entries.len()),
+                json!({ "entries": entries }),
+            )
+        }
+        Err(error) => failed(
+            &format!("读取请求日志失败：{error}"),
+            json!({ "entries": [] }),
+        ),
+    }
+}
+
+#[tauri::command]
+pub fn clear_request_logs() -> CommandResult<Value> {
+    match codex_plus_core::request_log::clear_request_logs() {
+        Ok(()) => ok("请求日志已清空。", json!({})),
+        Err(error) => failed(&format!("清空请求日志失败：{error}"), json!({})),
+    }
 }
 
 #[tauri::command]
@@ -6379,13 +6583,14 @@ pub fn set_relay_proxy(profile_id: String, proxy_url: String) -> CommandResult<V
     match codex_plus_core::relay_proxy::set_proxy_for_profile(&profile_id, &proxy_url) {
         Ok(()) => ok(
             if proxy_url.trim().is_empty() {
-                "供应商独立代理已清除。"
+                "供应商独立代理已清除。请保存并重新应用该供应商，然后重启 Codex 使会话请求生效。"
             } else {
-                "供应商独立代理已保存。"
+                "供应商独立代理已保存。请保存并重新应用该供应商，然后重启 Codex 使会话请求生效。"
             },
             json!({
                 "profileId": profile_id.trim(),
-                "proxyUrl": proxy_url.trim()
+                "proxyUrl": proxy_url.trim(),
+                "configured": codex_plus_core::relay_proxy::configured_proxy_for_profile(&profile_id).is_some()
             }),
         ),
         Err(error) => failed(&format!("保存供应商代理失败：{error}"), json!({})),
@@ -6867,6 +7072,9 @@ pub fn switch_relay_profile(
                     "backupPath": result.backup_path.as_ref()
                 }),
             );
+            // 新配置已经写进 config.toml：需要本地代理时立即让它常驻，
+            // 这样不经过 Codex++ 启动的客户端也能直接用。
+            sync_resident_helper();
             ok(
                 "供应商已切换。",
                 relay_switch_payload(result.settings, status, result.backup_path),
@@ -7831,6 +8039,8 @@ pub fn apply_relay_injection() -> CommandResult<RelayPayload> {
                 &home,
                 "manager.apply_relay_injection.aggregate",
             );
+            // 聚合也走本地代理：配置写好后立即常驻，供外部客户端直接使用。
+            sync_resident_helper();
         }
         return response;
     }
@@ -7853,6 +8063,7 @@ pub fn apply_relay_injection() -> CommandResult<RelayPayload> {
                     result.backup_path.as_ref(),
                     None,
                 );
+                sync_resident_helper();
                 ok(
                     "已按兼容切换规则切换供应商。",
                     relay_payload(status, result.backup_path),
@@ -7912,6 +8123,7 @@ pub fn apply_relay_injection() -> CommandResult<RelayPayload> {
                 result.backup_path.as_ref(),
                 None,
             );
+            sync_resident_helper();
             ok(
                 "中转配置已写入，密钥未在界面明文显示。",
                 relay_payload(status, result.backup_path),
@@ -8054,6 +8266,7 @@ pub fn apply_pure_api_injection() -> CommandResult<RelayPayload> {
                         relay_payload(status, result.backup_path),
                     );
                 }
+                sync_resident_helper();
                 ok(
                     "已按兼容切换规则切换供应商。",
                     relay_payload(status, result.backup_path),
@@ -8103,6 +8316,7 @@ pub fn apply_pure_api_injection() -> CommandResult<RelayPayload> {
                     relay_payload(status, result.backup_path),
                 );
             }
+            sync_resident_helper();
             ok(
                 "纯 API 模式已写入：config.toml 已写入 custom provider，auth.json 已切换为当前供应商。",
                 relay_payload(status, result.backup_path),
@@ -10235,6 +10449,43 @@ base_url = "https://example.invalid/v1"
     }
 
     #[test]
+    fn project_path_identity_matches_frontend_grouping() {
+        assert_eq!(normalized_project_path(r"C:\Projects\Foo\\"), "C:/Projects/Foo");
+        assert_eq!(normalized_project_path("/Projects/Foo///"), "/Projects/Foo");
+        assert_ne!(normalized_project_path("/Projects/Foo"), normalized_project_path("/Projects/foo"));
+        assert_ne!(normalized_project_path("/Projects/Foo"), normalized_project_path(" /Projects/Foo"));
+    }
+
+    #[test]
+    fn list_project_sessions_keeps_case_distinct_projects_separate() {
+        let _codex_home_guard = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let home = temp.path().join("codex-home");
+        let sqlite = home.join("sqlite");
+        std::fs::create_dir_all(&sqlite).unwrap();
+        let db = rusqlite::Connection::open(sqlite.join("state_5.sqlite")).unwrap();
+        db.execute_batch(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, title TEXT, cwd TEXT, updated_at_ms INTEGER);\
+             INSERT INTO threads VALUES ('upper', '', 'Upper', '/Projects/Foo', 30);\
+             INSERT INTO threads VALUES ('upper-slash', '', 'Upper slash', '/Projects/Foo/', 20);\
+             INSERT INTO threads VALUES ('lower', '', 'Lower', '/Projects/foo', 10);",
+        ).unwrap();
+        drop(db);
+        unsafe { std::env::set_var("CODEX_HOME", &home); }
+        let upper = list_project_sessions_blocking("/Projects/Foo/".into());
+        let lower = list_project_sessions_blocking("/Projects/foo".into());
+        restore_codex_home(previous_codex_home);
+
+        assert_eq!(upper.status, "ok");
+        assert_eq!(upper.payload.total_count, 2);
+        assert_eq!(upper.payload.sessions.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec!["upper", "upper-slash"]);
+        assert_eq!(lower.status, "ok");
+        assert_eq!(lower.payload.total_count, 1);
+        assert_eq!(lower.payload.sessions[0].id, "lower");
+    }
+
+    #[test]
     fn list_local_sessions_deduplicates_threads_across_current_and_legacy_dbs() {
         let _codex_home_guard = lock_codex_home_for_test();
         let temp = tempfile::tempdir().unwrap();
@@ -10564,6 +10815,29 @@ enabled = true
             normalized.codex_app_path.is_empty(),
             "指向 Codex++ 自身的路径不该落库，实际是 {}",
             normalized.codex_app_path
+        );
+    }
+
+    #[test]
+    fn normalize_settings_before_save_clamps_helper_body_limit() {
+        let settings = BackendSettings {
+            helper_max_request_body_mib: 9999,
+            ..BackendSettings::default()
+        };
+        assert_eq!(
+            normalize_settings_before_save(settings)
+                .helper_max_request_body_mib,
+            512
+        );
+
+        let settings = BackendSettings {
+            helper_max_request_body_mib: 1,
+            ..BackendSettings::default()
+        };
+        assert_eq!(
+            normalize_settings_before_save(settings)
+                .helper_max_request_body_mib,
+            32
         );
     }
 

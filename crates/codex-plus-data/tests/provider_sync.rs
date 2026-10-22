@@ -1029,12 +1029,13 @@ fn provider_sync_skips_rollout_locked_after_planning() {
     assert_eq!(fs::read(&rollout).unwrap(), original_rollout);
 }
 
+/// 上面 Windows 用例的 unix 对照：规划后文件变得不可读（PermissionDenied 与共享冲突
+/// 同样按「被锁」处理），备份后的哈希复核要跳过它，而不是把整次同步打成失败。
 #[cfg(unix)]
 #[test]
 fn provider_sync_skips_rollout_unreadable_after_planning() {
     use std::os::unix::fs::PermissionsExt;
 
-    // Unix 用权限拒绝复现同一跳过分支；Windows 上方用独占句柄覆盖真实锁定场景。
     let tmp = tempdir().unwrap();
     let home = tmp.path().join(".codex");
     fs::create_dir(&home).unwrap();
