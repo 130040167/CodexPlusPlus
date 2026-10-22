@@ -177,6 +177,75 @@ function allowMicrophone(target) {
   }
 }
 
+/**
+ * Computer Use 授权自检（仅 macOS、仅勾选了 Computer Use 制作的副本）。
+ *
+ * 由副本自己查自己的授权：isTrustedAccessibilityClient / getMediaAccessStatus
+ * 查的是调用进程本身，不需要读 TCC.db，也就不需要「完全磁盘访问」。
+ * 缺授权时 Computer Use 用不了，弹窗引导用户去系统设置；每次启动最多提醒一次。
+ */
+const CU_MARKER = '.cu-patched';
+
+function computerUsePermissions(electron) {
+  const { systemPreferences } = electron;
+  let accessibility = false;
+  let screen = false;
+  try { accessibility = systemPreferences.isTrustedAccessibilityClient(false) === true; } catch (e) {}
+  try { screen = systemPreferences.getMediaAccessStatus('screen') === 'granted'; } catch (e) {}
+  return { accessibility, screen };
+}
+
+/** 让系统把副本登记进隐私列表并弹出官方提示，再打开对应设置页。 */
+function requestComputerUsePermissions(electron, missing) {
+  const { systemPreferences, desktopCapturer, shell } = electron;
+  if (missing.accessibility) {
+    // 传 true 会让 macOS 弹「去系统设置」提示，同时把副本加进辅助功能列表。
+    try { systemPreferences.isTrustedAccessibilityClient(true); } catch (e) {}
+  }
+  if (missing.screen) {
+    // 主动取一次屏幕源：系统会弹屏幕录制提示，并把副本加进列表。
+    try {
+      Promise.resolve(desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } }))
+        .catch(() => {});
+    } catch (e) {}
+  }
+  const anchor = missing.accessibility ? 'Privacy_Accessibility' : 'Privacy_ScreenCapture';
+  shell.openExternal('x-apple.systempreferences:com.apple.preference.security?' + anchor).catch(() => {});
+}
+
+function checkComputerUsePermissions(electron) {
+  if (process.platform !== 'darwin') return;
+  if (!fs.existsSync(path.join(process.resourcesPath || '', CU_MARKER))) return;
+  const { app, dialog, BrowserWindow } = electron;
+  const granted = computerUsePermissions(electron);
+  log('computer use permissions: accessibility=' + granted.accessibility + ' screen=' + granted.screen);
+  if (granted.accessibility && granted.screen) return;
+  const missing = { accessibility: !granted.accessibility, screen: !granted.screen };
+  const names = [];
+  if (missing.accessibility) names.push('辅助功能');
+  if (missing.screen) names.push('屏幕录制');
+  const parent = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+  const options = {
+    type: 'warning',
+    buttons: ['去授权', '稍后'],
+    defaultId: 0,
+    cancelId: 1,
+    message: 'Computer Use 还缺少系统授权，授权前无法使用',
+    detail:
+      '缺少：' + names.join('、') + '。\n\n' +
+      '点「去授权」后在系统设置里打开「' + app.getName() + '」的开关。' +
+      // 副本与官方版同一个 bundle id：列表里那一行可能是给官方版授的，副本照样过不了。
+      '如果开关已经是打开的仍然提示，先用「−」删掉这一行，再重新打开本应用授权。' +
+      (missing.screen ? '\n\n屏幕录制授权后需要退出并重新打开本应用才生效。' : ''),
+  };
+  const shown = parent ? dialog.showMessageBox(parent, options) : dialog.showMessageBox(options);
+  Promise.resolve(shown)
+    .then((result) => {
+      if (result && result.response === 0) requestComputerUsePermissions(electron, missing);
+    })
+    .catch((e) => log('permission dialog failed: ' + (e && e.message)));
+}
+
 if (globalThis.__claudeCnHookInstalled) {
   log('already installed, skip');
 } else {
@@ -371,6 +440,11 @@ function install() {
     electron.webContents.getAllWebContents().forEach((wc) => watch(wc));
     globalThis.__claudeCnHookInstalled = true;
     log('hook installed (Claude ' + app.getVersion() + ', pid ' + process.pid + ')');
+    // 等主窗口出来再查，弹窗才能挂在窗口上而不是孤零零浮在桌面。
+    app.whenReady()
+      .then(() => new Promise((resolve) => setTimeout(resolve, 2500)))
+      .then(() => checkComputerUsePermissions(electron))
+      .catch((e) => log('permission check failed: ' + (e && e.message)));
   } catch (e) {
     log('wire failed: ' + (e && e.message));
   }
