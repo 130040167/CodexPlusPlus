@@ -13199,9 +13199,22 @@ type ClaudeLocalizationStatus = {
   computerUse: boolean;
 };
 
+/**
+ * Claude 增强页跨挂载的记忆：Codex++ 运行期间只在第一次进入时自动检测一次，
+ * 之后再进来直接显示上次结果，需要时手动点「检测 Claude」刷新。
+ *
+ * 检测已在后台线程跑、带 15 秒超时，未安装 Claude 时直接早退（#2539 的死机不会再现），
+ * 所以首次进入自动检测是安全的；但每次切回来都重新探测进程和运行时没有必要。
+ */
+const claudeLocalizationMemo: {
+  status: CommandResult<ClaudeLocalizationStatus> | null;
+  autoDetected: boolean;
+} = { status: null, autoDetected: false };
+
 function ClaudeLocalizationScreen() {
-  const [status, setStatus] = useState<CommandResult<ClaudeLocalizationStatus> | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
+  const [status, setStatus] = useState<CommandResult<ClaudeLocalizationStatus> | null>(claudeLocalizationMemo.status);
+  // 首次进入会自动检测：初值就标成检测中，免得第一帧先闪出「点击重试」。
+  const [busy, setBusy] = useState<string | null>(claudeLocalizationMemo.autoDetected ? null : "detect");
   const [error, setError] = useState<string | null>(null);
   /** 制作增强版时宿主推送的阶段进度（0-100）。 */
   const [progress, setProgress] = useState<{ percent: number; message: string } | null>(null);
@@ -13227,6 +13240,8 @@ function ClaudeLocalizationScreen() {
     return () => { unlisten?.(); };
   }, []);
   const accept = (result: CommandResult<ClaudeLocalizationStatus>) => {
+    // 先记下有效结果再判断挂载：检测中切走页面，回来时仍能看到这次的结果。
+    if (result.status === "ok") claudeLocalizationMemo.status = result;
     if (!mounted.current) return;
     if (result.status === "ok") setStatus(result);
     else setError(result.message);
@@ -13242,6 +13257,11 @@ function ClaudeLocalizationScreen() {
       if (mounted.current) setBusy(null);
     }
   };
+  useEffect(() => {
+    if (claudeLocalizationMemo.autoDetected) return;
+    claudeLocalizationMemo.autoDetected = true;
+    void refresh();
+  }, []);
   const act = async (action: "prepare" | "launch" | "restore" | "check") => {
     if (pending.current) return;
     pending.current = true;
@@ -13361,7 +13381,11 @@ function ClaudeLocalizationScreen() {
             </div>
           </div>
           {!s ? (
-            <p className="claude-l10n-hint">{t("点击“检测 Claude”读取安装状态；进入此页不会自动检测或修改应用。")}</p>
+            <p className="claude-l10n-hint">
+              {busy === "detect"
+                ? t("正在读取 Claude 安装状态，只读检测，不会修改应用。")
+                : t("没有读到安装状态，点击“检测 Claude”重试；检测不会修改应用。")}
+            </p>
           ) : !s.supported ? (
             <p className="claude-l10n-hint">{t("未检测到 Claude，请先安装官方应用。你可以继续使用 Codex++ 的其他功能。")}</p>
           ) : null}
