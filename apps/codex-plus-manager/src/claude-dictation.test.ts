@@ -99,6 +99,11 @@ test("Code 与 Cowork 两套发送键都要认得", () => {
   assert.ok(page.includes("code-prompt-send"), "缺少 Code 模式的发送键 testid");
   assert.ok(page.includes("chat-input-send"), "缺少 Cowork 模式的发送键 testid");
   assert.ok(page.includes("开始任务"), "Cowork 的发送键标签是「开始任务」，兜底匹配必须覆盖");
+  // Code 模式空闲且输入框为空时不渲染发送键，只剩右侧动作区空壳；不认它，入口会掉到左下角。
+  assert.ok(
+    page.includes("code-prompt-trailing-controls") && page.includes("code-prompt-send-cell"),
+    "空输入框时没有发送键，必须按常驻的 trailing-controls / send-cell 定位",
+  );
   assert.ok(
     page.includes("setInterval(schedule"),
     "模式切换后 composer 会被整块重建，需要低频兜底重挂",
