@@ -435,11 +435,16 @@ function install() {
   };
 
   try {
-    allowMicrophone(session.defaultSession);
+    // 注入器连得够快时 hook 会在 app ready 之前装载，这时读 session.defaultSession 会抛
+    // 「Session can only be received when app is ready」，整条 hook 跟着失败。
+    // 监听器先挂上（webContents 都在 ready 之后才创建），麦克风放行等 ready 再做。
     app.on('web-contents-created', (_e, wc) => watch(wc));
     electron.webContents.getAllWebContents().forEach((wc) => watch(wc));
     globalThis.__claudeCnHookInstalled = true;
     log('hook installed (Claude ' + app.getVersion() + ', pid ' + process.pid + ')');
+    app.whenReady()
+      .then(() => allowMicrophone(session.defaultSession))
+      .catch((e) => log('microphone permission handler failed: ' + (e && e.message)));
     // 等主窗口出来再查，弹窗才能挂在窗口上而不是孤零零浮在桌面。
     app.whenReady()
       .then(() => new Promise((resolve) => setTimeout(resolve, 2500)))

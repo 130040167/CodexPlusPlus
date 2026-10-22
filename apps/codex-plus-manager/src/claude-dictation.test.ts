@@ -93,6 +93,18 @@ test("音频上传字段按白名单收敛，不把页面内容塞进请求头",
   );
 });
 
+test("hook 可能早于 app ready 装载，不能在装载时同步读 session.defaultSession", () => {
+  // ready 之前读 defaultSession 会抛错，整条 hook 失败，汉化和语音入口一起消失。
+  assert.ok(
+    hook.includes(".then(() => allowMicrophone(session.defaultSession))"),
+    "麦克风放行必须等 app.whenReady()",
+  );
+  assert.ok(
+    !/^\s*allowMicrophone\(session\.defaultSession\);/m.test(hook),
+    "不能在装载时同步调用 allowMicrophone(session.defaultSession)",
+  );
+});
+
 test("Code 与 Cowork 两套发送键都要认得", () => {
   // 两套界面的发送键 testid 与文案完全不同：Code 是 code-prompt-send /「发送」，
   // Cowork 是 chat-input-send /「开始任务」。少认一套，入口就会掉到编辑器容器的末尾。
