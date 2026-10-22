@@ -26,9 +26,18 @@ const DICTATION_FILE = path.join(DIR, 'page-dictation.js');
 
 /**
  * Codex++ launcher 写的听写凭据：helper 端口 + 能力令牌。
- * 路径必须与 crates/codex-plus-core/src/launcher.rs 的 DICTATION_HELPER_RECEIPT 一致。
+ * 文件名必须与 crates/codex-plus-core/src/launcher.rs 的 DICTATION_HELPER_RECEIPT 一致。
+ *
+ * launcher 把它写在状态目录（default_app_state_dir），而本脚本装在
+ * `<状态目录>/claude-localization`（claude_localization.rs 的 runtime_dir），所以先读上一级。
+ * 状态目录可被 CODEX_PLUS_STATE_DIR 改掉（本地构建、多开实例），写死家目录会读不到；
+ * 家目录那份只作手工部署（hook 不在 runtime_dir 下）时的兜底。
  */
-const RECEIPT = path.join(os.homedir(), '.codex-session-delete', 'dictation-helper.json');
+const RECEIPT_NAME = 'dictation-helper.json';
+const RECEIPTS = [
+  path.join(path.dirname(DIR), RECEIPT_NAME),
+  path.join(os.homedir(), '.codex-session-delete', RECEIPT_NAME),
+].filter((file, index, all) => all.indexOf(file) === index);
 /** 页面调用主进程的 binding 名（page-dictation.js 按同名字面量调用）。 */
 const BINDING = '__claudeCnDictationCall';
 
@@ -41,19 +50,21 @@ function log(msg) {
 
 /** 读取 launcher 落下的听写凭据；helper 没运行时返回 null。 */
 function readReceipt() {
-  try {
-    const value = JSON.parse(fs.readFileSync(RECEIPT, 'utf8'));
-    if (
-      value &&
-      Number.isInteger(value.port) &&
-      value.port > 0 &&
-      value.port < 65536 &&
-      typeof value.token === 'string' &&
-      value.token
-    ) {
-      return value;
-    }
-  } catch (e) {}
+  for (const file of RECEIPTS) {
+    try {
+      const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (
+        value &&
+        Number.isInteger(value.port) &&
+        value.port > 0 &&
+        value.port < 65536 &&
+        typeof value.token === 'string' &&
+        value.token
+      ) {
+        return value;
+      }
+    } catch (e) {}
+  }
   return null;
 }
 

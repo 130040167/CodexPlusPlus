@@ -62,6 +62,20 @@ test("听写凭据文件名与状态目录跨语言一致", () => {
   );
 });
 
+test("hook 优先从所在 runtime_dir 的上一级读凭据，跟随被覆盖的状态目录", () => {
+  // 状态目录可被 CODEX_PLUS_STATE_DIR 覆盖（本地构建、多开），launcher 的凭据写在那里；
+  // 只读家目录时会报「语音服务未运行」。推导前提：runtime_dir = 状态目录/claude-localization。
+  assert.ok(
+    /fn runtime_dir\(\) -> PathBuf \{\s*crate::paths::default_app_state_dir\(\)\.join\("claude-localization"\)/.test(
+      localization,
+    ),
+    "runtime_dir 必须是状态目录下的一级子目录，hook 才能按上一级找到凭据",
+  );
+  const first = hook.indexOf("path.join(path.dirname(DIR), RECEIPT_NAME)");
+  const fallback = hook.indexOf("path.join(os.homedir(), '.codex-session-delete', RECEIPT_NAME)");
+  assert.ok(first >= 0 && fallback > first, "状态目录那份必须排在家目录兜底之前");
+});
+
 test("语音脚本被登记进受管副本的资产清单", () => {
   assert.ok(
     localization.includes('"page-dictation.js"'),

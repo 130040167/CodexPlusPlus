@@ -80,12 +80,17 @@ pub async fn claude_localization_action(
 ) -> CommandResult<Value> {
     use tauri::Emitter;
     let result = tauri::async_runtime::spawn_blocking(move || {
-        codex_plus_core::claude_localization::perform_with_progress(&action, &move |percent, message| {
+        let result = codex_plus_core::claude_localization::perform_with_progress(&action, &move |percent, message| {
             let _ = app.emit(
                 "claude-localization-progress",
                 json!({ "percent": percent, "message": message }),
             );
-        })
+        });
+        // 刚制作好副本或刚启动副本时，语音入口需要 helper 在线（见 sync_resident_helper）。
+        if result.is_ok() {
+            sync_resident_helper();
+        }
+        result
     })
     .await;
     match result {
@@ -101,7 +106,12 @@ pub async fn claude_localization_action(
 #[tauri::command]
 pub async fn claude_localization_set_voice_input(enabled: bool) -> CommandResult<Value> {
     match tauri::async_runtime::spawn_blocking(move || {
-        codex_plus_core::claude_localization::set_voice_input(enabled)
+        let status = codex_plus_core::claude_localization::set_voice_input(enabled);
+        // 打开时立即拉起 helper；关闭时不停，helper 可能还在给协议代理用。
+        if enabled && status.is_ok() {
+            sync_resident_helper();
+        }
+        status
     }).await {
         Ok(Ok(status)) => ok(
             if enabled { "语音输入已开启。" } else { "语音输入已关闭。" },
@@ -2568,7 +2578,8 @@ fn restart_stop_failure_message(error: &RestartStopError) -> String {
 /// 而 live `config.toml` 里写死了本地代理地址，于是终端 `codex`、IDE 插件等
 /// 不经过 Codex++ 启动的客户端会连到一个没人监听的端口。现在只要管理器在跑、
 /// 且当前供应商需要本地代理，就把 helper 托管在管理器进程里：Codex 会话退出
-/// 不影响它，只有 Codex++ 退出才停止。
+/// 不影响它，只有 Codex++ 退出才停止。Claude 副本开着语音输入时同理常驻，
+/// 它的转写也走这个 helper。
 ///
 /// 返回实际监听的端口；当前配置不需要本地代理或启动失败时返回 `None`。
 /// 失败只记诊断日志，不打断调用方（启动链路会按旧逻辑自行 bind/重试）。
@@ -2592,7 +2603,12 @@ pub fn sync_resident_helper() -> Option<u16> {
         .as_ref()
         .and_then(codex_plus_core::launcher::required_fixed_helper_port)
         .is_some();
+    // 第三个信号：Claude 副本的语音入口要靠 helper 转写，没在跑 Codex 时也得有人监听。
+    let claude_voice_needs_helper = settings
+        .as_ref()
+        .is_some_and(codex_plus_core::claude_localization::voice_input_needs_helper);
     if !settings_need_proxy
+        && !claude_voice_needs_helper
         && !codex_plus_core::relay_config::live_config_uses_managed_protocol_proxy_in_home(&home)
     {
         return None;

@@ -552,6 +552,19 @@ fn voice_input_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// 副本的语音入口靠 Codex++ helper 转写（hook.js 读 helper 落下的凭据）。helper 原本只随
+/// Codex 会话或协议代理常驻，没在跑 Codex 时 Claude 里点麦克风只会提示「语音服务未运行」。
+/// 所以开关打开且已经制作过副本时，管理器要把 helper 常驻起来。
+///
+/// 只看副本凭据，不探测版本与进程，启动链路可以廉价调用；没做过副本的用户不占端口。
+pub fn voice_input_needs_helper(settings: &crate::settings::BackendSettings) -> bool {
+    voice_input_needs_helper_at(&runtime_dir(), settings.claude_app_voice_input)
+}
+
+fn voice_input_needs_helper_at(root: &Path, voice_input: bool) -> bool {
+    voice_input && root.join("prepared.json").is_file()
+}
+
 /// Computer Use 开关。读不到按关闭处理——这条会改 asar，不能默认开。
 fn computer_use_enabled() -> bool {
     crate::settings::SettingsStore::default()
@@ -1144,5 +1157,15 @@ mod tests {
         )
         .unwrap();
         assert!(!dynamic.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn voice_input_needs_helper_only_after_copy_is_prepared() {
+        let dir = tempfile::tempdir().unwrap();
+        // 没做过副本：语音开关默认开启也不能让管理器常驻 helper 占端口。
+        assert!(!voice_input_needs_helper_at(dir.path(), true));
+        fs::write(dir.path().join("prepared.json"), b"{}").unwrap();
+        assert!(voice_input_needs_helper_at(dir.path(), true));
+        assert!(!voice_input_needs_helper_at(dir.path(), false));
     }
 }
