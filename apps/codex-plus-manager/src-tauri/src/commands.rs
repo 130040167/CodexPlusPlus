@@ -7060,11 +7060,13 @@ pub fn switch_relay_profile(
                 json!({
                     "previousActiveRelayId": previous_active_relay_id,
                     "activeRelayId": settings.active_relay_id,
-                    "error": error.to_string()
+                    // `{:#}` 带上完整错误链：只取最外层会只剩「保存供应商设置失败」，
+                    // 看不到真正原因（#2651）。
+                    "error": format!("{error:#}")
                 }),
             );
             failed(
-                &format!("供应商切换失败：{error}"),
+                &format!("供应商切换失败：{error:#}"),
                 relay_switch_payload(settings, status, None),
             )
         }
