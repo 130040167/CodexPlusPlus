@@ -1984,6 +1984,20 @@ body {
   min-width: 0;
 }
 
+/* Key 首尾预览（#2656）：放在 Key 输入框正下方，删除按钮仍是最后一个子元素。 */
+.relay-api-key-preview {
+  grid-column: 3;
+  grid-row: 2;
+  min-width: 0;
+  overflow: hidden;
+  padding: 0 4px;
+  color: hsl(var(--muted-foreground));
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Key 区可能只占表单半列，按它自身的宽度换行，避免宽窗口内仍挤出边框。 */
 @container relay-api-keys (max-width: 440px) {
   .relay-api-key-row {
@@ -2008,6 +2022,11 @@ body {
   .relay-api-key-row > button:last-child {
     grid-column: 3;
     grid-row: 1;
+  }
+
+  .relay-api-key-preview {
+    grid-column: 1 / -1;
+    grid-row: 3;
   }
 }
 

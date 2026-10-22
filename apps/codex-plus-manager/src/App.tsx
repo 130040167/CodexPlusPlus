@@ -185,7 +185,7 @@ import {
   normalizeAggregateDefaultRelayId,
 } from "./aggregate-members";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
-import { createRelayApiKey, normalizeRelayApiKeys, relayProfileWithNormalizedApiKeys, relayProfileWithUpdatedApiKey, type RelayApiKey } from "./provider-api-keys";
+import { apiKeyPreview, createRelayApiKey, normalizeRelayApiKeys, relayProfileWithNormalizedApiKeys, relayProfileWithUpdatedApiKey, type RelayApiKey } from "./provider-api-keys";
 import { relayHeadersValidationMessage, serializeRelayHeaders } from "./relay-headers";
 import { sessionProviderForProtocol } from "./relay-session";
 import { usePopoverLayer } from "./use-popover-layer";
@@ -10783,6 +10783,11 @@ function RelayProfileEditor({
                                 key.id === entry.id ? { ...key, apiKey: event.currentTarget.value } : key))}
                               placeholder={t("输入供应商的 API Key")}
                             />
+                            {apiKeyPreview(entry.apiKey) ? (
+                              <span className="relay-api-key-preview" title={t("Key 首尾预览")}>
+                                {apiKeyPreview(entry.apiKey)}
+                              </span>
+                            ) : null}
                             <Button
                               aria-label={t("删除 Key")}
                               disabled={normalizedApiKeys.apiKeys.length === 1}
