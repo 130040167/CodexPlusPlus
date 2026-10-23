@@ -37,6 +37,8 @@ use serde_json::{Map, Value, json};
 
 /// Claude / Codex 配置里的 MCP server 名字。改动会影响已接入用户的配置，不要改。
 pub const SERVER_ID: &str = "codex-plus-cu";
+/// 浏览器控制用的第二个 server 名。
+pub const BROWSER_SERVER_ID: &str = "codex-plus-browser";
 /// Codex `config.toml` 里的键名（TOML 里不能用连字符之外的字符，这里用下划线保持一致）。
 pub const CODEX_SERVER_ID: &str = "codex_plus_cu";
 
@@ -153,6 +155,40 @@ impl RuntimeLocation {
         env
     }
 
+    /// 浏览器面的环境。与 CU 的 `env()` 分开：
+    ///
+    /// - 只开 `browser` 面（CU 走原生直通，不需要 cua-repl 的 computer 面）；
+    /// - `BROWSER_USE_TINYSKY_ENABLED=1` 才会下发 `tab.ax`，否则 Chrome 后端只有
+    ///   Playwright/DOM，元素索引点击直接不可用。
+    pub(crate) fn browser_env(&self) -> BTreeMap<String, String> {
+        let mut env = self.env();
+        env.insert("CUA_REPL_ENABLED_SURFACES".into(), "browser".into());
+        env.insert("BROWSER_USE_AVAILABLE_BACKENDS".into(), "chrome".into());
+        env.insert("BROWSER_USE_TINYSKY_ENABLED".into(), "1".into());
+        env.insert(
+            "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME".into(),
+            "Control the Chrome browser in conjunction with the Chrome Plugin.".into(),
+        );
+        env
+    }
+
+    /// 原生 CU server 直接需要的环境。
+    ///
+    /// 实测：缺 `CODEX_CLI_PATH` 时，凡是需要「app-server 审批通道」的调用都会失败为
+    /// `-10005 codex app-server exited before returning a response`（例如首次接管
+    /// Calculator 时）。这条通道与直通不直通无关，原生 server 自己要它。
+    pub(crate) fn native_client_env(&self) -> BTreeMap<String, String> {
+        let mut env = BTreeMap::new();
+        env.insert("CODEX_HOME".into(), self.codex_home.clone());
+        if let Some(cli) = &self.codex_cli {
+            env.insert("CODEX_CLI_PATH".into(), cli.clone());
+        }
+        if let Some(service) = &self.service_path {
+            env.insert("SKY_CUA_SERVICE_PATH".into(), service.clone());
+        }
+        env
+    }
+
     fn self_command(&self) -> String {
         std::env::current_exe()
             .map(|path| path.to_string_lossy().into_owned())
@@ -168,6 +204,14 @@ impl RuntimeLocation {
         json!({
             "command": self.self_command(),
             "args": ["--codex-plus-cu-mcp"],
+        })
+    }
+
+    /// 浏览器控制的条目。单独一个 MCP server，和 CU 并列。
+    fn browser_server_entry(&self) -> Value {
+        json!({
+            "command": self.self_command(),
+            "args": ["--codex-plus-browser-mcp"],
         })
     }
 }
@@ -627,19 +671,31 @@ fn install_json_entry(
     let servers = servers
         .as_object_mut()
         .with_context(|| format!("{} 的 mcpServers 不是对象，未修改", path.display()))?;
-    let expected = runtime.server_entry();
-    if let Some(existing) = servers.get(SERVER_ID) {
-        ensure!(
-            looks_like_ours(existing, runtime),
-            "{} 里已有同名 {} 且不是本功能写入的，未覆盖",
-            path.display(),
-            SERVER_ID
-        );
-        if entry_matches(existing, &expected) {
-            return receipt(target, false, None);
+
+    // CU 与浏览器是两个独立的 server，各自判定、各自写；只改自己那条。
+    let entries = [
+        (SERVER_ID, runtime.server_entry()),
+        (BROWSER_SERVER_ID, runtime.browser_server_entry()),
+    ];
+    let mut changed = false;
+    for (id, expected) in entries {
+        if let Some(existing) = servers.get(id) {
+            ensure!(
+                looks_like_ours(existing, runtime),
+                "{} 里已有同名 {} 且不是本功能写入的，未覆盖",
+                path.display(),
+                id
+            );
+            if entry_matches(existing, &expected) {
+                continue;
+            }
         }
+        servers.insert(id.to_string(), expected);
+        changed = true;
     }
-    servers.insert(SERVER_ID.to_string(), expected);
+    if !changed {
+        return receipt(target, false, None);
+    }
     let rendered = format!("{}\n", serde_json::to_string_pretty(&root)?);
     let backup = write_with_backup(path, before.as_deref(), &rendered)?;
     receipt(target, true, backup)
@@ -650,11 +706,12 @@ fn uninstall_json_entry(path: &Path, target: Target) -> anyhow::Result<InstallRe
         return receipt(target, false, None);
     };
     let mut root = parse_json_object(&before, path)?;
-    let removed = root
-        .get_mut("mcpServers")
-        .and_then(Value::as_object_mut)
-        .and_then(|servers| servers.remove(SERVER_ID))
-        .is_some();
+    let mut removed = false;
+    if let Some(servers) = root.get_mut("mcpServers").and_then(Value::as_object_mut) {
+        for id in [SERVER_ID, BROWSER_SERVER_ID] {
+            removed |= servers.remove(id).is_some();
+        }
+    }
     if !removed {
         return receipt(target, false, None);
     }
@@ -1283,7 +1340,8 @@ fn looks_like_ours(entry: &Value, runtime: &RuntimeLocation) -> bool {
         .and_then(|items| items.first())
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if first_arg == "--codex-plus-cu-mcp" {
+    // CU 与浏览器是两个条目，都算本功能写入的。
+    if first_arg == "--codex-plus-cu-mcp" || first_arg == "--codex-plus-browser-mcp" {
         // 同一份配置可能在 debug / release / 安装位置之间被复用：只认「是不是
         // Codex++ 自己的二进制」，而不是某一条绝对路径，否则换个构建就会被判成他人条目。
         if command == runtime.self_command() {

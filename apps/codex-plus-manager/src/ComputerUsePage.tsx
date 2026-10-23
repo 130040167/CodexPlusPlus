@@ -36,6 +36,14 @@ type CuCheck = {
   failureDetail?: string;
 };
 type CuResult = { status: string; message: string };
+type CuApprovalMode = "auto" | "claude";
+type CuApprovedApp = { decision: string; mode?: string; displayName?: string; decidedAt?: number };
+type CuApprovalState = {
+  status?: string;
+  message?: string;
+  mode?: CuApprovalMode;
+  approvals?: Array<[string, CuApprovedApp]>;
+};
 
 // Codex 桌面版自己会把 [mcp_servers.computer-use] 写进 ~/.codex/config.toml，
 // 再挂一份只会让同一个 CU 服务出现两条连接，所以默认只列两个 Claude 客户端。
@@ -87,9 +95,84 @@ export function ComputerUsePage() {
   const [readError, setReadError] = useState("");
   const [actionError, setActionError] = useState("");
   const [notice, setNotice] = useState("");
+  const [approval, setApproval] = useState<CuApprovalState | null>(null);
   const mounted = useRef(false);
   const epoch = useRef(0);
   const lock = useRef(false);
+
+  const loadApproval = useCallback(async () => {
+    try {
+      const next = await invoke<CuApprovalState>("computer_use_approval_get");
+      if (mounted.current) setApproval(next);
+    } catch (reason) {
+      if (mounted.current) setActionError(errorText(reason));
+    }
+  }, []);
+
+  const changeApprovalMode = async (mode: CuApprovalMode) => {
+    if (lock.current) return;
+    lock.current = true;
+    setBusy("approval");
+    setActionError("");
+    setNotice("");
+    try {
+      const result = await invoke<CuResult>("computer_use_approval_set", { mode });
+      if (!mounted.current) return;
+      if (result.status === "ok") {
+        setNotice(result.message || t("审批策略已保存。"));
+        await loadApproval();
+      } else {
+        setActionError(result.message || t("保存审批策略失败。"));
+      }
+    } catch (reason) {
+      if (mounted.current) setActionError(errorText(reason));
+    } finally {
+      if (mounted.current) {
+        lock.current = false;
+        setBusy("");
+      }
+    }
+  };
+
+  const forgetApproval = async (app: string) => {
+    if (lock.current) return;
+    lock.current = true;
+    setBusy(`forget:${app}`);
+    try {
+      const result = await invoke<CuResult>("computer_use_approval_forget", { app });
+      if (mounted.current && result.status === "ok") {
+        setNotice(result.message || t("已撤销。"));
+        await loadApproval();
+      }
+    } catch (reason) {
+      if (mounted.current) setActionError(errorText(reason));
+    } finally {
+      if (mounted.current) {
+        lock.current = false;
+        setBusy("");
+      }
+    }
+  };
+
+  const clearApprovals = async () => {
+    if (lock.current) return;
+    lock.current = true;
+    setBusy("approval:clear");
+    try {
+      const result = await invoke<CuResult>("computer_use_approval_clear");
+      if (mounted.current && result.status === "ok") {
+        setNotice(result.message || t("已清空。"));
+        await loadApproval();
+      }
+    } catch (reason) {
+      if (mounted.current) setActionError(errorText(reason));
+    } finally {
+      if (mounted.current) {
+        lock.current = false;
+        setBusy("");
+      }
+    }
+  };
 
   const loadStatus = useCallback(async () => {
     if (lock.current) return;
@@ -117,6 +200,7 @@ export function ComputerUsePage() {
   useEffect(() => {
     mounted.current = true;
     void loadStatus();
+    void loadApproval();
     return () => {
       mounted.current = false;
       epoch.current += 1;
@@ -285,6 +369,62 @@ export function ComputerUsePage() {
             </div>;
           })}
         </div>
+      </section>
+
+      <section className="cu-card" aria-labelledby="cu-approval-title">
+        <div className="cu-card-head">
+          <div>
+            <h2 id="cu-approval-title">{t("审批")}</h2>
+            <p>{t("Codex 在首次接管某个应用时会请求许可。这里决定这条请求由谁回答。")}</p>
+          </div>
+        </div>
+        <div className="cu-approval-modes" role="radiogroup" aria-label={t("审批策略")}>
+          <button
+            className="cu-mode"
+            type="button"
+            role="radio"
+            aria-checked={(approval?.mode ?? "auto") === "auto"}
+            data-active={(approval?.mode ?? "auto") === "auto"}
+            disabled={locked}
+            onClick={() => void changeApprovalMode("auto")}
+          >
+            <strong>{t("完全放开")}</strong>
+            <small>{t("自动放行所有应用，只记审计日志。适合完全信任调用方、不想被打断的场景。")}</small>
+          </button>
+          <button
+            className="cu-mode"
+            type="button"
+            role="radio"
+            aria-checked={approval?.mode === "claude"}
+            data-active={approval?.mode === "claude"}
+            disabled={locked}
+            onClick={() => void changeApprovalMode("claude")}
+          >
+            <strong>{t("交给 Claude 审批")}</strong>
+            <small>{t("把 Codex 原生的许可请求转给 MCP 客户端，由 Claude 侧弹卡确认；拒绝即不放行。")}</small>
+          </button>
+        </div>
+        {(approval?.approvals?.length ?? 0) > 0 && <div className="cu-approvals">
+          <div className="cu-approvals-head">
+            <strong>{t("已记忆的应用")}</strong>
+            <button className="mg-button" type="button" disabled={locked} onClick={() => void clearApprovals()}>
+              {busy === "approval:clear" ? <Loader2 size={14} className="cu-spin" /> : null}{t("全部清空")}
+            </button>
+          </div>
+          <ul className="cu-approval-list">
+            {approval!.approvals!.map(([key, entry]) => (
+              <li key={key}>
+                <span className="cu-approval-name">{entry.displayName || key}</span>
+                <code className="cu-approval-key" title={key}>{key}</code>
+                <span className="cu-approval-decision" data-decision={entry.decision}>{entry.decision === "allow" ? t("允许") : t("拒绝")}</span>
+                <button className="mg-button" type="button" disabled={locked} onClick={() => void forgetApproval(key)}>
+                  {busy === `forget:${key}` ? <Loader2 size={13} className="cu-spin" /> : null}{t("撤销")}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>}
+        {approval && (approval.approvals?.length ?? 0) === 0 && <p className="cu-hint">{t("还没有记住任何应用。选择「交给 Claude 审批」后，Claude 批准过的应用会出现在这里。")}</p>}
       </section>
 
       <section className="cu-card" aria-labelledby="cu-check-title">

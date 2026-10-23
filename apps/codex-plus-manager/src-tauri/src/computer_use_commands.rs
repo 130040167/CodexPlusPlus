@@ -131,3 +131,65 @@ pub async fn computer_use_open_app() -> CommandResult<Value> {
         Err(error) => failed(&error, json!({})),
     }
 }
+
+// ---------------------------------------------------------------------------
+// 审批
+// ---------------------------------------------------------------------------
+
+/// 当前审批策略与已记忆的应用。
+///
+/// `auto` = 全部放行（只留痕）；`claude` = 交给 MCP 客户端审批。
+#[tauri::command]
+pub async fn computer_use_approval_get() -> CommandResult<Value> {
+    let mode = codex_plus_core::computer_use_approval::ApprovalMode::current();
+    ok(
+        "已读取审批策略。",
+        json!({
+            "mode": mode.id(),
+            "approvals": codex_plus_core::computer_use_approval::ApprovalStore::read_all(),
+        }),
+    )
+}
+
+/// 切换审批策略。写进 `settings.json` 的 `computerUseApproval`。
+///
+/// 只改这一个键：设置里还有几十个互不相关的字段，整份回写会把并发改动冲掉。
+#[tauri::command]
+pub async fn computer_use_approval_set(mode: String) -> CommandResult<Value> {
+    if !matches!(mode.as_str(), "auto" | "claude") {
+        return failed("审批策略只能是 auto 或 claude", json!({}));
+    }
+    match run_blocking(move || -> anyhow::Result<()> {
+        let store = codex_plus_core::settings::SettingsStore::default();
+        let mut settings = store.load()?;
+        settings.computer_use_approval = mode;
+        store.save(&settings)?;
+        Ok(())
+    })
+    .await
+    {
+        Ok(()) => ok("审批策略已保存；对下一个 Claude 会话生效。", json!({})),
+        Err(error) => failed(&error, json!({})),
+    }
+}
+
+/// 撤销某个应用的审批记忆。
+#[tauri::command]
+pub async fn computer_use_approval_forget(app: String) -> CommandResult<Value> {
+    match run_blocking(move || codex_plus_core::computer_use_approval::ApprovalStore::forget(&app))
+        .await
+    {
+        Ok(true) => ok("已撤销该应用的审批记忆。", json!({})),
+        Ok(false) => ok("没有找到该应用的审批记录。", json!({})),
+        Err(error) => failed(&error, json!({})),
+    }
+}
+
+/// 清空全部审批记忆。
+#[tauri::command]
+pub async fn computer_use_approval_clear() -> CommandResult<Value> {
+    match run_blocking(codex_plus_core::computer_use_approval::ApprovalStore::clear).await {
+        Ok(()) => ok("已清空全部审批记忆。", json!({})),
+        Err(error) => failed(&error, json!({})),
+    }
+}

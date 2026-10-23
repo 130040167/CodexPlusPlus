@@ -10,6 +10,13 @@ fn main() {
         }
         return;
     }
+    if args.get(1).is_some_and(|arg| arg == "--codex-plus-browser-mcp") {
+        if let Err(error) = codex_plus_manager_lib::run_browser_use_mcp() {
+            eprintln!("浏览器控制 MCP 退出：{error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.get(1).is_some_and(|arg| arg == "--codex-plus-cu-cli") {
         if let Err(error) = codex_plus_manager_lib::run_computer_use_cli(&args[2..]) {
             eprintln!("Computer Use 诊断失败：{error:#}");

@@ -17,20 +17,25 @@
 //!
 //! 1. **字节转发**：`tools/list` / `tools/call` / 结果 / 通知全部原样透传，
 //!    不解析、不改写、不合成。id 也不重映射（1:1 会话，两端 id 天然一致）。
-//! 2. **补声明 elicitation**：Claude Code 不声明该能力，而原生 server 无论如何都会
-//!    发 `elicitation/create` 并阻塞（实测），所以 `initialize` 时替客户端补上。
-//! 3. **接管审批**：拦下 `elicitation/create` 并就地应答，同时留痕。
-//!
-//! 当前阶段就地 `accept`；审批卡与持久化在 M2 接进来（见设计文档 §5）。
+//! 2. **补声明 elicitation**：Claude Code 2.1.245 里虽然有 elicitation 的实现，
+//!    但客户端能力里未必声明；原生 server 无论如何都会发该请求并阻塞（实测），
+//!    所以 `initialize` 时替客户端补上，保证请求能被渲染。
+//! 3. **审批**：按 `computer_use_approval` 设置决定就地放行还是转给客户端。
 
+use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use serde_json::{Value, json};
 
 use crate::computer_use::{RuntimeLocation, locate_runtime};
+use crate::computer_use_approval::{ApprovalMode, ApprovalStore, Outcome, subject_of};
+
+/// 审批转给客户端后等多久。超过就回 `cancel`，不让会话永久挂住。
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 单帧上限，与原生 CU 的 8 MiB 对齐。
 const MAX_FRAME: usize = 8 * 1024 * 1024;
@@ -61,6 +66,11 @@ pub fn serve() -> anyhow::Result<()> {
     let mut forwarder = Forwarder {
         child_stdin,
         declare_elicitation: true,
+        client_supports_elicitation: None,
+        mode: ApprovalMode::current(),
+        pending: HashMap::new(),
+        session_allowed: BTreeSet::new(),
+        next_token: 0,
     };
     let outcome = forwarder.run(receiver);
     let _ = child.kill();
@@ -76,6 +86,7 @@ fn spawn_child(runtime: &RuntimeLocation, shim: &std::path::Path) -> anyhow::Res
     command
         .arg(shim)
         .env("CODEX_PLUS_CU_CLIENT", &runtime.client)
+        .envs(runtime.native_client_env())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -140,31 +151,64 @@ fn read_frame(reader: &mut impl BufRead, frame: &mut Vec<u8>) -> std::io::Result
     Ok(read)
 }
 
+/// 已转给客户端、正在等答复的审批。
+struct PendingApproval {
+    /// 子进程原本的请求 id。
+    child_id: Value,
+    /// 用于记忆与审计的键（bundle id，缺失时是显示名）。
+    key: String,
+    display: String,
+    started: Instant,
+}
+
 struct Forwarder {
     child_stdin: ChildStdin,
     /// 是否还需要在 `initialize` 里替客户端补 elicitation 能力。
     declare_elicitation: bool,
+    /// 客户端自己是否声明了 elicitation。
+    ///
+    /// `None` = 还没握手。这个值决定 `claude` 模式能不能真的转发：
+    /// Claude Code 2.x 不声明（转发出去没人渲染，只会等到超时），
+    /// 3.x 之后声明与否要以实际握手为准，不能按版本号猜。
+    client_supports_elicitation: Option<bool>,
+    mode: ApprovalMode,
+    /// 我们发给客户端的审批请求 id（字符串，避免与两端数字 id 撞号）→ 待办。
+    pending: HashMap<String, PendingApproval>,
+    /// 本进程内已放行的 app（`session` 语义，不落盘）。
+    session_allowed: BTreeSet<String>,
+    next_token: u64,
 }
 
 impl Forwarder {
     fn run(&mut self, receiver: Receiver<Event>) -> anyhow::Result<()> {
-        while let Ok(event) = receiver.recv() {
-            match event {
-                Event::Client(frame) => {
+        // 用 `recv_timeout` 而不是 `recv`：审批超时需要在**没有消息**时也能触发。
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(500)) {
+                Ok(Event::Client(frame)) => {
                     if let Err(error) = self.on_client(frame) {
                         eprintln!("[codex-plus-cu] 处理客户端消息失败：{error:#}");
                         return Ok(());
                     }
                 }
-                Event::Child(frame) => self.on_child(frame)?,
-                Event::ChildClosed => return Ok(()),
+                Ok(Event::Child(frame)) => self.on_child(frame)?,
+                Ok(Event::ChildClosed) => {
+                    self.cancel_all("CU 子进程已退出");
+                    return Ok(());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.cancel_all("客户端已断开");
+                    return Ok(());
+                }
             }
+            self.expire_pending()?;
         }
-        Ok(())
     }
 
-    /// 客户端 → 子进程。只有 `initialize` 会被改写（补 elicitation 能力），
-    /// 其余帧原样转发。
+    /// 客户端 → 子进程。
+    ///
+    /// 两种帧需要处理：`initialize` 要补 elicitation 能力；对本代理发出的审批
+    /// 请求的答复要换回子进程的原始 id。
     fn on_client(&mut self, frame: Vec<u8>) -> anyhow::Result<()> {
         if self.declare_elicitation
             && mentions(&frame, b"\"method\"")
@@ -172,34 +216,211 @@ impl Forwarder {
             && let Ok(mut message) = serde_json::from_slice::<Value>(&frame)
             && message.get("method").and_then(Value::as_str) == Some("initialize")
         {
+            // 先记下客户端**自己**有没有声明，再补。补只是为了不让服务端拒绝，
+            // 不代表客户端真的会渲染这个表单——`claude` 模式要看这个值决定能否转发。
+            self.client_supports_elicitation = Some(declares_capability(&message, "elicitation"));
             declare_elicitation(&mut message);
             self.declare_elicitation = false;
             let mut line = serde_json::to_vec(&message)?;
             line.push(b'\n');
             return self.write_child(&line);
         }
+        // 审批答复：没有 method、id 是我们发的字符串。
+        if !mentions(&frame, b"\"method\"")
+            && mentions(&frame, b"\"result\"")
+            && let Ok(message) = serde_json::from_slice::<Value>(&frame)
+            && let Some(token) = message.get("id").and_then(Value::as_str)
+            && let Some(pending) = self.pending.remove(token)
+        {
+            return self.relay_approval(&pending, &message);
+        }
         self.write_child(&frame)
     }
 
-    /// 子进程 → 客户端。唯一的例外是审批请求：就地应答，不转给客户端
-    /// （Claude Code 不声明 elicitation，转过去没人答，只会挂住整条链路）。
+    /// 逐条答复客户端对审批请求的决定。
+    fn relay_approval(&mut self, pending: &PendingApproval, message: &Value) -> anyhow::Result<()> {
+        let action = message
+            .get("result")
+            .and_then(|result| result.get("action"))
+            .and_then(Value::as_str)
+            .unwrap_or("cancel");
+        let content = message
+            .get("result")
+            .and_then(|result| result.get("content"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let outcome = match action {
+            "accept" => Outcome::ClientAccepted,
+            "decline" => Outcome::ClientDeclined,
+            _ => Outcome::ClientCanceled,
+        };
+        if outcome.accepted() {
+            // `session` 语义在本进程内生效；跨会话的持久化交给 `remember`。
+            self.session_allowed.insert(pending.key.clone());
+        }
+        let reply = json!({
+            "jsonrpc": "2.0",
+            "id": pending.child_id,
+            "result": { "action": action, "content": content }
+        });
+        let mut line = serde_json::to_vec(&reply)?;
+        line.push(b'\n');
+        self.write_child(&line)?;
+        self.audit(pending, outcome);
+        Ok(())
+    }
+
+    /// 子进程 → 客户端。审批请求按策略处理，其余帧原样透传。
     fn on_child(&mut self, frame: Vec<u8>) -> anyhow::Result<()> {
         if mentions(&frame, b"\"method\"") && mentions(&frame, b"elicitation/create") {
             if let Ok(message) = serde_json::from_slice::<Value>(&frame) {
                 if message.get("method").and_then(Value::as_str) == Some("elicitation/create") {
-                    record_elicitation(message.get("params"));
-                    let reply = json!({
-                        "jsonrpc": "2.0",
-                        "id": message.get("id").cloned().unwrap_or(Value::Null),
-                        "result": { "action": "accept", "content": {} }
-                    });
-                    let mut line = serde_json::to_vec(&reply)?;
-                    line.push(b'\n');
-                    return self.write_child(&line);
+                    return self.on_elicitation(message);
                 }
             }
         }
         write_client(&frame)
+    }
+
+    fn on_elicitation(&mut self, message: Value) -> anyhow::Result<()> {
+        let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+        let (key, display) = subject_of(&params);
+        let child_id = message.get("id").cloned().unwrap_or(Value::Null);
+
+        // 1) 本进程已放行过 / 文件里记忆过 → 直接 accept。
+        let remembered = if self.session_allowed.contains(&key) {
+            true
+        } else {
+            ApprovalStore::load()
+                .apps
+                .get(&key)
+                .map(|entry| entry.decision == "allow")
+                .unwrap_or(false)
+        };
+        if remembered {
+            let pending = PendingApproval {
+                child_id: child_id.clone(),
+                key,
+                display,
+                started: Instant::now(),
+            };
+            return self.accept_now(&pending, Outcome::Remembered);
+        }
+
+        // 2) `auto` 模式：就地放行，只留痕。
+        if self.mode == ApprovalMode::Auto {
+            let pending = PendingApproval {
+                child_id,
+                key,
+                display,
+                started: Instant::now(),
+            };
+            return self.accept_now(&pending, Outcome::AutoAccepted);
+        }
+
+        // 3) `claude` 模式：只有客户端**自己**声明了 elicitation 才转发。
+        //
+        // 客户端没声明时转发出去没人渲染，只能干等到超时——那比直接放行更糟：
+        // 用户会看到「读应用列表正常、一点击就卡两分钟」。
+        // 版本号不能作为依据（2.x 不声明、3.x 之后可能变），一律以握手时的实际能力为准。
+        if self.client_supports_elicitation == Some(false) {
+            let pending = PendingApproval {
+                child_id,
+                key,
+                display,
+                started: Instant::now(),
+            };
+            eprintln!(
+                "[codex-plus-cu] 客户端未声明 elicitation，`claude` 审批模式退回放行；\
+                 如需真正审批请改用支持 elicitation 的客户端"
+            );
+            return self.accept_now(&pending, Outcome::AutoAccepted);
+        }
+        self.next_token += 1;
+        let token = format!("codexplus-cu-elicit-{}", self.next_token);
+        let forwarded = json!({
+            "jsonrpc": "2.0",
+            "id": token,
+            "method": "elicitation/create",
+            "params": params,
+        });
+        let mut line = serde_json::to_vec(&forwarded)?;
+        line.push(b'\n');
+        self.pending.insert(
+            token,
+            PendingApproval {
+                child_id,
+                key,
+                display,
+                started: Instant::now(),
+            },
+        );
+        write_client(&line)
+    }
+
+    fn accept_now(&mut self, pending: &PendingApproval, outcome: Outcome) -> anyhow::Result<()> {
+        let reply = json!({
+            "jsonrpc": "2.0",
+            "id": pending.child_id,
+            "result": { "action": "accept", "content": {} }
+        });
+        let mut line = serde_json::to_vec(&reply)?;
+        line.push(b'\n');
+        self.write_child(&line)?;
+        if outcome == Outcome::AutoAccepted {
+            self.session_allowed.insert(pending.key.clone());
+        }
+        self.audit(pending, outcome);
+        Ok(())
+    }
+
+    /// 超时的审批一律回 `cancel`，避免客户端不答就把整条链路吊死。
+    fn expire_pending(&mut self) -> anyhow::Result<()> {
+        let expired: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| pending.started.elapsed() >= APPROVAL_TIMEOUT)
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in expired {
+            if let Some(pending) = self.pending.remove(&token) {
+                let reply = json!({
+                    "jsonrpc": "2.0",
+                    "id": pending.child_id,
+                    "result": { "action": "cancel", "content": {} }
+                });
+                let mut line = serde_json::to_vec(&reply)?;
+                line.push(b'\n');
+                self.write_child(&line)?;
+                self.audit(&pending, Outcome::ClientCanceled);
+            }
+        }
+        Ok(())
+    }
+
+    fn cancel_all(&mut self, _reason: &str) {
+        // 先把待办取出来再逐个答复：直接 drain 会同时可变借出 self.pending 与 self。
+        let pending: Vec<(String, PendingApproval)> = self.pending.drain().collect();
+        for (_, pending) in pending {
+            let reply = json!({
+                "jsonrpc": "2.0",
+                "id": pending.child_id,
+                "result": { "action": "cancel", "content": {} }
+            });
+            if let Ok(mut line) = serde_json::to_vec(&reply) {
+                line.push(b'\n');
+                let _ = self.write_child(&line);
+            }
+            self.audit(&pending, Outcome::ClientCanceled);
+        }
+    }
+
+    fn audit(&self, pending: &PendingApproval, outcome: Outcome) {
+        let params = json!({
+            "message": format!("Allow Computer Use to use \"{}\"?", pending.display),
+            "_meta": { "tool_params": { "app": pending.key } }
+        });
+        crate::computer_use_approval::audit(&params, self.mode, outcome);
     }
 
     fn write_child(&mut self, frame: &[u8]) -> anyhow::Result<()> {
@@ -230,6 +451,16 @@ fn write_client(frame: &[u8]) -> anyhow::Result<()> {
 ///
 /// 早先的实现直接替换整个 `capabilities`（连 `clientInfo` 一起盖掉），
 /// 那会让服务端看到的能力与客户端真实能力不符。
+/// 客户端自己有没有声明某个能力（`params.capabilities.<name>` 存在且非 null）。
+fn declares_capability(message: &Value, name: &str) -> bool {
+    message
+        .get("params")
+        .and_then(|params| params.get("capabilities"))
+        .and_then(|capabilities| capabilities.get(name))
+        .map(|value| !value.is_null())
+        .unwrap_or(false)
+}
+
 fn declare_elicitation(message: &mut Value) {
     let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) else {
         return;

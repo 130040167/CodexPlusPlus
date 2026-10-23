@@ -734,6 +734,18 @@ pub struct BackendSettings {
     // 功能本身还受订阅与组织策略约束；误开没有收益，显式勾选才做。
     #[serde(rename = "claudeAppComputerUse", default)]
     pub claude_app_computer_use: bool,
+    /// Codex++ Computer Use 的审批策略。
+    ///
+    /// - `auto`（默认）：代理就地放行，只留痕。适合信任调用方、只想少弹窗的场景。
+    /// - `claude`：把 Codex 原生的 elicitation 表单透传给客户端，由 Claude 侧审批。
+    ///
+    /// 取字符串而不是 bool：以后可能要加「按应用记忆」之类的第三档，
+    /// 用字符串能平滑扩，也不必再改一次 serde 形状。
+    #[serde(
+        rename = "computerUseApproval",
+        default = "default_computer_use_approval"
+    )]
+    pub computer_use_approval: String,
     #[serde(rename = "codexAppPasteFix", default)]
     pub codex_app_paste_fix: bool,
     // 默认关闭：撤下的那版会主动从 settings.json 删掉这个键，老用户升级后读不到，
@@ -1014,6 +1026,7 @@ impl Default for BackendSettings {
             claude_app_voice_input: true,
             claude_app_localization: true,
             claude_app_computer_use: false,
+            computer_use_approval: default_computer_use_approval(),
             codex_app_paste_fix: false,
             codex_app_force_chinese_locale: false,
             codex_app_typing_effect: default_typing_effect(),
@@ -1488,6 +1501,11 @@ pub fn default_true() -> bool {
 /// 「疑似有人在用」的默认策略：先不动，等空闲或用户手动触发。
 pub fn default_auto_takeover_when_active() -> String {
     crate::auto_takeover::ActivePolicy::Defer.as_str().to_string()
+}
+
+/// Computer Use 审批默认放行：与既有行为一致，升级不改变已有用户的使用方式。
+pub fn default_computer_use_approval() -> String {
+    "auto".to_string()
 }
 
 fn default_whale_balance_protocol() -> String {

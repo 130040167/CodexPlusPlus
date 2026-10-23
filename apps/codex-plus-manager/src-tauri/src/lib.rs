@@ -37,6 +37,12 @@ pub fn run_computer_use_mcp() -> anyhow::Result<()> {
     codex_plus_core::computer_use_proxy::serve()
 }
 
+/// 浏览器控制的 MCP 入口（stdio）。与 CU 分开：原生 CU server 没有浏览器工具，
+/// 浏览器面走 Codex 的 Chrome 扩展桥，需要 cua-repl 且每次调用带 turn 元数据。
+pub fn run_browser_use_mcp() -> anyhow::Result<()> {
+    codex_plus_core::browser_use::serve()
+}
+
 pub fn run_computer_use_cli(args: &[std::ffi::OsString]) -> anyhow::Result<()> {
     let action = args
         .first()
@@ -193,6 +199,10 @@ pub fn run() {
             computer_use_commands::computer_use_uninstall,
             computer_use_commands::computer_use_check,
             computer_use_commands::computer_use_open_app,
+            computer_use_commands::computer_use_approval_get,
+            computer_use_commands::computer_use_approval_set,
+            computer_use_commands::computer_use_approval_forget,
+            computer_use_commands::computer_use_approval_clear,
             commands::native_browser_status,
             commands::save_settings,
             commands::list_tools,
