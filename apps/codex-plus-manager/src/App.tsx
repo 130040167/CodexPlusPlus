@@ -13289,6 +13289,8 @@ type ClaudeLocalizationStatus = {
   voiceInput: boolean;
   localization: boolean;
   computerUse: boolean;
+  /** 当前平台能否真正应用 Computer Use；Windows 为 false（#2673）。 */
+  computerUseSupported: boolean;
 };
 
 /**
@@ -13565,13 +13567,15 @@ function ClaudeLocalizationScreen() {
             <label className="switch-row compact">
               <input
                 checked={Boolean(s?.computerUse)}
-                disabled={busy !== null || !s?.supported}
+                disabled={busy !== null || !s?.supported || s?.computerUseSupported === false}
                 onChange={(event) => void toggleComputerUse(event.currentTarget.checked)}
                 type="checkbox"
               />
               <span>
                 <strong>{t("Computer Use")}</strong>
-                <small>{t("解锁桌面控制：订阅与灰度校验已解除，API Key（3p）模式同样可用；会改写副本的 app.asar 并关闭 Electron 的 asar 完整性校验，原件不动。首次启动增强版会提示授权辅助功能与屏幕录制。")}</small>
+                <small>{s?.computerUseSupported === false
+                  ? t("暂仅支持 macOS：Windows 的副本构建流程不会改写 app.asar，打开这个开关不会有任何效果。")
+                  : t("解锁桌面控制：订阅与灰度校验已解除，API Key（3p）模式同样可用；会改写副本的 app.asar 并关闭 Electron 的 asar 完整性校验，原件不动。首次启动增强版会提示授权辅助功能与屏幕录制。")}</small>
               </span>
               <ToggleVisual />
             </label>

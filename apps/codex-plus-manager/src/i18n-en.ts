@@ -47,6 +47,7 @@ export const EN_PLAIN: Record<string, string> = {
   "设为当前 Key": "Select this key",
   "Key 名称": "Key name",
   "Key 首尾预览": "Key preview (first and last characters)",
+  "暂仅支持 macOS：Windows 的副本构建流程不会改写 app.asar，打开这个开关不会有任何效果。": "macOS only for now: the Windows copy-build flow does not rewrite app.asar, so this switch has no effect there.",
   "实时配置已被修改": "Live config was changed",
   "当前生效的 config.toml / auth.json 里的供应商地址，和「{0}」保存的不一样。可能是其它工具改过，也可能是你手动改的，Codex++ 无法自动判断该保留哪一份。": "The provider URL in the live config.toml / auth.json differs from what \"{0}\" has saved. Another tool may have changed it, or you edited it by hand; Codex++ cannot tell which one to keep.",
   "导入为新供应商：把当前生效的地址和 Key 保存成一个新供应商，「{0}」保持原样，然后继续切换。": "Import as new provider: save the live URL and key as a new provider, leave \"{0}\" unchanged, then continue switching.",

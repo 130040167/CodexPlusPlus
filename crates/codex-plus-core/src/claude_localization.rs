@@ -180,6 +180,9 @@ pub struct ClaudeLocalizationStatus {
     pub localization: bool,
     /// 是否在副本里解锁 Computer Use（改写 asar + 关闭 asar 完整性校验）。
     pub computer_use: bool,
+    /// 当前平台是否真的能应用 Computer Use；Windows 的构建脚本不改写 asar，
+    /// 打开开关只会存设置，界面据此禁用该开关（#2673）。
+    pub computer_use_supported: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -496,7 +499,34 @@ fn initial_status(source: &Path, copy: &Path) -> ClaudeLocalizationStatus {
         voice_input: settings.as_ref().is_none_or(|settings| settings.claude_app_voice_input),
         localization: settings.as_ref().is_none_or(|settings| settings.claude_app_localization),
         computer_use: computer_use_enabled(),
+        computer_use_supported: cfg!(target_os = "macos"),
     }
+}
+
+/// 副本是否需要用当前源码与设置重新制作。
+///
+/// Computer Use 只在能改写 asar 的平台参与比较：Windows 的准备脚本不改 asar，
+/// 回执里也就不会写 `computerUse`；若仍按「回执里没有 = 关」比较，开关一旦打开
+/// 就会永远判定需要更新，点「更新副本」后依旧提示需要更新（#2673）。
+fn copy_needs_rebuild(
+    prepared: bool,
+    receipt: Option<&Value>,
+    current_build: &str,
+    copy_version: &str,
+    source_version: &str,
+    computer_use: bool,
+    computer_use_supported: bool,
+) -> bool {
+    if !prepared {
+        return false;
+    }
+    let prepared_computer_use = receipt
+        .and_then(|r| r.get("computerUse"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    receipt.and_then(|r| r.get("sourceBuild")).and_then(Value::as_str) != Some(current_build)
+        || copy_version != source_version
+        || (computer_use_supported && prepared_computer_use != computer_use)
 }
 
 /// 未安装时不能继续探测运行时、版本或读取官方配置；测试注入探测器守住早退边界。
@@ -525,15 +555,15 @@ pub fn status() -> Result<ClaudeLocalizationStatus> {
         let receipt = fs::read(runtime_dir().join("prepared.json")).ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
         state.prepared = AppLayout::current().exists(&copy) && receipt.is_some();
-        let prepared_computer_use = receipt
-            .as_ref()
-            .and_then(|r| r.get("computerUse"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        state.needs_rebuild = state.prepared &&
-            (receipt.as_ref().and_then(|r| r.get("sourceBuild")).and_then(Value::as_str) != Some(current_build.as_str())
-                || state.copy_version != state.source_version
-                || prepared_computer_use != state.computer_use);
+        state.needs_rebuild = copy_needs_rebuild(
+            state.prepared,
+            receipt.as_ref(),
+            &current_build,
+            &state.copy_version,
+            &state.source_version,
+            state.computer_use,
+            state.computer_use_supported,
+        );
         state.shell_locale = read_config(&config_path()).ok()
             .and_then(|v| v.get("locale")?.as_str().map(str::to_string));
         state.running = claude_running(deadline)?;
@@ -977,7 +1007,22 @@ mod tests {
             prepared: false, needs_rebuild: false, running: false,
             node_available: false, python_available: false, shell_locale: None,
             catalog_entries: 0, voice_input: true, localization: true, computer_use: false,
+            computer_use_supported: cfg!(target_os = "macos"),
         }
+    }
+
+    #[test]
+    fn windows_never_asks_to_rebuild_for_computer_use() {
+        // #2673：Windows 的 MSIX 回执没有 computerUse；开关打开时不能因此永远要求更新。
+        let receipt = json!({ "sourceBuild": "26.1", "msix": true });
+        assert!(!copy_needs_rebuild(true, Some(&receipt), "26.1", "26.1", "26.1", true, false));
+        // macOS 仍按回执比较：开关与回执不一致就该重建。
+        assert!(copy_needs_rebuild(true, Some(&receipt), "26.1", "26.1", "26.1", true, true));
+        assert!(!copy_needs_rebuild(true, Some(&receipt), "26.1", "26.1", "26.1", false, true));
+        // 版本变化与未准备的情况对所有平台一致。
+        assert!(copy_needs_rebuild(true, Some(&receipt), "26.2", "26.1", "26.1", false, false));
+        assert!(copy_needs_rebuild(true, Some(&receipt), "26.1", "26.2", "26.1", false, false));
+        assert!(!copy_needs_rebuild(false, None, "26.1", "26.1", "26.1", true, false));
     }
 
     #[test]
