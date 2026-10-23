@@ -2,17 +2,23 @@
 //!
 //! DSH 桌面版的 profile 由若干 bundle 叠加而成，用户可改的只有
 //! `~/.dsh/profiles/desktop/cordis.patch.yml`——一个顶层 YAML 数组，每项是一条
-//! loader 补丁。MCP server 由 `@deepseek-ai/dsh-mcp-client` 插件承载，一个 server 一条：
+//! **loader 补丁指令**，不是插件条目本身。MCP server 由
+//! `@deepseek-ai/dsh-mcp-client` 插件承载，一个 server 插一条：
 //!
 //! ```yaml
-//! - id: codex-plus-cu
-//!   name: "@deepseek-ai/dsh-mcp-client"
-//!   config:
-//!     serverName: "codex-plus-cu"
-//!     transport: stdio
-//!     command: "/…/CodexPlusPlus"
-//!     args: ["--codex-plus-cu-mcp"]
+//! - insert:
+//!     - id: codex-plus-cu
+//!       name: "@deepseek-ai/dsh-mcp-client"
+//!       config:
+//!         serverName: "codex-plus-cu"
+//!         transport: stdio
+//!         command: "/…/CodexPlusPlus"
+//!         args: ["--codex-plus-cu-mcp"]
 //! ```
+//!
+//! `insert` 不能省。`dsh-app-boot` 的 `applyEntryPatches` 对不带 `insert` 的项按
+//! `id` 去已有条目里找目标：找不到就打一条 `patch: entry %C not found` 的警告然后跳过，
+//! 启动不报错，插件也不会被加载——写错了完全没有可见反馈。
 //!
 //! 工具名会是 `mcp__codex-plus-cu__click`，与 Claude Code 一致。
 //!
@@ -111,22 +117,24 @@ fn render(runtime: &RuntimeLocation) -> String {
     let mut out = String::new();
     out.push_str(BEGIN);
     out.push('\n');
+    // 一条 insert 补丁插入多个插件条目；拆成多条 insert 也行，合并更省行数。
+    out.push_str("- insert:\n");
     for (id, entry) in runtime.managed_entries() {
-        out.push_str(&format!("- id: {id}\n"));
-        out.push_str(&format!("  name: {}\n", json(&Value::from(PLUGIN))));
-        out.push_str("  config:\n");
-        out.push_str(&format!("    serverName: {}\n", json(&Value::from(id))));
-        out.push_str("    transport: stdio\n");
+        out.push_str(&format!("    - id: {id}\n"));
+        out.push_str(&format!("      name: {}\n", json(&Value::from(PLUGIN))));
+        out.push_str("      config:\n");
+        out.push_str(&format!("        serverName: {}\n", json(&Value::from(id))));
+        out.push_str("        transport: stdio\n");
         if let Some(command) = entry.get("command") {
-            out.push_str(&format!("    command: {}\n", json(command)));
+            out.push_str(&format!("        command: {}\n", json(command)));
         }
         if let Some(args) = entry.get("args") {
-            out.push_str(&format!("    args: {}\n", json(args)));
+            out.push_str(&format!("        args: {}\n", json(args)));
         }
         if let Some(env) = entry.get("env").and_then(Value::as_object) {
-            out.push_str("    env:\n");
+            out.push_str("        env:\n");
             for (key, value) in env {
-                out.push_str(&format!("      {key}: {}\n", json(value)));
+                out.push_str(&format!("          {key}: {}\n", json(value)));
             }
         }
     }
@@ -243,10 +251,12 @@ mod tests {
         let path = Path::new("/tmp/cordis.patch.yml");
         let out = install(Some(USER_PATCH), &runtime(), path).unwrap().unwrap();
         assert!(out.starts_with(USER_PATCH.trim_end()));
-        assert!(out.contains("- id: codex-plus-cu\n"));
-        assert!(out.contains("- id: codex-plus-browser\n"));
-        assert!(out.contains("  name: \"@deepseek-ai/dsh-mcp-client\"\n"));
-        assert!(out.contains("    args: [\"--codex-plus-browser-mcp\"]\n"));
+        // 条目必须包在 insert 补丁里，否则 loader 按 id 找不到目标就静默跳过。
+        assert!(out.contains("\n- insert:\n"));
+        assert!(out.contains("    - id: codex-plus-cu\n"));
+        assert!(out.contains("    - id: codex-plus-browser\n"));
+        assert!(out.contains("      name: \"@deepseek-ai/dsh-mcp-client\"\n"));
+        assert!(out.contains("        args: [\"--codex-plus-browser-mcp\"]\n"));
         assert!(out.ends_with(&format!("{END}\n")));
         // 再装一次不改。
         assert!(install(Some(&out), &runtime(), path).unwrap().is_none());
