@@ -1694,6 +1694,19 @@ mod tests {
     }
 
     #[test]
+    fn read_uses_temporary_tabs_and_caps_output() {
+        let js = code(
+            "browser_read",
+            json!({ "urls": ["https://a.example", "https://b.example"], "max_chars": 500 }),
+        );
+        // 只读抓取不能开正式标签，否则调研类任务会留下满地标签。
+        assert!(js.contains("br.tabs.content({urls:["));
+        assert!(!js.contains("createBrowserTab"));
+        assert!(js.contains("text.length > 500"));
+        assert!(js.contains("text.slice(0, 500)"));
+    }
+
+    #[test]
     fn group_uses_the_numeric_group_id() {
         let js = code("browser_group", json!({ "tabs": [1, 2], "title": "🔎 T", "color": "blue" }));
         assert!(js.contains("mgmt.tabs.group({tabIds:[1,2]})"));
