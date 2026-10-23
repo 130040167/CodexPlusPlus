@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { AlertTriangle, CheckCircle2, Loader2, MonitorSmartphone, Play, Plug, RefreshCw, Unplug } from "lucide-react";
+import { ComputerUsePreview } from "./ComputerUsePreview";
 import { PageHeader } from "./ManagementPages";
 import { t } from "./i18n";
 import "./ComputerUsePage.css";
@@ -45,6 +46,7 @@ type CuApprovalState = {
   mode?: CuApprovalMode;
   approvals?: Array<[string, CuApprovedApp]>;
   lastClient?: CuLastClient | null;
+  turnHooks?: { installed?: boolean; events?: string[]; settings?: string } | null;
 };
 
 // Codex 桌面版自己会把 [mcp_servers.computer-use] 写进 ~/.codex/config.toml，
@@ -422,6 +424,11 @@ export function ComputerUsePage() {
               ? t("，未声明审批卡能力（elicitation）。在这个客户端里「交给 Claude 审批」会退回为自动放行，不会弹卡。")
               : t("，未声明审批卡能力（elicitation）；如果切到「交给 Claude 审批」，在这个客户端里会退回为自动放行。")}
         </p>}
+        {approval?.turnHooks && <p className={approval.turnHooks.installed ? "cu-hint" : "cu-note cu-note-warn"}>
+          {approval.turnHooks.installed
+            ? t("浏览器回合钩子已装好：") + (approval.turnHooks.events ?? []).join(" / ") + t("，回合结束时自动关闭未标记的标签页。")
+            : t("未安装浏览器回合钩子。安装 Claude Code 接入后，回合结束时未标记的标签页不会自动关闭，会越堆越多。")}
+        </p>}
         {(approval?.approvals?.length ?? 0) > 0 && <div className="cu-approvals">
           <div className="cu-approvals-head">
             <strong>{t("已记忆的应用")}</strong>
@@ -444,6 +451,8 @@ export function ComputerUsePage() {
         </div>}
         {approval && (approval.approvals?.length ?? 0) === 0 && <p className="cu-hint">{t("还没有记住任何应用。选择「交给 Claude 审批」后，Claude 批准过的应用会出现在这里。")}</p>}
       </section>
+
+      <ComputerUsePreview />
 
       <section className="cu-card" aria-labelledby="cu-check-title">
         <div className="cu-card-head">

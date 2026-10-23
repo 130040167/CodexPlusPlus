@@ -17,6 +17,12 @@ fn main() {
         }
         return;
     }
+    // Claude Code 的 Stop / SubagentStop 钩子调用：只往 spool 里记一行，不启动 GUI。
+    // 第二个参数是安装时固化的 state 目录（钩子不继承 CODEX_PLUS_STATE_DIR）。
+    if args.get(1).is_some_and(|arg| arg == "--codex-plus-browser-turn-end") {
+        codex_plus_core::claude_hooks::record_turn_end(args.get(2).map(std::ffi::OsString::as_os_str));
+        return;
+    }
     if args.get(1).is_some_and(|arg| arg == "--codex-plus-cu-cli") {
         if let Err(error) = codex_plus_manager_lib::run_computer_use_cli(&args[2..]) {
             eprintln!("Computer Use 诊断失败：{error:#}");

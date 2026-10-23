@@ -9,6 +9,7 @@ pub mod auto_takeover;
 pub mod bridge;
 pub mod ccs_import;
 pub mod cdp;
+pub mod claude_hooks;
 pub mod claude_localization;
 pub mod codex_app_state;
 pub mod codex_home;

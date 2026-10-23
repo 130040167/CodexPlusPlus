@@ -41,15 +41,25 @@ pub async fn computer_use_install(target: String) -> CommandResult<Value> {
     };
     match run_blocking(move || codex_plus_core::computer_use::install(parsed)).await {
         Ok(receipt) => {
+            // 只有 Claude Code 有 hooks。装完 MCP 顺手挂上回合结束钩子，
+            // 否则浏览器标签不会在回合结束时清理（见 claude_hooks 模块注释）。
+            let hooks = if parsed == codex_plus_core::computer_use::Target::ClaudeCode {
+                codex_plus_core::claude_hooks::install().ok()
+            } else {
+                None
+            };
             let message = if receipt.changed {
                 "已接入；重启对应客户端后生效。"
             } else {
                 "已是接入状态，无需改动。"
             };
-            ok(
-                message,
-                serde_json::to_value(receipt).unwrap_or_else(|_| json!({})),
-            )
+            // 前端的 `CuMutation` 直接读 payload 顶层的 `changed` / `backupPath`，
+            // 所以钩子信息是追加字段，不能把 receipt 再包一层。
+            let mut payload = serde_json::to_value(receipt).unwrap_or_else(|_| json!({}));
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("hooks".into(), json!(hooks));
+            }
+            ok(message, payload)
         }
         Err(error) => failed(&error, json!({})),
     }
@@ -63,15 +73,22 @@ pub async fn computer_use_uninstall(target: String) -> CommandResult<Value> {
     };
     match run_blocking(move || codex_plus_core::computer_use::uninstall(parsed)).await {
         Ok(receipt) => {
+            // 撤掉接入时同步摘掉回合结束钩子，别在用户不用的客户端里留一条空命令。
+            let hooks = if parsed == codex_plus_core::computer_use::Target::ClaudeCode {
+                codex_plus_core::claude_hooks::uninstall().ok()
+            } else {
+                None
+            };
             let message = if receipt.changed {
                 "已移除接入；原配置已备份。"
             } else {
                 "本来就没有接入，未改动配置。"
             };
-            ok(
-                message,
-                serde_json::to_value(receipt).unwrap_or_else(|_| json!({})),
-            )
+            let mut payload = serde_json::to_value(receipt).unwrap_or_else(|_| json!({}));
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("hooks".into(), json!(hooks));
+            }
+            ok(message, payload)
         }
         Err(error) => failed(&error, json!({})),
     }
@@ -148,6 +165,12 @@ pub async fn computer_use_approval_get() -> CommandResult<Value> {
             "mode": mode.id(),
             "approvals": codex_plus_core::computer_use_approval::ApprovalStore::read_all(),
             "lastClient": codex_plus_core::computer_use_approval::last_client(),
+            // 浏览器标签的清理靠 Claude Code 的 Stop 钩子；装上没有要在页面上说清楚。
+            "turnHooks": {
+                "installed": codex_plus_core::claude_hooks::is_installed(),
+                "events": codex_plus_core::claude_hooks::installed_events(),
+                "settings": codex_plus_core::claude_hooks::claude_settings_path().display().to_string(),
+            },
         }),
     )
 }
