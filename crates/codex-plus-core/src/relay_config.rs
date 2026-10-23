@@ -3187,7 +3187,7 @@ fn wsl_catalog_paths_enabled(home: &Path, config: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn managed_catalog_pointer(home: &Path, relative: &str, config: &str) -> anyhow::Result<String> {
+pub(crate) fn managed_catalog_pointer(home: &Path, relative: &str, config: &str) -> anyhow::Result<String> {
     if wsl_catalog_paths_enabled(home, config) {
         // WSL 的 app-server 不能读取 C:\\...；相对路径由共享 CODEX_HOME 解析。
         return Ok(relative.replace('\\', "/"));
