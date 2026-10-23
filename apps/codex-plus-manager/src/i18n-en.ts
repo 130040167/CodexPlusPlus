@@ -46,6 +46,7 @@ export const EN_PLAIN: Record<string, string> = {
   "今日不再提示": "Don't remind me today",
   "设为当前 Key": "Select this key",
   "Key 名称": "Key name",
+  "Key 首尾预览": "Key preview (first and last characters)",
   "删除 Key": "Delete key",
   "添加 Key": "Add key",
   "本地服务器状态": "Local server status",

@@ -71,45 +71,6 @@ mkdirSync(stagingDir, { recursive: true });
 cpSync(bundle, stagingBundle, { recursive: true, verbatimSymlinks: true });
 cpSync(builtBinary, path.join(stagingBundle, "Contents", "MacOS", "CodexPlusPlus"));
 chmodSync(path.join(stagingBundle, "Contents", "MacOS", "CodexPlusPlus"), 0o755);
-
-// macOS 麦克风 TCC：Info.plist 里没有 NSMicrophoneUsageDescription 时，进程一碰
-// 麦克风就会被系统直接终止（而不是弹授权框）。固定 bundle 来自 /Applications 的
-// 已发布版本，可能还没有这个键，所以每次替换二进制后都在 staging 里补齐。
-// 只增改这一个键，LSEnvironment 等其它键原样保留；必须在 codesign 之前完成，
-// 否则签名密封的资源清单会与实际 plist 不一致。
-const ensureMicrophoneUsageDescription = () => {
-  const infoPlist = path.join(stagingBundle, "Contents", "Info.plist");
-  const usage = "Codex++ 需要麦克风，为 ZCode 语音输入录音。";
-  const plistBuddy = "/usr/libexec/PlistBuddy";
-  let exists = true;
-  let current = "";
-  try {
-    current = execFileSync(
-      plistBuddy,
-      ["-c", "Print :NSMicrophoneUsageDescription", infoPlist],
-      { encoding: "utf8" },
-    ).trim();
-  } catch {
-    exists = false;
-  }
-  if (!current) {
-    const command = exists
-      ? `Set :NSMicrophoneUsageDescription "${usage}"`
-      : `Add :NSMicrophoneUsageDescription string "${usage}"`;
-    run(plistBuddy, ["-c", command, infoPlist]);
-  }
-  const patched = execFileSync(
-    plistBuddy,
-    ["-c", "Print :NSMicrophoneUsageDescription", infoPlist],
-    { encoding: "utf8" },
-  ).trim();
-  if (!patched) {
-    console.error(`补充 NSMicrophoneUsageDescription 失败：${infoPlist}`);
-    process.exit(1);
-  }
-};
-ensureMicrophoneUsageDescription();
-run("plutil", ["-lint", path.join(stagingBundle, "Contents", "Info.plist")]);
 run("codesign", ["--force", "--deep", "--sign", "-", stagingBundle]);
 
 // 停掉固定目录里的旧实例（只匹配固定路径，不要误杀 /Applications 里的正式版）。

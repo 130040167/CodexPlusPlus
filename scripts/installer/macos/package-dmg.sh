@@ -110,8 +110,6 @@ create_app() {
   <string>APPL</string>
   <key>CodexPlusUnifiedApp</key>
   <true/>
-  <key>NSMicrophoneUsageDescription</key>
-  <string>Codex++ 需要麦克风，为 ZCode 语音输入录音。</string>
   <key>CFBundleSignature</key>
   <string>????</string>
   <key>CFBundleExecutable</key>
@@ -136,11 +134,7 @@ SIGNING_IDENTITY="${MACOS_SIGNING_IDENTITY:-}"
 # 公证凭据 profile（notarytool store-credentials 存的那个名字）。
 # 设为空则跳过公证，只签名。
 NOTARY_PROFILE="${MACOS_NOTARY_PROFILE:-}"
-# 正式（Developer ID + hardened runtime）签名用的 entitlements。
-# ZCode 语音输入由管理端自己录音：hardened runtime 下没有
-# com.apple.security.device.audio-input，即使 Info.plist 有 NSMicrophoneUsageDescription，
-# CoreAudio 也拿不到输入设备。entitlement 只是准入条件，TCC 授权仍由系统首次录音时弹窗。
-# ad-hoc 签名（本地 / PR 构建）不带它。
+# 正式（Developer ID + hardened runtime）签名用的 entitlements（文件存在时才带）。
 # 注意：plist 里不要写 XML 注释——AMFI 解析器很严格，注释里出现 "--" 就会报
 # "AMFIUnserializeXML: syntax error"，说明一律写在这里。
 ENTITLEMENTS="$ROOT/scripts/installer/macos/entitlements.plist"

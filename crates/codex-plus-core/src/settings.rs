@@ -732,11 +732,10 @@ pub struct BackendSettings {
     // 与「准备副本」这件事互不影响——副本只是所有增强共同的前置条件。
     #[serde(rename = "claudeAppLocalization", default = "default_true")]
     pub claude_app_localization: bool,
-    // 默认开启：给带调试端口启动的 ZCode 页面注入语音输入入口，识别走 Codex++ 自己的
-    // 听写服务（ZCode 渲染层缺麦克风 entitlement）。关掉后补注入线程不再安装脚本，
-    // 已注入的页面需等 ZCode 重启或下次页面重载才消失。
-    #[serde(rename = "zcodeAppVoiceInput", default = "default_true")]
-    pub zcode_app_voice_input: bool,
+    // 默认关闭：Computer Use 需要改写副本的 app.asar 并关掉 Electron 的 asar 完整性校验，
+    // 功能本身还受订阅与组织策略约束；误开没有收益，显式勾选才做。
+    #[serde(rename = "claudeAppComputerUse", default)]
+    pub claude_app_computer_use: bool,
     #[serde(rename = "codexAppPasteFix", default)]
     pub codex_app_paste_fix: bool,
     // 默认关闭：撤下的那版会主动从 settings.json 删掉这个键，老用户升级后读不到，
@@ -1017,7 +1016,7 @@ impl Default for BackendSettings {
             codex_app_usage_status_line: true,
             claude_app_voice_input: true,
             claude_app_localization: true,
-            zcode_app_voice_input: true,
+            claude_app_computer_use: false,
             codex_app_paste_fix: false,
             codex_app_force_chinese_locale: false,
             codex_app_typing_effect: default_typing_effect(),
@@ -3267,25 +3266,6 @@ mod tests {
         let parsed: BackendSettings = serde_json::from_value(off).unwrap();
         assert!(!parsed.claude_app_voice_input, "显式关闭必须被尊重");
         assert!(!parsed.claude_app_localization, "显式关闭必须被尊重");
-    }
-
-    #[test]
-    fn zcode_voice_input_defaults_on_and_respects_explicit_off() {
-        // 与 Claude 的语音开关同样处理：老用户的 settings.json 里没有这个键，
-        // 升级后必须默认开启，否则注入过去后用户找不到语音入口。
-        let mut legacy = serde_json::to_value(BackendSettings::default()).unwrap();
-        legacy.as_object_mut().unwrap().remove("zcodeAppVoiceInput");
-        let parsed: BackendSettings = serde_json::from_value(legacy).unwrap();
-        assert!(parsed.zcode_app_voice_input, "缺少键时 ZCode 语音输入应按默认开启");
-
-        let mut off = serde_json::to_value(BackendSettings::default()).unwrap();
-        off["zcodeAppVoiceInput"] = json!(false);
-        let parsed: BackendSettings = serde_json::from_value(off).unwrap();
-        assert!(!parsed.zcode_app_voice_input, "显式关闭必须被尊重");
-
-        // 字段名必须是前端约定的 camelCase，老版本看到未知键也不会解析失败。
-        let encoded = serde_json::to_value(BackendSettings::default()).unwrap();
-        assert_eq!(encoded["zcodeAppVoiceInput"], json!(true));
     }
 
     #[test]

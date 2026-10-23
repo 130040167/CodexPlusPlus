@@ -1,9 +1,6 @@
 mod auto_takeover;
 mod agent_collaboration_commands;
 mod global_dictation;
-mod mic;
-mod voice_server;
-mod zcode;
 pub mod commands;
 pub mod install;
 mod runtime_health;
@@ -131,9 +128,6 @@ pub fn run() {
                     serde_json::json!({ "message": error.to_string() }),
                 );
             }
-            // ZCode 补注入守护：ZCode 已带调试端口运行但页面里没有语音入口（或配置
-            // 因管理器重启而过期）时自动补注入。设置关掉时线程空转跳过。
-            zcode::start_supervisor(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -159,11 +153,7 @@ pub fn run() {
             commands::claude_localization_action,
             commands::claude_localization_set_voice_input,
             commands::claude_localization_set_localization,
-            // ZCode 增强：前端 invoke 找不到命令时是运行期静默失败，没有编译期兜底，
-            // 所以这三个必须注册在这里（契约由前端与 Lead 的端到端测试守护）。
-            commands::zcode_enhancement_status,
-            commands::zcode_enhancement_action,
-            commands::zcode_enhancement_set_voice_input,
+            commands::claude_localization_set_computer_use,
             commands::native_browser_status,
             commands::save_settings,
             commands::list_tools,
@@ -314,7 +304,6 @@ pub fn run() {
                     if !SHUTDOWN_STARTED.swap(true, Ordering::SeqCst) {
                         APP_EXITING.store(true, Ordering::SeqCst);
                         auto_takeover::stop_supervisor();
-                        zcode::stop_supervisor();
                         let app = app_handle.clone();
                         tauri::async_runtime::spawn_blocking(move || {
                             // 退出前先等待自有 CLI 任务清理，避免进程退出后遗留执行器。

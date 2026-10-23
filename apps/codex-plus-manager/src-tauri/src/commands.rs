@@ -74,9 +74,23 @@ pub async fn claude_localization_status() -> CommandResult<Value> {
 }
 
 #[tauri::command]
-pub async fn claude_localization_action(action: String) -> CommandResult<Value> {
+pub async fn claude_localization_action(
+    app: tauri::AppHandle,
+    action: String,
+) -> CommandResult<Value> {
+    use tauri::Emitter;
     let result = tauri::async_runtime::spawn_blocking(move || {
-        codex_plus_core::claude_localization::perform(&action)
+        let result = codex_plus_core::claude_localization::perform_with_progress(&action, &move |percent, message| {
+            let _ = app.emit(
+                "claude-localization-progress",
+                json!({ "percent": percent, "message": message }),
+            );
+        });
+        // 刚制作好副本或刚启动副本时，语音入口需要 helper 在线（见 sync_resident_helper）。
+        if result.is_ok() {
+            sync_resident_helper();
+        }
+        result
     })
     .await;
     match result {
@@ -92,7 +106,12 @@ pub async fn claude_localization_action(action: String) -> CommandResult<Value> 
 #[tauri::command]
 pub async fn claude_localization_set_voice_input(enabled: bool) -> CommandResult<Value> {
     match tauri::async_runtime::spawn_blocking(move || {
-        codex_plus_core::claude_localization::set_voice_input(enabled)
+        let status = codex_plus_core::claude_localization::set_voice_input(enabled);
+        // 打开时立即拉起 helper；关闭时不停，helper 可能还在给协议代理用。
+        if enabled && status.is_ok() {
+            sync_resident_helper();
+        }
+        status
     }).await {
         Ok(Ok(status)) => ok(
             if enabled { "语音输入已开启。" } else { "语音输入已关闭。" },
@@ -117,74 +136,21 @@ pub async fn claude_localization_set_localization(enabled: bool) -> CommandResul
     }
 }
 
-// ---------------------------------------------------------------- ZCode 增强
-
-fn zcode_status_value(status: &crate::zcode::ZcodeStatus) -> Value {
-    serde_json::to_value(status).unwrap_or_else(|_| json!({}))
-}
-
 #[tauri::command]
-pub async fn zcode_enhancement_status() -> CommandResult<Value> {
-    let status = crate::zcode::probe().await;
-    ok("ZCode 增强状态已读取。", zcode_status_value(&status))
-}
-
-#[tauri::command]
-pub async fn zcode_enhancement_action(action: String) -> CommandResult<Value> {
-    let action = action.trim().to_string();
-    match crate::zcode::action(&action).await {
-        Ok(status) => {
-            let message = match action.as_str() {
-                "launch" if status.injected => "ZCode 已启动并注入语音输入。",
-                "launch" if !status.voice_input => {
-                    "ZCode 已启动（语音输入开关关闭，未注入语音入口）。"
-                }
-                "launch" if status.running => {
-                    "ZCode 已启动，但语音输入入口尚未注入，可稍后重试「重新注入」。"
-                }
-                "launch" => "ZCode 启动指令已发送。",
-                "reinject" if status.injected => "语音输入入口已重新注入。",
-                "reinject" => "已尝试重新注入，但页面健康检查尚未通过。",
-                _ => "ZCode 增强状态已读取。",
-            };
-            ok(message, zcode_status_value(&status))
-        }
-        Err(error) => failed(&format!("ZCode 操作失败：{error:#}"), json!({})),
-    }
-}
-
-#[tauri::command]
-pub async fn zcode_enhancement_set_voice_input(enabled: bool) -> CommandResult<Value> {
-    let save = tauri::async_runtime::spawn_blocking(move || -> anyhow::Result<()> {
-        let store = SettingsStore::default();
-        let mut settings = store.load()?;
-        settings.zcode_app_voice_input = enabled;
-        store.save(&settings)?;
-        Ok(())
-    })
-    .await;
-    match save {
-        Ok(Ok(())) => {
+pub async fn claude_localization_set_computer_use(enabled: bool) -> CommandResult<Value> {
+    match tauri::async_runtime::spawn_blocking(move || {
+        codex_plus_core::claude_localization::set_computer_use(enabled)
+    }).await {
+        Ok(Ok(status)) => ok(
             if enabled {
-                // 尝试补注入（内部会按需启动本地语音服务拿 endpoint/token）。ZCode 没在
-                // 跑时失败不算错误，等它下次启动时由守护线程安装。
-                let _ = crate::zcode::reinject_if_possible().await;
+                "Computer Use 已勾选；重新准备副本后生效。"
             } else {
-                // 关闭时尽量让页面脚本自己清理，不留下一个点了会失败的入口。
-                let _ = crate::zcode::dispose().await;
-            }
-            let status = crate::zcode::probe().await;
-            ok(
-                if enabled {
-                    "ZCode 语音输入已开启。"
-                } else {
-                    "ZCode 语音输入已关闭。"
-                },
-                zcode_status_value(&status),
-            )
-        }
-        Ok(Err(error)) => failed(&format!("保存 ZCode 语音输入设置失败：{error:#}"), json!({})),
-        Err(error) => failed(&format!("保存 ZCode 语音输入设置失败：{error}"), json!({})),
+                "Computer Use 已关闭；重新准备副本后移除。"
+            },
+            serde_json::to_value(status).unwrap_or_else(|_| json!({})),
+        ),
+        Ok(Err(error)) => failed(&error.to_string(), json!({})),
+        Err(error) => failed(&format!("Claude 设置失败：{error}"), json!({})),
     }
 }
 
@@ -2612,7 +2578,8 @@ fn restart_stop_failure_message(error: &RestartStopError) -> String {
 /// 而 live `config.toml` 里写死了本地代理地址，于是终端 `codex`、IDE 插件等
 /// 不经过 Codex++ 启动的客户端会连到一个没人监听的端口。现在只要管理器在跑、
 /// 且当前供应商需要本地代理，就把 helper 托管在管理器进程里：Codex 会话退出
-/// 不影响它，只有 Codex++ 退出才停止。
+/// 不影响它，只有 Codex++ 退出才停止。Claude 副本开着语音输入时同理常驻，
+/// 它的转写也走这个 helper。
 ///
 /// 返回实际监听的端口；当前配置不需要本地代理或启动失败时返回 `None`。
 /// 失败只记诊断日志，不打断调用方（启动链路会按旧逻辑自行 bind/重试）。
@@ -2636,7 +2603,12 @@ pub fn sync_resident_helper() -> Option<u16> {
         .as_ref()
         .and_then(codex_plus_core::launcher::required_fixed_helper_port)
         .is_some();
+    // 第三个信号：Claude 副本的语音入口要靠 helper 转写，没在跑 Codex 时也得有人监听。
+    let claude_voice_needs_helper = settings
+        .as_ref()
+        .is_some_and(codex_plus_core::claude_localization::voice_input_needs_helper);
     if !settings_need_proxy
+        && !claude_voice_needs_helper
         && !codex_plus_core::relay_config::live_config_uses_managed_protocol_proxy_in_home(&home)
     {
         return None;
@@ -7088,11 +7060,13 @@ pub fn switch_relay_profile(
                 json!({
                     "previousActiveRelayId": previous_active_relay_id,
                     "activeRelayId": settings.active_relay_id,
-                    "error": error.to_string()
+                    // `{:#}` 带上完整错误链：只取最外层会只剩「保存供应商设置失败」，
+                    // 看不到真正原因（#2651）。
+                    "error": format!("{error:#}")
                 }),
             );
             failed(
-                &format!("供应商切换失败：{error}"),
+                &format!("供应商切换失败：{error:#}"),
                 relay_switch_payload(settings, status, None),
             )
         }
