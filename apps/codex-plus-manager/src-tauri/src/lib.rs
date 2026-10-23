@@ -16,6 +16,8 @@ const TRAY_ID: &str = "codex_plus_tray";
 static APP_EXITING: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_COMPLETE: AtomicBool = AtomicBool::new(false);
+/// 退出清理的等待上限（秒）：超过就直接退出，避免卡在托盘里退不掉（#2611）。
+const SHUTDOWN_WATCHDOG: u64 = 10;
 const TRAY_MENU_SHOW: &str = "tray_show_main";
 const TRAY_MENU_QUIT: &str = "tray_quit_app";
 const MANAGER_NAVIGATION_EVENT: &str = "manager-navigation-requested";
@@ -304,6 +306,22 @@ pub fn run() {
                     if !SHUTDOWN_STARTED.swap(true, Ordering::SeqCst) {
                         APP_EXITING.store(true, Ordering::SeqCst);
                         auto_takeover::stop_supervisor();
+                        // 退出清理里任何一步卡住（例如等待启动器或常驻代理），
+                        // 进程就会停在「已阻止退出、尚未完成」的状态：托盘菜单点了没反应，
+                        // 再点也不会重来（SHUTDOWN_STARTED 已经是 true），任务管理器里也
+                        // 只能强杀（#2611）。这里给清理设一个上限，到点直接退出，
+                        // 先写日志留下是超时退出的证据。
+                        std::thread::spawn(|| {
+                            std::thread::sleep(std::time::Duration::from_secs(SHUTDOWN_WATCHDOG));
+                            if SHUTDOWN_COMPLETE.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                                "app.shutdown_watchdog_forced",
+                                serde_json::json!({ "waitedSeconds": SHUTDOWN_WATCHDOG }),
+                            );
+                            std::process::exit(0);
+                        });
                         let app = app_handle.clone();
                         tauri::async_runtime::spawn_blocking(move || {
                             // 退出前先等待自有 CLI 任务清理，避免进程退出后遗留执行器。
