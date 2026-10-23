@@ -52,6 +52,8 @@ const MAX_PROBE_FRAME: usize = 512 * 1024;
 const SHIM_SOURCE: &str = include_str!("../../../assets/cu/shim.mjs");
 const SHIM_FILE: &str = "cu/shim.mjs";
 
+mod dsh;
+
 // ---------------------------------------------------------------------------
 // 数据模型
 // ---------------------------------------------------------------------------
@@ -63,16 +65,29 @@ pub enum Target {
     ClaudeCode,
     ClaudeDesktop,
     Codex,
+    /// DeepSeek Harness：cordis 补丁层（YAML），每个 server 一条 `dsh-mcp-client` 条目。
+    Dsh,
+    /// ZCode：`~/.zcode/cli/config.json` 的 `mcp.servers`。
+    Zcode,
+    /// WorkBuddy AI：`~/.workbuddy/mcp.json` 的 `mcpServers`。
+    WorkBuddy,
 }
 
 impl Target {
+    pub const ALL: [Target; 6] = [
+        Self::ClaudeCode,
+        Self::ClaudeDesktop,
+        Self::Codex,
+        Self::Dsh,
+        Self::Zcode,
+        Self::WorkBuddy,
+    ];
+
     pub fn parse(value: &str) -> anyhow::Result<Self> {
-        match value {
-            "claudeCode" => Ok(Self::ClaudeCode),
-            "claudeDesktop" => Ok(Self::ClaudeDesktop),
-            "codex" => Ok(Self::Codex),
-            other => bail!("未知的接入目标：{other}"),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|target| target.id() == value)
+            .with_context(|| format!("未知的接入目标：{value}"))
     }
 
     pub fn id(self) -> &'static str {
@@ -80,6 +95,9 @@ impl Target {
             Self::ClaudeCode => "claudeCode",
             Self::ClaudeDesktop => "claudeDesktop",
             Self::Codex => "codex",
+            Self::Dsh => "dsh",
+            Self::Zcode => "zcode",
+            Self::WorkBuddy => "workBuddy",
         }
     }
 
@@ -88,8 +106,39 @@ impl Target {
             Self::ClaudeCode => "Claude Code",
             Self::ClaudeDesktop => "Claude Desktop",
             Self::Codex => "Codex",
+            Self::Dsh => "DeepSeek Harness",
+            Self::Zcode => "ZCode",
+            Self::WorkBuddy => "WorkBuddy AI",
         }
     }
+
+    /// JSON 目标里 server 表所在的键路径。非 JSON 目标返回 `None`。
+    fn json_key_path(self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::ClaudeCode | Self::ClaudeDesktop | Self::WorkBuddy => Some(&["mcpServers"]),
+            // ZCode 优先读 `mcp.servers`（嵌套），为空才退回 `~/.agents/mcp.json`。
+            Self::Zcode => Some(&["mcp", "servers"]),
+            Self::Codex | Self::Dsh => None,
+        }
+    }
+
+    /// 配置文件所在目录不存在，说明这台机器没用过该工具：不主动替它建目录。
+    fn tool_home_missing(self) -> Option<String> {
+        let home = home_dir();
+        let (dir, name) = match self {
+            Self::Dsh => (home.join(".dsh/profiles/desktop"), "DeepSeek Harness"),
+            Self::Zcode => (home.join(".zcode"), "ZCode"),
+            Self::WorkBuddy => (home.join(".workbuddy"), "WorkBuddy AI"),
+            Self::ClaudeCode | Self::ClaudeDesktop | Self::Codex => return None,
+        };
+        (!dir.is_dir()).then(|| format!("没检测到 {name}（{} 不存在），先打开一次该应用", dir.display()))
+    }
+}
+
+fn home_dir() -> PathBuf {
+    directories::BaseDirs::new()
+        .map(|dirs| dirs.home_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// 本机 Codex CU 运行时。全部为绝对路径，写进配置后不再二次推导。
@@ -208,6 +257,14 @@ impl RuntimeLocation {
             }),
             crate::paths::state_dir_override(),
         )
+    }
+
+    /// 本功能会写进每个客户端的全部条目：桌面操控 + 浏览器。
+    fn managed_entries(&self) -> [(&'static str, Value); 2] {
+        [
+            (SERVER_ID, self.server_entry()),
+            (BROWSER_SERVER_ID, self.browser_server_entry()),
+        ]
     }
 
     /// 浏览器控制的条目。单独一个 MCP server，和 CU 并列。
@@ -462,6 +519,23 @@ fn codex_config_path() -> PathBuf {
     crate::codex_home::default_codex_home_dir().join("config.toml")
 }
 
+/// DSH 桌面版 profile 的用户补丁层。`cordis.yml` 本身由 DSH 生成、注释里明确写着
+/// 「Edit cordis.patch.yml, not this file」。
+fn dsh_config_path() -> PathBuf {
+    home_dir().join(".dsh/profiles/desktop/cordis.patch.yml")
+}
+
+fn config_paths(target: Target) -> Vec<PathBuf> {
+    match target {
+        Target::ClaudeCode => vec![claude_code_config_path()],
+        Target::ClaudeDesktop => claude_desktop_config_paths(),
+        Target::Codex => vec![codex_config_path()],
+        Target::Dsh => vec![dsh_config_path()],
+        Target::Zcode => vec![home_dir().join(".zcode/cli/config.json")],
+        Target::WorkBuddy => vec![home_dir().join(".workbuddy/mcp.json")],
+    }
+}
+
 
 fn lock_path() -> PathBuf {
     crate::paths::default_app_state_dir().join(".computer-use.lock")
@@ -475,7 +549,7 @@ fn lock_path() -> PathBuf {
 pub fn status() -> anyhow::Result<StatusReport> {
     let runtime = locate_runtime()?;
     let mut targets = BTreeMap::new();
-    for target in [Target::ClaudeCode, Target::ClaudeDesktop, Target::Codex] {
+    for target in Target::ALL {
         targets.insert(
             target.id().to_string(),
             target_status(target, runtime.as_ref()),
@@ -527,58 +601,69 @@ fn claude_desktop_running() -> bool {
 }
 
 fn target_status(target: Target, runtime: Option<&RuntimeLocation>) -> TargetStatus {
-    let config_paths = match target {
-        Target::ClaudeCode => vec![claude_code_config_path()],
-        Target::ClaudeDesktop => claude_desktop_config_paths(),
-        Target::Codex => vec![codex_config_path()],
-    };
+    let config_paths = config_paths(target);
     let path_text = config_paths
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("、");
-    let Some(runtime) = runtime else {
-        return TargetStatus {
-            id: target.id().into(),
-            label: target.label().into(),
-            config_path: path_text,
-            registered: false,
-            state: "unsupported".into(),
-            message: "未找到 Codex 运行时（ChatGPT.app）".into(),
-        };
+    let unsupported = |message: String| TargetStatus {
+        id: target.id().into(),
+        label: target.label().into(),
+        config_path: path_text.clone(),
+        registered: false,
+        state: "unsupported".into(),
+        message,
     };
-    let expected = runtime.server_entry();
+    let Some(runtime) = runtime else {
+        return unsupported("未找到 Codex 运行时（ChatGPT.app）".into());
+    };
+    if let Some(message) = target.tool_home_missing() {
+        return unsupported(message);
+    }
     let outcome = match target {
-        Target::ClaudeCode | Target::ClaudeDesktop => {
+        Target::ClaudeCode | Target::ClaudeDesktop | Target::Zcode | Target::WorkBuddy => {
+            let key_path = target.json_key_path().unwrap_or(&["mcpServers"]);
+            // 每个 (配置文件, server) 组合算一项：CU 与浏览器任一缺失都要提示更新。
             let mut registered = 0usize;
             let mut stale = 0usize;
             let mut foreign: Option<String> = None;
             let mut failure: Option<String> = None;
             for path in &config_paths {
-                match read_json_entry(path, SERVER_ID) {
-                    Ok(Some(existing)) if entry_matches(&existing, &expected) => registered += 1,
-                    Ok(Some(existing)) if looks_like_ours(&existing, runtime) => {
-                        registered += 1;
-                        stale += 1;
+                for (id, expected) in runtime.managed_entries() {
+                    match read_json_entry(path, key_path, id) {
+                        Ok(Some(existing)) if entry_matches(&existing, &expected) => {
+                            registered += 1
+                        }
+                        Ok(Some(existing)) if looks_like_ours(&existing, runtime) => {
+                            registered += 1;
+                            stale += 1;
+                        }
+                        Ok(Some(_)) => {
+                            foreign = Some(format!(
+                                "{} 里的同名条目 {id} 由其他工具写入，未改动",
+                                path.display()
+                            ));
+                        }
+                        Ok(None) => {}
+                        Err(error) => failure = Some(error.to_string()),
                     }
-                    Ok(Some(_)) => {
-                        foreign = Some(format!(
-                            "{} 里的同名条目由其他工具写入，未改动",
-                            path.display()
-                        ));
-                    }
-                    Ok(None) => {}
-                    Err(error) => failure = Some(error.to_string()),
                 }
             }
+            let total = config_paths.len() * runtime.managed_entries().len();
             if let Some(failure) = failure {
                 (false, "foreign", failure)
             } else if let Some(foreign) = foreign {
                 (false, "foreign", foreign)
             } else if registered == 0 {
-                (false, "missing", "尚未接入".to_string())
-            } else if registered < config_paths.len() {
-                (true, "needs_update", "部分配置文件仍未接入".to_string())
+                let mut message = "尚未接入".to_string();
+                // WorkBuddy 只在 mcp.json 不存在时写入示例服务器；由我们先建文件就不会再种。
+                if target == Target::WorkBuddy && !config_paths[0].exists() {
+                    message.push_str("；接入会新建 mcp.json，WorkBuddy 之后不会再写入它的示例 MCP 服务");
+                }
+                (false, "missing", message)
+            } else if registered < total {
+                (true, "needs_update", "部分条目仍未接入（桌面操控或浏览器）".to_string())
             } else if stale > 0 {
                 (true, "needs_update", "已接入，但运行时路径或版本已变化".to_string())
             } else if config_paths.len() > 1 {
@@ -587,6 +672,21 @@ fn target_status(target: Target, runtime: Option<&RuntimeLocation>) -> TargetSta
                 (true, "registered", "已接入".to_string())
             }
         }
+        Target::Dsh => match dsh::status(&config_paths[0], runtime) {
+            Ok(dsh::State::Missing) => (false, "missing", "尚未接入".to_string()),
+            Ok(dsh::State::Current) => (true, "registered", "已接入".to_string()),
+            Ok(dsh::State::Stale) => (
+                true,
+                "needs_update",
+                "已接入，但运行时路径或版本已变化".to_string(),
+            ),
+            Ok(dsh::State::Foreign) => (
+                false,
+                "foreign",
+                "补丁层里已有同名条目且不是本功能写入的，未改动".to_string(),
+            ),
+            Err(error) => (false, "foreign", error.to_string()),
+        },
         // Codex 目标的条目指向 cua-repl；直通路径不依赖它，但写进去的条目要用它，
         // 缺了就不该把坏路径写进别人的 config.toml。
         Target::Codex if !std::path::Path::new(&runtime.cua_repl).is_file() => (
@@ -629,17 +729,16 @@ fn target_status(target: Target, runtime: Option<&RuntimeLocation>) -> TargetSta
 pub fn install(target: Target) -> anyhow::Result<InstallReceipt> {
     let runtime =
         locate_runtime()?.context("未找到 Codex 运行时（ChatGPT.app），无法接入 Computer Use")?;
+    if let Some(message) = target.tool_home_missing() {
+        bail!("{message}");
+    }
     with_lock(|| match target {
-        Target::ClaudeCode | Target::ClaudeDesktop => {
-            let paths = if target == Target::ClaudeCode {
-                vec![claude_code_config_path()]
-            } else {
-                claude_desktop_config_paths()
-            };
+        Target::ClaudeCode | Target::ClaudeDesktop | Target::Zcode | Target::WorkBuddy => {
+            let key_path = target.json_key_path().unwrap_or(&["mcpServers"]);
             let mut changed = false;
             let mut backup: Option<PathBuf> = None;
-            for path in &paths {
-                let receipt = install_json_entry(path, &runtime, target)?;
+            for path in &config_paths(target) {
+                let receipt = install_json_entry(path, key_path, &runtime, target)?;
                 changed |= receipt.changed;
                 if backup.is_none() {
                     backup = receipt.backup_path.map(PathBuf::from);
@@ -654,21 +753,28 @@ pub fn install(target: Target) -> anyhow::Result<InstallReceipt> {
             );
             install_codex_entry(&codex_config_path(), &runtime, target)
         }
+        Target::Dsh => {
+            let path = dsh_config_path();
+            let before = read_text(&path)?;
+            match dsh::install(before.as_deref(), &runtime, &path)? {
+                None => receipt(target, false, None),
+                Some(rendered) => {
+                    let backup = write_with_backup(&path, before.as_deref(), &rendered)?;
+                    receipt(target, true, backup)
+                }
+            }
+        }
     })
 }
 
 pub fn uninstall(target: Target) -> anyhow::Result<InstallReceipt> {
     with_lock(|| match target {
-        Target::ClaudeCode | Target::ClaudeDesktop => {
-            let paths = if target == Target::ClaudeCode {
-                vec![claude_code_config_path()]
-            } else {
-                claude_desktop_config_paths()
-            };
+        Target::ClaudeCode | Target::ClaudeDesktop | Target::Zcode | Target::WorkBuddy => {
+            let key_path = target.json_key_path().unwrap_or(&["mcpServers"]);
             let mut changed = false;
             let mut backup: Option<PathBuf> = None;
-            for path in &paths {
-                let receipt = uninstall_json_entry(path, target)?;
+            for path in &config_paths(target) {
+                let receipt = uninstall_json_entry(path, key_path, target)?;
                 changed |= receipt.changed;
                 if backup.is_none() {
                     backup = receipt.backup_path.map(PathBuf::from);
@@ -677,30 +783,54 @@ pub fn uninstall(target: Target) -> anyhow::Result<InstallReceipt> {
             receipt(target, changed, backup)
         }
         Target::Codex => uninstall_codex_entry(&codex_config_path(), target),
+        Target::Dsh => {
+            let path = dsh_config_path();
+            let Some(before) = read_text(&path)? else {
+                return receipt(target, false, None);
+            };
+            match dsh::uninstall(&before) {
+                None => receipt(target, false, None),
+                Some(rendered) => {
+                    let backup = write_with_backup(&path, Some(&before), &rendered)?;
+                    receipt(target, true, backup)
+                }
+            }
+        }
     })
+}
+
+/// 按键路径取（必要时创建）server 表。中间层不是对象时拒绝修改。
+fn servers_at<'a>(
+    root: &'a mut Map<String, Value>,
+    key_path: &[&str],
+    path: &Path,
+) -> anyhow::Result<&'a mut Map<String, Value>> {
+    let mut node = root;
+    for key in key_path {
+        node = node
+            .entry(key.to_string())
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .with_context(|| {
+                format!("{} 的 {} 不是对象，未修改", path.display(), key_path.join("."))
+            })?;
+    }
+    Ok(node)
 }
 
 fn install_json_entry(
     path: &Path,
+    key_path: &[&str],
     runtime: &RuntimeLocation,
     target: Target,
 ) -> anyhow::Result<InstallReceipt> {
     let before = read_text(path)?;
     let mut root = parse_json_object(before.as_deref().unwrap_or("{}"), path)?;
-    let servers = root
-        .entry("mcpServers")
-        .or_insert_with(|| Value::Object(Map::new()));
-    let servers = servers
-        .as_object_mut()
-        .with_context(|| format!("{} 的 mcpServers 不是对象，未修改", path.display()))?;
+    let servers = servers_at(&mut root, key_path, path)?;
 
     // CU 与浏览器是两个独立的 server，各自判定、各自写；只改自己那条。
-    let entries = [
-        (SERVER_ID, runtime.server_entry()),
-        (BROWSER_SERVER_ID, runtime.browser_server_entry()),
-    ];
     let mut changed = false;
-    for (id, expected) in entries {
+    for (id, expected) in runtime.managed_entries() {
         if let Some(existing) = servers.get(id) {
             ensure!(
                 looks_like_ours(existing, runtime),
@@ -723,13 +853,21 @@ fn install_json_entry(
     receipt(target, true, backup)
 }
 
-fn uninstall_json_entry(path: &Path, target: Target) -> anyhow::Result<InstallReceipt> {
+fn uninstall_json_entry(
+    path: &Path,
+    key_path: &[&str],
+    target: Target,
+) -> anyhow::Result<InstallReceipt> {
     let Some(before) = read_text(path)? else {
         return receipt(target, false, None);
     };
     let mut root = parse_json_object(&before, path)?;
     let mut removed = false;
-    if let Some(servers) = root.get_mut("mcpServers").and_then(Value::as_object_mut) {
+    let mut node = Some(&mut root);
+    for key in key_path {
+        node = node.and_then(|map| map.get_mut(*key)).and_then(Value::as_object_mut);
+    }
+    if let Some(servers) = node {
         for id in [SERVER_ID, BROWSER_SERVER_ID] {
             removed |= servers.remove(id).is_some();
         }
@@ -1335,16 +1473,20 @@ fn prune_backups(path: &Path) {
     }
 }
 
-fn read_json_entry(path: &Path, server_id: &str) -> anyhow::Result<Option<Value>> {
+fn read_json_entry(
+    path: &Path,
+    key_path: &[&str],
+    server_id: &str,
+) -> anyhow::Result<Option<Value>> {
     let Some(text) = read_text(path)? else {
         return Ok(None);
     };
     let root = parse_json_object(&text, path)?;
-    Ok(root
-        .get("mcpServers")
-        .and_then(Value::as_object)
-        .and_then(|servers| servers.get(server_id))
-        .cloned())
+    let mut node = Some(&root);
+    for key in key_path {
+        node = node.and_then(|map| map.get(*key)).and_then(Value::as_object);
+    }
+    Ok(node.and_then(|servers| servers.get(server_id)).cloned())
 }
 
 /// 客户端会重写配置（Claude Desktop 会把 `type` 之类规范化掉），
@@ -1497,7 +1639,7 @@ mod tests {
         let path = temp.path().join(".claude.json");
         fs::write(&path, "{\n  \"numStartups\": 3,\n  \"mcpServers\": {}\n}\n").unwrap();
         let runtime = sample_runtime(temp.path());
-        let first = install_json_entry(&path, &runtime, Target::ClaudeCode).unwrap();
+        let first = install_json_entry(&path, &["mcpServers"], &runtime, Target::ClaudeCode).unwrap();
         assert!(first.changed);
         let text = fs::read_to_string(&path).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
@@ -1507,14 +1649,57 @@ mod tests {
             runtime.self_command()
         );
 
-        let second = install_json_entry(&path, &runtime, Target::ClaudeCode).unwrap();
+        let second = install_json_entry(&path, &["mcpServers"], &runtime, Target::ClaudeCode).unwrap();
         assert!(!second.changed, "重复安装不应该重写文件");
 
-        let removed = uninstall_json_entry(&path, Target::ClaudeCode).unwrap();
+        let removed = uninstall_json_entry(&path, &["mcpServers"], Target::ClaudeCode).unwrap();
         assert!(removed.changed);
         let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(value["mcpServers"].get(SERVER_ID).is_none());
         assert_eq!(value["numStartups"], 3);
+    }
+
+    #[test]
+    fn zcode_servers_live_under_nested_mcp_servers() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+        // ZCode 自己的 config.json 已有 plugins，不能被冲掉。
+        fs::write(&path, "{\n  \"plugins\": {\"a\": true}\n}\n").unwrap();
+        let runtime = sample_runtime(temp.path());
+        let key_path = Target::Zcode.json_key_path().unwrap();
+        assert!(install_json_entry(&path, key_path, &runtime, Target::Zcode).unwrap().changed);
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["plugins"]["a"], true);
+        assert_eq!(value["mcp"]["servers"][SERVER_ID]["args"][0], "--codex-plus-cu-mcp");
+        assert_eq!(
+            value["mcp"]["servers"][BROWSER_SERVER_ID]["args"][0],
+            "--codex-plus-browser-mcp"
+        );
+        assert!(value.get("mcpServers").is_none(), "不能写到 Claude 的键上");
+        assert!(read_json_entry(&path, key_path, SERVER_ID).unwrap().is_some());
+
+        assert!(uninstall_json_entry(&path, key_path, Target::Zcode).unwrap().changed);
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(value["mcp"]["servers"].get(SERVER_ID).is_none());
+        assert_eq!(value["plugins"]["a"], true);
+    }
+
+    #[test]
+    fn non_object_intermediate_key_is_left_alone() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+        fs::write(&path, "{\"mcp\": \"disabled\"}").unwrap();
+        let runtime = sample_runtime(temp.path());
+        assert!(install_json_entry(&path, &["mcp", "servers"], &runtime, Target::Zcode).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"mcp\": \"disabled\"}");
+    }
+
+    #[test]
+    fn target_ids_round_trip() {
+        for target in Target::ALL {
+            assert_eq!(Target::parse(target.id()).unwrap(), target);
+        }
+        assert!(Target::parse("nope").is_err());
     }
 
     #[test]
@@ -1527,7 +1712,7 @@ mod tests {
         )
         .unwrap();
         let runtime = sample_runtime(temp.path());
-        let error = install_json_entry(&path, &runtime, Target::ClaudeCode).unwrap_err();
+        let error = install_json_entry(&path, &["mcpServers"], &runtime, Target::ClaudeCode).unwrap_err();
         assert!(error.to_string().contains("同名"));
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("/other/node"));
@@ -1539,7 +1724,7 @@ mod tests {
         let path = temp.path().join(".claude.json");
         fs::write(&path, "{not json").unwrap();
         let runtime = sample_runtime(temp.path());
-        assert!(install_json_entry(&path, &runtime, Target::ClaudeCode).is_err());
+        assert!(install_json_entry(&path, &["mcpServers"], &runtime, Target::ClaudeCode).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "{not json");
     }
 

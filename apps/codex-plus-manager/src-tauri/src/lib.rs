@@ -53,12 +53,12 @@ pub fn run_computer_use_cli(args: &[std::ffi::OsString]) -> anyhow::Result<()> {
         "status" => serde_json::to_value(codex_plus_core::computer_use::status()?)?,
         "check" => serde_json::to_value(codex_plus_core::computer_use::check())?,
         "install" => {
-            let id = target.as_deref().ok_or_else(|| anyhow::anyhow!("install 需要 target：claudeCode / claudeDesktop / codex"))?;
+            let id = target.as_deref().ok_or_else(|| anyhow::anyhow!("install 需要 target：claudeCode / claudeDesktop / codex / dsh / zcode / workBuddy"))?;
             let parsed = codex_plus_core::computer_use::Target::parse(id)?;
             serde_json::to_value(codex_plus_core::computer_use::install(parsed)?)?
         }
         "uninstall" => {
-            let id = target.as_deref().ok_or_else(|| anyhow::anyhow!("uninstall 需要 target：claudeCode / claudeDesktop / codex"))?;
+            let id = target.as_deref().ok_or_else(|| anyhow::anyhow!("uninstall 需要 target：claudeCode / claudeDesktop / codex / dsh / zcode / workBuddy"))?;
             let parsed = codex_plus_core::computer_use::Target::parse(id)?;
             serde_json::to_value(codex_plus_core::computer_use::uninstall(parsed)?)?
         }

@@ -1,4 +1,4 @@
-/** Computer Use：复用 Codex app 的 Computer Use，通过 MCP 提供给 Claude Code / Claude Desktop / Codex。 */
+/** Computer Use：复用 Codex app 的 Computer Use 与 Chrome 控制，通过 MCP 提供给 Claude Code、DeepSeek Harness、ZCode 等客户端。 */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { AlertTriangle, CheckCircle2, Loader2, MonitorSmartphone, Play, Plug, RefreshCw, Unplug } from "lucide-react";
@@ -6,7 +6,7 @@ import { PageHeader } from "./ManagementPages";
 import { t } from "./i18n";
 import "./ComputerUsePage.css";
 
-type CuTargetId = "claudeCode" | "claudeDesktop" | "codex";
+type CuTargetId = "claudeCode" | "claudeDesktop" | "codex" | "dsh" | "zcode" | "workBuddy";
 type CuTargetState = "registered" | "missing" | "needs_update" | "foreign" | "unsupported";
 type CuTarget = { id: string; label: string; configPath: string; registered: boolean; state: CuTargetState; message: string };
 type CuTargets = Record<CuTargetId, CuTarget>;
@@ -48,12 +48,15 @@ type CuApprovalState = {
 };
 
 // Codex 桌面版自己会把 [mcp_servers.computer-use] 写进 ~/.codex/config.toml，
-// 再挂一份只会让同一个 CU 服务出现两条连接，所以默认只列两个 Claude 客户端。
-const targetIds: CuTargetId[] = ["claudeCode", "claudeDesktop"];
+// 再挂一份只会让同一个 CU 服务出现两条连接，所以不列 Codex。
+const targetIds: CuTargetId[] = ["claudeCode", "claudeDesktop", "dsh", "zcode", "workBuddy"];
 const targetFallback: Record<CuTargetId, { label: string; configPath: string }> = {
   claudeCode: { label: "Claude Code", configPath: "~/.claude.json" },
   claudeDesktop: { label: "Claude Desktop", configPath: "claude_desktop_config.json" },
   codex: { label: "Codex", configPath: "config.toml" },
+  dsh: { label: "DeepSeek Harness", configPath: "~/.dsh/profiles/desktop/cordis.patch.yml" },
+  zcode: { label: "ZCode", configPath: "~/.zcode/cli/config.json" },
+  workBuddy: { label: "WorkBuddy AI", configPath: "~/.workbuddy/mcp.json" },
 };
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const hasValue = (value?: string) => Boolean(value && value.trim());
@@ -298,7 +301,7 @@ export function ComputerUsePage() {
       </button>
     } />
     <div className="cu-content" aria-busy={loading}>
-      <p className="cu-intro">{t("复用 Codex app 的 Computer Use，通过 MCP 提供给 Claude Code / Claude Desktop / Codex。")}</p>
+      <p className="cu-intro">{t("复用 Codex app 的 Computer Use 与 Chrome 控制，通过 MCP 提供给 Claude Code、Claude Desktop、DeepSeek Harness、ZCode、WorkBuddy 等客户端。")}</p>
 
       {readError && <p className="cu-error" role="alert">{t("读取状态失败：")}{readError}</p>}
       {actionError && <p className="cu-error" role="alert">{t("操作失败：")}{actionError}</p>}
@@ -478,7 +481,7 @@ export function ComputerUsePage() {
       {status?.claudeDesktopRunning ? (
         <p className="cu-note cu-note-warn">{t("Claude Desktop 正在运行：它退出时会重写自己的配置，接入前建议先完全退出 Claude Desktop，改完再打开。")}</p>
       ) : null}
-      <p className="cu-note">{t("接入后需要重启 Claude Code 会话才会加载工具，工具名以")}<code>mcp__codex-plus-cu__</code>{t("前缀出现在工具列表中。")}</p>
+      <p className="cu-note">{t("接入后需要重启对应客户端（Claude Code 会话、DeepSeek Harness、ZCode、WorkBuddy）才会加载工具，工具名以")}<code>mcp__codex-plus-cu__</code>{t("与")}<code>mcp__codex-plus-browser__</code>{t("前缀出现在工具列表中。")}</p>
       <p className="cu-note">{t("Codex 桌面版与终端 CLI 共用")}<code>~/.codex/config.toml</code>{t("，其中已由 Codex 自己写入")}<code>[mcp_servers.computer-use]</code>{t("，无需重复接入；仅当你要在没有该条目的环境里单独启用时，才使用")}<code>--codex-plus-cu-cli install codex</code>{t("。")}</p>
     </div>
   </div>;
