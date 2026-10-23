@@ -316,6 +316,8 @@ export function ComputerUsePage() {
           <dd>{hasValue(status?.appPath) ? <code title={status?.appPath}>{status?.appPath}</code> : "—"}</dd>
           <dt>@oai/cua-repl</dt>
           <dd>{hasValue(status?.packageVersion) ? <code>{status?.packageVersion}</code> : "—"}</dd>
+          <dt>{t("CU server")}</dt>
+          <dd><code>SkyComputerUseClient</code></dd>
           <dt>{t("CU 服务路径")}</dt>
           <dd>{hasValue(status?.servicePath) ? <code title={status?.servicePath}>{status?.servicePath}</code> : "—"}</dd>
         </dl>
@@ -335,7 +337,7 @@ export function ComputerUsePage() {
         <div className="cu-card-head">
           <div>
             <h2 id="cu-targets-title">{t("接入目标")}</h2>
-            <p>{t("把同一个 Computer Use MCP 服务登记到三个客户端，写入前会自动备份原配置。")}</p>
+            <p>{t("登记两个 MCP 服务：桌面操控（直通 Codex 原生 CU）与 Chrome 浏览器控制。写入前会自动备份原配置，只改自己写入的条目。")}</p>
           </div>
         </div>
         <div className="cu-targets">
