@@ -1684,6 +1684,22 @@ pub fn live_config_matches_other_profile_in_home(
     }))
 }
 
+/// 回填时发现实时配置的 endpoint 与供应商快照对不上：分不清是外部工具接管还是
+/// 用户手工改的，自动回填只能停下（#2666）。单独成类型，切换流程据此让用户
+/// 显式选择「导入为新供应商」或「放弃实时改动」，而不是只给一句报错。
+#[derive(Debug)]
+pub struct LiveEndpointChanged;
+
+impl std::fmt::Display for LiveEndpointChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "实时供应商 endpoint 已改变，无法区分外部接管与手工编辑，已停止回填并保留原配置。请先将实时 config.toml / auth.json 显式导入为新供应商，或在编辑器明确保存新的 URL 与 Key 后再切换。",
+        )
+    }
+}
+
+impl std::error::Error for LiveEndpointChanged {}
+
 fn validate_backfill_endpoint_identity(profile: &RelayProfile, config: &str) -> anyhow::Result<()> {
     if profile.relay_mode == RelayMode::Official && !profile.official_mix_api_key {
         return Ok(());
@@ -1712,9 +1728,7 @@ fn validate_backfill_endpoint_identity(profile: &RelayProfile, config: &str) -> 
     {
         return Ok(());
     }
-    anyhow::bail!(
-        "实时供应商 endpoint 已改变，无法区分外部接管与手工编辑，已停止回填并保留原配置。请先将实时 config.toml / auth.json 显式导入为新供应商，或在编辑器明确保存新的 URL 与 Key 后再切换。"
-    )
+    Err(LiveEndpointChanged.into())
 }
 
 /// 纯官方快照保留非认证设置，去掉第三方路由/认证和托管目录指针。
@@ -5582,6 +5596,19 @@ fn restore_optional_file(path: &Path, contents: Option<&[u8]>) -> anyhow::Result
             Err(error) => Err(error.into()),
         },
     }
+}
+
+/// 放弃实时改动前把当前 config.toml / auth.json 原样备份，返回备份目录；
+/// 两个文件都不存在时没有可备份的内容，返回 None。
+pub fn backup_live_files(home: &Path) -> anyhow::Result<Option<String>> {
+    let read = |name: &str| match std::fs::read(home.join(name)) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(anyhow::Error::from(error).context(format!("读取实时 {name} 失败"))),
+    };
+    let config = read("config.toml")?;
+    let auth = read("auth.json")?;
+    create_live_backup(home, config.as_deref(), auth.as_deref())
 }
 
 fn create_live_backup(

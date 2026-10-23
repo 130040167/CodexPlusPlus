@@ -750,10 +750,16 @@ type RelaySwitchResult = CommandResult<{
   settingsPath: string;
   user_scripts: unknown;
   relay: RelayPayload;
+  /** 实时配置 endpoint 被外部改过而停下时才有（#2666）。 */
+  liveConflict?: { profileId: string; profileName: string };
 }>;
+
+/** 冲突弹窗里的两种继续方式，对应后端 LiveConflictResolution。 */
+type LiveConflictResolution = "importAsNewProfile" | "discardLiveChanges";
 
 type SettingsBackfillResult = CommandResult<{
   settings: BackendSettings;
+  liveConflict?: boolean;
 }>;
 
 type RelayProfileTestResult = CommandResult<{
@@ -1355,6 +1361,10 @@ export function App() {
     confirmText: string;
     cancelText: string;
     resolve: (confirmed: boolean) => void;
+  } | null>(null);
+  const [liveConflictDialog, setLiveConflictDialog] = useState<{
+    profileName: string;
+    resolve: (choice: LiveConflictResolution | null) => void;
   } | null>(null);
   const [sessionIndexCleanupDialog, setSessionIndexCleanupDialog] = useState<{
     candidates: SessionIndexCleanupCandidate[];
@@ -3346,7 +3356,11 @@ export function App() {
     showNotice(t("纯 API 模式"), t("已切换到纯 API。"), "ok");
   };
 
-  const switchRelayProfile = async (next: BackendSettings, previousActiveRelayId = settingsForm.activeRelayId) => {
+  const switchRelayProfile = async (
+    next: BackendSettings,
+    previousActiveRelayId = settingsForm.activeRelayId,
+    liveConflictResolution?: LiveConflictResolution,
+  ) => {
     if (relaySwitching) {
       showNotice(t("供应商切换中"), t("上一次切换还没有完成，请稍后再试。"), "failed");
       return;
@@ -3374,7 +3388,10 @@ export function App() {
       showNotice(t("供应商配置可能不正确"), validationError, "failed");
       return;
     }
-    switchSettings = await snapshotActiveRelayFilesBeforeSwitch(switchSettings, previousActiveRelayId);
+    // 用户已在冲突弹窗里做了选择时，回填交给后端按选择处理，不再先跑一遍注定失败的回填。
+    if (!liveConflictResolution) {
+      switchSettings = await snapshotActiveRelayFilesBeforeSwitch(switchSettings, previousActiveRelayId);
+    }
     const selectedAfterSave = activeRelayProfile(switchSettings);
     const command = relayProfileSwitchCommand(selectedAfterSave);
 
@@ -3383,12 +3400,14 @@ export function App() {
       targetRelayName: selectedAfterSave.name,
       previousActiveRelayId,
       command,
+      liveConflictResolution: liveConflictResolution ?? null,
     });
+    let liveConflict: { profileId: string; profileName: string } | null = null;
     setRelaySwitching(true);
     try {
       const result = await run(() =>
         call<RelaySwitchResult>("switch_relay_profile", {
-          request: { settings: switchSettings, previousActiveRelayId },
+          request: { settings: switchSettings, previousActiveRelayId, liveConflictResolution },
         }),
       );
       if (!result) {
@@ -3419,18 +3438,36 @@ export function App() {
           status: result.status,
           message: result.message,
           activeRelayId: selectedSettings.activeRelayId,
+          liveConflict: !!result.liveConflict,
         });
-        showNotice(t("供应商切换"), result.message, result.status);
-        return;
+        // 实时 endpoint 被外部改过（#2666）：不只报错，弹窗让用户选怎么继续。
+        // 这里不能 return：弹窗在 finally 之后，return 会让它永远走不到。
+        if (result.liveConflict && !liveConflictResolution) {
+          liveConflict = result.liveConflict;
+        } else {
+          showNotice(t("供应商切换"), result.message, result.status);
+        }
+      } else {
+        const currentSelected = activeRelayProfile(selectedSettings);
+        logDiagnostic("switchRelayProfile.ok", {
+          targetRelayId: currentSelected.id,
+          status: result.status,
+        });
+        if (liveConflictResolution) showNotice(t("供应商切换"), result.message, result.status);
       }
-      const currentSelected = activeRelayProfile(selectedSettings);
-      logDiagnostic("switchRelayProfile.ok", {
-        targetRelayId: currentSelected.id,
-        status: result.status,
-      });
     } finally {
       setRelaySwitching(false);
     }
+    const conflict = liveConflict;
+    if (!conflict) return;
+    const choice = await new Promise<LiveConflictResolution | null>((resolve) => {
+      setLiveConflictDialog({ profileName: conflict.profileName, resolve });
+    });
+    logDiagnostic("switchRelayProfile.live_conflict_choice", {
+      profileId: conflict.profileId,
+      choice: choice ?? "cancel",
+    });
+    if (choice) await switchRelayProfile(next, previousActiveRelayId, choice);
   };
 
   const snapshotActiveRelayFilesBeforeSwitch = async (
@@ -3445,6 +3482,8 @@ export function App() {
       }),
     );
     if (!result) return next;
+    // endpoint 被外部改过（#2666）：紧接着的切换会弹窗让用户选择，这里不重复提示。
+    if (result.liveConflict) return next;
     const normalized = normalizeSettings(result.settings);
     // degraded = 后端跳过了回填（例如 live config.toml 有语法错误，issue #618）。
     // 切换本身照常继续，只是用原配置走；提示一下原因即可，不能按 failed 处理，
@@ -4280,6 +4319,15 @@ export function App() {
           onConfirm={() => {
             confirmDialog.resolve(true);
             setConfirmDialog(null);
+          }}
+        />
+      ) : null}
+      {liveConflictDialog ? (
+        <LiveConflictDialog
+          profileName={liveConflictDialog.profileName}
+          onChoose={(choice) => {
+            liveConflictDialog.resolve(choice);
+            setLiveConflictDialog(null);
           }}
         />
       ) : null}
@@ -12997,6 +13045,45 @@ function ConfirmDialog({
             {confirm.confirmText}
           </Button>
           <Button onClick={onCancel} variant="secondary">{confirm.cancelText}</Button>
+        </Toolbar>
+      </div>
+    </div>
+  );
+}
+
+/** 切换时实时配置 endpoint 被外部改过（#2666）：让用户选导入还是放弃，不再只给报错。 */
+function LiveConflictDialog({
+  profileName,
+  onChoose,
+}: {
+  profileName: string;
+  onChoose: (choice: LiveConflictResolution | null) => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true">
+      <div className="modal-card confirm-modal">
+        <div className="modal-head">
+          <div>
+            <h2>{t("实时配置已被修改")}</h2>
+          </div>
+          <button className="toast-close" onClick={() => onChoose(null)} type="button">×</button>
+        </div>
+        <div className="confirm-modal-body">
+          <p className="modal-message">
+            {tf("当前生效的 config.toml / auth.json 里的供应商地址，和「{0}」保存的不一样。可能是其它工具改过，也可能是你手动改的，Codex++ 无法自动判断该保留哪一份。", [profileName])}
+          </p>
+          <p className="modal-message">{tf("导入为新供应商：把当前生效的地址和 Key 保存成一个新供应商，「{0}」保持原样，然后继续切换。", [profileName])}</p>
+          <p className="modal-message">{tf("放弃实时改动：先把当前生效的文件备份一份，「{0}」保持原样，然后继续切换。", [profileName])}</p>
+        </div>
+        <Toolbar className="confirm-modal-actions">
+          <Button onClick={() => onChoose("importAsNewProfile")}>
+            <Download className="h-4 w-4" />
+            {t("导入为新供应商")}
+          </Button>
+          <Button onClick={() => onChoose("discardLiveChanges")} variant="secondary">
+            {t("放弃实时改动、继续切换")}
+          </Button>
+          <Button onClick={() => onChoose(null)} variant="ghost">{t("取消")}</Button>
         </Toolbar>
       </div>
     </div>

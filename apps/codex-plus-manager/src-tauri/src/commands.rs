@@ -430,12 +430,25 @@ pub struct RelaySwitchPayload {
     pub relay: RelayPayload,
     pub settings_path: String,
     pub user_scripts: Value,
+    /// 实时配置 endpoint 被外部改过而停下时才有，前端据此弹窗让用户选择（#2666）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_conflict: Option<LiveConflictPayload>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveConflictPayload {
+    pub profile_id: String,
+    pub profile_name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsBackfillPayload {
     pub settings: BackendSettings,
+    /// 回填因实时 endpoint 被外部改过而停下（#2666）；随后的切换会弹窗处理，前端不必再提示一次。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub live_conflict: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -7000,6 +7013,9 @@ pub struct RelayProfileSwitchRequest {
     pub settings: BackendSettings,
     #[serde(default)]
     pub previous_active_relay_id: String,
+    /// 用户在冲突弹窗里的选择；不传等于照旧停下。
+    #[serde(default)]
+    pub live_conflict_resolution: codex_plus_core::relay_switch::LiveConflictResolution,
 }
 
 #[tauri::command]
@@ -7021,40 +7037,69 @@ pub fn switch_relay_profile(
     let store = SettingsStore::default();
     let previous_active_relay_id = request.previous_active_relay_id;
     let settings = normalize_settings_before_save(request.settings);
+    let resolution = request.live_conflict_resolution;
     log_manager_event(
         "manager.switch_relay_profile.start",
         json!({
             "previousActiveRelayId": previous_active_relay_id,
-            "targetRelayId": settings.active_relay_id
+            "targetRelayId": settings.active_relay_id,
+            "liveConflictResolution": format!("{resolution:?}")
         }),
     );
-    match codex_plus_core::relay_switch::switch_relay_profile_in_home(
+    match codex_plus_core::relay_switch::switch_relay_profile_in_home_resolving_conflict(
         &store,
         &home,
         settings,
         &previous_active_relay_id,
+        resolution,
     ) {
-        Ok(result) => {
+        Ok((result, outcome)) => {
             let status = codex_plus_core::relay_config::relay_status_from_home(&home);
             log_manager_event(
                 "manager.switch_relay_profile.ok",
                 json!({
                     "targetRelayId": result.settings.active_relay_id,
                     "configured": status.configured,
-                    "backupPath": result.backup_path.as_ref()
+                    "backupPath": result.backup_path.as_ref(),
+                    "importedProfileId": outcome.imported_profile_id.as_ref(),
+                    "liveBackupPath": outcome.live_backup_path.as_ref()
                 }),
             );
             // 新配置已经写进 config.toml：需要本地代理时立即让它常驻，
             // 这样不经过 Codex++ 启动的客户端也能直接用。
             sync_resident_helper();
+            let imported_name = outcome.imported_profile_id.as_ref().and_then(|id| {
+                result
+                    .settings
+                    .relay_profiles
+                    .iter()
+                    .find(|profile| &profile.id == id)
+                    .map(|profile| profile.name.clone())
+            });
+            let message = match (imported_name, outcome.live_backup_path.as_ref()) {
+                (Some(name), _) => format!("已把实时配置导入为新供应商「{name}」，并完成切换。"),
+                (None, Some(path)) => format!("供应商已切换。实时配置的改动已放弃，原文件备份在：{path}"),
+                (None, None) => "供应商已切换。".to_string(),
+            };
             ok(
-                "供应商已切换。",
+                &message,
                 relay_switch_payload(result.settings, status, result.backup_path),
             )
         }
         Err(error) => {
             let status = codex_plus_core::relay_config::relay_status_from_home(&home);
             let settings = store.load().unwrap_or_default();
+            let live_conflict = error
+                .downcast_ref::<codex_plus_core::relay_switch::LiveEndpointConflict>()
+                .map(|conflict| LiveConflictPayload {
+                    profile_name: settings
+                        .relay_profiles
+                        .iter()
+                        .find(|profile| profile.id == conflict.profile_id)
+                        .map(|profile| profile.name.clone())
+                        .unwrap_or_else(|| conflict.profile_id.clone()),
+                    profile_id: conflict.profile_id.clone(),
+                });
             log_manager_event(
                 "manager.switch_relay_profile.failed",
                 json!({
@@ -7062,13 +7107,13 @@ pub fn switch_relay_profile(
                     "activeRelayId": settings.active_relay_id,
                     // `{:#}` 带上完整错误链：只取最外层会只剩「保存供应商设置失败」，
                     // 看不到真正原因（#2651）。
-                    "error": format!("{error:#}")
+                    "error": format!("{error:#}"),
+                    "liveConflict": live_conflict.is_some()
                 }),
             );
-            failed(
-                &format!("供应商切换失败：{error:#}"),
-                relay_switch_payload(settings, status, None),
-            )
+            let mut payload = relay_switch_payload(settings, status, None);
+            payload.live_conflict = live_conflict;
+            failed(&format!("供应商切换失败：{error:#}"), payload)
         }
     }
 }
@@ -7138,7 +7183,7 @@ pub fn backfill_relay_profile_from_live(
         );
         return failed(
             "当前供应商已不在配置列表中，已停止切换以避免覆盖用户改动。",
-            SettingsBackfillPayload { settings },
+            SettingsBackfillPayload { settings, live_conflict: false },
         );
     };
 
@@ -7157,7 +7202,7 @@ pub fn backfill_relay_profile_from_live(
         );
         return degraded(
             &format!("config.toml 有语法错误，已跳过回填并保留原有配置（切换照常进行）：{error}"),
-            SettingsBackfillPayload { settings },
+            SettingsBackfillPayload { settings, live_conflict: false },
         );
     }
 
@@ -7170,14 +7215,14 @@ pub fn backfill_relay_profile_from_live(
             Ok(true) => {
                 return ok(
                     "实时配置属于其它已保存供应商，已保留原快照。",
-                    SettingsBackfillPayload { settings },
+                    SettingsBackfillPayload { settings, live_conflict: false },
                 );
             }
             Ok(false) => {}
             Err(error) => {
                 return failed(
                     &format!("读取实时配置归属失败，已保留原配置：{error}"),
-                    SettingsBackfillPayload { settings },
+                    SettingsBackfillPayload { settings, live_conflict: false },
                 );
             }
         }
@@ -7216,20 +7261,24 @@ pub fn backfill_relay_profile_from_live(
                 } else {
                     "当前供应商配置已从 live 文件回填。"
                 },
-                SettingsBackfillPayload { settings },
+                SettingsBackfillPayload { settings, live_conflict: false },
             )
         }
         Err(error) => {
+            let live_conflict = error
+                .chain()
+                .any(|cause| cause.is::<codex_plus_core::relay_config::LiveEndpointChanged>());
             log_manager_event(
                 "manager.backfill_relay_profile_from_live.failed",
                 json!({
                     "profileId": requested_profile_id,
-                    "error": error.to_string()
+                    "error": error.to_string(),
+                    "liveConflict": live_conflict
                 }),
             );
             failed(
                 &format!("回填当前供应商配置失败：{error}"),
-                SettingsBackfillPayload { settings },
+                SettingsBackfillPayload { settings, live_conflict },
             )
         }
     }
@@ -8483,6 +8532,7 @@ fn relay_switch_payload(
             .to_string_lossy()
             .to_string(),
         user_scripts: user_script_inventory(),
+        live_conflict: None,
     }
 }
 
