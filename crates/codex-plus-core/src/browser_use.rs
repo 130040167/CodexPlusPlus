@@ -159,6 +159,8 @@ struct ProxyState {
     init_ids: BTreeSet<i64>,
     session_id: String,
     turn_seq: u64,
+    /// 本回合是否真的用过浏览器。Stop 钩子是全局的，用它过滤别的会话的事件。
+    touched_turn: bool,
     ctx: CallContext,
 }
 
@@ -172,6 +174,7 @@ impl ProxyState {
             init_ids: BTreeSet::new(),
             session_id: uuid::Uuid::new_v4().to_string(),
             turn_seq: 1,
+            touched_turn: false,
             ctx: CallContext::default(),
         }
     }
@@ -192,7 +195,13 @@ impl ProxyState {
                 }
                 Ok(Event::Child(message)) => self.on_child(message),
                 Ok(Event::ChildClosed) => return Ok(()),
-                Ok(Event::TurnEnd) => self.end_turn(),
+                // 钩子是本机全局的：别的 Claude 会话结束时也会触发。本会话这一回合
+                // 没碰过浏览器就忽略，否则会把人家正在用的标签关掉。
+                Ok(Event::TurnEnd) => {
+                    if self.touched_turn {
+                        self.end_turn();
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             }
@@ -219,6 +228,7 @@ impl ProxyState {
         self.next_id += 1;
         let _ = self.write_child(&call);
         self.turn_seq += 1;
+        self.touched_turn = false;
         // 回合结束时扩展会关掉本回合的 agent 标签，句柄可能失效。
         self.ctx.last_tab = None;
     }
@@ -280,6 +290,7 @@ impl ProxyState {
                     if let Some(child_id) = self.remap(&mut message) {
                         self.plans.insert(child_id, tool);
                     }
+                    self.touched_turn = true;
                     return self.forward(message);
                 }
                 // 不认识的名字不再原样透传：cua-repl 里只有 js/js_reset/turn_ended，
