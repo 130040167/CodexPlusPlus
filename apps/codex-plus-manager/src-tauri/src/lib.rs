@@ -1,5 +1,6 @@
 mod auto_takeover;
 mod agent_collaboration_commands;
+mod computer_use_commands;
 mod global_dictation;
 pub mod commands;
 pub mod install;
@@ -28,6 +29,37 @@ pub(crate) fn app_is_exiting() -> bool {
 
 pub fn run_agent_collaboration_mcp(args: &[std::ffi::OsString]) -> anyhow::Result<()> {
     agent_collaboration_commands::run_mcp(args)
+}
+
+/// Computer Use 诊断入口。只给命令行与排障使用，不经过 GUI，也不注册到路由。
+/// Computer Use 的 MCP 入口（stdio）。作为代理运行，直到客户端断开。
+pub fn run_computer_use_mcp() -> anyhow::Result<()> {
+    codex_plus_core::computer_use_proxy::serve()
+}
+
+pub fn run_computer_use_cli(args: &[std::ffi::OsString]) -> anyhow::Result<()> {
+    let action = args
+        .first()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "status".to_string());
+    let target = args.get(1).map(|value| value.to_string_lossy().into_owned());
+    let output = match action.as_str() {
+        "status" => serde_json::to_value(codex_plus_core::computer_use::status()?)?,
+        "check" => serde_json::to_value(codex_plus_core::computer_use::check())?,
+        "install" => {
+            let id = target.as_deref().ok_or_else(|| anyhow::anyhow!("install 需要 target：claudeCode / claudeDesktop / codex"))?;
+            let parsed = codex_plus_core::computer_use::Target::parse(id)?;
+            serde_json::to_value(codex_plus_core::computer_use::install(parsed)?)?
+        }
+        "uninstall" => {
+            let id = target.as_deref().ok_or_else(|| anyhow::anyhow!("uninstall 需要 target：claudeCode / claudeDesktop / codex"))?;
+            let parsed = codex_plus_core::computer_use::Target::parse(id)?;
+            serde_json::to_value(codex_plus_core::computer_use::uninstall(parsed)?)?
+        }
+        other => anyhow::bail!("未知的 Computer Use 诊断动作：{other}"),
+    };
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
 }
 
 pub fn run() {
@@ -156,6 +188,11 @@ pub fn run() {
             commands::claude_localization_set_voice_input,
             commands::claude_localization_set_localization,
             commands::claude_localization_set_computer_use,
+            computer_use_commands::computer_use_status,
+            computer_use_commands::computer_use_install,
+            computer_use_commands::computer_use_uninstall,
+            computer_use_commands::computer_use_check,
+            computer_use_commands::computer_use_open_app,
             commands::native_browser_status,
             commands::save_settings,
             commands::list_tools,

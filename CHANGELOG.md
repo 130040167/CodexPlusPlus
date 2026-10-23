@@ -1,5 +1,11 @@
 # 更新日志
 
+## 未发布
+
+### 新增
+
+- **Computer Use 接入（原生直通 Codex 桌面版的 CU server）**：新增「Computer Use」页，把 Codex 桌面版的 computer use 以 MCP 接给 Claude Code 与 Claude Desktop。做法不是重写鼠标键盘模拟，也不是转译 cua-repl 的 JS 工具，而是**直通原生 CU server**（`SkyComputerUseClient mcp`）：它对外就是标准 stdio MCP，10 个离散工具（`list_apps` / `get_app_state` / `click` / `perform_secondary_action` / `set_value` / `select_text` / `scroll` / `drag` / `press_key` / `type_text`），带 `annotations`。唯一门槛是它校验「直接父进程的代码签名」——非 OpenAI 签名会被拒为 `-10000 Sender process is not authenticated`；因此由 ChatGPT.app 自带的签名 node 执行一个只负责 `spawn` 的 shim 拉起，中间不插 shell。工具面、AX 树信封、diff 语义（`There has been no change…`）、截图原分辨率、`frontmost` 标记全部原样透传，不再逐项手工对齐。代理只做三件事：字节转发、`initialize` 时替客户端补 `elicitation` 能力（Claude Code 不声明，而原生 server 无论如何都会发该请求并阻塞）、就地应答审批并留痕到 `~/.codex-session-delete/cu/elicitation.log`（审批卡与持久化在后续版本）。展开页可见运行时与两个接入目标的独立开关；「运行自检」走同一条直通链路（`tools/list` 校验工具面 + `tools/call list_apps`），失败按「未安装 / 父进程不受信 / 未授权 / 服务未就绪」分类提示。写入配置仍是「锁 → 读 → 比对 → 备份 → 原子写」，同名条目不是本功能写入的一律不覆盖；接入后需重启对应客户端会话。Codex 自己会把 `[mcp_servers.computer-use]` 写进 `~/.codex/config.toml`，桌面版与 CLI 共用该文件，因此不再重复接入。浏览器控制不在此 server 内（原生 CU 没有浏览器工具），后续由独立 server 提供。
+
 ## 1.11.2 - 2026-10-23
 
 本次为补丁更新，修复 Windows 上的启动器退出、WSL 配置路径和若干供应商与模型问题。

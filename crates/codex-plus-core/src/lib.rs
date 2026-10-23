@@ -14,6 +14,8 @@ pub mod codex_app_state;
 pub mod codex_home;
 pub mod codex_local_storage;
 pub mod codex_sqlite;
+pub mod computer_use;
+pub mod computer_use_proxy;
 pub mod connect;
 pub mod diagnostic_log;
 pub mod dictation;
