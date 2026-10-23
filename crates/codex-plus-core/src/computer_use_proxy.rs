@@ -23,8 +23,8 @@
 //! 3. **审批**：按 `computer_use_approval` 设置决定就地放行还是转给客户端。
 
 use std::collections::{BTreeSet, HashMap};
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::ffi::OsStr;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -39,7 +39,6 @@ const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 单帧上限，与原生 CU 的 8 MiB 对齐。
 const MAX_FRAME: usize = 8 * 1024 * 1024;
-const ELICITATION_LOG: &str = "cu/elicitation.log";
 
 enum Event {
     /// 客户端发来的原始帧（含结尾换行）。
@@ -73,31 +72,29 @@ pub fn serve() -> anyhow::Result<()> {
         next_token: 0,
     };
     let outcome = forwarder.run(receiver);
-    let _ = child.kill();
-    let _ = child.wait();
+    child.kill();
+    child.wait();
     outcome
 }
 
 /// 拉起 OpenAI 签名的 node 执行 shim，由 shim 直接 spawn 原生 CU server。
 ///
-/// 中间不经过 shell：服务端校验的是**直接父进程**的签名，多插一层就会失效。
-fn spawn_child(runtime: &RuntimeLocation, shim: &std::path::Path) -> anyhow::Result<Child> {
-    let mut command = Command::new(&runtime.node);
-    command
-        .arg(shim)
-        .env("CODEX_PLUS_CU_CLIENT", &runtime.client)
-        .envs(runtime.native_client_env())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(crate::windows_create_no_window());
-    }
-    command
-        .spawn()
-        .with_context(|| format!("无法启动 {}", runtime.node))
+/// 两条约束：
+/// - 中间不经过 shell：服务端校验**直接父进程**的签名，多插一层就会失效。
+/// - 必须放弃责任归属（disclaim），让 node 成为自己的 responsible process。否则
+///   Codex++ 被 Claude 的 `disclaimer` 或管理器 GUI 拉起时，责任进程是 ad-hoc 签名的
+///   Codex++，原生客户端报 `bootstrapTimedOut`。见 `disclaimed_spawn` 顶部的实测表。
+fn spawn_child(
+    runtime: &RuntimeLocation,
+    shim: &std::path::Path,
+) -> anyhow::Result<crate::disclaimed_spawn::DisclaimedChild> {
+    let mut envs: Vec<(String, String)> = runtime.native_client_env().into_iter().collect();
+    envs.push(("CODEX_PLUS_CU_CLIENT".into(), runtime.client.clone()));
+    crate::disclaimed_spawn::spawn(
+        std::path::Path::new(&runtime.node),
+        &[OsStr::new(shim)],
+        &envs,
+    )
 }
 
 fn spawn_client_reader(sender: Sender<Event>) {
@@ -119,7 +116,7 @@ fn spawn_client_reader(sender: Sender<Event>) {
     });
 }
 
-fn spawn_child_reader(stdout: std::process::ChildStdout, sender: Sender<Event>) {
+fn spawn_child_reader(stdout: Box<dyn Read + Send>, sender: Sender<Event>) {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         loop {
@@ -162,7 +159,7 @@ struct PendingApproval {
 }
 
 struct Forwarder {
-    child_stdin: ChildStdin,
+    child_stdin: Box<dyn Write + Send>,
     /// 是否还需要在 `initialize` 里替客户端补 elicitation 能力。
     declare_elicitation: bool,
     /// 客户端自己是否声明了 elicitation。
@@ -218,7 +215,12 @@ impl Forwarder {
         {
             // 先记下客户端**自己**有没有声明，再补。补只是为了不让服务端拒绝，
             // 不代表客户端真的会渲染这个表单——`claude` 模式要看这个值决定能否转发。
-            self.client_supports_elicitation = Some(declares_capability(&message, "elicitation"));
+            let supports = declares_capability(&message, "elicitation");
+            self.client_supports_elicitation = Some(supports);
+            crate::computer_use_approval::record_client(
+                message.get("params").and_then(|params| params.get("clientInfo")),
+                supports,
+            );
             declare_elicitation(&mut message);
             self.declare_elicitation = false;
             let mut line = serde_json::to_vec(&message)?;
@@ -447,12 +449,8 @@ fn write_client(frame: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 在客户端声明的能力里补上 `elicitation`，其余字段原样保留。
-///
-/// 早先的实现直接替换整个 `capabilities`（连 `clientInfo` 一起盖掉），
-/// 那会让服务端看到的能力与客户端真实能力不符。
 /// 客户端自己有没有声明某个能力（`params.capabilities.<name>` 存在且非 null）。
-fn declares_capability(message: &Value, name: &str) -> bool {
+pub(crate) fn declares_capability(message: &Value, name: &str) -> bool {
     message
         .get("params")
         .and_then(|params| params.get("capabilities"))
@@ -461,7 +459,11 @@ fn declares_capability(message: &Value, name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn declare_elicitation(message: &mut Value) {
+/// 在客户端声明的能力里补上 `elicitation`，其余字段原样保留。
+///
+/// 早先的实现直接替换整个 `capabilities`（连 `clientInfo` 一起盖掉），
+/// 那会让服务端看到的能力与客户端真实能力不符。
+pub(crate) fn declare_elicitation(message: &mut Value) {
     let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) else {
         return;
     };
@@ -475,32 +477,6 @@ fn declare_elicitation(message: &mut Value) {
         object
             .entry("elicitation")
             .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    }
-}
-
-/// 审批被放行时留痕：哪条请求、什么标题、持久化策略。
-fn record_elicitation(params: Option<&Value>) {
-    let Some(params) = params else { return };
-    let meta = params.get("_meta");
-    let summary = json!({
-        "at": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|value| value.as_secs())
-            .unwrap_or(0),
-        "kind": meta.and_then(|meta| meta.get("codex_approval_kind")).cloned(),
-        "message": params.get("message").cloned().or_else(|| params.get("title").cloned()),
-        "persist": meta.and_then(|meta| meta.get("persist")).cloned(),
-    });
-    let path = crate::paths::default_app_state_dir().join(ELICITATION_LOG);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(file, "{summary}");
     }
 }
 

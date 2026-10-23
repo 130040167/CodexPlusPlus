@@ -22,6 +22,44 @@ use serde::{Deserialize, Serialize};
 
 const APPROVALS_FILE: &str = "cu/approvals.json";
 const AUDIT_FILE: &str = "cu/audit.jsonl";
+const LAST_CLIENT_FILE: &str = "cu/last-client.json";
+/// 管理器自检握手时用的客户端名，见 `computer_use::run_probe`。
+pub const SELF_CHECK_CLIENT: &str = "codex-plus";
+
+/// 记下最近一次连上来的 MCP 客户端，以及它**自己**有没有声明 elicitation。
+///
+/// `claude` 模式依赖客户端能弹审批卡；客户端不支持时代理会退回放行。
+/// 这个降级必须让用户在页面上看得见，否则会误以为一直在手动审批。
+pub fn record_client(client_info: Option<&serde_json::Value>, supports_elicitation: bool) {
+    // 管理器自检也走这条入口（clientInfo.name = "codex-plus"），不能让它盖掉真实客户端。
+    if client_info
+        .and_then(|info| info.get("name"))
+        .and_then(serde_json::Value::as_str)
+        == Some(SELF_CHECK_CLIENT)
+    {
+        return;
+    }
+    let record = serde_json::json!({
+        "at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_secs())
+            .unwrap_or(0),
+        "name": client_info.and_then(|info| info.get("name")).cloned(),
+        "version": client_info.and_then(|info| info.get("version")).cloned(),
+        "elicitation": supports_elicitation,
+    });
+    let path = crate::paths::default_app_state_dir().join(LAST_CLIENT_FILE);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, format!("{record}\n"));
+}
+
+pub fn last_client() -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(crate::paths::default_app_state_dir().join(LAST_CLIENT_FILE))
+        .ok()?;
+    serde_json::from_str(&text).ok()
+}
 
 /// 审批策略。字符串形式与 `settings.json` 和前端下拉框一一对应。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

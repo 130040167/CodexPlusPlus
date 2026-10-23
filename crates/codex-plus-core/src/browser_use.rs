@@ -136,6 +136,8 @@ struct ProxyState {
     plans: HashMap<i64, String>,
     session_id: String,
     turn_seq: u64,
+    /// `initialize` 的内部 id：它的结果要换掉 cua-repl 的 instructions。
+    init_child_id: Option<i64>,
 }
 
 impl ProxyState {
@@ -147,6 +149,7 @@ impl ProxyState {
             plans: HashMap::new(),
             session_id: uuid::Uuid::new_v4().to_string(),
             turn_seq: 0,
+            init_child_id: None,
         }
     }
 
@@ -174,8 +177,11 @@ impl ProxyState {
             .to_string();
         match method.as_str() {
             "initialize" => {
-                // 不替换客户端的 capabilities，只保证 elicitation 可用。
-                self.remap(&mut message);
+                // 只补 elicitation，不动客户端其余能力：cua-repl 遇到需要许可的
+                // 浏览器操作时会发 elicitation/create，客户端没声明就直接抛
+                // `createElicitation is unavailable`。请求由本 server 就地应答（见 on_child）。
+                crate::computer_use_proxy::declare_elicitation(&mut message);
+                self.init_child_id = self.remap(&mut message);
                 return self.forward(message);
             }
             "tools/list" => {
@@ -245,6 +251,9 @@ impl ProxyState {
                     let _ = write_client(&reshaped);
                     return;
                 }
+                if self.init_child_id == Some(child_id) {
+                    replace_instructions(&mut message);
+                }
             }
         }
         let _ = write_client(&message);
@@ -288,6 +297,24 @@ fn inject_turn_metadata(message: &mut Value, session_id: &str, seq: &mut u64) {
             "x-codex-turn-metadata".into(),
             json!({ "session_id": session_id, "turn_id": format!("{session_id}-{seq}") }),
         );
+    }
+}
+
+/// 对外的使用说明。
+///
+/// cua-repl 的握手结果写的是「UI automation through cua_repl」，那是给 code-mode 用的；
+/// 本 server 对外只有离散的 `browser_*` 工具，没有 `js`，原样透传会误导模型去找不存在的工具。
+const INSTRUCTIONS: &str = "Control the user's real Google Chrome through the Codex browser extension.\n\
+\n\
+- Start with `browser_tabs` (or `browser_open` for a new page). Tab ids come from those results.\n\
+- Read a page with `browser_state` before acting; prefer `element_index` from it over coordinates.\n\
+- `browser_eval` runs a JavaScript expression in the page and returns its value.\n\
+- Group tabs only when the user asks: `browser_group`, then `browser_group_update` to rename or recolour.\n\
+- Tabs opened by another session cannot be driven here; open a fresh one with `browser_open` instead.";
+
+fn replace_instructions(message: &mut Value) {
+    if let Some(result) = message.get_mut("result").and_then(Value::as_object_mut) {
+        result.insert("instructions".into(), Value::String(INSTRUCTIONS.into()));
     }
 }
 

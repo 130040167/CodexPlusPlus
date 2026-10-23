@@ -147,6 +147,7 @@ pub async fn computer_use_approval_get() -> CommandResult<Value> {
         json!({
             "mode": mode.id(),
             "approvals": codex_plus_core::computer_use_approval::ApprovalStore::read_all(),
+            "lastClient": codex_plus_core::computer_use_approval::last_client(),
         }),
     )
 }

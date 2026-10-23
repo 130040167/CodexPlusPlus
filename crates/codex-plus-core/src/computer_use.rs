@@ -201,19 +201,41 @@ impl RuntimeLocation {
     /// `elicitation`（Claude Code 的 MCP 客户端不声明这个能力，直连会在接管 app 的
     /// 瞬间断掉）。代理内部仍原样拉起 `cua-repl`，工具面与执行器都没有变化。
     fn server_entry(&self) -> Value {
-        json!({
-            "command": self.self_command(),
-            "args": ["--codex-plus-cu-mcp"],
-        })
+        entry_with_state_dir(
+            json!({
+                "command": self.self_command(),
+                "args": ["--codex-plus-cu-mcp"],
+            }),
+            crate::paths::state_dir_override(),
+        )
     }
 
     /// 浏览器控制的条目。单独一个 MCP server，和 CU 并列。
     fn browser_server_entry(&self) -> Value {
-        json!({
-            "command": self.self_command(),
-            "args": ["--codex-plus-browser-mcp"],
-        })
+        entry_with_state_dir(
+            json!({
+                "command": self.self_command(),
+                "args": ["--codex-plus-browser-mcp"],
+            }),
+            crate::paths::state_dir_override(),
+        )
     }
+}
+
+/// 管理器用了显式状态目录时，把它带进 MCP 条目的 `env`。
+///
+/// 本地开发实例靠 `Info.plist` 的 `LSEnvironment` 设置 `CODEX_PLUS_STATE_DIR`，
+/// 这只在经 LaunchServices 打开时生效；Claude 拉起 MCP 进程时没有它，于是
+/// 管理器写的审批策略 / 审批记忆与 MCP 进程读的不是同一份文件（实测 2026-10-24）。
+/// 正式安装没有这个覆盖，条目保持不带 `env`。
+fn entry_with_state_dir(mut entry: Value, state_dir: Option<PathBuf>) -> Value {
+    if let (Some(dir), Some(object)) = (state_dir, entry.as_object_mut()) {
+        object.insert(
+            "env".into(),
+            json!({ crate::paths::STATE_DIR_ENV: dir.to_string_lossy() }),
+        );
+    }
+    entry
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -928,7 +950,10 @@ fn run_probe(_runtime: &RuntimeLocation) -> HealthReport {
             "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": { "name": "codex-plus", "version": env!("CARGO_PKG_VERSION") }
+                "clientInfo": {
+                    "name": crate::computer_use_approval::SELF_CHECK_CLIENT,
+                    "version": env!("CARGO_PKG_VERSION")
+                }
             }
         }),
     ) {
@@ -1327,6 +1352,14 @@ fn read_json_entry(path: &Path, server_id: &str) -> anyhow::Result<Option<Value>
 fn entry_matches(existing: &Value, expected: &Value) -> bool {
     existing.get("command") == expected.get("command")
         && existing.get("args") == expected.get("args")
+        && env_of(existing) == env_of(expected)
+}
+
+/// 只比较我们会写的那个变量：客户端可能往 `env` 里加别的东西，不能因此判成过期。
+fn env_of(entry: &Value) -> Option<&Value> {
+    entry
+        .get("env")
+        .and_then(|env| env.get(crate::paths::STATE_DIR_ENV))
 }
 
 fn looks_like_ours(entry: &Value, runtime: &RuntimeLocation) -> bool {
@@ -1428,6 +1461,22 @@ mod tests {
             app_version: Some("26.1016.61520".into()),
             package_version: Some("0.1.2".into()),
         }
+    }
+
+    #[test]
+    fn state_dir_override_travels_with_the_entry() {
+        let base = json!({ "command": "/x/CodexPlusPlus", "args": ["--codex-plus-cu-mcp"] });
+        // 没有覆盖：条目不带 env（正式安装的形状）。
+        assert!(entry_with_state_dir(base.clone(), None).get("env").is_none());
+
+        let with_dir = entry_with_state_dir(base.clone(), Some(PathBuf::from("/dev/state")));
+        assert_eq!(with_dir["env"][crate::paths::STATE_DIR_ENV], "/dev/state");
+
+        // 状态目录变了就要重写；客户端往 env 里塞的其它变量不影响判定。
+        assert!(!entry_matches(&base, &with_dir));
+        let mut decorated = with_dir.clone();
+        decorated["env"]["EXTRA"] = json!("1");
+        assert!(entry_matches(&decorated, &with_dir));
     }
 
     #[test]

@@ -38,11 +38,13 @@ type CuCheck = {
 type CuResult = { status: string; message: string };
 type CuApprovalMode = "auto" | "claude";
 type CuApprovedApp = { decision: string; mode?: string; displayName?: string; decidedAt?: number };
+type CuLastClient = { name?: string; version?: string; elicitation?: boolean; at?: number };
 type CuApprovalState = {
   status?: string;
   message?: string;
   mode?: CuApprovalMode;
   approvals?: Array<[string, CuApprovedApp]>;
+  lastClient?: CuLastClient | null;
 };
 
 // Codex 桌面版自己会把 [mcp_servers.computer-use] 写进 ~/.codex/config.toml，
@@ -406,6 +408,17 @@ export function ComputerUsePage() {
             <small>{t("把 Codex 原生的许可请求转给 MCP 客户端，由 Claude 侧弹卡确认；拒绝即不放行。")}</small>
           </button>
         </div>
+        {approval?.lastClient && <p
+          className={approval.mode === "claude" && approval.lastClient.elicitation === false ? "cu-note cu-note-warn" : "cu-hint"}
+          role={approval.mode === "claude" && approval.lastClient.elicitation === false ? "alert" : undefined}
+        >
+          {t("最近连接的客户端：")}<code>{[approval.lastClient.name, approval.lastClient.version].filter(Boolean).join(" ") || t("未知")}</code>
+          {approval.lastClient.elicitation
+            ? t("，支持审批卡。")
+            : approval.mode === "claude"
+              ? t("，未声明审批卡能力（elicitation）。在这个客户端里「交给 Claude 审批」会退回为自动放行，不会弹卡。")
+              : t("，未声明审批卡能力（elicitation）；如果切到「交给 Claude 审批」，在这个客户端里会退回为自动放行。")}
+        </p>}
         {(approval?.approvals?.length ?? 0) > 0 && <div className="cu-approvals">
           <div className="cu-approvals-head">
             <strong>{t("已记忆的应用")}</strong>
