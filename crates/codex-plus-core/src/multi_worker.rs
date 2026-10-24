@@ -702,6 +702,7 @@ mod tests {
                     Err(error) => panic!("mock CDP accept failed: {error}"),
                 }
             };
+            stream.set_nonblocking(false).unwrap();
             stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
             let mut request = [0_u8; 4096];
             let count = stream.read(&mut request).unwrap();
