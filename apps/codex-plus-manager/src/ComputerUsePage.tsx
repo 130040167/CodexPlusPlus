@@ -58,7 +58,7 @@ const targetFallback: Record<CuTargetId, { label: string; configPath: string }> 
   codex: { label: "Codex", configPath: "config.toml" },
   dsh: { label: "DeepSeek Harness", configPath: "~/.dsh/profiles/desktop/cordis.patch.yml" },
   zcode: { label: "ZCode", configPath: "~/.zcode/cli/config.json" },
-  workBuddy: { label: "WorkBuddy AI", configPath: "~/.workbuddy/mcp.json" },
+  workBuddy: { label: "WorkBuddy AI", configPath: "~/.workbuddy-ai/mcp.json" },
 };
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const hasValue = (value?: string) => Boolean(value && value.trim());

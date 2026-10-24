@@ -104,3 +104,25 @@
   .cu-approval-list li { grid-template-columns:1fr auto; }
   .cu-approval-key { grid-column:1/-1; }
 }
+
+/* 窗口预览：等比缩放，限制最大高度，避免撑爆页面 */
+.cu-preview-picker { display:flex; align-items:flex-end; gap:10px; margin-bottom:12px; }
+.cu-preview-select { display:flex; min-width:0; flex:1; flex-direction:column; gap:6px; }
+.cu-preview-select span { color:hsl(var(--muted-foreground)); font-size:11px; }
+.cu-preview-select select {
+  width:100%; min-width:0; padding:7px 9px;
+  border:1px solid hsl(var(--border)); border-radius:6px;
+  background:hsl(var(--background)); color:inherit; font-size:12px;
+}
+.cu-preview-stage {
+  display:flex; align-items:center; justify-content:center;
+  min-height:220px; max-height:60vh; padding:6px;
+  border:1px solid hsl(var(--border)); border-radius:8px;
+  background:hsl(var(--muted)/.35); overflow:hidden;
+}
+.cu-preview-stage[data-live="true"] { border-color:hsl(var(--primary)/.5); }
+.cu-preview-stage img { display:block; max-width:100%; max-height:58vh; border-radius:4px; }
+.cu-preview-empty { color:hsl(var(--muted-foreground)); font-size:12px; }
+@media(max-width:760px) {
+  .cu-preview-picker { flex-direction:column; align-items:stretch; }
+}

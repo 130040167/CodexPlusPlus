@@ -217,3 +217,132 @@ pub async fn computer_use_approval_clear() -> CommandResult<Value> {
         Err(error) => failed(&error, json!({})),
     }
 }
+
+/// 预览帧事件名；前端 `listen` 它来更新画面。
+pub const PREVIEW_FRAME_EVENT: &str = "cu-preview-frame";
+/// 预览结束事件名（窗口关闭、取流失败、主动停止）。
+pub const PREVIEW_END_EVENT: &str = "cu-preview-end";
+
+/// 当前预览会话。同一时刻只允许一个。
+static PREVIEW: std::sync::Mutex<Option<codex_plus_core::window_capture::PreviewHandle>> =
+    std::sync::Mutex::new(None);
+
+/// 申请「屏幕录制」权限（没授权时弹系统对话框）。
+#[tauri::command]
+pub async fn computer_use_preview_request_permission() -> CommandResult<Value> {
+    match run_blocking(move || -> anyhow::Result<bool> {
+        Ok(codex_plus_core::window_capture::request_permission())
+    })
+    .await
+    {
+        Ok(true) => ok("已获得屏幕录制权限。", json!({ "granted": true })),
+        Ok(false) => failed(
+            "还没有屏幕录制权限：在 系统设置 → 隐私与安全性 → 屏幕录制 里勾选 Codex++，然后重启应用。",
+            json!({ "granted": false }),
+        ),
+        Err(error) => failed(&error, json!({ "granted": false })),
+    }
+}
+
+/// 列出可预览的窗口。
+#[tauri::command]
+pub async fn computer_use_preview_windows() -> CommandResult<Value> {
+    let permitted = codex_plus_core::window_capture::has_permission();
+    match run_blocking(codex_plus_core::window_capture::list_windows).await {
+        Ok(windows) => {
+            let message = if !permitted {
+                "还没有屏幕录制权限，先去系统设置里授权（点「申请权限」可直接跳转）。"
+            } else if windows.is_empty() {
+                "没有可预览的窗口。"
+            } else {
+                "已列出可预览的窗口。"
+            };
+            // CommandResult 用 #[serde(flatten)] 展开载荷，只能是对象不能是数组
+            ok(
+                message,
+                json!({
+                    "windows": serde_json::to_value(windows).unwrap_or_else(|_| json!([])),
+                    "permitted": permitted,
+                }),
+            )
+        }
+        Err(error) => failed(&error, json!({ "windows": [], "permitted": permitted })),
+    }
+}
+
+/// 开始预览某个窗口。帧以 base64 data URL 通过事件推给前端。
+#[tauri::command]
+pub async fn computer_use_preview_start(
+    app: tauri::AppHandle,
+    window_id: u32,
+    scale: Option<f64>,
+    max_fps: Option<f64>,
+) -> CommandResult<Value> {
+    use base64::Engine as _;
+    use tauri::Emitter as _;
+
+    stop_preview();
+    let scale = scale.unwrap_or(0.5);
+    let max_fps = max_fps.unwrap_or(12.0);
+    let frame_app = app.clone();
+    let seq = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let handle = match codex_plus_core::window_capture::start_preview(
+        window_id,
+        scale,
+        max_fps,
+        move |jpeg| {
+            let n = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+            let _ = frame_app.emit(
+                PREVIEW_FRAME_EVENT,
+                json!({ "seq": n, "data": format!("data:image/jpeg;base64,{encoded}") }),
+            );
+        },
+    ) {
+        Ok(handle) => handle,
+        Err(error) => return failed(&error.to_string(), json!({})),
+    };
+
+    // 抓取线程因窗口关闭等原因自行退出时，把原因转达给前端
+    let watch_app = app.clone();
+    let watch_error = handle.error_slot();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let reason = watch_error.lock().ok().and_then(|e| e.clone());
+            if let Some(reason) = reason {
+                let _ = watch_app.emit(PREVIEW_END_EVENT, json!({ "reason": reason }));
+                return;
+            }
+            // 预览已被换掉或主动停掉时，错误槽不会再有变化，别常驻
+            if PREVIEW.lock().map(|slot| slot.is_none()).unwrap_or(true) {
+                return;
+            }
+        }
+    });
+
+    let mut slot = PREVIEW.lock().unwrap_or_else(|e| e.into_inner());
+    *slot = Some(handle);
+    ok(
+        "预览已开始。",
+        json!({ "event": PREVIEW_FRAME_EVENT, "scale": scale, "maxFps": max_fps }),
+    )
+}
+
+/// 停止预览。
+#[tauri::command]
+pub async fn computer_use_preview_stop() -> CommandResult<Value> {
+    stop_preview();
+    ok("预览已停止。", json!({}))
+}
+
+fn stop_preview() {
+    let handle = PREVIEW
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    if let Some(handle) = handle {
+        handle.stop();
+    }
+}

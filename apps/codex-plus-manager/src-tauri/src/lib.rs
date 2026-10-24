@@ -44,6 +44,8 @@ pub fn run_browser_use_mcp() -> anyhow::Result<()> {
 }
 
 pub fn run_computer_use_cli(args: &[std::ffi::OsString]) -> anyhow::Result<()> {
+    // CLI 进程没有 GUI，抓帧前必须先连上 WindowServer，否则 CoreGraphics 会断言崩溃
+    codex_plus_core::window_capture::ensure_graphics_initialized();
     let action = args
         .first()
         .map(|value| value.to_string_lossy().into_owned())
@@ -61,6 +63,69 @@ pub fn run_computer_use_cli(args: &[std::ffi::OsString]) -> anyhow::Result<()> {
             let id = target.as_deref().ok_or_else(|| anyhow::anyhow!("uninstall 需要 target：claudeCode / claudeDesktop / codex / dsh / zcode / workBuddy"))?;
             let parsed = codex_plus_core::computer_use::Target::parse(id)?;
             serde_json::to_value(codex_plus_core::computer_use::uninstall(parsed)?)?
+        }
+        // 浏览器回合钩子：install / uninstall，不传就是 read。
+        "hooks" => {
+            let action = target.as_deref().unwrap_or("read");
+            let receipt = match action {
+                "install" => serde_json::to_value(codex_plus_core::claude_hooks::install()?)?,
+                "uninstall" => serde_json::to_value(codex_plus_core::claude_hooks::uninstall()?)?,
+                "read" => serde_json::json!({
+                    "installed": codex_plus_core::claude_hooks::is_installed(),
+                    "events": codex_plus_core::claude_hooks::installed_events(),
+                    "settings": codex_plus_core::claude_hooks::claude_settings_path().display().to_string(),
+                }),
+                other => anyhow::bail!("hooks 只支持 install / uninstall / read，收到 {other}"),
+            };
+            receipt
+        }
+        // 窗口取流诊断：list 列出可预览窗口；frame <window_id> [缩放] 抓一帧存到临时文件
+        "preview" => {
+            let action = target.as_deref().unwrap_or("list");
+            match action {
+                "list" => serde_json::json!({
+                    "permitted": codex_plus_core::window_capture::has_permission(),
+                    "windows": codex_plus_core::window_capture::list_windows()?,
+                }),
+                "frame" => {
+                    let id = args
+                        .get(2)
+                        .and_then(|v| v.to_string_lossy().parse::<u32>().ok())
+                        .ok_or_else(|| anyhow::anyhow!("frame 需要 window_id"))?;
+                    let scale = args
+                        .get(3)
+                        .and_then(|v| v.to_string_lossy().parse::<f64>().ok())
+                        .unwrap_or(0.5);
+                    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+                    let handle = codex_plus_core::window_capture::start_preview(
+                        id,
+                        scale,
+                        12.0,
+                        move |jpeg| {
+                            let _ = tx.send(jpeg);
+                        },
+                    )?;
+                    let frame = rx.recv_timeout(std::time::Duration::from_secs(20));
+                    let thread_error = handle.error();
+                    handle.stop();
+                    match frame {
+                        Ok(bytes) => {
+                            let path = std::env::temp_dir().join("codex-plus-preview-frame.jpg");
+                            std::fs::write(&path, &bytes)?;
+                            serde_json::json!({
+                                "windowId": id,
+                                "bytes": bytes.len(),
+                                "path": path.display().to_string(),
+                            })
+                        }
+                        Err(error) => {
+                            let reason = thread_error.unwrap_or_else(|| "（线程没有留下原因）".into());
+                            anyhow::bail!("20 秒内没有拿到帧：{error}；线程报告：{reason}")
+                        }
+                    }
+                }
+                other => anyhow::bail!("preview 只支持 list / frame，收到 {other}"),
+            }
         }
         other => anyhow::bail!("未知的 Computer Use 诊断动作：{other}"),
     };
@@ -203,6 +268,10 @@ pub fn run() {
             computer_use_commands::computer_use_approval_set,
             computer_use_commands::computer_use_approval_forget,
             computer_use_commands::computer_use_approval_clear,
+            computer_use_commands::computer_use_preview_windows,
+            computer_use_commands::computer_use_preview_request_permission,
+            computer_use_commands::computer_use_preview_start,
+            computer_use_commands::computer_use_preview_stop,
             commands::native_browser_status,
             commands::save_settings,
             commands::list_tools,
