@@ -472,7 +472,12 @@ pub async fn terminate_verified_codex_instance(
     if !codex_arguments_match(&arguments, &identity.user_data_dir, identity.debug_port) {
         return Ok(false);
     }
-    // CDP 失联不影响已持有的进程身份；端口被邻居接管也不能改变终止目标。
+    // CDP 失联仍可依靠句柄身份停止；但可读取的 Browser 回执冲突不能降级放行。
+    if let Ok(browser) = crate::cdp::browser_identity(identity.debug_port).await
+        && browser.browser_id()? != identity.browser_id
+    {
+        return Ok(false);
+    }
     process.terminate_and_wait()?;
     Ok(true)
 }
@@ -644,6 +649,79 @@ mod tests {
         assert!(child.0.try_wait().unwrap().is_some());
         assert!(codex_instance_process_exited(&identity));
         assert!(other.0.try_wait().unwrap().is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn live_browser_conflict_refuses_stop_without_falling_back_to_process_identity() {
+        use std::io::{Read, Write};
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("user-data");
+        std::fs::create_dir(&data).unwrap();
+        let script = temp.path().join("wait.ps1");
+        std::fs::write(&script, "Start-Sleep -Seconds 60\n").unwrap();
+        let executable = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut child = ChildGuard(std::process::Command::new(&executable)
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&script)
+            .arg(format!("--remote-debugging-port={port}"))
+            .arg(format!("--user-data-dir={}", data.display()))
+            .spawn().unwrap());
+        let identity = CodexInstanceIdentity {
+            instance_id: "fixture".into(),
+            generation: 1,
+            debug_port: port,
+            helper_port: port,
+            user_data_dir: data,
+            browser_id: "stale-test-browser".into(),
+            process_id: child.0.id(),
+            process_birth_id: worker_birth_id(&child.0).unwrap(),
+            executable,
+        };
+        // 即使 PID/创建时间/路径/参数都匹配，可访问的 Browser ID 冲突仍必须阻止停止。
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "mock CDP was not queried");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("mock CDP accept failed: {error}"),
+                }
+            };
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+            let mut request = [0_u8; 4096];
+            let count = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET /json/version "));
+            let body = serde_json::json!({
+                "Browser": "Synthetic",
+                "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/browser/current-browser"),
+            }).to_string();
+            write!(stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()).unwrap();
+        });
+        let stopped = terminate_verified_codex_instance(&identity).await.unwrap();
+        server.join().unwrap();
+        assert!(!stopped);
+        assert!(child.0.try_wait().unwrap().is_none());
+        assert!(!codex_instance_process_exited(&identity));
+        // 同一身份在 CDP 完全失联后，仍能按持有的 OS 身份结束，不要求恢复桌面连接。
+        assert!(terminate_verified_codex_instance(&identity).await.unwrap());
+        assert!(child.0.try_wait().unwrap().is_some());
     }
 
     #[test]

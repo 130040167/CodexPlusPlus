@@ -12182,6 +12182,31 @@ model_reasoning_effort = "high"
         wrong.user_data_dir = temp.path().canonicalize().unwrap();
         assert!(!multi_manifest_identity_matches(&current, &wrong));
         assert!(!multi_instance_is_running(&instance));
+
+        // 同时改写顶层清单和独立回执后，嵌套的旧 launchResult 不能恢复有效旧身份。
+        let mut stale = current.clone();
+        stale.identity.as_mut().unwrap().browser_id = "stale-test-browser".into();
+        assert_eq!(
+            stale.launch_result.as_ref().unwrap().identity.as_ref().unwrap().browser_id,
+            "browser-A"
+        );
+        save_multi_instance_manifest(temp.path(), &stale).unwrap();
+        result.identity = stale.identity.clone();
+        write_multi_launch_result(&result_path, &result).unwrap();
+        let loaded = load_multi_instance_manifest(temp.path()).unwrap();
+        assert_eq!(loaded.identity.as_ref().unwrap().browser_id, "stale-test-browser");
+        assert_eq!(
+            loaded.launch_result.as_ref().unwrap().identity.as_ref().unwrap().browser_id,
+            "stale-test-browser"
+        );
+        // 独立回执损坏时也不能把清单内嵌的旧身份提升为停止身份。
+        std::fs::write(&result_path, b"{}").unwrap();
+        let loaded = load_multi_instance_manifest(temp.path()).unwrap();
+        assert_eq!(loaded.identity.as_ref().unwrap().browser_id, "stale-test-browser");
+        assert_eq!(
+            loaded.launch_result.as_ref().unwrap().identity.as_ref().unwrap().browser_id,
+            "browser-A"
+        );
     }
 
     #[cfg(unix)]
