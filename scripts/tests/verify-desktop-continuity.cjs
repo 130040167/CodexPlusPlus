@@ -59,6 +59,35 @@ const identity = process => ({
 });
 const sameProcess = (a, b) => a && b && a.ProcessId === b.ProcessId
   && a.CreationDate === b.CreationDate && a.ExecutablePath === b.ExecutablePath;
+function processExists(pid) {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { if (error.code === "ESRCH") return false; throw error; }
+}
+// 并行验收组须显式声明目录；排除有目录归属证据的进程及其后代，不结束它们。
+const externalTestRoots = JSON.parse(process.env.DESKTOP_EXTERNAL_TEST_ROOTS || "[]");
+assert.ok(Array.isArray(externalTestRoots));
+for (const root of externalTestRoots) {
+  assert.ok(typeof root === "string" && path.isAbsolute(root));
+  assert.ok(path.resolve(root).toLowerCase() !== path.parse(path.resolve(root)).root.toLowerCase());
+}
+function externalTestProcesses(processes) {
+  const found = new Set();
+  const roots = externalTestRoots.map(root => path.resolve(root).toLowerCase() + path.sep);
+  for (const candidate of processes) {
+    const exe = String(candidate.ExecutablePath || "").toLowerCase();
+    const command = String(candidate.CommandLine || "").toLowerCase().replaceAll("/", "\\");
+    if (roots.some(root => exe.startsWith(root) || command.includes(root))) found.add(candidate.ProcessId);
+  }
+  let changed;
+  do {
+    changed = false;
+    for (const candidate of processes) if (!found.has(candidate.ProcessId) && found.has(candidate.ParentProcessId)) {
+      found.add(candidate.ProcessId);
+      changed = true;
+    }
+  } while (changed);
+  return processes.filter(candidate => found.has(candidate.ProcessId));
+}
 const before = inventory();
 const protectedProcesses = before.filter(process => /^(codex-plus-plus(?:\.[\w-]+)*|codex|ChatGPT|cc-switch)\.exe$/i.test(process.Name));
 const originalRenderers = protectedProcesses.filter(process =>
@@ -891,7 +920,7 @@ async function runMainReplacementScenario(manager) {
     const restart = invoke(manager, "restart_codex_plus", { request });
     // Observe rejections immediately while waiting for process exit.
     restart.catch(() => {});
-    await until(() => !inventory().some(candidate => candidate.ProcessId === oldPid),
+    await until(() => !processExists(oldPid),
       "restart did not stop the previous main desktop with a healthy retiring helper", 30000);
     await close(retiringHelper);
     const restarted = await restart;
