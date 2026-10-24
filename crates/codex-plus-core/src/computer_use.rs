@@ -69,7 +69,7 @@ pub enum Target {
     Dsh,
     /// ZCode：`~/.zcode/cli/config.json` 的 `mcp.servers`。
     Zcode,
-    /// WorkBuddy AI：`~/.workbuddy/mcp.json` 的 `mcpServers`。
+    /// WorkBuddy AI：`~/.workbuddy-ai/mcp.json` 的 `mcpServers`（旧版是 `~/.workbuddy`）。
     WorkBuddy,
 }
 
@@ -128,7 +128,8 @@ impl Target {
         let (dir, name) = match self {
             Self::Dsh => (home.join(".dsh/profiles/desktop"), "DeepSeek Harness"),
             Self::Zcode => (home.join(".zcode"), "ZCode"),
-            Self::WorkBuddy => (home.join(".workbuddy"), "WorkBuddy AI"),
+            // 新版 WorkBuddy 的数据目录是 `.workbuddy-ai`，但保留旧版目录的探测。
+            Self::WorkBuddy => (workbuddy_config_dir(), "WorkBuddy AI"),
             Self::ClaudeCode | Self::ClaudeDesktop | Self::Codex => return None,
         };
         (!dir.is_dir()).then(|| format!("没检测到 {name}（{} 不存在），先打开一次该应用", dir.display()))
@@ -139,6 +140,31 @@ fn home_dir() -> PathBuf {
     directories::BaseDirs::new()
         .map(|dirs| dirs.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// WorkBuddy 的配置目录。
+///
+/// 应用按 `WORKBUDDY_CONFIG_DIR` → `CODEBUDDY_CONFIG_DIR` → `~/<dataFolderName>` 的顺序解析，
+/// 而 `dataFolderName` 从随包的产品配置里读。当前版本的取值是 `.workbuddy-ai`（实测运行中的
+/// 进程打开的全部句柄都在这个目录下），旧版本才是 `.workbuddy`。这里按同样的优先级还原：
+/// 环境变量优先；否则两个目录里挑真实存在的那个（优先 `.workbuddy-ai`）；都没有时按新版默认。
+fn workbuddy_config_dir() -> PathBuf {
+    for key in ["WORKBUDDY_CONFIG_DIR", "CODEBUDDY_CONFIG_DIR"] {
+        if let Some(value) = std::env::var_os(key) {
+            let path = PathBuf::from(value);
+            if !path.as_os_str().is_empty() {
+                return path;
+            }
+        }
+    }
+    let home = home_dir();
+    let current = home.join(".workbuddy-ai");
+    let legacy = home.join(".workbuddy");
+    if current.is_dir() || !legacy.is_dir() {
+        current
+    } else {
+        legacy
+    }
 }
 
 /// 本机 Codex CU 运行时。全部为绝对路径，写进配置后不再二次推导。
@@ -532,7 +558,7 @@ fn config_paths(target: Target) -> Vec<PathBuf> {
         Target::Codex => vec![codex_config_path()],
         Target::Dsh => vec![dsh_config_path()],
         Target::Zcode => vec![home_dir().join(".zcode/cli/config.json")],
-        Target::WorkBuddy => vec![home_dir().join(".workbuddy/mcp.json")],
+        Target::WorkBuddy => vec![workbuddy_config_dir().join("mcp.json")],
     }
 }
 
