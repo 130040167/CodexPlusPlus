@@ -2109,9 +2109,13 @@ fn multi_launch_result_message(
         .map(|status| status.message.trim())
         .filter(|message| !message.is_empty());
     match detail {
+        // 过去这里无条件归因到「Microsoft Store 安装版需要用包上下文启动」，
+        // 但 #2684 的对照实验证明商店版能并存两个实例、带参启动也正常；
+        // 真正的失败原因已经在 detail 里（未创建新进程、guard 锁未拿到等），
+        // 不该再给一条会把人带偏的建议。
         Some(detail) => format!(
             "Codex 多开实例启动后调试端口 {debug_port} 未就绪（{detail}）。\
-             若 Codex 是 Microsoft Store 安装版，请改用包上下文启动或改用非打包版本。"
+             请查看 codex-plus.log 中该实例的启动事件后再判断原因。"
         ),
         None => format!("Codex 多开实例启动后调试端口 {debug_port} 未就绪，Codex 可能已退出。"),
     }

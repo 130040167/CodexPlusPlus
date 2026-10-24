@@ -3120,7 +3120,15 @@ fn parse_optional_positive_u64(value: &str, label: &str) -> anyhow::Result<Optio
     if trimmed.is_empty() {
         return Ok(None);
     }
-    let parsed = trimmed
+    // 用户常从文档或别处复制带千分位的数字（`1,050,000`）。此前会直接
+    // `InvalidDigit` 判整次保存失败，而语义上它就是个合法的 1050000，
+    // 静默接受比让整份配置保存不了更合理（issue #2590）。
+    let digits: String = trimmed
+        .chars()
+        .filter(|character| !matches!(character, ',' | '_' | '\u{FF0C}' | '\u{3000}'))
+        .collect();
+    let digits = digits.trim();
+    let parsed = digits
         .parse::<u64>()
         .with_context(|| format!("{label}必须是正整数"))?;
     if parsed == 0 {
@@ -6758,4 +6766,42 @@ fn root_line_key(line: &str) -> Option<&str> {
         return None;
     }
     trimmed.split_once('=').map(|(key, _)| key.trim())
+}
+
+#[cfg(test)]
+mod window_value_parsing_tests {
+    use super::parse_optional_positive_u64;
+
+    #[test]
+    fn accepts_plain_digits() {
+        assert_eq!(parse_optional_positive_u64("1050000", "上下文大小").unwrap(), Some(1_050_000));
+        assert_eq!(parse_optional_positive_u64(" 1050000 ", "上下文大小").unwrap(), Some(1_050_000));
+    }
+
+    #[test]
+    fn accepts_thousand_separators() {
+        // 用户从文档复制 `1,050,000` 时，此前会判整次保存失败（issue #2590）。
+        assert_eq!(parse_optional_positive_u64("1,050,000", "上下文大小").unwrap(), Some(1_050_000));
+        assert_eq!(parse_optional_positive_u64("1_050_000", "上下文大小").unwrap(), Some(1_050_000));
+        assert_eq!(
+            parse_optional_positive_u64("1，050，000", "上下文大小").unwrap(),
+            Some(1_050_000),
+            "全角逗号同样应被接受"
+        );
+    }
+
+    #[test]
+    fn still_rejects_non_numeric_and_zero() {
+        assert!(parse_optional_positive_u64("abc", "上下文大小").is_err());
+        assert!(parse_optional_positive_u64("0", "上下文大小").is_err());
+        assert!(parse_optional_positive_u64("1.05M", "上下文大小").is_err());
+        assert_eq!(parse_optional_positive_u64("   ", "上下文大小").unwrap(), None);
+    }
+
+    #[test]
+    fn separator_position_is_not_validated() {
+        // 逗号位置不规范（例如 1,0,5,0）仍按纯数字处理：这个字段的目标是拿到
+        // 用户想要的窗口值，不是校验排版。真正的非数字才拒绝。
+        assert_eq!(parse_optional_positive_u64("1,0,5,0", "上下文大小").unwrap(), Some(1_050));
+    }
 }
