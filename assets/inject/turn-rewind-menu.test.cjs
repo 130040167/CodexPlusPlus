@@ -48,7 +48,7 @@ class Element {
   const settings = { turnRewind: false };
   let observes = 0, disconnects = 0, mutationCallback, moduleLoads = 0, disposed = 0;
   const saveRequests = [], toasts = [], diagnostics = [];
-  let scopeReads = 0;
+  let scopeReads = 0, registryLoads = 0, registryAvailable = false;
   class NativeRegistry {
     getImplForHostId(host) { scopeReads++; return this.scope.get("hosts").includes(host) ? this.scope.get("managers", host) : null; }
     getForHostId() {} getAll() {} addRegistryCallback() {}
@@ -67,7 +67,10 @@ class Element {
     codexPlusSettings: () => settings, showToast: message => toasts.push(message),
     sendCodexPlusDiagnostic: async (name, detail) => diagnostics.push({ name, detail }),
     loadCodexAppModule: async prefix => {
-      if (prefix === 'app-server-manager-hooks-') return { renamedRegistryExport: NativeRegistry };
+      if (prefix === 'app-server-manager-hooks-') {
+        registryLoads++;
+        return { get renamedRegistryExport() { return registryAvailable ? NativeRegistry : undefined; } };
+      }
       moduleLoads++;
       return { changedExportName: { workspaceFiles: { saveCopy(request) {
         saveRequests.push(request);
@@ -113,6 +116,10 @@ class Element {
   await Promise.resolve(); await Promise.resolve();
   branch.__reactFiber$fixture.memoizedState.memoizedState = { current: { getConversation: manager.getConversation }, scope };
   context.refreshTurnRewindMenus();
+  assert.equal(button.getAttribute('aria-disabled'), 'true', 'imported namespace may precede lazy class initialization');
+  registryAvailable = true;
+  context.refreshTurnRewindMenus();
+  assert.equal(registryLoads, 1, 'retry live binding discovery without reloading app assets');
   assert.equal(button.getAttribute('aria-disabled'), 'false');
   assert.ok(scopeReads > 0, 'existing native registry accessor reads the React scope');
   await button.click();
@@ -137,6 +144,66 @@ class Element {
   branch.__reactFiber$fixture.memoizedProps = identity;
   branch.__reactFiber$fixture.memoizedState.memoizedState = { registry: { getImplForHostId: () => manager } };
 
+  // 原生弹出菜单可能隔着很深的 Radix 包装，或由独立 portal 子树承载。
+  const messageFiber = branch.__reactFiber$fixture;
+  let deepFiber = messageFiber;
+  for (let depth = 0; depth < 90; depth++) deepFiber = { memoizedProps: {}, return: deepFiber };
+  branch.__reactFiber$fixture = deepFiber;
+  context.refreshTurnRewindMenus();
+  assert.equal(button.getAttribute('aria-disabled'), 'false', 'message identity beyond 64 native wrappers is reachable');
+
+  const trigger = body.appendChild(new Element());
+  trigger.setAttribute('id', 'fixture-trigger'); trigger.setAttribute('aria-haspopup', 'menu');
+  trigger.setAttribute('aria-expanded', 'true'); trigger.setAttribute('aria-controls', 'fixture-menu');
+  menu.setAttribute('id', 'fixture-menu'); menu.setAttribute('aria-labelledby', 'fixture-trigger');
+  trigger.__reactFiber$fixture = { memoizedProps: {}, return: {
+    memoizedProps: identity, dependencies: { firstContext: { memoizedValue: scope } }
+  } };
+  branch.__reactFiber$fixture = { memoizedProps: {} };
+  context.refreshTurnRewindMenus();
+  assert.equal(button.getAttribute('aria-disabled'), 'false', 'resolve through native menu/trigger accessibility association');
+  const beforeOwnerRun = activations.length;
+  await button.click();
+  assert.deepEqual(Array.from(activations.at(-1)), ['fixture-chat', 'fixture-new-target']);
+  assert.equal(activations.length, beforeOwnerRun + 1);
+
+  identity.turnId = 'fixture-owner-new-target'; await button.click();
+  assert.deepEqual(Array.from(activations.at(-1)), ['fixture-chat', 'fixture-owner-new-target']);
+  identity.turnId = 'fixture-new-target';
+
+  trigger.setAttribute('aria-expanded', 'false'); context.refreshTurnRewindMenus();
+  assert.equal(button.getAttribute('aria-disabled'), 'true', 'closed trigger must not identify a visible menu');
+  trigger.setAttribute('aria-expanded', 'true');
+  trigger.setAttribute('aria-controls', 'fixture-other-menu'); context.refreshTurnRewindMenus();
+  assert.equal(button.getAttribute('aria-disabled'), 'true', 'contradictory native control/label relations are not trusted');
+  trigger.setAttribute('aria-controls', 'fixture-other-menu'); menu.setAttribute('aria-labelledby', 'fixture-other-trigger');
+  context.refreshTurnRewindMenus();
+  assert.equal(button.getAttribute('aria-disabled'), 'true', 'do not use another menu or the last clicked message');
+  trigger.setAttribute('aria-controls', 'fixture-menu'); menu.setAttribute('aria-labelledby', 'fixture-trigger');
+
+  branch.__reactFiber$fixture = { memoizedProps: { threadId: 'other-chat', turnId: 'other-turn' } };
+  context.refreshTurnRewindMenus();
+  assert.equal(button.getAttribute('aria-disabled'), 'true', 'conflicting menu and trigger identities fail closed');
+  branch.__reactFiber$fixture = { memoizedProps: {} };
+  const duplicateTrigger = body.appendChild(new Element());
+  duplicateTrigger.setAttribute('aria-haspopup', 'menu'); duplicateTrigger.setAttribute('aria-expanded', 'true');
+  duplicateTrigger.setAttribute('aria-controls', 'fixture-menu'); duplicateTrigger.__reactFiber$fixture = messageFiber;
+  context.refreshTurnRewindMenus();
+  assert.equal(button.getAttribute('aria-disabled'), 'true', 'multiple explicit menu owners are ambiguous');
+  duplicateTrigger.remove();
+  // 一项自身没有 fiber 时，最近的原生父节点仍可提供身份；不读取 pendingProps。
+  delete branch.__reactFiber$fixture; menu.__reactFiber$fixture = messageFiber;
+  context.refreshTurnRewindMenus(); assert.equal(button.getAttribute('aria-disabled'), 'false');
+  delete menu.__reactFiber$fixture;
+  trigger.remove(); branch.__reactFiber$fixture = messageFiber;
+
+  let excessiveFiber = messageFiber;
+  for (let depth = 0; depth < 230; depth++) excessiveFiber = { memoizedProps: {}, return: excessiveFiber };
+  branch.__reactFiber$fixture = excessiveFiber; context.refreshTurnRewindMenus();
+  assert.equal(button.getAttribute('aria-disabled'), 'true', 'bounded scans never guess a target beyond the ancestor limit');
+  await button.click(); assert.equal(diagnostics.at(-1).detail.scanLimitReached, true);
+  branch.__reactFiber$fixture = messageFiber;
+
   const exported = await api.exportRecord({ id: 'fixture', text: '中文恢复记录' });
   assert.equal(exported.path, '/fixture/receipt.json'); assert.equal(disposed, 1);
   assert.equal(JSON.parse(Buffer.from(saveRequests[0].bytes).toString('utf8')).text, '中文恢复记录');
@@ -149,5 +216,5 @@ class Element {
   settings.turnRewind = false; context.fixtureSync();
   assert.equal(menu.children.length, 2); assert.equal(disconnects, 2);
   assert.equal(api.canRun('fixture-chat', 'fixture-turn'), false);
-  console.log('PASS: opt-in lifecycle, native branch placement, current committed turn identity, busy/remote/ambiguous/unsupported guards, native JSON export and disposal, and reinjection handoff.');
+  console.log('PASS: native trigger association, deep portal ancestry, lazy registry exports, current committed turn identity, opt-in lifecycle, busy/remote/conflicting-owner/unsupported guards, native JSON export and reinjection handoff.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

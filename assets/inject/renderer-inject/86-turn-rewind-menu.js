@@ -6,20 +6,34 @@
   let turnRewindSaveServicePromise = null;
   let turnRewindRegistryReader = null;
   let turnRewindRegistryLoad = null;
+  let turnRewindRegistryModule = null;
+  let turnRewindRegistryRetryAt = 0;
 
   // 新版客户端的 React hooks 只暴露会话 facade，写接口仍在已有的原生 manager。
   // 复用注册表的只读 accessor 与 React 中已有的 scope，不创建 manager，不猜 atom key。
+  function discoverTurnRewindRegistryReader() {
+    if (!turnRewindRegistryModule || turnRewindRegistryReader) return;
+    const candidates = Object.values(turnRewindRegistryModule).filter((value) => {
+      const prototype = typeof value === "function" ? value.prototype : null;
+      return prototype && ["getImplForHostId", "getForHostId", "getAll", "addRegistryCallback"]
+        .every((name) => typeof prototype[name] === "function");
+    });
+    if (candidates.length === 1) turnRewindRegistryReader = candidates[0].prototype.getImplForHostId;
+  }
+
   function prepareTurnRewindRegistryReader() {
-    if (turnRewindRegistryLoad) return;
+    // Rolldown 的类导出是 live binding，import 完成时可能尚未初始化。
+    // 后续菜单刷新只重读已缓存的 namespace，不重新 fetch 或主动运行模块初始化器。
+    discoverTurnRewindRegistryReader();
+    if (turnRewindRegistryLoad || Date.now() < turnRewindRegistryRetryAt) return;
     turnRewindRegistryLoad = loadCodexAppModule("app-server-manager-hooks-").then((module) => {
-      const candidates = Object.values(module || {}).filter((value) => {
-        const prototype = typeof value === "function" ? value.prototype : null;
-        return prototype && ["getImplForHostId", "getForHostId", "getAll", "addRegistryCallback"]
-          .every((name) => typeof prototype[name] === "function");
-      });
-      if (candidates.length === 1) turnRewindRegistryReader = candidates[0].prototype.getImplForHostId;
+      turnRewindRegistryModule = module;
+      discoverTurnRewindRegistryReader();
       scheduleTurnRewindMenuRefresh();
-    }).catch(() => { /* 未知版本保持不可用，由菜单解释原因。 */ });
+    }).catch(() => {
+      turnRewindRegistryLoad = null;
+      turnRewindRegistryRetryAt = Date.now() + 30000;
+    });
   }
 
   function turnRewindIsBranchItem(item) {
@@ -38,20 +52,42 @@
     } catch { return false; }
   }
 
-  // React 的逻辑父链会穿过 portal。只读当前菜单的 props、hooks 和 context，
-  // 不按页面顺序猜轮次，也不调用未知函数或创建新的会话管理器。
+  function turnRewindMenuOwners(node) {
+    const menu = node?.closest?.('[role="menu"]');
+    if (!menu) return [];
+    const menuId = menu.getAttribute("id");
+    const labels = (menu.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean);
+    return [...document.querySelectorAll('[aria-haspopup]')].filter((trigger) => {
+      if (!["menu", "true"].includes(trigger.getAttribute("aria-haspopup"))
+          || trigger.getAttribute("aria-expanded") !== "true") return false;
+      const controls = (trigger.getAttribute("aria-controls") || "").split(/\s+/).filter(Boolean);
+      const triggerId = trigger.getAttribute("id");
+      const controlsMenu = !!menuId && controls.includes(menuId);
+      const labelsTrigger = !!triggerId && labels.includes(triggerId);
+      if ((labelsTrigger && menuId && controls.length && !controlsMenu)
+          || (controlsMenu && triggerId && labels.length && !labelsTrigger)) return false;
+      return controlsMenu || labelsTrigger;
+    });
+  }
+
+  // 原生菜单可能经过深层 Radix 包装或 portal。除了菜单自身，使用原生
+  // aria-controls / aria-labelledby 的明确关联回到触发按钮，不按 DOM 顺序猜目标。
   function turnRewindContextFromNode(node, details = {}) {
-    const key = Object.getOwnPropertyNames(node || {}).find((name) => name.startsWith("__reactFiber$"));
-    let fiber = key ? node[key] : null;
     const identities = new Map();
     const managers = new Set();
+    const owners = turnRewindMenuOwners(node);
+    Object.assign(details, { ownerCount: owners.length, fiberFoundCount: 0, maxAncestorDepth: 0,
+      scanLimitReached: false, registryReaderReady: !!turnRewindRegistryReader, identityCount: 0, managerCount: 0 });
+    if (owners.length > 1) return null;
+    const seenValues = new Set();
+    let inspectedValues = 0;
     const inspect = (root) => {
       const queue = [{ value: root, depth: 0 }];
-      const seen = new Set();
-      for (let count = 0; queue.length && count < 256; count += 1) {
+      for (; queue.length && inspectedValues < 4096;) {
         const { value, depth } = queue.shift();
-        if (!value || typeof value !== "object" || seen.has(value)) continue;
-        seen.add(value);
+        if (!value || typeof value !== "object" || seenValues.has(value)) continue;
+        seenValues.add(value);
+        inspectedValues += 1;
         if (turnRewindManagerSupported(value)) { managers.add(value); continue; }
         try {
           if (typeof value.getImplForHostId === "function") {
@@ -73,26 +109,42 @@
         } catch { /* 原生 RPC stub 可能拒绝反射，保持不可用。 */ }
       }
     };
-    for (let depth = 0; fiber && depth < 64; depth += 1, fiber = fiber.return) {
-      // pendingProps 可能属于尚未提交的另一轮，不能用于破坏性操作的目标识别。
-      const props = fiber.memoizedProps;
-      const threadId = props?.threadId || props?.conversationId;
-      const turnId = props?.turnId;
-      if (typeof threadId === "string" && typeof turnId === "string" && threadId && turnId) {
-        identities.set(`${threadId}:${turnId}`, { threadId, turnId, hostId: props.hostId });
+    const seenFibers = new Set();
+    for (const anchor of [...owners, node]) {
+      let fiber = null;
+      for (let element = anchor, depth = 0; element && element !== document.body && depth < 8;
+          element = element.parentElement, depth += 1) {
+        const key = Object.getOwnPropertyNames(element).find((name) =>
+          name.startsWith("__reactFiber$") || name.startsWith("__reactInternalInstance$"));
+        if (key) { fiber = element[key]; break; }
       }
-      inspect(props?.value);
-      inspect(props?.scope);
-      for (let hook = fiber.memoizedState, count = 0; hook && count < 48; hook = hook.next, count += 1) {
-        inspect(hook.memoizedState);
+      if (fiber) details.fiberFoundCount += 1;
+      let depth = 0;
+      for (; fiber && !seenFibers.has(fiber) && depth < 192; depth += 1, fiber = fiber.return) {
+        seenFibers.add(fiber);
+        // pendingProps / alternate 可能属于另一轮，只读取已提交的 props。
+        const props = fiber.memoizedProps;
+        const threadId = props?.threadId || props?.conversationId;
+        const turnId = props?.turnId;
+        if (typeof threadId === "string" && typeof turnId === "string" && threadId && turnId) {
+          identities.set(JSON.stringify([threadId, turnId]), { threadId, turnId, hostId: props.hostId });
+        }
+        inspect(props?.value);
+        inspect(props?.scope);
+        for (let hook = fiber.memoizedState, count = 0; hook && count < 48; hook = hook.next, count += 1) {
+          inspect(hook.memoizedState);
+        }
+        for (let context = fiber.dependencies?.firstContext, count = 0; context && count < 32; context = context.next, count += 1) {
+          inspect(context.memoizedValue);
+        }
       }
-      for (let context = fiber.dependencies?.firstContext, count = 0; context && count < 32; context = context.next, count += 1) {
-        inspect(context.memoizedValue);
-      }
+      details.maxAncestorDepth = Math.max(details.maxAncestorDepth, depth);
+      if (fiber && !seenFibers.has(fiber)) details.scanLimitReached = true;
     }
     details.identityCount = identities.size;
     details.managerCount = managers.size;
-    if (identities.size !== 1) return null;
+    // 到达上限意味着祖先可能还有冲突身份，不能据不完整扫描执行破坏性操作。
+    if (details.scanLimitReached || identities.size !== 1) return null;
     const target = [...identities.values()][0];
     if (target.hostId && target.hostId !== "local") return null;
     const matches = [...managers].filter((manager) => {
@@ -147,6 +199,7 @@
 
   function refreshTurnRewindMenus() {
     if (!codexPlusTurnRewindEnabled()) return;
+    prepareTurnRewindRegistryReader();
     for (const menu of document.querySelectorAll('[role="menu"]')) {
       if (menu.hidden || menu.getAttribute("data-state") === "closed") continue;
       const branch = [...menu.querySelectorAll('[role="menuitem"]')].find(turnRewindIsBranchItem);
@@ -177,7 +230,7 @@
             const { target } = availability;
             button.disabled = true;
             // 自定义 DOM 项没有 Radix 的 onSelect；关闭原生菜单后释放模态焦点和指针锁。
-            menu.dispatchEvent(new KeyboardEvent("keydown", {
+            currentBranch.closest('[role="menu"]').dispatchEvent(new KeyboardEvent("keydown", {
               key: "Escape", code: "Escape", bubbles: true, cancelable: true,
             }));
             await codexPlusTurnRewind.run(target.threadId, target.turnId);
