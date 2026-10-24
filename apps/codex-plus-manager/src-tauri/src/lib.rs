@@ -293,6 +293,8 @@ pub fn run() {
             commands::import_claude_providers_from_cc_switch,
             commands::weixin_connect_qr_start,
             commands::weixin_connect_qr_status,
+            commands::weixin_connect_catalog,
+            commands::weixin_connect_projects,
             commands::weixin_connect_status,
             commands::weixin_connect_start,
             commands::weixin_connect_stop,

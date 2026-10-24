@@ -1,5 +1,7 @@
 pub mod app_server;
+pub mod controls;
 pub mod media;
+pub mod projects;
 pub mod session_store;
 pub mod weixin;
 
@@ -36,6 +38,10 @@ pub struct WeixinConnectConfig {
     pub work_dir: String,
     #[serde(default)]
     pub model: String,
+    #[serde(default)]
+    pub reasoning_effort: String,
+    #[serde(default)]
+    pub project_id: String,
     #[serde(default = "default_sandbox")]
     pub sandbox: String,
     #[serde(default)]
@@ -52,6 +58,8 @@ impl Default for WeixinConnectConfig {
             route_tag: String::new(),
             work_dir: String::new(),
             model: String::new(),
+            reasoning_effort: String::new(),
+            project_id: String::new(),
             sandbox: default_sandbox(),
             codex_path: String::new(),
         }
@@ -70,6 +78,8 @@ impl WeixinConnectConfig {
         self.route_tag = self.route_tag.trim().to_string();
         self.work_dir = self.work_dir.trim().to_string();
         self.model = self.model.trim().to_string();
+        self.reasoning_effort = self.reasoning_effort.trim().to_string();
+        self.project_id = self.project_id.trim().to_string();
         self.sandbox = normalize_sandbox(&self.sandbox);
         self.codex_path = self.codex_path.trim().to_string();
         self
@@ -106,23 +116,49 @@ pub type SharedWeixinConnectStatus = Arc<Mutex<WeixinConnectStatus>>;
 
 /// 只在消息边界切换 CLI，避免中断正在执行的回合。
 #[derive(Clone)]
-pub struct WeixinCodexPath(Arc<Mutex<String>>);
+pub struct WeixinCodexPath(Arc<Mutex<(String, Option<SessionDefaults>)>>);
+
+#[derive(Clone)]
+pub struct SessionDefaults {
+    pub model: String,
+    pub reasoning_effort: String,
+    pub project_id: String,
+    pub work_dir: String,
+    pub sandbox: String,
+}
 
 impl WeixinCodexPath {
     pub fn new(path: &str) -> Self {
-        Self(Arc::new(Mutex::new(path.trim().to_string())))
+        Self(Arc::new(Mutex::new((path.trim().to_string(), None))))
     }
 
     pub fn set(&self, path: &str) {
-        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = path.trim().to_string();
+        self.0.lock().unwrap_or_else(|error| error.into_inner()).0 = path.trim().to_string();
+    }
+
+    pub fn set_defaults(&self, defaults: SessionDefaults) {
+        self.0.lock().unwrap_or_else(|error| error.into_inner()).1 = Some(defaults);
+    }
+
+    fn apply_defaults(&self, config: &mut WeixinConnectConfig) {
+        let saved = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(defaults) = &saved.1 {
+            config.model.clone_from(&defaults.model);
+            config
+                .reasoning_effort
+                .clone_from(&defaults.reasoning_effort);
+            config.project_id.clone_from(&defaults.project_id);
+            config.work_dir.clone_from(&defaults.work_dir);
+            config.sandbox.clone_from(&defaults.sandbox);
+        }
     }
 
     fn apply(&self, config: &mut AppServerConfig) -> bool {
         let path = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        if config.executable == *path {
+        if config.executable == path.0 {
             return false;
         }
-        config.executable.clone_from(&path);
+        config.executable.clone_from(&path.0);
         true
     }
 }
@@ -142,7 +178,7 @@ pub async fn run_weixin_connect_with_codex_path(
     status: SharedWeixinConnectStatus,
     codex_path: WeixinCodexPath,
 ) -> anyhow::Result<()> {
-    let config = config.normalized();
+    let mut config = config.normalized();
     if config.token.is_empty() {
         bail!("请先扫码登录微信");
     }
@@ -169,6 +205,7 @@ pub async fn run_weixin_connect_with_codex_path(
         executable: config.codex_path.clone(),
         work_dir,
         model: config.model.clone(),
+        reasoning_effort: config.reasoning_effort.clone(),
         sandbox: config.sandbox.clone(),
     };
     let mut app_server: Option<CodexAppServer> = None;
@@ -245,6 +282,17 @@ pub async fn run_weixin_connect_with_codex_path(
             state
                 .context_tokens
                 .insert(message.from_user_id.clone(), message.context_token.clone());
+            codex_path.apply_defaults(&mut config);
+            app_config.model.clone_from(&config.model);
+            app_config
+                .reasoning_effort
+                .clone_from(&config.reasoning_effort);
+            app_config.sandbox.clone_from(&config.sandbox);
+            app_config.work_dir = if config.work_dir.is_empty() {
+                std::env::current_dir().context("无法读取当前工作目录")?
+            } else {
+                PathBuf::from(&config.work_dir)
+            };
             if codex_path.apply(&mut app_config) {
                 if let Some(mut server) = app_server.take() {
                     server.close().await;
@@ -258,6 +306,9 @@ pub async fn run_weixin_connect_with_codex_path(
                     &mut state,
                     &message,
                     &text,
+                    &config.account_id,
+                    &config.project_id,
+                    !config.work_dir.is_empty(),
                 ),
                 &stop,
             )
@@ -321,7 +372,97 @@ async fn process_weixin_message(
     state: &mut ConnectState,
     message: &WeixinMessage,
     text: &str,
+    account_id: &str,
+    project_id: &str,
+    explicit_work_dir: bool,
 ) -> anyhow::Result<()> {
+    let options_store = controls::SessionOptionsStore::for_peer(account_id, &message.from_user_id);
+    let options = options_store.load()?;
+    let mut app_config = app_config.clone();
+    if let Some(reason) = local_model_endpoint_unreachable_reason().await {
+        bail!("{reason}");
+    }
+    if app_server
+        .as_ref()
+        .map(|server| !server.is_running())
+        .unwrap_or(true)
+    {
+        *app_server = Some(CodexAppServer::start(app_config.clone()).await?);
+    }
+    let server = app_server.as_mut().context("Codex app-server 未启动")?;
+    let project = projects::resolve_project(server, project_id, &app_config.work_dir).await?;
+    let project_id = project["id"].as_str().context("工作项目缺少 ID")?;
+    if !explicit_work_dir
+        && let Some(path) = project["roots"]
+            .as_array()
+            .and_then(|roots| roots.first())
+            .and_then(|root| root["path"].as_str())
+    {
+        let root = PathBuf::from(path);
+        if !root.is_dir() {
+            bail!("工作项目目录不可用");
+        }
+        app_config.work_dir = root;
+    }
+    // 每条消息重新读取默认配置，防止 resume 沿用上一联系人的模型/档位。
+    let config_response = server
+        .api_request(
+            "config/read",
+            serde_json::json!({
+                "includeLayers":false,"cwd":app_config.work_dir.to_string_lossy()
+            }),
+        )
+        .await?;
+    let effective_config = &config_response["config"];
+    let defaults = controls::SessionOptions {
+        model: if app_config.model.is_empty() {
+            effective_config["model"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            app_config.model.clone()
+        },
+        reasoning_effort: if app_config.reasoning_effort.is_empty() {
+            effective_config["model_reasoning_effort"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            app_config.reasoning_effort.clone()
+        },
+    };
+    let catalog = crate::model_catalog::read_codex_model_catalog().await;
+    let mut effective = options.resolve(&defaults, &catalog);
+    if effective.model.is_empty() || effective.reasoning_effort.is_empty() {
+        let native_models = server
+            .api_request("model/list", serde_json::json!({"includeHidden":true}))
+            .await?;
+        if let Some(model) = native_models["data"].as_array().and_then(|models| {
+            models.iter().find(|model| {
+                if effective.model.is_empty() {
+                    model["isDefault"] == true
+                } else {
+                    model["model"].as_str() == Some(&effective.model)
+                        || model["id"].as_str() == Some(&effective.model)
+                }
+            })
+        }) {
+            if effective.model.is_empty() {
+                effective.model = model["model"].as_str().unwrap_or_default().to_string();
+            }
+            if effective.reasoning_effort.is_empty() {
+                effective.reasoning_effort = model["defaultReasoningEffort"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+            }
+        }
+    }
+    app_config.model = effective.model;
+    app_config.reasoning_effort = effective.reasoning_effort;
+    server.set_session_config(&app_config);
+    server.set_session_defaults(&defaults.model, &defaults.reasoning_effort);
     let mut attachments = Vec::new();
     if message.has_attachments() {
         let downloaded = match inbound_directory(&app_config.work_dir) {
@@ -342,20 +483,16 @@ async fn process_weixin_message(
             return Ok(());
         }
     }
-    if let Some(reason) = local_model_endpoint_unreachable_reason().await {
-        bail!("{reason}");
-    }
-    if app_server
-        .as_ref()
-        .map(|server| !server.is_running())
-        .unwrap_or(true)
-    {
-        *app_server = Some(CodexAppServer::start(app_config.clone()).await?);
-    }
-    let server = app_server.as_mut().context("Codex app-server 未启动")?;
-    let saved_thread_id = state.media_thread_ids.get(&message.from_user_id).cloned();
+    let saved_thread_id = state
+        .controlled_thread_ids
+        .get(&message.from_user_id)
+        .cloned();
     let previous_context = if saved_thread_id.is_none() {
-        if let Some(previous_id) = state.thread_ids.get(&message.from_user_id) {
+        if let Some(previous_id) = state
+            .media_thread_ids
+            .get(&message.from_user_id)
+            .or_else(|| state.thread_ids.get(&message.from_user_id))
+        {
             server
                 .recent_thread_context(previous_id)
                 .await
@@ -366,21 +503,13 @@ async fn process_weixin_message(
     } else {
         String::new()
     };
-    let thread_id = match server.prepare_thread(saved_thread_id.as_deref()).await {
-        Ok(thread_id) => thread_id,
-        Err(error) if saved_thread_id.is_some() => {
-            state.media_thread_ids.remove(&message.from_user_id);
-            server
-                .prepare_thread(None)
-                .await
-                .with_context(|| format!("恢复原会话失败（{error}），新建会话也失败"))?
-        }
-        Err(error) => return Err(error),
-    };
+    let thread_id = server
+        .prepare_thread_in_project(saved_thread_id.as_deref(), Some(project_id))
+        .await?;
     let mut prompt = attachment_prompt(text, &attachments);
     if !previous_context.is_empty() {
         prompt = format!(
-            "微信连接已升级为支持附件的会话，以下是旧会话的近期文字记录，仅作为历史上下文：\n<previous_conversation>\n{previous_context}\n</previous_conversation>\n\n本次消息：\n{prompt}"
+            "微信连接已升级为支持会话设置的会话，旧会话仍保留在历史记录中。以下是旧会话的近期文字记录，仅作为历史上下文：\n<previous_conversation>\n{previous_context}\n</previous_conversation>\n\n本次消息：\n{prompt}"
         );
     }
     let images = attachments
@@ -397,18 +526,29 @@ async fn process_weixin_message(
                 client,
                 peer: &message.from_user_id,
                 context_token: &message.context_token,
+                options_store: Some(&options_store),
+                defaults: Some(&defaults),
+            }),
+        )
+        .await?;
+    // legacy 线程在首条用户消息前尚未物化；不能在 turn 前调用 metadata/update。
+    server
+        .api_request(
+            "thread/metadata/update",
+            serde_json::json!({
+                "threadId":thread_id,"projectId":project_id
             }),
         )
         .await?;
     state
-        .media_thread_ids
+        .controlled_thread_ids
         .insert(message.from_user_id.clone(), thread_id);
     let reply = if turn_result.reply.trim().is_empty() {
         "Codex 已完成处理，但没有返回文字内容。"
     } else {
         turn_result.reply.trim()
     };
-    let reply_with_footer = append_reply_footer(reply, &turn_result, &app_config.work_dir);
+    let reply_with_footer = append_reply_footer(reply, &turn_result);
     client
         .send_text_chunks(
             &message.from_user_id,
@@ -478,14 +618,11 @@ fn attachment_prompt(text: &str, attachments: &[LocalAttachment]) -> String {
         }
     }
     parts.push("你正通过微信连接回复。用户要求回传图片或文件时，调用 send_weixin_attachment 实际发送工作目录内的结果，不能只回复本地路径。".to_string());
+    parts.push("用户明确要求修改本微信会话的模型或推理强度时，调用 weixin_session_settings 查询和修改；不要修改全局配置。设置从下一条消息生效，当前回合仍按原设置执行。回复末尾的模型、上下文和耗时由连接程序添加，不要自行编造或附加本地路径。".to_string());
     parts.join("\n\n")
 }
 
-fn append_reply_footer(
-    reply: &str,
-    turn: &AppServerTurnResult,
-    work_dir: &std::path::Path,
-) -> String {
+fn append_reply_footer(reply: &str, turn: &AppServerTurnResult) -> String {
     let model = if turn.model.trim().is_empty() {
         "Codex"
     } else {
@@ -499,29 +636,12 @@ fn append_reply_footer(
         _ => "ctx --".to_string(),
     };
     format!(
-        "{}\n\n{} · {}\n{}",
+        "{}\n\n{} · {} · {:.1}s",
         reply.trim(),
         model,
         context,
-        compact_work_dir(work_dir)
+        turn.elapsed_ms as f64 / 1000.0
     )
-}
-
-fn compact_work_dir(work_dir: &std::path::Path) -> String {
-    let path = work_dir.to_string_lossy();
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = std::path::Path::new(&home).to_string_lossy();
-        if path == home {
-            return "~".to_string();
-        }
-        if let Some(relative) = path
-            .strip_prefix(home.as_ref())
-            .and_then(|value| value.strip_prefix('/').filter(|value| !value.is_empty()))
-        {
-            return format!("~/{relative}");
-        }
-    }
-    path.into_owned()
 }
 
 /// 微信端收到的失败回复要带上原因：过去只有一句「处理失败」，用户必须回到电脑上
@@ -636,6 +756,157 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    /// 显式 opt-in：调用本机真实 CLI，但微信和模型均只使用本地固定夹具。
+    #[tokio::test]
+    #[ignore = "requires an installed CLI and fully isolated CODEX_HOME/SQLITE/state"]
+    async fn installed_cli_controls_projects_and_footer_acceptance() {
+        use serde_json::{Value, json};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let root = PathBuf::from(std::env::var("CODEX_PLUS_WEIXIN_ACCEPTANCE_ROOT").unwrap());
+        let home = crate::codex_home::default_codex_home_dir();
+        let sqlite = PathBuf::from(std::env::var("CODEX_SQLITE_HOME").unwrap());
+        let app_state = crate::paths::default_app_state_dir();
+        assert!(
+            home.starts_with(&root) && sqlite.starts_with(&root) && app_state.starts_with(&root)
+        );
+        let executable = std::env::var("CODEX_PLUS_WEIXIN_ACCEPTANCE_CLI").unwrap();
+        let gateway = MockServer::start().await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = calls.clone();
+        Mock::given(method("POST")).and(path("/v1/responses"))
+            .respond_with(move |_request: &wiremock::Request| {
+                let number = requests.fetch_add(1, Ordering::SeqCst);
+                let item = if number == 0 {
+                    json!({"type":"function_call","id":"fc_settings","call_id":"settings-call",
+                        "name":"weixin_session_settings",
+                        "arguments":"{\"action\":\"set\",\"model\":\"gpt-6-sol\",\"reasoningEffort\":\"low\"}","status":"completed"})
+                } else {
+                    json!({"type":"message","id":format!("msg_{number}"),"role":"assistant","status":"completed",
+                        "content":[{"type":"output_text","text":format!("LOCAL_WEIXIN_REPLY_{number}"),"annotations":[]}]})
+                };
+                let id = format!("resp_{number}");
+                let events = [
+                    json!({"type":"response.created","response":{"id":id,"status":"in_progress","output":[]}}),
+                    json!({"type":"response.output_item.added","output_index":0,"item":item}),
+                    json!({"type":"response.output_item.done","output_index":0,"item":item}),
+                    json!({"type":"response.completed","response":{"id":id,"status":"completed",
+                        "output":[item],"usage":{"input_tokens":1200,"output_tokens":80,"total_tokens":1280}}}),
+                ];
+                let body = events.iter().map(|event|
+                    format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap()))
+                    .collect::<String>();
+                ResponseTemplate::new(200).insert_header("content-type","text/event-stream").set_body_string(body)
+            }).mount(&gateway).await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ret":0})))
+            .mount(&gateway)
+            .await;
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&sqlite).unwrap();
+        let config_text = format!(
+            "model=\"gpt-6.1-sol\"\nmodel_provider=\"local_weixin_test\"\nmodel_reasoning_effort=\"high\"\napproval_policy=\"never\"\n\
+             [model_providers.local_weixin_test]\nname=\"Local acceptance fixture\"\nbase_url=\"{}/v1\"\nwire_api=\"responses\"\nrequires_openai_auth=false\n\
+             [features]\nplugins=false\nremote_plugin=false\nhooks=false\napps=false\nshell_snapshot=false\nenable_request_compression=false\napi_key_model_discovery=false\n",
+            gateway.uri()
+        );
+        crate::settings::atomic_write(&home.join("config.toml"), config_text.as_bytes()).unwrap();
+        let mut settings = crate::settings::BackendSettings::default();
+        settings.relay_profiles = vec![crate::settings::RelayProfile {
+            id: "local-weixin-test".into(),
+            name: "Local fixture".into(),
+            model: "gpt-6.1-sol".into(),
+            model_list: "gpt-6.1-sol\ngpt-6-sol".into(),
+            ..Default::default()
+        }];
+        settings.active_relay_id = "local-weixin-test".into();
+        crate::settings::SettingsStore::default()
+            .save(&settings)
+            .unwrap();
+        let work_dir = root.join("work");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let app_config = AppServerConfig {
+            executable: executable.clone(),
+            work_dir: work_dir.clone(),
+            model: "gpt-6.1-sol".into(),
+            reasoning_effort: "high".into(),
+            sandbox: "read-only".into(),
+        };
+        let before = projects::list_projects(executable.clone(), work_dir.clone())
+            .await
+            .unwrap();
+        assert_eq!(before["projects"], json!([]));
+        assert!(before["reservedProjectId"].is_null());
+        let mut server = None;
+        let mut state = ConnectState::default();
+        let client = WeixinClient::new(&gateway.uri(), "local-fake", "").unwrap();
+        let message: WeixinMessage = serde_json::from_value(json!({
+            "from_user_id":"peer-a","context_token":"fixture-context",
+            "message_type":1,"message_state":2
+        }))
+        .unwrap();
+        let result = async {
+            process_weixin_message(&client,&app_config,&mut server,&mut state,&message,"set low","acceptance","",true).await?;
+            let saved = controls::SessionOptionsStore::for_peer("acceptance","peer-a").load()?;
+            assert_eq!(saved.reasoning_effort, "low", "真实 CLI 必须派发设置工具并落盘");
+            assert_eq!(saved.model, "gpt-6-sol");
+            assert!(controls::SessionOptionsStore::for_peer("acceptance","peer-b").load()?.reasoning_effort.is_empty());
+            let listed = projects::list_projects(executable.clone(),work_dir.clone()).await?;
+            assert_eq!(listed["projects"].as_array().unwrap().len(), 1);
+            let project_id = listed["reservedProjectId"].as_str().unwrap().to_string();
+            let thread_id = state.controlled_thread_ids["peer-a"].clone();
+            let active = server.as_mut().unwrap();
+            let threads = active.api_request("thread/list",json!({"useStateDbOnly":true,"limit":100})).await?;
+            assert!(threads["data"].as_array().unwrap().iter().any(|thread|
+                thread["id"].as_str() == Some(&thread_id) && thread["projectId"].as_str() == Some(&project_id)));
+            active.api_request("project/update",json!({"projectId":project_id,"name":"Weixin Renamed Acceptance"})).await?;
+            let renamed = projects::list_projects(executable.clone(),work_dir.clone()).await?;
+            assert_eq!(renamed["reservedProjectId"], project_id);
+            assert_eq!(renamed["projects"][0]["name"], "Weixin Renamed Acceptance");
+            process_weixin_message(&client,&app_config,&mut server,&mut state,&message,"verify low","acceptance","",true).await?;
+            assert_eq!(state.controlled_thread_ids["peer-a"], thread_id);
+            let mut other = message.clone();
+            other.from_user_id = "peer-b".into();
+            process_weixin_message(&client,&app_config,&mut server,&mut state,&other,"default high","acceptance","",true).await?;
+            assert_ne!(state.controlled_thread_ids["peer-b"], thread_id);
+            let received = gateway.received_requests().await.unwrap();
+            let model_requests = received.iter().filter(|request| request.url.path() == "/v1/responses")
+                .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap()).collect::<Vec<_>>();
+            assert_eq!(model_requests.len(),4);
+            assert_eq!(model_requests[0]["reasoning"]["effort"], "high");
+            assert_eq!(model_requests[2]["reasoning"]["effort"], "low");
+            assert_eq!(model_requests[2]["model"], "gpt-6-sol");
+            assert_eq!(model_requests[3]["reasoning"]["effort"], "high");
+            assert_eq!(model_requests[3]["model"], "gpt-6.1-sol");
+            let replies = received.iter().filter(|request| request.url.path() == "/ilink/bot/sendmessage")
+                .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap()).collect::<Vec<_>>();
+            assert_eq!(replies.len(),3);
+            for (index, reply) in replies.iter().enumerate() {
+                let text = reply["msg"]["item_list"][0]["text_item"]["text"].as_str().unwrap();
+                assert!(text.contains(if index == 1 { "gpt-6-sol · ctx " } else { "gpt-6.1-sol · ctx " }));
+                assert!(text.ends_with('s'));
+                assert!(!text.contains(&work_dir.to_string_lossy().to_string()));
+            }
+            let history = server.as_mut().unwrap().api_request("thread/read",json!({"threadId":thread_id,"includeTurns":true})).await?;
+            assert!(!history["thread"]["turns"].as_array().unwrap().is_empty());
+            crate::settings::atomic_write(&root.join("evidence.json"),&serde_json::to_vec_pretty(&json!({
+                "localMocksOnly":true,"actualCli":executable,"projectId":project_id,"threadId":thread_id,
+                "projectName":renamed["projects"][0]["name"],
+                "nativeDbIndexed":true,"nativeHistoryReadable":true,
+                "reasoningEfforts":model_requests.iter().map(|request|request["reasoning"]["effort"].clone()).collect::<Vec<_>>(),
+                "replyCount":replies.len(),"lazyProject":true,"perPeerIsolation":true
+            }))?)?;
+            Ok::<_,anyhow::Error>(())
+        }.await;
+        if let Some(mut server) = server {
+            server.close().await;
+        }
+        result.unwrap();
+    }
+
     #[tokio::test]
     async fn stopping_cancels_pending_download_or_poll_before_it_can_continue() {
         let stop = Arc::new(AtomicBool::new(false));
@@ -695,6 +966,7 @@ mod tests {
             executable: "missing-codex".to_string(),
             work_dir: PathBuf::from("."),
             model: "test-model".to_string(),
+            reasoning_effort: String::new(),
             sandbox: "read-only".to_string(),
         };
         assert!(!runtime_path.apply(&mut config));
@@ -777,6 +1049,8 @@ mod tests {
             route_tag: String::new(),
             work_dir: work_dir.path().display().to_string(),
             model: String::new(),
+            reasoning_effort: String::new(),
+            project_id: String::new(),
             sandbox: "read-only".to_string(),
             codex_path: String::new(),
         };
@@ -845,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn reply_footer_contains_model_context_and_compact_work_dir() {
+    fn reply_footer_contains_model_context_and_elapsed_without_paths() {
         let turn = AppServerTurnResult {
             reply: "完成了".to_string(),
             model: "gpt-5.5".to_string(),
@@ -853,14 +1127,12 @@ mod tests {
                 context_used: Some(41772),
                 context_window: Some(1_000_000),
             },
+            elapsed_ms: 1250,
         };
-        let footer = append_reply_footer(
-            "完成了",
-            &turn,
-            std::path::Path::new("/Users/tester/project"),
-        );
+        let footer = append_reply_footer("完成了", &turn);
         assert!(footer.contains("gpt-5.5 · ctx 4%"));
-        assert!(footer.ends_with("/Users/tester/project"));
+        assert!(footer.ends_with("1.2s"));
+        assert!(!footer.contains("/Users/"));
     }
 
     #[test]
@@ -869,9 +1141,10 @@ mod tests {
             reply: "done".to_string(),
             model: String::new(),
             usage: app_server::TurnUsage::default(),
+            elapsed_ms: 0,
         };
-        let footer = append_reply_footer("done", &turn, std::path::Path::new("/tmp/work"));
+        let footer = append_reply_footer("done", &turn);
         assert!(footer.contains("Codex · ctx --"));
-        assert!(footer.ends_with("/tmp/work"));
+        assert!(footer.ends_with("0.0s"));
     }
 }
