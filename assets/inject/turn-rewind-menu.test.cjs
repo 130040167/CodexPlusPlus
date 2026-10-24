@@ -46,7 +46,16 @@ class Element {
     memoizedState: { memoizedState: { registry: { getImplForHostId: () => manager } } } };
   const settings = { turnRewind: false };
   let observes = 0, disconnects = 0, mutationCallback, moduleLoads = 0, disposed = 0;
-  const saveRequests = [];
+  const saveRequests = [], toasts = [], diagnostics = [];
+  let scopeReads = 0;
+  class NativeRegistry {
+    getImplForHostId(host) { scopeReads++; return this.scope.get("hosts").includes(host) ? this.scope.get("managers", host) : null; }
+    getForHostId() {} getAll() {} addRegistryCallback() {}
+  }
+  const scope = {
+    get(key, host) { return key === "hosts" ? ["local"] : host === "local" ? manager : null; },
+    set() { throw Error("Read-only lookup must never write scope"); }, watch() {}
+  };
   const context = { TextEncoder, setTimeout, clearTimeout, Symbol, crypto: require('node:crypto').webcrypto,
     document: { body, querySelectorAll: selector => body.querySelectorAll(selector), createElement: () => new Element() },
     MutationObserver: class {
@@ -54,8 +63,10 @@ class Element {
       observe() { observes++; } disconnect() { disconnects++; }
     },
     codexPlusBackendSettingsLoaded: false,
-    codexPlusSettings: () => settings, showToast: () => {},
-    loadCodexAppModule: async () => {
+    codexPlusSettings: () => settings, showToast: message => toasts.push(message),
+    sendCodexPlusDiagnostic: async (name, detail) => diagnostics.push({ name, detail }),
+    loadCodexAppModule: async prefix => {
+      if (prefix === 'app-server-manager-hooks-') return { renamedRegistryExport: NativeRegistry };
       moduleLoads++;
       return { changedExportName: { workspaceFiles: { saveCopy(request) {
         saveRequests.push(request);
@@ -74,24 +85,50 @@ class Element {
   settings.turnRewind = true; context.syncCodexPlusTurnRewind(); assert.equal(observes, 0);
   context.codexPlusBackendSettingsLoaded = true; context.syncCodexPlusTurnRewind();
   const button = menu.children[1];
-  assert.equal(button.textContent, '回退到本轮之前 · Codex++'); assert.equal(button.disabled, false);
+  assert.equal(button.textContent, '回退到本轮之前 · Codex++'); assert.equal(button.getAttribute('aria-disabled'), 'false');
   assert.equal(button.previousElementSibling, branch); assert.equal(menu.children[2], other);
   context.refreshTurnRewindMenus(); assert.equal(menu.children.length, 3); assert.equal(moduleLoads, 0);
   const activations = []; api.run = async (...args) => activations.push(args);
   identity.turnId = 'fixture-new-target'; await button.click();
   assert.deepEqual(Array.from(activations[0]), ['fixture-chat', 'fixture-new-target']);
 
-  identity.hostId = 'remote'; context.refreshTurnRewindMenus(); assert.equal(button.disabled, true);
+  identity.hostId = 'remote'; context.refreshTurnRewindMenus(); assert.equal(button.getAttribute('aria-disabled'), 'true');
   delete identity.hostId;
-  state.threadRuntimeStatus.type = 'active'; context.refreshTurnRewindMenus(); assert.equal(button.disabled, true);
+  state.threadRuntimeStatus.type = 'active'; context.refreshTurnRewindMenus(); assert.equal(button.getAttribute('aria-disabled'), 'true');
   state.threadRuntimeStatus.type = 'idle';
   branch.__reactFiber$fixture.return = { memoizedProps: { ...identity, turnId: 'conflicting-turn' } };
-  context.refreshTurnRewindMenus(); assert.equal(button.disabled, true); branch.__reactFiber$fixture.return = null;
+  context.refreshTurnRewindMenus(); assert.equal(button.getAttribute('aria-disabled'), 'true'); branch.__reactFiber$fixture.return = null;
   branch.__reactFiber$fixture.pendingProps = identity; branch.__reactFiber$fixture.memoizedProps = {};
-  context.refreshTurnRewindMenus(); assert.equal(button.disabled, true);
+  context.refreshTurnRewindMenus(); assert.equal(button.getAttribute('aria-disabled'), 'true');
   branch.__reactFiber$fixture.memoizedProps = identity;
   const nativeApply = manager.applyRevertResponseToConversation; delete manager.applyRevertResponseToConversation;
-  context.refreshTurnRewindMenus(); assert.equal(button.disabled, true); manager.applyRevertResponseToConversation = nativeApply;
+  context.refreshTurnRewindMenus(); assert.equal(button.getAttribute('aria-disabled'), 'true'); manager.applyRevertResponseToConversation = nativeApply;
+
+  // 当前原生 hooks 只给出 public facade 和 scope；完整写能力不在 facade 上。
+  await Promise.resolve(); await Promise.resolve();
+  branch.__reactFiber$fixture.memoizedState.memoizedState = { current: { getConversation: manager.getConversation }, scope };
+  context.refreshTurnRewindMenus();
+  assert.equal(button.getAttribute('aria-disabled'), 'false');
+  assert.ok(scopeReads > 0, 'existing native registry accessor reads the React scope');
+  await button.click();
+  assert.equal(activations.length, 2);
+  assert.deepEqual(Array.from(activations[1]), ['fixture-chat', 'fixture-new-target']);
+
+  // 支持能力不可用时仍能点击并解释原因，不能无声吞掉，也不能启动回退。
+  branch.__reactFiber$fixture.memoizedState.memoizedState = {};
+  context.refreshTurnRewindMenus();
+  assert.equal(button.getAttribute('aria-disabled'), 'true');
+  assert.equal(Boolean(button.disabled), false);
+  await button.click();
+  assert.match(toasts.at(-1), /原生回退接口/);
+  assert.equal(activations.length, 2);
+  assert.equal(diagnostics.at(-1).detail.identityCount, 1);
+  assert.equal(JSON.stringify(diagnostics).includes('fixture-chat'), false, 'diagnostics contain counts, not chat IDs or content');
+  branch.__reactFiber$fixture.memoizedProps = {};
+  await button.click();
+  assert.match(toasts.at(-1), /唯一识别/);
+  branch.__reactFiber$fixture.memoizedProps = identity;
+  branch.__reactFiber$fixture.memoizedState.memoizedState = { registry: { getImplForHostId: () => manager } };
 
   const exported = await api.exportRecord({ id: 'fixture', text: '中文恢复记录' });
   assert.equal(exported.path, '/fixture/receipt.json'); assert.equal(disposed, 1);
