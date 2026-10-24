@@ -242,10 +242,17 @@ pub struct LaunchInstance {
 
 impl LaunchInstance {
     pub fn from_options(options: &LaunchOptions) -> Self {
+        let state_dir = options.state_dir.clone().or_else(crate::paths::state_dir_override);
+        let codex_home = options.codex_home.clone().or_else(|| {
+            state_dir.as_ref().map(|_| crate::codex_home::default_codex_home_dir())
+        });
+        let sqlite_home = options.sqlite_home.clone().or_else(|| {
+            codex_home.as_deref().map(crate::codex_sqlite::resolve_sqlite_home_home_or_default)
+        });
         Self {
-            state_dir: options.state_dir.clone(),
-            codex_home: options.codex_home.clone(),
-            sqlite_home: options.sqlite_home.clone(),
+            state_dir,
+            codex_home,
+            sqlite_home,
         }
     }
 }
@@ -1339,7 +1346,8 @@ impl LaunchHooks for DefaultLaunchHooks {
     ) -> anyhow::Result<CodexLaunch> {
         let launch_extra_args = normalize_codex_extra_args(extra_args);
         let isolated_multi_instance =
-            std::env::var_os("CODEX_PLUS_MULTI_INSTANCE").is_some_and(|value| value == "1");
+            instance.state_dir.is_some()
+                || std::env::var_os("CODEX_PLUS_MULTI_INSTANCE").is_some_and(|value| value == "1");
         // 打包版（MSIX/Store）上的多开必须另走一条路。
         //
         // 主实例走 AUMID 激活，它是 Windows 上唯一能给进程包身份的方式；但 AUMID 激活

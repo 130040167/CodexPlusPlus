@@ -804,6 +804,8 @@ async function connectMainDesktop(manager, debugPort) {
     if (!receipt?.process_id || receipt.debug_port !== debugPort) return false;
     const process = inventory().find(candidate => candidate.ProcessId === receipt.process_id);
     if (!process || protectedProcesses.some(original => sameProcess(original, process))) return false;
+    assert.ok(process.CommandLine.includes(path.join(manager.state, "unused-electron")),
+      "main test must use the isolated Electron user-data directory before any UI operation");
     const version = await fetch(`http://127.0.0.1:${debugPort}/json/version`,
       { signal: AbortSignal.timeout(2000) }).then(response => response.json()).catch(() => null);
     if (!version?.webSocketDebuggerUrl) return false;
@@ -858,6 +860,21 @@ async function runMainReplacementScenario(manager) {
   await sendPrompt(main, "Return a synthetic response after manager replacement without tools.");
   await main.page.getByText(`DESKTOP_RECOVERED_${mode}`, { exact: true }).waitFor({ timeout: 90000 });
   await pass("mainAndTwoWorkersReconnectAfterManagerReplacement");
+  await stopManager(manager);
+  const blocker = http.createServer((_request, response) => response.writeHead(503).end());
+  try {
+    await listen(blocker, manager.port);
+    await startManager(manager);
+    const refused = await invoke(manager, "restart_codex_plus", { request });
+    assert.equal(refused.status, "failed", "unavailable proxy must reject restart before stopping Codex");
+    assert.match(refused.message, /未停止 Codex/);
+    await assertDesktopAlive(main);
+    await pass("busyProxyRejectsRestartWithoutClosingMainDesktop");
+  } finally {
+    await close(blocker);
+    await stopManager(manager);
+  }
+  await startManager(manager);
   const oldPid = main.id.processId;
   const restarted = await invoke(manager, "restart_codex_plus", { request });
   assert.notEqual(restarted.status, "failed", restarted.message);
