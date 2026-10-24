@@ -107,7 +107,7 @@ fn inspect_with(
     }
 }
 
-fn helper_available(port: u16) -> bool {
+pub(crate) fn helper_available(port: u16) -> bool {
     [
         SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
         SocketAddr::from((Ipv6Addr::LOCALHOST, port)),

@@ -875,12 +875,29 @@ async function runMainReplacementScenario(manager) {
     await close(blocker);
     await stopManager(manager);
   }
-  await startManager(manager);
   const oldPid = main.id.processId;
-  const restarted = await invoke(manager, "restart_codex_plus", { request });
-  assert.notEqual(restarted.status, "failed", restarted.message);
-  await until(() => !inventory().some(candidate => candidate.ProcessId === oldPid),
-    "restart did not stop the previous main desktop", 30000);
+  // 模拟独立 launcher 的健康 helper；它随已验证的旧桌面退出释放，而非要求重启前就空闲。
+  const retiringHelper = http.createServer((request, response) => {
+    if (request.url === "/backend/status") {
+      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
+        status: "ok", transport: "http-helper", version: "fixture",
+      }));
+    } else response.writeHead(503).end();
+  });
+  try {
+    await listen(retiringHelper, manager.port);
+    await startManager(manager);
+    const restart = invoke(manager, "restart_codex_plus", { request });
+    // Observe rejections immediately while waiting for process exit.
+    restart.catch(() => {});
+    await until(() => !inventory().some(candidate => candidate.ProcessId === oldPid),
+      "restart did not stop the previous main desktop with a healthy retiring helper", 30000);
+    await close(retiringHelper);
+    const restarted = await restart;
+    assert.notEqual(restarted.status, "failed", restarted.message);
+  } finally {
+    await close(retiringHelper);
+  }
   const replacement = await connectMainDesktop(manager, request.debugPort);
   assert.notEqual(replacement.id.processId, oldPid);
   for (const desktop of workers) await assertDesktopAlive(desktop);

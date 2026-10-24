@@ -2880,7 +2880,10 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
     // 接续失败时旧 runtime 不归本进程所有；先确认代理可用，不能关掉 Codex 后才发现无法启动。
     if !owns_session {
         sync_resident_helper();
-        if let Err(error) = prepare_fixed_helper_port_for_restart(settings.as_ref()) {
+        // 独立 launcher 的正常 helper 会在目标 Codex 退出后释放，不能把健康服务误判为死占用。
+        if !crate::runtime_health::helper_available(codex_plus_core::protocol_proxy::protocol_proxy_port())
+            && let Err(error) = prepare_fixed_helper_port_for_restart(settings.as_ref())
+        {
             return failed(
                 &format!("本地代理尚未就绪，未停止 Codex：{error:#}"),
                 json!({"debugPort": request.debug_port, "helperPort": request.helper_port}),
