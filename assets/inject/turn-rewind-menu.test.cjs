@@ -7,7 +7,7 @@ const shard = name => fs.readFileSync(path.join(__dirname, 'renderer-inject', na
 class Element {
   constructor() {
     this.nodeType = 1; this.children = []; this.attributes = {}; this.style = {};
-    this.textContent = ''; this.listeners = {}; this.parentElement = null;
+    this.textContent = ''; this.listeners = {}; this.events = []; this.parentElement = null;
   }
   setAttribute(key, value) { this.attributes[key] = String(value); }
   getAttribute(key) { return this.attributes[key] ?? null; }
@@ -23,6 +23,7 @@ class Element {
   }
   querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
   addEventListener(name, callback) { this.listeners[name] = callback; }
+  dispatchEvent(event) { this.events.push(event); return true; }
   remove() { this.parentElement.children = this.parentElement.children.filter(child => child !== this); }
   insertAdjacentElement(position, child) {
     assert.equal(position, 'afterend'); child.parentElement = this.parentElement;
@@ -56,7 +57,7 @@ class Element {
     get(key, host) { return key === "hosts" ? ["local"] : host === "local" ? manager : null; },
     set() { throw Error("Read-only lookup must never write scope"); }, watch() {}
   };
-  const context = { TextEncoder, setTimeout, clearTimeout, Symbol, crypto: require('node:crypto').webcrypto,
+  const context = { KeyboardEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } }, TextEncoder, setTimeout, clearTimeout, Symbol, crypto: require('node:crypto').webcrypto,
     document: { body, querySelectorAll: selector => body.querySelectorAll(selector), createElement: () => new Element() },
     MutationObserver: class {
       constructor(callback) { mutationCallback = callback; }
@@ -88,7 +89,11 @@ class Element {
   assert.equal(button.textContent, '回退到本轮之前 · Codex++'); assert.equal(button.getAttribute('aria-disabled'), 'false');
   assert.equal(button.previousElementSibling, branch); assert.equal(menu.children[2], other);
   context.refreshTurnRewindMenus(); assert.equal(menu.children.length, 3); assert.equal(moduleLoads, 0);
-  const activations = []; api.run = async (...args) => activations.push(args);
+  const activations = []; api.run = async (...args) => {
+    assert.equal(menu.events.at(-1)?.key, 'Escape', 'close native modal menu before starting rollback');
+    assert.equal(menu.events.at(-1)?.bubbles, true);
+    activations.push(args);
+  };
   identity.turnId = 'fixture-new-target'; await button.click();
   assert.deepEqual(Array.from(activations[0]), ['fixture-chat', 'fixture-new-target']);
 
@@ -119,7 +124,9 @@ class Element {
   context.refreshTurnRewindMenus();
   assert.equal(button.getAttribute('aria-disabled'), 'true');
   assert.equal(Boolean(button.disabled), false);
+  const previousEscapes = menu.events.length;
   await button.click();
+  assert.equal(menu.events.length, previousEscapes, 'unavailable clicks keep the menu and explain the issue');
   assert.match(toasts.at(-1), /原生回退接口/);
   assert.equal(activations.length, 2);
   assert.equal(diagnostics.at(-1).detail.identityCount, 1);

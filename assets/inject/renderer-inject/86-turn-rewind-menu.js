@@ -176,6 +176,10 @@
             }
             const { target } = availability;
             button.disabled = true;
+            // 自定义 DOM 项没有 Radix 的 onSelect；关闭原生菜单后释放模态焦点和指针锁。
+            menu.dispatchEvent(new KeyboardEvent("keydown", {
+              key: "Escape", code: "Escape", bubbles: true, cancelable: true,
+            }));
             await codexPlusTurnRewind.run(target.threadId, target.turnId);
           } catch (error) { showToast(String(error?.message || error), { type: "error" }); }
           finally { button.disabled = false; scheduleTurnRewindMenuRefresh(); }
