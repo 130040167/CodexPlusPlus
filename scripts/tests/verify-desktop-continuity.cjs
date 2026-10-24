@@ -828,6 +828,7 @@ async function runMainReplacementScenario(manager) {
   const workspace = path.join(manager.state, "workspace");
   const electron = path.join(manager.state, "unused-electron");
   await fs.mkdir(workspace, { recursive: true });
+  await fs.mkdir(manager.sqlite, { recursive: true });
   await fs.writeFile(path.join(manager.home, ".codex-global-state.json"), JSON.stringify({
     "electron-saved-workspace-roots": [workspace], "active-workspace-roots": [workspace],
     "electron-persisted-atom-state": { "electron:onboarding-projectless-completed": true,
