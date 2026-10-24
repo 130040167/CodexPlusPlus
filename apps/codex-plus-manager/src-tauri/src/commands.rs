@@ -2296,7 +2296,7 @@ fn new_multi_worker_token() -> String {
 }
 
 /// 每次管理器启动只交接一次；列表轮询不能反复重启正在工作的代理。
-pub fn resume_existing_multi_instances_background(app: tauri::AppHandle) {
+pub fn resume_existing_multi_instances_background(app: tauri::AppHandle, start_if_missing: bool) {
     tauri::async_runtime::spawn_blocking(move || {
         let _operation = multi_instance_mutation_lock()
             .lock()
@@ -2328,6 +2328,8 @@ pub fn resume_existing_multi_instances_background(app: tauri::AppHandle) {
                 );
             }
         }
+        // 旧 Windows worker 可能继承了主代理监听；先完成交接释放句柄，再恢复主实例。
+        resume_existing_codex_background(app.clone(), start_if_missing);
         let _ = app.emit("runtime-health-changed", ());
     });
 }
@@ -2357,7 +2359,7 @@ fn multi_resume_options_under(
     let canonical_root = root.canonicalize()?;
     anyhow::ensure!(
         multi_manifest_identity_matches(instance, identity)
-            && identity.user_data_dir.starts_with(&canonical_root)
+            && multi_resume_user_data_allowed(&canonical_root, identity, legacy_multi_user_data_parent(parent).as_deref())
             && options.instance_id == instance.instance_id
             && options.generation == instance.generation
             && Path::new(&options.state_dir).canonicalize()?
@@ -2376,6 +2378,26 @@ fn multi_resume_options_under(
     options.resume_identity = Some(identity.clone());
     options.resume_token = Some(new_multi_worker_token());
     Ok(options)
+}
+
+fn legacy_multi_user_data_parent(parent: &Path) -> Option<PathBuf> {
+    let dirs = directories::BaseDirs::new()?;
+    let production = dirs.home_dir().join(".codex-session-delete/codex-multi");
+    // 旧布局只属于生产状态，隔离管理器不能借此接管生产窗口。
+    (parent.canonicalize().ok()? == production.canonicalize().ok()?)
+        .then(|| dirs.data_local_dir().join("CodexPlusPlus/multi"))
+}
+
+fn multi_resume_user_data_allowed(
+    root: &Path,
+    identity: &codex_plus_core::multi_worker::CodexInstanceIdentity,
+    legacy_parent: Option<&Path>,
+) -> bool {
+    identity.user_data_dir.starts_with(root)
+        || legacy_parent
+            .map(|parent| parent.join(multi_instance_slug(&identity.instance_id)))
+            .and_then(|path| path.canonicalize().ok())
+            .is_some_and(|path| path == identity.user_data_dir)
 }
 
 fn resume_multi_instance_worker(root: &Path) -> anyhow::Result<()> {
@@ -2855,6 +2877,16 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
     } else {
         None
     };
+    // 接续失败时旧 runtime 不归本进程所有；先确认代理可用，不能关掉 Codex 后才发现无法启动。
+    if !owns_session {
+        sync_resident_helper();
+        if let Err(error) = prepare_fixed_helper_port_for_restart(settings.as_ref()) {
+            return failed(
+                &format!("本地代理尚未就绪，未停止 Codex：{error:#}"),
+                json!({"debugPort": request.debug_port, "helperPort": request.helper_port}),
+            );
+        }
+    }
     let provider_guard = match ensure_provider_sync_is_idle_before_stop() {
         Ok(guard) => guard,
         Err(message) => return failed(&message, json!({})),
@@ -2906,6 +2938,9 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
         );
     }
     if let Err(error) = prepare_fixed_helper_port_for_restart(settings.as_ref()) {
+        let _ = save_requested_launch_status(
+            &request, "failed", &format!("重启 Codex 失败：{error:#}"), current_timestamp_ms(),
+        );
         return failed(
             &format!("重启 Codex 失败：{error:#}"),
             json!({"debugPort": request.debug_port, "helperPort": request.helper_port}),
@@ -12009,6 +12044,31 @@ model_reasoning_effort = "high"
         wrong_instance.codex_home = Some(temp.path().to_string_lossy().into_owned());
         assert!(multi_resume_options_under(&root, &wrong_instance, &parent).is_err());
         assert!(multi_resume_options_under(&root, &instance, temp.path()).is_err());
+    }
+
+    #[test]
+    fn multi_worker_resume_accepts_only_exact_legacy_user_data_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("state/codex-multi/fixture");
+        let legacy = temp.path().join("local/CodexPlusPlus/multi");
+        for path in [&root, &legacy.join("fixture"), &legacy.join("other")] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let mut identity = codex_plus_core::multi_worker::CodexInstanceIdentity {
+            instance_id: "fixture".into(), generation: 7, debug_port: 19401, helper_port: 19402,
+            user_data_dir: legacy.join("fixture").canonicalize().unwrap(),
+            browser_id: "browser".into(), process_id: 123, process_birth_id: 456,
+            executable: temp.path().join("Codex.exe"),
+        };
+        let root = root.canonicalize().unwrap();
+        assert!(multi_resume_user_data_allowed(&root, &identity, Some(&legacy)));
+        assert!(!multi_resume_user_data_allowed(&root, &identity, None));
+        identity.user_data_dir = legacy.join("other").canonicalize().unwrap();
+        assert!(!multi_resume_user_data_allowed(&root, &identity, Some(&legacy)));
+        identity.user_data_dir = legacy.canonicalize().unwrap();
+        assert!(!multi_resume_user_data_allowed(&root, &identity, Some(&legacy)));
+        identity.user_data_dir = root;
+        assert!(multi_resume_user_data_allowed(&identity.user_data_dir, &identity, None));
     }
 
     #[test]

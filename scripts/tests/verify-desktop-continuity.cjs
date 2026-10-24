@@ -60,7 +60,7 @@ const identity = process => ({
 const sameProcess = (a, b) => a && b && a.ProcessId === b.ProcessId
   && a.CreationDate === b.CreationDate && a.ExecutablePath === b.ExecutablePath;
 const before = inventory();
-const protectedProcesses = before.filter(process => /^(codex-plus-plus|codex|ChatGPT|cc-switch)\.exe$/i.test(process.Name));
+const protectedProcesses = before.filter(process => /^(codex-plus-plus(?:\.[\w-]+)*|codex|ChatGPT|cc-switch)\.exe$/i.test(process.Name));
 const originalRenderers = protectedProcesses.filter(process =>
   /^ChatGPT\.exe$/i.test(process.Name) && /--type=renderer(?:\s|$)/.test(process.CommandLine || ""));
 const children = [], contexts = [], desktops = [], owned = new Map(), servers = new Set(), ports = new Set();
@@ -794,6 +794,84 @@ async function runWorkerHandoffScenario(first, manager) {
   await pass("handoffPreservesBothSavedSuppliersAndVisibleModelMenus");
 }
 
+async function connectMainDesktop(manager, debugPort) {
+  const desktop = { context: manager, root: manager.state, instanceId: "main", isMain: true };
+  desktops.push(desktop);
+  await until(async () => {
+    captureOwned();
+    const receipt = await fs.readFile(path.join(manager.state, "main-restart-identity.json"), "utf8")
+      .then(JSON.parse).catch(() => null);
+    if (!receipt?.process_id || receipt.debug_port !== debugPort) return false;
+    const process = inventory().find(candidate => candidate.ProcessId === receipt.process_id);
+    if (!process || protectedProcesses.some(original => sameProcess(original, process))) return false;
+    const version = await fetch(`http://127.0.0.1:${debugPort}/json/version`,
+      { signal: AbortSignal.timeout(2000) }).then(response => response.json()).catch(() => null);
+    if (!version?.webSocketDebuggerUrl) return false;
+    desktop.id = { processId: process.ProcessId, debugPort, helperPort: manager.port,
+      browserId: version.webSocketDebuggerUrl.split("/").at(-1) };
+    owned.set(process.ProcessId, identity(process));
+    return true;
+  }, "main desktop did not produce a verified ready receipt", 135000);
+  desktop.browser = await connectBrowser(debugPort);
+  await until(async () => {
+    desktop.page = desktop.browser.contexts().flatMap(context => context.pages())
+      .find(page => page.url().startsWith("app://"));
+    return desktop.page && await desktop.page.locator('[contenteditable="true"]').count() > 0;
+  }, "main desktop did not render its composer", 60000);
+  await ensureClear(desktop.page);
+  return desktop;
+}
+
+async function runMainReplacementScenario(manager) {
+  const workspace = path.join(manager.state, "workspace");
+  const electron = path.join(manager.state, "unused-electron");
+  await fs.mkdir(workspace, { recursive: true });
+  await fs.writeFile(path.join(manager.home, ".codex-global-state.json"), JSON.stringify({
+    "electron-saved-workspace-roots": [workspace], "active-workspace-roots": [workspace],
+    "electron-persisted-atom-state": { "electron:onboarding-projectless-completed": true,
+      last_completed_onboarding: Math.floor(Date.now() / 1000) },
+  }));
+  const settingsPath = path.join(manager.state, "settings.json");
+  const settings = JSON.parse(await fs.readFile(settingsPath, "utf8"));
+  settings.codexExtraArgs = [`--user-data-dir=${electron}`];
+  await fs.writeFile(settingsPath, JSON.stringify(settings));
+  const request = { appPath: appDir, debugPort: await freeDesktopDebugPort(),
+    helperPort: manager.port, syncActiveRelay: true };
+  ports.add(request.debugPort);
+  const started = await invoke(manager, "launch_codex_plus", { request });
+  assert.notEqual(started.status, "failed", started.message);
+  const main = await connectMainDesktop(manager, request.debugPort);
+  await sendPrompt(main, "Return a short synthetic response without tools.");
+  await main.page.getByText("DESKTOP_RECOVERED_complete", { exact: true }).waitFor({ timeout: 45000 });
+  // 主代理已经监听后再创建 worker，覆盖旧监听句柄被子进程留住的升级现场。
+  const workers = [await launchDesktop(manager), await launchDesktop(manager, `${token}-sibling`)];
+  const oldPids = workers.map(desktop => desktop.manifest.pid);
+  await stopManager(manager);
+  for (const desktop of [main, ...workers]) await assertDesktopAlive(desktop);
+  manager.executable = executable;
+  await startManager(manager);
+  for (const [index, desktop] of workers.entries()) {
+    await waitForWorkerHandoff(desktop, oldPids[index], executable);
+  }
+  await assertDesktopAlive(main);
+  mode = "main_after_upgrade";
+  await sendPrompt(main, "Return a synthetic response after manager replacement without tools.");
+  await main.page.getByText(`DESKTOP_RECOVERED_${mode}`, { exact: true }).waitFor({ timeout: 90000 });
+  await pass("mainAndTwoWorkersReconnectAfterManagerReplacement");
+  const oldPid = main.id.processId;
+  const restarted = await invoke(manager, "restart_codex_plus", { request });
+  assert.notEqual(restarted.status, "failed", restarted.message);
+  await until(() => !inventory().some(candidate => candidate.ProcessId === oldPid),
+    "restart did not stop the previous main desktop", 30000);
+  const replacement = await connectMainDesktop(manager, request.debugPort);
+  assert.notEqual(replacement.id.processId, oldPid);
+  for (const desktop of workers) await assertDesktopAlive(desktop);
+  mode = "main_after_restart";
+  await sendPrompt(replacement, "Return a synthetic response after desktop restart without tools.");
+  await replacement.page.getByText(`DESKTOP_RECOVERED_${mode}`, { exact: true }).waitFor({ timeout: 90000 });
+  await pass("mainRestartStopsThenRelaunchesAndCompletesTurnWithoutStoppingWorkers");
+}
+
 (async () => {
   await fs.mkdir(outputDir, { recursive: true });
   try {
@@ -803,6 +881,10 @@ async function runWorkerHandoffScenario(first, manager) {
     const a = await context("manager-a", upstream), b = await context("manager-b", upstream);
     if (process.env.DESKTOP_BASELINE_MANAGER) a.executable = path.resolve(process.env.DESKTOP_BASELINE_MANAGER);
     await startManager(a);
+    if (process.env.DESKTOP_MAIN_RESTART_ONLY) {
+      await runMainReplacementScenario(a);
+      return;
+    }
     if (process.env.DESKTOP_PROVIDER_SCENARIO) {
       const providerDesktop = await launchDesktop(a, `${token}-provider`);
       await runProviderScenario(providerDesktop);
@@ -992,6 +1074,7 @@ async function runWorkerHandoffScenario(first, manager) {
     cleaning = true;
     report.interrupted = interrupted || null;
     for (const desktop of desktops) {
+      if (desktop.isMain) continue;
       const context = desktop.context;
       if (!context.page || context.current?.exitCode !== null) continue;
       try {

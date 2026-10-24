@@ -222,11 +222,10 @@ pub fn run() {
             start_window_activation_listener(app.handle().clone());
             commands::start_weixin_connect_from_saved_settings();
             register_main_window_events(main_window);
-            commands::resume_existing_codex_background(
+            commands::resume_existing_multi_instances_background(
                 app.handle().clone(),
                 start_codex_at_login || start_codex_on_open,
             );
-            commands::resume_existing_multi_instances_background(app.handle().clone());
             // 自动接管官方 App（默认关闭）：设置里开着才起守护线程。
             auto_takeover::start_supervisor();
             if let Err(error) = global_dictation::apply_config() {

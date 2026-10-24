@@ -1788,6 +1788,16 @@ impl LaunchHooks for DefaultLaunchHooks {
     }
 }
 
+async fn bind_helper_listener(
+    host: &str,
+    port: u16,
+) -> std::io::Result<tokio::net::TcpListener> {
+    // std 创建的 Windows socket 不可继承；避免 Codex/worker 留住旧管理器的监听。
+    let listener = std::net::TcpListener::bind((host, port))?;
+    listener.set_nonblocking(true)?;
+    tokio::net::TcpListener::from_std(listener)
+}
+
 async fn start_helper_with_continuity(
     bind_host: &str,
     helper_port: u16,
@@ -1798,13 +1808,13 @@ async fn start_helper_with_continuity(
     let primary = if reuse_resident {
         Ok(None)
     } else {
-        tokio::net::TcpListener::bind((bind_host, helper_port)).await.map(Some)
+        bind_helper_listener(bind_host, helper_port).await.map(Some)
     }
         .with_context(|| format!("failed to bind helper runtime on {bind_host}:{helper_port}"));
     let aliases = endpoints.ports_for_restore();
     let mut alias_listeners = Vec::new();
     for alias in aliases.into_iter().filter(|alias| *alias != helper_port) {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", alias)).await;
+        let listener = bind_helper_listener("127.0.0.1", alias).await;
         let listener = match listener {
             Ok(listener) => Some(listener),
             Err(error) => {
@@ -1873,7 +1883,7 @@ fn spawn_helper_runtime(
                 tokio::select! {
                     _ = &mut shutdown_rx => return,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                        if let Ok(listener) = tokio::net::TcpListener::bind((host.as_str(), port)).await {
+                        if let Ok(listener) = bind_helper_listener(host.as_str(), port).await {
                             break listener;
                         }
                     }
@@ -5563,6 +5573,22 @@ fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> a
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn helper_listener_is_not_inheritable_by_codex_or_workers() {
+        use std::os::windows::io::AsRawSocket;
+        use windows::Win32::Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+        let listener = bind_helper_listener("127.0.0.1", 0).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut flags = 0;
+        unsafe {
+            GetHandleInformation(HANDLE(listener.as_raw_socket() as *mut _), &mut flags)
+        }.unwrap();
+        assert_eq!(flags & HANDLE_FLAG_INHERIT.0, 0);
+        drop(listener);
+        assert!(std::net::TcpListener::bind(address).is_ok());
+    }
 
     #[tokio::test]
     async fn proxy_continuity_recovers_cached_clients_across_restarts_and_provider_switches() {
