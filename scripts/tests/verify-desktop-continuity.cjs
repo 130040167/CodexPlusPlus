@@ -879,9 +879,10 @@ async function runMainReplacementScenario(manager) {
   // 模拟独立 launcher 的健康 helper；它随已验证的旧桌面退出释放，而非要求重启前就空闲。
   const retiringHelper = http.createServer((request, response) => {
     if (request.url === "/backend/status") {
-      response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
+      const body = JSON.stringify({
         status: "ok", transport: "http-helper", version: "fixture",
-      }));
+      });
+      response.writeHead(200, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) }).end(body);
     } else response.writeHead(503).end();
   });
   try {
