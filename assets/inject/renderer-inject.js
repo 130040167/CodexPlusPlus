@@ -15415,7 +15415,8 @@
     const managers = new Set();
     const owners = turnRewindMenuOwners(node);
     Object.assign(details, { ownerCount: owners.length, fiberFoundCount: 0, maxAncestorDepth: 0,
-      scanLimitReached: false, registryReaderReady: !!turnRewindRegistryReader, identityCount: 0, managerCount: 0 });
+      scanLimitReached: false, menuScanLimitReached: false, messageBoundaryResolved: false,
+      registryReaderReady: !!turnRewindRegistryReader, identityCount: 0, managerCount: 0 });
     if (owners.length > 1) return null;
     const seenValues = new Set();
     let inspectedValues = 0;
@@ -15447,8 +15448,13 @@
         } catch { /* 原生 RPC stub 可能拒绝反射，保持不可用。 */ }
       }
     };
+    const matchingManagers = (threadId) => [...managers].filter((manager) => {
+      try { return !!manager.getConversation(threadId); } catch { return false; }
+    });
     const seenFibers = new Set();
     for (const anchor of [...owners, node]) {
+      const isOwner = anchor === owners[0];
+      let messageBoundary = null;
       let fiber = null;
       for (let element = anchor, depth = 0; element && element !== document.body && depth < 8;
           element = element.parentElement, depth += 1) {
@@ -15464,8 +15470,13 @@
         const props = fiber.memoizedProps;
         const threadId = props?.threadId || props?.conversationId;
         const turnId = props?.turnId;
-        if (typeof threadId === "string" && typeof turnId === "string" && threadId && turnId) {
-          identities.set(JSON.stringify([threadId, turnId]), { threadId, turnId, hostId: props.hostId });
+        const hasIdentity = typeof threadId === "string" && typeof turnId === "string" && threadId && turnId;
+        // 原生回答操作栏同时接收 threadId、turnId 和 onFork；它是触发按钮的消息边界。
+        // 有明确菜单归属时，不把更上层页面/列表的 props 当成选中的消息。
+        if (hasIdentity && (!isOwner || (!messageBoundary && typeof props.onFork === "function"))) {
+          const identity = { threadId, turnId, hostId: props.hostId };
+          identities.set(JSON.stringify([threadId, turnId]), identity);
+          if (isOwner) messageBoundary = identity;
         }
         inspect(props?.value);
         inspect(props?.scope);
@@ -15475,19 +15486,26 @@
         for (let context = fiber.dependencies?.firstContext, count = 0; context && count < 32; context = context.next, count += 1) {
           inspect(context.memoizedValue);
         }
+        if (isOwner && messageBoundary && matchingManagers(messageBoundary.threadId).length === 1) {
+          // 身份已由原生触发按钮及消息操作栏确定，接口也已确认；不再遍历整个应用树。
+          details.messageBoundaryResolved = true;
+          break;
+        }
+        if (!isOwner && owners.length === 1 && hasIdentity) break;
       }
       details.maxAncestorDepth = Math.max(details.maxAncestorDepth, depth);
-      if (fiber && !seenFibers.has(fiber)) details.scanLimitReached = true;
+      if (fiber && !seenFibers.has(fiber)) {
+        if (isOwner || owners.length === 0) details.scanLimitReached = true;
+        else details.menuScanLimitReached = true;
+      }
     }
     details.identityCount = identities.size;
     details.managerCount = managers.size;
-    // 到达上限意味着祖先可能还有冲突身份，不能据不完整扫描执行破坏性操作。
-    if (details.scanLimitReached || identities.size !== 1) return null;
+    // 必要的消息边界识别仍未完成时不能猜目标；菜单包装的可选扫描不替代原生归属。
+    if (details.scanLimitReached || (owners.length === 1 && !details.messageBoundaryResolved) || identities.size !== 1) return null;
     const target = [...identities.values()][0];
     if (target.hostId && target.hostId !== "local") return null;
-    const matches = [...managers].filter((manager) => {
-      try { return !!manager.getConversation(target.threadId); } catch { return false; }
-    });
+    const matches = matchingManagers(target.threadId);
     details.matchCount = matches.length;
     return matches.length === 1 ? { ...target, manager: matches[0] } : null;
   }
@@ -15524,7 +15542,9 @@
     const details = {};
     const target = turnRewindContextFromNode(branch, details);
     if (!target) {
-      const reason = details.identityCount !== 1
+      const reason = details.scanLimitReached
+        ? "消息结构超出当前支持的安全识别范围，未执行回退。"
+        : details.identityCount !== 1
         ? "无法唯一识别此消息的聊天和轮次，未执行回退。请重新打开此聊天后重试。"
         : "无法获取此聊天的原生回退接口，未执行回退。请确认通过最新 Codex++ 测试版启动客户端。";
       return { reason, details };

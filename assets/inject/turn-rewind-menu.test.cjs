@@ -156,12 +156,26 @@ class Element {
   trigger.setAttribute('id', 'fixture-trigger'); trigger.setAttribute('aria-haspopup', 'menu');
   trigger.setAttribute('aria-expanded', 'true'); trigger.setAttribute('aria-controls', 'fixture-menu');
   menu.setAttribute('id', 'fixture-menu'); menu.setAttribute('aria-labelledby', 'fixture-trigger');
+  identity.onFork = () => {};
+  let applicationRoot = null;
+  for (let depth = 0; depth < 230; depth++) applicationRoot = { memoizedProps: {}, return: applicationRoot };
   trigger.__reactFiber$fixture = { memoizedProps: {}, return: {
-    memoizedProps: identity, dependencies: { firstContext: { memoizedValue: scope } }
+    memoizedProps: identity, dependencies: { firstContext: { memoizedValue: scope } }, return: applicationRoot
   } };
   branch.__reactFiber$fixture = { memoizedProps: {} };
   context.refreshTurnRewindMenus();
-  assert.equal(button.getAttribute('aria-disabled'), 'false', 'resolve through native menu/trigger accessibility association');
+  assert.equal(button.getAttribute('aria-disabled'), 'false', 'resolve the native message action boundary without scanning the entire deep application tree');
+  assert.equal(context.turnRewindAvailability(branch).details.messageBoundaryResolved, true);
+  // 复现日志中的另一种 192 层来源：无消息身份的菜单 portal 自身很深。
+  let detachedMenuTree = null;
+  for (let depth = 0; depth < 230; depth++) detachedMenuTree = { memoizedProps: {}, return: detachedMenuTree };
+  branch.__reactFiber$fixture = detachedMenuTree;
+  context.refreshTurnRewindMenus();
+  assert.equal(button.getAttribute('aria-disabled'), 'false', 'optional deep menu wrappers cannot invalidate a proven native trigger boundary');
+  const proven = context.turnRewindAvailability(branch).details;
+  assert.equal(proven.menuScanLimitReached, true); assert.equal(proven.scanLimitReached, false);
+  branch.__reactFiber$fixture = { memoizedProps: {} };
+
   const beforeOwnerRun = activations.length;
   await button.click();
   assert.deepEqual(Array.from(activations.at(-1)), ['fixture-chat', 'fixture-new-target']);
@@ -170,6 +184,16 @@ class Element {
   identity.turnId = 'fixture-owner-new-target'; await button.click();
   assert.deepEqual(Array.from(activations.at(-1)), ['fixture-chat', 'fixture-owner-new-target']);
   identity.turnId = 'fixture-new-target';
+
+  const nativeTriggerFiber = trigger.__reactFiber$fixture;
+  let inaccessibleTrigger = nativeTriggerFiber;
+  for (let depth = 0; depth < 230; depth++) inaccessibleTrigger = { memoizedProps: {}, return: inaccessibleTrigger };
+  trigger.__reactFiber$fixture = inaccessibleTrigger;
+  branch.__reactFiber$fixture = messageFiber;
+  context.refreshTurnRewindMenus();
+  assert.equal(button.getAttribute('aria-disabled'), 'true', 'an unresolved required trigger boundary must still fail closed');
+  await button.click(); assert.match(toasts.at(-1), /安全识别范围/);
+  trigger.__reactFiber$fixture = nativeTriggerFiber; branch.__reactFiber$fixture = { memoizedProps: {} };
 
   trigger.setAttribute('aria-expanded', 'false'); context.refreshTurnRewindMenus();
   assert.equal(button.getAttribute('aria-disabled'), 'true', 'closed trigger must not identify a visible menu');
