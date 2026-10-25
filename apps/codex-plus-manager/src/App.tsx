@@ -358,6 +358,7 @@ type BackendSettings = WhaleBalanceSettings & {
   codexAppPluginMarketplaceUnlock: boolean;
   codexAppModelWhitelistUnlock: boolean;
   codexAppSessionDelete: boolean;
+  codexAppSideChatSave: boolean;
   codexAppMarkdownExport: boolean;
   codexAppUsageStatusLine: boolean;
   codexAppPasteFix: boolean;
@@ -387,6 +388,7 @@ type BackendSettings = WhaleBalanceSettings & {
   /** 本地协议代理单次请求体上限（MiB，32~512，默认 128）。与 Rust `helper_max_request_body_mib` 对应。 */
   helperMaxRequestBodyMib: number;
   codexAppCapacityAutoRetry: boolean;
+  codexAppTurnRewind: boolean;
   codexAppStepwiseEnabled: boolean;
   codexAppAnswerOutlineEnabled: boolean;
   codexAppStepwiseDirectSend: boolean;
@@ -1282,6 +1284,7 @@ const defaultSettings: BackendSettings = {
   codexAppPluginMarketplaceUnlock: true,
   codexAppModelWhitelistUnlock: true,
   codexAppSessionDelete: true,
+  codexAppSideChatSave: false,
   codexAppMarkdownExport: true,
   codexAppUsageStatusLine: true,
   codexAppPasteFix: false,
@@ -1305,6 +1308,7 @@ const defaultSettings: BackendSettings = {
   protocolProxyMapUnlistedModels: false,
   helperMaxRequestBodyMib: 128,
   codexAppCapacityAutoRetry: false,
+  codexAppTurnRewind: false,
   codexAppStepwiseEnabled: false,
   codexAppAnswerOutlineEnabled: false,
   codexAppStepwiseDirectSend: false,
@@ -7570,6 +7574,8 @@ function EnhanceScreen({
               </FeatureGroup>
               <FeatureGroup title={t("对话与输入")} detail={t("调整会话管理、输入行为和对话阅读体验。")}>
                 <FeatureToggle title={t("会话删除")} detail={t("在会话列表悬停显示删除按钮，并支持撤销。")} checked={form.codexAppSessionDelete} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppSessionDelete", value)} />
+                <FeatureToggle title={t("旁支保存")} detail={t("在本地 Side Chat 标签页显示「保存」。回复结束后可保存为普通会话，包含创建旁支时的主历史。建议开启后新建旁支。")} checked={form.codexAppSideChatSave} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppSideChatSave", value)} />
+                <FeatureToggle title={t("轮次回退（实验性）")} detail={t("在回答菜单中撤销本轮及后续轮次的可恢复操作，AI 报告全部完成后才截断会话。仅支持本地聊天；恢复记录保存在本机，不是系统快照。")} checked={form.codexAppTurnRewind} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppTurnRewind", value)} />
                 <FeatureToggle title={t("纯 API 模式禁用 Work 视图")} detail={t("Work 视图要求 ChatGPT 账号身份，纯 API Key 下发送消息会报 Work browser access requires an authenticated account。开启后每次启动 Codex 前把详情模式写回 Codex；重新启动 Codex 后生效。")} checked={form.codexAppDisableWorkView} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppDisableWorkView", value)} />
                 <FeatureToggle title={t("Markdown 导出")} detail={t("在会话列表显示导出按钮，导出带时间戳的 Markdown。")} checked={form.codexAppMarkdownExport} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppMarkdownExport", value)} />
                 <FeatureToggle title={t("粘贴修复")} detail={t("从 Word 等富文本粘贴到 Codex composer 时只保留纯文本，避免被识别为图片/文件附件。需重启 Codex 才生效。")} checked={form.codexAppPasteFix} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppPasteFix", value)} />
