@@ -1507,8 +1507,8 @@ export const EN_PLAIN: Record<string, string> = {
   "未发现 Clash Verge Rev 配置，按未开启处理。": "No Clash Verge Rev configuration was found; TUN is treated as disabled.",
   "等待检测。": "Waiting for check.",
   "系统代理环境变量": "System proxy environment variables",
-  "未检测到 HTTP_PROXY、HTTPS_PROXY、ALL_PROXY、NO_PROXY 或 FTP_PROXY。":
-    "No HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, NO_PROXY, or FTP_PROXY variable was detected.",
+  "未检测到 HTTP_PROXY、HTTPS_PROXY、ALL_PROXY 或 FTP_PROXY。":
+    "No HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, or FTP_PROXY variable was detected.",
   "Codex .env 文件": "Codex .env file",
   "三项检测全部通过": "All three checks passed",
   "检测到需要处理的环境问题": "Environment issues need attention",
