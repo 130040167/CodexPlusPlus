@@ -13,6 +13,7 @@ mod lightweight;
 mod provider_lookup_commands;
 mod runtime_health;
 mod tray_panel;
+mod shutdown_watchdog;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -29,7 +30,7 @@ const MAIN_WINDOW_URL: &str = "/index.html";
 static APP_EXITING: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_COMPLETE: AtomicBool = AtomicBool::new(false);
-/// 退出清理的等待上限（秒）：超过就直接退出，避免卡在托盘里退不掉（#2611）。
+/// 整个退出流程的等待上限，包含清理完成后的最终框架退出。
 const SHUTDOWN_WATCHDOG: u64 = 10;
 const TRAY_MENU_SHOW: &str = "tray_show_main";
 const TRAY_MENU_QUIT: &str = "tray_quit_app";
@@ -524,23 +525,20 @@ pub fn run() {
                     api.prevent_exit();
                     if !SHUTDOWN_STARTED.swap(true, Ordering::SeqCst) {
                         APP_EXITING.store(true, Ordering::SeqCst);
+                        // 清理完成不代表进程已退出；最终 app.exit 未完成时仍须兜底。
+                        shutdown_watchdog::arm(
+                            std::time::Duration::from_secs(SHUTDOWN_WATCHDOG),
+                            || {
+                                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                                    "app.shutdown_watchdog_forced",
+                                    serde_json::json!({
+                                        "waitedSeconds": SHUTDOWN_WATCHDOG,
+                                        "cleanupComplete": SHUTDOWN_COMPLETE.load(Ordering::SeqCst),
+                                    }),
+                                );
+                            },
+                        );
                         auto_takeover::stop_supervisor();
-                        // 退出清理里任何一步卡住（例如等待启动器或常驻代理），
-                        // 进程就会停在「已阻止退出、尚未完成」的状态：托盘菜单点了没反应，
-                        // 再点也不会重来（SHUTDOWN_STARTED 已经是 true），任务管理器里也
-                        // 只能强杀（#2611）。这里给清理设一个上限，到点直接退出，
-                        // 先写日志留下是超时退出的证据。
-                        std::thread::spawn(|| {
-                            std::thread::sleep(std::time::Duration::from_secs(SHUTDOWN_WATCHDOG));
-                            if SHUTDOWN_COMPLETE.load(Ordering::SeqCst) {
-                                return;
-                            }
-                            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-                                "app.shutdown_watchdog_forced",
-                                serde_json::json!({ "waitedSeconds": SHUTDOWN_WATCHDOG }),
-                            );
-                            std::process::exit(0);
-                        });
                         let app = app_handle.clone();
                         tauri::async_runtime::spawn_blocking(move || {
                             // 退出前先等待自有 CLI 任务清理，避免进程退出后遗留执行器。
