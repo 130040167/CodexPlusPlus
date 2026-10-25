@@ -643,7 +643,9 @@ mod tests {
         #[cfg(not(target_os = "macos"))]
         {
             assert!(super::list_windows().unwrap().is_empty());
-            let error = super::start_preview(1, 0.5, 12.0, |_| {}).unwrap_err();
+            let error = super::start_preview(1, 0.5, 12.0, super::CaptureMode::default(), |_| {})
+                .err()
+                .expect("preview must be unsupported outside macOS");
             assert!(error.to_string().contains("只支持 macOS"));
         }
         #[cfg(target_os = "macos")]
