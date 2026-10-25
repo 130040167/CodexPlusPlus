@@ -11293,3 +11293,122 @@ select {
   color: hsl(var(--muted-foreground));
   font-size: 10px;
 }
+
+/* ── 供应商列表 ─────────────────────────────────────────────── */
+/* 当前供应商一眼可见：名字旁常驻「使用中」，「使用」按钮常驻；
+   测试 / 编辑 / 复制 / 删除这类次要操作仍悬停才出现，列表保持安静。 */
+.relay-management-page .relay-profile-card .relay-card-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.relay-management-page .relay-profile-card .relay-card-extra {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.16s ease;
+}
+
+.relay-management-page .relay-profile-card:hover .relay-card-extra,
+.relay-management-page .relay-profile-card:focus-within .relay-card-extra {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* 当前那行已经有「使用中」标记，按钮再写一遍是重复。 */
+.relay-management-page .relay-profile-card.active .relay-use-button {
+  display: none;
+}
+
+.relay-summary strong {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.relay-active-badge {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border: 1px solid hsl(var(--status-success) / 0.4);
+  border-radius: 6px;
+  background: hsl(var(--status-success) / 0.1);
+  color: hsl(var(--status-success));
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+/* 标题栏里的总开关：只留「配置切换」四个字和开关本体。 */
+.relay-master-switch-compact.switch-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 4px 6px 4px 10px;
+  border-radius: 9px;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.relay-master-switch-compact .toggle-switch-visual {
+  width: 32px;
+  height: 18px;
+}
+
+.relay-master-switch-compact .toggle-switch-thumb {
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+}
+
+.relay-master-switch-compact > input:checked ~ .toggle-switch-visual .toggle-switch-thumb {
+  transform: translateX(14px);
+}
+
+.relay-switch-off-note {
+  margin: 0 0 12px;
+  padding: 9px 12px;
+  border: 1px solid hsl(var(--status-warning) / 0.35);
+  border-radius: 8px;
+  background: hsl(var(--status-warning) / 0.07);
+  color: hsl(var(--status-warning));
+  font-size: 12px;
+}
+
+/* 模式分页：降成与其它页一致的小号分段控件，不再像一排主按钮。 */
+.relay-management-page .provider-view-tabs {
+  margin: 0 0 12px;
+  border-color: hsl(var(--border));
+  border-radius: 8px;
+}
+
+.relay-management-page .provider-view-tabs button {
+  gap: 6px;
+  min-width: 0;
+  padding: 6px 13px;
+  border-left-color: hsl(var(--border));
+  color: hsl(var(--muted-foreground));
+  font-size: 12.5px;
+  font-weight: 550;
+}
+
+.relay-management-page .provider-view-tabs button svg {
+  width: 14px;
+  height: 14px;
+}
+
+.relay-management-page .provider-view-tabs button:hover {
+  background: hsl(var(--accent) / 0.5);
+  color: hsl(var(--foreground));
+}
+
+.relay-management-page .provider-view-tabs button.active {
+  background: hsl(var(--brand-accent) / 0.14);
+  color: hsl(var(--brand-accent));
+}
+
+/* 「使用」固定贴右；悬停才出现的次要按钮排在它左边，不在行中间留一段空白。 */
+.relay-management-page .relay-profile-card .relay-card-actions {
+  flex-direction: row-reverse;
+}

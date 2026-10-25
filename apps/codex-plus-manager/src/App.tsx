@@ -6286,32 +6286,24 @@ function RelayScreen({
         icon={<KeyRound className="h-5 w-5" />}
         title={t("供应商列表")}
         actions={(
-          <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>
-            <Plus className="h-4 w-4" />
-            {t("添加供应商")}
-          </Button>
-        )}
-      />
-      <div className="mg-content">
-        <Panel className="relay-management-panel">
-          <CardContent>
-          <EnvConflictNotice envConflicts={envConflicts} actions={actions} />
-          <label className="switch-row relay-master-switch">
-            <input
-              checked={normalized.relayProfilesEnabled}
-              onChange={(event) => {
-                const next = { ...normalized, relayProfilesEnabled: event.currentTarget.checked };
-                void saveRelaySettings(next);
-              }}
-              type="checkbox"
-            />
-            <span>
-              <strong>{t("启用供应商配置切换")}</strong>
-              <small>{t("关闭后本工具不会在手动切换时写入 Codex 的 config.toml / auth.json；启动 Codex 时始终不会自动改这些文件。")}</small>
-            </span>
-            <ToggleVisual />
-          </label>
-          <div className="relay-add-row">
+          <>
+            {/* 总开关很少改动：收成标题栏里的小开关，完整说明放在悬停提示里；关闭时下方另有提示条。 */}
+            <label
+              className="switch-row compact relay-master-switch relay-master-switch-compact"
+              title={t("关闭后本工具不会在手动切换时写入 Codex 的 config.toml / auth.json；启动 Codex 时始终不会自动改这些文件。")}
+            >
+              <input
+                aria-label={t("启用供应商配置切换")}
+                checked={normalized.relayProfilesEnabled}
+                onChange={(event) => {
+                  const next = { ...normalized, relayProfilesEnabled: event.currentTarget.checked };
+                  void saveRelaySettings(next);
+                }}
+                type="checkbox"
+              />
+              <span>{t("配置切换")}</span>
+              <ToggleVisual />
+            </label>
             <div className="third-party-import" ref={thirdPartyImportTriggerRef}>
               <Button
                 onClick={openThirdPartyImport}
@@ -6363,7 +6355,22 @@ function RelayScreen({
                 </div>
               ) : null}
             </div>
-          </div>
+            <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>
+              <Plus className="h-4 w-4" />
+              {t("添加供应商")}
+            </Button>
+          </>
+        )}
+      />
+      <div className="mg-content">
+        <Panel className="relay-management-panel">
+          <CardContent>
+          <EnvConflictNotice envConflicts={envConflicts} actions={actions} />
+          {!normalized.relayProfilesEnabled ? (
+            <p className="relay-switch-off-note" role="status">
+              {t("供应商配置切换已关闭：点「使用」不会写入 Codex 的 config.toml / auth.json。需要切换时打开右上角的「配置切换」。")}
+            </p>
+          ) : null}
           <div className="provider-view-tabs" role="tablist" aria-label={t("供应商配置模式")}>
             <button aria-selected={providerView === "direct"} className={providerView === "direct" ? "active" : ""} onClick={() => selectProviderView("direct")} role="tab" title={t("直接访问 Responses API 供应商：只写入 Base URL 与 Key，不做协议转换。")} type="button">
               <Cable className="h-4 w-4" />
@@ -9625,7 +9632,10 @@ function SortableRelayProfileCard({
         {providerInitial(profile.name)}
       </span>
       <span className="relay-summary">
-        <strong>{profile.name || t("未命名供应商")}</strong>
+        <strong>
+          {profile.name || t("未命名供应商")}
+          {active ? <span className="relay-active-badge">{t("使用中")}</span> : null}
+        </strong>
         <small>{relayProfileModeLabel(profile)} · {relayProtocolLabel(profile.protocol)} · {relayProfileConfigBrief(profile)}</small>
       </span>
       <span className="relay-card-actions">
