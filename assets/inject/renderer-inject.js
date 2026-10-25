@@ -11405,18 +11405,24 @@
   }
 
   function captureCodexAggregateSelectedModels() {
-    const direct = codexPureApiAllowedModelSet("local", true);
-    if (!codexAggregateAllowedModelSet("local") && !direct) return;
+    // 设置先于目录发布；旧目录的来源才是裸名所属供应商，不能按新 active profile 猜测。
+    if (codexModelCatalog.status !== "ok") return;
+    const sources = codexModelCatalog.sources || [];
+    const directSource = sources.find((source) => source?.id?.startsWith("relay-profile:"));
+    const directGroup = directSource?.id.slice("relay-profile:".length);
+    if (!directGroup && !sources.some((source) => source?.type === "aggregate_model_catalog")) return;
     const identities = window.__codexPlusAggregateModelSelectionIdentities
       || (window.__codexPlusAggregateModelSelectionIdentities = new WeakMap());
     const profileId = codexRemoteSessionActiveProfile()?.id;
     for (const { node, picker, owner, hostId } of codexAggregateModelPickers()) {
-      if (!owner) { identities.delete(node); continue; }
       const previous = identities.get(node);
+      // 新 chat 可以保留自身身份，但复用旧会话节点时不能继承旧会话的待迁移选择。
+      if (previous && previous.owner !== owner) { identities.delete(node); continue; }
       // 连续保存时 React 可能尚未消费上一次迁移，保留最初的供应商身份。
       if (previous && previous.model === picker.model && previous.owner === owner
           && previous.hostId === hostId && previous.profileId === profileId) continue;
-      const groupId = direct ? profileId : codexPlusModelMetadata(picker.model)?.codex_plus_group_id;
+      const groupId = codexPlusModelNames().includes(picker.model)
+        ? directGroup || codexPlusModelMetadata(picker.model)?.codex_plus_group_id : "";
       if (typeof groupId === "string" && groupId) {
         identities.set(node, { model: picker.model, groupId, owner, hostId, profileId });
       }
@@ -11466,7 +11472,12 @@
     const target = codexPlusConfiguredDefaultModel();
     if (!target) return;
     const attempts = window.__codexPlusDefaultModelAttempts ||= new WeakMap();
-    for (const { node, picker, owner } of codexAggregateModelPickers()) {
+    for (const { node, picker, owner, hostId } of codexAggregateModelPickers()) {
+      const identity = window.__codexPlusAggregateModelSelectionIdentities?.get(node);
+      const retained = identity?.model === picker.model && identity?.owner === owner
+        && identity?.hostId === hostId && identity?.profileId === codexRemoteSessionActiveProfile()?.id;
+      // 同供应商 ID 迁移先于新 chat 的默认值恢复，避免先切到聚合的另一默认成员。
+      if (retained && codexAggregateSelectedModelTarget(picker.model, hostId, identity.groupId)) continue;
       // 已有会话交给其保存的模型身份恢复；新会话不能沿用原生目录外的默认值。
       if (owner || picker.disabled || codexPlusModelNames().includes(picker.model)
           || codexAggregateSelectedModelTarget(picker.model, "local")

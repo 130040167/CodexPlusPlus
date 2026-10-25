@@ -437,6 +437,8 @@ async function aggregateQueryRuntime(structuralSharing = false) {
     const findCodexQueryClient = () => client;
     const sendCodexPlusDiagnostic = () => {};
     const syncCodexRetainedThreadModels = () => {};
+    const patchStatsigModelWhitelist = () => {};
+    const installAppServerModelRequestPatch = () => {};
     ${functions}
     return {
       refresh: refreshCachedLocalModelQueries,
@@ -502,6 +504,57 @@ it("aggregate default changes replace stale slugs and keep display names even wi
   assert.deepEqual(local.data.data.map((m) => m.model), before.models, "switching back must work");
   remote.setData(remoteData);
   assert.equal(remote.data, remoteData, "remote publications stay untouched");
+});
+
+for (const owner of ["existing", ""]) for (const unlock of [false, true]) for (const overlapping of [false, true]) {
+  it(`direct to aggregate keeps supplier identity and effort across a replaced list (owner=${owner || "new-chat"}, unlock=${unlock}, overlapping=${overlapping})`, async () => {
+    const { runtime, catalog, nodes } = await aggregateQueryRuntime();
+    runtime.unlock(unlock);
+    runtime.profile({ id: "b", relayMode: "pureApi" });
+    const direct = { ...catalog("b"), model: "model-1", models: ["model-0", "model-1"],
+      sources: [{ id: "relay-profile:b", type: "relay_profile" }] };
+    runtime.catalog(direct);
+    const calls: unknown[][] = [];
+    const props = { model: "model-0", reasoningEffort: "ultra",
+      models: direct.models.map(model => ({ model })),
+      onSelectModel: (...args: unknown[]) => { calls.push(args); } };
+    nodes.push({ __reactFiber$test: { memoizedProps: props,
+      return: { memoizedProps: { permissionsHostId: "local", conversationId: owner } } } });
+    // 后端设置已经换家，而 React 仍携带旧目录和选中值；新默认成员也有同名裸 ID。
+    runtime.profile({ id: "agg", relayMode: "aggregate" });
+    const aggregate = catalog("a");
+    if (!overlapping) aggregate.models = aggregate.models.filter(model => model !== "model-0");
+    runtime.catalog(aggregate);
+    runtime.syncDefault();
+    assert.equal(calls.length, 0, "new chat must wait for its own supplier instead of selecting the new default");
+    assert.equal(runtime.syncSelection(), false, "wait for React to publish the alias");
+    runtime.catalog(aggregate);
+    props.models = aggregate.models.map(model => ({ model }));
+    runtime.runRefreshPass();
+    assert.deepEqual(calls, [["cpx-b/model-0", "ultra"]]);
+    props.model = "cpx-b/model-0";
+    assert.ok(props.models.some(entry => entry.model === props.model), "selected ID resolves to a native menu descriptor");
+    assert.equal(runtime.syncSelection(), false);
+  });
+}
+
+it("direct to aggregate does not guess a different member when the original model is missing", async () => {
+  const { runtime, catalog, nodes } = await aggregateQueryRuntime();
+  runtime.profile({ id: "b", relayMode: "pureApi" });
+  runtime.catalog({ ...catalog("b"), model: "model-0", models: ["model-0"],
+    sources: [{ id: "relay-profile:b", type: "relay_profile" }] });
+  const calls: unknown[][] = [];
+  const props = { model: "model-0", reasoningEffort: "high", models: [{ model: "model-0" }],
+    onSelectModel: (...args: unknown[]) => { calls.push(args); } };
+  nodes.push({ __reactFiber$test: { memoizedProps: props,
+    return: { memoizedProps: { permissionsHostId: "local", conversationId: "existing" } } } });
+  runtime.profile({ id: "agg", relayMode: "aggregate" });
+  const aggregate = catalog("a");
+  aggregate.models = aggregate.models.filter(model => model !== "cpx-b/model-0");
+  runtime.catalog(aggregate);
+  props.models = aggregate.models.map(model => ({ model }));
+  runtime.runRefreshPass();
+  assert.deepEqual(calls, [], "same-name model from the default member is not a substitute");
 });
 
 for (const unlock of [false, true]) {
@@ -648,7 +701,9 @@ for (const mode of ["instance", "prototype"]) {
       noteCodexManagedSessionStart() {}, codexThreadModelRequestState: () => ({}),
       prewarmCodexManagedSession: (_client: any, prewarm: any, params: any, options: any) => prewarm(params, options),
     });
-    vm.runInContext(`${source.slice(start, end)}\n${mode === "instance" ? "patchAppServerModelRequestClient(client)" : "installCodexAppServerClientPrototypePatch()"}`, context);
+    const sideChatBridge = source.match(/^  function sendAppServerRequestWithSideChat\([^]*?^  \}/m)?.[0];
+    assert.ok(sideChatBridge);
+    vm.runInContext(`${sideChatBridge}\n${source.slice(start, end)}\n${mode === "instance" ? "patchAppServerModelRequestClient(client)" : "installCodexAppServerClientPrototypePatch()"}`, context);
     const original = { model: "cpx-old/sol" };
     const request = client.sendRequest("thread/start", original);
     await Promise.resolve(); assert.equal(sent.length, 0);
