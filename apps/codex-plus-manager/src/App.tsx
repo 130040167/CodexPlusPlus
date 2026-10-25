@@ -91,6 +91,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { isGitHubRepositoryHomepage } from "./github-repository";
 import { NativeBrowserStatusView, nativeBrowserConsent } from "./native-browser-settings";
 import { AgentCachePanel } from "./agent-cache";
+import { summarizeRecentRequests, type RecentRequestSummary } from "./overview-model";
 import { AgentCollaborationPage } from "./AgentCollaborationPage";
 import { ComputerUsePage } from "./ComputerUsePage";
 import { PluginMarketScreen } from "./PluginMarketScreen";
@@ -4145,6 +4146,8 @@ export function App() {
               ads={ads}
               activeTool={activeTool}
               toolEntries={toolEntries}
+              form={settingsForm}
+              onNavigate={(next) => void navigate(next)}
               actions={actions}
             />
           ) : null}
@@ -5148,22 +5151,105 @@ function OverviewScreen({
   ads,
   activeTool,
   toolEntries,
+  form,
+  onNavigate,
   actions,
 }: {
   overview: OverviewResult | null;
   ads: AdsResult | null;
   activeTool: ToolId;
   toolEntries: ToolEntry[];
+  form: BackendSettings;
+  onNavigate: (route: Route) => void;
   actions: Actions;
 }) {
   const health = healthItems(overview);
   const tool = toolEntries.find((entry) => entry.id === activeTool);
+  const normalized = normalizeSettings(form);
+  const activeProfile = normalized.relayProfiles.find((profile) => profile.id === normalized.activeRelayId);
+  // 最近请求只在 Codex 概览里用；失败时静默显示空状态，不打断概览。
+  const [recent, setRecent] = useState<RecentRequestSummary | null>(null);
+  useEffect(() => {
+    if (activeTool !== "codex") return;
+    let cancelled = false;
+    void invoke<RequestLogsResult>("load_request_logs", { limit: 300 })
+      .then((result) => {
+        if (!cancelled) setRecent(summarizeRecentRequests(result.status === "ok" ? result.entries : [], Date.now()));
+      })
+      .catch(() => { if (!cancelled) setRecent(summarizeRecentRequests([], Date.now())); });
+    return () => { cancelled = true; };
+  }, [activeTool]);
+  const switchFromOverview = (profileId: string) => {
+    if (!profileId || profileId === normalized.activeRelayId) return;
+    void actions.switchRelayProfile(syncLegacyRelayFields({ ...normalized, activeRelayId: profileId }), normalized.activeRelayId);
+  };
   return (
     <>
-      {/* 置顶推荐位两个工具下都显示，内容与「推荐内容」页同源。 */}
-      <SponsorBoard ads={ads} actions={actions} />
       {activeTool === "codex" ? (
         <>
+          {/* 最常用的两件事放最上面：现在用的是哪个供应商（可直接切换），以及最近请求是否正常。 */}
+          <div className="overview-top-grid">
+            <Panel className="overview-current-panel">
+              <CardHead title={t("当前供应商")} detail="" />
+              <CardContent className="overview-current">
+                {activeProfile ? (
+                  <>
+                    <div className="overview-current-main">
+                      <span className="relay-index">{providerInitial(activeProfile.name)}</span>
+                      <span className="overview-current-text">
+                        <strong>{activeProfile.name || t("未命名供应商")}</strong>
+                        <small>
+                          {[relayProfileModeLabel(activeProfile), relayProtocolLabel(activeProfile.protocol), activeProfile.model]
+                            .filter(Boolean)
+                            .join(" · ")}
+                        </small>
+                      </span>
+                    </div>
+                    <div className="overview-current-actions">
+                      <select
+                        aria-label={t("切换供应商")}
+                        className="request-log-filter overview-current-select"
+                        disabled={actions.relaySwitching || !normalized.relayProfilesEnabled || normalized.relayProfiles.length < 2}
+                        onChange={(event) => switchFromOverview(event.currentTarget.value)}
+                        title={!normalized.relayProfilesEnabled ? t("供应商配置切换已关闭，在供应商配置页打开后才能切换") : t("切换供应商")}
+                        value={normalized.activeRelayId}
+                      >
+                        {normalized.relayProfiles.map((profile) => (
+                          <option key={profile.id} value={profile.id}>{profile.name || t("未命名供应商")}</option>
+                        ))}
+                      </select>
+                      <Button onClick={() => onNavigate("relay")} variant="secondary">{t("管理供应商")}</Button>
+                    </div>
+                  </>
+                ) : (
+                  <div className="overview-current-empty">
+                    <span>{t("还没有配置供应商。")}</span>
+                    <Button onClick={() => onNavigate("relay")}>{t("添加供应商")}</Button>
+                  </div>
+                )}
+              </CardContent>
+            </Panel>
+            <Panel className="overview-recent-panel">
+              <CardHead title={t("最近 24 小时请求")} detail="" />
+              <CardContent className="overview-recent">
+                {!recent ? (
+                  <span className="field-hint">{t("读取中…")}</span>
+                ) : recent.total === 0 ? (
+                  <span className="field-hint">{t("最近 24 小时没有经过本地代理的请求。直连且未开启协议转换时，请求不经过本地代理，这里不会有记录。")}</span>
+                ) : (
+                  <dl className="overview-recent-stats">
+                    <div><dt>{t("请求")}</dt><dd>{recent.total}</dd></div>
+                    <div data-state={recent.failed ? "warn" : "ok"}><dt>{t("成功率")}</dt><dd>{Math.round((recent.successRate ?? 0) * 100)}%</dd></div>
+                    <div><dt>{t("平均耗时")}</dt><dd>{((recent.avgDurationMs ?? 0) / 1000).toFixed(1)}s</dd></div>
+                    <div className="overview-recent-model"><dt>{t("常用模型")}</dt><dd title={recent.topModel ?? undefined}>{recent.topModel ?? "—"}</dd></div>
+                  </dl>
+                )}
+                <Button className="overview-recent-link" onClick={() => onNavigate("requestLog")} size="sm" variant="ghost">
+                  {t("查看请求日志")}
+                </Button>
+              </CardContent>
+            </Panel>
+          </div>
           <Panel>
             <CardHeader className="panel-head overview-health-header">
               <CardTitle>{t("健康检查")}</CardTitle>
@@ -5204,8 +5290,12 @@ function OverviewScreen({
               </div>
             </CardContent>
           </Panel>
+          {/* 推荐内容与「推荐内容」页同源；放在常用信息之后，不再压在概览最上面。 */}
+          <SponsorBoard ads={ads} actions={actions} />
         </>
       ) : (
+        <>
+        <SponsorBoard ads={ads} actions={actions} />
         <Panel>
           <CardHead title={tf("{0} 状态", [tool?.name ?? t("工具")])} detail={t("该工具由它自己的页签管理")} />
           <CardContent>
@@ -5237,6 +5327,7 @@ function OverviewScreen({
             </div>
           </CardContent>
         </Panel>
+        </>
       )}
     </>
   );
@@ -15090,6 +15181,7 @@ function statusLabel(status: string) {
     not_implemented: t("未实现"),
     disabled: t("已禁用"),
     stopped: t("未运行"),
+    waiting: t("等待启动"),
     connected: t("已连接"),
     disconnected: t("未连接"),
     unknown: t("未知"),
@@ -15099,6 +15191,7 @@ function statusLabel(status: string) {
 
 function statusClass(status: string) {
   if (["found", "installed", "ok", "running", "running_degraded", "connected"].includes(status)) return "good";
+  if (status === "waiting") return "idle";
   if (["failed", "missing"].includes(status)) return "bad";
   return "warn";
 }
@@ -15129,6 +15222,17 @@ function healthItems(overview: OverviewResult | null) {
     ok: ["running", "connected", "disabled"].includes(state?.status ?? ""),
     detail: state ? [state.address, t(state.message), extraDetail].filter(Boolean).join(" · ") : t("等待状态检查"),
   });
+  // 调试连接依赖 Codex 在运行：Codex 没启动时连不上是预期内的，显示为中性的「等待启动」而不是警告。
+  const debuggerState = overview?.runtime_health?.debugger;
+  const codexRunning = overview?.runtime_health?.codex_app?.status === "running";
+  const debuggerHealth = debuggerState && debuggerState.status !== "connected" && !codexRunning
+    ? {
+      title: t("调试连接状态"),
+      status: "waiting",
+      ok: true,
+      detail: [debuggerState.address, t("Codex 未运行，启动后自动连接")].filter(Boolean).join(" · "),
+    }
+    : serviceItem(t("调试连接状态"), debuggerState);
   return [
     {
       title: t("Codex 应用"),
@@ -15137,9 +15241,10 @@ function healthItems(overview: OverviewResult | null) {
       detail: overview?.codex_app.path || t("尚未检查 Codex 应用路径。"),
     },
     serviceItem(t("本地服务器状态"), overview?.runtime_health?.local_server, conversionDetail),
-    serviceItem(t("调试连接状态"), overview?.runtime_health?.debugger),
+    debuggerHealth,
   ];
 }
+
 
 function normalizeTypingEffect(value: unknown): TypingEffect {
   return value === "rainbow" || value === "fireworks" || value === "stars" ? value : "off";

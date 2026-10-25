@@ -11412,3 +11412,132 @@ select {
 .relay-management-page .relay-profile-card .relay-card-actions {
   flex-direction: row-reverse;
 }
+
+/* ── 概览 ───────────────────────────────────────────────────── */
+.overview-top-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+  gap: 14px;
+}
+
+.overview-top-grid > .panel {
+  min-width: 0;
+}
+
+.overview-current,
+.overview-recent {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.overview-current-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.overview-current-text {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.overview-current-text strong {
+  overflow: hidden;
+  font-size: 15px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.overview-current-text small {
+  overflow: hidden;
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.overview-current-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.overview-current-select {
+  min-width: 0;
+  flex: 1;
+}
+
+.overview-current-empty {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: hsl(var(--muted-foreground));
+  font-size: 13px;
+}
+
+.overview-recent-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px 14px;
+  margin: 0;
+}
+
+.overview-recent-stats dt {
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+}
+
+.overview-recent-stats dd {
+  margin: 2px 0 0;
+  font-size: 18px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.overview-recent-stats [data-state="warn"] dd {
+  color: hsl(var(--status-warning));
+}
+
+.overview-recent-model {
+  grid-column: 1 / -1;
+}
+
+.overview-recent-model dd {
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.overview-recent-link {
+  align-self: flex-start;
+  margin-left: -8px;
+}
+
+/* 中性状态（如「等待启动」）：灰色，不算问题。 */
+.idle {
+  color: hsl(var(--muted-foreground));
+}
+
+[class*="rounded-full"].idle {
+  border-color: hsl(var(--border));
+  background: hsl(var(--muted) / 0.5);
+}
+
+.health-item.ok:has(.idle) svg {
+  color: hsl(var(--muted-foreground));
+}
+
+@media (max-width: 900px) {
+  .overview-top-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
