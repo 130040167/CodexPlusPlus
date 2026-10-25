@@ -27,6 +27,7 @@ import {
   BookOpen,
   CheckCircle2,
   ChevronDown,
+  ChevronRight,
   Camera,
   CircleHelp,
   Copy,
@@ -53,6 +54,7 @@ import {
   MoreHorizontal,
   PackageOpen,
   FileCode2,
+  FolderOpen,
   Moon,
   MousePointerClick,
   Network,
@@ -66,6 +68,7 @@ import {
   Save,
   Search,
   Settings,
+  Sparkles,
   ShieldCheck,
   ShieldAlert,
   Star,
@@ -75,12 +78,17 @@ import {
   TestTube,
   Trash2,
   Wrench,
+  ArrowUp,
+  AppWindow,
+  Bug,
+  Server,
+  Tag,
   type LucideIcon,
 } from "lucide-react";
 import { createPresetPatch } from "@/components/ProviderPresetSelector";
 import { PRESETS, type ProviderPreset } from "./presets";
 import { createPortal } from "react-dom";
-import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
 
 import { Badge as UiBadge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -194,7 +202,7 @@ import { relayHeadersValidationMessage, serializeRelayHeaders } from "./relay-he
 import { sessionProviderForProtocol } from "./relay-session";
 import { usePopoverLayer } from "./use-popover-layer";
 import { resolveAnchoredMenuLayout, type AnchoredMenuLayout } from "./popover-layer";
-import { resolveProviderName } from "./provider-name";
+import { providerAvatarText, resolveProviderName } from "./provider-name";
 import {
   providerSyncStreamPercent,
   resolveProviderSyncCompletion,
@@ -350,6 +358,7 @@ type BackendSettings = WhaleBalanceSettings & {
   codexAppPluginMarketplaceUnlock: boolean;
   codexAppModelWhitelistUnlock: boolean;
   codexAppSessionDelete: boolean;
+  codexAppSideChatSave: boolean;
   codexAppMarkdownExport: boolean;
   codexAppUsageStatusLine: boolean;
   codexAppPasteFix: boolean;
@@ -379,6 +388,7 @@ type BackendSettings = WhaleBalanceSettings & {
   /** 本地协议代理单次请求体上限（MiB，32~512，默认 128）。与 Rust `helper_max_request_body_mib` 对应。 */
   helperMaxRequestBodyMib: number;
   codexAppCapacityAutoRetry: boolean;
+  codexAppTurnRewind: boolean;
   codexAppStepwiseEnabled: boolean;
   codexAppAnswerOutlineEnabled: boolean;
   codexAppStepwiseDirectSend: boolean;
@@ -1169,6 +1179,9 @@ type StartupResult = CommandResult<{
 /** 左侧 Agent 切换栏的工具标识。后端 `list_tools` 返回同名字符串。 */
 type ToolId = string;
 
+/** Codex++ 自己的 logo：与应用图标（src-tauri/icons/icon.png）同一张图。 */
+const APP_LOGO_URL = new URL("./assets/codex-plus-logo.png", import.meta.url).href;
+
 /** 品牌图标随应用打包，来源和许可见 assets/agents/LICENSE.txt。 */
 const TOOL_ICONS: Record<string, string> = {
   codex: new URL("./assets/agents/chatgpt.svg", import.meta.url).href,
@@ -1248,6 +1261,8 @@ const navigationSections: Array<{ label: string; routes: Route[]; placement?: "b
  * 所以和 Agent 协作一样放在这里，而不是重复出现在每个 Agent 的「扩展」分组里。
  */
 const globalNavigationRoutes: Route[] = ["recommendations", "agentCache", "agentCollaboration", "computerUse", "about", "settings"];
+// 最左栏里跟 Agent 图标排在一组的全局页（Computer Use 服务于所有 Agent），其余全局页放在底部。
+const railAgentGroupRoutes: Route[] = ["computerUse"];
 
 const defaultSettings: BackendSettings = {
   ...defaultWhaleBalanceSettings(),
@@ -1269,6 +1284,7 @@ const defaultSettings: BackendSettings = {
   codexAppPluginMarketplaceUnlock: true,
   codexAppModelWhitelistUnlock: true,
   codexAppSessionDelete: true,
+  codexAppSideChatSave: false,
   codexAppMarkdownExport: true,
   codexAppUsageStatusLine: true,
   codexAppPasteFix: false,
@@ -1292,6 +1308,7 @@ const defaultSettings: BackendSettings = {
   protocolProxyMapUnlistedModels: false,
   helperMaxRequestBodyMib: 128,
   codexAppCapacityAutoRetry: false,
+  codexAppTurnRewind: false,
   codexAppStepwiseEnabled: false,
   codexAppAnswerOutlineEnabled: false,
   codexAppStepwiseDirectSend: false,
@@ -2884,6 +2901,27 @@ export function App() {
     return null;
   };
 
+  /// 自动保存：不弹成功提示；校验不过就不保存，把原因交给页面显示，避免输入到一半就弹窗。
+  ///
+  /// 保存期间用户又改了表单时，保留新草稿、只同步版本号（否则下一次保存会撞版本冲突），
+  /// 草稿仍是「有修改」，由页面下一轮再存。
+  const autoSaveSettings = async (snapshot: BackendSettings): Promise<AutoSaveOutcome> => {
+    const normalized = normalizeSettings(snapshot);
+    const issue = whaleBalanceValidationMessage(whaleBalanceSettingsIssue(normalized))
+      || dictationSettingsValidationMessage(dictationSettingsIssue(normalized.dictation));
+    if (issue) return { status: "invalid", message: issue };
+    try {
+      const result = await call<SettingsResult>("save_settings", { settings: normalized });
+      if (!isSuccessStatus(result.status)) return { status: "failed", message: result.message };
+      const saved = normalizeSettings(result.settings);
+      setSettings(result);
+      setSettingsForm((current) => (backendSettingsEqual(current, snapshot) ? saved : { ...current, revision: saved.revision }));
+      return { status: "saved" };
+    } catch (error) {
+      return { status: "failed", message: stringifyError(error) };
+    }
+  };
+
   const beginWeixinQrLogin = async () => {
     const result = await run(() => call<WeixinQrResult>("weixin_connect_qr_start", {
       baseUrl: settingsForm.weixinConnectBaseUrl,
@@ -3898,6 +3936,7 @@ export function App() {
       performUpdate,
       saveSettings,
       saveSettingsValue,
+      autoSaveSettings,
       refreshSettings,
       resetSettings,
       exportSettings,
@@ -4110,6 +4149,8 @@ export function App() {
         onSelect={(toolId) => void switchTool(toolId)}
         onNavigate={(next) => void navigate(next)}
         onToggleTheme={actions.toggleTheme}
+        pendingUpdateVersion={update?.updateAvailable && update.latestVersion ? update.latestVersion : null}
+        onOpenUpdate={() => { if (update) setUpdatePrompt(update); }}
       />
       {!isGlobalPage ? (
         <aside className="sidebar">
@@ -4602,6 +4643,8 @@ function ModelReasoningLevelsCell({
   );
 }
 
+type AutoSaveOutcome = { status: "saved" } | { status: "invalid" | "failed"; message: string };
+
 type Actions = {
   refreshCurrent: () => Promise<void>;
   launch: () => Promise<void>;
@@ -4619,6 +4662,7 @@ type Actions = {
   performUpdate: () => Promise<void>;
   saveSettings: () => Promise<void>;
   saveSettingsValue: (settings: BackendSettings, silent?: boolean) => Promise<BackendSettings | null>;
+  autoSaveSettings: (settings: BackendSettings) => Promise<AutoSaveOutcome>;
   refreshSettings: (silent?: boolean) => Promise<BackendSettings | null>;
   resetSettings: () => Promise<void>;
   exportSettings: () => Promise<void>;
@@ -5332,19 +5376,19 @@ function OverviewScreen({
             <CardContent>
               <div className="health-grid overview-health-grid">
                 <div className={`health-item ${overview?.codex_version ? "ok" : "needs-fix"}`}>
-                  {overview?.codex_version ? <CheckCircle2 className="h-4 w-4" /> : <Bell className="h-4 w-4" />}
+                  <span className={`health-icon ${overview?.codex_version ? "good" : "warn"}`}><Tag className="h-4 w-4" /></span>
                   <div>
                     <strong>{t("Codex 版本")}</strong>
-                    <span>{overview?.codex_version ?? t("未检测到 Codex 应用版本。")}</span>
+                    <span title={overview?.codex_version ?? undefined}>{overview?.codex_version ?? t("未检测到 Codex 应用版本。")}</span>
                   </div>
                   <Badge status={overview?.codex_version ? "ok" : "not_checked"} />
                 </div>
                 {health.map((item) => (
                   <div className={`health-item ${item.ok ? "ok" : "needs-fix"}`} key={item.title}>
-                    {item.ok ? <CheckCircle2 className="h-4 w-4" /> : <Bell className="h-4 w-4" />}
+                    <span className={`health-icon ${statusClass(item.status)}`}><item.icon className="h-4 w-4" /></span>
                     <div>
                       <strong>{item.title}</strong>
-                      <span>{item.detail}</span>
+                      <span title={item.detail}>{item.detail}</span>
                     </div>
                     <Badge status={item.status} />
                   </div>
@@ -5491,31 +5535,21 @@ function ProxySettingsScreen({
       <Panel>
         <CardHead
           title={t("本地协议代理")}
-          detail={t("需要协议转换、聚合或请求避震时随 Codex++ 常驻；Codex 退出不影响，退出 Codex++ 才关闭")}
+          detail={t("需要协议转换、聚合或请求避震时随 Codex++ 常驻；退出 Codex++ 才关闭")}
         />
-        <CardContent className="settings-content">
-          <div className="status-table">
-            <StatusRow
-              title={t("本地服务器状态")}
-              status={localServer?.status ?? "not_checked"}
-              path={localServer?.address || "http://127.0.0.1:57321"}
-            />
-            <StatusRow
-              title={t("协议转换")}
-              status={conversionEnabled ? "ok" : "disabled"}
-              path={conversionEnabled ? t("协议转换已启用") : t("未启用")}
-            />
-            <StatusRow
-              title={t("调试连接状态")}
-              status={debuggerState?.status ?? "not_checked"}
-              path={debuggerState?.address ?? null}
-            />
+        <CardContent className="settings-content setting-rows">
+          {/* 与概览页健康检查同一套带图标状态卡。 */}
+          <div className="health-grid overview-health-grid proxy-status-grid">
+            {healthItems(overview)
+              .filter((item) => item.title !== t("Codex 应用"))
+              .map((item) => <HealthTile item={item} key={item.title} />)}
           </div>
-          <p className="field-hint">
-            {t("本地代理地址由 Codex++ 写入 config.toml；切换供应商或修改协议后重启 Codex 生效。")}
-          </p>
-          <div className="form-row">
-            <Field label={t("请求体上限（MiB）")}>
+          <SettingRow
+            title={t("请求体上限")}
+            description={t("长上下文会话超过上限会报 413；调大会增加本地代理的内存占用。")}
+            detail={t("默认 128 MiB，可填 32~512。长上下文会话（1M 窗口 + 截图历史）的请求体会超过旧的 32 MiB 硬上限并触发 413；调大后本地代理处理单次请求的内存占用也会增加。保存后立即对本地代理生效；环境变量 CODEX_PLUS_MAX_HTTP_BODY_BYTES（字节）优先于本设置。")}
+          >
+            <div className="setting-input-unit">
               <Input
                 max={512}
                 min={32}
@@ -5529,128 +5563,129 @@ function ProxySettingsScreen({
                   })
                 }
               />
-            </Field>
-          </div>
-          <p className="field-hint">
-            {t("默认 128 MiB，可填 32~512。长上下文会话（1M 窗口 + 截图历史）的请求体会超过旧的 32 MiB 硬上限并触发 413；调大后本地代理处理单次请求的内存占用也会增加。保存后立即对本地代理生效；环境变量 CODEX_PLUS_MAX_HTTP_BODY_BYTES（字节）优先于本设置。")}
+              <span>MiB</span>
+            </div>
+          </SettingRow>
+          <p className="setting-footnote">
+            {t("本地代理地址由 Codex++ 写入 config.toml；切换供应商或修改协议后重启 Codex 生效。")}
           </p>
         </CardContent>
       </Panel>
 
       <Panel>
-        <CardHead
-          title={t("请求避震")}
+        <SwitchPanelHead
+          checked={form.protocolProxyAutoRetry}
           detail={t("在本地代理内消化上游过载与限流，尽量不把错误交给 Codex")}
+          label={t("启用请求避震")}
+          onChange={(checked) => onFormChange({ ...form, protocolProxyAutoRetry: checked })}
+          title={t("请求避震")}
         />
-        <CardContent className="settings-content">
-          <div className="settings-block">
-            <label className="check-row">
-              <input
-                checked={form.protocolProxyAutoRetry}
-                onChange={(event) =>
-                  onFormChange({ ...form, protocolProxyAutoRetry: event.currentTarget.checked })
-                }
-                type="checkbox"
-              />
-              <span>{t("启用请求避震")}</span>
-            </label>
-            <p className="field-hint">
-              {t("仅作用于经过本地协议代理的请求：自动重试 200 流内的过载/容量错误，以及下方选择的 HTTP 状态码。")}
-            </p>
-            <div className="form-row">
-              <Field label={t("最多自动重试次数")}>
-                <Input
-                  max={20}
-                  min={0}
-                  type="number"
-                  value={form.protocolProxyAutoRetryMaxAttempts}
-                  onChange={(event) =>
-                    onFormChange({
-                      ...form,
-                      protocolProxyAutoRetryMaxAttempts: clampNumber(
-                        Number(event.currentTarget.value),
-                        0,
-                        20,
-                      ),
-                    })
-                  }
-                />
-              </Field>
-              <Field label={t("首次重试间隔（秒）")}>
-                <Input
-                  max={30}
-                  min={0}
-                  type="number"
-                  value={form.protocolProxyAutoRetryIntervalSeconds}
-                  onChange={(event) =>
-                    onFormChange({
-                      ...form,
-                      protocolProxyAutoRetryIntervalSeconds: clampNumber(
-                        Number(event.currentTarget.value),
-                        0,
-                        30,
-                      ),
-                    })
-                  }
-                />
-              </Field>
-            </div>
-            <p className="field-hint">
-              {t("之后按 2 倍退避，单次最长 30 秒；有 Retry-After 时优先采用。")}
-            </p>
-            {/* 不能用 Field：它是 <label>。WebKit 里被点的标签按钮已被 React 移除后，
-                label 会把这次点击转发给它的第一个按钮，一次删掉两个状态码。 */}
-            <div className="field text-sm font-medium leading-none" role="group" aria-label={t("重试的 HTTP 状态码")}>
-              <span>{t("重试的 HTTP 状态码")}</span>
-              <div className="retry-status-editor">
-                <div className="retry-status-list">
-                  {form.protocolProxyAutoRetryStatusCodes.map((status) => (
-                    <button
-                      key={status}
-                      className="retry-status-chip"
-                      onClick={() =>
-                        setRetryStatusCodes(
-                          form.protocolProxyAutoRetryStatusCodes.filter((item) => item !== status),
-                        )
-                      }
-                      title={t("点击移除")}
-                      type="button"
-                    >
-                      {status} ×
-                    </button>
-                  ))}
-                </div>
-                <div className="retry-status-input-row">
+        <CardContent className="settings-content setting-rows">
+          {form.protocolProxyAutoRetry ? (
+            <>
+              <SettingRow title={t("最多自动重试次数")} description={t("0–20 次；次数用尽后把错误交给 Codex。")}>
+                <div className="setting-input-unit">
                   <Input
-                    aria-label={t("输入状态码后回车")}
-                    inputMode="numeric"
-                    placeholder={t("输入状态码后回车，如 429")}
-                    value={retryStatusInput}
-                    onChange={(event) => setRetryStatusInput(event.currentTarget.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        event.preventDefault();
-                        addRetryStatusCodes();
-                      }
-                    }}
-                  />
-                  <Button
-                    onClick={() =>
-                      setRetryStatusCodes([...form.protocolProxyAutoRetryStatusCodes, ...COMMON_RETRY_STATUS_CODES])
+                    max={20}
+                    min={0}
+                    type="number"
+                    value={form.protocolProxyAutoRetryMaxAttempts}
+                    onChange={(event) =>
+                      onFormChange({
+                        ...form,
+                        protocolProxyAutoRetryMaxAttempts: clampNumber(
+                          Number(event.currentTarget.value),
+                          0,
+                          20,
+                        ),
+                      })
                     }
-                    type="button"
-                    variant="outline"
-                  >
-                    {t("填入常用")}
-                  </Button>
+                  />
+                  <span>{t("次")}</span>
                 </div>
-              </div>
-            </div>
-            <p className="field-hint">
-              {t("命中时退避重发，次数用尽后把错误交给 Codex。默认不选；常用 429（限流）和 5xx（服务端故障）。")}
-            </p>
-            <div className="form-row">
-              <Field label={t("避震模式")}>
+              </SettingRow>
+              <SettingRow title={t("首次重试间隔")} description={t("之后按 2 倍退避，单次最长 30 秒；有 Retry-After 时优先采用。")}>
+                <div className="setting-input-unit">
+                  <Input
+                    max={30}
+                    min={0}
+                    type="number"
+                    value={form.protocolProxyAutoRetryIntervalSeconds}
+                    onChange={(event) =>
+                      onFormChange({
+                        ...form,
+                        protocolProxyAutoRetryIntervalSeconds: clampNumber(
+                          Number(event.currentTarget.value),
+                          0,
+                          30,
+                        ),
+                      })
+                    }
+                  />
+                  <span>{t("秒")}</span>
+                </div>
+              </SettingRow>
+              {/* 状态码编辑不能放进 <label>（Field）：WebKit 会把点击转发给第一个按钮，一次删掉两个状态码。 */}
+              <SettingRow
+                stacked
+                title={t("重试的 HTTP 状态码")}
+                description={t("命中时退避重发。默认不选；常用 429（限流）和 5xx（服务端故障）。")}
+              >
+                <div role="group" aria-label={t("重试的 HTTP 状态码")}>
+                  <div className="retry-status-editor">
+                    <div className="retry-status-list">
+                      {form.protocolProxyAutoRetryStatusCodes.map((status) => (
+                        <button
+                          key={status}
+                          className="retry-status-chip"
+                          onClick={() =>
+                            setRetryStatusCodes(
+                              form.protocolProxyAutoRetryStatusCodes.filter((item) => item !== status),
+                            )
+                          }
+                          title={t("点击移除")}
+                          type="button"
+                        >
+                          {status} ×
+                        </button>
+                      ))}
+                    </div>
+                    <div className="retry-status-input-row">
+                      <Input
+                        aria-label={t("输入状态码后回车")}
+                        inputMode="numeric"
+                        placeholder={t("输入状态码后回车，如 429")}
+                        value={retryStatusInput}
+                        onChange={(event) => setRetryStatusInput(event.currentTarget.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            addRetryStatusCodes();
+                          }
+                        }}
+                      />
+                      <Button
+                        onClick={() =>
+                          setRetryStatusCodes([...form.protocolProxyAutoRetryStatusCodes, ...COMMON_RETRY_STATUS_CODES])
+                        }
+                        type="button"
+                        variant="outline"
+                      >
+                        {t("填入常用")}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              </SettingRow>
+              <SettingRow
+                title={t("避震模式")}
+                description={form.protocolProxyAutoRetryMode === "buffered"
+                  ? t("始终由代理重试，但要等整段生成完才显示。")
+                  : form.protocolProxyAutoRetryMode === "streaming-legacy"
+                    ? t("旧版流式行为，仅在新版有问题时使用。")
+                    : t("保留实时输出；正文出现前遇到过载由代理重试。")}
+                detail={t("流式：保留实时输出，正文提交前遇到过载由代理重试，之后交给 Codex；「首字提交延迟」为出现正文后再缓冲的时长，0 表示立即提交。整段缓冲：始终由代理重试，但要等整段生成完才显示。")}
+              >
                 <select
                   className="request-log-filter"
                   value={form.protocolProxyAutoRetryMode}
@@ -5670,53 +5705,52 @@ function ProxySettingsScreen({
                   <option value="streaming-legacy">{t("流式（旧行为）")}</option>
                   <option value="buffered">{t("整段缓冲")}</option>
                 </select>
-              </Field>
+              </SettingRow>
               {form.protocolProxyAutoRetryMode === "streaming" ? (
-                <Field label={t("首字提交延迟（毫秒）")}>
-                  <Input
-                    max={10000}
-                    min={0}
-                    step={100}
-                    type="number"
-                    value={form.protocolProxyAutoRetryCommitDelayMs}
-                    onChange={(event) =>
-                      onFormChange({
-                        ...form,
-                        protocolProxyAutoRetryCommitDelayMs: clampNumber(Number(event.currentTarget.value), 0, 10000),
-                      })
-                    }
-                  />
-                </Field>
+                <SettingRow title={t("首字提交延迟")} description={t("出现正文后再缓冲的时长，0 表示立即提交。")}>
+                  <div className="setting-input-unit">
+                    <Input
+                      max={10000}
+                      min={0}
+                      step={100}
+                      type="number"
+                      value={form.protocolProxyAutoRetryCommitDelayMs}
+                      onChange={(event) =>
+                        onFormChange({
+                          ...form,
+                          protocolProxyAutoRetryCommitDelayMs: clampNumber(Number(event.currentTarget.value), 0, 10000),
+                        })
+                      }
+                    />
+                    <span>ms</span>
+                  </div>
+                </SettingRow>
               ) : null}
-            </div>
-            <p className="field-hint">
-              {t("流式：保留实时输出，正文提交前遇到过载由代理重试，之后交给 Codex；「首字提交延迟」为出现正文后再缓冲的时长，0 表示立即提交。整段缓冲：始终由代理重试，但要等整段生成完才显示。")}
-            </p>
-          </div>
+              <p className="setting-footnote">
+                {t("仅作用于经过本地协议代理的请求：自动重试 200 流内的过载/容量错误，以及上面选择的 HTTP 状态码。")}
+              </p>
+            </>
+          ) : (
+            <p className="setting-footnote">{t("已关闭：上游过载或限流时，错误直接交给 Codex。")}</p>
+          )}
         </CardContent>
       </Panel>
 
       <Panel>
-        <CardHead
-          title={t("目录外模型映射")}
+        <SwitchPanelHead
+          checked={form.protocolProxyMapUnlistedModels}
           detail={t("把 Codex 后台任务的固定模型名改写为当前供应商的默认模型")}
+          label={t("改写目录外模型名")}
+          onChange={(checked) => onFormChange({ ...form, protocolProxyMapUnlistedModels: checked })}
+          title={t("目录外模型映射")}
         />
-        <CardContent className="settings-content">
-          <div className="settings-block">
-            <label className="check-row">
-              <input
-                checked={form.protocolProxyMapUnlistedModels}
-                onChange={(event) =>
-                  onFormChange({ ...form, protocolProxyMapUnlistedModels: event.currentTarget.checked })
-                }
-                type="checkbox"
-              />
-              <span>{t("改写目录外模型名")}</span>
-            </label>
-            <p className="field-hint">
-              {t("Codex 的自动审查（codex-auto-review）与标题/摘要等后台任务固定使用 gpt-* 等内部模型名，不经选模；第三方上游没有这些名字，原样转发只会报「模型不存在」并可能反复消耗额度。开启后，不在当前供应商模型列表里的请求模型会改写为该供应商的默认模型再转发（#1183 / #1446 / #1457）；官方登录与聚合供应商不受影响，已配置「自动审批模型」时 codex-auto-review 仍按该配置改写。默认关闭：开启后手填但未写进模型列表的模型也会被改写，请先把要用的模型都加进列表。")}
-            </p>
-          </div>
+        <CardContent className="settings-content setting-rows">
+          <p className="setting-footnote" title={t("Codex 的自动审查（codex-auto-review）与标题/摘要等后台任务固定使用 gpt-* 等内部模型名，不经选模；第三方上游没有这些名字，原样转发只会报「模型不存在」并可能反复消耗额度。开启后，不在当前供应商模型列表里的请求模型会改写为该供应商的默认模型再转发（#1183 / #1446 / #1457）；官方登录与聚合供应商不受影响，已配置「自动审批模型」时 codex-auto-review 仍按该配置改写。默认关闭：开启后手填但未写进模型列表的模型也会被改写，请先把要用的模型都加进列表。")}>
+            {t("自动审查、标题摘要等后台任务固定使用 gpt-* 内部模型名，第三方上游没有这些名字会报「模型不存在」。开启后，不在当前供应商模型列表里的模型会改写为该供应商的默认模型；官方登录与聚合供应商不受影响。")}
+          </p>
+          {form.protocolProxyMapUnlistedModels ? (
+            <p className="setting-warning">{t("注意：手填但没写进模型列表的模型也会被改写，请先把要用的模型都加进列表。")}</p>
+          ) : null}
         </CardContent>
       </Panel>
 
@@ -6265,7 +6299,7 @@ function RelayEnvironmentScreen({ result, actions }: { result: RelayEnvironmentR
 }
 
 function RelayScreen({
-  settings: _settings,
+  settings,
   relayFiles,
   envConflicts,
   ccsProviders,
@@ -6283,7 +6317,16 @@ function RelayScreen({
   const [detailProfileId, setDetailProfileId] = useState<string | null>(null);
   const [newProfileDraft, setNewProfileDraft] = useState<RelayProfile | null>(null);
   const [providerCatalogOpen, setProviderCatalogOpen] = useState(false);
-  const [providerView, setProviderView] = useState<ProviderViewKind>("direct");
+  // 目录页的搜索词放在这里：从模板进入编辑页再返回时，目录页会重新挂载，搜索不能丢。
+  const [providerCatalogQuery, setProviderCatalogQuery] = useState("");
+  // 进入时停在当前供应商所在的分区；找不到当前供应商时，没有直连项就展示协议转换分区。
+  const initialProviderView = (): ProviderViewKind => {
+    const active = normalized.relayProfiles.find((profile) => profile.id === normalized.activeRelayId);
+    if (active) return relayProviderView(active);
+    const views = normalized.relayProfiles.map(relayProviderView);
+    return !views.includes("direct") && views.includes("routing") ? "routing" : "direct";
+  };
+  const [providerView, setProviderView] = useState<ProviderViewKind>(initialProviderView);
   const [newAggregateMode, setNewAggregateMode] = useState<AggregateMode | null>(null);
   const [thirdPartyImportOpen, setThirdPartyImportOpen] = useState(false);
   const thirdPartyImportTriggerRef = useRef<HTMLDivElement>(null);
@@ -6291,6 +6334,8 @@ function RelayScreen({
   const [ccsDbPathDraft, setCcsDbPathDraft] = useState(normalized.ccsDbPath);
   const [ccsPathSaving, setCcsPathSaving] = useState(false);
   const [ccsBindings, setCcsBindings] = useState<Record<string, string>>({});
+  // 路径草稿与已保存的不一致时，列表还是旧库的：先「应用」才能导入。
+  const ccsPathDirty = ccsDbPathDraft.trim() !== normalized.ccsDbPath;
   useEffect(() => setCcsDbPathDraft(normalized.ccsDbPath), [normalized.ccsDbPath]);
   const saveCcsDbPath = async (path = ccsDbPathDraft) => {
     setCcsPathSaving(true);
@@ -6349,18 +6394,12 @@ function RelayScreen({
     setProviderView(view);
   };
   useEffect(() => {
-    // 协议转换供应商归入独立分区；首次打开时如果没有直连项，直接展示该分区。
+    // 设置读回之前表单是默认值（自带一个 default 供应商），不能据此定分区。
     if (providerViewAutoSelectedRef.current) return;
-    if (!normalized.relayProfiles.length) return;
+    if (!settings || !normalized.relayProfiles.length) return;
     providerViewAutoSelectedRef.current = true;
-    if (
-      providerView === "direct"
-      && !normalized.relayProfiles.some((profile) => relayProviderView(profile) === "direct")
-      && normalized.relayProfiles.some((profile) => relayProviderView(profile) === "routing")
-    ) {
-      setProviderView("routing");
-    }
-  }, [normalized.relayProfiles, providerView]);
+    setProviderView(initialProviderView());
+  }, [settings, normalized.relayProfiles, normalized.activeRelayId]);
   // 分页仅控制渲染。卡片的删除、复制和排序必须基于完整配置，避免隐藏的
   // 当前供应商被 syncLegacyRelayFields 当成不存在，改写成直连列表第一项。
   const switchRelayProfileFromList = (profileId: string) => {
@@ -6432,16 +6471,20 @@ function RelayScreen({
         form={normalized}
         isNew={isNewProfile}
         initialAggregateMode={isNewProfile ? newAggregateMode : null}
+        // 从目录页选模板进来时目录页状态还开着：返回只清掉草稿，回到目录页继续挑。
         onBack={() => {
           setNewProfileDraft(null);
           setNewAggregateMode(null);
           setDetailProfileId(null);
         }}
         onFormChange={saveRelaySettings}
+        // 保存后回到供应商列表，目录页一并关掉。
         onSaved={() => {
           setNewProfileDraft(null);
           setNewAggregateMode(null);
           setDetailProfileId(null);
+          setProviderCatalogOpen(false);
+          setProviderCatalogQuery("");
         }}
         actions={actions}
       />
@@ -6452,11 +6495,16 @@ function RelayScreen({
     return (
       <ProviderCatalogScreen
         form={normalized}
-        onBack={() => setProviderCatalogOpen(false)}
+        query={providerCatalogQuery}
+        onQueryChange={setProviderCatalogQuery}
+        onBack={() => {
+          setProviderCatalogOpen(false);
+          setProviderCatalogQuery("");
+        }}
+        // 不关目录页：编辑页优先渲染，从编辑页返回时回到这里而不是供应商列表。
         onSelect={(profile) => {
           setNewProfileDraft(profile);
           setNewAggregateMode(null);
-          setProviderCatalogOpen(false);
         }}
       />
     );
@@ -6506,43 +6554,77 @@ function RelayScreen({
                     }
                     : undefined}
                 >
-                  <label>
-                    {t("cc-switch 数据库路径")}
-                    <Input value={ccsDbPathDraft} onChange={(event) => setCcsDbPathDraft(event.currentTarget.value)} placeholder={t("留空使用默认路径")} />
-                  </label>
-                  <button disabled={ccsPathSaving} onClick={() => void selectCcsDatabase()} type="button">{t("选择数据库")}</button>
-                  <button disabled={ccsPathSaving} onClick={() => void saveCcsDbPath()} type="button">{t("保存路径并刷新")}</button>
-                  {ccsProviders && isSuccessStatus(ccsProviders.status) ? <span className="text-xs break-all">{t("实际来源")}：{ccsProviders.dbPath}</span> : null}
-                  {ccsProviders?.fallbackReason ? <span className="text-xs break-all">{ccsProviders.fallbackReason}</span> : null}
+                  <div className="third-party-import-head">
+                    <strong>{t("从 cc-switch 导入")}</strong>
+                    <small>{t("只读取 cc-switch 的数据库，不会改动它。")}</small>
+                  </div>
+                  <div className="third-party-import-source">
+                    <div className="third-party-import-path">
+                      <Input
+                        aria-label={t("cc-switch 数据库路径")}
+                        onChange={(event) => setCcsDbPathDraft(event.currentTarget.value)}
+                        placeholder={t("默认 ~/.cc-switch/cc-switch.db")}
+                        value={ccsDbPathDraft}
+                      />
+                      <Button disabled={ccsPathSaving} onClick={() => void selectCcsDatabase()} size="sm" title={t("选择数据库")} variant="secondary">
+                        <FolderOpen className="h-4 w-4" />
+                        {t("选择")}
+                      </Button>
+                      {ccsPathDirty ? (
+                        <Button disabled={ccsPathSaving} onClick={() => void saveCcsDbPath()} size="sm">
+                          {ccsPathSaving ? t("应用中") : t("应用")}
+                        </Button>
+                      ) : null}
+                    </div>
+                    {ccsProviders && isSuccessStatus(ccsProviders.status) ? (
+                      <small className="third-party-import-meta" title={ccsProviders.dbPath}>{t("实际来源")}：{ccsProviders.dbPath}</small>
+                    ) : null}
+                    {ccsProviders?.fallbackReason ? <small className="third-party-import-warning">{ccsProviders.fallbackReason}</small> : null}
+                  </div>
                   {/* 供应商列表单独滚动：cc-switch 里几十个供应商时，底部按钮仍然可见可点（issue #1906）。 */}
                   <div className="third-party-import-list">
-                    {ccsProviders?.providers.map((provider) => <label key={provider.sourceId}>
-                      {provider.name}
-                      <select value={ccsBindings[provider.sourceId] || ""} onChange={(event) => setCcsBindings((current) => ({ ...current, [provider.sourceId]: event.currentTarget.value }))}>
-                        <option value="">{t("自动识别来源或新增")}</option>
-                        {normalized.relayProfiles.map((profile) => <option key={profile.id} value={profile.id}>{t("关联已有")}：{profile.name}</option>)}
-                      </select>
-                    </label>)}
+                    {ccsProviders?.providers.length ? (
+                      <div className="third-party-import-list-head">
+                        <span>{tf("Codex 供应商 {0} 个", [ccsProviders.providers.length])}</span>
+                        <span>{t("导入为")}</span>
+                      </div>
+                    ) : (
+                      <p className="third-party-import-empty">{ccsProviderSummary(ccsProviders)}</p>
+                    )}
+                    {ccsProviders?.providers.map((provider) => (
+                      <label className="third-party-import-row" key={provider.sourceId}>
+                        <span className="third-party-import-name">
+                          <strong title={provider.name}>{provider.name}</strong>
+                          <small title={provider.baseUrl}>{urlHost(provider.baseUrl) || t("未填写地址")}</small>
+                        </span>
+                        <select
+                          aria-label={tf("{0} 导入为", [provider.name])}
+                          onChange={(event) => setCcsBindings((current) => ({ ...current, [provider.sourceId]: event.currentTarget.value }))}
+                          value={ccsBindings[provider.sourceId] || ""}
+                        >
+                          <option value="">{t("新增（同名自动关联）")}</option>
+                          {normalized.relayProfiles.map((profile) => <option key={profile.id} value={profile.id}>{t("关联已有")}：{profile.name}</option>)}
+                        </select>
+                      </label>
+                    ))}
                   </div>
                   <div className="third-party-import-actions">
-                    <button
-                      disabled={ccsPathSaving || ccsDbPathDraft.trim() !== normalized.ccsDbPath || !ccsProviders?.providers.length}
-                      onClick={() => {
-                        setThirdPartyImportOpen(false);
-                        void actions.importCcsProviders(ccsBindings);
-                      }}
-                      type="button"
-                    >
-                      <strong>ccswitch</strong>
-                      <span>{ccsProviderSummary(ccsProviders)}</span>
-                    </button>
-                    <button
-                      onClick={() => void actions.refreshCcsProviders()}
-                      type="button"
-                    >
-                      <RefreshCw className="h-4 w-4" />
-                      {t("刷新列表")}
-                    </button>
+                    {ccsPathDirty ? <small className="third-party-import-warning">{t("路径已修改，点「应用」读取新数据库后再导入。")}</small> : null}
+                    <div className="third-party-import-footer">
+                      <Button aria-label={t("刷新列表")} onClick={() => void actions.refreshCcsProviders()} size="icon" title={t("刷新列表")} variant="ghost">
+                        <RefreshCw className="h-4 w-4" />
+                      </Button>
+                      <Button
+                        disabled={ccsPathSaving || ccsPathDirty || !ccsProviders?.providers.length}
+                        onClick={() => {
+                          setThirdPartyImportOpen(false);
+                          void actions.importCcsProviders(ccsBindings);
+                        }}
+                      >
+                        <Download className="h-4 w-4" />
+                        {ccsProviders?.providers.length ? tf("导入 {0} 个供应商", [ccsProviders.providers.length]) : t("导入")}
+                      </Button>
+                    </div>
                   </div>
                 </div>
               ) : null}
@@ -6560,80 +6642,85 @@ function RelayScreen({
           <EnvConflictNotice envConflicts={envConflicts} actions={actions} />
           {!normalized.relayProfilesEnabled ? (
             <p className="relay-switch-off-note" role="status">
-              {t("供应商配置切换已关闭：点「使用」不会写入 Codex 的 config.toml / auth.json。需要切换时打开右上角的「配置切换」。")}
+              {t("供应商配置切换已关闭：Codex++ 不会写入 Codex 的 config.toml / auth.json，供应商列表已隐藏。需要切换时打开右上角的「配置切换」。")}
             </p>
           ) : null}
-          <div className="provider-view-tabs" role="tablist" aria-label={t("供应商配置模式")}>
-            <button aria-selected={providerView === "direct"} className={providerView === "direct" ? "active" : ""} onClick={() => selectProviderView("direct")} role="tab" title={t("直接访问 Responses API 供应商：只写入 Base URL 与 Key，不做协议转换。")} type="button">
-              <Cable className="h-4 w-4" />
-              <span>{t("直连")}</span>
-              <CircleHelp className="provider-view-help" size={13} />
-            </button>
-            <button aria-selected={providerView === "modelAggregation"} className={providerView === "modelAggregation" ? "active" : ""} onClick={() => selectProviderView("modelAggregation")} role="tab" title={t("把成员模型合并到 Codex 模型列表，带供应商前缀的模型固定发送到对应成员。")} type="button">
-              <Layers3 className="h-4 w-4" />
-              <span>{t("模型聚合")}</span>
-              <CircleHelp className="provider-view-help" size={13} />
-            </button>
-            <button aria-selected={providerView === "routing"} className={providerView === "routing" ? "active" : ""} onClick={() => selectProviderView("routing")} role="tab" title={t("供应商只支持 Chat Completions（或配置了模型路由）：由本地协议代理转换后转发。")} type="button">
-              <GitBranch className="h-4 w-4" />
-              <span>{t("需协议转换")}</span>
-              <CircleHelp className="provider-view-help" size={13} />
-            </button>
-            <button aria-selected={providerView === "failover"} className={providerView === "failover" ? "active" : ""} onClick={() => selectProviderView("failover")} role="tab" title={t("多个供应商组成请求池，支持失败切换、会话轮转、请求轮转与权重；成员可以是 API 供应商或官方登录账号。")} type="button">
-              <ArrowRightLeft className="h-4 w-4" />
-              <span>{t("故障转移")}</span>
-              <CircleHelp className="provider-view-help" size={13} />
-            </button>
-          </div>
-          {providerView === "direct" && !visibleProfiles.length ? (
-            <div className="provider-aggregate-empty">
-              <strong>{t("这个分页还没有直连供应商")}</strong>
-              <span>{t("直连分页只显示 Responses 直连且未配置模型路由的供应商；其他供应商在其余分页，配置不会丢失。")}</span>
-              <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>{t("添加供应商")}</Button>
-            </div>
+          {/* 总开关关闭时供应商切换不会写入 Codex：分页和列表都没有意义，整块隐藏，只留上方提示条。 */}
+          {normalized.relayProfilesEnabled ? (
+            <>
+            <div className="provider-view-tabs" role="tablist" aria-label={t("供应商配置模式")}>
+                <button aria-selected={providerView === "direct"} className={providerView === "direct" ? "active" : ""} onClick={() => selectProviderView("direct")} role="tab" title={t("直接访问 Responses API 供应商：只写入 Base URL 与 Key，不做协议转换。")} type="button">
+                  <Cable className="h-4 w-4" />
+                  <span>{t("直连")}</span>
+                  <CircleHelp className="provider-view-help" size={13} />
+                </button>
+                <button aria-selected={providerView === "modelAggregation"} className={providerView === "modelAggregation" ? "active" : ""} onClick={() => selectProviderView("modelAggregation")} role="tab" title={t("把成员模型合并到 Codex 模型列表，带供应商前缀的模型固定发送到对应成员。")} type="button">
+                  <Layers3 className="h-4 w-4" />
+                  <span>{t("模型聚合")}</span>
+                  <CircleHelp className="provider-view-help" size={13} />
+                </button>
+                <button aria-selected={providerView === "routing"} className={providerView === "routing" ? "active" : ""} onClick={() => selectProviderView("routing")} role="tab" title={t("供应商只支持 Chat Completions（或配置了模型路由）：由本地协议代理转换后转发。")} type="button">
+                  <GitBranch className="h-4 w-4" />
+                  <span>{t("需协议转换")}</span>
+                  <CircleHelp className="provider-view-help" size={13} />
+                </button>
+                <button aria-selected={providerView === "failover"} className={providerView === "failover" ? "active" : ""} onClick={() => selectProviderView("failover")} role="tab" title={t("多个供应商组成请求池，支持失败切换、会话轮转、请求轮转与权重；成员可以是 API 供应商或官方登录账号。")} type="button">
+                  <ArrowRightLeft className="h-4 w-4" />
+                  <span>{t("故障转移")}</span>
+                  <CircleHelp className="provider-view-help" size={13} />
+                </button>
+              </div>
+              {providerView === "direct" && !visibleProfiles.length ? (
+                <div className="provider-aggregate-empty">
+                  <strong>{t("这个分页还没有直连供应商")}</strong>
+                  <span>{t("直连分页只显示 Responses 直连且未配置模型路由的供应商；其他供应商在其余分页，配置不会丢失。")}</span>
+                  <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>{t("添加供应商")}</Button>
+                </div>
+              ) : null}
+              {providerView === "routing" && !visibleProfiles.length ? (
+                <div className="provider-aggregate-empty">
+                  <strong>{t("这个分页还没有需协议转换的供应商")}</strong>
+                  <span>{t("Chat Completions 协议或配置了模型路由的供应商会显示在这里；其他供应商在其余分页。")}</span>
+                  <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>{t("添加供应商")}</Button>
+                </div>
+              ) : null}
+              {providerView === "failover" && !visibleProfiles.length ? (
+                <div className="provider-aggregate-empty">
+                  <strong>{t("还没有故障转移配置")}</strong>
+                  <span>{t("在编辑页勾选成员供应商，并选择失败切换、轮转或权重策略。")}</span>
+                  <Button onClick={() => createNewAggregateProfile("provider")}>{t("创建故障转移配置")}</Button>
+                </div>
+              ) : null}
+              {providerView === "modelAggregation" && !visibleProfiles.length ? (
+                <div className="provider-aggregate-empty">
+                  <strong>{t("还没有模型聚合配置")}</strong>
+                  <span>{t("把成员模型合并到 Codex 列表，选中模型会固定发送到对应供应商。")}</span>
+                  <Button onClick={() => createNewAggregateProfile("model")}>{t("创建模型聚合配置")}</Button>
+                </div>
+              ) : null}
+              {(providerView === "failover" || providerView === "modelAggregation") && visibleProfiles.length ? (
+                <div className="provider-aggregate-toolbar">
+                  <Button
+                    onClick={() => createNewAggregateProfile(providerView === "failover" ? "provider" : "model")}
+                    size="sm"
+                    variant="secondary"
+                  >
+                    <Plus className="h-4 w-4" />
+                    {providerView === "failover" ? t("新建故障转移") : t("新建模型聚合")}
+                  </Button>
+                </div>
+              ) : null}
+              <RelayProfileList
+                form={normalized}
+                visibleProfiles={visibleProfiles}
+                onEdit={(profileId) => void editRelayProfile(profileId)}
+                onFormChange={saveRelaySettings}
+                onSwitchProfile={switchRelayProfileFromList}
+                disabled={actions.relaySwitching}
+                actions={actions}
+              />
+            </>
           ) : null}
-          {providerView === "routing" && !visibleProfiles.length ? (
-            <div className="provider-aggregate-empty">
-              <strong>{t("这个分页还没有需协议转换的供应商")}</strong>
-              <span>{t("Chat Completions 协议或配置了模型路由的供应商会显示在这里；其他供应商在其余分页。")}</span>
-              <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>{t("添加供应商")}</Button>
-            </div>
-          ) : null}
-          {providerView === "failover" && !visibleProfiles.length ? (
-            <div className="provider-aggregate-empty">
-              <strong>{t("还没有故障转移配置")}</strong>
-              <span>{t("在编辑页勾选成员供应商，并选择失败切换、轮转或权重策略。")}</span>
-              <Button onClick={() => createNewAggregateProfile("provider")}>{t("创建故障转移配置")}</Button>
-            </div>
-          ) : null}
-          {providerView === "modelAggregation" && !visibleProfiles.length ? (
-            <div className="provider-aggregate-empty">
-              <strong>{t("还没有模型聚合配置")}</strong>
-              <span>{t("把成员模型合并到 Codex 列表，选中模型会固定发送到对应供应商。")}</span>
-              <Button onClick={() => createNewAggregateProfile("model")}>{t("创建模型聚合配置")}</Button>
-            </div>
-          ) : null}
-          {(providerView === "failover" || providerView === "modelAggregation") && visibleProfiles.length ? (
-            <div className="provider-aggregate-toolbar">
-              <Button
-                onClick={() => createNewAggregateProfile(providerView === "failover" ? "provider" : "model")}
-                size="sm"
-                variant="secondary"
-              >
-                <Plus className="h-4 w-4" />
-                {providerView === "failover" ? t("新建故障转移") : t("新建模型聚合")}
-              </Button>
-            </div>
-          ) : null}
-          <RelayProfileList
-            form={normalized}
-            visibleProfiles={visibleProfiles}
-            onEdit={(profileId) => void editRelayProfile(profileId)}
-            onFormChange={saveRelaySettings}
-            onSwitchProfile={switchRelayProfileFromList}
-            disabled={actions.relaySwitching}
-            actions={actions}
-          />
           </CardContent>
         </Panel>
       </div>
@@ -6788,14 +6875,17 @@ function CodexMultiLaunchScreen({
 
 function ProviderCatalogScreen({
   form,
+  query,
+  onQueryChange: setQuery,
   onBack,
   onSelect,
 }: {
   form: BackendSettings;
+  query: string;
+  onQueryChange: (value: string) => void;
   onBack: () => void;
   onSelect: (profile: RelayProfile) => void;
 }) {
-  const [query, setQuery] = useState("");
   const categories: Array<{ id: ProviderPreset["category"]; label: string }> = [
     { id: "official", label: t("账号登录") },
     { id: "cn_official", label: t("模型厂商") },
@@ -6830,30 +6920,36 @@ function ProviderCatalogScreen({
             value={query}
           />
         </div>
-        <div className="provider-add-results">
-          <button className="provider-add-result provider-add-custom-result" onClick={() => selectPreset()} type="button">
-            <span className="provider-add-icon">✦</span>
-            <span><strong>{t("自定义配置")}</strong><small>{t("手动填写请求地址和 API Key")}</small></span>
-          </button>
-        </div>
+        <button className="provider-add-custom" onClick={() => selectPreset()} type="button">
+          <span className="provider-add-icon"><Sparkles className="h-4 w-4" /></span>
+          <span className="provider-add-text">
+            <strong>{t("自定义配置")}</strong>
+            <small>{t("手动填写请求地址和 API Key，适合中转站和自建服务")}</small>
+          </span>
+          <ChevronRight className="provider-add-chevron h-4 w-4" />
+        </button>
         {categories.map((category) => {
           const presets = filteredPresets.filter((preset) => preset.category === category.id);
           if (!presets.length) return null;
           return (
             <section className="provider-add-section" key={category.id}>
-              <h3>{category.label}</h3>
+              <h3>{category.label}<span>{presets.length}</span></h3>
               <div className="provider-add-results">
                 {presets.map((preset) => (
-                  <button className="provider-add-result" key={preset.id} onClick={() => selectPreset(preset)} type="button">
-                    <span className="provider-add-icon">{preset.name.slice(0, 1).toUpperCase()}</span>
-                    <span><strong>{preset.name}</strong><small>{preset.websiteUrl ? new URL(preset.websiteUrl).host : preset.baseUrl}</small></span>
+                  <button className="provider-add-result" key={preset.id} onClick={() => selectPreset(preset)} title={preset.baseUrl} type="button">
+                    <span className="provider-add-icon">{providerInitial(preset.name)}</span>
+                    <span className="provider-add-text">
+                      <strong>{preset.name}</strong>
+                      <small>{urlHost(preset.websiteUrl || preset.baseUrl)}</small>
+                    </span>
+                    <span className="provider-add-protocol">{preset.protocol === "chatCompletions" ? "Chat" : "Responses"}</span>
                   </button>
                 ))}
               </div>
             </section>
           );
         })}
-        {!filteredPresets.length ? <div className="empty">{t("没有匹配的供应商")}</div> : null}
+        {!filteredPresets.length ? <div className="provider-add-empty">{tf("没有匹配「{0}」的预设，可以用上面的「自定义配置」手动填写。", [query.trim()])}</div> : null}
         <p className="provider-add-hint">{t("选择供应商后会进入编辑页；API Key 和本地配置只在保存时写入当前 Codex。")}</p>
       </main>
     </div>
@@ -7163,7 +7259,7 @@ function DictationSettingsPanel({ form, onFormChange }: {
             <Info className="h-4 w-4" />
             <span>{form.dictation.provider === "sensevoice"
               ? t("下载模型并保存配置后，可在 Codex 输入框录音，停止后在本机转写并插入文字。")
-              : t("保存后 Codex 输入框底部会显示麦克风图标，停止录音后可插入或发送文字。录音会发送到上面填写的服务地址，无需重启。")}</span>
+              : t("开启后 Codex 输入框底部会显示麦克风图标，停止录音后可插入或发送文字。录音会发送到上面填写的服务地址，无需重启。")}</span>
           </div>
         </div>
       </CardContent>
@@ -7297,6 +7393,82 @@ function StepwiseSettingsPanel({ form, onFormChange, actions }: {
   );
 }
 
+/** 增强页改动后多久自动保存：开关点完马上存，文本框停止输入后再存。 */
+const ENHANCE_AUTO_SAVE_DELAY_MS = 500;
+
+type AutoSaveState =
+  | { state: "idle" | "pending" | "saving" | "saved" }
+  | { state: "invalid" | "failed"; message: string; retry: () => void };
+
+/// 增强页的自动保存。
+///
+/// - 防抖：同一轮连续改动只存一次；
+/// - 同一时间只有一个保存在途，期间的改动等它回来后再存（App 会同步版本号并触发下一轮）；
+/// - 离开页面时还有没存的改动就立即补存一次，不丢草稿。
+function useEnhanceAutoSave(
+  dirty: boolean,
+  form: BackendSettings,
+  save: (settings: BackendSettings) => Promise<AutoSaveOutcome>,
+): AutoSaveState {
+  const [status, setStatus] = useState<AutoSaveState>({ state: "idle" });
+  const savingRef = useRef(false);
+  const latest = useRef({ dirty, form, save });
+  latest.current = { dirty, form, save };
+
+  const flush = useCallback(async () => {
+    if (savingRef.current) return;
+    const { dirty: pending, form: snapshot, save: persist } = latest.current;
+    if (!pending) return;
+    savingRef.current = true;
+    setStatus({ state: "saving" });
+    const outcome = await persist(snapshot);
+    savingRef.current = false;
+    setStatus(outcome.status === "saved"
+      ? { state: "saved" }
+      : { state: outcome.status, message: outcome.message, retry: () => void flush() });
+  }, []);
+
+  useEffect(() => {
+    if (!dirty) return;
+    setStatus((current) => (current.state === "saving" || current.state === "invalid" ? current : { state: "pending" }));
+    const timer = window.setTimeout(() => void flush(), ENHANCE_AUTO_SAVE_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [dirty, form, flush]);
+
+  useEffect(() => () => {
+    if (latest.current.dirty && !savingRef.current) void latest.current.save(latest.current.form);
+  }, []);
+
+  return status;
+}
+
+function AutoSaveStatus({ state }: { state: AutoSaveState }) {
+  if (state.state === "invalid" || state.state === "failed") {
+    return (
+      <>
+        <span className="is-error" role="alert" title={state.message}>
+          {state.state === "invalid" ? tf("未保存：{0}", [t(state.message)]) : tf("自动保存失败：{0}", [t(state.message)])}
+        </span>
+        {state.state === "failed" ? (
+          <Button onClick={state.retry} size="sm" variant="secondary">
+            <RefreshCw className="h-4 w-4" />
+            {t("重试")}
+          </Button>
+        ) : null}
+      </>
+    );
+  }
+  const label = state.state === "saving" ? t("正在保存…")
+    : state.state === "pending" ? t("即将自动保存…")
+      : t("改动会自动保存");
+  return (
+    <span className={state.state === "saved" || state.state === "idle" ? "" : "is-dirty"} role="status">
+      {state.state === "saved" ? <CheckCircle2 className="h-3.5 w-3.5" /> : null}
+      {state.state === "saved" ? t("已自动保存") : label}
+    </span>
+  );
+}
+
 function EnhanceScreen({
   dirty,
   activeTab,
@@ -7313,11 +7485,7 @@ function EnhanceScreen({
   actions: Actions;
 }) {
   const setEnhanceFlag = (key: keyof BackendSettings, value: boolean) => onFormChange({ ...form, [key]: value });
-  const setPersistedEnhanceFlag = (key: keyof BackendSettings, value: boolean) => {
-    const next = { ...form, [key]: value };
-    onFormChange(next);
-    void actions.saveSettingsValue(next, true);
-  };
+  const autoSave = useEnhanceAutoSave(dirty, form, actions.autoSaveSettings);
   const masterEnabled = form.enhancementsEnabled;
   const tabs: Array<{ value: EnhancementTab; label: string }> = [
     { value: "general", label: t("常用增强") },
@@ -7344,39 +7512,38 @@ function EnhanceScreen({
             </span>
             <ToggleVisual />
           </label>
-          <div className="enhance-save-actions">
-            <span className={dirty ? "is-dirty" : ""} role="status">{dirty ? t("有未保存修改") : t("已保存")}</span>
-            <Button disabled={!dirty} onClick={() => void actions.saveSettings()}>
-              <Save className="h-4 w-4" />
-              {t("保存增强设置")}
-            </Button>
-          </div>
         </div>
-        <div className="enhance-tabs" role="tablist" aria-label={t("Codex增强")}>
-          {tabs.map((tab, index) => (
-            <button
-              key={tab.value}
-              id={`enhance-tab-${tab.value}`}
-              type="button"
-              role="tab"
-              aria-selected={activeTab === tab.value}
-              aria-controls={`enhance-pane-${tab.value}`}
-              tabIndex={activeTab === tab.value ? 0 : -1}
-              onClick={() => selectTab(tab.value)}
-              onKeyDown={(event) => {
-                const nextIndex = event.key === "ArrowRight" ? (index + 1) % tabs.length
-                  : event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length
-                    : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : null;
-                if (nextIndex === null) return;
-                event.preventDefault();
-                const nextTab = tabs[nextIndex].value;
-                selectTab(nextTab);
-                document.getElementById(`enhance-tab-${nextTab}`)?.focus();
-              }}
-            >
-              {tab.label}
-            </button>
-          ))}
+        {/* 开关独占一行靠右；保存状态移到分页栏右侧。 */}
+        <div className="enhance-tabs-row">
+          <div className="enhance-tabs" role="tablist" aria-label={t("Codex增强")}>
+            {tabs.map((tab, index) => (
+              <button
+                key={tab.value}
+                id={`enhance-tab-${tab.value}`}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === tab.value}
+                aria-controls={`enhance-pane-${tab.value}`}
+                tabIndex={activeTab === tab.value ? 0 : -1}
+                onClick={() => selectTab(tab.value)}
+                onKeyDown={(event) => {
+                  const nextIndex = event.key === "ArrowRight" ? (index + 1) % tabs.length
+                    : event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length
+                      : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : null;
+                  if (nextIndex === null) return;
+                  event.preventDefault();
+                  const nextTab = tabs[nextIndex].value;
+                  selectTab(nextTab);
+                  document.getElementById(`enhance-tab-${nextTab}`)?.focus();
+                }}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+          <div className="enhance-save-actions">
+            <AutoSaveStatus state={autoSave} />
+          </div>
         </div>
       </div>
       <div className="enhance-tab-panel" id="enhance-pane-general" role="tabpanel" aria-labelledby="enhance-tab-general" hidden={activeTab !== "general"}>
@@ -7403,11 +7570,13 @@ function EnhanceScreen({
                 </> : null}
                 <FeatureToggle title={t("插件市场解锁")} detail={t("API Key 模式下扩展插件市场请求，尽量显示完整插件列表；官方/混合模式通常不需要。")} checked={form.codexAppPluginMarketplaceUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppPluginMarketplaceUnlock", value)} />
                 <FeatureToggle title={t("模型白名单解锁")} detail={t("从环境变量和 config.toml 的 /v1/models 拉取模型并补进模型列表。")} checked={form.codexAppModelWhitelistUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppModelWhitelistUnlock", value)} />
-                <FeatureToggle title={t("原生 Fast 强制解锁")} detail={t("纯 API Key 模式恢复原生 Fast 开关；保存后重新启动 Codex 生效，实际支持与计费由供应商决定。")} checked={form.codexAppNativeFastUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppNativeFastUnlock", value)} />
+                <FeatureToggle title={t("原生 Fast 强制解锁")} detail={t("纯 API Key 模式恢复原生 Fast 开关；重新启动 Codex 后生效，实际支持与计费由供应商决定。")} checked={form.codexAppNativeFastUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppNativeFastUnlock", value)} />
               </FeatureGroup>
               <FeatureGroup title={t("对话与输入")} detail={t("调整会话管理、输入行为和对话阅读体验。")}>
                 <FeatureToggle title={t("会话删除")} detail={t("在会话列表悬停显示删除按钮，并支持撤销。")} checked={form.codexAppSessionDelete} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppSessionDelete", value)} />
-                <FeatureToggle title={t("纯 API 模式禁用 Work 视图")} detail={t("Work 视图要求 ChatGPT 账号身份，纯 API Key 下发送消息会报 Work browser access requires an authenticated account。开启后每次启动 Codex 前把详情模式写回 Codex；保存并重新启动 Codex 生效。")} checked={form.codexAppDisableWorkView} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppDisableWorkView", value)} />
+                <FeatureToggle title={t("旁支保存")} detail={t("在本地 Side Chat 标签页显示「保存」。回复结束后可保存为普通会话，包含创建旁支时的主历史。建议开启后新建旁支。")} checked={form.codexAppSideChatSave} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppSideChatSave", value)} />
+                <FeatureToggle title={t("轮次回退（实验性）")} detail={t("在回答菜单中撤销本轮及后续轮次的可恢复操作，AI 报告全部完成后才截断会话。仅支持本地聊天；恢复记录保存在本机，不是系统快照。")} checked={form.codexAppTurnRewind} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppTurnRewind", value)} />
+                <FeatureToggle title={t("纯 API 模式禁用 Work 视图")} detail={t("Work 视图要求 ChatGPT 账号身份，纯 API Key 下发送消息会报 Work browser access requires an authenticated account。开启后每次启动 Codex 前把详情模式写回 Codex；重新启动 Codex 后生效。")} checked={form.codexAppDisableWorkView} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppDisableWorkView", value)} />
                 <FeatureToggle title={t("Markdown 导出")} detail={t("在会话列表显示导出按钮，导出带时间戳的 Markdown。")} checked={form.codexAppMarkdownExport} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppMarkdownExport", value)} />
                 <FeatureToggle title={t("粘贴修复")} detail={t("从 Word 等富文本粘贴到 Codex composer 时只保留纯文本，避免被识别为图片/文件附件。需重启 Codex 才生效。")} checked={form.codexAppPasteFix} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppPasteFix", value)} />
                 <FeatureToggle title={t("强制中文界面")} detail={t("强制启用 Codex App 内置 zh-CN 语言包，避免 Statsig/VPN 不通时回退英文。需重启 Codex 才能完整生效。")} checked={form.codexAppForceChineseLocale} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppForceChineseLocale", value)} />
@@ -7415,7 +7584,7 @@ function EnhanceScreen({
                 <div className={`feature-toggle ${!masterEnabled ? "disabled" : ""}`}>
                   <span>
                     <strong>{t("打字特效（彩虹 P）")}</strong>
-                    <small>{t("在 Codex 输入框的光标附近显示特效，保存后生效；系统减少动态效果时暂停。")}</small>
+                    <small>{t("在 Codex 输入框的光标附近显示特效；系统减少动态效果时暂停。")}</small>
                   </span>
                   <AppSelect<TypingEffect>
                     ariaLabel={t("打字特效（彩虹 P）")}
@@ -7444,7 +7613,7 @@ function EnhanceScreen({
                   onChange={(value) => setEnhanceFlag("codexAppWhaleWidgetEnabled", value)}
                 />
                 <FeatureToggle title={t("活动进度条右侧布局")} detail={t("把 Codex 原生活动进度条、状态波形和活动悬浮框移到右侧，并镜像波形方向。")} checked={form.codexAppActivityOverlayRight} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppActivityOverlayRight", value)} />
-                {supportsPetRealMouseLook ? <FeatureToggle title={t("桌宠跟随真实鼠标")} detail={t("仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。")} checked={form.codexAppPetRealMouseLook} disabled={!masterEnabled} onChange={(value) => setPersistedEnhanceFlag("codexAppPetRealMouseLook", value)} /> : null}
+                {supportsPetRealMouseLook ? <FeatureToggle title={t("桌宠跟随真实鼠标")} detail={t("仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。")} checked={form.codexAppPetRealMouseLook} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppPetRealMouseLook", value)} /> : null}
                 {/* 余额配置独占一整行（CSS: > .settings-block），展开时不会牵动上面的开关卡。 */}
                 <WhaleBalanceSettingsFields form={form} onFormChange={onFormChange} />
               </FeatureGroup>
@@ -7486,7 +7655,7 @@ function StandaloneModeGroup({
         title={t("官方额度解锁")}
         detail={masterEnabled
           ? t("增强开启时此能力已自动生效；此开关只在关闭增强后生效。")
-          : t("官方登录 + API 供应商在官方订阅额度耗尽后仍可发送；只改客户端发送状态，不改变真实用量与计费。保存后重启 Codex 生效。")}
+          : t("官方登录 + API 供应商在官方订阅额度耗尽后仍可发送；只改客户端发送状态，不改变真实用量与计费。重启 Codex 后生效。")}
         checked={form.codexAppStandaloneQuotaUnlock}
         onChange={(value) => onFormChange({ ...form, codexAppStandaloneQuotaUnlock: value })}
       />
@@ -9515,93 +9684,98 @@ function AgentSettingsScreen({
       <>
         <Panel>
           <CardHead title={t("Codex 供应商设置")} detail={t("只作用于 Codex 供应商的配置")} />
-          <CardContent className="settings-content">
-            <Field className="settings-test-model-field" label={t("供应商测试模型")}>
+          <CardContent className="settings-content setting-rows">
+            <SettingRow
+              title={t("供应商测试模型")}
+              description={t("「测试供应商」按钮用这个模型发起一次真实请求，用于判断 Key 与端点是否可用。")}
+            >
               <Input
                 value={form.relayTestModel}
                 onChange={(event) => onFormChange({ ...form, relayTestModel: event.currentTarget.value })}
                 placeholder={t("例如 gpt-5.4-mini")}
               />
-            </Field>
-            <p className="field-hint">
-              {t("「测试供应商」按钮用这个模型发起一次真实请求，用于判断 Key 与端点是否可用。")}
-            </p>
+            </SettingRow>
           </CardContent>
         </Panel>
 
         <Panel>
-          <CardHead title={t("Codex 图片覆盖层")} detail={t("在当前 Codex 会话上叠加一张背景图")} />
-          <CardContent className="settings-content">
-            <div className="settings-block">
-              <label className="check-row">
-                <input
-                  checked={form.codexAppImageOverlayEnabled}
-                  onChange={(event) =>
-                    onFormChange({ ...form, codexAppImageOverlayEnabled: event.currentTarget.checked })
-                  }
-                  type="checkbox"
-                />
-                <span>{t("启用 Codex 图片覆盖层")}</span>
-              </label>
-              <div className="form-row">
-                <Field label={t("覆盖图片")}>
-                  <Input
-                    value={form.codexAppImageOverlayPath}
-                    onChange={(event) => onFormChange({ ...form, codexAppImageOverlayPath: event.currentTarget.value })}
-                    placeholder={t("选择 png / jpg / webp / gif / bmp")}
+          <SwitchPanelHead
+            checked={form.codexAppImageOverlayEnabled}
+            detail={t("在当前 Codex 会话上叠加一张背景图")}
+            label={t("启用 Codex 图片覆盖层")}
+            onChange={(checked) => onFormChange({ ...form, codexAppImageOverlayEnabled: checked })}
+            title={t("Codex 图片覆盖层")}
+          />
+          <CardContent className="settings-content setting-rows">
+            {form.codexAppImageOverlayEnabled ? (
+              <>
+                <SettingRow title={t("覆盖图片")} description={t("支持 png / jpg / webp / gif / bmp。")}>
+                  <div className="setting-inline">
+                    <Input
+                      value={form.codexAppImageOverlayPath}
+                      onChange={(event) => onFormChange({ ...form, codexAppImageOverlayPath: event.currentTarget.value })}
+                      placeholder={t("选择 png / jpg / webp / gif / bmp")}
+                    />
+                    <Button variant="secondary" onClick={() => void actions.chooseImageOverlayPath()}>
+                      {t("选择图片")}
+                    </Button>
+                  </div>
+                </SettingRow>
+                <SettingRow title={t("透明度")} description={t("数值越大，背景图越明显。")}>
+                  <div className="setting-inline setting-range">
+                    <Input
+                      min={1}
+                      max={100}
+                      type="range"
+                      value={form.codexAppImageOverlayOpacity}
+                      onChange={(event) =>
+                        onFormChange({
+                          ...form,
+                          codexAppImageOverlayOpacity: clampNumber(Number(event.currentTarget.value), 1, 100),
+                        })
+                      }
+                    />
+                    <span className="setting-range-value">{form.codexAppImageOverlayOpacity}%</span>
+                  </div>
+                </SettingRow>
+                <SettingRow title={t("背景适配方式")} description={t("图片和窗口比例不一致时如何铺放。")}>
+                  <AppSelect
+                    value={form.codexAppImageOverlayFitMode}
+                    onChange={(value) =>
+                      onFormChange({
+                        ...form,
+                        codexAppImageOverlayFitMode: value,
+                      })
+                    }
+                    options={[
+                      { value: "fill", label: t("填充") },
+                      { value: "fit", label: t("适应") },
+                      { value: "stretch", label: t("拉伸") },
+                      { value: "tile", label: t("平铺") },
+                      { value: "center", label: t("居中") },
+                    ]}
                   />
-                </Field>
-                <Toolbar>
-                  <Button variant="secondary" onClick={() => void actions.chooseImageOverlayPath()}>
-                    {t("选择图片")}
+                </SettingRow>
+                <SettingRow title={t("恢复默认")} description={t("清除图片，并把透明度、适配方式恢复为默认值。")}>
+                  <Button variant="secondary" onClick={() => void actions.resetImageOverlaySettings()}>
+                    {t("重置背景")}
                   </Button>
-                </Toolbar>
-              </div>
-              <Field label={tf("透明度 {0}%", [form.codexAppImageOverlayOpacity])}>
-                <Input
-                  min={1}
-                  max={100}
-                  type="range"
-                  value={form.codexAppImageOverlayOpacity}
-                  onChange={(event) =>
-                    onFormChange({
-                      ...form,
-                      codexAppImageOverlayOpacity: clampNumber(Number(event.currentTarget.value), 1, 100),
-                    })
-                  }
-                />
-              </Field>
-              <Field label={t("背景适配方式")}>
-                <AppSelect
-                  value={form.codexAppImageOverlayFitMode}
-                  onChange={(value) =>
-                    onFormChange({
-                      ...form,
-                      codexAppImageOverlayFitMode: value,
-                    })
-                  }
-                  options={[
-                    { value: "fill", label: t("填充") },
-                    { value: "fit", label: t("适应") },
-                    { value: "stretch", label: t("拉伸") },
-                    { value: "tile", label: t("平铺") },
-                    { value: "center", label: t("居中") },
-                  ]}
-                />
-              </Field>
-            </div>
-            <Toolbar>
-              <Button variant="secondary" onClick={() => void actions.resetImageOverlaySettings()}>
-                {t("重置背景")}
-              </Button>
-            </Toolbar>
+                </SettingRow>
+              </>
+            ) : (
+              <p className="setting-footnote">{t("已关闭：Codex 会话不叠加背景图。")}</p>
+            )}
           </CardContent>
         </Panel>
 
         <Panel>
           <CardHead title={t("Codex 启动参数")} detail={t("启动 Codex App 时追加到默认 CDP 参数后。留空则保持默认启动行为。")} />
-          <CardContent className="settings-content">
-            <Field label={t("额外参数")}>
+          <CardContent className="settings-content setting-rows">
+            <SettingRow
+              stacked
+              title={t("额外参数")}
+              description={t("每行一个参数，例如 --force_high_performance_gpu。不需要填写 open 或 --args。")}
+            >
               <Textarea
                 className="launch-args-input"
                 placeholder="--force_high_performance_gpu"
@@ -9614,8 +9788,7 @@ function AgentSettingsScreen({
                   })
                 }
               />
-            </Field>
-            <p className="field-hint">{t("每行一个参数，例如 --force_high_performance_gpu。不需要填写 open 或 --args。")}</p>
+            </SettingRow>
           </CardContent>
         </Panel>
       </>
@@ -12464,6 +12637,17 @@ function AggregateRelayProfileEditor({
       routes: [...routes, { pattern: "", profileId: aggregate.members[0]?.profileId ?? "", priority: 0 }],
     });
   };
+  // 模型聚合的最终效果：默认成员的模型以裸名发布，其余成员带 cpx- 前缀。勾选时就告诉用户 Codex 会看到什么。
+  const memberModelCount = (candidate: RelayProfile) => new Set([
+    ...candidate.modelList.split(/[\r\n,]+/).map((line) => line.trim()).filter(Boolean),
+    ...(candidate.model.trim() ? [candidate.model.trim()] : []),
+  ]).size;
+  const selectedCandidates = candidates.filter((candidate) => memberIds.has(candidate.id));
+  const defaultCandidate = selectedCandidates.find((candidate) => candidate.id === aggregate.defaultRelayId);
+  const bareModelCount = defaultCandidate ? memberModelCount(defaultCandidate) : 0;
+  const prefixedModelCount = selectedCandidates
+    .filter((candidate) => candidate.id !== defaultCandidate?.id)
+    .reduce((sum, candidate) => sum + memberModelCount(candidate), 0);
 
   return (
     <div className="relay-profile-editor aggregate-editor" data-aggregate-mode={modelMode ? "model" : "provider"}>
@@ -12522,16 +12706,24 @@ function AggregateRelayProfileEditor({
           ))}
         </div>
       ) : (
-        <div className="aggregate-model-mode-hint">
-          <strong>{t("模型聚合已启用")}</strong>
-          <span>{t("默认成员的模型以裸名发布、其他成员带 cpx- 前缀；勾选成员后点行尾「设为默认」指定默认供应商。本模式不使用轮转策略或通配符路由。")}</span>
-        </div>
+        null
       )}
       <div className="aggregate-members">
         <div className="aggregate-members-head">
           <div>
             <strong>{t("成员供应商")}</strong>
-            <span>{t("可勾选 API 供应商或已完成 ChatGPT 登录的官方账号；聚合供应商不会作为成员。")}</span>
+            <span>
+              {modelMode
+                ? t("默认成员的模型以裸名发布，其他成员带 cpx- 前缀；悬停已勾选的成员可「设为默认」。本模式不使用轮转策略或通配符路由。")
+                : t("可勾选 API 供应商或已完成 ChatGPT 登录的官方账号；聚合供应商不会作为成员。")}
+            </span>
+            {modelMode && selectedCandidates.length ? (
+              <span className="aggregate-model-summary">
+                {defaultCandidate
+                  ? tf("Codex 将看到 {0} 个裸名模型（来自 {1}）+ {2} 个 cpx- 前缀模型", [bareModelCount, defaultCandidate.name || t("未命名供应商"), prefixedModelCount])
+                  : tf("Codex 将看到 {0} 个 cpx- 前缀模型；还没指定默认成员，不带前缀的请求会报错", [prefixedModelCount])}
+              </span>
+            ) : null}
           </div>
           <UiBadge variant="outline">{aggregate.members.length} / {candidates.length}</UiBadge>
         </div>
@@ -14068,6 +14260,63 @@ function ClaudeLocalizationScreen() {
   );
 }
 
+/// 设置行：左边标题 + 一句短说明，右边控件；长说明放进悬停提示（`detail`）。
+/// `stacked` 时控件放到说明下方，给状态码编辑、多行输入这类宽控件用。
+function SettingRow({ title, description, detail, stacked = false, children }: {
+  title: ReactNode;
+  description?: ReactNode;
+  detail?: string;
+  stacked?: boolean;
+  children?: ReactNode;
+}) {
+  return (
+    <div className={`setting-row${stacked ? " setting-row-stacked" : ""}`} title={detail}>
+      <div className="setting-row-copy">
+        <strong>{title}</strong>
+        {description ? <span>{description}</span> : null}
+      </div>
+      {children ? <div className="setting-row-control">{children}</div> : null}
+    </div>
+  );
+}
+
+/// 标题栏右侧带开关的卡片头：开关关闭时，卡片里的设置整块收起，只留一行提示。
+function SwitchPanelHead({ title, detail, checked, onChange, label }: {
+  title: string;
+  detail: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  label: string;
+}) {
+  return (
+    <CardHeader className="panel-head switch-panel-head">
+      <div className="switch-panel-head-copy">
+        <CardTitle>{title}</CardTitle>
+        <CardDescription>{detail}</CardDescription>
+      </div>
+      <label className="switch-row compact relay-master-switch-compact">
+        <input aria-label={label} checked={checked} onChange={(event) => onChange(event.currentTarget.checked)} type="checkbox" />
+        <span>{checked ? t("已开启") : t("已关闭")}</span>
+        <ToggleVisual />
+      </label>
+    </CardHeader>
+  );
+}
+
+/// 带状态图标的小卡片，与概览页健康检查同一套样式。
+function HealthTile({ item }: { item: ReturnType<typeof healthItems>[number] }) {
+  return (
+    <div className={`health-item ${item.ok ? "ok" : "needs-fix"}`}>
+      <span className={`health-icon ${statusClass(item.status)}`}><item.icon className="h-4 w-4" /></span>
+      <div>
+        <strong>{item.title}</strong>
+        <span title={item.detail}>{item.detail}</span>
+      </div>
+      <Badge status={item.status} />
+    </div>
+  );
+}
+
 function CardHead({ title, detail }: { title: string; detail: string }) {
   return (
     <CardHeader className="panel-head">
@@ -14345,25 +14594,30 @@ function GrokScreen({
                 const endpoint = profile.upstreamBaseUrl || profile.baseUrl;
                 return (
                   <div className={`grok-provider-row ${selected ? "active" : ""}`} key={profile.id}>
+                    {/* 与 Codex 供应商列表同一套：两字头像 + 名称 / 地址，删除悬停才出现。 */}
                     <button
                       className="grok-provider-pick"
                       onClick={() => void selectProfile(profile.id)}
                       type="button"
                     >
-                      <span className="grok-provider-name">
-                        {profile.name}
-                        {selected ? <span className="grok-provider-badge">{t("使用中")}</span> : null}
-                      </span>
-                      <span className="grok-provider-url">
-                        {endpoint || t("未填写 Base URL")}
+                      <span className="relay-index" aria-hidden="true">{providerInitial(profile.name)}</span>
+                      <span className="grok-provider-text">
+                        <span className="grok-provider-name">
+                          <span className="relay-summary-name">{profile.name || t("未命名供应商")}</span>
+                          {selected ? <span className="relay-active-badge">{t("使用中")}</span> : null}
+                        </span>
+                        {/* 左列较窄：模型数放进第二行，给名称留出空间。 */}
+                        <span className="grok-provider-url">
+                          {endpoint || t("未填写 Base URL")} · {tf("{0} 个模型", [String(modelCount)])}
+                        </span>
                       </span>
                     </button>
-                    <span className="grok-provider-models">{tf("{0} 个模型", [String(modelCount)])}</span>
                     <Button
+                      className="grok-provider-delete"
                       onClick={() => void removeProfile(profile.id)}
                       size="icon"
                       title={t("删除供应商")}
-                      variant="outline"
+                      variant="ghost"
                     >
                       <Trash2 className="h-4 w-4" />
                     </Button>
@@ -14484,6 +14738,8 @@ function ApplicationRail({
   onSelect,
   onNavigate,
   onToggleTheme,
+  pendingUpdateVersion,
+  onOpenUpdate,
 }: {
   tools: ToolEntry[];
   activeTool: ToolId;
@@ -14493,39 +14749,69 @@ function ApplicationRail({
   onSelect: (toolId: ToolId) => void;
   onNavigate: (route: Route) => void;
   onToggleTheme: () => void;
+  /** 后台检查到的新版本号；没有新版本时为 null。 */
+  pendingUpdateVersion: string | null;
+  onOpenUpdate: () => void;
 }) {
   const languageLabel = getLanguage() === "en" ? t("切换到中文") : t("切换到英文");
   const themeLabel = theme === "dark" ? t("切换到浅色") : t("切换到深色");
+  const renderNavItem = (routeId: Route) => {
+    const item = routes.find((candidate) => candidate.id === routeId);
+    if (!item) return null;
+    const Icon = item.icon;
+    const selected = route === item.id;
+    return (
+      <button
+        aria-current={selected ? "page" : undefined}
+        aria-label={item.label}
+        className={`tool-chip rail-nav-item ${selected ? "active" : ""}`}
+        key={item.id}
+        onClick={() => onNavigate(item.id)}
+        title={item.label}
+        type="button"
+      >
+        <Icon aria-hidden="true" className="rail-nav-icon" />
+      </button>
+    );
+  };
   return (
     <aside className="app-rail">
+      {/* 程序左上角的 logo：点一下回到当前 Agent 的概览。
+          有新版本时右上角挂一个更新角标（独立按钮，不能嵌在 logo 按钮里），点角标弹出更新框。 */}
+      <div className="rail-brand-wrap">
+        <button
+          aria-label={t("Codex++ 概览")}
+          className="rail-brand"
+          onClick={() => onNavigate("overview")}
+          title="Codex++"
+          type="button"
+        >
+          <img alt="" draggable={false} src={APP_LOGO_URL} />
+        </button>
+        {pendingUpdateVersion ? (
+          <button
+            aria-label={tf("发现新版本 {0}，点击查看更新", [pendingUpdateVersion])}
+            className="rail-update-badge"
+            onClick={onOpenUpdate}
+            title={tf("发现新版本 {0}，点击查看更新", [pendingUpdateVersion])}
+            type="button"
+          >
+            <ArrowUp aria-hidden="true" strokeWidth={3} />
+          </button>
+        ) : null}
+      </div>
       <ToolSwitcher
         tools={tools}
         activeTool={activeTool}
         codexAppRunning={codexAppRunning}
         showSelection={!globalNavigationRoutes.includes(route)}
         onSelect={onSelect}
-      />
+      >
+        {railAgentGroupRoutes.map(renderNavItem)}
+      </ToolSwitcher>
       <div className="rail-bottom">
         <nav className="rail-navigation" aria-label={t("系统")}>
-          {globalNavigationRoutes.map((routeId) => {
-            const item = routes.find((candidate) => candidate.id === routeId);
-            if (!item) return null;
-            const Icon = item.icon;
-            const selected = route === item.id;
-            return (
-              <button
-                aria-current={selected ? "page" : undefined}
-                aria-label={item.label}
-                className={`tool-chip rail-nav-item ${selected ? "active" : ""}`}
-                key={item.id}
-                onClick={() => onNavigate(item.id)}
-                title={item.label}
-                type="button"
-              >
-                <Icon aria-hidden="true" className="rail-nav-icon" />
-              </button>
-            );
-          })}
+          {globalNavigationRoutes.filter((routeId) => !railAgentGroupRoutes.includes(routeId)).map(renderNavItem)}
         </nav>
         <div className="rail-preferences">
           <button
@@ -14564,12 +14850,15 @@ function ToolSwitcher({
   codexAppRunning,
   showSelection = true,
   onSelect,
+  children,
 }: {
   tools: ToolEntry[];
   activeTool: ToolId;
   codexAppRunning: boolean;
   showSelection?: boolean;
   onSelect: (toolId: ToolId) => void;
+  /** 排在 Agent 图标之后的同组入口。 */
+  children?: ReactNode;
 }) {
   return (
     <nav className="tool-switcher" aria-label={t("工具切换")}>
@@ -14603,6 +14892,7 @@ function ToolSwitcher({
           </button>
         );
       })}
+      {children}
     </nav>
   );
 }
@@ -15433,9 +15723,9 @@ function relayProfileEditorStatus(profile: RelayProfile, form: BackendSettings, 
   return profile.id === form.activeRelayId ? t("当前正在使用") : t("编辑后保存列表，再切换模式时会使用新配置");
 }
 
+/// 供应商头像上的两个字，规则见 provider-name.ts 的 providerAvatarText。
 function providerInitial(name: string) {
-  const trimmed = (name || t("供应商")).trim();
-  return Array.from(trimmed)[0]?.toUpperCase() || t("供");
+  return providerAvatarText(name, t("供"));
 }
 
 function statusLabel(status: string) {
@@ -15456,6 +15746,7 @@ function statusLabel(status: string) {
     disabled: t("已禁用"),
     stopped: t("未运行"),
     waiting: t("等待启动"),
+    off: t("未启用"),
     connected: t("已连接"),
     disconnected: t("未连接"),
     unknown: t("未知"),
@@ -15465,7 +15756,7 @@ function statusLabel(status: string) {
 
 function statusClass(status: string) {
   if (["found", "installed", "ok", "running", "running_degraded", "connected"].includes(status)) return "good";
-  if (status === "waiting") return "idle";
+  if (status === "waiting" || status === "off") return "idle";
   if (["failed", "missing"].includes(status)) return "bad";
   return "warn";
 }
@@ -15485,17 +15776,29 @@ function truncateSessionDeletePreview(value: string) {
   return normalized.length > 20 ? `${normalized.slice(0, 20)}...` : normalized;
 }
 
-function healthItems(overview: OverviewResult | null) {
+/// 概览健康检查的各项。每项带自己的图标；本地服务器与协议转换拆成两项：
+/// 协议转换跑在本地服务器里，但两者状态独立（服务器在跑、转换没开是常态）。
+function healthItems(overview: OverviewResult | null): Array<{ title: string; status: string; ok: boolean; detail: string; icon: LucideIcon }> {
   const conversionEnabled = overview?.runtime_health?.protocol_conversion_enabled;
-  const conversionDetail = typeof conversionEnabled === "boolean"
-    ? t(conversionEnabled ? "协议转换已启用" : "协议转换未启用")
-    : undefined;
-  const serviceItem = (title: string, state: RuntimeServiceState | undefined, extraDetail?: string) => ({
+  const serviceItem = (title: string, state: RuntimeServiceState | undefined, icon: LucideIcon) => ({
     title,
     status: state?.status ?? "not_checked",
     ok: ["running", "connected", "disabled"].includes(state?.status ?? ""),
-    detail: state ? [state.address, t(state.message), extraDetail].filter(Boolean).join(" · ") : t("等待状态检查"),
+    detail: state ? [state.address, t(state.message)].filter(Boolean).join(" · ") : t("等待状态检查"),
+    icon,
   });
+  // 协议转换没开不是问题：直连 Responses 的供应商本来就不需要，显示为中性的「未启用」。
+  const conversionHealth = {
+    title: t("协议转换"),
+    status: typeof conversionEnabled !== "boolean" ? "not_checked" : conversionEnabled ? "ok" : "off",
+    ok: typeof conversionEnabled === "boolean",
+    detail: typeof conversionEnabled !== "boolean"
+      ? t("等待状态检查")
+      : conversionEnabled
+        ? t("Chat Completions / Anthropic 请求经本地服务器转成 Responses")
+        : t("当前供应商直连 Responses，不需要转换"),
+    icon: ArrowRightLeft,
+  };
   // 调试连接依赖 Codex 在运行：Codex 没启动时连不上是预期内的，显示为中性的「等待启动」而不是警告。
   const debuggerState = overview?.runtime_health?.debugger;
   const codexRunning = overview?.runtime_health?.codex_app?.status === "running";
@@ -15505,16 +15808,19 @@ function healthItems(overview: OverviewResult | null) {
       status: "waiting",
       ok: true,
       detail: [debuggerState.address, t("Codex 未运行，启动后自动连接")].filter(Boolean).join(" · "),
+      icon: Bug,
     }
-    : serviceItem(t("调试连接状态"), debuggerState);
+    : serviceItem(t("调试连接状态"), debuggerState, Bug);
   return [
     {
       title: t("Codex 应用"),
       status: overview?.codex_app.status ?? "not_checked",
       ok: overview?.codex_app.status === "found",
       detail: overview?.codex_app.path || t("尚未检查 Codex 应用路径。"),
+      icon: AppWindow,
     },
-    serviceItem(t("本地服务器状态"), overview?.runtime_health?.local_server, conversionDetail),
+    serviceItem(t("本地服务器状态"), overview?.runtime_health?.local_server, Server),
+    conversionHealth,
     debuggerHealth,
   ];
 }
@@ -15849,6 +16155,17 @@ function relayProtocolLabel(protocol: RelayProtocol): string {
   if (protocol === "chatCompletions") return t("Chat Completions 转 Responses");
   if (protocol === "anthropicMessages") return t("Anthropic Messages 转 Responses");
   return "Responses API";
+}
+
+/// 网址只显示主机名；解析不了就原样返回。
+function urlHost(value: string | undefined): string {
+  const text = (value ?? "").trim();
+  if (!text) return "";
+  try {
+    return new URL(text).host;
+  } catch {
+    return text.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+  }
 }
 
 function ccsProviderSummary(result: CcsProvidersResult | null): string {

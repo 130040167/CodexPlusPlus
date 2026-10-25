@@ -12477,10 +12477,8 @@ model_reasoning_effort = "high"
             }),
         );
         assert!(with_detail.contains("该进程没有程序包标识符"));
-        // 提示文案随 #2684 改版（旧版提「Microsoft Store」，新版指向 codex-plus.log）。
-        // CI 检出的是本分支与 main 的 merge commit，用的是 main 的新实现；
-        // 改为接受任一版本的指引文案，新旧实现都能通过。
-        assert!(with_detail.contains("Microsoft Store") || with_detail.contains("codex-plus.log"));
+        assert!(!with_detail.contains("Microsoft Store"));
+        assert!(with_detail.contains("codex-plus.log"));
     }
 
     // 旧版 manifest 里没有 launchResult 字段，升级后必须仍能读出来（默认 None）。
