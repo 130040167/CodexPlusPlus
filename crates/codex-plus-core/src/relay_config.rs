@@ -655,9 +655,9 @@ pub fn apply_relay_profile_files_to_home_with_context(
         &profile.context_window,
         &profile.auto_compact_limit,
     )?;
-    with_model_catalog_rollback(home, profile, || {
+    with_model_catalog_rollback(home, profile, |catalog_write| {
         let config_with_catalog =
-            apply_model_catalog_to_config(home, profile, &config_with_limits)?;
+            apply_model_catalog_to_config(home, profile, &config_with_limits, catalog_write)?;
         let compatible_config =
             apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
         // 聚合 profile 的快照里没有凭据，必须现生成一份含代理 token 的合法 JSON，
@@ -977,9 +977,9 @@ fn apply_relay_profile_to_home_inner(
         &profile.context_window,
         &profile.auto_compact_limit,
     )?;
-    with_model_catalog_rollback(home, profile, || {
+    with_model_catalog_rollback(home, profile, |catalog_write| {
         let config_with_catalog =
-            apply_model_catalog_to_config(home, profile, &config_with_limits)?;
+            apply_model_catalog_to_config(home, profile, &config_with_limits, catalog_write)?;
         let compatible_config =
             apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
 
@@ -1055,9 +1055,9 @@ pub fn apply_relay_profile_config_to_home_with_context(
         &profile.context_window,
         &profile.auto_compact_limit,
     )?;
-    with_model_catalog_rollback(home, profile, || {
+    with_model_catalog_rollback(home, profile, |catalog_write| {
         let config_with_catalog =
-            apply_model_catalog_to_config(home, profile, &config_with_limits)?;
+            apply_model_catalog_to_config(home, profile, &config_with_limits, catalog_write)?;
         let compatible_config =
             apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
         apply_relay_config_file_to_home(home, &compatible_config)
@@ -2048,9 +2048,9 @@ pub(crate) fn apply_official_profile_to_home(
         &profile.context_window,
         &profile.auto_compact_limit,
     )?;
-    with_model_catalog_rollback(home, profile, || {
+    with_model_catalog_rollback(home, profile, |catalog_write| {
         // 旧API目录指针已移除；仍按本官方profile明确声明的窗口/元数据重新生成。
-        let config = apply_model_catalog_to_config_with_live_policy(home, profile, &config, false)?;
+        let config = apply_model_catalog_to_config_with_live_policy(home, profile, &config, false, catalog_write)?;
         let auth = official_profile_auth_for_switch(home, &profile.auth_contents)?;
         // 空配置是官方默认模式的合法状态，不能经过API入口的非空断言。
         let backup_path = write_codex_live_atomic(home, Some(&config), Some(auth.as_bytes()))?;
@@ -2556,21 +2556,48 @@ fn ensure_live_file_unchanged(path: &Path, expected: Option<&[u8]>) -> anyhow::R
     Ok(())
 }
 
+struct ModelCatalogWrite {
+    path: PathBuf,
+    previous: Option<Vec<u8>>,
+    written: Option<Vec<u8>>,
+}
+
+impl ModelCatalogWrite {
+    fn write(&mut self, path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+        anyhow::ensure!(path == self.path, "模型 catalog 写入路径与事务不一致");
+        ensure_live_file_unchanged(path, self.written.as_deref().or(self.previous.as_deref()))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        crate::settings::atomic_write(path, contents)?;
+        self.written = Some(contents.to_vec());
+        Ok(())
+    }
+}
+
 fn with_model_catalog_rollback<T>(
     home: &Path,
     profile: &RelayProfile,
-    operation: impl FnOnce() -> anyhow::Result<T>,
+    operation: impl FnOnce(&mut ModelCatalogWrite) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     let catalog_path = home
         .join("model-catalogs")
         .join(format!("{}.json", sanitize_catalog_filename(&profile.id)));
-    let previous_catalog = read_optional_bytes(&catalog_path)?;
-    match operation() {
+    let mut catalog_write = ModelCatalogWrite {
+        previous: read_optional_bytes(&catalog_path)?,
+        path: catalog_path,
+        written: None,
+    };
+    match operation(&mut catalog_write) {
         Ok(value) => Ok(value),
         Err(error) => {
-            if let Err(restore_error) =
-                restore_optional_file(&catalog_path, previous_catalog.as_deref())
-            {
+            let restore = if let Some(written) = catalog_write.written.as_deref() {
+                ensure_live_file_unchanged(&catalog_write.path, Some(written))
+                    .and_then(|_| restore_optional_file(&catalog_write.path, catalog_write.previous.as_deref()))
+            } else {
+                Ok(())
+            };
+            if let Err(restore_error) = restore {
                 return Err(
                     error.context(format!("应用失败后恢复模型 catalog 失败：{restore_error}"))
                 );
@@ -3519,8 +3546,9 @@ fn apply_model_catalog_to_config(
     home: &Path,
     profile: &RelayProfile,
     config_text: &str,
+    catalog_write: &mut ModelCatalogWrite,
 ) -> anyhow::Result<String> {
-    apply_model_catalog_to_config_with_live_policy(home, profile, config_text, true)
+    apply_model_catalog_to_config_with_live_policy(home, profile, config_text, true, catalog_write)
 }
 
 fn wsl_catalog_paths_enabled(home: &Path, config: &str) -> bool {
@@ -3743,6 +3771,7 @@ fn apply_model_catalog_to_config_with_live_policy(
     profile: &RelayProfile,
     config_text: &str,
     allow_live_external_catalog: bool,
+    catalog_write: &mut ModelCatalogWrite,
 ) -> anyhow::Result<String> {
     let mut pending_catalog = None;
     let config_text = render_model_catalog_to_config_with_live_policy(
@@ -3753,10 +3782,7 @@ fn apply_model_catalog_to_config_with_live_policy(
         &mut pending_catalog,
     )?;
     if let Some((catalog_path, catalog_json)) = pending_catalog {
-        if let Some(parent) = catalog_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        crate::settings::atomic_write(&catalog_path, catalog_json.as_bytes())?;
+        catalog_write.write(&catalog_path, catalog_json.as_bytes())?;
     }
     Ok(config_text)
 }
@@ -6329,6 +6355,48 @@ fn account_label_from_jwt(token: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn failed_catalog_apply_preserves_external_writes_and_only_restores_owned_content() {
+        for existed in [false, true] {
+            for changed in [false, true] {
+                for wrote in [false, true] {
+                    let home = tempfile::tempdir().unwrap();
+                    let profile = RelayProfile { id: "catalog-owner".into(), ..RelayProfile::default() };
+                    let path = home.path().join("model-catalogs/catalog-owner.json");
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    if existed { std::fs::write(&path, b"previous").unwrap(); }
+                    let error = with_model_catalog_rollback(home.path(), &profile, |catalog| -> anyhow::Result<()> {
+                        if wrote { catalog.write(&path, b"managed")?; }
+                        if changed { std::fs::write(&path, b"external")?; }
+                        anyhow::bail!("injected apply failure");
+                    }).unwrap_err();
+                    assert!(format!("{error:#}").contains("injected apply failure"));
+                    assert_eq!(read_optional_bytes(&path).unwrap(),
+                        if changed { Some(b"external".to_vec()) }
+                        else if existed { Some(b"previous".to_vec()) }
+                        else { None });
+                    if changed && wrote {
+                        assert!(format!("{error:#}").contains("保留外部修改"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_apply_refuses_external_takeover_before_its_write() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = RelayProfile { id: "catalog-owner".into(), ..RelayProfile::default() };
+        let path = home.path().join("model-catalogs/catalog-owner.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"previous").unwrap();
+        let error = with_model_catalog_rollback(home.path(), &profile, |catalog| {
+            std::fs::write(&path, b"external")?;
+            catalog.write(&path, b"managed")
+        }).unwrap_err();
+        assert!(format!("{error:#}").contains("保留外部修改"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"external");
+    }
     #[test]
     fn live_config_detects_managed_protocol_proxy_for_active_provider_only() {
         let home = tempfile::tempdir().unwrap();

@@ -7255,6 +7255,29 @@ fn switching_default_model_defers_thread_model_migration_until_launch() {
     assert_eq!(apply_pending_thread_model_migration(home, true).unwrap(), 0);
 }
 
+#[test]
+fn failed_default_model_switch_does_not_record_pending_migration() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    apply_relay_profile_to_home_with_switch_rules(home, &responses_profile_with_model("model-a"), "").unwrap();
+    let pending_path = home.join("codex-plus-pending-thread-model-migration.json");
+    let config = std::fs::read(home.join("config.toml")).unwrap();
+    let auth = std::fs::read(home.join("auth.json")).unwrap();
+    let catalog_path = home.join("model-catalogs/custom.json");
+    let catalog = std::fs::read(&catalog_path).ok();
+    for pending in [None, Some(br#"{"from":["model-old"],"to":"model-a"}"#.as_slice())] {
+        if let Some(bytes) = pending { std::fs::write(&pending_path, bytes).unwrap(); }
+        let mut profile = responses_profile_with_model("model-b");
+        profile.model_list = "model-b[32K]".into();
+        profile.auth_contents = "invalid auth JSON".into();
+        assert!(apply_relay_profile_to_home_with_switch_rules(home, &profile, "").is_err());
+        assert_eq!(std::fs::read(home.join("config.toml")).unwrap(), config);
+        assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), auth);
+        assert_eq!(std::fs::read(&pending_path).ok().as_deref(), pending);
+        assert_eq!(std::fs::read(&catalog_path).ok(), catalog);
+    }
+}
+
 /// 开关关闭时启动只丢弃记录，之后再打开也不会翻出旧切换。
 #[test]
 fn disabled_thread_model_migration_discards_pending_record() {
