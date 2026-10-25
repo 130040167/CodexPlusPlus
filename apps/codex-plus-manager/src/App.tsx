@@ -75,6 +75,7 @@ import {
   TestTube,
   Trash2,
   Wrench,
+  ArrowUp,
   type LucideIcon,
 } from "lucide-react";
 import { createPresetPatch } from "@/components/ProviderPresetSelector";
@@ -4113,6 +4114,8 @@ export function App() {
         onSelect={(toolId) => void switchTool(toolId)}
         onNavigate={(next) => void navigate(next)}
         onToggleTheme={actions.toggleTheme}
+        pendingUpdateVersion={update?.updateAvailable && update.latestVersion ? update.latestVersion : null}
+        onOpenUpdate={() => { if (update) setUpdatePrompt(update); }}
       />
       {!isGlobalPage ? (
         <aside className="sidebar">
@@ -14487,6 +14490,8 @@ function ApplicationRail({
   onSelect,
   onNavigate,
   onToggleTheme,
+  pendingUpdateVersion,
+  onOpenUpdate,
 }: {
   tools: ToolEntry[];
   activeTool: ToolId;
@@ -14496,21 +14501,38 @@ function ApplicationRail({
   onSelect: (toolId: ToolId) => void;
   onNavigate: (route: Route) => void;
   onToggleTheme: () => void;
+  /** 后台检查到的新版本号；没有新版本时为 null。 */
+  pendingUpdateVersion: string | null;
+  onOpenUpdate: () => void;
 }) {
   const languageLabel = getLanguage() === "en" ? t("切换到中文") : t("切换到英文");
   const themeLabel = theme === "dark" ? t("切换到浅色") : t("切换到深色");
   return (
     <aside className="app-rail">
-      {/* 程序左上角的 logo：点一下回到当前 Agent 的概览。 */}
-      <button
-        aria-label={t("Codex++ 概览")}
-        className="rail-brand"
-        onClick={() => onNavigate("overview")}
-        title="Codex++"
-        type="button"
-      >
-        <img alt="" draggable={false} src={APP_LOGO_URL} />
-      </button>
+      {/* 程序左上角的 logo：点一下回到当前 Agent 的概览。
+          有新版本时右上角挂一个更新角标（独立按钮，不能嵌在 logo 按钮里），点角标弹出更新框。 */}
+      <div className="rail-brand-wrap">
+        <button
+          aria-label={t("Codex++ 概览")}
+          className="rail-brand"
+          onClick={() => onNavigate("overview")}
+          title="Codex++"
+          type="button"
+        >
+          <img alt="" draggable={false} src={APP_LOGO_URL} />
+        </button>
+        {pendingUpdateVersion ? (
+          <button
+            aria-label={tf("发现新版本 {0}，点击查看更新", [pendingUpdateVersion])}
+            className="rail-update-badge"
+            onClick={onOpenUpdate}
+            title={tf("发现新版本 {0}，点击查看更新", [pendingUpdateVersion])}
+            type="button"
+          >
+            <ArrowUp aria-hidden="true" strokeWidth={3} />
+          </button>
+        ) : null}
+      </div>
       <ToolSwitcher
         tools={tools}
         activeTool={activeTool}
