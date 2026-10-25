@@ -6,7 +6,8 @@ use codex_plus_core::relay_config::{
     apply_relay_profile_to_home_with_switch_rules_and_proxy_port,
     backfill_relay_profile_from_home, backfill_relay_profile_from_home_with_common,
     chatgpt_auth_status_from_home, cleanup_unsupported_approval_policies_in_home,
-    clear_relay_config_to_home, clear_relay_config_to_home_with_auth,
+    clear_managed_proxy_config_for_uninstall, clear_relay_config_to_home,
+    clear_relay_config_to_home_with_auth,
     delete_context_entry_from_common_config, ensure_active_protocol_proxy_config_in_home,
     extract_common_config_from_config, list_context_entries_from_common_config,
     merge_common_config_into_config, normalize_relay_profile_for_storage,
@@ -4849,6 +4850,74 @@ experimental_bearer_token = "sk-official-mix"
     assert!(config.contains(r#"experimental_bearer_token = "sk-official-mix""#));
     assert!(config.contains("requires_openai_auth = true"));
     assert!(config.contains(r#"openai_base_url = "http://127.0.0.1:57321/v1""#));
+}
+
+#[test]
+fn uninstall_cleanup_restores_config_pointing_to_local_proxy() {
+    // issue #406：卸载后本地代理已不存在，残留的 127.0.0.1:57321 让官方 Codex 一直 502。
+    let temp = tempfile::tempdir().unwrap();
+    let original = r#"model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "http://127.0.0.1:57321/v1"
+experimental_bearer_token = "sk-test-redacted"
+
+[features]
+js_repl = false
+"#;
+    std::fs::write(temp.path().join("config.toml"), original).unwrap();
+
+    assert!(clear_managed_proxy_config_for_uninstall(temp.path()).unwrap());
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(!config.contains("127.0.0.1"), "{config}");
+    assert!(!config.contains("model_provider"), "{config}");
+    assert!(!config.contains("sk-test-redacted"), "{config}");
+    assert!(config.contains("js_repl = false"), "{config}");
+    // 清理前必须留一份原始备份，用户可以找回。
+    let backups: Vec<_> = std::fs::read_dir(temp.path().join("backups"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(backups[0].join("config.toml")).unwrap(),
+        original
+    );
+    // 再次执行不应重复改动。
+    assert!(!clear_managed_proxy_config_for_uninstall(temp.path()).unwrap());
+}
+
+#[test]
+fn uninstall_cleanup_keeps_config_with_remote_relay_untouched() {
+    let temp = tempfile::tempdir().unwrap();
+    let original = r#"model_provider = "custom"
+
+[model_providers.custom]
+name = "deepseek"
+base_url = "https://api.deepseek.com"
+wire_api = "responses"
+requires_openai_auth = true
+"#;
+    std::fs::write(temp.path().join("config.toml"), original).unwrap();
+
+    assert!(!clear_managed_proxy_config_for_uninstall(temp.path()).unwrap());
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("config.toml")).unwrap(),
+        original
+    );
+    assert!(!temp.path().join("backups").exists());
+}
+
+#[test]
+fn uninstall_cleanup_without_config_is_noop() {
+    let temp = tempfile::tempdir().unwrap();
+    assert!(!clear_managed_proxy_config_for_uninstall(temp.path()).unwrap());
+    assert!(!temp.path().join("config.toml").exists());
 }
 
 #[test]
