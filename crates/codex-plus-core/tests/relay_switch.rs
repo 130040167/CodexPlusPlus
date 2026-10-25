@@ -1333,6 +1333,17 @@ fn switch_from_default_official_ignores_live_api_key_auth() {
     for saved_auth in [
         String::new(),
         r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official"}}"#.to_string(),
+        serde_json::json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "account_id": "fixture-official-account",
+                "access_token": "fixture-access",
+                "id_token": "fixture-id",
+                "refresh_token": "fixture-refresh"
+            },
+            "last_refresh": "2026-10-25T00:00:00Z"
+        }).to_string(),
     ] {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex");
@@ -1379,11 +1390,14 @@ fn switch_from_default_official_ignores_live_api_key_auth() {
 
         let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
         assert!(
-            config.contains("https://api.deepseek.example/v1"),
-            "目标供应商应写入 config.toml：{config}"
+            config.contains("http://127.0.0.1:62021/v1")
+                && config.contains("sk-deepseek"),
+            "目标供应商应通过受管代理写入 config.toml：{config}"
         );
         let stored = store.load().unwrap();
         assert_eq!(stored.active_relay_id, "deepseek");
+        assert_eq!(stored.relay_profiles.iter().find(|profile| profile.id == "deepseek")
+            .unwrap().upstream_base_url, "https://api.deepseek.example/v1");
         for settings in [&result.settings, &stored] {
             let default = settings
                 .relay_profiles
@@ -1397,13 +1411,30 @@ fn switch_from_default_official_ignores_live_api_key_auth() {
                 default.auth_contents
             );
             if !saved_auth.is_empty() {
-                assert!(
-                    default.auth_contents.contains("\"access_token\""),
-                    "原有官方登录快照应保留：{}",
-                    default.auth_contents
+                let mut expected: serde_json::Value = serde_json::from_str(&saved_auth).unwrap();
+                expected.as_object_mut().unwrap().remove("OPENAI_API_KEY");
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&default.auth_contents).unwrap(),
+                    expected,
+                    "原有官方账号及全部 OAuth 字段应保留"
                 );
+            } else {
+                assert!(default.auth_contents.is_empty(), "空官方快照不应继承 API 登录态元数据");
             }
         }
+    }
+}
+
+#[test]
+fn official_snapshot_storage_still_rejects_unknown_auth_schema() {
+    for auth in [
+        r#"{"auth_mode":"apikey","OPENAI_API_KEY":"fixture-api"}"#,
+        r#"{"auth_mode":"chatgpt","tokens":{"account_id":"fixture-account"}}"#,
+        r#"{"auth_mode":"unknown","tokens":{"access_token":"fixture-access"}}"#,
+    ] {
+        let mut profile = RelayProfile { auth_contents: auth.into(), ..RelayProfile::default() };
+        assert!(codex_plus_core::relay_config::normalize_relay_profile_for_storage(&mut profile).is_err());
+        assert_eq!(profile.auth_contents, auth, "未知认证格式不能被清理或接受");
     }
 }
 

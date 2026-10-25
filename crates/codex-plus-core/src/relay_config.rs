@@ -5189,6 +5189,10 @@ fn restore_profile_credentials_after_backfill(
             }),
         );
     }
+    // 纯官方快照不能由受管 API bearer token 补成 API 登录态。
+    if profile.relay_mode == RelayMode::Official {
+        return Ok(());
+    }
     let Some(token) = experimental_bearer_token_from_config(&profile.config_contents)? else {
         return Ok(());
     };
