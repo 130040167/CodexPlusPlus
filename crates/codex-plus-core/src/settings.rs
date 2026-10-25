@@ -1003,7 +1003,9 @@ pub struct BackendSettings {
     /// 开启后，本地协议代理把「不在当前供应商公布模型集里的请求模型」改写为
     /// 该供应商的默认模型再转发；在公布集合里的模型（含用户显式配置的 gpt-*）
     /// 不受影响。官方登录（未混入 API）与聚合供应商不适用本映射。
-    #[serde(rename = "protocolProxyMapUnlistedModels", default = "default_true")]
+    /// 供应商配置了自动审批模型（autoReviewModel）时，codex-auto-review 仍按其改写。
+    /// 默认关闭（opt-in）：开启会改写用户手填但没写进 model_list 的模型，不能静默生效。
+    #[serde(rename = "protocolProxyMapUnlistedModels", default)]
     pub protocol_proxy_map_unlisted_models: bool,
     /// 本地协议代理（helper）单次 HTTP 请求体上限，单位 MiB。
     ///
@@ -1125,7 +1127,7 @@ impl Default for BackendSettings {
             protocol_proxy_auto_retry_mode: default_protocol_proxy_auto_retry_mode(),
             protocol_proxy_auto_retry_commit_delay_ms:
                 default_protocol_proxy_auto_retry_commit_delay_ms(),
-            protocol_proxy_map_unlisted_models: true,
+            protocol_proxy_map_unlisted_models: false,
             helper_max_request_body_mib: default_helper_max_request_body_mib(),
             tools: BTreeMap::new(),
             active_tool: ToolId::Codex,

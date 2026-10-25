@@ -7,20 +7,21 @@ use codex_plus_core::settings::{BackendSettings, SettingsStore};
 use serde_json::json;
 
 #[test]
-fn map_unlisted_models_defaults_to_true_for_old_settings() {
+fn map_unlisted_models_defaults_to_false_for_old_settings() {
+    // 默认关闭（opt-in）：开启会改写用户手填但没写进 model_list 的模型，不能静默生效。
     let defaults = BackendSettings::default();
-    assert!(defaults.protocol_proxy_map_unlisted_models);
+    assert!(!defaults.protocol_proxy_map_unlisted_models);
 
     let raw = serde_json::to_value(&defaults).unwrap();
-    assert_eq!(raw["protocolProxyMapUnlistedModels"], json!(true));
+    assert_eq!(raw["protocolProxyMapUnlistedModels"], json!(false));
 
-    // 旧 settings.json 没有该键时必须补默认 true，而不是落成 false。
+    // 旧 settings.json 没有该键时必须补默认 false，升级后行为不变。
     let settings: BackendSettings = serde_json::from_value(json!({
         "enhancementsEnabled": true,
         "codexAppThreadIdBadge": true,
     }))
     .unwrap();
-    assert!(settings.protocol_proxy_map_unlisted_models);
+    assert!(!settings.protocol_proxy_map_unlisted_models);
     assert!(settings.codex_app_thread_id_badge);
 }
 
@@ -31,16 +32,16 @@ fn map_unlisted_models_round_trips_and_partial_updates() {
     let store = SettingsStore::new(path.clone());
 
     let mut settings = BackendSettings::default();
-    settings.protocol_proxy_map_unlisted_models = false;
+    settings.protocol_proxy_map_unlisted_models = true;
     store.save(&settings).unwrap();
-    assert!(!store.load().unwrap().protocol_proxy_map_unlisted_models);
+    assert!(store.load().unwrap().protocol_proxy_map_unlisted_models);
 
     // 只改这一个键：必须命中 merge_known_setting_fields 白名单。
     store
-        .update(json!({"protocolProxyMapUnlistedModels": true}))
+        .update(json!({"protocolProxyMapUnlistedModels": false}))
         .unwrap();
-    assert!(store.load().unwrap().protocol_proxy_map_unlisted_models);
+    assert!(!store.load().unwrap().protocol_proxy_map_unlisted_models);
     let raw: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(raw["protocolProxyMapUnlistedModels"], json!(true));
+    assert_eq!(raw["protocolProxyMapUnlistedModels"], json!(false));
 }
