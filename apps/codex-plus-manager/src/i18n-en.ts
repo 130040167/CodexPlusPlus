@@ -298,7 +298,7 @@ export const EN_PLAIN: Record<string, string> = {
   "常用增强": "Common enhancements",
   "管理常用功能、语音输入与下一步建议。": "Manage common features, voice input, and next-step suggestions.",
   "打字特效（彩虹 P）": "Typing effects (Power Mode)",
-  "在 Codex 输入框的光标附近显示特效，保存后生效；系统减少动态效果时暂停。": "Show effects near the caret in the Codex composer after saving. Pause when the system prefers reduced motion.",
+  "在 Codex 输入框的光标附近显示特效；系统减少动态效果时暂停。": "Show effects near the caret in the Codex composer. Pause when the system prefers reduced motion.",
   "彩虹粒子": "Rainbow particles",
   "烟花": "Fireworks",
   "星光": "Stars",
@@ -331,7 +331,7 @@ export const EN_PLAIN: Record<string, string> = {
   "语音语言": "Speech language",
   "留空自动识别，例如 zh 或 en": "Leave blank to detect automatically, e.g. zh or en",
   "转写超时（秒）": "Transcription timeout (seconds)",
-  "保存后 Codex 输入框底部会显示麦克风图标，停止录音后可插入或发送文字。录音会发送到上面填写的服务地址，无需重启。": "After saving, a microphone icon appears at the bottom of the Codex composer. Stop recording to insert or send the text. Audio is sent to the service URL above. No restart is needed.",
+  "开启后 Codex 输入框底部会显示麦克风图标，停止录音后可插入或发送文字。录音会发送到上面填写的服务地址，无需重启。": "When enabled, a microphone icon appears at the bottom of the Codex composer. Stop recording to insert or send the text. Audio is sent to the service URL above. No restart is needed.",
   "语音 Base URL 必须是 HTTP(S) 基础地址，不能包含账号密码、查询参数或片段。": "The speech base URL must use HTTP(S) and must not include credentials, query parameters, or a fragment.",
   "启用语音输入时需要填写语音模型。": "Enter a speech model to enable voice input.",
   "语音 API Key 环境变量名称只能包含字母、数字和下划线，且不能以数字开头。": "The speech API key environment variable name must contain only letters, numbers, and underscores, and must not start with a number.",
@@ -412,8 +412,7 @@ export const EN_PLAIN: Record<string, string> = {
   "Codex增强": "Codex enhancements",
   "Debug 端口": "Debug port",
   "原生 Fast 强制解锁": "Force unlock native Fast",
-  "纯 API Key 模式恢复原生 Fast 开关；保存后重新启动 Codex 生效，实际支持与计费由供应商决定。":
-    "Restore the native Fast switch in API key mode; save and restart Codex to apply. Actual support and billing depend on the provider.",
+  "纯 API Key 模式恢复原生 Fast 开关；重新启动 Codex 后生效，实际支持与计费由供应商决定。": "Restore the native Fast switch in API key mode; restart Codex to apply. Actual support and billing depend on the provider.",
   "GitHub Release 更新": "GitHub Release update",
   "GitHub Release 检查": "GitHub Release check",
   "Helper 端口": "Helper port",
@@ -860,7 +859,6 @@ export const EN_PLAIN: Record<string, string> = {
   "供应商预设列表": "Provider preset list",
   "保存": "Save",
   "保存为默认路径": "Save as default path",
-  "保存增强设置": "Save enhancement settings",
   "保存扩展项": "Save entry",
   "保存的应用路径": "Saved app path",
   "保存自动修复设置": "Save auto-repair settings",
@@ -1019,8 +1017,7 @@ export const EN_PLAIN: Record<string, string> = {
   "启动任务": "Launch task",
   "启动前自动修复历史会话": "Auto-repair historical sessions before launch",
   "纯 API 模式禁用 Work 视图": "Disable Work view in Pure API mode",
-  "Work 视图要求 ChatGPT 账号身份，纯 API Key 下发送消息会报 Work browser access requires an authenticated account。开启后每次启动 Codex 前把详情模式写回 Codex；保存并重新启动 Codex 生效。":
-    "Work view requires a ChatGPT account identity; with a Pure API key, sending a message fails with \"Work browser access requires an authenticated account\". When enabled, the detail mode is switched back to Codex before each launch. Save and restart Codex to apply.",
+  "Work 视图要求 ChatGPT 账号身份，纯 API Key 下发送消息会报 Work browser access requires an authenticated account。开启后每次启动 Codex 前把详情模式写回 Codex；重新启动 Codex 后生效。": "Work view requires a ChatGPT account identity; with a Pure API key, sending a message fails with \"Work browser access requires an authenticated account\". When enabled, the detail mode is switched back to Codex before each launch. Restart Codex to apply.",
   "自动审批模型": "Auto-review model",
   "留空则原样转发 codex-auto-review": "Leave empty to forward codex-auto-review unchanged",
   "切换模型后旧会话跟随新默认": "Existing sessions follow the new default model",
@@ -1035,8 +1032,7 @@ export const EN_PLAIN: Record<string, string> = {
   "官方额度解锁": "Official quota unlock",
   "增强开启时此能力已自动生效；此开关只在关闭增强后生效。":
     "This capability is already active while enhancements are on; the switch only applies after enhancements are turned off.",
-  "官方登录 + API 供应商在官方订阅额度耗尽后仍可发送；只改客户端发送状态，不改变真实用量与计费。保存后重启 Codex 生效。":
-    "Official login + API providers can still send after the official subscription quota runs out. Only the client send state changes; real usage and billing are untouched. Restart Codex after saving.",
+  "官方登录 + API 供应商在官方订阅额度耗尽后仍可发送；只改客户端发送状态，不改变真实用量与计费。重启 Codex 后生效。": "Official login + API providers can still send after the official subscription quota runs out. Only the client send state changes; real usage and billing are untouched. Restart Codex to apply.",
   "启用供应商配置切换": "Enable provider configuration switching",
   "启用此扩展项": "Enable this entry",
   "包含测试模型、上下文大小与压缩阈值；留空即沿用全局默认值。":
@@ -1819,6 +1815,11 @@ export const EN_PLAIN: Record<string, string> = {
   "完整配置（JSON）": "Full configuration (JSON)",
   "与 settings.json 同形。切换时只写入其中的关键字段（ANTHROPIC_*、模型、鉴权等）和兼容开关、窗口值；其它键不会写入。": "Same shape as settings.json. Switching writes only its key fields (ANTHROPIC_*, models, auth, and so on) plus compatibility switches and window values. Other keys are not written.",
   "备注": "Notes",
+  // Codex增强页自动保存
+  "正在保存…": "Saving…",
+  "即将自动保存…": "Saving shortly…",
+  "改动会自动保存": "Changes are saved automatically",
+  "已自动保存": "Saved automatically",
 };
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
@@ -1980,6 +1981,9 @@ export const EN_TEMPLATE: Record<string, string> = {
   "删除供应商「{0}」？此操作不可撤销。": "Delete provider “{0}”? This cannot be undone.",
   "settings.json 无法解析，切换已暂停，不会覆盖它：{0}": "settings.json cannot be parsed. Switching is paused and the file will not be overwritten: {0}",
   "编辑「{0}」": "Edit “{0}”",
+  // Codex增强页自动保存
+  "未保存：{0}": "Not saved: {0}",
+  "自动保存失败：{0}": "Auto-save failed: {0}",
 };
 
 // Backend (Rust) messages returned via result.message. These are translated
