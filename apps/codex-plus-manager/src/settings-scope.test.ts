@@ -41,6 +41,14 @@ test("Agent 设置挂在各 Agent 的侧栏菜单，整体设置留在最左栏"
   assert.doesNotMatch(globalNavigation, /"agentSettings"/);
 });
 
+test("Computer Use 独立在最左栏，不再出现在每个 Agent 的菜单里", () => {
+  const sections = text.slice(text.indexOf("const navigationSections"), text.indexOf("const globalNavigationRoutes"));
+  assert.doesNotMatch(sections, /"computerUse"/);
+
+  const globalNavigation = text.slice(text.indexOf("const globalNavigationRoutes"), text.indexOf("const defaultSettings"));
+  assert.match(globalNavigation, /"computerUse"/);
+});
+
 test("Agent 设置标题跟随当前 Agent，整体设置标题固定", () => {
   const entry = functionSource("App");
   assert.match(entry, /route === "agentSettings" \? tf\("\{0\} 设置", \[activeToolName\]\) : routeTitle\(route\)/);

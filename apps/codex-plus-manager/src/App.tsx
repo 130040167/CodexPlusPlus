@@ -1219,7 +1219,7 @@ const navigationSections: Array<{ label: string; routes: Route[]; placement?: "b
   },
   {
     get label() { return t("扩展"); },
-    routes: ["weixin", "enhance", "dreamSkin", "userScripts", "pluginMarket", "computerUse"],
+    routes: ["weixin", "enhance", "dreamSkin", "userScripts", "pluginMarket"],
   },
   {
     get label() { return t("系统"); },
@@ -1228,8 +1228,12 @@ const navigationSections: Array<{ label: string; routes: Route[]; placement?: "b
   },
 ];
 
-/** 应用级入口放在最左栏；概览仍随当前 Agent 显示各自的状态。 */
-const globalNavigationRoutes: Route[] = ["recommendations", "agentCache", "agentCollaboration", "about", "settings"];
+/**
+ * 应用级入口放在最左栏；概览仍随当前 Agent 显示各自的状态。
+ * Computer Use 同时接入 Claude Code / Claude Desktop / DSH 等多个客户端，不属于任何一个 Agent，
+ * 所以和 Agent 协作一样放在这里，而不是重复出现在每个 Agent 的「扩展」分组里。
+ */
+const globalNavigationRoutes: Route[] = ["recommendations", "agentCache", "agentCollaboration", "computerUse", "about", "settings"];
 
 const defaultSettings: BackendSettings = {
   ...defaultWhaleBalanceSettings(),
