@@ -33,21 +33,55 @@ pub async fn computer_use_status() -> CommandResult<Value> {
     }
 }
 
+/// 前端传来的 target：内置目标的 id，或自定义目标的 `custom-…` id。
+enum TargetRef {
+    Builtin(codex_plus_core::computer_use::Target),
+    Custom(codex_plus_core::computer_use::CustomTarget),
+}
+
+impl TargetRef {
+    fn resolve(target: &str) -> anyhow::Result<Self> {
+        match codex_plus_core::computer_use::Target::parse(target) {
+            Ok(parsed) => Ok(Self::Builtin(parsed)),
+            Err(error) => codex_plus_core::computer_use::custom_target(target)
+                .map(Self::Custom)
+                .map_err(|_| error),
+        }
+    }
+
+    /// Claude Code 回合钩子要写的 settings.json；不是 Claude Code 时为 `None`。
+    fn hooks_path(&self) -> Option<std::path::PathBuf> {
+        match self {
+            Self::Builtin(codex_plus_core::computer_use::Target::ClaudeCode) => {
+                Some(codex_plus_core::claude_hooks::claude_settings_path())
+            }
+            Self::Builtin(_) => None,
+            Self::Custom(custom) => custom.claude_settings_path(),
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn computer_use_install(target: String) -> CommandResult<Value> {
-    let parsed = match codex_plus_core::computer_use::Target::parse(&target) {
+    let parsed = match TargetRef::resolve(&target) {
         Ok(target) => target,
         Err(error) => return failed(&error.to_string(), json!({})),
     };
-    match run_blocking(move || codex_plus_core::computer_use::install(parsed)).await {
+    let hooks_path = parsed.hooks_path();
+    let outcome = match parsed {
+        TargetRef::Builtin(builtin) => {
+            run_blocking(move || codex_plus_core::computer_use::install(builtin)).await
+        }
+        TargetRef::Custom(custom) => {
+            run_blocking(move || codex_plus_core::computer_use::install_custom(&custom.id)).await
+        }
+    };
+    match outcome {
         Ok(receipt) => {
             // 只有 Claude Code 有 hooks。装完 MCP 顺手挂上回合结束钩子，
             // 否则浏览器标签不会在回合结束时清理（见 claude_hooks 模块注释）。
-            let hooks = if parsed == codex_plus_core::computer_use::Target::ClaudeCode {
-                codex_plus_core::claude_hooks::install().ok()
-            } else {
-                None
-            };
+            let hooks = hooks_path
+                .and_then(|path| codex_plus_core::claude_hooks::install_at(&path).ok());
             let message = if receipt.changed {
                 "已接入；重启对应客户端后生效。"
             } else {
@@ -67,18 +101,24 @@ pub async fn computer_use_install(target: String) -> CommandResult<Value> {
 
 #[tauri::command]
 pub async fn computer_use_uninstall(target: String) -> CommandResult<Value> {
-    let parsed = match codex_plus_core::computer_use::Target::parse(&target) {
+    let parsed = match TargetRef::resolve(&target) {
         Ok(target) => target,
         Err(error) => return failed(&error.to_string(), json!({})),
     };
-    match run_blocking(move || codex_plus_core::computer_use::uninstall(parsed)).await {
+    let hooks_path = parsed.hooks_path();
+    let outcome = match parsed {
+        TargetRef::Builtin(builtin) => {
+            run_blocking(move || codex_plus_core::computer_use::uninstall(builtin)).await
+        }
+        TargetRef::Custom(custom) => {
+            run_blocking(move || codex_plus_core::computer_use::uninstall_custom(&custom.id)).await
+        }
+    };
+    match outcome {
         Ok(receipt) => {
             // 撤掉接入时同步摘掉回合结束钩子，别在用户不用的客户端里留一条空命令。
-            let hooks = if parsed == codex_plus_core::computer_use::Target::ClaudeCode {
-                codex_plus_core::claude_hooks::uninstall().ok()
-            } else {
-                None
-            };
+            let hooks = hooks_path
+                .and_then(|path| codex_plus_core::claude_hooks::uninstall_at(&path).ok());
             let message = if receipt.changed {
                 "已移除接入；原配置已备份。"
             } else {
@@ -90,6 +130,47 @@ pub async fn computer_use_uninstall(target: String) -> CommandResult<Value> {
             }
             ok(message, payload)
         }
+        Err(error) => failed(&error, json!({})),
+    }
+}
+
+/// 新增自定义接入目标（只登记，不写客户端配置；接入仍由用户点「接入」触发）。
+#[tauri::command]
+pub async fn computer_use_custom_add(kind: String, path: String) -> CommandResult<Value> {
+    let kind = match codex_plus_core::computer_use::Target::parse(&kind) {
+        Ok(kind) => kind,
+        Err(error) => return failed(&error.to_string(), json!({})),
+    };
+    let outcome = run_blocking(move || {
+        codex_plus_core::computer_use::add_custom_target(kind, &path)?;
+        codex_plus_core::computer_use::status()
+    })
+    .await;
+    match outcome {
+        Ok(report) => ok(
+            "已添加自定义目标；点「接入」写入配置。",
+            serde_json::to_value(report).unwrap_or_else(|_| json!({})),
+        ),
+        Err(error) => failed(&error, json!({})),
+    }
+}
+
+/// 删除自定义目标：先撤掉我们写入的条目与回合钩子，再从列表里去掉。
+#[tauri::command]
+pub async fn computer_use_custom_remove(id: String) -> CommandResult<Value> {
+    let outcome = run_blocking(move || {
+        let custom = codex_plus_core::computer_use::custom_target(&id)?;
+        if let Some(path) = custom.claude_settings_path() {
+            codex_plus_core::claude_hooks::uninstall_at(&path)?;
+        }
+        codex_plus_core::computer_use::remove_custom_target(&id)
+    })
+    .await;
+    match outcome {
+        Ok(report) => ok(
+            "已删除自定义目标，并移除了写入它配置里的条目。",
+            serde_json::to_value(report).unwrap_or_else(|_| json!({})),
+        ),
         Err(error) => failed(&error, json!({})),
     }
 }

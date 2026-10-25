@@ -100,7 +100,12 @@ pub struct HookReceipt {
 
 /// 把回合结束钩子装进 Claude Code 的 settings.json。
 pub fn install() -> anyhow::Result<HookReceipt> {
-    let path = claude_settings_path();
+    install_at(&claude_settings_path())
+}
+
+/// 装进指定的 settings.json：自定义配置目录（`CLAUDE_CONFIG_DIR` 布局）用。
+pub fn install_at(path: &Path) -> anyhow::Result<HookReceipt> {
+    let path = path.to_path_buf();
     let command = hook_command()?;
     let mut document = read_settings(&path)?;
     let backup = backup_settings(&path)?;
@@ -125,7 +130,12 @@ pub fn install() -> anyhow::Result<HookReceipt> {
 
 /// 移除我们装的钩子；别人的钩子不动。
 pub fn uninstall() -> anyhow::Result<HookReceipt> {
-    let path = claude_settings_path();
+    uninstall_at(&claude_settings_path())
+}
+
+/// 从指定的 settings.json 移除我们的钩子。
+pub fn uninstall_at(path: &Path) -> anyhow::Result<HookReceipt> {
+    let path = path.to_path_buf();
     if !path.is_file() {
         return Ok(HookReceipt {
             changed: false,

@@ -344,6 +344,18 @@ pub struct StatusReport {
     pub service_path: Option<String>,
     pub config_hint: Option<String>,
     pub targets: BTreeMap<String, TargetStatus>,
+    /// 用户自定义的目标，按添加顺序排列。
+    pub custom_targets: Vec<CustomTargetStatus>,
+}
+
+/// 自定义目标的状态：在 `TargetStatus` 之外带上类型与用户填写的路径。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomTargetStatus {
+    #[serde(flatten)]
+    pub status: TargetStatus,
+    pub kind: Target,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -353,6 +365,7 @@ pub struct InstallReceipt {
     pub changed: bool,
     pub backup_path: Option<String>,
     pub targets: BTreeMap<String, TargetStatus>,
+    pub custom_targets: Vec<CustomTargetStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -562,6 +575,225 @@ fn config_paths(target: Target) -> Vec<PathBuf> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 自定义接入目标
+// ---------------------------------------------------------------------------
+
+/// 允许自定义目录的客户端类型。与前端列出的内置目标一致：Codex 自己会写
+/// `[mcp_servers.computer-use]`，不提供。
+pub const CUSTOM_KINDS: [Target; 5] = [
+    Target::ClaudeCode,
+    Target::ClaudeDesktop,
+    Target::Dsh,
+    Target::Zcode,
+    Target::WorkBuddy,
+];
+
+const CUSTOM_STORE_FILE: &str = "computer-use-targets.json";
+const CUSTOM_ID_PREFIX: &str = "custom-";
+
+/// 用户自定义的接入目标：同一种客户端，换一个配置目录。
+///
+/// 典型场景是客户端被包装器换了配置目录（例如 reclaude 给 Claude Code 设置
+/// `CLAUDE_CONFIG_DIR`），内置目标写的默认路径它根本不读。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomTarget {
+    pub id: String,
+    pub kind: Target,
+    /// 用户填写的路径，原样保存：可以是配置目录，也可以直接是配置文件。
+    pub path: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct CustomStore {
+    #[serde(default)]
+    targets: Vec<CustomTarget>,
+}
+
+impl Target {
+    /// 配置目录里该客户端的配置文件名。
+    fn config_file_name(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => ".claude.json",
+            Self::ClaudeDesktop => "claude_desktop_config.json",
+            Self::Codex => "config.toml",
+            Self::Dsh => "cordis.patch.yml",
+            Self::Zcode => "config.json",
+            Self::WorkBuddy => "mcp.json",
+        }
+    }
+}
+
+impl CustomTarget {
+    /// 实际读写的配置文件。
+    pub fn config_path(&self) -> PathBuf {
+        self.config_path_in(&home_dir())
+    }
+
+    fn config_path_in(&self, home: &Path) -> PathBuf {
+        resolve_custom_path(self.kind, &self.path, home)
+    }
+
+    /// Claude Code 回合钩子所在的 settings.json：与配置文件同目录，
+    /// 和 `CLAUDE_CONFIG_DIR` 的布局一致。其他类型没有钩子。
+    pub fn claude_settings_path(&self) -> Option<PathBuf> {
+        (self.kind == Target::ClaudeCode)
+            .then(|| self.config_path().with_file_name("settings.json"))
+    }
+}
+
+/// 把用户输入解析成配置文件路径。
+///
+/// `~` 展开为家目录；已存在的目录、或没有配置扩展名的路径按目录处理并拼上该类型的
+/// 文件名；已存在的文件或带 json/toml/yml 扩展名的按文件原样使用。
+fn resolve_custom_path(kind: Target, input: &str, home: &Path) -> PathBuf {
+    let trimmed = input.trim();
+    let expanded = if trimmed == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        PathBuf::from(trimmed)
+    };
+    if expanded.is_dir() {
+        return expanded.join(kind.config_file_name());
+    }
+    let looks_like_file = expanded.is_file()
+        || expanded
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| matches!(ext, "json" | "toml" | "yml" | "yaml"));
+    if looks_like_file {
+        expanded
+    } else {
+        expanded.join(kind.config_file_name())
+    }
+}
+
+fn custom_store_path() -> PathBuf {
+    crate::paths::default_app_state_dir().join(CUSTOM_STORE_FILE)
+}
+
+fn load_custom_from(path: &Path) -> anyhow::Result<Vec<CustomTarget>> {
+    let Some(text) = read_text(path)? else {
+        return Ok(Vec::new());
+    };
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let store: CustomStore = serde_json::from_str(&text)
+        .with_context(|| format!("{} 不是合法 JSON，未读取自定义目标", path.display()))?;
+    Ok(store.targets)
+}
+
+fn save_custom_to(path: &Path, targets: &[CustomTarget]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("无法创建目录 {}", parent.display()))?;
+    }
+    let store = CustomStore { targets: targets.to_vec() };
+    let text = format!("{}\n", serde_json::to_string_pretty(&store)?);
+    crate::settings::atomic_write(path, text.as_bytes())
+        .with_context(|| format!("无法保存 {}", path.display()))
+}
+
+/// 已保存的自定义目标。存储文件损坏时返回空列表，由增删操作报错，不在查询时打断页面。
+pub fn custom_targets() -> Vec<CustomTarget> {
+    load_custom_from(&custom_store_path()).unwrap_or_default()
+}
+
+pub fn custom_target(id: &str) -> anyhow::Result<CustomTarget> {
+    load_custom_from(&custom_store_path())?
+        .into_iter()
+        .find(|target| target.id == id)
+        .with_context(|| format!("找不到自定义接入目标：{id}"))
+}
+
+/// 新增一个自定义目标（只登记，不写客户端配置）。
+pub fn add_custom_target(kind: Target, path: &str) -> anyhow::Result<CustomTarget> {
+    with_lock(|| add_custom_in(&custom_store_path(), kind, path, &home_dir()))
+}
+
+fn add_custom_in(
+    store: &Path,
+    kind: Target,
+    input: &str,
+    home: &Path,
+) -> anyhow::Result<CustomTarget> {
+    ensure!(CUSTOM_KINDS.contains(&kind), "{} 不支持自定义配置目录", kind.label());
+    let trimmed = input.trim();
+    ensure!(!trimmed.is_empty(), "请填写配置目录");
+    let file = resolve_custom_path(kind, trimmed, home);
+    ensure!(
+        file.is_absolute(),
+        "请填写绝对路径（可用 ~ 表示家目录）：{trimmed}"
+    );
+    let dir = file.parent().unwrap_or(&file);
+    ensure!(dir.is_dir(), "目录不存在：{}", dir.display());
+    ensure!(
+        !config_paths(kind).contains(&file),
+        "{} 是 {} 的默认配置，内置目标已经覆盖",
+        file.display(),
+        kind.label()
+    );
+    let mut targets = load_custom_from(store)?;
+    ensure!(
+        !targets
+            .iter()
+            .any(|target| target.kind == kind && target.config_path_in(home) == file),
+        "已经添加过：{}",
+        file.display()
+    );
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
+    let mut id = format!("{CUSTOM_ID_PREFIX}{stamp}");
+    let mut suffix = 1;
+    while targets.iter().any(|target| target.id == id) {
+        id = format!("{CUSTOM_ID_PREFIX}{stamp}-{suffix}");
+        suffix += 1;
+    }
+    let target = CustomTarget { id, kind, path: trimmed.to_string() };
+    targets.push(target.clone());
+    save_custom_to(store, &targets)?;
+    Ok(target)
+}
+
+/// 删除自定义目标：先撤掉我们写进它配置里的条目，再从列表里去掉。
+/// 别人写的条目一律不动，与内置目标的「移除」一致。
+pub fn remove_custom_target(id: &str) -> anyhow::Result<StatusReport> {
+    let target = custom_target(id)?;
+    uninstall_at(target.kind, &[target.config_path()])?;
+    with_lock(|| {
+        let store = custom_store_path();
+        let mut targets = load_custom_from(&store)?;
+        targets.retain(|item| item.id != id);
+        save_custom_to(&store, &targets)
+    })?;
+    status()
+}
+
+pub fn install_custom(id: &str) -> anyhow::Result<InstallReceipt> {
+    let target = custom_target(id)?;
+    let runtime =
+        locate_runtime()?.context("未找到 Codex 运行时（ChatGPT.app），无法接入 Computer Use")?;
+    let file = target.config_path();
+    if let Some(dir) = file.parent() {
+        ensure!(dir.is_dir(), "目录不存在：{}", dir.display());
+    }
+    let mut receipt = install_at(&runtime, target.kind, &[file])?;
+    receipt.target = target.id;
+    Ok(receipt)
+}
+
+pub fn uninstall_custom(id: &str) -> anyhow::Result<InstallReceipt> {
+    let target = custom_target(id)?;
+    let mut receipt = uninstall_at(target.kind, &[target.config_path()])?;
+    receipt.target = target.id;
+    Ok(receipt)
+}
+
 
 fn lock_path() -> PathBuf {
     crate::paths::default_app_state_dir().join(".computer-use.lock")
@@ -581,6 +813,10 @@ pub fn status() -> anyhow::Result<StatusReport> {
             target_status(target, runtime.as_ref()),
         );
     }
+    let custom_targets = custom_targets()
+        .iter()
+        .map(|custom| custom_status(custom, runtime.as_ref()))
+        .collect();
     Ok(StatusReport {
         runtime_found: runtime.is_some(),
         claude_desktop_running: claude_desktop_running(),
@@ -593,6 +829,7 @@ pub fn status() -> anyhow::Result<StatusReport> {
             "未找到 ChatGPT.app：请先安装 Codex 桌面版，或把应用放进 /Applications".to_string()
         }),
         targets,
+        custom_targets,
     })
 }
 
@@ -627,7 +864,28 @@ fn claude_desktop_running() -> bool {
 }
 
 fn target_status(target: Target, runtime: Option<&RuntimeLocation>) -> TargetStatus {
-    let config_paths = config_paths(target);
+    status_at(target, &config_paths(target), runtime, target.tool_home_missing())
+}
+
+fn custom_status(custom: &CustomTarget, runtime: Option<&RuntimeLocation>) -> CustomTargetStatus {
+    let file = custom.config_path();
+    // 自定义目录不存在时不替用户建目录，和内置目标「工具没装」同样处理。
+    let dir_missing = file
+        .parent()
+        .filter(|dir| !dir.is_dir())
+        .map(|dir| format!("目录不存在：{}", dir.display()));
+    let mut status = status_at(custom.kind, &[file], runtime, dir_missing);
+    status.id = custom.id.clone();
+    CustomTargetStatus { status, kind: custom.kind, path: custom.path.clone() }
+}
+
+/// 按给定的配置文件判定接入状态。`home_missing` 非空时直接判为不支持。
+fn status_at(
+    target: Target,
+    config_paths: &[PathBuf],
+    runtime: Option<&RuntimeLocation>,
+    home_missing: Option<String>,
+) -> TargetStatus {
     let path_text = config_paths
         .iter()
         .map(|path| path.to_string_lossy().into_owned())
@@ -644,7 +902,7 @@ fn target_status(target: Target, runtime: Option<&RuntimeLocation>) -> TargetSta
     let Some(runtime) = runtime else {
         return unsupported("未找到 Codex 运行时（ChatGPT.app）".into());
     };
-    if let Some(message) = target.tool_home_missing() {
+    if let Some(message) = home_missing {
         return unsupported(message);
     }
     let outcome = match target {
@@ -655,7 +913,7 @@ fn target_status(target: Target, runtime: Option<&RuntimeLocation>) -> TargetSta
             let mut stale = 0usize;
             let mut foreign: Option<String> = None;
             let mut failure: Option<String> = None;
-            for path in &config_paths {
+            for path in config_paths {
                 for (id, expected) in runtime.managed_entries() {
                     match read_json_entry(path, key_path, id) {
                         Ok(Some(existing)) if entry_matches(&existing, &expected) => {
@@ -758,13 +1016,22 @@ pub fn install(target: Target) -> anyhow::Result<InstallReceipt> {
     if let Some(message) = target.tool_home_missing() {
         bail!("{message}");
     }
+    install_at(&runtime, target, &config_paths(target))
+}
+
+/// 把条目写进给定的配置文件。内置目标与自定义目标共用。
+fn install_at(
+    runtime: &RuntimeLocation,
+    target: Target,
+    config_paths: &[PathBuf],
+) -> anyhow::Result<InstallReceipt> {
     with_lock(|| match target {
         Target::ClaudeCode | Target::ClaudeDesktop | Target::Zcode | Target::WorkBuddy => {
             let key_path = target.json_key_path().unwrap_or(&["mcpServers"]);
             let mut changed = false;
             let mut backup: Option<PathBuf> = None;
-            for path in &config_paths(target) {
-                let receipt = install_json_entry(path, key_path, &runtime, target)?;
+            for path in config_paths {
+                let receipt = install_json_entry(path, key_path, runtime, target)?;
                 changed |= receipt.changed;
                 if backup.is_none() {
                     backup = receipt.backup_path.map(PathBuf::from);
@@ -777,15 +1044,15 @@ pub fn install(target: Target) -> anyhow::Result<InstallReceipt> {
                 std::path::Path::new(&runtime.cua_repl).is_file(),
                 "当前 ChatGPT.app 不再提供 cua-repl，Codex 目标不可用（Claude 目标不受影响）"
             );
-            install_codex_entry(&codex_config_path(), &runtime, target)
+            install_codex_entry(&config_paths[0], runtime, target)
         }
         Target::Dsh => {
-            let path = dsh_config_path();
-            let before = read_text(&path)?;
-            match dsh::install(before.as_deref(), &runtime, &path)? {
+            let path = &config_paths[0];
+            let before = read_text(path)?;
+            match dsh::install(before.as_deref(), runtime, path)? {
                 None => receipt(target, false, None),
                 Some(rendered) => {
-                    let backup = write_with_backup(&path, before.as_deref(), &rendered)?;
+                    let backup = write_with_backup(path, before.as_deref(), &rendered)?;
                     receipt(target, true, backup)
                 }
             }
@@ -794,12 +1061,17 @@ pub fn install(target: Target) -> anyhow::Result<InstallReceipt> {
 }
 
 pub fn uninstall(target: Target) -> anyhow::Result<InstallReceipt> {
+    uninstall_at(target, &config_paths(target))
+}
+
+/// 从给定的配置文件里撤掉本功能写入的条目。内置目标与自定义目标共用。
+fn uninstall_at(target: Target, config_paths: &[PathBuf]) -> anyhow::Result<InstallReceipt> {
     with_lock(|| match target {
         Target::ClaudeCode | Target::ClaudeDesktop | Target::Zcode | Target::WorkBuddy => {
             let key_path = target.json_key_path().unwrap_or(&["mcpServers"]);
             let mut changed = false;
             let mut backup: Option<PathBuf> = None;
-            for path in &config_paths(target) {
+            for path in config_paths {
                 let receipt = uninstall_json_entry(path, key_path, target)?;
                 changed |= receipt.changed;
                 if backup.is_none() {
@@ -808,16 +1080,16 @@ pub fn uninstall(target: Target) -> anyhow::Result<InstallReceipt> {
             }
             receipt(target, changed, backup)
         }
-        Target::Codex => uninstall_codex_entry(&codex_config_path(), target),
+        Target::Codex => uninstall_codex_entry(&config_paths[0], target),
         Target::Dsh => {
-            let path = dsh_config_path();
-            let Some(before) = read_text(&path)? else {
+            let path = &config_paths[0];
+            let Some(before) = read_text(path)? else {
                 return receipt(target, false, None);
             };
             match dsh::uninstall(&before) {
                 None => receipt(target, false, None),
                 Some(rendered) => {
-                    let backup = write_with_backup(&path, Some(&before), &rendered)?;
+                    let backup = write_with_backup(path, Some(&before), &rendered)?;
                     receipt(target, true, backup)
                 }
             }
@@ -990,6 +1262,7 @@ fn receipt(
         changed,
         backup_path: backup_path.map(|path| path.to_string_lossy().into_owned()),
         targets: status.targets,
+        custom_targets: status.custom_targets,
     })
 }
 
@@ -1835,5 +2108,124 @@ mod tests {
             classify("Sky Computer Use native pipe is unavailable: refused", true),
             "service_unavailable"
         );
+    }
+
+    #[test]
+    fn custom_path_appends_file_name_for_directories() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        let dir = home.join("cfg");
+        fs::create_dir_all(&dir).unwrap();
+
+        // 已存在的目录：拼上该类型的配置文件名。
+        assert_eq!(
+            resolve_custom_path(Target::ClaudeCode, dir.to_str().unwrap(), home),
+            dir.join(".claude.json")
+        );
+        assert_eq!(
+            resolve_custom_path(Target::ClaudeDesktop, dir.to_str().unwrap(), home),
+            dir.join("claude_desktop_config.json")
+        );
+        // `~` 展开，首尾空白忽略。
+        assert_eq!(
+            resolve_custom_path(Target::WorkBuddy, "  ~/cfg ", home),
+            dir.join("mcp.json")
+        );
+        // 还不存在、但带配置扩展名的按文件原样使用。
+        let file = dir.join("custom.json");
+        assert_eq!(resolve_custom_path(Target::Zcode, file.to_str().unwrap(), home), file);
+        // 还不存在、也没有扩展名的当目录。
+        let later = home.join("later");
+        assert_eq!(
+            resolve_custom_path(Target::Dsh, later.to_str().unwrap(), home),
+            later.join("cordis.patch.yml")
+        );
+    }
+
+    #[test]
+    fn add_custom_target_validates_and_persists() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        let store = home.join("state").join(CUSTOM_STORE_FILE);
+        let dir = home.join(".rec/config");
+        fs::create_dir_all(&dir).unwrap();
+
+        let first = add_custom_in(&store, Target::ClaudeCode, "~/.rec/config", home).unwrap();
+        assert!(first.id.starts_with(CUSTOM_ID_PREFIX));
+        assert_eq!(first.path, "~/.rec/config");
+        assert_eq!(load_custom_from(&store).unwrap(), vec![first.clone()]);
+
+        // 同类型同文件不能重复添加；同目录换个类型可以。
+        let duplicate = add_custom_in(&store, Target::ClaudeCode, dir.to_str().unwrap(), home);
+        assert!(duplicate.unwrap_err().to_string().contains("已经添加过"));
+        let second = add_custom_in(&store, Target::ClaudeDesktop, "~/.rec/config", home).unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(load_custom_from(&store).unwrap().len(), 2);
+
+        // 目录不存在、相对路径、空路径、不支持的类型都拒绝，且不改存储。
+        assert!(add_custom_in(&store, Target::ClaudeCode, "~/missing/dir", home)
+            .unwrap_err()
+            .to_string()
+            .contains("目录不存在"));
+        assert!(add_custom_in(&store, Target::ClaudeCode, "relative/dir", home)
+            .unwrap_err()
+            .to_string()
+            .contains("绝对路径"));
+        assert!(add_custom_in(&store, Target::ClaudeCode, "   ", home).is_err());
+        assert!(add_custom_in(&store, Target::Codex, "~/.rec/config", home).is_err());
+        assert_eq!(load_custom_from(&store).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn corrupt_custom_store_is_reported_not_overwritten() {
+        let temp = TempDir::new().unwrap();
+        let store = temp.path().join(CUSTOM_STORE_FILE);
+        fs::write(&store, "{ not json").unwrap();
+        assert!(load_custom_from(&store).is_err());
+        let dir = temp.path().join("cfg");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(add_custom_in(&store, Target::ClaudeCode, dir.to_str().unwrap(), temp.path()).is_err());
+        assert_eq!(fs::read_to_string(&store).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn custom_status_follows_the_custom_file() {
+        let temp = TempDir::new().unwrap();
+        let runtime = sample_runtime(temp.path());
+        let dir = temp.path().join("rec-config");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(".claude.json");
+
+        let before = status_at(Target::ClaudeCode, &[file.clone()], Some(&runtime), None);
+        assert_eq!(before.state, "missing");
+        assert_eq!(before.config_path, file.to_string_lossy());
+
+        install_json_entry(&file, &["mcpServers"], &runtime, Target::ClaudeCode).unwrap();
+        let after = status_at(Target::ClaudeCode, &[file.clone()], Some(&runtime), None);
+        assert_eq!(after.state, "registered");
+
+        // 目录缺失时直接判为不支持，不去读文件。
+        let gone = status_at(
+            Target::ClaudeCode,
+            &[file],
+            Some(&runtime),
+            Some("目录不存在：x".into()),
+        );
+        assert_eq!(gone.state, "unsupported");
+    }
+
+    #[test]
+    fn custom_claude_code_hooks_live_next_to_the_config() {
+        let target = CustomTarget {
+            id: "custom-1".into(),
+            kind: Target::ClaudeCode,
+            path: "/tmp/rec/config/.claude.json".into(),
+        };
+        assert_eq!(
+            target.claude_settings_path(),
+            Some(PathBuf::from("/tmp/rec/config/settings.json"))
+        );
+        let desktop = CustomTarget { kind: Target::ClaudeDesktop, ..target };
+        assert_eq!(desktop.claude_settings_path(), None);
     }
 }

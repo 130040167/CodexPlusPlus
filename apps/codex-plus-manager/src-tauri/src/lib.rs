@@ -263,6 +263,8 @@ pub fn run() {
             computer_use_commands::computer_use_status,
             computer_use_commands::computer_use_install,
             computer_use_commands::computer_use_uninstall,
+            computer_use_commands::computer_use_custom_add,
+            computer_use_commands::computer_use_custom_remove,
             computer_use_commands::computer_use_check,
             computer_use_commands::computer_use_open_app,
             computer_use_commands::computer_use_browser_extension_status,

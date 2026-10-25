@@ -1,7 +1,8 @@
 /** Computer Use：复用 Codex app 的 Computer Use 与 Chrome 控制，通过 MCP 提供给 Claude Code、DeepSeek Harness、ZCode 等客户端。 */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { AlertTriangle, CheckCircle2, Loader2, MonitorSmartphone, Play, Plug, RefreshCw, Unplug } from "lucide-react";
+import { confirm, open } from "@tauri-apps/plugin-dialog";
+import { AlertTriangle, CheckCircle2, FolderOpen, Loader2, MonitorSmartphone, Play, Plug, Plus, RefreshCw, Trash2, Unplug } from "lucide-react";
 import { ComputerUsePreview } from "./ComputerUsePreview";
 import { PageHeader } from "./ManagementPages";
 import { t } from "./i18n";
@@ -11,6 +12,8 @@ type CuTargetId = "claudeCode" | "claudeDesktop" | "codex" | "dsh" | "zcode" | "
 type CuTargetState = "registered" | "missing" | "needs_update" | "foreign" | "unsupported";
 type CuTarget = { id: string; label: string; configPath: string; registered: boolean; state: CuTargetState; message: string };
 type CuTargets = Record<CuTargetId, CuTarget>;
+/** 自定义目标：同一种客户端换一个配置目录，id 形如 `custom-…`。 */
+type CuCustomTarget = CuTarget & { kind: CuTargetId; path: string };
 type CuStatus = {
   status: string;
   message: string;
@@ -21,8 +24,9 @@ type CuStatus = {
   servicePath?: string;
   configHint?: string;
   targets?: Partial<CuTargets>;
+  customTargets?: CuCustomTarget[];
 };
-type CuMutation = { status: string; message: string; changed: boolean; backupPath?: string; targets?: Partial<CuTargets> };
+type CuMutation = { status: string; message: string; changed: boolean; backupPath?: string; targets?: Partial<CuTargets>; customTargets?: CuCustomTarget[] };
 type CuFailureKind = "runtime_missing" | "untrusted_parent" | "permission_required" | "client_unsupported" | "service_unavailable" | "error";
 type CuCheck = {
   status: string;
@@ -69,6 +73,17 @@ const elidePath = (value: string, limit = 52) => {
   const tail = limit - head - 1;
   return `${value.slice(0, head)}…${value.slice(-tail)}`;
 };
+// 自定义目标可选的类型，与上面列出的内置目标一致。
+const customKinds: CuTargetId[] = targetIds;
+// 输入框占位说明：告诉用户该填哪一层目录。渲染时再过 t()。
+const customDirHint: Record<CuTargetId, string> = {
+  claudeCode: "CLAUDE_CONFIG_DIR 指向的目录（里面有 .claude.json）",
+  claudeDesktop: "包含 claude_desktop_config.json 的目录",
+  codex: "包含 config.toml 的目录",
+  dsh: "包含 cordis.patch.yml 的目录",
+  zcode: "包含 config.json 的目录",
+  workBuddy: "包含 mcp.json 的目录",
+};
 const removable = (state?: CuTargetState) => state === "registered" || state === "needs_update" || state === "foreign";
 const installable = (state?: CuTargetState) => state === "missing" || state === "needs_update" || state === "foreign";
 
@@ -97,7 +112,9 @@ function failureText(check: CuCheck): string {
 export function ComputerUsePage() {
   const [status, setStatus] = useState<CuStatus | null>(null);
   const [check, setCheck] = useState<CuCheck | null>(null);
-  const [backups, setBackups] = useState<Partial<Record<CuTargetId, string>>>({});
+  const [backups, setBackups] = useState<Record<string, string>>({});
+  const [newKind, setNewKind] = useState<CuTargetId>("claudeCode");
+  const [newPath, setNewPath] = useState("");
   const [busy, setBusy] = useState("");
   const [readError, setReadError] = useState("");
   const [actionError, setActionError] = useState("");
@@ -241,18 +258,28 @@ export function ComputerUsePage() {
     }
   };
 
-  const mutateTarget = async (target: CuTargetId, action: "install" | "uninstall") => {
+  /** `target` 是内置目标 id 或自定义目标的 `custom-…` id。 */
+  const mutateTarget = async (target: string, action: "install" | "uninstall") => {
     if (lock.current) return;
     lock.current = true;
     const stamp = ++epoch.current;
-    const label = status?.targets?.[target]?.label || targetFallback[target].label;
+    const custom = status?.customTargets?.find((item) => item.id === target);
+    const label = custom
+      ? `${custom.label} · ${t("自定义")}`
+      : status?.targets?.[target as CuTargetId]?.label || targetFallback[target as CuTargetId]?.label || target;
     setBusy(`${action}:${target}`);
     setActionError("");
     setNotice("");
     try {
       const result = await invoke<CuMutation>(action === "install" ? "computer_use_install" : "computer_use_uninstall", { target });
       if (!mounted.current || epoch.current !== stamp) return;
-      if (result.targets) setStatus((current) => (current ? { ...current, targets: { ...current.targets, ...result.targets } } : current));
+      if (result.targets || result.customTargets) {
+        setStatus((current) => (current ? {
+          ...current,
+          targets: { ...current.targets, ...result.targets },
+          customTargets: result.customTargets ?? current.customTargets,
+        } : current));
+      }
       if (result.status === "ok") {
         setNotice(action === "install" ? `${label} · ${t("已接入，重启客户端后加载工具")}` : `${label} · ${t("已移除")}`);
         setBackups((current) => {
@@ -263,6 +290,78 @@ export function ComputerUsePage() {
         });
       } else {
         setActionError(result.message || t("操作失败，请重试。"));
+      }
+    } catch (reason) {
+      if (mounted.current && epoch.current === stamp) setActionError(errorText(reason));
+    } finally {
+      if (mounted.current && epoch.current === stamp) {
+        lock.current = false;
+        setBusy("");
+      }
+    }
+  };
+
+  const pickCustomDir = async () => {
+    try {
+      const picked = await open({ directory: true, multiple: false, title: t("选择客户端实际读取的配置目录") });
+      if (typeof picked === "string" && mounted.current) setNewPath(picked);
+    } catch (reason) {
+      if (mounted.current) setActionError(errorText(reason));
+    }
+  };
+
+  const addCustomTarget = async () => {
+    if (lock.current || !newPath.trim()) return;
+    lock.current = true;
+    const stamp = ++epoch.current;
+    setBusy("custom:add");
+    setActionError("");
+    setNotice("");
+    try {
+      const result = await invoke<CuStatus>("computer_use_custom_add", { kind: newKind, path: newPath.trim() });
+      if (!mounted.current || epoch.current !== stamp) return;
+      if (result.status === "ok") {
+        setStatus(result);
+        setNewPath("");
+        setNotice(result.message || t("已添加自定义目标；点「接入」写入配置。"));
+      } else {
+        setActionError(result.message || t("添加失败，请重试。"));
+      }
+    } catch (reason) {
+      if (mounted.current && epoch.current === stamp) setActionError(errorText(reason));
+    } finally {
+      if (mounted.current && epoch.current === stamp) {
+        lock.current = false;
+        setBusy("");
+      }
+    }
+  };
+
+  const removeCustomTarget = async (target: CuCustomTarget) => {
+    if (lock.current) return;
+    const confirmed = await confirm(
+      `${t("删除后会先移除写入")} ${target.configPath} ${t("的 Codex++ 条目（别人写的不动），再从列表里去掉。")}`,
+      { title: t("删除自定义目标"), kind: "warning" },
+    );
+    if (!confirmed || !mounted.current) return;
+    lock.current = true;
+    const stamp = ++epoch.current;
+    setBusy(`custom:remove:${target.id}`);
+    setActionError("");
+    setNotice("");
+    try {
+      const result = await invoke<CuStatus>("computer_use_custom_remove", { id: target.id });
+      if (!mounted.current || epoch.current !== stamp) return;
+      if (result.status === "ok") {
+        setStatus(result);
+        setBackups((current) => {
+          const next = { ...current };
+          delete next[target.id];
+          return next;
+        });
+        setNotice(result.message || t("已删除自定义目标。"));
+      } else {
+        setActionError(result.message || t("删除失败，请重试。"));
       }
     } catch (reason) {
       if (mounted.current && epoch.current === stamp) setActionError(errorText(reason));
@@ -299,6 +398,38 @@ export function ComputerUsePage() {
   const loading = busy === "refresh" && !status;
   const found = status?.runtimeFound === true;
   const apps = (check?.sampleApps ?? []).slice(0, 8);
+
+  /** 一行接入目标。内置与自定义共用；传了 `custom` 才显示「自定义」标记和删除按钮。 */
+  const renderTarget = (id: string, target: CuTarget | undefined, label: string, configPath: string, custom?: CuCustomTarget) => {
+    const state = target?.state ?? "missing";
+    const backup = backups[id];
+    const installing = busy === `install:${id}`;
+    const removing = busy === `uninstall:${id}`;
+    const deleting = busy === `custom:remove:${id}`;
+    return <div className="cu-target" key={id} data-custom={custom ? "true" : undefined}>
+      <div className="cu-target-main">
+        <div className="cu-target-title">
+          <strong>{label}</strong>
+          {custom && <span className="cu-badge cu-badge-custom">{t("自定义")}</span>}
+          <span className="cu-badge" data-state={status ? state : "unknown"}>{status ? stateLabel(state) : t("未检测")}</span>
+        </div>
+        <code className="cu-target-path" title={configPath}>{elidePath(configPath)}</code>
+        {target?.message && <small className="cu-target-message">{target.message}</small>}
+        {backup && <small className="cu-target-backup">{t("已备份到")}<code title={backup}>{elidePath(backup)}</code></small>}
+      </div>
+      <div className="cu-target-actions">
+        {custom && <button className="mg-button" type="button" disabled={locked} title={t("移除写入的条目并删除这个自定义目标")} onClick={() => void removeCustomTarget(custom)}>
+          {deleting ? <Loader2 size={14} className="cu-spin" /> : <Trash2 size={14} />}{deleting ? t("删除中…") : t("删除")}
+        </button>}
+        <button className="mg-button" type="button" disabled={locked || !status || !removable(state)} onClick={() => void mutateTarget(id, "uninstall")}>
+          {removing ? <Loader2 size={14} className="cu-spin" /> : <Unplug size={14} />}{removing ? t("移除中…") : t("移除")}
+        </button>
+        <button className="mg-button mg-primary" type="button" disabled={locked || !status || !found || !installable(state)} title={status && !found ? t("先安装并打开一次 ChatGPT 后再接入") : state === "unsupported" ? t("该客户端不支持接入") : undefined} onClick={() => void mutateTarget(id, "install")}>
+          {installing ? <Loader2 size={14} className="cu-spin" /> : <Plug size={14} />}{installing ? t("接入中…") : t("接入")}
+        </button>
+      </div>
+    </div>;
+  };
 
   return <div className="mg-page cu-page">
     <PageHeader icon={<MonitorSmartphone size={20} strokeWidth={1.5} />} title="Computer Use" actions={
@@ -382,32 +513,44 @@ export function ComputerUsePage() {
           {targetIds.map((id) => {
             const fallback = targetFallback[id];
             const target = status?.targets?.[id];
-            const state = target?.state ?? "missing";
-            const label = target?.label || fallback.label;
-            const configPath = target?.configPath || fallback.configPath;
-            const backup = backups[id];
-            const installing = busy === `install:${id}`;
-            const removing = busy === `uninstall:${id}`;
-            return <div className="cu-target" key={id}>
-              <div className="cu-target-main">
-                <div className="cu-target-title">
-                  <strong>{label}</strong>
-                  <span className="cu-badge" data-state={status ? state : "unknown"}>{status ? stateLabel(state) : t("未检测")}</span>
-                </div>
-                <code className="cu-target-path" title={configPath}>{elidePath(configPath)}</code>
-                {target?.message && <small className="cu-target-message">{target.message}</small>}
-                {backup && <small className="cu-target-backup">{t("已备份到")}<code title={backup}>{elidePath(backup)}</code></small>}
-              </div>
-              <div className="cu-target-actions">
-                <button className="mg-button" type="button" disabled={locked || !status || !removable(state)} onClick={() => void mutateTarget(id, "uninstall")}>
-                  {removing ? <Loader2 size={14} className="cu-spin" /> : <Unplug size={14} />}{removing ? t("移除中…") : t("移除")}
-                </button>
-                <button className="mg-button mg-primary" type="button" disabled={locked || !status || !found || !installable(state)} title={status && !found ? t("先安装并打开一次 ChatGPT 后再接入") : state === "unsupported" ? t("该客户端不支持接入") : undefined} onClick={() => void mutateTarget(id, "install")}>
-                  {installing ? <Loader2 size={14} className="cu-spin" /> : <Plug size={14} />}{installing ? t("接入中…") : t("接入")}
-                </button>
-              </div>
-            </div>;
+            return renderTarget(id, target, target?.label || fallback.label, target?.configPath || fallback.configPath);
           })}
+          {(status?.customTargets ?? []).map((target) => renderTarget(target.id, target, target.label, target.configPath, target))}
+        </div>
+
+        <div className="cu-custom-add">
+          <div className="cu-custom-add-head">
+            <strong>{t("添加自定义配置目录")}</strong>
+            <p className="cu-hint">{t("客户端改用了别的配置目录时（例如被包装器设置了 CLAUDE_CONFIG_DIR），上面的默认路径它读不到。在这里登记它实际读取的目录，可添加任意多个；也可以直接填配置文件路径。")}</p>
+          </div>
+          <div className="cu-custom-add-row">
+            <select
+              className="cu-custom-kind"
+              value={newKind}
+              disabled={locked}
+              aria-label={t("客户端类型")}
+              onChange={(event) => setNewKind(event.target.value as CuTargetId)}
+            >
+              {customKinds.map((kind) => <option key={kind} value={kind}>{targetFallback[kind].label}</option>)}
+            </select>
+            <input
+              className="cu-custom-path"
+              type="text"
+              value={newPath}
+              disabled={locked}
+              spellCheck={false}
+              placeholder={t(customDirHint[newKind])}
+              aria-label={t("配置目录")}
+              onChange={(event) => setNewPath(event.target.value)}
+              onKeyDown={(event) => { if (event.key === "Enter") void addCustomTarget(); }}
+            />
+            <button className="mg-button" type="button" disabled={locked} onClick={() => void pickCustomDir()}>
+              <FolderOpen size={14} />{t("选择目录")}
+            </button>
+            <button className="mg-button mg-primary" type="button" disabled={locked || !newPath.trim()} onClick={() => void addCustomTarget()}>
+              {busy === "custom:add" ? <Loader2 size={14} className="cu-spin" /> : <Plus size={14} />}{t("添加")}
+            </button>
+          </div>
         </div>
       </section>
 

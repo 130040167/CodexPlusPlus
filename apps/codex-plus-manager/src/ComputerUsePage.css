@@ -73,6 +73,26 @@
   color: #b45309;
 }
 
+/* 自定义接入目标：列表里的标记 + 底部添加表单（与 .cu-preview-select 的控件同一套外观） */
+.cu-badge-custom { color:hsl(var(--brand-accent)); border-color:hsl(var(--brand-accent)/.35); background:hsl(var(--brand-accent)/.07); }
+.cu-custom-add { display:flex; min-width:0; flex-direction:column; gap:8px; margin-top:12px; }
+.cu-custom-add-head strong { font-size:12px; font-weight:600; }
+.cu-custom-add-head .cu-hint { margin:2px 0 0; }
+.cu-custom-add-row { display:flex; min-width:0; align-items:center; gap:7px; }
+.cu-custom-kind,
+.cu-custom-path {
+  min-width:0; height:30px; padding:0 9px;
+  border:1px solid hsl(var(--border)); border-radius:6px;
+  background:hsl(var(--background)); color:inherit; font-size:12px;
+}
+.cu-custom-kind { flex:0 0 auto; }
+.cu-custom-path { flex:1 1 auto; font-family:var(--font-mono,monospace); font-size:11px; }
+.cu-custom-path:focus,.cu-custom-kind:focus { outline:none; border-color:hsl(var(--brand-accent)/.6); }
+@media(max-width:760px) {
+  .cu-custom-add-row { flex-wrap:wrap; }
+  .cu-custom-path { flex-basis:100%; order:-1; }
+}
+
 .cu-ext-row { display:flex; align-items:center; gap:12px; flex-wrap:wrap; min-height:32px; }
 .cu-ext-ok { display:flex; align-items:center; gap:6px; font-size:13px; color:hsl(var(--muted-foreground)); }
 .cu-ext-ok svg { color:hsl(142 71% 45%); flex-shrink:0; }
