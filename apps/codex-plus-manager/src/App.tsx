@@ -14000,6 +14000,21 @@ function ClaudeLocalizationScreen() {
     claudeLocalizationMemo.autoDetected = true;
     void refresh();
   }, []);
+  /**
+   * Claude Desktop 是否已在 Computer Use 页接入 codex-plus-cu（含自定义目录）。
+   * 和这里的电脑控制同时开会让同一个对话里出现两套工具，用来提示二选一；读不到时按未接入处理。
+   */
+  const [claudeDesktopCuConnected, setClaudeDesktopCuConnected] = useState(false);
+  useEffect(() => {
+    const connected = (state?: string) => state === "registered" || state === "needs_update";
+    void invoke<{ targets?: Record<string, { state?: string }>; customTargets?: Array<{ kind?: string; state?: string }> }>("computer_use_status")
+      .then((result) => {
+        if (!mounted.current) return;
+        setClaudeDesktopCuConnected(connected(result.targets?.claudeDesktop?.state)
+          || Boolean(result.customTargets?.some((target) => target.kind === "claudeDesktop" && connected(target.state))));
+      })
+      .catch(() => undefined);
+  }, []);
   const act = async (action: "prepare" | "launch" | "restore" | "check") => {
     if (pending.current) return;
     pending.current = true;
@@ -14233,6 +14248,17 @@ function ClaudeLocalizationScreen() {
               </span>
               <ToggleVisual />
             </label>
+            {s?.computerUseSupported !== false ? (
+              s?.computerUse && claudeDesktopCuConnected ? (
+                <p className="claude-l10n-hint is-warning" role="alert">
+                  {t("Claude Desktop 同时接入了「Computer Use」页的 codex-plus-cu：同一个对话里会有两套电脑控制，Claude 可能混着调用、互相抢前台，同一个应用也要确认两次。建议二选一：保留这里的开关，就到「Computer Use」页撤销 Claude Desktop 的接入；或者关掉这里的开关。")}
+                </p>
+              ) : (
+                <p className="claude-l10n-hint">
+                  {t("这里的电脑控制和「Computer Use」页给 Claude Desktop 接入的 codex-plus-cu 是两套独立实现，同一个 Claude Desktop 里二选一即可，不要同时开。")}
+                </p>
+              )
+            ) : null}
             {s?.supported && !s.prepared ? (
               <p className="claude-l10n-hint">
                 {t("增强版还没制作：开关会先存下来，等你在上方制作好增强版并启动后生效。")}

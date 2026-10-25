@@ -1816,6 +1816,10 @@ export const EN_PLAIN: Record<string, string> = {
   "即将自动保存…": "Saving shortly…",
   "改动会自动保存": "Changes are saved automatically",
   "已自动保存": "Saved automatically",
+  "Claude Desktop 同时接入了「Computer Use」页的 codex-plus-cu：同一个对话里会有两套电脑控制，Claude 可能混着调用、互相抢前台，同一个应用也要确认两次。建议二选一：保留这里的开关，就到「Computer Use」页撤销 Claude Desktop 的接入；或者关掉这里的开关。":
+    "Claude Desktop is also connected to codex-plus-cu on the Computer Use page, so one conversation sees two sets of computer control: Claude may mix them, they can fight over the foreground app, and each app asks for approval twice. Pick one: keep this switch and disconnect Claude Desktop on the Computer Use page, or turn this switch off.",
+  "这里的电脑控制和「Computer Use」页给 Claude Desktop 接入的 codex-plus-cu 是两套独立实现，同一个 Claude Desktop 里二选一即可，不要同时开。":
+    "This computer control and the codex-plus-cu connection for Claude Desktop on the Computer Use page are separate implementations. Use one or the other in Claude Desktop, not both.",
 };
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
