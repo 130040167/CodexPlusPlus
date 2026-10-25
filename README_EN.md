@@ -43,28 +43,30 @@ Friendly link: <a href="https://linux.do">LINUX DO</a>
 
 | Area | Capabilities |
 | --- | --- |
-| Provider configuration | Official login, official login plus API, pure API, and aggregate providers; Grok provider management; Responses / Chat Completions; model tests, model discovery, Provider Doctor, cc-switch and deep-link imports |
-| Models and context | Per-model context windows, auto-compact limits, `model_catalog_json`, model metadata import (models.json), shared config, and per-provider MCP, Skill, and Plugin selection |
-| Session management | Local session scanning, bulk deletion, Markdown export, token usage history, Provider metadata sync, and backups |
-| WeChat connection | QR login connects personal WeChat to local Codex sessions; each WeChat contact maps to a separate session, with an allowed-user list |
-| Codex enhancements | Plugin marketplace and model whitelist handling, session actions, paste fix, API-key dictation, conversation width and scroll restore, native Fast unlock, Goals, next-step suggestions, skin management, and image overlay |
-| Native Fast for API keys | Opt in to Codex's native Standard / Fast controls for models configured with Fast (priority) support; disabled by default, with availability and pricing determined by the provider |
-| Development workflow | Project move and thread IDs |
-| Usage status line | Live generation speed, cache hit rate, and context usage below the composer, read from local Codex session records; the context share follows the per-model window Codex sees |
-| Request shock absorption | Absorb upstream overload errors (`server_overloaded`, `server_is_overloaded`, `at capacity`, ...) at the proxy with backoff retries. Streaming mode keeps live output and hands post-first-token overloads to Codex's native retry; buffered mode buffers the whole response and retries at any point (no streaming). Switch under Proxy settings → Request shock absorption; the request log shows in-flight requests, time to first token and total duration live |
-| Codex multi-launch | Start an isolated Codex instance per provider identity, each with its own config, sessions, and user data directory; running instances are listed together and can be restarted or stopped individually |
-| Sub-agent collaboration | Delegate in natural language from a Codex chat to Codex CLI, DeepSeek Harness (dsh), or Claude Code and receive results in the same chat; configure a default agent, model routes, and optional reuse of saved DSH authentication |
-| Scripts and maintenance | User script installation and toggles, app detection, shortcuts, Watcher, environment cleanup, logs, diagnostics, health checks, and Release updates |
+| Provider configuration | Official login, official login plus API, pure API, and aggregate providers (Failover / Model aggregation); Responses / Chat Completions; model tests, model discovery, Provider Doctor, cc-switch and deep-link imports; optional auto-review model per provider |
+| Models and context | Per-model context windows, auto-compact limits, `model_catalog_json`, model metadata import (models.json), and per-provider MCP, Skill, and Plugin selection |
+| Computer Use sharing · new | Expose the Computer Use and Chrome browser control built into the Codex desktop app (ChatGPT.app) over MCP to Claude Code, Claude Desktop, Codex CLI, DeepSeek Harness, ZCode, and WorkBuddy, with a selectable approval policy (macOS) |
+| Beyond Codex · new | Claude Code provider switching in a CC Switch-style list with third-party imports; an enhanced Claude.app copy with Chinese UI, composer dictation, and Computer Use; Grok CLI model and endpoint management |
+| Request shock absorption and request log | Back off and retry upstream overload errors at the proxy, optionally by HTTP status code; streaming or fully buffered mode; the always-on local proxy keeps running after Codex quits. The request log shows in-flight requests, time to first token, retry reasons, and token usage, filterable by conversation |
+| Session management | Local session scanning, bulk deletion, Markdown export, token usage history, project move, thread IDs, opt-in [turn rewind](docs/turn-rewind.md), and side chats saved as ordinary conversations |
+| Codex multi-launch | Start an isolated Codex instance per provider identity, each with its own config, sessions, and user data directory; restart or stop each one individually |
+| Sub-agent collaboration | Delegate in natural language from a Codex chat to Codex CLI, DeepSeek Harness (dsh), or Claude Code and receive results in the same chat |
+| Codex enhancements | Plugin marketplace and model whitelist handling, session actions, paste fix, dictation with a global hotkey, conversation width and scroll restore, native Fast unlock, Goals, next-step suggestions, skins, and image overlays |
+| Usage status line | Live generation speed, cache hit rate, and context usage below the composer, read from local Codex session records |
+| WeChat connection | QR login connects personal WeChat to local Codex sessions; each contact maps to a separate session, with an allowed-user list |
+| Maintenance | User scripts, AI agent cache cleanup (Codex, Claude, Codex++), app detection, shortcuts, launch at login, settings export / import, logs, diagnostics, and Release updates |
 
 Every UI enhancement is independently configurable. Disabling the global enhancement switch still leaves Codex++ available as a provider and launch manager.
 
-**Usage status line** shows live generation speed, cache hit rate, and context usage below the composer. Values come from the session records Codex writes locally, using the same definitions as Codex: cache hit is `cached_input_tokens / input_tokens`, and context usage compares the latest call's tokens against the per-model window Codex sees from the generated model catalog. It is on by default and can be disabled under Codex Enhancements → General → Usage status line. Speed is throughput measured between adjacent token events, so it includes tool execution time and reads below raw decode speed.
+**Computer Use sharing** wraps the desktop control in the Codex desktop app as two MCP servers, `codex-plus-cu` (desktop) and `codex-plus-browser` (Chrome), without copying any official binaries. Open **Computer Use** in the left rail, click **Connect** (「接入」) next to each client in the diagram, choose an approval policy on the `codex-plus-cu` node (「自动放行」 auto-approves with an audit log; 「交给 Claude」 lets the client confirm with an approval card), then restart the client. Codex++ backs up client configs before writing and only edits its own entries. Browser control requires the official ChatGPT for Chrome extension.
+
+**Usage status line** uses the same definitions as Codex: cache hit is `cached_input_tokens / input_tokens`, and context usage compares the latest call's tokens against the per-model window Codex sees. It is on by default and can be disabled under Codex Enhancements → General. Speed includes tool execution time, so it reads below raw decode speed.
 
 <p align="center">
   <img src="docs/images/usage-statusline.png" alt="Usage status line below the composer: 51 tok/s, cache hit 99.9%, context usage 19%" width="100%">
 </p>
 
-**Codex multi-launch** starts one isolated Codex instance per provider identity. Each instance keeps its own config, sessions, and user data directory, so a single Responses or Chat Completions provider can run side by side with others without sharing sessions. The running main Codex and multi-launch instances are listed together and can be restarted or stopped individually.
+**Codex multi-launch** runs one isolated Codex instance per provider identity, side by side without sharing sessions.
 
 <p align="center">
   <img src="docs/images/codex-multi-launch.png" alt="Codex multi-launch: running DeepSeek and Zhipu GLM instances with restart and stop actions" width="100%">
@@ -168,7 +170,11 @@ Run the model test or Provider Doctor from the provider detail page. Verify that
 
 ### Does it support Intel Macs?
 
-Yes. Releases provide both `macos-x64.dmg` and `macos-arm64.dmg`. Intel Macs should use the x64 package, while Apple Silicon Macs should use the arm64 package.
+Yes. The `macos-universal.dmg` package runs on both Intel and Apple Silicon Macs.
+
+### Computer Use tools do not appear in my client
+
+Restart the client after connecting. Fully quit Claude Desktop before connecting, because it rewrites its own config on exit. If the tools are still missing, check the config directory the client actually reads under **Config paths and custom directories** (「配置路径与自定义目录」) on the Computer Use page, and make sure ChatGPT has Accessibility and Screen Recording permissions.
 
 ## Development
 

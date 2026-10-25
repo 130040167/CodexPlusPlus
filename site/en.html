@@ -121,62 +121,82 @@
     <article class="fcard tilt">
       <span class="fcard-no mono">01</span>
       <h3>Switch providers freely</h3>
-      <p>Official sign-in, official + API, API-only, and aggregates. Failover switches members on errors; model aggregation pins models to members. Responses / Chat Completions conversion, model tests and Provider Doctor included.</p>
+      <p>Official login, official + API, pure API, and aggregate providers: Failover switches on errors, Model aggregation pins models to members. Responses / Chat Completions conversion, model tests, and Provider Doctor.</p>
+    </article>
+    <article class="fcard tilt" id="computer-use-feature">
+      <span class="fcard-no mono">02</span><span class="fcard-new">NEW</span>
+      <h3>Share Computer Use</h3>
+      <p>Expose the Computer Use and Chrome control built into the Codex desktop app over MCP to Claude Code, Claude Desktop, DeepSeek Harness, and more, with a selectable approval policy.</p>
     </article>
     <article class="fcard tilt">
-      <span class="fcard-no mono">02</span>
-      <h3>Every model, its own space</h3>
-      <p>Set context windows and compaction thresholds per model. Codex++ generates a dedicated <span class="mono">model_catalog_json</span> so Codex reads each model's window. Import model metadata; pick MCP, skills and plugins per provider.</p>
+      <span class="fcard-no mono">03</span><span class="fcard-new">NEW</span>
+      <h3>Beyond Codex</h3>
+      <p>Switch Claude Code providers with third-party imports; an enhanced Claude.app copy adds Chinese UI, dictation, and Computer Use; manage the Grok CLI too.</p>
     </article>
     <article class="fcard tilt">
-      <span class="fcard-no mono">03</span>
-      <h3>Simpler session management</h3>
-      <p>Local session scanning, delete with undo, batch management, Markdown export, token history, project moves and thread IDs.</p>
-    </article>
-    <article class="fcard tilt">
-      <span class="fcard-no mono">04</span>
-      <h3>Extend your workspace</h3>
-      <p>Browse community user scripts for model selectors, usage stats and more. Manage MCP servers, skills and Codex plugins, or hot-reload your own scripts.</p>
+      <span class="fcard-no mono">04</span><span class="fcard-new">NEW</span>
+      <h3>Request log</h3>
+      <p>See status, model, retry reasons, time to first token, and token usage for every request, with in-flight requests updating live and a per-conversation filter.</p>
     </article>
     <article class="fcard tilt">
       <span class="fcard-no mono">05</span>
-      <h3>Smoother writing and reading</h3>
-      <p>Voice input, paste fixes, conversation width, scroll restoration, next-step suggestions, answer outlines — and the typing effects you just tried.</p>
+      <h3>Request shock absorption</h3>
+      <p>Back off and retry upstream overloads at the proxy, optionally by HTTP status code. Streaming mode keeps live output; buffered mode absorbs overloads at any point.</p>
     </article>
     <article class="fcard tilt">
       <span class="fcard-no mono">06</span>
-      <h3>Many Codex, one machine</h3>
-      <p>Launch isolated Codex instances per provider identity: separate config, sessions and data directories, running side by side, each restartable on its own.</p>
+      <h3>Every model, its own space</h3>
+      <p>Per-model context windows and auto-compact limits in a dedicated <span class="mono">model_catalog_json</span>, so Codex picks up the right window for the current model.</p>
     </article>
-    <article class="fcard tilt">
+    <article class="fcard tilt" id="agent-feature">
       <span class="fcard-no mono">07</span>
-      <h3>Usage status line</h3>
-      <p>Live generation speed, cache hit rate and context usage below the composer, read from local Codex session records with matching definitions. On by default.</p>
+      <h3>Delegate in a sentence</h3>
+      <p>From a Codex chat, hand work to DeepSeek Harness, Claude Code, or another Codex; the matching CLI runs it and the result lands back in the same chat.</p>
     </article>
     <article class="fcard tilt">
       <span class="fcard-no mono">08</span>
-      <h3>Usage, with company</h3>
-      <p>Usage widgets and desktop pets: token stats, task status and budget alerts. Drag, resize, reskin, or bring your own character art.</p>
+      <h3>Simpler session management</h3>
+      <p>Scan, delete and undo, bulk-manage, export to Markdown, track token history, and move projects; opt-in turn rewind, and side chats saved as ordinary conversations.</p>
     </article>
     <article class="fcard tilt">
       <span class="fcard-no mono">09</span>
-      <h3>WeChat connect</h3>
-      <p>Scan a QR code to reach your local Codex. Each contact maps to an isolated session, with an allow-list of WeChat users. Hand off work from anywhere.</p>
-    </article>
-    <article class="fcard tilt" id="agent-feature">
-      <span class="fcard-no mono">10</span>
-      <h3>Delegate in a sentence</h3>
-      <p>Ask your current Codex chat to delegate to DeepSeek Harness (dsh), Claude Code or another Codex. The selected CLI runs the task and returns results to the same chat. Configure the default agent, CLI paths and models; naming an agent selects that target.</p>
+      <h3>Many Codex, one machine</h3>
+      <p>Launch an isolated Codex per provider identity with its own config, sessions, and data directory; restart or stop each one individually.</p>
     </article>
     <article class="fcard tilt" id="native-fast-feature">
-      <span class="fcard-no mono">11</span>
+      <span class="fcard-no mono">10</span>
       <h3>Native Fast with an API key</h3>
-      <p>Restore the native Fast switch in API-only mode and use Codex's own Standard / ⚡ Fast controls. Off by default; the model must declare Fast (priority) support. Availability and billing depend on your provider.</p>
+      <p>Restore the native Standard / ⚡ Fast controls in pure API-key mode. Off by default; availability and billing are up to the provider.</p>
+    </article>
+    <article class="fcard tilt">
+      <span class="fcard-no mono">11</span>
+      <h3>Usage status line</h3>
+      <p>Live generation speed, cache hit rate, and context usage under the composer, using the same definitions as Codex. On by default.</p>
     </article>
     <article class="fcard tilt">
       <span class="fcard-no mono">12</span>
-      <h3>Request shock absorption</h3>
-      <p>Absorb model capacity/overload errors (server_overloaded, server_is_overloaded, at capacity) at the proxy with backoff retries so Codex sessions are interrupted less often. The status line shows the request phase, model, elapsed time, retry count and last failure reason; streaming mode keeps live output while buffered mode absorbs overloads at any point.</p>
+      <h3>Smoother writing and reading</h3>
+      <p>Dictation with a global hotkey, paste fix, conversation width, scroll restore, next-step suggestions, answer outline, and typing effects.</p>
+    </article>
+    <article class="fcard tilt">
+      <span class="fcard-no mono">13</span>
+      <h3>Extend your workspace</h3>
+      <p>Community user scripts, plus MCP, Skill (grouping and bulk actions), and Codex plugin management, and your own scripts with hot reload.</p>
+    </article>
+    <article class="fcard tilt">
+      <span class="fcard-no mono">14</span>
+      <h3>WeChat connect</h3>
+      <p>Scan to connect local Codex; each contact maps to its own session, with an allowed-user list. Dispatch work on the go.</p>
+    </article>
+    <article class="fcard tilt">
+      <span class="fcard-no mono">15</span><span class="fcard-new">NEW</span>
+      <h3>AI agent cache cleanup</h3>
+      <p>Scan the known cache folders of Codex, Claude, and Codex++, see what takes space, and pick what to clear.</p>
+    </article>
+    <article class="fcard tilt">
+      <span class="fcard-no mono">16</span>
+      <h3>Usage, with company</h3>
+      <p>A usage widget and desktop pet: token stats, task status, and budget alerts; drag, resize, reskin, or use your own images.</p>
     </article>
   </div>
 </section>
@@ -366,6 +386,10 @@ your-model<span class="t-hl">[128000]</span>
     <details class="faq-item" id="faq-native-fast">
       <summary>Why is the native Fast switch still missing?<span class="faq-x" aria-hidden="true"></span></summary>
       <div class="faq-a"><p>Confirm that you saved and restarted Codex through Codex++. In your provider's model settings, set “Fast (priority) support”, then save both the model and provider before restarting. Only declare support that your provider actually offers; unlocking the client control does not change service limits or billing.</p></div>
+    </details>
+    <details class="faq-item" id="faq-computer-use">
+      <summary>Computer Use tools don't show up in my client<span class="faq-x" aria-hidden="true"></span></summary>
+      <div class="faq-a"><p>Restart the client after connecting. Fully quit Claude Desktop first, because it rewrites its own config on exit. If the tools are still missing, check the config directory the client actually reads under “Config paths and custom directories” on the Computer Use page, and make sure ChatGPT has Accessibility and Screen Recording permissions. macOS only for now.</p></div>
     </details>
     <details class="faq-item">
       <summary>Can enhancements be disabled? Will they survive official app updates?<span class="faq-x" aria-hidden="true"></span></summary>
