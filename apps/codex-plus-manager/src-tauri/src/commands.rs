@@ -4639,7 +4639,7 @@ fn list_project_sessions_blocking(cwd: String) -> CommandResult<LocalSessionsPay
     static PROJECT_PAGER: std::sync::OnceLock<std::sync::Mutex<codex_plus_data::LocalSessionPager>> =
         std::sync::OnceLock::new();
     let page = match PROJECT_PAGER.get_or_init(Default::default).lock() {
-        Ok(mut pager) => pager.list_page(&db_paths, 0, usize::MAX),
+        Ok(mut pager) => pager.list_page_with_thread_names(&home, &db_paths, 0, usize::MAX),
         Err(_) => codex_plus_data::LocalSessionPage {
             errors: vec!["项目会话查询缓存不可用，请重启管理窗口。".to_string()],
             ..Default::default()
@@ -4691,7 +4691,7 @@ fn list_local_sessions_blocking(
         std::sync::OnceLock::new();
     let pager = PAGER.get_or_init(Default::default);
     let page = match pager.lock() {
-        Ok(mut pager) => pager.list_page(&db_paths, offset, limit),
+        Ok(mut pager) => pager.list_page_with_thread_names(&home, &db_paths, offset, limit),
         Err(_) => codex_plus_data::LocalSessionPage {
             errors: vec!["会话查询缓存不可用，请重启管理窗口。".to_string()],
             ..Default::default()
@@ -10667,6 +10667,42 @@ base_url = "https://example.invalid/v1"
         assert_eq!(result.payload.sessions.len(), 1);
         assert_eq!(result.payload.sessions[0].id, "t1");
         assert_eq!(result.payload.sessions[0].title, "Current Thread");
+    }
+
+    #[test]
+    fn list_local_sessions_prefers_codex_sidebar_thread_names() {
+        let _codex_home_guard = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let codex_home = temp.path().join("codex-home");
+        let sqlite_dir = codex_home.join("sqlite");
+        std::fs::create_dir_all(&sqlite_dir).unwrap();
+        create_minimal_thread_db(&sqlite_dir.join("state_5.sqlite"), "t1", "你好", 100);
+        // Codex 重命名追加写到 CODEX_HOME/session_index.jsonl，侧栏显示最后一条（#1976）。
+        std::fs::write(
+            codex_home.join("session_index.jsonl"),
+            concat!(
+                r#"{"id":"t1","thread_name":"旧名","updated_at":"2026-01-01T00:00:00Z"}"#,
+                "\n",
+                r#"{"id":"t1","thread_name":"新名","updated_at":"2026-01-02T00:00:00Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+        let result = list_local_sessions_blocking(None);
+        // 夹具没有 cwd 列，所有会话都归到空路径项目下。
+        let project = list_project_sessions_blocking(String::new());
+        restore_codex_home(previous_codex_home);
+
+        assert_eq!(result.status, "ok");
+        assert_eq!(result.payload.sessions[0].id, "t1");
+        assert_eq!(result.payload.sessions[0].title, "新名");
+        assert_eq!(project.payload.sessions.len(), 1);
+        assert_eq!(project.payload.sessions[0].title, "新名");
     }
 
     #[test]
