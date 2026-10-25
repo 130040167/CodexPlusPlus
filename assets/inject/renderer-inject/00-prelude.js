@@ -442,6 +442,8 @@
   const codexAppServerClientCaptureMarker = "AppServerRequestClient is missing a message dispatcher";
   const codexAppServerClientCaptureAnchor = "async sendRequest(";
   const codexRemoteSessionRecoveryVersion = "9";
+  const codexRemoteSessionRecoveryGeneration = {};
+  window.__codexPlusRemoteSessionRecoveryGeneration = codexRemoteSessionRecoveryGeneration;
   const codexPluginMarketplaceUnlockVersion = "17";
   const codexThreadScrollMaxEntries = 120;
   const codexThreadScrollSaveThrottleMs = 120;

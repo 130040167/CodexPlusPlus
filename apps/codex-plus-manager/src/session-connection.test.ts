@@ -401,9 +401,11 @@ describe("managed aggregate session connection", () => {
     api.window.removeEventListener = () => {};
     const listenerSource = renderer.slice(renderer.indexOf("  function installCodexRemoteSessionRecoveryListener("),
       renderer.indexOf("  function installCodexRemoteSessionDispatcherSubscription("));
-    new Function("window", "codexRemoteSessionRecoveryVersion", "observeCodexRemoteSessionNotification",
+    const generation = {};
+    api.window.__codexPlusRemoteSessionRecoveryGeneration = generation;
+    new Function("window", "codexRemoteSessionRecoveryVersion", "codexRemoteSessionRecoveryGeneration", "observeCodexRemoteSessionNotification",
       "sendCodexPlusDiagnostic", `${listenerSource}\ninstallCodexRemoteSessionRecoveryListener();`)(
-      api.window, "test", api.observeError, () => {});
+      api.window, "test", generation, api.observeError, () => {});
     const data = { type: "mcp-notification", hostId: "local", method: "error",
       params: { threadId: "thread", error: { message: "Reconnecting... waiting for network" } } };
     const handler = api.window.__codexPlusRemoteSessionRecoveryMessageHandler;
@@ -428,15 +430,22 @@ describe("managed aggregate session connection", () => {
     shared.removeEventListener = (type: string, callback: any) => listeners.get(type)?.delete(callback);
     const listenerSource = renderer.slice(renderer.indexOf("  function installCodexRemoteSessionRecoveryListener("),
       renderer.indexOf("  function installCodexRemoteSessionDispatcherSubscription("));
-    const install = (observer: any) => new Function("window", "codexRemoteSessionRecoveryVersion",
-      "observeCodexRemoteSessionNotification", "sendCodexPlusDiagnostic",
-      `${listenerSource}\nreturn installCodexRemoteSessionRecoveryListener;`)(shared, "same-version", observer, () => {});
+    const install = (observer: any) => {
+      const generation = {};
+      shared.__codexPlusRemoteSessionRecoveryGeneration = generation;
+      return new Function("window", "codexRemoteSessionRecoveryVersion", "codexRemoteSessionRecoveryGeneration",
+        "observeCodexRemoteSessionNotification", "sendCodexPlusDiagnostic",
+        `${listenerSource}\nreturn installCodexRemoteSessionRecoveryListener;`)(shared, "same-version", generation, observer, () => {});
+    };
     const oldInstall = install(stale.observeError);
     oldInstall();
     const oldHandler = shared.__codexPlusRemoteSessionRecoveryMessageHandler;
     const newInstall = install(current.observeError);
     newInstall();
     assert.notEqual(shared.__codexPlusRemoteSessionRecoveryMessageHandler, oldHandler);
+    const currentHandler = shared.__codexPlusRemoteSessionRecoveryMessageHandler;
+    assert.equal(oldInstall(), false);
+    assert.equal(shared.__codexPlusRemoteSessionRecoveryMessageHandler, currentHandler);
     newInstall();
     assert.equal(listeners.get("message")?.size, 1);
     assert.equal(listeners.get("codex-message-from-view")?.size, 1);
@@ -464,14 +473,20 @@ describe("managed aggregate session connection", () => {
       renderer.indexOf("  function ", renderer.indexOf("  function installCodexRemoteSessionDispatcherSubscription(") + 12));
     const oldCalls: any[] = [];
     const currentCalls: any[] = [];
-    const install = (calls: any[]) => new Function("window", "codexRemoteSessionRecoveryVersion",
-      "observeCodexRemoteSessionNotification", "observeCodexManagedSessionConnectionError", "sendCodexPlusDiagnostic",
-      `${subscriptionSource}\nreturn installCodexRemoteSessionDispatcherSubscription;`)(shared, "same-version",
-        (value: any) => { calls.push(value); return true; },
-        (value: any) => { calls.push(value); return true; }, () => {});
-    install(oldCalls)(dispatcher);
+    const install = (calls: any[]) => {
+      const generation = {};
+      shared.__codexPlusRemoteSessionRecoveryGeneration = generation;
+      return new Function("window", "codexRemoteSessionRecoveryVersion", "codexRemoteSessionRecoveryGeneration",
+        "observeCodexRemoteSessionNotification", "observeCodexManagedSessionConnectionError", "sendCodexPlusDiagnostic",
+        `${subscriptionSource}\nreturn installCodexRemoteSessionDispatcherSubscription;`)(shared, "same-version", generation,
+          (value: any) => { calls.push(value); return true; },
+          (value: any) => { calls.push(value); return true; }, () => {});
+    };
+    const oldInstall = install(oldCalls);
+    oldInstall(dispatcher);
     const currentInstall = install(currentCalls);
     currentInstall(dispatcher);
+    assert.equal(oldInstall(dispatcher), false);
     currentInstall(dispatcher);
     for (const handlers of subscribers.values()) assert.equal(handlers.size, 1);
     const params = { threadId: "thread", error: { message: "Connection failed" } };

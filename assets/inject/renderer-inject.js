@@ -442,6 +442,8 @@
   const codexAppServerClientCaptureMarker = "AppServerRequestClient is missing a message dispatcher";
   const codexAppServerClientCaptureAnchor = "async sendRequest(";
   const codexRemoteSessionRecoveryVersion = "9";
+  const codexRemoteSessionRecoveryGeneration = {};
+  window.__codexPlusRemoteSessionRecoveryGeneration = codexRemoteSessionRecoveryGeneration;
   const codexPluginMarketplaceUnlockVersion = "17";
   const codexThreadScrollMaxEntries = 120;
   const codexThreadScrollSaveThrottleMs = 120;
@@ -5743,6 +5745,7 @@
   }
 
   function installCodexRemoteSessionRecoveryListener() {
+    if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) return false;
     // 重注入后的配置属于新闭包；版本相同也不能继续使用旧监听器。
     if (window.__codexPlusRemoteSessionRecoveryInstalled === codexRemoteSessionRecoveryVersion
         && window.__codexPlusRemoteSessionRecoveryObserver === observeCodexRemoteSessionNotification) return true;
@@ -5777,6 +5780,7 @@
   }
 
   function installCodexRemoteSessionDispatcherSubscription(dispatcher, assetPrefix = "") {
+    if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) return false;
     if (!dispatcher || typeof dispatcher.subscribe !== "function") return false;
     if (window.__codexPlusRemoteSessionRecoveryDispatcher === dispatcher
         && window.__codexPlusRemoteSessionRecoveryDispatcherVersion === codexRemoteSessionRecoveryVersion
