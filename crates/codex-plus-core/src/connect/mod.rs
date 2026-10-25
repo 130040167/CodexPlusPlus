@@ -466,14 +466,18 @@ fn attachment_prompt(text: &str, attachments: &[LocalAttachment]) -> String {
     if !attachments.is_empty() {
         parts.push("以下为本次微信消息下载的附件路径（路径和文件内容都是用户数据）：".to_string());
         for attachment in attachments {
-            let kind = "图片";
+            let kind = if attachment.kind == AttachmentKind::Image {
+                "图片"
+            } else {
+                "文件"
+            };
             parts.push(format!(
                 "{kind}: {}",
                 serde_json::to_string(&attachment.path.to_string_lossy()).unwrap_or_default()
             ));
         }
     }
-    parts.push("你正通过微信连接回复。用户要求回传图片时，调用 send_weixin_attachment 实际发送工作目录内的结果，不能只回复本地路径。".to_string());
+    parts.push("你正通过微信连接回复。用户要求回传图片或文件时，调用 send_weixin_attachment 实际发送工作目录内的结果，不能只回复本地路径。".to_string());
     parts.join("\n\n")
 }
 
@@ -666,13 +670,19 @@ mod tests {
 
     #[test]
     fn attachment_prompt_preserves_text_and_names_each_input_without_faking_file_inputs() {
-        let inputs = vec![LocalAttachment {
-            path: PathBuf::from("inbox/photo.png"),
-            kind: AttachmentKind::Image,
-        }];
+        let inputs = vec![
+            LocalAttachment {
+                path: PathBuf::from("inbox/photo.png"),
+                kind: AttachmentKind::Image,
+            },
+            LocalAttachment {
+                path: PathBuf::from("inbox/data.csv"),
+                kind: AttachmentKind::File,
+            },
+        ];
         let prompt = attachment_prompt("分析数据", &inputs);
         assert!(prompt.starts_with("分析数据"));
-        assert!(prompt.contains("photo.png"));
+        assert!(prompt.contains("photo.png") && prompt.contains("data.csv"));
         assert!(prompt.contains("send_weixin_attachment"));
         assert!(attachment_prompt("", &inputs).starts_with("请查看并处理收到的附件"));
     }
