@@ -41,7 +41,10 @@ fn post_status(port: u16) -> String {
 fn resident_helper_stays_up_across_codex_session_lifecycle() {
     // 听写凭据与诊断日志会写进状态目录；测试里整体挪到临时目录，避免影响本机实例。
     let state_dir = tempfile::tempdir().unwrap();
+    let codex_home = state_dir.path().join("home");
+    std::fs::create_dir(&codex_home).unwrap();
     unsafe {
+        std::env::set_var("CODEX_HOME", &codex_home);
         std::env::set_var(
             codex_plus_core::paths::STATE_DIR_ENV,
             state_dir.path().to_str().unwrap(),
@@ -90,6 +93,29 @@ fn resident_helper_stays_up_across_codex_session_lifecycle() {
         "复用常驻 helper 的会话收尾不能删除常驻 helper 的听写凭据"
     );
     assert!(post_status(port).starts_with("HTTP/1.1 200"));
+
+    // 常驻入口启动后才出现的历史端口由续接会话持有，不得跳过恢复或接管主入口。
+    let alias_port = free_loopback_port();
+    assert_ne!(alias_port, port);
+    std::fs::write(
+        state_dir.path().join("proxy-endpoints.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "homes": [{ "codex_home": codex_home, "ports": [port, alias_port] }],
+        })).unwrap(),
+    ).unwrap();
+    runtime.block_on(async {
+        let session_hooks = DefaultLaunchHooks::default();
+        session_hooks.start_helper_for_resume(port).await.unwrap();
+        let response = tokio::task::spawn_blocking(move || post_status(alias_port)).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 404"), "历史入口不能暴露管理路由：{response}");
+        session_hooks.shutdown_helper(port).await;
+    });
+    TcpListener::bind(("127.0.0.1", alias_port)).unwrap();
+    assert!(post_status(port).starts_with("HTTP/1.1 200"));
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["port"], serde_json::json!(port));
 
     // 会话 helper 用了另一个端口（例如协议转换暂时关闭、增强 helper 换端口）：
     // 会话收尾后凭据要回到仍在监听的常驻端口，而不是指向已关闭的会话端口。
