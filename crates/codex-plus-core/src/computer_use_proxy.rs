@@ -37,15 +37,107 @@ use crate::computer_use_approval::{ApprovalMode, ApprovalStore, Outcome, subject
 /// 审批转给客户端后等多久。超过就回 `cancel`，不让会话永久挂住。
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// 单帧上限，与原生 CU 的 8 MiB 对齐。
+/// 单帧上限，与原生 CU 的 8 MiB 对齐。超过的帧不转发，改回一个错误（见 [`Oversized`]）。
 const MAX_FRAME: usize = 8 * 1024 * 1024;
+
+/// 超长 JSON-RPC 错误码：服务端内部错误。
+const OVERSIZED_ERROR_CODE: i64 = -32603;
 
 enum Event {
     /// 客户端发来的原始帧（含结尾换行）。
     Client(Vec<u8>),
     /// 子进程发来的原始帧（含结尾换行）。
     Child(Vec<u8>),
+    /// 客户端发来的帧超过上限，已丢弃。
+    ClientOversized(Oversized),
+    /// 子进程发来的帧超过上限，已丢弃。
+    ChildOversized(Oversized),
+    ClientClosed,
     ChildClosed,
+}
+
+/// 一条被丢弃的超长帧：只留下回错误所需的信息。
+#[derive(Debug, Clone, PartialEq)]
+struct Oversized {
+    len: usize,
+    id: Option<Value>,
+    method: Option<String>,
+}
+
+impl Oversized {
+    /// 从完整帧里只取 `id` 和 `method`。其余字段用 `IgnoredAny` 跳过，不会为截图分配内存；
+    /// 帧不是合法 JSON 时两者都为空。
+    fn of(frame: &[u8]) -> Self {
+        #[derive(serde::Deserialize)]
+        struct Envelope {
+            #[serde(default)]
+            id: Option<Value>,
+            #[serde(default)]
+            method: Option<String>,
+        }
+        let envelope = serde_json::from_slice::<Envelope>(frame).ok();
+        Self {
+            len: frame.len(),
+            id: envelope.as_ref().and_then(|envelope| envelope.id.clone()).filter(|id| !id.is_null()),
+            method: envelope.and_then(|envelope| envelope.method),
+        }
+    }
+
+    /// 回给发送方的错误：只有带 id 的**请求**才需要答复（响应和通知不能回）。
+    fn error_reply(&self, origin: &str) -> Option<Vec<u8>> {
+        let id = self.id.as_ref()?;
+        self.method.as_ref()?;
+        let reply = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": OVERSIZED_ERROR_CODE,
+                "message": format!(
+                    "{origin}超过 {} MiB 上限（{:.1} MiB），已丢弃，会话不受影响。",
+                    MAX_FRAME / 1024 / 1024,
+                    self.len as f64 / 1024.0 / 1024.0
+                ),
+            }
+        });
+        let mut line = serde_json::to_vec(&reply).ok()?;
+        line.push(b'\n');
+        Some(line)
+    }
+
+    /// 子进程超长帧回给客户端的错误：它是对客户端某个请求的**响应**，按那个 id 回。
+    fn error_for_client(&self) -> Option<Vec<u8>> {
+        let id = self.id.as_ref()?;
+        if self.method.is_some() {
+            return None;
+        }
+        let reply = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": OVERSIZED_ERROR_CODE,
+                "message": format!(
+                    "Computer Use 返回内容超过 {} MiB 上限（{:.1} MiB），已丢弃，会话不受影响。\
+                     可以缩小窗口或换个方式重试。",
+                    MAX_FRAME / 1024 / 1024,
+                    self.len as f64 / 1024.0 / 1024.0
+                ),
+            }
+        });
+        let mut line = serde_json::to_vec(&reply).ok()?;
+        line.push(b'\n');
+        Some(line)
+    }
+}
+
+/// 读一帧的结果。
+#[derive(Debug, PartialEq)]
+enum Frame {
+    /// 完整的一帧（含结尾换行）。
+    Line(Vec<u8>),
+    /// 超过上限的一帧，已丢弃。和 EOF 分开：早先两者共用返回值 0，
+    /// 一条超长消息就被当成断开，整个 CU 会话随之结束。
+    Oversized(Oversized),
+    Eof,
 }
 
 /// 以 stdio MCP server 的身份运行，直到客户端断开。
@@ -79,7 +171,8 @@ pub fn serve() -> anyhow::Result<()> {
 
 /// 拉起 OpenAI 签名的 node 执行 shim，由 shim 直接 spawn 原生 CU server。
 ///
-/// 两条约束：
+/// 三条约束：
+/// - 环境只给原生 server 需要的那几项，不继承调用方的（Claude 的环境里有用户的 Key）。
 /// - 中间不经过 shell：服务端校验**直接父进程**的签名，多插一层就会失效。
 /// - 必须放弃责任归属（disclaim），让 node 成为自己的 responsible process。否则
 ///   Codex++ 被 Claude 的 `disclaimer` 或管理器 GUI 拉起时，责任进程是 ad-hoc 签名的
@@ -88,9 +181,10 @@ fn spawn_child(
     runtime: &RuntimeLocation,
     shim: &std::path::Path,
 ) -> anyhow::Result<crate::disclaimed_spawn::DisclaimedChild> {
+    // 不继承调用方环境：见 `native_client_env` 的说明。
     let mut envs: Vec<(String, String)> = runtime.native_client_env().into_iter().collect();
     envs.push(("CODEX_PLUS_CU_CLIENT".into(), runtime.client.clone()));
-    crate::disclaimed_spawn::spawn(
+    crate::disclaimed_spawn::spawn_clean(
         std::path::Path::new(&runtime.node),
         &[OsStr::new(shim)],
         &envs,
@@ -101,51 +195,53 @@ fn spawn_client_reader(sender: Sender<Event>) {
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut reader = BufReader::new(stdin.lock());
-        loop {
-            let mut frame = Vec::new();
-            match read_frame(&mut reader, &mut frame) {
-                Ok(0) => break,
-                Ok(_) => {
-                    if sender.send(Event::Client(frame)).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+        pump(&mut reader, &sender, Event::Client, Event::ClientOversized);
+        // 客户端断开要通知主循环：只靠 channel 断开不够，子进程那一侧的 sender 还活着。
+        let _ = sender.send(Event::ClientClosed);
     });
 }
 
 fn spawn_child_reader(stdout: Box<dyn Read + Send>, sender: Sender<Event>) {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
-        loop {
-            let mut frame = Vec::new();
-            match read_frame(&mut reader, &mut frame) {
-                Ok(0) => break,
-                Ok(_) => {
-                    if sender.send(Event::Child(frame)).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+        pump(&mut reader, &sender, Event::Child, Event::ChildOversized);
         let _ = sender.send(Event::ChildClosed);
     });
 }
 
-/// 读一整帧（含结尾换行）。返回读到的字节数，0 表示 EOF。
+/// 逐帧读到 EOF 或出错为止；超长帧照常上报，不中断读取。
+fn pump(
+    reader: &mut impl BufRead,
+    sender: &Sender<Event>,
+    line: fn(Vec<u8>) -> Event,
+    oversized: fn(Oversized) -> Event,
+) {
+    loop {
+        let event = match read_frame(reader) {
+            Ok(Frame::Line(frame)) => line(frame),
+            Ok(Frame::Oversized(info)) => oversized(info),
+            Ok(Frame::Eof) | Err(_) => break,
+        };
+        if sender.send(event).is_err() {
+            break;
+        }
+    }
+}
+
+/// 读一整帧（含结尾换行）。
 ///
 /// 用 `read_until` 而不是 `lines()`：后者做 UTF-8 校验并吃掉换行，
 /// 而直通层的目标是**字节不变**。
-fn read_frame(reader: &mut impl BufRead, frame: &mut Vec<u8>) -> std::io::Result<usize> {
-    let read = reader.read_until(b'\n', frame)?;
-    if read > MAX_FRAME {
-        frame.clear();
-        return Ok(0);
+fn read_frame(reader: &mut impl BufRead) -> std::io::Result<Frame> {
+    let mut frame = Vec::new();
+    let read = reader.read_until(b'\n', &mut frame)?;
+    if read == 0 {
+        return Ok(Frame::Eof);
     }
-    Ok(read)
+    if read > MAX_FRAME {
+        return Ok(Frame::Oversized(Oversized::of(&frame)));
+    }
+    Ok(Frame::Line(frame))
 }
 
 /// 已转给客户端、正在等答复的审批。
@@ -188,6 +284,12 @@ impl Forwarder {
                     }
                 }
                 Ok(Event::Child(frame)) => self.on_child(frame)?,
+                Ok(Event::ChildOversized(info)) => self.on_child_oversized(&info)?,
+                Ok(Event::ClientOversized(info)) => self.on_client_oversized(&info)?,
+                Ok(Event::ClientClosed) => {
+                    self.cancel_all("客户端已断开");
+                    return Ok(());
+                }
                 Ok(Event::ChildClosed) => {
                     self.cancel_all("CU 子进程已退出");
                     return Ok(());
@@ -237,6 +339,34 @@ impl Forwarder {
             return self.relay_approval(&pending, &message);
         }
         self.write_child(&frame)
+    }
+
+    /// 子进程发来的超长帧：是对客户端请求的响应就按原 id 回错误；是子进程发的请求
+    /// （例如超长的审批请求）就回子进程错误，免得它一直等；通知直接丢掉。
+    fn on_child_oversized(&mut self, info: &Oversized) -> anyhow::Result<()> {
+        eprintln!(
+            "[codex-plus-cu] 丢弃 CU 发来的超长消息：{} 字节，method={:?}",
+            info.len, info.method
+        );
+        if let Some(line) = info.error_for_client() {
+            return write_client(&line);
+        }
+        if let Some(line) = info.error_reply("发给 CU 客户端的请求") {
+            return self.write_child(&line);
+        }
+        Ok(())
+    }
+
+    /// 客户端发来的超长帧：是请求就回客户端错误，响应和通知直接丢掉。
+    fn on_client_oversized(&mut self, info: &Oversized) -> anyhow::Result<()> {
+        eprintln!(
+            "[codex-plus-cu] 丢弃客户端发来的超长消息：{} 字节，method={:?}",
+            info.len, info.method
+        );
+        match info.error_reply("请求") {
+            Some(line) => write_client(&line),
+            None => Ok(()),
+        }
     }
 
     /// 逐条答复客户端对审批请求的决定。
@@ -522,15 +652,66 @@ mod tests {
     #[test]
     fn read_frame_preserves_bytes_and_newline() {
         let mut reader = BufReader::new(&b"{\"a\":1}\n{\"b\":2}\n"[..]);
-        let mut frame = Vec::new();
-        assert_eq!(read_frame(&mut reader, &mut frame).unwrap(), 8);
-        assert_eq!(frame, b"{\"a\":1}\n");
+        assert_eq!(read_frame(&mut reader).unwrap(), Frame::Line(b"{\"a\":1}\n".to_vec()));
+        assert_eq!(read_frame(&mut reader).unwrap(), Frame::Line(b"{\"b\":2}\n".to_vec()));
+        assert_eq!(read_frame(&mut reader).unwrap(), Frame::Eof);
+    }
 
-        frame.clear();
-        assert_eq!(read_frame(&mut reader, &mut frame).unwrap(), 8);
-        assert_eq!(frame, b"{\"b\":2}\n");
+    /// 一个超过上限的 tools/call 响应：截图塞在 result 里，id 在前。
+    fn huge_response(id: Value) -> Vec<u8> {
+        let image = "A".repeat(MAX_FRAME + 16);
+        let mut frame = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": { "content": [{ "type": "image", "data": image }] }
+        }))
+        .unwrap();
+        frame.push(b'\n');
+        frame
+    }
 
-        frame.clear();
-        assert_eq!(read_frame(&mut reader, &mut frame).unwrap(), 0);
+    #[test]
+    fn oversized_frame_is_skipped_and_reading_continues() {
+        let mut bytes = huge_response(json!(7));
+        bytes.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":8,\"result\":{}}\n");
+        let mut reader = BufReader::new(&bytes[..]);
+
+        let Frame::Oversized(info) = read_frame(&mut reader).unwrap() else {
+            panic!("expected oversized frame");
+        };
+        assert_eq!(info.id, Some(json!(7)));
+        assert_eq!(info.method, None);
+        assert!(info.len > MAX_FRAME);
+        // 超长帧之后的消息照常读到，不再被当成 EOF。
+        assert!(matches!(read_frame(&mut reader).unwrap(), Frame::Line(_)));
+        assert_eq!(read_frame(&mut reader).unwrap(), Frame::Eof);
+    }
+
+    #[test]
+    fn oversized_child_response_becomes_error_with_same_id() {
+        let info = Oversized::of(&huge_response(json!("req-1")));
+        let reply: Value = serde_json::from_slice(&info.error_for_client().unwrap()).unwrap();
+        assert_eq!(reply["id"], "req-1");
+        assert_eq!(reply["error"]["code"], OVERSIZED_ERROR_CODE);
+        assert!(reply["error"]["message"].as_str().unwrap().contains("已丢弃"));
+        // 响应不是请求，不能再回给子进程。
+        assert!(info.error_reply("x").is_none());
+    }
+
+    #[test]
+    fn oversized_request_is_answered_and_notifications_are_dropped() {
+        let request = Oversized { len: MAX_FRAME + 1, id: Some(json!(3)), method: Some("tools/call".into()) };
+        let reply: Value = serde_json::from_slice(&request.error_reply("请求").unwrap()).unwrap();
+        assert_eq!(reply["id"], 3);
+        assert!(request.error_for_client().is_none());
+
+        let notification = Oversized { len: MAX_FRAME + 1, id: None, method: Some("notifications/x".into()) };
+        assert!(notification.error_reply("请求").is_none());
+        assert!(notification.error_for_client().is_none());
+
+        // 截断或非法 JSON：拿不到 id，只能丢弃。
+        let garbage = Oversized::of(b"{\"id\":1, oops");
+        assert_eq!(garbage.id, None);
+        assert!(garbage.error_for_client().is_none());
     }
 }

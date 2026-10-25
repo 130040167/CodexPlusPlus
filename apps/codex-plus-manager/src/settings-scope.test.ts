@@ -53,6 +53,9 @@ test("Computer Use 独立在最左栏，不再出现在每个 Agent 的菜单里
 
   const globalNavigation = text.slice(text.indexOf("const globalNavigationRoutes"), text.indexOf("const defaultSettings"));
   assert.match(globalNavigation, /"computerUse"/);
+  // 图标和 Agent 排在最左栏上方同一组，不放进底部的系统导航。
+  assert.match(globalNavigation, /const railAgentGroupRoutes: Route\[\] = \["computerUse"\]/);
+  assert.match(functionSource("ApplicationRail"), /railAgentGroupRoutes\.map\(renderNavItem\)/);
 });
 
 test("Agent 设置标题跟随当前 Agent，整体设置标题固定", () => {

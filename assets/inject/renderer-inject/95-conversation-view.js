@@ -186,6 +186,7 @@
   }
 
   function scanLightweight() {
+    if (typeof syncCodexPlusTurnRewind === "function") runScanStep(syncCodexPlusTurnRewind);
     installStyle();
     applyDeletedLocalSessions();
     installCodexServiceTierDispatcherPatch();
@@ -937,6 +938,7 @@
     updateDeleteButtonOffsets();
     archivedPageRows().forEach(attachArchivedPageDeleteButton);
     refreshConversationView();
+    refreshSideChatSaveButtons();
     removeLegacyCodexServiceTierBadges();
     scheduleThreadScrollSync();
     refreshCodexModelWhitelistFromScan(window.__codexSessionDeleteLastMutations);

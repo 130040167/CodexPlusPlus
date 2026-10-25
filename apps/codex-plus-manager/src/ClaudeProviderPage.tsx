@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { ManagementDrawer, PageHeader } from "./ManagementPages";
 import { t, tf } from "./i18n";
+import { providerAvatarText } from "./provider-name";
 import {
   CLAUDE_PRESETS,
   COMPAT_SWITCHES,
@@ -201,16 +202,21 @@ export function ClaudeProviderPage({
                   onKeyDown={(event) => { if (event.key === "Enter" && event.target === event.currentTarget) setEditing({ provider, isNew: false }); }}
                   tabIndex={0}
                 >
-                  <span className="relay-index" title={provider.name}>{Array.from(provider.name.trim())[0]?.toUpperCase() || "C"}</span>
+                  {/* 与 Codex 供应商列表同一套：两字头像、接入方式与来源做成标签，第二行只放地址和模型。 */}
+                  <span className="relay-index" title={provider.name}>{providerAvatarText(provider.name, "C")}</span>
                   <span className="relay-summary">
                     <strong>
-                      {provider.name}
+                      <span className="relay-summary-name">{provider.name.trim() || t("未命名供应商")}</span>
+                      <span className="relay-tag" data-tone={brief.endpoint ? "api" : "official"}>
+                        {brief.endpoint ? t("API") : t("官方登录")}
+                      </span>
+                      {provider.ccsSourceId ? <span className="relay-tag">CC Switch</span> : null}
                       {active ? <span className="relay-active-badge">{t("使用中")}</span> : null}
                     </strong>
                     <small>
-                      {brief.endpoint || t("官方登录（不设置地址与 Key）")}
-                      {brief.model ? ` · ${brief.model}` : ""}
-                      {provider.ccsSourceId ? ` · ${t("来自 CC Switch")}` : ""}
+                      {brief.endpoint
+                        ? [brief.endpoint, brief.model].filter(Boolean).join(" · ")
+                        : t("使用 Claude Code 当前登录的账号，不设置地址与 Key")}
                     </small>
                   </span>
                   <span className="relay-card-actions">
