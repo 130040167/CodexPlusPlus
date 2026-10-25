@@ -71,7 +71,19 @@ mkdirSync(stagingDir, { recursive: true });
 cpSync(bundle, stagingBundle, { recursive: true, verbatimSymlinks: true });
 cpSync(builtBinary, path.join(stagingBundle, "Contents", "MacOS", "CodexPlusPlus"));
 chmodSync(path.join(stagingBundle, "Contents", "MacOS", "CodexPlusPlus"), 0o755);
-run("codesign", ["--force", "--deep", "--sign", "-", stagingBundle]);
+// Developer ID 证书按 Team ID 记账，重建后 TCC 授权（屏幕录制等）不会因 cdhash 变化而失效。
+// ad-hoc（"-"）则每次都产生新 cdhash，必须在系统设置里重新授权。
+// 只在 /usr/bin/security 能找到证书时用 Developer ID，否则回退 ad-hoc。
+let signingId = "-";
+try {
+  const identities = execFileSync("security", ["find-identity", "-v", "-p", "codesigning"], { encoding: "utf8" });
+  const match = identities.match(/"(Developer ID Application:[^"]+)"/);
+  if (match) signingId = match[1];
+} catch {
+  // 找不到证书，沿用 ad-hoc
+}
+console.log(`签名身份：${signingId === "-" ? "ad-hoc（TCC 授权在重建后会失效）" : signingId}`);
+run("codesign", ["--force", "--deep", "--sign", signingId, stagingBundle]);
 
 // 停掉固定目录里的旧实例（只匹配固定路径，不要误杀 /Applications 里的正式版）。
 const stopOldInstance = () => {

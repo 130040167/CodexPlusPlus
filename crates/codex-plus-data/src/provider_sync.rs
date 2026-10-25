@@ -1310,6 +1310,8 @@ where
         let mut eligible_rewrite_plans = Vec::new();
         for plan in &rewrite_plans {
             let mut writer = HashingWriter::new(std::io::sink());
+            // 规划之后才被独占打开的 rollout（Windows 共享冲突）与重写阶段一样跳过，
+            // 不能让一个被锁的文件把整次同步打成失败。
             let before = match stream_rewrite_rollout_session_meta_providers(
                 &plan.path,
                 &target_provider,
@@ -1317,7 +1319,6 @@ where
             ) {
                 Ok(before) => before,
                 Err(error) if is_locked_io_error(&error) => {
-                    // 规划之后也可能被原生进程占用；未准备日志的文件不能进入改写。
                     scanned_skipped_rollout_files.push(plan.path.clone());
                     continue;
                 }
