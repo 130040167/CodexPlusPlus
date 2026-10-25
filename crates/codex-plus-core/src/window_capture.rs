@@ -111,12 +111,12 @@ mod imp {
 
     /// 是否已经拿到「屏幕录制」权限。没有权限时枚举会得到空列表。
     pub fn has_permission() -> bool {
-        objc2_core_graphics::CGPreflightScreenCaptureAccess()
+        unsafe { objc2_core_graphics::CGPreflightScreenCaptureAccess() }
     }
 
     /// 触发系统的权限申请弹窗。已经授权时直接返回 true。
     pub fn request_permission() -> bool {
-        objc2_core_graphics::CGRequestScreenCaptureAccess()
+        unsafe { objc2_core_graphics::CGRequestScreenCaptureAccess() }
     }
 
     const ENUM_TIMEOUT: Duration = Duration::from_secs(15);
