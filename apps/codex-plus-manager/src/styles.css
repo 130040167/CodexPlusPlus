@@ -11840,3 +11840,15 @@ select {
 .aggregate-editor[data-aggregate-mode="model"] .aggregate-member-row {
   grid-template-columns: 18px minmax(0, 1fr) minmax(150px, 220px);
 }
+
+/* ── 拓展市场卡片 ───────────────────────────────────────────── */
+/* 板块视图改为纵向 flex：内容自然排列，操作按钮用 margin-top:auto 贴底，
+   同一行卡片的按钮落在同一条线上，描述框也不会被拉伸露出第 4 行。 */
+.script-market-card[data-view="grid"] {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.script-market-card[data-view="grid"] .script-market-actions { margin-top: auto; padding-top: 4px; }
+.script-market-status { flex-shrink: 0; white-space: nowrap; }
+.script-market-tag-more { border-style: dashed; cursor: help; }

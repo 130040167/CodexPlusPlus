@@ -8542,7 +8542,7 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
           title={t("市场拓展")}
           detail={
             market?.market.updatedAt
-              ? tf("清单更新时间：{0}，当前显示 {1} / {2}", [market.market.updatedAt, filteredMarketScripts.length, marketScripts.length])
+              ? tf("清单更新时间：{0}，当前显示 {1} / {2}", [formatMarketUpdatedAt(market.market.updatedAt), filteredMarketScripts.length, marketScripts.length])
               : t("从 GitHub 静态清单加载")
           }
         />
@@ -9849,6 +9849,14 @@ function SortableRelayProfileCard({
   );
 }
 
+/// 清单时间是 ISO 字符串（UTC），按本地时区显示成「2026-10-17 17:46」；解析失败原样返回。
+function formatMarketUpdatedAt(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 function MarketScriptCard({
   script,
   actions,
@@ -9862,7 +9870,11 @@ function MarketScriptCard({
   /// 前端不重算，直接取自 user_scripts 清单；为空表示未安装或不可删除。
   installedKey?: string;
 }) {
-  const status = script.updateAvailable ? t("可更新") : script.installed ? tf("已安装 {0}", [script.installedVersion]) : t("未安装");
+  // 「未安装」是默认状态：满屏同一个徽标只是噪音，只给已安装 / 可更新打标。
+  const status = script.updateAvailable ? t("可更新") : script.installed ? tf("已安装 {0}", [script.installedVersion]) : null;
+  // 标签最多露 3 个，其余收成「+N」，否则卡片被撑成高低不齐的两三行。
+  const visibleTags = script.tags.slice(0, 3);
+  const hiddenTags = script.tags.slice(3);
   const isGitHubHomepage = script.homepage ? isGitHubRepositoryHomepage(script.homepage) : false;
   const githubSupportLabel = isGitHubHomepage ? tf("在 GitHub 上支持作者：{0}", [script.name]) : undefined;
   return (
@@ -9870,17 +9882,20 @@ function MarketScriptCard({
       <div className="script-market-title">
         <div>
           <strong>{script.name}</strong>
-          <span>{script.author || t("未知作者")}</span>
+          <span>{script.author || t("未知作者")} · v{script.version}</span>
         </div>
-        <UiBadge variant={script.updateAvailable ? "default" : script.installed ? "secondary" : "outline"}>{status}</UiBadge>
+        {status ? <UiBadge className="script-market-status" variant={script.updateAvailable ? "default" : "secondary"}>{status}</UiBadge> : null}
       </div>
       <p className="script-market-description">{script.description || t("暂无描述。")}</p>
-      <div className="script-market-tags">
-        <span className="script-market-tag">v{script.version}</span>
-        {script.tags.map((tag) => (
+      {/* 没有标签就不渲染空容器：空容器会让被拉伸的卡片在描述下露出半行（见 .script-market-card 样式注释）。 */}
+      {script.tags.length ? <div className="script-market-tags">
+        {visibleTags.map((tag) => (
           <span className="script-market-tag" key={tag}>{tag}</span>
         ))}
-      </div>
+        {hiddenTags.length ? (
+          <span className="script-market-tag script-market-tag-more" title={hiddenTags.join("、")}>+{hiddenTags.length}</span>
+        ) : null}
+      </div> : null}
       <div className="script-market-actions">
         <Button onClick={() => void actions.installMarketScript(script.id)} size="sm">
           <Download className="h-4 w-4" />
