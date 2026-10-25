@@ -4726,7 +4726,24 @@ fn restore_profile_credentials_after_backfill(
         return Ok(());
     }
 
-    profile.auth_contents = live_auth.to_string();
+    // issue #2601：live auth.json 是 Codex 写的 API Key 登录态（如 `auth_mode = "apikey"`）
+    // 时，吸收进纯官方快照会被存储校验判为「不支持的官方认证存档格式」，整次切换/保存
+    // 失败。这类 live 认证不属于官方快照，保留原快照即可；可存储的格式维持原采纳语义。
+    if official_auth_snapshot_is_storable(live_auth) {
+        profile.auth_contents = live_auth.to_string();
+    } else {
+        profile.auth_contents = template_auth.to_string();
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "relay_backfill.official_auth.kept_snapshot",
+            json!({
+                "profileId": profile.id,
+                "reason": "live auth.json 不是可存入官方快照的认证格式，保留原快照",
+                "liveAuthMode": serde_json::from_str::<Value>(live_auth).ok().and_then(|value| {
+                    value.get("auth_mode").and_then(Value::as_str).map(str::to_string)
+                }),
+            }),
+        );
+    }
     let Some(token) = experimental_bearer_token_from_config(&profile.config_contents)? else {
         return Ok(());
     };
@@ -5488,6 +5505,22 @@ fn merge_model_into_model_list(model: &str, model_list: &str) -> String {
         }
     }
     models.join("\n")
+}
+
+/// 纯官方（非混合）快照能否原样落盘，口径与 `normalize_relay_profile_for_storage`
+/// 一致：空（显式退出）、ChatGPT 登录态，或只含 OPENAI_API_KEY 的旧快照。
+fn official_auth_snapshot_is_storable(contents: &str) -> bool {
+    if contents.trim().is_empty() || auth_contents_looks_like_chatgpt_auth(contents) {
+        return true;
+    }
+    serde_json::from_str::<Value>(contents)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_object()
+                .map(|object| object.keys().all(|key| key == "OPENAI_API_KEY"))
+        })
+        .unwrap_or(false)
 }
 
 fn auth_contents_looks_like_chatgpt_auth(contents: &str) -> bool {
