@@ -5501,31 +5501,21 @@ function ProxySettingsScreen({
       <Panel>
         <CardHead
           title={t("本地协议代理")}
-          detail={t("需要协议转换、聚合或请求避震时随 Codex++ 常驻；Codex 退出不影响，退出 Codex++ 才关闭")}
+          detail={t("需要协议转换、聚合或请求避震时随 Codex++ 常驻；退出 Codex++ 才关闭")}
         />
-        <CardContent className="settings-content">
-          <div className="status-table">
-            <StatusRow
-              title={t("本地服务器状态")}
-              status={localServer?.status ?? "not_checked"}
-              path={localServer?.address || "http://127.0.0.1:57321"}
-            />
-            <StatusRow
-              title={t("协议转换")}
-              status={conversionEnabled ? "ok" : "disabled"}
-              path={conversionEnabled ? t("协议转换已启用") : t("未启用")}
-            />
-            <StatusRow
-              title={t("调试连接状态")}
-              status={debuggerState?.status ?? "not_checked"}
-              path={debuggerState?.address ?? null}
-            />
+        <CardContent className="settings-content setting-rows">
+          {/* 与概览页健康检查同一套带图标状态卡。 */}
+          <div className="health-grid overview-health-grid proxy-status-grid">
+            {healthItems(overview)
+              .filter((item) => item.title !== t("Codex 应用"))
+              .map((item) => <HealthTile item={item} key={item.title} />)}
           </div>
-          <p className="field-hint">
-            {t("本地代理地址由 Codex++ 写入 config.toml；切换供应商或修改协议后重启 Codex 生效。")}
-          </p>
-          <div className="form-row">
-            <Field label={t("请求体上限（MiB）")}>
+          <SettingRow
+            title={t("请求体上限")}
+            description={t("长上下文会话超过上限会报 413；调大会增加本地代理的内存占用。")}
+            detail={t("默认 128 MiB，可填 32~512。长上下文会话（1M 窗口 + 截图历史）的请求体会超过旧的 32 MiB 硬上限并触发 413；调大后本地代理处理单次请求的内存占用也会增加。保存后立即对本地代理生效；环境变量 CODEX_PLUS_MAX_HTTP_BODY_BYTES（字节）优先于本设置。")}
+          >
+            <div className="setting-input-unit">
               <Input
                 max={512}
                 min={32}
@@ -5539,128 +5529,129 @@ function ProxySettingsScreen({
                   })
                 }
               />
-            </Field>
-          </div>
-          <p className="field-hint">
-            {t("默认 128 MiB，可填 32~512。长上下文会话（1M 窗口 + 截图历史）的请求体会超过旧的 32 MiB 硬上限并触发 413；调大后本地代理处理单次请求的内存占用也会增加。保存后立即对本地代理生效；环境变量 CODEX_PLUS_MAX_HTTP_BODY_BYTES（字节）优先于本设置。")}
+              <span>MiB</span>
+            </div>
+          </SettingRow>
+          <p className="setting-footnote">
+            {t("本地代理地址由 Codex++ 写入 config.toml；切换供应商或修改协议后重启 Codex 生效。")}
           </p>
         </CardContent>
       </Panel>
 
       <Panel>
-        <CardHead
-          title={t("请求避震")}
+        <SwitchPanelHead
+          checked={form.protocolProxyAutoRetry}
           detail={t("在本地代理内消化上游过载与限流，尽量不把错误交给 Codex")}
+          label={t("启用请求避震")}
+          onChange={(checked) => onFormChange({ ...form, protocolProxyAutoRetry: checked })}
+          title={t("请求避震")}
         />
-        <CardContent className="settings-content">
-          <div className="settings-block">
-            <label className="check-row">
-              <input
-                checked={form.protocolProxyAutoRetry}
-                onChange={(event) =>
-                  onFormChange({ ...form, protocolProxyAutoRetry: event.currentTarget.checked })
-                }
-                type="checkbox"
-              />
-              <span>{t("启用请求避震")}</span>
-            </label>
-            <p className="field-hint">
-              {t("仅作用于经过本地协议代理的请求：自动重试 200 流内的过载/容量错误，以及下方选择的 HTTP 状态码。")}
-            </p>
-            <div className="form-row">
-              <Field label={t("最多自动重试次数")}>
-                <Input
-                  max={20}
-                  min={0}
-                  type="number"
-                  value={form.protocolProxyAutoRetryMaxAttempts}
-                  onChange={(event) =>
-                    onFormChange({
-                      ...form,
-                      protocolProxyAutoRetryMaxAttempts: clampNumber(
-                        Number(event.currentTarget.value),
-                        0,
-                        20,
-                      ),
-                    })
-                  }
-                />
-              </Field>
-              <Field label={t("首次重试间隔（秒）")}>
-                <Input
-                  max={30}
-                  min={0}
-                  type="number"
-                  value={form.protocolProxyAutoRetryIntervalSeconds}
-                  onChange={(event) =>
-                    onFormChange({
-                      ...form,
-                      protocolProxyAutoRetryIntervalSeconds: clampNumber(
-                        Number(event.currentTarget.value),
-                        0,
-                        30,
-                      ),
-                    })
-                  }
-                />
-              </Field>
-            </div>
-            <p className="field-hint">
-              {t("之后按 2 倍退避，单次最长 30 秒；有 Retry-After 时优先采用。")}
-            </p>
-            {/* 不能用 Field：它是 <label>。WebKit 里被点的标签按钮已被 React 移除后，
-                label 会把这次点击转发给它的第一个按钮，一次删掉两个状态码。 */}
-            <div className="field text-sm font-medium leading-none" role="group" aria-label={t("重试的 HTTP 状态码")}>
-              <span>{t("重试的 HTTP 状态码")}</span>
-              <div className="retry-status-editor">
-                <div className="retry-status-list">
-                  {form.protocolProxyAutoRetryStatusCodes.map((status) => (
-                    <button
-                      key={status}
-                      className="retry-status-chip"
-                      onClick={() =>
-                        setRetryStatusCodes(
-                          form.protocolProxyAutoRetryStatusCodes.filter((item) => item !== status),
-                        )
-                      }
-                      title={t("点击移除")}
-                      type="button"
-                    >
-                      {status} ×
-                    </button>
-                  ))}
-                </div>
-                <div className="retry-status-input-row">
+        <CardContent className="settings-content setting-rows">
+          {form.protocolProxyAutoRetry ? (
+            <>
+              <SettingRow title={t("最多自动重试次数")} description={t("0–20 次；次数用尽后把错误交给 Codex。")}>
+                <div className="setting-input-unit">
                   <Input
-                    aria-label={t("输入状态码后回车")}
-                    inputMode="numeric"
-                    placeholder={t("输入状态码后回车，如 429")}
-                    value={retryStatusInput}
-                    onChange={(event) => setRetryStatusInput(event.currentTarget.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        event.preventDefault();
-                        addRetryStatusCodes();
-                      }
-                    }}
-                  />
-                  <Button
-                    onClick={() =>
-                      setRetryStatusCodes([...form.protocolProxyAutoRetryStatusCodes, ...COMMON_RETRY_STATUS_CODES])
+                    max={20}
+                    min={0}
+                    type="number"
+                    value={form.protocolProxyAutoRetryMaxAttempts}
+                    onChange={(event) =>
+                      onFormChange({
+                        ...form,
+                        protocolProxyAutoRetryMaxAttempts: clampNumber(
+                          Number(event.currentTarget.value),
+                          0,
+                          20,
+                        ),
+                      })
                     }
-                    type="button"
-                    variant="outline"
-                  >
-                    {t("填入常用")}
-                  </Button>
+                  />
+                  <span>{t("次")}</span>
                 </div>
-              </div>
-            </div>
-            <p className="field-hint">
-              {t("命中时退避重发，次数用尽后把错误交给 Codex。默认不选；常用 429（限流）和 5xx（服务端故障）。")}
-            </p>
-            <div className="form-row">
-              <Field label={t("避震模式")}>
+              </SettingRow>
+              <SettingRow title={t("首次重试间隔")} description={t("之后按 2 倍退避，单次最长 30 秒；有 Retry-After 时优先采用。")}>
+                <div className="setting-input-unit">
+                  <Input
+                    max={30}
+                    min={0}
+                    type="number"
+                    value={form.protocolProxyAutoRetryIntervalSeconds}
+                    onChange={(event) =>
+                      onFormChange({
+                        ...form,
+                        protocolProxyAutoRetryIntervalSeconds: clampNumber(
+                          Number(event.currentTarget.value),
+                          0,
+                          30,
+                        ),
+                      })
+                    }
+                  />
+                  <span>{t("秒")}</span>
+                </div>
+              </SettingRow>
+              {/* 状态码编辑不能放进 <label>（Field）：WebKit 会把点击转发给第一个按钮，一次删掉两个状态码。 */}
+              <SettingRow
+                stacked
+                title={t("重试的 HTTP 状态码")}
+                description={t("命中时退避重发。默认不选；常用 429（限流）和 5xx（服务端故障）。")}
+              >
+                <div role="group" aria-label={t("重试的 HTTP 状态码")}>
+                  <div className="retry-status-editor">
+                    <div className="retry-status-list">
+                      {form.protocolProxyAutoRetryStatusCodes.map((status) => (
+                        <button
+                          key={status}
+                          className="retry-status-chip"
+                          onClick={() =>
+                            setRetryStatusCodes(
+                              form.protocolProxyAutoRetryStatusCodes.filter((item) => item !== status),
+                            )
+                          }
+                          title={t("点击移除")}
+                          type="button"
+                        >
+                          {status} ×
+                        </button>
+                      ))}
+                    </div>
+                    <div className="retry-status-input-row">
+                      <Input
+                        aria-label={t("输入状态码后回车")}
+                        inputMode="numeric"
+                        placeholder={t("输入状态码后回车，如 429")}
+                        value={retryStatusInput}
+                        onChange={(event) => setRetryStatusInput(event.currentTarget.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            addRetryStatusCodes();
+                          }
+                        }}
+                      />
+                      <Button
+                        onClick={() =>
+                          setRetryStatusCodes([...form.protocolProxyAutoRetryStatusCodes, ...COMMON_RETRY_STATUS_CODES])
+                        }
+                        type="button"
+                        variant="outline"
+                      >
+                        {t("填入常用")}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              </SettingRow>
+              <SettingRow
+                title={t("避震模式")}
+                description={form.protocolProxyAutoRetryMode === "buffered"
+                  ? t("始终由代理重试，但要等整段生成完才显示。")
+                  : form.protocolProxyAutoRetryMode === "streaming-legacy"
+                    ? t("旧版流式行为，仅在新版有问题时使用。")
+                    : t("保留实时输出；正文出现前遇到过载由代理重试。")}
+                detail={t("流式：保留实时输出，正文提交前遇到过载由代理重试，之后交给 Codex；「首字提交延迟」为出现正文后再缓冲的时长，0 表示立即提交。整段缓冲：始终由代理重试，但要等整段生成完才显示。")}
+              >
                 <select
                   className="request-log-filter"
                   value={form.protocolProxyAutoRetryMode}
@@ -5680,53 +5671,52 @@ function ProxySettingsScreen({
                   <option value="streaming-legacy">{t("流式（旧行为）")}</option>
                   <option value="buffered">{t("整段缓冲")}</option>
                 </select>
-              </Field>
+              </SettingRow>
               {form.protocolProxyAutoRetryMode === "streaming" ? (
-                <Field label={t("首字提交延迟（毫秒）")}>
-                  <Input
-                    max={10000}
-                    min={0}
-                    step={100}
-                    type="number"
-                    value={form.protocolProxyAutoRetryCommitDelayMs}
-                    onChange={(event) =>
-                      onFormChange({
-                        ...form,
-                        protocolProxyAutoRetryCommitDelayMs: clampNumber(Number(event.currentTarget.value), 0, 10000),
-                      })
-                    }
-                  />
-                </Field>
+                <SettingRow title={t("首字提交延迟")} description={t("出现正文后再缓冲的时长，0 表示立即提交。")}>
+                  <div className="setting-input-unit">
+                    <Input
+                      max={10000}
+                      min={0}
+                      step={100}
+                      type="number"
+                      value={form.protocolProxyAutoRetryCommitDelayMs}
+                      onChange={(event) =>
+                        onFormChange({
+                          ...form,
+                          protocolProxyAutoRetryCommitDelayMs: clampNumber(Number(event.currentTarget.value), 0, 10000),
+                        })
+                      }
+                    />
+                    <span>ms</span>
+                  </div>
+                </SettingRow>
               ) : null}
-            </div>
-            <p className="field-hint">
-              {t("流式：保留实时输出，正文提交前遇到过载由代理重试，之后交给 Codex；「首字提交延迟」为出现正文后再缓冲的时长，0 表示立即提交。整段缓冲：始终由代理重试，但要等整段生成完才显示。")}
-            </p>
-          </div>
+              <p className="setting-footnote">
+                {t("仅作用于经过本地协议代理的请求：自动重试 200 流内的过载/容量错误，以及上面选择的 HTTP 状态码。")}
+              </p>
+            </>
+          ) : (
+            <p className="setting-footnote">{t("已关闭：上游过载或限流时，错误直接交给 Codex。")}</p>
+          )}
         </CardContent>
       </Panel>
 
       <Panel>
-        <CardHead
-          title={t("目录外模型映射")}
+        <SwitchPanelHead
+          checked={form.protocolProxyMapUnlistedModels}
           detail={t("把 Codex 后台任务的固定模型名改写为当前供应商的默认模型")}
+          label={t("改写目录外模型名")}
+          onChange={(checked) => onFormChange({ ...form, protocolProxyMapUnlistedModels: checked })}
+          title={t("目录外模型映射")}
         />
-        <CardContent className="settings-content">
-          <div className="settings-block">
-            <label className="check-row">
-              <input
-                checked={form.protocolProxyMapUnlistedModels}
-                onChange={(event) =>
-                  onFormChange({ ...form, protocolProxyMapUnlistedModels: event.currentTarget.checked })
-                }
-                type="checkbox"
-              />
-              <span>{t("改写目录外模型名")}</span>
-            </label>
-            <p className="field-hint">
-              {t("Codex 的自动审查（codex-auto-review）与标题/摘要等后台任务固定使用 gpt-* 等内部模型名，不经选模；第三方上游没有这些名字，原样转发只会报「模型不存在」并可能反复消耗额度。开启后，不在当前供应商模型列表里的请求模型会改写为该供应商的默认模型再转发（#1183 / #1446 / #1457）；官方登录与聚合供应商不受影响，已配置「自动审批模型」时 codex-auto-review 仍按该配置改写。默认关闭：开启后手填但未写进模型列表的模型也会被改写，请先把要用的模型都加进列表。")}
-            </p>
-          </div>
+        <CardContent className="settings-content setting-rows">
+          <p className="setting-footnote" title={t("Codex 的自动审查（codex-auto-review）与标题/摘要等后台任务固定使用 gpt-* 等内部模型名，不经选模；第三方上游没有这些名字，原样转发只会报「模型不存在」并可能反复消耗额度。开启后，不在当前供应商模型列表里的请求模型会改写为该供应商的默认模型再转发（#1183 / #1446 / #1457）；官方登录与聚合供应商不受影响，已配置「自动审批模型」时 codex-auto-review 仍按该配置改写。默认关闭：开启后手填但未写进模型列表的模型也会被改写，请先把要用的模型都加进列表。")}>
+            {t("自动审查、标题摘要等后台任务固定使用 gpt-* 内部模型名，第三方上游没有这些名字会报「模型不存在」。开启后，不在当前供应商模型列表里的模型会改写为该供应商的默认模型；官方登录与聚合供应商不受影响。")}
+          </p>
+          {form.protocolProxyMapUnlistedModels ? (
+            <p className="setting-warning">{t("注意：手填但没写进模型列表的模型也会被改写，请先把要用的模型都加进列表。")}</p>
+          ) : null}
         </CardContent>
       </Panel>
 
@@ -9530,93 +9520,98 @@ function AgentSettingsScreen({
       <>
         <Panel>
           <CardHead title={t("Codex 供应商设置")} detail={t("只作用于 Codex 供应商的配置")} />
-          <CardContent className="settings-content">
-            <Field className="settings-test-model-field" label={t("供应商测试模型")}>
+          <CardContent className="settings-content setting-rows">
+            <SettingRow
+              title={t("供应商测试模型")}
+              description={t("「测试供应商」按钮用这个模型发起一次真实请求，用于判断 Key 与端点是否可用。")}
+            >
               <Input
                 value={form.relayTestModel}
                 onChange={(event) => onFormChange({ ...form, relayTestModel: event.currentTarget.value })}
                 placeholder={t("例如 gpt-5.4-mini")}
               />
-            </Field>
-            <p className="field-hint">
-              {t("「测试供应商」按钮用这个模型发起一次真实请求，用于判断 Key 与端点是否可用。")}
-            </p>
+            </SettingRow>
           </CardContent>
         </Panel>
 
         <Panel>
-          <CardHead title={t("Codex 图片覆盖层")} detail={t("在当前 Codex 会话上叠加一张背景图")} />
-          <CardContent className="settings-content">
-            <div className="settings-block">
-              <label className="check-row">
-                <input
-                  checked={form.codexAppImageOverlayEnabled}
-                  onChange={(event) =>
-                    onFormChange({ ...form, codexAppImageOverlayEnabled: event.currentTarget.checked })
-                  }
-                  type="checkbox"
-                />
-                <span>{t("启用 Codex 图片覆盖层")}</span>
-              </label>
-              <div className="form-row">
-                <Field label={t("覆盖图片")}>
-                  <Input
-                    value={form.codexAppImageOverlayPath}
-                    onChange={(event) => onFormChange({ ...form, codexAppImageOverlayPath: event.currentTarget.value })}
-                    placeholder={t("选择 png / jpg / webp / gif / bmp")}
+          <SwitchPanelHead
+            checked={form.codexAppImageOverlayEnabled}
+            detail={t("在当前 Codex 会话上叠加一张背景图")}
+            label={t("启用 Codex 图片覆盖层")}
+            onChange={(checked) => onFormChange({ ...form, codexAppImageOverlayEnabled: checked })}
+            title={t("Codex 图片覆盖层")}
+          />
+          <CardContent className="settings-content setting-rows">
+            {form.codexAppImageOverlayEnabled ? (
+              <>
+                <SettingRow title={t("覆盖图片")} description={t("支持 png / jpg / webp / gif / bmp。")}>
+                  <div className="setting-inline">
+                    <Input
+                      value={form.codexAppImageOverlayPath}
+                      onChange={(event) => onFormChange({ ...form, codexAppImageOverlayPath: event.currentTarget.value })}
+                      placeholder={t("选择 png / jpg / webp / gif / bmp")}
+                    />
+                    <Button variant="secondary" onClick={() => void actions.chooseImageOverlayPath()}>
+                      {t("选择图片")}
+                    </Button>
+                  </div>
+                </SettingRow>
+                <SettingRow title={t("透明度")} description={t("数值越大，背景图越明显。")}>
+                  <div className="setting-inline setting-range">
+                    <Input
+                      min={1}
+                      max={100}
+                      type="range"
+                      value={form.codexAppImageOverlayOpacity}
+                      onChange={(event) =>
+                        onFormChange({
+                          ...form,
+                          codexAppImageOverlayOpacity: clampNumber(Number(event.currentTarget.value), 1, 100),
+                        })
+                      }
+                    />
+                    <span className="setting-range-value">{form.codexAppImageOverlayOpacity}%</span>
+                  </div>
+                </SettingRow>
+                <SettingRow title={t("背景适配方式")} description={t("图片和窗口比例不一致时如何铺放。")}>
+                  <AppSelect
+                    value={form.codexAppImageOverlayFitMode}
+                    onChange={(value) =>
+                      onFormChange({
+                        ...form,
+                        codexAppImageOverlayFitMode: value,
+                      })
+                    }
+                    options={[
+                      { value: "fill", label: t("填充") },
+                      { value: "fit", label: t("适应") },
+                      { value: "stretch", label: t("拉伸") },
+                      { value: "tile", label: t("平铺") },
+                      { value: "center", label: t("居中") },
+                    ]}
                   />
-                </Field>
-                <Toolbar>
-                  <Button variant="secondary" onClick={() => void actions.chooseImageOverlayPath()}>
-                    {t("选择图片")}
+                </SettingRow>
+                <SettingRow title={t("恢复默认")} description={t("清除图片，并把透明度、适配方式恢复为默认值。")}>
+                  <Button variant="secondary" onClick={() => void actions.resetImageOverlaySettings()}>
+                    {t("重置背景")}
                   </Button>
-                </Toolbar>
-              </div>
-              <Field label={tf("透明度 {0}%", [form.codexAppImageOverlayOpacity])}>
-                <Input
-                  min={1}
-                  max={100}
-                  type="range"
-                  value={form.codexAppImageOverlayOpacity}
-                  onChange={(event) =>
-                    onFormChange({
-                      ...form,
-                      codexAppImageOverlayOpacity: clampNumber(Number(event.currentTarget.value), 1, 100),
-                    })
-                  }
-                />
-              </Field>
-              <Field label={t("背景适配方式")}>
-                <AppSelect
-                  value={form.codexAppImageOverlayFitMode}
-                  onChange={(value) =>
-                    onFormChange({
-                      ...form,
-                      codexAppImageOverlayFitMode: value,
-                    })
-                  }
-                  options={[
-                    { value: "fill", label: t("填充") },
-                    { value: "fit", label: t("适应") },
-                    { value: "stretch", label: t("拉伸") },
-                    { value: "tile", label: t("平铺") },
-                    { value: "center", label: t("居中") },
-                  ]}
-                />
-              </Field>
-            </div>
-            <Toolbar>
-              <Button variant="secondary" onClick={() => void actions.resetImageOverlaySettings()}>
-                {t("重置背景")}
-              </Button>
-            </Toolbar>
+                </SettingRow>
+              </>
+            ) : (
+              <p className="setting-footnote">{t("已关闭：Codex 会话不叠加背景图。")}</p>
+            )}
           </CardContent>
         </Panel>
 
         <Panel>
           <CardHead title={t("Codex 启动参数")} detail={t("启动 Codex App 时追加到默认 CDP 参数后。留空则保持默认启动行为。")} />
-          <CardContent className="settings-content">
-            <Field label={t("额外参数")}>
+          <CardContent className="settings-content setting-rows">
+            <SettingRow
+              stacked
+              title={t("额外参数")}
+              description={t("每行一个参数，例如 --force_high_performance_gpu。不需要填写 open 或 --args。")}
+            >
               <Textarea
                 className="launch-args-input"
                 placeholder="--force_high_performance_gpu"
@@ -9629,8 +9624,7 @@ function AgentSettingsScreen({
                   })
                 }
               />
-            </Field>
-            <p className="field-hint">{t("每行一个参数，例如 --force_high_performance_gpu。不需要填写 open 或 --args。")}</p>
+            </SettingRow>
           </CardContent>
         </Panel>
       </>
@@ -14098,6 +14092,63 @@ function ClaudeLocalizationScreen() {
           </CardContent>
         </Panel>
       </div>
+    </div>
+  );
+}
+
+/// 设置行：左边标题 + 一句短说明，右边控件；长说明放进悬停提示（`detail`）。
+/// `stacked` 时控件放到说明下方，给状态码编辑、多行输入这类宽控件用。
+function SettingRow({ title, description, detail, stacked = false, children }: {
+  title: ReactNode;
+  description?: ReactNode;
+  detail?: string;
+  stacked?: boolean;
+  children?: ReactNode;
+}) {
+  return (
+    <div className={`setting-row${stacked ? " setting-row-stacked" : ""}`} title={detail}>
+      <div className="setting-row-copy">
+        <strong>{title}</strong>
+        {description ? <span>{description}</span> : null}
+      </div>
+      {children ? <div className="setting-row-control">{children}</div> : null}
+    </div>
+  );
+}
+
+/// 标题栏右侧带开关的卡片头：开关关闭时，卡片里的设置整块收起，只留一行提示。
+function SwitchPanelHead({ title, detail, checked, onChange, label }: {
+  title: string;
+  detail: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  label: string;
+}) {
+  return (
+    <CardHeader className="panel-head switch-panel-head">
+      <div className="switch-panel-head-copy">
+        <CardTitle>{title}</CardTitle>
+        <CardDescription>{detail}</CardDescription>
+      </div>
+      <label className="switch-row compact relay-master-switch-compact">
+        <input aria-label={label} checked={checked} onChange={(event) => onChange(event.currentTarget.checked)} type="checkbox" />
+        <span>{checked ? t("已开启") : t("已关闭")}</span>
+        <ToggleVisual />
+      </label>
+    </CardHeader>
+  );
+}
+
+/// 带状态图标的小卡片，与概览页健康检查同一套样式。
+function HealthTile({ item }: { item: ReturnType<typeof healthItems>[number] }) {
+  return (
+    <div className={`health-item ${item.ok ? "ok" : "needs-fix"}`}>
+      <span className={`health-icon ${statusClass(item.status)}`}><item.icon className="h-4 w-4" /></span>
+      <div>
+        <strong>{item.title}</strong>
+        <span title={item.detail}>{item.detail}</span>
+      </div>
+      <Badge status={item.status} />
     </div>
   );
 }
