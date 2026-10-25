@@ -813,7 +813,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  min-width: 260px;
+  width: 380px;
   /* 视口内兜底：菜单改 fixed 定位后也不允许超出窗口，超高时内部滚动。
      真正的限高由 `resolveAnchoredMenuLayout` 按触发按钮的 top 算出来走内联样式，
      这里只是没量到坐标时的回退（固定 100vh 不减 top 会把按钮顶到窗口外面）。
@@ -826,7 +826,8 @@ body {
   border-radius: 8px;
   background: hsl(var(--popover));
   box-shadow: 0 12px 26px hsl(var(--foreground) / 0.08);
-  padding: 8px;
+  padding: 12px;
+  gap: 10px;
 }
 
 /* 除供应商列表外的子项一律不压缩：否则「实际来源：…」这类一行文字会被 flex 挤成 4px 高。 */
@@ -848,50 +849,124 @@ body {
 .third-party-import-actions {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid hsl(var(--border));
 }
 
-.third-party-import-actions {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.third-party-import-menu button {
+.third-party-import-head {
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 3px;
-  width: 100%;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: hsl(var(--foreground));
-  cursor: pointer;
-  font: inherit;
-  padding: 9px 10px;
-  text-align: left;
+  gap: 2px;
+  padding: 2px 2px 4px;
 }
 
-.third-party-import-menu button.third-party-import-action {
-  grid-template-columns: auto minmax(0, 1fr);
+.third-party-import-head strong {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.third-party-import-head small,
+.third-party-import-meta,
+.third-party-import-empty {
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+}
+
+.third-party-import-source {
+  display: grid;
+  gap: 6px;
+}
+
+.third-party-import-path {
+  display: flex;
+  gap: 6px;
   align-items: center;
 }
 
-.third-party-import-menu button:hover:not(:disabled) {
-  background: hsl(var(--secondary));
-}
-
-.third-party-import-menu button:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
-.third-party-import-menu span {
-  color: hsl(var(--muted-foreground));
+.third-party-import-path input {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
   font-size: 12px;
+}
+
+.third-party-import-meta {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.third-party-import-warning {
+  color: hsl(var(--status-warning));
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.third-party-import-empty {
+  margin: 0;
+  padding: 14px 4px;
+  text-align: center;
+}
+
+.third-party-import-list-head {
+  display: flex;
+  justify-content: space-between;
+  padding: 6px 2px 0;
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+}
+
+.third-party-import-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 150px);
+  gap: 10px;
+  align-items: center;
+  padding: 7px 8px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--surface-sunken) / 0.35);
+}
+
+.third-party-import-name {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.third-party-import-name strong,
+.third-party-import-name small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.third-party-import-name strong {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.third-party-import-name small {
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+}
+
+.third-party-import-row select {
+  width: 100%;
+  height: 28px;
+  padding: 0 6px;
+  border: 1px solid hsl(var(--input));
+  border-radius: 6px;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font: inherit;
+  font-size: 12px;
+}
+
+.third-party-import-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .env-conflict-notice {
@@ -10633,6 +10708,24 @@ select {
 .provider-add-custom-result{border-color:hsl(var(--brand-accent)/.5);background:hsl(var(--brand-accent)/.08)}
 
 .provider-add-reference-layout{max-width:1040px}.provider-add-section h3{margin:24px 0 10px;color:hsl(var(--muted-foreground));font-size:14px}.provider-add-result{justify-content:flex-start;min-height:78px}.provider-add-result>span:last-child{min-width:0}.provider-add-icon{display:flex;align-items:center;justify-content:center;flex:none;width:38px;height:38px;border:1px solid hsl(var(--brand-accent)/.35);border-radius:10px;background:hsl(var(--brand-accent)/.08);color:hsl(var(--brand-accent));font-size:17px;font-weight:700}.provider-add-custom-result{grid-column:1}.provider-add-result small{margin-top:4px;max-width:100%}
+
+/* ── 添加供应商目录页 ───────────────────────────────────────── */
+/* 名称与网址上下两行；卡片压矮，宽屏三列；「自定义配置」独占一行。 */
+.provider-add-reference-layout .provider-add-results{grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:8px;margin-top:0}
+.provider-add-reference-layout .provider-add-result{min-height:0;padding:10px 12px;gap:10px;align-items:center;transition:border-color var(--motion-fast) var(--motion-ease),background var(--motion-fast) var(--motion-ease),transform var(--motion-fast) var(--motion-ease)}
+.provider-add-reference-layout .provider-add-result:hover{transform:translateY(-1px)}
+.provider-add-reference-layout .provider-add-icon{width:32px;height:32px;border-radius:8px;font-size:13px}
+.provider-add-text{display:grid;gap:2px;min-width:0;flex:1}
+.provider-add-text strong,.provider-add-text small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.provider-add-reference-layout .provider-add-text small{margin:0;max-width:none;font-size:11.5px}
+.provider-add-protocol{flex:none;padding:1px 6px;border:1px solid hsl(var(--border));border-radius:5px;color:hsl(var(--muted-foreground));font-size:10.5px}
+.provider-add-section h3{display:flex;align-items:center;gap:6px;margin:22px 0 8px;font-size:12.5px;font-weight:600}
+.provider-add-section h3 span{padding:0 6px;border-radius:999px;background:hsl(var(--secondary));color:hsl(var(--muted-foreground));font-size:11px;font-weight:500}
+.provider-add-custom{display:flex;align-items:center;gap:12px;width:100%;margin-top:14px;padding:12px 14px;border:1px dashed hsl(var(--brand-accent)/.55);border-radius:10px;background:hsl(var(--brand-accent)/.06);color:hsl(var(--foreground));font:inherit;text-align:left;cursor:pointer;transition:background var(--motion-fast) var(--motion-ease),border-color var(--motion-fast) var(--motion-ease)}
+.provider-add-custom:hover{border-style:solid;background:hsl(var(--brand-accent)/.1)}
+.provider-add-custom .provider-add-text small{color:hsl(var(--muted-foreground));font-size:12px}
+.provider-add-chevron{flex:none;color:hsl(var(--muted-foreground))}
+.provider-add-empty{margin-top:24px;padding:28px 16px;border:1px dashed hsl(var(--border));border-radius:10px;color:hsl(var(--muted-foreground));font-size:12.5px;text-align:center}
 
 /* 四个管理页统一内容容器：外层边框承载页面内容，内部列表保持独立分组。 */
 .mg-page>.mg-content{margin:18px 22px 22px;padding:20px;border:1px solid hsl(var(--border));border-radius:14px;background:hsl(var(--surface-sunken)/.32);box-shadow:var(--shadow-sm)}.mg-page>.mg-content>.mg-matrix,.mg-page>.mg-content>.mg-skill-list,.mg-page>.mg-content>.mg-session-list{background:hsl(var(--card)/.78);border-color:hsl(var(--border)/.95)}.relay-management-page>.mg-content>.relay-management-panel{border:0;background:transparent;box-shadow:none}.relay-management-page>.mg-content>.relay-management-panel:hover{box-shadow:none;border-color:transparent}.relay-management-page>.mg-content>.relay-management-panel>.card-content{padding:0}.mg-page>.mg-content>.mg-notice{margin-top:12px}@media(max-width:760px){.mg-page>.mg-content{margin:14px 14px 18px;padding:14px}}
