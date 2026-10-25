@@ -535,7 +535,7 @@ mod tests {
             let before = std::fs::read(&path).unwrap();
             let mut next = store.load().unwrap();
             next.active_relay_id = "next".into();
-            let error = switch_relay_profile_with_resolution_and_apply(
+            let error = switch_relay_profile_with_apply_resolving_conflict(
                 &store, &home, next, "old", resolution,
                 |_, selected| {
                     assert_eq!(selected.active_relay_id, "next");
