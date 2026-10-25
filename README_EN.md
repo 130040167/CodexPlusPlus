@@ -16,7 +16,7 @@
   <img alt="Tauri" src="https://img.shields.io/badge/tauri-2.x-24C8DB">
 </p>
 
-Codex++ is a unified management application for the OpenAI Codex / ChatGPT desktop app. Double-clicking opens its window; the official app is started from that window. It uses the Chromium DevTools Protocol and an embedded runtime for provider switching, protocol conversion, session management, and UI enhancements without modifying the official app's `app.asar` or installation files.
+Codex++ is a unified manager for AI coding agents. It started with the OpenAI Codex / ChatGPT desktop app — provider switching, protocol conversion, session management, and UI enhancements — and now also manages Claude Code, Claude Desktop, and the Grok CLI, with Computer Use sharing and sub-agent collaboration across agents. Double-click to open its window and launch each app from there. It never modifies any official app's installation files.
 
 ## Quick Start
 
@@ -40,6 +40,14 @@ Telegram: <https://t.me/CodexPlusPlus>
 Friendly link: <a href="https://linux.do">LINUX DO</a>
 
 ## Current Features
+
+| Agent | What Codex++ does |
+| --- | --- |
+| **Codex desktop** | Provider switching and protocol conversion, request shock absorption, session management, UI enhancements, multi-launch, extensions, and the usage widget |
+| **Claude Code** | CC Switch-style provider switching; Computer Use connection |
+| **Claude Desktop** | Enhanced copy (Chinese UI, dictation, Computer Use); Computer Use connection |
+| **Grok CLI** | Model and API endpoint configuration |
+| **DeepSeek Harness and more** | Computer Use connection; callable as a sub-agent from Codex chats |
 
 | Area | Capabilities |
 | --- | --- |
@@ -113,7 +121,7 @@ The optional usage widget lives under Codex Enhancements → General → Widgets
 
 **Whale widget source and credits:** The original features, complete UI engine, character, built-in sounds and animations come from [MeteorNOX/DeepSeek-Balance-Whale-Widget](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget), adapted here as a built-in Codex++ feature. The Codex desktop architecture also references [Yang-huai406/Codex-Whale-Public](https://github.com/Yang-huai406/Codex-Whale-Public). The upstream [LICENSE](assets/inject/upstream/whale-widget/LICENSE) and [PROVENANCE.md](assets/inject/upstream/whale-widget/PROVENANCE.md) are preserved; the media assets are not claimed as original work by this project.
 
-## Provider Modes
+## Codex Provider Modes
 
 Official login, mixed API, and pure API are stored and switched separately:
 
@@ -229,8 +237,8 @@ Copyright (C) 2026 BigPizzaV3
 
 CodexPlusPlus is licensed under the [GNU Affero General Public License v3.0](LICENSE), SPDX identifier `AGPL-3.0-only`. Modified versions that are distributed or offered to users over a network must provide the corresponding source code as required by AGPLv3.
 
-The license covers CodexPlusPlus code only. It does not grant rights to OpenAI, ChatGPT, Codex trademarks, application assets, or other third-party content.
+The license covers CodexPlusPlus code only. It does not grant rights to OpenAI, ChatGPT, Codex, Anthropic, Claude, xAI, or Grok trademarks, application assets, or other third-party content.
 
 ## Compatibility
 
-Codex++ depends on the official desktop app's page structure, CDP behavior, and local data formats. Official app updates may require injection updates. Keep backups before changing provider configuration or local session data.
+Codex++ depends on each official app's page structure, CDP behavior, and local data formats. Official app updates may require injection updates. Keep backups before changing provider configuration or local session data.

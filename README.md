@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="docs/images/readme-preview/hero.svg" alt="Codex++ — 让 Codex 更顺手。供应商与模型、工作流增强、拓展与个性化。" width="100%">
+  <img src="docs/images/readme-preview/hero.svg" alt="Codex++ — 让 AI 编程 Agent 更顺手。Codex、Claude Code、Claude Desktop 与 Grok 统一管理。" width="100%">
 </p>
 
 <p align="center">
-  <strong>给 Codex 桌面应用加一点「++」。</strong><br>
-  统一管理供应商与模型，让会话更好用，也让工作区更像你。
+  <strong>给你的 AI 编程 Agent 加一点「++」。</strong><br>
+  以 Codex 为核心，同时管理 Claude Code、Claude Desktop 与 Grok，还能把 Computer Use 共享给各个 Agent。
 </p>
 
 <p align="center">
@@ -28,7 +28,7 @@
   <br><sub>从供应商配置到界面增强，一个管理工具就够了。</sub>
 </p>
 
-Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的统一管理应用，通过 CDP 与内置运行服务提供供应商切换、协议转换、会话管理和界面增强。双击打开配置界面，再从界面启动官方应用。它不修改官方应用的 `app.asar`，也不向安装目录写入补丁文件。
+Codex++ 是 AI 编程 Agent 的统一管理应用。它从 OpenAI Codex / ChatGPT 桌面应用起步，提供供应商切换、协议转换、会话管理和界面增强；现在也管理 Claude Code、Claude Desktop 与 Grok CLI，并提供跨 Agent 的 Computer Use 与子 Agent 协作。双击打开配置界面，再从界面启动各个应用。它不修改任何官方应用的安装文件。
 
 ## 交流与支持
 
@@ -129,6 +129,14 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的统一管理应用，通
 想支持项目或展示品牌？[联系维护者](mailto:1727532@qq.com)。
 
 ## 功能一览
+
+| Agent | Codex++ 能做什么 |
+| --- | --- |
+| **Codex 桌面版** | 供应商切换与协议转换、请求避震、会话管理、界面增强、多开、拓展与桌宠 |
+| **Claude Code** | 供应商一键切换（CC Switch 风格）、接入 Computer Use |
+| **Claude Desktop** | 增强版（中文界面、语音输入、Computer Use）、接入 Computer Use |
+| **Grok CLI** | 模型与 API 端点配置 |
+| **DeepSeek Harness 等** | 接入 Computer Use、在 Codex 对话中作为子 Agent 调用 |
 
 <table>
   <tr>
@@ -277,7 +285,7 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的统一管理应用，通
 | Windows · x64 | `CodexPlusPlus-*-windows-x64-setup.exe` |
 | macOS · Apple Silicon / Intel | `CodexPlusPlus-*-macos-universal.dmg` |
 
-**2. 打开 Codex++ 完成配置**：确认官方 Codex / ChatGPT 桌面应用路径，选择供应商，按需开启增强。
+**2. 打开 Codex++ 完成配置**：确认官方 Codex / ChatGPT 桌面应用路径，选择供应商，按需开启增强；使用 Claude、Grok 相关功能时需安装对应客户端。
 
 **3. 点击「启动 Codex」**：依赖注入的设置需在界面中重启 Codex 才生效。
 
@@ -288,7 +296,7 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的统一管理应用，通
 
 </details>
 
-## 供应商与模型
+## Codex 供应商与模型
 
 | 模式 | 适用场景 |
 | --- | --- |
@@ -404,8 +412,8 @@ cargo build --release
 
 <p align="center">
   <img src="docs/images/codex-plus-plus.png" alt="Codex++ 项目标志" width="44"><br>
-  <strong>Codex++</strong> · 让 Codex 更顺手。<br>
+  <strong>Codex++</strong> · 让 AI 编程 Agent 更顺手。<br>
   <sub>Copyright © 2026 BigPizzaV3 · <a href="LICENSE">AGPL-3.0-only</a></sub>
 </p>
 
-CodexPlusPlus 的修改与分发、通过网络提供修改后版本的源代码义务，以 [GNU AGPL v3.0](LICENSE) 为准。许可证覆盖本项目自身代码，第三方素材遵循各自声明；不授予 OpenAI、ChatGPT、Codex 商标或应用资源的权利。
+CodexPlusPlus 的修改与分发、通过网络提供修改后版本的源代码义务，以 [GNU AGPL v3.0](LICENSE) 为准。许可证覆盖本项目自身代码，第三方素材遵循各自声明；不授予 OpenAI、ChatGPT、Codex、Anthropic、Claude、xAI、Grok 等商标或应用资源的权利。
