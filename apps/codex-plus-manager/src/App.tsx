@@ -1259,6 +1259,8 @@ const navigationSections: Array<{ label: string; routes: Route[]; placement?: "b
  * 所以和 Agent 协作一样放在这里，而不是重复出现在每个 Agent 的「扩展」分组里。
  */
 const globalNavigationRoutes: Route[] = ["recommendations", "agentCache", "agentCollaboration", "computerUse", "about", "settings"];
+// 最左栏里跟 Agent 图标排在一组的全局页（Computer Use 服务于所有 Agent），其余全局页放在底部。
+const railAgentGroupRoutes: Route[] = ["computerUse"];
 
 const defaultSettings: BackendSettings = {
   ...defaultWhaleBalanceSettings(),
@@ -14747,6 +14749,25 @@ function ApplicationRail({
 }) {
   const languageLabel = getLanguage() === "en" ? t("切换到中文") : t("切换到英文");
   const themeLabel = theme === "dark" ? t("切换到浅色") : t("切换到深色");
+  const renderNavItem = (routeId: Route) => {
+    const item = routes.find((candidate) => candidate.id === routeId);
+    if (!item) return null;
+    const Icon = item.icon;
+    const selected = route === item.id;
+    return (
+      <button
+        aria-current={selected ? "page" : undefined}
+        aria-label={item.label}
+        className={`tool-chip rail-nav-item ${selected ? "active" : ""}`}
+        key={item.id}
+        onClick={() => onNavigate(item.id)}
+        title={item.label}
+        type="button"
+      >
+        <Icon aria-hidden="true" className="rail-nav-icon" />
+      </button>
+    );
+  };
   return (
     <aside className="app-rail">
       {/* 程序左上角的 logo：点一下回到当前 Agent 的概览。
@@ -14779,28 +14800,12 @@ function ApplicationRail({
         codexAppRunning={codexAppRunning}
         showSelection={!globalNavigationRoutes.includes(route)}
         onSelect={onSelect}
-      />
+      >
+        {railAgentGroupRoutes.map(renderNavItem)}
+      </ToolSwitcher>
       <div className="rail-bottom">
         <nav className="rail-navigation" aria-label={t("系统")}>
-          {globalNavigationRoutes.map((routeId) => {
-            const item = routes.find((candidate) => candidate.id === routeId);
-            if (!item) return null;
-            const Icon = item.icon;
-            const selected = route === item.id;
-            return (
-              <button
-                aria-current={selected ? "page" : undefined}
-                aria-label={item.label}
-                className={`tool-chip rail-nav-item ${selected ? "active" : ""}`}
-                key={item.id}
-                onClick={() => onNavigate(item.id)}
-                title={item.label}
-                type="button"
-              >
-                <Icon aria-hidden="true" className="rail-nav-icon" />
-              </button>
-            );
-          })}
+          {globalNavigationRoutes.filter((routeId) => !railAgentGroupRoutes.includes(routeId)).map(renderNavItem)}
         </nav>
         <div className="rail-preferences">
           <button
@@ -14839,12 +14844,15 @@ function ToolSwitcher({
   codexAppRunning,
   showSelection = true,
   onSelect,
+  children,
 }: {
   tools: ToolEntry[];
   activeTool: ToolId;
   codexAppRunning: boolean;
   showSelection?: boolean;
   onSelect: (toolId: ToolId) => void;
+  /** 排在 Agent 图标之后的同组入口。 */
+  children?: ReactNode;
 }) {
   return (
     <nav className="tool-switcher" aria-label={t("工具切换")}>
@@ -14878,6 +14886,7 @@ function ToolSwitcher({
           </button>
         );
       })}
+      {children}
     </nav>
   );
 }
