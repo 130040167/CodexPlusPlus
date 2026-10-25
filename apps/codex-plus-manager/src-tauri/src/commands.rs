@@ -8032,8 +8032,15 @@ fn provider_doctor_recommendation(checks: &[ProviderDoctorCheck]) -> String {
     {
         return "优先检查测试模型名称、上游协议选择和 Key 权限；如果 Chat Completions 可用，请切到对应协议。".to_string();
     }
-    if checks.iter().any(|check| check.status == "warning") {
+    // 只有模型列表告警才是「测试模型不在列表里」，其他告警不能套用这句（#2638）
+    if checks
+        .iter()
+        .any(|check| check.id == "models" && check.status == "warning")
+    {
         return "连接可用，但测试模型没有出现在模型列表里；建议改用上游返回的模型名。".to_string();
+    }
+    if checks.iter().any(|check| check.status == "warning") {
+        return "连接可用，但上游返回了未完成的响应；请查看「真实请求」一项的详情，并在真实对话里确认是否正常。".to_string();
     }
     "可以作为 Codex 供应商使用；如果真实对话仍失败，请查看协议代理日志里的上游响应。".to_string()
 }
@@ -9885,6 +9892,27 @@ base_url = "https://example.invalid/v1"
         ]);
 
         assert!(recommendation.contains("/v1/models"));
+    }
+
+    #[test]
+    fn provider_doctor_recommendation_does_not_blame_model_list_for_request_warning() {
+        let recommendation = provider_doctor_recommendation(&[
+            ProviderDoctorCheck {
+                id: "models".to_string(),
+                title: "模型列表".to_string(),
+                status: "ok".to_string(),
+                detail: "已看到测试模型".to_string(),
+            },
+            ProviderDoctorCheck {
+                id: "request".to_string(),
+                title: "真实请求".to_string(),
+                status: "warning".to_string(),
+                detail: "incomplete".to_string(),
+            },
+        ]);
+
+        assert!(!recommendation.contains("模型列表"));
+        assert!(recommendation.contains("未完成"));
     }
 
     #[test]
