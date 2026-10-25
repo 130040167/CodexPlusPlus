@@ -88,7 +88,7 @@ import {
 import { createPresetPatch } from "@/components/ProviderPresetSelector";
 import { PRESETS, type ProviderPreset } from "./presets";
 import { createPortal } from "react-dom";
-import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
 
 import { Badge as UiBadge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -2895,6 +2895,27 @@ export function App() {
     return null;
   };
 
+  /// 自动保存：不弹成功提示；校验不过就不保存，把原因交给页面显示，避免输入到一半就弹窗。
+  ///
+  /// 保存期间用户又改了表单时，保留新草稿、只同步版本号（否则下一次保存会撞版本冲突），
+  /// 草稿仍是「有修改」，由页面下一轮再存。
+  const autoSaveSettings = async (snapshot: BackendSettings): Promise<AutoSaveOutcome> => {
+    const normalized = normalizeSettings(snapshot);
+    const issue = whaleBalanceValidationMessage(whaleBalanceSettingsIssue(normalized))
+      || dictationSettingsValidationMessage(dictationSettingsIssue(normalized.dictation));
+    if (issue) return { status: "invalid", message: issue };
+    try {
+      const result = await call<SettingsResult>("save_settings", { settings: normalized });
+      if (!isSuccessStatus(result.status)) return { status: "failed", message: result.message };
+      const saved = normalizeSettings(result.settings);
+      setSettings(result);
+      setSettingsForm((current) => (backendSettingsEqual(current, snapshot) ? saved : { ...current, revision: saved.revision }));
+      return { status: "saved" };
+    } catch (error) {
+      return { status: "failed", message: stringifyError(error) };
+    }
+  };
+
   const beginWeixinQrLogin = async () => {
     const result = await run(() => call<WeixinQrResult>("weixin_connect_qr_start", {
       baseUrl: settingsForm.weixinConnectBaseUrl,
@@ -3909,6 +3930,7 @@ export function App() {
       performUpdate,
       saveSettings,
       saveSettingsValue,
+      autoSaveSettings,
       refreshSettings,
       resetSettings,
       exportSettings,
@@ -4615,6 +4637,8 @@ function ModelReasoningLevelsCell({
   );
 }
 
+type AutoSaveOutcome = { status: "saved" } | { status: "invalid" | "failed"; message: string };
+
 type Actions = {
   refreshCurrent: () => Promise<void>;
   launch: () => Promise<void>;
@@ -4632,6 +4656,7 @@ type Actions = {
   performUpdate: () => Promise<void>;
   saveSettings: () => Promise<void>;
   saveSettingsValue: (settings: BackendSettings, silent?: boolean) => Promise<BackendSettings | null>;
+  autoSaveSettings: (settings: BackendSettings) => Promise<AutoSaveOutcome>;
   refreshSettings: (silent?: boolean) => Promise<BackendSettings | null>;
   resetSettings: () => Promise<void>;
   exportSettings: () => Promise<void>;
@@ -7227,7 +7252,7 @@ function DictationSettingsPanel({ form, onFormChange }: {
             <Info className="h-4 w-4" />
             <span>{form.dictation.provider === "sensevoice"
               ? t("下载模型并保存配置后，可在 Codex 输入框录音，停止后在本机转写并插入文字。")
-              : t("保存后 Codex 输入框底部会显示麦克风图标，停止录音后可插入或发送文字。录音会发送到上面填写的服务地址，无需重启。")}</span>
+              : t("开启后 Codex 输入框底部会显示麦克风图标，停止录音后可插入或发送文字。录音会发送到上面填写的服务地址，无需重启。")}</span>
           </div>
         </div>
       </CardContent>
@@ -7361,6 +7386,82 @@ function StepwiseSettingsPanel({ form, onFormChange, actions }: {
   );
 }
 
+/** 增强页改动后多久自动保存：开关点完马上存，文本框停止输入后再存。 */
+const ENHANCE_AUTO_SAVE_DELAY_MS = 500;
+
+type AutoSaveState =
+  | { state: "idle" | "pending" | "saving" | "saved" }
+  | { state: "invalid" | "failed"; message: string; retry: () => void };
+
+/// 增强页的自动保存。
+///
+/// - 防抖：同一轮连续改动只存一次；
+/// - 同一时间只有一个保存在途，期间的改动等它回来后再存（App 会同步版本号并触发下一轮）；
+/// - 离开页面时还有没存的改动就立即补存一次，不丢草稿。
+function useEnhanceAutoSave(
+  dirty: boolean,
+  form: BackendSettings,
+  save: (settings: BackendSettings) => Promise<AutoSaveOutcome>,
+): AutoSaveState {
+  const [status, setStatus] = useState<AutoSaveState>({ state: "idle" });
+  const savingRef = useRef(false);
+  const latest = useRef({ dirty, form, save });
+  latest.current = { dirty, form, save };
+
+  const flush = useCallback(async () => {
+    if (savingRef.current) return;
+    const { dirty: pending, form: snapshot, save: persist } = latest.current;
+    if (!pending) return;
+    savingRef.current = true;
+    setStatus({ state: "saving" });
+    const outcome = await persist(snapshot);
+    savingRef.current = false;
+    setStatus(outcome.status === "saved"
+      ? { state: "saved" }
+      : { state: outcome.status, message: outcome.message, retry: () => void flush() });
+  }, []);
+
+  useEffect(() => {
+    if (!dirty) return;
+    setStatus((current) => (current.state === "saving" || current.state === "invalid" ? current : { state: "pending" }));
+    const timer = window.setTimeout(() => void flush(), ENHANCE_AUTO_SAVE_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [dirty, form, flush]);
+
+  useEffect(() => () => {
+    if (latest.current.dirty && !savingRef.current) void latest.current.save(latest.current.form);
+  }, []);
+
+  return status;
+}
+
+function AutoSaveStatus({ state }: { state: AutoSaveState }) {
+  if (state.state === "invalid" || state.state === "failed") {
+    return (
+      <>
+        <span className="is-error" role="alert" title={state.message}>
+          {state.state === "invalid" ? tf("未保存：{0}", [t(state.message)]) : tf("自动保存失败：{0}", [t(state.message)])}
+        </span>
+        {state.state === "failed" ? (
+          <Button onClick={state.retry} size="sm" variant="secondary">
+            <RefreshCw className="h-4 w-4" />
+            {t("重试")}
+          </Button>
+        ) : null}
+      </>
+    );
+  }
+  const label = state.state === "saving" ? t("正在保存…")
+    : state.state === "pending" ? t("即将自动保存…")
+      : t("改动会自动保存");
+  return (
+    <span className={state.state === "saved" || state.state === "idle" ? "" : "is-dirty"} role="status">
+      {state.state === "saved" ? <CheckCircle2 className="h-3.5 w-3.5" /> : null}
+      {state.state === "saved" ? t("已自动保存") : label}
+    </span>
+  );
+}
+
 function EnhanceScreen({
   dirty,
   activeTab,
@@ -7377,11 +7478,7 @@ function EnhanceScreen({
   actions: Actions;
 }) {
   const setEnhanceFlag = (key: keyof BackendSettings, value: boolean) => onFormChange({ ...form, [key]: value });
-  const setPersistedEnhanceFlag = (key: keyof BackendSettings, value: boolean) => {
-    const next = { ...form, [key]: value };
-    onFormChange(next);
-    void actions.saveSettingsValue(next, true);
-  };
+  const autoSave = useEnhanceAutoSave(dirty, form, actions.autoSaveSettings);
   const masterEnabled = form.enhancementsEnabled;
   const tabs: Array<{ value: EnhancementTab; label: string }> = [
     { value: "general", label: t("常用增强") },
@@ -7409,11 +7506,7 @@ function EnhanceScreen({
             <ToggleVisual />
           </label>
           <div className="enhance-save-actions">
-            <span className={dirty ? "is-dirty" : ""} role="status">{dirty ? t("有未保存修改") : t("已保存")}</span>
-            <Button disabled={!dirty} onClick={() => void actions.saveSettings()}>
-              <Save className="h-4 w-4" />
-              {t("保存增强设置")}
-            </Button>
+            <AutoSaveStatus state={autoSave} />
           </div>
         </div>
         <div className="enhance-tabs" role="tablist" aria-label={t("Codex增强")}>
@@ -7467,11 +7560,11 @@ function EnhanceScreen({
                 </> : null}
                 <FeatureToggle title={t("插件市场解锁")} detail={t("API Key 模式下扩展插件市场请求，尽量显示完整插件列表；官方/混合模式通常不需要。")} checked={form.codexAppPluginMarketplaceUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppPluginMarketplaceUnlock", value)} />
                 <FeatureToggle title={t("模型白名单解锁")} detail={t("从环境变量和 config.toml 的 /v1/models 拉取模型并补进模型列表。")} checked={form.codexAppModelWhitelistUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppModelWhitelistUnlock", value)} />
-                <FeatureToggle title={t("原生 Fast 强制解锁")} detail={t("纯 API Key 模式恢复原生 Fast 开关；保存后重新启动 Codex 生效，实际支持与计费由供应商决定。")} checked={form.codexAppNativeFastUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppNativeFastUnlock", value)} />
+                <FeatureToggle title={t("原生 Fast 强制解锁")} detail={t("纯 API Key 模式恢复原生 Fast 开关；重新启动 Codex 后生效，实际支持与计费由供应商决定。")} checked={form.codexAppNativeFastUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppNativeFastUnlock", value)} />
               </FeatureGroup>
               <FeatureGroup title={t("对话与输入")} detail={t("调整会话管理、输入行为和对话阅读体验。")}>
                 <FeatureToggle title={t("会话删除")} detail={t("在会话列表悬停显示删除按钮，并支持撤销。")} checked={form.codexAppSessionDelete} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppSessionDelete", value)} />
-                <FeatureToggle title={t("纯 API 模式禁用 Work 视图")} detail={t("Work 视图要求 ChatGPT 账号身份，纯 API Key 下发送消息会报 Work browser access requires an authenticated account。开启后每次启动 Codex 前把详情模式写回 Codex；保存并重新启动 Codex 生效。")} checked={form.codexAppDisableWorkView} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppDisableWorkView", value)} />
+                <FeatureToggle title={t("纯 API 模式禁用 Work 视图")} detail={t("Work 视图要求 ChatGPT 账号身份，纯 API Key 下发送消息会报 Work browser access requires an authenticated account。开启后每次启动 Codex 前把详情模式写回 Codex；重新启动 Codex 后生效。")} checked={form.codexAppDisableWorkView} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppDisableWorkView", value)} />
                 <FeatureToggle title={t("Markdown 导出")} detail={t("在会话列表显示导出按钮，导出带时间戳的 Markdown。")} checked={form.codexAppMarkdownExport} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppMarkdownExport", value)} />
                 <FeatureToggle title={t("粘贴修复")} detail={t("从 Word 等富文本粘贴到 Codex composer 时只保留纯文本，避免被识别为图片/文件附件。需重启 Codex 才生效。")} checked={form.codexAppPasteFix} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppPasteFix", value)} />
                 <FeatureToggle title={t("强制中文界面")} detail={t("强制启用 Codex App 内置 zh-CN 语言包，避免 Statsig/VPN 不通时回退英文。需重启 Codex 才能完整生效。")} checked={form.codexAppForceChineseLocale} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppForceChineseLocale", value)} />
@@ -7479,7 +7572,7 @@ function EnhanceScreen({
                 <div className={`feature-toggle ${!masterEnabled ? "disabled" : ""}`}>
                   <span>
                     <strong>{t("打字特效（彩虹 P）")}</strong>
-                    <small>{t("在 Codex 输入框的光标附近显示特效，保存后生效；系统减少动态效果时暂停。")}</small>
+                    <small>{t("在 Codex 输入框的光标附近显示特效；系统减少动态效果时暂停。")}</small>
                   </span>
                   <AppSelect<TypingEffect>
                     ariaLabel={t("打字特效（彩虹 P）")}
@@ -7508,7 +7601,7 @@ function EnhanceScreen({
                   onChange={(value) => setEnhanceFlag("codexAppWhaleWidgetEnabled", value)}
                 />
                 <FeatureToggle title={t("活动进度条右侧布局")} detail={t("把 Codex 原生活动进度条、状态波形和活动悬浮框移到右侧，并镜像波形方向。")} checked={form.codexAppActivityOverlayRight} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppActivityOverlayRight", value)} />
-                {supportsPetRealMouseLook ? <FeatureToggle title={t("桌宠跟随真实鼠标")} detail={t("仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。")} checked={form.codexAppPetRealMouseLook} disabled={!masterEnabled} onChange={(value) => setPersistedEnhanceFlag("codexAppPetRealMouseLook", value)} /> : null}
+                {supportsPetRealMouseLook ? <FeatureToggle title={t("桌宠跟随真实鼠标")} detail={t("仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。")} checked={form.codexAppPetRealMouseLook} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppPetRealMouseLook", value)} /> : null}
                 {/* 余额配置独占一整行（CSS: > .settings-block），展开时不会牵动上面的开关卡。 */}
                 <WhaleBalanceSettingsFields form={form} onFormChange={onFormChange} />
               </FeatureGroup>
@@ -7550,7 +7643,7 @@ function StandaloneModeGroup({
         title={t("官方额度解锁")}
         detail={masterEnabled
           ? t("增强开启时此能力已自动生效；此开关只在关闭增强后生效。")
-          : t("官方登录 + API 供应商在官方订阅额度耗尽后仍可发送；只改客户端发送状态，不改变真实用量与计费。保存后重启 Codex 生效。")}
+          : t("官方登录 + API 供应商在官方订阅额度耗尽后仍可发送；只改客户端发送状态，不改变真实用量与计费。重启 Codex 后生效。")}
         checked={form.codexAppStandaloneQuotaUnlock}
         onChange={(value) => onFormChange({ ...form, codexAppStandaloneQuotaUnlock: value })}
       />
