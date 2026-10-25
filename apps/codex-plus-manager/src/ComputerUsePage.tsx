@@ -49,8 +49,15 @@ type CuCheck = {
 type CuResult = { status: string; message: string };
 type CuTab = "overview" | "preview" | "diagnose";
 type CuApprovalMode = "auto" | "claude";
-/** 操作方式：离散工具（直通原生 CU），或 cua_repl 的 js（和 Codex 当前主要路径一致）。 */
+/** 操作方式：cua_repl 的 js（默认，和 Codex 当前主要路径一致），或离散工具（直通原生 CU）。 */
 type CuMode = "tools" | "js";
+
+/**
+ * 本页的几个开关（操作方式、审批策略、悬浮预览）由后端单独写进 settings.json，文件版本号会变。
+ * 通知主界面同步，否则它表单里的旧版本号会让之后的设置保存报「已被其他操作更新」。
+ */
+export const BACKEND_SETTINGS_CHANGED_EVENT = "codex-plus:backend-settings-changed";
+const announceSettingsChanged = () => window.dispatchEvent(new Event(BACKEND_SETTINGS_CHANGED_EVENT));
 type CuApprovedApp = { decision: string; mode?: string; displayName?: string; decidedAt?: number };
 type CuLastClient = { name?: string; version?: string; elicitation?: boolean; at?: number };
 type CuApprovalState = {
@@ -164,6 +171,7 @@ export function ComputerUsePage() {
       const result = await invoke<CuResult>("computer_use_approval_set", { mode });
       if (!mounted.current) return;
       if (result.status === "ok") {
+        announceSettingsChanged();
         setNotice(result.message || t("审批策略已保存。"));
         await loadApproval();
       } else {
@@ -188,6 +196,7 @@ export function ComputerUsePage() {
       const result = await invoke<CuResult>("computer_use_mode_set", { mode });
       if (!mounted.current) return;
       if (result.status === "ok") {
+        announceSettingsChanged();
         setNotice(result.message || t("操作方式已保存；对新开的客户端会话生效。"));
         await loadApproval();
       } else {
@@ -212,6 +221,7 @@ export function ComputerUsePage() {
       const result = await invoke<CuResult>("computer_use_pip_set", { enabled });
       if (!mounted.current) return;
       if (result.status === "ok") {
+        announceSettingsChanged();
         setNotice(result.message || (enabled ? t("已开启悬浮预览。") : t("已关闭悬浮预览。")));
         await loadApproval();
       } else {
@@ -514,7 +524,7 @@ export function ComputerUsePage() {
     { id: "diagnose", label: t("诊断") },
   ];
   const approvalMode: CuApprovalMode = approval?.mode ?? "auto";
-  const cuMode: CuMode = approval?.cuMode ?? "tools";
+  const cuMode: CuMode = approval?.cuMode ?? "js";
 
   /** 图里的一个客户端：状态点 + 名称 + 一键接入/移除。路径等细节放在悬停提示与下方折叠区。 */
   const flowClient = (id: string, label: string, target: CuTarget | undefined, custom?: CuCustomTarget) => {

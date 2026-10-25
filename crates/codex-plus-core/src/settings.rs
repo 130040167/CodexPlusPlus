@@ -1562,9 +1562,10 @@ pub fn default_computer_use_approval() -> String {
     "auto".to_string()
 }
 
-/// Computer Use 默认用离散工具：与既有行为一致，JS 方式需要用户主动选择。
+/// Computer Use 默认用 JS（cua_repl）：与 Codex 当前主要的 CU 路径一致，
+/// 自带完整使用说明与确认规则，并能用 paste 输入中文。离散工具需要用户主动切换。
 pub fn default_computer_use_mode() -> String {
-    "tools".to_string()
+    "js".to_string()
 }
 
 fn default_whale_balance_protocol() -> String {

@@ -71,9 +71,9 @@ pub enum CuMode {
 impl CuMode {
     pub fn parse(value: &str) -> Self {
         match value {
-            "js" => Self::Js,
-            // 未知取值按默认处理：settings.json 里可能有旧版本或手写的值。
-            _ => Self::Tools,
+            "tools" => Self::Tools,
+            // 未知取值按默认（JS）处理：settings.json 里可能有旧版本或手写的值。
+            _ => Self::Js,
         }
     }
 

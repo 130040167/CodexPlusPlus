@@ -102,7 +102,7 @@ import { AgentCachePanel } from "./agent-cache";
 import { summarizeRecentRequests, type RecentRequestSummary } from "./overview-model";
 import { AgentCollaborationPage } from "./AgentCollaborationPage";
 import { ClaudeProviderPage } from "./ClaudeProviderPage";
-import { ComputerUsePage } from "./ComputerUsePage";
+import { BACKEND_SETTINGS_CHANGED_EVENT, ComputerUsePage } from "./ComputerUsePage";
 import { PluginMarketScreen } from "./PluginMarketScreen";
 import { ReleaseNotes } from "./ReleaseNotes";
 import { UPDATE_CHECK_INTERVAL_MS, UpdateNotifications } from "./update-notification";
@@ -1592,6 +1592,27 @@ export function App() {
       if (!silent) showResultNotice(t("概览已检查"), result, { silentSuccess: true });
     }
   };
+
+  // Computer Use 页的开关由后端单独写进 settings.json：重新读取，只合并这几个键和版本号，
+  // 别处没保存的草稿保持不动；否则表单里的旧版本号会让之后的保存全部报冲突。
+  useEffect(() => {
+    const sync = async () => {
+      const result = await run(() => call<SettingsResult>("load_settings"));
+      if (!result) return;
+      const fresh = normalizeSettings(result.settings) as BackendSettings & Record<string, unknown>;
+      setSettings(result);
+      setSettingsForm((current) => {
+        const merged: Record<string, unknown> = { ...current, revision: fresh.revision };
+        for (const key of ["computerUseMode", "computerUseApproval", "computerUsePip"]) merged[key] = fresh[key];
+        return merged as BackendSettings;
+      });
+    };
+    const handler = () => void sync();
+    window.addEventListener(BACKEND_SETTINGS_CHANGED_EVENT, handler);
+    return () => window.removeEventListener(BACKEND_SETTINGS_CHANGED_EVENT, handler);
+    // 只在挂载时注册；run / call 只依赖稳定的 setter。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const refreshSettings = async (silent = false) => {
     const result = await run(() => call<SettingsResult>("load_settings"));
