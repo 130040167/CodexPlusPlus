@@ -622,7 +622,8 @@ export function ComputerUsePage() {
         <div className="cu-flow-link cu-flow-lane-a" style={{ gridColumn: 6 }} />
         <div className="cu-flow-lane-a" style={{ gridColumn: 7 }}>{flowNode(<AppWindow size={16} />, t("本机桌面应用"), t("Finder、微信、系统设置…"), "target")}</div>
 
-        <div className="cu-flow-lane-b" style={{ gridColumn: 3 }}>{flowNode(<Globe size={16} />, "codex-plus-browser", t("浏览器控制"), "browser")}</div>
+        <div className="cu-flow-lane-b" style={{ gridColumn: 3 }}>{flowNode(<Globe size={16} />, "codex-plus-browser",
+          cuMode === "js" ? t("JS 方式下并入 codex-plus-cu，同 Codex") : t("浏览器控制"), "browser")}</div>
         <div className="cu-flow-link cu-flow-lane-b" style={{ gridColumn: 4 }} />
         <div className="cu-flow-lane-b" style={{ gridColumn: 5 }}>
           {flowNode(<Plug size={16} />, t("Chrome 扩展"),
@@ -641,14 +642,14 @@ export function ComputerUsePage() {
       <div className="cu-setting">
         <div className="cu-setting-copy">
           <strong>{t("操作方式")}</strong>
-          <small>{t("推荐 JS：与 Codex 当前的用法一致；首次使用自带完整说明和确认规则；一次调用能连续做多步操作，更快、更省 token；能用 paste 输入中文和多行文字。")}</small>
+          <small>{t("推荐 JS：与 Codex 当前的用法一致，桌面和 Chrome 都在同一个 js 工具里；首次使用自带完整说明和确认规则；一次调用能连续做多步操作，更快、更省 token；能用 paste 输入中文和多行文字。")}</small>
           {cuMode === "js"
             ? <small className="cu-flow-warn">{t("模型可执行任意 JavaScript（能读写文件、联网）。")}</small>
             : <small className="cu-flow-warn">{t("离散工具每个动作一次调用，返回都带截图；中文需用 set_value。")}</small>}
         </div>
         <div className="mg-segmented" role="radiogroup" aria-label={t("操作方式")}>
           <button type="button" role="radio" aria-checked={cuMode === "js"} data-active={cuMode === "js"} disabled={locked}
-            title={t("和 Codex 一样，用 cua_repl 的 js 工具操作；首次使用会自动下发完整说明与确认规则，支持 paste 输入中文。")} onClick={() => void changeCuMode("js")}>{t("JS（同 Codex）")}<span className="cu-flow-recommend">{t("推荐")}</span></button>
+            title={t("和 Codex 一样，用 cua_repl 的 js 工具操作桌面与 Chrome；首次使用会自动下发完整说明与确认规则，支持 paste 输入中文。")} onClick={() => void changeCuMode("js")}>{t("JS（同 Codex）")}<span className="cu-flow-recommend">{t("推荐")}</span></button>
           <button type="button" role="radio" aria-checked={cuMode === "tools"} data-active={cuMode === "tools"} disabled={locked}
             title={t("原生 Computer Use 的 10 个离散工具：get_app_state、click、type_text 等。")} onClick={() => void changeCuMode("tools")}>{t("离散工具")}</button>
         </div>
@@ -676,7 +677,9 @@ export function ComputerUsePage() {
         <input className="cu-setting-check" type="checkbox" checked={approval?.pip ?? true} disabled={locked} onChange={(event) => void changePip(event.target.checked)} />
       </label>
     </div>
-    <p className="cu-flow-foot">{t("接入后重启对应客户端，工具名以 mcp__codex-plus-cu__ 与 mcp__codex-plus-browser__ 开头。")}</p>
+    <p className="cu-flow-foot">{cuMode === "js"
+      ? t("接入后重启对应客户端。JS 方式下桌面与浏览器都用 mcp__codex-plus-cu__js，codex-plus-browser 不提供工具。")
+      : t("接入后重启对应客户端，工具名以 mcp__codex-plus-cu__ 与 mcp__codex-plus-browser__ 开头。")}</p>
   </section>;
 
   /** 一行接入目标。内置与自定义共用；传了 `custom` 才显示「自定义」标记和删除按钮。 */

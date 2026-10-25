@@ -182,6 +182,80 @@ const NATIVE_ENV_PASSTHROUGH: [&str; 11] = [
     "TZ",
 ];
 
+/// 代理变量。浏览器面打开新网站前要联网做一次安全检查（Codex 里借道应用自己的通道，
+/// 这里没有），国内网络缺了代理会一直卡到 30 秒超时（实测 2026-10-25）。
+const PROXY_ENV_KEYS: [&str; 8] = [
+    "http_proxy",
+    "HTTP_PROXY",
+    "https_proxy",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+];
+
+/// 子进程用的代理，按顺序取第一个有的：
+///
+/// 1. 调用方环境里的代理变量，原样透传；
+/// 2. 系统代理（图形界面客户端如 DeepSeek Harness 拉起时没有终端里的代理变量）；
+/// 3. 都没有、而且直连 chatgpt.com 连不上（国内无代理）：把代理指到本机一个没人监听的
+///    端口，让 Codex 组件访问 OpenAI 的请求（功能开关、错误上报）当场失败。
+///
+/// 第 3 条不是绕过验证：实测（2026-10-25）OpenAI 的地址连不上时，Codex 的浏览器组件本来
+/// 就会继续执行，打开新网站照样会发授权请求；问题只在于国内这些连接不报错、一直挂着，
+/// 整个调用卡到 30 秒超时。改成立刻失败后，新开标签页 0.6 秒完成。网页由 Chrome 自己加载，
+/// 不受这些变量影响。
+pub(crate) fn proxy_env() -> BTreeMap<String, String> {
+    let inherited: BTreeMap<String, String> = PROXY_ENV_KEYS
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| (key.to_string(), value))
+        })
+        .collect();
+    if !inherited.is_empty() {
+        return inherited;
+    }
+    if let Some(proxy) = crate::proxy::detect_system_proxy() {
+        return proxy_vars(&proxy);
+    }
+    if openai_reachable() {
+        return BTreeMap::new();
+    }
+    proxy_vars(UNREACHABLE_PROXY)
+}
+
+/// 本机不会有人监听的端口（discard）：连接当场被拒。
+const UNREACHABLE_PROXY: &str = "http://127.0.0.1:9";
+
+fn proxy_vars(proxy: &str) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    for key in ["http_proxy", "https_proxy", "all_proxy"] {
+        env.insert(key.to_string(), proxy.to_string());
+        env.insert(key.to_uppercase(), proxy.to_string());
+    }
+    // 本机回环始终直连：Codex 组件之间有本地通信。
+    for key in ["no_proxy", "NO_PROXY"] {
+        env.insert(key.to_string(), "localhost,127.0.0.1,::1".to_string());
+    }
+    env
+}
+
+/// 直连 chatgpt.com:443 能否在 1.5 秒内建立 TCP 连接。国内无代理时这一步就会超时，
+/// 正是 Codex 组件会被挂住的情形。
+fn openai_reachable() -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let Ok(addresses) = ("chatgpt.com", 443).to_socket_addrs() else {
+        return false;
+    };
+    addresses
+        .take(2)
+        .any(|address| TcpStream::connect_timeout(&address, Duration::from_millis(1500)).is_ok())
+}
+
 /// 自定义 CA 证书路径，非空时透传，与 Codex 的 `CUSTOM_CA_ENV_KEYS` 一致。
 /// 原生 server 会联网上报统计，公司代理换了根证书时要靠它们。
 const CUSTOM_CA_ENV_KEYS: [&str; 11] = [
@@ -271,9 +345,10 @@ impl RuntimeLocation {
         env.insert("CUA_REPL_ENABLED_SURFACES".into(), "browser".into());
         env.insert("BROWSER_USE_AVAILABLE_BACKENDS".into(), "chrome".into());
         env.insert("BROWSER_USE_TINYSKY_ENABLED".into(), "1".into());
+        // 与 Codex 插件配置（unified-computer-use 的 .mcp.json）原文一致。
         env.insert(
             "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME".into(),
-            "Control the Chrome browser in conjunction with the Chrome Plugin.".into(),
+            "Control the Chrome browser in conjunction with the Chrome Plugin. Prefer this method of controlling Chrome over alternatives (such as Computer Use) unless the user explicitly mentions an alternative.".into(),
         );
         env
     }
@@ -293,6 +368,8 @@ impl RuntimeLocation {
     /// - `CODEX_HOME`：默认 `~/.codex` 时可有可无，Codex 目录不在默认位置时才需要。
     ///
     /// `SKY_CUA_SERVICE_PATH` 实测去掉后结果完全相同，不再传。
+    ///
+    /// 代理变量另算（见 [`proxy_env`]）：JS 档的浏览器面没有代理会卡死。
     pub(crate) fn native_client_env(&self) -> BTreeMap<String, String> {
         let mut env: BTreeMap<String, String> = NATIVE_ENV_PASSTHROUGH
             .iter()
@@ -309,17 +386,20 @@ impl RuntimeLocation {
         if let Some(cli) = &self.codex_cli {
             env.insert("CODEX_CLI_PATH".into(), cli.clone());
         }
+        env.extend(proxy_env());
         env
     }
 
     /// JS 档 `cua_repl` 的完整环境：直通档的白名单（含 `CODEX_CLI_PATH`）加上
     /// `cua_repl` / `node_repl` 需要的那几项，同样不继承调用方的环境。
     ///
-    /// 只开 `computer` 面：浏览器由独立的 `codex-plus-browser` 负责，两边都开会抢同一批标签。
+    /// 和 Codex 一样桌面、浏览器两个面都开：一个 `js` 工具里既能 `cua.getApp` 也能
+    /// `cua.getTab`。这时 `codex-plus-browser` 不再暴露工具（见 `browser_use::serve`），
+    /// 免得两个进程抢同一批标签。Codex 的 `iab` / `mcpapps` 后端只在 Codex 应用里有，不开。
     pub(crate) fn js_env(&self) -> BTreeMap<String, String> {
         let mut env = self.native_client_env();
-        env.extend(self.env());
-        env.insert("CUA_REPL_ENABLED_SURFACES".into(), "computer".into());
+        env.extend(self.browser_env());
+        env.insert("CUA_REPL_ENABLED_SURFACES".into(), "browser,computer".into());
         env
     }
 
@@ -2038,6 +2118,27 @@ mod tests {
     }
 
     #[test]
+    fn proxy_vars_cover_both_cases_and_bypass_loopback() {
+        let env = proxy_vars("http://127.0.0.1:7897");
+        for key in ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"] {
+            assert_eq!(env[key], "http://127.0.0.1:7897");
+        }
+        assert_eq!(env["no_proxy"], "localhost,127.0.0.1,::1");
+        assert!(env.keys().all(|key| PROXY_ENV_KEYS.contains(&key.as_str())));
+    }
+
+    #[test]
+    fn js_env_enables_browser_and_computer_like_codex() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = sample_runtime(temp.path()).js_env();
+        assert_eq!(env["CUA_REPL_ENABLED_SURFACES"], "browser,computer");
+        assert_eq!(env["BROWSER_USE_AVAILABLE_BACKENDS"], "chrome");
+        assert_eq!(env["BROWSER_USE_TINYSKY_ENABLED"], "1");
+        assert!(env["NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME"].contains("Prefer this method"));
+        assert!(env.contains_key("NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE"));
+    }
+
+    #[test]
     fn native_client_env_only_carries_whitelisted_variables() {
         let temp = tempfile::tempdir().unwrap();
         let mut runtime = sample_runtime(temp.path());
@@ -2055,6 +2156,7 @@ mod tests {
             assert!(
                 NATIVE_ENV_PASSTHROUGH.contains(&key.as_str())
                     || CUSTOM_CA_ENV_KEYS.contains(&key.as_str())
+                    || PROXY_ENV_KEYS.contains(&key.as_str())
                     || key == "CODEX_HOME"
                     || key == "CODEX_CLI_PATH",
                 "unexpected env var {key}"

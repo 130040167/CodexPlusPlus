@@ -54,12 +54,20 @@ enum Event {
     Client(Value),
     Child(Value),
     ChildClosed,
+    /// 客户端断开（stdin 读到 EOF）。
+    ClientClosed,
     /// 外部钩子通知：当前回合结束。
     TurnEnd,
 }
 
 /// 浏览器能力的 MCP 服务入口。
 pub fn serve() -> anyhow::Result<()> {
+    // JS 档：浏览器已并入 codex-plus-cu 的 `js` 工具（和 Codex 一样，一个 cua_repl 同时开
+    // 桌面与浏览器）。这里只完成握手、不暴露工具，也不拉 cua-repl，免得两个进程抢同一批标签。
+    // 客户端里的注册不用改：切回离散工具档后，新会话照常拿到这些工具。
+    if crate::computer_use_proxy::CuMode::current() == crate::computer_use_proxy::CuMode::Js {
+        return serve_merged();
+    }
     let runtime = crate::computer_use::locate_runtime()?
         .context("未找到 Codex 运行时（ChatGPT.app），浏览器控制不可用")?;
     // 浏览器面必须走 cua-repl（`nodeRepl.rpc` 由它注入），与 CU 的直通路径不同。
@@ -87,10 +95,60 @@ pub fn serve() -> anyhow::Result<()> {
     outcome
 }
 
+/// JS 档下给客户端的说明：浏览器在 codex-plus-cu 里。
+const MERGED_NOTE: &str = "Browser control is provided by the codex-plus-cu `js` tool (same as Codex): use `cua.listTabs` / `cua.getTab` / `cua.createBrowserTab` there. This server exposes no tools while Codex++ uses the JS operation mode.";
+
+fn serve_merged() -> anyhow::Result<()> {
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Some(reply) = merged_reply(&message) {
+            writeln!(stdout, "{reply}")?;
+            stdout.flush()?;
+        }
+    }
+    Ok(())
+}
+
+/// JS 档的应答：握手正常，工具列表为空，误调用时说明去哪里用。通知不回。
+fn merged_reply(message: &Value) -> Option<Value> {
+    let id = message.get("id")?.clone();
+    let method = message.get("method")?.as_str()?;
+    let result = match method {
+        "initialize" => json!({
+            "protocolVersion": message
+                .pointer("/params/protocolVersion")
+                .cloned()
+                .unwrap_or_else(|| json!("2025-06-18")),
+            "capabilities": { "tools": {} },
+            "serverInfo": { "name": "codex-plus-browser", "version": env!("CARGO_PKG_VERSION") },
+            "instructions": MERGED_NOTE,
+        }),
+        "tools/list" => json!({ "tools": [] }),
+        "tools/call" => json!({ "isError": true, "content": [{ "type": "text", "text": MERGED_NOTE }] }),
+        "ping" => json!({}),
+        _ => {
+            return Some(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32601, "message": format!("Method not found: {method}") }
+            }));
+        }
+    };
+    Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+}
+
 fn spawn_child(runtime: &RuntimeLocation) -> anyhow::Result<Child> {
     let mut command = Command::new(&runtime.node);
     command
         .arg(&runtime.cua_repl)
+        // 继承调用方环境之外，没有代理时补上系统代理：图形界面客户端（DeepSeek Harness 等）
+        // 拉起时没有代理变量，打开新网站前的安全检查会一直卡到超时。
+        .envs(crate::computer_use::proxy_env())
         .envs(runtime.browser_env())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -119,6 +177,9 @@ fn spawn_client_reader(sender: Sender<Event>) {
                 }
             }
         }
+        // 必须显式通知：只靠 channel 断开不够（子进程那一侧的 sender 还活着），
+        // 否则客户端走了本进程和 cua-repl 还挂着，一直占着 Chrome 扩展的会话。
+        let _ = sender.send(Event::ClientClosed);
     });
 }
 
@@ -194,7 +255,7 @@ impl ProxyState {
                     }
                 }
                 Ok(Event::Child(message)) => self.on_child(message),
-                Ok(Event::ChildClosed) => return Ok(()),
+                Ok(Event::ChildClosed) | Ok(Event::ClientClosed) => return Ok(()),
                 // 钩子是本机全局的：别的 Claude 会话结束时也会触发。本会话这一回合
                 // 没碰过浏览器就忽略，否则会把人家正在用的标签关掉。
                 Ok(Event::TurnEnd) => {
@@ -1634,20 +1695,21 @@ fn render_payload(payload: &Value) -> String {
         let lines: Vec<String> = browsers
             .iter()
             .map(|browser| {
+                let kind = browser
+                    .get("family")
+                    .or_else(|| browser.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                // `cua.listBrowsers()` 不带标签列表；没有就不写数量，免得显示成「0 tabs」
+                // 让模型以为浏览器是空的（标签要用 browser_tabs 看）。
+                let detail = match browser.get("tabs").and_then(Value::as_array) {
+                    Some(tabs) => format!("{kind}, {} tabs", tabs.len()),
+                    None => kind.to_string(),
+                };
                 format!(
-                    "[{}] {} ({}, {} tabs)",
+                    "[{}] {} ({detail})",
                     browser.get("id").and_then(Value::as_str).unwrap_or("?"),
                     browser.get("name").and_then(Value::as_str).unwrap_or(""),
-                    browser
-                        .get("family")
-                        .or_else(|| browser.get("type"))
-                        .and_then(Value::as_str)
-                        .unwrap_or(""),
-                    browser
-                        .get("tabs")
-                        .and_then(Value::as_array)
-                        .map(Vec::len)
-                        .unwrap_or(0)
                 )
             })
             .collect();
@@ -1775,6 +1837,30 @@ mod tests {
         assert!(text.contains("[9] Mine — https://mine.example (user tab)"));
         // 已经在 agent 列表里的标签不重复出现。
         assert_eq!(text.matches("Example").count(), 1);
+    }
+
+    #[test]
+    fn merged_mode_handshakes_without_tools() {
+        let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-11-25" } });
+        let reply = merged_reply(&init).unwrap();
+        assert_eq!(reply["result"]["protocolVersion"], "2025-11-25");
+        assert!(reply["result"]["instructions"].as_str().unwrap().contains("codex-plus-cu"));
+        let list = merged_reply(&json!({ "id": 2, "method": "tools/list" })).unwrap();
+        assert_eq!(list["result"]["tools"], json!([]));
+        let call = merged_reply(&json!({ "id": 3, "method": "tools/call", "params": { "name": "browser_tabs" } })).unwrap();
+        assert_eq!(call["result"]["isError"], true);
+        // 通知不回。
+        assert!(merged_reply(&json!({ "method": "notifications/initialized" })).is_none());
+        assert_eq!(merged_reply(&json!({ "id": 4, "method": "resources/list" })).unwrap()["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn browser_list_does_not_claim_zero_tabs() {
+        // `cua.listBrowsers()` 实际返回的形状不带标签列表。
+        let listed = json!({ "ok": true, "browsers": [{ "id": "1", "name": "Chrome", "type": "chrome" }] });
+        assert_eq!(render_payload(&listed), "[1] Chrome (chrome)");
+        let with_tabs = json!({ "browsers": [{ "id": "1", "name": "Chrome", "type": "chrome", "tabs": [{}, {}] }] });
+        assert_eq!(render_payload(&with_tabs), "[1] Chrome (chrome, 2 tabs)");
     }
 
     #[test]
