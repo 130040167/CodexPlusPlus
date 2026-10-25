@@ -1,14 +1,12 @@
 use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const VOLCENGINE_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-volcengine.png");
 const PACKYCODE_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-packycode.png");
 const TOKEN_BRIDGE_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-0029.svg");
 const APIKEY_FUN_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-apikey-fun.png");
 const RAWCHAT_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-rawchat.svg");
 const RUNAPI_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-runapi.png");
 const BAIKEWEI_AI_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-baikewei-ai.jpg");
-const DEEPKEY_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-deepkey.png");
 const APIMART_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-apimart.png");
 const FENNO_AI_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-fenno-ai.png");
 const QINIU_AI_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-qiniu-ai.png");
@@ -114,14 +112,12 @@ fn fill_known_remote_logos(ads: &mut [Value]) {
 
 fn known_remote_logo(id: &str) -> Option<(&'static str, &'static [u8])> {
     match id {
-        "volcengine-ark-agent-plan" => Some(("image/png", VOLCENGINE_IMAGE)),
         "0029-token-bridge" => Some(("image/png", PACKYCODE_IMAGE)),
         "0055-token-bridge" => Some(("image/svg+xml", TOKEN_BRIDGE_IMAGE)),
         "apikey-fun-ai-relay" => Some(("image/png", APIKEY_FUN_IMAGE)),
         "rawchat-codex-relay" => Some(("image/svg+xml", RAWCHAT_IMAGE)),
         "runapi-openrouter-alternative" => Some(("image/png", RUNAPI_IMAGE)),
         "baikewei-ai" => Some(("image/jpeg", BAIKEWEI_AI_IMAGE)),
-        "deepkey-api-key" => Some(("image/png", DEEPKEY_IMAGE)),
         "apimart" => Some(("image/png", APIMART_IMAGE)),
         "fenno-ai" => Some(("image/png", FENNO_AI_IMAGE)),
         "qiniu-ai" => Some(("image/png", QINIU_AI_IMAGE)),

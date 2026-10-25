@@ -813,7 +813,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  min-width: 260px;
+  width: 380px;
   /* 视口内兜底：菜单改 fixed 定位后也不允许超出窗口，超高时内部滚动。
      真正的限高由 `resolveAnchoredMenuLayout` 按触发按钮的 top 算出来走内联样式，
      这里只是没量到坐标时的回退（固定 100vh 不减 top 会把按钮顶到窗口外面）。
@@ -826,7 +826,8 @@ body {
   border-radius: 8px;
   background: hsl(var(--popover));
   box-shadow: 0 12px 26px hsl(var(--foreground) / 0.08);
-  padding: 8px;
+  padding: 12px;
+  gap: 10px;
 }
 
 /* 除供应商列表外的子项一律不压缩：否则「实际来源：…」这类一行文字会被 flex 挤成 4px 高。 */
@@ -848,50 +849,124 @@ body {
 .third-party-import-actions {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid hsl(var(--border));
 }
 
-.third-party-import-actions {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.third-party-import-menu button {
+.third-party-import-head {
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 3px;
-  width: 100%;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: hsl(var(--foreground));
-  cursor: pointer;
-  font: inherit;
-  padding: 9px 10px;
-  text-align: left;
+  gap: 2px;
+  padding: 2px 2px 4px;
 }
 
-.third-party-import-menu button.third-party-import-action {
-  grid-template-columns: auto minmax(0, 1fr);
+.third-party-import-head strong {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.third-party-import-head small,
+.third-party-import-meta,
+.third-party-import-empty {
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+}
+
+.third-party-import-source {
+  display: grid;
+  gap: 6px;
+}
+
+.third-party-import-path {
+  display: flex;
+  gap: 6px;
   align-items: center;
 }
 
-.third-party-import-menu button:hover:not(:disabled) {
-  background: hsl(var(--secondary));
-}
-
-.third-party-import-menu button:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
-
-.third-party-import-menu span {
-  color: hsl(var(--muted-foreground));
+.third-party-import-path input {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
   font-size: 12px;
+}
+
+.third-party-import-meta {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.third-party-import-warning {
+  color: hsl(var(--status-warning));
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.third-party-import-empty {
+  margin: 0;
+  padding: 14px 4px;
+  text-align: center;
+}
+
+.third-party-import-list-head {
+  display: flex;
+  justify-content: space-between;
+  padding: 6px 2px 0;
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+}
+
+.third-party-import-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 150px);
+  gap: 10px;
+  align-items: center;
+  padding: 7px 8px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--surface-sunken) / 0.35);
+}
+
+.third-party-import-name {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.third-party-import-name strong,
+.third-party-import-name small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.third-party-import-name strong {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.third-party-import-name small {
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+}
+
+.third-party-import-row select {
+  width: 100%;
+  height: 28px;
+  padding: 0 6px;
+  border: 1px solid hsl(var(--input));
+  border-radius: 6px;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font: inherit;
+  font-size: 12px;
+}
+
+.third-party-import-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .env-conflict-notice {
@@ -3480,8 +3555,9 @@ details.relay-fold[open] > .relay-fold-body {
   gap: 8px;
 }
 
+/* 卡片至少 320px：窄窗口两列、宽窗口三列，地址和说明不会被挤到看不清。 */
 .overview-health-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
 }
 
 .panel-head.overview-health-header {
@@ -9127,11 +9203,9 @@ select {
   }
 }
 
-/* 增强页共用总开关与保存入口，服务配置通过页内标签切换。 */
+/* 增强页共用总开关与保存入口，服务配置通过页内标签切换。
+   不吸顶：吸顶时它盖在列表上，滚动中能看到被压住的半截文字。 */
 .enhance-page-controls {
-  position: sticky;
-  top: 0;
-  z-index: 5;
   border: 1px solid hsl(var(--border));
   border-radius: var(--radius-xl);
   background: hsl(var(--card));
@@ -9150,7 +9224,7 @@ select {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 22px;
-  width: auto;
+  flex: 1;
   min-width: 0;
   margin: 0;
   padding: 0;
@@ -9184,11 +9258,46 @@ select {
   color: hsl(var(--brand-accent));
 }
 
+/* 自动保存状态：已保存带一个勾；失败 / 校验不过用告警色，过长时省略，悬停看全文。 */
+.enhance-save-actions > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.enhance-save-actions > .is-error {
+  display: block;
+  color: hsl(var(--status-warning));
+}
+
 .enhance-tabs {
   display: flex;
   gap: 20px;
   padding: 0 18px;
   border-top: 1px solid hsl(var(--border) / 0.65);
+}
+
+.enhance-tabs-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-right: 18px;
+  border-top: 1px solid hsl(var(--border) / 0.65);
+}
+
+.enhance-tabs-row .enhance-tabs {
+  flex: 1;
+  min-width: 0;
+  border-top: 0;
+}
+
+.enhance-tabs-row .enhance-save-actions {
+  flex-shrink: 1;
+  min-width: 0;
 }
 
 .enhance-tabs button {
@@ -9267,14 +9376,13 @@ select {
   font-size: 13px;
 }
 
-.enhance-feature-groups .feature-switch-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px 18px;
-  margin: 0;
-}
-
+/* 单列设置行（与代理设置 / Codex 设置的 .setting-row 一致）：左边标题 + 说明，右边开关。
+   原来是双列 / 三列卡片，说明长的一张会把整行撑高，左右高度参差不齐。 */
+.enhance-feature-groups .feature-switch-grid,
 .enhance-feature-groups .feature-group:first-child .feature-switch-grid {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+  margin: 0;
 }
 
 /* 可展开的配置块（如「API 余额（可选）」）独占一整行：展开只往下长，
@@ -9283,7 +9391,6 @@ select {
   grid-column: 1 / -1;
 }
 
-.enhance-feature-groups .feature-toggle,
 .enhance-service-panel .feature-toggle {
   border: 0;
   border-radius: 6px;
@@ -9293,16 +9400,36 @@ select {
   box-shadow: none;
 }
 
+.enhance-feature-groups .feature-toggle {
+  gap: 24px;
+  border: 0;
+  border-bottom: 1px solid hsl(var(--border) / 0.55);
+  border-radius: 0;
+  background: transparent;
+  padding: 12px 6px;
+  box-shadow: none;
+}
+
+.enhance-feature-groups .feature-switch-grid > .feature-toggle:last-child {
+  border-bottom: 0;
+}
+
+/* 说明铺满一行会太长难读，限宽后长说明一般两行内放下。 */
+.enhance-feature-groups .feature-toggle small {
+  max-width: 860px;
+  line-height: 1.55;
+}
+
 .enhance-page .feature-toggle strong {
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .enhance-page .feature-toggle small {
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .enhance-page .feature-toggle:hover {
-  background: hsl(var(--accent) / 0.65);
+  background: hsl(var(--accent) / 0.4);
 }
 
 .enhance-feature-groups .feature-action-row {
@@ -9415,14 +9542,10 @@ select {
 
 .enhance-page #enhance-dictation,
 .enhance-page #enhance-stepwise {
-  scroll-margin-top: 120px;
+  scroll-margin-top: 16px;
 }
 
 @media (max-width: 1080px) {
-  .enhance-feature-groups .feature-group:first-child .feature-switch-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
   .enhance-service-toggles {
     grid-template-columns: 1fr;
     gap: 6px;
@@ -9436,13 +9559,12 @@ select {
     padding: 12px;
   }
 
-  .enhance-save-actions {
-    width: 100%;
-    justify-content: space-between;
-  }
-
   .enhance-tabs {
     padding-inline: 12px;
+  }
+
+  .enhance-tabs-row {
+    padding-right: 12px;
   }
 
   .enhance-feature-groups .feature-group-head {
@@ -10633,6 +10755,26 @@ select {
 
 .provider-add-reference-layout{max-width:1040px}.provider-add-section h3{margin:24px 0 10px;color:hsl(var(--muted-foreground));font-size:14px}.provider-add-result{justify-content:flex-start;min-height:78px}.provider-add-result>span:last-child{min-width:0}.provider-add-icon{display:flex;align-items:center;justify-content:center;flex:none;width:38px;height:38px;border:1px solid hsl(var(--brand-accent)/.35);border-radius:10px;background:hsl(var(--brand-accent)/.08);color:hsl(var(--brand-accent));font-size:17px;font-weight:700}.provider-add-custom-result{grid-column:1}.provider-add-result small{margin-top:4px;max-width:100%}
 
+/* ── 添加供应商目录页 ───────────────────────────────────────── */
+/* 名称与网址上下两行；卡片压矮，宽屏三列；「自定义配置」独占一行。 */
+.provider-add-reference-layout .provider-add-results{grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:8px;margin-top:0}
+.provider-add-reference-layout .provider-add-result{min-height:0;padding:10px 12px;gap:10px;align-items:center;transition:border-color var(--motion-fast) var(--motion-ease),background var(--motion-fast) var(--motion-ease),transform var(--motion-fast) var(--motion-ease)}
+.provider-add-reference-layout .provider-add-result:hover{transform:translateY(-1px)}
+.provider-add-reference-layout .provider-add-icon{width:32px;height:32px;border-radius:8px;font-size:13px}
+.provider-add-text{display:grid;gap:2px;min-width:0;flex:1}
+.provider-add-text strong,.provider-add-text small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.provider-add-reference-layout .provider-add-text small{margin:0;max-width:none;font-size:11.5px}
+.provider-add-protocol{flex:none;padding:1px 6px;border:1px solid hsl(var(--border));border-radius:5px;color:hsl(var(--muted-foreground));font-size:10.5px}
+.provider-add-section h3{display:flex;align-items:center;gap:6px;margin:22px 0 8px;font-size:12.5px;font-weight:600}
+.provider-add-section h3 span{padding:0 6px;border-radius:999px;background:hsl(var(--secondary));color:hsl(var(--muted-foreground));font-size:11px;font-weight:500}
+.provider-add-custom{display:flex;align-items:center;gap:12px;width:100%;margin-top:14px;padding:12px 14px;border:1px dashed hsl(var(--brand-accent)/.55);border-radius:10px;background:hsl(var(--brand-accent)/.06);color:hsl(var(--foreground));font:inherit;text-align:left;cursor:pointer;transition:background var(--motion-fast) var(--motion-ease),border-color var(--motion-fast) var(--motion-ease)}
+.provider-add-custom:hover{border-style:solid;background:hsl(var(--brand-accent)/.1)}
+.provider-add-custom .provider-add-text small{color:hsl(var(--muted-foreground));font-size:12px}
+.provider-add-chevron{flex:none;color:hsl(var(--muted-foreground))}
+.provider-add-empty{margin-top:24px;padding:28px 16px;border:1px dashed hsl(var(--border));border-radius:10px;color:hsl(var(--muted-foreground));font-size:12.5px;text-align:center}
+/* 外框与供应商列表（.mg-page）一致：同宽、14px 圆角、边框，内容裁在圆角里。 */
+.screen.management-screen>.provider-catalog-screen{flex:1 1 auto;width:min(100%,1240px);min-height:0;margin:0 auto 22px;border:1px solid hsl(var(--border));border-radius:14px;overflow:hidden}
+
 /* 四个管理页统一内容容器：外层边框承载页面内容，内部列表保持独立分组。 */
 .mg-page>.mg-content{margin:18px 22px 22px;padding:20px;border:1px solid hsl(var(--border));border-radius:14px;background:hsl(var(--surface-sunken)/.32);box-shadow:var(--shadow-sm)}.mg-page>.mg-content>.mg-matrix,.mg-page>.mg-content>.mg-skill-list,.mg-page>.mg-content>.mg-session-list{background:hsl(var(--card)/.78);border-color:hsl(var(--border)/.95)}.relay-management-page>.mg-content>.relay-management-panel{border:0;background:transparent;box-shadow:none}.relay-management-page>.mg-content>.relay-management-panel:hover{box-shadow:none;border-color:transparent}.relay-management-page>.mg-content>.relay-management-panel>.card-content{padding:0}.mg-page>.mg-content>.mg-notice{margin-top:12px}@media(max-width:760px){.mg-page>.mg-content{margin:14px 14px 18px;padding:14px}}
 
@@ -11138,20 +11280,32 @@ select {
   gap: 12px;
 }
 
+/* 宽屏一行排下，靠搜索框和会话筛选收缩；换行会先把「清空」挤下去，只在窄屏允许。 */
 .request-log-toolbar {
   display: flex;
   min-width: 0;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 8px;
 }
 
+.request-log-toolbar > button,
+.request-log-toolbar > .request-log-filter:not(.request-log-session-filter) {
+  flex-shrink: 0;
+}
+
+@media (max-width: 760px) {
+  .request-log-toolbar {
+    flex-wrap: wrap;
+  }
+}
+
 .request-log-search {
   display: flex;
-  flex: 1 1 260px;
+  flex: 1 1 220px;
   align-items: center;
   gap: 6px;
-  min-width: 180px;
+  min-width: 140px;
 }
 
 .request-log-search svg {
@@ -11168,7 +11322,10 @@ select {
   font-size: 12px;
 }
 
+/* 会话名可能很长：给出可收缩的宽度，避免把「清空」挤到第二行。 */
 .request-log-session-filter {
+  flex: 0 1 220px;
+  min-width: 110px;
   max-width: 260px;
 }
 
@@ -11911,3 +12068,216 @@ select {
 .script-market-card[data-view="grid"] .script-market-actions { margin-top: auto; padding-top: 4px; }
 .script-market-status { flex-shrink: 0; white-space: nowrap; }
 .script-market-tag-more { border-style: dashed; cursor: help; }
+
+/* 程序左上角 logo：图标栏最上方，下方一条细线与 Agent 切换分开。 */
+.rail-brand {
+  display: grid;
+  flex-shrink: 0;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  cursor: pointer;
+  transition: transform var(--motion-fast, 120ms) var(--motion-ease, ease), background-color var(--motion-fast, 120ms);
+}
+
+.rail-brand img {
+  width: 36px;
+  height: 36px;
+  object-fit: contain;
+  filter: drop-shadow(0 3px 8px hsl(240 80% 55% / 0.35));
+  user-select: none;
+}
+
+.rail-brand:hover {
+  background: hsl(var(--sidebar-muted, var(--muted)) / 0.6);
+  transform: translateY(-1px);
+}
+
+.rail-brand:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}
+
+.app-rail > .rail-brand-wrap + * {
+  position: relative;
+  margin-top: 2px;
+  padding-top: 12px;
+  border-top: 1px solid hsl(var(--sidebar-border));
+}
+
+/* logo 外层：给更新角标做定位参照。 */
+.rail-brand-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+
+/* 新版本角标：贴在 logo 右上角的小圆点 + 向上箭头，轻微呼吸提示；点它弹出更新框。 */
+.rail-update-badge {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 2px solid hsl(var(--sidebar-bg));
+  border-radius: 50%;
+  background: hsl(var(--status-success));
+  color: hsl(0 0% 100%);
+  cursor: pointer;
+  animation: rail-update-pulse 2.4s ease-in-out infinite;
+}
+
+.rail-update-badge svg {
+  width: 10px;
+  height: 10px;
+}
+
+.rail-update-badge:hover {
+  transform: scale(1.12);
+}
+
+.rail-update-badge:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}
+
+@keyframes rail-update-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 hsl(var(--status-success) / 0.45); }
+  50% { box-shadow: 0 0 0 5px hsl(var(--status-success) / 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rail-update-badge { animation: none; }
+}
+
+/* 默认成员：醒目的绿色「默认」；其他已勾选成员的「设为默认」悬停才出现，不再满屏蓝字。 */
+.aggregate-editor .aggregate-member-default-badge {
+  border: 1px solid hsl(var(--status-success) / 0.45);
+  background: hsl(var(--status-success) / 0.12);
+  color: hsl(var(--status-success));
+  font-weight: 600;
+}
+.aggregate-editor .aggregate-member-default-action {
+  opacity: 0;
+  transition: opacity 0.14s ease;
+}
+.aggregate-editor .aggregate-member-row:hover .aggregate-member-default-action,
+.aggregate-editor .aggregate-member-row:focus-within .aggregate-member-default-action {
+  opacity: 1;
+}
+.aggregate-model-summary {
+  display: block;
+  margin-top: 6px;
+  color: hsl(var(--brand-accent));
+  font-size: 12px;
+  font-weight: 500;
+}
+
+/* 头像改为两个字（如「哈K」「供4」），字号相应缩小，保持在方块内。 */
+.relay-index {
+  font-size: 12.5px;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+  text-transform: none;
+}
+
+/* 健康检查：每项左侧一个按状态着色的图标块（正常绿 / 需处理橙 / 中性灰 / 失败红）。 */
+.overview-health-grid .health-item { grid-template-columns: 34px minmax(0, 1fr) auto; }
+.health-icon {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  background: hsl(var(--muted) / 0.6);
+  color: hsl(var(--muted-foreground));
+}
+.health-icon.good { background: hsl(var(--status-success) / 0.12); color: hsl(var(--status-success)); }
+.health-icon.warn { background: hsl(var(--status-warning) / 0.12); color: hsl(var(--status-warning)); }
+.health-icon.bad { background: hsl(var(--status-error) / 0.12); color: hsl(var(--status-error)); }
+.health-icon.idle { background: hsl(var(--muted) / 0.6); color: hsl(var(--muted-foreground)); }
+@media (max-width: 760px) {
+  .overview-health-grid { grid-template-columns: 1fr; }
+}
+/* 三列下说明文字单行省略，完整内容在悬停提示里，不再把路径从中间折断。 */
+/* 说明最多两行，超出省略；完整内容在悬停提示里。 */
+.overview-health-grid .health-item > div > span {
+  display: -webkit-box;
+  min-width: 0;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+/* ── 设置行（代理设置 / Codex 设置共用）──────────────────────── */
+/* 左边标题 + 一句说明，右边控件；行与行之间细线分隔。 */
+.setting-rows { display: flex; flex-direction: column; gap: 0; }
+.setting-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(200px, 320px);
+  align-items: center;
+  gap: 24px;
+  padding: 14px 0;
+  border-bottom: 1px solid hsl(var(--border) / 0.55);
+}
+.setting-row:last-child { border-bottom: 0; }
+.setting-row-stacked { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+.setting-row-copy { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.setting-row-copy strong { font-size: 13px; font-weight: 600; }
+.setting-row-copy span { color: hsl(var(--muted-foreground)); font-size: 12px; line-height: 1.55; }
+.setting-row-control { display: flex; min-width: 0; justify-content: flex-end; }
+.setting-row-stacked .setting-row-control { justify-content: stretch; }
+.setting-row-stacked .setting-row-control > * { width: 100%; }
+.setting-row-control select,
+.setting-row-control > button[role="combobox"],
+.setting-row-control .app-select { width: 100%; }
+
+/* 数字输入 + 单位 */
+.setting-input-unit { display: flex; align-items: center; gap: 8px; width: 100%; max-width: 200px; }
+.setting-input-unit > span { flex-shrink: 0; color: hsl(var(--muted-foreground)); font-size: 12px; }
+.setting-inline { display: flex; align-items: center; gap: 8px; width: 100%; }
+.setting-range input[type="range"] { flex: 1; }
+.setting-range-value { width: 40px; flex-shrink: 0; color: hsl(var(--muted-foreground)); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
+
+.setting-footnote { margin: 12px 0 0; color: hsl(var(--muted-foreground)); font-size: 11.5px; line-height: 1.6; }
+.setting-rows > .setting-footnote:first-child { margin-top: 0; }
+.setting-warning {
+  margin: 10px 0 0;
+  padding: 8px 12px;
+  border: 1px solid hsl(var(--status-warning) / 0.35);
+  border-radius: 8px;
+  background: hsl(var(--status-warning) / 0.07);
+  color: hsl(var(--status-warning));
+  font-size: 12px;
+}
+
+/* 标题栏带开关的卡片头 */
+.panel-head.switch-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.switch-panel-head-copy { display: grid; gap: 3px; min-width: 0; }
+.panel-head.switch-panel-head .switch-panel-head-copy p { max-width: none; text-align: left; }
+
+/* 代理页状态卡：三项一行，和概览健康检查同一套样式 */
+.proxy-status-grid { margin-bottom: 6px; }
+/* 只有三项：最小 220px 就够三张一行，不像概览那样按 320px 折成两行。 */
+.overview-health-grid.proxy-status-grid { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+
+@media (max-width: 760px) {
+  .setting-row { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .setting-row-control { justify-content: flex-start; }
+}
+
+/* Grok 供应商行：与 Codex 供应商列表同一套头像 / 标签 / 悬停删除。 */
+.grok-provider-pick { display: flex; flex-direction: row; align-items: center; gap: 10px; min-width: 0; }
+.grok-provider-text { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.grok-provider-text .grok-provider-name { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.grok-provider-text .grok-provider-url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.grok-provider-row .grok-provider-models { margin: 0; white-space: nowrap; }
+.grok-provider-row .grok-provider-delete { opacity: 0; transition: opacity 0.16s ease; }
+.grok-provider-row:hover .grok-provider-delete,
+.grok-provider-row:focus-within .grok-provider-delete { opacity: 1; }
