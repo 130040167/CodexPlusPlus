@@ -1897,7 +1897,40 @@
     void appServerModelRequestPatchPromise;
   }
 
+  let codexNativeTitleModule = null;
+  let codexNativeTitleModulePromise = null;
+  let codexNativeTitleModuleRetryAt = 0;
+  function installCodexNativeTitleServiceGuard() {
+    if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) return;
+    const patch = (module) => {
+      if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) return;
+      for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(module || {}))) {
+        if (!("value" in descriptor)) continue;
+        try { patchCodexNativeTitleService(descriptor.value); } catch {}
+      }
+    };
+    if (codexNativeTitleModule) {
+      patch(codexNativeTitleModule);
+      return;
+    }
+    if (codexNativeTitleModulePromise || Date.now() < codexNativeTitleModuleRetryAt) return;
+    // 当前仅实证 app-shared 导出的服务容器；其他版本入口不做猜测性扫描。
+    codexNativeTitleModulePromise = loadOptionalCodexAppModule("app-shared-")
+      .then((module) => {
+        if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) return;
+        codexNativeTitleModule = module;
+        patch(module);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) return;
+        codexNativeTitleModulePromise = null;
+        codexNativeTitleModuleRetryAt = Date.now() + 30000;
+      });
+  }
+
   function ensureCodexModelWhitelistInstalls() {
+    installCodexNativeTitleServiceGuard();
     if (codexPlusModelUnlockEnabled()
         || codexPluginMarketplacePatchEnabled()
         || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())

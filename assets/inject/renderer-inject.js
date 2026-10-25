@@ -5288,6 +5288,60 @@
     return connection;
   }
 
+  function codexManagedNativeTitleFallback(params) {
+    if (params?.hostId !== "local") return false;
+    const profile = codexRemoteSessionActiveProfile();
+    if (!profile) return false;
+    const mode = profile.relayMode;
+    // 直接供应商没有 aggregate 的连接投影，但原生临时标题同样会绕过它。
+    return mode === "pureApi" || mode === "mixedApi"
+      || (mode === "official" && !!profile.officialMixApiKey)
+      || (mode === "aggregate" && !!codexManagedSessionConnection());
+  }
+
+  const codexNativeTitleServiceWrappers = window.__codexPlusNativeTitleServiceWrappers ||= new WeakMap();
+  function patchCodexNativeTitleService(services) {
+    if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) return false;
+    // 只接受模块导出的服务容器数据属性，不执行未知 getter 或改写 RPC stub。
+    if (!services || typeof services !== "object") return false;
+    const descriptor = Object.getOwnPropertyDescriptor(services, "threadMetadataGeneration");
+    if (!descriptor || !("value" in descriptor)) return false;
+    const service = descriptor.value;
+    if (!service || (typeof service !== "object" && typeof service !== "function")) return false;
+    const installed = codexNativeTitleServiceWrappers.get(service);
+    if (installed) {
+      installed.shouldFallback = codexManagedNativeTitleFallback;
+      window.__codexPlusNativeTitleServiceGuardInstalled = {
+        version: 1, generation: codexRemoteSessionRecoveryGeneration,
+      };
+      return true;
+    }
+    if (!descriptor.writable || typeof service.generateTitle !== "function") return false;
+    const original = service.generateTitle;
+    const state = { shouldFallback: codexManagedNativeTitleFallback };
+    const generateTitle = function (...args) {
+      // main 进程的临时 thread 不继承 renderer config。返回 null 让原生保留首行标题。
+      if (state.shouldFallback(args[0])) return Promise.resolve(null);
+      return Reflect.apply(original, service, args);
+    };
+    const bound = new Map();
+    const wrapper = new Proxy(Object.create(null), {
+      get(_target, key) {
+        if (key === "generateTitle") return generateTitle;
+        const value = Reflect.get(service, key, service);
+        if (typeof value !== "function") return value;
+        if (bound.get(key)?.original !== value) bound.set(key, { original: value, value: value.bind(service) });
+        return bound.get(key).value;
+      },
+    });
+    Object.defineProperty(services, "threadMetadataGeneration", { ...descriptor, value: wrapper });
+    codexNativeTitleServiceWrappers.set(wrapper, state);
+    window.__codexPlusNativeTitleServiceGuardInstalled = {
+      version: 1, generation: codexRemoteSessionRecoveryGeneration,
+    };
+    return true;
+  }
+
   function applyCodexManagedSessionConnection(method, params, hostId) {
     if (hostId !== "local" || !["thread/start", "thread/resume", "thread/fork"].includes(method)
         || !params || typeof params !== "object" || Array.isArray(params)) return params;
@@ -12800,7 +12854,40 @@
     void appServerModelRequestPatchPromise;
   }
 
+  let codexNativeTitleModule = null;
+  let codexNativeTitleModulePromise = null;
+  let codexNativeTitleModuleRetryAt = 0;
+  function installCodexNativeTitleServiceGuard() {
+    if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) return;
+    const patch = (module) => {
+      if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) return;
+      for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(module || {}))) {
+        if (!("value" in descriptor)) continue;
+        try { patchCodexNativeTitleService(descriptor.value); } catch {}
+      }
+    };
+    if (codexNativeTitleModule) {
+      patch(codexNativeTitleModule);
+      return;
+    }
+    if (codexNativeTitleModulePromise || Date.now() < codexNativeTitleModuleRetryAt) return;
+    // 当前仅实证 app-shared 导出的服务容器；其他版本入口不做猜测性扫描。
+    codexNativeTitleModulePromise = loadOptionalCodexAppModule("app-shared-")
+      .then((module) => {
+        if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) return;
+        codexNativeTitleModule = module;
+        patch(module);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) return;
+        codexNativeTitleModulePromise = null;
+        codexNativeTitleModuleRetryAt = Date.now() + 30000;
+      });
+  }
+
   function ensureCodexModelWhitelistInstalls() {
+    installCodexNativeTitleServiceGuard();
     if (codexPlusModelUnlockEnabled()
         || codexPluginMarketplacePatchEnabled()
         || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
