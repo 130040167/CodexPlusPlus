@@ -6,6 +6,7 @@ import vm from "node:vm";
 const catalog = readFileSync(new URL("../../../assets/inject/renderer-inject/70-model-catalog.js", import.meta.url), "utf8");
 const service = readFileSync(new URL("../../../assets/inject/renderer-inject/30-service-tier.js", import.meta.url), "utf8");
 const prelude = readFileSync(new URL("../../../assets/inject/renderer-inject/00-prelude.js", import.meta.url), "utf8");
+const marketplace = readFileSync(new URL("../../../assets/inject/renderer-inject/60-plugin-marketplace.js", import.meta.url), "utf8");
 const version = prelude.match(/const codexAppServerModelRequestPatchVersion = "([^"]+)"/)![1];
 function productionFunction(name: string) {
   const match = new RegExp(`  (?:async )?function ${name}\\(`).exec(catalog)!;
@@ -13,6 +14,8 @@ function productionFunction(name: string) {
   return catalog.slice(match.index, catalog.indexOf("\n  }\n", match.index) + 5);
 }
 const production = [
+  marketplace.slice(marketplace.indexOf("  const codexNativeHostClients = "),
+    marketplace.indexOf("  async function discoverNativeHostClient(")),
   service.slice(service.indexOf("  function codexManagedSessionConnection()"),
     service.indexOf("  function codexRemoteSessionStartedThreadId(")),
   catalog.slice(catalog.indexOf("  function codexRememberedThreadModels()"),
@@ -21,14 +24,19 @@ const production = [
     "normalizeCodexConfiguredModelRequest", "codexPerModelContextEnabled", "codexThreadModelRequestState",
     "refreshCodexThreadModelBeforeTurn", "codexAppServerNativeModelMethod", "patchAppServerModelRequestClient",
     "installCodexAppServerClientPrototypePatch", "sendAppServerRequestWithSideChat"].map(productionFunction),
+  catalog.slice(catalog.indexOf("  const appServerModelRequestPatchMaxMisses = "),
+    catalog.indexOf("  let codexNativeTitleModule = ")),
 ].join("\n");
 
-function fixture() {
+function fixture(productionSource = production) {
   const calls: any[] = [];
   const transforms: string[] = [];
   const storage = new Map<string, string>();
   class Client {
     hostId = "local";
+    constructor() {
+      if (!this.hostId) throw new Error("AppServerRequestClient is missing a message dispatcher");
+    }
     async sendRequest(method: string, params: any): Promise<any> {
       if (method === "send-cli-request-for-host") return this.nativeEnvelope(params);
       assert.equal(this.hostId === "local" || this.hostId === "ssh:test", true);
@@ -53,6 +61,8 @@ function fixture() {
     const models = mode === "aggregate" ? ["other-only", "cpx-hanhe/shared"] : ["shared"];
     const context = vm.createContext({
       window, codexRemoteSessionRecoveryGeneration: generation, codexAppServerModelRequestPatchVersion: version,
+      Map, Set, WeakRef,
+      codexAppServerClientCaptureMarker: "AppServerRequestClient is missing a message dispatcher",
       document: { querySelectorAll: () => [] },
       localStorage: { getItem: (key: string) => storage.get(key), setItem: (key: string, value: string) => storage.set(key, value) },
       codexPlusBackendSettingsLoaded: true, codexPlusBackendSettings: { managedSessionConnection: mode === "official" ? null : connection },
@@ -73,23 +83,64 @@ function fixture() {
       codexRemoteSessionTargetProvider: () => "custom",
       appServerModelRequestMethod: (method: string, params: any) => method === "send-cli-request-for-host" ? params.method : method,
       modelResponseHostId: (params: any) => params.hostId || "local",
-      registerNativeHostClient() {}, codexPlusPluginNativeInterceptClient: () => null,
+      codexPlusPluginNativeInterceptClient: () => null,
       prepareCodexPureApiModelCatalog: async () => gate ? await gate : true,
       loadBackendSettingsState: async () => true, codexAppServerPreparationTimeoutMs: 1500,
       validThreadScrollSessionKey: (value: any) => value,
-      sendCodexPlusDiagnostic() {}, nativeHostClient: () => client,
+      sendCodexPlusDiagnostic() {},
+      loadAppServerRequestCandidates: async () => ({ modules: [{}], candidates: [client], sources: [] }),
       recordTransform: () => transforms.push(`${mode}:${port}`), setTimeout, clearTimeout,
     });
-    const api = vm.runInContext(`(() => { ${production};
+    const api = vm.runInContext(`(() => { ${productionSource};
       const retained = sendCodexRetainedModelRequest;
       sendCodexRetainedModelRequest = (...args) => { recordTransform(); return retained(...args); };
       return {
-      patch: patchAppServerModelRequestClient, prototype: installCodexAppServerClientPrototypePatch
+      patch: patchAppServerModelRequestClient, prototype: installCodexAppServerClientPrototypePatch,
+      install: installAppServerModelRequestPatch, register: registerNativeHostClient,
+      bind: bindNativeHostClient, nativeClient: nativeHostClient
     }; })()`, context);
-    return { ...api, generation, connection };
+    context.api = api;
+    return { ...api, generation, connection,
+      prototype: () => vm.runInContext("api.prototype()", context, { timeout: 500 }),
+      install: () => vm.runInContext("api.install()", context, { timeout: 500 }),
+    };
   }
   return { client, Client, window, calls, transforms, inject, nativeSend, nativePrewarm };
 }
+
+for (const entry of ["prototype", "install"] as const) {
+  it(`${entry} snapshots real native registry entries while registration deletes and reinserts live keys`, async () => {
+    const f = fixture();
+    const api = f.inject("aggregate", 62021);
+    assert.equal(api.register({ hostId: "local", sendRequest() {} }), false, "constructor marker is required");
+    const remote = new f.Client(); remote.hostId = "ssh:test";
+    assert.equal(api.patch(f.client), true);
+    assert.equal(api.patch(remote), true);
+    const registry = f.window.__codexPlusNativeHostClients;
+    assert.equal(registry.size, 2);
+    const before = registry.get("local");
+    for (let i = 0; i < 5; i++) api[entry]();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.notEqual(registry.get("local"), before, "real bind performed delete/set while iterating snapshots");
+    assert.equal(registry.size, 2);
+    for (const value of registry.values()) assert.ok(value.ref instanceof WeakRef);
+    assert.equal(api.nativeClient("local"), f.client);
+    assert.equal(api.nativeClient("ssh:test"), remote);
+    await f.client.prewarmThreadStart({ model: "cpx-hanhe/shared" });
+    assert.equal(f.calls.at(-1).params.model, "cpx-hanhe/shared");
+  });
+}
+
+it("reproduces the prior live-Map self-feeding loop within a bounded VM timeout", () => {
+  const prior = production.replaceAll(
+    "Array.from(window.__codexPlusNativeHostClients?.values?.() || [])",
+    "window.__codexPlusNativeHostClients?.values?.() || []");
+  assert.notEqual(prior, production);
+  const f = fixture(prior);
+  const api = f.inject("aggregate", 62021);
+  api.patch(f.client);
+  assert.throws(() => api.prototype(), /Script execution timed out/, "real registration reproduces the old synchronous hang");
+});
 
 for (const entry of ["instance", "prototype", "instance+prototype"] as const) {
   it(`${entry} rebinds aggregate/direct/aggregate generations without stacking transforms`, async () => {

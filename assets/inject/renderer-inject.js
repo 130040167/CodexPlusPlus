@@ -12713,14 +12713,14 @@
     const klass = window.__codexPlusAppServerClientClass;
     if (!klass || typeof klass !== "function" || !klass.prototype) return false;
     const proto = klass.prototype;
-    // 兼容升级前已安装实例补丁、但尚未登记到本补丁注册表的原生客户端。
-    for (const entry of window.__codexPlusNativeHostClients?.values?.() || []) {
+    // 兼容旧实例；注册会 delete/set 移动 Map 条目，必须遍历快照以免自循环。
+    for (const entry of Array.from(window.__codexPlusNativeHostClients?.values?.() || [])) {
       const client = entry?.ref?.deref?.();
       if (!entry.getterBound && client?.__codexPlusModelRequestPatch
           && proto.isPrototypeOf(client)) patchAppServerModelRequestClient(client);
     }
     // 实例可能覆盖原型方法；两种入口必须在同一代重新绑定，不能只更新原型。
-    for (const client of window.__codexPlusModelRequestClients || []) {
+    for (const client of Array.from(window.__codexPlusModelRequestClients || [])) {
       if (klass.prototype.isPrototypeOf(client)) patchAppServerModelRequestClient(client);
     }
     if (proto.__codexPlusModelRequestPatch === codexAppServerModelRequestPatchVersion
@@ -12884,12 +12884,12 @@
 
   function installAppServerModelRequestPatch() {
     if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) return;
-    for (const entry of window.__codexPlusNativeHostClients?.values?.() || []) {
+    for (const entry of Array.from(window.__codexPlusNativeHostClients?.values?.() || [])) {
       const client = entry?.ref?.deref?.();
       if (!entry.getterBound && client?.__codexPlusModelRequestPatch) patchAppServerModelRequestClient(client);
     }
     // 已发现的实例无需重新扫描模块；即使新一代关闭所有功能，也要撤下旧规则。
-    for (const client of window.__codexPlusModelRequestClients || []) patchAppServerModelRequestClient(client);
+    for (const client of Array.from(window.__codexPlusModelRequestClients || [])) patchAppServerModelRequestClient(client);
     if (window.__codexPlusAppServerModelRequestPatchInstalled === codexAppServerModelRequestPatchVersion
         && window.__codexPlusAppServerModelRequestPatchGeneration === codexRemoteSessionRecoveryGeneration) return;
     if (appServerModelRequestPatchDisabled) return;
