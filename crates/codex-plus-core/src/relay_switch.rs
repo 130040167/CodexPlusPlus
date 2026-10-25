@@ -340,6 +340,16 @@ fn apply_selected_relay_profile(
     home: &Path,
     settings: &BackendSettings,
 ) -> anyhow::Result<RelaySwitchResult> {
+    apply_selected_relay_profile_with_ensure(
+        home, settings, crate::relay_config::ensure_active_protocol_proxy_config_in_home,
+    )
+}
+
+fn apply_selected_relay_profile_with_ensure(
+    home: &Path,
+    settings: &BackendSettings,
+    ensure: impl FnOnce(&Path, &BackendSettings) -> anyhow::Result<bool>,
+) -> anyhow::Result<RelaySwitchResult> {
     let relay = settings.active_relay_profile();
     let common_config = relay_combined_common_config(settings);
     let result = if relay.relay_mode == RelayMode::Official && !relay.official_mix_api_key {
@@ -360,12 +370,24 @@ fn apply_selected_relay_profile(
             settings.relay_preserve_nonprovider_settings,
         )?
     };
-    let status = relay_config_status_from_home(home);
-    if relay.relay_mode == RelayMode::PureApi && !status.configured {
-        anyhow::bail!(
-            "纯 API 配置写入后未检测到完整 custom provider，请检查 config.toml 和供应商 API Key。"
-        );
-    }
+    let validation: anyhow::Result<_> = (|| {
+        if settings.relay_profiles_enabled { ensure(home, settings)?; }
+        let status = relay_config_status_from_home(home);
+        anyhow::ensure!(relay.relay_mode != RelayMode::PureApi || status.configured,
+            "纯 API 配置写入后未检测到完整 custom provider，请检查 config.toml 和供应商 API Key。");
+        Ok(status)
+    })();
+    let status = match validation {
+        Ok(status) => status,
+        Err(error) => {
+            if let Some(receipt) = &result.pending_model_migration {
+                if let Err(rollback_error) = receipt.rollback() {
+                    return Err(error.context(format!("pending model migration 回滚未完成：{rollback_error:#}")));
+                }
+            }
+            return Err(error);
+        }
+    };
     Ok(RelaySwitchResult {
         settings: settings.clone(),
         configured: status.configured,
@@ -422,6 +444,111 @@ fn relay_combined_common_config(settings: &BackendSettings) -> String {
 mod tests {
     use super::*;
     use crate::settings::RelayProfile;
+
+    #[test]
+    fn pending_migration_rolls_back_when_production_post_apply_ensure_fails() {
+        for previous in [None, Some(b"{ \"from\": [\"model-x\"], \"to\": \"model-a\" }\n".as_slice())] {
+            for external in ["unchanged", "replaced", "deleted"] {
+                let temp = tempfile::tempdir().unwrap();
+                let home = temp.path().join("home");
+                std::fs::create_dir(&home).unwrap();
+                let store_path = temp.path().join("settings.json");
+                let store = SettingsStore::new(store_path.clone());
+                let profile = |id: &str, model: &str| RelayProfile {
+                    id: id.into(), name: id.into(), model: model.into(),
+                    relay_mode: RelayMode::PureApi,
+                    config_contents: format!("model = '{model}'\nmodel_provider = 'custom'\n[model_providers.custom]\nname = 'custom'\nwire_api = 'responses'\nbase_url = 'https://fixture.invalid/v1'\nrequires_openai_auth = false\n"),
+                    auth_contents: r#"{"OPENAI_API_KEY":"fixture-only"}"#.into(),
+                    ..RelayProfile::default()
+                };
+                store.save(&BackendSettings {
+                    relay_profiles_enabled: true,
+                    active_relay_id: "old".into(),
+                    relay_profiles: vec![profile("old", "model-a"), profile("next", "model-b")],
+                    ..BackendSettings::default()
+                }).unwrap();
+                let mut next = store.load().unwrap();
+                apply_selected_relay_profile(&home, &next).unwrap();
+                let path = home.join("codex-plus-pending-thread-model-migration.json");
+                if let Some(bytes) = previous { std::fs::write(&path, bytes).unwrap(); }
+                let saved = std::fs::read(&store_path).unwrap();
+                next.active_relay_id = "next".into();
+                let ensure_ran = std::cell::Cell::new(false);
+                let error = switch_relay_profile_with_apply(&store, &home, next, "old", |home, settings| {
+                    apply_selected_relay_profile_with_ensure(home, settings, |home, settings| {
+                        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?).unwrap();
+                        assert_eq!(value["to"], "model-b");
+                        crate::relay_config::ensure_active_protocol_proxy_config_in_home(home, settings)?;
+                        ensure_ran.set(true);
+                        match external {
+                            "replaced" => std::fs::write(&path, b"external pending")?,
+                            "deleted" => std::fs::remove_file(&path)?,
+                            _ => {}
+                        }
+                        anyhow::bail!("injected production post-apply ensure failure");
+                    })
+                }).unwrap_err();
+                assert!(ensure_ran.get());
+                let message = format!("{error:#}");
+                assert!(message.contains("injected production post-apply ensure failure"));
+                assert_eq!(std::fs::read(&store_path).unwrap(), saved);
+                let expected = match external {
+                    "replaced" => Some(b"external pending".as_slice()),
+                    "deleted" => None,
+                    _ => previous,
+                };
+                assert_eq!(std::fs::read(&path).ok().as_deref(), expected);
+                assert_eq!(message.contains("pending model migration 回滚未完成"), external != "unchanged");
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_resolution_failed_apply_rolls_back_import_and_preserves_previous_snapshot() {
+        for resolution in [
+            LiveConflictResolution::ImportAsNewProfile,
+            LiveConflictResolution::DiscardLiveChanges,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            std::fs::create_dir(&home).unwrap();
+            let path = temp.path().join("settings.json");
+            let store = SettingsStore::new(path.clone());
+            let profile = |id: &str| RelayProfile {
+                id: id.into(),
+                name: id.into(),
+                relay_mode: RelayMode::PureApi,
+                config_contents: format!(
+                    "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://{id}.example/v1\"\n"
+                ),
+                auth_contents: format!(r#"{{"OPENAI_API_KEY":"fixture-{id}"}}"#),
+                ..RelayProfile::default()
+            };
+            store.save(&BackendSettings {
+                active_relay_id: "old".into(),
+                relay_profiles: vec![profile("old"), profile("next")],
+                ..BackendSettings::default()
+            }).unwrap();
+            let external = profile("external");
+            std::fs::write(home.join("config.toml"), &external.config_contents).unwrap();
+            std::fs::write(home.join("auth.json"), &external.auth_contents).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let mut next = store.load().unwrap();
+            next.active_relay_id = "next".into();
+            let error = switch_relay_profile_with_resolution_and_apply(
+                &store, &home, next, "old", resolution,
+                |_, selected| {
+                    assert_eq!(selected.active_relay_id, "next");
+                    assert_eq!(selected.relay_profiles.len(), if resolution == LiveConflictResolution::ImportAsNewProfile { 3 } else { 2 });
+                    anyhow::bail!("fixture publish failure")
+                },
+            ).unwrap_err();
+            assert!(format!("{error:#}").contains("fixture publish failure"));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(std::fs::read_to_string(home.join("config.toml")).unwrap(), external.config_contents);
+            assert_eq!(std::fs::read_to_string(home.join("auth.json")).unwrap(), external.auth_contents);
+        }
+    }
 
     #[test]
     fn failed_apply_preserves_external_live_files() {

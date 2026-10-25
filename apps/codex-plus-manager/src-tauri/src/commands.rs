@@ -2855,12 +2855,15 @@ where
 {
     let mut warnings = Vec::new();
     let snapshot = if let Some(settings) = settings {
-        let snapshot = RelayLiveSnapshot::capture(home)?;
-        if let Err(error) = sync_active_relay_to_home(settings, home) {
-            if let Err(restore_error) = snapshot.restore(home) {
-                anyhow::bail!("同步当前供应商失败：{error}；回滚 live 配置也失败：{restore_error}");
+        let mut snapshot = RelayLiveSnapshot::capture(home)?;
+        match sync_active_relay_to_home(settings, home) {
+            Ok(applied) => snapshot.pending_model_migration = applied.pending_model_migration,
+            Err(error) => {
+                if let Err(restore_error) = snapshot.restore(home) {
+                    anyhow::bail!("同步当前供应商失败：{error}；回滚 live 配置也失败：{restore_error}");
+                }
+                return Err(error);
             }
-            return Err(error);
         }
         if let Some(warning) =
             codex_plus_core::aggregate_catalog::subagent_conflict_warning(home, settings)
@@ -2887,6 +2890,7 @@ where
 struct RelayLiveSnapshot {
     config: Option<Vec<u8>>,
     auth: Option<Vec<u8>>,
+    pending_model_migration: Option<codex_plus_core::codex_sqlite::PendingThreadModelMigrationReceipt>,
 }
 
 impl RelayLiveSnapshot {
@@ -2894,13 +2898,23 @@ impl RelayLiveSnapshot {
         Ok(Self {
             config: read_optional_file_bytes(&home.join("config.toml"))?,
             auth: read_optional_file_bytes(&home.join("auth.json"))?,
+            pending_model_migration: None,
         })
     }
 
     fn restore(&self, home: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(home)?;
-        restore_optional_file_bytes(&home.join("config.toml"), self.config.as_deref())?;
-        restore_optional_file_bytes(&home.join("auth.json"), self.auth.as_deref())?;
+        // 独立尝试每项恢复，某个 live 文件失败不能跳过 pending 的条件回滚。
+        let mut errors = Vec::new();
+        for (name, contents) in [("config.toml", self.config.as_deref()), ("auth.json", self.auth.as_deref())] {
+            if let Err(error) = restore_optional_file_bytes(&home.join(name), contents) {
+                errors.push(format!("{name}: {error:#}"));
+            }
+        }
+        if let Some(receipt) = &self.pending_model_migration {
+            if let Err(error) = receipt.rollback() { errors.push(format!("pending model migration: {error:#}")); }
+        }
+        anyhow::ensure!(errors.is_empty(), "回滚未完成：{}", errors.join("；"));
         Ok(())
     }
 }
@@ -10466,6 +10480,61 @@ base_url = "https://example.invalid/v1"
             || panic!("must not wait on cleanup"),
         );
         assert!(matches!(result, Err(RestartStopError::Codex(_))));
+    }
+
+    #[test]
+    fn pending_migration_restart_spawn_failure_restores_previous_or_preserves_external() {
+        for previous in [None, Some(b"{ \"from\": [\"model-x\"], \"to\": \"model-a\" }\n".as_slice())] {
+            for external in ["unchanged", "replaced", "deleted"] {
+                let home = tempfile::tempdir().unwrap();
+                let config = "model = 'model-a'\n";
+                let auth = b"{\"fixture\":true}\n";
+                std::fs::write(home.path().join("config.toml"), config).unwrap();
+                std::fs::write(home.path().join("auth.json"), auth).unwrap();
+                let path = home.path().join("codex-plus-pending-thread-model-migration.json");
+                if let Some(bytes) = previous { std::fs::write(&path, bytes).unwrap(); }
+                let mut settings = routed_pure_api_settings();
+                settings.relay_profiles[0].model = "model-b".into();
+                settings.relay_profiles[0].config_contents.insert_str(0, "model = 'model-b'\n");
+                let result = restart_codex_plus_after_stop(&launch_request(true), home.path(), Some(&settings), |_| {
+                    let pending: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+                    assert_eq!(pending["to"], "model-b");
+                    match external {
+                        "replaced" => std::fs::write(&path, b"external pending")?,
+                        "deleted" => std::fs::remove_file(&path)?,
+                        _ => {}
+                    }
+                    anyhow::bail!("synthetic immediate spawn failure");
+                });
+                let message = format!("{:#}", result.unwrap_err());
+                assert!(message.contains("synthetic immediate spawn failure"));
+                assert_eq!(std::fs::read_to_string(home.path().join("config.toml")).unwrap(), config);
+                assert_eq!(std::fs::read(home.path().join("auth.json")).unwrap(), auth);
+                let expected = match external {
+                    "replaced" => Some(b"external pending".as_slice()),
+                    "deleted" => None,
+                    _ => previous,
+                };
+                assert_eq!(std::fs::read(&path).ok().as_deref(), expected);
+                assert_eq!(message.contains("pending model migration 已被修改或消费"), external != "unchanged");
+            }
+        }
+    }
+
+    #[test]
+    fn pending_migration_restart_success_keeps_chain_for_opt_in_consumer() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "model = 'model-a'\n").unwrap();
+        let mut settings = routed_pure_api_settings();
+        settings.relay_profiles[0].model = "model-b".into();
+        settings.relay_profiles[0].config_contents.insert_str(0, "model = 'model-b'\n");
+        restart_codex_plus_after_stop(&launch_request(true), home.path(), Some(&settings), |_| Ok(())).unwrap();
+        let path = home.path().join("codex-plus-pending-thread-model-migration.json");
+        let pending: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(pending["from"], json!(["model-a"]));
+        assert_eq!(pending["to"], "model-b");
+        codex_plus_core::codex_sqlite::apply_pending_thread_model_migration(home.path(), false).unwrap();
+        assert!(!path.exists());
     }
 
     #[test]

@@ -273,6 +273,35 @@ fn pending_thread_model_migration_path(home: &Path) -> PathBuf {
     home.join(PENDING_THREAD_MODEL_MIGRATION_FILE)
 }
 
+/// 只恢复仍属于本次写入的 pending 文件；不代表 sqlite 或整个 home 的事务。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingThreadModelMigrationReceipt {
+    path: PathBuf,
+    previous: Option<Vec<u8>>,
+    written: Option<Vec<u8>>,
+}
+
+impl PendingThreadModelMigrationReceipt {
+    pub fn rollback(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            read_pending_migration_bytes(&self.path)? == self.written,
+            "pending model migration 已被修改或消费，保留当前状态，回滚未完成"
+        );
+        match &self.previous {
+            Some(bytes) => crate::settings::atomic_write(&self.path, bytes),
+            None => fs::remove_file(&self.path).map_err(Into::into),
+        }
+    }
+}
+
+fn read_pending_migration_bytes(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// 切换供应商/默认模型成功后调用：只记录「旧默认 → 新默认」，不碰 sqlite。
 ///
 /// 切换时 Codex 可能仍在运行并持有 WAL 写锁，直接回填有锁冲突和覆盖用户手选的
@@ -283,14 +312,23 @@ pub fn record_pending_thread_model_migration(
     previous_model: &str,
     new_model: &str,
 ) -> anyhow::Result<()> {
+    record_pending_thread_model_migration_with_receipt(home, previous_model, new_model).map(|_| ())
+}
+
+pub(crate) fn record_pending_thread_model_migration_with_receipt(
+    home: &Path,
+    previous_model: &str,
+    new_model: &str,
+) -> anyhow::Result<Option<PendingThreadModelMigrationReceipt>> {
     let previous_model = previous_model.trim();
     let new_model = new_model.trim();
     if previous_model.is_empty() || new_model.is_empty() || previous_model == new_model {
-        return Ok(());
+        return Ok(None);
     }
     let path = pending_thread_model_migration_path(home);
-    let mut pending = fs::read(&path)
-        .ok()
+    let previous = read_pending_migration_bytes(&path)?;
+    let mut pending = previous
+        .as_deref()
         .and_then(|bytes| serde_json::from_slice::<PendingThreadModelMigration>(&bytes).ok())
         .unwrap_or_default();
     if !pending.from.iter().any(|model| model == previous_model) {
@@ -299,12 +337,23 @@ pub fn record_pending_thread_model_migration(
     // 切回曾经的默认模型时，它不再是「旧默认」。
     pending.from.retain(|model| model != new_model);
     pending.to = new_model.to_string();
-    if pending.from.is_empty() {
-        let _ = fs::remove_file(&path);
-        return Ok(());
+    let written = if pending.from.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_vec_pretty(&pending)?)
+    };
+    if written == previous {
+        return Ok(None);
     }
-    crate::settings::atomic_write(&path, &serde_json::to_vec_pretty(&pending)?)?;
-    Ok(())
+    anyhow::ensure!(
+        read_pending_migration_bytes(&path)? == previous,
+        "pending model migration 在记录期间被修改，保留外部状态"
+    );
+    match &written {
+        Some(bytes) => crate::settings::atomic_write(&path, bytes)?,
+        None => { fs::remove_file(&path)?; }
+    }
+    Ok(Some(PendingThreadModelMigrationReceipt { path, previous, written }))
 }
 
 /// 启动 Codex 之前消费待迁移记录。`enabled` 为 false 时只丢弃记录，
@@ -324,6 +373,68 @@ pub fn apply_pending_thread_model_migration(home: &Path, enabled: bool) -> anyho
     // 回填失败时上面已经返回，记录保留到下次重试；成功或关闭时清掉。
     let _ = fs::remove_file(&path);
     Ok(updated)
+}
+
+#[cfg(test)]
+mod pending_migration_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn pending_migration_receipt_restores_absence_and_exact_previous_bytes() {
+        for previous in [None, Some(b"{ \"from\": [\"model-x\"], \"to\": \"model-a\" }\n".as_slice())] {
+            let home = tempfile::tempdir().unwrap();
+            let path = pending_thread_model_migration_path(home.path());
+            if let Some(bytes) = previous { fs::write(&path, bytes).unwrap(); }
+            let receipt = record_pending_thread_model_migration_with_receipt(home.path(), "model-a", "model-b")
+                .unwrap().unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(value["to"], "model-b");
+            receipt.rollback().unwrap();
+            assert_eq!(read_pending_migration_bytes(&path).unwrap().as_deref(), previous);
+        }
+    }
+
+    #[test]
+    fn pending_migration_receipt_preserves_external_replacement_and_consumption() {
+        for external in [None, Some(b"external pending bytes".as_slice())] {
+            let home = tempfile::tempdir().unwrap();
+            let path = pending_thread_model_migration_path(home.path());
+            let receipt = record_pending_thread_model_migration_with_receipt(home.path(), "model-a", "model-b")
+                .unwrap().unwrap();
+            match external {
+                Some(bytes) => fs::write(&path, bytes).unwrap(),
+                None => fs::remove_file(&path).unwrap(),
+            }
+            assert!(receipt.rollback().unwrap_err().to_string().contains("回滚未完成"));
+            assert_eq!(read_pending_migration_bytes(&path).unwrap().as_deref(), external);
+        }
+    }
+
+    #[test]
+    fn pending_migration_noop_and_failed_write_have_no_owned_receipt() {
+        let home = tempfile::tempdir().unwrap();
+        let path = pending_thread_model_migration_path(home.path());
+        fs::create_dir(&path).unwrap();
+        for (previous, next) in [("", "b"), ("a", ""), ("a", "a")] {
+            assert!(record_pending_thread_model_migration_with_receipt(home.path(), previous, next).unwrap().is_none());
+        }
+        assert!(record_pending_thread_model_migration_with_receipt(home.path(), "a", "b").is_err());
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn pending_migration_receipt_is_not_serialized_with_apply_result() {
+        let home = tempfile::tempdir().unwrap();
+        let receipt = record_pending_thread_model_migration_with_receipt(home.path(), "model-a", "model-b")
+            .unwrap().unwrap();
+        let result = crate::relay_config::RelayApplyResult {
+            config_path: "fixture/config.toml".into(), backup_path: None, configured: true,
+            pending_model_migration: Some(receipt),
+        };
+        assert_eq!(serde_json::to_value(result).unwrap(), serde_json::json!({
+            "configPath": "fixture/config.toml", "backupPath": null, "configured": true,
+        }));
+    }
 }
 
 fn backfill_thread_models_in_db(

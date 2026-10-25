@@ -70,6 +70,9 @@ pub struct RelayApplyResult {
     pub config_path: String,
     pub backup_path: Option<String>,
     pub configured: bool,
+    // 仅供同进程调用方撤销尚未消费的 pending 写入，不暴露给前端。
+    #[serde(skip)]
+    pub pending_model_migration: Option<crate::codex_sqlite::PendingThreadModelMigrationReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -571,6 +574,7 @@ pub fn apply_relay_config_to_home_with_session_provider(
         config_path: status.config_path,
         backup_path,
         configured: status.configured,
+        pending_model_migration: None,
     })
 }
 
@@ -606,6 +610,7 @@ pub fn apply_relay_files_to_home(
         config_path: status.config_path,
         backup_path,
         configured: status.configured,
+        pending_model_migration: None,
     })
 }
 
@@ -934,19 +939,23 @@ fn apply_relay_profile_with_switch_rules(
     require_configured_api: bool,
 ) -> anyhow::Result<RelayApplyResult> {
     let previous_model = live_root_model(home);
-    let result =
-        apply_relay_profile_to_home_inner(home, profile, common_config_contents, proxy_port, require_configured_api)?;
+    let mut result = apply_relay_profile_to_home_inner(
+        home, profile, common_config_contents, proxy_port, require_configured_api,
+    )?;
     // issue #2081：默认模型变了就记一笔，旧会话迁移留到下次启动前执行（opt-in）。
     let new_model = live_root_model(home);
-    if let Err(error) = crate::codex_sqlite::record_pending_thread_model_migration(
+    match crate::codex_sqlite::record_pending_thread_model_migration_with_receipt(
         home,
         &previous_model,
         &new_model,
     ) {
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "relay_config.record_thread_model_migration_failed",
-            serde_json::json!({ "message": error.to_string() }),
-        );
+        Ok(receipt) => result.pending_model_migration = receipt,
+        Err(error) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "relay_config.record_thread_model_migration_failed",
+                serde_json::json!({ "message": error.to_string() }),
+            );
+        }
     }
     Ok(result)
 }
@@ -1083,6 +1092,7 @@ pub fn apply_relay_config_file_to_home(
         config_path: status.config_path,
         backup_path,
         configured: status.configured,
+        pending_model_migration: None,
     })
 }
 
@@ -1140,6 +1150,7 @@ pub fn apply_pure_api_config_to_home_with_session_provider(
         config_path: status.config_path,
         backup_path,
         configured: status.configured,
+        pending_model_migration: None,
     })
 }
 
@@ -1540,6 +1551,7 @@ pub fn clear_relay_config_to_home_with_auth(
         config_path: status.config_path,
         backup_path,
         configured: status.configured,
+        pending_model_migration: None,
     })
 }
 
@@ -2059,6 +2071,7 @@ pub(crate) fn apply_official_profile_to_home(
             config_path: status.config_path,
             backup_path,
             configured: status.configured,
+            pending_model_migration: None,
         })
     })
 }
