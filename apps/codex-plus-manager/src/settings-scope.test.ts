@@ -41,6 +41,12 @@ test("Agent 设置挂在各 Agent 的侧栏菜单，整体设置留在最左栏"
   assert.doesNotMatch(globalNavigation, /"agentSettings"/);
 });
 
+test("设置菜单只属于 Codex，Claude / Grok 不再显示只有跳转按钮的空设置页", () => {
+  assert.match(text, /\{ id: "agentSettings",[^\n]*tool: "codex" \}/);
+  const agent = functionSource("AgentSettingsScreen");
+  assert.doesNotMatch(agent, /没有独立设置项|前往 Grok 配置|前往 Claude 增强/);
+});
+
 test("Computer Use 独立在最左栏，不再出现在每个 Agent 的菜单里", () => {
   const sections = text.slice(text.indexOf("const navigationSections"), text.indexOf("const globalNavigationRoutes"));
   assert.doesNotMatch(sections, /"computerUse"/);

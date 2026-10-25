@@ -1202,8 +1202,9 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "maintenance", get label() { return t("安装维护"); }, icon: Wrench, tool: "codex" },
   { id: "about", get label() { return t("关于"); }, icon: Info },
   { id: "settings", get label() { return t("整体设置"); }, icon: Settings },
-  // Agent 专属设置：入口在各 Agent 侧栏菜单里，内容只看当前 Agent。
-  { id: "agentSettings", get label() { return t("设置"); }, icon: Settings },
+  // Agent 专属设置：目前只有 Codex 有专属选项（供应商测试模型、图片覆盖层、启动参数）。
+  // Claude / Grok 没有独立设置项，原来那页只有一个跳回各自主页的按钮，所以不再给它们显示。
+  { id: "agentSettings", get label() { return t("设置"); }, icon: Settings, tool: "codex" },
   { id: "relayEnvironment", get label() { return t("代理设置"); }, icon: ShieldCheck, tool: "codex" },
   { id: "requestLog", get label() { return t("请求日志"); }, icon: List, tool: "codex" },
 ];
@@ -1522,14 +1523,12 @@ export function App() {
     const next = { ...settingsForm, activeTool: toolId };
     setSettingsForm(next);
     // 供应商页是跟着工具走的，切工具后如果当前页不属于新工具就跳到它自己的页。
-    // Agent 设置页本身跟着当前工具走，切过去直接展示新 Agent 的设置，不跳页。
+    // 设置页也只属于 Codex，同样按这条规则跳走。
     const currentRoute = routes.find((candidate) => candidate.id === route);
-    if (route !== "agentSettings") {
-      if (toolId === "claude") {
-        setRoute("claude");
-      } else if (currentRoute?.tool && currentRoute.tool !== toolId) {
-        setRoute(toolId === "grok" ? "grok" : "relay");
-      }
+    if (toolId === "claude") {
+      setRoute("claude");
+    } else if (currentRoute?.tool && currentRoute.tool !== toolId) {
+      setRoute(toolId === "grok" ? "grok" : "relay");
     }
     const result = await run(() => call<SettingsResult>("save_settings", { settings: next }));
     if (result) {
@@ -4302,17 +4301,17 @@ export function App() {
               settings={settings}
               theme={theme}
               actions={actions}
-              onOpenAgentSettings={() => void navigate("agentSettings")}
+              onOpenAgentSettings={() => void (async () => {
+                if (activeTool !== "codex") await switchTool("codex");
+                await navigate("agentSettings");
+              })()}
             />
           ) : null}
           {route === "agentSettings" ? (
             <AgentSettingsScreen
               dirty={settingsDirty}
               form={settingsForm}
-              activeTool={activeTool}
-              toolEntries={toolEntries}
               onFormChange={setSettingsForm}
-              onNavigate={(next) => void navigate(next)}
               actions={actions}
             />
           ) : null}
@@ -9258,147 +9257,123 @@ function AboutScreen({
 function AgentSettingsScreen({
   dirty,
   form,
-  activeTool,
-  toolEntries,
   onFormChange,
-  onNavigate,
   actions,
 }: {
   dirty: boolean;
   form: BackendSettings;
-  activeTool: ToolId;
-  toolEntries: ToolEntry[];
   onFormChange: (value: BackendSettings) => void;
-  onNavigate: (route: Route) => void;
   actions: Actions;
 }) {
-  const tool = toolEntries.find((entry) => entry.id === activeTool);
-  const isCodex = activeTool === "codex";
   return (
     <div className="settings-page">
-      {isCodex ? (
-        <>
-          <Panel>
-            <CardHead title={t("Codex 供应商设置")} detail={t("只作用于 Codex 供应商的配置")} />
-            <CardContent className="settings-content">
-              <Field className="settings-test-model-field" label={t("供应商测试模型")}>
-                <Input
-                  value={form.relayTestModel}
-                  onChange={(event) => onFormChange({ ...form, relayTestModel: event.currentTarget.value })}
-                  placeholder={t("例如 gpt-5.4-mini")}
+      <>
+        <Panel>
+          <CardHead title={t("Codex 供应商设置")} detail={t("只作用于 Codex 供应商的配置")} />
+          <CardContent className="settings-content">
+            <Field className="settings-test-model-field" label={t("供应商测试模型")}>
+              <Input
+                value={form.relayTestModel}
+                onChange={(event) => onFormChange({ ...form, relayTestModel: event.currentTarget.value })}
+                placeholder={t("例如 gpt-5.4-mini")}
+              />
+            </Field>
+            <p className="field-hint">
+              {t("「测试供应商」按钮用这个模型发起一次真实请求，用于判断 Key 与端点是否可用。")}
+            </p>
+          </CardContent>
+        </Panel>
+
+        <Panel>
+          <CardHead title={t("Codex 图片覆盖层")} detail={t("在当前 Codex 会话上叠加一张背景图")} />
+          <CardContent className="settings-content">
+            <div className="settings-block">
+              <label className="check-row">
+                <input
+                  checked={form.codexAppImageOverlayEnabled}
+                  onChange={(event) =>
+                    onFormChange({ ...form, codexAppImageOverlayEnabled: event.currentTarget.checked })
+                  }
+                  type="checkbox"
                 />
-              </Field>
-              <p className="field-hint">
-                {t("「测试供应商」按钮用这个模型发起一次真实请求，用于判断 Key 与端点是否可用。")}
-              </p>
-            </CardContent>
-          </Panel>
-
-          <Panel>
-            <CardHead title={t("Codex 图片覆盖层")} detail={t("在当前 Codex 会话上叠加一张背景图")} />
-            <CardContent className="settings-content">
-              <div className="settings-block">
-                <label className="check-row">
-                  <input
-                    checked={form.codexAppImageOverlayEnabled}
-                    onChange={(event) =>
-                      onFormChange({ ...form, codexAppImageOverlayEnabled: event.currentTarget.checked })
-                    }
-                    type="checkbox"
-                  />
-                  <span>{t("启用 Codex 图片覆盖层")}</span>
-                </label>
-                <div className="form-row">
-                  <Field label={t("覆盖图片")}>
-                    <Input
-                      value={form.codexAppImageOverlayPath}
-                      onChange={(event) => onFormChange({ ...form, codexAppImageOverlayPath: event.currentTarget.value })}
-                      placeholder={t("选择 png / jpg / webp / gif / bmp")}
-                    />
-                  </Field>
-                  <Toolbar>
-                    <Button variant="secondary" onClick={() => void actions.chooseImageOverlayPath()}>
-                      {t("选择图片")}
-                    </Button>
-                  </Toolbar>
-                </div>
-                <Field label={tf("透明度 {0}%", [form.codexAppImageOverlayOpacity])}>
+                <span>{t("启用 Codex 图片覆盖层")}</span>
+              </label>
+              <div className="form-row">
+                <Field label={t("覆盖图片")}>
                   <Input
-                    min={1}
-                    max={100}
-                    type="range"
-                    value={form.codexAppImageOverlayOpacity}
-                    onChange={(event) =>
-                      onFormChange({
-                        ...form,
-                        codexAppImageOverlayOpacity: clampNumber(Number(event.currentTarget.value), 1, 100),
-                      })
-                    }
+                    value={form.codexAppImageOverlayPath}
+                    onChange={(event) => onFormChange({ ...form, codexAppImageOverlayPath: event.currentTarget.value })}
+                    placeholder={t("选择 png / jpg / webp / gif / bmp")}
                   />
                 </Field>
-                <Field label={t("背景适配方式")}>
-                  <AppSelect
-                    value={form.codexAppImageOverlayFitMode}
-                    onChange={(value) =>
-                      onFormChange({
-                        ...form,
-                        codexAppImageOverlayFitMode: value,
-                      })
-                    }
-                    options={[
-                      { value: "fill", label: t("填充") },
-                      { value: "fit", label: t("适应") },
-                      { value: "stretch", label: t("拉伸") },
-                      { value: "tile", label: t("平铺") },
-                      { value: "center", label: t("居中") },
-                    ]}
-                  />
-                </Field>
+                <Toolbar>
+                  <Button variant="secondary" onClick={() => void actions.chooseImageOverlayPath()}>
+                    {t("选择图片")}
+                  </Button>
+                </Toolbar>
               </div>
-              <Toolbar>
-                <Button variant="secondary" onClick={() => void actions.resetImageOverlaySettings()}>
-                  {t("重置背景")}
-                </Button>
-              </Toolbar>
-            </CardContent>
-          </Panel>
-
-          <Panel>
-            <CardHead title={t("Codex 启动参数")} detail={t("启动 Codex App 时追加到默认 CDP 参数后。留空则保持默认启动行为。")} />
-            <CardContent className="settings-content">
-              <Field label={t("额外参数")}>
-                <Textarea
-                  className="launch-args-input"
-                  placeholder="--force_high_performance_gpu"
-                  spellCheck={false}
-                  value={codexExtraArgsToInput(form.codexExtraArgs)}
+              <Field label={tf("透明度 {0}%", [form.codexAppImageOverlayOpacity])}>
+                <Input
+                  min={1}
+                  max={100}
+                  type="range"
+                  value={form.codexAppImageOverlayOpacity}
                   onChange={(event) =>
                     onFormChange({
                       ...form,
-                      codexExtraArgs: inputToCodexExtraArgs(event.currentTarget.value),
+                      codexAppImageOverlayOpacity: clampNumber(Number(event.currentTarget.value), 1, 100),
                     })
                   }
                 />
               </Field>
-              <p className="field-hint">{t("每行一个参数，例如 --force_high_performance_gpu。不需要填写 open 或 --args。")}</p>
-            </CardContent>
-          </Panel>
-        </>
-      ) : (
-        <Panel>
-          <CardHead title={tf("{0} 设置", [tool?.name ?? t("Agent")])} detail={t("这个 Agent 目前没有独立设置项")} />
-          <CardContent className="settings-content">
-            <p className="field-hint">
-              {t("该 Agent 的供应商、模型与端点在它自己的页面里管理；界面主题、配置备份等整体设置在最左侧齿轮里。")}
-            </p>
+              <Field label={t("背景适配方式")}>
+                <AppSelect
+                  value={form.codexAppImageOverlayFitMode}
+                  onChange={(value) =>
+                    onFormChange({
+                      ...form,
+                      codexAppImageOverlayFitMode: value,
+                    })
+                  }
+                  options={[
+                    { value: "fill", label: t("填充") },
+                    { value: "fit", label: t("适应") },
+                    { value: "stretch", label: t("拉伸") },
+                    { value: "tile", label: t("平铺") },
+                    { value: "center", label: t("居中") },
+                  ]}
+                />
+              </Field>
+            </div>
             <Toolbar>
-              <Button variant="secondary" onClick={() => onNavigate(activeTool === "grok" ? "grok" : "claude")}>
-                {activeTool === "grok" ? t("前往 Grok 配置") : t("前往 Claude 增强")}
+              <Button variant="secondary" onClick={() => void actions.resetImageOverlaySettings()}>
+                {t("重置背景")}
               </Button>
             </Toolbar>
           </CardContent>
         </Panel>
-      )}
+
+        <Panel>
+          <CardHead title={t("Codex 启动参数")} detail={t("启动 Codex App 时追加到默认 CDP 参数后。留空则保持默认启动行为。")} />
+          <CardContent className="settings-content">
+            <Field label={t("额外参数")}>
+              <Textarea
+                className="launch-args-input"
+                placeholder="--force_high_performance_gpu"
+                spellCheck={false}
+                value={codexExtraArgsToInput(form.codexExtraArgs)}
+                onChange={(event) =>
+                  onFormChange({
+                    ...form,
+                    codexExtraArgs: inputToCodexExtraArgs(event.currentTarget.value),
+                  })
+                }
+              />
+            </Field>
+            <p className="field-hint">{t("每行一个参数，例如 --force_high_performance_gpu。不需要填写 open 或 --args。")}</p>
+          </CardContent>
+        </Panel>
+      </>
 
       <SettingsSaveBar dirty={dirty} actions={actions} />
     </div>
@@ -9461,11 +9436,11 @@ function GlobalSettingsScreen({
           </div>
           <div className="global-setting-row">
             <div className="global-setting-copy">
-              <strong>{t("Agent 专属设置")}</strong>
-              <span>{t("图片覆盖层、启动参数等跟随 Agent 的选项，放在各 Agent 菜单的「设置」里。")}</span>
+              <strong>{t("Codex 专属设置")}</strong>
+              <span>{t("供应商测试模型、图片覆盖层、启动参数等只作用于 Codex 的选项，在 Codex 菜单的「设置」里。")}</span>
             </div>
             <div className="global-setting-actions">
-              <Button variant="secondary" onClick={onOpenAgentSettings}>{t("打开 Agent 设置")}</Button>
+              <Button variant="secondary" onClick={onOpenAgentSettings}>{t("打开 Codex 设置")}</Button>
             </div>
           </div>
         </CardContent>
