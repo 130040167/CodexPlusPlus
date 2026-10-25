@@ -1117,27 +1117,17 @@ fn active_relay_profile_is_official_mix(settings: &BackendSettings) -> bool {
     profile.relay_mode == crate::settings::RelayMode::Official && profile.official_mix_api_key
 }
 #[cfg(windows)]
-fn apply_codexplusplus_window_icon_after_launch(process_id: u32) {
-    let icon_resource_path =
-        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("codex-plus-plus.exe"));
+fn apply_codexplusplus_taskbar_after_launch(process_id: u32) {
     tokio::spawn(async move {
-        let mut state = crate::windows_integration::WindowIconApplyState::default();
         for attempt in 1..=30 {
-            if crate::windows_integration::apply_codexplusplus_icon_attempt(
-                process_id,
-                &icon_resource_path,
-                &mut state,
-            ) {
+            if crate::windows_integration::apply_codexplusplus_taskbar_to_process_window(process_id) {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             if attempt == 30 {
                 let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "launcher.window_icon.apply_failed",
-                    serde_json::json!({
-                        "process_id": process_id,
-                        "icon_resource_path": icon_resource_path.to_string_lossy()
-                    }),
+                    "launcher.taskbar.apply_failed",
+                    serde_json::json!({ "process_id": process_id }),
                 );
             }
         }
@@ -1145,7 +1135,7 @@ fn apply_codexplusplus_window_icon_after_launch(process_id: u32) {
 }
 
 #[cfg(not(windows))]
-fn apply_codexplusplus_window_icon_after_launch(_process_id: u32) {}
+fn apply_codexplusplus_taskbar_after_launch(_process_id: u32) {}
 
 pub trait IntoLaunchHooks {
     fn into_launch_hooks(self) -> Arc<dyn LaunchHooks>;
@@ -1421,7 +1411,7 @@ impl LaunchHooks for DefaultLaunchHooks {
                             *self.packaged_activation_process.lock().await = process;
                             *self.packaged_launch_identity.lock().await = None;
                         }
-                        apply_codexplusplus_window_icon_after_launch(process_id);
+                        apply_codexplusplus_taskbar_after_launch(process_id);
                         return Ok(match activation {
                             CodexLaunch::PackagedActivation {
                                 app_user_model_id,
@@ -2864,6 +2854,7 @@ async fn handle_protocol_proxy_connection(
             upstream.take_response()?,
             upstream.wire_api,
             request_json.as_ref(),
+            session_headers.thread_id,
         )
         .await?;
         if let Some(first_output_at_ms) = first_output_at_ms {
@@ -3486,6 +3477,7 @@ async fn forward_protocol_proxy_stream(
     response: reqwest::Response,
     wire_api: crate::protocol_proxy::UpstreamWireApi,
     request: Option<&Value>,
+    thread_id: Option<&str>,
 ) -> anyhow::Result<(
     Option<String>,
     Option<crate::request_log::RequestUsage>,
@@ -3645,7 +3637,17 @@ async fn forward_protocol_proxy_stream(
         ));
     }
     stream.write_all(&converter.finish()).await?;
+    record_chat_converter_usage(thread_id, &converter);
     Ok((None, None, None, first_output_at_ms))
+}
+
+fn record_chat_converter_usage(
+    thread_id: Option<&str>,
+    converter: &crate::protocol_proxy::ChatSseToResponsesConverter,
+) {
+    if let Some(usage) = converter.latest_usage() {
+        crate::context_usage::record_usage(thread_id, converter.model(), usage);
+    }
 }
 
 fn log_helper_response(
@@ -7411,7 +7413,7 @@ mod proxy_stream_tests {
         let (mut writer, _) = downstream.accept().await.unwrap();
         let forwarded = tokio::spawn(async move {
             let (result, _usage, _detail, first_output_at_ms) =
-                forward_protocol_proxy_stream(&mut writer, &prefix, response, wire, None)
+                forward_protocol_proxy_stream(&mut writer, &prefix, response, wire, None, None)
                     .await
                     .unwrap();
             writer.shutdown().await.unwrap();
@@ -7661,7 +7663,14 @@ mod proxy_stream_tests {
 
         let forwarded = timeout(
             Duration::from_secs(20),
-            forward_protocol_proxy_stream(&mut writer, &[], response, UpstreamWireApi::Responses, None),
+            forward_protocol_proxy_stream(
+                &mut writer,
+                &[],
+                response,
+                UpstreamWireApi::Responses,
+                None,
+                None,
+            ),
         )
         .await
         .expect("上游发完终止块后转发必须结束")

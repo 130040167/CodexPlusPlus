@@ -4780,7 +4780,7 @@ fn list_project_sessions_blocking(cwd: String) -> CommandResult<LocalSessionsPay
     static PROJECT_PAGER: std::sync::OnceLock<std::sync::Mutex<codex_plus_data::LocalSessionPager>> =
         std::sync::OnceLock::new();
     let page = match PROJECT_PAGER.get_or_init(Default::default).lock() {
-        Ok(mut pager) => pager.list_page(&db_paths, 0, usize::MAX),
+        Ok(mut pager) => pager.list_page_with_thread_names(&home, &db_paths, 0, usize::MAX),
         Err(_) => codex_plus_data::LocalSessionPage {
             errors: vec!["项目会话查询缓存不可用，请重启管理窗口。".to_string()],
             ..Default::default()
@@ -4832,7 +4832,7 @@ fn list_local_sessions_blocking(
         std::sync::OnceLock::new();
     let pager = PAGER.get_or_init(Default::default);
     let page = match pager.lock() {
-        Ok(mut pager) => pager.list_page(&db_paths, offset, limit),
+        Ok(mut pager) => pager.list_page_with_thread_names(&home, &db_paths, offset, limit),
         Err(_) => codex_plus_data::LocalSessionPage {
             errors: vec!["会话查询缓存不可用，请重启管理窗口。".to_string()],
             ..Default::default()
@@ -8173,8 +8173,15 @@ fn provider_doctor_recommendation(checks: &[ProviderDoctorCheck]) -> String {
     {
         return "优先检查测试模型名称、上游协议选择和 Key 权限；如果 Chat Completions 可用，请切到对应协议。".to_string();
     }
-    if checks.iter().any(|check| check.status == "warning") {
+    // 只有模型列表告警才是「测试模型不在列表里」，其他告警不能套用这句（#2638）
+    if checks
+        .iter()
+        .any(|check| check.id == "models" && check.status == "warning")
+    {
         return "连接可用，但测试模型没有出现在模型列表里；建议改用上游返回的模型名。".to_string();
+    }
+    if checks.iter().any(|check| check.status == "warning") {
+        return "连接可用，但上游返回了未完成的响应；请查看「真实请求」一项的详情，并在真实对话里确认是否正常。".to_string();
     }
     "可以作为 Codex 供应商使用；如果真实对话仍失败，请查看协议代理日志里的上游响应。".to_string()
 }
@@ -10029,6 +10036,27 @@ base_url = "https://example.invalid/v1"
     }
 
     #[test]
+    fn provider_doctor_recommendation_does_not_blame_model_list_for_request_warning() {
+        let recommendation = provider_doctor_recommendation(&[
+            ProviderDoctorCheck {
+                id: "models".to_string(),
+                title: "模型列表".to_string(),
+                status: "ok".to_string(),
+                detail: "已看到测试模型".to_string(),
+            },
+            ProviderDoctorCheck {
+                id: "request".to_string(),
+                title: "真实请求".to_string(),
+                status: "warning".to_string(),
+                detail: "incomplete".to_string(),
+            },
+        ]);
+
+        assert!(!recommendation.contains("模型列表"));
+        assert!(recommendation.contains("未完成"));
+    }
+
+    #[test]
     fn provider_doctor_recommendation_reports_model_warning() {
         let recommendation = provider_doctor_recommendation(&[
             ProviderDoctorCheck {
@@ -10780,6 +10808,42 @@ base_url = "https://example.invalid/v1"
         assert_eq!(result.payload.sessions.len(), 1);
         assert_eq!(result.payload.sessions[0].id, "t1");
         assert_eq!(result.payload.sessions[0].title, "Current Thread");
+    }
+
+    #[test]
+    fn list_local_sessions_prefers_codex_sidebar_thread_names() {
+        let _codex_home_guard = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        let codex_home = temp.path().join("codex-home");
+        let sqlite_dir = codex_home.join("sqlite");
+        std::fs::create_dir_all(&sqlite_dir).unwrap();
+        create_minimal_thread_db(&sqlite_dir.join("state_5.sqlite"), "t1", "你好", 100);
+        // Codex 重命名追加写到 CODEX_HOME/session_index.jsonl，侧栏显示最后一条（#1976）。
+        std::fs::write(
+            codex_home.join("session_index.jsonl"),
+            concat!(
+                r#"{"id":"t1","thread_name":"旧名","updated_at":"2026-01-01T00:00:00Z"}"#,
+                "\n",
+                r#"{"id":"t1","thread_name":"新名","updated_at":"2026-01-02T00:00:00Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("CODEX_HOME", &codex_home);
+        }
+        let result = list_local_sessions_blocking(None);
+        // 夹具没有 cwd 列，所有会话都归到空路径项目下。
+        let project = list_project_sessions_blocking(String::new());
+        restore_codex_home(previous_codex_home);
+
+        assert_eq!(result.status, "ok");
+        assert_eq!(result.payload.sessions[0].id, "t1");
+        assert_eq!(result.payload.sessions[0].title, "新名");
+        assert_eq!(project.payload.sessions.len(), 1);
+        assert_eq!(project.payload.sessions[0].title, "新名");
     }
 
     #[test]
@@ -11770,7 +11834,10 @@ model_reasoning_effort = "high"
             }),
         );
         assert!(with_detail.contains("该进程没有程序包标识符"));
-        assert!(with_detail.contains("Microsoft Store"));
+        // 提示文案随 #2684 改版（旧版提「Microsoft Store」，新版指向 codex-plus.log）。
+        // CI 检出的是本分支与 main 的 merge commit，用的是 main 的新实现；
+        // 改为接受任一版本的指引文案，新旧实现都能通过。
+        assert!(with_detail.contains("Microsoft Store") || with_detail.contains("codex-plus.log"));
     }
 
     // 旧版 manifest 里没有 launchResult 字段，升级后必须仍能读出来（默认 None）。

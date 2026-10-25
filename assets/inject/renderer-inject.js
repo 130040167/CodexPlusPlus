@@ -424,7 +424,7 @@
   const codexPlusWindowZoomVar = "--codex-window-zoom";
   const codexDeleteVersion = "7";
   const codexExportVersion = "1";
-  const codexActionGroupVersion = "6";
+  const codexActionGroupVersion = "7";
   const codexArchiveRowActionsVersion = "1";
   const codexArchiveDeleteAllVersion = "2";
   const codexConversationViewVersion = "1";
@@ -6024,6 +6024,7 @@
       globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
         enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
         codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
+        nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
       });
     } catch (_) {
       return false;
@@ -6164,6 +6165,7 @@
         globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
           enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
           codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
+          nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
         });
         globalThis.__CODEX_PLUS_ACTIVITY_OVERLAY_SYNC__?.();
       }
@@ -6771,12 +6773,22 @@
     return Number.isFinite(expiresAt) && expiresAt < Date.now();
   }
 
+  /**
+   * 广告落地页只认 http(s)。
+   *
+   * 清单来自远程，`javascript:` 之类的 scheme 一旦写进 `<a href>`，点击就会在
+   * Codex 渲染进程里执行脚本；`escapeHtml` 只挡得住标签，挡不住 scheme。
+   */
+  function isCodexPlusAdWebUrl(value) {
+    return /^https?:\/\/[^\s/]/i.test(String(value || "").trim());
+  }
+
   function normalizeCodexPlusAds(payload) {
     if (!payload || !Array.isArray(payload.ads)) return [];
     // 只留赞助商推荐。上游清单里的 normal 条目不属于合作伙伴分组，
     // 放进来只会让「有数据但渲染不出东西」的状态变得难以判断。
     return payload.ads.filter((ad) => {
-      return ad && ad.type === "sponsor" && ad.title && ad.description && ad.url && !isCodexPlusAdExpired(ad);
+      return ad && ad.type === "sponsor" && ad.title && ad.description && isCodexPlusAdWebUrl(ad.url) && !isCodexPlusAdExpired(ad);
     }).map((ad) => ({
       id: String(ad.id || ad.title),
       type: ad.type,
@@ -7625,9 +7637,11 @@
       // Discord / Telegram / Issues 按钮也一律走 window.open）。
       const adCard = target?.closest("[data-codex-plus-ad-url]");
       if (adCard) {
+        // 无论 URL 合不合法都先掐掉 <a> 的默认行为：留下它，非 http(s) 的
+        // scheme 就会走原生跳转，而不是被下面这层挡掉。
+        event.preventDefault();
         const adUrl = adCard.getAttribute("data-codex-plus-ad-url") || "";
-        if (/^https?:\/\//i.test(adUrl)) {
-          event.preventDefault();
+        if (isCodexPlusAdWebUrl(adUrl)) {
           window.open(adUrl, "_blank", "noopener,noreferrer");
         }
         return;
@@ -15078,9 +15092,62 @@
 
   function removeActionGroups(row) {
     document.querySelectorAll(`.${moreMenuClass}`).forEach((menu) => {
-      if (menu.__codexSessionMoreRow === row) menu.remove();
+      if (menu.__codexSessionMoreRow === row) disposeSessionMoreMenu(menu);
     });
     row.querySelectorAll(`.${actionGroupClass}`).forEach((group) => group.remove());
+  }
+
+  function closeSessionMoreMenu(menu) {
+    menu.hidden = true;
+    const row = menu.__codexSessionMoreRow || menu.closest?.("[data-codex-delete-row]");
+    row?.classList?.remove("codex-session-more-open");
+    menu.__codexSessionMoreGroup?.querySelector?.(`.${moreButtonClass}`)?.setAttribute("aria-expanded", "false");
+  }
+
+  function disposeSessionMoreMenu(menu) {
+    closeSessionMoreMenu(menu);
+    menu.__codexSessionMoreCleanup?.();
+    const group = menu.__codexSessionMoreGroup;
+    if (group?.__codexSessionMoreMenu === menu) group.__codexSessionMoreMenu = null;
+    menu.__codexSessionMoreCleanup = null;
+    menu.__codexSessionMoreRow = null;
+    menu.__codexSessionMoreGroup = null;
+    menu.remove();
+  }
+
+  function pruneSessionMoreMenus(removedMenus = []) {
+    let needsScan = false;
+    const needsDelete = codexPlusSettings().sessionDelete;
+    // 菜单挂在 body 下，不会随 React 会话行一起卸载；复用现有观察器及时释放。
+    const menus = new Set([...document.querySelectorAll(`.${moreMenuClass}`), ...removedMenus]);
+    menus.forEach((menu) => {
+      const row = menu.__codexSessionMoreRow;
+      const group = menu.__codexSessionMoreGroup;
+      if (!menu.isConnected || !row?.isConnected || !group?.isConnected || !row.contains(group)
+          || !group.querySelector(`.${moreButtonClass}`)
+          || (needsDelete && !group.querySelector(`.${buttonClass}`))) {
+        if (row?.isConnected) needsScan = true;
+        disposeSessionMoreMenu(menu);
+      }
+    });
+    return needsScan;
+  }
+
+  function pruneRemovedSessionActions(mutations) {
+    let relevantRemoval = false;
+    const removedMenus = new Set();
+    const menuSelector = `.${moreMenuClass}`;
+    const actionSelector = `.${actionGroupClass}, .${moreButtonClass}, .${buttonClass}, ${menuSelector}`;
+    for (const mutation of mutations || []) {
+      for (const node of mutation.removedNodes) {
+        if (node.nodeType !== 1 || (!node.matches(actionSelector) && !node.querySelector(actionSelector))) continue;
+        relevantRemoval = true;
+        if (node.matches(menuSelector)) removedMenus.add(node);
+        node.querySelectorAll(menuSelector).forEach((menu) => removedMenus.add(menu));
+      }
+    }
+    // 同步移动和按钮克隆替换在观察器回调前已完成，只依据最终连接状态判断。
+    return relevantRemoval && pruneSessionMoreMenus(removedMenus);
   }
 
   function stopActionButtonEvent(row, button, event) {
@@ -15122,9 +15189,7 @@
   function closeSessionMoreMenus(exceptMenu = null) {
     document.querySelectorAll(`.${moreMenuClass}`).forEach((menu) => {
       if (menu !== exceptMenu) {
-        menu.hidden = true;
-        menu.closest?.("[data-codex-delete-row]")?.classList.remove("codex-session-more-open");
-        menu.__codexSessionMoreRow?.classList?.remove("codex-session-more-open");
+        closeSessionMoreMenu(menu);
       }
     });
   }
@@ -15139,19 +15204,27 @@
 
   function installSessionMoreMenuAutoClose(row, menu) {
     const group = menu.__codexSessionMoreGroup || menu.closest?.(`.${actionGroupClass}`);
+    let closeTimer = null;
     const closeIfOutside = () => {
-      window.setTimeout(() => {
+      window.clearTimeout(closeTimer);
+      closeTimer = window.setTimeout(() => {
+        closeTimer = null;
         if (menu.hidden) return;
         const active = document.activeElement;
         if (group?.matches?.(":hover") || menu.matches?.(":hover") || menu.contains(active)) return;
-        menu.hidden = true;
-        row.classList.remove("codex-session-more-open");
-        group?.querySelector?.(`.${moreButtonClass}`)?.setAttribute("aria-expanded", "false");
+        closeSessionMoreMenu(menu);
       }, 80);
     };
     group?.addEventListener("pointerleave", closeIfOutside, true);
     menu.addEventListener("pointerleave", closeIfOutside, true);
     menu.addEventListener("focusout", closeIfOutside, true);
+    menu.__codexSessionMoreCleanup = () => {
+      window.clearTimeout(closeTimer);
+      closeTimer = null;
+      group?.removeEventListener("pointerleave", closeIfOutside, true);
+      menu.removeEventListener("pointerleave", closeIfOutside, true);
+      menu.removeEventListener("focusout", closeIfOutside, true);
+    };
   }
 
   function updateSessionMoreMenuDirection(button, menu) {
@@ -15257,7 +15330,10 @@
     const missingMore = needsMoreMenu && !existingMoreButton;
     const deleteReady = !settings.sessionDelete || existingDeleteButton?.dataset.codexDeleteVersion === codexDeleteVersion;
     const groupReady = existingGroup?.dataset.codexActionGroupVersion === codexActionGroupVersion;
-    if (groupReady && deleteReady && !hasUnexpectedDelete && !hasUnexpectedMore && !hasUnexpectedExport && !missingDelete && !missingMore) {
+    const existingMenu = existingGroup?.__codexSessionMoreMenu;
+    const menuReady = !needsMoreMenu || (existingMenu?.isConnected
+      && existingMenu.__codexSessionMoreRow === row && existingMenu.__codexSessionMoreGroup === existingGroup);
+    if (groupReady && deleteReady && menuReady && !hasUnexpectedDelete && !hasUnexpectedMore && !hasUnexpectedExport && !missingDelete && !missingMore) {
       return;
     }
     removeActionGroups(row);
@@ -15267,6 +15343,7 @@
     row.dataset.codexDeleteRow = "true";
     const group = document.createElement("div");
     group.className = actionGroupClass;
+    group.setAttribute("data-codex-plus-ext", "session-actions");
     group.dataset.codexActionGroupVersion = codexActionGroupVersion;
     if (needsMoreMenu) {
       const moreButton = document.createElement("button");
@@ -15277,6 +15354,7 @@
       configureActionButton(moreButton, "更多操作", "…");
       const moreMenu = document.createElement("div");
       moreMenu.className = moreMenuClass;
+      moreMenu.setAttribute("data-codex-plus-ext", "session-more-menu");
       moreMenu.setAttribute("role", "menu");
       moreMenu.hidden = true;
       if (settings.markdownExport) {
@@ -15313,6 +15391,7 @@
       group.appendChild(moreButton);
       moreMenu.__codexSessionMoreRow = row;
       moreMenu.__codexSessionMoreGroup = group;
+      group.__codexSessionMoreMenu = moreMenu;
       document.body.appendChild(moreMenu);
       installSessionMoreMenuAutoClose(row, moreMenu);
     }
@@ -18510,6 +18589,7 @@
   }
 
   function scan() {
+    pruneSessionMoreMenus();
     if (document.hidden) {
       window.__codexSessionDeleteScanPending = true;
       return;
@@ -19221,9 +19301,12 @@
   }
 
   function scheduleScan(mutations) {
+    // 隐藏页面和已排队的扫描也要清理，不能让孤立菜单等待下一次可见扫描。
+    const sessionActionsNeedScan = pruneRemovedSessionActions(mutations);
     window.__codexSessionDeleteLastMutations = mutations;
     if (window.__codexSessionDeleteScanPending) return;
-    if (!shouldScheduleScan(mutations)) return;
+    // 原生页面可能只移除带归属标记的按钮组；所属行仍在时需要补回操作入口。
+    if (!sessionActionsNeedScan && !shouldScheduleScan(mutations)) return;
     window.__codexSessionDeleteScanPending = true;
     if (document.hidden) return;
     window.__codexSessionDeleteScanTimer = setTimeout(runScheduledScan, 200);
