@@ -1863,20 +1863,8 @@ fn stop_codex_multi_instance_blocking(
             },
         );
     };
-    if !multi_instance_is_running(&instance)
-        && !matches!(
-            codex_plus_core::watcher::inspect_process_instance(identity.process_id),
-            codex_plus_core::watcher::ProcessInstanceState::NotRunning
-        )
-    {
-        return failed(
-            "无法重新确认该实例的完整身份，已拒绝结束进程。",
-            CodexMultiInstancesPayload {
-                instances: Vec::new(),
-            },
-        );
-    }
-    if multi_instance_is_running(&instance) {
+    // CDP 健康只决定能否连接，停止依据持久化的进程创建身份。
+    if !codex_plus_core::multi_worker::codex_instance_process_exited(identity) {
         match tauri::async_runtime::block_on(
             codex_plus_core::multi_worker::terminate_verified_codex_instance(identity),
         ) {
@@ -1899,10 +1887,12 @@ fn stop_codex_multi_instance_blocking(
             }
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while multi_instance_is_running(&instance) && std::time::Instant::now() < deadline {
+        while !codex_plus_core::multi_worker::codex_instance_process_exited(identity)
+            && std::time::Instant::now() < deadline
+        {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        if multi_instance_is_running(&instance) {
+        if !codex_plus_core::multi_worker::codex_instance_process_exited(identity) {
             return failed(
                 "实例仍未退出，请稍后重试。",
                 CodexMultiInstancesPayload {
@@ -1914,7 +1904,24 @@ fn stop_codex_multi_instance_blocking(
     // 保留该代结果作为身份记录，下次启动用新 generation 排除旧结果。
     if let Some(pid) = instance.pid {
         let options_path = path.join("worker-options.json");
-        let _ = terminate_multi_worker(pid, &options_path, instance.worker_birth_id);
+        if let Err(error) = terminate_multi_worker(pid, &options_path, instance.worker_birth_id) {
+            return failed(
+                &format!("Codex 已停止，但后台 worker 清理失败：{error}"),
+                CodexMultiInstancesPayload { instances: Vec::new() },
+            );
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while multi_instance_worker_may_be_running(&instance, &path)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if multi_instance_worker_may_be_running(&instance, &path) {
+            return failed(
+                "Codex 已停止，但后台 worker 尚未确认退出，请稍后重试。",
+                CodexMultiInstancesPayload { instances: Vec::new() },
+            );
+        }
     }
     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
         "manager.multi_instance_stopped",
@@ -2758,7 +2765,7 @@ pub fn run_auto_takeover_launch(request: LaunchRequest) -> Result<(), String> {
     };
     // 自动接管也走常驻 helper：Codex 之后退出时本地代理仍可被外部客户端使用。
     sync_resident_helper();
-    codex_plus_launcher::start(launch_options).map_err(|error| error.to_string())
+    start_main_launcher_with_identity(launch_options).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -2786,18 +2793,12 @@ pub fn pause_auto_takeover_for_instance() -> CommandResult<crate::auto_takeover:
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum RestartDisposition {
-    LaunchOnly,
-    StopAndRestart,
-}
-
-fn restart_disposition(sync_active_relay: bool, app_running: bool) -> RestartDisposition {
-    if !sync_active_relay && !app_running {
-        RestartDisposition::LaunchOnly
-    } else {
-        RestartDisposition::StopAndRestart
-    }
+fn ensure_restart_target_known(has_target: bool, owns_session: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        has_target || !owns_session,
+        "本管理器仍持有 Codex 会话，但缺少可信进程身份；未执行停止或启动"
+    );
+    Ok(())
 }
 
 fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
@@ -2806,14 +2807,31 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
         Err(message) => return failed(message, json!({})),
     };
     let request = normalize_launch_request(request);
-    // 按本实例的调试端口判定是否在跑。
-    // 早先用 `find_codex_processes_for_debug_port`，但它在非 macOS 上返回全部
-    // Codex 进程：Windows 上只要有多开实例在跑，就会把「主 Codex 没开」误判成
-    // 「已运行」，进而走进重启分支去停进程。
-    let app_running = codex_plus_core::cdp::endpoint_available(request.debug_port);
-    if restart_disposition(request.sync_active_relay, app_running) == RestartDisposition::LaunchOnly
-    {
-        return spawn_codex_plus_launch(request, "Codex 未运行，已按直接启动方式在后台唤起。");
+    // 重启始终清理旧 runtime；CDP 断连不代表旧进程或 helper 已经退出。
+    let Some(app_dir) = codex_plus_core::app_paths::resolve_codex_app_dir(
+        (!request.app_path.trim().is_empty()).then(|| Path::new(request.app_path.trim())),
+    ) else {
+        return failed("无法定位 Codex 应用，未执行重启。", json!({}));
+    };
+    let target = match codex_plus_core::watcher::capture_codex_restart_target(
+        request.debug_port,
+        &codex_plus_core::app_paths::build_codex_executable(&app_dir),
+    ) {
+        Ok(target) => target,
+        Err(error) => return failed(&format!("无法确认重启目标身份：{error}"), json!({})),
+    };
+    let session = codex_plus_launcher::session_snapshot();
+    let owns_session = session.owned && session.debug_port == Some(request.debug_port);
+    if owns_session {
+        if let Err(error) = target.verify_session_generation(session.started_at_ms) {
+            return failed(&error.to_string(), json!({}));
+        }
+    }
+    if let Err(error) = ensure_restart_target_known(
+        target.has_verified_identity(),
+        owns_session,
+    ) {
+        return failed(&error.to_string(), json!({}));
     }
     let Ok(_guard) = relay_switch_mutex().try_lock() else {
         return failed(
@@ -2855,18 +2873,7 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
     ));
     let native_browser_shutdown = match stop_codex_plus_for_restart(
         || {
-            // 主实例在 Windows 上是 AUMID 激活的，命令行未必带调试端口；
-            // 这里允许「按端口没匹配到就退回全局结束」，否则重启会卡在
-            // 「Codex 进程尚未退出」。多开页的结束走的是不允许退回的那个版本。
-            #[cfg(windows)]
-            codex_plus_core::watcher::stop_codex_processes_for_debug_port_with_fallback(
-                request.debug_port,
-                true,
-            );
-            #[cfg(not(windows))]
-            codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(
-                request.debug_port,
-            );
+            target.stop_and_wait()?;
             anyhow::ensure!(
                 !codex_plus_core::cdp::endpoint_available(request.debug_port),
                 "Codex 进程尚未退出；未启动新实例"
@@ -3454,7 +3461,7 @@ fn start_embedded_launcher(request: &LaunchRequest) -> anyhow::Result<()> {
     // 先让常驻 helper 占住协议代理端口：启动链路会识别并复用，Codex 会话退出
     // 时就不再关闭它，从而实现「Codex++ 在跑，本地代理就一直可用」。
     sync_resident_helper();
-    codex_plus_launcher::start(codex_plus_launcher::LaunchOptions {
+    start_main_launcher_with_identity(codex_plus_launcher::LaunchOptions {
         app_dir: (!request.app_path.trim().is_empty())
             .then(|| PathBuf::from(request.app_path.trim())),
         debug_port: request.debug_port,
@@ -3462,6 +3469,30 @@ fn start_embedded_launcher(request: &LaunchRequest) -> anyhow::Result<()> {
         status_store: StatusStore::default(),
         ..Default::default()
     })
+}
+
+fn record_main_launcher_identity(receipt: &codex_plus_launcher::LaunchReceipt) {
+    if let Err(error) = codex_plus_core::watcher::record_main_restart_identity(
+        receipt.debug_port,
+        receipt.started_at_ms,
+        &codex_plus_core::app_paths::build_codex_executable(&receipt.app_dir),
+        &codex_plus_core::paths::default_app_state_dir(),
+        &codex_plus_core::relay_config::default_codex_home_dir(),
+    ) {
+        // 启动已成功，不能将回执落盘失败伪装成启动失败；后续无可信身份时拒绝停止。
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "manager.main_restart_identity_unavailable",
+            json!({ "message": error.to_string() }),
+        );
+    }
+}
+
+fn start_main_launcher_with_identity(
+    options: codex_plus_launcher::LaunchOptions,
+) -> anyhow::Result<()> {
+    let receipt = codex_plus_launcher::start_with_receipt(options)?;
+    record_main_launcher_identity(&receipt);
+    Ok(())
 }
 
 /// 重新打开管理界面时恢复已有 Codex 的 Helper、代理和注入，不启动官方应用。
@@ -3495,9 +3526,19 @@ pub fn resume_existing_codex_background(app: tauri::AppHandle, start_if_missing:
             ..Default::default()
         };
         match codex_plus_launcher::resume_if_running(options.clone()) {
-            Ok(true) => {}
+            Ok(true) => {
+                match codex_plus_launcher::resume_with_receipt(options.clone()) {
+                    Ok(receipt) => record_main_launcher_identity(&receipt),
+                    Err(error) => {
+                        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                            "manager.main_restart_identity_unavailable",
+                            json!({ "message": error.to_string() }),
+                        );
+                    }
+                }
+            }
             Ok(false) if start_if_missing => {
-                if let Err(error) = codex_plus_launcher::start(options) {
+                if let Err(error) = start_main_launcher_with_identity(options) {
                     let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
                         "manager.autostart_codex_failed",
                         json!({ "message": error.to_string() }),
@@ -9987,20 +10028,6 @@ base_url = "https://example.invalid/v1"
     }
 
     #[test]
-    fn restart_absent_app_uses_launch_but_explicit_sync_still_restarts() {
-        assert_eq!(
-            restart_disposition(false, false),
-            RestartDisposition::LaunchOnly
-        );
-        for (sync, running) in [(true, false), (false, true), (true, true)] {
-            assert_eq!(
-                restart_disposition(sync, running),
-                RestartDisposition::StopAndRestart
-            );
-        }
-    }
-
-    #[test]
     fn restart_and_launch_share_a_single_flight_guard() {
         let first = try_acquire_launch_guard().unwrap();
         assert!(try_acquire_launch_guard().is_err());
@@ -10676,6 +10703,35 @@ base_url = "https://example.invalid/v1"
         )
         .unwrap();
         assert_eq!(*events.borrow(), ["codex", "runtime", "cleanup"]);
+    }
+
+    #[test]
+    fn restart_absent_codex_cleans_runtime_then_launches_without_live_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let events = std::cell::RefCell::new(Vec::new());
+        ensure_restart_target_known(false, false).unwrap();
+        stop_codex_plus_for_restart(
+            || Ok(()),
+            || {
+                events.borrow_mut().push("runtime");
+                Ok(())
+            },
+            || Ok(codex_plus_core::native_browser::NativeBrowserShutdown::Ready),
+        ).unwrap();
+        restart_codex_plus_after_stop(&launch_request(false), temp.path(), None, |_| {
+            events.borrow_mut().push("launch");
+            Ok(())
+        }).unwrap();
+        assert_eq!(*events.borrow(), ["runtime", "launch"]);
+        assert!(!temp.path().join("config.toml").exists());
+        assert!(!temp.path().join("auth.json").exists());
+    }
+
+    #[test]
+    fn restart_owned_session_requires_verified_target_or_verified_exit() {
+        assert!(ensure_restart_target_known(false, true).is_err());
+        assert!(ensure_restart_target_known(true, true).is_ok());
+        assert!(ensure_restart_target_known(false, false).is_ok());
     }
 
     #[test]

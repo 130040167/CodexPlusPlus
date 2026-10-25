@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// 端口只是连接地址；停止实例必须同时持有这一代的进程和 Browser 身份。
+/// 端口只是连接地址；停止实例必须验证这一代的进程身份，不能依赖 CDP 健康。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexInstanceIdentity {
@@ -17,6 +17,100 @@ pub struct CodexInstanceIdentity {
     pub process_id: u32,
     pub process_birth_id: u64,
     pub executable: PathBuf,
+}
+
+fn valid_stop_identity(identity: &CodexInstanceIdentity) -> bool {
+    !identity.instance_id.is_empty()
+        && identity.generation != 0
+        && identity.process_id != 0
+        && identity.process_id != std::process::id()
+        && identity.process_birth_id != 0
+        && identity.debug_port != 0
+        && identity.helper_port != 0
+        && identity.executable.is_absolute()
+        && identity.user_data_dir.is_absolute()
+}
+
+/// 退出确认不查询 CDP；无法读取进程状态时必须继续阻止重新启动。
+pub fn codex_instance_process_exited(identity: &CodexInstanceIdentity) -> bool {
+    if !valid_stop_identity(identity) {
+        return false;
+    }
+    use crate::watcher::{ProcessInstanceState, inspect_process_instance};
+    match inspect_process_instance(identity.process_id) {
+        ProcessInstanceState::NotRunning => true,
+        #[cfg(windows)]
+        ProcessInstanceState::Running { birth_id: Some(birth), .. } => birth
+            .parse::<u64>()
+            .is_ok_and(|birth| birth != identity.process_birth_id),
+        _ => false,
+    }
+}
+
+// 持有句柄直到退出确认完成，避免检查 PID 后再按 PID 结束造成换代误杀。
+#[cfg(windows)]
+pub(crate) struct VerifiedStopProcess {
+    handle: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+impl VerifiedStopProcess {
+    pub(crate) fn capture(
+        pid: u32,
+        executable: &Path,
+        expected_birth: Option<u64>,
+    ) -> anyhow::Result<Option<Self>> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows::Win32::Foundation::{FILETIME, HANDLE};
+        use windows::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        };
+        anyhow::ensure!(pid != 0 && pid != std::process::id(), "拒绝结束无效进程");
+        let native = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+                false,
+                pid,
+            )
+        }?;
+        let handle = unsafe { OwnedHandle::from_raw_handle(native.0) };
+        let native = HANDLE(handle.as_raw_handle());
+        let mut birth = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        unsafe { GetProcessTimes(native, &mut birth, &mut exit, &mut kernel, &mut user) }?;
+        let birth_id = ((birth.dwHighDateTime as u64) << 32) | birth.dwLowDateTime as u64;
+        if expected_birth.is_some_and(|expected| expected != birth_id) {
+            return Ok(None);
+        }
+        // 第二个句柄验证映像和创建时间；原句柄一直持有，验证结果只用于同一代进程。
+        let Some(verified) =
+            crate::windows_integration::TrackedWindowsProcess::capture(pid, executable)?
+        else {
+            return Ok(None);
+        };
+        if verified.birth_id != birth_id || !verified.is_alive()? {
+            return Ok(None);
+        }
+        Ok(Some(Self { handle }))
+    }
+
+    pub(crate) fn terminate_and_wait(&self) -> anyhow::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+        let handle = HANDLE(self.handle.as_raw_handle());
+        if unsafe { WaitForSingleObject(handle, 0) } != WAIT_OBJECT_0 {
+            unsafe { TerminateProcess(handle, 0) }?;
+        }
+        anyhow::ensure!(
+            unsafe { WaitForSingleObject(handle, 10_000) } == WAIT_OBJECT_0,
+            "已验证的 Codex 进程尚未确认退出"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -362,10 +456,25 @@ pub async fn codex_instance_identity_matches(
 pub async fn terminate_verified_codex_instance(
     identity: &CodexInstanceIdentity,
 ) -> anyhow::Result<bool> {
-    if !codex_instance_identity_matches(identity).await? {
+    if !valid_stop_identity(identity) {
         return Ok(false);
     }
-    crate::windows_integration::terminate_verified_codex_instance(identity)
+    let Some(process) = VerifiedStopProcess::capture(
+        identity.process_id,
+        &identity.executable,
+        Some(identity.process_birth_id),
+    )? else {
+        return Ok(false);
+    };
+    let Some(arguments) = crate::windows_integration::process_arguments(identity.process_id) else {
+        return Ok(false);
+    };
+    if !codex_arguments_match(&arguments, &identity.user_data_dir, identity.debug_port) {
+        return Ok(false);
+    }
+    // CDP 失联不影响已持有的进程身份；端口被邻居接管也不能改变终止目标。
+    process.terminate_and_wait()?;
+    Ok(true)
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
@@ -476,6 +585,84 @@ pub fn terminate_verified_worker(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn disconnected_instance_stops_only_its_verified_process_and_waits_for_exit() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("wait.ps1");
+        std::fs::write(&script, "Start-Sleep -Seconds 60\n").unwrap();
+        let executable = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let own = temp.path().join("own");
+        let neighbor = temp.path().join("neighbor");
+        std::fs::create_dir(&own).unwrap();
+        std::fs::create_dir(&neighbor).unwrap();
+        let spawn = |data: &Path| {
+            ChildGuard(std::process::Command::new(&executable)
+                .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+                .arg(&script)
+                .arg("--remote-debugging-port=19341")
+                .arg(format!("--user-data-dir={}", data.display()))
+                .spawn().unwrap())
+        };
+        let mut child = spawn(&own);
+        let mut other = spawn(&neighbor);
+        let identity = CodexInstanceIdentity {
+            instance_id: "fixture".into(),
+            generation: 1,
+            debug_port: 19341,
+            helper_port: 19342,
+            user_data_dir: own,
+            // 无 CDP listener，也无 Browser 回执，仍可安全确认操作系统身份。
+            browser_id: String::new(),
+            process_id: child.0.id(),
+            process_birth_id: worker_birth_id(&child.0).unwrap(),
+            executable,
+        };
+        for invalid in 0..5 {
+            let mut wrong = identity.clone();
+            match invalid {
+                0 => wrong.generation = 0,
+                1 => wrong.process_birth_id += 1,
+                2 => wrong.executable = temp.path().join("other.exe"),
+                3 => wrong.user_data_dir = neighbor.clone(),
+                _ => wrong.debug_port += 1,
+            }
+            assert!(!terminate_verified_codex_instance(&wrong).await.unwrap());
+            assert!(child.0.try_wait().unwrap().is_none());
+            assert!(other.0.try_wait().unwrap().is_none());
+        }
+        assert!(!codex_instance_process_exited(&identity));
+        assert!(terminate_verified_codex_instance(&identity).await.unwrap());
+        assert!(child.0.try_wait().unwrap().is_some());
+        assert!(codex_instance_process_exited(&identity));
+        assert!(other.0.try_wait().unwrap().is_none());
+    }
+
+    #[test]
+    fn absent_or_unknown_identity_does_not_authorize_restart() {
+        let identity = CodexInstanceIdentity {
+            instance_id: "fixture".into(),
+            generation: 0,
+            debug_port: 19341,
+            helper_port: 19342,
+            user_data_dir: std::env::temp_dir(),
+            browser_id: String::new(),
+            process_id: 0,
+            process_birth_id: 0,
+            executable: std::env::current_exe().unwrap(),
+        };
+        assert!(!valid_stop_identity(&identity));
+        assert!(!codex_instance_process_exited(&identity));
+    }
+
     use super::*;
 
     #[test]

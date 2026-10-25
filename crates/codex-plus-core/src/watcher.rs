@@ -1603,19 +1603,293 @@ fn debug_port_from_command_line(command_line: &str) -> Option<u16> {
     None
 }
 
-/// 结束目标的选择逻辑：按端口匹配到的优先；一个都没匹配到且允许退回时才用全局集合。
-///
-/// 抽成纯函数是为了能在 macOS 上测「多开不允许退回、主实例允许退回」这条关键分支
-/// （Windows 分支本身在本机不编译）。
+/// 兼容旧调用签名，但任何调用方都不得退回全局结束。
 fn select_stop_targets(
     port_matched: Vec<u32>,
-    all_codex: impl FnOnce() -> Vec<u32>,
-    allow_global_fallback: bool,
+    _all_codex: impl FnOnce() -> Vec<u32>,
+    _allow_global_fallback: bool,
 ) -> Vec<u32> {
-    if port_matched.is_empty() && allow_global_fallback {
-        return all_codex();
-    }
     port_matched
+}
+
+/// 重启专用：在停止前固定目标身份，不能把 CDP 可用性当作进程存活。
+pub struct CodexRestartTarget {
+    verified_absence: bool,
+    receipt_started_at_ms: Option<u64>,
+    #[cfg(windows)]
+    processes: Vec<crate::multi_worker::VerifiedStopProcess>,
+    #[cfg(not(windows))]
+    processes: Vec<(u32, ProcessInstanceState)>,
+}
+
+/// 仅在本管理器的 ready 会话仍绑定 listener 时创建；之后不再依赖 CDP。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct MainRestartReceipt {
+    version: u32,
+    started_at_ms: u64,
+    debug_port: u16,
+    process_id: u32,
+    process_birth_id: u64,
+    executable: PathBuf,
+    state_dir: PathBuf,
+    codex_home: PathBuf,
+}
+
+fn main_restart_receipt_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("main-restart-identity.json")
+}
+
+fn same_restart_path(left: &Path, right: &Path) -> bool {
+    let normalize = |path: &Path| {
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        #[cfg(windows)]
+        {
+            path.to_string_lossy()
+                .trim_start_matches(r"\\?\")
+                .to_ascii_lowercase()
+        }
+        #[cfg(not(windows))]
+        {
+            path.to_string_lossy().into_owned()
+        }
+    };
+    left.is_absolute() && right.is_absolute() && normalize(left) == normalize(right)
+}
+
+impl MainRestartReceipt {
+    fn matches_scope(
+        &self,
+        debug_port: u16,
+        executable: &Path,
+        state_dir: &Path,
+        codex_home: &Path,
+    ) -> bool {
+        self.version == 1
+            && self.started_at_ms != 0
+            && self.debug_port == debug_port
+            && debug_port != 0
+            && self.process_id != 0
+            && self.process_id != std::process::id()
+            && self.process_birth_id != 0
+            && same_restart_path(&self.executable, executable)
+            && same_restart_path(&self.state_dir, state_dir)
+            && same_restart_path(&self.codex_home, codex_home)
+    }
+}
+
+/// 调用方必须已拿到本进程 ready 会话回执，不能用旧 status 推测本次归属。
+pub fn record_main_restart_identity(
+    debug_port: u16,
+    started_at_ms: u64,
+    executable: &Path,
+    state_dir: &Path,
+    codex_home: &Path,
+) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        // 新 ready 会话不能沿用旧会话回执；采集或原子替换失败后保持不可用。
+        std::fs::create_dir_all(state_dir)?;
+        std::fs::write(main_restart_receipt_path(state_dir), b"null\n")?;
+        anyhow::ensure!(started_at_ms != 0 && debug_port != 0, "缺少 ready 会话代际");
+        let process = crate::windows_integration::capture_debug_listener(debug_port, executable)?
+            .ok_or_else(|| anyhow::anyhow!("ready 会话缺少可验证的 Codex listener"))?;
+        let receipt = MainRestartReceipt {
+            version: 1,
+            started_at_ms,
+            debug_port,
+            process_id: process.process_id,
+            process_birth_id: process.birth_id,
+            executable: executable.canonicalize()?,
+            state_dir: state_dir.canonicalize()?,
+            codex_home: codex_home.canonicalize()?,
+        };
+        anyhow::ensure!(
+            receipt.matches_scope(debug_port, executable, state_dir, codex_home),
+            "ready 会话身份范围不匹配"
+        );
+        crate::settings::atomic_write(
+            &main_restart_receipt_path(state_dir),
+            &serde_json::to_vec_pretty(&receipt)?,
+        )?;
+    }
+    #[cfg(not(windows))]
+    let _ = (debug_port, started_at_ms, executable, state_dir, codex_home);
+    Ok(())
+}
+
+impl CodexRestartTarget {
+    pub fn is_empty(&self) -> bool {
+        self.processes.is_empty()
+    }
+
+    pub fn has_verified_identity(&self) -> bool {
+        self.verified_absence || !self.is_empty()
+    }
+
+    pub fn verify_session_generation(&self, started_at_ms: Option<u64>) -> anyhow::Result<()> {
+        if let Some(receipt_generation) = self.receipt_started_at_ms {
+            anyhow::ensure!(
+                Some(receipt_generation) == started_at_ms,
+                "主实例回执与本管理器当前会话代际不匹配"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn stop_and_wait(self) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        for process in self.processes {
+            process.terminate_and_wait()?;
+        }
+        #[cfg(not(windows))]
+        for (pid, identity) in self.processes {
+            anyhow::ensure!(
+                inspect_process_instance(pid) == identity,
+                "Codex 进程身份已改变，未执行停止"
+            );
+            #[cfg(target_os = "macos")]
+            terminate_macos_processes_and_wait(
+                vec![pid],
+                || {
+                    if matches!(inspect_process_instance(pid), ProcessInstanceState::NotRunning) {
+                        Vec::new()
+                    } else {
+                        vec![pid]
+                    }
+                },
+                RESTART_STOP_WAIT_TIMEOUT_MS,
+                RESTART_STOP_WAIT_INTERVAL_MS,
+            );
+            anyhow::ensure!(
+                matches!(inspect_process_instance(pid), ProcessInstanceState::NotRunning),
+                "Codex 进程尚未确认退出"
+            );
+        }
+        Ok(())
+    }
+}
+
+pub fn capture_codex_restart_target(
+    debug_port: u16,
+    executable: &Path,
+) -> anyhow::Result<CodexRestartTarget> {
+    capture_codex_restart_target_in_scope(
+        debug_port,
+        executable,
+        &crate::paths::default_app_state_dir(),
+        &crate::relay_config::default_codex_home_dir(),
+    )
+}
+
+fn capture_codex_restart_target_in_scope(
+    debug_port: u16,
+    executable: &Path,
+    state_dir: &Path,
+    codex_home: &Path,
+) -> anyhow::Result<CodexRestartTarget> {
+    #[cfg(windows)]
+    {
+        let mut processes = Vec::new();
+        let mut receipt_pid = None;
+        let mut has_receipt = false;
+        let mut receipt_started_at_ms = None;
+        match std::fs::read(main_restart_receipt_path(state_dir)) {
+            Ok(bytes) => {
+                let receipt: MainRestartReceipt = serde_json::from_slice(&bytes)?;
+                anyhow::ensure!(
+                    receipt.matches_scope(debug_port, executable, state_dir, codex_home),
+                    "主实例重启回执范围不匹配，未执行停止"
+                );
+                has_receipt = true;
+                receipt_started_at_ms = Some(receipt.started_at_ms);
+                match inspect_process_instance(receipt.process_id) {
+                    ProcessInstanceState::NotRunning => {}
+                    ProcessInstanceState::Running { birth_id: Some(birth), .. }
+                        if birth.parse::<u64>().ok() != Some(receipt.process_birth_id) =>
+                    {
+                        anyhow::bail!("主实例 PID 已被复用，旧回执不能授权停止新进程");
+                    }
+                    _ => {
+                        let process = crate::multi_worker::VerifiedStopProcess::capture(
+                            receipt.process_id,
+                            &receipt.executable,
+                            Some(receipt.process_birth_id),
+                        )?
+                        .ok_or_else(|| anyhow::anyhow!("主实例回执的进程身份不匹配"))?;
+                        receipt_pid = Some(receipt.process_id);
+                        processes.push(process);
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if has_receipt {
+            // 本管理器回执是唯一目标；不能因正式实例/邻居没有端口参数而阻断，
+            // 也不能把同端口后来出现的新进程追加成结束目标。
+            anyhow::ensure!(
+                crate::windows_integration::loopback_listener_process_ids(debug_port)?
+                    .iter().all(|pid| Some(*pid) == receipt_pid),
+                "主实例调试端口已由其它进程接管，未执行停止"
+            );
+            return Ok(CodexRestartTarget {
+                verified_absence: processes.is_empty(),
+                receipt_started_at_ms,
+                processes,
+            });
+        }
+        let mut ids = codex_instance_processes_for_debug_port(debug_port);
+        // AUMID 的命令行未必包含端口，通过内核 listener owner 定位，仍须验证映像。
+        ids.extend(crate::windows_integration::loopback_listener_process_ids(debug_port)?);
+        ids.sort_unstable();
+        ids.dedup();
+        // 无回执只考虑本端口的候选，不扫描同映像无端口的其它实例。
+        for pid in ids {
+            if receipt_pid == Some(pid) {
+                continue;
+            }
+            let process = crate::multi_worker::VerifiedStopProcess::capture(pid, executable, None)?
+                .ok_or_else(|| anyhow::anyhow!("调试端口对应的进程映像不匹配，未执行停止"))?;
+            let port_matches = crate::windows_integration::process_command_line(pid)
+                .is_some_and(|args| debug_port_from_command_line(&args) == Some(debug_port));
+            anyhow::ensure!(
+                port_matches
+                    || crate::windows_integration::loopback_listener_process_ids(debug_port)?
+                        .contains(&pid),
+                "进程在捕获期间已失去端口归属，未执行停止"
+            );
+            processes.push(process);
+        }
+        Ok(CodexRestartTarget {
+            processes,
+            verified_absence: false,
+            receipt_started_at_ms: None,
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (executable, state_dir, codex_home);
+        let ids = find_macos_codex_processes_for_debug_port(debug_port);
+        let mut processes = Vec::new();
+        for pid in ids {
+            let identity = inspect_process_instance(pid);
+            anyhow::ensure!(
+                matches!(&identity, ProcessInstanceState::Running { birth_id: Some(_), .. }),
+                "无法确认 Codex 创建身份"
+            );
+            processes.push((pid, identity));
+        }
+        Ok(CodexRestartTarget {
+            processes,
+            verified_absence: false,
+            receipt_started_at_ms: None,
+        })
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (debug_port, executable, state_dir, codex_home);
+        anyhow::bail!("当前平台不支持安全重启 Codex")
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1636,14 +1910,7 @@ pub fn stop_codex_processes_for_debug_port_and_wait(debug_port: u16) {
     stop_codex_processes_for_debug_port_with_fallback(debug_port, false);
 }
 
-/// Windows：结束指定调试端口的 Codex，允许在「按端口一个都没匹配到」时退回全局结束。
-///
-/// `allow_global_fallback` 只给**单实例**（主 Codex）用：主实例走 AUMID 激活，
-/// 激活出来的进程命令行未必带 `--remote-debugging-port`，而进程扫描读不到命令行时
-/// 按端口过滤会返回空。若这里坚持只按端口，结果会是「一个都不杀 + 上层判定
-/// 端口仍活着 → 硬失败」，重启 Codex 从此停不下来。
-///
-/// 多开**不要**打开这个开关，否则又会退化成「结束一个实例杀掉全部 Codex」。
+/// 兼容旧入口；allow_global_fallback 不再允许扩大停止范围。
 #[cfg(windows)]
 pub fn stop_codex_processes_for_debug_port_with_fallback(
     debug_port: u16,
@@ -1683,13 +1950,12 @@ mod select_stop_targets_tests {
         );
     }
 
-    // 主实例：Windows 上走 AUMID 激活，命令行未必带调试端口，按端口可能一个都匹配不到；
-    // 这时必须退回全局结束，否则「重启 Codex」会卡在「进程尚未退出」。
+    // 旧调用方即使显式请求回退，也不能扩大目标范围。
     #[test]
-    fn main_instance_stop_falls_back_only_when_nothing_matched() {
+    fn main_instance_stop_never_falls_back_when_nothing_matched() {
         assert_eq!(
             select_stop_targets(vec![], || vec![1, 2, 3], true),
-            vec![1, 2, 3]
+            Vec::<u32>::new()
         );
         assert_eq!(
             select_stop_targets(vec![7], || vec![1, 2, 3], true),
@@ -1700,16 +1966,123 @@ mod select_stop_targets_tests {
     // 退回是惰性的：已匹配到进程时不应该再去枚举全局列表。
     #[test]
     fn fallback_enumeration_is_lazy() {
-        let mut called = false;
-        let _ = select_stop_targets(
-            vec![7],
-            || {
-                called = true;
-                vec![1]
-            },
-            true,
-        );
-        assert!(!called);
+        for matched in [vec![], vec![7]] {
+            let mut called = false;
+            let _ = select_stop_targets(
+                matched,
+                || {
+                    called = true;
+                    vec![1]
+                },
+                true,
+            );
+            assert!(!called);
+        }
+    }
+}
+
+#[cfg(test)]
+mod main_restart_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn restart_receipt_requires_exact_scope_and_nonzero_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let receipt = MainRestartReceipt {
+            version: 1,
+            started_at_ms: 123,
+            debug_port: 19341,
+            process_id: std::process::id().saturating_add(1),
+            process_birth_id: 456,
+            executable: exe.clone(),
+            state_dir: root.clone(),
+            codex_home: root.clone(),
+        };
+        assert!(receipt.matches_scope(19341, &exe, &root, &root));
+        assert!(!receipt.matches_scope(19342, &exe, &root, &root));
+        assert!(!receipt.matches_scope(19341, &exe, &root.join("neighbor"), &root));
+        assert!(!receipt.matches_scope(19341, &exe, &root, &root.join("neighbor")));
+        assert!(!receipt.matches_scope(19341, &root.join("other.exe"), &root, &root));
+        let mut invalid = receipt.clone();
+        invalid.started_at_ms = 0;
+        assert!(!invalid.matches_scope(19341, &exe, &root, &root));
+        invalid = receipt;
+        invalid.process_birth_id = 0;
+        assert!(!invalid.matches_scope(19341, &exe, &root, &root));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn persisted_receipt_stops_main_without_cdp_or_port_arguments() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let executable = PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe")
+            .canonicalize().unwrap();
+        let spawn = || ChildGuard(std::process::Command::new(&executable)
+            .args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 60"])
+            .spawn().unwrap());
+        let mut child = spawn();
+        let mut neighbor = spawn();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        // 独立管理器尚未启动时，正式实例无端口不构成目标或启动阻断。
+        let absent = capture_codex_restart_target_in_scope(port, &executable, &root, &root).unwrap();
+        assert!(absent.is_empty());
+        assert!(!absent.has_verified_identity());
+        absent.stop_and_wait().unwrap();
+        assert!(child.0.try_wait().unwrap().is_none());
+        assert!(neighbor.0.try_wait().unwrap().is_none());
+        let receipt = MainRestartReceipt {
+            version: 1,
+            started_at_ms: 123,
+            debug_port: port,
+            process_id: child.0.id(),
+            process_birth_id: crate::multi_worker::worker_birth_id(&child.0).unwrap(),
+            executable: executable.clone(),
+            state_dir: root.clone(),
+            codex_home: root.clone(),
+        };
+        let write = |receipt: &MainRestartReceipt| {
+            std::fs::write(main_restart_receipt_path(&root),
+                serde_json::to_vec(receipt).unwrap()).unwrap();
+        };
+        for field in 0..3 {
+            let mut invalid = receipt.clone();
+            match field {
+                0 => invalid.process_birth_id += 1,
+                1 => invalid.state_dir = root.join("neighbor"),
+                _ => invalid.executable = root.join("other.exe"),
+            }
+            write(&invalid);
+            assert!(capture_codex_restart_target_in_scope(port, &executable, &root, &root).is_err());
+            assert!(child.0.try_wait().unwrap().is_none());
+            assert!(neighbor.0.try_wait().unwrap().is_none());
+        }
+        write(&receipt);
+        let target = capture_codex_restart_target_in_scope(port, &executable, &root, &root).unwrap();
+        assert!(child.0.try_wait().unwrap().is_none());
+        assert!(target.has_verified_identity());
+        assert!(target.verify_session_generation(Some(124)).is_err());
+        target.verify_session_generation(Some(123)).unwrap();
+        target.stop_and_wait().unwrap();
+        assert!(child.0.try_wait().unwrap().is_some());
+        assert!(neighbor.0.try_wait().unwrap().is_none());
+        // 已有可信回执确认旧进程退出，即使 runtime 尚在也可继续清理并启动。
+        let exited = capture_codex_restart_target_in_scope(port, &executable, &root, &root).unwrap();
+        assert!(exited.is_empty());
+        assert!(exited.has_verified_identity());
+        exited.stop_and_wait().unwrap();
     }
 }
 
