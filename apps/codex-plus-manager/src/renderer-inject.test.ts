@@ -1989,7 +1989,9 @@ describe("renderer injection app-server model request patch", () => {
     let pending: Array<() => void> = [];
     const diagnostics: string[] = [];
     const timers: Array<number> = [];
+    const generation = {};
     const fakeWindow: Record<string, unknown> = {
+      __codexPlusRemoteSessionRecoveryGeneration: generation,
       setTimeout: ((fn: () => void) => {
         timers.push(0);
         pending.push(fn);
@@ -2001,6 +2003,7 @@ describe("renderer injection app-server model request patch", () => {
     const factory = new Function(
       "window",
       "codexAppServerModelRequestPatchVersion",
+      "codexRemoteSessionRecoveryGeneration",
       "codexRemoteSessionProviderPatchEnabled",
       "loadAppServerRequestCandidates",
       "patchAppServerModelRequestClient",
@@ -2012,6 +2015,7 @@ describe("renderer injection app-server model request patch", () => {
     const install = factory(
       fakeWindow,
       1,
+      generation,
       // provider patch 开关两态都要测：以前 enabled 时走提前 return 绕过熔断。
       () => true,
       () =>

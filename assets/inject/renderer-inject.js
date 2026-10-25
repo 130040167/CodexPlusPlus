@@ -11410,7 +11410,8 @@
     if (direct) {
       const bare = typeof model === "string" && /^cpx-[^/]+\/.+/.test(model)
         ? model.slice(model.indexOf("/") + 1) : "";
-      return bare && direct.has(bare) ? bare : "";
+      return bare && model.startsWith(`cpx-${codexRemoteSessionActiveProfile()?.id}/`)
+        && direct.has(bare) ? bare : "";
     }
     const allowed = codexAggregateAllowedModelSet(hostId);
     if (!allowed || typeof model !== "string") return "";
@@ -11570,6 +11571,9 @@
     if (model && allowed.has(model)) return params;
     const bare = typeof model === "string" && /^cpx-[^/]+\/.+/.test(model)
       ? model.slice(model.indexOf("/") + 1) : "";
+    if (direct && bare && !model.startsWith(`cpx-${codexRemoteSessionActiveProfile()?.id}/`)) {
+      throw new Error("所选模型不属于当前供应商，请重新选择模型");
+    }
     const mapped = model && (codexAggregateSelectedModelTarget(model, hostId)
       || (direct && bare && direct.has(bare) ? bare : ""));
     // 明确的旧聚合模型不受当前目录支持时，不把它静默改成默认模型。
@@ -12437,13 +12441,42 @@
     }
   }
 
+  function codexAppServerNativeModelMethod(owner, originalKey, methodKey) {
+    const unwrap = (method) => {
+      const seen = new Set();
+      while (typeof method === "function" && Object.prototype.hasOwnProperty.call(method, "__codexPlusModelNativeOriginal")) {
+        if (seen.has(method)) return null;
+        seen.add(method);
+        method = method.__codexPlusModelNativeOriginal;
+      }
+      // bind 不保留函数自有属性；无法解开时只能寻找原型上独立保存的原生备份。
+      if (typeof method !== "function" || method.name.startsWith("bound ")
+          || /^(codexPlusModelPatchedSendRequest|codexPlusServiceTierPrewarmThreadStart)$/.test(method.name)) return null;
+      return method;
+    };
+    for (let current = owner; current; current = Object.getPrototypeOf(current)) {
+      const original = unwrap(Object.getOwnPropertyDescriptor(current, originalKey)?.value);
+      if (original) return original;
+    }
+    for (let current = owner; current; current = Object.getPrototypeOf(current)) {
+      const native = unwrap(Object.getOwnPropertyDescriptor(current, methodKey)?.value);
+      if (native) return native;
+    }
+    // 不猜测丢失的原始方法；让新 wrapper 在发送前明确失败，避免调用不透明旧 transform。
+    const unavailable = () => { throw new Error("无法确认原生请求入口，请重新打开应用后发送"); };
+    unavailable.__codexPlusModelNativeOriginal = null;
+    return unavailable;
+  }
+
   function patchAppServerModelRequestClient(client) {
+    if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) return false;
     if (!client || typeof client.sendRequest !== "function") return false;
     registerNativeHostClient(client);
     try {
       if (!Object.isExtensible(client)) return false;
       for (const key of [
         "__codexPlusModelRequestPatch",
+        "__codexPlusModelRequestGeneration",
         "__codexPlusModelOriginalSendRequest",
         "__codexPlusThreadModels",
         "__codexPlusServiceTierOriginalPrewarmThreadStart",
@@ -12456,13 +12489,25 @@
     } catch {
       return false;
     }
-    if (client.__codexPlusModelRequestPatch === codexAppServerModelRequestPatchVersion) return true;
-    const nativeSendRequest = (client.__codexPlusModelOriginalSendRequest || client.sendRequest).bind(client);
+    const clients = window.__codexPlusModelRequestClients ||= new Set();
+    clients.add(client);
+    if (clients.size > 256) clients.delete(clients.values().next().value);
+    if (client.__codexPlusModelRequestPatch === codexAppServerModelRequestPatchVersion
+        && client.__codexPlusModelRequestGeneration === codexRemoteSessionRecoveryGeneration) return true;
+    const nativeSendRequest = codexAppServerNativeModelMethod(client, "__codexPlusModelOriginalSendRequest", "sendRequest");
     client.__codexPlusModelOriginalSendRequest = nativeSendRequest;
-    const originalSendRequest = (method, params, options) =>
-      sendCodexRetainedModelRequest(client, nativeSendRequest, method, params, options);
+    const assertCurrent = () => {
+      if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) {
+        throw new Error("连接配置已变化，请重新发送消息");
+      }
+    };
+    const originalSendRequest = (method, params, options) => {
+      assertCurrent();
+      return sendCodexRetainedModelRequest(client, nativeSendRequest.bind(client), method, params, options);
+    };
     client.__codexPlusThreadModels = client.__codexPlusThreadModels || new Map();
     client.sendRequest = async function codexPlusModelPatchedSendRequest(method, params, options) {
+      assertCurrent();
       const managed = codexPlusPluginNativeInterceptClient(method, params, options,
         (nextOptions) => originalSendRequest(method, params, nextOptions), client.hostId);
       if (managed) return await managed;
@@ -12485,6 +12530,7 @@
         providerRefreshFailed = (await loadCodexModelCatalog())?.status === "failed";
       }
       if (!providerRefreshFailed) providerRefreshFailed = !await prepareCodexPureApiModelCatalog(String(method || ""), params, client.hostId);
+      assertCurrent();
       const configuredParams = providerRefreshFailed ? params
         : normalizeCodexConfiguredModelRequest(String(method || ""), params, client.hostId);
       const providerParams = providerRefreshFailed
@@ -12514,18 +12560,23 @@
       if (!codexPlusModelNames().length) await loadCodexModelCatalog();
       return patchAppServerModelResult(requestMethod, result, modelResponseHostId(params, client));
     };
+    client.sendRequest.__codexPlusModelNativeOriginal = nativeSendRequest;
     if (typeof client.prewarmThreadStart === "function") {
-      const originalPrewarmThreadStart = (client.__codexPlusServiceTierOriginalPrewarmThreadStart
-        || client.prewarmThreadStart).bind(client);
+      const originalPrewarmThreadStart = codexAppServerNativeModelMethod(client,
+        "__codexPlusServiceTierOriginalPrewarmThreadStart", "prewarmThreadStart");
       client.__codexPlusServiceTierOriginalPrewarmThreadStart = originalPrewarmThreadStart;
       client.prewarmThreadStart = async function codexPlusServiceTierPrewarmThreadStart(params, options) {
+        assertCurrent();
         return await prewarmCodexManagedSession(client, async (next, nextOptions) => {
           const ready = await prepareCodexPureApiModelCatalog("thread/start", next, client.hostId);
-          return originalPrewarmThreadStart(ready ? normalizeCodexConfiguredModelRequest("thread/start", next, client.hostId) : next, nextOptions);
+          assertCurrent();
+          return originalPrewarmThreadStart.call(client, ready ? normalizeCodexConfiguredModelRequest("thread/start", next, client.hostId) : next, nextOptions);
         }, params, options);
       };
+      client.prewarmThreadStart.__codexPlusModelNativeOriginal = originalPrewarmThreadStart;
     }
     client.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
+    client.__codexPlusModelRequestGeneration = codexRemoteSessionRecoveryGeneration;
     return true;
   }
 
@@ -12650,16 +12701,30 @@
   }
 
     function installCodexAppServerClientPrototypePatch() {
-    if (window.__codexPlusAppServerClientPrototypePatchInstalled === codexAppServerModelRequestPatchVersion) return true;
+    if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) return false;
     const wanted = codexPlusModelUnlockEnabled()
       || codexPluginMarketplacePatchEnabled()
       || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
-      || codexPlusSettings().sessionDelete || codexPlusSettings().sideChatSave;
+      || codexPlusSettings().sessionDelete || codexPlusSettings().sideChatSave
+      || window.__codexPlusAppServerClientPrototypePatchInstalled
+      || window.__codexPlusModelRequestClients?.size
+      || window.__codexPlusNativeHostClients?.size;
     if (!wanted) return false;
     const klass = window.__codexPlusAppServerClientClass;
     if (!klass || typeof klass !== "function" || !klass.prototype) return false;
     const proto = klass.prototype;
-    if (proto.__codexPlusModelRequestPatch === codexAppServerModelRequestPatchVersion) {
+    // 兼容升级前已安装实例补丁、但尚未登记到本补丁注册表的原生客户端。
+    for (const entry of window.__codexPlusNativeHostClients?.values?.() || []) {
+      const client = entry?.ref?.deref?.();
+      if (!entry.getterBound && client?.__codexPlusModelRequestPatch
+          && proto.isPrototypeOf(client)) patchAppServerModelRequestClient(client);
+    }
+    // 实例可能覆盖原型方法；两种入口必须在同一代重新绑定，不能只更新原型。
+    for (const client of window.__codexPlusModelRequestClients || []) {
+      if (klass.prototype.isPrototypeOf(client)) patchAppServerModelRequestClient(client);
+    }
+    if (proto.__codexPlusModelRequestPatch === codexAppServerModelRequestPatchVersion
+        && proto.__codexPlusModelRequestGeneration === codexRemoteSessionRecoveryGeneration) {
       window.__codexPlusAppServerClientPrototypePatchInstalled = codexAppServerModelRequestPatchVersion;
       return true;
     }
@@ -12674,13 +12739,20 @@
       window.__codexPlusAppServerClientPrototypePatchInstalled = codexAppServerModelRequestPatchVersion;
       return false;
     }
-    const nativeSendRequest = proto.__codexPlusModelOriginalSendRequest || proto.sendRequest;
+    const nativeSendRequest = codexAppServerNativeModelMethod(proto, "__codexPlusModelOriginalSendRequest", "sendRequest");
     proto.__codexPlusModelOriginalSendRequest = nativeSendRequest;
+    const assertCurrent = () => {
+      if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) {
+        throw new Error("连接配置已变化，请重新发送消息");
+      }
+    };
     const originalSendRequest = function (method, params, options) {
+      assertCurrent();
       return sendCodexRetainedModelRequest(this, nativeSendRequest.bind(this), method, params, options);
     };
     proto.__codexPlusThreadModels = proto.__codexPlusThreadModels || new Map();
     proto.sendRequest = async function codexPlusModelPatchedSendRequest(method, params, options) {
+      assertCurrent();
       const client = this;
       registerNativeHostClient(client);
       const managed = codexPlusPluginNativeInterceptClient(method, params, options,
@@ -12705,6 +12777,7 @@
         providerRefreshFailed = (await loadCodexModelCatalog())?.status === "failed";
       }
       if (!providerRefreshFailed) providerRefreshFailed = !await prepareCodexPureApiModelCatalog(String(method || ""), params, client.hostId);
+      assertCurrent();
       const configuredParams = providerRefreshFailed ? params
         : normalizeCodexConfiguredModelRequest(String(method || ""), params, client.hostId);
       const providerParams = providerRefreshFailed
@@ -12734,18 +12807,23 @@
       if (!codexPlusModelNames().length) await loadCodexModelCatalog();
       return patchAppServerModelResult(requestMethod, result, modelResponseHostId(params, client));
     };
+    proto.sendRequest.__codexPlusModelNativeOriginal = nativeSendRequest;
     if (typeof proto.prewarmThreadStart === "function") {
-      const originalPrewarmThreadStart = proto.__codexPlusServiceTierOriginalPrewarmThreadStart
-        || proto.prewarmThreadStart;
+      const originalPrewarmThreadStart = codexAppServerNativeModelMethod(proto,
+        "__codexPlusServiceTierOriginalPrewarmThreadStart", "prewarmThreadStart");
       proto.__codexPlusServiceTierOriginalPrewarmThreadStart = originalPrewarmThreadStart;
       proto.prewarmThreadStart = async function codexPlusServiceTierPrewarmThreadStart(params, options) {
+        assertCurrent();
         return await prewarmCodexManagedSession(this, async (next, nextOptions) => {
           const ready = await prepareCodexPureApiModelCatalog("thread/start", next, this.hostId);
+          assertCurrent();
           return originalPrewarmThreadStart.call(this, ready ? normalizeCodexConfiguredModelRequest("thread/start", next, this.hostId) : next, nextOptions);
         }, params, options);
       };
+      proto.prewarmThreadStart.__codexPlusModelNativeOriginal = originalPrewarmThreadStart;
     }
     proto.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
+    proto.__codexPlusModelRequestGeneration = codexRemoteSessionRecoveryGeneration;
     window.__codexPlusAppServerClientPrototypePatchInstalled = codexAppServerModelRequestPatchVersion;
     sendCodexPlusDiagnostic("app_server_client_prototype_patch_installed", {});
     return true;
@@ -12760,6 +12838,7 @@
   let appServerModelRequestPatchRetryDelayMs = 250;
 
   function scheduleAppServerModelRequestPatchRetry() {
+    if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) return;
     if (!codexRemoteSessionProviderPatchEnabled()) return;
     if (appServerModelRequestPatchRetryTimer) return;
     // issue #2256/#2255：固定 250ms 重试在 Codex 改 asset 命名后变成每秒 4 轮的全量
@@ -12804,12 +12883,21 @@
   }
 
   function installAppServerModelRequestPatch() {
-    if (window.__codexPlusAppServerModelRequestPatchInstalled === codexAppServerModelRequestPatchVersion) return;
+    if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) return;
+    for (const entry of window.__codexPlusNativeHostClients?.values?.() || []) {
+      const client = entry?.ref?.deref?.();
+      if (!entry.getterBound && client?.__codexPlusModelRequestPatch) patchAppServerModelRequestClient(client);
+    }
+    // 已发现的实例无需重新扫描模块；即使新一代关闭所有功能，也要撤下旧规则。
+    for (const client of window.__codexPlusModelRequestClients || []) patchAppServerModelRequestClient(client);
+    if (window.__codexPlusAppServerModelRequestPatchInstalled === codexAppServerModelRequestPatchVersion
+        && window.__codexPlusAppServerModelRequestPatchGeneration === codexRemoteSessionRecoveryGeneration) return;
     if (appServerModelRequestPatchDisabled) return;
     if (appServerModelRequestPatchPromise) return;
     const patch = async () => {
       try {
         const { modules, candidates, sources, discovery } = await loadAppServerRequestCandidates();
+        if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) return;
         if (modules.length === 0) {
           noteAppServerModelRequestPatchMiss("model_app_server_request_patch_skipped", {
             reason: "app_server_request_assets_missing",
@@ -12826,6 +12914,7 @@
           appServerModelRequestPatchMissCount = 0;
           appServerModelRequestPatchRetryDelayMs = 250;
           window.__codexPlusAppServerModelRequestPatchInstalled = codexAppServerModelRequestPatchVersion;
+          window.__codexPlusAppServerModelRequestPatchGeneration = codexRemoteSessionRecoveryGeneration;
           sendCodexPlusDiagnostic("model_app_server_request_patch_installed", {
             moduleCount: modules.length,
             candidateCount: candidates.length,
@@ -12842,6 +12931,7 @@
           });
         }
       } catch (error) {
+        if (window.__codexPlusRemoteSessionRecoveryGeneration !== codexRemoteSessionRecoveryGeneration) return;
         noteAppServerModelRequestPatchMiss("model_app_server_request_patch_failed", {
           errorName: error?.name || "",
           errorMessage: error?.message || String(error),
@@ -12891,7 +12981,10 @@
     if (codexPlusModelUnlockEnabled()
         || codexPluginMarketplacePatchEnabled()
         || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
-          || codexPlusSettings().sessionDelete || codexPlusSettings().sideChatSave) {
+          || codexPlusSettings().sessionDelete || codexPlusSettings().sideChatSave
+          || window.__codexPlusAppServerClientPrototypePatchInstalled
+          || window.__codexPlusModelRequestClients?.size
+          || window.__codexPlusNativeHostClients?.size) {
       installAppServerModelRequestPatch();
       void installCodexAppServerClientCapture().catch(() => {});
     }

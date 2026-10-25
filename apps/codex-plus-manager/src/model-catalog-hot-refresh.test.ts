@@ -561,19 +561,20 @@ for (const unlock of [false, true]) {
   it(`aggregate to direct normalizes only supported identities (unlock=${unlock})`, async () => {
     const { runtime, catalog, local, nodes } = await aggregateQueryRuntime();
     runtime.catalog(catalog("a"));
-    runtime.profile({ id: "direct", relayMode: "pureApi" });
+    runtime.profile({ id: "a", relayMode: "pureApi" });
     runtime.unlock(unlock);
     const original = { model: "cpx-a/model-0", effort: "high",
       collaborationMode: { settings: { model: "cpx-a/model-0", reasoning_effort: "high" } } };
     assert.equal(runtime.normalize("thread/start", original, "local"), original, "old catalog cannot authorize migration");
     runtime.catalog({ ...catalog("a"), model: "model-1", models: ["model-0", "model-1"],
-      sources: [{ id: "relay-profile:direct", type: "relay_profile" }] });
+      sources: [{ id: "relay-profile:a", type: "relay_profile" }] });
     for (const method of ["thread/start", "thread/resume", "turn/start"]) {
       const next = runtime.normalize(method, original, "local");
       assert.equal(next.model, "model-0");
       assert.equal(next.collaborationMode.settings.model, "model-0");
       assert.equal(next.effort, "high");
       assert.equal(original.model, "cpx-a/model-0");
+      assert.throws(() => runtime.normalize(method, { model: "cpx-b/model-0" }, "local"), /不属于当前供应商/);
       const unsupported = { model: "cpx-a/unsupported" };
       assert.equal(runtime.normalize(method, unsupported, "local"), unsupported);
       assert.equal(runtime.normalize(method, original, "ssh:test"), original);
@@ -674,8 +675,10 @@ for (const mode of ["instance", "prototype"]) {
     const client = new Client();
     let gate = deferred<boolean>();
     let ready = false;
+    const generation = {};
     const context = vm.createContext({
-      window: { __codexPlusAppServerClientClass: Client }, client,
+      window: { __codexPlusAppServerClientClass: Client, __codexPlusRemoteSessionRecoveryGeneration: generation }, client,
+      codexRemoteSessionRecoveryGeneration: generation,
       codexAppServerModelRequestPatchVersion: "test",
       codexPlusBackendSettingsLoaded: true,
       codexPlusModelUnlockEnabled: () => false,
@@ -701,9 +704,11 @@ for (const mode of ["instance", "prototype"]) {
       noteCodexManagedSessionStart() {}, codexThreadModelRequestState: () => ({}),
       prewarmCodexManagedSession: (_client: any, prewarm: any, params: any, options: any) => prewarm(params, options),
     });
+    const nativeMethod = source.slice(source.indexOf("  function codexAppServerNativeModelMethod("),
+      source.indexOf("  function patchAppServerModelRequestClient("));
     const sideChatBridge = source.match(/^  function sendAppServerRequestWithSideChat\([^]*?^  \}/m)?.[0];
     assert.ok(sideChatBridge);
-    vm.runInContext(`${sideChatBridge}\n${source.slice(start, end)}\n${mode === "instance" ? "patchAppServerModelRequestClient(client)" : "installCodexAppServerClientPrototypePatch()"}`, context);
+    vm.runInContext(`${sideChatBridge}\n${nativeMethod}${source.slice(start, end)}\n${mode === "instance" ? "patchAppServerModelRequestClient(client)" : "installCodexAppServerClientPrototypePatch()"}`, context);
     const original = { model: "cpx-old/sol" };
     const request = client.sendRequest("thread/start", original);
     await Promise.resolve(); assert.equal(sent.length, 0);
