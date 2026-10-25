@@ -49,12 +49,15 @@ type CuCheck = {
 type CuResult = { status: string; message: string };
 type CuTab = "overview" | "preview" | "diagnose";
 type CuApprovalMode = "auto" | "claude";
+/** 操作方式：离散工具（直通原生 CU），或 cua_repl 的 js（和 Codex 当前主要路径一致）。 */
+type CuMode = "tools" | "js";
 type CuApprovedApp = { decision: string; mode?: string; displayName?: string; decidedAt?: number };
 type CuLastClient = { name?: string; version?: string; elicitation?: boolean; at?: number };
 type CuApprovalState = {
   status?: string;
   message?: string;
   mode?: CuApprovalMode;
+  cuMode?: CuMode;
   approvals?: Array<[string, CuApprovedApp]>;
   lastClient?: CuLastClient | null;
   turnHooks?: { installed?: boolean; events?: string[]; settings?: string } | null;
@@ -164,6 +167,30 @@ export function ComputerUsePage() {
         await loadApproval();
       } else {
         setActionError(result.message || t("保存审批策略失败。"));
+      }
+    } catch (reason) {
+      if (mounted.current) setActionError(errorText(reason));
+    } finally {
+      if (mounted.current) {
+        lock.current = false;
+        setBusy("");
+      }
+    }
+  };
+
+  const changeCuMode = async (mode: CuMode) => {
+    if (lock.current || approval?.cuMode === mode) return;
+    lock.current = true;
+    setBusy("cuMode");
+    setActionError("");
+    try {
+      const result = await invoke<CuResult>("computer_use_mode_set", { mode });
+      if (!mounted.current) return;
+      if (result.status === "ok") {
+        setNotice(result.message || t("操作方式已保存；对新开的客户端会话生效。"));
+        await loadApproval();
+      } else {
+        setActionError(result.message || t("保存操作方式失败。"));
       }
     } catch (reason) {
       if (mounted.current) setActionError(errorText(reason));
@@ -462,6 +489,7 @@ export function ComputerUsePage() {
     { id: "diagnose", label: t("诊断") },
   ];
   const approvalMode: CuApprovalMode = approval?.mode ?? "auto";
+  const cuMode: CuMode = approval?.cuMode ?? "tools";
 
   /** 图里的一个客户端：状态点 + 名称 + 一键接入/移除。路径等细节放在悬停提示与下方折叠区。 */
   const flowClient = (id: string, label: string, target: CuTarget | undefined, custom?: CuCustomTarget) => {
@@ -544,6 +572,16 @@ export function ComputerUsePage() {
         <div className="cu-flow-lane-a" style={{ gridColumn: 3 }}>
           {flowNode(<MousePointerClick size={16} />, "codex-plus-cu", t("桌面操控"), "cu",
             <div className="cu-flow-approval">
+              <span>{t("操作方式")}</span>
+              <div className="mg-segmented" role="radiogroup" aria-label={t("操作方式")}>
+                <button type="button" role="radio" aria-checked={cuMode === "tools"} data-active={cuMode === "tools"} disabled={locked}
+                  title={t("原生 Computer Use 的 10 个离散工具：get_app_state、click、type_text 等。")} onClick={() => void changeCuMode("tools")}>{t("离散工具")}</button>
+                <button type="button" role="radio" aria-checked={cuMode === "js"} data-active={cuMode === "js"} disabled={locked}
+                  title={t("和 Codex 一样，用 cua_repl 的 js 工具操作；首次使用会自动下发完整说明与确认规则，支持 paste 输入中文。")} onClick={() => void changeCuMode("js")}>{t("JS（同 Codex）")}</button>
+              </div>
+              {cuMode === "js"
+                ? <small className="cu-flow-warn">{t("模型可执行任意 JavaScript（能读写文件、联网）；对新开的客户端会话生效")}</small>
+                : null}
               <span>{t("首次接管某个应用时")}</span>
               <div className="mg-segmented" role="radiogroup" aria-label={t("审批策略")}>
                 <button type="button" role="radio" aria-checked={approvalMode === "auto"} data-active={approvalMode === "auto"} disabled={locked}

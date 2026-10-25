@@ -265,6 +265,7 @@ pub fn run() {
             computer_use_commands::computer_use_uninstall,
             computer_use_commands::computer_use_custom_add,
             computer_use_commands::computer_use_custom_rename,
+            computer_use_commands::computer_use_mode_set,
             computer_use_commands::computer_use_custom_remove,
             computer_use_commands::computer_use_check,
             computer_use_commands::computer_use_open_app,

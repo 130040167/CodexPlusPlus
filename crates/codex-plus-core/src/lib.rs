@@ -19,6 +19,7 @@ pub mod browser_use;
 pub mod computer_use;
 pub mod window_capture;
 pub mod computer_use_approval;
+pub mod computer_use_js;
 pub mod computer_use_proxy;
 pub mod disclaimed_spawn;
 pub mod connect;

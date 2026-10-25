@@ -318,6 +318,8 @@ pub async fn computer_use_approval_get() -> CommandResult<Value> {
         "已读取审批策略。",
         json!({
             "mode": mode.id(),
+            // 操作方式：tools（离散工具）/ js（cua_repl）。
+            "cuMode": codex_plus_core::computer_use_proxy::CuMode::current().id(),
             "approvals": codex_plus_core::computer_use_approval::ApprovalStore::read_all(),
             "lastClient": codex_plus_core::computer_use_approval::last_client(),
             // 浏览器标签的清理靠 Claude Code 的 Stop 钩子；装上没有要在页面上说清楚。
@@ -348,6 +350,27 @@ pub async fn computer_use_approval_set(mode: String) -> CommandResult<Value> {
     .await
     {
         Ok(()) => ok("审批策略已保存；对下一个 Claude 会话生效。", json!({})),
+        Err(error) => failed(&error, json!({})),
+    }
+}
+
+/// 切换操作方式：`tools`（离散工具）或 `js`（cua_repl，和 Codex 一致）。
+/// 写进 `settings.json` 的 `computerUseMode`，只改这一个键；MCP 进程启动时读取。
+#[tauri::command]
+pub async fn computer_use_mode_set(mode: String) -> CommandResult<Value> {
+    if !matches!(mode.as_str(), "tools" | "js") {
+        return failed("操作方式只能是 tools 或 js", json!({}));
+    }
+    match run_blocking(move || -> anyhow::Result<()> {
+        let store = codex_plus_core::settings::SettingsStore::default();
+        let mut settings = store.load()?;
+        settings.computer_use_mode = mode;
+        store.save(&settings)?;
+        Ok(())
+    })
+    .await
+    {
+        Ok(()) => ok("操作方式已保存；对新开的客户端会话生效。", json!({})),
         Err(error) => failed(&error, json!({})),
     }
 }

@@ -767,6 +767,13 @@ pub struct BackendSettings {
         default = "default_computer_use_approval"
     )]
     pub computer_use_approval: String,
+    /// Computer Use 给客户端的操作方式：
+    /// - `tools`：原生 CU 的 10 个离散工具（直通 `SkyComputerUseClient mcp`）；
+    /// - `js`：`cua_repl` 的 `js` 工具，和 Codex 当前主要的 CU 路径一致。
+    ///
+    /// MCP 进程启动时读取，对之后新开的客户端会话生效。
+    #[serde(rename = "computerUseMode", default = "default_computer_use_mode")]
+    pub computer_use_mode: String,
     #[serde(rename = "codexAppPasteFix", default)]
     pub codex_app_paste_fix: bool,
     // 默认关闭：撤下的那版会主动从 settings.json 删掉这个键，老用户升级后读不到，
@@ -1064,6 +1071,7 @@ impl Default for BackendSettings {
             claude_app_localization: true,
             claude_app_computer_use: false,
             computer_use_approval: default_computer_use_approval(),
+            computer_use_mode: default_computer_use_mode(),
             codex_app_paste_fix: false,
             codex_app_force_chinese_locale: false,
             codex_app_typing_effect: default_typing_effect(),
@@ -1548,6 +1556,11 @@ pub fn default_auto_takeover_when_active() -> String {
 /// Computer Use 审批默认放行：与既有行为一致，升级不改变已有用户的使用方式。
 pub fn default_computer_use_approval() -> String {
     "auto".to_string()
+}
+
+/// Computer Use 默认用离散工具：与既有行为一致，JS 方式需要用户主动选择。
+pub fn default_computer_use_mode() -> String {
+    "tools".to_string()
 }
 
 fn default_whale_balance_protocol() -> String {

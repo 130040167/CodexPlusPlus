@@ -33,6 +33,7 @@ use serde_json::{Value, json};
 
 use crate::computer_use::{RuntimeLocation, locate_runtime};
 use crate::computer_use_approval::{ApprovalMode, ApprovalStore, Outcome, subject_of};
+use crate::computer_use_js::{ChildFrame, ClientFrame, JsBridge};
 
 /// 审批转给客户端后等多久。超过就回 `cancel`，不让会话永久挂住。
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -54,6 +55,43 @@ enum Event {
     ChildOversized(Oversized),
     ClientClosed,
     ChildClosed,
+    /// Claude Code 的 Stop 钩子：一个回合结束了（只在 JS 档使用）。
+    TurnEnd,
+}
+
+/// 给客户端的操作方式，见 `settings.computer_use_mode`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CuMode {
+    /// 原生 CU 的 10 个离散工具（直通 `SkyComputerUseClient mcp`）。
+    Tools,
+    /// `cua_repl` 的 `js` 工具，和 Codex 当前主要的 CU 路径一致。
+    Js,
+}
+
+impl CuMode {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "js" => Self::Js,
+            // 未知取值按默认处理：settings.json 里可能有旧版本或手写的值。
+            _ => Self::Tools,
+        }
+    }
+
+    /// 从设置文件现读。读失败按默认处理。
+    pub fn current() -> Self {
+        let value = crate::settings::SettingsStore::default()
+            .load()
+            .map(|settings| settings.computer_use_mode)
+            .unwrap_or_default();
+        Self::parse(&value)
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Tools => "tools",
+            Self::Js => "js",
+        }
+    }
 }
 
 /// 一条被丢弃的超长帧：只留下回错误所需的信息。
@@ -144,14 +182,23 @@ enum Frame {
 pub fn serve() -> anyhow::Result<()> {
     let runtime =
         locate_runtime()?.context("未找到 Codex 运行时（ChatGPT.app），Computer Use 不可用")?;
-    let shim = crate::computer_use::ensure_shim()?;
-    let mut child = spawn_child(&runtime, &shim)?;
+    let cu_mode = CuMode::current();
+    let mut child = match cu_mode {
+        CuMode::Tools => spawn_child(&runtime, &crate::computer_use::ensure_shim()?)?,
+        CuMode::Js => spawn_js_child(&runtime)?,
+    };
     let child_stdin = child.stdin.take().context("CU 子进程的标准输入不可用")?;
     let child_stdout = child.stdout.take().context("CU 子进程的标准输出不可用")?;
 
     let (sender, receiver) = mpsc::channel::<Event>();
     spawn_client_reader(sender.clone());
     spawn_child_reader(child_stdout, sender.clone());
+    if cu_mode == CuMode::Js {
+        let turn_sender = sender.clone();
+        crate::claude_hooks::spawn_turn_watcher(move || {
+            let _ = turn_sender.send(Event::TurnEnd);
+        });
+    }
     drop(sender);
 
     let mut forwarder = Forwarder {
@@ -162,6 +209,8 @@ pub fn serve() -> anyhow::Result<()> {
         pending: HashMap::new(),
         session_allowed: BTreeSet::new(),
         next_token: 0,
+        js: (cu_mode == CuMode::Js)
+            .then(|| JsBridge::new(uuid::Uuid::new_v4().to_string())),
     };
     let outcome = forwarder.run(receiver);
     child.kill();
@@ -187,6 +236,24 @@ fn spawn_child(
     crate::disclaimed_spawn::spawn_clean(
         std::path::Path::new(&runtime.node),
         &[OsStr::new(shim)],
+        &envs,
+    )
+}
+
+/// JS 档：拉起 `cua_repl`（OpenAI 签名的 node 直接执行，和 Codex 的插件配置一致）。
+///
+/// 和直通档一样放弃责任归属、不继承调用方环境；环境见 `RuntimeLocation::js_env`。
+fn spawn_js_child(
+    runtime: &RuntimeLocation,
+) -> anyhow::Result<crate::disclaimed_spawn::DisclaimedChild> {
+    anyhow::ensure!(
+        std::path::Path::new(&runtime.cua_repl).is_file(),
+        "当前 ChatGPT.app 没有 cua-repl，JS 操作方式不可用；请在 Computer Use 页改回「离散工具」"
+    );
+    let envs: Vec<(String, String)> = runtime.js_env().into_iter().collect();
+    crate::disclaimed_spawn::spawn_clean(
+        std::path::Path::new(&runtime.node),
+        &[OsStr::new(&runtime.cua_repl)],
         &envs,
     )
 }
@@ -270,6 +337,8 @@ struct Forwarder {
     /// 本进程内已放行的 app（`session` 语义，不落盘）。
     session_allowed: BTreeSet<String>,
     next_token: u64,
+    /// JS 档的回合与工具面状态；直通档为 `None`，帧原样转发。
+    js: Option<JsBridge>,
 }
 
 impl Forwarder {
@@ -293,6 +362,13 @@ impl Forwarder {
                 Ok(Event::ChildClosed) => {
                     self.cancel_all("CU 子进程已退出");
                     return Ok(());
+                }
+                Ok(Event::TurnEnd) => {
+                    if let Some(call) = self.js.as_mut().and_then(JsBridge::end_turn) {
+                        let mut line = serde_json::to_vec(&call)?;
+                        line.push(b'\n');
+                        self.write_child(&line)?;
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -337,6 +413,16 @@ impl Forwarder {
             && let Some(pending) = self.pending.remove(token)
         {
             return self.relay_approval(&pending, &message);
+        }
+        // JS 档：`tools/call` 要带回合信息，`tools/list` 的响应要过滤。
+        if let Some(js) = self.js.as_mut()
+            && mentions(&frame, b"\"tools/")
+            && let Ok(message) = serde_json::from_slice::<Value>(&frame)
+            && let ClientFrame::Rewritten(message) = js.on_client(message)
+        {
+            let mut line = serde_json::to_vec(&message)?;
+            line.push(b'\n');
+            return self.write_child(&line);
         }
         self.write_child(&frame)
     }
@@ -409,6 +495,20 @@ impl Forwarder {
                 if message.get("method").and_then(Value::as_str) == Some("elicitation/create") {
                     return self.on_elicitation(message);
                 }
+            }
+        }
+        if let Some(js) = self.js.as_mut()
+            && js.wants_child_frames()
+            && let Ok(message) = serde_json::from_slice::<Value>(&frame)
+        {
+            match js.on_child(message) {
+                ChildFrame::Drop => return Ok(()),
+                ChildFrame::Rewritten(message) => {
+                    let mut line = serde_json::to_vec(&message)?;
+                    line.push(b'\n');
+                    return write_client(&line);
+                }
+                ChildFrame::Forward => {}
             }
         }
         write_client(&frame)

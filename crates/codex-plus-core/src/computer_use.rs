@@ -312,6 +312,17 @@ impl RuntimeLocation {
         env
     }
 
+    /// JS 档 `cua_repl` 的完整环境：直通档的白名单（含 `CODEX_CLI_PATH`）加上
+    /// `cua_repl` / `node_repl` 需要的那几项，同样不继承调用方的环境。
+    ///
+    /// 只开 `computer` 面：浏览器由独立的 `codex-plus-browser` 负责，两边都开会抢同一批标签。
+    pub(crate) fn js_env(&self) -> BTreeMap<String, String> {
+        let mut env = self.native_client_env();
+        env.extend(self.env());
+        env.insert("CUA_REPL_ENABLED_SURFACES".into(), "computer".into());
+        env
+    }
+
     fn self_command(&self) -> String {
         std::env::current_exe()
             .map(|path| path.to_string_lossy().into_owned())
@@ -1483,6 +1494,8 @@ fn run_probe(_runtime: &RuntimeLocation) -> HealthReport {
     let deadline = Instant::now() + PROBE_TIMEOUT;
     let mut handshake_done = false;
     let mut request_sent = false;
+    // JS 档（`computerUseMode = js`）的工具面是 `cua_repl` 的 `js`，按工具面自动判断。
+    let mut js_mode = false;
     let mut failure: Option<HealthReport> = None;
 
     if let Err(error) = send_json(
@@ -1553,22 +1566,29 @@ fn run_probe(_runtime: &RuntimeLocation) -> HealthReport {
             continue;
         }
         if id == 2 {
-            let text = tool_names(&message).join(", ");
-            if !text.contains("get_app_state") || !text.contains("click") {
+            let names = tool_names(&message);
+            let text = names.join(", ");
+            js_mode = names.iter().any(|name| name == "js");
+            let tools_ok = if js_mode {
+                true
+            } else {
+                text.contains("get_app_state") && text.contains("click")
+            };
+            if !tools_ok {
                 failure = Some(probe_failure(
                     "service_unavailable",
                     &format!("Computer Use 工具面不符（拿到：{text}）"),
                 ));
                 continue;
             }
+            let call = if js_mode {
+                json!({ "name": "js", "arguments": { "code": crate::computer_use_js::PROBE_CODE } })
+            } else {
+                json!({ "name": "list_apps", "arguments": {} })
+            };
             let _ = send_json(
                 &mut stdin,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": 3,
-                    "method": "tools/call",
-                    "params": { "name": "list_apps", "arguments": {} }
-                }),
+                &json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": call }),
             );
             request_sent = true;
             continue;
@@ -1591,8 +1611,14 @@ fn run_probe(_runtime: &RuntimeLocation) -> HealthReport {
                 .and_then(|result| result.get("isError"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            if !is_error && !text.trim().is_empty() {
-                let (count, samples) = summarize_apps(&text);
+            // JS 档的首次输出还附带 cua_repl 的使用说明，应用列表在标记之间。
+            let apps = if js_mode {
+                crate::computer_use_js::probe_apps(&text).map(str::to_string)
+            } else {
+                Some(text.clone())
+            };
+            if !is_error && let Some(apps) = apps.filter(|apps| !apps.trim().is_empty()) {
+                let (count, samples) = summarize_apps(&apps);
                 kill_tree(&mut child);
                 return HealthReport {
                     ok: true,
