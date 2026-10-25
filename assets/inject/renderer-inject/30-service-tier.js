@@ -224,8 +224,9 @@
         && codexRemoteSessionActiveProfile()?.relayMode === "aggregate") {
       await loadBackendSettingsState(codexAppServerPreparationTimeoutMs);
     }
+    const configuredParams = normalizeCodexConfiguredModelRequest("thread/start", params, client.hostId);
     const nextParams = applyCodexManagedSessionConnection("thread/start",
-      params, client.hostId);
+      configuredParams, client.hostId);
     const result = await prewarm(nextParams, options);
     noteCodexManagedSessionStart("thread/start", nextParams, result, client.hostId);
     return result;
@@ -882,6 +883,9 @@
         codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
         nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
       });
+      if (typeof observeCodexModelCatalogRevision === "function") {
+        observeCodexModelCatalogRevision(settings.modelCatalogRevision);
+      }
     } catch (_) {
       return false;
     }

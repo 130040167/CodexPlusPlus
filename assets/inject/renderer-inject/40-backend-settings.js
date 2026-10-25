@@ -64,6 +64,11 @@
           codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
           nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
         });
+        if (typeof observeCodexModelCatalogRevision === "function") {
+          observeCodexModelCatalogRevision(settings?.modelCatalogRevision);
+        }
+        // 保存与心跳读取可能并发：成功响应已经成为新基线，必须让此前发出的旧 GET 失效。
+        codexPlusBackendSettingsSeq += 1;
         globalThis.__CODEX_PLUS_ACTIVITY_OVERLAY_SYNC__?.();
       }
     } finally {
