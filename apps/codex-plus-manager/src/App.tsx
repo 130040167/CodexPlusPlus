@@ -12470,6 +12470,17 @@ function AggregateRelayProfileEditor({
       routes: [...routes, { pattern: "", profileId: aggregate.members[0]?.profileId ?? "", priority: 0 }],
     });
   };
+  // 模型聚合的最终效果：默认成员的模型以裸名发布，其余成员带 cpx- 前缀。勾选时就告诉用户 Codex 会看到什么。
+  const memberModelCount = (candidate: RelayProfile) => new Set([
+    ...candidate.modelList.split(/[\r\n,]+/).map((line) => line.trim()).filter(Boolean),
+    ...(candidate.model.trim() ? [candidate.model.trim()] : []),
+  ]).size;
+  const selectedCandidates = candidates.filter((candidate) => memberIds.has(candidate.id));
+  const defaultCandidate = selectedCandidates.find((candidate) => candidate.id === aggregate.defaultRelayId);
+  const bareModelCount = defaultCandidate ? memberModelCount(defaultCandidate) : 0;
+  const prefixedModelCount = selectedCandidates
+    .filter((candidate) => candidate.id !== defaultCandidate?.id)
+    .reduce((sum, candidate) => sum + memberModelCount(candidate), 0);
 
   return (
     <div className="relay-profile-editor aggregate-editor" data-aggregate-mode={modelMode ? "model" : "provider"}>
@@ -12528,16 +12539,24 @@ function AggregateRelayProfileEditor({
           ))}
         </div>
       ) : (
-        <div className="aggregate-model-mode-hint">
-          <strong>{t("模型聚合已启用")}</strong>
-          <span>{t("默认成员的模型以裸名发布、其他成员带 cpx- 前缀；勾选成员后点行尾「设为默认」指定默认供应商。本模式不使用轮转策略或通配符路由。")}</span>
-        </div>
+        null
       )}
       <div className="aggregate-members">
         <div className="aggregate-members-head">
           <div>
             <strong>{t("成员供应商")}</strong>
-            <span>{t("可勾选 API 供应商或已完成 ChatGPT 登录的官方账号；聚合供应商不会作为成员。")}</span>
+            <span>
+              {modelMode
+                ? t("默认成员的模型以裸名发布，其他成员带 cpx- 前缀；悬停已勾选的成员可「设为默认」。本模式不使用轮转策略或通配符路由。")
+                : t("可勾选 API 供应商或已完成 ChatGPT 登录的官方账号；聚合供应商不会作为成员。")}
+            </span>
+            {modelMode && selectedCandidates.length ? (
+              <span className="aggregate-model-summary">
+                {defaultCandidate
+                  ? tf("Codex 将看到 {0} 个裸名模型（来自 {1}）+ {2} 个 cpx- 前缀模型", [bareModelCount, defaultCandidate.name || t("未命名供应商"), prefixedModelCount])
+                  : tf("Codex 将看到 {0} 个 cpx- 前缀模型；还没指定默认成员，不带前缀的请求会报错", [prefixedModelCount])}
+              </span>
+            ) : null}
           </div>
           <UiBadge variant="outline">{aggregate.members.length} / {candidates.length}</UiBadge>
         </div>
