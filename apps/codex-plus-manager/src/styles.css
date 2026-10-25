@@ -9203,11 +9203,9 @@ select {
   }
 }
 
-/* 增强页共用总开关与保存入口，服务配置通过页内标签切换。 */
+/* 增强页共用总开关与保存入口，服务配置通过页内标签切换。
+   不吸顶：吸顶时它盖在列表上，滚动中能看到被压住的半截文字。 */
 .enhance-page-controls {
-  position: sticky;
-  top: 0;
-  z-index: 5;
   border: 1px solid hsl(var(--border));
   border-radius: var(--radius-xl);
   background: hsl(var(--card));
@@ -9343,14 +9341,13 @@ select {
   font-size: 13px;
 }
 
-.enhance-feature-groups .feature-switch-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px 18px;
-  margin: 0;
-}
-
+/* 单列设置行（与代理设置 / Codex 设置的 .setting-row 一致）：左边标题 + 说明，右边开关。
+   原来是双列 / 三列卡片，说明长的一张会把整行撑高，左右高度参差不齐。 */
+.enhance-feature-groups .feature-switch-grid,
 .enhance-feature-groups .feature-group:first-child .feature-switch-grid {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+  margin: 0;
 }
 
 /* 可展开的配置块（如「API 余额（可选）」）独占一整行：展开只往下长，
@@ -9359,7 +9356,6 @@ select {
   grid-column: 1 / -1;
 }
 
-.enhance-feature-groups .feature-toggle,
 .enhance-service-panel .feature-toggle {
   border: 0;
   border-radius: 6px;
@@ -9369,16 +9365,36 @@ select {
   box-shadow: none;
 }
 
+.enhance-feature-groups .feature-toggle {
+  gap: 24px;
+  border: 0;
+  border-bottom: 1px solid hsl(var(--border) / 0.55);
+  border-radius: 0;
+  background: transparent;
+  padding: 12px 6px;
+  box-shadow: none;
+}
+
+.enhance-feature-groups .feature-switch-grid > .feature-toggle:last-child {
+  border-bottom: 0;
+}
+
+/* 说明铺满一行会太长难读，限宽后长说明一般两行内放下。 */
+.enhance-feature-groups .feature-toggle small {
+  max-width: 860px;
+  line-height: 1.55;
+}
+
 .enhance-page .feature-toggle strong {
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .enhance-page .feature-toggle small {
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .enhance-page .feature-toggle:hover {
-  background: hsl(var(--accent) / 0.65);
+  background: hsl(var(--accent) / 0.4);
 }
 
 .enhance-feature-groups .feature-action-row {
@@ -9491,14 +9507,10 @@ select {
 
 .enhance-page #enhance-dictation,
 .enhance-page #enhance-stepwise {
-  scroll-margin-top: 120px;
+  scroll-margin-top: 16px;
 }
 
 @media (max-width: 1080px) {
-  .enhance-feature-groups .feature-group:first-child .feature-switch-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
   .enhance-service-toggles {
     grid-template-columns: 1fr;
     gap: 6px;
