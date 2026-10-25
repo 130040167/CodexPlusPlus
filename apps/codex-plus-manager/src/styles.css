@@ -11733,3 +11733,44 @@ select {
 @container (max-width: 620px) {
   .claude-l10n-progress-steps { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* ── Grok 配置：当前配置在上，左列表右编辑 ─────────────────────── */
+.grok-page-layout { display: grid; gap: 14px; }
+.grok-panel .panel-head.grok-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.grok-panel .panel-head.grok-head > div:first-child { display: grid; gap: 3px; min-width: 0; }
+.grok-panel .panel-head.grok-head p { max-width: none; text-align: left; }
+.grok-editor-actions { display: flex; flex-shrink: 0; gap: 8px; }
+
+.grok-workspace {
+  display: grid;
+  grid-template-columns: minmax(240px, 0.85fr) minmax(0, 1.6fr);
+  gap: 14px;
+  align-items: start;
+}
+.grok-list-panel .grok-provider-list { gap: 6px; }
+/* 列表列变窄：名称一行、地址一行，模型数和删除放右侧。 */
+.grok-list-panel .grok-provider-url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.grok-editor-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.grok-live-panel .grok-live-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+@media (max-width: 960px) {
+  .grok-workspace { grid-template-columns: minmax(0, 1fr); }
+  .grok-live-panel .grok-live-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 640px) {
+  .grok-editor-pair { grid-template-columns: minmax(0, 1fr); }
+}
+/* 压过旧的 .grok-panel .panel-head（纵向排列）：标题在左、操作在右。 */
+.grok-page-layout .grok-panel > .panel-head.grok-head {
+  flex-direction: row;
+  align-items: center;
+  text-align: left;
+}
+.grok-page-layout .grok-panel > .panel-head.grok-head > div:first-child { justify-items: start; }

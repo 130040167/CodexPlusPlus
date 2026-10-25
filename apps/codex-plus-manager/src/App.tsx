@@ -14086,47 +14086,61 @@ function GrokScreen({
   const live = result?.live;
 
   return (
-    <>
-      <Panel className="grok-panel">
-        <CardHead
-          title={t("Grok 供应商")}
-          detail={t("每个供应商对应一套 Base URL + API Key + 模型列表。")}
-        />
-        <CardContent>
-          <div className="toolbar">
-            <Button disabled={loading} onClick={() => void refresh()} variant="outline">
-              <RefreshCw className="h-4 w-4" />
-              {loading ? t("刷新中") : t("刷新")}
-            </Button>
-            <Button onClick={() => void addProfile()} variant="outline">
-              <Plus className="h-4 w-4" />
-              {t("新增供应商")}
-            </Button>
-            <Button
-              disabled={saving || !draftDirty}
-              onClick={() => void saveDraft()}
-              title={draftDirty ? undefined : t("没有需要保存的修改")}
-              variant="outline"
-            >
-              <Save className="h-4 w-4" />
-              {saving ? t("保存中") : t("保存此供应商")}
-            </Button>
-            <Button
-              disabled={!activeProfile || applying || draftDirty}
-              onClick={() => setConfirming(true)}
-              title={
-                !activeProfile
-                  ? t("请先选择一个供应商")
-                  : draftDirty
-                    ? t("请先保存当前修改")
-                    : undefined
-              }
-            >
-              <Play className="h-4 w-4" />
-              {applying ? t("应用中") : t("应用到 Grok")}
-            </Button>
+    <div className="grok-page-layout">
+      {/* 最重要的是 Grok 实际生效的配置：放最上面，刷新跟它放在一起。 */}
+      <Panel className="grok-panel grok-live-panel">
+        <CardHeader className="panel-head grok-head">
+          <div>
+            <CardTitle>{t("Grok 当前配置")}</CardTitle>
+            <CardDescription>{live?.configPath || t("读取 ~/.grok/config.toml")}</CardDescription>
           </div>
+          <Button disabled={loading} onClick={() => void refresh()} size="sm" variant="outline">
+            <RefreshCw className="h-4 w-4" />
+            {loading ? t("刷新中") : t("刷新")}
+          </Button>
+        </CardHeader>
+        <CardContent>
+          {live ? (
+            <div className="grok-live-grid">
+              <div className="grok-live-item">
+                <span className="grok-live-label">{t("CLI")}</span>
+                <span className="grok-live-value">{live.cliPath || t("未检测到")}</span>
+              </div>
+              <div className="grok-live-item">
+                <span className="grok-live-label">{t("默认模型")}</span>
+                <span className="grok-live-value">{live.defaultModel || t("未设置")}</span>
+              </div>
+              <div className="grok-live-item">
+                <span className="grok-live-label">{t("全局端点")}</span>
+                <span className="grok-live-value">{live.modelsBaseUrl || t("未设置")}</span>
+              </div>
+              <div className="grok-live-item">
+                <span className="grok-live-label">{t("受管模型")}</span>
+                <span className="grok-live-value">
+                  {live.models.length ? live.models.map((model) => model.alias).join("、") : t("无")}
+                </span>
+              </div>
+            </div>
+          ) : (
+            <p className="muted-line">{t("尚未读取。")}</p>
+          )}
+        </CardContent>
+      </Panel>
 
+      {/* 左边选供应商，右边编辑；按钮各归各：新增在列表头，保存与应用在编辑区头。 */}
+      <div className="grok-workspace">
+        <Panel className="grok-panel grok-list-panel">
+          <CardHeader className="panel-head grok-head">
+            <div>
+              <CardTitle>{t("Grok 供应商")}</CardTitle>
+              <CardDescription>{t("每个供应商对应一套 Base URL + API Key + 模型列表。")}</CardDescription>
+            </div>
+            <Button onClick={() => void addProfile()} size="sm" variant="outline">
+              <Plus className="h-4 w-4" />
+              {t("新增")}
+            </Button>
+          </CardHeader>
+          <CardContent>
           {profiles.length === 0 ? (
             <div className="grok-empty">
               <Blocks className="h-5 w-5" aria-hidden="true" />
@@ -14170,20 +14184,56 @@ function GrokScreen({
               })}
             </div>
           )}
-        </CardContent>
-      </Panel>
+          </CardContent>
+        </Panel>
 
-      {draft ? (
-        <Panel className="grok-panel">
-          <CardHead title={t("编辑供应商")} detail={draft.name} />
+        <Panel className="grok-panel grok-editor-panel">
+          <CardHeader className="panel-head grok-head">
+            <div>
+              <CardTitle>{draft ? draft.name || t("未命名供应商") : t("编辑供应商")}</CardTitle>
+              <CardDescription>
+                {!draft ? t("在左边选一个供应商") : draftDirty ? t("有未保存修改") : t("改完先保存，再应用到 Grok 生效")}
+              </CardDescription>
+            </div>
+            <div className="grok-editor-actions">
+              <Button
+                disabled={saving || !draftDirty}
+                onClick={() => void saveDraft()}
+                size="sm"
+                title={draftDirty ? undefined : t("没有需要保存的修改")}
+                variant="outline"
+              >
+                <Save className="h-4 w-4" />
+                {saving ? t("保存中") : t("保存")}
+              </Button>
+              <Button
+                disabled={!activeProfile || applying || draftDirty}
+                onClick={() => setConfirming(true)}
+                size="sm"
+                title={
+                  !activeProfile
+                    ? t("请先选择一个供应商")
+                    : draftDirty
+                      ? t("请先保存当前修改")
+                      : undefined
+                }
+              >
+                <Play className="h-4 w-4" />
+                {applying ? t("应用中") : t("应用到 Grok")}
+              </Button>
+            </div>
+          </CardHeader>
           <CardContent>
-            <div className="grok-provider-editor">
+            {draft ? (
+              <>
+                <div className="grok-provider-editor">
               <Field label={t("名称")}>
                 <Input
                   onChange={(event) => setDraft({ ...draft, name: event.currentTarget.value })}
                   value={draft.name}
                 />
               </Field>
+                  <div className="grok-editor-pair">
               <Field label="Base URL">
                 <Input
                   onChange={(event) => setDraft({ ...draft, upstreamBaseUrl: event.currentTarget.value })}
@@ -14199,6 +14249,7 @@ function GrokScreen({
                   value={draft.apiKey}
                 />
               </Field>
+                  </div>
               <Field label={t("模型列表")}>
                 <Textarea
                   onChange={(event) => setDraft({ ...draft, modelList: event.currentTarget.value })}
@@ -14207,45 +14258,15 @@ function GrokScreen({
                   value={draft.modelList}
                 />
               </Field>
-            </div>
-            <p className="muted-line">
-              {t("每行一个模型，可用 [1M] / [200K] 后缀声明上下文窗口。")}
-              {" "}
-              {t("改完点「保存此供应商」，再点「应用到 Grok」生效。")}
-            </p>
+                </div>
+                <p className="muted-line">{t("每行一个模型，可用 [1M] / [200K] 后缀声明上下文窗口。")}</p>
+              </>
+            ) : (
+              <p className="muted-line">{t("还没有选中的供应商。")}</p>
+            )}
           </CardContent>
         </Panel>
-      ) : null}
-
-      <Panel className="grok-panel">
-        <CardHead title={t("Grok 当前配置")} detail={live?.configPath || t("读取 ~/.grok/config.toml")} />
-        <CardContent>
-          {live ? (
-            <div className="grok-live-grid">
-              <div className="grok-live-item">
-                <span className="grok-live-label">{t("CLI")}</span>
-                <span className="grok-live-value">{live.cliPath || t("未检测到")}</span>
-              </div>
-              <div className="grok-live-item">
-                <span className="grok-live-label">{t("默认模型")}</span>
-                <span className="grok-live-value">{live.defaultModel || t("未设置")}</span>
-              </div>
-              <div className="grok-live-item">
-                <span className="grok-live-label">{t("全局端点")}</span>
-                <span className="grok-live-value">{live.modelsBaseUrl || t("未设置")}</span>
-              </div>
-              <div className="grok-live-item">
-                <span className="grok-live-label">{t("受管模型")}</span>
-                <span className="grok-live-value">
-                  {live.models.length ? live.models.map((model) => model.alias).join("、") : t("无")}
-                </span>
-              </div>
-            </div>
-          ) : (
-            <p className="muted-line">{t("尚未读取。")}</p>
-          )}
-        </CardContent>
-      </Panel>
+      </div>
 
       {confirming ? (
         <ConfirmDialog
@@ -14261,7 +14282,7 @@ function GrokScreen({
           onConfirm={() => void applyToGrok()}
         />
       ) : null}
-    </>
+    </div>
   );
 }
 
