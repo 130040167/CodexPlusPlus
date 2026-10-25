@@ -939,6 +939,125 @@ pub fn save_grok_config(
     }
 }
 
+/// Claude Code 供应商命令的统一出口：失败时附上磁盘上的最新状态，前端据此回滚界面。
+fn claude_provider_result(
+    success: impl FnOnce(&codex_plus_core::tools::claude::ClaudeProvidersPayload) -> String,
+    failure: &str,
+    result: anyhow::Result<codex_plus_core::tools::claude::ClaudeProvidersPayload>,
+) -> CommandResult<Option<codex_plus_core::tools::claude::ClaudeProvidersPayload>> {
+    use codex_plus_core::tools::claude;
+    match result {
+        Ok(payload) => ok(&success(&payload), Some(payload)),
+        Err(error) => failed(
+            &format!("{failure}：{error:#}"),
+            claude::load(&claude::ClaudeContext::default_paths()).ok(),
+        ),
+    }
+}
+
+/// 读取 Claude Code 的供应商列表与 `settings.json` 现状。
+#[tauri::command]
+pub fn load_claude_providers()
+-> CommandResult<Option<codex_plus_core::tools::claude::ClaudeProvidersPayload>> {
+    use codex_plus_core::tools::claude;
+    claude_provider_result(
+        |_| "Claude 供应商已加载。".to_string(),
+        "读取 Claude 供应商失败",
+        claude::load(&claude::ClaudeContext::default_paths()),
+    )
+}
+
+/// 新增或保存一个 Claude 供应商；保存的是当前供应商时同步写入 `settings.json`。
+#[tauri::command]
+pub fn save_claude_provider(
+    provider: codex_plus_core::tools::claude::ClaudeProvider,
+) -> CommandResult<Option<codex_plus_core::tools::claude::ClaudeProvidersPayload>> {
+    use codex_plus_core::tools::claude;
+    let name = provider.name.trim().to_string();
+    claude_provider_result(
+        |payload| {
+            if payload.backup_path.is_some() {
+                format!("供应商「{name}」已保存，并已同步到 Claude Code。")
+            } else {
+                format!("供应商「{name}」已保存。")
+            }
+        },
+        "保存 Claude 供应商失败",
+        claude::save_provider(&claude::ClaudeContext::default_paths(), provider),
+    )
+}
+
+#[tauri::command]
+pub fn delete_claude_provider(
+    id: String,
+) -> CommandResult<Option<codex_plus_core::tools::claude::ClaudeProvidersPayload>> {
+    use codex_plus_core::tools::claude;
+    claude_provider_result(
+        |_| "供应商已删除。".to_string(),
+        "删除 Claude 供应商失败",
+        claude::delete_provider(&claude::ClaudeContext::default_paths(), &id),
+    )
+}
+
+/// 切换 Claude Code 的当前供应商：改写 `~/.claude/settings.json` 的关键字段，写前备份。
+#[tauri::command]
+pub fn switch_claude_provider(
+    id: String,
+) -> CommandResult<Option<codex_plus_core::tools::claude::ClaudeProvidersPayload>> {
+    use codex_plus_core::tools::claude;
+    claude_provider_result(
+        |payload| {
+            let name = payload
+                .providers
+                .iter()
+                .find(|provider| provider.id == payload.current_id)
+                .map(|provider| provider.name.as_str())
+                .unwrap_or_default();
+            let mut message = format!("已切换到「{name}」，新开的 Claude Code 会话生效。");
+            if payload.imported > 0 {
+                message.push_str("切换前 settings.json 里的配置已保存为「切换前的配置」。");
+            }
+            message
+        },
+        "切换 Claude 供应商失败",
+        claude::switch_provider(&claude::ClaudeContext::default_paths(), &id),
+    )
+}
+
+/// 把 `settings.json` 现有的地址、Key、模型存成一个供应商。
+#[tauri::command]
+pub fn import_claude_live_provider()
+-> CommandResult<Option<codex_plus_core::tools::claude::ClaudeProvidersPayload>> {
+    use codex_plus_core::tools::claude;
+    claude_provider_result(
+        |_| "已把 Claude Code 当前配置保存为供应商。".to_string(),
+        "导入 Claude 当前配置失败",
+        claude::import_live(&claude::ClaudeContext::default_paths()),
+    )
+}
+
+/// 从 CC Switch 的数据库导入 Claude 供应商（只读打开，不改 CC Switch）。
+#[tauri::command]
+pub fn import_claude_providers_from_cc_switch()
+-> CommandResult<Option<codex_plus_core::tools::claude::ClaudeProvidersPayload>> {
+    use codex_plus_core::tools::claude;
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    let configured = settings.ccs_db_path.trim();
+    let db_path = if configured.is_empty() {
+        codex_plus_core::ccs_import::default_ccs_db_path()
+    } else {
+        std::path::PathBuf::from(configured)
+    };
+    claude_provider_result(
+        |payload| match payload.imported {
+            0 => "CC Switch 里没有新的 Claude 供应商。".to_string(),
+            count => format!("已从 CC Switch 导入 {count} 个 Claude 供应商。"),
+        },
+        "从 CC Switch 导入失败",
+        claude::import_from_cc_switch(&claude::ClaudeContext::default_paths(), &db_path),
+    )
+}
+
 fn empty_grok_config_payload() -> codex_plus_core::grok_config::GrokConfigPayload {
     let home = codex_plus_core::grok_config::default_grok_home_dir();
     codex_plus_core::grok_config::GrokConfigPayload {
@@ -988,12 +1107,7 @@ pub fn list_tools() -> CommandResult<ToolsPayload> {
     let tools = codex_plus_core::tools::tool_specs()
         .into_iter()
         .map(|spec| {
-            let config = settings.tool_config(&spec.id);
-            let active_relay_name = config
-                .relay_profiles
-                .iter()
-                .find(|profile| profile.id == config.active_relay_id)
-                .map(|profile| profile.name.clone());
+            let (active_relay_name, relay_count) = tool_provider_summary(&settings, &spec.id);
             ToolEntry {
                 id: spec.id.as_str().to_string(),
                 name: spec.name,
@@ -1001,7 +1115,7 @@ pub fn list_tools() -> CommandResult<ToolsPayload> {
                 switchable: spec.switchable,
                 active: settings.active_tool == spec.id,
                 active_relay_name,
-                relay_count: config.relay_profiles.len(),
+                relay_count,
             }
         })
         .collect();
@@ -1011,6 +1125,33 @@ pub fn list_tools() -> CommandResult<ToolsPayload> {
         active_tool: settings.active_tool.as_str().to_string(),
     };
     ok("工具列表已加载。", payload)
+}
+
+/// 工具栏提示里的「当前供应商 / 供应商数」。Claude 的供应商存在独立文件里。
+fn tool_provider_summary(
+    settings: &BackendSettings,
+    id: &codex_plus_core::tools::ToolId,
+) -> (Option<String>, usize) {
+    use codex_plus_core::tools::{ToolId, claude};
+    if *id == ToolId::Claude {
+        return claude::load(&claude::ClaudeContext::default_paths())
+            .map(|payload| {
+                let name = payload
+                    .providers
+                    .iter()
+                    .find(|provider| provider.id == payload.current_id)
+                    .map(|provider| provider.name.clone());
+                (name, payload.providers.len())
+            })
+            .unwrap_or((None, 0));
+    }
+    let config = settings.tool_config(id);
+    let active_relay_name = config
+        .relay_profiles
+        .iter()
+        .find(|profile| profile.id == config.active_relay_id)
+        .map(|profile| profile.name.clone());
+    (active_relay_name, config.relay_profiles.len())
 }
 
 #[tauri::command]
