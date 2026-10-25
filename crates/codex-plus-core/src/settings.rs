@@ -396,6 +396,13 @@ impl RelayProfile {
         }
     }
 
+    /// 配置了「自动审批模型」时需要经本地协议代理改写 codex-auto-review（#1446），
+    /// 否则 Responses 直连的供应商根本不经过代理，填了也不生效（#1021）。
+    pub fn rewrites_auto_review_model(&self) -> bool {
+        (self.relay_mode != RelayMode::Official || self.official_mix_api_key)
+            && !self.auto_review_model.trim().is_empty()
+    }
+
     pub fn request_compatibility_enabled(&self) -> bool {
         if self.relay_mode == RelayMode::Official && !self.official_mix_api_key {
             return false;
@@ -1305,6 +1312,7 @@ impl BackendSettings {
             || self.active_relay_profile().uses_independent_proxy()
             || self.active_relay_profile().web_search_history_compat_enabled()
             || self.active_relay_profile().request_compatibility_enabled()
+            || self.active_relay_profile().rewrites_auto_review_model()
     }
 
     pub fn active_relay_uses_protocol_proxy(&self) -> bool {
