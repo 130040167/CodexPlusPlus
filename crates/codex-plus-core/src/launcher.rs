@@ -1820,12 +1820,18 @@ async fn start_helper_with_continuity(
     allow_deferred_primary: bool,
 ) -> anyhow::Result<Vec<HelperRuntime>> {
     let reuse_resident = crate::resident_helper::resident_helper_port() == Some(helper_port);
+    if reuse_resident {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "helper.reuse_resident",
+            serde_json::json!({ "helper_port": helper_port }),
+        );
+    }
     let primary = if reuse_resident {
         Ok(None)
     } else {
         bind_helper_listener(bind_host, helper_port).await.map(Some)
     }
-        .with_context(|| format!("failed to bind helper runtime on {bind_host}:{helper_port}"));
+    .with_context(|| format!("failed to bind helper runtime on {bind_host}:{helper_port}"));
     let aliases = endpoints.ports_for_restore();
     let mut alias_listeners = Vec::new();
     for alias in aliases.into_iter().filter(|alias| *alias != helper_port) {
@@ -1866,10 +1872,10 @@ async fn start_helper_with_continuity(
     let mut runtimes = Vec::new();
     if !reuse_resident {
         runtimes.push(spawn_helper_runtime(
-        bind_host.into(),
-        port,
-        listener,
-        false,
+            bind_host.into(),
+            port,
+            listener,
+            false,
         ));
     }
     for (alias, listener) in alias_listeners {

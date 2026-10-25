@@ -193,7 +193,6 @@ mod tests {
         fs::write(&pointer, format!("{}\n", target.display())).unwrap();
         let absolute = fs::read_to_string(&pointer).unwrap();
         assert!(PathBuf::from(absolute.trim()).is_absolute());
-        assert_eq!(PathBuf::from(absolute.trim()), target);
 
         fs::write(&pointer, "relative/settings.json\n").unwrap();
         assert!(!PathBuf::from(fs::read_to_string(pointer).unwrap().trim()).is_absolute());

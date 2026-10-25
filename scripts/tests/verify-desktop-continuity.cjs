@@ -89,7 +89,9 @@ function externalTestProcesses(processes) {
   return processes.filter(candidate => found.has(candidate.ProcessId));
 }
 const before = inventory();
-const protectedProcesses = before.filter(process => /^(codex-plus-plus(?:\.[\w-]+)*|codex|ChatGPT|cc-switch)\.exe$/i.test(process.Name));
+const externalBefore = externalTestProcesses(before);
+const protectedProcesses = before.filter(process => /^(codex-plus-plus(?:\.[\w-]+)*|codex|ChatGPT|cc-switch)\.exe$/i.test(process.Name)
+  && !externalBefore.some(external => sameProcess(process, external)));
 const originalRenderers = protectedProcesses.filter(process =>
   /^ChatGPT\.exe$/i.test(process.Name) && /--type=renderer(?:\s|$)/.test(process.CommandLine || ""));
 const children = [], contexts = [], desktops = [], owned = new Map(), servers = new Set(), ports = new Set();
@@ -1252,6 +1254,7 @@ async function runMainReplacementScenario(manager) {
       /^(codex-plus-plus|codex|ChatGPT|msedgewebview2)\.exe$/i.test(candidate.Name)
       && !before.some(prior => sameProcess(prior, candidate))
       && !sameProcess(candidate, owned.get(candidate.ProcessId))
+      && !externalTestProcesses(finalInventory).some(external => sameProcess(external, candidate))
       && !report.originalRendererDescendants.some(renderer => sameProcess(renderer, candidate))).map(identity);
     report.checks.noUnattributedApplicationProcesses = report.unattributed.length === 0;
     if (report.checks.ownedProcessesExited && report.checks.portsReleased

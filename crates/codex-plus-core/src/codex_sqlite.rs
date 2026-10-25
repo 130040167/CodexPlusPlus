@@ -68,7 +68,7 @@ fn resolve_sqlite_home_from_env() -> Option<PathBuf> {
     resolve_sqlite_home(std::env::var_os("CODEX_SQLITE_HOME"))
 }
 
-fn resolve_sqlite_home_home_or_default(home: &Path) -> PathBuf {
+pub(crate) fn resolve_sqlite_home_home_or_default(home: &Path) -> PathBuf {
     resolve_sqlite_home_from_env().unwrap_or_else(|| home.to_path_buf())
 }
 
