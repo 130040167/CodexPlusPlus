@@ -150,3 +150,91 @@
 @media(max-width:760px) {
   .cu-preview-picker { flex-direction:column; align-items:stretch; }
 }
+
+/* 工作原理示意图 ─────────────────────────────────────────────
+   7 列：客户端 | 连线 | MCP 服务 | 连线 | 运行时 | 连线 | 操作对象；
+   第 2、3 行是两条泳道（桌面操控 / 浏览器），客户端列跨两行。
+   窄窗口下图本身横向滚动，不把整页撑出横向滚动条。 */
+.cu-flow-card { --cu-flow-line: hsl(var(--muted-foreground) / .55); }
+.cu-flow-scroll { overflow-x:auto; margin:2px -4px 0; padding:4px; }
+.cu-flow {
+  display:grid; min-width:760px;
+  grid-template-columns:minmax(150px,1.1fr) 52px minmax(150px,1fr) 56px minmax(150px,1fr) 34px minmax(150px,1fr);
+  grid-template-rows:auto repeat(2, minmax(0,1fr));
+  row-gap:10px;
+}
+.cu-flow-col { grid-row:1; color:hsl(var(--muted-foreground)); font-size:11px; font-weight:600; letter-spacing:.01em; }
+.cu-flow-lane-a { grid-row:2; }
+.cu-flow-lane-b { grid-row:3; }
+
+.cu-flow-clients {
+  grid-column:1; grid-row:2 / span 2; align-self:center;
+  display:flex; flex-direction:column; gap:6px;
+  padding:10px; border:1px dashed hsl(var(--border)); border-radius:10px;
+}
+.cu-flow-chip {
+  display:flex; align-items:center; gap:6px; min-width:0;
+  padding:5px 8px; border:1px solid hsl(var(--border)); border-radius:7px;
+  background:hsl(var(--background)); font-size:11.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.cu-flow-chip svg { flex-shrink:0; color:hsl(var(--muted-foreground)); }
+.cu-flow-chip[data-tone=custom] { border-style:dashed; color:hsl(var(--brand-accent)); }
+.cu-flow-chip[data-tone=custom] svg { color:currentColor; }
+
+.cu-flow-node {
+  display:flex; align-items:center; gap:9px; height:100%; min-width:0;
+  padding:9px 10px; border:1px solid hsl(var(--border)); border-radius:10px;
+  background:hsl(var(--surface-raised, var(--card)) / .7);
+}
+.cu-flow-icon {
+  display:grid; flex-shrink:0; place-items:center; width:30px; height:30px; border-radius:8px;
+  color:hsl(var(--muted-foreground)); background:hsl(var(--muted) / .6);
+}
+.cu-flow-node[data-tone=cu] { border-color:hsl(var(--brand-accent) / .45); }
+.cu-flow-node[data-tone=cu] .cu-flow-icon { color:hsl(var(--brand-accent)); background:hsl(var(--brand-accent) / .12); }
+.cu-flow-node[data-tone=browser] { border-color:hsl(210 80% 60% / .45); }
+.cu-flow-node[data-tone=browser] .cu-flow-icon { color:hsl(210 80% 62%); background:hsl(210 80% 60% / .12); }
+.cu-flow-node[data-tone=target] .cu-flow-icon { color:hsl(var(--status-success)); background:hsl(var(--status-success) / .1); }
+.cu-flow-text { display:flex; min-width:0; flex-direction:column; gap:2px; }
+.cu-flow-text strong { overflow:hidden; font-size:12px; font-weight:600; text-overflow:ellipsis; white-space:nowrap; }
+.cu-flow-text small { color:hsl(var(--muted-foreground)); font-size:10.5px; line-height:1.45; }
+
+/* 连线：中线 + 右端箭头；标签浮在线上方。 */
+.cu-flow-link { position:relative; align-self:center; height:22px; margin:0 4px; }
+.cu-flow-link:not(.cu-flow-link-fan)::before {
+  content:""; position:absolute; left:0; right:5px; top:50%; height:1.5px; background:var(--cu-flow-line);
+}
+.cu-flow-link:not(.cu-flow-link-fan)::after,
+.cu-flow-link-fan::before,
+.cu-flow-link-fan::after {
+  content:""; position:absolute; right:0; width:0; height:0;
+  border-top:4px solid transparent; border-bottom:4px solid transparent; border-left:6px solid var(--cu-flow-line);
+  transform:translateY(-50%);
+}
+.cu-flow-link:not(.cu-flow-link-fan)::after { top:50%; }
+.cu-flow-link > span {
+  position:absolute; left:50%; bottom:calc(50% + 4px); transform:translateX(-50%);
+  display:inline-flex; align-items:center; gap:3px;
+  color:hsl(var(--muted-foreground)); font-size:10px; white-space:nowrap;
+}
+
+/* 扇出：从客户端中点分到两条泳道中心（泳道等高，中心约在 25% / 75%）。 */
+.cu-flow-link-fan {
+  grid-column:2; grid-row:2 / span 2; align-self:stretch; height:auto;
+  background:
+    linear-gradient(var(--cu-flow-line), var(--cu-flow-line)) no-repeat 0 50% / 50% 1.5px,
+    linear-gradient(var(--cu-flow-line), var(--cu-flow-line)) no-repeat 50% 50% / 1.5px 50%,
+    linear-gradient(var(--cu-flow-line), var(--cu-flow-line)) no-repeat calc(100% - 5px) 25% / calc(50% - 5px) 1.5px,
+    linear-gradient(var(--cu-flow-line), var(--cu-flow-line)) no-repeat calc(100% - 5px) 75% / calc(50% - 5px) 1.5px;
+}
+.cu-flow-link-fan::before { top:25%; }
+.cu-flow-link-fan::after { top:75%; }
+.cu-flow-link-fan > span { left:2px; transform:none; bottom:calc(50% + 4px); }
+
+.cu-flow-steps { display:grid; gap:4px; margin:14px 0 0; padding-left:18px; color:hsl(var(--muted-foreground)); font-size:12px; line-height:1.6; }
+.cu-flow-col { display:flex; align-items:center; gap:6px; }
+.cu-flow-col b {
+  display:inline-grid; place-items:center; width:16px; height:16px; border-radius:50%;
+  color:hsl(var(--brand-accent)); background:hsl(var(--brand-accent) / .14); font-size:10px; font-weight:700;
+}
+.cu-flow-steps { list-style:decimal; }

@@ -1,8 +1,8 @@
 /** Computer Use：复用 Codex app 的 Computer Use 与 Chrome 控制，通过 MCP 提供给 Claude Code、DeepSeek Harness、ZCode 等客户端。 */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
-import { AlertTriangle, CheckCircle2, FolderOpen, Loader2, MonitorSmartphone, Play, Plug, Plus, RefreshCw, Trash2, Unplug } from "lucide-react";
+import { AlertTriangle, AppWindow, Bot, CheckCircle2, FolderOpen, Globe, Loader2, MonitorSmartphone, MousePointerClick, Play, Plug, Plus, RefreshCw, ShieldCheck, Trash2, Unplug } from "lucide-react";
 import { ComputerUsePreview } from "./ComputerUsePreview";
 import { PageHeader } from "./ManagementPages";
 import { t } from "./i18n";
@@ -107,6 +107,63 @@ function failureText(check: CuCheck): string {
     case "error": return check.failureDetail || check.message || t("自检失败，请查看详情后重试。");
     default: return check.failureDetail || check.message || t("自检失败，请查看详情后重试。");
   }
+}
+
+/**
+ * 工作原理示意图：客户端 → Codex++ 的两个 MCP 服务 → Codex 运行时 → 实际被操作的对象。
+ *
+ * 用 CSS grid 而不是固定 viewBox 的 SVG：文字随窗口换行、跟随深浅色主题，也能被翻译。
+ * 两条泳道共享左侧的客户端列：上面是桌面操控，下面是浏览器控制。
+ */
+function CuFlowDiagram() {
+  const node = (icon: ReactNode, title: string, detail: string, tone?: string) => (
+    <div className="cu-flow-node" data-tone={tone}>
+      <span className="cu-flow-icon" aria-hidden="true">{icon}</span>
+      <span className="cu-flow-text">
+        <strong>{title}</strong>
+        <small>{detail}</small>
+      </span>
+    </div>
+  );
+  return <section className="cu-card cu-flow-card" aria-labelledby="cu-flow-title">
+    <div className="cu-card-head">
+      <div>
+        <h2 id="cu-flow-title">{t("工作原理")}</h2>
+        <p>{t("Codex++ 不自己实现桌面操控，而是把 ChatGPT.app 里现成的 Computer Use 与 Chrome 扩展，通过 MCP 转给其它 AI 客户端使用。")}</p>
+      </div>
+    </div>
+    <div className="cu-flow-scroll">
+      <div className="cu-flow" role="img" aria-label={t("客户端通过 MCP 调用 Codex++，Codex++ 审批后交给 ChatGPT.app 的原生 Computer Use 操作桌面应用，或交给 Chrome 扩展操作浏览器。")}>
+        <span className="cu-flow-col" style={{ gridColumn: 1 }}><b>1</b>{t("你的 AI 客户端")}</span>
+        <span className="cu-flow-col" style={{ gridColumn: 3 }}><b>2</b>{t("Codex++ MCP 服务")}</span>
+        <span className="cu-flow-col" style={{ gridColumn: 5 }}><b>3</b>{t("Codex 运行时")}</span>
+        <span className="cu-flow-col" style={{ gridColumn: 7 }}><b>4</b>{t("被操作的对象")}</span>
+
+        <div className="cu-flow-clients">
+          {["Claude Code", "Claude Desktop", "DeepSeek Harness", "ZCode / WorkBuddy"].map((name) => <span key={name} className="cu-flow-chip"><Bot size={13} aria-hidden="true" />{name}</span>)}
+          <span className="cu-flow-chip" data-tone="custom"><FolderOpen size={13} aria-hidden="true" />{t("自定义配置目录")}</span>
+        </div>
+        <div className="cu-flow-link cu-flow-link-fan"><span>MCP</span></div>
+
+        <div className="cu-flow-lane-a" style={{ gridColumn: 3 }}>{node(<MousePointerClick size={16} />, "codex-plus-cu", t("桌面操控"), "cu")}</div>
+        <div className="cu-flow-link cu-flow-lane-a" style={{ gridColumn: 4 }}><span><ShieldCheck size={12} aria-hidden="true" />{t("审批")}</span></div>
+        <div className="cu-flow-lane-a" style={{ gridColumn: 5 }}>{node(<MonitorSmartphone size={16} />, "ChatGPT.app", t("原生 Computer Use"))}</div>
+        <div className="cu-flow-link cu-flow-lane-a" style={{ gridColumn: 6 }} />
+        <div className="cu-flow-lane-a" style={{ gridColumn: 7 }}>{node(<AppWindow size={16} />, t("本机桌面应用"), t("Finder、微信、系统设置…"), "target")}</div>
+
+        <div className="cu-flow-lane-b" style={{ gridColumn: 3 }}>{node(<Globe size={16} />, "codex-plus-browser", t("浏览器控制"), "browser")}</div>
+        <div className="cu-flow-link cu-flow-lane-b" style={{ gridColumn: 4 }} />
+        <div className="cu-flow-lane-b" style={{ gridColumn: 5 }}>{node(<Plug size={16} />, t("Chrome 扩展"), "ChatGPT for Chrome")}</div>
+        <div className="cu-flow-link cu-flow-lane-b" style={{ gridColumn: 6 }} />
+        <div className="cu-flow-lane-b" style={{ gridColumn: 7 }}>{node(<Globe size={16} />, t("Chrome 标签页"), t("你已登录的真实浏览器"), "target")}</div>
+      </div>
+    </div>
+    <ol className="cu-flow-steps">
+      <li>{t("在下方「接入目标」点「接入」，Codex++ 把两个 MCP 服务写进该客户端的配置（会先备份）。")}</li>
+      <li>{t("重启客户端后，它的工具列表里会出现 mcp__codex-plus-cu__ 与 mcp__codex-plus-browser__ 开头的工具。")}</li>
+      <li>{t("AI 调用工具时，Codex++ 按「审批」策略放行，再交给 ChatGPT.app 或 Chrome 扩展真正执行。")}</li>
+    </ol>
+  </section>;
 }
 
 export function ComputerUsePage() {
@@ -444,6 +501,8 @@ export function ComputerUsePage() {
       {actionError && <p className="cu-error" role="alert">{t("操作失败：")}{actionError}</p>}
       {notice && <p className="cu-notice" role="status">{notice}</p>}
       {loading && <p className="cu-loading" role="status"><Loader2 size={15} className="cu-spin" />{t("正在检测本机运行时…")}</p>}
+
+      <CuFlowDiagram />
 
       <section className="cu-card cu-runtime" data-found={found} aria-labelledby="cu-runtime-title">
         <div className="cu-card-head">
