@@ -14430,25 +14430,30 @@ function GrokScreen({
                 const endpoint = profile.upstreamBaseUrl || profile.baseUrl;
                 return (
                   <div className={`grok-provider-row ${selected ? "active" : ""}`} key={profile.id}>
+                    {/* 与 Codex 供应商列表同一套：两字头像 + 名称 / 地址，删除悬停才出现。 */}
                     <button
                       className="grok-provider-pick"
                       onClick={() => void selectProfile(profile.id)}
                       type="button"
                     >
-                      <span className="grok-provider-name">
-                        {profile.name}
-                        {selected ? <span className="grok-provider-badge">{t("使用中")}</span> : null}
-                      </span>
-                      <span className="grok-provider-url">
-                        {endpoint || t("未填写 Base URL")}
+                      <span className="relay-index" aria-hidden="true">{providerInitial(profile.name)}</span>
+                      <span className="grok-provider-text">
+                        <span className="grok-provider-name">
+                          <span className="relay-summary-name">{profile.name || t("未命名供应商")}</span>
+                          {selected ? <span className="relay-active-badge">{t("使用中")}</span> : null}
+                        </span>
+                        {/* 左列较窄：模型数放进第二行，给名称留出空间。 */}
+                        <span className="grok-provider-url">
+                          {endpoint || t("未填写 Base URL")} · {tf("{0} 个模型", [String(modelCount)])}
+                        </span>
                       </span>
                     </button>
-                    <span className="grok-provider-models">{tf("{0} 个模型", [String(modelCount)])}</span>
                     <Button
+                      className="grok-provider-delete"
                       onClick={() => void removeProfile(profile.id)}
                       size="icon"
                       title={t("删除供应商")}
-                      variant="outline"
+                      variant="ghost"
                     >
                       <Trash2 className="h-4 w-4" />
                     </Button>

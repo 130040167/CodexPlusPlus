@@ -94,6 +94,7 @@ export const EN_PLAIN: Record<string, string> = {
   "供应商测试模型、图片覆盖层、启动参数等只作用于 Codex 的选项，在 Codex 菜单的「设置」里。": "Options that only affect Codex — provider test model, image overlay, launch arguments — live under Settings in the Codex menu.",
   "全选项目": "Select entire project",
   "读取中…": "Loading…",
+  "使用 Claude Code 当前登录的账号，不设置地址与 Key": "Uses the account signed in to Claude Code; no address or key is set",
   "已开启": "On",
   "已关闭": "Off",
   "请求体上限": "Request body limit",
