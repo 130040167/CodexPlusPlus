@@ -78,14 +78,6 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的统一管理应用，通
   </tr>
   <tr>
     <td align="center">
-      <a href="https://grooroute.com/register?aff=2B3KJR5SRNTX">
-        <img src="docs/images/sponsor-grooroute.png" alt="GrooRoute" width="170">
-      </a>
-    </td>
-    <td><a href="https://grooroute.com/register?aff=2B3KJR5SRNTX"><strong>GrooRoute</strong></a><br>GrooRoute 提供 Claude 与 GPT 全系官方原模型，一行配置即可接入 Claude Code、Codex 或直接调用 API，官方承诺不掺假、永久保真。限时注册活动：充值 50 美元赠送 50 美元，通过<a href="https://grooroute.com/register?aff=2B3KJR5SRNTX">专属链接注册</a>并完成充值后，联系客服即可获取优惠。官网：<a href="https://grooroute.com/">grooroute.com</a>。</td>
-  </tr>
-  <tr>
-    <td align="center">
       <a href="https://runapi.host/register?aff=AWJq">
         <img src="docs/images/sponsor-runapi.png" alt="RunAPI" width="150">
       </a>
@@ -204,6 +196,8 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的统一管理应用，通
 另外，微信连接支持扫码连接本机 Codex，每个联系人映射到独立会话，并可配置允许访问的微信用户。
 
 ## 看看它能做什么
+
+实验性[轮次回退](docs/turn-rewind.md)：默认关闭，在回答菜单中撤销本轮及后续轮次的可恢复操作，报告全部完成后再截断会话；恢复记录保存在本机并可导出。
 
 ### 把常用增强放到手边
 
