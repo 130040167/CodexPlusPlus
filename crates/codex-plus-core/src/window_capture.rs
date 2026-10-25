@@ -361,79 +361,118 @@ mod imp {
     // 系统以推送方式交帧，延迟更低、帧率可达屏幕刷新率；
     // 副作用：目标窗口左上角出现橙色摄像头图标（macOS 标准共享指示器）。
     //
-    // CMSampleBuffer → IOSurface → CGImage → JPEG
-    // CoreMedia / CoreVideo 通过 extern "C" 直接 link，不依赖额外 crate。
+    // 架构：全局静态 STREAM_SENDER 槽存 SyncSender，`extern "C"` 回调直接读取，
+    // 完全避免 associated object / FFI 边界 panic 问题。
     fn start_preview_stream(
         window_id: u32,
         scale: f64,
         max_fps: f64,
         sink: impl Fn(Vec<u8>) + Send + 'static,
     ) -> anyhow::Result<PreviewHandle> {
-        use objc2::define_class;
-        use objc2::msg_send;
-        use objc2::runtime::NSObject;
+        use std::ffi::c_void;
         use objc2_foundation::NSError;
 
-        // CoreMedia/CoreVideo 符号
-        #[link(name = "CoreMedia", kind = "framework")]
-        unsafe extern "C" {
-            fn CMSampleBufferGetImageBuffer(sbuf: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        // CoreMedia/CoreVideo/CoreGraphics 符号直链
+        #[link(name = "CoreMedia",    kind = "framework")] unsafe extern "C" {
+            fn CMSampleBufferGetImageBuffer(s: *mut c_void) -> *mut c_void;
         }
-        #[link(name = "CoreVideo", kind = "framework")]
-        unsafe extern "C" {
-            fn CVPixelBufferLockBaseAddress(buf: *mut std::ffi::c_void, flags: u64) -> i32;
-            fn CVPixelBufferUnlockBaseAddress(buf: *mut std::ffi::c_void, flags: u64) -> i32;
+        #[link(name = "CoreVideo",    kind = "framework")] unsafe extern "C" {
+            fn CVPixelBufferLockBaseAddress(b: *mut c_void, f: u64) -> i32;
+            fn CVPixelBufferUnlockBaseAddress(b: *mut c_void, f: u64) -> i32;
+            fn CVPixelBufferGetBaseAddress(b: *mut c_void) -> *mut c_void;
+            fn CVPixelBufferGetBytesPerRow(b: *mut c_void) -> usize;
+            fn CVPixelBufferGetWidth(b: *mut c_void) -> usize;
+            fn CVPixelBufferGetHeight(b: *mut c_void) -> usize;
         }
-        #[link(name = "CoreGraphics", kind = "framework")]
-        unsafe extern "C" {
-            fn CGBitmapContextCreate(
-                data: *mut std::ffi::c_void, width: usize, height: usize,
-                bpc: usize, bytes_per_row: usize,
-                cs: *mut std::ffi::c_void, bitmap_info: u32,
-            ) -> *mut std::ffi::c_void;
-            fn CGBitmapContextCreateImage(ctx: *mut std::ffi::c_void) -> *mut CGImage;
-            fn CGContextRelease(ctx: *mut std::ffi::c_void);
-            fn CGColorSpaceCreateDeviceRGB() -> *mut std::ffi::c_void;
-            fn CGColorSpaceRelease(cs: *mut std::ffi::c_void);
+        #[link(name = "CoreGraphics", kind = "framework")] unsafe extern "C" {
+            fn CGBitmapContextCreate(d: *mut c_void, w: usize, h: usize,
+                bpc: usize, bpr: usize, cs: *mut c_void, bi: u32) -> *mut c_void;
+            fn CGBitmapContextCreateImage(ctx: *mut c_void) -> *mut CGImage;
+            fn CGContextRelease(ctx: *mut c_void);
+            fn CGColorSpaceCreateDeviceRGB() -> *mut c_void;
+            fn CGColorSpaceRelease(cs: *mut c_void);
         }
-        // CVPixelBuffer → raw BGRA 指针
-        #[link(name = "CoreVideo", kind = "framework")]
-        unsafe extern "C" {
-            fn CVPixelBufferGetBaseAddress(buf: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
-            fn CVPixelBufferGetBytesPerRow(buf: *mut std::ffi::c_void) -> usize;
-            fn CVPixelBufferGetWidth(buf: *mut std::ffi::c_void) -> usize;
-            fn CVPixelBufferGetHeight(buf: *mut std::ffi::c_void) -> usize;
+        #[link(name = "System", kind = "dylib")] unsafe extern "C" {
+            fn dispatch_queue_create(label: *const i8, attr: *const c_void) -> *mut c_void;
         }
 
-        /// CVPixelBuffer (BGRA) → JPEG bytes
-        fn pixel_buffer_to_jpeg(pixel_buf: *mut std::ffi::c_void) -> anyhow::Result<Vec<u8>> {
-            unsafe {
-                CVPixelBufferLockBaseAddress(pixel_buf, 1); // read-only lock
-                let width       = CVPixelBufferGetWidth(pixel_buf);
-                let height      = CVPixelBufferGetHeight(pixel_buf);
-                let bpr         = CVPixelBufferGetBytesPerRow(pixel_buf);
-                let base        = CVPixelBufferGetBaseAddress(pixel_buf);
+        // 全局静态槽：callback 无法捕获闭包，用静态槽传递 sender
+        static STREAM_SENDER: std::sync::OnceLock<
+            Mutex<Option<mpsc::SyncSender<Vec<u8>>>>>
+            = std::sync::OnceLock::new();
+        let slot = STREAM_SENDER.get_or_init(|| Mutex::new(None));
 
-                let cs = CGColorSpaceCreateDeviceRGB();
-                // kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst = 0x2002
-                let ctx = CGBitmapContextCreate(base, width, height, 8, bpr, cs, 0x2002);
-                let img_ref = CGBitmapContextCreateImage(ctx);
-                CGContextRelease(ctx);
-                CGColorSpaceRelease(cs);
-                CVPixelBufferUnlockBaseAddress(pixel_buf, 1);
+        // 注册 SCStreamOutput 子类（进程生命周期内只注册一次）
+        static SUBCLASS_ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        SUBCLASS_ONCE.get_or_init(|| unsafe {
+            use objc2::runtime::{AnyClass, AnyProtocol, Sel};
+            use objc2::sel;
 
-                if img_ref.is_null() {
-                    anyhow::bail!("CGBitmapContextCreateImage 返回空");
+            extern "C" fn stream_did_output(
+                _this: *mut objc2::runtime::AnyObject,
+                _sel: Sel,
+                _stream: *mut objc2::runtime::AnyObject,
+                sample_buf: *mut c_void,
+                _output_type: i64,
+            ) {
+                // 不能 panic：外部 ObjC 调用帧
+                let pixel_buf = unsafe { CMSampleBufferGetImageBuffer(sample_buf) };
+                if pixel_buf.is_null() { return; }
+
+                let jpeg = unsafe {
+                    CVPixelBufferLockBaseAddress(pixel_buf, 1);
+                    let w   = CVPixelBufferGetWidth(pixel_buf);
+                    let h   = CVPixelBufferGetHeight(pixel_buf);
+                    let bpr = CVPixelBufferGetBytesPerRow(pixel_buf);
+                    let base = CVPixelBufferGetBaseAddress(pixel_buf);
+                    let cs  = CGColorSpaceCreateDeviceRGB();
+                    let ctx = CGBitmapContextCreate(base, w, h, 8, bpr, cs, 0x2002);
+                    let img = CGBitmapContextCreateImage(ctx);
+                    CGContextRelease(ctx);
+                    CGColorSpaceRelease(cs);
+                    CVPixelBufferUnlockBaseAddress(pixel_buf, 1);
+                    if img.is_null() { return; }
+                    let r = encode_jpeg(&*img);
+                    let _ = Retained::from_raw(img);
+                    match r { Ok(b) => b, Err(_) => return }
+                };
+
+                // 把帧发到接帧循环
+                if let Ok(guard) = STREAM_SENDER
+                    .get()
+                    .and_then(|s| s.lock().ok())
+                    .into_iter()
+                    .next()
+                    .map(|g| g)
+                    .ok_or(())
+                {
+                    // 无法直接用 guard，重新 lock
+                    drop(guard);
                 }
-                let result = encode_jpeg(&*img_ref);
-                // CGImageRelease — CGImage is toll-free bridged, 用 Retained drop
-                let _ = Retained::from_raw(img_ref); // 转交 ARC 管理
-                result
+                if let Some(slot) = STREAM_SENDER.get() {
+                    if let Ok(g) = slot.lock() {
+                        if let Some(tx) = g.as_ref() {
+                            let _ = tx.try_send(jpeg);
+                        }
+                    }
+                }
             }
-        }
+
+            let superclass = AnyClass::get(c"NSObject").unwrap();
+            let mut builder = objc2::runtime::ClassBuilder::new(
+                c"CodPlusStreamOutput", superclass).unwrap();
+            builder.add_method(
+                sel!(stream:didOutputSampleBuffer:ofType:),
+                stream_did_output as extern "C" fn(_, _, _, _, _),
+            );
+            if let Some(proto) = AnyProtocol::get(c"SCStreamOutput") {
+                builder.add_protocol(proto);
+            }
+            builder.register();
+        });
 
         let scale = scale.clamp(0.1, 2.0);
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop   = Arc::new(AtomicBool::new(false));
         let errors = Arc::new(Mutex::new(None::<String>));
         let frames = Arc::new(Mutex::new(0u64));
 
@@ -445,170 +484,49 @@ mod imp {
             .name("codex-plus-cu-stream".to_string())
             .spawn(move || {
                 let fail = |msg: String| {
-                    if let Ok(mut slot) = thread_errors.lock() { *slot = Some(msg); }
+                    if let Ok(mut s) = thread_errors.lock() { *s = Some(msg); }
                 };
 
-                // 1. 定位窗口
                 let Some(window) = find_window(window_id) else {
-                    fail("目标窗口已关闭或找不到".into());
-                    return;
+                    fail("目标窗口已关闭或找不到".into()); return;
                 };
 
                 let filter = unsafe {
                     SCContentFilter::initWithDesktopIndependentWindow(
-                        SCContentFilter::alloc(), &window,
-                    )
+                        SCContentFilter::alloc(), &window)
                 };
                 let config = unsafe { SCStreamConfiguration::new() };
                 unsafe {
                     let f = window.frame();
-                    config.setWidth((f.size.width  * scale).round().max(1.0) as usize);
+                    config.setWidth( (f.size.width  * scale).round().max(1.0) as usize);
                     config.setHeight((f.size.height * scale).round().max(1.0) as usize);
                     config.setShowsCursor(true);
                     config.setPixelFormat(u32::from_be_bytes(*b"BGRA"));
-                    // 设置最小帧间隔
-                    let min_interval = 1.0 / max_fps.clamp(1.0, 60.0);
-                    let cm_time: (i64, i32, u32, u32) = (
-                        1,
-                        (max_fps.clamp(1.0, 60.0) as i32),
-                        1,
-                        1,
-                    );
-                    let _ = cm_time; // 先不设，默认帧率由窗口刷新驱动
-                    let _ = min_interval;
+                    let _ = max_fps; // 帧率由窗口刷新驱动
                 }
 
-                // 2. 定义 SCStreamOutput Rust 实现对象
-                //    每次帧回调把像素帧传给 sink；线程安全靠 Mutex<sink>
-                let sink_shared: Arc<Mutex<Box<dyn Fn(Vec<u8>) + Send>>> =
-                    Arc::new(Mutex::new(Box::new(sink)));
-                let frame_stop   = thread_stop.clone();
-                let frame_frames = thread_frames.clone();
-                let frame_errors = thread_errors.clone();
-                let sink_arc     = sink_shared.clone();
-
-                // 用 block2 作为回调载体来绕开 define_class! 的复杂性：
-                // 把 SCStream 的帧回调包成一个 Objective-C block，用 swizzle 把
-                // addStreamOutput 换成 block 方式不可行。
-                // 正确做法：define_class! 定义一个持有 Arc 闭包的 NSObject 子类，
-                // 实现 SCStreamOutput 协议的 stream:didOutputSampleBuffer:ofType: 方法。
-
-                // 为了不在 Rust 里写完整的 define_class!/ClassBuilder 模板，
-                // 这里退而使用更简洁的方法：通过 SCStream 的 Objective-C 运行时
-                // 动态注册一个轻量子类（仿 KVO / block 桥接常见模式）。
-                // 由于 objc2 0.6 的 define_class! 需要 'static lifetime，
-                // 我们把 Arc 放进一个 Box<dyn Any + Send> 通过 associated object 传递。
-
-                // 实际上最简单可靠的方法：用 DispatchQueue + block2 中转。
-                // SCStream addStreamOutput:type:sampleHandlerQueue: 接受 dispatch_queue，
-                // 回调在那个队列上调用；我们用一个全局串行 queue 接帧，
-                // 然后在 SCStreamOutput 协议的回调里处理。
-                //
-                // 下面直接用 Rust FFI 到 dispatch + ObjC runtime 建一个最小实现：
-
-                use std::sync::atomic::AtomicPtr;
-                use std::ffi::c_void;
-
-                #[link(name = "System", kind = "dylib")]
-                unsafe extern "C" {
-                    fn dispatch_queue_create(
-                        label: *const i8,
-                        attr: *const c_void,
-                    ) -> *mut c_void;
+                // 注入 sender 到静态槽
+                let (sync_tx, sync_rx) = mpsc::sync_channel::<Vec<u8>>(4);
+                {
+                    let mut g = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    *g = Some(sync_tx);
                 }
-
-                // 帧回调通过 mpsc 传递像素缓冲区指针（已锁定）
-                let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>();
-
-                // 定义 SCStreamOutput 子类 —— 使用 objc2::define_class!
-                // 需要 'static 的闭包，所以把 sender 泄漏进去（通过 associated object）
-                let frame_tx_ptr = Box::into_raw(Box::new(frame_tx));
 
                 unsafe {
-                    use objc2::runtime::{AnyClass, AnyObject, Sel};
-                    use objc2::sel;
+                    use objc2::runtime::AnyClass;
                     use std::ffi::CString;
 
-                    // 动态子类名称（带随机后缀避免重名）
-                    static SUBCLASS_ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-                    const SUBCLASS: &str = "CodPlusStreamOutput\0";
-
-                    SUBCLASS_ONCE.get_or_init(|| {
-                        // 注册子类
-                        let superclass = AnyClass::get(c"NSObject").unwrap();
-                        let mut builder = objc2::runtime::ClassBuilder::new(
-                            c"CodPlusStreamOutput",
-                            superclass,
-                        ).unwrap();
-
-                        // stream:didOutputSampleBuffer:ofType:
-                        // 签名：- (void)stream:(SCStream*)stream
-                        //         didOutputSampleBuffer:(CMSampleBufferRef)sb
-                        //                      ofType:(SCStreamOutputType)type
-                        extern "C" fn stream_did_output(
-                            this: *mut AnyObject,
-                            _sel: Sel,
-                            _stream: *mut AnyObject,
-                            sample_buf: *mut c_void,
-                            _output_type: i64,
-                        ) {
-                            unsafe {
-                                // 取出 sender ptr（从 associated object）
-                                let key: *const c_void = 1usize as *const c_void;
-                                let sender_ptr: *mut c_void = msg_send![this, associatedObjectForKey: key];
-                                if sender_ptr.is_null() { return; }
-                                let sender = &*(sender_ptr as *const mpsc::SyncSender<Vec<u8>>);
-
-                                let pixel_buf = CMSampleBufferGetImageBuffer(sample_buf);
-                                if pixel_buf.is_null() { return; }
-                                match pixel_buffer_to_jpeg(pixel_buf) {
-                                    Ok(bytes) => { let _ = sender.try_send(bytes); }
-                                    Err(_) => {}
-                                }
-                            }
-                        }
-
-                        builder.add_method(
-                            sel!(stream:didOutputSampleBuffer:ofType:),
-                            stream_did_output as extern "C" fn(_, _, _, _, _),
-                        );
-
-                        // 添加 SCStreamOutput 协议
-                        if let Some(proto) = objc2::runtime::AnyProtocol::get(c"SCStreamOutput") {
-                            builder.add_protocol(proto);
-                        }
-
-                        builder.register();
-                    });
-
-                    // 实例化
                     let cls = AnyClass::get(c"CodPlusStreamOutput").unwrap();
-                    let output_obj: *mut AnyObject = msg_send![cls, new];
+                    let output_obj: *mut objc2::runtime::AnyObject = objc2::msg_send![cls, new];
 
-                    // 把 SyncSender 存到 associated object
-                    let (sync_tx, sync_rx) = mpsc::sync_channel::<Vec<u8>>(4);
-                    let sync_tx_ptr = Box::into_raw(Box::new(sync_tx)) as *mut c_void;
-                    let key: *const c_void = 1usize as *const c_void;
-                    let _: () = msg_send![output_obj, setAssociatedObject: sync_tx_ptr forKey: key policy: 0i64];
-
-                    // 释放之前多余的 frame_tx（这条路不再用）
-                    drop(Box::from_raw(frame_tx_ptr));
-
-                    // 创建 dispatch queue
                     let label = CString::new("codex.plus.stream.q").unwrap();
                     let queue = dispatch_queue_create(label.as_ptr(), std::ptr::null());
 
-                    // 创建 SCStream
                     let stream = SCStream::initWithFilter_configuration_delegate(
-                        SCStream::alloc(),
-                        &filter,
-                        &config,
-                        None,
-                    );
+                        SCStream::alloc(), &filter, &config, None);
 
-                    // addStreamOutput
                     let mut add_err: *mut NSError = std::ptr::null_mut();
-                    let _ok: bool = msg_send![
+                    let _ok: bool = objc2::msg_send![
                         &*stream,
                         addStreamOutput: output_obj
                         type: SCStreamOutputType::Screen
@@ -616,16 +534,15 @@ mod imp {
                         error: &mut add_err
                     ];
 
-                    // startCapture
                     let (start_tx, start_rx) = mpsc::channel::<Result<(), String>>();
-                    stream.startCaptureWithCompletionHandler(Some(&*RcBlock::new(move |e: *mut NSError| {
-                        if e.is_null() {
-                            let _ = start_tx.send(Ok(()));
-                        } else {
-                            let msg = unsafe { (&*e).localizedDescription().to_string() };
-                            let _ = start_tx.send(Err(msg));
-                        }
-                    })));
+                    stream.startCaptureWithCompletionHandler(Some(&*RcBlock::new(
+                        move |e: *mut NSError| {
+                            if e.is_null() { let _ = start_tx.send(Ok(())); }
+                            else {
+                                let msg = unsafe { (&*e).localizedDescription().to_string() };
+                                let _ = start_tx.send(Err(msg));
+                            }
+                        })));
                     match start_rx.recv_timeout(Duration::from_secs(10)) {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => { fail(format!("SCStream 启动失败：{e}")); return; }
@@ -633,38 +550,32 @@ mod imp {
                     }
 
                     // 接帧循环
-                    while !frame_stop.load(Ordering::Relaxed) {
+                    while !thread_stop.load(Ordering::Relaxed) {
                         match sync_rx.recv_timeout(Duration::from_secs(2)) {
                             Ok(bytes) => {
-                                if frame_stop.load(Ordering::Relaxed) { break; }
-                                if let Ok(s) = sink_arc.lock() { (s)(bytes); }
-                                if let Ok(mut n) = frame_frames.lock() { *n += 1; }
+                                if thread_stop.load(Ordering::Relaxed) { break; }
+                                sink(bytes);
+                                if let Ok(mut n) = thread_frames.lock() { *n += 1; }
                             }
                             Err(mpsc::RecvTimeoutError::Timeout) => continue,
                             Err(_) => break,
                         }
                     }
 
-                    // stopCapture
                     let (stop_tx, stop_rx) = mpsc::channel::<()>();
-                    stream.stopCaptureWithCompletionHandler(Some(&*RcBlock::new(move |_e: *mut NSError| {
-                        let _ = stop_tx.send(());
-                    })));
+                    stream.stopCaptureWithCompletionHandler(Some(&*RcBlock::new(
+                        move |_e: *mut NSError| { let _ = stop_tx.send(()); })));
                     let _ = stop_rx.recv_timeout(Duration::from_secs(5));
 
-                    // 回收 sender
-                    let recovered: *mut c_void = msg_send![output_obj, associatedObjectForKey: key];
-                    if !(recovered as *mut c_void).is_null() {
-                        drop(Box::from_raw(recovered as *mut mpsc::SyncSender<Vec<u8>>));
-                    }
-                    let _: () = msg_send![output_obj, release];
+                    // 清空静态槽
+                    if let Ok(mut g) = slot.lock() { *g = None; }
+                    let _: () = objc2::msg_send![output_obj, release];
                 }
             })?;
 
         Ok(PreviewHandle { stop, errors, frames, thread: Some(thread) })
     }
 }
-
 #[cfg(not(target_os = "macos"))]
 mod imp {
     use super::{CaptureWindow, PreviewHandle};
