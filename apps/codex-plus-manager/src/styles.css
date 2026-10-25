@@ -12115,3 +12115,13 @@ select {
   .setting-row { grid-template-columns: minmax(0, 1fr); gap: 10px; }
   .setting-row-control { justify-content: flex-start; }
 }
+
+/* Grok 供应商行：与 Codex 供应商列表同一套头像 / 标签 / 悬停删除。 */
+.grok-provider-pick { display: flex; flex-direction: row; align-items: center; gap: 10px; min-width: 0; }
+.grok-provider-text { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.grok-provider-text .grok-provider-name { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.grok-provider-text .grok-provider-url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.grok-provider-row .grok-provider-models { margin: 0; white-space: nowrap; }
+.grok-provider-row .grok-provider-delete { opacity: 0; transition: opacity 0.16s ease; }
+.grok-provider-row:hover .grok-provider-delete,
+.grok-provider-row:focus-within .grok-provider-delete { opacity: 1; }
