@@ -238,3 +238,28 @@
   color:hsl(var(--brand-accent)); background:hsl(var(--brand-accent) / .14); font-size:10px; font-weight:700;
 }
 .cu-flow-steps { list-style:decimal; }
+
+/* 顶部状态条 + 分页 ──────────────────────────────────────────
+   状态条始终可见，一眼看清四件事；点哪个就跳到对应分页。 */
+.cu-status-strip { display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:8px; }
+.cu-status-pill {
+  display:grid; grid-template-columns:auto minmax(0,1fr); grid-template-rows:auto auto; column-gap:8px; row-gap:2px;
+  align-items:center; min-width:0; padding:9px 12px; text-align:left; cursor:pointer;
+  border:1px solid hsl(var(--border)); border-radius:10px; background:hsl(var(--card)); color:inherit; font:inherit;
+  transition:border-color var(--motion-fast, 120ms), background-color var(--motion-fast, 120ms);
+}
+.cu-status-pill:hover { border-color:hsl(var(--brand-accent) / .45); background:hsl(var(--brand-accent) / .04); }
+.cu-status-dot { grid-row:1 / span 2; width:8px; height:8px; border-radius:50%; background:hsl(var(--muted-foreground) / .5); }
+.cu-status-pill[data-state=ok] .cu-status-dot { background:hsl(var(--status-success)); box-shadow:0 0 0 3px hsl(var(--status-success) / .15); }
+.cu-status-pill[data-state=warn] .cu-status-dot { background:hsl(var(--status-warning)); box-shadow:0 0 0 3px hsl(var(--status-warning) / .15); }
+.cu-status-label { color:hsl(var(--muted-foreground)); font-size:11px; }
+.cu-status-pill strong { overflow:hidden; font-size:13px; font-weight:600; text-overflow:ellipsis; white-space:nowrap; }
+
+.cu-tabs { margin-top:2px; }
+.cu-tabs button { cursor:pointer; }
+
+@media(max-width:760px) {
+  .cu-status-strip { grid-template-columns:repeat(2, minmax(0,1fr)); }
+  .cu-tabs { width:100%; overflow-x:auto; }
+}
+.cu-content > .cu-runtime-missing { margin-top:0; }
