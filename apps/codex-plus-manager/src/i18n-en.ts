@@ -942,6 +942,9 @@ export const EN_PLAIN: Record<string, string> = {
   "启动 Codex": "Launch Codex",
   "启动任务": "Launch task",
   "启动前自动修复历史会话": "Auto-repair historical sessions before launch",
+  "切换模型后旧会话跟随新默认": "Existing sessions follow the new default model",
+  "切换供应商或默认模型后，下次启动前把仍停在旧默认模型的会话改为新默认；手动选过模型的会话不变。保存设置后生效。":
+    "After switching provider or default model, sessions still on the previous default move to the new default before the next launch. Sessions with a manually chosen model are untouched. Takes effect after saving settings.",
   "启用": "Enable",
   "启用 Codex 图片覆盖层": "Enable Codex image overlay",
   "启用 Codex增强": "Enable Codex enhancements",

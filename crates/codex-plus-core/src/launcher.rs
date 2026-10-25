@@ -899,6 +899,25 @@ where
             }
         }
         timeline.mark("sanitize_historical_model_suffixes_done", 50);
+        // issue #2081：切换时只记录了待迁移项，这里 Codex 尚未启动，再回填旧会话模型。
+        match crate::codex_sqlite::apply_pending_thread_model_migration(
+            &home,
+            settings.thread_model_follow_switch_enabled,
+        ) {
+            Ok(0) => {}
+            Ok(updated) => {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.thread_model_migration",
+                    serde_json::json!({ "updated": updated }),
+                );
+            }
+            Err(error) => {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.thread_model_migration_failed",
+                    serde_json::json!({ "error": error.to_string() }),
+                );
+            }
+        }
         let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings)
             || remote_control_provider_proxy_enabled(&settings);
         // issue #2264：重启链路上的模型漂移修复。launcher 不重放完整 apply（那会

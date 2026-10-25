@@ -693,6 +693,10 @@ pub struct BackendSettings {
     pub codex_extra_args: Vec<String>,
     #[serde(rename = "providerSyncEnabled", default)]
     pub provider_sync_enabled: bool,
+    /// 切换供应商/默认模型后，下次启动前把仍停在旧默认模型的会话迁到新默认（#2081）。
+    /// 默认关闭；用户手动改过模型的会话不受影响。
+    #[serde(rename = "threadModelFollowSwitchEnabled", default)]
+    pub thread_model_follow_switch_enabled: bool,
     #[serde(rename = "providerSyncSavedProviders", default)]
     pub provider_sync_saved_providers: Vec<String>,
     #[serde(rename = "providerSyncManualProviders", default)]
@@ -1009,6 +1013,7 @@ impl Default for BackendSettings {
             codex_app_auto_takeover_when_active: default_auto_takeover_when_active(),
             codex_extra_args: Vec::new(),
             provider_sync_enabled: false,
+            thread_model_follow_switch_enabled: false,
             provider_sync_saved_providers: Vec::new(),
             provider_sync_manual_providers: Vec::new(),
             provider_sync_last_selected_provider: String::new(),
@@ -2219,6 +2224,12 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     }
     if let Some(value) = source.get("providerSyncEnabled").and_then(Value::as_bool) {
         target.insert("providerSyncEnabled".to_string(), Value::Bool(value));
+    }
+    if let Some(value) = source
+        .get("threadModelFollowSwitchEnabled")
+        .and_then(Value::as_bool)
+    {
+        target.insert("threadModelFollowSwitchEnabled".to_string(), Value::Bool(value));
     }
     if let Some(value) = source.get("ccsDbPath").and_then(Value::as_str) {
         target.insert(

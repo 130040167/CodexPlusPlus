@@ -328,6 +328,7 @@ type BackendSettings = WhaleBalanceSettings & {
   codexExtraArgs: string[];
   dictation: DictationSettings;
   providerSyncEnabled: boolean;
+  threadModelFollowSwitchEnabled?: boolean;
   ccsDbPath: string;
   providerSyncSavedProviders: string[];
   providerSyncManualProviders: string[];
@@ -1237,6 +1238,7 @@ const defaultSettings: BackendSettings = {
   codexExtraArgs: [],
   dictation: defaultDictationSettings(),
   providerSyncEnabled: false,
+  threadModelFollowSwitchEnabled: false,
   ccsDbPath: "",
   providerSyncSavedProviders: [],
   providerSyncManualProviders: [],
@@ -8571,6 +8573,19 @@ function SessionRepairPanel({ form, providerSyncProgress, sessionIndexRepairActi
               <span>
                 <strong>{t("启动前自动修复历史会话")}</strong>
                 <small>{t("启动前整理会话归属并检查缺失消息；运行期间每 30 分钟复查索引。保存设置后生效。")}</small>
+              </span>
+              <ToggleVisual />
+            </label>
+
+            <label className="switch-row compact session-auto-repair">
+              <input
+                checked={Boolean(form.threadModelFollowSwitchEnabled)}
+                onChange={(event) => onFormChange({ ...form, threadModelFollowSwitchEnabled: event.currentTarget.checked })}
+                type="checkbox"
+              />
+              <span>
+                <strong>{t("切换模型后旧会话跟随新默认")}</strong>
+                <small>{t("切换供应商或默认模型后，下次启动前把仍停在旧默认模型的会话改为新默认；手动选过模型的会话不变。保存设置后生效。")}</small>
               </span>
               <ToggleVisual />
             </label>

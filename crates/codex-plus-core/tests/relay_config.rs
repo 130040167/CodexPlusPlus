@@ -7044,3 +7044,104 @@ fn unparsable_live_config_does_not_block_switching_provider() {
     assert!(config.contains("base_url = \"https://relay.example/v1\""), "{config}");
     assert!(config.parse::<toml_edit::DocumentMut>().is_ok(), "写出的配置必须可解析：{config}");
 }
+
+fn responses_profile_with_model(model: &str) -> RelayProfile {
+    RelayProfile {
+        id: "custom".to_string(),
+        relay_mode: RelayMode::PureApi,
+        protocol: RelayProtocol::Responses,
+        config_contents: format!(
+            r#"model = "{model}"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "https://responses.example.test/v1"
+"#
+        ),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-test-redacted"}"#.to_string(),
+        ..RelayProfile::default()
+    }
+}
+
+/// issue #2081：切换默认模型时只记录待迁移项，不碰 sqlite；
+/// 下次启动前（opt-in）才把仍停在旧默认的会话迁到新默认，手选模型保持不变。
+#[test]
+fn switching_default_model_defers_thread_model_migration_until_launch() {
+    use codex_plus_core::codex_sqlite::apply_pending_thread_model_migration;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let db_path = home.join("state_5.sqlite");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, model TEXT, updated_at INTEGER)",
+        [],
+    )
+    .unwrap();
+    for (id, model) in [("old", "gpt-5.4"), ("picked", "claude-opus-5")] {
+        conn.execute(
+            "INSERT INTO threads (id, model, updated_at) VALUES (?1, ?2, 1000)",
+            [id, model],
+        )
+        .unwrap();
+    }
+    drop(conn);
+    let model_of = |id: &str| -> String {
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT model FROM threads WHERE id = ?1", [id], |row| row.get(0))
+            .unwrap()
+    };
+
+    apply_relay_profile_to_home_with_switch_rules(home, &responses_profile_with_model("gpt-5.4"), "")
+        .unwrap();
+    apply_relay_profile_to_home_with_switch_rules(home, &responses_profile_with_model("glm-5.2"), "")
+        .unwrap();
+
+    // 切换本身不写 sqlite
+    assert_eq!(model_of("old"), "gpt-5.4");
+
+    assert_eq!(apply_pending_thread_model_migration(home, true).unwrap(), 1);
+    assert_eq!(model_of("old"), "glm-5.2");
+    assert_eq!(model_of("picked"), "claude-opus-5");
+    // 记录已消费，重复启动不再迁移
+    assert_eq!(apply_pending_thread_model_migration(home, true).unwrap(), 0);
+}
+
+/// 开关关闭时启动只丢弃记录，之后再打开也不会翻出旧切换。
+#[test]
+fn disabled_thread_model_migration_discards_pending_record() {
+    use codex_plus_core::codex_sqlite::apply_pending_thread_model_migration;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let db_path = home.join("state_5.sqlite");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, model TEXT, updated_at INTEGER)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO threads (id, model, updated_at) VALUES ('old', 'gpt-5.4', 1000)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    apply_relay_profile_to_home_with_switch_rules(home, &responses_profile_with_model("gpt-5.4"), "")
+        .unwrap();
+    apply_relay_profile_to_home_with_switch_rules(home, &responses_profile_with_model("glm-5.2"), "")
+        .unwrap();
+
+    assert_eq!(apply_pending_thread_model_migration(home, false).unwrap(), 0);
+    assert_eq!(apply_pending_thread_model_migration(home, true).unwrap(), 0);
+    let model: String = rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .query_row("SELECT model FROM threads WHERE id = 'old'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(model, "gpt-5.4");
+}

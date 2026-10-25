@@ -845,6 +845,37 @@ pub fn apply_relay_profile_to_home_with_switch_rules_and_proxy_port(
     common_config_contents: &str,
     proxy_port: u16,
 ) -> anyhow::Result<RelayApplyResult> {
+    let previous_model = live_root_model(home);
+    let result =
+        apply_relay_profile_to_home_inner(home, profile, common_config_contents, proxy_port)?;
+    // issue #2081：默认模型变了就记一笔，旧会话迁移留到下次启动前执行（opt-in）。
+    let new_model = live_root_model(home);
+    if let Err(error) = crate::codex_sqlite::record_pending_thread_model_migration(
+        home,
+        &previous_model,
+        &new_model,
+    ) {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "relay_config.record_thread_model_migration_failed",
+            serde_json::json!({ "message": error.to_string() }),
+        );
+    }
+    Ok(result)
+}
+
+fn live_root_model(home: &Path) -> String {
+    std::fs::read_to_string(home.join("config.toml"))
+        .ok()
+        .and_then(|text| root_key_string(&text, "model"))
+        .unwrap_or_default()
+}
+
+fn apply_relay_profile_to_home_inner(
+    home: &Path,
+    profile: &RelayProfile,
+    common_config_contents: &str,
+    proxy_port: u16,
+) -> anyhow::Result<RelayApplyResult> {
     if profile.relay_mode == RelayMode::Official && !profile.official_mix_api_key {
         return apply_official_profile_to_home(home, profile, common_config_contents);
     }
