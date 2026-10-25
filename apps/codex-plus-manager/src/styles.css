@@ -10726,6 +10726,8 @@ select {
 .provider-add-custom .provider-add-text small{color:hsl(var(--muted-foreground));font-size:12px}
 .provider-add-chevron{flex:none;color:hsl(var(--muted-foreground))}
 .provider-add-empty{margin-top:24px;padding:28px 16px;border:1px dashed hsl(var(--border));border-radius:10px;color:hsl(var(--muted-foreground));font-size:12.5px;text-align:center}
+/* 外框与供应商列表（.mg-page）一致：同宽、14px 圆角、边框，内容裁在圆角里。 */
+.screen.management-screen>.provider-catalog-screen{flex:1 1 auto;width:min(100%,1240px);min-height:0;margin:0 auto 22px;border:1px solid hsl(var(--border));border-radius:14px;overflow:hidden}
 
 /* 四个管理页统一内容容器：外层边框承载页面内容，内部列表保持独立分组。 */
 .mg-page>.mg-content{margin:18px 22px 22px;padding:20px;border:1px solid hsl(var(--border));border-radius:14px;background:hsl(var(--surface-sunken)/.32);box-shadow:var(--shadow-sm)}.mg-page>.mg-content>.mg-matrix,.mg-page>.mg-content>.mg-skill-list,.mg-page>.mg-content>.mg-session-list{background:hsl(var(--card)/.78);border-color:hsl(var(--border)/.95)}.relay-management-page>.mg-content>.relay-management-panel{border:0;background:transparent;box-shadow:none}.relay-management-page>.mg-content>.relay-management-panel:hover{box-shadow:none;border-color:transparent}.relay-management-page>.mg-content>.relay-management-panel>.card-content{padding:0}.mg-page>.mg-content>.mg-notice{margin-top:12px}@media(max-width:760px){.mg-page>.mg-content{margin:14px 14px 18px;padding:14px}}
