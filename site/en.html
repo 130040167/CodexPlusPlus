@@ -121,82 +121,82 @@
     <article class="fcard tilt">
       <span class="fcard-no mono">01</span>
       <h3>Switch providers freely</h3>
-      <p>Official login, official + API, pure API, and aggregate providers: Failover switches on errors, Model aggregation pins models to members. Responses / Chat Completions conversion, model tests, and Provider Doctor.</p>
+      <p>Official login, official + API, pure API, failover, and model aggregation.</p>
     </article>
     <article class="fcard tilt" id="computer-use-feature">
       <span class="fcard-no mono">02</span><span class="fcard-new">NEW</span>
       <h3>Share Computer Use</h3>
-      <p>Expose the Computer Use and Chrome control built into the Codex desktop app over MCP to Claude Code, Claude Desktop, DeepSeek Harness, and more, with a selectable approval policy.</p>
+      <p>Lend Codex's desktop and browser control to other agents.</p>
     </article>
     <article class="fcard tilt">
       <span class="fcard-no mono">03</span><span class="fcard-new">NEW</span>
       <h3>Beyond Codex</h3>
-      <p>Switch Claude Code providers with third-party imports; an enhanced Claude.app copy adds Chinese UI, dictation, and Computer Use; manage the Grok CLI too.</p>
+      <p>Claude Code providers, an enhanced Claude.app, and the Grok CLI.</p>
     </article>
     <article class="fcard tilt">
       <span class="fcard-no mono">04</span><span class="fcard-new">NEW</span>
       <h3>Request log</h3>
-      <p>See status, model, retry reasons, time to first token, and token usage for every request, with in-flight requests updating live and a per-conversation filter.</p>
+      <p>Status, retries, and token usage for every request.</p>
     </article>
     <article class="fcard tilt">
       <span class="fcard-no mono">05</span>
       <h3>Request shock absorption</h3>
-      <p>Back off and retry upstream overloads at the proxy, optionally by HTTP status code. Streaming mode keeps live output; buffered mode absorbs overloads at any point.</p>
+      <p>Back off and retry upstream overloads at the proxy.</p>
     </article>
     <article class="fcard tilt">
       <span class="fcard-no mono">06</span>
       <h3>Every model, its own space</h3>
-      <p>Per-model context windows and auto-compact limits in a dedicated <span class="mono">model_catalog_json</span>, so Codex picks up the right window for the current model.</p>
+      <p>Per-model context windows and auto-compact limits.</p>
     </article>
     <article class="fcard tilt" id="agent-feature">
       <span class="fcard-no mono">07</span>
       <h3>Delegate in a sentence</h3>
-      <p>From a Codex chat, hand work to DeepSeek Harness, Claude Code, or another Codex; the matching CLI runs it and the result lands back in the same chat.</p>
+      <p>Delegate to DeepSeek or Claude Code from a Codex chat.</p>
     </article>
     <article class="fcard tilt">
       <span class="fcard-no mono">08</span>
       <h3>Simpler session management</h3>
-      <p>Scan, delete and undo, bulk-manage, export to Markdown, track token history, and move projects; opt-in turn rewind, and side chats saved as ordinary conversations.</p>
+      <p>Scan, delete and undo, bulk-manage, export, and rewind turns.</p>
     </article>
     <article class="fcard tilt">
       <span class="fcard-no mono">09</span>
       <h3>Many Codex, one machine</h3>
-      <p>Launch an isolated Codex per provider identity with its own config, sessions, and data directory; restart or stop each one individually.</p>
+      <p>One isolated Codex instance per provider.</p>
     </article>
     <article class="fcard tilt" id="native-fast-feature">
       <span class="fcard-no mono">10</span>
       <h3>Native Fast with an API key</h3>
-      <p>Restore the native Standard / ⚡ Fast controls in pure API-key mode. Off by default; availability and billing are up to the provider.</p>
+      <p>Native Standard / ⚡ Fast controls with a pure API key.</p>
     </article>
     <article class="fcard tilt">
       <span class="fcard-no mono">11</span>
       <h3>Usage status line</h3>
-      <p>Live generation speed, cache hit rate, and context usage under the composer, using the same definitions as Codex. On by default.</p>
+      <p>Speed, cache hits, and context usage under the composer.</p>
     </article>
     <article class="fcard tilt">
       <span class="fcard-no mono">12</span>
       <h3>Smoother writing and reading</h3>
-      <p>Dictation with a global hotkey, paste fix, conversation width, scroll restore, next-step suggestions, answer outline, and typing effects.</p>
+      <p>Dictation, paste fix, next-step suggestions, and typing effects.</p>
     </article>
     <article class="fcard tilt">
       <span class="fcard-no mono">13</span>
       <h3>Extend your workspace</h3>
-      <p>Community user scripts, plus MCP, Skill (grouping and bulk actions), and Codex plugin management, and your own scripts with hot reload.</p>
+      <p>Community scripts plus MCP, Skill, and Codex plugin management.</p>
     </article>
     <article class="fcard tilt">
       <span class="fcard-no mono">14</span>
       <h3>WeChat connect</h3>
-      <p>Scan to connect local Codex; each contact maps to its own session, with an allowed-user list. Dispatch work on the go.</p>
+      <p>Scan to connect local Codex and dispatch work on the go.</p>
     </article>
     <article class="fcard tilt">
       <span class="fcard-no mono">15</span><span class="fcard-new">NEW</span>
       <h3>AI agent cache cleanup</h3>
-      <p>Scan the known cache folders of Codex, Claude, and Codex++, see what takes space, and pick what to clear.</p>
+      <p>Scan and clear Codex, Claude, and Codex++ caches.</p>
     </article>
     <article class="fcard tilt">
       <span class="fcard-no mono">16</span>
       <h3>Usage, with company</h3>
-      <p>A usage widget and desktop pet: token stats, task status, and budget alerts; drag, resize, reskin, or use your own images.</p>
+      <p>A usage widget and desktop pet in your own style.</p>
     </article>
   </div>
 </section>
@@ -242,6 +242,34 @@
       <p class="section-sub">Real Codex++ UI and feature graphics. Select a thumbnail to preview; click the large image to view it full size.</p>
     </div>
     <div class="showcase-track" id="showcaseTrack">
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/manager-computer-use.png" target="_blank" rel="noopener"><img src="assets/manager-computer-use.png" alt="Computer Use: AI clients reach ChatGPT.app's native Computer Use and the Chrome extension through Codex++ MCP servers" loading="lazy"></a>
+        <figcaption><b>Share Computer Use</b><span>Click Connect and other agents can drive your desktop and browser.</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/manager-overview.png" target="_blank" rel="noopener"><img src="assets/manager-overview.png" alt="Overview: current provider, 24-hour request stats, and health checks" loading="lazy"></a>
+        <figcaption><b>Overview</b><span>Current provider, recent requests, and health checks at a glance.</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/manager-request-log.png" target="_blank" rel="noopener"><img src="assets/manager-request-log.png" alt="Request log: in-flight requests, automatic retries, time to first token, and token usage" loading="lazy"></a>
+        <figcaption><b>Request log</b><span>Status, retries, time to first token, and tokens, live.</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/manager-claude-providers.png" target="_blank" rel="noopener"><img src="assets/manager-claude-providers.png" alt="Claude Code provider list" loading="lazy"></a>
+        <figcaption><b>Claude Code providers</b><span>A CC Switch-style list with one-click switching.</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/manager-claude-enhance.png" target="_blank" rel="noopener"><img src="assets/manager-claude-enhance.png" alt="Claude enhancements: localization, dictation, and Computer Use" loading="lazy"></a>
+        <figcaption><b>Claude enhancements</b><span>Chinese UI, dictation, and Computer Use; the official app stays untouched.</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/manager-grok.png" target="_blank" rel="noopener"><img src="assets/manager-grok.png" alt="Grok configuration: current config, providers, and models" loading="lazy"></a>
+        <figcaption><b>Grok</b><span>Manage the Grok CLI's models and API endpoints.</span></figcaption>
+      </figure>
+      <figure class="shot">
+        <a class="shot-frame shot-preview" href="assets/manager-agent-cache.png" target="_blank" rel="noopener"><img src="assets/manager-agent-cache.png" alt="AI agent cache cleanup for Codex, Claude, and Codex++" loading="lazy"></a>
+        <figcaption><b>Cache cleanup</b><span>See each agent's cache usage and pick what to clear.</span></figcaption>
+      </figure>
       <figure class="shot shot-agent" id="agent-collaboration">
         <a class="shot-frame shot-preview" href="assets/agent-collaboration.png" target="_blank" rel="noopener" aria-label="Open the full-size sub-agent collaboration screenshot">
           <img src="assets/agent-collaboration.png" width="1766" height="630" loading="lazy" alt="A Codex chat asks DeepSeek what 1+1 is, uses Codex Plus Collaboration, then shows DeepSeek's answer: 1+1 equals 2">

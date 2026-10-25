@@ -132,84 +132,36 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的统一管理应用，通
 
 <table>
   <tr>
-    <td width="50%" valign="top">
-      <h3>🔌 供应商自由切换</h3>
-      官方登录、官方登录 + API、纯 API 与聚合供应商（故障转移 / 模型聚合）。支持 Responses / Chat Completions、模型测试与 Provider Doctor。
-    </td>
-    <td width="50%" valign="top">
-      <h3>🧠 每个模型，各有空间</h3>
-      按模型设置上下文窗口与自动压缩阈值，支持模型元数据导入；按供应商选择 MCP、Skill 和 Plugin。
-    </td>
+    <td width="50%" valign="top"><strong>🔌 供应商自由切换</strong><br>官方登录、官方 + API、纯 API、故障转移与模型聚合。</td>
+    <td width="50%" valign="top"><strong>🧠 每个模型，各有空间</strong><br>按模型设置上下文窗口与自动压缩阈值。</td>
   </tr>
   <tr>
-    <td valign="top">
-      <h3>🖱️ Computer Use 共享 · 新</h3>
-      把 Codex 自带的 Computer Use 与 Chrome 浏览器控制，通过 MCP 接给 Claude Code、Claude Desktop、DeepSeek Harness 等客户端，审批方式可选。
-    </td>
-    <td valign="top">
-      <h3>🤖 不止 Codex · 新</h3>
-      Claude Code 供应商一键切换（CC Switch 风格，支持从第三方导入）；Claude 增强版提供中文界面、语音输入与 Computer Use；另可管理 Grok CLI。
-    </td>
+    <td valign="top"><strong>🖱️ Computer Use 共享 · 新</strong><br>把 Codex 的桌面与浏览器控制接给其他 Agent。</td>
+    <td valign="top"><strong>🤖 Claude Code 与 Grok · 新</strong><br>供应商切换、Claude 增强版、Grok CLI 配置。</td>
   </tr>
   <tr>
-    <td valign="top">
-      <h3>🛡️ 请求避震与请求日志</h3>
-      上游过载时在代理层自动退避重试，可按 HTTP 状态码选择重试；请求日志实时显示进行中的请求、首字耗时、重试原因与 Token 用量，可按会话筛选。
-    </td>
-    <td valign="top">
-      <h3>🤝 子 Agent 协作</h3>
-      在 Codex 对话中用自然语言委派 Codex CLI、DeepSeek Harness（dsh）或 Claude Code，执行结果回到当前对话。
-    </td>
+    <td valign="top"><strong>🛡️ 请求避震与请求日志</strong><br>过载自动重试，每次请求都看得见。</td>
+    <td valign="top"><strong>🤝 子 Agent 协作</strong><br>在 Codex 对话里委派 DeepSeek、Claude Code。</td>
   </tr>
   <tr>
-    <td valign="top">
-      <h3>💬 会话管理更省心</h3>
-      本地会话扫描、删除与撤销、批量管理、Markdown 导出、Token 历史与项目移动；实验性<a href="docs/turn-rewind.md">轮次回退</a>，侧聊可保存为普通会话。
-    </td>
-    <td valign="top">
-      <h3>🧵 Codex 多开</h3>
-      为每个供应商身份启动相互隔离的 Codex 实例，配置、会话和用户数据目录各自独立，可单独重启或结束。
-    </td>
+    <td valign="top"><strong>💬 会话管理</strong><br>扫描、删除撤销、导出、<a href="docs/turn-rewind.md">轮次回退</a>。</td>
+    <td valign="top"><strong>🧵 Codex 多开</strong><br>每个供应商一个隔离实例。</td>
   </tr>
   <tr>
-    <td valign="top">
-      <h3>✨ 输入与阅读，都顺手</h3>
-      语音输入（含全局快捷键）、粘贴修复、会话宽度、滚动位置恢复、下一步建议、回答大纲与光标打字特效。
-    </td>
-    <td valign="top">
-      <h3>📊 用量状态栏</h3>
-      输入框下方实时显示生成速度、缓存命中率和上下文占用，口径与 Codex 一致，默认开启。
-    </td>
+    <td valign="top"><strong>✨ 输入与阅读</strong><br>语音输入、粘贴修复、下一步建议、打字特效。</td>
+    <td valign="top"><strong>📊 用量状态栏</strong><br>速度、缓存命中与上下文占用。</td>
   </tr>
   <tr>
-    <td valign="top">
-      <h3>⚡ 纯 API Key 也能用原生 Fast</h3>
-      按需解锁 Codex 原生 Standard / Fast 控件；默认关闭，实际支持与计费以供应商为准。
-    </td>
-    <td valign="top">
-      <h3>🧩 拓展你的工作区</h3>
-      浏览与管理社区用户脚本，另有 MCP、Skill（支持分组与批量管理）与 Codex 插件管理。
-    </td>
+    <td valign="top"><strong>⚡ API Key 原生 Fast</strong><br>纯 API Key 也能用 Standard / Fast 控件。</td>
+    <td valign="top"><strong>🧩 拓展与插件</strong><br>社区脚本、MCP、Skill 与 Codex 插件。</td>
   </tr>
   <tr>
-    <td valign="top">
-      <h3>📱 微信连接</h3>
-      扫码连接本机 Codex，每个联系人映射到独立会话，并可配置允许访问的微信用户。
-    </td>
-    <td valign="top">
-      <h3>🧹 AI Agent 缓存清理 · 新</h3>
-      扫描 Codex、Claude 与 Codex++ 的已知缓存目录，列出占用，由你勾选清理。
-    </td>
+    <td valign="top"><strong>📱 微信连接</strong><br>扫码连接本机 Codex。</td>
+    <td valign="top"><strong>🧹 AI Agent 缓存清理 · 新</strong><br>扫描并清理 Codex、Claude 缓存。</td>
   </tr>
   <tr>
-    <td valign="top">
-      <h3>🐳 用量挂件与桌宠 · 开发预览</h3>
-      Token 统计、任务状态和预算提醒，可拖动、缩放、更换角色。
-    </td>
-    <td valign="top">
-      <h3>🎨 皮肤与个性化</h3>
-      Dream Skin 社区主题、自定义图片覆盖层，让界面更有自己的风格。
-    </td>
+    <td valign="top"><strong>🐳 用量挂件与桌宠 · 开发预览</strong><br>Token 统计、任务状态与预算提醒。</td>
+    <td valign="top"><strong>🎨 皮肤与个性化</strong><br>社区主题与自定义图片。</td>
   </tr>
 </table>
 
@@ -217,50 +169,50 @@ Codex++ 是面向 OpenAI Codex / ChatGPT 桌面应用的统一管理应用，通
 
 ## 看看它能做什么
 
+### 概览：当前供应商、最近请求与健康检查，一屏看完
+
+<p align="center">
+  <img src="docs/images/readme-preview/manager-overview.png" alt="概览页：当前供应商、最近 24 小时请求统计与健康检查" width="100%">
+</p>
+
 ### Computer Use：把 Codex 的桌面控制借给其他 Agent
 
-Codex 桌面版（ChatGPT.app）自带 Computer Use 与 Chrome 浏览器控制。Codex++ 把它们包装成两个 MCP 服务（`codex-plus-cu` 桌面操控、`codex-plus-browser` 浏览器控制），接给 Claude Code、Claude Desktop、Codex CLI、DeepSeek Harness、ZCode、WorkBuddy 等客户端，不复制任何官方程序，运行时始终指向本机已安装的 ChatGPT.app。
+给客户端点「接入」，重启后就能在 Claude Code、Claude Desktop、DeepSeek Harness 等里操作桌面和浏览器。目前仅支持 macOS。
 
-1. 确认本机已安装并打开过一次 Codex 桌面版，且已授予辅助功能与屏幕录制权限。
-2. 在最左栏打开「Computer Use」，在工作原理图左侧给要用的客户端点「接入」；客户端换了配置目录时，可以在下方「配置路径与自定义目录」里登记。
-3. 在 `codex-plus-cu` 节点上选择审批方式：「自动放行」只记审计日志，「交给 Claude」由客户端弹卡确认。
-4. 重启对应客户端，工具名以 `mcp__codex-plus-cu__` 与 `mcp__codex-plus-browser__` 开头。
+<p align="center">
+  <img src="docs/images/readme-preview/manager-computer-use.png" alt="Computer Use 工作原理：AI 客户端经 Codex++ MCP 服务调用 ChatGPT.app 的原生 Computer Use 与 Chrome 扩展" width="100%">
+</p>
 
-写入客户端配置前会自动备份，只改动 Codex++ 自己写入的条目。浏览器控制依赖官方 ChatGPT for Chrome 扩展。目前仅支持 macOS。
+### 请求日志与自动重试
+
+<p align="center">
+  <img src="docs/images/readme-preview/manager-request-log.png" alt="请求日志：进行中的请求、自动重试、首字耗时、输入输出与缓存 Token" width="100%">
+</p>
+
+<p align="center">
+  <img src="docs/images/readme-preview/request-status-auto-retry.png" alt="请求状态与自动重试：模型繁忙后自动等待、重试成功并继续生成" width="100%">
+</p>
 
 ### Claude Code 与 Grok，也在同一个地方管
 
-最左栏切换 Agent 即可进入各自的页面：
+<table>
+  <tr>
+    <td width="50%" valign="top"><strong>Claude Code 供应商</strong><br><img src="docs/images/readme-preview/manager-claude-providers.png" alt="Claude Code 供应商列表：官方登录、API 中转与当前配置" width="100%"></td>
+    <td width="50%" valign="top"><strong>Claude 增强版</strong><br><img src="docs/images/readme-preview/manager-claude-enhance.png" alt="Claude 增强：受管增强版，可开关界面汉化、语音输入与 Computer Use" width="100%"></td>
+  </tr>
+  <tr>
+    <td valign="top"><strong>Grok 配置</strong><br><img src="docs/images/readme-preview/manager-grok.png" alt="Grok 配置：当前配置、供应商列表与模型编辑" width="100%"></td>
+    <td valign="top"><strong>AI Agent 缓存清理</strong><br><img src="docs/images/readme-preview/manager-agent-cache.png" alt="AI Agent 缓存清理：按 Codex、Claude、Codex++ 列出可清理的缓存" width="100%"></td>
+  </tr>
+</table>
 
-- **Claude Code 供应商**：参考 CC Switch 的列表与编辑体验，切换时写入 `~/.claude/settings.json`，支持从 cc-switch 等第三方导入。
-- **Claude 增强**：保留官方 Claude.app 原样，制作一份独立副本并在启动时注入增强，可分别开关中文界面、输入框语音输入与 Computer Use（Computer Use 暂仅 macOS）。
-- **Grok 配置**：管理 Grok CLI 的模型与 API 端点。
-
-### 请求状态、自动重试与请求日志
-
-模型容量不足或暂时过载（`server_overloaded`、`at capacity` 等）时，Codex++ 在代理层自动等待并重试，恢复后继续生成。「代理设置 → 请求避震」可选两种模式：**流式避震**保留实时输出，首字后的过载交给 Codex 原生重试；**整段缓冲避震**先收完整段响应，任何时点的过载都由代理重试（代价是失去流式）。本地协议代理常驻运行，Codex 退出后仍可用。
-
-<p align="center">
-  <img src="docs/images/readme-preview/request-status-auto-retry.png" alt="请求状态与自动重试：展示发送请求、模型繁忙后自动等待、重试成功并继续生成的流程，以及重试次数和上一次过载原因" width="100%">
-</p>
-
-「请求日志」记录经过本地代理的每一次请求：状态、模型、重试次数与原因、首字耗时、输入 / 输出 / 缓存 Token，进行中的请求实时更新，可按会话筛选。
-
-<p align="center">
-  <img src="docs/images/readme-preview/request-log-auto-retry.png" alt="请求日志与自动重试：实时显示进行中的请求、模型已满、自动重试次数和重试成功结果" width="100%">
-</p>
-
-### 输入框下方，用量一目了然
-
-「用量状态栏」实时显示生成速度、缓存命中率和上下文占用。数据取自 Codex 写入的本机会话记录：缓存命中为 `cached_input_tokens / input_tokens`，上下文占用按 Codex 识别到的每模型窗口计算。默认开启，可在「Codex 增强 → 常用增强」关闭。速度包含工具执行时间，读数会低于纯解码速度。
+### 用量状态栏
 
 <p align="center">
   <img src="docs/images/usage-statusline.png" alt="输入框下方的用量状态栏：51 tok/s、缓存命中 99.9%、上下文占用 19%" width="100%">
 </p>
 
-### 同一台电脑，多个 Codex 互不打扰
-
-「Codex多开」为每个供应商身份启动相互隔离的 Codex 实例。运行中的主 Codex 与多开实例集中在列表里，可单独重启或结束，不影响彼此会话。
+### Codex 多开
 
 <p align="center">
   <img src="docs/images/codex-multi-launch.png" alt="Codex 多开：列出运行中的 DeepSeek 与 Zhipu GLM 实例，可单独重启或结束" width="100%">
@@ -268,38 +220,19 @@ Codex 桌面版（ChatGPT.app）自带 Computer Use 与 Chrome 浏览器控制�
 
 ### 在 Codex 对话里，直接请其他 Agent 帮忙
 
-对 Codex 说「让 DeepSeek 实现这个功能」或「让 Claude Code 审核改动」，Codex++ 会通过 MCP 启动对应的原生 CLI，结果回到当前对话。点名时使用对应 Agent，未点名时使用默认 Agent。
-
-1. 打开「Agent 协作」，启用协作及要使用的 Agent，选择默认 Agent 并保存。
-2. 点击「一键接入并刷新」，将协作工具接入 Codex。
-3. 回到 Codex 对话，直接点名分派任务。
+对 Codex 说「让 DeepSeek 实现这个功能」，结果回到当前对话。配置见 [子 Agent 协作指南](docs/agent-collaboration.md)。
 
 <p align="center">
   <img src="docs/images/agent-collaboration.png" alt="实测：问问 DeepSeek 1+1 是多少，通过 Codex Plus Collaboration 协作集成返回 2" width="100%">
 </p>
 
-模型路由、DSH 登录复用与任务配置见 [子 Agent 协作指南](docs/agent-collaboration.md)。
-
-### 纯 API Key，也能使用原生 Fast 控件
-
-1. 打开「Codex 增强 → 常用增强」，开启增强总开关与「原生 Fast 强制解锁」（默认关闭）。
-2. 确认模型已声明 Fast 服务等级；需要手动配置时，在「供应商配置」中为该模型设置「Fast（priority）支持」并保存。
-3. 从 Codex++ 重新启动 Codex，在模型或推理强度菜单中选择 **⚡ Fast**；选择 **Standard** 即可恢复。
-
-实际可用性、提速效果与计费由供应商决定，开启后不会让所有模型自动提速。
-
-<details>
-  <summary><strong>展开查看 Codex 内的增强设置</strong></summary>
+### 模型选择器按供应商分组
 
 <p align="center">
-  <img src="docs/images/readme-preview/in-app-settings.png" alt="Codex 内的增强设置示例：后端状态、模型列表与会话操作" width="100%">
+  <img src="docs/images/readme-preview/model-picker-groups.png" alt="模型选择器按供应商分组折叠：供应商 4 组（默认，7 个模型）与 DeepSeek 组（2 个模型）" width="560">
 </p>
 
-</details>
-
-### 让拓展适应你的工作流
-
-从拓展市场发现社区脚本，为工作区添加用量面板、模型选择器、提示词优化等工具，按需安装、启停，也可以编写自己的脚本。这里的「拓展」是 Codex++ 用户脚本，与 Codex 官方插件市场是两个入口；开发说明见 [用户脚本热重载](docs/user-script-reload.md)。
+### 拓展市场
 
 <p align="center">
   <img src="docs/images/readme-preview/extension-market.png" alt="Codex++ 拓展市场：浏览社区脚本和工作流工具" width="100%">
@@ -310,21 +243,30 @@ Codex 桌面版（ChatGPT.app）自带 Computer Use 与 Chrome 浏览器控制�
 <table>
   <tr>
     <td width="42%" valign="top">
-      <strong>用量挂件与桌宠 · 开发预览</strong><br>
-      查看本地会话 Token 与任务状态，支持拖动、缩放和更换角色图片。
+      <strong>用量挂件与桌宠 · 开发预览</strong>
       <p><img src="docs/images/readme-preview/usage-widget.png" alt="角色用量挂件：气泡显示 Token 统计和运行状态" width="100%"></p>
     </td>
     <td width="58%" valign="top">
-      <strong>光标打字特效</strong><br>
-      彩虹粒子、烟花与星光，让输入多一点反馈。可随时关闭，系统减少动态效果时暂停。
+      <strong>光标打字特效</strong>
       <p><img src="docs/images/readme-preview/typing-effects.png" alt="Codex 输入框中的彩虹粒子打字特效" width="100%"></p>
     </td>
   </tr>
 </table>
 
-用量挂件在「Codex 增强 → 常用增强 → 挂件与桌宠」开启（默认关闭），包含原版角色、泡泡编辑器、音效与资源管理、余额与额度模板等。使用说明与统计口径见 [Codex 用量挂件](docs/whale-widget.md)，功能核对见 [完整功能验收](docs/whale-parity.md)。
+用量挂件在「Codex 增强 → 常用增强 → 挂件与桌宠」开启，说明见 [Codex 用量挂件](docs/whale-widget.md)。
 
 **鲸鱼功能来源与鸣谢：**原始功能、完整界面引擎、鲸鱼角色及内置音效/动图来自 [MeteorNOX/DeepSeek-Balance-Whale-Widget](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget)，本项目将其适配为 Codex++ 内置功能；Codex 桌面版技术路线另参考 [Yang-huai406/Codex-Whale-Public](https://github.com/Yang-huai406/Codex-Whale-Public)。原始代码与素材声明见随项目保留的 [LICENSE](assets/inject/upstream/whale-widget/LICENSE) 和 [PROVENANCE.md](assets/inject/upstream/whale-widget/PROVENANCE.md)，素材不重新声明为本项目原创。
+
+<details>
+  <summary><strong>纯 API Key 如何开启原生 Fast</strong></summary>
+
+1. 打开「Codex 增强 → 常用增强」，开启增强总开关与「原生 Fast 强制解锁」（默认关闭）。
+2. 在「供应商配置」中为该模型设置「Fast（priority）支持」并保存。
+3. 从 Codex++ 重启 Codex，在模型菜单中选择 **⚡ Fast**。
+
+实际可用性与计费由供应商决定。
+
+</details>
 
 ## 快速上手
 
@@ -335,9 +277,9 @@ Codex 桌面版（ChatGPT.app）自带 Computer Use 与 Chrome 浏览器控制�
 | Windows · x64 | `CodexPlusPlus-*-windows-x64-setup.exe` |
 | macOS · Apple Silicon / Intel | `CodexPlusPlus-*-macos-universal.dmg` |
 
-**2. 打开 Codex++ 完成配置**：Windows 提供桌面与开始菜单快捷方式，macOS 将 DMG 内的 **Codex++.app** 拖入「应用程序」。首次使用先确认官方应用路径（需已安装 Codex / ChatGPT 桌面应用），再选择供应商，按需开启增强功能。
+**2. 打开 Codex++ 完成配置**：确认官方 Codex / ChatGPT 桌面应用路径，选择供应商，按需开启增强。
 
-**3. 在界面中启动 Codex**：点击「启动 Codex」，加载已保存的配置并打开官方应用。依赖注入的设置需要保存后在界面中重启 Codex 才生效。更新可在「关于」页检查，有新版本时左上角 logo 会出现角标，点一下即可更新。
+**3. 点击「启动 Codex」**：依赖注入的设置需在界面中重启 Codex 才生效。
 
 <details>
   <summary><strong>从旧版 macOS 升级</strong></summary>
@@ -348,28 +290,14 @@ Codex 桌面版（ChatGPT.app）自带 Computer Use 与 Chrome 浏览器控制�
 
 ## 供应商与模型
 
-### 选一种适合你的使用方式
-
 | 模式 | 适用场景 |
 | --- | --- |
 | **官方登录** | 使用 ChatGPT / Codex 官方账号。 |
-| **官方登录 + API** | 保留官方登录状态与插件入口，模型请求始终走配置的兼容 API（不消耗官方额度）。 |
-| **纯 API** | 使用自定义 Base URL / Key，无需官方账号。 |
-| **聚合供应商** | **故障转移**：在多个供应商之间失败切换，按会话 / 请求 / 权重轮转。**模型聚合**：成员模型合并进 Codex 模型列表，带 `cpx-供应商ID/模型名` 前缀的条目固定发往对应成员。 |
+| **官方登录 + API** | 保留官方登录与插件入口，模型请求走兼容 API（不消耗官方额度）。 |
+| **纯 API** | 自定义 Base URL / Key，无需官方账号。 |
+| **聚合供应商** | **故障转移**：多个供应商之间失败切换与轮转。**模型聚合**：带 `cpx-供应商ID/模型名` 前缀的模型固定发往对应成员。 |
 
-Chat Completions 供应商可通过本地代理转换为 Codex 使用的 Responses 协议。聚合成员既可以是 API 供应商，也可以是已登录的官方账号：代理用该账号的 OAuth 凭据访问官方后端，token 过期时自动刷新，返回 401 时强制刷新后重试一次。供应商还可以配置自动审批模型，改写 Codex 的 `codex-auto-review` 请求。
-
-### 模型选择器：按供应商分组折叠
-
-模型聚合后，原生模型选择器按供应商折叠成组：表头显示供应商名与模型数量，默认成员带「默认」标志，支持「全部展开 / 全部折叠」并记住折叠状态；单供应商保持原生列表不动。
-
-<p align="center">
-  <img src="docs/images/readme-preview/model-picker-groups.png" alt="模型选择器按供应商分组折叠：供应商 4 组（默认，7 个模型）与 DeepSeek 组（2 个模型）" width="560">
-</p>
-
-### 给每个模型设置自己的上下文窗口
-
-在模型列表中使用窗口后缀，支持 `1M`、`200K` 或纯数字：
+在模型列表中加窗口后缀，即可给每个模型设置自己的上下文窗口：
 
 ```text
 deepseek-v4-pro[1M]
@@ -377,9 +305,7 @@ your-model[200K]
 another-model[128000]
 ```
 
-Codex++ 会生成独立的 `model_catalog_json`，让 Codex 按当前模型使用对应窗口；未指定后缀的模型沿用供应商级配置。请按供应商实际能力填写。
-
-切换供应商时会先保存当前配置，再写入目标配置。API Key 只保存在本机，提交反馈前请隐藏密钥与认证信息。
+API Key 只保存在本机，提交反馈前请隐藏密钥与认证信息。
 
 ## 常见问题
 

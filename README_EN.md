@@ -58,35 +58,58 @@ Friendly link: <a href="https://linux.do">LINUX DO</a>
 
 Every UI enhancement is independently configurable. Disabling the global enhancement switch still leaves Codex++ available as a provider and launch manager.
 
-**Computer Use sharing** wraps the desktop control in the Codex desktop app as two MCP servers, `codex-plus-cu` (desktop) and `codex-plus-browser` (Chrome), without copying any official binaries. Open **Computer Use** in the left rail, click **Connect** (「接入」) next to each client in the diagram, choose an approval policy on the `codex-plus-cu` node (「自动放行」 auto-approves with an audit log; 「交给 Claude」 lets the client confirm with an approval card), then restart the client. Codex++ backs up client configs before writing and only edits its own entries. Browser control requires the official ChatGPT for Chrome extension.
+## Screenshots
 
-**Usage status line** uses the same definitions as Codex: cache hit is `cached_input_tokens / input_tokens`, and context usage compares the latest call's tokens against the per-model window Codex sees. It is on by default and can be disabled under Codex Enhancements → General. Speed includes tool execution time, so it reads below raw decode speed.
+**Overview** — current provider, last 24 hours of requests, and health checks.
+
+<p align="center">
+  <img src="docs/images/readme-preview/manager-overview.png" alt="Overview: current provider, 24-hour request stats, and health checks" width="100%">
+</p>
+
+**Computer Use sharing** — click Connect (「接入」) next to a client and restart it; tools appear as `mcp__codex-plus-cu__*` and `mcp__codex-plus-browser__*` (macOS).
+
+<p align="center">
+  <img src="docs/images/readme-preview/manager-computer-use.png" alt="Computer Use: AI clients reach ChatGPT.app's native Computer Use and the Chrome extension through Codex++ MCP servers" width="100%">
+</p>
+
+**Request log and automatic retries**
+
+<p align="center">
+  <img src="docs/images/readme-preview/manager-request-log.png" alt="Request log: in-flight requests, automatic retries, time to first token, and input, output, and cached tokens" width="100%">
+</p>
+
+**Claude Code, Claude enhancements, Grok, and AI agent cache cleanup**
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/readme-preview/manager-claude-providers.png" alt="Claude Code providers" width="100%"></td>
+    <td width="50%"><img src="docs/images/readme-preview/manager-claude-enhance.png" alt="Claude enhancements: localization, dictation, and Computer Use" width="100%"></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/readme-preview/manager-grok.png" alt="Grok configuration" width="100%"></td>
+    <td><img src="docs/images/readme-preview/manager-agent-cache.png" alt="AI agent cache cleanup for Codex, Claude, and Codex++" width="100%"></td>
+  </tr>
+</table>
+
+**Usage status line**
 
 <p align="center">
   <img src="docs/images/usage-statusline.png" alt="Usage status line below the composer: 51 tok/s, cache hit 99.9%, context usage 19%" width="100%">
 </p>
 
-**Codex multi-launch** runs one isolated Codex instance per provider identity, side by side without sharing sessions.
+**Codex multi-launch**
 
 <p align="center">
   <img src="docs/images/codex-multi-launch.png" alt="Codex multi-launch: running DeepSeek and Zhipu GLM instances with restart and stop actions" width="100%">
 </p>
 
-**Sub-agent collaboration** lets you say “Have DeepSeek implement this feature” or “Ask Claude Code to review the changes” directly in a Codex chat. Codex++ starts the corresponding native CLI through MCP and returns its results to the same chat. It supports Codex CLI, DeepSeek Harness (`dsh`), and Claude Code; naming an agent selects that agent, while an unspecified delegation uses your configured default.
-
-Configure the default agent, CLI paths, models, and DeepSeek's `provider/model` route in the manager. You can optionally enable reuse of DSH's saved login and keys, letting dsh use its native authentication without storing another copy in Codex++.
-
-1. Open **Agent collaboration**, enable collaboration and the agents you want to use, select a default agent, and save.
-2. Click **Connect and refresh** (「一键接入并刷新」) to add the collaboration tools to Codex.
-3. Return to the Codex chat, name an agent and its task, and wait for the result.
+**Sub-agent collaboration** — say “Have DeepSeek implement this feature” in a Codex chat; see the [guide](docs/agent-collaboration.md).
 
 <p align="center">
   <img src="docs/images/agent-collaboration.png" alt="Verified DeepSeek example: ask what 1+1 equals and receive 2 through the Codex Plus Collaboration integration" width="100%">
 </p>
 
-Verified example: “Ask DeepSeek what 1+1 equals” → the collaboration integration returns DeepSeek's answer, “1+1 equals 2.” See the [sub-agent collaboration guide](docs/agent-collaboration.md) for model routes, authentication, and task settings.
-
-Enable the optional Codex usage widget under Codex Enhancements → General → Widgets and pets. It includes the original character, modular bubble editor, sound library and waveform trimming, character/image/audio management, edge snapping and alerts. View session and local usage, observed subscription windows and costs estimated from configured prices, or connect provider balance and quota templates. See the [widget guide](docs/whale-widget.md) and [feature verification](docs/whale-parity.md).
+The optional usage widget lives under Codex Enhancements → General → Widgets and pets; see the [widget guide](docs/whale-widget.md).
 
 **Whale widget source and credits:** The original features, complete UI engine, character, built-in sounds and animations come from [MeteorNOX/DeepSeek-Balance-Whale-Widget](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget), adapted here as a built-in Codex++ feature. The Codex desktop architecture also references [Yang-huai406/Codex-Whale-Public](https://github.com/Yang-huai406/Codex-Whale-Public). The upstream [LICENSE](assets/inject/upstream/whale-widget/LICENSE) and [PROVENANCE.md](assets/inject/upstream/whale-widget/PROVENANCE.md) are preserved; the media assets are not claimed as original work by this project.
 
@@ -105,13 +128,7 @@ Each provider can configure Responses or Chat Completions, model lists, a test m
 
 Per-model windows accept values such as `1M`, `200K`, or plain integers. Codex++ generates a dedicated `model_catalog_json` for Codex.
 
-When creating an aggregate provider, first choose **Failover** or **Model aggregation**. The two types have separate forms and runtime behavior. Model aggregation merges member models into Codex's model list and binds `cpx-<provider-id>/` entries to that member; Failover uses failover, rotation, and weights. Each member keeps its own model list, context window, and auto-compact settings.
-
-Members can be ordinary API providers or official accounts with a completed ChatGPT login. For official members the proxy sends requests to the chatgpt.com backend with that account's OAuth credentials, refreshes the access token with its refresh token when needed (writing the rotated tokens back to the provider snapshot), and retries once after a 401. When the same account is also used directly, the live auth.json credentials take precedence so refresh-token rotation cannot invalidate the snapshot.
-
-### A model picker that folds by provider
-
-Model aggregation merges several members' models into one catalog. The native model picker now folds them into a collapsible group per provider: headers show the provider name and model count, model names drop the repeated "（provider）" suffix, and the default member's group carries a **Default** badge. An "expand all / collapse all" control sits in the corner, collapse state is remembered per provider, and opening the picker expands just the group holding the current selection (or the default provider when nothing is selected). Single-provider setups keep the untouched native list.
+With model aggregation, the native model picker folds models into one group per provider.
 
 <p align="center">
   <img src="docs/images/readme-preview/model-picker-groups.png" alt="Model picker folded by provider: Provider 4 group (Default, 7 models) and DeepSeek group (2 models)" width="560">
