@@ -11592,9 +11592,22 @@ select {
   font-size: 12px;
 }
 
+.relay-management-page .provider-view-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 0 12px;
+}
+
+.relay-management-page .provider-view-bar .provider-aggregate-toolbar {
+  margin: 0;
+}
+
 /* 模式分页：降成与其它页一致的小号分段控件，不再像一排主按钮。 */
 .relay-management-page .provider-view-tabs {
-  margin: 0 0 12px;
+  margin: 0;
   border-color: hsl(var(--border));
   border-radius: 8px;
 }

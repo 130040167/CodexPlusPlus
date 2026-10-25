@@ -6648,7 +6648,9 @@ function RelayScreen({
           {/* 总开关关闭时供应商切换不会写入 Codex：分页和列表都没有意义，整块隐藏，只留上方提示条。 */}
           {normalized.relayProfilesEnabled ? (
             <>
-            <div className="provider-view-tabs" role="tablist" aria-label={t("供应商配置模式")}>
+            {/* 分页与「新建」按钮同一行：按钮靠右，不再单独占一行把列表往下推。 */}
+            <div className="provider-view-bar">
+              <div className="provider-view-tabs" role="tablist" aria-label={t("供应商配置模式")}>
                 <button aria-selected={providerView === "direct"} className={providerView === "direct" ? "active" : ""} onClick={() => selectProviderView("direct")} role="tab" title={t("直接访问 Responses API 供应商：只写入 Base URL 与 Key，不做协议转换。")} type="button">
                   <Cable className="h-4 w-4" />
                   <span>{t("直连")}</span>
@@ -6670,6 +6672,19 @@ function RelayScreen({
                   <CircleHelp className="provider-view-help" size={13} />
                 </button>
               </div>
+              {(providerView === "failover" || providerView === "modelAggregation") && visibleProfiles.length ? (
+                <div className="provider-aggregate-toolbar">
+                  <Button
+                    onClick={() => createNewAggregateProfile(providerView === "failover" ? "provider" : "model")}
+                    size="sm"
+                    variant="secondary"
+                  >
+                    <Plus className="h-4 w-4" />
+                    {providerView === "failover" ? t("新建故障转移") : t("新建模型聚合")}
+                  </Button>
+                </div>
+              ) : null}
+            </div>
               {providerView === "direct" && !visibleProfiles.length ? (
                 <div className="provider-aggregate-empty">
                   <strong>{t("这个分页还没有直连供应商")}</strong>
@@ -6696,18 +6711,6 @@ function RelayScreen({
                   <strong>{t("还没有模型聚合配置")}</strong>
                   <span>{t("把成员模型合并到 Codex 列表，选中模型会固定发送到对应供应商。")}</span>
                   <Button onClick={() => createNewAggregateProfile("model")}>{t("创建模型聚合配置")}</Button>
-                </div>
-              ) : null}
-              {(providerView === "failover" || providerView === "modelAggregation") && visibleProfiles.length ? (
-                <div className="provider-aggregate-toolbar">
-                  <Button
-                    onClick={() => createNewAggregateProfile(providerView === "failover" ? "provider" : "model")}
-                    size="sm"
-                    variant="secondary"
-                  >
-                    <Plus className="h-4 w-4" />
-                    {providerView === "failover" ? t("新建故障转移") : t("新建模型聚合")}
-                  </Button>
                 </div>
               ) : null}
               <RelayProfileList
