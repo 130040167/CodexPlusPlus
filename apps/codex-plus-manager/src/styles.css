@@ -9224,7 +9224,7 @@ select {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 22px;
-  width: auto;
+  flex: 1;
   min-width: 0;
   margin: 0;
   padding: 0;
@@ -9279,6 +9279,25 @@ select {
   gap: 20px;
   padding: 0 18px;
   border-top: 1px solid hsl(var(--border) / 0.65);
+}
+
+.enhance-tabs-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-right: 18px;
+  border-top: 1px solid hsl(var(--border) / 0.65);
+}
+
+.enhance-tabs-row .enhance-tabs {
+  flex: 1;
+  min-width: 0;
+  border-top: 0;
+}
+
+.enhance-tabs-row .enhance-save-actions {
+  flex-shrink: 1;
+  min-width: 0;
 }
 
 .enhance-tabs button {
@@ -9540,13 +9559,12 @@ select {
     padding: 12px;
   }
 
-  .enhance-save-actions {
-    width: 100%;
-    justify-content: space-between;
-  }
-
   .enhance-tabs {
     padding-inline: 12px;
+  }
+
+  .enhance-tabs-row {
+    padding-right: 12px;
   }
 
   .enhance-feature-groups .feature-group-head {
@@ -11262,20 +11280,32 @@ select {
   gap: 12px;
 }
 
+/* 宽屏一行排下，靠搜索框和会话筛选收缩；换行会先把「清空」挤下去，只在窄屏允许。 */
 .request-log-toolbar {
   display: flex;
   min-width: 0;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 8px;
 }
 
+.request-log-toolbar > button,
+.request-log-toolbar > .request-log-filter:not(.request-log-session-filter) {
+  flex-shrink: 0;
+}
+
+@media (max-width: 760px) {
+  .request-log-toolbar {
+    flex-wrap: wrap;
+  }
+}
+
 .request-log-search {
   display: flex;
-  flex: 1 1 260px;
+  flex: 1 1 220px;
   align-items: center;
   gap: 6px;
-  min-width: 180px;
+  min-width: 140px;
 }
 
 .request-log-search svg {
@@ -11292,7 +11322,10 @@ select {
   font-size: 12px;
 }
 
+/* 会话名可能很长：给出可收缩的宽度，避免把「清空」挤到第二行。 */
 .request-log-session-filter {
+  flex: 0 1 220px;
+  min-width: 110px;
   max-width: 260px;
 }
 

@@ -6293,7 +6293,7 @@ function RelayEnvironmentScreen({ result, actions }: { result: RelayEnvironmentR
 }
 
 function RelayScreen({
-  settings: _settings,
+  settings,
   relayFiles,
   envConflicts,
   ccsProviders,
@@ -6313,7 +6313,14 @@ function RelayScreen({
   const [providerCatalogOpen, setProviderCatalogOpen] = useState(false);
   // 目录页的搜索词放在这里：从模板进入编辑页再返回时，目录页会重新挂载，搜索不能丢。
   const [providerCatalogQuery, setProviderCatalogQuery] = useState("");
-  const [providerView, setProviderView] = useState<ProviderViewKind>("direct");
+  // 进入时停在当前供应商所在的分区；找不到当前供应商时，没有直连项就展示协议转换分区。
+  const initialProviderView = (): ProviderViewKind => {
+    const active = normalized.relayProfiles.find((profile) => profile.id === normalized.activeRelayId);
+    if (active) return relayProviderView(active);
+    const views = normalized.relayProfiles.map(relayProviderView);
+    return !views.includes("direct") && views.includes("routing") ? "routing" : "direct";
+  };
+  const [providerView, setProviderView] = useState<ProviderViewKind>(initialProviderView);
   const [newAggregateMode, setNewAggregateMode] = useState<AggregateMode | null>(null);
   const [thirdPartyImportOpen, setThirdPartyImportOpen] = useState(false);
   const thirdPartyImportTriggerRef = useRef<HTMLDivElement>(null);
@@ -6381,18 +6388,12 @@ function RelayScreen({
     setProviderView(view);
   };
   useEffect(() => {
-    // 协议转换供应商归入独立分区；首次打开时如果没有直连项，直接展示该分区。
+    // 设置读回之前表单是默认值（自带一个 default 供应商），不能据此定分区。
     if (providerViewAutoSelectedRef.current) return;
-    if (!normalized.relayProfiles.length) return;
+    if (!settings || !normalized.relayProfiles.length) return;
     providerViewAutoSelectedRef.current = true;
-    if (
-      providerView === "direct"
-      && !normalized.relayProfiles.some((profile) => relayProviderView(profile) === "direct")
-      && normalized.relayProfiles.some((profile) => relayProviderView(profile) === "routing")
-    ) {
-      setProviderView("routing");
-    }
-  }, [normalized.relayProfiles, providerView]);
+    setProviderView(initialProviderView());
+  }, [settings, normalized.relayProfiles, normalized.activeRelayId]);
   // 分页仅控制渲染。卡片的删除、复制和排序必须基于完整配置，避免隐藏的
   // 当前供应商被 syncLegacyRelayFields 当成不存在，改写成直连列表第一项。
   const switchRelayProfileFromList = (profileId: string) => {
@@ -7505,35 +7506,38 @@ function EnhanceScreen({
             </span>
             <ToggleVisual />
           </label>
+        </div>
+        {/* 开关独占一行靠右；保存状态移到分页栏右侧。 */}
+        <div className="enhance-tabs-row">
+          <div className="enhance-tabs" role="tablist" aria-label={t("Codex增强")}>
+            {tabs.map((tab, index) => (
+              <button
+                key={tab.value}
+                id={`enhance-tab-${tab.value}`}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === tab.value}
+                aria-controls={`enhance-pane-${tab.value}`}
+                tabIndex={activeTab === tab.value ? 0 : -1}
+                onClick={() => selectTab(tab.value)}
+                onKeyDown={(event) => {
+                  const nextIndex = event.key === "ArrowRight" ? (index + 1) % tabs.length
+                    : event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length
+                      : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : null;
+                  if (nextIndex === null) return;
+                  event.preventDefault();
+                  const nextTab = tabs[nextIndex].value;
+                  selectTab(nextTab);
+                  document.getElementById(`enhance-tab-${nextTab}`)?.focus();
+                }}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
           <div className="enhance-save-actions">
             <AutoSaveStatus state={autoSave} />
           </div>
-        </div>
-        <div className="enhance-tabs" role="tablist" aria-label={t("Codex增强")}>
-          {tabs.map((tab, index) => (
-            <button
-              key={tab.value}
-              id={`enhance-tab-${tab.value}`}
-              type="button"
-              role="tab"
-              aria-selected={activeTab === tab.value}
-              aria-controls={`enhance-pane-${tab.value}`}
-              tabIndex={activeTab === tab.value ? 0 : -1}
-              onClick={() => selectTab(tab.value)}
-              onKeyDown={(event) => {
-                const nextIndex = event.key === "ArrowRight" ? (index + 1) % tabs.length
-                  : event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length
-                    : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : null;
-                if (nextIndex === null) return;
-                event.preventDefault();
-                const nextTab = tabs[nextIndex].value;
-                selectTab(nextTab);
-                document.getElementById(`enhance-tab-${nextTab}`)?.focus();
-              }}
-            >
-              {tab.label}
-            </button>
-          ))}
         </div>
       </div>
       <div className="enhance-tab-panel" id="enhance-pane-general" role="tabpanel" aria-labelledby="enhance-tab-general" hidden={activeTab !== "general"}>
