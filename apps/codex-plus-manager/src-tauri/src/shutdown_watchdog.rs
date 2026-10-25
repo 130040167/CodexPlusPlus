@@ -1,12 +1,19 @@
 use std::time::Duration;
 
+/// 日志只尽力后台写入；不等待写盘，线程创建失败也不能妨碍退出。
+pub(crate) fn record_best_effort(record: impl FnOnce() + Send + 'static) {
+    let _ = std::thread::Builder::new()
+        .name("shutdown-diagnostic".into())
+        .spawn(record);
+}
+
 /// 只有进程真正退出才解除兜底，不能用后台清理完成代替退出确认。
 pub(crate) fn arm(timeout: Duration, record_timeout: impl FnOnce() + Send + 'static) {
     std::thread::spawn(move || {
         std::thread::sleep(timeout);
         // 诊断写盘也可能阻塞，不能让日志阻止最终退出。
         let (recorded, completion) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        record_best_effort(move || {
             record_timeout();
             let _ = recorded.send(());
         });
@@ -37,6 +44,13 @@ mod tests {
         let mode = std::env::var("CODEX_PLUS_SHUTDOWN_WATCHDOG_TEST").unwrap();
         let cleanup_complete = AtomicBool::new(mode == "complete");
         let block_diagnostic = mode == "blocked_diagnostic";
+        if mode == "blocked_entry" {
+            record_best_effort(|| {
+                loop {
+                    std::thread::park();
+                }
+            });
+        }
         arm(Duration::from_millis(100), move || {
             if block_diagnostic {
                 loop {
@@ -64,6 +78,7 @@ mod tests {
             "complete",
             "normal_exit",
             "blocked_diagnostic",
+            "blocked_entry",
         ] {
             let mut command = Command::new(std::env::current_exe().unwrap());
             command
@@ -107,7 +122,7 @@ mod tests {
                 .unwrap()
                 .read_to_string(&mut stdout)
                 .unwrap();
-            if mode != "normal_exit" && mode != "blocked_diagnostic" {
+            if !matches!(mode, "normal_exit" | "blocked_diagnostic") {
                 assert!(
                     stdout.contains(&format!("cleanupComplete={}", mode == "complete")),
                     "{stdout}"
@@ -116,5 +131,28 @@ mod tests {
                 assert!(!stdout.contains("cleanupComplete="), "{stdout}");
             }
         }
+    }
+
+    #[test]
+    fn entry_logging_returns_before_a_blocked_writer_finishes() {
+        let (writer_started, writer_started_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (writer_finished, writer_finished_rx) = std::sync::mpsc::channel();
+        let (caller_returned, caller_returned_rx) = std::sync::mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            record_best_effort(move || {
+                writer_started.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                writer_finished.send(()).unwrap();
+            });
+            caller_returned.send(()).unwrap();
+        });
+        let writer_started = writer_started_rx.recv_timeout(Duration::from_secs(2));
+        let caller_returned = caller_returned_rx.recv_timeout(Duration::from_secs(1));
+        let _ = release.send(());
+        caller.join().unwrap();
+        assert!(writer_started.is_ok(), "diagnostic writer never started");
+        assert!(caller_returned.is_ok(), "caller waited for diagnostic I/O");
+        writer_finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     }
 }
