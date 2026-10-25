@@ -385,10 +385,10 @@
     return local ? "local" : "";
   }
 
-  function codexPureApiAllowedModelSet(hostId) {
+  function codexPureApiAllowedModelSet(hostId, forRequest = false) {
     if (hostId !== "local") return null;
     const profile = codexRemoteSessionActiveProfile();
-    if (!codexPlusModelUnlockEnabled() || !codexPlusBackendSettingsLoaded
+    if ((!forRequest && !codexPlusModelUnlockEnabled()) || !codexPlusBackendSettingsLoaded
         || profile?.relayMode !== "pureApi" || codexModelCatalog.status !== "ok") return null;
     const profileId = String(profile.id || "").trim();
     const belongsToProfile = profileId && (codexModelCatalog.model_provider === profileId
@@ -396,6 +396,41 @@
         && codexModelCatalog.sources.some((source) => source?.id === `relay-profile:${profileId}`)));
     const names = codexPlusModelNames();
     return belongsToProfile && names.length ? new Set(names) : null;
+  }
+
+  async function prepareCodexPureApiModelCatalog(method, params, hostId) {
+    if (hostId !== "local") return true;
+    if (method === "send-cli-request-for-host" && params?.method) {
+      if (modelResponseHostId(params) !== "local") return true;
+      return prepareCodexPureApiModelCatalog(String(params.method), params.params, hostId);
+    }
+    if (!["thread/start", "thread/resume", "turn/start"].includes(method)) return true;
+    // 设置发布先于目录读取完成；限时等待并复核归属，不能使用上一家目录改派。
+    const deadline = Date.now() + codexAppServerPreparationTimeoutMs;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const profile = codexRemoteSessionActiveProfile();
+      if (profile?.relayMode !== "pureApi") return true;
+      const profileId = profile.id;
+      const revision = codexModelCatalogRevision;
+      if (!codexModelCatalogPromise && codexPureApiAllowedModelSet(hostId, true)) return true;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return false;
+      let timer;
+      try {
+        const read = codexModelCatalogPromise || loadCodexModelCatalog(true);
+        const completed = await Promise.race([
+          Promise.resolve(read).then(() => true, () => false),
+          new Promise((resolve) => { timer = window.setTimeout(() => resolve(false), remaining); }),
+        ]);
+        if (!completed) return false;
+      } finally {
+        if (timer !== undefined) window.clearTimeout(timer);
+      }
+      if (profileId === codexRemoteSessionActiveProfile()?.id && revision === codexModelCatalogRevision) {
+        return !!codexPureApiAllowedModelSet(hostId, true);
+      }
+    }
+    return false;
   }
 
   function codexAggregateAllowedModelSet(hostId, allowUnpublished = false) {
@@ -414,6 +449,12 @@
   }
 
   function codexAggregateSelectedModelTarget(model, hostId, groupId = "") {
+    const direct = codexPureApiAllowedModelSet(hostId, true);
+    if (direct) {
+      const bare = typeof model === "string" && /^cpx-[^/]+\/.+/.test(model)
+        ? model.slice(model.indexOf("/") + 1) : "";
+      return bare && direct.has(bare) ? bare : "";
+    }
     const allowed = codexAggregateAllowedModelSet(hostId);
     if (!allowed || typeof model !== "string") return "";
     const pool = codexModelCatalog.sources?.some((source) => source?.type === "aggregate_pool_catalog");
@@ -470,17 +511,24 @@
   }
 
   function captureCodexAggregateSelectedModels() {
-    if (!codexAggregateAllowedModelSet("local")) return;
+    // 设置先于目录发布；旧目录的来源才是裸名所属供应商，不能按新 active profile 猜测。
+    if (codexModelCatalog.status !== "ok") return;
+    const sources = codexModelCatalog.sources || [];
+    const directSource = sources.find((source) => source?.id?.startsWith("relay-profile:"));
+    const directGroup = directSource?.id.slice("relay-profile:".length);
+    if (!directGroup && !sources.some((source) => source?.type === "aggregate_model_catalog")) return;
     const identities = window.__codexPlusAggregateModelSelectionIdentities
       || (window.__codexPlusAggregateModelSelectionIdentities = new WeakMap());
     const profileId = codexRemoteSessionActiveProfile()?.id;
     for (const { node, picker, owner, hostId } of codexAggregateModelPickers()) {
-      if (!owner) { identities.delete(node); continue; }
       const previous = identities.get(node);
+      // 新 chat 可以保留自身身份，但复用旧会话节点时不能继承旧会话的待迁移选择。
+      if (previous && previous.owner !== owner) { identities.delete(node); continue; }
       // 连续保存时 React 可能尚未消费上一次迁移，保留最初的供应商身份。
       if (previous && previous.model === picker.model && previous.owner === owner
           && previous.hostId === hostId && previous.profileId === profileId) continue;
-      const groupId = codexPlusModelMetadata(picker.model)?.codex_plus_group_id;
+      const groupId = codexPlusModelNames().includes(picker.model)
+        ? directGroup || codexPlusModelMetadata(picker.model)?.codex_plus_group_id : "";
       if (typeof groupId === "string" && groupId) {
         identities.set(node, { model: picker.model, groupId, owner, hostId, profileId });
       }
@@ -488,7 +536,7 @@
   }
 
   function syncCodexAggregateSelectedModel() {
-    if (!codexAggregateAllowedModelSet("local")) return false;
+    if (!codexAggregateAllowedModelSet("local") && !codexPureApiAllowedModelSet("local", true)) return false;
     const attempts = window.__codexPlusAggregateModelSelectionAttempts
       || (window.__codexPlusAggregateModelSelectionAttempts = new WeakMap());
     let changed = false;
@@ -520,7 +568,7 @@
 
   function codexPlusConfiguredDefaultModel() {
     if (codexModelCatalog.status !== "ok") return "";
-    const allowed = codexAggregateAllowedModelSet("local") || codexPureApiAllowedModelSet("local");
+    const allowed = codexAggregateAllowedModelSet("local") || codexPureApiAllowedModelSet("local", true);
     if (!allowed) return "";
     return [codexModelCatalog.model, codexModelCatalog.default_model, ...allowed]
       .find((model) => typeof model === "string" && allowed.has(model)) || "";
@@ -530,7 +578,12 @@
     const target = codexPlusConfiguredDefaultModel();
     if (!target) return;
     const attempts = window.__codexPlusDefaultModelAttempts ||= new WeakMap();
-    for (const { node, picker, owner } of codexAggregateModelPickers()) {
+    for (const { node, picker, owner, hostId } of codexAggregateModelPickers()) {
+      const identity = window.__codexPlusAggregateModelSelectionIdentities?.get(node);
+      const retained = identity?.model === picker.model && identity?.owner === owner
+        && identity?.hostId === hostId && identity?.profileId === codexRemoteSessionActiveProfile()?.id;
+      // 同供应商 ID 迁移先于新 chat 的默认值恢复，避免先切到聚合的另一默认成员。
+      if (retained && codexAggregateSelectedModelTarget(picker.model, hostId, identity.groupId)) continue;
       // 已有会话交给其保存的模型身份恢复；新会话不能沿用原生目录外的默认值。
       if (owner || picker.disabled || codexPlusModelNames().includes(picker.model)
           || codexAggregateSelectedModelTarget(picker.model, "local")
@@ -553,11 +606,17 @@
       return next === params.params ? params : { ...params, params: next };
     }
     if (!["thread/start", "thread/resume", "turn/start"].includes(method)) return params;
-    const allowed = codexAggregateAllowedModelSet(hostId) || codexPureApiAllowedModelSet(hostId);
+    const direct = codexPureApiAllowedModelSet(hostId, true);
+    const allowed = codexAggregateAllowedModelSet(hostId) || direct;
     if (!allowed) return params;
     const model = params.model || params.collaborationMode?.settings?.model;
     if (model && allowed.has(model)) return params;
-    const mapped = model && codexAggregateSelectedModelTarget(model, hostId);
+    const bare = typeof model === "string" && /^cpx-[^/]+\/.+/.test(model)
+      ? model.slice(model.indexOf("/") + 1) : "";
+    const mapped = model && (codexAggregateSelectedModelTarget(model, hostId)
+      || (direct && bare && direct.has(bare) ? bare : ""));
+    // 明确的旧聚合模型不受当前目录支持时，不把它静默改成默认模型。
+    if (direct && bare && !mapped) return params;
     const target = mapped || (method === "thread/start" ? codexPlusConfiguredDefaultModel() : "");
     if (!target || target === model) return params;
     const next = { ...params, model: target };
@@ -768,7 +827,8 @@
   }
 
   function refreshCodexNativeLocalUserConfig(client) {
-    if (!codexPlusModelUnlockEnabled() && !codexAggregateAllowedModelSet("local")) return false;
+    if (!codexPlusModelUnlockEnabled() && !codexAggregateAllowedModelSet("local")
+        && !codexPureApiAllowedModelSet("local", true)) return false;
     const signature = codexPlusNativeConfigCatalogSignature();
     if (!signature) return false;
     // 原生模型 observer 依赖这个禁用自动读取的查询来决定目录和白名单。
@@ -1467,6 +1527,7 @@
           && !codexRemoteSessionTargetProvider()) {
         providerRefreshFailed = (await loadCodexModelCatalog())?.status === "failed";
       }
+      if (!providerRefreshFailed) providerRefreshFailed = !await prepareCodexPureApiModelCatalog(String(method || ""), params, client.hostId);
       const configuredParams = providerRefreshFailed ? params
         : normalizeCodexConfiguredModelRequest(String(method || ""), params, client.hostId);
       const providerParams = providerRefreshFailed
@@ -1484,7 +1545,8 @@
       const managedTurn = await sendCodexManagedSessionTurn(client, originalSendRequest,
         String(method || ""), nextParams, options, modelContextRefresh);
       if (managedTurn) return managedTurn.result;
-      const result = await originalSendRequest(method, nextParams, options);
+      const result = await sendAppServerRequestWithSideChat(client, method, nextParams,
+        () => originalSendRequest(method, nextParams, options));
       noteCodexManagedSessionStart(String(method || ""), nextParams, result, client.hostId);
       const threadState = codexThreadModelRequestState(String(method || ""), nextParams, result);
       if (modelContextRefresh !== false && threadState.threadId && threadState.model
@@ -1500,11 +1562,19 @@
         || client.prewarmThreadStart).bind(client);
       client.__codexPlusServiceTierOriginalPrewarmThreadStart = originalPrewarmThreadStart;
       client.prewarmThreadStart = async function codexPlusServiceTierPrewarmThreadStart(params, options) {
-        return await prewarmCodexManagedSession(client, originalPrewarmThreadStart, params, options);
+        return await prewarmCodexManagedSession(client, async (next, nextOptions) => {
+          const ready = await prepareCodexPureApiModelCatalog("thread/start", next, client.hostId);
+          return originalPrewarmThreadStart(ready ? normalizeCodexConfiguredModelRequest("thread/start", next, client.hostId) : next, nextOptions);
+        }, params, options);
       };
     }
     client.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
     return true;
+  }
+
+  function sendAppServerRequestWithSideChat(client, method, params, send) {
+    return typeof sendCodexSideChatNativeRequest === "function"
+      ? sendCodexSideChatNativeRequest(client, method, params, send) : send();
   }
 
   // issue #2177：Codex 26.908 把 AppServerRequestClient 类藏进模块闭包且不再导出，
@@ -1627,7 +1697,7 @@
     const wanted = codexPlusModelUnlockEnabled()
       || codexPluginMarketplacePatchEnabled()
       || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
-      || codexPlusSettings().sessionDelete;
+      || codexPlusSettings().sessionDelete || codexPlusSettings().sideChatSave;
     if (!wanted) return false;
     const klass = window.__codexPlusAppServerClientClass;
     if (!klass || typeof klass !== "function" || !klass.prototype) return false;
@@ -1677,6 +1747,7 @@
           && !codexRemoteSessionTargetProvider()) {
         providerRefreshFailed = (await loadCodexModelCatalog())?.status === "failed";
       }
+      if (!providerRefreshFailed) providerRefreshFailed = !await prepareCodexPureApiModelCatalog(String(method || ""), params, client.hostId);
       const configuredParams = providerRefreshFailed ? params
         : normalizeCodexConfiguredModelRequest(String(method || ""), params, client.hostId);
       const providerParams = providerRefreshFailed
@@ -1694,7 +1765,8 @@
       const managedTurn = await sendCodexManagedSessionTurn(client, originalSendRequest.bind(client),
         String(method || ""), nextParams, options, modelContextRefresh);
       if (managedTurn) return managedTurn.result;
-      const result = await originalSendRequest.call(client, method, nextParams, options);
+      const result = await sendAppServerRequestWithSideChat(client, method, nextParams,
+        () => originalSendRequest.call(client, method, nextParams, options));
       noteCodexManagedSessionStart(String(method || ""), nextParams, result, client.hostId);
       const threadState = codexThreadModelRequestState(String(method || ""), nextParams, result);
       if (modelContextRefresh !== false && threadState.threadId && threadState.model
@@ -1710,7 +1782,10 @@
         || proto.prewarmThreadStart;
       proto.__codexPlusServiceTierOriginalPrewarmThreadStart = originalPrewarmThreadStart;
       proto.prewarmThreadStart = async function codexPlusServiceTierPrewarmThreadStart(params, options) {
-        return await prewarmCodexManagedSession(this, originalPrewarmThreadStart.bind(this), params, options);
+        return await prewarmCodexManagedSession(this, async (next, nextOptions) => {
+          const ready = await prepareCodexPureApiModelCatalog("thread/start", next, this.hostId);
+          return originalPrewarmThreadStart.call(this, ready ? normalizeCodexConfiguredModelRequest("thread/start", next, this.hostId) : next, nextOptions);
+        }, params, options);
       };
     }
     proto.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
@@ -1826,7 +1901,7 @@
     if (codexPlusModelUnlockEnabled()
         || codexPluginMarketplacePatchEnabled()
         || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
-          || codexPlusSettings().sessionDelete) {
+          || codexPlusSettings().sessionDelete || codexPlusSettings().sideChatSave) {
       installAppServerModelRequestPatch();
       void installCodexAppServerClientCapture().catch(() => {});
     }
@@ -1857,7 +1932,8 @@
   }
 
   function scheduleCodexModelWhitelistRefresh(durationMs = 2500) {
-    if (!codexPlusModelUnlockEnabled() && !codexAggregateAllowedModelSet("local", true)) return;
+    if (!codexPlusModelUnlockEnabled() && !codexAggregateAllowedModelSet("local", true)
+        && !codexPureApiAllowedModelSet("local", true)) return;
     codexModelWhitelistRefreshUntil = Math.max(codexModelWhitelistRefreshUntil, Date.now() + durationMs);
     if (codexModelWhitelistRefreshTimer) return;
     sendCodexPlusDiagnostic("model_whitelist_refresh_scheduled", { durationMs });

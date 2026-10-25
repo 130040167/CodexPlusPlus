@@ -167,6 +167,37 @@ fn workbuddy_config_dir() -> PathBuf {
     }
 }
 
+/// 拉起原生 CU server 时从当前环境透传的变量，与 Codex 的 `DEFAULT_ENV_VARS`（Unix）一致。
+const NATIVE_ENV_PASSTHROUGH: [&str; 11] = [
+    "HOME",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "USER",
+    "__CF_USER_TEXT_ENCODING",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "TMPDIR",
+    "TZ",
+];
+
+/// 自定义 CA 证书路径，非空时透传，与 Codex 的 `CUSTOM_CA_ENV_KEYS` 一致。
+/// 原生 server 会联网上报统计，公司代理换了根证书时要靠它们。
+const CUSTOM_CA_ENV_KEYS: [&str; 11] = [
+    "CODEX_CA_CERTIFICATE",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "GIT_SSL_CAINFO",
+    "CARGO_HTTP_CAINFO",
+    "PIP_CERT",
+    "BUNDLE_SSL_CA_CERT",
+    "npm_config_cafile",
+    "NPM_CONFIG_CAFILE",
+];
+
 /// 本机 Codex CU 运行时。全部为绝对路径，写进配置后不再二次推导。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -247,19 +278,36 @@ impl RuntimeLocation {
         env
     }
 
-    /// 原生 CU server 直接需要的环境。
+    /// 原生 CU server 的**完整**环境：调用方的其它变量一律不传。
     ///
-    /// 实测：缺 `CODEX_CLI_PATH` 时，凡是需要「app-server 审批通道」的调用都会失败为
-    /// `-10005 codex app-server exited before returning a response`（例如首次接管
-    /// Calculator 时）。这条通道与直通不直通无关，原生 server 自己要它。
+    /// 照 Codex 自己拉起 stdio MCP server 的做法（`codex-rs/rmcp-client/src/utils.rs`
+    /// 的 `create_env_for_mcp_server`，rust-v0.163.0-alpha.11.2）：只透传
+    /// [`NATIVE_ENV_PASSTHROUGH`] 白名单和自定义 CA 变量。Claude Code 会把用户
+    /// `settings.json` 里的 `env`（含 `ANTHROPIC_AUTH_TOKEN` 等）继承给 MCP 进程，
+    /// 原样传下去等于把 Key 交给第三方程序。
+    ///
+    /// 在白名单之上只加两项（实测 2026-10-25，只读探针）：
+    /// - `CODEX_CLI_PATH`：**必须**。缺了连 `list_apps` 都失败为
+    ///   `-10005 codex app-server exited before returning a response`。
+    ///   Codex 里不用传，推测是因为那边的直接父进程就是 `codex` 本身。
+    /// - `CODEX_HOME`：默认 `~/.codex` 时可有可无，Codex 目录不在默认位置时才需要。
+    ///
+    /// `SKY_CUA_SERVICE_PATH` 实测去掉后结果完全相同，不再传。
     pub(crate) fn native_client_env(&self) -> BTreeMap<String, String> {
-        let mut env = BTreeMap::new();
+        let mut env: BTreeMap<String, String> = NATIVE_ENV_PASSTHROUGH
+            .iter()
+            .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_string(), value)))
+            .collect();
+        for key in CUSTOM_CA_ENV_KEYS {
+            if let Ok(value) = std::env::var(key)
+                && !value.is_empty()
+            {
+                env.insert(key.to_string(), value);
+            }
+        }
         env.insert("CODEX_HOME".into(), self.codex_home.clone());
         if let Some(cli) = &self.codex_cli {
             env.insert("CODEX_CLI_PATH".into(), cli.clone());
-        }
-        if let Some(service) = &self.service_path {
-            env.insert("SKY_CUA_SERVICE_PATH".into(), service.clone());
         }
         env
     }
@@ -1901,6 +1949,34 @@ mod tests {
             codex_cli: None,
             app_version: Some("26.1016.61520".into()),
             package_version: Some("0.1.2".into()),
+        }
+    }
+
+    #[test]
+    fn native_client_env_only_carries_whitelisted_variables() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut runtime = sample_runtime(temp.path());
+        runtime.codex_cli = Some("/Applications/ChatGPT.app/codex".into());
+        runtime.service_path = Some("/x/Codex Computer Use.app".into());
+        let env = runtime.native_client_env();
+
+        assert_eq!(env["CODEX_CLI_PATH"], "/Applications/ChatGPT.app/codex");
+        assert_eq!(env["CODEX_HOME"], runtime.codex_home);
+        // 实测没用，不再传。
+        assert!(!env.contains_key("SKY_CUA_SERVICE_PATH"));
+        // 测试进程自己的环境（cargo 的 CARGO_* 等）不能漏进去。
+        assert!(std::env::vars().any(|(key, _)| key.starts_with("CARGO_")));
+        for key in env.keys() {
+            assert!(
+                NATIVE_ENV_PASSTHROUGH.contains(&key.as_str())
+                    || CUSTOM_CA_ENV_KEYS.contains(&key.as_str())
+                    || key == "CODEX_HOME"
+                    || key == "CODEX_CLI_PATH",
+                "unexpected env var {key}"
+            );
+        }
+        if std::env::var_os("PATH").is_some() {
+            assert!(env.contains_key("PATH"));
         }
     }
 
