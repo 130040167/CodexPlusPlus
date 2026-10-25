@@ -414,6 +414,72 @@ describe("managed aggregate session connection", () => {
     assert.equal(api.window.__codexPlusManagedSessionStarts.get("thread").needsRecovery, true);
   });
 
+  it("rebinds same-version native listeners to the current injected settings", () => {
+    const stale = runtime();
+    const current = runtime();
+    stale.state.settings.managedSessionConnection = null;
+    const listeners = new Map<string, Set<any>>();
+    const shared = current.window;
+    shared.location = { origin: "app://-" };
+    shared.addEventListener = (type: string, callback: any) => {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type)!.add(callback);
+    };
+    shared.removeEventListener = (type: string, callback: any) => listeners.get(type)?.delete(callback);
+    const listenerSource = renderer.slice(renderer.indexOf("  function installCodexRemoteSessionRecoveryListener("),
+      renderer.indexOf("  function installCodexRemoteSessionDispatcherSubscription("));
+    const install = (observer: any) => new Function("window", "codexRemoteSessionRecoveryVersion",
+      "observeCodexRemoteSessionNotification", "sendCodexPlusDiagnostic",
+      `${listenerSource}\nreturn installCodexRemoteSessionRecoveryListener;`)(shared, "same-version", observer, () => {});
+    const oldInstall = install(stale.observeError);
+    oldInstall();
+    const oldHandler = shared.__codexPlusRemoteSessionRecoveryMessageHandler;
+    const newInstall = install(current.observeError);
+    newInstall();
+    assert.notEqual(shared.__codexPlusRemoteSessionRecoveryMessageHandler, oldHandler);
+    newInstall();
+    assert.equal(listeners.get("message")?.size, 1);
+    assert.equal(listeners.get("codex-message-from-view")?.size, 1);
+    for (const handler of listeners.get("message")!) handler({ source: null, origin: "", data: {
+      type: "mcp-notification", hostId: "local", method: "turn/completed",
+      params: { threadId: "thread", turn: { status: "failed", error: {
+        message: '{"error":{"message":"Synthetic network connection failed","type":"fixture_connection_failure"}}',
+        codexErrorInfo: "other", additionalDetails: null,
+      } } },
+    } });
+    assert.equal(shared.__codexPlusManagedSessionStarts.get("thread").needsRecovery, true);
+    assert.equal(stale.window.__codexPlusManagedSessionStarts, undefined);
+    assert.equal(current.calls.length, 0);
+  });
+
+  it("replaces same-version dispatcher subscriptions after reinjection without duplicates", () => {
+    const shared = {} as any;
+    const subscribers = new Map<string, Set<any>>();
+    const dispatcher = { subscribe(type: string, handler: any) {
+      if (!subscribers.has(type)) subscribers.set(type, new Set());
+      subscribers.get(type)!.add(handler);
+      return () => subscribers.get(type)?.delete(handler);
+    } };
+    const subscriptionSource = renderer.slice(renderer.indexOf("  function installCodexRemoteSessionDispatcherSubscription("),
+      renderer.indexOf("  function ", renderer.indexOf("  function installCodexRemoteSessionDispatcherSubscription(") + 12));
+    const oldCalls: any[] = [];
+    const currentCalls: any[] = [];
+    const install = (calls: any[]) => new Function("window", "codexRemoteSessionRecoveryVersion",
+      "observeCodexRemoteSessionNotification", "observeCodexManagedSessionConnectionError", "sendCodexPlusDiagnostic",
+      `${subscriptionSource}\nreturn installCodexRemoteSessionDispatcherSubscription;`)(shared, "same-version",
+        (value: any) => { calls.push(value); return true; },
+        (value: any) => { calls.push(value); return true; }, () => {});
+    install(oldCalls)(dispatcher);
+    const currentInstall = install(currentCalls);
+    currentInstall(dispatcher);
+    currentInstall(dispatcher);
+    for (const handlers of subscribers.values()) assert.equal(handlers.size, 1);
+    const params = { threadId: "thread", error: { message: "Connection failed" } };
+    for (const handler of subscribers.get("error")!) handler(params);
+    assert.deepEqual(oldCalls, []);
+    assert.deepEqual(currentCalls, [{ method: "error", params }]);
+  });
+
   it("pins transport without changing model, context or unrelated configuration", () => {
     const api = runtime();
     const params = { model: "provider/model", config: {

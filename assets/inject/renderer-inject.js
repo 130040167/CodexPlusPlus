@@ -441,7 +441,7 @@
   const codexAppServerModelRequestPatchVersion = "28";
   const codexAppServerClientCaptureMarker = "AppServerRequestClient is missing a message dispatcher";
   const codexAppServerClientCaptureAnchor = "async sendRequest(";
-  const codexRemoteSessionRecoveryVersion = "8";
+  const codexRemoteSessionRecoveryVersion = "9";
   const codexPluginMarketplaceUnlockVersion = "17";
   const codexThreadScrollMaxEntries = 120;
   const codexThreadScrollSaveThrottleMs = 120;
@@ -5743,7 +5743,9 @@
   }
 
   function installCodexRemoteSessionRecoveryListener() {
-    if (window.__codexPlusRemoteSessionRecoveryInstalled === codexRemoteSessionRecoveryVersion) return true;
+    // 重注入后的配置属于新闭包；版本相同也不能继续使用旧监听器。
+    if (window.__codexPlusRemoteSessionRecoveryInstalled === codexRemoteSessionRecoveryVersion
+        && window.__codexPlusRemoteSessionRecoveryObserver === observeCodexRemoteSessionNotification) return true;
     if (window.__codexPlusRemoteSessionRecoveryMessageHandler) {
       window.removeEventListener("message", window.__codexPlusRemoteSessionRecoveryMessageHandler, true);
     }
@@ -5764,6 +5766,7 @@
     const viewHandler = (event) => observeCodexRemoteSessionNotification(event?.detail);
     window.__codexPlusRemoteSessionRecoveryMessageHandler = messageHandler;
     window.__codexPlusRemoteSessionRecoveryViewHandler = viewHandler;
+    window.__codexPlusRemoteSessionRecoveryObserver = observeCodexRemoteSessionNotification;
     window.addEventListener("message", messageHandler, true);
     window.addEventListener("codex-message-from-view", viewHandler, true);
     window.__codexPlusRemoteSessionRecoveryInstalled = codexRemoteSessionRecoveryVersion;
@@ -5776,7 +5779,8 @@
   function installCodexRemoteSessionDispatcherSubscription(dispatcher, assetPrefix = "") {
     if (!dispatcher || typeof dispatcher.subscribe !== "function") return false;
     if (window.__codexPlusRemoteSessionRecoveryDispatcher === dispatcher
-        && window.__codexPlusRemoteSessionRecoveryDispatcherVersion === codexRemoteSessionRecoveryVersion) {
+        && window.__codexPlusRemoteSessionRecoveryDispatcherVersion === codexRemoteSessionRecoveryVersion
+        && window.__codexPlusRemoteSessionRecoveryDispatcherObserver === observeCodexRemoteSessionNotification) {
       return true;
     }
     if (typeof window.__codexPlusRemoteSessionRecoveryDispatcherUnsubscribe === "function") {
@@ -5808,6 +5812,7 @@
       dispatcher.subscribe("browser-sidebar-browser-use-state", browserUseHandler),
     ];
     window.__codexPlusRemoteSessionRecoveryDispatcher = dispatcher;
+    window.__codexPlusRemoteSessionRecoveryDispatcherObserver = observeCodexRemoteSessionNotification;
     window.__codexPlusRemoteSessionRecoveryDispatcherHandler = handler;
     window.__codexPlusRemoteSessionRecoveryDispatcherUnsubscribe = () => {
       for (const unsubscribe of unsubscribers) {
