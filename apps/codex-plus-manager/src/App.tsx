@@ -1169,6 +1169,9 @@ type StartupResult = CommandResult<{
 /** 左侧 Agent 切换栏的工具标识。后端 `list_tools` 返回同名字符串。 */
 type ToolId = string;
 
+/** Codex++ 自己的 logo：与应用图标（src-tauri/icons/icon.png）同一张图。 */
+const APP_LOGO_URL = new URL("./assets/codex-plus-logo.png", import.meta.url).href;
+
 /** 品牌图标随应用打包，来源和许可见 assets/agents/LICENSE.txt。 */
 const TOOL_ICONS: Record<string, string> = {
   codex: new URL("./assets/agents/chatgpt.svg", import.meta.url).href,
@@ -14498,6 +14501,16 @@ function ApplicationRail({
   const themeLabel = theme === "dark" ? t("切换到浅色") : t("切换到深色");
   return (
     <aside className="app-rail">
+      {/* 程序左上角的 logo：点一下回到当前 Agent 的概览。 */}
+      <button
+        aria-label={t("Codex++ 概览")}
+        className="rail-brand"
+        onClick={() => onNavigate("overview")}
+        title="Codex++"
+        type="button"
+      >
+        <img alt="" draggable={false} src={APP_LOGO_URL} />
+      </button>
       <ToolSwitcher
         tools={tools}
         activeTool={activeTool}

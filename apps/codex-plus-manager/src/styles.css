@@ -11911,3 +11911,43 @@ select {
 .script-market-card[data-view="grid"] .script-market-actions { margin-top: auto; padding-top: 4px; }
 .script-market-status { flex-shrink: 0; white-space: nowrap; }
 .script-market-tag-more { border-style: dashed; cursor: help; }
+
+/* 程序左上角 logo：图标栏最上方，下方一条细线与 Agent 切换分开。 */
+.rail-brand {
+  display: grid;
+  flex-shrink: 0;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  cursor: pointer;
+  transition: transform var(--motion-fast, 120ms) var(--motion-ease, ease), background-color var(--motion-fast, 120ms);
+}
+
+.rail-brand img {
+  width: 36px;
+  height: 36px;
+  object-fit: contain;
+  filter: drop-shadow(0 3px 8px hsl(240 80% 55% / 0.35));
+  user-select: none;
+}
+
+.rail-brand:hover {
+  background: hsl(var(--sidebar-muted, var(--muted)) / 0.6);
+  transform: translateY(-1px);
+}
+
+.rail-brand:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}
+
+.app-rail > .rail-brand + * {
+  position: relative;
+  margin-top: 2px;
+  padding-top: 12px;
+  border-top: 1px solid hsl(var(--sidebar-border));
+}
