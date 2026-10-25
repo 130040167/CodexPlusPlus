@@ -195,7 +195,7 @@ import { relayHeadersValidationMessage, serializeRelayHeaders } from "./relay-he
 import { sessionProviderForProtocol } from "./relay-session";
 import { usePopoverLayer } from "./use-popover-layer";
 import { resolveAnchoredMenuLayout, type AnchoredMenuLayout } from "./popover-layer";
-import { resolveProviderName } from "./provider-name";
+import { providerAvatarText, resolveProviderName } from "./provider-name";
 import {
   providerSyncStreamPercent,
   resolveProviderSyncCompletion,
@@ -6566,80 +6566,85 @@ function RelayScreen({
           <EnvConflictNotice envConflicts={envConflicts} actions={actions} />
           {!normalized.relayProfilesEnabled ? (
             <p className="relay-switch-off-note" role="status">
-              {t("供应商配置切换已关闭：点「使用」不会写入 Codex 的 config.toml / auth.json。需要切换时打开右上角的「配置切换」。")}
+              {t("供应商配置切换已关闭：Codex++ 不会写入 Codex 的 config.toml / auth.json，供应商列表已隐藏。需要切换时打开右上角的「配置切换」。")}
             </p>
           ) : null}
-          <div className="provider-view-tabs" role="tablist" aria-label={t("供应商配置模式")}>
-            <button aria-selected={providerView === "direct"} className={providerView === "direct" ? "active" : ""} onClick={() => selectProviderView("direct")} role="tab" title={t("直接访问 Responses API 供应商：只写入 Base URL 与 Key，不做协议转换。")} type="button">
-              <Cable className="h-4 w-4" />
-              <span>{t("直连")}</span>
-              <CircleHelp className="provider-view-help" size={13} />
-            </button>
-            <button aria-selected={providerView === "modelAggregation"} className={providerView === "modelAggregation" ? "active" : ""} onClick={() => selectProviderView("modelAggregation")} role="tab" title={t("把成员模型合并到 Codex 模型列表，带供应商前缀的模型固定发送到对应成员。")} type="button">
-              <Layers3 className="h-4 w-4" />
-              <span>{t("模型聚合")}</span>
-              <CircleHelp className="provider-view-help" size={13} />
-            </button>
-            <button aria-selected={providerView === "routing"} className={providerView === "routing" ? "active" : ""} onClick={() => selectProviderView("routing")} role="tab" title={t("供应商只支持 Chat Completions（或配置了模型路由）：由本地协议代理转换后转发。")} type="button">
-              <GitBranch className="h-4 w-4" />
-              <span>{t("需协议转换")}</span>
-              <CircleHelp className="provider-view-help" size={13} />
-            </button>
-            <button aria-selected={providerView === "failover"} className={providerView === "failover" ? "active" : ""} onClick={() => selectProviderView("failover")} role="tab" title={t("多个供应商组成请求池，支持失败切换、会话轮转、请求轮转与权重；成员可以是 API 供应商或官方登录账号。")} type="button">
-              <ArrowRightLeft className="h-4 w-4" />
-              <span>{t("故障转移")}</span>
-              <CircleHelp className="provider-view-help" size={13} />
-            </button>
-          </div>
-          {providerView === "direct" && !visibleProfiles.length ? (
-            <div className="provider-aggregate-empty">
-              <strong>{t("这个分页还没有直连供应商")}</strong>
-              <span>{t("直连分页只显示 Responses 直连且未配置模型路由的供应商；其他供应商在其余分页，配置不会丢失。")}</span>
-              <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>{t("添加供应商")}</Button>
-            </div>
+          {/* 总开关关闭时供应商切换不会写入 Codex：分页和列表都没有意义，整块隐藏，只留上方提示条。 */}
+          {normalized.relayProfilesEnabled ? (
+            <>
+            <div className="provider-view-tabs" role="tablist" aria-label={t("供应商配置模式")}>
+                <button aria-selected={providerView === "direct"} className={providerView === "direct" ? "active" : ""} onClick={() => selectProviderView("direct")} role="tab" title={t("直接访问 Responses API 供应商：只写入 Base URL 与 Key，不做协议转换。")} type="button">
+                  <Cable className="h-4 w-4" />
+                  <span>{t("直连")}</span>
+                  <CircleHelp className="provider-view-help" size={13} />
+                </button>
+                <button aria-selected={providerView === "modelAggregation"} className={providerView === "modelAggregation" ? "active" : ""} onClick={() => selectProviderView("modelAggregation")} role="tab" title={t("把成员模型合并到 Codex 模型列表，带供应商前缀的模型固定发送到对应成员。")} type="button">
+                  <Layers3 className="h-4 w-4" />
+                  <span>{t("模型聚合")}</span>
+                  <CircleHelp className="provider-view-help" size={13} />
+                </button>
+                <button aria-selected={providerView === "routing"} className={providerView === "routing" ? "active" : ""} onClick={() => selectProviderView("routing")} role="tab" title={t("供应商只支持 Chat Completions（或配置了模型路由）：由本地协议代理转换后转发。")} type="button">
+                  <GitBranch className="h-4 w-4" />
+                  <span>{t("需协议转换")}</span>
+                  <CircleHelp className="provider-view-help" size={13} />
+                </button>
+                <button aria-selected={providerView === "failover"} className={providerView === "failover" ? "active" : ""} onClick={() => selectProviderView("failover")} role="tab" title={t("多个供应商组成请求池，支持失败切换、会话轮转、请求轮转与权重；成员可以是 API 供应商或官方登录账号。")} type="button">
+                  <ArrowRightLeft className="h-4 w-4" />
+                  <span>{t("故障转移")}</span>
+                  <CircleHelp className="provider-view-help" size={13} />
+                </button>
+              </div>
+              {providerView === "direct" && !visibleProfiles.length ? (
+                <div className="provider-aggregate-empty">
+                  <strong>{t("这个分页还没有直连供应商")}</strong>
+                  <span>{t("直连分页只显示 Responses 直连且未配置模型路由的供应商；其他供应商在其余分页，配置不会丢失。")}</span>
+                  <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>{t("添加供应商")}</Button>
+                </div>
+              ) : null}
+              {providerView === "routing" && !visibleProfiles.length ? (
+                <div className="provider-aggregate-empty">
+                  <strong>{t("这个分页还没有需协议转换的供应商")}</strong>
+                  <span>{t("Chat Completions 协议或配置了模型路由的供应商会显示在这里；其他供应商在其余分页。")}</span>
+                  <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>{t("添加供应商")}</Button>
+                </div>
+              ) : null}
+              {providerView === "failover" && !visibleProfiles.length ? (
+                <div className="provider-aggregate-empty">
+                  <strong>{t("还没有故障转移配置")}</strong>
+                  <span>{t("在编辑页勾选成员供应商，并选择失败切换、轮转或权重策略。")}</span>
+                  <Button onClick={() => createNewAggregateProfile("provider")}>{t("创建故障转移配置")}</Button>
+                </div>
+              ) : null}
+              {providerView === "modelAggregation" && !visibleProfiles.length ? (
+                <div className="provider-aggregate-empty">
+                  <strong>{t("还没有模型聚合配置")}</strong>
+                  <span>{t("把成员模型合并到 Codex 列表，选中模型会固定发送到对应供应商。")}</span>
+                  <Button onClick={() => createNewAggregateProfile("model")}>{t("创建模型聚合配置")}</Button>
+                </div>
+              ) : null}
+              {(providerView === "failover" || providerView === "modelAggregation") && visibleProfiles.length ? (
+                <div className="provider-aggregate-toolbar">
+                  <Button
+                    onClick={() => createNewAggregateProfile(providerView === "failover" ? "provider" : "model")}
+                    size="sm"
+                    variant="secondary"
+                  >
+                    <Plus className="h-4 w-4" />
+                    {providerView === "failover" ? t("新建故障转移") : t("新建模型聚合")}
+                  </Button>
+                </div>
+              ) : null}
+              <RelayProfileList
+                form={normalized}
+                visibleProfiles={visibleProfiles}
+                onEdit={(profileId) => void editRelayProfile(profileId)}
+                onFormChange={saveRelaySettings}
+                onSwitchProfile={switchRelayProfileFromList}
+                disabled={actions.relaySwitching}
+                actions={actions}
+              />
+            </>
           ) : null}
-          {providerView === "routing" && !visibleProfiles.length ? (
-            <div className="provider-aggregate-empty">
-              <strong>{t("这个分页还没有需协议转换的供应商")}</strong>
-              <span>{t("Chat Completions 协议或配置了模型路由的供应商会显示在这里；其他供应商在其余分页。")}</span>
-              <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>{t("添加供应商")}</Button>
-            </div>
-          ) : null}
-          {providerView === "failover" && !visibleProfiles.length ? (
-            <div className="provider-aggregate-empty">
-              <strong>{t("还没有故障转移配置")}</strong>
-              <span>{t("在编辑页勾选成员供应商，并选择失败切换、轮转或权重策略。")}</span>
-              <Button onClick={() => createNewAggregateProfile("provider")}>{t("创建故障转移配置")}</Button>
-            </div>
-          ) : null}
-          {providerView === "modelAggregation" && !visibleProfiles.length ? (
-            <div className="provider-aggregate-empty">
-              <strong>{t("还没有模型聚合配置")}</strong>
-              <span>{t("把成员模型合并到 Codex 列表，选中模型会固定发送到对应供应商。")}</span>
-              <Button onClick={() => createNewAggregateProfile("model")}>{t("创建模型聚合配置")}</Button>
-            </div>
-          ) : null}
-          {(providerView === "failover" || providerView === "modelAggregation") && visibleProfiles.length ? (
-            <div className="provider-aggregate-toolbar">
-              <Button
-                onClick={() => createNewAggregateProfile(providerView === "failover" ? "provider" : "model")}
-                size="sm"
-                variant="secondary"
-              >
-                <Plus className="h-4 w-4" />
-                {providerView === "failover" ? t("新建故障转移") : t("新建模型聚合")}
-              </Button>
-            </div>
-          ) : null}
-          <RelayProfileList
-            form={normalized}
-            visibleProfiles={visibleProfiles}
-            onEdit={(profileId) => void editRelayProfile(profileId)}
-            onFormChange={saveRelaySettings}
-            onSwitchProfile={switchRelayProfileFromList}
-            disabled={actions.relaySwitching}
-            actions={actions}
-          />
           </CardContent>
         </Panel>
       </div>
@@ -15487,9 +15492,9 @@ function relayProfileEditorStatus(profile: RelayProfile, form: BackendSettings, 
   return profile.id === form.activeRelayId ? t("当前正在使用") : t("编辑后保存列表，再切换模式时会使用新配置");
 }
 
+/// 供应商头像上的两个字，规则见 provider-name.ts 的 providerAvatarText。
 function providerInitial(name: string) {
-  const trimmed = (name || t("供应商")).trim();
-  return Array.from(trimmed)[0]?.toUpperCase() || t("供");
+  return providerAvatarText(name, t("供"));
 }
 
 function statusLabel(status: string) {
