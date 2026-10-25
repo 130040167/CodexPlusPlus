@@ -40,3 +40,10 @@ test("预览窗口标明 Codex++ Computer Use", () => {
   assert.ok(read("./CuPipWindow.tsx").includes(">Codex++ Computer Use<"));
   assert.match(read("../src-tauri/src/cu_pip.rs"), /\.title\("Codex\+\+ Computer Use"\)/);
 });
+
+test("预览窗口能拖动：标题栏是拖动区，权限里有 start-dragging，非前台时第一下点击也生效", () => {
+  assert.match(read("./CuPipWindow.tsx"), /className="cu-pip-head" data-tauri-drag-region/);
+  const capability = JSON.parse(read("../src-tauri/capabilities/default.json")) as { permissions: string[] };
+  assert.ok(capability.permissions.includes("core:window:allow-start-dragging"));
+  assert.match(read("../src-tauri/src/cu_pip.rs"), /\.accept_first_mouse\(true\)/);
+});

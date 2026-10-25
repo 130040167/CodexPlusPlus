@@ -275,6 +275,9 @@ fn ensure_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         .skip_taskbar(true)
         .shadow(true)
         .focused(false)
+        // 小窗所属的 Codex++ 通常不在前台：不开这个，第一下点击只用来激活窗口，
+        // 网页收不到按下事件，标题栏拖不动、按钮第一下没反应。
+        .accept_first_mouse(true)
         .visible(false)
         .build()
         .inspect_err(|error| log("cu_pip.window_failed", json!({ "error": error.to_string() })))
