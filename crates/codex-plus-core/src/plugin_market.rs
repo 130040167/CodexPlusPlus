@@ -869,7 +869,8 @@ async fn resolve_git_proxy(work: &Path, url: &str) -> anyhow::Result<Option<Stri
         work,
         url,
         has_proxy_env,
-        crate::proxy::detect_system_proxy,
+        // 按仓库地址求值，Windows PAC / 自动检测代理也能生效（#2475）
+        || crate::proxy::detect_system_proxy_for_url(url),
     )
     .await
 }
