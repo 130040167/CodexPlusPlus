@@ -27,6 +27,7 @@ import {
   BookOpen,
   CheckCircle2,
   ChevronDown,
+  ChevronRight,
   Camera,
   CircleHelp,
   Copy,
@@ -53,6 +54,7 @@ import {
   MoreHorizontal,
   PackageOpen,
   FileCode2,
+  FolderOpen,
   Moon,
   MousePointerClick,
   Network,
@@ -66,6 +68,7 @@ import {
   Save,
   Search,
   Settings,
+  Sparkles,
   ShieldCheck,
   ShieldAlert,
   Star,
@@ -6291,6 +6294,8 @@ function RelayScreen({
   const [ccsDbPathDraft, setCcsDbPathDraft] = useState(normalized.ccsDbPath);
   const [ccsPathSaving, setCcsPathSaving] = useState(false);
   const [ccsBindings, setCcsBindings] = useState<Record<string, string>>({});
+  // 路径草稿与已保存的不一致时，列表还是旧库的：先「应用」才能导入。
+  const ccsPathDirty = ccsDbPathDraft.trim() !== normalized.ccsDbPath;
   useEffect(() => setCcsDbPathDraft(normalized.ccsDbPath), [normalized.ccsDbPath]);
   const saveCcsDbPath = async (path = ccsDbPathDraft) => {
     setCcsPathSaving(true);
@@ -6506,43 +6511,77 @@ function RelayScreen({
                     }
                     : undefined}
                 >
-                  <label>
-                    {t("cc-switch 数据库路径")}
-                    <Input value={ccsDbPathDraft} onChange={(event) => setCcsDbPathDraft(event.currentTarget.value)} placeholder={t("留空使用默认路径")} />
-                  </label>
-                  <button disabled={ccsPathSaving} onClick={() => void selectCcsDatabase()} type="button">{t("选择数据库")}</button>
-                  <button disabled={ccsPathSaving} onClick={() => void saveCcsDbPath()} type="button">{t("保存路径并刷新")}</button>
-                  {ccsProviders && isSuccessStatus(ccsProviders.status) ? <span className="text-xs break-all">{t("实际来源")}：{ccsProviders.dbPath}</span> : null}
-                  {ccsProviders?.fallbackReason ? <span className="text-xs break-all">{ccsProviders.fallbackReason}</span> : null}
+                  <div className="third-party-import-head">
+                    <strong>{t("从 cc-switch 导入")}</strong>
+                    <small>{t("只读取 cc-switch 的数据库，不会改动它。")}</small>
+                  </div>
+                  <div className="third-party-import-source">
+                    <div className="third-party-import-path">
+                      <Input
+                        aria-label={t("cc-switch 数据库路径")}
+                        onChange={(event) => setCcsDbPathDraft(event.currentTarget.value)}
+                        placeholder={t("默认 ~/.cc-switch/cc-switch.db")}
+                        value={ccsDbPathDraft}
+                      />
+                      <Button disabled={ccsPathSaving} onClick={() => void selectCcsDatabase()} size="sm" title={t("选择数据库")} variant="secondary">
+                        <FolderOpen className="h-4 w-4" />
+                        {t("选择")}
+                      </Button>
+                      {ccsPathDirty ? (
+                        <Button disabled={ccsPathSaving} onClick={() => void saveCcsDbPath()} size="sm">
+                          {ccsPathSaving ? t("应用中") : t("应用")}
+                        </Button>
+                      ) : null}
+                    </div>
+                    {ccsProviders && isSuccessStatus(ccsProviders.status) ? (
+                      <small className="third-party-import-meta" title={ccsProviders.dbPath}>{t("实际来源")}：{ccsProviders.dbPath}</small>
+                    ) : null}
+                    {ccsProviders?.fallbackReason ? <small className="third-party-import-warning">{ccsProviders.fallbackReason}</small> : null}
+                  </div>
                   {/* 供应商列表单独滚动：cc-switch 里几十个供应商时，底部按钮仍然可见可点（issue #1906）。 */}
                   <div className="third-party-import-list">
-                    {ccsProviders?.providers.map((provider) => <label key={provider.sourceId}>
-                      {provider.name}
-                      <select value={ccsBindings[provider.sourceId] || ""} onChange={(event) => setCcsBindings((current) => ({ ...current, [provider.sourceId]: event.currentTarget.value }))}>
-                        <option value="">{t("自动识别来源或新增")}</option>
-                        {normalized.relayProfiles.map((profile) => <option key={profile.id} value={profile.id}>{t("关联已有")}：{profile.name}</option>)}
-                      </select>
-                    </label>)}
+                    {ccsProviders?.providers.length ? (
+                      <div className="third-party-import-list-head">
+                        <span>{tf("Codex 供应商 {0} 个", [ccsProviders.providers.length])}</span>
+                        <span>{t("导入为")}</span>
+                      </div>
+                    ) : (
+                      <p className="third-party-import-empty">{ccsProviderSummary(ccsProviders)}</p>
+                    )}
+                    {ccsProviders?.providers.map((provider) => (
+                      <label className="third-party-import-row" key={provider.sourceId}>
+                        <span className="third-party-import-name">
+                          <strong title={provider.name}>{provider.name}</strong>
+                          <small title={provider.baseUrl}>{urlHost(provider.baseUrl) || t("未填写地址")}</small>
+                        </span>
+                        <select
+                          aria-label={tf("{0} 导入为", [provider.name])}
+                          onChange={(event) => setCcsBindings((current) => ({ ...current, [provider.sourceId]: event.currentTarget.value }))}
+                          value={ccsBindings[provider.sourceId] || ""}
+                        >
+                          <option value="">{t("新增（同名自动关联）")}</option>
+                          {normalized.relayProfiles.map((profile) => <option key={profile.id} value={profile.id}>{t("关联已有")}：{profile.name}</option>)}
+                        </select>
+                      </label>
+                    ))}
                   </div>
                   <div className="third-party-import-actions">
-                    <button
-                      disabled={ccsPathSaving || ccsDbPathDraft.trim() !== normalized.ccsDbPath || !ccsProviders?.providers.length}
-                      onClick={() => {
-                        setThirdPartyImportOpen(false);
-                        void actions.importCcsProviders(ccsBindings);
-                      }}
-                      type="button"
-                    >
-                      <strong>ccswitch</strong>
-                      <span>{ccsProviderSummary(ccsProviders)}</span>
-                    </button>
-                    <button
-                      onClick={() => void actions.refreshCcsProviders()}
-                      type="button"
-                    >
-                      <RefreshCw className="h-4 w-4" />
-                      {t("刷新列表")}
-                    </button>
+                    {ccsPathDirty ? <small className="third-party-import-warning">{t("路径已修改，点「应用」读取新数据库后再导入。")}</small> : null}
+                    <div className="third-party-import-footer">
+                      <Button aria-label={t("刷新列表")} onClick={() => void actions.refreshCcsProviders()} size="icon" title={t("刷新列表")} variant="ghost">
+                        <RefreshCw className="h-4 w-4" />
+                      </Button>
+                      <Button
+                        disabled={ccsPathSaving || ccsPathDirty || !ccsProviders?.providers.length}
+                        onClick={() => {
+                          setThirdPartyImportOpen(false);
+                          void actions.importCcsProviders(ccsBindings);
+                        }}
+                      >
+                        <Download className="h-4 w-4" />
+                        {ccsProviders?.providers.length ? tf("导入 {0} 个供应商", [ccsProviders.providers.length]) : t("导入")}
+                      </Button>
+                    </div>
                   </div>
                 </div>
               ) : null}
@@ -6835,30 +6874,36 @@ function ProviderCatalogScreen({
             value={query}
           />
         </div>
-        <div className="provider-add-results">
-          <button className="provider-add-result provider-add-custom-result" onClick={() => selectPreset()} type="button">
-            <span className="provider-add-icon">✦</span>
-            <span><strong>{t("自定义配置")}</strong><small>{t("手动填写请求地址和 API Key")}</small></span>
-          </button>
-        </div>
+        <button className="provider-add-custom" onClick={() => selectPreset()} type="button">
+          <span className="provider-add-icon"><Sparkles className="h-4 w-4" /></span>
+          <span className="provider-add-text">
+            <strong>{t("自定义配置")}</strong>
+            <small>{t("手动填写请求地址和 API Key，适合中转站和自建服务")}</small>
+          </span>
+          <ChevronRight className="provider-add-chevron h-4 w-4" />
+        </button>
         {categories.map((category) => {
           const presets = filteredPresets.filter((preset) => preset.category === category.id);
           if (!presets.length) return null;
           return (
             <section className="provider-add-section" key={category.id}>
-              <h3>{category.label}</h3>
+              <h3>{category.label}<span>{presets.length}</span></h3>
               <div className="provider-add-results">
                 {presets.map((preset) => (
-                  <button className="provider-add-result" key={preset.id} onClick={() => selectPreset(preset)} type="button">
-                    <span className="provider-add-icon">{preset.name.slice(0, 1).toUpperCase()}</span>
-                    <span><strong>{preset.name}</strong><small>{preset.websiteUrl ? new URL(preset.websiteUrl).host : preset.baseUrl}</small></span>
+                  <button className="provider-add-result" key={preset.id} onClick={() => selectPreset(preset)} title={preset.baseUrl} type="button">
+                    <span className="provider-add-icon">{providerInitial(preset.name)}</span>
+                    <span className="provider-add-text">
+                      <strong>{preset.name}</strong>
+                      <small>{urlHost(preset.websiteUrl || preset.baseUrl)}</small>
+                    </span>
+                    <span className="provider-add-protocol">{preset.protocol === "chatCompletions" ? "Chat" : "Responses"}</span>
                   </button>
                 ))}
               </div>
             </section>
           );
         })}
-        {!filteredPresets.length ? <div className="empty">{t("没有匹配的供应商")}</div> : null}
+        {!filteredPresets.length ? <div className="provider-add-empty">{tf("没有匹配「{0}」的预设，可以用上面的「自定义配置」手动填写。", [query.trim()])}</div> : null}
         <p className="provider-add-hint">{t("选择供应商后会进入编辑页；API Key 和本地配置只在保存时写入当前 Codex。")}</p>
       </main>
     </div>
@@ -15984,6 +16029,17 @@ function relayProtocolLabel(protocol: RelayProtocol): string {
   if (protocol === "chatCompletions") return t("Chat Completions 转 Responses");
   if (protocol === "anthropicMessages") return t("Anthropic Messages 转 Responses");
   return "Responses API";
+}
+
+/// 网址只显示主机名；解析不了就原样返回。
+function urlHost(value: string | undefined): string {
+  const text = (value ?? "").trim();
+  if (!text) return "";
+  try {
+    return new URL(text).host;
+  } catch {
+    return text.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+  }
 }
 
 function ccsProviderSummary(result: CcsProvidersResult | null): string {
