@@ -1159,8 +1159,14 @@ pub fn validate_relay_test_response(protocol: RelayProtocol, status: u16, text: 
     let state = match protocol {
         RelayProtocol::Responses => {
             if value.get("output").and_then(Value::as_array).is_none() { return failed(); }
+            // 测试请求自己把输出限制在 16 token，推理模型因此截断属正常，不算告警（#2638）
+            let truncated_by_test_limit = value
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str)
+                == Some("max_output_tokens");
             match value.get("status").and_then(Value::as_str) {
                 Some("completed") => "completed",
+                Some("incomplete") if truncated_by_test_limit => "completed",
                 Some("incomplete") => "incomplete",
                 _ => return failed(),
             }
@@ -1168,15 +1174,15 @@ pub fn validate_relay_test_response(protocol: RelayProtocol, status: u16, text: 
         RelayProtocol::ChatCompletions => {
             let Some(choices) = value.get("choices").and_then(Value::as_array).filter(|v| !v.is_empty()) else { return failed(); };
             if choices.iter().any(|c| !c.get("message").is_some_and(Value::is_object)) { return failed(); }
-            if choices.iter().all(|c| matches!(c.get("finish_reason").and_then(Value::as_str), Some("stop" | "tool_calls" | "function_call"))) { "completed" }
+            if choices.iter().all(|c| matches!(c.get("finish_reason").and_then(Value::as_str), Some("stop" | "tool_calls" | "function_call" | "length"))) { "completed" }
             else if choices.iter().all(|c| matches!(c.get("finish_reason").and_then(Value::as_str), Some("stop" | "tool_calls" | "function_call" | "length" | "content_filter"))) { "incomplete" }
             else { return failed(); }
         },
         RelayProtocol::AnthropicMessages => {
             if value.get("type").and_then(Value::as_str) != Some("message") || value.get("content").and_then(Value::as_array).is_none() { return failed(); }
             match value.get("stop_reason").and_then(Value::as_str) {
-                Some("end_turn" | "stop_sequence" | "tool_use") => "completed",
-                Some("max_tokens" | "pause_turn" | "refusal") => "incomplete",
+                Some("end_turn" | "stop_sequence" | "tool_use" | "max_tokens") => "completed",
+                Some("pause_turn" | "refusal") => "incomplete",
                 _ => return failed(),
             }
         },
