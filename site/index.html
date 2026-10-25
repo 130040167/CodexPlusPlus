@@ -5,11 +5,19 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Codex++ — 让 AI 编程 Agent 更顺手</title>
 <meta name="description" content="Codex++ 是 AI 编程 Agent 的统一管理工具：以 Codex 桌面版为核心，同时管理 Claude Code、Claude Desktop 与 Grok 的供应商和增强，并把 Computer Use 共享给各个 Agent。">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Codex++">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:title" content="Codex++ — 让 AI 编程 Agent 更顺手">
+<meta property="og:description" content="Codex++ 是 AI 编程 Agent 的统一管理工具：以 Codex 桌面版为核心，同时管理 Claude Code、Claude Desktop 与 Grok 的供应商和增强，并把 Computer Use 共享给各个 Agent。">
+<meta property="og:url" content="https://codexpp.cc/">
+<meta property="og:image" content="https://codexpp.cc/assets/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="icon" type="image/png" href="assets/logo.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,600;0,800;1,400&family=Noto+Sans+SC:wght@300;400;500;700;900&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="css/style.css?v=20261025-agents-2">
+<link rel="stylesheet" href="css/style.css?v=20261025-agents-5">
 </head>
 <body>
 
@@ -21,10 +29,9 @@
       <span class="brand-name">Codex<b>++</b></span>
     </a>
     <nav class="nav-links">
-      <a href="#manager-live" data-nav>在线体验</a>
       <a href="#features" data-nav>功能</a>
-      <a href="#modes" data-nav>接入方式</a>
       <a href="#showcase" data-nav>实拍</a>
+      <a href="#modes" data-nav>Codex 供应商</a>
       <a href="#steps" data-nav>快速上手</a>
       <a href="#community" data-nav>社区</a>
       <a href="#download" data-nav>下载</a>
@@ -61,6 +68,10 @@
       <span class="line"><span class="w grad">更顺手</span><span class="w plus">++</span></span>
     </h1>
     <p class="hero-sub reveal">Codex、Claude Code、Claude Desktop、Grok 的供应商、增强与 Computer Use，一个管理器搞定。<br>不改官方应用的安装文件，双击打开就能用。</p>
+    <div class="hero-agents reveal" aria-label="支持的 Agent">
+      <span class="hero-agents-label">支持的 Agent</span>
+      <ul><li><span class="agent-icon" style="-webkit-mask-image:url(assets/agents/chatgpt.svg);mask-image:url(assets/agents/chatgpt.svg)" aria-hidden="true"></span>Codex</li><li><span class="agent-icon" style="-webkit-mask-image:url(assets/agents/claude.svg);mask-image:url(assets/agents/claude.svg)" aria-hidden="true"></span>Claude Code</li><li><span class="agent-icon" style="-webkit-mask-image:url(assets/agents/claude.svg);mask-image:url(assets/agents/claude.svg)" aria-hidden="true"></span>Claude Desktop</li><li><span class="agent-icon" style="-webkit-mask-image:url(assets/agents/grok.svg);mask-image:url(assets/agents/grok.svg)" aria-hidden="true"></span>Grok</li><li class="more">DeepSeek Harness 等</li></ul>
+    </div>
     <div class="hero-cta reveal">
       <a class="btn btn-primary btn-lg magnetic" href="https://github.com/BigPizzaV3/CodexPlusPlus/releases" target="_blank" rel="noopener">
         <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
@@ -73,14 +84,14 @@
     </div>
     <dl class="hero-stats reveal">
       <div class="stat"><dt class="mono" data-count="32114" data-format="wan">0</dt><dd>GitHub Stars</dd></div>
-      <div class="stat"><dt class="mono" data-count="150" data-suffix="+">0</dt><dd>可接入主流模型</dd></div>
-      <div class="stat"><dt class="mono" data-count="1" data-format="m">0</dt><dd>单模型最大上下文窗口</dd></div>
-      <div class="stat"><dt class="mono">0</dt><dd>对官方应用的文件改动</dd></div>
+      <div class="stat"><dt class="mono" data-count="4">0</dt><dd>统一管理的 Agent</dd></div>
+      <div class="stat"><dt class="mono" data-count="6">0</dt><dd>Computer Use 客户端</dd></div>
+      <div class="stat"><dt class="mono">0</dt><dd>官方文件改动</dd></div>
     </dl>
     </div>
     <div class="hero-manager" id="manager-live">
       <div class="hero-manager-window">
-        <iframe title="Codex++ 管理器真实前端交互演示" src="manager-preview/?previewRoute=enhance&amp;lang=zh&amp;v=20261025" loading="eager"></iframe>
+        <iframe title="Codex++ 管理器真实前端交互演示" src="manager-preview/?previewRoute=overview&amp;lang=zh&amp;v=20261025" loading="eager"></iframe>
       </div>
     </div>
   </div>
@@ -88,30 +99,6 @@
   <a class="scroll-cue" href="#demo" data-nav aria-label="向下滚动">
     <span class="cue-ring"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
   </a>
-</section>
-
-<!-- ========== 打字特效现场 ========== -->
-<section class="demo" id="demo">
-  <div class="demo-bg" aria-hidden="true"></div>
-  <div class="section-head">
-    <p class="eyebrow">LIVE DEMO · 光标打字特效</p>
-    <h2>敲下的每个字符，<em>都有回应</em></h2>
-    <p class="section-sub">这不是视频，是跑在你屏幕上的真实特效——Codex++ 同款粒子引擎，在这里先敲一把试试。</p>
-  </div>
-  <div class="composer tilt" id="composer">
-    <div class="composer-bar">
-      <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-      <span class="composer-title mono">Codex composer · codex++</span>
-    </div>
-    <div class="composer-input" id="composerInput" contenteditable="true" spellcheck="false" data-placeholder="与 Codex 协作，说点什么……"></div>
-    <div class="composer-foot">
-      <span class="chip">＋ 附件</span>
-      <span class="chip chip-warn">⛨ 完全访问</span>
-      <span class="spacer"></span>
-      <span class="chip chip-model">DeepSeek Flash · Max ▾</span>
-      <span class="chip send">↑</span>
-    </div>
-  </div>
 </section>
 
 <!-- ========== 功能矩阵 ========== -->
@@ -205,40 +192,6 @@
   </div>
 </section>
 
-<!-- ========== 供应商接入方式 ========== -->
-<section class="modes" id="modes">
-  <div class="section-head">
-    <p class="eyebrow">PROVIDER MODES · 接入方式</p>
-    <h2>四种接法，<em>随你切换</em></h2>
-    <p class="section-sub">从纯官方账号到多供应商聚合，每种模式独立配置、一键切换；切换时先保存当前配置，再写入目标配置。</p>
-  </div>
-  <div class="seg" role="tablist" aria-label="供应商接入方式">
-    <span class="seg-pill" aria-hidden="true"></span>
-    <button class="seg-btn active" role="tab" aria-selected="true" data-mode="official">官方登录</button>
-    <button class="seg-btn" role="tab" aria-selected="false" data-mode="hybrid">官方登录 + API</button>
-    <button class="seg-btn" role="tab" aria-selected="false" data-mode="api">纯 API</button>
-    <button class="seg-btn" role="tab" aria-selected="false" data-mode="agg">聚合供应商</button>
-  </div>
-  <div class="mode-panel tilt" id="modePanel">
-    <div class="mode-copy">
-      <h3 id="modeTitle">官方登录</h3>
-      <p id="modeDesc">使用 ChatGPT / Codex 官方账号登录，模型请求走官方通道，保持官方应用的完整体验与插件入口。</p>
-      <ul class="mode-points" id="modePoints">
-        <li>ChatGPT / Codex 官方账号登录</li>
-        <li>官方额度与官方插件市场</li>
-        <li>零配置，开箱即用</li>
-      </ul>
-    </div>
-    <div class="mode-route mono" id="modeRoute" aria-label="请求流向示意">
-      <span class="route-node route-you">You</span>
-      <span class="route-link"></span>
-      <span class="route-node">Codex</span>
-      <span class="route-link"></span>
-      <span class="route-node route-hot">OpenAI</span>
-    </div>
-  </div>
-</section>
-
 <!-- ========== 点选实拍 ========== -->
 <section class="showcase" id="showcase">
   <div class="showcase-inner">
@@ -268,23 +221,11 @@
         <a class="shot-frame shot-preview" href="assets/manager-claude-enhance.png" target="_blank" rel="noopener"><img src="assets/manager-claude-enhance.png" alt="Claude 增强：受管增强版，可开关界面汉化、语音输入与 Computer Use" loading="lazy"></a>
         <figcaption><b>Claude 增强</b><span>中文界面、语音输入与 Computer Use，官方应用原样不动。</span></figcaption>
       </figure>
-      <figure class="shot">
-        <a class="shot-frame shot-preview" href="assets/manager-grok.png" target="_blank" rel="noopener"><img src="assets/manager-grok.png" alt="Grok 配置：当前配置、供应商列表与模型编辑" loading="lazy"></a>
-        <figcaption><b>Grok 配置</b><span>管理 Grok CLI 的模型与 API 端点。</span></figcaption>
-      </figure>
-      <figure class="shot">
-        <a class="shot-frame shot-preview" href="assets/manager-agent-cache.png" target="_blank" rel="noopener"><img src="assets/manager-agent-cache.png" alt="AI Agent 缓存清理：按 Codex、Claude、Codex++ 列出可清理的缓存" loading="lazy"></a>
-        <figcaption><b>缓存清理</b><span>看清每个 Agent 的缓存占用，勾选清理。</span></figcaption>
-      </figure>
       <figure class="shot shot-agent" id="agent-collaboration">
         <a class="shot-frame shot-preview" href="assets/agent-collaboration.png" target="_blank" rel="noopener" aria-label="打开子 Agent 协作实测截图原图">
           <img src="assets/agent-collaboration.png" width="1766" height="630" loading="lazy" alt="Codex 对话中请求问问 DeepSeek 1+1 是多少，调用 Codex Plus Collaboration 后，DeepSeek 回答 1+1 等于 2">
         </a>
         <figcaption><b>子 Agent 协作实测</b><span>Codex 通过 dsh 委派 DeepSeek，结果回到同一对话。点击截图查看原图。</span></figcaption>
-      </figure>
-      <figure class="shot">
-        <a class="shot-frame shot-preview" href="assets/manager-enhancements.png" target="_blank" rel="noopener"><img src="assets/manager-enhancements.png" alt="Codex++ 管理工具：集中管理模型、会话、输入体验和挂件设置" loading="lazy"></a>
-        <figcaption><b>增强集中管理</b><span>插件与模型、对话与输入、挂件与桌宠，一页开关。</span></figcaption>
       </figure>
       <figure class="shot">
         <a class="shot-frame shot-preview" href="assets/codex-multi-launch.png" target="_blank" rel="noopener"><img src="assets/codex-multi-launch.png" alt="Codex 多开：列出运行中的 DeepSeek 与 Zhipu GLM 实例" loading="lazy"></a>
@@ -298,21 +239,9 @@
         <a class="shot-frame shot-preview" href="assets/extension-market.png" target="_blank" rel="noopener"><img src="assets/extension-market.png" alt="Codex++ 拓展市场：浏览社区脚本和工作流工具" loading="lazy"></a>
         <figcaption><b>拓展市场</b><span>社区脚本即装即用：用量面板、模型矩阵、提示词优化。</span></figcaption>
       </figure>
-      <figure class="shot shot-feature">
-        <a class="shot-frame shot-preview" href="assets/request-status-auto-retry.png" target="_blank" rel="noopener"><img src="assets/request-status-auto-retry.png" alt="请求状态与自动重试：展示发送请求、模型繁忙后自动等待、重试成功并继续生成的流程，以及重试次数和上一次过载原因" loading="lazy"></a>
-        <figcaption><b>请求状态与自动重试</b><span>模型繁忙时自动等待并重试，状态行显示当前进度与失败原因。</span></figcaption>
-      </figure>
-      <figure class="shot shot-feature">
-        <a class="shot-frame shot-preview" href="assets/request-log-auto-retry.png" target="_blank" rel="noopener"><img src="assets/request-log-auto-retry.png" alt="请求日志与自动重试：实时显示进行中的请求、模型已满、自动重试次数和重试成功结果" loading="lazy"></a>
-        <figcaption><b>请求日志与自动重试</b><span>实时看到进行中的请求；模型已满时自动重试并记录每次结果。</span></figcaption>
-      </figure>
       <figure class="shot">
         <a class="shot-frame shot-preview" href="assets/usage-statusline.png" target="_blank" rel="noopener"><img src="assets/usage-statusline.png" alt="输入框下方的用量状态栏：51 tok/s、缓存命中 99.9%、上下文占用 19%" loading="lazy"></a>
         <figcaption><b>用量状态栏</b><span>51 tok/s · 缓存命中 99.9% · 上下文 19%，就在输入框下方。</span></figcaption>
-      </figure>
-      <figure class="shot">
-        <a class="shot-frame shot-preview shot-dark" href="assets/usage-widget.png" target="_blank" rel="noopener"><img src="assets/usage-widget.png" alt="角色用量挂件：气泡显示 Token 统计和运行状态" loading="lazy"></a>
-        <figcaption><b>桌宠用量挂件</b><span>今日用量、任务状态、预算提醒，换张图就是你的角色。</span></figcaption>
       </figure>
       <figure class="shot">
         <a class="shot-frame shot-preview" href="assets/typing-effects.png" target="_blank" rel="noopener"><img src="assets/typing-effects.png" alt="Codex 输入框中的彩虹粒子打字特效" loading="lazy"></a>
@@ -322,45 +251,76 @@
   </div>
 </section>
 
-<!-- ========== 上下文窗口 ========== -->
-<section class="context" id="context">
+<!-- ========== 供应商接入方式 ========== -->
+<section class="modes" id="modes">
   <div class="section-head">
-    <p class="eyebrow">PER-MODEL CONTEXT · 各模型，各有空间</p>
-    <h2>一行后缀，<em>百万窗口</em></h2>
-    <p class="section-sub">模型列表里写上窗口后缀，Codex++ 生成独立的 <span class="mono">model_catalog_json</span>，让 Codex 按当前模型使用对应窗口。未指定的模型继续沿用供应商级配置。</p>
+    <p class="eyebrow">CODEX PROVIDERS · Codex 供应商</p>
+    <h2>Codex 供应商，<em>随你切换</em></h2>
+    <p class="section-sub">四种接法独立配置、一键切换；每个模型还能单独声明上下文窗口。</p>
   </div>
-  <div class="context-cols">
-    <div class="term tilt" id="term">
-      <div class="term-bar">
-        <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-        <span class="mono term-title">model_list · config</span>
-      </div>
-      <pre class="term-body mono"><code><span class="t-cm"># 在模型列表里直接写窗口后缀</span>
-deepseek-v4-pro<span class="t-hl">[1M]</span>
-claude-opus-5.5<span class="t-hl">[200K]</span>
-your-model<span class="t-hl">[128000]</span>
-
-<span class="t-cm"># Codex++ 生成 model_catalog_json</span>
-<span class="t-cm"># codex 按当前模型识别各自窗口 ↓</span></code></pre>
-      <div class="term-out mono" id="termOut"><span class="t-ok">✓ catalog 已注入</span> <span class="t-dim">config.toml · model_catalog_json</span></div>
+  <div class="seg" role="tablist" aria-label="供应商接入方式">
+    <span class="seg-pill" aria-hidden="true"></span>
+    <button class="seg-btn active" role="tab" aria-selected="true" data-mode="official">官方登录</button>
+    <button class="seg-btn" role="tab" aria-selected="false" data-mode="hybrid">官方登录 + API</button>
+    <button class="seg-btn" role="tab" aria-selected="false" data-mode="api">纯 API</button>
+    <button class="seg-btn" role="tab" aria-selected="false" data-mode="agg">聚合供应商</button>
+  </div>
+  <div class="mode-panel tilt" id="modePanel">
+    <div class="mode-copy">
+      <h3 id="modeTitle">官方登录</h3>
+      <p id="modeDesc">使用 ChatGPT / Codex 官方账号登录，模型请求走官方通道，保持官方应用的完整体验与插件入口。</p>
+      <ul class="mode-points" id="modePoints">
+        <li>ChatGPT / Codex 官方账号登录</li>
+        <li>官方额度与官方插件市场</li>
+        <li>零配置，开箱即用</li>
+      </ul>
     </div>
-    <div class="bars">
-      <div class="bar-row" data-pct="20">
-        <span class="bar-label mono">generic-model</span>
-        <div class="bar-track"><div class="bar-fill"></div></div>
-        <span class="bar-val mono">200K</span>
+    <div class="mode-route mono" id="modeRoute" aria-label="请求流向示意">
+      <span class="route-node route-you">You</span>
+      <span class="route-link"></span>
+      <span class="route-node">Codex</span>
+      <span class="route-link"></span>
+      <span class="route-node route-hot">OpenAI</span>
+    </div>
+  </div>
+  <div class="modes-context">
+    <div class="modes-context-head">
+      <h3>一行后缀，百万窗口</h3>
+      <p>模型列表里写上窗口后缀，Codex++ 生成独立的 <span class="mono">model_catalog_json</span>，让 Codex 按当前模型使用对应窗口。未指定的模型继续沿用供应商级配置。</p>
+    </div>
+    <div class="context-cols">
+      <div class="term tilt" id="term">
+        <div class="term-bar">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="mono term-title">model_list · config</span>
+        </div>
+        <pre class="term-body mono"><code><span class="t-cm"># 在模型列表里直接写窗口后缀</span>
+  deepseek-v4-pro<span class="t-hl">[1M]</span>
+  claude-opus-5.5<span class="t-hl">[200K]</span>
+  your-model<span class="t-hl">[128000]</span>
+  
+  <span class="t-cm"># Codex++ 生成 model_catalog_json</span>
+  <span class="t-cm"># codex 按当前模型识别各自窗口 ↓</span></code></pre>
+        <div class="term-out mono" id="termOut"><span class="t-ok">✓ catalog 已注入</span> <span class="t-dim">config.toml · model_catalog_json</span></div>
       </div>
-      <div class="bar-row" data-pct="40">
-        <span class="bar-label mono">claude-opus-5.5</span>
-        <div class="bar-track"><div class="bar-fill"></div></div>
-        <span class="bar-val mono">400K</span>
+      <div class="bars">
+        <div class="bar-row" data-pct="20">
+          <span class="bar-label mono">generic-model</span>
+          <div class="bar-track"><div class="bar-fill"></div></div>
+          <span class="bar-val mono">200K</span>
+        </div>
+        <div class="bar-row" data-pct="40">
+          <span class="bar-label mono">claude-opus-5.5</span>
+          <div class="bar-track"><div class="bar-fill"></div></div>
+          <span class="bar-val mono">400K</span>
+        </div>
+        <div class="bar-row hot" data-pct="100">
+          <span class="bar-label mono">deepseek-v4-pro</span>
+          <div class="bar-track"><div class="bar-fill"></div></div>
+          <span class="bar-val mono">1M</span>
+        </div>
+        <p class="bars-note">按模型声明窗口，互不挤占；状态栏的「上下文占用」也按各模型窗口计算。</p>
       </div>
-      <div class="bar-row hot" data-pct="100">
-        <span class="bar-label mono">deepseek-v4-pro</span>
-        <div class="bar-track"><div class="bar-fill"></div></div>
-        <span class="bar-val mono">1M</span>
-      </div>
-      <p class="bars-note">按模型声明窗口，互不挤占；状态栏的「上下文占用」也按各模型窗口计算。</p>
     </div>
   </div>
 </section>
@@ -534,6 +494,6 @@ your-model<span class="t-hl">[128000]</span>
 <script src="assets/gsap.min.js"></script>
 <script src="assets/ScrollTrigger.min.js"></script>
 <script src="js/nebula.js"></script>
-<script src="js/main.js?v=20261017-gallery-3"></script>
+<script src="js/main.js?v=20261025-agents-1"></script>
 </body>
 </html>
