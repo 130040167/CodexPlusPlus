@@ -269,7 +269,7 @@ body::after {
   margin: 26px 0 24px;
 }
 /* 逐字入场动画靠 overflow 裁切；底部留出余量，免得 g、y 这类下伸字母被切掉。 */
-.hero-title .line { display: block; overflow: hidden; padding-bottom: 0.12em; }
+.hero-title .line { display: block; overflow: hidden; padding-bottom: 0.22em; }
 .hero-title .w {
   display: inline-block;
   will-change: transform;
@@ -1226,7 +1226,7 @@ body::after {
 /* ============ 入场基态（JS 接管前隐藏，避免闪烁） ============ */
 
 .reveal { opacity: 0; transform: translateY(26px); }
-.hero-title .w { transform: translateY(125%); }
+.hero-title .w { transform: translateY(135%); }
 body.no-anim .reveal, body.no-anim .hero-title .w { opacity: 1; transform: none; }
 body.no-anim .term-out { opacity: 1; transform: none; }
 body.no-anim .bar-fill { transition: none; }
