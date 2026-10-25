@@ -7240,3 +7240,28 @@ fn auto_review_model_routes_responses_profile_through_local_proxy() {
     let proxied = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert!(proxied.contains("127.0.0.1:57321"), "{proxied}");
 }
+
+/// issue #2021：`[memories]` 是用户在 Codex 里配置的本机设置，切换供应商时要从 live 补回。
+#[test]
+fn switching_relay_profile_preserves_live_memories_table() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        r#"model = "gpt-5.4"
+
+[memories]
+extract_model = "gpt-5.4-mini"
+consolidation_model = "gpt-5.4"
+"#,
+    )
+    .unwrap();
+
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &responses_profile_with_model("glm-5.2"), "")
+        .unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    let doc = config.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(doc["memories"]["extract_model"].as_str(), Some("gpt-5.4-mini"));
+    assert_eq!(doc["memories"]["consolidation_model"].as_str(), Some("gpt-5.4"));
+    assert_eq!(doc["model"].as_str(), Some("glm-5.2"));
+}
