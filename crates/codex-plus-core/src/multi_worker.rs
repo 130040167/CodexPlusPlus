@@ -87,6 +87,39 @@ pub async fn codex_instance_needs_worker(identity: &CodexInstanceIdentity) -> an
     }
 }
 
+/// 只有同代 Browser 仍可核验、页面列表可读取且没有原生页面和可见窗口，才确认无界面残留。
+pub async fn codex_instance_confirmed_windowless(identity: &CodexInstanceIdentity) -> anyhow::Result<bool> {
+    #[cfg(windows)]
+    {
+        if !codex_instance_needs_worker(identity).await? {
+            return Ok(false);
+        }
+        let browser = crate::cdp::browser_identity(identity.debug_port).await?;
+        if browser.browser_id()? != identity.browser_id {
+            return Ok(false);
+        }
+        let targets = crate::cdp::list_targets(identity.debug_port).await?;
+        Ok(crate::cdp::pick_injectable_codex_page_target(&targets).is_err()
+            && !crate::windows_integration::process_has_visible_window(identity.process_id)?)
+    }
+    #[cfg(not(windows))]
+    { let _ = identity; Ok(false) }
+}
+
+/// 自动收尾必须重新核对所有退出条件，不能借用允许 CDP 失联的显式停止入口。
+pub async fn cleanup_confirmed_windowless_instance(
+    identity: &CodexInstanceIdentity,
+    status: &crate::status::StatusStore,
+) -> anyhow::Result<bool> {
+    #[cfg(windows)]
+    {
+        let tree = CodexInstanceProcessTree::capture(identity)?;
+        tree.tree.stop_confirmed_windowless(identity, status).await
+    }
+    #[cfg(not(windows))]
+    { let _ = (identity, status); Ok(false) }
+}
+
 /// worker 从 ready 起追踪自己的后代；交接不结束桌面，只在根进程确认退出后回收残留。
 pub struct CodexInstanceProcessTree {
     #[cfg(windows)]
@@ -728,6 +761,8 @@ mod tests {
         }
         assert!(!codex_instance_process_exited(&identity));
         assert!(codex_instance_needs_worker(&identity).await.unwrap());
+        assert!(codex_instance_confirmed_windowless(&identity).await.is_err(),
+            "CDP unavailable must not confirm a closed desktop");
         assert!(terminate_verified_codex_instance(&identity).await.unwrap());
         assert!(child.0.try_wait().unwrap().is_some());
         assert!(codex_instance_process_exited(&identity));

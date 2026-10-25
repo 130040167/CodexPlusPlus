@@ -69,6 +69,23 @@ pub fn request_process_close(process_id: u32) -> bool {
     unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) }.is_ok()
 }
 
+#[cfg(windows)]
+pub(crate) fn process_has_visible_window(process_id: u32) -> anyhow::Result<bool> {
+    struct WindowProbe { pid: u32, visible: bool }
+    unsafe extern "system" fn probe(hwnd: HWND, data: LPARAM) -> BOOL {
+        let probe = unsafe { &mut *(data.0 as *mut WindowProbe) };
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)); }
+        if pid == probe.pid && unsafe { IsWindowVisible(hwnd) }.as_bool() {
+            probe.visible = true;
+        }
+        BOOL(1)
+    }
+    let mut state = WindowProbe { pid: process_id, visible: false };
+    unsafe { EnumWindows(Some(probe), LPARAM((&mut state as *mut WindowProbe) as isize)) }?;
+    Ok(state.visible)
+}
+
 /// 结束一个进程树。
 ///
 /// `force = false` 时**只**走 `WM_CLOSE`（不调用 taskkill）：`taskkill /T` 对 GUI

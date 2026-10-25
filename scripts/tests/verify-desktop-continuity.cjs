@@ -963,7 +963,15 @@ async function runMainReplacementScenario(manager) {
     const manifest = JSON.parse(await fs.readFile(path.join(desktop.root, "instance.json"), "utf8"));
     if (index === 0) await closeDesktop(desktop);
     else killOwned(desktop.id.processId);
-    await until(() => !processExists(manifest.pid), "worker did not exit after its desktop", 45000);
+    try {
+      await until(() => !processExists(manifest.pid), "worker did not exit after its desktop", 60000);
+    } catch (error) {
+      report.workerExitFailure = { root: tree[0], workerPid: manifest.pid,
+        survivingProcesses: inventory().filter(candidate => tree.some(prior => sameProcess(prior, candidate))
+          || candidate.ProcessId === manifest.pid).map(identity) };
+      await save();
+      throw error;
+    }
     await assertCapturedTreeExited(tree);
     await assertDesktopAlive(replacement);
     await pass(index === 0 ? "normalDesktopExitReleasesWorkerAndDescendants"

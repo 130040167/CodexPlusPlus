@@ -134,8 +134,7 @@ impl VerifiedStopTree {
 
     pub(crate) fn stop_and_wait(mut self) -> anyhow::Result<()> {
         let root = &self.processes[0];
-        if root.is_alive()? {
-            request_process_close(root.process_id);
+        if root.is_alive()? && request_process_close(root.process_id) {
             let deadline = Instant::now()
                 + Duration::from_millis(crate::watcher::RESTART_STOP_WAIT_TIMEOUT_MS);
             while self.processes[0].is_alive()? && Instant::now() < deadline {
@@ -145,6 +144,35 @@ impl VerifiedStopTree {
         }
         // 先固定所有当前后代，再停止主进程，阻止它继续派生后台任务。
         self.refresh()?;
+        self.finish_stop()
+    }
+
+    pub(super) async fn stop_confirmed_windowless(
+        mut self,
+        identity: &super::CodexInstanceIdentity,
+        status: &crate::status::StatusStore,
+    ) -> anyhow::Result<bool> {
+        let expected = status.load_latest()?;
+        if !expected
+            .as_ref()
+            .is_some_and(|s| s.status == "stopped" && s.debug_port == Some(identity.debug_port))
+        {
+            return Ok(false);
+        }
+        // 先做较慢的树捕获，再做最后一次 CDP/页面/窗口核验；不走显式重启的 WM_CLOSE 宽限。
+        self.refresh()?;
+        if !super::codex_instance_confirmed_windowless(identity).await?
+            || status.load_latest()? != expected
+            || crate::windows_integration::process_has_visible_window(identity.process_id)?
+        {
+            return Ok(false);
+        }
+        self.finish_stop()?;
+        Ok(true)
+    }
+
+    fn finish_stop(mut self) -> anyhow::Result<()> {
+        self.processes[0].terminate_and_wait()?;
         if self
             .processes
             .iter()
@@ -158,7 +186,6 @@ impl VerifiedStopTree {
                 }),
             );
         }
-        self.processes[0].terminate_and_wait()?;
         for _ in 0..8 {
             self.refresh()?;
             for process in self.processes.iter().rev() {

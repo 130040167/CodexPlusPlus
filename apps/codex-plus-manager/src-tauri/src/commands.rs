@@ -2268,6 +2268,7 @@ pub fn run_codex_multi_worker(options_path: &Path) -> anyhow::Result<()> {
         &root.join("worker-ready.json"),
         &serde_json::to_vec(&handoff)?,
     )?;
+    let mut windowless_since: Option<std::time::Instant> = None;
     while tauri::async_runtime::block_on(
         codex_plus_core::multi_worker::codex_instance_needs_worker(&identity),
     )
@@ -2275,6 +2276,41 @@ pub fn run_codex_multi_worker(options_path: &Path) -> anyhow::Result<()> {
     {
         if multi_worker_handoff_requested(root, &handoff) {
             break;
+        }
+        // Electron 关闭最后窗口后可能仍留着 Browser；仅在 launcher 已确认停止且
+        // 同代 Browser 连续可核验无页面/无窗口时清理。CDP 失败会重置宽限，不能当退出。
+        let launcher_stopped = instance_status_store.load_latest().ok().flatten()
+            .is_some_and(|status| status.status == "stopped" && status.debug_port == Some(identity.debug_port));
+        let confirmed_windowless = launcher_stopped && tauri::async_runtime::block_on(
+            codex_plus_core::multi_worker::codex_instance_confirmed_windowless(&identity),
+        ).unwrap_or(false);
+        if confirmed_windowless {
+            let since = windowless_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= std::time::Duration::from_secs(10) {
+                match tauri::async_runtime::block_on(
+                    codex_plus_core::multi_worker::cleanup_confirmed_windowless_instance(
+                        &identity, &instance_status_store),
+                ) {
+                    Ok(true) => {
+                        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                            "manager.multi_worker_closed_desktop_cleanup",
+                            json!({ "instance_id": identity.instance_id, "process_id": identity.process_id }),
+                        );
+                        break;
+                    }
+                    result => {
+                        windowless_since = None;
+                        if let Err(error) = result {
+                            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                                "manager.multi_worker_closed_desktop_cleanup_retry",
+                                json!({ "instance_id": identity.instance_id, "message": error.to_string() }),
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            windowless_since = None;
         }
         if let Err(error) = process_tree.refresh() {
             let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
