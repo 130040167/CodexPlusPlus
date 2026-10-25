@@ -1525,6 +1525,53 @@ describe("renderer injection service tier dispatcher patch", () => {
     assert.equal(harness.attempts(), settled);
   });
 
+  // #2657：26.1016 的 dispatcher 只从 app-shared-* 导出（带 getInstance 的类），
+  // app-initial-* 能加载但不导出它，setting-storage-* / vscode-api-* 已不存在。
+  it("finds the dispatcher class exported from app-shared on Codex 26.1016", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const start = renderer.indexOf("  const serviceTierDispatcherPatchMaxMisses = ");
+    const end = renderer.indexOf("\n  async function loadBackendSettingsState(", start);
+    const fromStart = renderer.indexOf("  function codexServiceTierDispatcherFromModule(");
+    const fromEnd = renderer.indexOf("\n  }\n", fromStart) + 4;
+    assert.ok(start >= 0 && end > start && fromStart >= 0 && fromEnd > fromStart);
+
+    class Dispatcher {
+      static instance: Dispatcher | null = null;
+      static getInstance() { return (this.instance ??= new Dispatcher()); }
+      dispatchMessage() {}
+      subscribe() {}
+    }
+    const modules: Record<string, unknown> = {
+      "app-initial-": { idt: "not-a-dispatcher", unrelated: () => undefined },
+      "app-shared-": { idt: "OwlRemoteSearchSuggestions", AFt: Dispatcher },
+    };
+    const details: Array<[string, unknown]> = [];
+    const install = new Function(
+      "window",
+      "codexServiceTierRequestOverrideVersion",
+      "loadCodexAppModule",
+      "dispatchCodexPlusMessage",
+      "installCodexRemoteSessionDispatcherSubscription",
+      "sendCodexPlusDiagnostic",
+      `${renderer.slice(fromStart, fromEnd)}\n${renderer.slice(start, end)}\nreturn installCodexServiceTierDispatcherPatch;`,
+    )(
+      {},
+      1,
+      async (prefix: string) => {
+        if (prefix in modules) return modules[prefix];
+        throw new Error(`未找到 Codex App asset: ${prefix}`);
+      },
+      () => undefined,
+      () => undefined,
+      (event: string, detail: unknown) => details.push([event, detail]),
+    ) as () => void;
+
+    install();
+    for (let i = 0; i < 10; i += 1) await Promise.resolve();
+
+    assert.deepEqual(details, [["service_tier_dispatcher_patch_installed", { assetPrefix: "app-shared-" }]]);
+  });
+
   it("keeps working normally when the dispatcher is found", async () => {
     const harness = dispatcherPatchRuntime(await readFile(rendererPath, "utf8"), true);
 
