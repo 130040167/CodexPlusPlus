@@ -5802,6 +5802,106 @@ impl Drop for AggregateHttpRegressionFixture {
     }
 }
 
+async fn aggregate_http_file_request(input: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let body = json!({
+            "model": "client-model", "input": input, "stream": false,
+            "conversation_id": "same-http-regression-session"
+        }).to_string();
+        let mut response = open_responses_proxy_request(&body, None).await.unwrap();
+        assert_eq!(response.status_code, 200);
+        assert_eq!(response.read_body().await.unwrap(), b"{}");
+    }).await.expect("file-backed proxy request timed out");
+}
+
+#[tokio::test]
+async fn aggregate_http_fallback_feedback_tracks_each_attempt_and_stays_on_c() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let settings_path = temp.path().join("settings.json");
+    let _guard = SettingsPathGuard::set(settings_path.clone());
+    let mut fixture = AggregateHttpRegressionFixture::start(
+        settings_path, "http-attempt-feedback", [500, 500, 200], [500, 500, 200],
+        [None, None, None],
+    ).await;
+
+    aggregate_http_file_request("initial").await;
+    fixture.expect("a", "initial", "old").await;
+    fixture.expect("b", "initial", "old").await;
+    fixture.expect("c", "initial", "old").await;
+    aggregate_http_file_request("next").await;
+    fixture.expect("c", "next", "old").await;
+    assert!(fixture.received.try_recv().is_err(), "不能跳过或绕回成员");
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn aggregate_concurrent_http_failures_of_a_advance_only_once_to_b() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let settings_path = temp.path().join("settings.json");
+    let _guard = SettingsPathGuard::set(settings_path.clone());
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let mut fixture = AggregateHttpRegressionFixture::start(
+        settings_path, "http-concurrent-feedback", [500, 200, 200], [500, 200, 200],
+        [Some(gate.clone()), None, None],
+    ).await;
+
+    let requests = async {
+        tokio::join!(aggregate_http_file_request("held"), aggregate_http_file_request("held"));
+    };
+    let release = async {
+        // 两个完整 A 请求都到达之后才放行 500，消除 snapshot 获取先后的竞态。
+        fixture.expect("a", "held", "old").await;
+        fixture.expect("a", "held", "old").await;
+        gate.add_permits(2);
+    };
+    tokio::join!(requests, release);
+    fixture.expect("b", "held", "old").await;
+    fixture.expect("b", "held", "old").await;
+    aggregate_http_file_request("next").await;
+    fixture.expect("b", "next", "old").await;
+    assert!(fixture.received.try_recv().is_err(), "并发 A 失败不能推进到 C");
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn aggregate_old_http_failure_and_fallback_cannot_mutate_admitted_generation() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let settings_path = temp.path().join("settings.json");
+    let _guard = SettingsPathGuard::set(settings_path.clone());
+    let first_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let fallback_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let mut fixture = AggregateHttpRegressionFixture::start(
+        settings_path, "http-generation-feedback", [500, 200, 200], [500, 500, 200],
+        [Some(first_gate.clone()), Some(fallback_gate.clone()), None],
+    ).await;
+
+    let advance_generation = async {
+        fixture.expect("a", "held", "old").await;
+        for (index, relay) in fixture.settings.relay_profiles.iter_mut().take(3).enumerate() {
+            relay.api_key = format!("synthetic-{}-new", ["a", "b", "c"][index]);
+        }
+        fixture.persist();
+        // 不能只保存配置：用新凭据实际请求 A -> B，接纳新 generation 并建立 B 游标。
+        aggregate_http_file_request("admit-new").await;
+        fixture.expect("a", "admit-new", "new").await;
+        fixture.expect("b", "admit-new", "new").await;
+        first_gate.add_permits(1);
+        fixture.expect("b", "held", "old").await;
+        aggregate_http_file_request("after-old-a-failure").await;
+        fixture.expect("b", "after-old-a-failure", "new").await;
+        fallback_gate.add_permits(1);
+    };
+    tokio::join!(aggregate_http_file_request("held"), advance_generation);
+    fixture.expect("c", "held", "old").await;
+    aggregate_http_file_request("after-old-fallback").await;
+    fixture.expect("b", "after-old-fallback", "new").await;
+    assert!(fixture.received.try_recv().is_err(), "旧 generation 不能改变新故障转移游标");
+    fixture.shutdown().await;
+}
+
 #[tokio::test]
 async fn aggregate_http_retired_model_can_continue_after_switching_to_pool() {
     let _lock = settings_path_test_lock().lock().unwrap();
@@ -7766,6 +7866,63 @@ fn preserve_live_app_settings_does_not_invent_mcp_servers() {
 }
 
 #[tokio::test]
+async fn buffered_native_compaction_keeps_only_complete_checkpoint_after_transport_error() {
+    use codex_plus_core::protocol_proxy::open_responses_proxy_request_with_settings_for_path_and_beta;
+    for legacy in [false, true] {
+        for ending in ["complete", "missing", "empty", "late_failure", "trailing_data"] {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let item = json!({
+                "id": "cmp_done", "type": "compaction",
+                "encrypted_content": if ending == "empty" { "" } else { "opaque-checkpoint" }
+            });
+            let mut body = format!(
+                "data: {}\n\n",
+                json!({"type":"response.output_item.done","output_index":0,"item":item})
+            );
+            if ending != "missing" {
+                body.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({"type":"response.completed","response":{"id":"resp_done","status":"completed","output":[item]}})
+                ));
+            }
+            if ending == "late_failure" {
+                body.push_str("data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n");
+            }
+            if ending == "trailing_data" {
+                body.push_str("data: {");
+            }
+            let expected = body.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let _ = read_async_http_request(&mut stream).await;
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+                stream.write_all(format!("{:x}\r\n{body}\r\n", body.len()).as_bytes()).await.unwrap();
+                stream.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                // 不发送 chunked 的结束块，强制在完整语义事件后出现传输错误。
+                stream.shutdown().await.unwrap();
+                tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_ok()
+            });
+            let opened = open_responses_proxy_request_with_settings_for_path_and_beta(
+                &json!({"model":"model","stream":true,"input":[{"type":"compaction_trigger"}]}).to_string(),
+                remote_compaction_settings(&format!("http://{address}/v1"), RelayProtocol::Responses),
+                if legacy { "/v1/responses/compact" } else { "/v1/responses" },
+                None,
+            ).await;
+            assert!(!server.await.unwrap(), "断流后不能自动重放压缩请求");
+            if ending == "complete" {
+                let mut response = opened.expect("完整 checkpoint 后的传输错误不能丢弃已完成结果");
+                assert!(response.native_compaction_passthrough);
+                assert_eq!(response.read_body().await.unwrap(), expected.as_bytes());
+            } else {
+                assert!(opened.is_err(), "不能把不完整或失败的 checkpoint 判为成功: {ending}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn native_compaction_preserves_protocol_and_opaque_state() {
     use codex_plus_core::protocol_proxy::open_responses_proxy_request_with_settings_for_path_and_beta;
     let item = json!({"id":"cmp_native", "type":"compaction", "encrypted_content":"opaque-native-state", "future":{"kept":true}});
@@ -8045,6 +8202,36 @@ async fn proxy_auto_retry_retries_opted_in_status_and_honors_retry_after() {
     let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
     assert!(body.contains("resp_ok"));
     assert!(!body.contains("rate limited"), "重试成功后不能把 429 交给 Codex");
+    assert_eq!(server.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_preserves_status_retry_when_error_body_exceeds_limit() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let oversized = "x".repeat(64 * 1024 + 1);
+    let responses = vec![
+        proxy_http_response("429 Too Many Requests", &oversized),
+        proxy_sse_response(&success_stream()),
+    ];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 1;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+    settings.protocol_proxy_auto_retry_status_codes = vec![429];
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    ).await.unwrap();
+
+    assert_eq!(result.status_code, 200);
+    let trace = result.request_trace.as_ref().unwrap();
+    assert_eq!(trace.attempts, 2);
+    assert_eq!(trace.auto_retries, 1);
+    assert_eq!(trace.retry_reasons, vec!["upstream_http_status:429".to_string()]);
+    assert!(!serde_json::to_string(trace).unwrap().contains(&oversized));
+    assert!(String::from_utf8(result.read_body().await.unwrap()).unwrap().contains("resp_ok"));
     assert_eq!(server.await.unwrap().len(), 2);
 }
 

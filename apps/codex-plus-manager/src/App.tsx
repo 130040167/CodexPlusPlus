@@ -185,6 +185,7 @@ import {
   setModelReasoningLevelsForSlug,
 } from "./model-reasoning";
 import { clampAggregateRoutePriority, normalizeAggregateRoutes, validateAggregateRoutes } from "./aggregate-routes";
+import { nextAggregateProfileName } from "./aggregate-profile-name";
 import {
   aggregateMemberCandidates,
   normalizeAggregateMembers,
@@ -17199,7 +17200,10 @@ function createAggregateRelayProfile(settings: BackendSettings): RelayProfile {
   return normalizeAggregateRelayProfile(
     {
       id,
-      name: tf("聚合供应商 {0}", [settings.relayProfiles.filter(isAggregateRelayProfile).length + 1]),
+      name: nextAggregateProfileName(
+        settings.relayProfiles.map((profile) => profile.name),
+        (number) => tf("聚合供应商 {0}", [number]),
+      ),
       model: "",
       baseUrl: "",
       upstreamBaseUrl: "",
