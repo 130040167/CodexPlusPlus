@@ -44,17 +44,17 @@ Friendly link: <a href="https://linux.do">LINUX DO</a>
 | Agent | What Codex++ does |
 | --- | --- |
 | **Codex desktop** | Provider switching and protocol conversion, request shock absorption, session management, UI enhancements, multi-launch, extensions, and the usage widget |
-| **Claude Code** | CC Switch-style provider switching; Computer Use connection |
+| **Claude Code** | One-click provider switching; Computer Use connection |
 | **Claude Desktop** | Enhanced copy (Chinese UI, dictation, Computer Use); Computer Use connection |
 | **Grok CLI** | Model and API endpoint configuration |
 | **DeepSeek Harness and more** | Computer Use connection; callable as a sub-agent from Codex chats |
 
 | Area | Capabilities |
 | --- | --- |
-| Provider configuration | Official login, official login plus API, pure API, and aggregate providers (Failover / Model aggregation); Responses / Chat Completions; model tests, model discovery, Provider Doctor, cc-switch and deep-link imports; optional auto-review model per provider |
+| Provider configuration | Official login, official login plus API, pure API, and aggregate providers (Failover / Model aggregation); Responses / Chat Completions; model tests, model discovery, Provider Doctor, third-party and deep-link imports; optional auto-review model per provider |
 | Models and context | Per-model context windows, auto-compact limits, `model_catalog_json`, model metadata import (models.json), and per-provider MCP, Skill, and Plugin selection |
 | Computer Use sharing · new | Expose the Computer Use and Chrome browser control built into the Codex desktop app (ChatGPT.app) over MCP to Claude Code, Claude Desktop, Codex CLI, DeepSeek Harness, ZCode, and WorkBuddy, with a selectable approval policy (macOS) |
-| Beyond Codex · new | Claude Code provider switching in a CC Switch-style list with third-party imports; an enhanced Claude.app copy with Chinese UI, composer dictation, and Computer Use; Grok CLI model and endpoint management |
+| Beyond Codex · new | Claude Code provider switching with imports from other tools; an enhanced Claude.app copy with Chinese UI, composer dictation, and Computer Use; Grok CLI model and endpoint management |
 | Request shock absorption and request log | Back off and retry upstream overload errors at the proxy, optionally by HTTP status code; streaming or fully buffered mode; the always-on local proxy keeps running after Codex quits. The request log shows in-flight requests, time to first token, retry reasons, and token usage, filterable by conversation |
 | Session management | Local session scanning, bulk deletion, Markdown export, token usage history, project move, thread IDs, opt-in [turn rewind](docs/turn-rewind.md), and side chats saved as ordinary conversations |
 | Codex multi-launch | Start an isolated Codex instance per provider identity, each with its own config, sessions, and user data directory; restart or stop each one individually |

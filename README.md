@@ -133,7 +133,7 @@ Codex++ 是 AI 编程 Agent 的统一管理应用。它从 OpenAI Codex / ChatGP
 | Agent | Codex++ 能做什么 |
 | --- | --- |
 | **Codex 桌面版** | 供应商切换与协议转换、请求避震、会话管理、界面增强、多开、拓展与桌宠 |
-| **Claude Code** | 供应商一键切换（CC Switch 风格）、接入 Computer Use |
+| **Claude Code** | 供应商一键切换、接入 Computer Use |
 | **Claude Desktop** | 增强版（中文界面、语音输入、Computer Use）、接入 Computer Use |
 | **Grok CLI** | 模型与 API 端点配置 |
 | **DeepSeek Harness 等** | 接入 Computer Use、在 Codex 对话中作为子 Agent 调用 |
