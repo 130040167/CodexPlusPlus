@@ -36,6 +36,41 @@ function runtime() {
 }
 
 describe("native title provider guard", () => {
+  it("uses production profile gating without requiring an aggregate projection for direct suppliers", () => {
+    const profile = { id: "direct", relayMode: "pureApi", officialMixApiKey: false };
+    const settings: any = { relayProfilesEnabled: true, activeRelayId: "direct", relayProfiles: [profile],
+      managedSessionConnection: null };
+    const context = vm.createContext({ window: {}, codexPlusBackendSettings: settings });
+    const activeProfile = tier.slice(tier.indexOf("  function codexRemoteSessionActiveProfile("),
+      tier.indexOf("  function codexRemoteSessionProviderPatchEnabled("));
+    vm.runInContext(`${activeProfile}\n${connectionGuard}\n${guard}\nthis.fallback = codexManagedNativeTitleFallback;`, context);
+    const local = { hostId: "local" };
+    for (const mode of ["pureApi", "mixedApi"]) {
+      profile.relayMode = mode;
+      assert.equal(context.fallback(local), true);
+      assert.equal(context.fallback({ hostId: "ssh:test" }), false);
+      settings.relayProfilesEnabled = false;
+      assert.equal(context.fallback(local), false);
+      settings.relayProfilesEnabled = true;
+    }
+    profile.relayMode = "official";
+    assert.equal(context.fallback(local), false);
+    profile.officialMixApiKey = true;
+    assert.equal(context.fallback(local), true);
+    profile.relayMode = "aggregate";
+    assert.equal(context.fallback(local), false);
+    settings.managedSessionConnection = { profileId: "direct", provider: "codex_plus_managed",
+      baseUrl: "http://127.0.0.1:62021/v1" };
+    assert.equal(context.fallback(local), true);
+    settings.managedSessionConnection.profileId = "stale";
+    assert.equal(context.fallback(local), false);
+    settings.managedSessionConnection.profileId = "direct";
+    settings.managedSessionConnection.baseUrl = "https://remote.invalid/v1";
+    assert.equal(context.fallback(local), false);
+    settings.activeRelayId = "missing";
+    assert.equal(context.fallback(local), false);
+  });
+
   it("returns null before native RPC only for protected local titles and follows hot switches", async () => {
     const { state, native, root, context } = runtime();
     assert.equal(context.patch(root), true);
