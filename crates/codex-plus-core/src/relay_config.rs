@@ -1652,6 +1652,7 @@ fn recognized_managed_proxy_endpoint(profile: &RelayProfile, config: &str) -> bo
         || profile.uses_independent_proxy()
         || profile.web_search_history_compat_enabled()
         || profile.request_compatibility_enabled()
+        || profile.rewrites_auto_review_model()
         || profile.relay_mode == RelayMode::Aggregate;
     let saved_endpoint_matches = provider_string_from_config(&profile.config_contents, "base_url")
         .is_some_and(|saved| {
@@ -5050,6 +5051,7 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
         || profile.uses_independent_proxy()
         || profile.web_search_history_compat_enabled()
         || profile.request_compatibility_enabled()
+        || profile.rewrites_auto_review_model()
         || has_managed_proxy_config
     {
         if !profile.upstream_base_url.trim().is_empty() {
@@ -5256,6 +5258,7 @@ fn complete_relay_profile_config_with_proxy_port(
         || profile.uses_independent_proxy()
         || profile.web_search_history_compat_enabled()
         || profile.request_compatibility_enabled()
+        || profile.rewrites_auto_review_model()
     {
         crate::protocol_proxy::local_responses_proxy_base_url(proxy_port)
     } else {
