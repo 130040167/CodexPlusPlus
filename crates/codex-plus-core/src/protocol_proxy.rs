@@ -4826,6 +4826,9 @@ fn project_strict_reasoning_history(body: &mut Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Codex 自动审批（「替我审批」）请求使用的固定模型 slug。
+const CODEX_AUTO_REVIEW_MODEL: &str = "codex-auto-review";
+
 async fn upstream_request_parts(
     relay: &crate::settings::RelayProfile,
     mut request_json: Value,
@@ -4854,6 +4857,14 @@ async fn upstream_request_parts(
         .filter(|value| !value.is_empty())
     {
         request_json["model"] = json!(model);
+    }
+    // issue #1446：「替我审批」固定请求 codex-auto-review，第三方上游不认识，
+    // 供应商配置了审批模型时按供应商改写；未配置保持原样转发。
+    let auto_review_model = relay.auto_review_model.trim();
+    if !auto_review_model.is_empty()
+        && request_json.get("model").and_then(Value::as_str) == Some(CODEX_AUTO_REVIEW_MODEL)
+    {
+        request_json["model"] = json!(auto_review_model);
     }
     let model = request_json.get("model").and_then(Value::as_str).unwrap_or("");
     let compatibility_enabled = relay.request_compatibility_enabled();
@@ -11831,6 +11842,39 @@ mod parallel_tool_call_pairing_tests {
         let input = adapted["input"].as_array().unwrap();
         assert_eq!(input[4]["type"], "custom_tool_call_output", "图片输出不应被改成 function_call_output");
         assert_eq!(input[6]["type"], "function_call_output");
+    }
+
+    /// issue #1446：配置了审批模型时把 codex-auto-review 改写成供应商模型；
+    /// 未配置时原样转发，普通请求不受影响。
+    #[tokio::test]
+    async fn auto_review_model_is_rewritten_only_when_configured() {
+        let mut relay = crate::settings::RelayProfile {
+            protocol: RelayProtocol::Responses,
+            base_url: "https://relay.example.test/v1".into(),
+            api_key: "sk-test".into(),
+            ..Default::default()
+        };
+        let review = || json!({"model": "codex-auto-review", "input": "review"});
+
+        let (_, out, _, _) =
+            upstream_request_parts(&relay, review(), "/v1/responses", None, false, None)
+                .await
+                .unwrap();
+        assert_eq!(out["model"], "codex-auto-review");
+
+        relay.auto_review_model = " deepseek-v4-flash ".into();
+        let (_, out, _, _) =
+            upstream_request_parts(&relay, review(), "/v1/responses", None, false, None)
+                .await
+                .unwrap();
+        assert_eq!(out["model"], "deepseek-v4-flash");
+
+        let normal = json!({"model": "deepseek-v4-pro", "input": "hi"});
+        let (_, out, _, _) =
+            upstream_request_parts(&relay, normal, "/v1/responses", None, false, None)
+                .await
+                .unwrap();
+        assert_eq!(out["model"], "deepseek-v4-pro");
     }
 
     fn assert_pairing(body: &Value, expected: usize) {

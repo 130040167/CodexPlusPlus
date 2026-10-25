@@ -144,6 +144,10 @@ pub struct RelayProfile {
     /// 明确选择严格 Responses 历史契约；默认不改写历史。
     #[serde(default, skip_serializing_if = "is_false")]
     pub strict_responses_reasoning: bool,
+    /// Codex「替我审批」固定请求 `codex-auto-review`，第三方上游通常不认识这个模型；
+    /// 填写后协议代理把它改写成这里的模型（#1446）。留空则原样转发。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub auto_review_model: String,
     /// Anthropic 上游的认证字段：`x-api-key`（默认，Anthropic 原生）或
     /// `authorization`（多数 Claude 系中转网关用 Bearer）。
     #[serde(
@@ -338,6 +342,7 @@ impl Default for RelayProfile {
             web_search_history_compat: false,
             trust_upstream_catalog_lite: false,
             strict_responses_reasoning: false,
+            auto_review_model: String::new(),
             anthropic_auth_header: String::new(),
             anthropic_max_tokens: 0,
             anthropic_prompt_cache: true,
@@ -1169,6 +1174,7 @@ impl BackendSettings {
                 web_search_history_compat: false,
                 trust_upstream_catalog_lite: false,
                 strict_responses_reasoning: false,
+                auto_review_model: String::new(),
                 anthropic_auth_header: String::new(),
                 anthropic_max_tokens: 0,
                 anthropic_prompt_cache: true,
@@ -1235,6 +1241,7 @@ impl BackendSettings {
             web_search_history_compat: false,
             trust_upstream_catalog_lite: false,
             strict_responses_reasoning: false,
+            auto_review_model: String::new(),
             anthropic_auth_header: String::new(),
             anthropic_max_tokens: 0,
             anthropic_prompt_cache: true,

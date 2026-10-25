@@ -478,6 +478,7 @@ export type RelayProfile = {
   vlmModel: string;
   vlmBaseUrl: string;
   userAgent: string;
+  autoReviewModel?: string;
   customHeaders: { key: string; value: string }[];
   sub2apiEnabled: boolean;
   sub2apiMultiplier: string;
@@ -11624,6 +11625,15 @@ function RelayProfileEditor({
               </Field>
             ) : null}
             {showApiFields ? (
+              <Field className="relay-field-auto-review-model" label={t("自动审批模型")}>
+                <Input
+                  value={profile.autoReviewModel ?? ""}
+                  onChange={(event) => updateDraft({ autoReviewModel: event.currentTarget.value })}
+                  placeholder={t("留空则原样转发 codex-auto-review")}
+                />
+              </Field>
+            ) : null}
+            {showApiFields ? (
               <Field className="relay-field-proxy" label={t("供应商独立代理")}>
                 <div className="relay-inline-field">
                   <Input
@@ -15348,6 +15358,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     modelMetadata: profile.modelMetadata || "",
     modelRoutes: relayMode === "official" && !officialMixApiKey ? [] : normalizeRelayModelRoutes(profile.modelRoutes),
     userAgent: profile.userAgent || "",
+    autoReviewModel: profile.autoReviewModel?.trim() || "",
     customHeaders: profile.customHeaders || [],
     sub2apiEnabled: profile.noAuth ? false : profile.sub2apiEnabled === true,
     sub2apiMultiplier: !profile.noAuth && profile.sub2apiEnabled === true ? profile.sub2apiMultiplier || "" : "",
