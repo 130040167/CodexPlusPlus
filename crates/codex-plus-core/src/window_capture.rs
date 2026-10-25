@@ -643,7 +643,10 @@ mod tests {
         #[cfg(not(target_os = "macos"))]
         {
             assert!(super::list_windows().unwrap().is_empty());
-            let error = super::start_preview(1, 0.5, 12.0, |_| {}).unwrap_err();
+            // PreviewHandle 没有 Debug，不能用 unwrap_err；取出错误再断言。
+            let error = super::start_preview(1, 0.5, 12.0, CaptureMode::Screenshot, |_| {})
+                .err()
+                .expect("非 macOS 上应当返回不支持");
             assert!(error.to_string().contains("只支持 macOS"));
         }
         #[cfg(target_os = "macos")]
