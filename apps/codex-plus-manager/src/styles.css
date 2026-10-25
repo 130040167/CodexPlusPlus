@@ -10856,6 +10856,78 @@ select {
   }
 }
 
+/* ── 代理设置页 ──────────────────────────────────────────────── */
+/* 只在本页生效：StatusRow / settings-block / form-row 别的页面也在用。 */
+
+/* 徽标列按内容收窄；grid 默认 stretch 会把徽标拉成一根长条。 */
+.proxy-settings-page .status-row {
+  grid-template-columns: 140px auto minmax(0, 1fr);
+}
+
+.proxy-settings-page .status-row > :nth-child(2) {
+  justify-self: start;
+}
+
+/* 卡片标题自带底线，状态表再画一条顶线就成了双线。 */
+.proxy-settings-page .status-table {
+  border-top: 0;
+}
+
+/* 卡片里的第一个分组不需要分隔线和上边距，否则标题下会空出一截。 */
+.proxy-settings-page .settings-content > .settings-block:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+/* 数字输入与下拉都是短值：固定宽度并排，不再一个占满一个挤窄。 */
+.proxy-settings-page .form-row,
+.proxy-settings-page .settings-block .form-row {
+  grid-template-columns: repeat(auto-fill, minmax(200px, 240px));
+  align-items: end;
+  justify-content: start;
+}
+
+/* 与同行的 Input（h-8）等高同底色，否则底部对齐后两边标签会错开。 */
+.proxy-settings-page .form-row select {
+  width: 100%;
+  height: 2rem;
+  background-color: hsl(var(--surface-sunken));
+  font-size: 12.5px;
+}
+
+.proxy-settings-page .retry-status-editor {
+  max-width: 492px;
+}
+
+.relay-environment-head {
+  align-items: center;
+}
+
+.relay-environment-head-side {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 12px;
+}
+
+.relay-environment-head-side p {
+  max-width: none;
+}
+
+.proxy-settings-page .relay-environment-check {
+  min-height: 0;
+  padding: 10px 12px;
+}
+
+.proxy-settings-page .relay-environment-check-copy strong {
+  font-size: 13px;
+}
+
+.proxy-settings-page .relay-environment-check-copy span {
+  overflow-wrap: anywhere;
+}
+
 /* ── 请求日志页 ──────────────────────────────────────────────── */
 /* 铺满可视区域：卡片撑到页面底部，列表在卡片内部滚动，避免大片留白。 */
 .screen.request-log-screen {

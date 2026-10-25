@@ -5259,6 +5259,8 @@ function ProxySettingsScreen({
   );
   const proxyProfileKey = proxyProfiles.map((profile) => profile.id).join("|");
   const [proxyUrls, setProxyUrls] = useState<Record<string, string>>({});
+  // 已保存的值：输入与它一致时「保存」置灰，十几行供应商里一眼看出哪行改过。
+  const [savedProxyUrls, setSavedProxyUrls] = useState<Record<string, string>>({});
   const [proxyConfigured, setProxyConfigured] = useState<Record<string, boolean>>({});
   const [proxyBusyId, setProxyBusyId] = useState<string | null>(null);
   const [retryStatusInput, setRetryStatusInput] = useState("");
@@ -5295,6 +5297,7 @@ function ProxySettingsScreen({
         configured[entry.id] = entry.configured;
       });
       setProxyUrls(urls);
+      setSavedProxyUrls(urls);
       setProxyConfigured(configured);
     });
     return () => {
@@ -5314,6 +5317,7 @@ function ProxySettingsScreen({
       }>("set_relay_proxy", { profileId, proxyUrl: proxyUrls[profileId] ?? "" });
       if (result.status === "ok") {
         setProxyUrls((current) => ({ ...current, [profileId]: result.proxyUrl ?? "" }));
+        setSavedProxyUrls((current) => ({ ...current, [profileId]: result.proxyUrl ?? "" }));
         setProxyConfigured((current) => ({ ...current, [profileId]: result.configured === true }));
       }
       await actions.showMessage(t("供应商独立代理"), result.message, result.status === "ok" ? "ok" : "failed");
@@ -5329,7 +5333,7 @@ function ProxySettingsScreen({
   const conversionEnabled = overview?.runtime_health?.protocol_conversion_enabled === true;
 
   return (
-    <div className="settings-page">
+    <div className="settings-page proxy-settings-page">
       <Panel>
         <CardHead
           title={t("本地协议代理")}
@@ -5564,7 +5568,10 @@ function ProxySettingsScreen({
                     }
                   />
                   <Button
-                    disabled={proxyBusyId === profile.id}
+                    disabled={
+                      proxyBusyId === profile.id ||
+                      (proxyUrls[profile.id] ?? "").trim() === (savedProxyUrls[profile.id] ?? "").trim()
+                    }
                     onClick={() => void saveProviderProxy(profile)}
                     variant="secondary"
                   >
@@ -6046,10 +6053,19 @@ function RelayEnvironmentScreen({ result, actions }: { result: RelayEnvironmentR
 
   return (
     <Panel>
-      <CardHead
-        title={t("中转站环境配置检测")}
-        detail={result ? (allPassed ? t("三项检测全部通过") : t("检测到需要处理的环境问题")) : t("正在读取本机环境")}
-      />
+      {/* 「重新检测」放在标题栏右侧，与其它卡片的页面级操作同位，不再单独占一行。 */}
+      <CardHeader className="panel-head relay-environment-head">
+        <CardTitle>{t("中转站环境配置检测")}</CardTitle>
+        <div className="relay-environment-head-side">
+          <CardDescription>
+            {result ? (allPassed ? t("三项检测全部通过") : t("检测到需要处理的环境问题")) : t("正在读取本机环境")}
+          </CardDescription>
+          <Button onClick={() => void actions.refreshRelayEnvironment()} size="sm" variant="outline">
+            <RefreshCw className="h-4 w-4" />
+            {t("重新检测")}
+          </Button>
+        </div>
+      </CardHeader>
       <CardContent>
         <div className="relay-environment-checks">
           {checks.map((check) => (
@@ -6065,12 +6081,6 @@ function RelayEnvironmentScreen({ result, actions }: { result: RelayEnvironmentR
             </div>
           ))}
         </div>
-        <Toolbar>
-          <Button onClick={() => void actions.refreshRelayEnvironment()}>
-            <RefreshCw className="h-4 w-4" />
-            {t("重新检测")}
-          </Button>
-        </Toolbar>
       </CardContent>
     </Panel>
   );
