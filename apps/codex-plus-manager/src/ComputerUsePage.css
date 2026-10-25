@@ -317,3 +317,25 @@
 .cu-more > summary strong { font-size:13px; font-weight:600; }
 .cu-more > summary small { color:hsl(var(--muted-foreground)); font-size:11.5px; }
 .cu-more > .cu-card { margin:0 12px 12px; }
+
+/* codex-plus-cu 节点上的状态小标签（开关在图下方的设置区）。 */
+.cu-flow-summary { display:flex; flex-wrap:wrap; gap:4px; padding-top:8px; border-top:1px dashed hsl(var(--border)); }
+.cu-flow-summary span { padding:1px 7px; border:1px solid hsl(var(--border)); border-radius:999px; color:hsl(var(--muted-foreground)); font-size:10.5px; white-space:nowrap; }
+.cu-flow-summary span[data-accent] { border-color:hsl(var(--brand-accent)/.4); background:hsl(var(--brand-accent)/.1); color:hsl(var(--brand-accent)); }
+
+/* 图下方的 codex-plus-cu 设置：一行一项，左边说明右边控件。 */
+.cu-settings { display:grid; margin-top:14px; border:1px solid hsl(var(--border)); border-radius:10px; background:hsl(var(--card)/.6); }
+.cu-settings-head { display:flex; align-items:baseline; gap:8px; padding:10px 14px; border-bottom:1px solid hsl(var(--border)); font-size:12.5px; font-weight:600; }
+.cu-settings-head small { color:hsl(var(--muted-foreground)); font-size:11px; font-weight:400; }
+.cu-setting { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:20px; align-items:center; padding:12px 14px; border-bottom:1px solid hsl(var(--border)/.55); }
+.cu-setting:last-child { border-bottom:0; }
+label.cu-setting { cursor:pointer; }
+.cu-setting-copy { display:grid; gap:3px; min-width:0; }
+.cu-setting-copy strong { font-size:12.5px; font-weight:600; }
+.cu-setting-copy small { color:hsl(var(--muted-foreground)); font-size:11.5px; line-height:1.55; }
+.cu-setting-copy small.cu-flow-warn { color:hsl(var(--status-warning)); }
+.cu-setting .mg-segmented { width:auto; flex-wrap:nowrap; }
+.cu-setting .mg-segmented button { white-space:nowrap; }
+.cu-setting-check { width:16px; height:16px; margin:0; }
+@media(max-width:760px) { .cu-setting { grid-template-columns:minmax(0,1fr); gap:8px; } }
+

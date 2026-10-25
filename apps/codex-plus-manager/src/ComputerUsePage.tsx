@@ -577,14 +577,15 @@ export function ComputerUsePage() {
   /**
    * 交互式工作原理图：客户端 → Codex++ 两个 MCP 服务 → Codex 运行时 → 被操作的对象。
    *
-   * 接入与审批直接在图上操作：左列每个客户端一键接入/移除；审批方式开关放在 codex-plus-cu
-   * 节点上，因为审批就发生在这一步。用 CSS grid 而不是 SVG，文字随窗口换行、跟随主题。
+   * 接入直接在图上操作：左列每个客户端一键接入/移除。codex-plus-cu 节点只显示当前的操作方式、
+   * 审批与悬浮预览状态，开关放在图下方的设置区——塞进节点会把整张图的行高撑开。
+   * 用 CSS grid 而不是 SVG，文字随窗口换行、跟随主题。
    */
   const renderFlow = () => <section className="cu-card cu-flow-card" aria-labelledby="cu-flow-title">
     <div className="cu-card-head">
       <div>
         <h2 id="cu-flow-title">{t("工作原理")}</h2>
-        <p>{t("Codex++ 把 ChatGPT.app 里现成的 Computer Use 与 Chrome 扩展，通过 MCP 转给其它 AI 客户端。左边点「接入」，codex-plus-cu 上选审批方式。")}</p>
+        <p>{t("Codex++ 把 ChatGPT.app 里现成的 Computer Use 与 Chrome 扩展，通过 MCP 转给其它 AI 客户端。左边点「接入」；操作方式、审批与悬浮预览在图下方设置。")}</p>
       </div>
     </div>
     <div className="cu-flow-scroll">
@@ -606,34 +607,10 @@ export function ComputerUsePage() {
 
         <div className="cu-flow-lane-a" style={{ gridColumn: 3 }}>
           {flowNode(<MousePointerClick size={16} />, "codex-plus-cu", t("桌面操控"), "cu",
-            <div className="cu-flow-approval">
-              <span>{t("操作方式")}</span>
-              <div className="mg-segmented" role="radiogroup" aria-label={t("操作方式")}>
-                <button type="button" role="radio" aria-checked={cuMode === "tools"} data-active={cuMode === "tools"} disabled={locked}
-                  title={t("原生 Computer Use 的 10 个离散工具：get_app_state、click、type_text 等。")} onClick={() => void changeCuMode("tools")}>{t("离散工具")}</button>
-                <button type="button" role="radio" aria-checked={cuMode === "js"} data-active={cuMode === "js"} disabled={locked}
-                  title={t("和 Codex 一样，用 cua_repl 的 js 工具操作；首次使用会自动下发完整说明与确认规则，支持 paste 输入中文。")} onClick={() => void changeCuMode("js")}>{t("JS（同 Codex）")}<span className="cu-flow-recommend">{t("推荐")}</span></button>
-              </div>
-              <small className="cu-flow-reason">
-                {t("推荐 JS：与 Codex 当前的用法一致；首次使用自带完整说明和确认规则；一次调用能连续做多步操作，更快、更省 token；能用 paste 输入中文和多行文字。")}
-              </small>
-              {cuMode === "js"
-                ? <small className="cu-flow-warn">{t("模型可执行任意 JavaScript（能读写文件、联网）；对新开的客户端会话生效")}</small>
-                : <small className="cu-flow-warn">{t("离散工具每个动作一次调用，返回都带截图；中文需用 set_value。对新开的客户端会话生效")}</small>}
-              <label className="cu-flow-check" title={t("同 Codex 的画中画：操作后台应用时在屏幕右上角实时显示目标窗口；回合结束或空闲 20 秒自动收起。需要屏幕录制权限。")}>
-                <input type="checkbox" checked={approval?.pip ?? true} disabled={locked} onChange={(event) => void changePip(event.target.checked)} />
-                {t("操作后台应用时显示悬浮预览")}
-              </label>
-              <span>{t("首次接管某个应用时")}</span>
-              <div className="mg-segmented" role="radiogroup" aria-label={t("审批策略")}>
-                <button type="button" role="radio" aria-checked={approvalMode === "auto"} data-active={approvalMode === "auto"} disabled={locked}
-                  title={t("自动放行所有应用，只记审计日志。")} onClick={() => void changeApprovalMode("auto")}>{t("自动放行")}</button>
-                <button type="button" role="radio" aria-checked={approvalMode === "claude"} data-active={approvalMode === "claude"} disabled={locked}
-                  title={t("把许可请求转给 MCP 客户端，由 Claude 侧弹卡确认；拒绝即不放行。")} onClick={() => void changeApprovalMode("claude")}>{t("交给 Claude")}</button>
-              </div>
-              {approvalMode === "claude" && approval?.lastClient?.elicitation === false
-                ? <small className="cu-flow-warn">{t("最近连接的客户端不支持审批卡，会退回自动放行")}</small>
-                : null}
+            <div className="cu-flow-summary" title={t("在下方「codex-plus-cu 设置」里修改")}>
+              <span data-accent={cuMode === "js" ? "true" : undefined}>{cuMode === "js" ? t("JS") : t("离散工具")}</span>
+              <span>{approvalMode === "auto" ? t("自动放行") : t("交给 Claude")}</span>
+              {approval?.pip ?? true ? <span>{t("悬浮预览")}</span> : null}
             </div>)}
         </div>
         <div className="cu-flow-link cu-flow-lane-a" style={{ gridColumn: 4 }}><span><ShieldCheck size={12} aria-hidden="true" />{t("审批")}</span></div>
@@ -658,6 +635,46 @@ export function ComputerUsePage() {
         <div className="cu-flow-link cu-flow-lane-b" style={{ gridColumn: 6 }} />
         <div className="cu-flow-lane-b" style={{ gridColumn: 7 }}>{flowNode(<Globe size={16} />, t("Chrome 标签页"), t("你已登录的真实浏览器"), "target")}</div>
       </div>
+    </div>
+    <div className="cu-settings" aria-labelledby="cu-settings-title">
+      <div className="cu-settings-head" id="cu-settings-title">{t("codex-plus-cu 设置")}<small>{t("对新开的客户端会话生效")}</small></div>
+      <div className="cu-setting">
+        <div className="cu-setting-copy">
+          <strong>{t("操作方式")}</strong>
+          <small>{t("推荐 JS：与 Codex 当前的用法一致；首次使用自带完整说明和确认规则；一次调用能连续做多步操作，更快、更省 token；能用 paste 输入中文和多行文字。")}</small>
+          {cuMode === "js"
+            ? <small className="cu-flow-warn">{t("模型可执行任意 JavaScript（能读写文件、联网）。")}</small>
+            : <small className="cu-flow-warn">{t("离散工具每个动作一次调用，返回都带截图；中文需用 set_value。")}</small>}
+        </div>
+        <div className="mg-segmented" role="radiogroup" aria-label={t("操作方式")}>
+          <button type="button" role="radio" aria-checked={cuMode === "js"} data-active={cuMode === "js"} disabled={locked}
+            title={t("和 Codex 一样，用 cua_repl 的 js 工具操作；首次使用会自动下发完整说明与确认规则，支持 paste 输入中文。")} onClick={() => void changeCuMode("js")}>{t("JS（同 Codex）")}<span className="cu-flow-recommend">{t("推荐")}</span></button>
+          <button type="button" role="radio" aria-checked={cuMode === "tools"} data-active={cuMode === "tools"} disabled={locked}
+            title={t("原生 Computer Use 的 10 个离散工具：get_app_state、click、type_text 等。")} onClick={() => void changeCuMode("tools")}>{t("离散工具")}</button>
+        </div>
+      </div>
+      <div className="cu-setting">
+        <div className="cu-setting-copy">
+          <strong>{t("首次接管某个应用时")}</strong>
+          <small>{t("自动放行只记审计日志；交给 Claude 由客户端弹卡确认，拒绝即不放行。")}</small>
+          {approvalMode === "claude" && approval?.lastClient?.elicitation === false
+            ? <small className="cu-flow-warn">{t("最近连接的客户端不支持审批卡，会退回自动放行")}</small>
+            : null}
+        </div>
+        <div className="mg-segmented" role="radiogroup" aria-label={t("审批策略")}>
+          <button type="button" role="radio" aria-checked={approvalMode === "auto"} data-active={approvalMode === "auto"} disabled={locked}
+            title={t("自动放行所有应用，只记审计日志。")} onClick={() => void changeApprovalMode("auto")}>{t("自动放行")}</button>
+          <button type="button" role="radio" aria-checked={approvalMode === "claude"} data-active={approvalMode === "claude"} disabled={locked}
+            title={t("把许可请求转给 MCP 客户端，由 Claude 侧弹卡确认；拒绝即不放行。")} onClick={() => void changeApprovalMode("claude")}>{t("交给 Claude")}</button>
+        </div>
+      </div>
+      <label className="cu-setting">
+        <span className="cu-setting-copy">
+          <strong>{t("操作后台应用时显示悬浮预览")}</strong>
+          <small>{t("同 Codex 的画中画：在屏幕右上角实时显示目标窗口；回合结束或空闲 20 秒自动收起。需要屏幕录制权限。")}</small>
+        </span>
+        <input className="cu-setting-check" type="checkbox" checked={approval?.pip ?? true} disabled={locked} onChange={(event) => void changePip(event.target.checked)} />
+      </label>
     </div>
     <p className="cu-flow-foot">{t("接入后重启对应客户端，工具名以 mcp__codex-plus-cu__ 与 mcp__codex-plus-browser__ 开头。")}</p>
   </section>;
