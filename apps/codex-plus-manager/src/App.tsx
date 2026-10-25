@@ -1285,7 +1285,7 @@ const defaultSettings: BackendSettings = {
   protocolProxyAutoRetryStatusCodes: [],
   protocolProxyAutoRetryMode: "streaming",
   protocolProxyAutoRetryCommitDelayMs: 1000,
-  protocolProxyMapUnlistedModels: true,
+  protocolProxyMapUnlistedModels: false,
   helperMaxRequestBodyMib: 128,
   codexAppCapacityAutoRetry: false,
   codexAppStepwiseEnabled: false,
@@ -5615,7 +5615,7 @@ function ProxySettingsScreen({
               <span>{t("改写目录外模型名")}</span>
             </label>
             <p className="field-hint">
-              {t("Codex 的自动审查（codex-auto-review）与标题/摘要等后台任务固定使用 gpt-* 等内部模型名，不经选模；第三方上游没有这些名字，原样转发只会报「模型不存在」并可能反复消耗额度。开启后，不在当前供应商模型列表里的请求模型会改写为该供应商的默认模型再转发（#1183 / #1446 / #1457）；官方登录与聚合供应商不受影响。")}
+              {t("Codex 的自动审查（codex-auto-review）与标题/摘要等后台任务固定使用 gpt-* 等内部模型名，不经选模；第三方上游没有这些名字，原样转发只会报「模型不存在」并可能反复消耗额度。开启后，不在当前供应商模型列表里的请求模型会改写为该供应商的默认模型再转发（#1183 / #1446 / #1457）；官方登录与聚合供应商不受影响，已配置「自动审批模型」时 codex-auto-review 仍按该配置改写。默认关闭：开启后手填但未写进模型列表的模型也会被改写，请先把要用的模型都加进列表。")}
             </p>
           </div>
         </CardContent>
@@ -15378,7 +15378,8 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     codexAppTypingEffect: normalizeTypingEffect(settings.codexAppTypingEffect),
     relayProfilesEnabled: settings.relayProfilesEnabled !== false,
     protocolProxyAutoRetry: settings.protocolProxyAutoRetry !== false,
-    protocolProxyMapUnlistedModels: settings.protocolProxyMapUnlistedModels !== false,
+    // 默认关闭（opt-in），只有显式开启才生效。
+    protocolProxyMapUnlistedModels: settings.protocolProxyMapUnlistedModels === true,
     protocolProxyAutoRetryMaxAttempts: clampNumber(settings.protocolProxyAutoRetryMaxAttempts ?? 5, 0, 20),
     protocolProxyAutoRetryMode:
       settings.protocolProxyAutoRetryMode === "buffered"

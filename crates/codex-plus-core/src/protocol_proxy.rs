@@ -4293,11 +4293,17 @@ fn unlisted_model_replacement(
     {
         return None;
     }
+    let model = model.trim();
+    // 自动审批模型优先（#1446）：供应商配置了 autoReviewModel 时，codex-auto-review
+    // 交给 `auto_review_model_rewrite` 按配置改写；这里若先改成默认模型，
+    // 那条规则就再也匹配不上，用户配置的审批模型会被静默覆盖。
+    if auto_review_model_rewrite(&settings.active_relay_profile(), model).is_some() {
+        return None;
+    }
     let published = crate::model_catalog::active_published_model_ids(settings);
     if published.is_empty() {
         return None;
     }
-    let model = model.trim();
     if model.is_empty() {
         return None;
     }
@@ -4784,7 +4790,10 @@ pub async fn open_chat_completions_proxy_request(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    if let Some(replacement) = unlisted_model_replacement(&settings, &requested_model) {
+    // 自动审批模型优先于目录外映射（与 Responses 路径的 upstream_request_parts 一致）。
+    if let Some(auto_review_model) = auto_review_model_rewrite(&relay, &requested_model) {
+        request_json["model"] = json!(auto_review_model);
+    } else if let Some(replacement) = unlisted_model_replacement(&settings, &requested_model) {
         log_unlisted_model_mapping(&requested_model, &replacement);
         request_json["model"] = Value::String(replacement);
     }
@@ -4930,6 +4939,17 @@ fn project_strict_reasoning_history(body: &mut Value) -> anyhow::Result<()> {
 /// Codex 自动审批（「替我审批」）请求使用的固定模型 slug。
 const CODEX_AUTO_REVIEW_MODEL: &str = "codex-auto-review";
 
+/// codex-auto-review 的改写目标：供应商配置了审批模型（#1446）时返回它，否则 `None`。
+/// 目录外模型映射（#1183）也用它判断是否让路，两处共用同一条规则。
+fn auto_review_model_rewrite<'a>(
+    relay: &'a crate::settings::RelayProfile,
+    model: &str,
+) -> Option<&'a str> {
+    let auto_review_model = relay.auto_review_model.trim();
+    (!auto_review_model.is_empty() && model == CODEX_AUTO_REVIEW_MODEL)
+        .then_some(auto_review_model)
+}
+
 async fn upstream_request_parts(
     relay: &crate::settings::RelayProfile,
     mut request_json: Value,
@@ -4962,10 +4982,10 @@ async fn upstream_request_parts(
     }
     // issue #1446：「替我审批」固定请求 codex-auto-review，第三方上游不认识，
     // 供应商配置了审批模型时按供应商改写；未配置保持原样转发。
-    let auto_review_model = relay.auto_review_model.trim();
-    if !auto_review_model.is_empty()
-        && request_json.get("model").and_then(Value::as_str) == Some(CODEX_AUTO_REVIEW_MODEL)
-    {
+    if let Some(auto_review_model) = auto_review_model_rewrite(
+        relay,
+        request_json.get("model").and_then(Value::as_str).unwrap_or(""),
+    ) {
         request_json["model"] = json!(auto_review_model);
     }
     let model = request_json.get("model").and_then(Value::as_str).unwrap_or("");
@@ -10796,7 +10816,36 @@ mod unlisted_model_mapping_tests {
         let mut settings = crate::settings::BackendSettings::default();
         settings.relay_profiles = vec![profile];
         settings.active_relay_id = "relay-api".to_string();
+        // 开关默认关闭（opt-in），以下用例除专门测关闭的以外都显式开启。
+        settings.protocol_proxy_map_unlisted_models = true;
         settings
+    }
+
+    #[test]
+    fn mapping_is_off_by_default() {
+        let mut settings = api_settings("minimax-m2.5\ndeepseek-v4-pro", "minimax-m2.5");
+        settings.protocol_proxy_map_unlisted_models =
+            crate::settings::BackendSettings::default().protocol_proxy_map_unlisted_models;
+        assert!(!settings.protocol_proxy_map_unlisted_models);
+        assert_eq!(unlisted_model_replacement(&settings, "gpt-5.4"), None);
+        assert_eq!(unlisted_model_replacement(&settings, "codex-auto-review"), None);
+    }
+
+    #[test]
+    fn configured_auto_review_model_wins_over_unlisted_mapping() {
+        let mut settings = api_settings("minimax-m2.5\ndeepseek-v4-pro", "minimax-m2.5");
+        settings.relay_profiles[0].auto_review_model = "deepseek-v4-flash".to_string();
+        // codex-auto-review 让路给 upstream_request_parts 的审批模型改写（#1446）。
+        assert_eq!(unlisted_model_replacement(&settings, "codex-auto-review"), None);
+        assert_eq!(
+            auto_review_model_rewrite(&settings.active_relay_profile(), "codex-auto-review"),
+            Some("deepseek-v4-flash")
+        );
+        // 其他目录外模型仍按默认模型映射。
+        assert_eq!(
+            unlisted_model_replacement(&settings, "gpt-5.4").as_deref(),
+            Some("minimax-m2.5")
+        );
     }
 
     #[test]
