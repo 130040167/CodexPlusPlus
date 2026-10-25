@@ -11541,3 +11541,124 @@ select {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* ── 供应商编辑页 ───────────────────────────────────────────── */
+/* 分区导航：在固定的标题栏下面，不随内容滚动。 */
+.relay-section-nav {
+  display: flex;
+  flex-shrink: 0;
+  gap: 4px;
+  overflow-x: auto;
+  padding: 8px 24px;
+  border-bottom: 1px solid hsl(var(--border) / 0.6);
+  background: hsl(var(--shell-bg));
+}
+
+.relay-section-nav button {
+  flex-shrink: 0;
+  padding: 4px 11px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.relay-section-nav button:hover {
+  border-color: hsl(var(--border));
+  background: hsl(var(--accent) / 0.5);
+  color: hsl(var(--foreground));
+}
+
+/* 分区跳转后标题不要贴着内容区顶边。 */
+.relay-detail-body .relay-fold,
+.relay-detail-body .relay-basic-section {
+  scroll-margin-top: 12px;
+}
+
+/* 高级兼容选项：一组默认收起的开关，横跨两列。 */
+.relay-compat-group {
+  grid-column: 1 / -1;
+  border: 1px solid hsl(var(--border) / 0.8);
+  border-radius: 10px;
+  background: hsl(var(--surface-sunken) / 0.3);
+}
+
+.relay-compat-group > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.relay-compat-group > summary::-webkit-details-marker {
+  display: none;
+}
+
+.relay-compat-group > summary .relay-fold-chevron {
+  transform: rotate(-90deg);
+  transition: transform var(--motion-fast, 120ms);
+}
+
+.relay-compat-group[open] > summary .relay-fold-chevron {
+  transform: none;
+}
+
+.relay-compat-group > summary strong {
+  font-size: 13px;
+}
+
+.relay-compat-group > summary small {
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+}
+
+.relay-compat-body {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+  padding: 0 12px 12px;
+}
+
+@container relay-editor (max-width: 560px) {
+  .relay-compat-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* 模型表头的「全部设为」 */
+.relay-model-head-bulk {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.relay-model-head-bulk select {
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px dashed hsl(var(--border));
+  border-radius: 6px;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.relay-model-head-bulk select:hover:not(:disabled) {
+  border-style: solid;
+  color: hsl(var(--foreground));
+}
+
+/* 表头里两列多了一行「全部设为」：所有列标题顶对齐，标题保持在同一条线上。 */
+.relay-model-row.relay-model-row-head {
+  align-items: start;
+}

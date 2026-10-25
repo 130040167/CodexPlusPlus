@@ -9920,6 +9920,7 @@ function RelayProfileDetail({
   onSaved?: () => void;
   actions: Actions;
 }) {
+  const detailBodyRef = useRef<HTMLDivElement>(null);
   const [draft, setDraft] = useState<RelayProfile>(profile);
   const [modelWindowRows, setModelWindowRows] = useState<ModelWindowRow[]>(
     modelWindowRowsFromProfile(profile.modelList, profile.modelWindows || "", profile.modelVlm, profile.modelAutoCompact),
@@ -10146,7 +10147,17 @@ function RelayProfileDetail({
           </Button>
         </div>
       </div>
-      <div className="relay-detail-body">
+      {!aggregateModeRequired && !isAggregateRelayProfile(draft) ? (
+        // 编辑页很长：标题栏下给一排分区跳转，点哪个就展开该分区并滚过去。
+        <nav className="relay-section-nav" aria-label={t("跳转到分区")}>
+          {relaySectionLinks().map((link) => (
+            <button key={link.id} onClick={() => jumpToRelaySection(detailBodyRef.current, link.id)} type="button">
+              {link.label}
+            </button>
+          ))}
+        </nav>
+      ) : null}
+      <div className="relay-detail-body" ref={detailBodyRef}>
         {aggregateModeRequired ? (
           <AggregateModeChooser onSelect={selectAggregateMode} />
         ) : (
@@ -10238,6 +10249,28 @@ function SortableModelWindowEntry({ id, children }: SortableModelWindowEntryProp
   );
 }
 
+/// 编辑页分区导航的条目。id 与 RelayFold 的 sectionId 一致；`basic` 是不可折叠的基础设置。
+function relaySectionLinks() {
+  return [
+    { id: "basic", label: t("基础") },
+    { id: "models", label: t("模型") },
+    { id: "requests", label: t("请求") },
+    { id: "advanced", label: t("更多选项") },
+    { id: "config-preview", label: t("配置预览") },
+  ];
+}
+
+/// 跳到编辑页某个分区：折叠着就先展开（会触发 RelayFold 记住展开状态），再滚到分区顶部。
+function jumpToRelaySection(root: HTMLElement | null, id: string) {
+  if (!root) return;
+  const target = id === "basic"
+    ? root.querySelector<HTMLElement>(".relay-basic-section")
+    : root.querySelector<HTMLElement>(`details[data-section="${id}"]`);
+  if (!target) return;
+  if (target instanceof HTMLDetailsElement && !target.open) target.open = true;
+  requestAnimationFrame(() => target.scrollIntoView({ behavior: "smooth", block: "start" }));
+}
+
 function RelayFold({ title, children, className = "", bodyClassName = "", issue, sectionId, defaultOpen = false }: {
   title: string;
   children: ReactNode;
@@ -10265,7 +10298,7 @@ function RelayFold({ title, children, className = "", bodyClassName = "", issue,
     previousIssue.current = issue;
   }, [issue]);
   return (
-    <details className={`relay-fold ${className}`.trim()} open={open} onToggle={(event) => {
+    <details className={`relay-fold ${className}`.trim()} data-section={sectionId} open={open} onToggle={(event) => {
       const next = event.currentTarget.open;
       if (next === open) return;
       setOpen(next);
@@ -10315,6 +10348,15 @@ function RelayProfileEditor({
   relayProxyProfileRef.current = profile;
   const relayProxyRevisionRef = useRef(0);
   const [stabilizePromptPrefix, setStabilizePromptPrefix] = useState(false);
+  // 「高级兼容选项」分组：null = 用户没手动开合过，按是否有开启项决定。
+  const [compatOpen, setCompatOpen] = useState<boolean | null>(null);
+  const compatEnabledCount = [
+    profile.standardOpenaiProtocol,
+    stabilizePromptPrefix,
+    profile.webSearchHistoryCompat,
+    profile.trustUpstreamCatalogLite === true,
+    profile.strictResponsesReasoning === true,
+  ].filter(Boolean).length;
   const [stabilizePromptPrefixBusy, setStabilizePromptPrefixBusy] = useState(false);
   const useCommonConfig = profile.useCommonConfig !== false;
   useEffect(() => {
@@ -10548,6 +10590,10 @@ function RelayProfileEditor({
     setModelWindowRows(
       modelWindowRows.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row)),
     );
+  };
+  // 表头「全部设为」：十几行模型的压缩比例 / 图片处理通常一样，不必逐行改。
+  const updateAllModelWindowRows = (patch: Partial<ModelWindowRow>) => {
+    setModelWindowRows(modelWindowRows.map((row) => ({ ...row, ...patch })));
   };
   // 内置命中 → 回填空窗口/压缩列的统一入口：上游获取、手动提交行名、打开导入
   // 面板都走这一条规则，不再只有「重新匹配」才回填（裁决见 builtinRowBackfillValue）。
@@ -11200,8 +11246,39 @@ function RelayProfileEditor({
                     <span aria-hidden="true" />
                     <span>{t("模型名称")}</span>
                     <span>{t("上下文窗口")}</span>
-                    <span>{t("自动压缩")}</span>
-                    <span>{t("图片处理方式")}</span>
+                    <span className="relay-model-head-bulk">
+                      {t("自动压缩")}
+                      <select
+                        aria-label={t("全部模型的自动压缩")}
+                        onChange={(event) => {
+                          if (event.currentTarget.value) updateAllModelWindowRows({ autoCompact: event.currentTarget.value });
+                          event.currentTarget.value = "";
+                        }}
+                        title={t("把所有模型设为同一个自动压缩比例")}
+                        value=""
+                      >
+                        <option value="">{t("全部设为…")}</option>
+                        {autoCompactOptions("").map((value) => <option key={value} value={value}>{value}</option>)}
+                      </select>
+                    </span>
+                    <span className="relay-model-head-bulk">
+                      {t("图片处理方式")}
+                      <select
+                        aria-label={t("全部模型的图片处理方式")}
+                        disabled={vlmUnsupportedProtocol}
+                        onChange={(event) => {
+                          if (event.currentTarget.value) updateAllModelWindowRows({ imageHandling: event.currentTarget.value as ModelWindowRow["imageHandling"] });
+                          event.currentTarget.value = "";
+                        }}
+                        title={t("把所有模型设为同一种图片处理方式")}
+                        value=""
+                      >
+                        <option value="">{t("全部设为…")}</option>
+                        <option value="send-as-is">{t("原样发送图片")}</option>
+                        <option value="strip">{t("移除图片")}</option>
+                        <option value="vlm">{t("视觉辅助分析")}</option>
+                      </select>
+                    </span>
                     <span>{t("思考等级")}</span>
                     <span>{t("模型配置")}</span>
                     <span aria-hidden="true" />
@@ -11698,30 +11775,6 @@ function RelayProfileEditor({
               </Field>
             ) : null}
             {showApiFields ? (
-              <label
-                className={`switch-row compact relay-switch-row relay-field-standard${profile.protocol === "chatCompletions" ? "" : " is-disabled"}`}
-                title={profile.protocol === "chatCompletions" ? undefined : t("仅在上游协议为 Chat Completions 时可用。Responses API 会原样转发。")}
-              >
-                <input
-                  checked={profile.standardOpenaiProtocol}
-                  disabled={profile.protocol !== "chatCompletions"}
-                  onChange={(event) =>
-                    updateDraft({ standardOpenaiProtocol: event.currentTarget.checked })
-                  }
-                  type="checkbox"
-                />
-                <span>
-                  <strong>{t("纯标准协议")}</strong>
-                  <small>
-                    {t("强制走标准 OpenAI 协议，不注入厂商私有 reasoning 参数。面向只认标准 OpenAI 字段、拒绝厂商私有参数的第三方网关。")}
-                    {" "}
-                    {t("若网关提示 thinking type: adaptive 无效，可启用此项后重试；这会停用厂商私有推理参数。")}
-                  </small>
-                </span>
-                <ToggleVisual />
-              </label>
-            ) : null}
-            {showApiFields ? (
               <Field className="relay-field-user-agent" label="User-Agent">
                 <Input
                   value={profile.userAgent}
@@ -11755,47 +11808,87 @@ function RelayProfileEditor({
               </Field>
             ) : null}
             {showApiFields ? (
-              <label className="switch-row compact relay-switch-row">
-                <input
-                  checked={stabilizePromptPrefix}
-                  disabled={stabilizePromptPrefixBusy}
-                  onChange={(event) => void saveStabilizePromptPrefix(event.currentTarget.checked)}
-                  type="checkbox"
-                />
-                <span><strong>{t("前缀稳定层")}</strong><small>{t("按供应商稳定可选历史块的顺序并移除成对 image_resize_notice；默认关闭，适合已确认上游支持的缓存场景。")}</small></span>
-                <ToggleVisual />
-              </label>
-            ) : null}
-            {showApiFields ? (
-              <label
-                className={`switch-row compact relay-switch-row relay-field-search-history${profile.protocol === "responses" ? "" : " is-disabled"}`}
-                title={profile.protocol === "responses" ? undefined : t("仅限 Responses API。")}
+              // 五个兼容性开关默认都关，且只在上游明确需要时才开：收成一组，摘要上写开了几项。
+              <details
+                className="relay-compat-group"
+                open={compatOpen ?? compatEnabledCount > 0}
+                onToggle={(event) => setCompatOpen(event.currentTarget.open)}
               >
-                <input
-                  checked={profile.webSearchHistoryCompat}
-                  disabled={profile.protocol !== "responses"}
-                  onChange={(event) =>
-                    updateDraft({ webSearchHistoryCompat: event.currentTarget.checked })
-                  }
-                  type="checkbox"
-                />
-                <span>
-                  <strong>{t("搜索历史压缩兼容（实验）")}</strong>
-                  <small>response protection is unavailable</small>
-                </span>
-                <ToggleVisual />
-              </label>
+                <summary>
+                  <ChevronDown aria-hidden="true" className="relay-fold-chevron h-4 w-4" />
+                  <strong>{t("高级兼容选项")}</strong>
+                  <small>{compatEnabledCount ? tf("已开启 {0} 项", [compatEnabledCount]) : t("全部关闭；只在上游明确需要时开启")}</small>
+                </summary>
+                <div className="relay-compat-body">
+                {showApiFields ? (
+                  <label
+                    className={`switch-row compact relay-switch-row relay-field-standard${profile.protocol === "chatCompletions" ? "" : " is-disabled"}`}
+                    title={profile.protocol === "chatCompletions" ? undefined : t("仅在上游协议为 Chat Completions 时可用。Responses API 会原样转发。")}
+                  >
+                    <input
+                      checked={profile.standardOpenaiProtocol}
+                      disabled={profile.protocol !== "chatCompletions"}
+                      onChange={(event) =>
+                        updateDraft({ standardOpenaiProtocol: event.currentTarget.checked })
+                      }
+                      type="checkbox"
+                    />
+                    <span>
+                      <strong>{t("纯标准协议")}</strong>
+                      <small>
+                        {t("强制走标准 OpenAI 协议，不注入厂商私有 reasoning 参数。面向只认标准 OpenAI 字段、拒绝厂商私有参数的第三方网关。")}
+                        {" "}
+                        {t("若网关提示 thinking type: adaptive 无效，可启用此项后重试；这会停用厂商私有推理参数。")}
+                      </small>
+                    </span>
+                    <ToggleVisual />
+                  </label>
+                ) : null}
+                {showApiFields ? (
+                  <label className="switch-row compact relay-switch-row">
+                    <input
+                      checked={stabilizePromptPrefix}
+                      disabled={stabilizePromptPrefixBusy}
+                      onChange={(event) => void saveStabilizePromptPrefix(event.currentTarget.checked)}
+                      type="checkbox"
+                    />
+                    <span><strong>{t("前缀稳定层")}</strong><small>{t("按供应商稳定可选历史块的顺序并移除成对 image_resize_notice；默认关闭，适合已确认上游支持的缓存场景。")}</small></span>
+                    <ToggleVisual />
+                  </label>
+                ) : null}
+                {showApiFields ? (
+                  <label
+                    className={`switch-row compact relay-switch-row relay-field-search-history${profile.protocol === "responses" ? "" : " is-disabled"}`}
+                    title={profile.protocol === "responses" ? undefined : t("仅限 Responses API。")}
+                  >
+                    <input
+                      checked={profile.webSearchHistoryCompat}
+                      disabled={profile.protocol !== "responses"}
+                      onChange={(event) =>
+                        updateDraft({ webSearchHistoryCompat: event.currentTarget.checked })
+                      }
+                      type="checkbox"
+                    />
+                    <span>
+                      <strong>{t("搜索历史压缩兼容（实验）")}</strong>
+                      <small>response protection is unavailable</small>
+                    </span>
+                    <ToggleVisual />
+                  </label>
+                ) : null}
+                {showApiFields && profile.protocol === "responses" ? <>
+                  <label className="switch-row compact relay-switch-row">
+                    <input type="checkbox" checked={profile.trustUpstreamCatalogLite === true} onChange={(event) => updateDraft({ trustUpstreamCatalogLite: event.currentTarget.checked })} />
+                    <span><strong>{t("保留外部目录的 Lite 声明")}</strong><small>{t("仅在已确认上游支持时启用；保留每个模型的显式声明，不会为全部模型开启 Lite。")}</small></span><ToggleVisual />
+                  </label>
+                  <label className="switch-row compact relay-switch-row">
+                    <input type="checkbox" checked={profile.strictResponsesReasoning === true} onChange={(event) => updateDraft({ strictResponsesReasoning: event.currentTarget.checked })} />
+                    <span><strong>{t("严格 Responses 推理历史兼容")}</strong><small>{t("仅当目标上游接受当前账号的加密历史时启用。混合推理只发送可识别的加密信封；占位或无效密文会明确报错。本地记录不变。")}</small></span><ToggleVisual />
+                  </label>
+                </> : null}
+                </div>
+              </details>
             ) : null}
-            {showApiFields && profile.protocol === "responses" ? <>
-              <label className="switch-row compact relay-switch-row">
-                <input type="checkbox" checked={profile.trustUpstreamCatalogLite === true} onChange={(event) => updateDraft({ trustUpstreamCatalogLite: event.currentTarget.checked })} />
-                <span><strong>{t("保留外部目录的 Lite 声明")}</strong><small>{t("仅在已确认上游支持时启用；保留每个模型的显式声明，不会为全部模型开启 Lite。")}</small></span><ToggleVisual />
-              </label>
-              <label className="switch-row compact relay-switch-row">
-                <input type="checkbox" checked={profile.strictResponsesReasoning === true} onChange={(event) => updateDraft({ strictResponsesReasoning: event.currentTarget.checked })} />
-                <span><strong>{t("严格 Responses 推理历史兼容")}</strong><small>{t("仅当目标上游接受当前账号的加密历史时启用。混合推理只发送可识别的加密信封；占位或无效密文会明确报错。本地记录不变。")}</small></span><ToggleVisual />
-              </label>
-            </> : null}
             {showApiFields ? (
               <Field className="relay-field-custom-headers" label={t("自定义请求头")}>
                 <div className="relay-custom-headers">
