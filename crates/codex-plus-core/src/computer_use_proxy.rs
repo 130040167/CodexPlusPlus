@@ -212,6 +212,12 @@ pub fn serve() -> anyhow::Result<()> {
         js: (cu_mode == CuMode::Js)
             .then(|| JsBridge::new(uuid::Uuid::new_v4().to_string())),
         last_activity: None,
+        tools_init_id: None,
+        // JS 档由 cua_repl 自己下发说明与确认规则；离散工具档由这里补。
+        policy: (cu_mode == CuMode::Tools)
+            .then(|| crate::computer_use_tools::read_confirmations(&runtime.node_module_dirs))
+            .flatten(),
+        policy_call_ids: BTreeSet::new(),
     };
     let outcome = forwarder.run(receiver);
     // 会话结束：让管理器收起这个会话的悬浮预览。
@@ -344,6 +350,12 @@ struct Forwarder {
     js: Option<JsBridge>,
     /// 最近一次记下的被操作应用（bundle id 或应用名）与时间：同一个应用 1 秒内不重复写。
     last_activity: Option<(String, Instant)>,
+    /// 离散工具档：客户端 `initialize` 的 id，响应里要补使用说明。
+    tools_init_id: Option<String>,
+    /// 离散工具档：还没附上的确认规则（附在本会话第一次成功的工具结果后面）。
+    policy: Option<String>,
+    /// 等着附确认规则的 `tools/call` 请求 id。
+    policy_call_ids: BTreeSet<String>,
 }
 
 impl Forwarder {
@@ -406,6 +418,9 @@ impl Forwarder {
             );
             declare_elicitation(&mut message);
             self.declare_elicitation = false;
+            if self.js.is_none() {
+                self.tools_init_id = message.get("id").map(Value::to_string);
+            }
             let mut line = serde_json::to_vec(&message)?;
             line.push(b'\n');
             return self.write_child(&line);
@@ -418,6 +433,24 @@ impl Forwarder {
             && let Some(pending) = self.pending.remove(token)
         {
             return self.relay_approval(&pending, &message);
+        }
+        // 离散工具档：`type_text` 含键盘打不出的字符时直接回错误（否则系统会静默丢字）；
+        // 确认规则还没附上时，记下这次调用的 id。
+        if self.js.is_none()
+            && mentions(&frame, b"\"tools/call\"")
+            && let Ok(message) = serde_json::from_slice::<Value>(&frame)
+            && message.get("method").and_then(Value::as_str) == Some("tools/call")
+        {
+            if let Some(reply) = crate::computer_use_tools::reject_untypeable(&message) {
+                let mut line = serde_json::to_vec(&reply)?;
+                line.push(b'\n');
+                return write_client(&line);
+            }
+            if self.policy.is_some()
+                && let Some(id) = message.get("id")
+            {
+                self.policy_call_ids.insert(id.to_string());
+            }
         }
         // JS 档：`tools/call` 要带回合信息，`tools/list` 的响应要过滤。
         if let Some(js) = self.js.as_mut()
@@ -501,6 +534,31 @@ impl Forwarder {
                 if message.get("method").and_then(Value::as_str) == Some("elicitation/create") {
                     return self.on_elicitation(message);
                 }
+            }
+        }
+        if self.js.is_none()
+            && (self.tools_init_id.is_some() || !self.policy_call_ids.is_empty())
+            && !mentions(&frame, b"\"method\"")
+            && let Ok(mut message) = serde_json::from_slice::<Value>(&frame)
+            && let Some(id) = message.get("id").map(Value::to_string)
+        {
+            let mut rewritten = false;
+            if self.tools_init_id.as_deref() == Some(id.as_str()) {
+                self.tools_init_id = None;
+                crate::computer_use_tools::add_instructions(&mut message);
+                rewritten = true;
+            } else if self.policy_call_ids.remove(&id)
+                && let Some(policy) = self.policy.as_deref()
+                && crate::computer_use_tools::append_text(&mut message, policy)
+            {
+                self.policy = None;
+                self.policy_call_ids.clear();
+                rewritten = true;
+            }
+            if rewritten {
+                let mut line = serde_json::to_vec(&message)?;
+                line.push(b'\n');
+                return write_client(&line);
             }
         }
         if let Some(js) = self.js.as_mut()

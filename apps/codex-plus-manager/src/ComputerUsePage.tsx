@@ -612,11 +612,14 @@ export function ComputerUsePage() {
                 <button type="button" role="radio" aria-checked={cuMode === "tools"} data-active={cuMode === "tools"} disabled={locked}
                   title={t("原生 Computer Use 的 10 个离散工具：get_app_state、click、type_text 等。")} onClick={() => void changeCuMode("tools")}>{t("离散工具")}</button>
                 <button type="button" role="radio" aria-checked={cuMode === "js"} data-active={cuMode === "js"} disabled={locked}
-                  title={t("和 Codex 一样，用 cua_repl 的 js 工具操作；首次使用会自动下发完整说明与确认规则，支持 paste 输入中文。")} onClick={() => void changeCuMode("js")}>{t("JS（同 Codex）")}</button>
+                  title={t("和 Codex 一样，用 cua_repl 的 js 工具操作；首次使用会自动下发完整说明与确认规则，支持 paste 输入中文。")} onClick={() => void changeCuMode("js")}>{t("JS（同 Codex）")}<span className="cu-flow-recommend">{t("推荐")}</span></button>
               </div>
+              <small className="cu-flow-reason">
+                {t("推荐 JS：与 Codex 当前的用法一致；首次使用自带完整说明和确认规则；一次调用能连续做多步操作，更快、更省 token；能用 paste 输入中文和多行文字。")}
+              </small>
               {cuMode === "js"
                 ? <small className="cu-flow-warn">{t("模型可执行任意 JavaScript（能读写文件、联网）；对新开的客户端会话生效")}</small>
-                : null}
+                : <small className="cu-flow-warn">{t("离散工具每个动作一次调用，返回都带截图；中文需用 set_value。对新开的客户端会话生效")}</small>}
               <label className="cu-flow-check" title={t("同 Codex 的画中画：操作后台应用时在屏幕右上角实时显示目标窗口；回合结束或空闲 20 秒自动收起。需要屏幕录制权限。")}>
                 <input type="checkbox" checked={approval?.pip ?? true} disabled={locked} onChange={(event) => void changePip(event.target.checked)} />
                 {t("操作后台应用时显示悬浮预览")}
