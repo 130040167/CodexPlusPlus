@@ -1176,7 +1176,7 @@ const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
  *
  * 新增页面时**必须**想清楚归属：默认可见会让 Codex 专属功能在 Grok 下露出来。
  */
-const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string; tool?: string }> = [
+const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string; tool?: string; children?: Array<{ id: Route; label: string; icon: LucideIcon }> }> = [
   // 概览在两个工具下都可见：它承载共用的置顶推荐位，以及各自的状态。
   { id: "overview", get label() { return t("概览"); }, icon: LayoutDashboard },
   { id: "relay", get label() { return t("供应商配置"); }, icon: KeyRound, tool: "codex" },
@@ -1196,7 +1196,8 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "agentCache", get label() { return t("AI Agent 缓存清理"); }, icon: Trash2 },
   // 跨客户端协作属于应用级能力，各工具下共用同一组任务。
   { id: "agentCollaboration", get label() { return t("Agent 协作"); }, icon: GitBranch, badge: "实验" },
-  { id: "computerUse", get label() { return t("Computer Use"); }, icon: MousePointerClick, badge: "实验" },
+  { id: "computerUse", get label() { return t("Computer Use"); }, icon: MousePointerClick, badge: "实验",
+    children: [{ id: "settings" as Route, get label() { return t("设置"); }, icon: Settings }] },
   { id: "maintenance", get label() { return t("安装维护"); }, icon: Wrench, tool: "codex" },
   { id: "about", get label() { return t("关于"); }, icon: Info },
   { id: "settings", get label() { return t("设置"); }, icon: Settings },
@@ -4067,20 +4068,45 @@ export function App() {
                   const item = routes.find((candidate) => candidate.id === routeId);
                   if (!item) return null;
                   const Icon = item.icon;
+                  const isActive = route === item.id;
+                  // 子路由也激活时，父条目也高亮。
+                  const childActive = item.children?.some((child) => child.id === route) ?? false;
                   return (
-                    <button
-                      className={`nav-item ${route === item.id ? "active" : ""}`}
-                      key={item.id}
-                      onClick={() => void navigate(item.id)}
-                      title={item.label}
-                      type="button"
-                    >
-                      <span className="nav-icon">
-                        <Icon className="h-4 w-4" aria-hidden="true" />
-                      </span>
-                      <span className="nav-label">{item.label}</span>
-                      {item.badge ? <span className="nav-badge">{item.badge}</span> : null}
-                    </button>
+                    <div key={item.id} className="nav-item-group">
+                      <button
+                        className={`nav-item ${isActive || childActive ? "active" : ""}`}
+                        onClick={() => void navigate(item.id)}
+                        title={item.label}
+                        type="button"
+                      >
+                        <span className="nav-icon">
+                          <Icon className="h-4 w-4" aria-hidden="true" />
+                        </span>
+                        <span className="nav-label">{item.label}</span>
+                        {item.badge ? <span className="nav-badge">{item.badge}</span> : null}
+                      </button>
+                      {item.children && (isActive || childActive) ? (
+                        <div className="nav-children">
+                          {item.children.map((child) => {
+                            const ChildIcon = child.icon;
+                            return (
+                              <button
+                                key={child.id}
+                                className={`nav-item nav-child-item ${route === child.id ? "active" : ""}`}
+                                onClick={() => void navigate(child.id)}
+                                title={child.label}
+                                type="button"
+                              >
+                                <span className="nav-icon">
+                                  <ChildIcon className="h-4 w-4" aria-hidden="true" />
+                                </span>
+                                <span className="nav-label">{child.label}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      ) : null}
+                    </div>
                   );
                 })}
               </div>
@@ -14048,6 +14074,10 @@ function ApplicationRail({
         codexAppRunning={codexAppRunning}
         showSelection={!globalNavigationRoutes.includes(route)}
         onSelect={onSelect}
+        onOpenSettings={(toolId) => {
+          onSelect(toolId);
+          onNavigate("settings");
+        }}
       />
       <div className="rail-bottom">
         <nav className="rail-navigation" aria-label={t("系统")}>
@@ -14101,6 +14131,8 @@ function ApplicationRail({
  *
  * 这里的「工具」指 Codex / Grok / 后续接入的 CLI，每个工具在自己的供应商
  * 分区里，互相不串配置。未接入供应商写盘的工具仍可进入自己的管理页。
+ *
+ * 右键 agent 图标：弹出二级菜单（切换 / 设置）。
  */
 function ToolSwitcher({
   tools,
@@ -14108,46 +14140,108 @@ function ToolSwitcher({
   codexAppRunning,
   showSelection = true,
   onSelect,
+  onOpenSettings,
 }: {
   tools: ToolEntry[];
   activeTool: ToolId;
   codexAppRunning: boolean;
   showSelection?: boolean;
   onSelect: (toolId: ToolId) => void;
+  onOpenSettings?: (toolId: ToolId) => void;
 }) {
   return (
     <nav className="tool-switcher" aria-label={t("工具切换")}>
-      {tools.map((tool) => {
-        const icon = TOOL_ICONS[tool.id];
-        const selected = showSelection && tool.id === activeTool;
-        const running = tool.id === "codex" && codexAppRunning;
-        const title = tool.switchable
-          ? tf("{0}｜{1}｜{2} 个供应商", [tool.name, tool.homeDir || t("未配置目录"), tool.relayCount])
-          : tf("{0}｜{1}｜供应商配置尚未接入", [tool.name, tool.homeDir || t("未配置目录")]);
-        return (
-          <button
-            aria-label={tool.switchable ? `${tool.name}${running ? ` · ${t("运行中")}` : ""}` : `${tool.name} · ${t("待接入")}`}
-            aria-pressed={selected}
-            className={`tool-chip ${selected ? "active" : ""}`}
-            disabled={!tool.switchable}
-            key={tool.id}
-            onClick={() => onSelect(tool.id)}
-            title={`${title}${running ? `｜${t("运行中")}` : ""}`}
-            type="button"
-          >
-            {icon ? (
-              <span
-                aria-hidden="true"
-                className={`tool-chip-icon tool-chip-brand-icon tool-chip-icon-${tool.id}`}
-                style={{ maskImage: `url("${icon}")`, WebkitMaskImage: `url("${icon}")` }}
-              />
-            ) : (
-              <Blocks aria-hidden="true" className="tool-chip-icon" />
-            )}
-          </button>
-        );
-      })}
+      {tools.map((tool) => (
+        <ToolChip
+          key={tool.id}
+          tool={tool}
+          selected={showSelection && tool.id === activeTool}
+          running={tool.id === "codex" && codexAppRunning}
+          onSelect={onSelect}
+          onOpenSettings={onOpenSettings}
+        />
+      ))}
     </nav>
+  );
+}
+
+/** 单个 agent 图标，带右键菜单。 */
+function ToolChip({
+  tool,
+  selected,
+  running,
+  onSelect,
+  onOpenSettings,
+}: {
+  tool: ToolEntry;
+  selected: boolean;
+  running: boolean;
+  onSelect: (toolId: ToolId) => void;
+  onOpenSettings?: (toolId: ToolId) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const { rootRef, menuRef, menuStyle } = usePopoverLayer({ open, onOpenChange: setOpen, align: "start", menuWidth: 140, maxHeight: 160 });
+  const icon = TOOL_ICONS[tool.id];
+  const title = tool.switchable
+    ? tf("{0}｜{1}｜{2} 个供应商", [tool.name, tool.homeDir || t("未配置目录"), tool.relayCount])
+    : tf("{0}｜{1}｜供应商配置尚未接入", [tool.name, tool.homeDir || t("未配置目录")]);
+  return (
+    <div
+      ref={rootRef as React.RefObject<HTMLDivElement>}
+      className="tool-chip-wrap"
+      onContextMenu={(event) => {
+        event.preventDefault();
+        setOpen((current) => !current);
+      }}
+    >
+      <button
+        aria-label={tool.switchable ? `${tool.name}${running ? ` · ${t("运行中")}` : ""}` : `${tool.name} · ${t("待接入")}`}
+        aria-pressed={selected}
+        className={`tool-chip ${selected ? "active" : ""}`}
+        disabled={!tool.switchable}
+        onClick={() => onSelect(tool.id)}
+        title={`${title}${running ? `｜${t("运行中")}` : ""}`}
+        type="button"
+      >
+        {icon ? (
+          <span
+            aria-hidden="true"
+            className={`tool-chip-icon tool-chip-brand-icon tool-chip-icon-${tool.id}`}
+            style={{ maskImage: `url("${icon}")`, WebkitMaskImage: `url("${icon}")` }}
+          />
+        ) : (
+          <Blocks aria-hidden="true" className="tool-chip-icon" />
+        )}
+      </button>
+      {open ? createPortal(
+        <div
+          className="tool-chip-menu"
+          ref={menuRef as React.RefObject<HTMLDivElement>}
+          role="menu"
+          style={menuStyle}
+        >
+          {!tool.switchable ? null : (
+            <button
+              className="tool-chip-menu-item"
+              role="menuitem"
+              type="button"
+              onClick={() => { onSelect(tool.id); setOpen(false); }}
+            >
+              {selected ? t("✓ 当前使用") : t("切换到此 Agent")}
+            </button>
+          )}
+          <button
+            className="tool-chip-menu-item"
+            role="menuitem"
+            type="button"
+            onClick={() => { onOpenSettings?.(tool.id); setOpen(false); }}
+          >
+            {t("设置…")}
+          </button>
+        </div>,
+        document.body,
+      ) : null}
+    </div>
   );
 }
 

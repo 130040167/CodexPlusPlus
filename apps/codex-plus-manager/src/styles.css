@@ -6159,6 +6159,32 @@ select {
   padding-top: 12px;
 }
 
+/* 导航条目分组：父项 + 可展开的子项列表。 */
+.nav-item-group {
+  display: flex;
+  flex-direction: column;
+}
+
+/* 子项缩进，与父项有一定左边距区分层级。 */
+.nav-children {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-left: 8px;
+  padding-left: 12px;
+  border-left: 1.5px solid hsl(var(--sidebar-border));
+}
+
+.nav-child-item {
+  font-size: 12px;
+  min-height: 30px;
+  opacity: 0.85;
+}
+
+.nav-child-item.active {
+  opacity: 1;
+}
+
 .nav-section-label {
   min-height: 20px;
   padding: 4px 10px 4px;
@@ -6405,6 +6431,52 @@ select {
   -webkit-mask-position: center;
   -webkit-mask-repeat: no-repeat;
   -webkit-mask-size: contain;
+}
+
+/* agent 图标的包裹层，使右键菜单定位锚定到图标上。 */
+.tool-chip-wrap {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* agent 右键菜单。portal 到 body，所以用绝对定位 + z-index。 */
+.tool-chip-menu {
+  background: hsl(var(--popover));
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,.18);
+  display: flex;
+  flex-direction: column;
+  min-width: 130px;
+  overflow: hidden;
+  padding: 4px 0;
+  z-index: 9999;
+}
+
+.tool-chip-menu-item {
+  align-items: center;
+  background: none;
+  border: none;
+  color: hsl(var(--popover-foreground));
+  cursor: pointer;
+  display: flex;
+  font-size: 13px;
+  gap: 8px;
+  padding: 7px 14px;
+  text-align: left;
+  width: 100%;
+}
+
+.tool-chip-menu-item:hover {
+  background: hsl(var(--accent));
+  color: hsl(var(--accent-foreground));
+}
+
+.tool-chip-menu-item:focus-visible {
+  background: hsl(var(--accent));
+  outline: none;
 }
 
 /* ── Grok 供应商页 ──────────────────────────────────────────── */
