@@ -11800,3 +11800,43 @@ select {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ── 聚合供应商编辑页 ─────────────────────────────────────────── */
+/* 模型聚合模式：名称与会话身份并排，不再各占一行。 */
+.aggregate-editor[data-aggregate-mode="model"] .aggregate-fields .relay-field-name { grid-column: auto; }
+
+/* 「模型聚合已启用」从大说明框收成一行提示。 */
+.aggregate-editor .aggregate-model-mode-hint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  padding: 8px 12px;
+  border-color: hsl(var(--primary) / 0.25);
+  background: hsl(var(--primary) / 0.05);
+}
+.aggregate-editor .aggregate-model-mode-hint strong { font-size: 12.5px; white-space: nowrap; }
+
+/* 成员行：单行高度、勾选与否一眼可分。 */
+.aggregate-editor .aggregate-member-list { gap: 6px; }
+.aggregate-editor .aggregate-member-row { padding: 7px 10px; cursor: pointer; }
+.aggregate-editor .aggregate-member-row:not(.selected) .aggregate-member-summary { opacity: 0.62; }
+.aggregate-editor .aggregate-member-row:not(.selected):hover .aggregate-member-summary { opacity: 0.9; }
+.aggregate-editor .aggregate-member-summary { display: grid; gap: 2px; min-width: 0; }
+.aggregate-editor .aggregate-member-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.aggregate-editor .aggregate-member-title strong {
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.aggregate-editor .aggregate-member-summary small {
+  overflow: hidden;
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.aggregate-editor[data-aggregate-mode="model"] .aggregate-member-row {
+  grid-template-columns: 18px minmax(0, 1fr) minmax(150px, 220px);
+}

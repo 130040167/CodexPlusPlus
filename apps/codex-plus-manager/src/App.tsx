@@ -93,6 +93,7 @@ import { NativeBrowserStatusView, nativeBrowserConsent } from "./native-browser-
 import { AgentCachePanel } from "./agent-cache";
 import { summarizeRecentRequests, type RecentRequestSummary } from "./overview-model";
 import { AgentCollaborationPage } from "./AgentCollaborationPage";
+import { ClaudeProviderPage } from "./ClaudeProviderPage";
 import { ComputerUsePage } from "./ComputerUsePage";
 import { PluginMarketScreen } from "./PluginMarketScreen";
 import { ReleaseNotes } from "./ReleaseNotes";
@@ -1165,7 +1166,7 @@ const TOOL_ICONS: Record<string, string> = {
   claude: new URL("./assets/agents/claude.svg", import.meta.url).href,
 };
 
-type Route = "overview" | "relay" | "multiLaunch" | "grok" | "claude" | "relayEnvironment" | "requestLog" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "computerUse" | "maintenance" | "about" | "settings" | "agentSettings";
+type Route = "overview" | "relay" | "multiLaunch" | "grok" | "claudeRelay" | "claude" | "relayEnvironment" | "requestLog" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "computerUse" | "maintenance" | "about" | "settings" | "agentSettings";
 type Theme = "dark" | "light";
 
 const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
@@ -1185,6 +1186,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "relay", get label() { return t("供应商配置"); }, icon: KeyRound, tool: "codex" },
   { id: "multiLaunch", get label() { return t("Codex多开"); }, icon: Layers3, tool: "codex" },
   { id: "grok", get label() { return t("Grok 配置"); }, icon: Blocks, tool: "grok" },
+  { id: "claudeRelay", get label() { return t("供应商配置"); }, icon: KeyRound, tool: "claude" },
   { id: "claude", get label() { return t("Claude 增强"); }, icon: Languages, tool: "claude" },
   { id: "sessions", get label() { return t("会话管理"); }, icon: MessageCircle, tool: "codex" },
   { id: "context", label: "MCP", icon: Network, tool: "codex" },
@@ -1213,7 +1215,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
 const navigationSections: Array<{ label: string; routes: Route[]; placement?: "bottom" }> = [
   {
     get label() { return t("工作区"); },
-    routes: ["overview", "relay", "relayEnvironment", "requestLog", "multiLaunch", "grok", "claude", "agentSettings"],
+    routes: ["overview", "relay", "relayEnvironment", "requestLog", "multiLaunch", "grok", "claudeRelay", "claude", "agentSettings"],
   },
   {
     get label() { return t("全局管理"); },
@@ -1527,7 +1529,8 @@ export function App() {
     // 设置页也只属于 Codex，同样按这条规则跳走。
     const currentRoute = routes.find((candidate) => candidate.id === route);
     if (toolId === "claude") {
-      setRoute("claude");
+      // 切到 Claude 时和 Codex 一样先落在供应商配置；正在看 Claude 自己的页面时不动。
+      if (currentRoute?.tool !== "claude") setRoute("claudeRelay");
     } else if (currentRoute?.tool && currentRoute.tool !== toolId) {
       setRoute(toolId === "grok" ? "grok" : "relay");
     }
@@ -4179,6 +4182,13 @@ export function App() {
           ) : null}
           {route === "grok" ? (
             <GrokScreen settings={settings} form={settingsForm} actions={actions} />
+          ) : null}
+          {route === "claudeRelay" ? (
+            <ClaudeProviderPage
+              notify={actions.showMessage}
+              onProvidersChanged={() => void refreshTools()}
+              openUrl={(url) => void actions.openExternalUrl(url)}
+            />
           ) : null}
           {route === "claude" ? <ClaudeLocalizationScreen /> : null}
           {route === "sessions" ? (
@@ -12392,11 +12402,15 @@ function AggregateRelayProfileEditor({
                     type="checkbox"
                   />
                   <span className="aggregate-member-summary">
+                    {/* 与供应商列表一致：接入方式做成标签，第二行只放地址。 */}
                     <span className="aggregate-member-title">
                       <strong>{candidate.name || t("未命名供应商")}</strong>
+                      <span className="relay-tag" data-tone={relayProfileTagTone(candidate)}>{relayProfileModeLabel(candidate)}</span>
+                      {candidate.protocol !== "responses" ? (
+                        <span className="relay-tag" data-tone="protocol">{relayProtocolShortLabel(candidate.protocol)}</span>
+                      ) : null}
                     </span>
                     <small>
-                      {relayProfileModeLabel(candidate)} · {relayProtocolLabel(candidate.protocol)} ·{" "}
                       {isOfficialLoginMemberProfile(candidate)
                         ? t("使用已登录的 ChatGPT 账号凭据")
                         : relayProfileConfigBrief(candidate)}
@@ -14644,6 +14658,7 @@ function routeSubtitle(route: Route) {
     relay: t("管理 API 供应商、协议、Key 与配置文件"),
     multiLaunch: t("为不同供应商启动相互隔离的 Codex 实例"),
     grok: t("管理 Grok CLI 的模型与 API 端点"),
+    claudeRelay: t("管理 Claude Code 的 API 供应商，切换时写入 ~/.claude/settings.json"),
     claude: t("保留官方 Claude.app 原样，通过增强版为 Claude 应用增强功能"),
     relayEnvironment: t("统一管理本地协议代理、供应商代理与重试策略"),
     requestLog: t("查看代理请求的状态、模型、重试、token 用量与缓存命中"),
