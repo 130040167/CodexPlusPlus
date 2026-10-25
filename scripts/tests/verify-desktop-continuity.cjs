@@ -538,6 +538,26 @@ async function closeDesktop(desktop) {
   if (desktop.browser) await bounded(desktop.browser.close(), 3000).catch(() => {});
 }
 
+function desktopProcessTree(desktop) {
+  const processes = inventory();
+  assert.ok(processes.some(candidate => sameProcess(candidate, owned.get(desktop.id.processId))));
+  const ids = new Set([desktop.id.processId]);
+  let changed;
+  do {
+    changed = false;
+    for (const candidate of processes) if (ids.has(candidate.ParentProcessId) && !ids.has(candidate.ProcessId)) {
+      ids.add(candidate.ProcessId);
+      changed = true;
+    }
+  } while (changed);
+  return processes.filter(candidate => ids.has(candidate.ProcessId)).map(identity);
+}
+
+async function assertCapturedTreeExited(tree) {
+  await until(() => tree.every(prior => !processExists(prior.ProcessId)),
+    "captured desktop descendants remained alive", 45000);
+}
+
 async function verifyLiveWorkerBlocks(context, desktop) {
   const manifestPath = path.join(desktop.root, "instance.json");
   const receiptPath = path.join(desktop.root, "launch-result.json");
@@ -905,6 +925,7 @@ async function runMainReplacementScenario(manager) {
     await stopManager(manager);
   }
   const oldPid = main.id.processId;
+  const previousTree = desktopProcessTree(main);
   // 模拟独立 launcher 的健康 helper；它随已验证的旧桌面退出释放，而非要求重启前就空闲。
   const retiringHelper = http.createServer((request, response) => {
     if (request.url === "/backend/status") {
@@ -930,11 +951,24 @@ async function runMainReplacementScenario(manager) {
   }
   const replacement = await connectMainDesktop(manager, request.debugPort);
   assert.notEqual(replacement.id.processId, oldPid);
+  await assertCapturedTreeExited(previousTree);
+  await pass("mainRestartRemovesPreviousDesktopProcessTree");
   for (const desktop of workers) await assertDesktopAlive(desktop);
   mode = "main_after_restart";
   await sendPrompt(replacement, "Return a synthetic response after desktop restart without tools.");
   await replacement.page.getByText(`DESKTOP_RECOVERED_${mode}`, { exact: true }).waitFor({ timeout: 90000 });
   await pass("mainRestartStopsThenRelaunchesAndCompletesTurnWithoutStoppingWorkers");
+  for (const [index, desktop] of workers.entries()) {
+    const tree = desktopProcessTree(desktop);
+    const manifest = JSON.parse(await fs.readFile(path.join(desktop.root, "instance.json"), "utf8"));
+    if (index === 0) await closeDesktop(desktop);
+    else killOwned(desktop.id.processId);
+    await until(() => !processExists(manifest.pid), "worker did not exit after its desktop", 45000);
+    await assertCapturedTreeExited(tree);
+    await assertDesktopAlive(replacement);
+    await pass(index === 0 ? "normalDesktopExitReleasesWorkerAndDescendants"
+      : "crashedDesktopRootReleasesWorkerAndDescendants");
+  }
 }
 
 (async () => {

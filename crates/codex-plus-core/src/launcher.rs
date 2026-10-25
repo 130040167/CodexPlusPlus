@@ -1630,6 +1630,7 @@ impl LaunchHooks for DefaultLaunchHooks {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
                     _ = interval.tick() => {
+                        let update = async {
                         let current_browser_id = match crate::cdp::browser_identity(debug_port).await {
                             Ok(identity) => identity.browser_id().ok(),
                             Err(_) => None,
@@ -1654,6 +1655,12 @@ impl LaunchHooks for DefaultLaunchHooks {
                             ),
                         );
                         record_pet_overlay_sync_result(debug_port, helper_port, pet_result);
+                        };
+                        tokio::select! {
+                            biased;
+                            _ = &mut shutdown_rx => break,
+                            _ = update => {}
+                        }
                     }
                 }
             }

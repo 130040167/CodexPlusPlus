@@ -352,21 +352,20 @@ pub fn delete_current_user_key(subkey: &str) -> anyhow::Result<()> {
 
 #[cfg(windows)]
 pub fn enumerate_processes() -> Vec<WindowsProcessInfo> {
-    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
-        return Vec::new();
-    };
-    if snapshot.is_invalid() {
-        return Vec::new();
-    }
+    try_enumerate_processes().unwrap_or_default()
+}
+
+#[cfg(windows)]
+pub(crate) fn try_enumerate_processes() -> anyhow::Result<Vec<WindowsProcessInfo>> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }?;
+    anyhow::ensure!(!snapshot.is_invalid(), "无法读取 Windows 进程快照");
     let _guard = HandleGuard(snapshot);
     let mut entry = PROCESSENTRY32W {
         dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
         ..Default::default()
     };
     let mut processes = Vec::new();
-    if unsafe { Process32FirstW(snapshot, &mut entry) }.is_err() {
-        return Vec::new();
-    }
+    unsafe { Process32FirstW(snapshot, &mut entry) }?;
     loop {
         let process_id = entry.th32ProcessID;
         processes.push(WindowsProcessInfo {
@@ -375,11 +374,16 @@ pub fn enumerate_processes() -> Vec<WindowsProcessInfo> {
             exe_file: nul_terminated_wide_to_string(&entry.szExeFile),
             executable_path: query_process_image_path(process_id),
         });
-        if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
-            break;
+        if let Err(error) = unsafe { Process32NextW(snapshot, &mut entry) } {
+            if error.code() == windows::core::HRESULT::from_win32(
+                windows::Win32::Foundation::ERROR_NO_MORE_FILES.0,
+            ) {
+                break;
+            }
+            return Err(error.into());
         }
     }
-    processes
+    Ok(processes)
 }
 
 #[cfg(windows)]

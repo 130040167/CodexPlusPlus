@@ -4,6 +4,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(windows)]
+mod windows_process_tree;
+#[cfg(windows)]
+pub(crate) use windows_process_tree::VerifiedStopTree;
+
 /// 端口只是连接地址；停止实例必须验证这一代的进程身份，不能依赖 CDP 健康。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,10 +52,87 @@ pub fn codex_instance_process_exited(identity: &CodexInstanceIdentity) -> bool {
     }
 }
 
+/// worker 存续依据 OS 创建身份；CDP 暂时失联或页面关闭不等于实例退出。
+pub async fn codex_instance_needs_worker(identity: &CodexInstanceIdentity) -> anyhow::Result<bool> {
+    if !valid_stop_identity(identity) || codex_instance_process_exited(identity) {
+        return Ok(false);
+    }
+    #[cfg(windows)]
+    {
+        let Some(process) = crate::windows_integration::TrackedWindowsProcess::capture(
+            identity.process_id, &identity.executable,
+        )? else { return Ok(false) };
+        if process.birth_id != identity.process_birth_id || !process.is_alive()? {
+            return Ok(false);
+        }
+        let args = crate::windows_integration::process_arguments(identity.process_id)
+            .ok_or_else(|| anyhow::anyhow!("暂时无法读取多开进程参数"))?;
+        if !codex_arguments_match(&args, &identity.user_data_dir, identity.debug_port) {
+            return Ok(false);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if macos_birth_token(identity.process_id) != Some(identity.process_birth_id) {
+            return Ok(false);
+        }
+        let args = macos_process_arguments(identity.process_id)?;
+        if !codex_arguments_match(&args, &identity.user_data_dir, identity.debug_port) {
+            return Ok(false);
+        }
+    }
+    match crate::cdp::browser_identity(identity.debug_port).await {
+        Ok(browser) => Ok(browser.browser_id()? == identity.browser_id),
+        Err(_) => Ok(true),
+    }
+}
+
+/// worker 从 ready 起追踪自己的后代；交接不结束桌面，只在根进程确认退出后回收残留。
+pub struct CodexInstanceProcessTree {
+    #[cfg(windows)]
+    tree: VerifiedStopTree,
+}
+
+impl CodexInstanceProcessTree {
+    pub fn capture(identity: &CodexInstanceIdentity) -> anyhow::Result<Self> {
+        anyhow::ensure!(valid_stop_identity(identity), "多开进程身份不完整");
+        #[cfg(windows)]
+        {
+            let process = VerifiedStopProcess::capture(identity.process_id, &identity.executable,
+                Some(identity.process_birth_id))?
+                .ok_or_else(|| anyhow::anyhow!("多开进程创建身份已变化"))?;
+            let args = crate::windows_integration::process_arguments(identity.process_id)
+                .ok_or_else(|| anyhow::anyhow!("无法读取多开进程参数"))?;
+            anyhow::ensure!(codex_arguments_match(&args, &identity.user_data_dir, identity.debug_port),
+                "多开进程参数与实例不匹配");
+            Ok(Self { tree: VerifiedStopTree::capture(process)? })
+        }
+        #[cfg(not(windows))]
+        Ok(Self {})
+    }
+
+    pub fn refresh(&mut self) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        self.tree.refresh()?;
+        Ok(())
+    }
+
+    pub fn cleanup_after_exit(self) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        {
+            anyhow::ensure!(self.tree.root_exited()?, "Codex 仍存活，未清理其进程树");
+            self.tree.stop_and_wait()?;
+        }
+        Ok(())
+    }
+}
+
 // 持有句柄直到退出确认完成，避免检查 PID 后再按 PID 结束造成换代误杀。
 #[cfg(windows)]
 pub(crate) struct VerifiedStopProcess {
     handle: std::os::windows::io::OwnedHandle,
+    process_id: u32,
+    birth_id: u64,
 }
 
 #[cfg(windows)]
@@ -94,7 +176,7 @@ impl VerifiedStopProcess {
         if verified.birth_id != birth_id || !verified.is_alive()? {
             return Ok(None);
         }
-        Ok(Some(Self { handle }))
+        Ok(Some(Self { handle, process_id: pid, birth_id }))
     }
 
     pub(crate) fn terminate_and_wait(&self) -> anyhow::Result<()> {
@@ -478,7 +560,7 @@ pub async fn terminate_verified_codex_instance(
     {
         return Ok(false);
     }
-    process.terminate_and_wait()?;
+    VerifiedStopTree::capture(process)?.stop_and_wait()?;
     Ok(true)
 }
 
@@ -626,7 +708,7 @@ mod tests {
             helper_port: 19342,
             user_data_dir: own,
             // 无 CDP listener，也无 Browser 回执，仍可安全确认操作系统身份。
-            browser_id: String::new(),
+            browser_id: "fixture-browser".into(),
             process_id: child.0.id(),
             process_birth_id: worker_birth_id(&child.0).unwrap(),
             executable,
@@ -645,9 +727,11 @@ mod tests {
             assert!(other.0.try_wait().unwrap().is_none());
         }
         assert!(!codex_instance_process_exited(&identity));
+        assert!(codex_instance_needs_worker(&identity).await.unwrap());
         assert!(terminate_verified_codex_instance(&identity).await.unwrap());
         assert!(child.0.try_wait().unwrap().is_some());
         assert!(codex_instance_process_exited(&identity));
+        assert!(!codex_instance_needs_worker(&identity).await.unwrap());
         assert!(other.0.try_wait().unwrap().is_none());
     }
 

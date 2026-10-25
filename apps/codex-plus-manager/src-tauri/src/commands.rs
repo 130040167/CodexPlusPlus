@@ -2197,6 +2197,7 @@ pub fn run_codex_multi_worker(options_path: &Path) -> anyhow::Result<()> {
             return Ok(());
         }
     };
+    let result = (|| -> anyhow::Result<()> {
     let endpoint_ready =
         wait_for_multi_instance_ready(receipt.debug_port, MULTI_LAUNCH_READY_TIMEOUT);
     let captured = if endpoint_ready {
@@ -2253,9 +2254,9 @@ pub fn run_codex_multi_worker(options_path: &Path) -> anyhow::Result<()> {
         },
     );
     let Some(identity) = identity else {
-        let _ = codex_plus_launcher::shutdown();
         return Ok(());
     };
+    let mut process_tree = codex_plus_core::multi_worker::CodexInstanceProcessTree::capture(&identity)?;
     let handoff = MultiWorkerHandoff {
         instance_id: options.instance_id.clone(),
         generation: options.generation,
@@ -2268,16 +2269,43 @@ pub fn run_codex_multi_worker(options_path: &Path) -> anyhow::Result<()> {
         &serde_json::to_vec(&handoff)?,
     )?;
     while tauri::async_runtime::block_on(
-        codex_plus_core::multi_worker::codex_instance_identity_matches(&identity),
+        codex_plus_core::multi_worker::codex_instance_needs_worker(&identity),
     )
-    .unwrap_or(false)
+    .unwrap_or(true)
     {
         if multi_worker_handoff_requested(root, &handoff) {
             break;
         }
+        process_tree.refresh()?;
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
-    codex_plus_launcher::shutdown()
+    if codex_plus_core::multi_worker::codex_instance_process_exited(&identity) {
+        process_tree.cleanup_after_exit()?;
+    }
+    Ok(())
+    })();
+    // ready 文件写入失败等错误出口也必须关闭 runtime；卡住时仅让当前 worker 进程退出。
+    let cleanup = shutdown_multi_worker();
+    result.and(cleanup)
+}
+
+const MULTI_WORKER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MULTI_WORKER_HANDOFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
+
+fn shutdown_multi_worker() -> anyhow::Result<()> {
+    shutdown_multi_worker_with(MULTI_WORKER_SHUTDOWN_TIMEOUT, codex_plus_launcher::shutdown)
+}
+
+fn shutdown_multi_worker_with(
+    timeout: std::time::Duration,
+    shutdown: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+) -> anyhow::Result<()> {
+    let (reply, result) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new().name("multi-worker-shutdown".into()).spawn(move || {
+        let _ = reply.send(shutdown());
+    })?;
+    result.recv_timeout(timeout)
+        .map_err(|_| anyhow::anyhow!("worker 后台服务未在 {} 秒内完成退出，当前 worker 将退出；Codex 保持运行", timeout.as_secs()))?
 }
 
 fn multi_worker_handoff_requested(root: &Path, expected: &MultiWorkerHandoff) -> bool {
@@ -2441,7 +2469,7 @@ fn resume_multi_instance_worker(root: &Path) -> anyhow::Result<()> {
                 &root.join("worker-handoff.json"),
                 &serde_json::to_vec(&ready)?,
             )?;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + MULTI_WORKER_HANDOFF_TIMEOUT;
             while worker_present()
                 && std::time::Instant::now() < deadline
             {
@@ -2924,8 +2952,12 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
     ) {
         Ok(shutdown) => shutdown,
         Err(error) => {
+            let message = restart_stop_failure_message(&error);
+            let _ = save_requested_launch_status(
+                &request, "failed", &message, current_timestamp_ms(),
+            );
             return failed(
-                &restart_stop_failure_message(&error),
+                &message,
                 json!({"debugPort": request.debug_port, "helperPort": request.helper_port}),
             );
         }
@@ -9595,6 +9627,28 @@ fn default_log_lines() -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn multi_worker_shutdown_preserves_cleanup_errors() {
+        let error = super::shutdown_multi_worker_with(std::time::Duration::from_secs(1),
+            || anyhow::bail!("cleanup fixture failed")).unwrap_err();
+        assert!(error.to_string().contains("cleanup fixture failed"));
+    }
+
+    #[test]
+    fn multi_worker_shutdown_has_a_deadline_and_handoff_allows_it_to_finish() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let result = super::shutdown_multi_worker_with(std::time::Duration::from_millis(20), move || {
+            let _ = wait.recv_timeout(std::time::Duration::from_secs(1));
+            let _ = finished.send(());
+            Ok(())
+        });
+        release.send(()).unwrap();
+        done.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert!(result.unwrap_err().to_string().contains("当前 worker 将退出"));
+        assert!(super::MULTI_WORKER_HANDOFF_TIMEOUT > super::MULTI_WORKER_SHUTDOWN_TIMEOUT);
+    }
+
     use super::*;
 
     #[test]

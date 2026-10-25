@@ -1617,7 +1617,7 @@ pub struct CodexRestartTarget {
     verified_absence: bool,
     receipt_started_at_ms: Option<u64>,
     #[cfg(windows)]
-    processes: Vec<crate::multi_worker::VerifiedStopProcess>,
+    processes: Vec<crate::multi_worker::VerifiedStopTree>,
     #[cfg(not(windows))]
     processes: Vec<(u32, ProcessInstanceState)>,
 }
@@ -1739,7 +1739,7 @@ impl CodexRestartTarget {
     pub fn stop_and_wait(self) -> anyhow::Result<()> {
         #[cfg(windows)]
         for process in self.processes {
-            process.terminate_and_wait()?;
+            process.stop_and_wait()?;
         }
         #[cfg(not(windows))]
         for (pid, identity) in self.processes {
@@ -1817,7 +1817,7 @@ fn capture_codex_restart_target_in_scope(
                         )?
                         .ok_or_else(|| anyhow::anyhow!("主实例回执的进程身份不匹配"))?;
                         receipt_pid = Some(receipt.process_id);
-                        processes.push(process);
+                        processes.push(crate::multi_worker::VerifiedStopTree::capture(process)?);
                     }
                 }
             }
@@ -1858,7 +1858,7 @@ fn capture_codex_restart_target_in_scope(
                         .contains(&pid),
                 "进程在捕获期间已失去端口归属，未执行停止"
             );
-            processes.push(process);
+            processes.push(crate::multi_worker::VerifiedStopTree::capture(process)?);
         }
         Ok(CodexRestartTarget {
             processes,
