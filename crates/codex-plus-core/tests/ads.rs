@@ -172,13 +172,6 @@ fn normalizes_known_remote_sponsors_with_local_logos() {
         "version": 1,
         "ads": [
             {
-                "id": "volcengine-ark-agent-plan",
-                "type": "sponsor",
-                "title": "火山方舟",
-                "description": "远端推荐内容",
-                "url": "https://example.test/volcengine"
-            },
-            {
                 "id": "0029-token-bridge",
                 "type": "sponsor",
                 "title": "PackyCode",
@@ -221,13 +214,6 @@ fn normalizes_known_remote_sponsors_with_local_logos() {
                 "url": "https://example.test/baikewei"
             },
             {
-                "id": "deepkey-api-key",
-                "type": "sponsor",
-                "title": "deepkey",
-                "description": "远端推荐内容",
-                "url": "https://example.test/deepkey"
-            },
-            {
                 "id": "jojocode-codex-relay",
                 "type": "sponsor",
                 "title": "JOJO Code",
@@ -240,11 +226,9 @@ fn normalizes_known_remote_sponsors_with_local_logos() {
     let ads = payload["ads"].as_array().unwrap();
 
     for id in [
-        "volcengine-ark-agent-plan",
         "0029-token-bridge",
         "apikey-fun-ai-relay",
         "runapi-openrouter-alternative",
-        "deepkey-api-key",
     ] {
         let ad = ads.iter().find(|ad| ad["id"] == json!(id)).unwrap();
         assert!(
