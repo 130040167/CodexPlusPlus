@@ -94,6 +94,7 @@ export const EN_PLAIN: Record<string, string> = {
   "供应商测试模型、图片覆盖层、启动参数等只作用于 Codex 的选项，在 Codex 菜单的「设置」里。": "Options that only affect Codex — provider test model, image overlay, launch arguments — live under Settings in the Codex menu.",
   "全选项目": "Select entire project",
   "读取中…": "Loading…",
+  "Codex++ 概览": "Codex++ overview",
   "使用 Codex 当前登录的 ChatGPT 账号": "Uses the ChatGPT account currently signed in to Codex",
   "在左边选一个供应商": "Pick a provider on the left",
   "改完先保存，再应用到 Grok 生效": "Save first, then apply to Grok",
