@@ -79,7 +79,8 @@ pub fn serve() -> anyhow::Result<()> {
 
 /// 拉起 OpenAI 签名的 node 执行 shim，由 shim 直接 spawn 原生 CU server。
 ///
-/// 两条约束：
+/// 三条约束：
+/// - 环境只给原生 server 需要的那几项，不继承调用方的（Claude 的环境里有用户的 Key）。
 /// - 中间不经过 shell：服务端校验**直接父进程**的签名，多插一层就会失效。
 /// - 必须放弃责任归属（disclaim），让 node 成为自己的 responsible process。否则
 ///   Codex++ 被 Claude 的 `disclaimer` 或管理器 GUI 拉起时，责任进程是 ad-hoc 签名的
@@ -88,9 +89,10 @@ fn spawn_child(
     runtime: &RuntimeLocation,
     shim: &std::path::Path,
 ) -> anyhow::Result<crate::disclaimed_spawn::DisclaimedChild> {
+    // 不继承调用方环境：见 `native_client_env` 的说明。
     let mut envs: Vec<(String, String)> = runtime.native_client_env().into_iter().collect();
     envs.push(("CODEX_PLUS_CU_CLIENT".into(), runtime.client.clone()));
-    crate::disclaimed_spawn::spawn(
+    crate::disclaimed_spawn::spawn_clean(
         std::path::Path::new(&runtime.node),
         &[OsStr::new(shim)],
         &envs,
