@@ -918,6 +918,23 @@ where
                 );
             }
         }
+        // issue #2632：纯 API 供应商下 Work 视图要求 ChatGPT 账号身份，发送即失败。
+        // 开关打开时在 Codex 启动前把详情模式写回 Codex 视图；失败不阻断启动。
+        match crate::work_view::apply_detail_mode_preference(&home, &settings) {
+            Ok(Some(previous)) => {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.work_view_disabled",
+                    serde_json::json!({ "previous": previous }),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.work_view_disable_failed",
+                    serde_json::json!({ "error": error.to_string() }),
+                );
+            }
+        }
         let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings)
             || remote_control_provider_proxy_enabled(&settings);
         // issue #2264：重启链路上的模型漂移修复。launcher 不重放完整 apply（那会

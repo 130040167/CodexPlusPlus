@@ -725,6 +725,9 @@ pub struct BackendSettings {
     pub enhancements_enabled: bool,
     #[serde(rename = "codexAppStandaloneQuotaUnlock", default)]
     pub codex_app_standalone_quota_unlock: bool,
+    /// 纯 API 供应商下启动前把详情模式写回 Codex 视图，避开 Work 视图要求 ChatGPT 账号（#2632）。
+    #[serde(rename = "codexAppDisableWorkView", default)]
+    pub codex_app_disable_work_view: bool,
     #[serde(rename = "codexAppPluginMarketplaceUnlock", default = "default_true")]
     pub codex_app_plugin_marketplace_unlock: bool,
     #[serde(rename = "codexAppModelWhitelistUnlock", default = "default_true")]
@@ -1045,6 +1048,7 @@ impl Default for BackendSettings {
             relay_profiles_enabled: true,
             enhancements_enabled: true,
             codex_app_standalone_quota_unlock: false,
+            codex_app_disable_work_view: false,
             codex_app_plugin_marketplace_unlock: true,
             codex_app_model_whitelist_unlock: true,
             codex_app_session_delete: true,
@@ -2333,6 +2337,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
         target.insert("enhancementsEnabled".to_string(), Value::Bool(value));
     }
     merge_bool_setting(target, source, "codexAppStandaloneQuotaUnlock");
+    merge_bool_setting(target, source, "codexAppDisableWorkView");
     merge_bool_setting(target, source, "codexAppPluginMarketplaceUnlock");
     merge_bool_setting(target, source, "codexAppModelWhitelistUnlock");
     merge_bool_setting(target, source, "codexAppSessionDelete");
@@ -4323,6 +4328,20 @@ experimental_bearer_token = "sk-existing""#
             settings.active_relay_session_provider(),
             RelaySessionProvider::Custom
         );
+    }
+
+    #[test]
+    fn settings_store_update_persists_disable_work_view_flag() {
+        // 前端开关已上线，后端白名单漏掉这个键时开关永远不生效（#2632）。
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+        store.save(&BackendSettings::default()).unwrap();
+        assert!(!store.load().unwrap().codex_app_disable_work_view);
+
+        let updated = store.update(json!({ "codexAppDisableWorkView": true })).unwrap();
+
+        assert!(updated.codex_app_disable_work_view);
+        assert!(store.load().unwrap().codex_app_disable_work_view);
     }
 
     #[test]
