@@ -554,8 +554,18 @@ function desktopProcessTree(desktop) {
 }
 
 async function assertCapturedTreeExited(tree) {
-  await until(() => tree.every(prior => !processExists(prior.ProcessId)),
-    "captured desktop descendants remained alive", 45000);
+  try {
+    await until(() => {
+      const live = inventory();
+      return tree.every(prior => !live.some(candidate => sameProcess(prior, candidate)));
+    }, "captured desktop descendants remained alive", 45000);
+  } catch (error) {
+    const live = inventory();
+    report.treeExitFailure = { tree, survivingProcesses: live.filter(candidate =>
+      tree.some(prior => sameProcess(prior, candidate))).map(identity) };
+    await save();
+    throw error;
+  }
 }
 
 async function verifyLiveWorkerBlocks(context, desktop) {
