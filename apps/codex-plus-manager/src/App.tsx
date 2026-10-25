@@ -6087,7 +6087,7 @@ function RelayEnvironmentScreen({ result, actions }: { result: RelayEnvironmentR
       detail: result
         ? proxyVariables.length
           ? tf("检测到代理环境变量：{0}。请清理后重新启动 Codex。", [proxyVariableLabels.join(t("、"))])
-          : t("未检测到 HTTP_PROXY、HTTPS_PROXY、ALL_PROXY、NO_PROXY 或 FTP_PROXY。")
+          : t("未检测到 HTTP_PROXY、HTTPS_PROXY、ALL_PROXY 或 FTP_PROXY。")
         : t("等待检测。"),
     },
     {
@@ -11337,7 +11337,7 @@ function RelayProfileEditor({
                                 setMetadataImportPreview(synchronized.preview);
                                 setMetadataImportError("");
                               }}
-                              placeholder="1M"
+                              placeholder={t("留空使用默认值")}
                             />
                           </div>
                           <div className="relay-model-cell relay-model-cell-compact">
