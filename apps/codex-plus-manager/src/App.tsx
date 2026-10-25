@@ -1179,10 +1179,13 @@ const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
 const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string; tool?: string; children?: Array<{ id: Route; label: string; icon: LucideIcon }> }> = [
   // 概览在两个工具下都可见：它承载共用的置顶推荐位，以及各自的状态。
   { id: "overview", get label() { return t("概览"); }, icon: LayoutDashboard },
-  { id: "relay", get label() { return t("供应商配置"); }, icon: KeyRound, tool: "codex" },
+  { id: "relay", get label() { return t("供应商配置"); }, icon: KeyRound, tool: "codex",
+    children: [{ id: "settings" as Route, get label() { return t("设置"); }, icon: Settings }] },
   { id: "multiLaunch", get label() { return t("Codex多开"); }, icon: Layers3, tool: "codex" },
-  { id: "grok", get label() { return t("Grok 配置"); }, icon: Blocks, tool: "grok" },
-  { id: "claude", get label() { return t("Claude 增强"); }, icon: Languages, tool: "claude" },
+  { id: "grok", get label() { return t("Grok 配置"); }, icon: Blocks, tool: "grok",
+    children: [{ id: "settings" as Route, get label() { return t("设置"); }, icon: Settings }] },
+  { id: "claude", get label() { return t("Claude 增强"); }, icon: Languages, tool: "claude",
+    children: [{ id: "settings" as Route, get label() { return t("设置"); }, icon: Settings }] },
   { id: "sessions", get label() { return t("会话管理"); }, icon: MessageCircle, tool: "codex" },
   { id: "context", label: "MCP", icon: Network, tool: "codex" },
   { id: "skills", label: "Skills", icon: BookOpen, tool: "codex" },
@@ -1196,8 +1199,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "agentCache", get label() { return t("AI Agent 缓存清理"); }, icon: Trash2 },
   // 跨客户端协作属于应用级能力，各工具下共用同一组任务。
   { id: "agentCollaboration", get label() { return t("Agent 协作"); }, icon: GitBranch, badge: "实验" },
-  { id: "computerUse", get label() { return t("Computer Use"); }, icon: MousePointerClick, badge: "实验",
-    children: [{ id: "settings" as Route, get label() { return t("设置"); }, icon: Settings }] },
+  { id: "computerUse", get label() { return t("Computer Use"); }, icon: MousePointerClick, badge: "实验" },
   { id: "maintenance", get label() { return t("安装维护"); }, icon: Wrench, tool: "codex" },
   { id: "about", get label() { return t("关于"); }, icon: Info },
   { id: "settings", get label() { return t("设置"); }, icon: Settings },
@@ -1226,7 +1228,7 @@ const navigationSections: Array<{ label: string; routes: Route[]; placement?: "b
 ];
 
 /** 应用级入口放在最左栏；概览仍随当前 Agent 显示各自的状态。 */
-const globalNavigationRoutes: Route[] = ["recommendations", "agentCache", "agentCollaboration", "about", "settings"];
+const globalNavigationRoutes: Route[] = ["recommendations", "agentCache", "agentCollaboration", "about"];
 
 const defaultSettings: BackendSettings = {
   ...defaultWhaleBalanceSettings(),
