@@ -51,7 +51,7 @@ test("maintenance retains application entrypoint checks and repairs", () => {
 });
 
 test("settings exposes reviewed configuration export and draft import", () => {
-  const screen = functionSource("SettingsScreen");
+  const screen = functionSource("GlobalSettingsScreen");
   assert.match(screen, /actions\.exportSettings\(\)/);
   assert.match(screen, /actions\.importSettings\(\)/);
   const entry = functionSource("App");

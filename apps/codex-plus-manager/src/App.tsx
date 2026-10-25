@@ -1162,7 +1162,7 @@ const TOOL_ICONS: Record<string, string> = {
   claude: new URL("./assets/agents/claude.svg", import.meta.url).href,
 };
 
-type Route = "overview" | "relay" | "multiLaunch" | "grok" | "claude" | "relayEnvironment" | "requestLog" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "computerUse" | "maintenance" | "about" | "settings";
+type Route = "overview" | "relay" | "multiLaunch" | "grok" | "claude" | "relayEnvironment" | "requestLog" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "computerUse" | "maintenance" | "about" | "settings" | "agentSettings";
 type Theme = "dark" | "light";
 
 const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
@@ -1176,16 +1176,13 @@ const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
  *
  * 新增页面时**必须**想清楚归属：默认可见会让 Codex 专属功能在 Grok 下露出来。
  */
-const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string; tool?: string; children?: Array<{ id: Route; label: string; icon: LucideIcon }> }> = [
+const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string; tool?: string }> = [
   // 概览在两个工具下都可见：它承载共用的置顶推荐位，以及各自的状态。
   { id: "overview", get label() { return t("概览"); }, icon: LayoutDashboard },
-  { id: "relay", get label() { return t("供应商配置"); }, icon: KeyRound, tool: "codex",
-    children: [{ id: "settings" as Route, get label() { return t("设置"); }, icon: Settings }] },
+  { id: "relay", get label() { return t("供应商配置"); }, icon: KeyRound, tool: "codex" },
   { id: "multiLaunch", get label() { return t("Codex多开"); }, icon: Layers3, tool: "codex" },
-  { id: "grok", get label() { return t("Grok 配置"); }, icon: Blocks, tool: "grok",
-    children: [{ id: "settings" as Route, get label() { return t("设置"); }, icon: Settings }] },
-  { id: "claude", get label() { return t("Claude 增强"); }, icon: Languages, tool: "claude",
-    children: [{ id: "settings" as Route, get label() { return t("设置"); }, icon: Settings }] },
+  { id: "grok", get label() { return t("Grok 配置"); }, icon: Blocks, tool: "grok" },
+  { id: "claude", get label() { return t("Claude 增强"); }, icon: Languages, tool: "claude" },
   { id: "sessions", get label() { return t("会话管理"); }, icon: MessageCircle, tool: "codex" },
   { id: "context", label: "MCP", icon: Network, tool: "codex" },
   { id: "skills", label: "Skills", icon: BookOpen, tool: "codex" },
@@ -1202,7 +1199,9 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "computerUse", get label() { return t("Computer Use"); }, icon: MousePointerClick, badge: "实验" },
   { id: "maintenance", get label() { return t("安装维护"); }, icon: Wrench, tool: "codex" },
   { id: "about", get label() { return t("关于"); }, icon: Info },
-  { id: "settings", get label() { return t("设置"); }, icon: Settings },
+  { id: "settings", get label() { return t("整体设置"); }, icon: Settings },
+  // Agent 专属设置：入口在各 Agent 侧栏菜单里，内容只看当前 Agent。
+  { id: "agentSettings", get label() { return t("设置"); }, icon: Settings },
   { id: "relayEnvironment", get label() { return t("代理设置"); }, icon: ShieldCheck, tool: "codex" },
   { id: "requestLog", get label() { return t("请求日志"); }, icon: List, tool: "codex" },
 ];
@@ -1210,7 +1209,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
 const navigationSections: Array<{ label: string; routes: Route[]; placement?: "bottom" }> = [
   {
     get label() { return t("工作区"); },
-    routes: ["overview", "relay", "relayEnvironment", "requestLog", "multiLaunch", "grok", "claude"],
+    routes: ["overview", "relay", "relayEnvironment", "requestLog", "multiLaunch", "grok", "claude", "agentSettings"],
   },
   {
     get label() { return t("全局管理"); },
@@ -1228,7 +1227,7 @@ const navigationSections: Array<{ label: string; routes: Route[]; placement?: "b
 ];
 
 /** 应用级入口放在最左栏；概览仍随当前 Agent 显示各自的状态。 */
-const globalNavigationRoutes: Route[] = ["recommendations", "agentCache", "agentCollaboration", "about"];
+const globalNavigationRoutes: Route[] = ["recommendations", "agentCache", "agentCollaboration", "about", "settings"];
 
 const defaultSettings: BackendSettings = {
   ...defaultWhaleBalanceSettings(),
@@ -1516,11 +1515,14 @@ export function App() {
     const next = { ...settingsForm, activeTool: toolId };
     setSettingsForm(next);
     // 供应商页是跟着工具走的，切工具后如果当前页不属于新工具就跳到它自己的页。
+    // Agent 设置页本身跟着当前工具走，切过去直接展示新 Agent 的设置，不跳页。
     const currentRoute = routes.find((candidate) => candidate.id === route);
-    if (toolId === "claude") {
-      setRoute("claude");
-    } else if (currentRoute?.tool && currentRoute.tool !== toolId) {
-      setRoute(toolId === "grok" ? "grok" : "relay");
+    if (route !== "agentSettings") {
+      if (toolId === "claude") {
+        setRoute("claude");
+      } else if (currentRoute?.tool && currentRoute.tool !== toolId) {
+        setRoute(toolId === "grok" ? "grok" : "relay");
+      }
     }
     const result = await run(() => call<SettingsResult>("save_settings", { settings: next }));
     if (result) {
@@ -2403,7 +2405,7 @@ export function App() {
       await refreshDreamSkinMarket(true);
       await refreshDreamSkinCommunity(true);
     }
-    if (next === "settings" || next === "enhance") await refreshSettings(true);
+    if (next === "settings" || next === "agentSettings" || next === "enhance") await refreshSettings(true);
     if (next === "userScripts") {
       await refreshSettings(true);
       await refreshScriptMarket(true);
@@ -4038,6 +4040,7 @@ export function App() {
   const isGlobalPage = globalNavigationRoutes.includes(route);
   const isManagementScreen = route === "relay" || route === "multiLaunch" || route === "sessions" || route === "context" || route === "skills";
   const codexAppRunning = overview?.runtime_health?.codex_app?.status === "running";
+  const activeToolName = toolEntries.find((entry) => entry.id === activeTool)?.name ?? t("当前 Agent");
 
   return (
     <div className={`shell ${theme} ${isGlobalPage ? "global-workspace" : ""}`}>
@@ -4070,45 +4073,20 @@ export function App() {
                   const item = routes.find((candidate) => candidate.id === routeId);
                   if (!item) return null;
                   const Icon = item.icon;
-                  const isActive = route === item.id;
-                  // 子路由也激活时，父条目也高亮。
-                  const childActive = item.children?.some((child) => child.id === route) ?? false;
                   return (
-                    <div key={item.id} className="nav-item-group">
-                      <button
-                        className={`nav-item ${isActive || childActive ? "active" : ""}`}
-                        onClick={() => void navigate(item.id)}
-                        title={item.label}
-                        type="button"
-                      >
-                        <span className="nav-icon">
-                          <Icon className="h-4 w-4" aria-hidden="true" />
-                        </span>
-                        <span className="nav-label">{item.label}</span>
-                        {item.badge ? <span className="nav-badge">{item.badge}</span> : null}
-                      </button>
-                      {item.children && (isActive || childActive) ? (
-                        <div className="nav-children">
-                          {item.children.map((child) => {
-                            const ChildIcon = child.icon;
-                            return (
-                              <button
-                                key={child.id}
-                                className={`nav-item nav-child-item ${route === child.id ? "active" : ""}`}
-                                onClick={() => void navigate(child.id)}
-                                title={child.label}
-                                type="button"
-                              >
-                                <span className="nav-icon">
-                                  <ChildIcon className="h-4 w-4" aria-hidden="true" />
-                                </span>
-                                <span className="nav-label">{child.label}</span>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      ) : null}
-                    </div>
+                    <button
+                      className={`nav-item ${route === item.id ? "active" : ""}`}
+                      key={item.id}
+                      onClick={() => void navigate(item.id)}
+                      title={item.label}
+                      type="button"
+                    >
+                      <span className="nav-icon">
+                        <Icon className="h-4 w-4" aria-hidden="true" />
+                      </span>
+                      <span className="nav-label">{item.label}</span>
+                      {item.badge ? <span className="nav-badge">{item.badge}</span> : null}
+                    </button>
                   );
                 })}
               </div>
@@ -4120,8 +4098,12 @@ export function App() {
       <main className="workspace">
         <header className="topbar" key={`topbar-${route}`}>
           <div>
-            <h1>{routeTitle(route)}</h1>
-            <p>{routeSubtitle(route)}</p>
+            <h1>{route === "agentSettings" ? tf("{0} 设置", [activeToolName]) : routeTitle(route)}</h1>
+            <p>
+              {route === "agentSettings"
+                ? tf("只作用于 {0}；界面主题、配置备份等整体设置在最左侧齿轮里。", [activeToolName])
+                : routeSubtitle(route)}
+            </p>
           </div>
           {/* data-topbar-actions：页面级操作的挂载点，Claude 增强页把「启动增强版」portal 进来。 */}
           <div className="topbar-actions" data-topbar-actions>
@@ -4308,14 +4290,21 @@ export function App() {
             />
           ) : null}
           {route === "settings" ? (
-            <SettingsScreen
+            <GlobalSettingsScreen
               dirty={settingsDirty}
               settings={settings}
               theme={theme}
+              actions={actions}
+            />
+          ) : null}
+          {route === "agentSettings" ? (
+            <AgentSettingsScreen
+              dirty={settingsDirty}
               form={settingsForm}
               activeTool={activeTool}
               toolEntries={toolEntries}
               onFormChange={setSettingsForm}
+              onNavigate={(next) => void navigate(next)}
               actions={actions}
             />
           ) : null}
@@ -9227,66 +9216,35 @@ function AboutScreen({
   );
 }
 
-/// 设置页。
+/// Agent 专属设置页。
 ///
-/// 内容按归属分成两类：
-/// - **应用级**（界面主题、语言等）：跟具体工具无关，任何工具下都显示
-/// - **工具级**：图片覆盖层、供应商测试模型、额外启动参数，只在聚焦 Codex 时显示
+/// 入口在侧栏各 Agent 自己的菜单里，只放跟随该 Agent 的选项：
+/// - **Codex**：供应商测试模型、图片覆盖层、额外启动参数
+/// - **Grok / Claude**：供应商与模型在各自页面里管理，这里给出跳转
 ///
-/// 语音输入和 Stepwise 的完整配置在 Codex增强 页面管理。
-function SettingsScreen({
+/// 应用级选项（主题、配置备份、配置文件路径）在最左侧齿轮的「设置」里，
+/// 见 [GlobalSettingsScreen]。语音输入和 Stepwise 的完整配置在 Codex增强 页面管理。
+function AgentSettingsScreen({
   dirty,
-  settings,
-  theme,
   form,
   activeTool,
   toolEntries,
   onFormChange,
+  onNavigate,
   actions,
 }: {
   dirty: boolean;
-  settings: SettingsResult | null;
-  theme: Theme;
   form: BackendSettings;
   activeTool: ToolId;
   toolEntries: ToolEntry[];
   onFormChange: (value: BackendSettings) => void;
+  onNavigate: (route: Route) => void;
   actions: Actions;
 }) {
   const tool = toolEntries.find((entry) => entry.id === activeTool);
   const isCodex = activeTool === "codex";
   return (
     <div className="settings-page">
-      <Panel>
-        <CardHead title={t("基础设置")} detail={settings?.settings_path ?? ""} />
-        <CardContent className="settings-content">
-          <div className="theme-row">
-            <div>
-              <strong>{t("界面主题")}</strong>
-              <span>{t("当前为")}{theme === "dark" ? t("深色") : t("浅色")}{t("模式。")}</span>
-            </div>
-            <Button variant="secondary" onClick={actions.toggleTheme}>{t("切换主题")}</Button>
-          </div>
-          <div className="settings-block">
-            <strong>{t("配置备份与迁移")}</strong>
-            <p className="field-hint">{t("导出文件包含供应商 API Key 等敏感信息；导入只会读入草稿，检查后仍需点击保存设置。")}</p>
-            <Toolbar>
-              <Button variant="secondary" onClick={() => void actions.exportSettings()}>{t("导出完整配置")}</Button>
-              <Button variant="secondary" onClick={() => void actions.importSettings()}>{t("导入配置草稿")}</Button>
-            </Toolbar>
-          </div>
-          <div className="settings-block">
-            <strong>{t("配置文件路径")}</strong>
-            <Input readOnly value={settings?.settings_path ?? ""} />
-            <p className="field-hint">{t("只迁移 settings.json；日志、备份、Skills 和运行状态仍留在原状态目录。更换后建议重新打开管理器。")}</p>
-            <Toolbar>
-              <Button variant="secondary" onClick={() => void actions.chooseSettingsPath()}>{t("选择路径")}</Button>
-              <Button variant="secondary" onClick={() => void actions.resetSettingsPath()}>{t("恢复默认路径")}</Button>
-            </Toolbar>
-          </div>
-        </CardContent>
-      </Panel>
-
       {isCodex ? (
         <>
           <Panel>
@@ -9397,24 +9355,90 @@ function SettingsScreen({
         </>
       ) : (
         <Panel>
-          <CardHead title={tf("{0} 设置", [tool?.name ?? t("工具")])} detail={t("这个工具目前没有独立设置项")} />
+          <CardHead title={tf("{0} 设置", [tool?.name ?? t("Agent")])} detail={t("这个 Agent 目前没有独立设置项")} />
           <CardContent className="settings-content">
             <p className="field-hint">
-              {t("该工具的配置在它自己的页签里管理；上面的基础设置对所有工具通用。")}
+              {t("该 Agent 的供应商、模型与端点在它自己的页面里管理；界面主题、配置备份等整体设置在最左侧齿轮里。")}
             </p>
+            <Toolbar>
+              <Button variant="secondary" onClick={() => onNavigate(activeTool === "grok" ? "grok" : "claude")}>
+                {activeTool === "grok" ? t("前往 Grok 配置") : t("前往 Claude 增强")}
+              </Button>
+            </Toolbar>
           </CardContent>
         </Panel>
       )}
 
-      {dirty ? (
-        <div className="settings-save-bar">
-          <span>{t("设置有修改时，保存后才会写入本地配置。")}</span>
-          <Button onClick={() => void actions.saveSettings()}>
-            <Save className="h-4 w-4" />
-            {t("保存设置")}
-          </Button>
-        </div>
-      ) : null}
+      <SettingsSaveBar dirty={dirty} actions={actions} />
+    </div>
+  );
+}
+
+/// 整体设置页（最左侧齿轮）。
+///
+/// 只放与当前 Agent 无关的应用级选项，内容不随 Agent 切换而变。
+/// Agent 专属选项放在各 Agent 菜单的「设置」里，见 [AgentSettingsScreen]。
+function GlobalSettingsScreen({
+  dirty,
+  settings,
+  theme,
+  actions,
+}: {
+  dirty: boolean;
+  settings: SettingsResult | null;
+  theme: Theme;
+  actions: Actions;
+}) {
+  return (
+    <div className="settings-page">
+      <Panel>
+        <CardHead title={t("基础设置")} detail={settings?.settings_path ?? ""} />
+        <CardContent className="settings-content">
+          <div className="theme-row">
+            <div>
+              <strong>{t("界面主题")}</strong>
+              <span>{t("当前为")}{theme === "dark" ? t("深色") : t("浅色")}{t("模式。")}</span>
+            </div>
+            <Button variant="secondary" onClick={actions.toggleTheme}>{t("切换主题")}</Button>
+          </div>
+          <div className="settings-block">
+            <strong>{t("配置备份与迁移")}</strong>
+            <p className="field-hint">{t("导出文件包含供应商 API Key 等敏感信息；导入只会读入草稿，检查后仍需点击保存设置。")}</p>
+            <Toolbar>
+              <Button variant="secondary" onClick={() => void actions.exportSettings()}>{t("导出完整配置")}</Button>
+              <Button variant="secondary" onClick={() => void actions.importSettings()}>{t("导入配置草稿")}</Button>
+            </Toolbar>
+          </div>
+          <div className="settings-block">
+            <strong>{t("配置文件路径")}</strong>
+            <Input readOnly value={settings?.settings_path ?? ""} />
+            <p className="field-hint">{t("只迁移 settings.json；日志、备份、Skills 和运行状态仍留在原状态目录。更换后建议重新打开管理器。")}</p>
+            <Toolbar>
+              <Button variant="secondary" onClick={() => void actions.chooseSettingsPath()}>{t("选择路径")}</Button>
+              <Button variant="secondary" onClick={() => void actions.resetSettingsPath()}>{t("恢复默认路径")}</Button>
+            </Toolbar>
+          </div>
+          <div className="settings-block">
+            <strong>{t("Agent 专属设置")}</strong>
+            <p className="field-hint">{t("图片覆盖层、启动参数等跟随 Agent 的选项，放在各 Agent 菜单的「设置」里。")}</p>
+          </div>
+        </CardContent>
+      </Panel>
+      <SettingsSaveBar dirty={dirty} actions={actions} />
+    </div>
+  );
+}
+
+/// 设置页底部的保存条：整体设置与 Agent 设置共用。
+function SettingsSaveBar({ dirty, actions }: { dirty: boolean; actions: Actions }) {
+  if (!dirty) return null;
+  return (
+    <div className="settings-save-bar">
+      <span>{t("设置有修改时，保存后才会写入本地配置。")}</span>
+      <Button onClick={() => void actions.saveSettings()}>
+        <Save className="h-4 w-4" />
+        {t("保存设置")}
+      </Button>
     </div>
   );
 }
@@ -14076,10 +14100,6 @@ function ApplicationRail({
         codexAppRunning={codexAppRunning}
         showSelection={!globalNavigationRoutes.includes(route)}
         onSelect={onSelect}
-        onOpenSettings={(toolId) => {
-          onSelect(toolId);
-          onNavigate("settings");
-        }}
       />
       <div className="rail-bottom">
         <nav className="rail-navigation" aria-label={t("系统")}>
@@ -14133,8 +14153,6 @@ function ApplicationRail({
  *
  * 这里的「工具」指 Codex / Grok / 后续接入的 CLI，每个工具在自己的供应商
  * 分区里，互相不串配置。未接入供应商写盘的工具仍可进入自己的管理页。
- *
- * 右键 agent 图标：弹出二级菜单（切换 / 设置）。
  */
 function ToolSwitcher({
   tools,
@@ -14142,108 +14160,46 @@ function ToolSwitcher({
   codexAppRunning,
   showSelection = true,
   onSelect,
-  onOpenSettings,
 }: {
   tools: ToolEntry[];
   activeTool: ToolId;
   codexAppRunning: boolean;
   showSelection?: boolean;
   onSelect: (toolId: ToolId) => void;
-  onOpenSettings?: (toolId: ToolId) => void;
 }) {
   return (
     <nav className="tool-switcher" aria-label={t("工具切换")}>
-      {tools.map((tool) => (
-        <ToolChip
-          key={tool.id}
-          tool={tool}
-          selected={showSelection && tool.id === activeTool}
-          running={tool.id === "codex" && codexAppRunning}
-          onSelect={onSelect}
-          onOpenSettings={onOpenSettings}
-        />
-      ))}
-    </nav>
-  );
-}
-
-/** 单个 agent 图标，带右键菜单。 */
-function ToolChip({
-  tool,
-  selected,
-  running,
-  onSelect,
-  onOpenSettings,
-}: {
-  tool: ToolEntry;
-  selected: boolean;
-  running: boolean;
-  onSelect: (toolId: ToolId) => void;
-  onOpenSettings?: (toolId: ToolId) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const { rootRef, menuRef, menuStyle } = usePopoverLayer({ open, onOpenChange: setOpen, align: "start", menuWidth: 140, maxHeight: 160 });
-  const icon = TOOL_ICONS[tool.id];
-  const title = tool.switchable
-    ? tf("{0}｜{1}｜{2} 个供应商", [tool.name, tool.homeDir || t("未配置目录"), tool.relayCount])
-    : tf("{0}｜{1}｜供应商配置尚未接入", [tool.name, tool.homeDir || t("未配置目录")]);
-  return (
-    <div
-      ref={rootRef as React.RefObject<HTMLDivElement>}
-      className="tool-chip-wrap"
-      onContextMenu={(event) => {
-        event.preventDefault();
-        setOpen((current) => !current);
-      }}
-    >
-      <button
-        aria-label={tool.switchable ? `${tool.name}${running ? ` · ${t("运行中")}` : ""}` : `${tool.name} · ${t("待接入")}`}
-        aria-pressed={selected}
-        className={`tool-chip ${selected ? "active" : ""}`}
-        disabled={!tool.switchable}
-        onClick={() => onSelect(tool.id)}
-        title={`${title}${running ? `｜${t("运行中")}` : ""}`}
-        type="button"
-      >
-        {icon ? (
-          <span
-            aria-hidden="true"
-            className={`tool-chip-icon tool-chip-brand-icon tool-chip-icon-${tool.id}`}
-            style={{ maskImage: `url("${icon}")`, WebkitMaskImage: `url("${icon}")` }}
-          />
-        ) : (
-          <Blocks aria-hidden="true" className="tool-chip-icon" />
-        )}
-      </button>
-      {open ? createPortal(
-        <div
-          className="tool-chip-menu"
-          ref={menuRef as React.RefObject<HTMLDivElement>}
-          role="menu"
-          style={menuStyle}
-        >
-          {!tool.switchable ? null : (
-            <button
-              className="tool-chip-menu-item"
-              role="menuitem"
-              type="button"
-              onClick={() => { onSelect(tool.id); setOpen(false); }}
-            >
-              {selected ? t("✓ 当前使用") : t("切换到此 Agent")}
-            </button>
-          )}
+      {tools.map((tool) => {
+        const icon = TOOL_ICONS[tool.id];
+        const selected = showSelection && tool.id === activeTool;
+        const running = tool.id === "codex" && codexAppRunning;
+        const title = tool.switchable
+          ? tf("{0}｜{1}｜{2} 个供应商", [tool.name, tool.homeDir || t("未配置目录"), tool.relayCount])
+          : tf("{0}｜{1}｜供应商配置尚未接入", [tool.name, tool.homeDir || t("未配置目录")]);
+        return (
           <button
-            className="tool-chip-menu-item"
-            role="menuitem"
+            aria-label={tool.switchable ? `${tool.name}${running ? ` · ${t("运行中")}` : ""}` : `${tool.name} · ${t("待接入")}`}
+            aria-pressed={selected}
+            className={`tool-chip ${selected ? "active" : ""}`}
+            disabled={!tool.switchable}
+            key={tool.id}
+            onClick={() => onSelect(tool.id)}
+            title={`${title}${running ? `｜${t("运行中")}` : ""}`}
             type="button"
-            onClick={() => { onOpenSettings?.(tool.id); setOpen(false); }}
           >
-            {t("设置…")}
+            {icon ? (
+              <span
+                aria-hidden="true"
+                className={`tool-chip-icon tool-chip-brand-icon tool-chip-icon-${tool.id}`}
+                style={{ maskImage: `url("${icon}")`, WebkitMaskImage: `url("${icon}")` }}
+              />
+            ) : (
+              <Blocks aria-hidden="true" className="tool-chip-icon" />
+            )}
           </button>
-        </div>,
-        document.body,
-      ) : null}
-    </div>
+        );
+      })}
+    </nav>
   );
 }
 
@@ -14478,7 +14434,8 @@ function routeSubtitle(route: Route) {
     computerUse: t("复用 Codex 的 Computer Use，通过 MCP 接给 Claude Code、Claude Desktop 与 Codex。"),
     maintenance: t("入口检查与修复、开机启动与应用路径"),
     about: t("版本信息、项目链接、GitHub Release 更新、日志与诊断"),
-    settings: t("主题和启动参数"),
+    settings: t("主题、配置备份与配置文件路径，不随 Agent 变化"),
+    agentSettings: t("当前 Agent 的专属设置"),
   };
   return subtitles[route];
 }
