@@ -3171,6 +3171,9 @@ pub fn atomic_write_with(
         if let Some(permissions) = existing_permissions {
             temp_file.set_permissions(permissions)?;
         }
+        // rename 前必须落盘：只 flush 时内容可能还在页缓存里，断电或蓝屏后会留下
+        // 已经替换成功、内容却全是 NUL 的 config.toml（#2450）。
+        temp_file.sync_all()?;
         Ok(())
     })();
     if let Err(error) = write_result {
