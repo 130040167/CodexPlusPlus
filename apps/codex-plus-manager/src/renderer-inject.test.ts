@@ -1217,14 +1217,14 @@ return { refresh: refreshCodexPlusExtensionsView, selection: () => codexPlusExte
 
   it("preserves sponsor logos, destinations and highlights in the native recommendation list", async () => {
     const renderer = await readFile(rendererPath, "utf8");
-    const logo = await readFile(new URL("../../../docs/images/sponsor-volcengine.png", import.meta.url));
+    const logo = await readFile(new URL("../../../docs/images/sponsor-runapi.png", import.meta.url));
     const image = `data:image/png;base64,${logo.toString("base64")}`;
     const runtime = new Function(`${escapeSource(renderer)}\n${segment(renderer, "  const codexPlusAdsUrl =", "  function cacheBustCodexPlusAdUrl(")}
 return {
   render: renderCodexPlusAds,
   set(payload, loaded = true) { codexPlusAds = normalizeCodexPlusAds(payload); codexPlusAdsLoaded = loaded; return codexPlusAds; }
 };`)() as { render: () => string; set: (payload: unknown, loaded?: boolean) => Array<Record<string, unknown>> };
-    const ad = { id: "volcengine", type: "sponsor", title: "火山方舟｜套餐", description: "原始 <描述>", url: "https://example.test/partner?plan=pro&source=codex", image, highlights: ['原始 "优惠" & 说明', "保留第二条亮点"] };
+    const ad = { id: "runapi", type: "sponsor", title: "RunAPI｜套餐", description: "原始 <描述>", url: "https://example.test/partner?plan=pro&source=codex", image, highlights: ['原始 "优惠" & 说明', "保留第二条亮点"] };
     const normalized = runtime.set({ ads: [ad, { ...ad, id: "normal", type: "normal" }, { ...ad, id: "expired", expires_at: "2000-01-01" }] });
     assert.equal(normalized.length, 1);
     assert.equal(normalized[0].image, image);
