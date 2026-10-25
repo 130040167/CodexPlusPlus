@@ -29,13 +29,15 @@ export function CuPipWindow() {
     };
   }, []);
 
-  const name = target.appName || "Computer Use";
+  const name = target.appName || "";
   return (
     <div className="cu-pip">
       <header className="cu-pip-head" data-tauri-drag-region>
         <span className="cu-pip-dot" aria-hidden="true" />
-        <strong data-tauri-drag-region title={target.title || name}>{name}</strong>
-        <small data-tauri-drag-region>{t("正在操作")}</small>
+        <strong className="cu-pip-brand" data-tauri-drag-region>Codex++ Computer Use</strong>
+        {name
+          ? <span className="cu-pip-app" data-tauri-drag-region title={`${t("正在操作")}：${target.title || name}`}>{name}</span>
+          : null}
         <button type="button" title={t("切到该应用")} aria-label={t("切到该应用")} onClick={() => void invoke("cu_pip_activate")}>
           <AppWindow size={13} />
         </button>
@@ -44,7 +46,7 @@ export function CuPipWindow() {
         </button>
       </header>
       <div className="cu-pip-body">
-        {frame ? <img alt={name} src={frame} draggable={false} /> : <span>{t("等待画面…")}</span>}
+        {frame ? <img alt={name || "Computer Use"} src={frame} draggable={false} /> : <span>{t("等待画面…")}</span>}
       </div>
     </div>
   );

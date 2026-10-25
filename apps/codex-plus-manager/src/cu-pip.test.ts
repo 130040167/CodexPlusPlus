@@ -35,3 +35,8 @@ test("预览组件加载后主动取目标，并能关闭与切到应用", () =>
     assert.ok(lib.includes(command), `lib.rs 缺少 ${command}`);
   }
 });
+
+test("预览窗口标明 Codex++ Computer Use", () => {
+  assert.ok(read("./CuPipWindow.tsx").includes(">Codex++ Computer Use<"));
+  assert.match(read("../src-tauri/src/cu_pip.rs"), /\.title\("Codex\+\+ Computer Use"\)/);
+});

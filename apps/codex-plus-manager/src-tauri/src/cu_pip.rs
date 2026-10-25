@@ -264,7 +264,7 @@ fn ensure_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         })
         .unwrap_or((MARGIN, 38.0));
     WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("/index.html#cu-pip".into()))
-        .title("Computer Use")
+        .title("Codex++ Computer Use")
         .inner_size(WIDTH, HEIGHT)
         .min_inner_size(220.0, 150.0)
         .position(x, y)

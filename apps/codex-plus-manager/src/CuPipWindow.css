@@ -32,18 +32,27 @@ html.cu-pip-root #app {
   cursor: grab;
 }
 
-.cu-pip-head strong {
+.cu-pip-brand {
+  flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-weight: 600;
+  letter-spacing: -0.01em;
 }
 
-.cu-pip-head small {
-  flex: 1;
-  color: hsl(var(--muted-foreground));
+/* 正在操作的应用：标题栏右侧的小标签。 */
+.cu-pip-app {
+  max-width: 45%;
+  overflow: hidden;
+  padding: 1px 7px;
+  border: 1px solid hsl(var(--brand-accent) / 0.35);
+  border-radius: 999px;
+  background: hsl(var(--brand-accent) / 0.1);
+  color: hsl(var(--brand-accent));
   font-size: 11px;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
