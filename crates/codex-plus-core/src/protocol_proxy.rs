@@ -2984,6 +2984,14 @@ impl ChatSseToResponsesConverter {
         }
     }
 
+    pub(crate) fn model(&self) -> &str {
+        &self.state.model
+    }
+
+    pub(crate) fn latest_usage(&self) -> Option<&Value> {
+        self.state.latest_usage.as_ref()
+    }
+
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
         append_utf8_safe(&mut self.buffer, &mut self.utf8_remainder, bytes);
         let mut output = String::new();
@@ -3433,6 +3441,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 model_override.as_deref(),
                 preserve_native_request,
                 official_base.as_deref(),
+                session_headers,
             )
             .await
             {
@@ -3871,6 +3880,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 model_override.as_deref(),
                 false,
                 official_base.as_deref(),
+                session_headers,
             )
             .await;
             let (fallback_endpoint, fallback_body, fallback_wire, _) = match fallback {
@@ -4836,6 +4846,7 @@ async fn upstream_request_parts(
     model_override: Option<&str>,
     preserve_compaction_trigger: bool,
     official_base: Option<&str>,
+    session_headers: ProxySessionHeaders<'_>,
 ) -> anyhow::Result<(String, Value, UpstreamWireApi, bool)> {
     let compact = is_responses_compact_proxy_path(request_path)
         || request_has_compaction_trigger(&request_json);
@@ -4926,6 +4937,19 @@ async fn upstream_request_parts(
         normalize_responses_item_ids(&mut body);
     }
 
+    // base64 图片一旦落进文本字段会把 token 估算撑到不可用，必须在 VLM 预处理前清掉。
+    if guard_inline_image_data_urls(&mut body) {
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "inline_image_data_url_leak",
+            json!({ "model": model, "protocol": format!("{:?}", relay.protocol) }),
+        );
+    }
+
     // Image handling (per-model): send-as-is / strip / VLM analysis
     let model = body
         .get("model")
@@ -4952,12 +4976,13 @@ async fn upstream_request_parts(
 
                     for key in &["messages", "input"] {
                         if let Some(arr) = body.get_mut(key).and_then(Value::as_array_mut) {
-                            crate::vision::strip_image_blocks(
+                            crate::vision::strip_image_blocks_with_context(
                                 arr,
                                 &vlm_config,
                                 &relay.model_windows,
                                 &relay.context_window,
                                 &model,
+                                session_headers.thread_id,
                                 relay.protocol == crate::settings::RelayProtocol::Responses,
                             )
                             .await?;
@@ -4965,14 +4990,6 @@ async fn upstream_request_parts(
                     }
             }
         }
-    }
-
-    if guard_inline_image_data_urls(&mut body) {
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "inline_image_data_url_leak",
-            json!({ "model": model, "protocol": format!("{:?}", relay.protocol) }),
-        );
-        debug_assert!(false, "base64 图片泄漏进文本字段，检查协议转换路径");
     }
 
     let wire_api = match relay.protocol {
@@ -11833,7 +11850,15 @@ mod parallel_tool_call_pairing_tests {
         ], "tools": [{"type": "custom", "name": "view_image"}, {"type": "custom", "name": "exec"}]});
 
         let (_, out, _, _) =
-            upstream_request_parts(&relay, body, "/v1/responses", None, false, None)
+            upstream_request_parts(
+                &relay,
+                body,
+                "/v1/responses",
+                None,
+                false,
+                None,
+                ProxySessionHeaders::default(),
+            )
                 .await
                 .unwrap();
         assert_pairing(&out, 3);
@@ -11857,21 +11882,21 @@ mod parallel_tool_call_pairing_tests {
         let review = || json!({"model": "codex-auto-review", "input": "review"});
 
         let (_, out, _, _) =
-            upstream_request_parts(&relay, review(), "/v1/responses", None, false, None)
+            upstream_request_parts(&relay, review(), "/v1/responses", None, false, None, ProxySessionHeaders::default())
                 .await
                 .unwrap();
         assert_eq!(out["model"], "codex-auto-review");
 
         relay.auto_review_model = " deepseek-v4-flash ".into();
         let (_, out, _, _) =
-            upstream_request_parts(&relay, review(), "/v1/responses", None, false, None)
+            upstream_request_parts(&relay, review(), "/v1/responses", None, false, None, ProxySessionHeaders::default())
                 .await
                 .unwrap();
         assert_eq!(out["model"], "deepseek-v4-flash");
 
         let normal = json!({"model": "deepseek-v4-pro", "input": "hi"});
         let (_, out, _, _) =
-            upstream_request_parts(&relay, normal, "/v1/responses", None, false, None)
+            upstream_request_parts(&relay, normal, "/v1/responses", None, false, None, ProxySessionHeaders::default())
                 .await
                 .unwrap();
         assert_eq!(out["model"], "deepseek-v4-pro");
