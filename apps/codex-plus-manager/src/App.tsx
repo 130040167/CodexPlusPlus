@@ -5185,9 +5185,11 @@ function OverviewScreen({
   };
   return (
     <>
+      {/* 置顶推荐位两个工具下都显示，内容与「推荐内容」页同源。 */}
+      <SponsorBoard ads={ads} actions={actions} />
       {activeTool === "codex" ? (
         <>
-          {/* 最常用的两件事放最上面：现在用的是哪个供应商（可直接切换），以及最近请求是否正常。 */}
+          {/* 推荐位之下是最常用的两件事：现在用的是哪个供应商（可直接切换），以及最近请求是否正常。 */}
           <div className="overview-top-grid">
             <Panel className="overview-current-panel">
               <CardHead title={t("当前供应商")} detail="" />
@@ -5290,12 +5292,9 @@ function OverviewScreen({
               </div>
             </CardContent>
           </Panel>
-          {/* 推荐内容与「推荐内容」页同源；放在常用信息之后，不再压在概览最上面。 */}
-          <SponsorBoard ads={ads} actions={actions} />
         </>
       ) : (
         <>
-        <SponsorBoard ads={ads} actions={actions} />
         <Panel>
           <CardHead title={tf("{0} 状态", [tool?.name ?? t("工具")])} detail={t("该工具由它自己的页签管理")} />
           <CardContent>
