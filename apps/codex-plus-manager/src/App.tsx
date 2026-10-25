@@ -193,6 +193,7 @@ import { apiKeyPreview, createRelayApiKey, normalizeRelayApiKeys, relayProfileWi
 import { relayHeadersValidationMessage, serializeRelayHeaders } from "./relay-headers";
 import { sessionProviderForProtocol } from "./relay-session";
 import { usePopoverLayer } from "./use-popover-layer";
+import { resolveAnchoredMenuLayout, type AnchoredMenuLayout } from "./popover-layer";
 import { resolveProviderName } from "./provider-name";
 import {
   providerSyncStreamPercent,
@@ -206,6 +207,7 @@ import {
   defaultDreamSkinColors,
   isDreamSkinDraftDirty,
   normalizeDreamSkinTheme,
+  runExclusiveDreamSkinInstall,
   type DreamSkinCheck,
   type DreamSkinColors,
   type DreamSkinCommunityResult,
@@ -268,6 +270,12 @@ type PendingDreamSkinRestart = {
   currentThemeName: string;
   pendingThemeKey: string;
   pendingThemeName: string;
+};
+
+type DreamSkinInstallOperation = {
+  source: "market" | "community" | "pending-community" | "import";
+  id: string;
+  name: string;
 };
 
 type PathState = {
@@ -366,6 +374,8 @@ type BackendSettings = WhaleBalanceSettings & {
   protocolProxyAutoRetryMode: "streaming" | "streaming-legacy" | "buffered";
   /** 流式避震下首段可见输出后到提交的延迟（毫秒）；0 表示一出现可见输出立即提交。与 Rust `protocol_proxy_auto_retry_commit_delay_ms` 对应。 */
   protocolProxyAutoRetryCommitDelayMs: number;
+  /** 把不在当前供应商模型列表里的请求模型（Codex 后台任务的 gpt-* / codex-auto-review）改写为该供应商默认模型。与 Rust `protocol_proxy_map_unlisted_models` 对应。 */
+  protocolProxyMapUnlistedModels: boolean;
   /** 本地协议代理单次请求体上限（MiB，32~512，默认 128）。与 Rust `helper_max_request_body_mib` 对应。 */
   helperMaxRequestBodyMib: number;
   codexAppCapacityAutoRetry: boolean;
@@ -1279,6 +1289,7 @@ const defaultSettings: BackendSettings = {
   protocolProxyAutoRetryStatusCodes: [],
   protocolProxyAutoRetryMode: "streaming",
   protocolProxyAutoRetryCommitDelayMs: 1000,
+  protocolProxyMapUnlistedModels: false,
   helperMaxRequestBodyMib: 128,
   codexAppCapacityAutoRetry: false,
   codexAppStepwiseEnabled: false,
@@ -1409,6 +1420,8 @@ export function App() {
   const [dreamSkinLibraryLoading, setDreamSkinLibraryLoading] = useState(false);
   const [dreamSkinMarketLoading, setDreamSkinMarketLoading] = useState(false);
   const [dreamSkinCommunityLoading, setDreamSkinCommunityLoading] = useState(false);
+  const [dreamSkinInstallOperation, setDreamSkinInstallOperation] = useState<DreamSkinInstallOperation | null>(null);
+  const dreamSkinInstallLockRef = useRef(false);
   const [pendingDreamSkinCommunity, setPendingDreamSkinCommunity] = useState("");
   const [selectedDreamSkinTheme, setSelectedDreamSkinTheme] = useState("builtin");
   const [savedDreamSkinThemeDraft, setSavedDreamSkinThemeDraft] = useState<DreamSkinThemeDraft | null>(null);
@@ -1892,19 +1905,34 @@ export function App() {
     }
   };
 
+  const runDreamSkinInstallOperation = async <T,>(
+    operation: DreamSkinInstallOperation,
+    install: () => Promise<T>,
+  ): Promise<T | null> => runExclusiveDreamSkinInstall(
+    dreamSkinInstallLockRef,
+    (pending) => setDreamSkinInstallOperation(pending ? operation : null),
+    install,
+  );
+
   const installDreamSkinCommunityTheme = async (theme: DreamSkinCommunityTheme) => {
-    const result = await run(() => call<DreamSkinCommunityResult>(
-      "install_dream_skin_community_theme",
-      { id: theme.id },
-    ));
-    if (!result) return false;
-    setDreamSkinCommunity(result);
-    showResultNotice(t("DreamSkin 社区"), result);
-    if (!isSuccessStatus(result.status)) return false;
-    await refreshDreamSkinLibrary(true);
-    const draft = await loadDreamSkinThemeDraft(theme.themeId);
-    if (draft) setDreamSkinDraftSelection(`stored:${theme.themeId}`, draft);
-    return true;
+    const installed = await runDreamSkinInstallOperation(
+      { source: "community", id: theme.id, name: theme.name },
+      async () => {
+        const result = await run(() => call<DreamSkinCommunityResult>(
+          "install_dream_skin_community_theme",
+          { id: theme.id },
+        ));
+        if (!result) return false;
+        setDreamSkinCommunity(result);
+        showResultNotice(t("DreamSkin 社区"), result);
+        if (!isSuccessStatus(result.status)) return false;
+        await refreshDreamSkinLibrary(true);
+        const draft = await loadDreamSkinThemeDraft(theme.themeId);
+        if (draft) setDreamSkinDraftSelection(`stored:${theme.themeId}`, draft);
+        return true;
+      },
+    );
+    return installed ?? false;
   };
 
   const refreshPendingDreamSkinCommunity = async () => {
@@ -1914,24 +1942,31 @@ export function App() {
   };
 
   const confirmPendingDreamSkinCommunity = async () => {
-    const result = await run(() => call<DreamSkinCommunityResult>("confirm_pending_dream_skin_community"));
-    if (!result) return;
-    setDreamSkinCommunity(result);
-    showResultNotice(t("DreamSkin 社区"), result);
-    if (!isSuccessStatus(result.status)) return;
-    setPendingDreamSkinCommunity("");
-    setRoute("dreamSkin");
-    await refreshDreamSkinLibrary(true);
-    if (result.installedThemeId) {
-      const draft = await loadDreamSkinThemeDraft(result.installedThemeId);
-      if (draft) {
-        setDreamSkinDraftSelection(`stored:${result.installedThemeId}`, draft);
-        await activateDreamSkinDraft(draft);
+    await runDreamSkinInstallOperation(
+      { source: "pending-community", id: pendingDreamSkinCommunity, name: t("网页一键换肤主题") },
+      async () => {
+        const result = await run(() => call<DreamSkinCommunityResult>("confirm_pending_dream_skin_community"));
+        if (!result) return false;
+        setDreamSkinCommunity(result);
+        showResultNotice(t("DreamSkin 社区"), result);
+        if (!isSuccessStatus(result.status)) return false;
+        setPendingDreamSkinCommunity("");
+        setRoute("dreamSkin");
+        await refreshDreamSkinLibrary(true);
+        if (result.installedThemeId) {
+          const draft = await loadDreamSkinThemeDraft(result.installedThemeId);
+          if (draft) {
+            setDreamSkinDraftSelection(`stored:${result.installedThemeId}`, draft);
+            await activateDreamSkinDraft(draft);
+          }
+        }
+        return true;
       }
-    }
+    );
   };
 
   const dismissPendingDreamSkinCommunity = async () => {
+    if (dreamSkinInstallLockRef.current && dreamSkinInstallOperation?.source === "pending-community") return;
     const result = await run(() => call<PendingDreamSkinCommunityResult>("dismiss_pending_dream_skin_community"));
     if (!result) return;
     if (isSuccessStatus(result.status)) setPendingDreamSkinCommunity("");
@@ -1953,34 +1988,46 @@ export function App() {
     }
     const path = Array.isArray(selected) ? selected[0] : selected;
     if (!path) return;
-    const previousIds = new Set(dreamSkinLibrary?.themes.map((item) => item.id) ?? []);
-    const result = await run(() => call<DreamSkinThemeLibraryResult>(
-      "import_dream_skin_theme_package",
-      { path },
-    ));
-    if (!result) return;
-    showResultNotice(t("主题库"), result);
-    if (!isSuccessStatus(result.status)) return;
-    const library = { themes: result.themes, activeDraft: result.activeDraft };
-    setDreamSkinLibrary(library);
-    const imported = result.themes.find((item) => item.kind === "stored" && !previousIds.has(item.id));
-    if (imported) {
-      const draft = await loadDreamSkinThemeDraft(imported.id);
-      if (draft) setDreamSkinDraftSelection(imported.key, draft);
-    }
-    await refreshDreamSkinCommunity(true);
+    await runDreamSkinInstallOperation(
+      { source: "import", id: "local-package", name: t("本地主题包") },
+      async () => {
+        const previousIds = new Set(dreamSkinLibrary?.themes.map((item) => item.id) ?? []);
+        const result = await run(() => call<DreamSkinThemeLibraryResult>(
+          "import_dream_skin_theme_package",
+          { path },
+        ));
+        if (!result) return false;
+        showResultNotice(t("主题库"), result);
+        if (!isSuccessStatus(result.status)) return false;
+        const library = { themes: result.themes, activeDraft: result.activeDraft };
+        setDreamSkinLibrary(library);
+        const imported = result.themes.find((item) => item.kind === "stored" && !previousIds.has(item.id));
+        if (imported) {
+          const draft = await loadDreamSkinThemeDraft(imported.id);
+          if (draft) setDreamSkinDraftSelection(imported.key, draft);
+        }
+        await refreshDreamSkinCommunity(true);
+        return true;
+      },
+    );
   };
 
   const installDreamSkinMarketTheme = async (theme: DreamSkinMarketTheme) => {
-    const result = await run(() => call<DreamSkinMarketResult>("install_dream_skin_market_theme", { id: theme.id }));
-    if (!result) return false;
-    setDreamSkinMarket(result);
-    showResultNotice(t("主题市场"), result);
-    if (!isSuccessStatus(result.status)) return false;
-    await refreshDreamSkinLibrary(true);
-    const draft = await loadDreamSkinThemeDraft(theme.id);
-    if (draft) setDreamSkinDraftSelection(`stored:${theme.id}`, draft);
-    return true;
+    const installed = await runDreamSkinInstallOperation(
+      { source: "market", id: theme.id, name: theme.name },
+      async () => {
+        const result = await run(() => call<DreamSkinMarketResult>("install_dream_skin_market_theme", { id: theme.id }));
+        if (!result) return false;
+        setDreamSkinMarket(result);
+        showResultNotice(t("主题市场"), result);
+        if (!isSuccessStatus(result.status)) return false;
+        await refreshDreamSkinLibrary(true);
+        const draft = await loadDreamSkinThemeDraft(theme.id);
+        if (draft) setDreamSkinDraftSelection(`stored:${theme.id}`, draft);
+        return true;
+      },
+    );
+    return installed ?? false;
   };
 
   const runAfterDreamSkinDraftGuard = (action: () => void) => {
@@ -4269,6 +4316,7 @@ export function App() {
               marketLoading={dreamSkinMarketLoading}
               community={dreamSkinCommunity}
               communityLoading={dreamSkinCommunityLoading}
+              installOperation={dreamSkinInstallOperation}
               draft={dreamSkinThemeDraft}
               dirty={dreamSkinDraftDirty}
               pendingRestart={pendingDreamSkinRestart}
@@ -4417,6 +4465,8 @@ export function App() {
       ) : null}
       {pendingDreamSkinCommunity ? (
         <DreamSkinCommunityLinkDialog
+          installBlocked={Boolean(dreamSkinInstallOperation)}
+          installPending={dreamSkinInstallOperation?.source === "pending-community"}
           versionId={pendingDreamSkinCommunity}
           onConfirm={() => void confirmPendingDreamSkinCommunity()}
           onDismiss={() => void dismissPendingDreamSkinCommunity()}
@@ -5648,6 +5698,30 @@ function ProxySettingsScreen({
 
       <Panel>
         <CardHead
+          title={t("目录外模型映射")}
+          detail={t("把 Codex 后台任务的固定模型名改写为当前供应商的默认模型")}
+        />
+        <CardContent className="settings-content">
+          <div className="settings-block">
+            <label className="check-row">
+              <input
+                checked={form.protocolProxyMapUnlistedModels}
+                onChange={(event) =>
+                  onFormChange({ ...form, protocolProxyMapUnlistedModels: event.currentTarget.checked })
+                }
+                type="checkbox"
+              />
+              <span>{t("改写目录外模型名")}</span>
+            </label>
+            <p className="field-hint">
+              {t("Codex 的自动审查（codex-auto-review）与标题/摘要等后台任务固定使用 gpt-* 等内部模型名，不经选模；第三方上游没有这些名字，原样转发只会报「模型不存在」并可能反复消耗额度。开启后，不在当前供应商模型列表里的请求模型会改写为该供应商的默认模型再转发（#1183 / #1446 / #1457）；官方登录与聚合供应商不受影响，已配置「自动审批模型」时 codex-auto-review 仍按该配置改写。默认关闭：开启后手填但未写进模型列表的模型也会被改写，请先把要用的模型都加进列表。")}
+            </p>
+          </div>
+        </CardContent>
+      </Panel>
+
+      <Panel>
+        <CardHead
           title={t("供应商独立代理")}
           detail={t("为单个供应商单独指定 HTTP 代理；留空表示沿用系统代理")}
         />
@@ -6139,7 +6213,7 @@ function RelayEnvironmentScreen({ result, actions }: { result: RelayEnvironmentR
       detail: result
         ? proxyVariables.length
           ? tf("检测到代理环境变量：{0}。请清理后重新启动 Codex。", [proxyVariableLabels.join(t("、"))])
-          : t("未检测到 HTTP_PROXY、HTTPS_PROXY、ALL_PROXY、NO_PROXY 或 FTP_PROXY。")
+          : t("未检测到 HTTP_PROXY、HTTPS_PROXY、ALL_PROXY 或 FTP_PROXY。")
         : t("等待检测。"),
     },
     {
@@ -6213,7 +6287,7 @@ function RelayScreen({
   const [newAggregateMode, setNewAggregateMode] = useState<AggregateMode | null>(null);
   const [thirdPartyImportOpen, setThirdPartyImportOpen] = useState(false);
   const thirdPartyImportTriggerRef = useRef<HTMLDivElement>(null);
-  const [thirdPartyImportPosition, setThirdPartyImportPosition] = useState<{ top: number; right: number } | null>(null);
+  const [thirdPartyImportPosition, setThirdPartyImportPosition] = useState<AnchoredMenuLayout | null>(null);
   const [ccsDbPathDraft, setCcsDbPathDraft] = useState(normalized.ccsDbPath);
   const [ccsPathSaving, setCcsPathSaving] = useState(false);
   const [ccsBindings, setCcsBindings] = useState<Record<string, string>>({});
@@ -6314,10 +6388,12 @@ function RelayScreen({
     if (next) {
       // 菜单改为 fixed 定位：它原本挂在 .mg-content（overflow:auto）里，
       // 面板较矮时后半截会被裁掉（ccswitch 导入按钮、刷新列表都看不到）。
+      // 高度必须按触发按钮的位置收窄，否则 cc-switch 供应商一多（几十行），
+      // 菜单底部会超出窗口下沿，最后那排按钮永远点不到（issue #1906）。
       const rect = thirdPartyImportTriggerRef.current?.getBoundingClientRect();
       setThirdPartyImportPosition(
         rect
-          ? { top: Math.round(rect.bottom + 8), right: Math.round(Math.max(12, window.innerWidth - rect.right)) }
+          ? resolveAnchoredMenuLayout(rect, { width: window.innerWidth, height: window.innerHeight })
           : null,
       );
     }
@@ -6334,12 +6410,18 @@ function RelayScreen({
     };
     document.addEventListener("pointerdown", handlePointerDown, true);
     window.addEventListener("resize", close);
-    // capture 监听内层 .mg-content 的滚动。
-    window.addEventListener("scroll", close, { capture: true, passive: true });
+    // capture 监听内层 .mg-content 的滚动：页面滚了菜单会跟触发按钮错位，得收起。
+    // 但供应商列表自己也会滚（滚轮、拖滚动条），scroll 事件同样会冒到 window 的
+    // capture 阶段——不排除掉它，列表一动菜单就关，等于列表不能滚（issue #1906）。
+    const handleScroll = (event: Event) => {
+      if (thirdPartyImportTriggerRef.current?.contains(event.target as Node)) return;
+      close();
+    };
+    window.addEventListener("scroll", handleScroll, { capture: true, passive: true });
     return () => {
       document.removeEventListener("pointerdown", handlePointerDown, true);
       window.removeEventListener("resize", close);
-      window.removeEventListener("scroll", close, { capture: true });
+      window.removeEventListener("scroll", handleScroll, { capture: true });
     };
   }, [thirdPartyImportOpen]);
   if (detailProfile) {
@@ -6416,7 +6498,12 @@ function RelayScreen({
                 <div
                   className="third-party-import-menu"
                   style={thirdPartyImportPosition
-                    ? { position: "fixed", top: thirdPartyImportPosition.top, right: thirdPartyImportPosition.right }
+                    ? {
+                      position: "fixed",
+                      top: thirdPartyImportPosition.top,
+                      right: thirdPartyImportPosition.right,
+                      maxHeight: thirdPartyImportPosition.maxHeight,
+                    }
                     : undefined}
                 >
                   <label>
@@ -6427,31 +6514,36 @@ function RelayScreen({
                   <button disabled={ccsPathSaving} onClick={() => void saveCcsDbPath()} type="button">{t("保存路径并刷新")}</button>
                   {ccsProviders && isSuccessStatus(ccsProviders.status) ? <span className="text-xs break-all">{t("实际来源")}：{ccsProviders.dbPath}</span> : null}
                   {ccsProviders?.fallbackReason ? <span className="text-xs break-all">{ccsProviders.fallbackReason}</span> : null}
-                  {ccsProviders?.providers.map((provider) => <label key={provider.sourceId}>
-                    {provider.name}
-                    <select value={ccsBindings[provider.sourceId] || ""} onChange={(event) => setCcsBindings((current) => ({ ...current, [provider.sourceId]: event.currentTarget.value }))}>
-                      <option value="">{t("自动识别来源或新增")}</option>
-                      {normalized.relayProfiles.map((profile) => <option key={profile.id} value={profile.id}>{t("关联已有")}：{profile.name}</option>)}
-                    </select>
-                  </label>)}
-                  <button
-                    disabled={ccsPathSaving || ccsDbPathDraft.trim() !== normalized.ccsDbPath || !ccsProviders?.providers.length}
-                    onClick={() => {
-                      setThirdPartyImportOpen(false);
-                      void actions.importCcsProviders(ccsBindings);
-                    }}
-                    type="button"
-                  >
-                    <strong>ccswitch</strong>
-                    <span>{ccsProviderSummary(ccsProviders)}</span>
-                  </button>
-                  <button
-                    onClick={() => void actions.refreshCcsProviders()}
-                    type="button"
-                  >
-                    <RefreshCw className="h-4 w-4" />
-                    {t("刷新列表")}
-                  </button>
+                  {/* 供应商列表单独滚动：cc-switch 里几十个供应商时，底部按钮仍然可见可点（issue #1906）。 */}
+                  <div className="third-party-import-list">
+                    {ccsProviders?.providers.map((provider) => <label key={provider.sourceId}>
+                      {provider.name}
+                      <select value={ccsBindings[provider.sourceId] || ""} onChange={(event) => setCcsBindings((current) => ({ ...current, [provider.sourceId]: event.currentTarget.value }))}>
+                        <option value="">{t("自动识别来源或新增")}</option>
+                        {normalized.relayProfiles.map((profile) => <option key={profile.id} value={profile.id}>{t("关联已有")}：{profile.name}</option>)}
+                      </select>
+                    </label>)}
+                  </div>
+                  <div className="third-party-import-actions">
+                    <button
+                      disabled={ccsPathSaving || ccsDbPathDraft.trim() !== normalized.ccsDbPath || !ccsProviders?.providers.length}
+                      onClick={() => {
+                        setThirdPartyImportOpen(false);
+                        void actions.importCcsProviders(ccsBindings);
+                      }}
+                      type="button"
+                    >
+                      <strong>ccswitch</strong>
+                      <span>{ccsProviderSummary(ccsProviders)}</span>
+                    </button>
+                    <button
+                      onClick={() => void actions.refreshCcsProviders()}
+                      type="button"
+                    >
+                      <RefreshCw className="h-4 w-4" />
+                      {t("刷新列表")}
+                    </button>
+                  </div>
                 </div>
               ) : null}
             </div>
@@ -7411,6 +7503,7 @@ function DreamSkinScreen({
   marketLoading,
   community,
   communityLoading,
+  installOperation,
   draft,
   dirty,
   pendingRestart,
@@ -7429,6 +7522,7 @@ function DreamSkinScreen({
   marketLoading: boolean;
   community: DreamSkinCommunityResult | null;
   communityLoading: boolean;
+  installOperation: DreamSkinInstallOperation | null;
   draft: DreamSkinThemeDraft | null;
   dirty: boolean;
   pendingRestart: PendingDreamSkinRestart | null;
@@ -7668,9 +7762,11 @@ function DreamSkinScreen({
             </div>
             {themeView === "local" ? (
               <Toolbar>
-                <Button variant="outline" onClick={() => void actions.importDreamSkinThemePackage()}>
-                  <PackageOpen className="h-4 w-4" />
-                  {t("导入主题包")}
+                <Button disabled={Boolean(installOperation)} variant="outline" onClick={() => void actions.importDreamSkinThemePackage()}>
+                  {installOperation?.source === "import"
+                    ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
+                    : <PackageOpen className="h-4 w-4" />}
+                  {installOperation?.source === "import" ? t("导入中…") : t("导入主题包")}
                 </Button>
                 <Button variant="secondary" onClick={() => void actions.createDreamSkinTheme()}>
                   <ImagePlus className="h-4 w-4" />
@@ -7680,10 +7776,15 @@ function DreamSkinScreen({
             ) : null}
           </div>
 
+          {installOperation ? (
+            <DreamSkinInstallProgress label={dreamSkinInstallOperationLabel(installOperation)} />
+          ) : null}
+
           {themeView === "community" ? (
             <DreamSkinCommunitySection
               community={community}
               communityLoading={communityLoading}
+              installOperation={installOperation}
               actions={actions}
               onInstalled={() => setThemeView("local")}
             />
@@ -7720,6 +7821,7 @@ function DreamSkinScreen({
                   {market.themes.map((item) => (
                     <DreamSkinMarketCard
                       actions={actions}
+                      installOperation={installOperation}
                       key={item.id}
                       onInstalled={() => setThemeView("local")}
                       theme={item}
@@ -8152,12 +8254,16 @@ function DreamSkinColorField({
 function DreamSkinMarketCard({
   theme,
   actions,
+  installOperation,
   onInstalled,
 }: {
   theme: DreamSkinMarketTheme;
   actions: Actions;
+  installOperation: DreamSkinInstallOperation | null;
   onInstalled: () => void;
 }) {
+  const installing = installOperation?.source === "market" && installOperation.id === theme.id;
+  const installBlocked = Boolean(installOperation);
   const status = theme.updateAvailable
     ? t("可更新")
     : theme.installed
@@ -8192,18 +8298,23 @@ function DreamSkinMarketCard({
       </div>
       <div className="dream-skin-market-actions">
         <Button
+          aria-busy={installing}
+          disabled={installBlocked}
           onClick={async () => {
             if (await actions.installDreamSkinMarketTheme(theme)) onInstalled();
           }}
           size="sm"
         >
-          <Download className="h-4 w-4" />
-          {theme.updateAvailable ? t("更新") : theme.installed ? t("重新安装") : t("安装")}
+          {installing
+            ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
+            : <Download className="h-4 w-4" />}
+          {installing ? t("安装中…") : theme.updateAvailable ? t("更新") : theme.installed ? t("重新安装") : t("安装")}
         </Button>
         <Button onClick={() => void actions.openExternalUrl(theme.sourceUrl)} size="sm" variant="outline">
           <ExternalLink className="h-4 w-4" />
           {t("来源")}
         </Button>
+        {installing ? <DreamSkinInstallProgress /> : null}
       </div>
     </article>
   );
@@ -8212,11 +8323,13 @@ function DreamSkinMarketCard({
 function DreamSkinCommunitySection({
   community,
   communityLoading,
+  installOperation,
   actions,
   onInstalled,
 }: {
   community: DreamSkinCommunityResult | null;
   communityLoading: boolean;
+  installOperation: DreamSkinInstallOperation | null;
   actions: Actions;
   onInstalled: () => void;
 }) {
@@ -8291,6 +8404,7 @@ function DreamSkinCommunitySection({
           {items.map((item) => (
             <DreamSkinCommunityCard
               actions={actions}
+              installOperation={installOperation}
               key={item.id}
               onInstalled={onInstalled}
               theme={item}
@@ -8318,12 +8432,16 @@ function DreamSkinCommunitySection({
 function DreamSkinCommunityCard({
   theme,
   actions,
+  installOperation,
   onInstalled,
 }: {
   theme: DreamSkinCommunityTheme;
   actions: Actions;
+  installOperation: DreamSkinInstallOperation | null;
   onInstalled: () => void;
 }) {
+  const installing = installOperation?.source === "community" && installOperation.id === theme.id;
+  const installBlocked = Boolean(installOperation);
   const status = theme.updateAvailable
     ? t("可更新")
     : theme.installed
@@ -8356,22 +8474,42 @@ function DreamSkinCommunityCard({
       </div>
       <div className="dream-skin-community-actions">
         <Button
-          disabled={!theme.applyCompatible}
+          aria-busy={installing}
+          disabled={installBlocked || !theme.applyCompatible}
           onClick={async () => {
             if (await actions.installDreamSkinCommunityTheme(theme)) onInstalled();
           }}
           size="sm"
           title={theme.applyCompatible ? t("下载、校验并安装主题包") : t("此主题仅支持在线预览或下载")}
         >
-          <Download className="h-4 w-4" />
-          {theme.updateAvailable ? t("更新") : theme.installed ? t("重新安装") : t("安装")}
+          {installing
+            ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
+            : <Download className="h-4 w-4" />}
+          {installing ? t("安装中…") : theme.updateAvailable ? t("更新") : theme.installed ? t("重新安装") : t("安装")}
         </Button>
         <Button onClick={() => void actions.openExternalUrl(`https://dreamskin.cc/preview?themeVersion=${encodeURIComponent(theme.id)}`)} size="sm" variant="outline">
           <Eye className="h-4 w-4" />
           {t("预览")}
         </Button>
+        {installing ? <DreamSkinInstallProgress /> : null}
       </div>
     </article>
+  );
+}
+
+function dreamSkinInstallOperationLabel(operation: DreamSkinInstallOperation): string {
+  if (operation.source === "import") return t("正在导入并校验本地主题包…");
+  return tf("正在下载、校验并安装“{0}”…", [operation.name]);
+}
+
+function DreamSkinInstallProgress({ label = t("正在下载、校验并安装主题包…") }: { label?: string }) {
+  return (
+    <div aria-live="polite" className="dream-skin-install-progress" role="status">
+      <span>{label}</span>
+      <div aria-label={label} className="dream-skin-install-progress-bar" role="progressbar">
+        <div />
+      </div>
+    </div>
   );
 }
 
@@ -11414,7 +11552,7 @@ function RelayProfileEditor({
                                 setMetadataImportPreview(synchronized.preview);
                                 setMetadataImportError("");
                               }}
-                              placeholder="1M"
+                              placeholder={t("留空使用默认值")}
                             />
                           </div>
                           <div className="relay-model-cell relay-model-cell-compact">
@@ -13522,10 +13660,14 @@ function PendingProviderImportDialog({
 
 function DreamSkinCommunityLinkDialog({
   versionId,
+  installBlocked,
+  installPending,
   onConfirm,
   onDismiss,
 }: {
   versionId: string;
+  installBlocked: boolean;
+  installPending: boolean;
   onConfirm: () => void;
   onDismiss: () => void;
 }) {
@@ -13537,7 +13679,7 @@ function DreamSkinCommunityLinkDialog({
             <h2>{t("从 DreamSkin.cc 安装主题")}</h2>
             <p>{t("检测到网页一键换肤请求。确认后会从固定社区 API 下载，并在本机重新校验大小、SHA-256、ZIP 清单与 Safe CSS。")}</p>
           </div>
-          <button className="toast-close" onClick={onDismiss} type="button">×</button>
+          <button aria-label={t("关闭")} className="toast-close" disabled={installPending} onClick={onDismiss} type="button">×</button>
         </div>
         <div className="metric-list">
           <Metric label={t("主题版本 ID")} value={versionId} />
@@ -13547,12 +13689,18 @@ function DreamSkinCommunityLinkDialog({
           {t("链接不能携带任意下载地址、文件路径或命令；安装后主题会进入“我的主题”，不会自动重启 Codex。")}
         </div>
         <Toolbar>
-          <Button onClick={onConfirm}>
-            <Download className="h-4 w-4" />
-            {t("下载并安装")}
+          <Button aria-busy={installPending} disabled={installBlocked} onClick={onConfirm}>
+            {installPending
+              ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
+              : <Download className="h-4 w-4" />}
+            {installPending ? t("安装中…") : t("下载并安装")}
           </Button>
-          <Button onClick={onDismiss} variant="secondary">{t("取消")}</Button>
+          <Button disabled={installPending} onClick={onDismiss} variant="secondary">{t("取消")}</Button>
         </Toolbar>
+        {installPending ? <DreamSkinInstallProgress /> : null}
+        {installBlocked && !installPending ? (
+          <div className="hint-line" role="status">{t("其他主题正在安装，请等待完成后再安装此主题。")}</div>
+        ) : null}
       </div>
     </div>
   );
@@ -15446,6 +15594,8 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     codexAppTypingEffect: normalizeTypingEffect(settings.codexAppTypingEffect),
     relayProfilesEnabled: settings.relayProfilesEnabled !== false,
     protocolProxyAutoRetry: settings.protocolProxyAutoRetry !== false,
+    // 默认关闭（opt-in），只有显式开启才生效。
+    protocolProxyMapUnlistedModels: settings.protocolProxyMapUnlistedModels === true,
     protocolProxyAutoRetryMaxAttempts: clampNumber(settings.protocolProxyAutoRetryMaxAttempts ?? 5, 0, 20),
     protocolProxyAutoRetryMode:
       settings.protocolProxyAutoRetryMode === "buffered"

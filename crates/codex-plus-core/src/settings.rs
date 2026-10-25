@@ -396,6 +396,13 @@ impl RelayProfile {
         }
     }
 
+    /// 配置了「自动审批模型」时需要经本地协议代理改写 codex-auto-review（#1446），
+    /// 否则 Responses 直连的供应商根本不经过代理，填了也不生效（#1021）。
+    pub fn rewrites_auto_review_model(&self) -> bool {
+        (self.relay_mode != RelayMode::Official || self.official_mix_api_key)
+            && !self.auto_review_model.trim().is_empty()
+    }
+
     pub fn request_compatibility_enabled(&self) -> bool {
         if self.relay_mode == RelayMode::Official && !self.official_mix_api_key {
             return false;
@@ -989,6 +996,17 @@ pub struct BackendSettings {
         default = "default_protocol_proxy_auto_retry_commit_delay_ms"
     )]
     pub protocol_proxy_auto_retry_commit_delay_ms: u64,
+    /// 目录外模型名映射（#1183 / #1446 / #1457）：Codex 客户端的自动审查
+    /// （codex-auto-review）与标题/摘要等后台任务固定使用 gpt-* 等内部模型名，
+    /// 不经用户选模；第三方上游没有这些名字，原样转发只会得到
+    /// 「No available channel / 模型不存在」类错误，还可能按失败重试持续消耗额度。
+    /// 开启后，本地协议代理把「不在当前供应商公布模型集里的请求模型」改写为
+    /// 该供应商的默认模型再转发；在公布集合里的模型（含用户显式配置的 gpt-*）
+    /// 不受影响。官方登录（未混入 API）与聚合供应商不适用本映射。
+    /// 供应商配置了自动审批模型（autoReviewModel）时，codex-auto-review 仍按其改写。
+    /// 默认关闭（opt-in）：开启会改写用户手填但没写进 model_list 的模型，不能静默生效。
+    #[serde(rename = "protocolProxyMapUnlistedModels", default)]
+    pub protocol_proxy_map_unlisted_models: bool,
     /// 本地协议代理（helper）单次 HTTP 请求体上限，单位 MiB。
     ///
     /// 默认 128 MiB：1M 上下文窗口的长会话（带截图历史）实测请求体可到 ~50 MB，
@@ -1109,6 +1127,7 @@ impl Default for BackendSettings {
             protocol_proxy_auto_retry_mode: default_protocol_proxy_auto_retry_mode(),
             protocol_proxy_auto_retry_commit_delay_ms:
                 default_protocol_proxy_auto_retry_commit_delay_ms(),
+            protocol_proxy_map_unlisted_models: false,
             helper_max_request_body_mib: default_helper_max_request_body_mib(),
             tools: BTreeMap::new(),
             active_tool: ToolId::Codex,
@@ -1305,6 +1324,7 @@ impl BackendSettings {
             || self.active_relay_profile().uses_independent_proxy()
             || self.active_relay_profile().web_search_history_compat_enabled()
             || self.active_relay_profile().request_compatibility_enabled()
+            || self.active_relay_profile().rewrites_auto_review_model()
     }
 
     pub fn active_relay_uses_protocol_proxy(&self) -> bool {
@@ -2250,6 +2270,8 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     // 协议代理自动重试：管理器整份保存也会经过 normalize，这里补上部分更新路径，
     // 保证任何走 /settings/set 的调用都不会被静默丢弃。
     merge_bool_setting(target, source, "protocolProxyAutoRetry");
+    // 目录外模型映射开关同上：漏登记会让 /settings/set 补丁「保存了但没生效」。
+    merge_bool_setting(target, source, "protocolProxyMapUnlistedModels");
     if let Some(value) = source
         .get("protocolProxyAutoRetryMaxAttempts")
         .and_then(Value::as_u64)
@@ -3163,6 +3185,9 @@ pub fn atomic_write_with(
         if let Some(permissions) = existing_permissions {
             temp_file.set_permissions(permissions)?;
         }
+        // rename 前必须落盘：只 flush 时内容可能还在页缓存里，断电或蓝屏后会留下
+        // 已经替换成功、内容却全是 NUL 的 config.toml（#2450）。
+        temp_file.sync_all()?;
         Ok(())
     })();
     if let Err(error) = write_result {
