@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
-import { AlertTriangle, AppWindow, CheckCircle2, FolderOpen, Globe, Loader2, MonitorSmartphone, MousePointerClick, Play, Plug, Plus, RefreshCw, ShieldCheck, Trash2, Unplug } from "lucide-react";
+import { AlertTriangle, AppWindow, Check, CheckCircle2, FolderOpen, Globe, Loader2, MonitorSmartphone, MousePointerClick, Pencil, Play, Plug, Plus, RefreshCw, ShieldCheck, Trash2, Unplug, X } from "lucide-react";
 import { ComputerUsePreview } from "./ComputerUsePreview";
 import { PageHeader } from "./ManagementPages";
 import { t, tf } from "./i18n";
@@ -12,8 +12,14 @@ type CuTargetId = "claudeCode" | "claudeDesktop" | "codex" | "dsh" | "zcode" | "
 type CuTargetState = "registered" | "missing" | "needs_update" | "foreign" | "unsupported";
 type CuTarget = { id: string; label: string; configPath: string; registered: boolean; state: CuTargetState; message: string };
 type CuTargets = Record<CuTargetId, CuTarget>;
-/** 自定义目标：同一种客户端换一个配置目录，id 形如 `custom-…`。 */
-type CuCustomTarget = CuTarget & { kind: CuTargetId; path: string };
+/**
+ * 自定义目标：同一种客户端换一个配置目录，id 形如 `custom-…`。
+ * `name` 是用户起的名字（可能为空）；`label` 已按它取好显示名，没起名时是客户端类型名。
+ */
+type CuCustomTarget = CuTarget & { kind: CuTargetId; path: string; name: string };
+
+/** 自定义目标名字的长度上限，与后端 `CUSTOM_NAME_MAX_CHARS` 一致。 */
+const CUSTOM_NAME_MAX = 40;
 type CuStatus = {
   status: string;
   message: string;
@@ -118,6 +124,9 @@ export function ComputerUsePage() {
   const [backups, setBackups] = useState<Record<string, string>>({});
   const [newKind, setNewKind] = useState<CuTargetId>("claudeCode");
   const [newPath, setNewPath] = useState("");
+  const [newName, setNewName] = useState("");
+  /** 正在改名的自定义目标与草稿。 */
+  const [renaming, setRenaming] = useState<{ id: string; draft: string } | null>(null);
   const [tab, setTab] = useState<CuTab>("overview");
   // 图下方「配置路径与自定义目录」折叠区：图里的「添加自定义配置目录」会展开并滚到这里。
   const [showTargets, setShowTargets] = useState(false);
@@ -325,14 +334,49 @@ export function ComputerUsePage() {
     setActionError("");
     setNotice("");
     try {
-      const result = await invoke<CuStatus>("computer_use_custom_add", { kind: newKind, path: newPath.trim() });
+      const result = await invoke<CuStatus>("computer_use_custom_add", { kind: newKind, path: newPath.trim(), name: newName.trim() });
       if (!mounted.current || epoch.current !== stamp) return;
       if (result.status === "ok") {
         setStatus(result);
         setNewPath("");
+        setNewName("");
         setNotice(result.message || t("已添加自定义目标；点「接入」写入配置。"));
       } else {
         setActionError(result.message || t("添加失败，请重试。"));
+      }
+    } catch (reason) {
+      if (mounted.current && epoch.current === stamp) setActionError(errorText(reason));
+    } finally {
+      if (mounted.current && epoch.current === stamp) {
+        lock.current = false;
+        setBusy("");
+      }
+    }
+  };
+
+  /** 改名只改显示名，不动客户端配置；名字清空表示恢复默认显示（客户端类型名）。 */
+  const renameCustomTarget = async () => {
+    if (lock.current || !renaming) return;
+    const { id, draft } = renaming;
+    const current = status?.customTargets?.find((item) => item.id === id);
+    if (current && current.name === draft.trim()) {
+      setRenaming(null);
+      return;
+    }
+    lock.current = true;
+    const stamp = ++epoch.current;
+    setBusy(`custom:rename:${id}`);
+    setActionError("");
+    setNotice("");
+    try {
+      const result = await invoke<CuStatus>("computer_use_custom_rename", { id, name: draft.trim() });
+      if (!mounted.current || epoch.current !== stamp) return;
+      if (result.status === "ok") {
+        setStatus(result);
+        setRenaming(null);
+        setNotice(result.message || t("已更新名称。"));
+      } else {
+        setActionError(result.message || t("改名失败，请重试。"));
       }
     } catch (reason) {
       if (mounted.current && epoch.current === stamp) setActionError(errorText(reason));
@@ -548,8 +592,37 @@ export function ComputerUsePage() {
     return <div className="cu-target" key={id} data-custom={custom ? "true" : undefined}>
       <div className="cu-target-main">
         <div className="cu-target-title">
-          <strong>{label}</strong>
-          {custom && <span className="cu-badge cu-badge-custom">{t("自定义")}</span>}
+          {custom && renaming?.id === id
+            ? <span className="cu-rename">
+                <input
+                  aria-label={t("名称")}
+                  autoFocus
+                  className="cu-rename-input"
+                  disabled={locked}
+                  maxLength={CUSTOM_NAME_MAX}
+                  onChange={(event) => setRenaming({ id, draft: event.target.value })}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") void renameCustomTarget();
+                    if (event.key === "Escape") setRenaming(null);
+                  }}
+                  placeholder={targetFallback[custom.kind]?.label}
+                  value={renaming.draft}
+                />
+                <button className="cu-flow-icon-button" type="button" disabled={locked} title={t("保存名称")} aria-label={t("保存名称")} onClick={() => void renameCustomTarget()}>
+                  {busy === `custom:rename:${id}` ? <Loader2 size={12} className="cu-spin" /> : <Check size={12} />}
+                </button>
+                <button className="cu-flow-icon-button" type="button" disabled={locked} title={t("取消")} aria-label={t("取消")} onClick={() => setRenaming(null)}>
+                  <X size={12} />
+                </button>
+              </span>
+            : <>
+                <strong>{label}</strong>
+                {custom && <button className="cu-flow-icon-button" type="button" disabled={locked} title={t("改名")} aria-label={tf("给 {0} 改名", [label])} onClick={() => setRenaming({ id, draft: custom.name })}>
+                  <Pencil size={12} />
+                </button>}
+              </>}
+          {/* 起了名字时标签补上客户端类型，否则只看名字分不出是哪种客户端。 */}
+          {custom && <span className="cu-badge cu-badge-custom">{custom.name ? `${targetFallback[custom.kind]?.label ?? custom.kind} · ${t("自定义")}` : t("自定义")}</span>}
           <span className="cu-badge" data-state={status ? state : "unknown"}>{status ? stateLabel(state) : t("未检测")}</span>
         </div>
         <code className="cu-target-path" title={configPath}>{elidePath(configPath)}</code>
@@ -637,6 +710,17 @@ export function ComputerUsePage() {
                 >
                   {customKinds.map((kind) => <option key={kind} value={kind}>{targetFallback[kind].label}</option>)}
                 </select>
+                <input
+                  className="cu-custom-name"
+                  type="text"
+                  value={newName}
+                  disabled={locked}
+                  maxLength={CUSTOM_NAME_MAX}
+                  placeholder={t("名称（可选）")}
+                  aria-label={t("名称")}
+                  onChange={(event) => setNewName(event.target.value)}
+                  onKeyDown={(event) => { if (event.key === "Enter") void addCustomTarget(); }}
+                />
                 <input
                   className="cu-custom-path"
                   type="text"

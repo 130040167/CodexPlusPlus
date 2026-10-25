@@ -80,14 +80,20 @@
 .cu-custom-add-head .cu-hint { margin:2px 0 0; }
 .cu-custom-add-row { display:flex; min-width:0; align-items:center; gap:7px; }
 .cu-custom-kind,
+.cu-custom-name,
 .cu-custom-path {
   min-width:0; height:30px; padding:0 9px;
   border:1px solid hsl(var(--border)); border-radius:6px;
   background:hsl(var(--background)); color:inherit; font-size:12px;
 }
 .cu-custom-kind { flex:0 0 auto; }
+.cu-custom-name { flex:0 0 150px; }
 .cu-custom-path { flex:1 1 auto; font-family:var(--font-mono,monospace); font-size:11px; }
-.cu-custom-path:focus,.cu-custom-kind:focus { outline:none; border-color:hsl(var(--brand-accent)/.6); }
+.cu-custom-path:focus,.cu-custom-kind:focus,.cu-custom-name:focus { outline:none; border-color:hsl(var(--brand-accent)/.6); }
+/* 自定义目标就地改名 */
+.cu-rename { display:inline-flex; align-items:center; gap:4px; min-width:0; }
+.cu-rename-input { width:180px; min-width:0; height:24px; padding:0 7px; border:1px solid hsl(var(--brand-accent)/.6); border-radius:5px; background:hsl(var(--background)); color:inherit; font-size:12px; font-weight:600; }
+.cu-rename-input:focus { outline:none; }
 @media(max-width:760px) {
   .cu-custom-add-row { flex-wrap:wrap; }
   .cu-custom-path { flex-basis:100%; order:-1; }

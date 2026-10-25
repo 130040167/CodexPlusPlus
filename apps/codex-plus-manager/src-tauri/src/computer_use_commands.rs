@@ -136,19 +136,38 @@ pub async fn computer_use_uninstall(target: String) -> CommandResult<Value> {
 
 /// 新增自定义接入目标（只登记，不写客户端配置；接入仍由用户点「接入」触发）。
 #[tauri::command]
-pub async fn computer_use_custom_add(kind: String, path: String) -> CommandResult<Value> {
+pub async fn computer_use_custom_add(
+    kind: String,
+    path: String,
+    name: Option<String>,
+) -> CommandResult<Value> {
     let kind = match codex_plus_core::computer_use::Target::parse(&kind) {
         Ok(kind) => kind,
         Err(error) => return failed(&error.to_string(), json!({})),
     };
+    let name = name.unwrap_or_default();
     let outcome = run_blocking(move || {
-        codex_plus_core::computer_use::add_custom_target(kind, &path)?;
+        codex_plus_core::computer_use::add_custom_target(kind, &path, &name)?;
         codex_plus_core::computer_use::status()
     })
     .await;
     match outcome {
         Ok(report) => ok(
             "已添加自定义目标；点「接入」写入配置。",
+            serde_json::to_value(report).unwrap_or_else(|_| json!({})),
+        ),
+        Err(error) => failed(&error, json!({})),
+    }
+}
+
+/// 给自定义目标改名：只改界面显示名，不动客户端配置。`name` 为空恢复默认显示。
+#[tauri::command]
+pub async fn computer_use_custom_rename(id: String, name: String) -> CommandResult<Value> {
+    let outcome =
+        run_blocking(move || codex_plus_core::computer_use::rename_custom_target(&id, &name)).await;
+    match outcome {
+        Ok(report) => ok(
+            "已更新名称。",
             serde_json::to_value(report).unwrap_or_else(|_| json!({})),
         ),
         Err(error) => failed(&error, json!({})),

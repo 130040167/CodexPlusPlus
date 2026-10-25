@@ -404,6 +404,8 @@ pub struct CustomTargetStatus {
     pub status: TargetStatus,
     pub kind: Target,
     pub path: String,
+    /// 用户起的名字（可能为空）。`status.label` 已经按它取了显示名。
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -651,6 +653,10 @@ pub struct CustomTarget {
     pub kind: Target,
     /// 用户填写的路径，原样保存：可以是配置目录，也可以直接是配置文件。
     pub path: String,
+    /// 用户起的名字，只用于界面显示；为空时显示客户端类型名。
+    /// 写进客户端配置的 MCP 服务名不受影响（仍是 `codex-plus-cu`）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -673,7 +679,33 @@ impl Target {
     }
 }
 
+/// 自定义目标名字的长度上限（按字符计）。
+const CUSTOM_NAME_MAX_CHARS: usize = 40;
+
+/// 规整用户起的名字：去掉首尾空白；不允许控制字符和过长的名字。空字符串表示不起名。
+fn normalize_custom_name(name: &str) -> anyhow::Result<String> {
+    let trimmed = name.trim();
+    ensure!(
+        !trimmed.chars().any(char::is_control),
+        "名称不能包含换行等控制字符"
+    );
+    ensure!(
+        trimmed.chars().count() <= CUSTOM_NAME_MAX_CHARS,
+        "名称最多 {CUSTOM_NAME_MAX_CHARS} 个字"
+    );
+    Ok(trimmed.to_string())
+}
+
 impl CustomTarget {
+    /// 界面上显示的名字：起了名用名字，否则用客户端类型名。
+    pub fn display_name(&self) -> String {
+        if self.name.is_empty() {
+            self.kind.label().to_string()
+        } else {
+            self.name.clone()
+        }
+    }
+
     /// 实际读写的配置文件。
     pub fn config_path(&self) -> PathBuf {
         self.config_path_in(&home_dir())
@@ -757,18 +789,39 @@ pub fn custom_target(id: &str) -> anyhow::Result<CustomTarget> {
         .with_context(|| format!("找不到自定义接入目标：{id}"))
 }
 
-/// 新增一个自定义目标（只登记，不写客户端配置）。
-pub fn add_custom_target(kind: Target, path: &str) -> anyhow::Result<CustomTarget> {
-    with_lock(|| add_custom_in(&custom_store_path(), kind, path, &home_dir()))
+/// 新增一个自定义目标（只登记，不写客户端配置）。`name` 可以为空。
+pub fn add_custom_target(kind: Target, path: &str, name: &str) -> anyhow::Result<CustomTarget> {
+    with_lock(|| add_custom_in(&custom_store_path(), kind, path, name, &home_dir()))
+}
+
+/// 给自定义目标改名（只改显示名，不动客户端配置）。`name` 为空表示恢复默认显示。
+pub fn rename_custom_target(id: &str, name: &str) -> anyhow::Result<StatusReport> {
+    with_lock(|| rename_custom_in(&custom_store_path(), id, name))?;
+    status()
+}
+
+fn rename_custom_in(store: &Path, id: &str, name: &str) -> anyhow::Result<CustomTarget> {
+    let name = normalize_custom_name(name)?;
+    let mut targets = load_custom_from(store)?;
+    let target = targets
+        .iter_mut()
+        .find(|target| target.id == id)
+        .with_context(|| format!("找不到自定义接入目标：{id}"))?;
+    target.name = name;
+    let renamed = target.clone();
+    save_custom_to(store, &targets)?;
+    Ok(renamed)
 }
 
 fn add_custom_in(
     store: &Path,
     kind: Target,
     input: &str,
+    name: &str,
     home: &Path,
 ) -> anyhow::Result<CustomTarget> {
     ensure!(CUSTOM_KINDS.contains(&kind), "{} 不支持自定义配置目录", kind.label());
+    let name = normalize_custom_name(name)?;
     let trimmed = input.trim();
     ensure!(!trimmed.is_empty(), "请填写配置目录");
     let file = resolve_custom_path(kind, trimmed, home);
@@ -802,7 +855,7 @@ fn add_custom_in(
         id = format!("{CUSTOM_ID_PREFIX}{stamp}-{suffix}");
         suffix += 1;
     }
-    let target = CustomTarget { id, kind, path: trimmed.to_string() };
+    let target = CustomTarget { id, kind, path: trimmed.to_string(), name };
     targets.push(target.clone());
     save_custom_to(store, &targets)?;
     Ok(target)
@@ -924,7 +977,13 @@ fn custom_status(custom: &CustomTarget, runtime: Option<&RuntimeLocation>) -> Cu
         .map(|dir| format!("目录不存在：{}", dir.display()));
     let mut status = status_at(custom.kind, &[file], runtime, dir_missing);
     status.id = custom.id.clone();
-    CustomTargetStatus { status, kind: custom.kind, path: custom.path.clone() }
+    status.label = custom.display_name();
+    CustomTargetStatus {
+        status,
+        kind: custom.kind,
+        path: custom.path.clone(),
+        name: custom.name.clone(),
+    }
 }
 
 /// 按给定的配置文件判定接入状态。`home_missing` 非空时直接判为不支持。
@@ -2226,30 +2285,73 @@ mod tests {
         let dir = home.join(".rec/config");
         fs::create_dir_all(&dir).unwrap();
 
-        let first = add_custom_in(&store, Target::ClaudeCode, "~/.rec/config", home).unwrap();
+        let first = add_custom_in(&store, Target::ClaudeCode, "~/.rec/config", "", home).unwrap();
         assert!(first.id.starts_with(CUSTOM_ID_PREFIX));
         assert_eq!(first.path, "~/.rec/config");
         assert_eq!(load_custom_from(&store).unwrap(), vec![first.clone()]);
 
         // 同类型同文件不能重复添加；同目录换个类型可以。
-        let duplicate = add_custom_in(&store, Target::ClaudeCode, dir.to_str().unwrap(), home);
+        let duplicate = add_custom_in(&store, Target::ClaudeCode, dir.to_str().unwrap(), "", home);
         assert!(duplicate.unwrap_err().to_string().contains("已经添加过"));
-        let second = add_custom_in(&store, Target::ClaudeDesktop, "~/.rec/config", home).unwrap();
+        let second = add_custom_in(&store, Target::ClaudeDesktop, "~/.rec/config", "", home).unwrap();
         assert_ne!(first.id, second.id);
         assert_eq!(load_custom_from(&store).unwrap().len(), 2);
 
         // 目录不存在、相对路径、空路径、不支持的类型都拒绝，且不改存储。
-        assert!(add_custom_in(&store, Target::ClaudeCode, "~/missing/dir", home)
+        assert!(add_custom_in(&store, Target::ClaudeCode, "~/missing/dir", "", home)
             .unwrap_err()
             .to_string()
             .contains("目录不存在"));
-        assert!(add_custom_in(&store, Target::ClaudeCode, "relative/dir", home)
+        assert!(add_custom_in(&store, Target::ClaudeCode, "relative/dir", "", home)
             .unwrap_err()
             .to_string()
             .contains("绝对路径"));
-        assert!(add_custom_in(&store, Target::ClaudeCode, "   ", home).is_err());
-        assert!(add_custom_in(&store, Target::Codex, "~/.rec/config", home).is_err());
+        assert!(add_custom_in(&store, Target::ClaudeCode, "   ", "", home).is_err());
+        assert!(add_custom_in(&store, Target::Codex, "~/.rec/config", "", home).is_err());
         assert_eq!(load_custom_from(&store).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn custom_target_names_are_optional_validated_and_renamable() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        let store = home.join("state").join(CUSTOM_STORE_FILE);
+        fs::create_dir_all(home.join(".rec/a")).unwrap();
+        fs::create_dir_all(home.join(".rec/b")).unwrap();
+
+        // 起了名就用名字显示，首尾空白去掉；不起名显示类型名，存储里也不写 name 字段。
+        let named = add_custom_in(&store, Target::ClaudeCode, "~/.rec/a", "  工作账号  ", home).unwrap();
+        assert_eq!(named.name, "工作账号");
+        assert_eq!(named.display_name(), "工作账号");
+        let plain = add_custom_in(&store, Target::ClaudeCode, "~/.rec/b", "", home).unwrap();
+        assert_eq!(plain.display_name(), "Claude Code");
+        let text = fs::read_to_string(&store).unwrap();
+        assert_eq!(text.matches("\"name\"").count(), 1);
+
+        // 控制字符、超长名字拒绝，且不改存储。
+        assert!(add_custom_in(&store, Target::ClaudeCode, "~/.rec/b", "a\nb", home).is_err());
+        let long = "名".repeat(CUSTOM_NAME_MAX_CHARS + 1);
+        assert!(rename_custom_in(&store, &named.id, &long).unwrap_err().to_string().contains("最多"));
+        assert_eq!(load_custom_from(&store).unwrap().len(), 2);
+
+        // 改名只动名字；改成空字符串恢复默认显示；不存在的 id 报错。
+        let renamed = rename_custom_in(&store, &plain.id, "个人账号").unwrap();
+        assert_eq!(renamed.path, "~/.rec/b");
+        assert_eq!(load_custom_from(&store).unwrap()[1].name, "个人账号");
+        rename_custom_in(&store, &named.id, "   ").unwrap();
+        assert_eq!(load_custom_from(&store).unwrap()[0].display_name(), "Claude Code");
+        assert!(rename_custom_in(&store, "custom-missing", "x").is_err());
+    }
+
+    #[test]
+    fn custom_store_without_names_still_loads() {
+        // 旧版写的存储没有 name 字段。
+        let temp = TempDir::new().unwrap();
+        let store = temp.path().join(CUSTOM_STORE_FILE);
+        fs::write(&store, r#"{"targets":[{"id":"custom-1","kind":"claudeCode","path":"/x"}]}"#).unwrap();
+        let targets = load_custom_from(&store).unwrap();
+        assert_eq!(targets[0].name, "");
+        assert_eq!(targets[0].display_name(), "Claude Code");
     }
 
     #[test]
@@ -2260,7 +2362,7 @@ mod tests {
         assert!(load_custom_from(&store).is_err());
         let dir = temp.path().join("cfg");
         fs::create_dir_all(&dir).unwrap();
-        assert!(add_custom_in(&store, Target::ClaudeCode, dir.to_str().unwrap(), temp.path()).is_err());
+        assert!(add_custom_in(&store, Target::ClaudeCode, dir.to_str().unwrap(), "", temp.path()).is_err());
         assert_eq!(fs::read_to_string(&store).unwrap(), "{ not json");
     }
 
@@ -2296,6 +2398,7 @@ mod tests {
             id: "custom-1".into(),
             kind: Target::ClaudeCode,
             path: "/tmp/rec/config/.claude.json".into(),
+            name: String::new(),
         };
         assert_eq!(
             target.claude_settings_path(),
