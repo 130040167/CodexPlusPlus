@@ -438,7 +438,7 @@
   const codexPlusSettingsKey = "codexPlusSettings";
   const codexThreadScrollKey = "codexThreadScroll";
   const codexServiceTierRequestOverrideVersion = "10";
-  const codexAppServerModelRequestPatchVersion = "27";
+  const codexAppServerModelRequestPatchVersion = "28";
   const codexAppServerClientCaptureMarker = "AppServerRequestClient is missing a message dispatcher";
   const codexAppServerClientCaptureAnchor = "async sendRequest(";
   const codexRemoteSessionRecoveryVersion = "8";
@@ -11279,10 +11279,10 @@
     return local ? "local" : "";
   }
 
-  function codexPureApiAllowedModelSet(hostId) {
+  function codexPureApiAllowedModelSet(hostId, forRequest = false) {
     if (hostId !== "local") return null;
     const profile = codexRemoteSessionActiveProfile();
-    if (!codexPlusModelUnlockEnabled() || !codexPlusBackendSettingsLoaded
+    if ((!forRequest && !codexPlusModelUnlockEnabled()) || !codexPlusBackendSettingsLoaded
         || profile?.relayMode !== "pureApi" || codexModelCatalog.status !== "ok") return null;
     const profileId = String(profile.id || "").trim();
     const belongsToProfile = profileId && (codexModelCatalog.model_provider === profileId
@@ -11290,6 +11290,41 @@
         && codexModelCatalog.sources.some((source) => source?.id === `relay-profile:${profileId}`)));
     const names = codexPlusModelNames();
     return belongsToProfile && names.length ? new Set(names) : null;
+  }
+
+  async function prepareCodexPureApiModelCatalog(method, params, hostId) {
+    if (hostId !== "local") return true;
+    if (method === "send-cli-request-for-host" && params?.method) {
+      if (modelResponseHostId(params) !== "local") return true;
+      return prepareCodexPureApiModelCatalog(String(params.method), params.params, hostId);
+    }
+    if (!["thread/start", "thread/resume", "turn/start"].includes(method)) return true;
+    // 设置发布先于目录读取完成；限时等待并复核归属，不能使用上一家目录改派。
+    const deadline = Date.now() + codexAppServerPreparationTimeoutMs;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const profile = codexRemoteSessionActiveProfile();
+      if (profile?.relayMode !== "pureApi") return true;
+      const profileId = profile.id;
+      const revision = codexModelCatalogRevision;
+      if (!codexModelCatalogPromise && codexPureApiAllowedModelSet(hostId, true)) return true;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return false;
+      let timer;
+      try {
+        const read = codexModelCatalogPromise || loadCodexModelCatalog(true);
+        const completed = await Promise.race([
+          Promise.resolve(read).then(() => true, () => false),
+          new Promise((resolve) => { timer = window.setTimeout(() => resolve(false), remaining); }),
+        ]);
+        if (!completed) return false;
+      } finally {
+        if (timer !== undefined) window.clearTimeout(timer);
+      }
+      if (profileId === codexRemoteSessionActiveProfile()?.id && revision === codexModelCatalogRevision) {
+        return !!codexPureApiAllowedModelSet(hostId, true);
+      }
+    }
+    return false;
   }
 
   function codexAggregateAllowedModelSet(hostId, allowUnpublished = false) {
@@ -11308,6 +11343,12 @@
   }
 
   function codexAggregateSelectedModelTarget(model, hostId, groupId = "") {
+    const direct = codexPureApiAllowedModelSet(hostId, true);
+    if (direct) {
+      const bare = typeof model === "string" && /^cpx-[^/]+\/.+/.test(model)
+        ? model.slice(model.indexOf("/") + 1) : "";
+      return bare && direct.has(bare) ? bare : "";
+    }
     const allowed = codexAggregateAllowedModelSet(hostId);
     if (!allowed || typeof model !== "string") return "";
     const pool = codexModelCatalog.sources?.some((source) => source?.type === "aggregate_pool_catalog");
@@ -11364,7 +11405,8 @@
   }
 
   function captureCodexAggregateSelectedModels() {
-    if (!codexAggregateAllowedModelSet("local")) return;
+    const direct = codexPureApiAllowedModelSet("local", true);
+    if (!codexAggregateAllowedModelSet("local") && !direct) return;
     const identities = window.__codexPlusAggregateModelSelectionIdentities
       || (window.__codexPlusAggregateModelSelectionIdentities = new WeakMap());
     const profileId = codexRemoteSessionActiveProfile()?.id;
@@ -11374,7 +11416,7 @@
       // 连续保存时 React 可能尚未消费上一次迁移，保留最初的供应商身份。
       if (previous && previous.model === picker.model && previous.owner === owner
           && previous.hostId === hostId && previous.profileId === profileId) continue;
-      const groupId = codexPlusModelMetadata(picker.model)?.codex_plus_group_id;
+      const groupId = direct ? profileId : codexPlusModelMetadata(picker.model)?.codex_plus_group_id;
       if (typeof groupId === "string" && groupId) {
         identities.set(node, { model: picker.model, groupId, owner, hostId, profileId });
       }
@@ -11382,7 +11424,7 @@
   }
 
   function syncCodexAggregateSelectedModel() {
-    if (!codexAggregateAllowedModelSet("local")) return false;
+    if (!codexAggregateAllowedModelSet("local") && !codexPureApiAllowedModelSet("local", true)) return false;
     const attempts = window.__codexPlusAggregateModelSelectionAttempts
       || (window.__codexPlusAggregateModelSelectionAttempts = new WeakMap());
     let changed = false;
@@ -11414,7 +11456,7 @@
 
   function codexPlusConfiguredDefaultModel() {
     if (codexModelCatalog.status !== "ok") return "";
-    const allowed = codexAggregateAllowedModelSet("local") || codexPureApiAllowedModelSet("local");
+    const allowed = codexAggregateAllowedModelSet("local") || codexPureApiAllowedModelSet("local", true);
     if (!allowed) return "";
     return [codexModelCatalog.model, codexModelCatalog.default_model, ...allowed]
       .find((model) => typeof model === "string" && allowed.has(model)) || "";
@@ -11447,11 +11489,17 @@
       return next === params.params ? params : { ...params, params: next };
     }
     if (!["thread/start", "thread/resume", "turn/start"].includes(method)) return params;
-    const allowed = codexAggregateAllowedModelSet(hostId) || codexPureApiAllowedModelSet(hostId);
+    const direct = codexPureApiAllowedModelSet(hostId, true);
+    const allowed = codexAggregateAllowedModelSet(hostId) || direct;
     if (!allowed) return params;
     const model = params.model || params.collaborationMode?.settings?.model;
     if (model && allowed.has(model)) return params;
-    const mapped = model && codexAggregateSelectedModelTarget(model, hostId);
+    const bare = typeof model === "string" && /^cpx-[^/]+\/.+/.test(model)
+      ? model.slice(model.indexOf("/") + 1) : "";
+    const mapped = model && (codexAggregateSelectedModelTarget(model, hostId)
+      || (direct && bare && direct.has(bare) ? bare : ""));
+    // 明确的旧聚合模型不受当前目录支持时，不把它静默改成默认模型。
+    if (direct && bare && !mapped) return params;
     const target = mapped || (method === "thread/start" ? codexPlusConfiguredDefaultModel() : "");
     if (!target || target === model) return params;
     const next = { ...params, model: target };
@@ -11662,7 +11710,8 @@
   }
 
   function refreshCodexNativeLocalUserConfig(client) {
-    if (!codexPlusModelUnlockEnabled() && !codexAggregateAllowedModelSet("local")) return false;
+    if (!codexPlusModelUnlockEnabled() && !codexAggregateAllowedModelSet("local")
+        && !codexPureApiAllowedModelSet("local", true)) return false;
     const signature = codexPlusNativeConfigCatalogSignature();
     if (!signature) return false;
     // 原生模型 observer 依赖这个禁用自动读取的查询来决定目录和白名单。
@@ -12361,6 +12410,7 @@
           && !codexRemoteSessionTargetProvider()) {
         providerRefreshFailed = (await loadCodexModelCatalog())?.status === "failed";
       }
+      if (!providerRefreshFailed) providerRefreshFailed = !await prepareCodexPureApiModelCatalog(String(method || ""), params, client.hostId);
       const configuredParams = providerRefreshFailed ? params
         : normalizeCodexConfiguredModelRequest(String(method || ""), params, client.hostId);
       const providerParams = providerRefreshFailed
@@ -12395,7 +12445,10 @@
         || client.prewarmThreadStart).bind(client);
       client.__codexPlusServiceTierOriginalPrewarmThreadStart = originalPrewarmThreadStart;
       client.prewarmThreadStart = async function codexPlusServiceTierPrewarmThreadStart(params, options) {
-        return await prewarmCodexManagedSession(client, originalPrewarmThreadStart, params, options);
+        return await prewarmCodexManagedSession(client, async (next, nextOptions) => {
+          const ready = await prepareCodexPureApiModelCatalog("thread/start", next, client.hostId);
+          return originalPrewarmThreadStart(ready ? normalizeCodexConfiguredModelRequest("thread/start", next, client.hostId) : next, nextOptions);
+        }, params, options);
       };
     }
     client.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
@@ -12577,6 +12630,7 @@
           && !codexRemoteSessionTargetProvider()) {
         providerRefreshFailed = (await loadCodexModelCatalog())?.status === "failed";
       }
+      if (!providerRefreshFailed) providerRefreshFailed = !await prepareCodexPureApiModelCatalog(String(method || ""), params, client.hostId);
       const configuredParams = providerRefreshFailed ? params
         : normalizeCodexConfiguredModelRequest(String(method || ""), params, client.hostId);
       const providerParams = providerRefreshFailed
@@ -12611,7 +12665,10 @@
         || proto.prewarmThreadStart;
       proto.__codexPlusServiceTierOriginalPrewarmThreadStart = originalPrewarmThreadStart;
       proto.prewarmThreadStart = async function codexPlusServiceTierPrewarmThreadStart(params, options) {
-        return await prewarmCodexManagedSession(this, originalPrewarmThreadStart.bind(this), params, options);
+        return await prewarmCodexManagedSession(this, async (next, nextOptions) => {
+          const ready = await prepareCodexPureApiModelCatalog("thread/start", next, this.hostId);
+          return originalPrewarmThreadStart.call(this, ready ? normalizeCodexConfiguredModelRequest("thread/start", next, this.hostId) : next, nextOptions);
+        }, params, options);
       };
     }
     proto.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
@@ -12758,7 +12815,8 @@
   }
 
   function scheduleCodexModelWhitelistRefresh(durationMs = 2500) {
-    if (!codexPlusModelUnlockEnabled() && !codexAggregateAllowedModelSet("local", true)) return;
+    if (!codexPlusModelUnlockEnabled() && !codexAggregateAllowedModelSet("local", true)
+        && !codexPureApiAllowedModelSet("local", true)) return;
     codexModelWhitelistRefreshUntil = Math.max(codexModelWhitelistRefreshUntil, Date.now() + durationMs);
     if (codexModelWhitelistRefreshTimer) return;
     sendCodexPlusDiagnostic("model_whitelist_refresh_scheduled", { durationMs });

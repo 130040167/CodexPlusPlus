@@ -40,7 +40,7 @@ async function runtime() {
   const modelQuery = { queryKey: ["models", "list", "local"], state: { data: { data: models.map((model) => ({ model, hidden: false })) } } };
   const queries: unknown[] = [local, remote, unrelated, modelQuery];
   const timers = new Map<number, { callback: () => void; due: number }>();
-  let now = 10000, timerId = 0, enabled = true;
+  let now = 10000, timerId = 0, enabled = true, direct = false;
   const client = {
     getQueryCache: () => ({ getAll: () => queries }),
     setQueryData: () => modelQuery.state.data,
@@ -55,6 +55,7 @@ async function runtime() {
     client, WeakMap, Promise, JSON,
     codexPlusModelUnlockEnabled: () => false,
     codexAggregateAllowedModelSet: () => enabled ? new Set(models) : null,
+    codexPureApiAllowedModelSet: (_host: string, forRequest: boolean) => direct && forRequest ? new Set(["sol"]) : null,
     findCodexQueryClient: () => client,
     installCodexPlusModelQueryPublication: () => undefined,
     patchCachedLocalModelQueryData: (value: unknown) => value,
@@ -89,6 +90,7 @@ async function runtime() {
     reinject: () => vm.runInContext(injection, context) as Api,
     reader: (fn: typeof read) => { read = fn; },
     enabled: (value: boolean) => { enabled = value; },
+    direct: () => { enabled = false; direct = true; },
     advance: async (ms: number) => {
       now += ms;
       for (const [id, timer] of [...timers]) if (timer.due <= now) { timers.delete(id); timer.callback(); }
@@ -97,6 +99,20 @@ async function runtime() {
     timers,
   };
 }
+
+it("direct config refresh is independent of model unlock and leaves native model data alone", async () => {
+  const r = await runtime();
+  r.direct();
+  const remote = r.remote.state.data;
+  r.api.refresh();
+  await r.flush();
+  assert.equal(r.fetches.length, 1);
+  assert.equal(r.remote.state.data, remote);
+  assert.equal(r.selectedModels().length, 12);
+  r.api.refresh();
+  await r.flush();
+  assert.equal(r.fetches.length, 1);
+});
 
 it("a disabled native user-config query is reread so all 12 aggregate models survive observer filtering", async () => {
   const r = await runtime();

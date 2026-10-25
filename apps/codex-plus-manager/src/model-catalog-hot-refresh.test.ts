@@ -504,6 +504,165 @@ it("aggregate default changes replace stale slugs and keep display names even wi
   assert.equal(remote.data, remoteData, "remote publications stay untouched");
 });
 
+for (const unlock of [false, true]) {
+  it(`aggregate to direct normalizes only supported identities (unlock=${unlock})`, async () => {
+    const { runtime, catalog, local, nodes } = await aggregateQueryRuntime();
+    runtime.catalog(catalog("a"));
+    runtime.profile({ id: "direct", relayMode: "pureApi" });
+    runtime.unlock(unlock);
+    const original = { model: "cpx-a/model-0", effort: "high",
+      collaborationMode: { settings: { model: "cpx-a/model-0", reasoning_effort: "high" } } };
+    assert.equal(runtime.normalize("thread/start", original, "local"), original, "old catalog cannot authorize migration");
+    runtime.catalog({ ...catalog("a"), model: "model-1", models: ["model-0", "model-1"],
+      sources: [{ id: "relay-profile:direct", type: "relay_profile" }] });
+    for (const method of ["thread/start", "thread/resume", "turn/start"]) {
+      const next = runtime.normalize(method, original, "local");
+      assert.equal(next.model, "model-0");
+      assert.equal(next.collaborationMode.settings.model, "model-0");
+      assert.equal(next.effort, "high");
+      assert.equal(original.model, "cpx-a/model-0");
+      const unsupported = { model: "cpx-a/unsupported" };
+      assert.equal(runtime.normalize(method, unsupported, "local"), unsupported);
+      assert.equal(runtime.normalize(method, original, "ssh:test"), original);
+    }
+    const existing = { model: "unsupported" };
+    assert.equal(runtime.normalize("turn/start", existing, "local"), existing);
+    assert.equal(runtime.normalize("thread/resume", existing, "local"), existing);
+    const envelope = { hostId: "ssh:test", method: "turn/start", params: original };
+    assert.equal(runtime.normalize("send-cli-request-for-host", envelope, "local"), envelope);
+    const calls: unknown[] = [];
+    const owner = { permissionsHostId: "local", conversationId: "existing" };
+    const props = { ...original, reasoningEffort: "high",
+      models: [{ model: "model-0" }, { model: "model-1" }], onSelectModel: (...args: unknown[]) => calls.push(args) };
+    nodes.push({ __reactFiber$test: { memoizedProps: props,
+      return: { memoizedProps: owner } } });
+    runtime.syncDefault();
+    assert.equal(calls.length, 0, "existing composers are untouched");
+    assert.equal(runtime.syncSelection(), true, "an existing direct composer migrates the same model alias");
+    assert.deepEqual(calls, [["model-0", "high"]]);
+    assert.equal(runtime.syncSelection(), false, "pending migration is deduplicated");
+    props.model = "cpx-a/unsupported";
+    assert.equal(runtime.syncSelection(), false);
+    runtime.syncDefault();
+    assert.equal(calls.length, 1, "unsupported existing selection never falls back to the default");
+    props.model = "model-0";
+    assert.equal(runtime.syncSelection(), false, "bare selections stay unchanged");
+    props.model = "cpx-a/model-0";
+    owner.permissionsHostId = "ssh:test";
+    assert.equal(runtime.syncSelection(), false, "remote composers stay untouched");
+    owner.permissionsHostId = "local";
+    props.models = [{ model: "model-1" }];
+    assert.equal(runtime.syncSelection(), false, "wait until the picker contains the target model");
+    assert.equal(calls.length, 1);
+    if (!unlock) {
+      local.data = { data: [{ model: "native-only" }] };
+      runtime.refresh();
+      assert.deepEqual(local.data.data.map(m => m.model), ["native-only"], "request normalization must not enable native list filtering");
+    }
+  });
+}
+
+it("direct request preparation waits for current profile and revision with a bounded deadline", async () => {
+  const source = await readFile(CATALOG_URL, "utf8");
+  const start = source.indexOf("  async function prepareCodexPureApiModelCatalog(");
+  const end = source.indexOf("\n  }\n", start) + 5;
+  let profile = { id: "direct", relayMode: "pureApi" }, revision = "new", catalogOwner = "aggregate";
+  let pending: Promise<unknown> | null = null, reads = 0;
+  const timers = new Map<number, () => void>();
+  let timerId = 0;
+  const prepare = vm.runInNewContext(`(() => {
+    ${source.slice(start, end)}
+    return prepareCodexPureApiModelCatalog;
+  })()`, {
+    window: { setTimeout: (fn: () => void) => { timers.set(++timerId, fn); return timerId; },
+      clearTimeout: (id: number) => timers.delete(id) },
+    Date, Promise, codexAppServerPreparationTimeoutMs: 1000,
+    codexRemoteSessionActiveProfile: () => profile,
+    get codexModelCatalogRevision() { return revision; },
+    get codexModelCatalogPromise() { return pending; },
+    codexPureApiAllowedModelSet: () => catalogOwner === profile.id ? new Set(["sol"]) : null,
+    modelResponseHostId: (params: any) => params.hostId,
+    loadCodexModelCatalog: () => { reads++; return pending; },
+  });
+  const first = deferred<unknown>(); pending = first.promise;
+  let settled = false;
+  const request = prepare("thread/start", { model: "cpx-old/sol" }, "local").then((v: boolean) => { settled = true; return v; });
+  await Promise.resolve(); assert.equal(settled, false);
+  profile = { id: "newer", relayMode: "pureApi" }; revision = "newer";
+  const second = deferred<unknown>(); pending = second.promise;
+  first.resolve({});
+  for (let i = 0; i < 8; i++) await Promise.resolve();
+  assert.equal(settled, false, "profile change must await its own read");
+  catalogOwner = "newer"; pending = null; second.resolve({});
+  assert.equal(await request, true);
+  assert.equal(timers.size, 0);
+  pending = new Promise(() => {});
+  const timeout = prepare("turn/start", {}, "local");
+  for (const callback of [...timers.values()]) callback();
+  assert.equal(await timeout, false);
+  assert.equal(timers.size, 0);
+  assert.equal(await prepare("thread/start", {}, "ssh:test"), true);
+  assert.equal(await prepare("send-cli-request-for-host", { hostId: "ssh:test", method: "thread/start" }, "local"), true);
+  assert.equal(reads, 0, "reuse pending reads and never fetch for remote hosts");
+});
+
+for (const mode of ["instance", "prototype"]) {
+  it(`${mode} request and prewarm entries wait for catalog readiness before sending`, async () => {
+    const source = await readFile(CATALOG_URL, "utf8");
+    const marker = mode === "instance" ? "  function patchAppServerModelRequestClient(" : "    function installCodexAppServerClientPrototypePatch()";
+    const start = source.indexOf(marker);
+    const end = source.indexOf("\n  }\n", start) + 5;
+    const sent: any[] = [];
+    class Client {
+      hostId = "local";
+      async sendRequest(_method: string, params: any) { sent.push(params); return {}; }
+      async prewarmThreadStart(params: any) { sent.push(params); return {}; }
+    }
+    const client = new Client();
+    let gate = deferred<boolean>();
+    let ready = false;
+    const context = vm.createContext({
+      window: { __codexPlusAppServerClientClass: Client }, client,
+      codexAppServerModelRequestPatchVersion: "test",
+      codexPlusBackendSettingsLoaded: true,
+      codexPlusModelUnlockEnabled: () => false,
+      codexPluginMarketplacePatchEnabled: () => false,
+      codexPlusSettings: () => ({}),
+      codexRemoteSessionProviderPatchEnabled: () => true,
+      codexRemoteSessionProviderOverrideEnabled: () => false,
+      codexRemoteSessionProviderRequestMethod: () => true,
+      codexManagedSessionConnection: () => null,
+      codexPlusPluginNativeInterceptClient: () => null,
+      registerNativeHostClient() {}, sendCodexPlusDiagnostic() {},
+      appServerModelRequestMethod: (method: string) => method,
+      prepareCodexPureApiModelCatalog: async () => { const result = await gate.promise; ready = result; return result; },
+      normalizeCodexConfiguredModelRequest: (_method: string, params: any) => {
+        assert.equal(ready, true, "normalization must follow catalog preparation");
+        return { ...params, model: "sol" };
+      },
+      applyCodexRemoteSessionProviderOverride: (_method: string, params: any) => params,
+      prepareCodexManagedSessionConnection: async (_method: string, params: any) => params,
+      refreshCodexThreadModelBeforeTurn: async () => null,
+      sendCodexManagedSessionTurn: async () => null,
+      sendCodexRetainedModelRequest: (_client: any, send: any, method: string, params: any, options: any) => send(method, params, options),
+      noteCodexManagedSessionStart() {}, codexThreadModelRequestState: () => ({}),
+      prewarmCodexManagedSession: (_client: any, prewarm: any, params: any, options: any) => prewarm(params, options),
+    });
+    vm.runInContext(`${source.slice(start, end)}\n${mode === "instance" ? "patchAppServerModelRequestClient(client)" : "installCodexAppServerClientPrototypePatch()"}`, context);
+    const original = { model: "cpx-old/sol" };
+    const request = client.sendRequest("thread/start", original);
+    await Promise.resolve(); assert.equal(sent.length, 0);
+    gate.resolve(true); await request;
+    assert.equal(sent[0].model, "sol");
+    ready = false; gate = deferred<boolean>();
+    const prewarm = client.prewarmThreadStart(original);
+    await Promise.resolve(); assert.equal(sent.length, 1);
+    gate.resolve(true); await prewarm;
+    assert.equal(sent[1].model, "sol");
+    assert.equal(original.model, "cpx-old/sol");
+  });
+}
+
 it("new local composers replace an unlisted native default with a named configured model, while existing sessions stay intact", async () => {
   const { runtime, catalog, nodes } = await aggregateQueryRuntime();
   const current = catalog("b");

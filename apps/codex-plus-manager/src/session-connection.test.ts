@@ -280,7 +280,8 @@ describe("managed aggregate session connection", () => {
       catalog.indexOf("  // issue #2177"));
     const prototypePatch = catalog.slice(catalog.indexOf("    function installCodexAppServerClientPrototypePatch()"),
       catalog.indexOf("  const appServerModelRequestPatchMaxMisses"));
-    for (const mode of ["instance", "prototype", "envelope"]) {
+    for (const [previousVersion, mode] of ["16", "26", "27"].flatMap(previous =>
+      ["instance", "prototype", "envelope"].map(mode => [previous, mode]))) {
       const calls: string[] = [];
       let allowContextResume = false;
       let rejectContextResume = false;
@@ -338,6 +339,7 @@ describe("managed aggregate session connection", () => {
         sendCodexRetainedModelRequest: (_client: unknown, send: Function, method: string, params: unknown, options: unknown) =>
           send(method, params, options),
         normalizeCodexConfiguredModelRequest: (_method: string, params: any) => params,
+        prepareCodexPureApiModelCatalog: async () => true,
         loadBackendSettingsState: async () => { calls.push("settings/get"); return true; },
         codexAppServerPreparationTimeoutMs: 1500,
         sendCodexPlusDiagnostic() {}, codexPlusModelUnlockEnabled: () => false,
