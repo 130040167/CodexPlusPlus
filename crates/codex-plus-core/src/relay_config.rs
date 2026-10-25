@@ -5075,6 +5075,21 @@ pub fn relay_profile_model(profile: &RelayProfile) -> String {
         .unwrap_or_default()
 }
 
+/// 「测试供应商」与 Provider Doctor 使用的模型：供应商配置的默认模型 → 模型列表第一项 → 内置兜底。
+/// 不再读取单独的测试模型设置，避免测的模型和实际使用的模型不一致。
+pub fn relay_profile_test_model(profile: &RelayProfile) -> String {
+    let model = relay_profile_model(profile);
+    if !model.is_empty() {
+        return model;
+    }
+    profile
+        .model_list
+        .lines()
+        .map(|line| line.split('[').next().unwrap_or_default())
+        .find_map(sanitize_relay_model_name)
+        .unwrap_or_else(crate::settings::default_relay_test_model)
+}
+
 pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
     if profile.relay_mode == crate::settings::RelayMode::Aggregate {
         return crate::protocol_proxy::local_responses_proxy_base_url(

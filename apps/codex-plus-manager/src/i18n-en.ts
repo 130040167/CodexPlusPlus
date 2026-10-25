@@ -93,7 +93,7 @@ export const EN_PLAIN: Record<string, string> = {
   "恢复默认路径": "Restore default path",
   "打开 Codex 设置": "Open Codex settings",
   "Codex 专属设置": "Codex-only settings",
-  "供应商测试模型、图片覆盖层、启动参数等只作用于 Codex 的选项，在 Codex 菜单的「设置」里。": "Options that only affect Codex — provider test model, image overlay, launch arguments — live under Settings in the Codex menu.",
+  "图片覆盖层、启动参数等只作用于 Codex 的选项，在 Codex 菜单的「设置」里。": "Options that only affect Codex — image overlay, launch arguments — live under Settings in the Codex menu.",
   "全选项目": "Select entire project",
   "读取中…": "Loading…",
   "使用 Claude Code 当前登录的账号，不设置地址与 Key": "Uses the account signed in to Claude Code; no address or key is set",
@@ -697,7 +697,6 @@ export const EN_PLAIN: Record<string, string> = {
   "供应商切换中": "Switching provider",
   "供应商列表": "Provider list",
   "供应商测试": "Provider test",
-  "供应商测试模型": "Provider test model",
   "供应商配置": "Provider configuration",
   "工具切换": "Tool switcher",
   "工具列表": "Tool list",
@@ -730,10 +729,6 @@ export const EN_PLAIN: Record<string, string> = {
   "上一条": "Previous recommendation",
   "下一条": "Next recommendation",
   "赞助商轮播": "Sponsor carousel",
-  "Codex 供应商设置": "Codex provider settings",
-  "只作用于 Codex 供应商的配置": "Applies only to Codex providers",
-  "「测试供应商」按钮用这个模型发起一次真实请求，用于判断 Key 与端点是否可用。":
-    "The Test provider button sends one real request with this model to check that the key and endpoint work.",
   "Codex 图片覆盖层": "Codex image overlay",
   "在当前 Codex 会话上叠加一张背景图": "Overlay a background image on the current Codex session",
   "请求避震": "Request shock absorption",
@@ -1039,8 +1034,8 @@ export const EN_PLAIN: Record<string, string> = {
   "官方登录 + API 供应商在官方订阅额度耗尽后仍可发送；只改客户端发送状态，不改变真实用量与计费。重启 Codex 后生效。": "Official login + API providers can still send after the official subscription quota runs out. Only the client send state changes; real usage and billing are untouched. Restart Codex to apply.",
   "启用供应商配置切换": "Enable provider configuration switching",
   "启用此扩展项": "Enable this entry",
-  "包含测试模型、上下文大小与压缩阈值；留空即沿用全局默认值。":
-    "Covers the test model, context size and compaction threshold; leave blank to keep the global defaults.",
+  "包含上下文大小与压缩阈值；留空即沿用全局默认值。":
+    "Covers context size and compaction threshold; leave blank to keep the global defaults.",
   "官方登录之外再挂一份 API Key，用于额度耗尽时兜底。":
     "Keep an extra API key alongside the official login as a fallback when the quota runs out.",
   "图片": "Image",
@@ -1288,7 +1283,6 @@ export const EN_PLAIN: Record<string, string> = {
   "每行一个模型；上下文窗口可填": "One model per line; the context window can be",
   "没有匹配「": "No providers matching “",
   "浅色": "Light",
-  "测试模型": "Test model",
   "消息": "Message",
   "深色": "Dark",
   "混入 API": "Mixed-in API",
@@ -1949,7 +1943,6 @@ export const EN_TEMPLATE: Record<string, string> = {
     "Found {0} candidate record(s) that exist only in session_index.jsonl and have no source in the local databases or rollout files. They may still represent cloud-only or not-yet-persisted tasks, so review each item. Titles are shown only for preview; cleanup is decided by thread ID and data sources. Fully exit Codex App / ChatGPT before cleanup.",
   "确认清理 {0} 条": "Confirm cleanup of {0}",
   "清单更新时间：{0}": "Manifest updated at: {0}",
-  "留空使用默认：{0}": "Leave empty to use the default: {0}",
   "聚合供应商 {0}": "Aggregate provider {0}",
   "聚合供应商已配置为{0}，包含 {1} 个成员；真实对话会走本地代理轮转。":
     "The aggregate provider is configured as {0} with {1} member(s); real conversations rotate through the local proxy.",

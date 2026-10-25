@@ -7773,20 +7773,7 @@ pub async fn test_relay_profile(profile: RelayProfile) -> CommandResult<RelayPro
     } else {
         profile.name.trim()
     };
-    let settings = SettingsStore::default().load().unwrap_or_default();
-    let test_model: String = if !profile.test_model.trim().is_empty() {
-        // 1. 使用者在該供應商明確填的測試模型
-        profile.test_model.trim().to_string()
-    } else {
-        // 2. 該供應商自己 config.toml 裡的 model（避免串味）
-        let from_profile = codex_plus_core::relay_config::relay_profile_model(&profile);
-        if from_profile.trim().is_empty() {
-            // 3. 最後才用全域預設
-            settings.relay_test_model.trim().to_string()
-        } else {
-            from_profile
-        }
-    };
+    let test_model = codex_plus_core::relay_config::relay_profile_test_model(&profile);
     match codex_plus_core::relay_config::test_relay_profile(&profile, &test_model).await {
         Ok(result) => {
             let status = if !result.protocol_valid { "failed" }
@@ -7974,17 +7961,7 @@ pub async fn diagnose_relay_profile(profile: RelayProfile) -> CommandResult<Prov
     } else {
         profile.name.trim().to_string()
     };
-    let settings = SettingsStore::default().load().unwrap_or_default();
-    let test_model = if !profile.test_model.trim().is_empty() {
-        profile.test_model.trim().to_string()
-    } else {
-        let from_profile = codex_plus_core::relay_config::relay_profile_model(&profile);
-        if from_profile.trim().is_empty() {
-            settings.relay_test_model.trim().to_string()
-        } else {
-            from_profile
-        }
-    };
+    let test_model = codex_plus_core::relay_config::relay_profile_test_model(&profile);
     let mut checks = Vec::new();
 
     if profile.relay_mode == codex_plus_core::settings::RelayMode::Official

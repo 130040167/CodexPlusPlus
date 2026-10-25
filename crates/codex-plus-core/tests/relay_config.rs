@@ -12,6 +12,7 @@ use codex_plus_core::relay_config::{
     extract_common_config_from_config, list_context_entries_from_common_config,
     merge_common_config_into_config, normalize_relay_profile_for_storage,
     prepare_common_config_for_apply, relay_config_status_from_home, relay_profile_api_key,
+    relay_profile_test_model,
     sanitize_common_config_contents, set_codex_goals_feature_in_home,
     strip_common_config_from_config, sync_live_config_context_entries,
     upsert_context_entry_in_common_config,
@@ -7333,4 +7334,29 @@ consolidation_model = "gpt-5.4"
     assert_eq!(doc["memories"]["extract_model"].as_str(), Some("gpt-5.4-mini"));
     assert_eq!(doc["memories"]["consolidation_model"].as_str(), Some("gpt-5.4"));
     assert_eq!(doc["model"].as_str(), Some("glm-5.2"));
+}
+
+#[test]
+fn provider_test_uses_the_profile_default_model() {
+    // 旧配置里残留的测试模型不再生效：测的就是供应商实际使用的默认模型。
+    let profile = RelayProfile {
+        model: "deepseek-v4-pro".into(),
+        test_model: "legacy-test-model".into(),
+        model_list: "glm-5.3[200K]".into(),
+        ..RelayProfile::default()
+    };
+    assert_eq!(relay_profile_test_model(&profile), "deepseek-v4-pro");
+
+    // 没配默认模型时取模型列表第一项（去掉窗口后缀）。
+    let profile = RelayProfile {
+        model_list: "\nglm-5.3[200K]\nkimi-k3".into(),
+        ..RelayProfile::default()
+    };
+    assert_eq!(relay_profile_test_model(&profile), "glm-5.3");
+
+    // 都没有时才用内置兜底。
+    assert_eq!(
+        relay_profile_test_model(&RelayProfile::default()),
+        codex_plus_core::settings::default_relay_test_model()
+    );
 }

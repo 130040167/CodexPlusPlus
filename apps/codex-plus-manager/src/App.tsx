@@ -1228,7 +1228,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "maintenance", get label() { return t("安装维护"); }, icon: Wrench, tool: "codex" },
   { id: "about", get label() { return t("关于"); }, icon: Info },
   { id: "settings", get label() { return t("整体设置"); }, icon: Settings },
-  // Agent 专属设置：目前只有 Codex 有专属选项（供应商测试模型、图片覆盖层、启动参数）。
+  // Agent 专属设置：目前只有 Codex 有专属选项（图片覆盖层、启动参数）。
   // Claude / Grok 没有独立设置项，原来那页只有一个跳回各自主页的按钮，所以不再给它们显示。
   { id: "agentSettings", get label() { return t("设置"); }, icon: Settings, tool: "codex" },
   { id: "relayEnvironment", get label() { return t("代理设置"); }, icon: ShieldCheck, tool: "codex" },
@@ -9687,7 +9687,7 @@ function AboutScreen({
 /// Agent 专属设置页。
 ///
 /// 入口在侧栏各 Agent 自己的菜单里，只放跟随该 Agent 的选项：
-/// - **Codex**：供应商测试模型、图片覆盖层、额外启动参数
+/// - **Codex**：图片覆盖层、额外启动参数
 /// - **Grok / Claude**：供应商与模型在各自页面里管理，这里给出跳转
 ///
 /// 应用级选项（主题、配置备份、配置文件路径）在最左侧齿轮的「设置」里，
@@ -9706,22 +9706,6 @@ function AgentSettingsScreen({
   return (
     <div className="settings-page">
       <>
-        <Panel>
-          <CardHead title={t("Codex 供应商设置")} detail={t("只作用于 Codex 供应商的配置")} />
-          <CardContent className="settings-content setting-rows">
-            <SettingRow
-              title={t("供应商测试模型")}
-              description={t("「测试供应商」按钮用这个模型发起一次真实请求，用于判断 Key 与端点是否可用。")}
-            >
-              <Input
-                value={form.relayTestModel}
-                onChange={(event) => onFormChange({ ...form, relayTestModel: event.currentTarget.value })}
-                placeholder={t("例如 gpt-5.4-mini")}
-              />
-            </SettingRow>
-          </CardContent>
-        </Panel>
-
         <Panel>
           <SwitchPanelHead
             checked={form.codexAppImageOverlayEnabled}
@@ -9879,7 +9863,7 @@ function GlobalSettingsScreen({
           <div className="global-setting-row">
             <div className="global-setting-copy">
               <strong>{t("Codex 专属设置")}</strong>
-              <span>{t("供应商测试模型、图片覆盖层、启动参数等只作用于 Codex 的选项，在 Codex 菜单的「设置」里。")}</span>
+              <span>{t("图片覆盖层、启动参数等只作用于 Codex 的选项，在 Codex 菜单的「设置」里。")}</span>
             </div>
             <div className="global-setting-actions">
               <Button variant="secondary" onClick={onOpenAgentSettings}>{t("打开 Codex 设置")}</Button>
@@ -12347,16 +12331,9 @@ function RelayProfileEditor({
       <div className="relay-bottom-options">
         <RelayFold className="relay-advanced-block" defaultOpen sectionId="advanced" title={t("更多选项")}>
           <p className="relay-fold-description">
-            {t("包含测试模型、上下文大小与压缩阈值；留空即沿用全局默认值。")}
+            {t("包含上下文大小与压缩阈值；留空即沿用全局默认值。")}
           </p>
           <div className="relay-advanced-fields">
-            <Field className="relay-field-test-model" label={t("测试模型")}>
-              <Input
-                value={profile.testModel}
-                onChange={(event) => updateDraft({ testModel: event.currentTarget.value })}
-                placeholder={tf("留空使用默认：{0}", [form.relayTestModel || defaultSettings.relayTestModel])}
-              />
-            </Field>
             <Field className="relay-field-context-window" label={t("上下文大小")}>
               <Input
                 inputMode="numeric"
@@ -12683,13 +12660,6 @@ function AggregateRelayProfileEditor({
             placeholder={t("例如 主力聚合池")}
           />
         </Field>
-        {!modelMode ? <Field className="relay-field-test-model" label={t("测试模型")}>
-          <Input
-            value={profile.testModel}
-            onChange={(event) => onProfileChange({ ...profile, testModel: event.currentTarget.value })}
-            placeholder={tf("留空使用默认：{0}", [form.relayTestModel || defaultSettings.relayTestModel])}
-          />
-        </Field> : null}
         {!modelMode ? (
           <Field className="aggregate-strategy-field" label={t("聚合策略")}>
             <AppSelect

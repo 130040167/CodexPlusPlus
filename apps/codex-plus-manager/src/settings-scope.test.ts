@@ -27,9 +27,11 @@ test("整体设置只放应用级选项，Agent 设置承担工具级选项", ()
     assert.ok(!agent.includes(action), `Agent 设置不应包含 ${action}`);
   }
 
-  for (const copy of ["Codex 供应商设置", "Codex 图片覆盖层", "Codex 启动参数"]) {
+  for (const copy of ["Codex 图片覆盖层", "Codex 启动参数"]) {
     assert.ok(agent.includes(`t("${copy}")`), `Agent 设置应包含 ${copy}`);
   }
+  // 测试模型已删除：「测试供应商」直接用供应商自己的默认模型。
+  assert.doesNotMatch(agent, /供应商测试模型|relayTestModel/);
 });
 
 test("Agent 设置挂在各 Agent 的侧栏菜单，整体设置留在最左栏", () => {
