@@ -6286,6 +6286,8 @@ function RelayScreen({
   const [detailProfileId, setDetailProfileId] = useState<string | null>(null);
   const [newProfileDraft, setNewProfileDraft] = useState<RelayProfile | null>(null);
   const [providerCatalogOpen, setProviderCatalogOpen] = useState(false);
+  // 目录页的搜索词放在这里：从模板进入编辑页再返回时，目录页会重新挂载，搜索不能丢。
+  const [providerCatalogQuery, setProviderCatalogQuery] = useState("");
   const [providerView, setProviderView] = useState<ProviderViewKind>("direct");
   const [newAggregateMode, setNewAggregateMode] = useState<AggregateMode | null>(null);
   const [thirdPartyImportOpen, setThirdPartyImportOpen] = useState(false);
@@ -6437,16 +6439,20 @@ function RelayScreen({
         form={normalized}
         isNew={isNewProfile}
         initialAggregateMode={isNewProfile ? newAggregateMode : null}
+        // 从目录页选模板进来时目录页状态还开着：返回只清掉草稿，回到目录页继续挑。
         onBack={() => {
           setNewProfileDraft(null);
           setNewAggregateMode(null);
           setDetailProfileId(null);
         }}
         onFormChange={saveRelaySettings}
+        // 保存后回到供应商列表，目录页一并关掉。
         onSaved={() => {
           setNewProfileDraft(null);
           setNewAggregateMode(null);
           setDetailProfileId(null);
+          setProviderCatalogOpen(false);
+          setProviderCatalogQuery("");
         }}
         actions={actions}
       />
@@ -6457,11 +6463,16 @@ function RelayScreen({
     return (
       <ProviderCatalogScreen
         form={normalized}
-        onBack={() => setProviderCatalogOpen(false)}
+        query={providerCatalogQuery}
+        onQueryChange={setProviderCatalogQuery}
+        onBack={() => {
+          setProviderCatalogOpen(false);
+          setProviderCatalogQuery("");
+        }}
+        // 不关目录页：编辑页优先渲染，从编辑页返回时回到这里而不是供应商列表。
         onSelect={(profile) => {
           setNewProfileDraft(profile);
           setNewAggregateMode(null);
-          setProviderCatalogOpen(false);
         }}
       />
     );
@@ -6832,14 +6843,17 @@ function CodexMultiLaunchScreen({
 
 function ProviderCatalogScreen({
   form,
+  query,
+  onQueryChange: setQuery,
   onBack,
   onSelect,
 }: {
   form: BackendSettings;
+  query: string;
+  onQueryChange: (value: string) => void;
   onBack: () => void;
   onSelect: (profile: RelayProfile) => void;
 }) {
-  const [query, setQuery] = useState("");
   const categories: Array<{ id: ProviderPreset["category"]; label: string }> = [
     { id: "official", label: t("账号登录") },
     { id: "cn_official", label: t("模型厂商") },
