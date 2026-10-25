@@ -988,6 +988,9 @@ export const EN_PLAIN: Record<string, string> = {
   "启动 Codex": "Launch Codex",
   "启动任务": "Launch task",
   "启动前自动修复历史会话": "Auto-repair historical sessions before launch",
+  "纯 API 模式禁用 Work 视图": "Disable Work view in Pure API mode",
+  "Work 视图要求 ChatGPT 账号身份，纯 API Key 下发送消息会报 Work browser access requires an authenticated account。开启后每次启动 Codex 前把详情模式写回 Codex；保存并重新启动 Codex 生效。":
+    "Work view requires a ChatGPT account identity; with a Pure API key, sending a message fails with \"Work browser access requires an authenticated account\". When enabled, the detail mode is switched back to Codex before each launch. Save and restart Codex to apply.",
   "自动审批模型": "Auto-review model",
   "留空则原样转发 codex-auto-review": "Leave empty to forward codex-auto-review unchanged",
   "切换模型后旧会话跟随新默认": "Existing sessions follow the new default model",
