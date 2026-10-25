@@ -42,6 +42,17 @@ fn child_lifetime_matches(parent_birth: u64, parent_exit: u64, child_birth: u64)
     child_birth >= parent_birth && (parent_exit == 0 || child_birth <= parent_exit)
 }
 
+fn child_identity_matches(
+    expected_parent: u32,
+    actual_parent: u32,
+    parent_birth: u64,
+    parent_exit: u64,
+    child_birth: u64,
+) -> bool {
+    expected_parent == actual_parent
+        && child_lifetime_matches(parent_birth, parent_exit, child_birth)
+}
+
 impl VerifiedStopTree {
     pub(crate) fn capture(root: VerifiedStopProcess) -> anyhow::Result<Self> {
         let mut tree = Self {
@@ -60,7 +71,6 @@ impl VerifiedStopTree {
             let parent = &self.processes[index];
             let parent_pid = parent.process_id;
             let parent_birth = parent.birth_id;
-            let parent_exit = parent.exit_time()?;
             for child in snapshot
                 .iter()
                 .filter(|p| p.parent_process_id == parent_pid)
@@ -94,7 +104,16 @@ impl VerifiedStopTree {
                         Err(error) => return Err(error),
                     };
                 let Some(captured) = captured else { continue };
-                if !child_lifetime_matches(parent_birth, parent_exit, captured.birth_id) {
+                let actual_parent = crate::windows_integration::process_parent_id_from_handle(
+                    HANDLE(captured.handle.as_raw_handle()),
+                )?;
+                if !child_identity_matches(
+                    parent_pid,
+                    actual_parent,
+                    parent_birth,
+                    self.processes[index].exit_time()?,
+                    captured.birth_id,
+                ) {
                     continue;
                 }
                 anyhow::ensure!(
@@ -126,7 +145,11 @@ impl VerifiedStopTree {
         }
         // 先固定所有当前后代，再停止主进程，阻止它继续派生后台任务。
         self.refresh()?;
-        if self.processes.iter().any(|process| process.is_alive().unwrap_or(true)) {
+        if self
+            .processes
+            .iter()
+            .any(|process| process.is_alive().unwrap_or(true))
+        {
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "launcher.verified_tree_stop_fallback",
                 serde_json::json!({
@@ -165,6 +188,7 @@ mod tests {
         assert!(child_lifetime_matches(100, 0, 250));
         assert!(!child_lifetime_matches(100, 200, 250));
         assert!(!child_lifetime_matches(100, 0, 50));
+        assert!(!child_identity_matches(1, 2, 100, 0, 150));
     }
 
     #[test]

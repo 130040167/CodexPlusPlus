@@ -2276,7 +2276,12 @@ pub fn run_codex_multi_worker(options_path: &Path) -> anyhow::Result<()> {
         if multi_worker_handoff_requested(root, &handoff) {
             break;
         }
-        process_tree.refresh()?;
+        if let Err(error) = process_tree.refresh() {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.multi_worker_tree_refresh_retry",
+                json!({ "instance_id": identity.instance_id, "message": error.to_string() }),
+            );
+        }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
     if codex_plus_core::multi_worker::codex_instance_process_exited(&identity) {

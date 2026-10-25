@@ -753,6 +753,22 @@ fn query_peb_base_address(handle: HANDLE) -> Option<usize> {
         .then_some(information.peb_base_address as usize)
 }
 
+/// 直接读取所持句柄的父 PID，避免将快照中的旧关系套到复用后的进程。
+#[cfg(windows)]
+pub(crate) fn process_parent_id_from_handle(handle: HANDLE) -> anyhow::Result<u32> {
+    let mut information: ProcessBasicInformation = unsafe { std::mem::zeroed() };
+    let mut returned = 0_u32;
+    let status = unsafe {
+        NtQueryInformationProcess(
+            handle, PROCESS_BASIC_INFORMATION_CLASS,
+            (&mut information as *mut ProcessBasicInformation).cast(),
+            std::mem::size_of::<ProcessBasicInformation>() as u32, &mut returned,
+        )
+    };
+    anyhow::ensure!(status >= 0, "无法核验子进程句柄的父进程：{status:#x}");
+    Ok(u32::try_from(information.inherited_from_unique_process_id)?)
+}
+
 /// 32 位（WOW64）目标进程的 PEB 地址；不是 WOW64 进程时返回 `None`。
 #[cfg(windows)]
 fn query_wow64_peb_address(handle: HANDLE) -> Option<usize> {
