@@ -193,6 +193,9 @@ test("durable deletion survives row replacement and only hides the local host", 
   f.rows[0] = row(uuid, "local");
   f.context.applyDeletedLocalSessions();
   assert.equal(f.rows[0].getAttribute("data-codex-plus-deleted-local"), "true");
+  f.rows[0] = row(`local:${uuid}`, "local");
+  f.context.applyDeletedLocalSessions();
+  assert.equal(f.rows[0].getAttribute("data-codex-plus-deleted-local"), "true");
   f.rows[0].setAttribute("data-app-action-sidebar-thread-host-id", "ssh:fixture");
   f.context.applyDeletedLocalSessions();
   assert.equal(f.rows[0].getAttribute("data-codex-plus-deleted-local"), null);
@@ -300,12 +303,62 @@ test("route identity must match rather than merely sharing the same pathname", (
   assert.equal(f.context.isCurrentSessionRow(f.rows[0], f.context.sessionRefFromRow(f.rows[0])), false);
 });
 
-test("missing or ambiguous native new-chat affordances never trigger a reload", async () => {
+test("native new-chat affordances never trigger a reload", async () => {
   for (const ambiguous of [false, true]) {
     const f = deleteFixture();
-    if (ambiguous) { const duplicate = new Element({ "aria-label": "New chat" }); duplicate.parentElement = new Element(); f.buttons.push(duplicate); }
+    const duplicate = new Element({ "aria-label": "New chat" }); duplicate.parentElement = new Element();
+    if (ambiguous) f.buttons.push(duplicate);
     else f.native.visible = false;
     await f.begin(); await f.finish();
-    assert.equal(f.native.clicks, 0); assert.equal(f.timers.length, 0); assert.equal(f.reloads(), 0);
+    // 不可见但唯一时照常跳转（#2671）；真正有歧义时不点。两种情况都不能整页刷新。
+    assert.equal(f.native.clicks, ambiguous ? 0 : 1);
+    assert.equal(duplicate.clicks, 0);
+    assert.equal(f.timers.length, 0); assert.equal(f.reloads(), 0);
   }
+});
+
+test("hide rules follow the thread uuid across id spellings (#2671)", async () => {
+  const f = deleteFixture();
+  f.rows[0].setAttribute("data-app-action-sidebar-thread-id", `local:${uuid}`);
+  await f.begin(); await f.finish();
+  for (const id of [uuid, `local:${uuid}`]) {
+    f.rows[0] = row(id, "local");
+    f.context.applyDeletedLocalSessions();
+    assert.equal(f.rows[0].getAttribute("data-codex-plus-deleted-local"), "true", id);
+    f.rows[0].setAttribute("data-app-action-sidebar-thread-host-id", "ssh:fixture");
+    f.context.applyDeletedLocalSessions();
+    assert.equal(f.rows[0].getAttribute("data-codex-plus-deleted-local"), null, id);
+  }
+  f.rows[0] = row(`local:local:${uuid}`, "local");
+  f.context.applyDeletedLocalSessions();
+  assert.equal(f.rows[0].getAttribute("data-codex-plus-deleted-local"), null);
+  f.rows[0] = row("opaque-thread-key", "local");
+  f.context.applyDeletedLocalSessions();
+  assert.equal(f.rows[0].getAttribute("data-codex-plus-deleted-local"), null);
+  f.context.postJson = async () => ({ status: "ok", thread_ids: [] });
+  await f.context.refreshDeletedLocalSessions();
+  f.rows[0] = row(uuid, "local");
+  f.context.applyDeletedLocalSessions();
+  assert.equal(f.rows[0].getAttribute("data-codex-plus-deleted-local"), null);
+});
+
+test("deletion still navigates when the new chat button is not visible (#2671)", async () => {
+  const f = deleteFixture();
+  f.native.visible = false;
+  await f.begin(); await f.finish();
+  assert.equal(f.native.clicks, 1, "侧栏折叠时也要能跳到新会话");
+  assert.doesNotMatch(f.toasts.join(" "), /请点击新聊天/, "跳转成功就不再提示手动点击");
+  assert.ok(f.diagnostics.some((entry: any) => entry.event === "delete_session_new_chat_fallback"));
+});
+
+test("ambiguous invisible new chat candidates are not clicked (#2671)", async () => {
+  const f = deleteFixture();
+  f.native.visible = false;
+  const twin = new Element({ "aria-label": "新聊天" });
+  twin.parentElement = new Element();
+  twin.visible = false;
+  f.buttons.push(twin);
+  await f.begin(); await f.finish();
+  assert.equal(f.native.clicks + twin.clicks, 0, "多个不可见候选无法判定，不能乱点");
+  assert.match(f.toasts.join(" "), /新聊天/);
 });

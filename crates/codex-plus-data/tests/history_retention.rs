@@ -215,6 +215,10 @@ fn soft_deleted_job_assignment_undo_is_idempotent_but_rejects_changes() {
             f.undo(&token);
         } else {
             assert_eq!(result.status, DeleteStatus::Failed, "{}", result.message);
+            assert!(result.message.contains("agent_job_items"), "{}", result.message);
+            assert!(!f.visible("a"));
+            let repeated = f.adapter().undo(&token);
+            assert_eq!(repeated.status, DeleteStatus::Failed, "{}", repeated.message);
             assert!(!f.visible("a"));
         }
         let deleted: i64 = db

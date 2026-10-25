@@ -424,7 +424,7 @@
   const codexPlusWindowZoomVar = "--codex-window-zoom";
   const codexDeleteVersion = "7";
   const codexExportVersion = "1";
-  const codexActionGroupVersion = "6";
+  const codexActionGroupVersion = "7";
   const codexArchiveRowActionsVersion = "1";
   const codexArchiveDeleteAllVersion = "2";
   const codexConversationViewVersion = "1";
@@ -6024,6 +6024,7 @@
       globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
         enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
         codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
+        nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
       });
     } catch (_) {
       return false;
@@ -6164,6 +6165,7 @@
         globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
           enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
           codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
+          nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
         });
         globalThis.__CODEX_PLUS_ACTIVITY_OVERLAY_SYNC__?.();
       }
@@ -6771,12 +6773,22 @@
     return Number.isFinite(expiresAt) && expiresAt < Date.now();
   }
 
+  /**
+   * 广告落地页只认 http(s)。
+   *
+   * 清单来自远程，`javascript:` 之类的 scheme 一旦写进 `<a href>`，点击就会在
+   * Codex 渲染进程里执行脚本；`escapeHtml` 只挡得住标签，挡不住 scheme。
+   */
+  function isCodexPlusAdWebUrl(value) {
+    return /^https?:\/\/[^\s/]/i.test(String(value || "").trim());
+  }
+
   function normalizeCodexPlusAds(payload) {
     if (!payload || !Array.isArray(payload.ads)) return [];
     // 只留赞助商推荐。上游清单里的 normal 条目不属于合作伙伴分组，
     // 放进来只会让「有数据但渲染不出东西」的状态变得难以判断。
     return payload.ads.filter((ad) => {
-      return ad && ad.type === "sponsor" && ad.title && ad.description && ad.url && !isCodexPlusAdExpired(ad);
+      return ad && ad.type === "sponsor" && ad.title && ad.description && isCodexPlusAdWebUrl(ad.url) && !isCodexPlusAdExpired(ad);
     }).map((ad) => ({
       id: String(ad.id || ad.title),
       type: ad.type,
@@ -7625,9 +7637,11 @@
       // Discord / Telegram / Issues 按钮也一律走 window.open）。
       const adCard = target?.closest("[data-codex-plus-ad-url]");
       if (adCard) {
+        // 无论 URL 合不合法都先掐掉 <a> 的默认行为：留下它，非 http(s) 的
+        // scheme 就会走原生跳转，而不是被下面这层挡掉。
+        event.preventDefault();
         const adUrl = adCard.getAttribute("data-codex-plus-ad-url") || "";
-        if (/^https?:\/\//i.test(adUrl)) {
-          event.preventDefault();
+        if (isCodexPlusAdWebUrl(adUrl)) {
           window.open(adUrl, "_blank", "noopener,noreferrer");
         }
         return;
@@ -12295,6 +12309,16 @@
     return codexPlusModelPickerNormalizeStrict(value).replace(/^gpt-/u, "");
   }
 
+  /** 宽松归一化：忽略大小写、`gpt-` 前缀、空白以及 `-`/`_` 等分隔符。
+   * 目录里的 slug 是 `deepseek-flash`，原生行文本是 `DeepSeek Flash`，
+   * 先用严格归一化会漏掉这些别名，行就退化成 legacy 分组，同一家被切成好几段。 */
+  function codexPlusModelPickerNormalizeLoose(value) {
+    return String(value || "")
+      .toLowerCase()
+      .replace(/^gpt[\s_-]*/u, "")
+      .replace(/[^\p{L}\p{N}]+/gu, "");
+  }
+
   /**
    * 目录里的键和选择器里的名字不一定逐字相同。
    *
@@ -12361,6 +12385,44 @@
   }
 
   /**
+   * 目录里每一行“完整展示名 -> 权威归属”的精确索引。
+   *
+   * 行的原生文本就是目录的 `displayName`（带 `（供应商）` 后缀）。拿完整文本
+   * 匹配才能区分“多个成员都发布了同名上游模型”（例如三家都有
+   * `DeepSeek-V4-Pro`）的情况；只按裸模型名匹配会命中目录里第一个同名成员，
+   * 把另外两家的行并进错误的组。
+   */
+  function codexPlusModelPickerCatalogExactMap() {
+    const map = new Map();
+    const modelMetadata = codexModelCatalog?.modelMetadata || codexModelCatalog?.model_metadata;
+    if (!modelMetadata || typeof modelMetadata !== "object") return map;
+    const register = (entry) => {
+      if (!entry || typeof entry !== "object") return;
+      const displayName = entry.displayName || entry.display_name;
+      if (typeof displayName !== "string" || !displayName) return;
+      const provider = providerNameOf(entry);
+      const groupId =
+        typeof entry.codex_plus_group_id === "string" ? entry.codex_plus_group_id.trim() : "";
+      if (!provider || !groupId) return;
+      const value = { provider, groupId };
+      const fullKey = codexPlusModelPickerNormalizeLoose(displayName);
+      if (fullKey && !map.has(fullKey)) map.set(fullKey, value);
+      const split = codexPlusModelPickerSplitLabel(displayName);
+      if (split.name && split.provider) {
+        const pairKey = `${codexPlusModelPickerNormalizeLoose(split.name)}\u0000${codexPlusModelPickerNormalizeLoose(split.provider)}`;
+        if (!map.has(pairKey)) map.set(pairKey, value);
+      }
+    };
+    const slugList = Array.isArray(codexModelCatalog?.models)
+      ? codexModelCatalog.models.filter((slug) => typeof slug === "string" && slug)
+      : [];
+    const bySlug = new Map(Object.entries(modelMetadata));
+    for (const slug of slugList) register(bySlug.get(slug));
+    for (const entry of Object.values(modelMetadata)) register(entry);
+    return map;
+  }
+
+  /**
    * 一行的可分组身份。
    *
    * 原生结构（实测 2026-10 Codex 桌面版）：
@@ -12407,6 +12469,8 @@
    */
   function codexPlusModelPickerRows(list) {
     const providers = codexPlusModelPickerCatalogProviderMap();
+    const exact = codexPlusModelPickerCatalogExactMap();
+    const defaultGroupId = codexPlusModelPickerDefaultGroupId();
     const rows = [];
     const items = list.querySelectorAll('[role="menuitemradio"]');
     items.forEach((row) => {
@@ -12414,16 +12478,25 @@
       if (!identity?.groupable) return;
       const split = codexPlusModelPickerSplitLabel(identity.text);
       if (split.provider) codexPlusModelPickerRememberProvider(split.name, split.provider, true);
-      // 分组键：只信"行上有后缀"和"目录里的权威分组 id"这两个来源。
-      // 早期版本拿目录展示名去拟合行文本，别名一多就把模型分到了错的组（同一家被切成
-      // 好几段），所以目录查询只用来补 **分组 id**，不用来决定显示成哪一组。
-      const known = providers.get(codexPlusModelPickerNormalizeStrict(split.name))
-        || providers.get(codexPlusModelPickerNormalize(split.name));
+      // 分组键：优先用「完整展示名」或「模型名 + 后缀供应商」做精确匹配。
+      // 有后缀的行成员归属由后缀决定，不能再拿裸模型名去查目录——三家都发布
+      // `DeepSeek-V4-Pro` 时，裸名别名只会命中目录里第一个成员，把别人的
+      // 模型并进错误的组（同一家被切成好几段 / 同名分组出现多次）。
+      const pairKey = split.provider
+        ? `${codexPlusModelPickerNormalizeLoose(split.name)}\u0000${codexPlusModelPickerNormalizeLoose(split.provider)}`
+        : "";
+      const known = exact.get(codexPlusModelPickerNormalizeLoose(identity.text))
+        || (pairKey ? exact.get(pairKey) : null)
+        || (!split.provider
+          ? providers.get(codexPlusModelPickerNormalizeStrict(split.name))
+            || providers.get(codexPlusModelPickerNormalize(split.name))
+          : null);
       const groupId = known?.groupId
-        || (split.provider ? split.provider : codexPlusModelPickerDefaultGroupId());
+        || (split.provider ? `provider:${split.provider}` : defaultGroupId);
       // 显示名按行文本：有后缀就是那一家；裸名（默认成员的模型）用默认供应商的名字。
       const provider = split.provider || known?.provider || codexPlusModelPickerDefaultProviderName();
-      const authoritativeGroupId = !!known?.groupId || (!split.provider && !!codexPlusModelPickerDefaultGroupId());
+      const authoritativeGroupId = !!known?.groupId
+        || (split.provider ? true : !!defaultGroupId);
       rows.push({ row, label: identity.text, name: split.name, provider, groupId, authoritativeGroupId });
     });
     return rows;
@@ -13595,13 +13668,23 @@
     if (shouldLeave) {
       // 已审 native 的 New chat 按钮以 aria-label/newChatMessage 调用 onStartChat。
       // 只走唯一可见的原生 sidebar 控件；不猜内部路由，也不强制 reload。
-      const navigation = Array.from(document.querySelectorAll("aside.app-shell-left-panel button, nav[data-app-navigation-rail] button"))
-        .filter((candidate) => visibleElement(candidate) && !candidate.disabled && !isExtensionUiNode(candidate)
+      const newChatButtons = Array.from(document.querySelectorAll("aside.app-shell-left-panel button, nav[data-app-navigation-rail] button"))
+        .filter((candidate) => !candidate.disabled && !isExtensionUiNode(candidate)
           && candidate.closest("aside.app-shell-left-panel, nav[data-app-navigation-rail]")
           && /^(新聊天|新对话|New chat|New thread)$/i.test((candidate.getAttribute("aria-label") || candidate.textContent || "").trim()));
+      // 先只用可见的候选；侧栏折叠或被隐藏时新聊天按钮不可见，再退回不判可见的
+      // 唯一候选——按钮还在 DOM 里，React 的 onClick 照样能触发（#2671）。
+      const visibleNewChat = newChatButtons.filter(visibleElement);
+      const navigation = visibleNewChat.length === 1 ? visibleNewChat : newChatButtons;
       if (navigation.length === 1) {
         navigation[0].click();
         navigated = true;
+        if (!visibleElement(navigation[0])) {
+          sendCodexPlusDiagnostic("delete_session_new_chat_fallback", {
+            candidateCount: newChatButtons.length,
+            visibleCount: visibleNewChat.length,
+          });
+        }
       }
     }
     // 原生导航也可能同步重建行，移除前再确认一次，保护被复用的节点。
@@ -15004,9 +15087,62 @@
 
   function removeActionGroups(row) {
     document.querySelectorAll(`.${moreMenuClass}`).forEach((menu) => {
-      if (menu.__codexSessionMoreRow === row) menu.remove();
+      if (menu.__codexSessionMoreRow === row) disposeSessionMoreMenu(menu);
     });
     row.querySelectorAll(`.${actionGroupClass}`).forEach((group) => group.remove());
+  }
+
+  function closeSessionMoreMenu(menu) {
+    menu.hidden = true;
+    const row = menu.__codexSessionMoreRow || menu.closest?.("[data-codex-delete-row]");
+    row?.classList?.remove("codex-session-more-open");
+    menu.__codexSessionMoreGroup?.querySelector?.(`.${moreButtonClass}`)?.setAttribute("aria-expanded", "false");
+  }
+
+  function disposeSessionMoreMenu(menu) {
+    closeSessionMoreMenu(menu);
+    menu.__codexSessionMoreCleanup?.();
+    const group = menu.__codexSessionMoreGroup;
+    if (group?.__codexSessionMoreMenu === menu) group.__codexSessionMoreMenu = null;
+    menu.__codexSessionMoreCleanup = null;
+    menu.__codexSessionMoreRow = null;
+    menu.__codexSessionMoreGroup = null;
+    menu.remove();
+  }
+
+  function pruneSessionMoreMenus(removedMenus = []) {
+    let needsScan = false;
+    const needsDelete = codexPlusSettings().sessionDelete;
+    // 菜单挂在 body 下，不会随 React 会话行一起卸载；复用现有观察器及时释放。
+    const menus = new Set([...document.querySelectorAll(`.${moreMenuClass}`), ...removedMenus]);
+    menus.forEach((menu) => {
+      const row = menu.__codexSessionMoreRow;
+      const group = menu.__codexSessionMoreGroup;
+      if (!menu.isConnected || !row?.isConnected || !group?.isConnected || !row.contains(group)
+          || !group.querySelector(`.${moreButtonClass}`)
+          || (needsDelete && !group.querySelector(`.${buttonClass}`))) {
+        if (row?.isConnected) needsScan = true;
+        disposeSessionMoreMenu(menu);
+      }
+    });
+    return needsScan;
+  }
+
+  function pruneRemovedSessionActions(mutations) {
+    let relevantRemoval = false;
+    const removedMenus = new Set();
+    const menuSelector = `.${moreMenuClass}`;
+    const actionSelector = `.${actionGroupClass}, .${moreButtonClass}, .${buttonClass}, ${menuSelector}`;
+    for (const mutation of mutations || []) {
+      for (const node of mutation.removedNodes) {
+        if (node.nodeType !== 1 || (!node.matches(actionSelector) && !node.querySelector(actionSelector))) continue;
+        relevantRemoval = true;
+        if (node.matches(menuSelector)) removedMenus.add(node);
+        node.querySelectorAll(menuSelector).forEach((menu) => removedMenus.add(menu));
+      }
+    }
+    // 同步移动和按钮克隆替换在观察器回调前已完成，只依据最终连接状态判断。
+    return relevantRemoval && pruneSessionMoreMenus(removedMenus);
   }
 
   function stopActionButtonEvent(row, button, event) {
@@ -15048,9 +15184,7 @@
   function closeSessionMoreMenus(exceptMenu = null) {
     document.querySelectorAll(`.${moreMenuClass}`).forEach((menu) => {
       if (menu !== exceptMenu) {
-        menu.hidden = true;
-        menu.closest?.("[data-codex-delete-row]")?.classList.remove("codex-session-more-open");
-        menu.__codexSessionMoreRow?.classList?.remove("codex-session-more-open");
+        closeSessionMoreMenu(menu);
       }
     });
   }
@@ -15065,19 +15199,27 @@
 
   function installSessionMoreMenuAutoClose(row, menu) {
     const group = menu.__codexSessionMoreGroup || menu.closest?.(`.${actionGroupClass}`);
+    let closeTimer = null;
     const closeIfOutside = () => {
-      window.setTimeout(() => {
+      window.clearTimeout(closeTimer);
+      closeTimer = window.setTimeout(() => {
+        closeTimer = null;
         if (menu.hidden) return;
         const active = document.activeElement;
         if (group?.matches?.(":hover") || menu.matches?.(":hover") || menu.contains(active)) return;
-        menu.hidden = true;
-        row.classList.remove("codex-session-more-open");
-        group?.querySelector?.(`.${moreButtonClass}`)?.setAttribute("aria-expanded", "false");
+        closeSessionMoreMenu(menu);
       }, 80);
     };
     group?.addEventListener("pointerleave", closeIfOutside, true);
     menu.addEventListener("pointerleave", closeIfOutside, true);
     menu.addEventListener("focusout", closeIfOutside, true);
+    menu.__codexSessionMoreCleanup = () => {
+      window.clearTimeout(closeTimer);
+      closeTimer = null;
+      group?.removeEventListener("pointerleave", closeIfOutside, true);
+      menu.removeEventListener("pointerleave", closeIfOutside, true);
+      menu.removeEventListener("focusout", closeIfOutside, true);
+    };
   }
 
   function updateSessionMoreMenuDirection(button, menu) {
@@ -15183,7 +15325,10 @@
     const missingMore = needsMoreMenu && !existingMoreButton;
     const deleteReady = !settings.sessionDelete || existingDeleteButton?.dataset.codexDeleteVersion === codexDeleteVersion;
     const groupReady = existingGroup?.dataset.codexActionGroupVersion === codexActionGroupVersion;
-    if (groupReady && deleteReady && !hasUnexpectedDelete && !hasUnexpectedMore && !hasUnexpectedExport && !missingDelete && !missingMore) {
+    const existingMenu = existingGroup?.__codexSessionMoreMenu;
+    const menuReady = !needsMoreMenu || (existingMenu?.isConnected
+      && existingMenu.__codexSessionMoreRow === row && existingMenu.__codexSessionMoreGroup === existingGroup);
+    if (groupReady && deleteReady && menuReady && !hasUnexpectedDelete && !hasUnexpectedMore && !hasUnexpectedExport && !missingDelete && !missingMore) {
       return;
     }
     removeActionGroups(row);
@@ -15193,6 +15338,7 @@
     row.dataset.codexDeleteRow = "true";
     const group = document.createElement("div");
     group.className = actionGroupClass;
+    group.setAttribute("data-codex-plus-ext", "session-actions");
     group.dataset.codexActionGroupVersion = codexActionGroupVersion;
     if (needsMoreMenu) {
       const moreButton = document.createElement("button");
@@ -15203,6 +15349,7 @@
       configureActionButton(moreButton, "更多操作", "…");
       const moreMenu = document.createElement("div");
       moreMenu.className = moreMenuClass;
+      moreMenu.setAttribute("data-codex-plus-ext", "session-more-menu");
       moreMenu.setAttribute("role", "menu");
       moreMenu.hidden = true;
       if (settings.markdownExport) {
@@ -15239,6 +15386,7 @@
       group.appendChild(moreButton);
       moreMenu.__codexSessionMoreRow = row;
       moreMenu.__codexSessionMoreGroup = group;
+      group.__codexSessionMoreMenu = moreMenu;
       document.body.appendChild(moreMenu);
       installSessionMoreMenuAutoClose(row, moreMenu);
     }
@@ -17736,6 +17884,22 @@
       && queryKey[1] !== "image-generation";
   }
 
+  // Codex 26.1016 起还会按模型单独限额：additional_rate_limits 里当前模型那一条
+  // limit_reached 为 true 或 allowed 为 false 时，同样锁住发送（#2646）。
+  // 混入时一并解锁，只改这两个字段，其余额度信息不动。
+  function unlockAdditionalRateLimits(limits) {
+    if (!Array.isArray(limits)) return null;
+    let changed = false;
+    const next = limits.map((entry) => {
+      const rateLimit = entry?.rate_limit;
+      if (!rateLimit || typeof rateLimit !== "object") return entry;
+      if (rateLimit.allowed !== false && rateLimit.limit_reached !== true) return entry;
+      changed = true;
+      return { ...entry, rate_limit: { ...rateLimit, allowed: true, limit_reached: false } };
+    });
+    return changed ? next : null;
+  }
+
   // 低额度提示和发送锁都只看当前是不是官登混入 Key。纯官登不改这份用量。
   // 桌面端发送按钮读 rate_limit.allowed；limit_reached 为 true 也会被当成已用完。
   // 混入时在查询发布前把 allowed 写成 true，并清掉 limit_reached。
@@ -17755,6 +17919,13 @@
     const rateLimit = value.rate_limit;
     if (policy.unlockSend && (rateLimit.allowed !== true || rateLimit.limit_reached === true)) {
       next.rate_limit = { ...rateLimit, allowed: true, limit_reached: false };
+      changed = true;
+    }
+    const additionalRateLimits = policy.unlockSend
+      ? unlockAdditionalRateLimits(value.additional_rate_limits)
+      : null;
+    if (additionalRateLimits) {
+      next.additional_rate_limits = additionalRateLimits;
       changed = true;
     }
     if (policy.hideAlerts) {
@@ -18414,6 +18585,7 @@
   }
 
   function scan() {
+    pruneSessionMoreMenus();
     if (document.hidden) {
       window.__codexSessionDeleteScanPending = true;
       return;
@@ -19125,9 +19297,12 @@
   }
 
   function scheduleScan(mutations) {
+    // 隐藏页面和已排队的扫描也要清理，不能让孤立菜单等待下一次可见扫描。
+    const sessionActionsNeedScan = pruneRemovedSessionActions(mutations);
     window.__codexSessionDeleteLastMutations = mutations;
     if (window.__codexSessionDeleteScanPending) return;
-    if (!shouldScheduleScan(mutations)) return;
+    // 原生页面可能只移除带归属标记的按钮组；所属行仍在时需要补回操作入口。
+    if (!sessionActionsNeedScan && !shouldScheduleScan(mutations)) return;
     window.__codexSessionDeleteScanPending = true;
     if (document.hidden) return;
     window.__codexSessionDeleteScanTimer = setTimeout(runScheduledScan, 200);

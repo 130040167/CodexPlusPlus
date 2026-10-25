@@ -178,6 +178,11 @@ pub struct ClaudeLocalizationStatus {
     pub voice_input: bool,
     /// 是否注入中文界面；关掉后副本按原语言启动，与「准备副本」互不影响。
     pub localization: bool,
+    /// 是否在副本里解锁 Computer Use（改写 asar + 关闭 asar 完整性校验）。
+    pub computer_use: bool,
+    /// 当前平台是否真的能应用 Computer Use；Windows 的构建脚本不改写 asar，
+    /// 打开开关只会存设置，界面据此禁用该开关（#2673）。
+    pub computer_use_supported: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -310,16 +315,34 @@ fn home_dir() -> PathBuf {
         .unwrap_or_default()
 }
 
+/// 副本名不再带「CN」：汉化只是可选增强之一，装了 Computer Use 之类的功能时名字不该暗示语言。
+const COPY_BUNDLE_NAME: &str = "Claude Enhanced.app";
+const COPY_DIR_NAME: &str = "Claude Enhanced";
+const LEGACY_BUNDLE_NAME: &str = "Claude CN.app";
+const LEGACY_DIR_NAME: &str = "Claude CN";
+
 #[cfg(target_os = "macos")]
-fn copy_app(_source: &Path) -> PathBuf { runtime_dir().join("Claude CN.app") }
+fn copy_app(_source: &Path) -> PathBuf { runtime_dir().join(COPY_BUNDLE_NAME) }
 
 #[cfg(target_os = "windows")]
 fn copy_app(source: &Path) -> PathBuf {
-    if windows_msix_source(source) { source.to_path_buf() } else { runtime_dir().join("Claude CN").join("Claude.exe") }
+    if windows_msix_source(source) { source.to_path_buf() } else { runtime_dir().join(COPY_DIR_NAME).join("Claude.exe") }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn copy_app(_source: &Path) -> PathBuf { runtime_dir().join("Claude CN") }
+fn copy_app(_source: &Path) -> PathBuf { runtime_dir().join(COPY_DIR_NAME) }
+
+/// 老副本还叫「Claude CN」，改名后原地迁移一次，避免用户被迫重新准备。
+fn migrate_legacy_copy() {
+    let root = runtime_dir();
+    #[cfg(target_os = "macos")]
+    let (legacy, current) = (root.join(LEGACY_BUNDLE_NAME), root.join(COPY_BUNDLE_NAME));
+    #[cfg(not(target_os = "macos"))]
+    let (legacy, current) = (root.join(LEGACY_DIR_NAME), root.join(COPY_DIR_NAME));
+    if legacy.exists() && !current.exists() {
+        let _ = fs::rename(&legacy, &current);
+    }
+}
 
 #[cfg(target_os = "windows")]
 fn staged_copy_path(label: &str) -> PathBuf {
@@ -348,20 +371,116 @@ fn config_path() -> PathBuf {
         .join("config.json")
 }
 
+/// Windows 上可能同时存在好几份 Claude 外壳配置，不能只挑第一个：官方版装过就会有
+/// `%APPDATA%\Claude`，但商店版（MSIX）与增强副本实际读的是 `Claude-3p`
+/// （见 issue #2616，用户机器上在 `%LOCALAPPDATA%\Claude-3p`）。只写 Roaming\Claude
+/// 时界面仍是英文。这里返回所有已存在的候选，汉化与还原逐个处理。
 #[cfg(target_os = "windows")]
-fn config_path() -> PathBuf {
-    let support = std::env::var_os("APPDATA")
+fn config_paths() -> Vec<PathBuf> {
+    let roaming = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().join("AppData/Roaming"));
-    for name in ["Claude", "Claude-3p"] {
-        let dir = support.join(name);
-        if dir.is_dir() { return dir.join("config.json"); }
-    }
-    support.join("Claude").join("config.json")
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    windows_config_paths(&roaming, local.as_deref())
 }
 
+/// Windows 候选的纯计算部分，目录由调用方注入，便于在任意平台上测试。
+///
+/// 顺序即读取优先级：`%LOCALAPPDATA%\Claude-3p`、`%APPDATA%\Claude-3p`、
+/// MSIX 虚拟化目录（`Packages\<包>\LocalCache\Roaming\Claude-3p|Claude`）、
+/// `%APPDATA%\Claude`。只收已存在的目录，绝不新建；一个都没有时沿用旧行为
+/// 回退到 `%APPDATA%\Claude\config.json`。
+#[cfg(any(target_os = "windows", test))]
+fn windows_config_paths(roaming: &Path, local: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(local) = local {
+        dirs.push(local.join("Claude-3p"));
+    }
+    dirs.push(roaming.join("Claude-3p"));
+    if let Some(local) = local {
+        let mut packages: Vec<PathBuf> = fs::read_dir(local.join("Packages"))
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                ["AnthropicPBC.Claude_", "Claude_"].iter().any(|prefix| {
+                    name.get(..prefix.len())
+                        .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+                })
+            })
+            .map(|entry| entry.path().join("LocalCache").join("Roaming"))
+            .collect();
+        // read_dir 顺序不稳定，排序后结果可复现。
+        packages.sort();
+        for package in packages {
+            dirs.push(package.join("Claude-3p"));
+            dirs.push(package.join("Claude"));
+        }
+    }
+    dirs.push(roaming.join("Claude"));
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        let path = dir.join("config.json");
+        // 大小写不敏感的文件系统上同一目录可能被两种写法各收一次，去重防止重复写备份。
+        if dir.is_dir() && !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    if paths.is_empty() {
+        paths.push(roaming.join("Claude").join("config.json"));
+    }
+    paths
+}
+
+#[cfg(target_os = "macos")]
+fn config_paths() -> Vec<PathBuf> { vec![config_path()] }
+
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn config_path() -> PathBuf { home_dir().join(".claude/config.json") }
+fn config_paths() -> Vec<PathBuf> { vec![home_dir().join(".claude/config.json")] }
+
+/// 读外壳语言时取第一个已有 config.json 的候选；都没有就取第一个候选（读出来为空）。
+fn primary_config(configs: &[PathBuf]) -> Option<&PathBuf> {
+    configs.iter().find(|path| path.is_file()).or_else(|| configs.first())
+}
+
+/// 每份配置的语言备份都放在它自己的目录里，各自还原、互不覆盖。
+fn locale_backup_path(config: &Path) -> PathBuf {
+    config.with_extension("codex-plus-locale-backup.json")
+}
+
+/// 先把所有候选的当前语言读出来；任何一份格式异常就整体放弃，避免只改了一半。
+fn current_locales(configs: &[PathBuf]) -> Result<Vec<Option<Value>>> {
+    configs
+        .iter()
+        .map(|config| Ok(read_config(config)?.get("locale").cloned()))
+        .collect()
+}
+
+/// 给每份配置写入同一个语言，并各自在同目录备份原语言（已有备份不覆盖）。
+fn localize_configs(configs: &[PathBuf], locale: &str) -> Result<()> {
+    current_locales(configs)?;
+    for config in configs {
+        set_locale_at(config, &locale_backup_path(config), Some(locale), false)?;
+    }
+    Ok(())
+}
+
+/// 把有备份的配置逐个还原成各自备份里的原语言。
+///
+/// 外层 None 表示一份都没还原（从没汉化过，或备份损坏）——那些配置是用户自己的设置，不碰；
+/// 内层是第一个被还原的语言，汉化前本来没有语言时为 None（还原即删掉 locale 字段）。
+fn restore_saved_locales(configs: &[PathBuf]) -> Result<Option<Option<String>>> {
+    let mut first = None;
+    for config in configs {
+        let backup = locale_backup_path(config);
+        if let Some(value) = read_locale_backup(&backup) {
+            set_locale_at(config, &backup, value.as_deref(), true)?;
+            first.get_or_insert(value);
+        }
+    }
+    Ok(first)
+}
 
 fn find_runtime(name: &str, deadline: Instant) -> Result<Option<PathBuf>> {
     #[cfg(target_os = "windows")]
@@ -475,7 +594,35 @@ fn initial_status(source: &Path, copy: &Path) -> ClaudeLocalizationStatus {
         catalog_entries: catalog_entries(),
         voice_input: settings.as_ref().is_none_or(|settings| settings.claude_app_voice_input),
         localization: settings.as_ref().is_none_or(|settings| settings.claude_app_localization),
+        computer_use: computer_use_enabled(),
+        computer_use_supported: cfg!(target_os = "macos"),
     }
+}
+
+/// 副本是否需要用当前源码与设置重新制作。
+///
+/// Computer Use 只在能改写 asar 的平台参与比较：Windows 的准备脚本不改 asar，
+/// 回执里也就不会写 `computerUse`；若仍按「回执里没有 = 关」比较，开关一旦打开
+/// 就会永远判定需要更新，点「更新副本」后依旧提示需要更新（#2673）。
+fn copy_needs_rebuild(
+    prepared: bool,
+    receipt: Option<&Value>,
+    current_build: &str,
+    copy_version: &str,
+    source_version: &str,
+    computer_use: bool,
+    computer_use_supported: bool,
+) -> bool {
+    if !prepared {
+        return false;
+    }
+    let prepared_computer_use = receipt
+        .and_then(|r| r.get("computerUse"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    receipt.and_then(|r| r.get("sourceBuild")).and_then(Value::as_str) != Some(current_build)
+        || copy_version != source_version
+        || (computer_use_supported && prepared_computer_use != computer_use)
 }
 
 /// 未安装时不能继续探测运行时、版本或读取官方配置；测试注入探测器守住早退边界。
@@ -492,6 +639,7 @@ fn inspect_installed_source(
 }
 
 pub fn status() -> Result<ClaudeLocalizationStatus> {
+    migrate_legacy_copy();
     let deadline = Instant::now() + STATUS_TIMEOUT;
     let source = source_app(deadline)?;
     let copy = copy_app(&source);
@@ -503,10 +651,17 @@ pub fn status() -> Result<ClaudeLocalizationStatus> {
         let receipt = fs::read(runtime_dir().join("prepared.json")).ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
         state.prepared = AppLayout::current().exists(&copy) && receipt.is_some();
-        state.needs_rebuild = state.prepared &&
-            (receipt.as_ref().and_then(|r| r.get("sourceBuild")).and_then(Value::as_str) != Some(current_build.as_str())
-                || state.copy_version != state.source_version);
-        state.shell_locale = read_config(&config_path()).ok()
+        state.needs_rebuild = copy_needs_rebuild(
+            state.prepared,
+            receipt.as_ref(),
+            &current_build,
+            &state.copy_version,
+            &state.source_version,
+            state.computer_use,
+            state.computer_use_supported,
+        );
+        state.shell_locale = primary_config(&config_paths())
+            .and_then(|config| read_config(config).ok())
             .and_then(|v| v.get("locale")?.as_str().map(str::to_string));
         state.running = claude_running(deadline)?;
         state.node_available = find_runtime("node", deadline)?.is_some();
@@ -522,6 +677,27 @@ fn voice_input_enabled() -> bool {
         .load()
         .map(|settings| settings.claude_app_voice_input)
         .unwrap_or(true)
+}
+
+/// 副本的语音入口靠 Codex++ helper 转写（hook.js 读 helper 落下的凭据）。helper 原本只随
+/// Codex 会话或协议代理常驻，没在跑 Codex 时 Claude 里点麦克风只会提示「语音服务未运行」。
+/// 所以开关打开且已经制作过副本时，管理器要把 helper 常驻起来。
+///
+/// 只看副本凭据，不探测版本与进程，启动链路可以廉价调用；没做过副本的用户不占端口。
+pub fn voice_input_needs_helper(settings: &crate::settings::BackendSettings) -> bool {
+    voice_input_needs_helper_at(&runtime_dir(), settings.claude_app_voice_input)
+}
+
+fn voice_input_needs_helper_at(root: &Path, voice_input: bool) -> bool {
+    voice_input && root.join("prepared.json").is_file()
+}
+
+/// Computer Use 开关。读不到按关闭处理——这条会改 asar，不能默认开。
+fn computer_use_enabled() -> bool {
+    crate::settings::SettingsStore::default()
+        .load()
+        .map(|settings| settings.claude_app_computer_use)
+        .unwrap_or(false)
 }
 
 /// 界面汉化开关。同样是读不到就按开启处理。
@@ -542,6 +718,15 @@ pub fn set_voice_input(enabled: bool) -> Result<ClaudeLocalizationStatus> {
 }
 
 /// 写入界面汉化开关。副本是否已准备、是否重建，与这个开关无关。
+/// 写入 Computer Use 开关。只改设置；副本要重新准备才会带上/去掉 asar 改写。
+pub fn set_computer_use(enabled: bool) -> Result<ClaudeLocalizationStatus> {
+    let store = crate::settings::SettingsStore::default();
+    let mut settings = store.load()?;
+    settings.claude_app_computer_use = enabled;
+    store.save(&settings)?;
+    status()
+}
+
 pub fn set_localization(enabled: bool) -> Result<ClaudeLocalizationStatus> {
     let store = crate::settings::SettingsStore::default();
     let mut settings = store.load()?;
@@ -557,23 +742,22 @@ pub fn set_localization(enabled: bool) -> Result<ClaudeLocalizationStatus> {
 
 /// 读汉化前备份里的原语言。没有备份、或备份损坏时返回 None——调用方据此判定
 /// 「从来没汉化过」，从而不去碰用户自己的语言设置。
-fn saved_shell_locale(backup: &Path) -> Option<String> {
-    fs::read(backup)
+///
+/// 内层 None 表示备份记录的是「汉化前没有语言」：还原时要删掉 locale，
+/// 否则那份配置会一直停在 zh-Hans。
+fn read_locale_backup(backup: &Path) -> Option<Option<String>> {
+    let value = fs::read(backup)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| value.get("locale").and_then(Value::as_str).map(str::to_string))
+        .filter(Value::is_object)?;
+    Some(value.get("locale").and_then(Value::as_str).map(str::to_string))
 }
 
-/// 把官方 Claude 的外壳语言还原成汉化前备份里的值。
+/// 把各份 Claude 外壳配置的语言还原成各自汉化前备份里的值。
 ///
-/// 没有备份说明从来没汉化过，这时什么都不做：用户自己的语言设置不该被我们删掉。
+/// 没有备份的那份说明从来没汉化过，什么都不做：用户自己的语言设置不该被我们删掉。
 fn restore_shell_locale() -> Result<()> {
-    let config = config_path();
-    let backup = config.with_extension("codex-plus-locale-backup.json");
-    match saved_shell_locale(&backup) {
-        Some(value) => set_locale_at(&config, &backup, Some(value.as_str()), true),
-        None => Ok(()),
-    }
+    restore_saved_locales(&config_paths()).map(|_| ())
 }
 
 fn install_assets(root: &Path) -> Result<()> {
@@ -596,7 +780,14 @@ fn hidden_script_command(program: &Path) -> Command {
     command
 }
 
-fn run_script(program: &Path, script: &str, source: &Path, copy: &Path, args: &[&str]) -> Result<()> {
+fn run_script(
+    program: &Path,
+    script: &str,
+    source: &Path,
+    copy: &Path,
+    args: &[&str],
+    progress: &dyn Fn(u8, &str),
+) -> Result<()> {
     let root = runtime_dir();
     let log = root.join("operation.log");
     let output = fs::File::create(&log)?;
@@ -615,17 +806,38 @@ fn run_script(program: &Path, script: &str, source: &Path, copy: &Path, args: &[
             "CODEX_PLUS_CLAUDE_VOICE_INPUT",
             if voice_input_enabled() { "1" } else { "0" },
         )
+        // 只有勾选后才改写副本 asar（并关闭 asar 完整性校验）。
+        .env(
+            "CODEX_PLUS_CLAUDE_COMPUTER_USE",
+            if computer_use_enabled() { "1" } else { "0" },
+        )
         // 同理：注入器按这个决定要不要带中文界面那一段。
         .env(
             "CODEX_PLUS_CLAUDE_LOCALIZATION",
             if localization_enabled() { "1" } else { "0" },
+        )
+        .env(
+            "CODEX_PLUS_CLAUDE_PROGRESS",
+            root.join("progress.json"),
         )
         .stdout(output.try_clone()?)
         .stderr(output)
         .spawn()
         .context("无法启动汉化组件")?;
     let deadline = Instant::now() + Duration::from_secs(300);
+    let progress_file = root.join("progress.json");
+    let mut last_percent = 0u8;
     loop {
+        if let Ok(text) = fs::read_to_string(&progress_file) {
+            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                let percent = value.get("percent").and_then(Value::as_u64).unwrap_or(0).min(100) as u8;
+                let message = value.get("message").and_then(Value::as_str).unwrap_or("");
+                if percent != last_percent {
+                    last_percent = percent;
+                    progress(percent, message);
+                }
+            }
+        }
         if let Some(exit) = child.try_wait()? {
             if exit.success() {
                 return Ok(());
@@ -693,6 +905,14 @@ fn set_locale_at(config: &Path, backup: &Path, locale: Option<&str>, restore: bo
 }
 
 pub fn perform(action: &str) -> Result<ClaudeLocalizationResult> {
+    perform_with_progress(action, &|_, _| {})
+}
+
+/// 带进度回调的版本：percent 0-100，message 是给用户看的中文短句。
+pub fn perform_with_progress(
+    action: &str,
+    progress: &dyn Fn(u8, &str),
+) -> Result<ClaudeLocalizationResult> {
     ensure!(cfg!(any(target_os = "macos", target_os = "windows")), "Claude 增强目前支持 macOS 和 Windows");
     ensure!(
         ["prepare", "check", "launch", "restore"].contains(&action),
@@ -733,18 +953,21 @@ pub fn perform(action: &str) -> Result<ClaudeLocalizationResult> {
             } else {
             let staged = staged_copy_path(&format!("Claude-staging-{}", uuid::Uuid::new_v4()));
             let script = if cfg!(target_os = "windows") { "build-copy.ps1" } else { "build-copy.py" };
-            run_script(&script_runtime, script, &source, &staged, &[])?;
-            run_script(&script_runtime, script, &source, &staged, &["--check"])?;
+            progress(2, "准备增强版目录");
+            run_script(&script_runtime, script, &source, &staged, &[], progress)?;
+            progress(92, "校验增强版");
+            run_script(&script_runtime, script, &source, &staged, &["--check"], progress)?;
             // 校验通过后才替换；旧副本保留，构建失败时不会影响它。
             let old = staged_copy_path(&format!("Claude-backup-{}", uuid::Uuid::new_v4()));
             replace_copy(AppLayout::current(), &staged, &copy, &old)?;
             fs::write(
                 root.join("prepared.json"),
                 serde_json::to_vec(&json!({
-                    "sourceBuild": app_version(&source, "CFBundleVersion", Instant::now() + STATUS_TIMEOUT)?
+                    "sourceBuild": app_version(&source, "CFBundleVersion", Instant::now() + STATUS_TIMEOUT)?,
+                    "computerUse": computer_use_enabled()
                 }))?,
             )?;
-            "副本已准备并通过签名及 app.asar 一致性校验。".to_string()
+            "增强版已制作，签名与 app.asar 校验通过。".to_string()
             }
         }
         "check" => {
@@ -753,7 +976,7 @@ pub fn perform(action: &str) -> Result<ClaudeLocalizationResult> {
                 "Windows MSIX 安装入口已检测到，采用原版包启动注入。".to_string()
             } else {
                 let script = if cfg!(target_os = "windows") { "build-copy.ps1" } else { "build-copy.py" };
-                run_script(&script_runtime, script, &source, &copy, &["--check"])?;
+                run_script(&script_runtime, script, &source, &copy, &["--check"], &|_, _| {})?;
                 "副本签名、中文词表、注入开关及 app.asar 一致性校验通过。".to_string()
             }
         }
@@ -765,46 +988,48 @@ pub fn perform(action: &str) -> Result<ClaudeLocalizationResult> {
             };
             if !(cfg!(target_os = "windows") && windows_msix_source(&source)) {
                 let script = if cfg!(target_os = "windows") { "build-copy.ps1" } else { "build-copy.py" };
-                run_script(&script_runtime, script, &source, &copy, &["--check"])?;
+                run_script(&script_runtime, script, &source, &copy, &["--check"], &|_, _| {})?;
             }
-            let config = config_path();
-            let backup = config.with_extension("codex-plus-locale-backup.json");
-            let previous = read_config(&config)?.get("locale").cloned();
-            let saved_locale = || saved_shell_locale(&backup);
+            // 所有候选配置逐个处理（Windows 上官方版与商店版各有一份，见 #2616）。
+            let configs = config_paths();
+            let previous = current_locales(&configs)?;
             let localization = localization_enabled();
             let locale = if action == "restore" {
-                ensure!(backup.is_file(), "没有 codex++ 保存的语言备份");
-                let value = saved_locale();
-                set_locale_at(&config, &backup, value.as_deref(), true)?;
-                value.unwrap_or_else(|| "en-US".to_string())
+                ensure!(
+                    configs.iter().any(|config| locale_backup_path(config).is_file()),
+                    "没有 codex++ 保存的语言备份"
+                );
+                restore_saved_locales(&configs)?
+                    .flatten()
+                    .unwrap_or_else(|| "en-US".to_string())
             } else if localization {
-                set_locale_at(&config, &backup, Some("zh-Hans"), false)?;
+                localize_configs(&configs, "zh-Hans")?;
                 "zh-Hans".to_string()
             } else {
                 // 汉化关掉：副本按原语言启动。有备份说明之前汉化过，还原它；
                 // 从没汉化过就完全不碰用户自己的语言设置。
-                match saved_locale() {
-                    Some(value) => {
-                        set_locale_at(&config, &backup, Some(value.as_str()), true)?;
-                        value
-                    }
+                match restore_saved_locales(&configs)? {
+                    Some(value) => value.unwrap_or_else(|| "en-US".to_string()),
                     None => previous
-                        .as_ref()
-                        .and_then(Value::as_str)
+                        .iter()
+                        .flatten()
+                        .find_map(Value::as_str)
                         .unwrap_or("en-US")
                         .to_string(),
                 }
             };
             let script = if cfg!(target_os = "windows") { "inject-cn.ps1" } else { "inject-cn.js" };
-            if let Err(error) = run_script(&launcher, script, &source, &copy, &[if cfg!(windows) { "-Locale" } else { "--locale" }, locale.as_str()]) {
+            if let Err(error) = run_script(&launcher, script, &source, &copy, &[if cfg!(windows) { "-Locale" } else { "--locale" }, locale.as_str()], &|_, _| {}) {
                 // 启动失败后只在应用未运行时还原本次外壳语言，避免与 Claude 写盘竞争。
                 if !claude_running(Instant::now() + PROBE_TIMEOUT).unwrap_or(true) {
-                    let _ = set_locale_at(
-                        &config,
-                        &backup,
-                        previous.as_ref().and_then(Value::as_str),
-                        true,
-                    );
+                    for (config, previous) in configs.iter().zip(&previous) {
+                        let _ = set_locale_at(
+                            config,
+                            &locale_backup_path(config),
+                            previous.as_ref().and_then(Value::as_str),
+                            true,
+                        );
+                    }
                 }
                 return Err(error);
             }
@@ -879,8 +1104,23 @@ mod tests {
             source_version: String::new(), copy_version: String::new(),
             prepared: false, needs_rebuild: false, running: false,
             node_available: false, python_available: false, shell_locale: None,
-            catalog_entries: 0, voice_input: true, localization: true,
+            catalog_entries: 0, voice_input: true, localization: true, computer_use: false,
+            computer_use_supported: cfg!(target_os = "macos"),
         }
+    }
+
+    #[test]
+    fn windows_never_asks_to_rebuild_for_computer_use() {
+        // #2673：Windows 的 MSIX 回执没有 computerUse；开关打开时不能因此永远要求更新。
+        let receipt = json!({ "sourceBuild": "26.1", "msix": true });
+        assert!(!copy_needs_rebuild(true, Some(&receipt), "26.1", "26.1", "26.1", true, false));
+        // macOS 仍按回执比较：开关与回执不一致就该重建。
+        assert!(copy_needs_rebuild(true, Some(&receipt), "26.1", "26.1", "26.1", true, true));
+        assert!(!copy_needs_rebuild(true, Some(&receipt), "26.1", "26.1", "26.1", false, true));
+        // 版本变化与未准备的情况对所有平台一致。
+        assert!(copy_needs_rebuild(true, Some(&receipt), "26.2", "26.1", "26.1", false, false));
+        assert!(copy_needs_rebuild(true, Some(&receipt), "26.1", "26.2", "26.1", false, false));
+        assert!(!copy_needs_rebuild(false, None, "26.1", "26.1", "26.1", true, false));
     }
 
     #[test]
@@ -1002,16 +1242,20 @@ mod tests {
     }
 
     #[test]
-    fn saved_shell_locale_tolerates_missing_or_broken_backup() {
+    fn locale_backup_tolerates_missing_or_broken_backup() {
         // 关掉汉化时会按这个值还原官方语言；读不出来就必须什么都不做，
         // 否则会把用户自己的语言设置删掉。
         let dir = tempfile::tempdir().unwrap();
         let backup = dir.path().join("locale-backup.json");
-        assert_eq!(saved_shell_locale(&backup), None, "没有备份时不能凭空给一个语言");
+        assert_eq!(read_locale_backup(&backup), None, "没有备份时不能凭空给一个语言");
         fs::write(&backup, br#"{"locale":"ja-JP","other":1}"#).unwrap();
-        assert_eq!(saved_shell_locale(&backup).as_deref(), Some("ja-JP"));
+        assert_eq!(read_locale_backup(&backup), Some(Some("ja-JP".to_string())));
+        fs::write(&backup, br#"{"locale":null}"#).unwrap();
+        assert_eq!(read_locale_backup(&backup), Some(None), "汉化前没有语言也是有效备份");
         fs::write(&backup, b"not json").unwrap();
-        assert_eq!(saved_shell_locale(&backup), None, "备份损坏时不能乱动用户设置");
+        assert_eq!(read_locale_backup(&backup), None, "备份损坏时不能乱动用户设置");
+        fs::write(&backup, b"[]").unwrap();
+        assert_eq!(read_locale_backup(&backup), None, "非对象备份视为损坏");
     }
 
     #[test]
@@ -1048,6 +1292,108 @@ mod tests {
     }
 
     #[test]
+    fn windows_config_paths_cover_store_and_official_profiles_in_order() {
+        // #2616：官方版的 Roaming\Claude 存在时，商店版读的 Claude-3p 也必须被写到。
+        let dir = tempfile::tempdir().unwrap();
+        let roaming = dir.path().join("Roaming");
+        let local = dir.path().join("Local");
+        // 都不存在：沿用旧回退，且不能顺手建目录。
+        assert_eq!(
+            windows_config_paths(&roaming, Some(&local)),
+            vec![roaming.join("Claude/config.json")]
+        );
+        assert!(!roaming.exists() && !local.exists(), "计算候选不能新建目录");
+
+        let package = local.join("Packages/AnthropicPBC.Claude_fnn82j28hfe8t/LocalCache/Roaming");
+        for created in [
+            roaming.join("Claude"),
+            roaming.join("Claude-3p"),
+            local.join("Claude-3p"),
+            package.join("Claude"),
+            package.join("Claude-3p"),
+            // 名字相近的其他包不算。
+            local.join("Packages/ClaudeFork_x/LocalCache/Roaming/Claude-3p"),
+        ] {
+            fs::create_dir_all(created).unwrap();
+        }
+        assert_eq!(
+            windows_config_paths(&roaming, Some(&local)),
+            vec![
+                local.join("Claude-3p/config.json"),
+                roaming.join("Claude-3p/config.json"),
+                package.join("Claude-3p/config.json"),
+                package.join("Claude/config.json"),
+                roaming.join("Claude/config.json"),
+            ]
+        );
+        // 只有部分存在时，缺的不出现、也不被创建。
+        let dir = tempfile::tempdir().unwrap();
+        let roaming = dir.path().join("Roaming");
+        let local = dir.path().join("Local");
+        fs::create_dir_all(roaming.join("Claude")).unwrap();
+        fs::create_dir_all(local.join("Claude-3p")).unwrap();
+        assert_eq!(
+            windows_config_paths(&roaming, Some(&local)),
+            vec![local.join("Claude-3p/config.json"), roaming.join("Claude/config.json")]
+        );
+        assert!(!roaming.join("Claude-3p").exists());
+        assert!(!local.join("Packages").exists());
+        // 拿不到 LOCALAPPDATA 时只看 Roaming。
+        assert_eq!(windows_config_paths(&roaming, None), vec![roaming.join("Claude/config.json")]);
+    }
+
+    #[test]
+    fn localize_and_restore_every_config_symmetrically() {
+        let dir = tempfile::tempdir().unwrap();
+        let official = dir.path().join("Roaming/Claude/config.json");
+        let store = dir.path().join("Local/Claude-3p/config.json");
+        fs::create_dir_all(official.parent().unwrap()).unwrap();
+        fs::create_dir_all(store.parent().unwrap()).unwrap();
+        fs::write(&official, br#"{"locale":"ja-JP","other":1}"#).unwrap();
+        // 商店版这份没有 config.json（还没写过语言）。
+        let configs = vec![store.clone(), official.clone()];
+        assert_eq!(primary_config(&configs), Some(&official), "读取取第一个已有配置");
+
+        localize_configs(&configs, "zh-Hans").unwrap();
+        for config in &configs {
+            assert_eq!(read_config(config).unwrap()["locale"], "zh-Hans", "{config:?}");
+            assert!(locale_backup_path(config).is_file(), "每份配置各自备份：{config:?}");
+        }
+        assert_eq!(primary_config(&configs), Some(&store));
+        // 再汉化一次不能用 zh-Hans 覆盖原备份。
+        localize_configs(&configs, "zh-Hans").unwrap();
+
+        // 第一个是商店版，汉化前没有语言。
+        assert_eq!(restore_saved_locales(&configs).unwrap(), Some(None));
+        assert_eq!(read_config(&official).unwrap()["locale"], "ja-JP");
+        assert_eq!(read_config(&official).unwrap()["other"], 1);
+        // 汉化前没有语言的那份要把 locale 删掉，不能停在 zh-Hans。
+        assert!(read_config(&store).unwrap().get("locale").is_none());
+
+        // 从没汉化过（没有备份）的配置不碰。
+        let untouched = dir.path().join("Other/Claude/config.json");
+        fs::create_dir_all(untouched.parent().unwrap()).unwrap();
+        fs::write(&untouched, br#"{"locale":"fr-FR"}"#).unwrap();
+        assert_eq!(restore_saved_locales(std::slice::from_ref(&untouched)).unwrap(), None);
+        assert_eq!(read_config(&untouched).unwrap()["locale"], "fr-FR");
+    }
+
+    #[test]
+    fn localize_configs_touches_nothing_when_any_config_is_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("a/config.json");
+        let broken = dir.path().join("b/config.json");
+        fs::create_dir_all(good.parent().unwrap()).unwrap();
+        fs::create_dir_all(broken.parent().unwrap()).unwrap();
+        fs::write(&good, br#"{"locale":"en-US"}"#).unwrap();
+        fs::write(&broken, b"broken").unwrap();
+        assert!(localize_configs(&[good.clone(), broken.clone()], "zh-Hans").is_err());
+        assert_eq!(read_config(&good).unwrap()["locale"], "en-US");
+        assert!(!locale_backup_path(&good).exists());
+        assert_eq!(fs::read(&broken).unwrap(), b"broken");
+    }
+
+    #[test]
     fn bundled_catalogs_are_real_json_and_install_without_external_paths() {
         let dir = tempfile::tempdir().unwrap();
         install_assets(dir.path()).unwrap();
@@ -1060,5 +1406,15 @@ mod tests {
         )
         .unwrap();
         assert!(!dynamic.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn voice_input_needs_helper_only_after_copy_is_prepared() {
+        let dir = tempfile::tempdir().unwrap();
+        // 没做过副本：语音开关默认开启也不能让管理器常驻 helper 占端口。
+        assert!(!voice_input_needs_helper_at(dir.path(), true));
+        fs::write(dir.path().join("prepared.json"), b"{}").unwrap();
+        assert!(voice_input_needs_helper_at(dir.path(), true));
+        assert!(!voice_input_needs_helper_at(dir.path(), false));
     }
 }

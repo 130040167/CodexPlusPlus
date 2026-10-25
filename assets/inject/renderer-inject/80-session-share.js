@@ -558,13 +558,23 @@
     if (shouldLeave) {
       // 已审 native 的 New chat 按钮以 aria-label/newChatMessage 调用 onStartChat。
       // 只走唯一可见的原生 sidebar 控件；不猜内部路由，也不强制 reload。
-      const navigation = Array.from(document.querySelectorAll("aside.app-shell-left-panel button, nav[data-app-navigation-rail] button"))
-        .filter((candidate) => visibleElement(candidate) && !candidate.disabled && !isExtensionUiNode(candidate)
+      const newChatButtons = Array.from(document.querySelectorAll("aside.app-shell-left-panel button, nav[data-app-navigation-rail] button"))
+        .filter((candidate) => !candidate.disabled && !isExtensionUiNode(candidate)
           && candidate.closest("aside.app-shell-left-panel, nav[data-app-navigation-rail]")
           && /^(新聊天|新对话|New chat|New thread)$/i.test((candidate.getAttribute("aria-label") || candidate.textContent || "").trim()));
+      // 先只用可见的候选；侧栏折叠或被隐藏时新聊天按钮不可见，再退回不判可见的
+      // 唯一候选——按钮还在 DOM 里，React 的 onClick 照样能触发（#2671）。
+      const visibleNewChat = newChatButtons.filter(visibleElement);
+      const navigation = visibleNewChat.length === 1 ? visibleNewChat : newChatButtons;
       if (navigation.length === 1) {
         navigation[0].click();
         navigated = true;
+        if (!visibleElement(navigation[0])) {
+          sendCodexPlusDiagnostic("delete_session_new_chat_fallback", {
+            candidateCount: newChatButtons.length,
+            visibleCount: visibleNewChat.length,
+          });
+        }
       }
     }
     // 原生导航也可能同步重建行，移除前再确认一次，保护被复用的节点。
