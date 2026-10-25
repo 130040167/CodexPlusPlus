@@ -24,6 +24,8 @@ type CuResult = {
   permitted?: boolean;
 };
 
+type CaptureMode = "screenshot" | "stream";
+
 type FrameEvent = { seq: number; data: string };
 type EndEvent = { reason: string };
 
@@ -47,6 +49,7 @@ function describe(win: PreviewWindow): string {
 export function ComputerUsePreview() {
   const [windows, setWindows] = useState<PreviewWindow[]>([]);
   const [selected, setSelected] = useState<number | null>(null);
+  const [captureMode, setCaptureMode] = useState<CaptureMode>("screenshot");
   const [frame, setFrame] = useState<string>("");
   const [frames, setFrames] = useState(0);
   const [running, setRunning] = useState(false);
@@ -120,6 +123,7 @@ export function ComputerUsePreview() {
         windowId: selected,
         scale: PREVIEW_SCALE,
         maxFps: PREVIEW_FPS,
+        mode: captureMode,
       });
       if (!mounted.current) return;
       if (result.status === "ok") {
@@ -210,6 +214,17 @@ export function ComputerUsePreview() {
             ))}
           </select>
         </label>
+        <label className="cu-preview-select">
+          <span>{t("抓取方式")}</span>
+          <select
+            value={captureMode}
+            disabled={locked || running}
+            onChange={(e) => setCaptureMode(e.target.value as CaptureMode)}
+          >
+            <option value="screenshot">{t("截图模式（无共享标志）")}</option>
+            <option value="stream">{t("流模式（低延迟，显示共享标志）")}</option>
+          </select>
+        </label>
         {running ? (
           <button className="mg-button" type="button" onClick={() => void stop()}>
             <Square size={14} />{t("停止预览")}
@@ -235,6 +250,7 @@ export function ComputerUsePreview() {
       {running && (
         <p className="cu-hint">
           {t("已接收")}<code>{frames}</code>{t("帧")} · {PREVIEW_SCALE}× · {PREVIEW_FPS} fps
+          {" · "}{captureMode === "stream" ? t("流模式") : t("截图模式")}
         </p>
       )}
       {error && <p className="cu-failure" role="alert">{error}</p>}
