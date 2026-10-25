@@ -41,8 +41,8 @@ pub fn spool_dir() -> PathBuf {
     crate::paths::default_app_state_dir().join("browser")
 }
 
-/// 钩子命令里要写的 spool 绝对路径。
-fn spool_path() -> PathBuf {
+/// 钩子命令里要写的 spool 绝对路径。管理器的悬浮预览也据此判断回合结束。
+pub fn spool_path() -> PathBuf {
     spool_dir().join(SPOOL_FILE)
 }
 
@@ -358,7 +358,7 @@ pub fn spawn_turn_watcher(on_turn_end: impl Fn() + Send + 'static) {
 }
 
 /// 用「行数 + 修改时间」判断有没有新事件。
-fn spool_len(path: &Path) -> u64 {
+pub fn spool_len(path: &Path) -> u64 {
     let Ok(metadata) = std::fs::metadata(path) else {
         return 0;
     };

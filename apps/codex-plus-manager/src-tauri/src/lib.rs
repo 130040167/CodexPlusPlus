@@ -1,6 +1,7 @@
 mod auto_takeover;
 mod agent_collaboration_commands;
 mod computer_use_commands;
+mod cu_pip;
 mod global_dictation;
 pub mod commands;
 pub mod install;
@@ -220,6 +221,8 @@ pub fn run() {
                 Ok(())
             });
             start_window_activation_listener(app.handle().clone());
+            // Computer Use 操作后台应用时的悬浮预览（同 Codex 的画中画）。
+            cu_pip::start(app.handle().clone());
             commands::start_weixin_connect_from_saved_settings();
             register_main_window_events(main_window);
             commands::resume_existing_codex_background(
@@ -266,6 +269,10 @@ pub fn run() {
             computer_use_commands::computer_use_custom_add,
             computer_use_commands::computer_use_custom_rename,
             computer_use_commands::computer_use_mode_set,
+            computer_use_commands::computer_use_pip_set,
+            cu_pip::cu_pip_target,
+            cu_pip::cu_pip_dismiss,
+            cu_pip::cu_pip_activate,
             computer_use_commands::computer_use_custom_remove,
             computer_use_commands::computer_use_check,
             computer_use_commands::computer_use_open_app,

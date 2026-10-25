@@ -295,6 +295,8 @@
 .cu-flow-approval { display:flex; flex-direction:column; gap:5px; padding-top:8px; border-top:1px dashed hsl(var(--border)); }
 .cu-flow-approval > span { color:hsl(var(--muted-foreground)); font-size:10.5px; }
 .cu-flow-approval .mg-segmented { width:100%; }
+.cu-flow-check { display:flex; align-items:center; gap:6px; color:hsl(var(--foreground)); font-size:11px; cursor:pointer; }
+.cu-flow-check input { margin:0; }
 .cu-flow-approval .mg-segmented button { flex:1; padding:3px 6px; font-size:11px; cursor:pointer; }
 .cu-flow-warn { color:hsl(var(--status-warning)); font-size:10.5px; line-height:1.45; }
 .cu-flow-node[data-tone=warn] { border-color:hsl(var(--status-warning) / .5); }

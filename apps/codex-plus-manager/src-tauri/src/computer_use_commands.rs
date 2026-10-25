@@ -320,6 +320,10 @@ pub async fn computer_use_approval_get() -> CommandResult<Value> {
             "mode": mode.id(),
             // 操作方式：tools（离散工具）/ js（cua_repl）。
             "cuMode": codex_plus_core::computer_use_proxy::CuMode::current().id(),
+            "pip": codex_plus_core::settings::SettingsStore::default()
+                .load()
+                .map(|settings| settings.computer_use_pip)
+                .unwrap_or(true),
             "approvals": codex_plus_core::computer_use_approval::ApprovalStore::read_all(),
             "lastClient": codex_plus_core::computer_use_approval::last_client(),
             // 浏览器标签的清理靠 Claude Code 的 Stop 钩子；装上没有要在页面上说清楚。
@@ -371,6 +375,26 @@ pub async fn computer_use_mode_set(mode: String) -> CommandResult<Value> {
     .await
     {
         Ok(()) => ok("操作方式已保存；对新开的客户端会话生效。", json!({})),
+        Err(error) => failed(&error, json!({})),
+    }
+}
+
+/// 开关「操作时显示悬浮预览」。写进 `settings.json` 的 `computerUsePip`，只改这一个键。
+#[tauri::command]
+pub async fn computer_use_pip_set(enabled: bool) -> CommandResult<Value> {
+    match run_blocking(move || -> anyhow::Result<()> {
+        let store = codex_plus_core::settings::SettingsStore::default();
+        let mut settings = store.load()?;
+        settings.computer_use_pip = enabled;
+        store.save(&settings)?;
+        Ok(())
+    })
+    .await
+    {
+        Ok(()) => ok(
+            if enabled { "已开启悬浮预览。" } else { "已关闭悬浮预览。" },
+            json!({}),
+        ),
         Err(error) => failed(&error, json!({})),
     }
 }

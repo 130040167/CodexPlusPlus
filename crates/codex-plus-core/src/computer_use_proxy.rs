@@ -211,8 +211,11 @@ pub fn serve() -> anyhow::Result<()> {
         next_token: 0,
         js: (cu_mode == CuMode::Js)
             .then(|| JsBridge::new(uuid::Uuid::new_v4().to_string())),
+        last_activity: None,
     };
     let outcome = forwarder.run(receiver);
+    // 会话结束：让管理器收起这个会话的悬浮预览。
+    crate::cu_activity::record("end", 0, "", "");
     child.kill();
     child.wait();
     outcome
@@ -339,6 +342,8 @@ struct Forwarder {
     next_token: u64,
     /// JS 档的回合与工具面状态；直通档为 `None`，帧原样转发。
     js: Option<JsBridge>,
+    /// 最近一次记下的被操作应用（bundle id 或应用名）与时间：同一个应用 1 秒内不重复写。
+    last_activity: Option<(String, Instant)>,
 }
 
 impl Forwarder {
@@ -490,6 +495,7 @@ impl Forwarder {
 
     /// 子进程 → 客户端。审批请求按策略处理，其余帧原样透传。
     fn on_child(&mut self, frame: Vec<u8>) -> anyhow::Result<()> {
+        self.note_activity(&frame);
         if mentions(&frame, b"\"method\"") && mentions(&frame, b"elicitation/create") {
             if let Ok(message) = serde_json::from_slice::<Value>(&frame) {
                 if message.get("method").and_then(Value::as_str) == Some("elicitation/create") {
@@ -512,6 +518,30 @@ impl Forwarder {
             }
         }
         write_client(&frame)
+    }
+
+    /// 返回结果里能看出被操作的应用时，告诉管理器（悬浮预览用）：
+    /// 离散工具档有 `App=… (bundleID …, pid …)`，JS 档只有 `App: 名字.`。
+    fn note_activity(&mut self, frame: &[u8]) {
+        let (pid, bundle_id, app_name) = if mentions(frame, b"(bundleID ")
+            && let Some((bundle_id, pid)) = crate::cu_activity::parse_app_line(frame)
+        {
+            (pid, bundle_id, String::new())
+        } else if mentions(frame, b"\", App: ")
+            && let Some(name) = crate::cu_activity::parse_app_name(frame)
+        {
+            (0, String::new(), name)
+        } else {
+            return;
+        };
+        let key = if bundle_id.is_empty() { app_name.clone() } else { bundle_id.clone() };
+        let fresh = self.last_activity.as_ref().is_none_or(|(last, at)| {
+            *last != key || at.elapsed() >= Duration::from_secs(1)
+        });
+        if fresh {
+            crate::cu_activity::record("act", pid, &bundle_id, &app_name);
+            self.last_activity = Some((key, Instant::now()));
+        }
     }
 
     fn on_elicitation(&mut self, message: Value) -> anyhow::Result<()> {

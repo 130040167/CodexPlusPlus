@@ -58,6 +58,7 @@ type CuApprovalState = {
   message?: string;
   mode?: CuApprovalMode;
   cuMode?: CuMode;
+  pip?: boolean;
   approvals?: Array<[string, CuApprovedApp]>;
   lastClient?: CuLastClient | null;
   turnHooks?: { installed?: boolean; events?: string[]; settings?: string } | null;
@@ -191,6 +192,30 @@ export function ComputerUsePage() {
         await loadApproval();
       } else {
         setActionError(result.message || t("保存操作方式失败。"));
+      }
+    } catch (reason) {
+      if (mounted.current) setActionError(errorText(reason));
+    } finally {
+      if (mounted.current) {
+        lock.current = false;
+        setBusy("");
+      }
+    }
+  };
+
+  const changePip = async (enabled: boolean) => {
+    if (lock.current) return;
+    lock.current = true;
+    setBusy("pip");
+    setActionError("");
+    try {
+      const result = await invoke<CuResult>("computer_use_pip_set", { enabled });
+      if (!mounted.current) return;
+      if (result.status === "ok") {
+        setNotice(result.message || (enabled ? t("已开启悬浮预览。") : t("已关闭悬浮预览。")));
+        await loadApproval();
+      } else {
+        setActionError(result.message || t("保存失败，请重试。"));
       }
     } catch (reason) {
       if (mounted.current) setActionError(errorText(reason));
@@ -582,6 +607,10 @@ export function ComputerUsePage() {
               {cuMode === "js"
                 ? <small className="cu-flow-warn">{t("模型可执行任意 JavaScript（能读写文件、联网）；对新开的客户端会话生效")}</small>
                 : null}
+              <label className="cu-flow-check" title={t("同 Codex 的画中画：操作后台应用时在屏幕右上角实时显示目标窗口；回合结束或空闲 20 秒自动收起。需要屏幕录制权限。")}>
+                <input type="checkbox" checked={approval?.pip ?? true} disabled={locked} onChange={(event) => void changePip(event.target.checked)} />
+                {t("操作后台应用时显示悬浮预览")}
+              </label>
               <span>{t("首次接管某个应用时")}</span>
               <div className="mg-segmented" role="radiogroup" aria-label={t("审批策略")}>
                 <button type="button" role="radio" aria-checked={approvalMode === "auto"} data-active={approvalMode === "auto"} disabled={locked}
