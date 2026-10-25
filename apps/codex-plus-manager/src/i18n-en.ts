@@ -691,7 +691,7 @@ export const EN_PLAIN: Record<string, string> = {
   "工具": "Tool",
   "配置目录": "Config directory",
   "配置切换": "Config switching",
-  "供应商配置切换已关闭：点「使用」不会写入 Codex 的 config.toml / auth.json。需要切换时打开右上角的「配置切换」。": "Provider config switching is off: clicking Use will not write Codex's config.toml / auth.json. Turn on Config switching at the top right to switch.",
+  "供应商配置切换已关闭：Codex++ 不会写入 Codex 的 config.toml / auth.json，供应商列表已隐藏。需要切换时打开右上角的「配置切换」。": "Provider config switching is off: Codex++ will not write Codex's config.toml / auth.json, and the provider list is hidden. Turn on Config switching at the top right to switch.",
   "已接入，可在该工具页切换供应商。": "Wired up — switch providers on that tool's own page.",
   "尚未接入配置切换。": "Config switching is not wired up yet.",
   "该工具由它自己的页签管理": "This tool is managed on its own tab",

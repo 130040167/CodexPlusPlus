@@ -12021,3 +12021,11 @@ select {
   font-size: 12px;
   font-weight: 500;
 }
+
+/* 头像改为两个字（如「哈K」「供4」），字号相应缩小，保持在方块内。 */
+.relay-index {
+  font-size: 12.5px;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+  text-transform: none;
+}
