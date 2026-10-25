@@ -310,7 +310,7 @@ pub async fn computer_use_open_extension_store() -> CommandResult<Value> {
 
 /// 当前审批策略与已记忆的应用。
 ///
-/// `auto` = 全部放行（只留痕）；`claude` = 交给 MCP 客户端审批。
+/// `auto` = 全部放行（只留痕）；`claude` = 弹卡确认（转给当前连接的 MCP 客户端，同 Codex）。
 #[tauri::command]
 pub async fn computer_use_approval_get() -> CommandResult<Value> {
     let mode = codex_plus_core::computer_use_approval::ApprovalMode::current();
@@ -353,7 +353,7 @@ pub async fn computer_use_approval_set(mode: String) -> CommandResult<Value> {
     })
     .await
     {
-        Ok(()) => ok("审批策略已保存；对下一个 Claude 会话生效。", json!({})),
+        Ok(()) => ok("审批策略已保存；对新开的客户端会话生效。", json!({})),
         Err(error) => failed(&error, json!({})),
     }
 }
@@ -399,7 +399,7 @@ pub async fn computer_use_pip_set(enabled: bool) -> CommandResult<Value> {
     }
 }
 
-/// 撤销某个应用的审批记忆。
+/// 撤销某个应用的「始终允许」：Computer Use 自己的记录（与 Codex 共用）和旧版文件都删。
 #[tauri::command]
 pub async fn computer_use_approval_forget(app: String) -> CommandResult<Value> {
     match run_blocking(move || codex_plus_core::computer_use_approval::ApprovalStore::forget(&app))

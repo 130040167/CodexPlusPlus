@@ -58,7 +58,7 @@ type CuMode = "tools" | "js";
  */
 export const BACKEND_SETTINGS_CHANGED_EVENT = "codex-plus:backend-settings-changed";
 const announceSettingsChanged = () => window.dispatchEvent(new Event(BACKEND_SETTINGS_CHANGED_EVENT));
-type CuApprovedApp = { decision: string; mode?: string; displayName?: string; decidedAt?: number };
+type CuApprovedApp = { decision: string; mode?: string; displayName?: string; decidedAt?: number; source?: string };
 type CuLastClient = { name?: string; version?: string; elicitation?: boolean; at?: number };
 type CuApprovalState = {
   status?: string;
@@ -122,7 +122,7 @@ function failureText(check: CuCheck): string {
     case "runtime_missing": return t("没找到 ChatGPT.app，请先安装 Codex 桌面版");
     case "untrusted_parent": return t("Computer Use 拒绝了本次调用：ChatGPT.app 版本不兼容，请更新后再试");
     case "permission_required": return t("请在系统设置里给 ChatGPT 授予辅助功能/屏幕录制权限");
-    case "client_unsupported": return t("当前 Claude Code 版本不支持审批表单（elicitation）");
+    case "client_unsupported": return t("当前客户端不支持审批卡（elicitation）");
     case "service_unavailable": return t("Computer Use 服务未就绪，先打开一次 Codex 的 Computer Use");
     case "error": return check.failureDetail || check.message || t("自检失败，请查看详情后重试。");
     default: return check.failureDetail || check.message || t("自检失败，请查看详情后重试。");
@@ -609,7 +609,7 @@ export function ComputerUsePage() {
           {flowNode(<MousePointerClick size={16} />, "codex-plus-cu", t("桌面操控"), "cu",
             <div className="cu-flow-summary" title={t("在下方「codex-plus-cu 设置」里修改")}>
               <span data-accent={cuMode === "js" ? "true" : undefined}>{cuMode === "js" ? t("JS") : t("离散工具")}</span>
-              <span>{approvalMode === "auto" ? t("自动放行") : t("交给 Claude")}</span>
+              <span>{approvalMode === "auto" ? t("自动放行") : t("弹卡确认")}</span>
               {approval?.pip ?? true ? <span>{t("悬浮预览")}</span> : null}
             </div>)}
         </div>
@@ -656,7 +656,7 @@ export function ComputerUsePage() {
       <div className="cu-setting">
         <div className="cu-setting-copy">
           <strong>{t("首次接管某个应用时")}</strong>
-          <small>{t("自动放行只记审计日志；交给 Claude 由客户端弹卡确认，拒绝即不放行。")}</small>
+          <small>{t("弹卡确认同 Codex：由当前连接的客户端（Claude Code、Codex 等）弹卡，拒绝即不放行，勾「始终允许」后这个应用以后不再问；客户端不支持弹卡时退回自动放行。自动放行：不询问，只记审计日志。")}</small>
           {approvalMode === "claude" && approval?.lastClient?.elicitation === false
             ? <small className="cu-flow-warn">{t("最近连接的客户端不支持审批卡，会退回自动放行")}</small>
             : null}
@@ -665,7 +665,7 @@ export function ComputerUsePage() {
           <button type="button" role="radio" aria-checked={approvalMode === "auto"} data-active={approvalMode === "auto"} disabled={locked}
             title={t("自动放行所有应用，只记审计日志。")} onClick={() => void changeApprovalMode("auto")}>{t("自动放行")}</button>
           <button type="button" role="radio" aria-checked={approvalMode === "claude"} data-active={approvalMode === "claude"} disabled={locked}
-            title={t("把许可请求转给 MCP 客户端，由 Claude 侧弹卡确认；拒绝即不放行。")} onClick={() => void changeApprovalMode("claude")}>{t("交给 Claude")}</button>
+            title={t("和 Codex 一样，把许可请求转给当前连接的客户端弹卡确认；拒绝即不放行。")} onClick={() => void changeApprovalMode("claude")}>{t("弹卡确认")}</button>
         </div>
       </div>
       <label className="cu-setting">
@@ -841,12 +841,12 @@ export function ComputerUsePage() {
         </details>
 
         <details className="cu-more">
-          <summary><strong>{t("审批记录")}</strong><small>{t("最近连接的客户端是否支持审批卡、浏览器回合钩子、已记住的应用。")}</small></summary>
+          <summary><strong>{t("审批记录")}</strong><small>{t("最近连接的客户端是否支持审批卡、浏览器回合钩子、始终允许的应用。")}</small></summary>
           <section className="cu-card" aria-labelledby="cu-approval-title">
             <div className="cu-card-head">
               <div>
                 <h2 id="cu-approval-title">{t("审批记录")}</h2>
-                <p>{t("审批方式在上图的 codex-plus-cu 节点里切换；这里是客户端能力与已记住的应用。")}</p>
+                <p>{t("审批方式在上方「codex-plus-cu 设置」里切换；这里是客户端能力与始终允许的应用。")}</p>
               </div>
             </div>
             {approval?.lastClient && <p
@@ -857,8 +857,8 @@ export function ComputerUsePage() {
               {approval.lastClient.elicitation
                 ? t("，支持审批卡。")
                 : approval.mode === "claude"
-                  ? t("，未声明审批卡能力（elicitation）。在这个客户端里「交给 Claude 审批」会退回为自动放行，不会弹卡。")
-                  : t("，未声明审批卡能力（elicitation）；如果切到「交给 Claude 审批」，在这个客户端里会退回为自动放行。")}
+                  ? t("，未声明审批卡能力（elicitation）。在这个客户端里「弹卡确认」会退回为自动放行，不会弹卡。")
+                  : t("，未声明审批卡能力（elicitation）；如果切到「弹卡确认」，在这个客户端里会退回为自动放行。")}
             </p>}
             {approval?.turnHooks && <p className={approval.turnHooks.installed ? "cu-hint" : "cu-note cu-note-warn"}>
               {approval.turnHooks.installed
@@ -867,8 +867,8 @@ export function ComputerUsePage() {
             </p>}
             {(approval?.approvals?.length ?? 0) > 0 && <div className="cu-approvals">
               <div className="cu-approvals-head">
-                <strong>{t("已记忆的应用")}</strong>
-                <button className="mg-button" type="button" disabled={locked} onClick={() => void clearApprovals()}>
+                <strong>{t("始终允许的应用")}</strong>
+                <button className="mg-button" type="button" disabled={locked} title={t("Codex 里的「始终允许」也会一起清掉。")} onClick={() => void clearApprovals()}>
                   {busy === "approval:clear" ? <Loader2 size={14} className="cu-spin" /> : null}{t("全部清空")}
                 </button>
               </div>
@@ -876,8 +876,11 @@ export function ComputerUsePage() {
                 {approval!.approvals!.map(([key, entry]) => (
                   <li key={key}>
                     <span className="cu-approval-name">{entry.displayName || key}</span>
-                    <code className="cu-approval-key" title={key}>{key}</code>
-                    <span className="cu-approval-decision" data-decision={entry.decision}>{entry.decision === "allow" ? t("允许") : t("拒绝")}</span>
+                    <code className="cu-approval-key" title={key}>{entry.displayName ? key : ""}</code>
+                    <span className="cu-approval-decision" data-decision={entry.decision}
+                      title={entry.source === "computer-use" ? t("Computer Use 自己记的，Codex 也读这一份；撤销后 Codex 里也会重新询问。") : t("旧版 Codex++ 记录，只对 Codex++ 生效。")}>
+                      {entry.decision !== "allow" ? t("拒绝") : entry.source === "computer-use" ? t("与 Codex 共用") : t("Codex++ 旧记录")}
+                    </span>
                     <button className="mg-button" type="button" disabled={locked} onClick={() => void forgetApproval(key)}>
                       {busy === `forget:${key}` ? <Loader2 size={13} className="cu-spin" /> : null}{t("撤销")}
                     </button>
@@ -885,7 +888,7 @@ export function ComputerUsePage() {
                 ))}
               </ul>
             </div>}
-            {approval && (approval.approvals?.length ?? 0) === 0 && <p className="cu-hint">{t("还没有记住任何应用。选择「交给 Claude 审批」后，Claude 批准过的应用会出现在这里。")}</p>}
+            {approval && (approval.approvals?.length ?? 0) === 0 && <p className="cu-hint">{t("还没有始终允许的应用。在「弹卡确认」的卡片上勾选「始终允许」，或在 Codex 里选「始终允许」后，应用会出现在这里（两边共用）。")}</p>}
           </section>
         </details>
       </>}

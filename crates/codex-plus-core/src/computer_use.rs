@@ -136,7 +136,7 @@ impl Target {
     }
 }
 
-fn home_dir() -> PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
     directories::BaseDirs::new()
         .map(|dirs| dirs.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."))

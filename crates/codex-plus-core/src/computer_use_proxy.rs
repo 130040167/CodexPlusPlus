@@ -494,30 +494,25 @@ impl Forwarder {
     }
 
     /// 逐条答复客户端对审批请求的决定。
+    ///
+    /// 勾了「始终允许」就回 `_meta.persist: "always"`，由 Computer Use 自己记住（和 Codex 一样）。
     fn relay_approval(&mut self, pending: &PendingApproval, message: &Value) -> anyhow::Result<()> {
-        let action = message
-            .get("result")
-            .and_then(|result| result.get("action"))
-            .and_then(Value::as_str)
-            .unwrap_or("cancel");
-        let content = message
-            .get("result")
-            .and_then(|result| result.get("content"))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        let outcome = match action {
-            "accept" => Outcome::ClientAccepted,
-            "decline" => Outcome::ClientDeclined,
+        let (result, always) =
+            crate::computer_use_approval::native_reply(message.get("result"));
+        let outcome = match result.get("action").and_then(Value::as_str) {
+            Some("accept") if always => Outcome::ClientAcceptedAlways,
+            Some("accept") => Outcome::ClientAccepted,
+            Some("decline") => Outcome::ClientDeclined,
             _ => Outcome::ClientCanceled,
         };
         if outcome.accepted() {
-            // `session` 语义在本进程内生效；跨会话的持久化交给 `remember`。
+            // 本进程内不再问；跨会话的「始终允许」由 Computer Use 自己记。
             self.session_allowed.insert(pending.key.clone());
         }
         let reply = json!({
             "jsonrpc": "2.0",
             "id": pending.child_id,
-            "result": { "action": action, "content": content }
+            "result": result
         });
         let mut line = serde_json::to_vec(&reply)?;
         line.push(b'\n');
@@ -656,6 +651,8 @@ impl Forwarder {
             );
             return self.accept_now(&pending, Outcome::AutoAccepted);
         }
+        let mut params = params;
+        crate::computer_use_approval::offer_always(&mut params);
         self.next_token += 1;
         let token = format!("codexplus-cu-elicit-{}", self.next_token);
         let forwarded = json!({

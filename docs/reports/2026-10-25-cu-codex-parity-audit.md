@@ -18,7 +18,7 @@
 |---|---|---|---|
 | 1 | `tools/call` 带 `_meta`：`callId` + `x-codex-turn-metadata`（session_id / thread_id / turn_id / codex_version / `user_input_requested_during_turn`）。源码 `core/src/mcp_tool_call.rs` `build_mcp_tool_call_request_meta`、`core/src/turn_metadata.rs` | 不带 | 不做，见实测 |
 | 2 | 每轮结束 `notify = [SkyComputerUseClient, "turn-ended"]`，负载 `agent-turn-complete` | 没有 | 不做，见实测 |
-| 3 | elicitation 默认弹卡；「始终允许」回 `_meta.persist:"always"`，写进原生持久授权；`approval_policy=never` 时按权限配置决定接受或拒绝（`core/src/session/mcp.rs`） | 默认 `auto` 全部放行；`claude` 模式只在客户端声明 elicitation 时转发；不回 `persist`，授权记在自己的文件 | 产品选择，不做 |
+| 3 | elicitation 默认弹卡；「始终允许」回 `_meta.persist:"always"`，写进原生持久授权；`approval_policy=never` 时按权限配置决定接受或拒绝（`core/src/session/mcp.rs`） | 默认 `auto` 全部放行；「弹卡确认」（`claude`）只在客户端声明 elicitation 时转发 | **已改**：转发的卡片加「始终允许」勾选项，勾上回 `_meta.persist:"always"`，由原生写进 `ComputerUseAppApprovals.json`（与 Codex 共用）；页面列出并可撤销。默认值仍为 `auto` |
 | 4 | initialize：`codex-mcp-client` / title `Codex`，协议 `2025-06-18`，声明 elicitation 与 `openai/*` 扩展 | 透传客户端自己的 clientInfo，补 elicitation | 原生 client 不读 `openai/*` 扩展；未见影响，不做 |
 | 5 | 环境只给 11 个白名单变量 + 非空的自定义 CA 变量（`rmcp-client/src/utils.rs` `create_env_for_mcp_server`） | 继承调用方全部环境（含 Claude `settings.json` 注入的 `ANTHROPIC_AUTH_TOKEN` 等） | **已改**（`7a626928`） |
 | 6 | 进程链：签名的 `codex` 直接拉起 client，cwd `.` | 客户端 → Codex++ → 签名 node → shim → client | 签名校验通过，未见影响，不做 |
