@@ -11774,3 +11774,29 @@ select {
   text-align: left;
 }
 .grok-page-layout .grok-panel > .panel-head.grok-head > div:first-child { justify-items: start; }
+
+/* 供应商行的标签：接入方式 / 非 Responses 协议，参照 CC Switch 的胶囊样式。 */
+.relay-summary-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.relay-tag {
+  flex-shrink: 0;
+  padding: 1px 8px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.6;
+}
+.relay-tag[data-tone="official"] { border-color: hsl(var(--status-success) / 0.35); color: hsl(var(--status-success)); }
+.relay-tag[data-tone="mixed"] { border-color: hsl(280 60% 65% / 0.4); color: hsl(280 60% 72%); }
+.relay-tag[data-tone="api"] { border-color: hsl(210 80% 60% / 0.35); color: hsl(210 80% 66%); }
+.relay-tag[data-tone="aggregate"] { border-color: hsl(var(--brand-accent) / 0.4); color: hsl(var(--brand-accent)); }
+.relay-tag[data-tone="protocol"] { border-style: dashed; }
+/* 第二行只剩地址：不再用主题色，弱化成辅助信息。 */
+.relay-management-page .relay-summary small {
+  overflow: hidden;
+  color: hsl(var(--muted-foreground));
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

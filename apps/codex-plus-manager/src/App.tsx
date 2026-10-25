@@ -9722,11 +9722,22 @@ function SortableRelayProfileCard({
         {providerInitial(profile.name)}
       </span>
       <span className="relay-summary">
+        {/* 参照 CC Switch：接入方式、非 Responses 协议做成名字旁的标签，第二行只放地址。 */}
         <strong>
-          {profile.name || t("未命名供应商")}
+          <span className="relay-summary-name">{profile.name || t("未命名供应商")}</span>
+          <span className="relay-tag" data-tone={relayProfileTagTone(profile)}>{relayProfileModeLabel(profile)}</span>
+          {!isAggregateRelayProfile(profile) && profile.protocol !== "responses" ? (
+            <span className="relay-tag" data-tone="protocol">{relayProtocolShortLabel(profile.protocol)}</span>
+          ) : null}
           {active ? <span className="relay-active-badge">{t("使用中")}</span> : null}
         </strong>
-        <small>{relayProfileModeLabel(profile)} · {relayProtocolLabel(profile.protocol)} · {relayProfileConfigBrief(profile)}</small>
+        <small>
+          {profile.relayMode === "official"
+            ? profile.officialMixApiKey
+              ? profile.baseUrl || t("未填写 URL")
+              : t("使用 Codex 当前登录的 ChatGPT 账号")
+            : relayProfileConfigBrief(profile)}
+        </small>
       </span>
       <span className="relay-card-actions">
         <Button
@@ -15638,6 +15649,20 @@ function normalizeAnthropicThinkingMode(value: string | undefined): string {
 function normalizeAnthropicMaxTokens(value: number | undefined): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return 0;
   return Math.min(200000, Math.round(value));
+}
+
+/// 列表标签用的短协议名：卡片空间小，「转 Responses」留在编辑页里说明。
+function relayProtocolShortLabel(protocol: RelayProtocol): string {
+  if (protocol === "chatCompletions") return "Chat Completions";
+  if (protocol === "anthropicMessages") return "Anthropic";
+  return "Responses";
+}
+
+/// 接入方式标签的配色分组。
+function relayProfileTagTone(profile: RelayProfile): string {
+  if (isAggregateRelayProfile(profile)) return "aggregate";
+  if (profile.relayMode === "official") return profile.officialMixApiKey ? "mixed" : "official";
+  return "api";
 }
 
 function relayProtocolLabel(protocol: RelayProtocol): string {
