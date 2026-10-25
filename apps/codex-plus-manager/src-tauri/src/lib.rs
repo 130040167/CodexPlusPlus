@@ -101,6 +101,7 @@ pub fn run_computer_use_cli(args: &[std::ffi::OsString]) -> anyhow::Result<()> {
                         id,
                         scale,
                         12.0,
+                        codex_plus_core::window_capture::CaptureMode::Screenshot,
                         move |jpeg| {
                             let _ = tx.send(jpeg);
                         },
@@ -264,6 +265,8 @@ pub fn run() {
             computer_use_commands::computer_use_uninstall,
             computer_use_commands::computer_use_check,
             computer_use_commands::computer_use_open_app,
+            computer_use_commands::computer_use_browser_extension_status,
+            computer_use_commands::computer_use_open_extension_store,
             computer_use_commands::computer_use_approval_get,
             computer_use_commands::computer_use_approval_set,
             computer_use_commands::computer_use_approval_forget,

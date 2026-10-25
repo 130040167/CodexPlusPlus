@@ -103,6 +103,7 @@ export function ComputerUsePage() {
   const [actionError, setActionError] = useState("");
   const [notice, setNotice] = useState("");
   const [approval, setApproval] = useState<CuApprovalState | null>(null);
+  const [extStatus, setExtStatus] = useState<{ installed: boolean; storeUrl: string } | null>(null);
   const mounted = useRef(false);
   const epoch = useRef(0);
   const lock = useRef(false);
@@ -208,6 +209,9 @@ export function ComputerUsePage() {
     mounted.current = true;
     void loadStatus();
     void loadApproval();
+    void invoke<{ installed: boolean; storeUrl: string }>("computer_use_browser_extension_status")
+      .then((r) => { if (mounted.current) setExtStatus(r); })
+      .catch(() => { /* 非致命，静默忽略 */ });
     return () => {
       mounted.current = false;
       epoch.current += 1;
@@ -338,6 +342,33 @@ export function ComputerUsePage() {
             {busy === "open" ? <Loader2 size={14} className="cu-spin" /> : <Play size={14} />}{busy === "open" ? t("正在打开…") : t("打开 ChatGPT")}
           </button>
         </div>}
+      </section>
+
+      <section className="cu-card" aria-labelledby="cu-ext-title">
+        <div className="cu-card-head">
+          <div>
+            <h2 id="cu-ext-title">{t("Chrome 浏览器扩展")}</h2>
+            <p>{t("浏览器控制依赖 OpenAI 官方的 ChatGPT for Chrome 扩展。装好后无需额外配置，刷新页面即生效。")}</p>
+          </div>
+        </div>
+        <div className="cu-ext-row">
+          {extStatus == null
+            ? <span className="cu-hint">{t("检测中…")}</span>
+            : extStatus.installed
+              ? <span className="cu-ext-ok"><CheckCircle2 size={14} />{t("扩展已安装")}</span>
+              : <>
+                  <span className="cu-note cu-note-warn">{t("未检测到扩展，浏览器工具不可用。")}</span>
+                  <button
+                    className="mg-button mg-primary"
+                    type="button"
+                    disabled={locked}
+                    onClick={() => void invoke("computer_use_open_extension_store")}
+                  >
+                    {t("安装 Chrome 扩展 →")}
+                  </button>
+                </>
+          }
+        </div>
       </section>
 
       <section className="cu-card" aria-labelledby="cu-targets-title">

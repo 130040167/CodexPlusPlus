@@ -73,6 +73,10 @@
   color: #b45309;
 }
 
+.cu-ext-row { display:flex; align-items:center; gap:12px; flex-wrap:wrap; min-height:32px; }
+.cu-ext-ok { display:flex; align-items:center; gap:6px; font-size:13px; color:hsl(var(--muted-foreground)); }
+.cu-ext-ok svg { color:hsl(142 71% 45%); flex-shrink:0; }
+
 /* 审批：两个模式卡片 + 已记忆应用列表 */
 .cu-approval-modes { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:10px; }
 .cu-mode {

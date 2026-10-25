@@ -149,6 +149,61 @@ pub async fn computer_use_open_app() -> CommandResult<Value> {
     }
 }
 
+/// 检测 Codex 浏览器扩展是否已在 Chrome 里安装。
+///
+/// 判断依据：native messaging host 配置文件是否存在，以及 Chrome 扩展目录是否有
+/// 对应扩展 ID 的目录。只检测状态，不做任何写入。
+#[tauri::command]
+pub async fn computer_use_browser_extension_status() -> CommandResult<Value> {
+    use std::path::PathBuf;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    // Codex 用的两个扩展 ID（生产版 + 另一发布渠道）。
+    const EXT_IDS: &[&str] = &[
+        "hehggadaopoacecdllhhajmbjkdcmajg",
+        "odlomjlbamekndcpllcnffbgeohgkmjh",
+    ];
+    // native messaging host 文件：有它说明 Codex 已经注册过了。
+    let host_json = home
+        .join("Library/Application Support/Google/Chrome/NativeMessagingHosts")
+        .join("com.openai.codexextension.json");
+    let host_registered = host_json.is_file();
+    // Chrome 扩展目录：有任意一个 ID 目录就视为已安装。
+    let ext_base = home.join("Library/Application Support/Google/Chrome/Default/Extensions");
+    let ext_installed = EXT_IDS
+        .iter()
+        .any(|id| ext_base.join(id).is_dir());
+    let installed = host_registered || ext_installed;
+    ok(
+        if installed { "Chrome 浏览器扩展已安装。" } else { "Chrome 浏览器扩展未安装。" },
+        json!({
+            "installed": installed,
+            "hostRegistered": host_registered,
+            "extensionInstalled": ext_installed,
+            "storeUrl": "https://chromewebstore.google.com/detail/chatgpt/hehggadaopoacecdllhhajmbjkdcmajg",
+        }),
+    )
+}
+
+/// 打开 Chrome Web Store 里的 ChatGPT 扩展页，让用户点「添加到 Chrome」。
+#[tauri::command]
+pub async fn computer_use_open_extension_store() -> CommandResult<Value> {
+    let url = "https://chromewebstore.google.com/detail/chatgpt/hehggadaopoacecdllhhajmbjkdcmajg";
+    #[cfg(windows)]
+    let result = codex_plus_core::windows_open_url(url).map_err(|e| e.to_string());
+    #[cfg(not(windows))]
+    let result = std::process::Command::new("open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    match result {
+        Ok(()) => ok("已打开 Chrome Web Store 扩展页。", json!({ "url": url })),
+        Err(error) => failed(&format!("打开扩展页失败：{error}"), json!({ "url": url })),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 审批
 // ---------------------------------------------------------------------------
@@ -277,6 +332,7 @@ pub async fn computer_use_preview_start(
     window_id: u32,
     scale: Option<f64>,
     max_fps: Option<f64>,
+    mode: Option<String>,
 ) -> CommandResult<Value> {
     use base64::Engine as _;
     use tauri::Emitter as _;
@@ -284,6 +340,10 @@ pub async fn computer_use_preview_start(
     stop_preview();
     let scale = scale.unwrap_or(0.5);
     let max_fps = max_fps.unwrap_or(12.0);
+    let capture_mode = match mode.as_deref() {
+        Some("stream") => codex_plus_core::window_capture::CaptureMode::Stream,
+        _ => codex_plus_core::window_capture::CaptureMode::Screenshot,
+    };
     let frame_app = app.clone();
     let seq = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
@@ -291,6 +351,7 @@ pub async fn computer_use_preview_start(
         window_id,
         scale,
         max_fps,
+        capture_mode,
         move |jpeg| {
             let n = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let encoded = base64::engine::general_purpose::STANDARD.encode(&jpeg);
@@ -326,7 +387,7 @@ pub async fn computer_use_preview_start(
     *slot = Some(handle);
     ok(
         "预览已开始。",
-        json!({ "event": PREVIEW_FRAME_EVENT, "scale": scale, "maxFps": max_fps }),
+        json!({ "event": PREVIEW_FRAME_EVENT, "scale": scale, "maxFps": max_fps, "mode": format!("{:?}", capture_mode).to_lowercase() }),
     )
 }
 
