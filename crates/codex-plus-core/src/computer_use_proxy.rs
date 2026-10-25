@@ -525,6 +525,14 @@ impl Forwarder {
     /// 子进程 → 客户端。审批请求按策略处理，其余帧原样透传。
     fn on_child(&mut self, frame: Vec<u8>) -> anyhow::Result<()> {
         self.note_activity(&frame);
+        // JS 档操作浏览器：同 Codex，用结果里附带的截图更新悬浮预览。
+        if self.js.is_some()
+            && mentions(&frame, b"codex/toolSurface")
+            && mentions(&frame, b"browserUse")
+            && let Ok(message) = serde_json::from_slice::<Value>(&frame)
+        {
+            crate::cu_activity::note_browser_surface(&message);
+        }
         if mentions(&frame, b"\"method\"") && mentions(&frame, b"elicitation/create") {
             if let Ok(message) = serde_json::from_slice::<Value>(&frame) {
                 if message.get("method").and_then(Value::as_str) == Some("elicitation/create") {

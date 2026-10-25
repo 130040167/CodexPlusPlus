@@ -14,6 +14,12 @@
 //! - 用户点了关闭：这个会话里不再弹，直到下一个会话。
 //!
 //! 窗口显示时**不激活** Codex++，用户正在用的窗口不会失焦。
+//!
+//! # 浏览器
+//!
+//! 同 Codex：浏览器标签页的画面来自 `cua_repl` 结果里附带的截图（CU 服务写进
+//! `cu/pip-frame.jpg`），每操作一次更新一次。agent 的标签页在后台，Chrome 在不在前台
+//! 都显示；标签页都关了、回合结束或空闲 20 秒时收起。
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -48,6 +54,10 @@ struct PipState {
     dismissed_session: Option<u32>,
     /// 预览标题栏显示的应用名与窗口标题。
     target: serde_json::Value,
+    /// 当前目标是浏览器标签页（画面取自截图文件，而不是窗口取流）。
+    browser: bool,
+    /// 已推给预览的截图文件修改时间。
+    frame_seen: Option<std::time::SystemTime>,
 }
 
 static STATE: Mutex<Option<PipState>> = Mutex::new(None);
@@ -108,6 +118,19 @@ fn tick(app: &AppHandle, last_at: &mut u64, spool: &std::path::Path, spool_seen:
     {
         *last_at = activity.at;
         match activity.event.as_str() {
+            "act" if activity.kind == "browser" => with_state(|state| {
+                log("cu_pip.browser", json!({ "title": activity.title, "session": activity.session }));
+                if state.dismissed_session == Some(activity.session) || !enabled() {
+                    return;
+                }
+                state.browser = true;
+                state.window_id = None;
+                state.session = activity.session;
+                // 「切到该应用」用：Chrome 的进程。
+                state.pid = resolve_pid(&activity.app_name).unwrap_or(0);
+                state.target = json!({ "appName": activity.app_name, "title": activity.title });
+                state.last_act = Some(Instant::now());
+            }),
             "act" => {
                 // JS 档只有应用名：按名字找进程。
                 let pid = if activity.pid > 0 {
@@ -121,9 +144,10 @@ fn tick(app: &AppHandle, last_at: &mut u64, spool: &std::path::Path, spool_seen:
                         if state.dismissed_session == Some(activity.session) || !enabled() {
                             return;
                         }
-                        if state.pid != pid {
+                        if state.pid != pid || state.browser {
                             state.window_id = None;
                         }
+                        state.browser = false;
                         state.session = activity.session;
                         state.pid = pid;
                         state.last_act = Some(Instant::now());
@@ -139,20 +163,68 @@ fn tick(app: &AppHandle, last_at: &mut u64, spool: &std::path::Path, spool_seen:
         }
     }
 
-    let (pid, active) = with_state(|state| {
+    let (pid, active, browser) = with_state(|state| {
         let active = state
             .last_act
             .is_some_and(|at| at.elapsed() < IDLE);
         if !active {
             state.last_act = None;
         }
-        (state.pid, active)
+        (state.pid, active, state.browser)
     });
+    if browser {
+        if active {
+            show_browser(app);
+        } else {
+            hide(app);
+        }
+        return;
+    }
     let want = active && pid > 0 && cu_activity::frontmost_pid() != Some(pid);
     if want {
         show(app, pid);
     } else {
         hide(app);
+    }
+}
+
+/// 浏览器标签页：截图文件有更新就推给预览。
+fn show_browser(app: &AppHandle) {
+    let Some(window) = ensure_window(app) else {
+        return;
+    };
+    stop_preview();
+    let path = cu_activity::frame_path();
+    let modified = std::fs::metadata(&path).and_then(|meta| meta.modified()).ok();
+    let (fresh, first, target) = with_state(|state| {
+        let fresh = modified.is_some() && modified != state.frame_seen;
+        let first = state.frame_seen.is_none();
+        if fresh {
+            state.frame_seen = modified;
+        }
+        (fresh, first, state.target.clone())
+    });
+    if fresh {
+        let Ok(jpeg) = std::fs::read(&path) else {
+            return;
+        };
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+        // 预览收到目标事件会清掉旧画面，所以先发目标、再发画面。
+        let _ = window.emit_to(LABEL, TARGET_EVENT, target);
+        let _ = window.emit_to(
+            LABEL,
+            FRAME_EVENT,
+            json!({ "data": format!("data:image/jpeg;base64,{encoded}") }),
+        );
+        if first {
+            log("cu_pip.show_browser", json!({ "bytes": jpeg.len() }));
+        }
+    }
+    let already = with_state(|state| state.visible);
+    if !already && modified.is_some() {
+        order_front(app, &window);
+        with_state(|state| state.visible = true);
     }
 }
 
@@ -236,7 +308,11 @@ fn show(app: &AppHandle, pid: i32) {
 fn hide(app: &AppHandle) {
     let visible = with_state(|state| std::mem::replace(&mut state.visible, false));
     stop_preview();
-    with_state(|state| state.window_id = None);
+    with_state(|state| {
+        state.window_id = None;
+        // 下次显示时重新推一次画面。
+        state.frame_seen = None;
+    });
     if visible && let Some(window) = app.get_webview_window(LABEL) {
         let _ = window.hide();
     }

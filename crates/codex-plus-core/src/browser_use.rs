@@ -419,6 +419,8 @@ impl ProxyState {
             return;
         }
         if let Some(child_id) = message.get("id").and_then(Value::as_i64) {
+            // 同 Codex：结果里附带的标签页截图拿去更新悬浮预览。
+            crate::cu_activity::note_browser_surface(&message);
             if let Some(client_id) = self.pending.remove(&child_id) {
                 message["id"] = client_id;
                 if let Some(tool) = self.plans.remove(&child_id) {
