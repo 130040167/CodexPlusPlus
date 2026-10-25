@@ -1,19 +1,50 @@
 # 更新日志
 
-## 未发布
+## 1.12.0 - 2026-10-25
 
-### 修复
-
-- **第三方上游反复收到 gpt-\* / codex-auto-review 请求并报错扣费**（#1183，同族 #1446 / #1457）：Codex 客户端的自动审查（`codex-auto-review`）与标题/摘要、子代理等后台任务固定使用 gpt-\* 等内部模型名，不经用户选模；第三方上游没有这些名字，本地代理原样转发只会得到「No available channel / 模型不存在」类错误，还可能按失败重试持续消耗额度。开启「目录外模型映射」后，本地协议代理（Responses 与 Chat Completions 两条路径）会把「不在当前供应商公布模型集里的请求模型」改写为该供应商的默认模型再转发：用户显式配置进列表的 gpt-\* 照原样转发；官方登录（未混入 API）与聚合供应商不适用（前者后端本来就有官方模型，后者有自己的按成员归因策略）。设置页新增「目录外模型映射」开关（默认关闭，需手动开启，对应 `protocolProxyMapUnlistedModels`；开启后手填但未写进模型列表的模型也会被改写）；供应商配置了「自动审批模型」时 `codex-auto-review` 仍按该配置改写，不被本映射覆盖；每对「来源 → 目标」只记一条诊断日志（`protocol_proxy.unlisted_model_mapped`），不会刷大日志。
+本次为功能更新：Codex++ 不再只服务 Codex——新增 Claude Code 供应商管理与跨 Agent 的 Computer Use，管理界面整体改版，并修复一批供应商、代理与会话问题。
 
 ### 新增
 
-- **轮次回退（实验性，默认关闭）**：在本地 Codex 回答菜单的“分支到新聊天”下增加回退入口。先保存本机恢复记录，再让 AI 撤销选中轮及后续轮次的可恢复操作；仅在报告全部完成且会话未出现新轮次时截断历史。支持停止、原生另存为导出及失败保留记录，不修改官方安装包。详见 [使用说明与限制](docs/turn-rewind.md)。
+- **Computer Use 共享**：把 Codex 桌面版自带的 Computer Use 与 Chrome 浏览器控制，通过 MCP 接给 Claude Code、Claude Desktop、Codex CLI、DeepSeek Harness、ZCode 与 WorkBuddy AI。在最左栏「Computer Use」页给客户端点「接入」，重启客户端即可使用；工具名以 `mcp__codex-plus-cu__` 与 `mcp__codex-plus-browser__` 开头。直接复用本机 ChatGPT.app 的原生服务，不复制任何官方程序；写入客户端配置前自动备份，只改动 Codex++ 自己写入的条目。目前仅支持 macOS。
+  - 操作方式可选「JS」（与 Codex 当前路径一致，默认）或「离散工具」；操作后台应用时可显示可拖动的悬浮预览。
+  - 首次接管某个应用时可选「自动放行」（只记审计日志）或「弹卡确认」（由客户端弹卡，支持「始终允许」）；不支持审批卡的客户端会退回放行并在页面上说明。
+  - 客户端换了配置目录（例如被包装器改了 `CLAUDE_CONFIG_DIR`）时，可以登记任意多个自定义目录并起名字。
+- **Claude Code 供应商**：参考 CC Switch 的列表与编辑体验，一键切换 Claude Code 的 API 供应商（写入 `~/.claude/settings.json`），支持从 cc-switch 等第三方导入。
+- **自动审批模型**（#1446、#1457）：供应商可单独配置自动审批（`codex-auto-review`）使用的模型，配置后该供应商改走本地代理（#1021）。
+- **目录外模型映射**（#1183）：Codex 的后台任务固定使用 gpt-\* 等内部模型名，第三方上游没有这些模型会报错甚至扣费。开启后，本地代理会把不在供应商模型列表里的请求模型改写为该供应商的默认模型。默认关闭，在「代理设置」中开启。
+- **切换默认模型后旧会话跟随**（#2081）：切换供应商或默认模型后，可选择把仍停在旧默认模型的会话改为新默认；手动选过模型的会话不变。
+- **轮次回退（实验性，默认关闭）**：在回答菜单中撤销本轮及后续轮次的可恢复操作，报告全部完成后再截断会话；恢复记录保存在本机。详见 [使用说明与限制](docs/turn-rewind.md)。
+- **侧聊保存为普通会话**：本地 Side Chat 回复结束后可保存为普通会话，包含创建侧聊时的主历史。
+- **AI Agent 缓存清理**：扫描 Codex、Claude 与 Codex++ 的已知缓存目录，打开即扫描，由你勾选清理。
+- **新版本角标**：有新版本时左上角 logo 显示角标，点一下即可打开更新窗口。
 
-- **Computer Use 接入（原生直通 Codex 桌面版的 CU server）**：新增「Computer Use」页，把 Codex 桌面版的 computer use 以 MCP 接给 Claude Code 与 Claude Desktop。做法不是重写鼠标键盘模拟，也不是转译 cua-repl 的 JS 工具，而是**直通原生 CU server**（`SkyComputerUseClient mcp`）：它对外就是标准 stdio MCP，10 个离散工具（`list_apps` / `get_app_state` / `click` / `perform_secondary_action` / `set_value` / `select_text` / `scroll` / `drag` / `press_key` / `type_text`），带 `annotations`。唯一门槛是它校验「直接父进程的代码签名」——非 OpenAI 签名会被拒为 `-10000 Sender process is not authenticated`；因此由 ChatGPT.app 自带的签名 node 执行一个只负责 `spawn` 的 shim 拉起，中间不插 shell。工具面、AX 树信封、diff 语义（`There has been no change…`）、截图原分辨率、`frontmost` 标记全部原样透传，不再逐项手工对齐。代理只做三件事：字节转发、`initialize` 时替客户端补 `elicitation` 能力、按策略处理审批。「运行自检」走同一条直通链路（`tools/list` 校验工具面 + `tools/call list_apps`），失败按「未安装 / 父进程不受信 / 未授权 / 服务未就绪」分类提示。写入配置仍是「锁 → 读 → 比对 → 备份 → 原子写」，同名条目不是本功能写入的一律不覆盖；接入后需重启对应客户端会话。Codex 自己会把 `[mcp_servers.computer-use]` 写进 `~/.codex/config.toml`，桌面版与 CLI 共用该文件，因此不再重复接入。
-- **Computer Use 审批策略**：页面上可切换两档——「完全放开」自动放行所有应用、只记审计；「交给 Claude 审批」把 Codex 原生的 `Allow ChatGPT to use "X"?` 请求原样转给 MCP 客户端，由 Claude 侧弹卡，拒绝即不放行。批准过的应用记进 `~/.codex-session-delete/cu/approvals.json`，可在页面上逐个撤销或全部清空。客户端未声明 elicitation 能力时会退回放行并在日志里说明，不会干等到超时（实测 Claude Code 2.1.245 不声明、3.x 起以实际握手为准，所以按能力而非版本号判断）。
-- **Chrome 浏览器控制**：新增独立的 `codex-plus-browser` MCP server，暴露 12 个离散工具（`browser_list` / `tabs` / `open` / `close` / `state` / `click` / `type` / `key` / `eval` / `screenshot` / `group` / `group_update`），走 Codex 自己的 Chrome 扩展桥（native messaging），不需要自建扩展。标签页按元素索引点击走 AX 树，标签分组用 browser 级 `management` 能力。与 CU 分成两个 server 的原因：原生 CU server 没有浏览器工具，而浏览器桥要求每次调用带 Codex 的 turn 元数据。
-- **更多接入目标：DeepSeek Harness / ZCode / WorkBuddy AI**：Computer Use 页新增三个客户端，桌面操控与浏览器两个 server 一起登记。DeepSeek Harness 写进桌面版 profile 的补丁层 `~/.dsh/profiles/desktop/cordis.patch.yml`（每个 server 一条 `@deepseek-ai/dsh-mcp-client` 条目，放在带首尾标记的托管块里，用户自己的补丁与注释不动，卸载整段删除）；ZCode 写 `~/.zcode/cli/config.json` 的 `mcp.servers`（ZCode 优先读这里）；WorkBuddy AI 写 `~/.workbuddy/mcp.json`。工具没装（配置目录不存在）时显示为「不支持」，不替它建目录。WorkBuddy 只在 `mcp.json` 不存在时写入示例 MCP 服务，由 Codex++ 先建文件后它就不会再写，页面上会提示。接入状态现在同时检查两个 server，只缺浏览器条目也会提示「需更新」。
+### 改进
+
+- **管理界面改版**：左上角加 Codex++ logo，Computer Use 移到最左栏与 Agent 图标同组；概览页显示当前供应商、最近 24 小时请求与健康检查（本地服务与协议转换拆为两项）。
+- **供应商列表与编辑页**：参照 CC Switch 用标签显示接入方式，一眼看出当前供应商；编辑页加分区导航、兼容开关分组与模型批量设置；进入供应商配置时直接停在当前供应商所在的分区；关闭「配置切换」时隐藏列表。
+- **自动保存**：Codex 增强、Codex 设置、整体设置、代理设置、会话修复开关与微信连接改为自动保存，不再需要手动点「保存设置」。供应商编辑等需要先填完整的地方仍保留显式保存。
+- **删除「测试模型」设置**：「测试供应商」与 Provider Doctor 直接使用供应商配置的默认模型，没有默认模型时取模型列表第一项。
+- **代理设置、Codex 设置、Claude 增强、Grok 配置、拓展市场等页面重新排版**，请求日志工具栏宽屏下不再换行。
+
+### 修复
+
+- **官方快照吸收 API Key 登录态导致切换/保存失败**（#2601）。
+- **切换供应商时丢失 `[memories]` 设置**（#2021）：现在保留 live 配置里的该段。
+- **卸载后 config.toml 仍指向本机代理**（#406）：卸载时恢复为官方配置。
+- **商店版 Claude 汉化不生效**（#2616）：改写入 Claude-3p 配置。
+- **会话管理标题与 Codex 侧栏不一致**（#1976）：优先使用侧栏线程名。
+- **导出时找不到会话文件**（#167）：threads 缺行或 rollout_path 失效时按会话 id 回退查找。
+- **「纯 API 模式禁用 Work 视图」开关不起作用**（#2632）。
+- **原生 Fast 入口在本机纯 API 空账号时缺失**，以及额度用尽后前端仍被硬锁定的问题。
+- **service-tier 探测漏掉 app-shared- 前缀**（#2657）。
+- **macOS 兼容壳被单独打开时无响应**（#2493）：现在转交主程序或给出提示。
+- **Windows**：托盘左键单击直接唤起主窗口（#2676）；图标 256px 条目放回第一位（#2662）；保留 Codex 原生图标。
+- **代理与 PAC**：插件 Git 安装（#2475）、脚本市场与主题市场（#1329、#1339）按地址求值系统代理，支持 PAC；NO_PROXY 不再被当作需要清理的代理变量（#2691）。
+- **Provider Doctor 把被自身输出上限截断的测试请求判为告警**（#2638）。
+- **模型上下文窗口占位文字看起来像已填的 1M**（#2253）；上下文窗口解析容忍千分位，全局窗口不再压过模板。
+- **设置文件原子写入前未 fsync**（#2450）。
+- **社区 PR**：图片主题被原生容器遮挡与状态栏对比度（#2563）、历史官方市场注册导致插件安装状态丢失（#2607）、主题重复下载（#2608）、VLM 上下文窗口匹配与估算（#2617）、残留会话菜单（#2629）、重启官方 Codex 时丢失显式 HTTP 连接配置（#2634）、第三方导入菜单被挤出屏幕（#2648）、拒绝非 http(s) 的广告落地页（#2663）。
 
 ## 1.11.2 - 2026-10-23
 
