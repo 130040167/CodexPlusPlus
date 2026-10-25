@@ -12293,3 +12293,13 @@ select {
 .grok-provider-row .grok-provider-delete { opacity: 0; transition: opacity 0.16s ease; }
 .grok-provider-row:hover .grok-provider-delete,
 .grok-provider-row:focus-within .grok-provider-delete { opacity: 1; }
+
+/* 设置页的自动保存状态：靠右一行小字，替代原来底部的「保存设置」条。 */
+.settings-autosave {
+  justify-content: flex-end;
+  min-height: 20px;
+}
+
+.settings-page > .settings-autosave {
+  margin-bottom: -4px;
+}

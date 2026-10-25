@@ -861,8 +861,6 @@ export const EN_PLAIN: Record<string, string> = {
   "保存扩展项": "Save entry",
   "保存的应用路径": "Saved app path",
   "保存自动修复设置": "Save auto-repair settings",
-  "保存设置": "Save settings",
-  "设置有修改时，保存后才会写入本地配置。": "Save to write changed settings to the local configuration.",
   "修复历史会话": "Repair historical sessions",
   "启动 Codex 前整理旧对话的归属标记。": "Organize historical session ownership before Codex starts.",
   "保存路径": "Saved path",

@@ -4308,7 +4308,7 @@ export function App() {
               onDeleteMany={actions.deleteLocalSessions}
               onArchiveMany={actions.archiveLocalSessions}
               onListProjectSessions={actions.listProjectSessions}
-              repairPanel={<SessionRepairPanel form={settingsForm} providerSyncProgress={providerSyncProgress}
+              repairPanel={<SessionRepairPanel dirty={settingsDirty} form={settingsForm} providerSyncProgress={providerSyncProgress}
                 sessionIndexRepairActive={sessionIndexRepairActive} sessionIndexRepairReport={sessionIndexRepairReport}
                 sessionIndexRepairReportError={sessionIndexRepairReportError} providerSyncTargets={providerSyncTargets}
                 selectedProviderSyncTarget={selectedProviderSyncTarget} onFormChange={setSettingsForm} actions={actions} />}
@@ -4347,7 +4347,7 @@ export function App() {
               qr={weixinQr}
               sessions={localSessions?.sessions ?? []}
               onFormChange={setSettingsForm}
-              onSave={() => void saveSettings()}
+              autoSave={<SettingsAutoSave dirty={settingsDirty} form={settingsForm} actions={actions} />}
               onQrLogin={() => void beginWeixinQrLogin()}
               onStart={() => void startWeixinConnect()}
               onStop={() => void stopWeixinConnect()}
@@ -4421,6 +4421,7 @@ export function App() {
           {route === "settings" ? (
             <GlobalSettingsScreen
               dirty={settingsDirty}
+              form={settingsForm}
               settings={settings}
               theme={theme}
               actions={actions}
@@ -4929,7 +4930,7 @@ function WeixinConnectScreen({
   qr,
   sessions,
   onFormChange,
-  onSave,
+  autoSave,
   onQrLogin,
   onStart,
   onStop,
@@ -4944,7 +4945,7 @@ function WeixinConnectScreen({
   qr: WeixinQrResult | null;
   sessions: LocalSession[];
   onFormChange: (value: BackendSettings) => void;
-  onSave: () => void;
+  autoSave: ReactNode;
   onQrLogin: () => void;
   onStart: () => void;
   onStop: () => void;
@@ -4991,10 +4992,7 @@ function WeixinConnectScreen({
               </div>
             </div>
             <div className="toolbar weixin-connect-actions">
-              <Button onClick={onSave} variant="outline">
-                <Save className="h-4 w-4" />
-                {t("保存")}
-              </Button>
+              {autoSave}
               <Button onClick={onQrLogin} variant="outline">
                 <ScanLine className="h-4 w-4" />
                 {form.weixinConnectToken ? t("重新登录") : t("扫码登录")}
@@ -5553,6 +5551,7 @@ function ProxySettingsScreen({
 
   return (
     <div className="settings-page proxy-settings-page">
+      <SettingsAutoSave dirty={dirty} form={form} actions={actions} />
       <Panel>
         <CardHead
           title={t("本地协议代理")}
@@ -5824,15 +5823,6 @@ function ProxySettingsScreen({
 
       <RelayEnvironmentScreen result={relayEnvironment} actions={actions} />
 
-      {dirty ? (
-        <div className="settings-save-bar">
-          <span>{t("设置有修改时，保存后才会写入本地配置。")}</span>
-          <Button onClick={() => void actions.saveSettings()}>
-            <Save className="h-4 w-4" />
-            {t("保存设置")}
-          </Button>
-        </div>
-      ) : null}
     </div>
   );
 }
@@ -7493,6 +7483,22 @@ function AutoSaveStatus({ state }: { state: AutoSaveState }) {
   );
 }
 
+/// 设置表单的自动保存：改动后稍等片刻写入，替代原来的「保存设置」按钮。
+/// 做成组件而不是在各页面里直接调用 hook，方便在列表、面板等位置按需插入。
+function SettingsAutoSave({ dirty, form, actions, className = "" }: {
+  dirty: boolean;
+  form: BackendSettings;
+  actions: Actions;
+  className?: string;
+}) {
+  const state = useEnhanceAutoSave(dirty, form, actions.autoSaveSettings);
+  return (
+    <div className={`enhance-save-actions settings-autosave ${className}`}>
+      <AutoSaveStatus state={state} />
+    </div>
+  );
+}
+
 function EnhanceScreen({
   dirty,
   activeTab,
@@ -8942,7 +8948,8 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
   );
 }
 
-function SessionRepairPanel({ form, providerSyncProgress, sessionIndexRepairActive, sessionIndexRepairReport, sessionIndexRepairReportError, providerSyncTargets, selectedProviderSyncTarget, onFormChange, actions }: {
+function SessionRepairPanel({ dirty, form, providerSyncProgress, sessionIndexRepairActive, sessionIndexRepairReport, sessionIndexRepairReportError, providerSyncTargets, selectedProviderSyncTarget, onFormChange, actions }: {
+  dirty: boolean;
   form: BackendSettings;
   providerSyncProgress: ProviderSyncProgress;
   sessionIndexRepairActive: boolean;
@@ -9060,11 +9067,8 @@ function SessionRepairPanel({ form, providerSyncProgress, sessionIndexRepairActi
                 <Wrench className="h-4 w-4" />
                 {sessionIndexRepairActive ? t("正在检查索引…") : t("修复会话索引")}
               </Button>
-              <Button onClick={() => void actions.saveSettings()}>
-                <Save className="h-4 w-4" />
-                {t("保存设置")}
-              </Button>
             </div>
+            <SettingsAutoSave dirty={dirty} form={form} actions={actions} />
           </div>
 
           {providerSyncProgress.active || providerSyncProgress.percent > 0 ? (
@@ -9271,7 +9275,7 @@ function SessionsScreen({
             </div>
           </div>
 
-          <SessionRepairPanel form={form} providerSyncProgress={providerSyncProgress} sessionIndexRepairActive={sessionIndexRepairActive} sessionIndexRepairReport={sessionIndexRepairReport} sessionIndexRepairReportError={sessionIndexRepairReportError} providerSyncTargets={providerSyncTargets} selectedProviderSyncTarget={selectedProviderSyncTarget} onFormChange={onFormChange} actions={actions} />
+          <SessionRepairPanel dirty={false} form={form} providerSyncProgress={providerSyncProgress} sessionIndexRepairActive={sessionIndexRepairActive} sessionIndexRepairReport={sessionIndexRepairReport} sessionIndexRepairReportError={sessionIndexRepairReportError} providerSyncTargets={providerSyncTargets} selectedProviderSyncTarget={selectedProviderSyncTarget} onFormChange={onFormChange} actions={actions} />
         </CardContent>
       </Panel>
       <Panel className="sessions-list-panel">
@@ -9705,6 +9709,7 @@ function AgentSettingsScreen({
 }) {
   return (
     <div className="settings-page">
+      <SettingsAutoSave dirty={dirty} form={form} actions={actions} />
       <>
         <Panel>
           <SwitchPanelHead
@@ -9800,8 +9805,6 @@ function AgentSettingsScreen({
           </CardContent>
         </Panel>
       </>
-
-      <SettingsSaveBar dirty={dirty} actions={actions} />
     </div>
   );
 }
@@ -9812,12 +9815,14 @@ function AgentSettingsScreen({
 /// Agent 专属选项放在各 Agent 菜单的「设置」里，见 [AgentSettingsScreen]。
 function GlobalSettingsScreen({
   dirty,
+  form,
   settings,
   theme,
   actions,
   onOpenAgentSettings,
 }: {
   dirty: boolean;
+  form: BackendSettings;
   settings: SettingsResult | null;
   theme: Theme;
   actions: Actions;
@@ -9827,6 +9832,7 @@ function GlobalSettingsScreen({
   // 每一项都是同一种行：左边标题 + 说明，右边操作。路径只在「配置文件路径」里出现一次。
   return (
     <div className="settings-page global-settings-page">
+      <SettingsAutoSave dirty={dirty} form={form} actions={actions} />
       <Panel>
         <CardHead title={t("基础设置")} detail="" />
         <CardContent className="global-settings-list">
@@ -9871,21 +9877,6 @@ function GlobalSettingsScreen({
           </div>
         </CardContent>
       </Panel>
-      <SettingsSaveBar dirty={dirty} actions={actions} />
-    </div>
-  );
-}
-
-/// 设置页底部的保存条：整体设置与 Agent 设置共用。
-function SettingsSaveBar({ dirty, actions }: { dirty: boolean; actions: Actions }) {
-  if (!dirty) return null;
-  return (
-    <div className="settings-save-bar">
-      <span>{t("设置有修改时，保存后才会写入本地配置。")}</span>
-      <Button onClick={() => void actions.saveSettings()}>
-        <Save className="h-4 w-4" />
-        {t("保存设置")}
-      </Button>
     </div>
   );
 }
