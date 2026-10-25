@@ -11945,9 +11945,56 @@ select {
   outline-offset: 2px;
 }
 
-.app-rail > .rail-brand + * {
+.app-rail > .rail-brand-wrap + * {
   position: relative;
   margin-top: 2px;
   padding-top: 12px;
   border-top: 1px solid hsl(var(--sidebar-border));
+}
+
+/* logo 外层：给更新角标做定位参照。 */
+.rail-brand-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+
+/* 新版本角标：贴在 logo 右上角的小圆点 + 向上箭头，轻微呼吸提示；点它弹出更新框。 */
+.rail-update-badge {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 2px solid hsl(var(--sidebar-bg));
+  border-radius: 50%;
+  background: hsl(var(--status-success));
+  color: hsl(0 0% 100%);
+  cursor: pointer;
+  animation: rail-update-pulse 2.4s ease-in-out infinite;
+}
+
+.rail-update-badge svg {
+  width: 10px;
+  height: 10px;
+}
+
+.rail-update-badge:hover {
+  transform: scale(1.12);
+}
+
+.rail-update-badge:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}
+
+@keyframes rail-update-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 hsl(var(--status-success) / 0.45); }
+  50% { box-shadow: 0 0 0 5px hsl(var(--status-success) / 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rail-update-badge { animation: none; }
 }

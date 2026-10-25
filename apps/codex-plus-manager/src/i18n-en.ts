@@ -1749,6 +1749,7 @@ export const EN_TEMPLATE: Record<string, string> = {
   "可清理 {0}": "Cleanable: {0}",
   "已选择 {0}": "Selected: {0}",
   "目录明细（{0}）": "Directory details ({0})",
+  "发现新版本 {0}，点击查看更新": "Version {0} is available — click to update",
   "已开启 {0} 项": "{0} enabled",
   "{0} 的占用构成": "{0} usage breakdown",
   "将永久删除 {0} 个缓存文件（逻辑大小 {1}）。\n涉及应用：{2}\n\n请先退出相关 AI 应用及 CLI。只处理超过 24 小时未修改的文件，包含已选择的日志。\n\n此操作不可撤销。是否继续？": "Permanently delete {0} cache files (logical size {1}).\nApps: {2}\n\nQuit the relevant AI apps and CLIs first. Only files last modified over 24 hours ago are eligible, including selected logs.\n\nThis cannot be undone. Continue?",
