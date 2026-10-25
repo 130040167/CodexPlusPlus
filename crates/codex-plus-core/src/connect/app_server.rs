@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -9,10 +9,20 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdout, Command};
 
+use super::weixin::{AttachmentKind, WeixinClient};
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// app-server 起不来时保留多少行 stderr 用于报错。
 const STDERR_TAIL_LINES: usize = 8;
 const TURN_TIMEOUT: Duration = Duration::from_secs(600);
+const ATTACHMENT_TOOL: &str = "send_weixin_attachment";
+const MAX_ATTACHMENTS_PER_TURN: usize = 10;
+
+pub struct WeixinReplyChannel<'a> {
+    pub client: &'a WeixinClient,
+    pub peer: &'a str,
+    pub context_token: &'a str,
+}
 
 #[derive(Debug, Clone)]
 pub struct AppServerConfig {
@@ -256,6 +266,7 @@ impl CodexAppServer {
         let mut params = self.thread_params();
         let method = if let Some(thread_id) = thread_id.filter(|id| !id.trim().is_empty()) {
             params["threadId"] = Value::String(thread_id.trim().to_string());
+            params.as_object_mut().unwrap().remove("dynamicTools");
             params["persistExtendedHistory"] = Value::Bool(true);
             "thread/resume"
         } else {
@@ -266,19 +277,50 @@ impl CodexAppServer {
             .with_context(|| format!("Codex app-server {method} 未返回 thread id"))
     }
 
+    pub async fn recent_thread_context(&mut self, thread_id: &str) -> anyhow::Result<String> {
+        let result = self
+            .request(
+                "thread/read",
+                json!({"threadId": thread_id, "includeTurns": false}),
+                REQUEST_TIMEOUT,
+            )
+            .await?;
+        let thread = result.get("thread").context("旧会话元数据为空")?;
+        if thread.get("id").and_then(Value::as_str) != Some(thread_id) {
+            bail!("旧会话元数据 ID 不符");
+        }
+        let path = thread
+            .get("path")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .context("旧会话缺少本地历史文件位置")?;
+        let home = crate::codex_home::default_codex_home_dir();
+        let thread_id = thread_id.to_owned();
+        tokio::task::spawn_blocking(move || read_recent_rollout_context(&home, &path, &thread_id))
+            .await
+            .context("读取旧微信会话历史任务失败")?
+    }
+
     pub async fn run_turn(
         &mut self,
         thread_id: &str,
         prompt: &str,
     ) -> anyhow::Result<AppServerTurnResult> {
+        self.run_turn_with_attachments(thread_id, prompt, &[], None)
+            .await
+    }
+
+    pub async fn run_turn_with_attachments(
+        &mut self,
+        thread_id: &str,
+        prompt: &str,
+        image_paths: &[PathBuf],
+        reply_channel: Option<WeixinReplyChannel<'_>>,
+    ) -> anyhow::Result<AppServerTurnResult> {
         let id = self.take_request_id();
         let mut params = json!({
             "threadId": thread_id,
-            "input": [{
-                "type": "text",
-                "text": prompt,
-                "text_elements": []
-            }],
+            "input": turn_inputs(prompt, image_paths),
             "approvalPolicy": "never"
         });
         if !self.config.model.trim().is_empty() {
@@ -297,6 +339,8 @@ impl CodexAppServer {
         let mut reply_parts = Vec::new();
         let mut model = self.config.model.trim().to_string();
         let mut usage = TurnUsage::default();
+        let mut attachment_results = HashMap::new();
+        let mut sent_attachments = 0;
         let deadline = tokio::time::Instant::now() + TURN_TIMEOUT;
         while !response_received || !turn_completed {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -305,7 +349,20 @@ impl CodexAppServer {
             }
             let message = self.read_message(remaining).await?;
             if is_server_request(&message) {
-                self.reject_server_request(&message).await?;
+                if message.get("method").and_then(Value::as_str) == Some("item/tool/call")
+                    && let Some(channel) = reply_channel.as_ref()
+                {
+                    self.handle_attachment_tool(
+                        &message,
+                        thread_id,
+                        channel,
+                        &mut attachment_results,
+                        &mut sent_attachments,
+                    )
+                    .await?;
+                } else {
+                    self.reject_server_request(&message).await?;
+                }
                 continue;
             }
             if response_id(&message) == Some(id) {
@@ -341,8 +398,17 @@ impl CodexAppServer {
                         }
                     }
                 }
-                Some("turn/completed") => turn_completed = true,
-                Some("thread/status/changed") if thread_status_is_idle(&message) => {
+                Some("turn/completed") => {
+                    if let Some(turn) = message.get("params").and_then(|params| params.get("turn"))
+                        && matches!(
+                            turn.get("status").and_then(Value::as_str),
+                            Some("failed" | "interrupted")
+                        )
+                    {
+                        let reason = deep_string(turn.get("error"), &["message"])
+                            .unwrap_or_else(|| "回合未完成".to_string());
+                        bail!("Codex 处理失败：{reason}");
+                    }
                     turn_completed = true;
                 }
                 Some("error") => {
@@ -405,12 +471,84 @@ impl CodexAppServer {
             "experimentalRawEvents": false,
             "persistExtendedHistory": false,
             "approvalPolicy": "never",
-            "sandbox": normalize_sandbox(&self.config.sandbox)
+            "sandbox": normalize_sandbox(&self.config.sandbox),
+            "dynamicTools": [attachment_tool_spec()]
         });
         if !self.config.model.trim().is_empty() {
             params["model"] = Value::String(self.config.model.trim().to_string());
         }
         params
+    }
+
+    async fn handle_attachment_tool(
+        &mut self,
+        message: &Value,
+        thread_id: &str,
+        channel: &WeixinReplyChannel<'_>,
+        results: &mut HashMap<String, Value>,
+        sent: &mut usize,
+    ) -> anyhow::Result<()> {
+        let call_id = message
+            .get("params")
+            .and_then(|params| params.get("callId"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        if let Some(cached) = call_id.and_then(|id| results.get(id)) {
+            return self
+                .write_json(&json!({
+                    "jsonrpc": "2.0", "id": message["id"], "result": cached
+                }))
+                .await;
+        }
+        let result = async {
+            if call_id.is_none() {
+                bail!("附件工具请求缺少调用标识");
+            }
+            if message
+                .get("params")
+                .and_then(|params| params.get("threadId"))
+                .and_then(Value::as_str)
+                != Some(thread_id)
+            {
+                bail!("附件工具请求不属于当前微信会话");
+            }
+            let (path, kind) = attachment_tool_arguments(message, &self.config.work_dir)?;
+            if *sent >= MAX_ATTACHMENTS_PER_TURN {
+                bail!("每回合最多发送 {MAX_ATTACHMENTS_PER_TURN} 个附件");
+            }
+            channel
+                .client
+                .send_workspace_attachment(
+                    channel.peer,
+                    &path,
+                    kind,
+                    channel.context_token,
+                    &self.config.work_dir,
+                )
+                .await?;
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let text = format!("附件已成功发送到当前微信会话：{name}");
+            *sent += 1;
+            Ok::<_, anyhow::Error>(text)
+        }
+        .await;
+        let (success, text) = match result {
+            Ok(text) => (true, text),
+            Err(error) => (false, format!("附件未发送：{error}")),
+        };
+        let result = json!({
+            "success": success,
+            "contentItems": [{"type": "inputText", "text": text}]
+        });
+        if let Some(call_id) = call_id {
+            results.insert(call_id.to_string(), result.clone());
+        }
+        self.write_json(&json!({
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "result": result
+        }))
+        .await
     }
 
     async fn request(
@@ -527,6 +665,214 @@ impl CodexAppServer {
         self.next_id = self.next_id.saturating_add(1);
         id
     }
+}
+
+fn turn_inputs(prompt: &str, images: &[PathBuf]) -> Vec<Value> {
+    let mut inputs = vec![json!({
+        "type": "text", "text": prompt, "text_elements": []
+    })];
+    inputs.extend(images.iter().map(|path| {
+        json!({
+            "type": "localImage", "path": path.to_string_lossy()
+        })
+    }));
+    inputs
+}
+
+fn attachment_tool_spec() -> Value {
+    json!({
+        "type": "function",
+        "name": ATTACHMENT_TOOL,
+        "description": "将本地工作目录内的图片发送给当前微信用户。用户要求返回图片时，应调用本工具实际发送，不能只回复本地路径。path 可以是工作目录内的绝对或相对路径；kind=image 直接显示图片。发送成功后无需再次发送同一图片。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "工作目录内的现有文件路径"},
+                "kind": {"type": "string", "enum": ["image"]}
+            },
+            "required": ["path", "kind"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn attachment_tool_arguments(
+    message: &Value,
+    work_dir: &Path,
+) -> anyhow::Result<(PathBuf, AttachmentKind)> {
+    let params = message.get("params").context("工具请求缺少参数")?;
+    if params.get("tool").and_then(Value::as_str) != Some(ATTACHMENT_TOOL) {
+        bail!("未知微信工具");
+    }
+    if params
+        .get("namespace")
+        .is_some_and(|namespace| !namespace.is_null())
+    {
+        bail!("未知微信工具命名空间");
+    }
+    let arguments = params.get("arguments").context("工具请求缺少 arguments")?;
+    let path = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .context("缺少附件路径")?;
+    let kind = match arguments.get("kind").and_then(Value::as_str) {
+        Some("image") => AttachmentKind::Image,
+        _ => bail!("附件类型必须为 image"),
+    };
+    let root = work_dir.canonicalize().context("无法读取工作目录")?;
+    let candidate = Path::new(path);
+    let candidate = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root.join(candidate)
+    };
+    let candidate = candidate.canonicalize().context("附件不存在或无法读取")?;
+    if !candidate.starts_with(&root) || !candidate.is_file() {
+        bail!("只能发送当前工作目录内的文件");
+    }
+    Ok((candidate, kind))
+}
+
+fn recent_conversation_text(text: &str) -> String {
+    let start = text
+        .char_indices()
+        .rev()
+        .nth(24_000)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    text[start..].to_string()
+}
+
+fn read_recent_rollout_context(
+    home: &Path,
+    path: &Path,
+    thread_id: &str,
+) -> anyhow::Result<String> {
+    use std::io::{BufRead, Read};
+    const MAX_ROLLOUT_BYTES: u64 = 16 * 1024 * 1024;
+    const MAX_LINE_BYTES: u64 = 1024 * 1024;
+    let home = home.canonicalize().context("无法解析会话根目录")?;
+    // 压缩历史只回退同一逻辑文件，不扫描其他会话。
+    let path = if !path.exists() && path.extension().is_some_and(|ext| ext == "jsonl") {
+        let mut compressed = path.as_os_str().to_os_string();
+        compressed.push(".zst");
+        PathBuf::from(compressed)
+    } else {
+        path.to_owned()
+    };
+    let compressed = path.to_string_lossy().ends_with(".jsonl.zst");
+    if !compressed && path.extension().is_none_or(|ext| ext != "jsonl") {
+        bail!("旧会话历史文件类型无效");
+    }
+    let path = path.canonicalize().context("旧会话历史文件不存在")?;
+    let root = ["sessions", "archived_sessions"]
+        .iter()
+        .filter_map(|name| home.join(name).canonicalize().ok())
+        .find(|root| root.starts_with(&home) && path.starts_with(root))
+        .context("旧会话历史文件不在当前 CODEX_HOME 的历史目录内")?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(&path).context("无法打开旧会话历史文件")?;
+    if !file.metadata()?.is_file() {
+        bail!("旧会话历史必须是普通文件");
+    }
+    super::media::verify_opened_workspace_file(&file, &path, &root)?;
+    let source: Box<dyn Read + '_> = if compressed {
+        Box::new(zstd::stream::read::Decoder::new(&file).context("无法解压旧会话历史")?)
+    } else {
+        Box::new(&file)
+    };
+    let mut reader = std::io::BufReader::new(source.take(MAX_ROLLOUT_BYTES + 1));
+    let mut total = 0u64;
+    let mut matched_session = false;
+    let mut inherited_from = Vec::new();
+    let mut own_history_start = None;
+    let mut context = String::new();
+    loop {
+        let mut line = Vec::new();
+        let size = (&mut reader)
+            .take(MAX_LINE_BYTES + 1)
+            .read_until(b'\n', &mut line)?;
+        if size == 0 {
+            break;
+        }
+        total += size as u64;
+        if total > MAX_ROLLOUT_BYTES || size as u64 > MAX_LINE_BYTES {
+            bail!("旧会话历史超过安全读取限制");
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let record: Value = serde_json::from_slice(&line).context("旧会话历史包含无效 JSON")?;
+        let payload = &record["payload"];
+        if record["type"] == "session_meta" {
+            let id = payload["id"].as_str().context("旧会话历史缺少会话 ID")?;
+            if !matched_session {
+                if id != thread_id {
+                    bail!("旧会话历史 ID 不符");
+                }
+                matched_session = true;
+                own_history_start = payload["subagent_history_start_ordinal"].as_u64();
+                for key in ["parent_thread_id", "forked_from_id"] {
+                    if let Some(parent) = payload[key].as_str() {
+                        inherited_from.push(parent.to_string());
+                    }
+                }
+            } else if id != thread_id
+                && !(inherited_from.iter().any(|parent| parent == id)
+                    && own_history_start.is_some_and(|start| {
+                        record["ordinal"]
+                            .as_u64()
+                            .is_some_and(|ordinal| ordinal < start)
+                    }))
+            {
+                bail!("旧会话历史混入其他会话");
+            }
+        }
+        if record["type"] != "response_item" || payload["type"] != "message" {
+            continue;
+        }
+        let role = match payload["role"].as_str() {
+            Some("user") => "用户",
+            Some("assistant") => "助手",
+            _ => continue,
+        };
+        let text = payload["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| matches!(item["type"].as_str(), Some("input_text" | "output_text")))
+            .filter_map(|item| item["text"].as_str())
+            .filter(|text| {
+                payload["role"] != "user"
+                    || ![
+                        "<codex_internal_context",
+                        "<environment_context",
+                        "<permissions instructions>",
+                        "# AGENTS.md instructions",
+                        "<INSTRUCTIONS>",
+                    ]
+                    .iter()
+                    .any(|prefix| text.trim_start().starts_with(prefix))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            context.push_str(&format!("\n\n{role}：{text}"));
+            context = recent_conversation_text(&context);
+        }
+    }
+    if !matched_session {
+        bail!("旧会话历史缺少会话身份");
+    }
+    super::media::verify_opened_workspace_file(&file, &path, &root)?;
+    Ok(context.trim().to_string())
 }
 
 impl Drop for CodexAppServer {
@@ -647,15 +993,6 @@ fn extract_completed_agent_text(message: &Value) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-fn thread_status_is_idle(message: &Value) -> bool {
-    message
-        .get("params")
-        .and_then(|params| params.get("status"))
-        .and_then(|status| status.get("type").or(Some(status)))
-        .and_then(Value::as_str)
-        == Some("idle")
-}
-
 fn deep_string(value: Option<&Value>, keys: &[&str]) -> Option<String> {
     let value = value?;
     if let Some(text) = value.as_str() {
@@ -685,6 +1022,374 @@ fn deep_string(value: Option<&Value>, keys: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weixin_stdio_fixture() {
+        use std::io::{BufRead, Write};
+        if std::env::var("CODEX_PLUS_WEIXIN_RPC_FIXTURE").as_deref() != Ok("1") {
+            return;
+        }
+        fn emit(value: Value) {
+            println!("\n{value}");
+            std::io::stdout().flush().unwrap();
+        }
+        fn call(id: &str, call_id: &str, path: &str) {
+            emit(json!({
+                "jsonrpc": "2.0", "id": id, "method": "item/tool/call",
+                "params": {
+                    "threadId": "thread-fixture", "turnId": "turn-1",
+                    "callId": call_id, "tool": ATTACHMENT_TOOL, "namespace": null,
+                    "arguments": {"path": path, "kind": "image"}
+                }
+            }));
+        }
+        let mut turn = 0;
+        for line in std::io::stdin().lock().lines() {
+            let message: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            match message.get("method").and_then(Value::as_str) {
+                Some("initialize") => emit(json!({"id": message["id"], "result": {}})),
+                Some("initialized") => {}
+                Some("thread/start") => {
+                    assert_eq!(message["params"]["dynamicTools"][0]["type"], "function");
+                    emit(
+                        json!({"id": message["id"], "result": {"thread": {"id": "thread-fixture"}}}),
+                    );
+                }
+                Some("thread/resume") => {
+                    assert!(message["params"].get("dynamicTools").is_none());
+                    emit(
+                        json!({"id": message["id"], "result": {"thread": {"id": "thread-fixture"}}}),
+                    );
+                }
+                Some("thread/read") => {
+                    assert_eq!(message["params"]["includeTurns"], false);
+                    emit(json!({"id": message["id"], "result": {"thread": {
+                        "id": "thread-fixture",
+                        "path": std::env::current_dir().unwrap().join("sessions/legacy.jsonl")
+                    }}}));
+                }
+                Some("turn/start") => {
+                    turn += 1;
+                    // 上一回合残留的状态通知不能结束当前回合。
+                    emit(
+                        json!({"method": "thread/status/changed", "params": {"status": {"type": "idle"}}}),
+                    );
+                    emit(
+                        json!({"id": message["id"], "result": {"turn": {"id": format!("turn-{turn}")}}}),
+                    );
+                    if turn == 1 {
+                        assert_eq!(message["params"]["input"][1]["type"], "localImage");
+                        call("outside", "outside", "../private.txt");
+                    } else {
+                        emit(json!({"method": "turn/completed", "params": {"turn": {
+                            "id": "turn-2", "status": "failed", "error": {"message": "fixture model failure"}
+                        }}}));
+                    }
+                }
+                _ => match message.get("id").and_then(Value::as_str) {
+                    Some("outside") => {
+                        assert_eq!(message["result"]["success"], false);
+                        call("first", "first", "result.txt");
+                    }
+                    Some("first") => {
+                        assert_eq!(message["result"]["success"], true);
+                        std::fs::write("result.txt", "updated-result").unwrap();
+                        call("replay", "first", "result.txt");
+                    }
+                    Some("replay") => {
+                        assert_eq!(message["result"]["success"], true);
+                        call("updated", "second", "result.txt");
+                    }
+                    Some("updated") => {
+                        assert_eq!(message["result"]["success"], true);
+                        emit(json!({"method": "item/completed", "params": {"item": {
+                            "type": "agentMessage", "text": "file delivered"
+                        }}}));
+                        emit(json!({"method": "turn/completed", "params": {"turn": {
+                            "id": "turn-1", "status": "completed"
+                        }}}));
+                    }
+                    _ => panic!("Unexpected fixture message"),
+                },
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_turn_waits_for_completion_and_delivers_real_tool_requests_to_media_transport() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_partial_json, method, path},
+        };
+        let gateway = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getuploadurl"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "upload_full_url": format!("{}/upload", gateway.uri())
+            })))
+            .expect(2)
+            .mount(&gateway)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/upload"))
+            .respond_with(ResponseTemplate::new(200).insert_header("x-encrypted-param", "download"))
+            .expect(2)
+            .mount(&gateway)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .and(body_partial_json(json!({"msg": {
+                "to_user_id": "fixture-peer", "context_token": "fixture-context",
+                "item_list": [{"type": 2}]
+            }})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ret": 0})))
+            .expect(2)
+            .mount(&gateway)
+            .await;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("result.txt"), "first-result").unwrap();
+        std::fs::create_dir(temp.path().join("sessions")).unwrap();
+        std::fs::write(temp.path().join("sessions/legacy.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-fixture\"}}\n\
+             {\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"legacy question\"}]}}\n").unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "connect::app_server::tests::weixin_stdio_fixture",
+                "--nocapture",
+            ])
+            .env("CODEX_PLUS_WEIXIN_RPC_FIXTURE", "1")
+            .current_dir(temp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+        let mut child = command.spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut server = CodexAppServer {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout).lines(),
+            next_id: 1,
+            running: true,
+            config: AppServerConfig {
+                executable: String::new(),
+                work_dir: temp.path().to_path_buf(),
+                model: "fixture-model".to_string(),
+                sandbox: "workspace-write".to_string(),
+            },
+        };
+        let client = WeixinClient::new(&gateway.uri(), "fixture-token", "")
+            .unwrap()
+            .with_media_base_url(&gateway.uri())
+            .unwrap();
+        let result = async {
+            server.initialize().await?;
+            let metadata = server
+                .request(
+                    "thread/read",
+                    json!({"threadId": "thread-fixture", "includeTurns": false}),
+                    REQUEST_TIMEOUT,
+                )
+                .await?;
+            assert_eq!(metadata["thread"]["id"], "thread-fixture");
+            assert!(
+                read_recent_rollout_context(
+                    temp.path(),
+                    Path::new(metadata["thread"]["path"].as_str().unwrap()),
+                    "thread-fixture"
+                )?
+                .contains("legacy question")
+            );
+            let thread = server.prepare_thread(None).await?;
+            let turn = server
+                .run_turn_with_attachments(
+                    &thread,
+                    "process image and return result",
+                    &[temp.path().join("photo.png")],
+                    Some(WeixinReplyChannel {
+                        client: &client,
+                        peer: "fixture-peer",
+                        context_token: "fixture-context",
+                    }),
+                )
+                .await?;
+            assert_eq!(turn.reply, "file delivered");
+            server.prepare_thread(Some(&thread)).await?;
+            let error = server.run_turn(&thread, "fail").await.unwrap_err();
+            assert!(error.to_string().contains("fixture model failure"));
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        server.close().await;
+        result.unwrap();
+        gateway.verify().await;
+        let requests = gateway.received_requests().await.unwrap();
+        let uploads = requests
+            .iter()
+            .filter(|request| request.url.path() == "/ilink/bot/getuploadurl")
+            .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
+            .collect::<Vec<_>>();
+        assert_ne!(uploads[0]["rawfilemd5"], uploads[1]["rawfilemd5"]);
+    }
+
+    #[test]
+    fn image_turn_uses_local_image_inputs_alongside_text() {
+        let images = vec![PathBuf::from("C:/workspace/inbox/photo.png")];
+        let input = turn_inputs("查看附件", &images);
+        assert_eq!(input[0]["type"], "text");
+        assert_eq!(input[0]["text"], "查看附件");
+        assert_eq!(
+            input[1],
+            json!({"type": "localImage", "path": "C:/workspace/inbox/photo.png"})
+        );
+        assert_eq!(turn_inputs("hello", &[]).len(), 1);
+    }
+
+    #[test]
+    fn attachment_tool_is_registered_for_new_and_resumed_weixin_threads() {
+        let spec = attachment_tool_spec();
+        assert_eq!(spec["type"], "function");
+        assert_eq!(spec["name"], ATTACHMENT_TOOL);
+        assert_eq!(spec["inputSchema"]["required"], json!(["path", "kind"]));
+        assert_eq!(spec["inputSchema"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn legacy_context_copies_only_recent_conversation_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let file = sessions.join("legacy.jsonl");
+        let records = [
+            json!({"type":"session_meta","payload":{"id":"legacy"}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[
+                {"type":"input_text","text":"分析这张图"},{"type":"input_image","image_url":"private"}
+            ]}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[
+                {"type":"input_text","text":format!("<environment_context>{}</environment_context>", "private".repeat(5000))}
+            ]}}),
+            json!({"type":"response_item","payload":{"type":"function_call_output","output":"private"}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[
+                {"type":"output_text","text":"分析完成"}
+            ]}}),
+        ];
+        let bytes = records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file, &bytes).unwrap();
+        let context = read_recent_rollout_context(temp.path(), &file, "legacy").unwrap();
+        assert!(context.contains("用户：分析这张图"));
+        assert!(context.contains("助手：分析完成"));
+        assert!(!context.contains("private"));
+        assert!(
+            recent_conversation_text(&"中".repeat(30_000))
+                .chars()
+                .count()
+                <= 24_001
+        );
+        let compressed = sessions.join("compressed.jsonl.zst");
+        std::fs::write(
+            &compressed,
+            zstd::stream::encode_all(bytes.as_bytes(), 1).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_recent_rollout_context(temp.path(), &sessions.join("compressed.jsonl"), "legacy")
+                .unwrap(),
+            context
+        );
+        assert!(read_recent_rollout_context(temp.path(), &file, "wrong").is_err());
+        let outside = temp.path().join("outside.jsonl");
+        std::fs::write(&outside, &bytes).unwrap();
+        assert!(read_recent_rollout_context(temp.path(), &outside, "legacy").is_err());
+        std::fs::write(&file, "{broken").unwrap();
+        assert!(read_recent_rollout_context(temp.path(), &file, "legacy").is_err());
+        std::fs::write(&file, "x".repeat(1024 * 1024 + 1)).unwrap();
+        assert!(read_recent_rollout_context(temp.path(), &file, "legacy").is_err());
+    }
+
+    #[test]
+    fn legacy_context_accepts_only_declared_inherited_parent_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let file = sessions.join("fork.jsonl");
+        let mut records = [
+            json!({"type":"session_meta","ordinal":0,"payload":{"id":"child","parent_thread_id":"parent","subagent_history_start_ordinal":5}}),
+            json!({"type":"session_meta","ordinal":1,"payload":{"id":"parent"}}),
+            json!({"type":"response_item","ordinal":5,"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"child question"}]}}),
+        ];
+        let write = |records: &[Value]| {
+            std::fs::write(
+                &file,
+                records
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap()
+        };
+        write(&records);
+        assert!(
+            read_recent_rollout_context(temp.path(), &file, "child")
+                .unwrap()
+                .contains("child question")
+        );
+        records[1]["ordinal"] = json!(5);
+        write(&records);
+        assert!(read_recent_rollout_context(temp.path(), &file, "child").is_err());
+        records[1]["ordinal"] = json!(1);
+        records[1]["payload"]["id"] = json!("foreign");
+        write(&records);
+        assert!(read_recent_rollout_context(temp.path(), &file, "child").is_err());
+    }
+
+    #[test]
+    fn attachment_tool_rejects_traversal_missing_files_and_other_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("result.txt"), "result").unwrap();
+        std::fs::write(temp.path().join("private.txt"), "private").unwrap();
+        let request = |path: &str, kind: &str| {
+            json!({
+                "params": {"tool": ATTACHMENT_TOOL, "arguments": {"path": path, "kind": kind}}
+            })
+        };
+        let (path, kind) =
+            attachment_tool_arguments(&request("result.txt", "image"), &root).unwrap();
+        assert_eq!(path, root.join("result.txt").canonicalize().unwrap());
+        assert_eq!(kind, AttachmentKind::Image);
+        assert!(attachment_tool_arguments(&request("../private.txt", "image"), &root).is_err());
+        assert!(attachment_tool_arguments(&request(".", "image"), &root).is_err());
+        assert!(attachment_tool_arguments(&request("missing.txt", "image"), &root).is_err());
+        assert!(attachment_tool_arguments(&request("result.txt", "unknown"), &root).is_err());
+        let mut other = request("result.txt", "image");
+        other["params"]["tool"] = json!("other");
+        assert!(attachment_tool_arguments(&other, &root).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_tool_resolves_links_before_enforcing_workspace_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(temp.path().join("private.txt"), "private").unwrap();
+        std::os::unix::fs::symlink(temp.path().join("private.txt"), root.join("link.txt")).unwrap();
+        let request = json!({
+            "params": {"tool": ATTACHMENT_TOOL, "arguments": {"path": "link.txt", "kind": "image"}}
+        });
+        assert!(attachment_tool_arguments(&request, &root).is_err());
+    }
 
     #[cfg(windows)]
     #[test]
@@ -865,8 +1570,7 @@ mod tests {
         assert!(store.contains("系统保护"), "{store}");
         assert!(store.contains("清空"), "{store}");
 
-        let plain =
-            spawn_failure_hint(r"C:\codex\codex.exe", std::io::ErrorKind::PermissionDenied);
+        let plain = spawn_failure_hint(r"C:\codex\codex.exe", std::io::ErrorKind::PermissionDenied);
         assert_eq!(plain, "：没有执行权限");
 
         let missing = spawn_failure_hint("codex", std::io::ErrorKind::NotFound);
