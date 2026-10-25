@@ -5641,8 +5641,8 @@ pub async fn refresh_script_market() -> CommandResult<ScriptMarketPayload> {
             script_market_payload_from_manifest(&manifest, "ok", "脚本市场已刷新。"),
         ),
         Err(error) => failed(
-            &format!("脚本市场加载失败：{error}"),
-            failed_script_market_payload(&format!("脚本市场加载失败：{error}")),
+            &format!("脚本市场加载失败：{error:#}"),
+            failed_script_market_payload(&format!("脚本市场加载失败：{error:#}")),
         ),
     }
 }
@@ -5786,8 +5786,8 @@ pub async fn install_market_script(id: String) -> CommandResult<ScriptMarketPayl
             Ok(manifest) => manifest,
             Err(error) => {
                 return failed(
-                    &format!("脚本市场加载失败：{error}"),
-                    failed_script_market_payload(&format!("脚本市场加载失败：{error}")),
+                    &format!("脚本市场加载失败：{error:#}"),
+                    failed_script_market_payload(&format!("脚本市场加载失败：{error:#}")),
                 );
             }
         };
@@ -5804,11 +5804,11 @@ pub async fn install_market_script(id: String) -> CommandResult<ScriptMarketPayl
             script_market_payload_from_manifest(&manifest, "ok", "脚本已安装。"),
         ),
         Err(error) => failed(
-            &format!("安装脚本失败：{error}"),
+            &format!("安装脚本失败：{error:#}"),
             script_market_payload_from_manifest(
                 &manifest,
                 "failed",
-                &format!("安装脚本失败：{error}"),
+                &format!("安装脚本失败：{error:#}"),
             ),
         ),
     }
