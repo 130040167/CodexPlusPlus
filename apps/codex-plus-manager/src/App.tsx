@@ -4302,6 +4302,7 @@ export function App() {
               settings={settings}
               theme={theme}
               actions={actions}
+              onOpenAgentSettings={() => void navigate("agentSettings")}
             />
           ) : null}
           {route === "agentSettings" ? (
@@ -9413,44 +9414,59 @@ function GlobalSettingsScreen({
   settings,
   theme,
   actions,
+  onOpenAgentSettings,
 }: {
   dirty: boolean;
   settings: SettingsResult | null;
   theme: Theme;
   actions: Actions;
+  onOpenAgentSettings: () => void;
 }) {
+  const settingsPath = settings?.settings_path ?? "";
+  // 每一项都是同一种行：左边标题 + 说明，右边操作。路径只在「配置文件路径」里出现一次。
   return (
-    <div className="settings-page">
+    <div className="settings-page global-settings-page">
       <Panel>
-        <CardHead title={t("基础设置")} detail={settings?.settings_path ?? ""} />
-        <CardContent className="settings-content">
-          <div className="theme-row">
-            <div>
+        <CardHead title={t("基础设置")} detail="" />
+        <CardContent className="global-settings-list">
+          <div className="global-setting-row">
+            <div className="global-setting-copy">
               <strong>{t("界面主题")}</strong>
               <span>{t("当前为")}{theme === "dark" ? t("深色") : t("浅色")}{t("模式。")}</span>
             </div>
-            <Button variant="secondary" onClick={actions.toggleTheme}>{t("切换主题")}</Button>
+            <div className="global-setting-actions">
+              <Button variant="secondary" onClick={actions.toggleTheme}>{t("切换主题")}</Button>
+            </div>
           </div>
-          <div className="settings-block">
-            <strong>{t("配置备份与迁移")}</strong>
-            <p className="field-hint">{t("导出文件包含供应商 API Key 等敏感信息；导入只会读入草稿，检查后仍需点击保存设置。")}</p>
-            <Toolbar>
+          <div className="global-setting-row">
+            <div className="global-setting-copy">
+              <strong>{t("配置备份与迁移")}</strong>
+              <span>{t("导出文件包含供应商 API Key 等敏感信息；导入只会读入草稿，检查后仍需点击保存设置。")}</span>
+            </div>
+            <div className="global-setting-actions">
               <Button variant="secondary" onClick={() => void actions.exportSettings()}>{t("导出完整配置")}</Button>
               <Button variant="secondary" onClick={() => void actions.importSettings()}>{t("导入配置草稿")}</Button>
-            </Toolbar>
+            </div>
           </div>
-          <div className="settings-block">
-            <strong>{t("配置文件路径")}</strong>
-            <Input readOnly value={settings?.settings_path ?? ""} />
-            <p className="field-hint">{t("只迁移 settings.json；日志、备份、Skills 和运行状态仍留在原状态目录。更换后建议重新打开管理器。")}</p>
-            <Toolbar>
+          <div className="global-setting-row">
+            <div className="global-setting-copy">
+              <strong>{t("配置文件路径")}</strong>
+              <code className="global-setting-path" title={settingsPath}>{settingsPath || "—"}</code>
+              <span>{t("只迁移 settings.json；日志、备份、Skills 和运行状态仍留在原状态目录。更换后建议重新打开管理器。")}</span>
+            </div>
+            <div className="global-setting-actions">
               <Button variant="secondary" onClick={() => void actions.chooseSettingsPath()}>{t("选择路径")}</Button>
               <Button variant="secondary" onClick={() => void actions.resetSettingsPath()}>{t("恢复默认路径")}</Button>
-            </Toolbar>
+            </div>
           </div>
-          <div className="settings-block">
-            <strong>{t("Agent 专属设置")}</strong>
-            <p className="field-hint">{t("图片覆盖层、启动参数等跟随 Agent 的选项，放在各 Agent 菜单的「设置」里。")}</p>
+          <div className="global-setting-row">
+            <div className="global-setting-copy">
+              <strong>{t("Agent 专属设置")}</strong>
+              <span>{t("图片覆盖层、启动参数等跟随 Agent 的选项，放在各 Agent 菜单的「设置」里。")}</span>
+            </div>
+            <div className="global-setting-actions">
+              <Button variant="secondary" onClick={onOpenAgentSettings}>{t("打开 Agent 设置")}</Button>
+            </div>
           </div>
         </CardContent>
       </Panel>

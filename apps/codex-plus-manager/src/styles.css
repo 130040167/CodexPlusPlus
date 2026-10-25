@@ -9528,6 +9528,48 @@ select {
   color: hsl(var(--muted-foreground));
 }
 
+/* 占用构成：类型 + 大小两列，日志与临时文件弱化（不在推荐清理里）。 */
+/* 卡片等高：占用构成行数不同（Codex 三类、Codex++ 一类），把多出来的高度吃在这里，
+   底部的「已选择」与「目录明细」在三张卡片里落在同一条线上。 */
+.agent-cache-grid {
+  align-items: stretch;
+}
+
+.agent-cache-card {
+  display: flex;
+  flex-direction: column;
+}
+
+.agent-cache-kinds {
+  flex: 1 0 auto;
+  align-content: start;
+  display: grid;
+  gap: 6px;
+  margin: 0 0 14px;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+
+.agent-cache-kinds li {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: hsl(var(--muted-foreground));
+}
+
+.agent-cache-kinds strong {
+  color: hsl(var(--foreground) / 0.88);
+  font-weight: 560;
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-cache-kinds li[data-kind="logs"] strong,
+.agent-cache-kinds li[data-kind="temporary"] strong {
+  color: hsl(var(--muted-foreground));
+}
+
 .agent-cache-card-selection {
   padding-top: 12px;
   border-top: 1px solid hsl(var(--border));
@@ -10853,6 +10895,73 @@ select {
 
   .proxy-provider-meta {
     grid-column: 1 / -1;
+  }
+}
+
+/* ── 整体设置页 ──────────────────────────────────────────────── */
+/* 每项一行：左侧标题 + 说明，右侧操作；行之间细线分隔，不再混用卡片与分隔块。 */
+.global-settings-list {
+  display: flex;
+  flex-direction: column;
+  padding-block: 4px;
+}
+
+.global-setting-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 24px;
+  padding: 16px 0;
+  border-bottom: 1px solid hsl(var(--border) / 0.6);
+}
+
+.global-setting-row:last-child {
+  border-bottom: 0;
+}
+
+.global-setting-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.global-setting-copy strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.global-setting-copy span {
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.global-setting-path {
+  overflow: hidden;
+  color: hsl(var(--foreground) / 0.85);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+}
+
+.global-setting-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+@media (max-width: 760px) {
+  .global-setting-row {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .global-setting-actions {
+    justify-content: flex-start;
   }
 }
 
