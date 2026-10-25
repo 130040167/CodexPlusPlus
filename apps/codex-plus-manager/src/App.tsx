@@ -13735,24 +13735,34 @@ function ClaudeLocalizationScreen() {
               {statusText}
             </span>
           </div>
-          <div className="claude-l10n-stats">
-            <div className="claude-l10n-stat">
-              <span>{t("官方版本")}</span>
-              <strong title={s?.sourceVersion || undefined}>{!s ? t("未检测") : s.sourceVersion || t("未检测到")}</strong>
-            </div>
-            <div className="claude-l10n-stat">
-              <span>{t("副本版本")}</span>
-              <strong title={s?.copyVersion || undefined}>{s?.copyVersion || t("未准备")}</strong>
-            </div>
-            <div className="claude-l10n-stat">
-              <span>{t("外壳语言")}</span>
-              <strong>{s?.shellLocale || t("未设置")}</strong>
-            </div>
-            <div className="claude-l10n-stat">
-              <span>{t("官方词条")}</span>
-              <strong>{s?.catalogEntries != null ? `${s.catalogEntries.toLocaleString()} ${t("条")}` : t("未检测")}</strong>
-            </div>
-          </div>
+          {/* 三步进度：原来右栏的「上手步骤」收成一排，完成的步骤打勾。 */}
+          <ol className="claude-l10n-progress-steps">
+            <li data-done={s?.prepared ? "true" : "false"}>
+              <span aria-hidden="true">{s?.prepared ? "✓" : "1"}</span>
+              <div><strong>{t("制作增强版")}</strong><small>{t("官方 Claude.app 与 app.asar 保持原样")}</small></div>
+            </li>
+            <li data-done={s?.running ? "true" : "false"}>
+              <span aria-hidden="true">{s?.running ? "✓" : "2"}</span>
+              <div><strong>{t("启动增强版")}</strong><small>{t("右上角启动，增强在启动时注入")}</small></div>
+            </li>
+            <li data-done="false">
+              <span aria-hidden="true">3</span>
+              <div><strong>{t("开启需要的增强")}</strong><small>{t("下方各项独立开关，重启副本后应用")}</small></div>
+            </li>
+          </ol>
+          {/* 版本与词表信息只作参考，收成一行小字。 */}
+          <dl className="claude-l10n-meta">
+            <div><dt>{t("官方版本")}</dt><dd title={s?.sourceVersion || undefined}>{!s ? t("未检测") : s.sourceVersion || t("未检测到")}</dd></div>
+            <div><dt>{t("副本版本")}</dt><dd title={s?.copyVersion || undefined}>{s?.copyVersion || t("未准备")}</dd></div>
+            <div><dt>{t("外壳语言")}</dt><dd>{s?.shellLocale || t("未设置")}</dd></div>
+            <div><dt>{t("官方词条")}</dt><dd>{s?.catalogEntries != null ? `${s.catalogEntries.toLocaleString()} ${t("条")}` : t("未检测")}</dd></div>
+          </dl>
+          {s?.supported && !s.prepared ? (
+            <p className="claude-l10n-hint">
+              <Info className="h-4 w-4" />
+              {t("首次制作会创建独立副本并执行完整性校验；官方应用、登录态和 app.asar 不会被改写。macOS 可能需要钥匙串授权，Windows 会使用独立副本启动。")}
+            </p>
+          ) : null}
           {!s ? (
             <p className="claude-l10n-hint">
               {busy === "detect"
@@ -13809,14 +13819,14 @@ function ClaudeLocalizationScreen() {
           </div>
         </CardContent>
       </Panel>
-      {/* 左栏：增强项。每一项都跑在上方的受管副本上，汉化只是其中之一。 */}
-      <div className="claude-l10n-column">
+      {/* 增强项铺满整行、三列并排：每一项都跑在上方的受管副本上，汉化只是其中之一。 */}
+      <div className="claude-l10n-column claude-l10n-features">
         <Panel>
           <CardHead
             title={t("增强功能")}
             detail={t("各自独立开关，互不影响；副本只是它们共同的前置条件，改动在重启副本后应用。")}
           />
-          <CardContent>
+          <CardContent className="claude-l10n-feature-grid">
             <label className="switch-row compact">
               <input
                 checked={Boolean(s?.localization)}
@@ -13863,44 +13873,6 @@ function ClaudeLocalizationScreen() {
                 {t("增强版还没制作：开关会先存下来，等你在上方制作好增强版并启动后生效。")}
               </p>
             ) : null}
-          </CardContent>
-        </Panel>
-      </div>
-      {/* 右栏：上手步骤与说明。 */}
-      <div className="claude-l10n-column">
-        <Panel className="claude-l10n-guide">
-          <CardHead
-            title={t("上手步骤")}
-            detail={t("增强只在副本里生效，官方版和登录态不受影响。")}
-          />
-          <CardContent className="claude-l10n-guide-body">
-            <div className="claude-l10n-steps" role="list">
-              <div className="claude-l10n-step" data-done={s?.prepared ? "true" : "false"} role="listitem">
-                <span className="claude-l10n-step-no" aria-hidden="true">{s?.prepared ? "✓" : "1"}</span>
-                <div className="claude-l10n-step-body">
-                  <strong>{t("制作增强版")}</strong>
-                  <small>{t("用上方的按钮制作增强版；官方 Claude.app 与 app.asar 保持原样。")}</small>
-                </div>
-              </div>
-              <div className="claude-l10n-step" data-done={s?.running ? "true" : "false"} role="listitem">
-                <span className="claude-l10n-step-no" aria-hidden="true">{s?.running ? "✓" : "2"}</span>
-                <div className="claude-l10n-step-body">
-                  <strong>{t("启动增强版")}</strong>
-                  <small>{t("从 Codex++ 启动副本，增强在启动时注入。")}</small>
-                </div>
-              </div>
-              <div className="claude-l10n-step" role="listitem">
-                <span className="claude-l10n-step-no" aria-hidden="true">3</span>
-                <div className="claude-l10n-step-body">
-                  <strong>{t("在左边开启需要的增强")}</strong>
-                  <small>{t("界面汉化、语音输入与 Computer Use 各自独立，改动在重启副本后应用。")}</small>
-                </div>
-              </div>
-            </div>
-            <div className="claude-l10n-note" role="note">
-              <Info className="h-4 w-4" />
-              <span>{t("首次制作会创建独立副本并执行完整性校验；官方应用、登录态和 app.asar 不会被改写。macOS 可能需要钥匙串授权，Windows 会使用独立副本启动。")}</span>
-            </div>
           </CardContent>
         </Panel>
       </div>
