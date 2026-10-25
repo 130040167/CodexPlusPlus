@@ -11998,3 +11998,26 @@ select {
 @media (prefers-reduced-motion: reduce) {
   .rail-update-badge { animation: none; }
 }
+
+/* 默认成员：醒目的绿色「默认」；其他已勾选成员的「设为默认」悬停才出现，不再满屏蓝字。 */
+.aggregate-editor .aggregate-member-default-badge {
+  border: 1px solid hsl(var(--status-success) / 0.45);
+  background: hsl(var(--status-success) / 0.12);
+  color: hsl(var(--status-success));
+  font-weight: 600;
+}
+.aggregate-editor .aggregate-member-default-action {
+  opacity: 0;
+  transition: opacity 0.14s ease;
+}
+.aggregate-editor .aggregate-member-row:hover .aggregate-member-default-action,
+.aggregate-editor .aggregate-member-row:focus-within .aggregate-member-default-action {
+  opacity: 1;
+}
+.aggregate-model-summary {
+  display: block;
+  margin-top: 6px;
+  color: hsl(var(--brand-accent));
+  font-size: 12px;
+  font-weight: 500;
+}
