@@ -337,8 +337,8 @@ struct Forwarder {
     /// 客户端自己是否声明了 elicitation。
     ///
     /// `None` = 还没握手。这个值决定 `claude` 模式能不能真的转发：
-    /// Claude Code 2.x 不声明（转发出去没人渲染，只会等到超时），
-    /// 3.x 之后声明与否要以实际握手为准，不能按版本号猜。
+    /// 没声明表单式 elicitation 的客户端，转发出去没人渲染，只会等到超时。
+    /// 一律以实际握手为准，不能按客户端名或版本号猜。
     client_supports_elicitation: Option<bool>,
     mode: ApprovalMode,
     /// 我们发给客户端的审批请求 id（字符串，避免与两端数字 id 撞号）→ 待办。
@@ -410,7 +410,7 @@ impl Forwarder {
         {
             // 先记下客户端**自己**有没有声明，再补。补只是为了不让服务端拒绝，
             // 不代表客户端真的会渲染这个表单——`claude` 模式要看这个值决定能否转发。
-            let supports = declares_capability(&message, "elicitation");
+            let supports = supports_form_elicitation(&message);
             self.client_supports_elicitation = Some(supports);
             crate::computer_use_approval::record_client(
                 message.get("params").and_then(|params| params.get("clientInfo")),
@@ -425,9 +425,10 @@ impl Forwarder {
             line.push(b'\n');
             return self.write_child(&line);
         }
-        // 审批答复：没有 method、id 是我们发的字符串。
+        // 审批答复：没有 method、id 是我们发的字符串。客户端回错误（渲染不了）时按取消处理，
+        // 不能干等到超时。
         if !mentions(&frame, b"\"method\"")
-            && mentions(&frame, b"\"result\"")
+            && (mentions(&frame, b"\"result\"") || mentions(&frame, b"\"error\""))
             && let Ok(message) = serde_json::from_slice::<Value>(&frame)
             && let Some(token) = message.get("id").and_then(Value::as_str)
             && let Some(pending) = self.pending.remove(token)
@@ -637,7 +638,7 @@ impl Forwarder {
         //
         // 客户端没声明时转发出去没人渲染，只能干等到超时——那比直接放行更糟：
         // 用户会看到「读应用列表正常、一点击就卡两分钟」。
-        // 版本号不能作为依据（2.x 不声明、3.x 之后可能变），一律以握手时的实际能力为准。
+        // 不按客户端名或版本号猜，一律以握手时声明的能力为准（要支持表单式，只有 url 式不算）。
         if self.client_supports_elicitation == Some(false) {
             let pending = PendingApproval {
                 child_id,
@@ -764,14 +765,18 @@ fn write_client(frame: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 客户端自己有没有声明某个能力（`params.capabilities.<name>` 存在且非 null）。
-pub(crate) fn declares_capability(message: &Value, name: &str) -> bool {
-    message
-        .get("params")
-        .and_then(|params| params.get("capabilities"))
-        .and_then(|capabilities| capabilities.get(name))
-        .map(|value| !value.is_null())
-        .unwrap_or(false)
+/// 客户端能不能渲染表单式的审批卡。
+///
+/// MCP 2025-11-25 起 elicitation 分 `form` 与 `url` 两种：空对象 `{}` 按旧规范视为支持 form；
+/// 只声明 `{url:{}}` 的客户端渲染不了 Computer Use 的审批卡。
+/// 实测 Claude Code 2.1.310 声明的是 `{form:{}, url:{}}`。
+pub(crate) fn supports_form_elicitation(message: &Value) -> bool {
+    match message.pointer("/params/capabilities/elicitation") {
+        Some(Value::Object(modes)) => {
+            modes.is_empty() || modes.get("form").is_some_and(|form| !form.is_null())
+        }
+        _ => false,
+    }
 }
 
 /// 在客户端声明的能力里补上 `elicitation`，其余字段原样保留。
@@ -798,6 +803,18 @@ pub(crate) fn declare_elicitation(message: &mut Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn form_elicitation_support_follows_declared_modes() {
+        let init = |elicitation: Value| {
+            json!({ "method": "initialize", "params": { "capabilities": { "elicitation": elicitation } } })
+        };
+        assert!(supports_form_elicitation(&init(json!({}))));
+        assert!(supports_form_elicitation(&init(json!({ "form": {}, "url": {} }))));
+        assert!(!supports_form_elicitation(&init(json!({ "url": {} }))));
+        assert!(!supports_form_elicitation(&init(Value::Null)));
+        assert!(!supports_form_elicitation(&json!({ "method": "initialize", "params": { "capabilities": {} } })));
+    }
 
     #[test]
     fn declare_elicitation_keeps_existing_capabilities() {
