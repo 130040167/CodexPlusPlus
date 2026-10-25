@@ -76,6 +76,10 @@ import {
   Trash2,
   Wrench,
   ArrowUp,
+  AppWindow,
+  Bug,
+  Server,
+  Tag,
   type LucideIcon,
 } from "lucide-react";
 import { createPresetPatch } from "@/components/ProviderPresetSelector";
@@ -5338,19 +5342,19 @@ function OverviewScreen({
             <CardContent>
               <div className="health-grid overview-health-grid">
                 <div className={`health-item ${overview?.codex_version ? "ok" : "needs-fix"}`}>
-                  {overview?.codex_version ? <CheckCircle2 className="h-4 w-4" /> : <Bell className="h-4 w-4" />}
+                  <span className={`health-icon ${overview?.codex_version ? "good" : "warn"}`}><Tag className="h-4 w-4" /></span>
                   <div>
                     <strong>{t("Codex 版本")}</strong>
-                    <span>{overview?.codex_version ?? t("未检测到 Codex 应用版本。")}</span>
+                    <span title={overview?.codex_version ?? undefined}>{overview?.codex_version ?? t("未检测到 Codex 应用版本。")}</span>
                   </div>
                   <Badge status={overview?.codex_version ? "ok" : "not_checked"} />
                 </div>
                 {health.map((item) => (
                   <div className={`health-item ${item.ok ? "ok" : "needs-fix"}`} key={item.title}>
-                    {item.ok ? <CheckCircle2 className="h-4 w-4" /> : <Bell className="h-4 w-4" />}
+                    <span className={`health-icon ${statusClass(item.status)}`}><item.icon className="h-4 w-4" /></span>
                     <div>
                       <strong>{item.title}</strong>
-                      <span>{item.detail}</span>
+                      <span title={item.detail}>{item.detail}</span>
                     </div>
                     <Badge status={item.status} />
                   </div>
@@ -15515,6 +15519,7 @@ function statusLabel(status: string) {
     disabled: t("已禁用"),
     stopped: t("未运行"),
     waiting: t("等待启动"),
+    off: t("未启用"),
     connected: t("已连接"),
     disconnected: t("未连接"),
     unknown: t("未知"),
@@ -15524,7 +15529,7 @@ function statusLabel(status: string) {
 
 function statusClass(status: string) {
   if (["found", "installed", "ok", "running", "running_degraded", "connected"].includes(status)) return "good";
-  if (status === "waiting") return "idle";
+  if (status === "waiting" || status === "off") return "idle";
   if (["failed", "missing"].includes(status)) return "bad";
   return "warn";
 }
@@ -15544,17 +15549,29 @@ function truncateSessionDeletePreview(value: string) {
   return normalized.length > 20 ? `${normalized.slice(0, 20)}...` : normalized;
 }
 
-function healthItems(overview: OverviewResult | null) {
+/// 概览健康检查的各项。每项带自己的图标；本地服务器与协议转换拆成两项：
+/// 协议转换跑在本地服务器里，但两者状态独立（服务器在跑、转换没开是常态）。
+function healthItems(overview: OverviewResult | null): Array<{ title: string; status: string; ok: boolean; detail: string; icon: LucideIcon }> {
   const conversionEnabled = overview?.runtime_health?.protocol_conversion_enabled;
-  const conversionDetail = typeof conversionEnabled === "boolean"
-    ? t(conversionEnabled ? "协议转换已启用" : "协议转换未启用")
-    : undefined;
-  const serviceItem = (title: string, state: RuntimeServiceState | undefined, extraDetail?: string) => ({
+  const serviceItem = (title: string, state: RuntimeServiceState | undefined, icon: LucideIcon) => ({
     title,
     status: state?.status ?? "not_checked",
     ok: ["running", "connected", "disabled"].includes(state?.status ?? ""),
-    detail: state ? [state.address, t(state.message), extraDetail].filter(Boolean).join(" · ") : t("等待状态检查"),
+    detail: state ? [state.address, t(state.message)].filter(Boolean).join(" · ") : t("等待状态检查"),
+    icon,
   });
+  // 协议转换没开不是问题：直连 Responses 的供应商本来就不需要，显示为中性的「未启用」。
+  const conversionHealth = {
+    title: t("协议转换"),
+    status: typeof conversionEnabled !== "boolean" ? "not_checked" : conversionEnabled ? "ok" : "off",
+    ok: typeof conversionEnabled === "boolean",
+    detail: typeof conversionEnabled !== "boolean"
+      ? t("等待状态检查")
+      : conversionEnabled
+        ? t("Chat Completions / Anthropic 请求经本地服务器转成 Responses")
+        : t("当前供应商直连 Responses，不需要转换"),
+    icon: ArrowRightLeft,
+  };
   // 调试连接依赖 Codex 在运行：Codex 没启动时连不上是预期内的，显示为中性的「等待启动」而不是警告。
   const debuggerState = overview?.runtime_health?.debugger;
   const codexRunning = overview?.runtime_health?.codex_app?.status === "running";
@@ -15564,16 +15581,19 @@ function healthItems(overview: OverviewResult | null) {
       status: "waiting",
       ok: true,
       detail: [debuggerState.address, t("Codex 未运行，启动后自动连接")].filter(Boolean).join(" · "),
+      icon: Bug,
     }
-    : serviceItem(t("调试连接状态"), debuggerState);
+    : serviceItem(t("调试连接状态"), debuggerState, Bug);
   return [
     {
       title: t("Codex 应用"),
       status: overview?.codex_app.status ?? "not_checked",
       ok: overview?.codex_app.status === "found",
       detail: overview?.codex_app.path || t("尚未检查 Codex 应用路径。"),
+      icon: AppWindow,
     },
-    serviceItem(t("本地服务器状态"), overview?.runtime_health?.local_server, conversionDetail),
+    serviceItem(t("本地服务器状态"), overview?.runtime_health?.local_server, Server),
+    conversionHealth,
     debuggerHealth,
   ];
 }

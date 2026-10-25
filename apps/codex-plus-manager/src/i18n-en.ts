@@ -94,6 +94,8 @@ export const EN_PLAIN: Record<string, string> = {
   "供应商测试模型、图片覆盖层、启动参数等只作用于 Codex 的选项，在 Codex 菜单的「设置」里。": "Options that only affect Codex — provider test model, image overlay, launch arguments — live under Settings in the Codex menu.",
   "全选项目": "Select entire project",
   "读取中…": "Loading…",
+  "Chat Completions / Anthropic 请求经本地服务器转成 Responses": "Chat Completions / Anthropic requests are converted to Responses by the local server",
+  "当前供应商直连 Responses，不需要转换": "The current provider speaks Responses directly; no conversion needed",
   "默认成员的模型以裸名发布，其他成员带 cpx- 前缀；悬停已勾选的成员可「设为默认」。本模式不使用轮转策略或通配符路由。": "The default member's models are published by bare name; other members get a cpx- prefix. Hover a checked member to set it as default. This mode uses no rotation strategy or wildcard routes.",
   "Codex++ 概览": "Codex++ overview",
   "使用 Codex 当前登录的 ChatGPT 账号": "Uses the ChatGPT account currently signed in to Codex",

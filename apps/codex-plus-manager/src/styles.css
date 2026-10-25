@@ -3480,8 +3480,9 @@ details.relay-fold[open] > .relay-fold-body {
   gap: 8px;
 }
 
+/* 卡片至少 320px：窄窗口两列、宽窗口三列，地址和说明不会被挤到看不清。 */
 .overview-health-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
 }
 
 .panel-head.overview-health-header {
@@ -12028,4 +12029,32 @@ select {
   letter-spacing: -0.02em;
   white-space: nowrap;
   text-transform: none;
+}
+
+/* 健康检查：每项左侧一个按状态着色的图标块（正常绿 / 需处理橙 / 中性灰 / 失败红）。 */
+.overview-health-grid .health-item { grid-template-columns: 34px minmax(0, 1fr) auto; }
+.health-icon {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  background: hsl(var(--muted) / 0.6);
+  color: hsl(var(--muted-foreground));
+}
+.health-icon.good { background: hsl(var(--status-success) / 0.12); color: hsl(var(--status-success)); }
+.health-icon.warn { background: hsl(var(--status-warning) / 0.12); color: hsl(var(--status-warning)); }
+.health-icon.bad { background: hsl(var(--status-error) / 0.12); color: hsl(var(--status-error)); }
+.health-icon.idle { background: hsl(var(--muted) / 0.6); color: hsl(var(--muted-foreground)); }
+@media (max-width: 760px) {
+  .overview-health-grid { grid-template-columns: 1fr; }
+}
+/* 三列下说明文字单行省略，完整内容在悬停提示里，不再把路径从中间折断。 */
+/* 说明最多两行，超出省略；完整内容在悬停提示里。 */
+.overview-health-grid .health-item > div > span {
+  display: -webkit-box;
+  min-width: 0;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
