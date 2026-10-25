@@ -6,7 +6,7 @@ import { AppWindow, X } from "lucide-react";
 import { t } from "./i18n";
 import "./CuPipWindow.css";
 
-type PipTarget = { pid?: number; appName?: string; title?: string };
+type PipTarget = { pid?: number; appName?: string; title?: string; kind?: string };
 
 export function CuPipWindow() {
   const [frame, setFrame] = useState("");
@@ -30,6 +30,8 @@ export function CuPipWindow() {
   }, []);
 
   const name = target.appName || "";
+  // 浏览器档：点一下跳到 agent 正在操作的标签页（同 Codex）。
+  const jumpLabel = target.kind === "browser" ? t("切到该标签页") : t("切到该应用");
   return (
     <div className="cu-pip">
       <header className="cu-pip-head" data-tauri-drag-region>
@@ -38,7 +40,7 @@ export function CuPipWindow() {
         {name
           ? <span className="cu-pip-app" data-tauri-drag-region title={`${t("正在操作")}：${target.title || name}`}>{name}</span>
           : null}
-        <button type="button" title={t("切到该应用")} aria-label={t("切到该应用")} onClick={() => void invoke("cu_pip_activate")}>
+        <button type="button" title={jumpLabel} aria-label={jumpLabel} onClick={() => void invoke("cu_pip_activate")}>
           <AppWindow size={13} />
         </button>
         <button type="button" title={t("关闭（本次会话不再弹出）")} aria-label={t("关闭")} onClick={() => void invoke("cu_pip_dismiss")}>

@@ -58,6 +58,8 @@ struct PipState {
     browser: bool,
     /// 已推给预览的截图文件修改时间。
     frame_seen: Option<std::time::SystemTime>,
+    /// 浏览器档：正在操作的标签页编号（「切到该标签页」用）。
+    tab: String,
 }
 
 static STATE: Mutex<Option<PipState>> = Mutex::new(None);
@@ -128,7 +130,8 @@ fn tick(app: &AppHandle, last_at: &mut u64, spool: &std::path::Path, spool_seen:
                 state.session = activity.session;
                 // 「切到该应用」用：Chrome 的进程。
                 state.pid = resolve_pid(&activity.app_name).unwrap_or(0);
-                state.target = json!({ "appName": activity.app_name, "title": activity.title });
+                state.tab = activity.tab.clone();
+                state.target = json!({ "appName": activity.app_name, "title": activity.title, "kind": "browser" });
                 state.last_act = Some(Instant::now());
             }),
             "act" => {
@@ -396,8 +399,64 @@ pub fn cu_pip_dismiss(app: AppHandle) {
 }
 
 /// 预览上的「切到该应用」：把目标应用切到前台，预览随之收起。
+///
+/// 浏览器档同 Codex 的点预览跳标签。Codex 走扩展宿主的签名通道发 `focusTab`，第三方连不上；
+/// Codex 开放给模型的 `management` 也不许切换标签（`tabs.update` 的 `active`、`tabs.highlight`
+/// 实测都被拒）。这里用 Chrome 的 AppleScript：它的标签 `id` 和扩展里的标签编号是同一个
+/// session id。第一次会弹系统的「自动化」授权；没授权或没找到时退回只激活 Chrome。
 #[tauri::command]
 pub fn cu_pip_activate() -> bool {
-    let pid = with_state(|state| state.pid);
+    let (pid, browser, tab) = with_state(|state| (state.pid, state.browser, state.tab.clone()));
+    if browser && let Some(script) = focus_tab_script(&tab) {
+        // 授权弹窗会一直等用户回应，不能卡住界面线程。
+        std::thread::spawn(move || {
+            let focused = std::process::Command::new("/usr/bin/osascript")
+                .args(["-e", &script])
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
+                .unwrap_or(false);
+            log("cu_pip.focus_tab", json!({ "tab": tab, "focused": focused }));
+            if !focused && pid > 0 {
+                cu_activity::activate_pid(pid);
+            }
+        });
+        return true;
+    }
     pid > 0 && cu_activity::activate_pid(pid)
+}
+
+/// 按标签编号切到那个标签并把 Chrome 提到前台的 AppleScript。编号必须是数字，
+/// 不把任意文本拼进脚本。
+fn focus_tab_script(tab: &str) -> Option<String> {
+    let id: u64 = tab.parse().ok()?;
+    Some(format!(
+        r#"tell application "Google Chrome"
+  repeat with w in windows
+    set i to 0
+    repeat with t in tabs of w
+      set i to i + 1
+      if (id of t) is {id} then
+        set active tab index of w to i
+        set index of w to 1
+        activate
+        return true
+      end if
+    end repeat
+  end repeat
+end tell
+return false"#
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_script_only_for_numeric_tabs() {
+        let script = focus_tab_script("305258454").unwrap();
+        assert!(script.contains("if (id of t) is 305258454 then"));
+        assert!(focus_tab_script("1 then do shell script").is_none());
+        assert!(focus_tab_script("").is_none());
+    }
 }

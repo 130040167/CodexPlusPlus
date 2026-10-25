@@ -223,6 +223,8 @@ struct ProxyState {
     /// 本回合是否真的用过浏览器。Stop 钩子是全局的，用它过滤别的会话的事件。
     touched_turn: bool,
     ctx: CallContext,
+    /// 本进程自己发的请求（`turn_ended`）：响应不给客户端。
+    own_ids: BTreeSet<i64>,
 }
 
 impl ProxyState {
@@ -237,6 +239,7 @@ impl ProxyState {
             turn_seq: 1,
             touched_turn: false,
             ctx: CallContext::default(),
+            own_ids: BTreeSet::new(),
         }
     }
 
@@ -286,6 +289,7 @@ impl ProxyState {
                 "_meta": { "x-codex-turn-metadata": { "session_id": self.session_id, "turn_id": turn } }
             }
         });
+        self.own_ids.insert(self.next_id);
         self.next_id += 1;
         let _ = self.write_child(&call);
         self.turn_seq += 1;
@@ -419,6 +423,9 @@ impl ProxyState {
             return;
         }
         if let Some(child_id) = message.get("id").and_then(Value::as_i64) {
+            if self.own_ids.remove(&child_id) {
+                return;
+            }
             // 同 Codex：结果里附带的标签页截图拿去更新悬浮预览。
             crate::cu_activity::note_browser_surface(&message);
             if let Some(client_id) = self.pending.remove(&child_id) {

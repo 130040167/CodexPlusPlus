@@ -20,6 +20,9 @@
 //! 同 Codex：`cua_repl` 每次操作浏览器后，结果的 `_meta["codex/toolSurface"]` 里带着
 //! 当前标签页的截图与仍开着的标签列表，Codex 的悬浮预览就显示这张截图。这里照做：
 //! 截图写进 `cu/pip-frame.jpg`，活动记为 `kind = "browser"`；标签都关了记 `end`。
+//!
+//! 点预览跳到那个标签：Codex 走扩展宿主的签名通道发 `focusTab`，第三方连不上；
+//! 管理器改用 Chrome 的 AppleScript 按标签编号切换（见 `cu_pip`）。
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -50,6 +53,9 @@ pub struct CuActivity {
     /// 浏览器标签页的标题。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
+    /// 浏览器标签页的编号（点预览跳过去用）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tab: String,
     /// 写入时间（毫秒）。
     pub at: u64,
 }
@@ -75,12 +81,13 @@ pub fn record(event: &str, pid: i32, bundle_id: &str, app_name: &str) {
         app_name: app_name.to_string(),
         kind: String::new(),
         title: String::new(),
+        tab: String::new(),
         at: now_millis(),
     });
 }
 
 /// 浏览器标签页的活动。`act` 之前先写好截图（见 [`write_frame`]）。
-pub fn record_browser(event: &str, title: &str) {
+pub fn record_browser(event: &str, title: &str, tab: &str) {
     write(CuActivity {
         event: event.to_string(),
         session: std::process::id(),
@@ -89,6 +96,7 @@ pub fn record_browser(event: &str, title: &str) {
         app_name: "Google Chrome".to_string(),
         kind: "browser".to_string(),
         title: title.to_string(),
+        tab: tab.to_string(),
         at: now_millis(),
     });
 }
@@ -119,8 +127,8 @@ pub fn write_frame(jpeg: &[u8]) {
 /// Codex 附在浏览器操作结果里的悬浮预览信息（`_meta["codex/toolSurface"]`）。
 #[derive(Debug, PartialEq)]
 pub enum BrowserSurface {
-    /// 有新截图：图片字节与标签页标题。
-    Frame { jpeg: Vec<u8>, title: String },
+    /// 有新截图：图片字节、标签页标题与编号。
+    Frame { jpeg: Vec<u8>, title: String, tab: String },
     /// 标签页都关了（`openTabIds` 为空）：同 Codex，收起预览。
     Closed,
 }
@@ -136,40 +144,40 @@ pub fn browser_surface(message: &serde_json::Value) -> Option<BrowserSurface> {
         let (_, encoded) = data.split_once(";base64,")?;
         use base64::Engine as _;
         let jpeg = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
-        let tab = screenshot.get("tabId").map(|id| match id {
-            serde_json::Value::String(text) => text.clone(),
-            other => other.to_string(),
-        });
+        let tab = screenshot.get("tabId").map(id_text);
         let title = surface
             .get("openTabs")
             .and_then(serde_json::Value::as_array)
             .and_then(|tabs| {
-                tabs.iter().find(|item| {
-                    let id = item.get("id").map(|id| match id {
-                        serde_json::Value::String(text) => text.clone(),
-                        other => other.to_string(),
-                    });
-                    id.is_some() && id == tab
-                })
+                tabs.iter()
+                    .find(|item| tab.is_some() && item.get("id").map(id_text) == tab)
             })
             .and_then(|item| item.get("title"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string();
-        return Some(BrowserSurface::Frame { jpeg, title });
+        return Some(BrowserSurface::Frame { jpeg, title, tab: tab.unwrap_or_default() });
     }
     let open = surface.get("openTabIds")?.as_array()?;
     open.is_empty().then_some(BrowserSurface::Closed)
 }
 
+/// 标签编号在不同字段里有时是字符串、有时是数字，统一成文本。
+fn id_text(id: &serde_json::Value) -> String {
+    match id {
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// 看到浏览器预览信息就更新截图与活动（JS 档与离散工具档的浏览器服务共用）。
 pub fn note_browser_surface(message: &serde_json::Value) {
     match browser_surface(message) {
-        Some(BrowserSurface::Frame { jpeg, title }) => {
+        Some(BrowserSurface::Frame { jpeg, title, tab }) => {
             write_frame(&jpeg);
-            record_browser("act", &title);
+            record_browser("act", &title, &tab);
         }
-        Some(BrowserSurface::Closed) => record_browser("end", ""),
+        Some(BrowserSurface::Closed) => record_browser("end", "", ""),
         None => {}
     }
 }
@@ -306,7 +314,11 @@ mod tests {
         } } } });
         assert_eq!(
             browser_surface(&shot),
-            Some(BrowserSurface::Frame { jpeg: jpeg.to_vec(), title: "Example Domain".into() })
+            Some(BrowserSurface::Frame {
+                jpeg: jpeg.to_vec(),
+                title: "Example Domain".into(),
+                tab: "7".into()
+            })
         );
         let closed = serde_json::json!({ "result": { "_meta": { "codex/toolSurface": {
             "kind": "browserUse", "openTabIds": [], "openTabs": []
