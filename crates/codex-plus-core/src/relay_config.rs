@@ -1314,6 +1314,20 @@ pub fn clear_relay_config_to_home(home: &Path) -> anyhow::Result<RelayApplyResul
     clear_relay_config_to_home_with_auth(home, None)
 }
 
+/// 卸载 Codex++ 时调用：live `config.toml` 仍指向本机协议代理时恢复为官方配置。
+///
+/// 卸载后本地代理不再运行，残留的 `base_url = "http://127.0.0.1:57321/v1"`
+/// 会让官方 Codex 每次请求都 502（issue #406）。只在确认指向本机代理时才清理
+/// （等价于在管理器里「启用官方」，会先写备份）；直连远程中转站、官方登录等
+/// 其它配置原样保留。返回是否改动了 live 配置。
+pub fn clear_managed_proxy_config_for_uninstall(home: &Path) -> anyhow::Result<bool> {
+    if !live_config_uses_managed_protocol_proxy_in_home(home) {
+        return Ok(false);
+    }
+    clear_relay_config_to_home(home)?;
+    Ok(true)
+}
+
 pub fn clear_relay_config_to_home_with_auth(
     home: &Path,
     auth_contents: Option<&str>,
