@@ -932,13 +932,16 @@ fn build_js_call(tool: &str, args: &Value, ctx: &mut CallContext) -> Option<Stri
         ),
         "browser_open" => {
             let url = js_string(args.get("url")?.as_str()?);
+            // Codex 的 create_browser_api.js：createBrowserTab 返回前会先读一次完整 AX 树。
+            // 模型打开标签就能直接看到页面内容，不需要再调 browser_state。
             format!(
                 "{name_first}\
                  var br = await cua.getBrowser({browser_opts});\
                  var caps = []; try {{ caps = (await br.capabilities.list()).map(function(c){{return c.id;}}); }} catch (e) {{}}\
                  var opts = {{}}; if (caps.indexOf(\"visibility\") >= 0) opts.visible = false;\
                  var t = await cua.createBrowserTab({browser_id}, {url}, opts);\
-                 out.tab = {{ id: t.id, url: await t.url(), title: await t.title() }};"
+                 out.tab = {{ id: t.id, url: await t.url(), title: await t.title() }};\
+                 if (t.ax) {{ out.state = await t.ax.get(\"state\", {{disableDiffing:true}}); }}"
             )
         }
         "browser_claim" => format!(
@@ -948,7 +951,8 @@ fn build_js_call(tool: &str, args: &Value, ctx: &mut CallContext) -> Option<Stri
              var match = tabs.filter(function(x){{ return String(x.id) === wanted || String(x.providerTabId) === wanted; }})[0];\
              if (!match) throw new Error(\"用户标签里没有 \" + wanted + \"，先用 browser_tabs 看一遍\");\
              var t = await br.user.claimTab(match);\
-             out.tab = {{ id: t.id, url: await t.url(), title: await t.title() }};"
+             out.tab = {{ id: t.id, url: await t.url(), title: await t.title() }};\
+             if (t.ax) {{ out.state = await t.ax.get(\"state\", {{disableDiffing:true}}); }}"
         ),
         "browser_navigate" => {
             let action = args
@@ -1513,6 +1517,24 @@ fn reshape_result(tool: &str, message: Value, ctx: &mut CallContext) -> Value {
             content.push(json!({ "type": "image", "data": image, "mimeType": "image/jpeg" }));
         }
         content.push(json!({ "type": "text", "text": "ok" }));
+        return json!({ "jsonrpc": "2.0", "id": id, "result": { "content": content } });
+    }
+    // Codex 的 bind_tab.js 对 AX 状态调用 `nodeRepl.write(state, "cua.state")`，原样输出
+    // 字符串，不包一层对象。browser_state / browser_open / browser_claim 的 out.state 也
+    // 应当如此：AX 树原文直接呈现，后面再补 tab 元数据。
+    let state_str = payload
+        .get("state")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(state) = state_str {
+        content.push(json!({ "type": "text", "text": state }));
+        // tab 元数据追在状态后面，模型可以顺带知道当前 URL/title。
+        if let Some(tab) = payload.get("tab") {
+            let url = tab.get("url").and_then(Value::as_str).unwrap_or("");
+            let title = tab.get("title").and_then(Value::as_str).unwrap_or("");
+            let id_str = tab.get("id").and_then(Value::as_str).unwrap_or("");
+            content.push(json!({ "type": "text", "text": format!("tab:{id_str} url:{url} title:{title}") }));
+        }
         return json!({ "jsonrpc": "2.0", "id": id, "result": { "content": content } });
     }
     content.push(json!({ "type": "text", "text": render_payload(&payload) }));
