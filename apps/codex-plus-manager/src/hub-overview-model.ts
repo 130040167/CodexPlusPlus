@@ -1,5 +1,6 @@
 /** 网关总览（Agent → Codex++ → 供应商池）的纯数据整理，页面只负责画。 */
 import {
+  maskAccountName,
   memberStatus,
   modelDisplay,
   providerEnabled,
@@ -74,7 +75,7 @@ export function hubAgents(payload: GatewayPayload | null, codex: CodexSummary): 
 export function hubProviders(payload: GatewayPayload | null, callsByProvider: Map<string, number> | null): HubProviderNode[] {
   return (payload?.pool ?? []).filter(providerEnabled).map((entry) => ({
     id: entry.id,
-    name: entry.name,
+    name: maskAccountName(entry.name),
     baseUrl: entry.baseUrl,
     keyCount: entry.keyCount,
     status: memberStatus(payload, entry.id),
@@ -120,7 +121,7 @@ function feedItem(agent: string, record: RouteRecordView): HubFeedItem {
   return {
     agent,
     requested: record.requestedModel,
-    provider: target?.relayName ?? "",
+    provider: maskAccountName(target?.relayName ?? ""),
     model: target?.model ?? record.model,
     elapsedMs: record.elapsedMs,
     result: rerouted ? "rerouted" : record.result,

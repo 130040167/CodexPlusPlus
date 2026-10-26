@@ -2485,3 +2485,13 @@ span.gw-avatar[data-size] {
   width: 20px;
   height: 20px;
 }
+
+/* 会话行：Agent 图标（单色图标跟随文字颜色）与删除按钮 */
+.gw-session-agent-wrap {
+  display: grid;
+  flex: none;
+  place-items: center;
+}
+.gw-session-delete:hover:not(:disabled) {
+  color: hsl(var(--status-error));
+}

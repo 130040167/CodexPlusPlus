@@ -28,6 +28,7 @@ import {
   type GroupMode,
   type MemberStatus,
   type RouteRecordView,
+  maskAccountName,
 } from "./gateway-model";
 import { AgentsView, Floating, ModelList } from "./GatewayAgents";
 import { AppSelect } from "./AppSelect";
@@ -445,7 +446,7 @@ function RouteCard({ payload, agents }: { payload: GatewayPayload | null; agents
   const totals = activity.reduce((sum, item) => ({ requests: sum.requests + item.requests, rerouted: sum.rerouted + item.rerouted, errors: sum.errors + item.errors }), { requests: 0, rerouted: 0, errors: 0 });
   const lastGroup = latest?.last?.groupId ? payload?.groups.find((group) => group.id === latest.last?.groupId) : undefined;
   const summary = latest?.last?.planned[0]
-    ? tf("{0} 排在第一个。", [latest.last.planned[0].relayName])
+    ? tf("{0} 排在第一个。", [maskAccountName(latest.last.planned[0].relayName)])
     : t("还没有请求经过这里。在 Agent 里发一条消息试试。");
 
   return (
@@ -552,7 +553,7 @@ function RouteDiagram({
           <div className="gw-member" data-state={member.status.state} key={member.relayId} style={{ height: MEMBER_ROW_H }}>
             <i className="gw-radio" />
             <Avatar name={member.name} size="sm" />
-            <strong>{member.name}</strong>
+            <strong>{maskAccountName(member.name)}</strong>
             {member.model ? <code className="gw-chip">{member.model}</code> : null}
             <span className="gw-status" data-state={member.status.state}>{statusText(member.status)}</span>
           </div>

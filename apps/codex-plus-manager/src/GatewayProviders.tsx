@@ -24,6 +24,7 @@ import {
   type PresetSection,
   type ProviderDraft,
   type ProviderPrice,
+  maskAccountName,
 } from "./gateway-model";
 import { Avatar, Switch, type Notify, type Run } from "./gateway-ui";
 import { ProviderFormDialog, type ProviderFormState } from "./ProviderFormDialog";
@@ -210,7 +211,7 @@ function PoolRow({
     if (await run(`extras:${entry.id}`, "save_gateway_provider_extras", { id: entry.id, price: nextPrice, proxy }, t("保存价格与代理"))) setExtrasOpen(false);
   };
   const remove = async () => {
-    const ok = await appConfirm(tf("从网关删除「{0}」？直连模式里的供应商不受影响。", [entry.name]), { title: t("删除供应商"), confirmText: t("删除"), danger: true });
+    const ok = await appConfirm(tf("从网关删除「{0}」？直连模式里的供应商不受影响。", [maskAccountName(entry.name)]), { title: t("删除供应商"), confirmText: t("删除"), danger: true });
     if (ok) await run(`remove:${entry.id}`, "delete_gateway_provider", { id: entry.id }, t("删除供应商"));
   };
   return (
@@ -234,7 +235,7 @@ function PoolRow({
         </span>
         <Avatar baseUrl={entry.baseUrl} name={entry.name} size="lg" />
         <div className="gw-pool-main">
-          <strong>{entry.name}</strong>
+          <strong>{maskAccountName(entry.name)}</strong>
           <small>{sub}</small>
         </div>
         <span className="gw-pool-status"><i className="gw-dot" data-tone={tone} />{statusText}</span>

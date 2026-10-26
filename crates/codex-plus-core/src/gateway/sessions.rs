@@ -1,7 +1,8 @@
 //! 各 Agent 的本地会话：Claude Code（`~/.claude/projects/*/*.jsonl`）、Grok（`~/.grok/sessions/session_search.sqlite`）。
-//! Codex 的会话沿用现有的会话库读取（`list_local_sessions`）。只读，不改 Agent 的数据。
+//! Codex 的会话沿用现有的会话库读取（`list_local_sessions`）。
 //!
 //! 「继续」在终端里执行 Agent 自己的恢复命令（`claude --resume <id>`、`grok --resume <id>`、`codex resume <id>`）。
+//! 「删除」把会话文件 / 目录移进废纸篓（可找回），Grok 另从它的会话索引里删掉这一行。
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -281,6 +282,80 @@ pub fn open_in_terminal(cwd: &str, command: &str, scratch_dir: &Path) -> anyhow:
     }
 }
 
+/// 删除一个 Claude Code 会话：把 `projects/*/<id>.jsonl`（以及同名的附属目录）移进废纸篓，可以从废纸篓找回。
+/// 返回会话文件移到了哪里。
+pub fn delete_claude_session(claude_home: &Path, id: &str, trash_dir: &Path) -> anyhow::Result<PathBuf> {
+    let id = safe_id(id)?;
+    let projects = claude_home.join("projects");
+    let dirs = std::fs::read_dir(&projects).with_context(|| format!("读取 {}", projects.display()))?;
+    for dir in dirs.flatten() {
+        let file = dir.path().join(format!("{id}.jsonl"));
+        if file.is_file() {
+            let moved = move_to_trash(&file, trash_dir)?;
+            let companion = dir.path().join(id);
+            if companion.is_dir() {
+                move_to_trash(&companion, trash_dir)?;
+            }
+            return Ok(moved);
+        }
+    }
+    bail!("没有找到这个 Claude Code 会话：{id}")
+}
+
+/// 删除一个 Grok 会话：会话目录 `sessions/<目录>/<id>/` 移进废纸篓，再从 Grok 的会话索引里删掉这一行
+/// （索引库自带触发器，全文索引会一起更新）。返回会话目录移到了哪里。
+pub fn delete_grok_session(grok_home: &Path, id: &str, trash_dir: &Path) -> anyhow::Result<PathBuf> {
+    let id = safe_id(id)?;
+    let sessions = grok_home.join("sessions");
+    let mut moved = None;
+    if let Ok(dirs) = std::fs::read_dir(&sessions) {
+        for dir in dirs.flatten() {
+            let candidate = dir.path().join(id);
+            if candidate.is_dir() {
+                moved = Some(move_to_trash(&candidate, trash_dir)?);
+                break;
+            }
+        }
+    }
+    let index = sessions.join("session_search.sqlite");
+    let mut removed = 0;
+    if index.is_file() {
+        let connection = rusqlite::Connection::open(&index).with_context(|| format!("打开 {}", index.display()))?;
+        connection.busy_timeout(std::time::Duration::from_secs(3))?;
+        removed = connection.execute("DELETE FROM session_docs WHERE session_id = ?1", [id])?;
+    }
+    match moved {
+        Some(path) => Ok(path),
+        None if removed > 0 => Ok(index),
+        None => bail!("没有找到这个 Grok 会话：{id}"),
+    }
+}
+
+/// 移进废纸篓：同名时在文件名后加时间戳，不覆盖废纸篓里已有的东西。只做重命名，不删除任何内容。
+fn move_to_trash(path: &Path, trash_dir: &Path) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(trash_dir).with_context(|| format!("创建 {}", trash_dir.display()))?;
+    let name = path.file_name().context("路径没有文件名")?;
+    let mut target = trash_dir.join(name);
+    if target.exists() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_millis())
+            .unwrap_or_default();
+        target = trash_dir.join(format!("{} {stamp}", name.to_string_lossy()));
+    }
+    std::fs::rename(path, &target).with_context(|| format!("移动 {} 到废纸篓", path.display()))?;
+    Ok(target)
+}
+
+/// 删除会话用的废纸篓：macOS 是用户的 `~/.Trash`，其他系统放在 Codex++ 状态目录里。
+pub fn default_trash_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".Trash");
+    }
+    crate::paths::default_app_state_dir().join("deleted-sessions")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +429,51 @@ mod tests {
         assert!(resume_command("claude", "x; rm -rf ~").is_err());
         assert!(resume_command("other", "abc").is_err());
         assert_eq!(shell_quote("/a b/it's"), "'/a b/it'\\''s'");
+    }
+
+    #[test]
+    fn deleting_a_claude_session_moves_its_file_and_companion_dir_to_trash() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("projects").join("-Users-me");
+        std::fs::create_dir_all(project.join("abc-123")).unwrap();
+        std::fs::write(project.join("abc-123.jsonl"), "{}\n").unwrap();
+        std::fs::write(project.join("keep.jsonl"), "{}\n").unwrap();
+        let trash = root.path().join("Trash");
+        let moved = delete_claude_session(root.path(), "abc-123", &trash).unwrap();
+        assert_eq!(moved, trash.join("abc-123.jsonl"));
+        assert!(!project.join("abc-123.jsonl").exists());
+        assert!(!project.join("abc-123").exists());
+        assert!(trash.join("abc-123").is_dir());
+        assert!(project.join("keep.jsonl").exists());
+        // 同名再删一次不会覆盖废纸篓里已有的
+        std::fs::write(project.join("abc-123.jsonl"), "{}\n").unwrap();
+        let again = delete_claude_session(root.path(), "abc-123", &trash).unwrap();
+        assert_ne!(again, moved);
+        assert!(moved.exists() && again.exists());
+        assert!(delete_claude_session(root.path(), "../etc", &trash).is_err());
+        assert!(delete_claude_session(root.path(), "missing", &trash).is_err());
+    }
+
+    #[test]
+    fn deleting_a_grok_session_moves_its_dir_and_drops_the_index_row() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir_all(sessions.join("%2FUsers%2Fme").join("s-1")).unwrap();
+        let index = sessions.join("session_search.sqlite");
+        let connection = rusqlite::Connection::open(&index).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session_docs (session_id TEXT PRIMARY KEY, cwd TEXT NOT NULL, updated_at INTEGER NOT NULL, title TEXT NOT NULL);
+                 INSERT INTO session_docs VALUES ('s-1', '/Users/me', 1, 'one'), ('s-2', '/Users/me', 2, 'two');",
+            )
+            .unwrap();
+        drop(connection);
+        let trash = root.path().join("Trash");
+        let moved = delete_grok_session(root.path(), "s-1", &trash).unwrap();
+        assert_eq!(moved, trash.join("s-1"));
+        assert!(!sessions.join("%2FUsers%2Fme").join("s-1").exists());
+        let left = list_grok_sessions(root.path(), 10);
+        assert_eq!(left.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec!["s-2"]);
+        assert!(delete_grok_session(root.path(), "nope", &trash).is_err());
     }
 }

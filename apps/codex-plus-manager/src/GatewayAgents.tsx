@@ -19,6 +19,7 @@ import {
   type GatewayAgentView,
   type GatewayPayload,
   type PickerItem,
+  maskAccountName,
 } from "./gateway-model";
 import { AppSelect } from "./AppSelect";
 import { AGENT_ICONS, Avatar, Switch, avatarOf, loadFavorites, saveFavorites, type Notify, type Run, AgentIcon } from "./gateway-ui";
@@ -262,7 +263,7 @@ function AgentDetail({
           {used.map((entry) => (
             <span className="gw-model-chip" key={entry.id}>
               <Avatar baseUrl={entry.baseUrl} name={entry.name} size="sm" />
-              {entry.name}
+              {maskAccountName(entry.name)}
               <em>{entry.models.length}</em>
             </span>
           ))}
@@ -292,7 +293,7 @@ function AgentDetail({
                       type="checkbox"
                     />
                     <Avatar baseUrl={entry.baseUrl} name={entry.name} size="sm" />
-                    <span>{entry.name}</span>
+                    <span>{maskAccountName(entry.name)}</span>
                     <em>{entry.models.length}</em>
                   </label>
                 );

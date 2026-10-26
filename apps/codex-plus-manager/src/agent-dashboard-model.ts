@@ -1,5 +1,5 @@
 /** Claude Code / Grok 概览仪表板的数据整理：页面只负责画。 */
-import type { UsageCounts, UsageSummary } from "./gateway-model.ts";
+import { maskAccountName, type UsageCounts, type UsageSummary } from "./gateway-model.ts";
 
 export type DashboardRequest = {
   id: string;
@@ -33,7 +33,7 @@ export function recentAgentRequests(entries: RequestLogLike[], agent: string, li
     .map((entry) => ({
       id: entry.id,
       model: entry.model || entry.upstreamModel,
-      provider: entry.relayName,
+      provider: maskAccountName(entry.relayName),
       durationMs: entry.durationMs,
       success: entry.success,
       running: entry.state === "running",

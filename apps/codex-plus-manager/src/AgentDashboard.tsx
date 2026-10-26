@@ -6,7 +6,7 @@
  */
 import { useEffect, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowUpRight, CheckCircle2, Loader2, Play, TerminalSquare, XCircle } from "lucide-react";
+import { ArrowUpRight, CheckCircle2, Loader2, Play, XCircle } from "lucide-react";
 import { t, tf } from "./i18n";
 import { agentAccessState, agentUsageStats, recentAgentRequests, type DashboardRequest } from "./agent-dashboard-model";
 import { AgentGlyph, useGatewayPayload } from "./HubOverview";
@@ -109,14 +109,6 @@ export function AgentDashboard({
       setLaunching(false);
     }
   };
-  const resume = async (session: AgentSessionView) => {
-    try {
-      const result = await invoke<Result>("resume_agent_session", { agent: session.agent, id: session.id, cwd: session.cwd });
-      notify(t("在终端继续"), result.message, result.status);
-    } catch (error) {
-      notify(t("在终端继续"), String(error), "failed");
-    }
-  };
 
   const heroStatus: DashboardStatus = status ?? {
     tone: access,
@@ -183,9 +175,6 @@ export function AgentDashboard({
                       <small title={session.cwd}>{shortPath(session.cwd) || "~"}</small>
                     </span>
                     <time>{tf(time.text, time.args)}</time>
-                    <button aria-label={t("在终端继续")} className="agent-dash-icon" onClick={() => void resume(session)} title={t("在终端继续")} type="button">
-                      <TerminalSquare aria-hidden="true" size={14} />
-                    </button>
                   </li>
                 );
               })}

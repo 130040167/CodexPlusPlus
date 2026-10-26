@@ -1093,6 +1093,8 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "会话已删除": "Session deleted",
+  "删除失败": "Delete failed",
   "配置被别的工具改掉了，没有经过网关": "Config was changed by another tool; not going through the gateway",
   "未接入网关 · 用它自己的设置": "Not connected · using its own settings",
   "经 Codex++ 网关": "Via the Codex++ gateway",
@@ -2294,6 +2296,8 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "删除 Codex 会话「{0}」？删除前会自动备份。": "Delete Codex session \"{0}\"? It is backed up first.",
+  "删除 {0} 会话「{1}」？会话文件会移到废纸篓，需要时可以找回。": "Delete {0} session \"{1}\"? Its files move to the Trash so you can restore them.",
   "经 Codex++ 网关 · {0}": "Via the Codex++ gateway · {0}",
   "配置被 {0} 改掉了，没有经过网关": "Config was changed by {0}; not going through the gateway",
   "启动 {0}": "Launch {0}",

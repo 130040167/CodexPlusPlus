@@ -384,8 +384,8 @@ export function pickerSections(
     const providerHit = matches(query, entry.name, entry.id);
     const items = entry.models
       .filter((model) => providerHit || matches(query, model))
-      .map((model) => ({ model, label: model, sub: entry.name, avatar: avatar(entry.name) }));
-    if (items.length) sections.push({ key: `provider:${entry.id}`, title: entry.name, avatar: avatar(entry.name), items });
+      .map((model) => ({ model, label: model, sub: maskAccountName(entry.name), avatar: avatar(entry.name) }));
+    if (items.length) sections.push({ key: `provider:${entry.id}`, title: maskAccountName(entry.name), avatar: avatar(entry.name), items });
   }
   const groups = payload.groups
     .filter((group) => group.id !== skipGroup && group.members.length && matches(query, group.name, groupModelId(group.id)))
@@ -400,7 +400,7 @@ export function pickerSections(
       items: providers.slice(0, 6).map((entry) => ({
         model: `${entry.id}/${typed}`,
         label: typed,
-        sub: entry.name,
+        sub: maskAccountName(entry.name),
         avatar: avatar(entry.name),
         custom: true,
       })),
@@ -419,7 +419,7 @@ export function modelDisplay(payload: GatewayPayload | null, model: string, excl
     return { title: group?.name ?? title, sub: title, group: true };
   }
   const qualified = qualifiedProvider(payload, title, exclude);
-  if (qualified) return { title: qualified.model, sub: qualified.entry.name, group: false };
+  if (qualified) return { title: qualified.model, sub: maskAccountName(qualified.entry.name), group: false };
   const entry = agentPoolProviders(payload, exclude).find((item) => item.models.some((known) => known.toLowerCase() === title.toLowerCase()));
   return { title, sub: entry?.name ?? "", group: false };
 }
@@ -493,18 +493,18 @@ export function routeNarrative(agent: string, record: RouteRecordView, payload: 
   const lines: NarrativeLine[] = [];
   const who = agentName(agent);
   const requested = record.requestedModel || record.model;
-  const plan = record.planned.map((member) => `${member.relayName}/${member.model}`).join(", ");
+  const plan = record.planned.map((member) => `${maskAccountName(member.relayName)}/${member.model}`).join(", ");
   if (record.groupId) {
     const group = payload?.groups.find((item) => item.id === record.groupId);
     lines.push({ tone: "muted", text: "{0} 请求 {1}，交给路由组「{2}」：{3}", args: [who, requested, group?.name ?? record.groupId, plan] });
-    if (record.planned[0]) lines.push({ tone: "step", text: "{0} 排在第一个。", args: [record.planned[0].relayName] });
+    if (record.planned[0]) lines.push({ tone: "step", text: "{0} 排在第一个。", args: [maskAccountName(record.planned[0].relayName)] });
   } else {
     lines.push({ tone: "muted", text: "{0} 请求 {1}，转发到 {2}", args: [who, requested, plan] });
   }
   record.steps.forEach((step, index) => {
     const last = index === record.steps.length - 1;
     if (step.outcome === "answered") {
-      lines.push({ tone: "ok", text: "{0}（{1}）回答，用时 {2}。", args: [step.relayName, step.model, formatElapsed(record.elapsedMs)] });
+      lines.push({ tone: "ok", text: "{0}（{1}）回答，用时 {2}。", args: [maskAccountName(step.relayName), step.model, formatElapsed(record.elapsedMs)] });
       return;
     }
     const reason = step.outcome === "transport" ? "连不上" : failureLabel(step.failure) || "出错";
@@ -512,7 +512,7 @@ export function routeNarrative(agent: string, record: RouteRecordView, payload: 
     lines.push({
       tone: last ? "fail" : "step",
       text: last ? "{0} 的 Key {1} {2}{3}，错误交回给 {4}。" : "{0} 的 Key {1} {2}{3}，换下一个。",
-      args: last ? [step.relayName, step.keyId, reason, status, who] : [step.relayName, step.keyId, reason, status],
+      args: last ? [maskAccountName(step.relayName), step.keyId, reason, status, who] : [maskAccountName(step.relayName), step.keyId, reason, status],
     });
   });
   if (record.result === "cooling") {
@@ -531,7 +531,7 @@ export function connectedAgents(payload: GatewayPayload | null): GatewayAgentId[
 export function routeMembers(payload: GatewayPayload | null, records: RouteRecordView[]): Array<{ relayId: string; name: string; model: string }> {
   return agentPoolProviders(payload).map((entry) => {
     const planned = records.flatMap((record) => record.planned).find((member) => member.relayId === entry.id);
-    return { relayId: entry.id, name: entry.name, model: planned?.model ?? entry.models[0] ?? "" };
+    return { relayId: entry.id, name: maskAccountName(entry.name), model: planned?.model ?? entry.models[0] ?? "" };
   });
 }
 
@@ -866,4 +866,27 @@ export function relativeTime(ms: number, now: number): { text: string; args: Arr
   if (diff < 30 * 24 * 60 * minute) return { text: "{0} 天前", args: [Math.floor(diff / (24 * 60 * minute))] };
   const date = new Date(ms);
   return { text: "{0}", args: [`${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`] };
+}
+
+/**
+ * 订阅账号的显示名打码：「ChatGPT Pro · me@example.com」「Copilot · octocat」这类名字里的账号部分只露头尾，
+ * 名字里出现的邮箱也一样。只在显示时处理，存储的名字不变；普通供应商名不受影响。
+ */
+export function maskAccountName(name: string): string {
+  const masked = name.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, maskEmail);
+  const match = /^((?:ChatGPT|Copilot|SuperGrok|GitHub Copilot)[^·]*·\s*)(.+)$/.exec(masked);
+  if (!match || match[2].includes("@")) return masked;
+  return match[1] + maskToken(match[2].trim());
+}
+
+function maskEmail(email: string): string {
+  const at = email.indexOf("@");
+  return `${maskToken(email.slice(0, at))}${email.slice(at)}`;
+}
+
+/** 4 个字符以内只留第一个；更长的留头两个、尾两个，中间固定 4 个星号（不暴露长度）。 */
+function maskToken(value: string): string {
+  const chars = [...value];
+  if (chars.length <= 4) return `${chars[0] ?? ""}***`;
+  return `${chars.slice(0, 2).join("")}****${chars.slice(-2).join("")}`;
 }

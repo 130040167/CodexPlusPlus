@@ -325,7 +325,7 @@ test("供应商头像在任何列表里都不参与伸缩：挑选弹层、导�
 test("Claude Code / Grok 的概览是仪表板：接入状态、今日数据、最近会话与请求、配置摘要", () => {
   assert.match(functionSource("OverviewScreen"), /<AgentDashboard agent=\{activeTool\}/);
   const dashboard = readFileSync(new URL("./AgentDashboard.tsx", import.meta.url), "utf8");
-  for (const command of ["load_gateway_usage", "load_request_logs", "list_agent_sessions", "load_agent_mcp", "list_installed_skills", "open_agent_terminal", "resume_agent_session"]) {
+  for (const command of ["load_gateway_usage", "load_request_logs", "list_agent_sessions", "load_agent_mcp", "list_installed_skills", "open_agent_terminal"]) {
     assert.ok(dashboard.includes(`"${command}"`), command);
   }
   const lib = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
@@ -344,4 +344,14 @@ test("网关页的 Agent 图标：Claude Code / Grok 用遮罩按文字颜色绘
 test("内层滚动的页面（网关各页、Computer Use）滚动区延伸到窗口边，滚动条不压内容", () => {
   const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
   assert.match(css, /\.shell :is\(\.gw-content, \.cu-content\) \{[^}]*width: calc\(100% \+ 20px\);[^}]*margin-right: -20px;[^}]*padding-right: 20px;/);
+});
+
+test("会话页可以删除会话，不再有「在终端继续」；Claude Code / Grok 走 delete_agent_session，Codex 走 delete_local_session", () => {
+  const sessions = readFileSync(new URL("./GatewaySessions.tsx", import.meta.url), "utf8");
+  assert.doesNotMatch(sessions, /在终端继续|resume_agent_session/);
+  assert.match(sessions, /"delete_agent_session"/);
+  assert.match(sessions, /"delete_local_session"/);
+  assert.match(sessions, /appConfirm\(/);
+  const lib = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+  assert.match(lib, /gateway_commands::delete_agent_session,/);
 });

@@ -16,6 +16,7 @@ import {
   type UsageGroup,
   type UsageRange,
   type UsageSummary,
+  maskAccountName,
 } from "./gateway-model";
 import { AGENT_ICONS, Avatar, type Notify, type Run } from "./gateway-ui";
 
@@ -180,7 +181,7 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
               ) : (
                 <Avatar baseUrl={providerEntry?.baseUrl} name={group.label || "?"} size="sm" />
               )}
-              <strong>{split === "agent" ? agentName(group.key) : group.label || t("未知")}</strong>
+              <strong>{split === "agent" ? agentName(group.key) : maskAccountName(group.label) || t("未知")}</strong>
               <span className="gw-usage-bar"><i style={{ width: `${Math.max(2, (total / groupMax) * 100)}%` }} /></span>
               <span className="gw-usage-num">{formatTokens(total)}</span>
               <small>{tf("{0} 次", [group.calls])}</small>

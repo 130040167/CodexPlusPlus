@@ -15,6 +15,7 @@ import {
   type GatewayAgentView,
   type GatewayPayload,
   type GatewayResult,
+  maskAccountName,
 } from "./gateway-model";
 import { AGENT_ICONS, APP_LOGO_URL, Avatar, AgentIcon } from "./gateway-ui";
 import "./GatewayPage.css";
@@ -137,7 +138,7 @@ export function TrayPanel() {
                 <img alt="" src={AGENT_ICONS[agent === "codex" ? "codexApp" : agent] ?? AGENT_ICONS.codexApp} title={agentName(agent)} />
                 <div className="tray-log-main">
                   <strong>{entry.upstreamModel || entry.model || "—"}</strong>
-                  <small>{[entry.relayName, tokens, entry.durationMs ? `${(entry.durationMs / 1000).toFixed(1)}s` : ""].filter(Boolean).join(" · ")}</small>
+                  <small>{[maskAccountName(entry.relayName ?? ""), tokens, entry.durationMs ? `${(entry.durationMs / 1000).toFixed(1)}s` : ""].filter(Boolean).join(" · ")}</small>
                 </div>
                 <span className="tray-log-side">
                   <i className="gw-dot" data-tone={running ? "agent" : ok ? "on" : "error"} />

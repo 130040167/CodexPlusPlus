@@ -1,10 +1,14 @@
-/** 本地网关 · 会话：Codex、Claude Code、Grok 的本地会话放在一起，点一下在终端里继续。只读，不改 Agent 的数据。 */
+/**
+ * 会话：Codex、Claude Code、Grok 的本地会话放在一起，可以复制恢复命令或删除。
+ * 删除前确认；Codex 会话走它自己的删除（带备份），Claude Code / Grok 的会话移进废纸篓，可以找回。
+ */
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Copy, RefreshCw, Search, TerminalSquare } from "lucide-react";
+import { Copy, Loader2, RefreshCw, Search, Trash2 } from "lucide-react";
+import { appConfirm } from "./app-dialog";
 import { t, tf } from "./i18n";
 import { agentName, filterSessions, relativeTime, shortPath, type AgentSessionView, type SessionAgent } from "./gateway-model";
-import { AGENT_ICONS, type Notify } from "./gateway-ui";
+import { AGENT_ICONS, AgentIcon, type Notify } from "./gateway-ui";
 
 const memo: { sessions: AgentSessionView[] | null; agent: SessionAgent | "all" } = { sessions: null, agent: "all" };
 
@@ -61,12 +65,33 @@ export function SessionsView({ notify, agent: fixedAgent }: { notify: Notify; ag
   }, [sessions]);
   const now = Date.now();
 
-  const resume = async (session: AgentSessionView) => {
+  const [deleting, setDeleting] = useState<string | null>(null);
+  const remove = async (session: AgentSessionView) => {
+    const title = session.title || t("（没有标题）");
+    const confirmed = await appConfirm(
+      session.agent === "codex"
+        ? tf("删除 Codex 会话「{0}」？删除前会自动备份。", [title])
+        : tf("删除 {0} 会话「{1}」？会话文件会移到废纸篓，需要时可以找回。", [agentName(session.agent), title]),
+      { title: t("删除会话"), confirmText: t("删除"), danger: true },
+    );
+    if (!confirmed) return;
+    const key = `${session.agent}:${session.id}`;
+    setDeleting(key);
     try {
-      const result = await invoke<{ status: string; message: string }>("resume_agent_session", { agent: session.agent, id: session.id, cwd: session.cwd });
-      await notify(result.status === "ok" ? t("继续会话") : t("继续会话失败"), result.message, result.status === "ok" ? "ok" : "failed");
+      const result = session.agent === "codex"
+        ? await invoke<{ status: string; message: string }>("delete_local_session", { request: { sessionId: session.id, title: session.title } })
+        : await invoke<{ status: string; message: string }>("delete_agent_session", { agent: session.agent, id: session.id });
+      const done = result.status === "ok";
+      await notify(done ? t("会话已删除") : t("删除失败"), result.message, done ? "ok" : "failed");
+      if (done) {
+        const next = (memo.sessions ?? sessions ?? []).filter((item) => `${item.agent}:${item.id}` !== key);
+        memo.sessions = next;
+        setSessions(next);
+      }
     } catch (error) {
-      await notify(t("调用失败"), String(error), "failed");
+      await notify(t("删除失败"), String(error), "failed");
+    } finally {
+      setDeleting(null);
     }
   };
   const copyCommand = async (session: AgentSessionView) => {
@@ -114,7 +139,7 @@ export function SessionsView({ notify, agent: fixedAgent }: { notify: Notify; ag
           const when = relativeTime(session.updatedAtMs, now);
           return (
             <div className="gw-session-row" key={`${session.agent}:${session.id}`}>
-              <img alt="" className="gw-session-agent" src={AGENT_ICONS[session.agent === "codex" ? "codexApp" : session.agent]} title={agentName(session.agent)} />
+              <span className="gw-session-agent-wrap" title={agentName(session.agent)}><AgentIcon agent={session.agent} className="gw-session-agent" /></span>
               <div className="gw-session-main">
                 <strong title={session.title}>{session.title || t("（没有标题）")}</strong>
                 <small title={session.cwd}>{session.cwd ? shortPath(session.cwd) : t("（没有目录）")}</small>
@@ -123,9 +148,15 @@ export function SessionsView({ notify, agent: fixedAgent }: { notify: Notify; ag
               <button className="gw-icon-button" onClick={() => void copyCommand(session)} title={t("复制恢复命令")} type="button">
                 <Copy className="h-4 w-4" />
               </button>
-              <button className="gw-soft-button gw-session-resume" onClick={() => void resume(session)} type="button">
-                <TerminalSquare className="h-4 w-4" />
-                {t("在终端继续")}
+              <button
+                aria-label={t("删除会话")}
+                className="gw-icon-button gw-session-delete"
+                disabled={deleting !== null}
+                onClick={() => void remove(session)}
+                title={t("删除会话")}
+                type="button"
+              >
+                {deleting === `${session.agent}:${session.id}` ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
               </button>
             </div>
           );

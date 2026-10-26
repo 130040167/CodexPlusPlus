@@ -119,7 +119,7 @@ import { GatewayPage, type GatewayTab } from "./GatewayPage";
 import { AgentGlyph, HubOverview, useGatewayPayload } from "./HubOverview";
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
 import { SessionsView } from "./GatewaySessions";
-import { agentName } from "./gateway-model";
+import { agentName, maskAccountName } from "./gateway-model";
 import { SessionAgentTabs, type SessionTab } from "./SessionAgentTabs";
 import { noticeDuration, noticeTone } from "./notice-model";
 import { agentTabGroups, agentTarget } from "./page-groups";
@@ -4354,30 +4354,8 @@ export function App() {
           </div>
           <div className="topbar-actions">
             {/* data-topbar-actions：页面级操作的挂载点（TopbarActions / PageHeader），Claude 增强页把「启动增强版」portal 进来。
-                排在 Codex 状态与启动按钮左边。 */}
+                Codex 的启动 / 停止在侧栏 Codex 行的播放键上，顶栏不再重复。 */}
             <div className="topbar-page-actions" data-topbar-actions />
-            {activeTool === "codex" && !isGlobalPage ? (
-              <>
-                <span className="codex-app-state" aria-live="polite">
-                  <UiBadge
-                    className={statusClass(overview?.runtime_health?.codex_app?.status ?? "not_checked")}
-                    variant="secondary"
-                  >
-                    Codex {statusLabel(overview?.runtime_health?.codex_app?.status ?? "not_checked")}
-                  </UiBadge>
-                </span>
-                {/* 顶栏里可能还有页面自己的主按钮（例如「添加供应商」），启动按钮用次要样式避免两个紫色按钮并排。 */}
-                <Button
-                  disabled={launchPending || !overview?.runtime_health}
-                  onClick={() => void (codexAppRunning ? actions.restart() : actions.launch())}
-                  variant="secondary"
-                  title={codexAppRunning ? t("重启 Codex") : t("启动 Codex")}
-                >
-                  <Rocket className="h-4 w-4" />
-                  {codexAppRunning ? t("重启 Codex") : t("启动 Codex")}
-                </Button>
-              </>
-            ) : null}
           </div>
         </header>
         <section
@@ -6280,9 +6258,9 @@ function RequestLogScreen({ initialAgent = "all", onConsumeInitialAgent }: { ini
                       ) : null}
                     </span>
                   )}
-                  <span className="request-log-ellipsis request-log-source" title={`${agentName(requestLogAgent(entry))} · ${entry.relayName}`}>
+                  <span className="request-log-ellipsis request-log-source" title={`${agentName(requestLogAgent(entry))} · ${maskAccountName(entry.relayName)}`}>
                     <AgentGlyph agent={requestLogAgent(entry)} />
-                    {entry.relayName || "-"}
+                    {maskAccountName(entry.relayName) || "-"}
                   </span>
                   <span className="request-log-ellipsis" title={entry.upstreamModel ? `${entry.model} → ${entry.upstreamModel}` : entry.model}>
                     {entry.model || "-"}

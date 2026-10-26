@@ -328,6 +328,7 @@ pub fn run() {
             gateway_commands::load_gateway_balances,
             gateway_commands::list_agent_sessions,
             gateway_commands::resume_agent_session,
+            gateway_commands::delete_agent_session,
             gateway_commands::login_gateway_chatgpt,
             gateway_commands::start_gateway_copilot_login,
             gateway_commands::finish_gateway_copilot_login,

@@ -803,6 +803,22 @@ pub async fn list_agent_sessions(agent: String) -> CommandResult<AgentSessions> 
     ok("会话已加载。", AgentSessions { sessions })
 }
 
+/// 删除 Claude Code / Grok 的一个本地会话：移进废纸篓，可以找回。Codex 的会话走 `delete_local_session`。
+#[tauri::command]
+pub fn delete_agent_session(agent: String, id: String) -> CommandResult<Option<String>> {
+    use codex_plus_core::gateway::sessions;
+    let trash = sessions::default_trash_dir();
+    let result = match agent.as_str() {
+        "claude" => sessions::delete_claude_session(&ClaudeContext::default_paths().claude_home, &id, &trash),
+        "grok" => sessions::delete_grok_session(&codex_plus_core::grok_config::default_grok_home_dir(), &id, &trash),
+        other => Err(anyhow::anyhow!("{other} 的会话不在这里删除")),
+    };
+    match result {
+        Ok(path) => ok("会话已移到废纸篓，需要时可以从废纸篓找回。", Some(path.display().to_string())),
+        Err(error) => failed(&format!("删除失败：{error:#}"), None),
+    }
+}
+
 /// 在终端里继续一个会话（执行 Agent 自己的恢复命令）。
 #[tauri::command]
 pub fn resume_agent_session(
