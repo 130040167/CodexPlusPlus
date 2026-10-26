@@ -7,9 +7,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { createPortal } from "react-dom";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { ChevronRight, Copy, GripVertical, Plus, Search, X } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
 import { t, tf } from "./i18n";
 import {
   failureLabel,
@@ -19,19 +16,16 @@ import {
   presetAdded,
   presetHost,
   protocolLabel,
-  providerDraftFromEntry,
-  providerDraftFromPreset,
   providerEnabled,
   providerInput,
-  validateProviderDraft,
   type GatewayPayload,
   type GatewayPoolEntry,
   type GatewayPreset,
-  type GatewayProtocol,
   type PresetSection,
   type ProviderDraft,
 } from "./gateway-model";
 import { Avatar, Switch, type Notify, type Run } from "./gateway-ui";
+import { ProviderFormDialog, type ProviderFormState } from "./ProviderFormDialog";
 
 /** 能在网关里直接登录的订阅。 */
 type AccountKind = "chatgpt" | "chatgpt-api" | "copilot" | "grok";
@@ -47,7 +41,7 @@ const BROWSER_LOGIN_COMMANDS: Record<Exclude<AccountKind, "copilot">, string> = 
 };
 
 /** 表单弹窗的用途：按预设新建、自定义新建、编辑已有供应商。 */
-type FormState = { mode: "preset"; preset: GatewayPreset } | { mode: "custom" } | { mode: "edit"; entry: GatewayPoolEntry };
+type FormState = ProviderFormState;
 
 export function ProvidersView({
   payload,
@@ -452,115 +446,6 @@ function ImportDialog({ payload, busy, run, onClose }: { payload: GatewayPayload
 }
 
 /** 新建 / 编辑供应商：名称、Key（每行一个，多个自动轮换）、地址、协议、模型。 */
-function ProviderFormDialog({
-  form,
-  busy,
-  onSubmit,
-  onCancel,
-}: {
-  form: FormState;
-  busy: string | null;
-  onSubmit: (draft: ProviderDraft) => void;
-  onCancel: () => void;
-}) {
-  const editing = form.mode === "edit";
-  const preset = form.mode === "preset" ? form.preset : null;
-  const [draft, setDraft] = useState<ProviderDraft>(() => (form.mode === "edit" ? providerDraftFromEntry(form.entry) : providerDraftFromPreset(preset)));
-  const update = (patch: Partial<ProviderDraft>) => setDraft((previous) => ({ ...previous, ...patch }));
-  const validation = validateProviderDraft(draft, editing);
-  useEffect(() => {
-    const escape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onCancel();
-    };
-    document.addEventListener("keydown", escape);
-    return () => document.removeEventListener("keydown", escape);
-  }, [onCancel]);
-  const title = form.mode === "edit" ? tf("编辑 {0}", [form.entry.name]) : preset ? tf("添加 {0}", [preset.name]) : t("添加自定义供应商");
-  const keyHint = editing
-    ? tf("留空表示不改（现在有 {0} 个）", [form.mode === "edit" ? form.entry.keyCount : 0])
-    : preset?.apiKeyUrl
-      ? tf("在 {0} 获取；每行一个，多个自动轮换", [presetHost(preset.apiKeyUrl)])
-      : preset?.defaultKey
-        ? t("本机服务不校验 Key，保留默认值即可")
-        : t("每行一个，多个自动轮换");
-  return createPortal(
-    <div className="gw-modal-backdrop gw-portal" onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel(); }}>
-      <form
-        className="gw-modal"
-        onSubmit={(event) => {
-          event.preventDefault();
-          if (!validation) onSubmit(draft);
-        }}
-      >
-        <header>
-          {preset || editing ? <Avatar name={preset?.name ?? draft.name} /> : <span className="gw-avatar gw-avatar-plus"><Plus className="h-4 w-4" /></span>}
-          <strong>{title}</strong>
-          <button aria-label={t("关闭")} className="gw-icon-button" onClick={onCancel} type="button"><X className="h-4 w-4" /></button>
-        </header>
-        <div className="gw-modal-body">
-          <label className="gw-field">
-            <span>{t("名称")}</span>
-            <Input onChange={(event) => update({ name: event.currentTarget.value })} value={draft.name} />
-          </label>
-          <label className="gw-field">
-            <span>{t("API Key")} <small>{keyHint}</small></span>
-            <Textarea
-              autoComplete="off"
-              autoFocus={Boolean(preset && !preset.defaultKey)}
-              className="gw-secret"
-              onChange={(event) => update({ keys: event.currentTarget.value })}
-              placeholder="sk-..."
-              rows={2}
-              spellCheck={false}
-              value={draft.keys}
-            />
-          </label>
-          <div className="gw-modal-grid">
-            <label className="gw-field">
-              <span>{t("地址")}</span>
-              <Input onChange={(event) => update({ baseUrl: event.currentTarget.value })} placeholder="https://api.example.com/v1" value={draft.baseUrl} />
-            </label>
-            <label className="gw-field">
-              <span>{t("协议")}</span>
-              <select className="gw-select" onChange={(event) => update({ protocol: event.currentTarget.value as GatewayProtocol })} value={draft.protocol}>
-                <option value="chatCompletions">Chat Completions</option>
-                <option value="responses">Responses</option>
-                <option value="anthropicMessages">Anthropic Messages</option>
-              </select>
-            </label>
-          </div>
-          <label className="gw-field">
-            <span>{t("默认模型")} <small>{t("留空用模型列表的第一个")}</small></span>
-            <Input onChange={(event) => update({ model: event.currentTarget.value })} value={draft.model} />
-          </label>
-          <label className="gw-field">
-            <span>{t("模型列表")} <small>{t("每行一个，会出现在智能体的模型选择器里")}</small></span>
-            <Textarea onChange={(event) => update({ modelList: event.currentTarget.value })} rows={4} spellCheck={false} value={draft.modelList} />
-          </label>
-          <div className="gw-field">
-            <span>{t("价格")} <small>{t("每百万 token；填了才在「用量」里估算费用，可以不填")}</small></span>
-            <div className="gw-price-row">
-              <select aria-label={t("币种")} className="gw-select" onChange={(event) => update({ priceCurrency: event.currentTarget.value })} value={draft.priceCurrency}>
-                <option value="CNY">¥ CNY</option>
-                <option value="USD">$ USD</option>
-              </select>
-              <label><span>{t("输入")}</span><Input inputMode="decimal" onChange={(event) => update({ priceInput: event.currentTarget.value })} placeholder="0" value={draft.priceInput} /></label>
-              <label><span>{t("缓存命中")}</span><Input inputMode="decimal" onChange={(event) => update({ priceCached: event.currentTarget.value })} placeholder="0" value={draft.priceCached} /></label>
-              <label><span>{t("输出")}</span><Input inputMode="decimal" onChange={(event) => update({ priceOutput: event.currentTarget.value })} placeholder="0" value={draft.priceOutput} /></label>
-            </div>
-          </div>
-        </div>
-        <footer>
-          <span className="gw-error">{validation ? t(validation) : ""}</span>
-          <Button onClick={onCancel} size="sm" type="button" variant="ghost">{t("取消")}</Button>
-          <Button disabled={busy !== null || Boolean(validation)} size="sm" type="submit">{busy ? t("保存中") : editing ? t("保存") : t("添加到供应商池")}</Button>
-        </footer>
-      </form>
-    </div>,
-    document.body,
-  );
-}
-
 /** Copilot 设备码登录：显示验证码，等你在 GitHub 页面里输入并授权。 */
 function DeviceCodeDialog({ code, notify, onClose }: { code: DeviceCode; notify: Notify; onClose: () => void }) {
   const copy = async () => {

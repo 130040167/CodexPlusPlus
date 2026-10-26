@@ -5,6 +5,27 @@
 
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
+  // 网关 · 添加 / 编辑供应商
+  "任意 OpenAI / Anthropic 兼容接口": "Any OpenAI / Anthropic compatible API",
+  "留空表示不改": "Leave empty to keep",
+  "多个自动轮换": "multiple keys rotate automatically",
+  "不改就留空": "Leave empty to keep",
+  "删除这个 Key": "Remove this key",
+  "再加一个 Key": "Add another key",
+  "请求供应商的 /v1/models": "Request the provider's /v1/models",
+  "先填地址和 API Key": "Fill in the address and API key first",
+  "获取中…": "Fetching…",
+  "设为默认模型": "Set as default model",
+  "添加模型…": "Add model…",
+  "输入模型名回车添加，或从上游获取": "Type a model name and press Enter, or fetch from upstream",
+  "星标是默认模型；Agent 请求这些模型名时会路由到这个供应商。": "The starred one is the default; agents requesting these model names are routed to this provider.",
+  "每百万 token，用于「用量」里估算费用": "per million tokens, used to estimate cost in Usage",
+  "按公开价格填写": "Fill from public prices",
+  "正在查公开价格…": "Looking up public prices…",
+  "手动填写的价格，不会被自动覆盖。": "Prices entered by hand are not overwritten automatically.",
+  "填好地址后自动按公开价格填写。": "Prices fill in automatically from public data once the address is set.",
+  "加了模型后自动按公开价格填写。": "Prices fill in automatically from public data once a model is added.",
+  "全选当前": "Select visible",
   // 外壳 · 网关总览 · 命令面板 · 提示卡
   "从 GitHub 仓库安装 Skill，按 Agent 启用到 Codex、Claude Code 或 Grok": "Install skills from GitHub repositories and enable them per agent in Codex, Claude Code or Grok",
   "启用到": "Enabled in",
@@ -2103,6 +2124,18 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  // 网关 · 添加 / 编辑供应商
+  "从上游获取到 {0} 个模型": "Fetched {0} models from upstream",
+  "在 {0} 获取 Key": "Get a key at {0}",
+  "现有 {0} 个 Key": "{0} keys saved",
+  "已选 {0} 个模型": "{0} models selected",
+  "设 {0} 为默认模型": "Set {0} as the default model",
+  "移除 {0}": "Remove {0}",
+  "已按 models.dev 的 {0} · {1} 填写（美元）": "Filled from models.dev: {0} · {1} (USD)",
+  " · 上下文 {0}": " · context {0}",
+  "公开价格表里没找到 {0}，需要的话手动填写。": "{0} is not in the public price list; fill it in by hand if needed.",
+  "上游有 {0} 个模型，搜索后勾选": "Upstream has {0} models; search and pick",
+  "使用选中的 {0} 个": "Use {0} selected",
   // 外壳 · 网关总览
   "{0}：Codex 自带，只读": "{0}: bundled with Codex, read-only",
   "{0} 个文件": "{0} files",

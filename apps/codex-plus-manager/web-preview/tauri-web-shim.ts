@@ -283,6 +283,8 @@ export async function invoke<T = unknown>(command: string, args: Record<string, 
     case "list_tools": return tools as T;
     case "load_gateway": return gateway as T;
     case "scan_agent_cache": return ok({ report: agentCacheReport }) as T;
+    case "fetch_provider_models": return ok({ models: ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"], endpoint: "https://api.anthropic.com/v1/models" }) as T;
+    case "lookup_model_prices": return ok({ source: "models.dev", fetchedAtMs: Date.now(), prices: ((args.models as string[]) ?? []).map((model) => ({ model, price: { providerId: "anthropic", providerName: "Anthropic", modelId: model, currency: "USD", input: 3, cachedInput: 0.3, output: 15, context: 200000 } })) }) as T;
     case "load_agent_mcp":
     case "save_agent_mcp": return ok({ config: demoAgentMcp[String(args.agent)] }) as T;
     case "load_gateway_usage": return gatewayUsage as T;

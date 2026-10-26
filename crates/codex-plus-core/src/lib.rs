@@ -45,6 +45,7 @@ pub mod launcher;
 pub mod manager_navigation;
 pub mod mcp_config;
 pub mod model_catalog;
+pub mod model_pricing;
 pub mod model_suffix;
 pub mod models;
 pub mod multi_worker;
