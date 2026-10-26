@@ -65,6 +65,39 @@ export type ProviderHealthView = {
   consecutiveErrors: number;
 };
 
+/** 路由动态里的一次尝试。 */
+export type RouteStepView = {
+  relayId: string;
+  relayName: string;
+  keyId: string;
+  model: string;
+  outcome: "answered" | "failed" | "transport";
+  failure?: string | null;
+  status?: number | null;
+  elapsedMs: number;
+};
+
+export type RouteRecordView = {
+  requestedModel: string;
+  model: string;
+  groupId?: string | null;
+  planned: Array<{ relayId: string; relayName: string; model: string }>;
+  steps: RouteStepView[];
+  result: "answered" | "failed" | "cooling";
+  coolingMs?: number | null;
+  finishedAtMs: number;
+  elapsedMs: number;
+};
+
+export type AgentActivityView = {
+  agent: string;
+  requests: number;
+  rerouted: number;
+  errors: number;
+  inFlight: string[];
+  last?: RouteRecordView | null;
+};
+
 export type GatewayPayload = {
   gateway: GatewaySettings;
   port: number;
@@ -73,6 +106,8 @@ export type GatewayPayload = {
   groups: GatewayGroupEntry[];
   agents: GatewayAgentView[];
   health: { keys: KeyHealthView[]; providers: ProviderHealthView[] };
+  /** 旧版后端没有这个字段。 */
+  activity?: { agents: AgentActivityView[] };
   claudeProviders: Array<{ id: string; name: string }>;
   grokProfiles: Array<{ id: string; name: string }>;
 };
@@ -258,3 +293,225 @@ export function formatRemaining(ms: number | null | undefined): string {
 
 /** Claude 供应商列表里网关托管的那一条。 */
 export const GATEWAY_CLAUDE_PROVIDER_ID = "codex-plus-gateway";
+
+export const GATEWAY_AGENT_NAMES: Record<string, string> = { claude: "Claude Code", grok: "Grok", codex: "Codex" };
+
+export function agentName(agent: string): string {
+  return GATEWAY_AGENT_NAMES[agent] ?? agent;
+}
+
+/** 路由组在模型选择器、路由页里的短名。 */
+export function groupSlug(id: string): string {
+  return `group/${id}`;
+}
+
+export type PickerItem = {
+  /** `provider:<id>` / `group:<id>` */
+  target: string;
+  /** 路由组为空：用组里成员各自的模型。 */
+  model: string;
+  label: string;
+  sub: string;
+  avatar: string;
+  custom?: boolean;
+};
+
+export type PickerSection = { key: string; title: string; avatar: string; items: PickerItem[] };
+
+function matches(query: string, ...values: string[]): boolean {
+  if (!query) return true;
+  return values.some((value) => value.toLowerCase().includes(query));
+}
+
+/**
+ * 模型选择器的分组：路由组在前，然后每个供应商一组列出它的模型。
+ * 查询词不是任何已知模型时，另给一组「自定义模型」：发到各个供应商。
+ * `avatar` 由调用方算（避免这里依赖界面工具函数）。
+ */
+export function pickerSections(
+  payload: GatewayPayload | null,
+  rawQuery: string,
+  avatar: (name: string) => string,
+): PickerSection[] {
+  if (!payload) return [];
+  const query = rawQuery.trim().toLowerCase();
+  const sections: PickerSection[] = [];
+  const groups = payload.groups
+    .filter((group) => matches(query, group.name, groupSlug(group.id)))
+    .map((group) => ({
+      target: `group:${group.id}`,
+      model: "",
+      label: group.name,
+      sub: groupSlug(group.id),
+      avatar: avatar(group.name),
+    }));
+  if (groups.length) sections.push({ key: "group", title: "路由组", avatar: "", items: groups });
+  for (const entry of payload.pool) {
+    const providerHit = matches(query, entry.name);
+    const items = entry.models
+      .filter((model) => providerHit || matches(query, model))
+      .map((model) => ({
+        target: `provider:${entry.id}`,
+        model,
+        label: model,
+        sub: entry.name,
+        avatar: avatar(entry.name),
+      }));
+    if (items.length) sections.push({ key: `provider:${entry.id}`, title: entry.name, avatar: avatar(entry.name), items });
+  }
+  const typed = rawQuery.trim();
+  const known = payload.pool.some((entry) => entry.models.includes(typed));
+  if (typed && !known && !/\s/.test(typed)) {
+    sections.push({
+      key: "custom",
+      title: "自定义模型",
+      avatar: "",
+      items: payload.pool.slice(0, 6).map((entry) => ({
+        target: `provider:${entry.id}`,
+        model: typed,
+        label: typed,
+        sub: entry.name,
+        avatar: avatar(entry.name),
+        custom: true,
+      })),
+    });
+  }
+  return sections;
+}
+
+/** 当前绑定在选择器按钮上的显示：模型名 + 供应商，或路由组名。 */
+export function bindingDisplay(
+  payload: GatewayPayload | null,
+  target: string,
+  model: string,
+): { title: string; sub: string; kind: GatewayTargetKind | null } {
+  const parsed = parseTargetValue(target);
+  if (!payload || !parsed) return { title: "", sub: "", kind: null };
+  if (parsed.kind === "group") {
+    const group = payload.groups.find((item) => item.id === parsed.id);
+    return { title: group?.name ?? parsed.id, sub: groupSlug(parsed.id), kind: "group" };
+  }
+  const entry = payload.pool.find((item) => item.id === parsed.id);
+  return { title: model.trim() || entry?.models[0] || parsed.id, sub: entry?.name ?? parsed.id, kind: "provider" };
+}
+
+export function strategyLabel(strategy: string): string {
+  switch (strategy) {
+    case "conversationRoundRobin":
+      return "按对话轮转";
+    case "requestRoundRobin":
+      return "按请求轮转";
+    case "weightedRoundRobin":
+      return "权重轮转";
+    default:
+      return "依次";
+  }
+}
+
+export function strategyDescription(strategy: string): string {
+  switch (strategy) {
+    case "conversationRoundRobin":
+      return "按对话轮转：同一个对话固定一个成员，新对话轮到下一个；成员答不了时换下一个，每个成员再按自己的 Key 轮换。";
+    case "requestRoundRobin":
+      return "按请求轮转：每个请求轮到下一个成员；成员答不了时换下一个，每个成员再按自己的 Key 轮换。";
+    case "weightedRoundRobin":
+      return "权重轮转：按成员权重分配请求；成员答不了时换下一个，每个成员再按自己的 Key 轮换。";
+    default:
+      return "依次：按成员顺序，前一个答不了才换下一个，每个成员再按自己的 Key 轮换。";
+  }
+}
+
+export type MemberStatus = { state: "busy" | "answered" | "cooling" | "idle"; text: string; args: Array<string | number> };
+
+/** 供应商在路由图里的状态：正在回答 / 熔断或 Key 全部冷却 / 最近回答了谁 / Key 数。文案是中文原文，界面再翻译。 */
+export function memberStatus(payload: GatewayPayload | null, relayId: string): MemberStatus {
+  const activity = payload?.activity?.agents ?? [];
+  if (activity.some((agent) => agent.inFlight.includes(relayId))) {
+    return { state: "busy", text: "正在回答…", args: [] };
+  }
+  const breaker = payload?.health.providers.find((item) => item.relayId === relayId && item.breakerOpen);
+  if (breaker) return { state: "cooling", text: "连续出错 · {0} 后恢复", args: [formatRemaining(breaker.remainingMs)] };
+  const entry = payload?.pool.find((item) => item.id === relayId);
+  const keyCount = entry?.keyCount ?? 1;
+  const unhealthy = (payload?.health.keys ?? []).filter((key) => key.relayId === relayId && key.state !== "ok");
+  if (unhealthy.length >= keyCount && unhealthy.length > 0) {
+    const cooling = unhealthy.filter((key) => key.state === "cooling");
+    if (!cooling.length) return { state: "cooling", text: "Key 都已停用", args: [] };
+    const soonest = Math.min(...cooling.map((key) => key.remainingMs ?? 0));
+    const label = cooling.some((key) => key.lastFailure === "quota_exhausted") ? "额度耗尽 · {0} 后恢复" : "被限流 · {0} 后恢复";
+    return { state: "cooling", text: label, args: [formatRemaining(soonest)] };
+  }
+  const answered = activity
+    .filter((agent) => agent.last?.result === "answered" && agent.last.steps.at(-1)?.relayId === relayId)
+    .sort((left, right) => (right.last?.finishedAtMs ?? 0) - (left.last?.finishedAtMs ?? 0))[0];
+  if (answered) return { state: "answered", text: "回答了 {0}", args: [agentName(answered.agent)] };
+  if (unhealthy.length) return { state: "idle", text: "{0} 个 Key · {1} 个冷却中", args: [keyCount, unhealthy.length] };
+  return keyCount > 1 ? { state: "idle", text: "{0} 个 Key", args: [keyCount] } : { state: "idle", text: "一个 Key", args: [] };
+}
+
+export function formatElapsed(ms: number): string {
+  if (ms < 10_000) return `${(ms / 1000).toFixed(1)} s`;
+  return `${Math.round(ms / 1000)} s`;
+}
+
+export type NarrativeLine = { tone: "muted" | "step" | "ok" | "fail"; text: string; args: Array<string | number> };
+
+/** 「上一个请求是怎么路由的」：按记录逐条生成。文案是中文模板，界面用 tf 翻译。 */
+export function routeNarrative(agent: string, record: RouteRecordView, payload: GatewayPayload | null): NarrativeLine[] {
+  const lines: NarrativeLine[] = [];
+  const who = agentName(agent);
+  const requested = record.requestedModel || record.model;
+  const plan = record.planned.map((member) => `${member.relayName}/${member.model}`).join(", ");
+  if (record.groupId) {
+    const group = payload?.groups.find((item) => item.id === record.groupId);
+    lines.push({ tone: "muted", text: "{0} 请求 {1}，交给路由组「{2}」：{3}", args: [who, requested, group?.name ?? record.groupId, plan] });
+    if (record.planned[0]) lines.push({ tone: "step", text: "{0} 排在第一个。", args: [record.planned[0].relayName] });
+  } else {
+    lines.push({ tone: "muted", text: "{0} 请求 {1}，转发到 {2}", args: [who, requested, plan] });
+  }
+  record.steps.forEach((step, index) => {
+    const last = index === record.steps.length - 1;
+    if (step.outcome === "answered") {
+      lines.push({ tone: "ok", text: "{0}（{1}）回答，用时 {2}。", args: [step.relayName, step.model, formatElapsed(record.elapsedMs)] });
+      return;
+    }
+    const reason = step.outcome === "transport" ? "连不上" : failureLabel(step.failure) || "出错";
+    const status = step.status ? ` · HTTP ${step.status}` : "";
+    lines.push({
+      tone: last ? "fail" : "step",
+      text: last ? "{0} 的 Key {1} {2}{3}，错误交回给 {4}。" : "{0} 的 Key {1} {2}{3}，换下一个。",
+      args: last ? [step.relayName, step.keyId, reason, status, who] : [step.relayName, step.keyId, reason, status],
+    });
+  });
+  if (record.result === "cooling") {
+    lines.push({ tone: "fail", text: "所有 Key 都在冷却，约 {0} 后恢复。", args: [formatRemaining(record.coolingMs ?? 0) || "1s"] });
+  }
+  return lines;
+}
+
+/** 绑定到同一目标的 Agent 合成一张路由卡片。 */
+export function routeCards(payload: GatewayPayload | null): Array<{ target: string; agents: GatewayAgentId[] }> {
+  if (!payload) return [];
+  const cards: Array<{ target: string; agents: GatewayAgentId[] }> = [];
+  for (const view of payload.agents) {
+    const binding = payload.gateway.bindings[view.agent];
+    if (!view.enabled || !binding) continue;
+    const target = targetValue(binding.target);
+    const card = cards.find((item) => item.target === target);
+    if (card) card.agents.push(view.agent);
+    else cards.push({ target, agents: [view.agent] });
+  }
+  return cards;
+}
+
+/** 路由卡片右侧的成员：供应商就是它自己，路由组按成员顺序；模型取最近一次计划里的，没有就用成员默认模型。 */
+export function routeMembers(payload: GatewayPayload | null, target: string, records: RouteRecordView[]): Array<{ relayId: string; name: string; model: string }> {
+  const parsed = parseTargetValue(target);
+  if (!payload || !parsed) return [];
+  const ids = parsed.kind === "provider" ? [parsed.id] : payload.groups.find((group) => group.id === parsed.id)?.members ?? [];
+  return ids.map((id) => {
+    const entry = payload.pool.find((item) => item.id === id);
+    const planned = records.flatMap((record) => record.planned).find((member) => member.relayId === id);
+    return { relayId: id, name: entry?.name ?? id, model: planned?.model ?? entry?.models[0] ?? "" };
+  });
+}

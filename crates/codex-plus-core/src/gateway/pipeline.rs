@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use serde_json::Value;
 
+use crate::gateway::activity::{InFlight, RouteRecorder};
 use crate::gateway::anthropic_inbound;
 use crate::gateway::key_pool::{self, FailureClass};
 use crate::gateway::route::{GatewayCandidate, RoutePlan, record_group_event};
@@ -43,6 +44,23 @@ pub enum GatewayUpstream {
 pub struct GatewayOutcome {
     pub upstream: GatewayUpstream,
     pub trace: RequestTrace,
+    /// 成功时标记「正在由该上游回答」，持有到响应转发完为止。
+    pub busy: Option<InFlight>,
+}
+
+impl GatewayUpstream {
+    fn status_code(&self) -> Option<u16> {
+        match self {
+            GatewayUpstream::Pipeline(response) => Some(response.status_code),
+            GatewayUpstream::Native(response) => Some(response.status_code),
+            GatewayUpstream::Cooling(_) => None,
+        }
+    }
+
+    fn is_success(&self) -> bool {
+        self.status_code()
+            .is_some_and(|status| (200..300).contains(&status))
+    }
 }
 
 /// 客户端带来的 Anthropic 原始请求，只在 Claude Code 入口存在。
@@ -62,11 +80,26 @@ pub struct GatewayRequest<'a> {
     pub is_stream: bool,
 }
 
-/// 依次尝试路由计划里的候选。
+/// 依次尝试路由计划里的候选，并把路由过程记到路由动态里。
 pub async fn open(
     settings: &BackendSettings,
     plan: &RoutePlan,
     request: GatewayRequest<'_>,
+) -> anyhow::Result<GatewayOutcome> {
+    let mut recorder = RouteRecorder::new(plan);
+    let result = open_candidates(settings, plan, request, &mut recorder).await;
+    let answered = result
+        .as_ref()
+        .is_ok_and(|outcome| outcome.upstream.is_success());
+    recorder.finish(answered);
+    result
+}
+
+async fn open_candidates(
+    settings: &BackendSettings,
+    plan: &RoutePlan,
+    request: GatewayRequest<'_>,
+    recorder: &mut RouteRecorder,
 ) -> anyhow::Result<GatewayOutcome> {
     let mut trace = RequestTrace {
         model: plan.source_model.clone(),
@@ -74,9 +107,11 @@ pub async fn open(
     };
     if plan.candidates.is_empty() {
         if let Some(wait) = plan.cooling {
+            recorder.cooling(wait.as_millis() as u64);
             return Ok(GatewayOutcome {
                 upstream: GatewayUpstream::Cooling(wait),
                 trace,
+                busy: None,
             });
         }
         anyhow::bail!("网关没有可用的上游：请检查绑定的供应商或路由组是否配置了地址和 Key");
@@ -96,6 +131,7 @@ pub async fn open(
         if let Some(id) = request.live_request_id {
             crate::request_log::update_running_retry(id, trace.attempts, 0, Vec::new());
         }
+        let busy = recorder.begin(candidate);
         let native = request
             .anthropic
             .as_ref()
@@ -109,6 +145,7 @@ pub async fn open(
         };
         let failure = match attempt {
             Ok(Attempt::Success(upstream)) => {
+                recorder.step(candidate, "answered", None, upstream.status_code());
                 key_pool::record_success(&candidate.key, plan.conversation.as_deref());
                 record_group_event(plan.group_id.as_deref(), RotationEvent::Success);
                 if let GatewayUpstream::Pipeline(response) = &upstream
@@ -120,18 +157,33 @@ pub async fn open(
                     trace.retry_reasons = inner.retry_reasons.clone();
                     trace.attempt_details = inner.attempt_details.clone();
                 }
-                return Ok(GatewayOutcome { upstream, trace });
+                return Ok(GatewayOutcome {
+                    upstream,
+                    trace,
+                    busy: Some(busy),
+                });
             }
             Ok(Attempt::Failed { upstream, class }) => {
+                recorder.step(
+                    candidate,
+                    "failed",
+                    Some(class.label()),
+                    upstream.status_code(),
+                );
                 let failover = key_pool::record_failure(&candidate.key, &class, Instant::now());
                 log_attempt_failure(candidate, Some(&class), None, has_more && failover);
                 if !failover || !has_more {
-                    return Ok(GatewayOutcome { upstream, trace });
+                    return Ok(GatewayOutcome {
+                        upstream,
+                        trace,
+                        busy: None,
+                    });
                 }
                 None
             }
             Err(AttemptError::Fatal(error)) => return Err(error),
             Err(AttemptError::Transport(error)) => {
+                recorder.step(candidate, "transport", Some("server_error"), None);
                 key_pool::record_failure(
                     &candidate.key,
                     &FailureClass::ServerError,
@@ -141,6 +193,7 @@ pub async fn open(
                 Some(error)
             }
         };
+        drop(busy);
         if next_relay_differs {
             record_group_event(plan.group_id.as_deref(), RotationEvent::Failure);
         }

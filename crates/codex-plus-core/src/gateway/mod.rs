@@ -7,11 +7,13 @@
 //! - [`store`]：`gateway.json`，各 Agent 的绑定；
 //! - [`route`]：绑定 → 模型 → 候选上游；
 //! - [`key_pool`]：多 Key 冷却与熔断；
+//! - [`activity`]：路由动态（最近一次请求怎么走的、计数），供界面实时展示；
 //! - [`pipeline`]：候选循环；
 //! - [`anthropic_inbound`] / [`anthropic_outbound`]：Claude Code 的协议转换；
 //! - [`server`]：HTTP 入口；
 //! - [`apply`]：开启 / 关闭时改写 Agent 配置。
 
+pub mod activity;
 pub mod anthropic_inbound;
 pub mod anthropic_outbound;
 pub mod apply;

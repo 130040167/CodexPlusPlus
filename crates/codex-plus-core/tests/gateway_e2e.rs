@@ -540,6 +540,39 @@ async fn gateway_end_to_end() {
         "glm-5.3",
         "成员不认识的模型换成成员默认模型"
     );
+    // 路由动态：最近一次请求先试 bad（502）再由 good 回答，计数里有换过上游和 Agent 收到的错误。
+    {
+        let activity = codex_plus_core::gateway::activity::snapshot();
+        let claude = activity
+            .agents
+            .iter()
+            .find(|agent| agent.agent == "claude")
+            .expect("claude 有路由动态");
+        let last = claude.last.as_ref().expect("有最近一次记录");
+        assert_eq!(last.result, "answered");
+        assert_eq!(last.group_id.as_deref(), Some("group"));
+        let planned = last
+            .planned
+            .iter()
+            .map(|member| member.relay_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(planned, vec!["bad", "good"]);
+        let steps = last
+            .steps
+            .iter()
+            .map(|step| (step.relay_id.as_str(), step.outcome.as_str(), step.status))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            steps,
+            vec![
+                ("bad", "failed", Some(502)),
+                ("good", "answered", Some(200))
+            ]
+        );
+        assert!(claude.rerouted >= 2, "429 换 Key 与 502 换成员都算换过上游");
+        assert!(claude.errors >= 1, "400 原样交给了 Agent");
+        assert!(claude.in_flight.is_empty(), "响应转发完后不再显示正在回答");
+    }
 
     // —— 7. 鉴权与开关 ——
     let (status, text) = post(

@@ -4,6 +4,7 @@
 
 use serde::Serialize;
 
+use codex_plus_core::gateway::activity::{self, ActivitySnapshot};
 use codex_plus_core::gateway::apply::{self, ApplyContext};
 use codex_plus_core::gateway::key_pool::{self, PoolSnapshot};
 use codex_plus_core::gateway::store::{
@@ -63,6 +64,8 @@ pub struct GatewayPayload {
     pub groups: Vec<GatewayGroupEntry>,
     pub agents: Vec<GatewayAgentView>,
     pub health: PoolSnapshot,
+    /// 路由动态：各 Agent 最近一次请求怎么走的、计数、正在回答的上游。
+    pub activity: ActivitySnapshot,
     /// 可导入供应商池的 Claude 供应商（不含网关托管的那个）。
     pub claude_providers: Vec<GatewaySourceEntry>,
     /// 可导入供应商池的 Grok 供应商。
@@ -166,6 +169,7 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
         groups,
         agents,
         health: key_pool::snapshot(std::time::Instant::now()),
+        activity: activity::snapshot(),
         claude_providers,
         grok_profiles,
     }

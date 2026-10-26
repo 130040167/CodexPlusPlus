@@ -420,6 +420,8 @@ async fn handle_claude_messages(
         }
     };
     let trace = outcome.trace;
+    // 持有到响应转发完：路由页据此显示「正在回答」。
+    let _busy = outcome.busy;
     match outcome.upstream {
         GatewayUpstream::Cooling(wait) => {
             request_log.record_trace(&trace, 429, false);
