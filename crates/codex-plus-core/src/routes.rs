@@ -280,7 +280,12 @@ pub async fn handle_bridge_request(
             crate::dictation::cancel_bridge(&payload).map_err(anyhow::Error::from)
         }
         "/settings/set" => {
-            settings_value(&ctx, ctx.settings.set_settings(payload.clone()).await).await
+            let result = ctx.settings.set_settings(payload.clone()).await;
+            // Codex 设置页改了设置：通知管理器重新读取，两边开关保持一致。
+            if result.is_ok() {
+                crate::settings::notify_external_settings_change();
+            }
+            settings_value(&ctx, result).await
         }
         // 只读：设置项清单（标题、说明、分组等），注入页据此生成设置行。
         "/settings/catalog" => crate::settings_catalog::enhancement_settings_catalog(),

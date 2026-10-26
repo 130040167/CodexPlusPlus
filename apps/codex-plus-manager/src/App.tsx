@@ -110,6 +110,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { isGitHubRepositoryHomepage } from "./github-repository";
 import { NativeBrowserStatusView, nativeBrowserConsent } from "./native-browser-settings";
 import { AgentCachePanel } from "./agent-cache";
+import { rebaseSettingsEdits } from "./settings-rebase";
 import { summarizeRecentRequests, type RecentRequestSummary } from "./overview-model";
 import { AgentCollaborationPage } from "./AgentCollaborationPage";
 import { SectionLabel, Switch } from "./gateway-ui";
@@ -1485,6 +1486,9 @@ export function App() {
   } | null>(null);
   const [overview, setOverview] = useState<OverviewResult | null>(null);
   const [settings, setSettings] = useState<SettingsResult | null>(null);
+  // 外部改设置时要拿「上次读到的设置」与当前编辑比对，监听回调里读这个 ref 拿最新值。
+  const settingsRef = useRef<SettingsResult | null>(null);
+  settingsRef.current = settings;
   const [weixinStatus, setWeixinStatus] = useState<WeixinConnectStatusResult | null>(null);
   const [weixinQr, setWeixinQr] = useState<WeixinQrResult | null>(null);
   const [relay, setRelay] = useState<RelayResult | null>(null);
@@ -3961,12 +3965,28 @@ export function App() {
     return () => window.removeEventListener("focus", refresh);
   }, []);
 
-  // 网关改了 Codex 的直连设置（接入 / 断开网关）：重新读取，免得用旧设置整份写回。
+  // 网关改了 Codex 的直连设置（接入 / 断开网关），或在 Codex 设置页改了开关：
+  // 重新读取并把尚未保存的编辑叠上去，免得用旧设置整份写回或撞上 revision 冲突。
   useEffect(() => {
     let disposed = false;
     let stopListening: (() => void) | undefined;
+    const syncExternalSettings = async () => {
+      let result: SettingsResult;
+      try {
+        result = await call<SettingsResult>("load_settings");
+      } catch {
+        return;
+      }
+      if (disposed || !isSuccessStatus(result.status)) return;
+      const previous = settingsRef.current?.settings;
+      const latest = normalizeSettings(result.settings);
+      setSettings(result);
+      setSettingsForm((current) => (previous
+        ? rebaseSettingsEdits(normalizeSettings(current), normalizeSettings(previous), latest)
+        : latest));
+    };
     void listen("codex-plus-settings-changed", () => {
-      if (!disposed) void refreshSettings(true);
+      if (!disposed) void syncExternalSettings();
     }).then((unlisten) => {
       if (disposed) unlisten();
       else stopListening = unlisten;

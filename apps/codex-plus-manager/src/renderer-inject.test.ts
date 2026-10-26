@@ -1069,16 +1069,17 @@ return (loaded) => { codexPlusBackendSettingsLoaded = loaded; renderCodexPlusMen
 
   it("refreshes backend switches from enabled to disabled without losing their accessible state", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
-    const start = renderer.indexOf("  function refreshCodexPlusBackendToggles()");
+    const start = renderer.indexOf("  function syncCodexPlusBackendToggleButtons()");
     const end = renderer.indexOf("\n  let codexPlusUserScripts =", start);
     assert.ok(start >= 0 && end > start);
     const settings = { enhancementsEnabled: true };
     const attributes: Record<string, string> = {};
+    let attributeWrites = 0;
     const button = {
       dataset: {} as Record<string, string>,
       disabled: true,
       getAttribute: () => "enhancementsEnabled",
-      setAttribute: (name: string, value: string) => { attributes[name] = value; },
+      setAttribute: (name: string, value: string) => { attributes[name] = value; attributeWrites += 1; },
     };
     let menuRefreshes = 0;
     const refresh = new Function("document", "codexPlusBackendSettings", "syncStepwisePanel", "runScanStep", "syncCodexPlusTypingEffects", "renderCodexPlusMenu", "scan", "syncCodexPlusSettingsCatalogDescriptions",
@@ -1096,6 +1097,10 @@ return (loaded) => { codexPlusBackendSettingsLoaded = loaded; renderCodexPlusMen
     assert.equal(attributes["aria-checked"], "false");
     assert.equal(button.disabled, true, "backend refresh preserves the control's existing disabled state");
     assert.equal(menuRefreshes, 2, "each backend refresh also synchronizes the other settings controls");
+    // 心跳每 5 秒同步一次：值没变就不写属性，避免无谓的 DOM 变更触发扫描。
+    const writes = attributeWrites;
+    refresh();
+    assert.equal(attributeWrites, writes);
   });
 
   it("groups the settings homepage into labelled cards and keeps hidden service controls hidden", async () => {

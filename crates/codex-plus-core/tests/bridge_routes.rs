@@ -395,6 +395,27 @@ async fn settings_get_does_not_expose_stepwise_api_key_to_renderer() {
 }
 
 #[tokio::test]
+async fn settings_set_notifies_external_settings_change_listener() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NOTIFIED: AtomicUsize = AtomicUsize::new(0);
+    codex_plus_core::settings::set_external_settings_change_listener(|| {
+        NOTIFIED.fetch_add(1, Ordering::SeqCst);
+    });
+    let before = NOTIFIED.load(Ordering::SeqCst);
+
+    let result = handle_bridge_request(
+        test_context(),
+        "/settings/set",
+        json!({"providerSyncEnabled": true}),
+    )
+    .await;
+
+    assert_eq!(result["providerSyncEnabled"], json!(true));
+    // 同进程其它用例也可能写设置，只断言至少通知了一次。
+    assert!(NOTIFIED.load(Ordering::SeqCst) > before, "Codex 写入设置后应通知管理器");
+}
+
+#[tokio::test]
 async fn settings_set_does_not_persist_runtime_codex_app_version() {
     let settings = Arc::new(FakeSettings::with_codex_app_version("26.601.21317"));
     let ctx = BridgeContext::new(

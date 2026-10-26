@@ -215,6 +215,7 @@ pub fn run() {
             let main_window = main_window_builder.build()?;
             install_tray(app)?;
             gateway_commands::set_app_handle(app.handle().clone());
+            codex_plus_core::settings::set_external_settings_change_listener(gateway_commands::notify_settings_changed);
             if start_minimized {
                 set_manager_activation_policy(app.handle(), false);
             }

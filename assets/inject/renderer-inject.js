@@ -6161,6 +6161,8 @@
         if (typeof syncCodexPlusAgentPet === "function") runScanStep(syncCodexPlusAgentPet);
         if (typeof syncCodexPlusCapacityAutoRetry === "function") runScanStep(syncCodexPlusCapacityAutoRetry);
         globalThis.__CODEX_PLUS_ACTIVITY_OVERLAY_SYNC__?.();
+        // 管理器里改的设置：设置页开着时，开关与随总开关切换的说明也跟着变。
+        syncCodexPlusBackendToggleButtons();
         renderCodexPlusMenu();
         if (previousConversationView !== !!codexPlusSettings().conversationView) {
           refreshConversationView();
@@ -6193,15 +6195,25 @@
     }
   }
 
+  /**
+   * 把直接写后端字段的开关同步成当前值。心跳每 5 秒也会调用，
+   * 值没变就不写属性，避免无谓的 DOM 变更触发扫描。
+   */
+  function syncCodexPlusBackendToggleButtons() {
+    document.querySelectorAll(".codex-plus-toggle[data-codex-backend-setting]").forEach((button) => {
+      const key = button.getAttribute("data-codex-backend-setting");
+      const enabled = String(!!codexPlusBackendSettings[key]);
+      if (button.dataset.enabled === enabled) return;
+      button.dataset.enabled = enabled;
+      button.setAttribute("aria-checked", enabled);
+    });
+    syncCodexPlusSettingsCatalogDescriptions();
+  }
+
   function refreshCodexPlusBackendToggles() {
     globalThis.__CODEX_PLUS_ACTIVITY_OVERLAY_SYNC__?.();
     globalThis.__CODEX_PLUS_USAGE_STATUSLINE_SYNC__?.();
-    document.querySelectorAll(".codex-plus-toggle[data-codex-backend-setting]").forEach((button) => {
-      const key = button.getAttribute("data-codex-backend-setting");
-      button.dataset.enabled = String(!!codexPlusBackendSettings[key]);
-      button.setAttribute("aria-checked", button.dataset.enabled);
-    });
-    syncCodexPlusSettingsCatalogDescriptions();
+    syncCodexPlusBackendToggleButtons();
     syncStepwisePanel();
     runScanStep(syncCodexPlusTypingEffects);
     if (typeof syncCodexPlusAgentPet === "function") runScanStep(syncCodexPlusAgentPet);
@@ -7458,7 +7470,8 @@
     document.querySelectorAll("[data-codex-plus-setting-description]").forEach((node) => {
       const key = node.getAttribute("data-codex-plus-setting-description");
       const item = codexPlusSettingsCatalog.items.find((candidate) => candidate.key === key);
-      if (item) node.textContent = codexPlusSettingsCatalogDescription(item);
+      const description = item ? codexPlusSettingsCatalogDescription(item) : "";
+      if (item && node.textContent !== description) node.textContent = description;
     });
   }
 

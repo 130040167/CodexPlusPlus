@@ -249,9 +249,9 @@ pub fn set_app_handle(app: tauri::AppHandle) {
 /// 设置改动事件：主窗口收到后重新读取设置。
 pub const SETTINGS_CHANGED_EVENT: &str = "codex-plus-settings-changed";
 
-/// Codex 接入网关会改直连模式的设置（加入 / 删除托管供应商、切换当前供应商）：
-/// 通知主窗口重新读取，免得它拿旧设置整份写回。
-fn notify_settings_changed() {
+/// Codex 接入网关会改直连模式的设置（加入 / 删除托管供应商、切换当前供应商），
+/// Codex 设置页也会经桥接写设置：通知主窗口重新读取，免得它拿旧设置整份写回。
+pub(crate) fn notify_settings_changed() {
     if let Some(app) = APP.get() {
         let _ = tauri::Emitter::emit(app, SETTINGS_CHANGED_EVENT, ());
     }

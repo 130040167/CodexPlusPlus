@@ -13,6 +13,28 @@ use toml_edit::{DocumentMut, Item};
 
 use crate::tools::{ToolConfig, ToolId};
 
+type SettingsChangeListener = Box<dyn Fn() + Send + Sync>;
+
+/// 管理器之外（Codex 设置页经桥接 `/settings/set`）写入设置后的通知钩子。
+/// core 不依赖 Tauri：管理器启动时注册监听，再转成界面事件让主窗口重新读取。
+/// 管理器自己的保存不走这里，免得刷新冲掉它尚未保存的编辑。
+static EXTERNAL_SETTINGS_CHANGE_LISTENER: std::sync::Mutex<Option<SettingsChangeListener>> =
+    std::sync::Mutex::new(None);
+
+pub fn set_external_settings_change_listener(listener: impl Fn() + Send + Sync + 'static) {
+    if let Ok(mut slot) = EXTERNAL_SETTINGS_CHANGE_LISTENER.lock() {
+        *slot = Some(Box::new(listener));
+    }
+}
+
+pub fn notify_external_settings_change() {
+    if let Ok(slot) = EXTERNAL_SETTINGS_CHANGE_LISTENER.lock() {
+        if let Some(listener) = slot.as_ref() {
+            listener();
+        }
+    }
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
