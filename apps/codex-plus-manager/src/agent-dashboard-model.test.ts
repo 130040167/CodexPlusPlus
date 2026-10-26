@@ -27,3 +27,8 @@ test("顶部状态：经网关、被别的工具改掉、用自己的设置、�
   assert.equal(agentAccessState({ enabled: false }), "direct");
   assert.equal(agentAccessState(undefined), "missing");
 });
+
+test("Codex 的最近请求包含没有 agent 字段的直连记录", () => {
+  const entries = [log("a", null, 1), log("b", "codex", 2), log("c", "claude", 3)];
+  assert.deepEqual(recentAgentRequests(entries, "codex").map((item) => item.id), ["b", "a"]);
+});

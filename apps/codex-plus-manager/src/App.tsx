@@ -125,7 +125,7 @@ import { noticeDuration, noticeTone } from "./notice-model";
 import { agentTabGroups, agentTarget } from "./page-groups";
 import { TopbarActions } from "./TopbarActions";
 import { OnboardingTour } from "./OnboardingTour";
-import { AgentDashboard } from "./AgentDashboard";
+import { AgentDashboard, type DashboardAgent, type DashboardStat, type DashboardStatus } from "./AgentDashboard";
 import { shouldShowTour, TOUR_STORAGE_KEY, TOUR_VERSION } from "./onboarding-model";
 import "./ToolPages.css";
 import { BACKEND_SETTINGS_CHANGED_EVENT, ComputerUsePage } from "./ComputerUsePage";
@@ -1523,6 +1523,8 @@ export function App() {
   }, []);
   // 「会话」页默认看所有 Agent；切到 Codex 页签才是带删除 / 归档 / 修复的完整会话管理。
   const [sessionTab, setSessionTab] = useState<SessionTab>("all");
+  /** 请求日志打开时的 Agent 过滤（从 Agent 概览跳过去时设置，用一次就清掉）。 */
+  const [requestLogAgentFilter, setRequestLogAgentFilter] = useState<"all" | "codex" | "claude" | "grok">("all");
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "k") {
@@ -4388,6 +4390,12 @@ export function App() {
               toolEntries={toolEntries}
               form={settingsForm}
               onNavigate={(next) => void navigate(next)}
+              onOpenList={(kind, agent) => {
+                // 从 Agent 概览跳过去：会话页停在这个 Agent 的页签，请求日志按它过滤。
+                if (kind === "sessions") setSessionTab(agent);
+                else setRequestLogAgentFilter(agent);
+                void navigate(kind);
+              }}
               actions={actions}
             />
           ) : null}
@@ -4431,7 +4439,7 @@ export function App() {
             />
           ) : null}
           {route === "requestLog" ? (
-            <RequestLogScreen />
+            <RequestLogScreen initialAgent={requestLogAgentFilter} onConsumeInitialAgent={() => setRequestLogAgentFilter("all")} />
           ) : null}
           {route === "claude" ? <ClaudeLocalizationScreen /> : null}
           {route === "sessions" ? <SessionAgentTabs onChange={setSessionTab} value={sessionTab} /> : null}
@@ -5466,6 +5474,7 @@ function OverviewScreen({
   toolEntries,
   form,
   onNavigate,
+  onOpenList,
   actions,
 }: {
   overview: OverviewResult | null;
@@ -5473,6 +5482,8 @@ function OverviewScreen({
   toolEntries: ToolEntry[];
   form: BackendSettings;
   onNavigate: (route: Route) => void;
+  /** 打开会话页 / 请求日志并选中这个 Agent。 */
+  onOpenList: (kind: "sessions" | "requestLog", agent: DashboardAgent) => void;
   actions: Actions;
 }) {
   const health = healthItems(overview);
@@ -5486,7 +5497,8 @@ function OverviewScreen({
     let cancelled = false;
     void invoke<RequestLogsResult>("load_request_logs", { limit: 300 })
       .then((result) => {
-        if (!cancelled) setRecent(summarizeRecentRequests(result.status === "ok" ? result.entries : [], Date.now()));
+        // 网关记录里也有 Claude Code / Grok 的请求，Codex 概览只统计 Codex 自己的。
+        if (!cancelled) setRecent(summarizeRecentRequests(result.status === "ok" ? result.entries.filter((entry) => requestLogAgent(entry) === "codex") : [], Date.now()));
       })
       .catch(() => { if (!cancelled) setRecent(summarizeRecentRequests([], Date.now())); });
     return () => { cancelled = true; };
@@ -5495,133 +5507,99 @@ function OverviewScreen({
     if (!profileId || profileId === normalized.activeRelayId) return;
     void actions.switchRelayProfile(syncLegacyRelayFields({ ...normalized, activeRelayId: profileId }), normalized.activeRelayId);
   };
+  const gatewayManaged = activeProfile?.id === CODEX_GATEWAY_RELAY_ID;
+  // Codex 的状态栏：经网关 / 直连哪家供应商，操作是网关管理或切换供应商。
+  const codexStatus: DashboardStatus = gatewayManaged
+    ? { tone: "gateway", text: codexGatewayModelCount(activeProfile) ? tf("经 Codex++ 网关 · {0} 个模型", [codexGatewayModelCount(activeProfile)]) : t("经 Codex++ 网关") }
+    : activeProfile
+      ? { tone: "relay", text: tf("直连 · {0}", [[activeProfile.name || t("未命名供应商"), relayProtocolLabel(activeProfile.protocol), activeProfile.model].filter(Boolean).join(" · ")]) }
+      : { tone: "missing", text: t("还没有配置供应商。") };
+  const codexActions = gatewayManaged ? (
+    <>
+      <Button onClick={() => onNavigate("gateway")} size="sm">{t("管理接入")}</Button>
+      <Button onClick={() => onNavigate("relay")} size="sm" variant="secondary">{t("断开并还原")}</Button>
+    </>
+  ) : activeProfile ? (
+    <>
+      <AppSelect
+        ariaLabel={t("切换供应商")}
+        className="overview-current-select agent-dash-select"
+        disabled={actions.relaySwitching || !normalized.relayProfilesEnabled || normalized.relayProfiles.length < 2}
+        onChange={(next) => switchFromOverview(next)}
+        options={normalized.relayProfiles.map((profile) => ({ value: profile.id, label: profile.name || t("未命名供应商") }))}
+        size="sm"
+        title={!normalized.relayProfilesEnabled ? t("供应商配置切换已关闭，在供应商配置页打开后才能切换") : t("切换供应商")}
+        value={normalized.activeRelayId}
+      />
+      <Button onClick={() => onNavigate("relay")} size="sm" variant="secondary">{t("管理供应商")}</Button>
+    </>
+  ) : (
+    <Button onClick={() => onNavigate("relay")} size="sm">{t("添加供应商")}</Button>
+  );
+  const codexStats: DashboardStat[] = [
+    { label: t("24 小时请求"), value: recent ? recent.total : "—" },
+    { label: t("成功率"), value: recent?.successRate == null ? "—" : `${Math.round(recent.successRate * 100)}%`, tone: recent?.failed ? "warn" : "ok" },
+    { label: t("平均耗时"), value: recent?.avgDurationMs == null ? "—" : `${(recent.avgDurationMs / 1000).toFixed(1)}s` },
+    { label: t("常用模型"), value: recent?.topModel ?? "—", mono: false },
+  ];
   return (
     <>
       {activeTool === "codex" ? (
-        <>
-          {/* 推荐位之下是最常用的两件事：现在用的是哪个供应商（可直接切换），以及最近请求是否正常。 */}
-          <div className="overview-top-grid">
-            <Panel className="overview-current-panel">
-              <CardHead title={t("当前供应商")} detail="" />
-              <CardContent className="overview-current">
-                {activeProfile?.id === CODEX_GATEWAY_RELAY_ID ? (
-                  // 被新版网关接管：直接说明现状，不给切换下拉框（切了也只会报错），改去网关管理或断开。
-                  <>
-                    <div className="overview-current-main">
-                      <span className="relay-index overview-current-gateway"><Network aria-hidden="true" className="h-4 w-4" /></span>
-                      <span className="overview-current-text">
-                        <strong>{t("由 Codex++ 网关接管")}</strong>
-                        <small>
-                          {codexGatewayModelCount(activeProfile)
-                            ? tf("用网关供应商池里的 {0} 个模型；要切回旧版供应商，先断开并还原", [codexGatewayModelCount(activeProfile)])
-                            : t("用网关供应商池里的模型；要切回旧版供应商，先断开并还原")}
-                        </small>
-                      </span>
-                    </div>
-                    <div className="overview-current-actions overview-current-actions-indented">
-                      <Button onClick={() => onNavigate("gateway")}>{t("管理接入")}</Button>
-                      <Button onClick={() => onNavigate("relay")} variant="secondary">{t("断开并还原")}</Button>
-                    </div>
-                  </>
-                ) : activeProfile ? (
-                  <>
-                    <div className="overview-current-main">
-                      <span className="relay-index">{providerInitial(activeProfile.name)}</span>
-                      <span className="overview-current-text">
-                        <strong>{activeProfile.name || t("未命名供应商")}</strong>
-                        <small>
-                          {[relayProfileModeLabel(activeProfile), relayProtocolLabel(activeProfile.protocol), activeProfile.model]
-                            .filter(Boolean)
-                            .join(" · ")}
-                        </small>
-                      </span>
-                    </div>
-                    <div className="overview-current-actions">
-                      <AppSelect
-                        ariaLabel={t("切换供应商")}
-                        className="overview-current-select"
-                        disabled={actions.relaySwitching || !normalized.relayProfilesEnabled || normalized.relayProfiles.length < 2}
-                        onChange={(next) => switchFromOverview(next)}
-                        options={normalized.relayProfiles.map((profile) => ({ value: profile.id, label: profile.name || t("未命名供应商") }))}
-                        title={!normalized.relayProfilesEnabled ? t("供应商配置切换已关闭，在供应商配置页打开后才能切换") : t("切换供应商")}
-                        value={normalized.activeRelayId}
-                      />
-                      <Button onClick={() => onNavigate("relay")} variant="secondary">{t("管理供应商")}</Button>
-                    </div>
-                  </>
-                ) : (
-                  <div className="overview-current-empty">
-                    <span>{t("还没有配置供应商。")}</span>
-                    <Button onClick={() => onNavigate("relay")}>{t("添加供应商")}</Button>
-                  </div>
-                )}
-              </CardContent>
-            </Panel>
-            <Panel className="overview-recent-panel">
-              <CardHead title={t("最近 24 小时请求")} detail="" />
-              <CardContent className="overview-recent">
-                {!recent ? (
-                  <span className="field-hint">{t("读取中…")}</span>
-                ) : recent.total === 0 ? (
-                  <span className="field-hint">{t("最近 24 小时没有经过本地代理的请求。直连且未开启协议转换时，请求不经过本地代理，这里不会有记录。")}</span>
-                ) : (
-                  <dl className="overview-recent-stats">
-                    <div><dt>{t("请求")}</dt><dd>{recent.total}</dd></div>
-                    <div data-state={recent.failed ? "warn" : "ok"}><dt>{t("成功率")}</dt><dd>{Math.round((recent.successRate ?? 0) * 100)}%</dd></div>
-                    <div><dt>{t("平均耗时")}</dt><dd>{((recent.avgDurationMs ?? 0) / 1000).toFixed(1)}s</dd></div>
-                    <div className="overview-recent-model"><dt>{t("常用模型")}</dt><dd title={recent.topModel ?? undefined}>{recent.topModel ?? "—"}</dd></div>
-                  </dl>
-                )}
-                <Button className="overview-recent-link" onClick={() => onNavigate("requestLog")} size="sm" variant="ghost">
-                  {t("查看请求日志")}
-                </Button>
-              </CardContent>
-            </Panel>
-          </div>
-          <Panel>
-            <CardHeader className="panel-head overview-health-header">
-              <CardTitle>{t("健康检查")}</CardTitle>
-              <div className="overview-health-header-actions">
-                <CardDescription>{t("概览只展示关键问题，具体配置在对应页面处理")}</CardDescription>
-                <Button
-                  aria-label={t("刷新状态")}
-                  title={t("刷新状态")}
-                  size="icon"
-                  variant="outline"
-                  className="shrink-0"
-                  onClick={() => void actions.refreshCurrent()}
-                >
-                  <RefreshCw className="h-4 w-4" />
-                </Button>
-              </div>
-            </CardHeader>
-            <CardContent>
-              <div className="health-grid overview-health-grid">
-                <div className={`health-item ${overview?.codex_version ? "ok" : "needs-fix"}`}>
-                  <span className={`health-icon ${overview?.codex_version ? "good" : "warn"}`}><Tag className="h-4 w-4" /></span>
-                  <div>
-                    <strong>{t("Codex 版本")}</strong>
-                    <span title={overview?.codex_version ?? undefined}>{overview?.codex_version ?? t("未检测到 Codex 应用版本。")}</span>
-                  </div>
-                  <Badge status={overview?.codex_version ? "ok" : "not_checked"} />
+        // 三个 Agent 的概览同一套仪表板；Codex 另在下面放健康检查。
+        <AgentDashboard
+          actions={codexActions}
+          agent="codex"
+          name="Codex"
+          notify={actions.showMessage}
+          onNavigate={onNavigate}
+          onOpenList={onOpenList}
+          stats={codexStats}
+          status={codexStatus}
+          version={overview?.codex_version}
+        >
+        <Panel>
+          <CardHeader className="panel-head overview-health-header">
+            <CardTitle>{t("健康检查")}</CardTitle>
+            <div className="overview-health-header-actions">
+              <CardDescription>{t("概览只展示关键问题，具体配置在对应页面处理")}</CardDescription>
+              <Button
+                aria-label={t("刷新状态")}
+                title={t("刷新状态")}
+                size="icon"
+                variant="outline"
+                className="shrink-0"
+                onClick={() => void actions.refreshCurrent()}
+              >
+                <RefreshCw className="h-4 w-4" />
+              </Button>
+            </div>
+          </CardHeader>
+          <CardContent>
+            <div className="health-grid overview-health-grid">
+              <div className={`health-item ${overview?.codex_version ? "ok" : "needs-fix"}`}>
+                <span className={`health-icon ${overview?.codex_version ? "good" : "warn"}`}><Tag className="h-4 w-4" /></span>
+                <div>
+                  <strong>{t("Codex 版本")}</strong>
+                  <span title={overview?.codex_version ?? undefined}>{overview?.codex_version ?? t("未检测到 Codex 应用版本。")}</span>
                 </div>
-                {health.map((item) => (
-                  <div className={`health-item ${item.ok ? "ok" : "needs-fix"}`} key={item.title}>
-                    <span className={`health-icon ${statusClass(item.status)}`}><item.icon className="h-4 w-4" /></span>
-                    <div>
-                      <strong>{item.title}</strong>
-                      <span title={item.detail}>{item.detail}</span>
-                    </div>
-                    <Badge status={item.status} />
-                  </div>
-                ))}
+                <Badge status={overview?.codex_version ? "ok" : "not_checked"} />
               </div>
-            </CardContent>
-          </Panel>
-        </>
+              {health.map((item) => (
+                <div className={`health-item ${item.ok ? "ok" : "needs-fix"}`} key={item.title}>
+                  <span className={`health-icon ${statusClass(item.status)}`}><item.icon className="h-4 w-4" /></span>
+                  <div>
+                    <strong>{item.title}</strong>
+                    <span title={item.detail}>{item.detail}</span>
+                  </div>
+                  <Badge status={item.status} />
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Panel>
+        </AgentDashboard>
       ) : activeTool === "claude" || activeTool === "grok" ? (
-        // Claude Code / Grok：接入状态、今日数据、最近会话与请求、配置摘要。
-        <AgentDashboard agent={activeTool} name={tool?.name ?? activeTool} notify={actions.showMessage} onNavigate={onNavigate} />
+        <AgentDashboard agent={activeTool} name={tool?.name ?? activeTool} notify={actions.showMessage} onNavigate={onNavigate} onOpenList={onOpenList} />
       ) : null}
     </>
   );
@@ -6049,14 +6027,16 @@ function requestLogAgent(entry: RequestLogEntry): string {
   return entry.agent || "codex";
 }
 
-function RequestLogScreen() {
+function RequestLogScreen({ initialAgent = "all", onConsumeInitialAgent }: { initialAgent?: "all" | "codex" | "claude" | "grok"; onConsumeInitialAgent?: () => void }) {
   const [entries, setEntries] = useState<RequestLogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | "running" | "success" | "failed" | "retried">("all");
   const [sessionFilter, setSessionFilter] = useState("all");
-  const [agentFilter, setAgentFilter] = useState<"all" | "codex" | "claude" | "grok">("all");
+  const [agentFilter, setAgentFilter] = useState<"all" | "codex" | "claude" | "grok">(initialAgent);
+  // 初始过滤只用一次：之后从侧栏进来仍是「全部」。
+  useEffect(() => { if (initialAgent !== "all") onConsumeInitialAgent?.(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);

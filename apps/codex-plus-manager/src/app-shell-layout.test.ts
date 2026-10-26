@@ -247,12 +247,23 @@ test("Codex 被网关接管时，旧版供应商页的配置切换、从第三�
   assert.match(screen, /disabled=\{takenOverByGateway\}\n\s*onClick=\{\(\) => \{ setNewProfileDraft\(null\);/);
 });
 
-test("概览页当前供应商：被网关接管时直接显示接管状态，不给切换下拉框", () => {
+test("Codex 概览与 Claude / Grok 同一套仪表板：被网关接管时状态栏只给管理接入、断开并还原，不给切换下拉框", () => {
   const screen = functionSource("OverviewScreen");
-  assert.match(screen, /\{activeProfile\?\.id === CODEX_GATEWAY_RELAY_ID \? \(/);
-  const gatewayBranch = screen.slice(screen.indexOf("activeProfile?.id === CODEX_GATEWAY_RELAY_ID"), screen.indexOf(") : activeProfile ? ("));
-  assert.match(gatewayBranch, /t\("由 Codex\+\+ 网关接管"\)/);
+  assert.match(screen, /<AgentDashboard\n\s*actions=\{codexActions\}\n\s*agent="codex"/);
+  const gatewayBranch = screen.slice(screen.indexOf("const codexActions = gatewayManaged ? ("), screen.indexOf(") : activeProfile ? ("));
+  assert.match(gatewayBranch, /t\("管理接入"\)/);
   assert.doesNotMatch(gatewayBranch, /AppSelect|switchFromOverview/);
+  // 健康检查放在 Codex 仪表板下面
+  assert.ok(screen.indexOf("overview-health-header") > screen.indexOf("<AgentDashboard"));
+});
+
+test("从 Agent 概览点「全部」「请求日志」：会话页停在这个 Agent 的页签，请求日志按它过滤", () => {
+  const app = functionSource("App");
+  assert.match(app, /if \(kind === "sessions"\) setSessionTab\(agent\);\n\s*else setRequestLogAgentFilter\(agent\);/);
+  assert.match(app, /<RequestLogScreen initialAgent=\{requestLogAgentFilter\}/);
+  const dashboard = readFileSync(new URL("./AgentDashboard.tsx", import.meta.url), "utf8");
+  assert.match(dashboard, /onOpenList\("sessions", agent\)/);
+  assert.match(dashboard, /onOpenList\("requestLog", agent\)/);
 });
 
 test("「关于」并进「设置」：侧栏底部只留齿轮，合并页用左侧目录，旧的关于入口滚到版本与更新", () => {

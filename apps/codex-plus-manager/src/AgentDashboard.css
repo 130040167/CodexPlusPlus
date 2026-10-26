@@ -280,3 +280,19 @@
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+.shell .agent-dash-stats dd {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.shell .agent-dash-stats dd[data-mono="false"] {
+  font-size: 16px;
+  line-height: 30px;
+}
+.shell .agent-dash-actions .agent-dash-select {
+  width: 200px;
+}
+.shell .agent-dash-title > span[data-tone="relay"] i {
+  background: hsl(var(--brand-accent));
+}

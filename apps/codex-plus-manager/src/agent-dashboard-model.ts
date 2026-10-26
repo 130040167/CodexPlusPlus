@@ -26,7 +26,8 @@ type RequestLogLike = {
 /** 请求日志里这个 Agent 最近的几条，新的在前。 */
 export function recentAgentRequests(entries: RequestLogLike[], agent: string, limit = 6): DashboardRequest[] {
   return entries
-    .filter((entry) => entry.agent === agent)
+    // Codex 直连代理的记录没有 agent 字段，算作 Codex。
+    .filter((entry) => (entry.agent || "codex") === agent)
     .sort((left, right) => right.timestampMs - left.timestampMs)
     .slice(0, limit)
     .map((entry) => ({
