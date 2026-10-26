@@ -71,8 +71,8 @@ type CuApprovalState = {
   turnHooks?: { installed?: boolean; events?: string[]; settings?: string } | null;
 };
 
-// Codex 桌面版自己会把 [mcp_servers.computer-use] 写进 ~/.codex/config.toml，
-// 再挂一份只会让同一个 CU 服务出现两条连接，所以不列 Codex。
+// Codex 自带 Computer Use，不提供接入；status 里的 codex 只用来发现旧版本留下的条目，
+// 那会让 Codex 同时出现两套电脑控制工具，见下方的残留提示。
 const targetIds: CuTargetId[] = ["claudeCode", "claudeDesktop", "dsh", "zcode", "workBuddy"];
 const targetFallback: Record<CuTargetId, { label: string; configPath: string }> = {
   claudeCode: { label: "Claude Code", configPath: "~/.claude.json" },
@@ -511,6 +511,7 @@ export function ComputerUsePage() {
   const loading = busy === "refresh" && !status;
   const found = status?.runtimeFound === true;
   const apps = (check?.sampleApps ?? []).slice(0, 8);
+  const codexLeftover = status?.targets?.codex?.registered === true;
 
   // 已接入的客户端数：内置目标 + 自定义目标，「需更新」也算已接入。
   const connectedCount = [
@@ -776,6 +777,12 @@ export function ComputerUsePage() {
         {status?.claudeDesktopRunning ? (
           <p className="cu-note cu-note-warn">{t("Claude Desktop 正在运行：它退出时会重写自己的配置，接入前建议先完全退出 Claude Desktop，改完再打开。")}</p>
         ) : null}
+        {codexLeftover ? (
+          <div className="cu-note cu-note-warn cu-leftover" role="alert">
+            <span>{t("Codex 配置里残留了旧版本写入的 Codex++ Computer Use 条目，会和 Codex 自带的重复，可能出现 ambiguous 报错。移除后重启 Codex 生效。")}</span>
+            <button className="mg-button" type="button" disabled={locked} onClick={() => void mutateTarget("codex", "uninstall")}>{t("移除")}</button>
+          </div>
+        ) : null}
 
         <details className="cu-more" ref={targetsDetails} open={showTargets} onToggle={(event) => setShowTargets(event.currentTarget.open)}>
           <summary><strong>{t("配置路径与自定义目录")}</strong><small>{t("每个客户端写入的配置文件与备份位置；客户端换了配置目录时在这里添加。")}</small></summary>
@@ -981,7 +988,6 @@ export function ComputerUsePage() {
             </div>}
         </section>
         <p className="cu-note">{t("接入后需要重启对应客户端（Claude Code 会话、DeepSeek Harness、ZCode、WorkBuddy）才会加载工具，工具名以")}<code>mcp__codex-plus-cu__</code>{t("与")}<code>mcp__codex-plus-browser__</code>{t("前缀出现在工具列表中。")}</p>
-        <p className="cu-note">{t("Codex 桌面版与终端 CLI 共用")}<code>~/.codex/config.toml</code>{t("，其中已由 Codex 自己写入")}<code>[mcp_servers.computer-use]</code>{t("，无需重复接入；仅当你要在没有该条目的环境里单独启用时，才使用")}<code>--codex-plus-cu-cli install codex</code>{t("。")}</p>
       </>}
     </div>
   </div>;

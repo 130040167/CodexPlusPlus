@@ -72,6 +72,8 @@
 .cu-note-warn {
   color: #b45309;
 }
+.cu-leftover { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.cu-leftover .mg-button { flex:none; }
 
 /* 自定义接入目标：列表里的标记 + 底部添加表单（与 .cu-preview-select 的控件同一套外观） */
 .cu-badge-custom { color:hsl(var(--brand-accent)); border-color:hsl(var(--brand-accent)/.35); background:hsl(var(--brand-accent)/.07); }
