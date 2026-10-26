@@ -5,7 +5,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { createPortal } from "react-dom";
-import { confirm } from "@tauri-apps/plugin-dialog";
+import { appConfirm } from "./app-dialog";
 import { ChevronRight, Copy, GripVertical, Plus, Search, X } from "lucide-react";
 import { t, tf } from "./i18n";
 import {
@@ -203,7 +203,7 @@ function PoolRow({
     : [protocolLabel(entry.protocol), presetHost(entry.baseUrl), tf("{0} 个模型", [entry.models.length])]
   ).filter(Boolean).join(" · ");
   const remove = async () => {
-    const ok = await confirm(tf("从网关删除「{0}」？直连模式里的供应商不受影响。", [entry.name]), { title: t("删除供应商"), kind: "warning" });
+    const ok = await appConfirm(tf("从网关删除「{0}」？直连模式里的供应商不受影响。", [entry.name]), { title: t("删除供应商"), confirmText: t("删除"), danger: true });
     if (ok) await run(`remove:${entry.id}`, "delete_gateway_provider", { id: entry.id }, t("删除供应商"));
   };
   return (

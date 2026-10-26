@@ -73,7 +73,7 @@ test("consent precedes enabling, default is off, and refresh is read-only", asyn
   const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
   const component = await readFile(new URL("./native-browser-settings.tsx", import.meta.url), "utf8");
   assert.match(app, /codexAppNativeBrowserRequireIdentification: false/);
-  assert.match(app, /if \(value && !window\.confirm\(nativeBrowserConsent\)\) return;/);
+  assert.match(app, /if \(value && !\(await appConfirm\(nativeBrowserConsent, /);
   assert.match(component, /x-browser-agent/);
   assert.match(component, /不会关闭扩展已保存的标识设置/);
   assert.match(component, /Edge \/ Chrome 稳定版扩展/);

@@ -12576,6 +12576,63 @@ button.side-item:hover {
   }
 }
 
+/* 应用内确认 / 提示 / 输入框（替代系统原生对话框，见 app-dialog.tsx） */
+.modal-backdrop.app-dialog-backdrop {
+  z-index: 2000;
+}
+
+.modal-card.app-dialog {
+  width: min(420px, calc(100vw - 32px));
+}
+
+.app-dialog .modal-head {
+  margin-bottom: 8px;
+}
+
+.app-dialog .confirm-modal-body {
+  margin-bottom: 18px;
+}
+
+.app-dialog-message {
+  margin: 0;
+  color: hsl(var(--muted-foreground));
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.app-dialog-input {
+  width: 100%;
+  height: 34px;
+  margin-top: 10px;
+  padding: 0 10px;
+  border: 1px solid hsl(var(--input));
+  border-radius: 8px;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+}
+
+.app-dialog-input:focus {
+  border-color: hsl(var(--primary) / 0.6);
+}
+
+.app-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.app-dialog-actions .app-dialog-danger {
+  background: hsl(var(--destructive, 0 72% 51%));
+  color: hsl(var(--destructive-foreground, 0 0% 100%));
+}
+
+.app-dialog-actions .app-dialog-danger:hover {
+  background: hsl(var(--destructive, 0 72% 51%) / 0.88);
+}
+
 /* ── Graphite · 紧凑密度 ─────────────────────────────────────────
    所有旧页面共用的收口：单行顶栏、内容直接铺在画布上（不再框中套框）、
    卡片 / 列表行 / 控件统一收紧，字号以 13px 为基准。

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { confirm } from "@tauri-apps/plugin-dialog";
+import { appConfirm } from "./app-dialog";
 import { useEffect, useRef, useState } from "react";
 import { CheckCheck, ChevronRight, Info, RefreshCw, Sparkles, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -142,10 +142,10 @@ export function AgentCachePanel() {
     setError("");
     let submitted = false;
     try {
-      const accepted = await confirm(tf(
+      const accepted = await appConfirm(tf(
         "将永久删除 {0} 个缓存文件（逻辑大小 {1}）。\n涉及应用：{2}\n\n请先退出相关 AI 应用及 CLI。只处理超过 24 小时未修改的文件，包含已选择的日志。\n\n此操作不可撤销。是否继续？",
         [chosenFiles, bytes(chosenBytes), chosenSummary.apps.join("、")],
-      ), { title: t("确认清理 AI Agent 缓存"), kind: "warning" });
+      ), { title: t("确认清理 AI Agent 缓存"), confirmText: t("清理"), danger: true });
       if (!accepted || !mounted.current) return;
       submitted = true;
       const response = await invoke<Response<{ result?: CleanResult }>>("clean_agent_cache", {

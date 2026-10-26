@@ -1,7 +1,8 @@
 /** Computer Use：复用 Codex app 的 Computer Use 与 Chrome 控制，通过 MCP 提供给 Claude Code、DeepSeek Harness、ZCode 等客户端。 */
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { confirm, open } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/plugin-dialog";
+import { appConfirm } from "./app-dialog";
 import { AlertTriangle, AppWindow, Check, CheckCircle2, FolderOpen, Globe, Loader2, MonitorSmartphone, MousePointerClick, Pencil, Play, Plug, Plus, RefreshCw, ShieldCheck, Trash2, Unplug, X } from "lucide-react";
 import { ComputerUsePreview } from "./ComputerUsePreview";
 import { AppSelect } from "./AppSelect";
@@ -453,9 +454,9 @@ export function ComputerUsePage() {
 
   const removeCustomTarget = async (target: CuCustomTarget) => {
     if (lock.current) return;
-    const confirmed = await confirm(
+    const confirmed = await appConfirm(
       `${t("删除后会先移除写入")} ${target.configPath} ${t("的 Codex++ 条目（别人写的不动），再从列表里去掉。")}`,
-      { title: t("删除自定义目标"), kind: "warning" },
+      { title: t("删除自定义目标"), confirmText: t("删除"), danger: true },
     );
     if (!confirmed || !mounted.current) return;
     lock.current = true;

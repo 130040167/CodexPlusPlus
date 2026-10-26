@@ -1,7 +1,7 @@
 /** 本地网关 · 用量：余额、token / 缓存 / 推理 / 调用次数、按天的柱状图，以及按 Agent / 供应商 / 模型拆分。 */
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { confirm } from "@tauri-apps/plugin-dialog";
+import { appConfirm } from "./app-dialog";
 import { RefreshCw } from "lucide-react";
 import { getLanguage, t, tf } from "./i18n";
 import {
@@ -159,7 +159,7 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
             className="gw-text-button"
             disabled={busy !== null}
             onClick={() => void (async () => {
-              if (await confirm(t("清空全部用量统计？请求日志不受影响。"), { title: t("清空用量"), kind: "warning" })) {
+              if (await appConfirm(t("清空全部用量统计？请求日志不受影响。"), { title: t("清空用量"), confirmText: t("清空"), danger: true })) {
                 if (await run("usage:clear", "clear_gateway_usage", undefined, t("清空用量"))) void load(range);
               }
             })()}

@@ -114,6 +114,7 @@ import { summarizeRecentRequests, type RecentRequestSummary } from "./overview-m
 import { AgentCollaborationPage } from "./AgentCollaborationPage";
 import { SectionLabel, Switch } from "./gateway-ui";
 import { AppSelect, type AppSelectOption } from "./AppSelect";
+import { AppDialogHost, appAlert, appConfirm, appPrompt } from "./app-dialog";
 import { GatewayPage, type GatewayTab } from "./GatewayPage";
 import { AgentGlyph, HubOverview, useGatewayPayload } from "./HubOverview";
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
@@ -1792,7 +1793,7 @@ export function App() {
   const deleteUserScript = async (key: string) => {
     const script = settings?.user_scripts?.scripts?.find((item) => item.key === key);
     const name = script?.name || key;
-    if (!window.confirm(tf("删除插件“{0}”？此操作会移除本地插件文件。", [name]))) return;
+    if (!(await appConfirm(tf("删除插件“{0}”？此操作会移除本地插件文件。", [name]), { title: t("删除插件"), confirmText: t("删除"), danger: true }))) return;
     const result = await run(() => call<SettingsResult>("delete_user_script", { key }));
     if (result) {
       setSettings(result);
@@ -1840,7 +1841,7 @@ export function App() {
   const removeEnvConflicts = async (names: string[]) => {
     const uniqueNames = Array.from(new Set(names.map((name) => name.trim()).filter(Boolean)));
     if (!uniqueNames.length) return;
-    if (!window.confirm(tf("删除这些环境变量？\n\n{0}\n\n删除前会写入备份。", [uniqueNames.join("\n")]))) return;
+    if (!(await appConfirm(tf("删除这些环境变量？\n\n{0}\n\n删除前会写入备份。", [uniqueNames.join("\n")]), { title: t("删除环境变量"), confirmText: t("删除"), danger: true }))) return;
     const result = await run(() => call<RemoveEnvConflictsResult>("remove_env_conflicts", { request: { names: uniqueNames } }));
     if (result) {
       setEnvConflicts({
@@ -2321,7 +2322,7 @@ export function App() {
   };
 
   const renameDreamSkinTheme = async (item: DreamSkinThemeSummary) => {
-    const name = window.prompt(t("输入新的主题名称"), item.name)?.trim();
+    const name = (await appPrompt(t("重命名主题"), { defaultValue: item.name, placeholder: t("输入新的主题名称") }))?.trim();
     if (!name || name === item.name) return;
     const result = await run(() => call<DreamSkinThemeLibraryResult>("rename_dream_skin_theme", { id: item.id, name }));
     if (!result || !isSuccessStatus(result.status)) {
@@ -2692,7 +2693,7 @@ export function App() {
   const stopMultiLaunchInstance = async (instance: MultiLaunchInstance) => {
     if (multiLaunchActionPending) return;
     const name = formatMultiLaunchInstanceLabel(instance, { main: t("主 Codex"), fallback: t("Codex 实例") });
-    if (!window.confirm(tf("确定结束“{0}”吗？", [name]))) return;
+    if (!(await appConfirm(tf("确定结束“{0}”吗？", [name]), { title: t("结束实例"), confirmText: t("结束"), danger: true }))) return;
     setMultiLaunchActionPending(instance.instanceId);
     try {
       const result = await run(() => call<CommandResult<{ instanceId?: string }>>("stop_codex_multi_instance", {
@@ -3244,7 +3245,7 @@ export function App() {
   const recoverProviderSync = async () => {
     const backupDir = providerSyncProgress.result?.backupDir;
     if (providerSyncProgress.active || !backupDir) return;
-    if (!window.confirm(t("恢复这次未完成的修复？期间被其他操作修改的数据会保留，并报告冲突。"))) return;
+    if (!(await appConfirm(t("恢复这次未完成的修复？期间被其他操作修改的数据会保留，并报告冲突。"), { title: t("恢复修复"), confirmText: t("恢复") }))) return;
     setProviderSyncProgress((current) => ({ ...current, active: true, message: t("正在恢复…") }));
     try {
       const result = await run(() => call<CommandResult<ProviderSyncPayload>>("recover_provider_sync", { backupDir }));
@@ -4610,6 +4611,7 @@ export function App() {
           onClose={() => setNotice(null)}
         />
       ) : null}
+      <AppDialogHost />
       {confirmDialog ? (
         <ConfirmDialog
           confirm={confirmDialog}
@@ -6095,7 +6097,7 @@ function RequestLogScreen() {
   }, [autoRefresh]);
 
   const clearLogs = async () => {
-    if (!window.confirm(t("清空全部请求日志？此操作不可撤销。"))) return;
+    if (!(await appConfirm(t("清空全部请求日志？此操作不可撤销。"), { title: t("清空请求日志"), confirmText: t("清空"), danger: true }))) return;
     setClearing(true);
     try {
       const result = await invoke<{ status: Status; message: string }>("clear_request_logs");
@@ -7384,9 +7386,9 @@ function DictationSettingsPanel({ form, onFormChange }: {
       // 校验/保存失败时后端 payload 为空对象，不能用它覆盖用户刚输入的热键。
       const next = hotkeyStateFrom(result);
       if (next) setGlobalHotkey(next);
-      window.alert(result.message);
+      await appAlert(result.message, { title: t("全局听写快捷键") });
     } catch (error) {
-      window.alert(String(error));
+      await appAlert(String(error), { title: t("全局听写快捷键") });
     } finally {
       setGlobalHotkeyBusy(false);
     }
@@ -7846,10 +7848,10 @@ function EnhanceScreen({
                     detail={t("此兼容补丁仅适配 Windows 上的 Edge / Chrome；下次启动 Codex 时应用。扩展可能保留请求标识设置。")}
                     checked={form.codexAppNativeBrowserRequireIdentification}
                     disabled={!masterEnabled}
-                    onChange={(value) => {
-                      if (value && !window.confirm(nativeBrowserConsent)) return;
+                    onChange={(value) => void (async () => {
+                      if (value && !(await appConfirm(nativeBrowserConsent, { title: t("原生 Edge / Chrome 请求标识兼容（实验）"), confirmText: t("开启") }))) return;
                       setEnhanceFlag("codexAppNativeBrowserRequireIdentification", value);
-                    }}
+                    })()}
                   />
                   <NativeBrowserStatusView />
                 </> : null}
@@ -10620,7 +10622,7 @@ function RelayProfileDetail({
         next,
         activeLiveBaseUrl,
       );
-      if (requiresRestart && !window.confirm(t("此请求设置需要启动本地协议代理。保存后将立即重启 Codex，使设置安全生效。是否继续？"))) {
+      if (requiresRestart && !(await appConfirm(t("此请求设置需要启动本地协议代理。保存后将立即重启 Codex，使设置安全生效。是否继续？"), { title: t("需要重启 Codex"), confirmText: t("保存并重启") }))) {
         return;
       }
       const savedSettings = await onFormChange(next);
@@ -10681,10 +10683,10 @@ function RelayProfileDetail({
     <div className="relay-detail-page" key={profile.id}>
       <div className="relay-detail-header">
         <div className="relay-editor-heading">
-          <Button aria-label={t("返回列表")} onClick={() => {
-            if (hasUnsavedModelChanges && !window.confirm(t("有未保存的模型修改，确定放弃吗？"))) return;
+          <Button aria-label={t("返回列表")} onClick={() => void (async () => {
+            if (hasUnsavedModelChanges && !(await appConfirm(t("有未保存的模型修改，确定放弃吗？"), { title: t("放弃修改"), confirmText: t("放弃"), danger: true }))) return;
             onBack();
-          }} size="icon" title={t("返回列表")} type="button" variant="ghost">
+          })()} size="icon" title={t("返回列表")} type="button" variant="ghost">
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div className="relay-editor-heading-copy">

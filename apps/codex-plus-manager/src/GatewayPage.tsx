@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { confirm } from "@tauri-apps/plugin-dialog";
+import { appConfirm } from "./app-dialog";
 import { AlertTriangle, ChevronDown, ChevronUp, Plus, RefreshCw, Waypoints, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -225,7 +225,7 @@ function RoutingView({ payload, busy, run }: { payload: GatewayPayload | null; b
   const agents = connectedAgents(payload);
   const [editing, setEditing] = useState<GatewayGroupEntry | "new" | null>(null);
   const remove = async (group: GatewayGroupEntry) => {
-    const ok = await confirm(tf("删除路由组「{0}」？引用它的其它组会去掉这个成员。", [group.name]), { title: t("删除路由组"), kind: "warning" });
+    const ok = await appConfirm(tf("删除路由组「{0}」？引用它的其它组会去掉这个成员。", [group.name]), { title: t("删除路由组"), confirmText: t("删除"), danger: true });
     if (ok) await run(`group:${group.id}`, "delete_gateway_group", { id: group.id }, t("删除路由组"));
   };
   return (

@@ -2,6 +2,7 @@ import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState
 import { invoke } from "@tauri-apps/api/core";
 import { ArrowLeft, ArrowRight, BookOpen, ChevronDown, Copy, Edit3, ExternalLink, History, Link, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
 import { t, tf } from "./i18n";
+import { appConfirm, appPrompt } from "./app-dialog";
 import { matchesManagementQuery, sessionGroups, type ManagedSession } from "./management-model";
 import { AgentColumn, ManagementDrawer, MatrixCell, Menu, MenuItem, SearchField } from "./ManagementPages";
 import { MCP_AGENTS, type McpAgentId } from "./agent-mcp-model";
@@ -297,19 +298,19 @@ export function SkillsPage({ notify }: { notify: Notify }) {
     try { await invoke("open_external_url", { url }); }
     catch (e) { await notify("Skills", String(e), "failed"); }
   };
-  const createCustomGroup = () => {
-    const normalized = window.prompt(t("新建 Skill 分组"), "")?.trim();
+  const createCustomGroup = async () => {
+    const normalized = (await appPrompt(t("新建 Skill 分组"), { placeholder: t("分组名称") }))?.trim();
     if (!normalized || customGroupNames.includes(normalized)) return;
     setCustomGroupNames((old) => [...old, normalized]);
   };
-  const renameCustomGroup = (oldName: string) => {
-    const normalized = window.prompt(t("重命名 Skill 分组"), oldName)?.trim();
+  const renameCustomGroup = async (oldName: string) => {
+    const normalized = (await appPrompt(t("重命名 Skill 分组"), { defaultValue: oldName, placeholder: t("分组名称") }))?.trim();
     if (!normalized || normalized === oldName || customGroupNames.includes(normalized)) return;
     setCustomGroupNames((old) => old.map((item) => item === oldName ? normalized : item));
     setCustomGroupAssignments((old) => Object.fromEntries(Object.entries(old).map(([id, group]) => [id, group === oldName ? normalized : group])));
   };
-  const deleteCustomGroup = (name: string) => {
-    if (!window.confirm(tf("删除分组“{0}”？其中的 Skill 将回到来源分组。", [name]))) return;
+  const deleteCustomGroup = async (name: string) => {
+    if (!(await appConfirm(tf("删除分组“{0}”？其中的 Skill 将回到来源分组。", [name]), { title: t("删除分组"), confirmText: t("删除"), danger: true }))) return;
     setCustomGroupNames((old) => old.filter((item) => item !== name));
     setCustomGroupAssignments((old) => Object.fromEntries(Object.entries(old).filter(([, group]) => group !== name)));
   };

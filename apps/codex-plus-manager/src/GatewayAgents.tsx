@@ -1,7 +1,7 @@
 /** 本地网关 · 智能体：每个 Agent 一行，接入后供应商池里的模型都出现在它自己的模型列表里，也可以在这里直接选。 */
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
-import { confirm } from "@tauri-apps/plugin-dialog";
+import { appConfirm } from "./app-dialog";
 import { Check, ChevronDown, ChevronRight, ChevronUp, LayoutGrid, List, Search, Star, Unplug, Waypoints } from "lucide-react";
 import { t, tf } from "./i18n";
 import {
@@ -109,7 +109,7 @@ function AgentRow({
     return run(`save:${agent.agent}`, "save_gateway_binding", { agent: agent.agent, binding: bindingFromDraft(next, binding) }, t("保存网关绑定"), connected);
   };
   const disconnect = async () => {
-    const ok = await confirm(tf("断开 {0} 与 Codex++ 的连接？会还原它接入前的设置。", [agent.name]), { title: t("断开并还原"), kind: "warning" });
+    const ok = await appConfirm(tf("断开 {0} 与 Codex++ 的连接？会还原它接入前的设置。", [agent.name]), { title: t("断开并还原"), confirmText: t("断开并还原"), danger: true });
     if (ok) await run(`disable:${agent.agent}`, "disable_gateway_binding", { agent: agent.agent }, t("断开并还原"));
   };
   // 在选择器里选模型：已接入时直接改默认模型，未接入时选完即接入。

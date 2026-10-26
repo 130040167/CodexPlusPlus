@@ -323,3 +323,14 @@ test("全应用不用原生下拉框，统一用 AppSelect", () => {
   const shared = app.slice(app.indexOf("function SharedServiceSettings("), app.indexOf("function ProxySettingsScreen("));
   assert.match(shared, /<AppSelect/);
 });
+
+test("全应用不用系统原生的确认 / 提示 / 输入框，统一用 app-dialog", () => {
+  const dir = new URL("./", import.meta.url);
+  for (const file of readdirSync(dir)) {
+    if (!/\.tsx?$/.test(file) || file.includes(".test.") || file === "app-dialog.tsx") continue;
+    const source = readFileSync(new URL(file, dir), "utf8");
+    assert.doesNotMatch(source, /window\.(confirm|alert|prompt)\(/, file);
+    assert.doesNotMatch(source, /import \{[^}]*\b(confirm|ask|message)\b[^}]*\} from "@tauri-apps\/plugin-dialog"/, file);
+  }
+  assert.match(app, /<AppDialogHost \/>/);
+});
