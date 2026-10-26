@@ -48,7 +48,10 @@ Grok ─────────POST /gw/grok/v1/responses───┤  helper�
   要先「断开并还原」；断开后「Codex++ 网关」那一项还在时，选回它等于重新接入。
   Codex 用 ChatGPT 账号登录着时，托管供应商带 openai 会话身份（`model_provider = "openai"`，传输在
   `[model_providers.custom]`）：Codex 保留官方登录（会话、额度、远程控制照旧），`openai_base_url` 指向本地代理，
-  本地代理这一跳转给网关、不另记请求日志。没登录或用 API Key 时是普通自定义供应商。启动时若登录状态与
+  本地代理这一跳转给网关、不另记请求日志。Codex 自己没登录、池里有网关登录的 ChatGPT 账号时，接入时把它
+  「借给」Codex：token 写进 Codex 的 auth.json，网关里标记 `codex_plus_lent_to_codex`；借出期间同一账号以 Codex
+  那份为准，网关刷新后也写回 auth.json（始终一条 token 链，不会互相刷失效）。断开时把最新一代收回 gateway.json、
+  从 auth.json 拿掉登录；删除借出的账号前也会先收回。都没有时才是普通自定义供应商。启动时若登录状态与
   托管供应商的身份不一致会重写一次。
   实时配置被别的工具改过、与直连模式的记录对不上时，接入前把 `config.toml` / `auth.json` 原样存到
   `backups/codex-before-gateway.json`（0600），不往上一个供应商回填；断开时切回原供应商后原样写回。改完设置会通知主窗口重新读取，避免旧设置整份写回。

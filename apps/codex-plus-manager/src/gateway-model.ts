@@ -50,6 +50,8 @@ export type GatewayPoolEntry = {
   price?: ProviderPrice | null;
   /** 登录得到的账号：chatgpt / copilot / grok；普通供应商为空。 */
   account?: string;
+  /** 这个 ChatGPT 账号正借给 Codex 登录。 */
+  lentToCodex?: boolean;
 };
 
 export type ProviderPrice = { currency: string; input: number; cachedInput: number; output: number };

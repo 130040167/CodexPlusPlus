@@ -279,6 +279,7 @@ export const EN_PLAIN: Record<string, string> = {
   "Codex 正由 Codex++ 网关接管，旧版供应商列表已隐藏。点上方「断开并还原」后恢复。": "Codex is taken over by the Codex++ gateway, so the legacy provider list is hidden. Disconnect & restore above to bring it back.",
   "旧版供应商配置": "Provider configuration (legacy)",
   "ChatGPT 登录": "ChatGPT sign-in",
+  "Codex 正用它登录": "Codex is signed in with it",
   "用网关供应商池里的 {0} 个模型。接入期间旧版供应商列表已隐藏；要改用它们，先点「断开并还原」恢复接入前的配置。": "Using {0} models of the gateway's provider pool. The legacy provider list is hidden while connected; to use it, Disconnect & restore first.",
   "经 Codex++ 本地网关，用供应商池里的 {0} 个模型；在「Agent 接入」里管理": "Through the local Codex++ gateway with {0} models of the provider pool; managed under Agents",
   "opencode auth login 保存的 Key，按模型自动选协议": "Saved by opencode auth login; the protocol is picked per model",

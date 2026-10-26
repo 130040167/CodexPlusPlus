@@ -199,7 +199,7 @@ function PoolRow({
   const statusText = !enabled ? t("已关闭") : status.args.length ? tf(status.text, status.args) : t(status.text);
   const tone = !enabled ? "off" : status.state === "cooling" ? "error" : "on";
   const sub = (entry.account
-    ? [t("订阅登录"), tf("{0} 个模型", [entry.models.length])]
+    ? [t("订阅登录"), entry.lentToCodex ? t("Codex 正用它登录") : "", tf("{0} 个模型", [entry.models.length])]
     : [protocolLabel(entry.protocol), presetHost(entry.baseUrl), tf("{0} 个模型", [entry.models.length])]
   ).filter(Boolean).join(" · ");
   const remove = async () => {

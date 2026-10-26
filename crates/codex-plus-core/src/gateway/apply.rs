@@ -293,6 +293,95 @@ fn with_openai_session_identity(contents: &str) -> anyhow::Result<String> {
     Ok(doc.to_string())
 }
 
+/// 池里能借给 Codex 登录的账号：打开着的、网关自己登录的 ChatGPT 账号（按池里的顺序取第一个）。
+fn lendable_login(gateway: &GatewaySettings) -> Option<&GatewayProvider> {
+    gateway.providers.iter().find(|provider| {
+        provider.enabled && crate::official_login::is_gateway_owned_login(&provider.relay)
+    })
+}
+
+/// 把网关的 ChatGPT 账号借给 Codex 登录：token 写进 Codex 的 auth.json（其余字段不动），
+/// 网关里标记「借出」——之后这个账号以 Codex 那份为准，网关刷新也写回那里，两边始终同一代。
+fn lend_login_to_codex(ctx: &ApplyContext, provider_id: &str) -> anyhow::Result<()> {
+    let mut gateway = ctx.gateway.load()?;
+    let Some(provider) = gateway
+        .providers
+        .iter_mut()
+        .find(|provider| provider.relay.id == provider_id)
+    else {
+        return Ok(());
+    };
+    let path = ctx.codex_home.join("auth.json");
+    let live = std::fs::read_to_string(&path).unwrap_or_else(|_| "{}".to_string());
+    let merged = crate::official_login::auth_contents_with_member_login(
+        &live,
+        &provider.relay.auth_contents,
+        false,
+    )
+    .context("Codex 已经登录了别的 ChatGPT 账号，不能再借用网关的账号")?;
+    crate::settings::atomic_write(&path, merged.as_bytes())?;
+    let mut auth: Value = serde_json::from_str(&provider.relay.auth_contents)?;
+    auth[crate::official_login::LENT_TO_CODEX_MARKER] = Value::Bool(true);
+    provider.relay.auth_contents = serde_json::to_string_pretty(&auth)?;
+    ctx.gateway.save(&gateway)?;
+    Ok(())
+}
+
+/// 收回借给 Codex 的账号：Codex 那份是最新一代，token 写回网关、去掉「借出」标记，
+/// 再从 Codex 的 auth.json 里拿掉这个登录（借之前 Codex 本来就没登录）。
+pub fn return_lent_login(store: &GatewayStore, codex_home: &std::path::Path) -> anyhow::Result<()> {
+    let mut gateway = store.load()?;
+    let path = codex_home.join("auth.json");
+    let live = std::fs::read_to_string(&path).unwrap_or_default();
+    let live_login = crate::official_login::official_login_from_auth_contents(&live);
+    let mut changed = false;
+    let mut strip_live = false;
+    for provider in gateway
+        .providers
+        .iter_mut()
+        .filter(|provider| crate::official_login::is_lent_to_codex(&provider.relay))
+    {
+        let mut auth: Value = serde_json::from_str(&provider.relay.auth_contents)?;
+        let account = auth
+            .pointer("/tokens/account_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if let Some(login) = live_login
+            .as_ref()
+            .filter(|login| !account.is_empty() && login.account_id == account)
+        {
+            auth["tokens"]["access_token"] = json!(login.access_token);
+            if !login.refresh_token.is_empty() {
+                auth["tokens"]["refresh_token"] = json!(login.refresh_token);
+            }
+            strip_live = true;
+        }
+        if let Some(object) = auth.as_object_mut() {
+            object.remove(crate::official_login::LENT_TO_CODEX_MARKER);
+        }
+        provider.relay.auth_contents = serde_json::to_string_pretty(&auth)?;
+        changed = true;
+    }
+    if changed {
+        store.save(&gateway)?;
+    }
+    if strip_live && let Ok(Value::Object(mut object)) = serde_json::from_str::<Value>(&live) {
+        for key in ["tokens", "auth_mode", "last_refresh"] {
+            object.remove(key);
+        }
+        crate::settings::atomic_write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&Value::Object(object))?
+            )
+            .as_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
 /// Codex 现在是否用 ChatGPT 账号登录（auth.json 里有登录 token）。
 fn codex_signed_in(codex_home: &std::path::Path) -> bool {
     std::fs::read_to_string(codex_home.join("auth.json"))
@@ -367,8 +456,12 @@ fn write_codex(
     if !settings.relay_profiles_enabled {
         bail!("Codex 的供应商配置总开关已关闭，无法接入网关：先在 Codex 设置里打开");
     }
-    let profile =
-        codex_gateway_profile(gateway, binding, ctx.port, codex_signed_in(&ctx.codex_home))?;
+    // Codex 自己没登录、池里有网关登录的 ChatGPT 账号：借给 Codex，让它以官方身份接入。
+    let signed_in = codex_signed_in(&ctx.codex_home);
+    let lend = (!signed_in)
+        .then(|| lendable_login(gateway).map(|provider| provider.relay.id.clone()))
+        .flatten();
+    let profile = codex_gateway_profile(gateway, binding, ctx.port, signed_in || lend.is_some())?;
     match settings
         .relay_profiles
         .iter_mut()
@@ -416,6 +509,10 @@ fn write_codex(
         }
         Err(error) => return Err(error.context("把 Codex 切到网关失败")),
     }
+    // 切换时回填上一个供应商用的还是借之前的 auth.json；切过去之后再写入借来的登录。
+    if let Some(provider_id) = lend {
+        lend_login_to_codex(ctx, &provider_id)?;
+    }
     Ok(())
 }
 
@@ -458,6 +555,8 @@ pub fn enable_binding(
     {
         binding.restore.claude_previous_provider_id = snapshot;
     }
+    // 写配置时可能改过 gateway.json（借出账号等），以最新的为准再写绑定。
+    let mut gateway = ctx.gateway.load()?;
     gateway.bindings.insert(agent.as_str().to_string(), binding);
     ctx.gateway.save(&gateway)?;
     Ok(gateway)
@@ -469,7 +568,7 @@ pub fn disable_binding(
     settings: &BackendSettings,
     agent: &ToolId,
 ) -> anyhow::Result<GatewaySettings> {
-    let mut gateway = ctx.gateway.load()?;
+    let gateway = ctx.gateway.load()?;
     let Some(binding) = gateway.bindings.get(agent.as_str()).cloned() else {
         return Ok(gateway);
     };
@@ -479,6 +578,8 @@ pub fn disable_binding(
         ToolId::Codex => restore_codex(ctx, &binding)?,
         _ => {}
     }
+    // 恢复时可能改过 gateway.json（收回借出的账号等），以最新的为准。
+    let mut gateway = ctx.gateway.load()?;
     if let Some(binding) = gateway.bindings.get_mut(agent.as_str()) {
         binding.enabled = false;
         binding.restore = Default::default();
@@ -525,6 +626,8 @@ fn codex_active_relay_id(ctx: &ApplyContext) -> anyhow::Result<String> {
 /// 切回开启前的供应商（不在了就用列表里第一个），再删掉托管供应商。
 /// 用户已经在直连模式里切走了的，只删托管供应商。
 fn restore_codex(ctx: &ApplyContext, binding: &AgentBinding) -> anyhow::Result<()> {
+    // 先收回借给 Codex 的账号，切回去时上一个供应商写的是它自己的 auth.json。
+    return_lent_login(&ctx.gateway, &ctx.codex_home)?;
     let mut settings = ctx.settings.load()?;
     let is_managed = |profile: &RelayProfile| profile.id == CODEX_GATEWAY_RELAY_ID;
     if !settings.relay_profiles.iter().any(is_managed) {
@@ -689,7 +792,8 @@ pub fn sync_codex_identity(ctx: &ApplyContext) -> anyhow::Result<bool> {
     }
     let keeps_login =
         settings.active_relay_session_provider() == crate::settings::RelaySessionProvider::Openai;
-    if keeps_login == codex_signed_in(&ctx.codex_home) {
+    let can_sign_in = codex_signed_in(&ctx.codex_home) || lendable_login(&gateway).is_some();
+    if keeps_login == can_sign_in {
         return Ok(false);
     }
     write_codex(ctx, &gateway, &binding.clone())?;
@@ -716,7 +820,14 @@ pub fn reapply_if_port_changed(ctx: &ApplyContext) -> anyhow::Result<usize> {
         changed += 1;
     }
     if changed > 0 {
-        ctx.gateway.save(&gateway)?;
+        // 写配置时可能改过 gateway.json：只把端口记到最新的那份上。
+        let mut latest = ctx.gateway.load()?;
+        for (agent, binding) in &gateway.bindings {
+            if let Some(target) = latest.bindings.get_mut(agent) {
+                target.restore.applied_port = binding.restore.applied_port;
+            }
+        }
+        ctx.gateway.save(&latest)?;
     }
     Ok(changed)
 }

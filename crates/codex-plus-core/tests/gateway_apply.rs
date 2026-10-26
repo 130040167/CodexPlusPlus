@@ -513,6 +513,96 @@ fn signed_in_codex_keeps_its_chatgpt_identity_through_the_gateway() {
     assert_eq!(ctx.settings.load().unwrap().active_relay_id, "direct");
 }
 
+/// Codex 自己没登录、池里有网关登录的 ChatGPT 账号：接入时借给 Codex 登录（官方身份），
+/// 借出期间以 Codex 那份 token 为准；断开时把最新一代收回网关，Codex 回到没登录的样子。
+#[test]
+fn pool_chatgpt_account_is_lent_to_codex_and_taken_back() {
+    let fixture = fixture(57398);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    let mut direct = codex_plus_core::provider_import::pool_relay_profile(
+        "直连",
+        "https://api.direct.test/v1",
+        "sk-direct",
+        RelayProtocol::Responses,
+        "gpt-direct",
+        "gpt-direct",
+        &[],
+    )
+    .unwrap();
+    direct.id = "direct".into();
+    direct.relay_mode = RelayMode::PureApi;
+    codex_plus_core::relay_config::normalize_relay_profile_for_storage(&mut direct).unwrap();
+    let mut seeded = BackendSettings::default();
+    seeded.relay_profiles_enabled = true;
+    seeded.relay_profiles = vec![direct];
+    seeded.active_relay_id = "direct".into();
+    codex_plus_core::relay_switch::switch_relay_profile_in_home(
+        &ctx.settings,
+        &ctx.codex_home,
+        seeded,
+        "",
+    )
+    .unwrap();
+    let auth_path = ctx.codex_home.join("auth.json");
+    let read_auth = || -> Value {
+        serde_json::from_str(&std::fs::read_to_string(&auth_path).unwrap_or_default())
+            .unwrap_or(Value::Null)
+    };
+    assert!(read_auth().get("tokens").is_none(), "Codex 本来没登录");
+
+    // 网关里登录的 ChatGPT 账号。
+    let chatgpt = RelayProfile {
+        name: "ChatGPT Pro".into(),
+        relay_mode: RelayMode::Official,
+        protocol: RelayProtocol::Responses,
+        auth_contents: json!({
+            "auth_mode": "chatgpt",
+            "codex_plus_gateway": true,
+            "tokens": { "id_token": "idt", "access_token": "at-1", "refresh_token": "rt-1", "account_id": "acc-pool" }
+        })
+        .to_string(),
+        model_list: "gpt-6.1-sol".into(),
+        ..RelayProfile::default()
+    };
+    let (_, pool_id) =
+        codex_plus_core::gateway::apply::add_provider(&ctx.gateway, chatgpt, "login:chatgpt")
+            .unwrap();
+
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let auth = read_auth();
+    assert_eq!(auth["auth_mode"], "chatgpt");
+    assert_eq!(auth["tokens"]["account_id"], "acc-pool");
+    assert_eq!(auth["tokens"]["refresh_token"], "rt-1");
+    assert_eq!(auth["tokens"]["id_token"], "idt");
+    assert_eq!(
+        ctx.settings.load().unwrap().active_relay_session_provider(),
+        codex_plus_core::settings::RelaySessionProvider::Openai,
+        "借到登录后以官方身份接入"
+    );
+    let lent = ctx.gateway.load().unwrap();
+    assert!(codex_plus_core::official_login::is_lent_to_codex(
+        &lent.provider(&pool_id).unwrap().relay
+    ));
+
+    // 借出期间 Codex 自己刷新了 token。
+    let mut refreshed = read_auth();
+    refreshed["tokens"]["access_token"] = json!("at-2");
+    refreshed["tokens"]["refresh_token"] = json!("rt-2");
+    std::fs::write(&auth_path, refreshed.to_string()).unwrap();
+
+    let settings = ctx.settings.load().unwrap();
+    disable_binding(ctx, &settings, &ToolId::Codex).unwrap();
+    let back = ctx.gateway.load().unwrap();
+    let relay = &back.provider(&pool_id).unwrap().relay;
+    assert!(!codex_plus_core::official_login::is_lent_to_codex(relay));
+    let pool_auth: Value = serde_json::from_str(&relay.auth_contents).unwrap();
+    assert_eq!(pool_auth["tokens"]["refresh_token"], "rt-2", "收回最新一代");
+    assert_eq!(pool_auth["codex_plus_gateway"], true);
+    assert!(read_auth().get("tokens").is_none(), "Codex 回到没登录");
+    assert_eq!(ctx.settings.load().unwrap().active_relay_id, "direct");
+}
+
 #[test]
 fn enabling_requires_a_pool_and_a_routable_model() {
     let fixture = fixture(57393);

@@ -34,6 +34,8 @@ pub struct GatewayPoolEntry {
     pub price: Option<codex_plus_core::gateway::store::ProviderPrice>,
     /// 登录得到的账号：`chatgpt` / `copilot` / `grok`；普通供应商为空。
     pub account: String,
+    /// 这个 ChatGPT 账号正借给 Codex 登录（Codex 以官方身份接入网关）。
+    pub lent_to_codex: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -116,6 +118,7 @@ fn pool_entry(
         source: source.to_string(),
         price,
         account: account_kind(relay),
+        lent_to_codex: codex_plus_core::official_login::is_lent_to_codex(relay),
     }
 }
 
@@ -410,6 +413,19 @@ pub fn delete_gateway_provider(id: String) -> CommandResult<Option<GatewayPayloa
         tauri::async_runtime::spawn(async move {
             let _ = codex_plus_core::gateway::accounts::chatgpt_api_revoke(&relay).await;
         });
+    }
+    // 正借给 Codex 登录的账号：先从 Codex 收回，免得 Codex 留着一个网关已经不管的登录。
+    let store = GatewayStore::default();
+    if store.load().ok().and_then(|gateway| {
+        gateway
+            .provider(&id)
+            .map(|provider| codex_plus_core::official_login::is_lent_to_codex(&provider.relay))
+    }) == Some(true)
+    {
+        let _ = apply::return_lent_login(
+            &store,
+            &codex_plus_core::relay_config::default_codex_home_dir(),
+        );
     }
     respond(
         "已删除。",
