@@ -233,9 +233,56 @@ async fn attempt_pipeline(
     if candidate.relay.protocol == RelayProtocol::Responses {
         anthropic_inbound::strip_unreplayable_reasoning(&mut body);
     }
+    // ChatGPT 订阅后端只服务 Codex 自己的客户端：请求体、请求头都整理成 Codex CLI 发的样子。
+    let chatgpt = crate::official_login::member_uses_official_login_transport(&candidate.relay);
+    let mut relay = candidate.relay.clone();
+    let mut cache_key = String::new();
+    if chatgpt {
+        let home = crate::codex_home::default_codex_home_dir();
+        let prompt = crate::gateway::chatgpt_backend::codex_prompt_from_cache(
+            &home,
+            &candidate.upstream_model,
+        );
+        body["model"] = Value::String(candidate.upstream_model.clone());
+        crate::gateway::chatgpt_backend::adapt_request(&mut body, prompt.as_deref());
+        let version = crate::gateway::chatgpt_backend::codex_version(&home);
+        relay.user_agent = crate::gateway::chatgpt_backend::codex_user_agent(&version);
+        for (key, value) in [
+            ("version", version.as_str()),
+            ("OpenAI-Beta", "responses=experimental"),
+        ] {
+            if !relay
+                .custom_headers
+                .iter()
+                .any(|header| header.key.eq_ignore_ascii_case(key))
+            {
+                relay
+                    .custom_headers
+                    .push(crate::settings::RelayHeaderKeyValue {
+                        key: key.to_string(),
+                        value: value.to_string(),
+                    });
+            }
+        }
+        cache_key = body
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+    }
+    // 后端按 session-id / thread-id 找会话的缓存，键取自 prompt_cache_key。
+    let session_headers = if chatgpt && !cache_key.is_empty() {
+        ProxySessionHeaders {
+            session_id: Some(cache_key.as_str()),
+            thread_id: Some(cache_key.as_str()),
+            opencode_session: None,
+        }
+    } else {
+        request.session_headers
+    };
     let body = serde_json::to_string(&body).map_err(|error| AttemptError::Fatal(error.into()))?;
     let forced = ForcedRelay {
-        relay: candidate.relay.clone(),
+        relay,
         upstream_model: Some(candidate.upstream_model.clone()),
         auto_retry: request.auto_retry,
     };
@@ -245,7 +292,7 @@ async fn attempt_pipeline(
         forced,
         request.user_agent,
         "/responses",
-        request.session_headers,
+        session_headers,
         request.live_request_id,
     )
     .await

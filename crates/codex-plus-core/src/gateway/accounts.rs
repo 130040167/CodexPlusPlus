@@ -265,13 +265,10 @@ async fn wait_for_callback(
                 .await;
             continue;
         };
-        let (ok, page) = match &result {
-            Ok((_, returned)) if returned == state => (true, "登录成功，可以回到 Codex++ 了。"),
-            Ok(_) => (
-                false,
-                "登录校验失败（state 不一致），请回到 Codex++ 重新登录。",
-            ),
-            Err(_) => (false, "登录没有完成，请回到 Codex++ 重新登录。"),
+        let page = match &result {
+            Ok((_, returned)) if returned == state => "登录成功，可以回到 Codex++ 了。",
+            Ok(_) => "登录校验失败（state 不一致），请回到 Codex++ 重新登录。",
+            Err(_) => "登录没有完成，请回到 Codex++ 重新登录。",
         };
         let body = format!(
             "<!doctype html><meta charset=\"utf-8\"><title>Codex++</title><body style=\"font-family:system-ui;padding:48px;text-align:center\"><h2>{page}</h2></body>"

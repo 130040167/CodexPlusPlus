@@ -658,6 +658,92 @@ async fn gateway_end_to_end() {
     assert!(text.contains("response.completed"), "{text}");
     assert_eq!(grok_seen.lock().unwrap()[0].1["model"], "glm-5.3");
 
+    // —— 8b. ChatGPT 订阅账号：请求整理成 Codex CLI 的样子（system → developer、store:false、只流式），
+    //        客户端要非流式时从 response.completed 拼回完整响应 ——
+    let completed = json!({ "type": "response.completed", "response": {
+        "id": "resp_1", "object": "response", "status": "completed", "model": "gpt-6.1-sol",
+        "output": [{ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "订阅回答" }] }],
+        "usage": { "input_tokens": 12, "output_tokens": 3, "total_tokens": 15 }
+    }});
+    let (official_base, official_seen) = mock_upstream(vec![(
+        200,
+        "text/event-stream",
+        format!("event: response.completed\ndata: {completed}\n\n"),
+    )])
+    .await;
+    unsafe {
+        std::env::set_var(
+            "CODEX_PLUS_OFFICIAL_BASE_URL",
+            official_base.trim_end_matches("/v1"),
+        );
+    }
+    let mut chatgpt = codex_plus_core::settings::RelayProfile {
+        id: "chatgpt".into(),
+        name: "ChatGPT Pro".into(),
+        relay_mode: codex_plus_core::settings::RelayMode::Official,
+        protocol: RelayProtocol::Responses,
+        auth_contents: json!({
+            "auth_mode": "chatgpt",
+            "codex_plus_gateway": true,
+            "tokens": { "access_token": "at-official", "refresh_token": "rt", "account_id": "acc-1" }
+        })
+        .to_string(),
+        model_list: "gpt-6.1-sol".into(),
+        ..codex_plus_core::settings::RelayProfile::default()
+    };
+    chatgpt.model = "gpt-6.1-sol".into();
+    gateway.providers = providers(vec![chatgpt]);
+    gateway
+        .bindings
+        .insert("grok".into(), binding("gpt-6.1-sol", "cpx-gw-grok-e2e"));
+    save(&gateway);
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/gw/grok/v1/responses"))
+        .bearer_auth("cpx-gw-grok-e2e")
+        .json(&json!({
+            "model": "gpt-6.1-sol",
+            "stream": false,
+            "temperature": 0.3,
+            "instructions": "You are Grok.",
+            "input": [
+                { "type": "message", "role": "system", "content": [{ "type": "input_text", "text": "系统规则" }] },
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let text = response.text().await.unwrap();
+    assert!(text.contains("订阅回答"), "{text}");
+    {
+        let seen = official_seen.lock().unwrap();
+        let (head, body) = &seen[0];
+        let head_lower = head.to_ascii_lowercase();
+        assert!(
+            head_lower.contains("authorization: bearer at-official"),
+            "{head}"
+        );
+        assert!(head_lower.contains("chatgpt-account-id: acc-1"), "{head}");
+        assert!(head_lower.contains("originator: codex_cli_rs"), "{head}");
+        assert!(head_lower.contains("user-agent: codex_cli_rs/"), "{head}");
+        assert!(head_lower.contains("session-id: "), "{head}");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert!(body.get("temperature").is_none());
+        let roles = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["role"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert!(!roles.contains(&"system".to_string()), "{roles:?}");
+        assert!(roles.contains(&"developer".to_string()), "{roles:?}");
+    }
+    unsafe {
+        std::env::remove_var("CODEX_PLUS_OFFICIAL_BASE_URL");
+    }
+
     // —— 9. 关闭绑定后返回 503，旧的 Codex 代理路径不受影响 ——
     gateway.bindings.get_mut("claude").unwrap().enabled = false;
     save(&gateway);

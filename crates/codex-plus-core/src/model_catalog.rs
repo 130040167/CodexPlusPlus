@@ -908,7 +908,7 @@ pub async fn fetch_relay_profile_model_ids(
 }
 
 /// 官方模型目录的客户端版本参数；与 Codex CLI 的取值保持一致。
-const OFFICIAL_MODELS_CLIENT_VERSION: &str = "0.159.0";
+pub(crate) const OFFICIAL_MODELS_CLIENT_VERSION: &str = "0.159.0";
 
 /// 官方登录 profile 的模型列表：带账号 OAuth 凭据请求 chatgpt.com 官方目录。
 async fn fetch_official_login_model_ids(

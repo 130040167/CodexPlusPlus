@@ -3078,10 +3078,18 @@ pub(crate) fn non_stream_body_to_responses(
     upstream_body: &[u8],
     request_json: Option<&Value>,
 ) -> anyhow::Result<Value> {
-    let upstream_json: serde_json::Value = serde_json::from_slice(upstream_body)?;
     if wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
-        return Ok(upstream_json);
+        // ChatGPT 订阅后端只回流式结果：客户端要非流式时，从 response.completed 里取完整响应。
+        if let Ok(upstream_json) = serde_json::from_slice::<serde_json::Value>(upstream_body) {
+            return Ok(upstream_json);
+        }
+        if let Some(response) =
+            crate::gateway::chatgpt_backend::responses_json_from_sse(upstream_body)
+        {
+            return Ok(response);
+        }
     }
+    let upstream_json: serde_json::Value = serde_json::from_slice(upstream_body)?;
     // Anthropic 上游先落成 chat 响应体，再复用同一份 chat → Responses 映射；
     // 签名思考块要挂回 Responses 的 reasoning item，下一轮才能原样回放。
     let (chat_json, thinking_blocks) =

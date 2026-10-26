@@ -20,6 +20,7 @@ pub mod anthropic_inbound;
 pub mod anthropic_outbound;
 pub mod apply;
 pub mod balance;
+pub mod chatgpt_backend;
 pub mod key_pool;
 pub mod pipeline;
 pub mod route;
