@@ -145,6 +145,15 @@ pub fn proxied_client_for_profile(
     build_proxied_client(user_agent, proxy.as_deref())
 }
 
+/// 按供应商取代理：网关供应商用它自己的设置（`gateway_proxy`），直连模式的按 id 查代理表。
+pub fn proxied_client_for_relay(
+    user_agent: &str,
+    relay: &crate::settings::RelayProfile,
+) -> anyhow::Result<reqwest::Client> {
+    let proxy = crate::relay_proxy::proxy_for_relay(relay);
+    build_proxied_client(user_agent, proxy.as_deref())
+}
+
 /// VLM 专用 HTTP client（带超时）。
 /// 不复用通用 proxied_client，避免 VLM 服务无响应时永久阻塞整个代理。
 pub fn vlm_http_client() -> anyhow::Result<reqwest::Client> {

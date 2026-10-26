@@ -361,6 +361,7 @@ fn relay_profile_from_request(
         anthropic_prompt_cache: true,
         anthropic_impersonate_claude_code: false,
         anthropic_thinking_mode: String::new(),
+        gateway_proxy: None,
     }
 }
 

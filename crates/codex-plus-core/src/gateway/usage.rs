@@ -412,6 +412,7 @@ mod tests {
         gateway.providers.push(GatewayProvider {
             enabled: true,
             source: String::new(),
+            proxy: String::new(),
             price: Some(ProviderPrice {
                 currency: "cny".to_string(),
                 input: 2.0,

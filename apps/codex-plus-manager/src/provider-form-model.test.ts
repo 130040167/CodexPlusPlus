@@ -5,7 +5,7 @@ import { addModel, defaultModel, draftKeys, draftWithPrice, formatPrice, hasPric
 
 const draft = (patch: Partial<ProviderDraft> = {}): ProviderDraft => ({
   name: "X", baseUrl: "https://x", keys: "", protocol: "chatCompletions", model: "", modelList: "",
-  priceCurrency: "CNY", priceInput: "", priceCached: "", priceOutput: "", ...patch,
+  priceCurrency: "CNY", priceInput: "", priceCached: "", priceOutput: "", proxy: "", ...patch,
 });
 
 test("默认模型：选中的在列表里就用它，否则用第一个", () => {

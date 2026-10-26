@@ -1,5 +1,5 @@
 /** 本地网关：让 Claude Code、Grok 经 Codex++ 使用统一的供应商池，支持多 Key 轮换与路由组。 */
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm } from "@tauri-apps/plugin-dialog";
@@ -59,7 +59,18 @@ function statusText(status: MemberStatus): string {
  * 传入 `tab` 时由外层侧栏决定当前页签（不再显示页内标签条），页内跳转通过 `onTabChange` 交还外层；
  * 不传时保持原来的自管页签。
  */
-export function GatewayPage({ notify, tab: controlledTab, onTabChange }: { notify: Notify; tab?: Tab; onTabChange?: (tab: Tab) => void }) {
+export function GatewayPage({
+  notify,
+  tab: controlledTab,
+  onTabChange,
+  extraSettings,
+}: {
+  notify: Notify;
+  tab?: Tab;
+  onTabChange?: (tab: Tab) => void;
+  /** 「网关设置」末尾附加的内容：主窗口传进来的新旧共用本地服务设置。 */
+  extraSettings?: ReactNode;
+}) {
   const [payload, setPayload] = useState<GatewayPayload | null>(memo.payload);
   const [busy, setBusy] = useState<string | null>(memo.payload ? null : "load");
   const [ownTab, setTabState] = useState<Tab>(memo.tab);
@@ -201,6 +212,12 @@ export function GatewayPage({ notify, tab: controlledTab, onTabChange }: { notif
         {tab === "routing" ? <RoutingView busy={busy} payload={payload} run={run} /> : null}
         {tab === "usage" ? <UsageView busy={busy} notify={notify} payload={payload} run={run} /> : null}
         {tab === "gateway" ? <GatewayView busy={busy} payload={payload} run={run} /> : null}
+        {tab === "gateway" && extraSettings ? (
+          <>
+            <SectionLabel>{t("本地服务与请求避震（新旧共用）")}</SectionLabel>
+            {extraSettings}
+          </>
+        ) : null}
       </div>
     </div>
   );

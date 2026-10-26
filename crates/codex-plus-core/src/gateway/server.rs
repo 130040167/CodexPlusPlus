@@ -389,7 +389,8 @@ async fn handle_claude_messages(
                 opencode_session: None,
             },
             live_request_id: Some(live_request_id.as_str()),
-            auto_retry: false,
+            // 「请求避震」对新旧两套同时生效（只在用户打开时起作用）。
+            auto_retry: true,
             is_stream: wants_stream,
         },
     )
@@ -720,7 +721,7 @@ async fn handle_claude_count_tokens(
             crate::anthropic_bridge::anthropic_messages_url(relay.base_url.trim())
         );
         let user_agent = header_value_from_headers(headers, "user-agent").unwrap_or_default();
-        if let Ok(client) = crate::http_client::proxied_client_for_profile(&user_agent, &relay.id) {
+        if let Ok(client) = crate::http_client::proxied_client_for_relay(&user_agent, &relay) {
             let mut builder = client.post(&endpoint).json(&request);
             builder = crate::relay_headers::apply_for_protocol(builder, relay);
             if let Some(beta) = header_value_from_headers(headers, "anthropic-beta") {

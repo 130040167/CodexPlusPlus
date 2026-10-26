@@ -182,6 +182,11 @@ pub struct RelayProfile {
         skip_serializing_if = "String::is_empty"
     )]
     pub anthropic_thinking_mode: String,
+    /// 网关供应商的独立代理（存在 gateway.json，载入时填上，不写进 settings.json）。
+    /// 为 Some 时发请求只用它（空串＝不单独走代理），不按 id 去查直连模式的代理表：
+    /// 网关与直连模式的供应商 id 各自独立，按 id 查会误用同名直连供应商的代理。
+    #[serde(skip)]
+    pub gateway_proxy: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -348,6 +353,7 @@ impl Default for RelayProfile {
             anthropic_prompt_cache: true,
             anthropic_impersonate_claude_code: false,
             anthropic_thinking_mode: String::new(),
+            gateway_proxy: None,
         }
     }
 }
@@ -1367,6 +1373,7 @@ impl BackendSettings {
                 anthropic_prompt_cache: true,
                 anthropic_impersonate_claude_code: false,
                 anthropic_thinking_mode: String::new(),
+                gateway_proxy: None,
             };
         }
 
@@ -1434,6 +1441,7 @@ impl BackendSettings {
             anthropic_prompt_cache: true,
             anthropic_impersonate_claude_code: false,
             anthropic_thinking_mode: String::new(),
+            gateway_proxy: None,
         }
     }
 

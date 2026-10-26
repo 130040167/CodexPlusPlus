@@ -916,7 +916,7 @@ pub async fn fetch_relay_profile_model_ids(
         anyhow::bail!("Base URL 不能为空");
     }
     let endpoint = models_endpoint(&source.base_url);
-    let client = crate::http_client::proxied_client_for_profile(&profile.user_agent, &profile.id)?;
+    let client = crate::http_client::proxied_client_for_relay(&profile.user_agent, &profile)?;
     let (models, status) = fetch_models_from_source(&client, &source).await;
     if models.is_empty() {
         let message = status
@@ -938,7 +938,7 @@ async fn fetch_official_login_model_ids(
     let credential = crate::official_login::resolve_official_credential(profile, false).await?;
     let base = crate::official_login::official_base_url();
     let endpoint = format!("{}/models", base.trim().trim_end_matches('/'));
-    let client = crate::http_client::proxied_client_for_profile(&profile.user_agent, &profile.id)?;
+    let client = crate::http_client::proxied_client_for_relay(&profile.user_agent, &profile)?;
     let mut request = client
         .get(&endpoint)
         .query(&[("client_version", OFFICIAL_MODELS_CLIENT_VERSION)])

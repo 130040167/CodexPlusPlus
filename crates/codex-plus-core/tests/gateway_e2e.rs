@@ -139,6 +139,7 @@ fn providers(relays: Vec<RelayProfile>) -> Vec<GatewayProvider> {
             enabled: true,
             source: String::new(),
             price: None,
+            proxy: String::new(),
             relay,
         })
         .collect()

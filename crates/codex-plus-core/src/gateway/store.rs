@@ -35,6 +35,10 @@ pub struct GatewayProvider {
     /// 每百万 token 的价格，填了才在「用量」里估算费用。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price: Option<ProviderPrice>,
+    /// 这个供应商单独走的 HTTP 代理；空串表示不单独走代理（沿用系统代理）。
+    /// 与直连模式的「供应商独立代理」互不相干。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proxy: String,
     pub relay: RelayProfile,
 }
 
@@ -374,6 +378,8 @@ fn read_store(path: &Path) -> anyhow::Result<GatewaySettings> {
         if crate::relay_config::normalize_relay_profile_for_storage(&mut normalized).is_ok() {
             provider.relay = normalized;
         }
+        // 发请求时只认网关自己的代理设置，不按 id 去查直连模式的代理表。
+        provider.relay.gateway_proxy = Some(provider.proxy.clone());
     }
     Ok(settings)
 }
@@ -522,6 +528,7 @@ mod tests {
             enabled: true,
             source: String::new(),
             price: None,
+            proxy: String::new(),
             relay: RelayProfile {
                 id: "deepseek".to_string(),
                 ..RelayProfile::default()

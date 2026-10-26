@@ -420,7 +420,7 @@ async fn attempt_native(
     } else {
         relay.user_agent.trim().to_string()
     };
-    let client = crate::http_client::proxied_client_for_profile(&user_agent, &relay.id)
+    let client = crate::http_client::proxied_client_for_relay(&user_agent, &relay)
         .map_err(AttemptError::Fatal)?;
     let mut builder = client
         .post(&endpoint)

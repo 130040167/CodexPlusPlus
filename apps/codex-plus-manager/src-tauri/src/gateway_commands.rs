@@ -36,6 +36,8 @@ pub struct GatewayPoolEntry {
     pub account: String,
     /// 这个 ChatGPT 账号正借给 Codex 登录（Codex 以官方身份接入网关）。
     pub lent_to_codex: bool,
+    /// 网关供应商单独走的 HTTP 代理（空串表示不单独走代理）。
+    pub proxy: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -121,6 +123,7 @@ fn pool_entry(
         price,
         account: account_kind(relay),
         lent_to_codex: codex_plus_core::official_login::is_lent_to_codex(relay),
+        proxy: relay.gateway_proxy.clone().unwrap_or_default(),
     }
 }
 
@@ -523,6 +526,7 @@ pub async fn import_gateway_opencode_key(id: String) -> CommandResult<Option<Gat
             model: models.first().cloned().unwrap_or_default(),
             model_list: models.join("\n"),
             price: None,
+            proxy: None,
         };
         apply::create_provider(&GatewayStore::default(), &input, &format!("opencode:{id}"))?;
         Ok(if models.is_empty() {

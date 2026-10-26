@@ -48,6 +48,8 @@ export type GatewayPoolEntry = {
   source?: string;
   /** 每百万 token 的价格。 */
   price?: ProviderPrice | null;
+  /** 网关供应商单独走的 HTTP 代理，空串表示不单独走代理。 */
+  proxy?: string;
   /** 登录得到的账号：chatgpt / copilot / grok；普通供应商为空。 */
   account?: string;
   /** 这个 ChatGPT 账号正借给 Codex 登录。 */
@@ -667,9 +669,11 @@ export type ProviderDraft = {
   priceInput: string;
   priceCached: string;
   priceOutput: string;
+  /** 单独走的 HTTP 代理，空串表示不单独走代理（沿用系统代理）。 */
+  proxy: string;
 };
 
-const NO_PRICE = { priceCurrency: "CNY", priceInput: "", priceCached: "", priceOutput: "" };
+const NO_PRICE = { priceCurrency: "CNY", priceInput: "", priceCached: "", priceOutput: "", proxy: "" };
 
 export function providerDraftFromPreset(preset: GatewayPreset | null): ProviderDraft {
   if (!preset) return { name: "", baseUrl: "", keys: "", protocol: "chatCompletions", model: "", modelList: "", ...NO_PRICE };
@@ -697,6 +701,7 @@ export function providerDraftFromEntry(entry: GatewayPoolEntry): ProviderDraft {
     priceInput: entry.price ? String(entry.price.input) : "",
     priceCached: entry.price ? String(entry.price.cachedInput) : "",
     priceOutput: entry.price ? String(entry.price.output) : "",
+    proxy: entry.proxy ?? "",
   };
 }
 
@@ -710,6 +715,7 @@ export function providerInput(draft: ProviderDraft) {
     model: draft.model.trim(),
     modelList: splitModels(draft.modelList).join("\n"),
     price: priceFromDraft(draft),
+    proxy: draft.proxy.trim(),
   };
 }
 
@@ -730,6 +736,7 @@ export function validateProviderDraft(draft: ProviderDraft, editing = false): st
   if (!/^https?:\/\/\S+$/i.test(draft.baseUrl.trim())) return "地址要以 http:// 或 https:// 开头";
   if (!editing && !draft.keys.trim()) return "请填写 API Key";
   if (!draft.model.trim() && splitModels(draft.modelList).length === 0) return "至少填一个模型";
+  if (draft.proxy.trim() && !/^(https?|socks5h?):\/\/\S+$/i.test(draft.proxy.trim())) return "代理地址要写成 http://主机:端口（也支持 https:// 与 socks5://）";
   return null;
 }
 

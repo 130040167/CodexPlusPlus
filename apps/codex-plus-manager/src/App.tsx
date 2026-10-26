@@ -1259,7 +1259,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   // Agent 专属设置：目前只有 Codex 有专属选项（图片覆盖层、启动参数）。
   // Claude / Grok 没有独立设置项，原来那页只有一个跳回各自主页的按钮，所以不再给它们显示。
   { id: "agentSettings", get label() { return t("设置"); }, icon: Settings, tool: "codex" },
-  { id: "relayEnvironment", get label() { return t("代理设置"); }, icon: ShieldCheck, tool: "codex" },
+  { id: "relayEnvironment", get label() { return t("旧版代理设置"); }, icon: ShieldCheck, tool: "codex" },
   { id: "requestLog", get label() { return t("请求日志"); }, icon: List },
 ];
 
@@ -2541,6 +2541,7 @@ export function App() {
     }
     if (next === "multiLaunch") await refreshMultiLaunchInstances(true);
     if (next === "relayEnvironment") await refreshRelayEnvironment(true);
+    if (next === "gatewaySettings") await refreshOverview(true);
     if (next === "sessions") {
       await refreshSettings(true);
       await refreshLocalSessions(true);
@@ -4393,10 +4394,10 @@ export function App() {
           {route === "relayEnvironment" ? (
             <ProxySettingsScreen
               dirty={settingsDirty}
-              overview={overview}
               form={settingsForm}
               relayEnvironment={relayEnvironment}
               onFormChange={setSettingsForm}
+              onOpenGatewaySettings={() => void navigate("gatewaySettings")}
               actions={actions}
             />
           ) : null}
@@ -4523,7 +4524,17 @@ export function App() {
             />
           ) : null}
           {gatewayTabByRoute[route] ? (
-            <GatewayPage notify={actions.showMessage} onTabChange={(tab) => void navigate(gatewayRouteByTab[tab])} tab={gatewayTabByRoute[route]} />
+            <GatewayPage
+              extraSettings={
+                <>
+                  <SettingsAutoSave dirty={settingsDirty} form={settingsForm} actions={actions} />
+                  <SharedServiceSettings form={settingsForm} onFormChange={setSettingsForm} overview={overview} />
+                </>
+              }
+              notify={actions.showMessage}
+              onTabChange={(tab) => void navigate(gatewayRouteByTab[tab])}
+              tab={gatewayTabByRoute[route]}
+            />
           ) : null}
           {route === "agentSettings" || route === "maintenance" ? (
             // 设置与安装维护合在一页：左侧分类目录，右侧限宽列表。
@@ -5597,31 +5608,19 @@ function OverviewScreen({
   );
 }
 
-function ProxySettingsScreen({
-  dirty,
+/**
+ * 新旧两套共用的本地服务设置：服务状态、请求体上限、请求避震。放在「网关 → 网关设置」，
+ * 改的是 settings.json（随主窗口的设置一起自动保存）。
+ */
+function SharedServiceSettings({
   overview,
   form,
-  relayEnvironment,
   onFormChange,
-  actions,
 }: {
-  dirty: boolean;
   overview: OverviewResult | null;
   form: BackendSettings;
-  relayEnvironment: RelayEnvironmentResult | null;
   onFormChange: (value: BackendSettings) => void;
-  actions: Actions;
 }) {
-  const proxyProfiles = useMemo(
-    () => (form.relayProfiles ?? []).filter((profile) => profile.relayMode !== "aggregate"),
-    [form.relayProfiles],
-  );
-  const proxyProfileKey = proxyProfiles.map((profile) => profile.id).join("|");
-  const [proxyUrls, setProxyUrls] = useState<Record<string, string>>({});
-  // 已保存的值：输入与它一致时「保存」置灰，十几行供应商里一眼看出哪行改过。
-  const [savedProxyUrls, setSavedProxyUrls] = useState<Record<string, string>>({});
-  const [proxyConfigured, setProxyConfigured] = useState<Record<string, boolean>>({});
-  const [proxyBusyId, setProxyBusyId] = useState<string | null>(null);
   const [retryStatusInput, setRetryStatusInput] = useState("");
   const setRetryStatusCodes = (codes: number[]) =>
     onFormChange({ ...form, protocolProxyAutoRetryStatusCodes: normalizeRetryStatusCodes(codes) });
@@ -5631,73 +5630,12 @@ function ProxySettingsScreen({
     setRetryStatusCodes([...form.protocolProxyAutoRetryStatusCodes, ...next]);
     setRetryStatusInput("");
   };
-
-  useEffect(() => {
-    let cancelled = false;
-    const ids = proxyProfileKey ? proxyProfileKey.split("|") : [];
-    void Promise.all(
-      ids.map(async (id) => {
-        try {
-          const result = await invoke<{ status: string; proxyUrl?: string; configured?: boolean }>(
-            "load_relay_proxy",
-            { profileId: id },
-          );
-          return { id, url: result.status === "ok" ? result.proxyUrl ?? "" : "", configured: result.configured === true };
-        } catch {
-          return { id, url: "", configured: false };
-        }
-      }),
-    ).then((entries) => {
-      if (cancelled) return;
-      const urls: Record<string, string> = {};
-      const configured: Record<string, boolean> = {};
-      entries.forEach((entry) => {
-        urls[entry.id] = entry.url;
-        configured[entry.id] = entry.configured;
-      });
-      setProxyUrls(urls);
-      setSavedProxyUrls(urls);
-      setProxyConfigured(configured);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [proxyProfileKey]);
-
-  const saveProviderProxy = async (profile: RelayProfile) => {
-    const profileId = profile.id;
-    setProxyBusyId(profileId);
-    try {
-      const result = await invoke<{
-        status: string;
-        message: string;
-        proxyUrl?: string;
-        configured?: boolean;
-      }>("set_relay_proxy", { profileId, proxyUrl: proxyUrls[profileId] ?? "" });
-      if (result.status === "ok") {
-        setProxyUrls((current) => ({ ...current, [profileId]: result.proxyUrl ?? "" }));
-        setSavedProxyUrls((current) => ({ ...current, [profileId]: result.proxyUrl ?? "" }));
-        setProxyConfigured((current) => ({ ...current, [profileId]: result.configured === true }));
-      }
-      await actions.showMessage(t("供应商独立代理"), result.message, result.status === "ok" ? "ok" : "failed");
-    } catch (error) {
-      await actions.showMessage(t("供应商独立代理"), String(error), "failed");
-    } finally {
-      setProxyBusyId(null);
-    }
-  };
-
-  const localServer = overview?.runtime_health?.local_server;
-  const debuggerState = overview?.runtime_health?.debugger;
-  const conversionEnabled = overview?.runtime_health?.protocol_conversion_enabled === true;
-
   return (
-    <div className="settings-page proxy-settings-page">
-      <SettingsAutoSave dirty={dirty} form={form} actions={actions} />
+    <div className="settings-page proxy-settings-page shared-service-settings">
       <Panel>
         <CardHead
-          title={t("本地协议代理")}
-          detail={t("需要协议转换、聚合或请求避震时随 Codex++ 常驻；退出 Codex++ 才关闭")}
+          title={t("本地服务")}
+          detail={t("网关和旧版本地协议代理共用一个本地服务，随 Codex++ 常驻；退出 Codex++ 才关闭")}
         />
         <CardContent className="settings-content setting-rows">
           {/* 与概览页健康检查同一套带图标状态卡。 */}
@@ -5728,16 +5666,13 @@ function ProxySettingsScreen({
               <span>MiB</span>
             </div>
           </SettingRow>
-          <p className="setting-footnote">
-            {t("本地代理地址由 Codex++ 写入 config.toml；切换供应商或修改协议后重启 Codex 生效。")}
-          </p>
         </CardContent>
       </Panel>
 
       <Panel>
         <SwitchPanelHead
           checked={form.protocolProxyAutoRetry}
-          detail={t("在本地代理内消化上游过载与限流，尽量不把错误交给 Codex")}
+          detail={t("在本地服务内消化上游过载与限流，尽量不把错误交给 Agent")}
           label={t("启用请求避震")}
           onChange={(checked) => onFormChange({ ...form, protocolProxyAutoRetry: checked })}
           title={t("请求避震")}
@@ -5745,7 +5680,7 @@ function ProxySettingsScreen({
         <CardContent className="settings-content setting-rows">
           {form.protocolProxyAutoRetry ? (
             <>
-              <SettingRow title={t("最多自动重试次数")} description={t("0–20 次；次数用尽后把错误交给 Codex。")}>
+              <SettingRow title={t("最多自动重试次数")} description={t("0–20 次；次数用尽后把错误交给 Agent。")}>
                 <div className="setting-input-unit">
                   <Input
                     max={20}
@@ -5889,22 +5824,131 @@ function ProxySettingsScreen({
                 </SettingRow>
               ) : null}
               <p className="setting-footnote">
-                {t("仅作用于经过本地协议代理的请求：自动重试 200 流内的过载/容量错误，以及上面选择的 HTTP 状态码。")}
+                {t("作用于经过网关和旧版本地协议代理的请求：自动重试 200 流内的过载/容量错误，以及上面选择的 HTTP 状态码。")}
               </p>
             </>
           ) : (
-            <p className="setting-footnote">{t("已关闭：上游过载或限流时，错误直接交给 Codex。")}</p>
+            <p className="setting-footnote">{t("已关闭：上游过载或限流时，错误直接交给 Agent。")}</p>
           )}
         </CardContent>
       </Panel>
+    </div>
+  );
+}
 
+function ProxySettingsScreen({
+  dirty,
+  form,
+  relayEnvironment,
+  onFormChange,
+  onOpenGatewaySettings,
+  actions,
+}: {
+  dirty: boolean;
+  form: BackendSettings;
+  relayEnvironment: RelayEnvironmentResult | null;
+  onFormChange: (value: BackendSettings) => void;
+  onOpenGatewaySettings: () => void;
+  actions: Actions;
+}) {
+  // Codex 被新版网关接管时，旧版专用的设置不起作用，隐藏。
+  const takenOverByGateway = form.activeRelayId === CODEX_GATEWAY_RELAY_ID;
+  const proxyProfiles = useMemo(
+    () => (form.relayProfiles ?? []).filter((profile) => profile.relayMode !== "aggregate"),
+    [form.relayProfiles],
+  );
+  const proxyProfileKey = proxyProfiles.map((profile) => profile.id).join("|");
+  const [proxyUrls, setProxyUrls] = useState<Record<string, string>>({});
+  // 已保存的值：输入与它一致时「保存」置灰，十几行供应商里一眼看出哪行改过。
+  const [savedProxyUrls, setSavedProxyUrls] = useState<Record<string, string>>({});
+  const [proxyConfigured, setProxyConfigured] = useState<Record<string, boolean>>({});
+  const [proxyBusyId, setProxyBusyId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const ids = proxyProfileKey ? proxyProfileKey.split("|") : [];
+    void Promise.all(
+      ids.map(async (id) => {
+        try {
+          const result = await invoke<{ status: string; proxyUrl?: string; configured?: boolean }>(
+            "load_relay_proxy",
+            { profileId: id },
+          );
+          return { id, url: result.status === "ok" ? result.proxyUrl ?? "" : "", configured: result.configured === true };
+        } catch {
+          return { id, url: "", configured: false };
+        }
+      }),
+    ).then((entries) => {
+      if (cancelled) return;
+      const urls: Record<string, string> = {};
+      const configured: Record<string, boolean> = {};
+      entries.forEach((entry) => {
+        urls[entry.id] = entry.url;
+        configured[entry.id] = entry.configured;
+      });
+      setProxyUrls(urls);
+      setSavedProxyUrls(urls);
+      setProxyConfigured(configured);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [proxyProfileKey]);
+
+  const saveProviderProxy = async (profile: RelayProfile) => {
+    const profileId = profile.id;
+    setProxyBusyId(profileId);
+    try {
+      const result = await invoke<{
+        status: string;
+        message: string;
+        proxyUrl?: string;
+        configured?: boolean;
+      }>("set_relay_proxy", { profileId, proxyUrl: proxyUrls[profileId] ?? "" });
+      if (result.status === "ok") {
+        setProxyUrls((current) => ({ ...current, [profileId]: result.proxyUrl ?? "" }));
+        setSavedProxyUrls((current) => ({ ...current, [profileId]: result.proxyUrl ?? "" }));
+        setProxyConfigured((current) => ({ ...current, [profileId]: result.configured === true }));
+      }
+      await actions.showMessage(t("供应商独立代理"), result.message, result.status === "ok" ? "ok" : "failed");
+    } catch (error) {
+      await actions.showMessage(t("供应商独立代理"), String(error), "failed");
+    } finally {
+      setProxyBusyId(null);
+    }
+  };
+
+
+  return (
+    <div className="settings-page proxy-settings-page">
+      <SettingsAutoSave dirty={dirty} form={form} actions={actions} />
+      <Panel>
+        <CardHead
+          title={t("本地服务与请求避震已移到网关设置")}
+          detail={t("本地服务状态、请求体上限和请求避震对新旧两套同时生效，统一在「网关 → 网关设置」里改。")}
+        />
+        <CardContent className="settings-content">
+          <Button onClick={onOpenGatewaySettings} size="sm" variant="secondary">
+            {t("打开网关设置")}
+            <ArrowRight aria-hidden="true" className="h-3.5 w-3.5" />
+          </Button>
+        </CardContent>
+      </Panel>
+
+      {takenOverByGateway ? (
+        <p className="relay-switch-off-note" role="status">
+          {t("Codex 正由 Codex++ 网关接管，旧版代理设置不起作用，已隐藏。断开并还原后恢复。")}
+        </p>
+      ) : (
+      <>
       <Panel>
         <SwitchPanelHead
           checked={form.protocolProxyMapUnlistedModels}
           detail={t("把 Codex 后台任务的固定模型名改写为当前供应商的默认模型")}
           label={t("改写目录外模型名")}
           onChange={(checked) => onFormChange({ ...form, protocolProxyMapUnlistedModels: checked })}
-          title={t("目录外模型映射")}
+          title={t("目录外模型映射（旧版）")}
         />
         <CardContent className="settings-content setting-rows">
           <p className="setting-footnote" title={t("Codex 的自动审查（codex-auto-review）与标题/摘要等后台任务固定使用 gpt-* 等内部模型名，不经选模；第三方上游没有这些名字，原样转发只会报「模型不存在」并可能反复消耗额度。开启后，不在当前供应商模型列表里的请求模型会改写为该供应商的默认模型再转发（#1183 / #1446 / #1457）；官方登录与聚合供应商不受影响，已配置「自动审批模型」时 codex-auto-review 仍按该配置改写。默认关闭：开启后手填但未写进模型列表的模型也会被改写，请先把要用的模型都加进列表。")}>
@@ -5913,13 +5957,14 @@ function ProxySettingsScreen({
           {form.protocolProxyMapUnlistedModels ? (
             <p className="setting-warning">{t("注意：手填但没写进模型列表的模型也会被改写，请先把要用的模型都加进列表。")}</p>
           ) : null}
+          <p className="setting-footnote">{t("接入网关的 Agent 不用这一项：网关会把供应商池里没有的模型改写成该 Agent 的主模型。")}</p>
         </CardContent>
       </Panel>
 
       <Panel>
         <CardHead
-          title={t("供应商独立代理")}
-          detail={t("为单个供应商单独指定 HTTP 代理；留空表示沿用系统代理")}
+          title={t("供应商独立代理（旧版供应商）")}
+          detail={t("为旧版的单个供应商单独指定 HTTP 代理；留空表示沿用系统代理。网关供应商的代理在供应商池里编辑供应商时设置。")}
         />
         <CardContent className="settings-content">
           {proxyProfiles.length ? (
@@ -5962,6 +6007,9 @@ function ProxySettingsScreen({
           </p>
         </CardContent>
       </Panel>
+
+      </>
+      )}
 
       <RelayEnvironmentScreen result={relayEnvironment} actions={actions} />
 
@@ -15163,7 +15211,7 @@ function routeSubtitle(route: Route) {
     relay: t("管理 API 供应商、协议、Key 与配置文件"),
     multiLaunch: t("为不同供应商启动相互隔离的 Codex 实例"),
     claude: t("保留官方 Claude.app 原样，通过增强版为 Claude 应用增强功能"),
-    relayEnvironment: t("统一管理本地协议代理、供应商代理与重试策略"),
+    relayEnvironment: t("旧版直连模式专用：目录外模型映射与供应商独立代理"),
     requestLog: t("所有 Agent 经 Codex++ 的请求：状态、模型、重试、token 用量与缓存命中"),
     sessions: t("Codex、Claude Code、Grok 的本地会话放在一起：在终端继续，Codex 会话还能删除、归档与修复"),
     context: t("同时管理 Codex、Claude Code、Grok 的 MCP 服务器：每列一个 Agent，打开即写入它的配置"),

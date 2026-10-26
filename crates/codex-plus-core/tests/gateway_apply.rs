@@ -51,6 +51,7 @@ fn deepseek_input() -> ProviderInput {
         model: "deepseek-v4-pro".into(),
         model_list: "deepseek-v4-pro\ndeepseek-v4-flash".into(),
         price: None,
+        proxy: None,
     }
 }
 
@@ -626,6 +627,55 @@ fn pool_chatgpt_account_is_lent_to_codex_and_taken_back() {
     assert_eq!(pool_auth["codex_plus_gateway"], true);
     assert!(read_auth().get("tokens").is_none(), "Codex 回到没登录");
     assert_eq!(ctx.settings.load().unwrap().active_relay_id, "direct");
+}
+
+/// 网关供应商的独立代理存在 gateway.json，载入后只用它（不按 id 查直连模式的代理表）；
+/// 编辑时不传表示不改，空串表示清掉，写错的地址拦下。
+#[test]
+fn gateway_provider_proxy_is_its_own_setting() {
+    let fixture = fixture(57400);
+    let ctx = &fixture.ctx;
+    let mut input = deepseek_input();
+    input.name = "代理测试".into();
+    input.proxy = Some(" http://127.0.0.1:7890 ".into());
+    let (_, id) = create_provider(&ctx.gateway, &input, "preset:deepseek").unwrap();
+    let loaded = ctx.gateway.load().unwrap();
+    let provider = loaded.provider(&id).unwrap();
+    assert_eq!(provider.proxy, "http://127.0.0.1:7890");
+    assert_eq!(
+        provider.relay.gateway_proxy.as_deref(),
+        Some("http://127.0.0.1:7890")
+    );
+    assert_eq!(
+        codex_plus_core::relay_proxy::proxy_for_relay(&provider.relay).as_deref(),
+        Some("http://127.0.0.1:7890")
+    );
+
+    input.proxy = None;
+    update_provider(&ctx.gateway, &id, &input).unwrap();
+    assert_eq!(
+        ctx.gateway.load().unwrap().provider(&id).unwrap().proxy,
+        "http://127.0.0.1:7890",
+        "不传不改"
+    );
+    input.proxy = Some(String::new());
+    update_provider(&ctx.gateway, &id, &input).unwrap();
+    let cleared = ctx.gateway.load().unwrap();
+    assert_eq!(cleared.provider(&id).unwrap().proxy, "");
+    assert_eq!(
+        cleared
+            .provider(&id)
+            .unwrap()
+            .relay
+            .gateway_proxy
+            .as_deref(),
+        Some("")
+    );
+    input.proxy = Some("127.0.0.1:7890".into());
+    assert!(
+        update_provider(&ctx.gateway, &id, &input).is_err(),
+        "缺协议头的地址拦下"
+    );
 }
 
 #[test]

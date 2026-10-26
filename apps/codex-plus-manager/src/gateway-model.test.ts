@@ -242,7 +242,10 @@ test("供应商表单：多 Key 每行一个；本机服务预填 Key；编辑�
     model: "deepseek-v4-pro",
     modelList: "a\nb",
     price: null,
+    proxy: "",
   });
+  assert.equal(validateProviderDraft({ ...editing, proxy: "127.0.0.1:7890" }, true), "代理地址要写成 http://主机:端口（也支持 https:// 与 socks5://）");
+  assert.equal(validateProviderDraft({ ...editing, proxy: "socks5://127.0.0.1:1080" }, true), null);
   assert.deepEqual(providerInput({ ...editing, priceInput: "2", priceCached: "0.5", priceOutput: "abc" }).price, { currency: "CNY", input: 2, cachedInput: 0.5, output: 0 });
 });
 

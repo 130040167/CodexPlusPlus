@@ -344,6 +344,7 @@ mod tests {
             enabled: true,
             source: String::new(),
             price: None,
+            proxy: String::new(),
             relay: RelayProfile {
                 id: id.to_string(),
                 name: id.to_string(),

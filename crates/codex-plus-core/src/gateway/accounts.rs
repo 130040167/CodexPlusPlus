@@ -1717,6 +1717,7 @@ mod tests {
                 enabled: true,
                 source: "login:chatgpt".to_string(),
                 price: None,
+                proxy: String::new(),
                 relay,
             });
         store.save(&gateway).unwrap();

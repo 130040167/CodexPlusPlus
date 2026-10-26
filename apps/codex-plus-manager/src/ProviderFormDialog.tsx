@@ -216,6 +216,10 @@ export function ProviderFormDialog({
                 <Plus />{t("再加一个 Key")}
               </button>
             </div>
+            <label className="pf-field">
+              <span>{t("代理")} <small>{t("可选：只这个供应商单独走的 HTTP 代理，留空沿用系统代理")}</small></span>
+              <Input className="pf-mono" onChange={(event) => update({ proxy: event.currentTarget.value })} placeholder="http://127.0.0.1:7890" spellCheck={false} value={draft.proxy} />
+            </label>
           </section>
 
           <section className="pf-section">

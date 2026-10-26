@@ -964,6 +964,7 @@ pub fn copy_claude_provider(provider: &ClaudeProvider) -> anyhow::Result<RelayPr
         model: models.first().cloned().unwrap_or_default(),
         model_list: models.join("\n"),
         price: None,
+        proxy: None,
     })?;
     if bearer {
         profile.anthropic_auth_header =
@@ -1004,6 +1005,7 @@ pub fn copy_grok_profile(
         model: models.first().cloned().unwrap_or_default(),
         model_list: models.join("\n"),
         price: None,
+        proxy: None,
     })
 }
 
@@ -1066,6 +1068,24 @@ pub struct ProviderInput {
     /// 每百万 token 的价格；不填就不估算费用。
     #[serde(default)]
     pub price: Option<ProviderPrice>,
+    /// 这个供应商单独走的 HTTP 代理；不传表示不改，空串表示不单独走代理。
+    #[serde(default)]
+    pub proxy: Option<String>,
+}
+
+/// 代理地址只接受 http / https / socks5，空串表示不单独走代理。
+fn clean_proxy(proxy: &str) -> anyhow::Result<String> {
+    let proxy = proxy.trim();
+    if proxy.is_empty() {
+        return Ok(String::new());
+    }
+    let ok = ["http://", "https://", "socks5://", "socks5h://"]
+        .iter()
+        .any(|scheme| proxy.to_ascii_lowercase().starts_with(scheme));
+    if !ok || reqwest::Url::parse(proxy).is_err() {
+        bail!("代理地址要写成 http://主机:端口（也支持 https:// 与 socks5://）");
+    }
+    Ok(proxy.to_string())
 }
 
 fn clean_keys(keys: &[String]) -> Vec<String> {
@@ -1132,6 +1152,7 @@ pub fn add_provider(
         enabled: true,
         source: source.to_string(),
         price: None,
+        proxy: String::new(),
         relay,
     });
     store.save(&gateway)?;
@@ -1144,6 +1165,7 @@ pub fn create_provider(
     input: &ProviderInput,
     source: &str,
 ) -> anyhow::Result<(GatewaySettings, String)> {
+    let proxy = clean_proxy(input.proxy.as_deref().unwrap_or_default())?;
     let (mut gateway, id) = add_provider(store, build_relay(input)?, source)?;
     if let Some(provider) = gateway
         .providers
@@ -1151,6 +1173,7 @@ pub fn create_provider(
         .find(|provider| provider.relay.id == id)
     {
         provider.price = clean_price(input.price.clone());
+        provider.proxy = proxy;
         store.save(&gateway)?;
     }
     Ok((gateway, id))
@@ -1197,6 +1220,9 @@ pub fn update_provider(
     relay.anthropic_auth_header = provider.relay.anthropic_auth_header.clone();
     provider.relay = relay;
     provider.price = clean_price(input.price.clone());
+    if let Some(proxy) = &input.proxy {
+        provider.proxy = clean_proxy(proxy)?;
+    }
     store.save(&gateway)?;
     Ok(gateway)
 }
