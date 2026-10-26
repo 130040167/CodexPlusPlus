@@ -13672,3 +13672,13 @@ button.side-item:hover {
   font-family: var(--font-mono, monospace);
   font-size: 11px;
 }
+
+/* 内层滚动的页面（网关各页、Computer Use）：滚动区向右延伸到窗口边、再补回同样的内边距，
+   内容位置不变，macOS 悬浮滚动条落在右侧留白里，不再压住搜索框、按钮等内容。20px 对应 .screen 的右内边距。 */
+.shell .screen > * > :is(.gw-content, .cu-content),
+.shell :is(.gw-content, .cu-content) {
+  width: calc(100% + 20px);
+  max-width: none;
+  margin-right: -20px;
+  padding-right: 20px;
+}

@@ -2471,3 +2471,17 @@ body:has(.tray-panel) {
 span.gw-avatar[data-size] {
   flex: none;
 }
+
+/* Claude Code、Grok 的单色图标：用遮罩按当前文字颜色绘制，深浅主题都看得清（原来当 <img> 显示是黑的）。 */
+.gw-agent-mono {
+  display: inline-block;
+  flex: none;
+  background: currentColor;
+  -webkit-mask: var(--gw-agent-icon) center / contain no-repeat;
+  mask: var(--gw-agent-icon) center / contain no-repeat;
+}
+
+.gw-node-agent .gw-node-agent-icon {
+  width: 20px;
+  height: 20px;
+}

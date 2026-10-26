@@ -21,7 +21,7 @@ import {
   type PickerItem,
 } from "./gateway-model";
 import { AppSelect } from "./AppSelect";
-import { AGENT_ICONS, Avatar, Switch, avatarOf, loadFavorites, saveFavorites, type Notify, type Run, agentIcon } from "./gateway-ui";
+import { AGENT_ICONS, Avatar, Switch, avatarOf, loadFavorites, saveFavorites, type Notify, type Run, AgentIcon } from "./gateway-ui";
 
 export function AgentsView({
   payload,
@@ -151,7 +151,7 @@ function AgentRow({
   return (
     <div className="gw-agent" data-expanded={expanded}>
       <div className="gw-agent-row">
-        <img alt="" className="gw-agent-icon" src={agentIcon(agent.agent)} />
+        <AgentIcon agent={agent.agent} className="gw-agent-icon" />
         <div className="gw-agent-main">
           <div className="gw-agent-title">
             <strong>{agent.name}</strong>
@@ -576,7 +576,7 @@ function ModelPicker({
   const head = (
     <>
       <div className="gw-popover-item" data-selected={!connected} onClick={onDisconnect} role="option" aria-selected={!connected} tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter") onDisconnect(); }}>
-        <img alt="" className="gw-popover-agent" src={agentIcon(agent.agent)} />
+        <AgentIcon agent={agent.agent} className="gw-popover-agent" />
         <span className="gw-popover-item-label">{t("默认")}</span>
         <span className="gw-via gw-via-off">{t("不经 Codex++")}</span>
         <small>{tf("{0} 自带的默认值", [agent.name])}</small>
@@ -596,7 +596,7 @@ function ModelPicker({
     <div className="gw-picker">
       <button aria-expanded={open} aria-haspopup="listbox" className="gw-picker-button" onClick={() => onOpenChange(!open)} ref={buttonRef} type="button">
         {showDefault ? (
-          <img alt="" className="gw-picker-agent" src={agentIcon(agent.agent)} />
+          <AgentIcon agent={agent.agent} className="gw-picker-agent" />
         ) : display.group ? (
           <Waypoints className="gw-picker-glyph h-4 w-4" />
         ) : (

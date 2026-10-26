@@ -16,6 +16,16 @@ export const AGENT_ICONS: Record<string, string> = {
   codexApp: new URL("./assets/agents/codex.svg", import.meta.url).href,
 };
 
+/**
+ * 网关里 Agent 的图标。Codex 用 Codex 应用自己的彩色图标；Claude Code、Grok 只有黑色单色图，
+ * 直接当 <img> 在深色主题里看不见，所以用遮罩按当前文字颜色绘制，跟随主题。
+ */
+export function AgentIcon({ agent, className = "" }: { agent: string; className?: string }) {
+  if (agent === "codex") return <img alt="" className={className} src={AGENT_ICONS.codexApp} />;
+  const url = AGENT_ICONS[agent];
+  return <i aria-hidden="true" className={`${className} gw-agent-mono`.trim()} style={url ? ({ "--gw-agent-icon": `url("${url}")` } as CSSProperties) : undefined} />;
+}
+
 /** 网关里 Agent 的图标：Codex 用 Codex 应用的图标（`codex` 键是 Hub 用的 OpenAI 单色图标）。 */
 export function agentIcon(agent: string): string | undefined {
   return AGENT_ICONS[agent === "codex" ? "codexApp" : agent];

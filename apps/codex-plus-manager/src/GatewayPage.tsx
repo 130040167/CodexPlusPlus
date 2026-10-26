@@ -34,7 +34,7 @@ import { AppSelect } from "./AppSelect";
 import { ProvidersView } from "./GatewayProviders";
 import { SessionsView } from "./GatewaySessions";
 import { UsageView } from "./GatewayUsage";
-import { AGENT_ICONS, APP_LOGO_URL, Avatar, SectionLabel, Switch, type Notify, type Run, agentIcon } from "./gateway-ui";
+import { AGENT_ICONS, APP_LOGO_URL, Avatar, SectionLabel, Switch, type Notify, type Run, AgentIcon } from "./gateway-ui";
 import { TopbarActions } from "./TopbarActions";
 import "./GatewayPage.css";
 
@@ -522,7 +522,7 @@ function RouteDiagram({
       <div className="gw-diagram-col" style={{ paddingTop: agentTop, gap: AGENT_NODE_GAP }}>
         {agents.map((agent) => (
           <div className="gw-node-agent" key={agent.id} style={{ height: AGENT_NODE_H, "--gw-hue": AGENT_HUES[agent.id] ?? 232 } as CSSProperties}>
-            <img alt="" src={agentIcon(agent.id)} />
+            <AgentIcon agent={agent.id} className="gw-node-agent-icon" />
             <strong><i className="gw-dot" data-tone="agent" />{agentName(agent.id)}</strong>
             <small>{agent.binding ? modelDisplay(payload, agent.binding.model, agent.binding.poolExclude ?? []).title : ""}</small>
           </div>
