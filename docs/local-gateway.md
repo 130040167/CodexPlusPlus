@@ -44,7 +44,9 @@ Grok ─────────POST /gw/grok/v1/responses───┤  helper�
 - 状态文件：`<状态目录>/gateway.json`（接入设置、token、选项、供应商池、路由组），新建时权限 0600。
 - Codex：开启时在直连模式的供应商列表里放一个托管供应商 `codex-plus-gateway`（地址 `/gw/codex/v1`，Responses），
   用直连模式自己的切换流程写进 `~/.codex`（回填、冲突检测、模型目录照旧）；关闭时切回开启前的供应商并删掉托管供应商。
-  在 Codex 供应商页直接切到别的供应商等于断开网关。改完设置会通知主窗口重新读取，避免旧设置整份写回。
+  在 Codex 供应商页直接切到别的供应商等于断开网关，再选回「Codex++ 网关」等于重新接入。
+  实时配置被别的工具改过、与直连模式的记录对不上时，接入前把 `config.toml` / `auth.json` 原样存到
+  `backups/codex-before-gateway.json`（0600），不往上一个供应商回填；断开时切回原供应商后原样写回。改完设置会通知主窗口重新读取，避免旧设置整份写回。
 - Claude Code：开启时写入托管供应商 `codex-plus-gateway`（`ANTHROPIC_BASE_URL` 指向网关），
   复用「关键字段」切换逻辑，hooks / permissions 等用户键不动；关闭时切回开启前的供应商。
 - Grok：写入一个指向网关的 Responses 供应商；关闭时重新应用 Grok 页当前选中的供应商。

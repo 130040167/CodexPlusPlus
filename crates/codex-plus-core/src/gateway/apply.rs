@@ -253,7 +253,59 @@ pub fn codex_gateway_profile(
     Ok(profile)
 }
 
+/// 接入网关前 Codex 实时配置的原样副本。只在实时配置与直连模式的记录对不上时才存：
+/// 那时直连模式没法从它自己的记录还原，断开时要把这份原样写回。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexLiveStash {
+    #[serde(default)]
+    config_toml: Option<String>,
+    #[serde(default)]
+    auth_json: Option<String>,
+}
+
+const CODEX_LIVE_FILES: [&str; 2] = ["config.toml", "auth.json"];
+
+fn codex_stash_path(ctx: &ApplyContext) -> PathBuf {
+    ctx.backup_root.join("codex-before-gateway.json")
+}
+
+fn capture_codex_live(ctx: &ApplyContext) -> CodexLiveStash {
+    let read = |name: &str| std::fs::read_to_string(ctx.codex_home.join(name)).ok();
+    CodexLiveStash {
+        config_toml: read(CODEX_LIVE_FILES[0]),
+        auth_json: read(CODEX_LIVE_FILES[1]),
+    }
+}
+
+fn save_codex_stash(ctx: &ApplyContext, stash: &CodexLiveStash) -> anyhow::Result<()> {
+    let path = codex_stash_path(ctx);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // 里面有 auth.json（凭据），只给自己读写。
+    crate::settings::atomic_write(&path, serde_json::to_string_pretty(stash)?.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn take_codex_stash(ctx: &ApplyContext) -> Option<CodexLiveStash> {
+    let path = codex_stash_path(ctx);
+    let stash = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok());
+    let _ = std::fs::remove_file(&path);
+    stash
+}
+
 /// 把托管供应商放进直连模式的列表并切过去（已经在用时只刷新它的配置）。
+///
+/// 实时配置被别的工具改过、与直连模式的记录对不上（直连模式里切换会弹「实时配置冲突」）时，
+/// 不往上一个供应商回填，先把实时文件原样存下来再切；断开时原样写回。
 fn write_codex(
     ctx: &ApplyContext,
     gateway: &GatewaySettings,
@@ -276,13 +328,41 @@ fn write_codex(
         &mut settings.active_relay_id,
         CODEX_GATEWAY_RELAY_ID.to_string(),
     );
-    crate::relay_switch::switch_relay_profile_in_home(
+    let switching_in = previous != CODEX_GATEWAY_RELAY_ID;
+    let live = switching_in.then(|| capture_codex_live(ctx));
+    let switched = crate::relay_switch::switch_relay_profile_in_home(
         &ctx.settings,
         &ctx.codex_home,
-        settings,
+        settings.clone(),
         &previous,
-    )
-    .context("把 Codex 切到网关失败")?;
+    );
+    match switched {
+        Ok(_) => {
+            if switching_in {
+                // 直连模式能从自己的记录还原，不需要原样副本；清掉以前留下的。
+                let _ = std::fs::remove_file(codex_stash_path(ctx));
+            }
+        }
+        Err(error)
+            if switching_in
+                && error
+                    .downcast_ref::<crate::relay_switch::LiveEndpointConflict>()
+                    .is_some() =>
+        {
+            if let Some(live) = &live {
+                save_codex_stash(ctx, live)?;
+            }
+            crate::relay_switch::switch_relay_profile_in_home_resolving_conflict(
+                &ctx.settings,
+                &ctx.codex_home,
+                settings,
+                &previous,
+                crate::relay_switch::LiveConflictResolution::DiscardLiveChanges,
+            )
+            .context("把 Codex 切到网关失败")?;
+        }
+        Err(error) => return Err(error.context("把 Codex 切到网关失败")),
+    }
     Ok(())
 }
 
@@ -430,6 +510,20 @@ fn restore_codex(ctx: &ApplyContext, binding: &AgentBinding) -> anyhow::Result<(
         )
         .context("把 Codex 切回直连失败")?;
         settings = ctx.settings.load()?;
+        // 接入前的实时配置与直连模式的记录对不上：把当时的文件原样写回。
+        if let Some(stash) = take_codex_stash(ctx) {
+            for (name, contents) in CODEX_LIVE_FILES
+                .iter()
+                .zip([stash.config_toml, stash.auth_json])
+            {
+                let path = ctx.codex_home.join(name);
+                match contents {
+                    Some(contents) => crate::settings::atomic_write(&path, contents.as_bytes())?,
+                    None if path.exists() => std::fs::remove_file(&path)?,
+                    None => {}
+                }
+            }
+        }
     }
     // 切换会把请求里缺的供应商从磁盘补回，所以托管供应商要在切走之后单独删。
     settings
@@ -482,19 +576,27 @@ pub fn note_grok_switched(store: &GatewayStore) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 用户在 Codex 的供应商页直接切到别的供应商：网关绑定随之失效。
-pub fn note_codex_switched(store: &GatewayStore, target_id: &str) -> anyhow::Result<()> {
-    if target_id == CODEX_GATEWAY_RELAY_ID {
+/// 用户在 Codex 的供应商页直接切换：切到别的供应商等于断开网关；
+/// 切回托管的「Codex++ 网关」等于重新接入（断开时它还留在列表里，没被删）。
+pub fn note_codex_switched(
+    store: &GatewayStore,
+    target_id: &str,
+    previous_id: &str,
+) -> anyhow::Result<()> {
+    let mut gateway = store.load()?;
+    let Some(binding) = gateway.bindings.get_mut(ToolId::Codex.as_str()) else {
+        return Ok(());
+    };
+    let connected = target_id == CODEX_GATEWAY_RELAY_ID;
+    if binding.enabled == connected {
         return Ok(());
     }
-    let mut gateway = store.load()?;
-    if let Some(binding) = gateway.bindings.get_mut(ToolId::Codex.as_str())
-        && binding.enabled
-    {
-        binding.enabled = false;
-        binding.restore = Default::default();
-        store.save(&gateway)?;
+    binding.enabled = connected;
+    binding.restore = Default::default();
+    if connected && previous_id != CODEX_GATEWAY_RELAY_ID {
+        binding.restore.codex_previous_relay_id = previous_id.to_string();
     }
+    store.save(&gateway)?;
     Ok(())
 }
 

@@ -355,7 +355,7 @@ fn codex_enable_switches_to_managed_gateway_profile_and_disable_switches_back() 
 
     // 在 Codex 供应商页直接切走：绑定随之断开。
     enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
-    note_codex_switched(&ctx.gateway, "direct").unwrap();
+    note_codex_switched(&ctx.gateway, "direct", "codex-plus-gateway").unwrap();
     assert!(
         !ctx.gateway
             .load()
@@ -363,6 +363,77 @@ fn codex_enable_switches_to_managed_gateway_profile_and_disable_switches_back() 
             .binding(&ToolId::Codex)
             .unwrap()
             .enabled
+    );
+    // 托管供应商还在列表里：在 Codex 供应商页选回它，等于重新接入。
+    note_codex_switched(&ctx.gateway, "codex-plus-gateway", "direct").unwrap();
+    let saved = ctx.gateway.load().unwrap();
+    let binding = saved.binding(&ToolId::Codex).unwrap();
+    assert!(binding.enabled);
+    assert_eq!(binding.restore.codex_previous_relay_id, "direct");
+}
+
+/// Codex 的实时配置被别的工具改过（直连模式里切换会报「实时配置冲突」）：
+/// 照样能接入网关，断开时把接入前的文件原样写回。
+#[test]
+fn codex_with_externally_edited_config_connects_and_restores_it_byte_for_byte() {
+    let fixture = fixture(57396);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    let mut direct = codex_plus_core::provider_import::pool_relay_profile(
+        "直连",
+        "https://api.direct.test/v1",
+        "sk-direct",
+        RelayProtocol::Responses,
+        "gpt-direct",
+        "gpt-direct",
+        &[],
+    )
+    .unwrap();
+    direct.id = "direct".into();
+    direct.relay_mode = RelayMode::PureApi;
+    codex_plus_core::relay_config::normalize_relay_profile_for_storage(&mut direct).unwrap();
+    let mut seeded = BackendSettings::default();
+    seeded.relay_profiles_enabled = true;
+    seeded.relay_profiles = vec![direct];
+    seeded.active_relay_id = "direct".into();
+    codex_plus_core::relay_switch::switch_relay_profile_in_home(
+        &ctx.settings,
+        &ctx.codex_home,
+        seeded,
+        "",
+    )
+    .unwrap();
+    // 别的工具把 Codex 指到了自己那里。
+    let path = ctx.codex_home.join("config.toml");
+    let edited = std::fs::read_to_string(&path).unwrap().replace(
+        "https://api.direct.test/v1",
+        "http://127.0.0.1:3425/other-tool",
+    );
+    std::fs::write(&path, &edited).unwrap();
+
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let config = std::fs::read_to_string(&path).unwrap();
+    assert!(config.contains("/gw/codex/v1"), "{config}");
+    assert_eq!(
+        ctx.settings.load().unwrap().active_relay_id,
+        "codex-plus-gateway"
+    );
+    assert!(
+        ctx.backup_root.join("codex-before-gateway.json").exists(),
+        "实时配置对不上时存了原样副本"
+    );
+
+    let settings = ctx.settings.load().unwrap();
+    disable_binding(ctx, &settings, &ToolId::Codex).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), edited, "原样还原");
+    assert!(!ctx.backup_root.join("codex-before-gateway.json").exists());
+    let settings = ctx.settings.load().unwrap();
+    assert_eq!(settings.active_relay_id, "direct");
+    assert!(
+        !settings
+            .relay_profiles
+            .iter()
+            .any(|profile| profile.id == "codex-plus-gateway")
     );
 }
 
