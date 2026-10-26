@@ -13630,3 +13630,8 @@ button.side-item:hover {
 .shell .app-settings-page .app-settings-anchor .empty {
   padding: 14px;
 }
+/* 被网关接管时只有两个按钮：和上面的标题、说明左对齐（让出图标宽度 + 间距） */
+.shell .overview-current-panel .overview-current-actions-indented {
+  justify-content: flex-start;
+  padding-left: var(--overview-current-indent, 40px);
+}

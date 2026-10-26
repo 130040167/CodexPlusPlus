@@ -5494,7 +5494,7 @@ function OverviewScreen({
                   // 被新版网关接管：直接说明现状，不给切换下拉框（切了也只会报错），改去网关管理或断开。
                   <>
                     <div className="overview-current-main">
-                      <span className="relay-index overview-current-gateway"><Waypoints aria-hidden="true" className="h-4 w-4" /></span>
+                      <span className="relay-index overview-current-gateway"><Network aria-hidden="true" className="h-4 w-4" /></span>
                       <span className="overview-current-text">
                         <strong>{t("由 Codex++ 网关接管")}</strong>
                         <small>
@@ -5504,7 +5504,7 @@ function OverviewScreen({
                         </small>
                       </span>
                     </div>
-                    <div className="overview-current-actions">
+                    <div className="overview-current-actions overview-current-actions-indented">
                       <Button onClick={() => onNavigate("gateway")}>{t("管理接入")}</Button>
                       <Button onClick={() => onNavigate("relay")} variant="secondary">{t("断开并还原")}</Button>
                     </div>
