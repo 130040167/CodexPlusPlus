@@ -4356,7 +4356,6 @@ export function App() {
           {route === "overview" ? (
             <OverviewScreen
               overview={overview}
-              ads={ads}
               activeTool={activeTool}
               toolEntries={toolEntries}
               form={settingsForm}
@@ -4518,6 +4517,8 @@ export function App() {
               autoSave={<SettingsAutoSave dirty={settingsDirty} form={settingsForm} actions={actions} />}
             />
           ) : null}
+          {/* 置顶推荐位只放在网关总览一处，内容与「推荐内容」页同源；各 Agent 的概览不再重复。 */}
+          {route === "hub" ? <SponsorBoard ads={ads} actions={actions} /> : null}
           {route === "hub" ? (
             <HubOverview
               codex={{ running: codexAppRunning, providerName: toolEntries.find((entry) => entry.id === "codex")?.activeRelayName ?? null }}
@@ -5375,7 +5376,7 @@ function WeixinConnectScreen({
   );
 }
 
-/// 概览页的两个独立广告位。
+/// 网关总览顶部的两个独立广告位。
 ///
 /// 这里只读取广告源的 `top_ad/topAds`，不会读取普通 `ads` 推荐池。
 /// `top_ad` 可以是单个对象，也可以是数组；最多显示前两个有效广告。
@@ -5428,7 +5429,6 @@ function SponsorBoard({ ads, actions }: { ads: AdsResult | null; actions: Action
 
 function OverviewScreen({
   overview,
-  ads,
   activeTool,
   toolEntries,
   form,
@@ -5436,7 +5436,6 @@ function OverviewScreen({
   actions,
 }: {
   overview: OverviewResult | null;
-  ads: AdsResult | null;
   activeTool: ToolId;
   toolEntries: ToolEntry[];
   form: BackendSettings;
@@ -5465,8 +5464,6 @@ function OverviewScreen({
   };
   return (
     <>
-      {/* 置顶推荐位两个工具下都显示，内容与「推荐内容」页同源。 */}
-      <SponsorBoard ads={ads} actions={actions} />
       {activeTool === "codex" ? (
         <>
           {/* 推荐位之下是最常用的两件事：现在用的是哪个供应商（可直接切换），以及最近请求是否正常。 */}

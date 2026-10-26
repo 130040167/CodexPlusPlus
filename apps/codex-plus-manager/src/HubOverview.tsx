@@ -299,7 +299,9 @@ function Topology({ links, children }: { links: HubLink[]; children: React.React
             <path d={path.d} data-tone={path.tone} id={`hub-link-${index}`} style={{ strokeWidth: 1.25 + path.weight * 3 }} />
             {path.tone === "live"
               ? [0, 1].map((k) => (
-                <circle data-tone="live" key={k} r={2.2 + path.weight * 1.4}>
+                // 第二个点延迟出发；延迟期间它会停在 SVG 原点（拓扑图左上角），先隐藏，动画开始时再显示。
+                <circle data-tone="live" key={k} r={2.2 + path.weight * 1.4} visibility="hidden">
+                  <set attributeName="visibility" begin={`${k * 1.1}s`} to="visible" />
                   <animateMotion begin={`${k * 1.1}s`} dur="2.2s" repeatCount="indefinite">
                     <mpath href={`#hub-link-${index}`} />
                   </animateMotion>

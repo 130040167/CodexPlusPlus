@@ -233,3 +233,9 @@ test("代理设置按归属拆开：本地服务与请求避震移到网关设�
   assert.match(legacy, /t\("目录外模型映射（旧版）"\)/);
   assert.match(functionSource("App"), /<SharedServiceSettings[\s\S]*?form=\{settingsForm\}/);
 });
+
+test("置顶推荐位只放在网关总览一处，各 Agent 的概览不再重复", () => {
+  assert.match(functionSource("App"), /\{route === "hub" \? <SponsorBoard ads=\{ads\} actions=\{actions\} \/> : null\}/);
+  assert.doesNotMatch(functionSource("OverviewScreen"), /SponsorBoard/);
+  assert.equal((text.match(/<SponsorBoard /g) ?? []).length, 1);
+});
