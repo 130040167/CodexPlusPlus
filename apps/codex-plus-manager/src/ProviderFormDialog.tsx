@@ -17,7 +17,7 @@ import {
   type ProviderDraft,
 } from "./gateway-model";
 import { Avatar } from "./gateway-ui";
-import { AppSelect } from "./AppSelect";
+import { lookupPublicPrice } from "./ProviderExtrasDialog";
 import {
   FETCHED_DIRECT_LIMIT,
   addModel,
@@ -37,14 +37,6 @@ import "./ProviderFormDialog.css";
 export type ProviderFormState = { mode: "preset"; preset: GatewayPreset } | { mode: "custom" } | { mode: "edit"; entry: GatewayPoolEntry };
 
 type Result = { status: string; message: string };
-type PriceState =
-  | { state: "idle" }
-  | { state: "loading" }
-  | { state: "auto"; match: PriceMatch }
-  | { state: "miss" }
-  | { state: "manual" }
-  | { state: "error"; message: string };
-
 const PROTOCOLS: Array<{ id: GatewayProtocol; label: string }> = [
   { id: "chatCompletions", label: "Chat" },
   { id: "responses", label: "Responses" },
@@ -65,9 +57,8 @@ export function ProviderFormDialog({
   const editing = form.mode === "edit";
   const preset = form.mode === "preset" ? form.preset : null;
   const [draft, setDraft] = useState<ProviderDraft>(() => (form.mode === "edit" ? providerDraftFromEntry(form.entry) : providerDraftFromPreset(preset)));
-  // 已经有手填价格（编辑时）就不自动覆盖；用户一改价格也停止自动。
-  const autoPrice = useRef(!(editing && hasPrice(draft)));
-  const [price, setPrice] = useState<PriceState>(autoPrice.current ? { state: "idle" } : { state: "manual" });
+  // 价格在供应商池的详情里编辑；新添加时按公开价格表悄悄填上（查不到就不填）。
+  const autoPrice = useRef(!editing && !hasPrice(draft));
   const [fetching, setFetching] = useState(false);
   const [fetchNote, setFetchNote] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
   const [picker, setPicker] = useState<{ models: string[]; selected: Set<string>; query: string } | null>(null);
@@ -89,23 +80,8 @@ export function ProviderFormDialog({
   }, [onCancel]);
 
   const lookupPrice = async (model: string, baseUrl: string) => {
-    setPrice({ state: "loading" });
-    try {
-      const result = await invoke<Result & { prices?: Array<{ model: string; price?: PriceMatch | null }> }>("lookup_model_prices", { baseUrl, models: [model] });
-      if (result.status !== "ok") {
-        setPrice({ state: "error", message: result.message });
-        return;
-      }
-      const match = result.prices?.[0]?.price;
-      if (match) {
-        setDraft((previous) => draftWithPrice(previous, match));
-        setPrice({ state: "auto", match });
-      } else {
-        setPrice({ state: "miss" });
-      }
-    } catch (error) {
-      setPrice({ state: "error", message: String(error) });
-    }
+    const match = await lookupPublicPrice(baseUrl, model);
+    if (match && autoPrice.current) setDraft((previous) => draftWithPrice(previous, match));
   };
 
   // 地址或默认模型变了就重新查价（停顿半秒再查，打字时不反复请求）。
@@ -115,12 +91,6 @@ export function ProviderFormDialog({
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draft.baseUrl, chosenModel]);
-
-  const editPrice = (patch: Partial<ProviderDraft>) => {
-    autoPrice.current = false;
-    setPrice({ state: "manual" });
-    update(patch);
-  };
 
   const fetchModels = async () => {
     setFetching(true);
@@ -217,10 +187,6 @@ export function ProviderFormDialog({
                 <Plus />{t("再加一个 Key")}
               </button>
             </div>
-            <label className="pf-field">
-              <span>{t("代理")} <small>{t("可选：只这个供应商单独走的 HTTP 代理，留空沿用系统代理")}</small></span>
-              <Input className="pf-mono" onChange={(event) => update({ proxy: event.currentTarget.value })} placeholder="http://127.0.0.1:7890" spellCheck={false} value={draft.proxy} />
-            </label>
           </section>
 
           <section className="pf-section">
@@ -261,31 +227,6 @@ export function ProviderFormDialog({
             <p className="pf-hint">{t("星标是默认模型；Agent 请求这些模型名时会路由到这个供应商。")}</p>
           </section>
 
-          <section className="pf-section">
-            <h4>
-              {t("价格")}<small>{t("每百万 token，用于「用量」里估算费用")}</small>
-              <button className="pf-action" disabled={!chosenModel || !draft.baseUrl.trim() || price.state === "loading"} onClick={() => { autoPrice.current = true; void lookupPrice(chosenModel, draft.baseUrl.trim()); }} type="button">
-                <RefreshCw className={price.state === "loading" ? "animate-spin" : ""} />{t("按公开价格填写")}
-              </button>
-            </h4>
-            <PriceNote model={chosenModel} price={price} />
-            <div className="pf-price">
-              <AppSelect
-                size="sm"
-                label={t("币种")}
-                onChange={(next) => editPrice({ priceCurrency: next })}
-                options={[
-                  { value: "USD", label: "$ USD" },
-                  { value: "CNY", label: "¥ CNY" },
-                ]}
-                value={draft.priceCurrency === "USD" ? "USD" : "CNY"}
-                menuWidth={140}
-              />
-              <label><span>{t("输入")}</span><Input inputMode="decimal" onChange={(event) => editPrice({ priceInput: event.currentTarget.value })} placeholder="0" value={draft.priceInput} /></label>
-              <label><span>{t("缓存命中")}</span><Input inputMode="decimal" onChange={(event) => editPrice({ priceCached: event.currentTarget.value })} placeholder="0" value={draft.priceCached} /></label>
-              <label><span>{t("输出")}</span><Input inputMode="decimal" onChange={(event) => editPrice({ priceOutput: event.currentTarget.value })} placeholder="0" value={draft.priceOutput} /></label>
-            </div>
-          </section>
         </div>
 
         <footer className="pf-foot">
@@ -297,28 +238,6 @@ export function ProviderFormDialog({
     </div>,
     document.body,
   );
-}
-
-function PriceNote({ model, price }: { model: string; price: PriceState }) {
-  if (price.state === "loading") return <p className="pf-note">{t("正在查公开价格…")}</p>;
-  if (price.state === "auto") {
-    const { match } = price;
-    return (
-      <p className="pf-note" data-tone="ok">
-        <Check />
-        {tf("已按 models.dev 的 {0} · {1} 填写（美元）", [match.providerName, match.modelId])}
-        {match.context ? <span>{tf(" · 上下文 {0}", [formatContext(match.context)])}</span> : null}
-      </p>
-    );
-  }
-  if (price.state === "miss") return <p className="pf-note">{tf("公开价格表里没找到 {0}，需要的话手动填写。", [model])}</p>;
-  if (price.state === "error") return <p className="pf-note" data-tone="error">{price.message}</p>;
-  if (price.state === "manual") return <p className="pf-note">{t("手动填写的价格，不会被自动覆盖。")}</p>;
-  return <p className="pf-note">{model ? t("填好地址后自动按公开价格填写。") : t("加了模型后自动按公开价格填写。")}</p>;
-}
-
-function formatContext(tokens: number): string {
-  return tokens >= 1_000_000 ? `${formatPrice(tokens / 1_000_000)}M` : `${Math.round(tokens / 1000)}K`;
 }
 
 /** 上游模型太多时的勾选列表：可搜索，默认勾上已有的。 */

@@ -23,9 +23,11 @@ import {
   type GatewayPreset,
   type PresetSection,
   type ProviderDraft,
+  type ProviderPrice,
 } from "./gateway-model";
 import { Avatar, Switch, type Notify, type Run } from "./gateway-ui";
 import { ProviderFormDialog, type ProviderFormState } from "./ProviderFormDialog";
+import { ProviderExtrasDialog, priceSummary } from "./ProviderExtrasDialog";
 
 /** 能在网关里直接登录的订阅。 */
 type AccountKind = "chatgpt" | "chatgpt-api" | "copilot" | "grok";
@@ -202,6 +204,11 @@ function PoolRow({
     ? [t("订阅登录"), entry.lentToCodex ? t("Codex 正用它登录") : "", tf("{0} 个模型", [entry.models.length])]
     : [protocolLabel(entry.protocol), presetHost(entry.baseUrl), tf("{0} 个模型", [entry.models.length])]
   ).filter(Boolean).join(" · ");
+  const [extrasOpen, setExtrasOpen] = useState(false);
+  const price = priceSummary(entry);
+  const saveExtras = async (nextPrice: ProviderPrice | null, proxy: string) => {
+    if (await run(`extras:${entry.id}`, "save_gateway_provider_extras", { id: entry.id, price: nextPrice, proxy }, t("保存价格与代理"))) setExtrasOpen(false);
+  };
   const remove = async () => {
     const ok = await appConfirm(tf("从网关删除「{0}」？直连模式里的供应商不受影响。", [entry.name]), { title: t("删除供应商"), confirmText: t("删除"), danger: true });
     if (ok) await run(`remove:${entry.id}`, "delete_gateway_provider", { id: entry.id }, t("删除供应商"));
@@ -266,6 +273,20 @@ function PoolRow({
               ) : null}
             </div>
           </div>
+          <div className="gw-detail-row">
+            <span className="gw-detail-label">{t("价格")}</span>
+            <div className="gw-detail-value gw-chip-row">
+              <span className={price ? undefined : "gw-muted"}>{price || t("未填写，不估算费用")}</span>
+              <button className="gw-text-button" disabled={busy !== null} onClick={() => setExtrasOpen(true)} type="button">{t("编辑")}</button>
+            </div>
+          </div>
+          <div className="gw-detail-row">
+            <span className="gw-detail-label">{t("代理")}</span>
+            <div className="gw-detail-value gw-chip-row">
+              {entry.proxy ? <code className="gw-chip">{entry.proxy}</code> : <span className="gw-muted">{t("沿用系统代理")}</span>}
+              <button className="gw-text-button" disabled={busy !== null} onClick={() => setExtrasOpen(true)} type="button">{t("编辑")}</button>
+            </div>
+          </div>
           <div className="gw-detail-row gw-detail-foot">
             <span className="gw-detail-label gw-detail-file">{t("只属于网关，直连模式里看不到")}</span>
             <div className="gw-detail-value">
@@ -286,6 +307,14 @@ function PoolRow({
             </div>
           </div>
         </div>
+      ) : null}
+      {extrasOpen ? (
+        <ProviderExtrasDialog
+          busy={busy !== null}
+          entry={entry}
+          onCancel={() => setExtrasOpen(false)}
+          onSave={(nextPrice, proxy) => void saveExtras(nextPrice, proxy)}
+        />
       ) : null}
     </div>
   );

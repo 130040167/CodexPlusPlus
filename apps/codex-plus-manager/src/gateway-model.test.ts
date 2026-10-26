@@ -334,3 +334,14 @@ test("全应用不用系统原生的确认 / 提示 / 输入框，统一用 app-
   }
   assert.match(app, /<AppDialogHost \/>/);
 });
+
+test("供应商的价格与代理在供应商池详情里编辑，添加 / 编辑弹窗只管连接、Key 与模型", () => {
+  const form = readFileSync(new URL("./ProviderFormDialog.tsx", import.meta.url), "utf8");
+  assert.doesNotMatch(form, /t\("价格"\)|t\("代理"\)|priceInput: event|proxy: event/);
+  const providers = readFileSync(new URL("./GatewayProviders.tsx", import.meta.url), "utf8");
+  assert.match(providers, /"save_gateway_provider_extras"/);
+  assert.match(providers, /<ProviderExtrasDialog/);
+  const extras = readFileSync(new URL("./ProviderExtrasDialog.tsx", import.meta.url), "utf8");
+  assert.match(extras, /t\("按公开价格填写"\)/);
+  assert.match(extras, /placeholder="http:\/\/127\.0\.0\.1:7890"/);
+});

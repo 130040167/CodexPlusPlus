@@ -1227,6 +1227,28 @@ pub fn update_provider(
     Ok(gateway)
 }
 
+/// 只改供应商的价格与独立代理（订阅账号也能改；地址、Key、模型不动）。
+pub fn set_provider_extras(
+    store: &GatewayStore,
+    id: &str,
+    price: Option<ProviderPrice>,
+    proxy: &str,
+) -> anyhow::Result<GatewaySettings> {
+    let proxy = clean_proxy(proxy)?;
+    let mut gateway = store.load()?;
+    let Some(provider) = gateway
+        .providers
+        .iter_mut()
+        .find(|provider| provider.relay.id == id)
+    else {
+        bail!("供应商不存在：{id}");
+    };
+    provider.price = clean_price(price);
+    provider.proxy = proxy;
+    store.save(&gateway)?;
+    store.load()
+}
+
 /// 删除网关供应商：同时清掉路由组里指向它的成员和 Agent「挑选」里的记录。直连模式的数据不受影响。
 pub fn delete_provider(store: &GatewayStore, id: &str) -> anyhow::Result<GatewaySettings> {
     let mut gateway = store.load()?;

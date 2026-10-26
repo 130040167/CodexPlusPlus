@@ -332,6 +332,7 @@ pub fn run() {
             gateway_commands::login_gateway_grok,
             gateway_commands::login_gateway_chatgpt_api,
             gateway_commands::import_gateway_opencode_key,
+            gateway_commands::save_gateway_provider_extras,
             gateway_commands::save_gateway_tray_panel,
             tray_panel::tray_panel_action,
             tray_panel::refresh_tray_mode,

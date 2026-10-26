@@ -406,6 +406,20 @@ pub fn update_gateway_provider(
     )
 }
 
+/// 只改供应商的价格与独立代理（在供应商池的详情里编辑）。
+#[tauri::command]
+pub fn save_gateway_provider_extras(
+    id: String,
+    price: Option<codex_plus_core::gateway::store::ProviderPrice>,
+    proxy: String,
+) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "已保存。",
+        "保存失败",
+        apply::set_provider_extras(&GatewayStore::default(), &id, price, &proxy),
+    )
+}
+
 /// 删除网关供应商（直连模式的数据不受影响）。
 #[tauri::command]
 pub fn delete_gateway_provider(id: String) -> CommandResult<Option<GatewayPayload>> {

@@ -676,6 +676,32 @@ fn gateway_provider_proxy_is_its_own_setting() {
         update_provider(&ctx.gateway, &id, &input).is_err(),
         "缺协议头的地址拦下"
     );
+
+    // 详情里单独改价格与代理：地址、Key、模型不动。
+    let before = ctx.gateway.load().unwrap().provider(&id).unwrap().relay.clone();
+    let price = codex_plus_core::gateway::store::ProviderPrice {
+        currency: "USD".into(),
+        input: 2.0,
+        cached_input: 0.1,
+        output: 10.0,
+    };
+    let saved = codex_plus_core::gateway::apply::set_provider_extras(
+        &ctx.gateway,
+        &id,
+        Some(price.clone()),
+        "socks5://127.0.0.1:1080",
+    )
+    .unwrap();
+    let provider = saved.provider(&id).unwrap();
+    assert_eq!(provider.price, Some(price));
+    assert_eq!(provider.proxy, "socks5://127.0.0.1:1080");
+    assert_eq!(provider.relay.base_url, before.base_url);
+    assert_eq!(provider.relay.api_key, before.api_key);
+    assert_eq!(provider.relay.model_list, before.model_list);
+    assert!(
+        codex_plus_core::gateway::apply::set_provider_extras(&ctx.gateway, &id, None, "bad")
+            .is_err()
+    );
 }
 
 #[test]
