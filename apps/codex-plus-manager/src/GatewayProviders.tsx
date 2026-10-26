@@ -159,7 +159,10 @@ function PoolRow({
   const breaker = payload?.health.providers.some((item) => item.relayId === entry.id && item.breakerOpen);
   const statusText = !enabled ? t("已关闭") : status.args.length ? tf(status.text, status.args) : t(status.text);
   const tone = !enabled ? "off" : status.state === "cooling" ? "error" : "on";
-  const sub = [protocolLabel(entry.protocol), presetHost(entry.baseUrl), tf("{0} 个模型", [entry.models.length])].filter(Boolean).join(" · ");
+  const sub = (entry.official
+    ? [t("订阅登录"), tf("{0} 个模型", [entry.models.length])]
+    : [protocolLabel(entry.protocol), presetHost(entry.baseUrl), tf("{0} 个模型", [entry.models.length])]
+  ).filter(Boolean).join(" · ");
   const remove = async () => {
     const ok = await confirm(tf("从网关删除「{0}」？直连模式里的供应商不受影响。", [entry.name]), { title: t("删除供应商"), kind: "warning" });
     if (ok) await run(`remove:${entry.id}`, "delete_gateway_provider", { id: entry.id }, t("删除供应商"));
@@ -227,10 +230,17 @@ function PoolRow({
           <div className="gw-detail-row gw-detail-foot">
             <span className="gw-detail-label gw-detail-file">{t("只属于网关，直连模式里看不到")}</span>
             <div className="gw-detail-value">
-              <button className="gw-text-button" onClick={onEdit} type="button">
-                {t("编辑")}
-                <ChevronRight className="h-3.5 w-3.5" />
-              </button>
+              {entry.official ? (
+                <button className="gw-text-button" disabled={busy !== null} onClick={() => void run("login:chatgpt", "login_gateway_chatgpt", undefined, t("登录 ChatGPT"))} type="button">
+                  {t("重新登录")}
+                  <ChevronRight className="h-3.5 w-3.5" />
+                </button>
+              ) : (
+                <button className="gw-text-button" onClick={onEdit} type="button">
+                  {t("编辑")}
+                  <ChevronRight className="h-3.5 w-3.5" />
+                </button>
+              )}
               <button className="gw-danger-link" disabled={busy !== null} onClick={() => void remove()} type="button">
                 {t("删除")}
               </button>
@@ -277,7 +287,11 @@ function ProviderCatalog({
         key: "chatgpt",
         name: "ChatGPT",
         icon: <img alt="" className="gw-catalog-logo" src={AGENT_ICONS.codex} />,
-        onClick: () => void notify(t("订阅账号"), t("网关的订阅账号要在网关里单独登录（不能复制直连模式的登录，两边会互相把对方刷失效），这个功能还在做。"), "info"),
+        added: Boolean(payload?.pool.some((entry) => entry.official)),
+        onClick: () => void (async () => {
+          void notify(t("登录 ChatGPT"), t("已在浏览器打开登录页，登录完成后回到这里。5 分钟内有效。"), "info");
+          await run("login:chatgpt", "login_gateway_chatgpt", undefined, t("登录 ChatGPT"));
+        })(),
       }]
     : [];
   const local: CatalogItem[] = [
@@ -285,7 +299,7 @@ function ProviderCatalog({
     ...(hit(t("自定义")) ? [{ key: "custom", name: t("自定义"), icon: <span className="gw-avatar gw-avatar-plus" data-size="sm"><Plus className="h-3.5 w-3.5" /></span>, onClick: onCustom }] : []),
   ];
   const sections: Array<{ key: string; title: string; hint: string; items: CatalogItem[] }> = [
-    { key: "subscription", title: t("订阅"), hint: t("登录即可，无需密钥"), items: subscriptions },
+    { key: "subscription", title: t("订阅"), hint: t("登录即可，无需密钥；与 Codex 自己的登录互不影响"), items: subscriptions },
     { key: "vendor", title: t("供应商"), hint: t("模型厂商的 API"), items: presetItems("vendor") },
     { key: "relay", title: t("中转"), hint: t("一个密钥用多家模型"), items: presetItems("relay") },
     { key: "local", title: t("本机"), hint: t("本机运行的模型服务，或任意兼容地址"), items: local },

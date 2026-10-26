@@ -702,6 +702,62 @@ pub fn save_gateway_tray_panel(enabled: bool) -> CommandResult<Option<GatewayPay
     )
 }
 
+/// 用系统默认浏览器打开登录页。
+fn open_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd")
+        .args(["/c", "start", "", url])
+        .spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+}
+
+/// 在网关里登录 ChatGPT 订阅：浏览器登录后加进网关的供应商池。同一个账号再登录只更新 token。
+/// 与 Codex 自己的登录是两次独立的登录，互不影响。
+#[tauri::command]
+pub async fn login_gateway_chatgpt() -> CommandResult<Option<GatewayPayload>> {
+    use codex_plus_core::gateway::accounts;
+    let result: anyhow::Result<String> = async {
+        let account = accounts::chatgpt_login(open_in_browser).await?;
+        let store = GatewayStore::default();
+        let mut gateway = store.load()?;
+        // 同一个账号已经登录过：只换 token。
+        if !account.account_id.is_empty()
+            && let Some(provider) = gateway.providers.iter_mut().find(|provider| {
+                codex_plus_core::official_login::chatgpt_account_id_from_auth_contents(
+                    &provider.relay.auth_contents,
+                ) == account.account_id
+            })
+        {
+            provider.relay.auth_contents = account.auth_contents.clone();
+            let name = provider.relay.name.clone();
+            store.save(&gateway)?;
+            return Ok(format!("已更新「{name}」的登录。"));
+        }
+        let mut relay = accounts::chatgpt_relay(&account, &[]);
+        let models = codex_plus_core::model_catalog::fetch_relay_profile_model_ids(&relay)
+            .await
+            .map(|(models, _)| models)
+            .unwrap_or_default();
+        relay = accounts::chatgpt_relay(&account, &models);
+        let name = relay.name.clone();
+        apply::add_provider(&store, relay, "login:chatgpt")?;
+        Ok(if models.is_empty() {
+            format!("已添加「{name}」。没读到模型列表，请在供应商里编辑补上。")
+        } else {
+            format!("已添加「{name}」，{} 个模型。", models.len())
+        })
+    }
+    .await;
+    let result = refresh_agents(result);
+    match result {
+        Ok(message) => ok(&message, current_payload()),
+        Err(error) => failed(&format!("登录失败：{error:#}"), current_payload()),
+    }
+}
+
 /// 清掉某个供应商的 Key 冷却与熔断状态。
 #[tauri::command]
 pub fn reset_gateway_key_health(relay_id: String) -> CommandResult<Option<GatewayPayload>> {

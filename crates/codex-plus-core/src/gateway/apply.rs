@@ -646,7 +646,9 @@ pub fn add_provider(
     source: &str,
 ) -> anyhow::Result<(GatewaySettings, String)> {
     let mut gateway = store.load()?;
-    relay.id = gateway.unique_slug(&relay.name, false);
+    // 登录得到的账号名里带邮箱，短名用来源（如 `login:chatgpt` → `chatgpt`）更干净。
+    let slug_base = source.strip_prefix("login:").unwrap_or(&relay.name).to_string();
+    relay.id = gateway.unique_slug(&slug_base, false);
     let id = relay.id.clone();
     gateway.providers.push(GatewayProvider {
         enabled: true,

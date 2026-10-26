@@ -66,7 +66,22 @@ Agent 打开「接入」后，池里所有打开的供应商的模型和所有�
 - **路由**：所有接入的 Agent 共用一张实时卡片：左边 Agent、中间网关、右边池里的供应商，最近一次请求走过的线高亮；
   下面是请求数、换上游次数、交给 Agent 的错误数，以及「上一个请求是怎么路由的」逐条说明。
   数据来自 `gateway::activity`（只在内存，重启清零），页面每 2.5 秒刷新。再往下是网关的路由组：新建、编辑、删除。
-- **网关**：监听地址、各 Agent 的接入地址与 token、多 Key 轮换方式、退出时恢复直连。
+- **会话**：Codex（现有会话库）、Claude Code（`~/.claude/projects/*/*.jsonl`）、Grok（`~/.grok/sessions/session_search.sqlite`）
+  的本地会话放在一起，按 Agent 筛选、搜索，一键在终端执行 Agent 自己的恢复命令。只读。
+- **用量**：请求结束时按「日期 × Agent × 供应商 × 模型」累加到 `<状态目录>/gateway-usage.json`（不受请求日志裁剪影响）；
+  显示 token / 缓存读取 / 推理 / 调用、按天柱状图、按供应商 / 模型 / Agent 明细。供应商填了每百万 token 价格才估算费用；
+  余额只查有公开接口的 DeepSeek、Kimi / Moonshot、OpenRouter、SiliconFlow。
+- **网关**：监听地址、各 Agent 的接入地址与 token、多 Key 轮换方式、退出时恢复直连、托盘快捷面板开关。
+
+托盘快捷面板（默认开）：左键点托盘图标弹出，能给各 Agent 换模型、看最近的请求；右键仍是原菜单、双击打开主窗口。
+关掉开关时托盘恢复原来的点击行为。
+
+## 订阅登录
+
+- **ChatGPT**：在网关里走与 Codex CLI 相同的浏览器 PKCE 登录（本机 1455 端口接回调）。token 只存在 gateway.json，
+  凭据带 `codex_plus_gateway` 标记，刷新结果写回网关、不采纳 Codex 的 live 登录——与 Codex 自己的登录是两次独立的登录。
+- 其它订阅（Claude、Grok、Copilot、Gemini、Antigravity）暂未接入：它们要冒用官方客户端身份调用未公开的接口，
+  且部分厂商条款明确禁止（Anthropic 曾因此要求下架同类插件）。
 
 ## 限制
 

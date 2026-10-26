@@ -6,6 +6,10 @@
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
   // 本地网关
+  "登录 ChatGPT": "Sign in to ChatGPT",
+  "已在浏览器打开登录页，登录完成后回到这里。5 分钟内有效。": "The sign-in page is open in your browser. Come back here when you're done; it's valid for 5 minutes.",
+  "订阅登录": "Subscription sign-in",
+  "登录即可，无需密钥；与 Codex 自己的登录互不影响": "sign in, no key; separate from Codex's own sign-in",
   "点击托盘图标弹出快捷面板": "Click the tray icon to open the quick panel",
   "面板里能直接给各 Agent 换模型、看最近的请求；右键仍是原来的菜单，双击打开主窗口。关掉恢复原来的点击行为。": "The panel lets you switch each agent's model and see recent requests; right-click still opens the menu and double-click opens the main window. Turn off to restore the original click behavior.",
   "打开 Codex++": "Open Codex++",
@@ -67,9 +71,6 @@ export const EN_PLAIN: Record<string, string> = {
   "下移": "Move down",
   "添加成员": "Add member",
   "只属于网关，直连模式里看不到": "Belongs to the gateway only; not visible in direct mode",
-  "订阅账号": "Subscription accounts",
-  "网关的订阅账号要在网关里单独登录（不能复制直连模式的登录，两边会互相把对方刷失效），这个功能还在做。": "Subscription accounts for the gateway need their own sign-in (copying the direct-mode login would make each side invalidate the other's tokens). This is still in progress.",
-  "登录即可，无需密钥": "sign in, no key",
   "Codex 的供应商": "Codex providers",
   "从直连模式导入": "Import from direct mode",
   "复制一份进网关，之后两边各改各的，互不影响。官方登录账号不能复制，需要在网关里单独登录。": "A copy goes into the gateway; after that each side is edited separately. Official sign-in accounts can't be copied and need their own sign-in in the gateway.",
