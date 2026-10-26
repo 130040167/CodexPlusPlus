@@ -212,6 +212,7 @@ pub fn run() {
             }
             let main_window = main_window_builder.build()?;
             install_tray(app)?;
+            gateway_commands::set_app_handle(app.handle().clone());
             if start_minimized {
                 set_manager_activation_policy(app.handle(), false);
             }

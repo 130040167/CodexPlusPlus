@@ -79,7 +79,7 @@ pub struct GatewayPayload {
     pub opencode_keys: Vec<GatewaySourceEntry>,
 }
 
-const GATEWAY_AGENTS: &[ToolId] = &[ToolId::Claude, ToolId::Grok];
+const GATEWAY_AGENTS: &[ToolId] = &[ToolId::Codex, ToolId::Claude, ToolId::Grok];
 
 fn port() -> u16 {
     codex_plus_core::resident_helper::resident_helper_port()
@@ -228,11 +228,29 @@ fn current_payload() -> Option<GatewayPayload> {
     Some(build_payload(&settings, gateway))
 }
 
+static APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+pub fn set_app_handle(app: tauri::AppHandle) {
+    let _ = APP.set(app);
+}
+
+/// 设置改动事件：主窗口收到后重新读取设置。
+pub const SETTINGS_CHANGED_EVENT: &str = "codex-plus-settings-changed";
+
+/// Codex 接入网关会改直连模式的设置（加入 / 删除托管供应商、切换当前供应商）：
+/// 通知主窗口重新读取，免得它拿旧设置整份写回。
+fn notify_settings_changed() {
+    if let Some(app) = APP.get() {
+        let _ = tauri::Emitter::emit(app, SETTINGS_CHANGED_EVENT, ());
+    }
+}
+
 fn respond<T>(
     success: &str,
     failure: &str,
     result: anyhow::Result<T>,
 ) -> CommandResult<Option<GatewayPayload>> {
+    notify_settings_changed();
     match result {
         Ok(_) => ok(success, current_payload()),
         Err(error) => failed(&format!("{failure}：{error:#}"), current_payload()),
@@ -241,6 +259,7 @@ fn respond<T>(
 
 /// 供应商池或路由组变了：开着的 Agent 重写配置，让它的模型列表跟上。重写失败只记日志。
 fn refresh_agents<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    notify_settings_changed();
     if result.is_ok()
         && let Err(error) = apply::refresh_enabled(&context())
     {
@@ -485,7 +504,10 @@ pub async fn import_gateway_opencode_key(id: String) -> CommandResult<Option<Gat
         };
         apply::create_provider(&GatewayStore::default(), &input, &format!("opencode:{id}"))?;
         Ok(if models.is_empty() {
-            format!("已添加「{}」。没读到模型目录，请在供应商里获取模型。", entry.name)
+            format!(
+                "已添加「{}」。没读到模型目录，请在供应商里获取模型。",
+                entry.name
+            )
         } else {
             format!("已添加「{}」，{} 个模型。", entry.name, models.len())
         })

@@ -5,6 +5,9 @@
 //!   关闭时切回开启前的供应商。
 //! - Grok：合成一个指向网关的 Responses 供应商写进 `~/.grok/config.toml`；
 //!   关闭时重新应用 Grok 页里当前选中的供应商。
+//! - Codex：在直连模式的供应商列表里放一个托管供应商（[`CODEX_GATEWAY_RELAY_ID`]），
+//!   用直连模式自己的切换流程写进 `~/.codex`（回填、冲突检测、模型目录都照旧）；
+//!   关闭时切回开启前的供应商并删掉托管供应商。直连模式里切到别的供应商等于断开网关。
 //! - 供应商池与路由组只存在 `gateway.json`；从直连模式导入是复制，之后互不影响。
 
 use std::path::PathBuf;
@@ -18,7 +21,9 @@ use crate::gateway::store::{
     AgentBinding, GROUP_MODEL_PREFIX, GatewayGroup, GatewayProvider, GatewaySettings, GatewayStore,
     GroupMember, GroupMode, ProviderPrice, new_client_token,
 };
-use crate::settings::{BackendSettings, RelayApiKey, RelayMode, RelayProfile, RelayProtocol};
+use crate::settings::{
+    BackendSettings, RelayApiKey, RelayMode, RelayProfile, RelayProtocol, SettingsStore,
+};
 use crate::tools::ToolId;
 use crate::tools::claude::{self, ClaudeContext, ClaudeProvider, GATEWAY_PROVIDER_ID};
 
@@ -28,9 +33,15 @@ pub struct ApplyContext {
     pub gateway: GatewayStore,
     pub claude: ClaudeContext,
     pub grok_home: PathBuf,
+    /// Codex 的配置目录与直连模式的设置（Codex 接入网关走直连模式的切换流程）。
+    pub codex_home: PathBuf,
+    pub settings: SettingsStore,
     pub backup_root: PathBuf,
     pub port: u16,
 }
+
+/// Codex 直连模式供应商列表里托管的网关供应商 id。
+pub const CODEX_GATEWAY_RELAY_ID: &str = "codex-plus-gateway";
 
 impl ApplyContext {
     pub fn default_paths(port: u16) -> Self {
@@ -38,6 +49,8 @@ impl ApplyContext {
             gateway: GatewayStore::default(),
             claude: ClaudeContext::default_paths(),
             grok_home: crate::grok_config::default_grok_home_dir(),
+            codex_home: crate::relay_config::default_codex_home_dir(),
+            settings: SettingsStore::default(),
             backup_root: crate::paths::default_app_state_dir().join("backups"),
             port,
         }
@@ -133,6 +146,16 @@ pub fn grok_gateway_profile(
     binding: &AgentBinding,
     port: u16,
 ) -> RelayProfile {
+    agent_gateway_profile(gateway, binding, port, &ToolId::Grok)
+}
+
+/// Responses 类 Agent（Grok、Codex）的合成供应商：地址是该 Agent 的网关入口，模型列表是整个池。
+fn agent_gateway_profile(
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+    port: u16,
+    agent: &ToolId,
+) -> RelayProfile {
     let default_model = binding_default_model(gateway, binding);
     let window = binding.context_window;
     let mut models = vec![default_model.clone()];
@@ -154,7 +177,7 @@ pub fn grok_gateway_profile(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let base = format!("{}/v1", gateway_base_url(port, &ToolId::Grok));
+    let base = format!("{}/v1", gateway_base_url(port, agent));
     RelayProfile {
         id: "codex-plus-gateway".to_string(),
         name: "Codex++ 网关".to_string(),
@@ -202,9 +225,65 @@ fn write_agent_config(
                 &ctx.backup_root,
             )?;
         }
+        ToolId::Codex => write_codex(ctx, &gateway, binding)?,
         other => bail!("{} 不支持网关模式", other.as_str()),
     }
     Ok(None)
+}
+
+/// Codex 的托管网关供应商：与直连模式里手加的 Responses 供应商一样存储（配置快照里带地址和 token）。
+pub fn codex_gateway_profile(
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+    port: u16,
+) -> anyhow::Result<RelayProfile> {
+    let synthetic = agent_gateway_profile(gateway, binding, port, &ToolId::Codex);
+    let mut profile = crate::provider_import::pool_relay_profile(
+        "Codex++ 网关",
+        &synthetic.base_url,
+        &synthetic.api_key,
+        RelayProtocol::Responses,
+        &binding_default_model(gateway, binding),
+        &synthetic.model_list,
+        &[],
+    )?;
+    profile.id = CODEX_GATEWAY_RELAY_ID.to_string();
+    profile.relay_mode = RelayMode::PureApi;
+    crate::relay_config::normalize_relay_profile_for_storage(&mut profile)?;
+    Ok(profile)
+}
+
+/// 把托管供应商放进直连模式的列表并切过去（已经在用时只刷新它的配置）。
+fn write_codex(
+    ctx: &ApplyContext,
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+) -> anyhow::Result<()> {
+    let mut settings = ctx.settings.load()?;
+    if !settings.relay_profiles_enabled {
+        bail!("Codex 的供应商配置总开关已关闭，无法接入网关：先在 Codex 设置里打开");
+    }
+    let profile = codex_gateway_profile(gateway, binding, ctx.port)?;
+    match settings
+        .relay_profiles
+        .iter_mut()
+        .find(|item| item.id == CODEX_GATEWAY_RELAY_ID)
+    {
+        Some(existing) => *existing = profile,
+        None => settings.relay_profiles.push(profile),
+    }
+    let previous = std::mem::replace(
+        &mut settings.active_relay_id,
+        CODEX_GATEWAY_RELAY_ID.to_string(),
+    );
+    crate::relay_switch::switch_relay_profile_in_home(
+        &ctx.settings,
+        &ctx.codex_home,
+        settings,
+        &previous,
+    )
+    .context("把 Codex 切到网关失败")?;
+    Ok(())
 }
 
 /// 开启（或更新）一个 Agent 的网关绑定，并把它的配置指向网关。
@@ -232,6 +311,9 @@ pub fn enable_binding(
                 if current != GATEWAY_PROVIDER_ID {
                     restore.claude_previous_provider_id = current;
                 }
+            }
+            if *agent == ToolId::Codex {
+                restore.codex_previous_relay_id = codex_active_relay_id(ctx)?;
             }
             restore
         }
@@ -261,6 +343,7 @@ pub fn disable_binding(
     match agent {
         ToolId::Claude => restore_claude(ctx, &binding)?,
         ToolId::Grok => restore_grok(ctx, settings)?,
+        ToolId::Codex => restore_codex(ctx, &binding)?,
         _ => {}
     }
     if let Some(binding) = gateway.bindings.get_mut(agent.as_str()) {
@@ -293,6 +376,66 @@ fn restore_claude(ctx: &ApplyContext, binding: &AgentBinding) -> anyhow::Result<
     {
         claude::delete_provider(&ctx.claude, GATEWAY_PROVIDER_ID)?;
     }
+    Ok(())
+}
+
+/// Codex 当前在用的直连供应商（不是托管的网关供应商时）。
+fn codex_active_relay_id(ctx: &ApplyContext) -> anyhow::Result<String> {
+    let active = ctx.settings.load()?.active_relay_id;
+    Ok(if active == CODEX_GATEWAY_RELAY_ID {
+        String::new()
+    } else {
+        active
+    })
+}
+
+/// 切回开启前的供应商（不在了就用列表里第一个），再删掉托管供应商。
+/// 用户已经在直连模式里切走了的，只删托管供应商。
+fn restore_codex(ctx: &ApplyContext, binding: &AgentBinding) -> anyhow::Result<()> {
+    let mut settings = ctx.settings.load()?;
+    let is_managed = |profile: &RelayProfile| profile.id == CODEX_GATEWAY_RELAY_ID;
+    if !settings.relay_profiles.iter().any(is_managed) {
+        return Ok(());
+    }
+    if settings.active_relay_id == CODEX_GATEWAY_RELAY_ID {
+        let previous = binding.restore.codex_previous_relay_id.trim();
+        let exists = |id: &str| {
+            !id.is_empty()
+                && id != CODEX_GATEWAY_RELAY_ID
+                && (settings
+                    .relay_profiles
+                    .iter()
+                    .any(|profile| profile.id == id)
+                    || settings
+                        .aggregate_relay_profiles
+                        .iter()
+                        .any(|profile| profile.id == id))
+        };
+        let target = if exists(previous) {
+            previous.to_string()
+        } else {
+            settings
+                .relay_profiles
+                .iter()
+                .find(|profile| !is_managed(profile))
+                .map(|profile| profile.id.clone())
+                .context("Codex 的直连模式里没有别的供应商可切回：先在 Codex 的供应商页添加一个")?
+        };
+        settings.active_relay_id = target;
+        crate::relay_switch::switch_relay_profile_in_home(
+            &ctx.settings,
+            &ctx.codex_home,
+            settings,
+            CODEX_GATEWAY_RELAY_ID,
+        )
+        .context("把 Codex 切回直连失败")?;
+        settings = ctx.settings.load()?;
+    }
+    // 切换会把请求里缺的供应商从磁盘补回，所以托管供应商要在切走之后单独删。
+    settings
+        .relay_profiles
+        .retain(|profile| !is_managed(profile));
+    ctx.settings.save(&settings)?;
     Ok(())
 }
 
@@ -330,6 +473,22 @@ pub fn note_claude_switched(store: &GatewayStore, target_id: &str) -> anyhow::Re
 pub fn note_grok_switched(store: &GatewayStore) -> anyhow::Result<()> {
     let mut gateway = store.load()?;
     if let Some(binding) = gateway.bindings.get_mut(ToolId::Grok.as_str())
+        && binding.enabled
+    {
+        binding.enabled = false;
+        binding.restore = Default::default();
+        store.save(&gateway)?;
+    }
+    Ok(())
+}
+
+/// 用户在 Codex 的供应商页直接切到别的供应商：网关绑定随之失效。
+pub fn note_codex_switched(store: &GatewayStore, target_id: &str) -> anyhow::Result<()> {
+    if target_id == CODEX_GATEWAY_RELAY_ID {
+        return Ok(());
+    }
+    let mut gateway = store.load()?;
+    if let Some(binding) = gateway.bindings.get_mut(ToolId::Codex.as_str())
         && binding.enabled
     {
         binding.enabled = false;
@@ -378,6 +537,7 @@ pub fn restore_all_for_exit(ctx: &ApplyContext, settings: &BackendSettings) -> a
         match ToolId::parse(agent) {
             ToolId::Claude => restore_claude(ctx, binding)?,
             ToolId::Grok => restore_grok(ctx, settings)?,
+            ToolId::Codex => restore_codex(ctx, binding)?,
             _ => {}
         }
     }
@@ -423,6 +583,12 @@ pub fn reapply_enabled(ctx: &ApplyContext) -> anyhow::Result<usize> {
             let current = claude::current_provider_id(&ctx.claude)?;
             if current != GATEWAY_PROVIDER_ID && !current.is_empty() {
                 binding.restore.claude_previous_provider_id = current;
+            }
+        }
+        if agent == ToolId::Codex {
+            let current = codex_active_relay_id(ctx)?;
+            if !current.is_empty() {
+                binding.restore.codex_previous_relay_id = current;
             }
         }
         if let Some(snapshot) = write_agent_config(ctx, &agent, &binding)?
@@ -647,7 +813,10 @@ pub fn add_provider(
 ) -> anyhow::Result<(GatewaySettings, String)> {
     let mut gateway = store.load()?;
     // 登录得到的账号名里带邮箱，短名用来源（如 `login:chatgpt` → `chatgpt`）更干净。
-    let slug_base = source.strip_prefix("login:").unwrap_or(&relay.name).to_string();
+    let slug_base = source
+        .strip_prefix("login:")
+        .unwrap_or(&relay.name)
+        .to_string();
     relay.id = gateway.unique_slug(&slug_base, false);
     let id = relay.id.clone();
     gateway.providers.push(GatewayProvider {

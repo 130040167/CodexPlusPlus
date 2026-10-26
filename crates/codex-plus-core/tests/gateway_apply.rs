@@ -3,8 +3,8 @@
 use codex_plus_core::gateway::apply::{
     ApplyContext, GroupInput, ProviderInput, codex_importable, copy_claude_provider,
     copy_codex_provider, create_provider, delete_group, delete_provider, disable_binding,
-    enable_binding, note_claude_switched, reapply_if_port_changed, refresh_enabled,
-    reorder_providers, save_group, set_provider_enabled, update_provider,
+    enable_binding, note_claude_switched, note_codex_switched, reapply_if_port_changed,
+    refresh_enabled, reorder_providers, save_group, set_provider_enabled, update_provider,
 };
 use codex_plus_core::gateway::store::{
     AgentBinding, ClaudeRoleModels, GatewayStore, GroupMember, GroupMode,
@@ -30,6 +30,8 @@ fn fixture(port: u16) -> Fixture {
             backup_root: state.join("backups"),
         },
         grok_home: temp.path().join("grok"),
+        codex_home: temp.path().join("codex"),
+        settings: codex_plus_core::settings::SettingsStore::new(state.join("settings.json")),
         backup_root: state.join("backups"),
         port,
     };
@@ -278,6 +280,90 @@ fn grok_enable_writes_gateway_endpoint_and_disable_restores_profile() {
     let config = std::fs::read_to_string(ctx.grok_home.join("config.toml")).unwrap();
     assert!(config.contains("https://api.x.test/v1"), "{config}");
     assert!(!config.contains("/gw/grok"), "{config}");
+}
+
+/// Codex：走直连模式自己的切换流程，托管供应商进出列表，断开时切回原来的供应商。
+#[test]
+fn codex_enable_switches_to_managed_gateway_profile_and_disable_switches_back() {
+    let fixture = fixture(57395);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    let mut direct = codex_plus_core::provider_import::pool_relay_profile(
+        "直连",
+        "https://api.direct.test/v1",
+        "sk-direct",
+        RelayProtocol::Responses,
+        "gpt-direct",
+        "gpt-direct",
+        &[],
+    )
+    .unwrap();
+    direct.id = "direct".into();
+    direct.relay_mode = RelayMode::PureApi;
+    codex_plus_core::relay_config::normalize_relay_profile_for_storage(&mut direct).unwrap();
+    let mut seeded = BackendSettings::default();
+    seeded.relay_profiles_enabled = true;
+    seeded.relay_profiles = vec![direct];
+    seeded.active_relay_id = "direct".into();
+    codex_plus_core::relay_switch::switch_relay_profile_in_home(
+        &ctx.settings,
+        &ctx.codex_home,
+        seeded,
+        "",
+    )
+    .unwrap();
+    let config = || std::fs::read_to_string(ctx.codex_home.join("config.toml")).unwrap();
+    assert!(config().contains("api.direct.test"), "{}", config());
+
+    let gateway = enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let saved = gateway.binding(&ToolId::Codex).unwrap();
+    assert_eq!(saved.restore.codex_previous_relay_id, "direct");
+    let settings = ctx.settings.load().unwrap();
+    assert_eq!(settings.active_relay_id, "codex-plus-gateway");
+    assert!(
+        config().contains("http://127.0.0.1:57395/gw/codex/v1"),
+        "{}",
+        config()
+    );
+    assert!(
+        settings
+            .relay_profiles
+            .iter()
+            .any(|profile| profile.id == "direct"),
+        "原来的供应商还在"
+    );
+
+    // 池变了再写一次：仍在网关上，回填的是托管供应商自己。
+    refresh_enabled(ctx).unwrap();
+    assert_eq!(
+        ctx.settings.load().unwrap().active_relay_id,
+        "codex-plus-gateway"
+    );
+
+    disable_binding(ctx, &settings, &ToolId::Codex).unwrap();
+    let settings = ctx.settings.load().unwrap();
+    assert_eq!(settings.active_relay_id, "direct");
+    assert!(
+        !settings
+            .relay_profiles
+            .iter()
+            .any(|profile| profile.id == "codex-plus-gateway"),
+        "托管供应商已删除"
+    );
+    assert!(config().contains("api.direct.test"), "{}", config());
+    assert!(!config().contains("/gw/codex"), "{}", config());
+
+    // 在 Codex 供应商页直接切走：绑定随之断开。
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    note_codex_switched(&ctx.gateway, "direct").unwrap();
+    assert!(
+        !ctx.gateway
+            .load()
+            .unwrap()
+            .binding(&ToolId::Codex)
+            .unwrap()
+            .enabled
+    );
 }
 
 #[test]

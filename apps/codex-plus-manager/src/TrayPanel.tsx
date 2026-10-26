@@ -16,7 +16,7 @@ import {
   type GatewayPayload,
   type GatewayResult,
 } from "./gateway-model";
-import { AGENT_ICONS, APP_LOGO_URL, Avatar } from "./gateway-ui";
+import { AGENT_ICONS, APP_LOGO_URL, Avatar, agentIcon } from "./gateway-ui";
 import "./GatewayPage.css";
 
 /** 面板与主窗口共用主题设置（主窗口写在 localStorage 里）。 */
@@ -185,7 +185,7 @@ function PanelAgentRow({
       role="option"
       tabIndex={0}
     >
-      <img alt="" className="gw-popover-agent" src={AGENT_ICONS[agent.agent]} />
+      <img alt="" className="gw-popover-agent" src={agentIcon(agent.agent)} />
       <span className="gw-popover-item-label">{t("默认")}</span>
       <span className="gw-via gw-via-off">{t("不经 Codex++")}</span>
       <small>{tf("{0} 自带的默认值", [agent.name])}</small>
@@ -193,11 +193,11 @@ function PanelAgentRow({
   );
   return (
     <div className="tray-agent-row">
-      <img alt="" className="gw-agent-icon" src={AGENT_ICONS[agent.agent]} />
+      <img alt="" className="gw-agent-icon" src={agentIcon(agent.agent)} />
       <strong>{agent.name}</strong>
       <button aria-expanded={open} className="gw-picker-button tray-agent-picker" onClick={() => setOpen(!open)} ref={buttonRef} type="button">
         {!agent.enabled ? (
-          <img alt="" className="gw-picker-agent" src={AGENT_ICONS[agent.agent]} />
+          <img alt="" className="gw-picker-agent" src={agentIcon(agent.agent)} />
         ) : display.group ? (
           <Waypoints className="gw-picker-glyph h-4 w-4" />
         ) : (

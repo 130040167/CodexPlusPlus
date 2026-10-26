@@ -133,6 +133,9 @@ pub struct GatewayRestoreState {
     /// 开启前 Claude Code 正在用的供应商 id（`claude-providers.json` 里）。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub claude_previous_provider_id: String,
+    /// 开启前 Codex 正在用的供应商 id（直连模式 settings.json 里的 `active_relay_id`）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub codex_previous_relay_id: String,
     /// 写进各 Agent 配置时用的网关端口；端口变化后要重写。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_port: Option<u16>,

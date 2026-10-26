@@ -3898,6 +3898,22 @@ export function App() {
     return () => window.removeEventListener("focus", refresh);
   }, []);
 
+  // 网关改了 Codex 的直连设置（接入 / 断开网关）：重新读取，免得用旧设置整份写回。
+  useEffect(() => {
+    let disposed = false;
+    let stopListening: (() => void) | undefined;
+    void listen("codex-plus-settings-changed", () => {
+      if (!disposed) void refreshSettings(true);
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else stopListening = unlisten;
+    });
+    return () => {
+      disposed = true;
+      stopListening?.();
+    };
+  }, []);
+
   useEffect(() => {
     let disposed = false;
     let stopListening: (() => void) | undefined;

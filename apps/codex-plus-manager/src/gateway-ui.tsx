@@ -16,6 +16,11 @@ export const AGENT_ICONS: Record<string, string> = {
   codexApp: new URL("./assets/agents/codex.svg", import.meta.url).href,
 };
 
+/** 网关里 Agent 的图标：Codex 用 Codex 应用的图标（`codex` 键是 Hub 用的 OpenAI 单色图标）。 */
+export function agentIcon(agent: string): string | undefined {
+  return AGENT_ICONS[agent === "codex" ? "codexApp" : agent];
+}
+
 export const APP_LOGO_URL = new URL("./assets/codex-plus-logo.png", import.meta.url).href;
 
 function hueOf(name: string): number {

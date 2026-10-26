@@ -6970,6 +6970,11 @@ pub fn switch_relay_profile(
                     "liveBackupPath": outcome.live_backup_path.as_ref()
                 }),
             );
+            // 在 Codex 供应商页切到别的供应商：网关绑定随之断开。
+            let _ = codex_plus_core::gateway::apply::note_codex_switched(
+                &codex_plus_core::gateway::store::GatewayStore::default(),
+                &result.settings.active_relay_id,
+            );
             // 新配置已经写进 config.toml：需要本地代理时立即让它常驻，
             // 这样不经过 Codex++ 启动的客户端也能直接用。
             sync_resident_helper();

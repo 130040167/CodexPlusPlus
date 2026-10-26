@@ -5,7 +5,7 @@
  */
 import { PRESETS } from "./presets.ts";
 
-export type GatewayAgentId = "claude" | "grok";
+export type GatewayAgentId = "codex" | "claude" | "grok";
 export type UnknownModelPolicy = "mapToDefault" | "passthrough";
 export type KeyRotationMode = "sticky" | "roundRobin";
 export type GroupMode = "inOrder" | "rotate" | "weighted";

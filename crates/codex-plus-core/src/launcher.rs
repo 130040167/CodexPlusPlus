@@ -2689,8 +2689,9 @@ pub(crate) async fn handle_protocol_proxy_connection(
     let mut request_log =
         ProxyRequestLog::begin(method, path, request_json.as_ref(), request_thread_id);
     let live_request_id = request_log.entry.id.clone();
-    // 网关的 Responses 入口只服务非 Codex 客户端（Codex 走旧路径）。
-    let foreign_client = matches!(opener, ProxyOpener::Gateway(_));
+    // 经网关的非 Codex 客户端（Grok 等）不认识 ChatGPT 订阅后端的私有事件。
+    let foreign_client =
+        matches!(&opener, ProxyOpener::Gateway(agent) if *agent != crate::tools::ToolId::Codex);
     let opened = match &opener {
         ProxyOpener::Legacy => {
             crate::protocol_proxy::open_responses_proxy_request_for_path_with_session_headers_and_live_id(

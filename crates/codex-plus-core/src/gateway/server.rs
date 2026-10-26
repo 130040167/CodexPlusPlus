@@ -7,6 +7,7 @@
 //! | `GET /gw/claude/v1/models` | Claude Code | 模型列表（Anthropic 格式） |
 //! | `POST /gw/grok/v1/responses` | Grok | Responses，复用 Codex 代理的输出链路 |
 //! | `GET /gw/grok/v1/models` | Grok | 模型列表（OpenAI 格式） |
+//! | `POST /gw/codex/v1/responses` | Codex | Responses，同上（保留 ChatGPT 订阅后端的私有事件） |
 //!
 //! 身份靠路径，鉴权靠网关签发给该 Agent 的本地 token（`x-api-key` 或 `Authorization: Bearer`）。
 
@@ -39,7 +40,7 @@ pub fn split_gateway_path(path: &str) -> Option<(ToolId, String)> {
     let rest = path.strip_prefix("/gw/")?;
     let (agent, tail) = rest.split_once('/').unwrap_or((rest, ""));
     let agent = ToolId::parse(agent);
-    if matches!(agent, ToolId::Unknown(_) | ToolId::Codex) {
+    if matches!(agent, ToolId::Unknown(_)) {
         return None;
     }
     let tail = format!("/{tail}");
@@ -144,7 +145,7 @@ pub(crate) async fn handle(
             handle_claude_count_tokens(stream, &gateway, headers, body).await
         }
         (_, "GET", "/models") => handle_models(stream, &gateway, &agent).await,
-        (ToolId::Grok, "POST", "/responses") => {
+        (ToolId::Grok | ToolId::Codex, "POST", "/responses") => {
             let request_body = match decode_protocol_proxy_request_body(
                 body,
                 header_value_from_headers(headers, "content-encoding").as_deref(),
@@ -155,14 +156,17 @@ pub(crate) async fn handle(
             let user_agent = header_value_from_headers(headers, "user-agent");
             let session_id = header_value_from_headers(headers, "session-id")
                 .or_else(|| header_value_from_headers(headers, "x-grok-conv-id"));
+            // Codex 带自己的会话头和实验特性头，照旧传给上游。
+            let thread_id = header_value_from_headers(headers, "thread-id");
+            let beta_features = header_value_from_headers(headers, "x-codex-beta-features");
             handle_protocol_proxy_connection(
                 stream,
                 &request_body,
                 user_agent.as_deref(),
-                None,
+                beta_features.as_deref(),
                 ProxySessionHeaders {
                     session_id: session_id.as_deref(),
-                    thread_id: None,
+                    thread_id: thread_id.as_deref(),
                     opencode_session: None,
                 },
                 method,
@@ -813,7 +817,10 @@ mod tests {
             split_gateway_path("/gw/grok/v1/models/"),
             Some((ToolId::Grok, "/models".to_string()))
         );
-        assert_eq!(split_gateway_path("/gw/codex/v1/responses"), None);
+        assert_eq!(
+            split_gateway_path("/gw/codex/v1/responses"),
+            Some((ToolId::Codex, "/responses".to_string()))
+        );
         assert_eq!(split_gateway_path("/gw/other/x"), None);
         assert_eq!(split_gateway_path("/v1/messages"), None);
     }
