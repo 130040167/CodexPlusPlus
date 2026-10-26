@@ -13635,3 +13635,40 @@ button.side-item:hover {
   justify-content: flex-start;
   padding-left: var(--overview-current-indent, 40px);
 }
+
+/* Agent 接入页：行高、字号收到与设置、增强页同一档（原来行高 52～64px、正文 13.5px） */
+.shell .gw-agent-row {
+  gap: 14px;
+  min-height: 52px;
+  padding: 8px 16px;
+}
+.shell .gw-agent-icon {
+  width: 26px;
+  height: 26px;
+}
+.shell .gw-agent-detail {
+  padding: 2px 16px 4px 56px;
+}
+.shell .gw-detail-row {
+  grid-template-columns: 140px minmax(0, 1fr);
+  gap: 12px;
+  min-height: 40px;
+  padding: 6px 0;
+}
+.shell .gw-detail-label {
+  font-size: 12.5px;
+}
+.shell .gw-detail-value {
+  gap: 8px;
+  font-size: 12.5px;
+}
+.shell .gw-select-item {
+  gap: 8px;
+  min-height: 32px;
+  padding: 3px 8px;
+  font-size: 12.5px;
+}
+.shell .gw-select-item em {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+}

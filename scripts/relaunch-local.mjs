@@ -4,7 +4,7 @@
 // 固定使用 dist/local-build/Codex++.app：
 //   - 只替换 Contents/MacOS/CodexPlusPlus，保留 bundle 的 Info.plist / LSEnvironment / state，
 //     这样每次构建都复用同一个应用身份和测试配置，不会在 Finder / Launchpad 里多出一个 Codex++。
-//   - 图标源（src-tauri/icons/icon-macos.png）比 bundle 里的 .icns 新时，按打包脚本同样的方式重新生成 .icns，
+//   - 图标源（src-tauri/icons/icon-macos.png）变了（按内容指纹判断），按打包脚本同样的方式重新生成 .icns，
 //     否则换了 logo 之后 Dock 里还是旧图标。只换这一个文件，不动 Info.plist 与 bundle 身份。
 //   - 旧的历史构建交给 scripts/prune-local-builds.mjs 移入废纸篓。
 //
@@ -13,7 +13,8 @@
 //   node scripts/relaunch-local.mjs --skip-build    # 跳过构建，用现有 target/release 二进制重装并重启
 //   node scripts/relaunch-local.mjs --no-open       # 不自动启动（只替换 bundle）
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, renameSync, rmSync, statSync, utimesSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -27,7 +28,11 @@ const stagingDir = path.join(distDir, ".local-build-staging");
 const stagingBundle = path.join(stagingDir, "Codex++.app");
 const pruneScript = path.join(root, "scripts", "prune-local-builds.mjs");
 
-/** 图标源比 bundle 里的 .icns 新时重新生成（尺寸与 scripts/installer/macos/package-dmg.sh 一致）。返回是否更新了。 */
+/**
+ * 图标源内容变了就重新生成 .icns（尺寸与 scripts/installer/macos/package-dmg.sh 一致）。返回是否更新了。
+ * 不能比较修改时间：每次构建都会整体复制 bundle，复制出来的 .icns 时间总是比图标源新。
+ * 所以在 Resources 里记一份图标源的 sha256，内容不同才重新生成。
+ */
 function refreshBundleIcon(target) {
   const source = path.join(root, "apps", "codex-plus-manager", "src-tauri", "icons", "icon-macos.png");
   if (!existsSync(source)) return false;
@@ -39,7 +44,9 @@ function refreshBundleIcon(target) {
   }
   if (!iconName.endsWith(".icns")) iconName += ".icns";
   const icns = path.join(target, "Contents", "Resources", iconName);
-  if (existsSync(icns) && statSync(icns).mtimeMs >= statSync(source).mtimeMs) return false;
+  const marker = path.join(target, "Contents", "Resources", ".icon-source.sha256");
+  const digest = createHash("sha256").update(readFileSync(source)).digest("hex");
+  if (existsSync(icns) && existsSync(marker) && readFileSync(marker, "utf8").trim() === digest) return false;
   const iconset = path.join(stagingDir, "codex-plus-plus.iconset");
   mkdirSync(iconset, { recursive: true });
   for (const [name, size] of [
@@ -51,6 +58,7 @@ function refreshBundleIcon(target) {
   }
   mkdirSync(path.dirname(icns), { recursive: true });
   execFileSync("iconutil", ["-c", "icns", iconset, "-o", icns], { stdio: "inherit" });
+  writeFileSync(marker, `${digest}\n`);
   console.log(`已更新应用图标：${path.relative(root, icns)}`);
   return true;
 }

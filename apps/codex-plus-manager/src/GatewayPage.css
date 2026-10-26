@@ -1485,7 +1485,7 @@
   background: var(--gw-soft);
 }
 
-.gw-select-item span {
+.gw-select-item > span:not(.gw-avatar) {
   flex: 1;
 }
 
@@ -2464,4 +2464,10 @@ body:has(.tray-panel) {
   font-size: 28px;
   font-weight: 600;
   letter-spacing: 0.12em;
+}
+
+/* 头像（供应商图标）本身也是 span：各种「xxx span { flex: 1 }」的列表规则会把它拉成横条（导入弹窗、挑选弹层都出过）。
+   这里用更高的权重钉死它的尺寸，任何列表里都不参与伸缩。 */
+span.gw-avatar[data-size] {
+  flex: none;
 }

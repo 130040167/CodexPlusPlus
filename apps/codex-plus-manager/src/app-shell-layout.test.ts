@@ -304,3 +304,9 @@ test("Computer Use 的页签与会话页等同一种下划线页签（tp-tabs）
   const css = readFileSync(new URL("./ComputerUsePage.css", import.meta.url), "utf8");
   assert.doesNotMatch(css, /\.mg-tabs\.cu-tabs/);
 });
+
+test("供应商头像在任何列表里都不参与伸缩：挑选弹层、导入弹窗都出过被拉成横条的问题", () => {
+  const css = readFileSync(new URL("./GatewayPage.css", import.meta.url), "utf8");
+  assert.match(css, /span\.gw-avatar\[data-size\] \{\s*flex: none;/);
+  assert.doesNotMatch(css, /\.gw-select-item span \{/);
+});
