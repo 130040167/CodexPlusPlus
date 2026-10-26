@@ -306,6 +306,8 @@ export const EN_PLAIN: Record<string, string> = {
   "长上下文会话超过上限会报 413；调大会增加本地服务的内存占用。": "Long sessions over the limit fail with 413; a higher limit uses more memory in the local service.",
   "在本地服务内消化上游过载与限流，尽量不把错误交给 Agent。作用于经过网关和旧版本地协议代理的请求。": "Absorb upstream overloads and rate limits in the local service instead of handing errors to the agent. Applies to requests through the gateway and the legacy protocol proxy.",
   "加状态码，回车": "Add a status, Enter",
+  "赞助商": "Sponsors",
+  "支持 Codex++ 的服务商": "Services that support Codex++",
   "保存价格与代理": "Save price & proxy",
   "未填写，不估算费用": "Not set, no cost estimate",
   "沿用系统代理": "System proxy",

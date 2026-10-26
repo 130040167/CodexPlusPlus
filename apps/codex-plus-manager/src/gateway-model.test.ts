@@ -345,3 +345,14 @@ test("供应商的价格与代理在供应商池详情里编辑，添加 / 编�
   assert.match(extras, /t\("按公开价格填写"\)/);
   assert.match(extras, /placeholder="http:\/\/127\.0\.0\.1:7890"/);
 });
+
+test("赞助商单独一组放在「添加供应商」最前面，不再混在中转里", () => {
+  const presets = gatewayPresets();
+  const sponsors = presets.filter((preset) => preset.section === "sponsor").map((preset) => preset.key);
+  assert.deepEqual(sponsors, ["jojocode-max", "runapi", "apikeyfun", "pateway", "therouter", "shengsuanyun", "ccsub"]);
+  assert.equal(presets[0].section, "sponsor");
+  const relays = presets.filter((preset) => preset.section === "relay").map((preset) => preset.key);
+  assert.ok(relays.includes("openrouter") && relays.includes("siliconflow") && relays.includes("opencode-go"));
+  const catalog = readFileSync(new URL("./GatewayProviders.tsx", import.meta.url), "utf8");
+  assert.ok(catalog.indexOf('key: "sponsor"') < catalog.indexOf('key: "subscription"'));
+});

@@ -538,7 +538,7 @@ export function routeMembers(payload: GatewayPayload | null, records: RouteRecor
 /* —————————————— 内置厂商预设 —————————————— */
 
 export type GatewayProtocol = GatewayPoolEntry["protocol"];
-export type PresetSection = "vendor" | "relay" | "local";
+export type PresetSection = "sponsor" | "vendor" | "relay" | "local";
 
 export type GatewayPreset = {
   key: string;
@@ -620,6 +620,9 @@ const GATEWAY_EXTRA_PRESETS: GatewayPreset[] = [
 ];
 
 /** 「添加供应商」里的全部预设：厂商（官方 / 国内官方）、中转、本机。 */
+/** 赞助商：「添加供应商」目录里单独一组，放在最前面。 */
+export const SPONSOR_PRESET_IDS = ["jojocode-max", "runapi", "apikeyfun", "pateway", "therouter", "shengsuanyun", "ccsub"];
+
 export function gatewayPresets(): GatewayPreset[] {
   const shared = PRESETS.map((preset): GatewayPreset => ({
     key: preset.id,
@@ -628,12 +631,16 @@ export function gatewayPresets(): GatewayPreset[] {
     protocol: preset.protocol,
     model: preset.model,
     modelList: preset.modelList ?? (preset.model ? [preset.model] : []),
-    section: preset.category === "official" || preset.category === "cn_official" ? "vendor" : "relay",
+    section: SPONSOR_PRESET_IDS.includes(preset.id)
+      ? "sponsor"
+      : preset.category === "official" || preset.category === "cn_official" ? "vendor" : "relay",
     apiKeyUrl: preset.apiKeyUrl,
   }));
   const vendors = [...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "vendor"), ...shared.filter((preset) => preset.section === "vendor")];
   const relays = [...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "relay"), ...shared.filter((preset) => preset.section === "relay")];
-  return [...vendors, ...relays, ...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "local")];
+  // 赞助商按名单顺序排。
+  const sponsors = SPONSOR_PRESET_IDS.flatMap((id) => shared.filter((preset) => preset.key === id));
+  return [...sponsors, ...vendors, ...relays, ...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "local")];
 }
 
 function normalizeUrl(url: string): string {
