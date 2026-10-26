@@ -75,6 +75,8 @@ pub struct GatewayPayload {
     pub codex_providers: Vec<GatewayPoolEntry>,
     pub claude_providers: Vec<GatewaySourceEntry>,
     pub grok_profiles: Vec<GatewaySourceEntry>,
+    /// OpenCode 自己保存的 OpenCode Go / Zen Key（不含 Key 本身）。
+    pub opencode_keys: Vec<GatewaySourceEntry>,
 }
 
 const GATEWAY_AGENTS: &[ToolId] = &[ToolId::Claude, ToolId::Grok];
@@ -210,6 +212,13 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
         codex_providers,
         claude_providers,
         grok_profiles,
+        opencode_keys: codex_plus_core::gateway::opencode::load_stored_keys()
+            .into_iter()
+            .map(|(key, _)| GatewaySourceEntry {
+                id: key.id,
+                name: key.name,
+            })
+            .collect(),
     }
 }
 
@@ -448,6 +457,44 @@ pub fn import_gateway_provider(
         "导入失败",
         refresh_agents(result),
     )
+}
+
+/// 把 OpenCode 里保存的 OpenCode Go / Zen Key 加进网关池，模型取目录里网关能用的。
+#[tauri::command]
+pub async fn import_gateway_opencode_key(id: String) -> CommandResult<Option<GatewayPayload>> {
+    use codex_plus_core::gateway::opencode;
+    let result = async {
+        let (entry, key) = opencode::load_stored_keys()
+            .into_iter()
+            .find(|(entry, _)| entry.id == id)
+            .ok_or_else(|| anyhow::anyhow!("OpenCode 里没有 {id} 的 Key"))?;
+        let base_url = opencode::base_url_of(&entry.id)
+            .ok_or_else(|| anyhow::anyhow!("不认识的 OpenCode 网关：{id}"))?;
+        let models = match opencode::plan_of(base_url) {
+            Some(plan) => opencode::catalog_models(plan).await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let input = ProviderInput {
+            name: entry.name.clone(),
+            base_url: base_url.to_string(),
+            protocol: codex_plus_core::settings::RelayProtocol::ChatCompletions,
+            keys: vec![key],
+            model: models.first().cloned().unwrap_or_default(),
+            model_list: models.join("\n"),
+            price: None,
+        };
+        apply::create_provider(&GatewayStore::default(), &input, &format!("opencode:{id}"))?;
+        Ok(if models.is_empty() {
+            format!("已添加「{}」。没读到模型目录，请在供应商里获取模型。", entry.name)
+        } else {
+            format!("已添加「{}」，{} 个模型。", entry.name, models.len())
+        })
+    }
+    .await;
+    match refresh_agents(result) {
+        Ok(message) => ok(&message, current_payload()),
+        Err(error) => failed(&format!("导入失败：{error:#}"), current_payload()),
+    }
 }
 
 /// 新建或编辑网关路由组。

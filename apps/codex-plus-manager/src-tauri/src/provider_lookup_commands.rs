@@ -24,6 +24,17 @@ pub async fn fetch_provider_models(
     api_key: String,
     provider_id: Option<String>,
 ) -> CommandResult<ProviderModels> {
+    // OpenCode Go / Zen 的 /models 会列出 Gemini 和只给 OpenCode 自己用的免费模型：改用目录里网关能用的。
+    if let Some(plan) = codex_plus_core::gateway::opencode::plan_of(&base_url) {
+        if let Ok(models) = codex_plus_core::gateway::opencode::catalog_models(plan).await
+            && !models.is_empty()
+        {
+            return ok(
+                &format!("从 models.dev 目录获取到 {} 个可用模型（不含 Gemini 与免费模型）。", models.len()),
+                ProviderModels { models, endpoint: codex_plus_core::model_pricing::PRICE_CATALOG_URL.to_string() },
+            );
+        }
+    }
     let result = async {
         let key = api_key.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default().to_string();
         let mut relay = match (&provider_id, key.is_empty()) {

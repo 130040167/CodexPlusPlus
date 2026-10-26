@@ -134,6 +134,8 @@ export type GatewayPayload = {
   codexProviders: GatewayPoolEntry[];
   claudeProviders: Array<{ id: string; name: string }>;
   grokProfiles: Array<{ id: string; name: string }>;
+  /** OpenCode 里保存的 OpenCode Go / Zen Key。 */
+  opencodeKeys?: Array<{ id: string; name: string }>;
 };
 
 export type GatewayResult = { status: string; message: string } & Partial<GatewayPayload>;
@@ -567,6 +569,28 @@ const GATEWAY_EXTRA_PRESETS: GatewayPreset[] = [
     section: "vendor",
     apiKeyUrl: "https://console.x.ai",
   },
+  // OpenCode 的模型网关：Go 是按月订阅的开源编码模型，Zen 按量计费。每个模型只在一种协议上提供，
+  // 网关按 models.dev 目录逐个模型选协议，这里的协议只是占位。
+  {
+    key: "opencode-go",
+    name: "OpenCode Go",
+    baseUrl: "https://opencode.ai/zen/go/v1",
+    protocol: "chatCompletions",
+    model: "",
+    modelList: [],
+    section: "relay",
+    apiKeyUrl: "https://opencode.ai/auth",
+  },
+  {
+    key: "opencode-zen",
+    name: "OpenCode Zen",
+    baseUrl: "https://opencode.ai/zen/v1",
+    protocol: "chatCompletions",
+    model: "",
+    modelList: [],
+    section: "relay",
+    apiKeyUrl: "https://opencode.ai/auth",
+  },
   {
     key: "ollama",
     name: "Ollama",
@@ -602,7 +626,8 @@ export function gatewayPresets(): GatewayPreset[] {
     apiKeyUrl: preset.apiKeyUrl,
   }));
   const vendors = [...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "vendor"), ...shared.filter((preset) => preset.section === "vendor")];
-  return [...vendors, ...shared.filter((preset) => preset.section === "relay"), ...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "local")];
+  const relays = [...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "relay"), ...shared.filter((preset) => preset.section === "relay")];
+  return [...vendors, ...relays, ...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "local")];
 }
 
 function normalizeUrl(url: string): string {

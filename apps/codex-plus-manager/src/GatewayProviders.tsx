@@ -381,7 +381,7 @@ function ProviderCatalog({
   );
 }
 
-/** 导入：把直连模式里 Codex、Claude Code、Grok 的供应商复制一份进网关，之后两边互不影响。 */
+/** 导入：把直连模式里 Codex、Claude Code、Grok 的供应商复制一份进网关（之后两边互不影响），或用 OpenCode 里保存的 Key。 */
 function ImportDialog({ payload, busy, run, onClose }: { payload: GatewayPayload | null; busy: string | null; run: Run; onClose: () => void }) {
   useEffect(() => {
     const escape = (event: KeyboardEvent) => {
@@ -392,7 +392,10 @@ function ImportDialog({ payload, busy, run, onClose }: { payload: GatewayPayload
   }, [onClose]);
   const imported = (source: string, id: string) => Boolean(payload?.pool.some((entry) => entry.source === `${source}:${id}`));
   const finish = async (source: string, id: string) => {
-    if (await run(`import:${source}:${id}`, "import_gateway_provider", { source, id }, t("导入供应商"))) onClose();
+    const done = source === "opencode"
+      ? await run(`import:${source}:${id}`, "import_gateway_opencode_key", { id }, t("导入供应商"))
+      : await run(`import:${source}:${id}`, "import_gateway_provider", { source, id }, t("导入供应商"));
+    if (done) onClose();
   };
   const groups: Array<{ key: string; title: string; items: Array<{ id: string; name: string; sub: string }> }> = [
     {
@@ -410,12 +413,17 @@ function ImportDialog({ payload, busy, run, onClose }: { payload: GatewayPayload
       title: t("Grok 的供应商"),
       items: (payload?.grokProfiles ?? []).map((item) => ({ id: item.id, name: item.name, sub: t("Grok 页里配置的供应商") })),
     },
+    {
+      key: "opencode",
+      title: t("OpenCode 里保存的 Key"),
+      items: (payload?.opencodeKeys ?? []).map((item) => ({ id: item.id, name: item.name, sub: t("opencode auth login 保存的 Key，按模型自动选协议") })),
+    },
   ];
   return createPortal(
     <div className="gw-modal-backdrop gw-portal" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <div className="gw-modal gw-import-modal">
         <header>
-          <strong>{t("从直连模式导入")}</strong>
+          <strong>{t("导入供应商")}</strong>
           <button aria-label={t("关闭")} className="gw-icon-button" onClick={onClose} type="button"><X className="h-4 w-4" /></button>
         </header>
         <div className="gw-modal-body">

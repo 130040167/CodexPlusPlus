@@ -104,6 +104,7 @@ async fn open_candidates(
         model: plan.source_model.clone(),
         ..RequestTrace::default()
     };
+    let conversation_seed = conversation_seed(&request);
     if plan.candidates.is_empty() {
         if let Some(wait) = plan.cooling {
             recorder.cooling(wait.as_millis() as u64);
@@ -139,6 +140,19 @@ async fn open_candidates(
                 continue;
             }
         };
+        // OpenCode Go / Zen：按模型换成它所在的协议和地址，带上会话头。
+        let mut prepared = prepared;
+        if let Err(reason) = crate::gateway::opencode::prepare(
+            &mut prepared.relay,
+            &prepared.upstream_model,
+            conversation_seed.as_deref(),
+        ) {
+            let error = anyhow::anyhow!(reason);
+            recorder.step(candidate, "transport", Some("unsupported_model"), None);
+            log_attempt_failure(candidate, None, Some(&error), has_more);
+            last_error = Some(error);
+            continue;
+        }
         let candidate = &prepared;
         let busy = recorder.begin(candidate);
         let native = request
@@ -336,6 +350,42 @@ async fn attempt_pipeline(
         upstream: GatewayUpstream::Pipeline(response),
         class,
     })
+}
+
+/// 标识同一个对话的种子：客户端带的会话头，或请求里的缓存键，或按对话开头算的键。
+fn conversation_seed(request: &GatewayRequest<'_>) -> Option<String> {
+    let headers = &request.session_headers;
+    if let Some(seed) = [
+        headers.opencode_session,
+        headers.session_id,
+        headers.thread_id,
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|seed| !seed.is_empty())
+    {
+        return Some(seed.to_string());
+    }
+    let body = &request.responses_body;
+    if let Some(key) = body
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty())
+    {
+        return Some(key.to_string());
+    }
+    let input = body
+        .get("input")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    crate::gateway::chatgpt_backend::conversation_key(
+        body.get("instructions")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        input,
+    )
 }
 
 /// 这些错误是请求内容本身不被支持（附件、加密内容、原生搜索、缺视觉配置），换上游也一样。

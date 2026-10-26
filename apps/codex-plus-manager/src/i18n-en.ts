@@ -229,6 +229,8 @@ export const EN_PLAIN: Record<string, string> = {
   "供应商池是空的，先到「供应商」里添加。": "The provider pool is empty. Add one under Providers first.",
   "Claude Code 供应商": "Claude Code provider",
   "Grok 页里配置的供应商": "Providers configured on the Grok page",
+  "OpenCode 里保存的 Key": "Keys saved in OpenCode",
+  "opencode auth login 保存的 Key，按模型自动选协议": "Saved by opencode auth login; the protocol is picked per model",
   "查找供应商…": "Find a provider…",
   "已在供应商池里": "Already in the pool",
   "没有匹配的供应商": "No matching providers",

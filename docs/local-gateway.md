@@ -94,6 +94,11 @@ Agent 打开「接入」后，池里所有打开的供应商的模型和所有�
 - 账号类凭据都带 `codex_plus_account` / `codex_plus_gateway` 标记，与各 Agent 自己的登录互不影响。
 - 没有接入：Claude 订阅（Anthropic 条款只允许官方客户端使用订阅凭据）、Gemini CLI（Google 已于 2026-06-18 停止个人账号的
   Code Assist，且其说明写明第三方使用违反政策）、Antigravity（客户端密钥未公开，只能从客户端里提取）。
+- **OpenCode Go / Zen**（预设，用 OpenCode 控制台的 Key；也可在「导入…」里用 `opencode auth login` 保存在
+  `~/.local/share/opencode/auth.json` 的 Key）：同一个网关里每个模型只在一种协议上提供，网关按 models.dev 目录（与价格表
+  共用的缓存）逐个模型切换协议和地址——GPT / Grok / Muse 走 Responses，Claude、MiniMax、部分 Qwen 走 Anthropic，
+  其余走 Chat；目录里没有的按模型名推断。每个请求带 `x-opencode-session`（按对话保持不变，缺了上游回 400）。
+  Gemini 模型只走 Google 接口、免费模型只对 OpenCode 自己开放，都不列出。
 - 其它订阅（Cursor、Kiro、Devin、Qoder、Zed、WorkBuddy、ZCode、Factory 等）需要模拟各家客户端调用私有接口，
   暂不内置。
 - 除 ChatGPT API 外，以上登录都是冒用官方客户端身份调用未公开的接口，可能随时失效，也有账号被限制的风险。
