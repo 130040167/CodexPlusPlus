@@ -195,3 +195,12 @@ test("设置类页面共用左侧分类目录：增强、设置、微信连接�
   assert.match(toggle, /EXPERIMENTAL_TITLE\.test\(title\)/);
   assert.match(toggle, /RESTART_HINT\.test\(detail\)/);
 });
+
+test("插件市场紧凑布局的规则带 .shell 前缀：正式版 styles.css 后加载，同权重的 .panel { padding: 0 } 会清掉卡片内边距", () => {
+  const css = readFileSync(new URL("./PluginMarketScreen.css", import.meta.url), "utf8");
+  const block = css.slice(css.lastIndexOf("/*", css.indexOf("紧凑布局"))).replace(/\/\*[\s\S]*?\*\//g, "");
+  const selectors = [...block.matchAll(/(?:^|\})\s*([^{}]+?)\s*\{/g)].map((match) => match[1].trim()).filter(Boolean);
+  assert.ok(selectors.length > 10);
+  for (const group of selectors) for (const selector of group.split(",")) assert.match(selector.trim(), /^\.shell /, selector);
+  assert.match(block, /\.shell \.plugin-market-card \{[^}]*padding:\s*14px 16px/);
+});

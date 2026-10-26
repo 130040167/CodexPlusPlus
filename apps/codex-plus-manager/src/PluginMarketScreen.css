@@ -289,40 +289,41 @@
   .plugin-market-search { order: 1; flex-basis: 100%; }
 }
 
-/* ── 紧凑布局：工具栏不套卡片，卡片高度随内容、说明两行、底部一行操作 ── */
-.plugin-market-toolbar {
+/* ── 紧凑布局：工具栏不套卡片，卡片高度随内容、说明两行、底部一行操作 ──
+   选择器都带 .shell：正式版里 styles.css 在组件样式之后加载，同权重的 .panel { padding: 0 } 会把卡片内边距清零。 */
+.shell .plugin-market-toolbar {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px 14px;
 }
-.plugin-market-toolbar .plugin-market-controls {
+.shell .plugin-market-toolbar .plugin-market-controls {
   flex: 1 1 560px;
 }
-.plugin-market-toolbar .plugin-market-summary {
+.shell .plugin-market-toolbar .plugin-market-summary {
   margin: 0;
 }
-.plugin-market-grid {
+.shell .plugin-market-grid {
   grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
-  gap: 12px;
+  gap: 14px;
 }
-.plugin-market-card {
+.shell .plugin-market-card {
   height: auto;
-  gap: 8px;
-  padding: 12px 14px;
+  gap: 10px;
+  padding: 14px 16px;
 }
-.plugin-market-card > :first-child,
-.plugin-market-card > :last-child {
+.shell .plugin-market-card > :first-child,
+.shell .plugin-market-card > :last-child {
   padding: 0;
 }
-.plugin-market-card > .plugin-market-card-heading {
+.shell .plugin-market-card > .plugin-market-card-heading {
   display: flex;
   align-items: center;
   gap: 8px;
   margin: 0;
   min-width: 0;
 }
-.plugin-market-card-heading h3 {
+.shell .plugin-market-card-heading h3 {
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -332,33 +333,33 @@
   white-space: nowrap;
   -webkit-line-clamp: 1;
 }
-.plugin-market-card .plugin-market-package {
+.shell .plugin-market-card .plugin-market-package {
   width: 16px;
   height: 16px;
 }
-.plugin-market-card .plugin-market-status {
+.shell .plugin-market-card .plugin-market-status {
   display: flex;
   flex: none;
   gap: 4px;
   margin: 0;
 }
-.plugin-market-card .plugin-market-description {
+.shell .plugin-market-card .plugin-market-description {
   min-height: calc(2 * 1.55em);
   font-size: 12px;
   -webkit-line-clamp: 2;
 }
-.plugin-market-card > .plugin-market-card-foot {
+.shell .plugin-market-card > .plugin-market-card-foot {
   flex: none;
   flex-direction: row;
   justify-content: flex-start;
 }
-.plugin-market-card-foot {
+.shell .plugin-market-card-foot {
   display: flex;
   align-items: center;
   gap: 8px;
   margin-top: auto;
 }
-.plugin-market-card-foot .plugin-market-metadata {
+.shell .plugin-market-card-foot .plugin-market-metadata {
   display: flex;
   flex: 1;
   flex-wrap: nowrap;
@@ -372,7 +373,7 @@
   font-family: var(--font-mono, monospace);
   font-size: 11px;
 }
-.plugin-market-card-foot .plugin-market-card-actions {
+.shell .plugin-market-card-foot .plugin-market-card-actions {
   display: flex;
   justify-content: flex-end;
   gap: 4px;
