@@ -323,6 +323,21 @@ const demoSkills = {
   agentSkillsDirs: { codex: "~/.codex/skills", claude: "~/.claude/skills", grok: "~/.grok/skills" },
 };
 
+// 插件市场演示数据：几条长短不一的说明，看卡片排版。
+const demoMarketPlugin = (id: string, description: string, extra: Record<string, unknown> = {}) =>
+  ({ id, name: id, displayName: id, description, version: "1.0.0", author: "demo", tags: [], license: "MIT", path: "", tree: "", bytes: 64_000, skills: 1, requiresAuth: false, installed: false, updateAvailable: false, ...extra });
+const demoPluginMarket = {
+  status: "ok", message: "", source: "public", repository: "demo/plugins", total: 6, cached: true,
+  plugins: [
+    demoMarketPlugin("01 Superdesign", "Superdesign adds a design skill to ChatGPT for web UI, presentations, and graphics.", { version: "0.6.0", bytes: 230_900 }),
+    demoMarketPlugin("12ui Design", "Create distinctive interfaces with 12ui design skills and hosted design APIs.", { version: "0.2.65", bytes: 108_400 }),
+    demoMarketPlugin("1Password", "Use the local 1Password MCP server to manage 1Password Developer Environments and local .env mounts from Codex.", { version: "0.2.0", bytes: 42_500, installed: true }),
+    demoMarketPlugin("6X6", "Essential answers first, with focused detail on request.", { version: "1.0.2", bytes: 64_700 }),
+    demoMarketPlugin("Accurate Translation", "Translate text and files locally without metered translation API tokens.", { requiresAuth: true }),
+    demoMarketPlugin("Actively", "Win more deals with Actively by directly accessing your always-on personal sales assistant."),
+  ],
+};
+
 const demoAgentMcp: Record<string, unknown> = {
   claude: { agent: "claude", configPath: "~/.claude.json", exists: true, entries: [
     { id: "context7", enabled: true, tomlBody: "command = \"npx\"\nargs = [\"-y\", \"@upstash/context7-mcp\"]\n" },
@@ -348,6 +363,7 @@ export async function invoke<T = unknown>(command: string, args: Record<string, 
     case "lookup_model_prices": return ok({ source: "models.dev", fetchedAtMs: Date.now(), prices: ((args.models as string[]) ?? []).map((model) => ({ model, price: { providerId: "anthropic", providerName: "Anthropic", modelId: model, currency: "USD", input: 3, cachedInput: 0.3, output: 15, context: 200000 } })) }) as T;
     case "list_installed_skills":
     case "refresh_skill_catalog": return demoSkills as T;
+    case "refresh_plugin_market": return demoPluginMarket as T;
     case "load_agent_mcp":
     case "save_agent_mcp": return ok({ config: demoAgentMcp[String(args.agent)] }) as T;
     case "load_gateway_usage": return gatewayUsage as T;
