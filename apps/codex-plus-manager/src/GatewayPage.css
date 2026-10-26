@@ -1763,3 +1763,79 @@ span.gw-popover-check {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+/* 路由组列表右侧的编辑 / 删除 */
+.gw-row-buttons {
+  display: inline-flex;
+  gap: 14px;
+}
+
+.gw-group-row {
+  grid-template-columns: 76px minmax(0, 1fr) auto auto;
+}
+
+/* 路由组编辑弹窗 */
+.gw-group-modal {
+  width: min(600px, 100%);
+}
+
+.gw-mode-tabs {
+  width: max-content;
+}
+
+.gw-member-list {
+  display: grid;
+  gap: 6px;
+}
+
+.gw-member-edit {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 4px 6px 4px 10px;
+  border: 1px solid var(--gw-line);
+  border-radius: 10px;
+}
+
+.gw-member-edit-name {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+}
+
+.gw-member-edit-name strong,
+.gw-member-edit-name small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gw-member-edit-name strong {
+  font-size: 13.5px;
+  font-weight: 500;
+}
+
+.gw-member-edit-name small {
+  color: var(--gw-mute);
+  font-size: 12px;
+}
+
+.gw-member-edit .gw-icon-button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.gw-weight-input {
+  width: 64px;
+}
+
+/* Key 输入框：多行但不明文显示 */
+.gw-secret {
+  -webkit-text-security: disc;
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+
+.gw-import-note {
+  margin: 0 0 4px;
+}

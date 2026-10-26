@@ -7,12 +7,12 @@ import { t, tf } from "./i18n";
 import {
   agentModels,
   agentPoolProviders,
-  bindingDisplay,
   bindingFromDraft,
   draftFromBinding,
-  groupSlug,
+  modelDisplay,
   parseContextWindow,
   pickerSections,
+  providerEnabled,
   validateDraft,
   type BindingDraft,
   type GatewayAgentId,
@@ -114,21 +114,20 @@ function AgentRow({
   // 在选择器里选模型：已接入时直接改默认模型，未接入时选完即接入。
   const pick = (item: PickerItem) => {
     setPickerOpen(false);
-    void save({ ...draft, target: item.target, model: item.model });
+    void save({ ...draft, model: item.model });
   };
   const toggle = () => {
     if (connected) {
       void disconnect();
       return;
     }
-    const next = draft.target ? draft : { ...draft, target: "pool" };
-    const error = validateDraft(next, payload);
+    const error = validateDraft(draft, payload);
     if (error) {
       setPickerOpen(true);
       void notify(t("还不能接入"), t(error), "warning");
       return;
     }
-    void save(next);
+    void save(draft);
   };
 
   const running = Boolean(payload?.helperRunning);
@@ -223,7 +222,7 @@ function AgentDetail({
   const [windowText, setWindowText] = useState(draft.contextWindow);
   const selectRef = useRef<HTMLButtonElement>(null);
   useEffect(() => setWindowText(draft.contextWindow), [draft.contextWindow]);
-  const providers = (payload?.pool ?? []).filter((entry) => !(payload?.gateway.poolDisabled ?? []).includes(entry.id));
+  const providers = (payload?.pool ?? []).filter(providerEnabled);
   const used = agentPoolProviders(payload, draft.poolExclude);
   const groups = (payload?.groups ?? []).filter((group) => group.members.length);
   const tiers: Array<[keyof BindingDraft, string]> = [
@@ -356,7 +355,7 @@ function AgentDetail({
 }
 
 /** 挂到 body 的浮层：跟随锚点定位，下方放不下时翻到上方；点外面或按 Esc 关闭。 */
-function Floating({
+export function Floating({
   anchorRef,
   open,
   onClose,
@@ -422,19 +421,19 @@ function Floating({
 }
 
 /** 模型列表：左侧全部 / 收藏 / 按供应商跳转，右侧分组列出模型；顶部是「默认（不经 Codex++）」与「断开」。 */
-function ModelList({
+export function ModelList({
   payload,
   exclude,
   selectedModel,
-  selectedTarget,
   head,
+  skipGroup,
   onPick,
 }: {
   payload: GatewayPayload | null;
   exclude: string[];
   selectedModel: string;
-  selectedTarget: string;
   head?: ReactNode;
+  skipGroup?: string;
   onPick: (item: PickerItem) => void;
 }) {
   const [query, setQuery] = useState("");
@@ -442,12 +441,12 @@ function ModelList({
   const [favorites, setFavorites] = useState<string[]>(loadFavorites);
   const listRef = useRef<HTMLDivElement>(null);
   const sections = useMemo(() => {
-    const all = pickerSections(payload, query, avatarOf, exclude);
+    const all = pickerSections(payload, query, avatarOf, exclude, skipGroup);
     if (!favoritesOnly) return all;
     return all
       .map((section) => ({ ...section, items: section.items.filter((item) => favorites.includes(item.model)) }))
       .filter((section) => section.items.length);
-  }, [payload, query, exclude, favoritesOnly, favorites]);
+  }, [payload, query, exclude, favoritesOnly, favorites, skipGroup]);
   const toggleFavorite = (model: string) => {
     const next = favorites.includes(model) ? favorites.filter((item) => item !== model) : [...favorites, model];
     setFavorites(next);
@@ -460,7 +459,7 @@ function ModelList({
       if (node && listRef.current) listRef.current.scrollTop = node.offsetTop - 6;
     });
   };
-  const isSelected = (item: PickerItem) => item.target === selectedTarget && item.model.toLowerCase() === selectedModel.toLowerCase();
+  const isSelected = (item: PickerItem) => Boolean(selectedModel) && item.model.toLowerCase() === selectedModel.toLowerCase();
 
   return (
     <>
@@ -477,7 +476,7 @@ function ModelList({
             <Star className="h-4 w-4" />
           </button>
           <span className="gw-rail-divider" />
-          {pickerSections(payload, "", avatarOf, exclude).filter((section) => section.key !== "custom").map((section) => (
+          {pickerSections(payload, "", avatarOf, exclude, skipGroup).filter((section) => section.key !== "custom").map((section) => (
             <button aria-label={section.title} key={section.key} onClick={() => jump(section.key)} title={section.key === "group" ? t("路由组") : section.title} type="button">
               {section.key === "group" ? <Waypoints className="h-4 w-4" /> : <Avatar name={section.title} size="sm" />}
             </button>
@@ -501,7 +500,7 @@ function ModelList({
                     aria-selected={selected}
                     className="gw-popover-item"
                     data-selected={selected}
-                    key={`${item.target}|${item.model}`}
+                    key={item.model}
                     onClick={() => onPick(item)}
                     onKeyDown={(event) => { if (event.key === "Enter") onPick(item); }}
                     role="option"
@@ -553,9 +552,9 @@ function ModelPicker({
   onDisconnect: () => void;
 }) {
   const buttonRef = useRef<HTMLButtonElement>(null);
-  const display = bindingDisplay(payload, draft.target || "pool", draft.model, draft.poolExclude);
+  const display = modelDisplay(payload, draft.model, draft.poolExclude);
   const showDefault = !connected && !draft.model;
-  const selectedModel = connected || draft.model ? (display.group ? groupSlug(display.title) : display.title) : "";
+  const selectedModel = connected || draft.model ? draft.model.trim() || agentModels(payload, draft.poolExclude)[0] || "" : "";
   const head = (
     <>
       <div className="gw-popover-item" data-selected={!connected} onClick={onDisconnect} role="option" aria-selected={!connected} tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter") onDisconnect(); }}>
@@ -595,7 +594,6 @@ function ModelPicker({
           onPick={onPick}
           payload={payload}
           selectedModel={selectedModel}
-          selectedTarget={draft.target || "pool"}
         />
       </Floating>
     </div>
@@ -618,7 +616,7 @@ function TierPicker({
 }) {
   const [open, setOpen] = useState(false);
   const buttonRef = useRef<HTMLButtonElement>(null);
-  const display = value ? bindingDisplay(payload, "pool", value, exclude) : null;
+  const display = value ? modelDisplay(payload, value, exclude) : null;
   const head = (
     <div className="gw-popover-item" data-selected={!value} onClick={() => { setOpen(false); onPick(""); }} role="option" aria-selected={!value} tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter") { setOpen(false); onPick(""); } }}>
       <span className="gw-picker-glyph gw-tier-default">=</span>
@@ -646,7 +644,6 @@ function TierPicker({
           }}
           payload={payload}
           selectedModel={value}
-          selectedTarget="pool"
         />
       </Floating>
     </>

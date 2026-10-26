@@ -251,14 +251,6 @@ pub struct AggregateRelayRoute {
     /// 数字越大越优先，缺省 0；同 priority 按数组顺序（稳定优先）
     #[serde(default)]
     pub priority: u32,
-    /// 命中后发给该成员的模型名；空表示沿用请求里的模型名。
-    /// 目前只有网关模式的路由组读取它，Codex 聚合路径保持原样转发。
-    #[serde(
-        rename = "targetModel",
-        default,
-        skip_serializing_if = "String::is_empty"
-    )]
-    pub target_model: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]

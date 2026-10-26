@@ -1,41 +1,36 @@
-//! 网关模式命令：Agent 绑定的开关、供应商池导入、Key 健康状态。
+//! 网关模式命令：Agent 接入开关、网关自己的供应商池与路由组、Key 健康状态。
 //!
-//! 具体行为在 `codex_plus_core::gateway`；这里负责读写当前设置、同步常驻 helper 和提示文案。
+//! 网关模式与直连模式完全独立：供应商池、路由组只存在 `gateway.json`；
+//! 直连模式的 Codex / Claude / Grok 供应商只在「导入」时被读取并复制一份。
 
 use serde::Serialize;
 
 use codex_plus_core::gateway::activity::{self, ActivitySnapshot};
-use codex_plus_core::gateway::apply::{self, ApplyContext};
+use codex_plus_core::gateway::apply::{self, ApplyContext, GroupInput, ProviderInput};
 use codex_plus_core::gateway::key_pool::{self, PoolSnapshot};
 use codex_plus_core::gateway::store::{
-    AgentBinding, GatewaySettings, GatewayStore, KeyRotationMode, new_client_token,
+    AgentBinding, GatewayGroup, GatewaySettings, GatewayStore, KeyRotationMode, new_client_token,
 };
-use codex_plus_core::settings::{BackendSettings, RelayProtocol, SettingsStore};
+use codex_plus_core::settings::{BackendSettings, RelayProfile, RelayProtocol, SettingsStore};
 use codex_plus_core::tools::ToolId;
 use codex_plus_core::tools::claude::{self, ClaudeContext, GATEWAY_PROVIDER_ID};
 
 use crate::commands::{CommandResult, failed, ok, sync_resident_helper};
 
+/// 供应商在界面上的样子：不含 Key 原文。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayPoolEntry {
     pub id: String,
     pub name: String,
-    /// 只用于界面判断预设是否已添加（地址不含 Key）。
     pub base_url: String,
     pub protocol: RelayProtocol,
     pub official: bool,
     pub models: Vec<String>,
     pub key_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GatewayGroupEntry {
-    pub id: String,
-    pub name: String,
-    pub strategy: codex_plus_core::settings::AggregateRelayStrategy,
-    pub members: Vec<String>,
+    pub enabled: bool,
+    /// 预设 key 或导入来源，界面判断「已添加」用。
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,20 +58,19 @@ pub struct GatewaySourceEntry {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayPayload {
+    /// 绑定与选项；供应商池单独放在 `pool`（不带 Key），这里的 `providers` 总是空的。
     pub gateway: GatewaySettings,
     pub port: u16,
     pub helper_running: bool,
     pub pool: Vec<GatewayPoolEntry>,
-    /// 还没加入池的 Codex 供应商，可在「添加供应商」里挑选加入。
-    pub codex_providers: Vec<GatewayPoolEntry>,
-    pub groups: Vec<GatewayGroupEntry>,
+    pub groups: Vec<GatewayGroup>,
     pub agents: Vec<GatewayAgentView>,
     pub health: PoolSnapshot,
     /// 路由动态：各 Agent 最近一次请求怎么走的、计数、正在回答的上游。
     pub activity: ActivitySnapshot,
-    /// 可导入供应商池的 Claude 供应商（不含网关托管的那个）。
+    /// 可复制进网关的直连模式供应商。
+    pub codex_providers: Vec<GatewayPoolEntry>,
     pub claude_providers: Vec<GatewaySourceEntry>,
-    /// 可导入供应商池的 Grok 供应商。
     pub grok_profiles: Vec<GatewaySourceEntry>,
 }
 
@@ -99,7 +93,7 @@ fn parse_agent(agent: &str) -> anyhow::Result<ToolId> {
     Ok(agent)
 }
 
-fn pool_entry(relay: &codex_plus_core::settings::RelayProfile) -> GatewayPoolEntry {
+fn pool_entry(relay: &RelayProfile, enabled: bool, source: &str) -> GatewayPoolEntry {
     GatewayPoolEntry {
         id: relay.id.clone(),
         name: relay.name.clone(),
@@ -108,31 +102,21 @@ fn pool_entry(relay: &codex_plus_core::settings::RelayProfile) -> GatewayPoolEnt
         official: codex_plus_core::official_login::member_uses_official_login_transport(relay),
         models: codex_plus_core::gateway::route::relay_models(relay),
         key_count: key_pool::expand_keys(relay).len(),
+        enabled,
+        source: source.to_string(),
     }
 }
 
 fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> GatewayPayload {
     let port = port();
-    let pool_relays = apply::gateway_pool(settings, &gateway);
-    let codex_providers = apply::pool_relays(settings)
-        .into_iter()
-        .filter(|relay| !pool_relays.iter().any(|item| item.id == relay.id))
-        .map(pool_entry)
-        .collect();
-    let pool = pool_relays.into_iter().map(pool_entry).collect();
-    let groups = settings
-        .aggregate_relay_profiles
+    let pool = gateway
+        .providers
         .iter()
-        .map(|group| GatewayGroupEntry {
-            id: group.id.clone(),
-            name: group.name.clone(),
-            strategy: group.strategy,
-            members: group
-                .members
-                .iter()
-                .map(|member| member.relay_id.clone())
-                .collect(),
-        })
+        .map(|provider| pool_entry(&provider.relay, provider.enabled, &provider.source))
+        .collect();
+    let codex_providers = apply::codex_importable(settings)
+        .into_iter()
+        .map(|relay| pool_entry(relay, true, ""))
         .collect();
     let agents = GATEWAY_AGENTS
         .iter()
@@ -146,9 +130,9 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
                 enabled: binding.is_some_and(|binding| binding.enabled),
                 base_url: apply::gateway_base_url(port, agent),
                 default_model: binding
-                    .map(|binding| apply::resolved_default_model(settings, &gateway, binding))
+                    .map(|binding| apply::resolved_default_model(&gateway, binding))
                     .unwrap_or_default(),
-                models: codex_plus_core::gateway::server::exposed_models(settings, &gateway, agent),
+                models: codex_plus_core::gateway::server::exposed_models(&gateway, agent),
             }
         })
         .collect();
@@ -179,31 +163,34 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
                 .collect()
         })
         .unwrap_or_default();
+    let groups = gateway.groups.clone();
+    let mut gateway = gateway;
+    gateway.providers.clear();
     GatewayPayload {
         gateway,
         port,
         helper_running: codex_plus_core::resident_helper::resident_helper_port().is_some(),
         pool,
-        codex_providers,
         groups,
         agents,
         health: key_pool::snapshot(std::time::Instant::now()),
         activity: activity::snapshot(),
+        codex_providers,
         claude_providers,
         grok_profiles,
     }
 }
 
 fn current_payload() -> Option<GatewayPayload> {
-    let settings = SettingsStore::default().load().ok()?;
+    let settings = SettingsStore::default().load().unwrap_or_default();
     let gateway = GatewayStore::default().load().ok()?;
     Some(build_payload(&settings, gateway))
 }
 
-fn respond(
+fn respond<T>(
     success: &str,
     failure: &str,
-    result: anyhow::Result<GatewaySettings>,
+    result: anyhow::Result<T>,
 ) -> CommandResult<Option<GatewayPayload>> {
     match result {
         Ok(_) => ok(success, current_payload()),
@@ -211,20 +198,29 @@ fn respond(
     }
 }
 
+/// 供应商池或路由组变了：开着的 Agent 重写配置，让它的模型列表跟上。重写失败只记日志。
+fn refresh_agents<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    if result.is_ok()
+        && let Err(error) = apply::refresh_enabled(&context())
+    {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "gateway.refresh_agents_failed",
+            serde_json::json!({ "message": format!("{error:#}") }),
+        );
+    }
+    result
+}
+
 #[tauri::command]
 pub fn load_gateway() -> CommandResult<Option<GatewayPayload>> {
-    match (
-        SettingsStore::default().load(),
-        GatewayStore::default().load(),
-    ) {
-        (Ok(settings), Ok(gateway)) => {
-            ok("网关状态已加载。", Some(build_payload(&settings, gateway)))
-        }
-        (Err(error), _) | (_, Err(error)) => failed(&format!("读取网关状态失败：{error:#}"), None),
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    match GatewayStore::default().load() {
+        Ok(gateway) => ok("网关状态已加载。", Some(build_payload(&settings, gateway))),
+        Err(error) => failed(&format!("读取网关状态失败：{error:#}"), None),
     }
 }
 
-/// 开启或更新一个 Agent 的网关绑定：改写它的配置指向网关，并确保常驻 helper 在跑。
+/// 开启或更新一个 Agent 的网关接入：改写它的配置指向网关，并确保常驻 helper 在跑。
 #[tauri::command]
 pub fn save_gateway_binding(
     agent: String,
@@ -232,8 +228,7 @@ pub fn save_gateway_binding(
 ) -> CommandResult<Option<GatewayPayload>> {
     let result = (|| {
         let agent = parse_agent(&agent)?;
-        let settings = SettingsStore::default().load()?;
-        let saved = apply::enable_binding(&context(), &settings, &agent, binding)?;
+        let saved = apply::enable_binding(&context(), &agent, binding)?;
         if sync_resident_helper().is_none() {
             anyhow::bail!("网关绑定已写入，但本地网关没能启动，请查看诊断日志");
         }
@@ -241,13 +236,13 @@ pub fn save_gateway_binding(
     })();
     let name = codex_plus_core::tools::tool_display_name(&ToolId::parse(&agent));
     respond(
-        &format!("{name} 已改为经 Codex++ 网关，新开的会话生效。"),
-        "开启网关模式失败",
+        &format!("{name} 已接入 Codex++ 网关，新开的会话生效。"),
+        "接入网关失败",
         result,
     )
 }
 
-/// 关闭一个 Agent 的网关绑定，恢复成直连。
+/// 断开一个 Agent，恢复它原来的直连设置。
 #[tauri::command]
 pub fn disable_gateway_binding(agent: String) -> CommandResult<Option<GatewayPayload>> {
     let result = (|| {
@@ -257,8 +252,8 @@ pub fn disable_gateway_binding(agent: String) -> CommandResult<Option<GatewayPay
     })();
     let name = codex_plus_core::tools::tool_display_name(&ToolId::parse(&agent));
     respond(
-        &format!("{name} 已恢复直连，新开的会话生效。"),
-        "关闭网关模式失败",
+        &format!("{name} 已断开并还原，新开的会话生效。"),
+        "断开失败",
         result,
     )
 }
@@ -277,8 +272,7 @@ pub fn rotate_gateway_token(agent: String) -> CommandResult<Option<GatewayPayloa
         let binding = binding.clone();
         store.save(&gateway)?;
         if binding.enabled {
-            let settings = SettingsStore::default().load()?;
-            return apply::enable_binding(&context(), &settings, &agent, binding);
+            return apply::enable_binding(&context(), &agent, binding);
         }
         Ok(gateway)
     })();
@@ -305,74 +299,65 @@ pub fn save_gateway_options(
     respond("网关选项已保存。", "保存网关选项失败", result)
 }
 
-/// 把一个 Claude 供应商导入供应商池（变成 Anthropic 协议的普通供应商，Codex 页也能看到）。
+/// 用内置预设或手填的地址、Key 新建网关供应商。
 #[tauri::command]
-pub fn import_claude_provider_to_gateway_pool(id: String) -> CommandResult<Option<GatewayPayload>> {
-    let result = (|| {
-        let provider = claude::load(&ClaudeContext::default_paths())?
-            .providers
-            .into_iter()
-            .find(|provider| provider.id == id)
-            .ok_or_else(|| anyhow::anyhow!("Claude 供应商不存在：{id}"))?;
-        let store = SettingsStore::default();
-        let mut settings = store.load()?;
-        let profile = apply::import_claude_provider_to_pool(&mut settings, &provider)?;
-        store.save(&settings)?;
-        apply::add_to_pool(&GatewayStore::default(), &settings, &[profile.id])
-    })();
-    let result = refresh_agents(result);
-    respond("已导入供应商池。", "导入供应商池失败", result)
-}
-
-/// 把 Grok 页的一个供应商导入供应商池。
-#[tauri::command]
-pub fn import_grok_profile_to_gateway_pool(id: String) -> CommandResult<Option<GatewayPayload>> {
-    let result = (|| {
-        let store = SettingsStore::default();
-        let mut settings = store.load()?;
-        let profile = apply::import_grok_profile_to_pool(&mut settings, &id)?;
-        store.save(&settings)?;
-        apply::add_to_pool(&GatewayStore::default(), &settings, &[profile.id])
-    })();
-    let result = refresh_agents(result);
-    respond("已导入供应商池。", "导入供应商池失败", result)
-}
-
-/// 把已有的 Codex 供应商加入网关池。
-#[tauri::command]
-pub fn add_gateway_pool_providers(ids: Vec<String>) -> CommandResult<Option<GatewayPayload>> {
-    let result = (|| {
-        let settings = SettingsStore::default().load()?;
-        apply::add_to_pool(&GatewayStore::default(), &settings, &ids)
-    })();
-    let result = refresh_agents(result);
-    respond("已加入供应商池。", "加入供应商池失败", result)
-}
-
-/// 把供应商移出网关池；Codex 供应商列表里的这一项保留。
-#[tauri::command]
-pub fn remove_gateway_pool_provider(id: String) -> CommandResult<Option<GatewayPayload>> {
+pub fn create_gateway_provider(
+    input: ProviderInput,
+    source: String,
+) -> CommandResult<Option<GatewayPayload>> {
+    let name = input.name.trim().to_string();
     respond(
-        "已移出供应商池，Codex 供应商列表里的这一项仍然保留。",
-        "移出供应商池失败",
-        refresh_agents(apply::remove_from_pool(&GatewayStore::default(), &id)),
+        &format!("已添加「{name}」，接入的 Agent 现在能用它的模型了。"),
+        "添加供应商失败",
+        refresh_agents(apply::create_provider(
+            &GatewayStore::default(),
+            &input,
+            &source,
+        )),
+    )
+}
+
+/// 编辑网关供应商；Key 留空表示不改。
+#[tauri::command]
+pub fn update_gateway_provider(
+    id: String,
+    input: ProviderInput,
+) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "供应商已保存。",
+        "保存供应商失败",
+        refresh_agents(apply::update_provider(
+            &GatewayStore::default(),
+            &id,
+            &input,
+        )),
+    )
+}
+
+/// 删除网关供应商（直连模式的数据不受影响）。
+#[tauri::command]
+pub fn delete_gateway_provider(id: String) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "已删除。",
+        "删除供应商失败",
+        refresh_agents(apply::delete_provider(&GatewayStore::default(), &id)),
     )
 }
 
 /// 打开或关掉池里的某个供应商。
 #[tauri::command]
-pub fn set_gateway_pool_provider_enabled(
+pub fn set_gateway_provider_enabled(
     id: String,
     enabled: bool,
 ) -> CommandResult<Option<GatewayPayload>> {
     respond(
         if enabled {
-            "已打开，Agent 的模型列表里会出现它的模型。"
+            "已打开，接入的 Agent 能用它的模型了。"
         } else {
             "已关闭，它不再参与路由。"
         },
         "切换供应商失败",
-        refresh_agents(apply::set_pool_enabled(
+        refresh_agents(apply::set_provider_enabled(
             &GatewayStore::default(),
             &id,
             enabled,
@@ -382,46 +367,60 @@ pub fn set_gateway_pool_provider_enabled(
 
 /// 调整供应商池顺序。
 #[tauri::command]
-pub fn reorder_gateway_pool(ids: Vec<String>) -> CommandResult<Option<GatewayPayload>> {
+pub fn reorder_gateway_providers(ids: Vec<String>) -> CommandResult<Option<GatewayPayload>> {
     respond(
         "已调整顺序。",
         "调整顺序失败",
-        refresh_agents(apply::reorder_pool(&GatewayStore::default(), &ids)),
+        refresh_agents(apply::reorder_providers(&GatewayStore::default(), &ids)),
     )
 }
 
-/// 用内置预设或手填的地址、Key 新建供应商：写进 Codex 供应商列表并加入网关池。
+/// 从直连模式复制一个供应商进网关：`codex` / `claude` / `grok`。复制后两边互不影响。
 #[tauri::command]
-pub fn create_gateway_pool_provider(
-    name: String,
-    base_url: String,
-    api_key: String,
-    protocol: RelayProtocol,
-    model: String,
-    model_list: String,
+pub fn import_gateway_provider(
+    source: String,
+    id: String,
 ) -> CommandResult<Option<GatewayPayload>> {
     let result = (|| {
-        let store = SettingsStore::default();
-        let mut settings = store.load()?;
-        let profile = apply::create_pool_provider(
-            &mut settings,
-            apply::NewPoolProvider {
-                name: &name,
-                base_url: &base_url,
-                api_key: &api_key,
-                protocol,
-                model: &model,
-                model_list: &model_list,
-            },
-        )?;
-        store.save(&settings)?;
-        apply::add_to_pool(&GatewayStore::default(), &settings, &[profile.id])
+        let relay = match source.as_str() {
+            "codex" => apply::copy_codex_provider(&SettingsStore::default().load()?, &id)?,
+            "claude" => {
+                let provider = claude::load(&ClaudeContext::default_paths())?
+                    .providers
+                    .into_iter()
+                    .find(|provider| provider.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("Claude 供应商不存在：{id}"))?;
+                apply::copy_claude_provider(&provider)?
+            }
+            "grok" => apply::copy_grok_profile(&SettingsStore::default().load()?, &id)?,
+            other => anyhow::bail!("不认识的导入来源：{other}"),
+        };
+        apply::add_provider(&GatewayStore::default(), relay, &format!("{source}:{id}"))
     })();
-    let result = refresh_agents(result);
     respond(
-        &format!("已添加「{}」，可以在智能体里选它的模型了。", name.trim()),
-        "添加供应商失败",
-        result,
+        "已复制进网关的供应商池，原来的供应商不受影响。",
+        "导入失败",
+        refresh_agents(result),
+    )
+}
+
+/// 新建或编辑网关路由组。
+#[tauri::command]
+pub fn save_gateway_group(group: GroupInput) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "路由组已保存。",
+        "保存路由组失败",
+        refresh_agents(apply::save_group(&GatewayStore::default(), &group)),
+    )
+}
+
+/// 删除网关路由组。
+#[tauri::command]
+pub fn delete_gateway_group(id: String) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "路由组已删除。",
+        "删除路由组失败",
+        refresh_agents(apply::delete_group(&GatewayStore::default(), &id)),
     )
 }
 
@@ -440,7 +439,10 @@ pub fn reveal_gateway_agent_config(agent: String) -> CommandResult<Option<Gatewa
             anyhow::bail!("{} 还不存在", path.display());
         }
         #[cfg(target_os = "macos")]
-        let status = std::process::Command::new("open").arg("-R").arg(&path).status()?;
+        let status = std::process::Command::new("open")
+            .arg("-R")
+            .arg(&path)
+            .status()?;
         #[cfg(target_os = "windows")]
         let status = std::process::Command::new("explorer")
             .arg(format!("/select,{}", path.display()))
@@ -453,20 +455,6 @@ pub fn reveal_gateway_agent_config(agent: String) -> CommandResult<Option<Gatewa
         GatewayStore::default().load()
     })();
     respond("已在文件管理器中显示。", "打开失败", result)
-}
-
-/// 供应商池变了：开着的供应商池模式 Agent 重写配置，让它的模型列表跟上。重写失败只记日志。
-fn refresh_agents(result: anyhow::Result<GatewaySettings>) -> anyhow::Result<GatewaySettings> {
-    if result.is_ok()
-        && let Ok(settings) = SettingsStore::default().load()
-        && let Err(error) = apply::refresh_enabled(&context(), &settings)
-    {
-        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-            "gateway.refresh_agents_failed",
-            serde_json::json!({ "message": format!("{error:#}") }),
-        );
-    }
-    result
 }
 
 fn agent_config_path(agent: &ToolId) -> &'static str {
@@ -604,14 +592,11 @@ pub fn start_from_saved_state() {
     let Some(port) = sync_resident_helper() else {
         return;
     };
-    let Ok(settings) = SettingsStore::default().load() else {
-        return;
-    };
     let ctx = ApplyContext::default_paths(port);
     let result = if gateway.restore_on_exit {
-        apply::reapply_enabled(&ctx, &settings)
+        apply::reapply_enabled(&ctx)
     } else {
-        apply::reapply_if_port_changed(&ctx, &settings)
+        apply::reapply_if_port_changed(&ctx)
     };
     if let Err(error) = result {
         let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
@@ -623,9 +608,7 @@ pub fn start_from_saved_state() {
 
 /// 管理器退出时：用户要求的话把走网关的 Agent 恢复成直连。
 pub fn restore_for_exit() {
-    let Ok(settings) = SettingsStore::default().load() else {
-        return;
-    };
+    let settings = SettingsStore::default().load().unwrap_or_default();
     if let Err(error) = apply::restore_all_for_exit(&context(), &settings) {
         let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
             "gateway.exit_restore_failed",

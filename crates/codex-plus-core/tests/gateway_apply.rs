@@ -1,12 +1,13 @@
-//! 网关模式开启 / 关闭对 Agent 配置文件的改写与恢复。
+//! 网关模式开启 / 关闭对 Agent 配置文件的改写与恢复，以及网关自己的供应商池、路由组。
 
 use codex_plus_core::gateway::apply::{
-    ApplyContext, NewPoolProvider, add_to_pool, create_pool_provider, disable_binding,
-    enable_binding, gateway_pool, import_claude_provider_to_pool, note_claude_switched,
-    reapply_if_port_changed, refresh_enabled, remove_from_pool, set_pool_enabled,
+    ApplyContext, GroupInput, ProviderInput, codex_importable, copy_claude_provider,
+    copy_codex_provider, create_provider, delete_group, delete_provider, disable_binding,
+    enable_binding, note_claude_switched, reapply_if_port_changed, refresh_enabled,
+    reorder_providers, save_group, set_provider_enabled, update_provider,
 };
 use codex_plus_core::gateway::store::{
-    AgentBinding, ClaudeRoleModels, GatewayStore, GatewayTarget, GatewayTargetKind,
+    AgentBinding, ClaudeRoleModels, GatewayStore, GroupMember, GroupMode,
 };
 use codex_plus_core::settings::{BackendSettings, RelayMode, RelayProfile, RelayProtocol};
 use codex_plus_core::tools::ToolId;
@@ -34,31 +35,29 @@ fn fixture(port: u16) -> Fixture {
     };
     std::fs::create_dir_all(&ctx.claude.claude_home).unwrap();
     std::fs::create_dir_all(&ctx.grok_home).unwrap();
+    // 网关池里放一个供应商；直连模式的 settings 与它无关。
+    create_provider(&ctx.gateway, &deepseek_input(), "preset:deepseek").unwrap();
     Fixture { _temp: temp, ctx }
 }
 
-fn settings() -> BackendSettings {
-    BackendSettings {
-        relay_profiles: vec![RelayProfile {
-            id: "ds".into(),
-            name: "DeepSeek".into(),
-            relay_mode: RelayMode::PureApi,
-            protocol: RelayProtocol::ChatCompletions,
-            base_url: "https://api.deepseek.test/v1".into(),
-            api_key: "sk-ds".into(),
-            model_list: "deepseek-v4-pro\ndeepseek-v4-flash".into(),
-            ..RelayProfile::default()
-        }],
-        ..BackendSettings::default()
+fn deepseek_input() -> ProviderInput {
+    ProviderInput {
+        name: "DeepSeek".into(),
+        base_url: "https://api.deepseek.test/v1".into(),
+        protocol: RelayProtocol::ChatCompletions,
+        keys: vec!["sk-ds".into()],
+        model: "deepseek-v4-pro".into(),
+        model_list: "deepseek-v4-pro\ndeepseek-v4-flash".into(),
     }
+}
+
+/// 直连模式的设置：只用于关闭网关时恢复 Grok 原来的供应商。
+fn settings() -> BackendSettings {
+    BackendSettings::default()
 }
 
 fn binding() -> AgentBinding {
     AgentBinding {
-        target: GatewayTarget {
-            kind: GatewayTargetKind::Provider,
-            id: "ds".into(),
-        },
         model: "deepseek-v4-pro".into(),
         claude_roles: ClaudeRoleModels {
             haiku: "deepseek-v4-flash".into(),
@@ -109,7 +108,7 @@ fn claude_enable_points_at_gateway_and_disable_restores_previous_provider() {
     .unwrap();
     seed_claude_provider(ctx);
 
-    let gateway = enable_binding(ctx, &settings(), &ToolId::Claude, binding()).unwrap();
+    let gateway = enable_binding(ctx, &ToolId::Claude, binding()).unwrap();
     let saved = gateway.binding(&ToolId::Claude).unwrap();
     assert!(saved.enabled);
     assert!(saved.token.starts_with("cpx-gw-claude-"));
@@ -137,7 +136,7 @@ fn claude_enable_points_at_gateway_and_disable_restores_previous_provider() {
     // 再次保存（改模型）不换 token、不丢恢复现场。
     let mut updated = binding();
     updated.model = "deepseek-v4-flash".into();
-    let gateway = enable_binding(ctx, &settings(), &ToolId::Claude, updated).unwrap();
+    let gateway = enable_binding(ctx, &ToolId::Claude, updated).unwrap();
     let again = gateway.binding(&ToolId::Claude).unwrap();
     assert_eq!(again.token, saved.token);
     assert_eq!(again.restore.claude_previous_provider_id, "kimi");
@@ -177,7 +176,7 @@ fn claude_without_previous_provider_snapshots_live_config_and_restores_it() {
         r#"{ "env": { "ANTHROPIC_BASE_URL": "https://hand.test", "ANTHROPIC_AUTH_TOKEN": "sk-hand" } }"#,
     )
     .unwrap();
-    let gateway = enable_binding(ctx, &settings(), &ToolId::Claude, binding()).unwrap();
+    let gateway = enable_binding(ctx, &ToolId::Claude, binding()).unwrap();
     assert!(
         !gateway
             .binding(&ToolId::Claude)
@@ -196,7 +195,7 @@ fn claude_without_previous_provider_snapshots_live_config_and_restores_it() {
 fn claude_with_nothing_configured_is_cleared_on_disable() {
     let fixture = fixture(57397);
     let ctx = &fixture.ctx;
-    enable_binding(ctx, &settings(), &ToolId::Claude, binding()).unwrap();
+    enable_binding(ctx, &ToolId::Claude, binding()).unwrap();
     disable_binding(ctx, &settings(), &ToolId::Claude).unwrap();
     let live = read_settings_json(ctx);
     let env = live
@@ -216,7 +215,7 @@ fn switching_claude_provider_directly_turns_binding_off() {
     let fixture = fixture(57396);
     let ctx = &fixture.ctx;
     seed_claude_provider(ctx);
-    enable_binding(ctx, &settings(), &ToolId::Claude, binding()).unwrap();
+    enable_binding(ctx, &ToolId::Claude, binding()).unwrap();
     claude::switch_provider(&ctx.claude, "kimi").unwrap();
     note_claude_switched(&ctx.gateway, "kimi").unwrap();
     assert!(
@@ -232,15 +231,15 @@ fn switching_claude_provider_directly_turns_binding_off() {
 #[test]
 fn port_change_rewrites_enabled_agents() {
     let fixture = fixture(57395);
-    enable_binding(&fixture.ctx, &settings(), &ToolId::Claude, binding()).unwrap();
+    enable_binding(&fixture.ctx, &ToolId::Claude, binding()).unwrap();
     let mut moved = fixture.ctx.clone();
     moved.port = 58001;
-    assert_eq!(reapply_if_port_changed(&moved, &settings()).unwrap(), 1);
+    assert_eq!(reapply_if_port_changed(&moved).unwrap(), 1);
     assert_eq!(
         read_settings_json(&moved)["env"]["ANTHROPIC_BASE_URL"],
         "http://127.0.0.1:58001/gw/claude"
     );
-    assert_eq!(reapply_if_port_changed(&moved, &settings()).unwrap(), 0);
+    assert_eq!(reapply_if_port_changed(&moved).unwrap(), 0);
 }
 
 #[test]
@@ -263,7 +262,7 @@ fn grok_enable_writes_gateway_endpoint_and_disable_restores_profile() {
     shard.active_relay_id = "grok-direct".into();
     settings.set_tool_config(&ToolId::Grok, shard);
 
-    let gateway = enable_binding(ctx, &settings, &ToolId::Grok, binding()).unwrap();
+    let gateway = enable_binding(ctx, &ToolId::Grok, binding()).unwrap();
     let token = gateway.binding(&ToolId::Grok).unwrap().token.clone();
     let config = std::fs::read_to_string(ctx.grok_home.join("config.toml")).unwrap();
     assert!(
@@ -281,22 +280,151 @@ fn grok_enable_writes_gateway_endpoint_and_disable_restores_profile() {
 }
 
 #[test]
-fn enabling_requires_an_existing_target_and_model() {
+fn enabling_requires_a_pool_and_a_routable_model() {
     let fixture = fixture(57393);
-    let mut missing = binding();
-    missing.target.id = "nope".into();
-    assert!(enable_binding(&fixture.ctx, &settings(), &ToolId::Claude, missing).is_err());
-    let mut no_model = binding();
-    no_model.model.clear();
-    let mut bare = settings();
-    bare.relay_profiles[0].model_list.clear();
-    assert!(enable_binding(&fixture.ctx, &bare, &ToolId::Claude, no_model).is_err());
-    assert!(fixture.ctx.gateway.load().unwrap().bindings.is_empty());
+    let ctx = &fixture.ctx;
+    let mut unknown = binding();
+    unknown.model = "not-in-pool".into();
+    assert!(enable_binding(ctx, &ToolId::Claude, unknown).is_err());
+    // 「挑选」把唯一的供应商排除掉 → 没有可用供应商。
+    let mut excluded = binding();
+    excluded.pool_exclude = vec!["deepseek".into()];
+    assert!(enable_binding(ctx, &ToolId::Claude, excluded).is_err());
+    assert!(ctx.gateway.load().unwrap().bindings.is_empty());
+    // `<供应商 id>/<模型>` 能路由，即使模型不在列表里。
+    let mut qualified = binding();
+    qualified.model = "deepseek/deepseek-v4-preview".into();
+    assert!(enable_binding(ctx, &ToolId::Claude, qualified).is_ok());
 }
 
 #[test]
-fn claude_provider_imports_into_pool_as_anthropic_relay() {
-    let mut settings = settings();
+fn providers_live_only_in_the_gateway_store() {
+    let fixture = fixture(57392);
+    let store = &fixture.ctx.gateway;
+    // 新建：多个 Key 写成命名 Key；重名换成新短名。
+    let mut input = deepseek_input();
+    input.keys = vec!["sk-a".into(), " sk-b ".into(), "sk-a".into()];
+    let (gateway, id) = create_provider(store, &input, "preset:deepseek").unwrap();
+    assert_eq!(id, "deepseek-2");
+    let relay = &gateway.provider("deepseek-2").unwrap().relay;
+    assert_eq!(relay.api_keys.len(), 2);
+    assert_eq!(relay.api_key, "sk-a");
+    assert_eq!(
+        gateway.provider("deepseek-2").unwrap().source,
+        "preset:deepseek"
+    );
+
+    // 读回来地址、模型、Key 都还在。
+    let loaded = store.load().unwrap();
+    let relay = &loaded.provider("deepseek").unwrap().relay;
+    assert_eq!(relay.base_url, "https://api.deepseek.test/v1");
+    assert_eq!(relay.api_key, "sk-ds");
+    assert_eq!(
+        codex_plus_core::gateway::route::relay_models(relay),
+        vec!["deepseek-v4-pro", "deepseek-v4-flash"]
+    );
+
+    // 编辑：Key 留空沿用原来的，id 不变。
+    let mut edit = deepseek_input();
+    edit.name = "DeepSeek 主力".into();
+    edit.keys.clear();
+    edit.model_list = "deepseek-v4-pro".into();
+    let gateway = update_provider(store, "deepseek-2", &edit).unwrap();
+    let relay = &gateway.provider("deepseek-2").unwrap().relay;
+    assert_eq!(relay.name, "DeepSeek 主力");
+    assert_eq!(relay.api_keys.len(), 2, "Key 留空时保留原来的两个 Key");
+
+    // 排序、开关、删除。
+    let gateway = reorder_providers(store, &["deepseek-2".into()]).unwrap();
+    assert_eq!(gateway.providers[0].relay.id, "deepseek-2");
+    let gateway = set_provider_enabled(store, "deepseek", false).unwrap();
+    assert!(!gateway.provider("deepseek").unwrap().enabled);
+    let (_, group) = save_group(
+        store,
+        &GroupInput {
+            id: String::new(),
+            name: "Daily coding".into(),
+            mode: GroupMode::InOrder,
+            members: vec![
+                GroupMember {
+                    model: "deepseek-2/deepseek-v4-pro".into(),
+                    weight: 1,
+                },
+                GroupMember {
+                    model: "deepseek/deepseek-v4-flash".into(),
+                    weight: 1,
+                },
+            ],
+        },
+    )
+    .unwrap();
+    assert_eq!(group, "daily-coding");
+    let gateway = delete_provider(store, "deepseek-2").unwrap();
+    assert!(gateway.provider("deepseek-2").is_none());
+    assert_eq!(
+        gateway.group("daily-coding").unwrap().members.len(),
+        1,
+        "删掉供应商时路由组里指向它的成员一起去掉"
+    );
+    assert!(delete_provider(store, "deepseek-2").is_err());
+}
+
+#[test]
+fn groups_are_saved_validated_and_unlinked_on_delete() {
+    let fixture = fixture(57391);
+    let store = &fixture.ctx.gateway;
+    let member = |model: &str| GroupMember {
+        model: model.into(),
+        weight: 0,
+    };
+    assert!(
+        save_group(
+            store,
+            &GroupInput {
+                name: "空".into(),
+                ..GroupInput::default()
+            }
+        )
+        .is_err(),
+        "至少一个成员"
+    );
+    let (_, fast) = save_group(
+        store,
+        &GroupInput {
+            name: "Fast".into(),
+            mode: GroupMode::Rotate,
+            members: vec![
+                member("deepseek-v4-flash"),
+                member("group/fast"),
+                member("deepseek-v4-flash"),
+            ],
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    let (gateway, coder) = save_group(
+        store,
+        &GroupInput {
+            name: "Coder".into(),
+            members: vec![member("deepseek/deepseek-v4-pro"), member("group/fast")],
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    let saved = gateway.group(&fast).unwrap();
+    assert_eq!(saved.members.len(), 1, "去掉自引用和重复成员");
+    assert_eq!(saved.members[0].weight, 1, "权重至少为 1");
+    assert_eq!(saved.mode, GroupMode::Rotate);
+    let gateway = delete_group(store, &fast).unwrap();
+    assert_eq!(
+        gateway.group(&coder).unwrap().members.len(),
+        1,
+        "删掉的组从别的组里移除"
+    );
+}
+
+#[test]
+fn imports_copy_data_and_leave_the_direct_mode_untouched() {
     let provider = ClaudeProvider {
         id: "kimi".into(),
         name: "Kimi".into(),
@@ -311,163 +439,77 @@ fn claude_provider_imports_into_pool_as_anthropic_relay() {
         created_at: 0,
         ccs_source_id: String::new(),
     };
-    let profile = import_claude_provider_to_pool(&mut settings, &provider).unwrap();
-    assert_eq!(profile.protocol, RelayProtocol::AnthropicMessages);
-    assert_eq!(profile.base_url, "https://api.kimi.test/anthropic");
-    assert_eq!(profile.api_key, "sk-kimi");
-    assert_eq!(profile.anthropic_auth_header, "authorization");
-    assert_eq!(profile.model_list, "kimi-k2.5\nkimi-k2.5-mini");
-    assert_eq!(
-        codex_plus_core::relay_config::relay_profile_model(&profile),
-        "kimi-k2.5"
-    );
-    assert_eq!(settings.relay_profiles.len(), 2);
-}
+    let relay = copy_claude_provider(&provider).unwrap();
+    assert_eq!(relay.protocol, RelayProtocol::AnthropicMessages);
+    assert_eq!(relay.base_url, "https://api.kimi.test/anthropic");
+    assert_eq!(relay.api_key, "sk-kimi");
+    assert_eq!(relay.anthropic_auth_header, "authorization");
+    assert_eq!(relay.model_list, "kimi-k2.5\nkimi-k2.5-mini");
 
-#[test]
-fn pool_starts_empty_and_only_lists_added_or_bound_providers() {
-    let fixture = fixture(57321);
-    let ctx = &fixture.ctx;
-    let mut settings = settings();
-    settings.relay_profiles.push(RelayProfile {
-        id: "glm".into(),
-        name: "GLM".into(),
-        relay_mode: RelayMode::PureApi,
-        base_url: "https://glm.test/v1".into(),
-        api_key: "sk-glm".into(),
-        ..RelayProfile::default()
-    });
-    settings.relay_profiles.push(RelayProfile {
-        id: "agg".into(),
-        name: "Group".into(),
-        relay_mode: RelayMode::Aggregate,
-        ..RelayProfile::default()
-    });
-    let ids = |gateway| {
-        gateway_pool(&settings, gateway)
-            .into_iter()
-            .map(|relay| relay.id.clone())
-            .collect::<Vec<_>>()
-    };
-    // 旧状态文件（没有 pool 字段）是空池，不再把 Codex 的全部供应商都列出来。
-    let gateway = ctx.gateway.load().unwrap();
-    assert!(ids(&gateway).is_empty());
-
-    let gateway = add_to_pool(&ctx.gateway, &settings, &["glm".to_string()]).unwrap();
-    assert_eq!(ids(&gateway), vec!["glm"]);
-    assert!(add_to_pool(&ctx.gateway, &settings, &["agg".to_string()]).is_err());
-    assert!(add_to_pool(&ctx.gateway, &settings, &["gone".to_string()]).is_err());
-
-    // 绑定的供应商即使没加入池也显示，且不能移出。
-    enable_binding(ctx, &settings, &ToolId::Claude, binding()).unwrap();
-    let gateway = ctx.gateway.load().unwrap();
-    assert_eq!(ids(&gateway), vec!["glm", "ds"]);
-    assert!(remove_from_pool(&ctx.gateway, "ds").is_err());
-    let gateway = remove_from_pool(&ctx.gateway, "glm").unwrap();
-    assert_eq!(ids(&gateway), vec!["ds"]);
-    // Codex 里的供应商本身不受影响。
-    assert_eq!(settings.relay_profiles.len(), 3);
-}
-
-#[test]
-fn preset_provider_is_created_in_codex_list_with_default_model() {
+    // Codex 供应商：普通 API 供应商原样复制；官方登录账号和聚合供应商不能复制。
     let mut settings = BackendSettings::default();
-    let before = settings.relay_profiles.len();
-    let profile = create_pool_provider(
-        &mut settings,
-        NewPoolProvider {
-            name: "Kimi",
-            base_url: "https://api.moonshot.test/v1/",
-            api_key: "sk-kimi",
-            protocol: RelayProtocol::ChatCompletions,
-            model: "kimi-k3",
-            model_list: "kimi-k3\nkimi-k2.7-code",
+    settings.relay_profiles = vec![
+        RelayProfile {
+            id: "api".into(),
+            name: "API".into(),
+            relay_mode: RelayMode::PureApi,
+            base_url: "https://api.test/v1".into(),
+            api_key: "sk-api".into(),
+            ..RelayProfile::default()
         },
-    )
-    .unwrap();
-    assert_eq!(settings.relay_profiles.len(), before + 1);
-    assert_eq!(profile.name, "Kimi");
-    assert_eq!(profile.protocol, RelayProtocol::ChatCompletions);
+        RelayProfile {
+            id: "agg".into(),
+            name: "聚合".into(),
+            relay_mode: RelayMode::Aggregate,
+            ..RelayProfile::default()
+        },
+    ];
+    let before = settings.clone();
+    let copied = copy_codex_provider(&settings, "api").unwrap();
+    assert_eq!(copied.api_key, "sk-api");
+    assert!(copy_codex_provider(&settings, "agg").is_err());
     assert_eq!(
-        codex_plus_core::gateway::route::relay_models(&profile),
-        vec!["kimi-k3", "kimi-k2.7-code"]
+        codex_importable(&settings)
+            .iter()
+            .map(|relay| relay.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["api"]
     );
-    assert!(
-        create_pool_provider(
-            &mut settings,
-            NewPoolProvider {
-                name: "Loop",
-                base_url: "http://127.0.0.1:57321/gw/claude",
-                api_key: "x",
-                protocol: RelayProtocol::AnthropicMessages,
-                model: "",
-                model_list: "",
-            },
-        )
-        .is_err(),
-        "不能把网关自己加进池"
-    );
-    assert!(
-        create_pool_provider(
-            &mut settings,
-            NewPoolProvider {
-                name: "NoKey",
-                base_url: "https://x.test/v1",
-                api_key: " ",
-                protocol: RelayProtocol::Responses,
-                model: "",
-                model_list: "",
-            },
-        )
-        .is_err(),
-        "缺 Key 时报错"
-    );
+    assert_eq!(settings, before, "复制不改直连模式的数据");
 }
 
 #[test]
-fn pool_binding_exposes_every_pool_model_and_follows_pool_changes() {
-    let fixture = fixture(57395);
+fn pool_changes_follow_into_grok_model_list() {
+    let fixture = fixture(57390);
     let ctx = &fixture.ctx;
-    let mut settings = settings();
-    settings.relay_profiles.push(RelayProfile {
-        id: "kimi".into(),
-        name: "Kimi".into(),
-        relay_mode: RelayMode::PureApi,
-        protocol: RelayProtocol::ChatCompletions,
-        base_url: "https://kimi.test/v1".into(),
-        api_key: "sk-kimi".into(),
-        model_list: "kimi-k3".into(),
-        ..RelayProfile::default()
-    });
-    let pool_binding = AgentBinding {
-        target: GatewayTarget {
-            kind: GatewayTargetKind::Pool,
-            id: String::new(),
-        },
-        ..AgentBinding::default()
-    };
-    // 池是空的时不能开启。
-    assert!(enable_binding(ctx, &settings, &ToolId::Grok, pool_binding.clone()).is_err());
-
-    add_to_pool(&ctx.gateway, &settings, &["ds".to_string()]).unwrap();
-    enable_binding(ctx, &settings, &ToolId::Grok, pool_binding.clone()).unwrap();
+    enable_binding(ctx, &ToolId::Grok, AgentBinding::default()).unwrap();
     let config = || std::fs::read_to_string(ctx.grok_home.join("config.toml")).unwrap();
     assert!(config().contains("deepseek-v4-pro"), "{}", config());
     assert!(config().contains("deepseek-v4-flash"), "{}", config());
     assert!(!config().contains("kimi-k3"), "{}", config());
 
-    // 加入新供应商后刷新，Grok 的模型列表跟着变；关掉后又消失。
-    add_to_pool(&ctx.gateway, &settings, &["kimi".to_string()]).unwrap();
-    assert_eq!(refresh_enabled(ctx, &settings).unwrap(), 1);
+    let mut kimi = deepseek_input();
+    kimi.name = "Kimi".into();
+    kimi.model = "kimi-k3".into();
+    kimi.model_list = "kimi-k3".into();
+    create_provider(&ctx.gateway, &kimi, "").unwrap();
+    assert_eq!(refresh_enabled(ctx).unwrap(), 1);
     assert!(config().contains("kimi-k3"), "{}", config());
-    set_pool_enabled(&ctx.gateway, "kimi", false).unwrap();
-    refresh_enabled(ctx, &settings).unwrap();
+    save_group(
+        &ctx.gateway,
+        &GroupInput {
+            name: "Fast".into(),
+            members: vec![GroupMember {
+                model: "kimi-k3".into(),
+                weight: 1,
+            }],
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    refresh_enabled(ctx).unwrap();
+    assert!(config().contains("group/fast"), "{}", config());
+    set_provider_enabled(&ctx.gateway, "kimi", false).unwrap();
+    refresh_enabled(ctx).unwrap();
     assert!(!config().contains("kimi-k3"), "{}", config());
-
-    // 主模型必须是池里有的模型。
-    let unknown = AgentBinding {
-        model: "not-in-pool".into(),
-        ..pool_binding
-    };
-    assert!(enable_binding(ctx, &settings, &ToolId::Grok, unknown).is_err());
 }

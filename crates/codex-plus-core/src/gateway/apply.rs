@@ -1,21 +1,24 @@
-//! 网关模式的开启 / 关闭：把 Agent 的配置指向本地网关，关闭时恢复成直连。
+//! 网关模式的开启 / 关闭，以及网关自己的供应商池、路由组的增删改。
 //!
 //! - Claude Code：在 `claude-providers.json` 里放一个托管供应商（[`GATEWAY_PROVIDER_ID`]），
 //!   用现有的「关键字段」切换逻辑写进 `~/.claude/settings.json`，用户的 hooks 等键不动；
 //!   关闭时切回开启前的供应商。
 //! - Grok：合成一个指向网关的 Responses 供应商写进 `~/.grok/config.toml`；
 //!   关闭时重新应用 Grok 页里当前选中的供应商。
+//! - 供应商池与路由组只存在 `gateway.json`；从直连模式导入是复制，之后互不影响。
 
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::gateway::route::{self, binding_default_model};
 use crate::gateway::store::{
-    AgentBinding, GatewaySettings, GatewayStore, GatewayTargetKind, new_client_token,
+    AgentBinding, GROUP_MODEL_PREFIX, GatewayGroup, GatewayProvider, GatewaySettings, GatewayStore,
+    GroupMember, GroupMode, new_client_token,
 };
-use crate::settings::{BackendSettings, RelayMode, RelayProfile, RelayProtocol};
+use crate::settings::{BackendSettings, RelayApiKey, RelayMode, RelayProfile, RelayProtocol};
 use crate::tools::ToolId;
 use crate::tools::claude::{self, ClaudeContext, ClaudeProvider, GATEWAY_PROVIDER_ID};
 
@@ -46,57 +49,28 @@ pub fn gateway_base_url(port: u16, agent: &ToolId) -> String {
     format!("http://127.0.0.1:{port}/gw/{}", agent.as_str())
 }
 
-fn ensure_target_exists(
-    settings: &BackendSettings,
-    gateway: &GatewaySettings,
-    binding: &AgentBinding,
-) -> anyhow::Result<()> {
-    match binding.target.kind {
-        GatewayTargetKind::Pool => {
-            if route::binding_pool_relays(settings, gateway, binding).is_empty() {
-                bail!("供应商池是空的或都已关闭：先在「供应商」里添加供应商");
-            }
-            let model = route::binding_default_model(settings, gateway, binding);
-            if !model.is_empty()
-                && !route::pool_models(settings, gateway, binding)
-                    .iter()
-                    .any(|known| known.eq_ignore_ascii_case(&model))
-            {
-                bail!("供应商池里没有供应商提供模型 {model}");
-            }
-        }
-        GatewayTargetKind::Provider => {
-            let relay = settings
-                .relay_profiles
-                .iter()
-                .find(|relay| relay.id == binding.target.id)
-                .with_context(|| format!("供应商不存在：{}", binding.target.id))?;
-            if relay.relay_mode == RelayMode::Aggregate {
-                bail!("「{}」是聚合供应商，请选择路由组", relay.name);
-            }
-        }
-        GatewayTargetKind::Group => {
-            let group = settings
-                .aggregate_relay_profiles
-                .iter()
-                .find(|group| group.id == binding.target.id)
-                .with_context(|| format!("路由组不存在：{}", binding.target.id))?;
-            if group.members.is_empty() {
-                bail!("路由组「{}」没有成员", group.name);
-            }
-        }
+/// 开启前检查：池里有这个 Agent 能用的供应商，默认模型能路由。
+fn ensure_routable(gateway: &GatewaySettings, binding: &AgentBinding) -> anyhow::Result<()> {
+    if route::binding_pool_relays(gateway, binding).is_empty() {
+        bail!("供应商池是空的或都已关闭：先在「供应商」里添加供应商");
+    }
+    let model = binding_default_model(gateway, binding);
+    if model.is_empty() {
+        bail!("没有可用的默认模型：请给池里的供应商配置模型");
+    }
+    if !route::model_is_routable(gateway, binding, &model) {
+        bail!("供应商池里没有供应商提供模型 {model}");
     }
     Ok(())
 }
 
 /// 写给 Claude Code 的托管供应商。
 pub fn claude_gateway_provider(
-    settings: &BackendSettings,
     gateway: &GatewaySettings,
     binding: &AgentBinding,
     port: u16,
 ) -> ClaudeProvider {
-    let default_model = binding_default_model(settings, gateway, binding);
+    let default_model = binding_default_model(gateway, binding);
     let role = |value: &str| {
         let (slug, _) = crate::model_suffix::parse_model_suffix(value.trim());
         if slug.trim().is_empty() {
@@ -155,21 +129,18 @@ pub fn claude_gateway_provider(
 
 /// 写给 Grok 的合成供应商：Responses 协议，地址是网关，Key 是网关 token。
 pub fn grok_gateway_profile(
-    settings: &BackendSettings,
     gateway: &GatewaySettings,
     binding: &AgentBinding,
     port: u16,
 ) -> RelayProfile {
-    let default_model = binding_default_model(settings, gateway, binding);
+    let default_model = binding_default_model(gateway, binding);
     let window = binding.context_window;
     let mut models = vec![default_model.clone()];
-    // 供应商池模式：池里所有启用供应商的模型和路由组都进 Grok 的模型列表。
-    let pool_models = if binding.target.kind == GatewayTargetKind::Pool {
-        route::pool_models(settings, gateway, binding)
-    } else {
-        Vec::new()
-    };
-    for model in binding.declared_models().into_iter().chain(pool_models) {
+    // 池里所有能用的模型和路由组都进 Grok 的模型列表。
+    for model in route::pool_models(gateway, binding)
+        .into_iter()
+        .chain(binding.declared_models())
+    {
         if !models.contains(&model) {
             models.push(model);
         }
@@ -200,7 +171,6 @@ pub fn grok_gateway_profile(
 /// 写 Agent 配置。Claude 首次切换时若把 live 配置存成了「切换前的配置」，返回它的 id。
 fn write_agent_config(
     ctx: &ApplyContext,
-    settings: &BackendSettings,
     agent: &ToolId,
     binding: &AgentBinding,
 ) -> anyhow::Result<Option<String>> {
@@ -209,7 +179,7 @@ fn write_agent_config(
         ToolId::Claude => {
             claude::save_provider(
                 &ctx.claude,
-                claude_gateway_provider(settings, &gateway, binding, ctx.port),
+                claude_gateway_provider(&gateway, binding, ctx.port),
             )?;
             let before = claude::load(&ctx.claude)?
                 .providers
@@ -225,7 +195,7 @@ fn write_agent_config(
             return Ok(snapshot);
         }
         ToolId::Grok => {
-            let profile = grok_gateway_profile(settings, &gateway, binding, ctx.port);
+            let profile = grok_gateway_profile(&gateway, binding, ctx.port);
             crate::tools::grok::apply_profile_to_grok_at(
                 &ctx.grok_home,
                 &profile,
@@ -242,15 +212,11 @@ fn write_agent_config(
 /// 已经开着时只更新绑定与配置，开启前记下的「恢复现场」保持不变。
 pub fn enable_binding(
     ctx: &ApplyContext,
-    settings: &BackendSettings,
     agent: &ToolId,
     mut binding: AgentBinding,
 ) -> anyhow::Result<GatewaySettings> {
     let mut gateway = ctx.gateway.load()?;
-    ensure_target_exists(settings, &gateway, &binding)?;
-    if binding_default_model(settings, &gateway, &binding).is_empty() {
-        bail!("没有可用的主模型：请填写主模型，或给目标供应商配置默认模型");
-    }
+    ensure_routable(&gateway, &binding)?;
     let previous = gateway.binding(agent).cloned();
     binding.token = previous
         .as_ref()
@@ -272,7 +238,7 @@ pub fn enable_binding(
     };
     binding.enabled = true;
     binding.restore.applied_port = Some(ctx.port);
-    if let Some(snapshot) = write_agent_config(ctx, settings, agent, &binding)?
+    if let Some(snapshot) = write_agent_config(ctx, agent, &binding)?
         && binding.restore.claude_previous_provider_id.is_empty()
     {
         binding.restore.claude_previous_provider_id = snapshot;
@@ -374,10 +340,7 @@ pub fn note_grok_switched(store: &GatewayStore) -> anyhow::Result<()> {
 }
 
 /// 网关端口变了（例如 Windows 端口被占后换了新端口）：重写所有开着的 Agent 配置。
-pub fn reapply_if_port_changed(
-    ctx: &ApplyContext,
-    settings: &BackendSettings,
-) -> anyhow::Result<usize> {
+pub fn reapply_if_port_changed(ctx: &ApplyContext) -> anyhow::Result<usize> {
     let mut gateway = ctx.gateway.load()?;
     let mut changed = 0;
     let agents = gateway
@@ -392,7 +355,7 @@ pub fn reapply_if_port_changed(
         };
         binding.restore.applied_port = Some(ctx.port);
         let binding = binding.clone();
-        write_agent_config(ctx, settings, &agent, &binding)?;
+        write_agent_config(ctx, &agent, &binding)?;
         changed += 1;
     }
     if changed > 0 {
@@ -421,17 +384,17 @@ pub fn restore_all_for_exit(ctx: &ApplyContext, settings: &BackendSettings) -> a
     Ok(())
 }
 
-/// 供应商池变化后（加入、移出、开关）重写开着的 Agent 配置：Grok 的模型列表、Claude 的默认模型随池更新。
+/// 供应商池或路由组变化后重写开着的 Agent 配置：Grok 的模型列表、Claude 的默认模型随池更新。
 /// 不碰恢复现场；某个 Agent 写失败时继续写其它的，最后返回第一个错误。
-pub fn refresh_enabled(ctx: &ApplyContext, settings: &BackendSettings) -> anyhow::Result<usize> {
+pub fn refresh_enabled(ctx: &ApplyContext) -> anyhow::Result<usize> {
     let gateway = ctx.gateway.load()?;
     let mut count = 0;
     let mut first_error = None;
     for (agent, binding) in &gateway.bindings {
-        if !binding.enabled || binding.target.kind != GatewayTargetKind::Pool {
+        if !binding.enabled {
             continue;
         }
-        match write_agent_config(ctx, settings, &ToolId::parse(agent), binding) {
+        match write_agent_config(ctx, &ToolId::parse(agent), binding) {
             Ok(_) => count += 1,
             Err(error) => {
                 first_error.get_or_insert(error);
@@ -445,7 +408,7 @@ pub fn refresh_enabled(ctx: &ApplyContext, settings: &BackendSettings) -> anyhow
 }
 
 /// 启动时把开着的绑定重新写进 Agent 配置（退出时恢复过直连，或端口变了）。
-pub fn reapply_enabled(ctx: &ApplyContext, settings: &BackendSettings) -> anyhow::Result<usize> {
+pub fn reapply_enabled(ctx: &ApplyContext) -> anyhow::Result<usize> {
     let gateway = ctx.gateway.load()?;
     let mut count = 0;
     for (agent, binding) in &gateway.bindings {
@@ -462,7 +425,7 @@ pub fn reapply_enabled(ctx: &ApplyContext, settings: &BackendSettings) -> anyhow
                 binding.restore.claude_previous_provider_id = current;
             }
         }
-        if let Some(snapshot) = write_agent_config(ctx, settings, &agent, &binding)?
+        if let Some(snapshot) = write_agent_config(ctx, &agent, &binding)?
             && binding.restore.claude_previous_provider_id.is_empty()
         {
             binding.restore.claude_previous_provider_id = snapshot;
@@ -475,11 +438,8 @@ pub fn reapply_enabled(ctx: &ApplyContext, settings: &BackendSettings) -> anyhow
     Ok(count)
 }
 
-/// 把一个 Claude 供应商导入供应商池（Anthropic 协议）。返回新供应商。
-pub fn import_claude_provider_to_pool(
-    settings: &mut BackendSettings,
-    provider: &ClaudeProvider,
-) -> anyhow::Result<RelayProfile> {
+/// 把一个 Claude 供应商复制成网关供应商（Anthropic 协议）。只读 Claude 的数据，不改它。
+pub fn copy_claude_provider(provider: &ClaudeProvider) -> anyhow::Result<RelayProfile> {
     let env = provider
         .settings_config
         .get("env")
@@ -521,32 +481,24 @@ pub fn import_claude_provider_to_pool(
             models.push(model);
         }
     }
-    let existing = settings
-        .relay_profiles
-        .iter()
-        .map(|relay| relay.id.clone())
-        .collect::<Vec<_>>();
-    let mut profile = crate::provider_import::pool_relay_profile(
-        &provider.name,
-        &base_url,
-        &api_key,
-        RelayProtocol::AnthropicMessages,
-        models.first().map(String::as_str).unwrap_or_default(),
-        &models.join("\n"),
-        &existing,
-    )?;
+    let mut profile = build_relay(&ProviderInput {
+        name: provider.name.clone(),
+        base_url,
+        protocol: RelayProtocol::AnthropicMessages,
+        keys: vec![api_key],
+        model: models.first().cloned().unwrap_or_default(),
+        model_list: models.join("\n"),
+    })?;
     if bearer {
         profile.anthropic_auth_header =
             crate::anthropic_bridge::ANTHROPIC_AUTH_HEADER_BEARER.to_string();
     }
-    crate::relay_config::normalize_relay_profile_for_storage(&mut profile)?;
-    settings.relay_profiles.push(profile.clone());
     Ok(profile)
 }
 
-/// 把 Grok 页的一个供应商复制进供应商池。
-pub fn import_grok_profile_to_pool(
-    settings: &mut BackendSettings,
+/// 把 Grok 页的一个供应商复制成网关供应商。只读 Grok 的数据，不改它。
+pub fn copy_grok_profile(
+    settings: &BackendSettings,
     profile_id: &str,
 ) -> anyhow::Result<RelayProfile> {
     let source = settings
@@ -568,170 +520,322 @@ pub fn import_grok_profile_to_pool(
         .into_iter()
         .map(|(slug, _)| slug)
         .collect::<Vec<_>>();
-    let existing = settings
-        .relay_profiles
-        .iter()
-        .map(|relay| relay.id.clone())
-        .collect::<Vec<_>>();
-    let mut profile = crate::provider_import::pool_relay_profile(
-        &source.name,
-        &base_url,
-        &source.api_key,
-        source.protocol,
-        models.first().map(String::as_str).unwrap_or_default(),
-        &source.model_list,
-        &existing,
-    )?;
-    crate::relay_config::normalize_relay_profile_for_storage(&mut profile)?;
-    settings.relay_profiles.push(profile.clone());
-    Ok(profile)
+    build_relay(&ProviderInput {
+        name: source.name.clone(),
+        base_url,
+        protocol: source.protocol,
+        keys: vec![source.api_key.clone()],
+        model: models.first().cloned().unwrap_or_default(),
+        model_list: models.join("\n"),
+    })
 }
 
-/// 可以加入供应商池的 Codex 供应商（排除聚合供应商）。
-pub fn pool_relays(settings: &BackendSettings) -> Vec<&RelayProfile> {
+/// 可以从 Codex 复制过来的供应商：去掉聚合供应商和官方登录账号。
+///
+/// 官方登录的 refresh token 每用一次就换新的，刷新结果只写回 Codex 自己那一条；
+/// 复制一份会让两边互相把对方的登录刷失效，所以网关里的订阅账号要单独登录。
+pub fn codex_importable(settings: &BackendSettings) -> Vec<&RelayProfile> {
     settings
         .relay_profiles
         .iter()
-        .filter(|relay| relay.relay_mode != RelayMode::Aggregate)
+        .filter(|relay| {
+            relay.relay_mode != RelayMode::Aggregate
+                && !crate::official_login::member_uses_official_login_transport(relay)
+        })
         .collect()
 }
 
-/// 网关的供应商池：按加入顺序列出池里的供应商，再补上被绑定但不在池里的供应商；
-/// 已在 Codex 里删掉的 id 直接跳过。
-pub fn gateway_pool<'a>(
-    settings: &'a BackendSettings,
-    gateway: &GatewaySettings,
-) -> Vec<&'a RelayProfile> {
-    let candidates = pool_relays(settings);
-    let mut ids: Vec<String> = Vec::new();
-    for id in gateway
-        .pool
+/// 复制一个 Codex 供应商（地址、协议、多 Key、请求头等原样带上）。
+pub fn copy_codex_provider(
+    settings: &BackendSettings,
+    relay_id: &str,
+) -> anyhow::Result<RelayProfile> {
+    let relay = settings
+        .relay_profiles
         .iter()
-        .cloned()
-        .chain(gateway.bound_provider_ids())
-    {
-        if !ids.contains(&id) {
-            ids.push(id);
+        .find(|relay| relay.id == relay_id)
+        .with_context(|| format!("Codex 供应商不存在：{relay_id}"))?;
+    if relay.relay_mode == RelayMode::Aggregate {
+        bail!(
+            "「{}」是聚合供应商，网关的路由组请在「路由」里新建",
+            relay.name
+        );
+    }
+    if crate::official_login::member_uses_official_login_transport(relay) {
+        bail!(
+            "「{}」是官方登录账号，不能复制：两边共用登录会互相把对方刷失效，请在网关里单独登录",
+            relay.name
+        );
+    }
+    if relay.base_url.contains("/gw/") {
+        bail!("「{}」指向网关本身，不能导入", relay.name);
+    }
+    Ok(relay.clone())
+}
+
+/// 新建 / 编辑网关供应商的输入。`keys` 每个一行；编辑时为空表示沿用原来的 Key。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderInput {
+    pub name: String,
+    pub base_url: String,
+    pub protocol: RelayProtocol,
+    #[serde(default)]
+    pub keys: Vec<String>,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub model_list: String,
+}
+
+fn clean_keys(keys: &[String]) -> Vec<String> {
+    let mut cleaned: Vec<String> = Vec::new();
+    for key in keys {
+        let key = key.trim();
+        if !key.is_empty() && !cleaned.iter().any(|known| known == key) {
+            cleaned.push(key.to_string());
         }
     }
-    ids.iter()
-        .filter_map(|id| candidates.iter().copied().find(|relay| &relay.id == id))
-        .collect()
+    cleaned
 }
 
-/// 把 Codex 供应商加入网关池。
-pub fn add_to_pool(
+/// 按输入组装上游配置：多个 Key 写成命名 Key，参与多 Key 轮换。
+fn build_relay(input: &ProviderInput) -> anyhow::Result<RelayProfile> {
+    if input.base_url.contains("/gw/") {
+        bail!("不能把网关自己加进供应商池");
+    }
+    let keys = clean_keys(&input.keys);
+    let Some(first) = keys.first() else {
+        bail!("API Key 为空");
+    };
+    let mut relay = crate::provider_import::pool_relay_profile(
+        &input.name,
+        &input.base_url,
+        first,
+        input.protocol,
+        &input.model,
+        &input.model_list,
+        &[],
+    )?;
+    relay.relay_mode = RelayMode::PureApi;
+    if keys.len() > 1 {
+        relay.api_keys = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| RelayApiKey {
+                id: format!("key-{}", index + 1),
+                name: format!("Key {}", index + 1),
+                api_key: key.clone(),
+            })
+            .collect();
+        relay.active_api_key_id = "key-1".to_string();
+    }
+    crate::relay_config::normalize_relay_profile_for_storage(&mut relay)?;
+    Ok(relay)
+}
+
+/// 把一份上游配置加进网关池，id 换成网关里不重复的短名。返回新供应商的 id。
+pub fn add_provider(
     store: &GatewayStore,
-    settings: &BackendSettings,
-    relay_ids: &[String],
+    mut relay: RelayProfile,
+    source: &str,
+) -> anyhow::Result<(GatewaySettings, String)> {
+    let mut gateway = store.load()?;
+    relay.id = gateway.unique_slug(&relay.name, false);
+    let id = relay.id.clone();
+    gateway.providers.push(GatewayProvider {
+        enabled: true,
+        source: source.to_string(),
+        relay,
+    });
+    store.save(&gateway)?;
+    Ok((gateway, id))
+}
+
+/// 用预设或手填的地址、Key 新建网关供应商。
+pub fn create_provider(
+    store: &GatewayStore,
+    input: &ProviderInput,
+    source: &str,
+) -> anyhow::Result<(GatewaySettings, String)> {
+    add_provider(store, build_relay(input)?, source)
+}
+
+/// 编辑网关供应商：id 不变（Agent、路由组里的引用都还有效）；`keys` 为空时沿用原来的 Key。
+pub fn update_provider(
+    store: &GatewayStore,
+    id: &str,
+    input: &ProviderInput,
 ) -> anyhow::Result<GatewaySettings> {
     let mut gateway = store.load()?;
-    for relay_id in relay_ids {
-        let Some(relay) = settings
-            .relay_profiles
-            .iter()
-            .find(|relay| &relay.id == relay_id)
-        else {
-            bail!("供应商不存在：{relay_id}");
+    let Some(provider) = gateway
+        .providers
+        .iter_mut()
+        .find(|provider| provider.relay.id == id)
+    else {
+        bail!("供应商不存在：{id}");
+    };
+    let mut input = input.clone();
+    let keep_keys = clean_keys(&input.keys).is_empty();
+    if keep_keys {
+        input.keys = if provider.relay.api_keys.len() > 1 {
+            provider
+                .relay
+                .api_keys
+                .iter()
+                .map(|key| key.api_key.clone())
+                .collect()
+        } else {
+            vec![provider.relay.api_key.clone()]
         };
-        if relay.relay_mode == RelayMode::Aggregate {
-            bail!("「{}」是聚合供应商，请作为路由组使用", relay.name);
-        }
-        gateway.add_to_pool(relay_id);
     }
+    let mut relay = build_relay(&input)?;
+    relay.id = id.to_string();
+    // 原来的请求头、User-Agent、Anthropic 鉴权方式这些高级设置保留。
+    relay.custom_headers = provider.relay.custom_headers.clone();
+    relay.user_agent = provider.relay.user_agent.clone();
+    relay.anthropic_auth_header = provider.relay.anthropic_auth_header.clone();
+    provider.relay = relay;
     store.save(&gateway)?;
     Ok(gateway)
 }
 
-/// 把供应商移出网关池（Codex 里的供应商本身保留）。被 Agent 直接绑定时不允许移出。
-pub fn remove_from_pool(store: &GatewayStore, relay_id: &str) -> anyhow::Result<GatewaySettings> {
+/// 删除网关供应商：同时清掉路由组里指向它的成员和 Agent「挑选」里的记录。直连模式的数据不受影响。
+pub fn delete_provider(store: &GatewayStore, id: &str) -> anyhow::Result<GatewaySettings> {
     let mut gateway = store.load()?;
-    if let Some((agent, _)) = gateway.bindings.iter().find(|(_, binding)| {
-        binding.target.kind == GatewayTargetKind::Provider && binding.target.id == relay_id
-    }) {
-        bail!("{agent} 正绑定在这个供应商上，请先给它换一个模型或关闭网关");
+    let before = gateway.providers.len();
+    gateway.providers.retain(|provider| provider.relay.id != id);
+    if gateway.providers.len() == before {
+        bail!("供应商不存在：{id}");
     }
-    gateway.pool.retain(|id| id != relay_id);
-    gateway.pool_disabled.retain(|id| id != relay_id);
-    store.save(&gateway)?;
-    Ok(gateway)
-}
-
-/// 调整池里供应商的顺序（同一个模型有多家时按这个顺序尝试）。没列出的保持原顺序排在后面。
-pub fn reorder_pool(store: &GatewayStore, relay_ids: &[String]) -> anyhow::Result<GatewaySettings> {
-    let mut gateway = store.load()?;
-    let mut ordered: Vec<String> = relay_ids
-        .iter()
-        .filter(|id| gateway.pool.contains(id))
-        .cloned()
-        .collect();
-    ordered.dedup();
-    for id in &gateway.pool {
-        if !ordered.contains(id) {
-            ordered.push(id.clone());
-        }
+    let prefix = format!("{id}/");
+    for group in &mut gateway.groups {
+        group
+            .members
+            .retain(|member| !member.model.starts_with(&prefix));
     }
-    gateway.pool = ordered;
+    for binding in gateway.bindings.values_mut() {
+        binding.pool_exclude.retain(|excluded| excluded != id);
+    }
+    crate::gateway::key_pool::reset(id);
     store.save(&gateway)?;
     Ok(gateway)
 }
 
 /// 打开或关掉池里的某个供应商：关掉后不参与路由，也不出现在 Agent 的模型列表里。
-pub fn set_pool_enabled(
+pub fn set_provider_enabled(
     store: &GatewayStore,
-    relay_id: &str,
+    id: &str,
     enabled: bool,
 ) -> anyhow::Result<GatewaySettings> {
     let mut gateway = store.load()?;
-    if !gateway.pool.iter().any(|id| id == relay_id) {
-        bail!("供应商不在池里：{relay_id}");
-    }
-    gateway.set_pool_enabled(relay_id, enabled);
+    let Some(provider) = gateway
+        .providers
+        .iter_mut()
+        .find(|provider| provider.relay.id == id)
+    else {
+        bail!("供应商不存在：{id}");
+    };
+    provider.enabled = enabled;
     store.save(&gateway)?;
     Ok(gateway)
 }
 
-/// 用预设或手填的地址、Key 新建一个供应商：写进 Codex 供应商列表并加入网关池。
-pub struct NewPoolProvider<'a> {
-    pub name: &'a str,
-    pub base_url: &'a str,
-    pub api_key: &'a str,
-    pub protocol: RelayProtocol,
-    pub model: &'a str,
-    pub model_list: &'a str,
-}
-
-pub fn create_pool_provider(
-    settings: &mut BackendSettings,
-    input: NewPoolProvider<'_>,
-) -> anyhow::Result<RelayProfile> {
-    if input.base_url.contains("/gw/") {
-        bail!("不能把网关自己加进供应商池");
+/// 调整池里供应商的顺序（同一个模型有多家时按这个顺序尝试）。没列出的保持原顺序排在后面。
+pub fn reorder_providers(store: &GatewayStore, ids: &[String]) -> anyhow::Result<GatewaySettings> {
+    let mut gateway = store.load()?;
+    let mut ordered: Vec<GatewayProvider> = Vec::new();
+    for id in ids {
+        if let Some(position) = gateway
+            .providers
+            .iter()
+            .position(|provider| &provider.relay.id == id)
+        {
+            ordered.push(gateway.providers.remove(position));
+        }
     }
-    let existing = settings
-        .relay_profiles
-        .iter()
-        .map(|relay| relay.id.clone())
-        .collect::<Vec<_>>();
-    let mut profile = crate::provider_import::pool_relay_profile(
-        input.name,
-        input.base_url,
-        input.api_key,
-        input.protocol,
-        input.model,
-        input.model_list,
-        &existing,
-    )?;
-    crate::relay_config::normalize_relay_profile_for_storage(&mut profile)?;
-    settings.relay_profiles.push(profile.clone());
-    Ok(profile)
+    ordered.append(&mut gateway.providers);
+    gateway.providers = ordered;
+    store.save(&gateway)?;
+    Ok(gateway)
 }
 
-/// 绑定解析后的主模型，UI 展示用。
-pub fn resolved_default_model(
-    settings: &BackendSettings,
-    gateway: &GatewaySettings,
-    binding: &AgentBinding,
-) -> String {
-    route::binding_default_model(settings, gateway, binding)
+/// 新建 / 编辑路由组的输入。`id` 为空表示新建。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupInput {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub mode: GroupMode,
+    #[serde(default)]
+    pub members: Vec<GroupMember>,
+}
+
+/// 保存路由组。成员去空、去重；不能直接包含自己。返回组 id。
+pub fn save_group(
+    store: &GatewayStore,
+    input: &GroupInput,
+) -> anyhow::Result<(GatewaySettings, String)> {
+    let mut gateway = store.load()?;
+    let name = input.name.trim();
+    if name.is_empty() {
+        bail!("请填写路由组名称");
+    }
+    let id = if input.id.trim().is_empty() {
+        gateway.unique_slug(name, true)
+    } else {
+        input.id.trim().to_string()
+    };
+    let own = format!("{GROUP_MODEL_PREFIX}{id}");
+    let mut members: Vec<GroupMember> = Vec::new();
+    for member in &input.members {
+        let model = member.model.trim();
+        if model.is_empty() || model.eq_ignore_ascii_case(&own) {
+            continue;
+        }
+        if !members.iter().any(|known| known.model == model) {
+            members.push(GroupMember {
+                model: model.to_string(),
+                weight: member.weight.max(1),
+            });
+        }
+    }
+    if members.is_empty() {
+        bail!("路由组至少要有一个成员");
+    }
+    let group = GatewayGroup {
+        id: id.clone(),
+        name: name.to_string(),
+        mode: input.mode,
+        members,
+    };
+    match gateway.groups.iter_mut().find(|known| known.id == id) {
+        Some(existing) => *existing = group,
+        None => gateway.groups.push(group),
+    }
+    store.save(&gateway)?;
+    Ok((gateway, id))
+}
+
+/// 删除路由组：其它组里引用它的成员一并去掉。
+pub fn delete_group(store: &GatewayStore, id: &str) -> anyhow::Result<GatewaySettings> {
+    let mut gateway = store.load()?;
+    let before = gateway.groups.len();
+    gateway.groups.retain(|group| group.id != id);
+    if gateway.groups.len() == before {
+        bail!("路由组不存在：{id}");
+    }
+    let reference = format!("{GROUP_MODEL_PREFIX}{id}");
+    for group in &mut gateway.groups {
+        group.members.retain(|member| member.model != reference);
+    }
+    store.save(&gateway)?;
+    Ok(gateway)
+}
+
+/// 绑定解析后的默认模型，UI 展示用。
+pub fn resolved_default_model(gateway: &GatewaySettings, binding: &AgentBinding) -> String {
+    route::binding_default_model(gateway, binding)
 }

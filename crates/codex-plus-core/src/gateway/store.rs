@@ -1,8 +1,8 @@
 //! 网关模式的持久状态：`<状态目录>/gateway.json`。
 //!
-//! 不放进 `settings.json`：那份文件由前端整份保存，网关绑定写在里面会被覆盖。
-//! 供应商池与路由组仍以 `settings.json` 的 `relayProfiles` / `aggregateRelayProfiles`
-//! 为准，这里只存「哪个 Agent 走网关、指向哪个供应商或路由组、用哪些模型」。
+//! 网关模式与原来的直连模式完全独立：供应商池、路由组都只存在这里，
+//! 不读也不写 `settings.json` 里 Codex / Claude / Grok 各自的供应商。从直连模式「导入」是复制一份，
+//! 之后两边互不影响。文件里有上游 Key 和本地 token，新建时只给本人读写。
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use crate::settings::RelayProfile;
 use crate::tools::ToolId;
 
 const STORE_FILE: &str = "gateway.json";
@@ -18,22 +19,68 @@ const STORE_VERSION: u32 = 1;
 /// 客户端 token 前缀；日志里看到它就知道是网关签发的本地凭据，不是上游 Key。
 pub const CLIENT_TOKEN_PREFIX: &str = "cpx-gw-";
 
-/// 绑定目标：单个供应商，或一个路由组（复用聚合供应商的成员与策略）。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// 路由组当作模型名时的前缀：`group/<组 id>`。
+pub const GROUP_MODEL_PREFIX: &str = "group/";
+
+/// 网关供应商池里的一个供应商。上游配置复用 [`RelayProfile`] 的结构（协议、地址、多 Key 等），
+/// 但只存在网关里；`relay.id` 同时是它的短名，`<id>/<模型>` 可以指定只发给它。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct GatewayTarget {
-    pub kind: GatewayTargetKind,
-    pub id: String,
+pub struct GatewayProvider {
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+    /// 来源：内置预设的 key，或 `codex:<id>` / `claude:<id>` / `grok:<id>`，界面用来判断「已添加」。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    pub relay: RelayProfile,
 }
 
+fn enabled_by_default() -> bool {
+    true
+}
+
+/// 路由组的成员怎么排先后。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum GatewayTargetKind {
+pub enum GroupMode {
+    /// 依次：按成员顺序，前一个答不了才换下一个。
     #[default]
-    Provider,
-    Group,
-    /// 整个供应商池：Agent 能用池里所有启用供应商的模型，按模型名选上游。
-    Pool,
+    InOrder,
+    /// 轮换：每个请求从下一个成员开始。
+    Rotate,
+    /// 按权重：按成员权重分配第一个尝试的成员。
+    Weighted,
+}
+
+/// 路由组成员：`<供应商 id>/<模型>`、裸模型名（池里所有提供它的供应商），或 `group/<组 id>`（嵌套）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupMember {
+    pub model: String,
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+}
+
+fn default_weight() -> u32 {
+    1
+}
+
+/// 网关自己的路由组：Agent 在模型列表里把它当一个模型（`group/<id>`）来选。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayGroup {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub mode: GroupMode,
+    #[serde(default)]
+    pub members: Vec<GroupMember>,
+}
+
+impl GatewayGroup {
+    pub fn model_id(&self) -> String {
+        format!("{GROUP_MODEL_PREFIX}{}", self.id)
+    }
 }
 
 /// 请求里的模型不在绑定的模型集合里时怎么办。
@@ -80,10 +127,8 @@ pub struct GatewayRestoreState {
 pub struct AgentBinding {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default)]
-    pub target: GatewayTarget,
     /// 主模型：写进 Agent 配置的默认模型，也是未知模型的改写目标。
-    /// 为空时用目标供应商自己的默认模型。
+    /// 为空时用池里第一个供应商的默认模型。
     #[serde(default)]
     pub model: String,
     /// 额外暴露给 Agent 的模型（每行一个，可带 `[1M]` 窗口后缀）。
@@ -99,7 +144,7 @@ pub struct AgentBinding {
     /// 非 claude-* 模型名时 Claude Code 默认不发 effort，打开后强制启用。
     #[serde(default)]
     pub claude_enable_effort: bool,
-    /// 供应商池模式下这个 Agent 不使用的供应商（「挑选」里取消勾选的）。
+    /// 这个 Agent 不使用的池内供应商（「挑选」里取消勾选的）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pool_exclude: Vec<String>,
     /// 网关签发给该 Agent 的本地 token，用来鉴权本地请求。
@@ -113,7 +158,6 @@ impl Default for AgentBinding {
     fn default() -> Self {
         Self {
             enabled: false,
-            target: GatewayTarget::default(),
             model: String::new(),
             extra_models: Vec::new(),
             claude_roles: ClaudeRoleModels::default(),
@@ -182,48 +226,50 @@ pub struct GatewaySettings {
     /// 退出 Codex++ 时把走网关的 Agent 恢复成直连，避免网关不在时连不上。
     #[serde(default)]
     pub restore_on_exit: bool,
-    /// 供应商池：加入网关的供应商 id（引用 Codex 供应商列表，不复制数据）。
-    /// 旧版状态文件没有这个字段，视为空池；已绑定的供应商总会算在池里。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pool: Vec<String>,
-    /// 池里被关掉的供应商：不参与路由，也不出现在 Agent 的模型列表里。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pool_disabled: Vec<String>,
+    /// 网关的供应商池（顺序即同一模型多家时的尝试顺序）。
+    #[serde(default)]
+    pub providers: Vec<GatewayProvider>,
+    /// 网关的路由组。
+    #[serde(default)]
+    pub groups: Vec<GatewayGroup>,
 }
 
 impl GatewaySettings {
-    /// 把供应商加入池（已在池里则不变）。
-    pub fn add_to_pool(&mut self, relay_id: &str) {
-        let relay_id = relay_id.trim();
-        if !relay_id.is_empty() && !self.pool.iter().any(|id| id == relay_id) {
-            self.pool.push(relay_id.to_string());
-        }
-    }
-
-    /// 池里启用的供应商 id（按加入顺序）。
-    pub fn enabled_pool_ids(&self) -> Vec<String> {
-        self.pool
+    pub fn provider(&self, id: &str) -> Option<&GatewayProvider> {
+        self.providers
             .iter()
-            .filter(|id| !self.pool_disabled.contains(id))
-            .cloned()
-            .collect()
+            .find(|provider| provider.relay.id == id)
     }
 
-    pub fn set_pool_enabled(&mut self, relay_id: &str, enabled: bool) {
-        self.pool_disabled.retain(|id| id != relay_id);
-        if !enabled {
-            self.pool_disabled.push(relay_id.to_string());
+    pub fn group(&self, id: &str) -> Option<&GatewayGroup> {
+        self.groups.iter().find(|group| group.id == id)
+    }
+
+    /// 给新供应商 / 路由组生成不重复的短名：按名字转小写、空白换成 `-`，重名时加 `-2`、`-3`。
+    /// `group` 留给路由组前缀，供应商不能用。
+    pub fn unique_slug(&self, name: &str, for_group: bool) -> String {
+        let base = slugify(name);
+        let base = if !for_group && base == "group" {
+            "group-provider".to_string()
+        } else {
+            base
+        };
+        let taken = |candidate: &str| {
+            if for_group {
+                self.groups.iter().any(|group| group.id == candidate)
+            } else {
+                self.providers
+                    .iter()
+                    .any(|provider| provider.relay.id == candidate)
+            }
+        };
+        if !taken(&base) {
+            return base;
         }
-    }
-
-    /// 绑定直接指向的供应商 id（不含路由组成员）。
-    pub fn bound_provider_ids(&self) -> Vec<String> {
-        self.bindings
-            .values()
-            .filter(|binding| binding.target.kind == GatewayTargetKind::Provider)
-            .map(|binding| binding.target.id.clone())
-            .filter(|id| !id.is_empty())
-            .collect()
+        (2..)
+            .map(|index| format!("{base}-{index}"))
+            .find(|candidate| !taken(candidate))
+            .expect("无限序列总能找到空位")
     }
 
     pub fn binding(&self, agent: &ToolId) -> Option<&AgentBinding> {
@@ -283,7 +329,16 @@ fn read_store(path: &Path) -> anyhow::Result<GatewaySettings> {
     if text.trim().is_empty() {
         return Ok(GatewaySettings::default());
     }
-    serde_json::from_str(&text).with_context(|| format!("无法解析 {}", path.display()))
+    let mut settings: GatewaySettings =
+        serde_json::from_str(&text).with_context(|| format!("无法解析 {}", path.display()))?;
+    // 地址、默认模型、Key 落盘时存在 config / auth 文本里，读回来要像 settings.json 一样还原出来。
+    for provider in &mut settings.providers {
+        let mut normalized = provider.relay.clone();
+        if crate::relay_config::normalize_relay_profile_for_storage(&mut normalized).is_ok() {
+            provider.relay = normalized;
+        }
+    }
+    Ok(settings)
 }
 
 fn write_store(path: &Path, settings: &GatewaySettings) -> anyhow::Result<()> {
@@ -311,6 +366,26 @@ fn set_private(path: &Path) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 fn set_private(_path: &Path) -> anyhow::Result<()> {
     Ok(())
+}
+
+/// 名字 → 短名：小写，空白、`_`、`/` 换成 `-`，去掉首尾 `-`；空了用 `unnamed`。
+pub fn slugify(name: &str) -> String {
+    let mut slug = String::new();
+    for ch in name.trim().to_lowercase().chars() {
+        if ch.is_whitespace() || ch == '_' || ch == '/' {
+            if !slug.ends_with('-') {
+                slug.push('-');
+            }
+        } else {
+            slug.push(ch);
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "unnamed".to_string()
+    } else {
+        slug.to_string()
+    }
 }
 
 /// 为 Agent 签发一个新的本地 token。
@@ -358,10 +433,6 @@ mod tests {
             "claude".to_string(),
             AgentBinding {
                 enabled: true,
-                target: GatewayTarget {
-                    kind: GatewayTargetKind::Group,
-                    id: "pool".to_string(),
-                },
                 model: "deepseek-v4-pro".to_string(),
                 token: new_client_token(&ToolId::Claude),
                 ..AgentBinding::default()
@@ -370,7 +441,6 @@ mod tests {
         store.save(&settings).unwrap();
         let text = std::fs::read_to_string(&store.path).unwrap();
         assert!(text.contains("\"version\": 1"), "{text}");
-        assert!(text.contains("\"kind\": \"group\""), "{text}");
         let loaded = store.load().unwrap();
         assert_eq!(loaded.bindings, settings.bindings);
         assert!(loaded.any_enabled());
@@ -391,6 +461,33 @@ mod tests {
             binding.declared_models(),
             vec!["deepseek-v4-pro", "deepseek-v4-flash", "glm-5.3"]
         );
+    }
+
+    #[test]
+    fn older_files_with_codex_references_still_load() {
+        // 早期版本把绑定指向 Codex 的供应商 / 聚合，现在这些字段直接忽略。
+        let text = r#"{"version":1,"bindings":{"claude":{"enabled":true,"target":{"kind":"group","id":"x"},"model":"m","token":"t"}},"pool":["a"]}"#;
+        let settings: GatewaySettings = serde_json::from_str(text).unwrap();
+        assert!(settings.any_enabled());
+        assert!(settings.providers.is_empty());
+    }
+
+    #[test]
+    fn slugs_are_unique_and_keep_group_prefix_free() {
+        let mut settings = GatewaySettings::default();
+        assert_eq!(settings.unique_slug("Daily coding", true), "daily-coding");
+        assert_eq!(settings.unique_slug(" 哈基米 国模 ", false), "哈基米-国模");
+        assert_eq!(settings.unique_slug("Group", false), "group-provider");
+        settings.providers.push(GatewayProvider {
+            enabled: true,
+            source: String::new(),
+            relay: RelayProfile {
+                id: "deepseek".to_string(),
+                ..RelayProfile::default()
+            },
+        });
+        assert_eq!(settings.unique_slug("DeepSeek", false), "deepseek-2");
+        assert_eq!(settings.unique_slug("", true), "unnamed");
     }
 
     #[test]

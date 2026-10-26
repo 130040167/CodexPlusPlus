@@ -5,12 +5,10 @@
 use std::sync::{Arc, Mutex};
 
 use codex_plus_core::gateway::store::{
-    AgentBinding, ClaudeRoleModels, GatewaySettings, GatewayStore, GatewayTarget, GatewayTargetKind,
+    AgentBinding, ClaudeRoleModels, GatewayGroup, GatewayProvider, GatewaySettings, GatewayStore,
+    GroupMember, GroupMode,
 };
-use codex_plus_core::settings::{
-    AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, BackendSettings,
-    RelayApiKey, RelayProfile, RelayProtocol, SettingsStore,
-};
+use codex_plus_core::settings::{RelayApiKey, RelayProfile, RelayProtocol};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -123,13 +121,9 @@ fn chat_tool_sse() -> String {
         + "data: [DONE]\n\n"
 }
 
-fn binding(kind: GatewayTargetKind, id: &str, model: &str, token: &str) -> AgentBinding {
+fn binding(model: &str, token: &str) -> AgentBinding {
     AgentBinding {
         enabled: true,
-        target: GatewayTarget {
-            kind,
-            id: id.to_string(),
-        },
         model: model.to_string(),
         token: token.to_string(),
         claude_roles: ClaudeRoleModels::default(),
@@ -137,11 +131,19 @@ fn binding(kind: GatewayTargetKind, id: &str, model: &str, token: &str) -> Agent
     }
 }
 
-fn save(settings: &BackendSettings, gateway: &GatewaySettings) {
-    let store = SettingsStore::default();
-    let mut settings = settings.clone();
-    settings.settings_revision = store.revision().unwrap();
-    store.save(&settings).unwrap();
+/// 网关的供应商池只存在 gateway.json，不碰 settings.json。
+fn providers(relays: Vec<RelayProfile>) -> Vec<GatewayProvider> {
+    relays
+        .into_iter()
+        .map(|relay| GatewayProvider {
+            enabled: true,
+            source: String::new(),
+            relay,
+        })
+        .collect()
+}
+
+fn save(gateway: &GatewaySettings) {
     GatewayStore::default().save(gateway).unwrap();
 }
 
@@ -197,31 +199,28 @@ async fn gateway_end_to_end() {
     // —— 1. Claude → Chat 上游，流式文本；未知模型名改写成主模型 ——
     let (chat_base, chat_seen) =
         mock_upstream(vec![(200, "text/event-stream", chat_sse("你好呀"))]).await;
-    let mut settings = BackendSettings {
-        relay_profiles: vec![relay(
+    let mut gateway = GatewaySettings {
+        providers: providers(vec![relay(
             "chat",
             &chat_base,
             "sk-chat",
             RelayProtocol::ChatCompletions,
             "deepseek-v4-pro",
-        )],
-        ..BackendSettings::default()
+        )]),
+        ..GatewaySettings::default()
     };
-    let mut gateway = GatewaySettings::default();
-    gateway.bindings.insert(
-        "claude".into(),
-        binding(
-            GatewayTargetKind::Provider,
-            "chat",
-            "deepseek-v4-pro",
-            token,
-        ),
-    );
-    save(&settings, &gateway);
-    let loaded = SettingsStore::default().load().unwrap();
+    gateway
+        .bindings
+        .insert("claude".into(), binding("deepseek-v4-pro", token));
+    save(&gateway);
+    let loaded = GatewayStore::default().load().unwrap();
     assert_eq!(
-        loaded.relay_profiles[0].base_url, chat_base,
+        loaded.providers[0].relay.base_url, chat_base,
         "供应商地址落盘后应保留"
+    );
+    assert!(
+        !state_dir.path().join("settings.json").exists(),
+        "网关模式不写直连模式的 settings.json"
     );
 
     let (status, text) = post(port, "/gw/claude/v1/messages", token, &claude_request(true)).await;
@@ -258,8 +257,16 @@ async fn gateway_end_to_end() {
         assert_eq!(body["messages"][0]["content"], "You are Claude Code.");
         assert_eq!(body["tools"][0]["function"]["name"], "Bash");
     }
-    let log =
-        std::fs::read_to_string(state_dir.path().join("request-log.jsonl")).unwrap_or_default();
+    // 请求日志在响应转发完后异步落盘，稍等一下。
+    let mut log = String::new();
+    for _ in 0..40 {
+        log = std::fs::read_to_string(state_dir.path().join("request-log.jsonl"))
+            .unwrap_or_default();
+        if log.contains("\"agent\":\"claude\"") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     assert!(
         log.contains("\"agent\":\"claude\""),
         "请求日志应记录 Agent：{log}"
@@ -267,14 +274,14 @@ async fn gateway_end_to_end() {
 
     // —— 2. Chat 上游返回工具调用 → tool_use 块 ——
     let (tool_base, _) = mock_upstream(vec![(200, "text/event-stream", chat_tool_sse())]).await;
-    settings.relay_profiles = vec![relay(
+    gateway.providers = providers(vec![relay(
         "chat",
         &tool_base,
         "sk-chat",
         RelayProtocol::ChatCompletions,
         "deepseek-v4-pro",
-    )];
-    save(&settings, &gateway);
+    )]);
+    save(&gateway);
     let (status, text) = post(port, "/gw/claude/v1/messages", token, &claude_request(true)).await;
     assert_eq!(status, 200, "{text}");
     let events = sse_events(&text);
@@ -303,14 +310,14 @@ async fn gateway_end_to_end() {
     })
     .to_string();
     let (json_base, _) = mock_upstream(vec![(200, "application/json", json_completion)]).await;
-    settings.relay_profiles = vec![relay(
+    gateway.providers = providers(vec![relay(
         "chat",
         &json_base,
         "sk-chat",
         RelayProtocol::ChatCompletions,
         "deepseek-v4-pro",
-    )];
-    save(&settings, &gateway);
+    )]);
+    save(&gateway);
     let (status, text) = post(port, "/gw/claude/v1/messages", token, &claude_request(true)).await;
     assert_eq!(status, 200, "{text}");
     let events = sse_events(&text);
@@ -332,18 +339,17 @@ async fn gateway_end_to_end() {
     .to_string();
     let (resp_base, resp_seen) =
         mock_upstream(vec![(200, "application/json", responses_body)]).await;
-    settings.relay_profiles = vec![relay(
+    gateway.providers = providers(vec![relay(
         "resp",
         &resp_base,
         "sk-resp",
         RelayProtocol::Responses,
         "gpt-up",
-    )];
-    gateway.bindings.insert(
-        "claude".into(),
-        binding(GatewayTargetKind::Provider, "resp", "gpt-up", token),
-    );
-    save(&settings, &gateway);
+    )]);
+    gateway
+        .bindings
+        .insert("claude".into(), binding("gpt-up", token));
+    save(&gateway);
     let (status, text) = post(
         port,
         "/gw/claude/v1/messages",
@@ -370,18 +376,17 @@ async fn gateway_end_to_end() {
     let anthropic_sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_a\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-up\",\"content\":[],\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string();
     let (anth_base, anth_seen) =
         mock_upstream(vec![(200, "text/event-stream", anthropic_sse.clone())]).await;
-    settings.relay_profiles = vec![relay(
+    gateway.providers = providers(vec![relay(
         "anth",
         &anth_base,
         "sk-anth",
         RelayProtocol::AnthropicMessages,
         "claude-up",
-    )];
-    gateway.bindings.insert(
-        "claude".into(),
-        binding(GatewayTargetKind::Provider, "anth", "claude-up", token),
-    );
-    save(&settings, &gateway);
+    )]);
+    gateway
+        .bindings
+        .insert("claude".into(), binding("claude-up", token));
+    save(&gateway);
     let request = claude_request(true);
     let (status, text) = post(port, "/gw/claude/v1/messages", token, &request).await;
     assert_eq!(status, 200, "{text}");
@@ -436,17 +441,11 @@ async fn gateway_end_to_end() {
         },
     ];
     multi.active_api_key_id = "one".into();
-    settings.relay_profiles = vec![multi];
-    gateway.bindings.insert(
-        "claude".into(),
-        binding(
-            GatewayTargetKind::Provider,
-            "multi",
-            "deepseek-v4-pro",
-            token,
-        ),
-    );
-    save(&settings, &gateway);
+    gateway.providers = providers(vec![multi]);
+    gateway
+        .bindings
+        .insert("claude".into(), binding("deepseek-v4-pro", token));
+    save(&gateway);
     let (status, text) = post(port, "/gw/claude/v1/messages", token, &claude_request(true)).await;
     assert_eq!(status, 200, "{text}");
     assert!(text.contains("第二个 Key"), "{text}");
@@ -485,7 +484,7 @@ async fn gateway_end_to_end() {
     .await;
     let (good_base, good_seen) =
         mock_upstream(vec![(200, "text/event-stream", chat_sse("备用成员"))]).await;
-    settings.relay_profiles = vec![
+    gateway.providers = providers(vec![
         relay(
             "bad",
             &bad_base,
@@ -500,32 +499,27 @@ async fn gateway_end_to_end() {
             RelayProtocol::ChatCompletions,
             "glm-5.3",
         ),
-    ];
-    settings.aggregate_relay_profiles = vec![AggregateRelayProfile {
+    ]);
+    // 网关自己的路由组：默认模型就是这个组，Claude 请求的未知模型改写成它。
+    gateway.groups = vec![GatewayGroup {
         id: "group".into(),
         name: "group".into(),
-        session_provider: Default::default(),
-        model_aggregation_enabled: false,
-        strategy: AggregateRelayStrategy::Failover,
+        mode: GroupMode::InOrder,
         members: vec![
-            AggregateRelayMember {
-                relay_id: "bad".into(),
+            GroupMember {
+                model: "bad/deepseek-v4-pro".into(),
                 weight: 1,
             },
-            AggregateRelayMember {
-                relay_id: "good".into(),
+            GroupMember {
+                model: "good/glm-5.3".into(),
                 weight: 1,
             },
         ],
-        routes: Vec::new(),
-        default_relay_id: String::new(),
-        sync_default_member_login: false,
     }];
-    gateway.bindings.insert(
-        "claude".into(),
-        binding(GatewayTargetKind::Group, "group", "deepseek-v4-pro", token),
-    );
-    save(&settings, &gateway);
+    gateway
+        .bindings
+        .insert("claude".into(), binding("group/group", token));
+    save(&gateway);
     let (status, text) = post(port, "/gw/claude/v1/messages", token, &claude_request(true)).await;
     assert_eq!(status, 400, "{text}");
     let error: Value = serde_json::from_str(&text).unwrap();
@@ -610,28 +604,29 @@ async fn gateway_end_to_end() {
         .json::<Value>()
         .await
         .unwrap();
-    assert_eq!(models["data"][0]["id"], "deepseek-v4-pro");
+    // 默认模型（这里是路由组）在前，然后是池里所有模型和路由组。
+    let ids = models["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| model["id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["group/group", "deepseek-v4-pro", "glm-5.3"]);
 
     // —— 8. Grok：Responses 客户端 → Chat 上游，输出 Responses 事件流 ——
     let (grok_base, grok_seen) =
         mock_upstream(vec![(200, "text/event-stream", chat_sse("Grok 你好"))]).await;
-    settings.relay_profiles = vec![relay(
+    gateway.providers = providers(vec![relay(
         "grokup",
         &grok_base,
         "sk-grok",
         RelayProtocol::ChatCompletions,
         "glm-5.3",
-    )];
-    gateway.bindings.insert(
-        "grok".into(),
-        binding(
-            GatewayTargetKind::Provider,
-            "grokup",
-            "glm-5.3",
-            "cpx-gw-grok-e2e",
-        ),
-    );
-    save(&settings, &gateway);
+    )]);
+    gateway
+        .bindings
+        .insert("grok".into(), binding("glm-5.3", "cpx-gw-grok-e2e"));
+    save(&gateway);
     let response = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}/gw/grok/v1/responses"))
         .bearer_auth("cpx-gw-grok-e2e")
@@ -652,7 +647,7 @@ async fn gateway_end_to_end() {
 
     // —— 9. 关闭绑定后返回 503，旧的 Codex 代理路径不受影响 ——
     gateway.bindings.get_mut("claude").unwrap().enabled = false;
-    save(&settings, &gateway);
+    save(&gateway);
     let (status, text) = post(port, "/gw/claude/v1/messages", token, &claude_request(true)).await;
     assert_eq!(status, 503, "{text}");
     assert_eq!(

@@ -522,7 +522,6 @@ fn route(pattern: &str, relay_id: &str, priority: u32) -> AggregateRelayRoute {
         pattern: pattern.to_string(),
         relay_id: relay_id.to_string(),
         priority,
-        target_model: String::new(),
     }
 }
 

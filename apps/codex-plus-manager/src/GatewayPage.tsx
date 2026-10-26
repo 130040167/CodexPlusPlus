@@ -1,29 +1,35 @@
 /** 本地网关：让 Claude Code、Grok 经 Codex++ 使用统一的供应商池，支持多 Key 轮换与路由组。 */
-import { useEffect, useState, type CSSProperties } from "react";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { AlertTriangle, RefreshCw, Route as RouteIcon } from "lucide-react";
+import { confirm } from "@tauri-apps/plugin-dialog";
+import { AlertTriangle, ChevronDown, ChevronUp, Plus, RefreshCw, Route as RouteIcon, Waypoints, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { t, tf } from "./i18n";
 import {
   agentName,
-  bindingDisplay,
-  groupSlug,
+  connectedAgents,
+  groupModeDescription,
+  groupModeLabel,
+  groupModelId,
+  memberLabel,
   memberStatus,
-  parseTargetValue,
-  routeCards,
+  modelDisplay,
   routeMembers,
   routeNarrative,
-  strategyDescription,
-  strategyLabel,
-  targetValue,
+  slugify,
   type AgentActivityView,
   type GatewayAgentId,
+  type GatewayGroupEntry,
   type GatewayPayload,
   type GatewayResult,
+  type GroupMember,
+  type GroupMode,
   type MemberStatus,
   type RouteRecordView,
 } from "./gateway-model";
-import { AgentsView } from "./GatewayAgents";
+import { AgentsView, Floating, ModelList } from "./GatewayAgents";
 import { ProvidersView } from "./GatewayProviders";
 import { AGENT_ICONS, APP_LOGO_URL, Avatar, SectionLabel, Switch, type Notify, type Run } from "./gateway-ui";
 import "./GatewayPage.css";
@@ -45,7 +51,7 @@ function statusText(status: MemberStatus): string {
   return status.args.length ? tf(status.text, status.args) : t(status.text);
 }
 
-export function GatewayPage({ notify, onOpenCodexProviders }: { notify: Notify; onOpenCodexProviders: () => void }) {
+export function GatewayPage({ notify }: { notify: Notify }) {
   const [payload, setPayload] = useState<GatewayPayload | null>(memo.payload);
   const [busy, setBusy] = useState<string | null>(memo.payload ? null : "load");
   const [tab, setTabState] = useState<Tab>(memo.tab);
@@ -148,8 +154,8 @@ export function GatewayPage({ notify, onOpenCodexProviders }: { notify: Notify; 
           </p>
         ) : null}
         {tab === "agents" ? <AgentsView busy={busy} notify={notify} onManage={() => setTab("providers")} payload={payload} run={run} /> : null}
-        {tab === "providers" ? <ProvidersView busy={busy} onOpenCodexProviders={onOpenCodexProviders} payload={payload} run={run} /> : null}
-        {tab === "routing" ? <RoutingView onOpenCodexProviders={onOpenCodexProviders} payload={payload} /> : null}
+        {tab === "providers" ? <ProvidersView busy={busy} notify={notify} payload={payload} run={run} /> : null}
+        {tab === "routing" ? <RoutingView busy={busy} payload={payload} run={run} /> : null}
         {tab === "gateway" ? <GatewayView busy={busy} payload={payload} run={run} /> : null}
       </div>
     </div>
@@ -158,8 +164,13 @@ export function GatewayPage({ notify, onOpenCodexProviders }: { notify: Notify; 
 
 /* —————————————————————— 路由 —————————————————————— */
 
-function RoutingView({ payload, onOpenCodexProviders }: { payload: GatewayPayload | null; onOpenCodexProviders: () => void }) {
-  const cards = routeCards(payload);
+function RoutingView({ payload, busy, run }: { payload: GatewayPayload | null; busy: string | null; run: Run }) {
+  const agents = connectedAgents(payload);
+  const [editing, setEditing] = useState<GatewayGroupEntry | "new" | null>(null);
+  const remove = async (group: GatewayGroupEntry) => {
+    const ok = await confirm(tf("删除路由组「{0}」？引用它的其它组会去掉这个成员。", [group.name]), { title: t("删除路由组"), kind: "warning" });
+    if (ok) await run(`group:${group.id}`, "delete_gateway_group", { id: group.id }, t("删除路由组"));
+  };
   return (
     <>
       <SectionLabel>
@@ -167,19 +178,20 @@ function RoutingView({ payload, onOpenCodexProviders }: { payload: GatewayPayloa
         <i className="gw-dot gw-dot-live" data-tone={payload?.helperRunning ? "on" : "off"} />
         <em>{payload?.helperRunning ? t("实时，按网关的实际决策") : t("网关没有运行")}</em>
       </SectionLabel>
-      {cards.length === 0 ? (
+      {agents.length === 0 ? (
         <div className="gw-card gw-empty">
           <strong>{t("还没有 Agent 经网关")}</strong>
           <span>{t("在「智能体」里为 Claude Code 或 Grok 选好模型并打开开关，这里会实时显示每个请求怎么走。")}</span>
         </div>
-      ) : null}
-      {cards.map((card) => <RouteCard agents={card.agents} key={card.target} payload={payload} target={card.target} />)}
+      ) : (
+        <RouteCard agents={agents} payload={payload} />
+      )}
 
       <SectionLabel
         aside={(
           <>
             <em>{t("Agent 可以把路由组当作一个模型来选")}</em>
-            <button className="gw-text-button strong" onClick={onOpenCodexProviders} type="button">{t("新建路由组")}</button>
+            <button className="gw-text-button strong" disabled={busy !== null} onClick={() => setEditing("new")} type="button">{t("新建路由组")}</button>
           </>
         )}
       >
@@ -187,80 +199,209 @@ function RoutingView({ payload, onOpenCodexProviders }: { payload: GatewayPayloa
       </SectionLabel>
       <div className="gw-card">
         {(payload?.groups ?? []).map((group) => {
-          const members = group.members.map((id) => payload?.pool.find((entry) => entry.id === id)).filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
-          const joiner = group.strategy === "failover" ? " → " : " · ";
+          const joiner = group.mode === "inOrder" ? " → " : " · ";
+          const icons = group.members
+            .map((member) => modelDisplay(payload, member.model))
+            .filter((view) => !view.group && view.sub)
+            .slice(0, 3);
           return (
             <div className="gw-group-row" key={group.id}>
               <span className="gw-avatar-stack">
-                {members.slice(0, 3).map((entry) => <Avatar key={entry.id} name={entry.name} size="sm" />)}
+                {icons.length ? icons.map((view, index) => <Avatar key={`${view.sub}-${index}`} name={view.sub} size="sm" />) : <Waypoints className="h-4 w-4" />}
               </span>
               <div className="gw-group-main">
                 <div>
                   <strong>{group.name}</strong>
-                  <code className="gw-chip">{groupSlug(group.name)}</code>
+                  <code className="gw-chip">{groupModelId(group.id)}</code>
                 </div>
-                <small>{members.length ? members.map((entry) => `${entry.name} · ${entry.models[0] ?? "—"}`).join(joiner) : t("没有成员")}</small>
+                <small>{group.members.length ? group.members.map((member) => memberLabel(payload, member.model)).join(joiner) : t("没有成员")}</small>
               </div>
-              <span className="gw-pill gw-pill-outline">{t(strategyLabel(group.strategy))}</span>
-              <button className="gw-text-button" onClick={onOpenCodexProviders} type="button">{t("编辑")}</button>
+              <span className="gw-pill gw-pill-outline">{t(groupModeLabel(group.mode))}</span>
+              <span className="gw-row-buttons">
+                <button className="gw-text-button" disabled={busy !== null} onClick={() => setEditing(group)} type="button">{t("编辑")}</button>
+                <button className="gw-text-button" disabled={busy !== null} onClick={() => void remove(group)} type="button">{t("删除")}</button>
+              </span>
             </div>
           );
         })}
         {payload && payload.groups.length === 0 ? (
           <div className="gw-empty">
             <strong>{t("还没有路由组")}</strong>
-            <span>{t("在 Codex「供应商配置」里新建聚合供应商，它就是一个路由组：多个供应商按顺序或轮转回答。")}</span>
+            <span>{t("把几个模型编成一组，Agent 在模型列表里把它当一个模型来选：按顺序、轮换或按权重回答，组里也可以再放组。")}</span>
           </div>
         ) : null}
       </div>
+      {editing ? (
+        <GroupEditor
+          busy={busy}
+          group={editing === "new" ? null : editing}
+          onCancel={() => setEditing(null)}
+          onSave={async (input) => {
+            if (await run("group:save", "save_gateway_group", { group: input }, t("保存路由组"))) setEditing(null);
+          }}
+          payload={payload}
+        />
+      ) : null}
     </>
   );
 }
 
-function RouteCard({ payload, target, agents }: { payload: GatewayPayload | null; target: string; agents: GatewayAgentId[] }) {
-  const parsed = parseTargetValue(target);
-  const group = parsed?.kind === "group" ? payload?.groups.find((item) => item.id === parsed.id) : undefined;
-  const entry = parsed?.kind === "provider" ? payload?.pool.find((item) => item.id === parsed.id) : undefined;
+/** 新建 / 编辑路由组：名称、模式、成员（池里的模型或别的组）。 */
+function GroupEditor({
+  payload,
+  group,
+  busy,
+  onSave,
+  onCancel,
+}: {
+  payload: GatewayPayload | null;
+  group: GatewayGroupEntry | null;
+  busy: string | null;
+  onSave: (input: { id: string; name: string; mode: GroupMode; members: GroupMember[] }) => void;
+  onCancel: () => void;
+}) {
+  const [name, setName] = useState(group?.name ?? "");
+  const [mode, setMode] = useState<GroupMode>(group?.mode ?? "inOrder");
+  const [members, setMembers] = useState<GroupMember[]>(group?.members.map((member) => ({ ...member })) ?? []);
+  const [picking, setPicking] = useState(false);
+  const addRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !picking) onCancel();
+    };
+    document.addEventListener("keydown", escape);
+    return () => document.removeEventListener("keydown", escape);
+  }, [onCancel, picking]);
+  const move = (index: number, delta: number) => {
+    const next = [...members];
+    const [item] = next.splice(index, 1);
+    next.splice(Math.max(0, Math.min(next.length, index + delta)), 0, item);
+    setMembers(next);
+  };
+  const error = !name.trim() ? t("请填写路由组名称") : members.length === 0 ? t("路由组至少要有一个成员") : "";
+  const modes: Array<{ value: GroupMode; label: string }> = [
+    { value: "inOrder", label: t("依次") },
+    { value: "rotate", label: t("轮换") },
+    { value: "weighted", label: t("按权重") },
+  ];
+  return createPortal(
+    <div className="gw-modal-backdrop gw-portal" onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel(); }}>
+      <form
+        className="gw-modal gw-group-modal"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!error) onSave({ id: group?.id ?? "", name: name.trim(), mode, members });
+        }}
+      >
+        <header>
+          <span className="gw-avatar gw-avatar-plus"><Waypoints className="h-4 w-4" /></span>
+          <strong>{group ? tf("编辑 {0}", [group.name]) : t("新建路由组")}</strong>
+          <button aria-label={t("关闭")} className="gw-icon-button" onClick={onCancel} type="button"><X className="h-4 w-4" /></button>
+        </header>
+        <div className="gw-modal-body">
+          <label className="gw-field">
+            <span>{t("名称")} <small>{group ? groupModelId(group.id) : name.trim() ? groupModelId(slugify(name)) : ""}</small></span>
+            <Input autoFocus onChange={(event) => setName(event.currentTarget.value)} placeholder={t("例如 日常编码")} value={name} />
+          </label>
+          <div className="gw-field">
+            <span>{t("模式")}</span>
+            <div className="gw-tabs gw-mode-tabs" role="radiogroup">
+              {modes.map((item) => (
+                <button aria-checked={mode === item.value} data-active={mode === item.value} key={item.value} onClick={() => setMode(item.value)} role="radio" type="button">
+                  {item.label}
+                </button>
+              ))}
+            </div>
+            <small className="gw-muted">{t(groupModeDescription(mode))}</small>
+          </div>
+          <div className="gw-field">
+            <span>{t("成员")} <small>{mode === "inOrder" ? t("从上到下依次尝试") : t("答不了时按列表顺序换下一个")}</small></span>
+            <div className="gw-member-list">
+              {members.map((member, index) => {
+                const view = modelDisplay(payload, member.model);
+                return (
+                  <div className="gw-member-edit" key={`${member.model}-${index}`}>
+                    {view.group ? <Waypoints className="gw-picker-glyph h-4 w-4" /> : <Avatar name={view.sub || view.title} size="sm" />}
+                    <span className="gw-member-edit-name">
+                      <strong>{view.title}</strong>
+                      <small>{view.group ? view.sub : view.sub || t("池里还没有提供它的供应商")}</small>
+                    </span>
+                    {mode === "weighted" ? (
+                      <label className="gw-inline-field">
+                        <span>{t("权重")}</span>
+                        <input
+                          className="gw-inline-input gw-weight-input"
+                          min={1}
+                          onChange={(event) => {
+                            const next = [...members];
+                            next[index] = { ...member, weight: Math.max(1, Number(event.currentTarget.value) || 1) };
+                            setMembers(next);
+                          }}
+                          type="number"
+                          value={member.weight}
+                        />
+                      </label>
+                    ) : null}
+                    <button aria-label={t("上移")} className="gw-icon-button" disabled={index === 0} onClick={() => move(index, -1)} type="button"><ChevronUp className="h-4 w-4" /></button>
+                    <button aria-label={t("下移")} className="gw-icon-button" disabled={index === members.length - 1} onClick={() => move(index, 1)} type="button"><ChevronDown className="h-4 w-4" /></button>
+                    <button aria-label={t("移除")} className="gw-icon-button" onClick={() => setMembers(members.filter((_, position) => position !== index))} type="button"><X className="h-4 w-4" /></button>
+                  </div>
+                );
+              })}
+              <button className="gw-add-row" onClick={() => setPicking(!picking)} ref={addRef} type="button">
+                <Plus className="h-4 w-4" />
+                {t("添加成员")}
+              </button>
+              <Floating anchorRef={addRef} className="gw-model-popover" onClose={() => setPicking(false)} open={picking} width={520}>
+                <ModelList
+                  exclude={[]}
+                  onPick={(item) => {
+                    setPicking(false);
+                    if (!members.some((member) => member.model === item.model)) setMembers([...members, { model: item.model, weight: 1 }]);
+                  }}
+                  payload={payload}
+                  selectedModel=""
+                  skipGroup={group?.id}
+                />
+              </Floating>
+            </div>
+          </div>
+        </div>
+        <footer>
+          <span className="gw-error">{error}</span>
+          <Button onClick={onCancel} size="sm" type="button" variant="ghost">{t("取消")}</Button>
+          <Button disabled={busy !== null || Boolean(error)} size="sm" type="submit">{busy ? t("保存中") : t("保存")}</Button>
+        </footer>
+      </form>
+    </div>,
+    document.body,
+  );
+}
+
+function RouteCard({ payload, agents }: { payload: GatewayPayload | null; agents: GatewayAgentId[] }) {
   const activity = (payload?.activity?.agents ?? []).filter((item): item is AgentActivityView => agents.includes(item.agent as GatewayAgentId));
   const latest = activity
     .filter((item) => item.last)
     .sort((left, right) => (right.last?.finishedAtMs ?? 0) - (left.last?.finishedAtMs ?? 0))[0];
   const records = activity.map((item) => item.last).filter((record): record is RouteRecordView => Boolean(record));
-  const members = routeMembers(payload, target, records);
+  const members = routeMembers(payload, records);
   const totals = activity.reduce((sum, item) => ({ requests: sum.requests + item.requests, rerouted: sum.rerouted + item.rerouted, errors: sum.errors + item.errors }), { requests: 0, rerouted: 0, errors: 0 });
-  const keyMode = payload?.gateway.keyPolicy.mode === "roundRobin" ? t("逐请求换 Key") : t("会话粘性");
-
-  const isPool = parsed?.kind === "pool";
-  const title = isPool ? t("供应商池") : group?.name ?? entry?.name ?? parsed?.id ?? "";
-  const meta = isPool
-    ? tf("{0} 个供应商 · {1} 个 Agent", [members.length, agents.length])
-    : group
-      ? tf("路由组 · {0} 个成员 · {1} 个 Agent", [group.members.length, agents.length])
-      : tf("供应商 · {0} 个 Key · {1} 个 Agent", [entry?.keyCount ?? 1, agents.length]);
-  const description = isPool
-    ? t("按模型名选供应商：Agent 请求哪个模型，就发给池里提供它的供应商；同一个模型有多家时按池里的顺序依次尝试，每家再按自己的 Key 轮换。")
-    : group
-      ? t(strategyDescription(group.strategy))
-      : payload?.gateway.keyPolicy.mode === "roundRobin"
-        ? t("单个供应商：每个请求换下一个 Key，被限流或失效的 Key 自动跳过。")
-        : t("单个供应商：同一会话固定用一个 Key 保住缓存，出错才换下一个 Key。");
-  const summary = latest?.last
-    ? (group || isPool) && latest.last.planned[0]
-      ? tf("{0} 排在第一个。", [latest.last.planned[0].relayName])
-      : tf("全部请求发到 {0}。", [title])
+  const lastGroup = latest?.last?.groupId ? payload?.groups.find((group) => group.id === latest.last?.groupId) : undefined;
+  const summary = latest?.last?.planned[0]
+    ? tf("{0} 排在第一个。", [latest.last.planned[0].relayName])
     : t("还没有请求经过这里。在 Agent 里发一条消息试试。");
 
   return (
     <div className="gw-card gw-route-card">
       <div className="gw-route-head">
-        <strong>{title}</strong>
-        <span> · {meta}</span>
-        <p>{description}</p>
+        <strong>{t("供应商池")}</strong>
+        <span> · {tf("{0} 个供应商 · {1} 个 Agent", [members.length, agents.length])}</span>
+        <p>{lastGroup ? t(groupModeDescription(lastGroup.mode)) : t("按模型名选供应商：Agent 请求哪个模型，就发给池里提供它的供应商；同一个模型有多家时按池里的顺序依次尝试，每家再按自己的 Key 轮换。")}</p>
       </div>
       <RouteDiagram
         activeAgent={latest?.agent ?? null}
         agents={agents.map((agent) => ({ id: agent, binding: payload?.gateway.bindings[agent] }))}
-        hubPill={isPool ? t("按模型") : group ? t(strategyLabel(group.strategy)) : keyMode}
+        hubPill={lastGroup ? t(groupModeLabel(lastGroup.mode)) : t("按模型")}
         members={members.map((member) => ({ ...member, status: memberStatus(payload, member.relayId) }))}
         payload={payload}
       />
@@ -326,7 +467,7 @@ function RouteDiagram({
           <div className="gw-node-agent" key={agent.id} style={{ height: AGENT_NODE_H, "--gw-hue": AGENT_HUES[agent.id] ?? 232 } as CSSProperties}>
             <img alt="" src={AGENT_ICONS[agent.id]} />
             <strong><i className="gw-dot" data-tone="agent" />{agentName(agent.id)}</strong>
-            <small>{agent.binding ? bindingDisplay(payload, targetValue(agent.binding.target), agent.binding.model, agent.binding.poolExclude).title : ""}</small>
+            <small>{agent.binding ? modelDisplay(payload, agent.binding.model, agent.binding.poolExclude ?? []).title : ""}</small>
           </div>
         ))}
       </div>
@@ -434,8 +575,8 @@ export function GatewayBanner({ active, agentName, onOpen }: { active: boolean; 
       <RouteIcon className="h-4 w-4" />
       <span>
         {active
-          ? tf("{0} 当前经 Codex++ 本地网关转发，供应商、模型与多 Key 在「本地网关」里管理；在下方直接切换供应商会恢复直连。", [agentName])
-          : tf("想让 {0} 使用 Codex 的供应商池、ChatGPT 订阅、多 Key 轮换或路由组？可以开启本地网关模式。", [agentName])}
+          ? tf("{0} 当前接入了 Codex++ 本地网关，模型和供应商在「本地网关」里管理；在下方直接切换供应商会断开网关、恢复直连。", [agentName])
+          : tf("想让 {0} 和其它 Agent 共用一个供应商池，按模型名自动选供应商、多 Key 轮换、用路由组？可以接入本地网关（与这里的直连设置互不影响）。", [agentName])}
       </span>
       <Button onClick={onOpen} size="sm" variant="outline">{active ? t("管理网关") : t("了解网关模式")}</Button>
     </p>

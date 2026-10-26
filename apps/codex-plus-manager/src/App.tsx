@@ -535,7 +535,6 @@ type RelayAggregateRoute = {
   pattern: string;
   profileId: string;
   priority: number;
-  targetModel?: string;
 };
 type RelayAggregateConfig = {
   strategy: RelayAggregateStrategy;
@@ -558,7 +557,7 @@ type AggregateRelayProfile = {
   modelAggregationEnabled?: boolean;
   strategy: RelayAggregateStrategy;
   members: AggregateRelayMember[];
-  routes?: { pattern: string; relayId: string; priority: number; targetModel?: string }[];
+  routes?: { pattern: string; relayId: string; priority: number }[];
   defaultRelayId?: string;
   /** 把默认成员的官方登录同步进 Codex（auth.json 的 tokens 段）。默认关。 */
   syncDefaultMemberLogin?: boolean;
@@ -4402,12 +4401,7 @@ export function App() {
           {route === "agentCache" ? <AgentCachePanel /> : null}
           {route === "agentCollaboration" ? <AgentCollaborationPage /> : null}
           {route === "computerUse" ? <ComputerUsePage /> : null}
-          {route === "gateway" ? (
-            <GatewayPage
-              notify={actions.showMessage}
-              onOpenCodexProviders={() => void (async () => { await switchTool("codex"); await navigate("relay"); })()}
-            />
-          ) : null}
+          {route === "gateway" ? <GatewayPage notify={actions.showMessage} /> : null}
           {route === "maintenance" ? (
             <MaintenanceScreen
               overview={overview}
@@ -12865,12 +12859,6 @@ function AggregateRelayProfileEditor({
                   options={routeTargetOptions}
                   value={route.profileId}
                 />
-                <Input
-                  onChange={(event) => updateRoute(index, { targetModel: event.currentTarget.value })}
-                  placeholder={t("目标模型（可选）")}
-                  title={t("命中后发给该成员的模型名，留空沿用请求里的模型名。目前只在本地网关的路由组里生效。")}
-                  value={route.targetModel ?? ""}
-                />
                 {!routeTargetOptions.some((option) => option.value === route.profileId) ? (
                   <span className="aggregate-route-target-error">{t("路由目标必须是已勾选的聚合成员，请先在成员供应商中勾选。")}</span>
                 ) : null}
@@ -17155,7 +17143,6 @@ function normalizeAggregateProfilesFromRelayProfiles(profiles: RelayProfile[]): 
         pattern: route.pattern,
         relayId: route.profileId,
         priority: route.priority,
-        ...(route.targetModel ? { targetModel: route.targetModel } : {}),
       })),
       defaultRelayId: aggregate.defaultRelayId ?? "",
       syncDefaultMemberLogin: aggregate.syncDefaultMemberLogin === true,
@@ -17499,7 +17486,6 @@ function normalizeAggregateConfig(
       pattern: route.pattern.trim(),
       profileId: route.profileId,
       priority: clampAggregateRoutePriority(route.priority),
-      ...(route.targetModel?.trim() ? { targetModel: route.targetModel.trim() } : {}),
     }));
   // 默认供应商必须是当前成员；成员被移出（或值不再合法）时自动清空为「未设置」。
   const defaultRelayId = normalizeAggregateDefaultRelayId(

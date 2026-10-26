@@ -194,7 +194,7 @@ pub(crate) async fn open_responses_for_agent(
             .and_then(Value::as_str)
             .map(str::to_string)
     });
-    let plan = route::resolve_plan(&settings, &gateway, agent, model, conversation.as_deref())?;
+    let plan = route::resolve_plan(&gateway, agent, model, conversation.as_deref())?;
     let outcome = pipeline::open(
         &settings,
         &plan,
@@ -352,13 +352,7 @@ async fn handle_claude_messages(
     request_log.set_agent(&agent);
     let live_request_id = request_log.entry.id.clone();
 
-    let plan = match route::resolve_plan(
-        &settings,
-        gateway,
-        &agent,
-        &client_model,
-        session.as_deref(),
-    ) {
+    let plan = match route::resolve_plan(gateway, &agent, &client_model, session.as_deref()) {
         Ok(plan) => plan,
         Err(error) => {
             let message = crate::protocol_proxy::error_chain(&error);
@@ -705,13 +699,12 @@ async fn handle_claude_count_tokens(
             .await;
         }
     };
-    let settings = SettingsStore::default().load().unwrap_or_default();
     let model = request
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    if let Ok(plan) = route::resolve_plan(&settings, gateway, &agent, &model, None)
+    if let Ok(plan) = route::resolve_plan(gateway, &agent, &model, None)
         && let Some(candidate) = plan.candidates.first()
         && candidate.relay.protocol == crate::settings::RelayProtocol::AnthropicMessages
     {
@@ -751,8 +744,7 @@ async fn handle_models(
     gateway: &GatewaySettings,
     agent: &ToolId,
 ) -> anyhow::Result<()> {
-    let settings = SettingsStore::default().load().unwrap_or_default();
-    let models = exposed_models(&settings, gateway, agent);
+    let models = exposed_models(gateway, agent);
     let body = match agent {
         ToolId::Claude => json!({
             "data": models.iter().map(|model| json!({
@@ -780,27 +772,18 @@ async fn handle_models(
     Ok(())
 }
 
-/// 暴露给 Agent 的模型：主模型在前，再是绑定里声明的其它模型。
-pub fn exposed_models(
-    settings: &crate::settings::BackendSettings,
-    gateway: &GatewaySettings,
-    agent: &ToolId,
-) -> Vec<String> {
+/// 暴露给 Agent 的模型：默认模型在前，然后是池里所有能用的模型和路由组，以及绑定里声明的模型。
+pub fn exposed_models(gateway: &GatewaySettings, agent: &ToolId) -> Vec<String> {
     let Some(binding) = gateway.binding(agent) else {
         return Vec::new();
     };
     let mut models = Vec::new();
-    let default = route::binding_default_model(settings, gateway, binding);
+    let default = route::binding_default_model(gateway, binding);
     if !default.is_empty() {
         models.push(default);
     }
-    // 供应商池模式：池里所有启用供应商的模型和路由组都给 Agent。
-    let pool_models = if binding.target.kind == crate::gateway::store::GatewayTargetKind::Pool {
-        route::pool_models(settings, gateway, binding)
-    } else {
-        Vec::new()
-    };
-    for model in binding.declared_models().into_iter().chain(pool_models) {
+    let pool_models = route::pool_models(gateway, binding);
+    for model in pool_models.into_iter().chain(binding.declared_models()) {
         if !models.contains(&model) {
             models.push(model);
         }

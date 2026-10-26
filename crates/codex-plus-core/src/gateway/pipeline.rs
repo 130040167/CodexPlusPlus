@@ -12,9 +12,8 @@ use serde_json::Value;
 use crate::gateway::activity::{InFlight, RouteRecorder};
 use crate::gateway::anthropic_inbound;
 use crate::gateway::key_pool::{self, FailureClass};
-use crate::gateway::route::{GatewayCandidate, RoutePlan, record_group_event};
+use crate::gateway::route::{GatewayCandidate, RoutePlan};
 use crate::protocol_proxy::{ForcedRelay, ProxySessionHeaders, UpstreamProxyResponse};
-use crate::relay_rotation::RotationEvent;
 use crate::request_log::RequestTrace;
 use crate::settings::{BackendSettings, RelayProtocol};
 
@@ -120,10 +119,6 @@ async fn open_candidates(
     let mut last_error: Option<anyhow::Error> = None;
     for (index, candidate) in plan.candidates.iter().enumerate() {
         let has_more = index + 1 < count;
-        let next_relay_differs = plan
-            .candidates
-            .get(index + 1)
-            .is_none_or(|next| next.relay.id != candidate.relay.id);
         trace.attempts += 1;
         trace.relay_id = candidate.relay.id.clone();
         trace.relay_name = candidate.relay.name.clone();
@@ -147,7 +142,6 @@ async fn open_candidates(
             Ok(Attempt::Success(upstream)) => {
                 recorder.step(candidate, "answered", None, upstream.status_code());
                 key_pool::record_success(&candidate.key, plan.conversation.as_deref());
-                record_group_event(plan.group_id.as_deref(), RotationEvent::Success);
                 if let GatewayUpstream::Pipeline(response) = &upstream
                     && let Some(inner) = &response.request_trace
                 {
@@ -194,9 +188,6 @@ async fn open_candidates(
             }
         };
         drop(busy);
-        if next_relay_differs {
-            record_group_event(plan.group_id.as_deref(), RotationEvent::Failure);
-        }
         if let Some(error) = failure {
             last_error = Some(error);
         }
