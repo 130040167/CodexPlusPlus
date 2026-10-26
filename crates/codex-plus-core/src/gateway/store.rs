@@ -32,6 +32,8 @@ pub enum GatewayTargetKind {
     #[default]
     Provider,
     Group,
+    /// 整个供应商池：Agent 能用池里所有启用供应商的模型，按模型名选上游。
+    Pool,
 }
 
 /// 请求里的模型不在绑定的模型集合里时怎么办。
@@ -97,6 +99,9 @@ pub struct AgentBinding {
     /// 非 claude-* 模型名时 Claude Code 默认不发 effort，打开后强制启用。
     #[serde(default)]
     pub claude_enable_effort: bool,
+    /// 供应商池模式下这个 Agent 不使用的供应商（「挑选」里取消勾选的）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pool_exclude: Vec<String>,
     /// 网关签发给该 Agent 的本地 token，用来鉴权本地请求。
     #[serde(default)]
     pub token: String,
@@ -115,6 +120,7 @@ impl Default for AgentBinding {
             unknown_model: UnknownModelPolicy::default(),
             context_window: None,
             claude_enable_effort: false,
+            pool_exclude: Vec::new(),
             token: String::new(),
             restore: GatewayRestoreState::default(),
         }
@@ -180,6 +186,9 @@ pub struct GatewaySettings {
     /// 旧版状态文件没有这个字段，视为空池；已绑定的供应商总会算在池里。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pool: Vec<String>,
+    /// 池里被关掉的供应商：不参与路由，也不出现在 Agent 的模型列表里。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pool_disabled: Vec<String>,
 }
 
 impl GatewaySettings {
@@ -188,6 +197,22 @@ impl GatewaySettings {
         let relay_id = relay_id.trim();
         if !relay_id.is_empty() && !self.pool.iter().any(|id| id == relay_id) {
             self.pool.push(relay_id.to_string());
+        }
+    }
+
+    /// 池里启用的供应商 id（按加入顺序）。
+    pub fn enabled_pool_ids(&self) -> Vec<String> {
+        self.pool
+            .iter()
+            .filter(|id| !self.pool_disabled.contains(id))
+            .cloned()
+            .collect()
+    }
+
+    pub fn set_pool_enabled(&mut self, relay_id: &str, enabled: bool) {
+        self.pool_disabled.retain(|id| id != relay_id);
+        if !enabled {
+            self.pool_disabled.push(relay_id.to_string());
         }
     }
 

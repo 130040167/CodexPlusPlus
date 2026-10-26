@@ -43,6 +43,10 @@ pub struct GatewayGroupEntry {
 pub struct GatewayAgentView {
     pub agent: String,
     pub name: String,
+    /// 本机装的 CLI 版本（后台探测，探测完成前为空）。
+    pub version: Option<String>,
+    /// 开启网关时改写的配置文件，界面上展示给用户。
+    pub config_path: String,
     pub enabled: bool,
     pub base_url: String,
     pub default_model: String,
@@ -137,10 +141,12 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
             GatewayAgentView {
                 agent: agent.as_str().to_string(),
                 name: codex_plus_core::tools::tool_display_name(agent).to_string(),
+                version: agent_version(agent),
+                config_path: agent_config_path(agent).to_string(),
                 enabled: binding.is_some_and(|binding| binding.enabled),
                 base_url: apply::gateway_base_url(port, agent),
                 default_model: binding
-                    .map(|binding| apply::resolved_default_model(settings, binding))
+                    .map(|binding| apply::resolved_default_model(settings, &gateway, binding))
                     .unwrap_or_default(),
                 models: codex_plus_core::gateway::server::exposed_models(settings, &gateway, agent),
             }
@@ -314,6 +320,7 @@ pub fn import_claude_provider_to_gateway_pool(id: String) -> CommandResult<Optio
         store.save(&settings)?;
         apply::add_to_pool(&GatewayStore::default(), &settings, &[profile.id])
     })();
+    let result = refresh_agents(result);
     respond("已导入供应商池。", "导入供应商池失败", result)
 }
 
@@ -327,6 +334,7 @@ pub fn import_grok_profile_to_gateway_pool(id: String) -> CommandResult<Option<G
         store.save(&settings)?;
         apply::add_to_pool(&GatewayStore::default(), &settings, &[profile.id])
     })();
+    let result = refresh_agents(result);
     respond("已导入供应商池。", "导入供应商池失败", result)
 }
 
@@ -337,6 +345,7 @@ pub fn add_gateway_pool_providers(ids: Vec<String>) -> CommandResult<Option<Gate
         let settings = SettingsStore::default().load()?;
         apply::add_to_pool(&GatewayStore::default(), &settings, &ids)
     })();
+    let result = refresh_agents(result);
     respond("已加入供应商池。", "加入供应商池失败", result)
 }
 
@@ -346,7 +355,38 @@ pub fn remove_gateway_pool_provider(id: String) -> CommandResult<Option<GatewayP
     respond(
         "已移出供应商池，Codex 供应商列表里的这一项仍然保留。",
         "移出供应商池失败",
-        apply::remove_from_pool(&GatewayStore::default(), &id),
+        refresh_agents(apply::remove_from_pool(&GatewayStore::default(), &id)),
+    )
+}
+
+/// 打开或关掉池里的某个供应商。
+#[tauri::command]
+pub fn set_gateway_pool_provider_enabled(
+    id: String,
+    enabled: bool,
+) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        if enabled {
+            "已打开，Agent 的模型列表里会出现它的模型。"
+        } else {
+            "已关闭，它不再参与路由。"
+        },
+        "切换供应商失败",
+        refresh_agents(apply::set_pool_enabled(
+            &GatewayStore::default(),
+            &id,
+            enabled,
+        )),
+    )
+}
+
+/// 调整供应商池顺序。
+#[tauri::command]
+pub fn reorder_gateway_pool(ids: Vec<String>) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "已调整顺序。",
+        "调整顺序失败",
+        refresh_agents(apply::reorder_pool(&GatewayStore::default(), &ids)),
     )
 }
 
@@ -377,11 +417,173 @@ pub fn create_gateway_pool_provider(
         store.save(&settings)?;
         apply::add_to_pool(&GatewayStore::default(), &settings, &[profile.id])
     })();
+    let result = refresh_agents(result);
     respond(
         &format!("已添加「{}」，可以在智能体里选它的模型了。", name.trim()),
         "添加供应商失败",
         result,
     )
+}
+
+/// 在访达 / 资源管理器里显示网关改动的 Agent 配置文件。
+#[tauri::command]
+pub fn reveal_gateway_agent_config(agent: String) -> CommandResult<Option<GatewayPayload>> {
+    let result = (|| {
+        let agent = parse_agent(&agent)?;
+        let relative = agent_config_path(&agent).trim_start_matches("~/");
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("找不到用户目录"))?;
+        let path = home.join(relative);
+        if !path.exists() {
+            anyhow::bail!("{} 还不存在", path.display());
+        }
+        #[cfg(target_os = "macos")]
+        let status = std::process::Command::new("open").arg("-R").arg(&path).status()?;
+        #[cfg(target_os = "windows")]
+        let status = std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .status()?;
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let status = std::process::Command::new("xdg-open")
+            .arg(path.parent().unwrap_or(&path))
+            .status()?;
+        let _ = status;
+        GatewayStore::default().load()
+    })();
+    respond("已在文件管理器中显示。", "打开失败", result)
+}
+
+/// 供应商池变了：开着的供应商池模式 Agent 重写配置，让它的模型列表跟上。重写失败只记日志。
+fn refresh_agents(result: anyhow::Result<GatewaySettings>) -> anyhow::Result<GatewaySettings> {
+    if result.is_ok()
+        && let Ok(settings) = SettingsStore::default().load()
+        && let Err(error) = apply::refresh_enabled(&context(), &settings)
+    {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "gateway.refresh_agents_failed",
+            serde_json::json!({ "message": format!("{error:#}") }),
+        );
+    }
+    result
+}
+
+fn agent_config_path(agent: &ToolId) -> &'static str {
+    match agent {
+        ToolId::Claude => "~/.claude/settings.json",
+        ToolId::Grok => "~/.grok/config.toml",
+        _ => "",
+    }
+}
+
+/// Agent CLI 版本：第一次读取时在后台线程探测并缓存，探测完成前返回 None。
+fn agent_version(agent: &ToolId) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, Once, OnceLock};
+    static VERSIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    static PROBE: Once = Once::new();
+    let versions = VERSIONS.get_or_init(Mutex::default);
+    PROBE.call_once(|| {
+        std::thread::spawn(|| {
+            for (agent, binary) in [("claude", "claude"), ("grok", "grok")] {
+                if let Some(version) = probe_cli_version(binary) {
+                    let mut guard = VERSIONS
+                        .get_or_init(Mutex::default)
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.insert(agent.to_string(), version);
+                }
+            }
+        });
+    });
+    versions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(agent.as_str())
+        .cloned()
+}
+
+/// 在 PATH 和常见安装目录里找 CLI，跑 `--version`（最多等 4 秒），取第一个形如 1.2.3 的片段。
+fn probe_cli_version(binary: &str) -> Option<String> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let mut dirs_to_try: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    for extra in [
+        ".local/bin",
+        ".claude/local",
+        ".grok/bin",
+        ".npm-global/bin",
+        ".bun/bin",
+        ".volta/bin",
+    ] {
+        dirs_to_try.push(home.join(extra));
+    }
+    dirs_to_try.push("/opt/homebrew/bin".into());
+    dirs_to_try.push("/usr/local/bin".into());
+    let path = dirs_to_try
+        .into_iter()
+        .map(|dir| dir.join(binary))
+        .find(|candidate| candidate.is_file())?;
+    let mut child = std::process::Command::new(path)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                return None;
+            }
+        }
+    }
+    let output = child.wait_with_output().ok()?;
+    parse_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_version(text: &str) -> Option<String> {
+    text.split(|ch: char| ch.is_whitespace() || ch == '(' || ch == ')' || ch == ',')
+        .map(|token| token.trim_start_matches('v'))
+        .find(|token| {
+            token.split('.').count() >= 2
+                && token.split('.').all(|part| {
+                    !part.is_empty()
+                        && part
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+                })
+                && token.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+        })
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_version;
+
+    #[test]
+    fn cli_version_is_the_first_dotted_number() {
+        assert_eq!(
+            parse_version("2.1.310 (Claude Code)\n").as_deref(),
+            Some("2.1.310")
+        );
+        assert_eq!(
+            parse_version("grok v0.4.2-beta").as_deref(),
+            Some("0.4.2-beta")
+        );
+        assert_eq!(parse_version("no version here"), None);
+    }
 }
 
 /// 清掉某个供应商的 Key 冷却与熔断状态。

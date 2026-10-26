@@ -790,11 +790,17 @@ pub fn exposed_models(
         return Vec::new();
     };
     let mut models = Vec::new();
-    let default = route::binding_default_model(settings, binding);
+    let default = route::binding_default_model(settings, gateway, binding);
     if !default.is_empty() {
         models.push(default);
     }
-    for model in binding.declared_models() {
+    // 供应商池模式：池里所有启用供应商的模型和路由组都给 Agent。
+    let pool_models = if binding.target.kind == crate::gateway::store::GatewayTargetKind::Pool {
+        route::pool_models(settings, gateway, binding)
+    } else {
+        Vec::new()
+    };
+    for model in binding.declared_models().into_iter().chain(pool_models) {
         if !models.contains(&model) {
             models.push(model);
         }

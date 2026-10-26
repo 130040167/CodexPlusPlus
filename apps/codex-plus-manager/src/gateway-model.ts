@@ -2,7 +2,8 @@
 import { PRESETS } from "./presets.ts";
 
 export type GatewayAgentId = "claude" | "grok";
-export type GatewayTargetKind = "provider" | "group";
+/** `pool`：整个供应商池，按模型名选供应商；`provider` / `group` 是旧版的单一目标。 */
+export type GatewayTargetKind = "provider" | "group" | "pool";
 export type UnknownModelPolicy = "mapToDefault" | "passthrough";
 export type KeyRotationMode = "sticky" | "roundRobin";
 
@@ -19,6 +20,8 @@ export type AgentBinding = {
   unknownModel: UnknownModelPolicy;
   contextWindow?: number | null;
   claudeEnableEffort: boolean;
+  /** 供应商池模式下这个 Agent 不用的供应商（「挑选」里取消勾选的）。 */
+  poolExclude?: string[];
   token: string;
   restore?: { claudePreviousProviderId?: string; appliedPort?: number | null };
 };
@@ -28,6 +31,8 @@ export type GatewaySettings = {
   bindings: Partial<Record<GatewayAgentId, AgentBinding>>;
   keyPolicy: { mode: KeyRotationMode };
   restoreOnExit: boolean;
+  pool?: string[];
+  poolDisabled?: string[];
 };
 
 export type GatewayPoolEntry = {
@@ -45,6 +50,10 @@ export type GatewayGroupEntry = { id: string; name: string; strategy: string; me
 export type GatewayAgentView = {
   agent: GatewayAgentId;
   name: string;
+  /** 本机 CLI 版本，后台探测完成前为空。 */
+  version?: string | null;
+  /** 网关改写的配置文件。 */
+  configPath?: string;
   enabled: boolean;
   baseUrl: string;
   defaultModel: string;
@@ -130,14 +139,17 @@ export type BindingDraft = {
   unknownModel: UnknownModelPolicy;
   contextWindow: string;
   claudeEnableEffort: boolean;
+  poolExclude: string[];
 };
 
-/** 目标下拉框的值：`provider:<id>` / `group:<id>`。 */
+/** 目标的字符串写法：`pool` / `provider:<id>` / `group:<id>`。 */
 export function targetValue(target: GatewayTarget | undefined): string {
+  if (target?.kind === "pool") return "pool";
   return target && target.id ? `${target.kind}:${target.id}` : "";
 }
 
 export function parseTargetValue(value: string): GatewayTarget | null {
+  if (value === "pool") return { kind: "pool", id: "" };
   const index = value.indexOf(":");
   if (index <= 0) return null;
   const kind = value.slice(0, index);
@@ -149,7 +161,7 @@ export function parseTargetValue(value: string): GatewayTarget | null {
 export function blankBinding(): AgentBinding {
   return {
     enabled: false,
-    target: { kind: "provider", id: "" },
+    target: { kind: "pool", id: "" },
     model: "",
     extraModels: [],
     claudeRoles: { opus: "", sonnet: "", haiku: "", subagent: "" },
@@ -173,6 +185,7 @@ export function draftFromBinding(binding: AgentBinding | undefined): BindingDraf
     unknownModel: source.unknownModel,
     contextWindow: source.contextWindow ? String(source.contextWindow) : "",
     claudeEnableEffort: source.claudeEnableEffort,
+    poolExclude: [...(source.poolExclude ?? [])],
   };
 }
 
@@ -205,7 +218,7 @@ export function bindingFromDraft(draft: BindingDraft, previous: AgentBinding | u
   const window = parseContextWindow(draft.contextWindow);
   return {
     ...base,
-    target: parseTargetValue(draft.target) ?? { kind: "provider", id: "" },
+    target: parseTargetValue(draft.target) ?? { kind: "pool", id: "" },
     model: draft.model.trim(),
     extraModels: splitModels(draft.extraModels),
     claudeRoles: {
@@ -217,14 +230,45 @@ export function bindingFromDraft(draft: BindingDraft, previous: AgentBinding | u
     unknownModel: draft.unknownModel,
     contextWindow: window && Number.isFinite(window) ? window : null,
     claudeEnableEffort: draft.claudeEnableEffort,
+    poolExclude: [...draft.poolExclude],
   };
+}
+
+/** 池里这个供应商是否打开。 */
+export function poolProviderEnabled(payload: GatewayPayload | null, relayId: string): boolean {
+  return !(payload?.gateway.poolDisabled ?? []).includes(relayId);
+}
+
+/** Agent 能用的池内供应商：打开的，再去掉它「挑选」里排除的。 */
+export function agentPoolProviders(payload: GatewayPayload | null, exclude: string[] = []): GatewayPoolEntry[] {
+  return (payload?.pool ?? []).filter((entry) => poolProviderEnabled(payload, entry.id) && !exclude.includes(entry.id));
+}
+
+/** Agent 能用的全部模型：池内供应商的模型（去重，按池顺序）+ 路由组 `group/<短名>`。与后端 `pool_models` 一致。 */
+export function agentModels(payload: GatewayPayload | null, exclude: string[] = []): string[] {
+  const models: string[] = [];
+  for (const entry of agentPoolProviders(payload, exclude)) {
+    for (const model of entry.models) {
+      if (!models.some((known) => known.toLowerCase() === model.toLowerCase())) models.push(model);
+    }
+  }
+  for (const group of payload?.groups ?? []) {
+    const slug = groupSlug(group.name);
+    if (group.members.length && !models.includes(slug)) models.push(slug);
+  }
+  return models;
 }
 
 /** 表单校验：返回错误文案（中文原文，界面再翻译），没问题返回 null。 */
 export function validateDraft(draft: BindingDraft, payload: GatewayPayload | null): string | null {
   const target = parseTargetValue(draft.target);
   if (!target) return "请选择供应商或路由组";
-  if (payload) {
+  if (payload && target.kind === "pool") {
+    const models = agentModels(payload, draft.poolExclude);
+    if (!agentPoolProviders(payload, draft.poolExclude).length) return "供应商池是空的，先到「供应商」里添加";
+    const model = draft.model.trim();
+    if (model && !models.some((known) => known.toLowerCase() === model.toLowerCase())) return "供应商池里没有这个模型";
+  } else if (payload) {
     const exists = target.kind === "provider"
       ? payload.pool.some((entry) => entry.id === target.id)
       : payload.groups.some((group) => group.id === target.id);
@@ -243,6 +287,7 @@ export function validateDraft(draft: BindingDraft, payload: GatewayPayload | nul
 export function targetModels(payload: GatewayPayload | null, value: string): string[] {
   const target = parseTargetValue(value);
   if (!payload || !target) return [];
+  if (target.kind === "pool") return agentModels(payload);
   const relayIds = target.kind === "provider"
     ? [target.id]
     : payload.groups.find((group) => group.id === target.id)?.members ?? [];
@@ -329,49 +374,39 @@ function matches(query: string, ...values: string[]): boolean {
 }
 
 /**
- * 模型选择器的分组：路由组在前，然后每个供应商一组列出它的模型。
- * 查询词不是任何已知模型时，另给一组「自定义模型」：发到各个供应商。
+ * 模型选择器的分组（供应商池模式）：每个打开的池内供应商一组列出它的模型，路由组作为 `group/<短名>` 模型排在后面。
+ * 查询词不是任何已知模型时，另给一组「自定义模型」：直接发给某个供应商（旧版的单一供应商绑定）。
  * `avatar` 由调用方算（避免这里依赖界面工具函数）。
  */
 export function pickerSections(
   payload: GatewayPayload | null,
   rawQuery: string,
   avatar: (name: string) => string,
+  exclude: string[] = [],
 ): PickerSection[] {
   if (!payload) return [];
   const query = rawQuery.trim().toLowerCase();
   const sections: PickerSection[] = [];
-  const groups = payload.groups
-    .filter((group) => matches(query, group.name, groupSlug(group.name)))
-    .map((group) => ({
-      target: `group:${group.id}`,
-      model: "",
-      label: group.name,
-      sub: groupSlug(group.name),
-      avatar: avatar(group.name),
-    }));
-  if (groups.length) sections.push({ key: "group", title: "路由组", avatar: "", items: groups });
-  for (const entry of payload.pool) {
+  const providers = agentPoolProviders(payload, exclude);
+  for (const entry of providers) {
     const providerHit = matches(query, entry.name);
     const items = entry.models
       .filter((model) => providerHit || matches(query, model))
-      .map((model) => ({
-        target: `provider:${entry.id}`,
-        model,
-        label: model,
-        sub: entry.name,
-        avatar: avatar(entry.name),
-      }));
+      .map((model) => ({ target: "pool", model, label: model, sub: entry.name, avatar: avatar(entry.name) }));
     if (items.length) sections.push({ key: `provider:${entry.id}`, title: entry.name, avatar: avatar(entry.name), items });
   }
+  const groups = payload.groups
+    .filter((group) => group.members.length && matches(query, group.name, groupSlug(group.name)))
+    .map((group) => ({ target: "pool", model: groupSlug(group.name), label: group.name, sub: groupSlug(group.name), avatar: avatar(group.name) }));
+  if (groups.length) sections.push({ key: "group", title: "路由组", avatar: "", items: groups });
   const typed = rawQuery.trim();
-  const known = payload.pool.some((entry) => entry.models.includes(typed));
+  const known = agentModels(payload, exclude).some((model) => model.toLowerCase() === typed.toLowerCase());
   if (typed && !known && !/\s/.test(typed)) {
     sections.push({
       key: "custom",
       title: "自定义模型",
       avatar: "",
-      items: payload.pool.slice(0, 6).map((entry) => ({
+      items: providers.slice(0, 6).map((entry) => ({
         target: `provider:${entry.id}`,
         model: typed,
         label: typed,
@@ -384,20 +419,25 @@ export function pickerSections(
   return sections;
 }
 
-/** 当前绑定在选择器按钮上的显示：模型名 + 供应商，或路由组名。 */
-export function bindingDisplay(
-  payload: GatewayPayload | null,
-  target: string,
-  model: string,
-): { title: string; sub: string; kind: GatewayTargetKind | null } {
+export type BindingView = { title: string; sub: string; kind: GatewayTargetKind | null; group: boolean };
+
+/** 当前绑定在选择器按钮上的显示：模型名 + 提供它的供应商，或路由组名。 */
+export function bindingDisplay(payload: GatewayPayload | null, target: string, model: string, exclude: string[] = []): BindingView {
   const parsed = parseTargetValue(target);
-  if (!payload || !parsed) return { title: "", sub: "", kind: null };
+  if (!payload || !parsed) return { title: "", sub: "", kind: null, group: false };
+  if (parsed.kind === "pool") {
+    const title = model.trim() || agentModels(payload, exclude)[0] || "";
+    const group = payload.groups.find((item) => groupSlug(item.name) === title);
+    if (group) return { title: group.name, sub: groupSlug(group.name), kind: "pool", group: true };
+    const entry = agentPoolProviders(payload, exclude).find((item) => item.models.some((known) => known.toLowerCase() === title.toLowerCase()));
+    return { title, sub: entry?.name ?? "", kind: "pool", group: false };
+  }
   if (parsed.kind === "group") {
     const group = payload.groups.find((item) => item.id === parsed.id);
-    return { title: group?.name ?? parsed.id, sub: groupSlug(group?.name ?? parsed.id), kind: "group" };
+    return { title: group?.name ?? parsed.id, sub: groupSlug(group?.name ?? parsed.id), kind: "group", group: true };
   }
   const entry = payload.pool.find((item) => item.id === parsed.id);
-  return { title: model.trim() || entry?.models[0] || parsed.id, sub: entry?.name ?? parsed.id, kind: "provider" };
+  return { title: model.trim() || entry?.models[0] || parsed.id, sub: entry?.name ?? parsed.id, kind: "provider", group: false };
 }
 
 export function strategyLabel(strategy: string): string {
@@ -513,7 +553,9 @@ export function routeCards(payload: GatewayPayload | null): Array<{ target: stri
 export function routeMembers(payload: GatewayPayload | null, target: string, records: RouteRecordView[]): Array<{ relayId: string; name: string; model: string }> {
   const parsed = parseTargetValue(target);
   if (!payload || !parsed) return [];
-  const ids = parsed.kind === "provider" ? [parsed.id] : payload.groups.find((group) => group.id === parsed.id)?.members ?? [];
+  const ids = parsed.kind === "pool"
+    ? agentPoolProviders(payload).map((entry) => entry.id)
+    : parsed.kind === "provider" ? [parsed.id] : payload.groups.find((group) => group.id === parsed.id)?.members ?? [];
   return ids.map((id) => {
     const entry = payload.pool.find((item) => item.id === id);
     const planned = records.flatMap((record) => record.planned).find((member) => member.relayId === id);

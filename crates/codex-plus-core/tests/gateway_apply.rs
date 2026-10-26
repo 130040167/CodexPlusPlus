@@ -3,7 +3,7 @@
 use codex_plus_core::gateway::apply::{
     ApplyContext, NewPoolProvider, add_to_pool, create_pool_provider, disable_binding,
     enable_binding, gateway_pool, import_claude_provider_to_pool, note_claude_switched,
-    reapply_if_port_changed, remove_from_pool,
+    reapply_if_port_changed, refresh_enabled, remove_from_pool, set_pool_enabled,
 };
 use codex_plus_core::gateway::store::{
     AgentBinding, ClaudeRoleModels, GatewayStore, GatewayTarget, GatewayTargetKind,
@@ -422,4 +422,52 @@ fn preset_provider_is_created_in_codex_list_with_default_model() {
         .is_err(),
         "缺 Key 时报错"
     );
+}
+
+#[test]
+fn pool_binding_exposes_every_pool_model_and_follows_pool_changes() {
+    let fixture = fixture(57395);
+    let ctx = &fixture.ctx;
+    let mut settings = settings();
+    settings.relay_profiles.push(RelayProfile {
+        id: "kimi".into(),
+        name: "Kimi".into(),
+        relay_mode: RelayMode::PureApi,
+        protocol: RelayProtocol::ChatCompletions,
+        base_url: "https://kimi.test/v1".into(),
+        api_key: "sk-kimi".into(),
+        model_list: "kimi-k3".into(),
+        ..RelayProfile::default()
+    });
+    let pool_binding = AgentBinding {
+        target: GatewayTarget {
+            kind: GatewayTargetKind::Pool,
+            id: String::new(),
+        },
+        ..AgentBinding::default()
+    };
+    // 池是空的时不能开启。
+    assert!(enable_binding(ctx, &settings, &ToolId::Grok, pool_binding.clone()).is_err());
+
+    add_to_pool(&ctx.gateway, &settings, &["ds".to_string()]).unwrap();
+    enable_binding(ctx, &settings, &ToolId::Grok, pool_binding.clone()).unwrap();
+    let config = || std::fs::read_to_string(ctx.grok_home.join("config.toml")).unwrap();
+    assert!(config().contains("deepseek-v4-pro"), "{}", config());
+    assert!(config().contains("deepseek-v4-flash"), "{}", config());
+    assert!(!config().contains("kimi-k3"), "{}", config());
+
+    // 加入新供应商后刷新，Grok 的模型列表跟着变；关掉后又消失。
+    add_to_pool(&ctx.gateway, &settings, &["kimi".to_string()]).unwrap();
+    assert_eq!(refresh_enabled(ctx, &settings).unwrap(), 1);
+    assert!(config().contains("kimi-k3"), "{}", config());
+    set_pool_enabled(&ctx.gateway, "kimi", false).unwrap();
+    refresh_enabled(ctx, &settings).unwrap();
+    assert!(!config().contains("kimi-k3"), "{}", config());
+
+    // 主模型必须是池里有的模型。
+    let unknown = AgentBinding {
+        model: "not-in-pool".into(),
+        ..pool_binding
+    };
+    assert!(enable_binding(ctx, &settings, &ToolId::Grok, unknown).is_err());
 }

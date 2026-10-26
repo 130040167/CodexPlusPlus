@@ -46,8 +46,25 @@ pub fn gateway_base_url(port: u16, agent: &ToolId) -> String {
     format!("http://127.0.0.1:{port}/gw/{}", agent.as_str())
 }
 
-fn ensure_target_exists(settings: &BackendSettings, binding: &AgentBinding) -> anyhow::Result<()> {
+fn ensure_target_exists(
+    settings: &BackendSettings,
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+) -> anyhow::Result<()> {
     match binding.target.kind {
+        GatewayTargetKind::Pool => {
+            if route::binding_pool_relays(settings, gateway, binding).is_empty() {
+                bail!("供应商池是空的或都已关闭：先在「供应商」里添加供应商");
+            }
+            let model = route::binding_default_model(settings, gateway, binding);
+            if !model.is_empty()
+                && !route::pool_models(settings, gateway, binding)
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&model))
+            {
+                bail!("供应商池里没有供应商提供模型 {model}");
+            }
+        }
         GatewayTargetKind::Provider => {
             let relay = settings
                 .relay_profiles
@@ -75,10 +92,11 @@ fn ensure_target_exists(settings: &BackendSettings, binding: &AgentBinding) -> a
 /// 写给 Claude Code 的托管供应商。
 pub fn claude_gateway_provider(
     settings: &BackendSettings,
+    gateway: &GatewaySettings,
     binding: &AgentBinding,
     port: u16,
 ) -> ClaudeProvider {
-    let default_model = binding_default_model(settings, binding);
+    let default_model = binding_default_model(settings, gateway, binding);
     let role = |value: &str| {
         let (slug, _) = crate::model_suffix::parse_model_suffix(value.trim());
         if slug.trim().is_empty() {
@@ -138,13 +156,20 @@ pub fn claude_gateway_provider(
 /// 写给 Grok 的合成供应商：Responses 协议，地址是网关，Key 是网关 token。
 pub fn grok_gateway_profile(
     settings: &BackendSettings,
+    gateway: &GatewaySettings,
     binding: &AgentBinding,
     port: u16,
 ) -> RelayProfile {
-    let default_model = binding_default_model(settings, binding);
+    let default_model = binding_default_model(settings, gateway, binding);
     let window = binding.context_window;
     let mut models = vec![default_model.clone()];
-    for model in binding.declared_models() {
+    // 供应商池模式：池里所有启用供应商的模型和路由组都进 Grok 的模型列表。
+    let pool_models = if binding.target.kind == GatewayTargetKind::Pool {
+        route::pool_models(settings, gateway, binding)
+    } else {
+        Vec::new()
+    };
+    for model in binding.declared_models().into_iter().chain(pool_models) {
         if !models.contains(&model) {
             models.push(model);
         }
@@ -179,11 +204,12 @@ fn write_agent_config(
     agent: &ToolId,
     binding: &AgentBinding,
 ) -> anyhow::Result<Option<String>> {
+    let gateway = ctx.gateway.load()?;
     match agent {
         ToolId::Claude => {
             claude::save_provider(
                 &ctx.claude,
-                claude_gateway_provider(settings, binding, ctx.port),
+                claude_gateway_provider(settings, &gateway, binding, ctx.port),
             )?;
             let before = claude::load(&ctx.claude)?
                 .providers
@@ -199,7 +225,7 @@ fn write_agent_config(
             return Ok(snapshot);
         }
         ToolId::Grok => {
-            let profile = grok_gateway_profile(settings, binding, ctx.port);
+            let profile = grok_gateway_profile(settings, &gateway, binding, ctx.port);
             crate::tools::grok::apply_profile_to_grok_at(
                 &ctx.grok_home,
                 &profile,
@@ -220,11 +246,11 @@ pub fn enable_binding(
     agent: &ToolId,
     mut binding: AgentBinding,
 ) -> anyhow::Result<GatewaySettings> {
-    ensure_target_exists(settings, &binding)?;
-    if binding_default_model(settings, &binding).is_empty() {
+    let mut gateway = ctx.gateway.load()?;
+    ensure_target_exists(settings, &gateway, &binding)?;
+    if binding_default_model(settings, &gateway, &binding).is_empty() {
         bail!("没有可用的主模型：请填写主模型，或给目标供应商配置默认模型");
     }
-    let mut gateway = ctx.gateway.load()?;
     let previous = gateway.binding(agent).cloned();
     binding.token = previous
         .as_ref()
@@ -393,6 +419,29 @@ pub fn restore_all_for_exit(ctx: &ApplyContext, settings: &BackendSettings) -> a
         }
     }
     Ok(())
+}
+
+/// 供应商池变化后（加入、移出、开关）重写开着的 Agent 配置：Grok 的模型列表、Claude 的默认模型随池更新。
+/// 不碰恢复现场；某个 Agent 写失败时继续写其它的，最后返回第一个错误。
+pub fn refresh_enabled(ctx: &ApplyContext, settings: &BackendSettings) -> anyhow::Result<usize> {
+    let gateway = ctx.gateway.load()?;
+    let mut count = 0;
+    let mut first_error = None;
+    for (agent, binding) in &gateway.bindings {
+        if !binding.enabled || binding.target.kind != GatewayTargetKind::Pool {
+            continue;
+        }
+        match write_agent_config(ctx, settings, &ToolId::parse(agent), binding) {
+            Ok(_) => count += 1,
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(count),
+    }
 }
 
 /// 启动时把开着的绑定重新写进 Agent 配置（退出时恢复过直连，或端口变了）。
@@ -603,6 +652,41 @@ pub fn remove_from_pool(store: &GatewayStore, relay_id: &str) -> anyhow::Result<
         bail!("{agent} 正绑定在这个供应商上，请先给它换一个模型或关闭网关");
     }
     gateway.pool.retain(|id| id != relay_id);
+    gateway.pool_disabled.retain(|id| id != relay_id);
+    store.save(&gateway)?;
+    Ok(gateway)
+}
+
+/// 调整池里供应商的顺序（同一个模型有多家时按这个顺序尝试）。没列出的保持原顺序排在后面。
+pub fn reorder_pool(store: &GatewayStore, relay_ids: &[String]) -> anyhow::Result<GatewaySettings> {
+    let mut gateway = store.load()?;
+    let mut ordered: Vec<String> = relay_ids
+        .iter()
+        .filter(|id| gateway.pool.contains(id))
+        .cloned()
+        .collect();
+    ordered.dedup();
+    for id in &gateway.pool {
+        if !ordered.contains(id) {
+            ordered.push(id.clone());
+        }
+    }
+    gateway.pool = ordered;
+    store.save(&gateway)?;
+    Ok(gateway)
+}
+
+/// 打开或关掉池里的某个供应商：关掉后不参与路由，也不出现在 Agent 的模型列表里。
+pub fn set_pool_enabled(
+    store: &GatewayStore,
+    relay_id: &str,
+    enabled: bool,
+) -> anyhow::Result<GatewaySettings> {
+    let mut gateway = store.load()?;
+    if !gateway.pool.iter().any(|id| id == relay_id) {
+        bail!("供应商不在池里：{relay_id}");
+    }
+    gateway.set_pool_enabled(relay_id, enabled);
     store.save(&gateway)?;
     Ok(gateway)
 }
@@ -644,6 +728,10 @@ pub fn create_pool_provider(
 }
 
 /// 绑定解析后的主模型，UI 展示用。
-pub fn resolved_default_model(settings: &BackendSettings, binding: &AgentBinding) -> String {
-    route::binding_default_model(settings, binding)
+pub fn resolved_default_model(
+    settings: &BackendSettings,
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+) -> String {
+    route::binding_default_model(settings, gateway, binding)
 }

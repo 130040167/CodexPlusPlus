@@ -56,13 +56,101 @@ fn relay_default_model(relay: &RelayProfile) -> String {
     relay_models(relay).into_iter().next().unwrap_or_default()
 }
 
-/// 绑定的主模型：绑定里写了就用它，否则用目标的默认模型。
-pub fn binding_default_model(settings: &BackendSettings, binding: &AgentBinding) -> String {
+/// 路由组当作模型名时的写法：`group/<按组名生成的短名>`，与界面一致。
+pub fn group_slug(name: &str) -> String {
+    let mut slug = String::new();
+    for ch in name.trim().to_lowercase().chars() {
+        if ch.is_whitespace() || ch == '_' || ch == '/' {
+            if !slug.ends_with('-') {
+                slug.push('-');
+            }
+        } else {
+            slug.push(ch);
+        }
+    }
+    let slug = slug.trim_matches('-');
+    format!("group/{}", if slug.is_empty() { "unnamed" } else { slug })
+}
+
+/// 按 `group/<短名>` 找路由组（同名时取第一个）。
+pub fn group_by_slug(settings: &BackendSettings, model: &str) -> Option<AggregateRelayProfile> {
+    if !model.starts_with("group/") {
+        return None;
+    }
+    settings
+        .aggregate_relay_profiles
+        .iter()
+        .find(|group| group_slug(&group.name).eq_ignore_ascii_case(model))
+        .cloned()
+}
+
+/// 供应商池里启用的供应商（按加入顺序；已删除或变成聚合供应商的跳过）。
+pub fn enabled_pool_relays(
+    settings: &BackendSettings,
+    gateway: &GatewaySettings,
+) -> Vec<RelayProfile> {
+    gateway
+        .enabled_pool_ids()
+        .iter()
+        .filter_map(|id| find_relay(settings, id))
+        .filter(|relay| relay.relay_mode != RelayMode::Aggregate)
+        .collect()
+}
+
+/// 某个 Agent 能用的池内供应商：池里启用的，再去掉它「挑选」里排除的。
+pub fn binding_pool_relays(
+    settings: &BackendSettings,
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+) -> Vec<RelayProfile> {
+    enabled_pool_relays(settings, gateway)
+        .into_iter()
+        .filter(|relay| !binding.pool_exclude.contains(&relay.id))
+        .collect()
+}
+
+/// Agent 能用的全部模型：池内供应商的模型（去重，按池顺序），再加上各路由组的 `group/<短名>`。
+pub fn pool_models(
+    settings: &BackendSettings,
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+) -> Vec<String> {
+    let mut models: Vec<String> = Vec::new();
+    for relay in binding_pool_relays(settings, gateway, binding) {
+        for model in relay_models(&relay) {
+            if !models
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&model))
+            {
+                models.push(model);
+            }
+        }
+    }
+    for group in &settings.aggregate_relay_profiles {
+        let slug = group_slug(&group.name);
+        if !group.members.is_empty() && !models.contains(&slug) {
+            models.push(slug);
+        }
+    }
+    models
+}
+
+/// 绑定的主模型：绑定里写了就用它，否则用目标的默认模型（供应商池取第一个启用供应商的默认模型）。
+pub fn binding_default_model(
+    settings: &BackendSettings,
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+) -> String {
     let (slug, _) = crate::model_suffix::parse_model_suffix(binding.model.trim());
     if !slug.trim().is_empty() {
         return slug.trim().to_string();
     }
     match binding.target.kind {
+        GatewayTargetKind::Pool => binding_pool_relays(settings, gateway, binding)
+            .iter()
+            .map(relay_default_model)
+            .find(|model| !model.is_empty())
+            .unwrap_or_default(),
         GatewayTargetKind::Provider => find_relay(settings, &binding.target.id)
             .map(|relay| relay_default_model(&relay))
             .unwrap_or_default(),
@@ -82,13 +170,23 @@ pub fn binding_default_model(settings: &BackendSettings, binding: &AgentBinding)
 
 /// 把客户端请求的模型名按绑定改写。
 pub fn effective_model(binding: &AgentBinding, default_model: &str, requested: &str) -> String {
+    effective_model_with(binding, default_model, requested, &[])
+}
+
+/// 同 [`effective_model`]，`known` 是除绑定声明之外也算「认识」的模型（供应商池的全部模型）。
+fn effective_model_with(
+    binding: &AgentBinding,
+    default_model: &str,
+    requested: &str,
+    known: &[String],
+) -> String {
     let requested = requested.trim();
     if requested.is_empty() {
         return default_model.to_string();
     }
     let (requested_slug, _) = crate::model_suffix::parse_model_suffix(requested);
     let declared = binding.declared_models();
-    if declared.iter().any(|model| {
+    if declared.iter().chain(known.iter()).any(|model| {
         model.eq_ignore_ascii_case(&requested_slug) || model.eq_ignore_ascii_case(requested)
     }) {
         return requested_slug;
@@ -152,6 +250,88 @@ fn member_model(relay: &RelayProfile, model: &str) -> String {
     published[0].clone()
 }
 
+/// 路由组的成员顺序（各组自己的轮转选择器决定第一个），以及发给每个成员的模型名。
+fn group_relays(
+    settings: &BackendSettings,
+    group: &AggregateRelayProfile,
+    model: &str,
+    conversation: Option<&String>,
+) -> anyhow::Result<Vec<(RelayProfile, String)>> {
+    let first = {
+        let mut guard = selectors()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let rebuild = guard
+            .get(&group.id)
+            .is_none_or(|selector| selector.aggregate() != group);
+        if rebuild {
+            guard.insert(
+                group.id.clone(),
+                RelayRotationSelector::for_aggregate(group.clone())?,
+            );
+        }
+        guard
+            .get_mut(&group.id)
+            .expect("selector initialized")
+            .select(
+                settings,
+                RotationContext {
+                    conversation_id: conversation.cloned(),
+                    model: Some(model.to_string()),
+                },
+            )?
+    };
+    let mut relays = vec![first.clone()];
+    relays.extend(crate::relay_rotation::fallback_relays_after_in(
+        settings, group, &first.id,
+    )?);
+    Ok(relays
+        .into_iter()
+        .map(|relay| {
+            let upstream = routed_target_model(group, &relay.id, model)
+                .unwrap_or_else(|| member_model(&relay, model));
+            (relay, upstream)
+        })
+        .collect())
+}
+
+/// 供应商池按模型名选上游：池里所有提供这个模型的启用供应商依次尝试；
+/// 没有供应商提供它（未知模型原样转发时）交给主模型所在的供应商。
+fn pool_relays_for_model(
+    settings: &BackendSettings,
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+    model: &str,
+    default_model: &str,
+) -> anyhow::Result<Vec<(RelayProfile, String)>> {
+    let pool = binding_pool_relays(settings, gateway, binding);
+    if pool.is_empty() {
+        bail!("供应商池是空的或都已关闭：请在网关的「供应商」里添加或打开供应商");
+    }
+    let serving = |name: &str| {
+        pool.iter()
+            .filter(|relay| {
+                relay_models(relay)
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(name))
+            })
+            .map(|relay| (relay.clone(), name.to_string()))
+            .collect::<Vec<_>>()
+    };
+    let relays = serving(model);
+    if !relays.is_empty() {
+        return Ok(relays);
+    }
+    let fallback = serving(default_model)
+        .into_iter()
+        .map(|(relay, _)| (relay, model.to_string()))
+        .collect::<Vec<_>>();
+    if fallback.is_empty() {
+        bail!("供应商池里没有供应商提供模型 {model}");
+    }
+    Ok(fallback)
+}
+
 /// 按绑定解析出本次请求的候选上游。
 pub fn resolve_plan(
     settings: &BackendSettings,
@@ -163,8 +343,13 @@ pub fn resolve_plan(
     let binding = gateway
         .active_binding(agent)
         .with_context(|| format!("Codex++ 网关模式没有为 {} 开启", agent.as_str()))?;
-    let default_model = binding_default_model(settings, binding);
-    let model = effective_model(binding, &default_model, requested_model);
+    let default_model = binding_default_model(settings, gateway, binding);
+    let known = if binding.target.kind == GatewayTargetKind::Pool {
+        pool_models(settings, gateway, binding)
+    } else {
+        Vec::new()
+    };
+    let model = effective_model_with(binding, &default_model, requested_model, &known);
     let conversation = conversation
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -186,44 +371,19 @@ pub fn resolve_plan(
             GatewayTargetKind::Group => {
                 let group = find_group(settings, &binding.target.id)
                     .with_context(|| format!("网关绑定的路由组不存在：{}", binding.target.id))?;
-                let first = {
-                    let mut guard = selectors()
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let rebuild = guard
-                        .get(&group.id)
-                        .is_none_or(|selector| selector.aggregate() != &group);
-                    if rebuild {
-                        guard.insert(
-                            group.id.clone(),
-                            RelayRotationSelector::for_aggregate(group.clone())?,
-                        );
-                    }
-                    guard
-                        .get_mut(&group.id)
-                        .expect("selector initialized")
-                        .select(
-                            settings,
-                            RotationContext {
-                                conversation_id: conversation.clone(),
-                                model: Some(model.clone()),
-                            },
-                        )?
-                };
-                let mut relays = vec![first.clone()];
-                relays.extend(crate::relay_rotation::fallback_relays_after_in(
-                    settings, &group, &first.id,
-                )?);
-                let relays = relays
-                    .into_iter()
-                    .map(|relay| {
-                        let upstream = routed_target_model(&group, &relay.id, &model)
-                            .unwrap_or_else(|| member_model(&relay, &model));
-                        (relay, upstream)
-                    })
-                    .collect();
+                let relays = group_relays(settings, &group, &model, conversation.as_ref())?;
                 (relays, Some(group.id))
             }
+            GatewayTargetKind::Pool => match group_by_slug(settings, &model) {
+                Some(group) => {
+                    let relays = group_relays(settings, &group, &model, conversation.as_ref())?;
+                    (relays, Some(group.id))
+                }
+                None => (
+                    pool_relays_for_model(settings, gateway, binding, &model, &default_model)?,
+                    None,
+                ),
+            },
         };
 
     let now = Instant::now();
@@ -463,5 +623,156 @@ mod tests {
         let plan = resolve_plan(&settings, &gateway, &ToolId::Claude, "fast", None).unwrap();
         assert_eq!(plan.candidates[0].relay.id, "route-t-b");
         assert_eq!(plan.candidates[0].upstream_model, "glm-5.3-air");
+    }
+
+    fn pool_settings() -> BackendSettings {
+        BackendSettings {
+            relay_profiles: vec![
+                relay("pool-ds", "deepseek-v4-pro\ndeepseek-v4-flash"),
+                relay("pool-kimi", "kimi-k3"),
+                relay("pool-mirror", "deepseek-v4-pro"),
+                relay("pool-off", "off-model"),
+            ],
+            aggregate_relay_profiles: vec![AggregateRelayProfile {
+                id: "relay-c32b6cab".to_string(),
+                name: "Daily coding".to_string(),
+                members: vec![AggregateRelayMember {
+                    relay_id: "pool-kimi".to_string(),
+                    weight: 1,
+                }],
+                session_provider: Default::default(),
+                model_aggregation_enabled: false,
+                strategy: AggregateRelayStrategy::Failover,
+                routes: Vec::new(),
+                default_relay_id: String::new(),
+                sync_default_member_login: false,
+            }],
+            ..BackendSettings::default()
+        }
+    }
+
+    fn pool_gateway(model: &str) -> GatewaySettings {
+        let mut gateway = gateway(GatewayTargetKind::Pool, "", model);
+        gateway.pool = vec![
+            "pool-ds".to_string(),
+            "pool-kimi".to_string(),
+            "pool-mirror".to_string(),
+            "pool-off".to_string(),
+            "deleted".to_string(),
+        ];
+        gateway.set_pool_enabled("pool-off", false);
+        gateway
+    }
+
+    #[test]
+    fn pool_exposes_every_enabled_model_and_group_slugs() {
+        let settings = pool_settings();
+        let mut gateway = pool_gateway("");
+        assert_eq!(
+            pool_models(
+                &settings,
+                &gateway,
+                gateway.binding(&ToolId::Claude).unwrap()
+            ),
+            vec![
+                "deepseek-v4-pro",
+                "deepseek-v4-flash",
+                "kimi-k3",
+                "group/daily-coding"
+            ]
+        );
+        let binding = gateway.binding(&ToolId::Claude).unwrap();
+        assert_eq!(
+            binding_default_model(&settings, &gateway, binding),
+            "deepseek-v4-pro",
+            "没写主模型时取池里第一个供应商的默认模型"
+        );
+        // 「挑选」排除掉的供应商：模型不再出现，默认模型顺延。
+        gateway
+            .bindings
+            .get_mut("claude")
+            .unwrap()
+            .pool_exclude
+            .push("pool-ds".to_string());
+        let binding = gateway.binding(&ToolId::Claude).unwrap();
+        assert_eq!(
+            pool_models(&settings, &gateway, binding),
+            vec!["kimi-k3", "deepseek-v4-pro", "group/daily-coding"]
+        );
+        assert_eq!(
+            binding_default_model(&settings, &gateway, binding),
+            "kimi-k3"
+        );
+    }
+
+    #[test]
+    fn pool_routes_by_model_name_with_failover_across_providers() {
+        let settings = pool_settings();
+        let gateway = pool_gateway("deepseek-v4-pro");
+        let relays = |model: &str| {
+            resolve_plan(&settings, &gateway, &ToolId::Claude, model, None)
+                .unwrap()
+                .candidates
+                .into_iter()
+                .map(|candidate| (candidate.relay.id, candidate.upstream_model))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            relays("kimi-k3"),
+            vec![("pool-kimi".to_string(), "kimi-k3".to_string())]
+        );
+        // 两家都提供同一个模型：依次尝试。
+        assert_eq!(
+            relays("deepseek-v4-pro"),
+            vec![
+                ("pool-ds".to_string(), "deepseek-v4-pro".to_string()),
+                ("pool-mirror".to_string(), "deepseek-v4-pro".to_string()),
+            ]
+        );
+        // 关掉的供应商不参与；未知模型改写成主模型。
+        assert_eq!(relays("off-model")[0].1, "deepseek-v4-pro");
+        assert_eq!(relays("claude-opus-5-5")[0].1, "deepseek-v4-pro");
+        // 路由组当作一个模型。
+        let plan = resolve_plan(
+            &settings,
+            &gateway,
+            &ToolId::Claude,
+            "group/daily-coding",
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.group_id.as_deref(), Some("relay-c32b6cab"));
+        assert_eq!(plan.candidates[0].relay.id, "pool-kimi");
+        assert_eq!(plan.candidates[0].upstream_model, "kimi-k3");
+    }
+
+    #[test]
+    fn pool_passthrough_sends_unknown_models_to_the_default_provider() {
+        let settings = pool_settings();
+        let mut gateway = pool_gateway("kimi-k3");
+        gateway.bindings.get_mut("claude").unwrap().unknown_model = UnknownModelPolicy::Passthrough;
+        let plan = resolve_plan(
+            &settings,
+            &gateway,
+            &ToolId::Claude,
+            "kimi-k3-preview",
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.candidates[0].relay.id, "pool-kimi");
+        assert_eq!(plan.candidates[0].upstream_model, "kimi-k3-preview");
+        let empty = GatewaySettings {
+            pool: Vec::new(),
+            ..gateway
+        };
+        assert!(resolve_plan(&settings, &empty, &ToolId::Claude, "kimi-k3", None).is_err());
+    }
+
+    #[test]
+    fn group_slug_matches_the_ui() {
+        assert_eq!(group_slug("Daily coding"), "group/daily-coding");
+        assert_eq!(group_slug(" 系统默认 "), "group/系统默认");
+        assert_eq!(group_slug("a_b / c"), "group/a-b-c");
+        assert_eq!(group_slug(""), "group/unnamed");
     }
 }

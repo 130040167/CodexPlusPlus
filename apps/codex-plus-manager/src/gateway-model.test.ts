@@ -5,6 +5,7 @@ import {
   bindingFromDraft,
   blankBinding,
   draftFromBinding,
+  agentModels,
   bindingDisplay,
   formatRemaining,
   gatewayPresets,
@@ -49,13 +50,14 @@ function payload(): GatewayPayload {
   };
 }
 
-test("目标值在下拉框字符串与结构之间往返", () => {
+test("目标值在字符串与结构之间往返；新绑定默认是整个供应商池", () => {
   assert.equal(targetValue({ kind: "group", id: "g" }), "group:g");
   assert.deepEqual(parseTargetValue("provider:ds"), { kind: "provider", id: "ds" });
   assert.deepEqual(parseTargetValue("provider:a:b"), { kind: "provider", id: "a:b" });
   assert.equal(parseTargetValue("other:x"), null);
   assert.equal(parseTargetValue("provider:"), null);
-  assert.equal(targetValue(blankBinding().target), "");
+  assert.equal(targetValue(blankBinding().target), "pool");
+  assert.deepEqual(parseTargetValue("pool"), { kind: "pool", id: "" });
 });
 
 test("上下文窗口支持 k / M 写法", () => {
@@ -80,15 +82,19 @@ test("表单与绑定互转：多行模型去重，token 与恢复现场沿用�
   assert.deepEqual(splitModels(" a \n\n b,a"), ["a", "b"]);
 });
 
-test("校验：必须选目标、目标存在、没有默认模型时要填主模型、窗口格式正确", () => {
+test("校验：池模式要有可用供应商且模型在池里；旧版单一目标照旧校验", () => {
   const data = payload();
   const base = draftFromBinding(undefined);
-  assert.equal(validateDraft(base, data), "请选择供应商或路由组");
+  assert.equal(validateDraft(base, data), null, "池模式不填模型时用池里第一个模型");
+  assert.equal(validateDraft({ ...base, model: "glm-5.3" }, data), null);
+  assert.equal(validateDraft({ ...base, model: "group/group" }, data), null, "路由组也算池里的模型");
+  assert.equal(validateDraft({ ...base, model: "nope" }, data), "供应商池里没有这个模型");
+  assert.equal(validateDraft({ ...base, poolExclude: ["ds", "glm", "bare"] }, data), "供应商池是空的，先到「供应商」里添加");
+  assert.equal(validateDraft({ ...base, target: "" }, data), "请选择供应商或路由组");
   assert.equal(validateDraft({ ...base, target: "provider:gone" }, data), "所选供应商或路由组已不存在");
   assert.equal(validateDraft({ ...base, target: "provider:bare" }, data), "该供应商没有默认模型，请填写主模型");
   assert.equal(validateDraft({ ...base, target: "provider:bare", model: "x" }, data), null);
   assert.equal(validateDraft({ ...base, target: "provider:ds", contextWindow: "12" }, data), "上下文窗口格式不对，例如 200000、200k 或 1M");
-  assert.equal(validateDraft({ ...base, target: "group:g" }, data), null);
 });
 
 test("路由组的可选模型是成员模型的并集", () => {
@@ -106,24 +112,32 @@ test("冷却剩余时间显示", () => {
 
 const initials = (name: string) => name.slice(0, 2).toUpperCase();
 
-test("模型选择器：路由组在前，每个供应商一组；可按名字筛选，未知模型给出自定义项", () => {
+test("模型选择器：池里每个供应商一组，路由组作为 group/ 模型在后；关掉或挑掉的供应商不出现", () => {
   const all = pickerSections(payload(), "", initials);
-  assert.deepEqual(all.map((section) => section.key), ["group", "provider:ds", "provider:glm"]);
-  assert.deepEqual(all[0].items[0], { target: "group:g", model: "", label: "Group", sub: "group/group", avatar: "GR" });
-  assert.deepEqual(all[1].items.map((item) => item.model), ["deepseek-v4-pro", "deepseek-v4-flash"]);
+  assert.deepEqual(all.map((section) => section.key), ["provider:ds", "provider:glm", "group"]);
+  assert.deepEqual(all[0].items.map((item) => [item.target, item.model]), [["pool", "deepseek-v4-pro"], ["pool", "deepseek-v4-flash"]]);
+  assert.deepEqual(all[2].items[0], { target: "pool", model: "group/group", label: "Group", sub: "group/group", avatar: "GR" });
   // 供应商名命中时列出它的全部模型；模型名命中时只列命中的。
   assert.deepEqual(pickerSections(payload(), "deep", initials).map((section) => section.key), ["provider:ds", "custom"]);
   assert.deepEqual(pickerSections(payload(), "flash", initials)[0].items.map((item) => item.model), ["deepseek-v4-flash"]);
   const custom = pickerSections(payload(), "kimi-k3", initials);
   assert.equal(custom.at(-1)?.key, "custom");
-  assert.ok(custom.at(-1)?.items.every((item) => item.model === "kimi-k3" && item.custom));
+  assert.ok(custom.at(-1)?.items.every((item) => item.model === "kimi-k3" && item.custom && item.target.startsWith("provider:")));
   assert.equal(pickerSections(payload(), "deepseek-v4-pro", initials).some((section) => section.key === "custom"), false);
+  // 挑选里排除 / 池里关掉的供应商。
+  assert.deepEqual(pickerSections(payload(), "", initials, ["ds"]).map((section) => section.key), ["provider:glm", "group"]);
+  const data = payload();
+  data.gateway.poolDisabled = ["glm"];
+  assert.deepEqual(pickerSections(data, "", initials).map((section) => section.key), ["provider:ds", "group"]);
+  assert.deepEqual(agentModels(data), ["deepseek-v4-pro", "deepseek-v4-flash", "group/group"]);
 });
 
-test("选择器按钮：供应商显示模型名，路由组显示组名", () => {
-  assert.deepEqual(bindingDisplay(payload(), "provider:ds", ""), { title: "deepseek-v4-pro", sub: "DeepSeek", kind: "provider" });
-  assert.deepEqual(bindingDisplay(payload(), "provider:ds", "deepseek-v4-flash"), { title: "deepseek-v4-flash", sub: "DeepSeek", kind: "provider" });
-  assert.deepEqual(bindingDisplay(payload(), "group:g", ""), { title: "Group", sub: "group/group", kind: "group" });
+test("选择器按钮：池模式显示模型名和提供它的供应商；路由组显示组名", () => {
+  assert.deepEqual(bindingDisplay(payload(), "pool", ""), { title: "deepseek-v4-pro", sub: "DeepSeek", kind: "pool", group: false });
+  assert.deepEqual(bindingDisplay(payload(), "pool", "glm-5.3"), { title: "glm-5.3", sub: "GLM", kind: "pool", group: false });
+  assert.deepEqual(bindingDisplay(payload(), "pool", "group/group"), { title: "Group", sub: "group/group", kind: "pool", group: true });
+  assert.deepEqual(bindingDisplay(payload(), "provider:ds", "deepseek-v4-flash"), { title: "deepseek-v4-flash", sub: "DeepSeek", kind: "provider", group: false });
+  assert.deepEqual(bindingDisplay(payload(), "group:g", ""), { title: "Group", sub: "group/group", kind: "group", group: true });
   assert.equal(bindingDisplay(payload(), "", "").kind, null);
 });
 
@@ -245,6 +259,9 @@ test("网关页接入导航，命令已注册", () => {
     "add_gateway_pool_providers",
     "remove_gateway_pool_provider",
     "create_gateway_pool_provider",
+    "set_gateway_pool_provider_enabled",
+    "reorder_gateway_pool",
+    "reveal_gateway_agent_config",
   ]) {
     assert.match(lib, new RegExp(`gateway_commands::${command},`));
   }
