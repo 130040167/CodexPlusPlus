@@ -1,5 +1,6 @@
 mod auto_takeover;
 mod agent_collaboration_commands;
+mod agent_mcp_commands;
 mod computer_use_commands;
 mod cu_pip;
 mod gateway_commands;
@@ -294,6 +295,8 @@ pub fn run() {
             commands::save_settings,
             commands::list_tools,
             commands::test_vlm,
+            agent_mcp_commands::load_agent_mcp,
+            agent_mcp_commands::save_agent_mcp,
             gateway_commands::load_gateway,
             gateway_commands::save_gateway_binding,
             gateway_commands::disable_gateway_binding,

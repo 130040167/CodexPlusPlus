@@ -6,6 +6,12 @@
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
   // 外壳 · 网关总览 · 命令面板 · 提示卡
+  "同时管理 Codex、Claude Code、Grok 的 MCP 服务器：每列一个 Agent，打开即写入它的配置": "Manage MCP servers for Codex, Claude Code and Grok together: one column per agent; turning one on writes it into that agent's config",
+  "插件只有 Codex 支持": "Plugins are Codex-only",
+  "从各 Agent 读取现有配置，或添加一个服务器。": "Read existing configs from each agent, or add a server.",
+  "删除后会从这些 Agent 的配置中移除：": "Deleting removes it from these agents' configs: ",
+  "会同步写入已有这台服务器的所有 Agent；启停请在列表行操作。": "Changes are written to every agent that already has this server; toggle per agent in the list.",
+  "保存后立即写入勾选的 Agent，写前自动备份原配置。": "Saving writes to the selected agents right away; the original configs are backed up first.",
   "按 Agent 筛选": "Filter by agent",
   "全部 Agent": "All agents",
   "所有 Agent 经 Codex++ 的请求：状态、模型、重试、token 用量与缓存命中": "Every agent's requests through Codex++: status, model, retries, token usage and cache hits",
@@ -1572,7 +1578,6 @@ export const EN_PLAIN: Record<string, string> = {
   "状态": "Status",
   "独立管理 Codex 的 MCP 服务器与插件；切换任意供应商都会带上。":
     "Manage Codex's MCP, Skills and Plugins independently; they carry over whenever you switch providers.",
-  "独立管理 MCP 服务器与插件": "Independently manage MCP servers and plugins",
   "环境变量": "Environment variables",
   "环境变量检测": "Environment variable detection",
   "环境变量清理": "Environment variable cleanup",

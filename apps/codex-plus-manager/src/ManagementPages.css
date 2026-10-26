@@ -288,3 +288,15 @@
   .mg-session-group-count { min-width:52px; }
   .mg-session-page .mg-pagination { flex-wrap:wrap; }
 }
+
+/* 多 Agent 矩阵：名称 | 每个 Agent 一列开关 | 操作 */
+.mg-agent-matrix .mg-matrix-head,
+.mg-agent-matrix .mg-matrix-row { grid-template-columns:minmax(0,1fr) repeat(var(--mg-agent-columns,3),84px) 84px; gap:0; }
+.mg-agent-matrix[data-columns="1"] { --mg-agent-columns:1; }
+.mg-agent-column { gap:2px; color:hsl(var(--muted-foreground)); font-weight:500; }
+.mg-agent-column .hub-agent-glyph { width:15px; height:15px; color:hsl(var(--foreground)); }
+.mg-agent-column span { font-size:11px; white-space:nowrap; }
+.mg-agent-column small { font-family:var(--font-mono,monospace); font-size:10px; }
+.mg-agent-matrix .mg-cell { justify-self:center; }
+.mg-target-list { display:flex; flex-wrap:wrap; gap:6px 16px; }
+.mg-target-list .hub-agent-glyph { width:14px; height:14px; }

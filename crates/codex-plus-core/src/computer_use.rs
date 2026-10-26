@@ -655,7 +655,7 @@ fn read_package_version(path: &Path) -> Option<String> {
 // 路径
 // ---------------------------------------------------------------------------
 
-fn claude_code_config_path() -> PathBuf {
+pub(crate) fn claude_code_config_path() -> PathBuf {
     directories::BaseDirs::new()
         .map(|dirs| dirs.home_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."))
@@ -1851,7 +1851,7 @@ fn open_private(path: &Path) -> anyhow::Result<File> {
         .with_context(|| format!("无法打开 {}", path.display()))
 }
 
-fn read_text(path: &Path) -> anyhow::Result<Option<String>> {
+pub(crate) fn read_text(path: &Path) -> anyhow::Result<Option<String>> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1864,7 +1864,7 @@ fn read_text(path: &Path) -> anyhow::Result<Option<String>> {
     Ok(Some(text))
 }
 
-fn parse_json_object(text: &str, path: &Path) -> anyhow::Result<Map<String, Value>> {
+pub(crate) fn parse_json_object(text: &str, path: &Path) -> anyhow::Result<Map<String, Value>> {
     if text.trim().is_empty() {
         return Ok(Map::new());
     }
@@ -1876,7 +1876,7 @@ fn parse_json_object(text: &str, path: &Path) -> anyhow::Result<Map<String, Valu
     }
 }
 
-fn write_with_backup(
+pub(crate) fn write_with_backup(
     path: &Path,
     before: Option<&str>,
     contents: &str,

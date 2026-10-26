@@ -265,6 +265,17 @@ const demoAds = [
   { id: "demo-d", type: "normal", title: "示例教程", description: "如何把多个 Agent 接到同一个供应商池。", url: "https://example.com/d", highlights: [] },
 ];
 
+// MCP 演示数据：Claude Code 与 Grok 各自已有的服务器（Codex 一列来自设置里的公共配置）。
+const demoAgentMcp: Record<string, unknown> = {
+  claude: { agent: "claude", configPath: "~/.claude.json", exists: true, entries: [
+    { id: "context7", enabled: true, tomlBody: "command = \"npx\"\nargs = [\"-y\", \"@upstash/context7-mcp\"]\n" },
+    { id: "github", enabled: true, tomlBody: "url = \"https://api.githubcopilot.com/mcp/\"\n" },
+  ] },
+  grok: { agent: "grok", configPath: "~/.grok/config.toml", exists: true, entries: [
+    { id: "context7", enabled: true, tomlBody: "command = \"npx\"\nargs = [\"-y\", \"@upstash/context7-mcp\"]\n" },
+  ] },
+};
+
 const settingsResult = () => ok({ revision: "web-preview", settings: demoSettings, settings_path: "演示模式", user_scripts: { enabled: true, skip_next_start: false, scripts: [] } });
 
 export async function invoke<T = unknown>(command: string, args: Record<string, unknown> = {}): Promise<T> {
@@ -272,6 +283,8 @@ export async function invoke<T = unknown>(command: string, args: Record<string, 
     case "list_tools": return tools as T;
     case "load_gateway": return gateway as T;
     case "scan_agent_cache": return ok({ report: agentCacheReport }) as T;
+    case "load_agent_mcp":
+    case "save_agent_mcp": return ok({ config: demoAgentMcp[String(args.agent)] }) as T;
     case "load_gateway_usage": return gatewayUsage as T;
     case "startup_options": return ok({ showUpdate: false }) as T;
     case "consume_pending_manager_navigation": return null as T;
