@@ -404,6 +404,7 @@ type BackendSettings = {
   codexAppSessionDelete: boolean;
   codexAppSideChatSave: boolean;
   codexAppMarkdownExport: boolean;
+  codexAppSessionShare: boolean;
   codexAppUsageStatusLine: boolean;
   codexAppPasteFix: boolean;
   codexAppForceChineseLocale: boolean;
@@ -1351,6 +1352,7 @@ const defaultSettings: BackendSettings = {
   codexAppSessionDelete: true,
   codexAppSideChatSave: false,
   codexAppMarkdownExport: true,
+  codexAppSessionShare: true,
   codexAppUsageStatusLine: true,
   codexAppPasteFix: false,
   codexAppForceChineseLocale: false,
@@ -1776,7 +1778,7 @@ export function App() {
     if (result) {
       setSettings(result);
       setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
-      showResultNotice(t("本地插件"), result);
+      showResultNotice(t("本地脚本"), result);
     }
   };
 
@@ -1794,7 +1796,7 @@ export function App() {
     if (!result) return;
     setSettings(result);
     setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
-    showResultNotice(t("本地插件"), result);
+    showResultNotice(t("本地脚本"), result);
     if (isSuccessStatus(result.status)) await reloadUserScripts();
   };
 
@@ -1803,7 +1805,7 @@ export function App() {
     if (!result) return;
     setSettings(result);
     setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
-    showResultNotice(t("本地插件"), result);
+    showResultNotice(t("本地脚本"), result);
   };
 
   const setUserScriptEnabled = async (key: string, enabled: boolean) => {
@@ -1811,7 +1813,7 @@ export function App() {
     if (result) {
       setSettings(result);
       setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
-      showResultNotice(t("本地插件"), result);
+      showResultNotice(t("本地脚本"), result);
       await refreshUserScriptInventory();
     }
   };
@@ -1819,12 +1821,12 @@ export function App() {
   const deleteUserScript = async (key: string) => {
     const script = settings?.user_scripts?.scripts?.find((item) => item.key === key);
     const name = script?.name || key;
-    if (!(await appConfirm(tf("删除插件“{0}”？此操作会移除本地插件文件。", [name]), { title: t("删除插件"), confirmText: t("删除"), danger: true }))) return;
+    if (!(await appConfirm(tf("删除脚本“{0}”？此操作会移除本地脚本文件。", [name]), { title: t("删除脚本"), confirmText: t("删除"), danger: true }))) return;
     const result = await run(() => call<SettingsResult>("delete_user_script", { key }));
     if (result) {
       setSettings(result);
       setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
-      showResultNotice(t("本地插件"), result);
+      showResultNotice(t("本地脚本"), result);
       await refreshUserScriptInventory();
     }
   };
@@ -9046,7 +9048,7 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
   const marketScripts = market?.market.scripts ?? [];
   const [marketSearch, setMarketSearch] = useState("");
   const [marketView, setMarketView] = useState<"grid" | "list">("grid");
-  // 市场插件 / 本地插件放在同一块里切换，不再上下堆三张卡片。
+  // 市场脚本 / 本地脚本放在同一块里切换，不再上下堆三张卡片。
   const [pane, setPane] = useState<"market" | "local">("market");
   const filteredMarketScripts = useMemo(() => {
     const query = marketSearch.trim().toLocaleLowerCase();
@@ -9085,9 +9087,9 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
           <ExternalLink />
           {t("投稿")}
         </Button>
-        <Button onClick={() => void reload()} disabled={reloading} size="sm" variant="secondary" title={t("应用本地插件及开关；旧插件可能需要刷新 Codex 页面")}>
+        <Button onClick={() => void reload()} disabled={reloading} size="sm" variant="secondary" title={t("应用本地脚本及开关；旧脚本可能需要刷新 Codex 页面")}>
           <RefreshCw className={reloading ? "animate-spin" : ""} />
-          {t("热重载插件")}
+          {t("热重载脚本")}
         </Button>
         <Button onClick={() => void (async () => { await actions.refreshScriptMarket(); await actions.refreshCurrent(); })()} size="sm" variant="secondary">
           <RefreshCw />
@@ -9096,53 +9098,53 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
       </TopbarActions>
       {/* 状态条：两个整体开关 + 一行摘要，代替原来四行「键：值」的统计卡。 */}
       <div className="user-scripts-strip">
-        <label className="relay-bare-switch user-scripts-switch" title={t("整体开关不改变单个插件的启停设置")}>
+        <label className="relay-bare-switch user-scripts-switch" title={t("整体开关不改变单个脚本的启停设置")}>
           <input
-            aria-label={t("启用本地插件")}
+            aria-label={t("启用本地脚本")}
             checked={localEnabled}
             disabled={!inventory}
             onChange={() => void actions.setUserScriptsEnabled(!localEnabled)}
             type="checkbox"
           />
           <ToggleVisual />
-          <span>{t("启用本地插件")}</span>
+          <span>{t("启用本地脚本")}</span>
         </label>
         <label className="relay-bare-switch user-scripts-switch" title={t("脚本导致黑屏或卡死时，下一次启动先跳过脚本；脚本启停设置不会改变")}>
           <input
-            aria-label={t("下次启动跳过插件")}
+            aria-label={t("下次启动跳过脚本")}
             checked={Boolean(inventory?.skip_next_start)}
             disabled={!inventory}
             onChange={() => void actions.setUserScriptsSkipNextStart(!inventory?.skip_next_start)}
             type="checkbox"
           />
           <ToggleVisual />
-          <span>{t("下次启动跳过插件")}</span>
+          <span>{t("下次启动跳过脚本")}</span>
         </label>
         <span className="user-scripts-summary">
-          {tf("{0} 个市场插件，已安装 {1} 个", [marketScripts.length, installedCount])}
+          {tf("{0} 个市场脚本，已安装 {1} 个", [marketScripts.length, installedCount])}
           {market?.market.updatedAt ? ` · ${tf("清单更新于 {0}", [formatMarketUpdatedAt(market.market.updatedAt)])}` : market ? ` · ${market.market.message}` : ` · ${t("尚未刷新")}`}
         </span>
       </div>
       <div className="script-market-toolbar">
         <div className="mg-segmented user-scripts-panes" role="tablist" aria-label={t("脚本")}>
           <button aria-selected={pane === "market"} data-active={pane === "market"} onClick={() => setPane("market")} role="tab" type="button">
-            {t("市场插件")}<span>{marketScripts.length}</span>
+            {t("市场脚本")}<span>{marketScripts.length}</span>
           </button>
           <button aria-selected={pane === "local"} data-active={pane === "local"} onClick={() => setPane("local")} role="tab" type="button">
-            {t("本地插件")}<span>{scripts.length}</span>
+            {t("本地脚本")}<span>{scripts.length}</span>
           </button>
         </div>
         {pane === "market" ? <>
           <div className="script-market-search">
             <Search className="h-4 w-4" />
             <Input
-              aria-label={t("搜索市场插件")}
+              aria-label={t("搜索市场脚本")}
               onChange={(event) => setMarketSearch(event.currentTarget.value)}
               placeholder={t("搜索名称、作者、描述或标签")}
               value={marketSearch}
             />
           </div>
-          <div className="script-market-view-toggle" role="group" aria-label={t("插件排版")}>
+          <div className="script-market-view-toggle" role="group" aria-label={t("脚本排版")}>
             <Button aria-pressed={marketView === "grid"} onClick={() => setMarketView("grid")} size="sm" variant={marketView === "grid" ? "secondary" : "ghost"}>
               <LayoutGrid className="h-4 w-4" />
               {t("板块")}
@@ -9152,7 +9154,7 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
               {t("列表")}
             </Button>
           </div>
-        </> : <span className="user-scripts-summary">{t("内置、手动和市场安装插件；可在这里启停或删除用户插件")}</span>}
+        </> : <span className="user-scripts-summary">{t("内置、手动和市场安装脚本；可在这里启停或删除用户脚本")}</span>}
       </div>
       {pane === "market" ? (
         marketScripts.length ? (
@@ -9169,15 +9171,15 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
               ))}
             </div>
           ) : (
-            <div className="empty">{t("没有匹配的市场插件。")}</div>
+            <div className="empty">{t("没有匹配的市场脚本。")}</div>
           )
         ) : (
-          <div className="empty">{market?.status === "failed" ? market.message : t("点击刷新市场加载远程插件。")}</div>
+          <div className="empty">{market?.status === "failed" ? market.message : t("点击刷新市场加载远程脚本。")}</div>
         )
       ) : (
         <Panel>
           <div className="table">
-            {scripts.length ? scripts.map((script) => <ScriptRow key={script.key} script={script} actions={actions} />) : <div className="empty">{t("未发现用户插件。")}</div>}
+            {scripts.length ? scripts.map((script) => <ScriptRow key={script.key} script={script} actions={actions} />) : <div className="empty">{t("未发现用户脚本。")}</div>}
           </div>
         </Panel>
       )}

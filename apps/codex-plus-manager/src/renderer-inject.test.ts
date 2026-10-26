@@ -581,6 +581,7 @@ const settingsCatalogUrl = new URL("../../../crates/codex-plus-core/assets/enhan
 async function settingsCatalogRuntime(
   postJson: (path: string) => Promise<unknown>,
   platform: { windows: boolean; mac: boolean } = { windows: false, mac: true },
+  backendSettings: Record<string, unknown> = { enhancementsEnabled: true },
 ) {
   const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
   const slice = (startMarker: string, endMarker: string) => {
@@ -591,7 +592,7 @@ async function settingsCatalogRuntime(
   };
   const diagnostics: Array<{ name: string; detail: unknown }> = [];
   const runtime = new Function(
-    "postJson", "sendCodexPlusDiagnostic", "codexPlusIsWindowsPlatform", "codexPlusIsMacPlatform",
+    "postJson", "sendCodexPlusDiagnostic", "codexPlusIsWindowsPlatform", "codexPlusIsMacPlatform", "codexPlusBackendSettings",
     `${slice("  const codexPlusBackendSettingMap = {", "  const codexPlusBackendMappedSettings")}
 ${slice("  function escapeHtml(value) {", "\n  }\n")}
   }
@@ -613,7 +614,7 @@ ${slice("  let codexPlusSettingsCatalog = null;", "  function refreshCodexPlusSe
     status: () => codexPlusSettingsCatalogStatus,
     refreshes: () => refreshes,
   };`,
-  )(postJson, (name: string, detail: unknown) => { diagnostics.push({ name, detail }); }, platform.windows, platform.mac) as {
+  )(postJson, (name: string, detail: unknown) => { diagnostics.push({ name, detail }); }, platform.windows, platform.mac, backendSettings) as {
     load: () => Promise<unknown>;
     sections: () => string;
     status: () => { status: string; message: string };
@@ -626,7 +627,7 @@ ${slice("  let codexPlusSettingsCatalog = null;", "  function refreshCodexPlusSe
 function parseSettingsSections(html: string) {
   return Array.from(html.matchAll(/<section class="codex-plus-settings-section" aria-label="([^"]+)"[^>]*>([\s\S]*?)<\/section>/g), ([, title, body]) => ({
     title,
-    rows: Array.from(body.matchAll(/<div class="codex-plus-row"(?: data-codex-plus-setting-row="([^"]+)")?[^>]*>\s*<div><div class="codex-plus-row-title">([^<]*)<\/div><div class="codex-plus-row-description">([^<]*)<\/div><\/div>([\s\S]*?)(?=<div class="codex-plus-row"|$)/g), ([, key, rowTitle, description, control]) => ({
+    rows: Array.from(body.matchAll(/<div class="codex-plus-row"(?: data-codex-plus-setting-row="([^"]+)")?[^>]*>\s*<div><div class="codex-plus-row-title">([^<]*)<\/div><div class="codex-plus-row-description"[^>]*>([^<]*)<\/div><\/div>([\s\S]*?)(?=<div class="codex-plus-row"|$)/g), ([, key, rowTitle, description, control]) => ({
       key: key ?? "",
       title: rowTitle,
       description,
@@ -1080,11 +1081,11 @@ return (loaded) => { codexPlusBackendSettingsLoaded = loaded; renderCodexPlusMen
       setAttribute: (name: string, value: string) => { attributes[name] = value; },
     };
     let menuRefreshes = 0;
-    const refresh = new Function("document", "codexPlusBackendSettings", "syncStepwisePanel", "runScanStep", "syncCodexPlusTypingEffects", "renderCodexPlusMenu", "scan",
+    const refresh = new Function("document", "codexPlusBackendSettings", "syncStepwisePanel", "runScanStep", "syncCodexPlusTypingEffects", "renderCodexPlusMenu", "scan", "syncCodexPlusSettingsCatalogDescriptions",
       `${renderer.slice(start, end)}\nreturn refreshCodexPlusBackendToggles;`,
     )(
       { querySelectorAll: () => [button] }, settings, () => {}, () => {}, () => {},
-      () => { menuRefreshes += 1; }, () => {},
+      () => { menuRefreshes += 1; }, () => {}, () => {},
     ) as () => void;
     refresh();
     assert.equal(button.dataset.enabled, "true");
@@ -3111,7 +3112,7 @@ describe("renderer model reasoning efforts patch", () => {
 
 describe("Codex++ 设置页按设置项清单生成", () => {
   type CatalogItem = {
-    key: string; group: string; control: string; title: string; description: string;
+    key: string; group: string; control: string; title: string; description: string; descriptionWhenEnhancementsOn?: string;
     surfaces: string[]; platforms?: string[]; codexInputs?: Array<{ id: string; label: string; hint?: string }>;
   };
   type Catalog = { groups: Array<{ id: string; title: string; description?: string }>; items: CatalogItem[] };
@@ -3157,7 +3158,7 @@ describe("Codex++ 设置页按设置项清单生成", () => {
       const section = sections.find((candidate) => candidate.rows.includes(row))!;
       assert.equal(section.title, catalog.groups.find((group) => group.id === item.group)!.title);
       assert.equal(row.title, item.title);
-      assert.equal(row.description, item.description);
+      assert.equal(row.description, item.descriptionWhenEnhancementsOn ?? item.description);
       if (item.control === "bool") {
         assert.ok(row.control.includes(`role="switch" aria-checked="false" aria-label="${item.title}"`), `${item.key} 开关缺少读屏标签`);
         assert.match(row.control, /data-codex-plus-setting="[^"]+"|data-codex-backend-setting="[^"]+"/);
@@ -3177,6 +3178,22 @@ describe("Codex++ 设置页按设置项清单生成", () => {
     // 管理器专属项不出现在 Codex 设置页。
     for (const item of catalog.items.filter((candidate) => !candidate.surfaces.includes("codex"))) {
       assert.ok(!html.includes(item.title), `${item.key} 只在管理器显示`);
+    }
+  });
+
+  it("独立模式补丁的说明随增强总开关切换，与管理器一致", async () => {
+    const catalog = await readCatalog();
+    const switching = catalog.items.filter((item) => item.descriptionWhenEnhancementsOn && item.surfaces.includes("codex"));
+    assert.ok(switching.length > 0);
+    for (const enhancementsEnabled of [true, false]) {
+      const page = await settingsCatalogRuntime(async () => catalog, undefined, { enhancementsEnabled });
+      await page.load();
+      const rows = parseSettingsSections(page.sections()).flatMap((section) => section.rows);
+      for (const item of switching) {
+        const row = rows.find((candidate) => candidate.key === item.key)!;
+        assert.equal(row.description, enhancementsEnabled ? item.descriptionWhenEnhancementsOn : item.description, `${item.key} enhancements=${enhancementsEnabled}`);
+        assert.match(row.control + page.sections(), new RegExp(`data-codex-plus-setting-description="${item.key}"`));
+      }
     }
   });
 

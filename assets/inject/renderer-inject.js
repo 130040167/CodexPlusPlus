@@ -6201,6 +6201,7 @@
       button.dataset.enabled = String(!!codexPlusBackendSettings[key]);
       button.setAttribute("aria-checked", button.dataset.enabled);
     });
+    syncCodexPlusSettingsCatalogDescriptions();
     syncStepwisePanel();
     runScanStep(syncCodexPlusTypingEffects);
     if (typeof syncCodexPlusAgentPet === "function") runScanStep(syncCodexPlusAgentPet);
@@ -7446,6 +7447,21 @@
     return Object.keys(codexPlusBackendSettingMap).find((key) => codexPlusBackendSettingMap[key] === backendKey) || "";
   }
 
+  function codexPlusSettingsCatalogDescription(item) {
+    const enhancementsOn = codexPlusBackendSettings.enhancementsEnabled !== false;
+    return (enhancementsOn && item.descriptionWhenEnhancementsOn) || item.description || "";
+  }
+
+  /** 总开关变化后刷新带两套说明的行。 */
+  function syncCodexPlusSettingsCatalogDescriptions() {
+    if (!codexPlusSettingsCatalog) return;
+    document.querySelectorAll("[data-codex-plus-setting-description]").forEach((node) => {
+      const key = node.getAttribute("data-codex-plus-setting-description");
+      const item = codexPlusSettingsCatalog.items.find((candidate) => candidate.key === key);
+      if (item) node.textContent = codexPlusSettingsCatalogDescription(item);
+    });
+  }
+
   function renderCodexPlusSettingsCatalogRow(item) {
     const title = escapeHtml(item.title);
     let control = "";
@@ -7460,9 +7476,12 @@
     }
     // 不认识的控件类型宁可不显示，也不显示一个点了不生效的行。
     if (!control) return "";
+    // 独立模式补丁在增强开启时换一句说明，与管理器一致；切换由 syncCodexPlusSettingsCatalogDescriptions 完成。
+    const description = escapeHtml(codexPlusSettingsCatalogDescription(item));
+    const descriptionData = item.descriptionWhenEnhancementsOn ? ` data-codex-plus-setting-description="${escapeHtml(item.key)}"` : "";
     return `
                 <div class="codex-plus-row" data-codex-plus-setting-row="${escapeHtml(item.key)}">
-                  <div><div class="codex-plus-row-title">${title}</div><div class="codex-plus-row-description">${escapeHtml(item.description || "")}</div></div>
+                  <div><div class="codex-plus-row-title">${title}</div><div class="codex-plus-row-description"${descriptionData}>${description}</div></div>
                   ${control}
                 </div>`;
   }
