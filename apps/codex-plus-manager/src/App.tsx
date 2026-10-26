@@ -1220,17 +1220,17 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   // 概览在两个工具下都可见：它承载共用的置顶推荐位，以及各自的状态。
   { id: "overview", get label() { return t("概览"); }, icon: LayoutDashboard },
   { id: "relay", get label() { return t("供应商配置"); }, icon: KeyRound, tool: "codex" },
-  { id: "multiLaunch", get label() { return t("Codex多开"); }, icon: Layers3, tool: "codex" },
-  { id: "claude", get label() { return t("Claude 增强"); }, icon: Languages, tool: "claude" },
+  { id: "multiLaunch", get label() { return t("多开"); }, icon: Layers3, tool: "codex" },
+  { id: "claude", get label() { return t("增强"); }, icon: Languages, tool: "claude" },
   // 请求日志、会话、MCP、Skills 管理所有 Agent，不属于某一个 Agent。
   { id: "sessions", get label() { return t("会话"); }, icon: MessagesSquare },
   { id: "context", label: "MCP", icon: Network },
   { id: "skills", label: "Skills", icon: BookOpen },
   { id: "weixin", get label() { return t("微信连接"); }, icon: ScanLine, tool: "codex" },
-  { id: "enhance", get label() { return t("Codex增强"); }, icon: Hammer, tool: "codex" },
+  { id: "enhance", get label() { return t("增强"); }, icon: Hammer, tool: "codex" },
   { id: "dreamSkin", get label() { return t("皮肤管理"); }, icon: Palette, tool: "codex" },
-  { id: "userScripts", get label() { return t("拓展"); }, icon: FileCode2, tool: "codex" },
-  { id: "pluginMarket", get label() { return t("Codex 插件市场"); }, icon: Store, tool: "codex" },
+  { id: "userScripts", get label() { return t("插件"); }, icon: FileCode2, tool: "codex" },
+  { id: "pluginMarket", get label() { return t("插件市场"); }, icon: Store, tool: "codex" },
   { id: "recommendations", get label() { return t("推荐内容"); }, icon: ExternalLink },
   // 缓存清理覆盖多个 AI 应用，属于应用级页面，在各工具下均可访问。
   { id: "agentCache", get label() { return t("AI Agent 缓存清理"); }, icon: Trash2 },
@@ -1717,7 +1717,7 @@ export function App() {
     if (result) {
       setScriptMarket(result);
       setSettings((current) => (current ? { ...current, user_scripts: result.user_scripts } : current));
-      if (!silent || !isSuccessStatus(result.status)) showResultNotice(t("拓展"), result, { silentSuccess: true });
+      if (!silent || !isSuccessStatus(result.status)) showResultNotice(t("插件"), result, { silentSuccess: true });
     }
   };
 
@@ -1735,7 +1735,7 @@ export function App() {
     if (result) {
       setSettings(result);
       setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
-      showResultNotice(t("本地拓展"), result);
+      showResultNotice(t("本地插件"), result);
     }
   };
 
@@ -1744,7 +1744,7 @@ export function App() {
     if (result) {
       setScriptMarket(result);
       setSettings((current) => (current ? { ...current, user_scripts: result.user_scripts } : current));
-      showResultNotice(t("拓展"), result);
+      showResultNotice(t("插件"), result);
     }
   };
 
@@ -1753,7 +1753,7 @@ export function App() {
     if (!result) return;
     setSettings(result);
     setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
-    showResultNotice(t("本地拓展"), result);
+    showResultNotice(t("本地插件"), result);
     if (isSuccessStatus(result.status)) await reloadUserScripts();
   };
 
@@ -1762,7 +1762,7 @@ export function App() {
     if (!result) return;
     setSettings(result);
     setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
-    showResultNotice(t("本地拓展"), result);
+    showResultNotice(t("本地插件"), result);
   };
 
   const setUserScriptEnabled = async (key: string, enabled: boolean) => {
@@ -1770,7 +1770,7 @@ export function App() {
     if (result) {
       setSettings(result);
       setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
-      showResultNotice(t("本地拓展"), result);
+      showResultNotice(t("本地插件"), result);
       await refreshUserScriptInventory();
     }
   };
@@ -1778,12 +1778,12 @@ export function App() {
   const deleteUserScript = async (key: string) => {
     const script = settings?.user_scripts?.scripts?.find((item) => item.key === key);
     const name = script?.name || key;
-    if (!window.confirm(tf("删除拓展“{0}”？此操作会移除本地拓展文件。", [name]))) return;
+    if (!window.confirm(tf("删除插件“{0}”？此操作会移除本地插件文件。", [name]))) return;
     const result = await run(() => call<SettingsResult>("delete_user_script", { key }));
     if (result) {
       setSettings(result);
       setScriptMarket((current) => syncMarketInstalledState(current, result.user_scripts));
-      showResultNotice(t("本地拓展"), result);
+      showResultNotice(t("本地插件"), result);
       await refreshUserScriptInventory();
     }
   };
@@ -8942,11 +8942,11 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
   return (
     <>
       <Panel>
-        <CardHead title={t("拓展")} detail={tf("{0} 个市场拓展，已安装 {1} 个，本地整体 {2}", [marketScripts.length, installedCount, inventory?.enabled === false ? t("关闭") : t("开启")])} />
+        <CardHead title={t("插件")} detail={tf("{0} 个市场插件，已安装 {1} 个，本地整体 {2}", [marketScripts.length, installedCount, inventory?.enabled === false ? t("关闭") : t("开启")])} />
         <CardContent>
           <div className="metric-list">
             <Metric label={t("市场状态")} value={market?.market.message ?? t("尚未刷新")} />
-            <Metric label={t("远程拓展")} value={tf("{0} 个", [marketScripts.length])} />
+            <Metric label={t("远程插件")} value={tf("{0} 个", [marketScripts.length])} />
             <Metric label={t("已安装")} value={tf("{0} 个", [installedCount])} />
             <Metric label={t("本地整体")} value={inventory?.enabled === false ? t("关闭") : t("开启")} />
           </div>
@@ -8956,9 +8956,9 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
               disabled={!inventory}
               variant="secondary"
               aria-pressed={inventory?.enabled !== false}
-              title={t("整体开关不改变单个拓展的启停设置")}
+              title={t("整体开关不改变单个插件的启停设置")}
             >
-              {inventory?.enabled === false ? t("开启本地拓展") : t("关闭本地拓展")}
+              {inventory?.enabled === false ? t("开启本地插件") : t("关闭本地插件")}
             </Button>
             <Button
               onClick={() => void actions.setUserScriptsSkipNextStart(!inventory?.skip_next_start)}
@@ -8966,7 +8966,7 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
               variant={inventory?.skip_next_start ? "secondary" : "outline"}
               title={t("脚本导致黑屏或卡死时，下一次启动先跳过脚本；脚本启停设置不会改变")}
             >
-              {inventory?.skip_next_start ? t("取消下次启动安全模式") : t("下次启动跳过拓展")}
+              {inventory?.skip_next_start ? t("取消下次启动安全模式") : t("下次启动跳过插件")}
             </Button>
             <Button onClick={() => void actions.refreshScriptMarket()}>
               <RefreshCw className="h-4 w-4" />
@@ -8980,16 +8980,16 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
               <RefreshCw className="h-4 w-4" />
               {t("刷新本地")}
             </Button>
-            <Button onClick={() => void reload()} disabled={reloading} variant="secondary" title={t("应用本地拓展及开关；旧拓展可能需要刷新 Codex 页面")}>
+            <Button onClick={() => void reload()} disabled={reloading} variant="secondary" title={t("应用本地插件及开关；旧插件可能需要刷新 Codex 页面")}>
               <RefreshCw className={reloading ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
-              {t("热重载拓展")}
+              {t("热重载插件")}
             </Button>
           </Toolbar>
         </CardContent>
       </Panel>
       <Panel>
         <CardHead
-          title={t("市场拓展")}
+          title={t("市场插件")}
           detail={
             market?.market.updatedAt
               ? tf("清单更新时间：{0}，当前显示 {1} / {2}", [formatMarketUpdatedAt(market.market.updatedAt), filteredMarketScripts.length, marketScripts.length])
@@ -9001,13 +9001,13 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
             <div className="script-market-search">
               <Search className="h-4 w-4" />
               <Input
-                aria-label={t("搜索市场拓展")}
+                aria-label={t("搜索市场插件")}
                 onChange={(event) => setMarketSearch(event.currentTarget.value)}
                 placeholder={t("搜索名称、作者、描述或标签")}
                 value={marketSearch}
               />
             </div>
-            <div className="script-market-view-toggle" role="group" aria-label={t("拓展排版")}>
+            <div className="script-market-view-toggle" role="group" aria-label={t("插件排版")}>
               <Button
                 aria-pressed={marketView === "grid"}
                 onClick={() => setMarketView("grid")}
@@ -9042,18 +9042,18 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
                 ))}
               </div>
             ) : (
-              <div className="empty">{t("没有匹配的市场拓展。")}</div>
+              <div className="empty">{t("没有匹配的市场插件。")}</div>
             )
           ) : (
-            <div className="empty">{market?.status === "failed" ? market.message : t("点击刷新市场加载远程拓展。")}</div>
+            <div className="empty">{market?.status === "failed" ? market.message : t("点击刷新市场加载远程插件。")}</div>
           )}
         </CardContent>
       </Panel>
       <Panel>
-        <CardHead title={t("本地拓展")} detail={t("内置、手动和市场安装拓展；可在这里启停或删除用户拓展")} />
+        <CardHead title={t("本地插件")} detail={t("内置、手动和市场安装插件；可在这里启停或删除用户插件")} />
         <CardContent>
           <div className="table">
-            {scripts.length ? scripts.map((script) => <ScriptRow key={script.key} script={script} actions={actions} />) : <div className="empty">{t("未发现用户拓展。")}</div>}
+            {scripts.length ? scripts.map((script) => <ScriptRow key={script.key} script={script} actions={actions} />) : <div className="empty">{t("未发现用户插件。")}</div>}
           </div>
         </CardContent>
       </Panel>
@@ -14985,7 +14985,7 @@ function routeSubtitle(route: Route) {
     weixin: t("通过个人微信连接本机 Codex 会话"),
     enhance: t("管理常用功能、语音输入与下一步建议。"),
     dreamSkin: t("Codex-Dream-Skin 风格主题和换图"),
-    userScripts: t("内置和用户自定义拓展清单"),
+    userScripts: t("内置和用户自定义插件清单"),
     pluginMarket: t("检索插件，按需下载并安装到 Codex"),
     recommendations: t("来自 Codex++ 广告源的推荐，点卡片在浏览器里打开"),
     agentCache: t("扫描 Codex、Claude 与 Codex++ 的已知缓存目录，由你选择清理项目。"),
