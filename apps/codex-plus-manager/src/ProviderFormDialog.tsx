@@ -17,6 +17,7 @@ import {
   type ProviderDraft,
 } from "./gateway-model";
 import { Avatar } from "./gateway-ui";
+import { GwSelect } from "./GatewayAgents";
 import {
   FETCHED_DIRECT_LIMIT,
   addModel,
@@ -269,10 +270,17 @@ export function ProviderFormDialog({
             </h4>
             <PriceNote model={chosenModel} price={price} />
             <div className="pf-price">
-              <select aria-label={t("币种")} className="pf-select" onChange={(event) => editPrice({ priceCurrency: event.currentTarget.value })} value={draft.priceCurrency}>
-                <option value="USD">$ USD</option>
-                <option value="CNY">¥ CNY</option>
-              </select>
+              <GwSelect
+                compact
+                label={t("币种")}
+                onChange={(next) => editPrice({ priceCurrency: next })}
+                options={[
+                  { value: "USD", label: "$ USD" },
+                  { value: "CNY", label: "¥ CNY" },
+                ]}
+                value={draft.priceCurrency === "USD" ? "USD" : "CNY"}
+                width={140}
+              />
               <label><span>{t("输入")}</span><Input inputMode="decimal" onChange={(event) => editPrice({ priceInput: event.currentTarget.value })} placeholder="0" value={draft.priceInput} /></label>
               <label><span>{t("缓存命中")}</span><Input inputMode="decimal" onChange={(event) => editPrice({ priceCached: event.currentTarget.value })} placeholder="0" value={draft.priceCached} /></label>
               <label><span>{t("输出")}</span><Input inputMode="decimal" onChange={(event) => editPrice({ priceOutput: event.currentTarget.value })} placeholder="0" value={draft.priceOutput} /></label>

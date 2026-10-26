@@ -312,3 +312,13 @@ test("会话：合并排序、按 Agent 与关键词过滤；路径与相对时�
   assert.deepEqual(relativeTime(now - 3 * 3_600_000, now), { text: "{0} 小时前", args: [3] });
   assert.deepEqual(relativeTime(now - 2 * 86_400_000, now), { text: "{0} 天前", args: [2] });
 });
+
+test("网关各页不用原生下拉框，统一用 GwSelect", () => {
+  for (const file of ["GatewayPage.tsx", "GatewayAgents.tsx", "GatewayProviders.tsx", "GatewayUsage.tsx", "GatewaySessions.tsx", "TrayPanel.tsx", "ProviderFormDialog.tsx"]) {
+    const source = readFileSync(new URL(`./${file}`, import.meta.url), "utf8");
+    assert.doesNotMatch(source, /<select[\s>]/, file);
+  }
+  const shared = app.slice(app.indexOf("function SharedServiceSettings("), app.indexOf("function ProxySettingsScreen("));
+  assert.doesNotMatch(shared, /<select[\s>]/);
+  assert.match(shared, /<GwSelect/);
+});

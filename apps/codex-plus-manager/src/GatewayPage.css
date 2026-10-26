@@ -982,6 +982,78 @@
   white-space: nowrap;
 }
 
+/* —— 下拉选择（替代原生下拉框） —— */
+.gw-select-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 150px;
+  height: 34px;
+  padding: 0 10px 0 12px;
+  border: 1px solid hsl(var(--input));
+  border-radius: 8px;
+  background: hsl(var(--background));
+  color: var(--gw-ink);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.gw-select-button-compact {
+  min-width: 0;
+  height: 26px;
+  padding: 0 6px 0 8px;
+  border-radius: 7px;
+  font-size: 12px;
+}
+
+.gw-select-button:hover:not(:disabled),
+.gw-select-button[data-open="true"] {
+  border-color: hsl(var(--primary) / 0.5);
+}
+
+.gw-select-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.gw-select-button svg {
+  flex: none;
+  color: var(--gw-mute);
+}
+
+.gw-select-options {
+  display: grid;
+  gap: 2px;
+  padding: 6px;
+  overflow-y: auto;
+}
+
+.gw-select-option {
+  min-height: 0;
+  padding: 8px 10px;
+}
+
+.gw-select-option-text {
+  display: grid;
+  flex: 1;
+  gap: 2px;
+  min-width: 0;
+  font-size: 13px;
+}
+
+.gw-select-option-text small {
+  color: var(--gw-mute);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.gw-select-check {
+  flex: none;
+  color: hsl(var(--primary));
+}
+
 /* —— 网关设置里的新旧共用设置 —— */
 .gw-unit-input {
   display: inline-flex;
@@ -1006,6 +1078,18 @@
 
 .gw-unit-input span {
   min-width: 22px;
+}
+
+/* 去掉原生的上下微调箭头 */
+.gw-unit-input input::-webkit-outer-spin-button,
+.gw-unit-input input::-webkit-inner-spin-button {
+  margin: 0;
+  -webkit-appearance: none;
+}
+
+.gw-unit-input input {
+  -moz-appearance: textfield;
+  appearance: textfield;
 }
 
 /* 状态码一行放不下：说明在上，编辑区在下 */

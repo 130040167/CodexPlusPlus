@@ -113,6 +113,7 @@ import { AgentCachePanel } from "./agent-cache";
 import { summarizeRecentRequests, type RecentRequestSummary } from "./overview-model";
 import { AgentCollaborationPage } from "./AgentCollaborationPage";
 import { SectionLabel, Switch } from "./gateway-ui";
+import { GwSelect } from "./GatewayAgents";
 import { GatewayPage, type GatewayTab } from "./GatewayPage";
 import { AgentGlyph, HubOverview, useGatewayPayload } from "./HubOverview";
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
@@ -5723,25 +5724,17 @@ function SharedServiceSettings({
                 </small>
               </div>
               <span />
-              <select
-                className="gw-select"
-                onChange={(event) =>
-                  onFormChange({
-                    ...form,
-                    protocolProxyAutoRetryMode:
-                      event.currentTarget.value === "buffered"
-                        ? "buffered"
-                        : event.currentTarget.value === "streaming-legacy"
-                          ? "streaming-legacy"
-                          : "streaming",
-                  })
-                }
+              <GwSelect
+                label={t("避震模式")}
+                onChange={(next) => onFormChange({ ...form, protocolProxyAutoRetryMode: next })}
+                options={[
+                  { value: "streaming", label: t("流式（推荐）"), hint: t("保留实时输出；正文出现前遇到过载由代理重试。") },
+                  { value: "streaming-legacy", label: t("流式（旧行为）"), hint: t("旧版流式行为，仅在新版有问题时使用。") },
+                  { value: "buffered", label: t("整段缓冲"), hint: t("始终由代理重试，但要等整段生成完才显示。") },
+                ]}
                 value={form.protocolProxyAutoRetryMode}
-              >
-                <option value="streaming">{t("流式（推荐）")}</option>
-                <option value="streaming-legacy">{t("流式（旧行为）")}</option>
-                <option value="buffered">{t("整段缓冲")}</option>
-              </select>
+                width={300}
+              />
             </div>
             {form.protocolProxyAutoRetryMode === "streaming" ? (
               <div className="gw-setting-row">

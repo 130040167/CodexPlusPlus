@@ -29,7 +29,7 @@ import {
   type MemberStatus,
   type RouteRecordView,
 } from "./gateway-model";
-import { AgentsView, Floating, ModelList } from "./GatewayAgents";
+import { AgentsView, Floating, GwSelect, ModelList } from "./GatewayAgents";
 import { ProvidersView } from "./GatewayProviders";
 import { SessionsView } from "./GatewaySessions";
 import { UsageView } from "./GatewayUsage";
@@ -607,10 +607,16 @@ function GatewayView({ payload, busy, run }: { payload: GatewayPayload | null; b
             <strong>{t("多 Key 轮换")}</strong>
             <small>{mode === "roundRobin" ? t("每个请求换下一个 Key，用量更平均，但上游缓存命中会变低。") : t("同一会话固定一个 Key，出错才换；保住上游的提示词缓存。")}</small>
           </div>
-          <select className="gw-select" disabled={busy !== null} onChange={(event) => saveOptions(event.currentTarget.value, restoreOnExit)} value={mode}>
-            <option value="sticky">{t("会话粘性（推荐）")}</option>
-            <option value="roundRobin">{t("逐请求轮换")}</option>
-          </select>
+          <GwSelect
+            disabled={busy !== null}
+            label={t("多 Key 轮换")}
+            onChange={(next) => saveOptions(next, restoreOnExit)}
+            options={[
+              { value: "sticky", label: t("会话粘性（推荐）"), hint: t("同一会话固定一个 Key，出错才换") },
+              { value: "roundRobin", label: t("逐请求轮换"), hint: t("每个请求换下一个 Key") },
+            ]}
+            value={mode}
+          />
         </div>
         <div className="gw-setting-row">
           <div>
