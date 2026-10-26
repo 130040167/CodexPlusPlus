@@ -2106,3 +2106,91 @@ span.gw-popover-check {
     display: none;
   }
 }
+
+/* ———————————— 会话 ———————————— */
+.gw-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.gw-tab-icon {
+  width: 15px;
+  height: 15px;
+  object-fit: contain;
+}
+
+.gw-tab-count {
+  color: var(--gw-mute);
+  font-size: 11.5px;
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+}
+
+.gw-session-search {
+  flex: 1;
+  max-width: 340px;
+  margin-left: auto;
+}
+
+.gw-session-row {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto auto auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 58px;
+  padding: 8px 18px;
+}
+
+.gw-session-agent {
+  width: 20px;
+  height: 20px;
+  object-fit: contain;
+}
+
+.gw-session-main {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.gw-session-main strong,
+.gw-session-main small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gw-session-main strong {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.gw-session-main small {
+  color: var(--gw-mute);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+}
+
+.gw-session-time {
+  color: var(--gw-mute);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.gw-session-resume {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+@media (max-width: 760px) {
+  .gw-session-row {
+    grid-template-columns: 22px minmax(0, 1fr) auto;
+  }
+
+  .gw-session-time,
+  .gw-session-row .gw-icon-button {
+    display: none;
+  }
+}

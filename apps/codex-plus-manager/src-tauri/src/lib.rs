@@ -321,6 +321,8 @@ pub fn run() {
             gateway_commands::load_gateway_usage,
             gateway_commands::clear_gateway_usage,
             gateway_commands::load_gateway_balances,
+            gateway_commands::list_agent_sessions,
+            gateway_commands::resume_agent_session,
             commands::weixin_connect_qr_start,
             commands::weixin_connect_qr_status,
             commands::weixin_connect_status,

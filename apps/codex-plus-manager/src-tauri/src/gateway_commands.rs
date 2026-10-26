@@ -635,6 +635,52 @@ pub async fn load_gateway_balances() -> CommandResult<GatewayBalances> {
     ok("余额已刷新。", GatewayBalances { balances })
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessions {
+    pub sessions: Vec<codex_plus_core::gateway::sessions::AgentSession>,
+}
+
+/// Claude Code / Grok 的本地会话（Codex 的会话走 `list_local_sessions`）。
+#[tauri::command]
+pub async fn list_agent_sessions(agent: String) -> CommandResult<AgentSessions> {
+    let sessions = tauri::async_runtime::spawn_blocking(move || {
+        use codex_plus_core::gateway::sessions;
+        match agent.as_str() {
+            "claude" => {
+                sessions::list_claude_sessions(&ClaudeContext::default_paths().claude_home, 300)
+            }
+            "grok" => sessions::list_grok_sessions(
+                &codex_plus_core::grok_config::default_grok_home_dir(),
+                300,
+            ),
+            _ => Vec::new(),
+        }
+    })
+    .await
+    .unwrap_or_default();
+    ok("会话已加载。", AgentSessions { sessions })
+}
+
+/// 在终端里继续一个会话（执行 Agent 自己的恢复命令）。
+#[tauri::command]
+pub fn resume_agent_session(
+    agent: String,
+    id: String,
+    cwd: String,
+) -> CommandResult<Option<GatewayPayload>> {
+    let result = (|| {
+        use codex_plus_core::gateway::sessions;
+        let command = sessions::resume_command(&agent, &id)?;
+        let scratch = codex_plus_core::paths::default_app_state_dir().join("tmp");
+        sessions::open_in_terminal(&cwd, &command, &scratch)
+    })();
+    match result {
+        Ok(()) => ok("已在终端里打开。", None),
+        Err(error) => failed(&format!("打开失败：{error:#}"), None),
+    }
+}
+
 /// 清掉某个供应商的 Key 冷却与熔断状态。
 #[tauri::command]
 pub fn reset_gateway_key_health(relay_id: String) -> CommandResult<Option<GatewayPayload>> {

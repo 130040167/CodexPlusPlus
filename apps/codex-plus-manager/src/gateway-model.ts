@@ -765,3 +765,38 @@ export function shortDate(date: string, english = false): string {
   if (english) return `${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][month - 1]} ${day}`;
   return `${month}月${day}日`;
 }
+
+/* —————————————— 会话 —————————————— */
+
+export type SessionAgent = "codex" | "claude" | "grok";
+export type AgentSessionView = { agent: SessionAgent; id: string; title: string; cwd: string; updatedAtMs: number };
+
+/** 合并各 Agent 的会话：按更新时间倒序，按 Agent 和关键词（标题、目录、id）过滤。 */
+export function filterSessions(sessions: AgentSessionView[], agent: SessionAgent | "all", query: string): AgentSessionView[] {
+  const needle = query.trim().toLowerCase();
+  return sessions
+    .filter((session) => agent === "all" || session.agent === agent)
+    .filter((session) => !needle || [session.title, session.cwd, session.id].some((value) => value.toLowerCase().includes(needle)))
+    .sort((left, right) => right.updatedAtMs - left.updatedAtMs);
+}
+
+/** `/Users/me/code/app` → `~/code/app`；太长时只留最后两级。 */
+export function shortPath(path: string, home = ""): string {
+  let text = path.trim();
+  if (home && text.startsWith(home)) text = `~${text.slice(home.length)}`;
+  else text = text.replace(/^\/Users\/[^/]+/, "~").replace(/^\/home\/[^/]+/, "~");
+  const parts = text.split("/").filter(Boolean);
+  return parts.length > 4 ? `…/${parts.slice(-2).join("/")}` : text;
+}
+
+/** 相对时间：刚刚 / N 分钟前 / N 小时前 / N 天前 / 日期。返回中文模板与参数，界面再翻译。 */
+export function relativeTime(ms: number, now: number): { text: string; args: Array<string | number> } {
+  const diff = Math.max(0, now - ms);
+  const minute = 60_000;
+  if (diff < minute) return { text: "刚刚", args: [] };
+  if (diff < 60 * minute) return { text: "{0} 分钟前", args: [Math.floor(diff / minute)] };
+  if (diff < 24 * 60 * minute) return { text: "{0} 小时前", args: [Math.floor(diff / (60 * minute))] };
+  if (diff < 30 * 24 * 60 * minute) return { text: "{0} 天前", args: [Math.floor(diff / (24 * 60 * minute))] };
+  const date = new Date(ms);
+  return { text: "{0}", args: [`${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`] };
+}

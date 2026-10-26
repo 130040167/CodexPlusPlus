@@ -6,6 +6,18 @@
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
   // 本地网关
+  "部分会话读取失败": "Some sessions could not be read",
+  "继续会话": "Resume session",
+  "继续会话失败": "Failed to resume session",
+  "已复制": "Copied",
+  "搜索标题或目录": "Search title or folder",
+  "（没有标题）": "(untitled)",
+  "（没有目录）": "(no folder)",
+  "复制恢复命令": "Copy resume command",
+  "在终端继续": "Resume in terminal",
+  "没有匹配的会话": "No matching sessions",
+  "还没有会话": "No sessions yet",
+  "刚刚": "just now",
   "用量": "Usage",
   "价格": "Price",
   "每百万 token；填了才在「用量」里估算费用，可以不填": "per million tokens; used to estimate cost in Usage, optional",
@@ -2025,6 +2037,10 @@ export const EN_PLAIN: Record<string, string> = {
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
   // 本地网关
+  "{0} 分钟前": "{0} min ago",
+  "{0} 小时前": "{0} h ago",
+  "{0} 天前": "{0} d ago",
+  "{0}": "{0}",
   "{0} 输入 · {1} 输出": "{0} in · {1} out",
   "命中率 {0}%": "hit rate {0}%",
   "{0} 次出错": "{0} errors",

@@ -285,3 +285,22 @@ test("用量格式：token 缩写、货币、命中率、横轴标签", async ()
   assert.equal(shortDate("2026-09-01"), "9月1日");
   assert.equal(shortDate("2026-09-01", true), "Sep 1");
 });
+
+test("会话：合并排序、按 Agent 与关键词过滤；路径与相对时间", async () => {
+  const { filterSessions, relativeTime, shortPath } = await import("./gateway-model.ts");
+  const sessions = [
+    { agent: "codex" as const, id: "c1", title: "修复登录", cwd: "/Users/me/app", updatedAtMs: 10 },
+    { agent: "claude" as const, id: "k1", title: "重构网关", cwd: "/Users/me/gw", updatedAtMs: 30 },
+    { agent: "grok" as const, id: "g1", title: "写测试", cwd: "/Users/me/app", updatedAtMs: 20 },
+  ];
+  assert.deepEqual(filterSessions(sessions, "all", "").map((session) => session.id), ["k1", "g1", "c1"]);
+  assert.deepEqual(filterSessions(sessions, "grok", "").map((session) => session.id), ["g1"]);
+  assert.deepEqual(filterSessions(sessions, "all", "app").map((session) => session.id), ["g1", "c1"]);
+  assert.equal(shortPath("/Users/me/code/app"), "~/code/app");
+  assert.equal(shortPath("/Users/me/a/b/c/d/e"), "…/d/e");
+  const now = 1_000_000_000;
+  assert.deepEqual(relativeTime(now - 5_000, now), { text: "刚刚", args: [] });
+  assert.deepEqual(relativeTime(now - 5 * 60_000, now), { text: "{0} 分钟前", args: [5] });
+  assert.deepEqual(relativeTime(now - 3 * 3_600_000, now), { text: "{0} 小时前", args: [3] });
+  assert.deepEqual(relativeTime(now - 2 * 86_400_000, now), { text: "{0} 天前", args: [2] });
+});
