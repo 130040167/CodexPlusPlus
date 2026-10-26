@@ -22,6 +22,7 @@ async fn bridge_routes_cover_all_current_paths() {
     let cases = [
         ("/settings/get", json!({})),
         ("/settings/set", json!({"providerSyncEnabled": true})),
+        ("/settings/catalog", json!({})),
         ("/user-scripts/list", json!({})),
         ("/user-scripts/set-enabled", json!({"enabled": false})),
         (
@@ -254,6 +255,63 @@ async fn llm_proxy_rejects_non_post_methods() {
 
     assert_eq!(result["status"], json!("failed"));
     assert_eq!(result["message"], json!("LLM Bridge 仅支持 POST 请求"));
+}
+
+fn enhancement_settings_catalog_file() -> Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("enhancement-settings.json");
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn settings_catalog_route_returns_the_single_catalog_file() {
+    // 注入页的设置行只从这条路由取文案；返回的必须就是管理器 import 的那份 JSON。
+    let result = handle_bridge_request(test_context(), "/settings/catalog", json!({})).await;
+    assert_eq!(result, enhancement_settings_catalog_file());
+    assert!(result["items"].as_array().is_some_and(|items| !items.is_empty()));
+}
+
+#[test]
+fn settings_catalog_items_map_to_real_backend_settings() {
+    // 清单里的 key 就是 /settings/set 写入的字段：拼错或字段被删时这里先失败，
+    // 不会等到用户在 Codex 里点了开关才发现没存上。
+    let catalog = enhancement_settings_catalog_file();
+    let defaults = serde_json::to_value(BackendSettings::default()).unwrap();
+    let groups: Vec<&str> = catalog["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group| group["id"].as_str().unwrap())
+        .collect();
+    let mut keys = std::collections::HashSet::new();
+    for item in catalog["items"].as_array().unwrap() {
+        let key = item["key"].as_str().unwrap();
+        assert!(keys.insert(key), "{key} 在清单里重复");
+        assert!(
+            groups.contains(&item["group"].as_str().unwrap()),
+            "{key} 引用了不存在的分组"
+        );
+        let value = defaults
+            .get(key)
+            .unwrap_or_else(|| panic!("{key} 不是 BackendSettings 字段"));
+        match item["control"].as_str().unwrap() {
+            "bool" => assert!(value.is_boolean(), "{key} 应为布尔字段"),
+            "select" => {
+                let options: Vec<&str> = item["options"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|option| option["value"].as_str().unwrap())
+                    .collect();
+                assert!(
+                    options.contains(&value.as_str().unwrap()),
+                    "{key} 的默认值不在选项里"
+                );
+            }
+            other => panic!("{key} 使用了未知控件类型 {other}"),
+        }
+    }
 }
 
 #[tokio::test]

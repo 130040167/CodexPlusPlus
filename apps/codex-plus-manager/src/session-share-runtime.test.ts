@@ -174,7 +174,11 @@ test("the in-app share toggle persists a backend update rather than a temporary 
   vm.runInContext(`${style.slice(start, end)}\n${style.slice(setterStart, setterEnd)}`, context);
   context.setCodexPlusSetting("sessionShare", false); await Promise.resolve();
   assert.deepEqual(writes, [["codexAppSessionShare", false]]);
-  assert.ok(fragment("40-backend-settings.js").includes('data-codex-plus-setting="sessionShare"'));
+  // 设置页的分享开关按清单生成：清单字段映射到本页的 sessionShare，由 setCodexPlusSetting 写后端。
+  const catalog = JSON.parse(readFileSync(new URL("../../../crates/codex-plus-core/assets/enhancement-settings.json", import.meta.url), "utf8"));
+  const shareItem = catalog.items.find((item: { key: string }) => item.key === "codexAppSessionShare");
+  assert.ok(shareItem?.surfaces.includes("codex"));
+  assert.match(style, /sessionShare: "codexAppSessionShare"/);
 });
 
 test("backend refresh synchronizes share immediately and skips failed heartbeat reads", async () => {

@@ -136,6 +136,17 @@ import { McpPage, PageHeader } from "./ManagementPages";
 import { SkillsPage } from "./ManagementExtra";
 import { ProjectSessionPage } from "./ProjectSessionPage";
 import { ENHANCEMENT_SECTION_IDS, managerNavigationDestination, type EnhancementTab, type ManagerNavigationIntent } from "./enhancement-navigation";
+import {
+  enhancementGroup,
+  enhancementGroupAnchorId,
+  enhancementItem,
+  enhancementPlatformFromUserAgent,
+  isEnhancementItemMasterGated,
+  managerGeneralGroups,
+  managerGroupItems,
+  managerStandaloneGroup,
+  type EnhancementSettingItem,
+} from "./enhancement-catalog";
 import { DEFAULT_AUTO_COMPACT_PERCENT, autoCompactOptions, normalizeAutoCompactPercent } from "./auto-compact";
 import { agentPetSettingsIssue, defaultAgentPetSettings, normalizeAgentPetSettings, type AgentPetIssue, type AgentPetSettings } from "./agent-pet-settings";
 import { AgentPetPage } from "./AgentPetPage";
@@ -271,8 +282,10 @@ import {
 } from "./multi-launch-model";
 
 const isWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent);
-const isMacPlatform = /\bMacintosh\b/i.test(navigator.userAgent);
-const supportsPetRealMouseLook = isWindowsPlatform || isMacPlatform;
+/// 增强设置项清单按平台过滤（例如桌宠跟随鼠标只在 Windows / macOS 显示）。
+const enhancementPlatform = enhancementPlatformFromUserAgent(navigator.userAgent);
+/// 会话维护页的「启动前自动修复历史会话」与 Codex 设置页共用清单里的同一条文案。
+const providerSyncItem = enhancementItem("providerSyncEnabled");
 
 /// 多开启动后轮询「就绪/失败」结论的节奏：worker 最长等 90 秒就绪，这里给到 2 分钟。
 const MULTI_LAUNCH_POLL_INTERVAL_MS = 3000;
@@ -7524,15 +7537,16 @@ function StepwiseSettingsPanel({ form, onFormChange, actions }: {
   onFormChange: (value: BackendSettings) => void;
   actions: Actions;
 }) {
+  const group = enhancementGroup("stepwise");
   return (
     <Panel className="enhance-service-panel">
-      <CardHead title={t("下一步建议")} detail={t("控制下一步建议与回答大纲。")} />
+      <CardHead title={t(group.title)} detail={t(group.description ?? "")} />
       <CardContent className="settings-content">
         <div className="settings-block stepwise-settings-block" id={ENHANCEMENT_SECTION_IDS.stepwise}>
           <div className="enhance-service-toggles">
-            <FeatureToggle title={t("下一步建议")} detail={t("根据当前回答生成下一步建议。")} checked={form.codexAppStepwiseEnabled} disabled={!form.enhancementsEnabled} onChange={(value) => onFormChange({ ...form, codexAppStepwiseEnabled: value })} />
-            <FeatureToggle title={t("回答大纲")} detail={t("整理当前回答的结构。")} checked={form.codexAppAnswerOutlineEnabled} disabled={!form.enhancementsEnabled} onChange={(value) => onFormChange({ ...form, codexAppAnswerOutlineEnabled: value })} />
-            <FeatureToggle title={t("建议直接发送")} detail={t("点击建议后直接发送到当前会话。")} checked={form.codexAppStepwiseDirectSend} disabled={!form.enhancementsEnabled} onChange={(value) => onFormChange({ ...form, codexAppStepwiseDirectSend: value })} />
+            {managerGroupItems(group.id, enhancementPlatform).map((item) => (
+              <EnhancementSettingControl key={item.key} item={item} form={form} onFormChange={onFormChange} masterEnabled={form.enhancementsEnabled} />
+            ))}
           </div>
           <div className="stepwise-settings-section">{t("连接")}</div>
           <div className="form-row">
@@ -7755,22 +7769,42 @@ function EnhanceScreen({
   const setEnhanceFlag = (key: keyof BackendSettings, value: boolean) => onFormChange({ ...form, [key]: value });
   const autoSave = useEnhanceAutoSave(dirty, form, actions.autoSaveSettings);
   const masterEnabled = form.enhancementsEnabled;
+  const masterItem = enhancementItem("enhancementsEnabled");
+  // 开关的标题、说明、分组都来自设置项清单；这里只保留一处定制：
+  // Windows 原生浏览器兼容开启前要确认，并在开关后面跟一块补丁状态。
+  const renderSetting = (item: EnhancementSettingItem) => {
+    if (item.key === "codexAppNativeBrowserRequireIdentification") {
+      return (
+        <Fragment key={item.key}>
+          <EnhancementSettingControl
+            item={item}
+            form={form}
+            onFormChange={onFormChange}
+            masterEnabled={masterEnabled}
+            onToggle={(value) => void (async () => {
+              if (value && !(await appConfirm(nativeBrowserConsent, { title: t(item.title), confirmText: t("开启") }))) return;
+              setEnhanceFlag("codexAppNativeBrowserRequireIdentification", value);
+            })()}
+          />
+          <NativeBrowserStatusView />
+        </Fragment>
+      );
+    }
+    return <EnhancementSettingControl key={item.key} item={item} form={form} onFormChange={onFormChange} masterEnabled={masterEnabled} />;
+  };
   const tabs: Array<{ value: EnhancementTab; label: string }> = [
     { value: "general", label: t("常用增强") },
     { value: "dictation", label: t("语音输入") },
-    { value: "stepwise", label: t("下一步建议") },
+    { value: "stepwise", label: t(enhancementGroup("stepwise").title) },
   ];
   const selectTab = (tab: EnhancementTab) => {
     onTabChange(tab);
     document.getElementById("enhance-page-controls")?.scrollIntoView({ block: "start" });
   };
   // 「常用增强」页里的分组，显示在左侧目录的页签下面，点了滚到对应分组。
-  const generalSections = [
-    { id: "enhance-group-plugins", label: t("插件与模型") },
-    { id: "enhance-group-chat", label: t("对话与输入") },
-    { id: "enhance-group-pet", label: t("桌宠与活动") },
-    { id: "enhance-group-standalone", label: t("独立模式") },
-  ];
+  // 分组按清单顺序列出，独立模式排最后；锚点 id 由清单分组 id 生成，保持稳定。
+  const generalSections = [...managerGeneralGroups(), managerStandaloneGroup()]
+    .map((group) => ({ id: enhancementGroupAnchorId(group), label: t(group.title) }));
   return (
     <div className="settings-page enhance-page sectioned-page">
       <PageSectionNav label={t("增强分类")} sections={activeTab === "general" ? generalSections : []}>
@@ -7814,8 +7848,8 @@ function EnhanceScreen({
           />
           <ToggleVisual />
           <span>
-            <strong>{t("启用 Codex增强")}</strong>
-            <small>{t("关闭后暂停增强功能，服务配置会保留。")}</small>
+            <strong>{t(masterItem.title)}</strong>
+            <small>{t(masterItem.description)}</small>
           </span>
         </label>
         <div className="enhance-save-actions">
@@ -7830,60 +7864,11 @@ function EnhanceScreen({
               {masterEnabled ? null : (
                 <StandaloneModeGroup form={form} onFormChange={onFormChange} masterEnabled={masterEnabled} />
               )}
-              <FeatureGroup id="enhance-group-plugins" title={t("插件与模型")} detail={t("管理插件市场、模型列表和服务档位相关增强。")}>
-                {isWindowsPlatform ? <>
-                  <FeatureToggle
-                    title={t("原生 Edge / Chrome 请求标识兼容（实验）")}
-                    detail={t("此兼容补丁仅适配 Windows 上的 Edge / Chrome；下次启动 Codex 时应用。扩展可能保留请求标识设置。")}
-                    checked={form.codexAppNativeBrowserRequireIdentification}
-                    disabled={!masterEnabled}
-                    onChange={(value) => void (async () => {
-                      if (value && !(await appConfirm(nativeBrowserConsent, { title: t("原生 Edge / Chrome 请求标识兼容（实验）"), confirmText: t("开启") }))) return;
-                      setEnhanceFlag("codexAppNativeBrowserRequireIdentification", value);
-                    })()}
-                  />
-                  <NativeBrowserStatusView />
-                </> : null}
-                <FeatureToggle title={t("插件市场解锁")} detail={t("API Key 模式下扩展插件市场请求，尽量显示完整插件列表；官方/混合模式通常不需要。")} checked={form.codexAppPluginMarketplaceUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppPluginMarketplaceUnlock", value)} />
-                <FeatureToggle title={t("模型白名单解锁")} detail={t("从环境变量和 config.toml 的 /v1/models 拉取模型并补进模型列表。")} checked={form.codexAppModelWhitelistUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppModelWhitelistUnlock", value)} />
-                <FeatureToggle title={t("原生 Fast 强制解锁")} detail={t("纯 API Key 模式恢复原生 Fast 开关；重新启动 Codex 后生效，实际支持与计费由供应商决定。")} checked={form.codexAppNativeFastUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppNativeFastUnlock", value)} />
-              </FeatureGroup>
-              <FeatureGroup id="enhance-group-chat" title={t("对话与输入")} detail={t("调整会话管理、输入行为和对话阅读体验。")}>
-                <FeatureToggle title={t("会话删除")} detail={t("在会话列表悬停显示删除按钮，并支持撤销。")} checked={form.codexAppSessionDelete} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppSessionDelete", value)} />
-                <FeatureToggle title={t("旁支保存")} detail={t("在本地 Side Chat 标签页显示「保存」。回复结束后可保存为普通会话，包含创建旁支时的主历史。建议开启后新建旁支。")} checked={form.codexAppSideChatSave} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppSideChatSave", value)} />
-                <FeatureToggle title={t("轮次回退（实验性）")} detail={t("在回答菜单中撤销本轮及后续轮次的可恢复操作，AI 报告全部完成后才截断会话。仅支持本地聊天；恢复记录保存在本机，不是系统快照。")} checked={form.codexAppTurnRewind} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppTurnRewind", value)} />
-                <FeatureToggle title={t("纯 API 模式禁用 Work 视图")} detail={t("Work 视图要求 ChatGPT 账号身份，纯 API Key 下发送消息会报 Work browser access requires an authenticated account。开启后每次启动 Codex 前把详情模式写回 Codex；重新启动 Codex 后生效。")} checked={form.codexAppDisableWorkView} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppDisableWorkView", value)} />
-                <FeatureToggle title={t("Markdown 导出")} detail={t("在会话列表显示导出按钮，导出带时间戳的 Markdown。")} checked={form.codexAppMarkdownExport} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppMarkdownExport", value)} />
-                <FeatureToggle title={t("粘贴修复")} detail={t("从 Word 等富文本粘贴到 Codex composer 时只保留纯文本，避免被识别为图片/文件附件。需重启 Codex 才生效。")} checked={form.codexAppPasteFix} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppPasteFix", value)} />
-                <FeatureToggle title={t("强制中文界面")} detail={t("强制启用 Codex App 内置 zh-CN 语言包，避免 Statsig/VPN 不通时回退英文。需重启 Codex 才能完整生效。")} checked={form.codexAppForceChineseLocale} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppForceChineseLocale", value)} />
-                <FeatureToggle title={t("容量错误自动重试")} detail={t("模型容量不足（Selected model is at capacity）时自动点「重试」。Codex 原生只会自动重试 4 次且带 10/30/120/300 秒倒计时，之后只剩手动按钮；开启后由 Codex++ 立刻接管，原生倒计时也不等。间隔与次数上限在 Codex 应用内的 Codex++ 设置里调整。")} checked={form.codexAppCapacityAutoRetry} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppCapacityAutoRetry", value)} />
-                <div className={`feature-toggle ${!masterEnabled ? "disabled" : ""}`}>
-                  <span>
-                    <strong>{t("打字特效（彩虹 P）")}</strong>
-                    <small>{t("在 Codex 输入框的光标附近显示特效；系统减少动态效果时暂停。")}</small>
-                  </span>
-                  <AppSelect<TypingEffect>
-                    ariaLabel={t("打字特效（彩虹 P）")}
-                    value={form.codexAppTypingEffect}
-                    disabled={!masterEnabled}
-                    onChange={(value) => onFormChange({ ...form, codexAppTypingEffect: value })}
-                    options={[
-                      { value: "off", label: t("关闭") },
-                      { value: "rainbow", label: t("彩虹粒子") },
-                      { value: "fireworks", label: t("烟花") },
-                      { value: "stars", label: t("星光") },
-                    ]}
-                  />
-                </div>
-                <FeatureToggle title={t("会话 ID 标识")} detail={t("在侧边栏会话标题前显示短 ID 和 UUIDv7 创建时间，方便定位历史会话。")} checked={form.codexAppThreadIdBadge} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppThreadIdBadge", value)} />
-                <FeatureToggle title={t("对话居中宽度")} detail={t("把主对话和输入框限制到固定最大宽度，适合大屏阅读。")} checked={form.codexAppConversationView} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppConversationView", value)} />
-                <FeatureToggle title={t("切换对话保留位置")} detail={t("切换 thread 时恢复上一次浏览位置。")} checked={form.codexAppThreadScrollRestore} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppThreadScrollRestore", value)} />
-                <FeatureToggle title={t("用量状态栏")} detail={t("在输入框下方显示生成速度、缓存命中率和上下文占用。数据来自本机 Codex 会话记录，不改变请求内容。")} checked={form.codexAppUsageStatusLine} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppUsageStatusLine", value)} />
-              </FeatureGroup>
-              <FeatureGroup id="enhance-group-pet" title={t("桌宠与活动")} detail={t("调整 Codex 原生桌宠与活动进度条。可点按的 Agent 桌宠在「工具 → Agent 桌宠」里设置。")}>
-                <FeatureToggle title={t("活动进度条右侧布局")} detail={t("把 Codex 原生活动进度条、状态波形和活动悬浮框移到右侧，并镜像波形方向。")} checked={form.codexAppActivityOverlayRight} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppActivityOverlayRight", value)} />
-                {supportsPetRealMouseLook ? <FeatureToggle title={t("桌宠跟随真实鼠标")} detail={t("仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。")} checked={form.codexAppPetRealMouseLook} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppPetRealMouseLook", value)} /> : null}
-              </FeatureGroup>
+              {managerGeneralGroups().map((group) => (
+                <FeatureGroup key={group.id} id={enhancementGroupAnchorId(group)} title={t(group.title)} detail={t(group.description ?? "")}>
+                  {managerGroupItems(group.id, enhancementPlatform).map(renderSetting)}
+                </FeatureGroup>
+              ))}
               {masterEnabled ? (
                 <StandaloneModeGroup form={form} onFormChange={onFormChange} masterEnabled={masterEnabled} />
               ) : null}
@@ -7917,17 +7902,64 @@ function StandaloneModeGroup({
   onFormChange: (value: BackendSettings) => void;
   masterEnabled: boolean;
 }) {
+  const group = managerStandaloneGroup();
   return (
-    <FeatureGroup id="enhance-group-standalone" title={t("独立模式")} detail={t("增强总开关关闭后仍会生效的补丁。")}>
-      <FeatureToggle
-        title={t("官方额度解锁")}
-        detail={masterEnabled
-          ? t("增强开启时此能力已自动生效；此开关只在关闭增强后生效。")
-          : t("官方登录 + API 供应商在官方订阅额度耗尽后仍可发送；只改客户端发送状态，不改变真实用量与计费。重启 Codex 后生效。")}
-        checked={form.codexAppStandaloneQuotaUnlock}
-        onChange={(value) => onFormChange({ ...form, codexAppStandaloneQuotaUnlock: value })}
-      />
+    <FeatureGroup id={enhancementGroupAnchorId(group)} title={t(group.title)} detail={t(group.description ?? "")}>
+      {managerGroupItems(group.id, enhancementPlatform).map((item) => (
+        <EnhancementSettingControl key={item.key} item={item} form={form} onFormChange={onFormChange} masterEnabled={masterEnabled} />
+      ))}
     </FeatureGroup>
+  );
+}
+
+type BooleanSettingKey = { [K in keyof BackendSettings]-?: BackendSettings[K] extends boolean ? K : never }[keyof BackendSettings];
+
+/// 按设置项清单渲染一个增强设置：bool 是开关卡，select 是带下拉的卡片。
+/// 受总开关控制的项在增强关闭时禁用；独立模式补丁（masterGated: false）始终可改，
+/// 并按总开关状态切换说明（descriptionWhenEnhancementsOn）。
+function EnhancementSettingControl({
+  item,
+  form,
+  onFormChange,
+  masterEnabled,
+  onToggle,
+}: {
+  item: EnhancementSettingItem;
+  form: BackendSettings;
+  onFormChange: (value: BackendSettings) => void;
+  masterEnabled: boolean;
+  /** 需要在写入前插入确认等步骤时覆盖默认写入。 */
+  onToggle?: (value: boolean) => void;
+}) {
+  const disabled = isEnhancementItemMasterGated(item) && !masterEnabled;
+  const detail = t(masterEnabled && item.descriptionWhenEnhancementsOn ? item.descriptionWhenEnhancementsOn : item.description);
+  if (item.control === "select") {
+    const key = item.key as keyof BackendSettings;
+    return (
+      <div className={`feature-toggle ${disabled ? "disabled" : ""}`}>
+        <span>
+          <strong>{t(item.title)}</strong>
+          <small>{detail}</small>
+        </span>
+        <AppSelect<string>
+          ariaLabel={t(item.title)}
+          value={String(form[key] ?? "")}
+          disabled={disabled}
+          onChange={(value) => onFormChange({ ...form, [key]: value })}
+          options={(item.options ?? []).map((option) => ({ value: option.value, label: t(option.label) }))}
+        />
+      </div>
+    );
+  }
+  const key = item.key as BooleanSettingKey;
+  return (
+    <FeatureToggle
+      title={t(item.title)}
+      detail={detail}
+      checked={form[key]}
+      disabled={disabled}
+      onChange={onToggle ?? ((value) => onFormChange({ ...form, [key]: value }))}
+    />
   );
 }
 
@@ -9257,8 +9289,8 @@ function SessionRepairPanel({ dirty, form, providerSyncProgress, sessionIndexRep
                 type="checkbox"
               />
               <span>
-                <strong>{t("启动前自动修复历史会话")}</strong>
-                <small>{t("启动前整理会话归属并检查缺失消息；运行期间每 30 分钟复查索引。保存设置后生效。")}</small>
+                <strong>{t(providerSyncItem.title)}</strong>
+                <small>{t(providerSyncItem.description)}</small>
               </span>
               <ToggleVisual />
             </label>

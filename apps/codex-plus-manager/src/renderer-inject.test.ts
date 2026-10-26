@@ -572,6 +572,69 @@ function installRendererStyle(renderer: string) {
   return appended;
 }
 
+const settingsCatalogUrl = new URL("../../../crates/codex-plus-core/assets/enhancement-settings.json", import.meta.url);
+
+/**
+ * 把注入页里按清单生成设置页的那段代码切出来执行：/settings/catalog 由 postJson 桩返回，
+ * 其余依赖（键映射、转义、行内输入框的取值）都取产物里的真实实现或固定值。
+ */
+async function settingsCatalogRuntime(
+  postJson: (path: string) => Promise<unknown>,
+  platform: { windows: boolean; mac: boolean } = { windows: false, mac: true },
+) {
+  const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+  const slice = (startMarker: string, endMarker: string) => {
+    const start = renderer.indexOf(startMarker);
+    const end = renderer.indexOf(endMarker, start);
+    assert.ok(start >= 0 && end > start, `missing ${startMarker}`);
+    return renderer.slice(start, end);
+  };
+  const diagnostics: Array<{ name: string; detail: unknown }> = [];
+  const runtime = new Function(
+    "postJson", "sendCodexPlusDiagnostic", "codexPlusIsWindowsPlatform", "codexPlusIsMacPlatform",
+    `${slice("  const codexPlusBackendSettingMap = {", "  const codexPlusBackendMappedSettings")}
+${slice("  function escapeHtml(value) {", "\n  }\n")}
+  }
+  const capacityAutoRetryIntervalCeilingSeconds = 600;
+  const capacityAutoRetryMaxAttemptsCeiling = 200;
+  const conversationViewMinWidth = 320;
+  const conversationViewMaxAllowedWidth = 4000;
+  const capacityAutoRetryIntervalSeconds = () => 0;
+  const capacityAutoRetryMaxAttempts = () => 15;
+  const conversationViewWidth = () => 900;
+  let refreshes = 0;
+  function renderBackendStatus() {}
+  function refreshCodexPlusBackendToggles() {}
+${slice("  let codexPlusSettingsCatalog = null;", "  function refreshCodexPlusSettingsCatalogView()")}
+  function refreshCodexPlusSettingsCatalogView() { refreshes += 1; }
+  return {
+    load: loadCodexPlusSettingsCatalog,
+    sections: renderCodexPlusSettingsCatalogSections,
+    status: () => codexPlusSettingsCatalogStatus,
+    refreshes: () => refreshes,
+  };`,
+  )(postJson, (name: string, detail: unknown) => { diagnostics.push({ name, detail }); }, platform.windows, platform.mac) as {
+    load: () => Promise<unknown>;
+    sections: () => string;
+    status: () => { status: string; message: string };
+    refreshes: () => number;
+  };
+  return { ...runtime, diagnostics };
+}
+
+/** 从生成的 HTML 里读出分组与每行的标题、说明、绑定的设置 key。 */
+function parseSettingsSections(html: string) {
+  return Array.from(html.matchAll(/<section class="codex-plus-settings-section" aria-label="([^"]+)"[^>]*>([\s\S]*?)<\/section>/g), ([, title, body]) => ({
+    title,
+    rows: Array.from(body.matchAll(/<div class="codex-plus-row"(?: data-codex-plus-setting-row="([^"]+)")?[^>]*>\s*<div><div class="codex-plus-row-title">([^<]*)<\/div><div class="codex-plus-row-description">([^<]*)<\/div><\/div>([\s\S]*?)(?=<div class="codex-plus-row"|$)/g), ([, key, rowTitle, description, control]) => ({
+      key: key ?? "",
+      title: rowTitle,
+      description,
+      control,
+    })),
+  }));
+}
+
 describe("renderer injection header compatibility", () => {
   it("does not supplement native plugin lists from retired snapshots and still refreshes after installation", async () => {
     const [navigation, plugin] = await Promise.all([
@@ -653,15 +716,24 @@ describe("renderer injection header compatibility", () => {
     }
     assert.doesNotMatch(renderer, /codexPlusBackendSettings\.launchMode|data-relay-unneeded|兼容增强|完整增强/);
     assert.doesNotMatch(renderer, /codexMenuLocalizationScopeSelector\(\)/);
-    assert.match(renderer, /data-codex-backend-setting="enhancementsEnabled"/);
-    assert.match(renderer, /data-codex-plus-setting="pluginMarketplaceUnlock"/);
+    const catalog = JSON.parse(await readFile(settingsCatalogUrl, "utf8"));
+    const page = await settingsCatalogRuntime(async () => catalog);
+    await page.load();
+    const html = page.sections();
+    assert.match(html, /data-codex-backend-setting="enhancementsEnabled"/);
+    assert.match(html, /data-codex-plus-setting="pluginMarketplaceUnlock"/);
   });
 
   it("shows the next-step suggestion feature with its Chinese name", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
     const generation = await readFile(new URL("../../../assets/inject/floating-panel/stepwise/generation.js", import.meta.url), "utf8");
-    assert.match(renderer, /悬浮球 · 下一步建议/);
+    // 标题来自设置项清单（与管理器同一份），注入脚本里不再写死。
+    const catalog = JSON.parse(await readFile(settingsCatalogUrl, "utf8"));
+    const stepwise = catalog.items.find((item: { key: string }) => item.key === "codexAppStepwiseEnabled");
+    assert.equal(stepwise.title, "下一步建议");
+    assert.ok(stepwise.surfaces.includes("codex"));
     assert.doesNotMatch(renderer, /悬浮球 · Stepwise/);
+    for (const item of catalog.items) assert.doesNotMatch(`${item.title}${item.description}`, /Stepwise/);
     assert.match(generation, /window\.prompt\("复制下一步建议提示词", prompt\)/);
     assert.doesNotMatch(generation, /Copy Stepwise prompt/);
     assert.match(renderer, /stepwise: "codexAppStepwiseEnabled"/);
@@ -1030,8 +1102,18 @@ return (loaded) => { codexPlusBackendSettingsLoaded = loaded; renderCodexPlusMen
     const homeStart = renderer.indexOf('data-codex-plus-panel="home"');
     const homeEnd = renderer.indexOf("${renderCodexPlusExtensionMenuRows()}", homeStart);
     assert.ok(homeStart >= 0 && homeEnd > homeStart);
-    const sections = Array.from(renderer.slice(homeStart, homeEnd).matchAll(/<section class="codex-plus-settings-section" aria-label="([^"]+)">([\s\S]*?)<\/section>/g));
-    assert.deepEqual(sections.map((match) => match[1]), ["常规", "模型与服务", "对话与输入", "外观与布局", "工具与关于"]);
+    // 模板里只剩清单挂载点和固定的「工具与关于」；设置分组全部按清单生成。
+    const template = renderer.slice(homeStart, homeEnd);
+    assert.match(template, /\$\{renderCodexPlusSettingsCatalogSections\(\)\}\s*<section class="codex-plus-settings-section" aria-label="工具与关于" data-codex-plus-settings-tools="true">/);
+    const catalog = JSON.parse(await readFile(settingsCatalogUrl, "utf8"));
+    const page = await settingsCatalogRuntime(async () => catalog);
+    await page.load();
+    const html = page.sections() + template.slice(template.indexOf('<section class="codex-plus-settings-section" aria-label="工具与关于"'));
+    const sections = Array.from(html.matchAll(/<section class="codex-plus-settings-section" aria-label="([^"]+)"[^>]*>([\s\S]*?)<\/section>/g));
+    const expectedGroups = catalog.groups
+      .filter((group: { id: string }) => catalog.items.some((item: { group: string; surfaces: string[] }) => item.group === group.id && item.surfaces.includes("codex")))
+      .map((group: { title: string }) => group.title);
+    assert.deepEqual(sections.map((match) => match[1]), [...expectedGroups, "工具与关于"]);
     for (const [, title, contents] of sections) {
       assert.ok(contents.includes(`<h2 class="codex-plus-settings-section-title">${title}</h2>`));
       assert.ok(contents.includes('class="codex-plus-settings-card"'));
@@ -1103,7 +1185,10 @@ return (loaded) => { codexPlusBackendSettingsLoaded = loaded; renderCodexPlusMen
 
   it("saves dropdown selections through the existing hidden select change contract", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
-    const selectMarkup = renderer.match(/<select[^>]*data-codex-plus-typing-effect="true"[^>]*>[\s\S]*?<\/select>/)?.[0];
+    const catalog = JSON.parse(await readFile(settingsCatalogUrl, "utf8"));
+    const page = await settingsCatalogRuntime(async () => catalog);
+    await page.load();
+    const selectMarkup = page.sections().match(/<select[^>]*data-codex-plus-typing-effect="true"[^>]*>[\s\S]*?<\/select>/)?.[0];
     assert.ok(selectMarkup, "the select data attribute remains available to existing change handling");
     assert.match(selectMarkup, /\bhidden\b/);
     assert.match(selectMarkup, /aria-hidden="true"/);
@@ -3021,5 +3106,133 @@ describe("renderer model reasoning efforts patch", () => {
       efforts.map((entry) => entry.reasoningEffort),
       ["low", "medium", "high", "xhigh", "max", "ultra"],
     );
+  });
+});
+
+describe("Codex++ 设置页按设置项清单生成", () => {
+  type CatalogItem = {
+    key: string; group: string; control: string; title: string; description: string;
+    surfaces: string[]; platforms?: string[]; codexInputs?: Array<{ id: string; label: string; hint?: string }>;
+  };
+  type Catalog = { groups: Array<{ id: string; title: string; description?: string }>; items: CatalogItem[] };
+  const fragmentDir = new URL("../../../assets/inject/renderer-inject/", import.meta.url);
+  const readCatalog = async (): Promise<Catalog> => JSON.parse(await readFile(settingsCatalogUrl, "utf8"));
+  const visibleOn = (platform: string) => (item: CatalogItem) => item.surfaces.includes("codex")
+    && (!item.platforms || item.platforms.includes(platform));
+
+  it("注入分片里不再写死任何设置项标题、说明或分组名", async () => {
+    const catalog = await readCatalog();
+    const settingsPage = await readFile(new URL("40-backend-settings.js", fragmentDir), "utf8");
+    for (const group of catalog.groups) {
+      assert.ok(!settingsPage.includes(`aria-label="${group.title}"`), `分组「${group.title}」不应写死在设置页模板里`);
+      assert.ok(!settingsPage.includes(`>${group.title}</h2>`), `分组「${group.title}」不应写死在设置页模板里`);
+    }
+    for (const item of catalog.items) {
+      assert.ok(!settingsPage.includes(item.title), `「${item.title}」的标题应来自清单`);
+      assert.ok(!settingsPage.includes(item.description), `「${item.title}」的说明应来自清单`);
+    }
+    // 说明文案足够长、足够独特：任何分片里出现都意味着又多了一份副本。
+    const manifest = JSON.parse(await readFile(new URL("manifest.json", fragmentDir), "utf8"));
+    for (const fragment of manifest.fragments as Array<{ name: string }>) {
+      const source = await readFile(new URL(fragment.name, fragmentDir), "utf8");
+      for (const item of catalog.items) assert.ok(!source.includes(item.description), `${fragment.name} 里有「${item.title}」说明的副本`);
+    }
+  });
+
+  it("每个在 Codex 显示的设置项生成一行，文案与绑定都取自清单", async () => {
+    const catalog = await readCatalog();
+    const page = await settingsCatalogRuntime(async (path) => {
+      assert.equal(path, "/settings/catalog");
+      return catalog;
+    });
+    await page.load();
+    assert.equal(page.status().status, "ok");
+    const html = page.sections();
+    const sections = parseSettingsSections(html);
+    const rows = sections.flatMap((section) => section.rows.filter((row) => row.key));
+    const expected = catalog.groups.flatMap((group) => catalog.items.filter((item) => item.group === group.id && visibleOn("macos")(item)));
+    assert.deepEqual(rows.map((row) => row.key), expected.map((item) => item.key));
+    for (const item of expected) {
+      const row = rows.find((candidate) => candidate.key === item.key)!;
+      const section = sections.find((candidate) => candidate.rows.includes(row))!;
+      assert.equal(section.title, catalog.groups.find((group) => group.id === item.group)!.title);
+      assert.equal(row.title, item.title);
+      assert.equal(row.description, item.description);
+      if (item.control === "bool") {
+        assert.ok(row.control.includes(`role="switch" aria-checked="false" aria-label="${item.title}"`), `${item.key} 开关缺少读屏标签`);
+        assert.match(row.control, /data-codex-plus-setting="[^"]+"|data-codex-backend-setting="[^"]+"/);
+      }
+      for (const input of item.codexInputs ?? []) {
+        assert.ok(row.control.includes(`aria-label="${input.label}"`), `${item.key} 缺少行内输入框 ${input.id}`);
+      }
+    }
+    // 第一组最前面固定是后端连接状态，它不是设置项。
+    assert.match(sections[0].rows[0].control, /data-codex-backend-status="true"/);
+    // 能映射到本页 key 的走 setCodexPlusSetting，其余直接写后端字段。
+    assert.match(html, /data-codex-plus-setting="stepwise"/);
+    assert.match(html, /data-codex-plus-setting="sessionShare"/);
+    assert.match(html, /data-codex-backend-setting="providerSyncEnabled"/);
+    assert.match(html, /data-codex-plus-capacity-retry-interval="true" min="0" max="600"/);
+    assert.match(html, /data-codex-plus-conversation-view-width="true" min="320" max="4000" step="10" type="number" value="900"/);
+    // 管理器专属项不出现在 Codex 设置页。
+    for (const item of catalog.items.filter((candidate) => !candidate.surfaces.includes("codex"))) {
+      assert.ok(!html.includes(item.title), `${item.key} 只在管理器显示`);
+    }
+  });
+
+  it("按清单的平台限制过滤设置项", async () => {
+    const catalog = await readCatalog();
+    const limited = catalog.items.filter((item) => item.platforms && item.surfaces.includes("codex"));
+    assert.ok(limited.length > 0);
+    for (const [platform, flags] of [["windows", { windows: true, mac: false }], ["macos", { windows: false, mac: true }], ["linux", { windows: false, mac: false }]] as const) {
+      const page = await settingsCatalogRuntime(async () => catalog, flags);
+      await page.load();
+      const html = page.sections();
+      for (const item of limited) {
+        assert.equal(html.includes(`data-codex-plus-setting-row="${item.key}"`), item.platforms!.includes(platform), `${item.key} on ${platform}`);
+      }
+    }
+  });
+
+  it("读不到清单时给出原因和重试，不退回写死的副本", async () => {
+    const catalog = await readCatalog();
+    let response: unknown = { status: "failed", message: "Unknown bridge path" };
+    const page = await settingsCatalogRuntime(async () => response);
+    const loading = page.sections();
+    assert.match(loading, /data-codex-plus-settings-catalog-state="loading"/);
+    assert.match(loading, /data-codex-backend-status="true"/);
+    await page.load();
+    assert.equal(page.status().status, "failed");
+    const failed = page.sections();
+    assert.match(failed, /data-codex-plus-settings-catalog-state="failed" role="alert"/);
+    assert.match(failed, /Unknown bridge path/);
+    assert.match(failed, /data-codex-plus-settings-catalog-retry="true"/);
+    assert.match(failed, /data-codex-backend-status="true"/, "后端连接状态在失败时也要能看到");
+    for (const item of catalog.items) assert.ok(!failed.includes(item.title), "失败时不能显示任何兜底的设置副本");
+    assert.deepEqual(page.diagnostics.map((entry) => entry.name), ["settings_catalog_load_failed"]);
+    assert.ok(page.refreshes() >= 1);
+
+    response = { groups: "broken" };
+    await page.load();
+    assert.equal(page.status().status, "failed");
+    assert.match(page.sections(), /格式不正确/);
+
+    response = catalog;
+    await page.load();
+    assert.equal(page.status().status, "ok");
+    assert.match(page.sections(), /data-codex-plus-setting-row="enhancementsEnabled"/);
+
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    assert.match(renderer, /if \(target\?\.closest\("\[data-codex-plus-settings-catalog-retry\]"\)\) \{\s*void loadCodexPlusSettingsCatalog\(\);/);
+  });
+
+  it("清单路由只读且不开放给拓展", async () => {
+    const api = await readFile(new URL("91-extension-api.js", fragmentDir), "utf8");
+    const start = api.indexOf("const codexPlusExtensionRoutes = new Set([");
+    const whitelist = api.slice(start, api.indexOf("]);", start));
+    assert.ok(whitelist.length > 0);
+    assert.doesNotMatch(whitelist, /\/settings\/catalog/);
+    const settingsPage = await readFile(new URL("40-backend-settings.js", fragmentDir), "utf8");
+    assert.match(settingsPage, /postJson\("\/settings\/catalog", \{\}\)/);
   });
 });

@@ -77,8 +77,14 @@ test("consent precedes enabling, default is off, and refresh is read-only", asyn
   assert.match(component, /x-browser-agent/);
   assert.match(component, /不会关闭扩展已保存的标识设置/);
   assert.match(component, /Edge \/ Chrome 稳定版扩展/);
-  assert.match(app, /原生 Edge \/ Chrome 请求标识兼容（实验）/);
-  assert.match(app, /此兼容补丁仅适配 Windows 上的 Edge \/ Chrome/);
+  // 开关文案来自设置项清单，只在 Windows 的管理器里显示。
+  const catalog = JSON.parse(await readFile(new URL("../../../crates/codex-plus-core/assets/enhancement-settings.json", import.meta.url), "utf8"));
+  const item = catalog.items.find((candidate: { key: string }) => candidate.key === "codexAppNativeBrowserRequireIdentification");
+  assert.match(item.title, /原生 Edge \/ Chrome 请求标识兼容（实验）/);
+  assert.match(item.description, /此兼容补丁仅适配 Windows 上的 Edge \/ Chrome/);
+  assert.deepEqual(item.platforms, ["windows"]);
+  assert.deepEqual(item.surfaces, ["manager"]);
+  assert.match(app, /item\.key === "codexAppNativeBrowserRequireIdentification"[\s\S]*?<NativeBrowserStatusView \/>/);
   assert.match(nativeBrowserStatusLabel("unsupported"), /Edge \/ Chrome/);
   assert.match(component, /"native_browser_status"/);
   assert.doesNotMatch(component, /"restart|"save_settings/);

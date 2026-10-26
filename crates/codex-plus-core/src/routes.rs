@@ -282,6 +282,8 @@ pub async fn handle_bridge_request(
         "/settings/set" => {
             settings_value(&ctx, ctx.settings.set_settings(payload.clone()).await).await
         }
+        // 只读：设置项清单（标题、说明、分组等），注入页据此生成设置行。
+        "/settings/catalog" => crate::settings_catalog::enhancement_settings_catalog(),
         "/user-scripts/list" => {
             ctx.runtime
                 .user_script_inventory_with_runtime_status(payload.clone())

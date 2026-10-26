@@ -80,6 +80,7 @@ pub mod script_market;
 pub mod session_share;
 pub mod side_chat;
 pub mod settings;
+pub mod settings_catalog;
 pub mod share;
 pub mod skills;
 pub mod status;
