@@ -212,12 +212,7 @@ export function GatewayPage({
         {tab === "routing" ? <RoutingView busy={busy} payload={payload} run={run} /> : null}
         {tab === "usage" ? <UsageView busy={busy} notify={notify} payload={payload} run={run} /> : null}
         {tab === "gateway" ? <GatewayView busy={busy} payload={payload} run={run} /> : null}
-        {tab === "gateway" && extraSettings ? (
-          <>
-            <SectionLabel>{t("本地服务与请求避震（新旧共用）")}</SectionLabel>
-            {extraSettings}
-          </>
-        ) : null}
+        {tab === "gateway" && extraSettings ? extraSettings : null}
       </div>
     </div>
   );

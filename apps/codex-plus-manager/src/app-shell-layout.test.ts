@@ -223,12 +223,13 @@ test("导入供应商弹窗：只有文字那块占满宽度，头像（也是 s
 test("代理设置按归属拆开：本地服务与请求避震移到网关设置（新旧共用），旧版页只留旧版专用的两项", () => {
   assert.match(text, /id: "relayEnvironment", get label\(\) \{ return t\("旧版代理设置"\); \}/);
   const shared = functionSource("SharedServiceSettings");
-  assert.match(shared, /t\("本地服务"\)/);
+  assert.match(shared, /t\("本地服务（新旧共用）"\)/);
+  assert.match(shared, /className="gw-setting-row"/);
   assert.match(shared, /protocolProxyAutoRetry/);
   assert.match(shared, /helperMaxRequestBodyMib/);
   const legacy = functionSource("ProxySettingsScreen");
   assert.doesNotMatch(legacy, /helperMaxRequestBodyMib|protocolProxyAutoRetryMaxAttempts/);
   assert.match(legacy, /const takenOverByGateway = form\.activeRelayId === CODEX_GATEWAY_RELAY_ID;/);
   assert.match(legacy, /t\("目录外模型映射（旧版）"\)/);
-  assert.match(functionSource("App"), /<SharedServiceSettings form=\{settingsForm\}/);
+  assert.match(functionSource("App"), /<SharedServiceSettings[\s\S]*?form=\{settingsForm\}/);
 });
