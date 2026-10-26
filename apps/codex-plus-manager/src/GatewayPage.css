@@ -976,24 +976,6 @@
   white-space: nowrap;
 }
 
-/* Claude / Grok 页顶部的网关提示条 */
-.gateway-banner {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 0 0 12px;
-  padding: 9px 12px;
-  border: 1px solid hsl(var(--primary) / 0.35);
-  border-radius: 8px;
-  background: hsl(var(--primary) / 0.07);
-  font-size: 12.5px;
-}
-
-.gateway-banner > span {
-  flex: 1;
-  min-width: 0;
-}
-
 @media (max-width: 900px) {
   .gw-diagram {
     grid-template-columns: minmax(0, 1fr);

@@ -53,3 +53,12 @@ test("提示卡按语气分色、悬停暂停、不显示进度条，失败可�
   assert.doesNotMatch(notice, /toast-progress/);
   assert.doesNotMatch(styles, /\.toast-progress\b|@keyframes toast-progress/);
 });
+
+test("Claude / Grok 的供应商配置页已去掉：要么经网关接入供应商池，要么照 Agent 自己的配置直连", () => {
+  assert.doesNotMatch(text, /id: "claudeRelay"/);
+  assert.doesNotMatch(text, /id: "grok", get label/);
+  assert.doesNotMatch(text, /<ClaudeProviderPage|function GrokScreen/);
+  const sections = text.slice(text.indexOf("const navigationSections"), text.indexOf("const globalNavigationRoutes"));
+  assert.doesNotMatch(sections, /"claudeRelay"|"grok"/);
+  assert.match(sections, /"claude"/, "Claude 增强保留");
+});

@@ -3,7 +3,7 @@ import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm } from "@tauri-apps/plugin-dialog";
-import { AlertTriangle, ChevronDown, ChevronUp, Plus, RefreshCw, Route as RouteIcon, Waypoints, X } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronUp, Plus, RefreshCw, Waypoints, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { t, tf } from "./i18n";
@@ -610,20 +610,5 @@ function GatewayView({ payload, busy, run }: { payload: GatewayPayload | null; b
         </div>
       </div>
     </>
-  );
-}
-
-/** 嵌在 Claude / Grok 供应商页顶部：显示是否经网关，并跳到网关页。 */
-export function GatewayBanner({ active, agentName, onOpen }: { active: boolean; agentName: string; onOpen: () => void }) {
-  return (
-    <p className="gateway-banner" role="status">
-      <RouteIcon className="h-4 w-4" />
-      <span>
-        {active
-          ? tf("{0} 当前接入了 Codex++ 本地网关，模型和供应商在「本地网关」里管理；在下方直接切换供应商会断开网关、恢复直连。", [agentName])
-          : tf("想让 {0} 和其它 Agent 共用一个供应商池，按模型名自动选供应商、多 Key 轮换、用路由组？可以接入本地网关（与这里的直连设置互不影响）。", [agentName])}
-      </span>
-      <Button onClick={onOpen} size="sm" variant="outline">{active ? t("管理网关") : t("了解网关模式")}</Button>
-    </p>
   );
 }
