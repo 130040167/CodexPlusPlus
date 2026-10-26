@@ -51,6 +51,8 @@ pub struct GatewayAgentView {
     pub base_url: String,
     pub default_model: String,
     pub models: Vec<String>,
+    /// 开着网关、但配置已被别的工具改掉（请求不再经过 Codex++）。
+    pub drift: Option<codex_plus_core::gateway::drift::Drift>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -155,6 +157,7 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
         .into_iter()
         .map(|relay| pool_entry(relay, true, "", None))
         .collect();
+    let drift_ctx = ApplyContext::default_paths(port);
     let agents = GATEWAY_AGENTS
         .iter()
         .map(|agent| {
@@ -170,6 +173,9 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
                     .map(|binding| apply::resolved_default_model(&gateway, binding))
                     .unwrap_or_default(),
                 models: codex_plus_core::gateway::server::exposed_models(&gateway, agent),
+                drift: binding
+                    .filter(|binding| binding.enabled)
+                    .and_then(|_| codex_plus_core::gateway::drift::check(&drift_ctx, agent)),
             }
         })
         .collect();

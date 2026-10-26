@@ -70,6 +70,8 @@ export type GatewayAgentView = {
   baseUrl: string;
   defaultModel: string;
   models: string[];
+  /** 开着网关、但配置已被别的工具改掉：认得出的工具名与现在连的地址。 */
+  drift?: { by?: string | null; endpoint: string } | null;
 };
 
 export type KeyHealthView = {

@@ -375,6 +375,12 @@
   white-space: nowrap;
 }
 
+/* 配置被别的工具改掉时，状态行末尾的「重新接入」 */
+.gw-drift-reconnect {
+  margin-left: 8px;
+  font-size: inherit;
+}
+
 .gw-link {
   display: inline-flex;
   align-items: center;

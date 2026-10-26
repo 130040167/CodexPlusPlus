@@ -21,6 +21,7 @@ pub mod anthropic_outbound;
 pub mod apply;
 pub mod balance;
 pub mod chatgpt_backend;
+pub mod drift;
 pub mod key_pool;
 pub mod opencode;
 pub mod pipeline;

@@ -119,6 +119,24 @@ export function GatewayPage({ notify, tab: controlledTab, onTabChange }: { notif
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 窗口回到前台时静默读一次：别的工具可能趁这时改了 Agent 的配置（被接管提示要跟上）。
+  useEffect(() => {
+    let cancelled = false;
+    const onFocus = () => {
+      void invoke<GatewayResult>("load_gateway")
+        .then((result) => {
+          if (!cancelled) accept(result);
+        })
+        .catch(() => undefined);
+    };
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", onFocus);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // 路由页实时刷新：静默读取，不占用 busy，也不弹错误。
   useEffect(() => {
     if (tab !== "routing") return;

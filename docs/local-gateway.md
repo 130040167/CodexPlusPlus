@@ -89,6 +89,16 @@ Agent 打开「接入」后，池里所有打开的供应商的模型和所有�
 托盘快捷面板（默认开）：左键点托盘图标弹出，能给各 Agent 换模型、看最近的请求；右键仍是原菜单、双击打开主窗口。
 关掉开关时托盘恢复原来的点击行为。
 
+## 被别的工具接管
+
+开着网关的 Agent，每次读网关状态时都会检查它的配置还指不指向网关（`gateway/drift.rs`）：
+- Codex：`model_provider` 为 openai 时看 `openai_base_url` 是否指向本地代理，否则看该供应商的 `base_url` 是否是 `/gw/codex`；
+- Claude Code：`settings.json` 的 `env.ANTHROPIC_BASE_URL` 是否是 `/gw/claude`；
+- Grok：`config.toml` 里是否还有 `/gw/grok`。
+
+被改掉时 Agent 卡片不再显示「已接入」，改成「配置被 X 改了，Agent 现在不经过 Codex++」并给「重新接入」；
+能按地址或文件名认出 CC Switch（`:15721`、`cc-switch-*`）。窗口回到前台时会静默重读。
+
 ## 订阅登录
 
 - **ChatGPT**：在网关里走与 Codex CLI 相同的浏览器 PKCE 登录（本机 1455 端口接回调）。token 只存在 gateway.json，

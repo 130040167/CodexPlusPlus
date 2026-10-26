@@ -131,9 +131,15 @@ function AgentRow({
   };
 
   const running = Boolean(payload?.helperRunning);
-  const tone = connected ? (running ? "on" : "error") : "off";
+  // 配置被别的工具改掉了：请求不再经过 Codex++，「已接入」名不副实。
+  const drift = connected ? agent.drift ?? null : null;
+  const tone = connected ? (running && !drift ? "on" : "error") : "off";
   const modelCount = agentModels(payload, draft.poolExclude).length;
-  const status = connected
+  const reconnect = () =>
+    run(`save:${agent.agent}`, "save_gateway_binding", { agent: agent.agent, binding: bindingFromDraft(draft, binding) }, t("重新接入"));
+  const status = drift
+    ? tf("配置被 {0} 改了，{1} 现在不经过 Codex++", [drift.by || t("其它工具"), agent.name])
+    : connected
     ? running
       ? isClaude
         ? t("已接入 · 在 /model 里切换 opus · sonnet · haiku 档")
@@ -150,9 +156,14 @@ function AgentRow({
             <strong>{agent.name}</strong>
             {agent.version ? <span className="gw-version">{agent.version}</span> : null}
           </div>
-          <small>
+          <small title={drift?.endpoint ? tf("现在连的是 {0}", [drift.endpoint]) : undefined}>
             <i className="gw-dot" data-tone={tone} />
             {status}
+            {drift ? (
+              <button className="gw-link gw-drift-reconnect" disabled={busy !== null} onClick={() => void reconnect()} type="button">
+                {t("重新接入")}
+              </button>
+            ) : null}
           </small>
         </div>
         {connected ? (

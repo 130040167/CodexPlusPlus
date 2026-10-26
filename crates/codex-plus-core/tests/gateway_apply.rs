@@ -126,6 +126,11 @@ fn claude_enable_points_at_gateway_and_disable_restores_previous_provider() {
     );
     assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], saved.token.as_str());
     assert_eq!(env["ANTHROPIC_MODEL"], "deepseek-v4-pro");
+    assert_eq!(
+        codex_plus_core::gateway::drift::check(ctx, &ToolId::Claude),
+        None,
+        "刚接入不算被改"
+    );
     assert_eq!(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "deepseek-v4-pro");
     assert_eq!(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "deepseek-v4-flash");
     assert_eq!(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1000000");
@@ -275,6 +280,11 @@ fn grok_enable_writes_gateway_endpoint_and_disable_restores_profile() {
     assert!(config.contains("api_backend = \"responses\""), "{config}");
     assert!(config.contains(&token), "{config}");
     assert!(config.contains("deepseek-v4-pro"), "{config}");
+    assert_eq!(
+        codex_plus_core::gateway::drift::check(ctx, &ToolId::Grok),
+        None,
+        "刚接入不算被改"
+    );
 
     disable_binding(ctx, &settings, &ToolId::Grok).unwrap();
     let config = std::fs::read_to_string(ctx.grok_home.join("config.toml")).unwrap();
@@ -331,6 +341,11 @@ fn codex_enable_switches_to_managed_gateway_profile_and_disable_switches_back() 
             .iter()
             .any(|profile| profile.id == "direct"),
         "原来的供应商还在"
+    );
+    assert_eq!(
+        codex_plus_core::gateway::drift::check(ctx, &ToolId::Codex),
+        None,
+        "刚接入不算被改"
     );
 
     // 池变了再写一次：仍在网关上，回填的是托管供应商自己。
@@ -487,6 +502,11 @@ fn signed_in_codex_keeps_its_chatgpt_identity_through_the_gateway() {
         serde_json::from_str(&std::fs::read_to_string(ctx.codex_home.join("auth.json")).unwrap())
             .unwrap();
     assert_eq!(auth["tokens"]["access_token"], "at-codex", "官方登录保留");
+    assert_eq!(
+        codex_plus_core::gateway::drift::check(ctx, &ToolId::Codex),
+        None,
+        "刚接入不算被改"
+    );
     let settings = ctx.settings.load().unwrap();
     assert_eq!(
         settings.active_relay_session_provider(),
@@ -579,6 +599,11 @@ fn pool_chatgpt_account_is_lent_to_codex_and_taken_back() {
         ctx.settings.load().unwrap().active_relay_session_provider(),
         codex_plus_core::settings::RelaySessionProvider::Openai,
         "借到登录后以官方身份接入"
+    );
+    assert_eq!(
+        codex_plus_core::gateway::drift::check(ctx, &ToolId::Codex),
+        None,
+        "刚接入不算被改"
     );
     let lent = ctx.gateway.load().unwrap();
     assert!(codex_plus_core::official_login::is_lent_to_codex(
