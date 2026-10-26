@@ -25,7 +25,7 @@ test("只保留一条侧栏，旧的图标栏和 Agent 子侧栏都已移除", (
 
 test("侧栏顶部是网关状态卡，点它进入总览；Agent 点名字回到上次看的页面，没有就到各自的落脚页", () => {
   const sidebar = functionSource("AppSidebar");
-  assert.match(sidebar, /className=\{`side-hub[^`]*`\} onClick=\{\(\) => onNavigate\("hub"\)\}/);
+  assert.match(sidebar, /className=\{`side-hub[^`]*`\} data-tour="hub" onClick=\{\(\) => onNavigate\("hub"\)\}/);
   assert.match(sidebar, /useGatewayPayload\(/);
   assert.match(text, /const agentHomeRoute: Record<string, Route> = \{ codex: "overview", claude: "claude", grok: "overview" \}/);
   assert.match(text, /const agentEntryRoute = \(toolId: ToolId\) => agentTarget\(agentRoutes\(toolId\), lastAgentRoute\.get\(toolId\), agentHomeRoute\[toolId\] \?\? "overview"\)/);
@@ -274,4 +274,19 @@ test("Computer Use 工作原理图与网关总览同一套三列拓扑", () => {
   assert.match(page, /data-node=\{`cu-client:\$\{id\}`\}/);
   const hub = readFileSync(new URL("./HubOverview.tsx", import.meta.url), "utf8");
   assert.match(hub, /export function HubTopology\(/);
+});
+
+test("首次使用引导：首次启动自动打开（预览模式除外），看完或跳过都记下版本；设置页可重新打开；每一步的目标在侧栏都有锚点", () => {
+  const app = functionSource("App");
+  assert.match(app, /\{tourOpen \? <OnboardingTour onClose=\{closeTour\} \/> : null\}/);
+  assert.match(app, /window\.localStorage\.setItem\(TOUR_STORAGE_KEY, String\(TOUR_VERSION\)\)/);
+  assert.match(functionSource("initialTourOpen"), /has\("previewRoute"\)/);
+  assert.match(functionSource("GlobalSettingsScreen"), /onClick=\{onOpenTour\}/);
+  const model = readFileSync(new URL("./onboarding-model.ts", import.meta.url), "utf8");
+  const sidebar = functionSource("AppSidebar");
+  for (const match of model.matchAll(/target: "([^"]+)"/g)) {
+    const target = match[1];
+    const anchored = target.startsWith("nav-") ? sidebar.includes("data-tour={`nav-${item.id}`}") : sidebar.includes(`data-tour="${target}"`) || (target === "settings" && sidebar.includes("data-tour={routeId}"));
+    assert.ok(anchored, `引导目标 ${target} 在侧栏里没有锚点`);
+  }
 });

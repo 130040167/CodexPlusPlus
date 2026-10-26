@@ -124,6 +124,8 @@ import { SessionAgentTabs, type SessionTab } from "./SessionAgentTabs";
 import { noticeDuration, noticeTone } from "./notice-model";
 import { agentTabGroups, agentTarget } from "./page-groups";
 import { TopbarActions } from "./TopbarActions";
+import { OnboardingTour } from "./OnboardingTour";
+import { shouldShowTour, TOUR_STORAGE_KEY, TOUR_VERSION } from "./onboarding-model";
 import "./ToolPages.css";
 import { BACKEND_SETTINGS_CHANGED_EVENT, ComputerUsePage } from "./ComputerUsePage";
 import { PluginMarketScreen } from "./PluginMarketScreen";
@@ -1499,6 +1501,12 @@ export function App() {
   const dreamSkinPendingActionRef = useRef<(() => void) | null>(null);
   const [update, setUpdate] = useState<UpdateResult | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [tourOpen, setTourOpen] = useState(() => initialTourOpen());
+  const closeTour = useCallback(() => {
+    // 看完或跳过都记下来，下次不再自动弹出；设置页里可以重新打开。
+    try { window.localStorage.setItem(TOUR_STORAGE_KEY, String(TOUR_VERSION)); } catch { /* 存不了就只影响本次 */ }
+    setTourOpen(false);
+  }, []);
   // 「会话」页默认看所有 Agent；切到 Codex 页签才是带删除 / 归档 / 修复的完整会话管理。
   const [sessionTab, setSessionTab] = useState<SessionTab>("all");
   useEffect(() => {
@@ -4311,6 +4319,7 @@ export function App() {
         codexRun={{ running: codexAppRunning, busy: launchPending, onStart: () => void actions.launch(), onStop: () => void actions.stopCodex() }}
       />
       <CommandPalette commands={paletteCommands} onClose={() => setPaletteOpen(false)} open={paletteOpen} />
+      {tourOpen ? <OnboardingTour onClose={closeTour} /> : null}
       <main className="workspace">
         <header className="topbar" key={`topbar-${route}`}>
           <div className="topbar-heading">
@@ -4577,6 +4586,7 @@ export function App() {
               <div className="sectioned-body">
                 <AppSettingsFocus focus={settingsFocus} onDone={() => setSettingsFocus(null)} />
                 <GlobalSettingsScreen
+                  onOpenTour={() => setTourOpen(true)}
                   dirty={settingsDirty}
                   form={settingsForm}
                   settings={settings}
@@ -10060,7 +10070,9 @@ function GlobalSettingsScreen({
   theme,
   actions,
   onOpenAgentSettings,
+  onOpenTour,
 }: {
+  onOpenTour: () => void;
   dirty: boolean;
   form: BackendSettings;
   settings: SettingsResult | null;
@@ -10083,6 +10095,15 @@ function GlobalSettingsScreen({
             </div>
             <div className="global-setting-actions">
               <Button variant="secondary" onClick={actions.toggleTheme}>{t("切换主题")}</Button>
+            </div>
+          </div>
+          <div className="global-setting-row">
+            <div className="global-setting-copy">
+              <strong>{t("新手引导")}</strong>
+              <span>{t("一步步认识网关、供应商池、Agent 接入和各个入口。")}</span>
+            </div>
+            <div className="global-setting-actions">
+              <Button variant="secondary" onClick={onOpenTour}>{t("重新打开引导")}</Button>
             </div>
           </div>
           <div className="global-setting-row">
@@ -14876,6 +14897,7 @@ function AppSidebar({
       <button
         aria-current={selected ? "page" : undefined}
         className={`side-item ${selected ? "active" : ""}`}
+        data-tour={`nav-${item.id}`}
         key={item.id}
         onClick={() => onNavigate(item.id)}
         title={item.label}
@@ -14900,14 +14922,14 @@ function AppSidebar({
 
   return (
     <aside className="side">
-      <button className={`side-hub ${route === "hub" ? "active" : ""}`} onClick={() => onNavigate("hub")} title={t("网关总览")} type="button">
+      <button className={`side-hub ${route === "hub" ? "active" : ""}`} data-tour="hub" onClick={() => onNavigate("hub")} title={t("网关总览")} type="button">
         <img alt="" draggable={false} src={APP_LOGO_URL} />
         <span className="side-hub-text">
           <strong>Codex++</strong>
           <small><i className="side-dot" data-tone={gateway?.helperRunning ? "ok" : "off"} />{gatewayState}</small>
         </span>
       </button>
-      <button className="side-search" onClick={onOpenPalette} type="button">
+      <button className="side-search" data-tour="palette" onClick={onOpenPalette} type="button">
         <Search aria-hidden="true" className="side-item-icon" />
         <span>{t("快速跳转")}</span>
         <kbd>⌘K</kbd>
@@ -14919,12 +14941,12 @@ function AppSidebar({
           <div className="side-group-items">{gatewayNavigationRoutes.map((routeId) => renderItem(routeId))}</div>
         </section>
 
-        <section className={`side-group ${collapsed.includes("management") ? "collapsed" : ""}`}>
+        <section className={`side-group ${collapsed.includes("management") ? "collapsed" : ""}`} data-tour="management">
           {groupLabel("management", t("全局管理"))}
           <div className="side-group-items">{managementNavigationRoutes.map((routeId) => renderItem(routeId))}</div>
         </section>
 
-        <section className={`side-group ${collapsed.includes("agents") ? "collapsed" : ""}`}>
+        <section className={`side-group ${collapsed.includes("agents") ? "collapsed" : ""}`} data-tour="agents">
           {groupLabel(
             "agents",
             "Agent",
@@ -15011,6 +15033,7 @@ function AppSidebar({
               aria-current={route === routeId ? "page" : undefined}
               aria-label={item.label}
               className={`side-icon-button ${route === routeId ? "active" : ""}`}
+              data-tour={routeId}
               key={routeId}
               onClick={() => onNavigate(routeId)}
               title={item.label}
@@ -17634,6 +17657,17 @@ function loadInitialRoute(): Route {
     return "settings";
   }
   return "overview";
+}
+
+/** 首次使用引导：没看过当前版本就自动打开；预览模式（?previewRoute=）不打开。 */
+function initialTourOpen(): boolean {
+  if (typeof window === "undefined") return false;
+  if (new URLSearchParams(window.location.search).has("previewRoute")) return false;
+  try {
+    return shouldShowTour(window.localStorage.getItem(TOUR_STORAGE_KEY));
+  } catch {
+    return false;
+  }
 }
 
 /** 「关于」已经并进「设置」：启动时要看更新，就滚到版本与更新。 */
