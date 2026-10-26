@@ -792,6 +792,8 @@ pub struct SkillsPayload {
     pub repo_errors: Vec<String>,
     pub skills_dir: String,
     pub codex_skills_dir: String,
+    /// Codex 之外各 Agent 的 skills 目录（Agent id → 目录），前端用来标列头的提示。
+    pub agent_skills_dirs: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6097,6 +6099,11 @@ fn skills_payload(
         repo_errors,
         skills_dir: manager.source_dir().to_string_lossy().to_string(),
         codex_skills_dir: manager.linked_dir().to_string_lossy().to_string(),
+        agent_skills_dirs: manager
+            .agent_dirs()
+            .iter()
+            .map(|(agent, dir)| (agent.clone(), dir.to_string_lossy().to_string()))
+            .collect(),
     }
 }
 
@@ -6111,6 +6118,29 @@ fn default_skills_manager() -> codex_plus_core::skills::SkillsManager {
         codex_plus_core::paths::default_skills_state_path(),
         codex_plus_core::codex_home::default_codex_home_dir(),
     )
+    // Claude Code 与 Grok 都按 `<dir>/<id>/SKILL.md` 读 Skill，可以同一份源软链过去。
+    .with_agent_dirs(vec![
+        ("claude".to_string(), codex_plus_core::tools::default_claude_home_dir().join("skills")),
+        ("grok".to_string(), codex_plus_core::grok_config::default_grok_home_dir().join("skills")),
+    ])
+}
+
+/// 把 Skill 启用到 / 停用于某个 Agent（codex / claude / grok）。
+#[tauri::command]
+pub fn set_skill_enabled_for(agent: String, id: String, enabled: bool) -> CommandResult<SkillsPayload> {
+    let manager = default_skills_manager();
+    let name = match agent.as_str() {
+        "claude" => "Claude Code",
+        "grok" => "Grok",
+        _ => "Codex",
+    };
+    match manager.set_enabled_for(agent.trim(), id.trim(), enabled) {
+        Ok(()) => ok(
+            &if enabled { format!("已启用到 {name}，下次对话生效。") } else { format!("已在 {name} 停用。") },
+            current_skills_payload(&manager),
+        ),
+        Err(error) => failed(&format!("Skill 启停失败：{error:#}"), current_skills_payload(&manager)),
+    }
 }
 
 /// 上一次成功拉取的远端清单，按仓库 key 存。

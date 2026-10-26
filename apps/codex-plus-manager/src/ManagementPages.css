@@ -300,3 +300,11 @@
 .mg-agent-matrix .mg-cell { justify-self:center; }
 .mg-target-list { display:flex; flex-wrap:wrap; gap:6px 16px; }
 .mg-target-list .hub-agent-glyph { width:14px; height:14px; }
+
+/* Skills「启用到」：每个 Agent 一个图标开关，点亮表示已启用到它 */
+.mg-skill-agents { display:flex; align-items:center; gap:4px; }
+.mg-agent-toggle { display:grid; place-items:center; width:28px; height:24px; padding:0; border:1px solid hsl(var(--border)); border-radius:6px; background:transparent; color:hsl(var(--muted-foreground)/.55); cursor:pointer; }
+.mg-agent-toggle:hover:not(:disabled) { border-color:hsl(var(--input)); color:hsl(var(--foreground)); }
+.mg-agent-toggle.is-on { border-color:hsl(var(--brand-accent)/.5); background:hsl(var(--brand-accent)/.14); color:hsl(var(--brand-accent)); }
+.mg-agent-toggle:disabled { cursor:not-allowed; opacity:.55; }
+.mg-agent-toggle .hub-agent-glyph { width:13px; height:13px; }

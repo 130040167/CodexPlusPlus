@@ -391,6 +391,7 @@ pub fn run() {
             commands::install_skill,
             commands::update_skill,
             commands::set_skill_enabled,
+            commands::set_skill_enabled_for,
             commands::uninstall_skill,
             commands::restore_skill_backup,
             commands::delete_skill_backup,

@@ -6,6 +6,10 @@
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
   // 外壳 · 网关总览 · 命令面板 · 提示卡
+  "从 GitHub 仓库安装 Skill，按 Agent 启用到 Codex、Claude Code 或 Grok": "Install skills from GitHub repositories and enable them per agent in Codex, Claude Code or Grok",
+  "启用到": "Enabled in",
+  "已启用，点击停用": "Enabled, click to disable",
+  "未启用，点击启用": "Not enabled, click to enable",
   "同时管理 Codex、Claude Code、Grok 的 MCP 服务器：每列一个 Agent，打开即写入它的配置": "Manage MCP servers for Codex, Claude Code and Grok together: one column per agent; turning one on writes it into that agent's config",
   "插件只有 Codex 支持": "Plugins are Codex-only",
   "从各 Agent 读取现有配置，或添加一个服务器。": "Read existing configs from each agent, or add a server.",
@@ -1902,7 +1906,6 @@ export const EN_PLAIN: Record<string, string> = {
   "Skills": "Skills",
   "Skills 技能": "Skills",
   "Skills 仓库源": "Skill repositories",
-  "从 GitHub 仓库安装 Skill 到 Codex": "Install skills from GitHub repositories into Codex",
   "从 GitHub 仓库安装 Skill 到 Codex。启用后软链到 ~/.codex/skills/，下次对话即可用。":
     "Install skills from GitHub repositories into Codex. Enabling one symlinks it into ~/.codex/skills/, available from your next conversation.",
   "可安装": "Available",
@@ -2101,6 +2104,7 @@ export const EN_PLAIN: Record<string, string> = {
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
   // 外壳 · 网关总览
+  "{0}：Codex 自带，只读": "{0}: bundled with Codex, read-only",
   "{0} 个文件": "{0} files",
   "只作用于 {0}；界面主题、配置备份等整体设置在侧栏底部的齿轮里。": "Applies only to {0}. App-wide settings such as theme and backups are under the gear at the bottom of the sidebar.",
   "网关运行中 · :{0}": "Gateway running · :{0}",

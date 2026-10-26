@@ -8,12 +8,18 @@ import "./ManagementPages.css";
 import { parseSkillRepository } from "./skill-repository";
 import { SkillListViewport } from "./SkillListViewport";
 import { TopbarActions } from "./TopbarActions";
+import { AgentGlyph } from "./HubOverview";
 
 type Result = { status: string; message: string };
 type Notify = (title: string, message: string, status?: "ok" | "failed") => Promise<void>;
-type Skill = { id: string; name: string; description: string; repoKey: string; repoPath?: string; installed: boolean; enabled: boolean; bundled: boolean; updateAvailable: boolean };
+type Skill = { id: string; name: string; description: string; repoKey: string; repoPath?: string; installed: boolean; enabled: boolean; bundled: boolean; updateAvailable: boolean;
+  /** 已经启用到哪些 Agent（codex / claude / grok）。 */
+  agents?: string[];
+  /** Codex++ 的受控源里有它；只在某个 Agent 自己目录里的 Skill 为 false。 */
+  managed?: boolean };
+const SKILL_AGENTS = [{ id: "codex", label: "Codex" }, { id: "claude", label: "Claude Code" }, { id: "grok", label: "Grok" }];
 type Repo = { owner: string; name: string; branch: string; subdir: string; enabled: boolean };
-type SkillPayload = Result & { skills: Skill[]; repos: Repo[]; repositorySkills: Skill[]; repoCounts: Record<string, number>; repoErrors: string[]; skillsDir: string; codexSkillsDir: string };
+type SkillPayload = Result & { skills: Skill[]; repos: Repo[]; repositorySkills: Skill[]; repoCounts: Record<string, number>; repoErrors: string[]; skillsDir: string; codexSkillsDir: string; agentSkillsDirs?: Record<string, string> };
 type RepoInspection = Result & { repo: Repo; skills: Skill[]; skillCount: number };
 const SKILL_GROUP_STORAGE_KEY = "codex-plus-plus.skill-groups.v1";
 const ok = (r: Result) => r.status === "ok";
@@ -328,20 +334,23 @@ export function SkillsPage({ notify }: { notify: Notify }) {
         {customGroupNames.map((group) => <option key={group} value={group}>{group}</option>)}
       </select>
     </div>
-    <div className="mg-skill-status">
-      <div className="mg-status-toggle">
-        {s.bundled ? <span className="mg-readonly">{t("只读")}</span> :
-          <button className={"mg-switch " + (s.enabled ? "is-on" : "")} type="button" role="switch"
-            aria-checked={s.enabled} aria-label={`${s.name || s.id} ${t("启用技能")}`}
-            disabled={!s.installed || busy}
-            onClick={() => void run("set_skill_enabled", { id: s.id, enabled: !s.enabled })}><span /></button>}
-      </div>
-      <span className="mg-badge">{s.installed ? (s.enabled ? t("已启用") : t("已停用")) : t("未安装")}</span>
+    {/* 每个 Agent 一个图标开关：点亮 = 已启用到它（在它的 skills 目录里有这个 Skill）。 */}
+    <div className="mg-skill-agents">
+      {!s.installed ? <span className="mg-badge">{t("未安装")}</span> : SKILL_AGENTS.map((agent) => {
+        const on = (s.agents ?? (s.enabled ? ["codex"] : [])).includes(agent.id);
+        const readonly = s.bundled;
+        return <button aria-checked={on} aria-label={`${s.name || s.id} · ${agent.label}`} className={"mg-agent-toggle " + (on ? "is-on" : "")}
+          disabled={busy || readonly} key={agent.id} onClick={() => void run("set_skill_enabled_for", { agent: agent.id, id: s.id, enabled: !on })}
+          role="switch" title={readonly ? tf("{0}：Codex 自带，只读", [agent.label]) : `${agent.label}：${on ? t("已启用，点击停用") : t("未启用，点击启用")}`} type="button">
+          <AgentGlyph agent={agent.id} />
+        </button>;
+      })}
     </div>
     <div className="mg-row-actions">
       {s.installed ? <>
         {s.updateAvailable && <Button onClick={() => void run("update_skill", { repoKey: s.repoKey, id: s.id })} disabled={busy}>{t("更新")}</Button>}
-        {!s.bundled && <Button onClick={() => void run("uninstall_skill", { id: s.id })} disabled={busy}>{t("卸载")}</Button>}
+        {/* 只卸载 Codex++ 管理的或 Codex 目录里的；Claude / Grok 自己目录里的 Skill 不动。 */}
+        {!s.bundled && (s.managed || (s.agents ?? []).includes("codex") || s.agents === undefined) && <Button onClick={() => void run("uninstall_skill", { id: s.id })} disabled={busy}>{t("卸载")}</Button>}
       </> : !s.bundled && <Button primary onClick={() => void run("install_skill", { repoKey: s.repoKey, id: s.id })} disabled={busy}>{t("安装")}</Button>}
     </div>
   </div>;
@@ -378,7 +387,7 @@ export function SkillsPage({ notify }: { notify: Notify }) {
               {canBatch ? <><Button disabled={busy} onClick={() => void runBatch(groupItems, true)}>{t("全部启用")}</Button><Button disabled={busy} onClick={() => void runBatch(groupItems, false)}>{t("全部停用")}</Button></> : null}
             </div>
           </div>
-          {!collapsed ? <SkillListViewport className="mg-skill-list" items={groupItems} rowHeight={68} resetKey={`${tab}:${source}:${deferredQuery}`} busy={loading} header={<div className="mg-skill-head"><span>{t("技能")}</span><span>{t("来源")}</span><span>{t("状态")}</span><span /></div>} empty={<div className="mg-empty"><h2>{t("没有匹配的 Skill")}</h2></div>} renderRow={renderSkillRow} /> : null}
+          {!collapsed ? <SkillListViewport className="mg-skill-list" items={groupItems} rowHeight={68} resetKey={`${tab}:${source}:${deferredQuery}`} busy={loading} header={<div className="mg-skill-head"><span>{t("技能")}</span><span>{t("来源")}</span><span>{t("启用到")}</span><span /></div>} empty={<div className="mg-empty"><h2>{t("没有匹配的 Skill")}</h2></div>} renderRow={renderSkillRow} /> : null}
         </section>;
       })}
       {data?.repoErrors?.length ? <div className="mg-notice mg-warning">{data.repoErrors.map((e) => <p key={e}>{e}</p>)}</div> : null}
