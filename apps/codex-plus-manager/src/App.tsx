@@ -1223,7 +1223,7 @@ const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
 const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string; tool?: string }> = [
   // 概览在两个工具下都可见：它承载共用的置顶推荐位，以及各自的状态。
   { id: "overview", get label() { return t("概览"); }, icon: LayoutDashboard },
-  { id: "relay", get label() { return t("供应商配置"); }, icon: KeyRound, tool: "codex" },
+  { id: "relay", get label() { return t("旧版供应商配置"); }, icon: KeyRound, tool: "codex" },
   { id: "multiLaunch", get label() { return t("多开"); }, icon: Layers3, tool: "codex" },
   { id: "claude", get label() { return t("增强"); }, icon: Languages, tool: "claude" },
   // 请求日志、会话、MCP、Skills 管理所有 Agent，不属于某一个 Agent。
@@ -6476,8 +6476,8 @@ function LegacyRelayGatewayHint({
           </strong>
           <span>
             {count
-              ? tf("用网关供应商池里的 {0} 个模型。这里的供应商暂时不能选；要改用它们，先点「断开并还原」恢复接入前的配置。", [count])
-              : t("用网关供应商池里的模型。这里的供应商暂时不能选；要改用它们，先点「断开并还原」恢复接入前的配置。")}
+              ? tf("用网关供应商池里的 {0} 个模型。接入期间旧版供应商列表已隐藏；要改用它们，先点「断开并还原」恢复接入前的配置。", [count])
+              : t("用网关供应商池里的模型。接入期间旧版供应商列表已隐藏；要改用它们，先点「断开并还原」恢复接入前的配置。")}
           </span>
         </div>
         <Button onClick={onManageAgents} size="sm" variant="secondary">
@@ -6544,6 +6544,7 @@ function RelayScreen({
   actions: Actions;
 }) {
   const normalized = normalizeSettings(form);
+  const takenOverByGateway = normalized.activeRelayId === CODEX_GATEWAY_RELAY_ID;
   const [detailProfileId, setDetailProfileId] = useState<string | null>(null);
   const [newProfileDraft, setNewProfileDraft] = useState<RelayProfile | null>(null);
   const [providerCatalogOpen, setProviderCatalogOpen] = useState(false);
@@ -6875,8 +6876,14 @@ function RelayScreen({
               {t("供应商配置切换已关闭：Codex++ 不会写入 Codex 的 config.toml / auth.json，供应商列表已隐藏。需要切换时打开右上角的「配置切换」。")}
             </p>
           ) : null}
+          {/* Codex 被新版网关接管：旧版列表整块隐藏，断开并还原后恢复（状态与断开按钮在页面顶部）。 */}
+          {normalized.relayProfilesEnabled && takenOverByGateway ? (
+            <p className="relay-switch-off-note" role="status">
+              {t("Codex 正由 Codex++ 网关接管，旧版供应商列表已隐藏。点上方「断开并还原」后恢复。")}
+            </p>
+          ) : null}
           {/* 总开关关闭时供应商切换不会写入 Codex：分页和列表都没有意义，整块隐藏，只留上方提示条。 */}
-          {normalized.relayProfilesEnabled ? (
+          {normalized.relayProfilesEnabled && !takenOverByGateway ? (
             <>
             {/* 分页与「新建」按钮同一行：按钮靠右，不再单独占一行把列表往下推。 */}
             <div className="provider-view-bar">
@@ -10158,8 +10165,6 @@ function SortableRelayProfileCard({
   const active = profile.id === form.activeRelayId;
   // 网关托管的供应商：由「Agent 接入」管理，这里只能「使用」（重新接入）。
   const gatewayManaged = profile.id === CODEX_GATEWAY_RELAY_ID;
-  // Codex 正被网关接管：别的供应商不能直接选，要先在上方「断开并还原」。
-  const lockedByGateway = !gatewayManaged && form.activeRelayId === CODEX_GATEWAY_RELAY_ID;
   const style: CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
@@ -10223,18 +10228,16 @@ function SortableRelayProfileCard({
       <span className="relay-card-actions">
         <Button
           className={`relay-use-button ${active ? "active" : ""}`}
-          disabled={disabled || lockedByGateway}
+          disabled={disabled}
           onClick={(event) => {
             event.stopPropagation();
-            if (disabled || lockedByGateway) return;
+            if (disabled) return;
             onSwitchProfile(profile.id);
           }}
           size="sm"
           title={
             disabled
               ? t("供应商切换中")
-              : lockedByGateway
-                ? t("Codex 正由 Codex++ 网关接管：先在上方点「断开并还原」再切换")
               : !form.relayProfilesEnabled
                 ? t("供应商配置总开关已关闭，点击后按提示开启")
                 : active
