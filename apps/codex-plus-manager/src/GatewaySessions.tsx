@@ -29,9 +29,11 @@ async function loadAll(): Promise<{ sessions: AgentSessionView[]; errors: string
   return { sessions: [...codexSessions, ...claudeSessions, ...grokSessions], errors };
 }
 
-export function SessionsView({ notify }: { notify: Notify }) {
+/** 传入 `agent` 时由外层页签决定显示哪个 Agent 的会话，不再显示本组件自己的筛选条。 */
+export function SessionsView({ notify, agent: fixedAgent }: { notify: Notify; agent?: SessionAgent | "all" }) {
   const [sessions, setSessions] = useState<AgentSessionView[] | null>(memo.sessions);
-  const [agent, setAgentState] = useState<SessionAgent | "all">(memo.agent);
+  const [ownAgent, setAgentState] = useState<SessionAgent | "all">(memo.agent);
+  const agent = fixedAgent ?? ownAgent;
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const setAgent = (next: SessionAgent | "all") => {
@@ -88,15 +90,17 @@ export function SessionsView({ notify }: { notify: Notify }) {
   return (
     <>
       <div className="gw-usage-head">
-        <nav className="gw-tabs gw-range-tabs" role="tablist">
-          {filters.map((item) => (
-            <button aria-selected={agent === item.id} data-active={agent === item.id} key={item.id} onClick={() => setAgent(item.id)} role="tab" type="button">
-              {item.id !== "all" ? <img alt="" className="gw-tab-icon" src={AGENT_ICONS[item.id === "codex" ? "codexApp" : item.id]} /> : null}
-              {item.label}
-              <em className="gw-tab-count">{item.count}</em>
-            </button>
-          ))}
-        </nav>
+        {fixedAgent ? <span /> : (
+          <nav className="gw-tabs gw-range-tabs" role="tablist">
+            {filters.map((item) => (
+              <button aria-selected={agent === item.id} data-active={agent === item.id} key={item.id} onClick={() => setAgent(item.id)} role="tab" type="button">
+                {item.id !== "all" ? <img alt="" className="gw-tab-icon" src={AGENT_ICONS[item.id === "codex" ? "codexApp" : item.id]} /> : null}
+                {item.label}
+                <em className="gw-tab-count">{item.count}</em>
+              </button>
+            ))}
+          </nav>
+        )}
         <label className="gw-sheet-search gw-session-search">
           <Search className="h-4 w-4" />
           <input onChange={(event) => setQuery(event.currentTarget.value)} placeholder={t("搜索标题或目录")} value={query} />

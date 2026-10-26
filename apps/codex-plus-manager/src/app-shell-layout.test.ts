@@ -89,3 +89,28 @@ test("紧凑密度层：管理页不再套外框，覆盖规则带 .shell 前缀
   assert.ok(selectors.length > 20);
   for (const selector of selectors) assert.match(selector, /^\.shell /, selector);
 });
+
+test("请求日志、会话、MCP、Skills 拎成「全局管理」，管理所有 Agent，不再挂在 Codex 下面", () => {
+  assert.match(text, /const managementNavigationRoutes: Route\[\] = \["requestLog", "sessions", "context", "skills"\]/);
+  for (const id of ["requestLog", "sessions", "context", "skills"]) {
+    const line = text.split("\n").find((row) => row.includes(`{ id: "${id}",`));
+    assert.ok(line, id);
+    assert.doesNotMatch(line, /tool: "codex"/, `${id} 不再只属于 Codex`);
+  }
+  const sections = text.slice(text.indexOf("const navigationSections"), text.indexOf("const globalNavigationRoutes"));
+  assert.doesNotMatch(sections, /"requestLog"|"sessions"|"context"|"skills"/);
+  assert.match(functionSource("AppSidebar"), /managementNavigationRoutes\.map/);
+  // 网关的会话页并进「会话」：Codex 页签是完整的会话管理，其余页签是多 Agent 会话列表。
+  assert.doesNotMatch(text, /"gatewaySessions"/);
+  const entry = functionSource("App");
+  assert.match(entry, /route === "sessions" && sessionTab !== "codex" \? \(/);
+  assert.match(entry, /<SessionsView agent=\{sessionTab\}/);
+  assert.match(entry, /route === "sessions" && sessionTab === "codex" \? \(\s*<ProjectSessionPage/);
+});
+
+test("请求日志按 Agent 筛选；网关记录带 agent 字段，没有的算 Codex", () => {
+  const screen = functionSource("RequestLogScreen");
+  assert.match(screen, /agentFilter !== "all" && requestLogAgent\(entry\) !== agentFilter/);
+  assert.match(screen, /\[entries, filter, query, sessionFilter, agentFilter\]/);
+  assert.match(functionSource("requestLogAgent"), /return entry\.agent \|\| "codex";/);
+});

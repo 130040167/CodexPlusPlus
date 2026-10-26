@@ -12697,3 +12697,17 @@ button.side-item:hover {
   height: 28px;
   font-size: 12.5px;
 }
+
+/* 请求日志「来源」列：Agent 图标 + 供应商名 */
+.shell .request-log-source {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.shell .request-log-source .hub-agent-glyph {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  color: hsl(var(--muted-foreground));
+}

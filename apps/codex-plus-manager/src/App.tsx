@@ -113,6 +113,9 @@ import { AgentCollaborationPage } from "./AgentCollaborationPage";
 import { GatewayPage, type GatewayTab } from "./GatewayPage";
 import { AgentGlyph, HubOverview, useGatewayPayload } from "./HubOverview";
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
+import { SessionsView } from "./GatewaySessions";
+import { agentName } from "./gateway-model";
+import { SessionAgentTabs, type SessionTab } from "./SessionAgentTabs";
 import { noticeDuration, noticeTone } from "./notice-model";
 import { TopbarActions } from "./TopbarActions";
 import "./ToolPages.css";
@@ -647,6 +650,8 @@ type RequestLogAttemptDetail = {
 
 type RequestLogEntry = {
   id: string;
+  /** 网关模式下发起请求的 Agent（claude / grok）；Codex 直连代理的记录为空。 */
+  agent?: string | null;
   timestampMs: number;
   startedAtMs: number;
   durationMs: number;
@@ -1196,7 +1201,7 @@ type ToolId = string;
 /** Codex++ 自己的 logo：与应用图标（src-tauri/icons/icon.png）同一张图。 */
 const APP_LOGO_URL = new URL("./assets/codex-plus-logo.png", import.meta.url).href;
 
-type Route = "overview" | "relay" | "multiLaunch" | "claude" | "relayEnvironment" | "requestLog" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "computerUse" | "hub" | "gateway" | "gatewaySessions" | "gatewayProviders" | "gatewayRouting" | "gatewayUsage" | "gatewaySettings" | "maintenance" | "about" | "settings" | "agentSettings";
+type Route = "overview" | "relay" | "multiLaunch" | "claude" | "relayEnvironment" | "requestLog" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "computerUse" | "hub" | "gateway" | "gatewayProviders" | "gatewayRouting" | "gatewayUsage" | "gatewaySettings" | "maintenance" | "about" | "settings" | "agentSettings";
 type Theme = "dark" | "light";
 
 const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
@@ -1216,9 +1221,10 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "relay", get label() { return t("供应商配置"); }, icon: KeyRound, tool: "codex" },
   { id: "multiLaunch", get label() { return t("Codex多开"); }, icon: Layers3, tool: "codex" },
   { id: "claude", get label() { return t("Claude 增强"); }, icon: Languages, tool: "claude" },
-  { id: "sessions", get label() { return t("会话管理"); }, icon: MessageCircle, tool: "codex" },
-  { id: "context", label: "MCP", icon: Network, tool: "codex" },
-  { id: "skills", label: "Skills", icon: BookOpen, tool: "codex" },
+  // 请求日志、会话、MCP、Skills 管理所有 Agent，不属于某一个 Agent。
+  { id: "sessions", get label() { return t("会话"); }, icon: MessagesSquare },
+  { id: "context", label: "MCP", icon: Network },
+  { id: "skills", label: "Skills", icon: BookOpen },
   { id: "weixin", get label() { return t("微信连接"); }, icon: ScanLine, tool: "codex" },
   { id: "enhance", get label() { return t("Codex增强"); }, icon: Hammer, tool: "codex" },
   { id: "dreamSkin", get label() { return t("皮肤管理"); }, icon: Palette, tool: "codex" },
@@ -1236,7 +1242,6 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "gatewayProviders", get label() { return t("供应商池"); }, icon: Server },
   { id: "gatewayRouting", get label() { return t("路由"); }, icon: Split },
   { id: "gatewayUsage", get label() { return t("用量"); }, icon: BarChart3 },
-  { id: "gatewaySessions", get label() { return t("会话"); }, icon: MessagesSquare },
   { id: "gatewaySettings", get label() { return t("网关设置"); }, icon: SlidersHorizontal },
   { id: "maintenance", get label() { return t("安装维护"); }, icon: Wrench, tool: "codex" },
   { id: "about", get label() { return t("关于"); }, icon: Info },
@@ -1245,17 +1250,13 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   // Claude / Grok 没有独立设置项，原来那页只有一个跳回各自主页的按钮，所以不再给它们显示。
   { id: "agentSettings", get label() { return t("设置"); }, icon: Settings, tool: "codex" },
   { id: "relayEnvironment", get label() { return t("代理设置"); }, icon: ShieldCheck, tool: "codex" },
-  { id: "requestLog", get label() { return t("请求日志"); }, icon: List, tool: "codex" },
+  { id: "requestLog", get label() { return t("请求日志"); }, icon: List },
 ];
 
 const navigationSections: Array<{ label: string; routes: Route[]; placement?: "bottom" }> = [
   {
     get label() { return t("工作区"); },
-    routes: ["overview", "relay", "relayEnvironment", "requestLog", "multiLaunch", "claude", "agentSettings"],
-  },
-  {
-    get label() { return t("全局管理"); },
-    routes: ["context", "skills", "sessions"],
+    routes: ["overview", "relay", "relayEnvironment", "multiLaunch", "claude", "agentSettings"],
   },
   {
     get label() { return t("扩展"); },
@@ -1273,21 +1274,23 @@ const navigationSections: Array<{ label: string; routes: Route[]; placement?: "b
  * Computer Use 同时接入 Claude Code / Claude Desktop / DSH 等多个客户端，不属于任何一个 Agent，
  * 所以和 Agent 协作一样放在「工具」里，而不是重复出现在每个 Agent 的「扩展」分组里。
  */
-const globalNavigationRoutes: Route[] = ["hub", "gateway", "gatewayProviders", "gatewayRouting", "gatewayUsage", "gatewaySessions", "gatewaySettings", "computerUse", "agentCollaboration", "agentCache", "recommendations", "about", "settings"];
+const globalNavigationRoutes: Route[] = ["hub", "gateway", "gatewayProviders", "gatewayRouting", "gatewayUsage", "gatewaySettings", "requestLog", "sessions", "context", "skills", "computerUse", "agentCollaboration", "agentCache", "recommendations", "about", "settings"];
 /** 侧栏「网关」分组：任意 Agent 经 Codex++ 接入任意供应商。 */
-const gatewayNavigationRoutes: Route[] = ["hub", "gateway", "gatewayProviders", "gatewayRouting", "gatewayUsage", "gatewaySessions", "gatewaySettings"];
+const gatewayNavigationRoutes: Route[] = ["hub", "gateway", "gatewayProviders", "gatewayRouting", "gatewayUsage", "gatewaySettings"];
+/** 侧栏「全局管理」分组：同时管理所有 Agent 的请求日志、会话、MCP 与 Skills。 */
+const managementNavigationRoutes: Route[] = ["requestLog", "sessions", "context", "skills"];
 /** 侧栏「工具」分组：服务所有 Agent，但与供应商无关。关于、整体设置放在侧栏底部。 */
 const toolNavigationRoutes: Route[] = ["computerUse", "agentCollaboration", "agentCache", "recommendations"];
 /** 网关的各个页签由侧栏直接选中，页内不再显示标签条。 */
 const gatewayTabByRoute: Partial<Record<Route, GatewayTab>> = {
   gateway: "agents",
-  gatewaySessions: "sessions",
   gatewayProviders: "providers",
   gatewayRouting: "routing",
   gatewayUsage: "usage",
   gatewaySettings: "gateway",
 };
-const gatewayRouteByTab = Object.fromEntries(Object.entries(gatewayTabByRoute).map(([route, tab]) => [tab, route])) as Record<GatewayTab, Route>;
+// 网关里的「会话」已并进全局管理的「会话」页。
+const gatewayRouteByTab = { ...Object.fromEntries(Object.entries(gatewayTabByRoute).map(([route, tab]) => [tab, route])), sessions: "sessions" } as Record<GatewayTab, Route>;
 /**
  * 每个 Agent 在侧栏里的落脚页：点 Agent 名字先到这里。
  * Claude Code / Grok 的供应商不再在 Codex++ 里单独配置：要么经网关接入供应商池（「Agent 接入」），
@@ -1479,6 +1482,8 @@ export function App() {
   const dreamSkinPendingActionRef = useRef<(() => void) | null>(null);
   const [update, setUpdate] = useState<UpdateResult | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  // 「会话」页默认看所有 Agent；切到 Codex 页签才是带删除 / 归档 / 修复的完整会话管理。
+  const [sessionTab, setSessionTab] = useState<SessionTab>("all");
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "k") {
@@ -4201,7 +4206,7 @@ export function App() {
   const activeToolName = toolEntries.find((entry) => entry.id === activeTool)?.name ?? t("当前 Agent");
 
   const isGatewayPage = gatewayNavigationRoutes.includes(route);
-  const crumbGroup = isGatewayPage ? t("网关") : isGlobalPage ? "Codex++" : activeToolName;
+  const crumbGroup = isGatewayPage ? t("网关") : managementNavigationRoutes.includes(route) ? t("全局管理") : isGlobalPage ? "Codex++" : activeToolName;
   // ⌘K：页面、各 Agent 的页面和常用操作。非当前 Agent 的页面会先切到那个 Agent。
   const paletteCommands: PaletteCommand[] = [];
   const routeCommand = (routeId: Route, group: string, run: () => void, keywords = ""): PaletteCommand | null => {
@@ -4212,6 +4217,7 @@ export function App() {
   };
   const pushCommand = (command: PaletteCommand | null) => { if (command) paletteCommands.push(command); };
   gatewayNavigationRoutes.forEach((routeId) => pushCommand(routeCommand(routeId, t("网关"), () => void navigate(routeId), "gateway")));
+  managementNavigationRoutes.forEach((routeId) => pushCommand(routeCommand(routeId, t("全局管理"), () => void navigate(routeId))));
   for (const tool of toolEntries.filter((entry) => entry.switchable)) {
     const toolRoutes = navigationSections.flatMap((section) => section.routes).filter((routeId) => {
       const item = routes.find((candidate) => candidate.id === routeId);
@@ -4333,7 +4339,15 @@ export function App() {
             <RequestLogScreen />
           ) : null}
           {route === "claude" ? <ClaudeLocalizationScreen /> : null}
-          {route === "sessions" ? (
+          {route === "sessions" ? <SessionAgentTabs onChange={setSessionTab} value={sessionTab} /> : null}
+          {route === "sessions" && sessionTab !== "codex" ? (
+            <div className="mg-page gateway-page">
+              <div className="mg-content gw-content">
+                <SessionsView agent={sessionTab} notify={actions.showMessage} />
+              </div>
+            </div>
+          ) : null}
+          {route === "sessions" && sessionTab === "codex" ? (
             <ProjectSessionPage
               sessions={localSessions}
               onRefresh={async (offset) => { await actions.refreshLocalSessions(false, offset ?? 0); }}
@@ -5924,6 +5938,11 @@ function requestLogRetryLabel(entry: RequestLogEntry) {
   return "-";
 }
 
+/** 请求来自哪个 Agent：网关记录带 agent 字段，Codex 直连代理的记录没有。 */
+function requestLogAgent(entry: RequestLogEntry): string {
+  return entry.agent || "codex";
+}
+
 function RequestLogScreen() {
   const [entries, setEntries] = useState<RequestLogEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -5931,6 +5950,7 @@ function RequestLogScreen() {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | "running" | "success" | "failed" | "retried">("all");
   const [sessionFilter, setSessionFilter] = useState("all");
+  const [agentFilter, setAgentFilter] = useState<"all" | "codex" | "claude" | "grok">("all");
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
@@ -6025,6 +6045,7 @@ function RequestLogScreen() {
       if (filter === "success" && (running || !entry.success)) return false;
       if (filter === "failed" && (running || entry.success)) return false;
       if (filter === "retried" && entry.autoRetries === 0 && entry.attempts <= 1) return false;
+      if (agentFilter !== "all" && requestLogAgent(entry) !== agentFilter) return false;
       const threadId = (entry.threadId ?? "").trim();
       if (sessionFilter === "__none__") {
         if (threadId) return false;
@@ -6045,14 +6066,10 @@ function RequestLogScreen() {
         .toLowerCase()
         .includes(needle);
     });
-  }, [entries, filter, query]);
+  }, [entries, filter, query, sessionFilter, agentFilter]);
 
   return (
     <Panel className="request-log-panel">
-      <CardHead
-        title={t("请求日志")}
-        detail={tf("最近 {0} 条代理请求，含状态、模型、重试与 token 用量", [String(entries.length)])}
-      />
       <CardContent className="request-log-content">
         <div className="request-log-toolbar">
           <div className="request-log-search">
@@ -6064,6 +6081,17 @@ function RequestLogScreen() {
               onChange={(event) => setQuery(event.currentTarget.value)}
             />
           </div>
+          <select
+            aria-label={t("按 Agent 筛选")}
+            className="request-log-filter"
+            onChange={(event) => setAgentFilter(event.currentTarget.value as typeof agentFilter)}
+            value={agentFilter}
+          >
+            <option value="all">{t("全部 Agent")}</option>
+            <option value="codex">Codex</option>
+            <option value="claude">Claude Code</option>
+            <option value="grok">Grok</option>
+          </select>
           <select
             aria-label={t("状态筛选")}
             className="request-log-filter"
@@ -6158,7 +6186,10 @@ function RequestLogScreen() {
                       ) : null}
                     </span>
                   )}
-                  <span className="request-log-ellipsis" title={entry.relayName}>{entry.relayName || "-"}</span>
+                  <span className="request-log-ellipsis request-log-source" title={`${agentName(requestLogAgent(entry))} · ${entry.relayName}`}>
+                    <AgentGlyph agent={requestLogAgent(entry)} />
+                    {entry.relayName || "-"}
+                  </span>
                   <span className="request-log-ellipsis" title={entry.upstreamModel ? `${entry.model} → ${entry.upstreamModel}` : entry.model}>
                     {entry.model || "-"}
                     {entry.upstreamModel && entry.upstreamModel !== entry.model ? (
@@ -6267,7 +6298,7 @@ function RequestLogScreen() {
           <div className="empty">
             {entries.length
               ? t("没有匹配当前筛选条件的请求。")
-              : t("还没有请求日志。启动 Codex 发起一次对话后即可看到。")}
+              : t("还没有请求日志。在 Codex 或已接入网关的 Agent 里发起一次对话后即可看到。")}
           </div>
         )}
       </CardContent>
@@ -14447,7 +14478,8 @@ function loadCollapsedGroups(): string[] {
  * 唯一的侧栏：任意 Agent → Codex++ → 任意供应商。
  *
  * - 顶部是网关状态卡和 ⌘K 快速跳转；
- * - 「网关」：总览、Agent 接入、供应商池、路由、用量、会话、网关设置；
+ * - 「网关」：总览、Agent 接入、供应商池、路由、用量、网关设置；
+ * - 「全局管理」：请求日志、会话、MCP、Skills，同时管理所有 Agent；
  * - 「Agent」：每个 Agent 一行（状态点表示接入方式）；下一组是当前 Agent 自己的页面（供应商配置、增强、皮肤……），
  *   组名就是 Agent 的名字；
  * - 「工具」：服务所有 Agent、但与供应商无关的页面；
@@ -14564,6 +14596,11 @@ function AppSidebar({
         <section className={`side-group ${collapsed.includes("gateway") ? "collapsed" : ""}`}>
           {groupLabel("gateway", t("网关"))}
           <div className="side-group-items">{gatewayNavigationRoutes.map((routeId) => renderItem(routeId))}</div>
+        </section>
+
+        <section className={`side-group ${collapsed.includes("management") ? "collapsed" : ""}`}>
+          {groupLabel("management", t("全局管理"))}
+          <div className="side-group-items">{managementNavigationRoutes.map((routeId) => renderItem(routeId))}</div>
         </section>
 
         <section className={`side-group ${collapsed.includes("agents") ? "collapsed" : ""}`}>
@@ -14894,8 +14931,8 @@ function routeSubtitle(route: Route) {
     multiLaunch: t("为不同供应商启动相互隔离的 Codex 实例"),
     claude: t("保留官方 Claude.app 原样，通过增强版为 Claude 应用增强功能"),
     relayEnvironment: t("统一管理本地协议代理、供应商代理与重试策略"),
-    requestLog: t("查看代理请求的状态、模型、重试、token 用量与缓存命中"),
-    sessions: t("查看、删除和修复 Codex 本地会话"),
+    requestLog: t("所有 Agent 经 Codex++ 的请求：状态、模型、重试、token 用量与缓存命中"),
+    sessions: t("Codex、Claude Code、Grok 的本地会话放在一起：在终端继续，Codex 会话还能删除、归档与修复"),
     context: t("独立管理 MCP 服务器与插件"),
     skills: t("从 GitHub 仓库安装 Skill 到 Codex"),
     weixin: t("通过个人微信连接本机 Codex 会话"),
@@ -14912,7 +14949,6 @@ function routeSubtitle(route: Route) {
     gatewayProviders: t("所有接入的 Agent 共用的供应商池，支持多 Key 轮换"),
     gatewayRouting: t("按模型名选择供应商，路由组决定多家之间的顺序与分配"),
     gatewayUsage: t("按 Agent、供应商与模型统计调用、token、缓存与费用"),
-    gatewaySessions: t("Codex、Claude Code、Grok 的本地会话放在一起，一键在终端继续"),
     gatewaySettings: t("监听地址、Key 轮换方式与退出时的恢复策略"),
     maintenance: t("入口检查与修复、开机启动与应用路径"),
     about: t("版本信息、项目链接、GitHub Release 更新、日志与诊断"),

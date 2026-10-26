@@ -592,3 +592,40 @@
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* 下划线页签（会话页的 Agent 页签等） */
+.tp-tabs {
+  display: flex;
+  flex: none;
+  gap: 18px;
+  border-bottom: 1px solid hsl(var(--border));
+}
+
+.tp-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: -1px;
+  padding: 6px 0;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: hsl(var(--muted-foreground));
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.tp-tabs button:hover {
+  color: hsl(var(--foreground));
+}
+
+.tp-tabs button[data-active="true"] {
+  border-bottom-color: hsl(var(--brand-accent));
+  color: hsl(var(--foreground));
+}
+
+.tp-tabs .hub-agent-glyph {
+  width: 13px;
+  height: 13px;
+}

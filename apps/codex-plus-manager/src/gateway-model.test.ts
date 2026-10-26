@@ -250,7 +250,8 @@ test("网关页接入导航，命令已注册", () => {
   assert.match(app, /id: "gateway"/);
   // 网关各页签由侧栏直接选中：路由 → 页签一一对应，页内不再显示标签条。
   assert.match(app, /gatewayTabByRoute\[route\] \? \(\s*<GatewayPage[\s\S]*?tab=\{gatewayTabByRoute\[route\]\}/);
-  for (const [route, tab] of [["gateway", "agents"], ["gatewaySessions", "sessions"], ["gatewayProviders", "providers"], ["gatewayRouting", "routing"], ["gatewayUsage", "usage"], ["gatewaySettings", "gateway"]]) {
+  // 网关的「会话」已并进全局管理的「会话」页（sessions 路由），这里不再有单独的 gatewaySessions。
+  for (const [route, tab] of [["gateway", "agents"], ["gatewayProviders", "providers"], ["gatewayRouting", "routing"], ["gatewayUsage", "usage"], ["gatewaySettings", "gateway"]]) {
     assert.match(app, new RegExp(`${route}: "${tab}"`));
   }
   for (const command of [

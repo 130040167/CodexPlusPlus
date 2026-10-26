@@ -6,6 +6,11 @@
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
   // 外壳 · 网关总览 · 命令面板 · 提示卡
+  "按 Agent 筛选": "Filter by agent",
+  "全部 Agent": "All agents",
+  "所有 Agent 经 Codex++ 的请求：状态、模型、重试、token 用量与缓存命中": "Every agent's requests through Codex++: status, model, retries, token usage and cache hits",
+  "Codex、Claude Code、Grok 的本地会话放在一起：在终端继续，Codex 会话还能删除、归档与修复": "Local sessions from Codex, Claude Code and Grok in one place: resume in a terminal; Codex sessions can also be deleted, archived and repaired",
+  "按 Agent 查看会话": "View sessions by agent",
   "Codex 的供应商配置由 Codex++ 直接管理": "Codex providers are managed directly by Codex++",
   "来自 Codex++ 广告源的推荐，点卡片在浏览器里打开": "Recommendations from the Codex++ ad feed; click a card to open it in your browser",
   "重新扫描": "Rescan",
@@ -1039,8 +1044,8 @@ export const EN_PLAIN: Record<string, string> = {
   "清空全部请求日志？此操作不可撤销。": "Clear all request logs? This cannot be undone.",
   "读取请求日志失败。": "Failed to load request logs.",
   "正在读取请求日志…": "Loading request logs…",
-  "还没有请求日志。启动 Codex 发起一次对话后即可看到。":
-    "No request logs yet. Launch Codex and send a message to see entries here.",
+  "还没有请求日志。在 Codex 或已接入网关的 Agent 里发起一次对话后即可看到。":
+    "No request logs yet. Start a conversation in Codex or in an agent connected to the gateway and it will show up here.",
   "没有匹配当前筛选条件的请求。": "No requests match the current filters.",
   "仅成功": "Success only",
   "仅失败": "Failures only",
