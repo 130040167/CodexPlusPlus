@@ -240,11 +240,19 @@ test("置顶推荐位只放在网关总览一处，各 Agent 的概览不再重�
   assert.equal((text.match(/<SponsorBoard /g) ?? []).length, 1);
 });
 
-test("Codex 被网关接管时，旧版供应商页的配置切换、从第三方导入、添加供应商都禁用", () => {
+test("Codex 被网关接管时，旧版供应商页的配置切换、从第三方导入、添加供应商整组隐藏（不是置灰）", () => {
   const screen = functionSource("RelayScreen");
-  assert.match(screen, /aria-label=\{t\("启用供应商配置切换"\)\}\n\s*checked=\{normalized\.relayProfilesEnabled\}\n\s*disabled=\{takenOverByGateway\}/);
-  assert.match(screen, /disabled=\{takenOverByGateway\}\n\s*onClick=\{openThirdPartyImport\}/);
-  assert.match(screen, /disabled=\{takenOverByGateway\}\n\s*onClick=\{\(\) => \{ setNewProfileDraft\(null\);/);
+  assert.match(screen, /actions=\{takenOverByGateway \? null : \(/);
+  assert.doesNotMatch(screen, /disabled=\{takenOverByGateway\}/);
+});
+
+test("用量图表有鼠标交互：整列感应、高亮当天、浮出明细卡", () => {
+  const usage = readFileSync(new URL("./GatewayUsage.tsx", import.meta.url), "utf8");
+  assert.match(usage, /className="gw-bar-hit"/);
+  assert.match(usage, /className="gw-chart-tip"/);
+  const css = readFileSync(new URL("./GatewayPage.css", import.meta.url), "utf8");
+  assert.match(css, /\.gw-chart\[data-hovering="true"\] \.gw-bar:not\(\[data-active="true"\]\)/);
+  assert.match(css, /\.gw-usage-row:hover/);
 });
 
 test("Codex 概览与 Claude / Grok 同一套仪表板：被网关接管时状态栏只给管理接入、断开并还原，不给切换下拉框", () => {

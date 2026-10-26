@@ -272,7 +272,8 @@ const gateway = ok({
 const usageCounts = (calls: number, errors = 0) => ({ calls, errors, inputTokens: calls * 9000, outputTokens: calls * 700, cachedTokens: calls * 5600, reasoningTokens: 0 });
 const gatewayUsage = ok({
   totals: usageCounts(396, 5),
-  days: [{ date: new Date().toISOString().slice(0, 10), ...usageCounts(396, 5) }],
+  // 近 7 天，用来看用量图表的悬停效果
+  days: [120, 260, 90, 310, 180, 40, 396].map((calls, index) => ({ date: new Date(Date.now() - (6 - index) * 86_400_000).toISOString().slice(0, 10), ...usageCounts(calls, index === 3 ? 4 : 0) })),
   byAgent: [{ key: "claude", label: "claude", ...usageCounts(396, 5) }],
   byProvider: [{ key: "deepseek", label: "DeepSeek", ...usageCounts(281, 2) }, { key: "kimi", label: "Kimi", ...usageCounts(115, 3) }],
   byModel: [],

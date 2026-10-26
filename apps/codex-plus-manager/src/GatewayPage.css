@@ -2495,3 +2495,101 @@ span.gw-avatar[data-size] {
 .gw-session-delete:hover:not(:disabled) {
   color: hsl(var(--status-error));
 }
+
+/* 用量图表的鼠标交互：悬停的一天高亮、其余变暗，上方浮出明细卡；明细行与数据卡悬停有反馈 */
+.gw-bar-hit {
+  fill: transparent;
+  cursor: crosshair;
+}
+.gw-bar :is(.gw-bar-input, .gw-bar-output) {
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+.gw-chart[data-hovering="true"] .gw-bar:not([data-active="true"]) :is(.gw-bar-input, .gw-bar-output) {
+  opacity: 0.35;
+}
+.gw-bar[data-active="true"] .gw-bar-hit {
+  fill: hsl(var(--primary) / 0.08);
+}
+.gw-chart-tip {
+  position: absolute;
+  top: 6px;
+  z-index: 2;
+  min-width: 180px;
+  padding: 10px 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 10px;
+  background: hsl(var(--popover, var(--card)));
+  box-shadow: 0 10px 30px rgb(0 0 0 / 0.3);
+  font-size: 12px;
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+.gw-chart-tip[data-edge="start"] {
+  transform: translateX(-10%);
+}
+.gw-chart-tip[data-edge="end"] {
+  transform: translateX(-90%);
+}
+.gw-chart-tip strong {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.gw-chart-tip dl {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+}
+.gw-chart-tip dl > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.gw-chart-tip dt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--gw-mute);
+}
+.gw-chart-tip dd {
+  margin: 0;
+  font-family: var(--font-mono, monospace);
+  font-variant-numeric: tabular-nums;
+}
+.gw-chart-tip i {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: transparent;
+}
+.gw-chart-tip i[data-kind="input"] {
+  background: hsl(var(--primary) / 0.35);
+}
+.gw-chart-tip i[data-kind="output"] {
+  background: hsl(var(--primary));
+}
+.gw-chart-tip i[data-kind="cache"] {
+  background: hsl(var(--status-success) / 0.7);
+}
+.gw-chart-axis span[data-active="true"] {
+  color: var(--gw-ink);
+  font-weight: 600;
+}
+.gw-usage-row {
+  transition: background-color 0.12s ease;
+}
+.gw-usage-row:hover {
+  background: var(--gw-soft);
+}
+.gw-usage-row:hover .gw-usage-bar i {
+  filter: brightness(1.2);
+}
+.gw-stat-grid > div {
+  transition: background-color 0.12s ease;
+}
+.gw-stat-grid > div:hover {
+  background: var(--gw-soft);
+}

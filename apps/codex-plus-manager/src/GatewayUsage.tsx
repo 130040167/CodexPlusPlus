@@ -194,18 +194,24 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
   );
 }
 
-/** 按天的柱状图：浅色是输入，深色是输出，叠在一起。 */
+/**
+ * 按天的柱状图：浅色是输入，深色是输出，叠在一起。
+ * 鼠标移到某一天（整列都是感应区，矮柱子也好指）：这一列高亮、其余变暗，上方浮出当天的明细卡。
+ */
 function UsageChart({ summary }: { summary: UsageSummary | null }) {
   const days = summary?.days ?? [];
   const english = getLanguage() === "en";
+  const [hover, setHover] = useState<number | null>(null);
   const max = Math.max(1, ...days.map((day) => day.inputTokens + day.outputTokens));
   const labels = new Set(axisLabelIndexes(days.length, 7));
   const width = 1000;
   const height = 180;
   const gap = days.length > 60 ? 1 : 6;
   const barWidth = days.length ? (width - gap * (days.length - 1)) / days.length : 0;
+  const active = hover !== null ? days[hover] : undefined;
+  const activeLeft = hover !== null && days.length ? ((hover + 0.5) / days.length) * 100 : 0;
   return (
-    <div className="gw-chart">
+    <div className="gw-chart" data-hovering={active ? "true" : undefined} onMouseLeave={() => setHover(null)}>
       <span className="gw-chart-max">{formatTokens(max)}</span>
       <svg aria-label={t("每天用量")} preserveAspectRatio="none" role="img" viewBox={`0 0 ${width} ${height}`}>
         {days.map((day, index) => {
@@ -213,16 +219,28 @@ function UsageChart({ summary }: { summary: UsageSummary | null }) {
           const inputHeight = (day.inputTokens / max) * height;
           const outputHeight = (day.outputTokens / max) * height;
           return (
-            <g key={day.date}>
-              <title>{`${day.date} · ${tf("{0} 输入 · {1} 输出", [formatTokens(day.inputTokens), formatTokens(day.outputTokens)])} · ${tf("{0} 次", [day.calls])}`}</title>
+            <g className="gw-bar" data-active={hover === index ? "true" : undefined} key={day.date}>
+              <rect className="gw-bar-hit" height={height} width={barWidth + gap} x={x - gap / 2} y={0} onMouseEnter={() => setHover(index)} />
               <rect className="gw-bar-input" height={inputHeight} rx={2} width={barWidth} x={x} y={height - inputHeight} />
               <rect className="gw-bar-output" height={outputHeight} rx={2} width={barWidth} x={x} y={height - inputHeight - outputHeight} />
             </g>
           );
         })}
       </svg>
+      {active ? (
+        <div className="gw-chart-tip" data-edge={activeLeft < 18 ? "start" : activeLeft > 82 ? "end" : undefined} role="status" style={{ left: `${activeLeft}%` }}>
+          <strong>{shortDate(active.date, english)}</strong>
+          <dl>
+            <div><dt><i data-kind="total" />{t("合计")}</dt><dd>{formatTokens(active.inputTokens + active.outputTokens)}</dd></div>
+            <div><dt><i data-kind="input" />{t("输入")}</dt><dd>{formatTokens(active.inputTokens)}</dd></div>
+            <div><dt><i data-kind="output" />{t("输出")}</dt><dd>{formatTokens(active.outputTokens)}</dd></div>
+            {active.cachedTokens ? <div><dt><i data-kind="cache" />{t("缓存读取")}</dt><dd>{formatTokens(active.cachedTokens)}</dd></div> : null}
+            <div><dt><i data-kind="calls" />{t("调用")}</dt><dd>{active.errors ? tf("{0} 次 · {1} 次出错", [active.calls, active.errors]) : tf("{0} 次", [active.calls])}</dd></div>
+          </dl>
+        </div>
+      ) : null}
       <div className="gw-chart-axis">
-        {days.map((day, index) => (labels.has(index) ? <span key={day.date} style={{ left: `${((index + 0.5) / days.length) * 100}%` }}>{shortDate(day.date, english)}</span> : null))}
+        {days.map((day, index) => (labels.has(index) || hover === index ? <span data-active={hover === index ? "true" : undefined} key={day.date} style={{ left: `${((index + 0.5) / days.length) * 100}%` }}>{shortDate(day.date, english)}</span> : null))}
       </div>
     </div>
   );
