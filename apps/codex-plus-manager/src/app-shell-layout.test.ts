@@ -183,3 +183,15 @@ test("推荐内容只显示赞助商推荐", () => {
   assert.doesNotMatch(screen, /t\("普通推荐"\)|ad\.type === "normal"/);
   assert.match(screen, /t\("赞助商推荐"\)/);
 });
+
+test("设置类页面共用左侧分类目录：增强、设置、微信连接；开关列表限宽", () => {
+  for (const page of ["settings-page enhance-page sectioned-page", "settings-page codex-settings-page sectioned-page", "weixin-connect-page sectioned-page"]) {
+    assert.ok(text.includes(`className="${page}"`), page);
+  }
+  const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  assert.match(css, /\.shell \.sectioned-page \{[^}]*grid-template-columns:\s*172px minmax\(0, 880px\)/);
+  // 「（实验）」和「需重启」从文字里拿出来做成标题旁的小标签。
+  const toggle = functionSource("FeatureToggle");
+  assert.match(toggle, /EXPERIMENTAL_TITLE\.test\(title\)/);
+  assert.match(toggle, /RESTART_HINT\.test\(detail\)/);
+});

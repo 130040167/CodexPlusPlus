@@ -1027,6 +1027,16 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "增强分类": "Enhancement categories",
+  "实验": "Experimental",
+  "需重启": "Restart",
+  "设置分类": "Settings sections",
+  "启动参数": "Launch arguments",
+  "开机启动": "Start at login",
+  "应用路径": "App path",
+  "微信连接分类": "WeChat sections",
+  "连接状态": "Connection",
+  "启用本地插件": "Enable local plugins",
   "多开": "Multi-launch",
   "插件市场": "Plugin market",
   "Codex 自带，只读": "Bundled with Codex, read-only",
@@ -2169,6 +2179,8 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "清单更新于 {0}": "Catalog updated {0}",
+  "{0} 个市场插件，已安装 {1} 个": "{0} market plugins, {1} installed",
   // 网关 · 添加 / 编辑供应商
   "从上游获取到 {0} 个模型": "Fetched {0} models from upstream",
   "在 {0} 获取 Key": "Get a key at {0}",
