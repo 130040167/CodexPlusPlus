@@ -1255,7 +1255,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "weixin", get label() { return t("微信连接"); }, icon: ScanLine, tool: "codex" },
   { id: "enhance", get label() { return t("增强"); }, icon: Hammer, tool: "codex" },
   { id: "dreamSkin", get label() { return t("皮肤管理"); }, icon: Palette, tool: "codex" },
-  { id: "userScripts", get label() { return t("插件"); }, icon: FileCode2, tool: "codex" },
+  { id: "userScripts", get label() { return t("脚本"); }, icon: FileCode2, tool: "codex" },
   { id: "pluginMarket", get label() { return t("插件市场"); }, icon: Store, tool: "codex" },
   { id: "recommendations", get label() { return t("推荐内容"); }, icon: ExternalLink },
   // 缓存清理覆盖多个 AI 应用，属于应用级页面，在各工具下均可访问。
@@ -1758,7 +1758,7 @@ export function App() {
     if (result) {
       setScriptMarket(result);
       setSettings((current) => (current ? { ...current, user_scripts: result.user_scripts } : current));
-      if (!silent || !isSuccessStatus(result.status)) showResultNotice(t("插件"), result, { silentSuccess: true });
+      if (!silent || !isSuccessStatus(result.status)) showResultNotice(t("脚本"), result, { silentSuccess: true });
     }
   };
 
@@ -1785,7 +1785,7 @@ export function App() {
     if (result) {
       setScriptMarket(result);
       setSettings((current) => (current ? { ...current, user_scripts: result.user_scripts } : current));
-      showResultNotice(t("插件"), result);
+      showResultNotice(t("脚本"), result);
     }
   };
 
@@ -9124,7 +9124,7 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
         </span>
       </div>
       <div className="script-market-toolbar">
-        <div className="mg-segmented user-scripts-panes" role="tablist" aria-label={t("插件")}>
+        <div className="mg-segmented user-scripts-panes" role="tablist" aria-label={t("脚本")}>
           <button aria-selected={pane === "market"} data-active={pane === "market"} onClick={() => setPane("market")} role="tab" type="button">
             {t("市场插件")}<span>{marketScripts.length}</span>
           </button>
@@ -15189,7 +15189,7 @@ function routeSubtitle(route: Route) {
     weixin: t("通过个人微信连接本机 Codex 会话"),
     enhance: t("管理常用功能、语音输入与下一步建议。"),
     dreamSkin: t("Codex-Dream-Skin 风格主题和换图"),
-    userScripts: t("内置和用户自定义插件清单"),
+    userScripts: t("内置和用户自定义脚本清单"),
     pluginMarket: t("检索插件，按需下载并安装到 Codex"),
     recommendations: t("来自 Codex++ 广告源的推荐，点卡片在浏览器里打开"),
     agentCache: t("扫描 Codex、Claude 与 Codex++ 的已知缓存目录，由你选择清理项目。"),
