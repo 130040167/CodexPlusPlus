@@ -1,5 +1,6 @@
 mod auto_takeover;
 mod agent_collaboration_commands;
+mod agent_launch_commands;
 mod agent_mcp_commands;
 mod agent_pet_commands;
 mod provider_lookup_commands;
@@ -304,6 +305,7 @@ pub fn run() {
             agent_pet_commands::agent_pet_catalog,
             agent_pet_commands::agent_pet_image,
             agent_pet_commands::agent_pet_sounds,
+            agent_launch_commands::open_agent_terminal,
             agent_mcp_commands::load_agent_mcp,
             agent_mcp_commands::save_agent_mcp,
             gateway_commands::load_gateway,

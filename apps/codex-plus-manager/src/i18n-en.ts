@@ -1088,6 +1088,15 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "配置被别的工具改掉了，没有经过网关": "Config was changed by another tool; not going through the gateway",
+  "未接入网关 · 用它自己的设置": "Not connected · using its own settings",
+  "经 Codex++ 网关": "Via the Codex++ gateway",
+  "接入网关": "Connect to gateway",
+  "在终端启动": "Launch in terminal",
+  "可用模型": "Available models",
+  "最近会话": "Recent sessions",
+  "还没有经过网关的请求。在它里面发一条消息试试。": "No requests through the gateway yet. Send a message in it to try.",
+  "接入网关后，这里显示它的每次请求走了哪家供应商。": "Once connected, each request and the provider it used shows up here.",
   "欢迎使用 Codex++": "Welcome to Codex++",
   "Codex++ 让任意 Agent（Codex、Claude Code、Grok…）经同一个本地网关接入任意供应商。花半分钟认识一下各个入口。": "Codex++ connects any agent (Codex, Claude Code, Grok…) to any provider through one local gateway. Take half a minute to see where things are.",
   "网关状态": "Gateway status",
@@ -2275,6 +2284,10 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "经 Codex++ 网关 · {0}": "Via the Codex++ gateway · {0}",
+  "配置被 {0} 改掉了，没有经过网关": "Config was changed by {0}; not going through the gateway",
+  "启动 {0}": "Launch {0}",
+  "还没有 {0} 的本地会话。": "No local {0} sessions yet.",
   "{0} 更新说明": "What's new in {0}",
   "{0} / {1}": "{0} / {1}",
   "有新版本 {0}": "Version {0} available",

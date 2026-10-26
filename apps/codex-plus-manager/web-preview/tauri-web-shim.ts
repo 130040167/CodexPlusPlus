@@ -212,7 +212,7 @@ const tools = ok({
   tools: [
     { id: "codex", name: "Codex", homeDir: "~/.codex", switchable: true, active: true, activeRelayName: "默认中转", relayCount: 3 },
     { id: "grok", name: "Grok", homeDir: "~/.grok", switchable: false, active: false, activeRelayName: null, relayCount: 0 },
-    { id: "claude", name: "Claude", homeDir: "~/.claude", switchable: false, active: false, activeRelayName: null, relayCount: 0 },
+    { id: "claude", name: "Claude Code", homeDir: "~/.claude", switchable: true, active: false, activeRelayName: null, relayCount: 0 },
   ],
   activeTool: "codex",
 });
@@ -372,6 +372,17 @@ export async function invoke<T = unknown>(command: string, args: Record<string, 
     case "load_agent_mcp":
     case "save_agent_mcp": return ok({ config: demoAgentMcp[String(args.agent)] }) as T;
     case "load_gateway_usage": return gatewayUsage as T;
+    // Agent 概览仪表板的演示数据
+    case "list_agent_sessions": return ok({ sessions: args.agent === "claude" ? [
+      { agent: "claude", id: "s1", title: "重新设计当前程序的 UI", cwd: "/Users/demo/Desktop/CodexPlusPlus", updatedAtMs: Date.now() - 60_000 },
+      { agent: "claude", id: "s2", title: "审查 GitHub 全部 issue 和 PR", cwd: "/Users/demo/Desktop/CodexPlusPlus", updatedAtMs: Date.now() - 20_000 },
+      { agent: "claude", id: "s3", title: "帮我清理一点电脑垃圾", cwd: "/Users/demo", updatedAtMs: Date.now() - 57 * 60_000 },
+    ] : [] }) as T;
+    case "load_request_logs": return ok({ entries: [
+      { id: "r1", agent: "claude", timestampMs: Date.now() - 30_000, startedAtMs: 0, durationMs: 1800, success: true, model: "claude-sonnet-4-5", upstreamModel: "deepseek-v4-pro", relayName: "DeepSeek", state: null },
+      { id: "r2", agent: "claude", timestampMs: Date.now() - 90_000, startedAtMs: 0, durationMs: 3100, success: true, model: "claude-opus-4-5", upstreamModel: "kimi-k2", relayName: "Kimi", state: null },
+      { id: "r3", agent: "claude", timestampMs: Date.now() - 240_000, startedAtMs: 0, durationMs: 900, success: false, model: "claude-haiku-4-5", upstreamModel: "glm-4.6", relayName: "智谱 GLM", state: null },
+    ] }) as T;
     case "startup_options": return ok({ showUpdate: false }) as T;
     case "consume_pending_manager_navigation": return null as T;
     case "load_overview": return overview as T;

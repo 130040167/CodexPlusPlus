@@ -310,3 +310,13 @@ test("供应商头像在任何列表里都不参与伸缩：挑选弹层、导�
   assert.match(css, /span\.gw-avatar\[data-size\] \{\s*flex: none;/);
   assert.doesNotMatch(css, /\.gw-select-item span \{/);
 });
+
+test("Claude Code / Grok 的概览是仪表板：接入状态、今日数据、最近会话与请求、配置摘要", () => {
+  assert.match(functionSource("OverviewScreen"), /<AgentDashboard agent=\{activeTool\}/);
+  const dashboard = readFileSync(new URL("./AgentDashboard.tsx", import.meta.url), "utf8");
+  for (const command of ["load_gateway_usage", "load_request_logs", "list_agent_sessions", "load_agent_mcp", "list_installed_skills", "open_agent_terminal", "resume_agent_session"]) {
+    assert.ok(dashboard.includes(`"${command}"`), command);
+  }
+  const lib = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+  assert.match(lib, /agent_launch_commands::open_agent_terminal,/);
+});

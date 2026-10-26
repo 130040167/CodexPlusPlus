@@ -125,6 +125,7 @@ import { noticeDuration, noticeTone } from "./notice-model";
 import { agentTabGroups, agentTarget } from "./page-groups";
 import { TopbarActions } from "./TopbarActions";
 import { OnboardingTour } from "./OnboardingTour";
+import { AgentDashboard } from "./AgentDashboard";
 import { shouldShowTour, TOUR_STORAGE_KEY, TOUR_VERSION } from "./onboarding-model";
 import "./ToolPages.css";
 import { BACKEND_SETTINGS_CHANGED_EVENT, ComputerUsePage } from "./ComputerUsePage";
@@ -5605,41 +5606,10 @@ function OverviewScreen({
             </CardContent>
           </Panel>
         </>
-      ) : (
-        <>
-        <Panel>
-          <CardHead title={tf("{0} 状态", [tool?.name ?? t("工具")])} detail={t("该工具由它自己的页签管理")} />
-          <CardContent>
-            <div className="health-grid">
-              <div className={`health-item ${tool?.switchable ? "ok" : "needs-fix"}`}>
-                {tool?.switchable ? <CheckCircle2 className="h-4 w-4" /> : <Bell className="h-4 w-4" />}
-                <div>
-                  <strong>{t("配置切换")}</strong>
-                  <span>{tool?.switchable ? t("已接入，可在该工具页切换供应商。") : t("尚未接入配置切换。")}</span>
-                </div>
-                <Badge status={tool?.switchable ? "ok" : "not_checked"} />
-              </div>
-              <div className={`health-item ${tool?.relayCount ? "ok" : "needs-fix"}`}>
-                {tool?.relayCount ? <CheckCircle2 className="h-4 w-4" /> : <Bell className="h-4 w-4" />}
-                <div>
-                  <strong>{t("供应商")}</strong>
-                  <span>{tf("{0} 个已保存", [String(tool?.relayCount ?? 0)])}</span>
-                </div>
-                <Badge status={tool?.relayCount ? "ok" : "not_checked"} />
-              </div>
-              <div className="health-item ok">
-                <CheckCircle2 className="h-4 w-4" />
-                <div>
-                  <strong>{t("配置目录")}</strong>
-                  <span>{tool?.homeDir || t("未配置目录")}</span>
-                </div>
-                <Badge status="ok" />
-              </div>
-            </div>
-          </CardContent>
-        </Panel>
-        </>
-      )}
+      ) : activeTool === "claude" || activeTool === "grok" ? (
+        // Claude Code / Grok：接入状态、今日数据、最近会话与请求、配置摘要。
+        <AgentDashboard agent={activeTool} name={tool?.name ?? activeTool} notify={actions.showMessage} onNavigate={onNavigate} />
+      ) : null}
     </>
   );
 }
