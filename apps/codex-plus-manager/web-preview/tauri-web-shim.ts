@@ -326,6 +326,10 @@ export async function invoke<T = unknown>(command: string, args: Record<string, 
     case "check_env_conflicts": return ok({ conflicts: [] }) as T;
     case "load_provider_sync_targets": return ok({ currentProvider: "deepseek", targets: [] }) as T;
     case "load_pending_provider_import": return ok({ pending: null }) as T;
+    // 皮肤管理：预览里没有本机主题、市场与社区，返回空列表，页面能正常打开。
+    case "list_dream_skin_themes": return ok({ themes: [] }) as T;
+    case "refresh_dream_skin_market": return ok({ schemaVersion: 1, updatedAt: "", repositoryUrl: "", cached: true, warning: "", themes: [] }) as T;
+    case "refresh_dream_skin_community": return ok({ items: [], total: 0, fetchedAt: "", cached: true }) as T;
     case "load_pending_dream_skin_community": return ok({ versionId: "" }) as T;
     case "load_watcher_state": return ok({ enabled: false, running: false, status: "disabled", message: "演示模式" }) as T;
     case "load_auto_takeover_state": return ok({ running: false, enabled: false, message: "演示模式" }) as T;

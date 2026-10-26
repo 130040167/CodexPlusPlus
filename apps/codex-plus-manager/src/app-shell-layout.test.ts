@@ -138,3 +138,11 @@ test("Skills 与 MCP 共用一张多 Agent 表：每个 Agent 一列勾选，不
   assert.doesNotMatch(extra, /mg-agent-toggle|mg-skill-group-select/);
   assert.doesNotMatch(css, /\.dark \.mg-skills-page|\.mg-skills-page \.mg-primary|\.mg-skills-page :is\(\.mg-button/);
 });
+
+test("Agent 页签条不能是滚动容器：否则在 .screen 的 grid 里会被长页面挤成 1px，点进去就看不到页签", () => {
+  const css = readFileSync(new URL("./ToolPages.css", import.meta.url), "utf8");
+  const rules = [...css.matchAll(/\.agent-page-tabs\s*\{([^}]*)\}/g)].map((match) => match[1]);
+  assert.ok(rules.length > 0);
+  for (const body of rules) assert.doesNotMatch(body, /overflow/);
+  assert.match(rules.join("\n"), /flex-wrap:\s*wrap/);
+});

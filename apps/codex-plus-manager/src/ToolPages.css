@@ -630,14 +630,11 @@
   height: 13px;
 }
 
-/* Agent 的全部页面：一排页签，窗口窄时横向滚动；分组之间一条细竖线 */
+/* Agent 的全部页面：一排页签，窗口窄时换行；分组之间一条细竖线。
+   不能用横向滚动：滚动容器在 .screen 的 grid 里最小高度是 0，页面内容比窗口高时整条页签会被挤成 1px。 */
 .agent-page-tabs {
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-
-.agent-page-tabs::-webkit-scrollbar {
-  display: none;
+  flex-wrap: wrap;
+  row-gap: 0;
 }
 
 .agent-page-tabs button {
