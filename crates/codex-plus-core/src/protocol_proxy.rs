@@ -11387,6 +11387,15 @@ pub(crate) struct ResponsesSseTransformer {
     /// 终态失败事件里的 code/message 摘要。只进请求日志与诊断日志，
     /// 不拼进 failure 原因（原因会随 SSE 回给客户端，不能泄露上游 payload）。
     failure_detail: Option<String>,
+    /// 下游不是 Codex（经网关接入的 Grok 等）：去掉 ChatGPT 订阅后端私有的事件，
+    /// 这些客户端按标准 Responses 事件解析，遇到不认识的类型会直接报错。
+    strip_backend_events: bool,
+}
+
+/// ChatGPT 订阅后端在回复前后附带的私有事件：`response.metadata`（安全缓冲等）、
+/// `codex.rate_limits` 等。只有 Codex 自己的客户端认得。
+fn is_backend_private_event(event_type: &str) -> bool {
+    event_type == "response.metadata" || event_type.starts_with("codex.")
 }
 
 /// 单个事件参与改写的最大缓冲字节数（4 MiB）。
@@ -11413,6 +11422,12 @@ impl ResponsesSseTransformer {
                 })
             });
         Self { apply_patch_declared_as_function, ..Self::default() }
+    }
+
+    /// 转发给非 Codex 客户端时去掉后端私有事件，见 `strip_backend_events`。
+    pub(crate) fn stripping_backend_events(mut self, strip: bool) -> Self {
+        self.strip_backend_events = strip;
+        self
     }
 
     /// Push upstream bytes; returns bytes ready to write to the client.
@@ -11540,7 +11555,10 @@ impl ResponsesSseTransformer {
             .map(str::to_string)
             .or(sse_event_name);
         let event_type = event_type_owned.as_deref().unwrap_or("");
-        
+        if self.strip_backend_events && is_backend_private_event(event_type) {
+            return Vec::new();
+        }
+
         self.observe_event_type(event_type);
         if event_type == "response.completed" {
             if let Some(usage) = crate::request_log::usage_from_response_json(&data_json) {
@@ -11764,6 +11782,22 @@ data: {"type":"response.compaction.delta","delta":"..."}
         let mut transformer = ResponsesSseTransformer::default();
         let result = transformer.push_bytes(compaction_event.as_bytes());
         assert_eq!(result, compaction_event.as_bytes());
+    }
+
+    #[test]
+    fn backend_private_events_are_stripped_only_for_foreign_clients() {
+        let stream = "event: codex.rate_limits\ndata: {\"type\":\"codex.rate_limits\"}\n\n\
+event: response.metadata\ndata: {\"type\":\"response.metadata\"}\n\n\
+event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n";
+        // Codex 自己认得这些事件：默认原样转发。
+        let mut codex = ResponsesSseTransformer::default();
+        assert_eq!(codex.push_bytes(stream.as_bytes()), stream.as_bytes());
+
+        let mut foreign = ResponsesSseTransformer::default().stripping_backend_events(true);
+        let out = String::from_utf8(foreign.push_bytes(stream.as_bytes())).unwrap();
+        assert!(!out.contains("codex.rate_limits"), "{out}");
+        assert!(!out.contains("response.metadata"), "{out}");
+        assert!(out.contains("response.output_text.delta"), "{out}");
     }
 
     #[test]

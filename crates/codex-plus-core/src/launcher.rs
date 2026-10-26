@@ -2689,6 +2689,8 @@ pub(crate) async fn handle_protocol_proxy_connection(
     let mut request_log =
         ProxyRequestLog::begin(method, path, request_json.as_ref(), request_thread_id);
     let live_request_id = request_log.entry.id.clone();
+    // 网关的 Responses 入口只服务非 Codex 客户端（Codex 走旧路径）。
+    let foreign_client = matches!(opener, ProxyOpener::Gateway(_));
     let opened = match &opener {
         ProxyOpener::Legacy => {
             crate::protocol_proxy::open_responses_proxy_request_for_path_with_session_headers_and_live_id(
@@ -2808,7 +2810,8 @@ pub(crate) async fn handle_protocol_proxy_connection(
         if let Some(body) = upstream.buffered_body.take() {
             // buffered 模式：整段 SSE 已由协议代理收齐并重试完成，这里一次性转发。
             let mut transformer =
-                crate::protocol_proxy::ResponsesSseTransformer::for_request(request_json.as_ref());
+                crate::protocol_proxy::ResponsesSseTransformer::for_request(request_json.as_ref())
+                    .stripping_backend_events(foreign_client);
             let out = transformer.push_bytes(&body);
             stream.write_all(&out).await?;
             let usage = transformer.take_usage();
@@ -2932,15 +2935,17 @@ pub(crate) async fn handle_protocol_proxy_connection(
             return Ok(());
         }
         let stream_prefix = std::mem::take(&mut upstream.stream_prefix);
-        let (failure, usage, failure_detail, first_output_at_ms) = forward_protocol_proxy_stream(
-            stream,
-            &stream_prefix,
-            upstream.take_response()?,
-            upstream.wire_api,
-            request_json.as_ref(),
-            session_headers.thread_id,
-        )
-        .await?;
+        let (failure, usage, failure_detail, first_output_at_ms) =
+            forward_protocol_proxy_stream_for_client(
+                stream,
+                &stream_prefix,
+                upstream.take_response()?,
+                upstream.wire_api,
+                request_json.as_ref(),
+                session_headers.thread_id,
+                foreign_client,
+            )
+            .await?;
         if let Some(first_output_at_ms) = first_output_at_ms {
             request_log.mark_first_token_at(first_output_at_ms);
         }
@@ -3607,10 +3612,33 @@ pub(crate) async fn forward_protocol_proxy_stream<S: SseSink>(
     Option<String>,
     Option<u64>,
 )> {
+    forward_protocol_proxy_stream_for_client(
+        stream, prefix, response, wire_api, request, thread_id, false,
+    )
+    .await
+}
+
+/// 同 `forward_protocol_proxy_stream`；`foreign_client` 为真时下游不是 Codex，
+/// Responses 流里去掉 ChatGPT 订阅后端的私有事件。
+pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
+    stream: &mut S,
+    prefix: &[u8],
+    response: reqwest::Response,
+    wire_api: crate::protocol_proxy::UpstreamWireApi,
+    request: Option<&Value>,
+    thread_id: Option<&str>,
+    foreign_client: bool,
+) -> anyhow::Result<(
+    Option<String>,
+    Option<crate::request_log::RequestUsage>,
+    Option<String>,
+    Option<u64>,
+)> {
     let mut chunks = response.bytes_stream();
     let mut first_output_at_ms = None;
     if wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
-        let mut transformer = crate::protocol_proxy::ResponsesSseTransformer::for_request(request);
+        let mut transformer = crate::protocol_proxy::ResponsesSseTransformer::for_request(request)
+            .stripping_backend_events(foreign_client);
         // 代理预读过的开头必须先原样补写，否则 Codex 会丢掉 response.created 等事件。
         if !prefix.is_empty() {
             let out = transformer.push_bytes(prefix);

@@ -665,11 +665,25 @@ async fn gateway_end_to_end() {
         "output": [{ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "订阅回答" }] }],
         "usage": { "input_tokens": 12, "output_tokens": 3, "total_tokens": 15 }
     }});
-    let (official_base, official_seen) = mock_upstream(vec![(
-        200,
-        "text/event-stream",
-        format!("event: response.completed\ndata: {completed}\n\n"),
-    )])
+    let delta = json!({ "type": "response.output_text.delta", "delta": "订阅回答" });
+    let (official_base, official_seen) = mock_upstream(vec![
+        (
+            200,
+            "text/event-stream",
+            format!("event: response.completed\ndata: {completed}\n\n"),
+        ),
+        // 订阅后端在回复前后夹带私有事件：Codex 认得，Grok 不认得。
+        (
+            200,
+            "text/event-stream",
+            format!(
+                "event: codex.rate_limits\ndata: {{\"type\":\"codex.rate_limits\",\"rate_limits\":{{}}}}\n\n\
+                 event: response.metadata\ndata: {{\"type\":\"response.metadata\",\"metadata\":{{}}}}\n\n\
+                 event: response.output_text.delta\ndata: {delta}\n\n\
+                 event: response.completed\ndata: {completed}\n\n"
+            ),
+        ),
+    ])
     .await;
     unsafe {
         std::env::set_var(
@@ -740,6 +754,24 @@ async fn gateway_end_to_end() {
         assert!(!roles.contains(&"system".to_string()), "{roles:?}");
         assert!(roles.contains(&"developer".to_string()), "{roles:?}");
     }
+    // 流式转给 Grok 时去掉后端私有事件，否则 Grok 解析失败。
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/gw/grok/v1/responses"))
+        .bearer_auth("cpx-gw-grok-e2e")
+        .json(&json!({
+            "model": "gpt-6.1-sol",
+            "stream": true,
+            "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let text = response.text().await.unwrap();
+    assert!(text.contains("response.output_text.delta"), "{text}");
+    assert!(text.contains("response.completed"), "{text}");
+    assert!(!text.contains("response.metadata"), "{text}");
+    assert!(!text.contains("codex.rate_limits"), "{text}");
     unsafe {
         std::env::remove_var("CODEX_PLUS_OFFICIAL_BASE_URL");
     }
