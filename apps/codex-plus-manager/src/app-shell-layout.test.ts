@@ -246,3 +246,11 @@ test("Codex 被网关接管时，旧版供应商页的配置切换、从第三�
   assert.match(screen, /disabled=\{takenOverByGateway\}\n\s*onClick=\{openThirdPartyImport\}/);
   assert.match(screen, /disabled=\{takenOverByGateway\}\n\s*onClick=\{\(\) => \{ setNewProfileDraft\(null\);/);
 });
+
+test("概览页当前供应商：被网关接管时直接显示接管状态，不给切换下拉框", () => {
+  const screen = functionSource("OverviewScreen");
+  assert.match(screen, /\{activeProfile\?\.id === CODEX_GATEWAY_RELAY_ID \? \(/);
+  const gatewayBranch = screen.slice(screen.indexOf("activeProfile?.id === CODEX_GATEWAY_RELAY_ID"), screen.indexOf(") : activeProfile ? ("));
+  assert.match(gatewayBranch, /t\("由 Codex\+\+ 网关接管"\)/);
+  assert.doesNotMatch(gatewayBranch, /AppSelect|switchFromOverview/);
+});

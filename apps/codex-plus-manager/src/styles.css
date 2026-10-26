@@ -13387,3 +13387,11 @@ button.side-item:hover {
   width: 10px;
   height: 10px;
 }
+
+/* 概览页「当前供应商」被网关接管时的图标 */
+.shell .overview-current-gateway {
+  display: grid;
+  place-items: center;
+  color: hsl(var(--status-success));
+  background: hsl(var(--status-success) / 0.12);
+}

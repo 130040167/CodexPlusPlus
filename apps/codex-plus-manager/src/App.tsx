@@ -5469,7 +5469,26 @@ function OverviewScreen({
             <Panel className="overview-current-panel">
               <CardHead title={t("当前供应商")} detail="" />
               <CardContent className="overview-current">
-                {activeProfile ? (
+                {activeProfile?.id === CODEX_GATEWAY_RELAY_ID ? (
+                  // 被新版网关接管：直接说明现状，不给切换下拉框（切了也只会报错），改去网关管理或断开。
+                  <>
+                    <div className="overview-current-main">
+                      <span className="relay-index overview-current-gateway"><Waypoints aria-hidden="true" className="h-4 w-4" /></span>
+                      <span className="overview-current-text">
+                        <strong>{t("由 Codex++ 网关接管")}</strong>
+                        <small>
+                          {codexGatewayModelCount(activeProfile)
+                            ? tf("用网关供应商池里的 {0} 个模型；要切回旧版供应商，先断开并还原", [codexGatewayModelCount(activeProfile)])
+                            : t("用网关供应商池里的模型；要切回旧版供应商，先断开并还原")}
+                        </small>
+                      </span>
+                    </div>
+                    <div className="overview-current-actions">
+                      <Button onClick={() => onNavigate("gateway")}>{t("管理接入")}</Button>
+                      <Button onClick={() => onNavigate("relay")} variant="secondary">{t("断开并还原")}</Button>
+                    </div>
+                  </>
+                ) : activeProfile ? (
                   <>
                     <div className="overview-current-main">
                       <span className="relay-index">{providerInitial(activeProfile.name)}</span>

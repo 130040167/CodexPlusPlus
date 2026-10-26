@@ -1058,6 +1058,8 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "由 Codex++ 网关接管": "Managed by the Codex++ gateway",
+  "用网关供应商池里的模型；要切回旧版供应商，先断开并还原": "Uses models from the gateway pool; disconnect and restore to switch back to legacy providers",
   "Codex 正由 Codex++ 网关接管，旧版供应商配置暂不可用；先点「断开并还原」。": "Codex is managed by the Codex++ gateway, so legacy provider settings are unavailable. Click \"Disconnect and restore\" first.",
   "停止 Codex": "Stop Codex",
   "处理中…": "Working…",
@@ -2213,6 +2215,7 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "用网关供应商池里的 {0} 个模型；要切回旧版供应商，先断开并还原": "Uses {0} models from the gateway pool; disconnect and restore to switch back to legacy providers",
   "清单更新于 {0}": "Catalog updated {0}",
   "{0} 个市场插件，已安装 {1} 个": "{0} market plugins, {1} installed",
   // 网关 · 添加 / 编辑供应商
