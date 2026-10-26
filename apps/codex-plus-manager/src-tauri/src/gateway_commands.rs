@@ -369,6 +369,20 @@ pub fn update_gateway_provider(
 /// 删除网关供应商（直连模式的数据不受影响）。
 #[tauri::command]
 pub fn delete_gateway_provider(id: String) -> CommandResult<Option<GatewayPayload>> {
+    // ChatGPT API 账号：删除时顺带让 OpenAI 吊销它的 refresh token（失败不影响删除）。
+    if let Some(relay) = GatewayStore::default()
+        .load()
+        .ok()
+        .and_then(|gateway| gateway.provider(&id).map(|provider| provider.relay.clone()))
+        .filter(|relay| {
+            codex_plus_core::gateway::accounts::relay_account_kind(relay).as_deref()
+                == Some("chatgpt-api")
+        })
+    {
+        tauri::async_runtime::spawn(async move {
+            let _ = codex_plus_core::gateway::accounts::chatgpt_api_revoke(&relay).await;
+        });
+    }
     respond(
         "已删除。",
         "删除供应商失败",
@@ -859,6 +873,32 @@ pub async fn login_gateway_grok() -> CommandResult<Option<GatewayPayload>> {
         let tokens = accounts::grok_login(open_in_browser).await?;
         let models = accounts::grok_models(&tokens.access_token).await;
         add_account_provider(accounts::grok_relay(&tokens, &models), "grok", "email")
+    }
+    .await;
+    match refresh_agents(result) {
+        Ok(message) => ok(&message, current_payload()),
+        Err(error) => failed(&format!("登录失败：{error:#}"), current_payload()),
+    }
+}
+
+/// 在网关里登录 ChatGPT API（OpenAI 的「用 ChatGPT 登录」）：套餐额度直接用在 api.openai.com 上，
+/// Agent 的指令原样保留。与 ChatGPT（Codex 订阅）是两种独立的登录。
+#[tauri::command]
+pub async fn login_gateway_chatgpt_api() -> CommandResult<Option<GatewayPayload>> {
+    use codex_plus_core::gateway::accounts;
+    let result = async {
+        let state_dir = codex_plus_core::paths::default_app_state_dir();
+        let account = accounts::chatgpt_api_login(&state_dir, open_in_browser).await?;
+        let models = accounts::chatgpt_api_models(
+            &account.access_token,
+            &codex_plus_core::codex_home::default_codex_home_dir(),
+        )
+        .await;
+        add_account_provider(
+            accounts::chatgpt_api_relay(&account, &models),
+            "chatgpt-api",
+            "subject",
+        )
     }
     .await;
     match refresh_agents(result) {

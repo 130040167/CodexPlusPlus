@@ -776,6 +776,75 @@ async fn gateway_end_to_end() {
         std::env::remove_var("CODEX_PLUS_OFFICIAL_BASE_URL");
     }
 
+    // —— 8c. ChatGPT API（用 ChatGPT 登录）：直接发 api.openai.com，保留 Agent 自己的指令 ——
+    let (api_base, api_seen) = mock_upstream(vec![(
+        200,
+        "text/event-stream",
+        format!("event: response.completed\ndata: {completed}\n\n"),
+    )])
+    .await;
+    let far = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 3_600_000;
+    let siwc = RelayProfile {
+        id: "chatgpt-api".into(),
+        name: "ChatGPT API Plus".into(),
+        protocol: RelayProtocol::Responses,
+        auth_contents: json!({
+            "codex_plus_account": "chatgpt-api",
+            "client_id": "app_1",
+            "access_token": "siwc-at",
+            "refresh_token": "siwc-rt",
+            "expires_at_ms": far,
+            "api_base": api_base,
+        })
+        .to_string(),
+        model_list: "gpt-6.1-sol".into(),
+        model: "gpt-6.1-sol".into(),
+        ..RelayProfile::default()
+    };
+    gateway.providers = providers(vec![siwc]);
+    save(&gateway);
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/gw/grok/v1/responses"))
+        .bearer_auth("cpx-gw-grok-e2e")
+        .json(&json!({
+            "model": "gpt-6.1-sol",
+            "stream": false,
+            "temperature": 0.3,
+            "instructions": "You are Grok.",
+            "tools": [{ "type": "code_interpreter" }, { "type": "function", "name": "run" }],
+            "input": [
+                { "type": "message", "role": "system", "content": [{ "type": "input_text", "text": "系统规则" }] },
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let text = response.text().await.unwrap();
+    assert!(text.contains("订阅回答"), "{text}");
+    {
+        let seen = api_seen.lock().unwrap();
+        let (head, body) = &seen[0];
+        let head_lower = head.to_ascii_lowercase();
+        assert!(head_lower.starts_with("post /v1/responses"), "{head}");
+        assert!(
+            head_lower.contains("authorization: bearer siwc-at"),
+            "{head}"
+        );
+        assert!(!head_lower.contains("originator: codex_cli_rs"), "{head}");
+        assert_eq!(body["instructions"], "You are Grok.");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert!(body.get("temperature").is_none());
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+    }
+
     // —— 9. 关闭绑定后返回 503，旧的 Codex 代理路径不受影响 ——
     gateway.bindings.get_mut("claude").unwrap().enabled = false;
     save(&gateway);

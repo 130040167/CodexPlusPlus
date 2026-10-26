@@ -80,6 +80,12 @@ Agent 打开「接入」后，池里所有打开的供应商的模型和所有�
 
 - **ChatGPT**：在网关里走与 Codex CLI 相同的浏览器 PKCE 登录（本机 1455 端口接回调）。token 只存在 gateway.json，
   凭据带 `codex_plus_gateway` 标记，刷新结果写回网关、不采纳 Codex 的 live 登录——与 Codex 自己的登录是两次独立的登录。
+- **ChatGPT API**：OpenAI 给本机开源应用开放的「用 ChatGPT 登录」。首次登录以 `dynamic_agent_client` 注册，回调带回
+  OpenAI 签发的 client_id（每个账号各存一份），本机标识 `urn:uuid:` 存在状态目录的 `chatgpt-api-host`。授权范围必须包含
+  `chatgpt.tokens.use.direct`，否则账号不符合条件。请求直接发 `api.openai.com/v1/responses`，保留 Agent 自己的指令；
+  去掉接口不收的字段（采样参数、`previous_response_id` 等）和 OpenAI 托管工具，`system` 改 `developer`，`store:false`、
+  只流式（非流式客户端由网关拼回完整响应）。用量与 ChatGPT 本身共享 5 小时额度，超出时按额度用尽冷却。
+  删除供应商时会让 OpenAI 吊销它的 refresh token。与上面的 ChatGPT（Codex 订阅）是两种独立的登录。
 - **GitHub Copilot**：GitHub 设备码登录（VS Code Copilot 的 OAuth App），用 GitHub token 换 Copilot 的短期 token
   （约 30 分钟），请求前快过期时自动换新并写回 gateway.json；Chat Completions 协议，带 VS Code Copilot Chat 的请求头。
 - **SuperGrok**：auth.x.ai 浏览器 PKCE 登录（Grok CLI 的公开客户端），推理走订阅额度的 `cli-chat-proxy.grok.com/v1`
@@ -88,7 +94,9 @@ Agent 打开「接入」后，池里所有打开的供应商的模型和所有�
 - 账号类凭据都带 `codex_plus_account` / `codex_plus_gateway` 标记，与各 Agent 自己的登录互不影响。
 - 没有接入：Claude 订阅（Anthropic 条款只允许官方客户端使用订阅凭据）、Gemini CLI（Google 已于 2026-06-18 停止个人账号的
   Code Assist，且其说明写明第三方使用违反政策）、Antigravity（客户端密钥未公开，只能从客户端里提取）。
-- 以上登录都是冒用官方客户端身份调用未公开的接口，可能随时失效，也有账号被限制的风险。
+- 其它订阅（Cursor、Kiro、Devin、Qoder、Zed、WorkBuddy、ZCode、Factory 等）需要模拟各家客户端调用私有接口，
+  暂不内置。
+- 除 ChatGPT API 外，以上登录都是冒用官方客户端身份调用未公开的接口，可能随时失效，也有账号被限制的风险。
 
 ## 限制
 

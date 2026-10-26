@@ -390,9 +390,161 @@ pub fn responses_json_from_sse(body: &[u8]) -> Option<Value> {
     last
 }
 
+/// 「用 ChatGPT 登录」（ChatGPT API 订阅）不接受的 Responses 字段。`previous_response_id` 也去掉：
+/// 不存储，每轮都发完整对话。
+const API_REJECTED_FIELDS: &[&str] = &[
+    "background",
+    "conversation",
+    "max_output_tokens",
+    "max_tool_calls",
+    "metadata",
+    "moderation",
+    "multi_agent",
+    "prompt",
+    "prompt_cache_retention",
+    "safety_identifier",
+    "temperature",
+    "top_logprobs",
+    "top_p",
+    "truncation",
+    "user",
+    "previous_response_id",
+];
+
+/// OpenAI 自己执行的工具；ChatGPT 登录的 token 不能用，带上会整条请求被拒。
+const API_HOSTED_TOOLS: &[&str] = &[
+    "image_generation",
+    "file_search",
+    "code_interpreter",
+    "computer_use",
+    "computer_use_preview",
+    "computer",
+    "mcp",
+    "tool_search",
+];
+
+/// 发往 api.openai.com 的 ChatGPT API 订阅请求：不存储、只流式，去掉不接受的字段和托管工具，
+/// `system` 消息改成 `developer`。与 Codex 订阅不同，指令保留 Agent 自己的。
+pub fn adapt_api_request(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    for key in API_REJECTED_FIELDS {
+        object.remove(*key);
+    }
+    object.insert("store".to_string(), Value::Bool(false));
+    object.insert("stream".to_string(), Value::Bool(true));
+    match object.get_mut("input") {
+        Some(Value::String(text)) => {
+            let text = std::mem::take(text);
+            object.insert(
+                "input".to_string(),
+                json!([{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": text }] }]),
+            );
+        }
+        Some(Value::Array(items)) => {
+            for item in items.iter_mut() {
+                let Some(item) = item.as_object_mut() else {
+                    continue;
+                };
+                if item.get("role").and_then(Value::as_str) == Some("system") {
+                    item.insert("role".to_string(), json!("developer"));
+                }
+                // 工具以输入项的形式交过来（additional_tools）时也要去掉托管工具。
+                if item.get("type").and_then(Value::as_str) == Some("additional_tools")
+                    && let Some(Value::Array(tools)) = item.get_mut("tools")
+                {
+                    tools.retain(|tool| !is_hosted_tool(tool));
+                }
+            }
+        }
+        _ => {}
+    }
+    // 按对话命名缓存键：OpenAI 按它保留 ChatGPT 登录的提示词缓存。
+    let has_cache_key = object
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .is_some_and(|key| !key.is_empty());
+    if !has_cache_key {
+        let own = object
+            .get("instructions")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let input = object
+            .get("input")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if let Some(key) = conversation_key(own, input) {
+            object.insert("prompt_cache_key".to_string(), Value::String(key));
+        }
+    }
+    if let Some(Value::Array(tools)) = object.get_mut("tools") {
+        tools.retain(|tool| !is_hosted_tool(tool));
+        if tools.is_empty() {
+            object.remove("tools");
+            object.remove("tool_choice");
+        }
+    }
+}
+
+fn is_hosted_tool(tool: &Value) -> bool {
+    tool.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| API_HOSTED_TOOLS.contains(&kind))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_requests_keep_own_instructions_and_drop_hosted_tools() {
+        let mut body = json!({
+            "model": "gpt-6.1-sol",
+            "instructions": "You are Grok.",
+            "temperature": 0.2,
+            "max_output_tokens": 100,
+            "previous_response_id": "resp_1",
+            "stream": false,
+            "input": [
+                { "type": "message", "role": "system", "content": [{ "type": "input_text", "text": "规则" }] },
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }
+            ],
+            "tools": [{ "type": "web_search" }, { "type": "code_interpreter" }, { "type": "function", "name": "f" }],
+            "tool_choice": "auto"
+        });
+        adapt_api_request(&mut body);
+        assert_eq!(
+            body["instructions"], "You are Grok.",
+            "指令保留 Agent 自己的"
+        );
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        for key in ["temperature", "max_output_tokens", "previous_response_id"] {
+            assert!(body.get(key).is_none(), "{key}");
+        }
+        assert_eq!(body["input"][0]["role"], "developer");
+        let tools: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(tools, vec!["web_search", "function"]);
+        assert!(
+            body["prompt_cache_key"]
+                .as_str()
+                .is_some_and(|key| key.len() == 36)
+        );
+
+        let mut only_hosted =
+            json!({ "input": "hi", "tools": [{ "type": "mcp" }], "tool_choice": "auto" });
+        adapt_api_request(&mut only_hosted);
+        assert!(only_hosted.get("tools").is_none());
+        assert!(only_hosted.get("tool_choice").is_none());
+        assert_eq!(only_hosted["input"][0]["content"][0]["text"], "hi");
+    }
 
     #[test]
     fn requests_are_reshaped_like_codex_cli_sends_them() {

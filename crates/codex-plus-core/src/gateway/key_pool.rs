@@ -90,6 +90,7 @@ pub fn classify_failure(
     let quota_hint = [
         "insufficient_quota",
         "usage_limit_reached",
+        "subscription_sharing_usage_limit_exceeded",
         "exceeded your current quota",
         "quota exceeded",
         "quota_exceeded",

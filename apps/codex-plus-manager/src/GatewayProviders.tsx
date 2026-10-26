@@ -34,10 +34,17 @@ import {
 import { Avatar, Switch, type Notify, type Run } from "./gateway-ui";
 
 /** 能在网关里直接登录的订阅。 */
-type AccountKind = "chatgpt" | "copilot" | "grok";
+type AccountKind = "chatgpt" | "chatgpt-api" | "copilot" | "grok";
 type DeviceCode = { deviceCode: string; userCode: string; verificationUri: string; interval: number; expiresIn: number };
 
-const ACCOUNT_LABELS: Record<AccountKind, string> = { chatgpt: "ChatGPT", copilot: "GitHub Copilot", grok: "SuperGrok" };
+const ACCOUNT_LABELS: Record<AccountKind, string> = { chatgpt: "ChatGPT", "chatgpt-api": "ChatGPT API", copilot: "GitHub Copilot", grok: "SuperGrok" };
+
+/** 浏览器登录的订阅各自的命令。 */
+const BROWSER_LOGIN_COMMANDS: Record<Exclude<AccountKind, "copilot">, string> = {
+  chatgpt: "login_gateway_chatgpt",
+  "chatgpt-api": "login_gateway_chatgpt_api",
+  grok: "login_gateway_grok",
+};
 
 /** 表单弹窗的用途：按预设新建、自定义新建、编辑已有供应商。 */
 type FormState = { mode: "preset"; preset: GatewayPreset } | { mode: "custom" } | { mode: "edit"; entry: GatewayPoolEntry };
@@ -72,7 +79,7 @@ export function ProvidersView({
     void run("reorder", "reorder_gateway_providers", { ids }, t("调整顺序"), true);
   };
 
-  /** 登录订阅账号：ChatGPT / SuperGrok 走浏览器登录；Copilot 先显示验证码，再等你在 GitHub 上授权。 */
+  /** 登录订阅账号：ChatGPT / ChatGPT API / SuperGrok 走浏览器登录；Copilot 先显示验证码，再等你在 GitHub 上授权。 */
   const login = async (kind: AccountKind) => {
     const title = tf("登录 {0}", [ACCOUNT_LABELS[kind]]);
     if (kind === "copilot") {
@@ -94,7 +101,7 @@ export function ProvidersView({
       return;
     }
     void notify(title, t("已在浏览器打开登录页，登录完成后回到这里。5 分钟内有效。"), "info");
-    await run(`login:${kind}`, kind === "chatgpt" ? "login_gateway_chatgpt" : "login_gateway_grok", undefined, title);
+    await run(`login:${kind}`, BROWSER_LOGIN_COMMANDS[kind], undefined, title);
   };
 
   const submit = async (draft: ProviderDraft) => {
@@ -326,6 +333,7 @@ function ProviderCatalog({
   const subscriptions: CatalogItem[] = (
     [
       { kind: "chatgpt", name: "ChatGPT", icon: "openai" },
+      { kind: "chatgpt-api", name: "ChatGPT API", icon: "openai" },
       { kind: "copilot", name: "GitHub Copilot", icon: "githubcopilot" },
       { kind: "grok", name: "SuperGrok", icon: "grok" },
     ] as Array<{ kind: AccountKind; name: string; icon: string }>

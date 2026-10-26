@@ -318,6 +318,7 @@ pub fn run() {
             gateway_commands::start_gateway_copilot_login,
             gateway_commands::finish_gateway_copilot_login,
             gateway_commands::login_gateway_grok,
+            gateway_commands::login_gateway_chatgpt_api,
             gateway_commands::save_gateway_tray_panel,
             tray_panel::tray_panel_action,
             tray_panel::refresh_tray_mode,

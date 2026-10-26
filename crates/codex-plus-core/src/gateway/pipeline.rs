@@ -270,8 +270,21 @@ async fn attempt_pipeline(
             .unwrap_or_default()
             .to_string();
     }
+    // ChatGPT API（用 ChatGPT 登录）：直接发 api.openai.com，保留 Agent 自己的指令。
+    let chatgpt_api = !chatgpt
+        && crate::gateway::accounts::relay_account_kind(&candidate.relay).as_deref()
+            == Some("chatgpt-api");
+    if chatgpt_api {
+        body["model"] = Value::String(candidate.upstream_model.clone());
+        crate::gateway::chatgpt_backend::adapt_api_request(&mut body);
+        cache_key = body
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+    }
     // 后端按 session-id / thread-id 找会话的缓存，键取自 prompt_cache_key。
-    let session_headers = if chatgpt && !cache_key.is_empty() {
+    let session_headers = if (chatgpt || chatgpt_api) && !cache_key.is_empty() {
         ProxySessionHeaders {
             session_id: Some(cache_key.as_str()),
             thread_id: Some(cache_key.as_str()),
