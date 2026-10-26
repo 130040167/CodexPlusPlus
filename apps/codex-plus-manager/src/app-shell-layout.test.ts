@@ -266,3 +266,12 @@ test("「关于」并进「设置」：侧栏底部只留齿轮，合并页用�
   assert.equal(ids.length, 6);
   for (const id of ids) assert.match(text, new RegExp(`id="${id}"`));
 });
+
+test("Computer Use 工作原理图与网关总览同一套三列拓扑", () => {
+  const page = readFileSync(new URL("./ComputerUsePage.tsx", import.meta.url), "utf8");
+  assert.match(page, /<HubTopology links=\{links\}>/);
+  assert.match(page, /data-node="cu-core"/);
+  assert.match(page, /data-node=\{`cu-client:\$\{id\}`\}/);
+  const hub = readFileSync(new URL("./HubOverview.tsx", import.meta.url), "utf8");
+  assert.match(hub, /export function HubTopology\(/);
+});

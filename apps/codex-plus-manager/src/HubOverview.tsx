@@ -104,7 +104,7 @@ export function HubOverview({
       </header>
 
       <section className="hub-card">
-        <Topology links={links}>
+        <HubTopology links={links}>
           <div className="hub-col">
             <div className="hub-col-head"><span>{t("Agent")}</span><span>{t("请求")}</span></div>
             {agents.map((agent) => (
@@ -176,7 +176,7 @@ export function HubOverview({
               {t("添加供应商")}
             </button>
           </div>
-        </Topology>
+        </HubTopology>
       </section>
 
       <div className="hub-grid">
@@ -256,8 +256,8 @@ function UsageStats({ usage }: { usage: UsageSummary | null }) {
 
 type Path = { d: string; tone: HubLink["tone"]; weight: number; key: string };
 
-/** 三列布局 + 一层 SVG 连线。连线端点按真实节点位置量出来，窗口或内容变化时重画。 */
-function Topology({ links, children }: { links: HubLink[]; children: React.ReactNode }) {
+/** 三列布局 + 一层 SVG 连线。连线端点按真实节点位置量出来，窗口或内容变化时重画。Computer Use 页也用它。 */
+export function HubTopology({ links, children }: { links: HubLink[]; children: React.ReactNode }) {
   const root = useRef<HTMLDivElement>(null);
   const [paths, setPaths] = useState<Path[]>([]);
   const signature = links.map((link) => `${link.from}>${link.to}:${link.tone}:${link.weight.toFixed(2)}`).join("|");
