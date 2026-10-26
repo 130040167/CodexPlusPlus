@@ -1713,10 +1713,15 @@ span.gw-popover-check {
   cursor: default;
 }
 
-.gw-import-item > span {
+/* 头像组件本身也是 span，只能让文字那一块占满剩余宽度，否则头像会被拉成半行宽的横条。 */
+.gw-import-item > span:not(.gw-avatar) {
   display: grid;
   flex: 1;
   min-width: 0;
+}
+
+.gw-import-item > .gw-avatar {
+  flex: none;
 }
 
 .gw-import-item small {

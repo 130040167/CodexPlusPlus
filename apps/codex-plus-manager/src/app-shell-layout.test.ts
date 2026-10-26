@@ -204,3 +204,10 @@ test("插件市场紧凑布局的规则带 .shell 前缀：正式版 styles.css 
   for (const group of selectors) for (const selector of group.split(",")) assert.match(selector.trim(), /^\.shell /, selector);
   assert.match(block, /\.shell \.plugin-market-card \{[^}]*padding:\s*14px 16px/);
 });
+
+test("导入供应商弹窗：只有文字那块占满宽度，头像（也是 span）保持固定尺寸", () => {
+  const css = readFileSync(new URL("./GatewayPage.css", import.meta.url), "utf8");
+  assert.doesNotMatch(css, /\.gw-import-item > span \{/);
+  assert.match(css, /\.gw-import-item > span:not\(\.gw-avatar\) \{[^}]*flex: 1/);
+  assert.match(css, /\.gw-import-item > \.gw-avatar \{[^}]*flex: none/);
+});

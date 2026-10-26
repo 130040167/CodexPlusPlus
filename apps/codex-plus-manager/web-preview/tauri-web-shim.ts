@@ -260,8 +260,13 @@ const gateway = ok({
       },
     }],
   },
-  codexProviders: [],
-  claudeProviders: [],
+  // 导入弹窗演示数据：带品牌图标的、只显示首字母的都有，看头像是否保持固定尺寸。
+  codexProviders: [
+    { id: "hj", name: "哈基米 国模", protocol: "responses", baseUrl: "https://api.biuapi.com" },
+    { id: "kimi", name: "Kimi 官方", protocol: "responses", baseUrl: "https://api.moonshot.cn" },
+    { id: "deepseek", name: "DeepSeek", protocol: "responses", baseUrl: "https://api.deepseek.com" },
+  ],
+  claudeProviders: [{ id: "official", name: "Claude Official" }],
   grokProfiles: [],
 });
 const usageCounts = (calls: number, errors = 0) => ({ calls, errors, inputTokens: calls * 9000, outputTokens: calls * 700, cachedTokens: calls * 5600, reasoningTokens: 0 });
