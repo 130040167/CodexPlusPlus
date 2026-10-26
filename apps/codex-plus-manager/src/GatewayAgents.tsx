@@ -249,7 +249,7 @@ function AgentDetail({
         <div className="gw-detail-value gw-chip-row">
           {used.map((entry) => (
             <span className="gw-model-chip" key={entry.id}>
-              <Avatar name={entry.name} size="sm" />
+              <Avatar baseUrl={entry.baseUrl} name={entry.name} size="sm" />
               {entry.name}
               <em>{entry.models.length}</em>
             </span>
@@ -279,7 +279,7 @@ function AgentDetail({
                       onChange={() => onSave({ ...draft, poolExclude: on ? [...draft.poolExclude, entry.id] : draft.poolExclude.filter((id) => id !== entry.id) })}
                       type="checkbox"
                     />
-                    <Avatar name={entry.name} size="sm" />
+                    <Avatar baseUrl={entry.baseUrl} name={entry.name} size="sm" />
                     <span>{entry.name}</span>
                     <em>{entry.models.length}</em>
                   </label>

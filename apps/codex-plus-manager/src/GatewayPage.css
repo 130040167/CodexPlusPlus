@@ -1839,3 +1839,22 @@ span.gw-popover-check {
 .gw-import-note {
   margin: 0 0 4px;
 }
+
+/* 单色厂商图标：用遮罩按当前文字颜色着色 */
+.gw-mono-icon {
+  display: block;
+  width: 62%;
+  height: 62%;
+  background: currentColor;
+  -webkit-mask: var(--gw-icon) center / contain no-repeat;
+  mask: var(--gw-icon) center / contain no-repeat;
+}
+
+.gw-avatar-brand {
+  color: var(--gw-ink);
+}
+
+.gw-catalog-item .gw-avatar-brand,
+.gw-catalog-item .gw-avatar {
+  background: transparent;
+}

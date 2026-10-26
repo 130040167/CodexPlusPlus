@@ -1,5 +1,7 @@
 /** 本地网关页各标签共用的小组件与类型。 */
 import type { CSSProperties, ReactNode } from "react";
+import { BRAND_ICON_URLS } from "./provider-brand-icons";
+import { brandIconIsColor, brandIconKey } from "./provider-brands";
 import { providerAvatarText } from "./provider-name";
 
 export type Status = "ok" | "failed" | "warning" | "info";
@@ -26,21 +28,14 @@ export function avatarOf(name: string): string {
   return providerAvatarText(name, "P");
 }
 
-/** 已知品牌用打包的图标，其它供应商用按名字固定配色的字母头像。 */
-function brandIcon(name: string): string | null {
-  const lower = name.toLowerCase();
-  if (lower.includes("chatgpt") || lower.includes("openai") || lower.includes("官方登录")) return AGENT_ICONS.codex;
-  if (lower.includes("claude") || lower.includes("anthropic")) return AGENT_ICONS.claude;
-  if (lower.includes("grok") || lower === "xai") return AGENT_ICONS.grok;
-  return null;
-}
-
-export function Avatar({ name, size = "md", plain = false }: { name: string; size?: "sm" | "md" | "lg"; plain?: boolean }) {
-  const icon = plain ? null : brandIcon(name);
-  if (icon) {
+/** 已知厂商用打包的图标（按名字、再按地址识别），其它供应商用按名字固定配色的字母头像。 */
+export function Avatar({ name, baseUrl = "", size = "md", plain = false }: { name: string; baseUrl?: string; size?: "sm" | "md" | "lg"; plain?: boolean }) {
+  const key = plain ? null : brandIconKey(name, baseUrl);
+  const url = key ? BRAND_ICON_URLS[key] : undefined;
+  if (key && url) {
     return (
       <span className="gw-avatar gw-avatar-brand" data-size={size} title={name}>
-        <img alt="" src={icon} />
+        {brandIconIsColor(key) ? <img alt="" src={url} /> : <i className="gw-mono-icon" style={{ "--gw-icon": `url("${url}")` } as CSSProperties} />}
       </span>
     );
   }

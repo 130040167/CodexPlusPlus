@@ -183,7 +183,7 @@ function PoolRow({
         >
           <GripVertical className="h-4 w-4" />
         </span>
-        <Avatar name={entry.name} size="lg" />
+        <Avatar baseUrl={entry.baseUrl} name={entry.name} size="lg" />
         <div className="gw-pool-main">
           <strong>{entry.name}</strong>
           <small>{sub}</small>
