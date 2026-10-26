@@ -176,9 +176,31 @@ pub struct GatewaySettings {
     /// 退出 Codex++ 时把走网关的 Agent 恢复成直连，避免网关不在时连不上。
     #[serde(default)]
     pub restore_on_exit: bool,
+    /// 供应商池：加入网关的供应商 id（引用 Codex 供应商列表，不复制数据）。
+    /// 旧版状态文件没有这个字段，视为空池；已绑定的供应商总会算在池里。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pool: Vec<String>,
 }
 
 impl GatewaySettings {
+    /// 把供应商加入池（已在池里则不变）。
+    pub fn add_to_pool(&mut self, relay_id: &str) {
+        let relay_id = relay_id.trim();
+        if !relay_id.is_empty() && !self.pool.iter().any(|id| id == relay_id) {
+            self.pool.push(relay_id.to_string());
+        }
+    }
+
+    /// 绑定直接指向的供应商 id（不含路由组成员）。
+    pub fn bound_provider_ids(&self) -> Vec<String> {
+        self.bindings
+            .values()
+            .filter(|binding| binding.target.kind == GatewayTargetKind::Provider)
+            .map(|binding| binding.target.id.clone())
+            .filter(|id| !id.is_empty())
+            .collect()
+    }
+
     pub fn binding(&self, agent: &ToolId) -> Option<&AgentBinding> {
         self.bindings.get(agent.as_str())
     }

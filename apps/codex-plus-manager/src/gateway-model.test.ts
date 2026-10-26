@@ -7,9 +7,14 @@ import {
   draftFromBinding,
   bindingDisplay,
   formatRemaining,
+  gatewayPresets,
+  groupSlug,
   memberStatus,
   parseContextWindow,
   pickerSections,
+  presetAdded,
+  presetHost,
+  providerDraftFromPreset,
   routeCards,
   routeMembers,
   routeNarrative,
@@ -18,6 +23,7 @@ import {
   targetModels,
   targetValue,
   validateDraft,
+  validateProviderDraft,
   type GatewayPayload,
 } from "./gateway-model.ts";
 
@@ -30,10 +36,11 @@ function payload(): GatewayPayload {
     port: 57321,
     helperRunning: true,
     pool: [
-      { id: "ds", name: "DeepSeek", protocol: "chatCompletions", official: false, models: ["deepseek-v4-pro", "deepseek-v4-flash"], keyCount: 2 },
-      { id: "glm", name: "GLM", protocol: "anthropicMessages", official: false, models: ["glm-5.3"], keyCount: 1 },
-      { id: "bare", name: "Bare", protocol: "responses", official: false, models: [], keyCount: 1 },
+      { id: "ds", name: "DeepSeek", baseUrl: "https://api.deepseek.com/", protocol: "chatCompletions", official: false, models: ["deepseek-v4-pro", "deepseek-v4-flash"], keyCount: 2 },
+      { id: "glm", name: "GLM", baseUrl: "https://glm.test/v1", protocol: "anthropicMessages", official: false, models: ["glm-5.3"], keyCount: 1 },
+      { id: "bare", name: "Bare", baseUrl: "https://bare.test/v1", protocol: "responses", official: false, models: [], keyCount: 1 },
     ],
+    codexProviders: [],
     groups: [{ id: "g", name: "Group", strategy: "failover", members: ["ds", "glm"] }],
     agents: [],
     health: { keys: [], providers: [] },
@@ -102,7 +109,7 @@ const initials = (name: string) => name.slice(0, 2).toUpperCase();
 test("模型选择器：路由组在前，每个供应商一组；可按名字筛选，未知模型给出自定义项", () => {
   const all = pickerSections(payload(), "", initials);
   assert.deepEqual(all.map((section) => section.key), ["group", "provider:ds", "provider:glm"]);
-  assert.deepEqual(all[0].items[0], { target: "group:g", model: "", label: "Group", sub: "group/g", avatar: "GR" });
+  assert.deepEqual(all[0].items[0], { target: "group:g", model: "", label: "Group", sub: "group/group", avatar: "GR" });
   assert.deepEqual(all[1].items.map((item) => item.model), ["deepseek-v4-pro", "deepseek-v4-flash"]);
   // 供应商名命中时列出它的全部模型；模型名命中时只列命中的。
   assert.deepEqual(pickerSections(payload(), "deep", initials).map((section) => section.key), ["provider:ds", "custom"]);
@@ -116,7 +123,7 @@ test("模型选择器：路由组在前，每个供应商一组；可按名字�
 test("选择器按钮：供应商显示模型名，路由组显示组名", () => {
   assert.deepEqual(bindingDisplay(payload(), "provider:ds", ""), { title: "deepseek-v4-pro", sub: "DeepSeek", kind: "provider" });
   assert.deepEqual(bindingDisplay(payload(), "provider:ds", "deepseek-v4-flash"), { title: "deepseek-v4-flash", sub: "DeepSeek", kind: "provider" });
-  assert.deepEqual(bindingDisplay(payload(), "group:g", ""), { title: "Group", sub: "group/g", kind: "group" });
+  assert.deepEqual(bindingDisplay(payload(), "group:g", ""), { title: "Group", sub: "group/group", kind: "group" });
   assert.equal(bindingDisplay(payload(), "", "").kind, null);
 });
 
@@ -190,6 +197,39 @@ test("上一个请求的路由说明：先列计划，再逐个尝试，最后�
   assert.deepEqual(lines[3].args, ["GLM", "glm-5.3", "1.2 s"]);
 });
 
+test("路由组短名按组名生成，不显示随机 id", () => {
+  assert.equal(groupSlug("Daily coding"), "group/daily-coding");
+  assert.equal(groupSlug(" 系统默认 "), "group/系统默认");
+  assert.equal(groupSlug(""), "group/unnamed");
+});
+
+test("内置预设：厂商在前、中转其次、本机最后；地址相同的标记为已添加", () => {
+  const presets = gatewayPresets();
+  const sections = presets.map((preset) => preset.section);
+  assert.equal(sections.indexOf("relay") > sections.lastIndexOf("vendor"), true);
+  assert.equal(sections.indexOf("local") > sections.lastIndexOf("relay"), true);
+  const anthropic = presets.find((preset) => preset.key === "anthropic");
+  assert.equal(anthropic?.protocol, "anthropicMessages");
+  const deepseek = presets.find((preset) => preset.key === "deepseek")!;
+  assert.equal(deepseek.section, "vendor");
+  assert.equal(presetAdded(payload(), deepseek), true, "末尾斜杠和大小写不影响判断");
+  assert.equal(presetAdded(payload(), anthropic!), false);
+  assert.equal(new Set(presets.map((preset) => preset.key)).size, presets.length, "预设 key 不重复");
+  assert.equal(presetHost("https://api.deepseek.com/"), "api.deepseek.com");
+  assert.equal(presetHost("http://127.0.0.1:11434/v1"), "localhost:11434");
+});
+
+test("预设表单：本机服务预填 Key；校验名称、地址、Key 和模型", () => {
+  const ollama = gatewayPresets().find((preset) => preset.key === "ollama")!;
+  const draft = providerDraftFromPreset(ollama);
+  assert.equal(draft.apiKey, "ollama");
+  assert.equal(validateProviderDraft(draft), "至少填一个模型");
+  assert.equal(validateProviderDraft({ ...draft, model: "qwen3" }), null);
+  assert.equal(validateProviderDraft({ ...draft, model: "qwen3", baseUrl: "api.x" }), "地址要以 http:// 或 https:// 开头");
+  assert.equal(validateProviderDraft({ ...draft, model: "qwen3", apiKey: " " }), "请填写 API Key");
+  assert.equal(validateProviderDraft(providerDraftFromPreset(null)), "请填写名称");
+});
+
 test("网关页接入导航，命令已注册", () => {
   assert.match(app, /id: "gateway"/);
   assert.match(app, /route === "gateway" \? \(/);
@@ -202,6 +242,9 @@ test("网关页接入导航，命令已注册", () => {
     "import_claude_provider_to_gateway_pool",
     "import_grok_profile_to_gateway_pool",
     "reset_gateway_key_health",
+    "add_gateway_pool_providers",
+    "remove_gateway_pool_provider",
+    "create_gateway_pool_provider",
   ]) {
     assert.match(lib, new RegExp(`gateway_commands::${command},`));
   }

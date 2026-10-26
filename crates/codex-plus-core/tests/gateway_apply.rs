@@ -1,8 +1,9 @@
 //! 网关模式开启 / 关闭对 Agent 配置文件的改写与恢复。
 
 use codex_plus_core::gateway::apply::{
-    ApplyContext, disable_binding, enable_binding, import_claude_provider_to_pool,
-    note_claude_switched, reapply_if_port_changed,
+    ApplyContext, NewPoolProvider, add_to_pool, create_pool_provider, disable_binding,
+    enable_binding, gateway_pool, import_claude_provider_to_pool, note_claude_switched,
+    reapply_if_port_changed, remove_from_pool,
 };
 use codex_plus_core::gateway::store::{
     AgentBinding, ClaudeRoleModels, GatewayStore, GatewayTarget, GatewayTargetKind,
@@ -321,4 +322,104 @@ fn claude_provider_imports_into_pool_as_anthropic_relay() {
         "kimi-k2.5"
     );
     assert_eq!(settings.relay_profiles.len(), 2);
+}
+
+#[test]
+fn pool_starts_empty_and_only_lists_added_or_bound_providers() {
+    let fixture = fixture(57321);
+    let ctx = &fixture.ctx;
+    let mut settings = settings();
+    settings.relay_profiles.push(RelayProfile {
+        id: "glm".into(),
+        name: "GLM".into(),
+        relay_mode: RelayMode::PureApi,
+        base_url: "https://glm.test/v1".into(),
+        api_key: "sk-glm".into(),
+        ..RelayProfile::default()
+    });
+    settings.relay_profiles.push(RelayProfile {
+        id: "agg".into(),
+        name: "Group".into(),
+        relay_mode: RelayMode::Aggregate,
+        ..RelayProfile::default()
+    });
+    let ids = |gateway| {
+        gateway_pool(&settings, gateway)
+            .into_iter()
+            .map(|relay| relay.id.clone())
+            .collect::<Vec<_>>()
+    };
+    // 旧状态文件（没有 pool 字段）是空池，不再把 Codex 的全部供应商都列出来。
+    let gateway = ctx.gateway.load().unwrap();
+    assert!(ids(&gateway).is_empty());
+
+    let gateway = add_to_pool(&ctx.gateway, &settings, &["glm".to_string()]).unwrap();
+    assert_eq!(ids(&gateway), vec!["glm"]);
+    assert!(add_to_pool(&ctx.gateway, &settings, &["agg".to_string()]).is_err());
+    assert!(add_to_pool(&ctx.gateway, &settings, &["gone".to_string()]).is_err());
+
+    // 绑定的供应商即使没加入池也显示，且不能移出。
+    enable_binding(ctx, &settings, &ToolId::Claude, binding()).unwrap();
+    let gateway = ctx.gateway.load().unwrap();
+    assert_eq!(ids(&gateway), vec!["glm", "ds"]);
+    assert!(remove_from_pool(&ctx.gateway, "ds").is_err());
+    let gateway = remove_from_pool(&ctx.gateway, "glm").unwrap();
+    assert_eq!(ids(&gateway), vec!["ds"]);
+    // Codex 里的供应商本身不受影响。
+    assert_eq!(settings.relay_profiles.len(), 3);
+}
+
+#[test]
+fn preset_provider_is_created_in_codex_list_with_default_model() {
+    let mut settings = BackendSettings::default();
+    let before = settings.relay_profiles.len();
+    let profile = create_pool_provider(
+        &mut settings,
+        NewPoolProvider {
+            name: "Kimi",
+            base_url: "https://api.moonshot.test/v1/",
+            api_key: "sk-kimi",
+            protocol: RelayProtocol::ChatCompletions,
+            model: "kimi-k3",
+            model_list: "kimi-k3\nkimi-k2.7-code",
+        },
+    )
+    .unwrap();
+    assert_eq!(settings.relay_profiles.len(), before + 1);
+    assert_eq!(profile.name, "Kimi");
+    assert_eq!(profile.protocol, RelayProtocol::ChatCompletions);
+    assert_eq!(
+        codex_plus_core::gateway::route::relay_models(&profile),
+        vec!["kimi-k3", "kimi-k2.7-code"]
+    );
+    assert!(
+        create_pool_provider(
+            &mut settings,
+            NewPoolProvider {
+                name: "Loop",
+                base_url: "http://127.0.0.1:57321/gw/claude",
+                api_key: "x",
+                protocol: RelayProtocol::AnthropicMessages,
+                model: "",
+                model_list: "",
+            },
+        )
+        .is_err(),
+        "不能把网关自己加进池"
+    );
+    assert!(
+        create_pool_provider(
+            &mut settings,
+            NewPoolProvider {
+                name: "NoKey",
+                base_url: "https://x.test/v1",
+                api_key: " ",
+                protocol: RelayProtocol::Responses,
+                model: "",
+                model_list: "",
+            },
+        )
+        .is_err(),
+        "缺 Key 时报错"
+    );
 }

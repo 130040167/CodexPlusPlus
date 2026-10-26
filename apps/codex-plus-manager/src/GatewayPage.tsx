@@ -1,12 +1,12 @@
 /** 本地网关：让 Claude Code、Grok 经 Codex++ 使用统一的供应商池，支持多 Key 轮换与路由组。 */
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm } from "@tauri-apps/plugin-dialog";
-import { AlertTriangle, Check, ChevronDown, ChevronRight, LayoutGrid, Plus, RefreshCw, RotateCcw, Route as RouteIcon, Search, Waypoints } from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, ChevronRight, LayoutGrid, Plus, RefreshCw, RotateCcw, Route as RouteIcon, Search, Waypoints, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { PageHeader } from "./ManagementPages";
 import { t, tf } from "./i18n";
 import { providerAvatarText } from "./provider-name";
 import {
@@ -16,11 +16,15 @@ import {
   draftFromBinding,
   failureLabel,
   formatRemaining,
+  gatewayPresets,
   groupSlug,
   memberStatus,
   parseTargetValue,
   pickerSections,
+  presetAdded,
+  presetHost,
   protocolLabel,
+  providerDraftFromPreset,
   routeCards,
   routeMembers,
   routeNarrative,
@@ -28,13 +32,18 @@ import {
   strategyLabel,
   targetModels,
   validateDraft,
+  validateProviderDraft,
   type AgentActivityView,
   type BindingDraft,
   type GatewayAgentId,
   type GatewayAgentView,
   type GatewayPayload,
+  type GatewayPreset,
+  type GatewayProtocol,
   type GatewayResult,
   type MemberStatus,
+  type PresetSection,
+  type ProviderDraft,
   type RouteRecordView,
 } from "./gateway-model";
 import "./GatewayPage.css";
@@ -180,24 +189,19 @@ export function GatewayPage({ notify, onOpenCodexProviders }: { notify: Notify; 
 
   return (
     <div className="mg-page gateway-page">
-      <PageHeader
-        icon={<RouteIcon className="h-5 w-5" />}
-        title={t("本地网关")}
-        actions={(
-          <>
-            <nav aria-label={t("本地网关")} className="gw-tabs" role="tablist">
-              {tabs.map((item) => (
-                <button aria-selected={tab === item.id} data-active={tab === item.id} key={item.id} onClick={() => setTab(item.id)} role="tab" type="button">
-                  {item.label}
-                </button>
-              ))}
-            </nav>
-            <button aria-label={t("刷新")} className="gw-icon-button" disabled={busy !== null} onClick={() => void refresh(false)} title={t("刷新")} type="button">
-              <RefreshCw className={`h-4 w-4 ${busy === "load" ? "animate-spin" : ""}`} />
+      {/* 页面标题由外层框架显示，这里只放分段标签和刷新。 */}
+      <div className="gw-toolbar">
+        <nav aria-label={t("本地网关")} className="gw-tabs" role="tablist">
+          {tabs.map((item) => (
+            <button aria-selected={tab === item.id} data-active={tab === item.id} key={item.id} onClick={() => setTab(item.id)} role="tab" type="button">
+              {item.label}
             </button>
-          </>
-        )}
-      />
+          ))}
+        </nav>
+        <button aria-label={t("刷新")} className="gw-icon-button" disabled={busy !== null} onClick={() => void refresh(false)} title={t("刷新")} type="button">
+          <RefreshCw className={`h-4 w-4 ${busy === "load" ? "animate-spin" : ""}`} />
+        </button>
+      </div>
       <div className="mg-content gw-content">
         {payload && !payload.helperRunning && payload.agents.some((agent) => agent.enabled) ? (
           <p className="gw-alert" role="alert">
@@ -362,16 +366,44 @@ function ModelPicker({
   onPick: (target: string, model: string) => void;
 }) {
   const [query, setQuery] = useState("");
+  const [position, setPosition] = useState<CSSProperties | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const sections = useMemo(() => pickerSections(payload, query, avatarOf), [payload, query]);
   const display = bindingDisplay(payload, target, model);
+
+  // 弹层用 fixed 定位挂到 body：按钮下方放不下时翻到上方，高度不超出窗口。
+  useLayoutEffect(() => {
+    if (!open) return;
+    const place = () => {
+      const rect = wrapRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const width = Math.min(440, window.innerWidth - 24);
+      const left = Math.max(12, Math.min(rect.right - width, window.innerWidth - width - 12));
+      const below = window.innerHeight - rect.bottom - 18;
+      const above = rect.top - 18;
+      const upward = below < 320 && above > below;
+      const maxHeight = Math.min(460, upward ? above : below);
+      setPosition(upward
+        ? { left, width, bottom: window.innerHeight - rect.top + 6, maxHeight }
+        : { left, width, top: rect.bottom + 6, maxHeight });
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
     setQuery("");
     const close = (event: MouseEvent) => {
-      if (!wrapRef.current?.contains(event.target as Node)) onOpenChange(false);
+      const node = event.target as Node;
+      if (!wrapRef.current?.contains(node) && !popoverRef.current?.contains(node)) onOpenChange(false);
     };
     const escape = (event: KeyboardEvent) => {
       if (event.key === "Escape") onOpenChange(false);
@@ -397,8 +429,8 @@ function ModelPicker({
         <span>{display.kind ? display.title : t("选择模型")}</span>
         <ChevronDown className="h-3.5 w-3.5" />
       </button>
-      {open ? (
-        <div className="gw-popover" role="listbox">
+      {open && position ? createPortal(
+        <div className="gw-popover gw-portal" ref={popoverRef} role="listbox" style={position}>
           <label className="gw-popover-search">
             <Search className="h-4 w-4" />
             <input autoFocus onChange={(event) => setQuery(event.currentTarget.value)} placeholder={t("筛选，或输入任意模型 id…")} value={query} />
@@ -440,7 +472,8 @@ function ModelPicker({
               ))}
             </div>
           </div>
-        </div>
+        </div>,
+        document.body,
       ) : null}
     </div>
   );
@@ -555,30 +588,22 @@ function ProvidersView({
 }) {
   const [adding, setAdding] = useState(false);
   if (adding) {
-    return (
-      <AddProviderSheet
-        busy={busy}
-        onClose={() => setAdding(false)}
-        onImport={async (command, id) => {
-          if (await run(`import:${id}`, command, { id }, t("导入供应商池"))) setAdding(false);
-        }}
-        onOpenCodexProviders={onOpenCodexProviders}
-        payload={payload}
-      />
-    );
+    return <AddProviderSheet busy={busy} onClose={() => setAdding(false)} onOpenCodexProviders={onOpenCodexProviders} payload={payload} run={run} />;
   }
   const pool = payload?.pool ?? [];
+  const boundIds = new Set(Object.values(payload?.gateway.bindings ?? {}).filter((binding) => binding?.target.kind === "provider").map((binding) => binding!.target.id));
+  const remove = async (id: string, name: string) => {
+    const ok = await confirm(tf("把「{0}」移出供应商池？Codex 供应商列表里的这一项会保留。", [name]), { title: t("移出供应商池"), kind: "warning" });
+    if (ok) await run(`remove:${id}`, "remove_gateway_pool_provider", { id }, t("移出供应商池"));
+  };
   return (
     <>
       <SectionLabel
         aside={(
-          <>
-            <button className="gw-text-button" onClick={onOpenCodexProviders} type="button">{t("在 Codex 供应商配置里编辑")}</button>
-            <button className="gw-text-button strong" onClick={() => setAdding(true)} type="button">
-              <Plus className="h-3.5 w-3.5" />
-              {t("添加供应商")}
-            </button>
-          </>
+          <button className="gw-text-button strong" onClick={() => setAdding(true)} type="button">
+            <Plus className="h-3.5 w-3.5" />
+            {t("添加供应商")}
+          </button>
         )}
       >
         {t("供应商池")}
@@ -586,9 +611,9 @@ function ProvidersView({
       <div className="gw-card">
         {pool.map((entry) => {
           const status = memberStatus(payload, entry.id);
-          const unhealthy = Boolean(payload?.health.keys.some((key) => key.relayId === entry.id && key.state !== "ok"))
-            || Boolean(payload?.health.providers.some((item) => item.relayId === entry.id && item.breakerOpen));
           const failures = (payload?.health.keys ?? []).filter((key) => key.relayId === entry.id && key.state !== "ok");
+          const unhealthy = failures.length > 0 || Boolean(payload?.health.providers.some((item) => item.relayId === entry.id && item.breakerOpen));
+          const bound = boundIds.has(entry.id);
           return (
             <div className="gw-provider-row" key={entry.id}>
               <Avatar name={entry.name} />
@@ -596,6 +621,7 @@ function ProvidersView({
                 <div>
                   <strong>{entry.name}</strong>
                   <span className="gw-pill">{entry.official ? t("官方登录") : protocolLabel(entry.protocol)}</span>
+                  {bound ? <span className="gw-pill" data-tone="ok">{t("已绑定")}</span> : null}
                 </div>
                 <small>{entry.models.length ? entry.models.join(" · ") : t("未配置模型")}</small>
                 {failures.length ? (
@@ -605,50 +631,135 @@ function ProvidersView({
                 ) : null}
               </div>
               <span className="gw-status" data-state={status.state}>{statusText(status)}</span>
-              {unhealthy ? (
-                <button className="gw-text-button" disabled={busy !== null} onClick={() => void run(`reset:${entry.id}`, "reset_gateway_key_health", { relayId: entry.id }, t("重置 Key 状态"), true)} type="button">
-                  {t("重置")}
+              <span className="gw-row-actions">
+                {unhealthy ? (
+                  <button className="gw-text-button" disabled={busy !== null} onClick={() => void run(`reset:${entry.id}`, "reset_gateway_key_health", { relayId: entry.id }, t("重置 Key 状态"), true)} type="button">
+                    {t("重置")}
+                  </button>
+                ) : null}
+                <button
+                  className="gw-text-button"
+                  disabled={busy !== null || bound}
+                  onClick={() => void remove(entry.id, entry.name)}
+                  title={bound ? t("正有 Agent 绑定在这个供应商上") : t("移出供应商池，Codex 里的供应商保留")}
+                  type="button"
+                >
+                  {t("移出")}
                 </button>
-              ) : null}
+              </span>
             </div>
           );
         })}
         {payload && pool.length === 0 ? (
           <div className="gw-empty">
             <strong>{t("供应商池是空的")}</strong>
-            <span>{t("先在 Codex「供应商配置」里添加供应商，或从 Claude Code / Grok 导入。")}</span>
+            <span>{t("点「添加供应商」：从内置厂商预设新建、从 Codex 已有的供应商里挑选，或从 Claude Code / Grok 导入。")}</span>
+            <button className="gw-text-button strong gw-empty-action" onClick={() => setAdding(true)} type="button">
+              <Plus className="h-3.5 w-3.5" />
+              {t("添加供应商")}
+            </button>
           </div>
         ) : null}
       </div>
       <p className="gw-footnote">
-        {t("供应商池就是 Codex 的供应商列表（含官方登录账号），路由组就是聚合供应商；多个 Key 在供应商的命名 Key 里添加。被限流的 Key 会自动冷却，额度耗尽或失效的 Key 会被跳过，连续出错的供应商会被短暂熔断。")}
+        {t("池里只放加入网关的供应商，数据仍存在 Codex 供应商列表里，移出池不会删除它。多个 Key 在供应商的命名 Key 里添加；被限流的 Key 会自动冷却，额度耗尽或失效的 Key 会被跳过，连续出错的供应商会被短暂熔断。")}
+        {" "}
+        <button className="gw-text-button gw-inline" onClick={onOpenCodexProviders} type="button">{t("在 Codex 供应商配置里编辑")}</button>
       </p>
     </>
   );
 }
 
-/** 添加供应商：从 Claude Code / Grok 导入，或去 Codex 供应商配置里新建。 */
+type Tile = { key: string; name: string; sub: string; added?: boolean; dashed?: boolean; onClick: () => void; icon?: ReactNode };
+
+function TileGrid({ tiles, empty, disabled }: { tiles: Tile[]; empty?: string; disabled: boolean }) {
+  return (
+    <div className="gw-tile-grid">
+      {tiles.map((tile) => (
+        <button className={`gw-tile ${tile.dashed ? "gw-tile-custom" : ""}`} data-added={Boolean(tile.added)} disabled={disabled} key={tile.key} onClick={tile.onClick} type="button">
+          {tile.icon ?? <Avatar name={tile.name} />}
+          <span>
+            <strong>{tile.name}</strong>
+            <small>{tile.sub}</small>
+          </span>
+          {tile.added ? <Check className="gw-tile-check h-4 w-4" /> : null}
+        </button>
+      ))}
+      {tiles.length === 0 && empty ? <span className="gw-tile-empty">{empty}</span> : null}
+    </div>
+  );
+}
+
+/** 添加供应商：内置厂商预设、Codex 已有供应商、Claude Code / Grok 导入、自定义地址。 */
 function AddProviderSheet({
   payload,
   busy,
-  onImport,
+  run,
   onClose,
   onOpenCodexProviders,
 }: {
   payload: GatewayPayload | null;
   busy: string | null;
-  onImport: (command: string, id: string) => void;
+  run: Run;
   onClose: () => void;
   onOpenCodexProviders: () => void;
 }) {
   const [query, setQuery] = useState("");
+  const [form, setForm] = useState<{ preset: GatewayPreset | null } | null>(null);
   const needle = query.trim().toLowerCase();
+  const hit = (...values: string[]) => !needle || values.some((value) => value.toLowerCase().includes(needle));
+  const presets = useMemo(() => gatewayPresets(), []);
+  const disabled = busy !== null;
+
+  const finish = async (command: string, args: Record<string, unknown>, title: string) => {
+    if (await run(`add:${command}`, command, args, title)) onClose();
+  };
+  const presetTiles = (section: PresetSection): Tile[] => presets
+    .filter((preset) => preset.section === section && hit(preset.name, preset.baseUrl))
+    .map((preset) => ({
+      key: preset.key,
+      name: preset.name,
+      sub: presetAdded(payload, preset) ? t("已在供应商池里") : presetHost(preset.baseUrl),
+      added: presetAdded(payload, preset),
+      onClick: () => setForm({ preset }),
+    }));
   const inPool = (name: string) => Boolean(payload?.pool.some((entry) => entry.name === name));
-  const filter = (items: Array<{ id: string; name: string }>) => items.filter((item) => !needle || item.name.toLowerCase().includes(needle));
-  const sources: Array<{ title: string; hint: string; command: string; sub: string; items: Array<{ id: string; name: string }> }> = [
-    { title: t("从 Claude Code 导入"), hint: t("Anthropic 协议，Claude Code 经网关时原样转发"), command: "import_claude_provider_to_gateway_pool", sub: t("Claude Code 供应商"), items: filter(payload?.claudeProviders ?? []) },
-    { title: t("从 Grok 导入"), hint: t("Grok 页里配置的供应商"), command: "import_grok_profile_to_gateway_pool", sub: t("Grok 供应商"), items: filter(payload?.grokProfiles ?? []) },
+  const importTiles = (items: Array<{ id: string; name: string }>, command: string, sub: string): Tile[] => items
+    .filter((item) => hit(item.name))
+    .map((item) => ({
+      key: item.id,
+      name: item.name,
+      sub: inPool(item.name) ? t("已在供应商池里") : sub,
+      added: inPool(item.name),
+      onClick: () => void finish(command, { id: item.id }, t("导入供应商池")),
+    }));
+  const codexTiles: Tile[] = (payload?.codexProviders ?? [])
+    .filter((entry) => hit(entry.name, entry.baseUrl))
+    .map((entry) => ({
+      key: entry.id,
+      name: entry.name,
+      sub: entry.official ? t("官方登录") : `${protocolLabel(entry.protocol)} · ${presetHost(entry.baseUrl)}`,
+      onClick: () => void finish("add_gateway_pool_providers", { ids: [entry.id] }, t("加入供应商池")),
+    }));
+  const localTiles: Tile[] = [
+    ...presetTiles("local"),
+    ...(hit(t("自定义")) ? [{ key: "custom", name: t("自定义"), sub: t("任意兼容地址"), dashed: true, icon: <span className="gw-avatar gw-avatar-plus"><Plus className="h-4 w-4" /></span>, onClick: () => setForm({ preset: null }) }] : []),
   ];
+  const subscriptionTiles: Tile[] = hit("ChatGPT", t("ChatGPT 订阅"))
+    ? [{ key: "chatgpt", name: t("ChatGPT 订阅"), sub: t("在 Codex 里登录官方账号"), icon: <img alt="" className="gw-tile-logo" src={AGENT_ICONS.codex} />, onClick: onOpenCodexProviders }]
+    : [];
+
+  const sections: Array<{ key: string; title: string; hint: string; tiles: Tile[]; empty?: string }> = [
+    { key: "subscription", title: t("订阅"), hint: t("登录即可，无需 Key；登录后从下面「Codex 里已有的」加入"), tiles: subscriptionTiles },
+    { key: "vendor", title: t("厂商"), hint: t("填 Key 即可"), tiles: presetTiles("vendor") },
+    { key: "relay", title: t("中转"), hint: t("一个 Key 用多家模型"), tiles: presetTiles("relay") },
+    { key: "local", title: t("本机"), hint: t("本机运行的模型服务，或任意兼容地址"), tiles: localTiles },
+    { key: "codex", title: t("Codex 里已有的"), hint: t("直接加入，不复制数据"), tiles: codexTiles, empty: needle ? undefined : t("Codex 的供应商都已在池里") },
+    { key: "claude", title: t("从 Claude Code 导入"), hint: t("Anthropic 协议，Claude Code 经网关时原样转发"), tiles: importTiles(payload?.claudeProviders ?? [], "import_claude_provider_to_gateway_pool", t("Claude Code 供应商")) },
+    { key: "grok", title: t("从 Grok 导入"), hint: t("Grok 页里配置的供应商"), tiles: importTiles(payload?.grokProfiles ?? [], "import_grok_profile_to_gateway_pool", t("Grok 供应商")) },
+  ];
+  const visible = sections.filter((section) => section.tiles.length || (!needle && section.empty));
+
   return (
     <div className="gw-sheet">
       <div className="gw-sheet-head">
@@ -659,40 +770,101 @@ function AddProviderSheet({
         </label>
         <button className="gw-text-button" onClick={onClose} type="button">{t("关闭")}</button>
       </div>
-      {sources.map((source) => (
-        <section key={source.command}>
-          <h4>{source.title} <span>· {source.hint}</span></h4>
-          <div className="gw-tile-grid">
-            {source.items.map((item) => {
-              const added = inPool(item.name);
-              return (
-                <button className="gw-tile" data-added={added} disabled={busy !== null || added} key={item.id} onClick={() => onImport(source.command, item.id)} type="button">
-                  <Avatar name={item.name} />
-                  <span>
-                    <strong>{item.name}</strong>
-                    <small>{added ? t("已在供应商池里") : source.sub}</small>
-                  </span>
-                  {added ? <Check className="gw-tile-check h-4 w-4" /> : null}
-                </button>
-              );
-            })}
-            {source.items.length === 0 ? <span className="gw-tile-empty">{needle ? t("没有匹配的供应商") : t("这里还没有供应商")}</span> : null}
-          </div>
+      {visible.map((section) => (
+        <section key={section.key}>
+          <h4>{section.title} <span>· {section.hint}</span></h4>
+          <TileGrid disabled={disabled} empty={section.empty} tiles={section.tiles} />
         </section>
       ))}
-      <section>
-        <h4>{t("新建")} <span>· {t("在 Codex 供应商配置里填地址和 Key，保存后自动出现在池里")}</span></h4>
-        <div className="gw-tile-grid">
-          <button className="gw-tile gw-tile-custom" onClick={onOpenCodexProviders} type="button">
-            <span className="gw-avatar gw-avatar-plus"><Plus className="h-4 w-4" /></span>
-            <span>
-              <strong>{t("自定义")}</strong>
-              <small>{t("任意兼容地址")}</small>
-            </span>
-          </button>
-        </div>
-      </section>
+      {visible.length === 0 ? <div className="gw-empty">{t("没有匹配的供应商")}</div> : null}
+      {form ? (
+        <ProviderFormDialog
+          busy={busy}
+          onCancel={() => setForm(null)}
+          onSubmit={(draft) => void finish("create_gateway_pool_provider", { ...draft }, t("添加供应商"))}
+          preset={form.preset}
+        />
+      ) : null}
     </div>
+  );
+}
+
+/** 预设或自定义供应商的表单：名称、地址、Key、协议、模型。 */
+function ProviderFormDialog({
+  preset,
+  busy,
+  onSubmit,
+  onCancel,
+}: {
+  preset: GatewayPreset | null;
+  busy: string | null;
+  onSubmit: (draft: ProviderDraft) => void;
+  onCancel: () => void;
+}) {
+  const [draft, setDraft] = useState<ProviderDraft>(() => providerDraftFromPreset(preset));
+  const update = (patch: Partial<ProviderDraft>) => setDraft((previous) => ({ ...previous, ...patch }));
+  const validation = validateProviderDraft(draft);
+  useEffect(() => {
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onCancel();
+    };
+    document.addEventListener("keydown", escape);
+    return () => document.removeEventListener("keydown", escape);
+  }, [onCancel]);
+  return createPortal(
+    <div className="gw-modal-backdrop gw-portal" onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel(); }}>
+      <form
+        className="gw-modal"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!validation) onSubmit({ ...draft, model: draft.model.trim() });
+        }}
+      >
+        <header>
+          {preset ? <Avatar name={preset.name} /> : <span className="gw-avatar gw-avatar-plus"><Plus className="h-4 w-4" /></span>}
+          <strong>{preset ? tf("添加 {0}", [preset.name]) : t("添加自定义供应商")}</strong>
+          <button aria-label={t("关闭")} className="gw-icon-button" onClick={onCancel} type="button"><X className="h-4 w-4" /></button>
+        </header>
+        <div className="gw-modal-body">
+          <label className="gw-field">
+            <span>{t("名称")}</span>
+            <Input onChange={(event) => update({ name: event.currentTarget.value })} value={draft.name} />
+          </label>
+          <label className="gw-field">
+            <span>{t("API Key")} {preset?.apiKeyUrl ? <small>{tf("在 {0} 获取", [presetHost(preset.apiKeyUrl)])}</small> : preset?.defaultKey ? <small>{t("本机服务不校验 Key，保留默认值即可")}</small> : null}</span>
+            <Input autoComplete="off" autoFocus={Boolean(preset && !preset.defaultKey)} onChange={(event) => update({ apiKey: event.currentTarget.value })} placeholder="sk-..." type="password" value={draft.apiKey} />
+          </label>
+          <div className="gw-modal-grid">
+            <label className="gw-field">
+              <span>{t("地址")}</span>
+              <Input onChange={(event) => update({ baseUrl: event.currentTarget.value })} placeholder="https://api.example.com/v1" value={draft.baseUrl} />
+            </label>
+            <label className="gw-field">
+              <span>{t("协议")}</span>
+              <select className="gw-select" onChange={(event) => update({ protocol: event.currentTarget.value as GatewayProtocol })} value={draft.protocol}>
+                <option value="chatCompletions">Chat Completions</option>
+                <option value="responses">Responses</option>
+                <option value="anthropicMessages">Anthropic Messages</option>
+              </select>
+            </label>
+          </div>
+          <label className="gw-field">
+            <span>{t("默认模型")} <small>{t("留空用模型列表的第一个")}</small></span>
+            <Input onChange={(event) => update({ model: event.currentTarget.value })} value={draft.model} />
+          </label>
+          <label className="gw-field">
+            <span>{t("模型列表")} <small>{t("每行一个，会出现在智能体的模型选择器里")}</small></span>
+            <Textarea onChange={(event) => update({ modelList: event.currentTarget.value })} rows={4} spellCheck={false} value={draft.modelList} />
+          </label>
+        </div>
+        <footer>
+          <span className="gw-error">{validation ? t(validation) : ""}</span>
+          <Button onClick={onCancel} size="sm" type="button" variant="ghost">{t("取消")}</Button>
+          <Button disabled={busy !== null || Boolean(validation)} size="sm" type="submit">{busy ? t("保存中") : t("添加到供应商池")}</Button>
+        </footer>
+      </form>
+    </div>,
+    document.body,
   );
 }
 
@@ -737,7 +909,7 @@ function RoutingView({ payload, onOpenCodexProviders }: { payload: GatewayPayloa
               <div className="gw-group-main">
                 <div>
                   <strong>{group.name}</strong>
-                  <code className="gw-chip">{groupSlug(group.id)}</code>
+                  <code className="gw-chip">{groupSlug(group.name)}</code>
                 </div>
                 <small>{members.length ? members.map((entry) => `${entry.name} · ${entry.models[0] ?? "—"}`).join(joiner) : t("没有成员")}</small>
               </div>

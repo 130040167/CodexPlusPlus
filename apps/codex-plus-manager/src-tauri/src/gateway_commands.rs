@@ -21,6 +21,8 @@ use crate::commands::{CommandResult, failed, ok, sync_resident_helper};
 pub struct GatewayPoolEntry {
     pub id: String,
     pub name: String,
+    /// 只用于界面判断预设是否已添加（地址不含 Key）。
+    pub base_url: String,
     pub protocol: RelayProtocol,
     pub official: bool,
     pub models: Vec<String>,
@@ -61,6 +63,8 @@ pub struct GatewayPayload {
     pub port: u16,
     pub helper_running: bool,
     pub pool: Vec<GatewayPoolEntry>,
+    /// 还没加入池的 Codex 供应商，可在「添加供应商」里挑选加入。
+    pub codex_providers: Vec<GatewayPoolEntry>,
     pub groups: Vec<GatewayGroupEntry>,
     pub agents: Vec<GatewayAgentView>,
     pub health: PoolSnapshot,
@@ -91,19 +95,27 @@ fn parse_agent(agent: &str) -> anyhow::Result<ToolId> {
     Ok(agent)
 }
 
+fn pool_entry(relay: &codex_plus_core::settings::RelayProfile) -> GatewayPoolEntry {
+    GatewayPoolEntry {
+        id: relay.id.clone(),
+        name: relay.name.clone(),
+        base_url: relay.base_url.trim().to_string(),
+        protocol: relay.protocol,
+        official: codex_plus_core::official_login::member_uses_official_login_transport(relay),
+        models: codex_plus_core::gateway::route::relay_models(relay),
+        key_count: key_pool::expand_keys(relay).len(),
+    }
+}
+
 fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> GatewayPayload {
     let port = port();
-    let pool = apply::pool_relays(settings)
+    let pool_relays = apply::gateway_pool(settings, &gateway);
+    let codex_providers = apply::pool_relays(settings)
         .into_iter()
-        .map(|relay| GatewayPoolEntry {
-            id: relay.id.clone(),
-            name: relay.name.clone(),
-            protocol: relay.protocol,
-            official: codex_plus_core::official_login::member_uses_official_login_transport(relay),
-            models: codex_plus_core::gateway::route::relay_models(relay),
-            key_count: key_pool::expand_keys(relay).len(),
-        })
+        .filter(|relay| !pool_relays.iter().any(|item| item.id == relay.id))
+        .map(pool_entry)
         .collect();
+    let pool = pool_relays.into_iter().map(pool_entry).collect();
     let groups = settings
         .aggregate_relay_profiles
         .iter()
@@ -166,6 +178,7 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
         port,
         helper_running: codex_plus_core::resident_helper::resident_helper_port().is_some(),
         pool,
+        codex_providers,
         groups,
         agents,
         health: key_pool::snapshot(std::time::Instant::now()),
@@ -297,9 +310,9 @@ pub fn import_claude_provider_to_gateway_pool(id: String) -> CommandResult<Optio
             .ok_or_else(|| anyhow::anyhow!("Claude 供应商不存在：{id}"))?;
         let store = SettingsStore::default();
         let mut settings = store.load()?;
-        apply::import_claude_provider_to_pool(&mut settings, &provider)?;
+        let profile = apply::import_claude_provider_to_pool(&mut settings, &provider)?;
         store.save(&settings)?;
-        GatewayStore::default().load()
+        apply::add_to_pool(&GatewayStore::default(), &settings, &[profile.id])
     })();
     respond("已导入供应商池。", "导入供应商池失败", result)
 }
@@ -310,11 +323,65 @@ pub fn import_grok_profile_to_gateway_pool(id: String) -> CommandResult<Option<G
     let result = (|| {
         let store = SettingsStore::default();
         let mut settings = store.load()?;
-        apply::import_grok_profile_to_pool(&mut settings, &id)?;
+        let profile = apply::import_grok_profile_to_pool(&mut settings, &id)?;
         store.save(&settings)?;
-        GatewayStore::default().load()
+        apply::add_to_pool(&GatewayStore::default(), &settings, &[profile.id])
     })();
     respond("已导入供应商池。", "导入供应商池失败", result)
+}
+
+/// 把已有的 Codex 供应商加入网关池。
+#[tauri::command]
+pub fn add_gateway_pool_providers(ids: Vec<String>) -> CommandResult<Option<GatewayPayload>> {
+    let result = (|| {
+        let settings = SettingsStore::default().load()?;
+        apply::add_to_pool(&GatewayStore::default(), &settings, &ids)
+    })();
+    respond("已加入供应商池。", "加入供应商池失败", result)
+}
+
+/// 把供应商移出网关池；Codex 供应商列表里的这一项保留。
+#[tauri::command]
+pub fn remove_gateway_pool_provider(id: String) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "已移出供应商池，Codex 供应商列表里的这一项仍然保留。",
+        "移出供应商池失败",
+        apply::remove_from_pool(&GatewayStore::default(), &id),
+    )
+}
+
+/// 用内置预设或手填的地址、Key 新建供应商：写进 Codex 供应商列表并加入网关池。
+#[tauri::command]
+pub fn create_gateway_pool_provider(
+    name: String,
+    base_url: String,
+    api_key: String,
+    protocol: RelayProtocol,
+    model: String,
+    model_list: String,
+) -> CommandResult<Option<GatewayPayload>> {
+    let result = (|| {
+        let store = SettingsStore::default();
+        let mut settings = store.load()?;
+        let profile = apply::create_pool_provider(
+            &mut settings,
+            apply::NewPoolProvider {
+                name: &name,
+                base_url: &base_url,
+                api_key: &api_key,
+                protocol,
+                model: &model,
+                model_list: &model_list,
+            },
+        )?;
+        store.save(&settings)?;
+        apply::add_to_pool(&GatewayStore::default(), &settings, &[profile.id])
+    })();
+    respond(
+        &format!("已添加「{}」，可以在智能体里选它的模型了。", name.trim()),
+        "添加供应商失败",
+        result,
+    )
 }
 
 /// 清掉某个供应商的 Key 冷却与熔断状态。

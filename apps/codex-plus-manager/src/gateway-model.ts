@@ -1,4 +1,5 @@
 /** 网关模式的前端数据模型：与 `codex_plus_core::gateway` 的序列化结构一一对应，外加表单转换。 */
+import { PRESETS } from "./presets.ts";
 
 export type GatewayAgentId = "claude" | "grok";
 export type GatewayTargetKind = "provider" | "group";
@@ -32,6 +33,7 @@ export type GatewaySettings = {
 export type GatewayPoolEntry = {
   id: string;
   name: string;
+  baseUrl: string;
   protocol: "responses" | "chatCompletions" | "anthropicMessages";
   official: boolean;
   models: string[];
@@ -103,6 +105,8 @@ export type GatewayPayload = {
   port: number;
   helperRunning: boolean;
   pool: GatewayPoolEntry[];
+  /** 还没加入池的 Codex 供应商。 */
+  codexProviders: GatewayPoolEntry[];
   groups: GatewayGroupEntry[];
   agents: GatewayAgentView[];
   health: { keys: KeyHealthView[]; providers: ProviderHealthView[] };
@@ -300,9 +304,10 @@ export function agentName(agent: string): string {
   return GATEWAY_AGENT_NAMES[agent] ?? agent;
 }
 
-/** 路由组在模型选择器、路由页里的短名。 */
-export function groupSlug(id: string): string {
-  return `group/${id}`;
+/** 路由组在模型选择器、路由页里的短名：按组名生成（组 id 是一串随机字符，不适合给人看）。 */
+export function groupSlug(name: string): string {
+  const slug = name.trim().toLowerCase().replace(/[\s_/]+/g, "-").replace(/^-+|-+$/g, "");
+  return `group/${slug || "unnamed"}`;
 }
 
 export type PickerItem = {
@@ -337,12 +342,12 @@ export function pickerSections(
   const query = rawQuery.trim().toLowerCase();
   const sections: PickerSection[] = [];
   const groups = payload.groups
-    .filter((group) => matches(query, group.name, groupSlug(group.id)))
+    .filter((group) => matches(query, group.name, groupSlug(group.name)))
     .map((group) => ({
       target: `group:${group.id}`,
       model: "",
       label: group.name,
-      sub: groupSlug(group.id),
+      sub: groupSlug(group.name),
       avatar: avatar(group.name),
     }));
   if (groups.length) sections.push({ key: "group", title: "路由组", avatar: "", items: groups });
@@ -389,7 +394,7 @@ export function bindingDisplay(
   if (!payload || !parsed) return { title: "", sub: "", kind: null };
   if (parsed.kind === "group") {
     const group = payload.groups.find((item) => item.id === parsed.id);
-    return { title: group?.name ?? parsed.id, sub: groupSlug(parsed.id), kind: "group" };
+    return { title: group?.name ?? parsed.id, sub: groupSlug(group?.name ?? parsed.id), kind: "group" };
   }
   const entry = payload.pool.find((item) => item.id === parsed.id);
   return { title: model.trim() || entry?.models[0] || parsed.id, sub: entry?.name ?? parsed.id, kind: "provider" };
@@ -514,4 +519,126 @@ export function routeMembers(payload: GatewayPayload | null, target: string, rec
     const planned = records.flatMap((record) => record.planned).find((member) => member.relayId === id);
     return { relayId: id, name: entry?.name ?? id, model: planned?.model ?? entry?.models[0] ?? "" };
   });
+}
+
+/* —————————————— 内置厂商预设 —————————————— */
+
+export type GatewayProtocol = GatewayPoolEntry["protocol"];
+export type PresetSection = "vendor" | "relay" | "local";
+
+export type GatewayPreset = {
+  key: string;
+  name: string;
+  baseUrl: string;
+  protocol: GatewayProtocol;
+  model: string;
+  modelList: string[];
+  section: PresetSection;
+  /** 本机服务不校验 Key，预填一个占位值。 */
+  defaultKey?: string;
+  apiKeyUrl?: string;
+};
+
+/** 应用里通用预设之外、网关额外提供的几个：Anthropic 原生协议、xAI 和本机服务。 */
+const GATEWAY_EXTRA_PRESETS: GatewayPreset[] = [
+  {
+    key: "anthropic",
+    name: "Anthropic",
+    baseUrl: "https://api.anthropic.com",
+    protocol: "anthropicMessages",
+    model: "claude-sonnet-5-5",
+    modelList: ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"],
+    section: "vendor",
+    apiKeyUrl: "https://console.anthropic.com/settings/keys",
+  },
+  {
+    key: "xai",
+    name: "xAI",
+    baseUrl: "https://api.x.ai/v1",
+    protocol: "chatCompletions",
+    model: "",
+    modelList: [],
+    section: "vendor",
+    apiKeyUrl: "https://console.x.ai",
+  },
+  {
+    key: "ollama",
+    name: "Ollama",
+    baseUrl: "http://127.0.0.1:11434/v1",
+    protocol: "chatCompletions",
+    model: "",
+    modelList: [],
+    section: "local",
+    defaultKey: "ollama",
+  },
+  {
+    key: "lm-studio",
+    name: "LM Studio",
+    baseUrl: "http://127.0.0.1:1234/v1",
+    protocol: "chatCompletions",
+    model: "",
+    modelList: [],
+    section: "local",
+    defaultKey: "lm-studio",
+  },
+];
+
+/** 「添加供应商」里的全部预设：厂商（官方 / 国内官方）、中转、本机。 */
+export function gatewayPresets(): GatewayPreset[] {
+  const shared = PRESETS.map((preset): GatewayPreset => ({
+    key: preset.id,
+    name: preset.name,
+    baseUrl: preset.baseUrl,
+    protocol: preset.protocol,
+    model: preset.model,
+    modelList: preset.modelList ?? (preset.model ? [preset.model] : []),
+    section: preset.category === "official" || preset.category === "cn_official" ? "vendor" : "relay",
+    apiKeyUrl: preset.apiKeyUrl,
+  }));
+  const vendors = [...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "vendor"), ...shared.filter((preset) => preset.section === "vendor")];
+  return [...vendors, ...shared.filter((preset) => preset.section === "relay"), ...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "local")];
+}
+
+function normalizeUrl(url: string): string {
+  return url.trim().replace(/\/+$/, "").toLowerCase();
+}
+
+/** 预设卡片上的副标题：地址的主机名（本机服务显示端口）。 */
+export function presetHost(baseUrl: string): string {
+  try {
+    const url = new URL(baseUrl);
+    return url.hostname === "127.0.0.1" || url.hostname === "localhost" ? `localhost:${url.port}` : url.hostname;
+  } catch {
+    return baseUrl;
+  }
+}
+
+/** 池里已有同一地址的供应商：卡片显示为已添加（仍可再加一个，比如第二个账号）。 */
+export function presetAdded(payload: GatewayPayload | null, preset: GatewayPreset): boolean {
+  const target = normalizeUrl(preset.baseUrl);
+  return Boolean(payload?.pool.some((entry) => normalizeUrl(entry.baseUrl) === target));
+}
+
+/** 预设 / 自定义供应商的表单。 */
+export type ProviderDraft = { name: string; baseUrl: string; apiKey: string; protocol: GatewayProtocol; model: string; modelList: string };
+
+export function providerDraftFromPreset(preset: GatewayPreset | null): ProviderDraft {
+  if (!preset) return { name: "", baseUrl: "", apiKey: "", protocol: "chatCompletions", model: "", modelList: "" };
+  return {
+    name: preset.name,
+    baseUrl: preset.baseUrl,
+    apiKey: preset.defaultKey ?? "",
+    protocol: preset.protocol,
+    model: preset.model,
+    modelList: preset.modelList.join("\n"),
+  };
+}
+
+/** 表单校验：返回中文错误原文，没问题返回 null。 */
+export function validateProviderDraft(draft: ProviderDraft): string | null {
+  if (!draft.name.trim()) return "请填写名称";
+  if (!/^https?:\/\/\S+$/i.test(draft.baseUrl.trim())) return "地址要以 http:// 或 https:// 开头";
+  if (!draft.apiKey.trim()) return "请填写 API Key";
+  if (!draft.model.trim() && splitModels(draft.modelList).length === 0) return "至少填一个模型";
+  return null;
 }

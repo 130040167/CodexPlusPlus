@@ -538,13 +538,109 @@ pub fn import_grok_profile_to_pool(
     Ok(profile)
 }
 
-/// 供应商池：可以被网关绑定的供应商（排除聚合供应商）。
+/// 可以加入供应商池的 Codex 供应商（排除聚合供应商）。
 pub fn pool_relays(settings: &BackendSettings) -> Vec<&RelayProfile> {
     settings
         .relay_profiles
         .iter()
         .filter(|relay| relay.relay_mode != RelayMode::Aggregate)
         .collect()
+}
+
+/// 网关的供应商池：按加入顺序列出池里的供应商，再补上被绑定但不在池里的供应商；
+/// 已在 Codex 里删掉的 id 直接跳过。
+pub fn gateway_pool<'a>(
+    settings: &'a BackendSettings,
+    gateway: &GatewaySettings,
+) -> Vec<&'a RelayProfile> {
+    let candidates = pool_relays(settings);
+    let mut ids: Vec<String> = Vec::new();
+    for id in gateway
+        .pool
+        .iter()
+        .cloned()
+        .chain(gateway.bound_provider_ids())
+    {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids.iter()
+        .filter_map(|id| candidates.iter().copied().find(|relay| &relay.id == id))
+        .collect()
+}
+
+/// 把 Codex 供应商加入网关池。
+pub fn add_to_pool(
+    store: &GatewayStore,
+    settings: &BackendSettings,
+    relay_ids: &[String],
+) -> anyhow::Result<GatewaySettings> {
+    let mut gateway = store.load()?;
+    for relay_id in relay_ids {
+        let Some(relay) = settings
+            .relay_profiles
+            .iter()
+            .find(|relay| &relay.id == relay_id)
+        else {
+            bail!("供应商不存在：{relay_id}");
+        };
+        if relay.relay_mode == RelayMode::Aggregate {
+            bail!("「{}」是聚合供应商，请作为路由组使用", relay.name);
+        }
+        gateway.add_to_pool(relay_id);
+    }
+    store.save(&gateway)?;
+    Ok(gateway)
+}
+
+/// 把供应商移出网关池（Codex 里的供应商本身保留）。被 Agent 直接绑定时不允许移出。
+pub fn remove_from_pool(store: &GatewayStore, relay_id: &str) -> anyhow::Result<GatewaySettings> {
+    let mut gateway = store.load()?;
+    if let Some((agent, _)) = gateway.bindings.iter().find(|(_, binding)| {
+        binding.target.kind == GatewayTargetKind::Provider && binding.target.id == relay_id
+    }) {
+        bail!("{agent} 正绑定在这个供应商上，请先给它换一个模型或关闭网关");
+    }
+    gateway.pool.retain(|id| id != relay_id);
+    store.save(&gateway)?;
+    Ok(gateway)
+}
+
+/// 用预设或手填的地址、Key 新建一个供应商：写进 Codex 供应商列表并加入网关池。
+pub struct NewPoolProvider<'a> {
+    pub name: &'a str,
+    pub base_url: &'a str,
+    pub api_key: &'a str,
+    pub protocol: RelayProtocol,
+    pub model: &'a str,
+    pub model_list: &'a str,
+}
+
+pub fn create_pool_provider(
+    settings: &mut BackendSettings,
+    input: NewPoolProvider<'_>,
+) -> anyhow::Result<RelayProfile> {
+    if input.base_url.contains("/gw/") {
+        bail!("不能把网关自己加进供应商池");
+    }
+    let existing = settings
+        .relay_profiles
+        .iter()
+        .map(|relay| relay.id.clone())
+        .collect::<Vec<_>>();
+    let mut profile = crate::provider_import::pool_relay_profile(
+        input.name,
+        input.base_url,
+        input.api_key,
+        input.protocol,
+        input.model,
+        input.model_list,
+        &existing,
+    )?;
+    crate::relay_config::normalize_relay_profile_for_storage(&mut profile)?;
+    settings.relay_profiles.push(profile.clone());
+    Ok(profile)
 }
 
 /// 绑定解析后的主模型，UI 展示用。
