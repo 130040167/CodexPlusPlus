@@ -100,17 +100,15 @@ test("unified enhancements use the master switch and Chinese suggestion labels",
   for (const toggle of toggles) assert.equal(attribute(toggle, "disabled"), "!masterEnabled");
   assert.equal(attribute(fieldControl(enhance, "form.codexAppPluginMarketplaceUnlock"), "disabled"), "!masterEnabled");
   const petGroup = elements(enhance).find((element) => element.tagName.getText(app) === "FeatureGroup"
-    && attribute(element, "title") === 't("挂件与桌宠")');
+    && attribute(element, "title") === 't("桌宠与活动")');
   assert.ok(petGroup);
-  assert.equal(attribute(petGroup, "detail"), 't("在 Codex 中查看用量，设置自己的角色和互动方式。")');
+  assert.equal(attribute(petGroup, "detail"), 't("调整 Codex 原生桌宠与活动进度条。可点按的 Agent 桌宠在「工具 → Agent 桌宠」里设置。")');
   const petLook = fieldControl(petGroup.parent, "form.codexAppPetRealMouseLook");
   assert.ok(descendants(enhance).some((node) => ts.isConditionalExpression(node)
     && node.condition.getText(app) === "supportsPetRealMouseLook" && descendants(node.whenTrue).includes(petLook)), "native pet mouse tracking must be available on Windows and macOS");
   assert.ok(!descendants(enhance).some((node) => ts.isConditionalExpression(node)
     && node.condition.getText(app) === "isWindowsPlatform" && descendants(node.whenTrue).includes(petLook)), "native pet mouse tracking must not stay Windows-only");
-  const whaleWidget = fieldControl(petGroup.parent, "form.codexAppWhaleWidgetEnabled");
-  assert.ok(!descendants(enhance).some((node) => ts.isConditionalExpression(node)
-    && node.condition.getText(app) === "isWindowsPlatform" && descendants(node.whenTrue).includes(whaleWidget)), "the Codex usage widget must be available on every platform");
+  assert.ok(!enhance.getText(app).includes("agentPet"), "Agent 桌宠是独立页面，不再放在 Codex 增强里");
   assert.ok(fieldControl(petGroup.parent, "form.codexAppActivityOverlayRight"), "the native activity overlay mirror belongs with the pet layout settings");
 
   const visibleEnglish = descendants(app).filter((node) => ts.isStringLiteral(node)

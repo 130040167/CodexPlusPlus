@@ -930,7 +930,7 @@
         }
       }
     }
-    if (typeof syncCodexPlusWhaleWidget === "function") runScanStep(syncCodexPlusWhaleWidget);
+    if (typeof syncCodexPlusAgentPet === "function") runScanStep(syncCodexPlusAgentPet);
     refreshDreamSkin();
     refreshThreadIdBadges();
     sessionRows().forEach(tryAttachButton);

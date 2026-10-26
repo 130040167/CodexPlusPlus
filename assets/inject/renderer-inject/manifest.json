@@ -13,7 +13,7 @@
     {
       "name": "10-style.js",
       "description": "样式注入、默认设置、后端设置映射、梦皮主题变量与持久化",
-      "lines": 2746
+      "lines": 2744
     },
     {
       "name": "20-menu.js",
@@ -33,7 +33,7 @@
     {
       "name": "40-backend-settings.js",
       "description": "后端设置读写、心跳同步、用户脚本与市场状态、拓展 UI",
-      "lines": 1980
+      "lines": 1976
     },
     {
       "name": "50-navigation.js",
@@ -136,14 +136,9 @@
       "lines": 964
     },
     {
-      "name": "96-whale-compat.js",
-      "description": "Codex full whale host and bridge adapters",
-      "lines": 533
-    },
-    {
-      "name": "97-whale-widget.js",
-      "description": "Full whale engine opt-in lifecycle",
-      "lines": 64
+      "name": "97-agent-pet.js",
+      "description": "Agent 桌宠：可拖动角色、按压压扁回弹与按压音效",
+      "lines": 297
     },
     {
       "name": "98-scan-schedule.js",

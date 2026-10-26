@@ -29,6 +29,7 @@ fn build_proxied_client_with_timeouts(
     target_url: Option<&str>,
     connect_timeout: Option<std::time::Duration>,
     total_timeout: Option<std::time::Duration>,
+    redirect: Option<reqwest::redirect::Policy>,
 ) -> anyhow::Result<reqwest::Client> {
     let ua = if user_agent.trim().is_empty() {
         format!("CodexPlusPlus/{}", env!("CARGO_PKG_VERSION"))
@@ -41,6 +42,9 @@ fn build_proxied_client_with_timeouts(
     }
     if let Some(timeout) = total_timeout {
         builder = builder.timeout(timeout);
+    }
+    if let Some(policy) = redirect {
+        builder = builder.redirect(policy);
     }
     if let Some(proxy) = proxy_override
         .map(str::trim)
@@ -68,7 +72,7 @@ fn build_proxied_client(
     user_agent: &str,
     proxy_override: Option<&str>,
 ) -> anyhow::Result<reqwest::Client> {
-    build_proxied_client_with_timeouts(user_agent, proxy_override, None, None, None)
+    build_proxied_client_with_timeouts(user_agent, proxy_override, None, None, None, None)
 }
 
 /// 走系统代理 / 环境变量代理的 client，并显式指定连接与总超时。
@@ -84,6 +88,7 @@ pub fn proxied_client_with_timeouts(
         None,
         Some(connect_timeout),
         Some(total_timeout),
+        None,
     )
 }
 
@@ -102,6 +107,26 @@ pub fn proxied_client_for_url_with_timeouts(
         Some(target_url),
         Some(connect_timeout),
         Some(total_timeout),
+        None,
+    )
+}
+
+/// 同 `proxied_client_for_url_with_timeouts`，并指定重定向策略。
+/// 用于需要自己限定跳转次数与协议的下载（例如 Agent 桌宠取图只允许 https）。
+pub fn proxied_client_for_url_with_redirect(
+    user_agent: &str,
+    target_url: &str,
+    connect_timeout: std::time::Duration,
+    total_timeout: std::time::Duration,
+    redirect: reqwest::redirect::Policy,
+) -> anyhow::Result<reqwest::Client> {
+    build_proxied_client_with_timeouts(
+        user_agent,
+        None,
+        Some(target_url),
+        Some(connect_timeout),
+        Some(total_timeout),
+        Some(redirect),
     )
 }
 

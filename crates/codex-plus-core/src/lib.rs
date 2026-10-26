@@ -3,6 +3,7 @@ pub mod aggregate_catalog;
 pub mod agent_cache;
 pub mod agent_mcp;
 pub mod agent_collaboration;
+pub mod agent_pet;
 pub mod anthropic_bridge;
 pub mod app_paths;
 pub mod assets;
@@ -90,8 +91,6 @@ pub mod user_scripts;
 pub mod version;
 pub mod vision;
 pub mod watcher;
-pub mod whale;
-pub mod whale_full;
 pub mod work_view;
 // 不加 `#[cfg(windows)]`：模块内部各项已各自标注平台门控，在非 Windows 平台上
 // 是一个只含少数无平台依赖项（如 current_process_is_elevated 的桩实现）的空模块。

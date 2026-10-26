@@ -63,7 +63,7 @@
   installCodexPlusForceChineseLocale();
   installCodexPlusInstanceIdentity();
   runScanStep(installCodexPlusTypingEffects);
-  runScanStep(syncCodexPlusWhaleWidget);
+  runScanStep(syncCodexPlusAgentPet);
   let codexPlusResizeRafId = 0;
   window.__codexPlusResizeHandler = () => {
     cancelAnimationFrame(codexPlusResizeRafId);

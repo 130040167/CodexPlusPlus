@@ -144,13 +144,51 @@ const demoSettings = {
   relayTestModel: "gpt-5.4-mini",
   tools: {},
   activeTool: "codex",
-  codexAppWhaleWidgetEnabled: false,
-  codexAppWhaleBalanceProtocol: "auto",
-  codexAppWhaleBalancePath: "",
-  codexAppWhaleBalanceField: "",
-  codexAppWhaleBalanceCurrency: "USD",
-  codexAppWhaleBalanceScale: 1,
+  agentPet: {
+    enabled: false,
+    agents: ["codex"],
+    image: "whale",
+    customImageUrl: "",
+    size: 112,
+    soundEnabled: true,
+    soundSet: "duck",
+    volume: 0.6,
+  },
 };
+
+// 网页预览不走后端缓存，直接引用 jsDelivr 上的同一份图片。
+const agentPetCatalog: Array<[string, string, string]> = [
+  ["whale", "鲸鱼", "Spouting whale/3D/spouting_whale_3d.png"],
+  ["cat", "小猫", "Cat/3D/cat_3d.png"],
+  ["dog", "小狗", "Dog face/3D/dog_face_3d.png"],
+  ["fox", "狐狸", "Fox/3D/fox_3d.png"],
+  ["panda", "熊猫", "Panda/3D/panda_3d.png"],
+  ["penguin", "企鹅", "Penguin/3D/penguin_3d.png"],
+  ["hamster", "仓鼠", "Hamster/3D/hamster_3d.png"],
+  ["rabbit", "兔子", "Rabbit face/3D/rabbit_face_3d.png"],
+  ["frog", "青蛙", "Frog/3D/frog_3d.png"],
+  ["octopus", "章鱼", "Octopus/3D/octopus_3d.png"],
+  ["chick", "小鸡", "Baby chick/3D/baby_chick_3d.png"],
+  ["duck", "鸭子", "Duck/3D/duck_3d.png"],
+  ["dolphin", "海豚", "Dolphin/3D/dolphin_3d.png"],
+  ["otter", "水獭", "Otter/3D/otter_3d.png"],
+  ["unicorn", "独角兽", "Unicorn/3D/unicorn_3d.png"],
+  ["dino", "恐龙", "Sauropod/3D/sauropod_3d.png"],
+  ["robot", "机器人", "Robot/3D/robot_3d.png"],
+  ["ghost", "小幽灵", "Ghost/3D/ghost_3d.png"],
+];
+
+function agentPetPreviewImage(image: string, customImageUrl: string) {
+  if (image === "custom") {
+    return /^https:\/\//.test(customImageUrl)
+      ? { status: "ok", image: customImageUrl }
+      : { status: "failed", message: "自定义图片只支持 https:// 地址" };
+  }
+  const entry = agentPetCatalog.find(([id]) => id === image);
+  if (!entry) return { status: "failed", message: `未知的内置桌宠图片：${image}` };
+  const path = entry[2].split("/").map(encodeURIComponent).join("/");
+  return { status: "ok", image: `https://cdn.jsdelivr.net/gh/microsoft/fluentui-emoji@1ffb34c752ecf5d402f04cfb4b392c77f57c54bc/assets/${path}` };
+}
 
 const overview = ok({
   codex_app: { status: "found", path: "/Applications/Codex.app" },
@@ -303,6 +341,8 @@ export async function invoke<T = unknown>(command: string, args: Record<string, 
     case "load_gateway": return gateway as T;
     case "scan_agent_cache": return ok({ report: agentCacheReport }) as T;
     case "fetch_provider_models": return ok({ models: ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"], endpoint: "https://api.anthropic.com/v1/models" }) as T;
+    case "agent_pet_catalog": return agentPetCatalog.map(([id, name]) => ({ id, name })) as T;
+    case "agent_pet_image": return agentPetPreviewImage(String(args.image ?? ""), String(args.customImageUrl ?? "")) as T;
     case "lookup_model_prices": return ok({ source: "models.dev", fetchedAtMs: Date.now(), prices: ((args.models as string[]) ?? []).map((model) => ({ model, price: { providerId: "anthropic", providerName: "Anthropic", modelId: model, currency: "USD", input: 3, cachedInput: 0.3, output: 15, context: 200000 } })) }) as T;
     case "list_installed_skills":
     case "refresh_skill_catalog": return demoSkills as T;

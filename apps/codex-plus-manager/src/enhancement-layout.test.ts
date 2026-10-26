@@ -26,12 +26,8 @@ test("feature switch cards keep their own height and expanded blocks take a full
     /grid-column:\s*1\s*\/\s*-1/,
   );
 
-  // 回归前提：该配置块在「挂件与桌宠」里排在开关卡之后，才能落到单独一行。
-  const whaleGroup = app.slice(app.indexOf('t("挂件与桌宠")'), app.indexOf('</FeatureGroup>', app.indexOf('t("挂件与桌宠")')));
-  assert.match(whaleGroup, /<FeatureToggle[^>]*t\("Codex 用量挂件"\)/);
-  assert.match(whaleGroup, /<WhaleBalanceSettingsFields/);
-  assert.ok(
-    whaleGroup.indexOf("<WhaleBalanceSettingsFields") > whaleGroup.indexOf('t("活动进度条右侧布局")'),
-    "余额配置块必须排在开关卡之后，否则会在网格里留下空洞",
-  );
+  // 原「Codex 用量挂件」（含余额配置）已移出增强页，改为独立的「Agent 桌宠」页。
+  const petGroup = app.slice(app.indexOf('t("桌宠与活动")'), app.indexOf('</FeatureGroup>', app.indexOf('t("桌宠与活动")')));
+  assert.ok(petGroup.length > 0);
+  assert.doesNotMatch(petGroup, /Codex 用量挂件|WhaleBalanceSettingsFields/);
 });

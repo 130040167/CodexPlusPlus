@@ -57,6 +57,7 @@ import {
   FolderOpen,
   Moon,
   MousePointerClick,
+  PawPrint,
   Network,
   Power,
   PowerOff,
@@ -129,7 +130,8 @@ import { SkillsPage } from "./ManagementExtra";
 import { ProjectSessionPage } from "./ProjectSessionPage";
 import { ENHANCEMENT_SECTION_IDS, managerNavigationDestination, type EnhancementTab, type ManagerNavigationIntent } from "./enhancement-navigation";
 import { DEFAULT_AUTO_COMPACT_PERCENT, autoCompactOptions, normalizeAutoCompactPercent } from "./auto-compact";
-import { defaultWhaleBalanceSettings, normalizeWhaleBalanceSettings, whaleBalanceSettingsIssue, type WhaleBalanceIssue, type WhaleBalanceProtocol, type WhaleBalanceSettings } from "./whale-settings";
+import { agentPetSettingsIssue, defaultAgentPetSettings, normalizeAgentPetSettings, type AgentPetIssue, type AgentPetSettings } from "./agent-pet-settings";
+import { AgentPetPage } from "./AgentPetPage";
 import {
   applyDictationPreset,
   defaultDictationSettings,
@@ -355,8 +357,10 @@ type MultiLaunchInstancesResult = CommandResult<{
   instances: MultiLaunchInstance[];
 }>;
 
-type BackendSettings = WhaleBalanceSettings & {
+type BackendSettings = {
   revision?: string;
+  /** Agent 桌宠（与 Rust `agent_pet` 对应）。 */
+  agentPet: AgentPetSettings;
   codexAppPath: string;
   /** 自动接管官方 App（与 Rust `codex_app_auto_takeover` 对应）。 */
   codexAppAutoTakeover: boolean;
@@ -1202,7 +1206,7 @@ type ToolId = string;
 /** Codex++ 自己的 logo：与应用图标（src-tauri/icons/icon.png）同一张图。 */
 const APP_LOGO_URL = new URL("./assets/codex-plus-logo.png", import.meta.url).href;
 
-type Route = "overview" | "relay" | "multiLaunch" | "claude" | "relayEnvironment" | "requestLog" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "computerUse" | "hub" | "gateway" | "gatewayProviders" | "gatewayRouting" | "gatewayUsage" | "gatewaySettings" | "maintenance" | "about" | "settings" | "agentSettings";
+type Route = "overview" | "relay" | "multiLaunch" | "claude" | "relayEnvironment" | "requestLog" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "computerUse" | "agentPet" | "hub" | "gateway" | "gatewayProviders" | "gatewayRouting" | "gatewayUsage" | "gatewaySettings" | "maintenance" | "about" | "settings" | "agentSettings";
 type Theme = "dark" | "light";
 
 const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
@@ -1237,6 +1241,8 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   // 跨客户端协作属于应用级能力，各工具下共用同一组任务。
   { id: "agentCollaboration", get label() { return t("Agent 协作"); }, icon: GitBranch, badge: "实验" },
   { id: "computerUse", get label() { return t("Computer Use"); }, icon: MousePointerClick, badge: "实验" },
+  // 桌宠服务所有 Agent（目前只接入了 Codex），与具体 Agent 无关，放在「工具」里。
+  { id: "agentPet", get label() { return t("Agent 桌宠"); }, icon: PawPrint },
   // 网关：任意 Agent 经 Codex++ 接入任意供应商，与具体 Agent 无关，是应用级页面。
   { id: "hub", get label() { return t("总览"); }, icon: Waypoints },
   { id: "gateway", get label() { return t("Agent 接入"); }, icon: Plug },
@@ -1276,13 +1282,13 @@ const lastAgentRoute = new Map<string, Route>();
  * Computer Use 同时接入 Claude Code / Claude Desktop / DSH 等多个客户端，不属于任何一个 Agent，
  * 所以和 Agent 协作一样放在「工具」里，而不是重复出现在每个 Agent 的「扩展」分组里。
  */
-const globalNavigationRoutes: Route[] = ["hub", "gateway", "gatewayProviders", "gatewayRouting", "gatewayUsage", "gatewaySettings", "requestLog", "sessions", "context", "skills", "computerUse", "agentCollaboration", "agentCache", "recommendations", "about", "settings"];
+const globalNavigationRoutes: Route[] = ["hub", "gateway", "gatewayProviders", "gatewayRouting", "gatewayUsage", "gatewaySettings", "requestLog", "sessions", "context", "skills", "computerUse", "agentPet", "agentCollaboration", "agentCache", "recommendations", "about", "settings"];
 /** 侧栏「网关」分组：任意 Agent 经 Codex++ 接入任意供应商。 */
 const gatewayNavigationRoutes: Route[] = ["hub", "gateway", "gatewayProviders", "gatewayRouting", "gatewayUsage", "gatewaySettings"];
 /** 侧栏「全局管理」分组：同时管理所有 Agent 的请求日志、会话、MCP 与 Skills。 */
 const managementNavigationRoutes: Route[] = ["requestLog", "sessions", "context", "skills"];
 /** 侧栏「工具」分组：服务所有 Agent，但与供应商无关。关于、整体设置放在侧栏底部。 */
-const toolNavigationRoutes: Route[] = ["computerUse", "agentCollaboration", "agentCache", "recommendations"];
+const toolNavigationRoutes: Route[] = ["computerUse", "agentPet", "agentCollaboration", "agentCache", "recommendations"];
 /** 网关的各个页签由侧栏直接选中，页内不再显示标签条。 */
 const gatewayTabByRoute: Partial<Record<Route, GatewayTab>> = {
   gateway: "agents",
@@ -1302,7 +1308,7 @@ const agentHomeRoute: Record<string, Route> = { codex: "overview", claude: "clau
 const agentEntryRoute = (toolId: ToolId) => agentTarget(agentRoutes(toolId), lastAgentRoute.get(toolId), agentHomeRoute[toolId] ?? "overview");
 
 const defaultSettings: BackendSettings = {
-  ...defaultWhaleBalanceSettings(),
+  agentPet: defaultAgentPetSettings(),
   codexAppPath: "",
   codexAppAutoTakeover: false,
   codexAppAutoTakeoverWhenActive: "defer",
@@ -2931,9 +2937,9 @@ export function App() {
 
   const saveSettings = async () => {
     const next = normalizeSettings(settingsForm);
-    const whaleIssue = whaleBalanceValidationMessage(whaleBalanceSettingsIssue(next));
-    if (whaleIssue) {
-      showNotice(t("Codex 用量挂件"), whaleIssue, "failed");
+    const petIssue = agentPetValidationMessage(agentPetSettingsIssue(next.agentPet));
+    if (petIssue) {
+      showNotice(t("Agent 桌宠"), petIssue, "failed");
       return;
     }
     const dictationIssue = dictationSettingsValidationMessage(dictationSettingsIssue(next.dictation));
@@ -2953,9 +2959,9 @@ export function App() {
 
   const saveSettingsValue = async (next: BackendSettings, silent = true) => {
     const normalized = normalizeSettings(next);
-    const whaleIssue = whaleBalanceValidationMessage(whaleBalanceSettingsIssue(normalized));
-    if (whaleIssue) {
-      showNotice(t("Codex 用量挂件"), whaleIssue, "failed");
+    const petIssue = agentPetValidationMessage(agentPetSettingsIssue(normalized.agentPet));
+    if (petIssue) {
+      showNotice(t("Agent 桌宠"), petIssue, "failed");
       return null;
     }
     const dictationIssue = dictationSettingsValidationMessage(dictationSettingsIssue(normalized.dictation));
@@ -2982,7 +2988,7 @@ export function App() {
   /// 草稿仍是「有修改」，由页面下一轮再存。
   const autoSaveSettings = async (snapshot: BackendSettings): Promise<AutoSaveOutcome> => {
     const normalized = normalizeSettings(snapshot);
-    const issue = whaleBalanceValidationMessage(whaleBalanceSettingsIssue(normalized))
+    const issue = agentPetValidationMessage(agentPetSettingsIssue(normalized.agentPet))
       || dictationSettingsValidationMessage(dictationSettingsIssue(normalized.dictation));
     if (issue) return { status: "invalid", message: issue };
     try {
@@ -4480,6 +4486,13 @@ export function App() {
           {route === "agentCache" ? <AgentCachePanel /> : null}
           {route === "agentCollaboration" ? <AgentCollaborationPage /> : null}
           {route === "computerUse" ? <ComputerUsePage /> : null}
+          {route === "agentPet" ? (
+            <AgentPetPage
+              settings={settingsForm.agentPet}
+              onChange={(agentPet) => setSettingsForm((current) => ({ ...current, agentPet }))}
+              autoSave={<SettingsAutoSave dirty={settingsDirty} form={settingsForm} actions={actions} />}
+            />
+          ) : null}
           {route === "hub" ? (
             <HubOverview
               codex={{ running: codexAppRunning, providerName: toolEntries.find((entry) => entry.id === "codex")?.activeRelayName ?? null }}
@@ -7215,59 +7228,9 @@ function envConflictSourceLabel(source: string): string {
   return source || t("环境变量");
 }
 
-function whaleBalanceValidationMessage(issue: WhaleBalanceIssue | null): string | null {
-  if (issue === "path") return t("请填写供应商同域下的余额接口路径，不包含网址、查询参数或片段。");
-  if (issue === "field") return t("请填写余额字段路径，例如 data.balance 或 data.accounts[0].balance。");
-  if (issue === "currency") return t("币种请使用三位代码，例如 USD 或 CNY。");
-  if (issue === "scale") return t("金额倍率必须是大于 0 且不超过 1e12 的有限数值。");
+function agentPetValidationMessage(issue: AgentPetIssue | null): string | null {
+  if (issue === "customUrl") return t("自定义图片地址无效，请填写 https:// 开头的图片地址。");
   return null;
-}
-
-function WhaleBalanceSettingsFields({ form, onFormChange }: {
-  form: BackendSettings;
-  onFormChange: (value: BackendSettings) => void;
-}) {
-  if (!form.codexAppWhaleWidgetEnabled) return null;
-  const update = (patch: Partial<WhaleBalanceSettings>) => onFormChange({ ...form, ...patch });
-  const issue = whaleBalanceValidationMessage(whaleBalanceSettingsIssue(normalizeWhaleBalanceSettings(form)));
-  const disabled = !form.enhancementsEnabled;
-  return (
-    <details className="settings-block">
-      <summary>{t("API 余额（可选）")}</summary>
-      <p className="field-hint">{t("跟随 Codex++ 当前供应商查询余额；Codex 订阅额度和本地 token 无需配置此项。")}</p>
-      <Field label={t("余额查询方式")}>
-        <AppSelect<WhaleBalanceProtocol>
-          value={form.codexAppWhaleBalanceProtocol}
-          disabled={disabled}
-          onChange={(value) => update({ codexAppWhaleBalanceProtocol: value })}
-          options={[
-            { value: "auto", label: t("自动识别已支持的接口") },
-            { value: "off", label: t("仅显示 Codex 用量") },
-            { value: "custom", label: t("自定义供应商余额接口") },
-          ]}
-        />
-      </Field>
-      {form.codexAppWhaleBalanceProtocol === "custom" ? <>
-        <p className="field-hint">{t("按供应商文档填写 GET 接口和返回字段，复用当前供应商的 API Key。币种和倍率应与供应商账单一致。")}</p>
-        <Field label={t("余额接口路径")}>
-          <Input disabled={disabled} value={form.codexAppWhaleBalancePath} placeholder="/api/balance" onChange={(event) => update({ codexAppWhaleBalancePath: event.currentTarget.value })} />
-        </Field>
-        <Field label={t("余额字段路径")}>
-          <Input disabled={disabled} value={form.codexAppWhaleBalanceField} placeholder="data.balance" onChange={(event) => update({ codexAppWhaleBalanceField: event.currentTarget.value })} />
-        </Field>
-        <div className="form-row">
-          <Field label={t("余额币种")}>
-            <Input disabled={disabled} maxLength={3} value={form.codexAppWhaleBalanceCurrency} placeholder="USD" onChange={(event) => update({ codexAppWhaleBalanceCurrency: event.currentTarget.value.toUpperCase() })} />
-          </Field>
-          <Field label={t("金额倍率")}>
-            <Input disabled={disabled} type="number" step="any" min={0} value={Number.isFinite(form.codexAppWhaleBalanceScale) ? form.codexAppWhaleBalanceScale : ""} onChange={(event) => update({ codexAppWhaleBalanceScale: event.currentTarget.valueAsNumber })} />
-          </Field>
-        </div>
-        <p className="field-hint">{t("显示金额 = 接口数值 × 倍率；例如接口返回分时，倍率填 0.01。")}</p>
-        {issue ? <p className="field-hint" role="alert">{issue}</p> : null}
-      </> : null}
-    </details>
-  );
 }
 
 type DictationLocalModelState = {
@@ -7832,18 +7795,9 @@ function EnhanceScreen({
                 <FeatureToggle title={t("切换对话保留位置")} detail={t("切换 thread 时恢复上一次浏览位置。")} checked={form.codexAppThreadScrollRestore} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppThreadScrollRestore", value)} />
                 <FeatureToggle title={t("用量状态栏")} detail={t("在输入框下方显示生成速度、缓存命中率和上下文占用。数据来自本机 Codex 会话记录，不改变请求内容。")} checked={form.codexAppUsageStatusLine} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppUsageStatusLine", value)} />
               </FeatureGroup>
-              <FeatureGroup title={t("挂件与桌宠")} detail={t("在 Codex 中查看用量，设置自己的角色和互动方式。")}>
-                <FeatureToggle
-                  title={t("Codex 用量挂件")}
-                  detail={t("原版角色、泡泡编辑器、音效库和提醒，显示 Codex 会话与全机用量。点击角色旁的菜单配置。")}
-                  checked={form.codexAppWhaleWidgetEnabled}
-                  disabled={!masterEnabled}
-                  onChange={(value) => setEnhanceFlag("codexAppWhaleWidgetEnabled", value)}
-                />
+              <FeatureGroup title={t("桌宠与活动")} detail={t("调整 Codex 原生桌宠与活动进度条。可点按的 Agent 桌宠在「工具 → Agent 桌宠」里设置。")}>
                 <FeatureToggle title={t("活动进度条右侧布局")} detail={t("把 Codex 原生活动进度条、状态波形和活动悬浮框移到右侧，并镜像波形方向。")} checked={form.codexAppActivityOverlayRight} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppActivityOverlayRight", value)} />
                 {supportsPetRealMouseLook ? <FeatureToggle title={t("桌宠跟随真实鼠标")} detail={t("仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。")} checked={form.codexAppPetRealMouseLook} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppPetRealMouseLook", value)} /> : null}
-                {/* 余额配置独占一整行（CSS: > .settings-block），展开时不会牵动上面的开关卡。 */}
-                <WhaleBalanceSettingsFields form={form} onFormChange={onFormChange} />
               </FeatureGroup>
               {masterEnabled ? (
                 <StandaloneModeGroup form={form} onFormChange={onFormChange} masterEnabled={masterEnabled} />
@@ -15087,6 +15041,7 @@ function routeSubtitle(route: Route) {
     agentCache: t("扫描 Codex、Claude 与 Codex++ 的已知缓存目录，由你选择清理项目。"),
     agentCollaboration: t("连接 Codex、DeepSeek Harness 与 Claude Code，派发任务并查看结果。"),
     computerUse: t("复用 Codex 的 Computer Use，通过 MCP 接给 Claude Code、Claude Desktop 与 Codex。"),
+    agentPet: t("在 Agent 窗口里放一个可拖动的小角色，点一下压扁回弹，带按压音效"),
     hub: t("任意 Agent 经 Codex++ 接入任意供应商：谁在用、走哪家、是否健康，一屏看全"),
     gateway: t("选择哪些 Agent 经 Codex++ 网关接入，以及它们默认用哪个模型"),
     gatewayProviders: t("所有接入的 Agent 共用的供应商池，支持多 Key 轮换"),
@@ -15860,7 +15815,8 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
   return syncLegacyRelayFields({
     ...defaultSettings,
     ...settings,
-    ...normalizeWhaleBalanceSettings(settings),
+    // 旧版「Codex 用量挂件」开着、还没有桌宠设置的用户，升级后桌宠保持开启。
+    agentPet: normalizeAgentPetSettings(settings.agentPet, (settings as { codexAppWhaleWidgetEnabled?: unknown }).codexAppWhaleWidgetEnabled === true),
     ccsDbPath: (settings.ccsDbPath || "").trim(),
     dictation: normalizeDictationSettings(settings.dictation),
     codexAppTypingEffect: normalizeTypingEffect(settings.codexAppTypingEffect),
