@@ -290,3 +290,10 @@ test("首次使用引导：首次启动自动打开（预览模式除外），�
     assert.ok(anchored, `引导目标 ${target} 在侧栏里没有锚点`);
   }
 });
+
+test("设置页「版本与更新」：已是最新时不显示旧版本的安装包和说明；有新版本时说明收进可展开区", () => {
+  const about = functionSource("AboutScreen");
+  assert.match(about, /update\?\.updateAvailable && update\.assetName \?/);
+  assert.match(about, /\{update\?\.updateAvailable && update\.releaseSummary \? \(\n\s*<details className="app-update-notes">/);
+  assert.doesNotMatch(about, /<Metric label=\{t\("状态"\)\}/);
+});

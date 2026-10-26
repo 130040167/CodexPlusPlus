@@ -2262,6 +2262,7 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "{0} 更新说明": "What's new in {0}",
   "{0} / {1}": "{0} / {1}",
   "有新版本 {0}": "Version {0} available",
   "用网关供应商池里的 {0} 个模型；要切回旧版供应商，先断开并还原": "Uses {0} models from the gateway pool; disconnect and restore to switch back to legacy providers",

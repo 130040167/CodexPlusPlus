@@ -13488,3 +13488,145 @@ button.side-item:hover {
 .shell .app-settings-page .app-settings-anchor :is(textarea, pre) {
   max-height: 280px;
 }
+
+/* ── 设置页（含原「关于」）：卡片统一成「标题栏 + 分隔线列表」，行距、字号、按钮与增强页一致 ── */
+.shell .app-settings-page .panel > .p-4:not(.panel-head) {
+  padding: 0;
+}
+.shell .app-settings-page .global-settings-list {
+  padding: 0;
+}
+.shell .app-settings-page .global-setting-row {
+  gap: 16px;
+  padding: 11px 14px;
+}
+.shell .app-settings-page .global-setting-copy {
+  gap: 2px;
+}
+.shell .app-settings-page .global-setting-copy span {
+  line-height: 1.5;
+}
+.shell .app-settings-page .global-setting-path {
+  display: inline-block;
+  width: fit-content;
+  max-width: 100%;
+  margin: 3px 0 2px;
+  padding: 1px 6px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 5px;
+  background: hsl(var(--surface-sunken));
+  font-size: 11px;
+}
+.shell .app-settings-page .global-setting-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+/* 版本与更新 */
+.shell .app-settings-page .app-update-summary {
+  padding: 12px 14px;
+}
+.shell .app-settings-page .app-update-notes {
+  margin: 0 14px 12px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+}
+.shell .app-settings-page .app-update-notes > summary {
+  padding: 8px 12px;
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+  cursor: pointer;
+}
+.shell .app-settings-page .app-update-notes[open] > summary {
+  border-bottom: 1px solid hsl(var(--border));
+}
+.shell .app-settings-page .app-update-notes > :not(summary) {
+  max-height: 260px;
+  overflow: auto;
+  margin: 0;
+  padding: 10px 14px;
+  border: 0;
+  background: transparent;
+  font-size: 12.5px;
+}
+.shell .app-settings-page .app-update-notes :is(h1, h2) {
+  font-size: 14px;
+}
+.shell .app-settings-page .app-update-notes h3 {
+  font-size: 13px;
+}
+.shell .app-settings-page .task-progress {
+  margin: 0 14px 12px;
+}
+
+/* 关于 */
+/* 内容区本身就是 .app-about：要压过上面「内容区内边距清零」那条，所以选择器写全 */
+.shell .app-settings-page .panel > .p-4.app-about {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+  padding: 12px 14px;
+}
+.shell .app-settings-page .app-about-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 28px;
+  margin: 0;
+}
+.shell .app-settings-page .app-about-facts > div {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.shell .app-settings-page .app-about-facts dt {
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+}
+.shell .app-settings-page .app-about-facts dd {
+  margin: 0;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+}
+.shell .app-settings-page .app-about-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: hsl(var(--brand-accent));
+  font: inherit;
+  cursor: pointer;
+}
+.shell .app-settings-page .app-about-link:hover {
+  text-decoration: underline;
+}
+.shell .app-settings-page .app-about-links {
+  display: flex;
+  gap: 6px;
+}
+
+/* 日志、诊断：内容区留边，工具栏贴在下方，诊断报告限高 */
+.shell .app-settings-page .app-settings-anchor .panel > .p-4:not(.panel-head) {
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+}
+.shell .app-settings-page .app-settings-anchor .field-hint {
+  margin: 0;
+}
+.shell .app-settings-page .app-settings-anchor .log-lines {
+  max-height: 240px;
+}
+.shell .app-settings-page .app-settings-anchor .log-view.tall {
+  min-height: 160px;
+  height: 220px;
+  max-height: 220px;
+}
+.shell .app-settings-page .app-settings-anchor .empty {
+  padding: 14px;
+}

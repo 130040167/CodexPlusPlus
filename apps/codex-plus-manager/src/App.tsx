@@ -9889,7 +9889,7 @@ function AboutScreen({
                   : update?.latestVersion
                     ? t("已是最新版本")
                     : t("尚未检查更新")}
-                {update?.assetName ? ` · ${update.assetName}` : ""}
+                {update?.updateAvailable && update.assetName ? ` · ${update.assetName}` : ""}
               </span>
             </div>
             <div className="app-update-actions">
@@ -9901,35 +9901,44 @@ function AboutScreen({
               ) : null}
             </div>
           </div>
-          {update?.releaseSummary ? <ReleaseNotes markdown={update.releaseSummary} onOpenUrl={(url) => void actions.openExternalUrl(url)} /> : null}
+          {update?.updateAvailable && update.releaseSummary ? (
+            <details className="app-update-notes">
+              <summary>{tf("{0} 更新说明", [update.latestVersion ?? ""])}</summary>
+              <ReleaseNotes markdown={update.releaseSummary} onOpenUrl={(url) => void actions.openExternalUrl(url)} />
+            </details>
+          ) : null}
           <TaskProgressBox completedTitle={t("上次更新结果")} progress={updateInstallProgress} title={t("安装包更新进度")} />
         </CardContent>
       </Panel>
       <Panel id="app-settings-about">
         <CardHead title={t("关于 Codex++")} detail={t("本地 Codex 增强、管理工具和安装包维护")} />
-        <CardContent>
-          <div className="metric-list">
-            <Metric label={t("Codex 版本")} value={overview?.codex_version ?? t("未检测到")} />
-            <Metric label={t("项目地址")} value="github.com/BigPizzaV3/CodexPlusPlus" />
-          </div>
-          <Toolbar>
-            <Button onClick={() => void actions.openExternalUrl("https://github.com/BigPizzaV3/CodexPlusPlus")} variant="secondary">
-              <ExternalLink className="h-4 w-4" />
-              {t("打开项目主页")}
-            </Button>
-            <Button onClick={() => void actions.openExternalUrl("https://github.com/BigPizzaV3/CodexPlusPlus/issues")} variant="secondary">
-              <ExternalLink className="h-4 w-4" />
+        <CardContent className="app-about">
+          <dl className="app-about-facts">
+            <div><dt>{t("Codex 版本")}</dt><dd>{overview?.codex_version ?? t("未检测到")}</dd></div>
+            <div>
+              <dt>{t("项目地址")}</dt>
+              <dd>
+                <button className="app-about-link" onClick={() => void actions.openExternalUrl("https://github.com/BigPizzaV3/CodexPlusPlus")} type="button">
+                  github.com/BigPizzaV3/CodexPlusPlus
+                  <ExternalLink aria-hidden="true" className="h-3 w-3" />
+                </button>
+              </dd>
+            </div>
+          </dl>
+          <div className="app-about-links">
+            <Button onClick={() => void actions.openExternalUrl("https://github.com/BigPizzaV3/CodexPlusPlus/issues")} size="sm" variant="secondary">
+              <ExternalLink className="h-3.5 w-3.5" />
               {t("反馈问题")}
             </Button>
-            <Button onClick={() => void actions.openExternalUrl("https://discord.gg/y96kX7A76v")} variant="secondary">
-              <MessageCircle className="h-4 w-4" />
+            <Button onClick={() => void actions.openExternalUrl("https://discord.gg/y96kX7A76v")} size="sm" variant="secondary">
+              <MessageCircle className="h-3.5 w-3.5" />
               Discord
             </Button>
-            <Button onClick={() => void actions.openExternalUrl("https://t.me/CodexPlusPlus")} variant="secondary">
-              <MessageCircle className="h-4 w-4" />
+            <Button onClick={() => void actions.openExternalUrl("https://t.me/CodexPlusPlus")} size="sm" variant="secondary">
+              <MessageCircle className="h-3.5 w-3.5" />
               Telegram
             </Button>
-          </Toolbar>
+          </div>
         </CardContent>
       </Panel>
       <div className="app-settings-anchor" id="app-settings-logs"><LogsPanel logs={logs} actions={actions} /></div>
@@ -10094,7 +10103,7 @@ function GlobalSettingsScreen({
               <span>{t("当前为")}{theme === "dark" ? t("深色") : t("浅色")}{t("模式。")}</span>
             </div>
             <div className="global-setting-actions">
-              <Button variant="secondary" onClick={actions.toggleTheme}>{t("切换主题")}</Button>
+              <Button size="sm" variant="secondary" onClick={actions.toggleTheme}>{t("切换主题")}</Button>
             </div>
           </div>
           <div className="global-setting-row">
@@ -10103,7 +10112,7 @@ function GlobalSettingsScreen({
               <span>{t("一步步认识网关、供应商池、Agent 接入和各个入口。")}</span>
             </div>
             <div className="global-setting-actions">
-              <Button variant="secondary" onClick={onOpenTour}>{t("重新打开引导")}</Button>
+              <Button size="sm" variant="secondary" onClick={onOpenTour}>{t("重新打开引导")}</Button>
             </div>
           </div>
           <div className="global-setting-row">
@@ -10112,7 +10121,7 @@ function GlobalSettingsScreen({
               <span>{t("图片覆盖层、启动参数等只作用于 Codex 的选项，在 Codex 菜单的「设置」里。")}</span>
             </div>
             <div className="global-setting-actions">
-              <Button variant="secondary" onClick={onOpenAgentSettings}>{t("打开 Codex 设置")}</Button>
+              <Button size="sm" variant="secondary" onClick={onOpenAgentSettings}>{t("打开 Codex 设置")}</Button>
             </div>
           </div>
         </CardContent>
@@ -10126,8 +10135,8 @@ function GlobalSettingsScreen({
               <span>{t("导出文件包含供应商 API Key 等敏感信息；导入只会读入草稿，检查后仍需点击保存设置。")}</span>
             </div>
             <div className="global-setting-actions">
-              <Button variant="secondary" onClick={() => void actions.exportSettings()}>{t("导出完整配置")}</Button>
-              <Button variant="secondary" onClick={() => void actions.importSettings()}>{t("导入配置草稿")}</Button>
+              <Button size="sm" variant="secondary" onClick={() => void actions.exportSettings()}>{t("导出完整配置")}</Button>
+              <Button size="sm" variant="secondary" onClick={() => void actions.importSettings()}>{t("导入配置草稿")}</Button>
             </div>
           </div>
           <div className="global-setting-row">
@@ -10137,8 +10146,8 @@ function GlobalSettingsScreen({
               <span>{t("只迁移 settings.json；日志、备份、Skills 和运行状态仍留在原状态目录。更换后建议重新打开管理器。")}</span>
             </div>
             <div className="global-setting-actions">
-              <Button variant="secondary" onClick={() => void actions.chooseSettingsPath()}>{t("选择路径")}</Button>
-              <Button variant="secondary" onClick={() => void actions.resetSettingsPath()}>{t("恢复默认路径")}</Button>
+              <Button size="sm" variant="secondary" onClick={() => void actions.chooseSettingsPath()}>{t("选择路径")}</Button>
+              <Button size="sm" variant="secondary" onClick={() => void actions.resetSettingsPath()}>{t("恢复默认路径")}</Button>
             </div>
           </div>
         </CardContent>
@@ -10172,11 +10181,11 @@ function LogsPanel({ logs, actions }: { logs: LogsResult | null; actions: Action
           )}
         </div>
         <Toolbar>
-          <Button onClick={() => void actions.refreshLogs()}>{t("刷新")}</Button>
-          <Button variant="secondary" onClick={() => void actions.clearLogs()}>
+          <Button onClick={() => void actions.refreshLogs()} size="sm" variant="secondary">{t("刷新")}</Button>
+          <Button size="sm" variant="secondary" onClick={() => void actions.clearLogs()}>
             {t("清理日志")}
           </Button>
-          <Button variant="secondary" onClick={() => void actions.copyLogs()}>
+          <Button size="sm" variant="secondary" onClick={() => void actions.copyLogs()}>
             {t("复制")}
           </Button>
         </Toolbar>
@@ -10192,8 +10201,8 @@ function DiagnosticsPanel({ diagnostics, actions }: { diagnostics: DiagnosticsRe
       <CardContent>
         <Textarea className="log-view tall" readOnly value={diagnostics?.report ?? t("尚未生成诊断报告。")} />
         <Toolbar>
-          <Button onClick={() => void actions.refreshDiagnostics()}>{t("重新生成")}</Button>
-          <Button variant="secondary" onClick={() => void actions.copyDiagnostics()}>
+          <Button onClick={() => void actions.refreshDiagnostics()} size="sm" variant="secondary">{t("重新生成")}</Button>
+          <Button size="sm" variant="secondary" onClick={() => void actions.copyDiagnostics()}>
             {t("复制报告")}
           </Button>
         </Toolbar>
