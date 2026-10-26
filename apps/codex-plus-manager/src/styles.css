@@ -13062,3 +13062,41 @@ button.side-item:hover {
 .shell .codex-settings-page .panel .switch-row:last-of-type {
   border-bottom: 0;
 }
+
+/* 微信连接：左侧目录；表单分区标题在上、字段两列排布，输入框不再拉满整行 */
+.shell .weixin-connect-page .weixin-form-section {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  padding: 14px 16px;
+  scroll-margin-top: 8px;
+}
+.shell .weixin-connect-page .weixin-form-section-title {
+  min-height: 0;
+}
+.shell .weixin-connect-page .weixin-form-fields {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 14px;
+  width: 100%;
+}
+.shell .weixin-connect-page .weixin-form-fields > .field:has(.weixin-path-row, .weixin-field-hint, textarea) {
+  grid-column: 1 / -1;
+}
+.shell .weixin-connect-page .weixin-connect-form :is(input, .field-select) {
+  height: 32px;
+}
+@media (max-width: 900px) {
+  .shell .weixin-connect-page .weixin-form-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.shell .weixin-connect-page .weixin-status-panel h2 {
+  font-size: 15px;
+  font-weight: 600;
+}
+.shell .weixin-connect-page .weixin-connect-form :is(.weixin-path-row button, select) {
+  height: 32px;
+  min-height: 32px;
+}
+.shell .weixin-connect-page .weixin-connect-form .weixin-path-row button[title] {
+  width: 32px;
+}

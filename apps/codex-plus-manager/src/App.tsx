@@ -5084,8 +5084,15 @@ function WeixinConnectScreen({
   }[runtimeState] ?? runtimeState;
 
   return (
-    <div className="weixin-connect-page">
-      <Panel className={`weixin-status-panel is-${runtimeState}`}>
+    <div className="weixin-connect-page sectioned-page">
+      <PageSectionNav label={t("微信连接分类")} sections={[
+        { id: "weixin-section-status", label: t("连接状态") },
+        { id: "weixin-section-account", label: t("账号") },
+        { id: "weixin-section-session", label: t("会话管理") },
+        { id: "weixin-section-cli", label: "Codex CLI" },
+      ]} />
+      <div className="sectioned-body">
+      <Panel className={`weixin-status-panel is-${runtimeState}`} id="weixin-section-status">
         <CardContent className="weixin-status-content">
           <div className="weixin-connect-head">
             <div className="weixin-status-primary">
@@ -5173,7 +5180,7 @@ function WeixinConnectScreen({
           </div>
         </CardHeader>
         <CardContent className="weixin-connect-form">
-          <section className="weixin-form-section">
+          <section className="weixin-form-section" id="weixin-section-account">
             <div className="weixin-form-section-title">
               <KeyRound className="h-4 w-4" />
               <strong>{t("账号")}</strong>
@@ -5228,7 +5235,7 @@ function WeixinConnectScreen({
             </div>
           </section>
 
-          <section className="weixin-form-section">
+          <section className="weixin-form-section" id="weixin-section-session">
             <div className="weixin-form-section-title">
               <MessageCircle className="h-4 w-4" />
               <strong>{t("会话管理")}</strong>
@@ -5290,7 +5297,7 @@ function WeixinConnectScreen({
             </div>
           </section>
 
-          <section className="weixin-form-section">
+          <section className="weixin-form-section" id="weixin-section-cli">
             <div className="weixin-form-section-title">
               <Settings className="h-4 w-4" />
               <strong>Codex CLI</strong>
@@ -5325,6 +5332,7 @@ function WeixinConnectScreen({
           </section>
         </CardContent>
       </Panel>
+      </div>
     </div>
   );
 }
