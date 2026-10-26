@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { createContext, runInContext } from "node:vm";
 import { agentPetSettingsIssue, defaultAgentPetSettings, normalizeAgentPetSettings } from "./agent-pet-settings.ts";
+import { agentPetReleaseDelay } from "./agent-pet-sound.ts";
 
 /**
  * Agent 桌宠：设置规范化、Codex 里的运行时（挂载 / 压扁回弹 / 取图 / 卸载）以及管理器页面接线。
@@ -147,4 +148,16 @@ test("管理器：Agent 桌宠是「工具」里的独立页面，图库与图�
   assert.match(page, /invoke<CatalogEntry\[\]>\("agent_pet_catalog"\)/);
   assert.match(page, /invoke<ImageResult>\("agent_pet_image", \{ image, customImageUrl \}\)/);
   assert.doesNotMatch(app, /WhaleBalance|whale-settings|t\("Codex 用量挂件"\)/);
+});
+
+test("试听与 Codex 同一套衔接：点按时松开音排到按压音结束前 40ms，按住超过时长则立即播放", () => {
+  assert.ok(Math.abs(agentPetReleaseDelay(1, 0.3, 1.05) - 0.21) < 1e-9);
+  assert.equal(agentPetReleaseDelay(1, 0.3, 2), 0);
+  assert.match(fragment, /const codexPlusAgentPetReleaseLeadMs = 40;/);
+});
+
+test("管理器：音效由后端提供，预览按住会出声，并有试听按钮", () => {
+  assert.match(page, /invoke<AgentPetSoundSources>\("agent_pet_sounds"\)/);
+  assert.match(page, /<PetPreview [^>]*onPress=\{pressSound\} onRelease=\{releaseSound\}/);
+  assert.match(page, /player\.preview\(settings\.soundSet, settings\.volume\)/);
 });

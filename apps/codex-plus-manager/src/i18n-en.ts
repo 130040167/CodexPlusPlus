@@ -6,6 +6,7 @@
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
   // Agent 桌宠
+  "试听": "Preview sound",
   "Agent 桌宠": "Agent pet",
   "在 Agent 窗口里放一个可拖动的小角色，点一下压扁回弹，带按压音效": "A draggable little character in your agent window that squishes when clicked, with press sounds",
   "显示 Agent 桌宠": "Show agent pet",

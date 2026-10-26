@@ -6,7 +6,7 @@
  */
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Check, ImageOff, Link2, Loader2, PawPrint, RefreshCw } from "lucide-react";
+import { Check, ImageOff, Link2, Loader2, PawPrint, RefreshCw, Volume2 } from "lucide-react";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { PageHeader } from "./ManagementPages";
@@ -21,6 +21,7 @@ import {
   type AgentPetSettings,
   type AgentPetSoundSet,
 } from "./agent-pet-settings";
+import { AgentPetSoundPlayer, type AgentPetSoundSources } from "./agent-pet-sound";
 import { t } from "./i18n";
 import "./AgentPetPage.css";
 
@@ -60,6 +61,20 @@ export function AgentPetPage({ settings, onChange, autoSave }: {
   const [previews, setPreviews] = useState<Record<string, PreviewState>>({});
   const [customDraft, setCustomDraft] = useState(settings.customImageUrl);
   const [customPreview, setCustomPreview] = useState<PreviewState | null>(null);
+  // 试听用的音效与 Codex 里是同一份内嵌音频，由后端交给页面。
+  const playerRef = useRef<AgentPetSoundPlayer | null>(null);
+  if (!playerRef.current) playerRef.current = new AgentPetSoundPlayer({});
+  const player = playerRef.current;
+  useEffect(() => {
+    let alive = true;
+    void invoke<AgentPetSoundSources>("agent_pet_sounds").then((sources) => {
+      if (alive) player.setSources(sources);
+    }).catch(() => undefined);
+    return () => { alive = false; player.dispose(); };
+  }, [player]);
+  const soundOn = settings.soundEnabled;
+  const pressSound = () => { if (soundOn) void player.pressDown(settings.soundSet, settings.volume); };
+  const releaseSound = () => { if (soundOn) void player.pressUp(settings.soundSet, settings.volume); };
 
   const loadCatalog = async () => {
     setCatalogError("");
@@ -261,6 +276,7 @@ export function AgentPetPage({ settings, onChange, autoSave }: {
                 <span aria-hidden="true" className="toggle-switch-visual"><span className="toggle-switch-thumb" /></span>
               </label>
               <div className={`agent-pet-sound ${settings.soundEnabled ? "" : "is-off"}`}>
+                <div className="agent-pet-sound-row">
                 <div className="agent-pet-segmented" role="radiogroup" aria-label={t("音效")}>
                   {([["duck", t("小黄鸭")], ["fx1", t("音效 1")]] as Array<[AgentPetSoundSet, string]>).map(([value, label]) => (
                     <button
@@ -270,11 +286,21 @@ export function AgentPetPage({ settings, onChange, autoSave }: {
                       aria-checked={settings.soundSet === value}
                       className={settings.soundSet === value ? "is-selected" : ""}
                       disabled={!settings.soundEnabled}
-                      onClick={() => update({ soundSet: value })}
+                      onClick={() => { update({ soundSet: value }); void player.preview(value, settings.volume); }}
                     >
                       {label}
                     </button>
                   ))}
+                </div>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={!settings.soundEnabled || settings.volume <= 0}
+                  onClick={() => void player.preview(settings.soundSet, settings.volume)}
+                >
+                  <Volume2 className="h-4 w-4" />
+                  {t("试听")}
+                </Button>
                 </div>
                 <label className="agent-pet-range">
                   <span>{t("音量")}</span>
@@ -298,7 +324,7 @@ export function AgentPetPage({ settings, onChange, autoSave }: {
           <span className="agent-pet-preview-label">{t("预览 · 按住试试")}</span>
           <div className="agent-pet-stage">
             {selectedPreview?.state === "ok" ? (
-              <PetPreview image={selectedPreview.image} size={settings.size} />
+              <PetPreview image={selectedPreview.image} size={settings.size} onPress={pressSound} onRelease={releaseSound} />
             ) : selectedPreview?.state === "failed" ? (
               <span className="agent-pet-muted"><ImageOff className="h-5 w-5" /> {selectedPreview.message}</span>
             ) : (
@@ -313,16 +339,23 @@ export function AgentPetPage({ settings, onChange, autoSave }: {
 }
 
 /** 预览里的压扁回弹与 Codex 里一致：以底边为支点，按下压扁，松开弹回。 */
-function PetPreview({ image, size }: { image: string; size: number }) {
+function PetPreview({ image, size, onPress, onRelease }: { image: string; size: number; onPress: () => void; onRelease: () => void }) {
   const [pressed, setPressed] = useState(false);
-  const release = () => setPressed(false);
+  // 只在真正按着时触发松开音：pointerup 之后还会收到 lostpointercapture，不能重复播放。
+  const pressedRef = useRef(false);
+  const release = () => {
+    if (!pressedRef.current) return;
+    pressedRef.current = false;
+    setPressed(false);
+    onRelease();
+  };
   return (
     <button
       type="button"
       className={`agent-pet-figure ${pressed ? "is-pressed" : ""}`}
       style={{ width: size, height: size }}
       aria-label={t("按住预览压扁效果")}
-      onPointerDown={(event) => { event.currentTarget.setPointerCapture(event.pointerId); setPressed(true); }}
+      onPointerDown={(event) => { event.currentTarget.setPointerCapture(event.pointerId); pressedRef.current = true; setPressed(true); onPress(); }}
       onPointerUp={release}
       onPointerCancel={release}
       onLostPointerCapture={release}

@@ -20,7 +20,8 @@ const AGENT_PET_SOUNDS: &[(&str, &[u8], &[u8])] = &[
     ),
 ];
 
-fn agent_pet_sounds_json() -> String {
+/// 全部音效组：`{ 组名: { press, release } }`，值为 data URI。管理器试听与 Codex 注入共用。
+pub fn agent_pet_sounds() -> Value {
     let values: serde_json::Map<String, Value> = AGENT_PET_SOUNDS
         .iter()
         .map(|(name, press, release)| {
@@ -33,7 +34,11 @@ fn agent_pet_sounds_json() -> String {
             )
         })
         .collect();
-    Value::Object(values).to_string()
+    Value::Object(values)
+}
+
+fn agent_pet_sounds_json() -> String {
+    agent_pet_sounds().to_string()
 }
 
 fn agent_pet_sounds_script() -> String {

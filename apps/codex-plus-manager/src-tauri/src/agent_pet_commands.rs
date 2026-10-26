@@ -23,6 +23,12 @@ pub fn agent_pet_catalog() -> Vec<AgentPetCatalogEntry> {
     agent_pet::catalog()
 }
 
+/// 按压 / 松开音效，供页面试听：`{ duck: { press, release }, fx1: {…} }`，值为 data URI。
+#[tauri::command]
+pub fn agent_pet_sounds() -> serde_json::Value {
+    codex_plus_core::assets::agent_pet_sounds()
+}
+
 /// 取一张桌宠图片做预览。前端 invoke 参数为 `{ image, customImageUrl }`。
 #[tauri::command]
 pub async fn agent_pet_image(image: String, custom_image_url: String) -> AgentPetImageResult {
@@ -50,6 +56,17 @@ fn image_result(result: anyhow::Result<agent_pet::AgentPetImage>) -> AgentPetIma
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sounds_cover_both_sets_with_press_and_release() {
+        let value = agent_pet_sounds();
+        for set in ["duck", "fx1"] {
+            for slot in ["press", "release"] {
+                let uri = value[set][slot].as_str().unwrap();
+                assert!(uri.starts_with("data:audio/mpeg;base64,"), "{set}.{slot}");
+            }
+        }
+    }
 
     #[test]
     fn catalog_serializes_as_id_and_name() {

@@ -302,6 +302,7 @@ pub fn run() {
             provider_lookup_commands::lookup_model_prices,
             agent_pet_commands::agent_pet_catalog,
             agent_pet_commands::agent_pet_image,
+            agent_pet_commands::agent_pet_sounds,
             agent_mcp_commands::load_agent_mcp,
             agent_mcp_commands::save_agent_mcp,
             gateway_commands::load_gateway,

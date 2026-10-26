@@ -187,6 +187,13 @@
   opacity: 0.5;
 }
 
+.agent-pet-sound-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
 .agent-pet-segmented {
   display: inline-flex;
   justify-self: start;
