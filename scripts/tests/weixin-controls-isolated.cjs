@@ -59,13 +59,31 @@ module.exports = {
     const after = await invoke("weixin_connect_projects");
     assert.equal(after.projects.length, 0, "opening/refreshing settings must not create the lazy project");
     check("reserved Weixin project stays first and project/list has no creation side effects");
-    await page.getByRole("button", { name: "保存", exact: true }).click();
-    await page.getByText("已保存，下一条微信消息生效。", { exact: true }).waitFor();
-    const saved = await invoke("load_settings");
+    // 微信页使用通用 SettingsAutoSave；不点击旧的手动保存入口，等待防抖保存
+    // 完成后直接从后端读取，验证下一次打开页面仍保留结果。
+    let saved;
+    const deadline = Date.now() + 10000;
+    do {
+      signal.throwIfAborted();
+      saved = await invoke("load_settings");
+      if (saved.settings.weixinConnectModel === "gpt-6.1-sol"
+        && saved.settings.weixinConnectReasoningEffort === "low") break;
+      await page.waitForTimeout(250);
+    } while (Date.now() < deadline);
     assert.equal(saved.settings.weixinConnectModel, "gpt-6.1-sol");
     assert.equal(saved.settings.weixinConnectReasoningEffort, "low");
     assert.equal(saved.settings.weixinConnectProjectId, "");
-    check("UI save persists selected model, effort, and lazy project identity");
+    check("Weixin settings auto-save persists model, effort, and lazy project identity");
+    await page.getByRole("button", { name: "会话管理", exact: true }).click();
+    await dialogs.manager.ensureClear();
+    await page.getByRole("button", { name: "微信连接", exact: true }).click();
+    await page.locator(".weixin-connect-page").waitFor();
+    await dialogs.manager.ensureClear();
+    const reopenedModel = field("模型");
+    const reopenedEffort = field("推理强度");
+    assert.equal(await reopenedModel.inputValue(), "gpt-6.1-sol");
+    assert.equal(await reopenedEffort.inputValue(), "low");
+    check("Weixin settings remain selected after leaving and reopening the page");
     await project.scrollIntoViewIfNeeded();
     await dialogs.manager.ensureClear();
     await page.screenshot({ path: path.join(outputDir, "weixin-controls.png") });

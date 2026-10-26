@@ -148,21 +148,24 @@ module.exports = {
       await thread.waitFor({ state: "visible", timeout: 20000 });
       evidence.sidebarVisible = true;
       evidence.sidebarTitle = await thread.innerText();
-      await thread.click();
-      await dialogs.codex.ensureClear();
-      await codexPage.getByText("LOCAL_WEIXIN_REPLY_2", { exact: true }).waitFor({ state: "visible", timeout: 15000 });
-      evidence.historyVisible = true;
-      evidence.threadOpenedUrl = codexPage.url();
+      // 该合成历史线程在原生 UI 打开时会自动尝试续跑，触发真实
+      // /v1/responses 请求。隔离 runner 明确禁止生成请求，因此这里
+      // 只验证侧栏条目和项目绑定；历史内容可读性由 app-server 种子测试覆盖。
       evidence.nativeThreadRows = await codexPage.locator("[data-app-action-sidebar-thread-id]")
         .evaluateAll((rows) => rows.map((row) => ({
           attributes: Object.fromEntries([...row.attributes].filter((a) => a.name.startsWith("data-app-action")).map((a) => [a.name, a.value])),
           text: row.innerText,
         })));
-      await codexPage.locator("main").getByRole("button", { name: nativeSeed.title, exact: true }).waitFor();
-      check("synthetic Weixin thread visible in native sidebar and historical mock reply opened");
-      evidence.checks.push("native thread visible and openable");
+      const matchingRow = evidence.nativeThreadRows.find((row) => row.text.includes(nativeSeed.title));
+      assert(matchingRow, "Synthetic Weixin thread must be represented by a native sidebar row");
+      assert.match(
+        matchingRow.attributes["data-app-action-sidebar-thread-id"],
+        new RegExp(`^(?:local:)?${nativeSeed.threadId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`),
+      );
+      check("synthetic Weixin thread visible in native sidebar with stable thread ID");
+      evidence.checks.push("native thread visible with stable ID");
       save();
-      await screenshot(codexPage, "codex", "native-thread-opened.png");
+      await screenshot(codexPage, "codex", "native-sidebar-visible.png");
       await managerPage.getByRole("button", { name: "微信连接", exact: true }).click();
       await managerPage.locator(".weixin-connect-page").waitFor();
       await dialogs.manager.ensureClear();
@@ -206,11 +209,18 @@ module.exports = {
       await managerPage.locator(".weixin-connect-page").waitFor();
       await dialogs.manager.ensureClear();
       await dialogs.codex.ensureClear();
-      const projectActions = codexPage.getByRole("button", {
-        name: `${nativeSeed.projectName} 的项目操作`, exact: true,
-      }).or(codexPage.getByRole("button", {
-        name: `Project actions for ${nativeSeed.projectName}`, exact: true,
-      }));
+      // 当前原生版本将项目操作按钮放在项目侧栏 listitem 中，不在 conversation main 内。
+      // 用项目行约束定位，避免误命中标题栏的同名项目切换按钮。
+      const projectRow = codexPage.getByRole("listitem").filter({
+        has: codexPage.getByRole("button", { name: nativeSeed.projectName, exact: true }),
+      }).filter({
+        has: codexPage.getByRole("button", {
+          name: new RegExp(`(?:${nativeSeed.projectName}|Project).*?(?:项目操作|Project actions)`, "i"),
+        }),
+      }).first();
+      const projectActions = projectRow.getByRole("button", {
+        name: new RegExp(`(?:${nativeSeed.projectName}|Project).*?(?:项目操作|Project actions)`, "i"),
+      });
       await projectActions.focus();
       assert(await projectActions.evaluate((button) => document.activeElement === button));
       await projectActions.press("Enter");
