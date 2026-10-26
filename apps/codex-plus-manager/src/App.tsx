@@ -6585,6 +6585,7 @@ function RelayScreen({
 }) {
   const normalized = normalizeSettings(form);
   const takenOverByGateway = normalized.activeRelayId === CODEX_GATEWAY_RELAY_ID;
+  const legacyLockedHint = t("Codex 正由 Codex++ 网关接管，旧版供应商配置暂不可用；先点「断开并还原」。");
   const [detailProfileId, setDetailProfileId] = useState<string | null>(null);
   const [newProfileDraft, setNewProfileDraft] = useState<RelayProfile | null>(null);
   const [providerCatalogOpen, setProviderCatalogOpen] = useState(false);
@@ -6789,13 +6790,15 @@ function RelayScreen({
         actions={(
           <>
             {/* 总开关很少改动：收成标题栏里的小开关，完整说明放在悬停提示里；关闭时下方另有提示条。 */}
+            {/* Codex 被新版网关接管时，旧版的切换、导入、添加都不起作用，一律禁用；先「断开并还原」。 */}
             <label
               className="switch-row compact relay-master-switch relay-master-switch-compact"
-              title={t("关闭后本工具不会在手动切换时写入 Codex 的 config.toml / auth.json；启动 Codex 时始终不会自动改这些文件。")}
+              title={takenOverByGateway ? legacyLockedHint : t("关闭后本工具不会在手动切换时写入 Codex 的 config.toml / auth.json；启动 Codex 时始终不会自动改这些文件。")}
             >
               <input
                 aria-label={t("启用供应商配置切换")}
                 checked={normalized.relayProfilesEnabled}
+                disabled={takenOverByGateway}
                 onChange={(event) => {
                   const next = { ...normalized, relayProfilesEnabled: event.currentTarget.checked };
                   void saveRelaySettings(next);
@@ -6807,7 +6810,9 @@ function RelayScreen({
             </label>
             <div className="third-party-import" ref={thirdPartyImportTriggerRef}>
               <Button
+                disabled={takenOverByGateway}
                 onClick={openThirdPartyImport}
+                title={takenOverByGateway ? legacyLockedHint : undefined}
                 variant="secondary"
               >
                 <Download className="h-4 w-4" />
@@ -6903,7 +6908,11 @@ function RelayScreen({
                 </div>
               ) : null}
             </div>
-            <Button onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}>
+            <Button
+              disabled={takenOverByGateway}
+              onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}
+              title={takenOverByGateway ? legacyLockedHint : undefined}
+            >
               <Plus className="h-4 w-4" />
               {t("添加供应商")}
             </Button>
@@ -14784,7 +14793,7 @@ function AppSidebar({
   const gatewayState = !gateway
     ? t("读取中…")
     : gateway.helperRunning
-      ? tf("网关运行中 · :{0}", [gateway.port])
+      ? tf("网关运行中 · 端口 {0}", [gateway.port])
       : connectedAgents.size
         ? t("网关未运行")
         : t("还没有 Agent 接入");

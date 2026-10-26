@@ -239,3 +239,10 @@ test("置顶推荐位只放在网关总览一处，各 Agent 的概览不再重�
   assert.doesNotMatch(functionSource("OverviewScreen"), /SponsorBoard/);
   assert.equal((text.match(/<SponsorBoard /g) ?? []).length, 1);
 });
+
+test("Codex 被网关接管时，旧版供应商页的配置切换、从第三方导入、添加供应商都禁用", () => {
+  const screen = functionSource("RelayScreen");
+  assert.match(screen, /aria-label=\{t\("启用供应商配置切换"\)\}\n\s*checked=\{normalized\.relayProfilesEnabled\}\n\s*disabled=\{takenOverByGateway\}/);
+  assert.match(screen, /disabled=\{takenOverByGateway\}\n\s*onClick=\{openThirdPartyImport\}/);
+  assert.match(screen, /disabled=\{takenOverByGateway\}\n\s*onClick=\{\(\) => \{ setNewProfileDraft\(null\);/);
+});
