@@ -992,6 +992,7 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "增强": "Enhance",
   "供应商切换": "Provider switch",
   "供应商切换不可用": "Provider switching unavailable",
   "供应商切换中": "Switching provider",

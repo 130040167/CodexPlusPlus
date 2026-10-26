@@ -31,15 +31,20 @@ test("侧栏顶部是网关状态卡，点它进入总览；Agent 点名字先�
   assert.match(functionSource("App"), /onOpenAgent=\{\(toolId, destination\) => void switchTool\(toolId, destination \?\? agentHomeRoute\[toolId\] \?\? "overview"\)\}/);
 });
 
-test("Agent 一行一个始终可见（与设计图一致），当前 Agent 的页面单独一组，仍按 navigationSections 的归属过滤", () => {
+test("Agent 一行一个始终可见（与设计图一致）；当前 Agent 的页面收成 4 个分组，分组内用页签切换", () => {
   const sidebar = functionSource("AppSidebar");
   assert.match(sidebar, /className=\{`side-item side-agent \$\{current \? "current" : ""\}`\}/);
   assert.match(sidebar, /\{groupLabel\("agent-pages", activeToolName\)\}/);
   // 状态点表示接入方式而不是运行状态（运行状态只在顶栏显示，见 tool-chip-status.test.ts）。
   assert.match(sidebar, /tone: "direct"/);
   assert.doesNotMatch(sidebar, /codexAppRunning|running/);
-  assert.match(sidebar, /navigationSections\s*\.map\(\(section\) => section\.routes\.filter/);
-  assert.match(sidebar, /return item && \(!item\.tool \|\| item\.tool === activeTool\)/);
+  // 分组：概览 / 供应商 / 增强 / 设置，仍按页面的 tool 归属过滤；点分组回到上次看的页面。
+  const sections = text.slice(text.indexOf("const navigationSections"), text.indexOf("const globalNavigationRoutes"));
+  for (const id of ["overview", "providers", "enhance", "settings"]) assert.match(sections, new RegExp(`id: "${id}"`));
+  assert.match(sidebar, /visibleGroupRoutes\(group, routeTool, activeTool\)/);
+  assert.match(sidebar, /groupTarget\(visible, lastGroupRoute\.get\(group\.id\)\)/);
+  assert.match(functionSource("AgentPageTabs"), /if \(visible\.length < 2\) return null;/);
+  assert.match(functionSource("App"), /<AgentPageTabs activeTool=\{activeTool\}/);
 });
 
 test("⌘K 打开命令面板，总览页渲染在 hub 路由", () => {

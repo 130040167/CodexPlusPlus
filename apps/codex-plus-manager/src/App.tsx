@@ -117,6 +117,7 @@ import { SessionsView } from "./GatewaySessions";
 import { agentName } from "./gateway-model";
 import { SessionAgentTabs, type SessionTab } from "./SessionAgentTabs";
 import { noticeDuration, noticeTone } from "./notice-model";
+import { groupOfRoute, groupTarget, visibleGroupRoutes } from "./page-groups";
 import { TopbarActions } from "./TopbarActions";
 import "./ToolPages.css";
 import { BACKEND_SETTINGS_CHANGED_EVENT, ComputerUsePage } from "./ComputerUsePage";
@@ -1253,21 +1254,19 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "requestLog", get label() { return t("请求日志"); }, icon: List },
 ];
 
-const navigationSections: Array<{ label: string; routes: Route[]; placement?: "bottom" }> = [
-  {
-    get label() { return t("工作区"); },
-    routes: ["overview", "relay", "relayEnvironment", "multiLaunch", "claude", "agentSettings"],
-  },
-  {
-    get label() { return t("扩展"); },
-    routes: ["weixin", "enhance", "dreamSkin", "userScripts", "pluginMarket"],
-  },
-  {
-    get label() { return t("系统"); },
-    routes: ["maintenance"],
-    placement: "bottom",
-  },
+/**
+ * Agent 的页面分组：侧栏只列分组，分组里的页面在内容区顶部用页签切换（Codex 原来 11 个入口收成 4 个）。
+ * 每个页面仍按 `routes` 里的 `tool` 归属过滤；只剩一个页面的分组不显示页签。
+ */
+const navigationSections: Array<{ id: string; label: string; icon: LucideIcon; routes: Route[] }> = [
+  { id: "overview", get label() { return t("概览"); }, icon: LayoutDashboard, routes: ["overview"] },
+  { id: "providers", get label() { return t("供应商"); }, icon: KeyRound, routes: ["relay", "relayEnvironment", "multiLaunch"] },
+  { id: "enhance", get label() { return t("增强"); }, icon: Sparkles, routes: ["claude", "enhance", "dreamSkin", "userScripts", "pluginMarket", "weixin"] },
+  { id: "settings", get label() { return t("设置"); }, icon: Settings, routes: ["agentSettings", "maintenance"] },
 ];
+const routeTool = (routeId: Route) => routes.find((candidate) => candidate.id === routeId)?.tool;
+/** 每个分组上次打开的页面：点分组时回到那里。 */
+const lastGroupRoute = new Map<string, Route>();
 
 /**
  * 与具体 Agent 无关的应用级页面：网关、工具、关于、整体设置。打开它们时侧栏里没有 Agent 处于选中态。
@@ -1482,6 +1481,10 @@ export function App() {
   const dreamSkinPendingActionRef = useRef<(() => void) | null>(null);
   const [update, setUpdate] = useState<UpdateResult | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  useEffect(() => {
+    const group = groupOfRoute(navigationSections, route);
+    if (group) lastGroupRoute.set(group.id, route);
+  }, [route]);
   // 「会话」页默认看所有 Agent；切到 Codex 页签才是带删除 / 归档 / 修复的完整会话管理。
   const [sessionTab, setSessionTab] = useState<SessionTab>("all");
   useEffect(() => {
@@ -4301,6 +4304,7 @@ export function App() {
           className={`screen ${isManagementScreen ? "management-screen" : ""} ${route === "requestLog" ? "request-log-screen" : ""}`.trim()}
           key={route}
         >
+          <AgentPageTabs activeTool={activeTool} onNavigate={(next) => void navigate(next)} route={route} />
           {route === "overview" ? (
             <OverviewScreen
               overview={overview}
@@ -14485,6 +14489,29 @@ function loadCollapsedGroups(): string[] {
  * - 「工具」：服务所有 Agent、但与供应商无关的页面；
  * - 底部：版本与更新、整体设置、关于、语言和主题。
  */
+/** 分组里有多个页面时，内容区顶部的页签（例如「供应商」：供应商配置 / 代理设置 / Codex 多开）。 */
+function AgentPageTabs({ route, activeTool, onNavigate }: { route: Route; activeTool: ToolId; onNavigate: (route: Route) => void }) {
+  const group = groupOfRoute(navigationSections, route);
+  if (!group) return null;
+  const visible = visibleGroupRoutes(group, routeTool, activeTool);
+  if (visible.length < 2) return null;
+  return (
+    <nav aria-label={group.label} className="tp-tabs agent-page-tabs" role="tablist">
+      {visible.map((routeId) => {
+        const item = routes.find((candidate) => candidate.id === routeId);
+        if (!item) return null;
+        const Icon = item.icon;
+        return (
+          <button aria-selected={route === routeId} data-active={route === routeId} key={routeId} onClick={() => onNavigate(routeId)} role="tab" type="button">
+            <Icon aria-hidden="true" size={14} />
+            {item.label}
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+
 function AppSidebar({
   tools,
   activeTool,
@@ -14559,13 +14586,10 @@ function AppSidebar({
   };
 
   const activeToolName = tools.find((tool) => tool.id === activeTool)?.name ?? "Agent";
-  // 当前 Agent 自己的页面，按 navigationSections 分段；与工具无关的页面（概览）也算在内。
-  const agentSections = navigationSections
-    .map((section) => section.routes.filter((routeId) => {
-      const item = routes.find((candidate) => candidate.id === routeId);
-      return item && (!item.tool || item.tool === activeTool);
-    }))
-    .filter((sectionRoutes) => sectionRoutes.length > 0);
+  // 当前 Agent 的页面分组；与工具无关的页面（概览）也算在内，分组里一页都看不到就不显示。
+  const agentGroups = navigationSections
+    .map((group) => ({ group, visible: visibleGroupRoutes(group, routeTool, activeTool) }))
+    .filter((entry) => entry.visible.length > 0);
 
   const groupLabel = (key: string, label: string, aside?: ReactNode) => (
     <div className="side-group-label">
@@ -14648,12 +14672,25 @@ function AppSidebar({
         <section className={`side-group ${collapsed.includes("agent-pages") ? "collapsed" : ""}`}>
           {groupLabel("agent-pages", activeToolName)}
           <div className="side-group-items">
-            {agentSections.map((sectionRoutes, index) => (
-              <Fragment key={index}>
-                {index > 0 ? <i className="side-divider" /> : null}
-                {sectionRoutes.map((routeId) => renderItem(routeId))}
-              </Fragment>
-            ))}
+            {agentGroups.map(({ group, visible }) => {
+              const Icon = group.icon;
+              const selected = visible.includes(route);
+              const target = groupTarget(visible, lastGroupRoute.get(group.id));
+              return (
+                <button
+                  aria-current={selected ? "page" : undefined}
+                  className={`side-item ${selected ? "active" : ""}`}
+                  key={group.id}
+                  onClick={() => { if (target) onNavigate(target); }}
+                  title={visible.length > 1 ? `${group.label}：${visible.map((routeId) => routes.find((item) => item.id === routeId)?.label).join(" / ")}` : group.label}
+                  type="button"
+                >
+                  <Icon aria-hidden="true" className="side-item-icon" />
+                  <span className="side-item-label">{group.label}</span>
+                  {visible.length > 1 ? <span className="side-item-count">{visible.length}</span> : null}
+                </button>
+              );
+            })}
           </div>
         </section>
 
