@@ -23,27 +23,31 @@ test("只保留一条侧栏，旧的图标栏和 Agent 子侧栏都已移除", (
   assert.doesNotMatch(styles, /\.app-rail\b|\.tool-chip\b|\.rail-brand\b/);
 });
 
-test("侧栏顶部是网关状态卡，点它进入总览；Agent 点名字先到各自的落脚页", () => {
+test("侧栏顶部是网关状态卡，点它进入总览；Agent 点名字回到上次看的页面，没有就到各自的落脚页", () => {
   const sidebar = functionSource("AppSidebar");
   assert.match(sidebar, /className=\{`side-hub[^`]*`\} onClick=\{\(\) => onNavigate\("hub"\)\}/);
   assert.match(sidebar, /useGatewayPayload\(/);
   assert.match(text, /const agentHomeRoute: Record<string, Route> = \{ codex: "overview", claude: "claude", grok: "overview" \}/);
-  assert.match(functionSource("App"), /onOpenAgent=\{\(toolId, destination\) => void switchTool\(toolId, destination \?\? agentHomeRoute\[toolId\] \?\? "overview"\)\}/);
+  assert.match(text, /const agentEntryRoute = \(toolId: ToolId\) => agentTarget\(agentRoutes\(toolId\), lastAgentRoute\.get\(toolId\), agentHomeRoute\[toolId\] \?\? "overview"\)/);
+  assert.match(functionSource("App"), /onOpenAgent=\{\(toolId, destination\) => void switchTool\(toolId, destination \?\? agentEntryRoute\(toolId\)\)\}/);
+  assert.match(functionSource("App"), /if \(!globalNavigationRoutes\.includes\(route\)\) lastAgentRoute\.set\(activeTool, route\);/);
 });
 
-test("Agent 一行一个始终可见（与设计图一致）；当前 Agent 的页面收成 4 个分组，分组内用页签切换", () => {
+test("Agent 一行一个始终可见（与设计图一致）；点开 Agent 后它的全部页面都在内容区顶部的页签里", () => {
   const sidebar = functionSource("AppSidebar");
-  assert.match(sidebar, /className=\{`side-item side-agent \$\{current \? "current" : ""\}`\}/);
-  assert.match(sidebar, /\{groupLabel\("agent-pages", activeToolName\)\}/);
+  assert.match(sidebar, /className=\{`side-item side-agent \$\{current \? "current" : ""\} \$\{current && !onGlobalPage \? "active" : ""\}`\}/);
   // 状态点表示接入方式而不是运行状态（运行状态只在顶栏显示，见 tool-chip-status.test.ts）。
   assert.match(sidebar, /tone: "direct"/);
   assert.doesNotMatch(sidebar, /codexAppRunning|running/);
-  // 分组：概览 / 供应商 / 增强 / 设置，仍按页面的 tool 归属过滤；点分组回到上次看的页面。
+  // 侧栏不再列当前 Agent 的页面。
+  assert.doesNotMatch(sidebar, /agent-pages|navigationSections/);
+  // 页签：概览 / 供应商 / 增强 / 设置 分组用细线隔开，仍按页面的 tool 归属过滤；通用页面不显示。
   const sections = text.slice(text.indexOf("const navigationSections"), text.indexOf("const globalNavigationRoutes"));
   for (const id of ["overview", "providers", "enhance", "settings"]) assert.match(sections, new RegExp(`id: "${id}"`));
-  assert.match(sidebar, /visibleGroupRoutes\(group, routeTool, activeTool\)/);
-  assert.match(sidebar, /groupTarget\(visible, lastGroupRoute\.get\(group\.id\)\)/);
-  assert.match(functionSource("AgentPageTabs"), /if \(visible\.length < 2\) return null;/);
+  const tabs = functionSource("AgentPageTabs");
+  assert.match(tabs, /if \(globalNavigationRoutes\.includes\(route\)\) return null;/);
+  assert.match(tabs, /agentTabGroups\(navigationSections, routeTool, activeTool\)/);
+  assert.match(tabs, /className="agent-page-tabs-sep"/);
   assert.match(functionSource("App"), /<AgentPageTabs activeTool=\{activeTool\}/);
 });
 
@@ -118,4 +122,9 @@ test("请求日志按 Agent 筛选；网关记录带 agent 字段，没有的算
   assert.match(screen, /agentFilter !== "all" && requestLogAgent\(entry\) !== agentFilter/);
   assert.match(screen, /\[entries, filter, query, sessionFilter, agentFilter\]/);
   assert.match(functionSource("requestLogAgent"), /return entry\.agent \|\| "codex";/);
+});
+
+test("旧版 Codex 供应商配置页顶部建议改用新版网关，按钮打开供应商池", () => {
+  assert.match(functionSource("App"), /\{route === "relay" \? <LegacyRelayGatewayHint onOpenGateway=\{\(\) => void navigate\("gatewayProviders"\)\} \/> : null\}/);
+  assert.match(functionSource("LegacyRelayGatewayHint"), /t\("建议改用新版网关"\)/);
 });

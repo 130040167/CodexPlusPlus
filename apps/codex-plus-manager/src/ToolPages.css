@@ -629,3 +629,63 @@
   width: 13px;
   height: 13px;
 }
+
+/* Agent 的全部页面：一排页签，窗口窄时横向滚动；分组之间一条细竖线 */
+.agent-page-tabs {
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.agent-page-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.agent-page-tabs button {
+  flex: none;
+  white-space: nowrap;
+}
+
+.agent-page-tabs-sep {
+  flex: none;
+  align-self: center;
+  width: 1px;
+  height: 14px;
+  margin-bottom: 1px;
+  background: hsl(var(--border));
+}
+
+/* 旧版 Codex 供应商配置页顶部：建议改用新版网关 */
+.legacy-gateway-hint {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid hsl(var(--brand-accent) / 0.3);
+  border-radius: 8px;
+  background: hsl(var(--brand-accent) / 0.07);
+}
+
+.legacy-gateway-hint-icon {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  color: hsl(var(--brand-accent));
+}
+
+.legacy-gateway-hint-text {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.legacy-gateway-hint-text span {
+  color: hsl(var(--muted-foreground));
+}
+
+.legacy-gateway-hint button {
+  flex: none;
+}

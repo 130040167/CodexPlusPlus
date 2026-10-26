@@ -1,26 +1,33 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { groupOfRoute, groupTarget, visibleGroupRoutes } from "./page-groups.ts";
+import { agentTabGroups, agentTarget, visibleGroupRoutes } from "./page-groups.ts";
 
 type R = "overview" | "relay" | "proxy" | "claude" | "enhance";
 const owner: Record<R, string | undefined> = { overview: undefined, relay: "codex", proxy: "codex", claude: "claude", enhance: "codex" };
-const groups = [
-  { id: "overview", routes: ["overview"] as R[] },
-  { id: "providers", routes: ["relay", "proxy"] as R[] },
-  { id: "enhance", routes: ["claude", "enhance"] as R[] },
+const toolOf = (route: R) => owner[route];
+const groups: Array<{ id: string; routes: R[] }> = [
+  { id: "overview", routes: ["overview"] },
+  { id: "providers", routes: ["relay", "proxy"] },
+  { id: "enhance", routes: ["claude", "enhance"] },
 ];
 
 test("按当前 Agent 过滤分组里的页面", () => {
-  assert.deepEqual(visibleGroupRoutes(groups[1], (r) => owner[r], "codex"), ["relay", "proxy"]);
-  assert.deepEqual(visibleGroupRoutes(groups[1], (r) => owner[r], "claude"), []);
-  assert.deepEqual(visibleGroupRoutes(groups[2], (r) => owner[r], "claude"), ["claude"]);
-  assert.deepEqual(visibleGroupRoutes(groups[0], (r) => owner[r], "grok"), ["overview"]);
+  assert.deepEqual(visibleGroupRoutes(groups[1], toolOf, "codex"), ["relay", "proxy"]);
+  assert.deepEqual(visibleGroupRoutes(groups[1], toolOf, "claude"), []);
+  assert.deepEqual(visibleGroupRoutes(groups[2], toolOf, "claude"), ["claude"]);
+  assert.deepEqual(visibleGroupRoutes(groups[0], toolOf, "grok"), ["overview"]);
 });
 
-test("找到页面所在的分组；点分组回到上次看的页面", () => {
-  assert.equal(groupOfRoute(groups, "proxy" as R)?.id, "providers");
-  assert.equal(groupOfRoute(groups, "overview" as R)?.id, "overview");
-  assert.equal(groupTarget(["relay", "proxy"], "proxy"), "proxy");
-  assert.equal(groupTarget(["relay", "proxy"], undefined), "relay");
-  assert.equal(groupTarget(["claude"], "enhance"), "claude", "记住的页面当前 Agent 看不到时回到第一页");
+test("Agent 的页签分组去掉空分组", () => {
+  assert.deepEqual(
+    agentTabGroups(groups, toolOf, "claude").map((entry) => [entry.group.id, entry.routes]),
+    [["overview", ["overview"]], ["enhance", ["claude"]]],
+  );
+  assert.deepEqual(agentTabGroups(groups, toolOf, "codex").flatMap((entry) => entry.routes), ["overview", "relay", "proxy", "enhance"]);
+});
+
+test("点 Agent 回到上次看的页面，看不到时回落脚页", () => {
+  assert.equal(agentTarget(["overview", "relay", "proxy"], "proxy", "overview"), "proxy");
+  assert.equal(agentTarget(["overview", "relay"], undefined, "overview"), "overview");
+  assert.equal(agentTarget(["overview", "claude"], "enhance", "claude"), "claude", "记住的页面不属于这个 Agent 时回落脚页");
 });

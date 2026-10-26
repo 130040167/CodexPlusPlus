@@ -1,4 +1,7 @@
-/** Agent 页面分组：侧栏只显示分组（概览 / 供应商 / 增强 / 设置），分组里的页面在内容区顶部用页签切换。 */
+/**
+ * Agent 的页面：侧栏只列 Agent，点开后它的全部页面都在内容区顶部的页签里，
+ * 按分组（概览 / 供应商 / 增强 / 设置）用细分隔线隔开。
+ */
 
 export type PageGroup<R extends string> = { id: string; routes: R[] };
 
@@ -10,11 +13,14 @@ export function visibleGroupRoutes<R extends string>(group: PageGroup<R>, toolOf
   });
 }
 
-export function groupOfRoute<R extends string, G extends PageGroup<R>>(groups: G[], route: R): G | undefined {
-  return groups.find((group) => group.routes.includes(route));
+/** 某个 Agent 的页签分组：去掉一页都看不到的分组。 */
+export function agentTabGroups<R extends string, G extends PageGroup<R>>(groups: G[], toolOf: (route: R) => string | undefined, tool: string): Array<{ group: G; routes: R[] }> {
+  return groups
+    .map((group) => ({ group, routes: visibleGroupRoutes(group, toolOf, tool) }))
+    .filter((entry) => entry.routes.length > 0);
 }
 
-/** 点分组时去哪一页：上次在这个分组里看的页面（当前 Agent 还能看到的话），否则第一页。 */
-export function groupTarget<R extends string>(visible: R[], remembered: R | undefined): R | undefined {
-  return remembered && visible.includes(remembered) ? remembered : visible[0];
+/** 点 Agent 时去哪一页：上次在这个 Agent 里看的页面（仍属于它的话），否则它的落脚页。 */
+export function agentTarget<R extends string>(visible: R[], remembered: R | undefined, home: R): R {
+  return remembered && visible.includes(remembered) ? remembered : home;
 }

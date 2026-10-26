@@ -117,7 +117,7 @@ import { SessionsView } from "./GatewaySessions";
 import { agentName } from "./gateway-model";
 import { SessionAgentTabs, type SessionTab } from "./SessionAgentTabs";
 import { noticeDuration, noticeTone } from "./notice-model";
-import { groupOfRoute, groupTarget, visibleGroupRoutes } from "./page-groups";
+import { agentTabGroups, agentTarget } from "./page-groups";
 import { TopbarActions } from "./TopbarActions";
 import "./ToolPages.css";
 import { BACKEND_SETTINGS_CHANGED_EVENT, ComputerUsePage } from "./ComputerUsePage";
@@ -1255,18 +1255,20 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
 ];
 
 /**
- * Agent 的页面分组：侧栏只列分组，分组里的页面在内容区顶部用页签切换（Codex 原来 11 个入口收成 4 个）。
- * 每个页面仍按 `routes` 里的 `tool` 归属过滤；只剩一个页面的分组不显示页签。
+ * Agent 的页面分组：侧栏只列 Agent，点开后它的全部页面都在内容区顶部的页签里，分组之间用细线隔开。
+ * 每个页面仍按 `routes` 里的 `tool` 归属过滤；只有一个页面的 Agent 不显示页签。
  */
-const navigationSections: Array<{ id: string; label: string; icon: LucideIcon; routes: Route[] }> = [
-  { id: "overview", get label() { return t("概览"); }, icon: LayoutDashboard, routes: ["overview"] },
-  { id: "providers", get label() { return t("供应商"); }, icon: KeyRound, routes: ["relay", "relayEnvironment", "multiLaunch"] },
-  { id: "enhance", get label() { return t("增强"); }, icon: Sparkles, routes: ["claude", "enhance", "dreamSkin", "userScripts", "pluginMarket", "weixin"] },
-  { id: "settings", get label() { return t("设置"); }, icon: Settings, routes: ["agentSettings", "maintenance"] },
+const navigationSections: Array<{ id: string; routes: Route[] }> = [
+  { id: "overview", routes: ["overview"] },
+  { id: "providers", routes: ["relay", "relayEnvironment", "multiLaunch"] },
+  { id: "enhance", routes: ["claude", "enhance", "dreamSkin", "userScripts", "pluginMarket", "weixin"] },
+  { id: "settings", routes: ["agentSettings", "maintenance"] },
 ];
 const routeTool = (routeId: Route) => routes.find((candidate) => candidate.id === routeId)?.tool;
-/** 每个分组上次打开的页面：点分组时回到那里。 */
-const lastGroupRoute = new Map<string, Route>();
+/** 某个 Agent 能看到的全部页面，按页签顺序。 */
+const agentRoutes = (toolId: ToolId) => agentTabGroups(navigationSections, routeTool, toolId).flatMap((entry) => entry.routes);
+/** 每个 Agent 上次打开的页面：在侧栏点 Agent 时回到那里。 */
+const lastAgentRoute = new Map<string, Route>();
 
 /**
  * 与具体 Agent 无关的应用级页面：网关、工具、关于、整体设置。打开它们时侧栏里没有 Agent 处于选中态。
@@ -1296,6 +1298,7 @@ const gatewayRouteByTab = { ...Object.fromEntries(Object.entries(gatewayTabByRou
  * 要么不接入、照它自己的配置文件直连。
  */
 const agentHomeRoute: Record<string, Route> = { codex: "overview", claude: "claude", grok: "overview" };
+const agentEntryRoute = (toolId: ToolId) => agentTarget(agentRoutes(toolId), lastAgentRoute.get(toolId), agentHomeRoute[toolId] ?? "overview");
 
 const defaultSettings: BackendSettings = {
   ...defaultWhaleBalanceSettings(),
@@ -1481,10 +1484,6 @@ export function App() {
   const dreamSkinPendingActionRef = useRef<(() => void) | null>(null);
   const [update, setUpdate] = useState<UpdateResult | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
-  useEffect(() => {
-    const group = groupOfRoute(navigationSections, route);
-    if (group) lastGroupRoute.set(group.id, route);
-  }, [route]);
   // 「会话」页默认看所有 Agent；切到 Codex 页签才是带删除 / 归档 / 修复的完整会话管理。
   const [sessionTab, setSessionTab] = useState<SessionTab>("all");
   useEffect(() => {
@@ -1527,6 +1526,9 @@ export function App() {
   // 同时开着时才不会各说各话。
   const [toolEntries, setToolEntries] = useState<ToolEntry[]>([]);
   const [activeTool, setActiveTool] = useState<ToolId>("codex");
+  useEffect(() => {
+    if (!globalNavigationRoutes.includes(route)) lastAgentRoute.set(activeTool, route);
+  }, [route, activeTool]);
   const [providerSyncProgress, setProviderSyncProgress] = useState<ProviderSyncProgress>({
     active: false,
     percent: 0,
@@ -4222,11 +4224,7 @@ export function App() {
   gatewayNavigationRoutes.forEach((routeId) => pushCommand(routeCommand(routeId, t("网关"), () => void navigate(routeId), "gateway")));
   managementNavigationRoutes.forEach((routeId) => pushCommand(routeCommand(routeId, t("全局管理"), () => void navigate(routeId))));
   for (const tool of toolEntries.filter((entry) => entry.switchable)) {
-    const toolRoutes = navigationSections.flatMap((section) => section.routes).filter((routeId) => {
-      const item = routes.find((candidate) => candidate.id === routeId);
-      return item && (!item.tool || item.tool === tool.id);
-    });
-    toolRoutes.forEach((routeId) => pushCommand(routeCommand(routeId, tool.name, () => void switchTool(tool.id, routeId), tool.id)));
+    agentRoutes(tool.id).forEach((routeId) => pushCommand(routeCommand(routeId, tool.name, () => void switchTool(tool.id, routeId), tool.id)));
   }
   [...toolNavigationRoutes, "about" as Route, "settings" as Route].forEach((routeId) => pushCommand(routeCommand(routeId, t("工具"), () => void navigate(routeId))));
   paletteCommands.push(
@@ -4250,7 +4248,7 @@ export function App() {
         route={route}
         theme={theme}
         version={overview?.current_version ?? update?.currentVersion ?? ""}
-        onOpenAgent={(toolId, destination) => void switchTool(toolId, destination ?? agentHomeRoute[toolId] ?? "overview")}
+        onOpenAgent={(toolId, destination) => void switchTool(toolId, destination ?? agentEntryRoute(toolId))}
         onNavigate={(next) => void navigate(next)}
         onToggleTheme={actions.toggleTheme}
         onOpenPalette={() => setPaletteOpen(true)}
@@ -4316,6 +4314,7 @@ export function App() {
               actions={actions}
             />
           ) : null}
+          {route === "relay" ? <LegacyRelayGatewayHint onOpenGateway={() => void navigate("gatewayProviders")} /> : null}
           {route === "relay" ? (
             <RelayScreen
               settings={settings}
@@ -6384,6 +6383,26 @@ function RelayEnvironmentScreen({ result, actions }: { result: RelayEnvironmentR
         </div>
       </CardContent>
     </Panel>
+  );
+}
+
+/**
+ * 旧版 Codex 供应商配置页顶部的提示：建议改用新版网关的供应商池。
+ * 这里的配置照旧生效，提示只负责把人引到网关。
+ */
+function LegacyRelayGatewayHint({ onOpenGateway }: { onOpenGateway: () => void }) {
+  return (
+    <div className="legacy-gateway-hint" role="note">
+      <Waypoints aria-hidden="true" className="legacy-gateway-hint-icon" />
+      <div className="legacy-gateway-hint-text">
+        <strong>{t("建议改用新版网关")}</strong>
+        <span>{t("在网关的「供应商池」统一管理供应商，多个 Agent 共用，支持多 Key 轮换、按模型路由、故障转移与用量统计。这里是旧版的 Codex 直连配置，仍可继续使用。")}</span>
+      </div>
+      <Button onClick={onOpenGateway} size="sm" variant="secondary">
+        {t("打开供应商池")}
+        <ArrowRight aria-hidden="true" className="h-3.5 w-3.5" />
+      </Button>
+    </div>
   );
 }
 
@@ -14484,30 +14503,36 @@ function loadCollapsedGroups(): string[] {
  * - 顶部是网关状态卡和 ⌘K 快速跳转；
  * - 「网关」：总览、Agent 接入、供应商池、路由、用量、网关设置；
  * - 「全局管理」：请求日志、会话、MCP、Skills，同时管理所有 Agent；
- * - 「Agent」：每个 Agent 一行（状态点表示接入方式）；下一组是当前 Agent 自己的页面（供应商配置、增强、皮肤……），
- *   组名就是 Agent 的名字；
+ * - 「Agent」：每个 Agent 一行（状态点表示接入方式）；它自己的页面（供应商配置、增强、皮肤……）在内容区顶部的页签里；
  * - 「工具」：服务所有 Agent、但与供应商无关的页面；
  * - 底部：版本与更新、整体设置、关于、语言和主题。
  */
-/** 分组里有多个页面时，内容区顶部的页签（例如「供应商」：供应商配置 / 代理设置 / Codex 多开）。 */
+/**
+ * 当前 Agent 的全部页面：内容区顶部一排页签，分组（概览 / 供应商 / 增强 / 设置）之间用细线隔开。
+ * 网关、全局管理、工具这些通用页面不显示；只有一个页面的 Agent 也不显示。
+ */
 function AgentPageTabs({ route, activeTool, onNavigate }: { route: Route; activeTool: ToolId; onNavigate: (route: Route) => void }) {
-  const group = groupOfRoute(navigationSections, route);
-  if (!group) return null;
-  const visible = visibleGroupRoutes(group, routeTool, activeTool);
-  if (visible.length < 2) return null;
+  if (globalNavigationRoutes.includes(route)) return null;
+  const groups = agentTabGroups(navigationSections, routeTool, activeTool);
+  if (groups.reduce((count, entry) => count + entry.routes.length, 0) < 2) return null;
   return (
-    <nav aria-label={group.label} className="tp-tabs agent-page-tabs" role="tablist">
-      {visible.map((routeId) => {
-        const item = routes.find((candidate) => candidate.id === routeId);
-        if (!item) return null;
-        const Icon = item.icon;
-        return (
-          <button aria-selected={route === routeId} data-active={route === routeId} key={routeId} onClick={() => onNavigate(routeId)} role="tab" type="button">
-            <Icon aria-hidden="true" size={14} />
-            {item.label}
-          </button>
-        );
-      })}
+    <nav aria-label={t("Agent 页面")} className="tp-tabs agent-page-tabs" role="tablist">
+      {groups.map(({ group, routes: groupRoutes }, index) => (
+        <Fragment key={group.id}>
+          {index > 0 ? <span aria-hidden="true" className="agent-page-tabs-sep" /> : null}
+          {groupRoutes.map((routeId) => {
+            const item = routes.find((candidate) => candidate.id === routeId);
+            if (!item) return null;
+            const Icon = item.icon;
+            return (
+              <button aria-selected={route === routeId} data-active={route === routeId} key={routeId} onClick={() => onNavigate(routeId)} role="tab" type="button">
+                <Icon aria-hidden="true" size={14} />
+                {item.label}
+              </button>
+            );
+          })}
+        </Fragment>
+      ))}
     </nav>
   );
 }
@@ -14585,12 +14610,6 @@ function AppSidebar({
     );
   };
 
-  const activeToolName = tools.find((tool) => tool.id === activeTool)?.name ?? "Agent";
-  // 当前 Agent 的页面分组；与工具无关的页面（概览）也算在内，分组里一页都看不到就不显示。
-  const agentGroups = navigationSections
-    .map((group) => ({ group, visible: visibleGroupRoutes(group, routeTool, activeTool) }))
-    .filter((entry) => entry.visible.length > 0);
-
   const groupLabel = (key: string, label: string, aside?: ReactNode) => (
     <div className="side-group-label">
       <button aria-expanded={!collapsed.includes(key)} onClick={() => toggleGroup(key)} type="button">
@@ -14636,7 +14655,7 @@ function AppSidebar({
             </button>,
           )}
           <div className="side-group-items">
-            {/* 每个 Agent 一行，始终都在；点一下切到它并打开它的落脚页。它自己的页面在下一组。 */}
+            {/* 每个 Agent 一行，始终都在；点一下切到它，回到上次看的页面（没有就是落脚页）。它的页面都在内容区顶部的页签里。 */}
             {tools.map((tool) => {
               const current = tool.id === activeTool;
               const title = tool.switchable
@@ -14653,7 +14672,7 @@ function AppSidebar({
                 <button
                   aria-current={current && !onGlobalPage ? "true" : undefined}
                   aria-label={tool.switchable ? `${tool.name} · ${access.label}` : `${tool.name} · ${t("待接入")}`}
-                  className={`side-item side-agent ${current ? "current" : ""}`}
+                  className={`side-item side-agent ${current ? "current" : ""} ${current && !onGlobalPage ? "active" : ""}`}
                   disabled={!tool.switchable}
                   key={tool.id}
                   onClick={() => onOpenAgent(tool.id)}
@@ -14663,31 +14682,6 @@ function AppSidebar({
                   <AgentGlyph agent={tool.id} className="side-item-icon" />
                   <span className="side-item-label">{tool.name}</span>
                   <i aria-hidden="true" className="side-dot side-agent-dot" data-tone={access.tone} />
-                </button>
-              );
-            })}
-          </div>
-        </section>
-
-        <section className={`side-group ${collapsed.includes("agent-pages") ? "collapsed" : ""}`}>
-          {groupLabel("agent-pages", activeToolName)}
-          <div className="side-group-items">
-            {agentGroups.map(({ group, visible }) => {
-              const Icon = group.icon;
-              const selected = visible.includes(route);
-              const target = groupTarget(visible, lastGroupRoute.get(group.id));
-              return (
-                <button
-                  aria-current={selected ? "page" : undefined}
-                  className={`side-item ${selected ? "active" : ""}`}
-                  key={group.id}
-                  onClick={() => { if (target) onNavigate(target); }}
-                  title={visible.length > 1 ? `${group.label}：${visible.map((routeId) => routes.find((item) => item.id === routeId)?.label).join(" / ")}` : group.label}
-                  type="button"
-                >
-                  <Icon aria-hidden="true" className="side-item-icon" />
-                  <span className="side-item-label">{group.label}</span>
-                  {visible.length > 1 ? <span className="side-item-count">{visible.length}</span> : null}
                 </button>
               );
             })}
