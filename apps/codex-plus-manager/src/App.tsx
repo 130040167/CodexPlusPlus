@@ -1262,7 +1262,8 @@ const navigationSections: Array<{ id: string; routes: Route[] }> = [
   { id: "overview", routes: ["overview"] },
   { id: "providers", routes: ["relay", "relayEnvironment", "multiLaunch"] },
   { id: "enhance", routes: ["claude", "enhance", "dreamSkin", "userScripts", "pluginMarket", "weixin"] },
-  { id: "settings", routes: ["agentSettings", "maintenance"] },
+  // 安装维护并进了设置页（排在设置下方），不再单独占一个页签；"maintenance" 路由保留为设置页的别名。
+  { id: "settings", routes: ["agentSettings"] },
 ];
 const routeTool = (routeId: Route) => routes.find((candidate) => candidate.id === routeId)?.tool;
 /** 某个 Agent 能看到的全部页面，按页签顺序。 */
@@ -2510,7 +2511,9 @@ export function App() {
     }
   };
 
-  const navigate = async (next: Route, skipDreamSkinDraftGuard = false) => {
+  const navigate = async (target: Route, skipDreamSkinDraftGuard = false) => {
+    // 安装维护已经并进设置页。
+    const next: Route = target === "maintenance" ? "agentSettings" : target;
     if (!skipDreamSkinDraftGuard && route === "dreamSkin" && next !== "dreamSkin" && dreamSkinDraftDirty) {
       runAfterDreamSkinDraftGuard(() => void navigate(next, true));
       return;
@@ -2563,7 +2566,7 @@ export function App() {
       await refreshLogs(true);
       await refreshDiagnostics(true);
     }
-    if (next === "maintenance") {
+    if (next === "agentSettings") {
       await refreshOverview(true);
       await refreshWatcher(true);
       await refreshAutoTakeover(true);
@@ -4487,7 +4490,15 @@ export function App() {
           {gatewayTabByRoute[route] ? (
             <GatewayPage notify={actions.showMessage} onTabChange={(tab) => void navigate(gatewayRouteByTab[tab])} tab={gatewayTabByRoute[route]} />
           ) : null}
-          {route === "maintenance" ? (
+          {route === "agentSettings" ? (
+            <AgentSettingsScreen
+              dirty={settingsDirty}
+              form={settingsForm}
+              onFormChange={setSettingsForm}
+              actions={actions}
+            />
+          ) : null}
+          {route === "agentSettings" || route === "maintenance" ? (
             <MaintenanceScreen
               overview={overview}
               launchPending={launchPending}
@@ -4520,14 +4531,6 @@ export function App() {
                 if (activeTool !== "codex") await switchTool("codex");
                 await navigate("agentSettings");
               })()}
-            />
-          ) : null}
-          {route === "agentSettings" ? (
-            <AgentSettingsScreen
-              dirty={settingsDirty}
-              form={settingsForm}
-              onFormChange={setSettingsForm}
-              actions={actions}
             />
           ) : null}
         </section>
@@ -9573,8 +9576,8 @@ function RecommendationsScreen({ ads, actions }: { ads: AdsResult | null; action
   const topIdentities = new Set(topAds.map(adIdentity));
   const pool = items.filter((ad) => !topIdentities.has(adIdentity(ad)));
   const ordered = [...topAds, ...pool];
+  // 只展示赞助商推荐；普通推荐不再显示。
   const sponsors = ordered.filter((ad) => ad.type === "sponsor");
-  const normal = ordered.filter((ad) => ad.type === "normal");
   return (
     <div className="tp-page rec-page">
       <TopbarActions>
@@ -9584,16 +9587,12 @@ function RecommendationsScreen({ ads, actions }: { ads: AdsResult | null; action
         </Button>
       </TopbarActions>
       {!ads ? <p className="rec-empty">{t("尚未加载推荐内容")}</p> : null}
-      {sponsors.length ? (
+      {ads ? (
         <section className="tp-page">
           <div className="tp-section-head"><h3>{t("赞助商推荐")}</h3><span>{tf("{0} 条", [sponsors.length])}</span></div>
           <AdGrid actions={actions} ads={sponsors} empty={t("暂无赞助商推荐。")} />
         </section>
       ) : null}
-      <section className="tp-page">
-        <div className="tp-section-head"><h3>{t("普通推荐")}</h3><span>{tf("{0} 条", [normal.length])}</span></div>
-        <AdGrid actions={actions} ads={normal} empty={t("暂无普通推荐。")} />
-      </section>
       <p className="tp-foot">{t("与 Codex 内插件菜单使用同一个远端广告源")}</p>
     </div>
   );
@@ -14785,7 +14784,7 @@ function AppSidebar({
                 <button
                   aria-current={current && !onGlobalPage ? "true" : undefined}
                   aria-label={tool.switchable ? `${tool.name} · ${access.label}` : `${tool.name} · ${t("待接入")}`}
-                  className={`side-item side-agent ${current ? "current" : ""} ${current && !onGlobalPage ? "active" : ""}`}
+                  className={`side-item side-agent ${current && !onGlobalPage ? "current active" : ""}`}
                   disabled={!tool.switchable}
                   key={tool.id}
                   onClick={() => onOpenAgent(tool.id)}

@@ -35,7 +35,8 @@ test("侧栏顶部是网关状态卡，点它进入总览；Agent 点名字回�
 
 test("Agent 一行一个始终可见（与设计图一致）；点开 Agent 后它的全部页面都在内容区顶部的页签里", () => {
   const sidebar = functionSource("AppSidebar");
-  assert.match(sidebar, /className=\{`side-item side-agent \$\{current \? "current" : ""\} \$\{current && !onGlobalPage \? "active" : ""\}`\}/);
+  // 在网关、全局管理、工具这些通用页面时 Agent 行不显示选中，侧栏同一时间只有一个选中项。
+  assert.match(sidebar, /className=\{`side-item side-agent \$\{current && !onGlobalPage \? "current active" : ""\}`\}/);
   // 状态点表示接入方式而不是运行状态（运行状态只在顶栏显示，见 tool-chip-status.test.ts）。
   assert.match(sidebar, /tone: "direct"/);
   assert.doesNotMatch(sidebar, /codexAppRunning|running/);
@@ -156,4 +157,19 @@ test("Agent 页签条不能是滚动容器：否则在 .screen 的 grid 里会�
   assert.ok(rules.length > 0);
   for (const body of rules) assert.doesNotMatch(body, /overflow/);
   assert.match(rules.join("\n"), /flex-wrap:\s*wrap/);
+});
+
+test("安装维护并进设置页：设置分组只有一个页面，设置页下方渲染维护内容，旧路由跳到设置", () => {
+  const sections = text.slice(text.indexOf("const navigationSections"), text.indexOf("const globalNavigationRoutes"));
+  assert.match(sections, /\{ id: "settings", routes: \["agentSettings"\] \}/);
+  const app = functionSource("App");
+  assert.match(app, /const next: Route = target === "maintenance" \? "agentSettings" : target;/);
+  assert.match(app, /\{route === "agentSettings" \|\| route === "maintenance" \? \(\n\s*<MaintenanceScreen/);
+  assert.ok(app.indexOf("<AgentSettingsScreen") < app.indexOf("<MaintenanceScreen"), "设置在上、安装维护在下");
+});
+
+test("推荐内容只显示赞助商推荐", () => {
+  const screen = functionSource("RecommendationsScreen");
+  assert.doesNotMatch(screen, /t\("普通推荐"\)|ad\.type === "normal"/);
+  assert.match(screen, /t\("赞助商推荐"\)/);
 });
