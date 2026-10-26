@@ -174,24 +174,15 @@ export const PRESETS: ProviderPreset[] = [
 
   // ── 聚合/中转 ──
   {
-    id: "jojocode",
-    name: "JOJO Code",
-    websiteUrl: "https://jojocode.com/",
-    apiKeyUrl: "https://jojocode.com/",
-    category: "aggregator",
-    baseUrl: "https://jojocode.com/v1",
-    protocol: "responses",
-    model: "gpt-5.5",
-  },
-  {
     id: "jojocode-max",
-    name: "JOJO Code 包月",
-    websiteUrl: "https://max.jojocode.com/",
-    apiKeyUrl: "https://max.jojocode.com/",
+    name: "JOJO Code",
+    websiteUrl: "https://max2.jojocode.com/",
+    apiKeyUrl: "https://max2.jojocode.com/",
     category: "aggregator",
-    baseUrl: "https://max.jojocode.com/v1",
+    baseUrl: "https://max2.jojocode.com/v1",
     protocol: "responses",
-    model: "gpt-5.5",
+    // 模型留空：添加时「从上游获取」或手填。
+    model: "",
   },
   {
     id: "runapi",
