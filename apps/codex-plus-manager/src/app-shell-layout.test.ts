@@ -27,7 +27,7 @@ test("侧栏顶部是网关状态卡，点它进入总览；Agent 点名字先�
   const sidebar = functionSource("AppSidebar");
   assert.match(sidebar, /className=\{`side-hub[^`]*`\} onClick=\{\(\) => onNavigate\("hub"\)\}/);
   assert.match(sidebar, /useGatewayPayload\(/);
-  assert.match(text, /const agentHomeRoute: Record<string, Route> = \{ codex: "overview", claude: "claudeRelay", grok: "grok" \}/);
+  assert.match(text, /const agentHomeRoute: Record<string, Route> = \{ codex: "overview", claude: "claude", grok: "overview" \}/);
   assert.match(functionSource("App"), /onOpenAgent=\{\(toolId, destination\) => void switchTool\(toolId, destination \?\? agentHomeRoute\[toolId\] \?\? "overview"\)\}/);
 });
 

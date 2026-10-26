@@ -45,7 +45,7 @@ Grok ─────────POST /gw/grok/v1/responses───┤  helper�
 - Claude Code：开启时写入托管供应商 `codex-plus-gateway`（`ANTHROPIC_BASE_URL` 指向网关），
   复用「关键字段」切换逻辑，hooks / permissions 等用户键不动；关闭时切回开启前的供应商。
 - Grok：写入一个指向网关的 Responses 供应商；关闭时重新应用 Grok 页当前选中的供应商。
-- 在 Claude / Grok 页直接切换供应商等于离开网关模式，绑定随之关闭。
+- Codex++ 不再提供 Claude Code / Grok 的供应商配置页：不接入网关时，它们照自己的配置文件直连；「断开并还原」恢复接入前的配置。
 
 ## 接入方式
 

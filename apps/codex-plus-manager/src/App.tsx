@@ -110,8 +110,7 @@ import { NativeBrowserStatusView, nativeBrowserConsent } from "./native-browser-
 import { AgentCachePanel } from "./agent-cache";
 import { summarizeRecentRequests, type RecentRequestSummary } from "./overview-model";
 import { AgentCollaborationPage } from "./AgentCollaborationPage";
-import { ClaudeProviderPage } from "./ClaudeProviderPage";
-import { GatewayBanner, GatewayPage, type GatewayTab } from "./GatewayPage";
+import { GatewayPage, type GatewayTab } from "./GatewayPage";
 import { AgentGlyph, HubOverview, useGatewayPayload } from "./HubOverview";
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
 import { noticeDuration, noticeTone } from "./notice-model";
@@ -1195,7 +1194,7 @@ type ToolId = string;
 /** Codex++ 自己的 logo：与应用图标（src-tauri/icons/icon.png）同一张图。 */
 const APP_LOGO_URL = new URL("./assets/codex-plus-logo.png", import.meta.url).href;
 
-type Route = "overview" | "relay" | "multiLaunch" | "grok" | "claudeRelay" | "claude" | "relayEnvironment" | "requestLog" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "computerUse" | "hub" | "gateway" | "gatewaySessions" | "gatewayProviders" | "gatewayRouting" | "gatewayUsage" | "gatewaySettings" | "maintenance" | "about" | "settings" | "agentSettings";
+type Route = "overview" | "relay" | "multiLaunch" | "claude" | "relayEnvironment" | "requestLog" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "computerUse" | "hub" | "gateway" | "gatewaySessions" | "gatewayProviders" | "gatewayRouting" | "gatewayUsage" | "gatewaySettings" | "maintenance" | "about" | "settings" | "agentSettings";
 type Theme = "dark" | "light";
 
 const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
@@ -1214,8 +1213,6 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "overview", get label() { return t("概览"); }, icon: LayoutDashboard },
   { id: "relay", get label() { return t("供应商配置"); }, icon: KeyRound, tool: "codex" },
   { id: "multiLaunch", get label() { return t("Codex多开"); }, icon: Layers3, tool: "codex" },
-  { id: "grok", get label() { return t("Grok 配置"); }, icon: Blocks, tool: "grok" },
-  { id: "claudeRelay", get label() { return t("供应商配置"); }, icon: KeyRound, tool: "claude" },
   { id: "claude", get label() { return t("Claude 增强"); }, icon: Languages, tool: "claude" },
   { id: "sessions", get label() { return t("会话管理"); }, icon: MessageCircle, tool: "codex" },
   { id: "context", label: "MCP", icon: Network, tool: "codex" },
@@ -1252,7 +1249,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
 const navigationSections: Array<{ label: string; routes: Route[]; placement?: "bottom" }> = [
   {
     get label() { return t("工作区"); },
-    routes: ["overview", "relay", "relayEnvironment", "requestLog", "multiLaunch", "grok", "claudeRelay", "claude", "agentSettings"],
+    routes: ["overview", "relay", "relayEnvironment", "requestLog", "multiLaunch", "claude", "agentSettings"],
   },
   {
     get label() { return t("全局管理"); },
@@ -1289,8 +1286,12 @@ const gatewayTabByRoute: Partial<Record<Route, GatewayTab>> = {
   gatewaySettings: "gateway",
 };
 const gatewayRouteByTab = Object.fromEntries(Object.entries(gatewayTabByRoute).map(([route, tab]) => [tab, route])) as Record<GatewayTab, Route>;
-/** 每个 Agent 在侧栏里的落脚页：点 Agent 名字先到这里。 */
-const agentHomeRoute: Record<string, Route> = { codex: "overview", claude: "claudeRelay", grok: "grok" };
+/**
+ * 每个 Agent 在侧栏里的落脚页：点 Agent 名字先到这里。
+ * Claude Code / Grok 的供应商不再在 Codex++ 里单独配置：要么经网关接入供应商池（「Agent 接入」），
+ * 要么不接入、照它自己的配置文件直连。
+ */
+const agentHomeRoute: Record<string, Route> = { codex: "overview", claude: "claude", grok: "overview" };
 
 const defaultSettings: BackendSettings = {
   ...defaultWhaleBalanceSettings(),
@@ -1599,11 +1600,8 @@ export function App() {
     // 供应商页是跟着工具走的，切工具后如果当前页不属于新工具就跳到它自己的页。
     // 设置页也只属于 Codex，同样按这条规则跳走。
     const currentRoute = routes.find((candidate) => candidate.id === route);
-    if (toolId === "claude") {
-      // 切到 Claude 时和 Codex 一样先落在供应商配置；正在看 Claude 自己的页面时不动。
-      if (currentRoute?.tool !== "claude") setRoute("claudeRelay");
-    } else if (currentRoute?.tool && currentRoute.tool !== toolId) {
-      setRoute(toolId === "grok" ? "grok" : "relay");
+    if (currentRoute?.tool && currentRoute.tool !== toolId) {
+      setRoute(agentHomeRoute[toolId] ?? "overview");
     }
     const result = await run(() => call<SettingsResult>("save_settings", { settings: next }));
     if (result) {
@@ -2517,7 +2515,6 @@ export function App() {
     }
     if (next === "multiLaunch") await refreshMultiLaunchInstances(true);
     if (next === "relayEnvironment") await refreshRelayEnvironment(true);
-    if (next === "grok") await refreshSettings(true);
     if (next === "sessions") {
       await refreshSettings(true);
       await refreshLocalSessions(true);
@@ -4328,17 +4325,6 @@ export function App() {
           ) : null}
           {route === "requestLog" ? (
             <RequestLogScreen />
-          ) : null}
-          {route === "grok" ? (
-            <GrokScreen settings={settings} form={settingsForm} actions={actions} onOpenGateway={() => void navigate("gateway")} />
-          ) : null}
-          {route === "claudeRelay" ? (
-            <ClaudeProviderPage
-              notify={actions.showMessage}
-              onOpenGateway={() => void navigate("gateway")}
-              onProvidersChanged={() => void refreshTools()}
-              openUrl={(url) => void actions.openExternalUrl(url)}
-            />
           ) : null}
           {route === "claude" ? <ClaudeLocalizationScreen /> : null}
           {route === "sessions" ? (
@@ -14443,22 +14429,6 @@ type GrokProvidersResult = CommandResult<{
   liveProfile: RelayProfile;
 }>;
 
-function newGrokProfileDraft(): RelayProfile {
-  return {
-    ...defaultSettings.relayProfiles[0],
-    id: `grok-${Date.now().toString(36)}`,
-    name: t("新建 Grok 供应商"),
-    modelList: "",
-    upstreamBaseUrl: "",
-    baseUrl: "",
-    apiKey: "",
-    protocol: "chatCompletions",
-    relayMode: "pureApi",
-    configContents: "",
-    authContents: "",
-  };
-}
-
 /**
  * Grok 分区的供应商管理。
  *
@@ -14467,368 +14437,6 @@ function newGrokProfileDraft(): RelayProfile {
  * （`[ui]`、`[models].web_search` 等）保留。所以「应用到 Grok」是需要确认的
  * 破坏性操作，这里显式二次确认。
  */
-function GrokScreen({
-  settings,
-  form,
-  actions,
-  onOpenGateway,
-}: {
-  settings: SettingsResult | null;
-  form: BackendSettings;
-  actions: {
-    saveSettingsValue: (next: BackendSettings, silent?: boolean) => Promise<BackendSettings | null>;
-    showMessage: (title: string, message: string, status?: Status) => Promise<void>;
-    refreshCurrent: () => void;
-  };
-  onOpenGateway: () => void;
-}) {
-  const [result, setResult] = useState<GrokProvidersResult | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [applying, setApplying] = useState(false);
-  const [confirming, setConfirming] = useState(false);
-  // 编辑区走本地草稿 + 显式保存，跟 Codex 供应商页一致。
-  // 直接在 onChange 里写盘的话，敲一个 Base URL 会触发几十次全量 save_settings。
-  const [draft, setDraft] = useState<RelayProfile | null>(null);
-
-  const shard = form.tools?.grok;
-  const profiles = shard?.relayProfiles?.length ? shard.relayProfiles : [];
-  const activeId = shard?.activeRelayId || "";
-  const activeProfile = profiles.find((profile) => profile.id === activeId);
-
-  // 切换选中的供应商（或外部刷新）时，把草稿重置成磁盘上的值。
-  useEffect(() => {
-    setDraft(activeProfile ? { ...activeProfile } : null);
-    // 只在选中的供应商变化时重置，不要在每次 profiles 数组变化时打断编辑。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeProfile?.id, activeProfile?.name, activeProfile?.upstreamBaseUrl, activeProfile?.apiKey, activeProfile?.modelList]);
-
-  const draftDirty = Boolean(
-    draft
-      && activeProfile
-      && (draft.name !== activeProfile.name
-        || draft.upstreamBaseUrl !== activeProfile.upstreamBaseUrl
-        || draft.apiKey !== activeProfile.apiKey
-        || draft.modelList !== activeProfile.modelList),
-  );
-
-  const refresh = async () => {
-    setLoading(true);
-    try {
-      const loaded = await invoke<GrokProvidersResult>("load_grok_providers");
-      setResult(loaded);
-    } catch (error) {
-      await actions.showMessage(t("调用失败"), String(error), "failed");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    void refresh();
-    // 只在进入本页时拉一次；后续状态由本页自己的操作维护。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  /// 唯一真正落盘的地方。结构性操作（新增/删除/切换选中）用它，
-  /// 编辑区则攒够了再调一次。
-  const writeShard = async (
-    nextProfiles: RelayProfile[],
-    nextActiveId: string,
-  ): Promise<boolean> => {
-    const next: BackendSettings = {
-      ...form,
-      activeTool: "grok",
-      tools: {
-        ...form.tools,
-        grok: {
-          ...shard,
-          relayProfiles: nextProfiles,
-          activeRelayId: nextActiveId,
-        },
-      },
-    };
-    // saveSettingsValue 会把结果写回 settings / settingsForm，所以这里不需要
-    // 自己先 setState（那反而会跟服务端归一化后的结果打架）。
-    const saved = await actions.saveSettingsValue(next, true);
-    if (!saved) return false;
-    await refresh();
-    return true;
-  };
-
-  const addProfile = async () => {
-    const fresh = newGrokProfileDraft();
-    const ok = await writeShard([...profiles, fresh], fresh.id);
-    if (!ok) return;
-    // 新增后直接把草稿铺好，用户马上就能填。
-    setDraft({ ...fresh });
-    await actions.showMessage(t("已新增"), tf("已新增供应商「{0}」，填好模型列表后点「应用到 Grok」。", [fresh.name]), "ok");
-  };
-
-  const saveDraft = async () => {
-    if (!draft || !activeProfile || saving) return;
-    setSaving(true);
-    try {
-      const ok = await writeShard(
-        profiles.map((profile) => (profile.id === draft.id ? { ...profile, ...draft } : profile)),
-        activeId,
-      );
-      if (ok) await actions.showMessage(t("已保存"), tf("供应商「{0}」已保存。", [draft.name]), "ok");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const removeProfile = async (id: string) => {
-    const rest = profiles.filter((profile) => profile.id !== id);
-    await writeShard(rest, activeId === id ? (rest[0]?.id ?? "") : activeId);
-  };
-
-  const selectProfile = async (id: string) => {
-    if (id === activeId) return;
-    await writeShard(profiles, id);
-  };
-
-  const applyToGrok = async () => {
-    if (draftDirty) {
-      await actions.showMessage(t("有未保存修改"), t("请先保存当前供应商，再应用到 Grok。"), "failed");
-      setConfirming(false);
-      return;
-    }
-    setApplying(true);
-    try {
-      // 只把 Grok 分片交给后端，避免整份 settings 被当成「本次改动」写回去。
-      const applied = await invoke<GrokProvidersResult>("apply_grok_relay_profile", {
-        settings: {
-          ...form,
-          tools: { ...form.tools, grok: { ...shard, activeRelayId: activeId } },
-        },
-      });
-      setConfirming(false);
-      if (applied.status === "ok") {
-        await actions.showMessage(t("已应用"), applied.message, "ok");
-      } else {
-        await actions.showMessage(t("应用失败"), applied.message, "failed");
-      }
-      await refresh();
-    } catch (error) {
-      await actions.showMessage(t("调用失败"), String(error), "failed");
-    } finally {
-      setApplying(false);
-    }
-  };
-
-  const live = result?.live;
-
-  const viaGateway = (live?.modelsBaseUrl ?? "").includes("/gw/grok");
-
-  return (
-    <div className="grok-page-layout">
-      <GatewayBanner active={viaGateway} agentName="Grok" onOpen={onOpenGateway} />
-      {/* 最重要的是 Grok 实际生效的配置：放最上面，刷新跟它放在一起。 */}
-      <Panel className="grok-panel grok-live-panel">
-        <CardHeader className="panel-head grok-head">
-          <div>
-            <CardTitle>{t("Grok 当前配置")}</CardTitle>
-            <CardDescription>{live?.configPath || t("读取 ~/.grok/config.toml")}</CardDescription>
-          </div>
-          <Button disabled={loading} onClick={() => void refresh()} size="sm" variant="outline">
-            <RefreshCw className="h-4 w-4" />
-            {loading ? t("刷新中") : t("刷新")}
-          </Button>
-        </CardHeader>
-        <CardContent>
-          {live ? (
-            <div className="grok-live-grid">
-              <div className="grok-live-item">
-                <span className="grok-live-label">{t("CLI")}</span>
-                <span className="grok-live-value">{live.cliPath || t("未检测到")}</span>
-              </div>
-              <div className="grok-live-item">
-                <span className="grok-live-label">{t("默认模型")}</span>
-                <span className="grok-live-value">{live.defaultModel || t("未设置")}</span>
-              </div>
-              <div className="grok-live-item">
-                <span className="grok-live-label">{t("全局端点")}</span>
-                <span className="grok-live-value">{live.modelsBaseUrl || t("未设置")}</span>
-              </div>
-              <div className="grok-live-item">
-                <span className="grok-live-label">{t("受管模型")}</span>
-                <span className="grok-live-value">
-                  {live.models.length ? live.models.map((model) => model.alias).join("、") : t("无")}
-                </span>
-              </div>
-            </div>
-          ) : (
-            <p className="muted-line">{t("尚未读取。")}</p>
-          )}
-        </CardContent>
-      </Panel>
-
-      {/* 左边选供应商，右边编辑；按钮各归各：新增在列表头，保存与应用在编辑区头。 */}
-      <div className="grok-workspace">
-        <Panel className="grok-panel grok-list-panel">
-          <CardHeader className="panel-head grok-head">
-            <div>
-              <CardTitle>{t("Grok 供应商")}</CardTitle>
-              <CardDescription>{t("每个供应商对应一套 Base URL + API Key + 模型列表。")}</CardDescription>
-            </div>
-            <Button onClick={() => void addProfile()} size="sm" variant="outline">
-              <Plus className="h-4 w-4" />
-              {t("新增")}
-            </Button>
-          </CardHeader>
-          <CardContent>
-          {profiles.length === 0 ? (
-            <div className="grok-empty">
-              <Blocks className="h-5 w-5" aria-hidden="true" />
-              <div>
-                <strong>{t("还没有 Grok 供应商")}</strong>
-                <span>{t("点「新增供应商」，填好 Base URL、API Key 和模型列表，再点「应用到 Grok」。")}</span>
-              </div>
-            </div>
-          ) : (
-            <div className="grok-provider-list">
-              {profiles.map((profile) => {
-                const selected = profile.id === activeId;
-                const modelCount = profile.modelList.split(/[\r\n,]+/).filter((line) => line.trim()).length;
-                const endpoint = profile.upstreamBaseUrl || profile.baseUrl;
-                return (
-                  <div className={`grok-provider-row ${selected ? "active" : ""}`} key={profile.id}>
-                    {/* 与 Codex 供应商列表同一套：两字头像 + 名称 / 地址，删除悬停才出现。 */}
-                    <button
-                      className="grok-provider-pick"
-                      onClick={() => void selectProfile(profile.id)}
-                      type="button"
-                    >
-                      <span className="relay-index" aria-hidden="true">{providerInitial(profile.name)}</span>
-                      <span className="grok-provider-text">
-                        <span className="grok-provider-name">
-                          <span className="relay-summary-name">{profile.name || t("未命名供应商")}</span>
-                          {selected ? <span className="relay-active-badge">{t("使用中")}</span> : null}
-                        </span>
-                        {/* 左列较窄：模型数放进第二行，给名称留出空间。 */}
-                        <span className="grok-provider-url">
-                          {endpoint || t("未填写 Base URL")} · {tf("{0} 个模型", [String(modelCount)])}
-                        </span>
-                      </span>
-                    </button>
-                    <Button
-                      className="grok-provider-delete"
-                      onClick={() => void removeProfile(profile.id)}
-                      size="icon"
-                      title={t("删除供应商")}
-                      variant="ghost"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-          </CardContent>
-        </Panel>
-
-        <Panel className="grok-panel grok-editor-panel">
-          <CardHeader className="panel-head grok-head">
-            <div>
-              <CardTitle>{draft ? draft.name || t("未命名供应商") : t("编辑供应商")}</CardTitle>
-              <CardDescription>
-                {!draft ? t("在左边选一个供应商") : draftDirty ? t("有未保存修改") : t("改完先保存，再应用到 Grok 生效")}
-              </CardDescription>
-            </div>
-            <div className="grok-editor-actions">
-              <Button
-                disabled={saving || !draftDirty}
-                onClick={() => void saveDraft()}
-                size="sm"
-                title={draftDirty ? undefined : t("没有需要保存的修改")}
-                variant="outline"
-              >
-                <Save className="h-4 w-4" />
-                {saving ? t("保存中") : t("保存")}
-              </Button>
-              <Button
-                disabled={!activeProfile || applying || draftDirty}
-                onClick={() => setConfirming(true)}
-                size="sm"
-                title={
-                  !activeProfile
-                    ? t("请先选择一个供应商")
-                    : draftDirty
-                      ? t("请先保存当前修改")
-                      : undefined
-                }
-              >
-                <Play className="h-4 w-4" />
-                {applying ? t("应用中") : t("应用到 Grok")}
-              </Button>
-            </div>
-          </CardHeader>
-          <CardContent>
-            {draft ? (
-              <>
-                <div className="grok-provider-editor">
-              <Field label={t("名称")}>
-                <Input
-                  onChange={(event) => setDraft({ ...draft, name: event.currentTarget.value })}
-                  value={draft.name}
-                />
-              </Field>
-                  <div className="grok-editor-pair">
-              <Field label="Base URL">
-                <Input
-                  onChange={(event) => setDraft({ ...draft, upstreamBaseUrl: event.currentTarget.value })}
-                  placeholder="https://your-endpoint.example/v1"
-                  value={draft.upstreamBaseUrl}
-                />
-              </Field>
-              <Field label="API Key">
-                <Input
-                  onChange={(event) => setDraft({ ...draft, apiKey: event.currentTarget.value })}
-                  placeholder={t("留空则不改动 Grok 里已有的 Key")}
-                  type="password"
-                  value={draft.apiKey}
-                />
-              </Field>
-                  </div>
-              <Field label={t("模型列表")}>
-                <Textarea
-                  onChange={(event) => setDraft({ ...draft, modelList: event.currentTarget.value })}
-                  placeholder={"grok-4.5[1M]\ngrok-4.1-fast"}
-                  rows={4}
-                  value={draft.modelList}
-                />
-              </Field>
-                </div>
-                <p className="muted-line">{t("每行一个模型，可用 [1M] / [200K] 后缀声明上下文窗口。")}</p>
-              </>
-            ) : (
-              <p className="muted-line">{t("还没有选中的供应商。")}</p>
-            )}
-          </CardContent>
-        </Panel>
-      </div>
-
-      {confirming ? (
-        <ConfirmDialog
-          confirm={{            title: t("应用到 Grok？"),
-            message: tf(
-              "Grok 里所有由 Codex++ 管理的模型表会被供应商「{0}」的模型列表整体替换（[ui]、web_search 等未管理字段保留）。原配置会先备份。",
-              [activeProfile?.name || ""],
-            ),
-            confirmText: applying ? t("应用中") : t("确认应用"),
-            cancelText: t("取消"),
-          }}
-          onCancel={() => setConfirming(false)}
-          onConfirm={() => void applyToGrok()}
-        />
-      ) : null}
-    </div>
-  );
-}
-
 const SIDEBAR_COLLAPSED_KEY = "codex-plus-sidebar-collapsed";
 
 function loadCollapsedGroups(): string[] {
@@ -15268,8 +14876,6 @@ function routeSubtitle(route: Route) {
     overview: t("检查问题、启动与快速修复"),
     relay: t("管理 API 供应商、协议、Key 与配置文件"),
     multiLaunch: t("为不同供应商启动相互隔离的 Codex 实例"),
-    grok: t("管理 Grok CLI 的模型与 API 端点"),
-    claudeRelay: t("管理 Claude Code 的 API 供应商，切换时写入 ~/.claude/settings.json"),
     claude: t("保留官方 Claude.app 原样，通过增强版为 Claude 应用增强功能"),
     relayEnvironment: t("统一管理本地协议代理、供应商代理与重试策略"),
     requestLog: t("查看代理请求的状态、模型、重试、token 用量与缓存命中"),

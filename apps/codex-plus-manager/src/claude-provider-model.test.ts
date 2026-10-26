@@ -85,10 +85,11 @@ test("校验：名称必填，Base URL 必须是 http(s)", () => {
   assert.ok(validateProviderDraft(draft));
 });
 
-test("Claude 的供应商配置挂在 Claude 菜单，切到 Claude 先落在这一页", () => {
-  assert.match(app, /\{ id: "claudeRelay", get label\(\) \{ return t\("供应商配置"\); \}, icon: KeyRound, tool: "claude" \}/);
+test("Claude / Grok 的供应商配置页已去掉：要么经网关接入供应商池，要么照 Agent 自己的配置直连", () => {
+  assert.doesNotMatch(app, /id: "claudeRelay"/);
+  assert.doesNotMatch(app, /id: "grok", get label/);
+  assert.doesNotMatch(app, /<ClaudeProviderPage|function GrokScreen/);
   const sections = app.slice(app.indexOf("const navigationSections"), app.indexOf("const globalNavigationRoutes"));
-  assert.match(sections, /"claudeRelay", "claude"/);
-  assert.match(app, /if \(currentRoute\?\.tool !== "claude"\) setRoute\("claudeRelay"\);/);
-  assert.match(app, /route === "claudeRelay" \? \(\s*<ClaudeProviderPage/);
+  assert.doesNotMatch(sections, /"claudeRelay"|"grok"/);
+  assert.match(sections, /"claude"/, "Claude 增强保留");
 });
