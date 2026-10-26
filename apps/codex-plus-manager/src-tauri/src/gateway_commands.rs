@@ -32,6 +32,8 @@ pub struct GatewayPoolEntry {
     /// 预设 key 或导入来源，界面判断「已添加」用。
     pub source: String,
     pub price: Option<codex_plus_core::gateway::store::ProviderPrice>,
+    /// 登录得到的账号：`chatgpt` / `copilot` / `grok`；普通供应商为空。
+    pub account: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,7 +113,23 @@ fn pool_entry(
         enabled,
         source: source.to_string(),
         price,
+        account: account_kind(relay),
     }
+}
+
+fn account_kind(relay: &RelayProfile) -> String {
+    if codex_plus_core::official_login::member_uses_official_login_transport(relay) {
+        return "chatgpt".to_string();
+    }
+    serde_json::from_str::<serde_json::Value>(&relay.auth_contents)
+        .ok()
+        .and_then(|value| {
+            value
+                .get(codex_plus_core::gateway::accounts::ACCOUNT_KIND_FIELD)
+                .and_then(|kind| kind.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
 }
 
 fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> GatewayPayload {
@@ -753,6 +771,97 @@ pub async fn login_gateway_chatgpt() -> CommandResult<Option<GatewayPayload>> {
     .await;
     let result = refresh_agents(result);
     match result {
+        Ok(message) => ok(&message, current_payload()),
+        Err(error) => failed(&format!("登录失败：{error:#}"), current_payload()),
+    }
+}
+
+/// 账号类供应商（Copilot / SuperGrok）加进网关池；同一个账号（按 `identity_field`）已存在时只换凭据。
+fn add_account_provider(
+    relay: codex_plus_core::settings::RelayProfile,
+    kind: &str,
+    identity_field: &str,
+) -> anyhow::Result<String> {
+    use codex_plus_core::gateway::accounts::ACCOUNT_KIND_FIELD;
+    let identity = |contents: &str| {
+        serde_json::from_str::<serde_json::Value>(contents)
+            .ok()
+            .filter(|value| {
+                value.get(ACCOUNT_KIND_FIELD).and_then(|kind| kind.as_str()) == Some(kind)
+            })
+            .and_then(|value| {
+                value
+                    .get(identity_field)
+                    .and_then(|field| field.as_str())
+                    .map(str::to_string)
+            })
+            .filter(|value| !value.is_empty())
+    };
+    let store = GatewayStore::default();
+    let mut gateway = store.load()?;
+    if let Some(id) = identity(&relay.auth_contents)
+        && let Some(provider) = gateway.providers.iter_mut().find(|provider| {
+            identity(&provider.relay.auth_contents).as_deref() == Some(id.as_str())
+        })
+    {
+        provider.relay.auth_contents = relay.auth_contents.clone();
+        if !relay.model_list.trim().is_empty() {
+            provider.relay.model_list = relay.model_list.clone();
+        }
+        let name = provider.relay.name.clone();
+        store.save(&gateway)?;
+        return Ok(format!("已更新「{name}」的登录。"));
+    }
+    let name = relay.name.clone();
+    let count = relay
+        .model_list
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    apply::add_provider(&store, relay, &format!("login:{kind}"))?;
+    Ok(format!("已添加「{name}」，{count} 个模型。"))
+}
+
+/// Copilot 登录第一步：向 GitHub 要设备验证码，并在浏览器打开输入验证码的页面。
+#[tauri::command]
+pub async fn start_gateway_copilot_login()
+-> CommandResult<Option<codex_plus_core::gateway::accounts::DeviceCode>> {
+    match codex_plus_core::gateway::accounts::copilot_device_code().await {
+        Ok(code) => {
+            open_in_browser(&code.verification_uri);
+            ok("请在浏览器里输入验证码。", Some(code))
+        }
+        Err(error) => failed(&format!("登录失败：{error:#}"), None),
+    }
+}
+
+/// Copilot 登录第二步：等用户在 GitHub 上授权，换 Copilot token，加进网关池。
+#[tauri::command]
+pub async fn finish_gateway_copilot_login(
+    code: codex_plus_core::gateway::accounts::DeviceCode,
+) -> CommandResult<Option<GatewayPayload>> {
+    let result = async {
+        let relay = codex_plus_core::gateway::accounts::copilot_finish(&code).await?;
+        add_account_provider(relay, "copilot", "login")
+    }
+    .await;
+    match refresh_agents(result) {
+        Ok(message) => ok(&message, current_payload()),
+        Err(error) => failed(&format!("登录失败：{error:#}"), current_payload()),
+    }
+}
+
+/// 在网关里登录 SuperGrok：浏览器登录后加进网关池。与 Grok CLI 自己的登录互不影响。
+#[tauri::command]
+pub async fn login_gateway_grok() -> CommandResult<Option<GatewayPayload>> {
+    use codex_plus_core::gateway::accounts;
+    let result = async {
+        let tokens = accounts::grok_login(open_in_browser).await?;
+        let models = accounts::grok_models(&tokens.access_token).await;
+        add_account_provider(accounts::grok_relay(&tokens, &models), "grok", "email")
+    }
+    .await;
+    match refresh_agents(result) {
         Ok(message) => ok(&message, current_payload()),
         Err(error) => failed(&format!("登录失败：{error:#}"), current_payload()),
     }

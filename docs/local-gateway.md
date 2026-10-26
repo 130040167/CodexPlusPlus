@@ -80,8 +80,15 @@ Agent 打开「接入」后，池里所有打开的供应商的模型和所有�
 
 - **ChatGPT**：在网关里走与 Codex CLI 相同的浏览器 PKCE 登录（本机 1455 端口接回调）。token 只存在 gateway.json，
   凭据带 `codex_plus_gateway` 标记，刷新结果写回网关、不采纳 Codex 的 live 登录——与 Codex 自己的登录是两次独立的登录。
-- 其它订阅（Claude、Grok、Copilot、Gemini、Antigravity）暂未接入：它们要冒用官方客户端身份调用未公开的接口，
-  且部分厂商条款明确禁止（Anthropic 曾因此要求下架同类插件）。
+- **GitHub Copilot**：GitHub 设备码登录（VS Code Copilot 的 OAuth App），用 GitHub token 换 Copilot 的短期 token
+  （约 30 分钟），请求前快过期时自动换新并写回 gateway.json；Chat Completions 协议，带 VS Code Copilot Chat 的请求头。
+- **SuperGrok**：auth.x.ai 浏览器 PKCE 登录（Grok CLI 的公开客户端），推理走订阅额度的 `cli-chat-proxy.grok.com/v1`
+  （Responses 协议，带 Grok CLI 的客户端标识头，版本号被 xAI 提高时会回 426，需要跟着改）；access token 快过期时用
+  refresh token 换新。部分 SuperGrok 账号会被 xAI 的白名单拒绝（403），这时只能用 API Key。
+- 账号类凭据都带 `codex_plus_account` / `codex_plus_gateway` 标记，与各 Agent 自己的登录互不影响。
+- 没有接入：Claude 订阅（Anthropic 条款只允许官方客户端使用订阅凭据）、Gemini CLI（Google 已于 2026-06-18 停止个人账号的
+  Code Assist，且其说明写明第三方使用违反政策）、Antigravity（客户端密钥未公开，只能从客户端里提取）。
+- 以上登录都是冒用官方客户端身份调用未公开的接口，可能随时失效，也有账号被限制的风险。
 
 ## 限制
 

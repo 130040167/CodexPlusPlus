@@ -6,7 +6,8 @@
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
   // 本地网关
-  "登录 ChatGPT": "Sign in to ChatGPT",
+  "登录 GitHub Copilot": "Sign in to GitHub Copilot",
+  "复制验证码": "Copy code",
   "已在浏览器打开登录页，登录完成后回到这里。5 分钟内有效。": "The sign-in page is open in your browser. Come back here when you're done; it's valid for 5 minutes.",
   "订阅登录": "Subscription sign-in",
   "登录即可，无需密钥；与 Codex 自己的登录互不影响": "sign in, no key; separate from Codex's own sign-in",
@@ -2044,6 +2045,9 @@ export const EN_PLAIN: Record<string, string> = {
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
   // 本地网关
+  "登录 {0}": "Sign in to {0}",
+  "已在浏览器打开 {0}，输入下面的验证码并授权。授权完成后这里会自动继续。": "{0} is open in your browser. Enter the code below and authorize; this continues automatically afterwards.",
+  "验证码 {0} 分钟内有效。需要这个 GitHub 账号有 Copilot 订阅。": "The code is valid for {0} minutes. This GitHub account needs a Copilot subscription.",
   "{0} 分钟前": "{0} min ago",
   "{0} 小时前": "{0} h ago",
   "{0} 天前": "{0} d ago",

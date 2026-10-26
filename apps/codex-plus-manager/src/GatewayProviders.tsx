@@ -3,9 +3,10 @@
  * 与直连模式完全独立：这里的增删改只动 gateway.json；「导入…」是把直连模式的供应商复制一份过来。
  */
 import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { createPortal } from "react-dom";
 import { confirm } from "@tauri-apps/plugin-dialog";
-import { ChevronRight, GripVertical, Plus, Search, X } from "lucide-react";
+import { ChevronRight, Copy, GripVertical, Plus, Search, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -30,7 +31,13 @@ import {
   type PresetSection,
   type ProviderDraft,
 } from "./gateway-model";
-import { AGENT_ICONS, Avatar, Switch, type Notify, type Run } from "./gateway-ui";
+import { Avatar, Switch, type Notify, type Run } from "./gateway-ui";
+
+/** 能在网关里直接登录的订阅。 */
+type AccountKind = "chatgpt" | "copilot" | "grok";
+type DeviceCode = { deviceCode: string; userCode: string; verificationUri: string; interval: number; expiresIn: number };
+
+const ACCOUNT_LABELS: Record<AccountKind, string> = { chatgpt: "ChatGPT", copilot: "GitHub Copilot", grok: "SuperGrok" };
 
 /** 表单弹窗的用途：按预设新建、自定义新建、编辑已有供应商。 */
 type FormState = { mode: "preset"; preset: GatewayPreset } | { mode: "custom" } | { mode: "edit"; entry: GatewayPoolEntry };
@@ -52,6 +59,7 @@ export function ProvidersView({
   const [catalogOpen, setCatalogOpen] = useState(false);
   const [dragging, setDragging] = useState<string | null>(null);
   const [form, setForm] = useState<FormState | null>(null);
+  const [deviceCode, setDeviceCode] = useState<DeviceCode | null>(null);
   const showCatalog = catalogOpen || (payload !== null && pool.length === 0);
   const needle = query.trim().toLowerCase();
   const visible = pool.filter((entry) => !needle || entry.name.toLowerCase().includes(needle) || entry.models.some((model) => model.toLowerCase().includes(needle)));
@@ -62,6 +70,31 @@ export function ProvidersView({
     ids.splice(ids.indexOf(targetId), 0, dragging);
     setDragging(null);
     void run("reorder", "reorder_gateway_providers", { ids }, t("调整顺序"), true);
+  };
+
+  /** 登录订阅账号：ChatGPT / SuperGrok 走浏览器登录；Copilot 先显示验证码，再等你在 GitHub 上授权。 */
+  const login = async (kind: AccountKind) => {
+    const title = tf("登录 {0}", [ACCOUNT_LABELS[kind]]);
+    if (kind === "copilot") {
+      let code: DeviceCode;
+      try {
+        const result = await invoke<{ status: string; message: string } & Partial<DeviceCode>>("start_gateway_copilot_login");
+        if (result.status !== "ok" || !result.userCode || !result.deviceCode) {
+          await notify(tf("{0}失败", [title]), result.message, "failed");
+          return;
+        }
+        code = { deviceCode: result.deviceCode, userCode: result.userCode, verificationUri: result.verificationUri ?? "https://github.com/login/device", interval: result.interval ?? 5, expiresIn: result.expiresIn ?? 900 };
+      } catch (error) {
+        await notify(t("调用失败"), String(error), "failed");
+        return;
+      }
+      setDeviceCode(code);
+      await run("login:copilot", "finish_gateway_copilot_login", { code }, title);
+      setDeviceCode(null);
+      return;
+    }
+    void notify(title, t("已在浏览器打开登录页，登录完成后回到这里。5 分钟内有效。"), "info");
+    await run(`login:${kind}`, kind === "chatgpt" ? "login_gateway_chatgpt" : "login_gateway_grok", undefined, title);
   };
 
   const submit = async (draft: ProviderDraft) => {
@@ -97,6 +130,7 @@ export function ProvidersView({
               onDragStart={() => setDragging(entry.id)}
               onDrop={() => drop(entry.id)}
               onEdit={() => setForm({ mode: "edit", entry })}
+              onRelogin={() => void login(entry.account as AccountKind)}
               onToggleExpand={() => setExpanded(expanded === entry.id ? null : entry.id)}
               payload={payload}
               run={run}
@@ -118,11 +152,13 @@ export function ProvidersView({
           notify={notify}
           onClose={() => setCatalogOpen(false)}
           onCustom={() => setForm({ mode: "custom" })}
+          onLogin={(kind) => void login(kind)}
           onPreset={(preset) => setForm({ mode: "preset", preset })}
           payload={payload}
           run={run}
         />
       ) : null}
+      {deviceCode ? <DeviceCodeDialog code={deviceCode} notify={notify} onClose={() => setDeviceCode(null)} /> : null}
       {form ? <ProviderFormDialog busy={busy} form={form} onCancel={() => setForm(null)} onSubmit={(draft) => void submit(draft)} /> : null}
     </>
   );
@@ -140,6 +176,7 @@ function PoolRow({
   onDragEnd,
   onDrop,
   onEdit,
+  onRelogin,
 }: {
   entry: GatewayPoolEntry;
   payload: GatewayPayload | null;
@@ -152,6 +189,7 @@ function PoolRow({
   onDragEnd: () => void;
   onDrop: () => void;
   onEdit: () => void;
+  onRelogin: () => void;
 }) {
   const enabled = providerEnabled(entry);
   const status = memberStatus(payload, entry.id);
@@ -159,7 +197,7 @@ function PoolRow({
   const breaker = payload?.health.providers.some((item) => item.relayId === entry.id && item.breakerOpen);
   const statusText = !enabled ? t("已关闭") : status.args.length ? tf(status.text, status.args) : t(status.text);
   const tone = !enabled ? "off" : status.state === "cooling" ? "error" : "on";
-  const sub = (entry.official
+  const sub = (entry.account
     ? [t("订阅登录"), tf("{0} 个模型", [entry.models.length])]
     : [protocolLabel(entry.protocol), presetHost(entry.baseUrl), tf("{0} 个模型", [entry.models.length])]
   ).filter(Boolean).join(" · ");
@@ -230,8 +268,8 @@ function PoolRow({
           <div className="gw-detail-row gw-detail-foot">
             <span className="gw-detail-label gw-detail-file">{t("只属于网关，直连模式里看不到")}</span>
             <div className="gw-detail-value">
-              {entry.official ? (
-                <button className="gw-text-button" disabled={busy !== null} onClick={() => void run("login:chatgpt", "login_gateway_chatgpt", undefined, t("登录 ChatGPT"))} type="button">
+              {entry.account ? (
+                <button className="gw-text-button" disabled={busy !== null} onClick={onRelogin} type="button">
                   {t("重新登录")}
                   <ChevronRight className="h-3.5 w-3.5" />
                 </button>
@@ -264,6 +302,7 @@ function ProviderCatalog({
   onClose,
   onPreset,
   onCustom,
+  onLogin,
 }: {
   payload: GatewayPayload | null;
   busy: string | null;
@@ -273,6 +312,7 @@ function ProviderCatalog({
   onClose: () => void;
   onPreset: (preset: GatewayPreset) => void;
   onCustom: () => void;
+  onLogin: (kind: AccountKind) => void;
 }) {
   const [query, setQuery] = useState("");
   const [importing, setImporting] = useState(false);
@@ -282,18 +322,21 @@ function ProviderCatalog({
   const presetItems = (section: PresetSection): CatalogItem[] => presets
     .filter((preset) => preset.section === section && hit(preset.name, preset.baseUrl))
     .map((preset) => ({ key: preset.key, name: preset.name, added: presetAdded(payload, preset), onClick: () => onPreset(preset) }));
-  const subscriptions: CatalogItem[] = hit("ChatGPT", t("订阅"))
-    ? [{
-        key: "chatgpt",
-        name: "ChatGPT",
-        icon: <img alt="" className="gw-catalog-logo" src={AGENT_ICONS.codex} />,
-        added: Boolean(payload?.pool.some((entry) => entry.official)),
-        onClick: () => void (async () => {
-          void notify(t("登录 ChatGPT"), t("已在浏览器打开登录页，登录完成后回到这里。5 分钟内有效。"), "info");
-          await run("login:chatgpt", "login_gateway_chatgpt", undefined, t("登录 ChatGPT"));
-        })(),
-      }]
-    : [];
+  const loggedIn = (kind: AccountKind) => Boolean(payload?.pool.some((entry) => entry.account === kind));
+  const subscriptions: CatalogItem[] = (
+    [
+      { kind: "chatgpt", name: "ChatGPT", icon: "openai" },
+      { kind: "copilot", name: "GitHub Copilot", icon: "githubcopilot" },
+      { kind: "grok", name: "SuperGrok", icon: "grok" },
+    ] as Array<{ kind: AccountKind; name: string; icon: string }>
+  )
+    .filter((item) => hit(item.name, t("订阅")))
+    .map((item) => ({
+      key: `login:${item.kind}`,
+      name: item.name,
+      added: loggedIn(item.kind),
+      onClick: () => onLogin(item.kind),
+    }));
   const local: CatalogItem[] = [
     ...presetItems("local"),
     ...(hit(t("自定义")) ? [{ key: "custom", name: t("自定义"), icon: <span className="gw-avatar gw-avatar-plus" data-size="sm"><Plus className="h-3.5 w-3.5" /></span>, onClick: onCustom }] : []),
@@ -505,6 +548,37 @@ function ProviderFormDialog({
           <Button disabled={busy !== null || Boolean(validation)} size="sm" type="submit">{busy ? t("保存中") : editing ? t("保存") : t("添加到供应商池")}</Button>
         </footer>
       </form>
+    </div>,
+    document.body,
+  );
+}
+
+/** Copilot 设备码登录：显示验证码，等你在 GitHub 页面里输入并授权。 */
+function DeviceCodeDialog({ code, notify, onClose }: { code: DeviceCode; notify: Notify; onClose: () => void }) {
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(code.userCode);
+      await notify(t("已复制"), code.userCode, "ok");
+    } catch (error) {
+      await notify(t("复制失败"), String(error), "failed");
+    }
+  };
+  return createPortal(
+    <div className="gw-modal-backdrop gw-portal">
+      <div className="gw-modal gw-device-modal">
+        <header>
+          <strong>{t("登录 GitHub Copilot")}</strong>
+          <button aria-label={t("关闭")} className="gw-icon-button" onClick={onClose} type="button"><X className="h-4 w-4" /></button>
+        </header>
+        <div className="gw-modal-body">
+          <p className="gw-muted">{tf("已在浏览器打开 {0}，输入下面的验证码并授权。授权完成后这里会自动继续。", [code.verificationUri])}</p>
+          <button className="gw-device-code" onClick={() => void copy()} title={t("复制验证码")} type="button">
+            <span>{code.userCode}</span>
+            <Copy className="h-4 w-4" />
+          </button>
+          <p className="gw-muted">{tf("验证码 {0} 分钟内有效。需要这个 GitHub 账号有 Copilot 订阅。", [Math.round(code.expiresIn / 60)])}</p>
+        </div>
+      </div>
     </div>,
     document.body,
   );

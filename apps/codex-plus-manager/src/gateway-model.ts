@@ -48,6 +48,8 @@ export type GatewayPoolEntry = {
   source?: string;
   /** 每百万 token 的价格。 */
   price?: ProviderPrice | null;
+  /** 登录得到的账号：chatgpt / copilot / grok；普通供应商为空。 */
+  account?: string;
 };
 
 export type ProviderPrice = { currency: string; input: number; cachedInput: number; output: number };

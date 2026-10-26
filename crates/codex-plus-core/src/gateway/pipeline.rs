@@ -126,6 +126,20 @@ async fn open_candidates(
         if let Some(id) = request.live_request_id {
             crate::request_log::update_running_retry(id, trace.attempts, 0, Vec::new());
         }
+        // 账号类供应商（如 Copilot）在请求前换好短期 token。
+        let prepared = match crate::gateway::accounts::prepare_relay(&candidate.relay).await {
+            Ok(relay) => GatewayCandidate {
+                relay,
+                ..candidate.clone()
+            },
+            Err(error) => {
+                recorder.step(candidate, "transport", Some("auth_invalid"), None);
+                log_attempt_failure(candidate, None, Some(&error), has_more);
+                last_error = Some(error);
+                continue;
+            }
+        };
+        let candidate = &prepared;
         let busy = recorder.begin(candidate);
         let native = request
             .anthropic
