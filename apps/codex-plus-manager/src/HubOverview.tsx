@@ -96,8 +96,8 @@ export function HubOverview({
 
   return (
     <div className="hub-page">
+      {/* 页面标题已在外壳顶栏，这里只留一句现状说明。 */}
       <header className="hub-intro">
-        <h2>{t("接入总览")}</h2>
         <p>
           {tf("{0} 个 Agent 通过 Codex++ 共用 {1} 个供应商。请求按模型名路由，Key 冷却或供应商熔断时自动换上游。", [connected, providers.length])}
         </p>

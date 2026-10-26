@@ -7,6 +7,7 @@ import { ManagementDrawer } from "./ManagementPages";
 import "./ManagementPages.css";
 import { parseSkillRepository } from "./skill-repository";
 import { SkillListViewport } from "./SkillListViewport";
+import { TopbarActions } from "./TopbarActions";
 
 type Result = { status: string; message: string };
 type Notify = (title: string, message: string, status?: "ok" | "failed") => Promise<void>;
@@ -18,7 +19,8 @@ const SKILL_GROUP_STORAGE_KEY = "codex-plus-plus.skill-groups.v1";
 const ok = (r: Result) => r.status === "ok";
 function Button({ children, onClick, disabled, primary }: { children: ReactNode; onClick: () => void; disabled?: boolean; primary?: boolean }) { return <button type="button" className={"mg-button " + (primary ? "mg-primary" : "")} onClick={onClick} disabled={disabled}>{children}</button>; }
 function SearchBox({ value, onChange, placeholder }: { value: string; onChange: (v: string) => void; placeholder: string }) { return <div className="mg-search"><Search size={14} /><input aria-label={placeholder} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} /></div>; }
-function Header({ icon, title, actions }: { icon: ReactNode; title: string; actions: ReactNode }) { return <header className="mg-header" data-tauri-drag-region><div className="mg-header-title">{icon}<h1>{title}</h1></div><div className="mg-header-actions">{actions}</div></header>; }
+// 标题由外壳顶栏显示；这里只把页面操作送进顶栏。
+function Header({ actions }: { icon?: ReactNode; title?: string; actions: ReactNode }) { return <TopbarActions>{actions}</TopbarActions>; }
 function Field({ label, children }: { label: string; children: ReactNode }) { return <label className="mg-field"><span>{label}</span>{children}</label>; }
 function repoKey(repo: Repo) { return `${repo.owner}/${repo.name}@${repo.branch}${repo.subdir ? `:${repo.subdir}` : ""}`; }
 function repoFromKey(key: string | null): Repo | null {

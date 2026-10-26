@@ -236,17 +236,47 @@ const gatewayUsage = ok({
   costs: [{ currency: "CNY", amount: 12.84 }],
 });
 
+// 缓存清理演示数据：三个应用、各类目录，数字取自一台常用机器的量级。
+const cacheGroup = (id: string, app: string, kind: string, totalMiB: number, eligibleMiB: number, files: number) => ({
+  id, app, kind, path: `~/Library/Caches/${app}/${kind}`, totalBytes: totalMiB * 1048576, eligibleBytes: eligibleMiB * 1048576,
+  eligibleFiles: files, skippedFiles: 3, cleanable: kind !== "temporary",
+});
+const agentCacheReport = {
+  scanId: "demo",
+  warnings: [],
+  groups: [
+    cacheGroup("codex-cache", "Codex", "cache", 83, 80, 412),
+    cacheGroup("codex-logs", "Codex", "logs", 221, 153, 96),
+    cacheGroup("codex-tmp", "Codex", "temporary", 894, 0, 0),
+    cacheGroup("claude-cache", "Claude", "cache", 23, 23, 120),
+    cacheGroup("claude-logs", "Claude", "logs", 36, 36, 40),
+    cacheGroup("plus-update", "Codex++", "update", 459, 459, 2),
+    cacheGroup("plus-cache", "Codex++", "cache", 0.07, 0.07, 6),
+  ],
+};
+
+// 推荐内容演示数据：中性名称，横幅用内联 SVG，不请求外部图片。
+const demoBanner = (label: string, hue: number) =>
+  `data:image/svg+xml;utf8,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="640" height="200"><defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="hsl(${hue} 60% 18%)"/><stop offset="1" stop-color="hsl(${hue + 40} 60% 30%)"/></linearGradient></defs><rect width="640" height="200" fill="url(#g)"/><text x="40" y="118" font-family="Helvetica" font-size="44" font-weight="700" fill="white">${label}</text></svg>`)}`;
+const demoAds = [
+  { id: "demo-a", type: "sponsor", title: "示例中转站 A", description: "稳定的 API 中转服务，支持主流模型与图像能力，适合日常开发和团队协作。", url: "https://example.com/a", image: demoBanner("Relay A", 220), highlights: ["价格划算", "稳定接入", "高缓存命中"] },
+  { id: "demo-b", type: "sponsor", title: "示例聚合平台 B", description: "一个 Key 访问多家模型，兼容 Claude Code 等工具。", url: "https://example.com/b", image: demoBanner("Hub B", 280), highlights: ["多模型", "兼容 Claude Code"] },
+  { id: "demo-c", type: "sponsor", title: "示例服务 C", description: "开放、稳定、高性价比的模型中转。", url: "https://example.com/c", image: demoBanner("Service C", 20), highlights: ["按量计费"] },
+  { id: "demo-d", type: "normal", title: "示例教程", description: "如何把多个 Agent 接到同一个供应商池。", url: "https://example.com/d", highlights: [] },
+];
+
 const settingsResult = () => ok({ revision: "web-preview", settings: demoSettings, settings_path: "演示模式", user_scripts: { enabled: true, skip_next_start: false, scripts: [] } });
 
 export async function invoke<T = unknown>(command: string, args: Record<string, unknown> = {}): Promise<T> {
   switch (command) {
     case "list_tools": return tools as T;
     case "load_gateway": return gateway as T;
+    case "scan_agent_cache": return ok({ report: agentCacheReport }) as T;
     case "load_gateway_usage": return gatewayUsage as T;
     case "startup_options": return ok({ showUpdate: false }) as T;
     case "consume_pending_manager_navigation": return null as T;
     case "load_overview": return overview as T;
-    case "load_ads": return ok({ version: 1, ads: [], topAds: [] }) as T;
+    case "load_ads": return ok({ version: 1, ads: demoAds, topAds: [] }) as T;
     case "load_settings":
     case "save_settings":
     case "reset_settings":

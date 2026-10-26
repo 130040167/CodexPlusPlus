@@ -154,7 +154,7 @@
     "Liberation Mono", Menlo, Courier, "PingFang SC", "Microsoft YaHei";
 
   font-family: var(--font-sans);
-  font-size: 13.5px;
+  font-size: 13px;
   font-variant-numeric: tabular-nums;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -5383,7 +5383,7 @@ input[type="range"]:disabled {
   }
 
   .shell {
-    grid-template-columns: 200px minmax(0, 1fr);
+    grid-template-columns: 188px minmax(0, 1fr);
   }
 
   .grid.two,
@@ -6097,7 +6097,7 @@ select {
 /* ── 外壳 ───────────────────────────────────────────────────── */
 
 .shell {
-  grid-template-columns: 248px minmax(0, 1fr);
+  grid-template-columns: 220px minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
   background: hsl(var(--shell-bg));
 }
@@ -6837,7 +6837,7 @@ select {
 
 @media (max-width: 1080px) {
   .shell {
-    grid-template-columns: 220px minmax(0, 1fr);
+    grid-template-columns: 204px minmax(0, 1fr);
   }
 
   .enhance-panel .mode-grid,
@@ -11831,11 +11831,11 @@ select {
 .side-hub {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin: 12px 10px 6px;
-  padding: 9px 10px;
+  gap: 9px;
+  margin: 10px 8px 4px;
+  padding: 6px 8px;
   border: 1px solid hsl(var(--sidebar-border));
-  border-radius: 10px;
+  border-radius: 9px;
   background: linear-gradient(180deg, hsl(var(--surface-raised)), hsl(var(--sidebar-bg)));
   color: hsl(var(--foreground));
   font: inherit;
@@ -11849,8 +11849,8 @@ select {
 }
 
 .side-hub img {
-  width: 28px;
-  height: 28px;
+  width: 24px;
+  height: 24px;
   flex: none;
   border-radius: 7px;
   user-select: none;
@@ -11862,7 +11862,7 @@ select {
 
 .side-hub-text strong {
   display: block;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 650;
 }
 
@@ -11895,8 +11895,8 @@ select {
   display: flex;
   align-items: center;
   gap: 9px;
-  margin: 0 10px 4px;
-  padding: 6px 9px;
+  margin: 0 8px 2px;
+  padding: 5px 8px;
   border: 0;
   border-radius: 7px;
   background: transparent;
@@ -11927,13 +11927,13 @@ select {
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 0 10px 12px;
+  padding: 0 8px 10px;
 }
 
 .side-group-label {
   display: flex;
   align-items: center;
-  padding: 12px 0 3px;
+  padding: 10px 0 2px;
 }
 
 .side-group-label > button:first-child {
@@ -12002,16 +12002,16 @@ select {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 9px;
   width: 100%;
-  min-height: 30px;
+  min-height: 27px;
   padding: 0 8px;
   border: 0;
   border-radius: 6px;
   background: transparent;
   color: hsl(var(--muted-foreground));
   font: inherit;
-  font-size: 13px;
+  font-size: 12.5px;
   text-align: left;
   cursor: pointer;
 }
@@ -12031,15 +12031,15 @@ button.side-item:hover {
   position: absolute;
   top: 7px;
   bottom: 7px;
-  left: -10px;
+  left: -8px;
   width: 2px;
   border-radius: 2px;
   background: hsl(var(--brand-accent));
 }
 
 .side-item-icon {
-  width: 16px;
-  height: 16px;
+  width: 15px;
+  height: 15px;
   flex: none;
   stroke-width: 1.8;
 }
@@ -12084,16 +12084,16 @@ button.side-item:hover {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 5px;
+  gap: 4px;
   min-width: 0;
-  height: 28px;
-  padding: 0 6px;
+  height: 25px;
+  padding: 0 3px;
   border: 0;
   border-radius: 6px;
   background: transparent;
   color: hsl(var(--muted-foreground));
   font: inherit;
-  font-size: 12px;
+  font-size: 11.5px;
   cursor: pointer;
 }
 
@@ -12105,8 +12105,8 @@ button.side-item:hover {
 }
 
 .side-agent-tab .side-item-icon {
-  width: 14px;
-  height: 14px;
+  width: 13px;
+  height: 13px;
 }
 
 .side-agent-tab:hover:not(:disabled) {
@@ -12149,7 +12149,7 @@ button.side-item:hover {
   display: flex;
   align-items: center;
   gap: 2px;
-  padding: 8px 10px 10px 14px;
+  padding: 6px 8px 8px 12px;
   border-top: 1px solid hsl(var(--sidebar-border));
 }
 
@@ -12244,7 +12244,8 @@ button.side-item:hover {
 
 .topbar-title h1 {
   overflow: hidden;
-  font-size: 14.5px;
+  font-size: 13.5px;
+  font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -12540,4 +12541,208 @@ button.side-item:hover {
   .modal-card {
     animation: none;
   }
+}
+
+/* ── Graphite · 紧凑密度 ─────────────────────────────────────────
+   所有旧页面共用的收口：单行顶栏、内容直接铺在画布上（不再框中套框）、
+   卡片 / 列表行 / 控件统一收紧，字号以 13px 为基准。
+   组件 CSS 与本文件的加载先后在开发预览和正式构建里不同，所以每条规则都加 .shell 前缀提高特异性，
+   不依赖加载顺序。 */
+
+/* 顶栏：面包屑与副标题同一行 */
+.shell .topbar {
+  min-height: 44px;
+  padding: 0 18px;
+}
+.shell .topbar-heading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.shell .topbar-heading > p {
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+  margin: 0;
+  font-size: 12px;
+}
+.shell .topbar-actions {
+  align-items: center;
+}
+.shell .topbar-page-actions {
+  display: contents;
+}
+
+/* 内容区 */
+.shell .screen {
+  gap: 12px;
+  padding: 14px 20px 24px;
+}
+
+/* 管理页（供应商、多开、MCP、Skills、会话、Agent 协作、Computer Use…）与网关页：
+   去掉外层描边框和渐变底，内容直接放在画布上 */
+.shell .mg-page {
+  margin: 0 auto;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.shell .mg-page > .mg-content {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.shell .mg-toolbar,
+.shell .mg-tabs-bar,
+.shell .mg-session-controls {
+  min-height: 0;
+  padding: 0 0 12px;
+}
+.shell .mg-button,
+.shell .mg-icon-button {
+  height: 28px;
+  border-color: hsl(var(--input));
+  border-radius: 7px;
+  font-size: 12.5px;
+}
+.shell .mg-icon-button {
+  width: 28px;
+  border-color: transparent;
+}
+.shell .mg-primary {
+  border-color: hsl(var(--primary));
+  background: hsl(var(--primary));
+  box-shadow: none;
+}
+.shell .mg-search {
+  width: 280px;
+  height: 28px;
+  border-radius: 7px;
+  background: hsl(var(--surface-sunken));
+}
+.shell .mg-tabs,
+.shell .mg-segmented {
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  background: hsl(var(--surface-sunken));
+}
+.shell .mg-tabs button,
+.shell .mg-segmented button {
+  padding: 3px 10px;
+  font-size: 12.5px;
+}
+.shell .mg-tabs button[data-active="true"],
+.shell .mg-segmented button[data-active="true"] {
+  background: hsl(var(--accent));
+  box-shadow: none;
+  color: hsl(var(--foreground));
+}
+.shell .mg-matrix,
+.shell .mg-skill-list,
+.shell .mg-session-list {
+  border-radius: 10px;
+  box-shadow: none;
+}
+.shell .mg-matrix-head,
+.shell .mg-skill-head {
+  min-height: 34px;
+  background: hsl(var(--muted));
+}
+.shell .mg-matrix-row,
+.shell .mg-skill-row {
+  min-height: 48px;
+}
+.shell .mg-matrix-row:hover,
+.shell .mg-skill-row:hover,
+.shell .mg-session-row:hover {
+  background: hsl(var(--accent) / 0.5);
+}
+.shell .mg-switch.is-on,
+.shell .mg-cell > span[data-on="true"] {
+  background: hsl(var(--primary));
+  box-shadow: none;
+}
+.shell .mg-group-head {
+  border-inline-start: 0;
+  background: hsl(var(--muted));
+}
+.shell .mg-drawer > header {
+  height: 52px;
+  min-height: 52px;
+  background: none;
+}
+.shell .mg-badge {
+  border-radius: 5px;
+}
+
+/* 卡片：去阴影、收紧标题与内边距 */
+.shell .panel,
+.shell .panel:hover {
+  border-color: hsl(var(--border));
+  border-radius: 10px;
+  box-shadow: none;
+}
+.shell .panel-head {
+  gap: 12px;
+  padding: 10px 14px;
+}
+.shell .panel-head h3 {
+  font-size: 13px;
+  font-weight: 600;
+}
+.shell .panel > .p-4 {
+  padding: 12px 14px;
+}
+
+/* 表单与工具条 */
+.shell .field {
+  gap: 5px;
+  margin-bottom: 10px;
+}
+.shell .toolbar {
+  margin-top: 10px;
+}
+
+/* 网关页：字号对齐 13px 基准，Agent 行与模型选择器收窄 */
+.shell .gateway-page {
+  background: transparent;
+}
+.shell .gw-content {
+  max-width: none;
+  padding-top: 0;
+}
+.shell .gw-lead {
+  font-size: 13px;
+}
+.shell .gw-agent-row {
+  grid-template-columns: 30px minmax(0, 1fr) auto minmax(180px, 260px) auto;
+  gap: 14px;
+  min-height: 52px;
+  padding: 8px 16px;
+}
+.shell .gw-agent-icon {
+  width: 26px;
+  height: 26px;
+}
+.shell .gw-agent-title strong {
+  font-size: 13.5px;
+}
+.shell .gw-version {
+  font-size: 12px;
+}
+.shell .gw-subhead {
+  padding: 10px 16px 4px;
+  font-size: 12px;
+}
+.shell .gw-picker-button {
+  height: 30px;
+  border-radius: 8px;
+  font-size: 12.5px;
+}
+.shell .gw-soft-button {
+  height: 28px;
+  font-size: 12.5px;
 }

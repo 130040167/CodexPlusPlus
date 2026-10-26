@@ -34,6 +34,7 @@ import { ProvidersView } from "./GatewayProviders";
 import { SessionsView } from "./GatewaySessions";
 import { UsageView } from "./GatewayUsage";
 import { AGENT_ICONS, APP_LOGO_URL, Avatar, SectionLabel, Switch, type Notify, type Run } from "./gateway-ui";
+import { TopbarActions } from "./TopbarActions";
 import "./GatewayPage.css";
 
 type Tab = "agents" | "sessions" | "providers" | "routing" | "usage" | "gateway";
@@ -63,11 +64,6 @@ export function GatewayPage({ notify, tab: controlledTab, onTabChange }: { notif
   const [busy, setBusy] = useState<string | null>(memo.payload ? null : "load");
   const [ownTab, setTabState] = useState<Tab>(memo.tab);
   const tab = controlledTab ?? ownTab;
-  // 由外层侧栏控制时不显示页内工具条，刷新按钮放进外层顶栏的操作区（与 Claude 增强页同一个挂载点）。
-  const [topbarSlot, setTopbarSlot] = useState<Element | null>(null);
-  useEffect(() => {
-    setTopbarSlot(controlledTab ? document.querySelector("[data-topbar-actions]") : null);
-  }, [controlledTab]);
   const setTab = (next: Tab) => {
     if (controlledTab) {
       onTabChange?.(next);
@@ -160,7 +156,8 @@ export function GatewayPage({ notify, tab: controlledTab, onTabChange }: { notif
     <div className="mg-page gateway-page">
       {/* 页面标题由外层框架显示，这里只放分段标签和刷新。 */}
       {controlledTab ? (
-        topbarSlot ? createPortal(refreshButton, topbarSlot) : null
+        // 由外层侧栏控制时不显示页内工具条，刷新按钮放进外壳顶栏。
+        <TopbarActions>{refreshButton}</TopbarActions>
       ) : (
         <div className="gw-toolbar">
           <nav aria-label={t("本地网关")} className="gw-tabs" role="tablist">

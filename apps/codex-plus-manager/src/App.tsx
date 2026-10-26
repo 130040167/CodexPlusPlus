@@ -114,6 +114,8 @@ import { GatewayPage, type GatewayTab } from "./GatewayPage";
 import { AgentGlyph, HubOverview, useGatewayPayload } from "./HubOverview";
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
 import { noticeDuration, noticeTone } from "./notice-model";
+import { TopbarActions } from "./TopbarActions";
+import "./ToolPages.css";
 import { BACKEND_SETTINGS_CHANGED_EVENT, ComputerUsePage } from "./ComputerUsePage";
 import { PluginMarketScreen } from "./PluginMarketScreen";
 import { ReleaseNotes } from "./ReleaseNotes";
@@ -4261,8 +4263,10 @@ export function App() {
                 : routeSubtitle(route)}
             </p>
           </div>
-          {/* data-topbar-actions：页面级操作的挂载点，Claude 增强页把「启动增强版」portal 进来。 */}
-          <div className="topbar-actions" data-topbar-actions>
+          <div className="topbar-actions">
+            {/* data-topbar-actions：页面级操作的挂载点（TopbarActions / PageHeader），Claude 增强页把「启动增强版」portal 进来。
+                排在 Codex 状态与启动按钮左边。 */}
+            <div className="topbar-page-actions" data-topbar-actions />
             {activeTool === "codex" && !isGlobalPage ? (
               <>
                 <span className="codex-app-state" aria-live="polite">
@@ -4273,9 +4277,11 @@ export function App() {
                     Codex {statusLabel(overview?.runtime_health?.codex_app?.status ?? "not_checked")}
                   </UiBadge>
                 </span>
+                {/* 顶栏里可能还有页面自己的主按钮（例如「添加供应商」），启动按钮用次要样式避免两个紫色按钮并排。 */}
                 <Button
                   disabled={launchPending || !overview?.runtime_health}
                   onClick={() => void (codexAppRunning ? actions.restart() : actions.launch())}
+                  variant="secondary"
                   title={codexAppRunning ? t("重启 Codex") : t("启动 Codex")}
                 >
                   <Rocket className="h-4 w-4" />
@@ -9418,37 +9424,26 @@ function RecommendationsScreen({ ads, actions }: { ads: AdsResult | null; action
   const sponsors = ordered.filter((ad) => ad.type === "sponsor");
   const normal = ordered.filter((ad) => ad.type === "normal");
   return (
-    <>
-      <Panel>
-        <CardHead title={t("推荐内容")} detail={t("与 Codex 内插件菜单使用同一个远端广告源")} />
-        <CardContent>
-          <div className="recommend-hero">
-            <div>
-              <strong>{ads ? tf("已加载 {0} 条推荐", [ordered.length]) : t("尚未加载推荐内容")}</strong>
-              <span>{t("内容来自 Codex++ 广告源，含置顶推荐与普通推荐。")}</span>
-            </div>
-            <Button onClick={() => void actions.refreshAds()}>
-              <RefreshCw className="h-4 w-4" />
-              {t("刷新推荐")}
-            </Button>
-          </div>
-        </CardContent>
-      </Panel>
+    <div className="tp-page rec-page">
+      <TopbarActions>
+        <Button onClick={() => void actions.refreshAds()} size="sm" variant="secondary">
+          <RefreshCw />
+          {t("刷新推荐")}
+        </Button>
+      </TopbarActions>
+      {!ads ? <p className="rec-empty">{t("尚未加载推荐内容")}</p> : null}
       {sponsors.length ? (
-        <Panel>
-          <CardHead title={t("赞助商推荐")} detail={tf("{0} 条", [sponsors.length])} />
-          <CardContent>
-            <AdGrid actions={actions} ads={sponsors} empty={t("暂无赞助商推荐。")} />
-          </CardContent>
-        </Panel>
+        <section className="tp-page">
+          <div className="tp-section-head"><h3>{t("赞助商推荐")}</h3><span>{tf("{0} 条", [sponsors.length])}</span></div>
+          <AdGrid actions={actions} ads={sponsors} empty={t("暂无赞助商推荐。")} />
+        </section>
       ) : null}
-      <Panel>
-        <CardHead title={t("普通推荐")} detail={tf("{0} 条", [normal.length])} />
-        <CardContent>
-          <AdGrid actions={actions} ads={normal} empty={t("暂无普通推荐。")} />
-        </CardContent>
-      </Panel>
-    </>
+      <section className="tp-page">
+        <div className="tp-section-head"><h3>{t("普通推荐")}</h3><span>{tf("{0} 条", [normal.length])}</span></div>
+        <AdGrid actions={actions} ads={normal} empty={t("暂无普通推荐。")} />
+      </section>
+      <p className="tp-foot">{t("与 Codex 内插件菜单使用同一个远端广告源")}</p>
+    </div>
   );
 }
 
@@ -14807,31 +14802,40 @@ function ScriptRow({ script, actions }: { script: NonNullable<UserScriptInventor
 }
 
 function AdGrid({ ads, empty, actions }: { ads: AdItem[]; empty: string; actions: Actions }) {
-  if (!ads.length) return <div className="empty">{empty}</div>;
+  if (!ads.length) return <div className="rec-empty">{empty}</div>;
   return (
-    <div className="ad-grid">
+    <div className="rec-grid">
       {ads.map((ad) => (
-        <button className="ad-card" key={ad.id || `${ad.type}-${ad.title}`} onClick={() => void actions.openExternalUrl(ad.url)} type="button">
-          {ad.image ? <img alt="" className="ad-image" src={ad.image} /> : null}
-          <div className="ad-content">
-            <strong>{formatAdTitle(ad.title)}</strong>
-            <p className="recommendation-description" title={ad.description}>{ad.description}</p>
-          </div>
-          {ad.highlights?.length ? (
-            <div className="ad-tags">
-              {ad.highlights.map((item) => (
-                <span key={item}>{item}</span>
-              ))}
+        <button className="tp-card rec-card" key={ad.id || `${ad.type}-${ad.title}`} onClick={() => void actions.openExternalUrl(ad.url)} title={ad.url} type="button">
+          {ad.image ? <img alt="" className="rec-image" loading="lazy" src={ad.image} /> : null}
+          <div className="rec-body">
+            <div className="rec-title">
+              <strong>{formatAdTitle(ad.title)}</strong>
+              <small>{adHost(ad.url)}</small>
+              <ExternalLink aria-hidden="true" />
             </div>
-          ) : null}
-          <span className="ad-link">
-            {t("打开")}
-            <ExternalLink className="h-4 w-4" />
-          </span>
+            <p className="rec-desc" title={ad.description}>{ad.description}</p>
+            {ad.highlights?.length ? (
+              <div className="rec-tags">
+                {ad.highlights.map((item) => (
+                  <span key={item}>{item}</span>
+                ))}
+              </div>
+            ) : null}
+          </div>
         </button>
       ))}
     </div>
   );
+}
+
+/// 卡片右上角显示落地页域名，点之前就知道会打开哪里。
+function adHost(url: string): string {
+  try {
+    return new URL(url).host.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
 }
 
 /// 广告标题原样展示。
@@ -14887,7 +14891,7 @@ function routeSubtitle(route: Route) {
     dreamSkin: t("Codex-Dream-Skin 风格主题和换图"),
     userScripts: t("内置和用户自定义拓展清单"),
     pluginMarket: t("检索插件，按需下载并安装到 Codex"),
-    recommendations: t("普通推荐内容"),
+    recommendations: t("来自 Codex++ 广告源的推荐，点卡片在浏览器里打开"),
     agentCache: t("扫描 Codex、Claude 与 Codex++ 的已知缓存目录，由你选择清理项目。"),
     agentCollaboration: t("连接 Codex、DeepSeek Harness 与 Claude Code，派发任务并查看结果。"),
     computerUse: t("复用 Codex 的 Computer Use，通过 MCP 接给 Claude Code、Claude Desktop 与 Codex。"),

@@ -19,7 +19,7 @@ function functionSource(name: string) {
 test("只保留一条侧栏，旧的图标栏和 Agent 子侧栏都已移除", () => {
   assert.doesNotMatch(text, /function ApplicationRail|function ToolSwitcher|className="sidebar"|className="app-rail"/);
   assert.match(functionSource("App"), /<AppSidebar\b/);
-  assert.match(styles, /\.shell \{\n  grid-template-columns: 248px minmax\(0, 1fr\);/);
+  assert.match(styles, /\.shell \{\n  grid-template-columns: 220px minmax\(0, 1fr\);/);
   assert.doesNotMatch(styles, /\.app-rail\b|\.tool-chip\b|\.rail-brand\b/);
 });
 
@@ -61,4 +61,27 @@ test("Claude / Grok 的供应商配置页已去掉：要么经网关接入供应
   const sections = text.slice(text.indexOf("const navigationSections"), text.indexOf("const globalNavigationRoutes"));
   assert.doesNotMatch(sections, /"claudeRelay"|"grok"/);
   assert.match(sections, /"claude"/, "Claude 增强保留");
+});
+
+test("页面不再画第二条标题栏：PageHeader 和工具页的操作都送进外壳顶栏", () => {
+  const management = readFileSync(new URL("./ManagementPages.tsx", import.meta.url), "utf8");
+  const extra = readFileSync(new URL("./ManagementExtra.tsx", import.meta.url), "utf8");
+  const cache = readFileSync(new URL("./agent-cache.tsx", import.meta.url), "utf8");
+  assert.match(management, /export function PageHeader\([^)]*\) \{\n  return <TopbarActions>\{actions\}<\/TopbarActions>;/);
+  assert.match(extra, /function Header\([^)]*\) \{ return <TopbarActions>\{actions\}<\/TopbarActions>; \}/);
+  for (const source of [management, extra]) assert.doesNotMatch(source, /className="mg-header"/);
+  assert.match(cache, /<TopbarActions>/);
+  assert.doesNotMatch(cache, /CardHeader|className="panel agent-cache-panel"/);
+  // 顶栏里给页面操作留了单独的挂载点，排在 Codex 状态与启动按钮左边。
+  assert.match(text, /<div className="topbar-page-actions" data-topbar-actions \/>/);
+});
+
+test("紧凑密度层：管理页不再套外框，覆盖规则带 .shell 前缀不依赖加载顺序", () => {
+  const layer = styles.slice(styles.indexOf("/* ── Graphite · 紧凑密度"));
+  assert.match(layer, /\.shell \.mg-page \{\n  margin: 0 auto;\n  overflow: visible;\n  border: 0;/);
+  assert.match(layer, /\.shell \.topbar \{\n  min-height: 44px;/);
+  // 层内每条规则都以 .shell 开头
+  const selectors = [...layer.matchAll(/^([^\s/@}][^{]*)\{$/gm)].map((match) => match[1]);
+  assert.ok(selectors.length > 20);
+  for (const selector of selectors) assert.match(selector, /^\.shell /, selector);
 });

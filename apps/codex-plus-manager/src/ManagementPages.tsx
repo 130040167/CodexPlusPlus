@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ArrowLeft, ArrowRight, BookOpen, Check, ChevronDown, Copy, Download, Edit3, ExternalLink, Folder, History, MoreHorizontal, Plus, RefreshCw, Search, Server, Trash2, X } from "lucide-react";
 import { t } from "./i18n";
 import { matchesManagementQuery, sessionGroups, skillRepoKey, type ManagedSession } from "./management-model";
+import { TopbarActions } from "./TopbarActions";
 import "./ManagementPages.css";
 
 type Result = { status: string; message: string };
@@ -20,8 +21,12 @@ function Action({ children, onClick, disabled, primary = false, title }: { child
 function IconAction({ children, onClick, label, disabled }: { children: ReactNode; onClick: () => void; label: string; disabled?: boolean }) {
   return <button type="button" className="mg-icon-button" onClick={onClick} aria-label={label} title={label} disabled={disabled}>{children}</button>;
 }
-export function PageHeader({ icon, title, actions }: { icon: ReactNode; title: string; actions?: ReactNode }) {
-  return <header className="mg-header" data-tauri-drag-region><div className="mg-header-title" data-tauri-drag-region>{icon}<h1 data-tauri-drag-region>{title}</h1></div><div className="mg-header-actions">{actions}</div></header>;
+/**
+ * 页面标题已经由外壳顶栏的面包屑显示，这里不再画第二条标题栏；
+ * `icon`、`title` 保留给调用方表明页面身份，实际只把 `actions` 送进顶栏。
+ */
+export function PageHeader({ actions }: { icon?: ReactNode; title?: string; actions?: ReactNode }) {
+  return <TopbarActions>{actions}</TopbarActions>;
 }
 function SearchField({ value, onChange, placeholder }: { value: string; onChange: (value: string) => void; placeholder: string }) {
   return <div className="mg-search"><Search size={15} /><input aria-label={placeholder} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} />{value && <IconAction label={t("清除搜索")} onClick={() => onChange("")}><X size={13} /></IconAction>}</div>;

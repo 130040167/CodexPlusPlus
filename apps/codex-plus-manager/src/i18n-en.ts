@@ -6,6 +6,10 @@
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
   // 外壳 · 网关总览 · 命令面板 · 提示卡
+  "来自 Codex++ 广告源的推荐，点卡片在浏览器里打开": "Recommendations from the Codex++ ad feed; click a card to open it in your browser",
+  "重新扫描": "Rescan",
+  "已扫描": "Scanned",
+  "可清理": "Cleanable",
   "总览": "Overview",
   "Agent 接入": "Agent access",
   "网关设置": "Gateway settings",
@@ -24,7 +28,6 @@ export const EN_PLAIN: Record<string, string> = {
   "按 Agent、供应商与模型统计调用、token、缓存与费用": "Calls, tokens, cache and cost by agent, provider and model",
   "Codex、Claude Code、Grok 的本地会话放在一起，一键在终端继续": "Local sessions from Codex, Claude Code and Grok in one place; resume any of them in a terminal",
   "监听地址、Key 轮换方式与退出时的恢复策略": "Listen address, key rotation and what happens on quit",
-  "接入总览": "Connection overview",
   "直连模式": "Direct mode",
   "已接入": "Connected",
   "未接入网关": "Not on the gateway",
@@ -2087,6 +2090,7 @@ export const EN_PLAIN: Record<string, string> = {
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
   // 外壳 · 网关总览
+  "{0} 个文件": "{0} files",
   "只作用于 {0}；界面主题、配置备份等整体设置在侧栏底部的齿轮里。": "Applies only to {0}. App-wide settings such as theme and backups are under the gear at the bottom of the sidebar.",
   "网关运行中 · :{0}": "Gateway running · :{0}",
   "收起 {0} 的页面": "Collapse {0} pages",
