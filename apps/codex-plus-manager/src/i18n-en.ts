@@ -6,6 +6,7 @@
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
   // 外壳 · 网关总览 · 命令面板 · 提示卡
+  "Codex 的供应商配置由 Codex++ 直接管理": "Codex providers are managed directly by Codex++",
   "来自 Codex++ 广告源的推荐，点卡片在浏览器里打开": "Recommendations from the Codex++ ad feed; click a card to open it in your browser",
   "重新扫描": "Rescan",
   "已扫描": "Scanned",

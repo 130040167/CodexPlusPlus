@@ -14448,7 +14448,8 @@ function loadCollapsedGroups(): string[] {
  *
  * - 顶部是网关状态卡和 ⌘K 快速跳转；
  * - 「网关」：总览、Agent 接入、供应商池、路由、用量、会话、网关设置；
- * - 「Agent」：所有 Agent 排成一行页签，下面是当前 Agent 自己的页面（供应商配置、增强、皮肤……）；
+ * - 「Agent」：每个 Agent 一行（状态点表示接入方式）；下一组是当前 Agent 自己的页面（供应商配置、增强、皮肤……），
+ *   组名就是 Agent 的名字；
  * - 「工具」：服务所有 Agent、但与供应商无关的页面；
  * - 底部：版本与更新、整体设置、关于、语言和主题。
  */
@@ -14525,6 +14526,7 @@ function AppSidebar({
     );
   };
 
+  const activeToolName = tools.find((tool) => tool.id === activeTool)?.name ?? "Agent";
   // 当前 Agent 自己的页面，按 navigationSections 分段；与工具无关的页面（概览）也算在内。
   const agentSections = navigationSections
     .map((section) => section.routes.filter((routeId) => {
@@ -14573,32 +14575,42 @@ function AppSidebar({
             </button>,
           )}
           <div className="side-group-items">
-            {/* 所有 Agent 排成一行页签，始终可见；下面列出当前 Agent 自己的页面。 */}
-            <div className="side-agent-tabs" role="tablist" aria-label={t("工具切换")}>
-              {tools.map((tool) => {
-                const current = tool.id === activeTool;
-                const title = tool.switchable
-                  ? tf("{0}｜{1}｜{2} 个供应商", [tool.name, tool.homeDir || t("未配置目录"), tool.relayCount])
-                  : tf("{0}｜{1}｜供应商配置尚未接入", [tool.name, tool.homeDir || t("未配置目录")]);
-                return (
-                  <button
-                    aria-label={tool.switchable ? tool.name : `${tool.name} · ${t("待接入")}`}
-                    aria-selected={current}
-                    className={`side-agent-tab ${current ? "current" : ""} ${current && !onGlobalPage ? "selected" : ""}`}
-                    disabled={!tool.switchable}
-                    key={tool.id}
-                    onClick={() => onOpenAgent(tool.id)}
-                    role="tab"
-                    title={connectedAgents.has(tool.id) ? `${title}｜${t("已经通过 Codex++ 网关接入")}` : title}
-                    type="button"
-                  >
-                    <AgentGlyph agent={tool.id} className="side-item-icon" />
-                    <span>{tool.name.replace(/ Code$/, "")}</span>
-                    {connectedAgents.has(tool.id) ? <i aria-hidden="true" className="side-agent-gateway" /> : null}
-                  </button>
-                );
-              })}
-            </div>
+            {/* 每个 Agent 一行，始终都在；点一下切到它并打开它的落脚页。它自己的页面在下一组。 */}
+            {tools.map((tool) => {
+              const current = tool.id === activeTool;
+              const title = tool.switchable
+                ? tf("{0}｜{1}｜{2} 个供应商", [tool.name, tool.homeDir || t("未配置目录"), tool.relayCount])
+                : tf("{0}｜{1}｜供应商配置尚未接入", [tool.name, tool.homeDir || t("未配置目录")]);
+              // 状态点表示接入方式，不表示运行状态（运行状态在顶栏）：Codex 由 Codex++ 直接管理供应商配置，
+              // 其余 Agent 看是否已经接入网关。
+              const access = tool.id === "codex"
+                ? { tone: "direct", label: t("Codex 的供应商配置由 Codex++ 直接管理") }
+                : connectedAgents.has(tool.id)
+                  ? { tone: "ok", label: t("已经通过 Codex++ 网关接入") }
+                  : { tone: "off", label: t("未接入网关") };
+              return (
+                <button
+                  aria-current={current && !onGlobalPage ? "true" : undefined}
+                  aria-label={tool.switchable ? `${tool.name} · ${access.label}` : `${tool.name} · ${t("待接入")}`}
+                  className={`side-item side-agent ${current ? "current" : ""}`}
+                  disabled={!tool.switchable}
+                  key={tool.id}
+                  onClick={() => onOpenAgent(tool.id)}
+                  title={`${title}｜${access.label}`}
+                  type="button"
+                >
+                  <AgentGlyph agent={tool.id} className="side-item-icon" />
+                  <span className="side-item-label">{tool.name}</span>
+                  <i aria-hidden="true" className="side-dot side-agent-dot" data-tone={access.tone} />
+                </button>
+              );
+            })}
+          </div>
+        </section>
+
+        <section className={`side-group ${collapsed.includes("agent-pages") ? "collapsed" : ""}`}>
+          {groupLabel("agent-pages", activeToolName)}
+          <div className="side-group-items">
             {agentSections.map((sectionRoutes, index) => (
               <Fragment key={index}>
                 {index > 0 ? <i className="side-divider" /> : null}
