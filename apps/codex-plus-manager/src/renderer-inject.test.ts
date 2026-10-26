@@ -24,7 +24,7 @@ describe("session more menu lifecycle", () => {
       const button = { expanded: "true", setAttribute: (_: string, value: string) => { button.expanded = value; } };
       const deleteButton = { dataset: { codexDeleteVersion: "7" } };
       const group = {
-        ...events(), isConnected: true, hasDelete: true, dataset: { codexActionGroupVersion: "7" },
+        ...events(), isConnected: true, hasDelete: true, dataset: { codexActionGroupVersion: "7", codexMoreMenuKey: "export" },
         __codexSessionMoreMenu: null as unknown,
         querySelector: (selector: string) => selector === ".more-button" ? button
           : selector === ".delete-button" && group.hasDelete ? deleteButton : null,
@@ -48,6 +48,7 @@ describe("session more menu lifecycle", () => {
     const api = new Function("document", "window", "codexPlusSettings", "codexPlusBackendSettings",
       "moreMenuClass", "moreButtonClass", "buttonClass", "actionGroupClass", "exportButtonClass",
       "codexDeleteVersion", "codexActionGroupVersion", "actionGroupFromRow", "sessionRefFromRow",
+      "codexPlusRegistry", "codexPlusExtensionItems",
       `${source.split("  function tryAttachButton(row)")[0]}
        return { pruneSessionMoreMenus, pruneRemovedSessionActions, attachButton, closeSessionMoreMenus, installSessionMoreMenuAutoClose };`,
     )(
@@ -63,6 +64,7 @@ describe("session more menu lifecycle", () => {
       () => ({ sessionDelete: true, markdownExport: true }), { enhancementsEnabled: true },
       "more-menu", "more-button", "delete-button", "actions", "export-button", "7", "7",
       (row: { querySelectorAll: () => unknown[] }) => row.querySelectorAll()[0], () => ({}),
+      { rowActions: new Map() }, (registry: Map<string, unknown>) => [...registry.values()],
     );
     return {
       ...api, timers, menuQueries: () => menuQueries,
@@ -233,6 +235,212 @@ describe("session more menu lifecycle", () => {
     needsScan = false;
     scheduleScan(removed);
     assert.equal(timers.length, 1, "normal removal of owned UI must not feed a scan loop");
+  });
+});
+
+describe("session row action buttons", () => {
+  // 只够 attachButton 用的极简 DOM：支持复合简单选择器（tag / .class / [attr] / [attr="v"]）
+  // 和逗号并列，不支持后代组合符。innerHTML 只识别本模块会写入的两种结构。
+  class FakeElement {
+    tagName: string;
+    className = "";
+    attributes = new Map<string, string>();
+    children: FakeElement[] = [];
+    parentElement: FakeElement | null = null;
+    dataset: Record<string, string> = {};
+    listeners = new Map<string, unknown>();
+    hidden = false;
+    type = "";
+    text = "";
+    style = { setProperty: () => {} };
+    [key: string]: unknown;
+    constructor(tag: string) { this.tagName = tag.toUpperCase(); }
+    get isConnected(): boolean { return this.parentElement ? this.parentElement.isConnected : this.tagName === "BODY"; }
+    get textContent(): string { return this.text + this.children.map((child) => child.textContent).join(""); }
+    set textContent(value: string) { this.text = value; this.children = []; }
+    set innerHTML(html: string) {
+      this.children = [];
+      this.text = "";
+      const inner = html.match(/^<span class="codex-session-action-inner">(<svg[^>]*>)/);
+      if (inner) {
+        const span = this.appendChild(new FakeElement("span"));
+        span.className = "codex-session-action-inner";
+        const svg = span.appendChild(new FakeElement("svg"));
+        for (const [, name, value] of inner[1].matchAll(/([\w-]+)="([^"]*)"/g)) svg.setAttribute(name, value);
+        return;
+      }
+      this.text = html.replace(/<[^>]*>/g, "");
+    }
+    setAttribute(name: string, value: string) { this.attributes.set(name, String(value)); }
+    getAttribute(name: string) { return this.attributes.get(name) ?? null; }
+    hasAttribute(name: string) { return this.attributes.has(name); }
+    removeAttribute(name: string) { this.attributes.delete(name); }
+    appendChild(child: FakeElement) { child.parentElement = this; this.children.push(child); return child; }
+    remove() {
+      if (!this.parentElement) return;
+      this.parentElement.children = this.parentElement.children.filter((child) => child !== this);
+      this.parentElement = null;
+    }
+    replaceWith(next: FakeElement) {
+      const parent = this.parentElement;
+      if (!parent) return;
+      parent.children[parent.children.indexOf(this)] = next;
+      next.parentElement = parent;
+      this.parentElement = null;
+    }
+    cloneNode(): FakeElement { return this; }
+    addEventListener(name: string, callback: unknown) { this.listeners.set(name, callback); }
+    removeEventListener(name: string) { this.listeners.delete(name); }
+    matches(selector: string): boolean {
+      return selector.split(",").some((part) => {
+        const compound = part.trim();
+        const tag = compound.match(/^[a-z]+/i)?.[0];
+        if (tag && tag.toUpperCase() !== this.tagName) return false;
+        const classes = [...compound.matchAll(/\.([\w-]+)/g)].map((match) => match[1]);
+        const ownClasses = this.className.split(/\s+/);
+        if (!classes.every((name) => ownClasses.includes(name))) return false;
+        return [...compound.matchAll(/\[([\w-]+)(?:="([^"]*)")?\]/g)].every(([, name, value]) =>
+          value === undefined ? this.hasAttribute(name) : this.getAttribute(name) === value);
+      });
+    }
+    closest(selector: string): FakeElement | null {
+      for (let node: FakeElement | null = this; node; node = node.parentElement) if (node.matches(selector)) return node;
+      return null;
+    }
+    querySelectorAll(selector: string): FakeElement[] {
+      return this.children.flatMap((child) => [...(child.matches(selector) ? [child] : []), ...child.querySelectorAll(selector)]);
+    }
+    querySelector(selector: string) { return this.querySelectorAll(selector)[0] ?? null; }
+  }
+
+  async function runtime(settings: { sessionDelete: boolean; markdownExport: boolean }) {
+    const source = await readFile(
+      new URL("../../../assets/inject/renderer-inject/90-action-groups.js", import.meta.url), "utf8",
+    );
+    const body = new FakeElement("body");
+    const document = {
+      body,
+      createElement: (tag: string) => new FakeElement(tag),
+      querySelectorAll: (selector: string) => body.querySelectorAll(selector),
+    };
+    const registry = { rowActions: new Map<string, { id: string; label: string; order: number }>() };
+    const api = new Function("document", "window", "HTMLElement", "codexPlusSettings", "codexPlusBackendSettings",
+      "moreMenuClass", "moreButtonClass", "buttonClass", "actionGroupClass", "exportButtonClass", "actionButtonClass",
+      "codexDeleteVersion", "codexActionGroupVersion", "actionGroupFromRow", "sessionRefFromRow",
+      "codexPlusRegistry", "codexPlusExtensionItems", "appendCodexPlusExtensionRowActions", "syncActionGroupLayout",
+      `${source.split("  function tryAttachButton(row)")[0]}
+       return { attachButton };`,
+    )(
+      document, { setTimeout: () => 0, clearTimeout: () => {}, requestAnimationFrame: () => 0 }, FakeElement,
+      () => settings, { enhancementsEnabled: true },
+      "more-menu", "more-button", "delete-button", "actions", "export-button", "action-button", "8", "8",
+      (row: FakeElement) => row.querySelector(".actions"), () => ({ session_id: "thread-1" }),
+      registry, (map: Map<string, { order: number }>) => [...map.values()].sort((a, b) => a.order - b.order),
+      (menu: FakeElement) => registry.rowActions.forEach((item) => {
+        const node = menu.appendChild(new FakeElement("button"));
+        node.text = item.label;
+      }),
+      () => {},
+    );
+    const row = body.appendChild(new FakeElement("div"));
+    return { ...api, body, row, registry };
+  }
+
+  it("only renders the more button when a menu item exists", async () => {
+    const deleteOnly = await runtime({ sessionDelete: true, markdownExport: false });
+    deleteOnly.attachButton(deleteOnly.row);
+    const group = deleteOnly.row.querySelector(".actions");
+    assert.ok(group, "the delete button still gets its group");
+    assert.ok(group.querySelector(".delete-button"));
+    assert.equal(group.querySelector(".more-button"), null, "no export and no extension action means no … button");
+    assert.equal(deleteOnly.body.querySelector(".more-menu"), null);
+
+    const nothing = await runtime({ sessionDelete: false, markdownExport: false });
+    nothing.attachButton(nothing.row);
+    assert.equal(nothing.row.querySelector(".actions"), null, "no delete and no menu item renders nothing");
+
+    const exportOnly = await runtime({ sessionDelete: false, markdownExport: true });
+    exportOnly.attachButton(exportOnly.row);
+    assert.ok(exportOnly.row.querySelector(".more-button"));
+    const menu = exportOnly.body.querySelector(".more-menu");
+    assert.deepEqual(menu?.children.map((item: { textContent: string }) => item.textContent), ["⇩导出"]);
+  });
+
+  it("adds and removes the more button as extension row actions register and dispose", async () => {
+    const api = await runtime({ sessionDelete: true, markdownExport: false });
+    api.attachButton(api.row);
+    assert.equal(api.row.querySelector(".more-button"), null);
+    api.registry.rowActions.set("script:rowAction:a", { id: "script:rowAction:a", label: "拓展操作", order: 1000 });
+    api.attachButton(api.row);
+    assert.ok(api.row.querySelector(".more-button"), "a registered row action brings the … button back");
+    assert.deepEqual(api.body.querySelector(".more-menu")?.children.map((item: { textContent: string }) => item.textContent), ["拓展操作"]);
+    api.registry.rowActions.clear();
+    api.attachButton(api.row);
+    assert.equal(api.row.querySelector(".more-button"), null, "disposing the last row action removes it again");
+    assert.equal(api.body.querySelector(".more-menu"), null, "its detached menu is disposed as well");
+    assert.ok(api.row.querySelector(".delete-button"));
+  });
+
+  it("dresses the delete button in the native pin/archive button classes and data attributes", async () => {
+    const api = await runtime({ sessionDelete: true, markdownExport: false });
+    const native = api.row.appendChild(new FakeElement("button"));
+    native.className = "_Button_abc pointer-events-auto";
+    native.setAttribute("aria-label", "归档聊天");
+    native.setAttribute("data-color", "secondary");
+    native.setAttribute("data-variant", "transparent");
+    native.setAttribute("data-size", "3xs");
+    native.setAttribute("data-uniform", "");
+    const inner = native.appendChild(new FakeElement("span"));
+    inner.className = "_ButtonInner_abc";
+    inner.appendChild(new FakeElement("svg")).setAttribute("viewBox", "0 0 16 16");
+    api.attachButton(api.row);
+
+    const button = api.row.querySelector(".delete-button")!;
+    assert.equal(button.className, "_Button_abc pointer-events-auto action-button delete-button");
+    assert.equal(button.getAttribute("data-codex-native-style"), "true");
+    for (const [name, value] of [["data-color", "secondary"], ["data-variant", "transparent"], ["data-size", "3xs"], ["data-uniform", ""]]) {
+      assert.equal(button.getAttribute(name), value, name);
+    }
+    assert.equal(button.querySelector(".codex-session-action-inner")?.className, "codex-session-action-inner _ButtonInner_abc");
+    const svg = button.querySelector("svg")!;
+    assert.equal(svg.getAttribute("data-codex-session-action-icon"), "stroke", "trash stays a line icon");
+    assert.equal(svg.getAttribute("stroke-width"), "1.05", "fill-based native icons keep the matched light weight");
+    assert.equal(button.closest("[data-codex-plus-ext]")?.getAttribute("data-codex-plus-ext"), "session-actions");
+  });
+
+  it("ignores the danger confirm button and converts a stroked native icon to the 16 grid", async () => {
+    const api = await runtime({ sessionDelete: true, markdownExport: false });
+    const confirm = api.row.appendChild(new FakeElement("button"));
+    confirm.className = "_Button_danger";
+    confirm.setAttribute("aria-label", "归档聊天");
+    confirm.setAttribute("data-color", "danger");
+    confirm.appendChild(new FakeElement("svg"));
+    const pin = api.row.appendChild(new FakeElement("button"));
+    pin.className = "_Button_pin";
+    pin.setAttribute("aria-label", "Pin chat");
+    const svg = pin.appendChild(new FakeElement("svg"));
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("stroke-width", "1.5");
+    api.attachButton(api.row);
+
+    const button = api.row.querySelector(".delete-button")!;
+    assert.equal(button.className, "_Button_pin action-button delete-button", "never borrows the danger confirm style");
+    assert.equal(button.querySelector("svg")?.getAttribute("stroke-width"), "1", "24-grid 1.5 maps to 16-grid 1");
+  });
+
+  it("keeps the fallback look aligned with native icon buttons instead of a red or filled hover", async () => {
+    const style = await readFile(
+      new URL("../../../assets/inject/renderer-inject/10-style.js", import.meta.url), "utf8",
+    );
+    const fallback = style.slice(style.indexOf(".${actionButtonClass}:not([data-codex-native-style]) {"));
+    assert.match(fallback, /width: var\(--control-size-4xs, 20px\);/);
+    assert.match(fallback, /border-radius: var\(--control-radius-sm, var\(--radius-sm, 6px\)\);/);
+    assert.match(fallback, /color: var\(--color-text-secondary-ghost,/);
+    assert.match(fallback, /width: var\(--control-icon-size-xs, 14px\);/);
+    // 悬停只提亮文字色、不铺底色，与原生 transparent 变体一致。
+    assert.match(style, /:not\(\[data-codex-native-style\]\)\[aria-expanded="true"\] \{\s*background: transparent;\s*color: var\(--color-text-secondary-ghost-hover,/);
+    assert.doesNotMatch(style, /--codex-session-action-hover-background|--codex-session-action-color/);
+    assert.doesNotMatch(style, /\.\$\{buttonClass\}:hover/);
   });
 });
 
@@ -470,42 +678,24 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /codexModelCatalog\?\.codex_model_provider/);
   });
 
-  it("adds the session copy shortcut through the native fork action", async () => {
+  it("keeps the retired in-place session copy and auto-rename actions out of every menu", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
 
-    assert.match(renderer, /原地复制会话 - Codex\+\+/);
-    assert.match(renderer, /createSessionMoreMenuItem\("原地复制会话 - Codex\+\+"/);
-    assert.match(renderer, /getAttribute\("aria-label"\)[\s\S]*聊天操作/);
-    assert.match(renderer, /从这里创建聊天分支/);
-    assert.match(renderer, /data-app-action-sidebar-thread-selected/);
-    assert.match(renderer, /sessionCopyMenuActivationTimeoutMs/);
-    assert.doesNotMatch(renderer, /\n\s*refreshSessionCopyMenuItems\(\);/);
+    // 会话行「…」菜单与 Codex 原生「聊天操作」菜单里都不能再出现这两项。
+    assert.doesNotMatch(renderer, /原地复制会话|自动重命名当前会话|已自动重命名/);
+    assert.doesNotMatch(renderer, /function (?:activateSessionCopyMenuItem|createSessionCopyMenuItem|refreshSessionCopyMenuItems|sessionCopyMenuRow|sessionCopyMenuScopes|activateSessionAutoRenameMenuItem|nativeSessionRenameCapability|isNativeSessionRenameMenuItem|visibleSessionRenameDialog|rememberSessionActionTrigger)\(/);
+    assert.doesNotMatch(renderer, /sessionCopyMenuItemClass|sessionCopyMenuItemVersion|sessionCopyMenuActivationTimeoutMs|sessionAutoRenameTimeoutMs|lastSessionActionTrigger/);
+    assert.doesNotMatch(renderer, /__codexSessionCopyRow|__codexSessionAutoRenameRow|codexSessionCopyMenu|codexSessionAutoRenameMenu/);
+    assert.doesNotMatch(renderer, /从这里创建聊天分支|Fork from here/);
+    // 旧版本同页注入时挂上的触发器监听要被摘掉，不能留下悬空回调。
+    assert.match(renderer, /document\.removeEventListener\("pointerdown", window\.__codexSessionActionTriggerHandler, true\);/);
+    assert.doesNotMatch(renderer, /document\.addEventListener\("(?:pointerdown|click)", window\.__codexSessionActionTriggerHandler/);
   });
 
   it("does not install a session sharing button after sharing is retired", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
     assert.doesNotMatch(renderer, /\n\s*installSessionShareButton\(\);/);
     assert.doesNotMatch(renderer, /\n\s*installSessionShareImportListener\(\);/);
-  });
-
-  it("automatically renames a session through the native title suggestion", async () => {
-    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
-
-    assert.match(renderer, /自动重命名当前会话/);
-    assert.match(renderer, /activateSessionAutoRenameMenuItem/);
-    assert.match(renderer, /input\[aria-label="聊天标题"\], input\[aria-label="Chat title"\]/);
-    assert.match(renderer, /button\.classList\.contains\("text-info"\)/);
-    assert.match(renderer, /\^\(保存\|Save\)\$/);
-    assert.match(renderer, /Codex 未能生成新名称/);
-  });
-
-  it("accepts localized native rename labels introduced by newer Codex builds", async () => {
-    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
-
-    assert.match(renderer, /function isNativeSessionRenameMenuItem\(candidate\)/);
-    assert.match(renderer, /data-testid/);
-    assert.match(renderer, /自动重命名当前会话\|auto\.\?rename current session/);
-    assert.match(renderer, /\.find\(isNativeSessionRenameMenuItem\)/);
   });
 
   it("removes the legacy Codex++ top-bar entry", async () => {

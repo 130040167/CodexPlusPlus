@@ -386,22 +386,18 @@
   // 已发布的旧类名保留兼容；对应功能不再安装。
   const zedRemoteButtonClass = "codex-zed-remote-button";
   const zedRemoteOpenInMenuItemClass = "codex-zed-open-in-menu-item";
-  const sessionCopyMenuItemClass = "codex-session-copy-menu-item";
-  const sessionCopyMenuItemVersion = "1";
-  const sessionCopyMenuActivationTimeoutMs = 12000;
   const sessionShareButtonClass = "codex-session-share-button";
   const sessionShareButtonVersion = "1";
   const codexPlusShareBaseUrl = "https://share.codexpp.cc";
   const codexPlusShareFallbackBaseUrl = "https://codexpp-share.pages.dev";
   const codexPlusShareMaxCharacters = 900000;
-  const sessionAutoRenameTimeoutMs = 20000;
   const zedRemoteToastClass = "codex-zed-remote-toast";
   const upstreamWorktreeDialogClass = "codex-upstream-worktree-dialog";
   const upstreamBranchOptionAttribute = "data-codex-upstream-branch-option";
   const styleId = "codex-delete-style";
   // 改 10-style.js 里的任何 CSS 都要把它 +1：installStyle 靠这个版本号判断
   // 页面里已有的 <style> 是否过期，不升的话新样式在旧标签存在时会被直接跳过。
-  const codexDeleteStyleVersion = "34";
+  const codexDeleteStyleVersion = "35";
   const codexPlusMenuId = "codex-plus-menu";
   const codexPlusMenuFloatingClass = "codex-plus-menu-floating";
   const codexPlusSidebarNavId = "codex-plus-sidebar-nav";
@@ -424,7 +420,7 @@
   const codexPlusWindowZoomVar = "--codex-window-zoom";
   const codexDeleteVersion = "7";
   const codexExportVersion = "1";
-  const codexActionGroupVersion = "7";
+  const codexActionGroupVersion = "8";
   const codexArchiveRowActionsVersion = "1";
   const codexArchiveDeleteAllVersion = "2";
   const codexConversationViewVersion = "1";
@@ -434,7 +430,6 @@
   const codexServiceTierBadgeVersion = "3";
   let codexPlusVersion = window.__CODEX_PLUS_VERSION__ || "unknown";
   const codexPlusBuild = window.__CODEX_PLUS_BUILD__ || "unknown";
-  let lastSessionActionTrigger = null;
   const codexPlusSettingsKey = "codexPlusSettings";
   const codexThreadScrollKey = "codexThreadScroll";
   const codexServiceTierRequestOverrideVersion = "10";
@@ -1987,24 +1982,43 @@
         background: transparent;
       }
       .${actionButtonClass} {
-        width: 20px;
-        height: 20px;
+        flex: 0 0 auto;
+        -webkit-app-region: no-drag;
+      }
+      /* 外观优先套用同一行原生「置顶 / 归档」按钮的类名与 data-* 属性（见
+         90-action-groups.js 的 syncNativeSessionActionStyle），套上后带
+         data-codex-native-style，下面这组兜底规则就不再生效。兜底按 Codex 原生
+         secondary / transparent / 3xs 图标按钮复刻：20px 方形、14px 图标、
+         默认三级文字色，悬停只提亮颜色、不铺底色。 */
+      .${actionButtonClass}:not([data-codex-native-style]) {
+        position: relative;
+        width: var(--control-size-4xs, 20px);
+        height: var(--control-size-4xs, 20px);
         display: inline-flex;
         align-items: center;
         justify-content: center;
         border: 0;
-        border-radius: 6px;
+        border-radius: var(--control-radius-sm, var(--radius-sm, 6px));
         background: transparent;
-        color: var(--codex-session-action-color, var(--color-token-text-tertiary, var(--codex-plus-text-tertiary, rgba(255,255,255,.5))));
-        font: 14px/1 system-ui, sans-serif;
+        color: var(--color-text-secondary-ghost, var(--color-text-tertiary, var(--color-token-text-tertiary, var(--codex-plus-text-tertiary, rgba(255,255,255,.5)))));
+        font: inherit;
         padding: 0;
         cursor: default;
         text-align: center;
+        transition: color var(--transition-duration-basic, .15s) var(--transition-ease-basic, ease);
       }
-      .${actionButtonClass} svg {
+      .${actionButtonClass}:not([data-codex-native-style]) svg {
         display: block;
-        width: 16px;
-        height: 16px;
+        width: var(--control-icon-size-xs, 14px);
+        height: var(--control-icon-size-xs, 14px);
+      }
+      .codex-session-action-inner {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
       }
       [data-codex-plus-ext="side-chat-save"] > .codex-plus-side-chat-save-spinner {
         display: inline-block;
@@ -2019,10 +2033,11 @@
         animation: codex-plus-side-chat-save-spin .8s linear infinite;
       }
       @keyframes codex-plus-side-chat-save-spin { to { transform: rotate(360deg); } }
-      .${actionButtonClass}:hover,
-      .${actionButtonClass}:focus-visible {
-        background: var(--codex-session-action-hover-background, transparent);
-        color: var(--codex-session-action-hover-color, var(--codex-session-action-color, var(--color-token-text-primary, #f4f4f5)));
+      .${actionButtonClass}:not([data-codex-native-style]):hover,
+      .${actionButtonClass}:not([data-codex-native-style]):focus-visible,
+      .${actionButtonClass}:not([data-codex-native-style])[aria-expanded="true"] {
+        background: transparent;
+        color: var(--color-text-secondary-ghost-hover, var(--color-text, var(--color-token-text-primary, #f4f4f5)));
         outline: none;
       }
       .${moreMenuClass} {
@@ -2109,9 +2124,6 @@
         border-color: var(--color-token-border-light, var(--color-token-border-default, rgba(0,0,0,.12)));
         background: var(--color-token-bg-secondary, transparent);
         color: var(--color-token-text-primary, inherit);
-      }
-      .${sessionCopyMenuItemClass} {
-        cursor: pointer;
       }
       .${sessionShareButtonClass} {
         position: static;
@@ -3123,18 +3135,6 @@
       .codex-session-more-menu-item { border-radius: var(--border-radius-sm, 6px); font-family: inherit; }
       .codex-session-more-menu-item:hover,
       .codex-session-more-menu-item:focus-visible { background: var(--codex-plus-bg-hover); }
-      .${actionButtonClass} {
-        width: var(--h-token-button-composer-sm, 28px);
-        height: var(--h-token-button-composer-sm, 28px);
-        border-radius: var(--border-radius-lg, 8px);
-        color: var(--codex-session-action-color, var(--codex-plus-text-tertiary));
-        font-family: inherit;
-      }
-      .${actionButtonClass}:hover,
-      .${actionButtonClass}:focus-visible {
-        background: var(--codex-session-action-hover-background, var(--codex-plus-bg-hover));
-        color: var(--codex-session-action-hover-color, var(--codex-plus-text));
-      }
       .${sessionShareButtonClass}:hover,
       .${sessionShareButtonClass}:focus-visible {
         background: var(--codex-plus-bg-hover);
@@ -13863,22 +13863,16 @@
         const native = nativeButtons.map(button => ({ button, rect: button.getBoundingClientRect() }))
           .filter(({ rect }) => rect.width > 0 && rect.height > 0)
           .sort((a, b) => a.rect.left - b.rect.left)[0];
-        const nativeStyle = native && getComputedStyle(native.button);
         const right = native ? Math.max(28, Math.round(rowRect.right - native.rect.left + 8)) : 28;
         const titleLeft = row.querySelector(selectors.threadTitle)?.getBoundingClientRect().left || rowRect.left + 40;
         const renderScale = row.offsetWidth > 0 ? rowRect.width / row.offsetWidth : 1;
         return { row, group, native, right, effectiveRight: right, titleLeft, renderScale,
-          groupWidth: Math.ceil(group.getBoundingClientRect().width || 96),
-          color: nativeStyle?.color, background: nativeStyle?.backgroundColor };
+          groupWidth: Math.ceil(group.getBoundingClientRect().width || 96) };
       });
     for (const layout of layouts) {
-      const { group, right, native, color, background } = layout;
-      group.style.setProperty("--codex-session-actions-right", `${right}px`);
-      if (native) {
-        group.style.setProperty("--codex-session-action-color", color);
-        group.style.setProperty("--codex-session-action-hover-color", color);
-        group.style.setProperty("--codex-session-action-hover-background", background);
-      }
+      // 颜色与悬停态不再从原生按钮的计算样式抄：那样拿到的是静止态，悬停时
+      // 既不提亮也不变底色。外观改由按钮直接套用原生类名（syncNativeSessionActionStyle）。
+      layout.group.style.setProperty("--codex-session-actions-right", `${layout.right}px`);
     }
     for (const layout of layouts) {
       if (!layout.native) continue;
@@ -16223,36 +16217,146 @@
     return replacement;
   }
 
-  function configureActionButton(button, label, icon) {
-    button.setAttribute("aria-label", label);
-    button.dataset.codexActionLabel = label;
-    button.removeAttribute("title");
-    button.textContent = icon;
+  // 会话行图标按钮的线性图标统一画在 16 栅格上，线宽 1.05、圆角端点：与 Codex
+  // 原生「置顶 / 归档」所用 light-16 图标的笔画粗细和墨迹范围一致。原生如果换成
+  // 描边图标，syncNativeSessionActionStyle 会按它的 stroke-width 换算后覆盖。
+  const sessionActionIconStrokeWidth = "1.05";
+
+  function sessionActionStrokeIconSvg(paths) {
+    return `<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="${sessionActionIconStrokeWidth}" stroke-linecap="round" stroke-linejoin="round" data-codex-session-action-icon="stroke">${paths}</svg>`;
   }
 
   function trashIconSvg() {
-    return `
-      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M3 6h18"></path>
-        <path d="M8 6V4h8v2"></path>
-        <path d="M19 6l-1 14H6L5 6"></path>
-        <path d="M10 11v5"></path>
-        <path d="M14 11v5"></path>
-      </svg>
-    `;
+    return sessionActionStrokeIconSvg([
+      '<path d="M2.5 4.5h11"></path>',
+      '<path d="M6 4.5v-1a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1"></path>',
+      '<path d="M3.75 4.5v8a1 1 0 0 0 1 1h6.5a1 1 0 0 0 1-1v-8"></path>',
+      '<path d="M6.75 7v3.75"></path>',
+      '<path d="M9.25 7v3.75"></path>',
+    ].join(""));
+  }
+
+  function ellipsisIconSvg() {
+    return '<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" fill="currentColor" data-codex-session-action-icon="fill"><circle cx="3.5" cy="8" r="1.1"></circle><circle cx="8" cy="8" r="1.1"></circle><circle cx="12.5" cy="8" r="1.1"></circle></svg>';
   }
 
   function configureSvgActionButton(button, label, svg) {
     button.setAttribute("aria-label", label);
     button.dataset.codexActionLabel = label;
     button.removeAttribute("title");
-    button.innerHTML = svg;
+    // 原生按钮的图标包在一层 inner span 里（负责居中），这里保持同样结构，
+    // 套用原生类名时 inner span 也一并换成原生的 inner 类名。
+    button.innerHTML = `<span class="codex-session-action-inner">${svg}</span>`;
+  }
+
+  // Codex 原生按钮的外观由 CSS module 类名 + data-color / data-variant / data-size
+  // 等属性共同决定，只抄 className 不够，这些属性要一起带上。
+  const nativeSessionActionStyleAttributes = [
+    "data-color", "data-variant", "data-size", "data-uniform", "data-pill",
+    "data-squircle", "data-icon-size", "data-gutter-size",
+  ];
+  // 最近一次从原生按钮读到的样式快照；新建的按钮直接套用，不必等悬停。
+  let nativeSessionActionStyle = null;
+
+  function nativeSessionIconButtonFromRow(row) {
+    for (const button of row?.querySelectorAll?.("button") || []) {
+      if (button.closest(`.${actionGroupClass}, [data-codex-plus-ext]`)) continue;
+      const label = `${button.getAttribute("aria-label") || ""} ${button.getAttribute("title") || ""}`;
+      if (!/(pin|archive|置顶|归档)/i.test(label)) continue;
+      // 只认纯图标按钮：归档二次确认的「确认」是带文字的危险色按钮，不能当样板。
+      // 原生图标也可能不是内联 svg，等宽（data-uniform）的图标按钮同样可以当样板。
+      if ((button.textContent || "").trim()) continue;
+      if (!button.querySelector("svg") && !button.hasAttribute("data-uniform")) continue;
+      if (button.getAttribute("data-color") === "danger") continue;
+      return button;
+    }
+    return null;
+  }
+
+  function nativeSessionIconStrokeWidth(svg) {
+    const stroked = svg?.matches?.("[stroke-width]") ? svg : svg?.querySelector?.("[stroke-width]");
+    const width = Number.parseFloat(stroked?.getAttribute("stroke-width") || "");
+    const viewBoxWidth = Number.parseFloat((svg?.getAttribute("viewBox") || "").trim().split(/[\s,]+/)[2] || "");
+    if (!(width > 0) || !(viewBoxWidth > 0)) return "";
+    return String(Math.round((width * 16 / viewBoxWidth) * 100) / 100);
+  }
+
+  function readNativeSessionActionStyle(button) {
+    const className = typeof button?.className === "string" ? button.className.trim() : "";
+    if (!className) return null;
+    const attributes = {};
+    nativeSessionActionStyleAttributes.forEach((name) => {
+      if (button.hasAttribute(name)) attributes[name] = button.getAttribute(name);
+    });
+    const inner = Array.from(button.children).find((child) => child.tagName === "SPAN" && child.querySelector("svg"));
+    const innerClassName = typeof inner?.className === "string" ? inner.className.trim() : "";
+    const strokeWidth = nativeSessionIconStrokeWidth(button.querySelector("svg"));
+    return {
+      className, attributes, innerClassName, strokeWidth,
+      key: JSON.stringify([className, attributes, innerClassName, strokeWidth]),
+    };
+  }
+
+  function applyNativeSessionActionStyle(button, style = nativeSessionActionStyle) {
+    if (!(button instanceof HTMLElement)) return;
+    // 自己的类名（删除 / 更多的识别类）记在 dataset 上，换原生类名时始终保留。
+    if (!button.dataset.codexActionClasses) button.dataset.codexActionClasses = button.className;
+    if (!style || button.__codexNativeStyleKey === style.key) return;
+    button.className = `${style.className} ${button.dataset.codexActionClasses}`;
+    nativeSessionActionStyleAttributes.forEach((name) => button.removeAttribute(name));
+    Object.entries(style.attributes).forEach(([name, value]) => button.setAttribute(name, value));
+    const inner = button.querySelector(".codex-session-action-inner");
+    if (inner) inner.className = `codex-session-action-inner ${style.innerClassName}`.trim();
+    button.querySelectorAll('svg[data-codex-session-action-icon="stroke"]').forEach((svg) => {
+      svg.setAttribute("stroke-width", style.strokeWidth || sessionActionIconStrokeWidth);
+    });
+    button.setAttribute("data-codex-native-style", "true");
+    button.__codexNativeStyleKey = style.key;
+  }
+
+  function syncNativeSessionActionStyle(row) {
+    const native = nativeSessionIconButtonFromRow(row);
+    const style = native ? readNativeSessionActionStyle(native) : null;
+    const changed = !!style && style.key !== nativeSessionActionStyle?.key;
+    if (changed) nativeSessionActionStyle = style;
+    if (!nativeSessionActionStyle) return;
+    // 原生样式变了（Codex 改版或首次读到）就刷新所有行，否则只补当前行。
+    const scope = changed ? document : actionGroupFromRow(row);
+    scope?.querySelectorAll?.(`.${actionButtonClass}`)
+      .forEach((button) => applyNativeSessionActionStyle(button));
+  }
+
+  function installNativeSessionActionStyleSync(row) {
+    if (row.__codexNativeActionStyleSync) return;
+    row.__codexNativeActionStyleSync = true;
+    // 原生置顶 / 归档按钮多数只在悬停时挂载，当帧还没渲染出来，等下一帧再读。
+    row.addEventListener("pointerenter", () => {
+      window.requestAnimationFrame(() => {
+        if (row.isConnected) syncNativeSessionActionStyle(row);
+      });
+    }, { passive: true });
+  }
+
+  /**
+   * 会话行「…」菜单要放哪些项。返回空串表示没有任何菜单项，此时不渲染「…」按钮。
+   * 内置只剩 Markdown 导出；其余来自拓展注册的会话行操作（增强总开关关闭时不显示）。
+   * 返回值同时用作菜单指纹：项变了（开关切换、拓展注册 / 注销）就整组重建。
+   */
+  function sessionMoreMenuKey(settings) {
+    const rowActions = codexPlusBackendSettings.enhancementsEnabled !== false
+      ? codexPlusExtensionItems(codexPlusRegistry.rowActions)
+      : [];
+    return [
+      ...(settings.markdownExport ? ["export"] : []),
+      ...rowActions.map((item) => `ext:${item.id}`),
+    ].join("|");
   }
 
   function attachButton(row) {
     const settings = codexPlusSettings();
-    const sessionMenuEnabled = codexPlusBackendSettings.enhancementsEnabled !== false;
-    if (!settings.sessionDelete && !settings.markdownExport && !sessionMenuEnabled) {
+    const moreMenuKey = sessionMoreMenuKey(settings);
+    const needsMoreMenu = !!moreMenuKey;
+    if (!settings.sessionDelete && !needsMoreMenu) {
       removeActionGroups(row);
       row.dataset.codexDeleteRow = "false";
       return;
@@ -16261,7 +16365,6 @@
     const existingDeleteButton = existingGroup?.querySelector(`.${buttonClass}`);
     const existingMoreButton = existingGroup?.querySelector(`.${moreButtonClass}`);
     const existingExportButton = existingGroup?.querySelector(`.${exportButtonClass}`);
-    const needsMoreMenu = sessionMenuEnabled;
     const hasUnexpectedDelete = !settings.sessionDelete && !!existingDeleteButton;
     const hasUnexpectedMore = !needsMoreMenu && !!existingMoreButton;
     const hasUnexpectedExport = !!existingExportButton;
@@ -16271,7 +16374,8 @@
     const groupReady = existingGroup?.dataset.codexActionGroupVersion === codexActionGroupVersion;
     const existingMenu = existingGroup?.__codexSessionMoreMenu;
     const menuReady = !needsMoreMenu || (existingMenu?.isConnected
-      && existingMenu.__codexSessionMoreRow === row && existingMenu.__codexSessionMoreGroup === existingGroup);
+      && existingMenu.__codexSessionMoreRow === row && existingMenu.__codexSessionMoreGroup === existingGroup
+      && existingGroup.dataset.codexMoreMenuKey === moreMenuKey);
     if (groupReady && deleteReady && menuReady && !hasUnexpectedDelete && !hasUnexpectedMore && !hasUnexpectedExport && !missingDelete && !missingMore) {
       return;
     }
@@ -16284,13 +16388,15 @@
     group.className = actionGroupClass;
     group.setAttribute("data-codex-plus-ext", "session-actions");
     group.dataset.codexActionGroupVersion = codexActionGroupVersion;
+    group.dataset.codexMoreMenuKey = moreMenuKey;
     if (needsMoreMenu) {
       const moreButton = document.createElement("button");
       moreButton.type = "button";
       moreButton.className = `${actionButtonClass} ${moreButtonClass}`;
       moreButton.setAttribute("aria-haspopup", "menu");
       moreButton.setAttribute("aria-expanded", "false");
-      configureActionButton(moreButton, "更多操作", "…");
+      configureSvgActionButton(moreButton, "更多操作", ellipsisIconSvg());
+      applyNativeSessionActionStyle(moreButton);
       const moreMenu = document.createElement("div");
       moreMenu.className = moreMenuClass;
       moreMenu.setAttribute("data-codex-plus-ext", "session-more-menu");
@@ -16303,20 +16409,11 @@
           exportMarkdown(ref);
         }));
       }
-      if (sessionMenuEnabled) {
-        const sessionCopyItem = createSessionMoreMenuItem("原地复制会话 - Codex++", "⧉", activateSessionCopyMenuItem);
-        sessionCopyItem.dataset.codexSessionCopyMenu = "true";
-        sessionCopyItem.dataset.codexSessionCopyVersion = sessionCopyMenuItemVersion;
-        sessionCopyItem.__codexSessionCopyRow = row;
-        moreMenu.appendChild(sessionCopyItem);
-        const sessionAutoRenameItem = createSessionMoreMenuItem("自动重命名当前会话", "✦", activateSessionAutoRenameMenuItem);
-        sessionAutoRenameItem.dataset.codexSessionAutoRenameMenu = "true";
-        sessionAutoRenameItem.__codexSessionAutoRenameRow = row;
-        moreMenu.appendChild(sessionAutoRenameItem);
+      // 拓展注册的会话行操作追加在内置项之后。注册 / 注销会改变 moreMenuKey，
+      // 触发整组重建并重新走一遍这里，所以拓展项不会因为重建而丢失。
+      if (codexPlusBackendSettings.enhancementsEnabled !== false) {
+        appendCodexPlusExtensionRowActions(moreMenu, row, moreButton);
       }
-      // 拓展注册的会话行操作追加在内置项之后。菜单每次重建（版本号变化）都会
-      // 重新走一遍这里，所以拓展项不会因为重建而丢失。
-      appendCodexPlusExtensionRowActions(moreMenu, row, moreButton);
       const openMoreMenu = (event) => {
         stopActionButtonEvent(row, moreButton, event);
         hideActionButtonTooltip();
@@ -16340,12 +16437,16 @@
       deleteButton.className = `${actionButtonClass} ${buttonClass}`;
       deleteButton.dataset.codexDeleteVersion = codexDeleteVersion;
       configureSvgActionButton(deleteButton, "删除", trashIconSvg());
+      applyNativeSessionActionStyle(deleteButton);
       const openDeleteConfirm = (event) => openDeleteConfirmForRow(row, deleteButton, sessionRefFromRow(row), event);
       installActionButtonEvents(row, deleteButton, openDeleteConfirm);
       group.appendChild(deleteButton);
       setTimeout(() => refreshActionButton(deleteButton, row, openDeleteConfirm), 0);
     }
     row.appendChild(group);
+    // 先套上原生按钮外观再量布局，避免尺寸在测量后才变化。
+    syncNativeSessionActionStyle(row);
+    installNativeSessionActionStyleSync(row);
     syncActionGroupLayout(row, group);
   }
 
@@ -17142,6 +17243,9 @@
       sessionRows().forEach((row) => {
         const group = actionGroupFromRow(row);
         if (group) delete group.dataset.codexActionLayoutStable;
+        // 「…」按钮只在有菜单项时出现：拓展注册 / 注销会话行操作后立刻按新指纹
+        // 重建（或摘掉）这一行的按钮组，不用等下一次扫描。
+        tryAttachButton(row);
       });
     } catch {}
   }
@@ -19144,350 +19248,6 @@
     };
   }
 
-  function sessionCopyMenuRow(menu) {
-    const triggerId = menu?.getAttribute?.("aria-labelledby") || "";
-    const trigger = triggerId ? document.getElementById(triggerId) : null;
-    const labeledTrigger = trigger && /^(聊天操作|Chat actions)$/i.test(trigger.getAttribute("aria-label") || "")
-      ? trigger
-      : null;
-    const fallbackTrigger = lastSessionActionTrigger?.isConnected
-      ? lastSessionActionTrigger
-      : document.querySelector('button[aria-label="聊天操作"], button[aria-label="Chat actions"]');
-    const row = (labeledTrigger || fallbackTrigger)?.closest?.(selectors.sidebarThread)
-      || [...document.querySelectorAll(selectors.sidebarThread)]
-        .find((candidate) => candidate.getAttribute("data-app-action-sidebar-thread-selected") === "true");
-    const ref = row ? sessionRefFromRow(row) : null;
-    if (!row || !ref?.session_id || isClientNewThreadId(ref.session_id)) return null;
-    return row;
-  }
-
-  function looksLikeSessionActionMenu(menu) {
-    if (!(menu instanceof HTMLElement) || menu.hidden) return false;
-    if (menu.matches(`.${moreMenuClass}, .${codexPlusMenuFloatingClass}, #${codexPlusMenuId}`)) return false;
-    const text = normalizedElementText(menu);
-    const hasRename = /(?:重命名|rename)/i.test(text);
-    const hasOtherSessionAction = /(?:置顶|取消置顶|pin|unpin|归档|archive|删除|delete|移动|move)/i.test(text);
-    return hasRename || hasOtherSessionAction;
-  }
-
-  function isNativeSessionRenameMenuItem(candidate) {
-    if (!(candidate instanceof HTMLElement) || !visibleElement(candidate)) return false;
-    const text = normalizedElementText(candidate);
-    const label = candidate.getAttribute("aria-label") || "";
-    const testid = candidate.getAttribute("data-testid") || "";
-    // Codex 26.1007 changed the visible label from the bare "重命名"/
-    // "Rename" to a longer localized label. Match the native semantic
-    // affordance while excluding Codex++'s own auto-rename entry.
-    if (/自动重命名当前会话|auto.?rename current session/i.test(`${text} ${label}`)) return false;
-    return /重命名|rename/i.test(`${text} ${label} ${testid}`);
-  }
-
-  function rememberSessionActionTrigger(event) {
-    const trigger = event.target?.closest?.('button[aria-label="聊天操作"], button[aria-label="Chat actions"]');
-    if (trigger) lastSessionActionTrigger = trigger;
-  }
-
-  function sessionCopyMenuScopes(scope = document) {
-    const root = scope?.querySelectorAll ? scope : document;
-    const menus = [];
-    if (scope instanceof HTMLElement && scope.matches?.('[role="menu"]')) menus.push(scope);
-    root.querySelectorAll?.('[role="menu"]').forEach((menu) => menus.push(menu));
-    return Array.from(new Set(menus));
-  }
-
-  function sessionCopyMenuItemIcon() {
-    return '<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3"></path></svg>';
-  }
-
-  function sessionCopyMenuActivationIsDuplicate(target) {
-    if (!(target instanceof HTMLElement)) return false;
-    const now = Date.now();
-    const activatedAt = Number(target.dataset.codexSessionCopyActivatedAt || 0);
-    if (activatedAt && now - activatedAt < 600) return true;
-    target.dataset.codexSessionCopyActivatedAt = String(now);
-    return false;
-  }
-
-  async function selectSessionRowForAction(row) {
-    if (!(row instanceof HTMLElement) || !row.isConnected) return false;
-    const targetId = row.getAttribute("data-app-action-sidebar-thread-id") || "";
-    if (!targetId) return false;
-    if (row.getAttribute("data-app-action-sidebar-thread-selected") !== "true") row.click();
-
-    const deadline = Date.now() + sessionCopyMenuActivationTimeoutMs;
-    while (Date.now() < deadline) {
-      const selected = [...document.querySelectorAll(selectors.sidebarThread)]
-        .find((candidate) => candidate.getAttribute("data-app-action-sidebar-thread-selected") === "true");
-      if (selected?.getAttribute("data-app-action-sidebar-thread-id") === targetId) return true;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    return false;
-  }
-
-  function dispatchNativePointerClick(node) {
-    if (!(node instanceof HTMLElement)) return;
-    node.focus?.();
-    if (typeof PointerEvent === "function") {
-      node.dispatchEvent(new PointerEvent("pointerdown", {
-        bubbles: true,
-        cancelable: true,
-        composed: true,
-        button: 0,
-        buttons: 1,
-        pointerId: 1,
-        pointerType: "mouse",
-        isPrimary: true,
-      }));
-      node.dispatchEvent(new PointerEvent("pointerup", {
-        bubbles: true,
-        cancelable: true,
-        composed: true,
-        button: 0,
-        buttons: 0,
-        pointerId: 1,
-        pointerType: "mouse",
-        isPrimary: true,
-      }));
-    }
-    node.click();
-  }
-
-  async function waitForSessionElement(resolveElement, timeoutMs) {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const element = resolveElement();
-      if (element) return element;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    return null;
-  }
-
-  function visibleSessionRenameDialog() {
-    return [...document.querySelectorAll('[role="dialog"]')]
-      .filter(visibleElement)
-      .find((dialog) => dialog.querySelector('input[aria-label="聊天标题"], input[aria-label="Chat title"]')) || null;
-  }
-
-  function closeSessionRenameDialog(dialog) {
-    const cancelButton = [...dialog?.querySelectorAll?.("button") || []]
-      .find((button) => /^(取消|Cancel)$/i.test(normalizedElementText(button)));
-    if (cancelButton) {
-      cancelButton.click();
-      return;
-    }
-    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true }));
-  }
-
-  function sessionActionTrigger(row) {
-    const direct = row?.querySelector?.('button[aria-label="聊天操作"], button[aria-label="Chat actions"]');
-    if (direct instanceof HTMLElement && visibleElement(direct)) return direct;
-    if (lastSessionActionTrigger instanceof HTMLElement && lastSessionActionTrigger.isConnected && visibleElement(lastSessionActionTrigger)) {
-      return lastSessionActionTrigger;
-    }
-    const candidates = Array.from(document.querySelectorAll([
-      'button[aria-label="聊天操作"]',
-      'button[aria-label="Chat actions"]',
-      'button[aria-label="会话操作"]',
-      'button[aria-label="Thread actions"]',
-      'button[aria-label="更多"]',
-      'button[aria-label="More"]',
-      'button[aria-label="More options"]',
-      'button[aria-label="更多操作"]',
-      'button[aria-label="More actions"]',
-      'button[aria-label="会话选项"]',
-      'button[aria-label="Conversation options"]',
-      'button[aria-label="Thread options"]',
-      'button[aria-haspopup="menu"]',
-    ].join(","))).filter((button) => {
-      if (!(button instanceof HTMLElement) || !visibleElement(button) || isExtensionUiNode(button)) return false;
-      const header = button.closest?.(selectors.appHeader);
-      return !!header || /聊天操作|Chat actions|会话操作|Thread actions|更多|More|选项|options/i.test(button.getAttribute("aria-label") || "");
-    });
-    if (candidates.length) return candidates.at(-1);
-    const header = document.querySelector(selectors.appHeader);
-    const iconButtons = Array.from(header?.querySelectorAll?.("button") || [])
-      .filter((button) => button instanceof HTMLElement && visibleElement(button) && !isExtensionUiNode(button))
-      .filter((button) => {
-        const text = normalizedElementText(button);
-        return text === "..." || text === "⋯" || text === "···" || button.getAttribute("aria-expanded") != null;
-      });
-    return iconButtons.at(-1) || null;
-  }
-
-  function nativeSessionRenameCapability(dialog, initialTitle) {
-    if (!(dialog instanceof HTMLElement)) return null;
-    const buttons = [...dialog.querySelectorAll("button")].filter((button) => visibleElement(button) && !button.disabled);
-    const suggestion = buttons.find((button) => {
-      const text = normalizedElementText(button);
-      if (!text || text === initialTitle || /^(取消|保存|Cancel|Save)$/i.test(text)) return false;
-      const semantics = `${button.getAttribute("aria-label") || ""} ${button.getAttribute("data-testid") || ""}`;
-      return button.classList.contains("text-info")
-        || /(?:title|name)[-_ ]suggestion|(?:use|apply|accept).*(?:suggested|suggestion)|使用.*建议|采用.*建议/i.test(semantics);
-    }) || null;
-    const generate = buttons.find((button) => /生成.*(?:名称|标题)|(?:generate|suggest).*(?:title|name)/i.test(
-      `${normalizedElementText(button)} ${button.getAttribute("aria-label") || ""}`)) || null;
-    const pending = dialog.matches('[aria-busy="true"], [data-state="loading"]')
-      || !!dialog.querySelector('[aria-busy="true"], [role="progressbar"], [data-state="loading"]');
-    return suggestion || generate || pending ? { suggestion, generate, pending } : null;
-  }
-
-  async function activateSessionAutoRenameMenuItem(event) {
-    if (event?.type === "keydown" && !["Enter", " "].includes(event.key)) return;
-    const item = event?.currentTarget;
-    event?.preventDefault?.();
-    event?.stopPropagation?.();
-    event?.stopImmediatePropagation?.();
-    if (sessionCopyMenuActivationIsDuplicate(item)) return;
-    closeSessionMoreMenus();
-
-    const row = item?.__codexSessionAutoRenameRow;
-    if (!(row instanceof HTMLElement) || !row.isConnected) {
-      showToast("找不到要重命名的会话", null);
-      return;
-    }
-    if (!await selectSessionRowForAction(row)) {
-      showToast("会话加载超时，请稍后重试", null);
-      return;
-    }
-
-    const trigger = sessionActionTrigger(row);
-    if (!(trigger instanceof HTMLElement)) {
-      showToast("找不到 Codex 原生重命名入口", null);
-      return;
-    }
-    lastSessionActionTrigger = trigger;
-    dispatchNativePointerClick(trigger);
-
-    let renameItem = await waitForSessionElement(() => {
-      return sessionCopyMenuScopes()
-        .filter((menu) => visibleElement(menu) && looksLikeSessionActionMenu(menu))
-        .flatMap((menu) => [...menu.querySelectorAll('[role="menuitem"]')])
-        .find(isNativeSessionRenameMenuItem) || null;
-    }, 1200);
-    if (!renameItem) {
-      trigger.click();
-      renameItem = await waitForSessionElement(() => {
-        return [...document.querySelectorAll('[role="menuitem"]')]
-          .filter(visibleElement)
-          .find(isNativeSessionRenameMenuItem) || null;
-      }, 1200);
-    }
-    if (!(renameItem instanceof HTMLElement)) {
-      showToast("无法打开 Codex 原生重命名入口", null);
-      return;
-    }
-    renameItem.click();
-
-    const dialog = await waitForSessionElement(visibleSessionRenameDialog, 3000);
-    if (!(dialog instanceof HTMLElement)) {
-      showToast("无法打开 Codex 原生重命名窗口", null);
-      return;
-    }
-    const titleInput = dialog.querySelector('input[aria-label="聊天标题"], input[aria-label="Chat title"]');
-    const initialTitle = titleInput?.value || "";
-    // 新版可能只有手动输入框。先确认原生能力，不能空等 20 秒后关掉用户窗口。
-    const capability = await waitForSessionElement(() => nativeSessionRenameCapability(visibleSessionRenameDialog(), initialTitle), 800);
-    if (!capability) {
-      showToast("当前 Codex 未提供自动命名，可在此窗口手动重命名", null);
-      return;
-    }
-    if (!capability.suggestion && capability.generate) capability.generate.click();
-    showToast("正在使用 Codex 生成会话名称…", null);
-
-    const suggestionButton = await waitForSessionElement(() => {
-      const currentDialog = visibleSessionRenameDialog();
-      if (!currentDialog) return null;
-      return nativeSessionRenameCapability(currentDialog, initialTitle)?.suggestion || null;
-    }, sessionAutoRenameTimeoutMs);
-    if (!(suggestionButton instanceof HTMLElement)) {
-      showToast("Codex 未能生成新名称，可在此窗口手动重命名", null);
-      return;
-    }
-
-    suggestionButton.click();
-    const renamedInput = await waitForSessionElement(() => {
-      const input = visibleSessionRenameDialog()?.querySelector('input[aria-label="聊天标题"], input[aria-label="Chat title"]');
-      return input?.value?.trim() && input.value.trim() !== initialTitle.trim() ? input : null;
-    }, 1500);
-    const activeDialog = visibleSessionRenameDialog();
-    const saveButton = [...activeDialog?.querySelectorAll?.("button") || []]
-      .find((button) => /^(保存|Save)$/i.test(normalizedElementText(button)));
-    if (!renamedInput || !(saveButton instanceof HTMLElement) || saveButton.disabled) {
-      showToast("Codex 未能应用新名称，可在此窗口手动重命名", null);
-      return;
-    }
-    saveButton.click();
-    showToast("已自动重命名当前会话", null);
-  }
-
-  async function activateSessionCopyMenuItem(event) {
-    if (event?.type === "keydown" && !["Enter", " "].includes(event.key)) return;
-    const item = event?.currentTarget;
-    event?.preventDefault?.();
-    event?.stopPropagation?.();
-    event?.stopImmediatePropagation?.();
-    if (sessionCopyMenuActivationIsDuplicate(item)) return;
-    const row = item?.__codexSessionCopyRow;
-    if (!(row instanceof HTMLElement) || !row.isConnected) {
-      showToast("找不到要复制的会话", null);
-      return;
-    }
-    if (!await selectSessionRowForAction(row)) {
-      showToast("会话加载超时，请稍后重试", null);
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 350));
-    const forkButtons = [...document.querySelectorAll('button[aria-label="从这里创建聊天分支"], button[aria-label="Fork from here"]')]
-      .filter(visibleElement)
-      .filter((button) => !isExtensionUiNode(button));
-    const forkButton = forkButtons.at(-1);
-    if (!forkButton) {
-      showToast("当前会话没有可用的官方分支入口", null);
-      return;
-    }
-    forkButton.click();
-  }
-
-  function createSessionCopyMenuItem(referenceItem, row) {
-    const item = document.createElement("div");
-    item.className = referenceItem?.className || "no-drag outline-hidden rounded-lg px-[var(--padding-row-x)] py-[var(--padding-row-y)] text-sm text-default group cursor-interaction flex flex-col";
-    item.classList.add(sessionCopyMenuItemClass);
-    item.setAttribute("role", referenceItem?.getAttribute("role") || "menuitem");
-    item.setAttribute("tabindex", referenceItem?.getAttribute("tabindex") || "-1");
-    item.setAttribute("data-orientation", referenceItem?.getAttribute("data-orientation") || "vertical");
-    item.setAttribute("data-codex-session-copy-menu", "true");
-    item.dataset.codexSessionCopyVersion = sessionCopyMenuItemVersion;
-    item.__codexSessionCopyRow = row;
-    item.innerHTML = `<div class="flex w-full items-center gap-1.5"><span class="inline-flex h-5 w-5 shrink-0 items-center justify-center opacity-75 group-focus:opacity-100 group-hover:opacity-100">${sessionCopyMenuItemIcon()}</span><span class="flex-1 min-w-0 truncate">原地复制会话 - Codex++</span></div>`;
-    item.addEventListener("pointerup", activateSessionCopyMenuItem, true);
-    item.addEventListener("click", activateSessionCopyMenuItem, true);
-    item.addEventListener("keydown", activateSessionCopyMenuItem, true);
-    return item;
-  }
-
-  function refreshSessionCopyMenuItems(scope = document) {
-    sessionCopyMenuScopes(scope).forEach((menu) => {
-      if (!(menu instanceof HTMLElement) || isExtensionUiNode(menu)) return;
-      if (menu.matches(`.${moreMenuClass}, .${codexPlusMenuFloatingClass}, #${codexPlusMenuId}`)) {
-        menu.querySelectorAll(`.${sessionCopyMenuItemClass}`).forEach((item) => item.remove());
-        return;
-      }
-      const row = sessionCopyMenuRow(menu);
-      if (!looksLikeSessionActionMenu(menu)) return;
-      const existing = menu.querySelector(`.${sessionCopyMenuItemClass}`);
-      if (!row) {
-        existing?.remove();
-        return;
-      }
-      if (existing) {
-        existing.__codexSessionCopyRow = row;
-        return;
-      }
-      const referenceItem = menu.querySelector('[role="menuitem"]');
-      menu.appendChild(createSessionCopyMenuItem(referenceItem, row));
-    });
-  }
-
   function scanDeferred() {
     if (codexPluginMarketplacePatchEnabled()) {
       const pluginUnlockStrategy = codexPluginUnlockStrategy();
@@ -19853,7 +19613,7 @@
    */
   function isExtensionUiNode(node) {
     if (!node?.closest) return false;
-    if (node.closest(`[data-codex-plus-ext], .codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${codexPlusPageClass}, #${codexPlusSidebarNavId}, #${codexPlusRailNavId}, #${codexPlusRailExtensionsId}, #${codexPlusRailSponsorId}, #${codexPlusRailNavId} > button, #${codexPlusRailExtensionsId} > button, #${codexPlusRailSponsorId} > button, .${codexServiceTierBadgeClass}, .${sessionShareButtonClass}, .codex-zed-remote-button, .codex-zed-remote-toast, .${sessionCopyMenuItemClass}, #codex-plus-menu, #${capacityAutoRetryChipId}`)) {
+    if (node.closest(`[data-codex-plus-ext], .codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${codexPlusPageClass}, #${codexPlusSidebarNavId}, #${codexPlusRailNavId}, #${codexPlusRailExtensionsId}, #${codexPlusRailSponsorId}, #${codexPlusRailNavId} > button, #${codexPlusRailExtensionsId} > button, #${codexPlusRailSponsorId} > button, .${codexServiceTierBadgeClass}, .${sessionShareButtonClass}, .codex-zed-remote-button, .codex-zed-remote-toast, #codex-plus-menu, #${capacityAutoRetryChipId}`)) {
       return true;
     }
     return isCodexPlusExtensionNode(node);
@@ -20154,12 +19914,11 @@
     attributes: true,
     attributeFilter: ["data-app-action-sidebar-thread-id", "href"],
   });
+  // 会话复制 / 自动命名两项已下线；同页重复注入时摘掉旧脚本留下的触发器监听。
   document.removeEventListener("pointerdown", window.__codexSessionActionTriggerHandler, true);
-  window.__codexSessionActionTriggerHandler = rememberSessionActionTrigger;
-  document.addEventListener("pointerdown", window.__codexSessionActionTriggerHandler, true);
   document.removeEventListener("click", window.__codexSessionActionTriggerClickHandler, true);
-  window.__codexSessionActionTriggerClickHandler = rememberSessionActionTrigger;
-  document.addEventListener("click", window.__codexSessionActionTriggerClickHandler, true);
+  window.__codexSessionActionTriggerHandler = null;
+  window.__codexSessionActionTriggerClickHandler = null;
   // 对外接口层在此刻挂载：此时所有分片都已执行完毕，闭包里的函数全部就绪。
   // 放在 99-tail 收尾之前，确保 IIFE 结束前 window.codexPlus 已经可用——
   // 用户脚本的注入晚于本脚本，不会撞上这个时间点。

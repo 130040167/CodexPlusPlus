@@ -2897,10 +2897,13 @@ fn injection_script_keeps_session_action_buttons_in_pr_style() {
     let script = assets::injection_script(57321);
 
     assert!(script.contains("actionButtonClass = \"codex-session-action-button\""));
+    // 优先套用同一行原生置顶 / 归档按钮的类名与 data-* 属性；兜底样式只在没套上时生效，
+    // 悬停只提亮文字色、不铺底色，也不再从原生静止态抄颜色变量。
+    assert!(script.contains("function syncNativeSessionActionStyle(row)"));
+    assert!(script.contains(".${actionButtonClass}:not([data-codex-native-style]) {"));
     assert!(script.contains("background: transparent;"));
-    assert!(
-        script.contains("background: var(--codex-session-action-hover-background, transparent);")
-    );
+    assert!(script.contains("var(--color-text-secondary-ghost-hover,"));
+    assert!(!script.contains("--codex-session-action-hover-background"));
     assert!(script.contains("cursor: default;"));
 }
 
@@ -3244,7 +3247,9 @@ fn injection_script_moves_export_and_project_move_into_more_menu() {
 
     assert!(script.contains("moreButtonClass = \"codex-session-more-button\""));
     assert!(script.contains("moreMenuClass = \"codex-session-more-menu\""));
-    assert!(script.contains("configureActionButton(moreButton, \"更多操作\", \"…\")"));
+    assert!(
+        script.contains("configureSvgActionButton(moreButton, \"更多操作\", ellipsisIconSvg())")
+    );
     assert!(script.contains("createSessionMoreMenuItem(\"导出\""));
     assert!(!script.contains("createSessionMoreMenuItem(\"移动\""));
     assert!(script.contains("group.appendChild(moreButton)"));
