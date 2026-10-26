@@ -11871,6 +11871,9 @@ select {
   display: flex;
   align-items: center;
   gap: 6px;
+  /* 长文本要截断所以 overflow: hidden；状态点外有一圈 3px 光晕，四周留 3px 再用负外边距抵消，免得光晕被裁掉。 */
+  margin: -3px 0 -3px -3px;
+  padding: 3px 0 3px 3px;
   overflow: hidden;
   color: hsl(var(--muted-foreground));
   font-family: var(--font-mono);
