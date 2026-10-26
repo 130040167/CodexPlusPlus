@@ -44,7 +44,11 @@ export type GatewayPoolEntry = {
   /** 后端旧版没有这两个字段（直连模式里挑出来的供应商列表）。 */
   enabled?: boolean;
   source?: string;
+  /** 每百万 token 的价格。 */
+  price?: ProviderPrice | null;
 };
+
+export type ProviderPrice = { currency: string; input: number; cachedInput: number; output: number };
 
 export type GroupMember = { model: string; weight: number };
 export type GatewayGroupEntry = { id: string; name: string; mode: GroupMode; members: GroupMember[] };
@@ -618,10 +622,24 @@ export function presetAdded(payload: GatewayPayload | null, preset: GatewayPrese
 }
 
 /** 新建 / 编辑供应商的表单。`keys` 每行一个，多个 Key 自动轮换；编辑时留空表示不改。 */
-export type ProviderDraft = { name: string; baseUrl: string; keys: string; protocol: GatewayProtocol; model: string; modelList: string };
+export type ProviderDraft = {
+  name: string;
+  baseUrl: string;
+  keys: string;
+  protocol: GatewayProtocol;
+  model: string;
+  modelList: string;
+  /** 每百万 token 价格，空串表示不填。 */
+  priceCurrency: string;
+  priceInput: string;
+  priceCached: string;
+  priceOutput: string;
+};
+
+const NO_PRICE = { priceCurrency: "CNY", priceInput: "", priceCached: "", priceOutput: "" };
 
 export function providerDraftFromPreset(preset: GatewayPreset | null): ProviderDraft {
-  if (!preset) return { name: "", baseUrl: "", keys: "", protocol: "chatCompletions", model: "", modelList: "" };
+  if (!preset) return { name: "", baseUrl: "", keys: "", protocol: "chatCompletions", model: "", modelList: "", ...NO_PRICE };
   return {
     name: preset.name,
     baseUrl: preset.baseUrl,
@@ -629,6 +647,7 @@ export function providerDraftFromPreset(preset: GatewayPreset | null): ProviderD
     protocol: preset.protocol,
     model: preset.model,
     modelList: preset.modelList.join("\n"),
+    ...NO_PRICE,
   };
 }
 
@@ -641,6 +660,10 @@ export function providerDraftFromEntry(entry: GatewayPoolEntry): ProviderDraft {
     protocol: entry.protocol,
     model: entry.models[0] ?? "",
     modelList: entry.models.join("\n"),
+    priceCurrency: entry.price?.currency || "CNY",
+    priceInput: entry.price ? String(entry.price.input) : "",
+    priceCached: entry.price ? String(entry.price.cachedInput) : "",
+    priceOutput: entry.price ? String(entry.price.output) : "",
   };
 }
 
@@ -653,7 +676,19 @@ export function providerInput(draft: ProviderDraft) {
     keys: draft.keys.split(/\n/).map((line) => line.trim()).filter(Boolean),
     model: draft.model.trim(),
     modelList: splitModels(draft.modelList).join("\n"),
+    price: priceFromDraft(draft),
   };
+}
+
+function priceNumber(text: string): number {
+  const value = Number(text.trim());
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/** 三个价格都没填（或都是 0）时不带价格。 */
+export function priceFromDraft(draft: ProviderDraft): ProviderPrice | null {
+  const price = { currency: draft.priceCurrency || "CNY", input: priceNumber(draft.priceInput), cachedInput: priceNumber(draft.priceCached), output: priceNumber(draft.priceOutput) };
+  return price.input || price.cachedInput || price.output ? price : null;
 }
 
 /** 表单校验：返回中文错误原文，没问题返回 null。编辑时可以不填 Key。 */
@@ -663,4 +698,70 @@ export function validateProviderDraft(draft: ProviderDraft, editing = false): st
   if (!editing && !draft.keys.trim()) return "请填写 API Key";
   if (!draft.model.trim() && splitModels(draft.modelList).length === 0) return "至少填一个模型";
   return null;
+}
+
+/* —————————————— 用量 —————————————— */
+
+export type UsageCounts = { calls: number; errors: number; inputTokens: number; outputTokens: number; cachedTokens: number; reasoningTokens: number };
+export type UsageDay = UsageCounts & { date: string };
+export type UsageGroup = UsageCounts & { key: string; label: string };
+export type UsageSummary = {
+  totals: UsageCounts;
+  days: UsageDay[];
+  byAgent: UsageGroup[];
+  byProvider: UsageGroup[];
+  byModel: UsageGroup[];
+  costs: Array<{ currency: string; amount: number }>;
+};
+export type ProviderBalance = { providerId: string; provider: string; baseUrl: string; amount?: number | null; currency: string; error?: string | null };
+export type UsageRange = "today" | "7d" | "30d" | "all";
+
+/** 23M / 2.2M / 158K / 940。 */
+export function formatTokens(value: number): string {
+  if (value >= 1_000_000_000) return `${trimNumber(value / 1_000_000_000)}B`;
+  if (value >= 1_000_000) return `${trimNumber(value / 1_000_000)}M`;
+  if (value >= 1_000) return `${trimNumber(value / 1_000)}K`;
+  return String(value);
+}
+
+function trimNumber(value: number): string {
+  return value >= 100 ? value.toFixed(0) : value >= 10 ? value.toFixed(0) : value.toFixed(1).replace(/\.0$/, "");
+}
+
+export function currencySymbol(currency: string): string {
+  switch (currency.toUpperCase()) {
+    case "CNY":
+      return "¥";
+    case "USD":
+      return "$";
+    case "EUR":
+      return "€";
+    default:
+      return `${currency.toUpperCase()} `;
+  }
+}
+
+export function formatMoney(amount: number, currency: string): string {
+  return `${currencySymbol(currency)}${amount.toFixed(2)}`;
+}
+
+/** 缓存命中率（命中的输入 / 全部输入），没有输入时为 null。 */
+export function cacheHitRate(counts: UsageCounts): number | null {
+  return counts.inputTokens > 0 ? counts.cachedTokens / counts.inputTokens : null;
+}
+
+/** 横轴标签：最多 `count` 个，均匀分布，总是包含第一天和最后一天。 */
+export function axisLabelIndexes(length: number, count = 7): number[] {
+  if (length <= 0) return [];
+  if (length <= count) return Array.from({ length }, (_, index) => index);
+  const step = (length - 1) / (count - 1);
+  return Array.from(new Set(Array.from({ length: count }, (_, index) => Math.round(index * step))));
+}
+
+/** `2026-09-01` → `9月1日` / `Sep 1`（界面按语言选）。 */
+export function shortDate(date: string, english = false): string {
+  const [, month, day] = date.split("-").map(Number);
+  if (!month || !day) return date;
+  if (english) return `${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][month - 1]} ${day}`;
+  return `${month}月${day}日`;
 }

@@ -472,6 +472,18 @@ function ProviderFormDialog({
             <span>{t("模型列表")} <small>{t("每行一个，会出现在智能体的模型选择器里")}</small></span>
             <Textarea onChange={(event) => update({ modelList: event.currentTarget.value })} rows={4} spellCheck={false} value={draft.modelList} />
           </label>
+          <div className="gw-field">
+            <span>{t("价格")} <small>{t("每百万 token；填了才在「用量」里估算费用，可以不填")}</small></span>
+            <div className="gw-price-row">
+              <select aria-label={t("币种")} className="gw-select" onChange={(event) => update({ priceCurrency: event.currentTarget.value })} value={draft.priceCurrency}>
+                <option value="CNY">¥ CNY</option>
+                <option value="USD">$ USD</option>
+              </select>
+              <label><span>{t("输入")}</span><Input inputMode="decimal" onChange={(event) => update({ priceInput: event.currentTarget.value })} placeholder="0" value={draft.priceInput} /></label>
+              <label><span>{t("缓存命中")}</span><Input inputMode="decimal" onChange={(event) => update({ priceCached: event.currentTarget.value })} placeholder="0" value={draft.priceCached} /></label>
+              <label><span>{t("输出")}</span><Input inputMode="decimal" onChange={(event) => update({ priceOutput: event.currentTarget.value })} placeholder="0" value={draft.priceOutput} /></label>
+            </div>
+          </div>
         </div>
         <footer>
           <span className="gw-error">{validation ? t(validation) : ""}</span>

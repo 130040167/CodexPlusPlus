@@ -343,6 +343,7 @@ mod tests {
         GatewayProvider {
             enabled: true,
             source: String::new(),
+            price: None,
             relay: RelayProfile {
                 id: id.to_string(),
                 name: id.to_string(),

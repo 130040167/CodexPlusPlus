@@ -31,6 +31,7 @@ pub struct GatewayPoolEntry {
     pub enabled: bool,
     /// 预设 key 或导入来源，界面判断「已添加」用。
     pub source: String,
+    pub price: Option<codex_plus_core::gateway::store::ProviderPrice>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,7 +94,12 @@ fn parse_agent(agent: &str) -> anyhow::Result<ToolId> {
     Ok(agent)
 }
 
-fn pool_entry(relay: &RelayProfile, enabled: bool, source: &str) -> GatewayPoolEntry {
+fn pool_entry(
+    relay: &RelayProfile,
+    enabled: bool,
+    source: &str,
+    price: Option<codex_plus_core::gateway::store::ProviderPrice>,
+) -> GatewayPoolEntry {
     GatewayPoolEntry {
         id: relay.id.clone(),
         name: relay.name.clone(),
@@ -104,6 +110,7 @@ fn pool_entry(relay: &RelayProfile, enabled: bool, source: &str) -> GatewayPoolE
         key_count: key_pool::expand_keys(relay).len(),
         enabled,
         source: source.to_string(),
+        price,
     }
 }
 
@@ -112,11 +119,18 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
     let pool = gateway
         .providers
         .iter()
-        .map(|provider| pool_entry(&provider.relay, provider.enabled, &provider.source))
+        .map(|provider| {
+            pool_entry(
+                &provider.relay,
+                provider.enabled,
+                &provider.source,
+                provider.price.clone(),
+            )
+        })
         .collect();
     let codex_providers = apply::codex_importable(settings)
         .into_iter()
-        .map(|relay| pool_entry(relay, true, ""))
+        .map(|relay| pool_entry(relay, true, "", None))
         .collect();
     let agents = GATEWAY_AGENTS
         .iter()
@@ -572,6 +586,53 @@ mod tests {
         );
         assert_eq!(parse_version("no version here"), None);
     }
+}
+
+/// 用量汇总。`range`：`today` / `7d` / `30d` / `all`。
+#[tauri::command]
+pub fn load_gateway_usage(
+    range: String,
+) -> CommandResult<Option<codex_plus_core::gateway::usage::UsageSummary>> {
+    use codex_plus_core::gateway::usage::{UsageStore, local_day};
+    let days = match range.as_str() {
+        "today" => Some(1),
+        "7d" => Some(7),
+        "all" => None,
+        _ => Some(30),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or_default();
+    let gateway = GatewayStore::default().load().unwrap_or_default();
+    match UsageStore::default().summary(&local_day(now), days, &gateway) {
+        Ok(summary) => ok("用量已加载。", Some(summary)),
+        Err(error) => failed(&format!("读取用量失败：{error:#}"), None),
+    }
+}
+
+/// 清空用量统计（请求日志不受影响）。
+#[tauri::command]
+pub fn clear_gateway_usage() -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "用量统计已清空。",
+        "清空用量失败",
+        codex_plus_core::gateway::usage::UsageStore::default().clear(),
+    )
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayBalances {
+    pub balances: Vec<codex_plus_core::gateway::balance::ProviderBalance>,
+}
+
+/// 查池里有余额接口的供应商的余额（联网，每家最多 10 秒）。
+#[tauri::command]
+pub async fn load_gateway_balances() -> CommandResult<GatewayBalances> {
+    let gateway = GatewayStore::default().load().unwrap_or_default();
+    let balances = codex_plus_core::gateway::balance::fetch_balances(&gateway).await;
+    ok("余额已刷新。", GatewayBalances { balances })
 }
 
 /// 清掉某个供应商的 Key 冷却与熔断状态。

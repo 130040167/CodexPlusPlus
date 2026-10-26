@@ -48,6 +48,7 @@ fn deepseek_input() -> ProviderInput {
         keys: vec!["sk-ds".into()],
         model: "deepseek-v4-pro".into(),
         model_list: "deepseek-v4-pro\ndeepseek-v4-flash".into(),
+        price: None,
     }
 }
 

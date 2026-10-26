@@ -138,6 +138,7 @@ fn providers(relays: Vec<RelayProfile>) -> Vec<GatewayProvider> {
         .map(|relay| GatewayProvider {
             enabled: true,
             source: String::new(),
+            price: None,
             relay,
         })
         .collect()
@@ -260,8 +261,8 @@ async fn gateway_end_to_end() {
     // 请求日志在响应转发完后异步落盘，稍等一下。
     let mut log = String::new();
     for _ in 0..40 {
-        log = std::fs::read_to_string(state_dir.path().join("request-log.jsonl"))
-            .unwrap_or_default();
+        log =
+            std::fs::read_to_string(state_dir.path().join("request-log.jsonl")).unwrap_or_default();
         if log.contains("\"agent\":\"claude\"") {
             break;
         }
@@ -271,6 +272,18 @@ async fn gateway_end_to_end() {
         log.contains("\"agent\":\"claude\""),
         "请求日志应记录 Agent：{log}"
     );
+    // 用量按天汇总单独存，不受请求日志裁剪影响（紧跟日志之后写，同样稍等）。
+    let mut usage = String::new();
+    for _ in 0..40 {
+        usage = std::fs::read_to_string(state_dir.path().join("gateway-usage.json"))
+            .unwrap_or_default();
+        if usage.contains("\"agent\":\"claude\"") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(usage.contains("\"agent\":\"claude\""), "{usage}");
+    assert!(usage.contains("\"inputTokens\":20"), "{usage}");
 
     // —— 2. Chat 上游返回工具调用 → tool_use 块 ——
     let (tool_base, _) = mock_upstream(vec![(200, "text/event-stream", chat_tool_sse())]).await;

@@ -24,7 +24,7 @@ pub const GROUP_MODEL_PREFIX: &str = "group/";
 
 /// 网关供应商池里的一个供应商。上游配置复用 [`RelayProfile`] 的结构（协议、地址、多 Key 等），
 /// 但只存在网关里；`relay.id` 同时是它的短名，`<id>/<模型>` 可以指定只发给它。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayProvider {
     #[serde(default = "enabled_by_default")]
@@ -32,7 +32,24 @@ pub struct GatewayProvider {
     /// 来源：内置预设的 key，或 `codex:<id>` / `claude:<id>` / `grok:<id>`，界面用来判断「已添加」。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source: String,
+    /// 每百万 token 的价格，填了才在「用量」里估算费用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<ProviderPrice>,
     pub relay: RelayProfile,
+}
+
+/// 每百万 token 的价格。命中缓存的输入单独计价。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderPrice {
+    #[serde(default)]
+    pub currency: String,
+    #[serde(default)]
+    pub input: f64,
+    #[serde(default)]
+    pub cached_input: f64,
+    #[serde(default)]
+    pub output: f64,
 }
 
 fn enabled_by_default() -> bool {
@@ -213,7 +230,7 @@ pub struct KeyPolicy {
     pub mode: KeyRotationMode,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewaySettings {
     #[serde(default)]
@@ -481,6 +498,7 @@ mod tests {
         settings.providers.push(GatewayProvider {
             enabled: true,
             source: String::new(),
+            price: None,
             relay: RelayProfile {
                 id: "deepseek".to_string(),
                 ..RelayProfile::default()

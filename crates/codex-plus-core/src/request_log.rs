@@ -189,6 +189,10 @@ pub fn finish_request(entry: &RequestLogEntry) {
         live.remove(&entry.id);
     }
     let _ = append_request_log(entry);
+    // 单元测试里默认路径指向真实用户状态目录，同样不写。
+    if !(cfg!(test) && log_path_override().is_none()) {
+        crate::gateway::usage::record_entry(entry);
+    }
 }
 
 /// 更新进行中请求的快照（例如上游地址/首字耗时在请求结束前就已知）。

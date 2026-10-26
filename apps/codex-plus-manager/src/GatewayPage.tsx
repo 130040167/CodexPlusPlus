@@ -31,10 +31,11 @@ import {
 } from "./gateway-model";
 import { AgentsView, Floating, ModelList } from "./GatewayAgents";
 import { ProvidersView } from "./GatewayProviders";
+import { UsageView } from "./GatewayUsage";
 import { AGENT_ICONS, APP_LOGO_URL, Avatar, SectionLabel, Switch, type Notify, type Run } from "./gateway-ui";
 import "./GatewayPage.css";
 
-type Tab = "agents" | "providers" | "routing" | "gateway";
+type Tab = "agents" | "providers" | "routing" | "usage" | "gateway";
 
 const memo: { payload: GatewayPayload | null; tab: Tab } = { payload: null, tab: "agents" };
 
@@ -128,6 +129,7 @@ export function GatewayPage({ notify }: { notify: Notify }) {
     { id: "agents", label: t("智能体") },
     { id: "providers", label: t("供应商") },
     { id: "routing", label: t("路由") },
+    { id: "usage", label: t("用量") },
     { id: "gateway", label: t("网关") },
   ];
 
@@ -156,6 +158,7 @@ export function GatewayPage({ notify }: { notify: Notify }) {
         {tab === "agents" ? <AgentsView busy={busy} notify={notify} onManage={() => setTab("providers")} payload={payload} run={run} /> : null}
         {tab === "providers" ? <ProvidersView busy={busy} notify={notify} payload={payload} run={run} /> : null}
         {tab === "routing" ? <RoutingView busy={busy} payload={payload} run={run} /> : null}
+        {tab === "usage" ? <UsageView busy={busy} notify={notify} payload={payload} run={run} /> : null}
         {tab === "gateway" ? <GatewayView busy={busy} payload={payload} run={run} /> : null}
       </div>
     </div>

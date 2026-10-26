@@ -8,6 +8,7 @@
 //! - [`route`]：绑定 → 模型 → 候选上游；
 //! - [`key_pool`]：多 Key 冷却与熔断；
 //! - [`activity`]：路由动态（最近一次请求怎么走的、计数），供界面实时展示；
+//! - [`usage`]：按天汇总的用量统计；[`balance`]：供应商余额；
 //! - [`pipeline`]：候选循环；
 //! - [`anthropic_inbound`] / [`anthropic_outbound`]：Claude Code 的协议转换；
 //! - [`server`]：HTTP 入口；
@@ -17,11 +18,13 @@ pub mod activity;
 pub mod anthropic_inbound;
 pub mod anthropic_outbound;
 pub mod apply;
+pub mod balance;
 pub mod key_pool;
 pub mod pipeline;
 pub mod route;
 pub mod server;
 pub mod store;
+pub mod usage;
 
 /// helper 收到的路径是否归网关处理。
 pub fn is_gateway_path(path: &str) -> bool {

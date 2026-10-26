@@ -16,7 +16,7 @@ use serde_json::{Map, Value, json};
 use crate::gateway::route::{self, binding_default_model};
 use crate::gateway::store::{
     AgentBinding, GROUP_MODEL_PREFIX, GatewayGroup, GatewayProvider, GatewaySettings, GatewayStore,
-    GroupMember, GroupMode, new_client_token,
+    GroupMember, GroupMode, ProviderPrice, new_client_token,
 };
 use crate::settings::{BackendSettings, RelayApiKey, RelayMode, RelayProfile, RelayProtocol};
 use crate::tools::ToolId;
@@ -488,6 +488,7 @@ pub fn copy_claude_provider(provider: &ClaudeProvider) -> anyhow::Result<RelayPr
         keys: vec![api_key],
         model: models.first().cloned().unwrap_or_default(),
         model_list: models.join("\n"),
+        price: None,
     })?;
     if bearer {
         profile.anthropic_auth_header =
@@ -527,6 +528,7 @@ pub fn copy_grok_profile(
         keys: vec![source.api_key.clone()],
         model: models.first().cloned().unwrap_or_default(),
         model_list: models.join("\n"),
+        price: None,
     })
 }
 
@@ -586,6 +588,9 @@ pub struct ProviderInput {
     pub model: String,
     #[serde(default)]
     pub model_list: String,
+    /// 每百万 token 的价格；不填就不估算费用。
+    #[serde(default)]
+    pub price: Option<ProviderPrice>,
 }
 
 fn clean_keys(keys: &[String]) -> Vec<String> {
@@ -646,6 +651,7 @@ pub fn add_provider(
     gateway.providers.push(GatewayProvider {
         enabled: true,
         source: source.to_string(),
+        price: None,
         relay,
     });
     store.save(&gateway)?;
@@ -658,7 +664,21 @@ pub fn create_provider(
     input: &ProviderInput,
     source: &str,
 ) -> anyhow::Result<(GatewaySettings, String)> {
-    add_provider(store, build_relay(input)?, source)
+    let (mut gateway, id) = add_provider(store, build_relay(input)?, source)?;
+    if let Some(provider) = gateway
+        .providers
+        .iter_mut()
+        .find(|provider| provider.relay.id == id)
+    {
+        provider.price = clean_price(input.price.clone());
+        store.save(&gateway)?;
+    }
+    Ok((gateway, id))
+}
+
+/// 全是 0 的价格等于没填。
+fn clean_price(price: Option<ProviderPrice>) -> Option<ProviderPrice> {
+    price.filter(|price| price.input > 0.0 || price.cached_input > 0.0 || price.output > 0.0)
 }
 
 /// 编辑网关供应商：id 不变（Agent、路由组里的引用都还有效）；`keys` 为空时沿用原来的 Key。
@@ -696,6 +716,7 @@ pub fn update_provider(
     relay.user_agent = provider.relay.user_agent.clone();
     relay.anthropic_auth_header = provider.relay.anthropic_auth_header.clone();
     provider.relay = relay;
+    provider.price = clean_price(input.price.clone());
     store.save(&gateway)?;
     Ok(gateway)
 }

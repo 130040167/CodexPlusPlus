@@ -241,7 +241,9 @@ test("供应商表单：多 Key 每行一个；本机服务预填 Key；编辑�
     keys: ["sk-a", "sk-b"],
     model: "deepseek-v4-pro",
     modelList: "a\nb",
+    price: null,
   });
+  assert.deepEqual(providerInput({ ...editing, priceInput: "2", priceCached: "0.5", priceOutput: "abc" }).price, { currency: "CNY", input: 2, cachedInput: 0.5, output: 0 });
 });
 
 test("网关页接入导航，命令已注册", () => {
@@ -266,4 +268,20 @@ test("网关页接入导航，命令已注册", () => {
   ]) {
     assert.match(lib, new RegExp(`gateway_commands::${command},`));
   }
+});
+
+test("用量格式：token 缩写、货币、命中率、横轴标签", async () => {
+  const { axisLabelIndexes, cacheHitRate, formatMoney, formatTokens, shortDate } = await import("./gateway-model.ts");
+  assert.equal(formatTokens(940), "940");
+  assert.equal(formatTokens(158_000), "158K");
+  assert.equal(formatTokens(2_200_000), "2.2M");
+  assert.equal(formatTokens(23_000_000), "23M");
+  assert.equal(formatMoney(86.4, "CNY"), "¥86.40");
+  assert.equal(formatMoney(23.75, "usd"), "$23.75");
+  assert.equal(cacheHitRate({ calls: 1, errors: 0, inputTokens: 100, outputTokens: 0, cachedTokens: 88, reasoningTokens: 0 }), 0.88);
+  assert.equal(cacheHitRate({ calls: 0, errors: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0 }), null);
+  assert.deepEqual(axisLabelIndexes(30, 7), [0, 5, 10, 15, 19, 24, 29]);
+  assert.deepEqual(axisLabelIndexes(3, 7), [0, 1, 2]);
+  assert.equal(shortDate("2026-09-01"), "9月1日");
+  assert.equal(shortDate("2026-09-01", true), "Sep 1");
 });
