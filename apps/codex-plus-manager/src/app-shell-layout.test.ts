@@ -45,10 +45,11 @@ test("⌘K 打开命令面板，总览页渲染在 hub 路由", () => {
   assert.match(entry, /route === "hub" \? \(\s*<HubOverview/);
 });
 
-test("提示卡按语气分色、悬停暂停，失败可复制详情", () => {
+test("提示卡按语气分色、悬停暂停、不显示进度条，失败可复制详情", () => {
   const notice = functionSource("NoticeDialog");
   assert.match(notice, /noticeTone\(notice\.status\)/);
   assert.match(notice, /onMouseEnter=\{\(\) => setPaused\(true\)\}/);
   assert.match(notice, /tone === "error" && notice\.message/);
-  assert.match(styles, /\.toast-card\[data-paused="true"\] \.toast-progress \{\n  animation-play-state: paused;/);
+  assert.doesNotMatch(notice, /toast-progress/);
+  assert.doesNotMatch(styles, /\.toast-progress\b|@keyframes toast-progress/);
 });

@@ -13712,13 +13712,11 @@ function NoticeDialog({
     <div className="toast-wrap" role={tone === "error" ? "alert" : "status"} aria-live={tone === "error" ? "assertive" : "polite"}>
       <div
         className="toast-card"
-        data-paused={paused}
         data-tone={tone}
         onBlur={() => setPaused(false)}
         onFocus={() => setPaused(true)}
         onMouseEnter={() => setPaused(true)}
         onMouseLeave={() => setPaused(false)}
-        style={{ "--toast-duration": `${duration}ms` } as CSSProperties}
       >
         <span className="toast-icon"><Icon aria-hidden="true" /></span>
         <div className="toast-body">
@@ -13734,7 +13732,6 @@ function NoticeDialog({
         <button aria-label={t("关闭提示")} className="toast-dismiss" onClick={onClose} type="button">
           <X aria-hidden="true" />
         </button>
-        <span aria-hidden="true" className="toast-progress" />
       </div>
     </div>
   );
