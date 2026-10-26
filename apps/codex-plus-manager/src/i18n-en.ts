@@ -5,6 +5,48 @@
 
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
+  // 外壳 · 网关总览 · 命令面板 · 提示卡
+  "总览": "Overview",
+  "Agent 接入": "Agent access",
+  "网关设置": "Gateway settings",
+  "操作": "Actions",
+  "复制详情": "Copy details",
+  "网关未运行": "Gateway not running",
+  "还没有 Agent 接入": "No agent connected yet",
+  "网关总览": "Gateway overview",
+  "快速跳转": "Quick jump",
+  "接入 Agent": "Connect agent",
+  "已经通过 Codex++ 网关接入": "Connected through the Codex++ gateway",
+  "任意 Agent 经 Codex++ 接入任意供应商：谁在用、走哪家、是否健康，一屏看全": "Any agent, any provider through Codex++: who is using it, which provider answers, and whether it is healthy, on one screen",
+  "选择哪些 Agent 经 Codex++ 网关接入，以及它们默认用哪个模型": "Choose which agents go through the Codex++ gateway and which model they use by default",
+  "所有接入的 Agent 共用的供应商池，支持多 Key 轮换": "The provider pool shared by every connected agent, with multi-key rotation",
+  "按模型名选择供应商，路由组决定多家之间的顺序与分配": "Providers are picked by model name; routing groups set the order and split between them",
+  "按 Agent、供应商与模型统计调用、token、缓存与费用": "Calls, tokens, cache and cost by agent, provider and model",
+  "Codex、Claude Code、Grok 的本地会话放在一起，一键在终端继续": "Local sessions from Codex, Claude Code and Grok in one place; resume any of them in a terminal",
+  "监听地址、Key 轮换方式与退出时的恢复策略": "Listen address, key rotation and what happens on quit",
+  "接入总览": "Connection overview",
+  "直连模式": "Direct mode",
+  "已接入": "Connected",
+  "未接入网关": "Not on the gateway",
+  "按模型名路由": "Routes by model name",
+  "协议互转": "Protocol conversion",
+  "逐请求轮换 Key": "Per-request key rotation",
+  "会话粘性 Key": "Session-sticky keys",
+  "换上游": "Rerouted",
+  "冷却 Key": "Cooling keys",
+  "熔断": "Tripped",
+  "今日调用": "Calls today",
+  "供应商池还是空的。": "The provider pool is empty.",
+  "路由动态": "Live routing",
+  "还没有请求经过网关。在已接入的 Agent 里发一条消息试试。": "No requests have gone through the gateway yet. Send a message from a connected agent to try it.",
+  "今日用量": "Usage today",
+  "成功": "OK",
+  "冷却": "Cooling",
+  "今天还没有经过网关的请求。": "No gateway requests today.",
+  "估算费用": "Estimated cost",
+  "按 Agent 拆分": "Split by agent",
+  "跳到页面、Agent 或执行操作…": "Jump to a page or agent, or run an action…",
+  "没有匹配项": "No matches",
   // 本地网关
   "登录 GitHub Copilot": "Sign in to GitHub Copilot",
   "复制验证码": "Copy code",
@@ -2044,6 +2086,14 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  // 外壳 · 网关总览
+  "只作用于 {0}；界面主题、配置备份等整体设置在侧栏底部的齿轮里。": "Applies only to {0}. App-wide settings such as theme and backups are under the gear at the bottom of the sidebar.",
+  "网关运行中 · :{0}": "Gateway running · :{0}",
+  "收起 {0} 的页面": "Collapse {0} pages",
+  "展开 {0} 的页面": "Expand {0} pages",
+  "{0} 个 Agent 通过 Codex++ 共用 {1} 个供应商。请求按模型名路由，Key 冷却或供应商熔断时自动换上游。": "{0} agents share {1} providers through Codex++. Requests route by model name and switch upstream automatically when a key cools down or a provider trips.",
+  "直连 · {0}": "Direct · {0}",
+  "{0} 个路由组": "{0} routing groups",
   // 本地网关
   "登录 {0}": "Sign in to {0}",
   "已在浏览器打开 {0}，输入下面的验证码并授权。授权完成后这里会自动继续。": "{0} is open in your browser. Enter the code below and authorize; this continues automatically afterwards.",

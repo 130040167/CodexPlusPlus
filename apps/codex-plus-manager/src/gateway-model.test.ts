@@ -248,7 +248,11 @@ test("供应商表单：多 Key 每行一个；本机服务预填 Key；编辑�
 
 test("网关页接入导航，命令已注册", () => {
   assert.match(app, /id: "gateway"/);
-  assert.match(app, /route === "gateway" \? <GatewayPage/);
+  // 网关各页签由侧栏直接选中：路由 → 页签一一对应，页内不再显示标签条。
+  assert.match(app, /gatewayTabByRoute\[route\] \? \(\s*<GatewayPage[\s\S]*?tab=\{gatewayTabByRoute\[route\]\}/);
+  for (const [route, tab] of [["gateway", "agents"], ["gatewaySessions", "sessions"], ["gatewayProviders", "providers"], ["gatewayRouting", "routing"], ["gatewayUsage", "usage"], ["gatewaySettings", "gateway"]]) {
+    assert.match(app, new RegExp(`${route}: "${tab}"`));
+  }
   for (const command of [
     "load_gateway",
     "save_gateway_binding",

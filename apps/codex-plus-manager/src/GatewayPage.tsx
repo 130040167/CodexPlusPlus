@@ -37,6 +37,7 @@ import { AGENT_ICONS, APP_LOGO_URL, Avatar, SectionLabel, Switch, type Notify, t
 import "./GatewayPage.css";
 
 type Tab = "agents" | "sessions" | "providers" | "routing" | "usage" | "gateway";
+export type GatewayTab = Tab;
 
 const memo: { payload: GatewayPayload | null; tab: Tab } = { payload: null, tab: "agents" };
 
@@ -53,11 +54,25 @@ function statusText(status: MemberStatus): string {
   return status.args.length ? tf(status.text, status.args) : t(status.text);
 }
 
-export function GatewayPage({ notify }: { notify: Notify }) {
+/**
+ * 传入 `tab` 时由外层侧栏决定当前页签（不再显示页内标签条），页内跳转通过 `onTabChange` 交还外层；
+ * 不传时保持原来的自管页签。
+ */
+export function GatewayPage({ notify, tab: controlledTab, onTabChange }: { notify: Notify; tab?: Tab; onTabChange?: (tab: Tab) => void }) {
   const [payload, setPayload] = useState<GatewayPayload | null>(memo.payload);
   const [busy, setBusy] = useState<string | null>(memo.payload ? null : "load");
-  const [tab, setTabState] = useState<Tab>(memo.tab);
+  const [ownTab, setTabState] = useState<Tab>(memo.tab);
+  const tab = controlledTab ?? ownTab;
+  // 由外层侧栏控制时不显示页内工具条，刷新按钮放进外层顶栏的操作区（与 Claude 增强页同一个挂载点）。
+  const [topbarSlot, setTopbarSlot] = useState<Element | null>(null);
+  useEffect(() => {
+    setTopbarSlot(controlledTab ? document.querySelector("[data-topbar-actions]") : null);
+  }, [controlledTab]);
   const setTab = (next: Tab) => {
+    if (controlledTab) {
+      onTabChange?.(next);
+      return;
+    }
     memo.tab = next;
     setTabState(next);
   };
@@ -135,21 +150,29 @@ export function GatewayPage({ notify }: { notify: Notify }) {
     { id: "gateway", label: t("网关") },
   ];
 
+  const refreshButton = (
+    <button aria-label={t("刷新")} className="gw-icon-button" disabled={busy !== null} onClick={() => void refresh(false)} title={t("刷新")} type="button">
+      <RefreshCw className={`h-4 w-4 ${busy === "load" ? "animate-spin" : ""}`} />
+    </button>
+  );
+
   return (
     <div className="mg-page gateway-page">
       {/* 页面标题由外层框架显示，这里只放分段标签和刷新。 */}
-      <div className="gw-toolbar">
-        <nav aria-label={t("本地网关")} className="gw-tabs" role="tablist">
-          {tabs.map((item) => (
-            <button aria-selected={tab === item.id} data-active={tab === item.id} key={item.id} onClick={() => setTab(item.id)} role="tab" type="button">
-              {item.label}
-            </button>
-          ))}
-        </nav>
-        <button aria-label={t("刷新")} className="gw-icon-button" disabled={busy !== null} onClick={() => void refresh(false)} title={t("刷新")} type="button">
-          <RefreshCw className={`h-4 w-4 ${busy === "load" ? "animate-spin" : ""}`} />
-        </button>
-      </div>
+      {controlledTab ? (
+        topbarSlot ? createPortal(refreshButton, topbarSlot) : null
+      ) : (
+        <div className="gw-toolbar">
+          <nav aria-label={t("本地网关")} className="gw-tabs" role="tablist">
+            {tabs.map((item) => (
+              <button aria-selected={tab === item.id} data-active={tab === item.id} key={item.id} onClick={() => setTab(item.id)} role="tab" type="button">
+                {item.label}
+              </button>
+            ))}
+          </nav>
+          {refreshButton}
+        </div>
+      )}
       <div className="mg-content gw-content">
         {payload && !payload.helperRunning && payload.agents.some((agent) => agent.enabled) ? (
           <p className="gw-alert" role="alert">
