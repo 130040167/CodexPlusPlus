@@ -4330,7 +4330,22 @@ export function App() {
               actions={actions}
             />
           ) : null}
-          {route === "relay" ? <LegacyRelayGatewayHint onOpenGateway={() => void navigate("gatewayProviders")} /> : null}
+          {route === "relay" ? (
+            <LegacyRelayGatewayHint
+              form={settingsForm}
+              onDisconnect={async () => {
+                try {
+                  const result = await invoke<{ status: string; message: string }>("disable_gateway_binding", { agent: "codex" });
+                  await showNotice(result.status === "ok" ? t("已断开网关") : t("断开失败"), result.message, result.status === "ok" ? "ok" : "failed");
+                } catch (error) {
+                  await showNotice(t("断开失败"), String(error), "failed");
+                }
+                await refreshSettings(true);
+              }}
+              onManageAgents={() => void navigate("gateway")}
+              onOpenGateway={() => void navigate("gatewayProviders")}
+            />
+          ) : null}
           {route === "relay" ? (
             <RelayScreen
               settings={settings}
@@ -6402,11 +6417,78 @@ function RelayEnvironmentScreen({ result, actions }: { result: RelayEnvironmentR
   );
 }
 
+/** Codex 接入网关时，网关在直连模式的供应商列表里放的托管供应商（core 的 `CODEX_GATEWAY_RELAY_ID`）。 */
+const CODEX_GATEWAY_RELAY_ID = "codex-plus-gateway";
+
+function codexGatewayModelCount(profile: RelayProfile | undefined): number {
+  return (profile?.modelList ?? "").split("\n").filter((line) => line.trim()).length;
+}
+
 /**
- * 旧版 Codex 供应商配置页顶部的提示：建议改用新版网关的供应商池。
- * 这里的配置照旧生效，提示只负责把人引到网关。
+ * 旧版 Codex 供应商配置页顶部的提示。
+ * - Codex 正经网关接入：显示状态，可去管理或直接断开并还原；
+ * - 断开过但托管供应商还在：提示点它的「使用」即可重新接入；
+ * - 其余：建议改用新版网关的供应商池（这里的配置照旧生效）。
  */
-function LegacyRelayGatewayHint({ onOpenGateway }: { onOpenGateway: () => void }) {
+function LegacyRelayGatewayHint({
+  form,
+  onOpenGateway,
+  onManageAgents,
+  onDisconnect,
+}: {
+  form: BackendSettings;
+  onOpenGateway: () => void;
+  onManageAgents: () => void;
+  onDisconnect: () => Promise<void>;
+}) {
+  const [disconnecting, setDisconnecting] = useState(false);
+  const managed = form.relayProfiles.find((profile) => profile.id === CODEX_GATEWAY_RELAY_ID);
+  if (managed && form.activeRelayId === CODEX_GATEWAY_RELAY_ID) {
+    const count = codexGatewayModelCount(managed);
+    return (
+      <div className="legacy-gateway-hint" data-state="connected" role="status">
+        <Waypoints aria-hidden="true" className="legacy-gateway-hint-icon" />
+        <div className="legacy-gateway-hint-text">
+          <strong>{t("Codex 当前经 Codex++ 网关（新版）")}</strong>
+          <span>
+            {count
+              ? tf("用网关供应商池里的 {0} 个模型。在下面选任一供应商即切回直连；「断开并还原」恢复接入前的配置。", [count])
+              : t("用网关供应商池里的模型。在下面选任一供应商即切回直连；「断开并还原」恢复接入前的配置。")}
+          </span>
+        </div>
+        <Button onClick={onManageAgents} size="sm" variant="secondary">
+          {t("管理接入")}
+          <ArrowRight aria-hidden="true" className="h-3.5 w-3.5" />
+        </Button>
+        <Button
+          disabled={disconnecting}
+          onClick={() => {
+            setDisconnecting(true);
+            void onDisconnect().finally(() => setDisconnecting(false));
+          }}
+          size="sm"
+          variant="outline"
+        >
+          {disconnecting ? t("断开中…") : t("断开并还原")}
+        </Button>
+      </div>
+    );
+  }
+  if (managed) {
+    return (
+      <div className="legacy-gateway-hint" role="note">
+        <Waypoints aria-hidden="true" className="legacy-gateway-hint-icon" />
+        <div className="legacy-gateway-hint-text">
+          <strong>{t("Codex 已从网关切回直连")}</strong>
+          <span>{t("想回到新版网关，在下面「Codex++ 网关」那一项点「使用」，或到「Agent 接入」里打开 Codex。")}</span>
+        </div>
+        <Button onClick={onManageAgents} size="sm" variant="secondary">
+          {t("打开 Agent 接入")}
+          <ArrowRight aria-hidden="true" className="h-3.5 w-3.5" />
+        </Button>
+      </div>
+    );
+  }
   return (
     <div className="legacy-gateway-hint" role="note">
       <Waypoints aria-hidden="true" className="legacy-gateway-hint-icon" />
@@ -10113,6 +10195,8 @@ function SortableRelayProfileCard({
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: profile.id });
   const active = profile.id === form.activeRelayId;
+  // 网关托管的供应商：由「Agent 接入」管理，这里只能「使用」（重新接入）。
+  const gatewayManaged = profile.id === CODEX_GATEWAY_RELAY_ID;
   const style: CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
@@ -10121,10 +10205,11 @@ function SortableRelayProfileCard({
   return (
     <div
       className={`relay-profile-card ${active ? "active" : ""} ${isDragging ? "dragging" : ""}`}
+      data-gateway-managed={gatewayManaged || undefined}
       data-relay-profile-id={profile.id}
       key={profile.id}
       onKeyDown={(event) => {
-        if (event.key === "Enter") onEdit(profile.id);
+        if (event.key === "Enter" && !gatewayManaged) onEdit(profile.id);
       }}
       ref={setNodeRef}
       style={style}
@@ -10147,14 +10232,22 @@ function SortableRelayProfileCard({
         {/* 参照 CC Switch：接入方式、非 Responses 协议做成名字旁的标签，第二行只放地址。 */}
         <strong>
           <span className="relay-summary-name">{profile.name || t("未命名供应商")}</span>
-          <span className="relay-tag" data-tone={relayProfileTagTone(profile)}>{relayProfileModeLabel(profile)}</span>
-          {!isAggregateRelayProfile(profile) && profile.protocol !== "responses" ? (
+          {gatewayManaged ? (
+            <span className="relay-tag" data-tone="gateway">{t("新版网关")}</span>
+          ) : (
+            <span className="relay-tag" data-tone={relayProfileTagTone(profile)}>{relayProfileModeLabel(profile)}</span>
+          )}
+          {!gatewayManaged && !isAggregateRelayProfile(profile) && profile.protocol !== "responses" ? (
             <span className="relay-tag" data-tone="protocol">{relayProtocolShortLabel(profile.protocol)}</span>
           ) : null}
           {active ? <span className="relay-active-badge">{t("使用中")}</span> : null}
         </strong>
         <small>
-          {profile.relayMode === "official"
+          {gatewayManaged
+            ? codexGatewayModelCount(profile)
+              ? tf("经 Codex++ 本地网关，用供应商池里的 {0} 个模型；在「Agent 接入」里管理", [codexGatewayModelCount(profile)])
+              : t("经 Codex++ 本地网关，用供应商池里的模型；在「Agent 接入」里管理")
+            : profile.relayMode === "official"
             ? profile.officialMixApiKey
               ? profile.baseUrl || t("未填写 URL")
               : t("使用 Codex 当前登录的 ChatGPT 账号")
@@ -10178,13 +10271,16 @@ function SortableRelayProfileCard({
                 ? t("供应商配置总开关已关闭，点击后按提示开启")
                 : active
                   ? t("当前正在使用")
-                  : t("设为当前")
+                  : gatewayManaged
+                    ? t("重新接入 Codex++ 网关")
+                    : t("设为当前")
           }
           variant={active ? "secondary" : "outline"}
         >
           <CheckCircle2 className="h-4 w-4" />
           {active ? t("使用中") : t("使用")}
         </Button>
+        {gatewayManaged ? null : (
         <span className="relay-card-extra">
           <Button
             disabled={!multiLaunchSupported(profile) || actions.multiLaunchPending === profile.id}
@@ -10256,6 +10352,7 @@ function SortableRelayProfileCard({
             <Trash2 className="h-4 w-4" />
           </Button>
         </span>
+        )}
       </span>
     </div>
   );

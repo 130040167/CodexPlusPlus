@@ -686,3 +686,13 @@
 .legacy-gateway-hint button {
   flex: none;
 }
+
+/* Codex 正经新版网关接入：状态条换成「已接入」的绿色 */
+.legacy-gateway-hint[data-state="connected"] {
+  border-color: hsl(var(--status-success) / 0.35);
+  background: hsl(var(--status-success) / 0.07);
+}
+
+.legacy-gateway-hint[data-state="connected"] .legacy-gateway-hint-icon {
+  color: hsl(var(--status-success));
+}

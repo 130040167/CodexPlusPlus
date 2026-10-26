@@ -124,9 +124,20 @@ test("请求日志按 Agent 筛选；网关记录带 agent 字段，没有的算
   assert.match(functionSource("requestLogAgent"), /return entry\.agent \|\| "codex";/);
 });
 
-test("旧版 Codex 供应商配置页顶部建议改用新版网关，按钮打开供应商池", () => {
-  assert.match(functionSource("App"), /\{route === "relay" \? <LegacyRelayGatewayHint onOpenGateway=\{\(\) => void navigate\("gatewayProviders"\)\} \/> : null\}/);
-  assert.match(functionSource("LegacyRelayGatewayHint"), /t\("建议改用新版网关"\)/);
+test("旧版 Codex 供应商配置页顶部：没接入时建议改用新版网关，接入后显示状态并能断开还原", () => {
+  const app = functionSource("App");
+  assert.match(app, /<LegacyRelayGatewayHint[\s\S]*onOpenGateway=\{\(\) => void navigate\("gatewayProviders"\)\}/);
+  assert.match(app, /invoke<\{ status: string; message: string \}>\("disable_gateway_binding", \{ agent: "codex" \}\)/);
+  const hint = functionSource("LegacyRelayGatewayHint");
+  assert.match(hint, /t\("建议改用新版网关"\)/);
+  assert.match(hint, /form\.activeRelayId === CODEX_GATEWAY_RELAY_ID/);
+  assert.match(hint, /t\("Codex 当前经 Codex\+\+ 网关（新版）"\)/);
+  assert.match(hint, /t\("Codex 已从网关切回直连"\)/);
+  // 列表里托管的网关供应商单独标出，只能「使用」，不能编辑、删除。
+  const card = functionSource("SortableRelayProfileCard");
+  assert.match(card, /const gatewayManaged = profile\.id === CODEX_GATEWAY_RELAY_ID;/);
+  assert.match(card, /data-tone="gateway">\{t\("新版网关"\)\}/);
+  assert.match(card, /\{gatewayManaged \? null : \(\s*<span className="relay-card-extra">/);
 });
 
 test("Skills 与 MCP 共用一张多 Agent 表：每个 Agent 一列勾选，不再有页面自己的配色和按钮尺寸", () => {

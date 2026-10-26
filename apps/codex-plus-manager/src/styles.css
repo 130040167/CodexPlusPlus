@@ -11620,6 +11620,7 @@ select {
 .relay-tag[data-tone="api"] { border-color: hsl(210 80% 60% / 0.35); color: hsl(210 80% 66%); }
 .relay-tag[data-tone="aggregate"] { border-color: hsl(var(--brand-accent) / 0.4); color: hsl(var(--brand-accent)); }
 .relay-tag[data-tone="protocol"] { border-style: dashed; }
+.relay-tag[data-tone="gateway"] { border-color: hsl(var(--status-success) / 0.4); color: hsl(var(--status-success)); }
 /* 第二行只剩地址：不再用主题色，弱化成辅助信息。 */
 .relay-management-page .relay-summary small {
   overflow: hidden;
