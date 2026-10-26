@@ -1031,6 +1031,8 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "停止 Codex": "Stop Codex",
+  "处理中…": "Working…",
   "增强分类": "Enhancement categories",
   "实验": "Experimental",
   "需重启": "Restart",

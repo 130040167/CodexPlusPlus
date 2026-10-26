@@ -72,6 +72,7 @@ import {
   Sparkles,
   ShieldCheck,
   ShieldAlert,
+  Square,
   Star,
   Store,
   Stethoscope,
@@ -314,6 +315,8 @@ type PathState = {
 type LaunchStatus = {
   status: string;
   message: string;
+  /** 阶段；侧栏「停止 Codex」写的是 user_stopped，用来和意外退出区分。 */
+  phase?: string | null;
   started_at_ms: number;
   debug_port: number | null;
   helper_port: number | null;
@@ -1288,7 +1291,7 @@ const gatewayNavigationRoutes: Route[] = ["hub", "gateway", "gatewayProviders", 
 /** 侧栏「全局管理」分组：同时管理所有 Agent 的请求日志、会话、MCP 与 Skills。 */
 const managementNavigationRoutes: Route[] = ["requestLog", "sessions", "context", "skills"];
 /** 侧栏「工具」分组：服务所有 Agent，但与供应商无关。关于、整体设置放在侧栏底部。 */
-const toolNavigationRoutes: Route[] = ["computerUse", "agentPet", "agentCollaboration", "agentCache", "recommendations"];
+const toolNavigationRoutes: Route[] = ["recommendations", "computerUse", "agentPet", "agentCollaboration", "agentCache"];
 /** 网关的各个页签由侧栏直接选中，页内不再显示标签条。 */
 const gatewayTabByRoute: Partial<Record<Route, GatewayTab>> = {
   gateway: "agents",
@@ -1643,7 +1646,9 @@ export function App() {
       // 崩溃检测：进程从运行状态变为停止/失败 → 弹出通知
       const prev = prevLaunchStatusRef.current;
       const current = result.latest_launch?.status;
-      if (prev && prev === "running" && current && (current === "stopped" || current === "failed" || current === "crashed")) {
+      // 用户在侧栏点了「停止」不算意外停止。
+      const stoppedByUser = result.latest_launch?.phase === "user_stopped";
+      if (prev && prev === "running" && current && !stoppedByUser && (current === "stopped" || current === "failed" || current === "crashed")) {
         showNotice(t("Codex 意外停止"), tf("进程状态：{0}。是否要重新启动？", [current]), "failed");
       }
       prevLaunchStatusRef.current = current ?? null;
@@ -2749,7 +2754,22 @@ export function App() {
     }
   };
 
-  const launchCommand = async (command: "launch_codex_plus" | "restart_codex_plus", syncActiveRelay = false) => {
+  /** 侧栏 Codex 行的「停止」：结束主 Codex，和重启共用停止流程。 */
+  const stopCodex = async () => {
+    if (launchPendingRef.current) return;
+    launchPendingRef.current = true;
+    setLaunchPending(true);
+    try {
+      const result = await launchCommand("stop_codex_plus");
+      if (result) showNotice(t("停止 Codex"), result.message, result.status);
+      await refreshOverview(true);
+    } finally {
+      launchPendingRef.current = false;
+      setLaunchPending(false);
+    }
+  };
+
+  const launchCommand = async (command: "launch_codex_plus" | "restart_codex_plus" | "stop_codex_plus", syncActiveRelay = false) => {
     const result = await run(() =>
       call<LaunchCommandResult>(command, {
         request: {
@@ -4028,6 +4048,7 @@ export function App() {
       restartMultiLaunchInstance,
       stopMultiLaunchInstance,
       restart,
+      stopCodex,
       repairShortcuts,
       checkUpdate,
       performUpdate,
@@ -4279,6 +4300,7 @@ export function App() {
         onOpenPalette={() => setPaletteOpen(true)}
         pendingUpdateVersion={update?.updateAvailable && update.latestVersion ? update.latestVersion : null}
         onOpenUpdate={() => { if (update) setUpdatePrompt(update); }}
+        codexRun={{ running: codexAppRunning, busy: launchPending, onStart: () => void actions.launch(), onStop: () => void actions.stopCodex() }}
       />
       <CommandPalette commands={paletteCommands} onClose={() => setPaletteOpen(false)} open={paletteOpen} />
       <main className="workspace">
@@ -4790,6 +4812,7 @@ type Actions = {
   restartMultiLaunchInstance: (instance: MultiLaunchInstance) => Promise<void>;
   stopMultiLaunchInstance: (instance: MultiLaunchInstance) => Promise<void>;
   restart: (syncActiveRelay?: boolean) => Promise<boolean>;
+  stopCodex: () => Promise<void>;
   repairShortcuts: () => Promise<void>;
   checkUpdate: () => Promise<void>;
   performUpdate: () => Promise<void>;
@@ -14711,7 +14734,10 @@ function AppSidebar({
   onOpenPalette,
   pendingUpdateVersion,
   onOpenUpdate,
+  codexRun,
 }: {
+  /** Codex 行的播放 / 停止：只有桌面应用的 Codex 有，命令行 Agent 没有常驻进程可启停。 */
+  codexRun: { running: boolean; busy: boolean; onStart: () => void; onStop: () => void };
   tools: ToolEntry[];
   activeTool: ToolId;
   route: Route;
@@ -14831,20 +14857,34 @@ function AppSidebar({
                   ? { tone: "ok", label: t("已经通过 Codex++ 网关接入") }
                   : { tone: "off", label: t("未接入网关") };
               return (
-                <button
-                  aria-current={current && !onGlobalPage ? "true" : undefined}
-                  aria-label={tool.switchable ? `${tool.name} · ${access.label}` : `${tool.name} · ${t("待接入")}`}
-                  className={`side-item side-agent ${current && !onGlobalPage ? "current active" : ""}`}
-                  disabled={!tool.switchable}
-                  key={tool.id}
-                  onClick={() => onOpenAgent(tool.id)}
-                  title={`${title}｜${access.label}`}
-                  type="button"
-                >
-                  <AgentGlyph agent={tool.id} className="side-item-icon" />
-                  <span className="side-item-label">{tool.name}</span>
-                  <i aria-hidden="true" className="side-dot side-agent-dot" data-tone={access.tone} />
-                </button>
+                <div className="side-agent-wrap" key={tool.id}>
+                  <button
+                    aria-current={current && !onGlobalPage ? "true" : undefined}
+                    aria-label={tool.switchable ? `${tool.name} · ${access.label}` : `${tool.name} · ${t("待接入")}`}
+                    className={`side-item side-agent ${current && !onGlobalPage ? "current active" : ""}`}
+                    disabled={!tool.switchable}
+                    onClick={() => onOpenAgent(tool.id)}
+                    title={`${title}｜${access.label}`}
+                    type="button"
+                  >
+                    <AgentGlyph agent={tool.id} className="side-item-icon" />
+                    <span className="side-item-label">{tool.name}</span>
+                    <i aria-hidden="true" className="side-dot side-agent-dot" data-tone={access.tone} />
+                  </button>
+                  {tool.id === "codex" && tool.switchable ? (
+                    <button
+                      aria-label={codexRun.running ? t("停止 Codex") : t("启动 Codex")}
+                      className="side-agent-run"
+                      data-running={codexRun.running}
+                      disabled={codexRun.busy}
+                      onClick={codexRun.running ? codexRun.onStop : codexRun.onStart}
+                      title={codexRun.busy ? t("处理中…") : codexRun.running ? t("停止 Codex") : t("启动 Codex")}
+                      type="button"
+                    >
+                      {codexRun.busy ? <Loader2 aria-hidden="true" className="animate-spin" /> : codexRun.running ? <Square aria-hidden="true" /> : <Play aria-hidden="true" />}
+                    </button>
+                  ) : null}
+                </div>
               );
             })}
           </div>

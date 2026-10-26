@@ -2301,31 +2301,9 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
         10,
     ));
     let native_browser_shutdown = match stop_codex_plus_for_restart(
-        || {
-            // 主实例在 Windows 上是 AUMID 激活的，命令行未必带调试端口；
-            // 这里允许「按端口没匹配到就退回全局结束」，否则重启会卡在
-            // 「Codex 进程尚未退出」。多开页的结束走的是不允许退回的那个版本。
-            #[cfg(windows)]
-            codex_plus_core::watcher::stop_codex_processes_for_debug_port_with_fallback(
-                request.debug_port,
-                true,
-            );
-            #[cfg(not(windows))]
-            codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(
-                request.debug_port,
-            );
-            anyhow::ensure!(
-                !codex_plus_core::cdp::endpoint_available(request.debug_port),
-                "Codex 进程尚未退出；未启动新实例"
-            );
-            Ok(())
-        },
+        || stop_main_codex_process(request.debug_port),
         codex_plus_launcher::stop,
-        || {
-            codex_plus_core::native_browser::wait_for_monitor_shutdown(
-                std::time::Duration::from_secs(10),
-            )
-        },
+        wait_native_browser_shutdown,
     ) {
         Ok(shutdown) => shutdown,
         Err(error) => {
@@ -2415,6 +2393,93 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
                     "nativeBrowserRestoreFailed": native_browser_restore_failed
                 }),
             )
+        }
+    }
+}
+
+/// 结束主 Codex 进程并确认调试端口已关闭。重启和「停止 Codex」共用。
+fn stop_main_codex_process(debug_port: u16) -> anyhow::Result<()> {
+    // 主实例在 Windows 上是 AUMID 激活的，命令行未必带调试端口；
+    // 这里允许「按端口没匹配到就退回全局结束」，否则会卡在
+    // 「Codex 进程尚未退出」。多开页的结束走的是不允许退回的那个版本。
+    #[cfg(windows)]
+    codex_plus_core::watcher::stop_codex_processes_for_debug_port_with_fallback(debug_port, true);
+    #[cfg(not(windows))]
+    codex_plus_core::watcher::stop_codex_processes_for_debug_port_and_wait(debug_port);
+    anyhow::ensure!(
+        !codex_plus_core::cdp::endpoint_available(debug_port),
+        "Codex 进程尚未退出"
+    );
+    Ok(())
+}
+
+fn wait_native_browser_shutdown()
+-> anyhow::Result<codex_plus_core::native_browser::NativeBrowserShutdown> {
+    codex_plus_core::native_browser::wait_for_monitor_shutdown(std::time::Duration::from_secs(10))
+}
+
+/// 侧栏 Codex 行的「停止」：走和重启相同的停止流程（结束进程 → 清理后台服务 → 等浏览器恢复），
+/// 只是不再启动新实例。状态记为 stopped / user_stopped，前端据此不把它当成「意外停止」。
+#[tauri::command]
+pub async fn stop_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
+    match tauri::async_runtime::spawn_blocking(move || stop_codex_plus_blocking(request)).await {
+        Ok(result) => result,
+        Err(error) => failed(&format!("停止后台任务失败：{error}"), json!({})),
+    }
+}
+
+fn stop_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
+    let _launch_guard = match try_acquire_launch_guard() {
+        Ok(guard) => guard,
+        Err(message) => return failed(message, json!({})),
+    };
+    let request = normalize_launch_request(request);
+    if !codex_plus_core::cdp::endpoint_available(request.debug_port) {
+        return ok("Codex 没有在运行。", json!({}));
+    }
+    let Ok(_guard) = relay_switch_mutex().try_lock() else {
+        return failed("供应商切换正在进行，未停止 Codex；请稍后重试。", json!({}));
+    };
+    let _provider_guard = match ensure_provider_sync_is_idle_before_stop() {
+        Ok(guard) => guard,
+        Err(message) => return failed(&message, json!({})),
+    };
+    let _ = StatusStore::default().save_latest(&requested_launch_status_with_phase(
+        &request,
+        "stopping",
+        "正在停止 Codex 并清理后台服务…",
+        current_timestamp_ms(),
+        "user_stopping",
+        10,
+    ));
+    match stop_codex_plus_for_restart(
+        || stop_main_codex_process(request.debug_port),
+        codex_plus_launcher::stop,
+        wait_native_browser_shutdown,
+    ) {
+        Ok(_) => {
+            let _ = StatusStore::default().save_latest(&requested_launch_status_with_phase(
+                &request,
+                "stopped",
+                "Codex 已停止。",
+                current_timestamp_ms(),
+                "user_stopped",
+                100,
+            ));
+            ok("Codex 已停止。", json!({}))
+        }
+        Err(error) => failed(&stop_failure_message(&error), json!({})),
+    }
+}
+
+fn stop_failure_message(error: &RestartStopError) -> String {
+    match error {
+        RestartStopError::Codex(error) => format!("Codex 进程尚未确认退出：{error}"),
+        RestartStopError::NativeBrowser(error) => {
+            format!("Codex 已停止，但原生浏览器文件尚未恢复：{error}")
+        }
+        RestartStopError::Runtime(error) => {
+            format!("Codex 已停止，但后台服务尚未清理完成：{error}")
         }
     }
 }
@@ -10188,6 +10253,25 @@ base_url = "https://example.invalid/v1"
             anyhow::anyhow!("Invalid native cleanup receipt"),
         ));
         assert!(failed.contains("原生浏览器文件恢复失败"));
+    }
+
+    #[test]
+    fn stop_errors_name_the_step_without_mentioning_a_new_instance() {
+        // 侧栏「停止 Codex」不会启动新实例，提示里不能出现「未启动新实例」这类重启用语。
+        let codex = stop_failure_message(&RestartStopError::Codex(anyhow::anyhow!(
+            "app remains running"
+        )));
+        let runtime = stop_failure_message(&RestartStopError::Runtime(anyhow::anyhow!(
+            "runtime still exiting"
+        )));
+        let browser =
+            stop_failure_message(&RestartStopError::NativeBrowser(anyhow::anyhow!("receipt")));
+        assert!(codex.contains("Codex 进程尚未确认退出"));
+        assert!(runtime.contains("后台服务尚未清理完成"));
+        assert!(browser.contains("原生浏览器文件尚未恢复"));
+        for message in [codex, runtime, browser] {
+            assert!(!message.contains("新实例"), "{message}");
+        }
     }
 
     #[test]

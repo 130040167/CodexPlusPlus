@@ -37,9 +37,17 @@ test("Agent 一行一个始终可见（与设计图一致）；点开 Agent 后�
   const sidebar = functionSource("AppSidebar");
   // 在网关、全局管理、工具这些通用页面时 Agent 行不显示选中，侧栏同一时间只有一个选中项。
   assert.match(sidebar, /className=\{`side-item side-agent \$\{current && !onGlobalPage \? "current active" : ""\}`\}/);
-  // 状态点表示接入方式而不是运行状态（运行状态只在顶栏显示，见 tool-chip-status.test.ts）。
+  // 状态点表示接入方式而不是运行状态（运行状态在顶栏和 Codex 行的播放 / 停止键上）。
   assert.match(sidebar, /tone: "direct"/);
-  assert.doesNotMatch(sidebar, /codexAppRunning|running/);
+  const access = sidebar.slice(sidebar.indexOf("const access ="), sidebar.indexOf("return (", sidebar.indexOf("const access =")));
+  assert.doesNotMatch(access, /running/);
+  // 只有 Codex 行有播放 / 停止：命令行 Agent 没有常驻进程可启停。
+  assert.match(sidebar, /\{tool\.id === "codex" && tool\.switchable \? \(\n\s*<button\n\s*aria-label=\{codexRun\.running \? t\("停止 Codex"\) : t\("启动 Codex"\)\}/);
+  assert.match(sidebar, /onClick=\{codexRun\.running \? codexRun\.onStop : codexRun\.onStart\}/);
+  // 主动停止写 user_stopped，崩溃检测不把它当成意外停止。
+  assert.match(text, /const stoppedByUser = result\.latest_launch\?\.phase === "user_stopped";/);
+  const lib = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+  assert.match(lib, /commands::stop_codex_plus,/);
   // 侧栏不再列当前 Agent 的页面。
   assert.doesNotMatch(sidebar, /agent-pages|navigationSections/);
   // 页签：概览 / 供应商 / 增强 / 设置 分组用细线隔开，仍按页面的 tool 归属过滤；通用页面不显示。

@@ -259,6 +259,7 @@ pub fn run() {
             commands::stop_codex_multi_instance,
             commands::restart_codex_multi_instance,
             commands::restart_codex_plus,
+            commands::stop_codex_plus,
             commands::load_settings,
             commands::load_request_logs,
             commands::clear_request_logs,

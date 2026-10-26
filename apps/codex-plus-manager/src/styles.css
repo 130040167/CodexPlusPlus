@@ -13254,3 +13254,58 @@ button.side-item:hover {
 .shell .dream-skin-page .dream-skin-theme-copy :is(small, span) {
   font-size: 11px;
 }
+
+/* 侧栏 Codex 行：状态点左边的播放 / 停止。行本身是按钮，播放键作为兄弟元素叠在行上。 */
+.shell .side-agent-wrap {
+  position: relative;
+}
+/* 只给名字留出播放键的位置，状态点仍贴在行的最右边。 */
+.shell .side-agent-wrap:has(.side-agent-run) .side-item-label {
+  margin-right: 30px;
+}
+.shell .side-agent-run {
+  position: absolute;
+  top: 50%;
+  right: 22px;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  cursor: pointer;
+  transform: translateY(-50%);
+}
+.shell .side-agent-run:hover:not(:disabled) {
+  background: hsl(var(--accent));
+  color: hsl(var(--foreground));
+}
+.shell .side-agent-run[data-running="false"]:hover:not(:disabled) {
+  color: hsl(var(--status-success));
+}
+.shell .side-agent-run[data-running="true"]:hover:not(:disabled) {
+  color: hsl(var(--status-error));
+}
+.shell .side-agent-run:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+.shell .side-agent-run:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 1px;
+}
+.shell .side-agent-run svg {
+  width: 12px;
+  height: 12px;
+}
+.shell .side-agent-run[data-running="false"] svg {
+  fill: currentColor;
+}
+.shell .side-agent-run[data-running="true"] svg {
+  fill: currentColor;
+  width: 10px;
+  height: 10px;
+}
