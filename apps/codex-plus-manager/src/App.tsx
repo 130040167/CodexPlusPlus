@@ -83,6 +83,7 @@ import {
   Bug,
   Server,
   Tag,
+  Waypoints,
   type LucideIcon,
 } from "lucide-react";
 import { createPresetPatch } from "@/components/ProviderPresetSelector";
@@ -102,6 +103,7 @@ import { AgentCachePanel } from "./agent-cache";
 import { summarizeRecentRequests, type RecentRequestSummary } from "./overview-model";
 import { AgentCollaborationPage } from "./AgentCollaborationPage";
 import { ClaudeProviderPage } from "./ClaudeProviderPage";
+import { GatewayBanner, GatewayPage } from "./GatewayPage";
 import { BACKEND_SETTINGS_CHANGED_EVENT, ComputerUsePage } from "./ComputerUsePage";
 import { PluginMarketScreen } from "./PluginMarketScreen";
 import { ReleaseNotes } from "./ReleaseNotes";
@@ -533,6 +535,7 @@ type RelayAggregateRoute = {
   pattern: string;
   profileId: string;
   priority: number;
+  targetModel?: string;
 };
 type RelayAggregateConfig = {
   strategy: RelayAggregateStrategy;
@@ -555,7 +558,7 @@ type AggregateRelayProfile = {
   modelAggregationEnabled?: boolean;
   strategy: RelayAggregateStrategy;
   members: AggregateRelayMember[];
-  routes?: { pattern: string; relayId: string; priority: number }[];
+  routes?: { pattern: string; relayId: string; priority: number; targetModel?: string }[];
   defaultRelayId?: string;
   /** 把默认成员的官方登录同步进 Codex（auth.json 的 tokens 段）。默认关。 */
   syncDefaultMemberLogin?: boolean;
@@ -1189,7 +1192,7 @@ const TOOL_ICONS: Record<string, string> = {
   claude: new URL("./assets/agents/claude.svg", import.meta.url).href,
 };
 
-type Route = "overview" | "relay" | "multiLaunch" | "grok" | "claudeRelay" | "claude" | "relayEnvironment" | "requestLog" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "computerUse" | "maintenance" | "about" | "settings" | "agentSettings";
+type Route = "overview" | "relay" | "multiLaunch" | "grok" | "claudeRelay" | "claude" | "relayEnvironment" | "requestLog" | "sessions" | "context" | "skills" | "weixin" | "enhance" | "dreamSkin" | "userScripts" | "pluginMarket" | "recommendations" | "agentCache" | "agentCollaboration" | "computerUse" | "gateway" | "maintenance" | "about" | "settings" | "agentSettings";
 type Theme = "dark" | "light";
 
 const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
@@ -1225,6 +1228,8 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   // 跨客户端协作属于应用级能力，各工具下共用同一组任务。
   { id: "agentCollaboration", get label() { return t("Agent 协作"); }, icon: GitBranch, badge: "实验" },
   { id: "computerUse", get label() { return t("Computer Use"); }, icon: MousePointerClick, badge: "实验" },
+  // 本地网关服务于 Codex 之外的所有 Agent（Claude Code、Grok），同样是应用级页面。
+  { id: "gateway", get label() { return t("本地网关"); }, icon: Waypoints, badge: "实验" },
   { id: "maintenance", get label() { return t("安装维护"); }, icon: Wrench, tool: "codex" },
   { id: "about", get label() { return t("关于"); }, icon: Info },
   { id: "settings", get label() { return t("整体设置"); }, icon: Settings },
@@ -1260,9 +1265,9 @@ const navigationSections: Array<{ label: string; routes: Route[]; placement?: "b
  * Computer Use 同时接入 Claude Code / Claude Desktop / DSH 等多个客户端，不属于任何一个 Agent，
  * 所以和 Agent 协作一样放在这里，而不是重复出现在每个 Agent 的「扩展」分组里。
  */
-const globalNavigationRoutes: Route[] = ["recommendations", "agentCache", "agentCollaboration", "computerUse", "about", "settings"];
+const globalNavigationRoutes: Route[] = ["recommendations", "agentCache", "agentCollaboration", "computerUse", "gateway", "about", "settings"];
 // 最左栏里跟 Agent 图标排在一组的全局页（Computer Use 服务于所有 Agent），其余全局页放在底部。
-const railAgentGroupRoutes: Route[] = ["computerUse"];
+const railAgentGroupRoutes: Route[] = ["computerUse", "gateway"];
 
 const defaultSettings: BackendSettings = {
   ...defaultWhaleBalanceSettings(),
@@ -4290,11 +4295,12 @@ export function App() {
             <RequestLogScreen />
           ) : null}
           {route === "grok" ? (
-            <GrokScreen settings={settings} form={settingsForm} actions={actions} />
+            <GrokScreen settings={settings} form={settingsForm} actions={actions} onOpenGateway={() => void navigate("gateway")} />
           ) : null}
           {route === "claudeRelay" ? (
             <ClaudeProviderPage
               notify={actions.showMessage}
+              onOpenGateway={() => void navigate("gateway")}
               onProvidersChanged={() => void refreshTools()}
               openUrl={(url) => void actions.openExternalUrl(url)}
             />
@@ -4396,6 +4402,12 @@ export function App() {
           {route === "agentCache" ? <AgentCachePanel /> : null}
           {route === "agentCollaboration" ? <AgentCollaborationPage /> : null}
           {route === "computerUse" ? <ComputerUsePage /> : null}
+          {route === "gateway" ? (
+            <GatewayPage
+              notify={actions.showMessage}
+              onOpenCodexProviders={() => void (async () => { await switchTool("codex"); await navigate("relay"); })()}
+            />
+          ) : null}
           {route === "maintenance" ? (
             <MaintenanceScreen
               overview={overview}
@@ -12853,6 +12865,12 @@ function AggregateRelayProfileEditor({
                   options={routeTargetOptions}
                   value={route.profileId}
                 />
+                <Input
+                  onChange={(event) => updateRoute(index, { targetModel: event.currentTarget.value })}
+                  placeholder={t("目标模型（可选）")}
+                  title={t("命中后发给该成员的模型名，留空沿用请求里的模型名。目前只在本地网关的路由组里生效。")}
+                  value={route.targetModel ?? ""}
+                />
                 {!routeTargetOptions.some((option) => option.value === route.profileId) ? (
                   <span className="aggregate-route-target-error">{t("路由目标必须是已勾选的聚合成员，请先在成员供应商中勾选。")}</span>
                 ) : null}
@@ -14386,6 +14404,7 @@ function GrokScreen({
   settings,
   form,
   actions,
+  onOpenGateway,
 }: {
   settings: SettingsResult | null;
   form: BackendSettings;
@@ -14394,6 +14413,7 @@ function GrokScreen({
     showMessage: (title: string, message: string, status?: Status) => Promise<void>;
     refreshCurrent: () => void;
   };
+  onOpenGateway: () => void;
 }) {
   const [result, setResult] = useState<GrokProvidersResult | null>(null);
   const [loading, setLoading] = useState(false);
@@ -14533,8 +14553,11 @@ function GrokScreen({
 
   const live = result?.live;
 
+  const viaGateway = (live?.modelsBaseUrl ?? "").includes("/gw/grok");
+
   return (
     <div className="grok-page-layout">
+      <GatewayBanner active={viaGateway} agentName="Grok" onOpen={onOpenGateway} />
       {/* 最重要的是 Grok 实际生效的配置：放最上面，刷新跟它放在一起。 */}
       <Panel className="grok-panel grok-live-panel">
         <CardHeader className="panel-head grok-head">
@@ -15138,6 +15161,7 @@ function routeSubtitle(route: Route) {
     agentCache: t("扫描 Codex、Claude 与 Codex++ 的已知缓存目录，由你选择清理项目。"),
     agentCollaboration: t("连接 Codex、DeepSeek Harness 与 Claude Code，派发任务并查看结果。"),
     computerUse: t("复用 Codex 的 Computer Use，通过 MCP 接给 Claude Code、Claude Desktop 与 Codex。"),
+    gateway: t("让 Claude Code、Grok 经 Codex++ 本地网关使用统一的供应商池，支持多 Key 轮换与路由组"),
     maintenance: t("入口检查与修复、开机启动与应用路径"),
     about: t("版本信息、项目链接、GitHub Release 更新、日志与诊断"),
     settings: t("主题、配置备份与配置文件路径，不随 Agent 变化"),
@@ -17131,6 +17155,7 @@ function normalizeAggregateProfilesFromRelayProfiles(profiles: RelayProfile[]): 
         pattern: route.pattern,
         relayId: route.profileId,
         priority: route.priority,
+        ...(route.targetModel ? { targetModel: route.targetModel } : {}),
       })),
       defaultRelayId: aggregate.defaultRelayId ?? "",
       syncDefaultMemberLogin: aggregate.syncDefaultMemberLogin === true,
@@ -17474,6 +17499,7 @@ function normalizeAggregateConfig(
       pattern: route.pattern.trim(),
       profileId: route.profileId,
       priority: clampAggregateRoutePriority(route.priority),
+      ...(route.targetModel?.trim() ? { targetModel: route.targetModel.trim() } : {}),
     }));
   // 默认供应商必须是当前成员；成员被移出（或值不再合法）时自动清空为「未设置」。
   const defaultRelayId = normalizeAggregateDefaultRelayId(

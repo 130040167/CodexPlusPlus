@@ -1,0 +1,172 @@
+/* 本地网关页。表单控件复用 ClaudeProviderPage.css 的 .claude-field / .claude-editor-grid。 */
+
+.gateway-content {
+  display: grid;
+  gap: 18px;
+}
+
+.gateway-intro {
+  margin: 0;
+  color: hsl(var(--muted-foreground));
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.gateway-section {
+  display: grid;
+  gap: 10px;
+}
+
+.gateway-section h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.gateway-agent-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 12px;
+}
+
+.gateway-agent-card {
+  display: grid;
+  gap: 12px;
+  align-content: start;
+  padding: 14px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 10px;
+  background: hsl(var(--surface-raised));
+}
+
+.gateway-agent-card.active {
+  border-color: hsl(var(--primary) / 0.45);
+}
+
+.gateway-agent-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.gateway-agent-head strong {
+  font-size: 14px;
+}
+
+.gateway-agent-head small {
+  overflow: hidden;
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gateway-agent-endpoint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12px;
+}
+
+.gateway-agent-endpoint em {
+  flex-shrink: 0;
+  color: hsl(var(--muted-foreground));
+  font-style: normal;
+}
+
+.gateway-agent-endpoint code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gateway-select {
+  width: 100%;
+  min-width: 0;
+}
+
+.gateway-advanced-toggle {
+  justify-self: start;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: hsl(var(--primary));
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.gateway-agent-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.gateway-agent-actions .claude-editor-error {
+  flex: 1;
+  min-width: 120px;
+}
+
+.gateway-pool-card {
+  grid-template-columns: 32px minmax(0, 1fr);
+}
+
+.gateway-import-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.gateway-health-list {
+  display: grid;
+  gap: 6px;
+}
+
+.gateway-health-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+  font-size: 12.5px;
+}
+
+.gateway-health-row small {
+  flex: 1;
+  color: hsl(var(--muted-foreground));
+}
+
+.gateway-inline-icon {
+  display: inline;
+  margin-right: 4px;
+  vertical-align: -3px;
+  color: hsl(var(--status-success, var(--primary)));
+}
+
+.gateway-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+  padding: 9px 12px;
+  border: 1px solid hsl(var(--primary) / 0.35);
+  border-radius: 8px;
+  background: hsl(var(--primary) / 0.07);
+  font-size: 12.5px;
+}
+
+.gateway-banner > span {
+  flex: 1;
+  min-width: 0;
+}
+
+@media (max-width: 760px) {
+  .gateway-import-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+}

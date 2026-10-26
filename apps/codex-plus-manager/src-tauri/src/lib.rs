@@ -2,6 +2,7 @@ mod auto_takeover;
 mod agent_collaboration_commands;
 mod computer_use_commands;
 mod cu_pip;
+mod gateway_commands;
 mod global_dictation;
 pub mod commands;
 pub mod install;
@@ -229,6 +230,8 @@ pub fn run() {
                 app.handle().clone(),
                 start_codex_at_login || start_codex_on_open,
             );
+            // 网关模式：有 Agent 走网关时常驻 helper 必须在线。
+            gateway_commands::start_from_saved_state();
             // 自动接管官方 App（默认关闭）：设置里开着才起守护线程。
             auto_takeover::start_supervisor();
             if let Err(error) = global_dictation::apply_config() {
@@ -300,6 +303,14 @@ pub fn run() {
             commands::switch_claude_provider,
             commands::import_claude_live_provider,
             commands::import_claude_providers_from_cc_switch,
+            gateway_commands::load_gateway,
+            gateway_commands::save_gateway_binding,
+            gateway_commands::disable_gateway_binding,
+            gateway_commands::rotate_gateway_token,
+            gateway_commands::save_gateway_options,
+            gateway_commands::import_claude_provider_to_gateway_pool,
+            gateway_commands::import_grok_profile_to_gateway_pool,
+            gateway_commands::reset_gateway_key_health,
             commands::weixin_connect_qr_start,
             commands::weixin_connect_qr_status,
             commands::weixin_connect_status,
@@ -472,6 +483,7 @@ pub fn run() {
                             }
                             // 常驻本地代理只在 Codex++ 退出时停止；Codex 会话结束
                             // 不会关它（见 core::resident_helper）。
+                            gateway_commands::restore_for_exit();
                             codex_plus_core::resident_helper::stop_resident_helper();
                             SHUTDOWN_COMPLETE.store(true, Ordering::SeqCst);
                             app.exit(0);

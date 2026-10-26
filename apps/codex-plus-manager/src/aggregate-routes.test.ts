@@ -162,3 +162,17 @@ describe("priority 上限", () => {
     assert.strictEqual(issues, null);
   });
 });
+
+describe("normalizeAggregateRoutes targetModel", () => {
+  it("保留非空的目标模型，空值不写出", () => {
+    const routes: AggregateRouteLike[] = [
+      { pattern: "fast", relayId: "member-a", priority: 1, targetModel: " glm-5.3-air " },
+      { pattern: "slow", relayId: "member-b", priority: 0, targetModel: "  " },
+    ];
+    const result = normalizeAggregateRoutes(routes);
+    assert.deepStrictEqual(result, [
+      { pattern: "fast", profileId: "member-a", priority: 1, targetModel: "glm-5.3-air" },
+      { pattern: "slow", profileId: "member-b", priority: 0 },
+    ]);
+  });
+});

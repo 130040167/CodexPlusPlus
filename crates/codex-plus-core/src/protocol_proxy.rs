@@ -443,7 +443,7 @@ enum BufferedResponsesStream {
     },
 }
 
-fn estimated_tokens_from_chars(chars: usize) -> u64 {
+pub(crate) fn estimated_tokens_from_chars(chars: usize) -> u64 {
     ((chars as u64) + 3) / 4
 }
 
@@ -979,7 +979,7 @@ const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
 ];
 const ERROR_BODY_PREVIEW_LIMIT: usize = 1024;
 
-fn exec_retry_after_duration(
+pub(crate) fn exec_retry_after_duration(
     headers: &reqwest::header::HeaderMap,
     now: SystemTime,
 ) -> Option<Duration> {
@@ -1837,6 +1837,19 @@ pub struct UpstreamProxyResponse {
     pub response: Option<reqwest::Response>,
 }
 
+/// 网关模式：调用方已经选定唯一上游，代理只负责协议转换与发送。
+///
+/// 设置后跳过聚合绑定、模型路由、目录外模型映射与全局轮转选择器，
+/// 失败切换与 Key 冷却由网关自己的候选循环负责。
+#[derive(Debug, Clone)]
+pub struct ForcedRelay {
+    pub relay: crate::settings::RelayProfile,
+    /// 发往上游的模型名；`None` 时沿用请求体里的 model。
+    pub upstream_model: Option<String>,
+    /// 是否启用「请求避震」自动重试（参数仍读设置）。
+    pub auto_retry: bool,
+}
+
 /// 客户端会话头白名单；不接受鉴权或任意其他客户端请求头。
 #[derive(Clone, Copy, Default)]
 pub struct ProxySessionHeaders<'a> {
@@ -2594,7 +2607,7 @@ fn output_compaction_count(output: Option<&Value>) -> Option<usize> {
     Some(compactions.count())
 }
 
-async fn read_limited_upstream_body(
+pub(crate) async fn read_limited_upstream_body(
     response: &mut reqwest::Response,
     limit: usize,
 ) -> anyhow::Result<Vec<u8>> {
@@ -3186,6 +3199,7 @@ pub async fn open_responses_proxy_request_for_path_with_session_headers(
         beta_features,
         session_headers,
         None,
+        None,
     )
     .await
 }
@@ -3209,6 +3223,7 @@ pub async fn open_responses_proxy_request_for_path_with_session_headers_and_live
         beta_features,
         session_headers,
         live_request_id,
+        None,
     )
     .await
 }
@@ -3224,6 +3239,7 @@ pub async fn open_responses_proxy_request_with_settings(
         "/responses",
         None,
         ProxySessionHeaders::default(),
+        None,
         None,
     )
     .await
@@ -3241,6 +3257,7 @@ pub async fn open_responses_proxy_request_with_settings_for_path(
         request_path,
         None,
         ProxySessionHeaders::default(),
+        None,
         None,
     )
     .await
@@ -3277,6 +3294,33 @@ pub async fn open_responses_proxy_request_with_settings_for_path_and_session_hea
         beta_features,
         session_headers,
         None,
+        None,
+    )
+    .await
+}
+
+/// 网关入口：把一个 Responses 请求发往调用方选定的唯一上游。
+///
+/// 协议转换（Responses → Chat / Anthropic）、官方登录、exec 兼容等与普通代理路径
+/// 完全相同；不读当前供应商，也不推进 Codex 的全局轮转状态。
+pub async fn open_responses_proxy_request_for_relay(
+    body: &str,
+    settings: crate::settings::BackendSettings,
+    forced: ForcedRelay,
+    original_user_agent: Option<&str>,
+    request_path: &str,
+    session_headers: ProxySessionHeaders<'_>,
+    live_request_id: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    open_responses_proxy_request_with_settings_and_user_agent(
+        body,
+        settings,
+        original_user_agent,
+        request_path,
+        None,
+        session_headers,
+        live_request_id,
+        Some(forced),
     )
     .await
 }
@@ -3289,6 +3333,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     beta_features: Option<&str>,
     session_headers: ProxySessionHeaders<'_>,
     live_request_id: Option<&str>,
+    forced: Option<ForcedRelay>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let mut request_json: Value = serde_json::from_str(body)?;
     expand_local_compaction_history(&mut request_json);
@@ -3302,7 +3347,11 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         .map(str::trim)
         .unwrap_or("")
         .to_string();
-    let aggregate_model = match crate::aggregate_catalog::resolve_active_model(&settings, &source_model) {
+    let aggregate_model = match if forced.is_some() {
+        Ok(None)
+    } else {
+        crate::aggregate_catalog::resolve_active_model(&settings, &source_model)
+    } {
         Ok(binding) => binding,
         Err(error) => {
             return Ok(UpstreamProxyResponse {
@@ -3330,7 +3379,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     if let Some(binding) = &aggregate_model {
         request_json["model"] = Value::String(binding.upstream_model.clone());
     }
-    let model_route = if aggregate_model.is_some() {
+    let model_route = if aggregate_model.is_some() || forced.is_some() {
         None
     } else {
         select_model_route(&settings, &source_model)?
@@ -3345,6 +3394,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     // `source_model` 保持原始值，轮转粘性与请求日志仍按用户视角的模型归因。
     if aggregate_model.is_none()
         && model_route.is_none()
+        && forced.is_none()
         && let Some(replacement) = unlisted_model_replacement(&settings, &source_model)
     {
         log_unlisted_model_mapping(&source_model, &replacement);
@@ -3355,7 +3405,9 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         conversation_id: conversation_id_from_responses_request(&request_json),
         model,
     };
-    let (relay, relays) = if let Some(binding) = &aggregate_model {
+    let (relay, relays) = if let Some(forced) = &forced {
+        (forced.relay.clone(), vec![forced.relay.clone()])
+    } else if let Some(binding) = &aggregate_model {
         (binding.relay.clone(), vec![binding.relay.clone()])
     } else if let Some(route) = &model_route {
         (route.relay.clone(), vec![route.relay.clone()])
@@ -3371,10 +3423,15 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         relays.first().map(|item| item.id.as_str()),
         Some(relay.id.as_str())
     );
-    let strict_aggregate_model = aggregate_model.is_some();
+    // 强制上游同样不推进全局轮转选择器：它不属于当前活动聚合。
+    let strict_aggregate_model = aggregate_model.is_some() || forced.is_some();
     let relay_count = relays.len();
     let mut exec_negotiation_used = false;
-    let mut auto_retry = ProxyAutoRetry::from_settings(&settings);
+    let mut auto_retry = if forced.as_ref().is_some_and(|forced| !forced.auto_retry) {
+        None
+    } else {
+        ProxyAutoRetry::from_settings(&settings)
+    };
     let mut request_attempt = 0_usize;
     let buffered_mode = settings.protocol_proxy_auto_retry_mode == "buffered";
     let commit_policy = StreamStartCommitPolicy::from_settings(&settings);
@@ -3433,10 +3490,13 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             None
         };
         let official_base = official_member.then(crate::official_login::official_base_url);
-        let model_override = aggregate_model
-            .as_ref()
-            .map(|binding| binding.upstream_model.clone())
-            .or_else(|| aggregate_upstream_model_override(&settings, &relay));
+        let model_override = match &forced {
+            Some(forced) => forced.upstream_model.clone(),
+            None => aggregate_model
+                .as_ref()
+                .map(|binding| binding.upstream_model.clone())
+                .or_else(|| aggregate_upstream_model_override(&settings, &relay)),
+        };
         let preserve_native_request = relay.protocol == RelayProtocol::Responses
             && (request_has_compaction_trigger(&request_json)
                 || is_responses_compact_proxy_path(request_path));
@@ -6501,7 +6561,7 @@ fn extract_chat_sse_error(value: &Value) -> (String, Option<String>) {
     (message, error_type)
 }
 
-fn http_status_line(status: u16) -> String {
+pub(crate) fn http_status_line(status: u16) -> String {
     match status {
         200 => "200 OK".to_string(),
         400 => "400 Bad Request".to_string(),
@@ -6531,7 +6591,7 @@ pub fn responses_error_from_upstream(status_code: u16, content_type: &str, body:
     json!({ "error": error })
 }
 
-fn upstream_error_parts(
+pub(crate) fn upstream_error_parts(
     status_code: u16,
     content_type: &str,
     body: &[u8],

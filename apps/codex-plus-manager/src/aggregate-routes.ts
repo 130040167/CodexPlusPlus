@@ -6,13 +6,15 @@
  */
 
 export type AggregateRouteLike =
-  | { pattern: string; profileId: string; priority: number }
-  | { pattern: string; relayId: string; priority: number };
+  | { pattern: string; profileId: string; priority: number; targetModel?: string }
+  | { pattern: string; relayId: string; priority: number; targetModel?: string };
 
 export type AggregateRouteNormalized = {
   pattern: string;
   profileId: string;
   priority: number;
+  /** 命中后发给成员的模型名；缺省表示沿用请求里的模型名（目前只有网关模式读取）。 */
+  targetModel?: string;
 };
 
 export type AggregateRouteValidationIssue =
@@ -40,11 +42,15 @@ export function normalizeAggregateRoutes(
 ): AggregateRouteNormalized[] {
   const { dropEmptyPattern = false, memberIds, clampPriority = true } = options;
   return routes
-    .map((route) => ({
-      pattern: route.pattern.trim(),
-      profileId: "profileId" in route ? route.profileId : route.relayId,
-      priority: clampPriority ? clampAggregateRoutePriority(route.priority) : route.priority,
-    }))
+    .map((route) => {
+      const targetModel = (route.targetModel ?? "").trim();
+      return {
+        pattern: route.pattern.trim(),
+        profileId: "profileId" in route ? route.profileId : route.relayId,
+        priority: clampPriority ? clampAggregateRoutePriority(route.priority) : route.priority,
+        ...(targetModel ? { targetModel } : {}),
+      };
+    })
     .filter((route) => {
       if (dropEmptyPattern && !route.pattern) return false;
       if (memberIds && !memberIds.has(route.profileId)) return false;

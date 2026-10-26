@@ -55,8 +55,8 @@ test("Computer Use 独立在最左栏，不再出现在每个 Agent 的菜单里
 
   const globalNavigation = text.slice(text.indexOf("const globalNavigationRoutes"), text.indexOf("const defaultSettings"));
   assert.match(globalNavigation, /"computerUse"/);
-  // 图标和 Agent 排在最左栏上方同一组，不放进底部的系统导航。
-  assert.match(globalNavigation, /const railAgentGroupRoutes: Route\[\] = \["computerUse"\]/);
+  // 图标和 Agent 排在最左栏上方同一组，不放进底部的系统导航；本地网关同样服务所有 Agent，排在它后面。
+  assert.match(globalNavigation, /const railAgentGroupRoutes: Route\[\] = \["computerUse", "gateway"\]/);
   assert.match(functionSource("ApplicationRail"), /railAgentGroupRoutes\.map\(renderNavItem\)/);
 });
 

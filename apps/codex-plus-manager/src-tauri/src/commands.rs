@@ -882,6 +882,11 @@ pub fn apply_grok_relay_profile(settings: BackendSettings) -> CommandResult<Grok
         }
     };
 
+    // 直接应用别的供应商等于离开网关模式，绑定随之关闭。
+    let _ = codex_plus_core::gateway::apply::note_grok_switched(
+        &codex_plus_core::gateway::store::GatewayStore::default(),
+    );
+
     // 先写盘再保存设置：写 config.toml 失败时不该留下「设置里说切了、磁盘上没切」
     // 的不一致状态。
     let mut saved_shard = shard.clone();
@@ -1020,7 +1025,13 @@ pub fn switch_claude_provider(
             message
         },
         "切换 Claude 供应商失败",
-        claude::switch_provider(&claude::ClaudeContext::default_paths(), &id),
+        claude::switch_provider(&claude::ClaudeContext::default_paths(), &id).inspect(|_| {
+            // 直接切到别的供应商等于离开网关模式，绑定随之关闭。
+            let _ = codex_plus_core::gateway::apply::note_claude_switched(
+                &codex_plus_core::gateway::store::GatewayStore::default(),
+                &id,
+            );
+        }),
     )
 }
 
@@ -2765,8 +2776,11 @@ pub fn sync_resident_helper() -> Option<u16> {
     let claude_voice_needs_helper = settings
         .as_ref()
         .is_some_and(codex_plus_core::claude_localization::voice_input_needs_helper);
+    // 第四个信号：有 Agent 开着网关模式，它的请求随时会打到 helper 的 `/gw/*`。
+    let gateway_needs_helper = codex_plus_core::gateway::needs_helper();
     if !settings_need_proxy
         && !claude_voice_needs_helper
+        && !gateway_needs_helper
         && !codex_plus_core::relay_config::live_config_uses_managed_protocol_proxy_in_home(&home)
     {
         return None;

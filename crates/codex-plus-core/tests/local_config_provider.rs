@@ -229,6 +229,7 @@ fn imported_aggregate_preserves_members_and_routes_after_switching_away_and_back
             pattern: "second-*".into(),
             relay_id: "second".into(),
             priority: 5,
+            target_model: String::new(),
         }],
         default_relay_id: "first".into(),
         sync_default_member_login: true,

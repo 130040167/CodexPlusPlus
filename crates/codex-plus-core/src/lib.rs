@@ -35,6 +35,7 @@ pub mod dream_skin_market;
 pub mod dream_skin_package;
 pub mod dream_skin_runtime;
 pub mod env_conflicts;
+pub mod gateway;
 pub mod grok_config;
 pub mod global_dictation;
 pub mod http_client;

@@ -157,7 +157,12 @@ static GLOBAL_SELECTOR: OnceLock<Mutex<Option<RelayRotationSelector>>> = OnceLoc
 
 impl RelayRotationSelector {
     pub fn from_settings(settings: &BackendSettings) -> Result<Self, SelectionError> {
-        let aggregate = active_aggregate(settings)?.clone();
+        Self::for_aggregate(active_aggregate(settings)?.clone())
+    }
+
+    /// 按指定聚合（路由组）建选择器，不要求它是当前活动聚合。
+    /// 网关模式用它为每个路由组维护独立的轮转状态，不碰 Codex 的全局选择器。
+    pub fn for_aggregate(aggregate: AggregateRelayProfile) -> Result<Self, SelectionError> {
         ensure_aggregate_has_members(&aggregate)?;
         Ok(Self {
             aggregate,
@@ -166,6 +171,10 @@ impl RelayRotationSelector {
             weighted_index: 0,
             conversation_assignments: HashMap::new(),
         })
+    }
+
+    pub fn aggregate(&self) -> &AggregateRelayProfile {
+        &self.aggregate
     }
 
     pub fn select(
@@ -358,19 +367,28 @@ pub fn fallback_relays_after(
     let Some(active_aggregate) = settings.active_aggregate_relay_profile() else {
         return Ok(Vec::new());
     };
-    ensure_aggregate_has_members(&active_aggregate)?;
-    let start_index = active_aggregate
+    fallback_relays_after_in(settings, &active_aggregate, relay_id)
+}
+
+/// 指定聚合（路由组）里排在 `relay_id` 之后的可用成员，按成员顺序循环一圈。
+pub fn fallback_relays_after_in(
+    settings: &BackendSettings,
+    aggregate: &AggregateRelayProfile,
+    relay_id: &str,
+) -> Result<Vec<RelayProfile>, SelectionError> {
+    ensure_aggregate_has_members(aggregate)?;
+    let start_index = aggregate
         .members
         .iter()
         .position(|member| member.relay_id == relay_id)
         .map(|index| index + 1)
         .unwrap_or(0);
-    let fallbacks = (0..active_aggregate.members.len().saturating_sub(1))
+    let fallbacks = (0..aggregate.members.len().saturating_sub(1))
         .map(|offset| {
-            let index = (start_index + offset) % active_aggregate.members.len();
-            &active_aggregate.members[index]
+            let index = (start_index + offset) % aggregate.members.len();
+            &aggregate.members[index]
         })
-        .filter(|member| relay_is_available(settings, &active_aggregate, &member.relay_id))
+        .filter(|member| relay_is_available(settings, aggregate, &member.relay_id))
         .filter_map(|member| relay_profile_by_id(settings, &member.relay_id))
         .collect::<Vec<_>>();
     Ok(fallbacks)

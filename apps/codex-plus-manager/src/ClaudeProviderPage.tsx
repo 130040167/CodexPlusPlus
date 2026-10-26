@@ -30,6 +30,8 @@ import {
   type ClaudeProvidersPayload,
   type ClaudeSettingsConfig,
 } from "./claude-provider-model";
+import { GatewayBanner } from "./GatewayPage";
+import { GATEWAY_CLAUDE_PROVIDER_ID } from "./gateway-model";
 import "./ClaudeProviderPage.css";
 
 type Status = "ok" | "failed" | "warning" | "info";
@@ -47,11 +49,13 @@ export function ClaudeProviderPage({
   notify,
   openUrl,
   onProvidersChanged,
+  onOpenGateway,
 }: {
   notify: Notify;
   openUrl: (url: string) => void;
   /** 供应商数量或当前供应商变化后通知外层刷新 Agent 栏提示。 */
   onProvidersChanged: () => void;
+  onOpenGateway: () => void;
 }) {
   const [payload, setPayload] = useState<ClaudeProvidersPayload | null>(memo.payload);
   const [busy, setBusy] = useState<string | null>(memo.payload ? null : "load");
@@ -173,6 +177,7 @@ export function ClaudeProviderPage({
         )}
       />
       <div className="mg-content">
+        <GatewayBanner active={currentId === GATEWAY_CLAUDE_PROVIDER_ID} agentName="Claude Code" onOpen={onOpenGateway} />
         <LiveStatus
           payload={payload}
           busy={busy}
@@ -195,6 +200,8 @@ export function ClaudeProviderPage({
               const active = provider.id === currentId;
               const brief = providerBrief(provider);
               const pending = busy === `switch:${provider.id}`;
+              // 网关托管的供应商由「本地网关」页维护，这里只读。
+              const managed = provider.id === GATEWAY_CLAUDE_PROVIDER_ID;
               return (
                 <div
                   className={`relay-profile-card claude-provider-card ${active ? "active" : ""}`}
@@ -211,6 +218,7 @@ export function ClaudeProviderPage({
                         {brief.endpoint ? t("API") : t("官方登录")}
                       </span>
                       {provider.ccsSourceId ? <span className="relay-tag">CC Switch</span> : null}
+                      {managed ? <span className="relay-tag" data-tone="api">{t("网关")}</span> : null}
                       {active ? <span className="relay-active-badge">{t("使用中")}</span> : null}
                     </strong>
                     <small>
@@ -237,10 +245,17 @@ export function ClaudeProviderPage({
                           <ExternalLink className="h-4 w-4" />
                         </Button>
                       ) : null}
-                      <Button onClick={() => setEditing({ provider, isNew: false })} size="icon" title={t("编辑")} variant="ghost">
+                      <Button
+                        disabled={managed}
+                        onClick={() => setEditing({ provider, isNew: false })}
+                        size="icon"
+                        title={managed ? t("请在「本地网关」里修改") : t("编辑")}
+                        variant="ghost"
+                      >
                         <Edit3 className="h-4 w-4" />
                       </Button>
                       <Button
+                        disabled={managed}
                         onClick={() => setEditing({ provider: duplicateClaudeProvider(provider, t("副本")), isNew: true })}
                         size="icon"
                         title={t("复制")}
@@ -249,7 +264,7 @@ export function ClaudeProviderPage({
                         <Copy className="h-4 w-4" />
                       </Button>
                       <Button
-                        disabled={active || busy !== null}
+                        disabled={active || managed || busy !== null}
                         onClick={() => void remove(provider)}
                         size="icon"
                         title={active ? t("正在使用的供应商不能删除") : t("删除")}

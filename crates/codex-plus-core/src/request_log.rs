@@ -128,6 +128,9 @@ pub struct RequestLogEntry {
     pub usage: Option<RequestUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_hit_ratio: Option<f64>,
+    /// 网关模式下发起请求的 Agent（claude / grok）；Codex 直连代理的旧记录为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 impl RequestLogEntry {
@@ -459,6 +462,7 @@ mod tests {
                 reasoning_tokens: 50,
             }),
             cache_hit_ratio: None,
+            agent: None,
         }
     }
 
