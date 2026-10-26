@@ -8985,6 +8985,8 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
   const marketScripts = market?.market.scripts ?? [];
   const [marketSearch, setMarketSearch] = useState("");
   const [marketView, setMarketView] = useState<"grid" | "list">("grid");
+  // 市场插件 / 本地插件放在同一块里切换，不再上下堆三张卡片。
+  const [pane, setPane] = useState<"market" | "local">("market");
   const filteredMarketScripts = useMemo(() => {
     const query = marketSearch.trim().toLocaleLowerCase();
     if (!query) return marketScripts;
@@ -9014,125 +9016,111 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
     }
     return map;
   }, [scripts]);
+  const localEnabled = inventory?.enabled !== false;
   return (
-    <>
-      <Panel>
-        <CardHead title={t("插件")} detail={tf("{0} 个市场插件，已安装 {1} 个，本地整体 {2}", [marketScripts.length, installedCount, inventory?.enabled === false ? t("关闭") : t("开启")])} />
-        <CardContent>
-          <div className="metric-list">
-            <Metric label={t("市场状态")} value={market?.market.message ?? t("尚未刷新")} />
-            <Metric label={t("远程插件")} value={tf("{0} 个", [marketScripts.length])} />
-            <Metric label={t("已安装")} value={tf("{0} 个", [installedCount])} />
-            <Metric label={t("本地整体")} value={inventory?.enabled === false ? t("关闭") : t("开启")} />
+    <div className="tp-page user-scripts-page">
+      <TopbarActions>
+        <Button onClick={() => void actions.openExternalUrl(SCRIPT_MARKET_REPOSITORY_URL)} size="sm" variant="ghost">
+          <ExternalLink />
+          {t("投稿")}
+        </Button>
+        <Button onClick={() => void reload()} disabled={reloading} size="sm" variant="secondary" title={t("应用本地插件及开关；旧插件可能需要刷新 Codex 页面")}>
+          <RefreshCw className={reloading ? "animate-spin" : ""} />
+          {t("热重载插件")}
+        </Button>
+        <Button onClick={() => void (async () => { await actions.refreshScriptMarket(); await actions.refreshCurrent(); })()} size="sm" variant="secondary">
+          <RefreshCw />
+          {t("刷新")}
+        </Button>
+      </TopbarActions>
+      {/* 状态条：两个整体开关 + 一行摘要，代替原来四行「键：值」的统计卡。 */}
+      <div className="user-scripts-strip">
+        <label className="relay-bare-switch user-scripts-switch" title={t("整体开关不改变单个插件的启停设置")}>
+          <input
+            aria-label={t("启用本地插件")}
+            checked={localEnabled}
+            disabled={!inventory}
+            onChange={() => void actions.setUserScriptsEnabled(!localEnabled)}
+            type="checkbox"
+          />
+          <ToggleVisual />
+          <span>{t("启用本地插件")}</span>
+        </label>
+        <label className="relay-bare-switch user-scripts-switch" title={t("脚本导致黑屏或卡死时，下一次启动先跳过脚本；脚本启停设置不会改变")}>
+          <input
+            aria-label={t("下次启动跳过插件")}
+            checked={Boolean(inventory?.skip_next_start)}
+            disabled={!inventory}
+            onChange={() => void actions.setUserScriptsSkipNextStart(!inventory?.skip_next_start)}
+            type="checkbox"
+          />
+          <ToggleVisual />
+          <span>{t("下次启动跳过插件")}</span>
+        </label>
+        <span className="user-scripts-summary">
+          {tf("{0} 个市场插件，已安装 {1} 个", [marketScripts.length, installedCount])}
+          {market?.market.updatedAt ? ` · ${tf("清单更新于 {0}", [formatMarketUpdatedAt(market.market.updatedAt)])}` : market ? ` · ${market.market.message}` : ` · ${t("尚未刷新")}`}
+        </span>
+      </div>
+      <div className="script-market-toolbar">
+        <div className="mg-segmented user-scripts-panes" role="tablist" aria-label={t("插件")}>
+          <button aria-selected={pane === "market"} data-active={pane === "market"} onClick={() => setPane("market")} role="tab" type="button">
+            {t("市场插件")}<span>{marketScripts.length}</span>
+          </button>
+          <button aria-selected={pane === "local"} data-active={pane === "local"} onClick={() => setPane("local")} role="tab" type="button">
+            {t("本地插件")}<span>{scripts.length}</span>
+          </button>
+        </div>
+        {pane === "market" ? <>
+          <div className="script-market-search">
+            <Search className="h-4 w-4" />
+            <Input
+              aria-label={t("搜索市场插件")}
+              onChange={(event) => setMarketSearch(event.currentTarget.value)}
+              placeholder={t("搜索名称、作者、描述或标签")}
+              value={marketSearch}
+            />
           </div>
-          <Toolbar>
-            <Button
-              onClick={() => void actions.setUserScriptsEnabled(inventory?.enabled === false)}
-              disabled={!inventory}
-              variant="secondary"
-              aria-pressed={inventory?.enabled !== false}
-              title={t("整体开关不改变单个插件的启停设置")}
-            >
-              {inventory?.enabled === false ? t("开启本地插件") : t("关闭本地插件")}
+          <div className="script-market-view-toggle" role="group" aria-label={t("插件排版")}>
+            <Button aria-pressed={marketView === "grid"} onClick={() => setMarketView("grid")} size="sm" variant={marketView === "grid" ? "secondary" : "ghost"}>
+              <LayoutGrid className="h-4 w-4" />
+              {t("板块")}
             </Button>
-            <Button
-              onClick={() => void actions.setUserScriptsSkipNextStart(!inventory?.skip_next_start)}
-              disabled={!inventory}
-              variant={inventory?.skip_next_start ? "secondary" : "outline"}
-              title={t("脚本导致黑屏或卡死时，下一次启动先跳过脚本；脚本启停设置不会改变")}
-            >
-              {inventory?.skip_next_start ? t("取消下次启动安全模式") : t("下次启动跳过插件")}
+            <Button aria-pressed={marketView === "list"} onClick={() => setMarketView("list")} size="sm" variant={marketView === "list" ? "secondary" : "ghost"}>
+              <List className="h-4 w-4" />
+              {t("列表")}
             </Button>
-            <Button onClick={() => void actions.refreshScriptMarket()}>
-              <RefreshCw className="h-4 w-4" />
-              {t("刷新市场")}
-            </Button>
-            <Button onClick={() => void actions.openExternalUrl(SCRIPT_MARKET_REPOSITORY_URL)} variant="secondary">
-              <ExternalLink className="h-4 w-4" />
-              {t("投稿")}
-            </Button>
-            <Button onClick={() => void actions.refreshCurrent()} variant="secondary">
-              <RefreshCw className="h-4 w-4" />
-              {t("刷新本地")}
-            </Button>
-            <Button onClick={() => void reload()} disabled={reloading} variant="secondary" title={t("应用本地插件及开关；旧插件可能需要刷新 Codex 页面")}>
-              <RefreshCw className={reloading ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
-              {t("热重载插件")}
-            </Button>
-          </Toolbar>
-        </CardContent>
-      </Panel>
-      <Panel>
-        <CardHead
-          title={t("市场插件")}
-          detail={
-            market?.market.updatedAt
-              ? tf("清单更新时间：{0}，当前显示 {1} / {2}", [formatMarketUpdatedAt(market.market.updatedAt), filteredMarketScripts.length, marketScripts.length])
-              : t("从 GitHub 静态清单加载")
-          }
-        />
-        <CardContent>
-          <div className="script-market-toolbar">
-            <div className="script-market-search">
-              <Search className="h-4 w-4" />
-              <Input
-                aria-label={t("搜索市场插件")}
-                onChange={(event) => setMarketSearch(event.currentTarget.value)}
-                placeholder={t("搜索名称、作者、描述或标签")}
-                value={marketSearch}
-              />
-            </div>
-            <div className="script-market-view-toggle" role="group" aria-label={t("插件排版")}>
-              <Button
-                aria-pressed={marketView === "grid"}
-                onClick={() => setMarketView("grid")}
-                size="sm"
-                variant={marketView === "grid" ? "secondary" : "ghost"}
-              >
-                <LayoutGrid className="h-4 w-4" />
-                {t("板块")}
-              </Button>
-              <Button
-                aria-pressed={marketView === "list"}
-                onClick={() => setMarketView("list")}
-                size="sm"
-                variant={marketView === "list" ? "secondary" : "ghost"}
-              >
-                <List className="h-4 w-4" />
-                {t("列表")}
-              </Button>
-            </div>
           </div>
-          {marketScripts.length ? (
-            filteredMarketScripts.length ? (
-              <div className={marketView === "list" ? "script-market-list" : "script-market-grid"}>
-                {filteredMarketScripts.map((script) => (
-                  <MarketScriptCard
-                    actions={actions}
-                    installedKey={installedKeyByMarketId.get(script.id)}
-                    key={script.id}
-                    script={script}
-                    view={marketView}
-                  />
-                ))}
-              </div>
-            ) : (
-              <div className="empty">{t("没有匹配的市场插件。")}</div>
-            )
+        </> : <span className="user-scripts-summary">{t("内置、手动和市场安装插件；可在这里启停或删除用户插件")}</span>}
+      </div>
+      {pane === "market" ? (
+        marketScripts.length ? (
+          filteredMarketScripts.length ? (
+            <div className={marketView === "list" ? "script-market-list" : "script-market-grid"}>
+              {filteredMarketScripts.map((script) => (
+                <MarketScriptCard
+                  actions={actions}
+                  installedKey={installedKeyByMarketId.get(script.id)}
+                  key={script.id}
+                  script={script}
+                  view={marketView}
+                />
+              ))}
+            </div>
           ) : (
-            <div className="empty">{market?.status === "failed" ? market.message : t("点击刷新市场加载远程插件。")}</div>
-          )}
-        </CardContent>
-      </Panel>
-      <Panel>
-        <CardHead title={t("本地插件")} detail={t("内置、手动和市场安装插件；可在这里启停或删除用户插件")} />
-        <CardContent>
+            <div className="empty">{t("没有匹配的市场插件。")}</div>
+          )
+        ) : (
+          <div className="empty">{market?.status === "failed" ? market.message : t("点击刷新市场加载远程插件。")}</div>
+        )
+      ) : (
+        <Panel>
           <div className="table">
             {scripts.length ? scripts.map((script) => <ScriptRow key={script.key} script={script} actions={actions} />) : <div className="empty">{t("未发现用户插件。")}</div>}
           </div>
-        </CardContent>
-      </Panel>
-    </>
+        </Panel>
+      )}
+    </div>
   );
 }
 

@@ -13100,3 +13100,64 @@ button.side-item:hover {
 .shell .weixin-connect-page .weixin-connect-form .weixin-path-row button[title] {
   width: 32px;
 }
+
+/* 插件页：状态条（两个整体开关 + 摘要）、市场 / 本地切换，卡片更紧凑 */
+.shell .user-scripts-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 22px;
+  padding: 10px 14px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 10px;
+  background: hsl(var(--card));
+}
+.shell .user-scripts-switch {
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.shell .user-scripts-summary {
+  margin-left: auto;
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+}
+.shell .user-scripts-page .script-market-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin: 0;
+}
+.shell .user-scripts-page .script-market-search {
+  flex: 1 1 260px;
+}
+.shell .user-scripts-panes button span {
+  margin-left: 6px;
+  color: hsl(var(--muted-foreground));
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+}
+.shell .user-scripts-page .script-market-grid {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+  gap: 12px;
+}
+.shell .user-scripts-page .script-market-card {
+  gap: 8px;
+  padding: 12px 14px;
+}
+.shell .user-scripts-page .script-market-title strong {
+  font-size: 13.5px;
+}
+.shell .user-scripts-page .script-market-title span {
+  font-size: 11.5px;
+}
+.shell .user-scripts-page .script-market-description {
+  font-size: 12px;
+  -webkit-line-clamp: 2;
+}
+.shell .user-scripts-page .script-market-tag {
+  padding: 0 6px;
+  font-size: 10.5px;
+  line-height: 18px;
+}
