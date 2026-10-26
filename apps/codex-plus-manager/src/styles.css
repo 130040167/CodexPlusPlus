@@ -2554,6 +2554,84 @@ details.relay-fold[open] > .relay-fold-body {
   width: 18px;
 }
 
+.app-select-placeholder {
+  color: hsl(var(--muted-foreground));
+  font-weight: 500;
+}
+
+/* 带说明的选项：名字一行、说明一行 */
+.app-select-option.has-hint {
+  min-height: 44px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+
+.app-select-option-text {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.app-select-option-text > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-select-option-text small {
+  color: hsl(var(--muted-foreground));
+  font-size: 11.5px;
+  font-weight: 450;
+  line-height: 1.4;
+  white-space: normal;
+}
+
+/* 请求日志工具栏的筛选 */
+.app-select.request-log-select {
+  width: auto;
+  flex-shrink: 0;
+}
+
+.request-log-select .app-select-trigger {
+  min-height: 32px;
+  min-width: 110px;
+  border-radius: 8px;
+}
+
+.app-select.request-log-session-select {
+  flex: 0 1 220px;
+  min-width: 110px;
+  max-width: 260px;
+}
+
+.request-log-session-select .app-select-trigger {
+  min-width: 0;
+}
+
+/* 模型表头「全部设为…」：虚线小按钮 */
+.relay-model-bulk-select .app-select-trigger {
+  min-height: 24px;
+  padding: 0 6px;
+  border-style: dashed;
+  border-radius: 6px;
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+}
+
+.relay-model-bulk-select .app-select-trigger:hover:not(:disabled) {
+  border-style: solid;
+  color: hsl(var(--foreground));
+}
+
+/* 紧凑尺寸：表单一行里的小下拉 */
+.app-select-sm .app-select-trigger {
+  min-height: 28px;
+  padding: 0 8px;
+  border-radius: 7px;
+  font-weight: 500;
+}
+
 .app-select.text-xs .app-select-trigger,
 .app-select.text-xs .app-select-option,
 .app-select-menu.text-xs .app-select-option {

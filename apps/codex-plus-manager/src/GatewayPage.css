@@ -962,6 +962,11 @@
   min-width: 0;
 }
 
+/* 右侧控件（开关、下拉、输入框、状态）一律贴右对齐 */
+.gw-setting-row > :last-child:not(:first-child) {
+  justify-self: end;
+}
+
 .gw-setting-row strong {
   font-size: 14px;
   font-weight: 500;
@@ -982,102 +987,40 @@
   white-space: nowrap;
 }
 
-/* —— 下拉选择（替代原生下拉框） —— */
-.gw-select-button {
-  display: inline-flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  min-width: 150px;
-  height: 34px;
-  padding: 0 10px 0 12px;
-  border: 1px solid hsl(var(--input));
-  border-radius: 8px;
-  background: hsl(var(--background));
-  color: var(--gw-ink);
-  font: inherit;
-  font-size: 13px;
-  cursor: pointer;
-}
-
-.gw-select-button-compact {
-  min-width: 0;
-  height: 26px;
-  padding: 0 6px 0 8px;
-  border-radius: 7px;
-  font-size: 12px;
-}
-
-.gw-select-button:hover:not(:disabled),
-.gw-select-button[data-open="true"] {
-  border-color: hsl(var(--primary) / 0.5);
-}
-
-.gw-select-button:disabled {
-  opacity: 0.6;
-  cursor: default;
-}
-
-.gw-select-button svg {
-  flex: none;
-  color: var(--gw-mute);
-}
-
-.gw-select-options {
-  display: grid;
-  gap: 2px;
-  padding: 6px;
-  overflow-y: auto;
-}
-
-.gw-select-option {
-  min-height: 0;
-  padding: 8px 10px;
-}
-
-.gw-select-option-text {
-  display: grid;
-  flex: 1;
-  gap: 2px;
-  min-width: 0;
-  font-size: 13px;
-}
-
-.gw-select-option-text small {
-  color: var(--gw-mute);
-  font-size: 11.5px;
-  line-height: 1.45;
-}
-
-.gw-select-check {
-  flex: none;
-  color: hsl(var(--primary));
-}
-
 /* —— 网关设置里的新旧共用设置 —— */
+/* 数字输入：单位放在框里，所有框同宽，右边与开关、下拉对齐 */
 .gw-unit-input {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  color: var(--gw-mute);
-  font-size: 12.5px;
-}
-
-.gw-unit-input input {
-  width: 88px;
+  width: 150px;
   height: 34px;
-  padding: 0 10px;
+  padding: 0 12px 0 0;
   border: 1px solid hsl(var(--input));
   border-radius: 8px;
   background: hsl(var(--background));
+  color: var(--gw-mute);
+  font-size: 12.5px;
+  cursor: text;
+}
+
+.gw-unit-input:focus-within {
+  border-color: hsl(var(--primary) / 0.5);
+}
+
+.gw-unit-input input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0 8px 0 12px;
+  border: 0;
+  outline: none;
+  background: transparent;
   color: var(--gw-ink);
   font: inherit;
   font-size: 13px;
   font-variant-numeric: tabular-nums;
-}
-
-.gw-unit-input span {
-  min-width: 22px;
+  -moz-appearance: textfield;
+  appearance: textfield;
 }
 
 /* 去掉原生的上下微调箭头 */
@@ -1087,9 +1030,25 @@
   -webkit-appearance: none;
 }
 
-.gw-unit-input input {
-  -moz-appearance: textfield;
-  appearance: textfield;
+.gw-unit-input span {
+  flex: none;
+}
+
+/* 下拉与输入框同宽同高 */
+.gw-setting-row .app-select,
+.gw-inline-field .app-select {
+  width: 150px;
+}
+
+.gw-setting-row .app-select-trigger,
+.gw-inline-field .app-select-trigger {
+  min-height: 34px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.gw-inline-field .app-select {
+  width: 170px;
 }
 
 /* 状态码一行放不下：说明在上，编辑区在下 */
@@ -1098,6 +1057,10 @@
   gap: 10px;
   padding-top: 14px;
   padding-bottom: 14px;
+}
+
+.gw-setting-row-stacked > :last-child:not(:first-child) {
+  justify-self: stretch;
 }
 
 .gw-retry-codes {

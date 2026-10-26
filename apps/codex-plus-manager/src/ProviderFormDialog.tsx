@@ -17,7 +17,7 @@ import {
   type ProviderDraft,
 } from "./gateway-model";
 import { Avatar } from "./gateway-ui";
-import { GwSelect } from "./GatewayAgents";
+import { AppSelect } from "./AppSelect";
 import {
   FETCHED_DIRECT_LIMIT,
   addModel,
@@ -270,8 +270,8 @@ export function ProviderFormDialog({
             </h4>
             <PriceNote model={chosenModel} price={price} />
             <div className="pf-price">
-              <GwSelect
-                compact
+              <AppSelect
+                size="sm"
                 label={t("币种")}
                 onChange={(next) => editPrice({ priceCurrency: next })}
                 options={[
@@ -279,7 +279,7 @@ export function ProviderFormDialog({
                   { value: "CNY", label: "¥ CNY" },
                 ]}
                 value={draft.priceCurrency === "USD" ? "USD" : "CNY"}
-                width={140}
+                menuWidth={140}
               />
               <label><span>{t("输入")}</span><Input inputMode="decimal" onChange={(event) => editPrice({ priceInput: event.currentTarget.value })} placeholder="0" value={draft.priceInput} /></label>
               <label><span>{t("缓存命中")}</span><Input inputMode="decimal" onChange={(event) => editPrice({ priceCached: event.currentTarget.value })} placeholder="0" value={draft.priceCached} /></label>

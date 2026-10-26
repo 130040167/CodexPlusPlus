@@ -348,3 +348,8 @@ label.cu-setting { cursor:pointer; }
 .cu-setting-check:disabled { opacity:.5; cursor:not-allowed; }
 @media(max-width:760px) { .cu-setting { grid-template-columns:minmax(0,1fr); gap:8px; } }
 
+
+/* 客户端类型下拉（AppSelect）：与同一行的输入框同高 */
+.app-select.cu-custom-kind-select { flex: 0 0 160px; width: 160px; }
+.cu-custom-kind-select .app-select-trigger { min-height: 30px; border-radius: 6px; font-size: 12px; font-weight: 500; }
+.cu-preview-select .app-select-trigger { min-height: 34px; font-size: 12.5px; font-weight: 500; }

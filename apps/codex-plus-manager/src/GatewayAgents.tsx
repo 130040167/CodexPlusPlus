@@ -20,6 +20,7 @@ import {
   type GatewayPayload,
   type PickerItem,
 } from "./gateway-model";
+import { AppSelect } from "./AppSelect";
 import { AGENT_ICONS, Avatar, Switch, avatarOf, loadFavorites, saveFavorites, type Notify, type Run, agentIcon } from "./gateway-ui";
 
 export function AgentsView({
@@ -323,7 +324,7 @@ function AgentDetail({
         <div className="gw-detail-value gw-chip-row">
           <div className="gw-inline-field">
             <span>{t("未知模型名")}</span>
-            <GwSelect
+            <AppSelect
               disabled={busy !== null}
               label={t("未知模型名")}
               onChange={(next) => onSave({ ...draft, unknownModel: next as BindingDraft["unknownModel"] })}
@@ -434,84 +435,6 @@ export function Floating({
       {children}
     </div>,
     document.body,
-  );
-}
-
-/** 下拉选择：替代原生下拉框，弹层与模型选择器同一套样式。 */
-export function GwSelect<T extends string>({
-  value,
-  options,
-  onChange,
-  label,
-  disabled,
-  width = 240,
-  compact = false,
-}: {
-  value: T;
-  options: Array<{ value: T; label: string; hint?: string }>;
-  onChange: (value: T) => void;
-  /** 无障碍名称。 */
-  label: string;
-  disabled?: boolean;
-  width?: number;
-  /** 紧凑尺寸：放在表单的一行小控件里。 */
-  compact?: boolean;
-}) {
-  const [open, setOpen] = useState(false);
-  const buttonRef = useRef<HTMLButtonElement>(null);
-  const current = options.find((option) => option.value === value);
-  const pick = (next: T) => {
-    setOpen(false);
-    buttonRef.current?.focus();
-    if (next !== value) onChange(next);
-  };
-  return (
-    <>
-      <button
-        aria-expanded={open}
-        aria-haspopup="listbox"
-        aria-label={label}
-        className={`gw-select-button ${compact ? "gw-select-button-compact" : ""}`}
-        data-open={open}
-        disabled={disabled}
-        onClick={() => setOpen(!open)}
-        ref={buttonRef}
-        type="button"
-      >
-        <span>{current?.label ?? value}</span>
-        <ChevronDown className="h-3.5 w-3.5" />
-      </button>
-      <Floating anchorRef={buttonRef} className="gw-select-popover" onClose={() => setOpen(false)} open={open} width={width}>
-        <div aria-label={label} className="gw-select-options" role="listbox">
-          {options.map((option) => {
-            const selected = option.value === value;
-            return (
-              <div
-                aria-selected={selected}
-                className="gw-popover-item gw-select-option"
-                data-selected={selected}
-                key={option.value}
-                onClick={() => pick(option.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    pick(option.value);
-                  }
-                }}
-                role="option"
-                tabIndex={0}
-              >
-                <span className="gw-select-option-text">
-                  <span>{option.label}</span>
-                  {option.hint ? <small>{option.hint}</small> : null}
-                </span>
-                {selected ? <Check className="gw-select-check h-4 w-4" /> : null}
-              </div>
-            );
-          })}
-        </div>
-      </Floating>
-    </>
   );
 }
 

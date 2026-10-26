@@ -149,3 +149,6 @@
 @media (prefers-reduced-motion:reduce) { .agent-collaboration-spin { animation:none; } }
 @media(max-width:1000px) { .agent-collaboration-agents { grid-template-columns:1fr; } .agent-collaboration-default { grid-template-columns:minmax(160px,240px) minmax(120px,200px); } .agent-collaboration-default>.agent-collaboration-hint { grid-column:1/-1; } }
 @media(max-width:760px) { .agent-collaboration-section-head { flex-wrap:wrap; } .agent-collaboration-default,.agent-collaboration-form-row,.agent-collaboration-task-workspace,.agent-collaboration-mcp-configs { grid-template-columns:1fr; } .agent-collaboration-task-list { max-height:240px; border-right:0; border-bottom:1px solid hsl(var(--border)); } .agent-collaboration-continuation,.agent-collaboration-form-footer { align-items:flex-start; flex-direction:column; } }
+
+/* 下拉（AppSelect）与同一行的输入框同高 */
+.agent-collaboration-content .mg-field .app-select-trigger { min-height: 34px; font-size: 12.5px; font-weight: 500; }

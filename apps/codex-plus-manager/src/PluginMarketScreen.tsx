@@ -6,6 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardDescription, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { t, tf } from "./i18n";
+import { AppSelect } from "./AppSelect";
 import { applyPluginInstallation, filterMarketPlugins, isPluginMarketSuccess, mergePluginMarketCatalog, pluginMarketPage, PluginMarketRequests, type MarketCatalogs, type MarketFilter, type MarketPlugin, type MarketResult, type MarketSource } from "./plugin-market-model";
 import "./PluginMarketScreen.css";
 
@@ -155,16 +156,20 @@ export function PluginMarketScreen() {
               <Search aria-hidden="true" />
               <Input aria-label={t("搜索插件")} onChange={(event) => setQuery(event.currentTarget.value)} placeholder={t("搜索名称、作者、描述或标签")} ref={searchInput} type="search" value={query} />
             </label>
-            <label className="plugin-market-filter">
-              <span className="sr-only">{t("筛选插件")}</span>
-              <select onChange={(event) => setFilter(event.currentTarget.value as MarketFilter)} value={filter}>
-                <option value="all">{t("全部插件")}</option>
-                <option value="available">{t("可安装")}</option>
-                <option value="installed">{t("已安装")}</option>
-                <option value="updates">{t("有更新")}</option>
-                <option value="auth">{t("需服务授权")}</option>
-              </select>
-            </label>
+            <div className="plugin-market-filter">
+              <AppSelect
+                ariaLabel={t("筛选插件")}
+                onChange={(next) => setFilter(next)}
+                options={[
+                  { value: "all", label: t("全部插件") },
+                  { value: "available", label: t("可安装") },
+                  { value: "installed", label: t("已安装") },
+                  { value: "updates", label: t("有更新") },
+                  { value: "auth", label: t("需服务授权") },
+                ] as { value: MarketFilter; label: string }[]}
+                value={filter}
+              />
+            </div>
             <Button disabled={loading || !!installing} onClick={() => void loadCatalog(source, true)} variant="outline">
               <RefreshCw aria-hidden="true" className={loading ? "plugin-market-spinner" : ""} />
               {loading ? t("加载中…") : t("刷新索引")}

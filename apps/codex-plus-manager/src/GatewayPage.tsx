@@ -29,7 +29,8 @@ import {
   type MemberStatus,
   type RouteRecordView,
 } from "./gateway-model";
-import { AgentsView, Floating, GwSelect, ModelList } from "./GatewayAgents";
+import { AgentsView, Floating, ModelList } from "./GatewayAgents";
+import { AppSelect } from "./AppSelect";
 import { ProvidersView } from "./GatewayProviders";
 import { SessionsView } from "./GatewaySessions";
 import { UsageView } from "./GatewayUsage";
@@ -607,7 +608,8 @@ function GatewayView({ payload, busy, run }: { payload: GatewayPayload | null; b
             <strong>{t("多 Key 轮换")}</strong>
             <small>{mode === "roundRobin" ? t("每个请求换下一个 Key，用量更平均，但上游缓存命中会变低。") : t("同一会话固定一个 Key，出错才换；保住上游的提示词缓存。")}</small>
           </div>
-          <GwSelect
+          <span />
+          <AppSelect
             disabled={busy !== null}
             label={t("多 Key 轮换")}
             onChange={(next) => saveOptions(next, restoreOnExit)}

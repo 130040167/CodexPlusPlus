@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { AlertTriangle, AppWindow, Check, CheckCircle2, FolderOpen, Globe, Loader2, MonitorSmartphone, MousePointerClick, Pencil, Play, Plug, Plus, RefreshCw, ShieldCheck, Trash2, Unplug, X } from "lucide-react";
 import { ComputerUsePreview } from "./ComputerUsePreview";
+import { AppSelect } from "./AppSelect";
 import { PageHeader } from "./ManagementPages";
 import { t, tf } from "./i18n";
 import "./ComputerUsePage.css";
@@ -808,15 +809,14 @@ export function ComputerUsePage() {
                 <p className="cu-hint">{t("客户端改用了别的配置目录时（例如被包装器设置了 CLAUDE_CONFIG_DIR），上面的默认路径它读不到。在这里登记它实际读取的目录，可添加任意多个；也可以直接填配置文件路径。")}</p>
               </div>
               <div className="cu-custom-add-row">
-                <select
-                  className="cu-custom-kind"
-                  value={newKind}
+                <AppSelect
+                  ariaLabel={t("客户端类型")}
+                  className="cu-custom-kind-select"
                   disabled={locked}
-                  aria-label={t("客户端类型")}
-                  onChange={(event) => setNewKind(event.target.value as CuTargetId)}
-                >
-                  {customKinds.map((kind) => <option key={kind} value={kind}>{targetFallback[kind].label}</option>)}
-                </select>
+                  onChange={(next) => setNewKind(next)}
+                  options={customKinds.map((kind) => ({ value: kind, label: targetFallback[kind].label }))}
+                  value={newKind}
+                />
                 <input
                   className="cu-custom-name"
                   type="text"

@@ -113,7 +113,7 @@ import { AgentCachePanel } from "./agent-cache";
 import { summarizeRecentRequests, type RecentRequestSummary } from "./overview-model";
 import { AgentCollaborationPage } from "./AgentCollaborationPage";
 import { SectionLabel, Switch } from "./gateway-ui";
-import { GwSelect } from "./GatewayAgents";
+import { AppSelect, type AppSelectOption } from "./AppSelect";
 import { GatewayPage, type GatewayTab } from "./GatewayPage";
 import { AgentGlyph, HubOverview, useGatewayPayload } from "./HubOverview";
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
@@ -5320,18 +5320,16 @@ function WeixinConnectScreen({
               </label>
               <label className="field">
                 <span>{t("沙箱权限")}</span>
-                <select
-                  className="field-select"
-                  onChange={(event) => onFormChange({
-                    ...form,
-                    weixinConnectSandbox: event.target.value as BackendSettings["weixinConnectSandbox"],
-                  })}
+                <AppSelect
+                  ariaLabel={t("沙箱权限")}
+                  onChange={(next) => onFormChange({ ...form, weixinConnectSandbox: next })}
+                  options={[
+                    { value: "read-only", label: t("只读") },
+                    { value: "workspace-write", label: t("允许修改工作目录") },
+                    { value: "danger-full-access", label: t("完全访问") },
+                  ]}
                   value={form.weixinConnectSandbox}
-                >
-                  <option value="read-only">{t("只读")}</option>
-                  <option value="workspace-write">{t("允许修改工作目录")}</option>
-                  <option value="danger-full-access">{t("完全访问")}</option>
-                </select>
+                />
               </label>
             </div>
           </section>
@@ -5485,18 +5483,15 @@ function OverviewScreen({
                       </span>
                     </div>
                     <div className="overview-current-actions">
-                      <select
-                        aria-label={t("切换供应商")}
-                        className="request-log-filter overview-current-select"
+                      <AppSelect
+                        ariaLabel={t("切换供应商")}
+                        className="overview-current-select"
                         disabled={actions.relaySwitching || !normalized.relayProfilesEnabled || normalized.relayProfiles.length < 2}
-                        onChange={(event) => switchFromOverview(event.currentTarget.value)}
+                        onChange={(next) => switchFromOverview(next)}
+                        options={normalized.relayProfiles.map((profile) => ({ value: profile.id, label: profile.name || t("未命名供应商") }))}
                         title={!normalized.relayProfilesEnabled ? t("供应商配置切换已关闭，在供应商配置页打开后才能切换") : t("切换供应商")}
                         value={normalized.activeRelayId}
-                      >
-                        {normalized.relayProfiles.map((profile) => (
-                          <option key={profile.id} value={profile.id}>{profile.name || t("未命名供应商")}</option>
-                        ))}
-                      </select>
+                      />
                       <Button onClick={() => onNavigate("relay")} variant="secondary">{t("管理供应商")}</Button>
                     </div>
                   </>
@@ -5721,7 +5716,7 @@ function SharedServiceSettings({
                 </small>
               </div>
               <span />
-              <GwSelect
+              <AppSelect
                 label={t("避震模式")}
                 onChange={(next) => onFormChange({ ...form, protocolProxyAutoRetryMode: next })}
                 options={[
@@ -5730,7 +5725,7 @@ function SharedServiceSettings({
                   { value: "buffered", label: t("整段缓冲"), hint: t("始终由代理重试，但要等整段生成完才显示。") },
                 ]}
                 value={form.protocolProxyAutoRetryMode}
-                width={300}
+                menuWidth={300}
               />
             </div>
             {form.protocolProxyAutoRetryMode === "streaming" ? (
@@ -6169,47 +6164,54 @@ function RequestLogScreen() {
               onChange={(event) => setQuery(event.currentTarget.value)}
             />
           </div>
-          <select
-            aria-label={t("按 Agent 筛选")}
-            className="request-log-filter"
-            onChange={(event) => setAgentFilter(event.currentTarget.value as typeof agentFilter)}
+          <AppSelect
+            ariaLabel={t("按 Agent 筛选")}
+            className="request-log-select"
+            menuWidth={160}
+            onChange={(next) => setAgentFilter(next)}
+            options={[
+              { value: "all", label: t("全部 Agent") },
+              { value: "codex", label: "Codex" },
+              { value: "claude", label: "Claude Code" },
+              { value: "grok", label: "Grok" },
+            ] as AppSelectOption<typeof agentFilter>[]}
+            size="sm"
             value={agentFilter}
-          >
-            <option value="all">{t("全部 Agent")}</option>
-            <option value="codex">Codex</option>
-            <option value="claude">Claude Code</option>
-            <option value="grok">Grok</option>
-          </select>
-          <select
-            aria-label={t("状态筛选")}
-            className="request-log-filter"
+          />
+          <AppSelect
+            ariaLabel={t("状态筛选")}
+            className="request-log-select"
+            menuWidth={140}
+            onChange={(next) => setFilter(next)}
+            options={[
+              { value: "all", label: t("全部") },
+              { value: "running", label: t("进行中") },
+              { value: "success", label: t("仅成功") },
+              { value: "failed", label: t("仅失败") },
+              { value: "retried", label: t("含重试") },
+            ] as AppSelectOption<typeof filter>[]}
+            size="sm"
             value={filter}
-            onChange={(event) => setFilter(event.currentTarget.value as typeof filter)}
-          >
-            <option value="all">{t("全部")}</option>
-            <option value="running">{t("进行中")}</option>
-            <option value="success">{t("仅成功")}</option>
-            <option value="failed">{t("仅失败")}</option>
-            <option value="retried">{t("含重试")}</option>
-          </select>
-          <select
-            aria-label={t("按会话筛选")}
-            className="request-log-filter request-log-session-filter"
-            onChange={(event) => setSessionFilter(event.currentTarget.value)}
-            title={t("按会话筛选")}
-            value={sessionFilter}
-          >
-            <option value="all">{t("全部会话")}</option>
-            {sessions.map((session) => (
-              <option key={session.id} value={session.id}>
-                {tf("{0}（{1} 条）", [
+          />
+          <AppSelect
+            ariaLabel={t("按会话筛选")}
+            className="request-log-select request-log-session-select"
+            menuWidth={280}
+            onChange={(next) => setSessionFilter(next)}
+            options={[
+              { value: "all", label: t("全部会话") },
+              ...sessions.map((session) => ({
+                value: session.id,
+                label: tf("{0}（{1} 条）", [
                   session.title || tf("会话 {0}", [formatRequestLogSession(session.id)]),
                   String(session.count),
-                ])}
-              </option>
-            ))}
-            {hasUnknownSession ? <option value="__none__">{t("未记录会话")}</option> : null}
-          </select>
+                ]),
+              })),
+            ]}
+            size="sm"
+            title={t("按会话筛选")}
+            value={sessionFilter}
+          />
           <label className="check-row request-log-auto">
             <input
               checked={autoRefresh}
@@ -6866,14 +6868,17 @@ function RelayScreen({
                           <strong title={provider.name}>{provider.name}</strong>
                           <small title={provider.baseUrl}>{urlHost(provider.baseUrl) || t("未填写地址")}</small>
                         </span>
-                        <select
-                          aria-label={tf("{0} 导入为", [provider.name])}
-                          onChange={(event) => setCcsBindings((current) => ({ ...current, [provider.sourceId]: event.currentTarget.value }))}
+                        <AppSelect
+                          ariaLabel={tf("{0} 导入为", [provider.name])}
+                          menuWidth={240}
+                          onChange={(next) => setCcsBindings((current) => ({ ...current, [provider.sourceId]: next }))}
+                          options={[
+                            { value: "", label: t("新增（同名自动关联）") },
+                            ...normalized.relayProfiles.map((profile) => ({ value: profile.id, label: `${t("关联已有")}：${profile.name}` })),
+                          ]}
+                          size="sm"
                           value={ccsBindings[provider.sourceId] || ""}
-                        >
-                          <option value="">{t("新增（同名自动关联）")}</option>
-                          {normalized.relayProfiles.map((profile) => <option key={profile.id} value={profile.id}>{t("关联已有")}：{profile.name}</option>)}
-                        </select>
+                        />
                       </label>
                     ))}
                   </div>
@@ -11798,36 +11803,40 @@ function RelayProfileEditor({
                     <span>{t("上下文窗口")}</span>
                     <span className="relay-model-head-bulk">
                       {t("自动压缩")}
-                      <select
-                        aria-label={t("全部模型的自动压缩")}
-                        onChange={(event) => {
-                          if (event.currentTarget.value) updateAllModelWindowRows({ autoCompact: event.currentTarget.value });
-                          event.currentTarget.value = "";
+                      <AppSelect
+                        ariaLabel={t("全部模型的自动压缩")}
+                        className="relay-model-bulk-select"
+                        menuWidth={140}
+                        onChange={(next) => {
+                          if (next) updateAllModelWindowRows({ autoCompact: next });
                         }}
+                        options={autoCompactOptions("").map((value) => ({ value, label: value }))}
+                        placeholder={t("全部设为…")}
+                        size="sm"
                         title={t("把所有模型设为同一个自动压缩比例")}
                         value=""
-                      >
-                        <option value="">{t("全部设为…")}</option>
-                        {autoCompactOptions("").map((value) => <option key={value} value={value}>{value}</option>)}
-                      </select>
+                      />
                     </span>
                     <span className="relay-model-head-bulk">
                       {t("图片处理方式")}
-                      <select
-                        aria-label={t("全部模型的图片处理方式")}
+                      <AppSelect
+                        ariaLabel={t("全部模型的图片处理方式")}
+                        className="relay-model-bulk-select"
                         disabled={vlmUnsupportedProtocol}
-                        onChange={(event) => {
-                          if (event.currentTarget.value) updateAllModelWindowRows({ imageHandling: event.currentTarget.value as ModelWindowRow["imageHandling"] });
-                          event.currentTarget.value = "";
+                        menuWidth={160}
+                        onChange={(next) => {
+                          if (next) updateAllModelWindowRows({ imageHandling: next as ModelWindowRow["imageHandling"] });
                         }}
+                        options={[
+                          { value: "send-as-is", label: t("原样发送图片") },
+                          { value: "strip", label: t("移除图片") },
+                          { value: "vlm", label: t("视觉辅助分析") },
+                        ]}
+                        placeholder={t("全部设为…")}
+                        size="sm"
                         title={t("把所有模型设为同一种图片处理方式")}
                         value=""
-                      >
-                        <option value="">{t("全部设为…")}</option>
-                        <option value="send-as-is">{t("原样发送图片")}</option>
-                        <option value="strip">{t("移除图片")}</option>
-                        <option value="vlm">{t("视觉辅助分析")}</option>
-                      </select>
+                      />
                     </span>
                     <span>{t("思考等级")}</span>
                     <span>{t("模型配置")}</span>
@@ -14950,92 +14959,6 @@ function Field({ label, children, className = "" }: { label: string; children: R
       <span>{label}</span>
       {children}
     </Label>
-  );
-}
-
-type AppSelectOption<T extends string> = {
-  value: T;
-  label: ReactNode;
-  disabled?: boolean;
-  title?: string;
-};
-
-function AppSelect<T extends string>({
-  value,
-  options,
-  onChange,
-  disabled = false,
-  className = "",
-  title = "",
-  ariaLabel,
-}: {
-  value: T;
-  options: AppSelectOption<T>[];
-  onChange: (value: T) => void;
-  disabled?: boolean;
-  className?: string;
-  title?: string;
-  ariaLabel?: string;
-}) {
-  const [open, setOpen] = useState(false);
-  const selected = options.find((option) => option.value === value) || options[0];
-  const selectOption = (option: AppSelectOption<T>) => {
-    if (option.disabled) return;
-    onChange(option.value);
-    setOpen(false);
-  };
-  const { rootRef, menuRef, menuStyle } = usePopoverLayer({
-    open: open && !disabled,
-    onOpenChange: setOpen,
-    minWidth: 180,
-    maxHeight: 260,
-  });
-  return (
-    <div
-      className={`app-select ${open ? "open" : ""} ${disabled ? "disabled" : ""} ${className}`.trim()}
-      ref={rootRef}
-    >
-      <button
-        aria-expanded={open}
-        aria-label={ariaLabel}
-        className="app-select-trigger"
-        disabled={disabled}
-        onClick={() => setOpen((current) => !current)}
-        title={title}
-        type="button"
-      >
-        <span>{selected?.label ?? value}</span>
-        <ChevronDown className="h-4 w-4" />
-      </button>
-      {open && !disabled ? createPortal(
-        <div
-          className={`app-select-menu app-select-menu-portal ${className}`.trim()}
-          ref={menuRef}
-          role="listbox"
-          style={menuStyle}
-        >
-          {options.map((option) => (
-            <button
-              aria-selected={option.value === value}
-              className={`app-select-option ${option.value === value ? "selected" : ""}`}
-              disabled={option.disabled}
-              key={option.value}
-              onClick={() => selectOption(option)}
-              onMouseDown={(event) => {
-                event.preventDefault();
-                selectOption(option);
-              }}
-              title={option.title}
-              type="button"
-            >
-              {option.value === value ? <CheckCircle2 className="h-4 w-4" /> : <span className="app-select-option-spacer" />}
-              <span>{option.label}</span>
-            </button>
-          ))}
-        </div>,
-        document.body,
-      ) : null}
-    </div>
   );
 }
 

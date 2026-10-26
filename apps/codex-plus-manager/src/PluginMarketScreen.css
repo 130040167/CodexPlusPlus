@@ -379,3 +379,7 @@
   gap: 4px;
   margin: 0;
 }
+
+/* 插件筛选下拉（AppSelect） */
+.shell .plugin-market-filter .app-select { width: 150px; }
+.shell .plugin-market-filter .app-select-trigger { min-height: 36px; font-weight: 500; }

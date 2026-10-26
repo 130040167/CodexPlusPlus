@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
 import {
   agentModels,
@@ -313,12 +313,13 @@ test("会话：合并排序、按 Agent 与关键词过滤；路径与相对时�
   assert.deepEqual(relativeTime(now - 2 * 86_400_000, now), { text: "{0} 天前", args: [2] });
 });
 
-test("网关各页不用原生下拉框，统一用 GwSelect", () => {
-  for (const file of ["GatewayPage.tsx", "GatewayAgents.tsx", "GatewayProviders.tsx", "GatewayUsage.tsx", "GatewaySessions.tsx", "TrayPanel.tsx", "ProviderFormDialog.tsx"]) {
-    const source = readFileSync(new URL(`./${file}`, import.meta.url), "utf8");
+test("全应用不用原生下拉框，统一用 AppSelect", () => {
+  const dir = new URL("./", import.meta.url);
+  for (const file of readdirSync(dir)) {
+    if (!file.endsWith(".tsx")) continue;
+    const source = readFileSync(new URL(file, dir), "utf8");
     assert.doesNotMatch(source, /<select[\s>]/, file);
   }
   const shared = app.slice(app.indexOf("function SharedServiceSettings("), app.indexOf("function ProxySettingsScreen("));
-  assert.doesNotMatch(shared, /<select[\s>]/);
-  assert.match(shared, /<GwSelect/);
+  assert.match(shared, /<AppSelect/);
 });
