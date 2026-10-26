@@ -13044,3 +13044,21 @@ button.side-item:hover {
     flex-wrap: wrap;
   }
 }
+
+/* 设置页（含安装维护）：卡片里的开关行不再各自描边，改成卡片内的分隔线列表 */
+.shell .codex-settings-page .settings-page {
+  display: grid;
+  gap: 14px;
+}
+.shell .codex-settings-page .panel .switch-row {
+  margin: 0;
+  padding: 10px 0;
+  border: 0;
+  border-bottom: 1px solid hsl(var(--border) / 0.7);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.shell .codex-settings-page .panel .switch-row:last-of-type {
+  border-bottom: 0;
+}

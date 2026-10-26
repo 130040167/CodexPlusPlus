@@ -4503,25 +4503,29 @@ export function App() {
           {gatewayTabByRoute[route] ? (
             <GatewayPage notify={actions.showMessage} onTabChange={(tab) => void navigate(gatewayRouteByTab[tab])} tab={gatewayTabByRoute[route]} />
           ) : null}
-          {route === "agentSettings" ? (
-            <AgentSettingsScreen
-              dirty={settingsDirty}
-              form={settingsForm}
-              onFormChange={setSettingsForm}
-              actions={actions}
-            />
-          ) : null}
           {route === "agentSettings" || route === "maintenance" ? (
-            <MaintenanceScreen
-              overview={overview}
-              launchPending={launchPending}
-              watcher={watcher}
-              autoTakeover={autoTakeover}
-              settings={settings}
-              launchForm={launchForm}
-              onLaunchFormChange={setLaunchForm}
-              actions={actions}
-            />
+            // 设置与安装维护合在一页：左侧分类目录，右侧限宽列表。
+            <div className="settings-page codex-settings-page sectioned-page">
+              <PageSectionNav label={t("设置分类")} sections={codexSettingsSections()} />
+              <div className="sectioned-body">
+                <AgentSettingsScreen
+                  dirty={settingsDirty}
+                  form={settingsForm}
+                  onFormChange={setSettingsForm}
+                  actions={actions}
+                />
+                <MaintenanceScreen
+                  overview={overview}
+                  launchPending={launchPending}
+                  watcher={watcher}
+                  autoTakeover={autoTakeover}
+                  settings={settings}
+                  launchForm={launchForm}
+                  onLaunchFormChange={setLaunchForm}
+                  actions={actions}
+                />
+              </div>
+            </div>
           ) : null}
           {route === "about" ? (
             <AboutScreen
@@ -9598,7 +9602,7 @@ function MaintenanceScreen({
   const savedCodexAppPath = settings?.settings.codexAppPath ?? "";
   return (
     <>
-      <Panel>
+      <Panel id="codex-settings-check">
         <CardHead title={t("检查与修复")} detail={t("检查 Codex++ 入口、Codex 应用和开机启动状态")} />
         <CardContent>
           <div className="status-table">
@@ -9617,7 +9621,7 @@ function MaintenanceScreen({
           </Toolbar>
         </CardContent>
       </Panel>
-      <Panel>
+      <Panel id="codex-settings-startup">
         <CardHead title={t("开机打开 Codex++")} detail={t("登录系统后打开 Codex++ 界面，可选择自动启动 Codex")} />
         <CardContent>
           <label className="switch-row">
@@ -9674,7 +9678,7 @@ function MaintenanceScreen({
           </label>
         </CardContent>
       </Panel>
-      <Panel>
+      <Panel id="codex-settings-takeover">
         <CardHead title={t("自动接管官方 App")} detail={t("你自己双击启动官方 App 时，Codex++ 自动接管并注入增强")} />
         <CardContent>
           <label className="switch-row">
@@ -9722,7 +9726,7 @@ function MaintenanceScreen({
           )}
         </CardContent>
       </Panel>
-      <Panel>
+      <Panel id="codex-settings-app-path">
         <CardHead title={t("Codex 应用路径")} detail={t("免安装版或解包版只需要选择一次，之后从界面启动会自动复用")} />
         <CardContent>
           <div className="status-table">
@@ -9743,7 +9747,7 @@ function MaintenanceScreen({
           </Toolbar>
         </CardContent>
       </Panel>
-      <Panel>
+      <Panel id="codex-settings-manual-launch">
         <CardHead title={t("手动启动")} detail={t("应用路径留空时使用已保存路径；没有保存路径时使用自动探测")} />
         <CardContent>
           <Field label={t("应用路径覆盖")}>
@@ -9872,7 +9876,7 @@ function AgentSettingsScreen({
     <div className="settings-page">
       <SettingsAutoSave dirty={dirty} form={form} actions={actions} />
       <>
-        <Panel>
+        <Panel id="codex-settings-overlay">
           <SwitchPanelHead
             checked={form.codexAppImageOverlayEnabled}
             detail={t("在当前 Codex 会话上叠加一张背景图")}
@@ -9942,7 +9946,7 @@ function AgentSettingsScreen({
           </CardContent>
         </Panel>
 
-        <Panel>
+        <Panel id="codex-settings-launch-args">
           <CardHead title={t("Codex 启动参数")} detail={t("启动 Codex App 时追加到默认 CDP 参数后。留空则保持默认启动行为。")} />
           <CardContent className="settings-content setting-rows">
             <SettingRow
@@ -13741,6 +13745,19 @@ function FeatureToggle({
       <ToggleVisual />
     </label>
   );
+}
+
+/** 设置页（含安装维护）左侧目录的分组，id 对应各张卡片。 */
+function codexSettingsSections() {
+  return [
+    { id: "codex-settings-overlay", label: t("图片覆盖层") },
+    { id: "codex-settings-launch-args", label: t("启动参数") },
+    { id: "codex-settings-check", label: t("检查与修复") },
+    { id: "codex-settings-startup", label: t("开机启动") },
+    { id: "codex-settings-takeover", label: t("自动接管") },
+    { id: "codex-settings-app-path", label: t("应用路径") },
+    { id: "codex-settings-manual-launch", label: t("手动启动") },
+  ];
 }
 
 const EXPERIMENTAL_TITLE = /\s*(?:（实验性?）|\(experimental\))$/i;
