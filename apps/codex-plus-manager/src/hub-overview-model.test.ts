@@ -72,6 +72,22 @@ test("Codex 走直连排在第一位，其余 Agent 按网关绑定显示", () =
   assert.equal(agents[2].live, false);
 });
 
+test("Codex 接入网关后只画网关节点；在网关列表里但没打开时仍画成直连，不重复", () => {
+  const base = payload();
+  const codexRow = { agent: "codex", name: "Codex", enabled: true } as (typeof base.agents)[number];
+  const connected = { ...base, agents: [codexRow, ...base.agents] } as GatewayPayload;
+  const viaGateway = hubAgents(connected, { running: true, providerName: "DeepSeek 官方" });
+  assert.deepEqual(viaGateway.map((agent) => agent.id), ["codex", "claude", "grok"]);
+  assert.equal(viaGateway[0].direct, false);
+  assert.equal(viaGateway[0].enabled, true);
+
+  const off = { ...base, agents: [{ ...codexRow, enabled: false }, ...base.agents] } as GatewayPayload;
+  const direct = hubAgents(off, { running: true, providerName: "DeepSeek 官方" });
+  assert.deepEqual(direct.map((agent) => agent.id), ["codex", "claude", "grok"]);
+  assert.equal(direct[0].direct, true);
+  assert.equal(direct[0].detail, "DeepSeek 官方");
+});
+
 test("供应商池只列打开的供应商，带上今日调用量", () => {
   const providers = hubProviders(payload(), new Map([["ds", 40]]));
   assert.deepEqual(providers.map((provider) => provider.id), ["ds", "kimi"]);

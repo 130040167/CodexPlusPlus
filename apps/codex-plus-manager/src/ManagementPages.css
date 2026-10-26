@@ -307,3 +307,6 @@
 .mg-menu button[aria-checked="true"]::after { content:"✓"; float:right; color:hsl(var(--brand-accent)); }
 .mg-skill-matrix .mg-skill-group { margin:0; }
 .mg-skill-matrix .mg-skill-source small { font-size:11px; color:hsl(var(--muted-foreground)); }
+/* 多 Agent 表头（MCP / Skills）：Agent 列是图标 + 名字 + 数量三行，比普通表头高，上下留出边距 */
+.shell .mg-agent-matrix .mg-matrix-head { padding-top: 8px; padding-bottom: 8px; }
+.shell .mg-agent-matrix .mg-agent-column { gap: 3px; }

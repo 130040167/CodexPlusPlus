@@ -9,11 +9,11 @@ import {
   type UsageCounts,
 } from "./gateway-model.ts";
 
-/** 拓扑图左列的一个 Agent。Codex 走直连模式，不经网关的供应商池。 */
+/** 拓扑图左列的一个 Agent。Codex 没接入网关时走直连模式，不经网关的供应商池。 */
 export type HubAgentNode = {
   id: string;
   name: string;
-  /** 接入了网关（Codex 恒为 false，用 `direct` 表示）。 */
+  /** 接入了网关（直连的 Codex 为 false，用 `direct` 表示）。 */
   enabled: boolean;
   direct: boolean;
   /** 副标题：网关模型，或直连的供应商名。 */
@@ -48,10 +48,13 @@ export type CodexSummary = { running: boolean; providerName: string | null };
 
 export function hubAgents(payload: GatewayPayload | null, codex: CodexSummary): HubAgentNode[] {
   const activity = payload?.activity?.agents ?? [];
-  const nodes: HubAgentNode[] = [
-    { id: "codex", name: "Codex", enabled: false, direct: true, detail: codex.providerName ?? "", requests: 0, live: false },
-  ];
+  // Codex 只出现一次：接入了网关就按网关节点画，否则排第一个、画成直连。
+  const codexViaGateway = (payload?.agents ?? []).some((agent) => agent.agent === "codex" && agent.enabled);
+  const nodes: HubAgentNode[] = codexViaGateway
+    ? []
+    : [{ id: "codex", name: "Codex", enabled: false, direct: true, detail: codex.providerName ?? "", requests: 0, live: false }];
   for (const agent of payload?.agents ?? []) {
+    if (agent.agent === "codex" && !codexViaGateway) continue;
     const binding = payload?.gateway.bindings[agent.agent];
     const stats = activity.find((item) => item.agent === agent.agent);
     const model = binding?.enabled ? modelDisplay(payload, binding.model, binding.poolExclude ?? []).title : "";

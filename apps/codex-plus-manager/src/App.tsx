@@ -14857,10 +14857,11 @@ function AppSidebar({
                 : tf("{0}｜{1}｜供应商配置尚未接入", [tool.name, tool.homeDir || t("未配置目录")]);
               // 状态点表示接入方式，不表示运行状态（运行状态在顶栏）：Codex 由 Codex++ 直接管理供应商配置，
               // 其余 Agent 看是否已经接入网关。
-              const access = tool.id === "codex"
-                ? { tone: "direct", label: t("Codex 的供应商配置由 Codex++ 直接管理") }
-                : connectedAgents.has(tool.id)
-                  ? { tone: "ok", label: t("已经通过 Codex++ 网关接入") }
+              // 接入了网关一律绿色；Codex 没接入网关时是直连（紫色），由 Codex++ 直接管理供应商配置。
+              const access = connectedAgents.has(tool.id)
+                ? { tone: "ok", label: t("已经通过 Codex++ 网关接入") }
+                : tool.id === "codex"
+                  ? { tone: "direct", label: t("Codex 的供应商配置由 Codex++ 直接管理") }
                   : { tone: "off", label: t("未接入网关") };
               return (
                 <div className="side-agent-wrap" key={tool.id}>
