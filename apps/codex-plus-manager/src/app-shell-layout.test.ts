@@ -297,3 +297,10 @@ test("设置页「版本与更新」：已是最新时不显示旧版本的安�
   assert.match(about, /\{update\?\.updateAvailable && update\.releaseSummary \? \(\n\s*<details className="app-update-notes">/);
   assert.doesNotMatch(about, /<Metric label=\{t\("状态"\)\}/);
 });
+
+test("Computer Use 的页签与会话页等同一种下划线页签（tp-tabs），不再改写 mg-tabs", () => {
+  const page = readFileSync(new URL("./ComputerUsePage.tsx", import.meta.url), "utf8");
+  assert.match(page, /<div className="tp-tabs cu-tabs" role="tablist"/);
+  const css = readFileSync(new URL("./ComputerUsePage.css", import.meta.url), "utf8");
+  assert.doesNotMatch(css, /\.mg-tabs\.cu-tabs/);
+});

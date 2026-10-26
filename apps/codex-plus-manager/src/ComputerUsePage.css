@@ -241,13 +241,9 @@
 .cu-flow-steps { list-style:decimal; }
 
 /* 分页：下划线页签，与外壳一致 */
-.mg-tabs.cu-tabs { gap:18px; width:100%; padding:0; border:0; border-bottom:1px solid hsl(var(--border)); border-radius:0; background:none; }
-.mg-tabs.cu-tabs button { margin-bottom:-1px; padding:6px 0; border-bottom:2px solid transparent; border-radius:0; background:none; box-shadow:none; color:hsl(var(--muted-foreground)); font-size:12.5px; cursor:pointer; }
-.mg-tabs.cu-tabs button:hover { color:hsl(var(--foreground)); }
-.mg-tabs.cu-tabs button[data-active=true] { border-bottom-color:hsl(var(--brand-accent)); background:none; box-shadow:none; color:hsl(var(--foreground)); }
 
 @media(max-width:760px) {
-  .cu-tabs { width:100%; overflow-x:auto; }
+  .cu-tabs { flex-wrap:wrap; }
 }
 .cu-content > .cu-runtime-missing { margin-top:0; }
 

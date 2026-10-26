@@ -768,7 +768,8 @@ export function ComputerUsePage() {
         </button>
       </div>}
 
-      <div className="mg-tabs cu-tabs" role="tablist" aria-label={t("Computer Use 分页")}>
+      {/* 与会话页等其他页面同一种下划线页签（tp-tabs）。 */}
+      <div className="tp-tabs cu-tabs" role="tablist" aria-label={t("Computer Use 分页")}>
         {cuTabs.map((item) => <button key={item.id} type="button" role="tab" aria-selected={activeTab === item.id} data-active={activeTab === item.id} onClick={() => setTab(item.id)}>{item.label}</button>)}
       </div>
 
