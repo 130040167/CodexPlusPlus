@@ -13452,3 +13452,39 @@ button.side-item:hover {
   color: hsl(var(--status-success));
   background: hsl(var(--status-success) / 0.12);
 }
+
+/* 设置页「版本与更新」：一行摘要 + 操作 */
+.shell .app-update-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+}
+.shell .app-update-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.shell .app-update-copy strong {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.shell .app-update-copy span {
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+}
+.shell .app-update-copy span[data-tone="new"] {
+  color: hsl(var(--status-success));
+}
+.shell .app-update-actions {
+  display: flex;
+  gap: 8px;
+}
+.shell .app-settings-page .app-settings-anchor {
+  scroll-margin-top: 8px;
+}
+.shell .app-settings-page .app-settings-anchor :is(textarea, pre) {
+  max-height: 280px;
+}

@@ -176,7 +176,7 @@ test("安装维护并进设置页：设置分组只有一个页面，设置页�
   const sections = text.slice(text.indexOf("const navigationSections"), text.indexOf("const globalNavigationRoutes"));
   assert.match(sections, /\{ id: "settings", routes: \["agentSettings"\] \}/);
   const app = functionSource("App");
-  assert.match(app, /const next: Route = target === "maintenance" \? "agentSettings" : target;/);
+  assert.match(app, /const next: Route = target === "maintenance" \? "agentSettings" : target === "about" \? "settings" : target;/);
   assert.match(app, /\{route === "agentSettings" \|\| route === "maintenance" \? \(/);
   // 合并后的设置页用左侧分类目录，目录里的每一项都对应一张卡片。
   assert.match(app, /<PageSectionNav label=\{t\("设置分类"\)\} sections=\{codexSettingsSections\(\)\} \/>/);
@@ -253,4 +253,16 @@ test("概览页当前供应商：被网关接管时直接显示接管状态，�
   const gatewayBranch = screen.slice(screen.indexOf("activeProfile?.id === CODEX_GATEWAY_RELAY_ID"), screen.indexOf(") : activeProfile ? ("));
   assert.match(gatewayBranch, /t\("由 Codex\+\+ 网关接管"\)/);
   assert.doesNotMatch(gatewayBranch, /AppSelect|switchFromOverview/);
+});
+
+test("「关于」并进「设置」：侧栏底部只留齿轮，合并页用左侧目录，旧的关于入口滚到版本与更新", () => {
+  const sidebar = functionSource("AppSidebar");
+  assert.match(sidebar, /\(\["settings"\] as Route\[\]\)\.map/);
+  const app = functionSource("App");
+  assert.match(app, /<PageSectionNav label=\{t\("设置分类"\)\} sections=\{appSettingsSections\(\)\} \/>/);
+  assert.match(app, /if \(target === "about"\) setSettingsFocus\("app-settings-update"\);/);
+  assert.ok(app.indexOf("<GlobalSettingsScreen") < app.indexOf("<AboutScreen"));
+  const ids = [...text.slice(text.indexOf("function appSettingsSections"), text.indexOf("function AppSettingsFocus")).matchAll(/id: "([^"]+)"/g)].map((match) => match[1]);
+  assert.equal(ids.length, 6);
+  for (const id of ids) assert.match(text, new RegExp(`id="${id}"`));
 });

@@ -1445,6 +1445,8 @@ export function App() {
   useSyncExternalStore(subscribeLanguage, getLanguage, getLanguage);
   const [theme, setTheme] = useState<Theme>(() => loadInitialTheme());
   const [route, setRoute] = useState<Route>(() => loadInitialRoute());
+  /** 合并后的「设置」页里要滚到的分组（原来跳「关于」的地方滚到版本与更新、日志）。 */
+  const [settingsFocus, setSettingsFocus] = useState<string | null>(() => initialSettingsFocus());
   const [enhancementTab, setEnhancementTab] = useState<EnhancementTab>("general");
   const [pendingEnhancementSection, setPendingEnhancementSection] = useState<ManagerNavigationIntent["section"] | null>(null);
   const [notice, setNotice] = useState<{ title: string; message: string; status?: Status } | null>(null);
@@ -2526,8 +2528,9 @@ export function App() {
   };
 
   const navigate = async (target: Route, skipDreamSkinDraftGuard = false) => {
-    // 安装维护已经并进设置页。
-    const next: Route = target === "maintenance" ? "agentSettings" : target;
+    // 安装维护并进了 Codex 设置页；关于并进了设置页（滚到版本与更新）。
+    if (target === "about") setSettingsFocus("app-settings-update");
+    const next: Route = target === "maintenance" ? "agentSettings" : target === "about" ? "settings" : target;
     if (!skipDreamSkinDraftGuard && route === "dreamSkin" && next !== "dreamSkin" && dreamSkinDraftDirty) {
       runAfterDreamSkinDraftGuard(() => void navigate(next, true));
       return;
@@ -2576,7 +2579,7 @@ export function App() {
       await refreshUserScriptInventory();
     }
     if (next === "recommendations") await refreshAds(true);
-    if (next === "about") {
+    if (next === "settings") {
       await refreshOverview(true);
       await refreshLogs(true);
       await refreshDiagnostics(true);
@@ -3751,7 +3754,8 @@ export function App() {
       const startup = await run(() => call<StartupResult>("startup_options"));
       const handledNavigation = await consumePendingManagerNavigation();
       if (!handledNavigation && startup?.showUpdate) {
-        setRoute("about");
+        setSettingsFocus("app-settings-update");
+        setRoute("settings");
         void checkUpdate(false);
       } else {
         void checkUpdate(true);
@@ -4236,7 +4240,7 @@ export function App() {
       showMessage: async (title: string, message: string, status?: Status) => showNotice(title, message, status),
       copyLogs: () => copyText(logs?.text ?? "", t("日志已复制。")),
       copyDiagnostics: () => copyText(diagnostics?.report ?? "", t("诊断报告已复制。")),
-      goLogs: () => navigate("about"),
+      goLogs: () => { setSettingsFocus("app-settings-logs"); return navigate("settings"); },
       checkHealth: async () => {
         await refreshOverview(true);
         await refreshRelay(true);
@@ -4276,7 +4280,7 @@ export function App() {
   for (const tool of toolEntries.filter((entry) => entry.switchable)) {
     agentRoutes(tool.id).forEach((routeId) => pushCommand(routeCommand(routeId, tool.name, () => void switchTool(tool.id, routeId), tool.id)));
   }
-  [...toolNavigationRoutes, "about" as Route, "settings" as Route].forEach((routeId) => pushCommand(routeCommand(routeId, t("工具"), () => void navigate(routeId))));
+  [...toolNavigationRoutes, "settings" as Route].forEach((routeId) => pushCommand(routeCommand(routeId, t("工具"), () => void navigate(routeId))));
   paletteCommands.push(
     {
       id: "action:codex",
@@ -4566,28 +4570,33 @@ export function App() {
               </div>
             </div>
           ) : null}
-          {route === "about" ? (
-            <AboutScreen
-              overview={overview}
-              update={update}
-              updateInstallProgress={updateInstallProgress}
-              logs={logs}
-              diagnostics={diagnostics}
-              actions={actions}
-            />
-          ) : null}
-          {route === "settings" ? (
-            <GlobalSettingsScreen
-              dirty={settingsDirty}
-              form={settingsForm}
-              settings={settings}
-              theme={theme}
-              actions={actions}
-              onOpenAgentSettings={() => void (async () => {
-                if (activeTool !== "codex") await switchTool("codex");
-                await navigate("agentSettings");
-              })()}
-            />
+          {route === "settings" || route === "about" ? (
+            // 设置与关于合在一页：左侧分类目录，右侧限宽。
+            <div className="settings-page app-settings-page sectioned-page">
+              <PageSectionNav label={t("设置分类")} sections={appSettingsSections()} />
+              <div className="sectioned-body">
+                <AppSettingsFocus focus={settingsFocus} onDone={() => setSettingsFocus(null)} />
+                <GlobalSettingsScreen
+                  dirty={settingsDirty}
+                  form={settingsForm}
+                  settings={settings}
+                  theme={theme}
+                  actions={actions}
+                  onOpenAgentSettings={() => void (async () => {
+                    if (activeTool !== "codex") await switchTool("codex");
+                    await navigate("agentSettings");
+                  })()}
+                />
+                <AboutScreen
+                  overview={overview}
+                  update={update}
+                  updateInstallProgress={updateInstallProgress}
+                  logs={logs}
+                  diagnostics={diagnostics}
+                  actions={actions}
+                />
+              </div>
+            </div>
           ) : null}
         </section>
       </main>
@@ -9857,11 +9866,39 @@ function AboutScreen({
 }) {
   return (
     <>
-      <Panel>
+      <Panel id="app-settings-update">
+        <CardHead title={t("版本与更新")} detail={t("从 GitHub Release 下载安装包更新")} />
+        <CardContent>
+          {/* 一行摘要 + 操作；发布说明在下面，下载进度只在下载时出现。 */}
+          <div className="app-update-summary">
+            <div className="app-update-copy">
+              <strong>Codex++ {overview?.current_version ?? update?.currentVersion ?? "-"}</strong>
+              <span data-tone={update?.updateAvailable ? "new" : undefined}>
+                {update?.updateAvailable && update.latestVersion
+                  ? tf("有新版本 {0}", [update.latestVersion])
+                  : update?.latestVersion
+                    ? t("已是最新版本")
+                    : t("尚未检查更新")}
+                {update?.assetName ? ` · ${update.assetName}` : ""}
+              </span>
+            </div>
+            <div className="app-update-actions">
+              <Button onClick={() => void actions.checkUpdate()} variant={update?.updateAvailable ? "secondary" : "default"}>{t("检查更新")}</Button>
+              {update?.updateAvailable ? (
+                <Button disabled={updateInstallProgress.active} onClick={() => void actions.performUpdate()}>
+                  {updateInstallProgress.active ? t("正在下载安装包…") : t("下载并运行安装包")}
+                </Button>
+              ) : null}
+            </div>
+          </div>
+          {update?.releaseSummary ? <ReleaseNotes markdown={update.releaseSummary} onOpenUrl={(url) => void actions.openExternalUrl(url)} /> : null}
+          <TaskProgressBox completedTitle={t("上次更新结果")} progress={updateInstallProgress} title={t("安装包更新进度")} />
+        </CardContent>
+      </Panel>
+      <Panel id="app-settings-about">
         <CardHead title={t("关于 Codex++")} detail={t("本地 Codex 增强、管理工具和安装包维护")} />
         <CardContent>
           <div className="metric-list">
-            <Metric label={t("Codex++ 版本")} value={overview?.current_version ?? update?.currentVersion ?? "-"} />
             <Metric label={t("Codex 版本")} value={overview?.codex_version ?? t("未检测到")} />
             <Metric label={t("项目地址")} value="github.com/BigPizzaV3/CodexPlusPlus" />
           </div>
@@ -9885,27 +9922,8 @@ function AboutScreen({
           </Toolbar>
         </CardContent>
       </Panel>
-      <Panel>
-        <CardHead title={t("GitHub Release 更新")} detail={tf("当前版本 {0}", [overview?.current_version ?? update?.currentVersion ?? "-"])} />
-        <CardContent>
-          <div className="metric-list">
-            <Metric label={t("状态")} value={update?.status ?? "not_checked"} />
-            <Metric label={t("最新版本")} value={update?.latestVersion ?? t("未检查")} />
-            <Metric label={t("资源")} value={update?.assetName ?? "-"} />
-            <Metric label={t("进度")} value={`${formatProgressPercent(update?.progress ?? 0)}%`} />
-          </div>
-          <ReleaseNotes markdown={update?.releaseSummary || update?.message || t("尚未检查 GitHub Release；更新会下载并启动安装包。")} onOpenUrl={(url) => void actions.openExternalUrl(url)} />
-          <TaskProgressBox completedTitle={t("上次更新结果")} progress={updateInstallProgress} title={t("安装包更新进度")} />
-          <Toolbar>
-            <Button onClick={() => void actions.checkUpdate()}>{t("检查更新")}</Button>
-            <Button disabled={updateInstallProgress.active} variant="secondary" onClick={() => void actions.performUpdate()}>
-              {updateInstallProgress.active ? t("正在下载安装包…") : t("下载并运行安装包")}
-            </Button>
-          </Toolbar>
-        </CardContent>
-      </Panel>
-      <LogsPanel logs={logs} actions={actions} />
-      <DiagnosticsPanel diagnostics={diagnostics} actions={actions} />
+      <div className="app-settings-anchor" id="app-settings-logs"><LogsPanel logs={logs} actions={actions} /></div>
+      <div className="app-settings-anchor" id="app-settings-diagnostics"><DiagnosticsPanel diagnostics={diagnostics} actions={actions} /></div>
     </>
   );
 }
@@ -10055,7 +10073,7 @@ function GlobalSettingsScreen({
   return (
     <div className="settings-page global-settings-page">
       <SettingsAutoSave dirty={dirty} form={form} actions={actions} />
-      <Panel>
+      <Panel id="app-settings-general">
         <CardHead title={t("基础设置")} detail="" />
         <CardContent className="global-settings-list">
           <div className="global-setting-row">
@@ -10067,6 +10085,20 @@ function GlobalSettingsScreen({
               <Button variant="secondary" onClick={actions.toggleTheme}>{t("切换主题")}</Button>
             </div>
           </div>
+          <div className="global-setting-row">
+            <div className="global-setting-copy">
+              <strong>{t("Codex 专属设置")}</strong>
+              <span>{t("图片覆盖层、启动参数等只作用于 Codex 的选项，在 Codex 菜单的「设置」里。")}</span>
+            </div>
+            <div className="global-setting-actions">
+              <Button variant="secondary" onClick={onOpenAgentSettings}>{t("打开 Codex 设置")}</Button>
+            </div>
+          </div>
+        </CardContent>
+      </Panel>
+      <Panel id="app-settings-config">
+        <CardHead title={t("配置文件")} detail={t("settings.json 的备份、迁移与存放位置")} />
+        <CardContent className="global-settings-list">
           <div className="global-setting-row">
             <div className="global-setting-copy">
               <strong>{t("配置备份与迁移")}</strong>
@@ -10086,15 +10118,6 @@ function GlobalSettingsScreen({
             <div className="global-setting-actions">
               <Button variant="secondary" onClick={() => void actions.chooseSettingsPath()}>{t("选择路径")}</Button>
               <Button variant="secondary" onClick={() => void actions.resetSettingsPath()}>{t("恢复默认路径")}</Button>
-            </div>
-          </div>
-          <div className="global-setting-row">
-            <div className="global-setting-copy">
-              <strong>{t("Codex 专属设置")}</strong>
-              <span>{t("图片覆盖层、启动参数等只作用于 Codex 的选项，在 Codex 菜单的「设置」里。")}</span>
-            </div>
-            <div className="global-setting-actions">
-              <Button variant="secondary" onClick={onOpenAgentSettings}>{t("打开 Codex 设置")}</Button>
             </div>
           </div>
         </CardContent>
@@ -13808,6 +13831,31 @@ function FeatureToggle({
   );
 }
 
+/** 应用设置页（含原「关于」）左侧目录的分组，id 对应各张卡片。 */
+function appSettingsSections() {
+  return [
+    { id: "app-settings-general", label: t("基础设置") },
+    { id: "app-settings-config", label: t("配置文件") },
+    { id: "app-settings-update", label: t("版本与更新") },
+    { id: "app-settings-about", label: t("关于") },
+    { id: "app-settings-logs", label: t("日志") },
+    { id: "app-settings-diagnostics", label: t("诊断") },
+  ];
+}
+
+/** 打开设置页时滚到指定分组（例如启动时提示更新 → 版本与更新），滚完清掉。 */
+function AppSettingsFocus({ focus, onDone }: { focus: string | null; onDone: () => void }) {
+  useEffect(() => {
+    if (!focus) return;
+    const frame = window.requestAnimationFrame(() => {
+      document.getElementById(focus)?.scrollIntoView({ block: "start" });
+      onDone();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [focus, onDone]);
+  return null;
+}
+
 /** 设置页（含安装维护）左侧目录的分组，id 对应各张卡片。 */
 function codexSettingsSections() {
   return [
@@ -14954,7 +15002,7 @@ function AppSidebar({
           </button>
         ) : null}
         <span className="side-foot-spacer" />
-        {(["about", "settings"] as Route[]).map((routeId) => {
+        {(["settings"] as Route[]).map((routeId) => {
           const item = routes.find((candidate) => candidate.id === routeId);
           if (!item) return null;
           const Icon = item.icon;
@@ -15143,7 +15191,7 @@ function routeSubtitle(route: Route) {
     gatewaySettings: t("监听地址、Key 轮换方式与退出时的恢复策略"),
     maintenance: t("入口检查与修复、开机启动与应用路径"),
     about: t("版本信息、项目链接、GitHub Release 更新、日志与诊断"),
-    settings: t("主题、配置备份与配置文件路径，不随 Agent 变化"),
+    settings: t("主题、配置文件、版本更新与日志诊断，不随 Agent 变化"),
     agentSettings: t("当前 Agent 的专属设置"),
   };
   return subtitles[route];
@@ -17583,7 +17631,14 @@ function loadInitialRoute(): Route {
     return previewRoute as Route;
   }
   if (params.get("showUpdate") === "1" || window.location.hash === "#about") {
-    return "about";
+    return "settings";
   }
   return "overview";
+}
+
+/** 「关于」已经并进「设置」：启动时要看更新，就滚到版本与更新。 */
+function initialSettingsFocus(): string | null {
+  if (typeof window === "undefined") return null;
+  const params = new URLSearchParams(window.location.search);
+  return params.get("showUpdate") === "1" || window.location.hash === "#about" ? "app-settings-update" : null;
 }
