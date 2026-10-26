@@ -31,6 +31,8 @@ export type GatewaySettings = {
   bindings: Partial<Record<GatewayAgentId, AgentBinding>>;
   keyPolicy: { mode: KeyRotationMode };
   restoreOnExit: boolean;
+  /** 左键点托盘图标弹出快捷面板（旧版后端没有这个字段，视为开）。 */
+  trayPanel?: boolean;
 };
 
 export type GatewayPoolEntry = {

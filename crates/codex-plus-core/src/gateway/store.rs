@@ -230,7 +230,7 @@ pub struct KeyPolicy {
     pub mode: KeyRotationMode,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewaySettings {
     #[serde(default)]
@@ -249,6 +249,23 @@ pub struct GatewaySettings {
     /// 网关的路由组。
     #[serde(default)]
     pub groups: Vec<GatewayGroup>,
+    /// 左键点托盘图标弹出快捷面板（默认开）；关掉时托盘保持原来的点击行为。
+    #[serde(default = "enabled_by_default")]
+    pub tray_panel: bool,
+}
+
+impl Default for GatewaySettings {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            bindings: BTreeMap::new(),
+            key_policy: KeyPolicy::default(),
+            restore_on_exit: false,
+            providers: Vec::new(),
+            groups: Vec::new(),
+            tray_panel: true,
+        }
+    }
 }
 
 impl GatewaySettings {
@@ -438,6 +455,9 @@ mod tests {
         let store = GatewayStore::at(temp.path().join("gateway.json"));
         let settings = store.load().unwrap();
         assert!(!settings.any_enabled());
+        assert!(settings.tray_panel, "托盘快捷面板默认开");
+        let old: GatewaySettings = serde_json::from_str("{}").unwrap();
+        assert!(old.tray_panel, "旧文件没有这个字段时也是开");
         assert!(settings.active_binding(&ToolId::Claude).is_none());
     }
 

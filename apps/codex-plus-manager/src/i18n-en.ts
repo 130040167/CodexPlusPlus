@@ -6,6 +6,12 @@
 // Plain strings: t("中文") -> EN_PLAIN["中文"].
 export const EN_PLAIN: Record<string, string> = {
   // 本地网关
+  "点击托盘图标弹出快捷面板": "Click the tray icon to open the quick panel",
+  "面板里能直接给各 Agent 换模型、看最近的请求；右键仍是原来的菜单，双击打开主窗口。关掉恢复原来的点击行为。": "The panel lets you switch each agent's model and see recent requests; right-click still opens the menu and double-click opens the main window. Turn off to restore the original click behavior.",
+  "打开 Codex++": "Open Codex++",
+  "最近请求": "Recent requests",
+  "还没有请求": "No requests yet",
+  "退出": "Quit",
   "部分会话读取失败": "Some sessions could not be read",
   "继续会话": "Resume session",
   "继续会话失败": "Failed to resume session",

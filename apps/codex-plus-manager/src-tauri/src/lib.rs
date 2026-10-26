@@ -7,6 +7,7 @@ mod global_dictation;
 pub mod commands;
 pub mod install;
 mod runtime_health;
+mod tray_panel;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -14,7 +15,7 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, WindowEvent};
 
-const TRAY_ID: &str = "codex_plus_tray";
+pub(crate) const TRAY_ID: &str = "codex_plus_tray";
 
 static APP_EXITING: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
@@ -323,6 +324,9 @@ pub fn run() {
             gateway_commands::load_gateway_balances,
             gateway_commands::list_agent_sessions,
             gateway_commands::resume_agent_session,
+            gateway_commands::save_gateway_tray_panel,
+            tray_panel::tray_panel_action,
+            tray_panel::refresh_tray_mode,
             commands::weixin_connect_qr_start,
             commands::weixin_connect_qr_status,
             commands::weixin_connect_status,
@@ -573,6 +577,10 @@ fn install_tray<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
+            // 快捷面板打开时左键单击交给面板；关掉时保持原来的行为。
+            if tray_panel::handle_tray_event(tray.app_handle(), &event) {
+                return;
+            }
             if tray_event_shows_main_window(&event) {
                 show_main_window(tray.app_handle());
             }
@@ -603,6 +611,7 @@ fn install_tray<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
 
     // Tauri 的资源表持有托盘对象，局部句柄释放不会移除菜单栏入口。
     let _ = tray_builder.build(app)?;
+    tray_panel::apply_tray_mode(app.handle(), TRAY_ID);
     Ok(())
 }
 
@@ -767,6 +776,17 @@ fn update_tray_labels<R: tauri::Runtime>(
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.set_title(&window_title);
     }
+}
+
+/// 托盘快捷面板的「打开 Codex++」。
+pub(crate) fn show_main_window_from<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) {
+    show_main_window(app_handle);
+}
+
+/// 托盘快捷面板的「退出」：与托盘菜单的退出一致。
+pub(crate) fn request_app_exit<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) {
+    APP_EXITING.store(true, Ordering::SeqCst);
+    app_handle.exit(0);
 }
 
 fn show_main_window<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) {

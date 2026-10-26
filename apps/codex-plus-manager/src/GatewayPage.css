@@ -2194,3 +2194,146 @@ span.gw-popover-check {
     display: none;
   }
 }
+
+/* ———————————— 托盘快捷面板 ———————————— */
+html:has(.tray-panel),
+body:has(.tray-panel) {
+  height: 100%;
+  overflow: hidden;
+  background: hsl(var(--background));
+}
+
+.tray-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  color: var(--gw-ink);
+  font-size: 13.5px;
+}
+
+.tray-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 12px 8px 16px;
+}
+
+.tray-panel-head img {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+}
+
+.tray-panel-head strong {
+  font-size: 15px;
+}
+
+.tray-panel-status {
+  display: inline-flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  color: var(--gw-mute);
+  font-size: 12px;
+}
+
+.tray-panel-body {
+  display: grid;
+  flex: 1;
+  align-content: start;
+  gap: 10px;
+  overflow-y: auto;
+  padding: 4px 12px 8px;
+}
+
+.tray-agent-row {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr) minmax(150px, 210px);
+  align-items: center;
+  gap: 10px;
+  min-height: 52px;
+  padding: 8px 12px;
+}
+
+.tray-agent-row .gw-agent-icon {
+  width: 24px;
+  height: 24px;
+}
+
+.tray-agent-row strong {
+  font-size: 14.5px;
+  font-weight: 500;
+}
+
+.tray-agent-picker {
+  height: 32px;
+  font-size: 13px;
+}
+
+.tray-panel-message {
+  margin: 0;
+  color: var(--gw-err);
+  font-size: 12px;
+}
+
+.tray-panel-label {
+  padding: 4px 4px 0;
+  color: var(--gw-mute);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.tray-log-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 6px 12px;
+}
+
+.tray-log-row > img {
+  width: 16px;
+  height: 16px;
+  object-fit: contain;
+}
+
+.tray-log-main {
+  display: grid;
+  min-width: 0;
+}
+
+.tray-log-main strong,
+.tray-log-main small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tray-log-main strong {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.tray-log-main small {
+  color: var(--gw-mute);
+  font-size: 11.5px;
+}
+
+.tray-log-side {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--gw-mute);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.tray-panel-foot {
+  display: flex;
+  justify-content: space-between;
+  padding: 10px 16px 12px;
+  border-top: 1px solid var(--gw-line);
+}

@@ -681,6 +681,27 @@ pub fn resume_agent_session(
     }
 }
 
+/// 托盘快捷面板开关。
+#[tauri::command]
+pub fn save_gateway_tray_panel(enabled: bool) -> CommandResult<Option<GatewayPayload>> {
+    let result = (|| {
+        let store = GatewayStore::default();
+        let mut gateway = store.load()?;
+        gateway.tray_panel = enabled;
+        store.save(&gateway)?;
+        Ok(gateway)
+    })();
+    respond(
+        if enabled {
+            "点击托盘图标会弹出快捷面板。"
+        } else {
+            "托盘图标恢复原来的点击行为。"
+        },
+        "保存失败",
+        result,
+    )
+}
+
 /// 清掉某个供应商的 Key 冷却与熔断状态。
 #[tauri::command]
 pub fn reset_gateway_key_health(relay_id: String) -> CommandResult<Option<GatewayPayload>> {
