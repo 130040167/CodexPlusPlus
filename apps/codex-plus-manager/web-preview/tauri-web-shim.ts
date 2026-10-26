@@ -266,6 +266,25 @@ const demoAds = [
 ];
 
 // MCP 演示数据：Claude Code 与 Grok 各自已有的服务器（Codex 一列来自设置里的公共配置）。
+// Skills 页演示数据：内置、已安装（启用到不同 Agent）、仓库里未安装的各几条。
+const demoSkill = (id: string, repoKey: string, description: string, extra: Record<string, unknown> = {}) =>
+  ({ id, name: id, description, repoKey, installed: false, enabled: false, bundled: false, updateAvailable: false, agents: [], managed: true, ...extra });
+const demoSkills = {
+  status: "ok", message: "",
+  skills: [
+    demoSkill("imagegen", "", "Generate or edit raster images when the task benefits from AI-created bitmap visuals.", { installed: true, enabled: true, bundled: true, agents: ["codex"], managed: false }),
+    demoSkill("skill-creator", "", "Create or update a Codex skill with appropriately scoped instructions.", { installed: true, enabled: true, bundled: true, agents: ["codex"], managed: false }),
+    demoSkill("pdf", "anthropics/skills@main", "Read, merge, split and fill PDF files.", { installed: true, enabled: true, agents: ["codex", "claude"] }),
+    demoSkill("frontend-design", "anthropics/skills@main", "Build distinctive, production-grade frontend interfaces.", { installed: true, enabled: false, agents: ["claude"], updateAvailable: true }),
+    demoSkill("algorithmic-art", "anthropics/skills@main", "Creating algorithmic art using p5.js with seeded randomness."),
+    demoSkill("academy-guide", "anthropics/skills@main", "Check this skill before answering questions about courses."),
+  ],
+  repos: [{ owner: "anthropics", name: "skills", branch: "main", subdir: "", enabled: true }],
+  repositorySkills: [], repoCounts: { "anthropics/skills@main": 20 }, repoErrors: [],
+  skillsDir: "~/.codex-plus/skills", codexSkillsDir: "~/.codex/skills",
+  agentSkillsDirs: { codex: "~/.codex/skills", claude: "~/.claude/skills", grok: "~/.grok/skills" },
+};
+
 const demoAgentMcp: Record<string, unknown> = {
   claude: { agent: "claude", configPath: "~/.claude.json", exists: true, entries: [
     { id: "context7", enabled: true, tomlBody: "command = \"npx\"\nargs = [\"-y\", \"@upstash/context7-mcp\"]\n" },
@@ -285,6 +304,8 @@ export async function invoke<T = unknown>(command: string, args: Record<string, 
     case "scan_agent_cache": return ok({ report: agentCacheReport }) as T;
     case "fetch_provider_models": return ok({ models: ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"], endpoint: "https://api.anthropic.com/v1/models" }) as T;
     case "lookup_model_prices": return ok({ source: "models.dev", fetchedAtMs: Date.now(), prices: ((args.models as string[]) ?? []).map((model) => ({ model, price: { providerId: "anthropic", providerName: "Anthropic", modelId: model, currency: "USD", input: 3, cachedInput: 0.3, output: 15, context: 200000 } })) }) as T;
+    case "list_installed_skills":
+    case "refresh_skill_catalog": return demoSkills as T;
     case "load_agent_mcp":
     case "save_agent_mcp": return ok({ config: demoAgentMcp[String(args.agent)] }) as T;
     case "load_gateway_usage": return gatewayUsage as T;

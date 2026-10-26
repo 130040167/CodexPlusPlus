@@ -16,7 +16,7 @@ type Notify = (title: string, message: string, status?: "ok" | "failed" | "pendi
 type ContextEntry = { kind: "mcp" | "skill" | "plugin"; id: string; title: string; tomlBody: string; enabled: boolean };
 const succeeded = (result: Result) => result.status === "ok";
 
-function Action({ children, onClick, disabled, primary = false, title }: { children: ReactNode; onClick: () => void; disabled?: boolean; primary?: boolean; title?: string }) {
+export function Action({ children, onClick, disabled, primary = false, title }: { children: ReactNode; onClick: () => void; disabled?: boolean; primary?: boolean; title?: string }) {
   return <button type="button" className={`mg-button ${primary ? "mg-primary" : ""}`} onClick={onClick} disabled={disabled} title={title}>{children}</button>;
 }
 function IconAction({ children, onClick, label, disabled }: { children: ReactNode; onClick: () => void; label: string; disabled?: boolean }) {
@@ -29,10 +29,10 @@ function IconAction({ children, onClick, label, disabled }: { children: ReactNod
 export function PageHeader({ actions }: { icon?: ReactNode; title?: string; actions?: ReactNode }) {
   return <TopbarActions>{actions}</TopbarActions>;
 }
-function SearchField({ value, onChange, placeholder }: { value: string; onChange: (value: string) => void; placeholder: string }) {
+export function SearchField({ value, onChange, placeholder }: { value: string; onChange: (value: string) => void; placeholder: string }) {
   return <div className="mg-search"><Search size={15} /><input aria-label={placeholder} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} />{value && <IconAction label={t("清除搜索")} onClick={() => onChange("")}><X size={13} /></IconAction>}</div>;
 }
-function Menu({ label = t("更多操作"), children }: { label?: string; children: ReactNode }) {
+export function Menu({ label = t("更多操作"), children }: { label?: string; children: ReactNode }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -44,8 +44,9 @@ function Menu({ label = t("更多操作"), children }: { label?: string; childre
   }, [open]);
   return <div className="mg-menu-wrap" ref={ref}><button type="button" className="mg-icon-button" aria-label={label} aria-expanded={open} aria-haspopup="menu" onClick={() => setOpen(!open)}><MoreHorizontal size={17} /></button>{open && <div className="mg-menu" role="menu" onClick={() => setOpen(false)}>{children}</div>}</div>;
 }
-function MenuItem({ children, onClick, disabled, danger }: { children: ReactNode; onClick: () => void; disabled?: boolean; danger?: boolean }) {
-  return <button type="button" role="menuitem" className={danger ? "mg-danger" : ""} disabled={disabled} onClick={onClick}>{children}</button>;
+/** 菜单项；传了 `checked` 就是单选项（例如 Skill 的分组），选中的项右侧打勾。 */
+export function MenuItem({ children, onClick, disabled, danger, checked }: { children: ReactNode; onClick: () => void; disabled?: boolean; danger?: boolean; checked?: boolean }) {
+  return <button type="button" role={checked === undefined ? "menuitem" : "menuitemradio"} aria-checked={checked} className={danger ? "mg-danger" : ""} disabled={disabled} onClick={onClick}>{children}</button>;
 }
 export function ManagementDrawer({ title, onClose, children, footer, wide = false, dismissOnBackdrop = true }: { title: string; onClose: () => void; children: ReactNode; footer?: ReactNode; wide?: boolean; dismissOnBackdrop?: boolean }) {
   const ref = useRef<HTMLElement>(null);
@@ -75,11 +76,12 @@ function Empty({ title, detail, children }: { title: string; detail?: string; ch
 }
 const agentLabel = (agent: McpAgentId) => (agent === "codex" ? "Codex" : agent === "claude" ? "Claude Code" : "Grok");
 /** 矩阵列头：Agent 图标 + 名称 + 在用数量；悬停显示它的配置文件位置。 */
-function AgentColumn({ agent, count, title }: { agent: McpAgentId; count: number; title?: string }) {
+export function AgentColumn({ agent, count, title }: { agent: McpAgentId; count: number; title?: string }) {
   return <div className="mg-column mg-agent-column" title={title ? `${agentLabel(agent)} · ${title}` : agentLabel(agent)}><AgentGlyph agent={agent} /><span>{agentLabel(agent)}</span><small>{count}</small></div>;
 }
-function MatrixCell({ name, enabled, disabled, onToggle, agent = "codex" }: { name: string; enabled: boolean; disabled?: boolean; onToggle: () => void; agent?: McpAgentId }) {
-  return <button className="mg-cell" type="button" aria-pressed={enabled} aria-label={`${name} · ${agentLabel(agent)}：${enabled ? t("已启用") : t("已停用")}`} title={`${name} · ${agentLabel(agent)}`} disabled={disabled} onClick={onToggle}><span data-on={enabled}>{enabled && <Check size={12} strokeWidth={3} />}</span></button>;
+/** 矩阵里的一格勾选；`hint` 覆盖悬停说明（例如「未安装」「只读」）。 */
+export function MatrixCell({ name, enabled, disabled, onToggle, agent = "codex", hint }: { name: string; enabled: boolean; disabled?: boolean; onToggle: () => void; agent?: McpAgentId; hint?: string }) {
+  return <button className="mg-cell" type="button" aria-pressed={enabled} aria-label={`${name} · ${agentLabel(agent)}：${enabled ? t("已启用") : t("已停用")}`} title={hint ? `${agentLabel(agent)}：${hint}` : `${name} · ${agentLabel(agent)}`} disabled={disabled} onClick={onToggle}><span data-on={enabled}>{enabled && <Check size={12} strokeWidth={3} />}</span></button>;
 }
 async function copyValue(text: string, notify: Notify) {
   try { await navigator.clipboard.writeText(text); await notify(t("复制"), t("已复制。"), "ok"); }

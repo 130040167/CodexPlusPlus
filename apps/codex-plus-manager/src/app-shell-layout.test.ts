@@ -128,3 +128,13 @@ test("旧版 Codex 供应商配置页顶部建议改用新版网关，按钮打�
   assert.match(functionSource("App"), /\{route === "relay" \? <LegacyRelayGatewayHint onOpenGateway=\{\(\) => void navigate\("gatewayProviders"\)\} \/> : null\}/);
   assert.match(functionSource("LegacyRelayGatewayHint"), /t\("建议改用新版网关"\)/);
 });
+
+test("Skills 与 MCP 共用一张多 Agent 表：每个 Agent 一列勾选，不再有页面自己的配色和按钮尺寸", () => {
+  const extra = readFileSync(new URL("./ManagementExtra.tsx", import.meta.url), "utf8");
+  const css = readFileSync(new URL("./ManagementPages.css", import.meta.url), "utf8");
+  assert.match(extra, /className="mg-matrix mg-agent-matrix mg-skill-matrix"/);
+  assert.match(extra, /MCP_AGENTS\.map\(\(agent\) => <AgentColumn /);
+  assert.match(extra, /MCP_AGENTS\.map\(\(agent\) => <MatrixCell /);
+  assert.doesNotMatch(extra, /mg-agent-toggle|mg-skill-group-select/);
+  assert.doesNotMatch(css, /\.dark \.mg-skills-page|\.mg-skills-page \.mg-primary|\.mg-skills-page :is\(\.mg-button/);
+});

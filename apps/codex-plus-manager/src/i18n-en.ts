@@ -994,6 +994,9 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "Codex 自带，只读": "Bundled with Codex, read-only",
+  "查看详情": "View details",
+  "分组": "Group",
   "Agent 页面": "Agent pages",
   "建议改用新版网关": "Try the new gateway",
   "在网关的「供应商池」统一管理供应商，多个 Agent 共用，支持多 Key 轮换、按模型路由、故障转移与用量统计。这里是旧版的 Codex 直连配置，仍可继续使用。":

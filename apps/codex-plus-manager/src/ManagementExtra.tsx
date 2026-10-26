@@ -3,12 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { ArrowLeft, ArrowRight, BookOpen, ChevronDown, Copy, Edit3, ExternalLink, History, Link, Plus, RefreshCw, Search, Trash2, X } from "lucide-react";
 import { t, tf } from "./i18n";
 import { matchesManagementQuery, sessionGroups, type ManagedSession } from "./management-model";
-import { ManagementDrawer } from "./ManagementPages";
+import { AgentColumn, ManagementDrawer, MatrixCell, Menu, MenuItem, SearchField } from "./ManagementPages";
+import { MCP_AGENTS, type McpAgentId } from "./agent-mcp-model";
 import "./ManagementPages.css";
 import { parseSkillRepository } from "./skill-repository";
 import { SkillListViewport } from "./SkillListViewport";
 import { TopbarActions } from "./TopbarActions";
-import { AgentGlyph } from "./HubOverview";
 
 type Result = { status: string; message: string };
 type Notify = (title: string, message: string, status?: "ok" | "failed") => Promise<void>;
@@ -17,7 +17,6 @@ type Skill = { id: string; name: string; description: string; repoKey: string; r
   agents?: string[];
   /** Codex++ 的受控源里有它；只在某个 Agent 自己目录里的 Skill 为 false。 */
   managed?: boolean };
-const SKILL_AGENTS = [{ id: "codex", label: "Codex" }, { id: "claude", label: "Claude Code" }, { id: "grok", label: "Grok" }];
 type Repo = { owner: string; name: string; branch: string; subdir: string; enabled: boolean };
 type SkillPayload = Result & { skills: Skill[]; repos: Repo[]; repositorySkills: Skill[]; repoCounts: Record<string, number>; repoErrors: string[]; skillsDir: string; codexSkillsDir: string; agentSkillsDirs?: Record<string, string> };
 type RepoInspection = Result & { repo: Repo; skills: Skill[]; skillCount: number };
@@ -322,74 +321,85 @@ export function SkillsPage({ notify }: { notify: Notify }) {
       return next;
     });
   };
-  const renderSkillRow = (s: Skill) => <div className="mg-skill-row" key={s.repoKey + ":" + s.id}>
-    <button type="button" className="mg-skill-name" onClick={() => setDetail(s)}>
-      <strong title={s.name || s.id}>{s.name || s.id}</strong>
-      <small title={s.description}>{s.description || t("暂无描述")}</small>
-    </button>
-    <div className="mg-skill-source" title={s.repoKey || sourceLabel(s)}>
-      {repoUrl(s) ? <button className="mg-link-button" onClick={() => openRepo(s.repoKey)}>{sourceLabel(s)}</button> : sourceLabel(s)}
-      <select className="mg-skill-group-select" aria-label={t("分配 Skill 分组")} value={customGroupAssignments[s.id] || ""} onChange={(event) => assignSkillGroup(s.id, event.currentTarget.value)}>
-        <option value="">{t("按来源")}</option>
-        {customGroupNames.map((group) => <option key={group} value={group}>{group}</option>)}
-      </select>
-    </div>
-    {/* 每个 Agent 一个图标开关：点亮 = 已启用到它（在它的 skills 目录里有这个 Skill）。 */}
-    <div className="mg-skill-agents">
-      {!s.installed ? <span className="mg-badge">{t("未安装")}</span> : SKILL_AGENTS.map((agent) => {
-        const on = (s.agents ?? (s.enabled ? ["codex"] : [])).includes(agent.id);
-        const readonly = s.bundled;
-        return <button aria-checked={on} aria-label={`${s.name || s.id} · ${agent.label}`} className={"mg-agent-toggle " + (on ? "is-on" : "")}
-          disabled={busy || readonly} key={agent.id} onClick={() => void run("set_skill_enabled_for", { agent: agent.id, id: s.id, enabled: !on })}
-          role="switch" title={readonly ? tf("{0}：Codex 自带，只读", [agent.label]) : `${agent.label}：${on ? t("已启用，点击停用") : t("未启用，点击启用")}`} type="button">
-          <AgentGlyph agent={agent.id} />
-        </button>;
-      })}
-    </div>
-    <div className="mg-row-actions">
-      {s.installed ? <>
-        {s.updateAvailable && <Button onClick={() => void run("update_skill", { repoKey: s.repoKey, id: s.id })} disabled={busy}>{t("更新")}</Button>}
-        {/* 只卸载 Codex++ 管理的或 Codex 目录里的；Claude / Grok 自己目录里的 Skill 不动。 */}
-        {!s.bundled && (s.managed || (s.agents ?? []).includes("codex") || s.agents === undefined) && <Button onClick={() => void run("uninstall_skill", { id: s.id })} disabled={busy}>{t("卸载")}</Button>}
-      </> : !s.bundled && <Button primary onClick={() => void run("install_skill", { repoKey: s.repoKey, id: s.id })} disabled={busy}>{t("安装")}</Button>}
-    </div>
-  </div>;
+  const skillAgents = (s: Skill) => s.agents ?? (s.enabled ? ["codex"] : []);
+  const agentCount = (agent: McpAgentId) => (data?.skills || []).filter((s) => s.installed && skillAgents(s).includes(agent)).length;
+  // 与 MCP 页同一张表：名称 | 来源 | 每个 Agent 一列勾选 | 操作。分组、详情、卸载收进行末的「更多」菜单。
+  const renderSkillRow = (s: Skill) => {
+    // 只卸载 Codex++ 管理的或 Codex 目录里的；Claude / Grok 自己目录里的 Skill 不动。
+    const canUninstall = s.installed && !s.bundled && (s.managed || skillAgents(s).includes("codex") || s.agents === undefined);
+    return <div className="mg-matrix-row" key={s.repoKey + ":" + s.id}>
+      <button type="button" className="mg-row-main" onClick={() => setDetail(s)}>
+        <div><strong title={s.name || s.id}>{s.name || s.id}</strong>{s.updateAvailable ? <span className="mg-badge">{t("可更新")}</span> : null}</div>
+        <small title={s.description}>{s.description || t("暂无描述")}</small>
+      </button>
+      <div className="mg-skill-source" title={s.repoKey || sourceLabel(s)}>
+        {repoUrl(s) ? <button className="mg-link-button" onClick={() => openRepo(s.repoKey)} type="button">{sourceLabel(s)}</button> : <small>{sourceLabel(s)}</small>}
+      </div>
+      {MCP_AGENTS.map((agent) => <MatrixCell agent={agent} key={agent} name={s.name || s.id}
+        enabled={s.installed && skillAgents(s).includes(agent)}
+        disabled={busy || !s.installed || s.bundled}
+        hint={!s.installed ? t("未安装") : s.bundled ? t("Codex 自带，只读") : undefined}
+        onToggle={() => void run("set_skill_enabled_for", { agent, id: s.id, enabled: !skillAgents(s).includes(agent) })} />)}
+      <div className="mg-row-actions">
+        {!s.installed && !s.bundled ? <Button primary onClick={() => void run("install_skill", { repoKey: s.repoKey, id: s.id })} disabled={busy}>{t("安装")}</Button> : null}
+        {s.installed && s.updateAvailable ? <Button onClick={() => void run("update_skill", { repoKey: s.repoKey, id: s.id })} disabled={busy}>{t("更新")}</Button> : null}
+        <Menu>
+          <MenuItem onClick={() => setDetail(s)}>{t("查看详情")}</MenuItem>
+          {customGroupNames.length ? <>
+            <div className="mg-menu-label">{t("分组")}</div>
+            <MenuItem checked={!customGroupAssignments[s.id]} onClick={() => assignSkillGroup(s.id, "")}>{t("按来源")}</MenuItem>
+            {customGroupNames.map((group) => <MenuItem checked={customGroupAssignments[s.id] === group} key={group} onClick={() => assignSkillGroup(s.id, group)}>{group}</MenuItem>)}
+          </> : null}
+          {canUninstall ? <MenuItem danger disabled={busy} onClick={() => void run("uninstall_skill", { id: s.id })}>{t("卸载")}</MenuItem> : null}
+        </Menu>
+      </div>
+    </div>;
+  };
+  const discoverCount = (data?.skills || []).filter((s) => !s.installed || s.bundled).length;
+  const installedCount = (data?.skills || []).filter((s) => s.installed).length;
+  const tabTotal = tab === "discover" ? discoverCount : installedCount;
   return <div className="mg-page mg-skills-page">
     <Header icon={<BookOpen size={20}/>} title="Skills" actions={<>
-      <Button onClick={() => void load()} disabled={busy || loading}><RefreshCw size={14}/>{t("刷新目录")}</Button>
-      <Button onClick={() => void run("import_ccs_skills", {})} disabled={busy}><BookOpen size={14}/>{t("从 cc-switch 导入")}</Button>
-      <Button onClick={() => setRepoOpen(true)}><Link size={14}/>{t("管理仓库")}</Button>
+      <Button onClick={() => void load()} disabled={busy || loading}><RefreshCw size={16}/>{t("刷新目录")}</Button>
+      <Button onClick={() => void run("import_ccs_skills", {})} disabled={busy}><BookOpen size={16}/>{t("从 cc-switch 导入")}</Button>
+      <Button onClick={() => setRepoOpen(true)}><Link size={16}/>{t("管理仓库")}</Button>
     </>} />
-    <div className="mg-tabs-bar">
+    <div className="mg-toolbar">
       <div className="mg-segmented">
-        <button type="button" data-active={tab === "discover"} onClick={() => setTab("discover")}>{t("发现")} · {(data?.skills || []).filter((s) => !s.installed || s.bundled).length}</button>
-        <button type="button" data-active={tab === "installed"} onClick={() => setTab("installed")}>{t("已安装")} · {(data?.skills || []).filter((s) => s.installed).length}</button>
+        <button type="button" data-active={tab === "discover"} onClick={() => setTab("discover")}>{t("发现")} · {discoverCount}</button>
+        <button type="button" data-active={tab === "installed"} onClick={() => setTab("installed")}>{t("已安装")} · {installedCount}</button>
       </div>
-      <SearchBox value={query} onChange={setQuery} placeholder={t("搜索 Skills 或仓库")} />
-      <Button onClick={createCustomGroup}>{t("新建分组")}</Button>
-      {groups.length > 1 ? <>
-        <Button onClick={() => setCollapsedGroups(new Set(groups.map(([source]) => source)))}>{t("全部折叠")}</Button>
-        <Button onClick={() => setCollapsedGroups(new Set())}>{t("全部展开")}</Button>
-      </> : null}
+      <SearchField value={query} onChange={setQuery} placeholder={t("搜索 Skills 或仓库")} />
+      <span>{items.length === tabTotal ? `${tabTotal} ${t("个 Skill")}` : `${items.length} / ${tabTotal}`}</span>
+      <div className="mg-push mg-toolbar-actions">
+        <Button onClick={createCustomGroup}>{t("新建分组")}</Button>
+        {groups.length > 1 ? <>
+          <Button onClick={() => setCollapsedGroups(new Set(groups.map(([source]) => source)))}>{t("全部折叠")}</Button>
+          <Button onClick={() => setCollapsedGroups(new Set())}>{t("全部展开")}</Button>
+        </> : null}
+      </div>
     </div>
     <div className="mg-content">
-      {!groups.length ? <div className="mg-skill-list"><div className="mg-empty"><h2>{loading ? t("正在扫描…") : t("没有匹配的 Skill")}</h2></div></div> : groups.map(([source, groupItems]) => {
-        const collapsed = collapsedGroups.has(source) && !query.trim();
-        const canBatch = groupItems.some((skill) => skill.installed && !skill.bundled);
-        const custom = customGroupNames.includes(source);
-        return <section className="mg-skill-group" key={source}>
-          <div className="mg-skill-group-head">
-            <button type="button" className="mg-group-head" onClick={() => setCollapsedGroups((old) => { const next = new Set(old); next.has(source) ? next.delete(source) : next.add(source); return next; })}>
-              <ChevronDown size={15} className={collapsed ? "mg-chevron-collapsed" : ""}/><strong>{source}</strong><small>{groupItems.length} {t("个 Skill")}</small>
-            </button>
-            <div className="mg-row-actions">
-              {custom ? <><Button disabled={busy} onClick={() => renameCustomGroup(source)}>{t("重命名")}</Button><Button disabled={busy} onClick={() => deleteCustomGroup(source)}>{t("删除分组")}</Button></> : null}
-              {canBatch ? <><Button disabled={busy} onClick={() => void runBatch(groupItems, true)}>{t("全部启用")}</Button><Button disabled={busy} onClick={() => void runBatch(groupItems, false)}>{t("全部停用")}</Button></> : null}
+      <div className="mg-matrix mg-agent-matrix mg-skill-matrix" aria-busy={loading}>
+        <div className="mg-matrix-head"><span>{t("技能")}</span><span>{t("来源")}</span>{MCP_AGENTS.map((agent) => <AgentColumn agent={agent} count={agentCount(agent)} key={agent} title={data?.agentSkillsDirs?.[agent]} />)}<span className="mg-actions-label">{t("操作")}</span></div>
+        {!groups.length ? <div className="mg-empty"><h2>{loading ? t("正在扫描…") : t("没有匹配的 Skill")}</h2></div> : groups.map(([source, groupItems]) => {
+          const collapsed = collapsedGroups.has(source) && !query.trim();
+          const canBatch = groupItems.some((skill) => skill.installed && !skill.bundled);
+          const custom = customGroupNames.includes(source);
+          return <section className="mg-skill-group" key={source}>
+            <div className="mg-skill-group-row">
+              <button type="button" className="mg-group-head" aria-expanded={!collapsed} onClick={() => setCollapsedGroups((old) => { const next = new Set(old); next.has(source) ? next.delete(source) : next.add(source); return next; })}>
+                <ChevronDown size={15} className={collapsed ? "mg-chevron-collapsed" : ""}/><strong>{source}</strong><small>{groupItems.length} {t("个 Skill")}</small>
+              </button>
+              <div className="mg-row-actions">
+                {custom ? <><Button disabled={busy} onClick={() => renameCustomGroup(source)}>{t("重命名")}</Button><Button disabled={busy} onClick={() => deleteCustomGroup(source)}>{t("删除分组")}</Button></> : null}
+                {canBatch ? <><Button disabled={busy} onClick={() => void runBatch(groupItems, true)}>{t("全部启用")}</Button><Button disabled={busy} onClick={() => void runBatch(groupItems, false)}>{t("全部停用")}</Button></> : null}
+              </div>
             </div>
-          </div>
-          {!collapsed ? <SkillListViewport className="mg-skill-list" items={groupItems} rowHeight={68} resetKey={`${tab}:${source}:${deferredQuery}`} busy={loading} header={<div className="mg-skill-head"><span>{t("技能")}</span><span>{t("来源")}</span><span>{t("启用到")}</span><span /></div>} empty={<div className="mg-empty"><h2>{t("没有匹配的 Skill")}</h2></div>} renderRow={renderSkillRow} /> : null}
-        </section>;
-      })}
+            {!collapsed ? groupItems.map(renderSkillRow) : null}
+          </section>;
+        })}
+      </div>
       {data?.repoErrors?.length ? <div className="mg-notice mg-warning">{data.repoErrors.map((e) => <p key={e}>{e}</p>)}</div> : null}
     </div>
     {repoOpen && <SkillRepoDrawer repos={data?.repos || []} catalog={data?.repositorySkills || []} counts={data?.repoCounts || {}} initialKey={repoSelection} busy={busy} onClose={() => setRepoOpen(false)} onSave={saveRepo} onDelete={(r) => void deleteRepo(r)} onInspect={inspectRepo} onOpenUrl={(url) => void openUrl(url)} onOpenSkill={setDetail} onRun={(cmd, args) => void run(cmd, args)} />}
