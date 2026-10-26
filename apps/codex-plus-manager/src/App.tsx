@@ -5517,7 +5517,6 @@ function OverviewScreen({
   const codexActions = gatewayManaged ? (
     <>
       <Button onClick={() => onNavigate("gateway")} size="sm">{t("管理接入")}</Button>
-      <Button onClick={() => onNavigate("relay")} size="sm" variant="secondary">{t("断开并还原")}</Button>
     </>
   ) : activeProfile ? (
     <>
