@@ -999,7 +999,8 @@ pub fn start_from_saved_state() {
         apply::reapply_enabled(&ctx)
     } else {
         apply::reapply_if_port_changed(&ctx)
-    };
+    }
+    .and_then(|count| apply::sync_codex_identity(&ctx).map(|_| count));
     if let Err(error) = result {
         let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
             "gateway.startup_reapply_failed",

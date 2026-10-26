@@ -6943,6 +6943,17 @@ pub fn switch_relay_profile(
     let previous_active_relay_id = request.previous_active_relay_id;
     let settings = normalize_settings_before_save(request.settings);
     let resolution = request.live_conflict_resolution;
+    // Codex 被网关接管时不能在这里直接切走：先断开并还原，网关才能把接入前的配置恢复干净。
+    if codex_plus_core::gateway::apply::codex_switch_blocked_by_gateway(&store, &settings.active_relay_id) {
+        return failed(
+            "Codex 正由 Codex++ 网关接管：先在「供应商配置」顶部或「Agent 接入」里点「断开并还原」，再切换供应商。",
+            relay_switch_payload(
+                store.load().unwrap_or_default(),
+                codex_plus_core::relay_config::relay_status_from_home(&home),
+                None,
+            ),
+        );
+    }
     log_manager_event(
         "manager.switch_relay_profile.start",
         json!({

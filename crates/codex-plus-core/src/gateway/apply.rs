@@ -43,6 +43,13 @@ pub struct ApplyContext {
 /// Codex 直连模式供应商列表里托管的网关供应商 id。
 pub const CODEX_GATEWAY_RELAY_ID: &str = "codex-plus-gateway";
 
+/// Codex 当前在用网关托管的供应商：本地代理收到的 Codex 请求只是转给网关的一跳。
+pub fn codex_hops_through_gateway() -> bool {
+    SettingsStore::default()
+        .load()
+        .is_ok_and(|settings| settings.active_relay_id == CODEX_GATEWAY_RELAY_ID)
+}
+
 impl ApplyContext {
     pub fn default_paths(port: u16) -> Self {
         Self {
@@ -232,10 +239,15 @@ fn write_agent_config(
 }
 
 /// Codex 的托管网关供应商：与直连模式里手加的 Responses 供应商一样存储（配置快照里带地址和 token）。
+///
+/// `signed_in`：Codex 用 ChatGPT 账号登录着。这时供应商带 openai 会话身份（与直连模式的
+/// 「官方会话身份」一样）：Codex 保留内置的 OpenAI 供应商与登录，会话、额度、远程控制照旧，
+/// 请求经本地代理（`openai_base_url`）转给网关。没登录或用 API Key 时是普通的自定义供应商。
 pub fn codex_gateway_profile(
     gateway: &GatewaySettings,
     binding: &AgentBinding,
     port: u16,
+    signed_in: bool,
 ) -> anyhow::Result<RelayProfile> {
     let synthetic = agent_gateway_profile(gateway, binding, port, &ToolId::Codex);
     let mut profile = crate::provider_import::pool_relay_profile(
@@ -249,8 +261,48 @@ pub fn codex_gateway_profile(
     )?;
     profile.id = CODEX_GATEWAY_RELAY_ID.to_string();
     profile.relay_mode = RelayMode::PureApi;
+    if signed_in {
+        profile.config_contents = with_openai_session_identity(&profile.config_contents)?;
+    }
     crate::relay_config::normalize_relay_profile_for_storage(&mut profile)?;
     Ok(profile)
+}
+
+/// 把供应商配置改成 openai 会话身份：`model_provider = "openai"`，传输放进 `[model_providers.custom]`。
+fn with_openai_session_identity(contents: &str) -> anyhow::Result<String> {
+    let mut doc = contents
+        .parse::<toml_edit::DocumentMut>()
+        .context("托管供应商配置不是合法 TOML")?;
+    let provider = doc
+        .get("model_provider")
+        .and_then(toml_edit::Item::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if provider == "openai" {
+        return Ok(doc.to_string());
+    }
+    let mut table = doc
+        .get_mut("model_providers")
+        .and_then(toml_edit::Item::as_table_mut)
+        .and_then(|providers| providers.remove(&provider))
+        .and_then(|item| item.into_table().ok())
+        .context("托管供应商配置里没有传输供应商")?;
+    table["name"] = toml_edit::value("custom");
+    doc["model_providers"]["custom"] = toml_edit::Item::Table(table);
+    doc["model_provider"] = toml_edit::value("openai");
+    Ok(doc.to_string())
+}
+
+/// Codex 现在是否用 ChatGPT 账号登录（auth.json 里有登录 token）。
+fn codex_signed_in(codex_home: &std::path::Path) -> bool {
+    std::fs::read_to_string(codex_home.join("auth.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .is_some_and(|auth| {
+            auth.pointer("/tokens/access_token")
+                .and_then(Value::as_str)
+                .is_some_and(|token| !token.trim().is_empty())
+        })
 }
 
 /// 接入网关前 Codex 实时配置的原样副本。只在实时配置与直连模式的记录对不上时才存：
@@ -315,7 +367,8 @@ fn write_codex(
     if !settings.relay_profiles_enabled {
         bail!("Codex 的供应商配置总开关已关闭，无法接入网关：先在 Codex 设置里打开");
     }
-    let profile = codex_gateway_profile(gateway, binding, ctx.port)?;
+    let profile =
+        codex_gateway_profile(gateway, binding, ctx.port, codex_signed_in(&ctx.codex_home))?;
     match settings
         .relay_profiles
         .iter_mut()
@@ -598,6 +651,49 @@ pub fn note_codex_switched(
     }
     store.save(&gateway)?;
     Ok(())
+}
+
+/// 直连模式里切换供应商前：Codex 正被网关接管（当前是托管供应商、绑定开着）且要切到别的供应商时拦下。
+pub fn codex_switch_blocked_by_gateway(settings: &SettingsStore, target_id: &str) -> bool {
+    if target_id == CODEX_GATEWAY_RELAY_ID {
+        return false;
+    }
+    let on_gateway = settings
+        .load()
+        .is_ok_and(|saved| saved.active_relay_id == CODEX_GATEWAY_RELAY_ID);
+    on_gateway
+        && GatewayStore::default()
+            .load()
+            .ok()
+            .and_then(|gateway| {
+                gateway
+                    .binding(&ToolId::Codex)
+                    .map(|binding| binding.enabled)
+            })
+            .unwrap_or(false)
+}
+
+/// Codex 开着网关时，托管供应商的会话身份要跟 Codex 的登录状态一致（登录了 ChatGPT 就保留官方身份）：
+/// 不一致（之后才登录 / 退出，或旧版写的）就重写一次。返回是否重写了。
+pub fn sync_codex_identity(ctx: &ApplyContext) -> anyhow::Result<bool> {
+    let gateway = ctx.gateway.load()?;
+    let Some(binding) = gateway
+        .binding(&ToolId::Codex)
+        .filter(|binding| binding.enabled)
+    else {
+        return Ok(false);
+    };
+    let settings = ctx.settings.load()?;
+    if settings.active_relay_id != CODEX_GATEWAY_RELAY_ID {
+        return Ok(false);
+    }
+    let keeps_login =
+        settings.active_relay_session_provider() == crate::settings::RelaySessionProvider::Openai;
+    if keeps_login == codex_signed_in(&ctx.codex_home) {
+        return Ok(false);
+    }
+    write_codex(ctx, &gateway, &binding.clone())?;
+    Ok(true)
 }
 
 /// 网关端口变了（例如 Windows 端口被占后换了新端口）：重写所有开着的 Agent 配置。

@@ -437,6 +437,82 @@ fn codex_with_externally_edited_config_connects_and_restores_it_byte_for_byte() 
     );
 }
 
+/// Codex 用 ChatGPT 账号登录着：接入网关后保留官方登录身份（内置 OpenAI 供应商 + 登录 token），
+/// 请求经本地代理（openai_base_url）转给网关；断开后回到原来的供应商。
+#[test]
+fn signed_in_codex_keeps_its_chatgpt_identity_through_the_gateway() {
+    let fixture = fixture(57397);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    let mut direct = codex_plus_core::provider_import::pool_relay_profile(
+        "直连",
+        "https://api.direct.test/v1",
+        "sk-direct",
+        RelayProtocol::Responses,
+        "gpt-direct",
+        "gpt-direct",
+        &[],
+    )
+    .unwrap();
+    direct.id = "direct".into();
+    direct.relay_mode = RelayMode::PureApi;
+    codex_plus_core::relay_config::normalize_relay_profile_for_storage(&mut direct).unwrap();
+    let mut seeded = BackendSettings::default();
+    seeded.relay_profiles_enabled = true;
+    seeded.relay_profiles = vec![direct];
+    seeded.active_relay_id = "direct".into();
+    codex_plus_core::relay_switch::switch_relay_profile_in_home(
+        &ctx.settings,
+        &ctx.codex_home,
+        seeded,
+        "",
+    )
+    .unwrap();
+    // Codex 自己登录着 ChatGPT。
+    std::fs::write(
+        ctx.codex_home.join("auth.json"),
+        r#"{"auth_mode":"chatgpt","tokens":{"id_token":"x","access_token":"at-codex","refresh_token":"rt","account_id":"acc"}}"#,
+    )
+    .unwrap();
+
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let config = std::fs::read_to_string(ctx.codex_home.join("config.toml")).unwrap();
+    assert!(config.contains("model_provider = \"openai\""), "{config}");
+    assert!(config.contains("openai_base_url"), "{config}");
+    assert!(
+        config.contains("http://127.0.0.1:57397/gw/codex/v1"),
+        "{config}"
+    );
+    let auth: Value =
+        serde_json::from_str(&std::fs::read_to_string(ctx.codex_home.join("auth.json")).unwrap())
+            .unwrap();
+    assert_eq!(auth["tokens"]["access_token"], "at-codex", "官方登录保留");
+    let settings = ctx.settings.load().unwrap();
+    assert_eq!(
+        settings.active_relay_session_provider(),
+        codex_plus_core::settings::RelaySessionProvider::Openai
+    );
+
+    // 身份已一致：启动时不重写。退出 ChatGPT 登录后：重写成普通的自定义供应商。
+    assert!(!codex_plus_core::gateway::apply::sync_codex_identity(ctx).unwrap());
+    std::fs::write(
+        ctx.codex_home.join("auth.json"),
+        r#"{"OPENAI_API_KEY":"sk-x"}"#,
+    )
+    .unwrap();
+    assert!(codex_plus_core::gateway::apply::sync_codex_identity(ctx).unwrap());
+    assert_eq!(
+        ctx.settings.load().unwrap().active_relay_session_provider(),
+        codex_plus_core::settings::RelaySessionProvider::Custom
+    );
+
+    let settings = ctx.settings.load().unwrap();
+    disable_binding(ctx, &settings, &ToolId::Codex).unwrap();
+    let config = std::fs::read_to_string(ctx.codex_home.join("config.toml")).unwrap();
+    assert!(!config.contains("/gw/codex"), "{config}");
+    assert_eq!(ctx.settings.load().unwrap().active_relay_id, "direct");
+}
+
 #[test]
 fn enabling_requires_a_pool_and_a_routable_model() {
     let fixture = fixture(57393);

@@ -139,6 +139,9 @@ test("旧版 Codex 供应商配置页顶部：没接入时建议改用新版网�
   assert.match(card, /const gatewayManaged = profile\.id === CODEX_GATEWAY_RELAY_ID;/);
   assert.match(card, /data-tone="gateway">\{t\("新版网关"\)\}/);
   assert.match(card, /\{gatewayManaged \? null : \(\s*<span className="relay-card-extra">/);
+  // 被网关接管时别的供应商不能直接选，要先断开并还原。
+  assert.match(card, /const lockedByGateway = !gatewayManaged && form\.activeRelayId === CODEX_GATEWAY_RELAY_ID;/);
+  assert.match(card, /disabled=\{disabled \|\| lockedByGateway\}/);
 });
 
 test("Skills 与 MCP 共用一张多 Agent 表：每个 Agent 一列勾选，不再有页面自己的配色和按钮尺寸", () => {

@@ -696,3 +696,13 @@
 .legacy-gateway-hint[data-state="connected"] .legacy-gateway-hint-icon {
   color: hsl(var(--status-success));
 }
+
+.legacy-gateway-hint-badge {
+  margin-left: 8px;
+  padding: 1px 6px;
+  border: 1px solid hsl(var(--status-success) / 0.4);
+  border-radius: 999px;
+  color: hsl(var(--status-success));
+  font-size: 11px;
+  font-weight: 500;
+}

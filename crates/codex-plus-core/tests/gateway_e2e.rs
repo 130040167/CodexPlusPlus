@@ -845,6 +845,91 @@ async fn gateway_end_to_end() {
         assert_eq!(body["tools"].as_array().unwrap().len(), 1);
     }
 
+    // —— 8d. Codex 以 ChatGPT 官方身份接入：请求带着 Codex 自己的登录先到本地代理（openai_base_url），
+    //        经托管的「Codex++ 网关」供应商转进网关，再按池路由 ——
+    let (codex_base, codex_seen) =
+        mock_upstream(vec![(200, "text/event-stream", chat_sse("经网关回答"))]).await;
+    gateway.providers = providers(vec![relay(
+        "glm",
+        &codex_base,
+        "sk-glm",
+        RelayProtocol::ChatCompletions,
+        "glm-5.3",
+    )]);
+    gateway
+        .bindings
+        .insert("codex".into(), binding("glm-5.3", "cpx-gw-codex-e2e"));
+    save(&gateway);
+    let managed = codex_plus_core::gateway::apply::codex_gateway_profile(
+        &gateway,
+        gateway
+            .binding(&codex_plus_core::tools::ToolId::Codex)
+            .unwrap(),
+        port,
+        true,
+    )
+    .unwrap();
+    let mut direct = codex_plus_core::settings::BackendSettings::default();
+    direct.relay_profiles_enabled = true;
+    direct.relay_profiles = vec![managed];
+    direct.active_relay_id = codex_plus_core::gateway::apply::CODEX_GATEWAY_RELAY_ID.into();
+    codex_plus_core::settings::SettingsStore::default()
+        .save(&direct)
+        .unwrap();
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .bearer_auth("chatgpt-access-token")
+        .header("chatgpt-account-id", "acc-codex")
+        .header("session-id", "codex-session-1")
+        .json(&json!({
+            "model": "glm-5.3",
+            "stream": true,
+            "instructions": "You are Codex.",
+            "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let text = response.text().await.unwrap();
+    assert!(text.contains("经网关回答"), "{text}");
+    assert!(text.contains("response.completed"), "{text}");
+    {
+        let seen = codex_seen.lock().unwrap();
+        let (head, body) = &seen[0];
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("authorization: bearer sk-glm"),
+            "{head}"
+        );
+        assert!(
+            !head.contains("chatgpt-access-token"),
+            "Codex 的登录凭据不外传给池里的供应商：{head}"
+        );
+        assert_eq!(body["model"], "glm-5.3");
+    }
+    // 本地代理这一跳不另记日志：只有网关那一条（带 agent）。
+    let mut codex_entries = Vec::new();
+    for _ in 0..50 {
+        codex_entries = codex_plus_core::request_log::read_request_logs(100)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| entry.thread_id.as_deref() == Some("codex-session-1"))
+            .collect::<Vec<_>>();
+        if !codex_entries.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let codex_entries = codex_plus_core::request_log::read_request_logs(100)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| entry.thread_id.as_deref() == Some("codex-session-1"))
+        .collect::<Vec<_>>();
+    assert_eq!(codex_entries.len(), 1, "{codex_entries:?}");
+    assert_eq!(codex_entries[0].agent.as_deref(), Some("codex"));
+
     // —— 9. 关闭绑定后返回 503，旧的 Codex 代理路径不受影响 ——
     gateway.bindings.get_mut("claude").unwrap().enabled = false;
     save(&gateway);

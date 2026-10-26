@@ -6440,6 +6440,11 @@ function codexGatewayModelCount(profile: RelayProfile | undefined): number {
   return (profile?.modelList ?? "").split("\n").filter((line) => line.trim()).length;
 }
 
+/** 托管的网关供应商带 openai 会话身份：Codex 保留 ChatGPT 官方登录，请求经本地代理进网关。 */
+function codexGatewayKeepsLogin(profile: RelayProfile | undefined): boolean {
+  return /^\s*model_provider\s*=\s*["']openai["']/m.test(profile?.configContents ?? "");
+}
+
 /**
  * 旧版 Codex 供应商配置页顶部的提示。
  * - Codex 正经网关接入：显示状态，可去管理或直接断开并还原；
@@ -6465,11 +6470,14 @@ function LegacyRelayGatewayHint({
       <div className="legacy-gateway-hint" data-state="connected" role="status">
         <Waypoints aria-hidden="true" className="legacy-gateway-hint-icon" />
         <div className="legacy-gateway-hint-text">
-          <strong>{t("Codex 当前经 Codex++ 网关（新版）")}</strong>
+          <strong>
+            {t("Codex 当前经 Codex++ 网关（新版）")}
+            {codexGatewayKeepsLogin(managed) ? <span className="legacy-gateway-hint-badge">{t("保留 ChatGPT 登录")}</span> : null}
+          </strong>
           <span>
             {count
-              ? tf("用网关供应商池里的 {0} 个模型。在下面选任一供应商即切回直连；「断开并还原」恢复接入前的配置。", [count])
-              : t("用网关供应商池里的模型。在下面选任一供应商即切回直连；「断开并还原」恢复接入前的配置。")}
+              ? tf("用网关供应商池里的 {0} 个模型。这里的供应商暂时不能选；要改用它们，先点「断开并还原」恢复接入前的配置。", [count])
+              : t("用网关供应商池里的模型。这里的供应商暂时不能选；要改用它们，先点「断开并还原」恢复接入前的配置。")}
           </span>
         </div>
         <Button onClick={onManageAgents} size="sm" variant="secondary">
@@ -10150,6 +10158,8 @@ function SortableRelayProfileCard({
   const active = profile.id === form.activeRelayId;
   // 网关托管的供应商：由「Agent 接入」管理，这里只能「使用」（重新接入）。
   const gatewayManaged = profile.id === CODEX_GATEWAY_RELAY_ID;
+  // Codex 正被网关接管：别的供应商不能直接选，要先在上方「断开并还原」。
+  const lockedByGateway = !gatewayManaged && form.activeRelayId === CODEX_GATEWAY_RELAY_ID;
   const style: CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
@@ -10186,7 +10196,10 @@ function SortableRelayProfileCard({
         <strong>
           <span className="relay-summary-name">{profile.name || t("未命名供应商")}</span>
           {gatewayManaged ? (
-            <span className="relay-tag" data-tone="gateway">{t("新版网关")}</span>
+            <>
+              <span className="relay-tag" data-tone="gateway">{t("新版网关")}</span>
+              {codexGatewayKeepsLogin(profile) ? <span className="relay-tag" data-tone="official">{t("ChatGPT 登录")}</span> : null}
+            </>
           ) : (
             <span className="relay-tag" data-tone={relayProfileTagTone(profile)}>{relayProfileModeLabel(profile)}</span>
           )}
@@ -10210,16 +10223,18 @@ function SortableRelayProfileCard({
       <span className="relay-card-actions">
         <Button
           className={`relay-use-button ${active ? "active" : ""}`}
-          disabled={disabled}
+          disabled={disabled || lockedByGateway}
           onClick={(event) => {
             event.stopPropagation();
-            if (disabled) return;
+            if (disabled || lockedByGateway) return;
             onSwitchProfile(profile.id);
           }}
           size="sm"
           title={
             disabled
               ? t("供应商切换中")
+              : lockedByGateway
+                ? t("Codex 正由 Codex++ 网关接管：先在上方点「断开并还原」再切换")
               : !form.relayProfilesEnabled
                 ? t("供应商配置总开关已关闭，点击后按提示开启")
                 : active

@@ -2478,6 +2478,9 @@ pub(crate) struct ProxyRequestLog {
     started: std::time::Instant,
     pub(crate) entry: crate::request_log::RequestLogEntry,
     written: bool,
+    /// 不进请求日志：Codex 以官方身份接入网关时，本地代理这一跳只是转给网关，
+    /// 网关那一跳会记一条带 Agent 与路由的，这里不重复记。
+    silent: bool,
 }
 
 impl ProxyRequestLog {
@@ -2486,6 +2489,16 @@ impl ProxyRequestLog {
         path: &str,
         request: Option<&Value>,
         thread_id: Option<String>,
+    ) -> Self {
+        Self::begin_with(method, path, request, thread_id, false)
+    }
+
+    pub(crate) fn begin_with(
+        method: &str,
+        path: &str,
+        request: Option<&Value>,
+        thread_id: Option<String>,
+        silent: bool,
     ) -> Self {
         let started_at_ms = current_time_ms();
         let model = request
@@ -2526,14 +2539,17 @@ impl ProxyRequestLog {
                 agent: None,
             },
             written: false,
+            silent,
         };
-        crate::request_log::start_request(&log.entry);
+        if !silent {
+            crate::request_log::start_request(&log.entry);
+        }
         log
     }
 
     pub(crate) fn set_agent(&mut self, agent: &crate::tools::ToolId) {
         self.entry.agent = Some(agent.as_str().to_string());
-        crate::request_log::update_running(&self.entry);
+        self.update_running();
     }
 
     /// 网关自己写出响应（不经 `UpstreamProxyResponse`）时记录路由痕迹。
@@ -2558,7 +2574,7 @@ impl ProxyRequestLog {
             self.entry.first_token_ms =
                 Some(first_output_at_ms.saturating_sub(self.entry.started_at_ms));
         }
-        crate::request_log::update_running(&self.entry);
+        self.update_running();
     }
 
     pub(crate) fn record_upstream(&mut self, upstream: &crate::protocol_proxy::UpstreamProxyResponse) {
@@ -2579,7 +2595,7 @@ impl ProxyRequestLog {
                     Some(first_output_at_ms.saturating_sub(self.entry.started_at_ms));
             }
         }
-        crate::request_log::update_running(&self.entry);
+        self.update_running();
     }
 
     pub(crate) fn record_error(&mut self, status: &str, error: String) {
@@ -2628,12 +2644,18 @@ impl ProxyRequestLog {
             self.entry.first_token_ms =
                 Some(first_output_at_ms.saturating_sub(self.entry.started_at_ms));
             self.entry.phase = Some("generating".to_string());
+            self.update_running();
+        }
+    }
+
+    fn update_running(&self) {
+        if !self.silent {
             crate::request_log::update_running(&self.entry);
         }
     }
 
     fn write(&mut self) {
-        if self.written {
+        if self.written || self.silent {
             return;
         }
         self.written = true;
@@ -2686,8 +2708,15 @@ pub(crate) async fn handle_protocol_proxy_connection(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let mut request_log =
-        ProxyRequestLog::begin(method, path, request_json.as_ref(), request_thread_id);
+    let quiet = matches!(opener, ProxyOpener::Legacy)
+        && crate::gateway::apply::codex_hops_through_gateway();
+    let mut request_log = ProxyRequestLog::begin_with(
+        method,
+        path,
+        request_json.as_ref(),
+        request_thread_id,
+        quiet,
+    );
     let live_request_id = request_log.entry.id.clone();
     // 经网关的非 Codex 客户端（Grok 等）不认识 ChatGPT 订阅后端的私有事件。
     let foreign_client =
