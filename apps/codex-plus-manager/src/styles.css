@@ -12830,3 +12830,217 @@ button.side-item:hover {
 .shell .gw-sheet-search {
   height: 28px;
 }
+
+/* ── 设置类页面（增强、设置）：左侧分类目录 + 右侧限宽列表 ─────────────────────
+   开关紧挨说明文字，不再隔着一千多像素的整行；目录随页面滚动固定在左侧，并高亮当前分组。 */
+.shell .sectioned-page {
+  display: grid;
+  grid-template-columns: 172px minmax(0, 880px);
+  gap: 28px;
+  align-items: start;
+  justify-content: start;
+}
+.shell .sectioned-body {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+.shell .sectioned-body :is(.panel, .feature-group) {
+  scroll-margin-top: 8px;
+}
+.shell .page-section-nav {
+  position: sticky;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.shell .page-section-nav-list,
+.shell .page-section-nav .enhance-tabs {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 0;
+  border: 0;
+}
+.shell .page-section-nav .enhance-tabs + .page-section-nav-list {
+  padding: 8px 0 0 10px;
+  border-top: 1px solid hsl(var(--border));
+}
+.shell .page-section-nav button {
+  position: relative;
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: hsl(var(--muted-foreground));
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.shell .page-section-nav button:hover {
+  background: hsl(var(--accent) / 0.5);
+  color: hsl(var(--foreground));
+}
+.shell .page-section-nav .enhance-tabs button {
+  color: hsl(var(--foreground));
+  font-weight: 500;
+}
+.shell .page-section-nav :is(button[aria-selected="true"], button[aria-current="true"]) {
+  background: hsl(var(--accent));
+  color: hsl(var(--foreground));
+  font-weight: 550;
+}
+.shell .page-section-nav .enhance-tabs button[aria-selected="true"]::after {
+  display: none;
+}
+.shell .page-section-nav .page-section-nav-list button[aria-current="true"]::before {
+  content: "";
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 0;
+  width: 2px;
+  border-radius: 2px;
+  background: hsl(var(--brand-accent));
+}
+
+/* 增强页总开关：一条细横幅 */
+.shell .enhance-master-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 10px;
+  background: hsl(var(--card));
+}
+.shell .enhance-master-switch {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  cursor: pointer;
+}
+.shell .enhance-master-switch > input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.shell .enhance-master-switch > span:last-child {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.shell .enhance-master-switch strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+.shell .enhance-master-switch small {
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+}
+.shell .enhance-master-switch > input:checked + .toggle-switch-visual {
+  border-color: hsl(var(--primary));
+  background: hsl(var(--primary));
+}
+.shell .enhance-master-switch > input:checked + .toggle-switch-visual .toggle-switch-thumb {
+  transform: translateX(14px);
+}
+.shell .enhance-master-switch > input:focus-visible + .toggle-switch-visual {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}
+.shell .enhance-page .enhance-save-actions {
+  flex: none;
+  margin: 0;
+}
+
+/* 增强页分组：去掉卡片底，分组标题 + 一列开关行 */
+.shell .enhance-page .enhance-tab-panel .panel.enhance-panel {
+  border: 0;
+  background: transparent;
+}
+.shell .enhance-page .enhance-content {
+  padding: 0;
+}
+.shell .enhance-page .enhance-feature-groups {
+  gap: 18px;
+}
+.shell .enhance-page .enhance-feature-groups .feature-group {
+  gap: 0;
+  padding: 0;
+  border: 1px solid hsl(var(--border));
+  border-radius: 10px;
+  background: hsl(var(--card));
+  overflow: hidden;
+}
+.shell .enhance-page .enhance-feature-groups .feature-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid hsl(var(--border));
+  background: hsl(var(--muted) / 0.4);
+}
+.shell .enhance-page .feature-switch-grid {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+}
+.shell .enhance-page .feature-switch-grid > :is(.feature-toggle, .settings-block) {
+  margin: 0;
+  padding: 10px 14px;
+  border: 0;
+  border-radius: 0;
+  border-bottom: 1px solid hsl(var(--border) / 0.7);
+  background: transparent;
+  box-shadow: none;
+}
+.shell .enhance-page .feature-switch-grid > :last-child {
+  border-bottom: 0;
+}
+.shell .enhance-page .feature-switch-grid > .feature-toggle:hover {
+  background: hsl(var(--accent) / 0.35);
+}
+
+/* 开关标题旁的小标签：实验 / 需重启 */
+.shell .feature-tag {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+  padding: 0 5px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 4px;
+  color: hsl(var(--muted-foreground));
+  font-size: 10.5px;
+  font-style: normal;
+  font-weight: 500;
+  line-height: 16px;
+  vertical-align: 1px;
+}
+.shell .feature-tag[data-tone="experimental"] {
+  border-color: hsl(var(--status-warning) / 0.4);
+  color: hsl(var(--status-warning));
+}
+
+@media (max-width: 900px) {
+  .shell .sectioned-page {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 14px;
+  }
+  .shell .page-section-nav {
+    position: static;
+  }
+  .shell .page-section-nav-list,
+  .shell .page-section-nav .enhance-tabs {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+}

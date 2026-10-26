@@ -7702,54 +7702,62 @@ function EnhanceScreen({
     onTabChange(tab);
     document.getElementById("enhance-page-controls")?.scrollIntoView({ block: "start" });
   };
+  // 「常用增强」页里的分组，显示在左侧目录的页签下面，点了滚到对应分组。
+  const generalSections = [
+    { id: "enhance-group-plugins", label: t("插件与模型") },
+    { id: "enhance-group-chat", label: t("对话与输入") },
+    { id: "enhance-group-pet", label: t("桌宠与活动") },
+    { id: "enhance-group-standalone", label: t("独立模式") },
+  ];
   return (
-    <div className="settings-page enhance-page">
-      <div className="enhance-page-controls" id="enhance-page-controls">
-        <div className="enhance-page-toolbar">
-          <label className="switch-row compact enhance-master-switch">
-            <input
-              checked={form.enhancementsEnabled}
-              onChange={(event) => onFormChange({ ...form, enhancementsEnabled: event.currentTarget.checked })}
-              type="checkbox"
-            />
-            <span>
-              <strong>{t("启用 Codex增强")}</strong>
-              <small>{t("关闭后暂停增强功能，服务配置会保留。")}</small>
-            </span>
-            <ToggleVisual />
-          </label>
+    <div className="settings-page enhance-page sectioned-page">
+      <PageSectionNav label={t("增强分类")} sections={activeTab === "general" ? generalSections : []}>
+        <div className="enhance-tabs" role="tablist" aria-label={t("Codex增强")} aria-orientation="vertical">
+          {tabs.map((tab, index) => (
+            <button
+              key={tab.value}
+              id={`enhance-tab-${tab.value}`}
+              type="button"
+              role="tab"
+              aria-selected={activeTab === tab.value}
+              aria-controls={`enhance-pane-${tab.value}`}
+              tabIndex={activeTab === tab.value ? 0 : -1}
+              onClick={() => selectTab(tab.value)}
+              onKeyDown={(event) => {
+                const forward = event.key === "ArrowRight" || event.key === "ArrowDown";
+                const backward = event.key === "ArrowLeft" || event.key === "ArrowUp";
+                const nextIndex = forward ? (index + 1) % tabs.length
+                  : backward ? (index + tabs.length - 1) % tabs.length
+                    : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : null;
+                if (nextIndex === null) return;
+                event.preventDefault();
+                const nextTab = tabs[nextIndex].value;
+                selectTab(nextTab);
+                document.getElementById(`enhance-tab-${nextTab}`)?.focus();
+              }}
+            >
+              {tab.label}
+            </button>
+          ))}
         </div>
-        {/* 开关独占一行靠右；保存状态移到分页栏右侧。 */}
-        <div className="enhance-tabs-row">
-          <div className="enhance-tabs" role="tablist" aria-label={t("Codex增强")}>
-            {tabs.map((tab, index) => (
-              <button
-                key={tab.value}
-                id={`enhance-tab-${tab.value}`}
-                type="button"
-                role="tab"
-                aria-selected={activeTab === tab.value}
-                aria-controls={`enhance-pane-${tab.value}`}
-                tabIndex={activeTab === tab.value ? 0 : -1}
-                onClick={() => selectTab(tab.value)}
-                onKeyDown={(event) => {
-                  const nextIndex = event.key === "ArrowRight" ? (index + 1) % tabs.length
-                    : event.key === "ArrowLeft" ? (index + tabs.length - 1) % tabs.length
-                      : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : null;
-                  if (nextIndex === null) return;
-                  event.preventDefault();
-                  const nextTab = tabs[nextIndex].value;
-                  selectTab(nextTab);
-                  document.getElementById(`enhance-tab-${nextTab}`)?.focus();
-                }}
-              >
-                {tab.label}
-              </button>
-            ))}
-          </div>
-          <div className="enhance-save-actions">
-            <AutoSaveStatus state={autoSave} />
-          </div>
+      </PageSectionNav>
+      <div className="sectioned-body">
+      {/* 总开关一条细横幅，开关紧挨着说明；保存状态在横幅右侧。 */}
+      <div className="enhance-master-bar" id="enhance-page-controls">
+        <label className="enhance-master-switch">
+          <input
+            checked={form.enhancementsEnabled}
+            onChange={(event) => onFormChange({ ...form, enhancementsEnabled: event.currentTarget.checked })}
+            type="checkbox"
+          />
+          <ToggleVisual />
+          <span>
+            <strong>{t("启用 Codex增强")}</strong>
+            <small>{t("关闭后暂停增强功能，服务配置会保留。")}</small>
+          </span>
+        </label>
+        <div className="enhance-save-actions">
+          <AutoSaveStatus state={autoSave} />
         </div>
       </div>
       <div className="enhance-tab-panel" id="enhance-pane-general" role="tabpanel" aria-labelledby="enhance-tab-general" hidden={activeTab !== "general"}>
@@ -7760,7 +7768,7 @@ function EnhanceScreen({
               {masterEnabled ? null : (
                 <StandaloneModeGroup form={form} onFormChange={onFormChange} masterEnabled={masterEnabled} />
               )}
-              <FeatureGroup title={t("插件与模型")} detail={t("管理插件市场、模型列表和服务档位相关增强。")}>
+              <FeatureGroup id="enhance-group-plugins" title={t("插件与模型")} detail={t("管理插件市场、模型列表和服务档位相关增强。")}>
                 {isWindowsPlatform ? <>
                   <FeatureToggle
                     title={t("原生 Edge / Chrome 请求标识兼容（实验）")}
@@ -7778,7 +7786,7 @@ function EnhanceScreen({
                 <FeatureToggle title={t("模型白名单解锁")} detail={t("从环境变量和 config.toml 的 /v1/models 拉取模型并补进模型列表。")} checked={form.codexAppModelWhitelistUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppModelWhitelistUnlock", value)} />
                 <FeatureToggle title={t("原生 Fast 强制解锁")} detail={t("纯 API Key 模式恢复原生 Fast 开关；重新启动 Codex 后生效，实际支持与计费由供应商决定。")} checked={form.codexAppNativeFastUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppNativeFastUnlock", value)} />
               </FeatureGroup>
-              <FeatureGroup title={t("对话与输入")} detail={t("调整会话管理、输入行为和对话阅读体验。")}>
+              <FeatureGroup id="enhance-group-chat" title={t("对话与输入")} detail={t("调整会话管理、输入行为和对话阅读体验。")}>
                 <FeatureToggle title={t("会话删除")} detail={t("在会话列表悬停显示删除按钮，并支持撤销。")} checked={form.codexAppSessionDelete} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppSessionDelete", value)} />
                 <FeatureToggle title={t("旁支保存")} detail={t("在本地 Side Chat 标签页显示「保存」。回复结束后可保存为普通会话，包含创建旁支时的主历史。建议开启后新建旁支。")} checked={form.codexAppSideChatSave} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppSideChatSave", value)} />
                 <FeatureToggle title={t("轮次回退（实验性）")} detail={t("在回答菜单中撤销本轮及后续轮次的可恢复操作，AI 报告全部完成后才截断会话。仅支持本地聊天；恢复记录保存在本机，不是系统快照。")} checked={form.codexAppTurnRewind} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppTurnRewind", value)} />
@@ -7810,7 +7818,7 @@ function EnhanceScreen({
                 <FeatureToggle title={t("切换对话保留位置")} detail={t("切换 thread 时恢复上一次浏览位置。")} checked={form.codexAppThreadScrollRestore} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppThreadScrollRestore", value)} />
                 <FeatureToggle title={t("用量状态栏")} detail={t("在输入框下方显示生成速度、缓存命中率和上下文占用。数据来自本机 Codex 会话记录，不改变请求内容。")} checked={form.codexAppUsageStatusLine} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppUsageStatusLine", value)} />
               </FeatureGroup>
-              <FeatureGroup title={t("桌宠与活动")} detail={t("调整 Codex 原生桌宠与活动进度条。可点按的 Agent 桌宠在「工具 → Agent 桌宠」里设置。")}>
+              <FeatureGroup id="enhance-group-pet" title={t("桌宠与活动")} detail={t("调整 Codex 原生桌宠与活动进度条。可点按的 Agent 桌宠在「工具 → Agent 桌宠」里设置。")}>
                 <FeatureToggle title={t("活动进度条右侧布局")} detail={t("把 Codex 原生活动进度条、状态波形和活动悬浮框移到右侧，并镜像波形方向。")} checked={form.codexAppActivityOverlayRight} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppActivityOverlayRight", value)} />
                 {supportsPetRealMouseLook ? <FeatureToggle title={t("桌宠跟随真实鼠标")} detail={t("仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。")} checked={form.codexAppPetRealMouseLook} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppPetRealMouseLook", value)} /> : null}
               </FeatureGroup>
@@ -7831,6 +7839,7 @@ function EnhanceScreen({
       <div className="enhance-tab-panel" id="enhance-pane-stepwise" role="tabpanel" aria-labelledby="enhance-tab-stepwise" hidden={activeTab !== "stepwise"}>
         <StepwiseSettingsPanel form={form} onFormChange={onFormChange} actions={actions} />
       </div>
+      </div>
     </div>
   );
 }
@@ -7847,7 +7856,7 @@ function StandaloneModeGroup({
   masterEnabled: boolean;
 }) {
   return (
-    <FeatureGroup title={t("独立模式")} detail={t("增强总开关关闭后仍会生效的补丁。")}>
+    <FeatureGroup id="enhance-group-standalone" title={t("独立模式")} detail={t("增强总开关关闭后仍会生效的补丁。")}>
       <FeatureToggle
         title={t("官方额度解锁")}
         detail={masterEnabled
@@ -13639,9 +13648,55 @@ function FeatureItem({ title, detail, enabled }: { title: string; detail: string
   );
 }
 
-function FeatureGroup({ title, detail, children }: { title: string; detail: string; children: ReactNode }) {
+/**
+ * 设置类页面（增强、设置）左侧的分类目录：点一下滚到对应分组，滚动时高亮当前所在的分组。
+ * `children` 放在目录最上面（增强页把「常用增强 / 语音输入 / 下一步建议」页签放在这里）。
+ */
+function PageSectionNav({ label, sections, children }: { label: string; sections: Array<{ id: string; label: string }>; children?: ReactNode }) {
+  const [current, setCurrent] = useState(sections[0]?.id ?? "");
+  const sectionKey = sections.map((section) => section.id).join("|");
+  useEffect(() => {
+    const nodes = sections.map((section) => document.getElementById(section.id)).filter((node): node is HTMLElement => Boolean(node));
+    if (!nodes.length) return;
+    const scroller = nodes[0].closest(".screen");
+    const sync = () => {
+      const line = (scroller?.getBoundingClientRect().top ?? 0) + 96;
+      let active = nodes[0].id;
+      for (const node of nodes) if (node.getBoundingClientRect().top <= line) active = node.id;
+      setCurrent(active);
+    };
+    sync();
+    scroller?.addEventListener("scroll", sync, { passive: true });
+    return () => scroller?.removeEventListener("scroll", sync);
+    // sections 每次渲染都是新数组，按 id 列表判断是否变化。
+  }, [sectionKey]);
   return (
-    <section className="feature-group">
+    <nav aria-label={label} className="page-section-nav">
+      {children}
+      {sections.length ? (
+        <div className="page-section-nav-list">
+          {sections.map((section) => (
+            <button
+              aria-current={current === section.id ? "true" : undefined}
+              key={section.id}
+              onClick={() => {
+                setCurrent(section.id);
+                document.getElementById(section.id)?.scrollIntoView({ block: "start", behavior: "smooth" });
+              }}
+              type="button"
+            >
+              {section.label}
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </nav>
+  );
+}
+
+function FeatureGroup({ title, detail, children, id }: { title: string; detail: string; children: ReactNode; id?: string }) {
+  return (
+    <section className="feature-group" id={id}>
       <div className="feature-group-head">
         <strong>{title}</strong>
         <small>{detail}</small>
@@ -13664,6 +13719,9 @@ function FeatureToggle({
   disabled?: boolean;
   onChange: (value: boolean) => void;
 }) {
+  // 「（实验）」从标题里拿出来做成小标签；说明里写了要重启 Codex 的，标题旁加「需重启」。
+  const experimental = EXPERIMENTAL_TITLE.test(title);
+  const needsRestart = RESTART_HINT.test(detail);
   return (
     <label className={`feature-toggle ${disabled ? "disabled" : ""}`}>
       <input
@@ -13673,13 +13731,20 @@ function FeatureToggle({
         type="checkbox"
       />
       <span>
-        <strong>{title}</strong>
+        <strong>
+          {experimental ? title.replace(EXPERIMENTAL_TITLE, "") : title}
+          {experimental ? <em className="feature-tag" data-tone="experimental">{t("实验")}</em> : null}
+          {needsRestart ? <em className="feature-tag">{t("需重启")}</em> : null}
+        </strong>
         <small>{detail}</small>
       </span>
       <ToggleVisual />
     </label>
   );
 }
+
+const EXPERIMENTAL_TITLE = /\s*(?:（实验性?）|\(experimental\))$/i;
+const RESTART_HINT = /重启 ?Codex|重新启动 ?Codex|下次启动 ?Codex|restart(?:ing)? Codex|relaunch/i;
 
 function ToggleVisual() {
   return (
@@ -14113,9 +14178,9 @@ function TaskProgressBox({ progress, title, completedTitle = t("上次修复结�
   );
 }
 
-function Panel({ children, fill = false, className = "" }: { children: React.ReactNode; fill?: boolean; className?: string }) {
+function Panel({ children, fill = false, className = "", id }: { children: React.ReactNode; fill?: boolean; className?: string; id?: string }) {
   return (
-    <Card className={`panel ${fill ? "fill" : ""} ${className}`}>
+    <Card className={`panel ${fill ? "fill" : ""} ${className}`} id={id}>
       {children}
     </Card>
   );
