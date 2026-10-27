@@ -120,7 +120,7 @@ import { GatewayPage, type GatewayTab } from "./GatewayPage";
 import { AgentGlyph, HubOverview, useGatewayPayload } from "./HubOverview";
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
 import { SessionsView } from "./GatewaySessions";
-import { agentName, maskAccountName } from "./gateway-model";
+import { agentName, maskAccountName, type GatewayResult } from "./gateway-model";
 import { SessionAgentTabs, type SessionTab } from "./SessionAgentTabs";
 import { noticeDuration, noticeTone } from "./notice-model";
 import { agentTabGroups, agentTarget } from "./page-groups";
@@ -6492,6 +6492,8 @@ function codexGatewayKeepsLogin(profile: RelayProfile | undefined): boolean {
 
 /**
  * 旧版 Codex 供应商配置页顶部的提示。
+ * - Codex 还指向托管供应商、网关里却没有它的接入记录（降级后又升级、gateway.json 换过或坏了）：
+ *   给「切回直连」，否则页面一直显示「被网关接管」却断不开；
  * - Codex 正经网关接入：显示状态，可去管理或直接断开并还原；
  * - 断开过但托管供应商还在：提示点它的「使用」即可重新接入；
  * - 其余：建议改用新版网关的供应商池（这里的配置照旧生效）。
@@ -6509,7 +6511,42 @@ function LegacyRelayGatewayHint({
 }) {
   const [disconnecting, setDisconnecting] = useState(false);
   const managed = form.relayProfiles.find((profile) => profile.id === CODEX_GATEWAY_RELAY_ID);
-  if (managed && form.activeRelayId === CODEX_GATEWAY_RELAY_ID) {
+  const onGateway = form.activeRelayId === CODEX_GATEWAY_RELAY_ID;
+  // 网关里有没有开着的 Codex 接入记录；读不出 gateway.json 也算没有。
+  const [bound, setBound] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!onGateway) return;
+    let cancelled = false;
+    invoke<GatewayResult>("load_gateway")
+      .then((result) => {
+        if (!cancelled) setBound(result.status === "ok" && result.gateway?.bindings?.codex?.enabled === true);
+      })
+      .catch(() => {
+        if (!cancelled) setBound(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [onGateway, form.relayProfiles]);
+  const disconnect = () => {
+    setDisconnecting(true);
+    void onDisconnect().finally(() => setDisconnecting(false));
+  };
+  if (onGateway && (!managed || bound === false)) {
+    return (
+      <div className="legacy-gateway-hint" data-state="orphan" role="status">
+        <Waypoints aria-hidden="true" className="legacy-gateway-hint-icon" />
+        <div className="legacy-gateway-hint-text">
+          <strong>{t("Codex 还指向网关托管的供应商")}</strong>
+          <span>{t("网关里没有 Codex 的接入记录（可能降级后又升级过，或网关状态文件损坏），请求可能连不上。点「切回直连」切回接入前或列表里第一个直连供应商。")}</span>
+        </div>
+        <Button disabled={disconnecting} onClick={disconnect} size="sm">
+          {disconnecting ? t("切换中…") : t("切回直连")}
+        </Button>
+      </div>
+    );
+  }
+  if (managed && onGateway) {
     const count = codexGatewayModelCount(managed);
     return (
       <div className="legacy-gateway-hint" data-state="connected" role="status">
@@ -6529,15 +6566,7 @@ function LegacyRelayGatewayHint({
           {t("管理接入")}
           <ArrowRight aria-hidden="true" className="h-3.5 w-3.5" />
         </Button>
-        <Button
-          disabled={disconnecting}
-          onClick={() => {
-            setDisconnecting(true);
-            void onDisconnect().finally(() => setDisconnecting(false));
-          }}
-          size="sm"
-          variant="outline"
-        >
+        <Button disabled={disconnecting} onClick={disconnect} size="sm" variant="outline">
           {disconnecting ? t("断开中…") : t("断开并还原")}
         </Button>
       </div>
@@ -6930,7 +6959,7 @@ function RelayScreen({
           {/* Codex 被新版网关接管：旧版列表整块隐藏，断开并还原后恢复（状态与断开按钮在页面顶部）。 */}
           {normalized.relayProfilesEnabled && takenOverByGateway ? (
             <p className="relay-switch-off-note" role="status">
-              {t("Codex 正由 Codex++ 网关接管，旧版供应商列表已隐藏。点上方「断开并还原」后恢复。")}
+              {t("Codex 正由 Codex++ 网关接管，旧版供应商列表已隐藏。点上方「断开并还原」（或「切回直连」）后恢复。")}
             </p>
           ) : null}
           {/* 总开关关闭时供应商切换不会写入 Codex：分页和列表都没有意义，整块隐藏，只留上方提示条。 */}
