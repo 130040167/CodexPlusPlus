@@ -2409,7 +2409,7 @@ export const EN_TEMPLATE: Record<string, string> = {
   "在 {0} 里": "In {0}",
   "在 {0} 的模型列表里选任何一个模型。": "Pick any model in {0}'s model list.",
   "{0} 自带的默认值": "{0}'s own default",
-  "还原 {0} 接入 Codex++ 之前的设置": "Restore {0}'s settings from before Codex++",
+  "断开 Codex++，还原 {0} 接入之前的设置": "Disconnect Codex++ and restore {0}'s earlier settings",
   "{0} 参与调度": "Dispatch to {0}",
   "{0} 个 Key 轮换": "{0} keys rotating",
   "添加 {0}": "Add {0}",

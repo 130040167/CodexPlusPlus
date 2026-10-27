@@ -2,7 +2,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { appConfirm } from "./app-dialog";
-import { Check, ChevronDown, ChevronRight, ChevronUp, Layers, List, Search, Star, Unplug, Waypoints, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, ChevronUp, Layers, List, Search, Star, Waypoints, X } from "lucide-react";
 import { t, tf } from "./i18n";
 import {
   agentModels,
@@ -637,17 +637,18 @@ function ModelPicker({
   const selectedModel = connected || draft.model ? draft.model.trim() || agentModels(payload, draft.poolExclude)[0] || "" : "";
   const head = (
     <>
-      <button className="gw-mp-action" data-active={!connected} onClick={onDisconnect} title={tf("{0} 自带的默认值", [agent.name])} type="button">
+      {/* 用默认 = 断开网关并还原接入前的配置，只放这一个入口。 */}
+      <button
+        className="gw-mp-action"
+        data-active={!connected}
+        onClick={onDisconnect}
+        title={connected ? tf("断开 Codex++，还原 {0} 接入之前的设置", [agent.name]) : tf("{0} 自带的默认值", [agent.name])}
+        type="button"
+      >
         <AgentIcon agent={agent.agent} className="gw-popover-agent" />
         {t("用默认（不经 Codex++）")}
         {!connected ? <Check className="h-3.5 w-3.5" /> : null}
       </button>
-      {connected ? (
-        <button className="gw-mp-action" onClick={onDisconnect} title={tf("还原 {0} 接入 Codex++ 之前的设置", [agent.name])} type="button">
-          <Unplug className="h-3.5 w-3.5" />
-          {t("断开并还原配置")}
-        </button>
-      ) : null}
     </>
   );
   return (
