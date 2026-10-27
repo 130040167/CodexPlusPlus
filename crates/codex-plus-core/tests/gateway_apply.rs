@@ -488,6 +488,13 @@ fn codex_gateway_catalog_carries_display_names_reasoning_and_provider_groups() {
     let pro = model("deepseek-v4-pro");
     assert_eq!(pro["codex_plus_group"], "DeepSeek");
     assert_eq!(pro["display_name"], "DeepSeek-V4-Pro");
+    // 两家都有的模型，第二家名下也列一份（带供应商前缀），Codex 里每家的分组都完整。
+    let second = model(&format!(
+        "{}/deepseek-v4-pro",
+        profile_id_of(ctx, "ChatGPT Pro · 2649340134@qq.com")
+    ));
+    assert_eq!(second["display_name"], "DeepSeek-V4-Pro");
+    assert_eq!(second["codex_plus_group"], "ChatGPT Pro · 26****34@qq.com");
     let group = model("group/daily");
     assert_eq!(group["display_name"], "Daily");
     assert_eq!(group["codex_plus_group"], "模型组");

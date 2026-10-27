@@ -168,11 +168,13 @@ fn agent_gateway_profile(
     let default_model = binding_default_model(gateway, binding);
     let window = binding.context_window;
     let mut models = vec![default_model.clone()];
-    // 池里所有能用的模型和路由组都进 Grok 的模型列表。
-    for model in route::pool_models(gateway, binding)
-        .into_iter()
-        .chain(binding.declared_models())
-    {
+    // 池里所有能用的模型和模型组都进 Agent 的模型列表；Codex 按供应商分组显示，多家都有的模型每家各列一份。
+    let pool = if *agent == ToolId::Codex {
+        route::codex_pool_models(gateway, binding)
+    } else {
+        route::pool_models(gateway, binding)
+    };
+    for model in pool.into_iter().chain(binding.declared_models()) {
         if !models.contains(&model) {
             models.push(model);
         }
@@ -331,6 +333,7 @@ const CODEX_GROUPS_GROUP_ID: &str = "codex-plus-gateway-groups";
 
 /// Codex 模型目录里每个模型的元数据（显示名、推理档位、按供应商分组），与直连模式的按模型聚合一致：
 /// 裸模型名取池里第一个提供它的供应商（网关也先发给它）的成员目录，分组是那个供应商；
+/// 多家都有的模型，后面几家以 `<供应商 id>/<模型>` 各列一份，归在各自名下（见 [`route::codex_pool_models`]）；
 /// `group/<id>` 显示组名，单独归在「模型组」一组。没有可写的条目时返回空串。
 ///
 /// 写进托管供应商的 `model_metadata`：生成 `model_catalog_json` 时覆盖进目录，
@@ -339,7 +342,7 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
     let relays = route::binding_pool_relays(gateway, binding);
     let mut member_catalogs: Vec<Option<Vec<Value>>> = vec![None; relays.len()];
     let mut metadata = Map::new();
-    for model in route::pool_models(gateway, binding) {
+    for model in route::codex_pool_models(gateway, binding) {
         if let Some(id) = model.strip_prefix(GROUP_MODEL_PREFIX) {
             let Some(group) = gateway.group(id) else {
                 continue;
@@ -361,11 +364,8 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
             metadata.insert(model, Value::Object(fields));
             continue;
         }
-        let Some(index) = relays.iter().position(|relay| {
-            route::relay_models(relay)
-                .iter()
-                .any(|candidate| candidate.eq_ignore_ascii_case(&model))
-        }) else {
+        // 多家都有的模型，后面几家以 `<供应商 id>/<模型>` 列出：元数据取那一家的，分组也是那一家。
+        let Some((index, upstream)) = route::codex_model_owner(&relays, &model) else {
             continue;
         };
         let relay = relays[index];
@@ -378,7 +378,7 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
         let Some(entry) = catalog.iter().find(|entry| {
             entry["slug"]
                 .as_str()
-                .is_some_and(|slug| slug.eq_ignore_ascii_case(&model))
+                .is_some_and(|slug| slug.eq_ignore_ascii_case(&upstream))
         }) else {
             continue;
         };
@@ -387,9 +387,9 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
         let display = fields
             .get("display_name")
             .and_then(Value::as_str)
-            .filter(|name| !name.eq_ignore_ascii_case(&model))
+            .filter(|name| !name.eq_ignore_ascii_case(&upstream))
             .map(str::to_string)
-            .unwrap_or_else(|| pretty_model_name(&model));
+            .unwrap_or_else(|| pretty_model_name(&upstream));
         // 分组名和描述会显示在 Codex 的模型选择器里：账号名要打码。
         let group = if relay.name.trim().is_empty() {
             relay.id.clone()
@@ -397,7 +397,7 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
             crate::gateway::accounts::mask_account_name(relay.name.trim())
         };
         fields.insert("display_name".into(), json!(display));
-        fields.insert("description".into(), json!(format!("{model} · {group}")));
+        fields.insert("description".into(), json!(format!("{upstream} · {group}")));
         fields.insert("codex_plus_group".into(), json!(group));
         fields.insert("codex_plus_group_id".into(), json!(relay.id));
         metadata.insert(model, Value::Object(fields));

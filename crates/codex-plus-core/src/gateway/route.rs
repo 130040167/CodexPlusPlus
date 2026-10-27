@@ -111,6 +111,51 @@ pub fn pool_models(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<Str
     models
 }
 
+/// Codex 的模型列表：每家供应商的模型都列在它自己名下，Codex 选择器里按供应商分组时每组都完整。
+/// 同一个模型多家都有时，第一家用裸模型名（请求按池顺序依次尝试各家），其余各家用 `<供应商 id>/<模型>`
+/// （只发给那一家）。最后是有成员的模型组。
+pub fn codex_pool_models(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<String> {
+    let relays = binding_pool_relays(gateway, binding);
+    let mut models: Vec<String> = Vec::new();
+    for relay in &relays {
+        for model in relay_models(relay) {
+            let entry = if models
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&model))
+            {
+                format!("{}/{model}", relay.id)
+            } else {
+                model
+            };
+            if !models
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&entry))
+            {
+                models.push(entry);
+            }
+        }
+    }
+    for group in &gateway.groups {
+        if !group.members.is_empty() {
+            models.push(group.model_id());
+        }
+    }
+    models
+}
+
+/// Codex 模型列表里一项归哪家供应商、发给它的模型名：裸模型名归第一个提供它的供应商，
+/// `<供应商 id>/<模型>` 归那一家。模型组和认不出的返回 None。
+pub fn codex_model_owner<'a>(relays: &[&'a RelayProfile], model: &str) -> Option<(usize, String)> {
+    if let Some(index) = relays.iter().position(|relay| serves(relay, model)) {
+        return Some((index, model.to_string()));
+    }
+    let (relay, upstream) = qualified_in(relays, model)?;
+    let index = relays
+        .iter()
+        .position(|candidate| candidate.id == relay.id)?;
+    serves(relay, &upstream).then_some((index, upstream))
+}
+
 /// 绑定的默认模型：绑定里写了就用它，否则用池里第一个供应商的默认模型。
 pub fn binding_default_model(gateway: &GatewaySettings, binding: &AgentBinding) -> String {
     let (slug, _) = crate::model_suffix::parse_model_suffix(binding.model.trim());
@@ -1127,5 +1172,42 @@ mod tests {
             .map(|(relay, _)| relay)
             .collect();
         assert_eq!(order, ["sp-fast", "sp-slow", "sp-new"]);
+    }
+
+    #[test]
+    fn codex_lists_shared_models_under_every_provider() {
+        let gateway = gateway("deepseek-v4-pro");
+        let binding = gateway.binding(&ToolId::Claude).unwrap().clone();
+        let models = codex_pool_models(&gateway, &binding);
+        assert_eq!(
+            models[..4],
+            [
+                "deepseek-v4-pro".to_string(),
+                "deepseek-v4-flash".to_string(),
+                "kimi-k3".to_string(),
+                "mirror/deepseek-v4-pro".to_string(),
+            ],
+            "mirror 也有 deepseek-v4-pro：在它名下以 mirror/ 前缀再列一份"
+        );
+        let relays = binding_pool_relays(&gateway, &binding);
+        let owner = |model: &str| {
+            codex_model_owner(&relays, model)
+                .map(|(index, upstream)| (relays[index].id.clone(), upstream))
+        };
+        assert_eq!(
+            owner("deepseek-v4-pro"),
+            Some(pair("ds", "deepseek-v4-pro"))
+        );
+        assert_eq!(
+            owner("mirror/deepseek-v4-pro"),
+            Some(pair("mirror", "deepseek-v4-pro"))
+        );
+        assert_eq!(owner("group/fast"), None);
+        // 带前缀的那份只发给那一家；裸模型名照旧按池顺序依次尝试。
+        assert_eq!(
+            routed(&gateway, "mirror/deepseek-v4-pro"),
+            vec![pair("mirror", "deepseek-v4-pro")]
+        );
+        assert_eq!(routed(&gateway, "deepseek-v4-pro").len(), 2);
     }
 }
