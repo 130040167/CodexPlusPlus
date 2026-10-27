@@ -977,16 +977,28 @@ export function validateProviderDraft(draft: ProviderDraft, editing = false): st
 
 /* —————————————— 用量 —————————————— */
 
-export type UsageCounts = { calls: number; errors: number; inputTokens: number; outputTokens: number; cachedTokens: number; reasoningTokens: number };
+export type UsageCounts = {
+  calls: number;
+  errors: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  reasoningTokens: number;
+  /** 记了耗时的请求的总耗时；旧版后端和旧数据没有。 */
+  durationMs?: number;
+  timedCalls?: number;
+};
+export type UsageCost = { currency: string; amount: number };
 export type UsageDay = UsageCounts & { date: string };
-export type UsageGroup = UsageCounts & { key: string; label: string };
+/** `costs` 只含填了价格的部分，旧版后端没有。 */
+export type UsageGroup = UsageCounts & { key: string; label: string; costs?: UsageCost[] };
 export type UsageSummary = {
   totals: UsageCounts;
   days: UsageDay[];
   byAgent: UsageGroup[];
   byProvider: UsageGroup[];
   byModel: UsageGroup[];
-  costs: Array<{ currency: string; amount: number }>;
+  costs: UsageCost[];
 };
 export type ProviderBalance = { providerId: string; provider: string; baseUrl: string; amount?: number | null; currency: string; error?: string | null };
 export type UsageRange = "today" | "7d" | "30d" | "all";
@@ -1023,6 +1035,35 @@ export function formatMoney(amount: number, currency: string): string {
 /** 缓存命中率（命中的输入 / 全部输入），没有输入时为 null。 */
 export function cacheHitRate(counts: UsageCounts): number | null {
   return counts.inputTokens > 0 ? counts.cachedTokens / counts.inputTokens : null;
+}
+
+/** 平均耗时（毫秒）；没有计时数据时为 null。 */
+export function averageDuration(counts: UsageCounts): number | null {
+  return counts.timedCalls ? (counts.durationMs ?? 0) / counts.timedCalls : null;
+}
+
+/** 多币种费用连起来：`$3.22 + ¥1.50`；没有费用为空串。 */
+export function costText(costs: UsageCost[] | undefined): string {
+  return (costs ?? []).filter((cost) => cost.amount > 0).map((cost) => formatMoney(cost.amount, cost.currency)).join(" + ");
+}
+
+/** 柱状图的纵轴上限：取 1 / 2 / 5 × 10ⁿ 里不小于最大值的那个，刻度好读。 */
+export function niceCeiling(value: number): number {
+  if (value <= 0) return 1;
+  const power = 10 ** Math.floor(Math.log10(value));
+  for (const step of [1, 2, 5, 10]) {
+    if (step * power >= value) return step * power;
+  }
+  return 10 * power;
+}
+
+/** 这段时间里的用量概况：有请求的天数、单日峰值（按 token）、有请求的日子的日均 token。 */
+export function usageDayStats(days: UsageDay[]): { activeDays: number; peak: UsageDay | null; dailyAverage: number } {
+  const active = days.filter((day) => day.calls > 0);
+  const total = (day: UsageDay) => day.inputTokens + day.outputTokens;
+  const peak = active.reduce<UsageDay | null>((best, day) => (!best || total(day) > total(best) ? day : best), null);
+  const sum = active.reduce((acc, day) => acc + total(day), 0);
+  return { activeDays: active.length, peak, dailyAverage: active.length ? sum / active.length : 0 };
 }
 
 /** 横轴标签：最多 `count` 个，均匀分布，总是包含第一天和最后一天。 */

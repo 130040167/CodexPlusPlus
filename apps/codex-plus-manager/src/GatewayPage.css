@@ -1850,29 +1850,6 @@ span.gw-popover-check {
   margin: 0;
 }
 
-.gw-usage-cost {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  margin-left: auto;
-}
-
-.gw-usage-cost strong {
-  font-size: 22px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
-
-.gw-usage-cost em {
-  color: var(--gw-mute);
-  font-size: 13px;
-  font-style: normal;
-}
-
-.gw-usage-cost .gw-icon-button {
-  align-self: center;
-}
-
 .gw-balance-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
@@ -1915,71 +1892,8 @@ span.gw-popover-check {
   font-variant-numeric: tabular-nums;
 }
 
-.gw-stat-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-}
-
-.gw-stat-grid > * + * {
-  border-top: 0;
-  border-left: 1px solid var(--gw-line);
-}
-
-.gw-stat-grid > div {
-  display: grid;
-  gap: 4px;
-  padding: 18px 22px;
-}
-
-.gw-stat-grid strong {
-  font-size: 28px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  line-height: 1.15;
-}
-
-.gw-stat-grid span {
-  color: var(--gw-mute);
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.gw-stat-grid small {
-  color: var(--gw-mute);
-  font-size: 12.5px;
-}
-
-.gw-chart-card {
-  padding: 16px 22px 12px;
-}
-
 .gw-chart {
   position: relative;
-}
-
-.gw-chart svg {
-  display: block;
-  width: 100%;
-  height: 180px;
-  margin-top: 14px;
-}
-
-.gw-chart-max {
-  position: absolute;
-  top: -4px;
-  right: 0;
-  color: var(--gw-mute);
-  font-size: 11.5px;
-}
-
-.gw-bar-input {
-  fill: hsl(var(--primary) / 0.35);
-}
-
-.gw-bar-output {
-  fill: hsl(var(--primary));
 }
 
 .gw-chart-axis {
@@ -2008,53 +1922,6 @@ span.gw-popover-check {
   font-size: 12.5px;
 }
 
-.gw-usage-row {
-  display: grid;
-  grid-template-columns: 22px minmax(120px, 220px) minmax(0, 1fr) 70px 60px;
-  align-items: center;
-  gap: 12px;
-  min-height: 46px;
-  padding: 6px 18px;
-}
-
-.gw-usage-row strong {
-  overflow: hidden;
-  font-size: 13.5px;
-  font-weight: 500;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.gw-usage-agent {
-  width: 20px;
-  height: 20px;
-}
-
-.gw-usage-bar {
-  height: 8px;
-  border-radius: 999px;
-  background: var(--gw-soft);
-}
-
-.gw-usage-bar i {
-  display: block;
-  height: 100%;
-  border-radius: 999px;
-  background: hsl(var(--primary) / 0.7);
-}
-
-.gw-usage-num {
-  font-size: 13px;
-  font-variant-numeric: tabular-nums;
-  text-align: right;
-}
-
-.gw-usage-row small {
-  color: var(--gw-mute);
-  font-size: 12px;
-  text-align: right;
-}
-
 .gw-price-row {
   display: grid;
   grid-template-columns: 110px repeat(3, minmax(0, 1fr));
@@ -2070,21 +1937,6 @@ span.gw-popover-check {
 .gw-price-row label span {
   color: var(--gw-mute);
   font-size: 11.5px;
-}
-
-@media (max-width: 900px) {
-  .gw-stat-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .gw-usage-row {
-    grid-template-columns: 22px minmax(0, 1fr) 60px;
-  }
-
-  .gw-usage-row .gw-usage-bar,
-  .gw-usage-row small {
-    display: none;
-  }
 }
 
 /* ———————————— 会话 ———————————— */
@@ -2380,13 +2232,6 @@ span.gw-avatar[data-size] {
   fill: transparent;
   cursor: crosshair;
 }
-.gw-bar :is(.gw-bar-input, .gw-bar-output) {
-  pointer-events: none;
-  transition: opacity 0.12s ease;
-}
-.gw-chart[data-hovering="true"] .gw-bar:not([data-active="true"]) :is(.gw-bar-input, .gw-bar-output) {
-  opacity: 0.35;
-}
 .gw-bar[data-active="true"] .gw-bar-hit {
   fill: hsl(var(--primary) / 0.08);
 }
@@ -2444,35 +2289,10 @@ span.gw-avatar[data-size] {
   border-radius: 2px;
   background: transparent;
 }
-.gw-chart-tip i[data-kind="input"] {
-  background: hsl(var(--primary) / 0.35);
-}
-.gw-chart-tip i[data-kind="output"] {
-  background: hsl(var(--primary));
-}
-.gw-chart-tip i[data-kind="cache"] {
-  background: hsl(var(--status-success) / 0.7);
-}
 .gw-chart-axis span[data-active="true"] {
   color: var(--gw-ink);
   font-weight: 600;
 }
-.gw-usage-row {
-  transition: background-color 0.12s ease;
-}
-.gw-usage-row:hover {
-  background: var(--gw-soft);
-}
-.gw-usage-row:hover .gw-usage-bar i {
-  filter: brightness(1.2);
-}
-.gw-stat-grid > div {
-  transition: background-color 0.12s ease;
-}
-.gw-stat-grid > div:hover {
-  background: var(--gw-soft);
-}
-
 /* 添加供应商：弹出框（原来铺在页面里） */
 .gw-modal.gw-catalog-modal {
   width: min(860px, 100%);
@@ -3183,4 +3003,384 @@ body.gw-sorting * {
 /* 模型组一行：图标、名称、模式、会话固定、按钮。 */
 .shell .gw-group-row {
   grid-template-columns: 76px minmax(0, 1fr) auto auto auto;
+}
+
+/* ———————————— 用量 ———————————— */
+.shell .gw-usage-refresh {
+  margin-left: auto;
+}
+
+/* 统计格：每格画右边和下边的细线，贴卡片边缘的那几条被裁掉，换行时也整齐。 */
+.shell .gw-usage-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(176px, 1fr));
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.shell .gw-usage-stats > * + * {
+  border-top: 0;
+}
+
+.shell .gw-usage-stat {
+  position: relative;
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+  padding: 16px 20px 18px;
+  box-shadow: 1px 0 0 var(--gw-line), 0 1px 0 var(--gw-line);
+  transition: background-color 0.12s ease;
+}
+
+.shell .gw-usage-stat:hover {
+  background: color-mix(in srgb, var(--gw-card) 92%, hsl(var(--foreground)));
+}
+
+.shell .gw-usage-stat > span {
+  color: var(--gw-mute);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.shell .gw-usage-stat strong {
+  overflow: hidden;
+  font-size: 26px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shell .gw-usage-stat[data-kind="cost"] strong {
+  color: hsl(var(--primary));
+}
+
+.shell .gw-usage-stat small {
+  overflow: hidden;
+  color: var(--gw-mute);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shell .gw-usage-stat small[data-tone="err"],
+.shell .gw-usage-num[data-tone="err"] {
+  color: var(--gw-warn);
+}
+
+.shell .gw-usage-meter {
+  display: block;
+  height: 4px;
+  margin-top: 2px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: var(--gw-soft);
+}
+
+.shell .gw-usage-meter b {
+  display: block;
+  height: 100%;
+  border-radius: 99px;
+  background: hsl(var(--status-success) / 0.75);
+}
+
+/* 图表卡片 */
+.shell .gw-chart-card {
+  padding: 16px 22px 14px;
+}
+
+.shell .gw-chart-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 18px;
+}
+
+.shell .gw-chart-head > strong {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.shell .gw-chart-legend,
+.shell .gw-chart-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  color: var(--gw-mute);
+  font-size: 12px;
+}
+
+.shell .gw-chart-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.shell .gw-chart-facts {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.shell .gw-chart-legend i,
+.shell .gw-chart-tip i {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+
+/* 右侧留出刻度数字的位置，柱子不会压到数字。 */
+.shell .gw-chart-plot {
+  position: relative;
+  height: 180px;
+  margin: 18px 48px 0 0;
+}
+
+.shell .gw-chart-plot svg {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.shell .gw-chart-grid {
+  position: absolute;
+  right: 0;
+  left: 0;
+  border-top: 1px dashed var(--gw-line);
+  pointer-events: none;
+}
+
+.shell .gw-chart-grid em {
+  position: absolute;
+  top: -8px;
+  right: -48px;
+  width: 42px;
+  color: var(--gw-mute);
+  font-size: 11px;
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+}
+
+.shell .gw-bar-input,
+.shell :is(.gw-chart-legend, .gw-chart-tip) i[data-kind="input"] {
+  fill: hsl(var(--primary) / 0.32);
+  background: hsl(var(--primary) / 0.32);
+}
+
+.shell .gw-bar-cache,
+.shell :is(.gw-chart-legend, .gw-chart-tip) i[data-kind="cache"] {
+  fill: hsl(var(--status-success) / 0.55);
+  background: hsl(var(--status-success) / 0.55);
+}
+
+.shell .gw-bar-output,
+.shell :is(.gw-chart-legend, .gw-chart-tip) i[data-kind="output"] {
+  fill: hsl(var(--primary));
+  background: hsl(var(--primary));
+}
+
+.shell .gw-bar-empty {
+  fill: hsl(var(--muted-foreground) / 0.25);
+}
+
+.shell .gw-bar :is(.gw-bar-input, .gw-bar-cache, .gw-bar-output, .gw-bar-empty) {
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+
+.shell .gw-chart[data-hovering="true"] .gw-bar:not([data-active="true"]) :is(.gw-bar-input, .gw-bar-cache, .gw-bar-output) {
+  opacity: 0.35;
+}
+
+.shell .gw-chart-tip p {
+  margin: 0;
+  color: var(--gw-mute);
+}
+
+.shell .gw-chart-axis {
+  position: relative;
+  height: 22px;
+  margin: 0 48px 0 0;
+  border-top: 1px solid var(--gw-line);
+}
+
+/* 按 Agent 的占比条 */
+.shell .gw-usage-agents {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--gw-line);
+}
+
+.shell .gw-usage-agents-bar {
+  display: flex;
+  gap: 2px;
+  height: 8px;
+  overflow: hidden;
+  border-radius: 99px;
+}
+
+.shell .gw-usage-agents-bar i,
+.shell .gw-usage-agents-legend i {
+  background: hsl(var(--muted-foreground) / 0.5);
+}
+
+.shell :is(.gw-usage-agents-bar, .gw-usage-agents-legend) i[data-agent="codex"] {
+  background: hsl(var(--primary));
+}
+
+.shell :is(.gw-usage-agents-bar, .gw-usage-agents-legend) i[data-agent="claude"] {
+  background: hsl(var(--brand-accent));
+}
+
+.shell :is(.gw-usage-agents-bar, .gw-usage-agents-legend) i[data-agent="grok"] {
+  background: hsl(var(--brand-accent-2));
+}
+
+.shell .gw-usage-agents-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  color: var(--gw-mute);
+  font-size: 12px;
+}
+
+.shell .gw-usage-agents-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.shell .gw-usage-agents-legend i {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+
+.shell .gw-usage-agents-legend b {
+  color: var(--gw-ink);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 明细表 */
+.shell .gw-usage-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1.5fr) minmax(110px, 1.2fr) 64px 72px 72px 52px 96px;
+  align-items: center;
+  gap: 12px;
+  min-height: 48px;
+  padding: 6px 20px;
+  transition: background-color 0.12s ease;
+}
+
+.shell .gw-usage-row:hover:not(.gw-usage-row-head) {
+  background: var(--gw-soft);
+}
+
+.shell .gw-usage-row-head {
+  min-height: 34px;
+  color: var(--gw-mute);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+.shell .gw-usage-row-head > span:nth-child(n + 3) {
+  text-align: right;
+}
+
+.shell .gw-usage-name {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.shell .gw-usage-name strong {
+  overflow: hidden;
+  font-size: 13.5px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shell .gw-usage-agent {
+  width: 20px;
+  height: 20px;
+}
+
+.shell .gw-usage-share {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.shell .gw-usage-bar {
+  flex: 1;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--gw-soft);
+}
+
+.shell .gw-usage-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: hsl(var(--primary) / 0.7);
+}
+
+.shell .gw-usage-row:hover .gw-usage-bar i {
+  filter: brightness(1.2);
+}
+
+.shell .gw-usage-share em {
+  width: 42px;
+  color: var(--gw-mute);
+  font-size: 12px;
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.shell .gw-usage-num {
+  overflow: hidden;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 一个价格都没填时不占「费用」一列。 */
+.shell .gw-usage-table[data-cost="false"] .gw-usage-row {
+  grid-template-columns: minmax(150px, 1.5fr) minmax(110px, 1.2fr) 64px 72px 72px 52px;
+}
+
+.shell .gw-usage-table[data-cost="false"] .gw-usage-row > :nth-child(7) {
+  display: none;
+}
+
+@media (max-width: 900px) {
+  .shell .gw-usage-row,
+  .shell .gw-usage-table[data-cost="false"] .gw-usage-row {
+    grid-template-columns: minmax(0, 1fr) 56px 64px 80px;
+  }
+
+  .shell .gw-usage-table[data-cost="false"] .gw-usage-row {
+    grid-template-columns: minmax(0, 1fr) 56px 64px;
+  }
+
+  .shell .gw-usage-row > :nth-child(2),
+  .shell .gw-usage-row > :nth-child(5),
+  .shell .gw-usage-row > :nth-child(6) {
+    display: none;
+  }
+
+  .shell .gw-chart-facts {
+    margin-left: 0;
+  }
 }

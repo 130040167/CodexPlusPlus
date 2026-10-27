@@ -32,6 +32,11 @@ pub struct UsageCounts {
     /// 推理 token（已包含在 `output_tokens` 里）。
     #[serde(default)]
     pub reasoning_tokens: u64,
+    /// 记了耗时的请求的总耗时（毫秒）；旧数据没有，平均耗时只按 `timed_calls` 算。
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub timed_calls: u64,
 }
 
 impl UsageCounts {
@@ -42,6 +47,8 @@ impl UsageCounts {
         self.output_tokens += other.output_tokens;
         self.cached_tokens += other.cached_tokens;
         self.reasoning_tokens += other.reasoning_tokens;
+        self.duration_ms += other.duration_ms;
+        self.timed_calls += other.timed_calls;
     }
 }
 
@@ -159,18 +166,31 @@ impl UsageStore {
             for row in &rows {
                 counts.add(&row.counts);
                 summary.totals.add(&row.counts);
-                add_group(&mut summary.by_agent, &row.agent, &row.agent, &row.counts);
+                let price = gateway
+                    .provider(&row.provider_id)
+                    .and_then(|provider| provider.price_for(&row.model));
+                add_group(
+                    &mut summary.by_agent,
+                    &row.agent,
+                    &row.agent,
+                    &row.counts,
+                    price,
+                );
                 add_group(
                     &mut summary.by_provider,
                     &row.provider_id,
                     &row.provider,
                     &row.counts,
+                    price,
                 );
-                add_group(&mut summary.by_model, &row.model, &row.model, &row.counts);
-                if let Some(price) = gateway
-                    .provider(&row.provider_id)
-                    .and_then(|provider| provider.price_for(&row.model))
-                {
+                add_group(
+                    &mut summary.by_model,
+                    &row.model,
+                    &row.model,
+                    &row.counts,
+                    price,
+                );
+                if let Some(price) = price {
                     add_cost(&mut summary.costs, price, &row.counts);
                 }
             }
@@ -201,14 +221,28 @@ fn write_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(Mutex::default)
 }
 
-fn add_group(groups: &mut Vec<UsageGroup>, key: &str, label: &str, counts: &UsageCounts) {
-    match groups.iter_mut().find(|group| group.key == key) {
-        Some(group) => group.counts.add(counts),
-        None => groups.push(UsageGroup {
-            key: key.to_string(),
-            label: label.to_string(),
-            counts: *counts,
-        }),
+fn add_group(
+    groups: &mut Vec<UsageGroup>,
+    key: &str,
+    label: &str,
+    counts: &UsageCounts,
+    price: Option<&ProviderPrice>,
+) {
+    let index = match groups.iter().position(|group| group.key == key) {
+        Some(index) => index,
+        None => {
+            groups.push(UsageGroup {
+                key: key.to_string(),
+                label: label.to_string(),
+                ..UsageGroup::default()
+            });
+            groups.len() - 1
+        }
+    };
+    let group = &mut groups[index];
+    group.counts.add(counts);
+    if let Some(price) = price {
+        add_cost(&mut group.costs, price, counts);
     }
 }
 
@@ -245,6 +279,9 @@ pub struct UsageGroup {
     pub label: String,
     #[serde(flatten)]
     pub counts: UsageCounts,
+    /// 这一组里填了价格的部分估算出的费用。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub costs: Vec<UsageCost>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -323,6 +360,8 @@ pub fn record_entry_in(store: &UsageStore, entry: &RequestLogEntry) -> anyhow::R
             output_tokens: usage.output_tokens,
             cached_tokens: usage.cached_tokens,
             reasoning_tokens: usage.reasoning_tokens,
+            duration_ms: entry.duration_ms,
+            timed_calls: u64::from(entry.duration_ms > 0),
         },
     };
     let timestamp = if entry.timestamp_ms > 0 {
@@ -351,7 +390,7 @@ mod tests {
             id: "id".to_string(),
             timestamp_ms: 1_790_000_000_000,
             started_at_ms: 0,
-            duration_ms: 0,
+            duration_ms: 1200,
             method: "POST".to_string(),
             path: "/v1/messages".to_string(),
             status_code: 200,
@@ -445,6 +484,23 @@ mod tests {
         assert_eq!(summary.costs.len(), 1);
         assert_eq!(summary.costs[0].currency, "CNY");
         assert!((summary.costs[0].amount - 5.0).abs() < 1e-9);
+        let ds = summary
+            .by_provider
+            .iter()
+            .find(|group| group.key == "ds")
+            .unwrap();
+        assert!((ds.costs[0].amount - 5.0).abs() < 1e-9, "每组也算出费用");
+        assert!(
+            summary
+                .by_provider
+                .iter()
+                .find(|group| group.key == "codex-relay")
+                .unwrap()
+                .costs
+                .is_empty()
+        );
+        assert_eq!(summary.totals.timed_calls, 4);
+        assert_eq!(summary.totals.duration_ms, 4 * 1200);
 
         let all = store.summary(&day, None, &gateway).unwrap();
         assert_eq!(all.days.len(), 1);
