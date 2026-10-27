@@ -1091,6 +1091,17 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "默认窗口": "Default window",
+  "按公开资料填写": "Fill from public data",
+  "正在查公开资料…": "Looking up public data…",
+  "保存上下文窗口": "Save context windows",
+  "未填写，用模型自带资料": "Not set; uses each model's own data",
+  "用模型自带资料": "Model's own data",
+  "按模型填，如 128k、1M": "Per model, e.g. 128k, 1M",
+  "Agent 按它压缩上下文；请求比它还长时，路由先试别家": "Agents compact to fit it; requests longer than it try other providers first",
+  "留空的模型用「其它模型」那一行；都不填就用模型自带的资料。": "Blank models use the \"Other models\" row; leave all blank to use each model's own data.",
+  "窗口要写成 128k、1M 或至少 1000 的数字": "Write windows like 128k, 1M, or a number of at least 1000",
+  "供应商池里没写窗口的模型用这个；按模型的窗口在供应商池的详情里填": "Used for models with no window in the provider pool; set per-model windows in the provider's details",
   "用哪些供应商": "Providers used",
   "模型名后带供应商": "Show provider after model names",
   "多家都有的模型，在 Codex 的模型列表和输入框里显示成「GPT-6 Astra（ChatGPT Pro）」，自动组显示「（自动）」。": "Models offered by several providers show as “GPT-6 Astra (ChatGPT Pro)” in Codex's model list and composer; auto groups show “(Auto)”.",
@@ -2489,6 +2500,10 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "所有模型 · {0}": "All models · {0}",
+  "{0} / {1} 个模型 · {2}": "{0} / {1} models · {2}",
+  "{0} 的上下文窗口": "{0} context windows",
+  "models.dev 里找到 {0} / {1} 个模型的窗口，其余需要的话手动填写。": "Found windows for {0} / {1} models on models.dev; fill in the rest by hand if needed.",
   "删除组「{0}」？引用它的其它组会去掉这个成员。": "Delete group “{0}”? Groups that include it lose that member.",
   "已隐藏 {0} 个": "{0} hidden",
   "权重 {0}": "Weight {0}",
@@ -2781,6 +2796,8 @@ export const EN_TEMPLATE: Record<string, string> = {
 // at the display layer (showNotice wraps message with t()). Exact-match first,
 // then pattern-based for messages that embed dynamic values.
 export const EN_BACKEND: Record<string, string> = {
+  "上下文窗口已保存。": "Context windows saved.",
+  "保存上下文窗口失败": "Failed to save context windows",
   "扫描已失效，请重新扫描。": "The scan is no longer valid. Scan again.",
   "扫描已过期，请重新扫描。": "The scan has expired. Scan again.",
   "请选择缓存项目。": "Select cache items first.",

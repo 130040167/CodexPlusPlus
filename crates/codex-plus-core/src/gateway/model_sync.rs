@@ -340,6 +340,8 @@ mod tests {
             source: String::new(),
             price: None,
             model_prices: Default::default(),
+            model_windows: Default::default(),
+            context_window: None,
             proxy: String::new(),
             upstream_new: vec!["b".into()],
             upstream_gone: vec!["x".into()],

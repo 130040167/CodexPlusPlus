@@ -475,6 +475,15 @@
   font-size: 12.5px;
 }
 
+/* 上下文窗口：模型一列、窗口一列 */
+.gw-portal .pf-price-row.pf-window-row {
+  grid-template-columns: minmax(0, 1fr) 140px;
+}
+
+.gw-portal .pf-window-row[data-invalid="true"] input {
+  border-color: hsl(var(--status-error));
+}
+
 .gw-portal .pf-price-fallback {
   color: hsl(var(--muted-foreground));
   font-size: 12px;

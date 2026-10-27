@@ -36,6 +36,10 @@ pub struct GatewayPoolEntry {
     /// 按模型的价格（上游模型名 → 价格）。
     pub model_prices:
         std::collections::BTreeMap<String, codex_plus_core::gateway::store::ProviderPrice>,
+    /// 按模型的上下文窗口（上游模型名 → token）。
+    pub model_windows: std::collections::BTreeMap<String, u64>,
+    /// 没单独写窗口的模型用的窗口。
+    pub context_window: Option<u64>,
     /// 登录得到的账号：`chatgpt` / `copilot` / `grok`；普通供应商为空。
     pub account: String,
     /// 订阅账号的套餐（如「ChatGPT Pro」「Copilot Pro+」）；普通供应商为空。
@@ -157,6 +161,8 @@ fn pool_entry(
         source: source.to_string(),
         price,
         model_prices,
+        model_windows: Default::default(),
+        context_window: None,
         account: account_kind(relay),
         plan: codex_plus_core::gateway::accounts::account_plan(relay),
         lent_to_codex: codex_plus_core::official_login::is_lent_to_codex(relay),
@@ -187,8 +193,10 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
     let pool = gateway
         .providers
         .iter()
-        .map(|provider| {
-            pool_entry(
+        .map(|provider| GatewayPoolEntry {
+            model_windows: provider.model_windows.clone(),
+            context_window: provider.context_window,
+            ..pool_entry(
                 &provider.relay,
                 provider.enabled,
                 &provider.source,
@@ -577,6 +585,25 @@ pub fn save_gateway_provider_extras(
         "已保存。",
         "保存失败",
         apply::set_provider_extras(&GatewayStore::default(), &id, price, model_prices, &proxy),
+    )
+}
+
+/// 改供应商的上下文窗口（按模型的和其余模型用的默认值）；窗口写在 Agent 的模型资料里，存完重写 Agent 配置。
+#[tauri::command]
+pub fn save_gateway_provider_windows(
+    id: String,
+    windows: std::collections::BTreeMap<String, u64>,
+    fallback: Option<u64>,
+) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "上下文窗口已保存。",
+        "保存上下文窗口失败",
+        refresh_agents(apply::set_provider_windows(
+            &GatewayStore::default(),
+            &id,
+            windows,
+            fallback,
+        )),
     )
 }
 

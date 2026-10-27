@@ -387,8 +387,9 @@ function AgentDetail({
               value={draft.unknownModel}
             />
           </div>
-          <label className="gw-inline-field">
-            <span>{t("上下文窗口")}</span>
+          {/* 窗口按模型在供应商池里填；这里只给池里没写窗口的模型兜底。 */}
+          <label className="gw-inline-field" title={t("供应商池里没写窗口的模型用这个；按模型的窗口在供应商池的详情里填")}>
+            <span>{t("默认窗口")}</span>
             <input
               className="gw-inline-input"
               onBlur={() => {
@@ -507,7 +508,10 @@ export function ModelList({
 }) {
   const nav = useContext(GatewayNavContext);
   const [query, setQuery] = useState("");
-  const [favoritesOnly, setFavoritesOnly] = useState(false);
+  // 筛选：全部 / 只看收藏 / 只看某一家（或自动组、模型组）。再点一次选中的筛选回到全部。
+  const [scope, setScope] = useState<"all" | "favorites" | { section: string }>("all");
+  const favoritesOnly = scope === "favorites";
+  const sectionOnly = typeof scope === "object" ? scope.section : null;
   // 收藏存在网关里（Codex 的选择器也要显示）；旧版存在本窗口的 localStorage，网关里还没有时沿用并迁过去。
   const stored = payload?.gateway.favoriteModels;
   const [favorites, setFavorites] = useState<string[]>(() => (stored && stored.length ? stored : loadFavorites()));
@@ -524,22 +528,22 @@ export function ModelList({
   const listRef = useRef<HTMLDivElement>(null);
   const sections = useMemo(() => {
     const all = pickerSections(payload, query, avatarOf, exclude, skipGroup);
+    // 手输的模型 ID（custom）不属于哪一家，按供应商筛选时也留着。
+    if (sectionOnly) return all.filter((section) => section.key === sectionOnly || section.key === "custom");
     if (!favoritesOnly) return all;
     return all
       .map((section) => ({ ...section, items: section.items.filter((item) => isFavoriteModel(favorites, item.model, payload)) }))
       .filter((section) => section.items.length);
-  }, [payload, query, exclude, favoritesOnly, favorites, skipGroup]);
+  }, [payload, query, exclude, favoritesOnly, sectionOnly, favorites, skipGroup]);
   const toggleFavorite = (model: string) => {
     const next = toggleFavoriteModel(favorites, model, payload);
     setFavorites(next);
     void persistFavorites(next);
   };
-  const jump = (key: string) => {
-    setFavoritesOnly(false);
-    window.requestAnimationFrame(() => {
-      const node = listRef.current?.querySelector<HTMLElement>(`[data-section="${CSS.escape(key)}"]`);
-      if (node && listRef.current) listRef.current.scrollTop = node.offsetTop - 6;
-    });
+  const pickScope = (next: "all" | "favorites" | { section: string }) => {
+    const same = typeof next === "object" ? sectionOnly === next.section : scope === next;
+    setScope(same ? "all" : next);
+    if (listRef.current) listRef.current.scrollTop = 0;
   };
   const isSelected = (item: PickerItem) => Boolean(selectedModel) && item.model.toLowerCase() === selectedModel.toLowerCase();
 
@@ -559,10 +563,10 @@ export function ModelList({
           <em>{tf("{0} 个", [total])}</em>
         </label>
         <div className="gw-mp-filters">
-          <button data-active={!favoritesOnly} onClick={() => { setFavoritesOnly(false); setQuery(""); if (listRef.current) listRef.current.scrollTop = 0; }} type="button">{t("全部")}</button>
-          <button data-active={favoritesOnly} onClick={() => setFavoritesOnly(!favoritesOnly)} type="button"><Star className="h-3 w-3" />{t("收藏")}</button>
+          <button data-active={scope === "all"} onClick={() => { setScope("all"); setQuery(""); if (listRef.current) listRef.current.scrollTop = 0; }} type="button">{t("全部")}</button>
+          <button data-active={favoritesOnly} onClick={() => pickScope("favorites")} type="button"><Star className="h-3 w-3" />{t("收藏")}</button>
           {filters.map((section) => (
-            <button key={section.key} onClick={() => jump(section.key)} title={section.key === "group" || section.key === "auto" ? t(section.title) : section.title} type="button">
+            <button data-active={sectionOnly === section.key} key={section.key} onClick={() => pickScope({ section: section.key })} title={section.key === "group" || section.key === "auto" ? t(section.title) : section.title} type="button">
               {section.key === "group" ? <Waypoints className="h-3 w-3" /> : section.key === "auto" ? <Shuffle className="h-3 w-3" /> : <Avatar name={section.title} size="sm" />}
               <span>{section.key === "group" || section.key === "auto" ? t(section.title) : section.title.split(" · ")[0]}</span>
             </button>

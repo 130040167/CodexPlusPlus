@@ -126,10 +126,13 @@ pub fn claude_gateway_provider(
             json!(role(&binding.claude_roles.subagent)),
         );
     }
-    let window = binding.context_window.or_else(|| {
-        let (_, window) = crate::model_suffix::parse_model_suffix(binding.model.trim());
-        window
-    });
+    // Claude Code 只有一个窗口设置：按默认模型的窗口（供应商池里写的），没写用 Agent 的默认窗口。
+    let window = route::model_entry_window(gateway, binding, &default_model)
+        .or(binding.context_window)
+        .or_else(|| {
+            let (_, window) = crate::model_suffix::parse_model_suffix(binding.model.trim());
+            window
+        });
     if let Some(window) = window {
         env.insert(
             "CLAUDE_CODE_MAX_CONTEXT_TOKENS".to_string(),
@@ -167,7 +170,6 @@ fn agent_gateway_profile(
     agent: &ToolId,
 ) -> RelayProfile {
     let default_model = binding_default_model(gateway, binding);
-    let window = binding.context_window;
     let mut models = vec![default_model.clone()];
     // 池里所有能用的模型和模型组都进 Agent 的模型列表；Codex 按供应商分组显示，多家都有的模型每家各列一份。
     let pool = if *agent == ToolId::Codex {
@@ -183,9 +185,13 @@ fn agent_gateway_profile(
     let model_list = models
         .iter()
         .filter(|model| !model.is_empty())
-        .map(|model| match window {
-            Some(window) => format!("{model}[{window}]"),
-            None => model.clone(),
+        // 每个模型带自己的窗口（供应商池里按模型写的）；没写的用 Agent 的默认窗口，都没有就不带，
+        // 交给 Agent 自带的模型资料。
+        .map(|model| {
+            match route::model_entry_window(gateway, binding, model).or(binding.context_window) {
+                Some(window) => format!("{model}[{window}]"),
+                None => model.clone(),
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -1583,6 +1589,11 @@ pub fn copy_claude_provider(provider: &ClaudeProvider) -> anyhow::Result<RelayPr
         profile.anthropic_auth_header =
             crate::anthropic_bridge::ANTHROPIC_AUTH_HEADER_BEARER.to_string();
     }
+    // 直连时给 Claude Code 设的窗口当作这家的默认窗口（模型名里的 `[1m]` 已按模型收进窗口表）。
+    let window = text("CLAUDE_CODE_MAX_CONTEXT_TOKENS");
+    if crate::model_suffix::parse_window_token(&window).is_some() {
+        profile.context_window = window;
+    }
     Ok(profile)
 }
 
@@ -1606,11 +1617,17 @@ pub fn copy_grok_profile(
     if base_url.contains("/gw/grok") {
         bail!("「{}」指向网关本身，不能导入", source.name);
     }
-    let models = crate::tools::grok::parse_grok_model_list(&source.model_list)
-        .into_iter()
-        .map(|(slug, _)| slug)
+    let parsed = crate::tools::grok::parse_grok_model_list(&source.model_list);
+    let models = parsed
+        .iter()
+        .map(|(slug, _)| slug.clone())
         .collect::<Vec<_>>();
-    build_relay(&ProviderInput {
+    // 模型带的 `[1M]` 窗口放进上游配置的窗口表，加进池时收进网关自己的按模型窗口。
+    let windows: BTreeMap<String, String> = parsed
+        .into_iter()
+        .filter_map(|(slug, window)| window.map(|window| (slug, window.to_string())))
+        .collect();
+    let mut relay = build_relay(&ProviderInput {
         name: source.name.clone(),
         base_url,
         protocol: source.protocol,
@@ -1620,7 +1637,12 @@ pub fn copy_grok_profile(
         price: None,
         model_prices: None,
         proxy: None,
-    })
+    })?;
+    if !windows.is_empty() {
+        relay.model_windows = serde_json::to_string(&windows)?;
+    }
+    relay.context_window = source.context_window.clone();
+    Ok(relay)
 }
 
 /// 可以从 Codex 复制过来的供应商：去掉聚合供应商和官方登录账号。
@@ -2032,6 +2054,8 @@ fn add_provider_with(
             source: source.to_string(),
             price: None,
             model_prices: BTreeMap::new(),
+            model_windows: BTreeMap::new(),
+            context_window: None,
             proxy: String::new(),
             upstream_new: Vec::new(),
             upstream_gone: Vec::new(),
@@ -2183,6 +2207,33 @@ pub fn set_provider_extras(
             provider.model_prices = clean_model_prices(prices);
         }
         provider.proxy = proxy;
+        Ok(())
+    })?;
+    store.load()
+}
+
+/// 供应商的上下文窗口：按模型的（键是上游模型名）和其余模型用的默认值。0 或不写表示不设。
+/// 窗口会写进 Agent 的模型资料，保存后要重新写一遍 Agent 配置（调用方负责）。
+pub fn set_provider_windows(
+    store: &GatewayStore,
+    id: &str,
+    windows: BTreeMap<String, u64>,
+    fallback: Option<u64>,
+) -> anyhow::Result<GatewaySettings> {
+    store.update(|gateway| {
+        let Some(provider) = gateway
+            .providers
+            .iter_mut()
+            .find(|provider| provider.relay.id == id)
+        else {
+            bail!("供应商不存在：{id}");
+        };
+        provider.model_windows = windows
+            .into_iter()
+            .map(|(model, window)| (model.trim().to_string(), window))
+            .filter(|(model, window)| !model.is_empty() && *window > 0)
+            .collect();
+        provider.context_window = fallback.filter(|window| *window > 0);
         Ok(())
     })?;
     store.load()

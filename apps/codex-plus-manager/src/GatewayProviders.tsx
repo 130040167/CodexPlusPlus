@@ -38,6 +38,7 @@ import {
 import { AgentIcon, Avatar, KeyCount, MemberStatusLabel, QuotaBadge, QuotaWindows, Switch, type Notify, type Run } from "./gateway-ui";
 import { ProviderFormDialog, type ProviderFormState } from "./ProviderFormDialog";
 import { ProviderExtrasDialog, priceSummary } from "./ProviderExtrasDialog";
+import { ProviderWindowsDialog, windowSummary } from "./ProviderWindowsDialog";
 import { ProviderModelsDialog } from "./ProviderModelsDialog";
 import { gatewayJump } from "./gateway-store";
 import { ModelMatrix } from "./GatewayModelMatrix";
@@ -414,6 +415,11 @@ function PoolRow({
   // 价格、代理各开各的弹窗。
   const [extrasOpen, setExtrasOpen] = useState<"price" | "proxy" | null>(null);
   const [modelsOpen, setModelsOpen] = useState(false);
+  const [windowsOpen, setWindowsOpen] = useState(false);
+  const windows = windowSummary(entry);
+  const saveWindows = async (modelWindows: Record<string, number>, fallback: number | null) => {
+    if (await run(`windows:${entry.id}`, "save_gateway_provider_windows", { id: entry.id, windows: modelWindows, fallback }, t("保存上下文窗口"))) setWindowsOpen(false);
+  };
   const newModels = entry.upstreamNew?.length ?? 0;
   const saveModels = async (models: string[], defaultModel: string) => {
     if (await run(`models:${entry.id}`, "save_gateway_provider_models", { id: entry.id, models, defaultModel }, t("保存模型列表"))) setModelsOpen(false);
@@ -535,6 +541,13 @@ function PoolRow({
             </div>
           </div>
           <div className="gw-detail-row">
+            <span className="gw-detail-label">{t("上下文窗口")}</span>
+            <div className="gw-detail-value gw-chip-row">
+              <span className={windows ? undefined : "gw-muted"}>{windows || t("未填写，用模型自带资料")}</span>
+              <button className="gw-text-button" disabled={busy !== null || entry.models.length === 0} onClick={() => setWindowsOpen(true)} type="button">{t("编辑")}</button>
+            </div>
+          </div>
+          <div className="gw-detail-row">
             <span className="gw-detail-label">{t("代理")}</span>
             <div className="gw-detail-value gw-chip-row">
               {entry.proxy ? <code className="gw-chip">{entry.proxy}</code> : <span className="gw-muted">{t("沿用系统代理")}</span>}
@@ -564,6 +577,9 @@ function PoolRow({
       ) : null}
       {modelsOpen ? (
         <ProviderModelsDialog busy={busy !== null} entry={entry} onCancel={() => setModelsOpen(false)} onSave={(models, defaultModel) => void saveModels(models, defaultModel)} />
+      ) : null}
+      {windowsOpen ? (
+        <ProviderWindowsDialog busy={busy !== null} entry={entry} onCancel={() => setWindowsOpen(false)} onSave={(modelWindows, fallback) => void saveWindows(modelWindows, fallback)} />
       ) : null}
       {extrasOpen ? (
         <ProviderExtrasDialog

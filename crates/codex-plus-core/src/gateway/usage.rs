@@ -460,6 +460,8 @@ mod tests {
             enabled: true,
             source: String::new(),
             model_prices: Default::default(),
+            model_windows: Default::default(),
+            context_window: None,
             proxy: String::new(),
             price: Some(ProviderPrice {
                 currency: "cny".to_string(),

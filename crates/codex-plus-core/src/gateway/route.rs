@@ -38,6 +38,8 @@ pub struct GatewayCandidate {
     pub relay: RelayProfile,
     pub key: KeyRef,
     pub upstream_model: String,
+    /// 这家这个模型的上下文窗口（供应商池里写了才有）：请求比它还长时排到最后再试。
+    pub window: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +305,23 @@ fn codex_pool_blocks(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<V
     );
     blocks.retain(|block| !block.is_empty());
     blocks
+}
+
+/// Agent 模型列表里一项的上下文窗口：它会发给的各家里写了窗口的取最小值（模型组、多家自动切换
+/// 都按最短的那家算，保证 Agent 按这个长度压缩后每家都装得下）。都没写返回 None。
+pub fn model_entry_window(
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+    model: &str,
+) -> Option<u64> {
+    expand_model(gateway, binding, model, 0, &mut Vec::new(), false)
+        .into_iter()
+        .filter_map(|(relay, upstream)| {
+            gateway
+                .provider(&relay.id)
+                .and_then(|provider| provider.window_for(&upstream))
+        })
+        .min()
 }
 
 /// 列表里有几家供应商提供这个模型（按模型名，不分大小写）。
@@ -815,6 +834,9 @@ fn resolve_plan_with(
     let mut candidates = Vec::new();
     let mut cooling: Option<Duration> = None;
     for (relay, upstream_model) in relays {
+        let window = gateway
+            .provider(&relay.id)
+            .and_then(|provider| provider.window_for(&upstream_model));
         let (keys, soonest) = key_pool::order_keys_with(
             &relay,
             gateway.key_policy.mode,
@@ -830,6 +852,7 @@ fn resolve_plan_with(
                 relay: key.relay,
                 key: key.key,
                 upstream_model: upstream_model.clone(),
+                window,
             });
         }
     }
@@ -856,6 +879,8 @@ mod tests {
             source: String::new(),
             price: None,
             model_prices: Default::default(),
+            model_windows: Default::default(),
+            context_window: None,
             proxy: String::new(),
             upstream_new: Vec::new(),
             upstream_gone: Vec::new(),

@@ -4,7 +4,8 @@ use codex_plus_core::gateway::apply::{
     ApplyContext, GroupInput, ProviderInput, codex_importable, copy_claude_provider,
     copy_codex_provider, create_provider, delete_group, delete_provider, disable_binding,
     enable_binding, note_claude_switched, note_codex_switched, reapply_if_port_changed,
-    refresh_enabled, reorder_providers, save_group, set_provider_enabled, update_provider,
+    refresh_enabled, reorder_providers, save_group, set_provider_enabled, set_provider_windows,
+    update_provider,
 };
 use codex_plus_core::gateway::store::{
     AgentBinding, ClaudeRoleModels, GatewayStore, GroupMember, GroupMode, GroupSticky,
@@ -1373,4 +1374,108 @@ fn auto_group_settings_save_and_reset_to_default() {
     // 改回默认：记录删掉，自动组回到「没改过」、跟着池子变。
     let gateway = save_auto_group(store, "deepseek-v4-pro", AutoGroupSettings::default()).unwrap();
     assert!(gateway.auto_groups.is_empty());
+}
+
+fn codex_catalog(ctx: &ApplyContext) -> Value {
+    let config = std::fs::read_to_string(ctx.codex_home.join("config.toml")).unwrap();
+    let pointer = config
+        .lines()
+        .find_map(|line| line.strip_prefix("model_catalog_json = "))
+        .map(|value| value.trim().trim_matches('"').to_string())
+        .unwrap_or_else(|| panic!("网关供应商要写模型目录：{config}"));
+    let pointer = std::path::PathBuf::from(pointer);
+    let path = if pointer.is_absolute() {
+        pointer
+    } else {
+        ctx.codex_home.join(pointer)
+    };
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[test]
+fn context_windows_follow_each_model_in_the_pool() {
+    let fixture = fixture(57396);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    let mut seeded = BackendSettings::default();
+    seeded.relay_profiles_enabled = true;
+    ctx.settings.save(&seeded).unwrap();
+    let id = ctx.gateway.load().unwrap().providers[0].relay.id.clone();
+    set_provider_windows(
+        &ctx.gateway,
+        &id,
+        [("DeepSeek-V4-Pro".to_string(), 1_000_000)].into(),
+        Some(128_000),
+    )
+    .unwrap();
+
+    // Agent 的默认窗口只给没写窗口的模型兜底；池里按模型写的优先。
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let catalog = codex_catalog(ctx);
+    let window = |slug: &str| {
+        catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["slug"] == slug)
+            .unwrap_or_else(|| panic!("目录里没有 {slug}：{catalog}"))["context_window"]
+            .clone()
+    };
+    assert_eq!(window("deepseek-v4-pro"), 1_000_000);
+    assert_eq!(
+        window("deepseek-v4-flash"),
+        128_000,
+        "没单独写的用这家的默认窗口"
+    );
+
+    // Claude Code 只有一个窗口：按默认模型的。
+    enable_binding(ctx, &ToolId::Claude, binding()).unwrap();
+    assert_eq!(
+        read_settings_json(ctx)["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"],
+        "1000000"
+    );
+
+    // 清掉供应商的窗口后回到 Agent 的默认窗口。
+    set_provider_windows(&ctx.gateway, &id, Default::default(), None).unwrap();
+    refresh_enabled(ctx).unwrap();
+    let catalog = codex_catalog(ctx);
+    let flash = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["slug"] == "deepseek-v4-flash")
+        .unwrap()["context_window"]
+        .clone();
+    assert_eq!(flash, 1_000_000);
+}
+
+#[test]
+fn imported_windows_move_into_the_gateway_provider() {
+    let fixture = fixture(57397);
+    let ctx = &fixture.ctx;
+    let relay = RelayProfile {
+        id: "relay".into(),
+        name: "Relay".into(),
+        relay_mode: RelayMode::PureApi,
+        base_url: "https://relay.test/v1".into(),
+        api_key: "sk-relay".into(),
+        model: "kimi-k3".into(),
+        model_list: "kimi-k3[256K]\nglm-5".into(),
+        context_window: "200K".into(),
+        ..RelayProfile::default()
+    };
+    codex_plus_core::gateway::apply::add_provider(&ctx.gateway, relay, "codex:relay", None)
+        .unwrap();
+    let gateway = ctx.gateway.load().unwrap();
+    let provider = gateway.provider("relay").unwrap();
+    assert_eq!(provider.window_for("kimi-k3"), Some(256_000));
+    assert_eq!(provider.window_for("glm-5"), Some(200_000));
+    assert!(
+        provider
+            .relay
+            .model_windows
+            .trim_matches(['{', '}'])
+            .is_empty()
+    );
+    assert!(provider.relay.context_window.is_empty());
 }

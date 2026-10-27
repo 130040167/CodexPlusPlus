@@ -1902,6 +1902,8 @@ mod tests {
                 source: "login:chatgpt".to_string(),
                 price: None,
                 model_prices: Default::default(),
+                model_windows: Default::default(),
+                context_window: None,
                 proxy: String::new(),
                 upstream_new: Vec::new(),
                 upstream_gone: Vec::new(),

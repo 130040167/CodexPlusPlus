@@ -43,6 +43,13 @@ pub struct GatewayProvider {
     /// 按模型的价格：键是上游模型名（不带供应商前缀）。同一家不同模型价格往往差好几倍。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_prices: BTreeMap<String, ProviderPrice>,
+    /// 按模型的上下文窗口（token）：键是上游模型名（不带供应商前缀）。写进 Agent 的模型资料，
+    /// 路由时请求比窗口还长的成员排到最后。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_windows: BTreeMap<String, u64>,
+    /// 没单独写窗口的模型用的窗口；都不填就交给模型自带的资料。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
     /// 这个供应商单独走的 HTTP 代理；空串表示不单独走代理（沿用系统代理）。
     /// 与直连模式的「供应商独立代理」互不相干。
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -79,6 +86,52 @@ impl GatewayProvider {
             })
             .map(|(_, price)| price)
             .or(self.price.as_ref())
+    }
+}
+
+impl GatewayProvider {
+    /// 某个上游模型的窗口：单独写的优先（忽略大小写和 `[1M]` 后缀），其次是这家的默认窗口；
+    /// 都没有返回 None（交给模型自带的资料）。
+    pub fn window_for(&self, model: &str) -> Option<u64> {
+        let (slug, _) = crate::model_suffix::parse_model_suffix(model.trim());
+        let slug = slug.trim();
+        self.model_windows
+            .iter()
+            .find(|(name, _)| {
+                crate::model_suffix::parse_model_suffix(name.trim())
+                    .0
+                    .trim()
+                    .eq_ignore_ascii_case(slug)
+            })
+            .map(|(_, window)| *window)
+            .or(self.context_window)
+            .filter(|window| *window > 0)
+    }
+
+    /// 上游配置里带的窗口（从直连模式导入的、或模型列表里写了 `[1M]` 后缀的）收进网关自己的
+    /// 字段，再从上游配置里清掉：之后只认网关字段，界面上删掉的窗口不会被旧记录带回来。
+    pub fn adopt_relay_windows(&mut self) {
+        let legacy: BTreeMap<String, String> =
+            serde_json::from_str(&self.relay.model_windows).unwrap_or_default();
+        for (model, token) in legacy {
+            let Some(window) = crate::model_suffix::parse_window_token(&token) else {
+                continue;
+            };
+            let (slug, _) = crate::model_suffix::parse_model_suffix(model.trim());
+            if !self
+                .model_windows
+                .keys()
+                .any(|known| known.eq_ignore_ascii_case(slug.trim()))
+            {
+                self.model_windows.insert(slug.trim().to_string(), window);
+            }
+        }
+        if self.context_window.is_none() {
+            self.context_window =
+                crate::model_suffix::parse_window_token(&self.relay.context_window);
+        }
+        self.relay.model_windows.clear();
+        self.relay.context_window.clear();
     }
 }
 
@@ -584,6 +637,8 @@ fn read_store(path: &Path) -> anyhow::Result<GatewaySettings> {
         if crate::relay_config::normalize_relay_profile_for_storage(&mut normalized).is_ok() {
             provider.relay = normalized;
         }
+        // 导入或手写 `[1M]` 带进上游配置的窗口，收进网关自己的按模型窗口。
+        provider.adopt_relay_windows();
         // 发请求时只认网关自己的代理设置，不按 id 去查直连模式的代理表。
         provider.relay.gateway_proxy = Some(provider.proxy.clone());
     }
@@ -831,6 +886,8 @@ mod tests {
             source: String::new(),
             price: None,
             model_prices: Default::default(),
+            model_windows: Default::default(),
+            context_window: None,
             proxy: String::new(),
             upstream_new: Vec::new(),
             upstream_gone: Vec::new(),

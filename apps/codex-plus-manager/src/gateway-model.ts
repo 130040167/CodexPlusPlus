@@ -60,6 +60,10 @@ export type GatewayPoolEntry = {
   price?: ProviderPrice | null;
   /** 按模型的价格（上游模型名 → 价格）；没填的模型用 `price`。 */
   modelPrices?: Record<string, ProviderPrice>;
+  /** 按模型的上下文窗口（上游模型名 → token）；没写的模型用 `contextWindow`。 */
+  modelWindows?: Record<string, number>;
+  /** 没单独写窗口的模型用的窗口；都没有就用模型自带资料。 */
+  contextWindow?: number | null;
   /** 网关供应商单独走的 HTTP 代理，空串表示不单独走代理。 */
   proxy?: string;
   /** 登录得到的账号：chatgpt / copilot / grok；普通供应商为空。 */

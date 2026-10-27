@@ -354,6 +354,7 @@ pub fn run() {
             gateway_commands::cancel_gateway_login,
             gateway_commands::import_gateway_providers,
             gateway_commands::save_gateway_provider_extras,
+            gateway_commands::save_gateway_provider_windows,
             tray_panel::tray_panel_action,
             tray_panel::tray_panel_enabled,
             tray_panel::set_tray_panel_enabled,

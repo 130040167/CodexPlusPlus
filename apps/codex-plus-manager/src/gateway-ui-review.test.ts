@@ -190,3 +190,18 @@ test("「挑选」弹层挂在 body 上，紧凑规则用 .gw-portal 前缀", ()
   assert.match(read("GatewayPage.css"), /\.gw-portal \.gw-select-item \{/);
   assert.doesNotMatch(read("styles.css"), /\.shell \.gw-select-item/);
 });
+
+test("模型选择器顶部的供应商按钮是筛选，不是滚动到那一段", () => {
+  const source = read("GatewayAgents.tsx");
+  assert.match(source, /onClick=\{\(\) => pickScope\(\{ section: section\.key \}\)\}/);
+  assert.match(source, /if \(sectionOnly\) return all\.filter\(\(section\) => section\.key === sectionOnly \|\| section\.key === "custom"\)/);
+  assert.doesNotMatch(source, /scrollTop = node\.offsetTop/);
+});
+
+test("上下文窗口按模型在供应商池里填，Agent 页只留兜底的默认窗口", () => {
+  const providers = read("GatewayProviders.tsx");
+  assert.match(providers, /"save_gateway_provider_windows", \{ id: entry\.id, windows: modelWindows, fallback \}/);
+  const dialog = read("ProviderWindowsDialog.tsx");
+  assert.match(dialog, /next\[model\] = windowText\(match\.context\)/, "按公开资料填写用 models.dev 的 limit.context");
+  assert.match(read("GatewayAgents.tsx"), /<span>\{t\("默认窗口"\)\}<\/span>/);
+});
