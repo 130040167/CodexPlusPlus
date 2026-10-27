@@ -6585,8 +6585,21 @@ pub async fn perform_update(
     app: tauri::AppHandle,
     release: Option<codex_plus_core::update::Release>,
 ) -> CommandResult<Value> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     let emitter = app.clone();
+    let launching = Arc::new(AtomicBool::new(false));
+    let restored = Arc::new(AtomicBool::new(false));
+    let restored_flag = restored.clone();
     let result = perform_update_inner(release, move |progress| {
+        // 安装包已下载校验、马上启动安装器：先把接入网关的 Agent 恢复成直连（不看「退出时恢复直连」开关）。
+        // 新版本没起来或回滚到旧版时，Agent 不会因为网关不在而全部连不上。
+        if progress.stage == codex_plus_core::update::UpdateStage::Launching
+            && !launching.swap(true, Ordering::SeqCst)
+            && crate::gateway_commands::restore_for_update()
+        {
+            restored_flag.store(true, Ordering::SeqCst);
+        }
         let _ = emitter.emit("update-progress", progress);
     })
     .await;
@@ -6596,6 +6609,9 @@ pub async fn perform_update(
             std::thread::sleep(std::time::Duration::from_millis(750));
             app.exit(0);
         });
+    } else if restored.load(Ordering::SeqCst) {
+        // 安装器没启动起来，Codex++ 继续运行：重新接回网关。
+        crate::gateway_commands::undo_restore_for_update();
     }
     result
 }

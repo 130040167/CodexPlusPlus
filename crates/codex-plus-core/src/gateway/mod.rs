@@ -14,7 +14,7 @@
 //! - [`pipeline`]：候选循环；
 //! - [`anthropic_inbound`] / [`anthropic_outbound`]：Claude Code 的协议转换；
 //! - [`server`]：HTTP 入口；
-//! - [`apply`]：开启 / 关闭时改写 Agent 配置。
+//! - [`apply`]：开启 / 关闭时改写 Agent 配置；[`restore`]：接入前配置的存档与断开时的还原。
 
 pub mod accounts;
 pub mod activity;
@@ -29,6 +29,7 @@ pub mod model_sync;
 pub mod opencode;
 pub mod pipeline;
 pub mod quota;
+pub mod restore;
 pub mod route;
 pub mod server;
 pub mod sessions;

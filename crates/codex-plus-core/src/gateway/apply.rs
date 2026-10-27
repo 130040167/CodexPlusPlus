@@ -17,6 +17,7 @@ use anyhow::{Context, bail};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use crate::gateway::restore::{self as stash, ChangedKey, FileStash, KeyPath};
 use crate::gateway::route::{self, binding_default_model};
 use crate::gateway::store::{
     AgentBinding, GROUP_MODEL_PREFIX, GatewayGroup, GatewayProvider, GatewaySettings, GatewayStore,
@@ -208,6 +209,11 @@ fn write_agent_config(
     let gateway = ctx.gateway.load()?;
     match agent {
         ToolId::Claude => {
+            // 还没指向网关：先把 settings.json 原样存一份，断开时据此还原（见 [`restore_claude`]）。
+            let live_path = ctx.claude.claude_home.join("settings.json");
+            let fresh = claude::current_provider_id(&ctx.claude)? != GATEWAY_PROVIDER_ID;
+            let live_before = stash::read_optional(&live_path)?;
+            let mut file_stash = begin_stash(&claude_stash_path(ctx), fresh, &live_before)?;
             claude::save_provider(
                 &ctx.claude,
                 claude_gateway_provider(&gateway, binding, ctx.port),
@@ -223,20 +229,70 @@ fn write_agent_config(
                 .iter()
                 .find(|provider| !before.contains(&provider.id))
                 .map(|provider| provider.id.clone());
+            if let Some(file_stash) = &mut file_stash {
+                let live_after = stash::read_optional(&live_path)?;
+                file_stash.record_write(
+                    &stash::json_value(live_before.as_deref())?,
+                    &stash::json_value(live_after.as_deref())?,
+                );
+                stash::save_stash(&claude_stash_path(ctx), file_stash)?;
+            }
             return Ok(snapshot);
         }
         ToolId::Grok => {
+            // 同上：Grok 的 config.toml 接入前原样存一份。
+            let live_path = ctx.grok_home.join("config.toml");
+            let live_before = stash::read_optional(&live_path)?;
+            let fresh = !live_before.as_deref().is_some_and(grok_points_at_gateway);
+            let mut file_stash = begin_stash(&grok_stash_path(ctx), fresh, &live_before)?;
             let profile = grok_gateway_profile(&gateway, binding, ctx.port);
             crate::tools::grok::apply_profile_to_grok_at(
                 &ctx.grok_home,
                 &profile,
                 &ctx.backup_root,
             )?;
+            if let Some(file_stash) = &mut file_stash {
+                let live_after = stash::read_optional(&live_path)?;
+                file_stash.record_write(
+                    &stash::toml_value(live_before.as_deref())?,
+                    &stash::toml_value(live_after.as_deref())?,
+                );
+                stash::save_stash(&grok_stash_path(ctx), file_stash)?;
+            }
         }
         ToolId::Codex => write_codex(ctx, &gateway, binding)?,
         other => bail!("{} 不支持网关模式", other.as_str()),
     }
     Ok(None)
+}
+
+/// 开始改写一个 Agent 的配置文件前准备存档：
+/// - `fresh`（还没指向网关）：新建存档，记下接入前的原文；先落盘再改配置，存不下就不改；
+/// - 已经指向网关：沿用已有的存档（之后把这次改到的键追加进去）；没有存档（旧版接入的）就不记。
+fn begin_stash(
+    path: &std::path::Path,
+    fresh: bool,
+    live_before: &Option<String>,
+) -> anyhow::Result<Option<FileStash>> {
+    if fresh {
+        let file_stash = FileStash::new(live_before.clone());
+        stash::save_stash(path, &file_stash)?;
+        return Ok(Some(file_stash));
+    }
+    Ok(stash::load_stash(path))
+}
+
+fn claude_stash_path(ctx: &ApplyContext) -> PathBuf {
+    ctx.backup_root.join("claude-before-gateway.json")
+}
+
+fn grok_stash_path(ctx: &ApplyContext) -> PathBuf {
+    ctx.backup_root.join("grok-before-gateway.json")
+}
+
+/// Grok 的配置还指向网关（与 [`crate::gateway::drift`] 的判断一致）。
+fn grok_points_at_gateway(text: &str) -> bool {
+    text.contains("/gw/grok")
 }
 
 /// Codex 的托管网关供应商：与直连模式里手加的 Responses 供应商一样存储（配置快照里带地址和 token）。
@@ -604,15 +660,47 @@ fn codex_signed_in(codex_home: &std::path::Path) -> bool {
         })
 }
 
-/// 接入网关前 Codex 实时配置的原样副本。只在实时配置与直连模式的记录对不上时才存：
-/// 那时直连模式没法从它自己的记录还原，断开时要把这份原样写回。
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+/// 接入网关前 Codex 实时配置的副本。只在实时配置与直连模式的记录对不上时才存：
+/// 那时直连模式没法从它自己的记录还原，断开时据此还原网关改过的键（见 [`restore_codex_files`]）。
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexLiveStash {
     #[serde(default)]
     config_toml: Option<String>,
     #[serde(default)]
     auth_json: Option<String>,
+    /// 网关改过的 config.toml 键；None 是旧版的存档（没记），还原时按已知的网关键兜底。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    config_changed: Option<Vec<ChangedKey>>,
+    /// 网关改过的 auth.json 键与写进去的值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_changed: Option<Vec<ChangedKey>>,
+}
+
+impl CodexLiveStash {
+    /// 记下一次写入改到的键（`before` / `after` 是写入前后的实时文件）。
+    /// 文件解析不了时当作空的（那样的文件直连模式本来也切不过去）。
+    fn record_write(&mut self, before: &CodexLiveStash, after: &CodexLiveStash) {
+        let empty = || Value::Object(Map::new());
+        let mut config = FileStash {
+            before: None,
+            changed: self.config_changed.take().unwrap_or_default(),
+        };
+        config.record_write(
+            &stash::toml_value(before.config_toml.as_deref()).unwrap_or_else(|_| empty()),
+            &stash::toml_value(after.config_toml.as_deref()).unwrap_or_else(|_| empty()),
+        );
+        self.config_changed = Some(config.changed);
+        let mut auth = FileStash {
+            before: None,
+            changed: self.auth_changed.take().unwrap_or_default(),
+        };
+        auth.record_write(
+            &stash::json_value(before.auth_json.as_deref()).unwrap_or_else(|_| empty()),
+            &stash::json_value(after.auth_json.as_deref()).unwrap_or_else(|_| empty()),
+        );
+        self.auth_changed = Some(auth.changed);
+    }
 }
 
 const CODEX_LIVE_FILES: [&str; 2] = ["config.toml", "auth.json"];
@@ -626,31 +714,88 @@ fn capture_codex_live(ctx: &ApplyContext) -> CodexLiveStash {
     CodexLiveStash {
         config_toml: read(CODEX_LIVE_FILES[0]),
         auth_json: read(CODEX_LIVE_FILES[1]),
+        ..CodexLiveStash::default()
     }
 }
 
-fn save_codex_stash(ctx: &ApplyContext, stash: &CodexLiveStash) -> anyhow::Result<()> {
-    let path = codex_stash_path(ctx);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // 里面有 auth.json（凭据），只给自己读写。
-    crate::settings::atomic_write(&path, serde_json::to_string_pretty(stash)?.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+/// 旧版存档没记网关改过哪些键：按网关会写的键兜底（这些键与接入前不同就改回去）。
+const CODEX_GATEWAY_KEYS: &[&str] = &[
+    "model_provider",
+    "model",
+    "model_catalog_json",
+    "openai_base_url",
+    "model_reasoning_effort",
+    "model_context_window",
+    "model_auto_compact_token_limit",
+    "preferred_auth_method",
+];
+
+fn legacy_codex_config_paths(before: Option<&str>, current: Option<&str>) -> Vec<KeyPath> {
+    let (Ok(before), Ok(current)) = (stash::toml_value(before), stash::toml_value(current)) else {
+        return Vec::new();
+    };
+    stash::changed_paths(&before, &current)
+        .into_iter()
+        .filter(|path| {
+            path.first().is_some_and(|key| {
+                key == "model_providers" || CODEX_GATEWAY_KEYS.contains(&key.as_str())
+            })
+        })
+        .collect()
+}
+
+/// 断开时还原 Codex 的实时文件（只在接入时存过副本的情况下）。`live` 是切回直连之前的实时文件。
+///
+/// - config.toml：只把网关改过的键改回接入前的值，其余（例如接入期间加的 MCP）照当前的留着；
+/// - auth.json：只处理网关改过、之后 Codex 没再动过的键（Codex 刷新过的 token、新登录的账号都保留），
+///   其余照切回前的样子；接入前没有、现在也没别的内容时才删掉。
+fn restore_codex_files(
+    ctx: &ApplyContext,
+    saved: &CodexLiveStash,
+    live: &CodexLiveStash,
+) -> anyhow::Result<()> {
+    let config_paths = match &saved.config_changed {
+        Some(changed) => changed.iter().map(|key| key.path.clone()).collect(),
+        None => {
+            legacy_codex_config_paths(saved.config_toml.as_deref(), live.config_toml.as_deref())
+        }
+    };
+    let config = stash::restore_toml(
+        saved.config_toml.as_deref(),
+        live.config_toml.as_deref(),
+        &config_paths,
+    )
+    .context("还原 Codex 的 config.toml 失败")?;
+    stash::write_or_remove(&ctx.codex_home.join(CODEX_LIVE_FILES[0]), config.as_deref())?;
+
+    let auth_changed = match &saved.auth_changed {
+        Some(changed) => changed.clone(),
+        // 旧版存档：只认得出网关自己的 token（cpx-gw- 开头），把它们换回接入前的值。
+        None => stash::json_value(live.auth_json.as_deref())
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, value)| {
+                value.as_str().is_some_and(|text| {
+                    text.starts_with(crate::gateway::store::CLIENT_TOKEN_PREFIX)
+                })
+            })
+            .map(|(key, value)| ChangedKey {
+                path: vec![key],
+                written: Some(value),
+            })
+            .collect(),
+    };
+    let auth = stash::restore_json(
+        saved.auth_json.as_deref(),
+        live.auth_json.as_deref(),
+        &auth_changed,
+        |key, _, now| stash::value_at(now, &key.path) != key.written.as_ref(),
+    )
+    .context("还原 Codex 的 auth.json 失败")?;
+    stash::write_or_remove(&ctx.codex_home.join(CODEX_LIVE_FILES[1]), auth.as_deref())?;
     Ok(())
-}
-
-fn take_codex_stash(ctx: &ApplyContext) -> Option<CodexLiveStash> {
-    let path = codex_stash_path(ctx);
-    let stash = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok());
-    let _ = std::fs::remove_file(&path);
-    stash
 }
 
 /// 把托管供应商放进直连模式的列表并切过去（已经在用时只刷新它的配置）。
@@ -685,7 +830,7 @@ fn write_codex(
         CODEX_GATEWAY_RELAY_ID.to_string(),
     );
     let switching_in = previous != CODEX_GATEWAY_RELAY_ID;
-    let live = switching_in.then(|| capture_codex_live(ctx));
+    let live = capture_codex_live(ctx);
     let switched = crate::relay_switch::switch_relay_profile_in_home(
         &ctx.settings,
         &ctx.codex_home,
@@ -696,7 +841,14 @@ fn write_codex(
         Ok(_) => {
             if switching_in {
                 // 直连模式能从自己的记录还原，不需要原样副本；清掉以前留下的。
-                let _ = std::fs::remove_file(codex_stash_path(ctx));
+                stash::remove_stash(&codex_stash_path(ctx));
+            } else if let Some(mut saved) =
+                stash::load_stash::<CodexLiveStash>(&codex_stash_path(ctx))
+                && saved.config_changed.is_some()
+            {
+                // 接入时存过副本：这次重写改到的键也记上，断开时一起改回去。
+                saved.record_write(&live, &capture_codex_live(ctx));
+                stash::save_stash(&codex_stash_path(ctx), &saved)?;
             }
         }
         Err(error)
@@ -705,9 +857,8 @@ fn write_codex(
                     .downcast_ref::<crate::relay_switch::LiveEndpointConflict>()
                     .is_some() =>
         {
-            if let Some(live) = &live {
-                save_codex_stash(ctx, live)?;
-            }
+            // 先存接入前的原文（还没记改了哪些键：万一切换中途退出，还原时按已知的网关键兜底）。
+            stash::save_stash(&codex_stash_path(ctx), &live)?;
             crate::relay_switch::switch_relay_profile_in_home_resolving_conflict(
                 &ctx.settings,
                 &ctx.codex_home,
@@ -716,6 +867,9 @@ fn write_codex(
                 crate::relay_switch::LiveConflictResolution::DiscardLiveChanges,
             )
             .context("把 Codex 切到网关失败")?;
+            let mut saved = live.clone();
+            saved.record_write(&live, &capture_codex_live(ctx));
+            stash::save_stash(&codex_stash_path(ctx), &saved)?;
         }
         Err(error) => return Err(error.context("把 Codex 切到网关失败")),
     }
@@ -742,6 +896,15 @@ pub fn enable_binding(
         .map(|previous| previous.token.clone())
         .filter(|token| !token.trim().is_empty())
         .unwrap_or_else(|| new_client_token(agent));
+    // 更新版本写的未知字段：界面传回的绑定里没有的，沿用原来的。
+    if let Some(previous) = &previous {
+        for (key, value) in &previous.extra {
+            binding
+                .extra
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
     binding.restore = match previous.filter(|previous| previous.enabled) {
         Some(previous) => previous.restore,
         None => {
@@ -778,16 +941,28 @@ pub fn disable_binding(
     settings: &BackendSettings,
     agent: &ToolId,
 ) -> anyhow::Result<GatewaySettings> {
-    let gateway = ctx.gateway.load()?;
-    let Some(binding) = gateway.bindings.get(agent.as_str()).cloned() else {
-        return Ok(gateway);
+    let gateway = match ctx.gateway.load() {
+        Ok(gateway) => gateway,
+        // gateway.json 读不出来（例如损坏），但 Agent 还指向网关：照样还原，不碰 gateway.json。
+        Err(error) if agent_points_at_gateway(ctx, agent) => {
+            restore_agent(ctx, settings, agent, &AgentBinding::default())
+                .with_context(|| format!("网关状态读取失败（{error:#}），按直连还原也失败"))?;
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "gateway.disable_without_store",
+                serde_json::json!({ "agent": agent.as_str(), "message": format!("{error:#}") }),
+            );
+            return Ok(GatewaySettings::default());
+        }
+        Err(error) => return Err(error),
     };
-    match agent {
-        ToolId::Claude => restore_claude(ctx, &binding)?,
-        ToolId::Grok => restore_grok(ctx, settings)?,
-        ToolId::Codex => restore_codex(ctx, &binding)?,
-        _ => {}
-    }
+    // 没有绑定（例如降级后又升级、gateway.json 被换过），但 Agent 还停在网关上：照样还原，
+    // 否则界面一直显示「被网关接管」却断不开。
+    let binding = match gateway.bindings.get(agent.as_str()) {
+        Some(binding) => binding.clone(),
+        None if agent_points_at_gateway(ctx, agent) => AgentBinding::default(),
+        None => return Ok(gateway),
+    };
+    restore_agent(ctx, settings, agent, &binding)?;
     // 恢复时可能改过 gateway.json（收回借出的账号等），以最新的为准。
     let mut gateway = ctx.gateway.load()?;
     if let Some(binding) = gateway.bindings.get_mut(agent.as_str()) {
@@ -798,8 +973,44 @@ pub fn disable_binding(
     Ok(gateway)
 }
 
+/// 把一个 Agent 的配置还原成接入网关前的样子。
+fn restore_agent(
+    ctx: &ApplyContext,
+    settings: &BackendSettings,
+    agent: &ToolId,
+    binding: &AgentBinding,
+) -> anyhow::Result<()> {
+    match agent {
+        ToolId::Claude => restore_claude(ctx, binding),
+        ToolId::Grok => restore_grok(ctx, settings),
+        ToolId::Codex => restore_codex(ctx, binding),
+        _ => Ok(()),
+    }
+}
+
+/// Agent 的配置现在还指向网关（不看 gateway.json 里的绑定）。
+fn agent_points_at_gateway(ctx: &ApplyContext, agent: &ToolId) -> bool {
+    match agent {
+        ToolId::Codex => ctx
+            .settings
+            .load()
+            .is_ok_and(|settings| settings.active_relay_id == CODEX_GATEWAY_RELAY_ID),
+        ToolId::Claude => claude::current_provider_id(&ctx.claude)
+            .is_ok_and(|current| current == GATEWAY_PROVIDER_ID),
+        ToolId::Grok => stash::read_optional(&ctx.grok_home.join("config.toml"))
+            .ok()
+            .flatten()
+            .is_some_and(|text| grok_points_at_gateway(&text)),
+        _ => false,
+    }
+}
+
+/// 切回开启前的供应商（不在了就清掉当前供应商），删掉托管供应商；
+/// 接入时存过 settings.json 的话，再把网关改过的键改回接入前的值（接入前的配置如果没存成供应商，
+/// 只靠切换会丢）。用户已经在 Claude 页切走了的，只删托管供应商。
 fn restore_claude(ctx: &ApplyContext, binding: &AgentBinding) -> anyhow::Result<()> {
     let payload = claude::load(&ctx.claude)?;
+    let stash_path = claude_stash_path(ctx);
     if payload.current_id == GATEWAY_PROVIDER_ID {
         let previous = binding.restore.claude_previous_provider_id.trim();
         let can_switch_back = !previous.is_empty()
@@ -812,7 +1023,21 @@ fn restore_claude(ctx: &ApplyContext, binding: &AgentBinding) -> anyhow::Result<
         } else {
             claude::clear_current(&ctx.claude)?;
         }
+        if let Some(saved) = stash::load_stash::<FileStash>(&stash_path) {
+            let live_path = ctx.claude.claude_home.join("settings.json");
+            let live = stash::read_optional(&live_path)?;
+            let restored = stash::restore_json(
+                saved.before.as_deref(),
+                live.as_deref(),
+                &saved.changed,
+                |_, _, _| false,
+            )
+            .context("还原 Claude Code 的 settings.json 失败")?;
+            stash::write_or_remove(&live_path, restored.as_deref())
+                .context("写回 Claude Code 接入网关前的 settings.json 失败")?;
+        }
     }
+    stash::remove_stash(&stash_path);
     if payload
         .providers
         .iter()
@@ -837,13 +1062,18 @@ fn codex_active_relay_id(ctx: &ApplyContext) -> anyhow::Result<String> {
 /// 用户已经在直连模式里切走了的，只删托管供应商。
 fn restore_codex(ctx: &ApplyContext, binding: &AgentBinding) -> anyhow::Result<()> {
     // 先收回借给 Codex 的账号，切回去时上一个供应商写的是它自己的 auth.json。
-    return_lent_login(&ctx.gateway, &ctx.codex_home)?;
+    // gateway.json 读不出来时没法知道借没借，跳过。
+    if ctx.gateway.load().is_ok() {
+        return_lent_login(&ctx.gateway, &ctx.codex_home)?;
+    }
     let mut settings = ctx.settings.load()?;
     let is_managed = |profile: &RelayProfile| profile.id == CODEX_GATEWAY_RELAY_ID;
-    if !settings.relay_profiles.iter().any(is_managed) {
+    let has_managed = settings.relay_profiles.iter().any(is_managed);
+    let on_gateway = settings.active_relay_id == CODEX_GATEWAY_RELAY_ID;
+    if !has_managed && !on_gateway {
         return Ok(());
     }
-    if settings.active_relay_id == CODEX_GATEWAY_RELAY_ID {
+    if on_gateway {
         let previous = binding.restore.codex_previous_relay_id.trim();
         let exists = |id: &str| {
             !id.is_empty()
@@ -867,29 +1097,47 @@ fn restore_codex(ctx: &ApplyContext, binding: &AgentBinding) -> anyhow::Result<(
                 .map(|profile| profile.id.clone())
                 .context("Codex 的直连模式里没有别的供应商可切回：先在 Codex 的供应商页添加一个")?
         };
+        // 切回前的实时文件：接入时存过副本的话，据此只改回网关改过的键。
+        let live = capture_codex_live(ctx);
+        let saved = stash::load_stash::<CodexLiveStash>(&codex_stash_path(ctx));
         settings.active_relay_id = target;
-        crate::relay_switch::switch_relay_profile_in_home(
-            &ctx.settings,
-            &ctx.codex_home,
-            settings,
-            CODEX_GATEWAY_RELAY_ID,
-        )
-        .context("把 Codex 切回直连失败")?;
-        settings = ctx.settings.load()?;
-        // 接入前的实时配置与直连模式的记录对不上：把当时的文件原样写回。
-        if let Some(stash) = take_codex_stash(ctx) {
-            for (name, contents) in CODEX_LIVE_FILES
-                .iter()
-                .zip([stash.config_toml, stash.auth_json])
-            {
-                let path = ctx.codex_home.join(name);
-                match contents {
-                    Some(contents) => crate::settings::atomic_write(&path, contents.as_bytes())?,
-                    None if path.exists() => std::fs::remove_file(&path)?,
-                    None => {}
+        // 托管供应商还在列表里时按直连模式的正常流程切（会回填公共配置，接入期间加的 MCP 等不丢）；
+        // 不在了（被删、或旧版留下的状态），或实时配置被别的工具改过，就不回填、实时文件先备份再切。
+        let discard_live = if has_managed {
+            match crate::relay_switch::switch_relay_profile_in_home(
+                &ctx.settings,
+                &ctx.codex_home,
+                settings.clone(),
+                CODEX_GATEWAY_RELAY_ID,
+            ) {
+                Ok(_) => false,
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::relay_switch::LiveEndpointConflict>()
+                        .is_some() =>
+                {
+                    true
                 }
+                Err(error) => return Err(error.context("把 Codex 切回直连失败")),
             }
+        } else {
+            true
+        };
+        if discard_live {
+            crate::relay_switch::switch_relay_profile_in_home_resolving_conflict(
+                &ctx.settings,
+                &ctx.codex_home,
+                settings,
+                CODEX_GATEWAY_RELAY_ID,
+                crate::relay_switch::LiveConflictResolution::DiscardLiveChanges,
+            )
+            .context("把 Codex 切回直连失败")?;
         }
+        settings = ctx.settings.load()?;
+        if let Some(saved) = saved {
+            restore_codex_files(ctx, &saved, &live)?;
+        }
+        stash::remove_stash(&codex_stash_path(ctx));
     }
     // 切换会把请求里缺的供应商从磁盘补回，所以托管供应商要在切走之后单独删。
     settings
@@ -899,16 +1147,39 @@ fn restore_codex(ctx: &ApplyContext, binding: &AgentBinding) -> anyhow::Result<(
     Ok(())
 }
 
+/// 还原 Grok 的 config.toml：接入时存过原文的，把网关改过的键（地址、api_backend、Key、默认模型、
+/// 模型别名）改回接入前的值；没有存档（旧版接入的）时重新应用 Grok 页当前选中的供应商。
+/// 配置已经不指向网关（用户在 Grok 页换过）时不动。写不回去时报错，不假装成功。
 fn restore_grok(ctx: &ApplyContext, settings: &BackendSettings) -> anyhow::Result<()> {
-    let Some(config) = settings.tools.get(&ToolId::Grok) else {
-        return Ok(());
-    };
-    let Some(profile) = crate::tools::grok::active_grok_profile(config) else {
-        return Ok(());
-    };
-    if crate::tools::grok::parse_grok_model_list(&profile.model_list).is_empty() {
+    let live_path = ctx.grok_home.join("config.toml");
+    let live = stash::read_optional(&live_path)?;
+    let on_gateway = live.as_deref().is_some_and(grok_points_at_gateway);
+    let stash_path = grok_stash_path(ctx);
+    if let Some(saved) = stash::load_stash::<FileStash>(&stash_path) {
+        if on_gateway {
+            let restored =
+                stash::restore_toml(saved.before.as_deref(), live.as_deref(), &saved.paths())
+                    .context("还原 Grok 的 config.toml 失败")?;
+            stash::write_or_remove(&live_path, restored.as_deref())
+                .context("写回 Grok 接入网关前的 config.toml 失败")?;
+        }
+        stash::remove_stash(&stash_path);
         return Ok(());
     }
+    if !on_gateway {
+        return Ok(());
+    }
+    let profile = settings
+        .tools
+        .get(&ToolId::Grok)
+        .and_then(crate::tools::grok::active_grok_profile)
+        .filter(|profile| {
+            !crate::tools::grok::parse_grok_model_list(&profile.model_list).is_empty()
+        })
+        .context(
+            "Grok 的配置还指向网关，但没有接入前的存档，也没有可应用的 Grok 供应商：\
+             请在 Grok 页添加并应用一个供应商",
+        )?;
     crate::tools::grok::apply_profile_to_grok_at(&ctx.grok_home, &profile, &ctx.backup_root)?;
     Ok(())
 }
@@ -1042,25 +1313,40 @@ pub fn reapply_if_port_changed(ctx: &ApplyContext) -> anyhow::Result<usize> {
     Ok(changed)
 }
 
-/// 退出 Codex++ 时恢复所有走网关的 Agent（用户打开了「退出时恢复直连」）。
-/// 绑定保留为开启状态，下次启动时由 [`reapply_enabled`] 重新指回网关。
-pub fn restore_all_for_exit(ctx: &ApplyContext, settings: &BackendSettings) -> anyhow::Result<()> {
+/// 退出 Codex++（用户打开了「退出时恢复直连」，默认开）或安装更新前（`force`，不看开关）
+/// 恢复所有走网关的 Agent。绑定保留为开启状态，并记下「已恢复」，下次启动时由 [`reapply_enabled`]
+/// 重新指回网关。某个 Agent 还原失败时继续还原其它的，最后返回第一个错误。
+pub fn restore_all_for_exit(
+    ctx: &ApplyContext,
+    settings: &BackendSettings,
+    force: bool,
+) -> anyhow::Result<()> {
     let gateway = ctx.gateway.load()?;
-    if !gateway.restore_on_exit {
+    if !force && !gateway.restore_on_exit {
         return Ok(());
     }
+    let mut restored = false;
+    let mut first_error = None;
     for (agent, binding) in &gateway.bindings {
         if !binding.enabled {
             continue;
         }
-        match ToolId::parse(agent) {
-            ToolId::Claude => restore_claude(ctx, binding)?,
-            ToolId::Grok => restore_grok(ctx, settings)?,
-            ToolId::Codex => restore_codex(ctx, binding)?,
-            _ => {}
+        match restore_agent(ctx, settings, &ToolId::parse(agent), binding) {
+            Ok(()) => restored = true,
+            Err(error) => {
+                first_error.get_or_insert(error.context(format!("还原 {agent} 失败")));
+            }
         }
     }
-    Ok(())
+    if restored {
+        let mut latest = ctx.gateway.load()?;
+        latest.restored_at_exit = true;
+        ctx.gateway.save(&latest)?;
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// 供应商池或路由组变化后重写开着的 Agent 配置：Grok 的模型列表、Claude 的默认模型随池更新。
@@ -1086,7 +1372,7 @@ pub fn refresh_enabled(ctx: &ApplyContext) -> anyhow::Result<usize> {
     }
 }
 
-/// 启动时把开着的绑定重新写进 Agent 配置（退出时恢复过直连，或端口变了）。
+/// 启动时把开着的绑定重新写进 Agent 配置（退出 / 更新前恢复过直连，或端口变了），并清掉「已恢复」标记。
 pub fn reapply_enabled(ctx: &ApplyContext) -> anyhow::Result<usize> {
     let gateway = ctx.gateway.load()?;
     let mut count = 0;
@@ -1119,6 +1405,11 @@ pub fn reapply_enabled(ctx: &ApplyContext) -> anyhow::Result<usize> {
         latest.bindings.insert(agent.as_str().to_string(), binding);
         ctx.gateway.save(&latest)?;
         count += 1;
+    }
+    let mut latest = ctx.gateway.load()?;
+    if latest.restored_at_exit {
+        latest.restored_at_exit = false;
+        ctx.gateway.save(&latest)?;
     }
     Ok(count)
 }
@@ -1585,6 +1876,7 @@ pub fn add_provider(
         upstream_gone: Vec::new(),
         models_checked_at_ms: 0,
         relay,
+        extra: Default::default(),
     });
     exclude_new_provider(&mut gateway, &id, skip_agents);
     store.save(&gateway)?;
@@ -1831,15 +2123,20 @@ pub fn save_group(
     if members.is_empty() {
         bail!("模型组至少要有一个成员");
     }
-    let group = GatewayGroup {
+    let mut group = GatewayGroup {
         id: id.clone(),
         name: name.to_string(),
         mode: input.mode,
         sticky: input.sticky,
         members,
+        extra: Default::default(),
     };
     match gateway.groups.iter_mut().find(|known| known.id == id) {
-        Some(existing) => *existing = group,
+        Some(existing) => {
+            // 更新版本写的未知字段跟着原来的组走。
+            group.extra = std::mem::take(&mut existing.extra);
+            *existing = group;
+        }
         None => gateway.groups.push(group),
     }
     store.save(&gateway)?;

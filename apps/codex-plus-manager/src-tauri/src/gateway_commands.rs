@@ -1301,7 +1301,7 @@ pub fn reset_gateway_key_health(relay_id: String) -> CommandResult<Option<Gatewa
     ok("已重置该供应商的 Key 状态。", current_payload())
 }
 
-/// 管理器启动时：有 Agent 开着网关就拉起常驻 helper，并在端口变化或退出时恢复过直连的情况下重写配置。
+/// 管理器启动时：有 Agent 开着网关就拉起常驻 helper，并在端口变化或退出 / 更新前恢复过直连的情况下重写配置。
 pub fn start_from_saved_state() {
     let Ok(gateway) = GatewayStore::default().load() else {
         return;
@@ -1313,7 +1313,7 @@ pub fn start_from_saved_state() {
         return;
     };
     let ctx = ApplyContext::default_paths(port);
-    let result = if gateway.restore_on_exit {
+    let result = if gateway.restore_on_exit || gateway.restored_at_exit {
         apply::reapply_enabled(&ctx)
     } else {
         apply::reapply_if_port_changed(&ctx)
@@ -1327,13 +1327,39 @@ pub fn start_from_saved_state() {
     }
 }
 
-/// 管理器退出时：用户要求的话把走网关的 Agent 恢复成直连。
+/// 管理器退出时：用户要求的话（默认开）把走网关的 Agent 恢复成直连。
 pub fn restore_for_exit() {
     let settings = SettingsStore::default().load().unwrap_or_default();
-    if let Err(error) = apply::restore_all_for_exit(&context(), &settings) {
+    if let Err(error) = apply::restore_all_for_exit(&context(), &settings, false) {
         let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
             "gateway.exit_restore_failed",
             serde_json::json!({ "message": format!("{error:#}") }),
         );
     }
+}
+
+/// 安装更新前：不管「退出时恢复直连」开没开，都把走网关的 Agent 恢复成直连。
+/// 新版本没起来（安装失败、降级到不认识网关的旧版）时 Agent 也能直接连上游。返回是否有 Agent 被还原。
+pub fn restore_for_update() -> bool {
+    let has_enabled = GatewayStore::default()
+        .load()
+        .is_ok_and(|gateway| gateway.any_enabled());
+    if !has_enabled {
+        return false;
+    }
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    let result = apply::restore_all_for_exit(&context(), &settings, true);
+    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+        "gateway.update_restore",
+        serde_json::json!({
+            "ok": result.is_ok(),
+            "message": result.as_ref().err().map(|error| format!("{error:#}")),
+        }),
+    );
+    true
+}
+
+/// 更新没装成、Codex++ 继续运行：把更新前恢复成直连的 Agent 重新接回网关。
+pub fn undo_restore_for_update() {
+    start_from_saved_state();
 }

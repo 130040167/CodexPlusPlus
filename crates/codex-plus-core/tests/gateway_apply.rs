@@ -207,7 +207,12 @@ fn claude_with_nothing_configured_is_cleared_on_disable() {
     let ctx = &fixture.ctx;
     enable_binding(ctx, &ToolId::Claude, binding()).unwrap();
     disable_binding(ctx, &settings(), &ToolId::Claude).unwrap();
-    let live = read_settings_json(ctx);
+    // 接入前没有 settings.json：还原成没有（之后有别的改动时才留下文件）。
+    let path = ctx.claude.claude_home.join("settings.json");
+    let live: Value = std::fs::read_to_string(&path)
+        .ok()
+        .map(|text| serde_json::from_str(&text).unwrap())
+        .unwrap_or_else(|| json!({}));
     let env = live
         .get("env")
         .and_then(Value::as_object)
@@ -267,6 +272,13 @@ fn grok_enable_writes_gateway_endpoint_and_disable_restores_profile() {
         model_list: "grok-5".into(),
         ..RelayProfile::default()
     };
+    // Grok 页应用过这个供应商：接入前 config.toml 指向它。
+    codex_plus_core::tools::grok::apply_profile_to_grok_at(
+        &ctx.grok_home,
+        &grok_profile,
+        &ctx.backup_root,
+    )
+    .unwrap();
     let mut shard = settings.tool_config(&ToolId::Grok);
     shard.relay_profiles = vec![grok_profile];
     shard.active_relay_id = "grok-direct".into();
