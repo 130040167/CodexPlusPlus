@@ -3167,3 +3167,9 @@ body.gw-sorting * {
   margin: 0;
   padding: 14px 18px 18px;
 }
+
+.shell .gw-sync-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}

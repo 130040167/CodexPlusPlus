@@ -202,6 +202,59 @@ pub fn set_provider_models(
 
 /// 按公开价格表给没填价的模型补价格。只补「供应商没有统一价格、这个模型也没单独填」的；
 /// `only` 为 `None` 时处理全部供应商。返回补了几个模型。
+/// 公开价格表的一条匹配 → 供应商价格（没写币种的按美元）。
+fn price_from_match(found: crate::model_pricing::PriceMatch) -> ProviderPrice {
+    ProviderPrice {
+        currency: if found.currency.is_empty() {
+            "USD".to_string()
+        } else {
+            found.currency
+        },
+        input: found.input,
+        cached_input: found.cached_input,
+        output: found.output,
+    }
+}
+
+/// 一键同步：按公开价格表更新一个供应商所有模型的价格。查得到的覆盖（包括手动填过的），
+/// 查不到的保留原值。返回（查到几个，一共几个模型）。
+pub async fn sync_public_prices(store: &GatewayStore, id: &str) -> anyhow::Result<(usize, usize)> {
+    let relay = store
+        .load()?
+        .provider(id)
+        .map(|provider| provider.relay.clone())
+        .ok_or_else(|| anyhow::anyhow!("供应商不存在：{id}"))?;
+    let models = crate::gateway::route::relay_models(&relay);
+    let (catalog, _) = crate::model_pricing::load_catalog(false).await?;
+    let found: Vec<(String, ProviderPrice)> = models
+        .iter()
+        .filter_map(|model| {
+            catalog
+                .lookup(&relay.base_url, model)
+                .map(|hit| (model.clone(), price_from_match(hit)))
+        })
+        .collect();
+    if !found.is_empty() {
+        let mut gateway = store.load()?;
+        let Some(provider) = gateway
+            .providers
+            .iter_mut()
+            .find(|provider| provider.relay.id == id)
+        else {
+            bail!("供应商不存在：{id}");
+        };
+        for (model, price) in &found {
+            // 大小写不同的旧记录一并替换，免得同一个模型存两份。
+            provider
+                .model_prices
+                .retain(|name, _| !name.eq_ignore_ascii_case(model));
+            provider.model_prices.insert(model.clone(), price.clone());
+        }
+        store.save(&gateway)?;
+    }
+    Ok((found.len(), models.len()))
+}
+
 pub async fn fill_missing_prices(
     store: &GatewayStore,
     only: Option<&str>,
@@ -245,19 +298,7 @@ pub async fn fill_missing_prices(
                 continue;
             }
             if let Some(found) = catalog.lookup(&base_url, &model) {
-                provider.model_prices.insert(
-                    model,
-                    ProviderPrice {
-                        currency: if found.currency.is_empty() {
-                            "USD".to_string()
-                        } else {
-                            found.currency
-                        },
-                        input: found.input,
-                        cached_input: found.cached_input,
-                        output: found.output,
-                    },
-                );
+                provider.model_prices.insert(model, price_from_match(found));
                 filled += 1;
             }
         }
@@ -324,8 +365,7 @@ mod tests {
             "默认模型不在列表里就换成第一个"
         );
 
-        let saved =
-            set_provider_models(&store, "p", &["c".into(), "d".into()], Some("d")).unwrap();
+        let saved = set_provider_models(&store, "p", &["c".into(), "d".into()], Some("d")).unwrap();
         assert_eq!(saved.provider("p").unwrap().relay.model, "d");
     }
 }

@@ -430,15 +430,16 @@ pub fn update_gateway_provider(
     id: String,
     input: ProviderInput,
 ) -> CommandResult<Option<GatewayPayload>> {
-    respond(
-        "供应商已保存。",
-        "保存供应商失败",
-        refresh_agents(apply::update_provider(
-            &GatewayStore::default(),
-            &id,
-            &input,
-        )),
-    )
+    let result = refresh_agents(apply::update_provider(
+        &GatewayStore::default(),
+        &id,
+        &input,
+    ));
+    // 表单里可能改了模型列表：新模型按公开价格表补价格。
+    if result.is_ok() {
+        autofill_prices(Some(id));
+    }
+    respond("供应商已保存。", "保存供应商失败", result)
 }
 
 /// 只改供应商的价格与独立代理（在供应商池的详情里编辑）。
@@ -502,6 +503,22 @@ fn refresh_added<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
         autofill_prices(None);
     }
     refresh_agents(result)
+}
+
+/// 一键同步价格：按公开价格表更新这个供应商所有模型的价格并保存。
+#[tauri::command]
+pub async fn sync_gateway_provider_prices(id: String) -> CommandResult<Option<GatewayPayload>> {
+    match model_sync::sync_public_prices(&GatewayStore::default(), &id).await {
+        Ok((0, total)) => failed(
+            &format!("公开价格表里没找到这 {total} 个模型，需要的话手动填写。"),
+            current_payload(),
+        ),
+        Ok((found, total)) => ok(
+            &format!("已按公开价格表更新 {found} / {total} 个模型的价格。"),
+            current_payload(),
+        ),
+        Err(error) => failed(&format!("同步价格失败：{error:#}"), current_payload()),
+    }
 }
 
 /// 后台按公开价格表给没填价的模型补价格（添加供应商、改模型列表后调用）。补完由界面的轮询读到。

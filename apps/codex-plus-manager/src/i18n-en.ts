@@ -1093,6 +1093,13 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "保存代理": "Save proxy",
+  "保存价格": "Save prices",
+  "同步价格": "Sync prices",
+  "按公开价格表（models.dev）更新所有模型的价格": "Update prices for all models from the public price list (models.dev)",
+  "同步": "Sync",
+  "用于「用量」里估算费用": "Used to estimate costs in Usage",
+  "只作用于这个供应商": "Applies to this provider only",
   "Agent 请求这些模型名时会路由到这个供应商": "Agent requests for these model names are routed to this provider",
   "用已保存的 Key 或登录重新获取": "Fetch again with the saved key or login",
   "从上游刷新": "Refresh from upstream",
@@ -2325,6 +2332,8 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "{0} 的价格": "{0} pricing",
+  "{0} 的代理": "{0} proxy",
   "上游有 {0} 个模型": "{0} models upstream",
   "{0} 的模型": "{0} models",
   "上游新增 {0}": "{0} new upstream",

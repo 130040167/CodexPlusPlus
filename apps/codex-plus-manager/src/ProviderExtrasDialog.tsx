@@ -68,10 +68,14 @@ export function ProviderExtrasDialog({
   busy,
   onSave,
   onCancel,
+  section,
 }: {
   entry: GatewayPoolEntry;
   busy: boolean;
-  onSave: (price: ProviderPrice | null, modelPrices: Record<string, ProviderPrice>, proxy: string) => void;
+  /** 只编辑价格或只编辑代理；另一项原样保留。 */
+  section: "price" | "proxy";
+  /** `modelPrices` 为 null 表示不改按模型的价格。 */
+  onSave: (price: ProviderPrice | null, modelPrices: Record<string, ProviderPrice> | null, proxy: string) => void;
   onCancel: () => void;
 }) {
   // 每个模型一行，最后一行「其它模型」是没单独填价时用的默认价。
@@ -130,22 +134,26 @@ export function ProviderExtrasDialog({
         className="pf-modal pf-extras-modal"
         onSubmit={(event) => {
           event.preventDefault();
-          if (proxyError) return;
+          if (section === "proxy") {
+            if (!proxyError) onSave(entry.price ?? null, null, proxy.trim());
+            return;
+          }
           const perModel: Record<string, PriceRow> = { ...rows };
           delete perModel[FALLBACK];
-          onSave(priceFromRow(rows[FALLBACK] ?? EMPTY_PRICE_ROW, currency), modelPricesFromRows(perModel, currency), proxy.trim());
+          onSave(priceFromRow(rows[FALLBACK] ?? EMPTY_PRICE_ROW, currency), modelPricesFromRows(perModel, currency), entry.proxy ?? "");
         }}
       >
         <header className="pf-head">
           <Avatar baseUrl={entry.baseUrl} name={entry.name} />
           <div>
-            <strong>{tf("{0} 的价格与代理", [entry.name])}</strong>
-            <small>{t("价格用于「用量」里估算费用；代理只作用于这个供应商")}</small>
+            <strong>{section === "price" ? tf("{0} 的价格", [entry.name]) : tf("{0} 的代理", [entry.name])}</strong>
+            <small>{section === "price" ? t("用于「用量」里估算费用") : t("只作用于这个供应商")}</small>
           </div>
           <button aria-label={t("关闭")} className="pf-icon" onClick={onCancel} type="button"><X /></button>
         </header>
 
         <div className="pf-body">
+          {section === "price" ? (
           <section className="pf-section">
             <h4>
               {t("价格")}<small>{t("每百万 token，按模型计")}</small>
@@ -188,17 +196,18 @@ export function ProviderExtrasDialog({
               </div>
             </div>
           </section>
-
+          ) : (
           <section className="pf-section">
             <h4>{t("代理")}<small>{t("只这个供应商单独走的 HTTP 代理，留空沿用系统代理")}</small></h4>
             <Input className="pf-mono" onChange={(event) => setProxy(event.currentTarget.value)} placeholder="http://127.0.0.1:7890" spellCheck={false} value={proxy} />
           </section>
+          )}
         </div>
 
         <footer className="pf-foot">
-          <span className="pf-error">{proxyError}</span>
+          <span className="pf-error">{section === "proxy" ? proxyError : ""}</span>
           <Button onClick={onCancel} size="sm" type="button" variant="ghost">{t("取消")}</Button>
-          <Button disabled={busy || Boolean(proxyError)} size="sm" type="submit">{busy ? t("保存中") : t("保存")}</Button>
+          <Button disabled={busy || (section === "proxy" && Boolean(proxyError))} size="sm" type="submit">{busy ? t("保存中") : t("保存")}</Button>
         </footer>
       </form>
     </div>,

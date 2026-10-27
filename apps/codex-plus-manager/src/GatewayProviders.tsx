@@ -6,7 +6,7 @@ import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointer
 import { invoke } from "@tauri-apps/api/core";
 import { createPortal } from "react-dom";
 import { appConfirm } from "./app-dialog";
-import { Check, ChevronRight, Copy, GripVertical, Plus, Search, X } from "lucide-react";
+import { Check, ChevronRight, Copy, GripVertical, Plus, RefreshCw, Search, X } from "lucide-react";
 import { t, tf } from "./i18n";
 import {
   defaultProviderAgents,
@@ -297,15 +297,17 @@ function PoolRow({
     ? [t("订阅登录"), entry.lentToCodex ? t("Codex 正用它登录") : "", tf("{0} 个模型", [entry.models.length])]
     : [protocolLabel(entry.protocol), presetHost(entry.baseUrl), tf("{0} 个模型", [entry.models.length])]
   ).filter(Boolean).join(" · ");
-  const [extrasOpen, setExtrasOpen] = useState(false);
+  // 价格、代理各开各的弹窗。
+  const [extrasOpen, setExtrasOpen] = useState<"price" | "proxy" | null>(null);
   const [modelsOpen, setModelsOpen] = useState(false);
   const newModels = entry.upstreamNew?.length ?? 0;
   const saveModels = async (models: string[], defaultModel: string) => {
     if (await run(`models:${entry.id}`, "save_gateway_provider_models", { id: entry.id, models, defaultModel }, t("保存模型列表"))) setModelsOpen(false);
   };
   const price = priceSummary(entry);
-  const saveExtras = async (nextPrice: ProviderPrice | null, modelPrices: Record<string, ProviderPrice>, proxy: string) => {
-    if (await run(`extras:${entry.id}`, "save_gateway_provider_extras", { id: entry.id, price: nextPrice, modelPrices, proxy }, t("保存价格与代理"))) setExtrasOpen(false);
+  const saveExtras = async (nextPrice: ProviderPrice | null, modelPrices: Record<string, ProviderPrice> | null, proxy: string) => {
+    const title = extrasOpen === "proxy" ? t("保存代理") : t("保存价格");
+    if (await run(`extras:${entry.id}`, "save_gateway_provider_extras", { id: entry.id, price: nextPrice, modelPrices, proxy }, title)) setExtrasOpen(null);
   };
   const remove = async () => {
     const ok = await appConfirm(tf("从网关删除「{0}」？直连模式里的供应商不受影响。", [maskAccountName(entry.name)]), { title: t("删除供应商"), confirmText: t("删除"), danger: true });
@@ -384,14 +386,25 @@ function PoolRow({
             <span className="gw-detail-label">{t("价格")}</span>
             <div className="gw-detail-value gw-chip-row">
               <span className={price ? undefined : "gw-muted"}>{price || t("未填写，不估算费用")}</span>
-              <button className="gw-text-button" disabled={busy !== null} onClick={() => setExtrasOpen(true)} type="button">{t("编辑")}</button>
+              <button className="gw-text-button" disabled={busy !== null} onClick={() => setExtrasOpen("price")} type="button">{t("编辑")}</button>
+              {/* 一键按公开价格表更新所有模型的价格，不用打开弹窗。 */}
+              <button
+                className="gw-text-button gw-sync-button"
+                disabled={busy !== null || entry.models.length === 0}
+                onClick={() => void run(`prices:${entry.id}`, "sync_gateway_provider_prices", { id: entry.id }, t("同步价格"))}
+                title={t("按公开价格表（models.dev）更新所有模型的价格")}
+                type="button"
+              >
+                <RefreshCw className={busy === `prices:${entry.id}` ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
+                {t("同步")}
+              </button>
             </div>
           </div>
           <div className="gw-detail-row">
             <span className="gw-detail-label">{t("代理")}</span>
             <div className="gw-detail-value gw-chip-row">
               {entry.proxy ? <code className="gw-chip">{entry.proxy}</code> : <span className="gw-muted">{t("沿用系统代理")}</span>}
-              <button className="gw-text-button" disabled={busy !== null} onClick={() => setExtrasOpen(true)} type="button">{t("编辑")}</button>
+              <button className="gw-text-button" disabled={busy !== null} onClick={() => setExtrasOpen("proxy")} type="button">{t("编辑")}</button>
             </div>
           </div>
           <div className="gw-detail-row gw-detail-foot">
@@ -420,9 +433,10 @@ function PoolRow({
       ) : null}
       {extrasOpen ? (
         <ProviderExtrasDialog
+          section={extrasOpen}
           busy={busy !== null}
           entry={entry}
-          onCancel={() => setExtrasOpen(false)}
+          onCancel={() => setExtrasOpen(null)}
           onSave={(nextPrice, modelPrices, proxy) => void saveExtras(nextPrice, modelPrices, proxy)}
         />
       ) : null}
