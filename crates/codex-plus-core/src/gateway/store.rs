@@ -903,6 +903,7 @@ mod tests {
                                     mode: GroupMode::default(),
                                     sticky: GroupSticky::default(),
                                     members: Vec::new(),
+                                    extra: Default::default(),
                                 });
                                 Ok(())
                             })
