@@ -1135,10 +1135,14 @@ fn build_relay(input: &ProviderInput) -> anyhow::Result<RelayProfile> {
 }
 
 /// 把一份上游配置加进网关池，id 换成网关里不重复的短名。返回新供应商的 id。
+///
+/// `skip_agents` 是添加时取消勾选的 Agent：新供应商不给它们用。为 `None` 时按各 Agent
+/// 自己的「添加供应商时自动加入」设置。
 pub fn add_provider(
     store: &GatewayStore,
     mut relay: RelayProfile,
     source: &str,
+    skip_agents: Option<&[String]>,
 ) -> anyhow::Result<(GatewaySettings, String)> {
     let mut gateway = store.load()?;
     // 登录得到的账号名里带邮箱，短名用来源（如 `login:chatgpt` → `chatgpt`）更干净。
@@ -1155,8 +1159,30 @@ pub fn add_provider(
         proxy: String::new(),
         relay,
     });
+    exclude_new_provider(&mut gateway, &id, skip_agents);
     store.save(&gateway)?;
     Ok((gateway, id))
+}
+
+/// 新供应商不给哪些 Agent 用：勾选优先，没勾选时看 Agent 的 `auto_join_providers`。
+fn exclude_new_provider(gateway: &mut GatewaySettings, id: &str, skip_agents: Option<&[String]>) {
+    match skip_agents {
+        Some(agents) => {
+            for agent in agents {
+                let binding = gateway.bindings.entry(agent.clone()).or_default();
+                if !binding.pool_exclude.iter().any(|excluded| excluded == id) {
+                    binding.pool_exclude.push(id.to_string());
+                }
+            }
+        }
+        None => {
+            for binding in gateway.bindings.values_mut() {
+                if !binding.auto_join_providers {
+                    binding.pool_exclude.push(id.to_string());
+                }
+            }
+        }
+    }
 }
 
 /// 用预设或手填的地址、Key 新建网关供应商。
@@ -1164,9 +1190,10 @@ pub fn create_provider(
     store: &GatewayStore,
     input: &ProviderInput,
     source: &str,
+    skip_agents: Option<&[String]>,
 ) -> anyhow::Result<(GatewaySettings, String)> {
     let proxy = clean_proxy(input.proxy.as_deref().unwrap_or_default())?;
-    let (mut gateway, id) = add_provider(store, build_relay(input)?, source)?;
+    let (mut gateway, id) = add_provider(store, build_relay(input)?, source, skip_agents)?;
     if let Some(provider) = gateway
         .providers
         .iter_mut()

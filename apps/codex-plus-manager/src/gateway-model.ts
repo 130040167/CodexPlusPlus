@@ -22,6 +22,8 @@ export type AgentBinding = {
   claudeEnableEffort: boolean;
   /** 这个 Agent 不用的池内供应商（「挑选」里取消勾选的）。 */
   poolExclude?: string[];
+  /** 往池里添加供应商时默认也给它用（旧版后端没有这个字段，视为开）。 */
+  autoJoinProviders?: boolean;
   token: string;
   restore?: { claudePreviousProviderId?: string; appliedPort?: number | null };
 };
@@ -158,6 +160,7 @@ export type BindingDraft = {
   contextWindow: string;
   claudeEnableEffort: boolean;
   poolExclude: string[];
+  autoJoinProviders: boolean;
 };
 
 export function blankBinding(): AgentBinding {
@@ -186,7 +189,20 @@ export function draftFromBinding(binding: AgentBinding | undefined): BindingDraf
     contextWindow: source.contextWindow ? String(source.contextWindow) : "",
     claudeEnableEffort: source.claudeEnableEffort,
     poolExclude: [...(source.poolExclude ?? [])],
+    autoJoinProviders: source.autoJoinProviders !== false,
   };
+}
+
+/** 添加供应商时默认勾选的 Agent：没关掉「添加供应商时自动加入」的。 */
+export function defaultProviderAgents(payload: GatewayPayload | null): GatewayAgentId[] {
+  return (payload?.agents ?? [])
+    .map((agent) => agent.agent)
+    .filter((agent) => payload?.gateway.bindings[agent]?.autoJoinProviders !== false);
+}
+
+/** 添加命令带上的 `skipAgents`：没勾选的 Agent。 */
+export function skippedAgents(payload: GatewayPayload | null, picked: GatewayAgentId[]): GatewayAgentId[] {
+  return (payload?.agents ?? []).map((agent) => agent.agent).filter((agent) => !picked.includes(agent));
 }
 
 /** 窗口支持纯数字和 `200k` / `1M` 写法。无效时返回 NaN。 */
@@ -230,6 +246,7 @@ export function bindingFromDraft(draft: BindingDraft, previous: AgentBinding | u
     contextWindow: window && Number.isFinite(window) ? window : null,
     claudeEnableEffort: draft.claudeEnableEffort,
     poolExclude: [...draft.poolExclude],
+    autoJoinProviders: draft.autoJoinProviders,
   };
 }
 

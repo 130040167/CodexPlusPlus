@@ -1,5 +1,5 @@
 /** 网关「添加 / 编辑供应商」弹窗：连接（名称、协议、地址、多个 Key）、模型（从上游获取）、价格（按公开价格表自动填）。 */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { Check, Plus, RefreshCw, Search, Star, X } from "lucide-react";
@@ -48,11 +48,14 @@ export function ProviderFormDialog({
   busy,
   onSubmit,
   onCancel,
+  agentPicks,
 }: {
   form: ProviderFormState;
   busy: string | null;
   onSubmit: (draft: ProviderDraft) => void;
   onCancel: () => void;
+  /** 新添加时显示「给哪些 Agent 用」，编辑时不传。 */
+  agentPicks?: ReactNode;
 }) {
   const editing = form.mode === "edit";
   const preset = form.mode === "preset" ? form.preset : null;
@@ -233,6 +236,7 @@ export function ProviderFormDialog({
 
         </div>
 
+        {agentPicks ? <div className="pf-agents">{agentPicks}</div> : null}
         <footer className="pf-foot">
           <span className="pf-error">{validation ? t(validation) : ""}</span>
           <Button onClick={onCancel} size="sm" type="button" variant="ghost">{t("取消")}</Button>

@@ -38,7 +38,7 @@ fn fixture(port: u16) -> Fixture {
     std::fs::create_dir_all(&ctx.claude.claude_home).unwrap();
     std::fs::create_dir_all(&ctx.grok_home).unwrap();
     // 网关池里放一个供应商；直连模式的 settings 与它无关。
-    create_provider(&ctx.gateway, &deepseek_input(), "preset:deepseek").unwrap();
+    create_provider(&ctx.gateway, &deepseek_input(), "preset:deepseek", None).unwrap();
     Fixture { _temp: temp, ctx }
 }
 
@@ -587,7 +587,7 @@ fn pool_chatgpt_account_is_lent_to_codex_and_taken_back() {
         ..RelayProfile::default()
     };
     let (_, pool_id) =
-        codex_plus_core::gateway::apply::add_provider(&ctx.gateway, chatgpt, "login:chatgpt")
+        codex_plus_core::gateway::apply::add_provider(&ctx.gateway, chatgpt, "login:chatgpt", None)
             .unwrap();
 
     enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
@@ -638,7 +638,7 @@ fn gateway_provider_proxy_is_its_own_setting() {
     let mut input = deepseek_input();
     input.name = "代理测试".into();
     input.proxy = Some(" http://127.0.0.1:7890 ".into());
-    let (_, id) = create_provider(&ctx.gateway, &input, "preset:deepseek").unwrap();
+    let (_, id) = create_provider(&ctx.gateway, &input, "preset:deepseek", None).unwrap();
     let loaded = ctx.gateway.load().unwrap();
     let provider = loaded.provider(&id).unwrap();
     assert_eq!(provider.proxy, "http://127.0.0.1:7890");
@@ -678,7 +678,14 @@ fn gateway_provider_proxy_is_its_own_setting() {
     );
 
     // 详情里单独改价格与代理：地址、Key、模型不动。
-    let before = ctx.gateway.load().unwrap().provider(&id).unwrap().relay.clone();
+    let before = ctx
+        .gateway
+        .load()
+        .unwrap()
+        .provider(&id)
+        .unwrap()
+        .relay
+        .clone();
     let price = codex_plus_core::gateway::store::ProviderPrice {
         currency: "USD".into(),
         input: 2.0,
@@ -723,13 +730,47 @@ fn enabling_requires_a_pool_and_a_routable_model() {
 }
 
 #[test]
+fn new_providers_follow_agent_picks_and_auto_join() {
+    let fixture = fixture(57401);
+    let store = &fixture.ctx.gateway;
+    // Grok 关掉「添加供应商时自动加入」，Claude 保持默认。
+    let mut gateway = store.load().unwrap();
+    gateway.bindings.insert("claude".into(), binding());
+    let mut grok = binding();
+    grok.auto_join_providers = false;
+    gateway.bindings.insert("grok".into(), grok);
+    store.save(&gateway).unwrap();
+
+    // 没传勾选：按各 Agent 的设置。
+    let (gateway, id) = create_provider(store, &deepseek_input(), "preset:deepseek", None).unwrap();
+    assert!(!gateway.bindings["claude"].pool_exclude.contains(&id));
+    assert!(gateway.bindings["grok"].pool_exclude.contains(&id));
+
+    // 传了勾选：取消勾选的 Agent 不用它，哪怕之前没有绑定也记下来。
+    let skip = vec!["claude".to_string(), "codex".to_string()];
+    let (gateway, id) =
+        create_provider(store, &deepseek_input(), "preset:deepseek", Some(&skip)).unwrap();
+    assert!(gateway.bindings["claude"].pool_exclude.contains(&id));
+    assert!(gateway.bindings["codex"].pool_exclude.contains(&id));
+    assert!(!gateway.bindings["codex"].enabled);
+    assert!(
+        !gateway.bindings["grok"].pool_exclude.contains(&id),
+        "勾选了就给它用"
+    );
+
+    // 旧数据没有这个字段时默认自动加入。
+    let parsed: AgentBinding = serde_json::from_str("{}").unwrap();
+    assert!(parsed.auto_join_providers);
+}
+
+#[test]
 fn providers_live_only_in_the_gateway_store() {
     let fixture = fixture(57392);
     let store = &fixture.ctx.gateway;
     // 新建：多个 Key 写成命名 Key；重名换成新短名。
     let mut input = deepseek_input();
     input.keys = vec!["sk-a".into(), " sk-b ".into(), "sk-a".into()];
-    let (gateway, id) = create_provider(store, &input, "preset:deepseek").unwrap();
+    let (gateway, id) = create_provider(store, &input, "preset:deepseek", None).unwrap();
     assert_eq!(id, "deepseek-2");
     let relay = &gateway.provider("deepseek-2").unwrap().relay;
     assert_eq!(relay.api_keys.len(), 2);
@@ -917,7 +958,7 @@ fn pool_changes_follow_into_grok_model_list() {
     kimi.name = "Kimi".into();
     kimi.model = "kimi-k3".into();
     kimi.model_list = "kimi-k3".into();
-    create_provider(&ctx.gateway, &kimi, "").unwrap();
+    create_provider(&ctx.gateway, &kimi, "", None).unwrap();
     assert_eq!(refresh_enabled(ctx).unwrap(), 1);
     assert!(config().contains("kimi-k3"), "{}", config());
     save_group(

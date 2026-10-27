@@ -171,6 +171,9 @@ pub struct AgentBinding {
     /// 这个 Agent 不使用的池内供应商（「挑选」里取消勾选的）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pool_exclude: Vec<String>,
+    /// 往池里添加供应商时，默认也给这个 Agent 用；关掉后新供应商默认记进 `pool_exclude`。
+    #[serde(default = "enabled_by_default")]
+    pub auto_join_providers: bool,
     /// 网关签发给该 Agent 的本地 token，用来鉴权本地请求。
     #[serde(default)]
     pub token: String,
@@ -189,6 +192,7 @@ impl Default for AgentBinding {
             context_window: None,
             claude_enable_effort: false,
             pool_exclude: Vec::new(),
+            auto_join_providers: true,
             token: String::new(),
             restore: GatewayRestoreState::default(),
         }

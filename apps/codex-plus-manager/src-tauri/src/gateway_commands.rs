@@ -376,6 +376,7 @@ pub fn save_gateway_options(
 pub fn create_gateway_provider(
     input: ProviderInput,
     source: String,
+    skip_agents: Option<Vec<String>>,
 ) -> CommandResult<Option<GatewayPayload>> {
     let name = input.name.trim().to_string();
     respond(
@@ -385,6 +386,7 @@ pub fn create_gateway_provider(
             &GatewayStore::default(),
             &input,
             &source,
+            skip_agents.as_deref(),
         )),
     )
 }
@@ -493,6 +495,7 @@ pub fn reorder_gateway_providers(ids: Vec<String>) -> CommandResult<Option<Gatew
 pub fn import_gateway_provider(
     source: String,
     id: String,
+    skip_agents: Option<Vec<String>>,
 ) -> CommandResult<Option<GatewayPayload>> {
     let result = (|| {
         let relay = match source.as_str() {
@@ -508,7 +511,12 @@ pub fn import_gateway_provider(
             "grok" => apply::copy_grok_profile(&SettingsStore::default().load()?, &id)?,
             other => anyhow::bail!("不认识的导入来源：{other}"),
         };
-        apply::add_provider(&GatewayStore::default(), relay, &format!("{source}:{id}"))
+        apply::add_provider(
+            &GatewayStore::default(),
+            relay,
+            &format!("{source}:{id}"),
+            skip_agents.as_deref(),
+        )
     })();
     respond(
         "已复制进网关的供应商池，原来的供应商不受影响。",
@@ -519,7 +527,10 @@ pub fn import_gateway_provider(
 
 /// 把 OpenCode 里保存的 OpenCode Go / Zen Key 加进网关池，模型取目录里网关能用的。
 #[tauri::command]
-pub async fn import_gateway_opencode_key(id: String) -> CommandResult<Option<GatewayPayload>> {
+pub async fn import_gateway_opencode_key(
+    id: String,
+    skip_agents: Option<Vec<String>>,
+) -> CommandResult<Option<GatewayPayload>> {
     use codex_plus_core::gateway::opencode;
     let result = async {
         let (entry, key) = opencode::load_stored_keys()
@@ -542,7 +553,12 @@ pub async fn import_gateway_opencode_key(id: String) -> CommandResult<Option<Gat
             price: None,
             proxy: None,
         };
-        apply::create_provider(&GatewayStore::default(), &input, &format!("opencode:{id}"))?;
+        apply::create_provider(
+            &GatewayStore::default(),
+            &input,
+            &format!("opencode:{id}"),
+            skip_agents.as_deref(),
+        )?;
         Ok(if models.is_empty() {
             format!(
                 "已添加「{}」。没读到模型目录，请在供应商里获取模型。",
@@ -809,12 +825,23 @@ pub fn delete_agent_session(agent: String, id: String) -> CommandResult<Option<S
     use codex_plus_core::gateway::sessions;
     let trash = sessions::default_trash_dir();
     let result = match agent.as_str() {
-        "claude" => sessions::delete_claude_session(&ClaudeContext::default_paths().claude_home, &id, &trash),
-        "grok" => sessions::delete_grok_session(&codex_plus_core::grok_config::default_grok_home_dir(), &id, &trash),
+        "claude" => sessions::delete_claude_session(
+            &ClaudeContext::default_paths().claude_home,
+            &id,
+            &trash,
+        ),
+        "grok" => sessions::delete_grok_session(
+            &codex_plus_core::grok_config::default_grok_home_dir(),
+            &id,
+            &trash,
+        ),
         other => Err(anyhow::anyhow!("{other} 的会话不在这里删除")),
     };
     match result {
-        Ok(path) => ok("会话已移到废纸篓，需要时可以从废纸篓找回。", Some(path.display().to_string())),
+        Ok(path) => ok(
+            "会话已移到废纸篓，需要时可以从废纸篓找回。",
+            Some(path.display().to_string()),
+        ),
         Err(error) => failed(&format!("删除失败：{error:#}"), None),
     }
 }
@@ -874,7 +901,9 @@ fn open_in_browser(url: &str) {
 /// 在网关里登录 ChatGPT 订阅：浏览器登录后加进网关的供应商池。同一个账号再登录只更新 token。
 /// 与 Codex 自己的登录是两次独立的登录，互不影响。
 #[tauri::command]
-pub async fn login_gateway_chatgpt() -> CommandResult<Option<GatewayPayload>> {
+pub async fn login_gateway_chatgpt(
+    skip_agents: Option<Vec<String>>,
+) -> CommandResult<Option<GatewayPayload>> {
     use codex_plus_core::gateway::accounts;
     let result: anyhow::Result<String> = async {
         let account = accounts::chatgpt_login(open_in_browser).await?;
@@ -900,7 +929,7 @@ pub async fn login_gateway_chatgpt() -> CommandResult<Option<GatewayPayload>> {
             .unwrap_or_default();
         relay = accounts::chatgpt_relay(&account, &models);
         let name = relay.name.clone();
-        apply::add_provider(&store, relay, "login:chatgpt")?;
+        apply::add_provider(&store, relay, "login:chatgpt", skip_agents.as_deref())?;
         Ok(if models.is_empty() {
             format!("已添加「{name}」。没读到模型列表，请在供应商里编辑补上。")
         } else {
@@ -920,6 +949,7 @@ fn add_account_provider(
     relay: codex_plus_core::settings::RelayProfile,
     kind: &str,
     identity_field: &str,
+    skip_agents: Option<&[String]>,
 ) -> anyhow::Result<String> {
     use codex_plus_core::gateway::accounts::ACCOUNT_KIND_FIELD;
     let identity = |contents: &str| {
@@ -957,7 +987,7 @@ fn add_account_provider(
         .lines()
         .filter(|line| !line.trim().is_empty())
         .count();
-    apply::add_provider(&store, relay, &format!("login:{kind}"))?;
+    apply::add_provider(&store, relay, &format!("login:{kind}"), skip_agents)?;
     Ok(format!("已添加「{name}」，{count} 个模型。"))
 }
 
@@ -978,10 +1008,11 @@ pub async fn start_gateway_copilot_login()
 #[tauri::command]
 pub async fn finish_gateway_copilot_login(
     code: codex_plus_core::gateway::accounts::DeviceCode,
+    skip_agents: Option<Vec<String>>,
 ) -> CommandResult<Option<GatewayPayload>> {
     let result = async {
         let relay = codex_plus_core::gateway::accounts::copilot_finish(&code).await?;
-        add_account_provider(relay, "copilot", "login")
+        add_account_provider(relay, "copilot", "login", skip_agents.as_deref())
     }
     .await;
     match refresh_agents(result) {
@@ -992,12 +1023,19 @@ pub async fn finish_gateway_copilot_login(
 
 /// 在网关里登录 SuperGrok：浏览器登录后加进网关池。与 Grok CLI 自己的登录互不影响。
 #[tauri::command]
-pub async fn login_gateway_grok() -> CommandResult<Option<GatewayPayload>> {
+pub async fn login_gateway_grok(
+    skip_agents: Option<Vec<String>>,
+) -> CommandResult<Option<GatewayPayload>> {
     use codex_plus_core::gateway::accounts;
     let result = async {
         let tokens = accounts::grok_login(open_in_browser).await?;
         let models = accounts::grok_models(&tokens.access_token).await;
-        add_account_provider(accounts::grok_relay(&tokens, &models), "grok", "email")
+        add_account_provider(
+            accounts::grok_relay(&tokens, &models),
+            "grok",
+            "email",
+            skip_agents.as_deref(),
+        )
     }
     .await;
     match refresh_agents(result) {
@@ -1009,7 +1047,9 @@ pub async fn login_gateway_grok() -> CommandResult<Option<GatewayPayload>> {
 /// 在网关里登录 ChatGPT API（OpenAI 的「用 ChatGPT 登录」）：套餐额度直接用在 api.openai.com 上，
 /// Agent 的指令原样保留。与 ChatGPT（Codex 订阅）是两种独立的登录。
 #[tauri::command]
-pub async fn login_gateway_chatgpt_api() -> CommandResult<Option<GatewayPayload>> {
+pub async fn login_gateway_chatgpt_api(
+    skip_agents: Option<Vec<String>>,
+) -> CommandResult<Option<GatewayPayload>> {
     use codex_plus_core::gateway::accounts;
     let result = async {
         let state_dir = codex_plus_core::paths::default_app_state_dir();
@@ -1023,6 +1063,7 @@ pub async fn login_gateway_chatgpt_api() -> CommandResult<Option<GatewayPayload>
             accounts::chatgpt_api_relay(&account, &models),
             "chatgpt-api",
             "subject",
+            skip_agents.as_deref(),
         )
     }
     .await;

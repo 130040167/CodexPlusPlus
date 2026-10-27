@@ -6,9 +6,10 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { createPortal } from "react-dom";
 import { appConfirm } from "./app-dialog";
-import { ChevronRight, Copy, GripVertical, Plus, Search, X } from "lucide-react";
+import { Check, ChevronRight, Copy, GripVertical, Plus, Search, X } from "lucide-react";
 import { t, tf } from "./i18n";
 import {
+  defaultProviderAgents,
   failureLabel,
   formatRemaining,
   gatewayPresets,
@@ -18,6 +19,8 @@ import {
   protocolLabel,
   providerEnabled,
   providerInput,
+  skippedAgents,
+  type GatewayAgentId,
   type GatewayPayload,
   type GatewayPoolEntry,
   type GatewayPreset,
@@ -26,7 +29,7 @@ import {
   type ProviderPrice,
   maskAccountName,
 } from "./gateway-model";
-import { Avatar, Switch, type Notify, type Run } from "./gateway-ui";
+import { AgentIcon, Avatar, Switch, type Notify, type Run } from "./gateway-ui";
 import { ProviderFormDialog, type ProviderFormState } from "./ProviderFormDialog";
 import { ProviderExtrasDialog, priceSummary } from "./ProviderExtrasDialog";
 
@@ -64,6 +67,14 @@ export function ProvidersView({
   const [dragging, setDragging] = useState<string | null>(null);
   const [form, setForm] = useState<FormState | null>(null);
   const [deviceCode, setDeviceCode] = useState<DeviceCode | null>(null);
+  // 这次添加给哪些 Agent 用：打开「添加供应商」时按各 Agent 的「添加供应商时自动加入」预选。
+  const [picked, setPicked] = useState<GatewayAgentId[]>([]);
+  const skipAgents = skippedAgents(payload, picked);
+  const openCatalog = () => {
+    setPicked(defaultProviderAgents(payload));
+    setCatalogOpen(true);
+  };
+  const agentPicks = <AgentPicks onChange={setPicked} payload={payload} picked={picked} />;
   const needle = query.trim().toLowerCase();
   const visible = pool.filter((entry) => !needle || entry.name.toLowerCase().includes(needle) || entry.models.some((model) => model.toLowerCase().includes(needle)));
 
@@ -75,8 +86,9 @@ export function ProvidersView({
     void run("reorder", "reorder_gateway_providers", { ids }, t("调整顺序"), true);
   };
 
-  /** 登录订阅账号：ChatGPT / ChatGPT API / SuperGrok 走浏览器登录；Copilot 先显示验证码，再等你在 GitHub 上授权。 */
-  const login = async (kind: AccountKind) => {
+  /** 登录订阅账号：ChatGPT / ChatGPT API / SuperGrok 走浏览器登录；Copilot 先显示验证码，再等你在 GitHub 上授权。
+   * `skip` 是新添加时取消勾选的 Agent；重新登录已有账号时不传。 */
+  const login = async (kind: AccountKind, skip?: GatewayAgentId[]) => {
     const title = tf("登录 {0}", [ACCOUNT_LABELS[kind]]);
     if (kind === "copilot") {
       let code: DeviceCode;
@@ -92,12 +104,12 @@ export function ProvidersView({
         return;
       }
       setDeviceCode(code);
-      await run("login:copilot", "finish_gateway_copilot_login", { code }, title);
+      await run("login:copilot", "finish_gateway_copilot_login", { code, skipAgents: skip }, title);
       setDeviceCode(null);
       return;
     }
     void notify(title, t("已在浏览器打开登录页，登录完成后回到这里。5 分钟内有效。"), "info");
-    await run(`login:${kind}`, BROWSER_LOGIN_COMMANDS[kind], undefined, title);
+    await run(`login:${kind}`, BROWSER_LOGIN_COMMANDS[kind], skip ? { skipAgents: skip } : undefined, title);
   };
 
   const submit = async (draft: ProviderDraft) => {
@@ -105,7 +117,7 @@ export function ProvidersView({
     const input = providerInput(draft);
     const ok = form.mode === "edit"
       ? await run(`edit:${form.entry.id}`, "update_gateway_provider", { id: form.entry.id, input }, t("保存供应商"))
-      : await run("add:create", "create_gateway_provider", { input, source: form.mode === "preset" ? `preset:${form.preset.key}` : "custom" }, t("添加供应商"));
+      : await run("add:create", "create_gateway_provider", { input, source: form.mode === "preset" ? `preset:${form.preset.key}` : "custom", skipAgents }, t("添加供应商"));
     if (ok) {
       setForm(null);
     }
@@ -145,13 +157,13 @@ export function ProvidersView({
         <div className="gw-card gw-pool-empty">
           <strong>{t("供应商池还是空的")}</strong>
           <span>{t("登录订阅，或添加厂商 API、中转站的 Key。所有接入的 Agent 共用这里的供应商。")}</span>
-          <button className="gw-primary-button" onClick={() => setCatalogOpen(true)} type="button">
+          <button className="gw-primary-button" onClick={openCatalog} type="button">
             <Plus className="h-4 w-4" />
             {t("添加供应商")}
           </button>
         </div>
       ) : (
-        <button className="gw-add-row" onClick={() => setCatalogOpen(true)} type="button">
+        <button className="gw-add-row" onClick={openCatalog} type="button">
           <Plus className="h-4 w-4" />
           {t("添加供应商")}
         </button>
@@ -163,14 +175,16 @@ export function ProvidersView({
           notify={notify}
           onClose={() => setCatalogOpen(false)}
           onCustom={() => { setCatalogOpen(false); setForm({ mode: "custom" }); }}
-          onLogin={(kind) => { setCatalogOpen(false); void login(kind); }}
+          onLogin={(kind) => { setCatalogOpen(false); void login(kind, skipAgents); }}
           onPreset={(preset) => { setCatalogOpen(false); setForm({ mode: "preset", preset }); }}
+          agentPicks={agentPicks}
           payload={payload}
           run={run}
+          skipAgents={skipAgents}
         />
       ) : null}
       {deviceCode ? <DeviceCodeDialog code={deviceCode} notify={notify} onClose={() => setDeviceCode(null)} /> : null}
-      {form ? <ProviderFormDialog busy={busy} form={form} onCancel={() => setForm(null)} onSubmit={(draft) => void submit(draft)} /> : null}
+      {form ? <ProviderFormDialog agentPicks={form.mode === "edit" ? undefined : agentPicks} busy={busy} form={form} onCancel={() => setForm(null)} onSubmit={(draft) => void submit(draft)} /> : null}
     </>
   );
 }
@@ -328,6 +342,34 @@ function PoolRow({
   );
 }
 
+/** 添加时给哪些 Agent 用：一排可切换的 Agent，默认按各自的「添加供应商时自动加入」。 */
+function AgentPicks({ payload, picked, onChange }: { payload: GatewayPayload | null; picked: GatewayAgentId[]; onChange: (next: GatewayAgentId[]) => void }) {
+  const agents = payload?.agents ?? [];
+  if (!agents.length) return null;
+  return (
+    <div className="gw-agent-picks">
+      <span>{t("添加后给这些 Agent 用")}</span>
+      {agents.map((agent) => {
+        const on = picked.includes(agent.agent);
+        return (
+          <button
+            aria-pressed={on}
+            data-on={on}
+            key={agent.agent}
+            onClick={() => onChange(on ? picked.filter((item) => item !== agent.agent) : [...picked, agent.agent])}
+            type="button"
+          >
+            <AgentIcon agent={agent.agent} className="gw-agent-pick-icon" />
+            {agent.name}
+            {on ? <Check className="h-3.5 w-3.5" /> : null}
+          </button>
+        );
+      })}
+      {picked.length === 0 ? <em>{t("都不选也能添加，之后在 Agent 的「挑选」里再打开")}</em> : null}
+    </div>
+  );
+}
+
 type CatalogItem = { key: string; name: string; added?: boolean; icon?: ReactNode; onClick: () => void };
 
 /** 「添加供应商」目录：订阅、供应商（厂商 API）、中转、本机；「导入…」从直连模式复制。 */
@@ -340,6 +382,8 @@ function ProviderCatalog({
   onPreset,
   onCustom,
   onLogin,
+  agentPicks,
+  skipAgents,
 }: {
   payload: GatewayPayload | null;
   busy: string | null;
@@ -349,6 +393,8 @@ function ProviderCatalog({
   onPreset: (preset: GatewayPreset) => void;
   onCustom: () => void;
   onLogin: (kind: AccountKind) => void;
+  agentPicks: ReactNode;
+  skipAgents: GatewayAgentId[];
 }) {
   const [query, setQuery] = useState("");
   const [importing, setImporting] = useState(false);
@@ -423,15 +469,16 @@ function ProviderCatalog({
           ))}
           {sections.length === 0 ? <div className="gw-empty">{t("没有匹配的供应商")}</div> : null}
         </div>
+        <footer className="gw-catalog-foot">{agentPicks}</footer>
       </div>
-      {importing ? <ImportDialog busy={busy} onClose={() => setImporting(false)} payload={payload} run={run} /> : null}
+      {importing ? <ImportDialog busy={busy} onClose={() => setImporting(false)} payload={payload} run={run} skipAgents={skipAgents} /> : null}
     </div>,
     document.body,
   );
 }
 
 /** 导入：把直连模式里 Codex、Claude Code、Grok 的供应商复制一份进网关（之后两边互不影响），或用 OpenCode 里保存的 Key。 */
-function ImportDialog({ payload, busy, run, onClose }: { payload: GatewayPayload | null; busy: string | null; run: Run; onClose: () => void }) {
+function ImportDialog({ payload, busy, run, onClose, skipAgents }: { payload: GatewayPayload | null; busy: string | null; run: Run; onClose: () => void; skipAgents: GatewayAgentId[] }) {
   useEffect(() => {
     const escape = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
@@ -442,8 +489,8 @@ function ImportDialog({ payload, busy, run, onClose }: { payload: GatewayPayload
   const imported = (source: string, id: string) => Boolean(payload?.pool.some((entry) => entry.source === `${source}:${id}`));
   const finish = async (source: string, id: string) => {
     const done = source === "opencode"
-      ? await run(`import:${source}:${id}`, "import_gateway_opencode_key", { id }, t("导入供应商"))
-      : await run(`import:${source}:${id}`, "import_gateway_provider", { source, id }, t("导入供应商"));
+      ? await run(`import:${source}:${id}`, "import_gateway_opencode_key", { id, skipAgents }, t("导入供应商"))
+      : await run(`import:${source}:${id}`, "import_gateway_provider", { source, id, skipAgents }, t("导入供应商"));
     if (done) onClose();
   };
   const groups: Array<{ key: string; title: string; items: Array<{ id: string; name: string; sub: string }> }> = [

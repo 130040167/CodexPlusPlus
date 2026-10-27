@@ -2930,3 +2930,68 @@ span.gw-avatar[data-size] {
   width: 15px;
   height: 15px;
 }
+
+/* 添加供应商：给哪些 Agent 用（目录弹窗底部、填写表单里各一排）。 */
+.gw-portal .gw-agent-picks {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--gw-mute);
+  font-size: 12.5px;
+}
+
+.gw-portal .gw-agent-picks > span {
+  margin-right: 4px;
+}
+
+.gw-portal .gw-agent-picks button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px dashed var(--gw-line);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--gw-mute);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.gw-portal .gw-agent-picks button[data-on="true"] {
+  border-style: solid;
+  border-color: hsl(var(--primary) / 0.45);
+  background: hsl(var(--primary) / 0.08);
+  color: var(--gw-ink);
+}
+
+.gw-portal .gw-agent-picks button[data-on="true"] svg {
+  color: hsl(var(--primary));
+}
+
+.gw-portal .gw-agent-picks button[data-on="false"] .gw-agent-pick-icon {
+  opacity: 0.45;
+}
+
+.gw-portal .gw-agent-pick-icon {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  object-fit: contain;
+}
+
+.gw-portal .gw-agent-picks em {
+  font-size: 11.5px;
+  font-style: normal;
+}
+
+.gw-portal .gw-catalog-foot {
+  padding: 10px 18px;
+}
+
+.gw-portal .pf-agents {
+  padding: 10px 16px;
+  border-top: 1px solid hsl(var(--border));
+}

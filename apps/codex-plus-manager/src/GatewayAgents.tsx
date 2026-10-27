@@ -355,6 +355,10 @@ function AgentDetail({
               <span>{t("强制启用推理强度")}</span>
             </label>
           ) : null}
+          <label className="gw-inline-field gw-inline-check" title={t("关掉后，新添加的供应商默认不给这个 Agent 用；添加时仍可手动勾选。")}>
+            <input checked={draft.autoJoinProviders} disabled={busy !== null} onChange={(event) => onSave({ ...draft, autoJoinProviders: event.currentTarget.checked })} type="checkbox" />
+            <span>{t("添加供应商时自动加入")}</span>
+          </label>
         </div>
       </div>
       <div className="gw-detail-row gw-detail-foot">
