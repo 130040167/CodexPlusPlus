@@ -172,7 +172,11 @@ export function ProviderFormDialog({
                     autoComplete="off"
                     autoFocus={index === 0 && Boolean(preset && !preset.defaultKey)}
                     className="pf-mono"
-                    onChange={(event) => setDraft((previous) => withKeys(previous, draftKeys(previous).map((item, position) => (position === index ? event.currentTarget.value : item))))}
+                    onChange={(event) => {
+                      // 先取值再进 updater：updater 延迟执行时 currentTarget 已为 null，会抛错白屏
+                      const value = event.currentTarget.value;
+                      setDraft((previous) => withKeys(previous, draftKeys(previous).map((item, position) => (position === index ? value : item))));
+                    }}
                     placeholder={editing ? t("不改就留空") : "sk-..."}
                     spellCheck={false}
                     type="password"
