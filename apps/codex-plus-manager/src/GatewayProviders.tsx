@@ -348,7 +348,7 @@ function PoolRow({
         </span>
         <Switch
           disabled={busy !== null}
-          label={tf("{0} 参与路由", [entry.name])}
+          label={tf("{0} 参与调度", [entry.name])}
           on={enabled}
           onToggle={() => void run(`toggle:${entry.id}`, "set_gateway_provider_enabled", { id: entry.id, enabled: !enabled }, t("切换供应商"), true)}
         />

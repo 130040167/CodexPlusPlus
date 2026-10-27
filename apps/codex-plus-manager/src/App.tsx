@@ -1271,7 +1271,7 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "hub", get label() { return t("总览"); }, icon: Waypoints },
   { id: "gateway", get label() { return t("Agent 接入"); }, icon: Plug },
   { id: "gatewayProviders", get label() { return t("供应商池"); }, icon: Server },
-  { id: "gatewayRouting", get label() { return t("路由"); }, icon: Split },
+  { id: "gatewayRouting", get label() { return t("模型调度"); }, icon: Split },
   { id: "gatewayUsage", get label() { return t("用量"); }, icon: BarChart3 },
   { id: "gatewaySettings", get label() { return t("网关设置"); }, icon: SlidersHorizontal },
   { id: "maintenance", get label() { return t("安装维护"); }, icon: Wrench, tool: "codex" },
@@ -14784,7 +14784,7 @@ function loadCollapsedGroups(): string[] {
  * 唯一的侧栏：任意 Agent → Codex++ → 任意供应商。
  *
  * - 顶部是网关状态卡和 ⌘K 快速跳转；
- * - 「网关」：总览、Agent 接入、供应商池、路由、用量、网关设置；
+ * - 「网关」：总览、Agent 接入、供应商池、模型调度、用量、网关设置；
  * - 「全局管理」：请求日志、会话、MCP、Skills，同时管理所有 Agent；
  * - 「Agent」：每个 Agent 一行（状态点表示接入方式）；它自己的页面（供应商配置、增强、皮肤……）在内容区顶部的页签里；
  * - 「工具」：服务所有 Agent、但与供应商无关的页面；
@@ -15196,7 +15196,7 @@ function routeSubtitle(route: Route) {
     hub: t("任意 Agent 经 Codex++ 接入任意供应商：谁在用、走哪家、是否健康，一屏看全"),
     gateway: t("选择哪些 Agent 经 Codex++ 网关接入，以及它们默认用哪个模型"),
     gatewayProviders: t("所有接入的 Agent 共用的供应商池，支持多 Key 轮换"),
-    gatewayRouting: t("按模型名选择供应商，路由组决定多家之间的顺序与分配"),
+    gatewayRouting: t("每个模型发给哪几家、先后顺序，以及把几个模型编成模型组"),
     gatewayUsage: t("按 Agent、供应商与模型统计调用、token、缓存与费用"),
     gatewaySettings: t("监听地址、Key 轮换方式与退出时的恢复策略"),
     maintenance: t("入口检查与修复、开机启动与应用路径"),

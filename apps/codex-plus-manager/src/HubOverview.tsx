@@ -1,7 +1,7 @@
-/** 网关总览：任意 Agent → Codex++ → 任意供应商。左列 Agent、中间网关、右列供应商池，下方是路由动态与今日用量。 */
+/** 网关总览：任意 Agent → Codex++ → 任意供应商。左列 Agent、中间网关、右列供应商池，下方是最近请求与今日用量。 */
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowUpRight, Plus } from "lucide-react";
+import { ArrowUpRight, ChevronDown, Plus } from "lucide-react";
 import { t, tf } from "./i18n";
 import {
   agentName,
@@ -9,6 +9,7 @@ import {
   formatElapsed,
   formatMoney,
   formatTokens,
+  routeNarrative,
   type GatewayPayload,
   type GatewayResult,
   type UsageSummary,
@@ -97,7 +98,7 @@ export function HubOverview({
   notify: Notify;
   onOpenAgent: (agent: string) => void;
   /** 跳到网关的某个页签或其它页面。 */
-  onNavigate: (target: "gateway" | "gatewayProviders" | "gatewayRouting" | "gatewayUsage") => void;
+  onNavigate: (target: "gateway" | "gatewayProviders" | "gatewayUsage" | "requestLog") => void;
 }) {
   const payload = useGatewayPayload(LIVE_REFRESH_MS);
   const usage = useTodayUsage();
@@ -180,7 +181,7 @@ export function HubOverview({
               <span>{t("按模型名路由")}</span>
               <span>{t("协议互转")}</span>
               <span>{payload?.gateway.keyPolicy.mode === "roundRobin" ? t("逐请求轮换 Key") : t("会话粘性 Key")}</span>
-              {payload?.groups.length ? <span>{tf("{0} 个路由组", [payload.groups.length])}</span> : null}
+              {payload?.groups.length ? <span>{tf("{0} 个模型组", [payload.groups.length])}</span> : null}
             </div>
             <dl>
               <div><dt>{t("请求")}</dt><dd>{totals.requests}</dd></div>
@@ -219,13 +220,13 @@ export function HubOverview({
       <div className="hub-grid">
         <section className="hub-card">
           <div className="hub-card-head">
-            <h3>{t("路由动态")}</h3>
-            <button className="hub-link" onClick={() => onNavigate("gatewayRouting")} type="button">{t("路由")}<ArrowUpRight className="h-3.5 w-3.5" /></button>
+            <h3>{t("最近请求")}</h3>
+            <button className="hub-link" onClick={() => onNavigate("requestLog")} type="button">{t("请求日志")}<ArrowUpRight className="h-3.5 w-3.5" /></button>
           </div>
           {feed.length === 0 ? (
             <p className="hub-empty">{t("还没有请求经过网关。在已接入的 Agent 里发一条消息试试。")}</p>
           ) : (
-            <ul className="hub-feed">{feed.map((item) => <FeedRow item={item} key={`${item.agent}-${item.finishedAtMs}`} />)}</ul>
+            <ul className="hub-feed">{feed.map((item) => <FeedRow item={item} key={`${item.agent}-${item.finishedAtMs}`} payload={payload} />)}</ul>
           )}
         </section>
         <section className="hub-card">
@@ -252,7 +253,9 @@ export function HubOverview({
   );
 }
 
-function FeedRow({ item }: { item: HubFeedItem }) {
+/** 一条最近请求；点开列出这次怎么走的：计划、每次尝试、最后谁回答。 */
+function FeedRow({ item, payload }: { item: HubFeedItem; payload: GatewayPayload | null }) {
+  const [open, setOpen] = useState(false);
   const label: Record<HubFeedItem["result"], string> = {
     answered: t("成功"),
     rerouted: t("换上游"),
@@ -260,16 +263,27 @@ function FeedRow({ item }: { item: HubFeedItem }) {
     cooling: t("冷却"),
     busy: t("进行中"),
   };
+  const record = payload?.activity?.agents.find((agent) => agent.agent === item.agent)?.last;
   return (
-    <li>
-      <span className="hub-feed-agent"><AgentGlyph agent={item.agent} />{agentName(item.agent)}</span>
-      <span className="hub-feed-route">
-        {item.requested}
-        <i>→</i>
-        <b>{item.provider ? `${item.provider} / ${item.model}` : item.model}</b>
-      </span>
-      <span className="hub-feed-ms">{formatElapsed(item.elapsedMs)}</span>
-      <span className="hub-badge" data-result={item.result}>{label[item.result]}</span>
+    <li data-open={open}>
+      <button aria-expanded={open} className="hub-feed-row" disabled={!record} onClick={() => setOpen(!open)} type="button">
+        <span className="hub-feed-agent"><AgentGlyph agent={item.agent} />{agentName(item.agent)}</span>
+        <span className="hub-feed-route">
+          {item.requested}
+          <i>→</i>
+          <b>{item.provider ? `${item.provider} / ${item.model}` : item.model}</b>
+        </span>
+        <span className="hub-feed-ms">{formatElapsed(item.elapsedMs)}</span>
+        <span className="hub-badge" data-result={item.result}>{label[item.result]}</span>
+        <ChevronDown aria-hidden className="hub-feed-chevron h-3.5 w-3.5" />
+      </button>
+      {open && record ? (
+        <ol className="hub-feed-trace">
+          {routeNarrative(item.agent, record, payload).map((line, index) => (
+            <li data-tone={line.tone} key={index}>{tf(line.text, line.args.map((arg) => (typeof arg === "string" && /^[一-龥]/.test(arg) ? t(arg) : arg)))}</li>
+          ))}
+        </ol>
+      ) : null}
     </li>
   );
 }

@@ -114,7 +114,7 @@ async fn open_candidates(
                 busy: None,
             });
         }
-        anyhow::bail!("网关没有可用的上游：请检查绑定的供应商或路由组是否配置了地址和 Key");
+        anyhow::bail!("网关没有可用的上游：请检查绑定的供应商或模型组是否配置了地址和 Key");
     }
     let count = plan.candidates.len();
     let mut last_error: Option<anyhow::Error> = None;

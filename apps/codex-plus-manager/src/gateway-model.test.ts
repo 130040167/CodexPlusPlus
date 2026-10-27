@@ -13,6 +13,7 @@ import {
   groupModelId,
   memberLabel,
   memberStatus,
+  modelDispatch,
   modelDisplay,
   prettyModelName,
   modelRoutable,
@@ -23,7 +24,6 @@ import {
   providerDraftFromEntry,
   providerDraftFromPreset,
   providerInput,
-  routeMembers,
   routeNarrative,
   slugify,
   splitModels,
@@ -187,15 +187,17 @@ test("成员状态：正在回答 > 熔断 / Key 全部冷却 > 最近回答了�
   assert.deepEqual(memberStatus(payload(), "bare"), { state: "idle", text: "{0} 个 Key", args: [1] });
 });
 
-test("路由页：所有接入的 Agent 共用一张卡片；成员是池里打开的供应商", () => {
+test("模型调度表：每个模型列出提供它的供应商，按池顺序；有备用的排前面，关掉的不算，标出排除它的 Agent", () => {
   const data = withActivity();
   assert.deepEqual(connectedAgents(data), ["claude"]);
-  const records = data.activity!.agents.map((agent) => agent.last!);
-  assert.deepEqual(routeMembers(data, records), [
-    { relayId: "deepseek", name: "DeepSeek", model: "deepseek-v4-flash" },
-    { relayId: "glm", name: "GLM", model: "glm-5.3" },
-    { relayId: "bare", name: "Bare", model: "" },
-  ]);
+  data.pool[2].models = ["glm-5.3", "GLM-5.3", "bare-1"];
+  data.pool.push({ id: "off", name: "Off", baseUrl: "https://off.test/v1", protocol: "responses", official: false, models: ["glm-5.3"], keyCount: 1, enabled: false, source: "" });
+  data.gateway.bindings.claude = { ...data.gateway.bindings.claude!, poolExclude: ["bare"] };
+  const rows = modelDispatch(data);
+  assert.deepEqual(rows.map((row) => row.model), ["glm-5.3", "deepseek-v4-pro", "deepseek-v4-flash", "bare-1"]);
+  assert.deepEqual(rows[0].providers.map((provider) => provider.id), ["glm", "bare"], "大小写不同算同一个模型；关掉的供应商不在里面");
+  assert.deepEqual(rows[0].providers[1].excludedBy, ["claude"]);
+  assert.deepEqual(rows[0].providers[0].excludedBy, []);
 });
 
 test("上一个请求的路由说明：先列计划，再逐个尝试，最后谁回答", () => {

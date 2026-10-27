@@ -1039,7 +1039,7 @@ pub fn copy_codex_provider(
         .with_context(|| format!("Codex 供应商不存在：{relay_id}"))?;
     if relay.relay_mode == RelayMode::Aggregate {
         bail!(
-            "「{}」是聚合供应商，网关的路由组请在「路由」里新建",
+            "「{}」是聚合供应商，网关的模型组请在「模型调度」里新建",
             relay.name
         );
     }
@@ -1388,7 +1388,7 @@ pub fn save_group(
     let mut gateway = store.load()?;
     let name = input.name.trim();
     if name.is_empty() {
-        bail!("请填写路由组名称");
+        bail!("请填写模型组名称");
     }
     let id = if input.id.trim().is_empty() {
         gateway.unique_slug(name, true)
@@ -1410,7 +1410,7 @@ pub fn save_group(
         }
     }
     if members.is_empty() {
-        bail!("路由组至少要有一个成员");
+        bail!("模型组至少要有一个成员");
     }
     let group = GatewayGroup {
         id: id.clone(),
@@ -1432,7 +1432,7 @@ pub fn delete_group(store: &GatewayStore, id: &str) -> anyhow::Result<GatewaySet
     let before = gateway.groups.len();
     gateway.groups.retain(|group| group.id != id);
     if gateway.groups.len() == before {
-        bail!("路由组不存在：{id}");
+        bail!("模型组不存在：{id}");
     }
     let reference = format!("{GROUP_MODEL_PREFIX}{id}");
     for group in &mut gateway.groups {

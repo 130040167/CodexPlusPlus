@@ -1,41 +1,35 @@
-/** 本地网关：让 Claude Code、Grok 经 Codex++ 使用统一的供应商池，支持多 Key 轮换与路由组。 */
-import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+/** 本地网关：让 Claude Code、Grok 经 Codex++ 使用统一的供应商池，支持多 Key 轮换与模型组。 */
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { appConfirm } from "./app-dialog";
-import { AlertTriangle, ChevronDown, ChevronUp, Plus, RefreshCw, Waypoints, X } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronRight, ChevronUp, Plus, RefreshCw, Search, Waypoints, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { t, tf } from "./i18n";
 import {
   agentName,
-  connectedAgents,
   groupModeDescription,
   groupModeLabel,
   groupModelId,
   memberLabel,
   memberStatus,
+  modelDispatch,
   modelDisplay,
-  routeMembers,
-  routeNarrative,
+  prettyModelName,
   slugify,
-  type AgentActivityView,
-  type GatewayAgentId,
   type GatewayGroupEntry,
   type GatewayPayload,
   type GatewayResult,
   type GroupMember,
   type GroupMode,
-  type MemberStatus,
-  type RouteRecordView,
-  maskAccountName,
 } from "./gateway-model";
 import { AgentsView, Floating, ModelList } from "./GatewayAgents";
 import { AppSelect } from "./AppSelect";
 import { ProvidersView } from "./GatewayProviders";
 import { SessionsView } from "./GatewaySessions";
 import { UsageView } from "./GatewayUsage";
-import { AGENT_ICONS, APP_LOGO_URL, Avatar, MemberStatusLabel, SectionLabel, Switch, type Notify, type Run, AgentIcon } from "./gateway-ui";
+import { Avatar, MemberStatusLabel, SectionLabel, Switch, type Notify, type Run } from "./gateway-ui";
 import { TopbarActions } from "./TopbarActions";
 import "./GatewayPage.css";
 
@@ -44,9 +38,7 @@ export type GatewayTab = Tab;
 
 const memo: { payload: GatewayPayload | null; tab: Tab } = { payload: null, tab: "agents" };
 
-/** 路由图里各 Agent 连线的色相。 */
-const AGENT_HUES: Record<string, number> = { claude: 18, grok: 210, codex: 250 };
-/** 路由页实时刷新间隔。 */
+/** 模型调度页刷新供应商状态的间隔。 */
 const LIVE_REFRESH_MS = 2500;
 
 function hasPayload(result: GatewayResult): result is GatewayResult & GatewayPayload {
@@ -146,7 +138,7 @@ export function GatewayPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 路由页实时刷新：静默读取，不占用 busy，也不弹错误。
+  // 模型调度页定时刷新供应商状态：静默读取，不占用 busy，也不弹错误。
   useEffect(() => {
     if (tab !== "routing") return;
     let cancelled = false;
@@ -168,7 +160,7 @@ export function GatewayPage({
     { id: "agents", label: t("智能体") },
     { id: "sessions", label: t("会话") },
     { id: "providers", label: t("供应商") },
-    { id: "routing", label: t("路由") },
+    { id: "routing", label: t("模型调度") },
     { id: "usage", label: t("用量") },
     { id: "gateway", label: t("网关") },
   ];
@@ -207,7 +199,7 @@ export function GatewayPage({
         {tab === "agents" ? <AgentsView busy={busy} notify={notify} onManage={() => setTab("providers")} payload={payload} run={run} /> : null}
         {tab === "sessions" ? <SessionsView notify={notify} /> : null}
         {tab === "providers" ? <ProvidersView busy={busy} notify={notify} payload={payload} run={run} /> : null}
-        {tab === "routing" ? <RoutingView busy={busy} payload={payload} run={run} /> : null}
+        {tab === "routing" ? <RoutingView busy={busy} onManage={() => setTab("providers")} payload={payload} run={run} /> : null}
         {tab === "usage" ? <UsageView busy={busy} notify={notify} payload={payload} run={run} /> : null}
         {tab === "gateway" ? <GatewayView busy={busy} payload={payload} run={run} /> : null}
         {tab === "gateway" && extraSettings ? extraSettings : null}
@@ -216,40 +208,30 @@ export function GatewayPage({
   );
 }
 
-/* —————————————————————— 路由 —————————————————————— */
+/* —————————————————————— 模型调度 —————————————————————— */
 
-function RoutingView({ payload, busy, run }: { payload: GatewayPayload | null; busy: string | null; run: Run }) {
-  const agents = connectedAgents(payload);
+/** 调度表默认显示的行数，搜索或展开后显示全部。 */
+const DISPATCH_PREVIEW = 12;
+
+function RoutingView({ payload, busy, run, onManage }: { payload: GatewayPayload | null; busy: string | null; run: Run; onManage: () => void }) {
   const [editing, setEditing] = useState<GatewayGroupEntry | "new" | null>(null);
   const remove = async (group: GatewayGroupEntry) => {
-    const ok = await appConfirm(tf("删除路由组「{0}」？引用它的其它组会去掉这个成员。", [group.name]), { title: t("删除路由组"), confirmText: t("删除"), danger: true });
-    if (ok) await run(`group:${group.id}`, "delete_gateway_group", { id: group.id }, t("删除路由组"));
+    const ok = await appConfirm(tf("删除模型组「{0}」？引用它的其它组会去掉这个成员。", [group.name]), { title: t("删除模型组"), confirmText: t("删除"), danger: true });
+    if (ok) await run(`group:${group.id}`, "delete_gateway_group", { id: group.id }, t("删除模型组"));
   };
   return (
     <>
-      <SectionLabel>
-        {t("路由")}
-        <i className="gw-dot gw-dot-live" data-tone={payload?.helperRunning ? "on" : "off"} />
-        <em>{payload?.helperRunning ? t("实时，按网关的实际决策") : t("网关没有运行")}</em>
-      </SectionLabel>
-      {agents.length === 0 ? (
-        <div className="gw-card gw-empty">
-          <strong>{t("还没有 Agent 经网关")}</strong>
-          <span>{t("在「智能体」里为 Claude Code 或 Grok 选好模型并打开开关，这里会实时显示每个请求怎么走。")}</span>
-        </div>
-      ) : (
-        <RouteCard agents={agents} payload={payload} />
-      )}
+      <DispatchTable onManage={onManage} payload={payload} />
 
       <SectionLabel
         aside={(
           <>
-            <em>{t("Agent 可以把路由组当作一个模型来选")}</em>
-            <button className="gw-text-button strong" disabled={busy !== null} onClick={() => setEditing("new")} type="button">{t("新建路由组")}</button>
+            <em>{t("Agent 可以把模型组当作一个模型来选")}</em>
+            <button className="gw-text-button strong" disabled={busy !== null} onClick={() => setEditing("new")} type="button">{t("新建模型组")}</button>
           </>
         )}
       >
-        {t("路由组")}
+        {t("模型组")}
       </SectionLabel>
       <div className="gw-card">
         {(payload?.groups ?? []).map((group) => {
@@ -280,7 +262,7 @@ function RoutingView({ payload, busy, run }: { payload: GatewayPayload | null; b
         })}
         {payload && payload.groups.length === 0 ? (
           <div className="gw-empty">
-            <strong>{t("还没有路由组")}</strong>
+            <strong>{t("还没有模型组")}</strong>
             <span>{t("把几个模型编成一组，Agent 在模型列表里把它当一个模型来选：按顺序、轮换或按权重回答，组里也可以再放组。")}</span>
           </div>
         ) : null}
@@ -291,7 +273,7 @@ function RoutingView({ payload, busy, run }: { payload: GatewayPayload | null; b
           group={editing === "new" ? null : editing}
           onCancel={() => setEditing(null)}
           onSave={async (input) => {
-            if (await run("group:save", "save_gateway_group", { group: input }, t("保存路由组"))) setEditing(null);
+            if (await run("group:save", "save_gateway_group", { group: input }, t("保存模型组"))) setEditing(null);
           }}
           payload={payload}
         />
@@ -300,7 +282,80 @@ function RoutingView({ payload, busy, run }: { payload: GatewayPayload | null; b
   );
 }
 
-/** 新建 / 编辑路由组：名称、模式、成员（池里的模型或别的组）。 */
+/** 每个模型名一行，列出提供它的供应商；从左到右就是网关的尝试顺序。 */
+function DispatchTable({ payload, onManage }: { payload: GatewayPayload | null; onManage: () => void }) {
+  const [query, setQuery] = useState("");
+  const [expanded, setExpanded] = useState(false);
+  const rows = modelDispatch(payload);
+  const needle = query.trim().toLowerCase();
+  const matched = needle
+    ? rows.filter((row) => row.model.toLowerCase().includes(needle) || row.providers.some((provider) => provider.name.toLowerCase().includes(needle)))
+    : rows;
+  const shown = needle || expanded ? matched : matched.slice(0, DISPATCH_PREVIEW);
+  const backed = rows.filter((row) => row.providers.length > 1).length;
+  return (
+    <>
+      <SectionLabel
+        aside={(
+          <button className="gw-text-button strong" onClick={onManage} type="button">{t("调整顺序")}</button>
+        )}
+      >
+        {t("模型调度")}
+        <em>{tf("{0} 个模型 · {1} 个有备用", [rows.length, backed])}</em>
+      </SectionLabel>
+      <div className="gw-card gw-dispatch">
+        <p className="gw-dispatch-lead">
+          {t("Agent 请求一个模型名时，网关从左往右依次尝试提供它的供应商：前一家出错、Key 都在冷却或被熔断，就换下一家。顺序跟着供应商池走，在池里拖动即可调整。")}
+        </p>
+        {rows.length > DISPATCH_PREVIEW ? (
+          <div className="gw-dispatch-search">
+            <Search aria-hidden className="h-4 w-4" />
+            <input aria-label={t("搜索模型或供应商")} onChange={(event) => setQuery(event.target.value)} placeholder={t("搜索模型或供应商")} value={query} />
+          </div>
+        ) : null}
+        {rows.length === 0 ? (
+          <div className="gw-empty">
+            <strong>{t("供应商池里还没有模型")}</strong>
+            <span>{t("在「供应商池」添加并打开供应商后，这里列出每个模型会发给谁。")}</span>
+          </div>
+        ) : null}
+        {shown.map((row) => (
+          <div className="gw-dispatch-row" key={row.model}>
+            <div className="gw-dispatch-model">
+              <strong title={row.model}>{prettyModelName(row.model)}</strong>
+              <code>{row.model}</code>
+            </div>
+            <ol className="gw-dispatch-chain">
+              {row.providers.map((provider, index) => {
+                const status = memberStatus(payload, provider.id);
+                const note = provider.excludedBy.length ? tf("{0} 不用这家", [provider.excludedBy.map(agentName).join("、")]) : undefined;
+                return (
+                  <li data-excluded={provider.excludedBy.length > 0} data-state={status.state} key={provider.id} title={note}>
+                    {index > 0 ? <ChevronRight aria-hidden className="gw-dispatch-arrow h-3.5 w-3.5" /> : null}
+                    <span className="gw-dispatch-step">
+                      <i>{index + 1}</i>
+                      <Avatar baseUrl={provider.baseUrl} name={provider.name} size="sm" />
+                      <b>{provider.name}</b>
+                      {status.state === "idle" ? null : <small><MemberStatusLabel status={status} /></small>}
+                    </span>
+                  </li>
+                );
+              })}
+            </ol>
+          </div>
+        ))}
+        {!needle && matched.length > DISPATCH_PREVIEW ? (
+          <button className="gw-dispatch-more" onClick={() => setExpanded(!expanded)} type="button">
+            {expanded ? t("收起") : tf("显示全部 {0} 个模型", [matched.length])}
+          </button>
+        ) : null}
+        {needle && matched.length === 0 ? <p className="gw-dispatch-none">{t("没有匹配的模型")}</p> : null}
+      </div>
+    </>
+  );
+}
+
+/** 新建 / 编辑模型组：名称、模式、成员（池里的模型或别的组）。 */
 function GroupEditor({
   payload,
   group,
@@ -332,7 +387,7 @@ function GroupEditor({
     next.splice(Math.max(0, Math.min(next.length, index + delta)), 0, item);
     setMembers(next);
   };
-  const error = !name.trim() ? t("请填写路由组名称") : members.length === 0 ? t("路由组至少要有一个成员") : "";
+  const error = !name.trim() ? t("请填写模型组名称") : members.length === 0 ? t("模型组至少要有一个成员") : "";
   const modes: Array<{ value: GroupMode; label: string }> = [
     { value: "inOrder", label: t("依次") },
     { value: "rotate", label: t("轮换") },
@@ -349,7 +404,7 @@ function GroupEditor({
       >
         <header>
           <span className="gw-avatar gw-avatar-plus"><Waypoints className="h-4 w-4" /></span>
-          <strong>{group ? tf("编辑 {0}", [group.name]) : t("新建路由组")}</strong>
+          <strong>{group ? tf("编辑 {0}", [group.name]) : t("新建模型组")}</strong>
           <button aria-label={t("关闭")} className="gw-icon-button" onClick={onCancel} type="button"><X className="h-4 w-4" /></button>
         </header>
         <div className="gw-modal-body">
@@ -429,133 +484,6 @@ function GroupEditor({
       </form>
     </div>,
     document.body,
-  );
-}
-
-function RouteCard({ payload, agents }: { payload: GatewayPayload | null; agents: GatewayAgentId[] }) {
-  const activity = (payload?.activity?.agents ?? []).filter((item): item is AgentActivityView => agents.includes(item.agent as GatewayAgentId));
-  const latest = activity
-    .filter((item) => item.last)
-    .sort((left, right) => (right.last?.finishedAtMs ?? 0) - (left.last?.finishedAtMs ?? 0))[0];
-  const records = activity.map((item) => item.last).filter((record): record is RouteRecordView => Boolean(record));
-  const members = routeMembers(payload, records);
-  const totals = activity.reduce((sum, item) => ({ requests: sum.requests + item.requests, rerouted: sum.rerouted + item.rerouted, errors: sum.errors + item.errors }), { requests: 0, rerouted: 0, errors: 0 });
-  const lastGroup = latest?.last?.groupId ? payload?.groups.find((group) => group.id === latest.last?.groupId) : undefined;
-  const summary = latest?.last?.planned[0]
-    ? tf("{0} 排在第一个。", [maskAccountName(latest.last.planned[0].relayName)])
-    : t("还没有请求经过这里。在 Agent 里发一条消息试试。");
-
-  return (
-    <div className="gw-card gw-route-card">
-      <div className="gw-route-head">
-        <strong>{t("供应商池")}</strong>
-        <span> · {tf("{0} 个供应商 · {1} 个 Agent", [members.length, agents.length])}</span>
-        <p>{lastGroup ? t(groupModeDescription(lastGroup.mode)) : t("按模型名选供应商：Agent 请求哪个模型，就发给池里提供它的供应商；同一个模型有多家时按池里的顺序依次尝试，每家再按自己的 Key 轮换。")}</p>
-      </div>
-      <RouteDiagram
-        activeAgent={latest?.agent ?? null}
-        agents={agents.map((agent) => ({ id: agent, binding: payload?.gateway.bindings[agent] }))}
-        hubPill={lastGroup ? t(groupModeLabel(lastGroup.mode)) : t("按模型")}
-        members={members.map((member) => ({ ...member, status: memberStatus(payload, member.relayId) }))}
-        payload={payload}
-      />
-      <div className="gw-route-summary">
-        <p>{summary}</p>
-        <dl>
-          <div><dt>{totals.requests}</dt><dd>{t("个请求")}</dd></div>
-          <div><dt>{totals.rerouted}</dt><dd>{t("次换上游")}</dd></div>
-          <div><dt>{totals.errors}</dt><dd>{t("个错误交给了 Agent")}</dd></div>
-        </dl>
-      </div>
-      {latest?.last ? (
-        <div className="gw-route-trace">
-          <h4>{t("上一个请求是怎么路由的")}</h4>
-          <ul>
-            {routeNarrative(latest.agent, latest.last, payload).map((line, index) => (
-              <li data-tone={line.tone} key={index}>{tf(line.text, line.args.map((arg) => (typeof arg === "string" && /^[一-龥]/.test(arg) ? t(arg) : arg)))}</li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-const AGENT_NODE_H = 76;
-const AGENT_NODE_GAP = 12;
-const MEMBER_ROW_H = 46;
-const MEMBER_ROW_GAP = 8;
-const HUB_H = 118;
-const LINK_W = 64;
-
-/** 路由图：左边 Agent，中间网关，右边成员；最近一次请求走过的线用虚线高亮。 */
-function RouteDiagram({
-  payload,
-  agents,
-  members,
-  activeAgent,
-  hubPill,
-}: {
-  payload: GatewayPayload | null;
-  agents: Array<{ id: GatewayAgentId; binding: GatewayPayload["gateway"]["bindings"][GatewayAgentId] }>;
-  members: Array<{ relayId: string; name: string; model: string; status: MemberStatus }>;
-  activeAgent: string | null;
-  hubPill: string;
-}) {
-  const agentsH = agents.length * AGENT_NODE_H + Math.max(0, agents.length - 1) * AGENT_NODE_GAP;
-  const membersH = members.length * MEMBER_ROW_H + Math.max(0, members.length - 1) * MEMBER_ROW_GAP;
-  const height = Math.max(agentsH, membersH, HUB_H);
-  const agentTop = (height - agentsH) / 2;
-  const memberTop = (height - membersH) / 2;
-  const middle = height / 2;
-  const agentY = (index: number) => agentTop + index * (AGENT_NODE_H + AGENT_NODE_GAP) + AGENT_NODE_H / 2;
-  const memberY = (index: number) => memberTop + index * (MEMBER_ROW_H + MEMBER_ROW_GAP) + MEMBER_ROW_H / 2;
-  const curve = (fromY: number, toY: number) => `M0 ${fromY} C${LINK_W / 2} ${fromY}, ${LINK_W / 2} ${toY}, ${LINK_W} ${toY}`;
-  const hue = AGENT_HUES[activeAgent ?? ""] ?? 232;
-  const activeStyle = { "--gw-hue": hue } as CSSProperties;
-
-  return (
-    <div className="gw-diagram" style={{ height }}>
-      <div className="gw-diagram-col" style={{ paddingTop: agentTop, gap: AGENT_NODE_GAP }}>
-        {agents.map((agent) => (
-          <div className="gw-node-agent" key={agent.id} style={{ height: AGENT_NODE_H, "--gw-hue": AGENT_HUES[agent.id] ?? 232 } as CSSProperties}>
-            <AgentIcon agent={agent.id} className="gw-node-agent-icon" />
-            <strong><i className="gw-dot" data-tone="agent" />{agentName(agent.id)}</strong>
-            <small>{agent.binding ? modelDisplay(payload, agent.binding.model, agent.binding.poolExclude ?? []).title : ""}</small>
-          </div>
-        ))}
-      </div>
-      <svg aria-hidden className="gw-links" height={height} width={LINK_W}>
-        {agents.map((agent, index) => (
-          <path className={agent.id === activeAgent ? "active" : ""} d={curve(agentY(index), middle)} key={agent.id} style={agent.id === activeAgent ? activeStyle : undefined} />
-        ))}
-      </svg>
-      <div className="gw-diagram-col" style={{ paddingTop: (height - HUB_H) / 2 }}>
-        <div className="gw-hub" style={{ height: HUB_H }}>
-          <img alt="" src={APP_LOGO_URL} />
-          <strong>{t("Codex++ 网关")}</strong>
-          <small>{`127.0.0.1:${payload?.port ?? ""}`}</small>
-          <span className="gw-pill gw-pill-solid">{hubPill}</span>
-        </div>
-      </div>
-      <svg aria-hidden className="gw-links" height={height} width={LINK_W}>
-        {members.map((member, index) => {
-          const active = member.status.state === "answered" || member.status.state === "busy";
-          return <path className={active ? "active" : ""} d={curve(middle, memberY(index))} key={member.relayId} style={active ? activeStyle : undefined} />;
-        })}
-      </svg>
-      <div className="gw-diagram-col" style={{ paddingTop: memberTop, gap: MEMBER_ROW_GAP }}>
-        {members.map((member) => (
-          <div className="gw-member" data-state={member.status.state} key={member.relayId} style={{ height: MEMBER_ROW_H }}>
-            <i className="gw-radio" />
-            <Avatar name={member.name} size="sm" />
-            <strong>{maskAccountName(member.name)}</strong>
-            {member.model ? <code className="gw-chip">{member.model}</code> : null}
-            <span className="gw-status" data-state={member.status.state}><MemberStatusLabel status={member.status} /></span>
-          </div>
-        ))}
-      </div>
-    </div>
   );
 }
 

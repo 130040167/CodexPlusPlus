@@ -580,7 +580,7 @@ pub fn set_gateway_provider_enabled(
         if enabled {
             "已打开，接入的 Agent 能用它的模型了。"
         } else {
-            "已关闭，它不再参与路由。"
+            "已关闭，它不再参与调度。"
         },
         "切换供应商失败",
         refresh_agents(apply::set_provider_enabled(
@@ -691,8 +691,8 @@ pub async fn import_gateway_opencode_key(
 #[tauri::command]
 pub fn save_gateway_group(group: GroupInput) -> CommandResult<Option<GatewayPayload>> {
     respond(
-        "路由组已保存。",
-        "保存路由组失败",
+        "模型组已保存。",
+        "保存模型组失败",
         refresh_agents(apply::save_group(&GatewayStore::default(), &group)),
     )
 }
@@ -701,8 +701,8 @@ pub fn save_gateway_group(group: GroupInput) -> CommandResult<Option<GatewayPayl
 #[tauri::command]
 pub fn delete_gateway_group(id: String) -> CommandResult<Option<GatewayPayload>> {
     respond(
-        "路由组已删除。",
-        "删除路由组失败",
+        "模型组已删除。",
+        "删除模型组失败",
         refresh_agents(apply::delete_group(&GatewayStore::default(), &id)),
     )
 }

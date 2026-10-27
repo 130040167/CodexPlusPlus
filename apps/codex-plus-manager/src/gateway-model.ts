@@ -1,6 +1,6 @@
 /** 网关模式的前端数据模型：与 `codex_plus_core::gateway` 的序列化结构一一对应，外加表单转换。
  *
- * 网关模式与直连模式完全独立：供应商池、路由组只属于网关；所有接入的 Agent 共用整个池。
+ * 网关模式与直连模式完全独立：供应商池、模型组只属于网关；所有接入的 Agent 共用整个池。
  * 模型名三种写法：裸模型名（池里提供它的供应商依次尝试）、`<供应商 id>/<模型>`、`group/<组 id>`。
  */
 import { PRESETS } from "./presets.ts";
@@ -260,7 +260,7 @@ export function bindingFromDraft(draft: BindingDraft, previous: AgentBinding | u
 
 export const GROUP_MODEL_PREFIX = "group/";
 
-/** 路由组当作模型时的名字：`group/<组 id>`。 */
+/** 模型组当作模型时的名字：`group/<组 id>`。 */
 export function groupModelId(id: string): string {
   return `${GROUP_MODEL_PREFIX}${id}`;
 }
@@ -281,7 +281,7 @@ export function agentPoolProviders(payload: GatewayPayload | null, exclude: stri
   return (payload?.pool ?? []).filter((entry) => providerEnabled(entry) && !exclude.includes(entry.id));
 }
 
-/** Agent 能用的全部模型：池内供应商的模型（去重，按池顺序）+ 有成员的路由组。与后端 `pool_models` 一致。 */
+/** Agent 能用的全部模型：池内供应商的模型（去重，按池顺序）+ 有成员的模型组。与后端 `pool_models` 一致。 */
 export function agentModels(payload: GatewayPayload | null, exclude: string[] = []): string[] {
   const models: string[] = [];
   for (const entry of agentPoolProviders(payload, exclude)) {
@@ -390,9 +390,9 @@ function matches(query: string, ...values: string[]): boolean {
 }
 
 /**
- * 模型选择器的分组：每个能用的池内供应商一组列出它的模型，路由组（`group/<id>`）排在后面。
+ * 模型选择器的分组：每个能用的池内供应商一组列出它的模型，模型组（`group/<id>`）排在后面。
  * 查询词不是任何已知模型时，另给一组「自定义模型」：`<供应商 id>/<输入>`，直接发给那个供应商。
- * `skipGroup` 用来在编辑路由组时排除它自己。`avatar` 由调用方算（避免这里依赖界面工具函数）。
+ * `skipGroup` 用来在编辑模型组时排除它自己。`avatar` 由调用方算（避免这里依赖界面工具函数）。
  */
 export function pickerSections(
   payload: GatewayPayload | null,
@@ -415,7 +415,7 @@ export function pickerSections(
   const groups = payload.groups
     .filter((group) => group.id !== skipGroup && group.members.length && matches(query, group.name, groupModelId(group.id)))
     .map((group) => ({ model: groupModelId(group.id), label: group.name, sub: groupModelId(group.id), avatar: avatar(group.name) }));
-  if (groups.length) sections.push({ key: "group", title: "路由组", avatar: "", items: groups });
+  if (groups.length) sections.push({ key: "group", title: "模型组", avatar: "", items: groups });
   const typed = rawQuery.trim();
   if (typed && !/\s/.test(typed) && !modelRoutable(payload, typed, exclude)) {
     sections.push({
@@ -436,7 +436,7 @@ export function pickerSections(
 
 export type ModelView = { title: string; sub: string; group: boolean };
 
-/** 一个模型名在按钮上的显示：模型名 + 提供它的供应商；路由组显示组名。空串用池里第一个模型。 */
+/** 一个模型名在按钮上的显示：模型名 + 提供它的供应商；模型组显示组名。空串用池里第一个模型。 */
 export function modelDisplay(payload: GatewayPayload | null, model: string, exclude: string[] = []): ModelView {
   const title = model.trim() || agentModels(payload, exclude)[0] || "";
   if (title.startsWith(GROUP_MODEL_PREFIX)) {
@@ -519,7 +519,7 @@ export function groupModeDescription(mode: string): string {
   }
 }
 
-/** 路由组成员在列表里的显示：「供应商 · 模型」或「组名」。 */
+/** 模型组成员在列表里的显示：「供应商 · 模型」或「组名」。 */
 export function memberLabel(payload: GatewayPayload | null, model: string): string {
   const view = modelDisplay(payload, model);
   if (view.group) return view.title;
@@ -528,7 +528,7 @@ export function memberLabel(payload: GatewayPayload | null, model: string): stri
 
 export type MemberStatus = { state: "busy" | "answered" | "cooling" | "idle"; text: string; args: Array<string | number> };
 
-/** 供应商在路由图里的状态：正在回答 / 熔断或 Key 全部冷却 / 最近回答了谁 / Key 数。文案是中文原文，界面再翻译。 */
+/** 供应商在调度表、总览里的状态：正在回答 / 熔断或 Key 全部冷却 / 最近回答了谁 / Key 数。文案是中文原文，界面再翻译。 */
 export function memberStatus(payload: GatewayPayload | null, relayId: string): MemberStatus {
   const activity = payload?.activity?.agents ?? [];
   if (activity.some((agent) => agent.inFlight.includes(relayId))) {
@@ -561,7 +561,7 @@ export function formatElapsed(ms: number): string {
 
 export type NarrativeLine = { tone: "muted" | "step" | "ok" | "fail"; text: string; args: Array<string | number> };
 
-/** 「上一个请求是怎么路由的」：按记录逐条生成。文案是中文模板，界面用 tf 翻译。 */
+/** 总览「最近请求」展开后的路由经过：按记录逐条生成。文案是中文模板，界面用 tf 翻译。 */
 export function routeNarrative(agent: string, record: RouteRecordView, payload: GatewayPayload | null): NarrativeLine[] {
   const lines: NarrativeLine[] = [];
   const who = agentName(agent);
@@ -569,7 +569,7 @@ export function routeNarrative(agent: string, record: RouteRecordView, payload: 
   const plan = record.planned.map((member) => `${maskAccountName(member.relayName)}/${member.model}`).join(", ");
   if (record.groupId) {
     const group = payload?.groups.find((item) => item.id === record.groupId);
-    lines.push({ tone: "muted", text: "{0} 请求 {1}，交给路由组「{2}」：{3}", args: [who, requested, group?.name ?? record.groupId, plan] });
+    lines.push({ tone: "muted", text: "{0} 请求 {1}，交给模型组「{2}」：{3}", args: [who, requested, group?.name ?? record.groupId, plan] });
     if (record.planned[0]) lines.push({ tone: "step", text: "{0} 排在第一个。", args: [maskAccountName(record.planned[0].relayName)] });
   } else {
     lines.push({ tone: "muted", text: "{0} 请求 {1}，转发到 {2}", args: [who, requested, plan] });
@@ -595,17 +595,36 @@ export function routeNarrative(agent: string, record: RouteRecordView, payload: 
 }
 
 
-/** 所有接入的 Agent 共用整个池：路由页只有一张卡片。 */
+/** 已接入网关的 Agent（它们共用整个池）。 */
 export function connectedAgents(payload: GatewayPayload | null): GatewayAgentId[] {
   return (payload?.agents ?? []).filter((view) => view.enabled).map((view) => view.agent);
 }
 
-/** 路由卡片右侧的成员：池里打开的供应商；模型取最近一次计划里的，没有就用供应商默认模型。 */
-export function routeMembers(payload: GatewayPayload | null, records: RouteRecordView[]): Array<{ relayId: string; name: string; model: string }> {
-  return agentPoolProviders(payload).map((entry) => {
-    const planned = records.flatMap((record) => record.planned).find((member) => member.relayId === entry.id);
-    return { relayId: entry.id, name: maskAccountName(entry.name), model: planned?.model ?? entry.models[0] ?? "" };
-  });
+export type DispatchProvider = { id: string; name: string; baseUrl: string; excludedBy: GatewayAgentId[] };
+export type DispatchRow = { model: string; providers: DispatchProvider[] };
+
+/**
+ * 模型调度表：每个模型名列出池里提供它的供应商，顺序就是网关的尝试顺序（与后端 `expand_model` 一致：
+ * 打开的供应商按池顺序）。有备用的模型排前面；`excludedBy` 是在「挑选」里排除了这家的已接入 Agent。
+ */
+export function modelDispatch(payload: GatewayPayload | null): DispatchRow[] {
+  const connected = connectedAgents(payload);
+  const rows: DispatchRow[] = [];
+  for (const entry of agentPoolProviders(payload)) {
+    const excludedBy = connected.filter((agent) => payload?.gateway.bindings[agent]?.poolExclude?.includes(entry.id));
+    for (const model of entry.models) {
+      let row = rows.find((item) => item.model.toLowerCase() === model.toLowerCase());
+      if (!row) {
+        row = { model, providers: [] };
+        rows.push(row);
+      }
+      if (!row.providers.some((provider) => provider.id === entry.id)) {
+        row.providers.push({ id: entry.id, name: maskAccountName(entry.name), baseUrl: entry.baseUrl, excludedBy });
+      }
+    }
+  }
+  // sort 是稳定的：同样家数的模型保持池里的先后。
+  return rows.sort((left, right) => Number(right.providers.length > 1) - Number(left.providers.length > 1));
 }
 
 /* —————————————— 内置厂商预设 —————————————— */

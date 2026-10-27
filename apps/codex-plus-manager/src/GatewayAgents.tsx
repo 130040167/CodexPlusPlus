@@ -322,7 +322,7 @@ function AgentDetail({
           {groups.length ? (
             <span className="gw-model-chip">
               <Waypoints className="h-3.5 w-3.5" />
-              {t("路由组")}
+              {t("模型组")}
               <em>{groups.length}</em>
             </span>
           ) : null}
@@ -552,9 +552,9 @@ export function ModelList({
           <button data-active={!favoritesOnly} onClick={() => { setFavoritesOnly(false); setQuery(""); if (listRef.current) listRef.current.scrollTop = 0; }} type="button">{t("全部")}</button>
           <button data-active={favoritesOnly} onClick={() => setFavoritesOnly(!favoritesOnly)} type="button"><Star className="h-3 w-3" />{t("收藏")}</button>
           {filters.map((section) => (
-            <button key={section.key} onClick={() => jump(section.key)} title={section.key === "group" ? t("路由组") : section.title} type="button">
+            <button key={section.key} onClick={() => jump(section.key)} title={section.key === "group" ? t("模型组") : section.title} type="button">
               {section.key === "group" ? <Waypoints className="h-3 w-3" /> : <Avatar name={section.title} size="sm" />}
-              <span>{section.key === "group" ? t("路由组") : section.title.split(" · ")[0]}</span>
+              <span>{section.key === "group" ? t("模型组") : section.title.split(" · ")[0]}</span>
             </button>
           ))}
         </div>
