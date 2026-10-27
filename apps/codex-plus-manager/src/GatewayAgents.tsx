@@ -152,7 +152,7 @@ function AgentRow({
   return (
     <div className="gw-agent" data-expanded={expanded}>
       <div className="gw-agent-row">
-        <AgentIcon agent={agent.agent} className="gw-agent-icon" />
+        <span className="gw-agent-icon-box"><AgentIcon agent={agent.agent} className="gw-agent-icon" /></span>
         <div className="gw-agent-main">
           <div className="gw-agent-title">
             <strong>{agent.name}</strong>

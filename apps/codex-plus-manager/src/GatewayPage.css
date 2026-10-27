@@ -2593,3 +2593,80 @@ span.gw-avatar[data-size] {
 .gw-stat-grid > div:hover {
   background: var(--gw-soft);
 }
+
+/* 添加供应商：弹出框（原来铺在页面里） */
+.gw-modal.gw-catalog-modal {
+  width: min(860px, 100%);
+  height: min(640px, 100%);
+}
+.gw-catalog-modal header .gw-sheet-search {
+  flex: 1;
+  max-width: 320px;
+  margin-left: auto;
+}
+.gw-catalog-modal header strong {
+  flex: none;
+}
+.gw-catalog-modal .gw-modal-body.gw-catalog {
+  display: block;
+  margin: 0;
+  padding: 6px 14px 14px;
+}
+
+/* 供应商池为空时的引导 */
+.gw-pool-empty {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 32px 20px;
+  text-align: center;
+}
+.gw-pool-empty strong {
+  font-size: 14px;
+}
+.gw-pool-empty span {
+  max-width: 420px;
+  color: var(--gw-mute);
+  font-size: 12.5px;
+}
+.gw-primary-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  margin-top: 8px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 8px;
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
+  font: inherit;
+  cursor: pointer;
+}
+
+/* 细节微调：开关打开用主题色；供应商行悬停有底色；Agent 图标放在圆角方块里 */
+.shell .gw-switch.is-on {
+  background: hsl(var(--primary));
+}
+.shell .gw-switch.is-on span {
+  background: #fff;
+}
+.gw-pool-row {
+  transition: background-color 0.12s ease;
+}
+.shell .gw-pool-row:hover {
+  background: var(--gw-soft);
+}
+.gw-agent-icon-box {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  background: var(--gw-soft);
+}
+.shell .gw-agent-icon-box .gw-agent-icon {
+  width: 20px;
+  height: 20px;
+}

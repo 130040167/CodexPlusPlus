@@ -363,3 +363,11 @@ test("会话页可以删除会话，不再有「在终端继续」；Claude Code
   const lib = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
   assert.match(lib, /gateway_commands::delete_agent_session,/);
 });
+
+test("添加供应商是弹出框，不再铺在供应商池页面里；池为空时显示引导", () => {
+  const providers = readFileSync(new URL("./GatewayProviders.tsx", import.meta.url), "utf8");
+  assert.match(providers, /className="gw-modal gw-catalog-modal"/);
+  assert.match(providers, /\{catalogOpen \? \(\n\s*<ProviderCatalog/);
+  assert.doesNotMatch(providers, /showCatalog/);
+  assert.match(providers, /className="gw-card gw-pool-empty"/);
+});

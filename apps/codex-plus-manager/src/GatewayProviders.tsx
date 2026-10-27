@@ -64,7 +64,6 @@ export function ProvidersView({
   const [dragging, setDragging] = useState<string | null>(null);
   const [form, setForm] = useState<FormState | null>(null);
   const [deviceCode, setDeviceCode] = useState<DeviceCode | null>(null);
-  const showCatalog = catalogOpen || (payload !== null && pool.length === 0);
   const needle = query.trim().toLowerCase();
   const visible = pool.filter((entry) => !needle || entry.name.toLowerCase().includes(needle) || entry.models.some((model) => model.toLowerCase().includes(needle)));
 
@@ -109,7 +108,6 @@ export function ProvidersView({
       : await run("add:create", "create_gateway_provider", { input, source: form.mode === "preset" ? `preset:${form.preset.key}` : "custom" }, t("添加供应商"));
     if (ok) {
       setForm(null);
-      if (form.mode !== "edit" && pool.length) setCatalogOpen(false);
     }
   };
 
@@ -143,21 +141,30 @@ export function ProvidersView({
           {visible.length === 0 ? <div className="gw-empty">{t("没有匹配的供应商")}</div> : null}
         </div>
       ) : null}
-      {!showCatalog ? (
+      {payload !== null && pool.length === 0 ? (
+        <div className="gw-card gw-pool-empty">
+          <strong>{t("供应商池还是空的")}</strong>
+          <span>{t("登录订阅，或添加厂商 API、中转站的 Key。所有接入的 Agent 共用这里的供应商。")}</span>
+          <button className="gw-primary-button" onClick={() => setCatalogOpen(true)} type="button">
+            <Plus className="h-4 w-4" />
+            {t("添加供应商")}
+          </button>
+        </div>
+      ) : (
         <button className="gw-add-row" onClick={() => setCatalogOpen(true)} type="button">
           <Plus className="h-4 w-4" />
           {t("添加供应商")}
         </button>
-      ) : null}
-      {showCatalog ? (
+      )}
+      {/* 添加供应商是弹出框；选好一项就关掉它，进入对应的填写 / 登录。 */}
+      {catalogOpen ? (
         <ProviderCatalog
           busy={busy}
-          closable={pool.length > 0}
           notify={notify}
           onClose={() => setCatalogOpen(false)}
-          onCustom={() => setForm({ mode: "custom" })}
-          onLogin={(kind) => void login(kind)}
-          onPreset={(preset) => setForm({ mode: "preset", preset })}
+          onCustom={() => { setCatalogOpen(false); setForm({ mode: "custom" }); }}
+          onLogin={(kind) => { setCatalogOpen(false); void login(kind); }}
+          onPreset={(preset) => { setCatalogOpen(false); setForm({ mode: "preset", preset }); }}
           payload={payload}
           run={run}
         />
@@ -329,7 +336,6 @@ function ProviderCatalog({
   busy,
   run,
   notify,
-  closable,
   onClose,
   onPreset,
   onCustom,
@@ -339,7 +345,6 @@ function ProviderCatalog({
   busy: string | null;
   run: Run;
   notify: Notify;
-  closable: boolean;
   onClose: () => void;
   onPreset: (preset: GatewayPreset) => void;
   onCustom: () => void;
@@ -381,34 +386,47 @@ function ProviderCatalog({
     { key: "local", title: t("本机"), hint: t("本机运行的模型服务，或任意兼容地址"), items: local },
   ].filter((section) => section.items.length);
 
-  return (
-    <div className="gw-catalog">
-      <div className="gw-sheet-head">
-        <span className="gw-section-title">{t("添加供应商")}</span>
-        <label className="gw-sheet-search">
-          <Search className="h-4 w-4" />
-          <input onChange={(event) => setQuery(event.currentTarget.value)} placeholder={t("查找供应商…")} value={query} />
-        </label>
-        <button className="gw-text-button" onClick={() => setImporting(true)} type="button">{t("导入…")}</button>
-        {closable ? <button className="gw-text-button" onClick={onClose} type="button">{t("关闭")}</button> : null}
+  useEffect(() => {
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !importing) onClose();
+    };
+    window.addEventListener("keydown", escape);
+    return () => window.removeEventListener("keydown", escape);
+  }, [importing, onClose]);
+
+  return createPortal(
+    <div className="gw-modal-backdrop gw-portal" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <div className="gw-modal gw-catalog-modal" role="dialog" aria-label={t("添加供应商")}>
+        <header>
+          <strong>{t("添加供应商")}</strong>
+          <label className="gw-sheet-search">
+            <Search className="h-4 w-4" />
+            <input autoFocus onChange={(event) => setQuery(event.currentTarget.value)} placeholder={t("查找供应商…")} value={query} />
+          </label>
+          <button className="gw-text-button" onClick={() => setImporting(true)} type="button">{t("导入…")}</button>
+          <button aria-label={t("关闭")} className="gw-icon-button" onClick={onClose} type="button"><X className="h-4 w-4" /></button>
+        </header>
+        <div className="gw-modal-body gw-catalog">
+          {sections.map((section) => (
+            <section className="gw-catalog-section" key={section.key}>
+              <h4>{section.title} <span>{section.hint}</span></h4>
+              <div className="gw-catalog-grid">
+                {section.items.map((item) => (
+                  <button className="gw-catalog-item" disabled={busy !== null} key={item.key} onClick={item.onClick} type="button">
+                    {item.icon ?? <Avatar name={item.name} size="sm" />}
+                    <span>{item.name}</span>
+                    {item.added ? <i className="gw-dot" data-tone="added" title={t("已在供应商池里")} /> : null}
+                  </button>
+                ))}
+              </div>
+            </section>
+          ))}
+          {sections.length === 0 ? <div className="gw-empty">{t("没有匹配的供应商")}</div> : null}
+        </div>
       </div>
-      {sections.map((section) => (
-        <section className="gw-catalog-section" key={section.key}>
-          <h4>{section.title} <span>{section.hint}</span></h4>
-          <div className="gw-catalog-grid">
-            {section.items.map((item) => (
-              <button className="gw-catalog-item" disabled={busy !== null} key={item.key} onClick={item.onClick} type="button">
-                {item.icon ?? <Avatar name={item.name} size="sm" />}
-                <span>{item.name}</span>
-                {item.added ? <i className="gw-dot" data-tone="added" title={t("已在供应商池里")} /> : null}
-              </button>
-            ))}
-          </div>
-        </section>
-      ))}
-      {sections.length === 0 ? <div className="gw-empty">{t("没有匹配的供应商")}</div> : null}
       {importing ? <ImportDialog busy={busy} onClose={() => setImporting(false)} payload={payload} run={run} /> : null}
-    </div>
+    </div>,
+    document.body,
   );
 }
 

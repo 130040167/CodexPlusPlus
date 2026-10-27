@@ -1093,6 +1093,8 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "登录订阅，或添加厂商 API、中转站的 Key。所有接入的 Agent 共用这里的供应商。": "Sign in to a subscription, or add API keys from vendors or relays. Every connected agent shares these providers.",
+  "供应商池还是空的": "The provider pool is empty",
   "合计": "Total",
   "会话已删除": "Session deleted",
   "删除失败": "Delete failed",
