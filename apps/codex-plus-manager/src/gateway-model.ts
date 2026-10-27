@@ -43,6 +43,8 @@ export type GatewaySettings = {
   modelSuffix?: boolean;
   /** 模型收藏（管理器模型下拉里的星标），Codex 的选择器里也显示。 */
   favoriteModels?: string[];
+  /** 生图模型：空是自动，`off` 是关闭，其余是 `<供应商 id>/<模型>`。 */
+  imageModel?: string;
 };
 
 export type GatewayPoolEntry = {
@@ -60,6 +62,8 @@ export type GatewayPoolEntry = {
   price?: ProviderPrice | null;
   /** 按模型的价格（上游模型名 → 价格）；没填的模型用 `price`。 */
   modelPrices?: Record<string, ProviderPrice>;
+  /** 按模型的模型资料（思考等级等）JSON，格式同直连模式的「模型配置」。 */
+  modelMetadata?: string;
   /** 按模型的上下文窗口（上游模型名 → token）；没写的模型用 `contextWindow`。 */
   modelWindows?: Record<string, number>;
   /** 没单独写窗口的模型用的窗口；都没有就用模型自带资料。 */
@@ -192,6 +196,20 @@ export type GatewayPayload = {
   codexOfficial?: Array<{ id: string; name: string }>;
   /** 自动组（旧版后端没有这个字段）。 */
   autoGroups?: AutoGroupEntry[];
+  /** 「生图模型」能选的：ChatGPT 订阅账号和各家的生图模型（旧版后端没有）。 */
+  imageOptions?: ImageOption[];
+  /** 生图选「自动」时先用的那一项。 */
+  imageAuto?: ImageOption | null;
+};
+
+export type ImageOption = {
+  /** 存进 `imageModel` 的值：`<供应商 id>/<模型>`。 */
+  id: string;
+  providerId: string;
+  providerName: string;
+  model: string;
+  /** ChatGPT 订阅账号：后端自己选生图模型。 */
+  vendorPicks: boolean;
 };
 
 export type GatewayResult = { status: string; message: string } & Partial<GatewayPayload>;

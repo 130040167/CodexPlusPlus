@@ -36,6 +36,8 @@ pub struct GatewayPoolEntry {
     /// 按模型的价格（上游模型名 → 价格）。
     pub model_prices:
         std::collections::BTreeMap<String, codex_plus_core::gateway::store::ProviderPrice>,
+    /// 按模型的模型资料（思考等级等），格式同直连模式的「模型配置」JSON。
+    pub model_metadata: String,
     /// 按模型的上下文窗口（上游模型名 → token）。
     pub model_windows: std::collections::BTreeMap<String, u64>,
     /// 没单独写窗口的模型用的窗口。
@@ -117,6 +119,10 @@ pub struct GatewayPayload {
     pub codex_aggregates: Vec<apply::AggregateSource>,
     /// 直连模式的官方登录账号：不能复制，要在网关里单独登录（名字已打码）。
     pub codex_official: Vec<GatewaySourceEntry>,
+    /// 「生图模型」能选的：ChatGPT 订阅账号和各家的生图模型。
+    pub image_options: Vec<codex_plus_core::gateway::images::ImageOption>,
+    /// 生图选「自动」时先用的那一项。
+    pub image_auto: Option<codex_plus_core::gateway::images::ImageOption>,
 }
 
 const GATEWAY_AGENTS: &[ToolId] = &[ToolId::Codex, ToolId::Claude, ToolId::Grok];
@@ -163,6 +169,7 @@ fn pool_entry(
         model_prices,
         model_windows: Default::default(),
         context_window: None,
+        model_metadata: relay.model_metadata.clone(),
         account: account_kind(relay),
         plan: codex_plus_core::gateway::accounts::account_plan(relay),
         lent_to_codex: codex_plus_core::official_login::is_lent_to_codex(relay),
@@ -294,9 +301,14 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
             }
         })
         .collect();
+    // 生图选项要在清掉供应商之前算。
+    let image_options = codex_plus_core::gateway::images::options(&gateway);
+    let image_auto = codex_plus_core::gateway::images::auto_choice(&gateway);
     let mut gateway = gateway;
     gateway.providers.clear();
     GatewayPayload {
+        image_options,
+        image_auto,
         gateway,
         port,
         helper_running: codex_plus_core::resident_helper::resident_helper_port().is_some(),
@@ -493,6 +505,54 @@ pub fn save_gateway_model_suffix(enabled: bool) -> CommandResult<Option<GatewayP
         "网关选项已保存。",
         "保存网关选项失败",
         refresh_agents(result),
+    )
+}
+
+/// 生图模型：空串是自动，`off` 是关闭，其余是 `<供应商 id>/<模型>`。
+#[tauri::command]
+pub fn save_gateway_image_model(model: String) -> CommandResult<Option<GatewayPayload>> {
+    let result = GatewayStore::default().update(|gateway| {
+        gateway.image_model = model.trim().to_string();
+        Ok(())
+    });
+    respond("生图模型已保存。", "保存生图模型失败", result)
+}
+
+/// 供应商各模型内置的思考等级（编辑思考等级时当作没改过的显示值）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderReasoningPayload {
+    pub models: Vec<apply::ModelReasoningView>,
+}
+
+#[tauri::command]
+pub fn gateway_provider_reasoning(id: String) -> CommandResult<Option<ProviderReasoningPayload>> {
+    let result = GatewayStore::default()
+        .load()
+        .and_then(|gateway| apply::provider_reasoning(&gateway, &id));
+    match result {
+        Ok(models) => ok(
+            "已读取思考等级。",
+            Some(ProviderReasoningPayload { models }),
+        ),
+        Err(error) => failed(&format!("读取思考等级失败：{error:#}"), None),
+    }
+}
+
+/// 保存供应商按模型的思考等级（模型资料 JSON）；写进 Agent 的模型目录，存完重写 Agent 配置。
+#[tauri::command]
+pub fn save_gateway_provider_metadata(
+    id: String,
+    model_metadata: String,
+) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "思考等级已保存。",
+        "保存思考等级失败",
+        refresh_agents(apply::set_provider_metadata(
+            &GatewayStore::default(),
+            &id,
+            &model_metadata,
+        )),
     )
 }
 

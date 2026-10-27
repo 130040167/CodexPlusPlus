@@ -2173,6 +2173,8 @@ fn update_provider_in(
     relay.custom_headers = provider.relay.custom_headers.clone();
     relay.user_agent = provider.relay.user_agent.clone();
     relay.anthropic_auth_header = provider.relay.anthropic_auth_header.clone();
+    // 按模型的思考等级等模型资料也保留（在供应商池详情里单独编辑）。
+    relay.model_metadata = provider.relay.model_metadata.clone();
     provider.relay = relay;
     provider.price = clean_price(input.price.clone());
     if let Some(prices) = &input.model_prices {
@@ -2234,6 +2236,83 @@ pub fn set_provider_windows(
             .filter(|(model, window)| !model.is_empty() && *window > 0)
             .collect();
         provider.context_window = fallback.filter(|window| *window > 0);
+        Ok(())
+    })?;
+    store.load()
+}
+
+/// 供应商一个模型的思考等级：内置资料里的（不含用户改过的），界面拿它当没改时的显示值。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelReasoningView {
+    pub model: String,
+    pub builtin_levels: Vec<String>,
+    pub builtin_default: Option<String>,
+}
+
+/// 供应商各模型内置的思考等级（按这家的模型列表顺序）。认不出的模型借用通用模板的档位。
+pub fn provider_reasoning(
+    gateway: &GatewaySettings,
+    id: &str,
+) -> anyhow::Result<Vec<ModelReasoningView>> {
+    let provider = gateway
+        .provider(id)
+        .with_context(|| format!("供应商不存在：{id}"))?;
+    let mut builtin = provider.relay.clone();
+    builtin.model_metadata.clear();
+    let catalog = crate::aggregate_catalog::build_member_catalog(&builtin)?;
+    let entries = catalog["models"].as_array().cloned().unwrap_or_default();
+    Ok(route::relay_models(&provider.relay)
+        .into_iter()
+        .map(|model| {
+            let entry = entries.iter().find(|entry| {
+                entry["slug"]
+                    .as_str()
+                    .is_some_and(|slug| slug.eq_ignore_ascii_case(&model))
+            });
+            let builtin_levels = entry
+                .and_then(|entry| entry["supported_reasoning_levels"].as_array())
+                .map(|levels| {
+                    levels
+                        .iter()
+                        .filter_map(|level| {
+                            level["effort"]
+                                .as_str()
+                                .or_else(|| level.as_str())
+                                .map(str::to_string)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let builtin_default = entry
+                .and_then(|entry| entry["default_reasoning_level"].as_str())
+                .map(str::to_string);
+            ModelReasoningView {
+                model,
+                builtin_levels,
+                builtin_default,
+            }
+        })
+        .collect())
+}
+
+/// 保存供应商的模型资料（按模型的思考等级、默认等级、思考参数怎么发），格式与直连模式的
+/// 「模型配置」一致。写进 Agent 的模型目录，保存后要重新写一遍 Agent 配置（调用方负责）。
+pub fn set_provider_metadata(
+    store: &GatewayStore,
+    id: &str,
+    metadata: &str,
+) -> anyhow::Result<GatewaySettings> {
+    crate::relay_config::parse_model_metadata_map(metadata)?;
+    store.update(|gateway| {
+        let Some(provider) = gateway
+            .providers
+            .iter_mut()
+            .find(|provider| provider.relay.id == id)
+        else {
+            bail!("供应商不存在：{id}");
+        };
+        provider.relay.model_metadata = metadata.trim().to_string();
         Ok(())
     })?;
     store.load()

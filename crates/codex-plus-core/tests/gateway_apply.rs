@@ -3,9 +3,9 @@
 use codex_plus_core::gateway::apply::{
     ApplyContext, GroupInput, ProviderInput, codex_importable, copy_claude_provider,
     copy_codex_provider, create_provider, delete_group, delete_provider, disable_binding,
-    enable_binding, note_claude_switched, note_codex_switched, reapply_if_port_changed,
-    refresh_enabled, reorder_providers, save_group, set_provider_enabled, set_provider_windows,
-    update_provider,
+    enable_binding, note_claude_switched, note_codex_switched, provider_reasoning,
+    reapply_if_port_changed, refresh_enabled, reorder_providers, save_group, set_provider_enabled,
+    set_provider_metadata, set_provider_windows, update_provider,
 };
 use codex_plus_core::gateway::store::{
     AgentBinding, ClaudeRoleModels, GatewayStore, GroupMember, GroupMode, GroupSticky,
@@ -1478,4 +1478,53 @@ fn imported_windows_move_into_the_gateway_provider() {
             .is_empty()
     );
     assert!(provider.relay.context_window.is_empty());
+}
+
+#[test]
+fn reasoning_levels_are_edited_per_model_and_survive_provider_edits() {
+    let fixture = fixture(57398);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    let mut seeded = BackendSettings::default();
+    seeded.relay_profiles_enabled = true;
+    ctx.settings.save(&seeded).unwrap();
+    let id = ctx.gateway.load().unwrap().providers[0].relay.id.clone();
+
+    let builtin = provider_reasoning(&ctx.gateway.load().unwrap(), &id).unwrap();
+    assert_eq!(builtin[0].model, "deepseek-v4-pro");
+    assert!(!builtin[0].builtin_levels.is_empty(), "内置资料里有档位");
+
+    set_provider_metadata(
+        &ctx.gateway,
+        &id,
+        r#"{"deepseek-v4-pro":{"supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}],"default_reasoning_level":"high"}}"#,
+    )
+    .unwrap();
+    // 编辑供应商（地址、Key、模型）不丢思考等级。
+    update_provider(&ctx.gateway, &id, &deepseek_input()).unwrap();
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let catalog = codex_catalog(ctx);
+    let pro = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["slug"] == "deepseek-v4-pro")
+        .unwrap()
+        .clone();
+    let efforts: Vec<&str> = pro["supported_reasoning_levels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|level| level["effort"].as_str().unwrap())
+        .collect();
+    assert_eq!(efforts, ["low", "high"]);
+    assert_eq!(pro["default_reasoning_level"], "high");
+    // 内置档位读的是没改过的。
+    let again = provider_reasoning(&ctx.gateway.load().unwrap(), &id).unwrap();
+    assert_eq!(again[0].builtin_levels, builtin[0].builtin_levels);
+
+    assert!(
+        set_provider_metadata(&ctx.gateway, &id, "[1, 2]").is_err(),
+        "不是对象要拒绝"
+    );
 }

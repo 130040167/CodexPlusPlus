@@ -455,6 +455,9 @@ pub struct GatewaySettings {
     /// 收藏的模型（管理器模型下拉里点的星标）：写给 Codex 的模型目录时标出来，Codex 的选择器里也显示星标。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub favorite_models: Vec<String>,
+    /// 生图模型：空串是自动（见 [`crate::gateway::images`]），`off` 是关闭，其余是 `<供应商 id>/<模型>`。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub image_model: String,
     /// 最后写这个文件的 Codex++ 版本。降级到旧版时旧版不会跑这里的代码，只留个记录方便排查。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub app_version: String,
@@ -482,6 +485,7 @@ impl Default for GatewaySettings {
             model_suffix: true,
             auto_groups: BTreeMap::new(),
             favorite_models: Vec::new(),
+            image_model: String::new(),
             app_version: String::new(),
             extra: Map::new(),
         }

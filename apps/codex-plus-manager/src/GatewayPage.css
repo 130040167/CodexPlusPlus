@@ -3873,3 +3873,8 @@ body:has(.gw-modal-backdrop) .app-select-menu-portal {
 .shell .gw-models-toolbar .gw-models-auto + .gw-primary-button {
   margin-left: 0;
 }
+
+/* 生图模型的下拉要放得下「自动 · 供应商 · 模型」。 */
+.gw-setting-row .app-select.gw-image-select {
+  width: 280px;
+}

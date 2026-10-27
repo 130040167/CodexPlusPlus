@@ -205,3 +205,13 @@ test("上下文窗口按模型在供应商池里填，Agent 页只留兜底的�
   assert.match(dialog, /next\[model\] = windowText\(match\.context\)/, "按公开资料填写用 models.dev 的 limit.context");
   assert.match(read("GatewayAgents.tsx"), /<span>\{t\("默认窗口"\)\}<\/span>/);
 });
+
+test("网关设置里选生图模型；供应商池按模型改思考等级，存的是和直连模式同格式的模型资料", () => {
+  const page = read("GatewayPage.tsx");
+  assert.match(page, /"save_gateway_image_model", \{ model: next \}/);
+  assert.match(page, /\{ value: "off", label: t\("关闭"\)/);
+  const dialog = read("ProviderReasoningDialog.tsx");
+  assert.match(dialog, /setModelReasoningLevelsForSlug\(current, model, levels, defaultLevel\)/);
+  assert.match(dialog, /invoke<ReasoningResult>\("gateway_provider_reasoning", \{ id: entry\.id \}\)/);
+  assert.match(read("GatewayProviders.tsx"), /"save_gateway_provider_metadata", \{ id: entry\.id, modelMetadata \}/);
+});

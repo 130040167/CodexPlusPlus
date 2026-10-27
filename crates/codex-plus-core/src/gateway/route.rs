@@ -73,6 +73,14 @@ pub fn relay_models(relay: &RelayProfile) -> Vec<String> {
     models
 }
 
+/// 能聊天的模型：去掉生图模型（见 [`crate::gateway::images::is_image_model`]）。
+pub fn chat_models(relay: &RelayProfile) -> Vec<String> {
+    relay_models(relay)
+        .into_iter()
+        .filter(|model| !crate::gateway::images::is_image_model(model))
+        .collect()
+}
+
 fn serves(relay: &RelayProfile, model: &str) -> bool {
     relay_models(relay)
         .iter()
@@ -204,7 +212,8 @@ pub fn pool_models(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<Str
     let mut models: Vec<String> = Vec::new();
     let unlisted = unlisted_members(gateway);
     for relay in binding_pool_relays(gateway, binding) {
-        for model in relay_models(relay) {
+        // 生图模型不能聊天，不进 Agent 的模型列表（在「网关设置」的生图模型里选）。
+        for model in chat_models(relay) {
             if !unlisted.contains(&model.to_ascii_lowercase())
                 && !models
                     .iter()
@@ -269,7 +278,7 @@ fn codex_pool_blocks(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<V
     let unlisted = unlisted_members(gateway);
     for relay in &relays {
         let mut block = Vec::new();
-        for model in relay_models(relay) {
+        for model in chat_models(relay) {
             if serving_count(&relays, &model) > 1 {
                 let pinned = format!("{}/{model}", relay.id);
                 if !unlisted.contains(&pinned.to_ascii_lowercase()) && fresh(&pinned) {
