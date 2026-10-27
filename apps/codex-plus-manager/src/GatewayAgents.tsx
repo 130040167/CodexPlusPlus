@@ -20,6 +20,8 @@ import {
   type GatewayPayload,
   type PickerItem,
   maskAccountName,
+  isFavoriteModel,
+  toggleFavoriteModel,
 } from "./gateway-model";
 import { AppSelect } from "./AppSelect";
 import { useEscapeLayer } from "./use-escape-layer";
@@ -508,11 +510,11 @@ export function ModelList({
     const all = pickerSections(payload, query, avatarOf, exclude, skipGroup);
     if (!favoritesOnly) return all;
     return all
-      .map((section) => ({ ...section, items: section.items.filter((item) => favorites.includes(item.model)) }))
+      .map((section) => ({ ...section, items: section.items.filter((item) => isFavoriteModel(favorites, item.model, payload)) }))
       .filter((section) => section.items.length);
   }, [payload, query, exclude, favoritesOnly, favorites, skipGroup]);
   const toggleFavorite = (model: string) => {
-    const next = favorites.includes(model) ? favorites.filter((item) => item !== model) : [...favorites, model];
+    const next = toggleFavoriteModel(favorites, model, payload);
     setFavorites(next);
     saveFavorites(next);
   };
@@ -566,7 +568,7 @@ export function ModelList({
             </div>
             {section.items.map((item) => {
               const selected = isSelected(item);
-              const favorite = favorites.includes(item.model);
+              const favorite = isFavoriteModel(favorites, item.model, payload);
               return (
                 <div
                   aria-selected={selected}

@@ -492,11 +492,8 @@ fn codex_gateway_catalog_carries_display_names_reasoning_and_provider_groups() {
     assert_eq!(pinned["display_name"], "DeepSeek-V4-Pro（DeepSeek）");
     let second_id = profile_id_of(ctx, "ChatGPT Pro · 2649340134@qq.com");
     let second = model(&format!("{second_id}/deepseek-v4-pro"));
-    // 账号名超过注入层认的后缀长度，后缀用供应商 id；分组名仍是打码的完整账号名。
-    assert_eq!(
-        second["display_name"],
-        format!("DeepSeek-V4-Pro（{second_id}）")
-    );
+    // 打码后的账号名超过注入层认的后缀长度：用「·」前那段（池里没有别家同名开头）；分组名仍是完整账号名。
+    assert_eq!(second["display_name"], "DeepSeek-V4-Pro（ChatGPT Pro）");
     assert_eq!(second["codex_plus_group"], "ChatGPT Pro · 26****34@qq.com");
     let auto = model("deepseek-v4-pro");
     assert_eq!(auto["display_name"], "DeepSeek-V4-Pro（自动）");

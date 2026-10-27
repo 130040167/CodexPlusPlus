@@ -117,33 +117,74 @@ pub fn pool_models(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<Str
 ///   裸模型名，作为「多家自动切换」入口：按池顺序依次尝试各家，出错换下一家；
 /// - 最后是有成员的模型组。
 pub fn codex_pool_models(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<String> {
+    codex_pool_blocks(gateway, binding).concat()
+}
+
+/// 同 [`codex_pool_models`]，但把默认模型所在的那一块（某一家 / 多家自动切换 / 模型组）挪到最前面。
+/// Codex 按列表顺序排模型，默认模型总是排第一（见 `merge_model_into_model_list`）；选择器的分组
+/// 注入只插标题、不搬行，同一组的行必须挨在一起，否则默认模型那组会被拆成两截。
+pub fn codex_pool_models_led_by(
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+    default_model: &str,
+) -> Vec<String> {
+    let mut blocks = codex_pool_blocks(gateway, binding);
+    if let Some(index) = blocks.iter().position(|block| {
+        block
+            .iter()
+            .any(|model| model.eq_ignore_ascii_case(default_model.trim()))
+    }) {
+        let block = blocks.remove(index);
+        blocks.insert(0, block);
+    }
+    blocks.concat()
+}
+
+/// Codex 模型列表按分组切成的几块：每家一块、多家自动切换一块、模型组一块（空块不要）。
+fn codex_pool_blocks(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<Vec<String>> {
     let relays = binding_pool_relays(gateway, binding);
-    let mut models: Vec<String> = Vec::new();
-    let mut shared: Vec<String> = Vec::new();
-    let mut push = |list: &mut Vec<String>, entry: String| {
-        if !list.iter().any(|known| known.eq_ignore_ascii_case(&entry)) {
-            list.push(entry);
+    let mut seen: Vec<String> = Vec::new();
+    let mut fresh = |entry: &str| {
+        if seen.iter().any(|known| known.eq_ignore_ascii_case(entry)) {
+            false
+        } else {
+            seen.push(entry.to_string());
+            true
         }
     };
+    let mut blocks: Vec<Vec<String>> = Vec::new();
+    let mut shared: Vec<String> = Vec::new();
     for relay in &relays {
+        let mut block = Vec::new();
         for model in relay_models(relay) {
             if serving_count(&relays, &model) > 1 {
-                push(&mut models, format!("{}/{model}", relay.id));
-                push(&mut shared, model);
-            } else {
-                push(&mut models, model);
+                let pinned = format!("{}/{model}", relay.id);
+                if fresh(&pinned) {
+                    block.push(pinned);
+                }
+                if !shared
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&model))
+                {
+                    shared.push(model);
+                }
+            } else if fresh(&model) {
+                block.push(model);
             }
         }
+        blocks.push(block);
     }
-    for model in shared {
-        push(&mut models, model);
-    }
-    for group in &gateway.groups {
-        if !group.members.is_empty() {
-            models.push(group.model_id());
-        }
-    }
-    models
+    blocks.push(shared.into_iter().filter(|model| fresh(model)).collect());
+    blocks.push(
+        gateway
+            .groups
+            .iter()
+            .filter(|group| !group.members.is_empty())
+            .map(GatewayGroup::model_id)
+            .collect(),
+    );
+    blocks.retain(|block| !block.is_empty());
+    blocks
 }
 
 /// 列表里有几家供应商提供这个模型（按模型名，不分大小写）。
@@ -1228,5 +1269,19 @@ mod tests {
             vec![pair("mirror", "deepseek-v4-pro")]
         );
         assert_eq!(routed(&gateway, "deepseek-v4-pro").len(), 2);
+    }
+
+    #[test]
+    fn codex_list_keeps_the_default_models_group_together() {
+        let gateway = gateway("deepseek-v4-pro");
+        let binding = gateway.binding(&ToolId::Claude).unwrap().clone();
+        // 默认模型是两家都有的 deepseek-v4-pro（自动切换入口）：自动那一块整体排到最前。
+        let led = codex_pool_models_led_by(&gateway, &binding, "deepseek-v4-pro");
+        assert_eq!(led[0], "deepseek-v4-pro");
+        assert_eq!(led.len(), codex_pool_models(&gateway, &binding).len());
+        // 默认模型是 kimi 独有的：kimi 那一块排最前，其余块的相对顺序不变。
+        let led = codex_pool_models_led_by(&gateway, &binding, "kimi-k3");
+        assert_eq!(led[0], "kimi-k3");
+        assert_eq!(led[1], "ds/deepseek-v4-pro");
     }
 }

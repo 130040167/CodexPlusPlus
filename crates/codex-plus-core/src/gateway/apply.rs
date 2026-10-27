@@ -170,7 +170,7 @@ fn agent_gateway_profile(
     let mut models = vec![default_model.clone()];
     // 池里所有能用的模型和模型组都进 Agent 的模型列表；Codex 按供应商分组显示，多家都有的模型每家各列一份。
     let pool = if *agent == ToolId::Codex {
-        route::codex_pool_models(gateway, binding)
+        route::codex_pool_models_led_by(gateway, binding, &default_model)
     } else {
         route::pool_models(gateway, binding)
     };
@@ -419,12 +419,10 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
         // 不加后缀就分不开（与直连模式按模型聚合的写法一致，注入层会去掉后缀再显示），
         // 选中后输入框里也看得出是哪一家。注入层只认 24 个字以内的后缀，账号名太长时用供应商 id。
         let display = if providers > 1 {
-            let suffix = if group.chars().count() <= CODEX_GROUP_SUFFIX_MAX {
-                group.clone()
-            } else {
-                relay.id.clone()
-            };
-            format!("{display}（{suffix}）")
+            format!(
+                "{display}（{}）",
+                codex_group_suffix(relay, &group, &relays)
+            )
         } else {
             display
         };
@@ -438,6 +436,36 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
         return String::new();
     }
     serde_json::to_string(&Value::Object(metadata)).unwrap_or_default()
+}
+
+/// 同名模型显示名后的 `（供应商）` 后缀：注入层只认 24 个字以内的后缀。打码后的完整名放得下就用它；
+/// 放不下时用 `·` 前那段（如「ChatGPT Pro」），前提是池里没有别家同样以它开头（否则几行又分不开）；
+/// 都不行才用供应商 id。
+fn codex_group_suffix(relay: &RelayProfile, group: &str, relays: &[&RelayProfile]) -> String {
+    if group.chars().count() <= CODEX_GROUP_SUFFIX_MAX {
+        return group.to_string();
+    }
+    let head = |name: &str| {
+        name.split('·')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let short = head(group);
+    let unique = relays
+        .iter()
+        .filter(|other| other.id != relay.id)
+        .all(|other| {
+            head(&crate::gateway::accounts::mask_account_name(
+                other.name.trim(),
+            )) != short
+        });
+    if !short.is_empty() && short.chars().count() <= CODEX_GROUP_SUFFIX_MAX && unique {
+        short
+    } else {
+        relay.id.clone()
+    }
 }
 
 /// 目录条目里选择器要用的字段；整条（含基础指令等大字段）不进设置文件。

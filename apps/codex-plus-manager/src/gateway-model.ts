@@ -1245,3 +1245,48 @@ export function importCandidates(payload: GatewayPayload | null): ImportCandidat
 export function pendingImportCount(payload: GatewayPayload | null): number {
   return importCandidates(payload).filter((item) => !item.imported).length;
 }
+
+/* —————————————— 模型收藏 —————————————— */
+
+/** `<供应商 id>/<模型>` 是哪个模型的固定那份：返回裸模型名；不是固定写法返回 null。 */
+function pinnedBare(payload: GatewayPayload | null, model: string): string | null {
+  const slash = model.indexOf("/");
+  if (slash <= 0) return null;
+  const id = model.slice(0, slash).toLowerCase();
+  const rest = model.slice(slash + 1);
+  const entry = agentPoolProviders(payload).find((item) => item.id.toLowerCase() === id);
+  return entry && entry.models.some((known) => known.toLowerCase() === rest.toLowerCase()) ? rest : null;
+}
+
+/** 这个模型在各家名下固定的那几份。 */
+function pinnedCopies(payload: GatewayPayload | null, bare: string): string[] {
+  const serving = servingProviders(payload, bare);
+  return serving.length > 1 ? serving.map((entry) => `${entry.id}/${bare}`) : [];
+}
+
+/**
+ * 收藏按模型名存。旧版本收藏的是裸名，那时多家都有的模型只有一份；现在每家名下各一份 `<供应商 id>/<模型>`。
+ * 兼容：某个模型还没有任何「固定那份」被单独收藏过时，裸名收藏同时点亮它在各家名下的那几份（和「自动」那份）。
+ */
+export function isFavoriteModel(favorites: string[], model: string, payload: GatewayPayload | null): boolean {
+  if (favorites.includes(model)) return true;
+  const bare = pinnedBare(payload, model);
+  if (!bare || !favorites.some((item) => item.toLowerCase() === bare.toLowerCase())) return false;
+  return !pinnedCopies(payload, bare).some((copy) => favorites.includes(copy));
+}
+
+/** 切换收藏。取消一份时只取消这一份：裸名兼容点亮的那几份先展开成各自的收藏再去掉这一份。 */
+export function toggleFavoriteModel(favorites: string[], model: string, payload: GatewayPayload | null): string[] {
+  if (!isFavoriteModel(favorites, model, payload)) return [...favorites, model];
+  const bare = pinnedBare(payload, model);
+  if (bare && !favorites.includes(model)) {
+    // 这一份是被旧的裸名收藏点亮的：其余几家的那份改成单独收藏，「自动」那份（裸名）保留。
+    const others = pinnedCopies(payload, bare).filter((copy) => copy !== model && !favorites.includes(copy));
+    return [...favorites, ...others];
+  }
+  const next = favorites.filter((item) => item !== model);
+  // 取消的是裸名（「自动」那份或旧收藏）：之前靠它点亮的各家那几份，改成单独收藏留着。
+  const copies = pinnedCopies(payload, model);
+  if (copies.length && !copies.some((copy) => favorites.includes(copy))) return [...next, ...copies];
+  return next;
+}
