@@ -104,9 +104,27 @@ pub enum GroupMode {
     Rotate,
     /// 按权重：按成员权重分配第一个尝试的成员。
     Weighted,
+    /// 额度优先：订阅账号里剩余额度最多的先试；没有额度数据的排在有余量的后面，用完的排最后。
+    Usage,
+    /// 速度优先：最近响应最快的先试；还没测过的先试一次。
+    Fast,
 }
 
-/// 路由组成员：`<供应商 id>/<模型>`、裸模型名（池里所有提供它的供应商），或 `group/<组 id>`（嵌套）。
+/// 同一个会话在组里固定用哪个成员：固定才能命中上游的提示词缓存。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GroupSticky {
+    /// 缓存有效期内固定：上次回答的成员一段时间内（见 `route::CACHE_STICKY_TTL`）继续先试。
+    #[default]
+    Cache,
+    /// 整个会话固定：会话里一直先试上次回答的成员，除非它答不了。
+    Session,
+    /// 不固定：每个请求按模式重新排。
+    Off,
+}
+
+/// 模型组成员：`<供应商 id>/<模型>`、裸模型名（池里所有提供它的供应商）、`group/<组 id>`（嵌套），
+/// 或带 `*` 的通配符（按 `<供应商 id>/<模型>` 匹配池里现有的模型，上游新增的模型自动算进来）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupMember {
@@ -127,6 +145,8 @@ pub struct GatewayGroup {
     pub name: String,
     #[serde(default)]
     pub mode: GroupMode,
+    #[serde(default)]
+    pub sticky: GroupSticky,
     #[serde(default)]
     pub members: Vec<GroupMember>,
 }

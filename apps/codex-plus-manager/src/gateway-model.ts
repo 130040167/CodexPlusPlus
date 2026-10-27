@@ -8,7 +8,9 @@ import { PRESETS } from "./presets.ts";
 export type GatewayAgentId = "codex" | "claude" | "grok";
 export type UnknownModelPolicy = "mapToDefault" | "passthrough";
 export type KeyRotationMode = "sticky" | "roundRobin";
-export type GroupMode = "inOrder" | "rotate" | "weighted";
+export type GroupMode = "inOrder" | "rotate" | "weighted" | "usage" | "fast";
+/** 同一会话在组里固定用哪个成员：缓存有效期内（默认）/ 整个会话 / 不固定。 */
+export type GroupSticky = "cache" | "session" | "off";
 
 export type ClaudeRoleModels = { opus: string; sonnet: string; haiku: string; subagent: string };
 
@@ -64,12 +66,19 @@ export type GatewayPoolEntry = {
   upstreamGone?: string[];
   /** 这个 ChatGPT 账号正借给 Codex 登录。 */
   lentToCodex?: boolean;
+  /** 订阅账号的剩余额度；查不到或普通供应商为空。 */
+  quota?: ProviderQuota | null;
 };
 
 export type ProviderPrice = { currency: string; input: number; cachedInput: number; output: number };
 
 export type GroupMember = { model: string; weight: number };
-export type GatewayGroupEntry = { id: string; name: string; mode: GroupMode; members: GroupMember[] };
+export type GatewayGroupEntry = { id: string; name: string; mode: GroupMode; sticky?: GroupSticky; members: GroupMember[] };
+
+/** 订阅账号的一个额度窗口：windowMinutes 300 是 5 小时、10080 是每周，null 是按月（Copilot 高级请求）。 */
+export type QuotaWindow = { windowMinutes: number | null; usedPercent: number; resetsAtMs: number | null };
+export type ProviderQuota = { windows: QuotaWindow[]; updatedAtMs: number };
+export type SpeedView = { relayId: string; model: string; ms: number; samples: number };
 
 export type GatewayAgentView = {
   agent: GatewayAgentId;
@@ -146,6 +155,8 @@ export type GatewayPayload = {
   health: { keys: KeyHealthView[]; providers: ProviderHealthView[] };
   /** 旧版后端没有这个字段。 */
   activity?: { agents: AgentActivityView[] };
+  /** 各（供应商, 模型）最近的平均首包耗时；模型名是小写。 */
+  speeds?: SpeedView[];
   /** 可复制进网关的直连模式供应商。 */
   codexProviders: GatewayPoolEntry[];
   claudeProviders: Array<{ id: string; name: string }>;
@@ -360,7 +371,10 @@ export function formatRemaining(ms: number | null | undefined): string {
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.ceil(seconds / 60);
   if (minutes < 60) return `${minutes}m`;
-  return `${Math.floor(minutes / 60)}h${minutes % 60 ? `${minutes % 60}m` : ""}`;
+  const hours = Math.floor(minutes / 60);
+  // 一天以上（每周额度的重置时间）只写到小时。
+  if (hours >= 24) return `${Math.floor(hours / 24)}d${hours % 24 ? `${hours % 24}h` : ""}`;
+  return `${hours}h${minutes % 60 ? `${minutes % 60}m` : ""}`;
 }
 
 
@@ -503,6 +517,10 @@ export function groupModeLabel(mode: string): string {
       return "轮换";
     case "weighted":
       return "按权重";
+    case "usage":
+      return "额度优先";
+    case "fast":
+      return "速度优先";
     default:
       return "依次";
   }
@@ -511,16 +529,91 @@ export function groupModeLabel(mode: string): string {
 export function groupModeDescription(mode: string): string {
   switch (mode) {
     case "rotate":
-      return "轮换：每个请求从下一个成员开始；成员答不了时换下一个，每个成员再按自己的 Key 轮换。";
+      return "轮换：每个新会话从下一个成员开始；成员答不了时换下一个，每个成员再按自己的 Key 轮换。";
     case "weighted":
       return "按权重：按成员权重决定先试谁；成员答不了时换下一个，每个成员再按自己的 Key 轮换。";
+    case "usage":
+      return "额度优先：订阅账号里剩余额度最多的先试；没有额度数据的排在后面，额度用完的排最后。";
+    case "fast":
+      return "速度优先：最近响应最快的先试；还没测过的先试一次，之后按实测速度排。";
     default:
       return "依次：按成员顺序，前一个答不了才换下一个，每个成员再按自己的 Key 轮换。";
   }
 }
 
-/** 模型组成员在列表里的显示：「供应商 · 模型」或「组名」。 */
+export function groupStickyLabel(sticky: string | undefined): string {
+  switch (sticky) {
+    case "session":
+      return "整个会话固定";
+    case "off":
+      return "不固定";
+    default:
+      return "缓存期内固定";
+  }
+}
+
+export function groupStickyDescription(sticky: string | undefined): string {
+  switch (sticky) {
+    case "session":
+      return "同一会话一直先试上次回答的成员，它答不了才换，最省缓存。";
+    case "off":
+      return "每个请求都按模式重新排，会话中途可能换成员，上游的提示词缓存会失效。";
+    default:
+      return "同一会话 10 分钟内继续先试上次回答的成员，保住上游的提示词缓存；空闲超过 10 分钟再按模式重新排。";
+  }
+}
+
+/** 通配符成员：带 `*`，按 `<供应商 id>/<模型>` 或裸模型名匹配池里现有的模型。 */
+export function isPattern(model: string): boolean {
+  return model.includes("*");
+}
+
+/** 与后端 `route::glob_matches` 一致：`*` 匹配任意一段字符（包括 `/`），不区分大小写。 */
+export function globMatches(pattern: string, text: string): boolean {
+  const escaped = pattern.toLowerCase().split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"));
+  return new RegExp(`^${escaped.join(".*")}$`, "s").test(text.toLowerCase());
+}
+
+/** 通配符现在匹配到的 `<供应商 id>/<模型>`：打开的供应商，按池顺序。 */
+export function patternMatches(payload: GatewayPayload | null, pattern: string): string[] {
+  const matches: string[] = [];
+  for (const entry of agentPoolProviders(payload)) {
+    for (const model of entry.models) {
+      const qualified = `${entry.id}/${model}`;
+      if (globMatches(pattern, qualified) || globMatches(pattern, model)) matches.push(qualified);
+    }
+  }
+  return matches;
+}
+
+/** 某个上游最近的平均首包耗时（毫秒），没测过为 null。 */
+export function speedOf(payload: GatewayPayload | null, relayId: string, model: string): number | null {
+  const found = payload?.speeds?.find((item) => item.relayId === relayId && item.model === model.toLowerCase());
+  return found ? found.ms : null;
+}
+
+/** 额度窗口的名字（中文模板 + 参数，界面再翻译）：5 小时 / 每周 / 本月，其它按时长写。 */
+export function quotaWindowLabel(window: QuotaWindow): { text: string; args: number[] } {
+  const minutes = window.windowMinutes;
+  if (minutes === null) return { text: "本月", args: [] };
+  if (minutes === 300) return { text: "5 小时", args: [] };
+  if (minutes === 10080) return { text: "每周", args: [] };
+  if (minutes % 1440 === 0) return { text: "{0} 天", args: [minutes / 1440] };
+  if (minutes % 60 === 0) return { text: "{0} 小时", args: [minutes / 60] };
+  return { text: "{0} 分钟", args: [minutes] };
+}
+
+/** 剩余比例（0–1），取最紧的窗口；过了重置时间的窗口按满额。与后端 `quota::remaining_at` 一致。 */
+export function quotaRemaining(quota: ProviderQuota, nowMs: number): number {
+  return quota.windows.reduce((least, window) => {
+    const left = window.resetsAtMs !== null && window.resetsAtMs <= nowMs ? 1 : Math.min(1, Math.max(0, 1 - window.usedPercent / 100));
+    return Math.min(least, left);
+  }, 1);
+}
+
+/** 模型组成员在列表里的显示：「供应商 · 模型」「组名」，通配符原样显示。 */
 export function memberLabel(payload: GatewayPayload | null, model: string): string {
+  if (isPattern(model)) return model;
   const view = modelDisplay(payload, model);
   if (view.group) return view.title;
   return view.sub ? `${view.sub} · ${view.title}` : view.title;
@@ -528,8 +621,11 @@ export function memberLabel(payload: GatewayPayload | null, model: string): stri
 
 export type MemberStatus = { state: "busy" | "answered" | "cooling" | "idle"; text: string; args: Array<string | number> };
 
-/** 供应商在调度表、总览里的状态：正在回答 / 熔断或 Key 全部冷却 / 最近回答了谁 / Key 数。文案是中文原文，界面再翻译。 */
-export function memberStatus(payload: GatewayPayload | null, relayId: string): MemberStatus {
+/** 供应商在调度表、总览里的状态：正在回答 / 熔断或 Key 全部冷却 / 10 分钟内哪个 Agent 用过 / Key 数。文案是中文原文，界面再翻译。 */
+/** 「某 Agent 刚用过」只显示这么久，之后回到套餐 / Key 数。 */
+export const RECENT_USE_MS = 10 * 60 * 1000;
+
+export function memberStatus(payload: GatewayPayload | null, relayId: string, nowMs: number = Date.now()): MemberStatus {
   const activity = payload?.activity?.agents ?? [];
   if (activity.some((agent) => agent.inFlight.includes(relayId))) {
     return { state: "busy", text: "正在回答…", args: [] };
@@ -546,12 +642,29 @@ export function memberStatus(payload: GatewayPayload | null, relayId: string): M
     const label = cooling.some((key) => key.lastFailure === "quota_exhausted") ? "额度耗尽 · {0} 后恢复" : "被限流 · {0} 后恢复";
     return { state: "cooling", text: label, args: [formatRemaining(soonest)] };
   }
+  // 最近 10 分钟内由它回答过的 Agent 请求：显示「Codex 刚用过」。
   const answered = activity
-    .filter((agent) => agent.last?.result === "answered" && agent.last.steps.at(-1)?.relayId === relayId)
+    .filter((agent) => agent.last?.result === "answered" && agent.last.steps.at(-1)?.relayId === relayId && nowMs - agent.last.finishedAtMs < RECENT_USE_MS)
     .sort((left, right) => (right.last?.finishedAtMs ?? 0) - (left.last?.finishedAtMs ?? 0))[0];
-  if (answered) return { state: "answered", text: "回答了 {0}", args: [agentName(answered.agent)] };
+  if (answered) return { state: "answered", text: "{0} 刚用过", args: [agentName(answered.agent)] };
   if (unhealthy.length) return { state: "idle", text: "{0} 个 Key · {1} 个冷却中", args: [keyCount, unhealthy.length] };
   return { state: "idle", text: "{0} 个 Key", args: [Math.max(keyCount, 1)] };
+}
+
+/**
+ * 模型调度表里一格（供应商 × 模型）的状态：冷却、熔断按整家供应商算；「刚用过」只标在真正被请求的那个模型上。
+ * 其它情况不显示（返回 null）。
+ */
+export function dispatchStatus(payload: GatewayPayload | null, relayId: string, model: string, nowMs: number = Date.now()): MemberStatus | null {
+  const status = memberStatus(payload, relayId, nowMs);
+  if (status.state === "cooling") return status;
+  const used = (payload?.activity?.agents ?? [])
+    .filter((agent) => {
+      const step = agent.last?.result === "answered" ? agent.last.steps.at(-1) : undefined;
+      return step?.relayId === relayId && step.model.toLowerCase() === model.toLowerCase() && nowMs - (agent.last?.finishedAtMs ?? 0) < RECENT_USE_MS;
+    })
+    .sort((left, right) => (right.last?.finishedAtMs ?? 0) - (left.last?.finishedAtMs ?? 0))[0];
+  return used ? { state: "answered", text: "{0} 刚用过", args: [agentName(used.agent)] } : null;
 }
 
 export function formatElapsed(ms: number): string {

@@ -1,9 +1,11 @@
 //! 网关的路由：Agent 绑定 → 模型名 → 候选上游（供应商 × Key）列表。
 //!
-//! 只看网关自己的供应商池和路由组（`gateway.json`），与直连模式的供应商无关。模型名有三种写法：
+//! 只看网关自己的供应商池和模型组（`gateway.json`），与直连模式的供应商无关。模型名有三种写法：
 //! - 裸模型名：池里所有提供它的供应商按池顺序依次尝试；
 //! - `<供应商 id>/<模型>`：只发给这个供应商；
-//! - `group/<组 id>`：按路由组的成员与模式展开，成员也可以是另一个组。
+//! - `group/<组 id>`：按模型组的成员与模式展开，成员也可以是另一个组，或带 `*` 的通配符。
+//!
+//! 模型组还会记住每个会话上次是哪个成员回答的（见 [`GroupSticky`]），下次先试它，保住上游的提示词缓存。
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -14,13 +16,19 @@ use anyhow::{Context, bail};
 use crate::gateway::key_pool::{self, KeyRef};
 use crate::gateway::store::{
     AgentBinding, GROUP_MODEL_PREFIX, GatewayGroup, GatewaySettings, GroupMember, GroupMode,
-    UnknownModelPolicy,
+    GroupSticky, UnknownModelPolicy,
 };
 use crate::settings::RelayProfile;
 use crate::tools::ToolId;
 
-/// 嵌套路由组最多展开几层，防止组互相引用时死循环。
+/// 嵌套模型组最多展开几层，防止组互相引用时死循环。
 const MAX_GROUP_DEPTH: usize = 4;
+/// 「缓存有效期内固定」：上次回答后这么久内，同一会话继续先试那个成员。上游的提示词缓存一般保留几分钟到一小时。
+pub const CACHE_STICKY_TTL: Duration = Duration::from_secs(10 * 60);
+/// 「整个会话固定」也不会永远记着：这么久没用的会话忘掉。
+const SESSION_STICKY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// 记住的会话数上限，超过时先清掉过期的。
+const STICKY_LIMIT: usize = 2048;
 
 /// 一个可尝试的上游：供应商（`api_key` 已换成该 Key）+ 发给它的模型名。
 #[derive(Debug, Clone)]
@@ -185,6 +193,9 @@ fn expand_model(
     if let Some(group) = group_by_model(gateway, model) {
         return expand_group(gateway, binding, group, depth, visiting);
     }
+    if is_pattern(model) {
+        return expand_pattern(gateway, binding, model);
+    }
     if let Some((relay, upstream)) = qualified_provider(gateway, binding, model) {
         return vec![(relay.clone(), upstream)];
     }
@@ -195,7 +206,62 @@ fn expand_model(
         .collect()
 }
 
-/// 路由组展开：按模式决定从哪个成员开始，成员依次展开（嵌套组递归，出现环或太深时跳过）。
+/// 成员是不是通配符。
+pub fn is_pattern(model: &str) -> bool {
+    model.contains('*')
+}
+
+/// 通配符匹配：`*` 匹配任意一段字符（包括 `/`），不区分大小写。
+pub fn glob_matches(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    let text = text.to_ascii_lowercase();
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if parts.len() == 1 {
+        return text == first;
+    }
+    if !text.starts_with(first) || text.len() < first.len() + last.len() || !text.ends_with(last) {
+        return false;
+    }
+    let mut rest = &text[first.len()..text.len() - last.len()];
+    for part in &parts[1..parts.len() - 1] {
+        match rest.find(part) {
+            Some(index) => rest = &rest[index + part.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+/// 通配符成员展开成池里匹配的 (供应商, 模型)：`<供应商 id>/<模型>` 或裸模型名能匹配上就算，
+/// 按池顺序、各供应商自己的模型顺序。
+fn expand_pattern(
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+    pattern: &str,
+) -> Vec<(RelayProfile, String)> {
+    let mut relays = Vec::new();
+    for relay in binding_pool_relays(gateway, binding) {
+        for model in relay_models(relay) {
+            let qualified = format!("{}/{model}", relay.id);
+            if glob_matches(pattern, &qualified) || glob_matches(pattern, &model) {
+                relays.push((relay.clone(), model));
+            }
+        }
+    }
+    relays
+}
+
+/// 通配符现在匹配到的 `<供应商 id>/<模型>`（所有打开的供应商，不看 Agent 的挑选），界面显示用。
+pub fn pattern_matches(gateway: &GatewaySettings, pattern: &str) -> Vec<String> {
+    expand_pattern(gateway, &AgentBinding::default(), pattern)
+        .into_iter()
+        .map(|(relay, model)| format!("{}/{model}", relay.id))
+        .collect()
+}
+
+/// 模型组展开：按模式决定从哪个成员开始，成员依次展开（嵌套组递归，出现环或太深时跳过）；
+/// 「额度优先」「速度优先」展开后再按额度 / 速度给所有上游排先后。
 fn expand_group(
     gateway: &GatewaySettings,
     binding: &AgentBinding,
@@ -221,17 +287,101 @@ fn expand_group(
         }
     }
     visiting.pop();
+    match group.mode {
+        GroupMode::Usage => sort_by_quota(&mut relays),
+        GroupMode::Fast => sort_by_speed(&mut relays),
+        _ => {}
+    }
     relays
 }
 
-/// 按路由组模式排出成员的尝试顺序。轮换 / 权重的进度存在内存里，各组独立。
+/// 额度优先：有余量的按剩余比例从多到少，其次是没有额度数据的（保持原顺序），用完的排最后。
+fn sort_by_quota(relays: &mut [(RelayProfile, String)]) {
+    relays.sort_by(|(left, _), (right, _)| {
+        let rank = |relay: &RelayProfile| match crate::gateway::quota::remaining(&relay.id) {
+            Some(left) if left > 0.0 => (0, -left),
+            None => (1, 0.0),
+            Some(_) => (2, 0.0),
+        };
+        let (left, right) = (rank(left), rank(right));
+        left.0.cmp(&right.0).then(left.1.total_cmp(&right.1))
+    });
+}
+
+/// 速度优先：还没测过的先试一次，其余按平均首包耗时从快到慢。
+fn sort_by_speed(relays: &mut [(RelayProfile, String)]) {
+    relays.sort_by_key(|(relay, model)| {
+        crate::gateway::speed::latency(&relay.id, model)
+            .map_or((0, Duration::ZERO), |latency| (1, latency))
+    });
+}
+
+type StickyTable = HashMap<(String, String), (String, String, Instant)>;
+
+fn sticky_table() -> &'static Mutex<StickyTable> {
+    static TABLE: OnceLock<Mutex<StickyTable>> = OnceLock::new();
+    TABLE.get_or_init(Mutex::default)
+}
+
+/// 记下这个会话在组里是哪个上游回答的。没有组或会话标识时不记。
+pub fn remember_answer(plan: &RoutePlan, candidate: &GatewayCandidate) {
+    let (Some(group), Some(conversation)) = (&plan.group_id, &plan.conversation) else {
+        return;
+    };
+    let now = Instant::now();
+    let mut table = sticky_table()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if table.len() >= STICKY_LIMIT {
+        table.retain(|_, (_, _, at)| now.duration_since(*at) < SESSION_STICKY_TTL);
+    }
+    table.insert(
+        (group.clone(), conversation.clone()),
+        (
+            candidate.relay.id.clone(),
+            candidate.upstream_model.clone(),
+            now,
+        ),
+    );
+}
+
+/// 这个会话在组里该先试的上游 (供应商 id, 模型)：按组的固定方式，过期或不固定时返回 None。
+fn recall_answer(
+    group: &GatewayGroup,
+    conversation: &str,
+    now: Instant,
+) -> Option<(String, String)> {
+    let ttl = match group.sticky {
+        GroupSticky::Off => return None,
+        GroupSticky::Cache => CACHE_STICKY_TTL,
+        GroupSticky::Session => SESSION_STICKY_TTL,
+    };
+    let table = sticky_table()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (relay, model, at) = table.get(&(group.id.clone(), conversation.to_string()))?;
+    (now.duration_since(*at) < ttl).then(|| (relay.clone(), model.clone()))
+}
+
+/// 把会话上次回答的上游挪到最前面；它已经不在候选里（被移出组、关掉）就不动。
+fn prefer_remembered(relays: &mut Vec<(RelayProfile, String)>, remembered: &(String, String)) {
+    if let Some(index) = relays
+        .iter()
+        .position(|(relay, model)| relay.id == remembered.0 && *model == remembered.1)
+    {
+        let item = relays.remove(index);
+        relays.insert(0, item);
+    }
+}
+
+/// 按模型组模式排出成员的尝试顺序。轮换 / 权重的进度存在内存里，各组独立。
 fn ordered_members(group: &GatewayGroup) -> Vec<GroupMember> {
     let members = group.members.clone();
     if members.len() < 2 {
         return members;
     }
     let start = match group.mode {
-        GroupMode::InOrder => 0,
+        GroupMode::InOrder | GroupMode::Usage | GroupMode::Fast => 0,
         GroupMode::Rotate => (next_counter(&group.id) % members.len() as u64) as usize,
         GroupMode::Weighted => {
             let total: u64 = members
@@ -288,8 +438,14 @@ pub fn resolve_plan(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
 
-    let group_id = group_by_model(gateway, &model).map(|group| group.id.clone());
+    let group = group_by_model(gateway, &model);
+    let group_id = group.map(|group| group.id.clone());
     let mut relays = expand_model(gateway, binding, &model, 0, &mut Vec::new());
+    if let (Some(group), Some(conversation)) = (group, conversation.as_deref())
+        && let Some(remembered) = recall_answer(group, conversation, Instant::now())
+    {
+        prefer_remembered(&mut relays, &remembered);
+    }
     if relays.is_empty() && group_id.is_none() {
         // 原样转发的未知模型：交给默认模型所在的供应商。
         relays = expand_model(gateway, binding, &default_model, 0, &mut Vec::new())
@@ -373,6 +529,7 @@ mod tests {
             id: id.to_string(),
             name: id.to_string(),
             mode,
+            sticky: GroupSticky::Cache,
             members,
         }
     }
@@ -558,5 +715,138 @@ mod tests {
         );
         gateway.providers.clear();
         assert!(resolve_plan(&gateway, &ToolId::Claude, "kimi-k3", None).is_err());
+    }
+
+    #[test]
+    fn glob_matches_any_run_of_characters_ignoring_case() {
+        assert!(glob_matches(
+            "openrouter/*:free",
+            "OpenRouter/meta/llama-4:free"
+        ));
+        assert!(glob_matches("*-free", "big-pickle-free"));
+        assert!(glob_matches("deepseek*", "deepseek-v4-pro"));
+        assert!(glob_matches("*", "anything"));
+        assert!(glob_matches("a*b*c", "a-x-b-y-c"));
+        assert!(!glob_matches("a*b*c", "a-x-c-y-b"));
+        assert!(!glob_matches("ab*ba", "aba"), "前后缀不能重叠");
+        assert!(
+            !glob_matches("deepseek", "deepseek-v4"),
+            "没有 * 就要整串相同"
+        );
+    }
+
+    #[test]
+    fn pattern_members_follow_the_pool() {
+        let mut gateway = gateway("group/wild");
+        gateway.groups.push(group(
+            "wild",
+            GroupMode::InOrder,
+            vec![member("*-v4-pro"), member("kimi/*")],
+        ));
+        assert_eq!(
+            routed(&gateway, "group/wild"),
+            vec![
+                pair("ds", "deepseek-v4-pro"),
+                pair("mirror", "deepseek-v4-pro"),
+                pair("kimi", "kimi-k3"),
+            ]
+        );
+        // 上游新增的模型自动算进来；关掉的供应商不算。
+        gateway.providers[1].relay.model_list = "kimi-k3\nkimi-k3-turbo".to_string();
+        assert_eq!(routed(&gateway, "group/wild").len(), 4);
+        assert_eq!(
+            pattern_matches(&gateway, "off/*"),
+            Vec::<String>::new(),
+            "关掉的供应商不匹配"
+        );
+        assert_eq!(
+            pattern_matches(&gateway, "kimi/*"),
+            vec!["kimi/kimi-k3", "kimi/kimi-k3-turbo"]
+        );
+    }
+
+    #[test]
+    fn sticky_groups_keep_a_conversation_on_the_member_that_answered() {
+        let mut gateway = gateway("group/sticky-spin");
+        gateway.groups.push(group(
+            "sticky-spin",
+            GroupMode::Rotate,
+            vec![member("ds/deepseek-v4-flash"), member("kimi-k3")],
+        ));
+        let plan = |gateway: &GatewaySettings, conversation: &str| {
+            resolve_plan(gateway, &ToolId::Claude, "group/sticky-spin", Some(conversation)).unwrap()
+        };
+        let first = plan(&gateway, "sticky-conv");
+        let answered = first.candidates[0].clone();
+        remember_answer(&first, &answered);
+        for _ in 0..3 {
+            assert_eq!(
+                plan(&gateway, "sticky-conv").candidates[0].relay.id,
+                answered.relay.id,
+                "轮换组里同一会话也先试上次回答的成员"
+            );
+        }
+        // 别的会话照常轮换；不固定时按模式重新排。
+        let others: Vec<String> = (0..2)
+            .map(|_| {
+                plan(&gateway, "another-conv").candidates[0]
+                    .relay
+                    .id
+                    .clone()
+            })
+            .collect();
+        assert_ne!(others[0], others[1]);
+        gateway.groups.last_mut().unwrap().sticky = GroupSticky::Off;
+        let spins: Vec<String> = (0..2)
+            .map(|_| plan(&gateway, "sticky-conv").candidates[0].relay.id.clone())
+            .collect();
+        assert_ne!(spins[0], spins[1]);
+    }
+
+    #[test]
+    fn usage_and_fast_modes_reorder_every_upstream() {
+        use crate::gateway::quota::{ProviderQuota, QuotaWindow, record};
+        let mut gateway = gateway("group/quota");
+        gateway.providers.extend([
+            provider("q-low", "same"),
+            provider("q-unknown", "same"),
+            provider("q-empty", "same"),
+            provider("q-high", "same"),
+        ]);
+        let quota = |used: f64| ProviderQuota {
+            windows: vec![QuotaWindow {
+                window_minutes: Some(300),
+                used_percent: used,
+                resets_at_ms: None,
+            }],
+            updated_at_ms: 0,
+        };
+        record("q-low", quota(90.0));
+        record("q-empty", quota(100.0));
+        record("q-high", quota(10.0));
+        gateway
+            .groups
+            .push(group("quota", GroupMode::Usage, vec![member("same")]));
+        let order: Vec<String> = routed(&gateway, "group/quota")
+            .into_iter()
+            .map(|(relay, _)| relay)
+            .collect();
+        assert_eq!(order, ["q-high", "q-low", "q-unknown", "q-empty"]);
+
+        gateway.providers.extend([
+            provider("sp-slow", "speedy"),
+            provider("sp-new", "speedy"),
+            provider("sp-fast", "speedy"),
+        ]);
+        crate::gateway::speed::record("sp-slow", "speedy", Duration::from_millis(3000));
+        crate::gateway::speed::record("sp-fast", "speedy", Duration::from_millis(400));
+        gateway
+            .groups
+            .push(group("fastest", GroupMode::Fast, vec![member("speedy")]));
+        let order: Vec<String> = routed(&gateway, "group/fastest")
+            .into_iter()
+            .map(|(relay, _)| relay)
+            .collect();
+        assert_eq!(order, ["sp-new", "sp-fast", "sp-slow"], "没测过的先试一次");
     }
 }

@@ -7,7 +7,7 @@ use codex_plus_core::gateway::apply::{
     refresh_enabled, reorder_providers, save_group, set_provider_enabled, update_provider,
 };
 use codex_plus_core::gateway::store::{
-    AgentBinding, ClaudeRoleModels, GatewayStore, GroupMember, GroupMode,
+    AgentBinding, ClaudeRoleModels, GatewayStore, GroupMember, GroupMode, GroupSticky,
 };
 use codex_plus_core::settings::{BackendSettings, RelayMode, RelayProfile, RelayProtocol};
 use codex_plus_core::tools::ToolId;
@@ -838,6 +838,7 @@ fn providers_live_only_in_the_gateway_store() {
             id: String::new(),
             name: "Daily coding".into(),
             mode: GroupMode::InOrder,
+            sticky: GroupSticky::Session,
             members: vec![
                 GroupMember {
                     model: "deepseek-2/deepseek-v4-pro".into(),
@@ -852,6 +853,11 @@ fn providers_live_only_in_the_gateway_store() {
     )
     .unwrap();
     assert_eq!(group, "daily-coding");
+    assert_eq!(
+        store.load().unwrap().group("daily-coding").unwrap().sticky,
+        GroupSticky::Session,
+        "会话固定方式随组保存"
+    );
     let gateway = delete_provider(store, "deepseek-2").unwrap();
     assert!(gateway.provider("deepseek-2").is_none());
     assert_eq!(
@@ -908,6 +914,7 @@ fn groups_are_saved_validated_and_unlinked_on_delete() {
     assert_eq!(saved.members.len(), 1, "去掉自引用和重复成员");
     assert_eq!(saved.members[0].weight, 1, "权重至少为 1");
     assert_eq!(saved.mode, GroupMode::Rotate);
+    assert_eq!(saved.sticky, GroupSticky::Cache, "没填时默认缓存期内固定");
     let gateway = delete_group(store, &fast).unwrap();
     assert_eq!(
         gateway.group(&coder).unwrap().members.len(),

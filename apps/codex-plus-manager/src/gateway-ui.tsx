@@ -2,7 +2,7 @@
 import type { CSSProperties, ReactNode } from "react";
 import { KeyRound } from "lucide-react";
 import { t, tf } from "./i18n";
-import type { MemberStatus } from "./gateway-model";
+import { formatRemaining, quotaRemaining, quotaWindowLabel, type MemberStatus, type ProviderQuota } from "./gateway-model";
 import { BRAND_ICON_URLS } from "./provider-brand-icons";
 import { brandIconIsColor, brandIconKey } from "./provider-brands";
 import { providerAvatarText } from "./provider-name";
@@ -107,6 +107,40 @@ export function KeyCount({ count }: { count: number }) {
     <span className="gw-key-count" title={tf("{0} 个 Key", [count])}>
       <KeyRound aria-hidden="true" />
       {count}
+    </span>
+  );
+}
+
+/** 订阅额度的剩余量：一根细条 + 百分比，取最紧的窗口。 */
+export function QuotaBadge({ quota }: { quota: ProviderQuota }) {
+  const left = Math.round(quotaRemaining(quota, Date.now()) * 100);
+  const tone = left <= 10 ? "low" : left <= 30 ? "mid" : "ok";
+  return (
+    <span className="gw-quota-badge" data-tone={tone} title={t("剩余额度（取最紧的窗口）")}>
+      <i style={{ "--gw-quota": `${left}%` } as CSSProperties} />
+      {tf("剩 {0}%", [left])}
+    </span>
+  );
+}
+
+/** 订阅额度的明细：每个窗口一行，已用比例和重置时间。 */
+export function QuotaWindows({ quota }: { quota: ProviderQuota }) {
+  const now = Date.now();
+  return (
+    <span className="gw-quota-windows">
+      {quota.windows.map((window, index) => {
+        const reset = window.resetsAtMs !== null && window.resetsAtMs > now ? formatRemaining(window.resetsAtMs - now) : "";
+        const label = quotaWindowLabel(window);
+        const used = window.resetsAtMs !== null && window.resetsAtMs <= now ? 0 : Math.round(window.usedPercent);
+        return (
+          <span className="gw-quota-window" data-tone={used >= 90 ? "low" : used >= 70 ? "mid" : "ok"} key={index}>
+            <b>{label.args.length ? tf(label.text, label.args) : t(label.text)}</b>
+            <i style={{ "--gw-quota": `${Math.max(0, 100 - used)}%` } as CSSProperties} />
+            <span>{tf("已用 {0}%", [used])}</span>
+            {reset ? <small>{tf("{0} 后重置", [reset])}</small> : null}
+          </span>
+        );
+      })}
     </span>
   );
 }

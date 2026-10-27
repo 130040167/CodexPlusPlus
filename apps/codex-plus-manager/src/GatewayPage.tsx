@@ -3,26 +3,33 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { appConfirm } from "./app-dialog";
-import { AlertTriangle, ChevronDown, ChevronRight, ChevronUp, Plus, RefreshCw, Search, Waypoints, X } from "lucide-react";
+import { AlertTriangle, Asterisk, ChevronDown, ChevronRight, ChevronUp, Plus, RefreshCw, Search, Waypoints, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { t, tf } from "./i18n";
 import {
   agentName,
+  formatElapsed,
   groupModeDescription,
   groupModeLabel,
   groupModelId,
+  groupStickyDescription,
+  groupStickyLabel,
+  isPattern,
   memberLabel,
-  memberStatus,
+  dispatchStatus,
   modelDispatch,
   modelDisplay,
+  patternMatches,
   prettyModelName,
+  speedOf,
   slugify,
   type GatewayGroupEntry,
   type GatewayPayload,
   type GatewayResult,
   type GroupMember,
   type GroupMode,
+  type GroupSticky,
 } from "./gateway-model";
 import { AgentsView, Floating, ModelList } from "./GatewayAgents";
 import { AppSelect } from "./AppSelect";
@@ -253,6 +260,7 @@ function RoutingView({ payload, busy, run, onManage }: { payload: GatewayPayload
                 <small>{group.members.length ? group.members.map((member) => memberLabel(payload, member.model)).join(joiner) : t("没有成员")}</small>
               </div>
               <span className="gw-pill gw-pill-outline">{t(groupModeLabel(group.mode))}</span>
+              <span className="gw-pill gw-pill-outline" title={t(groupStickyDescription(group.sticky))}>{t(groupStickyLabel(group.sticky))}</span>
               <span className="gw-row-buttons">
                 <button className="gw-text-button" disabled={busy !== null} onClick={() => setEditing(group)} type="button">{t("编辑")}</button>
                 <button className="gw-text-button" disabled={busy !== null} onClick={() => void remove(group)} type="button">{t("删除")}</button>
@@ -327,16 +335,18 @@ function DispatchTable({ payload, onManage }: { payload: GatewayPayload | null; 
             </div>
             <ol className="gw-dispatch-chain">
               {row.providers.map((provider, index) => {
-                const status = memberStatus(payload, provider.id);
+                const status = dispatchStatus(payload, provider.id, row.model);
+                const speed = speedOf(payload, provider.id, row.model);
                 const note = provider.excludedBy.length ? tf("{0} 不用这家", [provider.excludedBy.map(agentName).join("、")]) : undefined;
                 return (
-                  <li data-excluded={provider.excludedBy.length > 0} data-state={status.state} key={provider.id} title={note}>
+                  <li data-excluded={provider.excludedBy.length > 0} data-state={status?.state ?? "idle"} key={provider.id} title={note}>
                     {index > 0 ? <ChevronRight aria-hidden className="gw-dispatch-arrow h-3.5 w-3.5" /> : null}
                     <span className="gw-dispatch-step">
                       <i>{index + 1}</i>
                       <Avatar baseUrl={provider.baseUrl} name={provider.name} size="sm" />
                       <b>{provider.name}</b>
-                      {status.state === "idle" ? null : <small><MemberStatusLabel status={status} /></small>}
+                      {status ? <small><MemberStatusLabel status={status} /></small> : null}
+                      {speed !== null ? <small className="gw-dispatch-speed" title={t("最近的平均首包耗时")}>{formatElapsed(speed)}</small> : null}
                     </span>
                   </li>
                 );
@@ -366,11 +376,13 @@ function GroupEditor({
   payload: GatewayPayload | null;
   group: GatewayGroupEntry | null;
   busy: string | null;
-  onSave: (input: { id: string; name: string; mode: GroupMode; members: GroupMember[] }) => void;
+  onSave: (input: { id: string; name: string; mode: GroupMode; sticky: GroupSticky; members: GroupMember[] }) => void;
   onCancel: () => void;
 }) {
   const [name, setName] = useState(group?.name ?? "");
   const [mode, setMode] = useState<GroupMode>(group?.mode ?? "inOrder");
+  const [sticky, setSticky] = useState<GroupSticky>(group?.sticky ?? "cache");
+  const [pattern, setPattern] = useState("");
   const [members, setMembers] = useState<GroupMember[]>(group?.members.map((member) => ({ ...member })) ?? []);
   const [picking, setPicking] = useState(false);
   const addRef = useRef<HTMLButtonElement>(null);
@@ -392,14 +404,29 @@ function GroupEditor({
     { value: "inOrder", label: t("依次") },
     { value: "rotate", label: t("轮换") },
     { value: "weighted", label: t("按权重") },
+    { value: "usage", label: t("额度优先") },
+    { value: "fast", label: t("速度优先") },
   ];
+  const stickies: GroupSticky[] = ["cache", "session", "off"];
+  const patternText = pattern.trim();
+  const patternHits = isPattern(patternText) ? patternMatches(payload, patternText) : [];
+  const addPattern = () => {
+    if (!isPattern(patternText)) return;
+    if (!members.some((member) => member.model === patternText)) setMembers([...members, { model: patternText, weight: 1 }]);
+    setPattern("");
+  };
+  const memberHint = mode === "inOrder"
+    ? t("从上到下依次尝试")
+    : mode === "usage" || mode === "fast"
+      ? t("额度 / 速度相同时按列表顺序")
+      : t("答不了时按列表顺序换下一个");
   return createPortal(
     <div className="gw-modal-backdrop gw-portal" onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel(); }}>
       <form
         className="gw-modal gw-group-modal"
         onSubmit={(event) => {
           event.preventDefault();
-          if (!error) onSave({ id: group?.id ?? "", name: name.trim(), mode, members });
+          if (!error) onSave({ id: group?.id ?? "", name: name.trim(), mode, sticky, members });
         }}
       >
         <header>
@@ -424,16 +451,33 @@ function GroupEditor({
             <small className="gw-muted">{t(groupModeDescription(mode))}</small>
           </div>
           <div className="gw-field">
-            <span>{t("成员")} <small>{mode === "inOrder" ? t("从上到下依次尝试") : t("答不了时按列表顺序换下一个")}</small></span>
+            <span>{t("会话固定")}</span>
+            <div className="gw-tabs gw-mode-tabs" role="radiogroup">
+              {stickies.map((item) => (
+                <button aria-checked={sticky === item} data-active={sticky === item} key={item} onClick={() => setSticky(item)} role="radio" type="button">
+                  {t(groupStickyLabel(item))}
+                </button>
+              ))}
+            </div>
+            <small className="gw-muted">{t(groupStickyDescription(sticky))}</small>
+          </div>
+          <div className="gw-field">
+            <span>{t("成员")} <small>{memberHint}</small></span>
             <div className="gw-member-list">
               {members.map((member, index) => {
                 const view = modelDisplay(payload, member.model);
+                const wildcard = isPattern(member.model);
+                const hits = wildcard ? patternMatches(payload, member.model) : [];
                 return (
-                  <div className="gw-member-edit" key={`${member.model}-${index}`}>
-                    {view.group ? <Waypoints className="gw-picker-glyph h-4 w-4" /> : <Avatar name={view.sub || view.title} size="sm" />}
+                  <div className="gw-member-edit" data-pattern={wildcard} key={`${member.model}-${index}`}>
+                    {wildcard ? <Asterisk className="gw-picker-glyph h-4 w-4" /> : view.group ? <Waypoints className="gw-picker-glyph h-4 w-4" /> : <Avatar name={view.sub || view.title} size="sm" />}
                     <span className="gw-member-edit-name">
-                      <strong>{view.title}</strong>
-                      <small>{view.group ? view.sub : view.sub || t("池里还没有提供它的供应商")}</small>
+                      <strong>{wildcard ? member.model : view.title}</strong>
+                      {wildcard ? (
+                        <small title={hits.join("\n")}>{hits.length ? tf("通配符 · 现在匹配 {0} 个模型", [hits.length]) : t("通配符 · 现在没有匹配的模型")}</small>
+                      ) : (
+                        <small>{view.group ? view.sub : view.sub || t("池里还没有提供它的供应商")}</small>
+                      )}
                     </span>
                     {mode === "weighted" ? (
                       <label className="gw-inline-field">
@@ -457,10 +501,33 @@ function GroupEditor({
                   </div>
                 );
               })}
-              <button className="gw-add-row" onClick={() => setPicking(!picking)} ref={addRef} type="button">
-                <Plus className="h-4 w-4" />
-                {t("添加成员")}
-              </button>
+              <div className="gw-add-line">
+                <button className="gw-add-row" onClick={() => setPicking(!picking)} ref={addRef} type="button">
+                  <Plus className="h-4 w-4" />
+                  {t("添加成员")}
+                </button>
+                <span className="gw-pattern-input">
+                  <Asterisk aria-hidden className="h-3.5 w-3.5" />
+                  <input
+                    aria-label={t("通配符成员")}
+                    onChange={(event) => setPattern(event.currentTarget.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        addPattern();
+                      }
+                    }}
+                    placeholder={t("通配符，如 openrouter/*:free")}
+                    value={pattern}
+                  />
+                  {patternText ? (
+                    <button className="gw-text-button strong" disabled={!isPattern(patternText)} onClick={addPattern} title={patternHits.slice(0, 20).join("\n")} type="button">
+                      {isPattern(patternText) ? tf("添加（{0} 个）", [patternHits.length]) : t("要带 *")}
+                    </button>
+                  ) : null}
+                </span>
+              </div>
+              <small className="gw-muted">{t("通配符按「供应商 id/模型」或模型名匹配，* 代表任意字符；上游新增的模型会自动算进来。")}</small>
               <Floating anchorRef={addRef} className="gw-model-popover" onClose={() => setPicking(false)} open={picking} width={520}>
                 <ModelList
                   exclude={[]}

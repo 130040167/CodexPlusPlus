@@ -20,7 +20,7 @@ use serde_json::{Map, Value, json};
 use crate::gateway::route::{self, binding_default_model};
 use crate::gateway::store::{
     AgentBinding, GROUP_MODEL_PREFIX, GatewayGroup, GatewayProvider, GatewaySettings, GatewayStore,
-    GroupMember, GroupMode, ProviderPrice, new_client_token,
+    GroupMember, GroupMode, GroupSticky, ProviderPrice, new_client_token,
 };
 use crate::settings::{
     BackendSettings, RelayApiKey, RelayMode, RelayProfile, RelayProtocol, SettingsStore,
@@ -1367,7 +1367,7 @@ pub fn reorder_providers(store: &GatewayStore, ids: &[String]) -> anyhow::Result
     Ok(gateway)
 }
 
-/// 新建 / 编辑路由组的输入。`id` 为空表示新建。
+/// 新建 / 编辑模型组的输入。`id` 为空表示新建。
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupInput {
@@ -1377,10 +1377,12 @@ pub struct GroupInput {
     #[serde(default)]
     pub mode: GroupMode,
     #[serde(default)]
+    pub sticky: GroupSticky,
+    #[serde(default)]
     pub members: Vec<GroupMember>,
 }
 
-/// 保存路由组。成员去空、去重；不能直接包含自己。返回组 id。
+/// 保存模型组。成员去空、去重；不能直接包含自己。返回组 id。
 pub fn save_group(
     store: &GatewayStore,
     input: &GroupInput,
@@ -1416,6 +1418,7 @@ pub fn save_group(
         id: id.clone(),
         name: name.to_string(),
         mode: input.mode,
+        sticky: input.sticky,
         members,
     };
     match gateway.groups.iter_mut().find(|known| known.id == id) {
@@ -1426,7 +1429,7 @@ pub fn save_group(
     Ok((gateway, id))
 }
 
-/// 删除路由组：其它组里引用它的成员一并去掉。
+/// 删除模型组：其它组里引用它的成员一并去掉。
 pub fn delete_group(store: &GatewayStore, id: &str) -> anyhow::Result<GatewaySettings> {
     let mut gateway = store.load()?;
     let before = gateway.groups.len();

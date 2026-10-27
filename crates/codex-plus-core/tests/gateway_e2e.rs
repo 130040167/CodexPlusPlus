@@ -523,6 +523,7 @@ async fn gateway_end_to_end() {
         id: "group".into(),
         name: "group".into(),
         mode: GroupMode::InOrder,
+        sticky: Default::default(),
         members: vec![
             GroupMember {
                 model: "bad/deepseek-v4-pro".into(),

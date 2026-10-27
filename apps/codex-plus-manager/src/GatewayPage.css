@@ -3051,3 +3051,136 @@ body.gw-sorting * {
   align-items: center;
   gap: 4px;
 }
+
+/* —— 模型组：通配符成员 —— */
+.gw-portal .gw-add-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+}
+
+.gw-portal .gw-pattern-input {
+  display: inline-flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  min-width: 220px;
+  height: 32px;
+  padding: 0 4px 0 10px;
+  border: 1px dashed var(--gw-line);
+  border-radius: 8px;
+  color: var(--gw-mute);
+}
+
+.gw-portal .gw-pattern-input:focus-within {
+  border-style: solid;
+  border-color: hsl(var(--primary) / 0.5);
+}
+
+.gw-portal .gw-pattern-input input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--gw-ink);
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  outline: none;
+}
+
+.gw-portal .gw-pattern-input .gw-text-button {
+  white-space: nowrap;
+}
+
+.gw-portal .gw-member-edit[data-pattern="true"] strong {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+/* —— 订阅额度 —— */
+.shell .gw-quota-badge,
+.shell .gw-quota-window {
+  --gw-quota-color: var(--gw-ok);
+}
+
+.shell .gw-quota-badge[data-tone="mid"],
+.shell .gw-quota-window[data-tone="mid"] {
+  --gw-quota-color: var(--gw-warn);
+}
+
+.shell .gw-quota-badge[data-tone="low"],
+.shell .gw-quota-window[data-tone="low"] {
+  --gw-quota-color: var(--gw-err);
+}
+
+.shell .gw-quota-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 8px;
+  color: var(--gw-mute);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.shell .gw-quota-badge i,
+.shell .gw-quota-window i {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: hsl(var(--muted-foreground) / 0.2);
+}
+
+.shell .gw-quota-badge i::after,
+.shell .gw-quota-window i::after {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--gw-quota);
+  border-radius: inherit;
+  background: var(--gw-quota-color);
+  content: "";
+}
+
+.shell .gw-quota-windows {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+}
+
+.shell .gw-quota-window {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.shell .gw-quota-window b {
+  font-weight: 500;
+}
+
+.shell .gw-quota-window i {
+  width: 56px;
+}
+
+.shell .gw-quota-window small {
+  color: var(--gw-mute);
+  font-size: 11.5px;
+}
+
+.shell .gw-dispatch-step .gw-dispatch-speed {
+  color: var(--gw-mute);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
+/* 模型组一行：图标、名称、模式、会话固定、按钮。 */
+.shell .gw-group-row {
+  grid-template-columns: 76px minmax(0, 1fr) auto auto auto;
+}

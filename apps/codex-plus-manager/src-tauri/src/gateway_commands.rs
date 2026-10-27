@@ -48,6 +48,8 @@ pub struct GatewayPoolEntry {
     pub upstream_new: Vec<String>,
     /// 上次检查时列表里有、上游已经没有的模型。
     pub upstream_gone: Vec<String>,
+    /// 订阅账号的额度（ChatGPT 5 小时 / 每周、Copilot 本月高级请求）；查不到或普通供应商为空。
+    pub quota: Option<codex_plus_core::gateway::quota::ProviderQuota>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +89,8 @@ pub struct GatewayPayload {
     pub health: PoolSnapshot,
     /// 路由动态：各 Agent 最近一次请求怎么走的、计数、正在回答的上游。
     pub activity: ActivitySnapshot,
+    /// 各（供应商, 模型）最近的平均首包耗时，模型调度表和「速度优先」用。
+    pub speeds: Vec<codex_plus_core::gateway::speed::SpeedView>,
     /// 可复制进网关的直连模式供应商。
     pub codex_providers: Vec<GatewayPoolEntry>,
     pub claude_providers: Vec<GatewaySourceEntry>,
@@ -143,6 +147,7 @@ fn pool_entry(
         proxy: relay.gateway_proxy.clone().unwrap_or_default(),
         upstream_new: upstream.0,
         upstream_gone: upstream.1,
+        quota: codex_plus_core::gateway::quota::get(&relay.id),
     }
 }
 
@@ -254,6 +259,7 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
         agents,
         health: key_pool::snapshot(std::time::Instant::now()),
         activity: activity::snapshot(),
+        speeds: codex_plus_core::gateway::speed::snapshot(),
         codex_providers,
         claude_providers,
         grok_profiles,
@@ -501,6 +507,7 @@ pub fn save_gateway_provider_models(
 fn refresh_added<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
     if result.is_ok() {
         autofill_prices(None);
+        refresh_quotas();
     }
     refresh_agents(result)
 }
@@ -528,9 +535,44 @@ fn autofill_prices(only: Option<String>) {
     });
 }
 
-/// 后台任务：启动时补一次价格，之后每小时看一眼，超过一天没检查的供应商重新拉上游模型。
+/// 后台查一遍订阅账号的额度（刚登录的账号不用等下一轮）。
+fn refresh_quotas() {
+    tauri::async_runtime::spawn(async move {
+        let Ok(gateway) = GatewayStore::default().load() else {
+            return;
+        };
+        for provider in gateway.providers.iter().filter(|provider| provider.enabled) {
+            if codex_plus_core::gateway::quota::supports(&provider.relay) {
+                let _ = codex_plus_core::gateway::quota::refresh(&provider.relay).await;
+            }
+        }
+    });
+}
+
+/// 手动刷新一个账号的额度。
+#[tauri::command]
+pub async fn refresh_gateway_quota(id: String) -> CommandResult<Option<GatewayPayload>> {
+    let relay = GatewayStore::default()
+        .load()
+        .ok()
+        .and_then(|gateway| gateway.provider(&id).map(|provider| provider.relay.clone()));
+    let Some(relay) = relay else {
+        return failed(&format!("供应商不存在：{id}"), current_payload());
+    };
+    match codex_plus_core::gateway::quota::refresh(&relay).await {
+        Ok(Some(_)) => ok("额度已刷新。", current_payload()),
+        Ok(None) => failed("这个供应商没有可查的额度。", current_payload()),
+        Err(error) => failed(&format!("查询额度失败：{error:#}"), current_payload()),
+    }
+}
+
+/// 后台任务：启动时补一次价格，之后每小时看一眼，超过一天没检查的供应商重新拉上游模型；
+/// 另外每 10 分钟查一遍订阅账号的额度。
 pub fn start_model_watch() {
     tauri::async_runtime::spawn(model_sync::watch(GatewayStore::default()));
+    tauri::async_runtime::spawn(codex_plus_core::gateway::quota::watch(
+        GatewayStore::default(),
+    ));
 }
 
 /// 删除网关供应商（直连模式的数据不受影响）。

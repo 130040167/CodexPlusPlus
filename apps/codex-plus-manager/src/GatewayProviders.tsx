@@ -29,7 +29,7 @@ import {
   type ProviderPrice,
   maskAccountName,
 } from "./gateway-model";
-import { AgentIcon, Avatar, KeyCount, MemberStatusLabel, Switch, type Notify, type Run } from "./gateway-ui";
+import { AgentIcon, Avatar, KeyCount, MemberStatusLabel, QuotaBadge, QuotaWindows, Switch, type Notify, type Run } from "./gateway-ui";
 import { ProviderFormDialog, type ProviderFormState } from "./ProviderFormDialog";
 import { ProviderExtrasDialog, priceSummary } from "./ProviderExtrasDialog";
 import { ProviderModelsDialog } from "./ProviderModelsDialog";
@@ -305,6 +305,8 @@ function PoolRow({
     if (await run(`models:${entry.id}`, "save_gateway_provider_models", { id: entry.id, models, defaultModel }, t("保存模型列表"))) setModelsOpen(false);
   };
   const price = priceSummary(entry);
+  // ChatGPT 订阅账号和 Copilot 能查额度（ChatGPT API 账号按量计费，没有额度窗口）。
+  const quotaSupported = entry.account === "chatgpt" || entry.account === "copilot";
   const saveExtras = async (nextPrice: ProviderPrice | null, modelPrices: Record<string, ProviderPrice> | null, proxy: string) => {
     const title = extrasOpen === "proxy" ? t("保存代理") : t("保存价格");
     if (await run(`extras:${entry.id}`, "save_gateway_provider_extras", { id: entry.id, price: nextPrice, modelPrices, proxy }, title)) setExtrasOpen(null);
@@ -343,8 +345,9 @@ function PoolRow({
             </button>
           ) : null}
           <i className="gw-dot" data-tone={tone} />
-          {/* 订阅账号空闲时显示套餐，其它供应商显示 Key 数。 */}
+          {/* 订阅账号空闲时显示套餐（和剩余额度），其它供应商显示 Key 数。 */}
           {!enabled ? t("已关闭") : status.state === "idle" && entry.account && entry.plan ? entry.plan : <MemberStatusLabel status={status} />}
+          {enabled && entry.quota ? <QuotaBadge quota={entry.quota} /> : null}
         </span>
         <Switch
           disabled={busy !== null}
@@ -382,6 +385,23 @@ function PoolRow({
               ) : null}
             </div>
           </div>
+          {quotaSupported ? (
+            <div className="gw-detail-row">
+              <span className="gw-detail-label">{t("额度")}</span>
+              <div className="gw-detail-value gw-chip-row">
+                {entry.quota ? <QuotaWindows quota={entry.quota} /> : <span className="gw-muted">{t("还没查到，每 10 分钟查一次，用过一次也会更新")}</span>}
+                <button
+                  className="gw-text-button gw-sync-button"
+                  disabled={busy !== null}
+                  onClick={() => void run(`quota:${entry.id}`, "refresh_gateway_quota", { id: entry.id }, t("刷新额度"), true)}
+                  type="button"
+                >
+                  <RefreshCw className={busy === `quota:${entry.id}` ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
+                  {t("刷新")}
+                </button>
+              </div>
+            </div>
+          ) : null}
           <div className="gw-detail-row">
             <span className="gw-detail-label">{t("价格")}</span>
             <div className="gw-detail-value gw-chip-row">

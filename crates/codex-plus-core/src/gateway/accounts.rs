@@ -349,6 +349,7 @@ pub const COPILOT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
+const COPILOT_USER_URL: &str = "https://api.github.com/copilot_internal/user";
 const GITHUB_USER_URL: &str = "https://api.github.com/user";
 const COPILOT_DEFAULT_API: &str = "https://api.githubcopilot.com";
 /// 凭据里标识账号类型的字段。
@@ -528,6 +529,34 @@ pub fn parse_copilot_token(value: &Value) -> anyhow::Result<CopilotToken> {
             .unwrap_or_default()
             .to_string(),
     })
+}
+
+/// Copilot 账号信息（含本月高级请求额度）：`api.github.com/copilot_internal/user`。
+pub async fn copilot_user(relay: &RelayProfile) -> anyhow::Result<Value> {
+    let github_token = account_kind(relay)
+        .and_then(|(_, value)| {
+            value
+                .get("github_token")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|token| !token.is_empty())
+        .context("Copilot 登录信息不完整，请重新登录")?;
+    let mut request = http_client()?
+        .get(COPILOT_USER_URL)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("token {github_token}"),
+        )
+        .header(reqwest::header::ACCEPT, "application/json");
+    for (key, value) in copilot_headers() {
+        request = request.header(key, value);
+    }
+    let response = request.send().await.context("连不上 GitHub")?;
+    if !response.status().is_success() {
+        bail!("查询 Copilot 额度失败：HTTP {}", response.status().as_u16());
+    }
+    Ok(response.json().await?)
 }
 
 pub async fn copilot_exchange(github_token: &str) -> anyhow::Result<CopilotToken> {

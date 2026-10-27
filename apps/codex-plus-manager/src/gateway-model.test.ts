@@ -6,6 +6,7 @@ import {
   bindingFromDraft,
   blankBinding,
   connectedAgents,
+  dispatchStatus,
   draftFromBinding,
   formatRemaining,
   activeSponsorIds,
@@ -172,9 +173,10 @@ function withActivity(): GatewayPayload {
   return data;
 }
 
-test("成员状态：正在回答 > 熔断 / Key 全部冷却 > 最近回答了谁 > Key 数", () => {
+test("成员状态：正在回答 > 熔断 / Key 全部冷却 > 10 分钟内哪个 Agent 用过 > Key 数", () => {
   const data = withActivity();
-  assert.deepEqual(memberStatus(data, "glm"), { state: "answered", text: "回答了 {0}", args: ["Claude Code"] });
+  assert.deepEqual(memberStatus(data, "glm", 60_000), { state: "answered", text: "{0} 刚用过", args: ["Claude Code"] });
+  assert.equal(memberStatus(data, "glm", 11 * 60_000).state, "idle", "超过 10 分钟不再显示，回到 Key 数");
   assert.deepEqual(memberStatus(data, "deepseek"), { state: "idle", text: "{0} 个 Key", args: [2] });
   data.health.keys = [{ relayId: "deepseek", keyId: "key-1", state: "cooling", remainingMs: 35_000, lastFailure: "rate_limited" }];
   assert.deepEqual(memberStatus(data, "deepseek"), { state: "idle", text: "{0} 个 Key · {1} 个冷却中", args: [2, 1] });
@@ -207,6 +209,16 @@ test("上一个请求的路由说明：先列计划，再逐个尝试，最后�
   assert.deepEqual(lines[0].args, ["Claude Code", "claude-sonnet-5", "Daily", "DeepSeek/deepseek-v4-flash, GLM/glm-5.3"]);
   assert.deepEqual(lines[2].args, ["DeepSeek", "key-1", "被限流", " · HTTP 429"]);
   assert.deepEqual(lines[3].args, ["GLM", "glm-5.3", "1.2 s"]);
+});
+
+test("调度表的状态按模型：「刚用过」只标在真正被请求的模型上，冷却按整家供应商", () => {
+  const data = withActivity();
+  data.pool[1].models = ["glm-5.3", "glm-5.3-air"];
+  assert.deepEqual(dispatchStatus(data, "glm", "GLM-5.3", 60_000), { state: "answered", text: "{0} 刚用过", args: ["Claude Code"] });
+  assert.equal(dispatchStatus(data, "glm", "glm-5.3-air", 60_000), null, "同一家的其它模型不标");
+  assert.equal(dispatchStatus(data, "glm", "glm-5.3", 11 * 60_000), null, "超过 10 分钟不标");
+  data.health.providers = [{ relayId: "glm", breakerOpen: true, remainingMs: 30_000 } as GatewayPayload["health"]["providers"][number]];
+  assert.equal(dispatchStatus(data, "glm", "glm-5.3-air", 60_000)?.state, "cooling");
 });
 
 test("冷却剩余时间显示", () => {

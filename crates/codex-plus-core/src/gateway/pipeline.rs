@@ -155,6 +155,7 @@ async fn open_candidates(
         }
         let candidate = &prepared;
         let busy = recorder.begin(candidate);
+        let started = Instant::now();
         let native = request
             .anthropic
             .as_ref()
@@ -170,6 +171,13 @@ async fn open_candidates(
             Ok(Attempt::Success(upstream)) => {
                 recorder.step(candidate, "answered", None, upstream.status_code());
                 key_pool::record_success(&candidate.key, plan.conversation.as_deref());
+                crate::gateway::speed::record(
+                    &candidate.relay.id,
+                    &candidate.upstream_model,
+                    started.elapsed(),
+                );
+                crate::gateway::route::remember_answer(plan, candidate);
+                observe_quota(&candidate.relay.id, &upstream);
                 if let GatewayUpstream::Pipeline(response) = &upstream
                     && let Some(inner) = &response.request_trace
                 {
@@ -350,6 +358,28 @@ async fn attempt_pipeline(
         upstream: GatewayUpstream::Pipeline(response),
         class,
     })
+}
+
+/// ChatGPT 后端的响应头带着这个账号的额度，顺手记下（模型组「额度优先」、供应商池显示用）。
+fn observe_quota(relay_id: &str, upstream: &GatewayUpstream) {
+    let headers = match upstream {
+        GatewayUpstream::Pipeline(response) => {
+            response.response.as_ref().map(reqwest::Response::headers)
+        }
+        GatewayUpstream::Native(response) => {
+            response.response.as_ref().map(reqwest::Response::headers)
+        }
+        GatewayUpstream::Cooling(_) => None,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    if let Some(quota) =
+        headers.and_then(|headers| crate::gateway::quota::from_codex_headers(headers, now))
+    {
+        crate::gateway::quota::record(relay_id, quota);
+    }
 }
 
 /// 标识同一个对话的种子：客户端带的会话头，或请求里的缓存键，或按对话开头算的键。

@@ -2,11 +2,12 @@
 //!
 //! 可选开启，与「直连切换」并存：没开网关的 Agent 完全按原来的方式写配置文件。
 //! 开启后 Agent 的配置指向本地 helper 的 `/gw/<agent>/...`，请求在这里按绑定选上游，
-//! 复用 Codex 代理已有的协议转换、官方登录与请求日志，并支持多 Key 轮换与路由组。
+//! 复用 Codex 代理已有的协议转换、官方登录与请求日志，并支持多 Key 轮换与模型组。
 //!
 //! - [`store`]：`gateway.json`，各 Agent 的绑定；
 //! - [`route`]：绑定 → 模型 → 候选上游；
 //! - [`key_pool`]：多 Key 冷却与熔断；[`accounts`]：在网关里登录订阅账号；
+//! - [`quota`]：订阅账号的剩余额度；[`speed`]：各上游的响应速度（模型组「额度优先」「速度优先」用）；
 //! - [`activity`]：路由动态（最近一次请求怎么走的、计数），供界面实时展示；
 //! - [`model_sync`]：重新拉上游模型、补公开价格、定期检查新模型；
 //! - [`usage`]：按天汇总的用量统计；[`balance`]：供应商余额；[`sessions`]：各 Agent 的本地会话；
@@ -27,9 +28,11 @@ pub mod key_pool;
 pub mod model_sync;
 pub mod opencode;
 pub mod pipeline;
+pub mod quota;
 pub mod route;
 pub mod server;
 pub mod sessions;
+pub mod speed;
 pub mod store;
 pub mod usage;
 
