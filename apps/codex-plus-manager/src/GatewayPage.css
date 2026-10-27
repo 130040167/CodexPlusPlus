@@ -3032,3 +3032,24 @@ body.gw-sorting * {
 .shell .gw-detail-row.gw-detail-foot {
   grid-template-columns: auto minmax(0, 1fr);
 }
+
+/* Key 数量：钥匙图标 + 数字 */
+.shell .gw-key-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.shell .gw-key-count svg {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  opacity: 0.75;
+}
+
+.shell .gw-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}

@@ -29,7 +29,7 @@ import {
   type ProviderPrice,
   maskAccountName,
 } from "./gateway-model";
-import { AgentIcon, Avatar, Switch, type Notify, type Run } from "./gateway-ui";
+import { AgentIcon, Avatar, KeyCount, MemberStatusLabel, Switch, type Notify, type Run } from "./gateway-ui";
 import { ProviderFormDialog, type ProviderFormState } from "./ProviderFormDialog";
 import { ProviderExtrasDialog, priceSummary } from "./ProviderExtrasDialog";
 
@@ -256,7 +256,6 @@ function PoolRow({
   const status = memberStatus(payload, entry.id);
   const failures = (payload?.health.keys ?? []).filter((key) => key.relayId === entry.id && key.state !== "ok");
   const breaker = payload?.health.providers.some((item) => item.relayId === entry.id && item.breakerOpen);
-  const statusText = !enabled ? t("已关闭") : status.args.length ? tf(status.text, status.args) : t(status.text);
   const tone = !enabled ? "off" : status.state === "cooling" ? "error" : "on";
   const sub = (entry.account
     ? [t("订阅登录"), entry.lentToCodex ? t("Codex 正用它登录") : "", tf("{0} 个模型", [entry.models.length])]
@@ -294,7 +293,11 @@ function PoolRow({
           <strong>{maskAccountName(entry.name)}</strong>
           <small>{sub}</small>
         </div>
-        <span className="gw-pool-status"><i className="gw-dot" data-tone={tone} />{statusText}</span>
+        <span className="gw-pool-status">
+          <i className="gw-dot" data-tone={tone} />
+          {/* 订阅账号空闲时显示套餐，其它供应商显示 Key 数。 */}
+          {!enabled ? t("已关闭") : status.state === "idle" && entry.account && entry.plan ? entry.plan : <MemberStatusLabel status={status} />}
+        </span>
         <Switch
           disabled={busy !== null}
           label={tf("{0} 参与路由", [entry.name])}
@@ -315,9 +318,9 @@ function PoolRow({
             </div>
           </div>
           <div className="gw-detail-row">
-            <span className="gw-detail-label">Key</span>
+            <span className="gw-detail-label">{entry.account ? t("套餐") : "Key"}</span>
             <div className="gw-detail-value gw-chip-row">
-              <span>{entry.keyCount > 1 ? tf("{0} 个 Key 轮换", [entry.keyCount]) : tf("{0} 个 Key", [1])}</span>
+              {entry.account ? <span>{entry.plan || t("未知")}</span> : <KeyCount count={entry.keyCount} />}
               {failures.map((key) => (
                 <span className="gw-key-failure" key={key.keyId}>
                   {`${key.keyId}：${[t(failureLabel(key.lastFailure)) || t(key.state === "disabled" ? "已停用" : "冷却中"), formatRemaining(key.remainingMs)].filter(Boolean).join(" · ")}`}

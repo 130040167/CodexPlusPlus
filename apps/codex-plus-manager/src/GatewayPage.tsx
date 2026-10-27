@@ -35,7 +35,7 @@ import { AppSelect } from "./AppSelect";
 import { ProvidersView } from "./GatewayProviders";
 import { SessionsView } from "./GatewaySessions";
 import { UsageView } from "./GatewayUsage";
-import { AGENT_ICONS, APP_LOGO_URL, Avatar, SectionLabel, Switch, type Notify, type Run, AgentIcon } from "./gateway-ui";
+import { AGENT_ICONS, APP_LOGO_URL, Avatar, MemberStatusLabel, SectionLabel, Switch, type Notify, type Run, AgentIcon } from "./gateway-ui";
 import { TopbarActions } from "./TopbarActions";
 import "./GatewayPage.css";
 
@@ -51,10 +51,6 @@ const LIVE_REFRESH_MS = 2500;
 
 function hasPayload(result: GatewayResult): result is GatewayResult & GatewayPayload {
   return Boolean(result.gateway && Array.isArray(result.pool));
-}
-
-function statusText(status: MemberStatus): string {
-  return status.args.length ? tf(status.text, status.args) : t(status.text);
 }
 
 /**
@@ -555,7 +551,7 @@ function RouteDiagram({
             <Avatar name={member.name} size="sm" />
             <strong>{maskAccountName(member.name)}</strong>
             {member.model ? <code className="gw-chip">{member.model}</code> : null}
-            <span className="gw-status" data-state={member.status.state}>{statusText(member.status)}</span>
+            <span className="gw-status" data-state={member.status.state}><MemberStatusLabel status={member.status} /></span>
           </div>
         ))}
       </div>

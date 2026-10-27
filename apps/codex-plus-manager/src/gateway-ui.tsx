@@ -1,5 +1,8 @@
 /** 本地网关页各标签共用的小组件与类型。 */
 import type { CSSProperties, ReactNode } from "react";
+import { KeyRound } from "lucide-react";
+import { t, tf } from "./i18n";
+import type { MemberStatus } from "./gateway-model";
 import { BRAND_ICON_URLS } from "./provider-brand-icons";
 import { brandIconIsColor, brandIconKey } from "./provider-brands";
 import { providerAvatarText } from "./provider-name";
@@ -96,4 +99,28 @@ export function saveFavorites(models: string[]) {
   } catch {
     // 存不了就只在本次会话里生效。
   }
+}
+
+/** Key 数量：钥匙图标 + 数字。 */
+export function KeyCount({ count }: { count: number }) {
+  return (
+    <span className="gw-key-count" title={tf("{0} 个 Key", [count])}>
+      <KeyRound aria-hidden="true" />
+      {count}
+    </span>
+  );
+}
+
+/** 供应商状态：空闲时只显示 Key 数（图标 + 数字），其它状态显示文字。 */
+export function MemberStatusLabel({ status }: { status: MemberStatus }) {
+  if (status.text === "{0} 个 Key") return <KeyCount count={Number(status.args[0])} />;
+  if (status.text === "{0} 个 Key · {1} 个冷却中") {
+    return (
+      <>
+        <KeyCount count={Number(status.args[0])} />
+        {tf("{0} 个冷却中", [status.args[1]])}
+      </>
+    );
+  }
+  return <>{status.args.length ? tf(status.text, status.args) : t(status.text)}</>;
 }

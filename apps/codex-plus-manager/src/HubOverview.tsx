@@ -14,7 +14,7 @@ import {
   type UsageSummary,
 } from "./gateway-model";
 import { hubAgents, hubFeed, hubLinks, hubProviders, hubTotals, successRate, type CodexSummary, type HubFeedItem, type HubLink } from "./hub-overview-model";
-import { AGENT_ICONS, APP_LOGO_URL, Avatar } from "./gateway-ui";
+import { AGENT_ICONS, APP_LOGO_URL, Avatar, KeyCount, MemberStatusLabel } from "./gateway-ui";
 import "./HubOverview.css";
 
 const LIVE_REFRESH_MS = 3000;
@@ -163,9 +163,7 @@ export function HubOverview({
                     {provider.status.state === "cooling" ? <i className="hub-dot" data-tone="warn" /> : null}
                   </strong>
                   <small data-state={provider.status.state}>
-                    {provider.status.state === "idle"
-                      ? tf("{0} 个 Key", [provider.keyCount])
-                      : provider.status.args.length ? tf(provider.status.text, provider.status.args) : t(provider.status.text)}
+                    {provider.status.state === "idle" ? <KeyCount count={provider.keyCount} /> : <MemberStatusLabel status={provider.status} />}
                   </small>
                 </span>
                 {provider.calls !== null ? <span className="hub-node-num">{provider.calls}</span> : null}

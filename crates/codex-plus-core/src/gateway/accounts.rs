@@ -499,6 +499,8 @@ pub struct CopilotToken {
     pub token: String,
     pub expires_at_ms: u64,
     pub api_base: String,
+    /// 订阅档位（GitHub 返回的 `sku`，如 `free_limited_copilot`、`plus_monthly_subscriber_quota`），没有时为空。
+    pub sku: String,
 }
 
 pub fn parse_copilot_token(value: &Value) -> anyhow::Result<CopilotToken> {
@@ -520,6 +522,11 @@ pub fn parse_copilot_token(value: &Value) -> anyhow::Result<CopilotToken> {
         token,
         expires_at_ms: value.get("expires_at").and_then(Value::as_u64).unwrap_or(0) * 1000,
         api_base,
+        sku: value
+            .get("sku")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
     })
 }
 
@@ -638,6 +645,7 @@ pub fn copilot_relay(
         "copilot_token": token.token,
         "expires_at_ms": token.expires_at_ms,
         "api_base": token.api_base,
+        "sku": token.sku,
     });
     RelayProfile {
         name: if login.is_empty() {
@@ -1535,6 +1543,79 @@ fn now_ms() -> u64 {
 }
 
 /// 账号类供应商的类型（`copilot` / `grok` / `chatgpt-api`）；普通供应商为 None。
+/// 订阅账号的套餐，如「ChatGPT Pro」「Copilot Pro+」「SuperGrok」；不是订阅账号或读不出来时为空。
+/// 只读登录时存下的凭据，不发请求。
+pub fn account_plan(relay: &RelayProfile) -> String {
+    if crate::official_login::member_uses_official_login_transport(relay) {
+        let value: Value = serde_json::from_str(&relay.auth_contents).unwrap_or(Value::Null);
+        let id_token = value
+            .pointer("/tokens/id_token")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let plan = jwt_claims(id_token)
+            .pointer("/https:~1~1api.openai.com~1auth/chatgpt_plan_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        return with_plan("ChatGPT", &plan);
+    }
+    let Some((kind, value)) = account_kind(relay) else {
+        return String::new();
+    };
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    match kind.as_str() {
+        "chatgpt-api" => with_plan("ChatGPT", &text("plan")),
+        "copilot" => copilot_plan_label(&text("sku"), &text("api_base")),
+        "grok" => "SuperGrok".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// `pro` → 「ChatGPT Pro」；没有套餐时只写产品名。
+fn with_plan(product: &str, plan: &str) -> String {
+    let plan = plan.trim();
+    if plan.is_empty() {
+        return product.to_string();
+    }
+    let mut chars = plan.chars();
+    let first = chars
+        .next()
+        .map(|c| c.to_uppercase().collect::<String>())
+        .unwrap_or_default();
+    format!("{product} {first}{}", chars.as_str())
+}
+
+/// Copilot 的 `sku` → 套餐名。旧账号没存 `sku` 时按 API 地址（individual / business / enterprise）推断。
+pub fn copilot_plan_label(sku: &str, api_base: &str) -> String {
+    let sku = sku.to_ascii_lowercase();
+    let label = if sku.contains("enterprise") {
+        "Copilot Enterprise"
+    } else if sku.contains("business") {
+        "Copilot Business"
+    } else if sku.contains("plus") {
+        "Copilot Pro+"
+    } else if sku.contains("educational") {
+        "Copilot Pro"
+    } else if sku.contains("free") {
+        "Copilot Free"
+    } else if !sku.is_empty() {
+        "Copilot Pro"
+    } else if api_base.contains(".enterprise.") {
+        "Copilot Enterprise"
+    } else if api_base.contains(".business.") {
+        "Copilot Business"
+    } else {
+        "Copilot"
+    };
+    label.to_string()
+}
+
 pub fn relay_account_kind(relay: &RelayProfile) -> Option<String> {
     account_kind(relay).map(|(kind, _)| kind)
 }
@@ -1615,6 +1696,9 @@ async fn prepare_copilot(relay: &RelayProfile, value: &Value) -> anyhow::Result<
     auth["copilot_token"] = json!(token.token);
     auth["expires_at_ms"] = json!(token.expires_at_ms);
     auth["api_base"] = json!(token.api_base);
+    if !token.sku.is_empty() {
+        auth["sku"] = json!(token.sku);
+    }
     updated.auth_contents = auth.to_string();
     updated.api_key = token.token.clone();
     updated.base_url = format!("{}#", token.api_base);
@@ -1796,6 +1880,7 @@ mod tests {
     #[tokio::test]
     async fn fresh_copilot_tokens_are_used_as_is() {
         let token = CopilotToken {
+            sku: String::new(),
             token: "fresh".to_string(),
             expires_at_ms: now_ms() + 3_600_000,
             api_base: "https://api.githubcopilot.com".to_string(),
@@ -1959,5 +2044,49 @@ mod tests {
             merge_siwc_models(&json!({ "data": [{ "id": "gpt-5.5" }] }), &Value::Null),
             vec!["gpt-5.5"]
         );
+    }
+
+    #[test]
+    fn account_plan_reads_stored_credentials() {
+        let copilot = |sku: &str, api: &str| copilot_plan_label(sku, api);
+        assert_eq!(copilot("free_limited_copilot", ""), "Copilot Free");
+        assert_eq!(copilot("plus_monthly_subscriber_quota", ""), "Copilot Pro+");
+        assert_eq!(copilot("monthly_subscriber_quota", ""), "Copilot Pro");
+        assert_eq!(copilot("free_educational_quota", ""), "Copilot Pro");
+        assert_eq!(
+            copilot("copilot_for_business_seat_quota", ""),
+            "Copilot Business"
+        );
+        assert_eq!(
+            copilot("", "https://api.enterprise.githubcopilot.com"),
+            "Copilot Enterprise"
+        );
+        assert_eq!(
+            copilot("", "https://api.individual.githubcopilot.com"),
+            "Copilot"
+        );
+
+        let grok = grok_relay(
+            &GrokTokens {
+                access_token: "a".into(),
+                refresh_token: "r".into(),
+                expires_at_ms: 0,
+                email: "g@x.ai".into(),
+            },
+            &[],
+        );
+        assert_eq!(account_plan(&grok), "SuperGrok");
+
+        let account = account_from_tokens(&json!({
+            "access_token": "a",
+            "refresh_token": "r",
+            "id_token": jwt(json!({
+                "email": "me@example.com",
+                "https://api.openai.com/auth": { "chatgpt_account_id": "acc", "chatgpt_plan_type": "pro" }
+            })),
+        }))
+        .unwrap();
+        assert_eq!(account_plan(&chatgpt_relay(&account, &[])), "ChatGPT Pro");
+        assert_eq!(account_plan(&RelayProfile::default()), "");
     }
 }

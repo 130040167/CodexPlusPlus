@@ -1093,6 +1093,7 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "套餐": "Plan",
   "每百万 token，按模型计": "Per 1M tokens, per model",
   "留空的模型用「其它模型」那一行；都不填就不估算费用。": "Blank models use the Other models row; leave all blank to skip cost estimates.",
   "其它模型": "Other models",
@@ -2309,6 +2310,7 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "{0} 个冷却中": "{0} cooling",
   "{0} / {1} 个模型": "{0} / {1} models",
   "所有模型 · 输入 {0} · 缓存 {1} · 输出 {2}": "All models \u00b7 input {0} \u00b7 cached {1} \u00b7 output {2}",
   "models.dev 里找到 {0} / {1} 个模型的价格（美元），其余需要的话手动填写。": "Found prices for {0} / {1} models on models.dev (USD); fill in the rest manually if needed.",

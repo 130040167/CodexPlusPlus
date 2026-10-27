@@ -37,6 +37,8 @@ pub struct GatewayPoolEntry {
         std::collections::BTreeMap<String, codex_plus_core::gateway::store::ProviderPrice>,
     /// 登录得到的账号：`chatgpt` / `copilot` / `grok`；普通供应商为空。
     pub account: String,
+    /// 订阅账号的套餐（如「ChatGPT Pro」「Copilot Pro+」）；普通供应商为空。
+    pub plan: String,
     /// 这个 ChatGPT 账号正借给 Codex 登录（Codex 以官方身份接入网关）。
     pub lent_to_codex: bool,
     /// 网关供应商单独走的 HTTP 代理（空串表示不单独走代理）。
@@ -130,6 +132,7 @@ fn pool_entry(
         price,
         model_prices,
         account: account_kind(relay),
+        plan: codex_plus_core::gateway::accounts::account_plan(relay),
         lent_to_codex: codex_plus_core::official_login::is_lent_to_codex(relay),
         proxy: relay.gateway_proxy.clone().unwrap_or_default(),
     }
