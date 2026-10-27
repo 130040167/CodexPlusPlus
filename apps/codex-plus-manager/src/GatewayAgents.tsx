@@ -2,7 +2,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { appConfirm } from "./app-dialog";
-import { Check, ChevronDown, ChevronRight, ChevronUp, LayoutGrid, List, Search, Star, Unplug, Waypoints } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, ChevronUp, List, Search, Star, Unplug, Waypoints } from "lucide-react";
 import { t, tf } from "./i18n";
 import {
   agentModels,
@@ -480,73 +480,78 @@ export function ModelList({
   };
   const isSelected = (item: PickerItem) => Boolean(selectedModel) && item.model.toLowerCase() === selectedModel.toLowerCase();
 
+  const filters = pickerSections(payload, "", avatarOf, exclude, skipGroup).filter((section) => section.key !== "custom");
+  const total = sections.reduce((sum, section) => sum + section.items.length, 0);
+
+  // 排版：搜索 + 一排横向筛选在上；列表每个模型两行（模型名 / 供应商）；「默认」「断开」这类操作在底部。
   return (
-    <>
-      <label className="gw-popover-search">
-        <Search className="h-4 w-4" />
-        <input autoFocus onChange={(event) => setQuery(event.currentTarget.value)} placeholder={t("筛选，或输入任意模型 ID…")} value={query} />
-      </label>
-      <div className="gw-popover-body">
-        <div className="gw-popover-rail">
-          <button aria-label={t("全部")} data-active={!favoritesOnly} onClick={() => { setFavoritesOnly(false); setQuery(""); if (listRef.current) listRef.current.scrollTop = 0; }} type="button">
-            <LayoutGrid className="h-4 w-4" />
-          </button>
-          <button aria-label={t("收藏")} data-active={favoritesOnly} onClick={() => setFavoritesOnly(!favoritesOnly)} type="button">
-            <Star className="h-4 w-4" />
-          </button>
-          <span className="gw-rail-divider" />
-          {pickerSections(payload, "", avatarOf, exclude, skipGroup).filter((section) => section.key !== "custom").map((section) => (
-            <button aria-label={section.title} key={section.key} onClick={() => jump(section.key)} title={section.key === "group" ? t("路由组") : section.title} type="button">
-              {section.key === "group" ? <Waypoints className="h-4 w-4" /> : <Avatar name={section.title} size="sm" />}
+    <div className="gw-mp">
+      <div className="gw-mp-top">
+        <label className="gw-mp-search">
+          <Search className="h-4 w-4" />
+          <input autoFocus onChange={(event) => setQuery(event.currentTarget.value)} placeholder={t("筛选，或输入任意模型 ID…")} value={query} />
+          <em>{tf("{0} 个", [total])}</em>
+        </label>
+        <div className="gw-mp-filters">
+          <button data-active={!favoritesOnly} onClick={() => { setFavoritesOnly(false); setQuery(""); if (listRef.current) listRef.current.scrollTop = 0; }} type="button">{t("全部")}</button>
+          <button data-active={favoritesOnly} onClick={() => setFavoritesOnly(!favoritesOnly)} type="button"><Star className="h-3 w-3" />{t("收藏")}</button>
+          {filters.map((section) => (
+            <button key={section.key} onClick={() => jump(section.key)} title={section.key === "group" ? t("路由组") : section.title} type="button">
+              {section.key === "group" ? <Waypoints className="h-3 w-3" /> : <Avatar name={section.title} size="sm" />}
+              <span>{section.key === "group" ? t("路由组") : section.title.split(" · ")[0]}</span>
             </button>
           ))}
         </div>
-        <div className="gw-popover-list" ref={listRef}>
-          {!favoritesOnly && !query ? head : null}
-          {sections.length === 0 ? (
-            <div className="gw-empty">
-              {favoritesOnly ? t("还没有收藏的模型，点模型右侧的星标收藏。") : payload?.pool.length ? t("没有匹配的模型") : t("供应商池是空的，先到「供应商」里添加。")}
-            </div>
-          ) : null}
-          {sections.map((section) => (
-            <div data-section={section.key} key={section.key}>
-              <div className="gw-popover-heading">{section.key === "group" || section.key === "custom" ? t(section.title) : section.title}</div>
-              {section.items.map((item) => {
-                const selected = isSelected(item);
-                const favorite = favorites.includes(item.model);
-                return (
-                  <div
-                    aria-selected={selected}
-                    className="gw-popover-item"
-                    data-selected={selected}
-                    key={item.model}
-                    onClick={() => onPick(item)}
-                    onKeyDown={(event) => { if (event.key === "Enter") onPick(item); }}
-                    role="option"
-                    tabIndex={0}
-                  >
-                    {section.key === "group" ? <Waypoints className="gw-picker-glyph h-4 w-4" /> : <Avatar name={item.sub} size="sm" />}
-                    <span className="gw-popover-item-label">{item.label}</span>
-                    <span className="gw-via">{item.custom ? t("自定义") : t("经 Codex++")}</span>
-                    <small>{item.sub}</small>
-                    <button
-                      aria-label={favorite ? t("取消收藏") : t("收藏")}
-                      className="gw-star"
-                      data-on={favorite}
-                      onClick={(event) => { event.stopPropagation(); toggleFavorite(item.model); }}
-                      type="button"
-                    >
-                      <Star className="h-3.5 w-3.5" />
-                    </button>
-                    {selected ? <Check className="gw-popover-check h-4 w-4" /> : <span className="gw-popover-check" />}
-                  </div>
-                );
-              })}
-            </div>
-          ))}
-        </div>
       </div>
-    </>
+      <div className="gw-mp-list" ref={listRef}>
+        {sections.length === 0 ? (
+          <div className="gw-empty">
+            {favoritesOnly ? t("还没有收藏的模型，点模型右侧的星标收藏。") : payload?.pool.length ? t("没有匹配的模型") : t("供应商池是空的，先到「供应商」里添加。")}
+          </div>
+        ) : null}
+        {sections.map((section) => (
+          <section className="gw-mp-section" data-section={section.key} key={section.key}>
+            <div className="gw-mp-heading">
+              {section.key === "group" ? <Waypoints className="h-3.5 w-3.5" /> : section.key === "custom" ? null : <Avatar name={section.title} size="sm" />}
+              <span>{section.key === "group" || section.key === "custom" ? t(section.title) : section.title}</span>
+              <em>{section.items.length}</em>
+            </div>
+            {section.items.map((item) => {
+              const selected = isSelected(item);
+              const favorite = favorites.includes(item.model);
+              return (
+                <div
+                  aria-selected={selected}
+                  className="gw-mp-item"
+                  data-selected={selected}
+                  key={item.model}
+                  onClick={() => onPick(item)}
+                  onKeyDown={(event) => { if (event.key === "Enter") onPick(item); }}
+                  role="option"
+                  tabIndex={0}
+                >
+                  <span className="gw-mp-text">
+                    <code>{item.label}</code>
+                    {item.custom ? <small>{t("自定义模型 ID")}</small> : item.sub && item.sub !== section.title ? <small>{item.sub}</small> : null}
+                  </span>
+                  <button
+                    aria-label={favorite ? t("取消收藏") : t("收藏")}
+                    className="gw-mp-star"
+                    data-on={favorite}
+                    onClick={(event) => { event.stopPropagation(); toggleFavorite(item.model); }}
+                    type="button"
+                  >
+                    <Star className="h-3.5 w-3.5" />
+                  </button>
+                  {selected ? <Check className="gw-mp-check h-4 w-4" /> : null}
+                </div>
+              );
+            })}
+          </section>
+        ))}
+      </div>
+      {head ? <div className="gw-mp-foot">{head}</div> : null}
+    </div>
   );
 }
 
@@ -576,20 +581,16 @@ function ModelPicker({
   const selectedModel = connected || draft.model ? draft.model.trim() || agentModels(payload, draft.poolExclude)[0] || "" : "";
   const head = (
     <>
-      <div className="gw-popover-item" data-selected={!connected} onClick={onDisconnect} role="option" aria-selected={!connected} tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter") onDisconnect(); }}>
+      <button className="gw-mp-action" data-active={!connected} onClick={onDisconnect} title={tf("{0} 自带的默认值", [agent.name])} type="button">
         <AgentIcon agent={agent.agent} className="gw-popover-agent" />
-        <span className="gw-popover-item-label">{t("默认")}</span>
-        <span className="gw-via gw-via-off">{t("不经 Codex++")}</span>
-        <small>{tf("{0} 自带的默认值", [agent.name])}</small>
-        <span className="gw-star" />
-        {!connected ? <Check className="gw-popover-check h-4 w-4" /> : <span className="gw-popover-check" />}
-      </div>
+        {t("用默认（不经 Codex++）")}
+        {!connected ? <Check className="h-3.5 w-3.5" /> : null}
+      </button>
       {connected ? (
-        <div className="gw-popover-item" onClick={onDisconnect} role="option" aria-selected={false} tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter") onDisconnect(); }}>
-          <Unplug className="gw-picker-glyph h-4 w-4" />
-          <span className="gw-popover-item-label">{t("断开 Codex++（还原配置）")}</span>
-          <small>{tf("还原 {0} 接入 Codex++ 之前的设置", [agent.name])}</small>
-        </div>
+        <button className="gw-mp-action" onClick={onDisconnect} title={tf("还原 {0} 接入 Codex++ 之前的设置", [agent.name])} type="button">
+          <Unplug className="h-3.5 w-3.5" />
+          {t("断开并还原配置")}
+        </button>
       ) : null}
     </>
   );
@@ -637,13 +638,11 @@ function TierPicker({
   const buttonRef = useRef<HTMLButtonElement>(null);
   const display = value ? modelDisplay(payload, value, exclude) : null;
   const head = (
-    <div className="gw-popover-item" data-selected={!value} onClick={() => { setOpen(false); onPick(""); }} role="option" aria-selected={!value} tabIndex={0} onKeyDown={(event) => { if (event.key === "Enter") { setOpen(false); onPick(""); } }}>
-      <span className="gw-picker-glyph gw-tier-default">=</span>
-      <span className="gw-popover-item-label">{t("同默认模型")}</span>
-      <small>{t("跟随这一行选的模型")}</small>
-      <span className="gw-star" />
-      {!value ? <Check className="gw-popover-check h-4 w-4" /> : <span className="gw-popover-check" />}
-    </div>
+    <button className="gw-mp-action" data-active={!value} onClick={() => { setOpen(false); onPick(""); }} title={t("跟随这一行选的模型")} type="button">
+      <span className="gw-tier-default">=</span>
+      {t("同默认模型")}
+      {!value ? <Check className="h-3.5 w-3.5" /> : null}
+    </button>
   );
   return (
     <>

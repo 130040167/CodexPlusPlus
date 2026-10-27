@@ -1,7 +1,7 @@
 /** 托盘快捷面板：各 Agent 当前用的模型（可直接切换）、最近的请求、打开主窗口 / 退出。 */
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ChevronDown, ExternalLink, RefreshCw, Waypoints } from "lucide-react";
+import { Check, ChevronDown, ExternalLink, RefreshCw, Waypoints } from "lucide-react";
 import { t, tf } from "./i18n";
 import { ModelList, Floating } from "./GatewayAgents";
 import {
@@ -175,22 +175,20 @@ function PanelAgentRow({
   const draft = draftFromBinding(binding);
   const display = modelDisplay(payload, draft.model, draft.poolExclude);
   const head = (
-    <div
-      aria-selected={!agent.enabled}
-      className="gw-popover-item"
-      data-selected={!agent.enabled}
+    <button
+      className="gw-mp-action"
+      data-active={!agent.enabled}
       onClick={() => {
         setOpen(false);
         if (agent.enabled) void onRun("disable_gateway_binding", { agent: agent.agent });
       }}
-      role="option"
-      tabIndex={0}
+      title={tf("{0} 自带的默认值", [agent.name])}
+      type="button"
     >
       <AgentIcon agent={agent.agent} className="gw-popover-agent" />
-      <span className="gw-popover-item-label">{t("默认")}</span>
-      <span className="gw-via gw-via-off">{t("不经 Codex++")}</span>
-      <small>{tf("{0} 自带的默认值", [agent.name])}</small>
-    </div>
+      {t("用默认（不经 Codex++）")}
+      {!agent.enabled ? <Check className="h-3.5 w-3.5" /> : null}
+    </button>
   );
   return (
     <div className="tray-agent-row">
