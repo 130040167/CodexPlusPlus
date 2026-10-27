@@ -514,6 +514,7 @@ mod tests {
                 model_list: models.to_string(),
                 ..RelayProfile::default()
             },
+            extra: Default::default(),
         }
     }
 
@@ -531,6 +532,7 @@ mod tests {
             mode,
             sticky: GroupSticky::Cache,
             members,
+            extra: Default::default(),
         }
     }
 

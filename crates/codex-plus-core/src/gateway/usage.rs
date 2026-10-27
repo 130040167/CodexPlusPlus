@@ -19,6 +19,7 @@ const USAGE_FILE: &str = "gateway-usage.json";
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageCounts {
+    #[serde(default)]
     pub calls: u64,
     #[serde(default)]
     pub errors: u64,
@@ -62,6 +63,9 @@ pub struct UsageRow {
     pub model: String,
     #[serde(flatten)]
     pub counts: UsageCounts,
+    /// 不认识的字段（更新版本加的统计项）原样保留：回滚后这一版继续累加时不把它们丢掉。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +76,9 @@ struct UsageFile {
     /// `YYYY-MM-DD`（本地日期）→ 当天各组合的累计。
     #[serde(default)]
     days: BTreeMap<String, Vec<UsageRow>>,
+    /// 不认识的顶层字段原样保留。
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -363,6 +370,7 @@ pub fn record_entry_in(store: &UsageStore, entry: &RequestLogEntry) -> anyhow::R
             duration_ms: entry.duration_ms,
             timed_calls: u64::from(entry.duration_ms > 0),
         },
+        extra: Default::default(),
     };
     let timestamp = if entry.timestamp_ms > 0 {
         entry.timestamp_ms
@@ -466,6 +474,7 @@ mod tests {
                 id: "ds".to_string(),
                 ..RelayProfile::default()
             },
+            extra: Default::default(),
         });
         let summary = store.summary(&day, Some(7), &gateway).unwrap();
         assert_eq!(summary.days.len(), 7);
@@ -506,5 +515,29 @@ mod tests {
         assert_eq!(all.days.len(), 1);
         store.clear().unwrap();
         assert_eq!(store.summary(&day, None, &gateway).unwrap().totals.calls, 0);
+    }
+
+    /// 更新版本加的统计项、顶层字段：这一版继续记账时原样保留。
+    #[test]
+    fn unknown_fields_survive_recording() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = UsageStore::at(temp.path().join("gateway-usage.json"));
+        let day = local_day(1_790_000_000_000);
+        let text = serde_json::json!({
+            "version": 9,
+            "futureTop": "keep",
+            "days": { day.clone(): [{
+                "agent": "claude", "providerId": "ds", "provider": "DS",
+                "model": "deepseek-v4-pro", "calls": 2, "cacheWriteTokens": 77
+            }]}
+        });
+        std::fs::write(&store.path, text.to_string()).unwrap();
+        record_entry_in(&store, &entry(Some("claude"), "ds", 10, 5, 0)).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&store.path).unwrap()).unwrap();
+        assert_eq!(saved["futureTop"], "keep");
+        let row = &saved["days"][&day][0];
+        assert_eq!(row["calls"], 3);
+        assert_eq!(row["cacheWriteTokens"], 77);
     }
 }

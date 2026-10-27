@@ -343,6 +343,7 @@ mod tests {
                 model_list: "a\nx".into(),
                 ..RelayProfile::default()
             },
+            extra: Default::default(),
         });
         store.save(&gateway).unwrap();
 

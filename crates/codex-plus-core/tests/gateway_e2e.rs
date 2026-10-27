@@ -145,6 +145,7 @@ fn providers(relays: Vec<RelayProfile>) -> Vec<GatewayProvider> {
             upstream_gone: Vec::new(),
             models_checked_at_ms: 0,
             relay,
+            extra: Default::default(),
         })
         .collect()
 }
@@ -534,6 +535,7 @@ async fn gateway_end_to_end() {
                 weight: 1,
             },
         ],
+        extra: Default::default(),
     }];
     gateway
         .bindings

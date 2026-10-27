@@ -9,13 +9,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value};
 
 use crate::settings::RelayProfile;
 use crate::tools::ToolId;
 
 const STORE_FILE: &str = "gateway.json";
-const STORE_VERSION: u32 = 1;
+/// 2：`restore_on_exit` 默认改为开启（见 [`read_store`] 里的迁移）。
+const STORE_VERSION: u32 = 2;
 /// 客户端 token 前缀；日志里看到它就知道是网关签发的本地凭据，不是上游 Key。
 pub const CLIENT_TOKEN_PREFIX: &str = "cpx-gw-";
 
@@ -53,6 +56,9 @@ pub struct GatewayProvider {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub models_checked_at_ms: u64,
     pub relay: RelayProfile,
+    /// 不认识的字段（更新版本写的）原样保留，保存时写回，回滚后再升级不丢数据。
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -91,6 +97,20 @@ pub struct ProviderPrice {
 
 fn enabled_by_default() -> bool {
     true
+}
+
+/// 宽松读取枚举：认不出的取值（更新版本加的新选项）按默认值处理，不让整份 gateway.json 读失败。
+/// 原值在保存时由 [`preserve_raw_unknowns`] 写回，不会被默认值覆盖掉。
+///
+/// 没有用 `#[serde(other)]` 兜底变体：新增变体会让各处按枚举穷举的 `match` 都要改，
+/// 而且写回时只能写成兜底变体的名字，原值还是丢了。
+fn lenient<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned + Default,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 /// 路由组的成员怎么排先后。
@@ -143,12 +163,15 @@ fn default_weight() -> u32 {
 pub struct GatewayGroup {
     pub id: String,
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub mode: GroupMode,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub sticky: GroupSticky,
     #[serde(default)]
     pub members: Vec<GroupMember>,
+    /// 不认识的字段原样保留。
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 impl GatewayGroup {
@@ -181,6 +204,9 @@ pub struct ClaudeRoleModels {
     pub haiku: String,
     #[serde(default)]
     pub subagent: String,
+    /// 不认识的字段原样保留。
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// 开启网关前的现场，关闭时据此恢复。
@@ -196,6 +222,9 @@ pub struct GatewayRestoreState {
     /// 写进各 Agent 配置时用的网关端口；端口变化后要重写。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_port: Option<u16>,
+    /// 不认识的字段原样保留。
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// 一个 Agent 的网关绑定。
@@ -213,7 +242,7 @@ pub struct AgentBinding {
     pub extra_models: Vec<String>,
     #[serde(default)]
     pub claude_roles: ClaudeRoleModels,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub unknown_model: UnknownModelPolicy,
     /// 写给 Agent 的上下文窗口（Claude Code 的 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,6 +261,9 @@ pub struct AgentBinding {
     pub token: String,
     #[serde(default)]
     pub restore: GatewayRestoreState,
+    /// 不认识的字段原样保留。
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 impl Default for AgentBinding {
@@ -248,6 +280,7 @@ impl Default for AgentBinding {
             auto_join_providers: true,
             token: String::new(),
             restore: GatewayRestoreState::default(),
+            extra: Map::new(),
         }
     }
 }
@@ -290,8 +323,11 @@ pub enum KeyRotationMode {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyPolicy {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub mode: KeyRotationMode,
+    /// 不认识的字段原样保留。
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -305,8 +341,15 @@ pub struct GatewaySettings {
     #[serde(default)]
     pub key_policy: KeyPolicy,
     /// 退出 Codex++ 时把走网关的 Agent 恢复成直连，避免网关不在时连不上。
-    #[serde(default)]
+    ///
+    /// 默认开：网关跟着 Codex++ 一起退出，不恢复的话 Agent 全都连不上；降级到不认识网关的旧版时同理。
+    /// 旧文件（version < 2）里的 `false` 多半是当年的默认值、不是用户选的，读的时候统一迁移成开，
+    /// 见 [`read_store`]。
+    #[serde(default = "enabled_by_default")]
     pub restore_on_exit: bool,
+    /// 退出或安装更新前已经把开着的 Agent 恢复成直连（绑定仍是开启）：下次启动要重新接回网关。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub restored_at_exit: bool,
     /// 网关的供应商池（顺序即同一模型多家时的尝试顺序）。
     #[serde(default)]
     pub providers: Vec<GatewayProvider>,
@@ -316,6 +359,16 @@ pub struct GatewaySettings {
     /// 左键点托盘图标弹出快捷面板（默认开）；关掉时托盘保持原来的点击行为。
     #[serde(default = "enabled_by_default")]
     pub tray_panel: bool,
+    /// 最后写这个文件的 Codex++ 版本。降级到旧版时旧版不会跑这里的代码，只留个记录方便排查。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app_version: String,
+    /// 不认识的字段（更新版本写的）原样保留，保存时写回。
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Default for GatewaySettings {
@@ -324,10 +377,13 @@ impl Default for GatewaySettings {
             version: 0,
             bindings: BTreeMap::new(),
             key_policy: KeyPolicy::default(),
-            restore_on_exit: false,
+            restore_on_exit: true,
+            restored_at_exit: false,
             providers: Vec::new(),
             groups: Vec::new(),
             tray_panel: true,
+            app_version: String::new(),
+            extra: Map::new(),
         }
     }
 }
@@ -429,6 +485,12 @@ fn read_store(path: &Path) -> anyhow::Result<GatewaySettings> {
     }
     let mut settings: GatewaySettings =
         serde_json::from_str(&text).with_context(|| format!("无法解析 {}", path.display()))?;
+    // 版本 1 及更早的文件里 `restoreOnExit` 总会写出来，默认值 false 与用户主动关掉的分不开。
+    // 不恢复的后果是退出或降级后 Agent 全部连不上，所以整体迁移成开；用户真想关，再关一次即可
+    // （之后的文件是版本 2，不再迁移）。
+    if settings.version < 2 {
+        settings.restore_on_exit = true;
+    }
     // 地址、默认模型、Key 落盘时存在 config / auth 文本里，读回来要像 settings.json 一样还原出来。
     for provider in &mut settings.providers {
         let mut normalized = provider.relay.clone();
@@ -444,8 +506,17 @@ fn read_store(path: &Path) -> anyhow::Result<GatewaySettings> {
 fn write_store(path: &Path, settings: &GatewaySettings) -> anyhow::Result<()> {
     let mut settings = settings.clone();
     settings.version = STORE_VERSION;
+    settings.app_version = crate::version::VERSION.to_string();
     let existed = path.is_file();
-    let mut text = serde_json::to_string_pretty(&settings)?;
+    let mut value = serde_json::to_value(&settings)?;
+    // 磁盘上原有的、这一版不认识的取值（供应商配置里的新字段、枚举的新选项）照原样带回去。
+    if let Some(old) = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    {
+        preserve_raw_unknowns(&mut value, &old);
+    }
+    let mut text = serde_json::to_string_pretty(&value)?;
     text.push('\n');
     crate::settings::atomic_write(path, text.as_bytes())
         .with_context(|| format!("无法写入 {}", path.display()))?;
@@ -454,6 +525,89 @@ fn write_store(path: &Path, settings: &GatewaySettings) -> anyhow::Result<()> {
         set_private(path)?;
     }
     Ok(())
+}
+
+/// 结构体自己的未知字段由 `extra` 保留；这里补上两类 `extra` 管不到的：
+/// - 供应商的 `relay`（[`RelayProfile`]，与直连模式共用的结构）里不认识的字段；
+/// - 枚举字段里不认识的取值：读的时候按默认值处理了，只要还是默认值（用户没改过）就写回原值。
+fn preserve_raw_unknowns(new: &mut Value, old: &Value) {
+    // 供应商：按 `relay.id` 对上。
+    let old_providers = old.get("providers").and_then(Value::as_array);
+    if let (Some(providers), Some(old_providers)) = (
+        new.get_mut("providers").and_then(Value::as_array_mut),
+        old_providers,
+    ) {
+        for provider in providers {
+            let Some(id) = provider.pointer("/relay/id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(old_relay) = old_providers
+                .iter()
+                .find(|old| old.pointer("/relay/id").and_then(Value::as_str) == Some(id))
+                .and_then(|old| old.get("relay"))
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            let Some(relay) = provider.get_mut("relay").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            for (key, value) in old_relay {
+                if !relay.contains_key(key)
+                    && !crate::settings::RELAY_PROFILE_KNOWN_FIELDS.contains(&key.as_str())
+                {
+                    relay.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+    // 模型组：按 `id` 对上。
+    let old_groups = old.get("groups").and_then(Value::as_array);
+    if let (Some(groups), Some(old_groups)) = (
+        new.get_mut("groups").and_then(Value::as_array_mut),
+        old_groups,
+    ) {
+        for group in groups {
+            let id = group.get("id").cloned();
+            let Some(old_group) = old_groups.iter().find(|old| old.get("id") == id.as_ref()) else {
+                continue;
+            };
+            keep_unknown_enum::<GroupMode>(group, old_group, "mode");
+            keep_unknown_enum::<GroupSticky>(group, old_group, "sticky");
+        }
+    }
+    if let (Some(bindings), Some(old_bindings)) = (
+        new.get_mut("bindings").and_then(Value::as_object_mut),
+        old.get("bindings").and_then(Value::as_object),
+    ) {
+        for (agent, binding) in bindings {
+            if let Some(old_binding) = old_bindings.get(agent) {
+                keep_unknown_enum::<UnknownModelPolicy>(binding, old_binding, "unknownModel");
+            }
+        }
+    }
+    if let (Some(policy), Some(old_policy)) = (new.get_mut("keyPolicy"), old.get("keyPolicy")) {
+        keep_unknown_enum::<KeyRotationMode>(policy, old_policy, "mode");
+    }
+}
+
+/// `old[key]` 是这一版认不出的取值、`new[key]` 还是默认值时，写回原值。
+fn keep_unknown_enum<T>(new: &mut Value, old: &Value, key: &str)
+where
+    T: DeserializeOwned + Serialize + Default,
+{
+    let Some(old_value) = old.get(key) else {
+        return;
+    };
+    if serde_json::from_value::<T>(old_value.clone()).is_ok() {
+        return;
+    }
+    let default = serde_json::to_value(T::default()).unwrap_or(Value::Null);
+    if let Some(object) = new.as_object_mut()
+        && object.get(key).is_none_or(|value| *value == default)
+    {
+        object.insert(key.to_string(), old_value.clone());
+    }
 }
 
 #[cfg(unix)]
@@ -543,7 +697,11 @@ mod tests {
         );
         store.save(&settings).unwrap();
         let text = std::fs::read_to_string(&store.path).unwrap();
-        assert!(text.contains("\"version\": 1"), "{text}");
+        assert!(text.contains("\"version\": 2"), "{text}");
+        assert!(
+            text.contains(&format!("\"appVersion\": \"{}\"", crate::version::VERSION)),
+            "记下写文件的版本：{text}"
+        );
         let loaded = store.load().unwrap();
         assert_eq!(loaded.bindings, settings.bindings);
         assert!(loaded.any_enabled());
@@ -594,9 +752,101 @@ mod tests {
                 id: "deepseek".to_string(),
                 ..RelayProfile::default()
             },
+            extra: Default::default(),
         });
         assert_eq!(settings.unique_slug("DeepSeek", false), "deepseek-2");
         assert_eq!(settings.unique_slug("", true), "unnamed");
+    }
+
+    /// 回滚到这一版后：更新版本写的未知字段、枚举新取值都要能读，保存后原样还在。
+    #[test]
+    fn unknown_fields_and_enum_values_survive_load_and_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(temp.path().join("gateway.json"));
+        let text = r#"{
+          "version": 7,
+          "restoreOnExit": false,
+          "futureTopLevel": {"a": 1},
+          "keyPolicy": {"mode": "leastUsed", "futurePolicy": true},
+          "bindings": {
+            "claude": {
+              "enabled": true,
+              "model": "m",
+              "token": "t",
+              "unknownModel": "askUser",
+              "futureBinding": [1, 2],
+              "claudeRoles": {"opus": "o", "futureRole": "x"},
+              "restore": {"appliedPort": 1, "futureRestore": "y"}
+            }
+          },
+          "providers": [{
+            "enabled": true,
+            "futureProvider": "keep",
+            "relay": {"id": "p", "name": "P", "futureRelayField": {"deep": true}}
+          }],
+          "groups": [
+            {"id": "g", "name": "G", "mode": "smartest", "sticky": "forever", "futureGroup": 3, "members": []},
+            {"id": "h", "name": "H", "mode": "rotate", "sticky": "off"}
+          ]
+        }"#;
+        std::fs::write(&store.path, text).unwrap();
+        let mut settings = store.load().unwrap();
+        // 认不出的取值按默认处理。
+        assert_eq!(settings.groups[0].mode, GroupMode::InOrder);
+        assert_eq!(settings.groups[0].sticky, GroupSticky::Cache);
+        assert_eq!(settings.groups[1].mode, GroupMode::Rotate);
+        assert_eq!(settings.key_policy.mode, KeyRotationMode::Sticky);
+        let binding = settings.binding(&ToolId::Claude).unwrap();
+        assert_eq!(binding.unknown_model, UnknownModelPolicy::MapToDefault);
+        assert!(
+            !settings.restore_on_exit,
+            "版本 2 之后的文件里显式关掉的保持关"
+        );
+
+        // 改一点别的再保存。
+        settings.groups[1].mode = GroupMode::Weighted;
+        settings.tray_panel = false;
+        store.save(&settings).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&store.path).unwrap()).unwrap();
+        assert_eq!(saved["futureTopLevel"]["a"], 1);
+        assert_eq!(saved["keyPolicy"]["mode"], "leastUsed");
+        assert_eq!(saved["keyPolicy"]["futurePolicy"], true);
+        let claude = &saved["bindings"]["claude"];
+        assert_eq!(claude["unknownModel"], "askUser");
+        assert_eq!(claude["futureBinding"][1], 2);
+        assert_eq!(claude["claudeRoles"]["futureRole"], "x");
+        assert_eq!(claude["restore"]["futureRestore"], "y");
+        assert_eq!(saved["providers"][0]["futureProvider"], "keep");
+        assert_eq!(
+            saved["providers"][0]["relay"]["futureRelayField"]["deep"],
+            true
+        );
+        assert_eq!(saved["groups"][0]["mode"], "smartest");
+        assert_eq!(saved["groups"][0]["sticky"], "forever");
+        assert_eq!(saved["groups"][0]["futureGroup"], 3);
+        assert_eq!(saved["groups"][1]["mode"], "weighted", "改过的照新值写");
+        assert_eq!(saved["trayPanel"], false);
+        // 再读一遍还是同样的内容。
+        let again = store.load().unwrap();
+        assert_eq!(again.groups[0].extra["futureGroup"], 3);
+    }
+
+    #[test]
+    fn restore_on_exit_defaults_on_and_old_files_migrate() {
+        assert!(GatewaySettings::default().restore_on_exit);
+        let temp = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(temp.path().join("gateway.json"));
+        // 版本 1 的文件总会写出 false（当年的默认值），读的时候迁移成开。
+        std::fs::write(&store.path, r#"{"version":1,"restoreOnExit":false}"#).unwrap();
+        assert!(store.load().unwrap().restore_on_exit);
+        std::fs::write(&store.path, r#"{"bindings":{}}"#).unwrap();
+        assert!(store.load().unwrap().restore_on_exit);
+        // 迁移后用户再关掉：存成版本 2，之后保持关。
+        let mut settings = store.load().unwrap();
+        settings.restore_on_exit = false;
+        store.save(&settings).unwrap();
+        assert!(!store.load().unwrap().restore_on_exit);
     }
 
     #[test]
