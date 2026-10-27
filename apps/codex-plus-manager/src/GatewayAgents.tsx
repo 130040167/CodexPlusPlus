@@ -148,7 +148,7 @@ function AgentRow({
 
   return (
     <div className="gw-agent" data-expanded={expanded}>
-      {/* 开关在最左；已接入时整行点击展开详情，模型下拉和开关各管各的。 */}
+      {/* 已接入时整行点击展开详情，模型下拉和开关各管各的。 */}
       <div
         className="gw-agent-row"
         data-clickable={connected}
@@ -157,7 +157,6 @@ function AgentRow({
           onToggleExpand();
         }}
       >
-        <Switch disabled={busy !== null} label={tf("{0} 接入 Codex++", [agent.name])} on={connected} onToggle={toggle} />
         <span className="gw-agent-icon-box"><AgentIcon agent={agent.agent} className="gw-agent-icon" /></span>
         <div className="gw-agent-main">
           <div className="gw-agent-title">
@@ -193,6 +192,7 @@ function AgentRow({
           open={pickerOpen}
           payload={payload}
         />
+        <Switch disabled={busy !== null} label={tf("{0} 接入 Codex++", [agent.name])} on={connected} onToggle={toggle} />
         <button
           aria-expanded={expanded}
           aria-label={isClaude ? t("档位") : t("详情")}

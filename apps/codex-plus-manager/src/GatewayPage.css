@@ -3054,9 +3054,9 @@ body.gw-sorting * {
   gap: 6px;
 }
 
-/* Agent 接入：开关在左 · 图标 · 名称与状态标签 · 默认模型 · 展开箭头 */
+/* Agent 接入：图标 · 名称与状态标签 · 默认模型 · 开关 · 展开箭头 */
 .shell .gw-agent > .gw-agent-row {
-  grid-template-columns: auto 34px minmax(0, 1fr) minmax(200px, 300px) 24px;
+  grid-template-columns: 34px minmax(0, 1fr) minmax(200px, 300px) auto 24px;
   gap: 14px;
 }
 
@@ -3130,4 +3130,28 @@ body.gw-sorting * {
   font-size: 11.5px;
   font-style: normal;
   font-variant-numeric: tabular-nums;
+}
+
+/* 供应商池顶栏：搜索框和「添加供应商」同高、垂直居中 */
+.shell .gw-provider-search-row .gw-sheet-search,
+.shell .gw-provider-search-row .gw-primary-button {
+  box-sizing: border-box;
+  height: 34px;
+}
+
+.shell .gw-provider-search-row .gw-primary-button {
+  margin-top: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+/* 后台检查发现的新模型 */
+.shell .gw-new-models {
+  padding: 1px 8px;
+  border: 1px solid hsl(var(--primary) / 0.4);
+  border-radius: 999px;
+  background: hsl(var(--primary) / 0.1);
+  color: hsl(var(--primary));
+  font-size: 11.5px;
+  cursor: pointer;
 }

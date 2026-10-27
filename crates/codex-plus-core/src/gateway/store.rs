@@ -43,7 +43,20 @@ pub struct GatewayProvider {
     /// 与直连模式的「供应商独立代理」互不相干。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub proxy: String,
+    /// 上次检查上游时，上游有、列表里没有的模型（界面提示「有新模型」，保存模型列表后清掉）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream_new: Vec<String>,
+    /// 上次检查上游时，列表里有、上游已经没有的模型。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream_gone: Vec<String>,
+    /// 上次检查上游模型的时间（毫秒），0 表示没检查过。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub models_checked_at_ms: u64,
     pub relay: RelayProfile,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl GatewayProvider {
@@ -554,6 +567,9 @@ mod tests {
             price: None,
             model_prices: Default::default(),
             proxy: String::new(),
+            upstream_new: Vec::new(),
+            upstream_gone: Vec::new(),
+            models_checked_at_ms: 0,
             relay: RelayProfile {
                 id: "deepseek".to_string(),
                 ..RelayProfile::default()

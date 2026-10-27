@@ -58,6 +58,10 @@ export type GatewayPoolEntry = {
   account?: string;
   /** 订阅账号的套餐，如「ChatGPT Pro」「Copilot Pro+」。 */
   plan?: string;
+  /** 后台检查时上游有、列表里没有的模型。 */
+  upstreamNew?: string[];
+  /** 后台检查时列表里有、上游已经没有的模型。 */
+  upstreamGone?: string[];
   /** 这个 ChatGPT 账号正借给 Codex 登录。 */
   lentToCodex?: boolean;
 };

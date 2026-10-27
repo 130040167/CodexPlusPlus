@@ -346,6 +346,9 @@ mod tests {
             price: None,
             model_prices: Default::default(),
             proxy: String::new(),
+            upstream_new: Vec::new(),
+            upstream_gone: Vec::new(),
+            models_checked_at_ms: 0,
             relay: RelayProfile {
                 id: id.to_string(),
                 name: id.to_string(),

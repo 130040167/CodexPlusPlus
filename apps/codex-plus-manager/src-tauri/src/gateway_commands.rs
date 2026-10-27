@@ -8,6 +8,7 @@ use serde::Serialize;
 use codex_plus_core::gateway::activity::{self, ActivitySnapshot};
 use codex_plus_core::gateway::apply::{self, ApplyContext, GroupInput, ProviderInput};
 use codex_plus_core::gateway::key_pool::{self, PoolSnapshot};
+use codex_plus_core::gateway::model_sync;
 use codex_plus_core::gateway::store::{
     AgentBinding, GatewayGroup, GatewaySettings, GatewayStore, KeyRotationMode, new_client_token,
 };
@@ -43,6 +44,10 @@ pub struct GatewayPoolEntry {
     pub lent_to_codex: bool,
     /// 网关供应商单独走的 HTTP 代理（空串表示不单独走代理）。
     pub proxy: String,
+    /// 上次检查时上游有、列表里没有的模型（界面提示新模型）。
+    pub upstream_new: Vec<String>,
+    /// 上次检查时列表里有、上游已经没有的模型。
+    pub upstream_gone: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -118,6 +123,7 @@ fn pool_entry(
         String,
         codex_plus_core::gateway::store::ProviderPrice,
     >,
+    upstream: (Vec<String>, Vec<String>),
 ) -> GatewayPoolEntry {
     GatewayPoolEntry {
         id: relay.id.clone(),
@@ -135,6 +141,8 @@ fn pool_entry(
         plan: codex_plus_core::gateway::accounts::account_plan(relay),
         lent_to_codex: codex_plus_core::official_login::is_lent_to_codex(relay),
         proxy: relay.gateway_proxy.clone().unwrap_or_default(),
+        upstream_new: upstream.0,
+        upstream_gone: upstream.1,
     }
 }
 
@@ -165,12 +173,25 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
                 &provider.source,
                 provider.price.clone(),
                 provider.model_prices.clone(),
+                (
+                    provider.upstream_new.clone(),
+                    provider.upstream_gone.clone(),
+                ),
             )
         })
         .collect();
     let codex_providers = apply::codex_importable(settings)
         .into_iter()
-        .map(|relay| pool_entry(relay, true, "", None, Default::default()))
+        .map(|relay| {
+            pool_entry(
+                relay,
+                true,
+                "",
+                None,
+                Default::default(),
+                Default::default(),
+            )
+        })
         .collect();
     let drift_ctx = ApplyContext::default_paths(port);
     let agents = GATEWAY_AGENTS
@@ -394,7 +415,7 @@ pub fn create_gateway_provider(
     respond(
         &format!("已添加「{name}」，接入的 Agent 现在能用它的模型了。"),
         "添加供应商失败",
-        refresh_agents(apply::create_provider(
+        refresh_added(apply::create_provider(
             &GatewayStore::default(),
             &input,
             &source,
@@ -435,6 +456,64 @@ pub fn save_gateway_provider_extras(
         "保存失败",
         apply::set_provider_extras(&GatewayStore::default(), &id, price, model_prices, &proxy),
     )
+}
+
+/// 用存下的凭据重新拉一个供应商的模型，和现有列表比较（不改列表，只记下差异供界面提示）。
+#[tauri::command]
+pub async fn check_gateway_provider_models(
+    id: String,
+) -> CommandResult<Option<model_sync::ModelDiff>> {
+    match model_sync::check_provider(&GatewayStore::default(), &id).await {
+        Ok(diff) => ok(
+            &format!(
+                "上游有 {} 个模型：新增 {} 个，已下架 {} 个。",
+                diff.upstream.len(),
+                diff.added.len(),
+                diff.removed.len()
+            ),
+            Some(diff),
+        ),
+        Err(error) => failed(&format!("获取模型列表失败：{error:#}"), None),
+    }
+}
+
+/// 保存手动编辑或刷新后的模型列表；新加的模型按公开价格表补价格。
+#[tauri::command]
+pub fn save_gateway_provider_models(
+    id: String,
+    models: Vec<String>,
+    default_model: Option<String>,
+) -> CommandResult<Option<GatewayPayload>> {
+    let result = refresh_agents(model_sync::set_provider_models(
+        &GatewayStore::default(),
+        &id,
+        &models,
+        default_model.as_deref(),
+    ));
+    if result.is_ok() {
+        autofill_prices(Some(id));
+    }
+    respond("模型列表已保存。", "保存模型列表失败", result)
+}
+
+/// 添加供应商之后：同 [`refresh_agents`]，并在后台按公开价格表给新模型填好价格。
+fn refresh_added<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    if result.is_ok() {
+        autofill_prices(None);
+    }
+    refresh_agents(result)
+}
+
+/// 后台按公开价格表给没填价的模型补价格（添加供应商、改模型列表后调用）。补完由界面的轮询读到。
+fn autofill_prices(only: Option<String>) {
+    tauri::async_runtime::spawn(async move {
+        let _ = model_sync::fill_missing_prices(&GatewayStore::default(), only.as_deref()).await;
+    });
+}
+
+/// 后台任务：启动时补一次价格，之后每小时看一眼，超过一天没检查的供应商重新拉上游模型。
+pub fn start_model_watch() {
+    tauri::async_runtime::spawn(model_sync::watch(GatewayStore::default()));
 }
 
 /// 删除网关供应商（直连模式的数据不受影响）。
@@ -536,7 +615,7 @@ pub fn import_gateway_provider(
     respond(
         "已复制进网关的供应商池，原来的供应商不受影响。",
         "导入失败",
-        refresh_agents(result),
+        refresh_added(result),
     )
 }
 
@@ -585,7 +664,7 @@ pub async fn import_gateway_opencode_key(
         })
     }
     .await;
-    match refresh_agents(result) {
+    match refresh_added(result) {
         Ok(message) => ok(&message, current_payload()),
         Err(error) => failed(&format!("导入失败：{error:#}"), current_payload()),
     }
@@ -953,7 +1032,7 @@ pub async fn login_gateway_chatgpt(
         })
     }
     .await;
-    let result = refresh_agents(result);
+    let result = refresh_added(result);
     match result {
         Ok(message) => ok(&message, current_payload()),
         Err(error) => failed(&format!("登录失败：{error:#}"), current_payload()),
@@ -1031,7 +1110,7 @@ pub async fn finish_gateway_copilot_login(
         add_account_provider(relay, "copilot", "login", skip_agents.as_deref())
     }
     .await;
-    match refresh_agents(result) {
+    match refresh_added(result) {
         Ok(message) => ok(&message, current_payload()),
         Err(error) => failed(&format!("登录失败：{error:#}"), current_payload()),
     }
@@ -1054,7 +1133,7 @@ pub async fn login_gateway_grok(
         )
     }
     .await;
-    match refresh_agents(result) {
+    match refresh_added(result) {
         Ok(message) => ok(&message, current_payload()),
         Err(error) => failed(&format!("登录失败：{error:#}"), current_payload()),
     }
@@ -1083,7 +1162,7 @@ pub async fn login_gateway_chatgpt_api(
         )
     }
     .await;
-    match refresh_agents(result) {
+    match refresh_added(result) {
         Ok(message) => ok(&message, current_payload()),
         Err(error) => failed(&format!("登录失败：{error:#}"), current_payload()),
     }

@@ -1164,6 +1164,9 @@ pub fn add_provider(
         price: None,
         model_prices: BTreeMap::new(),
         proxy: String::new(),
+        upstream_new: Vec::new(),
+        upstream_gone: Vec::new(),
+        models_checked_at_ms: 0,
         relay,
     });
     exclude_new_provider(&mut gateway, &id, skip_agents);

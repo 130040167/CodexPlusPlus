@@ -32,6 +32,7 @@ import {
 import { AgentIcon, Avatar, KeyCount, MemberStatusLabel, Switch, type Notify, type Run } from "./gateway-ui";
 import { ProviderFormDialog, type ProviderFormState } from "./ProviderFormDialog";
 import { ProviderExtrasDialog, priceSummary } from "./ProviderExtrasDialog";
+import { ProviderModelsDialog } from "./ProviderModelsDialog";
 
 /** 能在网关里直接登录的订阅。 */
 type AccountKind = "chatgpt" | "chatgpt-api" | "copilot" | "grok";
@@ -262,6 +263,11 @@ function PoolRow({
     : [protocolLabel(entry.protocol), presetHost(entry.baseUrl), tf("{0} 个模型", [entry.models.length])]
   ).filter(Boolean).join(" · ");
   const [extrasOpen, setExtrasOpen] = useState(false);
+  const [modelsOpen, setModelsOpen] = useState(false);
+  const newModels = entry.upstreamNew?.length ?? 0;
+  const saveModels = async (models: string[], defaultModel: string) => {
+    if (await run(`models:${entry.id}`, "save_gateway_provider_models", { id: entry.id, models, defaultModel }, t("保存模型列表"))) setModelsOpen(false);
+  };
   const price = priceSummary(entry);
   const saveExtras = async (nextPrice: ProviderPrice | null, modelPrices: Record<string, ProviderPrice>, proxy: string) => {
     if (await run(`extras:${entry.id}`, "save_gateway_provider_extras", { id: entry.id, price: nextPrice, modelPrices, proxy }, t("保存价格与代理"))) setExtrasOpen(false);
@@ -294,6 +300,11 @@ function PoolRow({
           <small>{sub}</small>
         </div>
         <span className="gw-pool-status">
+          {newModels ? (
+            <button className="gw-new-models" onClick={() => setModelsOpen(true)} title={t("后台检查发现上游有新模型，点开查看")} type="button">
+              {tf("+{0} 新模型", [newModels])}
+            </button>
+          ) : null}
           <i className="gw-dot" data-tone={tone} />
           {/* 订阅账号空闲时显示套餐，其它供应商显示 Key 数。 */}
           {!enabled ? t("已关闭") : status.state === "idle" && entry.account && entry.plan ? entry.plan : <MemberStatusLabel status={status} />}
@@ -315,6 +326,7 @@ function PoolRow({
             <div className="gw-detail-value gw-chip-row">
               {entry.models.map((model) => <code className="gw-chip" key={model}>{`${entry.id}/${model}`}</code>)}
               {entry.models.length === 0 ? <span className="gw-muted">{t("未配置模型")}</span> : null}
+              <button className="gw-text-button" disabled={busy !== null} onClick={() => setModelsOpen(true)} type="button">{t("编辑")}</button>
             </div>
           </div>
           <div className="gw-detail-row">
@@ -348,7 +360,7 @@ function PoolRow({
             </div>
           </div>
           <div className="gw-detail-row gw-detail-foot">
-            <span className="gw-detail-label gw-detail-file">{t("只属于网关，直连模式里看不到")}</span>
+            <span className="gw-detail-label" />
             <div className="gw-detail-value">
               {entry.account ? (
                 <button className="gw-text-button" disabled={busy !== null} onClick={onRelogin} type="button">
@@ -367,6 +379,9 @@ function PoolRow({
             </div>
           </div>
         </div>
+      ) : null}
+      {modelsOpen ? (
+        <ProviderModelsDialog busy={busy !== null} entry={entry} onCancel={() => setModelsOpen(false)} onSave={(models, defaultModel) => void saveModels(models, defaultModel)} />
       ) : null}
       {extrasOpen ? (
         <ProviderExtrasDialog

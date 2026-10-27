@@ -8,6 +8,7 @@
 //! - [`route`]：绑定 → 模型 → 候选上游；
 //! - [`key_pool`]：多 Key 冷却与熔断；[`accounts`]：在网关里登录订阅账号；
 //! - [`activity`]：路由动态（最近一次请求怎么走的、计数），供界面实时展示；
+//! - [`model_sync`]：重新拉上游模型、补公开价格、定期检查新模型；
 //! - [`usage`]：按天汇总的用量统计；[`balance`]：供应商余额；[`sessions`]：各 Agent 的本地会话；
 //! - [`pipeline`]：候选循环；
 //! - [`anthropic_inbound`] / [`anthropic_outbound`]：Claude Code 的协议转换；
@@ -23,6 +24,7 @@ pub mod balance;
 pub mod chatgpt_backend;
 pub mod drift;
 pub mod key_pool;
+pub mod model_sync;
 pub mod opencode;
 pub mod pipeline;
 pub mod route;

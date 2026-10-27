@@ -420,6 +420,9 @@ mod tests {
                 cached_input: 0.5,
                 output: 8.0,
             }),
+            upstream_new: Vec::new(),
+            upstream_gone: Vec::new(),
+            models_checked_at_ms: 0,
             relay: RelayProfile {
                 id: "ds".to_string(),
                 ..RelayProfile::default()
