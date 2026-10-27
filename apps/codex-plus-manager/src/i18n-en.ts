@@ -1092,7 +1092,7 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
-  "Codex 的聚合供应商": "Codex aggregate providers",
+  "模型组（来自 Codex 的聚合供应商）": "Model groups (from Codex aggregate providers)",
   "全不选": "Select none",
   "全选未导入的": "Select all not imported",
   "复制一份进网关，之后两边各改各的，互不影响。": "A copy goes into the gateway; after that the two are edited separately.",
@@ -2378,10 +2378,9 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "{0} 个成员 · {1} · {2}，成员一起导入": "{0} members · {1} · {2}; members are imported too",
   "直连模式里有 {0} 个供应商，可以一次导入网关；之后两边各改各的。也可以登录订阅，或添加新的厂商 API、中转站。": "Direct mode has {0} providers you can import into the gateway in one go; after that the two are edited separately. You can also sign in to a subscription or add a new vendor API or relay.",
   "从直连模式导入 {0} 个": "Import {0} from direct mode",
-  "{0} 个成员 · 按模型聚合，成员进池即可": "{0} members · by model: the members just join the pool",
-  "{0} 个成员 · 成员进池，建同名模型组": "{0} members · members join the pool, plus a model group of the same name",
   "导入 {0} 个": "Import {0}",
   "导入直连模式的 {0} 个供应商": "Import {0} providers from direct mode",
   "通配符 · 现在匹配 {0} 个模型": "Pattern · matches {0} models now",

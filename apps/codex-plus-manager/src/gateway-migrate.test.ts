@@ -18,7 +18,7 @@ function payload(): GatewayPayload {
       { id: "relay-a", name: "A", baseUrl: "https://a.test/v1", protocol: "responses", official: false, models: [], keyCount: 1 },
       { id: "relay-b", name: "B", baseUrl: "https://b.test/v1", protocol: "responses", official: false, models: [], keyCount: 1 },
     ],
-    codexAggregates: [{ id: "agg", name: "日常", members: 2, byModel: false, imported: false }],
+    codexAggregates: [{ id: "agg", name: "日常", members: 2, mode: "inOrder", sticky: "cache", imported: false }],
     codexOfficial: [{ id: "official", name: "ChatGPT Pro · 26****34@qq.com" }],
     claudeProviders: [{ id: "kimi", name: "Kimi" }],
     grokProfiles: [],

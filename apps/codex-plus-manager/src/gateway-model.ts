@@ -163,8 +163,8 @@ export type GatewayPayload = {
   grokProfiles: Array<{ id: string; name: string }>;
   /** OpenCode 里保存的 OpenCode Go / Zen Key。 */
   opencodeKeys?: Array<{ id: string; name: string }>;
-  /** 直连模式的聚合供应商：搬进网关时成员进池、建同名模型组（按模型聚合不建组）。 */
-  codexAggregates?: Array<{ id: string; name: string; members: number; byModel: boolean; imported: boolean }>;
+  /** 直连模式里能搬成模型组的聚合供应商（按模型聚合、没有成员的不在这里）：成员进池，建同名模型组。 */
+  codexAggregates?: Array<{ id: string; name: string; members: number; mode: GroupMode; sticky: GroupSticky; imported: boolean }>;
   /** 直连模式的官方登录账号：不能复制，要在网关里单独登录。名字已打码。 */
   codexOfficial?: Array<{ id: string; name: string }>;
 };

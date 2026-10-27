@@ -1236,18 +1236,21 @@ pub fn codex_importable(settings: &BackendSettings) -> Vec<&RelayProfile> {
         .collect()
 }
 
-/// 直连模式里可以搬进网关的聚合供应商。`imported`：网关里已有同名模型组，或（按模型聚合时）成员都已导入。
+/// 直连模式里能搬成网关模型组的聚合供应商。`imported`：网关里已有同名模型组。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AggregateSource {
     pub id: String,
     pub name: String,
     pub members: usize,
-    /// 按模型聚合：网关池本身按模型名分发，搬过来不建模型组。
-    pub by_model: bool,
+    /// 搬过来后模型组的模式与会话固定方式。
+    pub mode: GroupMode,
+    pub sticky: GroupSticky,
     pub imported: bool,
 }
 
+/// 只列搬过来会建模型组的聚合：按模型聚合的不列（它的成员就是上面那些普通供应商，池本身按模型名分发），
+/// 没有成员的也不列（搬过来什么都不会发生）。
 pub fn codex_aggregates(
     settings: &BackendSettings,
     gateway: &GatewaySettings,
@@ -1255,33 +1258,36 @@ pub fn codex_aggregates(
     settings
         .aggregate_relay_profiles
         .iter()
+        .filter(|aggregate| !aggregate.model_aggregation_enabled && !aggregate.members.is_empty())
         .map(|aggregate| {
-            let imported = if aggregate.model_aggregation_enabled {
-                aggregate.members.iter().all(|member| {
-                    settings
-                        .relay_profiles
-                        .iter()
-                        .find(|relay| relay.id == member.relay_id)
-                        .is_none_or(|relay| {
-                            crate::official_login::member_uses_official_login_transport(relay)
-                                || imported_codex_provider(gateway, &relay.id).is_some()
-                        })
-                })
-            } else {
-                gateway
-                    .groups
-                    .iter()
-                    .any(|group| group.name == aggregate.name)
-            };
+            let (mode, sticky) = aggregate_group_mode(aggregate.strategy);
             AggregateSource {
                 id: aggregate.id.clone(),
                 name: aggregate.name.clone(),
                 members: aggregate.members.len(),
-                by_model: aggregate.model_aggregation_enabled,
-                imported,
+                mode,
+                sticky,
+                imported: gateway
+                    .groups
+                    .iter()
+                    .any(|group| group.name == aggregate.name),
             }
         })
         .collect()
+}
+
+/// 聚合策略对应的模型组模式：故障转移 → 依次；按会话轮换 → 轮换 + 整个会话固定；
+/// 按请求轮换 → 轮换 + 不固定；加权 → 按权重。
+fn aggregate_group_mode(
+    strategy: crate::settings::AggregateRelayStrategy,
+) -> (GroupMode, GroupSticky) {
+    use crate::settings::AggregateRelayStrategy;
+    match strategy {
+        AggregateRelayStrategy::Failover => (GroupMode::InOrder, GroupSticky::Cache),
+        AggregateRelayStrategy::ConversationRoundRobin => (GroupMode::Rotate, GroupSticky::Session),
+        AggregateRelayStrategy::RequestRoundRobin => (GroupMode::Rotate, GroupSticky::Off),
+        AggregateRelayStrategy::WeightedRoundRobin => (GroupMode::Weighted, GroupSticky::Cache),
+    }
 }
 
 /// 直连模式里的官方登录账号（不能复制，要在网关里单独登录）。
@@ -1415,20 +1421,7 @@ pub fn import_codex_aggregate(
     if members.is_empty() {
         return Ok(result);
     }
-    let (mode, sticky) = match aggregate.strategy {
-        crate::settings::AggregateRelayStrategy::Failover => {
-            (GroupMode::InOrder, GroupSticky::Cache)
-        }
-        crate::settings::AggregateRelayStrategy::ConversationRoundRobin => {
-            (GroupMode::Rotate, GroupSticky::Session)
-        }
-        crate::settings::AggregateRelayStrategy::RequestRoundRobin => {
-            (GroupMode::Rotate, GroupSticky::Off)
-        }
-        crate::settings::AggregateRelayStrategy::WeightedRoundRobin => {
-            (GroupMode::Weighted, GroupSticky::Cache)
-        }
-    };
+    let (mode, sticky) = aggregate_group_mode(aggregate.strategy);
     // 同名模型组已存在就覆盖它，重复搬不会多出一个组。
     let existing = store
         .load()?

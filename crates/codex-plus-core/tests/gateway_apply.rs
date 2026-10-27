@@ -1191,7 +1191,14 @@ fn direct_aggregates_move_into_the_gateway_as_pool_providers_and_a_group() {
             direct_relay("relay-a", "model-a"),
             direct_relay("relay-b", "model-b"),
         ],
-        aggregate_relay_profiles: vec![aggregate("agg", false), aggregate("by-model", true)],
+        aggregate_relay_profiles: vec![
+            aggregate("agg", false),
+            aggregate("by-model", true),
+            AggregateRelayProfile {
+                members: Vec::new(),
+                ..aggregate("empty", false)
+            },
+        ],
         ..BackendSettings::default()
     };
     // relay-a 之前单独导入过：复用，不再复制一份。
@@ -1241,7 +1248,7 @@ fn direct_aggregates_move_into_the_gateway_as_pool_providers_and_a_group() {
     assert!(
         codex_aggregates(&settings, &gateway)
             .iter()
-            .any(|item| item.id == "agg" && item.imported)
+            .any(|item| item.id == "agg" && item.imported && item.mode == GroupMode::Weighted)
     );
 
     // 再搬一次：不多导供应商、不多出模型组。
@@ -1259,9 +1266,10 @@ fn direct_aggregates_move_into_the_gateway_as_pool_providers_and_a_group() {
             .iter()
             .any(|note| note.contains("按模型聚合"))
     );
-    assert!(
-        codex_aggregates(&settings, &store.load().unwrap())
-            .iter()
-            .any(|item| item.id == "by-model" && item.imported && item.by_model)
-    );
+    // 导入列表只列会建模型组的：按模型聚合（成员就是普通供应商）和没有成员的都不列。
+    let listed: Vec<String> = codex_aggregates(&settings, &store.load().unwrap())
+        .into_iter()
+        .map(|item| item.id)
+        .collect();
+    assert_eq!(listed, vec!["agg".to_string()]);
 }

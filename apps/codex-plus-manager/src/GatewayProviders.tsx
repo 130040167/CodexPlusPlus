@@ -13,6 +13,8 @@ import {
   failureLabel,
   formatRemaining,
   gatewayPresets,
+  groupModeLabel,
+  groupStickyLabel,
   importCandidates,
   memberStatus,
   pendingImportCount,
@@ -696,7 +698,7 @@ function ImportDialog({
       }
       case "aggregate": {
         const info = aggregate(item.id);
-        return info?.byModel ? tf("{0} 个成员 · 按模型聚合，成员进池即可", [info.members]) : tf("{0} 个成员 · 成员进池，建同名模型组", [info?.members ?? 0]);
+        return info ? tf("{0} 个成员 · {1} · {2}，成员一起导入", [info.members, t(groupModeLabel(info.mode)), t(groupStickyLabel(info.sticky))]) : "";
       }
       case "claude":
         return t("Anthropic 协议，原样转发");
@@ -708,7 +710,7 @@ function ImportDialog({
   };
   const sections: Array<{ key: ImportSource; title: string }> = [
     { key: "codex", title: t("Codex 的供应商") },
-    { key: "aggregate", title: t("Codex 的聚合供应商") },
+    { key: "aggregate", title: t("模型组（来自 Codex 的聚合供应商）") },
     { key: "claude", title: t("Claude Code 的供应商") },
     { key: "grok", title: t("Grok 的供应商") },
     { key: "opencode", title: t("OpenCode 里保存的 Key") },
