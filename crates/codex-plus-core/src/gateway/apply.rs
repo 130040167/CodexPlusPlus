@@ -334,10 +334,11 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
             .filter(|name| !name.eq_ignore_ascii_case(&model))
             .map(str::to_string)
             .unwrap_or_else(|| pretty_model_name(&model));
+        // 分组名和描述会显示在 Codex 的模型选择器里：账号名要打码。
         let group = if relay.name.trim().is_empty() {
             relay.id.clone()
         } else {
-            relay.name.trim().to_string()
+            crate::gateway::accounts::mask_account_name(relay.name.trim())
         };
         fields.insert("display_name".into(), json!(display));
         fields.insert("description".into(), json!(format!("{model} · {group}")));

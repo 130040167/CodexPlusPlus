@@ -1645,6 +1645,49 @@ pub fn copilot_plan_label(sku: &str, api_base: &str) -> String {
     label.to_string()
 }
 
+/// 账号名打码，与管理器的 `maskAccountName` 一致：邮箱只打本地部分；
+/// 「ChatGPT / Copilot / SuperGrok … · 账号」里不是邮箱的账号整体打码。写进 Agent 配置、给 Agent 看的名字都要过它。
+pub fn mask_account_name(name: &str) -> String {
+    let masked = name
+        .split(' ')
+        .map(|word| match word.split_once('@') {
+            Some((local, domain))
+                if !local.is_empty() && domain.contains('.') && !domain.ends_with('.') =>
+            {
+                format!("{}@{domain}", mask_token(local))
+            }
+            _ => word.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let account_prefix = ["ChatGPT", "Copilot", "SuperGrok", "GitHub Copilot"]
+        .iter()
+        .any(|prefix| masked.starts_with(prefix));
+    if let Some((head, rest)) = masked.split_once('·')
+        && account_prefix
+        && !rest.contains('@')
+        && !rest.trim().is_empty()
+    {
+        let spaces = &rest[..rest.len() - rest.trim_start().len()];
+        return format!("{head}·{spaces}{}", mask_token(rest.trim()));
+    }
+    masked
+}
+
+/// 4 个字符以内只留第一个；更长的留头两个、尾两个，中间固定 4 个星号（不暴露长度）。
+fn mask_token(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= 4 {
+        return format!(
+            "{}***",
+            chars.first().map(char::to_string).unwrap_or_default()
+        );
+    }
+    let head: String = chars[..2].iter().collect();
+    let tail: String = chars[chars.len() - 2..].iter().collect();
+    format!("{head}****{tail}")
+}
+
 pub fn relay_account_kind(relay: &RelayProfile) -> Option<String> {
     account_kind(relay).map(|(kind, _)| kind)
 }
@@ -1748,6 +1791,28 @@ async fn prepare_copilot(relay: &RelayProfile, value: &Value) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn masks_account_names_like_the_manager() {
+        assert_eq!(
+            mask_account_name("ChatGPT Pro · 2649340134@qq.com"),
+            "ChatGPT Pro · 26****34@qq.com"
+        );
+        assert_eq!(
+            mask_account_name("ChatGPT Plus · ab@x.io"),
+            "ChatGPT Plus · a***@x.io"
+        );
+        assert_eq!(
+            mask_account_name("Copilot Pro+ · octocat-dev"),
+            "Copilot Pro+ · oc****ev"
+        );
+        assert_eq!(mask_account_name("DeepSeek"), "DeepSeek");
+        assert_eq!(
+            mask_account_name("Relay · team"),
+            "Relay · team",
+            "普通供应商名不动"
+        );
+    }
 
     fn jwt(payload: Value) -> String {
         let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;

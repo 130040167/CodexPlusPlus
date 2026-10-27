@@ -399,7 +399,7 @@ fn codex_gateway_catalog_carries_display_names_reasoning_and_provider_groups() {
     create_provider(
         &ctx.gateway,
         &ProviderInput {
-            name: "Claude 中转".into(),
+            name: "ChatGPT Pro · 2649340134@qq.com".into(),
             base_url: "https://relay.test/v1".into(),
             protocol: RelayProtocol::Responses,
             keys: vec!["sk-relay".into()],
@@ -462,7 +462,16 @@ fn codex_gateway_catalog_carries_display_names_reasoning_and_provider_groups() {
             .is_some_and(|levels| !levels.is_empty()),
         "{opus}"
     );
-    assert_eq!(opus["codex_plus_group"], "Claude 中转");
+    // 分组名和描述显示在 Codex 的模型选择器里，账号要打码。
+    assert_eq!(opus["codex_plus_group"], "ChatGPT Pro · 26****34@qq.com");
+    assert!(
+        !opus["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("2649340134"),
+        "悬停说明里也不能有原始账号：{}",
+        opus["description"]
+    );
     // 两家都提供的模型归第一个提供它的供应商（网关也先发给它）。
     let pro = model("deepseek-v4-pro");
     assert_eq!(pro["codex_plus_group"], "DeepSeek");
@@ -490,7 +499,10 @@ fn codex_gateway_catalog_carries_display_names_reasoning_and_provider_groups() {
             .as_array()
             .is_some_and(|levels| !levels.is_empty())
     );
-    assert_eq!(ui["codex_plus_group_id"], profile_id_of(ctx, "Claude 中转"));
+    assert_eq!(
+        ui["codex_plus_group_id"],
+        profile_id_of(ctx, "ChatGPT Pro · 2649340134@qq.com")
+    );
 }
 
 fn profile_id_of(ctx: &ApplyContext, name: &str) -> String {
