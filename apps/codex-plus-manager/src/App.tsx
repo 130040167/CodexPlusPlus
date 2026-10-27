@@ -4558,6 +4558,7 @@ export function App() {
           {route === "hub" ? (
             <HubOverview
               codex={{ running: codexAppRunning, providerName: toolEntries.find((entry) => entry.id === "codex")?.activeRelayName ?? null }}
+              notify={actions.showMessage}
               onNavigate={(next) => void navigate(next)}
               onOpenAgent={(agent) => void switchTool(agent, agentHomeRoute[agent] ?? "overview")}
             />

@@ -1,7 +1,8 @@
 /* 本地网关页：中性平面风格——白底圆角卡片、分隔行、大写小标题、黑色开关。 */
 
 .gateway-page,
-.gw-portal {
+.gw-portal,
+.gw-agent-modal {
   --gw-card: hsl(var(--card));
   --gw-line: hsl(var(--border) / 0.8);
   --gw-soft: hsl(var(--muted) / 0.55);
@@ -3154,4 +3155,15 @@ body.gw-sorting * {
   color: hsl(var(--primary));
   font-size: 11.5px;
   cursor: pointer;
+}
+
+/* 总览里就地「接入 Agent」的弹窗：里面就是 Agent 接入列表 */
+.shell .gw-modal.gw-agent-modal {
+  width: min(920px, 100%);
+}
+
+.shell .gw-agent-modal-body {
+  display: block;
+  margin: 0;
+  padding: 14px 18px 18px;
 }

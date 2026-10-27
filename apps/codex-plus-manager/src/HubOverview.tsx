@@ -14,7 +14,9 @@ import {
   type UsageSummary,
 } from "./gateway-model";
 import { hubAgents, hubFeed, hubLinks, hubProviders, hubTotals, successRate, type CodexSummary, type HubFeedItem, type HubLink } from "./hub-overview-model";
-import { AGENT_ICONS, APP_LOGO_URL, Avatar, KeyCount, MemberStatusLabel } from "./gateway-ui";
+import { AGENT_ICONS, APP_LOGO_URL, Avatar, KeyCount, MemberStatusLabel, type Notify, type Run } from "./gateway-ui";
+import { AgentConnectDialog } from "./GatewayAgents";
+import { ProviderAdder } from "./GatewayProviders";
 import "./HubOverview.css";
 
 const LIVE_REFRESH_MS = 3000;
@@ -22,9 +24,23 @@ const USAGE_REFRESH_MS = 30_000;
 
 /** 侧栏状态卡和总览页共用的网关数据：各自按自己的间隔静默刷新，失败时保留上一次的值。 */
 const shared: { payload: GatewayPayload | null } = { payload: null };
+const listeners = new Set<(payload: GatewayPayload) => void>();
+
+/** 命令返回了新的网关数据（如在总览里接入了 Agent）：立刻推给所有在用的组件，不等下次轮询。 */
+function publishGatewayPayload(result: GatewayResult) {
+  if (!result.gateway || !Array.isArray(result.pool)) return;
+  shared.payload = result as GatewayPayload;
+  for (const listener of listeners) listener(shared.payload);
+}
 
 export function useGatewayPayload(intervalMs: number): GatewayPayload | null {
   const [payload, setPayload] = useState<GatewayPayload | null>(shared.payload);
+  useEffect(() => {
+    listeners.add(setPayload);
+    return () => {
+      listeners.delete(setPayload);
+    };
+  }, []);
   useEffect(() => {
     let cancelled = false;
     const load = () =>
@@ -73,10 +89,12 @@ export function AgentGlyph({ agent, className = "" }: { agent: string; className
 
 export function HubOverview({
   codex,
+  notify,
   onOpenAgent,
   onNavigate,
 }: {
   codex: CodexSummary;
+  notify: Notify;
   onOpenAgent: (agent: string) => void;
   /** 跳到网关的某个页签或其它页面。 */
   onNavigate: (target: "gateway" | "gatewayProviders" | "gatewayRouting" | "gatewayUsage") => void;
@@ -93,6 +111,27 @@ export function HubOverview({
   const totals = hubTotals(payload);
   const feed = hubFeed(payload);
   const connected = agents.filter((agent) => agent.enabled).length;
+  // 「接入 Agent」「添加供应商」就地弹窗，不跳到对应页面。
+  const [adding, setAdding] = useState<"agent" | "provider" | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const run: Run = async (key, command, args, title, silent = false) => {
+    setBusy(key);
+    try {
+      const result = await invoke<GatewayResult>(command, args);
+      publishGatewayPayload(result);
+      if (result.status !== "ok") {
+        await notify(tf("{0}失败", [title]), result.message, "failed");
+        return false;
+      }
+      if (!silent) await notify(title, result.message, "ok");
+      return true;
+    } catch (error) {
+      await notify(t("调用失败"), String(error), "failed");
+      return false;
+    } finally {
+      setBusy(null);
+    }
+  };
 
   return (
     <div className="hub-page">
@@ -124,7 +163,7 @@ export function HubOverview({
                 {agent.enabled ? <span className="hub-node-num">{agent.requests}</span> : null}
               </button>
             ))}
-            <button className="hub-node hub-node-ghost" onClick={() => onNavigate("gateway")} type="button">
+            <button className="hub-node hub-node-ghost" onClick={() => setAdding("agent")} type="button">
               <Plus aria-hidden="true" className="h-4 w-4" />
               {t("接入 Agent")}
             </button>
@@ -169,7 +208,7 @@ export function HubOverview({
                 {provider.calls !== null ? <span className="hub-node-num">{provider.calls}</span> : null}
               </button>
             ))}
-            <button className="hub-node hub-node-ghost" onClick={() => onNavigate("gatewayProviders")} type="button">
+            <button className="hub-node hub-node-ghost" onClick={() => setAdding("provider")} type="button">
               <Plus aria-hidden="true" className="h-4 w-4" />
               {t("添加供应商")}
             </button>
@@ -197,6 +236,18 @@ export function HubOverview({
           <UsageStats usage={usage} />
         </section>
       </div>
+
+      {adding === "agent" ? (
+        <AgentConnectDialog
+          busy={busy}
+          notify={notify}
+          onClose={() => setAdding(null)}
+          onManage={() => { setAdding(null); onNavigate("gateway"); }}
+          payload={payload}
+          run={run}
+        />
+      ) : null}
+      {adding === "provider" ? <ProviderAdder busy={busy} notify={notify} onClose={() => setAdding(null)} payload={payload} run={run} /> : null}
     </div>
   );
 }

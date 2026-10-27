@@ -2,7 +2,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { appConfirm } from "./app-dialog";
-import { Check, ChevronDown, ChevronRight, ChevronUp, Layers, List, Search, Star, Unplug, Waypoints } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, ChevronUp, Layers, List, Search, Star, Unplug, Waypoints, X } from "lucide-react";
 import { t, tf } from "./i18n";
 import {
   agentModels,
@@ -65,6 +65,46 @@ export function AgentsView({
         {!payload ? <div className="gw-empty">{t("正在读取…")}</div> : null}
       </div>
     </>
+  );
+}
+
+/** 在别的页面（总览）里直接接入 Agent：弹窗里就是「Agent 接入」的列表，不用跳页。
+ * 列表的样式挂在 `.shell` 下，所以弹窗就地渲染（固定定位），不挂到 body。 */
+export function AgentConnectDialog({
+  payload,
+  busy,
+  run,
+  notify,
+  onManage,
+  onClose,
+}: {
+  payload: GatewayPayload | null;
+  busy: string | null;
+  run: Run;
+  notify: Notify;
+  onManage: () => void;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const escape = (event: KeyboardEvent) => {
+      // 下拉开着时 Esc 先关下拉。
+      if (event.key === "Escape" && !document.querySelector(".gw-portal.gw-popover")) onClose();
+    };
+    window.addEventListener("keydown", escape);
+    return () => window.removeEventListener("keydown", escape);
+  }, [onClose]);
+  return (
+    <div className="gw-modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <div aria-label={t("接入 Agent")} className="gw-modal gw-agent-modal" role="dialog">
+        <header>
+          <strong>{t("接入 Agent")}</strong>
+          <button aria-label={t("关闭")} className="gw-icon-button" onClick={onClose} type="button"><X className="h-4 w-4" /></button>
+        </header>
+        <div className="gw-modal-body gw-agent-modal-body">
+          <AgentsView busy={busy} notify={notify} onManage={onManage} payload={payload} run={run} />
+        </div>
+      </div>
+    </div>
   );
 }
 

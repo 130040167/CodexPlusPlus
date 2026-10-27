@@ -64,18 +64,11 @@ export function ProvidersView({
   const pool = payload?.pool ?? [];
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<string | null>(null);
-  const [catalogOpen, setCatalogOpen] = useState(false);
+  const [adding, setAdding] = useState(false);
   const [dragging, setDragging] = useState<string | null>(null);
+  // 编辑已有供应商的表单；新添加走 ProviderAdder。
   const [form, setForm] = useState<FormState | null>(null);
-  const [deviceCode, setDeviceCode] = useState<DeviceCode | null>(null);
-  // 这次添加给哪些 Agent 用：打开「添加供应商」时按各 Agent 的「添加供应商时自动加入」预选。
-  const [picked, setPicked] = useState<GatewayAgentId[]>([]);
-  const skipAgents = skippedAgents(payload, picked);
-  const openCatalog = () => {
-    setPicked(defaultProviderAgents(payload));
-    setCatalogOpen(true);
-  };
-  const agentPicks = <AgentPicks onChange={setPicked} payload={payload} picked={picked} />;
+  const openCatalog = () => setAdding(true);
   // 拖动排序中的临时顺序；松手后提交，等新数据回来再清掉。
   const [order, setOrder] = useState<string[] | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -128,41 +121,10 @@ export function ProvidersView({
     window.addEventListener("pointercancel", finish);
   };
 
-  /** 登录订阅账号：ChatGPT / ChatGPT API / SuperGrok 走浏览器登录；Copilot 先显示验证码，再等你在 GitHub 上授权。
-   * `skip` 是新添加时取消勾选的 Agent；重新登录已有账号时不传。 */
-  const login = async (kind: AccountKind, skip?: GatewayAgentId[]) => {
-    const title = tf("登录 {0}", [ACCOUNT_LABELS[kind]]);
-    if (kind === "copilot") {
-      let code: DeviceCode;
-      try {
-        const result = await invoke<{ status: string; message: string } & Partial<DeviceCode>>("start_gateway_copilot_login");
-        if (result.status !== "ok" || !result.userCode || !result.deviceCode) {
-          await notify(tf("{0}失败", [title]), result.message, "failed");
-          return;
-        }
-        code = { deviceCode: result.deviceCode, userCode: result.userCode, verificationUri: result.verificationUri ?? "https://github.com/login/device", interval: result.interval ?? 5, expiresIn: result.expiresIn ?? 900 };
-      } catch (error) {
-        await notify(t("调用失败"), String(error), "failed");
-        return;
-      }
-      setDeviceCode(code);
-      await run("login:copilot", "finish_gateway_copilot_login", { code, skipAgents: skip }, title);
-      setDeviceCode(null);
-      return;
-    }
-    void notify(title, t("已在浏览器打开登录页，登录完成后回到这里。5 分钟内有效。"), "info");
-    await run(`login:${kind}`, BROWSER_LOGIN_COMMANDS[kind], skip ? { skipAgents: skip } : undefined, title);
-  };
-
-  const submit = async (draft: ProviderDraft) => {
-    if (!form) return;
-    const input = providerInput(draft);
-    const ok = form.mode === "edit"
-      ? await run(`edit:${form.entry.id}`, "update_gateway_provider", { id: form.entry.id, input }, t("保存供应商"))
-      : await run("add:create", "create_gateway_provider", { input, source: form.mode === "preset" ? `preset:${form.preset.key}` : "custom", skipAgents }, t("添加供应商"));
-    if (ok) {
-      setForm(null);
-    }
+  const { login, dialog: loginDialog } = useAccountLogin(run, notify);
+  const saveEdit = async (draft: ProviderDraft) => {
+    if (form?.mode !== "edit") return;
+    if (await run(`edit:${form.entry.id}`, "update_gateway_provider", { id: form.entry.id, input: providerInput(draft) }, t("保存供应商"))) setForm(null);
   };
 
   return (
@@ -209,23 +171,96 @@ export function ProvidersView({
           </button>
         </div>
       ) : null}
-      {/* 添加供应商是弹出框；选好一项就关掉它，进入对应的填写 / 登录。 */}
+      {adding ? <ProviderAdder busy={busy} notify={notify} onClose={() => setAdding(false)} payload={payload} run={run} /> : null}
+      {loginDialog}
+      {form ? <ProviderFormDialog busy={busy} form={form} onCancel={() => setForm(null)} onSubmit={(draft) => void saveEdit(draft)} /> : null}
+    </>
+  );
+}
+
+/** 订阅账号登录（新添加和「重新登录」共用）：返回登录函数和 Copilot 验证码弹窗。 */
+function useAccountLogin(run: Run, notify: Notify) {
+  const [deviceCode, setDeviceCode] = useState<DeviceCode | null>(null);
+  /** 登录订阅账号：ChatGPT / ChatGPT API / SuperGrok 走浏览器登录；Copilot 先显示验证码，再等你在 GitHub 上授权。
+   * `skip` 是新添加时取消勾选的 Agent；重新登录已有账号时不传。 */
+  const login = async (kind: AccountKind, skip?: GatewayAgentId[]) => {
+    const title = tf("登录 {0}", [ACCOUNT_LABELS[kind]]);
+    if (kind === "copilot") {
+      let code: DeviceCode;
+      try {
+        const result = await invoke<{ status: string; message: string } & Partial<DeviceCode>>("start_gateway_copilot_login");
+        if (result.status !== "ok" || !result.userCode || !result.deviceCode) {
+          await notify(tf("{0}失败", [title]), result.message, "failed");
+          return;
+        }
+        code = { deviceCode: result.deviceCode, userCode: result.userCode, verificationUri: result.verificationUri ?? "https://github.com/login/device", interval: result.interval ?? 5, expiresIn: result.expiresIn ?? 900 };
+      } catch (error) {
+        await notify(t("调用失败"), String(error), "failed");
+        return;
+      }
+      setDeviceCode(code);
+      await run("login:copilot", "finish_gateway_copilot_login", { code, skipAgents: skip }, title);
+      setDeviceCode(null);
+      return;
+    }
+    void notify(title, t("已在浏览器打开登录页，登录完成后回到这里。5 分钟内有效。"), "info");
+    await run(`login:${kind}`, BROWSER_LOGIN_COMMANDS[kind], skip ? { skipAgents: skip } : undefined, title);
+  };
+
+  const dialog = deviceCode ? <DeviceCodeDialog code={deviceCode} notify={notify} onClose={() => setDeviceCode(null)} /> : null;
+  return { login, dialog };
+}
+
+/** 「添加供应商」整套流程：目录弹窗 → 填写表单或订阅登录，顶部可选给哪些 Agent 用。
+ * 供应商池和总览都用它；流程结束（添加成功、取消或登录结束）时调 `onClose`。 */
+export function ProviderAdder({
+  payload,
+  busy,
+  run,
+  notify,
+  onClose,
+}: {
+  payload: GatewayPayload | null;
+  busy: string | null;
+  run: Run;
+  notify: Notify;
+  onClose: () => void;
+}) {
+  // 这次添加给哪些 Agent 用：按各 Agent 的「添加供应商时自动加入」预选。
+  const [picked, setPicked] = useState<GatewayAgentId[]>(() => defaultProviderAgents(payload));
+  const skipAgents = skippedAgents(payload, picked);
+  const [catalogOpen, setCatalogOpen] = useState(true);
+  const [form, setForm] = useState<FormState | null>(null);
+  const [loggingIn, setLoggingIn] = useState(false);
+  const { login, dialog } = useAccountLogin(run, notify);
+  const agentPicks = <AgentPicks onChange={setPicked} payload={payload} picked={picked} />;
+  const submit = async (draft: ProviderDraft) => {
+    if (!form || form.mode === "edit") return;
+    const input = providerInput(draft);
+    if (await run("add:create", "create_gateway_provider", { input, source: form.mode === "preset" ? `preset:${form.preset.key}` : "custom", skipAgents }, t("添加供应商"))) onClose();
+  };
+  return (
+    <>
       {catalogOpen ? (
         <ProviderCatalog
+          agentPicks={agentPicks}
           busy={busy}
           notify={notify}
-          onClose={() => setCatalogOpen(false)}
+          onClose={onClose}
           onCustom={() => { setCatalogOpen(false); setForm({ mode: "custom" }); }}
-          onLogin={(kind) => { setCatalogOpen(false); void login(kind, skipAgents); }}
+          onLogin={(kind) => {
+            setCatalogOpen(false);
+            setLoggingIn(true);
+            void login(kind, skipAgents).finally(onClose);
+          }}
           onPreset={(preset) => { setCatalogOpen(false); setForm({ mode: "preset", preset }); }}
-          agentPicks={agentPicks}
           payload={payload}
           run={run}
           skipAgents={skipAgents}
         />
       ) : null}
-      {deviceCode ? <DeviceCodeDialog code={deviceCode} notify={notify} onClose={() => setDeviceCode(null)} /> : null}
-      {form ? <ProviderFormDialog agentPicks={form.mode === "edit" ? undefined : agentPicks} busy={busy} form={form} onCancel={() => setForm(null)} onSubmit={(draft) => void submit(draft)} /> : null}
+      {loggingIn ? dialog : null}
+      {form ? <ProviderFormDialog agentPicks={agentPicks} busy={busy} form={form} onCancel={onClose} onSubmit={(draft) => void submit(draft)} /> : null}
     </>
   );
 }
