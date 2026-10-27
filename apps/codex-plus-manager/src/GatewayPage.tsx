@@ -43,6 +43,7 @@ import { SessionsView } from "./GatewaySessions";
 import { UsageView } from "./GatewayUsage";
 import { Avatar, MemberStatusLabel, SectionLabel, Switch, makeRun, type Notify, type Run } from "./gateway-ui";
 import { TopbarActions } from "./TopbarActions";
+import { GatewayNavContext, gatewayJump } from "./gateway-store";
 import { useEscapeLayer } from "./use-escape-layer";
 import { publishGatewayPayload } from "./gateway-store";
 import "./GatewayPage.css";
@@ -158,14 +159,27 @@ export function GatewayPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab]);
 
+  // 按数据流排：供应商 → 模型 → Agent。
   const tabs: Array<{ id: Tab; label: string }> = [
-    { id: "agents", label: t("智能体") },
-    { id: "sessions", label: t("会话") },
     { id: "providers", label: t("供应商") },
     { id: "routing", label: t("模型") },
+    { id: "agents", label: t("智能体") },
+    { id: "sessions", label: t("会话") },
     { id: "usage", label: t("用量") },
     { id: "gateway", label: t("网关") },
   ];
+
+  // 跨页跳转：「模型」页列头 → 供应商池里展开这一家；模型下拉的「模型组」→「模型」页的模型组页签。
+  const openProvider = (id: string) => {
+    gatewayJump.provider = id;
+    setTab("providers");
+  };
+  const nav = {
+    openModelGroups: () => {
+      gatewayJump.modelsTab = "groups";
+      setTab("routing");
+    },
+  };
 
   const refreshButton = (
     <button aria-label={t("刷新")} className="gw-icon-button" disabled={busy !== null} onClick={() => void refresh(false)} title={t("刷新")} type="button">
@@ -191,6 +205,7 @@ export function GatewayPage({
           {refreshButton}
         </div>
       )}
+      <GatewayNavContext.Provider value={nav}>
       <div className="mg-content gw-content">
         {payload && !payload.helperRunning && payload.agents.some((agent) => agent.enabled) ? (
           <p className="gw-alert" role="alert">
@@ -201,11 +216,12 @@ export function GatewayPage({
         {tab === "agents" ? <AgentsView busy={busy} notify={notify} onManage={() => setTab("providers")} payload={payload} run={run} /> : null}
         {tab === "sessions" ? <SessionsView notify={notify} /> : null}
         {tab === "providers" ? <ProvidersView busy={busy} notify={notify} payload={payload} run={run} /> : null}
-        {tab === "routing" ? <RoutingView busy={busy} onManage={() => setTab("providers")} payload={payload} run={run} /> : null}
+        {tab === "routing" ? <RoutingView busy={busy} onManage={() => setTab("providers")} onOpenProvider={openProvider} payload={payload} run={run} /> : null}
         {tab === "usage" ? <UsageView busy={busy} notify={notify} payload={payload} run={run} /> : null}
         {tab === "gateway" ? <GatewayView busy={busy} payload={payload} run={run} /> : null}
         {tab === "gateway" && extraSettings ? extraSettings : null}
       </div>
+      </GatewayNavContext.Provider>
     </div>
   );
 }
@@ -221,8 +237,14 @@ type MatrixFilter = "all" | "shared" | `provider:${string}`;
 const modelsMemo: { tab: ModelsTab } = { tab: "models" };
 
 /** 「模型」页：网关里能用的模型（供应商 × 模型矩阵）和模型组，两个页签。 */
-function RoutingView({ payload, busy, run, onManage }: { payload: GatewayPayload | null; busy: string | null; run: Run; onManage: () => void }) {
-  const [tab, setTabState] = useState<ModelsTab>(modelsMemo.tab);
+function RoutingView({ payload, busy, run, onManage, onOpenProvider }: { payload: GatewayPayload | null; busy: string | null; run: Run; onManage: () => void; onOpenProvider: (id: string) => void }) {
+  const [tab, setTabState] = useState<ModelsTab>(() => {
+    // 从别的页跳过来指定了页签（如模型下拉里的「管理模型组」）：用它，读完清掉。
+    const jumped = gatewayJump.modelsTab;
+    gatewayJump.modelsTab = null;
+    if (jumped) modelsMemo.tab = jumped;
+    return modelsMemo.tab;
+  });
   const setTab = (next: ModelsTab) => {
     modelsMemo.tab = next;
     setTabState(next);
@@ -239,7 +261,7 @@ function RoutingView({ payload, busy, run, onManage }: { payload: GatewayPayload
           {t("模型组")}<em>{payload ? groups.length : "…"}</em>
         </button>
       </div>
-      {tab === "models" ? <ModelMatrix busy={busy} onManage={onManage} payload={payload} rows={rows} run={run} /> : <GroupsPanel busy={busy} payload={payload} run={run} />}
+      {tab === "models" ? <ModelMatrix busy={busy} onManage={onManage} onOpenProvider={onOpenProvider} payload={payload} rows={rows} run={run} /> : <GroupsPanel busy={busy} payload={payload} run={run} />}
     </>
   );
 }
@@ -320,7 +342,7 @@ function shortProviderName(name: string): string {
  * 供应商 × 模型矩阵：行是模型，列是池里打开的供应商（顺序就是池的顺序），格子里有点就是这家提供。
  * 打开「多家自动切换」时，多家都有的那几行点里标出「自动」的尝试顺序。
  */
-function ModelMatrix({ payload, rows, onManage, busy, run }: { payload: GatewayPayload | null; rows: DispatchRow[]; onManage: () => void; busy: string | null; run: Run }) {
+function ModelMatrix({ payload, rows, onManage, onOpenProvider, busy, run }: { payload: GatewayPayload | null; rows: DispatchRow[]; onManage: () => void; onOpenProvider: (id: string) => void; busy: string | null; run: Run }) {
   const autoModels = payload?.gateway.autoModels === true;
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<MatrixFilter>("all");
@@ -392,11 +414,13 @@ function ModelMatrix({ payload, rows, onManage, busy, run }: { payload: GatewayP
                 <tr>
                   <th className="gw-matrix-model" scope="col">{t("模型")}</th>
                   {providers.map((entry) => (
-                    <th key={entry.id} scope="col" title={maskAccountName(entry.name)}>
-                      <span className="gw-matrix-provider">
+                    <th key={entry.id} scope="col">
+                      {/* 点列头去供应商池展开这一家，在那里改它的模型列表、Key、价格。 */}
+                      <button className="gw-matrix-provider" onClick={() => onOpenProvider(entry.id)} title={tf("在供应商池里打开「{0}」", [maskAccountName(entry.name)])} type="button">
                         <Avatar baseUrl={entry.baseUrl} name={entry.name} size="sm" />
                         <span>{maskAccountName(shortProviderName(entry.name))}</span>
-                      </span>
+                        <ChevronRight aria-hidden className="h-3.5 w-3.5" />
+                      </button>
                     </th>
                   ))}
                 </tr>

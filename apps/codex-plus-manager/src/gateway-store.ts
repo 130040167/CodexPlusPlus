@@ -1,5 +1,5 @@
 /** 侧栏状态卡、总览页、网关页共用的网关数据：各自按自己的间隔静默刷新，失败时保留上一次的值。 */
-import { useEffect, useState } from "react";
+import { createContext, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { GatewayPayload, GatewayResult } from "./gateway-model";
 
@@ -40,3 +40,9 @@ export function useGatewayPayload(intervalMs: number): GatewayPayload | null {
   }, [intervalMs]);
   return payload;
 }
+
+/** 网关各页之间跳转时带的落地位置：跳过去的页面读一次就清掉。 */
+export const gatewayJump: { provider: string | null; modelsTab: "models" | "groups" | null } = { provider: null, modelsTab: null };
+
+/** 网关页里的跳转入口（只在网关页里有；总览、托盘里的模型下拉拿不到就不显示对应链接）。 */
+export const GatewayNavContext = createContext<{ openModelGroups?: () => void }>({});

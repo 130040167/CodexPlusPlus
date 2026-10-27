@@ -3553,3 +3553,47 @@ body:has(.gw-modal-backdrop) .app-select-menu-portal {
   flex: none;
   white-space: nowrap;
 }
+
+/* 矩阵列头：点了去供应商池展开这一家。 */
+.shell button.gw-matrix-provider {
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.shell button.gw-matrix-provider svg {
+  color: var(--gw-mute);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.shell button.gw-matrix-provider:hover {
+  background: hsl(var(--muted) / 0.6);
+}
+
+.shell button.gw-matrix-provider:hover svg,
+.shell button.gw-matrix-provider:focus-visible svg {
+  opacity: 1;
+}
+
+/* 模型下拉里「模型组」标题旁的「管理」。 */
+.gw-portal .gw-mp-manage,
+.gw-agent-modal .gw-mp-manage {
+  margin-left: auto;
+  padding: 0 6px;
+  border: 0;
+  background: none;
+  color: hsl(var(--primary));
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.gw-portal .gw-mp-manage + em,
+.gw-agent-modal .gw-mp-manage + em {
+  margin-left: 6px;
+}

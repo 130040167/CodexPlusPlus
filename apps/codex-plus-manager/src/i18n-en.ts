@@ -2453,6 +2453,7 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "在供应商池里打开「{0}」": "Open “{0}” in the provider pool",
   "平均首包 {0}": "Average first byte {0}",
   "{0} 个模型 · {1} 个多家都有": "{0} models · {1} offered by several providers",
   "已切换到 {0}": "Switched to {0}",

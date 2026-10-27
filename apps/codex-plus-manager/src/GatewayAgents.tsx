@@ -1,5 +1,5 @@
 /** 本地网关 · 智能体：每个 Agent 一行，接入后供应商池里的模型都出现在它自己的模型列表里，也可以在这里直接选。 */
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
+import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { appConfirm } from "./app-dialog";
@@ -26,7 +26,7 @@ import {
   type GatewayResult,
 } from "./gateway-model";
 import { AppSelect } from "./AppSelect";
-import { publishGatewayPayload } from "./gateway-store";
+import { GatewayNavContext, publishGatewayPayload } from "./gateway-store";
 import { useEscapeLayer } from "./use-escape-layer";
 import { AGENT_ICONS, AutoTag, Avatar, ModelViewGlyph, Switch, avatarOf, loadFavorites, saveFavorites, type Notify, type Run, AgentIcon } from "./gateway-ui";
 
@@ -505,6 +505,7 @@ export function ModelList({
   skipGroup?: string;
   onPick: (item: PickerItem) => void;
 }) {
+  const nav = useContext(GatewayNavContext);
   const [query, setQuery] = useState("");
   const [favoritesOnly, setFavoritesOnly] = useState(false);
   // 收藏存在网关里（Codex 的选择器也要显示）；旧版存在本窗口的 localStorage，网关里还没有时沿用并迁过去。
@@ -579,6 +580,9 @@ export function ModelList({
             <div className="gw-mp-heading">
               {section.key === "group" ? <Waypoints className="h-3.5 w-3.5" /> : section.key === "auto" ? <Shuffle className="h-3.5 w-3.5" /> : section.key === "custom" ? null : <Avatar name={section.title} size="sm" />}
               <span>{section.key === "group" || section.key === "custom" || section.key === "auto" ? t(section.title) : section.title}</span>
+              {section.key === "group" && nav.openModelGroups ? (
+                <button className="gw-mp-manage" onClick={nav.openModelGroups} type="button">{t("管理")}</button>
+              ) : null}
               <em>{section.items.length}</em>
             </div>
             {section.items.map((item) => {

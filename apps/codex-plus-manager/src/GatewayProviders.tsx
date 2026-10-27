@@ -2,7 +2,7 @@
  *
  * 与直连模式完全独立：这里的增删改只动 gateway.json；「导入…」是把直连模式的供应商复制一份过来。
  */
-import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { createPortal } from "react-dom";
 import { appConfirm } from "./app-dialog";
@@ -39,6 +39,7 @@ import { AgentIcon, Avatar, KeyCount, MemberStatusLabel, QuotaBadge, QuotaWindow
 import { ProviderFormDialog, type ProviderFormState } from "./ProviderFormDialog";
 import { ProviderExtrasDialog, priceSummary } from "./ProviderExtrasDialog";
 import { ProviderModelsDialog } from "./ProviderModelsDialog";
+import { gatewayJump } from "./gateway-store";
 import { useEscapeLayer } from "./use-escape-layer";
 
 /** 能在网关里直接登录的订阅。 */
@@ -70,7 +71,18 @@ export function ProvidersView({
 }) {
   const pool = payload?.pool ?? [];
   const [query, setQuery] = useState("");
-  const [expanded, setExpanded] = useState<string | null>(null);
+  // 从「模型」页点列头跳过来：展开那一家并滚到它。读完就清掉。
+  const [expanded, setExpanded] = useState<string | null>(() => {
+    const jumped = gatewayJump.provider;
+    gatewayJump.provider = null;
+    return jumped;
+  });
+  const jumpedTo = useRef(expanded);
+  useEffect(() => {
+    const id = jumpedTo.current;
+    jumpedTo.current = null;
+    if (id) document.querySelector(`[data-pool-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: "center" });
+  }, []);
   const [adding, setAdding] = useState<false | "catalog" | "import">(false);
   const pendingImports = pendingImportCount(payload);
   const [dragging, setDragging] = useState<string | null>(null);
