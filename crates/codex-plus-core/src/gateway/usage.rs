@@ -169,7 +169,7 @@ impl UsageStore {
                 add_group(&mut summary.by_model, &row.model, &row.model, &row.counts);
                 if let Some(price) = gateway
                     .provider(&row.provider_id)
-                    .and_then(|provider| provider.price.as_ref())
+                    .and_then(|provider| provider.price_for(&row.model))
                 {
                     add_cost(&mut summary.costs, price, &row.counts);
                 }
@@ -412,6 +412,7 @@ mod tests {
         gateway.providers.push(GatewayProvider {
             enabled: true,
             source: String::new(),
+            model_prices: Default::default(),
             proxy: String::new(),
             price: Some(ProviderPrice {
                 currency: "cny".to_string(),

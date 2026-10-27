@@ -17,20 +17,18 @@ import {
   type ProviderDraft,
 } from "./gateway-model";
 import { Avatar } from "./gateway-ui";
-import { lookupPublicPrice } from "./ProviderExtrasDialog";
+import { lookupPublicPrices } from "./ProviderExtrasDialog";
 import {
   FETCHED_DIRECT_LIMIT,
   addModel,
   defaultModel,
   draftKeys,
   draftModels,
-  draftWithPrice,
-  formatPrice,
   hasPrice,
+  priceFromMatch,
   removeModel,
   withKeys,
   withModels,
-  type PriceMatch,
 } from "./provider-form-model";
 import "./ProviderFormDialog.css";
 
@@ -60,7 +58,7 @@ export function ProviderFormDialog({
   const editing = form.mode === "edit";
   const preset = form.mode === "preset" ? form.preset : null;
   const [draft, setDraft] = useState<ProviderDraft>(() => (form.mode === "edit" ? providerDraftFromEntry(form.entry) : providerDraftFromPreset(preset)));
-  // 价格在供应商池的详情里编辑；新添加时按公开价格表悄悄填上（查不到就不填）。
+  // 价格在供应商池的详情里按模型编辑；新添加时按公开价格表给每个模型悄悄填上（查不到的不填）。
   const autoPrice = useRef(!editing && !hasPrice(draft));
   const [fetching, setFetching] = useState(false);
   const [fetchNote, setFetchNote] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
@@ -82,18 +80,21 @@ export function ProviderFormDialog({
     return () => document.removeEventListener("keydown", escape);
   }, [onCancel]);
 
-  const lookupPrice = async (model: string, baseUrl: string) => {
-    const match = await lookupPublicPrice(baseUrl, model);
-    if (match && autoPrice.current) setDraft((previous) => draftWithPrice(previous, match));
+  const lookupPrices = async (list: string[], baseUrl: string) => {
+    const found = await lookupPublicPrices(baseUrl, list);
+    if (!autoPrice.current) return;
+    const modelPrices = Object.fromEntries(Object.entries(found).map(([model, match]) => [model, priceFromMatch(match)]));
+    setDraft((previous) => ({ ...previous, modelPrices }));
   };
 
-  // 地址或默认模型变了就重新查价（停顿半秒再查，打字时不反复请求）。
+  // 地址或模型列表变了就重新查价（停顿半秒再查，打字时不反复请求）。
+  const modelKey = models.join("\n");
   useEffect(() => {
-    if (!autoPrice.current || !chosenModel || !draft.baseUrl.trim()) return;
-    const timer = window.setTimeout(() => void lookupPrice(chosenModel, draft.baseUrl.trim()), 500);
+    if (!autoPrice.current || !models.length || !draft.baseUrl.trim()) return;
+    const timer = window.setTimeout(() => void lookupPrices(models, draft.baseUrl.trim()), 500);
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draft.baseUrl, chosenModel]);
+  }, [draft.baseUrl, modelKey]);
 
   const fetchModels = async () => {
     setFetching(true);

@@ -431,3 +431,65 @@
   color: hsl(var(--status-error));
   font-size: 12px;
 }
+
+/* 按模型的价格表：模型名 + 输入 / 缓存命中 / 输出，最后一行是「其它模型」的默认价。 */
+.gw-portal .pf-price-table {
+  overflow: hidden;
+  border: 1px solid hsl(var(--border));
+  border-radius: 8px;
+}
+
+.gw-portal .pf-price-rows {
+  max-height: 264px;
+  overflow-y: auto;
+}
+
+.gw-portal .pf-price-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) repeat(3, minmax(0, 1fr));
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+}
+
+.gw-portal .pf-price-row + .pf-price-row {
+  border-top: 1px solid hsl(var(--border) / 0.6);
+}
+
+.gw-portal .pf-price-head {
+  background: hsl(var(--surface-sunken));
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+}
+
+.gw-portal .pf-price-row code {
+  overflow: hidden;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gw-portal .pf-price-row input {
+  height: 28px;
+  font-size: 12.5px;
+}
+
+.gw-portal .pf-price-fallback {
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+}
+
+.gw-portal .pf-section h4 {
+  white-space: nowrap;
+}
+
+.gw-portal .pf-section h4 .pf-currency {
+  flex: none;
+  width: 96px;
+  margin-left: auto;
+}
+
+.gw-portal .pf-section h4 .pf-currency + .pf-action {
+  margin-left: 0;
+}

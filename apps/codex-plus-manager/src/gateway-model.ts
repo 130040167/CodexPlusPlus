@@ -50,6 +50,8 @@ export type GatewayPoolEntry = {
   source?: string;
   /** 每百万 token 的价格。 */
   price?: ProviderPrice | null;
+  /** 按模型的价格（上游模型名 → 价格）；没填的模型用 `price`。 */
+  modelPrices?: Record<string, ProviderPrice>;
   /** 网关供应商单独走的 HTTP 代理，空串表示不单独走代理。 */
   proxy?: string;
   /** 登录得到的账号：chatgpt / copilot / grok；普通供应商为空。 */
@@ -715,6 +717,8 @@ export type ProviderDraft = {
   priceOutput: string;
   /** 单独走的 HTTP 代理，空串表示不单独走代理（沿用系统代理）。 */
   proxy: string;
+  /** 按模型的价格：新添加时按公开价格表自动查；不带表示不改。 */
+  modelPrices?: Record<string, ProviderPrice> | null;
 };
 
 const NO_PRICE = { priceCurrency: "CNY", priceInput: "", priceCached: "", priceOutput: "", proxy: "" };
@@ -759,6 +763,7 @@ export function providerInput(draft: ProviderDraft) {
     model: draft.model.trim(),
     modelList: splitModels(draft.modelList).join("\n"),
     price: priceFromDraft(draft),
+    modelPrices: draft.modelPrices ?? null,
     proxy: draft.proxy.trim(),
   };
 }

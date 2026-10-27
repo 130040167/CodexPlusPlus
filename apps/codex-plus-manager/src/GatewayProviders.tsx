@@ -264,8 +264,8 @@ function PoolRow({
   ).filter(Boolean).join(" · ");
   const [extrasOpen, setExtrasOpen] = useState(false);
   const price = priceSummary(entry);
-  const saveExtras = async (nextPrice: ProviderPrice | null, proxy: string) => {
-    if (await run(`extras:${entry.id}`, "save_gateway_provider_extras", { id: entry.id, price: nextPrice, proxy }, t("保存价格与代理"))) setExtrasOpen(false);
+  const saveExtras = async (nextPrice: ProviderPrice | null, modelPrices: Record<string, ProviderPrice>, proxy: string) => {
+    if (await run(`extras:${entry.id}`, "save_gateway_provider_extras", { id: entry.id, price: nextPrice, modelPrices, proxy }, t("保存价格与代理"))) setExtrasOpen(false);
   };
   const remove = async () => {
     const ok = await appConfirm(tf("从网关删除「{0}」？直连模式里的供应商不受影响。", [maskAccountName(entry.name)]), { title: t("删除供应商"), confirmText: t("删除"), danger: true });
@@ -370,7 +370,7 @@ function PoolRow({
           busy={busy !== null}
           entry={entry}
           onCancel={() => setExtrasOpen(false)}
-          onSave={(nextPrice, proxy) => void saveExtras(nextPrice, proxy)}
+          onSave={(nextPrice, modelPrices, proxy) => void saveExtras(nextPrice, modelPrices, proxy)}
         />
       ) : null}
     </div>

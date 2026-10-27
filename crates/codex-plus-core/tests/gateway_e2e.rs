@@ -139,6 +139,7 @@ fn providers(relays: Vec<RelayProfile>) -> Vec<GatewayProvider> {
             enabled: true,
             source: String::new(),
             price: None,
+            model_prices: Default::default(),
             proxy: String::new(),
             relay,
         })

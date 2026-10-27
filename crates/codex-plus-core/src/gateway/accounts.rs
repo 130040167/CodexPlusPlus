@@ -1717,6 +1717,7 @@ mod tests {
                 enabled: true,
                 source: "login:chatgpt".to_string(),
                 price: None,
+                model_prices: Default::default(),
                 proxy: String::new(),
                 relay,
             });

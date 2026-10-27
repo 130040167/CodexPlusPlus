@@ -10,6 +10,7 @@
 //!   关闭时切回开启前的供应商并删掉托管供应商。直连模式里切到别的供应商等于断开网关。
 //! - 供应商池与路由组只存在 `gateway.json`；从直连模式导入是复制，之后互不影响。
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
@@ -964,6 +965,7 @@ pub fn copy_claude_provider(provider: &ClaudeProvider) -> anyhow::Result<RelayPr
         model: models.first().cloned().unwrap_or_default(),
         model_list: models.join("\n"),
         price: None,
+        model_prices: None,
         proxy: None,
     })?;
     if bearer {
@@ -1005,6 +1007,7 @@ pub fn copy_grok_profile(
         model: models.first().cloned().unwrap_or_default(),
         model_list: models.join("\n"),
         price: None,
+        model_prices: None,
         proxy: None,
     })
 }
@@ -1065,9 +1068,12 @@ pub struct ProviderInput {
     pub model: String,
     #[serde(default)]
     pub model_list: String,
-    /// 每百万 token 的价格；不填就不估算费用。
+    /// 每百万 token 的价格；不填就不估算费用。按模型的价格优先，这里是其余模型的默认价。
     #[serde(default)]
     pub price: Option<ProviderPrice>,
+    /// 按模型的价格；不传表示不改（编辑时保留原来的）。
+    #[serde(default)]
+    pub model_prices: Option<BTreeMap<String, ProviderPrice>>,
     /// 这个供应商单独走的 HTTP 代理；不传表示不改，空串表示不单独走代理。
     #[serde(default)]
     pub proxy: Option<String>,
@@ -1156,6 +1162,7 @@ pub fn add_provider(
         enabled: true,
         source: source.to_string(),
         price: None,
+        model_prices: BTreeMap::new(),
         proxy: String::new(),
         relay,
     });
@@ -1200,6 +1207,7 @@ pub fn create_provider(
         .find(|provider| provider.relay.id == id)
     {
         provider.price = clean_price(input.price.clone());
+        provider.model_prices = clean_model_prices(input.model_prices.clone().unwrap_or_default());
         provider.proxy = proxy;
         store.save(&gateway)?;
     }
@@ -1209,6 +1217,18 @@ pub fn create_provider(
 /// 全是 0 的价格等于没填。
 fn clean_price(price: Option<ProviderPrice>) -> Option<ProviderPrice> {
     price.filter(|price| price.input > 0.0 || price.cached_input > 0.0 || price.output > 0.0)
+}
+
+/// 按模型的价格：去掉空模型名和没填的项。
+fn clean_model_prices(prices: BTreeMap<String, ProviderPrice>) -> BTreeMap<String, ProviderPrice> {
+    prices
+        .into_iter()
+        .filter_map(|(model, price)| {
+            let model = model.trim().to_string();
+            let price = clean_price(Some(price))?;
+            (!model.is_empty()).then_some((model, price))
+        })
+        .collect()
 }
 
 /// 编辑网关供应商：id 不变（Agent、路由组里的引用都还有效）；`keys` 为空时沿用原来的 Key。
@@ -1247,6 +1267,9 @@ pub fn update_provider(
     relay.anthropic_auth_header = provider.relay.anthropic_auth_header.clone();
     provider.relay = relay;
     provider.price = clean_price(input.price.clone());
+    if let Some(prices) = &input.model_prices {
+        provider.model_prices = clean_model_prices(prices.clone());
+    }
     if let Some(proxy) = &input.proxy {
         provider.proxy = clean_proxy(proxy)?;
     }
@@ -1255,10 +1278,12 @@ pub fn update_provider(
 }
 
 /// 只改供应商的价格与独立代理（订阅账号也能改；地址、Key、模型不动）。
+/// `model_prices` 为 `None` 时保留原来按模型的价格。
 pub fn set_provider_extras(
     store: &GatewayStore,
     id: &str,
     price: Option<ProviderPrice>,
+    model_prices: Option<BTreeMap<String, ProviderPrice>>,
     proxy: &str,
 ) -> anyhow::Result<GatewaySettings> {
     let proxy = clean_proxy(proxy)?;
@@ -1271,6 +1296,9 @@ pub fn set_provider_extras(
         bail!("供应商不存在：{id}");
     };
     provider.price = clean_price(price);
+    if let Some(prices) = model_prices {
+        provider.model_prices = clean_model_prices(prices);
+    }
     provider.proxy = proxy;
     store.save(&gateway)?;
     store.load()

@@ -32,6 +32,9 @@ pub struct GatewayPoolEntry {
     /// 预设 key 或导入来源，界面判断「已添加」用。
     pub source: String,
     pub price: Option<codex_plus_core::gateway::store::ProviderPrice>,
+    /// 按模型的价格（上游模型名 → 价格）。
+    pub model_prices:
+        std::collections::BTreeMap<String, codex_plus_core::gateway::store::ProviderPrice>,
     /// 登录得到的账号：`chatgpt` / `copilot` / `grok`；普通供应商为空。
     pub account: String,
     /// 这个 ChatGPT 账号正借给 Codex 登录（Codex 以官方身份接入网关）。
@@ -109,6 +112,10 @@ fn pool_entry(
     enabled: bool,
     source: &str,
     price: Option<codex_plus_core::gateway::store::ProviderPrice>,
+    model_prices: std::collections::BTreeMap<
+        String,
+        codex_plus_core::gateway::store::ProviderPrice,
+    >,
 ) -> GatewayPoolEntry {
     GatewayPoolEntry {
         id: relay.id.clone(),
@@ -121,6 +128,7 @@ fn pool_entry(
         enabled,
         source: source.to_string(),
         price,
+        model_prices,
         account: account_kind(relay),
         lent_to_codex: codex_plus_core::official_login::is_lent_to_codex(relay),
         proxy: relay.gateway_proxy.clone().unwrap_or_default(),
@@ -153,12 +161,13 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
                 provider.enabled,
                 &provider.source,
                 provider.price.clone(),
+                provider.model_prices.clone(),
             )
         })
         .collect();
     let codex_providers = apply::codex_importable(settings)
         .into_iter()
-        .map(|relay| pool_entry(relay, true, "", None))
+        .map(|relay| pool_entry(relay, true, "", None, Default::default()))
         .collect();
     let drift_ctx = ApplyContext::default_paths(port);
     let agents = GATEWAY_AGENTS
@@ -413,12 +422,15 @@ pub fn update_gateway_provider(
 pub fn save_gateway_provider_extras(
     id: String,
     price: Option<codex_plus_core::gateway::store::ProviderPrice>,
+    model_prices: Option<
+        std::collections::BTreeMap<String, codex_plus_core::gateway::store::ProviderPrice>,
+    >,
     proxy: String,
 ) -> CommandResult<Option<GatewayPayload>> {
     respond(
         "已保存。",
         "保存失败",
-        apply::set_provider_extras(&GatewayStore::default(), &id, price, &proxy),
+        apply::set_provider_extras(&GatewayStore::default(), &id, price, model_prices, &proxy),
     )
 }
 
@@ -551,6 +563,7 @@ pub async fn import_gateway_opencode_key(
             model: models.first().cloned().unwrap_or_default(),
             model_list: models.join("\n"),
             price: None,
+            model_prices: None,
             proxy: None,
         };
         apply::create_provider(

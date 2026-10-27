@@ -32,14 +32,34 @@ pub struct GatewayProvider {
     /// 来源：内置预设的 key，或 `codex:<id>` / `claude:<id>` / `grok:<id>`，界面用来判断「已添加」。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source: String,
-    /// 每百万 token 的价格，填了才在「用量」里估算费用。
+    /// 每百万 token 的价格，填了才在「用量」里估算费用。按模型的价格见 `model_prices`，
+    /// 这里是没单独填价的模型用的默认价（旧版只有这一组）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price: Option<ProviderPrice>,
+    /// 按模型的价格：键是上游模型名（不带供应商前缀）。同一家不同模型价格往往差好几倍。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_prices: BTreeMap<String, ProviderPrice>,
     /// 这个供应商单独走的 HTTP 代理；空串表示不单独走代理（沿用系统代理）。
     /// 与直连模式的「供应商独立代理」互不相干。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub proxy: String,
     pub relay: RelayProfile,
+}
+
+impl GatewayProvider {
+    /// 某个上游模型的价格：先按模型找（忽略大小写和 `[1M]` 这类窗口后缀），找不到用默认价。
+    pub fn price_for(&self, model: &str) -> Option<&ProviderPrice> {
+        let (slug, _) = crate::model_suffix::parse_model_suffix(model.trim());
+        let slug = slug.trim();
+        self.model_prices
+            .iter()
+            .find(|(name, _)| {
+                let (name, _) = crate::model_suffix::parse_model_suffix(name.trim());
+                name.trim().eq_ignore_ascii_case(slug)
+            })
+            .map(|(_, price)| price)
+            .or(self.price.as_ref())
+    }
 }
 
 /// 每百万 token 的价格。命中缓存的输入单独计价。
@@ -532,6 +552,7 @@ mod tests {
             enabled: true,
             source: String::new(),
             price: None,
+            model_prices: Default::default(),
             proxy: String::new(),
             relay: RelayProfile {
                 id: "deepseek".to_string(),

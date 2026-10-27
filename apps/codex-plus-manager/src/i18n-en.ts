@@ -1093,6 +1093,9 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "每百万 token，按模型计": "Per 1M tokens, per model",
+  "留空的模型用「其它模型」那一行；都不填就不估算费用。": "Blank models use the Other models row; leave all blank to skip cost estimates.",
+  "其它模型": "Other models",
   "添加后给这些 Agent 用": "Use with these agents",
   "都不选也能添加，之后在 Agent 的「挑选」里再打开": "You can add it for none and turn it on later under the agent's Pick list",
   "关掉后，新添加的供应商默认不给这个 Agent 用；添加时仍可手动勾选。": "When off, newly added providers are not used by this agent by default; you can still tick it when adding.",
@@ -2306,6 +2309,9 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "{0} / {1} 个模型": "{0} / {1} models",
+  "所有模型 · 输入 {0} · 缓存 {1} · 输出 {2}": "All models \u00b7 input {0} \u00b7 cached {1} \u00b7 output {2}",
+  "models.dev 里找到 {0} / {1} 个模型的价格（美元），其余需要的话手动填写。": "Found prices for {0} / {1} models on models.dev (USD); fill in the rest manually if needed.",
   "{0} 次 · {1} 次出错": "{0} calls · {1} errors",
   "删除 Codex 会话「{0}」？删除前会自动备份。": "Delete Codex session \"{0}\"? It is backed up first.",
   "删除 {0} 会话「{1}」？会话文件会移到废纸篓，需要时可以找回。": "Delete {0} session \"{1}\"? Its files move to the Trash so you can restore them.",

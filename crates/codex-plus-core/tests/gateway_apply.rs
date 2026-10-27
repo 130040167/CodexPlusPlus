@@ -51,6 +51,7 @@ fn deepseek_input() -> ProviderInput {
         model: "deepseek-v4-pro".into(),
         model_list: "deepseek-v4-pro\ndeepseek-v4-flash".into(),
         price: None,
+        model_prices: None,
         proxy: None,
     }
 }
@@ -692,21 +693,47 @@ fn gateway_provider_proxy_is_its_own_setting() {
         cached_input: 0.1,
         output: 10.0,
     };
+    let pro = codex_plus_core::gateway::store::ProviderPrice {
+        currency: "USD".into(),
+        input: 4.0,
+        cached_input: 0.2,
+        output: 16.0,
+    };
     let saved = codex_plus_core::gateway::apply::set_provider_extras(
         &ctx.gateway,
         &id,
         Some(price.clone()),
+        Some(
+            [
+                ("deepseek-v4-pro".to_string(), pro.clone()),
+                ("deepseek-v4-flash".to_string(), Default::default()),
+            ]
+            .into(),
+        ),
         "socks5://127.0.0.1:1080",
     )
     .unwrap();
     let provider = saved.provider(&id).unwrap();
-    assert_eq!(provider.price, Some(price));
+    assert_eq!(provider.price, Some(price.clone()));
+    // 按模型的价格优先，没填（全 0）的项丢掉、回落到默认价；窗口后缀和大小写不影响匹配。
+    assert_eq!(provider.model_prices.len(), 1);
+    assert_eq!(provider.price_for("DeepSeek-V4-Pro[1M]"), Some(&pro));
+    assert_eq!(provider.price_for("deepseek-v4-flash"), Some(&price));
+    // 不传按模型的价格时保留原来的。
+    let kept =
+        codex_plus_core::gateway::apply::set_provider_extras(&ctx.gateway, &id, None, None, "")
+            .unwrap();
+    assert_eq!(kept.provider(&id).unwrap().model_prices.len(), 1);
+    assert_eq!(
+        kept.provider(&id).unwrap().price_for("deepseek-v4-flash"),
+        None
+    );
     assert_eq!(provider.proxy, "socks5://127.0.0.1:1080");
     assert_eq!(provider.relay.base_url, before.base_url);
     assert_eq!(provider.relay.api_key, before.api_key);
     assert_eq!(provider.relay.model_list, before.model_list);
     assert!(
-        codex_plus_core::gateway::apply::set_provider_extras(&ctx.gateway, &id, None, "bad")
+        codex_plus_core::gateway::apply::set_provider_extras(&ctx.gateway, &id, None, None, "bad")
             .is_err()
     );
 }
