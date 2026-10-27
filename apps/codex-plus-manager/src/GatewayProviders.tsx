@@ -1,8 +1,8 @@
-/** 本地网关 · 供应商：网关自己的供应商池（可开关、排序、编辑、删除），下面是「添加供应商」目录。
+/** 本地网关 · 供应商：网关自己的供应商池（可开关、排序、编辑、删除），右上角「添加供应商」打开目录弹窗。
  *
  * 与直连模式完全独立：这里的增删改只动 gateway.json；「导入…」是把直连模式的供应商复制一份过来。
  */
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { createPortal } from "react-dom";
 import { appConfirm } from "./app-dialog";
@@ -75,15 +75,56 @@ export function ProvidersView({
     setCatalogOpen(true);
   };
   const agentPicks = <AgentPicks onChange={setPicked} payload={payload} picked={picked} />;
+  // 拖动排序中的临时顺序；松手后提交，等新数据回来再清掉。
+  const [order, setOrder] = useState<string[] | null>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const needle = query.trim().toLowerCase();
-  const visible = pool.filter((entry) => !needle || entry.name.toLowerCase().includes(needle) || entry.models.some((model) => model.toLowerCase().includes(needle)));
+  const ordered = order ? order.map((id) => pool.find((entry) => entry.id === id)).filter((entry): entry is GatewayPoolEntry => Boolean(entry)) : pool;
+  const visible = ordered.filter((entry) => !needle || entry.name.toLowerCase().includes(needle) || entry.models.some((model) => model.toLowerCase().includes(needle)));
 
-  const drop = (targetId: string) => {
-    if (!dragging || dragging === targetId) return;
-    const ids = pool.map((entry) => entry.id).filter((id) => id !== dragging);
-    ids.splice(ids.indexOf(targetId), 0, dragging);
-    setDragging(null);
-    void run("reorder", "reorder_gateway_providers", { ids }, t("调整顺序"), true);
+  /** 按住把手上下拖动排序。用指针事件实现：桌面端 webview 会拦截 HTML5 拖放，原生 draggable 拖不动。 */
+  const startDrag = (id: string, event: ReactPointerEvent) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const initial = pool.map((entry) => entry.id);
+    let current = initial;
+    setExpanded(null);
+    setDragging(id);
+    setOrder(initial);
+    // 落点按其它行的中线算：指针越过哪几行的中线，就排在它们后面。行高不同、列表正在重排时也不会来回跳。
+    const move = (moveEvent: PointerEvent) => {
+      const others = [...(listRef.current?.querySelectorAll<HTMLElement>("[data-pool-id]") ?? [])]
+        .filter((row) => row.dataset.poolId !== id)
+        .map((row) => {
+          const rect = row.getBoundingClientRect();
+          return { id: row.dataset.poolId ?? "", middle: rect.top + rect.height / 2 };
+        })
+        .sort((left, right) => left.middle - right.middle);
+      if (!others.length) return;
+      const above = others.filter((row) => row.middle < moveEvent.clientY);
+      const next = current.filter((item) => item !== id);
+      const index = above.length ? next.indexOf(above[above.length - 1].id) + 1 : next.indexOf(others[0].id);
+      next.splice(Math.max(index, 0), 0, id);
+      if (next.join("\n") === current.join("\n")) return;
+      current = next;
+      setOrder(next);
+    };
+    const finish = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", finish);
+      document.body.classList.remove("gw-sorting");
+      setDragging(null);
+      if (current.join("\n") === initial.join("\n")) {
+        setOrder(null);
+        return;
+      }
+      void run("reorder", "reorder_gateway_providers", { ids: current }, t("调整顺序"), true).finally(() => setOrder(null));
+    };
+    document.body.classList.add("gw-sorting");
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
   };
 
   /** 登录订阅账号：ChatGPT / ChatGPT API / SuperGrok 走浏览器登录；Copilot 先显示验证码，再等你在 GitHub 上授权。
@@ -130,9 +171,15 @@ export function ProvidersView({
           <Search className="h-4 w-4" />
           <input onChange={(event) => setQuery(event.currentTarget.value)} placeholder={t("查找供应商")} value={query} />
         </label>
+        {pool.length ? (
+          <button className="gw-primary-button" onClick={openCatalog} type="button">
+            <Plus className="h-4 w-4" />
+            {t("添加供应商")}
+          </button>
+        ) : null}
       </div>
       {pool.length ? (
-        <div className="gw-card gw-pool-card">
+        <div className="gw-card gw-pool-card" ref={listRef}>
           {visible.map((entry) => (
             <PoolRow
               busy={busy}
@@ -140,9 +187,7 @@ export function ProvidersView({
               entry={entry}
               expanded={expanded === entry.id}
               key={entry.id}
-              onDragEnd={() => setDragging(null)}
-              onDragStart={() => setDragging(entry.id)}
-              onDrop={() => drop(entry.id)}
+              onGripDown={(event) => startDrag(entry.id, event)}
               onEdit={() => setForm({ mode: "edit", entry })}
               onRelogin={() => void login(entry.account as AccountKind)}
               onToggleExpand={() => setExpanded(expanded === entry.id ? null : entry.id)}
@@ -162,12 +207,7 @@ export function ProvidersView({
             {t("添加供应商")}
           </button>
         </div>
-      ) : (
-        <button className="gw-add-row" onClick={openCatalog} type="button">
-          <Plus className="h-4 w-4" />
-          {t("添加供应商")}
-        </button>
-      )}
+      ) : null}
       {/* 添加供应商是弹出框；选好一项就关掉它，进入对应的填写 / 登录。 */}
       {catalogOpen ? (
         <ProviderCatalog
@@ -197,9 +237,7 @@ function PoolRow({
   expanded,
   dragging,
   onToggleExpand,
-  onDragStart,
-  onDragEnd,
-  onDrop,
+  onGripDown,
   onEdit,
   onRelogin,
 }: {
@@ -210,9 +248,7 @@ function PoolRow({
   expanded: boolean;
   dragging: boolean;
   onToggleExpand: () => void;
-  onDragStart: () => void;
-  onDragEnd: () => void;
-  onDrop: () => void;
+  onGripDown: (event: ReactPointerEvent) => void;
   onEdit: () => void;
   onRelogin: () => void;
 }) {
@@ -236,20 +272,19 @@ function PoolRow({
     if (ok) await run(`remove:${entry.id}`, "delete_gateway_provider", { id: entry.id }, t("删除供应商"));
   };
   return (
-    <div
-      className="gw-pool-item"
-      data-dragging={dragging}
-      data-off={!enabled}
-      onDragOver={(event) => event.preventDefault()}
-      onDrop={(event) => { event.preventDefault(); onDrop(); }}
-    >
-      <div className="gw-pool-row">
+    <div className="gw-pool-item" data-dragging={dragging} data-off={!enabled} data-pool-id={entry.id}>
+      {/* 整行点击展开；把手、开关、按钮各管各的。 */}
+      <div
+        className="gw-pool-row"
+        onClick={(event) => {
+          if ((event.target as HTMLElement).closest("button, a, input, .gw-grip")) return;
+          onToggleExpand();
+        }}
+      >
         <span
           aria-label={t("拖动排序")}
           className="gw-grip"
-          draggable
-          onDragEnd={onDragEnd}
-          onDragStart={(event) => { event.dataTransfer.effectAllowed = "move"; onDragStart(); }}
+          onPointerDown={onGripDown}
           title={t("拖动排序：同一个模型有多家时按这个顺序尝试")}
         >
           <GripVertical className="h-4 w-4" />
@@ -282,7 +317,7 @@ function PoolRow({
           <div className="gw-detail-row">
             <span className="gw-detail-label">Key</span>
             <div className="gw-detail-value gw-chip-row">
-              <span>{entry.keyCount > 1 ? tf("{0} 个 Key 轮换", [entry.keyCount]) : t("一个 Key")}</span>
+              <span>{entry.keyCount > 1 ? tf("{0} 个 Key 轮换", [entry.keyCount]) : tf("{0} 个 Key", [1])}</span>
               {failures.map((key) => (
                 <span className="gw-key-failure" key={key.keyId}>
                   {`${key.keyId}：${[t(failureLabel(key.lastFailure)) || t(key.state === "disabled" ? "已停用" : "冷却中"), formatRemaining(key.remainingMs)].filter(Boolean).join(" · ")}`}

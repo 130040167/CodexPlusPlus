@@ -174,7 +174,7 @@ test("成员状态：正在回答 > 熔断 / Key 全部冷却 > 最近回答了�
   assert.equal(memberStatus(data, "glm").state, "cooling");
   data.activity!.agents[0].inFlight = ["glm"];
   assert.deepEqual(memberStatus(data, "glm"), { state: "busy", text: "正在回答…", args: [] });
-  assert.deepEqual(memberStatus(payload(), "bare"), { state: "idle", text: "一个 Key", args: [] });
+  assert.deepEqual(memberStatus(payload(), "bare"), { state: "idle", text: "{0} 个 Key", args: [1] });
 });
 
 test("路由页：所有接入的 Agent 共用一张卡片；成员是池里打开的供应商", () => {

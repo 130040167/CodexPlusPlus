@@ -495,7 +495,7 @@ export function memberStatus(payload: GatewayPayload | null, relayId: string): M
     .sort((left, right) => (right.last?.finishedAtMs ?? 0) - (left.last?.finishedAtMs ?? 0))[0];
   if (answered) return { state: "answered", text: "回答了 {0}", args: [agentName(answered.agent)] };
   if (unhealthy.length) return { state: "idle", text: "{0} 个 Key · {1} 个冷却中", args: [keyCount, unhealthy.length] };
-  return keyCount > 1 ? { state: "idle", text: "{0} 个 Key", args: [keyCount] } : { state: "idle", text: "一个 Key", args: [] };
+  return { state: "idle", text: "{0} 个 Key", args: [Math.max(keyCount, 1)] };
 }
 
 export function formatElapsed(ms: number): string {

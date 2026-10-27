@@ -2995,3 +2995,40 @@ span.gw-avatar[data-size] {
   padding: 10px 16px;
   border-top: 1px solid hsl(var(--border));
 }
+
+/* 供应商池：右上角「添加供应商」、整行点击展开、指针拖动排序。 */
+.shell .gw-provider-search-row {
+  align-items: center;
+  gap: 10px;
+}
+
+.shell .gw-pool-row {
+  cursor: pointer;
+}
+
+.shell .gw-grip {
+  touch-action: none;
+}
+
+.shell .gw-pool-item[data-dragging="true"] {
+  position: relative;
+  z-index: 1;
+  background: var(--gw-soft);
+  opacity: 1;
+  box-shadow: 0 6px 18px hsl(var(--shadow-color) / 0.18);
+}
+
+.shell .gw-pool-item[data-dragging="true"] .gw-grip {
+  opacity: 1;
+}
+
+body.gw-sorting,
+body.gw-sorting * {
+  cursor: grabbing !important;
+  user-select: none !important;
+}
+
+/* 明细最后一行左边是一句长说明，不能套用上面固定宽度的标签列，否则会压到右边的按钮。 */
+.shell .gw-detail-row.gw-detail-foot {
+  grid-template-columns: auto minmax(0, 1fr);
+}
