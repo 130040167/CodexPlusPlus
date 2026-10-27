@@ -336,8 +336,17 @@ fn refresh_agents<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
     result
 }
 
+/// 界面每隔几秒轮询一次：读设置、gateway.json、检查各 Agent 配置漂移都是文件 IO，
+/// 放到阻塞线程池里做，不占主线程。返回格式不变。
 #[tauri::command]
-pub fn load_gateway() -> CommandResult<Option<GatewayPayload>> {
+pub async fn load_gateway() -> CommandResult<Option<GatewayPayload>> {
+    match tauri::async_runtime::spawn_blocking(load_gateway_blocking).await {
+        Ok(result) => result,
+        Err(error) => failed(&format!("读取网关状态失败：{error}"), None),
+    }
+}
+
+fn load_gateway_blocking() -> CommandResult<Option<GatewayPayload>> {
     let settings = SettingsStore::default().load().unwrap_or_default();
     match GatewayStore::default().load() {
         Ok(gateway) => ok("网关状态已加载。", Some(build_payload(&settings, gateway))),
@@ -738,13 +747,17 @@ pub async fn import_gateway_providers(
                     &item.id,
                     skip,
                 )?;
+                // 部分成员失败时 outcome 照样带着已导入的数目，失败原因在 notes 里。
                 added += outcome.added;
-                if let Some(id) = outcome.group
-                    && let Some(group) = GatewayStore::default().load()?.group(&id)
-                {
-                    groups.push(group.name.clone());
-                }
                 notes.extend(outcome.notes);
+                if let Some(id) = outcome.group {
+                    let name = GatewayStore::default()
+                        .load()
+                        .ok()
+                        .and_then(|gateway| gateway.group(&id).map(|group| group.name.clone()))
+                        .unwrap_or(id);
+                    groups.push(name);
+                }
                 Ok(())
             })(),
             source => import_from_direct(source, &item.id, skip).map(|_| added += 1),
