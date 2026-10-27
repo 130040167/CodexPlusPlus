@@ -474,6 +474,20 @@ pub fn save_gateway_auto_models(enabled: bool) -> CommandResult<Option<GatewayPa
     )
 }
 
+/// 「模型名后带供应商」：多家都有的模型在 Codex 的模型列表和输入框里名字后面带不带「（供应商）」。
+#[tauri::command]
+pub fn save_gateway_model_suffix(enabled: bool) -> CommandResult<Option<GatewayPayload>> {
+    let result = GatewayStore::default().update(|gateway| {
+        gateway.model_suffix = enabled;
+        Ok(())
+    });
+    respond(
+        "网关选项已保存。",
+        "保存网关选项失败",
+        refresh_agents(result),
+    )
+}
+
 /// 自动组卡片上的设置（模式、会话固定、隐藏成员、手动选中的成员、隐藏整个自动组）。和默认一样时记录会被删掉。
 #[tauri::command]
 pub fn save_gateway_auto_group(

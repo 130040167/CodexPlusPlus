@@ -718,6 +718,7 @@ function GatewayView({ payload, busy, run }: { payload: GatewayPayload | null; b
   if (!payload) return null;
   const mode = payload.gateway.keyPolicy.mode;
   const restoreOnExit = payload.gateway.restoreOnExit;
+  const modelSuffix = payload.gateway.modelSuffix !== false;
   const saveOptions = (keyRotation: string, restore: boolean) => void run("options", "save_gateway_options", { keyRotation, restoreOnExit: restore }, t("保存网关选项"), true);
   return (
     <>
@@ -776,6 +777,21 @@ function GatewayView({ payload, busy, run }: { payload: GatewayPayload | null; b
           </div>
           <span />
           <Switch disabled={busy !== null} label={t("退出 Codex++ 时恢复直连")} on={restoreOnExit} onToggle={() => saveOptions(mode, !restoreOnExit)} />
+        </div>
+        <div className="gw-setting-row">
+          <div>
+            <strong>{t("模型名后带供应商")}</strong>
+            <small>{modelSuffix
+              ? t("多家都有的模型，在 Codex 的模型列表和输入框里显示成「GPT-6 Astra（ChatGPT Pro）」，自动组显示「（自动）」。")
+              : t("只显示模型名「GPT-6 Astra」，看不出是哪一家；Codex 选择器里仍按供应商分组。")}</small>
+          </div>
+          <span />
+          <Switch
+            disabled={busy !== null}
+            label={t("模型名后带供应商")}
+            on={modelSuffix}
+            onToggle={() => void run("model-suffix", "save_gateway_model_suffix", { enabled: !modelSuffix }, t("保存网关选项"), true)}
+          />
         </div>
       </div>
     </>

@@ -39,6 +39,8 @@ export type GatewaySettings = {
   trayPanel?: boolean;
   /** 多家都有的模型额外列一份「自动」（按顺序在各家之间切换）。默认关。 */
   autoModels?: boolean;
+  /** 多家都有的模型在 Codex 里名字后面带不带「（供应商）」（旧版后端没有，视为带）。 */
+  modelSuffix?: boolean;
   /** 模型收藏（管理器模型下拉里的星标），Codex 的选择器里也显示。 */
   favoriteModels?: string[];
 };

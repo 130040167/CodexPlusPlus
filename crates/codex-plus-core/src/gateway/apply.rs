@@ -329,6 +329,11 @@ pub fn codex_gateway_profile(
     Ok(profile)
 }
 
+/// 「模型名后带供应商」关掉时用的看不见的标记：各家那份追加 N 个零宽空格（N 是这家在池里的位置），
+/// 自动那份追加一个零宽非连接符。看起来和模型名一样，分组脚本按原文比对时又互不相同。
+const PROVIDER_MARK: &str = "\u{200B}";
+const AUTO_MARK: &str = "\u{200C}";
+
 /// Codex 模型选择器的注入层能从显示名尾部 `（…）` 认出的供应商名最长多少字（见 71-model-picker-groups.js）。
 const CODEX_GROUP_SUFFIX_MAX: usize = 24;
 
@@ -403,7 +408,12 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
         let providers = route::serving_count(&relays, &upstream);
         if providers > 1 && upstream == model {
             // 多家自动切换入口：单独一组，按池顺序依次尝试各家。
-            fields.insert("display_name".into(), json!(format!("{display}（自动）")));
+            let marked = if gateway.model_suffix {
+                format!("{display}（自动）")
+            } else {
+                format!("{display}{AUTO_MARK}")
+            };
+            fields.insert("display_name".into(), json!(marked));
             fields.insert(
                 "description".into(),
                 json!(format!("{model} · {providers} 家按顺序自动切换")),
@@ -425,13 +435,16 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
         // 多家都有的模型，每家那份显示名带 `（供应商）` 后缀：选择器按整行文字认分组，同名的几行
         // 不加后缀就分不开（与直连模式按模型聚合的写法一致，注入层会去掉后缀再显示），
         // 选中后输入框里也看得出是哪一家。注入层只认 24 个字以内的后缀，账号名太长时用供应商 id。
-        let display = if providers > 1 {
+        // 「模型名后带供应商」关掉时，换成看不见的标记（每家不同），选择器照样分得清，界面上只显示模型名。
+        let display = if providers <= 1 {
+            display
+        } else if gateway.model_suffix {
             format!(
                 "{display}（{}）",
                 codex_group_suffix(relay, &group, &relays)
             )
         } else {
-            display
+            format!("{display}{}", PROVIDER_MARK.repeat(index + 1))
         };
         fields.insert("display_name".into(), json!(display));
         fields.insert("description".into(), json!(format!("{upstream} · {group}")));

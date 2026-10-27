@@ -544,6 +544,41 @@ fn codex_gateway_catalog_carries_display_names_reasoning_and_provider_groups() {
         ui["codex_plus_group_id"],
         profile_id_of(ctx, "ChatGPT Pro · 2649340134@qq.com")
     );
+
+    // 关掉「模型名后带供应商」：同名几份的显示名只差看不见的零宽字符，去掉它们都是模型名本身，但互不相同。
+    ctx.gateway
+        .update(|gateway| {
+            gateway.model_suffix = false;
+            Ok(())
+        })
+        .unwrap();
+    refresh_enabled(ctx).unwrap();
+    let settings = ctx.settings.load().unwrap();
+    let profile = settings
+        .relay_profiles
+        .iter()
+        .find(|profile| profile.id == "codex-plus-gateway")
+        .unwrap();
+    let metadata: Value = serde_json::from_str(&profile.model_metadata).unwrap();
+    let names: Vec<String> = [
+        format!("{deepseek_id}/deepseek-v4-pro"),
+        format!("{second_id}/deepseek-v4-pro"),
+        "deepseek-v4-pro".to_string(),
+    ]
+    .iter()
+    .map(|slug| metadata[slug]["display_name"].as_str().unwrap().to_string())
+    .collect();
+    for name in &names {
+        assert_eq!(
+            name.replace(['\u{200B}', '\u{200C}'], ""),
+            "DeepSeek-V4-Pro",
+            "{name:?}"
+        );
+        assert!(!name.contains('（'), "看不到供应商后缀：{name:?}");
+    }
+    assert_ne!(names[0], names[1]);
+    assert_ne!(names[1], names[2]);
+    assert_ne!(names[0], names[2]);
 }
 
 fn profile_id_of(ctx: &ApplyContext, name: &str) -> String {

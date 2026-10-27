@@ -12541,6 +12541,10 @@
       if (!provider || !groupId) return;
       // 在 Codex++ 里收藏过的模型（网关写的 `codex_plus_favorite`）：行尾画星标。
       const value = { provider, groupId, favorite: entry.codex_plus_favorite === true };
+      // 原文键：网关关掉「模型名后带供应商」时，同名的几份只差末尾看不见的零宽字符，
+      // 宽松归一化会把它们抹掉，必须先按原文比对。
+      const rawKey = `raw\u0000${String(displayName).replace(/\s+/g, " ").trim()}`;
+      if (!map.has(rawKey)) map.set(rawKey, value);
       const fullKey = codexPlusModelPickerNormalizeLoose(displayName);
       if (fullKey && !map.has(fullKey)) map.set(fullKey, value);
       const split = codexPlusModelPickerSplitLabel(displayName);
@@ -12621,7 +12625,8 @@
       const pairKey = split.provider
         ? `${codexPlusModelPickerNormalizeLoose(split.name)}\u0000${codexPlusModelPickerNormalizeLoose(split.provider)}`
         : "";
-      const exactKnown = exact.get(codexPlusModelPickerNormalizeLoose(identity.text))
+      const exactKnown = exact.get(`raw\u0000${identity.text}`)
+        || exact.get(codexPlusModelPickerNormalizeLoose(identity.text))
         || (pairKey ? exact.get(pairKey) : null);
       const known = exactKnown
         || (!split.provider

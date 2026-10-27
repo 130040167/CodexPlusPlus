@@ -392,6 +392,10 @@ pub struct GatewaySettings {
     /// 旧文件（version < 3）里的 false 是当时的默认值，读的时候迁移成开，见 [`read_store`]。
     #[serde(default = "enabled_by_default")]
     pub auto_models: bool,
+    /// 多家都有的模型，在 Codex 的模型列表和输入框里名字后面带不带「（供应商）」。默认带。
+    /// 关掉时名字后面换成看不见的字符：分组脚本照样能分清是哪一家，界面上只显示模型名。
+    #[serde(default = "enabled_by_default")]
+    pub model_suffix: bool,
     /// 自动组上改过的设置（键是小写模型名）。没改过的自动组不落盘，跟着供应商池自动变化。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub auto_groups: BTreeMap<String, AutoGroupSettings>,
@@ -422,6 +426,7 @@ impl Default for GatewaySettings {
             groups: Vec::new(),
             tray_panel: true,
             auto_models: true,
+            model_suffix: true,
             auto_groups: BTreeMap::new(),
             favorite_models: Vec::new(),
             app_version: String::new(),
