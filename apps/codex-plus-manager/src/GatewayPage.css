@@ -3053,3 +3053,81 @@ body.gw-sorting * {
   align-items: center;
   gap: 6px;
 }
+
+/* Agent 接入：开关在左 · 图标 · 名称与状态标签 · 默认模型 · 展开箭头 */
+.shell .gw-agent > .gw-agent-row {
+  grid-template-columns: auto 34px minmax(0, 1fr) minmax(200px, 300px) 24px;
+  gap: 14px;
+}
+
+.shell .gw-agent > .gw-agent-row[data-clickable="true"] {
+  cursor: pointer;
+}
+
+.shell .gw-agent > .gw-agent-row[data-clickable="true"]:hover {
+  background: var(--gw-soft);
+}
+
+.shell .gw-agent > .gw-agent-row .gw-chevron:disabled {
+  visibility: hidden;
+}
+
+.shell .gw-agent-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.shell .gw-agent-meta > span:not(.gw-agent-badge):not(.gw-agent-count) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.shell .gw-agent-badge {
+  flex: none;
+  padding: 0 7px;
+  border: 1px solid var(--gw-line);
+  border-radius: 5px;
+  color: var(--gw-mute);
+  font-size: 11.5px;
+  line-height: 18px;
+}
+
+.shell .gw-agent-badge[data-tone="on"] {
+  border-color: hsl(var(--status-success, 142 60% 45%) / 0.4);
+  color: hsl(var(--status-success, 142 60% 45%));
+}
+
+.shell .gw-agent-badge[data-tone="error"] {
+  border-color: hsl(var(--status-error) / 0.4);
+  color: hsl(var(--status-error));
+}
+
+.shell .gw-agent-count {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.shell .gw-agent-count svg {
+  width: 13px;
+  height: 13px;
+  opacity: 0.75;
+}
+
+.shell .gw-agent-card > .gw-subhead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.shell .gw-agent-card > .gw-subhead em {
+  color: var(--gw-mute);
+  font-size: 11.5px;
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+}

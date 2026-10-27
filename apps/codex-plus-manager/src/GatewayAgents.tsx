@@ -2,7 +2,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { appConfirm } from "./app-dialog";
-import { Check, ChevronDown, ChevronRight, ChevronUp, List, Search, Star, Unplug, Waypoints } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, ChevronUp, Layers, List, Search, Star, Unplug, Waypoints } from "lucide-react";
 import { t, tf } from "./i18n";
 import {
   agentModels,
@@ -56,12 +56,11 @@ export function AgentsView({
   );
   return (
     <>
-      <p className="gw-lead">
-        {t("打开「接入」后，Codex++ 中配置的模型会作为")} <strong>Codex++</strong> {t("供应商出现在 Agent 的模型列表里；也可在此直接选模型。")}
-      </p>
+      <p className="gw-lead">{t("接入后 Agent 的请求经 Codex++ 转发到供应商池。右侧选的是默认模型，在 Agent 里随时可以换。")}</p>
       <div className="gw-card gw-agent-card">
+        {connected.length ? <div className="gw-subhead">{t("已接入")}<em>{connected.length}</em></div> : null}
         {connected.map(row)}
-        {others.length ? <div className="gw-subhead">{t("未设置")}</div> : null}
+        {others.length ? <div className="gw-subhead">{t("未接入")}<em>{others.length}</em></div> : null}
         {others.map(row)}
         {!payload ? <div className="gw-empty">{t("正在读取…")}</div> : null}
       </div>
@@ -139,28 +138,41 @@ function AgentRow({
   const modelCount = agentModels(payload, draft.poolExclude).length;
   const reconnect = () =>
     run(`save:${agent.agent}`, "save_gateway_binding", { agent: agent.agent, binding: bindingFromDraft(draft, binding) }, t("重新接入"));
-  const status = drift
+  // 状态标签：短词；出问题时才写一句说明。
+  const badge = drift ? t("被改动") : connected ? (running ? t("已接入") : t("网关未运行")) : t("未接入");
+  const note = drift
     ? tf("配置被 {0} 改了，{1} 现在不经过 Codex++", [drift.by || t("其它工具"), agent.name])
-    : connected
-    ? running
-      ? isClaude
-        ? t("已接入 · 在 /model 里切换 opus · sonnet · haiku 档")
-        : tf("已接入 · {0} 的模型列表里有 {1} 个模型", [agent.name, agent.models.length])
-      : t("已接入 · 网关没有运行")
-    : tf("未接入 · 用 {0} 自己的设置", [agent.name]);
+    : connected && isClaude
+    ? "opus · sonnet · haiku"
+    : "";
 
   return (
     <div className="gw-agent" data-expanded={expanded}>
-      <div className="gw-agent-row">
+      {/* 开关在最左；已接入时整行点击展开详情，模型下拉和开关各管各的。 */}
+      <div
+        className="gw-agent-row"
+        data-clickable={connected}
+        onClick={(event) => {
+          if (!connected || (event.target as HTMLElement).closest("button, a, input")) return;
+          onToggleExpand();
+        }}
+      >
+        <Switch disabled={busy !== null} label={tf("{0} 接入 Codex++", [agent.name])} on={connected} onToggle={toggle} />
         <span className="gw-agent-icon-box"><AgentIcon agent={agent.agent} className="gw-agent-icon" /></span>
         <div className="gw-agent-main">
           <div className="gw-agent-title">
             <strong>{agent.name}</strong>
             {agent.version ? <span className="gw-version">{agent.version}</span> : null}
           </div>
-          <small title={drift?.endpoint ? tf("现在连的是 {0}", [drift.endpoint]) : undefined}>
-            <i className="gw-dot" data-tone={tone} />
-            {status}
+          <small className="gw-agent-meta" title={drift?.endpoint ? tf("现在连的是 {0}", [drift.endpoint]) : undefined}>
+            <span className="gw-agent-badge" data-tone={tone}>{badge}</span>
+            {connected && !drift ? (
+              <span className="gw-agent-count" title={tf("{0} 个模型", [modelCount])}>
+                <Layers aria-hidden="true" />
+                {modelCount}
+              </span>
+            ) : null}
+            {note ? <span>{note}</span> : null}
             {drift ? (
               <button className="gw-link gw-drift-reconnect" disabled={busy !== null} onClick={() => void reconnect()} type="button">
                 {t("重新接入")}
@@ -168,16 +180,6 @@ function AgentRow({
             ) : null}
           </small>
         </div>
-        {connected ? (
-          expanded ? (
-            <button className="gw-soft-button" onClick={onToggleExpand} type="button">{t("收起")}</button>
-          ) : (
-            <button aria-expanded={false} className="gw-link" onClick={onToggleExpand} type="button">
-              {isClaude ? t("档位") : tf("模型 {0}", [modelCount])}
-              <ChevronRight className="h-3.5 w-3.5" />
-            </button>
-          )
-        ) : <span />}
         <ModelPicker
           agent={agent}
           connected={connected}
@@ -191,7 +193,17 @@ function AgentRow({
           open={pickerOpen}
           payload={payload}
         />
-        <Switch disabled={busy !== null} label={tf("{0} 接入 Codex++", [agent.name])} on={connected} onToggle={toggle} />
+        <button
+          aria-expanded={expanded}
+          aria-label={isClaude ? t("档位") : t("详情")}
+          className="gw-chevron"
+          data-open={expanded}
+          disabled={!connected}
+          onClick={onToggleExpand}
+          type="button"
+        >
+          <ChevronRight className="h-4 w-4" />
+        </button>
       </div>
       {expanded && connected ? (
         <>
