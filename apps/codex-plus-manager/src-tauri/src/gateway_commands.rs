@@ -1132,6 +1132,126 @@ fn open_in_browser(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
+/// 进行中的订阅登录（ChatGPT / ChatGPT API / SuperGrok 的浏览器回调、Copilot 的设备码轮询）。
+/// 同一时间只留一个：登录跑在单独的任务里，取消或开始新的登录时 abort 掉它，
+/// 回调端口随监听器一起释放、轮询随任务停止。存的是（序号，中止函数）。
+type LoginAbort = (u64, Box<dyn Fn() + Send>);
+static LOGIN_TASK: std::sync::Mutex<Option<LoginAbort>> = std::sync::Mutex::new(None);
+static LOGIN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 登录被用户取消时的提示；界面按 status `cancelled` 识别，不弹失败提示。
+const LOGIN_CANCELLED: &str = "登录已取消。";
+
+fn login_slot() -> std::sync::MutexGuard<'static, Option<LoginAbort>> {
+    LOGIN_TASK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 登录的结局：完成（成功或失败）或被取消。
+enum LoginOutcome<T> {
+    Done(anyhow::Result<T>),
+    Cancelled,
+}
+
+/// 把一次登录放进可取消的任务里跑完。开始前先中止上一次还没结束的登录。
+async fn cancellable_login<T, F>(login: F) -> LoginOutcome<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
+{
+    let handle = tauri::async_runtime::spawn(login);
+    let id = LOGIN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    {
+        let abort = handle.inner().abort_handle();
+        let mut slot = login_slot();
+        if let Some((_, previous)) = slot.take() {
+            previous();
+        }
+        *slot = Some((id, Box::new(move || abort.abort())));
+    }
+    let joined = handle.await;
+    {
+        let mut slot = login_slot();
+        if slot.as_ref().is_some_and(|(current, _)| *current == id) {
+            *slot = None;
+        }
+    }
+    match joined {
+        Ok(result) => LoginOutcome::Done(result),
+        Err(tauri::Error::JoinError(error)) if error.is_cancelled() => LoginOutcome::Cancelled,
+        Err(error) => LoginOutcome::Done(Err(anyhow::anyhow!("登录任务异常退出：{error}"))),
+    }
+}
+
+/// 登录命令统一的返回：成功刷新价格 / 额度 / Agent，取消时返回 `cancelled`。
+fn login_response(outcome: LoginOutcome<String>) -> CommandResult<Option<GatewayPayload>> {
+    match outcome {
+        LoginOutcome::Cancelled => CommandResult {
+            status: "cancelled".to_string(),
+            message: LOGIN_CANCELLED.to_string(),
+            payload: current_payload(),
+        },
+        LoginOutcome::Done(result) => match refresh_added(result) {
+            Ok(message) => ok(&message, current_payload()),
+            Err(error) => failed(&format!("登录失败：{error:#}"), current_payload()),
+        },
+    }
+}
+
+/// 取消进行中的订阅登录（关掉验证码弹窗、点「取消登录」时调用）。没有进行中的登录时什么也不做。
+#[tauri::command]
+pub fn cancel_gateway_login() -> CommandResult<()> {
+    let cancelled = login_slot().take().map(|(_, abort)| abort()).is_some();
+    ok(
+        if cancelled {
+            LOGIN_CANCELLED
+        } else {
+            "没有进行中的登录。"
+        },
+        (),
+    )
+}
+
+#[cfg(test)]
+mod login_tests {
+    use super::{LoginOutcome, cancel_gateway_login, cancellable_login, login_slot};
+
+    /// 等后台登录任务登记好中止函数。
+    fn wait_registered() {
+        for _ in 0..200 {
+            if login_slot().is_some() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("登录任务没有登记");
+    }
+
+    #[test]
+    fn login_can_be_cancelled_and_a_new_login_aborts_the_previous_one() {
+        tauri::async_runtime::block_on(async {
+            // 取消：一直等不到回调的登录被中止，返回 Cancelled，登记位清空。
+            let waiting = tauri::async_runtime::spawn(cancellable_login(std::future::pending::<
+                anyhow::Result<String>,
+            >()));
+            wait_registered();
+            assert_eq!(cancel_gateway_login().status, "ok");
+            assert!(matches!(waiting.await.unwrap(), LoginOutcome::Cancelled));
+            assert!(login_slot().is_none());
+
+            // 开始新的登录时中止上一次；新的照常完成。
+            let first = tauri::async_runtime::spawn(cancellable_login(std::future::pending::<
+                anyhow::Result<String>,
+            >()));
+            wait_registered();
+            let second = cancellable_login(async { Ok("done".to_string()) }).await;
+            assert!(matches!(second, LoginOutcome::Done(Ok(ref message)) if message == "done"));
+            assert!(matches!(first.await.unwrap(), LoginOutcome::Cancelled));
+            assert!(login_slot().is_none());
+        });
+    }
+}
+
 /// 在网关里登录 ChatGPT 订阅：浏览器登录后加进网关的供应商池。同一个账号再登录只更新 token。
 /// 与 Codex 自己的登录是两次独立的登录，互不影响。
 #[tauri::command]
@@ -1139,7 +1259,7 @@ pub async fn login_gateway_chatgpt(
     skip_agents: Option<Vec<String>>,
 ) -> CommandResult<Option<GatewayPayload>> {
     use codex_plus_core::gateway::accounts;
-    let result: anyhow::Result<String> = async {
+    let outcome = cancellable_login(async move {
         let account = accounts::chatgpt_login(open_in_browser).await?;
         let store = GatewayStore::default();
         let mut gateway = store.load()?;
@@ -1169,13 +1289,9 @@ pub async fn login_gateway_chatgpt(
         } else {
             format!("已添加「{name}」，{} 个模型。", models.len())
         })
-    }
+    })
     .await;
-    let result = refresh_added(result);
-    match result {
-        Ok(message) => ok(&message, current_payload()),
-        Err(error) => failed(&format!("登录失败：{error:#}"), current_payload()),
-    }
+    login_response(outcome)
 }
 
 /// 账号类供应商（Copilot / SuperGrok）加进网关池；同一个账号（按 `identity_field`）已存在时只换凭据。
@@ -1244,15 +1360,12 @@ pub async fn finish_gateway_copilot_login(
     code: codex_plus_core::gateway::accounts::DeviceCode,
     skip_agents: Option<Vec<String>>,
 ) -> CommandResult<Option<GatewayPayload>> {
-    let result = async {
+    let outcome = cancellable_login(async move {
         let relay = codex_plus_core::gateway::accounts::copilot_finish(&code).await?;
         add_account_provider(relay, "copilot", "login", skip_agents.as_deref())
-    }
+    })
     .await;
-    match refresh_added(result) {
-        Ok(message) => ok(&message, current_payload()),
-        Err(error) => failed(&format!("登录失败：{error:#}"), current_payload()),
-    }
+    login_response(outcome)
 }
 
 /// 在网关里登录 SuperGrok：浏览器登录后加进网关池。与 Grok CLI 自己的登录互不影响。
@@ -1261,7 +1374,7 @@ pub async fn login_gateway_grok(
     skip_agents: Option<Vec<String>>,
 ) -> CommandResult<Option<GatewayPayload>> {
     use codex_plus_core::gateway::accounts;
-    let result = async {
+    let outcome = cancellable_login(async move {
         let tokens = accounts::grok_login(open_in_browser).await?;
         let models = accounts::grok_models(&tokens.access_token).await;
         add_account_provider(
@@ -1270,12 +1383,9 @@ pub async fn login_gateway_grok(
             "email",
             skip_agents.as_deref(),
         )
-    }
+    })
     .await;
-    match refresh_added(result) {
-        Ok(message) => ok(&message, current_payload()),
-        Err(error) => failed(&format!("登录失败：{error:#}"), current_payload()),
-    }
+    login_response(outcome)
 }
 
 /// 在网关里登录 ChatGPT API（OpenAI 的「用 ChatGPT 登录」）：套餐额度直接用在 api.openai.com 上，
@@ -1285,7 +1395,7 @@ pub async fn login_gateway_chatgpt_api(
     skip_agents: Option<Vec<String>>,
 ) -> CommandResult<Option<GatewayPayload>> {
     use codex_plus_core::gateway::accounts;
-    let result = async {
+    let outcome = cancellable_login(async move {
         let state_dir = codex_plus_core::paths::default_app_state_dir();
         let account = accounts::chatgpt_api_login(&state_dir, open_in_browser).await?;
         let models = accounts::chatgpt_api_models(
@@ -1299,12 +1409,9 @@ pub async fn login_gateway_chatgpt_api(
             "subject",
             skip_agents.as_deref(),
         )
-    }
+    })
     .await;
-    match refresh_added(result) {
-        Ok(message) => ok(&message, current_payload()),
-        Err(error) => failed(&format!("登录失败：{error:#}"), current_payload()),
-    }
+    login_response(outcome)
 }
 
 /// 清掉某个供应商的 Key 冷却与熔断状态。
