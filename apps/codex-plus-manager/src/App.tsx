@@ -15,7 +15,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import {
   ArrowLeft,
@@ -114,6 +114,7 @@ import { rebaseSettingsEdits } from "./settings-rebase";
 import { summarizeRecentRequests, type RecentRequestSummary } from "./overview-model";
 import { AgentCollaborationPage } from "./AgentCollaborationPage";
 import { SectionLabel, Switch } from "./gateway-ui";
+import { parseTrayRequest, TRAY_REQUEST_EVENT, TRAY_RESULT_EVENT, type TrayRequest, type TrayResult } from "./tray-panel-model";
 import { AppSelect, type AppSelectOption } from "./AppSelect";
 import { AppDialogHost, appAlert, appConfirm, appPrompt } from "./app-dialog";
 import { GatewayPage, type GatewayTab } from "./GatewayPage";
@@ -2739,20 +2740,25 @@ export function App() {
     }
   };
 
-  const launch = async () => {
-    if (launchPendingRef.current) return;
+  /** 启动 Codex；返回是否确认启动成功（托盘面板据此决定要不要把主窗口叫出来看提示）。 */
+  const launch = async (): Promise<boolean> => {
+    if (launchPendingRef.current) return false;
     launchPendingRef.current = true;
     setLaunchPending(true);
     try {
       const result = await launchCommand("launch_codex_plus");
-      if (!result) return;
+      if (!result) return false;
       if (!isSuccessStatus(result.status)) {
         showNotice(t("启动任务"), result.message, result.status);
-        return;
+        return false;
       }
       showNotice(t("启动任务"), t("正在等待 Codex 启动结果…"), "accepted");
       const completion = await waitForLaunchCompletion(result.launchStartedAtMs);
       showLaunchCompletionNotice(t("启动任务"), completion, result.launchStartedAtMs);
+      return Boolean(
+        completion
+        && resolveLaunchStatus(completion.latest_launch, result.launchStartedAtMs ?? 0) === "success",
+      );
     } finally {
       launchPendingRef.current = false;
       setLaunchPending(false);
@@ -2792,14 +2798,15 @@ export function App() {
   };
 
   /** 侧栏 Codex 行的「停止」：结束主 Codex，和重启共用停止流程。 */
-  const stopCodex = async () => {
-    if (launchPendingRef.current) return;
+  const stopCodex = async (): Promise<boolean> => {
+    if (launchPendingRef.current) return false;
     launchPendingRef.current = true;
     setLaunchPending(true);
     try {
       const result = await launchCommand("stop_codex_plus");
       if (result) showNotice(t("停止 Codex"), result.message, result.status);
       await refreshOverview(true);
+      return Boolean(result && isSuccessStatus(result.status));
     } finally {
       launchPendingRef.current = false;
       setLaunchPending(false);
@@ -3601,15 +3608,15 @@ export function App() {
     next: BackendSettings,
     previousActiveRelayId = settingsForm.activeRelayId,
     liveConflictResolution?: LiveConflictResolution,
-  ) => {
+  ): Promise<boolean> => {
     if (relaySwitching) {
       showNotice(t("供应商切换中"), t("上一次切换还没有完成，请稍后再试。"), "failed");
-      return;
+      return false;
     }
     let switchSettings = normalizeSettings(next);
     if (!switchSettings.relayProfilesEnabled) {
       showNotice(t("供应商配置已关闭"), t("当前不会写入 Codex config.toml / auth.json。打开供应商配置总开关后再切换。"), "failed");
-      return;
+      return false;
     }
     const targetBeforeSnapshot = activeRelayProfile(switchSettings);
     logDiagnostic("switchRelayProfile.start", {
@@ -3627,7 +3634,7 @@ export function App() {
         error: validationError,
       });
       showNotice(t("供应商配置可能不正确"), validationError, "failed");
-      return;
+      return false;
     }
     // 用户已在冲突弹窗里做了选择时，回填交给后端按选择处理，不再先跑一遍注定失败的回填。
     if (!liveConflictResolution) {
@@ -3644,6 +3651,7 @@ export function App() {
       liveConflictResolution: liveConflictResolution ?? null,
     });
     let liveConflict: { profileId: string; profileName: string } | null = null;
+    let switched = false;
     setRelaySwitching(true);
     try {
       const result = await run(() =>
@@ -3655,7 +3663,7 @@ export function App() {
         logDiagnostic("switchRelayProfile.apply_no_result", {
           targetRelayId: selectedAfterSave.id,
         });
-        return;
+        return false;
       }
       const selectedSettings = normalizeSettings(result.settings);
       setSettings({
@@ -3695,12 +3703,15 @@ export function App() {
           status: result.status,
         });
         if (liveConflictResolution) showNotice(t("供应商切换"), result.message, result.status);
+        switched = true;
       }
     } finally {
       setRelaySwitching(false);
     }
     const conflict = liveConflict;
-    if (!conflict) return;
+    if (!conflict) return switched;
+    // 从托盘面板发起时主窗口可能是隐藏的：弹窗前先把主窗口叫出来，否则弹窗没人看得见。
+    void invoke("tray_panel_action", { action: "open" }).catch(() => {});
     const choice = await new Promise<LiveConflictResolution | null>((resolve) => {
       setLiveConflictDialog({ profileName: conflict.profileName, resolve });
     });
@@ -3708,7 +3719,8 @@ export function App() {
       profileId: conflict.profileId,
       choice: choice ?? "cancel",
     });
-    if (choice) await switchRelayProfile(next, previousActiveRelayId, choice);
+    if (!choice) return false;
+    return switchRelayProfile(next, previousActiveRelayId, choice);
   };
 
   const snapshotActiveRelayFilesBeforeSwitch = async (
@@ -3828,6 +3840,58 @@ export function App() {
     let stopListening: (() => void) | undefined;
     void listen(MANAGER_NAVIGATION_EVENT, () => {
       if (!disposed) void consumePendingManagerNavigation();
+    }).then((unlisten) => {
+      if (disposed) {
+        unlisten();
+      } else {
+        stopListening = unlisten;
+      }
+    });
+    return () => {
+      disposed = true;
+      stopListening?.();
+    };
+  }, []);
+
+  // 托盘快捷面板发来的请求：打开某页、切换供应商、启动 / 重启 / 停止 Codex。
+  // 复用主窗口现有流程（校验、冲突弹窗、等待启动结果），做完给面板回一个结果；
+  // 没成功时把主窗口叫出来，失败提示是在主窗口里弹的。
+  // 监听只注册一次，处理函数每次渲染更新到 ref 里，读到的总是最新状态。
+  const trayRequestHandlerRef = useRef<(request: TrayRequest) => Promise<TrayResult>>(async (request) => ({ id: request.id, ok: false }));
+  trayRequestHandlerRef.current = async (request: TrayRequest): Promise<TrayResult> => {
+    const revealMainWindow = () => void invoke("tray_panel_action", { action: "open" }).catch(() => {});
+    if (request.kind === "navigate") {
+      if (request.route === "relay" || request.route === "sessions" || request.route === "requestLog") setActiveTool("codex");
+      await navigate(request.route);
+      return { id: request.id, ok: true };
+    }
+    if (request.kind === "switchRelay") {
+      // 设置还没读回来时表单是默认值，拿它去切换会把配置写坏。
+      if (!settings) return { id: request.id, ok: false, message: t("主窗口还没读到设置，请稍后再试。") };
+      const normalized = normalizeSettings(settingsForm);
+      if (request.profileId === normalized.activeRelayId) return { id: request.id, ok: true };
+      if (!normalized.relayProfiles.some((profile) => profile.id === request.profileId)) {
+        return { id: request.id, ok: false, message: t("没找到这个供应商，可能已被删除。") };
+      }
+      const switched = await switchRelayProfile(syncLegacyRelayFields({ ...normalized, activeRelayId: request.profileId }), normalized.activeRelayId);
+      if (!switched) revealMainWindow();
+      return { id: request.id, ok: switched };
+    }
+    const done = request.kind === "launch" ? await launch() : request.kind === "restart" ? await restart() : await stopCodex();
+    if (!done) revealMainWindow();
+    return { id: request.id, ok: done };
+  };
+
+  useEffect(() => {
+    let disposed = false;
+    let stopListening: (() => void) | undefined;
+    void listen<unknown>(TRAY_REQUEST_EVENT, (event) => {
+      const request = parseTrayRequest(event.payload);
+      if (disposed || !request) return;
+      void trayRequestHandlerRef.current(request)
+        .catch((error): TrayResult => ({ id: request.id, ok: false, message: stringifyError(error) }))
+        .then((result) => emit(TRAY_RESULT_EVENT, result))
+        .catch(() => {});
     }).then((unlisten) => {
       if (disposed) {
         unlisten();
@@ -4862,7 +4926,7 @@ type AutoSaveOutcome = { status: "saved" } | { status: "invalid" | "failed"; mes
 
 type Actions = {
   refreshCurrent: () => Promise<void>;
-  launch: () => Promise<void>;
+  launch: () => Promise<boolean>;
   launchMultiInstance: (profile: RelayProfile) => Promise<void>;
   multiLaunchPending: string | null;
   multiLaunchInstances: MultiLaunchInstance[];
@@ -4872,7 +4936,7 @@ type Actions = {
   restartMultiLaunchInstance: (instance: MultiLaunchInstance) => Promise<void>;
   stopMultiLaunchInstance: (instance: MultiLaunchInstance) => Promise<void>;
   restart: (syncActiveRelay?: boolean) => Promise<boolean>;
-  stopCodex: () => Promise<void>;
+  stopCodex: () => Promise<boolean>;
   repairShortcuts: () => Promise<void>;
   checkUpdate: () => Promise<void>;
   performUpdate: () => Promise<void>;
@@ -4957,7 +5021,7 @@ type Actions = {
   diagnoseRelayProfile: (profile: RelayProfile) => Promise<ProviderDoctorResult | null>;
   testStepwiseSettings: (settings: BackendSettings) => Promise<void>;
   fetchRelayProfileModels: (profile: RelayProfile) => Promise<string[] | null>;
-  switchRelayProfile: (settings: BackendSettings, previousActiveRelayId?: string) => Promise<void>;
+  switchRelayProfile: (settings: BackendSettings, previousActiveRelayId?: string) => Promise<boolean>;
   relaySwitching: boolean;
   switchOfficialMode: () => Promise<void>;
   switchPureApiMode: () => Promise<void>;
@@ -10075,6 +10139,34 @@ function AgentSettingsScreen({
   );
 }
 
+/// 托盘快捷面板开关。值仍存在 gateway.json 的 `trayPanel`（老版本在网关设置里改过的选择照样有效），
+/// 由后端命令读写，后端同时更新托盘行为和内存缓存。
+function useTrayPanelSetting() {
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    void invoke<boolean>("tray_panel_enabled")
+      .then((value) => { if (!cancelled) setEnabled(value !== false); })
+      .catch(() => { if (!cancelled) setEnabled(true); });
+    return () => { cancelled = true; };
+  }, []);
+  const toggle = async () => {
+    if (enabled === null || saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      setEnabled(await invoke<boolean>("set_tray_panel_enabled", { enabled: !enabled }));
+    } catch (failure) {
+      setError(stringifyError(failure));
+    } finally {
+      setSaving(false);
+    }
+  };
+  return { enabled, saving, error, toggle };
+}
+
 /// 整体设置页（最左侧齿轮）。
 ///
 /// 只放与当前 Agent 无关的应用级选项，内容不随 Agent 切换而变。
@@ -10097,6 +10189,7 @@ function GlobalSettingsScreen({
   onOpenAgentSettings: () => void;
 }) {
   const settingsPath = settings?.settings_path ?? "";
+  const trayPanel = useTrayPanelSetting();
   // 每一项都是同一种行：左边标题 + 说明，右边操作。路径只在「配置文件路径」里出现一次。
   return (
     <div className="settings-page global-settings-page">
@@ -10111,6 +10204,15 @@ function GlobalSettingsScreen({
             </div>
             <div className="global-setting-actions">
               <Button size="sm" variant="secondary" onClick={actions.toggleTheme}>{t("切换主题")}</Button>
+            </div>
+          </div>
+          <div className="global-setting-row">
+            <div className="global-setting-copy">
+              <strong>{t("点击托盘图标弹出快捷面板")}</strong>
+              <span>{trayPanel.error || t("面板里能看 Codex 状态、一键启动或重启、切换供应商、看用量，网关用户还能给各 Agent 换模型。右键仍是原来的菜单，双击打开主窗口；关掉恢复原来的点击行为。")}</span>
+            </div>
+            <div className="global-setting-actions">
+              <Switch disabled={trayPanel.enabled === null || trayPanel.saving} label={t("点击托盘图标弹出快捷面板")} on={trayPanel.enabled ?? true} onToggle={() => void trayPanel.toggle()} />
             </div>
           </div>
           <div className="global-setting-row">

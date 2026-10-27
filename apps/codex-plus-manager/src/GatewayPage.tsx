@@ -566,7 +566,6 @@ function GatewayView({ payload, busy, run }: { payload: GatewayPayload | null; b
   if (!payload) return null;
   const mode = payload.gateway.keyPolicy.mode;
   const restoreOnExit = payload.gateway.restoreOnExit;
-  const trayPanel = payload.gateway.trayPanel !== false;
   const saveOptions = (keyRotation: string, restore: boolean) => void run("options", "save_gateway_options", { keyRotation, restoreOnExit: restore }, t("保存网关选项"), true);
   return (
     <>
@@ -625,21 +624,6 @@ function GatewayView({ payload, busy, run }: { payload: GatewayPayload | null; b
           </div>
           <span />
           <Switch disabled={busy !== null} label={t("退出 Codex++ 时恢复直连")} on={restoreOnExit} onToggle={() => saveOptions(mode, !restoreOnExit)} />
-        </div>
-        <div className="gw-setting-row">
-          <div>
-            <strong>{t("点击托盘图标弹出快捷面板")}</strong>
-            <small>{t("面板里能直接给各 Agent 换模型、看最近的请求；右键仍是原来的菜单，双击打开主窗口。关掉恢复原来的点击行为。")}</small>
-          </div>
-          <span />
-          <Switch
-            disabled={busy !== null}
-            label={t("点击托盘图标弹出快捷面板")}
-            on={trayPanel}
-            onToggle={() => void (async () => {
-              if (await run("tray-panel", "save_gateway_tray_panel", { enabled: !trayPanel }, t("保存网关选项"), true)) await invoke("refresh_tray_mode");
-            })()}
-          />
         </div>
       </div>
     </>
