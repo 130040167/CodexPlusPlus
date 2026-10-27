@@ -734,7 +734,8 @@
   white-space: nowrap;
 }
 
-.shell .gw-dispatch-chain li:first-child .gw-dispatch-step {
+/* 第一家高亮只在有先后（「自动」打开）时才有意义。 */
+.shell .gw-dispatch-chain[data-ordered="true"] li:first-child .gw-dispatch-step {
   border-color: hsl(var(--primary) / 0.35);
   background: hsl(var(--primary) / 0.07);
 }
@@ -3396,4 +3397,13 @@ body:has(.gw-modal-backdrop) .app-select-menu-portal {
 /* 模型调度页里的「多家自动切换」开关行。 */
 .shell .gw-dispatch .gw-dispatch-auto {
   padding: 12px 20px;
+}
+
+/* 「自动」关着：各家并列，不分先后。 */
+.shell .gw-dispatch-chain[data-ordered="false"] {
+  gap: 6px 8px;
+}
+
+.shell .gw-dispatch-chain[data-ordered="false"] .gw-dispatch-step {
+  padding-left: 6px;
 }

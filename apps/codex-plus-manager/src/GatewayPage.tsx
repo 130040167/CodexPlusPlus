@@ -295,17 +295,20 @@ function DispatchTable({ payload, onManage, busy, run }: { payload: GatewayPaylo
   const backed = rows.filter((row) => row.providers.length > 1).length;
   return (
     <>
+      {/* 顺序只对「自动」有意义：开关关着时这张表只说明每个模型由哪几家提供，不显示先后。 */}
       <SectionLabel
-        aside={(
+        aside={autoModels ? (
           <button className="gw-text-button strong" onClick={onManage} type="button">{t("调整顺序")}</button>
-        )}
+        ) : null}
       >
         {t("模型调度")}
-        {payload ? <em>{tf("{0} 个模型 · {1} 个有备用", [rows.length, backed])}</em> : null}
+        {payload ? <em>{autoModels ? tf("{0} 个模型 · {1} 个有备用", [rows.length, backed]) : tf("{0} 个模型 · {1} 个多家都有", [rows.length, backed])}</em> : null}
       </SectionLabel>
       <div className="gw-card gw-dispatch">
         <p className="gw-dispatch-lead">
-          {t("同一个模型有多家提供时，Agent 的模型列表里每家名下各有一份，选了哪家就只发给哪家。下面的顺序给「自动」用：前一家出错、Key 都在冷却或被熔断，就换下一家；顺序跟着供应商池走，在池里拖动即可调整。")}
+          {autoModels
+            ? t("同一个模型有多家提供时，Agent 的模型列表里每家名下各有一份，选了哪家就只发给哪家。下面的顺序给「自动」用：前一家出错、Key 都在冷却或被熔断，就换下一家；顺序跟着供应商池走，在池里拖动即可调整。")
+            : t("下面是每个模型由哪几家提供。多家都有时，Agent 的模型列表里每家名下各有一份，选了哪家就只发给哪家。")}
         </p>
         <div className="gw-setting-row gw-dispatch-auto">
           <div>
@@ -343,16 +346,16 @@ function DispatchTable({ payload, onManage, busy, run }: { payload: GatewayPaylo
               <strong title={row.model}>{prettyModelName(row.model)}</strong>
               <code>{row.model}</code>
             </div>
-            <ol className="gw-dispatch-chain">
+            <ol className="gw-dispatch-chain" data-ordered={autoModels}>
               {row.providers.map((provider, index) => {
                 const status = dispatchStatus(payload, provider.id, row.model);
                 const speed = speedOf(payload, provider.id, row.model);
                 const note = provider.excludedBy.length ? tf("{0} 不用这家", [provider.excludedBy.map(agentName).join(t("、"))]) : undefined;
                 return (
                   <li data-excluded={provider.excludedBy.length > 0} data-state={status?.state ?? "idle"} key={provider.id} title={note}>
-                    {index > 0 ? <ChevronRight aria-hidden className="gw-dispatch-arrow h-3.5 w-3.5" /> : null}
+                    {autoModels && index > 0 ? <ChevronRight aria-hidden className="gw-dispatch-arrow h-3.5 w-3.5" /> : null}
                     <span className="gw-dispatch-step">
-                      <i>{index + 1}</i>
+                      {autoModels ? <i>{index + 1}</i> : null}
                       <Avatar baseUrl={provider.baseUrl} name={provider.name} size="sm" />
                       <b>{provider.name}</b>
                       {status ? <small><MemberStatusLabel status={status} /></small> : null}

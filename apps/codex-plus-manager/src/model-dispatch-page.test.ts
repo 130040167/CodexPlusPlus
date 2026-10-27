@@ -25,3 +25,12 @@ test("界面不再出现「路由组」，统一叫模型组", () => {
     assert.doesNotMatch(read(name), /"[^"\n]*路由组[^"\n]*"/, name);
   }
 });
+
+test("「多家自动切换」关着时，调度表只说明由哪几家提供：不显示序号、箭头和「调整顺序」", () => {
+  const page = read("GatewayPage.tsx");
+  assert.match(page, /aside=\{autoModels \? \(/);
+  assert.match(page, /\{autoModels && index > 0 \? <ChevronRight/);
+  assert.match(page, /\{autoModels \? <i>\{index \+ 1\}<\/i> : null\}/);
+  assert.match(page, /data-ordered=\{autoModels\}/);
+  assert.match(read("GatewayPage.css"), /\.gw-dispatch-chain\[data-ordered="true"\] li:first-child/);
+});

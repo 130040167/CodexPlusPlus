@@ -1091,6 +1091,7 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "下面是每个模型由哪几家提供。多家都有时，Agent 的模型列表里每家名下各有一份，选了哪家就只发给哪家。": "Below is which providers offer each model. When several do, the agent's model list has one copy under each provider, and picking one sends requests only to that provider.",
   "多家自动切换": "Auto across providers",
   "切换没有完成，详情见主窗口。": "The switch didn't finish; see the main window for details.",
   "没有完成，详情见主窗口。": "Didn't finish; see the main window for details.",
@@ -2436,6 +2437,7 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "{0} 个模型 · {1} 个多家都有": "{0} models · {1} offered by several providers",
   "已切换到 {0}": "Switched to {0}",
   "按填写的价格估算：{0}": "Estimated from your prices: {0}",
   "网关运行中 · 127.0.0.1:{0}": "Gateway running · 127.0.0.1:{0}",
