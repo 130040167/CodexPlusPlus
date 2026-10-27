@@ -1644,16 +1644,26 @@ pub fn import_codex_aggregate(
             continue;
         };
         let provider_id = if crate::official_login::member_uses_official_login_transport(relay) {
-            let gateway = store.load()?;
-            match gateway.providers.iter().find(|provider| {
-                crate::official_login::member_uses_official_login_transport(&provider.relay)
-            }) {
-                Some(provider) => provider.relay.id.clone(),
-                None => {
+            let lendable = store.load().map(|gateway| {
+                gateway
+                    .providers
+                    .iter()
+                    .find(|provider| {
+                        crate::official_login::member_uses_official_login_transport(&provider.relay)
+                    })
+                    .map(|provider| provider.relay.id.clone())
+            });
+            match lendable {
+                Ok(Some(id)) => id,
+                Ok(None) => {
                     result.notes.push(format!(
                         "「{}」是官方登录账号，不能复制：在网关里登录 ChatGPT 后再把它加进模型组",
                         crate::gateway::accounts::mask_account_name(&relay.name)
                     ));
+                    continue;
+                }
+                Err(error) => {
+                    result.notes.push(member_failure(relay, &error));
                     continue;
                 }
             }
@@ -1663,14 +1673,26 @@ pub fn import_codex_aggregate(
                 .push(format!("成员「{}」本身是聚合供应商，跳过", relay.name));
             continue;
         } else {
-            match imported_codex_provider(&store.load()?, &relay.id) {
-                Some(id) => id,
-                None => {
-                    let copy = copy_codex_provider(settings, &relay.id)?;
-                    let (_, id) =
-                        add_provider(store, copy, &format!("codex:{}", relay.id), skip_agents)?;
-                    result.added += 1;
+            // 单个成员导入失败只记一笔，不影响已经导入的和后面的成员。
+            let imported = (|| -> anyhow::Result<(String, bool)> {
+                if let Some(id) = imported_codex_provider(&store.load()?, &relay.id) {
+                    return Ok((id, false));
+                }
+                let copy = copy_codex_provider(settings, &relay.id)?;
+                let (_, id) =
+                    add_provider(store, copy, &format!("codex:{}", relay.id), skip_agents)?;
+                Ok((id, true))
+            })();
+            match imported {
+                Ok((id, added)) => {
+                    if added {
+                        result.added += 1;
+                    }
                     id
+                }
+                Err(error) => {
+                    result.notes.push(member_failure(relay, &error));
+                    continue;
                 }
             }
         };
@@ -1713,26 +1735,42 @@ pub fn import_codex_aggregate(
         return Ok(result);
     }
     let (mode, sticky) = aggregate_group_mode(aggregate.strategy);
-    // 同名模型组已存在就覆盖它，重复搬不会多出一个组。
-    let existing = store
-        .load()?
-        .groups
-        .iter()
-        .find(|group| group.name == aggregate.name)
-        .map(|group| group.id.clone())
-        .unwrap_or_default();
-    let (_, id) = save_group(
-        store,
-        &GroupInput {
-            id: existing,
-            name: aggregate.name.clone(),
-            mode,
-            sticky,
-            members,
-        },
-    )?;
-    result.group = Some(id);
+    // 成员已经进池了：建组失败也照实返回已导入的数目，失败原因写进 notes。
+    let saved = (|| {
+        // 同名模型组已存在就覆盖它，重复搬不会多出一个组。
+        let existing = store
+            .load()?
+            .groups
+            .iter()
+            .find(|group| group.name == aggregate.name)
+            .map(|group| group.id.clone())
+            .unwrap_or_default();
+        save_group(
+            store,
+            &GroupInput {
+                id: existing,
+                name: aggregate.name.clone(),
+                mode,
+                sticky,
+                members,
+            },
+        )
+    })();
+    match saved {
+        Ok((_, id)) => result.group = Some(id),
+        Err(error) => result
+            .notes
+            .push(format!("模型组「{}」没建成：{error:#}", aggregate.name)),
+    }
     Ok(result)
+}
+
+/// 聚合成员导入失败时写给用户的一句话（账号名打码）。
+fn member_failure(relay: &RelayProfile, error: &anyhow::Error) -> String {
+    format!(
+        "成员「{}」没导入：{error:#}",
+        crate::gateway::accounts::mask_account_name(&relay.name)
+    )
 }
 
 /// 复制一个 Codex 供应商（地址、协议、多 Key、请求头等原样带上）。
@@ -1854,33 +1892,46 @@ fn build_relay(input: &ProviderInput) -> anyhow::Result<RelayProfile> {
 /// 自己的「添加供应商时自动加入」设置。
 pub fn add_provider(
     store: &GatewayStore,
-    mut relay: RelayProfile,
+    relay: RelayProfile,
     source: &str,
     skip_agents: Option<&[String]>,
 ) -> anyhow::Result<(GatewaySettings, String)> {
-    let mut gateway = store.load()?;
-    // 登录得到的账号名里带邮箱，短名用来源（如 `login:chatgpt` → `chatgpt`）更干净。
-    let slug_base = source
-        .strip_prefix("login:")
-        .unwrap_or(&relay.name)
-        .to_string();
-    relay.id = gateway.unique_slug(&slug_base, false);
-    let id = relay.id.clone();
-    gateway.providers.push(GatewayProvider {
-        enabled: true,
-        source: source.to_string(),
-        price: None,
-        model_prices: BTreeMap::new(),
-        proxy: String::new(),
-        upstream_new: Vec::new(),
-        upstream_gone: Vec::new(),
-        models_checked_at_ms: 0,
-        relay,
-        extra: Default::default(),
-    });
-    exclude_new_provider(&mut gateway, &id, skip_agents);
-    store.save(&gateway)?;
-    Ok((gateway, id))
+    add_provider_with(store, relay, source, skip_agents, |_| Ok(()))
+}
+
+/// 同 [`add_provider`]，加进池的同一次带锁写入里再用 `extra` 补设价格、代理等字段。
+fn add_provider_with(
+    store: &GatewayStore,
+    mut relay: RelayProfile,
+    source: &str,
+    skip_agents: Option<&[String]>,
+    extra: impl FnOnce(&mut GatewayProvider) -> anyhow::Result<()>,
+) -> anyhow::Result<(GatewaySettings, String)> {
+    store.update(|gateway| {
+        // 登录得到的账号名里带邮箱，短名用来源（如 `login:chatgpt` → `chatgpt`）更干净。
+        let slug_base = source
+            .strip_prefix("login:")
+            .unwrap_or(&relay.name)
+            .to_string();
+        relay.id = gateway.unique_slug(&slug_base, false);
+        let id = relay.id.clone();
+        let mut provider = GatewayProvider {
+            enabled: true,
+            source: source.to_string(),
+            price: None,
+            model_prices: BTreeMap::new(),
+            proxy: String::new(),
+            upstream_new: Vec::new(),
+            upstream_gone: Vec::new(),
+            models_checked_at_ms: 0,
+            relay,
+            extra: Default::default(),
+        };
+        extra(&mut provider)?;
+        gateway.providers.push(provider);
+        exclude_new_provider(gateway, &id, skip_agents);
+        Ok(id)
+    })
 }
 
 /// 新供应商不给哪些 Agent 用：勾选优先，没勾选时看 Agent 的 `auto_join_providers`。
@@ -1912,18 +1963,19 @@ pub fn create_provider(
     skip_agents: Option<&[String]>,
 ) -> anyhow::Result<(GatewaySettings, String)> {
     let proxy = clean_proxy(input.proxy.as_deref().unwrap_or_default())?;
-    let (mut gateway, id) = add_provider(store, build_relay(input)?, source, skip_agents)?;
-    if let Some(provider) = gateway
-        .providers
-        .iter_mut()
-        .find(|provider| provider.relay.id == id)
-    {
-        provider.price = clean_price(input.price.clone());
-        provider.model_prices = clean_model_prices(input.model_prices.clone().unwrap_or_default());
-        provider.proxy = proxy;
-        store.save(&gateway)?;
-    }
-    Ok((gateway, id))
+    add_provider_with(
+        store,
+        build_relay(input)?,
+        source,
+        skip_agents,
+        |provider| {
+            provider.price = clean_price(input.price.clone());
+            provider.model_prices =
+                clean_model_prices(input.model_prices.clone().unwrap_or_default());
+            provider.proxy = proxy;
+            Ok(())
+        },
+    )
 }
 
 /// 全是 0 的价格等于没填。
@@ -1949,7 +2001,15 @@ pub fn update_provider(
     id: &str,
     input: &ProviderInput,
 ) -> anyhow::Result<GatewaySettings> {
-    let mut gateway = store.load()?;
+    let (gateway, ()) = store.update(|gateway| update_provider_in(gateway, id, input))?;
+    Ok(gateway)
+}
+
+fn update_provider_in(
+    gateway: &mut GatewaySettings,
+    id: &str,
+    input: &ProviderInput,
+) -> anyhow::Result<()> {
     let Some(provider) = gateway
         .providers
         .iter_mut()
@@ -1985,8 +2045,7 @@ pub fn update_provider(
     if let Some(proxy) = &input.proxy {
         provider.proxy = clean_proxy(proxy)?;
     }
-    store.save(&gateway)?;
-    Ok(gateway)
+    Ok(())
 }
 
 /// 只改供应商的价格与独立代理（订阅账号也能改；地址、Key、模型不动）。
@@ -1999,42 +2058,50 @@ pub fn set_provider_extras(
     proxy: &str,
 ) -> anyhow::Result<GatewaySettings> {
     let proxy = clean_proxy(proxy)?;
-    let mut gateway = store.load()?;
-    let Some(provider) = gateway
-        .providers
-        .iter_mut()
-        .find(|provider| provider.relay.id == id)
-    else {
-        bail!("供应商不存在：{id}");
-    };
-    provider.price = clean_price(price);
-    if let Some(prices) = model_prices {
-        provider.model_prices = clean_model_prices(prices);
-    }
-    provider.proxy = proxy;
-    store.save(&gateway)?;
+    store.update(|gateway| {
+        let Some(provider) = gateway
+            .providers
+            .iter_mut()
+            .find(|provider| provider.relay.id == id)
+        else {
+            bail!("供应商不存在：{id}");
+        };
+        provider.price = clean_price(price);
+        if let Some(prices) = model_prices {
+            provider.model_prices = clean_model_prices(prices);
+        }
+        provider.proxy = proxy;
+        Ok(())
+    })?;
     store.load()
 }
 
-/// 删除网关供应商：同时清掉路由组里指向它的成员和 Agent「挑选」里的记录。直连模式的数据不受影响。
+/// 删除网关供应商：同时清掉路由组里指向它的成员和 Agent「挑选」里的记录，以及内存里按 id 记的
+/// Key 健康、额度、速度（id 会被之后添加的供应商复用，比如重新登录的 `chatgpt`）。
+/// 直连模式的数据不受影响。
 pub fn delete_provider(store: &GatewayStore, id: &str) -> anyhow::Result<GatewaySettings> {
-    let mut gateway = store.load()?;
-    let before = gateway.providers.len();
-    gateway.providers.retain(|provider| provider.relay.id != id);
-    if gateway.providers.len() == before {
-        bail!("供应商不存在：{id}");
-    }
-    let prefix = format!("{id}/");
-    for group in &mut gateway.groups {
-        group
-            .members
-            .retain(|member| !member.model.starts_with(&prefix));
-    }
-    for binding in gateway.bindings.values_mut() {
-        binding.pool_exclude.retain(|excluded| excluded != id);
-    }
+    let (gateway, ()) = store.update(|gateway| {
+        let before = gateway.providers.len();
+        gateway.providers.retain(|provider| provider.relay.id != id);
+        if gateway.providers.len() == before {
+            bail!("供应商不存在：{id}");
+        }
+        // `<id>/…` 的成员一般指向它；但模型名本身带 `/`、被别的供应商声明的（如 OpenRouter 的
+        // `openai/gpt-5`），以及还能匹配到别家模型的通配符，留着。
+        let remaining = &gateway.providers;
+        for group in &mut gateway.groups {
+            group
+                .members
+                .retain(|member| route::member_outlives_provider(remaining, id, &member.model));
+        }
+        for binding in gateway.bindings.values_mut() {
+            binding.pool_exclude.retain(|excluded| excluded != id);
+        }
+        Ok(())
+    })?;
     crate::gateway::key_pool::reset(id);
-    store.save(&gateway)?;
+    crate::gateway::quota::forget(id);
+    crate::gateway::speed::forget(id);
     Ok(gateway)
 }
 
@@ -2044,35 +2111,37 @@ pub fn set_provider_enabled(
     id: &str,
     enabled: bool,
 ) -> anyhow::Result<GatewaySettings> {
-    let mut gateway = store.load()?;
-    let Some(provider) = gateway
-        .providers
-        .iter_mut()
-        .find(|provider| provider.relay.id == id)
-    else {
-        bail!("供应商不存在：{id}");
-    };
-    provider.enabled = enabled;
-    store.save(&gateway)?;
+    let (gateway, ()) = store.update(|gateway| {
+        let Some(provider) = gateway
+            .providers
+            .iter_mut()
+            .find(|provider| provider.relay.id == id)
+        else {
+            bail!("供应商不存在：{id}");
+        };
+        provider.enabled = enabled;
+        Ok(())
+    })?;
     Ok(gateway)
 }
 
 /// 调整池里供应商的顺序（同一个模型有多家时按这个顺序尝试）。没列出的保持原顺序排在后面。
 pub fn reorder_providers(store: &GatewayStore, ids: &[String]) -> anyhow::Result<GatewaySettings> {
-    let mut gateway = store.load()?;
-    let mut ordered: Vec<GatewayProvider> = Vec::new();
-    for id in ids {
-        if let Some(position) = gateway
-            .providers
-            .iter()
-            .position(|provider| &provider.relay.id == id)
-        {
-            ordered.push(gateway.providers.remove(position));
+    let (gateway, ()) = store.update(|gateway| {
+        let mut ordered: Vec<GatewayProvider> = Vec::new();
+        for id in ids {
+            if let Some(position) = gateway
+                .providers
+                .iter()
+                .position(|provider| &provider.relay.id == id)
+            {
+                ordered.push(gateway.providers.remove(position));
+            }
         }
-    }
-    ordered.append(&mut gateway.providers);
-    gateway.providers = ordered;
-    store.save(&gateway)?;
+        ordered.append(&mut gateway.providers);
+        gateway.providers = ordered;
+        Ok(())
+    })?;
     Ok(gateway)
 }
 
@@ -2096,7 +2165,10 @@ pub fn save_group(
     store: &GatewayStore,
     input: &GroupInput,
 ) -> anyhow::Result<(GatewaySettings, String)> {
-    let mut gateway = store.load()?;
+    store.update(|gateway| save_group_in(gateway, input))
+}
+
+fn save_group_in(gateway: &mut GatewaySettings, input: &GroupInput) -> anyhow::Result<String> {
     let name = input.name.trim();
     if name.is_empty() {
         bail!("请填写模型组名称");
@@ -2139,23 +2211,23 @@ pub fn save_group(
         }
         None => gateway.groups.push(group),
     }
-    store.save(&gateway)?;
-    Ok((gateway, id))
+    Ok(id)
 }
 
 /// 删除模型组：其它组里引用它的成员一并去掉。
 pub fn delete_group(store: &GatewayStore, id: &str) -> anyhow::Result<GatewaySettings> {
-    let mut gateway = store.load()?;
-    let before = gateway.groups.len();
-    gateway.groups.retain(|group| group.id != id);
-    if gateway.groups.len() == before {
-        bail!("模型组不存在：{id}");
-    }
-    let reference = format!("{GROUP_MODEL_PREFIX}{id}");
-    for group in &mut gateway.groups {
-        group.members.retain(|member| member.model != reference);
-    }
-    store.save(&gateway)?;
+    let (gateway, ()) = store.update(|gateway| {
+        let before = gateway.groups.len();
+        gateway.groups.retain(|group| group.id != id);
+        if gateway.groups.len() == before {
+            bail!("模型组不存在：{id}");
+        }
+        let reference = format!("{GROUP_MODEL_PREFIX}{id}");
+        for group in &mut gateway.groups {
+            group.members.retain(|member| member.model != reference);
+        }
+        Ok(())
+    })?;
     Ok(gateway)
 }
 
@@ -2166,7 +2238,158 @@ pub fn resolved_default_model(gateway: &GatewaySettings, binding: &AgentBinding)
 
 #[cfg(test)]
 mod tests {
-    use super::pretty_model_name;
+    use super::*;
+    use crate::settings::{
+        AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, RelaySessionProvider,
+    };
+
+    fn direct_relay(id: &str, base_url: &str, model: &str) -> RelayProfile {
+        RelayProfile {
+            id: id.to_string(),
+            name: id.to_string(),
+            relay_mode: RelayMode::PureApi,
+            base_url: base_url.to_string(),
+            api_key: format!("sk-{id}"),
+            model: model.to_string(),
+            model_list: model.to_string(),
+            ..RelayProfile::default()
+        }
+    }
+
+    #[test]
+    fn aggregate_import_keeps_going_when_a_member_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(temp.path().join("gateway.json"));
+        let settings = BackendSettings {
+            relay_profiles: vec![
+                direct_relay("agg-a", "https://a.test/v1", "model-a"),
+                // 指向网关本身的成员复制会失败。
+                direct_relay("agg-bad", "http://127.0.0.1:1/gw/codex/v1", "model-bad"),
+                direct_relay("agg-c", "https://c.test/v1", "model-c"),
+            ],
+            aggregate_relay_profiles: vec![AggregateRelayProfile {
+                id: "agg".to_string(),
+                name: "混合".to_string(),
+                session_provider: RelaySessionProvider::Custom,
+                model_aggregation_enabled: false,
+                strategy: AggregateRelayStrategy::Failover,
+                members: ["agg-a", "agg-bad", "agg-c"]
+                    .into_iter()
+                    .map(|id| AggregateRelayMember {
+                        relay_id: id.to_string(),
+                        weight: 1,
+                    })
+                    .collect(),
+                routes: Vec::new(),
+                default_relay_id: String::new(),
+                sync_default_member_login: false,
+            }],
+            ..BackendSettings::default()
+        };
+        let outcome = import_codex_aggregate(&store, &settings, "agg", None).unwrap();
+        assert_eq!(outcome.added, 2, "出错的成员之外照常导入");
+        assert!(
+            outcome.notes.iter().any(|note| note.contains("agg-bad")),
+            "{:?}",
+            outcome.notes
+        );
+        let gateway = store.load().unwrap();
+        let group = gateway.group(outcome.group.as_deref().unwrap()).unwrap();
+        assert_eq!(group.members.len(), 2);
+        assert_eq!(gateway.providers.len(), 2);
+    }
+
+    #[test]
+    fn deleting_a_provider_keeps_slashed_members_and_forgets_runtime_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(temp.path().join("gateway.json"));
+        let (_, openai) = add_provider(
+            &store,
+            direct_relay("x", "https://openai.test/v1", "gpt-4o"),
+            "",
+            None,
+        )
+        .unwrap();
+        let mut router = direct_relay("y", "https://router.test/v1", "openai/gpt-5");
+        router.name = "router".to_string();
+        add_provider(&store, router, "", None).unwrap();
+        assert_eq!(openai, "x");
+        save_group(
+            &store,
+            &GroupInput {
+                name: "mix".to_string(),
+                members: ["x/gpt-4o", "x/*", "router/openai/gpt-5"]
+                    .into_iter()
+                    .map(|model| GroupMember {
+                        model: model.to_string(),
+                        weight: 1,
+                    })
+                    .collect(),
+                ..GroupInput::default()
+            },
+        )
+        .unwrap();
+        crate::gateway::speed::record("x", "gpt-4o", std::time::Duration::from_millis(10));
+        crate::gateway::quota::record(
+            "x",
+            crate::gateway::quota::ProviderQuota {
+                windows: vec![crate::gateway::quota::QuotaWindow {
+                    window_minutes: Some(300),
+                    used_percent: 99.0,
+                    resets_at_ms: None,
+                }],
+                updated_at_ms: 0,
+            },
+        );
+
+        let gateway = delete_provider(&store, "x").unwrap();
+        let members: Vec<&str> = gateway.groups[0]
+            .members
+            .iter()
+            .map(|member| member.model.as_str())
+            .collect();
+        assert_eq!(members, ["router/openai/gpt-5"]);
+        assert!(crate::gateway::quota::get("x").is_none(), "额度跟着清掉");
+        assert!(crate::gateway::speed::latency("x", "gpt-4o").is_none());
+    }
+
+    #[test]
+    fn deleting_a_provider_keeps_members_that_name_another_providers_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(temp.path().join("gateway.json"));
+        let mut openai = direct_relay("openai-src", "https://openai.test/v1", "gpt-5");
+        openai.name = "openai".to_string();
+        add_provider(&store, openai, "", None).unwrap();
+        let mut router = direct_relay("router-src", "https://router.test/v1", "openai/gpt-5");
+        router.name = "router".to_string();
+        add_provider(&store, router, "", None).unwrap();
+        save_group(
+            &store,
+            &GroupInput {
+                name: "slashed".to_string(),
+                members: ["openai/gpt-5", "openai/gpt-4o", "openai/*"]
+                    .into_iter()
+                    .map(|model| GroupMember {
+                        model: model.to_string(),
+                        weight: 1,
+                    })
+                    .collect(),
+                ..GroupInput::default()
+            },
+        )
+        .unwrap();
+        let gateway = delete_provider(&store, "openai").unwrap();
+        let members: Vec<&str> = gateway.groups[0]
+            .members
+            .iter()
+            .map(|member| member.model.as_str())
+            .collect();
+        assert_eq!(
+            members,
+            ["openai/gpt-5", "openai/*"],
+            "OpenRouter 声明的 openai/gpt-5 和还能匹配到它的通配符留下"
+        );
+    }
 
     #[test]
     fn pretty_model_names_match_the_manager() {

@@ -135,6 +135,10 @@ async fn open_candidates(
             },
             Err(error) => {
                 recorder.step(candidate, "transport", Some("auth_invalid"), None);
+                crate::gateway::speed::record_failure(
+                    &candidate.relay.id,
+                    &candidate.upstream_model,
+                );
                 log_attempt_failure(candidate, None, Some(&error), has_more);
                 last_error = Some(error);
                 continue;
@@ -201,6 +205,11 @@ async fn open_candidates(
                     upstream.status_code(),
                 );
                 let failover = key_pool::record_failure(&candidate.key, &class, Instant::now());
+                // 失败也算「试过了」：速度优先的组不再把它当没测过的排第一。
+                crate::gateway::speed::record_failure(
+                    &candidate.relay.id,
+                    &candidate.upstream_model,
+                );
                 log_attempt_failure(candidate, Some(&class), None, has_more && failover);
                 if !failover || !has_more {
                     return Ok(GatewayOutcome {
@@ -218,6 +227,10 @@ async fn open_candidates(
                     &candidate.key,
                     &FailureClass::ServerError,
                     Instant::now(),
+                );
+                crate::gateway::speed::record_failure(
+                    &candidate.relay.id,
+                    &candidate.upstream_model,
                 );
                 log_attempt_failure(candidate, None, Some(&error), has_more);
                 Some(error)

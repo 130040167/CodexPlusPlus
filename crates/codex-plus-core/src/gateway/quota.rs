@@ -58,6 +58,21 @@ pub fn record(relay_id: &str, quota: ProviderQuota) {
         .insert(relay_id.to_string(), quota);
 }
 
+/// 忘掉一个供应商的额度（删除供应商时用：`login:chatgpt` 的 id 会被新登录的账号复用，
+/// 不清的话新账号会沿用旧账号的额度）。
+pub fn forget(relay_id: &str) {
+    cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(relay_id);
+}
+
+/// 秒（可能是小数、负数或很大的数）→ 毫秒，越界时取边界值，不溢出。
+fn seconds_to_ms(seconds: f64) -> u64 {
+    // f64 → u64 的 `as` 本身是饱和转换（负数、NaN 得 0，过大得 u64::MAX）。
+    (seconds * 1000.0) as u64
+}
+
 pub fn get(relay_id: &str) -> Option<ProviderQuota> {
     cache()
         .lock()
@@ -99,10 +114,10 @@ pub fn from_codex_headers(headers: &HeaderMap, now_ms: u64) -> Option<ProviderQu
             continue;
         };
         let resets_at_ms = read(format!("x-codex-{slot}-reset-at"))
-            .map(|seconds| (seconds * 1000.0) as u64)
+            .map(seconds_to_ms)
             .or_else(|| {
                 read(format!("x-codex-{slot}-reset-after-seconds"))
-                    .map(|seconds| now_ms + (seconds * 1000.0) as u64)
+                    .map(|seconds| now_ms.saturating_add(seconds_to_ms(seconds)))
             });
         windows.push(QuotaWindow {
             window_minutes: read(format!("x-codex-{slot}-window-minutes"))
@@ -131,12 +146,12 @@ pub fn parse_chatgpt_usage(value: &Value, now_ms: u64) -> Option<ProviderQuota> 
         let resets_at_ms = window
             .get("reset_at")
             .and_then(Value::as_u64)
-            .map(|seconds| seconds * 1000)
+            .map(|seconds| seconds.saturating_mul(1000))
             .or_else(|| {
                 window
                     .get("reset_after_seconds")
                     .and_then(Value::as_u64)
-                    .map(|seconds| now_ms + seconds * 1000)
+                    .map(|seconds| now_ms.saturating_add(seconds.saturating_mul(1000)))
             });
         windows.push(QuotaWindow {
             window_minutes: window
@@ -281,6 +296,46 @@ mod tests {
             "5 小时窗口过了重置时间算满额，每周的仍然紧"
         );
         assert!(from_codex_headers(&HeaderMap::new(), 0).is_none());
+    }
+
+    #[test]
+    fn huge_reset_values_saturate_instead_of_overflowing() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-codex-primary-used-percent", "5".parse().unwrap());
+        headers.insert(
+            "x-codex-primary-reset-after-seconds",
+            "1e300".parse().unwrap(),
+        );
+        let quota = from_codex_headers(&headers, u64::MAX - 1).unwrap();
+        assert_eq!(quota.windows[0].resets_at_ms, Some(u64::MAX));
+
+        let usage = json!({
+            "rate_limit": {
+                "primary_window": { "used_percent": 1, "reset_at": u64::MAX },
+                "secondary_window": { "used_percent": 1, "reset_after_seconds": u64::MAX }
+            }
+        });
+        let quota = parse_chatgpt_usage(&usage, 1_000).unwrap();
+        assert_eq!(quota.windows[0].resets_at_ms, Some(u64::MAX));
+        assert_eq!(quota.windows[1].resets_at_ms, Some(u64::MAX));
+    }
+
+    #[test]
+    fn forget_drops_a_deleted_providers_quota() {
+        record(
+            "quota-forget",
+            ProviderQuota {
+                windows: vec![QuotaWindow {
+                    window_minutes: Some(300),
+                    used_percent: 90.0,
+                    resets_at_ms: None,
+                }],
+                updated_at_ms: 0,
+            },
+        );
+        assert!(get("quota-forget").is_some());
+        forget("quota-forget");
+        assert!(get("quota-forget").is_none());
     }
 
     #[test]

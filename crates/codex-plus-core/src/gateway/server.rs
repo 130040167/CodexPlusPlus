@@ -709,7 +709,8 @@ async fn handle_claude_count_tokens(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    if let Ok(plan) = route::resolve_plan(gateway, &agent, &model, None)
+    // 只是数 token，不真正发请求：用预览，别推进模型组轮换和 Key 轮询的进度。
+    if let Ok(plan) = route::preview_plan(gateway, &agent, &model, None)
         && let Some(candidate) = plan.candidates.first()
         && candidate.relay.protocol == crate::settings::RelayProtocol::AnthropicMessages
     {
