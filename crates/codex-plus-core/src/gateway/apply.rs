@@ -1882,7 +1882,7 @@ pub fn copy_codex_provider(
         .with_context(|| format!("Codex 供应商不存在：{relay_id}"))?;
     if relay.relay_mode == RelayMode::Aggregate {
         bail!(
-            "「{}」是聚合供应商，网关的模型组请在「模型调度」里新建",
+            "「{}」是聚合供应商，网关的模型组请在「模型」页里新建",
             relay.name
         );
     }

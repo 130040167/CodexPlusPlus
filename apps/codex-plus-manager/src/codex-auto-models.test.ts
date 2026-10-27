@@ -38,7 +38,7 @@ test("「多家自动切换」默认关：关着时没有自动那一组，只�
   const keys = pickerSections(data, "", () => "").map((section) => section.key);
   assert.deepEqual(keys, ["provider:chatgpt", "provider:jojo"]);
   const page = readFileSync(new URL("./GatewayPage.tsx", import.meta.url), "utf8");
-  assert.match(page, /"save_gateway_auto_models", \{ enabled: !autoModels \}/, "开关在模型调度页");
+  assert.match(page, /"save_gateway_auto_models", \{ enabled: !autoModels \}/, "开关在「模型」页");
 });
 
 test("模型按钮：自动切换的模型带「自动」标签与专用图标；Codex 目录侧同样拆开（后端测试覆盖）", () => {

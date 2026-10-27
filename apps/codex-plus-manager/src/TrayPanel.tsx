@@ -429,7 +429,7 @@ const QUICK_LINKS: Array<{ route: TrayRoute; label: string; icon: LucideIcon }> 
   { route: "requestLog", label: "请求日志", icon: ScrollText },
   { route: "gateway", label: "网关接入", icon: Waypoints },
   { route: "gatewayProviders", label: "供应商池", icon: Layers },
-  { route: "gatewayRouting", label: "模型调度", icon: Split },
+  { route: "gatewayRouting", label: "模型", icon: Split },
   { route: "gatewayUsage", label: "用量统计", icon: Activity },
 ];
 

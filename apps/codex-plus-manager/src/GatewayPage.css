@@ -623,141 +623,6 @@
   color: var(--gw-mute);
 }
 
-/* —— 模型调度 —— */
-.shell .gw-dispatch-lead {
-  margin: 0;
-  padding: 14px 20px;
-  color: var(--gw-mute);
-  font-size: 13px;
-  line-height: 1.6;
-}
-
-.shell .gw-dispatch-search {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 20px;
-  color: var(--gw-mute);
-}
-
-.shell .gw-dispatch-search input {
-  flex: 1;
-  min-width: 0;
-  height: 30px;
-  border: 0;
-  background: transparent;
-  color: var(--gw-ink);
-  font: inherit;
-  font-size: 13px;
-  outline: none;
-}
-
-.shell .gw-dispatch-row {
-  display: grid;
-  grid-template-columns: minmax(150px, 0.32fr) minmax(0, 1fr);
-  align-items: center;
-  gap: 16px;
-  padding: 10px 20px;
-}
-
-.shell .gw-dispatch-model {
-  display: grid;
-  min-width: 0;
-}
-
-.shell .gw-dispatch-model strong {
-  overflow: hidden;
-  font-size: 13.5px;
-  font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.shell .gw-dispatch-model code {
-  overflow: hidden;
-  color: var(--gw-mute);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.shell .gw-dispatch-chain {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px 4px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.shell .gw-dispatch-chain li {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.shell .gw-dispatch-arrow {
-  color: hsl(var(--muted-foreground) / 0.6);
-}
-
-.shell .gw-dispatch-step {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 30px;
-  padding: 0 10px 0 4px;
-  border: 1px solid var(--gw-line);
-  border-radius: 8px;
-  background: var(--gw-soft);
-  font-size: 12.5px;
-}
-
-.shell .gw-dispatch-step i {
-  min-width: 16px;
-  color: var(--gw-mute);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-style: normal;
-  text-align: center;
-}
-
-.shell .gw-dispatch-step b {
-  font-weight: 500;
-  white-space: nowrap;
-}
-
-.shell .gw-dispatch-step small {
-  color: var(--gw-mute);
-  font-size: 11px;
-  white-space: nowrap;
-}
-
-/* 第一家高亮只在有先后（「自动」打开）时才有意义。 */
-.shell .gw-dispatch-chain[data-ordered="true"] li:first-child .gw-dispatch-step {
-  border-color: hsl(var(--primary) / 0.35);
-  background: hsl(var(--primary) / 0.07);
-}
-
-.shell .gw-dispatch-chain li[data-state="cooling"] .gw-dispatch-step {
-  border-color: hsl(var(--status-warning) / 0.4);
-  background: hsl(var(--status-warning) / 0.08);
-}
-
-.shell .gw-dispatch-chain li[data-state="cooling"] .gw-dispatch-step small {
-  color: var(--gw-warn);
-}
-
-.shell .gw-dispatch-chain li[data-state="busy"] .gw-dispatch-step small,
-.shell .gw-dispatch-chain li[data-state="answered"] .gw-dispatch-step small {
-  color: var(--gw-ok);
-}
-
-.shell .gw-dispatch-chain li[data-excluded="true"] .gw-dispatch-step {
-  border-style: dashed;
-}
-
 .shell .gw-dispatch-more {
   width: 100%;
   height: 38px;
@@ -977,10 +842,6 @@
 }
 
 @media (max-width: 900px) {
-  .shell .gw-dispatch-row {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 6px;
-  }
 }
 
 @media (max-width: 760px) {
@@ -2859,12 +2720,6 @@ body.gw-sorting * {
   font-size: 11.5px;
 }
 
-.shell .gw-dispatch-step .gw-dispatch-speed {
-  color: var(--gw-mute);
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-}
-
 /* 模型组一行：图标、名称、模式、会话固定、按钮。 */
 .shell .gw-group-row {
   grid-template-columns: 76px minmax(0, 1fr) auto auto auto;
@@ -3394,16 +3249,307 @@ body:has(.gw-modal-backdrop) .app-select-menu-portal {
   line-height: 18px;
 }
 
-/* 模型调度页里的「多家自动切换」开关行。 */
-.shell .gw-dispatch .gw-dispatch-auto {
-  padding: 12px 20px;
+/* ———————— 「模型」页：页签、工具栏、供应商 × 模型矩阵 ———————— */
+.shell .gw-models-tabs {
+  display: inline-flex;
+  gap: 4px;
+  width: max-content;
+  padding: 3px;
+  border-radius: 10px;
+  background: var(--gw-soft);
 }
 
-/* 「自动」关着：各家并列，不分先后。 */
-.shell .gw-dispatch-chain[data-ordered="false"] {
-  gap: 6px 8px;
+.shell .gw-models-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--gw-mute);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
 }
 
-.shell .gw-dispatch-chain[data-ordered="false"] .gw-dispatch-step {
-  padding-left: 6px;
+.shell .gw-models-tabs button[data-active="true"] {
+  background: var(--gw-card);
+  color: var(--gw-ink);
+  box-shadow: 0 1px 2px hsl(var(--shadow-color) / 0.12), 0 0 0 1px var(--gw-line);
+}
+
+.shell .gw-models-tabs em,
+.shell .gw-models-filters em {
+  color: var(--gw-mute);
+  font-size: 11.5px;
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+}
+
+.shell .gw-models-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+}
+
+.shell .gw-models-toolbar .gw-primary-button {
+  margin: 0 0 0 auto;
+}
+
+.shell .gw-models-toolbar .gw-models-hint {
+  flex: 1;
+  min-width: 260px;
+}
+
+.shell .gw-models-search {
+  flex: 1;
+  max-width: 360px;
+  min-width: 200px;
+}
+
+.shell .gw-models-auto {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+  color: var(--gw-ink);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.shell .gw-models-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.shell .gw-models-filters button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px 0 8px;
+  border: 1px solid var(--gw-line);
+  border-radius: 99px;
+  background: transparent;
+  color: var(--gw-ink);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.shell .gw-models-filters button[data-active="true"] {
+  border-color: hsl(var(--primary) / 0.5);
+  background: hsl(var(--primary) / 0.1);
+}
+
+.shell .gw-models-filters .gw-avatar {
+  width: 18px;
+  height: 18px;
+}
+
+.shell .gw-models-hint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+  margin: 0;
+  color: var(--gw-mute);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.shell .gw-matrix-card {
+  overflow: hidden;
+}
+
+.shell .gw-matrix-scroll {
+  overflow-x: auto;
+}
+
+.shell .gw-matrix {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.shell .gw-matrix th,
+.shell .gw-matrix td {
+  padding: 0;
+  border-bottom: 1px solid var(--gw-line);
+  text-align: center;
+  vertical-align: middle;
+}
+
+.shell .gw-matrix tbody tr:last-child th,
+.shell .gw-matrix tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.shell .gw-matrix thead th {
+  height: 44px;
+  padding: 0 12px;
+  background: var(--gw-soft);
+  color: var(--gw-mute);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.shell .gw-matrix td {
+  min-width: 112px;
+  height: 46px;
+}
+
+.shell .gw-matrix tbody tr:hover > * {
+  background: hsl(var(--muted) / 0.35);
+}
+
+/* 模型列固定在左边，供应商多时横向滚动也看得到是哪个模型。 */
+.shell .gw-matrix .gw-matrix-model {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  width: 38%;
+  min-width: 220px;
+  padding: 6px 20px;
+  background: var(--gw-card);
+  text-align: left;
+}
+
+.shell .gw-matrix thead .gw-matrix-model {
+  background: var(--gw-soft);
+}
+
+.shell .gw-matrix tbody .gw-matrix-model {
+  display: table-cell;
+}
+
+.shell .gw-matrix tbody .gw-matrix-model strong {
+  display: block;
+  overflow: hidden;
+  font-size: 13.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shell .gw-matrix tbody .gw-matrix-model code {
+  display: block;
+  overflow: hidden;
+  color: var(--gw-mute);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shell .gw-matrix-provider {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--gw-ink);
+}
+
+.shell .gw-matrix-provider .gw-avatar {
+  width: 20px;
+  height: 20px;
+}
+
+/* 格子：有就一个实心点，点里可以放「自动」的先后；下面一行小字是平均首包耗时。 */
+.shell .gw-matrix-cell,
+.shell .gw-models-legend .gw-matrix-cell {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.shell .gw-matrix-cell i {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: hsl(var(--primary) / 0.85);
+  color: hsl(var(--primary-foreground));
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.shell .gw-matrix-cell[data-state="answered"] i {
+  background: var(--gw-ok);
+}
+
+.shell .gw-matrix-cell[data-state="cooling"] i {
+  background: var(--gw-warn);
+}
+
+.shell .gw-matrix-cell[data-excluded="true"] i {
+  border: 1.5px dashed hsl(var(--primary));
+  background: transparent;
+  color: hsl(var(--primary));
+}
+
+.shell .gw-matrix-cell small {
+  color: var(--gw-mute);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.shell .gw-matrix-none {
+  color: hsl(var(--muted-foreground) / 0.35);
+}
+
+.shell .gw-models-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  margin: -4px 0 0;
+  color: var(--gw-mute);
+  font-size: 12px;
+}
+
+.shell .gw-models-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.shell .gw-models-legend .gw-matrix-cell i {
+  width: 12px;
+  height: 12px;
+}
+
+@media (max-width: 760px) {
+  .shell .gw-models-auto {
+    margin-left: 0;
+  }
+}
+
+/* 页面内容是网格：表的最小宽度不能把整页撑宽，横向滚动只发生在表里。 */
+.shell .gw-matrix-card,
+.shell .gw-models-filters,
+.shell .gw-models-hint,
+.shell .gw-models-toolbar {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.shell .gateway-page,
+.shell .gateway-page > .gw-content {
+  min-width: 0;
+}
+
+.shell .gw-provider-search-row .gw-primary-button {
+  flex: none;
+  white-space: nowrap;
 }

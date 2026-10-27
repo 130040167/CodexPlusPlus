@@ -446,7 +446,7 @@ export function pickerSections(
       });
     if (items.length) sections.push({ key: `provider:${entry.id}`, title: maskAccountName(entry.name), avatar: avatar(entry.name), items });
   }
-  // 「多家自动切换」默认关（在模型调度页打开）。
+  // 「多家自动切换」默认关（在「模型」页打开）。
   if (shared.length && payload.gateway.autoModels) {
     sections.push({
       key: "auto",
@@ -714,7 +714,7 @@ export function memberStatus(payload: GatewayPayload | null, relayId: string, no
 }
 
 /**
- * 模型调度表里一格（供应商 × 模型）的状态：冷却、熔断按整家供应商算；「刚用过」只标在真正被请求的那个模型上。
+ * 「模型」页矩阵里一格（供应商 × 模型）的状态：冷却、熔断按整家供应商算；「刚用过」只标在真正被请求的那个模型上。
  * 其它情况不显示（返回 null）。
  */
 export function dispatchStatus(payload: GatewayPayload | null, relayId: string, model: string, nowMs: number = Date.now()): MemberStatus | null {
@@ -781,7 +781,7 @@ export type DispatchProvider = { id: string; name: string; baseUrl: string; excl
 export type DispatchRow = { model: string; providers: DispatchProvider[] };
 
 /**
- * 模型调度表：每个模型名列出池里提供它的供应商，顺序就是网关的尝试顺序（与后端 `expand_model` 一致：
+ * 「模型」页矩阵：每个模型名列出池里提供它的供应商，顺序就是网关的尝试顺序（与后端 `expand_model` 一致：
  * 打开的供应商按池顺序）。有备用的模型排前面；`excludedBy` 是在「挑选」里排除了这家的已接入 Agent。
  */
 export function modelDispatch(payload: GatewayPayload | null): DispatchRow[] {

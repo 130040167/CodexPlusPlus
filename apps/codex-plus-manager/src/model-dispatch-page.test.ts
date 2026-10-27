@@ -4,12 +4,15 @@ import test from "node:test";
 
 const read = (name: string) => readFileSync(new URL(`./${name}`, import.meta.url), "utf8");
 
-test("模型调度页只讲规则：调度表 + 模型组，不再重复总览的实时连线图", () => {
+test("「模型」页：模型 / 模型组两个页签，模型页是供应商 × 模型矩阵，不再重复总览的实时连线图", () => {
   const page = read("GatewayPage.tsx");
-  assert.match(page, /<DispatchTable busy=\{busy\} onManage=\{onManage\} payload=\{payload\} run=\{run\} \/>/);
-  assert.doesNotMatch(page, /RouteDiagram|RouteCard|routeNarrative/);
-  assert.match(page, /\{ id: "routing", label: t\("模型调度"\) \}/);
-  assert.match(read("App.tsx"), /id: "gatewayRouting", get label\(\) \{ return t\("模型调度"\); \}/);
+  assert.match(page, /role="tablist" aria-label=\{t\("模型"\)\}/);
+  assert.match(page, /<ModelMatrix busy=\{busy\} onManage=\{onManage\} payload=\{payload\} rows=\{rows\} run=\{run\} \/>/);
+  assert.match(page, /<GroupsPanel busy=\{busy\} payload=\{payload\} run=\{run\} \/>/);
+  assert.match(page, /<table className="gw-matrix">/);
+  assert.doesNotMatch(page, /RouteDiagram|RouteCard|routeNarrative|DispatchTable/);
+  assert.match(page, /\{ id: "routing", label: t\("模型"\) \}/);
+  assert.match(read("App.tsx"), /id: "gatewayRouting", get label\(\) \{ return t\("模型"\); \}/);
 });
 
 test("总览「最近请求」可展开看这次怎么走的，右上角去请求日志", () => {
@@ -26,11 +29,11 @@ test("界面不再出现「路由组」，统一叫模型组", () => {
   }
 });
 
-test("「多家自动切换」关着时，调度表只说明由哪几家提供：不显示序号、箭头和「调整顺序」", () => {
+test("「多家自动切换」关着时矩阵只说明由哪几家提供：不显示先后数字、不出现「调整顺序」", () => {
   const page = read("GatewayPage.tsx");
-  assert.match(page, /aside=\{autoModels \? \(/);
-  assert.match(page, /\{autoModels && index > 0 \? <ChevronRight/);
-  assert.match(page, /\{autoModels \? <i>\{index \+ 1\}<\/i> : null\}/);
-  assert.match(page, /data-ordered=\{autoModels\}/);
-  assert.match(read("GatewayPage.css"), /\.gw-dispatch-chain\[data-ordered="true"\] li:first-child/);
+  assert.match(page, /<i>\{autoModels && multi \? index \+ 1 : null\}<\/i>/);
+  assert.match(page, /\{autoModels \? \(\s*<>[\s\S]*?t\("调整顺序"\)/);
+  // 列就是池里打开的供应商，顺序与池一致；短名显示，完整（打码）名放悬停提示。
+  assert.match(page, /const providers = useMemo\(\(\) => agentPoolProviders\(payload\), \[payload\]\);/);
+  assert.match(page, /title=\{maskAccountName\(entry\.name\)\}/);
 });

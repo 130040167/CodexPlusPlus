@@ -89,7 +89,7 @@ pub struct GatewayPayload {
     pub health: PoolSnapshot,
     /// 路由动态：各 Agent 最近一次请求怎么走的、计数、正在回答的上游。
     pub activity: ActivitySnapshot,
-    /// 各（供应商, 模型）最近的平均首包耗时，模型调度表和「速度优先」用。
+    /// 各（供应商, 模型）最近的平均首包耗时，「模型」页和「速度优先」用。
     pub speeds: Vec<codex_plus_core::gateway::speed::SpeedView>,
     /// 可复制进网关的直连模式供应商。
     pub codex_providers: Vec<GatewayPoolEntry>,

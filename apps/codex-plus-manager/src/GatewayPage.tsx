@@ -31,6 +31,10 @@ import {
   type GroupMember,
   type GroupMode,
   type GroupSticky,
+  agentPoolProviders,
+  maskAccountName,
+  type DispatchRow,
+  type MemberStatus,
 } from "./gateway-model";
 import { AgentsView, Floating, ModelList } from "./GatewayAgents";
 import { AppSelect } from "./AppSelect";
@@ -51,7 +55,7 @@ const memo: { payload: GatewayPayload | null; tab: Tab } = { payload: null, tab:
 /** 组编辑器的模型选择不排除任何供应商；模块级常量，避免每次渲染都换新数组让列表重算。 */
 const NO_EXCLUDE: string[] = [];
 
-/** 模型调度页刷新供应商状态的间隔。 */
+/** 「模型」页刷新供应商状态的间隔。 */
 const LIVE_REFRESH_MS = 2500;
 
 function hasPayload(result: GatewayResult): result is GatewayResult & GatewayPayload {
@@ -136,7 +140,7 @@ export function GatewayPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 模型调度页定时刷新供应商状态：静默读取，不占用 busy，也不弹错误。
+  // 「模型」页定时刷新供应商状态：静默读取，不占用 busy，也不弹错误。
   useEffect(() => {
     if (tab !== "routing") return;
     let cancelled = false;
@@ -158,7 +162,7 @@ export function GatewayPage({
     { id: "agents", label: t("智能体") },
     { id: "sessions", label: t("会话") },
     { id: "providers", label: t("供应商") },
-    { id: "routing", label: t("模型调度") },
+    { id: "routing", label: t("模型") },
     { id: "usage", label: t("用量") },
     { id: "gateway", label: t("网关") },
   ];
@@ -206,12 +210,42 @@ export function GatewayPage({
   );
 }
 
-/* —————————————————————— 模型调度 —————————————————————— */
+/* —————————————————————— 模型 —————————————————————— */
 
-/** 调度表默认显示的行数，搜索或展开后显示全部。 */
-const DISPATCH_PREVIEW = 12;
+/** 模型矩阵默认显示的行数，搜索、筛选或展开后显示全部。 */
+const MATRIX_PREVIEW = 30;
 
+type ModelsTab = "models" | "groups";
+type MatrixFilter = "all" | "shared" | `provider:${string}`;
+
+const modelsMemo: { tab: ModelsTab } = { tab: "models" };
+
+/** 「模型」页：网关里能用的模型（供应商 × 模型矩阵）和模型组，两个页签。 */
 function RoutingView({ payload, busy, run, onManage }: { payload: GatewayPayload | null; busy: string | null; run: Run; onManage: () => void }) {
+  const [tab, setTabState] = useState<ModelsTab>(modelsMemo.tab);
+  const setTab = (next: ModelsTab) => {
+    modelsMemo.tab = next;
+    setTabState(next);
+  };
+  const rows = useMemo(() => modelDispatch(payload), [payload]);
+  const groups = payload?.groups ?? [];
+  return (
+    <>
+      <div className="gw-models-tabs" role="tablist" aria-label={t("模型")}>
+        <button aria-selected={tab === "models"} data-active={tab === "models"} onClick={() => setTab("models")} role="tab" type="button">
+          {t("模型")}<em>{payload ? rows.length : "…"}</em>
+        </button>
+        <button aria-selected={tab === "groups"} data-active={tab === "groups"} onClick={() => setTab("groups")} role="tab" type="button">
+          {t("模型组")}<em>{payload ? groups.length : "…"}</em>
+        </button>
+      </div>
+      {tab === "models" ? <ModelMatrix busy={busy} onManage={onManage} payload={payload} rows={rows} run={run} /> : <GroupsPanel busy={busy} payload={payload} run={run} />}
+    </>
+  );
+}
+
+/** 模型组页签：列表 + 新建 / 编辑 / 删除。 */
+function GroupsPanel({ payload, busy, run }: { payload: GatewayPayload | null; busy: string | null; run: Run }) {
   const [editing, setEditing] = useState<GatewayGroupEntry | "new" | null>(null);
   const remove = async (group: GatewayGroupEntry) => {
     const ok = await appConfirm(tf("删除模型组「{0}」？引用它的其它组会去掉这个成员。", [group.name]), { title: t("删除模型组"), confirmText: t("删除"), danger: true });
@@ -219,18 +253,13 @@ function RoutingView({ payload, busy, run, onManage }: { payload: GatewayPayload
   };
   return (
     <>
-      <DispatchTable busy={busy} onManage={onManage} payload={payload} run={run} />
-
-      <SectionLabel
-        aside={(
-          <>
-            <em>{t("Agent 可以把模型组当作一个模型来选")}</em>
-            <button className="gw-text-button strong" disabled={busy !== null} onClick={() => setEditing("new")} type="button">{t("新建模型组")}</button>
-          </>
-        )}
-      >
-        {t("模型组")}
-      </SectionLabel>
+      <div className="gw-models-toolbar">
+        <p className="gw-models-hint">{t("把几个模型编成一组，Agent 在模型列表里把它当一个模型来选：按顺序、轮换、按权重、额度或速度回答，组里也可以再放组。")}</p>
+        <button className="gw-primary-button" disabled={busy !== null || !payload} onClick={() => setEditing("new")} type="button">
+          <Plus className="h-4 w-4" />
+          {t("新建模型组")}
+        </button>
+      </div>
       <div className="gw-card">
         {(payload?.groups ?? []).map((group) => {
           const joiner = group.mode === "inOrder" ? " → " : " · ";
@@ -259,10 +288,11 @@ function RoutingView({ payload, busy, run, onManage }: { payload: GatewayPayload
             </div>
           );
         })}
+        {!payload ? <div className="gw-empty">{t("正在读取…")}</div> : null}
         {payload && payload.groups.length === 0 ? (
           <div className="gw-empty">
             <strong>{t("还没有模型组")}</strong>
-            <span>{t("把几个模型编成一组，Agent 在模型列表里把它当一个模型来选：按顺序、轮换或按权重回答，组里也可以再放组。")}</span>
+            <span>{t("比如把两家的同一个模型编成「依次」组：第一家出错自动换第二家；或者把几个便宜模型编成「轮换」组分摊用量。")}</span>
           </div>
         ) : null}
       </div>
@@ -281,41 +311,48 @@ function RoutingView({ payload, busy, run, onManage }: { payload: GatewayPayload
   );
 }
 
-/** 每个模型名一行，列出提供它的供应商；从左到右就是网关的尝试顺序。 */
-function DispatchTable({ payload, onManage, busy, run }: { payload: GatewayPayload | null; onManage: () => void; busy: string | null; run: Run }) {
+/** 供应商名的短写法：`·` 前那段（「ChatGPT Pro · 邮箱」→「ChatGPT Pro」），完整名放在悬停提示里。 */
+function shortProviderName(name: string): string {
+  return name.split("·")[0].trim() || name;
+}
+
+/**
+ * 供应商 × 模型矩阵：行是模型，列是池里打开的供应商（顺序就是池的顺序），格子里有点就是这家提供。
+ * 打开「多家自动切换」时，多家都有的那几行点里标出「自动」的尝试顺序。
+ */
+function ModelMatrix({ payload, rows, onManage, busy, run }: { payload: GatewayPayload | null; rows: DispatchRow[]; onManage: () => void; busy: string | null; run: Run }) {
   const autoModels = payload?.gateway.autoModels === true;
   const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<MatrixFilter>("all");
   const [expanded, setExpanded] = useState(false);
-  const rows = useMemo(() => modelDispatch(payload), [payload]);
+  const providers = useMemo(() => agentPoolProviders(payload), [payload]);
+  const shared = rows.filter((row) => row.providers.length > 1).length;
   const needle = query.trim().toLowerCase();
-  const matched = needle
-    ? rows.filter((row) => row.model.toLowerCase().includes(needle) || row.providers.some((provider) => provider.name.toLowerCase().includes(needle)))
-    : rows;
-  const shown = needle || expanded ? matched : matched.slice(0, DISPATCH_PREVIEW);
-  const backed = rows.filter((row) => row.providers.length > 1).length;
+  const matched = rows.filter((row) => {
+    if (filter === "shared" && row.providers.length < 2) return false;
+    if (filter.startsWith("provider:") && !row.providers.some((provider) => `provider:${provider.id}` === filter)) return false;
+    return !needle || row.model.toLowerCase().includes(needle) || prettyModelName(row.model).toLowerCase().includes(needle);
+  });
+  const shown = needle || expanded || filter !== "all" ? matched : matched.slice(0, MATRIX_PREVIEW);
+  const filters: Array<{ key: MatrixFilter; label: ReactNode; count: number; title?: string }> = [
+    { key: "all", label: t("全部"), count: rows.length },
+    { key: "shared", label: t("多家都有"), count: shared },
+    ...providers.map((entry) => ({
+      key: `provider:${entry.id}` as MatrixFilter,
+      label: <><Avatar baseUrl={entry.baseUrl} name={entry.name} size="sm" />{maskAccountName(shortProviderName(entry.name))}</>,
+      count: rows.filter((row) => row.providers.some((provider) => provider.id === entry.id)).length,
+      title: maskAccountName(entry.name),
+    })),
+  ];
   return (
     <>
-      {/* 顺序只对「自动」有意义：开关关着时这张表只说明每个模型由哪几家提供，不显示先后。 */}
-      <SectionLabel
-        aside={autoModels ? (
-          <button className="gw-text-button strong" onClick={onManage} type="button">{t("调整顺序")}</button>
-        ) : null}
-      >
-        {t("模型调度")}
-        {payload ? <em>{autoModels ? tf("{0} 个模型 · {1} 个有备用", [rows.length, backed]) : tf("{0} 个模型 · {1} 个多家都有", [rows.length, backed])}</em> : null}
-      </SectionLabel>
-      <div className="gw-card gw-dispatch">
-        <p className="gw-dispatch-lead">
-          {autoModels
-            ? t("同一个模型有多家提供时，Agent 的模型列表里每家名下各有一份，选了哪家就只发给哪家。下面的顺序给「自动」用：前一家出错、Key 都在冷却或被熔断，就换下一家；顺序跟着供应商池走，在池里拖动即可调整。")
-            : t("下面是每个模型由哪几家提供。多家都有时，Agent 的模型列表里每家名下各有一份，选了哪家就只发给哪家。")}
-        </p>
-        <div className="gw-setting-row gw-dispatch-auto">
-          <div>
-            <strong>{t("多家自动切换")}</strong>
-            <small>{autoModels ? t("已打开：多家都有的模型在「多家自动切换」里另有一份「自动」，按下面的顺序依次尝试。") : t("打开后，多家都有的模型会在「多家自动切换」里另列一份「自动」，按下面的顺序依次尝试；关着时只能选具体某一家。")}</small>
-          </div>
-          <span />
+      <div className="gw-models-toolbar">
+        <label className="gw-sheet-search gw-models-search">
+          <Search className="h-4 w-4" />
+          <input aria-label={t("搜索模型")} onChange={(event) => setQuery(event.target.value)} placeholder={t("搜索模型")} value={query} />
+        </label>
+        <div className="gw-models-auto" title={t("多家都有的模型额外列一份「自动」：按供应商池的顺序依次尝试，前一家出错、Key 都在冷却或被熔断就换下一家。关着时只能选具体某一家。")}>
+          <span>{t("多家自动切换")}</span>
           <Switch
             disabled={busy !== null || !payload}
             label={t("多家自动切换")}
@@ -323,59 +360,100 @@ function DispatchTable({ payload, onManage, busy, run }: { payload: GatewayPaylo
             onToggle={() => void run("auto-models", "save_gateway_auto_models", { enabled: !autoModels }, t("多家自动切换"), true)}
           />
         </div>
-        {rows.length > DISPATCH_PREVIEW ? (
-          <div className="gw-dispatch-search">
-            <Search aria-hidden className="h-4 w-4" />
-            <input aria-label={t("搜索模型或供应商")} onChange={(event) => setQuery(event.target.value)} placeholder={t("搜索模型或供应商")} value={query} />
-          </div>
-        ) : null}
+      </div>
+      <div className="gw-models-filters" role="group" aria-label={t("筛选")}>
+        {filters.map((item) => (
+          <button data-active={filter === item.key} key={item.key} onClick={() => setFilter(filter === item.key ? "all" : item.key)} title={item.title} type="button">
+            {item.label}
+            <em>{item.count}</em>
+          </button>
+        ))}
+      </div>
+      <p className="gw-models-hint">
+        {autoModels ? (
+          <>
+            {t("多家都有的模型，Agent 里每家各一份（只发给那家），另有一份「自动」：按列从左到右依次尝试，数字是先后。")}
+            <button className="gw-text-button" onClick={onManage} type="button">{t("调整顺序")}</button>
+          </>
+        ) : t("多家都有的模型，Agent 里每家各一份，选哪家就只发给哪家。打开「多家自动切换」可以再多一份按顺序自动换家的。")}
+      </p>
+      <div className="gw-card gw-matrix-card">
         {!payload ? <div className="gw-empty">{t("正在读取…")}</div> : null}
         {payload && rows.length === 0 ? (
           <div className="gw-empty">
             <strong>{payload.pool.length ? t("供应商都已关闭") : t("供应商池里还没有模型")}</strong>
-            <span>
-              {payload.pool.length
-                ? t("打开供应商池里的供应商后，这里列出每个模型会发给谁。")
-                : t("在「供应商池」添加并打开供应商后，这里列出每个模型会发给谁。")}
-            </span>
+            <span>{payload.pool.length ? t("打开供应商池里的供应商后，这里列出每个模型由哪几家提供。") : t("在「供应商池」添加并打开供应商后，这里列出每个模型由哪几家提供。")}</span>
           </div>
         ) : null}
-        {shown.map((row) => (
-          <div className="gw-dispatch-row" key={row.model}>
-            <div className="gw-dispatch-model">
-              <strong title={row.model}>{prettyModelName(row.model)}</strong>
-              <code>{row.model}</code>
-            </div>
-            <ol className="gw-dispatch-chain" data-ordered={autoModels}>
-              {row.providers.map((provider, index) => {
-                const status = dispatchStatus(payload, provider.id, row.model);
-                const speed = speedOf(payload, provider.id, row.model);
-                const note = provider.excludedBy.length ? tf("{0} 不用这家", [provider.excludedBy.map(agentName).join(t("、"))]) : undefined;
-                return (
-                  <li data-excluded={provider.excludedBy.length > 0} data-state={status?.state ?? "idle"} key={provider.id} title={note}>
-                    {autoModels && index > 0 ? <ChevronRight aria-hidden className="gw-dispatch-arrow h-3.5 w-3.5" /> : null}
-                    <span className="gw-dispatch-step">
-                      {autoModels ? <i>{index + 1}</i> : null}
-                      <Avatar baseUrl={provider.baseUrl} name={provider.name} size="sm" />
-                      <b>{provider.name}</b>
-                      {status ? <small><MemberStatusLabel status={status} /></small> : null}
-                      {speed !== null ? <small className="gw-dispatch-speed" title={t("最近的平均首包耗时")}>{formatElapsed(speed)}</small> : null}
-                    </span>
-                  </li>
-                );
-              })}
-            </ol>
+        {payload && rows.length ? (
+          <div className="gw-matrix-scroll">
+            <table className="gw-matrix">
+              <thead>
+                <tr>
+                  <th className="gw-matrix-model" scope="col">{t("模型")}</th>
+                  {providers.map((entry) => (
+                    <th key={entry.id} scope="col" title={maskAccountName(entry.name)}>
+                      <span className="gw-matrix-provider">
+                        <Avatar baseUrl={entry.baseUrl} name={entry.name} size="sm" />
+                        <span>{maskAccountName(shortProviderName(entry.name))}</span>
+                      </span>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {shown.map((row) => {
+                  const multi = row.providers.length > 1;
+                  return (
+                    <tr data-multi={multi} key={row.model}>
+                      <th className="gw-matrix-model" scope="row">
+                        <strong title={row.model}>{prettyModelName(row.model)}</strong>
+                        <code>{row.model}</code>
+                      </th>
+                      {providers.map((entry) => {
+                        const index = row.providers.findIndex((provider) => provider.id === entry.id);
+                        if (index < 0) return <td key={entry.id}><span className="gw-matrix-none" aria-label={t("不提供")}>·</span></td>;
+                        const provider = row.providers[index];
+                        const status = dispatchStatus(payload, provider.id, row.model);
+                        const speed = speedOf(payload, provider.id, row.model);
+                        const excluded = provider.excludedBy.length ? tf("{0} 不用这家", [provider.excludedBy.map(agentName).join(t("、"))]) : "";
+                        const tips = [maskAccountName(entry.name), status ? statusText(status) : "", speed !== null ? tf("平均首包 {0}", [formatElapsed(speed)]) : "", excluded].filter(Boolean).join(" · ");
+                        return (
+                          <td key={entry.id} title={tips}>
+                            <span className="gw-matrix-cell" data-excluded={provider.excludedBy.length > 0} data-state={status?.state ?? "idle"}>
+                              <i>{autoModels && multi ? index + 1 : null}</i>
+                              {speed !== null ? <small>{formatElapsed(speed)}</small> : null}
+                            </span>
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
-        ))}
-        {!needle && matched.length > DISPATCH_PREVIEW ? (
+        ) : null}
+        {payload && !needle && filter === "all" && matched.length > MATRIX_PREVIEW ? (
           <button className="gw-dispatch-more" onClick={() => setExpanded(!expanded)} type="button">
             {expanded ? t("收起") : tf("显示全部 {0} 个模型", [matched.length])}
           </button>
         ) : null}
-        {needle && matched.length === 0 ? <p className="gw-dispatch-none">{t("没有匹配的模型")}</p> : null}
+        {payload && rows.length > 0 && matched.length === 0 ? <p className="gw-dispatch-none">{t("没有匹配的模型")}</p> : null}
       </div>
+      <p className="gw-models-legend">
+        <span><span className="gw-matrix-cell" data-state="idle"><i /></span>{t("提供")}</span>
+        <span><span className="gw-matrix-cell" data-state="answered"><i /></span>{t("刚用过")}</span>
+        <span><span className="gw-matrix-cell" data-state="cooling"><i /></span>{t("冷却或熔断中")}</span>
+        <span><span className="gw-matrix-cell" data-excluded="true" data-state="idle"><i /></span>{t("有 Agent 不用这家")}</span>
+      </p>
     </>
   );
+}
+
+/** 格子悬停提示里的状态文字。 */
+function statusText(status: MemberStatus): string {
+  return tf(status.text, status.args.map((arg) => (typeof arg === "string" ? t(arg) : arg)));
 }
 
 /** 新建 / 编辑模型组：名称、模式、成员（池里的模型或别的组）。 */

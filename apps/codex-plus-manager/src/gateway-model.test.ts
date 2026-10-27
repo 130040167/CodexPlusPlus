@@ -189,7 +189,7 @@ test("成员状态：正在回答 > 熔断 / Key 全部冷却 > 10 分钟内哪�
   assert.deepEqual(memberStatus(payload(), "bare"), { state: "idle", text: "{0} 个 Key", args: [1] });
 });
 
-test("模型调度表：每个模型列出提供它的供应商，按池顺序；有备用的排前面，关掉的不算，标出排除它的 Agent", () => {
+test("「模型」页矩阵：每个模型列出提供它的供应商，按池顺序；有备用的排前面，关掉的不算，标出排除它的 Agent", () => {
   const data = withActivity();
   assert.deepEqual(connectedAgents(data), ["claude"]);
   data.pool[2].models = ["glm-5.3", "GLM-5.3", "bare-1"];
