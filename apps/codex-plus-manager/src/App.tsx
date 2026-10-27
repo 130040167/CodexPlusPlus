@@ -1270,10 +1270,10 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "agentPet", get label() { return t("Agent 桌宠"); }, icon: PawPrint },
   // 网关：任意 Agent 经 Codex++ 接入任意供应商，与具体 Agent 无关，是应用级页面。
   { id: "hub", get label() { return t("总览"); }, icon: Waypoints },
-  // 按数据流排：先有供应商，才有模型，最后给 Agent 用。
+  // 先有供应商，再接 Agent；路由是进阶设置，放在 Agent 接入之后。
   { id: "gatewayProviders", get label() { return t("供应商池"); }, icon: Server },
-  { id: "gatewayRouting", get label() { return t("路由"); }, icon: Split },
   { id: "gateway", get label() { return t("Agent 接入"); }, icon: Plug },
+  { id: "gatewayRouting", get label() { return t("路由"); }, icon: Split },
   { id: "gatewayUsage", get label() { return t("用量"); }, icon: BarChart3 },
   { id: "gatewaySettings", get label() { return t("网关设置"); }, icon: SlidersHorizontal },
   { id: "maintenance", get label() { return t("安装维护"); }, icon: Wrench, tool: "codex" },
@@ -1308,9 +1308,9 @@ const lastAgentRoute = new Map<string, Route>();
  * Computer Use 同时接入 Claude Code / Claude Desktop / DSH 等多个客户端，不属于任何一个 Agent，
  * 所以和 Agent 协作一样放在「工具」里，而不是重复出现在每个 Agent 的「扩展」分组里。
  */
-const globalNavigationRoutes: Route[] = ["hub", "gatewayProviders", "gatewayRouting", "gateway", "gatewayUsage", "gatewaySettings", "requestLog", "sessions", "context", "skills", "computerUse", "agentPet", "agentCollaboration", "agentCache", "recommendations", "about", "settings"];
+const globalNavigationRoutes: Route[] = ["hub", "gatewayProviders", "gateway", "gatewayRouting", "gatewayUsage", "gatewaySettings", "requestLog", "sessions", "context", "skills", "computerUse", "agentPet", "agentCollaboration", "agentCache", "recommendations", "about", "settings"];
 /** 侧栏「网关」分组：任意 Agent 经 Codex++ 接入任意供应商。 */
-const gatewayNavigationRoutes: Route[] = ["hub", "gatewayProviders", "gatewayRouting", "gateway", "gatewayUsage", "gatewaySettings"];
+const gatewayNavigationRoutes: Route[] = ["hub", "gatewayProviders", "gateway", "gatewayRouting", "gatewayUsage", "gatewaySettings"];
 /** 侧栏「全局管理」分组：同时管理所有 Agent 的请求日志、会话、MCP 与 Skills。 */
 const managementNavigationRoutes: Route[] = ["requestLog", "sessions", "context", "skills"];
 /** 侧栏「工具」分组：服务所有 Agent，但与供应商无关。关于、整体设置放在侧栏底部。 */
@@ -14904,7 +14904,7 @@ function loadCollapsedGroups(): string[] {
  * 唯一的侧栏：任意 Agent → Codex++ → 任意供应商。
  *
  * - 顶部是网关状态卡和 ⌘K 快速跳转；
- * - 「网关」：总览、供应商池、路由、Agent 接入、用量、网关设置（按数据流：供应商 → 路由 → Agent）；
+ * - 「网关」：总览、供应商池、Agent 接入、路由、用量、网关设置；
  * - 「全局管理」：请求日志、会话、MCP、Skills，同时管理所有 Agent；
  * - 「Agent」：每个 Agent 一行（状态点表示接入方式）；它自己的页面（供应商配置、增强、皮肤……）在内容区顶部的页签里；
  * - 「工具」：服务所有 Agent、但与供应商无关的页面；

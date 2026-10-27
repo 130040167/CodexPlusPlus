@@ -35,9 +35,9 @@ test("路由页：「我的组」和「自动组」两段卡片，卡片上直�
   assert.match(page, /hideMembers: previous\?\.hideMembers \?\? false, pick: previous\?\.pick \?\? ""/);
 });
 
-test("侧栏按数据流排：供应商池 → 路由 → Agent 接入；供应商池里「按模型」是供应商 × 模型矩阵，点列头回到列表展开那一家", () => {
+test("侧栏顺序：供应商池 → Agent 接入 → 路由；供应商池里「按模型」是供应商 × 模型矩阵，点列头回到列表展开那一家", () => {
   const app = read("App.tsx");
-  assert.match(app, /const gatewayNavigationRoutes: Route\[\] = \["hub", "gatewayProviders", "gatewayRouting", "gateway", "gatewayUsage", "gatewaySettings"\];/);
+  assert.match(app, /const gatewayNavigationRoutes: Route\[\] = \["hub", "gatewayProviders", "gateway", "gatewayRouting", "gatewayUsage", "gatewaySettings"\];/);
   const providers = read("GatewayProviders.tsx");
   assert.match(providers, /<ModelMatrix\s/);
   assert.match(providers, /setView\("list"\);\s*setExpanded\(id\);/);

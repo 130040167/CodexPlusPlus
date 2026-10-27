@@ -162,11 +162,11 @@ export function GatewayPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab]);
 
-  // 按数据流排：供应商 → 模型 → Agent。
+  // 与侧栏同序：供应商 → Agent → 路由。
   const tabs: Array<{ id: Tab; label: string }> = [
     { id: "providers", label: t("供应商") },
-    { id: "routing", label: t("路由") },
     { id: "agents", label: t("智能体") },
+    { id: "routing", label: t("路由") },
     { id: "sessions", label: t("会话") },
     { id: "usage", label: t("用量") },
     { id: "gateway", label: t("网关") },
