@@ -405,7 +405,7 @@ export function pickerSections(
     const providerHit = matches(query, entry.name, entry.id);
     const items = entry.models
       .filter((model) => providerHit || matches(query, model))
-      .map((model) => ({ model, label: model, sub: maskAccountName(entry.name), avatar: avatar(entry.name) }));
+      .map((model) => ({ model, label: prettyModelName(model), sub: maskAccountName(entry.name), avatar: avatar(entry.name) }));
     if (items.length) sections.push({ key: `provider:${entry.id}`, title: maskAccountName(entry.name), avatar: avatar(entry.name), items });
   }
   const groups = payload.groups
@@ -440,9 +440,57 @@ export function modelDisplay(payload: GatewayPayload | null, model: string, excl
     return { title: group?.name ?? title, sub: title, group: true };
   }
   const qualified = qualifiedProvider(payload, title, exclude);
-  if (qualified) return { title: qualified.model, sub: maskAccountName(qualified.entry.name), group: false };
+  if (qualified) return { title: prettyModelName(qualified.model), sub: maskAccountName(qualified.entry.name), group: false };
   const entry = agentPoolProviders(payload, exclude).find((item) => item.models.some((known) => known.toLowerCase() === title.toLowerCase()));
-  return { title, sub: entry?.name ?? "", group: false };
+  return { title: prettyModelName(title), sub: entry?.name ?? "", group: false };
+}
+
+/** 品牌词的正式写法。 */
+const MODEL_WORDS: Record<string, string> = {
+  gpt: "GPT",
+  glm: "GLM",
+  deepseek: "DeepSeek",
+  minimax: "MiniMax",
+  qwen: "Qwen",
+  qwq: "QwQ",
+  kimi: "Kimi",
+  grok: "Grok",
+  claude: "Claude",
+  gemini: "Gemini",
+  gemma: "Gemma",
+  llama: "Llama",
+  mistral: "Mistral",
+  codestral: "Codestral",
+  doubao: "Doubao",
+  ernie: "ERNIE",
+  hunyuan: "Hunyuan",
+  step: "Step",
+  mimo: "MiMo",
+  longcat: "LongCat",
+};
+
+/** 一段模型名：品牌词按正式写法；`v4`、`k2`、`r1` 这类字母 + 数字大写；`235b` → `235B`；`o3` 这类 OpenAI 推理模型保持小写；其余首字母大写。 */
+function prettyModelToken(token: string): string {
+  const lower = token.toLowerCase();
+  if (MODEL_WORDS[lower]) return MODEL_WORDS[lower];
+  if (/^o\d/.test(lower)) return lower;
+  if (/^[a-z]\d+(\.\d+)?[a-z]?$/.test(lower)) return lower.toUpperCase();
+  if (/^\d+(\.\d+)?[bkm]$/.test(lower)) return lower.toUpperCase();
+  if (/^\d/.test(lower)) return lower;
+  const word = /^([a-z]+)(.*)$/.exec(lower);
+  if (!word) return token;
+  const head = MODEL_WORDS[word[1]] ?? word[1].charAt(0).toUpperCase() + word[1].slice(1);
+  return head + word[2];
+}
+
+/** 模型 ID 的显示写法，如 `gpt-6.1-sol` → `GPT-6.1-Sol`、`deepseek-v4-pro` → `DeepSeek-V4-Pro`。
+ * 只用于显示，请求和配置里仍用原始 ID；`vendor/` 前缀和 `[1M]` 后缀原样保留。 */
+export function prettyModelName(model: string): string {
+  const match = /^(.*\/)?([^/[]+)(\[.*\])?$/.exec(model.trim());
+  if (!match) return model;
+  const [, prefix = "", name, suffix = ""] = match;
+  if (/[A-Z]/.test(name)) return model.trim();
+  return prefix + name.split(/([-_])/).map((part) => (part === "-" || part === "_" ? part : prettyModelToken(part))).join("") + suffix;
 }
 
 export function groupModeLabel(mode: string): string {

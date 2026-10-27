@@ -14,6 +14,7 @@ import {
   memberLabel,
   memberStatus,
   modelDisplay,
+  prettyModelName,
   modelRoutable,
   parseContextWindow,
   pickerSections,
@@ -117,14 +118,23 @@ test("模型选择器：每个供应商一组，路由组作为 group/ 模型在
 });
 
 test("模型显示：模型名 + 提供它的供应商；<供应商>/<模型> 拆开；路由组显示组名", () => {
-  assert.deepEqual(modelDisplay(payload(), ""), { title: "deepseek-v4-pro", sub: "DeepSeek", group: false });
-  assert.deepEqual(modelDisplay(payload(), "glm-5.3"), { title: "glm-5.3", sub: "GLM", group: false });
-  assert.deepEqual(modelDisplay(payload(), "deepseek/deepseek-v4-flash"), { title: "deepseek-v4-flash", sub: "DeepSeek", group: false });
+  assert.deepEqual(modelDisplay(payload(), ""), { title: "DeepSeek-V4-Pro", sub: "DeepSeek", group: false });
+  assert.deepEqual(modelDisplay(payload(), "glm-5.3"), { title: "GLM-5.3", sub: "GLM", group: false });
+  assert.deepEqual(modelDisplay(payload(), "deepseek/deepseek-v4-flash"), { title: "DeepSeek-V4-Flash", sub: "DeepSeek", group: false });
   assert.deepEqual(modelDisplay(payload(), "group/daily"), { title: "Daily", sub: "group/daily", group: true });
-  assert.equal(memberLabel(payload(), "deepseek/deepseek-v4-flash"), "DeepSeek · deepseek-v4-flash");
+  assert.equal(memberLabel(payload(), "deepseek/deepseek-v4-flash"), "DeepSeek · DeepSeek-V4-Flash");
   assert.equal(memberLabel(payload(), "group/daily"), "Daily");
   assert.equal(groupModelId("daily"), "group/daily");
   assert.equal(slugify(" 系统 默认 "), "系统-默认");
+});
+
+test("模型名显示成正式写法，只影响显示", () => {
+  assert.equal(prettyModelName("gpt-6.1-sol"), "GPT-6.1-Sol");
+  assert.equal(prettyModelName("kimi-k2-turbo"), "Kimi-K2-Turbo");
+  assert.equal(prettyModelName("qwen3-235b-a22b"), "Qwen3-235B-A22B");
+  assert.equal(prettyModelName("o3-mini"), "o3-Mini");
+  assert.equal(prettyModelName("anthropic/claude-sonnet-5[1M]"), "anthropic/Claude-Sonnet-5[1M]");
+  assert.equal(prettyModelName("MiniMax-M2"), "MiniMax-M2", "本来就带大写的原样保留");
 });
 
 function withActivity(): GatewayPayload {

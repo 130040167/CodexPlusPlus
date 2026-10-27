@@ -2838,16 +2838,16 @@ span.gw-avatar[data-size] {
   min-width: 0;
 }
 
-.gw-portal .gw-mp-text code {
+.gw-portal .gw-mp-text strong {
   overflow: hidden;
   color: var(--gw-ink);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12.5px;
+  font-size: 13px;
+  font-weight: 500;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.gw-portal .gw-mp-item[data-selected="true"] code {
+.gw-portal .gw-mp-item[data-selected="true"] strong {
   color: hsl(var(--primary));
   font-weight: 600;
 }

@@ -535,7 +535,7 @@ export function ModelList({
                   tabIndex={0}
                 >
                   <span className="gw-mp-text">
-                    <code>{item.label}</code>
+                    <strong title={item.model}>{item.label}</strong>
                     {item.custom ? <small>{t("自定义模型 ID")}</small> : item.sub && item.sub !== section.title ? <small>{item.sub}</small> : null}
                   </span>
                   <button
