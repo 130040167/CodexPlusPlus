@@ -4,9 +4,10 @@
 //! 不读也不写 `settings.json` 里 Codex / Claude / Grok 各自的供应商。从直连模式「导入」是复制一份，
 //! 之后两边互不影响。文件里有上游 Key 和本地 token，新建时只给本人读写。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::Context;
 use serde::de::DeserializeOwned;
@@ -468,7 +469,43 @@ impl GatewayStore {
     }
 
     pub fn save(&self, settings: &GatewaySettings) -> anyhow::Result<()> {
+        let _guard = self.lock();
         write_store(&self.path, settings)
+    }
+
+    /// 带锁的读-改-写：同一进程里对同一个文件的 `update` 依次进行，后台任务（检查模型、
+    /// 刷新登录 token）与界面命令同时改时不会互相覆盖。`edit` 出错时不写盘；改完和读到的
+    /// 一样时也不写盘。返回改后的状态与 `edit` 的返回值。
+    ///
+    /// `edit` 里不能再调用这个 store 的 `save` / `update`（同一把锁，会死锁）。
+    pub fn update<T>(
+        &self,
+        edit: impl FnOnce(&mut GatewaySettings) -> anyhow::Result<T>,
+    ) -> anyhow::Result<(GatewaySettings, T)> {
+        let _guard = self.lock();
+        let before = read_store(&self.path)?;
+        let mut settings = before.clone();
+        let value = edit(&mut settings)?;
+        if settings != before {
+            write_store(&self.path, &settings)?;
+        }
+        Ok((settings, value))
+    }
+
+    /// 这个文件在进程内的写锁。按路径区分，测试里各自的临时文件互不阻塞。
+    fn lock(&self) -> std::sync::MutexGuard<'static, ()> {
+        static LOCKS: OnceLock<Mutex<HashMap<PathBuf, &'static Mutex<()>>>> = OnceLock::new();
+        let lock: &'static Mutex<()> = {
+            let mut locks = LOCKS
+                .get_or_init(Mutex::default)
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            locks
+                .entry(self.path.clone())
+                // 每个路径只泄漏一把锁，进程里用到的 gateway.json 路径屈指可数。
+                .or_insert_with(|| Box::leak(Box::new(Mutex::new(()))))
+        };
+        lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -847,6 +884,45 @@ mod tests {
         settings.restore_on_exit = false;
         store.save(&settings).unwrap();
         assert!(!store.load().unwrap().restore_on_exit);
+    }
+
+    #[test]
+    fn update_serializes_concurrent_writers() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(temp.path().join("gateway.json"));
+        let threads: Vec<_> = (0..8)
+            .map(|thread| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for index in 0..10 {
+                        store
+                            .update(|gateway| {
+                                gateway.groups.push(GatewayGroup {
+                                    id: format!("g-{thread}-{index}"),
+                                    name: String::new(),
+                                    mode: GroupMode::default(),
+                                    sticky: GroupSticky::default(),
+                                    members: Vec::new(),
+                                });
+                                Ok(())
+                            })
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(store.load().unwrap().groups.len(), 80, "并发写入一条都不丢");
+
+        // 出错时不写盘。
+        let failed = store.update(|gateway| -> anyhow::Result<()> {
+            gateway.groups.clear();
+            anyhow::bail!("不保存")
+        });
+        assert!(failed.is_err());
+        assert_eq!(store.load().unwrap().groups.len(), 80);
     }
 
     #[test]

@@ -1001,15 +1001,17 @@ async fn prepare_grok(relay: &RelayProfile, value: &Value) -> anyhow::Result<Rel
     updated.auth_contents = auth.to_string();
     updated.api_key = tokens.access_token.clone();
     updated.base_url = GROK_PROXY_BASE.to_string();
-    if let Ok(mut gateway) = store.load()
-        && let Some(provider) = gateway
+    // 后台刷新 token 和界面命令可能同时改 gateway.json：带锁读改写，免得互相覆盖。
+    let _ = store.update(|gateway| {
+        if let Some(provider) = gateway
             .providers
             .iter_mut()
             .find(|provider| provider.relay.id == relay.id)
-    {
-        provider.relay.auth_contents = updated.auth_contents.clone();
-        let _ = store.save(&gateway);
-    }
+        {
+            provider.relay.auth_contents = updated.auth_contents.clone();
+        }
+        Ok(())
+    });
     Ok(updated)
 }
 
@@ -1513,15 +1515,17 @@ async fn prepare_chatgpt_api(relay: &RelayProfile, value: &Value) -> anyhow::Res
     let Some(ready) = chatgpt_api_from_auth(&updated, &auth) else {
         bail!("刷新 ChatGPT API 登录失败：新 token 的有效期太短");
     };
-    if let Ok(mut gateway) = store.load()
-        && let Some(provider) = gateway
+    // 后台刷新 token 和界面命令可能同时改 gateway.json：带锁读改写，免得互相覆盖。
+    let _ = store.update(|gateway| {
+        if let Some(provider) = gateway
             .providers
             .iter_mut()
             .find(|provider| provider.relay.id == relay.id)
-    {
-        provider.relay.auth_contents = ready.auth_contents.clone();
-        let _ = store.save(&gateway);
-    }
+        {
+            provider.relay.auth_contents = ready.auth_contents.clone();
+        }
+        Ok(())
+    });
     Ok(ready)
 }
 
@@ -1774,17 +1778,19 @@ async fn prepare_copilot(relay: &RelayProfile, value: &Value) -> anyhow::Result<
     updated.auth_contents = auth.to_string();
     updated.api_key = token.token.clone();
     updated.base_url = format!("{}#", token.api_base);
-    if let Ok(mut gateway) = store.load()
-        && let Some(provider) = gateway
+    // 后台刷新 token 和界面命令可能同时改 gateway.json：带锁读改写，免得互相覆盖。
+    let _ = store.update(|gateway| {
+        if let Some(provider) = gateway
             .providers
             .iter_mut()
             .find(|provider| provider.relay.id == relay.id)
-    {
-        provider.relay.auth_contents = updated.auth_contents.clone();
-        provider.relay.api_key = updated.api_key.clone();
-        provider.relay.base_url = updated.base_url.clone();
-        let _ = store.save(&gateway);
-    }
+        {
+            provider.relay.auth_contents = updated.auth_contents.clone();
+            provider.relay.api_key = updated.api_key.clone();
+            provider.relay.base_url = updated.base_url.clone();
+        }
+        Ok(())
+    });
     Ok(updated)
 }
 

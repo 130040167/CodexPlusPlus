@@ -105,26 +105,26 @@ pub async fn check_provider(store: &GatewayStore, id: &str) -> anyhow::Result<Mo
         .map(|provider| provider.relay.clone())
         .ok_or_else(|| anyhow::anyhow!("供应商不存在：{id}"))?;
     let fetched = upstream_models(&relay).await;
-    // 拉之前和拉之后都可能有别的写入：重新读一次再改。
-    let mut gateway = store.load()?;
-    let Some(provider) = gateway
-        .providers
-        .iter_mut()
-        .find(|provider| provider.relay.id == id)
-    else {
-        bail!("供应商不存在：{id}");
-    };
-    provider.models_checked_at_ms = now_ms();
-    let result = fetched.map(|upstream| {
-        let diff = diff_models(
-            &crate::gateway::route::relay_models(&provider.relay),
-            &upstream,
-        );
-        provider.upstream_new = diff.added.clone();
-        provider.upstream_gone = diff.removed.clone();
-        diff
-    });
-    store.save(&gateway)?;
+    // 拉的这段时间里可能有别的写入：在锁里重新读一次再改。
+    let (_, result) = store.update(|gateway| {
+        let Some(provider) = gateway
+            .providers
+            .iter_mut()
+            .find(|provider| provider.relay.id == id)
+        else {
+            bail!("供应商不存在：{id}");
+        };
+        provider.models_checked_at_ms = now_ms();
+        Ok(fetched.map(|upstream| {
+            let diff = diff_models(
+                &crate::gateway::route::relay_models(&provider.relay),
+                &upstream,
+            );
+            provider.upstream_new = diff.added.clone();
+            provider.upstream_gone = diff.removed.clone();
+            diff
+        }))
+    })?;
     result
 }
 
@@ -172,31 +172,37 @@ pub fn set_provider_models(
             list.push(model.to_string());
         }
     }
-    let mut gateway = store.load()?;
-    let Some(provider) = gateway
-        .providers
-        .iter_mut()
-        .find(|provider| provider.relay.id == id)
-    else {
-        bail!("供应商不存在：{id}");
-    };
-    // 指定了默认模型（且在列表里）就用它；否则原来的默认模型还在就保留，不在就换成第一个。
-    let wanted = default_model
-        .map(str::trim)
-        .filter(|model| list.iter().any(|item| item.eq_ignore_ascii_case(model)))
-        .map(str::to_string);
-    let keep = list
-        .iter()
-        .any(|model| model.eq_ignore_ascii_case(provider.relay.model.trim()));
-    if let Some(model) = wanted {
-        provider.relay.model = model;
-    } else if !keep {
-        provider.relay.model = list.first().cloned().unwrap_or_default();
-    }
-    provider.relay.model_list = list.join("\n");
-    provider.upstream_new.clear();
-    provider.upstream_gone.clear();
-    store.save(&gateway)?;
+    let (gateway, ()) = store.update(|gateway| {
+        let Some(provider) = gateway
+            .providers
+            .iter_mut()
+            .find(|provider| provider.relay.id == id)
+        else {
+            bail!("供应商不存在：{id}");
+        };
+        // 当前默认模型按 config 快照优先的口径取，和读盘、路由看到的一致。
+        let current = crate::relay_config::relay_profile_model(&provider.relay);
+        // 指定了默认模型（且在列表里）就用它；否则原来的默认模型还在就保留，不在就换成第一个。
+        let wanted = default_model
+            .map(str::trim)
+            .and_then(|model| list.iter().find(|item| item.eq_ignore_ascii_case(model)))
+            .cloned();
+        let model = match wanted {
+            Some(model) => model,
+            None => list
+                .iter()
+                .find(|model| model.eq_ignore_ascii_case(current.trim()))
+                .or(list.first())
+                .cloned()
+                .unwrap_or_default(),
+        };
+        // 默认模型同时写进 config 快照；只改字段的话读盘时会被快照里的旧值改回来。
+        crate::relay_config::set_relay_profile_model(&mut provider.relay, &model)?;
+        provider.relay.model_list = list.join("\n");
+        provider.upstream_new.clear();
+        provider.upstream_gone.clear();
+        Ok(())
+    })?;
     Ok(gateway)
 }
 
@@ -235,22 +241,23 @@ pub async fn sync_public_prices(store: &GatewayStore, id: &str) -> anyhow::Resul
         })
         .collect();
     if !found.is_empty() {
-        let mut gateway = store.load()?;
-        let Some(provider) = gateway
-            .providers
-            .iter_mut()
-            .find(|provider| provider.relay.id == id)
-        else {
-            bail!("供应商不存在：{id}");
-        };
-        for (model, price) in &found {
-            // 大小写不同的旧记录一并替换，免得同一个模型存两份。
-            provider
-                .model_prices
-                .retain(|name, _| !name.eq_ignore_ascii_case(model));
-            provider.model_prices.insert(model.clone(), price.clone());
-        }
-        store.save(&gateway)?;
+        store.update(|gateway| {
+            let Some(provider) = gateway
+                .providers
+                .iter_mut()
+                .find(|provider| provider.relay.id == id)
+            else {
+                bail!("供应商不存在：{id}");
+            };
+            for (model, price) in &found {
+                // 大小写不同的旧记录一并替换，免得同一个模型存两份。
+                provider
+                    .model_prices
+                    .retain(|name, _| !name.eq_ignore_ascii_case(model));
+                provider.model_prices.insert(model.clone(), price.clone());
+            }
+            Ok(())
+        })?;
     }
     Ok((found.len(), models.len()))
 }
@@ -283,29 +290,29 @@ pub async fn fill_missing_prices(
         return Ok(0);
     }
     let (catalog, _) = crate::model_pricing::load_catalog(false).await?;
-    let mut gateway = store.load()?;
-    let mut filled = 0;
-    for (id, base_url, missing) in wanted {
-        let Some(provider) = gateway
-            .providers
-            .iter_mut()
-            .find(|provider| provider.relay.id == id)
-        else {
-            continue;
-        };
-        for model in missing {
-            if provider.price_for(&model).is_some() {
+    // 拉价格表期间可能有别的写入：在锁里重新读一次再补。
+    let (_, filled) = store.update(|gateway| {
+        let mut filled = 0;
+        for (id, base_url, missing) in wanted {
+            let Some(provider) = gateway
+                .providers
+                .iter_mut()
+                .find(|provider| provider.relay.id == id)
+            else {
                 continue;
-            }
-            if let Some(found) = catalog.lookup(&base_url, &model) {
-                provider.model_prices.insert(model, price_from_match(found));
-                filled += 1;
+            };
+            for model in missing {
+                if provider.price_for(&model).is_some() {
+                    continue;
+                }
+                if let Some(found) = catalog.lookup(&base_url, &model) {
+                    provider.model_prices.insert(model, price_from_match(found));
+                    filled += 1;
+                }
             }
         }
-    }
-    if filled > 0 {
-        store.save(&gateway)?;
-    }
+        Ok(filled)
+    })?;
     Ok(filled)
 }
 
@@ -368,5 +375,62 @@ mod tests {
 
         let saved = set_provider_models(&store, "p", &["c".into(), "d".into()], Some("d")).unwrap();
         assert_eq!(saved.provider("p").unwrap().relay.model, "d");
+    }
+
+    #[test]
+    fn saving_models_rewrites_the_default_in_the_config_snapshot() {
+        use crate::gateway::apply::{ProviderInput, create_provider};
+        let temp = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(temp.path().join("gateway.json"));
+        let input = ProviderInput {
+            name: "Snapshot".into(),
+            base_url: "https://snapshot.test/v1".into(),
+            protocol: crate::settings::RelayProtocol::ChatCompletions,
+            keys: vec!["sk-snapshot".into()],
+            model: "old-model".into(),
+            model_list: "old-model\nkeep-model".into(),
+            ..ProviderInput::default()
+        };
+        let (_, id) = create_provider(&store, &input, "", None).unwrap();
+        let created = store.load().unwrap();
+        assert!(
+            created
+                .provider(&id)
+                .unwrap()
+                .relay
+                .config_contents
+                .contains("old-model"),
+            "create_provider 建出来的供应商带 config 快照"
+        );
+
+        // 换默认模型并删掉旧默认：重新读盘后旧模型不能被改回来、也不能并回列表。
+        set_provider_models(
+            &store,
+            &id,
+            &["keep-model".into(), "new-model".into()],
+            Some("new-model"),
+        )
+        .unwrap();
+        let loaded = store.load().unwrap();
+        let relay = &loaded.provider(&id).unwrap().relay;
+        assert_eq!(relay.model, "new-model");
+        assert_eq!(crate::relay_config::relay_profile_model(relay), "new-model");
+        assert_eq!(
+            crate::gateway::route::relay_models(relay),
+            vec!["new-model", "keep-model"]
+        );
+        assert!(
+            !relay.model_list.contains("old-model"),
+            "{}",
+            relay.model_list
+        );
+
+        // 没指定默认模型、原默认被删：换成列表第一个，同样落到快照里。
+        set_provider_models(&store, &id, &["keep-model".into()], None).unwrap();
+        let loaded = store.load().unwrap();
+        let relay = &loaded.provider(&id).unwrap().relay;
+        assert_eq!(relay.model, "keep-model");
+        assert_eq!(relay.model_list, "keep-model");
+        assert!(!relay.config_contents.contains("new-model"));
     }
 }
