@@ -262,11 +262,219 @@ pub fn codex_gateway_profile(
     )?;
     profile.id = CODEX_GATEWAY_RELAY_ID.to_string();
     profile.relay_mode = RelayMode::PureApi;
+    profile.model_metadata = codex_model_metadata(gateway, binding);
     if signed_in {
         profile.config_contents = with_openai_session_identity(&profile.config_contents)?;
     }
     crate::relay_config::normalize_relay_profile_for_storage(&mut profile)?;
     Ok(profile)
+}
+
+/// 模型组在 Codex 模型选择器里的分组身份。
+const CODEX_GROUPS_GROUP_ID: &str = "codex-plus-gateway-groups";
+
+/// Codex 模型目录里每个模型的元数据（显示名、推理档位、按供应商分组），与直连模式的按模型聚合一致：
+/// 裸模型名取池里第一个提供它的供应商（网关也先发给它）的成员目录，分组是那个供应商；
+/// `group/<id>` 显示组名，单独归在「模型组」一组。没有可写的条目时返回空串。
+///
+/// 写进托管供应商的 `model_metadata`：生成 `model_catalog_json` 时覆盖进目录，
+/// 注入层读的 `/codex-model-catalog` 也按它给出推理档位与分组。
+fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> String {
+    let relays = route::binding_pool_relays(gateway, binding);
+    let mut member_catalogs: Vec<Option<Vec<Value>>> = vec![None; relays.len()];
+    let mut metadata = Map::new();
+    for model in route::pool_models(gateway, binding) {
+        if let Some(id) = model.strip_prefix(GROUP_MODEL_PREFIX) {
+            let Some(group) = gateway.group(id) else {
+                continue;
+            };
+            let entry = crate::model_suffix::collect_catalog_entries(
+                &model,
+                &Default::default(),
+                &Default::default(),
+                &model,
+            );
+            let template: Value =
+                serde_json::from_str(&crate::model_suffix::build_model_catalog_json(&entry, None))
+                    .unwrap_or(Value::Null);
+            let mut fields = catalog_ui_fields(&template["models"][0]);
+            fields.insert("display_name".into(), json!(group.name));
+            fields.insert("description".into(), json!(format!("{model} · 模型组")));
+            fields.insert("codex_plus_group".into(), json!("模型组"));
+            fields.insert("codex_plus_group_id".into(), json!(CODEX_GROUPS_GROUP_ID));
+            metadata.insert(model, Value::Object(fields));
+            continue;
+        }
+        let Some(index) = relays.iter().position(|relay| {
+            route::relay_models(relay)
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&model))
+        }) else {
+            continue;
+        };
+        let relay = relays[index];
+        let catalog = member_catalogs[index].get_or_insert_with(|| {
+            crate::aggregate_catalog::build_member_catalog(relay)
+                .ok()
+                .and_then(|payload| payload["models"].as_array().cloned())
+                .unwrap_or_default()
+        });
+        let Some(entry) = catalog.iter().find(|entry| {
+            entry["slug"]
+                .as_str()
+                .is_some_and(|slug| slug.eq_ignore_ascii_case(&model))
+        }) else {
+            continue;
+        };
+        let mut fields = catalog_ui_fields(entry);
+        // 没有元数据的模型，成员目录的显示名就是原始 ID：换成规范写法（gpt-6.1-sol → GPT-6.1-Sol）。
+        let display = fields
+            .get("display_name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.eq_ignore_ascii_case(&model))
+            .map(str::to_string)
+            .unwrap_or_else(|| pretty_model_name(&model));
+        let group = if relay.name.trim().is_empty() {
+            relay.id.clone()
+        } else {
+            relay.name.trim().to_string()
+        };
+        fields.insert("display_name".into(), json!(display));
+        fields.insert("description".into(), json!(format!("{model} · {group}")));
+        fields.insert("codex_plus_group".into(), json!(group));
+        fields.insert("codex_plus_group_id".into(), json!(relay.id));
+        metadata.insert(model, Value::Object(fields));
+    }
+    if metadata.is_empty() {
+        return String::new();
+    }
+    serde_json::to_string(&Value::Object(metadata)).unwrap_or_default()
+}
+
+/// 目录条目里选择器要用的字段；整条（含基础指令等大字段）不进设置文件。
+fn catalog_ui_fields(entry: &Value) -> Map<String, Value> {
+    let mut fields = Map::new();
+    for key in [
+        "display_name",
+        "supported_reasoning_levels",
+        "default_reasoning_level",
+        "supports_reasoning_summaries",
+    ] {
+        if let Some(value) = entry.get(key).filter(|value| !value.is_null()) {
+            fields.insert(key.to_string(), value.clone());
+        }
+    }
+    fields
+}
+
+/// 模型 ID 的显示写法，和管理器界面一致：品牌词按正式写法（GPT、DeepSeek、GLM），
+/// `v4`、`k2` 这类字母 + 数字大写，其余首字母大写。已经带大写的原样保留。
+fn pretty_model_name(model: &str) -> String {
+    const WORDS: &[(&str, &str)] = &[
+        ("gpt", "GPT"),
+        ("glm", "GLM"),
+        ("deepseek", "DeepSeek"),
+        ("minimax", "MiniMax"),
+        ("qwen", "Qwen"),
+        ("qwq", "QwQ"),
+        ("kimi", "Kimi"),
+        ("grok", "Grok"),
+        ("claude", "Claude"),
+        ("gemini", "Gemini"),
+        ("gemma", "Gemma"),
+        ("llama", "Llama"),
+        ("mistral", "Mistral"),
+        ("codestral", "Codestral"),
+        ("doubao", "Doubao"),
+        ("ernie", "ERNIE"),
+        ("hunyuan", "Hunyuan"),
+        ("step", "Step"),
+        ("mimo", "MiMo"),
+        ("longcat", "LongCat"),
+    ];
+    let model = model.trim();
+    let (prefix, name) = match model.rfind('/') {
+        Some(index) => model.split_at(index + 1),
+        None => ("", model),
+    };
+    if name.chars().any(|ch| ch.is_ascii_uppercase()) {
+        return model.to_string();
+    }
+    let token = |part: &str| -> String {
+        let lower = part.to_ascii_lowercase();
+        let word = |key: &str| {
+            WORDS
+                .iter()
+                .find(|(known, _)| *known == key)
+                .map(|(_, word)| *word)
+        };
+        if let Some(word) = word(&lower) {
+            return word.to_string();
+        }
+        let bytes = lower.as_bytes();
+        // 数字串（可带一个小数部分）从 `from` 开始，返回结束位置。
+        let number_end = |from: usize| {
+            let mut end = from;
+            while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                end += 1;
+            }
+            if end > from
+                && bytes.get(end) == Some(&b'.')
+                && bytes.get(end + 1).is_some_and(u8::is_ascii_digit)
+            {
+                end += 1;
+                while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                    end += 1;
+                }
+            }
+            (end > from).then_some(end)
+        };
+        let Some(&first) = bytes.first() else {
+            return String::new();
+        };
+        // `o3` 这类 OpenAI 推理模型保持小写。
+        if first == b'o' && bytes.get(1).is_some_and(u8::is_ascii_digit) {
+            return lower;
+        }
+        // `v4`、`k2.5`、`r1b`：一个字母 + 数字（+ 至多一个字母）。
+        if first.is_ascii_alphabetic()
+            && let Some(end) = number_end(1)
+            && (end == bytes.len() || (end + 1 == bytes.len() && bytes[end].is_ascii_alphabetic()))
+        {
+            return lower.to_ascii_uppercase();
+        }
+        if first.is_ascii_digit() {
+            // `235b`、`32k` 大写，其余数字开头的原样。
+            return match number_end(0) {
+                Some(end) if end + 1 == bytes.len() && matches!(bytes[end], b'b' | b'k' | b'm') => {
+                    lower.to_ascii_uppercase()
+                }
+                _ => lower,
+            };
+        }
+        let letters = lower.bytes().take_while(u8::is_ascii_alphabetic).count();
+        if letters == 0 {
+            return part.to_string();
+        }
+        let (head, rest) = lower.split_at(letters);
+        let head = word(head)
+            .map(str::to_string)
+            .unwrap_or_else(|| head[..1].to_ascii_uppercase() + &head[1..]);
+        head + rest
+    };
+    let mut out = String::from(prefix);
+    let mut current = String::new();
+    for ch in name.chars() {
+        if ch == '-' || ch == '_' {
+            out.push_str(&token(&current));
+            out.push(ch);
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+    out.push_str(&token(&current));
+    out
 }
 
 /// 把供应商配置改成 openai 会话身份：`model_provider = "openai"`，传输放进 `[model_providers.custom]`。
@@ -1448,4 +1656,26 @@ pub fn delete_group(store: &GatewayStore, id: &str) -> anyhow::Result<GatewaySet
 /// 绑定解析后的默认模型，UI 展示用。
 pub fn resolved_default_model(gateway: &GatewaySettings, binding: &AgentBinding) -> String {
     route::binding_default_model(gateway, binding)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pretty_model_name;
+
+    #[test]
+    fn pretty_model_names_match_the_manager() {
+        for (raw, pretty) in [
+            ("gpt-6.1-sol", "GPT-6.1-Sol"),
+            ("deepseek-v4-pro", "DeepSeek-V4-Pro"),
+            ("claude-opus-5-5", "Claude-Opus-5-5"),
+            ("kimi-k2.5", "Kimi-K2.5"),
+            ("qwen3-235b-a22b", "Qwen3-235B-A22B"),
+            ("o3-mini", "o3-Mini"),
+            ("glm-5.3", "GLM-5.3"),
+            ("anthropic/claude-sonnet-5", "anthropic/Claude-Sonnet-5"),
+            ("MiniMax-M3", "MiniMax-M3"),
+        ] {
+            assert_eq!(pretty_model_name(raw), pretty, "{raw}");
+        }
+    }
 }

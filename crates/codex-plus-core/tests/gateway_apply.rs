@@ -389,6 +389,121 @@ fn codex_enable_switches_to_managed_gateway_profile_and_disable_switches_back() 
     assert_eq!(binding.restore.codex_previous_relay_id, "direct");
 }
 
+/// 网关模式给 Codex 的模型目录与直连模式的按模型聚合一样：显示名、推理档位、按供应商分组，
+/// 模型组单独一组。没有内置元数据的模型（第三方的 claude-*）也要有推理档位。
+#[test]
+fn codex_gateway_catalog_carries_display_names_reasoning_and_provider_groups() {
+    let fixture = fixture(57394);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    create_provider(
+        &ctx.gateway,
+        &ProviderInput {
+            name: "Claude 中转".into(),
+            base_url: "https://relay.test/v1".into(),
+            protocol: RelayProtocol::Responses,
+            keys: vec!["sk-relay".into()],
+            model: "claude-opus-5-5".into(),
+            model_list: "claude-opus-5-5\ndeepseek-v4-pro".into(),
+            price: None,
+            model_prices: None,
+            proxy: None,
+        },
+        "",
+        None,
+    )
+    .unwrap();
+    save_group(
+        &ctx.gateway,
+        &GroupInput {
+            name: "Daily".into(),
+            mode: GroupMode::InOrder,
+            members: vec![GroupMember {
+                model: "claude-opus-5-5".into(),
+                weight: 1,
+            }],
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    let mut seeded = BackendSettings::default();
+    seeded.relay_profiles_enabled = true;
+    ctx.settings.save(&seeded).unwrap();
+
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let config = std::fs::read_to_string(ctx.codex_home.join("config.toml")).unwrap();
+    let pointer = config
+        .lines()
+        .find_map(|line| line.strip_prefix("model_catalog_json = "))
+        .map(|value| value.trim().trim_matches('"').to_string())
+        .unwrap_or_else(|| panic!("网关供应商要写模型目录：{config}"));
+    let pointer = std::path::PathBuf::from(pointer);
+    let path = if pointer.is_absolute() {
+        pointer
+    } else {
+        ctx.codex_home.join(pointer)
+    };
+    let catalog: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let model = |slug: &str| {
+        catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["slug"] == slug)
+            .cloned()
+            .unwrap_or_else(|| panic!("目录里没有 {slug}：{catalog}"))
+    };
+
+    let opus = model("claude-opus-5-5");
+    assert_eq!(opus["display_name"], "Claude-Opus-5-5");
+    assert!(
+        opus["supported_reasoning_levels"]
+            .as_array()
+            .is_some_and(|levels| !levels.is_empty()),
+        "{opus}"
+    );
+    assert_eq!(opus["codex_plus_group"], "Claude 中转");
+    // 两家都提供的模型归第一个提供它的供应商（网关也先发给它）。
+    let pro = model("deepseek-v4-pro");
+    assert_eq!(pro["codex_plus_group"], "DeepSeek");
+    assert_eq!(pro["display_name"], "DeepSeek-V4-Pro");
+    let group = model("group/daily");
+    assert_eq!(group["display_name"], "Daily");
+    assert_eq!(group["codex_plus_group"], "模型组");
+
+    // 注入层读的模型元数据（托管供应商的 model_metadata）同样给出推理档位与分组。
+    let settings = ctx.settings.load().unwrap();
+    let profile = settings
+        .relay_profiles
+        .iter()
+        .find(|profile| profile.id == "codex-plus-gateway")
+        .unwrap();
+    let metadata: Value = serde_json::from_str(&profile.model_metadata).unwrap();
+    let ui = codex_plus_core::model_suffix::model_ui_metadata_with_override(
+        "claude-opus-5-5",
+        metadata.get("claude-opus-5-5"),
+    )
+    .unwrap();
+    assert_eq!(ui["displayName"], "Claude-Opus-5-5");
+    assert!(
+        ui["supportedReasoningEfforts"]
+            .as_array()
+            .is_some_and(|levels| !levels.is_empty())
+    );
+    assert_eq!(ui["codex_plus_group_id"], profile_id_of(ctx, "Claude 中转"));
+}
+
+fn profile_id_of(ctx: &ApplyContext, name: &str) -> String {
+    ctx.gateway
+        .load()
+        .unwrap()
+        .providers
+        .iter()
+        .find(|provider| provider.relay.name == name)
+        .map(|provider| provider.relay.id.clone())
+        .unwrap()
+}
+
 /// Codex 的实时配置被别的工具改过（直连模式里切换会报「实时配置冲突」）：
 /// 照样能接入网关，断开时把接入前的文件原样写回。
 #[test]
