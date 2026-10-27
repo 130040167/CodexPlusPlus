@@ -2,7 +2,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { appConfirm } from "./app-dialog";
-import { Check, ChevronDown, ChevronRight, ChevronUp, Layers, List, Search, Star, Waypoints, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, ChevronUp, Layers, List, Search, Shuffle, Star, Waypoints, X } from "lucide-react";
 import { t, tf } from "./i18n";
 import {
   agentModels,
@@ -23,7 +23,7 @@ import {
 } from "./gateway-model";
 import { AppSelect } from "./AppSelect";
 import { useEscapeLayer } from "./use-escape-layer";
-import { AGENT_ICONS, Avatar, Switch, avatarOf, loadFavorites, saveFavorites, type Notify, type Run, AgentIcon } from "./gateway-ui";
+import { AGENT_ICONS, AutoTag, Avatar, ModelViewGlyph, Switch, avatarOf, loadFavorites, saveFavorites, type Notify, type Run, AgentIcon } from "./gateway-ui";
 
 export function AgentsView({
   payload,
@@ -544,9 +544,9 @@ export function ModelList({
           <button data-active={!favoritesOnly} onClick={() => { setFavoritesOnly(false); setQuery(""); if (listRef.current) listRef.current.scrollTop = 0; }} type="button">{t("全部")}</button>
           <button data-active={favoritesOnly} onClick={() => setFavoritesOnly(!favoritesOnly)} type="button"><Star className="h-3 w-3" />{t("收藏")}</button>
           {filters.map((section) => (
-            <button key={section.key} onClick={() => jump(section.key)} title={section.key === "group" ? t("模型组") : section.title} type="button">
-              {section.key === "group" ? <Waypoints className="h-3 w-3" /> : <Avatar name={section.title} size="sm" />}
-              <span>{section.key === "group" ? t("模型组") : section.title.split(" · ")[0]}</span>
+            <button key={section.key} onClick={() => jump(section.key)} title={section.key === "group" || section.key === "auto" ? t(section.title) : section.title} type="button">
+              {section.key === "group" ? <Waypoints className="h-3 w-3" /> : section.key === "auto" ? <Shuffle className="h-3 w-3" /> : <Avatar name={section.title} size="sm" />}
+              <span>{section.key === "group" || section.key === "auto" ? t(section.title) : section.title.split(" · ")[0]}</span>
             </button>
           ))}
         </div>
@@ -560,8 +560,8 @@ export function ModelList({
         {sections.map((section) => (
           <section className="gw-mp-section" data-section={section.key} key={section.key}>
             <div className="gw-mp-heading">
-              {section.key === "group" ? <Waypoints className="h-3.5 w-3.5" /> : section.key === "custom" ? null : <Avatar name={section.title} size="sm" />}
-              <span>{section.key === "group" || section.key === "custom" ? t(section.title) : section.title}</span>
+              {section.key === "group" ? <Waypoints className="h-3.5 w-3.5" /> : section.key === "auto" ? <Shuffle className="h-3.5 w-3.5" /> : section.key === "custom" ? null : <Avatar name={section.title} size="sm" />}
+              <span>{section.key === "group" || section.key === "custom" || section.key === "auto" ? t(section.title) : section.title}</span>
               <em>{section.items.length}</em>
             </div>
             {section.items.map((item) => {
@@ -646,14 +646,9 @@ function ModelPicker({
   return (
     <div className="gw-picker">
       <button aria-expanded={open} aria-haspopup="listbox" className="gw-picker-button" onClick={() => onOpenChange(!open)} ref={buttonRef} type="button">
-        {showDefault ? (
-          <AgentIcon agent={agent.agent} className="gw-picker-agent" />
-        ) : display.group ? (
-          <Waypoints className="gw-picker-glyph h-4 w-4" />
-        ) : (
-          <Avatar name={display.sub || display.title} size="sm" />
-        )}
+        {showDefault ? <AgentIcon agent={agent.agent} className="gw-picker-agent" /> : <ModelViewGlyph view={display} />}
         <span>{showDefault ? t("默认") : display.title || t("选择模型")}</span>
+        {showDefault ? null : <AutoTag view={display} />}
         <ChevronDown className="h-3.5 w-3.5" />
       </button>
       <Floating anchorRef={buttonRef} className="gw-model-popover" onClose={() => onOpenChange(false)} open={open} width={560}>
@@ -697,8 +692,9 @@ function TierPicker({
     <>
       <button aria-expanded={open} className="gw-tier-button" onClick={() => setOpen(!open)} ref={buttonRef} type="button">
         <em>{label}</em>
-        {display ? (display.group ? <Waypoints className="h-3.5 w-3.5" /> : <Avatar name={display.sub || display.title} size="sm" />) : null}
+        {display ? <ModelViewGlyph view={display} /> : null}
         <span>{display ? display.title : t("同默认模型")}</span>
+        {display ? <AutoTag view={display} /> : null}
         <ChevronDown className="h-3.5 w-3.5" />
       </button>
       <Floating anchorRef={buttonRef} className="gw-model-popover" onClose={() => setOpen(false)} open={open} width={520}>

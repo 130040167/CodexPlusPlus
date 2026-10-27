@@ -1,7 +1,7 @@
 /** 本地网关页各标签共用的小组件与类型。 */
 import type { CSSProperties, ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { KeyRound } from "lucide-react";
+import { KeyRound, Shuffle, Waypoints } from "lucide-react";
 import { t, tf } from "./i18n";
 import {
   formatRemaining,
@@ -11,6 +11,7 @@ import {
   quotaWindowLabel,
   type GatewayResult,
   type MemberStatus,
+  type ModelView,
   type ProviderQuota,
 } from "./gateway-model";
 import { BRAND_ICON_URLS } from "./provider-brand-icons";
@@ -203,4 +204,16 @@ export function MemberStatusLabel({ status }: { status: MemberStatus }) {
     );
   }
   return <>{status.args.length ? tf(status.text, status.args) : t(status.text)}</>;
+}
+
+/** 模型按钮前的小图标：模型组、多家自动切换各有图标，其余用供应商头像。 */
+export function ModelViewGlyph({ view }: { view: ModelView }) {
+  if (view.group) return <Waypoints className="gw-picker-glyph h-4 w-4" />;
+  if (view.auto) return <Shuffle aria-label={t("多家自动切换")} className="gw-picker-glyph h-4 w-4" />;
+  return <Avatar name={view.sub || view.title} size="sm" />;
+}
+
+/** 模型名后的「自动」小标签：多家自动切换时显示，悬停列出按顺序尝试的几家。 */
+export function AutoTag({ view }: { view: ModelView }) {
+  return view.auto ? <em className="gw-auto-tag" title={view.sub}>{t("自动")}</em> : null;
 }

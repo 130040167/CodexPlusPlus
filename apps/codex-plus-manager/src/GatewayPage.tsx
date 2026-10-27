@@ -304,7 +304,7 @@ function DispatchTable({ payload, onManage }: { payload: GatewayPayload | null; 
       </SectionLabel>
       <div className="gw-card gw-dispatch">
         <p className="gw-dispatch-lead">
-          {t("同一个模型有多家提供时，Codex 的模型列表里每家单独列一份，选了哪家就只发给哪家；其它 Agent 写成「供应商 id/模型名」也一样。选不带供应商的模型名时，网关按下面从左往右的顺序依次尝试：前一家出错、Key 都在冷却或被熔断，就换下一家。顺序跟着供应商池走，在池里拖动即可调整。")}
+          {t("同一个模型有多家提供时，模型列表里每家名下各有一份，选了哪家就只发给哪家；另有一份「自动」（在「多家自动切换」里），选它时网关按下面从左往右的顺序依次尝试：前一家出错、Key 都在冷却或被熔断，就换下一家。顺序跟着供应商池走，在池里拖动即可调整。")}
         </p>
         {rows.length > DISPATCH_PREVIEW ? (
           <div className="gw-dispatch-search">

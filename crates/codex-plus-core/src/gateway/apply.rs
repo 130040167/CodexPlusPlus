@@ -331,12 +331,15 @@ pub fn codex_gateway_profile(
 /// Codex 模型选择器的注入层能从显示名尾部 `（…）` 认出的供应商名最长多少字（见 71-model-picker-groups.js）。
 const CODEX_GROUP_SUFFIX_MAX: usize = 24;
 
+/// 多家都有的模型的「自动切换」入口在 Codex 模型选择器里的分组身份。
+const CODEX_AUTO_GROUP_ID: &str = "codex-plus-gateway-auto";
+
 /// 模型组在 Codex 模型选择器里的分组身份。
 const CODEX_GROUPS_GROUP_ID: &str = "codex-plus-gateway-groups";
 
 /// Codex 模型目录里每个模型的元数据（显示名、推理档位、按供应商分组），与直连模式的按模型聚合一致：
-/// 裸模型名取池里第一个提供它的供应商（网关也先发给它）的成员目录，分组是那个供应商；
-/// 多家都有的模型，后面几家以 `<供应商 id>/<模型>` 各列一份，归在各自名下（见 [`route::codex_pool_models`]）；
+/// 只有一家的模型取那一家的成员目录，分组是那一家；多家都有的模型每家各列一份 `<供应商 id>/<模型>`
+/// 归在各家名下，另有一份裸名的「自动切换」入口单独一组（见 [`route::codex_pool_models`]）；
 /// `group/<id>` 显示组名，单独归在「模型组」一组。没有可写的条目时返回空串。
 ///
 /// 写进托管供应商的 `model_metadata`：生成 `model_catalog_json` 时覆盖进目录，
@@ -367,7 +370,7 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
             metadata.insert(model, Value::Object(fields));
             continue;
         }
-        // 多家都有的模型，后面几家以 `<供应商 id>/<模型>` 列出：元数据取那一家的，分组也是那一家。
+        // 归哪家：`<供应商 id>/<模型>` 是那一家；裸名归第一个提供它的供应商（多家都有时它是自动切换入口）。
         let Some((index, upstream)) = route::codex_model_owner(&relays, &model) else {
             continue;
         };
@@ -393,24 +396,37 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
             .filter(|name| !name.eq_ignore_ascii_case(&upstream))
             .map(str::to_string)
             .unwrap_or_else(|| pretty_model_name(&upstream));
+        let providers = route::serving_count(&relays, &upstream);
+        if providers > 1 && upstream == model {
+            // 多家自动切换入口：单独一组，按池顺序依次尝试各家。
+            fields.insert("display_name".into(), json!(format!("{display}（自动）")));
+            fields.insert(
+                "description".into(),
+                json!(format!("{model} · {providers} 家按顺序自动切换")),
+            );
+            fields.insert("codex_plus_group".into(), json!("多家自动切换"));
+            fields.insert("codex_plus_group_id".into(), json!(CODEX_AUTO_GROUP_ID));
+            metadata.insert(model, Value::Object(fields));
+            continue;
+        }
         // 分组名和描述会显示在 Codex 的模型选择器里：账号名要打码。
         let group = if relay.name.trim().is_empty() {
             relay.id.clone()
         } else {
             crate::gateway::accounts::mask_account_name(relay.name.trim())
         };
-        // 多家都有的模型，后面几家的那一份显示名带 `（供应商）` 后缀：选择器按整行文字认分组，
-        // 同名的两行不加后缀就分不开（与直连模式按模型聚合的写法一致，注入层会去掉后缀再显示）。
-        // 注入层只认 24 个字以内的后缀，账号名太长时用供应商 id。
-        let display = if upstream == model {
-            display
-        } else {
+        // 多家都有的模型，每家那份显示名带 `（供应商）` 后缀：选择器按整行文字认分组，同名的几行
+        // 不加后缀就分不开（与直连模式按模型聚合的写法一致，注入层会去掉后缀再显示），
+        // 选中后输入框里也看得出是哪一家。注入层只认 24 个字以内的后缀，账号名太长时用供应商 id。
+        let display = if providers > 1 {
             let suffix = if group.chars().count() <= CODEX_GROUP_SUFFIX_MAX {
                 group.clone()
             } else {
                 relay.id.clone()
             };
             format!("{display}（{suffix}）")
+        } else {
+            display
         };
         fields.insert("display_name".into(), json!(display));
         fields.insert("description".into(), json!(format!("{upstream} · {group}")));
@@ -432,6 +448,9 @@ fn catalog_ui_fields(entry: &Value) -> Map<String, Value> {
         "supported_reasoning_levels",
         "default_reasoning_level",
         "supports_reasoning_summaries",
+        // Fast（优先处理）按这两个字段判断能不能开；不带过去 Codex 里的 Fast 按钮就一直是灰的。
+        "service_tiers",
+        "additional_speed_tiers",
     ] {
         if let Some(value) = entry.get(key).filter(|value| !value.is_null()) {
             fields.insert(key.to_string(), value.clone());
@@ -2258,6 +2277,24 @@ mod tests {
     use crate::settings::{
         AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, RelaySessionProvider,
     };
+
+    #[test]
+    fn catalog_ui_fields_keep_fast_tiers_and_drop_bulky_fields() {
+        let entry = json!({
+            "slug": "gpt-6.1-sol",
+            "display_name": "GPT-6.1 Sol",
+            "base_instructions": "很长的系统指令",
+            "service_tiers": [{ "id": "priority", "name": "Fast" }],
+            "additional_speed_tiers": ["fast"],
+        });
+        let fields = catalog_ui_fields(&entry);
+        assert_eq!(
+            fields["service_tiers"][0]["id"], "priority",
+            "Fast 靠它解锁"
+        );
+        assert_eq!(fields["additional_speed_tiers"][0], "fast");
+        assert!(!fields.contains_key("base_instructions"));
+    }
 
     fn direct_relay(id: &str, base_url: &str, model: &str) -> RelayProfile {
         RelayProfile {

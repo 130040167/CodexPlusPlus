@@ -36,8 +36,9 @@ function payload(): GatewayPayload {
 
 test("裸模型名的显示、模型组成员标签里的账号名打码", () => {
   const data = payload();
-  assert.equal(modelDisplay(data, "gpt-5.5").sub, "ChatGPT Pro · 26****34@qq.com");
-  assert.equal(memberLabel(data, "gpt-5.5"), "ChatGPT Pro · 26****34@qq.com · GPT-5.5");
+  // 两家都有的 gpt-5.5：裸名是「多家自动切换」，列出按顺序尝试的几家（都打码）；带前缀的固定一家。
+  assert.deepEqual(modelDisplay(data, "gpt-5.5"), { title: "GPT-5.5", sub: "ChatGPT Pro · 26****34@qq.com → Copilot · Bi****V3", group: false, auto: true });
+  assert.equal(memberLabel(data, "gpt-5.5"), "GPT-5.5 · ChatGPT Pro · 26****34@qq.com → Copilot · Bi****V3");
   assert.equal(memberLabel(data, "claude-sonnet-5"), "Copilot · Bi****V3 · Claude-Sonnet-5");
   assert.equal(memberLabel(data, "copilot-1/claude-sonnet-5"), "Copilot · Bi****V3 · Claude-Sonnet-5");
   // 调度表里的供应商名也打码；大小写不同的同名模型算一行。

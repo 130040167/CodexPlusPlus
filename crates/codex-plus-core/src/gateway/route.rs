@@ -112,28 +112,31 @@ pub fn pool_models(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<Str
 }
 
 /// Codex 的模型列表：每家供应商的模型都列在它自己名下，Codex 选择器里按供应商分组时每组都完整。
-/// 同一个模型多家都有时，第一家用裸模型名（请求按池顺序依次尝试各家），其余各家用 `<供应商 id>/<模型>`
-/// （只发给那一家）。最后是有成员的模型组。
+/// - 只有一家提供的模型：裸模型名（只有这一家，等于固定发给它）；
+/// - 多家都提供的模型：每家各列一份 `<供应商 id>/<模型>`（固定发给那一家），再在后面单独列一份
+///   裸模型名，作为「多家自动切换」入口：按池顺序依次尝试各家，出错换下一家；
+/// - 最后是有成员的模型组。
 pub fn codex_pool_models(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<String> {
     let relays = binding_pool_relays(gateway, binding);
     let mut models: Vec<String> = Vec::new();
+    let mut shared: Vec<String> = Vec::new();
+    let mut push = |list: &mut Vec<String>, entry: String| {
+        if !list.iter().any(|known| known.eq_ignore_ascii_case(&entry)) {
+            list.push(entry);
+        }
+    };
     for relay in &relays {
         for model in relay_models(relay) {
-            let entry = if models
-                .iter()
-                .any(|known| known.eq_ignore_ascii_case(&model))
-            {
-                format!("{}/{model}", relay.id)
+            if serving_count(&relays, &model) > 1 {
+                push(&mut models, format!("{}/{model}", relay.id));
+                push(&mut shared, model);
             } else {
-                model
-            };
-            if !models
-                .iter()
-                .any(|known| known.eq_ignore_ascii_case(&entry))
-            {
-                models.push(entry);
+                push(&mut models, model);
             }
         }
+    }
+    for model in shared {
+        push(&mut models, model);
     }
     for group in &gateway.groups {
         if !group.members.is_empty() {
@@ -143,8 +146,14 @@ pub fn codex_pool_models(gateway: &GatewaySettings, binding: &AgentBinding) -> V
     models
 }
 
-/// Codex 模型列表里一项归哪家供应商、发给它的模型名：裸模型名归第一个提供它的供应商，
-/// `<供应商 id>/<模型>` 归那一家。模型组和认不出的返回 None。
+/// 列表里有几家供应商提供这个模型（按模型名，不分大小写）。
+pub fn serving_count(relays: &[&RelayProfile], model: &str) -> usize {
+    relays.iter().filter(|relay| serves(relay, model)).count()
+}
+
+/// Codex 模型列表里一项归哪家供应商、发给它的模型名：裸模型名归第一个提供它的供应商
+/// （多家都有时它是「自动切换」入口，元数据取第一家的），`<供应商 id>/<模型>` 归那一家。
+/// 模型组和认不出的返回 None。
 pub fn codex_model_owner<'a>(relays: &[&'a RelayProfile], model: &str) -> Option<(usize, String)> {
     if let Some(index) = relays.iter().position(|relay| serves(relay, model)) {
         return Some((index, model.to_string()));
@@ -1180,14 +1189,15 @@ mod tests {
         let binding = gateway.binding(&ToolId::Claude).unwrap().clone();
         let models = codex_pool_models(&gateway, &binding);
         assert_eq!(
-            models[..4],
+            models[..5],
             [
-                "deepseek-v4-pro".to_string(),
+                "ds/deepseek-v4-pro".to_string(),
                 "deepseek-v4-flash".to_string(),
                 "kimi-k3".to_string(),
                 "mirror/deepseek-v4-pro".to_string(),
+                "deepseek-v4-pro".to_string(),
             ],
-            "mirror 也有 deepseek-v4-pro：在它名下以 mirror/ 前缀再列一份"
+            "两家都有的 deepseek-v4-pro：各家名下各列一份固定的，最后一份裸名是自动切换入口"
         );
         let relays = binding_pool_relays(&gateway, &binding);
         let owner = |model: &str| {
@@ -1195,15 +1205,24 @@ mod tests {
                 .map(|(index, upstream)| (relays[index].id.clone(), upstream))
         };
         assert_eq!(
-            owner("deepseek-v4-pro"),
+            owner("ds/deepseek-v4-pro"),
             Some(pair("ds", "deepseek-v4-pro"))
         );
         assert_eq!(
             owner("mirror/deepseek-v4-pro"),
             Some(pair("mirror", "deepseek-v4-pro"))
         );
+        assert_eq!(
+            owner("deepseek-v4-pro"),
+            Some(pair("ds", "deepseek-v4-pro"))
+        );
         assert_eq!(owner("group/fast"), None);
-        // 带前缀的那份只发给那一家；裸模型名照旧按池顺序依次尝试。
+        assert_eq!(serving_count(&relays, "DeepSeek-V4-Pro"), 2);
+        // 固定的那份只发给那一家；裸名（自动）按池顺序依次尝试。
+        assert_eq!(
+            routed(&gateway, "ds/deepseek-v4-pro"),
+            vec![pair("ds", "deepseek-v4-pro")]
+        );
         assert_eq!(
             routed(&gateway, "mirror/deepseek-v4-pro"),
             vec![pair("mirror", "deepseek-v4-pro")]

@@ -484,22 +484,25 @@ fn codex_gateway_catalog_carries_display_names_reasoning_and_provider_groups() {
         "悬停说明里也不能有原始账号：{}",
         opus["description"]
     );
-    // 两家都提供的模型归第一个提供它的供应商（网关也先发给它）。
-    let pro = model("deepseek-v4-pro");
-    assert_eq!(pro["codex_plus_group"], "DeepSeek");
-    assert_eq!(pro["display_name"], "DeepSeek-V4-Pro");
-    // 两家都有的模型，第二家名下也列一份（带供应商前缀），Codex 里每家的分组都完整。
-    let second = model(&format!(
-        "{}/deepseek-v4-pro",
-        profile_id_of(ctx, "ChatGPT Pro · 2649340134@qq.com")
-    ));
-    // 同名的两行要分得开：后面那家带后缀；账号名超过注入层认的长度，用供应商 id。
+    // 两家都提供的模型：每家名下各一份固定的（带供应商前缀，显示名带后缀分得开），
+    // 再加一份裸名的「自动切换」入口单独成组。
+    let deepseek_id = profile_id_of(ctx, "DeepSeek");
+    let pinned = model(&format!("{deepseek_id}/deepseek-v4-pro"));
+    assert_eq!(pinned["codex_plus_group"], "DeepSeek");
+    assert_eq!(pinned["display_name"], "DeepSeek-V4-Pro（DeepSeek）");
     let second_id = profile_id_of(ctx, "ChatGPT Pro · 2649340134@qq.com");
+    let second = model(&format!("{second_id}/deepseek-v4-pro"));
+    // 账号名超过注入层认的后缀长度，后缀用供应商 id；分组名仍是打码的完整账号名。
     assert_eq!(
         second["display_name"],
         format!("DeepSeek-V4-Pro（{second_id}）")
     );
     assert_eq!(second["codex_plus_group"], "ChatGPT Pro · 26****34@qq.com");
+    let auto = model("deepseek-v4-pro");
+    assert_eq!(auto["display_name"], "DeepSeek-V4-Pro（自动）");
+    assert_eq!(auto["codex_plus_group"], "多家自动切换");
+    // 只有一家的模型照旧用裸名、不带后缀。
+    assert_eq!(model("claude-opus-5-5")["display_name"], "Claude-Opus-5-5");
     let group = model("group/daily");
     assert_eq!(group["display_name"], "Daily");
     assert_eq!(group["codex_plus_group"], "模型组");

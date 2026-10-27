@@ -52,7 +52,7 @@ import {
   type UsageSummary,
   maskAccountName,
 } from "./gateway-model";
-import { AGENT_ICONS, APP_LOGO_URL, Avatar, AgentIcon } from "./gateway-ui";
+import { AGENT_ICONS, APP_LOGO_URL, AutoTag, Avatar, AgentIcon, ModelViewGlyph } from "./gateway-ui";
 import {
   activeRelayItem,
   codexEnhanced,
@@ -782,14 +782,9 @@ function PanelAgentRow({
       <AgentIcon agent={agent.agent} className="gw-agent-icon" />
       <strong>{agent.name}</strong>
       <button aria-expanded={open} className="gw-picker-button tp-agent-picker" onClick={() => setOpen(!open)} ref={buttonRef} type="button">
-        {!agent.enabled ? (
-          <AgentIcon agent={agent.agent} className="gw-picker-agent" />
-        ) : display.group ? (
-          <Waypoints className="gw-picker-glyph h-4 w-4" />
-        ) : (
-          <Avatar name={display.sub || display.title} size="sm" />
-        )}
+        {!agent.enabled ? <AgentIcon agent={agent.agent} className="gw-picker-agent" /> : <ModelViewGlyph view={display} />}
         <span>{agent.enabled ? display.title : t("默认")}</span>
+        {agent.enabled ? <AutoTag view={display} /> : null}
         <ChevronDown className="h-3.5 w-3.5" />
       </button>
       <Floating anchorRef={buttonRef} className="gw-model-popover" onClose={() => setOpen(false)} open={open} width={340}>

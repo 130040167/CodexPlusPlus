@@ -428,12 +428,32 @@ export function pickerSections(
   const query = rawQuery.trim().toLowerCase();
   const sections: PickerSection[] = [];
   const providers = agentPoolProviders(payload, exclude);
+  // 多家都有的模型：每家名下那份固定发给这一家（`<供应商 id>/<模型>`），另在「多家自动切换」里列一份裸名，
+  // 选它才按池顺序依次尝试。只有一家的模型用裸名（只有这一家）。与写给 Codex 的模型列表一致。
+  const shared: string[] = [];
   for (const entry of providers) {
     const providerHit = matches(query, entry.name, entry.id);
     const items = entry.models
       .filter((model) => providerHit || matches(query, model))
-      .map((model) => ({ model, label: prettyModelName(model), sub: maskAccountName(entry.name), avatar: avatar(entry.name) }));
+      .map((model) => {
+        const multi = servingProviders(payload, model, exclude).length > 1;
+        if (multi && !shared.some((known) => known.toLowerCase() === model.toLowerCase())) shared.push(model);
+        return { model: multi ? `${entry.id}/${model}` : model, label: prettyModelName(model), sub: maskAccountName(entry.name), avatar: avatar(entry.name) };
+      });
     if (items.length) sections.push({ key: `provider:${entry.id}`, title: maskAccountName(entry.name), avatar: avatar(entry.name), items });
+  }
+  if (shared.length) {
+    sections.push({
+      key: "auto",
+      title: "多家自动切换",
+      avatar: "",
+      items: shared.map((model) => ({
+        model,
+        label: prettyModelName(model),
+        sub: servingProviders(payload, model, exclude).map((entry) => maskAccountName(entry.name)).join(" → "),
+        avatar: "",
+      })),
+    });
   }
   const groups = payload.groups
     .filter((group) => group.id !== skipGroup && group.members.length && matches(query, group.name, groupModelId(group.id)))
@@ -457,7 +477,14 @@ export function pickerSections(
   return sections;
 }
 
-export type ModelView = { title: string; sub: string; group: boolean };
+/** `auto`：多家都有的模型的裸名，按池顺序在这几家之间自动切换（`sub` 是这几家，按尝试顺序）。 */
+export type ModelView = { title: string; sub: string; group: boolean; auto?: boolean };
+
+/** 提供这个模型的供应商（Agent 能用的、按池顺序）。 */
+export function servingProviders(payload: GatewayPayload | null, model: string, exclude: string[] = []): GatewayPoolEntry[] {
+  const name = model.trim().toLowerCase();
+  return agentPoolProviders(payload, exclude).filter((entry) => entry.models.some((known) => known.toLowerCase() === name));
+}
 
 /** 一个模型名在按钮上的显示：模型名 + 提供它的供应商；模型组显示组名。空串用池里第一个模型。 */
 export function modelDisplay(payload: GatewayPayload | null, model: string, exclude: string[] = []): ModelView {
@@ -468,7 +495,11 @@ export function modelDisplay(payload: GatewayPayload | null, model: string, excl
   }
   const qualified = qualifiedProvider(payload, title, exclude);
   if (qualified) return { title: prettyModelName(qualified.model), sub: maskAccountName(qualified.entry.name), group: false };
-  const entry = agentPoolProviders(payload, exclude).find((item) => item.models.some((known) => known.toLowerCase() === title.toLowerCase()));
+  const serving = servingProviders(payload, title, exclude);
+  if (serving.length > 1) {
+    return { title: prettyModelName(title), sub: serving.map((entry) => maskAccountName(entry.name)).join(" → "), group: false, auto: true };
+  }
+  const entry = serving[0];
   return { title: prettyModelName(title), sub: entry ? maskAccountName(entry.name) : "", group: false };
 }
 
@@ -634,6 +665,8 @@ export function memberLabel(payload: GatewayPayload | null, model: string): stri
   if (isPattern(model)) return model;
   const view = modelDisplay(payload, model);
   if (view.group) return view.title;
+  // 多家自动切换：模型名在前，后面是按顺序尝试的几家。
+  if (view.auto) return `${view.title} · ${view.sub}`;
   return view.sub ? `${view.sub} · ${view.title}` : view.title;
 }
 
