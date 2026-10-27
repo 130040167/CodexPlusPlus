@@ -295,7 +295,7 @@ test("网关页接入导航，命令已注册", () => {
     "delete_gateway_provider",
     "set_gateway_provider_enabled",
     "reorder_gateway_providers",
-    "import_gateway_provider",
+    "import_gateway_providers",
     "save_gateway_group",
     "delete_gateway_group",
     "reveal_gateway_agent_config",

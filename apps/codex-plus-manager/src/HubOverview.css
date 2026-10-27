@@ -580,3 +580,9 @@
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* 供应商池空着、直连模式里有供应商时的导入入口：比「添加供应商」醒目一点。 */
+.shell .hub-node-import {
+  border-color: hsl(var(--primary) / 0.45);
+  color: hsl(var(--primary));
+}

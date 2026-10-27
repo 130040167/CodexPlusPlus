@@ -22,7 +22,7 @@ test("「添加供应商时自动加入」旧数据视为开，表单来回保�
 
 test("各条添加路径都带上 skipAgents", () => {
   const source = readFileSync(new URL("./GatewayProviders.tsx", import.meta.url), "utf8");
-  for (const command of ["create_gateway_provider", "import_gateway_provider", "import_gateway_opencode_key", "finish_gateway_copilot_login"]) {
+  for (const command of ["create_gateway_provider", "import_gateway_providers", "finish_gateway_copilot_login"]) {
     const line = source.split("\n").find((item) => item.includes(`"${command}"`)) ?? "";
     assert.match(line, /skipAgents/, command);
   }

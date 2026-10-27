@@ -13,7 +13,9 @@ import {
   failureLabel,
   formatRemaining,
   gatewayPresets,
+  importCandidates,
   memberStatus,
+  pendingImportCount,
   presetAdded,
   presetHost,
   protocolLabel,
@@ -28,6 +30,8 @@ import {
   type ProviderDraft,
   type ProviderPrice,
   maskAccountName,
+  type ImportCandidate,
+  type ImportSource,
 } from "./gateway-model";
 import { AgentIcon, Avatar, KeyCount, MemberStatusLabel, QuotaBadge, QuotaWindows, Switch, type Notify, type Run } from "./gateway-ui";
 import { ProviderFormDialog, type ProviderFormState } from "./ProviderFormDialog";
@@ -64,11 +68,12 @@ export function ProvidersView({
   const pool = payload?.pool ?? [];
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState<string | null>(null);
-  const [adding, setAdding] = useState(false);
+  const [adding, setAdding] = useState<false | "catalog" | "import">(false);
+  const pendingImports = pendingImportCount(payload);
   const [dragging, setDragging] = useState<string | null>(null);
   // 编辑已有供应商的表单；新添加走 ProviderAdder。
   const [form, setForm] = useState<FormState | null>(null);
-  const openCatalog = () => setAdding(true);
+  const openCatalog = () => setAdding("catalog");
   // 拖动排序中的临时顺序；松手后提交，等新数据回来再清掉。
   const [order, setOrder] = useState<string[] | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -164,14 +169,25 @@ export function ProvidersView({
       {payload !== null && pool.length === 0 ? (
         <div className="gw-card gw-pool-empty">
           <strong>{t("供应商池还是空的")}</strong>
-          <span>{t("登录订阅，或添加厂商 API、中转站的 Key。所有接入的 Agent 共用这里的供应商。")}</span>
-          <button className="gw-primary-button" onClick={openCatalog} type="button">
-            <Plus className="h-4 w-4" />
-            {t("添加供应商")}
-          </button>
+          {pendingImports ? (
+            <span>{tf("直连模式里有 {0} 个供应商，可以一次导入网关；之后两边各改各的。也可以登录订阅，或添加新的厂商 API、中转站。", [pendingImports])}</span>
+          ) : (
+            <span>{t("登录订阅，或添加厂商 API、中转站的 Key。所有接入的 Agent 共用这里的供应商。")}</span>
+          )}
+          <div className="gw-pool-empty-actions">
+            {pendingImports ? (
+              <button className="gw-primary-button" onClick={() => setAdding("import")} type="button">
+                {tf("从直连模式导入 {0} 个", [pendingImports])}
+              </button>
+            ) : null}
+            <button className={pendingImports ? "gw-soft-button" : "gw-primary-button"} onClick={openCatalog} type="button">
+              <Plus className="h-4 w-4" />
+              {t("添加供应商")}
+            </button>
+          </div>
         </div>
       ) : null}
-      {adding ? <ProviderAdder busy={busy} notify={notify} onClose={() => setAdding(false)} payload={payload} run={run} /> : null}
+      {adding ? <ProviderAdder busy={busy} notify={notify} onClose={() => setAdding(false)} payload={payload} run={run} startWith={adding === "import" ? "import" : "catalog"} /> : null}
       {loginDialog}
       {form ? <ProviderFormDialog busy={busy} form={form} onCancel={() => setForm(null)} onSubmit={(draft) => void saveEdit(draft)} /> : null}
     </>
@@ -219,17 +235,21 @@ export function ProviderAdder({
   run,
   notify,
   onClose,
+  startWith = "catalog",
 }: {
   payload: GatewayPayload | null;
   busy: string | null;
   run: Run;
   notify: Notify;
   onClose: () => void;
+  /** 「import」：引导卡片点进来，直接打开从直连模式导入。 */
+  startWith?: "catalog" | "import";
 }) {
   // 这次添加给哪些 Agent 用：按各 Agent 的「添加供应商时自动加入」预选。
   const [picked, setPicked] = useState<GatewayAgentId[]>(() => defaultProviderAgents(payload));
   const skipAgents = skippedAgents(payload, picked);
-  const [catalogOpen, setCatalogOpen] = useState(true);
+  const [catalogOpen, setCatalogOpen] = useState(startWith === "catalog");
+  const [importOnly, setImportOnly] = useState(startWith === "import");
   const [form, setForm] = useState<FormState | null>(null);
   const [loggingIn, setLoggingIn] = useState(false);
   const { login, dialog } = useAccountLogin(run, notify);
@@ -254,6 +274,21 @@ export function ProviderAdder({
             void login(kind, skipAgents).finally(onClose);
           }}
           onPreset={(preset) => { setCatalogOpen(false); setForm({ mode: "preset", preset }); }}
+          payload={payload}
+          run={run}
+          skipAgents={skipAgents}
+        />
+      ) : null}
+      {importOnly ? (
+        <ImportDialog
+          agentPicks={agentPicks}
+          busy={busy}
+          onClose={onClose}
+          onLogin={() => {
+            setImportOnly(false);
+            setLoggingIn(true);
+            void login("chatgpt", skipAgents).finally(onClose);
+          }}
           payload={payload}
           run={run}
           skipAgents={skipAgents}
@@ -593,14 +628,43 @@ function ProviderCatalog({
         </div>
         <footer className="gw-catalog-foot">{agentPicks}</footer>
       </div>
-      {importing ? <ImportDialog busy={busy} onClose={() => setImporting(false)} payload={payload} run={run} skipAgents={skipAgents} /> : null}
+      {importing ? (
+        <ImportDialog
+          agentPicks={agentPicks}
+          busy={busy}
+          onClose={() => setImporting(false)}
+          onLogin={() => { setImporting(false); onLogin("chatgpt"); }}
+          payload={payload}
+          run={run}
+          skipAgents={skipAgents}
+        />
+      ) : null}
     </div>,
     document.body,
   );
 }
 
-/** 导入：把直连模式里 Codex、Claude Code、Grok 的供应商复制一份进网关（之后两边互不影响），或用 OpenCode 里保存的 Key。 */
-function ImportDialog({ payload, busy, run, onClose, skipAgents }: { payload: GatewayPayload | null; busy: string | null; run: Run; onClose: () => void; skipAgents: GatewayAgentId[] }) {
+/**
+ * 导入：把直连模式里 Codex、Claude Code、Grok 的供应商复制一份进网关（之后两边互不影响），或用 OpenCode 里保存的 Key。
+ * 多选，默认勾上还没导入的，一次导完；聚合供应商搬成「成员进池 + 同名模型组」；官方登录账号不能复制，直接去登录。
+ */
+function ImportDialog({
+  payload,
+  busy,
+  run,
+  onClose,
+  onLogin,
+  skipAgents,
+  agentPicks,
+}: {
+  payload: GatewayPayload | null;
+  busy: string | null;
+  run: Run;
+  onClose: () => void;
+  onLogin: () => void;
+  skipAgents: GatewayAgentId[];
+  agentPicks?: ReactNode;
+}) {
   useEffect(() => {
     const escape = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
@@ -608,63 +672,117 @@ function ImportDialog({ payload, busy, run, onClose, skipAgents }: { payload: Ga
     document.addEventListener("keydown", escape);
     return () => document.removeEventListener("keydown", escape);
   }, [onClose]);
-  const imported = (source: string, id: string) => Boolean(payload?.pool.some((entry) => entry.source === `${source}:${id}`));
-  const finish = async (source: string, id: string) => {
-    const done = source === "opencode"
-      ? await run(`import:${source}:${id}`, "import_gateway_opencode_key", { id, skipAgents }, t("导入供应商"))
-      : await run(`import:${source}:${id}`, "import_gateway_provider", { source, id, skipAgents }, t("导入供应商"));
-    if (done) onClose();
+  const candidates = importCandidates(payload);
+  const keyOf = (item: ImportCandidate) => `${item.source}:${item.id}`;
+  const [picked, setPicked] = useState<Set<string>>(() => new Set(candidates.filter((item) => !item.imported).map(keyOf)));
+  const toggle = (key: string) => {
+    const next = new Set(picked);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    setPicked(next);
   };
-  const groups: Array<{ key: string; title: string; items: Array<{ id: string; name: string; sub: string }> }> = [
-    {
-      key: "codex",
-      title: t("Codex 的供应商"),
-      items: (payload?.codexProviders ?? []).map((entry) => ({ id: entry.id, name: entry.name, sub: `${protocolLabel(entry.protocol)} · ${presetHost(entry.baseUrl)}` })),
-    },
-    {
-      key: "claude",
-      title: t("Claude Code 的供应商"),
-      items: (payload?.claudeProviders ?? []).map((item) => ({ id: item.id, name: item.name, sub: t("Anthropic 协议，原样转发") })),
-    },
-    {
-      key: "grok",
-      title: t("Grok 的供应商"),
-      items: (payload?.grokProfiles ?? []).map((item) => ({ id: item.id, name: item.name, sub: t("Grok 页里配置的供应商") })),
-    },
-    {
-      key: "opencode",
-      title: t("OpenCode 里保存的 Key"),
-      items: (payload?.opencodeKeys ?? []).map((item) => ({ id: item.id, name: item.name, sub: t("opencode auth login 保存的 Key，按模型自动选协议") })),
-    },
+  const chosen = candidates.filter((item) => picked.has(keyOf(item)));
+  const submit = async () => {
+    const items = chosen.map((item) => ({ source: item.source, id: item.id }));
+    if (await run("import:batch", "import_gateway_providers", { items, skipAgents }, t("导入供应商"))) onClose();
+  };
+  const codexEntry = (id: string) => payload?.codexProviders.find((entry) => entry.id === id);
+  const aggregate = (id: string) => payload?.codexAggregates?.find((item) => item.id === id);
+  const subOf = (item: ImportCandidate) => {
+    switch (item.source) {
+      case "codex": {
+        const entry = codexEntry(item.id);
+        return entry ? `${protocolLabel(entry.protocol)} · ${presetHost(entry.baseUrl)}` : "";
+      }
+      case "aggregate": {
+        const info = aggregate(item.id);
+        return info?.byModel ? tf("{0} 个成员 · 按模型聚合，成员进池即可", [info.members]) : tf("{0} 个成员 · 成员进池，建同名模型组", [info?.members ?? 0]);
+      }
+      case "claude":
+        return t("Anthropic 协议，原样转发");
+      case "grok":
+        return t("Grok 页里配置的供应商");
+      default:
+        return t("opencode auth login 保存的 Key，按模型自动选协议");
+    }
+  };
+  const sections: Array<{ key: ImportSource; title: string }> = [
+    { key: "codex", title: t("Codex 的供应商") },
+    { key: "aggregate", title: t("Codex 的聚合供应商") },
+    { key: "claude", title: t("Claude Code 的供应商") },
+    { key: "grok", title: t("Grok 的供应商") },
+    { key: "opencode", title: t("OpenCode 里保存的 Key") },
   ];
+  const official = payload?.codexOfficial ?? [];
+  const chatgptLoggedIn = Boolean(payload?.pool.some((entry) => entry.account === "chatgpt"));
+  const pending = candidates.filter((item) => !item.imported);
+  const allPicked = pending.length > 0 && pending.every((item) => picked.has(keyOf(item)));
   return createPortal(
     <div className="gw-modal-backdrop gw-portal" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <div className="gw-modal gw-import-modal">
         <header>
-          <strong>{t("导入供应商")}</strong>
+          <strong>{t("从直连模式导入")}</strong>
+          {pending.length ? (
+            <button className="gw-text-button" onClick={() => setPicked(allPicked ? new Set() : new Set(pending.map(keyOf)))} type="button">
+              {allPicked ? t("全不选") : t("全选未导入的")}
+            </button>
+          ) : null}
           <button aria-label={t("关闭")} className="gw-icon-button" onClick={onClose} type="button"><X className="h-4 w-4" /></button>
         </header>
         <div className="gw-modal-body">
-          <p className="gw-muted gw-import-note">{t("复制一份进网关，之后两边各改各的，互不影响。官方登录账号不能复制，需要在网关里单独登录。")}</p>
-          {groups.map((group) => (
-            <section key={group.key}>
-              <h4 className="gw-import-title">{group.title}</h4>
-              {group.items.length ? group.items.map((item) => {
-                const added = imported(group.key, item.id);
-                return (
-                  <button className="gw-import-item" disabled={busy !== null} key={item.id} onClick={() => void finish(group.key, item.id)} type="button">
-                    <Avatar name={item.name} size="sm" />
-                    <span>
-                      <strong>{item.name}</strong>
-                      <small>{added ? t("已导入过，再点会再复制一份") : item.sub}</small>
-                    </span>
-                    <Plus className="h-4 w-4" />
-                  </button>
-                );
-              }) : <p className="gw-muted gw-import-empty">{t("这里没有可导入的供应商")}</p>}
+          <p className="gw-muted gw-import-note">{t("复制一份进网关，之后两边各改各的，互不影响。")}</p>
+          {sections.map((section) => {
+            const items = candidates.filter((item) => item.source === section.key);
+            if (!items.length) return null;
+            return (
+              <section key={section.key}>
+                <h4 className="gw-import-title">{section.title}</h4>
+                {items.map((item) => {
+                  const key = keyOf(item);
+                  const on = picked.has(key);
+                  return (
+                    <button aria-pressed={on} className="gw-import-item" data-on={on} disabled={busy !== null} key={key} onClick={() => toggle(key)} type="button">
+                      <span className="gw-import-check">{on ? <Check className="h-3.5 w-3.5" /> : null}</span>
+                      <Avatar name={item.name} size="sm" />
+                      <span>
+                        <strong>{maskAccountName(item.name)}</strong>
+                        <small>{subOf(item)}</small>
+                      </span>
+                      {item.imported ? <em className="gw-import-badge">{t("已在池里")}</em> : null}
+                    </button>
+                  );
+                })}
+              </section>
+            );
+          })}
+          {official.length ? (
+            <section>
+              <h4 className="gw-import-title">{t("官方登录账号")}</h4>
+              {official.map((item) => (
+                <div className="gw-import-item gw-import-login" key={item.id}>
+                  <span className="gw-import-check" />
+                  <Avatar name={item.name} size="sm" />
+                  <span>
+                    <strong>{item.name}</strong>
+                    <small>{t("不能复制：两边共用登录会互相把对方刷失效，需要在网关里单独登录一次")}</small>
+                  </span>
+                  {chatgptLoggedIn ? (
+                    <em className="gw-import-badge">{t("网关已登录 ChatGPT")}</em>
+                  ) : (
+                    <button className="gw-text-button strong" disabled={busy !== null} onClick={onLogin} type="button">{t("去登录")}</button>
+                  )}
+                </div>
+              ))}
             </section>
-          ))}
+          ) : null}
+          {candidates.length === 0 && official.length === 0 ? <p className="gw-muted gw-import-empty">{t("直连模式里没有可导入的供应商")}</p> : null}
         </div>
+        <footer className="gw-import-foot">
+          {agentPicks}
+          <button className="gw-primary-button" disabled={busy !== null || chosen.length === 0} onClick={() => void submit()} type="button">
+            {busy === "import:batch" ? t("导入中…") : tf("导入 {0} 个", [chosen.length])}
+          </button>
+        </footer>
       </div>
     </div>,
     document.body,

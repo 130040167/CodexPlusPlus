@@ -1140,3 +1140,128 @@ fn pool_changes_follow_into_grok_model_list() {
     refresh_enabled(ctx).unwrap();
     assert!(!config().contains("kimi-k3"), "{}", config());
 }
+
+fn direct_relay(id: &str, model: &str) -> RelayProfile {
+    RelayProfile {
+        id: id.to_string(),
+        name: format!("中转 {id}"),
+        relay_mode: RelayMode::PureApi,
+        protocol: RelayProtocol::Responses,
+        base_url: format!("https://{id}.test/v1"),
+        api_key: format!("sk-{id}"),
+        model: model.to_string(),
+        model_list: model.to_string(),
+        ..RelayProfile::default()
+    }
+}
+
+#[test]
+fn direct_aggregates_move_into_the_gateway_as_pool_providers_and_a_group() {
+    use codex_plus_core::gateway::apply::{add_provider, codex_aggregates, import_codex_aggregate};
+    use codex_plus_core::settings::{
+        AggregateRelayMember, AggregateRelayProfile, AggregateRelayRoute, AggregateRelayStrategy,
+    };
+    let fixture = fixture(57395);
+    let store = &fixture.ctx.gateway;
+    let member = |relay_id: &str, weight: u32| AggregateRelayMember {
+        relay_id: relay_id.to_string(),
+        weight,
+    };
+    let aggregate = |id: &str, by_model: bool| AggregateRelayProfile {
+        id: id.to_string(),
+        name: format!("聚合 {id}"),
+        session_provider: Default::default(),
+        model_aggregation_enabled: by_model,
+        strategy: AggregateRelayStrategy::WeightedRoundRobin,
+        members: vec![
+            member("relay-a", 3),
+            member("relay-b", 1),
+            member("gone", 1),
+        ],
+        routes: vec![AggregateRelayRoute {
+            pattern: "gpt-*".into(),
+            relay_id: "relay-b".into(),
+            priority: 0,
+        }],
+        default_relay_id: String::new(),
+        sync_default_member_login: false,
+    };
+    let settings = BackendSettings {
+        relay_profiles: vec![
+            direct_relay("relay-a", "model-a"),
+            direct_relay("relay-b", "model-b"),
+        ],
+        aggregate_relay_profiles: vec![aggregate("agg", false), aggregate("by-model", true)],
+        ..BackendSettings::default()
+    };
+    // relay-a 之前单独导入过：复用，不再复制一份。
+    let (_, imported_a) = add_provider(
+        store,
+        copy_codex_provider(&settings, "relay-a").unwrap(),
+        "codex:relay-a",
+        None,
+    )
+    .unwrap();
+
+    let result = import_codex_aggregate(store, &settings, "agg", None).unwrap();
+    assert_eq!(result.added, 1, "只新导入 relay-b");
+    let gateway = store.load().unwrap();
+    let group = gateway.group(result.group.as_deref().unwrap()).unwrap();
+    assert_eq!(group.name, "聚合 agg");
+    assert_eq!(group.mode, GroupMode::Weighted);
+    let imported_b = gateway
+        .providers
+        .iter()
+        .find(|provider| provider.source == "codex:relay-b")
+        .unwrap()
+        .relay
+        .id
+        .clone();
+    assert_eq!(
+        group
+            .members
+            .iter()
+            .map(|member| (member.model.clone(), member.weight))
+            .collect::<Vec<_>>(),
+        vec![
+            (format!("{imported_a}/model-a"), 3),
+            (format!("{imported_b}/model-b"), 1)
+        ]
+    );
+    assert!(
+        result.notes.iter().any(|note| note.contains("gone")),
+        "{:?}",
+        result.notes
+    );
+    assert!(
+        result.notes.iter().any(|note| note.contains("路由规则")),
+        "{:?}",
+        result.notes
+    );
+    assert!(
+        codex_aggregates(&settings, &gateway)
+            .iter()
+            .any(|item| item.id == "agg" && item.imported)
+    );
+
+    // 再搬一次：不多导供应商、不多出模型组。
+    let again = import_codex_aggregate(store, &settings, "agg", None).unwrap();
+    assert_eq!(again.added, 0);
+    assert_eq!(again.group, result.group);
+    assert_eq!(store.load().unwrap().groups.len(), 1);
+
+    // 按模型聚合：成员进池就够了，不建组。
+    let by_model = import_codex_aggregate(store, &settings, "by-model", None).unwrap();
+    assert_eq!((by_model.added, by_model.group), (0, None));
+    assert!(
+        by_model
+            .notes
+            .iter()
+            .any(|note| note.contains("按模型聚合"))
+    );
+    assert!(
+        codex_aggregates(&settings, &store.load().unwrap())
+            .iter()
+            .any(|item| item.id == "by-model" && item.imported && item.by_model)
+    );
+}

@@ -1236,6 +1236,221 @@ pub fn codex_importable(settings: &BackendSettings) -> Vec<&RelayProfile> {
         .collect()
 }
 
+/// 直连模式里可以搬进网关的聚合供应商。`imported`：网关里已有同名模型组，或（按模型聚合时）成员都已导入。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AggregateSource {
+    pub id: String,
+    pub name: String,
+    pub members: usize,
+    /// 按模型聚合：网关池本身按模型名分发，搬过来不建模型组。
+    pub by_model: bool,
+    pub imported: bool,
+}
+
+pub fn codex_aggregates(
+    settings: &BackendSettings,
+    gateway: &GatewaySettings,
+) -> Vec<AggregateSource> {
+    settings
+        .aggregate_relay_profiles
+        .iter()
+        .map(|aggregate| {
+            let imported = if aggregate.model_aggregation_enabled {
+                aggregate.members.iter().all(|member| {
+                    settings
+                        .relay_profiles
+                        .iter()
+                        .find(|relay| relay.id == member.relay_id)
+                        .is_none_or(|relay| {
+                            crate::official_login::member_uses_official_login_transport(relay)
+                                || imported_codex_provider(gateway, &relay.id).is_some()
+                        })
+                })
+            } else {
+                gateway
+                    .groups
+                    .iter()
+                    .any(|group| group.name == aggregate.name)
+            };
+            AggregateSource {
+                id: aggregate.id.clone(),
+                name: aggregate.name.clone(),
+                members: aggregate.members.len(),
+                by_model: aggregate.model_aggregation_enabled,
+                imported,
+            }
+        })
+        .collect()
+}
+
+/// 直连模式里的官方登录账号（不能复制，要在网关里单独登录）。
+pub fn codex_official_accounts(settings: &BackendSettings) -> Vec<&RelayProfile> {
+    settings
+        .relay_profiles
+        .iter()
+        .filter(|relay| {
+            relay.relay_mode != RelayMode::Aggregate
+                && crate::official_login::member_uses_official_login_transport(relay)
+        })
+        .collect()
+}
+
+/// 已从直连模式导入过的 Codex 供应商在网关里的 id。
+fn imported_codex_provider(gateway: &GatewaySettings, relay_id: &str) -> Option<String> {
+    let source = format!("codex:{relay_id}");
+    gateway
+        .providers
+        .iter()
+        .find(|provider| provider.source == source)
+        .map(|provider| provider.relay.id.clone())
+}
+
+/// 聚合供应商搬进网关的结果。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AggregateImport {
+    /// 新导入池里的成员供应商数。
+    pub added: usize,
+    /// 建好的模型组 id；按模型聚合或没有可用成员时为空。
+    pub group: Option<String>,
+    /// 没法照搬的地方，原样告诉用户。
+    pub notes: Vec<String>,
+}
+
+/// 把直连模式的聚合供应商搬进网关：成员导进池（导入过的复用），再按策略建同名模型组。
+/// - 故障转移 → 依次；按会话轮换 → 轮换 + 整个会话固定；按请求轮换 → 轮换 + 不固定；加权 → 按权重；
+/// - 按模型聚合不建组：网关池本身就按模型名分发；
+/// - 官方登录成员不能复制，用池里已登录的 ChatGPT 账号代替，没有就提示去登录；
+/// - 模型路由规则网关里没有对应功能，写进 notes。
+pub fn import_codex_aggregate(
+    store: &GatewayStore,
+    settings: &BackendSettings,
+    aggregate_id: &str,
+    skip_agents: Option<&[String]>,
+) -> anyhow::Result<AggregateImport> {
+    let aggregate = settings
+        .aggregate_relay_profiles
+        .iter()
+        .find(|aggregate| aggregate.id == aggregate_id)
+        .with_context(|| format!("聚合供应商不存在：{aggregate_id}"))?;
+    let mut result = AggregateImport::default();
+    let mut members: Vec<GroupMember> = Vec::new();
+    for member in &aggregate.members {
+        let Some(relay) = settings
+            .relay_profiles
+            .iter()
+            .find(|relay| relay.id == member.relay_id)
+        else {
+            result
+                .notes
+                .push(format!("成员 {} 已经不存在，跳过", member.relay_id));
+            continue;
+        };
+        let provider_id = if crate::official_login::member_uses_official_login_transport(relay) {
+            let gateway = store.load()?;
+            match gateway.providers.iter().find(|provider| {
+                crate::official_login::member_uses_official_login_transport(&provider.relay)
+            }) {
+                Some(provider) => provider.relay.id.clone(),
+                None => {
+                    result.notes.push(format!(
+                        "「{}」是官方登录账号，不能复制：在网关里登录 ChatGPT 后再把它加进模型组",
+                        crate::gateway::accounts::mask_account_name(&relay.name)
+                    ));
+                    continue;
+                }
+            }
+        } else if relay.relay_mode == RelayMode::Aggregate {
+            result
+                .notes
+                .push(format!("成员「{}」本身是聚合供应商，跳过", relay.name));
+            continue;
+        } else {
+            match imported_codex_provider(&store.load()?, &relay.id) {
+                Some(id) => id,
+                None => {
+                    let copy = copy_codex_provider(settings, &relay.id)?;
+                    let (_, id) =
+                        add_provider(store, copy, &format!("codex:{}", relay.id), skip_agents)?;
+                    result.added += 1;
+                    id
+                }
+            }
+        };
+        if aggregate.model_aggregation_enabled {
+            continue;
+        }
+        let model = crate::relay_config::relay_profile_model(relay);
+        let model = if model.trim().is_empty() {
+            route::relay_models(relay)
+                .into_iter()
+                .next()
+                .unwrap_or_default()
+        } else {
+            model.trim().to_string()
+        };
+        if model.is_empty() {
+            result
+                .notes
+                .push(format!("成员「{}」没有配置模型，没加进模型组", relay.name));
+            continue;
+        }
+        members.push(GroupMember {
+            model: format!("{provider_id}/{model}"),
+            weight: member.weight.max(1),
+        });
+    }
+    if !aggregate.routes.is_empty() {
+        result.notes.push(format!(
+            "{} 条模型路由规则网关里没有对应功能，没有转换；可以把对应模型直接加进供应商池",
+            aggregate.routes.len()
+        ));
+    }
+    if aggregate.model_aggregation_enabled {
+        result
+            .notes
+            .push("按模型聚合：网关的供应商池本身按模型名分发，不用建模型组".to_string());
+        return Ok(result);
+    }
+    if members.is_empty() {
+        return Ok(result);
+    }
+    let (mode, sticky) = match aggregate.strategy {
+        crate::settings::AggregateRelayStrategy::Failover => {
+            (GroupMode::InOrder, GroupSticky::Cache)
+        }
+        crate::settings::AggregateRelayStrategy::ConversationRoundRobin => {
+            (GroupMode::Rotate, GroupSticky::Session)
+        }
+        crate::settings::AggregateRelayStrategy::RequestRoundRobin => {
+            (GroupMode::Rotate, GroupSticky::Off)
+        }
+        crate::settings::AggregateRelayStrategy::WeightedRoundRobin => {
+            (GroupMode::Weighted, GroupSticky::Cache)
+        }
+    };
+    // 同名模型组已存在就覆盖它，重复搬不会多出一个组。
+    let existing = store
+        .load()?
+        .groups
+        .iter()
+        .find(|group| group.name == aggregate.name)
+        .map(|group| group.id.clone())
+        .unwrap_or_default();
+    let (_, id) = save_group(
+        store,
+        &GroupInput {
+            id: existing,
+            name: aggregate.name.clone(),
+            mode,
+            sticky,
+            members,
+        },
+    )?;
+    result.group = Some(id);
+    Ok(result)
+}
+
 /// 复制一个 Codex 供应商（地址、协议、多 Key、请求头等原样带上）。
 pub fn copy_codex_provider(
     settings: &BackendSettings,

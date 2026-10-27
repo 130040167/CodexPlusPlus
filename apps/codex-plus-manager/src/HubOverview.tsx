@@ -10,6 +10,7 @@ import {
   formatMoney,
   formatTokens,
   routeNarrative,
+  pendingImportCount,
   type GatewayPayload,
   type GatewayResult,
   type UsageSummary,
@@ -113,7 +114,8 @@ export function HubOverview({
   const feed = hubFeed(payload);
   const connected = agents.filter((agent) => agent.enabled).length;
   // 「接入 Agent」「添加供应商」就地弹窗，不跳到对应页面。
-  const [adding, setAdding] = useState<"agent" | "provider" | null>(null);
+  const [adding, setAdding] = useState<"agent" | "provider" | "import" | null>(null);
+  const pendingImports = pendingImportCount(payload);
   const [busy, setBusy] = useState<string | null>(null);
   const run: Run = async (key, command, args, title, silent = false) => {
     setBusy(key);
@@ -194,6 +196,11 @@ export function HubOverview({
           <div className="hub-col">
             <div className="hub-col-head"><span>{t("供应商池")}</span><span>{t("今日调用")}</span></div>
             {providers.length === 0 ? <p className="hub-empty">{t("供应商池还是空的。")}</p> : null}
+            {providers.length === 0 && pendingImports ? (
+              <button className="hub-node hub-node-ghost hub-node-import" onClick={() => setAdding("import")} type="button">
+                {tf("导入直连模式的 {0} 个供应商", [pendingImports])}
+              </button>
+            ) : null}
             {providers.map((provider) => (
               <button className="hub-node" data-node={`provider:${provider.id}`} key={provider.id} onClick={() => onNavigate("gatewayProviders")} type="button">
                 <Avatar baseUrl={provider.baseUrl} name={provider.name} size="sm" />
@@ -248,7 +255,9 @@ export function HubOverview({
           run={run}
         />
       ) : null}
-      {adding === "provider" ? <ProviderAdder busy={busy} notify={notify} onClose={() => setAdding(null)} payload={payload} run={run} /> : null}
+      {adding === "provider" || adding === "import" ? (
+        <ProviderAdder busy={busy} notify={notify} onClose={() => setAdding(null)} payload={payload} run={run} startWith={adding === "import" ? "import" : "catalog"} />
+      ) : null}
     </div>
   );
 }

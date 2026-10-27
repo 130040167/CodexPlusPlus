@@ -97,6 +97,10 @@ pub struct GatewayPayload {
     pub grok_profiles: Vec<GatewaySourceEntry>,
     /// OpenCode 自己保存的 OpenCode Go / Zen Key（不含 Key 本身）。
     pub opencode_keys: Vec<GatewaySourceEntry>,
+    /// 直连模式的聚合供应商：可以搬进网关（成员进池 + 同名模型组）。
+    pub codex_aggregates: Vec<apply::AggregateSource>,
+    /// 直连模式的官方登录账号：不能复制，要在网关里单独登录（名字已打码）。
+    pub codex_official: Vec<GatewaySourceEntry>,
 }
 
 const GATEWAY_AGENTS: &[ToolId] = &[ToolId::Codex, ToolId::Claude, ToolId::Grok];
@@ -185,6 +189,14 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
             )
         })
         .collect();
+    let codex_aggregates = apply::codex_aggregates(settings, &gateway);
+    let codex_official = apply::codex_official_accounts(settings)
+        .into_iter()
+        .map(|relay| GatewaySourceEntry {
+            id: relay.id.clone(),
+            name: codex_plus_core::gateway::accounts::mask_account_name(&relay.name),
+        })
+        .collect();
     let codex_providers = apply::codex_importable(settings)
         .into_iter()
         .map(|relay| {
@@ -270,6 +282,8 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
                 name: key.name,
             })
             .collect(),
+        codex_aggregates,
+        codex_official,
     }
 }
 
@@ -643,90 +657,143 @@ pub fn reorder_gateway_providers(ids: Vec<String>) -> CommandResult<Option<Gatew
     )
 }
 
-/// 从直连模式复制一个供应商进网关：`codex` / `claude` / `grok`。复制后两边互不影响。
-#[tauri::command]
-pub fn import_gateway_provider(
-    source: String,
-    id: String,
-    skip_agents: Option<Vec<String>>,
-) -> CommandResult<Option<GatewayPayload>> {
-    let result = (|| {
-        let relay = match source.as_str() {
-            "codex" => apply::copy_codex_provider(&SettingsStore::default().load()?, &id)?,
-            "claude" => {
-                let provider = claude::load(&ClaudeContext::default_paths())?
-                    .providers
-                    .into_iter()
-                    .find(|provider| provider.id == id)
-                    .ok_or_else(|| anyhow::anyhow!("Claude 供应商不存在：{id}"))?;
-                apply::copy_claude_provider(&provider)?
-            }
-            "grok" => apply::copy_grok_profile(&SettingsStore::default().load()?, &id)?,
-            other => anyhow::bail!("不认识的导入来源：{other}"),
-        };
-        apply::add_provider(
-            &GatewayStore::default(),
-            relay,
-            &format!("{source}:{id}"),
-            skip_agents.as_deref(),
+/// 把 OpenCode 里保存的 OpenCode Go / Zen Key 加进网关池，模型取目录里网关能用的。
+async fn import_opencode(id: &str, skip_agents: Option<&[String]>) -> anyhow::Result<String> {
+    use codex_plus_core::gateway::opencode;
+    let (entry, key) = opencode::load_stored_keys()
+        .into_iter()
+        .find(|(entry, _)| entry.id == id)
+        .ok_or_else(|| anyhow::anyhow!("OpenCode 里没有 {id} 的 Key"))?;
+    let base_url = opencode::base_url_of(&entry.id)
+        .ok_or_else(|| anyhow::anyhow!("不认识的 OpenCode 网关：{id}"))?;
+    let models = match opencode::plan_of(base_url) {
+        Some(plan) => opencode::catalog_models(plan).await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let input = ProviderInput {
+        name: entry.name.clone(),
+        base_url: base_url.to_string(),
+        protocol: codex_plus_core::settings::RelayProtocol::ChatCompletions,
+        keys: vec![key],
+        model: models.first().cloned().unwrap_or_default(),
+        model_list: models.join("\n"),
+        price: None,
+        model_prices: None,
+        proxy: None,
+    };
+    apply::create_provider(
+        &GatewayStore::default(),
+        &input,
+        &format!("opencode:{id}"),
+        skip_agents,
+    )?;
+    Ok(if models.is_empty() {
+        format!(
+            "已添加「{}」。没读到模型目录，请在供应商里获取模型。",
+            entry.name
         )
-    })();
-    respond(
-        "已复制进网关的供应商池，原来的供应商不受影响。",
-        "导入失败",
-        refresh_added(result),
-    )
+    } else {
+        format!("已添加「{}」，{} 个模型。", entry.name, models.len())
+    })
 }
 
-/// 把 OpenCode 里保存的 OpenCode Go / Zen Key 加进网关池，模型取目录里网关能用的。
+/// 批量导入里的一项：`source` 是 `codex` / `claude` / `grok` / `opencode` / `aggregate`。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ImportItem {
+    pub source: String,
+    pub id: String,
+}
+
+/// 从直连模式（和 OpenCode）一次导入多个供应商。已在池里的跳过；聚合供应商搬成「成员进池 + 同名模型组」。
+/// 每项单独成败，结果汇总成一句话，没法照搬的地方附在后面。
 #[tauri::command]
-pub async fn import_gateway_opencode_key(
-    id: String,
+pub async fn import_gateway_providers(
+    items: Vec<ImportItem>,
     skip_agents: Option<Vec<String>>,
 ) -> CommandResult<Option<GatewayPayload>> {
-    use codex_plus_core::gateway::opencode;
-    let result = async {
-        let (entry, key) = opencode::load_stored_keys()
-            .into_iter()
-            .find(|(entry, _)| entry.id == id)
-            .ok_or_else(|| anyhow::anyhow!("OpenCode 里没有 {id} 的 Key"))?;
-        let base_url = opencode::base_url_of(&entry.id)
-            .ok_or_else(|| anyhow::anyhow!("不认识的 OpenCode 网关：{id}"))?;
-        let models = match opencode::plan_of(base_url) {
-            Some(plan) => opencode::catalog_models(plan).await.unwrap_or_default(),
-            None => Vec::new(),
+    let skip = skip_agents.as_deref();
+    let mut added = 0usize;
+    let mut skipped = 0usize;
+    let mut groups: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for item in &items {
+        let already = GatewayStore::default().load().is_ok_and(|gateway| {
+            gateway
+                .providers
+                .iter()
+                .any(|provider| provider.source == format!("{}:{}", item.source, item.id))
+        });
+        if already {
+            skipped += 1;
+            continue;
+        }
+        let result: anyhow::Result<()> = match item.source.as_str() {
+            "opencode" => import_opencode(&item.id, skip).await.map(|_| added += 1),
+            "aggregate" => (|| {
+                let settings = SettingsStore::default().load()?;
+                let outcome = apply::import_codex_aggregate(
+                    &GatewayStore::default(),
+                    &settings,
+                    &item.id,
+                    skip,
+                )?;
+                added += outcome.added;
+                if let Some(id) = outcome.group
+                    && let Some(group) = GatewayStore::default().load()?.group(&id)
+                {
+                    groups.push(group.name.clone());
+                }
+                notes.extend(outcome.notes);
+                Ok(())
+            })(),
+            source => import_from_direct(source, &item.id, skip).map(|_| added += 1),
         };
-        let input = ProviderInput {
-            name: entry.name.clone(),
-            base_url: base_url.to_string(),
-            protocol: codex_plus_core::settings::RelayProtocol::ChatCompletions,
-            keys: vec![key],
-            model: models.first().cloned().unwrap_or_default(),
-            model_list: models.join("\n"),
-            price: None,
-            model_prices: None,
-            proxy: None,
-        };
-        apply::create_provider(
-            &GatewayStore::default(),
-            &input,
-            &format!("opencode:{id}"),
-            skip_agents.as_deref(),
-        )?;
-        Ok(if models.is_empty() {
-            format!(
-                "已添加「{}」。没读到模型目录，请在供应商里获取模型。",
-                entry.name
-            )
-        } else {
-            format!("已添加「{}」，{} 个模型。", entry.name, models.len())
-        })
+        if let Err(error) = result {
+            failures.push(format!("{error:#}"));
+        }
     }
-    .await;
-    match refresh_added(result) {
-        Ok(message) => ok(&message, current_payload()),
-        Err(error) => failed(&format!("导入失败：{error:#}"), current_payload()),
+    let _ = refresh_added(Ok(()));
+    let mut message = format!("已导入 {added} 个供应商");
+    if !groups.is_empty() {
+        message.push_str(&format!("，建好模型组「{}」", groups.join("」「")));
     }
+    if skipped > 0 {
+        message.push_str(&format!("，{skipped} 个已在池里"));
+    }
+    message.push('。');
+    for note in notes.iter().chain(failures.iter()) {
+        message.push_str(&format!("\n· {note}"));
+    }
+    if added == 0 && groups.is_empty() && !failures.is_empty() {
+        failed(&message, current_payload())
+    } else {
+        ok(&message, current_payload())
+    }
+}
+
+/// 从直连模式复制一项进池：`codex` / `claude` / `grok`。
+fn import_from_direct(source: &str, id: &str, skip: Option<&[String]>) -> anyhow::Result<String> {
+    let relay = match source {
+        "codex" => apply::copy_codex_provider(&SettingsStore::default().load()?, id)?,
+        "claude" => {
+            let provider = claude::load(&ClaudeContext::default_paths())?
+                .providers
+                .into_iter()
+                .find(|provider| provider.id == id)
+                .ok_or_else(|| anyhow::anyhow!("Claude 供应商不存在：{id}"))?;
+            apply::copy_claude_provider(&provider)?
+        }
+        "grok" => apply::copy_grok_profile(&SettingsStore::default().load()?, id)?,
+        other => anyhow::bail!("不认识的导入来源：{other}"),
+    };
+    let (_, id) = apply::add_provider(
+        &GatewayStore::default(),
+        relay,
+        &format!("{source}:{id}"),
+        skip,
+    )?;
+    Ok(id)
 }
 
 /// 新建或编辑网关路由组。

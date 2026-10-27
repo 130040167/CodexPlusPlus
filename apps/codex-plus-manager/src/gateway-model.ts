@@ -163,6 +163,10 @@ export type GatewayPayload = {
   grokProfiles: Array<{ id: string; name: string }>;
   /** OpenCode 里保存的 OpenCode Go / Zen Key。 */
   opencodeKeys?: Array<{ id: string; name: string }>;
+  /** 直连模式的聚合供应商：搬进网关时成员进池、建同名模型组（按模型聚合不建组）。 */
+  codexAggregates?: Array<{ id: string; name: string; members: number; byModel: boolean; imported: boolean }>;
+  /** 直连模式的官方登录账号：不能复制，要在网关里单独登录。名字已打码。 */
+  codexOfficial?: Array<{ id: string; name: string }>;
 };
 
 export type GatewayResult = { status: string; message: string } & Partial<GatewayPayload>;
@@ -1138,4 +1142,28 @@ function maskToken(value: string): string {
   const chars = [...value];
   if (chars.length <= 4) return `${chars[0] ?? ""}***`;
   return `${chars.slice(0, 2).join("")}****${chars.slice(-2).join("")}`;
+}
+
+/* —————————————— 从直连模式导入 —————————————— */
+
+export type ImportSource = "codex" | "claude" | "grok" | "opencode" | "aggregate";
+export type ImportCandidate = { source: ImportSource; id: string; name: string; imported: boolean };
+
+/** 能导入网关的供应商（不含官方登录账号）：已导入过的标 `imported`。 */
+export function importCandidates(payload: GatewayPayload | null): ImportCandidate[] {
+  const pooled = (source: string, id: string) => Boolean(payload?.pool.some((entry) => entry.source === `${source}:${id}`));
+  const plain = (source: ImportSource, items: Array<{ id: string; name: string }> | undefined) =>
+    (items ?? []).map((item) => ({ source, id: item.id, name: item.name, imported: pooled(source, item.id) }));
+  return [
+    ...plain("codex", payload?.codexProviders),
+    ...(payload?.codexAggregates ?? []).map((item) => ({ source: "aggregate" as const, id: item.id, name: item.name, imported: item.imported })),
+    ...plain("claude", payload?.claudeProviders),
+    ...plain("grok", payload?.grokProfiles),
+    ...plain("opencode", payload?.opencodeKeys),
+  ];
+}
+
+/** 还没导入网关的供应商数（引导卡片用）。 */
+export function pendingImportCount(payload: GatewayPayload | null): number {
+  return importCandidates(payload).filter((item) => !item.imported).length;
 }
