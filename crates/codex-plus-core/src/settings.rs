@@ -170,6 +170,13 @@ pub struct RelayProfile {
     /// 填写后协议代理把它改写成这里的模型（#1446）。留空则原样转发。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub auto_review_model: String,
+    /// Multi-Agent 子代理协议版本（#2683）：`"v1"` / `"v2"` 为显式选择，空串为 Auto
+    /// （沿用现有自动行为：Responses Lite 场景写 v2，其余沿用模板原值或不写）。
+    /// 优先级：每模型 modelMetadata 的 multi_agent_version > 本字段 > Auto。
+    /// 显式 v1 时会同步把 config.toml 的 `[features] multi_agent_v2` 压为 false，
+    /// 防止闸门单向覆盖目录声明。聚合供应商不适用本字段（保持其钉 v1 的既有行为）。
+    #[serde(rename = "multiAgent", default, skip_serializing_if = "String::is_empty")]
+    pub multi_agent: String,
     /// Anthropic 上游的认证字段：`x-api-key`（默认，Anthropic 原生）或
     /// `authorization`（多数 Claude 系中转网关用 Bearer）。
     #[serde(
@@ -370,6 +377,7 @@ impl Default for RelayProfile {
             trust_upstream_catalog_lite: false,
             strict_responses_reasoning: false,
             auto_review_model: String::new(),
+            multi_agent: String::new(),
             anthropic_auth_header: String::new(),
             anthropic_max_tokens: 0,
             anthropic_prompt_cache: true,
@@ -1390,6 +1398,7 @@ impl BackendSettings {
                 trust_upstream_catalog_lite: false,
                 strict_responses_reasoning: false,
                 auto_review_model: String::new(),
+                multi_agent: String::new(),
                 anthropic_auth_header: String::new(),
                 anthropic_max_tokens: 0,
                 anthropic_prompt_cache: true,
@@ -1458,6 +1467,7 @@ impl BackendSettings {
             trust_upstream_catalog_lite: false,
             strict_responses_reasoning: false,
             auto_review_model: String::new(),
+            multi_agent: String::new(),
             anthropic_auth_header: String::new(),
             anthropic_max_tokens: 0,
             anthropic_prompt_cache: true,

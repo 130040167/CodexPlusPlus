@@ -178,9 +178,12 @@ import {
   normalizeTokenCountInput,
   modelMetadataKey,
   modelFastSupportMode,
+  modelMultiAgentMode,
   synchronizeModelMetadataLiteSupport,
   synchronizeModelMetadataFastSupport,
+  synchronizeModelMetadataMultiAgentVersion,
   type ModelFastSupportMode,
+  type ModelMultiAgentMode,
   parseModelMetadataDocument,
   parseModelMetadataMap,
   remapModelMetadataSlugs,
@@ -550,6 +553,8 @@ export type RelayProfile = {
   vlmBaseUrl: string;
   userAgent: string;
   autoReviewModel?: string;
+  /** Multi-Agent 子代理协议（#2683）：空串=自动，v1/v2=供应商级显式选择（目录每模型兜底）。 */
+  multiAgent?: string;
   customHeaders: { key: string; value: string }[];
   sub2apiEnabled: boolean;
   sub2apiMultiplier: string;
@@ -12356,16 +12361,33 @@ function RelayProfileEditor({
                               />
                               <p className="field-hint">{t("按当前供应商逐模型声明。仅在上游支持 service_tier=priority 时选择支持；继承会清除自定义声明，取消不会保存修改。")}</p>
                             </Field>
-                            <Field label={t("Responses Lite 支持")}>
-                              <AppSelect value={metadataImportPreview?.metadata.use_responses_lite === true ? "supported" : metadataImportPreview?.metadata.use_responses_lite === false ? "unsupported" : "inherit"}
-                                options={[{ value: "inherit", label: t("继承模型默认能力") }, { value: "supported", label: t("明确支持 Lite") }, { value: "unsupported", label: t("标准 Responses") }]}
-                                onChange={(value) => {
-                                  const changed = synchronizeModelMetadataLiteSupport(metadataImportDocument, slug, value as "inherit" | "supported" | "unsupported");
-                                  if (!changed) { setMetadataImportError(t("请先修正当前模型的 JSON 配置。")); return; }
-                                  setMetadataImportDocument(changed.document); setMetadataImportPreview(changed.preview); setImportPrefillSource("existing"); setMetadataImportError("");
-                                }} />
-                              <p className="field-hint">{t("保存此模型后还需保存并使用供应商；只为已核实支持 Lite 的上游选择支持。")}</p>
-                            </Field>
+                            <div className="form-row">
+                              <Field label={t("Responses Lite 支持")}>
+                                <AppSelect value={metadataImportPreview?.metadata.use_responses_lite === true ? "supported" : metadataImportPreview?.metadata.use_responses_lite === false ? "unsupported" : "inherit"}
+                                  options={[{ value: "inherit", label: t("继承模型默认能力") }, { value: "supported", label: t("明确支持 Lite") }, { value: "unsupported", label: t("标准 Responses") }]}
+                                  onChange={(value) => {
+                                    const changed = synchronizeModelMetadataLiteSupport(metadataImportDocument, slug, value as "inherit" | "supported" | "unsupported");
+                                    if (!changed) { setMetadataImportError(t("请先修正当前模型的 JSON 配置。")); return; }
+                                    setMetadataImportDocument(changed.document); setMetadataImportPreview(changed.preview); setImportPrefillSource("existing"); setMetadataImportError("");
+                                  }} />
+                                <p className="field-hint">{t("只为已核实支持 Lite 的上游选择支持。")}</p>
+                              </Field>
+                              <Field label={t("Multi Agent 协议")}>
+                                <AppSelect value={modelMultiAgentMode(metadataImportPreview?.metadata)}
+                                  options={[
+                                    { value: "inherit", label: t("跟随供应商设置") },
+                                    { value: "v1", label: t("v1（经典）") },
+                                    { value: "v2", label: t("v2（新版）") },
+                                    { value: "disabled", label: t("关闭子代理") },
+                                  ]}
+                                  onChange={(value) => {
+                                    const changed = synchronizeModelMetadataMultiAgentVersion(metadataImportDocument, slug, value as ModelMultiAgentMode);
+                                    if (!changed) { setMetadataImportError(t("请先修正当前模型的 JSON 配置。")); return; }
+                                    setMetadataImportDocument(changed.document); setMetadataImportPreview(changed.preview); setImportPrefillSource("existing"); setMetadataImportError("");
+                                  }} />
+                                <p className="field-hint">{t("v2 需上游支持加密子代理载荷，转 Chat 协议的中转请选 v1；仅新会话生效。")}</p>
+                              </Field>
+                            </div>
                             <Textarea
                               autoFocus
                               value={metadataImportDocument}
@@ -12651,6 +12673,22 @@ function RelayProfileEditor({
                   onChange={(event) => updateDraft({ autoReviewModel: event.currentTarget.value })}
                   placeholder={t("留空则原样转发 codex-auto-review")}
                 />
+              </Field>
+            ) : null}
+            {showApiFields ? (
+              <Field className="relay-field-multi-agent" label={t("Multi Agent 协议")}>
+                <AppSelect
+                  value={profile.multiAgent === "v1" || profile.multiAgent === "v2" ? profile.multiAgent : "auto"}
+                  options={[
+                    { value: "auto", label: t("自动（推荐）") },
+                    { value: "v1", label: t("v1（经典，转 Chat 中转适用）") },
+                    { value: "v2", label: t("v2（新版，需上游支持加密载荷）") },
+                  ]}
+                  onChange={(value) => updateDraft({ multiAgent: value === "v1" || value === "v2" ? value : "" })}
+                />
+                <p className="field-hint">
+                  {t("子代理协议的供应商级默认；模型元数据里的 multi_agent_version 声明优先于它。选 v1 会在使用该供应商期间压下 [features] multi_agent_v2，切走时自动还原。仅对直连供应商生效，Codex 经新版网关接入时由网关配置决定。仅新会话生效。")}
+                </p>
               </Field>
             ) : null}
             {showApiFields ? (
@@ -16358,6 +16396,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     modelRoutes: relayMode === "official" && !officialMixApiKey ? [] : normalizeRelayModelRoutes(profile.modelRoutes),
     userAgent: profile.userAgent || "",
     autoReviewModel: profile.autoReviewModel?.trim() || "",
+    multiAgent: profile.multiAgent === "v1" || profile.multiAgent === "v2" ? profile.multiAgent : "",
     customHeaders: profile.customHeaders || [],
     sub2apiEnabled: profile.noAuth ? false : profile.sub2apiEnabled === true,
     sub2apiMultiplier: !profile.noAuth && profile.sub2apiEnabled === true ? profile.sub2apiMultiplier || "" : "",

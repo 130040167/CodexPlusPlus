@@ -2063,6 +2063,7 @@ async fn launch_starts_helper_when_chat_protocol_proxy_is_enabled() {
             trust_upstream_catalog_lite: false,
             strict_responses_reasoning: false,
             auto_review_model: String::new(),
+            multi_agent: String::new(),
             anthropic_auth_header: String::new(),
             anthropic_max_tokens: 0,
             anthropic_prompt_cache: true,
