@@ -207,7 +207,8 @@ test("上一个请求的路由说明：先列计划，再逐个尝试，最后�
   const lines = routeNarrative("claude", data.activity!.agents[0].last!, data);
   assert.deepEqual(lines.map((line) => line.tone), ["muted", "step", "step", "ok"]);
   assert.deepEqual(lines[0].args, ["Claude Code", "claude-sonnet-5", "Daily", "DeepSeek/deepseek-v4-flash, GLM/glm-5.3"]);
-  assert.deepEqual(lines[2].args, ["DeepSeek", "key-1", "被限流", " · HTTP 429"]);
+  // 失败原因是界面文案，标成 { zh } 交给界面翻译；供应商名、Key id 原样显示。
+  assert.deepEqual(lines[2].args, ["DeepSeek", "key-1", { zh: "被限流" }, " · HTTP 429"]);
   assert.deepEqual(lines[3].args, ["GLM", "glm-5.3", "1.2 s"]);
 });
 

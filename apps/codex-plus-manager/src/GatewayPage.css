@@ -1366,6 +1366,20 @@
   font-style: normal;
 }
 
+/* 紧凑密度：「挑选」弹层挂在 body 上、不在 .shell 里，原来写成 .shell .gw-select-item 的紧凑规则对它不生效。
+   用 .gw-portal 前缀（比上面的基础规则权重高，与加载顺序无关）。 */
+.gw-portal .gw-select-item {
+  gap: 8px;
+  min-height: 32px;
+  padding: 3px 8px;
+  font-size: 12.5px;
+}
+
+.gw-portal .gw-select-item em {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+}
+
 /* 模型选择器的条目：图标 · 名字 · 「经 Codex++」 · 说明 · 收藏 · 勾 */
 .gw-model-popover {
   min-height: 0;
@@ -3468,4 +3482,42 @@ body.gw-sorting * {
   background: transparent;
   color: var(--gw-ink);
   font-size: 13px;
+}
+
+/* 浏览器登录进行中的提示条：挂在 body 上、固定在窗口底部，不挡其它操作。 */
+.gw-portal.gw-login-pending {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  z-index: 900;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: calc(100vw - 32px);
+  padding: 8px 10px 8px 14px;
+  border: 1px solid var(--gw-line);
+  border-radius: 999px;
+  background: var(--gw-card);
+  color: var(--gw-ink);
+  font-size: 12.5px;
+  box-shadow: 0 8px 28px rgb(0 0 0 / 0.16);
+  transform: translateX(-50%);
+}
+
+.gw-portal.gw-login-pending > svg {
+  flex: none;
+  color: var(--gw-mute);
+}
+
+.gw-portal.gw-login-pending > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 网关弹窗（遮罩 z-index 1000）里打开的下拉（币种、未知模型名等）：下拉菜单挂在 body 上、默认 z-index 240，
+   会被弹窗盖住看不见。弹窗开着时把下拉抬到弹窗之上；用 :has 只在有网关弹窗时生效，权重高于基础规则，与加载顺序无关。 */
+body:has(.gw-modal-backdrop) .app-select-menu-portal {
+  z-index: 1010;
 }

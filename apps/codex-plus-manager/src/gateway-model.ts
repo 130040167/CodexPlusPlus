@@ -299,9 +299,14 @@ export function agentPoolProviders(payload: GatewayPayload | null, exclude: stri
 /** Agent 能用的全部模型：池内供应商的模型（去重，按池顺序）+ 有成员的模型组。与后端 `pool_models` 一致。 */
 export function agentModels(payload: GatewayPayload | null, exclude: string[] = []): string[] {
   const models: string[] = [];
+  // 按小写去重；用 Set 查重，池大时轮询刷新也不会 O(n²)。
+  const seen = new Set<string>();
   for (const entry of agentPoolProviders(payload, exclude)) {
     for (const model of entry.models) {
-      if (!models.some((known) => known.toLowerCase() === model.toLowerCase())) models.push(model);
+      const key = model.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      models.push(model);
     }
   }
   for (const group of payload?.groups ?? []) {
@@ -464,7 +469,7 @@ export function modelDisplay(payload: GatewayPayload | null, model: string, excl
   const qualified = qualifiedProvider(payload, title, exclude);
   if (qualified) return { title: prettyModelName(qualified.model), sub: maskAccountName(qualified.entry.name), group: false };
   const entry = agentPoolProviders(payload, exclude).find((item) => item.models.some((known) => known.toLowerCase() === title.toLowerCase()));
-  return { title: prettyModelName(title), sub: entry?.name ?? "", group: false };
+  return { title: prettyModelName(title), sub: entry ? maskAccountName(entry.name) : "", group: false };
 }
 
 /** 品牌词的正式写法。 */
@@ -567,6 +572,15 @@ export function groupStickyDescription(sticky: string | undefined): string {
   }
 }
 
+/** 权重输入框的文字 → 权重：空串、读不成数时返回 null（保留原值），否则取 ≥ 1 的整数。 */
+export function parseWeight(text: string): number | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  const value = Number(trimmed);
+  if (!Number.isFinite(value)) return null;
+  return Math.max(1, Math.floor(value));
+}
+
 /** 通配符成员：带 `*`，按 `<供应商 id>/<模型>` 或裸模型名匹配池里现有的模型。 */
 export function isPattern(model: string): boolean {
   return model.includes("*");
@@ -635,16 +649,22 @@ export function memberStatus(payload: GatewayPayload | null, relayId: string, no
     return { state: "busy", text: "正在回答…", args: [] };
   }
   const breaker = payload?.health.providers.find((item) => item.relayId === relayId && item.breakerOpen);
-  if (breaker) return { state: "cooling", text: "连续出错 · {0} 后恢复", args: [formatRemaining(breaker.remainingMs)] };
+  if (breaker) {
+    const left = formatRemaining(breaker.remainingMs);
+    return left ? { state: "cooling", text: "连续出错 · {0} 后恢复", args: [left] } : { state: "cooling", text: "连续出错", args: [] };
+  }
   const entry = payload?.pool.find((item) => item.id === relayId);
   const keyCount = entry?.keyCount ?? 1;
   const unhealthy = (payload?.health.keys ?? []).filter((key) => key.relayId === relayId && key.state !== "ok");
   if (unhealthy.length >= keyCount && unhealthy.length > 0) {
     const cooling = unhealthy.filter((key) => key.state === "cooling");
     if (!cooling.length) return { state: "cooling", text: "Key 都已停用", args: [] };
-    const soonest = Math.min(...cooling.map((key) => key.remainingMs ?? 0));
-    const label = cooling.some((key) => key.lastFailure === "quota_exhausted") ? "额度耗尽 · {0} 后恢复" : "被限流 · {0} 后恢复";
-    return { state: "cooling", text: label, args: [formatRemaining(soonest)] };
+    // 只看还有剩余时间的 Key：剩余时间为 null / 0 的不该把「最快恢复」拉成 0。
+    const waits = cooling.map((key) => key.remainingMs ?? 0).filter((ms) => ms > 0);
+    const left = waits.length ? formatRemaining(Math.min(...waits)) : "";
+    const quota = cooling.some((key) => key.lastFailure === "quota_exhausted");
+    if (!left) return { state: "cooling", text: quota ? "额度耗尽" : "被限流", args: [] };
+    return { state: "cooling", text: quota ? "额度耗尽 · {0} 后恢复" : "被限流 · {0} 后恢复", args: [left] };
   }
   // 最近 10 分钟内由它回答过的 Agent 请求：显示「Codex 刚用过」。
   const answered = activity
@@ -676,7 +696,9 @@ export function formatElapsed(ms: number): string {
   return `${Math.round(ms / 1000)} s`;
 }
 
-export type NarrativeLine = { tone: "muted" | "step" | "ok" | "fail"; text: string; args: Array<string | number> };
+/** 路由说明的参数：`{ zh }` 是界面文案（失败原因等），显示前要翻译；其它（供应商名、模型名、Key id）原样显示。 */
+export type NarrativeArg = string | number | { zh: string };
+export type NarrativeLine = { tone: "muted" | "step" | "ok" | "fail"; text: string; args: NarrativeArg[] };
 
 /** 总览「最近请求」展开后的路由经过：按记录逐条生成。文案是中文模板，界面用 tf 翻译。 */
 export function routeNarrative(agent: string, record: RouteRecordView, payload: GatewayPayload | null): NarrativeLine[] {
@@ -697,7 +719,7 @@ export function routeNarrative(agent: string, record: RouteRecordView, payload: 
       lines.push({ tone: "ok", text: "{0}（{1}）回答，用时 {2}。", args: [maskAccountName(step.relayName), step.model, formatElapsed(record.elapsedMs)] });
       return;
     }
-    const reason = step.outcome === "transport" ? "连不上" : failureLabel(step.failure) || "出错";
+    const reason = { zh: step.outcome === "transport" ? "连不上" : failureLabel(step.failure) || "出错" };
     const status = step.status ? ` · HTTP ${step.status}` : "";
     lines.push({
       tone: last ? "fail" : "step",
@@ -727,16 +749,21 @@ export type DispatchRow = { model: string; providers: DispatchProvider[] };
 export function modelDispatch(payload: GatewayPayload | null): DispatchRow[] {
   const connected = connectedAgents(payload);
   const rows: DispatchRow[] = [];
+  // 模型名（小写）→ 行；每行再记已列出的供应商 id。池大时轮询刷新也不会 O(n²)。
+  const byModel = new Map<string, { row: DispatchRow; ids: Set<string> }>();
   for (const entry of agentPoolProviders(payload)) {
     const excludedBy = connected.filter((agent) => payload?.gateway.bindings[agent]?.poolExclude?.includes(entry.id));
     for (const model of entry.models) {
-      let row = rows.find((item) => item.model.toLowerCase() === model.toLowerCase());
-      if (!row) {
-        row = { model, providers: [] };
-        rows.push(row);
+      const key = model.toLowerCase();
+      let slot = byModel.get(key);
+      if (!slot) {
+        slot = { row: { model, providers: [] }, ids: new Set() };
+        byModel.set(key, slot);
+        rows.push(slot.row);
       }
-      if (!row.providers.some((provider) => provider.id === entry.id)) {
-        row.providers.push({ id: entry.id, name: maskAccountName(entry.name), baseUrl: entry.baseUrl, excludedBy });
+      if (!slot.ids.has(entry.id)) {
+        slot.ids.add(entry.id);
+        slot.row.providers.push({ id: entry.id, name: maskAccountName(entry.name), baseUrl: entry.baseUrl, excludedBy });
       }
     }
   }
@@ -1121,15 +1148,33 @@ export function relativeTime(ms: number, now: number): { text: string; args: Arr
   return { text: "{0}", args: [`${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`] };
 }
 
+/** 名字里的邮箱。前面紧挨着 `*` 等字符的不算（那是已经打过码的邮箱尾巴），保证打码可以重复调用。 */
+const EMAIL_PATTERN = /(?<![A-Za-z0-9._%+*-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+
 /**
  * 订阅账号的显示名打码：「ChatGPT Pro · me@example.com」「Copilot · octocat」这类名字里的账号部分只露头尾，
  * 名字里出现的邮箱也一样。只在显示时处理，存储的名字不变；普通供应商名不受影响。
  */
 export function maskAccountName(name: string): string {
-  const masked = name.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, maskEmail);
+  const masked = name.replace(EMAIL_PATTERN, maskEmail);
   const match = /^((?:ChatGPT|Copilot|SuperGrok|GitHub Copilot)[^·]*·\s*)(.+)$/.exec(masked);
-  if (!match || match[2].includes("@")) return masked;
+  // 已经打过码的（带 *）原样返回：名字可能先打码再传给头像等组件，再打一次会变形。
+  if (!match || match[2].includes("@") || match[2].includes("*")) return masked;
   return match[1] + maskToken(match[2].trim());
+}
+
+/**
+ * 一段提示文字里的账号打码：邮箱一律打码，「」里的供应商名按 `maskAccountName` 处理。
+ * 后端的提示（如「已添加「ChatGPT Pro · me@example.com」」）原样弹 toast 前用它过一遍。
+ */
+export function maskAccountText(text: string): string {
+  // 按「」切开分别处理，避免已经打过码的邮箱被再打一次。
+  return text
+    .split(/(「[^」]+」)/)
+    .map((part) => (part.startsWith("「") && part.endsWith("」")
+      ? `「${maskAccountName(part.slice(1, -1))}」`
+      : part.replace(EMAIL_PATTERN, maskEmail)))
+    .join("");
 }
 
 function maskEmail(email: string): string {

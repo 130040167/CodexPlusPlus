@@ -13659,16 +13659,6 @@ button.side-item:hover {
   gap: 8px;
   font-size: 12.5px;
 }
-.shell .gw-select-item {
-  gap: 8px;
-  min-height: 32px;
-  padding: 3px 8px;
-  font-size: 12.5px;
-}
-.shell .gw-select-item em {
-  font-family: var(--font-mono, monospace);
-  font-size: 11px;
-}
 
 /* 内层滚动的页面（网关各页、Computer Use）：滚动区向右延伸到窗口边、再补回同样的内边距，
    内容位置不变，macOS 悬浮滚动条落在右侧留白里，不再压住搜索框、按钮等内容。20px 对应 .screen 的右内边距。 */

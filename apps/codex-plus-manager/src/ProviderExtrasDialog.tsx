@@ -1,6 +1,6 @@
 /** 供应商的价格与独立代理：在供应商池的详情里编辑（添加 / 编辑供应商的弹窗只管连接、Key 与模型）。
  * 价格按模型填：同一家的不同模型价格往往差好几倍。 */
-import { useEffect, useState, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { Check, RefreshCw, X } from "lucide-react";
@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { t, tf } from "./i18n";
 import { AppSelect } from "./AppSelect";
-import { type GatewayPoolEntry, type ProviderPrice } from "./gateway-model";
+import { maskAccountName, type GatewayPoolEntry, type ProviderPrice } from "./gateway-model";
 import {
   EMPTY_PRICE_ROW,
   formatPrice,
@@ -20,6 +20,7 @@ import {
   type PriceRow,
 } from "./provider-form-model";
 import { Avatar } from "./gateway-ui";
+import { useEscapeLayer } from "./use-escape-layer";
 import "./ProviderFormDialog.css";
 
 type Result = { status: string; message: string };
@@ -92,13 +93,8 @@ export function ProviderExtrasDialog({
     ? t("代理地址要写成 http://主机:端口（也支持 https:// 与 socks5://）")
     : "";
 
-  useEffect(() => {
-    const escape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onCancel();
-    };
-    document.addEventListener("keydown", escape);
-    return () => document.removeEventListener("keydown", escape);
-  }, [onCancel]);
+  // Esc 栈：币种下拉开着时 Esc 只关下拉，不会把整个价格弹窗（和填了一半的价格）关掉。
+  useEscapeLayer(true, onCancel);
 
   const fillPublicPrices = async () => {
     if (!entry.models.length) return;
@@ -146,7 +142,7 @@ export function ProviderExtrasDialog({
         <header className="pf-head">
           <Avatar baseUrl={entry.baseUrl} name={entry.name} />
           <div>
-            <strong>{section === "price" ? tf("{0} 的价格", [entry.name]) : tf("{0} 的代理", [entry.name])}</strong>
+            <strong>{section === "price" ? tf("{0} 的价格", [maskAccountName(entry.name)]) : tf("{0} 的代理", [maskAccountName(entry.name)])}</strong>
             <small>{section === "price" ? t("用于「用量」里估算费用") : t("只作用于这个供应商")}</small>
           </div>
           <button aria-label={t("关闭")} className="pf-icon" onClick={onCancel} type="button"><X /></button>

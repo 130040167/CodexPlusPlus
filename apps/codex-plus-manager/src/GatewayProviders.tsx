@@ -2,7 +2,7 @@
  *
  * 与直连模式完全独立：这里的增删改只动 gateway.json；「导入…」是把直连模式的供应商复制一份过来。
  */
-import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { createPortal } from "react-dom";
 import { appConfirm } from "./app-dialog";
@@ -39,6 +39,7 @@ import { AgentIcon, Avatar, KeyCount, MemberStatusLabel, QuotaBadge, QuotaWindow
 import { ProviderFormDialog, type ProviderFormState } from "./ProviderFormDialog";
 import { ProviderExtrasDialog, priceSummary } from "./ProviderExtrasDialog";
 import { ProviderModelsDialog } from "./ProviderModelsDialog";
+import { useEscapeLayer } from "./use-escape-layer";
 
 /** 能在网关里直接登录的订阅。 */
 type AccountKind = "chatgpt" | "chatgpt-api" | "copilot" | "grok";
@@ -128,7 +129,7 @@ export function ProvidersView({
     window.addEventListener("pointercancel", finish);
   };
 
-  const { login, dialog: loginDialog } = useAccountLogin(run, notify);
+  const { login, pending: loginPending, dialog: loginDialog } = useAccountLogin(run, notify);
   const saveEdit = async (draft: ProviderDraft) => {
     if (form?.mode !== "edit") return;
     if (await run(`edit:${form.entry.id}`, "update_gateway_provider", { id: form.entry.id, input: providerInput(draft) }, t("保存供应商"))) setForm(null);
@@ -159,6 +160,7 @@ export function ProvidersView({
               key={entry.id}
               onGripDown={(event) => startDrag(entry.id, event)}
               onEdit={() => setForm({ mode: "edit", entry })}
+              loggingIn={Boolean(entry.account) && loginPending === entry.account}
               onRelogin={() => void login(entry.account as AccountKind)}
               onToggleExpand={() => setExpanded(expanded === entry.id ? null : entry.id)}
               payload={payload}
@@ -196,37 +198,68 @@ export function ProvidersView({
   );
 }
 
-/** 订阅账号登录（新添加和「重新登录」共用）：返回登录函数和 Copilot 验证码弹窗。 */
+/**
+ * 订阅账号登录（新添加和「重新登录」共用）：返回登录函数、进行中的登录和它的弹窗 / 提示条。
+ *
+ * 登录要等用户在浏览器或 GitHub 上操作，最长 5–15 分钟，所以不占全局 busy（其它按钮照常可用），
+ * 只用自己的 `pending`。关掉 Copilot 验证码弹窗、按 Esc 或点「取消登录」都会让后端中止这次登录
+ * （释放回调端口、停止轮询）；开始新的登录时后端也会中止上一次。
+ */
 function useAccountLogin(run: Run, notify: Notify) {
+  const [pending, setPending] = useState<AccountKind | null>(null);
   const [deviceCode, setDeviceCode] = useState<DeviceCode | null>(null);
+  // 当前这次登录的序号：取消或开始新的登录后，旧登录的收尾不再改界面。
+  const attempt = useRef(0);
+  const cancel = () => {
+    attempt.current += 1;
+    setPending(null);
+    setDeviceCode(null);
+    void invoke("cancel_gateway_login").catch(() => undefined);
+  };
   /** 登录订阅账号：ChatGPT / ChatGPT API / SuperGrok 走浏览器登录；Copilot 先显示验证码，再等你在 GitHub 上授权。
    * `skip` 是新添加时取消勾选的 Agent；重新登录已有账号时不传。 */
   const login = async (kind: AccountKind, skip?: GatewayAgentId[]) => {
+    const id = ++attempt.current;
+    const current = () => attempt.current === id;
     const title = tf("登录 {0}", [ACCOUNT_LABELS[kind]]);
-    if (kind === "copilot") {
-      let code: DeviceCode;
-      try {
-        const result = await invoke<{ status: string; message: string } & Partial<DeviceCode>>("start_gateway_copilot_login");
-        if (result.status !== "ok" || !result.userCode || !result.deviceCode) {
-          await notify(tf("{0}失败", [title]), result.message, "failed");
+    setPending(kind);
+    setDeviceCode(null);
+    try {
+      if (kind === "copilot") {
+        let code: DeviceCode;
+        try {
+          const result = await invoke<{ status: string; message: string } & Partial<DeviceCode>>("start_gateway_copilot_login");
+          if (result.status !== "ok" || !result.userCode || !result.deviceCode) {
+            await notify(tf("{0}失败", [title]), result.message, "failed");
+            return;
+          }
+          code = { deviceCode: result.deviceCode, userCode: result.userCode, verificationUri: result.verificationUri ?? "https://github.com/login/device", interval: result.interval ?? 5, expiresIn: result.expiresIn ?? 900 };
+        } catch (error) {
+          await notify(t("调用失败"), String(error), "failed");
           return;
         }
-        code = { deviceCode: result.deviceCode, userCode: result.userCode, verificationUri: result.verificationUri ?? "https://github.com/login/device", interval: result.interval ?? 5, expiresIn: result.expiresIn ?? 900 };
-      } catch (error) {
-        await notify(t("调用失败"), String(error), "failed");
+        // 拿验证码期间已经取消了。
+        if (!current()) return;
+        setDeviceCode(code);
+        await run("login:copilot", "finish_gateway_copilot_login", { code, skipAgents: skip }, title, false, { background: true });
         return;
       }
-      setDeviceCode(code);
-      await run("login:copilot", "finish_gateway_copilot_login", { code, skipAgents: skip }, title);
-      setDeviceCode(null);
-      return;
+      void notify(title, t("已在浏览器打开登录页，登录完成后回到这里。5 分钟内有效。"), "info");
+      await run(`login:${kind}`, BROWSER_LOGIN_COMMANDS[kind], skip ? { skipAgents: skip } : undefined, title, false, { background: true });
+    } finally {
+      if (current()) {
+        setPending(null);
+        setDeviceCode(null);
+      }
     }
-    void notify(title, t("已在浏览器打开登录页，登录完成后回到这里。5 分钟内有效。"), "info");
-    await run(`login:${kind}`, BROWSER_LOGIN_COMMANDS[kind], skip ? { skipAgents: skip } : undefined, title);
   };
 
-  const dialog = deviceCode ? <DeviceCodeDialog code={deviceCode} notify={notify} onClose={() => setDeviceCode(null)} /> : null;
-  return { login, dialog };
+  const dialog = deviceCode ? (
+    <DeviceCodeDialog code={deviceCode} notify={notify} onCancel={cancel} />
+  ) : pending ? (
+    <LoginPendingBar label={ACCOUNT_LABELS[pending]} onCancel={cancel} />
+  ) : null;
+  return { login, pending, dialog };
 }
 
 /** 「添加供应商」整套流程：目录弹窗 → 填写表单或订阅登录，顶部可选给哪些 Agent 用。
@@ -313,6 +346,7 @@ function PoolRow({
   onGripDown,
   onEdit,
   onRelogin,
+  loggingIn,
 }: {
   entry: GatewayPoolEntry;
   payload: GatewayPayload | null;
@@ -324,6 +358,8 @@ function PoolRow({
   onGripDown: (event: ReactPointerEvent) => void;
   onEdit: () => void;
   onRelogin: () => void;
+  /** 这个账号类型正在登录（浏览器 / 设备码），按钮显示进行中。 */
+  loggingIn: boolean;
 }) {
   const enabled = providerEnabled(entry);
   const status = memberStatus(payload, entry.id);
@@ -388,7 +424,7 @@ function PoolRow({
         </span>
         <Switch
           disabled={busy !== null}
-          label={tf("{0} 参与调度", [entry.name])}
+          label={tf("{0} 参与调度", [maskAccountName(entry.name)])}
           on={enabled}
           onToggle={() => void run(`toggle:${entry.id}`, "set_gateway_provider_enabled", { id: entry.id, enabled: !enabled }, t("切换供应商"), true)}
         />
@@ -412,7 +448,7 @@ function PoolRow({
               {entry.account ? <span>{entry.plan || t("未知")}</span> : <KeyCount count={entry.keyCount} />}
               {failures.map((key) => (
                 <span className="gw-key-failure" key={key.keyId}>
-                  {`${key.keyId}：${[t(failureLabel(key.lastFailure)) || t(key.state === "disabled" ? "已停用" : "冷却中"), formatRemaining(key.remainingMs)].filter(Boolean).join(" · ")}`}
+                  {`${key.keyId}${t("：")}${[t(failureLabel(key.lastFailure)) || t(key.state === "disabled" ? "已停用" : "冷却中"), formatRemaining(key.remainingMs)].filter(Boolean).join(" · ")}`}
                 </span>
               ))}
               {failures.length || breaker ? (
@@ -468,8 +504,8 @@ function PoolRow({
             <span className="gw-detail-label" />
             <div className="gw-detail-value">
               {entry.account ? (
-                <button className="gw-text-button" disabled={busy !== null} onClick={onRelogin} type="button">
-                  {t("重新登录")}
+                <button className="gw-text-button" disabled={busy !== null || loggingIn} onClick={onRelogin} type="button">
+                  {loggingIn ? t("登录中…") : t("重新登录")}
                   <ChevronRight className="h-3.5 w-3.5" />
                 </button>
               ) : (
@@ -591,13 +627,8 @@ function ProviderCatalog({
     { key: "local", title: t("本机"), hint: t("本机运行的模型服务，或任意兼容地址"), items: local },
   ].filter((section) => section.items.length);
 
-  useEffect(() => {
-    const escape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !importing) onClose();
-    };
-    window.addEventListener("keydown", escape);
-    return () => window.removeEventListener("keydown", escape);
-  }, [importing, onClose]);
+  // Esc 栈：从这里打开的「导入…」在上面一层，Esc 先关导入，不会把整个添加流程关掉。
+  useEscapeLayer(true, onClose);
 
   return createPortal(
     <div className="gw-modal-backdrop gw-portal" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
@@ -667,13 +698,7 @@ function ImportDialog({
   skipAgents: GatewayAgentId[];
   agentPicks?: ReactNode;
 }) {
-  useEffect(() => {
-    const escape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    document.addEventListener("keydown", escape);
-    return () => document.removeEventListener("keydown", escape);
-  }, [onClose]);
+  useEscapeLayer(true, onClose);
   const candidates = importCandidates(payload);
   const keyOf = (item: ImportCandidate) => `${item.source}:${item.id}`;
   const [picked, setPicked] = useState<Set<string>>(() => new Set(candidates.filter((item) => !item.imported).map(keyOf)));
@@ -765,7 +790,7 @@ function ImportDialog({
                   <span className="gw-import-check" />
                   <Avatar name={item.name} size="sm" />
                   <span>
-                    <strong>{item.name}</strong>
+                    <strong>{maskAccountName(item.name)}</strong>
                     <small>{t("不能复制：两边共用登录会互相把对方刷失效，需要在网关里单独登录一次")}</small>
                   </span>
                   {chatgptLoggedIn ? (
@@ -791,9 +816,9 @@ function ImportDialog({
   );
 }
 
-/** 新建 / 编辑供应商：名称、Key（每行一个，多个自动轮换）、地址、协议、模型。 */
-/** Copilot 设备码登录：显示验证码，等你在 GitHub 页面里输入并授权。 */
-function DeviceCodeDialog({ code, notify, onClose }: { code: DeviceCode; notify: Notify; onClose: () => void }) {
+/** Copilot 设备码登录：显示验证码，等你在 GitHub 页面里输入并授权。关掉弹窗（含 Esc）就是取消登录。 */
+function DeviceCodeDialog({ code, notify, onCancel }: { code: DeviceCode; notify: Notify; onCancel: () => void }) {
+  useEscapeLayer(true, onCancel);
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(code.userCode);
@@ -807,7 +832,7 @@ function DeviceCodeDialog({ code, notify, onClose }: { code: DeviceCode; notify:
       <div className="gw-modal gw-device-modal">
         <header>
           <strong>{t("登录 GitHub Copilot")}</strong>
-          <button aria-label={t("关闭")} className="gw-icon-button" onClick={onClose} type="button"><X className="h-4 w-4" /></button>
+          <button aria-label={t("取消登录")} className="gw-icon-button" onClick={onCancel} title={t("取消登录")} type="button"><X className="h-4 w-4" /></button>
         </header>
         <div className="gw-modal-body">
           <p className="gw-muted">{tf("已在浏览器打开 {0}，输入下面的验证码并授权。授权完成后这里会自动继续。", [code.verificationUri])}</p>
@@ -817,7 +842,23 @@ function DeviceCodeDialog({ code, notify, onClose }: { code: DeviceCode; notify:
           </button>
           <p className="gw-muted">{tf("验证码 {0} 分钟内有效。需要这个 GitHub 账号有 Copilot 订阅。", [Math.round(code.expiresIn / 60)])}</p>
         </div>
+        <footer>
+          <span className="gw-error" />
+          <button className="gw-soft-button" onClick={onCancel} type="button">{t("取消登录")}</button>
+        </footer>
       </div>
+    </div>,
+    document.body,
+  );
+}
+
+/** 浏览器登录进行中的提示条：不挡操作（固定在窗口底部），可随时取消。 */
+function LoginPendingBar({ label, onCancel }: { label: string; onCancel: () => void }) {
+  return createPortal(
+    <div aria-live="polite" className="gw-portal gw-login-pending" role="status">
+      <RefreshCw aria-hidden="true" className="h-3.5 w-3.5 animate-spin" />
+      <span>{tf("正在等待 {0} 登录，在浏览器里完成后会自动继续", [label])}</span>
+      <button className="gw-text-button strong" onClick={onCancel} type="button">{t("取消登录")}</button>
     </div>,
     document.body,
   );

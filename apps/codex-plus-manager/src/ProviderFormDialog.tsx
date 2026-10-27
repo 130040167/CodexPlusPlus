@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { t, tf } from "./i18n";
 import {
+  maskAccountName,
   presetHost,
   providerDraftFromEntry,
   providerDraftFromPreset,
@@ -17,6 +18,7 @@ import {
   type ProviderDraft,
 } from "./gateway-model";
 import { Avatar } from "./gateway-ui";
+import { useEscapeLayer } from "./use-escape-layer";
 import { lookupPublicPrices } from "./ProviderExtrasDialog";
 import {
   FETCHED_DIRECT_LIMIT,
@@ -72,13 +74,8 @@ export function ProviderFormDialog({
   const firstKey = keys.map((key) => key.trim()).find(Boolean) ?? "";
   const canFetch = Boolean(draft.baseUrl.trim()) && (Boolean(firstKey) || editing) && !fetching;
 
-  useEffect(() => {
-    const escape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onCancel();
-    };
-    document.addEventListener("keydown", escape);
-    return () => document.removeEventListener("keydown", escape);
-  }, [onCancel]);
+  // Esc 栈：「从上游获取」的勾选列表开着时 Esc 先收起列表。
+  useEscapeLayer(true, onCancel);
 
   const lookupPrices = async (list: string[], baseUrl: string) => {
     const found = await lookupPublicPrices(baseUrl, list);
@@ -123,7 +120,7 @@ export function ProviderFormDialog({
     }
   };
 
-  const title = form.mode === "edit" ? tf("编辑 {0}", [form.entry.name]) : preset ? tf("添加 {0}", [preset.name]) : t("添加自定义供应商");
+  const title = form.mode === "edit" ? tf("编辑 {0}", [maskAccountName(form.entry.name)]) : preset ? tf("添加 {0}", [preset.name]) : t("添加自定义供应商");
   const subtitle = preset?.apiKeyUrl ? tf("在 {0} 获取 Key", [presetHost(preset.apiKeyUrl)]) : editing ? tf("现有 {0} 个 Key", [form.entry.keyCount]) : t("任意 OpenAI / Anthropic 兼容接口");
   const keyHint = editing ? t("留空表示不改") : preset?.defaultKey ? t("本机服务不校验 Key，保留默认值即可") : t("多个自动轮换");
 
@@ -263,6 +260,8 @@ function ModelPicker({
     const query = picker.query.trim().toLowerCase();
     return query ? picker.models.filter((model) => model.toLowerCase().includes(query)) : picker.models;
   }, [picker.models, picker.query]);
+  // 勾选列表也是一层：Esc 只收起它，不关掉整个表单。
+  useEscapeLayer(true, () => setPicker(null));
   const toggle = (model: string) => {
     const selected = new Set(picker.selected);
     if (selected.has(model)) selected.delete(model);
@@ -273,7 +272,16 @@ function ModelPicker({
     <div className="pf-picker">
       <div className="pf-picker-head">
         <Search />
-        <input autoFocus onChange={(event) => setPicker({ ...picker, query: event.currentTarget.value })} placeholder={tf("上游有 {0} 个模型，搜索后勾选", [picker.models.length])} value={picker.query} />
+        <input
+          autoFocus
+          onChange={(event) => setPicker({ ...picker, query: event.currentTarget.value })}
+          onKeyDown={(event) => {
+            // 这个搜索框在表单里：回车只是搜索，不能提交整个表单。
+            if (event.key === "Enter") event.preventDefault();
+          }}
+          placeholder={tf("上游有 {0} 个模型，搜索后勾选", [picker.models.length])}
+          value={picker.query}
+        />
         <button className="pf-link" onClick={() => setPicker({ ...picker, selected: new Set([...picker.selected, ...visible]) })} type="button">{t("全选当前")}</button>
       </div>
       <div className="pf-picker-list">

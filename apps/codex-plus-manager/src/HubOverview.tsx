@@ -12,11 +12,11 @@ import {
   routeNarrative,
   pendingImportCount,
   type GatewayPayload,
-  type GatewayResult,
   type UsageSummary,
 } from "./gateway-model";
-import { hubAgents, hubFeed, hubLinks, hubProviders, hubTotals, successRate, type CodexSummary, type HubFeedItem, type HubLink } from "./hub-overview-model";
-import { AGENT_ICONS, APP_LOGO_URL, Avatar, KeyCount, MemberStatusLabel, type Notify, type Run } from "./gateway-ui";
+import { hubAgents, hubFeed, hubLinks, hubPoolState, hubProviders, hubTotals, successRate, type CodexSummary, type HubFeedItem, type HubLink } from "./hub-overview-model";
+import { AGENT_ICONS, APP_LOGO_URL, Avatar, KeyCount, MemberStatusLabel, makeRun, type Notify, type Run } from "./gateway-ui";
+import { publishGatewayPayload, useGatewayPayload } from "./gateway-store";
 import { AgentConnectDialog } from "./GatewayAgents";
 import { ProviderAdder } from "./GatewayProviders";
 import "./HubOverview.css";
@@ -24,44 +24,8 @@ import "./HubOverview.css";
 const LIVE_REFRESH_MS = 3000;
 const USAGE_REFRESH_MS = 30_000;
 
-/** 侧栏状态卡和总览页共用的网关数据：各自按自己的间隔静默刷新，失败时保留上一次的值。 */
-const shared: { payload: GatewayPayload | null } = { payload: null };
-const listeners = new Set<(payload: GatewayPayload) => void>();
-
-/** 命令返回了新的网关数据（如在总览里接入了 Agent）：立刻推给所有在用的组件，不等下次轮询。 */
-function publishGatewayPayload(result: GatewayResult) {
-  if (!result.gateway || !Array.isArray(result.pool)) return;
-  shared.payload = result as GatewayPayload;
-  for (const listener of listeners) listener(shared.payload);
-}
-
-export function useGatewayPayload(intervalMs: number): GatewayPayload | null {
-  const [payload, setPayload] = useState<GatewayPayload | null>(shared.payload);
-  useEffect(() => {
-    listeners.add(setPayload);
-    return () => {
-      listeners.delete(setPayload);
-    };
-  }, []);
-  useEffect(() => {
-    let cancelled = false;
-    const load = () =>
-      invoke<GatewayResult>("load_gateway")
-        .then((result) => {
-          if (cancelled || !result.gateway || !Array.isArray(result.pool)) return;
-          shared.payload = result as GatewayPayload;
-          setPayload(shared.payload);
-        })
-        .catch(() => undefined);
-    void load();
-    const timer = window.setInterval(load, intervalMs);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [intervalMs]);
-  return payload;
-}
+/** 侧栏状态卡、总览、网关页共用的网关数据在 gateway-store 里；这里转出 hook，保持原来的引用路径。 */
+export { useGatewayPayload };
 
 function useTodayUsage(): UsageSummary | null {
   const [summary, setSummary] = useState<UsageSummary | null>(null);
@@ -117,31 +81,17 @@ export function HubOverview({
   const [adding, setAdding] = useState<"agent" | "provider" | "import" | null>(null);
   const pendingImports = pendingImportCount(payload);
   const [busy, setBusy] = useState<string | null>(null);
-  const run: Run = async (key, command, args, title, silent = false) => {
-    setBusy(key);
-    try {
-      const result = await invoke<GatewayResult>(command, args);
-      publishGatewayPayload(result);
-      if (result.status !== "ok") {
-        await notify(tf("{0}失败", [title]), result.message, "failed");
-        return false;
-      }
-      if (!silent) await notify(title, result.message, "ok");
-      return true;
-    } catch (error) {
-      await notify(t("调用失败"), String(error), "failed");
-      return false;
-    } finally {
-      setBusy(null);
-    }
-  };
+  const run: Run = makeRun(setBusy, publishGatewayPayload, notify);
+  const poolState = hubPoolState(payload);
 
   return (
     <div className="hub-page">
       {/* 页面标题已在外壳顶栏，这里只留一句现状说明。 */}
       <header className="hub-intro">
         <p>
-          {tf("{0} 个 Agent 通过 Codex++ 共用 {1} 个供应商。请求按模型名路由，Key 冷却或供应商熔断时自动换上游。", [connected, providers.length])}
+          {payload
+            ? tf("{0} 个 Agent 通过 Codex++ 共用 {1} 个供应商。请求按模型名路由，Key 冷却或供应商熔断时自动换上游。", [connected, providers.length])
+            : t("正在读取网关状态…")}
         </p>
       </header>
 
@@ -195,8 +145,10 @@ export function HubOverview({
 
           <div className="hub-col">
             <div className="hub-col-head"><span>{t("供应商池")}</span><span>{t("今日调用")}</span></div>
-            {providers.length === 0 ? <p className="hub-empty">{t("供应商池还是空的。")}</p> : null}
-            {providers.length === 0 && pendingImports ? (
+            {poolState === "loading" ? <p className="hub-empty">{t("读取中…")}</p> : null}
+            {poolState === "empty" ? <p className="hub-empty">{t("供应商池还是空的。")}</p> : null}
+            {poolState === "allOff" ? <p className="hub-empty">{tf("池里的 {0} 个供应商都已关闭。", [payload?.pool.length ?? 0])}</p> : null}
+            {poolState === "empty" && pendingImports ? (
               <button className="hub-node hub-node-ghost hub-node-import" onClick={() => setAdding("import")} type="button">
                 {tf("导入直连模式的 {0} 个供应商", [pendingImports])}
               </button>
@@ -289,7 +241,7 @@ function FeedRow({ item, payload }: { item: HubFeedItem; payload: GatewayPayload
       {open && record ? (
         <ol className="hub-feed-trace">
           {routeNarrative(item.agent, record, payload).map((line, index) => (
-            <li data-tone={line.tone} key={index}>{tf(line.text, line.args.map((arg) => (typeof arg === "string" && /^[一-龥]/.test(arg) ? t(arg) : arg)))}</li>
+            <li data-tone={line.tone} key={index}>{tf(line.text, line.args.map((arg) => (typeof arg === "object" ? t(arg.zh) : arg)))}</li>
           ))}
         </ol>
       ) : null}

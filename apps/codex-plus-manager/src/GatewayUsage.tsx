@@ -1,5 +1,5 @@
 /** 本地网关 · 用量：余额、费用 / token / 缓存 / 调用 / 耗时、按天的柱状图与 Agent 占比，以及按供应商 / 模型 / Agent 的明细表。 */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { appConfirm } from "./app-dialog";
 import { RefreshCw } from "lucide-react";
@@ -36,9 +36,13 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
   const [loadingBalances, setLoadingBalances] = useState(false);
   const [split, setSplit] = useState<"provider" | "model" | "agent">("provider");
 
+  // 每次读取的序号：快速切换范围时，先发出的请求可能后回来，只认最后一次的结果。
+  const latest = useRef(0);
   const load = async (next: UsageRange) => {
+    const id = ++latest.current;
     try {
       const result = await invoke<{ status: string; message: string } & Partial<UsageSummary>>("load_gateway_usage", { range: next });
+      if (id !== latest.current) return;
       if (result.status !== "ok" || !result.totals) {
         await notify(t("读取用量失败"), result.message, "failed");
         return;
@@ -47,7 +51,7 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
       memo.summary = value;
       setSummary(value);
     } catch (error) {
-      await notify(t("调用失败"), String(error), "failed");
+      if (id === latest.current) await notify(t("调用失败"), String(error), "failed");
     }
   };
   const loadBalances = async () => {
@@ -111,7 +115,7 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
             <div className="gw-card gw-balance-card" key={balance.providerId}>
               <div className="gw-balance-name">
                 <Avatar baseUrl={balance.baseUrl} name={balance.provider} size="sm" />
-                <strong>{balance.provider}</strong>
+                <strong>{maskAccountName(balance.provider)}</strong>
               </div>
               <div className="gw-balance-row">
                 <span>{t("余额")}</span>
@@ -209,7 +213,7 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
                 ) : (
                   <Avatar baseUrl={providerEntry?.baseUrl} name={group.label || "?"} size="sm" />
                 )}
-                <strong title={group.label}>{name || t("未知")}</strong>
+                <strong title={split === "provider" ? maskAccountName(group.label) : group.label}>{name || t("未知")}</strong>
               </span>
               <span className="gw-usage-share">
                 <span className="gw-usage-bar"><i style={{ width: `${Math.max(2, share * 100)}%` }} /></span>

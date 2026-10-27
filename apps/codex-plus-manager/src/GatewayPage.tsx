@@ -1,5 +1,5 @@
 /** 本地网关：让 Claude Code、Grok 经 Codex++ 使用统一的供应商池，支持多 Key 轮换与模型组。 */
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { appConfirm } from "./app-dialog";
@@ -17,6 +17,7 @@ import {
   groupStickyLabel,
   isPattern,
   memberLabel,
+  parseWeight,
   dispatchStatus,
   modelDispatch,
   modelDisplay,
@@ -36,14 +37,19 @@ import { AppSelect } from "./AppSelect";
 import { ProvidersView } from "./GatewayProviders";
 import { SessionsView } from "./GatewaySessions";
 import { UsageView } from "./GatewayUsage";
-import { Avatar, MemberStatusLabel, SectionLabel, Switch, type Notify, type Run } from "./gateway-ui";
+import { Avatar, MemberStatusLabel, SectionLabel, Switch, makeRun, type Notify, type Run } from "./gateway-ui";
 import { TopbarActions } from "./TopbarActions";
+import { useEscapeLayer } from "./use-escape-layer";
+import { publishGatewayPayload } from "./gateway-store";
 import "./GatewayPage.css";
 
 type Tab = "agents" | "sessions" | "providers" | "routing" | "usage" | "gateway";
 export type GatewayTab = Tab;
 
 const memo: { payload: GatewayPayload | null; tab: Tab } = { payload: null, tab: "agents" };
+
+/** 组编辑器的模型选择不排除任何供应商；模块级常量，避免每次渲染都换新数组让列表重算。 */
+const NO_EXCLUDE: string[] = [];
 
 /** 模型调度页刷新供应商状态的间隔。 */
 const LIVE_REFRESH_MS = 2500;
@@ -85,27 +91,12 @@ export function GatewayPage({
     if (hasPayload(result)) {
       memo.payload = result;
       setPayload(result);
+      // 侧栏状态卡、总览共用的数据也立刻更新，不等它们下次轮询。
+      publishGatewayPayload(result);
     }
   };
 
-  const run: Run = async (key, command, args, title, silent = false) => {
-    setBusy(key);
-    try {
-      const result = await invoke<GatewayResult>(command, args);
-      accept(result);
-      if (result.status !== "ok") {
-        await notify(tf("{0}失败", [title]), result.message, "failed");
-        return false;
-      }
-      if (!silent) await notify(title, result.message, "ok");
-      return true;
-    } catch (error) {
-      await notify(t("调用失败"), String(error), "failed");
-      return false;
-    } finally {
-      setBusy(null);
-    }
-  };
+  const run: Run = makeRun(setBusy, accept, notify);
 
   const refresh = async (silent = true) => {
     setBusy("load");
@@ -294,7 +285,7 @@ function RoutingView({ payload, busy, run, onManage }: { payload: GatewayPayload
 function DispatchTable({ payload, onManage }: { payload: GatewayPayload | null; onManage: () => void }) {
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState(false);
-  const rows = modelDispatch(payload);
+  const rows = useMemo(() => modelDispatch(payload), [payload]);
   const needle = query.trim().toLowerCase();
   const matched = needle
     ? rows.filter((row) => row.model.toLowerCase().includes(needle) || row.providers.some((provider) => provider.name.toLowerCase().includes(needle)))
@@ -309,7 +300,7 @@ function DispatchTable({ payload, onManage }: { payload: GatewayPayload | null; 
         )}
       >
         {t("模型调度")}
-        <em>{tf("{0} 个模型 · {1} 个有备用", [rows.length, backed])}</em>
+        {payload ? <em>{tf("{0} 个模型 · {1} 个有备用", [rows.length, backed])}</em> : null}
       </SectionLabel>
       <div className="gw-card gw-dispatch">
         <p className="gw-dispatch-lead">
@@ -321,10 +312,15 @@ function DispatchTable({ payload, onManage }: { payload: GatewayPayload | null; 
             <input aria-label={t("搜索模型或供应商")} onChange={(event) => setQuery(event.target.value)} placeholder={t("搜索模型或供应商")} value={query} />
           </div>
         ) : null}
-        {rows.length === 0 ? (
+        {!payload ? <div className="gw-empty">{t("正在读取…")}</div> : null}
+        {payload && rows.length === 0 ? (
           <div className="gw-empty">
-            <strong>{t("供应商池里还没有模型")}</strong>
-            <span>{t("在「供应商池」添加并打开供应商后，这里列出每个模型会发给谁。")}</span>
+            <strong>{payload.pool.length ? t("供应商都已关闭") : t("供应商池里还没有模型")}</strong>
+            <span>
+              {payload.pool.length
+                ? t("打开供应商池里的供应商后，这里列出每个模型会发给谁。")
+                : t("在「供应商池」添加并打开供应商后，这里列出每个模型会发给谁。")}
+            </span>
           </div>
         ) : null}
         {shown.map((row) => (
@@ -337,7 +333,7 @@ function DispatchTable({ payload, onManage }: { payload: GatewayPayload | null; 
               {row.providers.map((provider, index) => {
                 const status = dispatchStatus(payload, provider.id, row.model);
                 const speed = speedOf(payload, provider.id, row.model);
-                const note = provider.excludedBy.length ? tf("{0} 不用这家", [provider.excludedBy.map(agentName).join("、")]) : undefined;
+                const note = provider.excludedBy.length ? tf("{0} 不用这家", [provider.excludedBy.map(agentName).join(t("、"))]) : undefined;
                 return (
                   <li data-excluded={provider.excludedBy.length > 0} data-state={status?.state ?? "idle"} key={provider.id} title={note}>
                     {index > 0 ? <ChevronRight aria-hidden className="gw-dispatch-arrow h-3.5 w-3.5" /> : null}
@@ -386,13 +382,10 @@ function GroupEditor({
   const [members, setMembers] = useState<GroupMember[]>(group?.members.map((member) => ({ ...member })) ?? []);
   const [picking, setPicking] = useState(false);
   const addRef = useRef<HTMLButtonElement>(null);
-  useEffect(() => {
-    const escape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !picking) onCancel();
-    };
-    document.addEventListener("keydown", escape);
-    return () => document.removeEventListener("keydown", escape);
-  }, [onCancel, picking]);
+  // Esc 栈：「添加成员」浮层、模式下拉开着时 Esc 先关它们。
+  useEscapeLayer(true, onCancel);
+  // 权重输入框正在编辑的原始文字（允许暂时为空），失焦时再规范成 ≥ 1 的整数。
+  const [weightText, setWeightText] = useState<Record<number, string>>({});
   const move = (index: number, delta: number) => {
     const next = [...members];
     const [item] = next.splice(index, 1);
@@ -485,13 +478,26 @@ function GroupEditor({
                         <input
                           className="gw-inline-input gw-weight-input"
                           min={1}
+                          onBlur={() => {
+                            setWeightText((previous) => {
+                              const next = { ...previous };
+                              delete next[index];
+                              return next;
+                            });
+                          }}
                           onChange={(event) => {
-                            const next = [...members];
-                            next[index] = { ...member, weight: Math.max(1, Number(event.currentTarget.value) || 1) };
-                            setMembers(next);
+                            const text = event.currentTarget.value;
+                            setWeightText((previous) => ({ ...previous, [index]: text }));
+                            // 能读成数的就先记下；删空、输入到一半时保留原值，失焦后显示规范值。
+                            const parsed = parseWeight(text);
+                            if (parsed !== null) {
+                              const next = [...members];
+                              next[index] = { ...member, weight: parsed };
+                              setMembers(next);
+                            }
                           }}
                           type="number"
-                          value={member.weight}
+                          value={weightText[index] ?? String(member.weight)}
                         />
                       </label>
                     ) : null}
@@ -530,7 +536,7 @@ function GroupEditor({
               <small className="gw-muted">{t("通配符按「供应商 id/模型」或模型名匹配，* 代表任意字符；上游新增的模型会自动算进来。")}</small>
               <Floating anchorRef={addRef} className="gw-model-popover" onClose={() => setPicking(false)} open={picking} width={520}>
                 <ModelList
-                  exclude={[]}
+                  exclude={NO_EXCLUDE}
                   onPick={(item) => {
                     setPicking(false);
                     if (!members.some((member) => member.model === item.model)) setMembers([...members, { model: item.model, weight: 1 }]);

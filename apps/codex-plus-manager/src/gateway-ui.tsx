@@ -1,15 +1,60 @@
 /** 本地网关页各标签共用的小组件与类型。 */
 import type { CSSProperties, ReactNode } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { KeyRound } from "lucide-react";
 import { t, tf } from "./i18n";
-import { formatRemaining, quotaRemaining, quotaWindowLabel, type MemberStatus, type ProviderQuota } from "./gateway-model";
+import {
+  formatRemaining,
+  maskAccountName,
+  maskAccountText,
+  quotaRemaining,
+  quotaWindowLabel,
+  type GatewayResult,
+  type MemberStatus,
+  type ProviderQuota,
+} from "./gateway-model";
 import { BRAND_ICON_URLS } from "./provider-brand-icons";
 import { brandIconIsColor, brandIconKey } from "./provider-brands";
 import { providerAvatarText } from "./provider-name";
 
 export type Status = "ok" | "failed" | "warning" | "info";
 export type Notify = (title: string, message: string, status?: Status) => Promise<void>;
-export type Run = (key: string, command: string, args: Record<string, unknown> | undefined, title: string, silent?: boolean) => Promise<boolean>;
+/** `background`：不占全局 busy（订阅登录要等用户在浏览器里操作几分钟，不能把其它按钮都锁住）。 */
+export type RunOptions = { background?: boolean };
+export type Run = (
+  key: string,
+  command: string,
+  args: Record<string, unknown> | undefined,
+  title: string,
+  silent?: boolean,
+  options?: RunOptions,
+) => Promise<boolean>;
+
+/**
+ * 网关页、总览共用的命令执行：占用 busy（`background` 时不占）、收下新数据、弹结果提示。
+ * 提示文字里的账号名、邮箱打码；用户自己取消的（status 为 cancelled）不提示。
+ */
+export function makeRun(setBusy: (key: string | null) => void, accept: (result: GatewayResult) => void, notify: Notify): Run {
+  return async (key, command, args, title, silent = false, options = {}) => {
+    if (!options.background) setBusy(key);
+    try {
+      const result = await invoke<GatewayResult>(command, args);
+      accept(result);
+      if (result.status === "cancelled") return false;
+      if (result.status !== "ok") {
+        await notify(tf("{0}失败", [title]), maskAccountText(result.message), "failed");
+        return false;
+      }
+      if (!silent) await notify(title, maskAccountText(result.message), "ok");
+      return true;
+    } catch (error) {
+      await notify(t("调用失败"), maskAccountText(String(error)), "failed");
+      return false;
+    } finally {
+      if (!options.background) setBusy(null);
+    }
+  };
+}
 
 /** 品牌图标随应用打包，来源和许可见 assets/agents/LICENSE.txt。 */
 export const AGENT_ICONS: Record<string, string> = {
@@ -46,19 +91,20 @@ export function avatarOf(name: string): string {
   return providerAvatarText(name, "P");
 }
 
-/** 已知厂商用打包的图标（按名字、再按地址识别），其它供应商用按名字固定配色的字母头像。 */
+/** 已知厂商用打包的图标（按名字、再按地址识别），其它供应商用按名字固定配色的字母头像。
+ * 悬停提示里的名字打码（订阅账号名里带邮箱 / 用户名）。 */
 export function Avatar({ name, baseUrl = "", size = "md", plain = false }: { name: string; baseUrl?: string; size?: "sm" | "md" | "lg"; plain?: boolean }) {
   const key = plain ? null : brandIconKey(name, baseUrl);
   const url = key ? BRAND_ICON_URLS[key] : undefined;
   if (key && url) {
     return (
-      <span className="gw-avatar gw-avatar-brand" data-size={size} title={name}>
+      <span className="gw-avatar gw-avatar-brand" data-size={size} title={maskAccountName(name)}>
         {brandIconIsColor(key) ? <img alt="" src={url} /> : <i className="gw-mono-icon" style={{ "--gw-icon": `url("${url}")` } as CSSProperties} />}
       </span>
     );
   }
   return (
-    <span className="gw-avatar" data-size={size} style={{ "--gw-hue": hueOf(name) } as CSSProperties} title={name}>
+    <span className="gw-avatar" data-size={size} style={{ "--gw-hue": hueOf(name) } as CSSProperties} title={maskAccountName(name)}>
       {avatarOf(name)}
     </span>
   );

@@ -1,6 +1,6 @@
 /** 供应商的模型列表：手动增删、设默认模型，或用存下的凭据从上游刷新（订阅账号也能刷）。
  * 刷新只列出新增 / 已下架的模型，由用户决定加不加、删不删，保存后才写回。 */
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { Plus, RefreshCw, Star, X } from "lucide-react";
@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { t, tf } from "./i18n";
 import { maskAccountName, splitModels, type GatewayPoolEntry } from "./gateway-model";
 import { Avatar } from "./gateway-ui";
+import { useEscapeLayer } from "./use-escape-layer";
 import "./ProviderFormDialog.css";
 
 /** 后端 `ModelDiff`，随状态一起摊平在结果里。 */
@@ -37,13 +38,7 @@ export function ProviderModelsDialog({
   const pending = added.filter((model) => !models.some((item) => same(item, model)));
   const goneHere = gone.filter((model) => models.some((item) => same(item, model)));
 
-  useEffect(() => {
-    const escape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onCancel();
-    };
-    document.addEventListener("keydown", escape);
-    return () => document.removeEventListener("keydown", escape);
-  }, [onCancel]);
+  useEscapeLayer(true, onCancel);
 
   const add = (list: string[]) => setModels((previous) => [...previous, ...list.filter((model) => !previous.some((item) => same(item, model)))]);
   const remove = (model: string) => setModels((previous) => previous.filter((item) => item !== model));

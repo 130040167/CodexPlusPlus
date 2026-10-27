@@ -22,6 +22,7 @@ import {
   maskAccountName,
 } from "./gateway-model";
 import { AppSelect } from "./AppSelect";
+import { useEscapeLayer } from "./use-escape-layer";
 import { AGENT_ICONS, Avatar, Switch, avatarOf, loadFavorites, saveFavorites, type Notify, type Run, AgentIcon } from "./gateway-ui";
 
 export function AgentsView({
@@ -84,14 +85,8 @@ export function AgentConnectDialog({
   onManage: () => void;
   onClose: () => void;
 }) {
-  useEffect(() => {
-    const escape = (event: KeyboardEvent) => {
-      // 下拉开着时 Esc 先关下拉。
-      if (event.key === "Escape" && !document.querySelector(".gw-portal.gw-popover")) onClose();
-    };
-    window.addEventListener("keydown", escape);
-    return () => window.removeEventListener("keydown", escape);
-  }, [onClose]);
+  // Esc 栈：里面的下拉、确认框开着时 Esc 先关它们，不会连带关掉这个弹窗。
+  useEscapeLayer(true, onClose);
   return (
     <div className="gw-modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <div aria-label={t("接入 Agent")} className="gw-modal gw-agent-modal" role="dialog">
@@ -475,16 +470,11 @@ export function Floating({
       const node = event.target as Node;
       if (!anchorRef.current?.contains(node) && !panelRef.current?.contains(node)) onClose();
     };
-    const escape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
     document.addEventListener("mousedown", close);
-    document.addEventListener("keydown", escape);
-    return () => {
-      document.removeEventListener("mousedown", close);
-      document.removeEventListener("keydown", escape);
-    };
+    return () => document.removeEventListener("mousedown", close);
   }, [open, onClose, anchorRef]);
+  // Esc 只关这个浮层（它总在外面的弹窗之后打开，位于 Esc 栈顶）。
+  useEscapeLayer(open, onClose);
   if (!open || !position) return null;
   return createPortal(
     <div className={`gw-popover gw-portal ${className}`} ref={panelRef} style={position}>
@@ -535,7 +525,10 @@ export function ModelList({
   };
   const isSelected = (item: PickerItem) => Boolean(selectedModel) && item.model.toLowerCase() === selectedModel.toLowerCase();
 
-  const filters = pickerSections(payload, "", avatarOf, exclude, skipGroup).filter((section) => section.key !== "custom");
+  const filters = useMemo(
+    () => pickerSections(payload, "", avatarOf, exclude, skipGroup).filter((section) => section.key !== "custom"),
+    [payload, exclude, skipGroup],
+  );
   const total = sections.reduce((sum, section) => sum + section.items.length, 0);
 
   // 排版：搜索 + 一排横向筛选在上；列表每个模型两行（模型名 / 供应商）；「默认」「断开」这类操作在底部。

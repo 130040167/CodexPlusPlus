@@ -1096,6 +1096,13 @@ export const EN_PLAIN: Record<string, string> = {
   "网关里没有 Codex 的接入记录（可能降级后又升级过，或网关状态文件损坏），请求可能连不上。点「切回直连」切回接入前或列表里第一个直连供应商。": "The gateway has no connection record for Codex (perhaps after a downgrade and upgrade, or a damaged gateway state file), so requests may fail. Use Switch back to direct to return to the provider used before, or the first direct provider in the list.",
   "切回直连": "Switch back to direct",
   "切换中…": "Switching…",
+  "供应商都已关闭": "All providers are turned off",
+  "打开供应商池里的供应商后，这里列出每个模型会发给谁。": "Turn on providers in the pool to see which provider each model goes to.",
+  "登录中…": "Signing in…",
+  "取消登录": "Cancel sign-in",
+  "正在读取网关状态…": "Loading gateway status…",
+  "连续出错": "Repeated errors",
+  "：": ": ",
   "模型组（来自 Codex 的聚合供应商）": "Model groups (from Codex aggregate providers)",
   "全不选": "Select none",
   "全选未导入的": "Select all not imported",
@@ -2382,6 +2389,8 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "正在等待 {0} 登录，在浏览器里完成后会自动继续": "Waiting for {0} sign-in; it continues automatically once you finish in the browser",
+  "池里的 {0} 个供应商都已关闭。": "All {0} providers in the pool are turned off.",
   "{0} 个成员 · {1} · {2}，成员一起导入": "{0} members · {1} · {2}; members are imported too",
   "直连模式里有 {0} 个供应商，可以一次导入网关；之后两边各改各的。也可以登录订阅，或添加新的厂商 API、中转站。": "Direct mode has {0} providers you can import into the gateway in one go; after that the two are edited separately. You can also sign in to a subscription or add a new vendor API or relay.",
   "从直连模式导入 {0} 个": "Import {0} from direct mode",
