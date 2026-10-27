@@ -152,7 +152,10 @@ it("目录条目按别名匹配，且只用它补分组 id、不用它决定显�
   assert.match(source, /replace\(\/\^gpt\[-\\s\]\*\/iu, ""\)/);
   // 早期版本的教训：拿目录展示名去拟合行文本会把同一家切成好几段。
   assert.match(source, /const groupId = known\?\.groupId/);
-  assert.match(source, /const provider = split\.provider \|\| known\?\.provider/);
+  // 只有整行精确命中目录（含 `（后缀）` 的完整展示名）时，才用目录里的分组名做显示归属：
+  // 网关把同名模型的后几家写成 `名字（供应商 id）`，标题要显示打过码的完整账号名；别名命中仍不决定归属。
+  assert.match(source, /const provider = exactKnown\?\.provider \|\| split\.provider \|\| known\?\.provider/);
+  assert.match(source, /const exactKnown = exact\.get\(codexPlusModelPickerNormalizeLoose\(identity\.text\)\)/);
   // 组内任意一行命中默认分组即认定该组是默认（裸名行的 id 可能来自目录）。
   assert.match(source, /group\.entries\.some\(\(entry\) => entry\.groupId === defaultGroupId/);
 });

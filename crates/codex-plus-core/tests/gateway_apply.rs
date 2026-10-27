@@ -493,7 +493,12 @@ fn codex_gateway_catalog_carries_display_names_reasoning_and_provider_groups() {
         "{}/deepseek-v4-pro",
         profile_id_of(ctx, "ChatGPT Pro · 2649340134@qq.com")
     ));
-    assert_eq!(second["display_name"], "DeepSeek-V4-Pro");
+    // 同名的两行要分得开：后面那家带后缀；账号名超过注入层认的长度，用供应商 id。
+    let second_id = profile_id_of(ctx, "ChatGPT Pro · 2649340134@qq.com");
+    assert_eq!(
+        second["display_name"],
+        format!("DeepSeek-V4-Pro（{second_id}）")
+    );
     assert_eq!(second["codex_plus_group"], "ChatGPT Pro · 26****34@qq.com");
     let group = model("group/daily");
     assert_eq!(group["display_name"], "Daily");

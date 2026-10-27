@@ -1191,7 +1191,7 @@ export const EN_PLAIN: Record<string, string> = {
   "每天 token": "Tokens per day",
   "输入（未命中缓存）": "Input (uncached)",
   "没有请求": "No requests",
-  "Agent 请求一个模型名时，网关从左往右依次尝试提供它的供应商：前一家出错、Key 都在冷却或被熔断，就换下一家。顺序跟着供应商池走，在池里拖动即可调整。": "When an agent asks for a model, the gateway tries the providers that serve it from left to right: if one errors, has every key cooling down or is tripped, it moves to the next. The order follows the provider pool; drag providers there to change it.",
+  "同一个模型有多家提供时，Codex 的模型列表里每家单独列一份，选了哪家就只发给哪家；其它 Agent 写成「供应商 id/模型名」也一样。选不带供应商的模型名时，网关按下面从左往右的顺序依次尝试：前一家出错、Key 都在冷却或被熔断，就换下一家。顺序跟着供应商池走，在池里拖动即可调整。": "When several providers offer the same model, Codex lists each one separately and picking one sends requests only to that provider; other agents can write “provider id/model” for the same effect. When you pick the plain model name, the gateway tries the providers below from left to right: if one errors, has every key cooling down or is tripped, it moves to the next. The order follows the provider pool; drag providers there to change it.",
   "搜索模型或供应商": "Search models or providers",
   "供应商池里还没有模型": "No models in the provider pool yet",
   "在「供应商池」添加并打开供应商后，这里列出每个模型会发给谁。": "Add and enable providers in the provider pool to see where each model goes.",

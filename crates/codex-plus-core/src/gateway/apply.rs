@@ -328,6 +328,9 @@ pub fn codex_gateway_profile(
     Ok(profile)
 }
 
+/// Codex 模型选择器的注入层能从显示名尾部 `（…）` 认出的供应商名最长多少字（见 71-model-picker-groups.js）。
+const CODEX_GROUP_SUFFIX_MAX: usize = 24;
+
 /// 模型组在 Codex 模型选择器里的分组身份。
 const CODEX_GROUPS_GROUP_ID: &str = "codex-plus-gateway-groups";
 
@@ -395,6 +398,19 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
             relay.id.clone()
         } else {
             crate::gateway::accounts::mask_account_name(relay.name.trim())
+        };
+        // 多家都有的模型，后面几家的那一份显示名带 `（供应商）` 后缀：选择器按整行文字认分组，
+        // 同名的两行不加后缀就分不开（与直连模式按模型聚合的写法一致，注入层会去掉后缀再显示）。
+        // 注入层只认 24 个字以内的后缀，账号名太长时用供应商 id。
+        let display = if upstream == model {
+            display
+        } else {
+            let suffix = if group.chars().count() <= CODEX_GROUP_SUFFIX_MAX {
+                group.clone()
+            } else {
+                relay.id.clone()
+            };
+            format!("{display}（{suffix}）")
         };
         fields.insert("display_name".into(), json!(display));
         fields.insert("description".into(), json!(format!("{upstream} · {group}")));
