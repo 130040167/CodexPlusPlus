@@ -25,6 +25,7 @@ import {
   Blocks,
   Cable,
   BookOpen,
+  Check,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
@@ -4868,8 +4869,8 @@ function ModelReasoningLevelsCell({
                 role="option"
                 type="button"
               >
-                {selected ? <CheckCircle2 className="h-4 w-4" /> : <span className="app-select-option-spacer" />}
-                <span>{level}</span>
+                <span className="app-select-option-label">{level}</span>
+                {selected ? <Check aria-hidden className="app-select-check" /> : null}
               </button>
             );
           })}

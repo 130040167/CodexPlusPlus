@@ -3461,52 +3461,41 @@ body:has(.gw-modal-backdrop) .app-select-menu-portal {
   height: 20px;
 }
 
-/* 格子：有就一个实心点，点里可以放「自动」的先后；下面一行小字是平均首包耗时。 */
+/* 格子：有这个模型就放这家的图标；外圈颜色是状态，变淡是有 Agent 不用这家；下面一行小字是平均首包耗时。 */
 .shell .gw-matrix-cell,
 .shell .gw-models-legend .gw-matrix-cell {
   display: inline-flex;
   flex-direction: column;
   align-items: center;
-  gap: 2px;
+  gap: 3px;
 }
 
-.shell .gw-matrix-cell i {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  background: hsl(var(--primary) / 0.85);
-  color: hsl(var(--primary-foreground));
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  font-style: normal;
-  font-weight: 700;
+/* 不让图标自己的 title 盖掉格子的状态提示。 */
+.shell .gw-matrix-cell .gw-avatar {
+  width: 22px;
+  height: 22px;
+  pointer-events: none;
+  border-radius: 7px;
+  box-shadow: 0 0 0 2px transparent;
 }
 
-.shell .gw-matrix-cell[data-state="answered"] i {
-  background: var(--gw-ok);
+.shell .gw-matrix-cell[data-state="answered"] .gw-avatar {
+  box-shadow: 0 0 0 2px var(--gw-ok);
 }
 
-.shell .gw-matrix-cell[data-state="cooling"] i {
-  background: var(--gw-warn);
+.shell .gw-matrix-cell[data-state="cooling"] .gw-avatar {
+  box-shadow: 0 0 0 2px var(--gw-warn);
 }
 
-.shell .gw-matrix-cell[data-excluded="true"] i {
-  border: 1.5px dashed hsl(var(--primary));
-  background: transparent;
-  color: hsl(var(--primary));
+.shell .gw-matrix-cell[data-excluded="true"] .gw-avatar {
+  opacity: 0.35;
+  filter: grayscale(1);
 }
 
 .shell .gw-matrix-cell small {
   color: var(--gw-mute);
   font-family: var(--font-mono);
   font-size: 10px;
-}
-
-.shell .gw-matrix-none {
-  color: hsl(var(--muted-foreground) / 0.35);
 }
 
 .shell .gw-models-legend {
@@ -3524,9 +3513,26 @@ body:has(.gw-modal-backdrop) .app-select-menu-portal {
   gap: 6px;
 }
 
+/* 图例用小方块示意外圈与变淡。 */
 .shell .gw-models-legend .gw-matrix-cell i {
+  display: inline-block;
   width: 12px;
   height: 12px;
+  border-radius: 4px;
+  background: var(--gw-soft);
+}
+
+.shell .gw-models-legend .gw-matrix-cell[data-state="answered"] i {
+  box-shadow: 0 0 0 2px var(--gw-ok);
+}
+
+.shell .gw-models-legend .gw-matrix-cell[data-state="cooling"] i {
+  box-shadow: 0 0 0 2px var(--gw-warn);
+}
+
+.shell .gw-models-legend .gw-matrix-cell[data-excluded="true"] i {
+  background: hsl(var(--muted-foreground) / 0.35);
+  opacity: 0.5;
 }
 
 @media (max-width: 760px) {

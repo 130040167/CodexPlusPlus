@@ -106,7 +106,7 @@ export function ModelMatrix({ payload, onOpenProvider }: { payload: GatewayPaylo
                       </th>
                       {providers.map((entry) => {
                         const index = row.providers.findIndex((provider) => provider.id === entry.id);
-                        if (index < 0) return <td key={entry.id}><span className="gw-matrix-none" aria-label={t("不提供")}>·</span></td>;
+                        if (index < 0) return <td aria-label={t("不提供")} key={entry.id} />;
                         const provider = row.providers[index];
                         const status = dispatchStatus(payload, provider.id, row.model);
                         const speed = speedOf(payload, provider.id, row.model);
@@ -115,7 +115,7 @@ export function ModelMatrix({ payload, onOpenProvider }: { payload: GatewayPaylo
                         return (
                           <td key={entry.id} title={tips}>
                             <span className="gw-matrix-cell" data-excluded={provider.excludedBy.length > 0} data-state={status?.state ?? "idle"}>
-                              <i />
+                              <Avatar baseUrl={entry.baseUrl} name={entry.name} size="sm" />
                               {speed !== null ? <small>{formatElapsed(speed)}</small> : null}
                             </span>
                           </td>
@@ -136,7 +136,7 @@ export function ModelMatrix({ payload, onOpenProvider }: { payload: GatewayPaylo
         {payload && rows.length > 0 && matched.length === 0 ? <p className="gw-dispatch-none">{t("没有匹配的模型")}</p> : null}
       </div>
       <p className="gw-models-legend">
-        <span><span className="gw-matrix-cell" data-state="idle"><i /></span>{t("提供")}</span>
+        {/* 格子里放的是这家的图标，图例只讲外圈和变淡是什么意思。 */}
         <span><span className="gw-matrix-cell" data-state="answered"><i /></span>{t("刚用过")}</span>
         <span><span className="gw-matrix-cell" data-state="cooling"><i /></span>{t("冷却或熔断中")}</span>
         <span><span className="gw-matrix-cell" data-excluded="true" data-state="idle"><i /></span>{t("有 Agent 不用这家")}</span>

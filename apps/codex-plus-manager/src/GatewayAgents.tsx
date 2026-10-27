@@ -298,18 +298,17 @@ function AgentDetail({
 
   return (
     <div className="gw-agent-detail">
-      <div className="gw-detail-row">
-        <span className="gw-detail-label">{tf("在 {0} 里", [agent.name])}</span>
-        <div className="gw-detail-value">
-          {isClaude ? (
+      {/* 只有 Claude Code 的档位切换需要说明；其它 Agent 在自己的模型列表里直接选，不用再讲一遍。 */}
+      {isClaude ? (
+        <div className="gw-detail-row">
+          <span className="gw-detail-label">{tf("在 {0} 里", [agent.name])}</span>
+          <div className="gw-detail-value">
             <span>{t("在 Claude Code 的")} <code className="gw-code">/model</code> {t("里切换 opus · sonnet · haiku 档，各档用的模型在下面设置。")}</span>
-          ) : (
-            <span>{tf("在 {0} 的模型列表里选任何一个模型。", [agent.name])}</span>
-          )}
+          </div>
         </div>
-      </div>
+      ) : null}
       <div className="gw-detail-row">
-        <span className="gw-detail-label">{t("模型列表")}</span>
+        <span className="gw-detail-label">{t("用哪些供应商")}</span>
         <div className="gw-detail-value gw-chip-row">
           {used.map((entry) => (
             <span className="gw-model-chip" key={entry.id}>
@@ -379,6 +378,7 @@ function AgentDetail({
             <AppSelect
               disabled={busy !== null}
               label={t("未知模型名")}
+              menuWidth={240}
               onChange={(next) => onSave({ ...draft, unknownModel: next as BindingDraft["unknownModel"] })}
               options={[
                 { value: "mapToDefault", label: t("改写成默认模型"), hint: t("池里没有的模型名换成主模型") },
