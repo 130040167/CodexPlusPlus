@@ -42,7 +42,7 @@ export function useGatewayPayload(intervalMs: number): GatewayPayload | null {
 }
 
 /** 网关各页之间跳转时带的落地位置：跳过去的页面读一次就清掉。 */
-export const gatewayJump: { provider: string | null; modelsTab: "models" | "groups" | null } = { provider: null, modelsTab: null };
+export const gatewayJump: { provider: string | null } = { provider: null };
 
 /** 网关页里的跳转入口（只在网关页里有；总览、托盘里的模型下拉拿不到就不显示对应链接）。 */
 export const GatewayNavContext = createContext<{ openModelGroups?: () => void }>({});

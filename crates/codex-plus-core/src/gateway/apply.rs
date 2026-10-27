@@ -20,8 +20,9 @@ use serde_json::{Map, Value, json};
 use crate::gateway::restore::{self as stash, ChangedKey, FileStash, KeyPath};
 use crate::gateway::route::{self, binding_default_model};
 use crate::gateway::store::{
-    AgentBinding, GROUP_MODEL_PREFIX, GatewayGroup, GatewayProvider, GatewaySettings, GatewayStore,
-    GroupMember, GroupMode, GroupSticky, ProviderPrice, new_client_token,
+    AgentBinding, AutoGroupSettings, GROUP_MODEL_PREFIX, GatewayGroup, GatewayProvider,
+    GatewaySettings, GatewayStore, GroupMember, GroupMode, GroupSticky, ProviderPrice,
+    new_client_token,
 };
 use crate::settings::{
     BackendSettings, RelayApiKey, RelayMode, RelayProfile, RelayProtocol, SettingsStore,
@@ -407,7 +408,7 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
                 "description".into(),
                 json!(format!("{model} · {providers} 家按顺序自动切换")),
             );
-            fields.insert("codex_plus_group".into(), json!("多家自动切换"));
+            fields.insert("codex_plus_group".into(), json!("自动组"));
             fields.insert("codex_plus_group_id".into(), json!(CODEX_AUTO_GROUP_ID));
             if codex_favorite(gateway, &relays, &model) {
                 fields.insert("codex_plus_favorite".into(), json!(true));
@@ -1850,6 +1851,7 @@ pub fn import_codex_aggregate(
                 mode,
                 sticky,
                 members,
+                ..GroupInput::default()
             },
         )
     })();
@@ -1882,7 +1884,7 @@ pub fn copy_codex_provider(
         .with_context(|| format!("Codex 供应商不存在：{relay_id}"))?;
     if relay.relay_mode == RelayMode::Aggregate {
         bail!(
-            "「{}」是聚合供应商，网关的模型组请在「模型」页里新建",
+            "「{}」是聚合供应商，网关的组请在「路由」页里新建",
             relay.name
         );
     }
@@ -2255,6 +2257,12 @@ pub struct GroupInput {
     pub sticky: GroupSticky,
     #[serde(default)]
     pub members: Vec<GroupMember>,
+    /// 隐藏成员：组里的模型不再单独出现在 Agent 的模型列表里。
+    #[serde(default)]
+    pub hide_members: bool,
+    /// 手动模式下选中的成员。
+    #[serde(default)]
+    pub pick: String,
 }
 
 /// 保存模型组。成员去空、去重；不能直接包含自己。返回组 id。
@@ -2298,6 +2306,8 @@ fn save_group_in(gateway: &mut GatewaySettings, input: &GroupInput) -> anyhow::R
         mode: input.mode,
         sticky: input.sticky,
         members,
+        hide_members: input.hide_members,
+        pick: input.pick.trim().to_string(),
         extra: Default::default(),
     };
     match gateway.groups.iter_mut().find(|known| known.id == id) {
@@ -2309,6 +2319,29 @@ fn save_group_in(gateway: &mut GatewaySettings, input: &GroupInput) -> anyhow::R
         None => gateway.groups.push(group),
     }
     Ok(id)
+}
+
+/// 保存自动组的设置（键是模型名，不分大小写）。和默认一样时删掉记录，自动组回到「没改过」。
+pub fn save_auto_group(
+    store: &GatewayStore,
+    model: &str,
+    settings: AutoGroupSettings,
+) -> anyhow::Result<GatewaySettings> {
+    let key = model.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        bail!("没有指定自动组的模型");
+    }
+    let (gateway, _) = store.update(|gateway| {
+        let mut settings = settings;
+        settings.pick = settings.pick.trim().to_string();
+        if settings == AutoGroupSettings::default() {
+            gateway.auto_groups.remove(&key);
+        } else {
+            gateway.auto_groups.insert(key.clone(), settings);
+        }
+        Ok(())
+    })?;
+    Ok(gateway)
 }
 
 /// 删除模型组：其它组里引用它的成员一并去掉。

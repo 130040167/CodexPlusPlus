@@ -40,6 +40,7 @@ import { ProviderFormDialog, type ProviderFormState } from "./ProviderFormDialog
 import { ProviderExtrasDialog, priceSummary } from "./ProviderExtrasDialog";
 import { ProviderModelsDialog } from "./ProviderModelsDialog";
 import { gatewayJump } from "./gateway-store";
+import { ModelMatrix } from "./GatewayModelMatrix";
 import { useEscapeLayer } from "./use-escape-layer";
 
 /** 能在网关里直接登录的订阅。 */
@@ -58,6 +59,9 @@ const BROWSER_LOGIN_COMMANDS: Record<Exclude<AccountKind, "copilot">, string> = 
 /** 表单弹窗的用途：按预设新建、自定义新建、编辑已有供应商。 */
 type FormState = ProviderFormState;
 
+/** 供应商池上次用的视图（切页再回来保持）。 */
+const providersViewMemo: { view: "list" | "models" } = { view: "list" };
+
 export function ProvidersView({
   payload,
   busy,
@@ -71,7 +75,7 @@ export function ProvidersView({
 }) {
   const pool = payload?.pool ?? [];
   const [query, setQuery] = useState("");
-  // 从「模型」页点列头跳过来：展开那一家并滚到它。读完就清掉。
+  // 从别的页跳过来指定了供应商：展开那一家并滚到它。读完就清掉。
   const [expanded, setExpanded] = useState<string | null>(() => {
     const jumped = gatewayJump.provider;
     gatewayJump.provider = null;
@@ -85,6 +89,12 @@ export function ProvidersView({
   }, []);
   const [adding, setAdding] = useState<false | "catalog" | "import">(false);
   const pendingImports = pendingImportCount(payload);
+  // 「按供应商」是原来的列表；「按模型」是供应商 × 模型矩阵，看每个模型由哪几家提供。
+  const [view, setViewState] = useState<"list" | "models">(providersViewMemo.view);
+  const setView = (next: "list" | "models") => {
+    providersViewMemo.view = next;
+    setViewState(next);
+  };
   const [dragging, setDragging] = useState<string | null>(null);
   // 编辑已有供应商的表单；新添加走 ProviderAdder。
   const [form, setForm] = useState<FormState | null>(null);
@@ -150,10 +160,18 @@ export function ProvidersView({
   return (
     <>
       <div className="gw-provider-search-row">
-        <label className="gw-sheet-search">
-          <Search className="h-4 w-4" />
-          <input onChange={(event) => setQuery(event.currentTarget.value)} placeholder={t("查找供应商")} value={query} />
-        </label>
+        {pool.length ? (
+          <div className="gw-models-tabs" role="tablist" aria-label={t("视图")}>
+            <button aria-selected={view === "list"} data-active={view === "list"} onClick={() => setView("list")} role="tab" type="button">{t("按供应商")}</button>
+            <button aria-selected={view === "models"} data-active={view === "models"} onClick={() => setView("models")} role="tab" type="button">{t("按模型")}</button>
+          </div>
+        ) : null}
+        {view === "list" ? (
+          <label className="gw-sheet-search">
+            <Search className="h-4 w-4" />
+            <input onChange={(event) => setQuery(event.currentTarget.value)} placeholder={t("查找供应商")} value={query} />
+          </label>
+        ) : <span className="gw-provider-search-gap" />}
         {pool.length ? (
           <button className="gw-primary-button" onClick={openCatalog} type="button">
             <Plus className="h-4 w-4" />
@@ -161,7 +179,18 @@ export function ProvidersView({
           </button>
         ) : null}
       </div>
-      {pool.length ? (
+      {pool.length && view === "models" ? (
+        <ModelMatrix
+          onOpenProvider={(id) => {
+            // 点列头：回到按供应商的列表，展开并滚到那一家。
+            setView("list");
+            setExpanded(id);
+            window.requestAnimationFrame(() => document.querySelector(`[data-pool-id="${CSS.escape(id)}"]`)?.scrollIntoView({ block: "center" }));
+          }}
+          payload={payload}
+        />
+      ) : null}
+      {pool.length && view === "list" ? (
         <div className="gw-card gw-pool-card" ref={listRef}>
           {visible.map((entry) => (
             <PoolRow

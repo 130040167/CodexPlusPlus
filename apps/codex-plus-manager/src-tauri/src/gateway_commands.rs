@@ -69,6 +69,16 @@ pub struct GatewayAgentView {
     pub drift: Option<codex_plus_core::gateway::drift::Drift>,
 }
 
+/// 界面上的自动组：组本身 + 是否隐藏 + 有没有改过设置。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoGroupView {
+    #[serde(flatten)]
+    pub group: GatewayGroup,
+    pub hidden: bool,
+    pub customized: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewaySourceEntry {
@@ -85,11 +95,13 @@ pub struct GatewayPayload {
     pub helper_running: bool,
     pub pool: Vec<GatewayPoolEntry>,
     pub groups: Vec<GatewayGroup>,
+    /// 自动组：池里多家都有的模型各一个（含已隐藏的）。
+    pub auto_groups: Vec<AutoGroupView>,
     pub agents: Vec<GatewayAgentView>,
     pub health: PoolSnapshot,
     /// 路由动态：各 Agent 最近一次请求怎么走的、计数、正在回答的上游。
     pub activity: ActivitySnapshot,
-    /// 各（供应商, 模型）最近的平均首包耗时，「模型」页和「速度优先」用。
+    /// 各（供应商, 模型）最近的平均首包耗时，「路由」页、供应商池「按模型」和「速度优先」用。
     pub speeds: Vec<codex_plus_core::gateway::speed::SpeedView>,
     /// 可复制进网关的直连模式供应商。
     pub codex_providers: Vec<GatewayPoolEntry>,
@@ -260,6 +272,20 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
         })
         .unwrap_or_default();
     let groups = gateway.groups.clone();
+    let auto_groups = codex_plus_core::gateway::route::auto_groups(&gateway)
+        .into_iter()
+        .map(|group| {
+            let key = group.name.to_ascii_lowercase();
+            AutoGroupView {
+                hidden: gateway
+                    .auto_groups
+                    .get(&key)
+                    .is_some_and(|settings| settings.hidden),
+                customized: gateway.auto_groups.contains_key(&key),
+                group,
+            }
+        })
+        .collect();
     let mut gateway = gateway;
     gateway.providers.clear();
     GatewayPayload {
@@ -268,6 +294,7 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
         helper_running: codex_plus_core::resident_helper::resident_helper_port().is_some(),
         pool,
         groups,
+        auto_groups,
         agents,
         health: key_pool::snapshot(std::time::Instant::now()),
         activity: activity::snapshot(),
@@ -444,6 +471,23 @@ pub fn save_gateway_auto_models(enabled: bool) -> CommandResult<Option<GatewayPa
         "网关选项已保存。",
         "保存网关选项失败",
         refresh_agents(result),
+    )
+}
+
+/// 自动组卡片上的设置（模式、会话固定、隐藏成员、手动选中的成员、隐藏整个自动组）。和默认一样时记录会被删掉。
+#[tauri::command]
+pub fn save_gateway_auto_group(
+    model: String,
+    settings: codex_plus_core::gateway::store::AutoGroupSettings,
+) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "自动组已保存。",
+        "保存自动组失败",
+        refresh_agents(apply::save_auto_group(
+            &GatewayStore::default(),
+            &model,
+            settings,
+        )),
     )
 }
 

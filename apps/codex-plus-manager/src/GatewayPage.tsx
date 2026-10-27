@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { appConfirm } from "./app-dialog";
-import { AlertTriangle, Asterisk, ChevronDown, ChevronRight, ChevronUp, Plus, RefreshCw, Search, Waypoints, X } from "lucide-react";
+import { AlertTriangle, Asterisk, ChevronDown, ChevronRight, ChevronUp, Plus, RefreshCw, Search, Shuffle, Waypoints, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { t, tf } from "./i18n";
@@ -35,15 +35,18 @@ import {
   maskAccountName,
   type DispatchRow,
   type MemberStatus,
+  memberTarget,
+  type AutoGroupEntry,
 } from "./gateway-model";
 import { AgentsView, Floating, ModelList } from "./GatewayAgents";
 import { AppSelect } from "./AppSelect";
 import { ProvidersView } from "./GatewayProviders";
 import { SessionsView } from "./GatewaySessions";
 import { UsageView } from "./GatewayUsage";
-import { Avatar, MemberStatusLabel, SectionLabel, Switch, makeRun, type Notify, type Run } from "./gateway-ui";
+import { Avatar, MemberStatusLabel, QuotaBadge, SectionLabel, Switch, makeRun, type Notify, type Run } from "./gateway-ui";
+import { shortProviderName } from "./GatewayModelMatrix";
 import { TopbarActions } from "./TopbarActions";
-import { GatewayNavContext, gatewayJump } from "./gateway-store";
+import { GatewayNavContext } from "./gateway-store";
 import { useEscapeLayer } from "./use-escape-layer";
 import { publishGatewayPayload } from "./gateway-store";
 import "./GatewayPage.css";
@@ -56,7 +59,7 @@ const memo: { payload: GatewayPayload | null; tab: Tab } = { payload: null, tab:
 /** 组编辑器的模型选择不排除任何供应商；模块级常量，避免每次渲染都换新数组让列表重算。 */
 const NO_EXCLUDE: string[] = [];
 
-/** 「模型」页刷新供应商状态的间隔。 */
+/** 路由页刷新供应商状态的间隔。 */
 const LIVE_REFRESH_MS = 2500;
 
 function hasPayload(result: GatewayResult): result is GatewayResult & GatewayPayload {
@@ -141,7 +144,7 @@ export function GatewayPage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 「模型」页定时刷新供应商状态：静默读取，不占用 busy，也不弹错误。
+  // 路由页定时刷新供应商状态：静默读取，不占用 busy，也不弹错误。
   useEffect(() => {
     if (tab !== "routing") return;
     let cancelled = false;
@@ -162,24 +165,15 @@ export function GatewayPage({
   // 按数据流排：供应商 → 模型 → Agent。
   const tabs: Array<{ id: Tab; label: string }> = [
     { id: "providers", label: t("供应商") },
-    { id: "routing", label: t("模型") },
+    { id: "routing", label: t("路由") },
     { id: "agents", label: t("智能体") },
     { id: "sessions", label: t("会话") },
     { id: "usage", label: t("用量") },
     { id: "gateway", label: t("网关") },
   ];
 
-  // 跨页跳转：「模型」页列头 → 供应商池里展开这一家；模型下拉的「模型组」→「模型」页的模型组页签。
-  const openProvider = (id: string) => {
-    gatewayJump.provider = id;
-    setTab("providers");
-  };
-  const nav = {
-    openModelGroups: () => {
-      gatewayJump.modelsTab = "groups";
-      setTab("routing");
-    },
-  };
+  // 模型下拉里「我的组」旁的「管理」→ 路由页。
+  const nav = { openModelGroups: () => setTab("routing") };
 
   const refreshButton = (
     <button aria-label={t("刷新")} className="gw-icon-button" disabled={busy !== null} onClick={() => void refresh(false)} title={t("刷新")} type="button">
@@ -216,7 +210,7 @@ export function GatewayPage({
         {tab === "agents" ? <AgentsView busy={busy} notify={notify} onManage={() => setTab("providers")} payload={payload} run={run} /> : null}
         {tab === "sessions" ? <SessionsView notify={notify} /> : null}
         {tab === "providers" ? <ProvidersView busy={busy} notify={notify} payload={payload} run={run} /> : null}
-        {tab === "routing" ? <RoutingView busy={busy} onManage={() => setTab("providers")} onOpenProvider={openProvider} payload={payload} run={run} /> : null}
+        {tab === "routing" ? <RoutingView busy={busy} payload={payload} run={run} /> : null}
         {tab === "usage" ? <UsageView busy={busy} notify={notify} payload={payload} run={run} /> : null}
         {tab === "gateway" ? <GatewayView busy={busy} payload={payload} run={run} /> : null}
         {tab === "gateway" && extraSettings ? extraSettings : null}
@@ -226,105 +220,150 @@ export function GatewayPage({
   );
 }
 
-/* —————————————————————— 模型 —————————————————————— */
+/* —————————————————————— 路由 —————————————————————— */
 
-/** 模型矩阵默认显示的行数，搜索、筛选或展开后显示全部。 */
-const MATRIX_PREVIEW = 30;
+/** 卡片上路由方式的选项（顺序与组编辑器一致）。 */
+const MODE_OPTIONS: GroupMode[] = ["inOrder", "rotate", "weighted", "usage", "fast", "manual"];
+const STICKY_OPTIONS: GroupSticky[] = ["cache", "session", "off"];
 
-type ModelsTab = "models" | "groups";
-type MatrixFilter = "all" | "shared" | `provider:${string}`;
-
-const modelsMemo: { tab: ModelsTab } = { tab: "models" };
-
-/** 「模型」页：网关里能用的模型（供应商 × 模型矩阵）和模型组，两个页签。 */
-function RoutingView({ payload, busy, run, onManage, onOpenProvider }: { payload: GatewayPayload | null; busy: string | null; run: Run; onManage: () => void; onOpenProvider: (id: string) => void }) {
-  const [tab, setTabState] = useState<ModelsTab>(() => {
-    // 从别的页跳过来指定了页签（如模型下拉里的「管理模型组」）：用它，读完清掉。
-    const jumped = gatewayJump.modelsTab;
-    gatewayJump.modelsTab = null;
-    if (jumped) modelsMemo.tab = jumped;
-    return modelsMemo.tab;
-  });
-  const setTab = (next: ModelsTab) => {
-    modelsMemo.tab = next;
-    setTabState(next);
-  };
-  const rows = useMemo(() => modelDispatch(payload), [payload]);
-  const groups = payload?.groups ?? [];
-  return (
-    <>
-      <div className="gw-models-tabs" role="tablist" aria-label={t("模型")}>
-        <button aria-selected={tab === "models"} data-active={tab === "models"} onClick={() => setTab("models")} role="tab" type="button">
-          {t("模型")}<em>{payload ? rows.length : "…"}</em>
-        </button>
-        <button aria-selected={tab === "groups"} data-active={tab === "groups"} onClick={() => setTab("groups")} role="tab" type="button">
-          {t("模型组")}<em>{payload ? groups.length : "…"}</em>
-        </button>
-      </div>
-      {tab === "models" ? <ModelMatrix busy={busy} onManage={onManage} onOpenProvider={onOpenProvider} payload={payload} rows={rows} run={run} /> : <GroupsPanel busy={busy} payload={payload} run={run} />}
-    </>
-  );
-}
-
-/** 模型组页签：列表 + 新建 / 编辑 / 删除。 */
-function GroupsPanel({ payload, busy, run }: { payload: GatewayPayload | null; busy: string | null; run: Run }) {
+/** 路由页：你建的组和自动组，每张卡片上直接改路由方式、会话固定、隐藏成员，手动模式下点成员锁定。 */
+function RoutingView({ payload, busy, run }: { payload: GatewayPayload | null; busy: string | null; run: Run }) {
   const [editing, setEditing] = useState<GatewayGroupEntry | "new" | null>(null);
-  const remove = async (group: GatewayGroupEntry) => {
-    const ok = await appConfirm(tf("删除模型组「{0}」？引用它的其它组会去掉这个成员。", [group.name]), { title: t("删除模型组"), confirmText: t("删除"), danger: true });
-    if (ok) await run(`group:${group.id}`, "delete_gateway_group", { id: group.id }, t("删除模型组"));
+  const [query, setQuery] = useState("");
+  const [showHidden, setShowHidden] = useState(false);
+  const autoOn = payload?.gateway.autoModels !== false;
+  const needle = query.trim().toLowerCase();
+  const hit = (group: GatewayGroupEntry) =>
+    !needle || group.name.toLowerCase().includes(needle) || group.members.some((member) => member.model.toLowerCase().includes(needle));
+  const mine = (payload?.groups ?? []).filter(hit);
+  const autos = (payload?.autoGroups ?? []).filter(hit);
+  const visibleAutos = autos.filter((group) => !group.hidden);
+  const hiddenAutos = autos.filter((group) => group.hidden);
+
+  const saveMine = (group: GatewayGroupEntry, patch: Partial<GatewayGroupEntry>) => {
+    const next = { ...group, ...patch };
+    void run(`group:${group.id}`, "save_gateway_group", {
+      group: { id: next.id, name: next.name, mode: next.mode, sticky: next.sticky ?? "cache", members: next.members, hideMembers: next.hideMembers ?? false, pick: next.pick ?? "" },
+    }, t("保存组"), true);
   };
+  const saveAuto = (group: AutoGroupEntry, patch: Partial<AutoGroupEntry>) => {
+    const next = { ...group, ...patch };
+    void run(`auto:${group.id}`, "save_gateway_auto_group", {
+      model: group.name,
+      settings: { mode: next.mode, sticky: next.sticky ?? "cache", hidden: next.hidden, hideMembers: next.hideMembers ?? false, pick: next.pick ?? "" },
+    }, t("保存自动组"), true);
+  };
+  const remove = async (group: GatewayGroupEntry) => {
+    const ok = await appConfirm(tf("删除组「{0}」？引用它的其它组会去掉这个成员。", [group.name]), { title: t("删除组"), confirmText: t("删除"), danger: true });
+    if (ok) await run(`group:${group.id}`, "delete_gateway_group", { id: group.id }, t("删除组"));
+  };
+
   return (
     <>
       <div className="gw-models-toolbar">
-        <p className="gw-models-hint">{t("把几个模型编成一组，Agent 在模型列表里把它当一个模型来选：按顺序、轮换、按权重、额度或速度回答，组里也可以再放组。")}</p>
+        <label className="gw-sheet-search gw-models-search">
+          <Search className="h-4 w-4" />
+          <input aria-label={t("搜索组或模型")} onChange={(event) => setQuery(event.target.value)} placeholder={t("搜索组或模型")} value={query} />
+        </label>
+        <div className="gw-models-auto" title={t("多家都有的模型自动成一个组：Agent 选不带供应商的模型名时走它。关掉后只列出你建的组，不带供应商的模型名按供应商池的顺序依次尝试。")}>
+          <span>{t("自动建组")}</span>
+          <Switch
+            disabled={busy !== null || !payload}
+            label={t("自动建组")}
+            on={autoOn}
+            onToggle={() => void run("auto-models", "save_gateway_auto_models", { enabled: !autoOn }, t("自动建组"), true)}
+          />
+        </div>
         <button className="gw-primary-button" disabled={busy !== null || !payload} onClick={() => setEditing("new")} type="button">
           <Plus className="h-4 w-4" />
-          {t("新建模型组")}
+          {t("新建组")}
         </button>
       </div>
-      <div className="gw-card">
-        {(payload?.groups ?? []).map((group) => {
-          const joiner = group.mode === "inOrder" ? " → " : " · ";
-          const icons = group.members
-            .map((member) => modelDisplay(payload, member.model))
-            .filter((view) => !view.group && view.sub)
-            .slice(0, 3);
-          return (
-            <div className="gw-group-row" key={group.id}>
-              <span className="gw-avatar-stack">
-                {icons.length ? icons.map((view, index) => <Avatar key={`${view.sub}-${index}`} name={view.sub} size="sm" />) : <Waypoints className="h-4 w-4" />}
-              </span>
-              <div className="gw-group-main">
-                <div>
-                  <strong>{group.name}</strong>
-                  <code className="gw-chip">{groupModelId(group.id)}</code>
-                </div>
-                <small>{group.members.length ? group.members.map((member) => memberLabel(payload, member.model)).join(joiner) : t("没有成员")}</small>
+      <p className="gw-models-hint">{t("组让 Agent 把几个模型当成一个来选：按什么方式先试哪个、同一会话要不要固定、出错换谁，都在卡片上改。")}</p>
+
+      {!payload ? <div className="gw-card gw-empty">{t("正在读取…")}</div> : null}
+
+      {payload ? (
+        <SectionLabel aside={<em>{t("Agent 里以 group/<id> 出现")}</em>}>
+          {t("我的组")}<em>{mine.length}</em>
+        </SectionLabel>
+      ) : null}
+      {payload && mine.length === 0 ? (
+        <div className="gw-card gw-empty">
+          <strong>{needle ? t("没有匹配的组") : t("还没有自己建的组")}</strong>
+          {needle ? null : <span>{t("比如把两家的同一个模型编成「依次」组：第一家出错自动换第二家；或者把几个便宜模型编成「轮换」组分摊用量。")}</span>}
+        </div>
+      ) : null}
+      {mine.map((group) => (
+        <GroupCard
+          busy={busy}
+          group={group}
+          key={group.id}
+          onChange={(patch) => saveMine(group, patch)}
+          onDelete={() => void remove(group)}
+          onEdit={() => setEditing(group)}
+          payload={payload}
+        />
+      ))}
+
+      {payload ? (
+        <SectionLabel aside={<em>{autoOn ? t("多家都有的模型自动成组，Agent 选不带供应商的模型名时走它") : t("自动建组已关闭")}</em>}>
+          {t("自动组")}<em>{visibleAutos.length}</em>
+        </SectionLabel>
+      ) : null}
+      {payload && !autoOn ? (
+        <div className="gw-card gw-empty">
+          <strong>{t("自动建组已关闭")}</strong>
+          <span>{t("打开后，多家都有的模型会自动成一个组；不带供应商的模型名现在按供应商池的顺序依次尝试。")}</span>
+        </div>
+      ) : null}
+      {payload && autoOn && autos.length === 0 ? (
+        <div className="gw-card gw-empty">
+          <strong>{needle ? t("没有匹配的组") : t("还没有多家都有的模型")}</strong>
+          {needle ? null : <span>{t("两家以上的供应商都提供同一个模型时，这里会自动多出一个组。")}</span>}
+        </div>
+      ) : null}
+      {autoOn
+        ? visibleAutos.map((group) => (
+          <GroupCard
+            auto
+            busy={busy}
+            group={group}
+            key={group.id}
+            onChange={(patch) => saveAuto(group, patch)}
+            onHide={() => saveAuto(group, { hidden: true })}
+            onReset={group.customized ? () => void run(`auto:${group.id}`, "save_gateway_auto_group", { model: group.name, settings: {} }, t("恢复默认"), true) : undefined}
+            payload={payload}
+          />
+        ))
+        : null}
+      {autoOn && hiddenAutos.length ? (
+        <div className="gw-hidden-autos">
+          <button className="gw-text-button" onClick={() => setShowHidden(!showHidden)} type="button">
+            {showHidden ? t("收起已隐藏的") : tf("已隐藏 {0} 个", [hiddenAutos.length])}
+          </button>
+          {showHidden
+            ? hiddenAutos.map((group) => (
+              <div className="gw-hidden-auto" key={group.id}>
+                <strong>{prettyModelName(group.name)}</strong>
+                <code>{group.name}</code>
+                <button className="gw-text-button strong" disabled={busy !== null} onClick={() => saveAuto(group, { hidden: false })} type="button">{t("恢复")}</button>
               </div>
-              <span className="gw-pill gw-pill-outline">{t(groupModeLabel(group.mode))}</span>
-              <span className="gw-pill gw-pill-outline" title={t(groupStickyDescription(group.sticky))}>{t(groupStickyLabel(group.sticky))}</span>
-              <span className="gw-row-buttons">
-                <button className="gw-text-button" disabled={busy !== null} onClick={() => setEditing(group)} type="button">{t("编辑")}</button>
-                <button className="gw-text-button" disabled={busy !== null} onClick={() => void remove(group)} type="button">{t("删除")}</button>
-              </span>
-            </div>
-          );
-        })}
-        {!payload ? <div className="gw-empty">{t("正在读取…")}</div> : null}
-        {payload && payload.groups.length === 0 ? (
-          <div className="gw-empty">
-            <strong>{t("还没有模型组")}</strong>
-            <span>{t("比如把两家的同一个模型编成「依次」组：第一家出错自动换第二家；或者把几个便宜模型编成「轮换」组分摊用量。")}</span>
-          </div>
-        ) : null}
-      </div>
+            ))
+            : null}
+        </div>
+      ) : null}
+
       {editing ? (
         <GroupEditor
           busy={busy}
           group={editing === "new" ? null : editing}
           onCancel={() => setEditing(null)}
           onSave={async (input) => {
-            if (await run("group:save", "save_gateway_group", { group: input }, t("保存模型组"))) setEditing(null);
+            // 编辑器不管「隐藏成员」和手动选中的成员：沿用卡片上已有的。
+            const previous = editing === "new" ? null : editing;
+            const group = { ...input, hideMembers: previous?.hideMembers ?? false, pick: previous?.pick ?? "" };
+            if (await run("group:save", "save_gateway_group", { group }, t("保存组"))) setEditing(null);
           }}
           payload={payload}
         />
@@ -333,152 +372,145 @@ function GroupsPanel({ payload, busy, run }: { payload: GatewayPayload | null; b
   );
 }
 
-/** 供应商名的短写法：`·` 前那段（「ChatGPT Pro · 邮箱」→「ChatGPT Pro」），完整名放在悬停提示里。 */
-function shortProviderName(name: string): string {
-  return name.split("·")[0].trim() || name;
-}
-
-/**
- * 供应商 × 模型矩阵：行是模型，列是池里打开的供应商（顺序就是池的顺序），格子里有点就是这家提供。
- * 打开「多家自动切换」时，多家都有的那几行点里标出「自动」的尝试顺序。
- */
-function ModelMatrix({ payload, rows, onManage, onOpenProvider, busy, run }: { payload: GatewayPayload | null; rows: DispatchRow[]; onManage: () => void; onOpenProvider: (id: string) => void; busy: string | null; run: Run }) {
-  const autoModels = payload?.gateway.autoModels === true;
-  const [query, setQuery] = useState("");
-  const [filter, setFilter] = useState<MatrixFilter>("all");
-  const [expanded, setExpanded] = useState(false);
-  const providers = useMemo(() => agentPoolProviders(payload), [payload]);
-  const shared = rows.filter((row) => row.providers.length > 1).length;
-  const needle = query.trim().toLowerCase();
-  const matched = rows.filter((row) => {
-    if (filter === "shared" && row.providers.length < 2) return false;
-    if (filter.startsWith("provider:") && !row.providers.some((provider) => `provider:${provider.id}` === filter)) return false;
-    return !needle || row.model.toLowerCase().includes(needle) || prettyModelName(row.model).toLowerCase().includes(needle);
-  });
-  const shown = needle || expanded || filter !== "all" ? matched : matched.slice(0, MATRIX_PREVIEW);
-  const filters: Array<{ key: MatrixFilter; label: ReactNode; count: number; title?: string }> = [
-    { key: "all", label: t("全部"), count: rows.length },
-    { key: "shared", label: t("多家都有"), count: shared },
-    ...providers.map((entry) => ({
-      key: `provider:${entry.id}` as MatrixFilter,
-      label: <><Avatar baseUrl={entry.baseUrl} name={entry.name} size="sm" />{maskAccountName(shortProviderName(entry.name))}</>,
-      count: rows.filter((row) => row.providers.some((provider) => provider.id === entry.id)).length,
-      title: maskAccountName(entry.name),
-    })),
-  ];
+/** 一张组卡片：标题（名字、Agent 里怎么选它）、路由方式、会话固定、成员列表（状态、额度、耗时）、隐藏成员。 */
+function GroupCard({
+  group,
+  payload,
+  busy,
+  auto = false,
+  onChange,
+  onEdit,
+  onDelete,
+  onHide,
+  onReset,
+}: {
+  group: GatewayGroupEntry;
+  payload: GatewayPayload | null;
+  busy: string | null;
+  auto?: boolean;
+  onChange: (patch: Partial<GatewayGroupEntry>) => void;
+  onEdit?: () => void;
+  onDelete?: () => void;
+  onHide?: () => void;
+  onReset?: () => void;
+}) {
+  const manual = group.mode === "manual";
+  const picked = manual ? (group.members.find((member) => member.model.toLowerCase() === (group.pick ?? "").toLowerCase()) ?? group.members[0])?.model : "";
+  const disabled = busy !== null;
   return (
-    <>
-      <div className="gw-models-toolbar">
-        <label className="gw-sheet-search gw-models-search">
-          <Search className="h-4 w-4" />
-          <input aria-label={t("搜索模型")} onChange={(event) => setQuery(event.target.value)} placeholder={t("搜索模型")} value={query} />
-        </label>
-        <div className="gw-models-auto" title={t("多家都有的模型额外列一份「自动」：按供应商池的顺序依次尝试，前一家出错、Key 都在冷却或被熔断就换下一家。关着时只能选具体某一家。")}>
-          <span>{t("多家自动切换")}</span>
-          <Switch
-            disabled={busy !== null || !payload}
-            label={t("多家自动切换")}
-            on={autoModels}
-            onToggle={() => void run("auto-models", "save_gateway_auto_models", { enabled: !autoModels }, t("多家自动切换"), true)}
+    <section className="gw-card gw-route-group" data-auto={auto}>
+      <header className="gw-route-group-head">
+        <span className="gw-route-group-icon">{auto ? <Shuffle className="h-4 w-4" /> : <Waypoints className="h-4 w-4" />}</span>
+        <div className="gw-route-group-title">
+          <strong>{auto ? prettyModelName(group.name) : group.name}</strong>
+          <code className="gw-chip" title={t("Agent 里选这个名字就走这个组")}>{auto ? group.name : groupModelId(group.id)}</code>
+          {auto ? <span className="gw-pill gw-pill-outline">{t("自动")}</span> : null}
+        </div>
+        <div className="gw-route-group-controls">
+          <AppSelect
+            disabled={disabled}
+            label={t("路由方式")}
+            onChange={(mode) => onChange({ mode })}
+            options={MODE_OPTIONS.map((mode) => ({ value: mode, label: t(groupModeLabel(mode)), hint: t(groupModeDescription(mode)) }))}
+            size="sm"
+            value={group.mode}
+          />
+          <AppSelect
+            disabled={disabled || manual}
+            label={t("会话固定")}
+            onChange={(sticky) => onChange({ sticky })}
+            options={STICKY_OPTIONS.map((sticky) => ({ value: sticky, label: t(groupStickyLabel(sticky)), hint: t(groupStickyDescription(sticky)) }))}
+            size="sm"
+            title={manual ? t("手动模式只用选中的那个成员，不需要会话固定") : undefined}
+            value={group.sticky ?? "cache"}
           />
         </div>
-      </div>
-      <div className="gw-models-filters" role="group" aria-label={t("筛选")}>
-        {filters.map((item) => (
-          <button data-active={filter === item.key} key={item.key} onClick={() => setFilter(filter === item.key ? "all" : item.key)} title={item.title} type="button">
-            {item.label}
-            <em>{item.count}</em>
-          </button>
+      </header>
+      <ol className="gw-route-members" data-manual={manual}>
+        {group.members.map((member, index) => (
+          <RouteMember
+            disabled={disabled}
+            index={index}
+            key={`${member.model}-${index}`}
+            manual={manual}
+            member={member}
+            mode={group.mode}
+            onPick={() => onChange({ pick: member.model })}
+            payload={payload}
+            picked={picked === member.model}
+          />
         ))}
-      </div>
-      <p className="gw-models-hint">
-        {autoModels ? (
-          <>
-            {t("多家都有的模型，Agent 里每家各一份（只发给那家），另有一份「自动」：按列从左到右依次尝试，数字是先后。")}
-            <button className="gw-text-button" onClick={onManage} type="button">{t("调整顺序")}</button>
-          </>
-        ) : t("多家都有的模型，Agent 里每家各一份，选哪家就只发给哪家。打开「多家自动切换」可以再多一份按顺序自动换家的。")}
-      </p>
-      <div className="gw-card gw-matrix-card">
-        {!payload ? <div className="gw-empty">{t("正在读取…")}</div> : null}
-        {payload && rows.length === 0 ? (
-          <div className="gw-empty">
-            <strong>{payload.pool.length ? t("供应商都已关闭") : t("供应商池里还没有模型")}</strong>
-            <span>{payload.pool.length ? t("打开供应商池里的供应商后，这里列出每个模型由哪几家提供。") : t("在「供应商池」添加并打开供应商后，这里列出每个模型由哪几家提供。")}</span>
-          </div>
-        ) : null}
-        {payload && rows.length ? (
-          <div className="gw-matrix-scroll">
-            <table className="gw-matrix">
-              <thead>
-                <tr>
-                  <th className="gw-matrix-model" scope="col">{t("模型")}</th>
-                  {providers.map((entry) => (
-                    <th key={entry.id} scope="col">
-                      {/* 点列头去供应商池展开这一家，在那里改它的模型列表、Key、价格。 */}
-                      <button className="gw-matrix-provider" onClick={() => onOpenProvider(entry.id)} title={tf("在供应商池里打开「{0}」", [maskAccountName(entry.name)])} type="button">
-                        <Avatar baseUrl={entry.baseUrl} name={entry.name} size="sm" />
-                        <span>{maskAccountName(shortProviderName(entry.name))}</span>
-                        <ChevronRight aria-hidden className="h-3.5 w-3.5" />
-                      </button>
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {shown.map((row) => {
-                  const multi = row.providers.length > 1;
-                  return (
-                    <tr data-multi={multi} key={row.model}>
-                      <th className="gw-matrix-model" scope="row">
-                        <strong title={row.model}>{prettyModelName(row.model)}</strong>
-                        <code>{row.model}</code>
-                      </th>
-                      {providers.map((entry) => {
-                        const index = row.providers.findIndex((provider) => provider.id === entry.id);
-                        if (index < 0) return <td key={entry.id}><span className="gw-matrix-none" aria-label={t("不提供")}>·</span></td>;
-                        const provider = row.providers[index];
-                        const status = dispatchStatus(payload, provider.id, row.model);
-                        const speed = speedOf(payload, provider.id, row.model);
-                        const excluded = provider.excludedBy.length ? tf("{0} 不用这家", [provider.excludedBy.map(agentName).join(t("、"))]) : "";
-                        const tips = [maskAccountName(entry.name), status ? statusText(status) : "", speed !== null ? tf("平均首包 {0}", [formatElapsed(speed)]) : "", excluded].filter(Boolean).join(" · ");
-                        return (
-                          <td key={entry.id} title={tips}>
-                            <span className="gw-matrix-cell" data-excluded={provider.excludedBy.length > 0} data-state={status?.state ?? "idle"}>
-                              <i>{autoModels && multi ? index + 1 : null}</i>
-                              {speed !== null ? <small>{formatElapsed(speed)}</small> : null}
-                            </span>
-                          </td>
-                        );
-                      })}
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        ) : null}
-        {payload && !needle && filter === "all" && matched.length > MATRIX_PREVIEW ? (
-          <button className="gw-dispatch-more" onClick={() => setExpanded(!expanded)} type="button">
-            {expanded ? t("收起") : tf("显示全部 {0} 个模型", [matched.length])}
-          </button>
-        ) : null}
-        {payload && rows.length > 0 && matched.length === 0 ? <p className="gw-dispatch-none">{t("没有匹配的模型")}</p> : null}
-      </div>
-      <p className="gw-models-legend">
-        <span><span className="gw-matrix-cell" data-state="idle"><i /></span>{t("提供")}</span>
-        <span><span className="gw-matrix-cell" data-state="answered"><i /></span>{t("刚用过")}</span>
-        <span><span className="gw-matrix-cell" data-state="cooling"><i /></span>{t("冷却或熔断中")}</span>
-        <span><span className="gw-matrix-cell" data-excluded="true" data-state="idle"><i /></span>{t("有 Agent 不用这家")}</span>
-      </p>
-    </>
+        {group.members.length === 0 ? <li className="gw-route-member-empty">{t("没有成员")}</li> : null}
+      </ol>
+      <footer className="gw-route-group-foot">
+        <label className="gw-route-hide" title={t("打开后，组里的模型不再单独出现在 Agent 的模型列表里，只能通过这个组来选；直接写名字仍然能用。")}>
+          <Switch disabled={disabled} label={t("隐藏成员")} on={group.hideMembers === true} onToggle={() => onChange({ hideMembers: !group.hideMembers })} />
+          <span>{t("隐藏成员")}</span>
+        </label>
+        <span className="gw-route-group-mode">{t(groupModeDescription(group.mode))}</span>
+        <span className="gw-row-buttons">
+          {onEdit ? <button className="gw-text-button" disabled={disabled} onClick={onEdit} type="button">{t("编辑")}</button> : null}
+          {onReset ? <button className="gw-text-button" disabled={disabled} onClick={onReset} title={t("回到依次、缓存期内固定、不隐藏成员")} type="button">{t("恢复默认")}</button> : null}
+          {onHide ? <button className="gw-text-button" disabled={disabled} onClick={onHide} title={t("这个自动组不再出现在 Agent 里，不带供应商的模型名按供应商池的顺序依次尝试")} type="button">{t("隐藏")}</button> : null}
+          {onDelete ? <button className="gw-text-button" disabled={disabled} onClick={onDelete} type="button">{t("删除")}</button> : null}
+        </span>
+      </footer>
+    </section>
   );
 }
 
-/** 格子悬停提示里的状态文字。 */
-function statusText(status: MemberStatus): string {
-  return tf(status.text, status.args.map((arg) => (typeof arg === "string" ? t(arg) : arg)));
+/** 组里的一个成员：先后 / 手动选中、供应商与模型、状态、额度、平均耗时。 */
+function RouteMember({
+  member,
+  index,
+  mode,
+  manual,
+  picked,
+  payload,
+  disabled,
+  onPick,
+}: {
+  member: GroupMember;
+  index: number;
+  mode: GroupMode;
+  manual: boolean;
+  picked: boolean;
+  payload: GatewayPayload | null;
+  disabled: boolean;
+  onPick: () => void;
+}) {
+  const target = memberTarget(payload, member.model);
+  const view = modelDisplay(payload, member.model);
+  const status = target ? dispatchStatus(payload, target.entry.id, target.model) : null;
+  const speed = target ? speedOf(payload, target.entry.id, target.model) : null;
+  const quota = target?.entry.quota ?? null;
+  const body = (
+    <>
+      <span className="gw-route-member-mark">
+        {manual ? <i className="gw-radio-dot" data-on={picked} /> : <i>{mode === "inOrder" || mode === "usage" || mode === "fast" ? index + 1 : "·"}</i>}
+      </span>
+      {target ? <Avatar baseUrl={target.entry.baseUrl} name={target.entry.name} size="sm" /> : view.group ? <Waypoints className="gw-picker-glyph h-4 w-4" /> : <Shuffle className="gw-picker-glyph h-4 w-4" />}
+      <span className="gw-route-member-name">
+        <strong>{target ? maskAccountName(shortProviderName(target.entry.name)) : view.title}</strong>
+        <small>{target ? prettyModelName(target.model) : member.model}</small>
+      </span>
+      {mode === "weighted" ? <span className="gw-route-member-weight">{tf("权重 {0}", [member.weight])}</span> : null}
+      {status ? <span className="gw-route-member-status" data-state={status.state}><MemberStatusLabel status={status} /></span> : null}
+      {quota ? <QuotaBadge quota={quota} /> : null}
+      {speed !== null ? <small className="gw-route-member-speed" title={t("最近的平均首包耗时")}>{formatElapsed(speed)}</small> : null}
+    </>
+  );
+  return (
+    <li className="gw-route-member" data-picked={picked} data-state={status?.state ?? "idle"}>
+      {manual ? (
+        <button className="gw-route-member-row" disabled={disabled || picked} onClick={onPick} title={picked ? t("正在用这一个") : t("改成只用这一个")} type="button">{body}</button>
+      ) : (
+        <div className="gw-route-member-row">{body}</div>
+      )}
+    </li>
+  );
 }
+
 
 /** 新建 / 编辑模型组：名称、模式、成员（池里的模型或别的组）。 */
 function GroupEditor({
@@ -518,6 +550,7 @@ function GroupEditor({
     { value: "weighted", label: t("按权重") },
     { value: "usage", label: t("额度优先") },
     { value: "fast", label: t("速度优先") },
+    { value: "manual", label: t("手动") },
   ];
   const stickies: GroupSticky[] = ["cache", "session", "off"];
   const patternText = pattern.trim();

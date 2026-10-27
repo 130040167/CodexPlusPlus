@@ -15,8 +15,8 @@ use anyhow::{Context, bail};
 
 use crate::gateway::key_pool::{self, KeyRef};
 use crate::gateway::store::{
-    AgentBinding, GROUP_MODEL_PREFIX, GatewayGroup, GatewayProvider, GatewaySettings, GroupMember,
-    GroupMode, GroupSticky, UnknownModelPolicy,
+    AgentBinding, AutoGroupSettings, GROUP_MODEL_PREFIX, GatewayGroup, GatewayProvider,
+    GatewaySettings, GroupMember, GroupMode, GroupSticky, UnknownModelPolicy,
 };
 use crate::settings::RelayProfile;
 use crate::tools::ToolId;
@@ -90,14 +90,123 @@ pub fn binding_pool_relays<'a>(
         .collect()
 }
 
+/// 自动组的 id 前缀（`auto:<小写模型名>`），只在内部用（会话固定、轮换进度、界面）；Agent 选它用的是裸模型名。
+pub const AUTO_GROUP_PREFIX: &str = "auto:";
+
+/// 池里打开的供应商和它们各自的模型（只解析一次模型列表）。
+fn enabled_relay_models(gateway: &GatewaySettings) -> Vec<(&RelayProfile, Vec<String>)> {
+    gateway
+        .providers
+        .iter()
+        .filter(|provider| provider.enabled)
+        .map(|provider| (&provider.relay, relay_models(&provider.relay)))
+        .collect()
+}
+
+/// 用已解析的模型列表拼出一个模型的自动组；只有一家或没人提供时返回 None。
+fn build_auto_group(
+    gateway: &GatewaySettings,
+    lists: &[(&RelayProfile, Vec<String>)],
+    model: &str,
+) -> Option<GatewayGroup> {
+    let members: Vec<GroupMember> = lists
+        .iter()
+        .filter(|(_, models)| models.iter().any(|known| known.eq_ignore_ascii_case(model)))
+        .map(|(relay, _)| GroupMember {
+            model: format!("{}/{model}", relay.id),
+            weight: 1,
+        })
+        .collect();
+    if members.len() < 2 {
+        return None;
+    }
+    let key = model.to_ascii_lowercase();
+    let settings = gateway.auto_groups.get(&key).cloned().unwrap_or_default();
+    Some(GatewayGroup {
+        id: format!("{AUTO_GROUP_PREFIX}{key}"),
+        name: model.to_string(),
+        mode: settings.mode,
+        sticky: settings.sticky,
+        members,
+        hide_members: settings.hide_members,
+        pick: settings.pick,
+        extra: Default::default(),
+    })
+}
+
+/// 池里打开的供应商里多家都有的模型，各自一个自动组（含已隐藏的），按模型第一次出现的先后。
+/// 成员是每家固定的那份 `<供应商 id>/<模型>`，按池顺序；模式、会话固定等取用户改过的设置。
+pub fn auto_groups(gateway: &GatewaySettings) -> Vec<GatewayGroup> {
+    let lists = enabled_relay_models(gateway);
+    let mut seen: Vec<String> = Vec::new();
+    let mut groups = Vec::new();
+    for (_, models) in &lists {
+        for model in models {
+            let key = model.to_ascii_lowercase();
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            if let Some(group) = build_auto_group(gateway, &lists, model) {
+                groups.push(group);
+            }
+        }
+    }
+    groups
+}
+
+/// 自动组上改过的设置（没改过返回默认）。
+pub fn auto_group_settings(gateway: &GatewaySettings, model: &str) -> AutoGroupSettings {
+    gateway
+        .auto_groups
+        .get(&model.to_ascii_lowercase())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// 这个裸模型名现在走不走自动组：自动建组开着、这个自动组没被隐藏、池里确实多家都有。
+pub fn active_auto_group(gateway: &GatewaySettings, model: &str) -> Option<GatewayGroup> {
+    if !gateway.auto_models || model.starts_with(GROUP_MODEL_PREFIX) || is_pattern(model) {
+        return None;
+    }
+    if auto_group_settings(gateway, model).hidden {
+        return None;
+    }
+    build_auto_group(gateway, &enabled_relay_models(gateway), model)
+}
+
+/// 隐藏了成员的组（自建的、生效中的自动组）里，不再单独出现在 Agent 模型列表里的那些成员。
+/// 只算具体的模型（`<供应商 id>/<模型>` 或裸模型名），通配符和嵌套组不算。
+fn unlisted_members(gateway: &GatewaySettings) -> Vec<String> {
+    let mut hidden: Vec<String> = Vec::new();
+    let concrete = |member: &GroupMember| {
+        let model = member.model.trim();
+        (!model.is_empty() && !is_pattern(model) && !model.starts_with(GROUP_MODEL_PREFIX))
+            .then(|| model.to_ascii_lowercase())
+    };
+    for group in gateway.groups.iter().filter(|group| group.hide_members) {
+        hidden.extend(group.members.iter().filter_map(concrete));
+    }
+    if gateway.auto_models {
+        for group in auto_groups(gateway) {
+            if group.hide_members && !auto_group_settings(gateway, &group.name).hidden {
+                hidden.extend(group.members.iter().filter_map(concrete));
+            }
+        }
+    }
+    hidden
+}
+
 /// Agent 能用的全部模型：池内供应商的模型（去重，按池顺序），再加上有成员的路由组 `group/<id>`。
 pub fn pool_models(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<String> {
     let mut models: Vec<String> = Vec::new();
+    let unlisted = unlisted_members(gateway);
     for relay in binding_pool_relays(gateway, binding) {
         for model in relay_models(relay) {
-            if !models
-                .iter()
-                .any(|known| known.eq_ignore_ascii_case(&model))
+            if !unlisted.contains(&model.to_ascii_lowercase())
+                && !models
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&model))
             {
                 models.push(model);
             }
@@ -154,12 +263,14 @@ fn codex_pool_blocks(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<V
     };
     let mut blocks: Vec<Vec<String>> = Vec::new();
     let mut shared: Vec<String> = Vec::new();
+    // 隐藏了成员的组：成员不再单独列出，只能通过组来选。
+    let unlisted = unlisted_members(gateway);
     for relay in &relays {
         let mut block = Vec::new();
         for model in relay_models(relay) {
             if serving_count(&relays, &model) > 1 {
                 let pinned = format!("{}/{model}", relay.id);
-                if fresh(&pinned) {
+                if !unlisted.contains(&pinned.to_ascii_lowercase()) && fresh(&pinned) {
                     block.push(pinned);
                 }
                 if !shared
@@ -168,16 +279,20 @@ fn codex_pool_blocks(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<V
                 {
                     shared.push(model);
                 }
-            } else if fresh(&model) {
+            } else if !unlisted.contains(&model.to_ascii_lowercase()) && fresh(&model) {
                 block.push(model);
             }
         }
         blocks.push(block);
     }
-    // 「多家自动切换」默认关：关着时不列这一块（默认模型若是裸名，仍由写配置的地方单独补上）。
-    if gateway.auto_models {
-        blocks.push(shared.into_iter().filter(|model| fresh(model)).collect());
-    }
+    // 自动组：每个生效中的自动组列一份裸模型名（隐藏了的、或关了自动建组时不列）。
+    blocks.push(
+        shared
+            .into_iter()
+            .filter(|model| gateway.auto_models && !auto_group_settings(gateway, model).hidden)
+            .filter(|model| fresh(model))
+            .collect(),
+    );
     blocks.push(
         gateway
             .groups
@@ -327,6 +442,13 @@ fn group_by_model<'a>(gateway: &'a GatewaySettings, model: &str) -> Option<&'a G
         .find(|group| group.id.eq_ignore_ascii_case(id))
 }
 
+/// 这个模型名走哪个组：`group/<id>` 是自建的组；多家都有的裸模型名走它的自动组（生效时）。
+fn group_for(gateway: &GatewaySettings, model: &str) -> Option<GatewayGroup> {
+    group_by_model(gateway, model)
+        .cloned()
+        .or_else(|| active_auto_group(gateway, model))
+}
+
 /// 一个模型名展开成 (供应商, 发给它的模型) 列表。
 fn expand_model(
     gateway: &GatewaySettings,
@@ -336,8 +458,8 @@ fn expand_model(
     visiting: &mut Vec<String>,
     advance: bool,
 ) -> Vec<(RelayProfile, String)> {
-    if let Some(group) = group_by_model(gateway, model) {
-        return expand_group(gateway, binding, group, depth, visiting, advance);
+    if let Some(group) = group_for(gateway, model) {
+        return expand_group(gateway, binding, &group, depth, visiting, advance);
     }
     if is_pattern(model) {
         return expand_pattern(gateway, binding, model);
@@ -566,11 +688,20 @@ fn prefer_remembered(relays: &mut Vec<(RelayProfile, String)>, remembered: &(Str
 /// `advance` 为 false 时只看当前进度、不往前推（count_tokens 这类预览用）。
 fn ordered_members(group: &GatewayGroup, advance: bool) -> Vec<GroupMember> {
     let members = group.members.clone();
+    if group.mode == GroupMode::Manual {
+        // 手动：只用选中的那个成员（没选或选的已不在组里时用第一个），答不了也不换。
+        let picked = members
+            .iter()
+            .find(|member| member.model.eq_ignore_ascii_case(group.pick.trim()))
+            .or_else(|| members.first())
+            .cloned();
+        return picked.into_iter().collect();
+    }
     if members.len() < 2 {
         return members;
     }
     let start = match group.mode {
-        GroupMode::InOrder | GroupMode::Usage | GroupMode::Fast => 0,
+        GroupMode::InOrder | GroupMode::Usage | GroupMode::Fast | GroupMode::Manual => 0,
         GroupMode::Rotate => (group_counter(&group.id, advance) % members.len() as u64) as usize,
         GroupMode::Weighted => {
             let total: u64 = members
@@ -652,11 +783,12 @@ fn resolve_plan_with(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
 
-    let group = group_by_model(gateway, &model);
-    let group_id = group.map(|group| group.id.clone());
-    let sticky_ttl = group.and_then(|group| sticky_ttl(group.sticky));
+    let group = group_for(gateway, &model);
+    let group_id = group.as_ref().map(|group| group.id.clone());
+    let sticky_ttl = group.as_ref().and_then(|group| sticky_ttl(group.sticky));
     let mut relays = expand_model(gateway, binding, &model, 0, &mut Vec::new(), advance);
-    if let (Some(group), Some(conversation)) = (group, conversation.as_deref())
+    if let (Some(group), Some(conversation)) = (group.as_ref(), conversation.as_deref())
+        && group.mode != GroupMode::Manual
         && let Some(remembered) = recall_answer(group, conversation, Instant::now())
     {
         prefer_remembered(&mut relays, &remembered);
@@ -755,7 +887,7 @@ mod tests {
             mode,
             sticky: GroupSticky::Cache,
             members,
-            extra: Default::default(),
+            ..GatewayGroup::default()
         }
     }
 
@@ -1230,7 +1362,8 @@ mod tests {
     #[test]
     fn codex_lists_shared_models_under_every_provider() {
         let mut gateway = gateway("deepseek-v4-pro");
-        // 「多家自动切换」默认关：只有各家固定的那份。
+        // 关了自动建组：只有各家固定的那份。
+        gateway.auto_models = false;
         let binding = gateway.binding(&ToolId::Claude).unwrap().clone();
         assert!(
             !codex_pool_models(&gateway, &binding)
@@ -1296,5 +1429,91 @@ mod tests {
         let led = codex_pool_models_led_by(&gateway, &binding, "kimi-k3");
         assert_eq!(led[0], "kimi-k3");
         assert_eq!(led[1], "ds/deepseek-v4-pro");
+    }
+
+    #[test]
+    fn shared_bare_models_route_through_their_auto_group() {
+        let mut gateway = gateway("deepseek-v4-pro");
+        // 自动组：成员是两家各自固定的那份，按池顺序；默认依次。
+        let auto = auto_groups(&gateway);
+        assert_eq!(auto.len(), 1);
+        assert_eq!(auto[0].id, "auto:deepseek-v4-pro");
+        assert_eq!(
+            auto[0]
+                .members
+                .iter()
+                .map(|m| m.model.as_str())
+                .collect::<Vec<_>>(),
+            ["ds/deepseek-v4-pro", "mirror/deepseek-v4-pro"]
+        );
+        let plan =
+            resolve_plan(&gateway, &ToolId::Claude, "deepseek-v4-pro", Some("conv")).unwrap();
+        assert_eq!(
+            plan.group_id.as_deref(),
+            Some("auto:deepseek-v4-pro"),
+            "裸名走自动组，会话固定按组记"
+        );
+        assert_eq!(routed(&gateway, "deepseek-v4-pro").len(), 2);
+
+        // 手动：只发给选中的那一家，答不了也不换。
+        gateway.auto_groups.insert(
+            "deepseek-v4-pro".into(),
+            AutoGroupSettings {
+                mode: GroupMode::Manual,
+                pick: "mirror/deepseek-v4-pro".into(),
+                ..AutoGroupSettings::default()
+            },
+        );
+        assert_eq!(
+            routed(&gateway, "deepseek-v4-pro"),
+            vec![pair("mirror", "deepseek-v4-pro")]
+        );
+
+        // 隐藏这个自动组：裸名回到按池顺序依次试，也不再出现在 Codex 的列表里。
+        gateway
+            .auto_groups
+            .get_mut("deepseek-v4-pro")
+            .unwrap()
+            .hidden = true;
+        assert_eq!(routed(&gateway, "deepseek-v4-pro").len(), 2);
+        let binding = gateway.binding(&ToolId::Claude).unwrap().clone();
+        assert!(
+            !codex_pool_models(&gateway, &binding)
+                .iter()
+                .any(|m| m == "deepseek-v4-pro")
+        );
+    }
+
+    #[test]
+    fn hidden_members_leave_the_lists_but_still_route() {
+        let mut gateway = gateway("deepseek-v4-pro");
+        let binding = gateway.binding(&ToolId::Claude).unwrap().clone();
+        // 自动组隐藏成员：各家固定的那份不再单独列出，只剩自动那份。
+        gateway.auto_groups.insert(
+            "deepseek-v4-pro".into(),
+            AutoGroupSettings {
+                hide_members: true,
+                ..AutoGroupSettings::default()
+            },
+        );
+        let models = codex_pool_models(&gateway, &binding);
+        assert!(
+            !models
+                .iter()
+                .any(|m| m == "ds/deepseek-v4-pro" || m == "mirror/deepseek-v4-pro")
+        );
+        assert!(models.iter().any(|m| m == "deepseek-v4-pro"));
+        assert_eq!(
+            routed(&gateway, "ds/deepseek-v4-pro"),
+            vec![pair("ds", "deepseek-v4-pro")],
+            "直接写名字仍能用"
+        );
+        // 自建组隐藏成员：成员里的裸模型名不再出现在 Claude / Grok 的列表里。
+        gateway.groups[0].hide_members = true;
+        let models = pool_models(&gateway, &binding);
+        assert!(
+            !models.iter().any(|m| m == "kimi-k3"),
+            "fast 组的成员 kimi-k3 被隐藏：{models:?}"
+        );
     }
 }

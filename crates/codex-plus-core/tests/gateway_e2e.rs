@@ -536,6 +536,7 @@ async fn gateway_end_to_end() {
             },
         ],
         extra: Default::default(),
+        ..GatewayGroup::default()
     }];
     gateway
         .bindings

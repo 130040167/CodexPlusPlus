@@ -19,7 +19,7 @@ use crate::tools::ToolId;
 
 const STORE_FILE: &str = "gateway.json";
 /// 2：`restore_on_exit` 默认改为开启（见 [`read_store`] 里的迁移）。
-const STORE_VERSION: u32 = 2;
+const STORE_VERSION: u32 = 3;
 /// 客户端 token 前缀；日志里看到它就知道是网关签发的本地凭据，不是上游 Key。
 pub const CLIENT_TOKEN_PREFIX: &str = "cpx-gw-";
 
@@ -129,6 +129,8 @@ pub enum GroupMode {
     Usage,
     /// 速度优先：最近响应最快的先试；还没测过的先试一次。
     Fast,
+    /// 手动：只发给选中的那个成员（`pick`，没选时是第一个），它答不了也不换。
+    Manual,
 }
 
 /// 同一个会话在组里固定用哪个成员：固定才能命中上游的提示词缓存。
@@ -159,7 +161,7 @@ fn default_weight() -> u32 {
 }
 
 /// 网关自己的路由组：Agent 在模型列表里把它当一个模型（`group/<id>`）来选。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayGroup {
     pub id: String,
@@ -170,6 +172,12 @@ pub struct GatewayGroup {
     pub sticky: GroupSticky,
     #[serde(default)]
     pub members: Vec<GroupMember>,
+    /// 隐藏成员：组里的模型不再单独出现在 Agent 的模型列表里，只能通过这个组来选（直接写名字仍能用）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hide_members: bool,
+    /// 手动模式下选中的成员（成员的模型名）；空串表示第一个成员。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pick: String,
     /// 不认识的字段原样保留。
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -179,6 +187,26 @@ impl GatewayGroup {
     pub fn model_id(&self) -> String {
         format!("{GROUP_MODEL_PREFIX}{}", self.id)
     }
+}
+
+/// 自动组上用户改过的设置。成员不存：总是池里提供这个模型的那几家，按池顺序。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoGroupSettings {
+    #[serde(default, deserialize_with = "lenient")]
+    pub mode: GroupMode,
+    #[serde(default, deserialize_with = "lenient")]
+    pub sticky: GroupSticky,
+    /// 隐藏这个自动组：不出现在 Agent 的模型列表里，不带供应商的模型名也不再走它（回到按池顺序依次试）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hide_members: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pick: String,
+    /// 不认识的字段原样保留。
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// 请求里的模型不在绑定的模型集合里时怎么办。
@@ -360,9 +388,13 @@ pub struct GatewaySettings {
     /// 左键点托盘图标弹出快捷面板（默认开）；关掉时托盘保持原来的点击行为。
     #[serde(default = "enabled_by_default")]
     pub tray_panel: bool,
-    /// 多家都有的模型额外列一份「自动」（按池顺序在各家之间切换）。默认关：只列各家固定的那份。
-    #[serde(default)]
+    /// 自动建组：多家都有的模型自动成一个组（Agent 选不带供应商的模型名时走它）。默认开；
+    /// 旧文件（version < 3）里的 false 是当时的默认值，读的时候迁移成开，见 [`read_store`]。
+    #[serde(default = "enabled_by_default")]
     pub auto_models: bool,
+    /// 自动组上改过的设置（键是小写模型名）。没改过的自动组不落盘，跟着供应商池自动变化。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub auto_groups: BTreeMap<String, AutoGroupSettings>,
     /// 收藏的模型（管理器模型下拉里点的星标）：写给 Codex 的模型目录时标出来，Codex 的选择器里也显示星标。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub favorite_models: Vec<String>,
@@ -389,7 +421,8 @@ impl Default for GatewaySettings {
             providers: Vec::new(),
             groups: Vec::new(),
             tray_panel: true,
-            auto_models: false,
+            auto_models: true,
+            auto_groups: BTreeMap::new(),
             favorite_models: Vec::new(),
             app_version: String::new(),
             extra: Map::new(),
@@ -535,6 +568,10 @@ fn read_store(path: &Path) -> anyhow::Result<GatewaySettings> {
     // （之后的文件是版本 2，不再迁移）。
     if settings.version < 2 {
         settings.restore_on_exit = true;
+    }
+    // 版本 2 的 `autoModels: false` 是那时「多家自动切换」的默认值；自动建组改成默认开以后统一迁移成开。
+    if settings.version < 3 {
+        settings.auto_models = true;
     }
     // 地址、默认模型、Key 落盘时存在 config / auth 文本里，读回来要像 settings.json 一样还原出来。
     for provider in &mut settings.providers {
@@ -742,7 +779,7 @@ mod tests {
         );
         store.save(&settings).unwrap();
         let text = std::fs::read_to_string(&store.path).unwrap();
-        assert!(text.contains("\"version\": 2"), "{text}");
+        assert!(text.contains("\"version\": 3"), "{text}");
         assert!(
             text.contains(&format!("\"appVersion\": \"{}\"", crate::version::VERSION)),
             "记下写文件的版本：{text}"
@@ -895,6 +932,21 @@ mod tests {
     }
 
     #[test]
+    fn auto_groups_default_on_and_version_two_files_migrate() {
+        assert!(GatewaySettings::default().auto_models);
+        let temp = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(temp.path().join("gateway.json"));
+        // 版本 2 写的 false 是当时「多家自动切换」的默认值：迁移成开。
+        std::fs::write(&store.path, r#"{"version":2,"autoModels":false}"#).unwrap();
+        assert!(store.load().unwrap().auto_models);
+        // 迁移后用户再关掉：存成版本 3，之后保持关。
+        let mut settings = store.load().unwrap();
+        settings.auto_models = false;
+        store.save(&settings).unwrap();
+        assert!(!store.load().unwrap().auto_models);
+    }
+
+    #[test]
     fn update_serializes_concurrent_writers() {
         let temp = tempfile::tempdir().unwrap();
         let store = GatewayStore::at(temp.path().join("gateway.json"));
@@ -911,7 +963,7 @@ mod tests {
                                     mode: GroupMode::default(),
                                     sticky: GroupSticky::default(),
                                     members: Vec::new(),
-                                    extra: Default::default(),
+                                    ..GatewayGroup::default()
                                 });
                                 Ok(())
                             })

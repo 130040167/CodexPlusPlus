@@ -505,7 +505,7 @@ fn codex_gateway_catalog_carries_display_names_reasoning_and_provider_groups() {
     assert_eq!(second["codex_plus_group"], "ChatGPT Pro · 26****34@qq.com");
     let auto = model("deepseek-v4-pro");
     assert_eq!(auto["display_name"], "DeepSeek-V4-Pro（自动）");
-    assert_eq!(auto["codex_plus_group"], "多家自动切换");
+    assert_eq!(auto["codex_plus_group"], "自动组");
     // 旧版的裸名收藏：自动那份和各家那几份都标收藏（Codex 选择器里画星标）；别的模型不标。
     assert_eq!(auto["codex_plus_favorite"], true);
     assert_eq!(pinned["codex_plus_favorite"], true);
@@ -1017,6 +1017,7 @@ fn providers_live_only_in_the_gateway_store() {
                     weight: 1,
                 },
             ],
+            ..GroupInput::default()
         },
     )
     .unwrap();
@@ -1313,4 +1314,28 @@ fn direct_aggregates_move_into_the_gateway_as_pool_providers_and_a_group() {
         .map(|item| item.id)
         .collect();
     assert_eq!(listed, vec!["agg".to_string()]);
+}
+
+#[test]
+fn auto_group_settings_save_and_reset_to_default() {
+    use codex_plus_core::gateway::apply::save_auto_group;
+    use codex_plus_core::gateway::store::AutoGroupSettings;
+    let fixture = fixture(57396);
+    let store = &fixture.ctx.gateway;
+    // 新文件：自动建组默认开。
+    assert!(store.load().unwrap().auto_models);
+    let changed = AutoGroupSettings {
+        mode: GroupMode::Manual,
+        pick: " kimi/deepseek-v4-pro ".into(),
+        hide_members: true,
+        ..AutoGroupSettings::default()
+    };
+    let gateway = save_auto_group(store, "DeepSeek-V4-Pro", changed).unwrap();
+    let saved = gateway.auto_groups.get("deepseek-v4-pro").unwrap();
+    assert_eq!(saved.mode, GroupMode::Manual);
+    assert_eq!(saved.pick, "kimi/deepseek-v4-pro", "去掉首尾空格");
+    assert!(saved.hide_members);
+    // 改回默认：记录删掉，自动组回到「没改过」、跟着池子变。
+    let gateway = save_auto_group(store, "deepseek-v4-pro", AutoGroupSettings::default()).unwrap();
+    assert!(gateway.auto_groups.is_empty());
 }

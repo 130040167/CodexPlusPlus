@@ -3249,7 +3249,7 @@ body:has(.gw-modal-backdrop) .app-select-menu-portal {
   line-height: 18px;
 }
 
-/* ———————— 「模型」页：页签、工具栏、供应商 × 模型矩阵 ———————— */
+/* ———————— 路由页工具栏、供应商池「按模型」矩阵 ———————— */
 .shell .gw-models-tabs {
   display: inline-flex;
   gap: 4px;
@@ -3596,4 +3596,274 @@ body:has(.gw-modal-backdrop) .app-select-menu-portal {
 .gw-portal .gw-mp-manage + em,
 .gw-agent-modal .gw-mp-manage + em {
   margin-left: 6px;
+}
+
+/* ———————— 路由页：组卡片 ———————— */
+.shell .gw-section-label > span > em {
+  margin-left: 6px;
+  color: var(--gw-mute);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 400;
+}
+
+.shell .gw-route-group {
+  overflow: visible;
+}
+
+.shell .gw-route-group[data-auto="true"] {
+  border-style: dashed;
+}
+
+.shell .gw-route-group > * + * {
+  border-top: 1px solid var(--gw-line);
+}
+
+.shell .gw-route-group-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 12px;
+  padding: 14px 18px;
+}
+
+.shell .gw-route-group-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border-radius: 8px;
+  background: hsl(var(--primary) / 0.1);
+  color: hsl(var(--primary));
+}
+
+.shell .gw-route-group-title {
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  min-width: 0;
+}
+
+.shell .gw-route-group-title strong {
+  font-size: 14.5px;
+  font-weight: 600;
+}
+
+.shell .gw-route-group-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.shell .gw-route-group-controls > * {
+  min-width: 132px;
+}
+
+.shell .gw-route-members {
+  display: grid;
+  margin: 0;
+  padding: 6px 10px;
+  list-style: none;
+}
+
+.shell .gw-route-member-row {
+  display: grid;
+  grid-template-columns: 22px 22px minmax(0, 1fr) auto auto auto auto;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 42px;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--gw-ink);
+  font: inherit;
+  text-align: left;
+}
+
+.shell button.gw-route-member-row {
+  cursor: pointer;
+}
+
+.shell button.gw-route-member-row:hover:not(:disabled) {
+  background: hsl(var(--muted) / 0.45);
+}
+
+.shell button.gw-route-member-row:disabled {
+  cursor: default;
+}
+
+.shell .gw-route-member[data-picked="true"] .gw-route-member-row {
+  background: hsl(var(--primary) / 0.08);
+}
+
+.shell .gw-route-member[data-state="cooling"] .gw-route-member-name {
+  opacity: 0.65;
+}
+
+.shell .gw-route-member-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.shell .gw-route-member-mark > i {
+  color: var(--gw-mute);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.shell .gw-radio-dot {
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid hsl(var(--muted-foreground) / 0.6);
+  border-radius: 50%;
+}
+
+.shell .gw-radio-dot[data-on="true"] {
+  border-color: hsl(var(--primary));
+  box-shadow: inset 0 0 0 3px hsl(var(--card)), inset 0 0 0 8px hsl(var(--primary));
+}
+
+.shell .gw-route-member-name {
+  display: grid;
+  min-width: 0;
+}
+
+.shell .gw-route-member-name strong,
+.shell .gw-route-member-name small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shell .gw-route-member-name strong {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.shell .gw-route-member-name small {
+  color: var(--gw-mute);
+  font-size: 11.5px;
+}
+
+.shell .gw-route-member-weight,
+.shell .gw-route-member-speed {
+  color: var(--gw-mute);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.shell .gw-route-member-status {
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.shell .gw-route-member-status[data-state="cooling"] {
+  color: var(--gw-warn);
+}
+
+.shell .gw-route-member-status[data-state="answered"],
+.shell .gw-route-member-status[data-state="busy"] {
+  color: var(--gw-ok);
+}
+
+.shell .gw-route-member .gw-quota-badge {
+  margin-left: 0;
+}
+
+.shell .gw-route-member-empty {
+  padding: 10px 8px;
+  color: var(--gw-mute);
+  font-size: 12.5px;
+}
+
+.shell .gw-route-group-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  padding: 10px 18px;
+}
+
+.shell .gw-route-hide {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.shell .gw-route-group-mode {
+  flex: 1;
+  min-width: 200px;
+  color: var(--gw-mute);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.shell .gw-hidden-autos {
+  display: grid;
+  gap: 6px;
+  justify-items: start;
+}
+
+.shell .gw-hidden-auto {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 14px;
+  border: 1px dashed var(--gw-line);
+  border-radius: 10px;
+  color: var(--gw-mute);
+  font-size: 12.5px;
+}
+
+.shell .gw-hidden-auto code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.shell .gw-hidden-auto button {
+  margin-left: auto;
+}
+
+.shell .gw-provider-search-row .gw-models-tabs {
+  flex: none;
+}
+
+.shell .gw-provider-search-gap {
+  flex: 1;
+}
+
+@media (max-width: 760px) {
+  .shell .gw-route-member-row {
+    grid-template-columns: 22px 22px minmax(0, 1fr) auto;
+  }
+
+  .shell .gw-route-member-row > .gw-quota-badge,
+  .shell .gw-route-member-row > .gw-route-member-speed,
+  .shell .gw-route-member-row > .gw-route-member-weight {
+    display: none;
+  }
+}
+
+/* 卡片右上的两个下拉并排；窄屏再换行。 */
+.shell .gw-route-group-controls > * {
+  width: 150px;
+  min-width: 0;
+  flex: none;
+}
+
+.shell .gw-models-toolbar .gw-models-auto + .gw-primary-button {
+  margin-left: 0;
 }

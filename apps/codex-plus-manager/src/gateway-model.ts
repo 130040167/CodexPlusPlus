@@ -8,7 +8,7 @@ import { PRESETS } from "./presets.ts";
 export type GatewayAgentId = "codex" | "claude" | "grok";
 export type UnknownModelPolicy = "mapToDefault" | "passthrough";
 export type KeyRotationMode = "sticky" | "roundRobin";
-export type GroupMode = "inOrder" | "rotate" | "weighted" | "usage" | "fast";
+export type GroupMode = "inOrder" | "rotate" | "weighted" | "usage" | "fast" | "manual";
 /** 同一会话在组里固定用哪个成员：缓存有效期内（默认）/ 整个会话 / 不固定。 */
 export type GroupSticky = "cache" | "session" | "off";
 
@@ -77,7 +77,20 @@ export type GatewayPoolEntry = {
 export type ProviderPrice = { currency: string; input: number; cachedInput: number; output: number };
 
 export type GroupMember = { model: string; weight: number };
-export type GatewayGroupEntry = { id: string; name: string; mode: GroupMode; sticky?: GroupSticky; members: GroupMember[] };
+export type GatewayGroupEntry = {
+  id: string;
+  name: string;
+  mode: GroupMode;
+  sticky?: GroupSticky;
+  members: GroupMember[];
+  /** 隐藏成员：组里的模型不再单独出现在 Agent 的模型列表里，只能通过组来选。 */
+  hideMembers?: boolean;
+  /** 手动模式下选中的成员（成员的模型名）。 */
+  pick?: string;
+};
+
+/** 自动组：池里多家都有的模型各一个，`name` 是模型名，`id` 是 `auto:<小写模型名>`。 */
+export type AutoGroupEntry = GatewayGroupEntry & { hidden: boolean; customized: boolean };
 
 /** 订阅账号的一个额度窗口：windowMinutes 300 是 5 小时、10080 是每周，null 是按月（Copilot 高级请求）。 */
 export type QuotaWindow = { windowMinutes: number | null; usedPercent: number; resetsAtMs: number | null };
@@ -171,6 +184,8 @@ export type GatewayPayload = {
   codexAggregates?: Array<{ id: string; name: string; members: number; mode: GroupMode; sticky: GroupSticky; imported: boolean }>;
   /** 直连模式的官方登录账号：不能复制，要在网关里单独登录。名字已打码。 */
   codexOfficial?: Array<{ id: string; name: string }>;
+  /** 自动组（旧版后端没有这个字段）。 */
+  autoGroups?: AutoGroupEntry[];
 };
 
 export type GatewayResult = { status: string; message: string } & Partial<GatewayPayload>;
@@ -432,38 +447,36 @@ export function pickerSections(
   const query = rawQuery.trim().toLowerCase();
   const sections: PickerSection[] = [];
   const providers = agentPoolProviders(payload, exclude);
-  // 多家都有的模型：每家名下那份固定发给这一家（`<供应商 id>/<模型>`）；打开「多家自动切换」时另列一份裸名，
-  // 选它才按池顺序依次尝试。只有一家的模型用裸名（只有这一家）。与写给 Codex 的模型列表一致。
+  // 多家都有的模型：每家名下那份固定发给这一家（`<供应商 id>/<模型>`）；它的自动组生效时另列一份裸名，
+  // 选它按自动组的方式走。只有一家的模型用裸名。隐藏了成员的组，成员不单独列出。与写给 Codex 的模型列表一致。
+  const unlisted = unlistedModels(payload);
   const shared: string[] = [];
   for (const entry of providers) {
     const providerHit = matches(query, entry.name, entry.id);
     const items = entry.models
       .filter((model) => providerHit || matches(query, model))
-      .map((model) => {
+      .flatMap((model) => {
         const multi = servingProviders(payload, model, exclude).length > 1;
         if (multi && !shared.some((known) => known.toLowerCase() === model.toLowerCase())) shared.push(model);
-        return { model: multi ? `${entry.id}/${model}` : model, label: prettyModelName(model), sub: maskAccountName(entry.name), avatar: avatar(entry.name) };
+        const value = multi ? `${entry.id}/${model}` : model;
+        if (unlisted.has(value.toLowerCase())) return [];
+        return [{ model: value, label: prettyModelName(model), sub: maskAccountName(entry.name), avatar: avatar(entry.name) }];
       });
     if (items.length) sections.push({ key: `provider:${entry.id}`, title: maskAccountName(entry.name), avatar: avatar(entry.name), items });
   }
-  // 「多家自动切换」默认关（在「模型」页打开）。
-  if (shared.length && payload.gateway.autoModels) {
-    sections.push({
-      key: "auto",
-      title: "多家自动切换",
+  const autoItems = shared
+    .filter((model) => activeAutoGroup(payload, model))
+    .map((model) => ({
+      model,
+      label: prettyModelName(model),
+      sub: servingProviders(payload, model, exclude).map((entry) => maskAccountName(entry.name)).join(" → "),
       avatar: "",
-      items: shared.map((model) => ({
-        model,
-        label: prettyModelName(model),
-        sub: servingProviders(payload, model, exclude).map((entry) => maskAccountName(entry.name)).join(" → "),
-        avatar: "",
-      })),
-    });
-  }
+    }));
+  if (autoItems.length) sections.push({ key: "auto", title: "自动组", avatar: "", items: autoItems });
   const groups = payload.groups
     .filter((group) => group.id !== skipGroup && group.members.length && matches(query, group.name, groupModelId(group.id)))
     .map((group) => ({ model: groupModelId(group.id), label: group.name, sub: groupModelId(group.id), avatar: avatar(group.name) }));
-  if (groups.length) sections.push({ key: "group", title: "模型组", avatar: "", items: groups });
+  if (groups.length) sections.push({ key: "group", title: "我的组", avatar: "", items: groups });
   const typed = rawQuery.trim();
   if (typed && !/\s/.test(typed) && !modelRoutable(payload, typed, exclude)) {
     sections.push({
@@ -566,6 +579,8 @@ export function groupModeLabel(mode: string): string {
       return "额度优先";
     case "fast":
       return "速度优先";
+    case "manual":
+      return "手动";
     default:
       return "依次";
   }
@@ -581,6 +596,8 @@ export function groupModeDescription(mode: string): string {
       return "额度优先：订阅账号里剩余额度最多的先试；没有额度数据的排在后面，额度用完的排最后。";
     case "fast":
       return "速度优先：最近响应最快的先试；还没测过的先试一次，之后按实测速度排。";
+    case "manual":
+      return "手动：只发给选中的那个成员，它答不了也不换；在成员列表里点一下就换成它。";
     default:
       return "依次：按成员顺序，前一个答不了才换下一个，每个成员再按自己的 Key 轮换。";
   }
@@ -714,7 +731,7 @@ export function memberStatus(payload: GatewayPayload | null, relayId: string, no
 }
 
 /**
- * 「模型」页矩阵里一格（供应商 × 模型）的状态：冷却、熔断按整家供应商算；「刚用过」只标在真正被请求的那个模型上。
+ * 供应商池「按模型」矩阵、路由页组成员里一格（供应商 × 模型）的状态：冷却、熔断按整家供应商算；「刚用过」只标在真正被请求的那个模型上。
  * 其它情况不显示（返回 null）。
  */
 export function dispatchStatus(payload: GatewayPayload | null, relayId: string, model: string, nowMs: number = Date.now()): MemberStatus | null {
@@ -781,7 +798,7 @@ export type DispatchProvider = { id: string; name: string; baseUrl: string; excl
 export type DispatchRow = { model: string; providers: DispatchProvider[] };
 
 /**
- * 「模型」页矩阵：每个模型名列出池里提供它的供应商，顺序就是网关的尝试顺序（与后端 `expand_model` 一致：
+ * 供应商池「按模型」矩阵：每个模型名列出池里提供它的供应商，顺序就是网关的尝试顺序（与后端 `expand_model` 一致：
  * 打开的供应商按池顺序）。有备用的模型排前面；`excludedBy` 是在「挑选」里排除了这家的已接入 Agent。
  */
 export function modelDispatch(payload: GatewayPayload | null): DispatchRow[] {
@@ -1294,4 +1311,37 @@ export function toggleFavoriteModel(favorites: string[], model: string, payload:
   const copies = pinnedCopies(payload, model);
   if (copies.length && !copies.some((copy) => favorites.includes(copy))) return [...next, ...copies];
   return next;
+}
+
+/* —————————————— 路由：自动组、隐藏成员 —————————————— */
+
+/** 这个裸模型名现在走不走自动组：自动建组开着、这个自动组没被隐藏（与后端 `active_auto_group` 一致）。 */
+export function activeAutoGroup(payload: GatewayPayload | null, model: string): AutoGroupEntry | null {
+  if (!payload || payload.gateway.autoModels === false) return null;
+  const found = payload.autoGroups?.find((group) => group.name.toLowerCase() === model.toLowerCase());
+  return found && !found.hidden ? found : null;
+}
+
+/** 隐藏了成员的组（自建的、生效中的自动组）里，不再单独出现在模型列表里的模型（小写）。 */
+export function unlistedModels(payload: GatewayPayload | null): Set<string> {
+  const hidden = new Set<string>();
+  const add = (group: GatewayGroupEntry) => {
+    for (const member of group.members) {
+      const model = member.model.trim();
+      if (model && !model.includes("*") && !model.startsWith(GROUP_MODEL_PREFIX)) hidden.add(model.toLowerCase());
+    }
+  };
+  for (const group of payload?.groups ?? []) if (group.hideMembers) add(group);
+  if (payload?.gateway.autoModels !== false) {
+    for (const group of payload?.autoGroups ?? []) if (group.hideMembers && !group.hidden) add(group);
+  }
+  return hidden;
+}
+
+/** 组成员指向的具体上游：`<供应商 id>/<模型>` 或只有一家的裸模型名才有；多家的裸名、组、通配符返回 null。 */
+export function memberTarget(payload: GatewayPayload | null, model: string): { entry: GatewayPoolEntry; model: string } | null {
+  const qualified = qualifiedProvider(payload, model.trim());
+  if (qualified) return qualified;
+  const serving = servingProviders(payload, model);
+  return serving.length === 1 ? { entry: serving[0], model: model.trim() } : null;
 }
