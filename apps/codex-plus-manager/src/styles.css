@@ -12804,9 +12804,6 @@ button.side-item:hover {
   max-width: none;
   padding-top: 0;
 }
-.shell .gw-lead {
-  font-size: 13px;
-}
 .shell .gw-agent-row {
   grid-template-columns: 30px minmax(0, 1fr) auto minmax(180px, 260px) auto;
   gap: 14px;

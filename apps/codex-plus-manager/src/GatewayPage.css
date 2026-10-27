@@ -90,13 +90,6 @@
   padding-bottom: 28px;
 }
 
-.gw-lead {
-  margin: 0;
-  color: var(--gw-ink);
-  font-size: 13.5px;
-  line-height: 1.6;
-}
-
 .gw-alert {
   display: flex;
   align-items: center;

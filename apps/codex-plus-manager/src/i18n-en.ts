@@ -1149,7 +1149,6 @@ export const EN_PLAIN: Record<string, string> = {
   "至少保留一个模型": "Keep at least one model",
   "保存模型列表": "Save model list",
   "后台检查发现上游有新模型，点开查看": "Background check found new upstream models; click to review",
-  "接入后 Agent 的请求经 Codex++ 转发到供应商池。右侧选的是默认模型，在 Agent 里随时可以换。": "Connected agents send requests through Codex++ to the provider pool. The model on the right is the default; switch anytime inside the agent.",
   "未接入": "Not connected",
   "被改动": "Changed",
   "套餐": "Plan",

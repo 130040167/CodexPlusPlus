@@ -56,7 +56,6 @@ export function AgentsView({
   );
   return (
     <>
-      <p className="gw-lead">{t("接入后 Agent 的请求经 Codex++ 转发到供应商池。右侧选的是默认模型，在 Agent 里随时可以换。")}</p>
       <div className="gw-card gw-agent-card">
         {connected.length ? <div className="gw-subhead">{t("已接入")}<em>{connected.length}</em></div> : null}
         {connected.map(row)}
