@@ -39,8 +39,9 @@ const throwingStorage = {
   },
 };
 
-test("托盘面板四个页签，网关只是其中之一且排在最后；默认是概览", () => {
-  assert.deepEqual([...TRAY_TABS], ["home", "providers", "usage", "gateway"]);
+test("托盘面板三个页签，网关只是其中之一且排在最后；默认是概览；没有旧版的供应商切换", () => {
+  assert.deepEqual([...TRAY_TABS], ["home", "usage", "gateway"]);
+  assert.equal(restoreTrayTab("providers"), "home", "上次停在已去掉的「供应商」页签时回到概览");
   assert.equal(restoreTrayTab(null), "home");
   assert.equal(restoreTrayTab("gateway"), "gateway");
   assert.equal(restoreTrayTab("routing"), "home", "不认识的旧值回到概览");
@@ -51,7 +52,7 @@ test("记住上次的页签：读写 localStorage，存储不可用时不抛错"
   storeTrayTab("usage", storage);
   assert.equal(storage.data.get(TRAY_TAB_STORAGE_KEY), "usage");
   assert.equal(readStoredTrayTab(storage), "usage");
-  assert.doesNotThrow(() => storeTrayTab("providers", throwingStorage));
+  assert.doesNotThrow(() => storeTrayTab("gateway", throwingStorage));
   assert.equal(readStoredTrayTab(throwingStorage), "home");
   assert.equal(readStoredTrayTab(null), "home");
 });
@@ -149,10 +150,10 @@ test("订阅额度：只列有额度的启用供应商，过了重置时间按�
 });
 
 test("主窗口只接受格式正确的面板请求", () => {
-  assert.deepEqual(parseTrayRequest({ id: "1", kind: "navigate", route: "relay" }), { id: "1", kind: "navigate", route: "relay" });
+  assert.deepEqual(parseTrayRequest({ id: "1", kind: "navigate", route: "gatewayRouting" }), { id: "1", kind: "navigate", route: "gatewayRouting" });
+  assert.equal(parseTrayRequest({ id: "1", kind: "navigate", route: "relay" }), null, "旧版供应商页不从面板打开");
   assert.equal(parseTrayRequest({ id: "1", kind: "navigate", route: "dreamSkin" }), null, "不在白名单里的页面不打开");
-  assert.deepEqual(parseTrayRequest({ id: "2", kind: "switchRelay", profileId: "a" }), { id: "2", kind: "switchRelay", profileId: "a" });
-  assert.equal(parseTrayRequest({ id: "2", kind: "switchRelay", profileId: "" }), null);
+  assert.equal(parseTrayRequest({ id: "2", kind: "switchRelay", profileId: "a" }), null, "面板不再切换直连供应商");
   assert.deepEqual(parseTrayRequest({ id: "3", kind: "restart" }), { id: "3", kind: "restart" });
   assert.equal(parseTrayRequest({ kind: "launch" }), null);
   assert.equal(parseTrayRequest({ id: "4", kind: "deleteEverything" }), null);
@@ -171,6 +172,7 @@ test("托盘面板改成多页签：网关只是一个页签，记住页签，�
   const app = read("./App.tsx");
   assert.match(app, /listen<unknown>\(TRAY_REQUEST_EVENT/);
   assert.match(app, /emit\(TRAY_RESULT_EVENT, result\)/);
+  assert.doesNotMatch(panel, /ProvidersTab|switchRelay/);
 });
 
 test("「点击托盘图标弹出快捷面板」从网关设置移到整体设置，仍存 gateway.json 的 trayPanel", () => {

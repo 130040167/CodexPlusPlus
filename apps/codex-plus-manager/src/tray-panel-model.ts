@@ -1,14 +1,14 @@
 /** 托盘快捷面板的纯数据逻辑：页签、Codex 状态、供应商列表、用量速览。不碰 i18n，文案由组件翻译。 */
 import type { GatewayPayload, GatewayPoolEntry, QuotaWindow, UsageSummary } from "./gateway-model.ts";
 
-export type TrayTabId = "home" | "providers" | "usage" | "gateway";
+export type TrayTabId = "home" | "usage" | "gateway";
 
 /** 页签顺序：先放所有用户都用得上的，网关放最后。 */
-export const TRAY_TABS: readonly TrayTabId[] = ["home", "providers", "usage", "gateway"];
+export const TRAY_TABS: readonly TrayTabId[] = ["home", "usage", "gateway"];
 
 export const TRAY_TAB_STORAGE_KEY = "codex-plus-tray-tab";
 
-/** 存储里的值不认识（旧版本、被改坏）时回到「概览」。 */
+/** 存储里的值不认识（旧版本、被改坏，或已去掉的「供应商」页签）时回到「概览」。 */
 export function restoreTrayTab(raw: string | null | undefined): TrayTabId {
   return TRAY_TABS.includes(raw as TrayTabId) ? (raw as TrayTabId) : "home";
 }
@@ -210,13 +210,12 @@ export function trayQuotaRows(pool: GatewayPoolEntry[] | undefined, nowMs: numbe
 /** 面板发给主窗口的请求（主窗口执行后回一个结果）。 */
 export type TrayRequest =
   | { id: string; kind: "navigate"; route: TrayRoute }
-  | { id: string; kind: "switchRelay"; profileId: string }
   | { id: string; kind: "launch" | "restart" | "stop" };
 
 export type TrayResult = { id: string; ok: boolean; message?: string };
 
 /** 面板能直接打开的主窗口页面。 */
-export const TRAY_ROUTES = ["overview", "relay", "sessions", "requestLog", "gateway", "gatewayProviders", "gatewayUsage", "settings"] as const;
+export const TRAY_ROUTES = ["overview", "sessions", "requestLog", "gateway", "gatewayProviders", "gatewayRouting", "gatewayUsage", "settings"] as const;
 export type TrayRoute = (typeof TRAY_ROUTES)[number];
 
 export function isTrayRoute(value: unknown): value is TrayRoute {
@@ -232,7 +231,6 @@ export function parseTrayRequest(value: unknown): TrayRequest | null {
   const raw = value as Record<string, unknown>;
   if (typeof raw.id !== "string" || !raw.id) return null;
   if (raw.kind === "navigate") return isTrayRoute(raw.route) ? { id: raw.id, kind: "navigate", route: raw.route } : null;
-  if (raw.kind === "switchRelay") return typeof raw.profileId === "string" && raw.profileId ? { id: raw.id, kind: "switchRelay", profileId: raw.profileId } : null;
   if (raw.kind === "launch" || raw.kind === "restart" || raw.kind === "stop") return { id: raw.id, kind: raw.kind };
   return null;
 }

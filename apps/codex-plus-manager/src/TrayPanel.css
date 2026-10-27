@@ -81,10 +81,10 @@ body:has(.tray-panel) {
   background: hsl(var(--primary));
 }
 
-/* ———— 页签条：四格等宽，图标在上、文字在下，选中格浮起 ———— */
+/* ———— 页签条：三格等宽，图标在上、文字在下，选中格浮起 ———— */
 .tray-panel .tp-tabs {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 4px;
   margin: 0 12px 10px;
   padding: 3px;
@@ -460,80 +460,6 @@ body:has(.tray-panel) {
 .tray-panel .tp-quick-item:hover {
   border-color: hsl(var(--primary) / 0.45);
   background: hsl(var(--accent) / 0.6);
-}
-
-/* ———— 供应商 ———— */
-.tray-panel .tp-relay {
-  display: grid;
-  grid-template-columns: 24px minmax(0, 1fr) auto 18px;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  min-height: 50px;
-  padding: 8px 12px;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
-}
-
-.tray-panel .tp-list > .tp-relay:first-child {
-  border-radius: 13px 13px 0 0;
-}
-
-.tray-panel .tp-list > .tp-relay:last-child {
-  border-radius: 0 0 13px 13px;
-}
-
-.tray-panel .tp-list > .tp-relay:only-child {
-  border-radius: 13px;
-}
-
-.tray-panel .tp-relay:hover:not(:disabled) {
-  background: hsl(var(--accent) / 0.7);
-}
-
-.tray-panel .tp-relay:disabled {
-  cursor: default;
-}
-
-.tray-panel .tp-relay[data-active="true"] {
-  background: hsl(var(--primary) / 0.08);
-}
-
-.tray-panel .tp-relay-main {
-  display: grid;
-  min-width: 0;
-}
-
-.tray-panel .tp-relay-main strong,
-.tray-panel .tp-relay-main small {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.tray-panel .tp-relay-main strong {
-  font-size: 13px;
-  font-weight: 500;
-}
-
-.tray-panel .tp-relay-main small {
-  color: var(--gw-mute);
-  font-size: 11.5px;
-}
-
-.tray-panel .tp-relay-mark {
-  display: inline-flex;
-  color: hsl(var(--primary));
-}
-
-.tray-panel .tp-relay-mark svg {
-  width: 16px;
-  height: 16px;
 }
 
 .tray-panel .tp-kind {

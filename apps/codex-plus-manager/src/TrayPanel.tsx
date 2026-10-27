@@ -1,9 +1,10 @@
 /**
- * 托盘快捷面板：四个页签——
- * 概览（Codex 状态与启动 / 重启 / 停止、今日速览、常用入口）、供应商（直连供应商一键切换）、
+ * 托盘快捷面板：三个页签——
+ * 概览（Codex 状态与启动 / 重启 / 停止、今日速览、常用入口）、
  * 用量（今天 / 7 天的请求与 token、订阅额度、余额）、网关（各 Agent 换模型、最近请求）。
+ * 旧版的直连供应商切换不放进面板：供应商统一在网关里管。
  *
- * 会改配置或拉起进程的操作（切换供应商、启动 Codex）不在面板里重做一遍，而是发给主窗口，
+ * 会拉起进程的操作（启动 / 重启 / 停止 Codex）不在面板里重做一遍，而是发给主窗口，
  * 走主窗口现有的流程（校验、冲突弹窗、等待启动结果），做完主窗口回一个结果。
  */
 import { useEffect, useRef, useState, type ReactNode } from "react";
@@ -21,6 +22,7 @@ import {
   MessagesSquare,
   Play,
   Plug,
+  Split,
   RefreshCw,
   RotateCw,
   ScrollText,
@@ -60,7 +62,6 @@ import {
   readStoredTrayTab,
   storeTrayTab,
   trayQuotaRows,
-  trayRelayItems,
   usageGlance,
   TRAY_REQUEST_EVENT,
   TRAY_RESULT_EVENT,
@@ -106,13 +107,12 @@ type LogEntry = {
 type UsageRange = "today" | "7d";
 
 /** 网关页签要看实时请求，刷得勤一些；其它页签慢一点。都只在面板可见时刷。 */
-const REFRESH_MS: Record<TrayTabId, number> = { home: 5000, providers: 8000, usage: 8000, gateway: 3000 };
-/** 发给主窗口的请求最多等这么久（启动 Codex 本身最多等 30 秒，切换供应商可能弹冲突窗口）。 */
+const REFRESH_MS: Record<TrayTabId, number> = { home: 5000, usage: 8000, gateway: 3000 };
+/** 发给主窗口的请求最多等这么久（启动 Codex 本身最多等 30 秒）。 */
 const REQUEST_TIMEOUT_MS = 90_000;
 
 const TAB_META: Record<TrayTabId, { label: string; icon: LucideIcon }> = {
   home: { label: "概览", icon: House },
-  providers: { label: "供应商", icon: Plug },
   usage: { label: "用量", icon: ChartColumn },
   gateway: { label: "网关", icon: Waypoints },
 };
@@ -194,7 +194,6 @@ export function TrayPanel() {
   const loadTab = async (which: TrayTabId) => {
     const jobs: Array<Promise<void>> = [loadOverview()];
     if (which === "home") jobs.push(loadSettings(), loadUsage("today"));
-    if (which === "providers") jobs.push(loadSettings());
     if (which === "usage") jobs.push(loadUsage(rangeRef.current), loadGateway());
     if (which === "gateway") jobs.push(loadGateway(), loadLogs());
     await Promise.all(jobs);
@@ -261,16 +260,14 @@ export function TrayPanel() {
   const finishPending = (current: Pending, ok: boolean, message?: string) => {
     pendingRef.current = null;
     setPending(null);
-    if (current.kind === "switchRelay") {
-      setFlash(ok ? { tone: "ok", text: tf("已切换到 {0}", [current.target ?? ""]) } : { tone: "error", text: message || t("切换没有完成，详情见主窗口。") });
-    } else if (current.kind !== "navigate") {
+    if (current.kind !== "navigate") {
       if (!ok) setFlash({ tone: "error", text: message || t("没有完成，详情见主窗口。") });
     }
     void loadTab(tabRef.current);
   };
 
   /** 把请求发给主窗口。同一时间只处理一个。 */
-  const request = async (body: { kind: "switchRelay"; profileId: string } | { kind: "launch" | "restart" | "stop" }, target?: string) => {
+  const request = async (body: { kind: "launch" | "restart" | "stop" }, target?: string) => {
     if (pendingRef.current) return;
     const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const next: Pending = { id, kind: body.kind, target };
@@ -356,7 +353,6 @@ export function TrayPanel() {
             today={usage.today ?? null}
           />
         ) : null}
-        {tab === "providers" ? <ProvidersTab onOpenRoute={openRoute} onSwitch={(id, name) => void request({ kind: "switchRelay", profileId: id }, name)} pending={pending} settings={settings} /> : null}
         {tab === "usage" ? (
           <UsageTab
             balances={balances}
@@ -429,11 +425,11 @@ function LinkButton({ label, onClick }: { label: string; onClick: () => void }) 
 /* —————————————— 概览 —————————————— */
 
 const QUICK_LINKS: Array<{ route: TrayRoute; label: string; icon: LucideIcon }> = [
-  { route: "relay", label: "供应商", icon: Plug },
   { route: "sessions", label: "会话", icon: MessagesSquare },
   { route: "requestLog", label: "请求日志", icon: ScrollText },
   { route: "gateway", label: "网关接入", icon: Waypoints },
   { route: "gatewayProviders", label: "供应商池", icon: Layers },
+  { route: "gatewayRouting", label: "模型调度", icon: Split },
   { route: "gatewayUsage", label: "用量统计", icon: Activity },
 ];
 
@@ -458,7 +454,7 @@ function HomeTab({
   const active = activeRelayItem(settings);
   const glance = usageGlance(today);
   const busy = pending !== null;
-  const busyKind = pending && pending.kind !== "switchRelay" && pending.kind !== "navigate" ? pending.kind : null;
+  const busyKind = pending && pending.kind !== "navigate" ? pending.kind : null;
   const connection = settings?.relayProfilesEnabled === false
     ? t("供应商配置已关闭")
     : !active
@@ -543,84 +539,6 @@ function Stat({ label, value }: { label: string; value: string }) {
       <strong>{value}</strong>
       <small>{label}</small>
     </span>
-  );
-}
-
-/* —————————————— 供应商 —————————————— */
-
-const KIND_LABEL: Record<TrayRelayKind, string> = {
-  gateway: "网关",
-  aggregate: "聚合",
-  conversion: "协议转换",
-  official: "官方",
-  direct: "",
-};
-
-function ProvidersTab({
-  settings,
-  pending,
-  onSwitch,
-  onOpenRoute,
-}: {
-  settings: TraySettings | null;
-  pending: Pending | null;
-  onSwitch: (id: string, name: string) => void;
-  onOpenRoute: (route: TrayRoute) => Promise<void>;
-}) {
-  if (!settings) return <div className="tp-empty">{t("正在读取…")}</div>;
-  const items = trayRelayItems(settings);
-  if (settings.relayProfilesEnabled === false) {
-    return (
-      <div className="tp-card tp-intro">
-        <Plug aria-hidden="true" className="tp-intro-icon" />
-        <strong>{t("供应商配置已关闭")}</strong>
-        <p>{t("现在不会改写 Codex 的 config.toml / auth.json。到供应商页打开总开关后，就能在这里一键切换。")}</p>
-        <button className="tp-button" data-variant="primary" onClick={() => void onOpenRoute("relay")} type="button">{t("打开供应商页")}</button>
-      </div>
-    );
-  }
-  if (!items.length) {
-    return (
-      <div className="tp-card tp-intro">
-        <Plug aria-hidden="true" className="tp-intro-icon" />
-        <strong>{t("还没有配置供应商")}</strong>
-        <p>{t("添加一个供应商后，就能在这里一键切换 Codex 用哪家。")}</p>
-        <button className="tp-button" data-variant="primary" onClick={() => void onOpenRoute("relay")} type="button">{t("添加供应商")}</button>
-      </div>
-    );
-  }
-  const switching = pending?.kind === "switchRelay";
-  return (
-    <Section aside={<LinkButton label={t("管理")} onClick={() => void onOpenRoute("relay")} />} title={t("Codex 用哪家供应商")}>
-      <div className="tp-card tp-list">
-        {items.map((item) => {
-          const label = item.name || t("未命名供应商");
-          const busyHere = switching && pending?.target === label;
-          return (
-            <button
-              aria-pressed={item.active}
-              className="tp-relay"
-              data-active={item.active}
-              disabled={item.active || switching}
-              key={item.id}
-              onClick={() => onSwitch(item.id, label)}
-              type="button"
-            >
-              <Avatar baseUrl={item.baseUrl} name={label} size="sm" />
-              <span className="tp-relay-main">
-                <strong>{maskAccountName(label)}</strong>
-                {item.detail ? <small>{item.detail}</small> : null}
-              </span>
-              {KIND_LABEL[item.kind] ? <em className="tp-kind">{t(KIND_LABEL[item.kind])}</em> : null}
-              <span className="tp-relay-mark">
-                {item.active ? <Check aria-label={t("当前")} /> : busyHere ? <RefreshCw aria-hidden="true" className="animate-spin" /> : null}
-              </span>
-            </button>
-          );
-        })}
-      </div>
-      <p className="tp-note">{t("切换会改写 Codex 的配置；已打开的 Codex 会话可能要重启 Codex 才会用上新的供应商。")}</p>
-    </Section>
   );
 }
 

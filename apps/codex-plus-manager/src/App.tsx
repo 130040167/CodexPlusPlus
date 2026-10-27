@@ -3853,7 +3853,7 @@ export function App() {
     };
   }, []);
 
-  // 托盘快捷面板发来的请求：打开某页、切换供应商、启动 / 重启 / 停止 Codex。
+  // 托盘快捷面板发来的请求：打开某页、启动 / 重启 / 停止 Codex。
   // 复用主窗口现有流程（校验、冲突弹窗、等待启动结果），做完给面板回一个结果；
   // 没成功时把主窗口叫出来，失败提示是在主窗口里弹的。
   // 监听只注册一次，处理函数每次渲染更新到 ref 里，读到的总是最新状态。
@@ -3861,21 +3861,9 @@ export function App() {
   trayRequestHandlerRef.current = async (request: TrayRequest): Promise<TrayResult> => {
     const revealMainWindow = () => void invoke("tray_panel_action", { action: "open" }).catch(() => {});
     if (request.kind === "navigate") {
-      if (request.route === "relay" || request.route === "sessions" || request.route === "requestLog") setActiveTool("codex");
+      if (request.route === "sessions" || request.route === "requestLog") setActiveTool("codex");
       await navigate(request.route);
       return { id: request.id, ok: true };
-    }
-    if (request.kind === "switchRelay") {
-      // 设置还没读回来时表单是默认值，拿它去切换会把配置写坏。
-      if (!settings) return { id: request.id, ok: false, message: t("主窗口还没读到设置，请稍后再试。") };
-      const normalized = normalizeSettings(settingsForm);
-      if (request.profileId === normalized.activeRelayId) return { id: request.id, ok: true };
-      if (!normalized.relayProfiles.some((profile) => profile.id === request.profileId)) {
-        return { id: request.id, ok: false, message: t("没找到这个供应商，可能已被删除。") };
-      }
-      const switched = await switchRelayProfile(syncLegacyRelayFields({ ...normalized, activeRelayId: request.profileId }), normalized.activeRelayId);
-      if (!switched) revealMainWindow();
-      return { id: request.id, ok: switched };
     }
     const done = request.kind === "launch" ? await launch() : request.kind === "restart" ? await restart() : await stopCodex();
     if (!done) revealMainWindow();
