@@ -433,6 +433,40 @@ pub fn save_gateway_options(
     respond("网关选项已保存。", "保存网关选项失败", result)
 }
 
+/// 「多家自动切换」开关：多家都有的模型额外列一份按顺序自动切换的入口。改完重写开着的 Agent 配置。
+#[tauri::command]
+pub fn save_gateway_auto_models(enabled: bool) -> CommandResult<Option<GatewayPayload>> {
+    let result = GatewayStore::default().update(|gateway| {
+        gateway.auto_models = enabled;
+        Ok(())
+    });
+    respond(
+        "网关选项已保存。",
+        "保存网关选项失败",
+        refresh_agents(result),
+    )
+}
+
+/// 保存模型收藏（管理器模型下拉里的星标）。写给 Codex 的模型目录会标出收藏，所以也要重写开着的 Agent 配置。
+#[tauri::command]
+pub fn save_gateway_favorites(models: Vec<String>) -> CommandResult<Option<GatewayPayload>> {
+    let mut list: Vec<String> = Vec::new();
+    for model in models
+        .iter()
+        .map(|model| model.trim())
+        .filter(|model| !model.is_empty())
+    {
+        if !list.iter().any(|known| known == model) {
+            list.push(model.to_string());
+        }
+    }
+    let result = GatewayStore::default().update(|gateway| {
+        gateway.favorite_models = list;
+        Ok(())
+    });
+    respond("收藏已保存。", "保存收藏失败", refresh_agents(result))
+}
+
 /// 用内置预设或手填的地址、Key 新建网关供应商。
 #[tauri::command]
 pub fn create_gateway_provider(

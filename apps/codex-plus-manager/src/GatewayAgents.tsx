@@ -1,6 +1,7 @@
 /** 本地网关 · 智能体：每个 Agent 一行，接入后供应商池里的模型都出现在它自己的模型列表里，也可以在这里直接选。 */
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
+import { invoke } from "@tauri-apps/api/core";
 import { appConfirm } from "./app-dialog";
 import { Check, ChevronDown, ChevronRight, ChevronUp, Layers, List, Search, Shuffle, Star, Waypoints, X } from "lucide-react";
 import { t, tf } from "./i18n";
@@ -22,8 +23,10 @@ import {
   maskAccountName,
   isFavoriteModel,
   toggleFavoriteModel,
+  type GatewayResult,
 } from "./gateway-model";
 import { AppSelect } from "./AppSelect";
+import { publishGatewayPayload } from "./gateway-store";
 import { useEscapeLayer } from "./use-escape-layer";
 import { AGENT_ICONS, AutoTag, Avatar, ModelViewGlyph, Switch, avatarOf, loadFavorites, saveFavorites, type Notify, type Run, AgentIcon } from "./gateway-ui";
 
@@ -504,7 +507,19 @@ export function ModelList({
 }) {
   const [query, setQuery] = useState("");
   const [favoritesOnly, setFavoritesOnly] = useState(false);
-  const [favorites, setFavorites] = useState<string[]>(loadFavorites);
+  // 收藏存在网关里（Codex 的选择器也要显示）；旧版存在本窗口的 localStorage，网关里还没有时沿用并迁过去。
+  const stored = payload?.gateway.favoriteModels;
+  const [favorites, setFavorites] = useState<string[]>(() => (stored && stored.length ? stored : loadFavorites()));
+  useEffect(() => {
+    if (stored && stored.length) {
+      setFavorites(stored);
+      return;
+    }
+    const legacy = loadFavorites();
+    if (payload && legacy.length) void persistFavorites(legacy);
+    // 只在网关里的收藏变化时同步。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stored?.join("\n")]);
   const listRef = useRef<HTMLDivElement>(null);
   const sections = useMemo(() => {
     const all = pickerSections(payload, query, avatarOf, exclude, skipGroup);
@@ -516,7 +531,7 @@ export function ModelList({
   const toggleFavorite = (model: string) => {
     const next = toggleFavoriteModel(favorites, model, payload);
     setFavorites(next);
-    saveFavorites(next);
+    void persistFavorites(next);
   };
   const jump = (key: string) => {
     setFavoritesOnly(false);
@@ -603,6 +618,16 @@ export function ModelList({
       {head ? <div className="gw-mp-foot">{head}</div> : null}
     </div>
   );
+}
+
+/** 收藏写进网关（同时留一份在本窗口，后端旧版时也不丢），并把新数据推给其它页面。失败不打扰用户。 */
+async function persistFavorites(models: string[]) {
+  saveFavorites(models);
+  try {
+    publishGatewayPayload(await invoke<GatewayResult>("save_gateway_favorites", { models }));
+  } catch {
+    // 后端没有这个命令（旧版）或保存失败：本窗口里的收藏照样生效。
+  }
 }
 
 /** Agent 行右侧的模型下拉。 */

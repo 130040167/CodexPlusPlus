@@ -322,6 +322,8 @@ pub fn run() {
             gateway_commands::save_gateway_binding,
             gateway_commands::disable_gateway_binding,
             gateway_commands::rotate_gateway_token,
+            gateway_commands::save_gateway_auto_models,
+            gateway_commands::save_gateway_favorites,
             gateway_commands::save_gateway_options,
             gateway_commands::reset_gateway_key_health,
             gateway_commands::create_gateway_provider,

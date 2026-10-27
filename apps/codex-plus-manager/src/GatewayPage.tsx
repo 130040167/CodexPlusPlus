@@ -219,7 +219,7 @@ function RoutingView({ payload, busy, run, onManage }: { payload: GatewayPayload
   };
   return (
     <>
-      <DispatchTable onManage={onManage} payload={payload} />
+      <DispatchTable busy={busy} onManage={onManage} payload={payload} run={run} />
 
       <SectionLabel
         aside={(
@@ -282,7 +282,8 @@ function RoutingView({ payload, busy, run, onManage }: { payload: GatewayPayload
 }
 
 /** 每个模型名一行，列出提供它的供应商；从左到右就是网关的尝试顺序。 */
-function DispatchTable({ payload, onManage }: { payload: GatewayPayload | null; onManage: () => void }) {
+function DispatchTable({ payload, onManage, busy, run }: { payload: GatewayPayload | null; onManage: () => void; busy: string | null; run: Run }) {
+  const autoModels = payload?.gateway.autoModels === true;
   const [query, setQuery] = useState("");
   const [expanded, setExpanded] = useState(false);
   const rows = useMemo(() => modelDispatch(payload), [payload]);
@@ -304,8 +305,21 @@ function DispatchTable({ payload, onManage }: { payload: GatewayPayload | null; 
       </SectionLabel>
       <div className="gw-card gw-dispatch">
         <p className="gw-dispatch-lead">
-          {t("同一个模型有多家提供时，模型列表里每家名下各有一份，选了哪家就只发给哪家；另有一份「自动」（在「多家自动切换」里），选它时网关按下面从左往右的顺序依次尝试：前一家出错、Key 都在冷却或被熔断，就换下一家。顺序跟着供应商池走，在池里拖动即可调整。")}
+          {t("同一个模型有多家提供时，Agent 的模型列表里每家名下各有一份，选了哪家就只发给哪家。下面的顺序给「自动」用：前一家出错、Key 都在冷却或被熔断，就换下一家；顺序跟着供应商池走，在池里拖动即可调整。")}
         </p>
+        <div className="gw-setting-row gw-dispatch-auto">
+          <div>
+            <strong>{t("多家自动切换")}</strong>
+            <small>{autoModels ? t("已打开：多家都有的模型在「多家自动切换」里另有一份「自动」，按下面的顺序依次尝试。") : t("打开后，多家都有的模型会在「多家自动切换」里另列一份「自动」，按下面的顺序依次尝试；关着时只能选具体某一家。")}</small>
+          </div>
+          <span />
+          <Switch
+            disabled={busy !== null || !payload}
+            label={t("多家自动切换")}
+            on={autoModels}
+            onToggle={() => void run("auto-models", "save_gateway_auto_models", { enabled: !autoModels }, t("多家自动切换"), true)}
+          />
+        </div>
         {rows.length > DISPATCH_PREVIEW ? (
           <div className="gw-dispatch-search">
             <Search aria-hidden className="h-4 w-4" />

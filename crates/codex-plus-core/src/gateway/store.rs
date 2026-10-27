@@ -360,6 +360,12 @@ pub struct GatewaySettings {
     /// 左键点托盘图标弹出快捷面板（默认开）；关掉时托盘保持原来的点击行为。
     #[serde(default = "enabled_by_default")]
     pub tray_panel: bool,
+    /// 多家都有的模型额外列一份「自动」（按池顺序在各家之间切换）。默认关：只列各家固定的那份。
+    #[serde(default)]
+    pub auto_models: bool,
+    /// 收藏的模型（管理器模型下拉里点的星标）：写给 Codex 的模型目录时标出来，Codex 的选择器里也显示星标。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub favorite_models: Vec<String>,
     /// 最后写这个文件的 Codex++ 版本。降级到旧版时旧版不会跑这里的代码，只留个记录方便排查。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub app_version: String,
@@ -383,6 +389,8 @@ impl Default for GatewaySettings {
             providers: Vec::new(),
             groups: Vec::new(),
             tray_panel: true,
+            auto_models: false,
+            favorite_models: Vec::new(),
             app_version: String::new(),
             extra: Map::new(),
         }

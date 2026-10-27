@@ -367,6 +367,9 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
             fields.insert("description".into(), json!(format!("{model} · 模型组")));
             fields.insert("codex_plus_group".into(), json!("模型组"));
             fields.insert("codex_plus_group_id".into(), json!(CODEX_GROUPS_GROUP_ID));
+            if codex_favorite(gateway, &relays, &model) {
+                fields.insert("codex_plus_favorite".into(), json!(true));
+            }
             metadata.insert(model, Value::Object(fields));
             continue;
         }
@@ -406,6 +409,9 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
             );
             fields.insert("codex_plus_group".into(), json!("多家自动切换"));
             fields.insert("codex_plus_group_id".into(), json!(CODEX_AUTO_GROUP_ID));
+            if codex_favorite(gateway, &relays, &model) {
+                fields.insert("codex_plus_favorite".into(), json!(true));
+            }
             metadata.insert(model, Value::Object(fields));
             continue;
         }
@@ -430,12 +436,40 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
         fields.insert("description".into(), json!(format!("{upstream} · {group}")));
         fields.insert("codex_plus_group".into(), json!(group));
         fields.insert("codex_plus_group_id".into(), json!(relay.id));
+        if codex_favorite(gateway, &relays, &model) {
+            fields.insert("codex_plus_favorite".into(), json!(true));
+        }
         metadata.insert(model, Value::Object(fields));
     }
     if metadata.is_empty() {
         return String::new();
     }
     serde_json::to_string(&Value::Object(metadata)).unwrap_or_default()
+}
+
+/// 这个模型在管理器里收藏过没有（与管理器的 `isFavoriteModel` 一致）：直接收藏过这个名字算；
+/// 旧版收藏的是裸名，那时多家都有的模型只有一份——这个模型还没有任何一家的那份被单独收藏过时，
+/// 裸名收藏也点亮各家那几份。
+fn codex_favorite(gateway: &GatewaySettings, relays: &[&RelayProfile], model: &str) -> bool {
+    let favorites = &gateway.favorite_models;
+    let has = |name: &str| favorites.iter().any(|item| item.eq_ignore_ascii_case(name));
+    if has(model) {
+        return true;
+    }
+    let Some((_, upstream)) = route::codex_model_owner(relays, model) else {
+        return false;
+    };
+    if upstream == model || !has(&upstream) {
+        return false;
+    }
+    !relays
+        .iter()
+        .filter(|relay| {
+            route::relay_models(relay)
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&upstream))
+        })
+        .any(|relay| has(&format!("{}/{upstream}", relay.id)))
 }
 
 /// 同名模型显示名后的 `（供应商）` 后缀：注入层只认 24 个字以内的后缀。打码后的完整名放得下就用它；

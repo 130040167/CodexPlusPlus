@@ -3392,3 +3392,8 @@ body:has(.gw-modal-backdrop) .app-select-menu-portal {
   font-style: normal;
   line-height: 18px;
 }
+
+/* 模型调度页里的「多家自动切换」开关行。 */
+.shell .gw-dispatch .gw-dispatch-auto {
+  padding: 12px 20px;
+}

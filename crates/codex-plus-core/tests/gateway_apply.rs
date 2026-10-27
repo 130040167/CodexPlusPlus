@@ -441,6 +441,14 @@ fn codex_gateway_catalog_carries_display_names_reasoning_and_provider_groups() {
     let mut seeded = BackendSettings::default();
     seeded.relay_profiles_enabled = true;
     ctx.settings.save(&seeded).unwrap();
+    // 打开「多家自动切换」；收藏里有一个旧版的裸名收藏。
+    ctx.gateway
+        .update(|gateway| {
+            gateway.auto_models = true;
+            gateway.favorite_models = vec!["deepseek-v4-pro".into()];
+            Ok(())
+        })
+        .unwrap();
 
     enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
     let config = std::fs::read_to_string(ctx.codex_home.join("config.toml")).unwrap();
@@ -498,6 +506,15 @@ fn codex_gateway_catalog_carries_display_names_reasoning_and_provider_groups() {
     let auto = model("deepseek-v4-pro");
     assert_eq!(auto["display_name"], "DeepSeek-V4-Pro（自动）");
     assert_eq!(auto["codex_plus_group"], "多家自动切换");
+    // 旧版的裸名收藏：自动那份和各家那几份都标收藏（Codex 选择器里画星标）；别的模型不标。
+    assert_eq!(auto["codex_plus_favorite"], true);
+    assert_eq!(pinned["codex_plus_favorite"], true);
+    assert_eq!(second["codex_plus_favorite"], true);
+    assert!(
+        model("claude-opus-5-5")
+            .get("codex_plus_favorite")
+            .is_none()
+    );
     // 只有一家的模型照旧用裸名、不带后缀。
     assert_eq!(model("claude-opus-5-5")["display_name"], "Claude-Opus-5-5");
     let group = model("group/daily");

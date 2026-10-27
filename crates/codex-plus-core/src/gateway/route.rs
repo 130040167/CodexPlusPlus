@@ -113,8 +113,8 @@ pub fn pool_models(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<Str
 
 /// Codex 的模型列表：每家供应商的模型都列在它自己名下，Codex 选择器里按供应商分组时每组都完整。
 /// - 只有一家提供的模型：裸模型名（只有这一家，等于固定发给它）；
-/// - 多家都提供的模型：每家各列一份 `<供应商 id>/<模型>`（固定发给那一家），再在后面单独列一份
-///   裸模型名，作为「多家自动切换」入口：按池顺序依次尝试各家，出错换下一家；
+/// - 多家都提供的模型：每家各列一份 `<供应商 id>/<模型>`（固定发给那一家）；打开「多家自动切换」
+///   （`auto_models`）时再单独列一份裸模型名：按池顺序依次尝试各家，出错换下一家；
 /// - 最后是有成员的模型组。
 pub fn codex_pool_models(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<String> {
     codex_pool_blocks(gateway, binding).concat()
@@ -174,7 +174,10 @@ fn codex_pool_blocks(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<V
         }
         blocks.push(block);
     }
-    blocks.push(shared.into_iter().filter(|model| fresh(model)).collect());
+    // 「多家自动切换」默认关：关着时不列这一块（默认模型若是裸名，仍由写配置的地方单独补上）。
+    if gateway.auto_models {
+        blocks.push(shared.into_iter().filter(|model| fresh(model)).collect());
+    }
     blocks.push(
         gateway
             .groups
@@ -1226,7 +1229,16 @@ mod tests {
 
     #[test]
     fn codex_lists_shared_models_under_every_provider() {
-        let gateway = gateway("deepseek-v4-pro");
+        let mut gateway = gateway("deepseek-v4-pro");
+        // 「多家自动切换」默认关：只有各家固定的那份。
+        let binding = gateway.binding(&ToolId::Claude).unwrap().clone();
+        assert!(
+            !codex_pool_models(&gateway, &binding)
+                .iter()
+                .any(|model| model == "deepseek-v4-pro"),
+            "关着时不列自动那份"
+        );
+        gateway.auto_models = true;
         let binding = gateway.binding(&ToolId::Claude).unwrap().clone();
         let models = codex_pool_models(&gateway, &binding);
         assert_eq!(
@@ -1273,7 +1285,8 @@ mod tests {
 
     #[test]
     fn codex_list_keeps_the_default_models_group_together() {
-        let gateway = gateway("deepseek-v4-pro");
+        let mut gateway = gateway("deepseek-v4-pro");
+        gateway.auto_models = true;
         let binding = gateway.binding(&ToolId::Claude).unwrap().clone();
         // 默认模型是两家都有的 deepseek-v4-pro（自动切换入口）：自动那一块整体排到最前。
         let led = codex_pool_models_led_by(&gateway, &binding, "deepseek-v4-pro");

@@ -177,3 +177,13 @@ it("默认标志不改变无障碍语义：读屏会念出「默认供应商」"
   assert.match(source, /（默认供应商）/);
   assert.match(source, /\(default provider\)/);
 });
+
+it("在 Codex++ 里收藏的模型在选择器行尾画星标，取消收藏或还原时拿掉", async () => {
+  const source = await readShard();
+  assert.match(source, /favorite: entry\.codex_plus_favorite === true/);
+  assert.match(source, /favorite: exactKnown\?\.favorite === true/);
+  assert.match(source, /codexPlusModelPickerFavoriteClass = "codex-plus-model-group-favorite"/);
+  // 星标节点带归属标记，扫描不会把它当成原生标签，也不会自喂循环。
+  assert.match(source, /star\.setAttribute\("data-codex-plus-ext", codexPlusModelPickerGroupsExtMark\)/);
+  assert.match(source, /content\.querySelector\(`\.\$\{codexPlusModelPickerFavoriteClass\}`\)\?\.remove\(\)/);
+});

@@ -37,6 +37,10 @@ export type GatewaySettings = {
   restoreOnExit: boolean;
   /** 左键点托盘图标弹出快捷面板（旧版后端没有这个字段，视为开）。 */
   trayPanel?: boolean;
+  /** 多家都有的模型额外列一份「自动」（按顺序在各家之间切换）。默认关。 */
+  autoModels?: boolean;
+  /** 模型收藏（管理器模型下拉里的星标），Codex 的选择器里也显示。 */
+  favoriteModels?: string[];
 };
 
 export type GatewayPoolEntry = {
@@ -428,7 +432,7 @@ export function pickerSections(
   const query = rawQuery.trim().toLowerCase();
   const sections: PickerSection[] = [];
   const providers = agentPoolProviders(payload, exclude);
-  // 多家都有的模型：每家名下那份固定发给这一家（`<供应商 id>/<模型>`），另在「多家自动切换」里列一份裸名，
+  // 多家都有的模型：每家名下那份固定发给这一家（`<供应商 id>/<模型>`）；打开「多家自动切换」时另列一份裸名，
   // 选它才按池顺序依次尝试。只有一家的模型用裸名（只有这一家）。与写给 Codex 的模型列表一致。
   const shared: string[] = [];
   for (const entry of providers) {
@@ -442,7 +446,8 @@ export function pickerSections(
       });
     if (items.length) sections.push({ key: `provider:${entry.id}`, title: maskAccountName(entry.name), avatar: avatar(entry.name), items });
   }
-  if (shared.length) {
+  // 「多家自动切换」默认关（在模型调度页打开）。
+  if (shared.length && payload.gateway.autoModels) {
     sections.push({
       key: "auto",
       title: "多家自动切换",

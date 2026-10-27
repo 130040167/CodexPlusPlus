@@ -6,7 +6,7 @@ const read = (name: string) => readFileSync(new URL(`./${name}`, import.meta.url
 
 test("模型调度页只讲规则：调度表 + 模型组，不再重复总览的实时连线图", () => {
   const page = read("GatewayPage.tsx");
-  assert.match(page, /<DispatchTable onManage=\{onManage\} payload=\{payload\} \/>/);
+  assert.match(page, /<DispatchTable busy=\{busy\} onManage=\{onManage\} payload=\{payload\} run=\{run\} \/>/);
   assert.doesNotMatch(page, /RouteDiagram|RouteCard|routeNarrative/);
   assert.match(page, /\{ id: "routing", label: t\("模型调度"\) \}/);
   assert.match(read("App.tsx"), /id: "gatewayRouting", get label\(\) \{ return t\("模型调度"\); \}/);
