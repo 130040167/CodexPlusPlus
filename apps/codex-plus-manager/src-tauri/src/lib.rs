@@ -444,6 +444,7 @@ pub fn run() {
             commands::open_external_url,
             commands::repair_shortcuts,
             commands::check_update,
+            commands::skip_update_version,
             commands::perform_update,
             commands::load_watcher_state,
             commands::set_watcher_enabled,

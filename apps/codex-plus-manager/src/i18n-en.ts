@@ -472,6 +472,9 @@ export const EN_PLAIN: Record<string, string> = {
   "立即更新": "Update now",
   "关闭提示": "Close",
   "今日不再提示": "Don't remind me today",
+  "跳过此版本": "Skip this version",
+  "启动时自动检查更新": "Check for updates automatically",
+  "打开 Codex++ 时及运行期间每隔几小时在后台检查新版本并提示。关闭后不再自动检查，仍可随时点「检查更新」。": "Checks for new versions in the background when Codex++ opens and every few hours while it runs. When off, nothing is checked automatically; you can still click \"Check for updates\" anytime.",
   "设为当前 Key": "Select this key",
   "Key 名称": "Key name",
   "Key 首尾预览": "Key preview (first and last characters)",
@@ -2855,6 +2858,7 @@ export const EN_TEMPLATE: Record<string, string> = {
 // at the display layer (showNotice wraps message with t()). Exact-match first,
 // then pattern-based for messages that embed dynamic values.
 export const EN_BACKEND: Record<string, string> = {
+  "要跳过的版本号为空。": "The version to skip is empty.",
   "生图选项已保存。": "Image option saved.",
   "保存生图选项失败": "Failed to save image option",
   "生图模型已保存。": "Image model saved.",
@@ -2984,6 +2988,9 @@ export const EN_BACKEND: Record<string, string> = {
 // Pattern-based backend translations: [regex, replacement template].
 // Checked when EN_BACKEND exact match fails — covers messages with dynamic values.
 export const EN_BACKEND_PATTERNS: Array<[RegExp, string]> = [
+  [/^已跳过 (.+)，出现更新的版本时再提示。$/, "Skipped $1. You'll be reminded when a newer version is released."],
+  [/^保存跳过版本失败：(.+)$/, "Failed to save the skipped version: $1"],
+  [/^保存跳过版本后重新读取设置失败：(.+)$/, "Saved the skipped version but failed to reload settings: $1"],
   [/^请先退出 (.+) 应用及其 CLI，再重新扫描清理。$/, "Quit $1 and its CLI, then scan again to clean caches."],
   [/^缓存扫描失败：(.+)$/, "Cache scan failed: $1"],
   [/^缓存清理失败：(.+)$/, "Cache cleanup failed: $1"],

@@ -6537,6 +6537,26 @@ pub async fn repair_shortcuts() -> InstallActionResult {
         .unwrap_or_else(|error| install_background_failure("修复快捷方式", error))
 }
 
+/// 更新提示里的「跳过此版本」（#1272）：只写 settings.json 的 `updateSkippedVersion` 一个键，
+/// 不经前端整份表单保存，避免把其他未保存的草稿一起写进去。返回最新设置供前端合并版本号。
+#[tauri::command]
+pub fn skip_update_version(version: String) -> CommandResult<SettingsPayload> {
+    let version = version.trim().to_string();
+    if version.is_empty() {
+        return failed("要跳过的版本号为空。", fallback_settings_payload());
+    }
+    match SettingsStore::default().update(json!({ "updateSkippedVersion": version })) {
+        Ok(_) => settings_payload(
+            &format!("已跳过 {version}，出现更新的版本时再提示。"),
+            "保存跳过版本后重新读取设置失败",
+        ),
+        Err(error) => failed(
+            &format!("保存跳过版本失败：{error}"),
+            fallback_settings_payload(),
+        ),
+    }
+}
+
 #[tauri::command]
 pub async fn check_update() -> CommandResult<Value> {
     match codex_plus_core::update::check_for_update(codex_plus_core::version::VERSION).await {

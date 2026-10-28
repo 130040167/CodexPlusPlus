@@ -13546,6 +13546,9 @@ button.side-item:hover {
 .shell .app-settings-page .app-update-summary {
   padding: 12px 14px;
 }
+.shell .app-settings-page .app-update-preferences {
+  border-top: 1px solid hsl(var(--border) / 0.6);
+}
 .shell .app-settings-page .app-update-notes {
   margin: 0 14px 12px;
   border: 1px solid hsl(var(--border));
