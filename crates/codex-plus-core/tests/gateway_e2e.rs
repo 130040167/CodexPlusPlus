@@ -1001,6 +1001,34 @@ async fn gateway_end_to_end() {
         assert_eq!(body["model"], "flux-1-schnell");
         assert_eq!(body["prompt"], "a cat");
     }
+    // 生图也记进请求日志：类型、Agent、最后回答的那家、试了几家。
+    let mut image_entry = None;
+    for _ in 0..40 {
+        let log =
+            std::fs::read_to_string(state_dir.path().join("request-log.jsonl")).unwrap_or_default();
+        image_entry = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|entry| {
+                entry["wire_api"] == "imageGenerations" || entry["wireApi"] == "imageGenerations"
+            });
+        if image_entry.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let image_entry = image_entry.expect("生图请求要记进请求日志");
+    let field = |snake: &str, camel: &str| {
+        image_entry
+            .get(snake)
+            .or_else(|| image_entry.get(camel))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    assert_eq!(field("agent", "agent"), "grok");
+    assert_eq!(field("relay_id", "relayId"), "painter");
+    assert_eq!(field("attempts", "attempts"), 2);
+    assert_eq!(field("success", "success"), true);
     // 关掉生图：直接报错，不发给上游。
     gateway.image_models.insert("grok".into(), "off".into());
     save(&gateway);

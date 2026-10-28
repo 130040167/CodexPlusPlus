@@ -249,9 +249,22 @@ async fn handle_images(
         user_agent,
     } = request;
     let requested = crate::gateway::images::requested_model(body, content_type);
+    // 每次生图记一条请求日志（用量也从这里汇总）：类型记成 imageGenerations / imageEdits。
+    let mut log = ProxyRequestLog::begin(method, path, None, None);
+    log.set_agent(agent);
+    log.entry.model = requested.clone().unwrap_or_default();
+    log.entry.wire_api = if edits {
+        "imageEdits"
+    } else {
+        "imageGenerations"
+    }
+    .to_string();
     let targets = match crate::gateway::images::targets(gateway, agent, requested.as_deref()) {
         Ok(targets) => targets,
-        Err(message) => return write_error(stream, agent, 400, &message).await,
+        Err(message) => {
+            log.record_error("400", message.clone());
+            return write_error(stream, agent, 400, &message).await;
+        }
     };
     let count = targets.len();
     let mut last_error = String::new();
@@ -279,6 +292,14 @@ async fn handle_images(
             Some(model) => crate::gateway::images::rewrite_model(body, content_type, model),
             None => body.to_vec(),
         };
+        log.entry.attempts += 1;
+        log.entry.relay_id = target.relay.id.clone();
+        log.entry.relay_name = target.relay.name.clone();
+        log.entry.upstream_model = target
+            .model
+            .clone()
+            .or_else(|| requested.clone())
+            .unwrap_or_default();
         let mut upstream = match crate::protocol_proxy::open_gateway_image_request(
             &relay,
             edits,
@@ -304,7 +325,22 @@ async fn handle_images(
         } else {
             upstream.content_type.clone()
         };
-        let answer = upstream.read_body().await?;
+        let mut answer = upstream.read_body().await?;
+        if upstream.is_success() {
+            // 只给了图片链接的，下载下来补成 b64_json（Codex 只认它）；走这家自己的代理。
+            if let Ok(client) =
+                crate::http_client::proxied_client_for_relay(&relay.user_agent, &relay)
+            {
+                answer = crate::gateway::images::inline_image_urls(answer, &client).await;
+            }
+        }
+        log.entry.status_code = upstream.status_code;
+        log.entry.success = upstream.is_success();
+        if upstream.is_success() {
+            log.record_usage_json(&answer);
+        } else {
+            log.entry.error = Some(String::from_utf8_lossy(&answer).chars().take(500).collect());
+        }
         write_http_response(stream, &status, &content_type, &answer).await?;
         log_helper_response(
             if upstream.is_success() {
@@ -320,7 +356,9 @@ async fn handle_images(
         stream.shutdown().await?;
         return Ok(());
     }
-    write_error(stream, agent, 502, &format!("生图失败：{last_error}")).await
+    let message = format!("生图失败：{last_error}");
+    log.record_error("502", message.clone());
+    write_error(stream, agent, 502, &message).await
 }
 
 /// Grok 等 Responses 客户端：按 Agent 绑定选上游，返回值交给 Codex 代理的输出链路。

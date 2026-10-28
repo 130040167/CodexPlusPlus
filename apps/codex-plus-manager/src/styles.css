@@ -13723,3 +13723,15 @@ button.side-item:hover {
 .shell .gw-usage-stat strong {
   font-size: 22px;
 }
+
+/* 请求日志：生图请求的类型标记 */
+.shell .request-log-kind {
+  margin-right: 5px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: hsl(var(--brand-accent) / 0.14);
+  color: hsl(var(--brand-accent));
+  font-size: 10.5px;
+  font-style: normal;
+  font-weight: 600;
+}

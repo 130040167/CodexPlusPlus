@@ -6083,6 +6083,11 @@ function requestLogAgent(entry: RequestLogEntry): string {
   return entry.agent || "codex";
 }
 
+/** 生图请求（网关记成 imageGenerations / imageEdits）：列表里标「生图」，运行中显示「生成中」而不是「流式中」。 */
+function isImageRequest(entry: { wireApi?: string }): boolean {
+  return (entry.wireApi ?? "").startsWith("image");
+}
+
 function RequestLogScreen({ initialAgent = "all", onConsumeInitialAgent }: { initialAgent?: "all" | "codex" | "claude" | "grok"; onConsumeInitialAgent?: () => void }) {
   const [entries, setEntries] = useState<RequestLogEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -6340,6 +6345,7 @@ function RequestLogScreen({ initialAgent = "all", onConsumeInitialAgent }: { ini
                     {maskAccountName(entry.relayName) || "-"}
                   </span>
                   <span className="request-log-ellipsis" title={entry.upstreamModel ? `${entry.model} → ${entry.upstreamModel}` : entry.model}>
+                    {isImageRequest(entry) ? <em className="request-log-kind">{t("生图")}</em> : null}
                     {entry.model || "-"}
                     {entry.upstreamModel && entry.upstreamModel !== entry.model ? (
                       <small> → {entry.upstreamModel}</small>
@@ -6352,7 +6358,7 @@ function RequestLogScreen({ initialAgent = "all", onConsumeInitialAgent }: { ini
                     {requestLogRetryLabel(entry)}
                   </span>
                   <span className="request-log-muted" title={entry.state === "running" ? t("token 用量由上游在请求完成时返回，流式过程中无法准确统计") : ""}>
-                    {entry.state === "running" ? t("流式中") : formatRequestLogTokens(entry.usage?.inputTokens)}
+                    {entry.state === "running" ? (isImageRequest(entry) ? t("生成中") : t("流式中")) : formatRequestLogTokens(entry.usage?.inputTokens)}
                   </span>
                   <span
                     className="request-log-muted"
@@ -6363,12 +6369,12 @@ function RequestLogScreen({ initialAgent = "all", onConsumeInitialAgent }: { ini
                     {entry.state === "running"
                       ? entry.estimatedOutputTokens
                         ? `~${formatRequestLogTokens(entry.estimatedOutputTokens)}`
-                        : t("流式中")
+                        : (isImageRequest(entry) ? t("生成中") : t("流式中"))
                       : formatRequestLogTokens(entry.usage?.outputTokens)}
                   </span>
                   <span>
                     {entry.state === "running" ? (
-                      <span className="request-log-muted">{t("流式中")}</span>
+                      <span className="request-log-muted">{(isImageRequest(entry) ? t("生成中") : t("流式中"))}</span>
                     ) : entry.usage?.cachedTokens ? (
                       <>
                         {formatRequestLogTokens(entry.usage.cachedTokens)}

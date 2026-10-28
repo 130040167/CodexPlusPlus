@@ -1091,6 +1091,7 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "生成中": "Generating",
   "ChatGPT 账号优先，其次按池里的顺序每家试一次，优先用请求里写的模型": "ChatGPT accounts first, then each provider once in pool order, preferring the model the request names",
   "只发给这一家，失败不换": "Only this provider; no fallback on failure",
   "池里还没有能生图的模型：登录 ChatGPT 账号，或给供应商加上生图模型": "No model in the pool can draw yet: sign in to a ChatGPT account, or add an image model to a provider",
