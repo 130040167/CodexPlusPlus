@@ -784,15 +784,39 @@ const GROK_REFRESH_AHEAD_MS: u64 = 5 * 60 * 1000;
 const GROK_DEFAULT_MODELS: &[&str] =
     &["grok-4.6", "grok-build-0.1", "grok-4.3", "grok-code-fast-1"];
 
-/// 推理代理要求的客户端标识，缺了会回 426。版本号被 xAI 提高时要跟着改。
+/// 冒充的 Grok CLI 版本。xAI 会抬高最低版本（低于时回 426 Upgrade Required），届时跟着改。
+const GROK_CLIENT_VERSION: &str = "1.0.70";
+
+/// 推理代理要求的客户端标识，缺了会回 426。
 pub fn grok_proxy_headers() -> Vec<(&'static str, &'static str)> {
     vec![
         ("X-XAI-Token-Auth", "xai-grok-cli"),
         ("x-authenticateresponse", "authenticate-response"),
         ("x-grok-client-mode", "headless"),
-        ("x-grok-client-version", "1.0.5"),
+        ("x-grok-client-version", GROK_CLIENT_VERSION),
         ("x-grok-client-identifier", "grok-shell"),
     ]
+}
+
+/// 登录时这些头已存进供应商配置，版本号升级后老账号仍带旧值。
+/// 每次请求前用当前值覆盖同名头，用户自加的其他头保留。
+fn sync_grok_proxy_headers(relay: &mut RelayProfile) {
+    let current = grok_proxy_headers();
+    relay.custom_headers.retain(|header| {
+        !current
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case(header.key.trim()))
+    });
+    relay
+        .custom_headers
+        .extend(
+            current
+                .into_iter()
+                .map(|(key, value)| crate::settings::RelayHeaderKeyValue {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                }),
+        );
 }
 
 pub fn grok_authorize_url(redirect_uri: &str, challenge: &str, state: &str) -> String {
@@ -1015,6 +1039,7 @@ fn grok_from_auth(relay: &RelayProfile, value: &Value) -> Option<RelayProfile> {
     let mut updated = relay.clone();
     updated.api_key = token.to_string();
     updated.base_url = GROK_PROXY_BASE.to_string();
+    sync_grok_proxy_headers(&mut updated);
     Some(updated)
 }
 
@@ -1094,6 +1119,7 @@ fn grok_finish_refresh(
     updated.auth_contents = auth.to_string();
     updated.api_key = tokens.access_token.clone();
     updated.base_url = GROK_PROXY_BASE.to_string();
+    sync_grok_proxy_headers(&mut updated);
     Ok(updated)
 }
 
@@ -2224,6 +2250,33 @@ mod tests {
         stored.api_key.clear();
         let ready = grok_from_auth(&stored, &account_kind(&relay).unwrap().1).unwrap();
         assert_eq!(ready.api_key, "at");
+
+        // 老账号存的是旧版本号，请求前要换成当前值，用户自加的头保留
+        for header in &mut stored.custom_headers {
+            if header.key == "x-grok-client-version" {
+                header.value = "1.0.5".to_string();
+            }
+        }
+        stored
+            .custom_headers
+            .push(crate::settings::RelayHeaderKeyValue {
+                key: "X-Custom".to_string(),
+                value: "keep".to_string(),
+            });
+        let ready = grok_from_auth(&stored, &account_kind(&relay).unwrap().1).unwrap();
+        let versions: Vec<_> = ready
+            .custom_headers
+            .iter()
+            .filter(|header| header.key.eq_ignore_ascii_case("x-grok-client-version"))
+            .map(|header| header.value.as_str())
+            .collect();
+        assert_eq!(versions, vec![GROK_CLIENT_VERSION]);
+        assert!(
+            ready
+                .custom_headers
+                .iter()
+                .any(|header| header.key == "X-Custom" && header.value == "keep")
+        );
     }
 
     #[test]
