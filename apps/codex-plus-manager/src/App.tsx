@@ -406,6 +406,7 @@ type BackendSettings = {
   codexAppPluginMarketplaceUnlock: boolean;
   codexAppModelWhitelistUnlock: boolean;
   codexAppSessionDelete: boolean;
+  codexAppSessionDeleteSkipConfirm: boolean;
   codexAppSideChatSave: boolean;
   codexAppMarkdownExport: boolean;
   codexAppSessionShare: boolean;
@@ -1367,6 +1368,7 @@ const defaultSettings: BackendSettings = {
   codexAppPluginMarketplaceUnlock: true,
   codexAppModelWhitelistUnlock: true,
   codexAppSessionDelete: true,
+  codexAppSessionDeleteSkipConfirm: false,
   codexAppSideChatSave: false,
   codexAppMarkdownExport: true,
   codexAppSessionShare: true,

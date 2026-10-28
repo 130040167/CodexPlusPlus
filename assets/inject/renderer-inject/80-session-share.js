@@ -692,6 +692,19 @@
     });
   }
 
+  /**
+   * 快速删除（#48）：设置「删除会话时不再确认」打开后，本机会话跳过确认弹窗。
+   * 本机删除有备份并可在提示里撤销；远端 / SSH 会话是永久删除、无法撤销，始终要确认。
+   */
+  function sessionDeleteSkipsConfirm(hostId) {
+    if (hostId !== "local") return false;
+    try {
+      return codexPlusSettings().sessionDeleteSkipConfirm === true;
+    } catch {
+      return false;
+    }
+  }
+
   function openDeleteConfirmForRow(row, button, ref, event) {
     event.preventDefault();
     event.stopPropagation();
@@ -707,7 +720,8 @@
       return;
     }
     ref = { session_id: ref.session_id, title: ref.title, host_id: ref.host_id };
-    return confirmDelete(ref.title, ref.host_id).then(async (confirmed) => {
+    const confirmation = sessionDeleteSkipsConfirm(ref.host_id) ? Promise.resolve(true) : confirmDelete(ref.title, ref.host_id);
+    return confirmation.then(async (confirmed) => {
       if (!confirmed) return;
       if (!row.isConnected || !sameDeletedSessionRef(sessionRefFromRow(row), ref)) {
         showToast("会话已变化，请重新选择后删除", null);

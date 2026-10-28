@@ -106,6 +106,7 @@ function deleteFixture() {
   const request = deferred<any>();
   const confirmations: string[] = [], requests: any[] = [], diagnostics: any[] = [], toasts: string[] = [], timers: number[] = [], refreshes: any[] = [];
   let reloads = 0;
+  const settings: Record<string, unknown> = {};
   const location: any = { href: "", pathname: "", search: "", hash: "", reload: () => { reloads += 1; } };
   const setLocation = (href: string) => { const url = new URL(href); Object.assign(location, { href: url.href, pathname: url.pathname, search: url.search, hash: url.hash }); };
   const activate = (id: string) => {
@@ -127,6 +128,7 @@ function deleteFixture() {
     sessionRows: () => rows.filter((element) => element.isConnected),
     visibleElement: (element: Element) => element.visible && element.isConnected,
     isExtensionUiNode: (element: Element) => !!element.getAttribute("data-codex-plus-ext"),
+    codexPlusSettings: () => settings,
     confirmDelete: (title: string) => { confirmations.push(title); return Promise.resolve(true); },
     postJson: (_path: string, ref: any) => { requests.push(ref); return request.promise; },
     showToast: (text: string) => { toasts.push(text); },
@@ -137,7 +139,7 @@ function deleteFixture() {
   vm.runInContext(`${refHelpers}\n${singleFunction(refs, "locationThreadId")}\n${singleFunction(refs, "currentSessionRef")}\n${deletion.slice(deletion.indexOf("  function rowHref(row)"), deletion.indexOf("  async function exportMarkdown(ref)"))}\n${singleFunction(deletion, "refreshRecentConversationsForHost")}\nfunction signal(e,t){return rpc.sendRequest(e,t)}; loadOptionalCodexAppModule=async()=>({signal});`, context);
   const begin = async (element = rows[0]) => { context.openDeleteConfirmForRow(element, button, context.sessionRefFromRow(element), { preventDefault() {}, stopPropagation() {}, stopImmediatePropagation() {} }); await flush(); };
   const finish = async (result = { status: "local_deleted", session_id: requests[0]?.session_id, message: "deleted" }) => { request.resolve(result); await flush(); };
-  return { context, rows, native, buttons, requests, confirmations, diagnostics, timers, toasts, refreshes, styles, begin, finish, activate, setLocation, reloads: () => reloads };
+  return { context, settings, rows, native, buttons, requests, confirmations, diagnostics, timers, toasts, refreshes, styles, begin, finish, activate, setLocation, reloads: () => reloads };
 }
 
 test("local current deletion uses native navigation and refresh without a page reload", async () => {
@@ -355,4 +357,23 @@ test("sidebar rebuilds hide rows resolved to a deleted thread until undo (#2671)
   // 撤销后恢复显示。
   f.context.unhideDeletedSessionRows([`${uuid}`]);
   assert.equal(rebuilt.getAttribute("data-codex-plus-deleted-session-row"), null);
+});
+
+test("quick delete skips confirmation only for local sessions (#48)", async () => {
+  // 默认关闭：本机会话照常弹确认。
+  const off = deleteFixture(); await off.begin();
+  assert.equal(off.confirmations.length, 1);
+  // 打开后本机会话直接删除，仍带撤销提示。
+  const local = deleteFixture(); local.settings.sessionDeleteSkipConfirm = true;
+  await local.begin();
+  assert.equal(local.confirmations.length, 0, "本机会话不再弹确认");
+  assert.equal(local.requests.length, 1);
+  assert.equal(local.requests[0].host_id, "local");
+  await local.finish();
+  assert.equal(local.rows[0].removed, true);
+  // 远端 / SSH 会话无法撤销，开关打开也必须确认。
+  const remote = deleteFixture(); remote.settings.sessionDeleteSkipConfirm = true;
+  remote.rows[0].setAttribute("data-app-action-sidebar-thread-host-id", "ssh:fixture");
+  await remote.begin();
+  assert.equal(remote.confirmations.length, 1, "远端会话仍需确认");
 });

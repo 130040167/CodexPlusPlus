@@ -106,6 +106,14 @@
       "surfaces": ["manager", "codex"]
     },
     {
+      "key": "codexAppSessionDeleteSkipConfirm",
+      "group": "chat",
+      "control": "bool",
+      "title": "删除会话时不再确认",
+      "description": "开启后删除本机会话不再弹出确认框，删除后仍可在提示里撤销。远端 / SSH 会话无法撤销，仍会要求确认。",
+      "surfaces": ["manager", "codex"]
+    },
+    {
       "key": "codexAppSideChatSave",
       "group": "chat",
       "control": "bool",

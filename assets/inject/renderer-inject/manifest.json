@@ -13,7 +13,7 @@
     {
       "name": "10-style.js",
       "description": "样式注入、默认设置、后端设置映射、梦皮主题变量与持久化",
-      "lines": 2775
+      "lines": 2777
     },
     {
       "name": "20-menu.js",
@@ -68,7 +68,7 @@
     {
       "name": "80-session-share.js",
       "description": "会话运行时工具；分享入口已撤出管理器扫描",
-      "lines": 860
+      "lines": 874
     },
     {
       "name": "81-capacity-auto-retry.js",
