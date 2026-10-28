@@ -209,6 +209,7 @@ test("上下文窗口按模型在供应商池里填，Agent 页只留兜底的�
 test("生图模型在 Agent 接入里按 Agent 选；供应商池按模型改思考等级，存的是和直连模式同格式的模型资料", () => {
   const agents = read("GatewayAgents.tsx");
   assert.match(agents, /"save_gateway_image_model", \{ agent, model: next \}/);
+  assert.match(agents, /"save_gateway_image_inline", \{ agent, enabled: event\.currentTarget\.checked \}/, "生图链接转数据可以按 Agent 关掉");
   assert.match(agents, /\{ value: "off", label: t\("关闭"\)/);
   assert.match(agents, /agent\.agent === "codex" \? <ImageModelRow/, "目前只有 Codex 会发生图请求");
   assert.doesNotMatch(read("GatewayPage.tsx"), /save_gateway_image_model/, "网关设置里不再有全局的生图模型");

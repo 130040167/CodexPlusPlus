@@ -459,6 +459,9 @@ pub struct GatewaySettings {
     /// `off` 是关闭，其余是 `<供应商 id>/<模型>`。不放在 [`AgentBinding`] 里：界面保存绑定时整份替换。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub image_models: BTreeMap<String, String>,
+    /// 生图结果只给链接时原样转发、不下载成图片数据的 Agent（默认都转，见 [`Self::inline_image_urls_for`]）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_keep_urls: Vec<String>,
     /// 旧版的全局生图模型，读的时候迁移给 Codex（见 [`read_store`]），之后不再写。
     #[serde(default, skip_serializing)]
     pub image_model: String,
@@ -490,6 +493,7 @@ impl Default for GatewaySettings {
             auto_groups: BTreeMap::new(),
             favorite_models: Vec::new(),
             image_models: BTreeMap::new(),
+            image_keep_urls: Vec::new(),
             image_model: String::new(),
             app_version: String::new(),
             extra: Map::new(),
@@ -510,6 +514,11 @@ impl GatewaySettings {
             .get(agent.as_str())
             .map(String::as_str)
             .unwrap_or_default()
+    }
+
+    /// 这个 Agent 的生图结果只给链接时，要不要下载下来补成 `b64_json`。
+    pub fn inline_image_urls_for(&self, agent: &ToolId) -> bool {
+        !self.image_keep_urls.iter().any(|id| id == agent.as_str())
     }
 
     pub fn group(&self, id: &str) -> Option<&GatewayGroup> {
@@ -845,6 +854,7 @@ mod tests {
         let settings = store.load().unwrap();
         assert_eq!(settings.image_model_for(&ToolId::Codex), "jo/gpt-image-2");
         assert_eq!(settings.image_model_for(&ToolId::Grok), "");
+        assert!(settings.inline_image_urls_for(&ToolId::Codex));
         store.save(&settings).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(!text.contains("\"imageModel\""), "旧字段不再写：{text}");

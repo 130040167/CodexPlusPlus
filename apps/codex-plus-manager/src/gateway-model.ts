@@ -45,6 +45,8 @@ export type GatewaySettings = {
   favoriteModels?: string[];
   /** 各 Agent 的生图模型（键是 Agent id）：没有或空是自动，`off` 是关闭，其余是 `<供应商 id>/<模型>`。 */
   imageModels?: Record<string, string>;
+  /** 生图结果只给链接时原样转发、不下载成图片数据的 Agent（默认都转）。 */
+  imageKeepUrls?: string[];
 };
 
 export type GatewayPoolEntry = {

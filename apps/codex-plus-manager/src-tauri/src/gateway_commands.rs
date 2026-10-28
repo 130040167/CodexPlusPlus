@@ -533,6 +533,24 @@ pub fn save_gateway_image_model(
     respond("生图模型已保存。", "保存生图模型失败", result)
 }
 
+/// 某个 Agent 的生图结果只给链接时，要不要下载下来补成图片数据（默认要）。
+#[tauri::command]
+pub fn save_gateway_image_inline(
+    agent: String,
+    enabled: bool,
+) -> CommandResult<Option<GatewayPayload>> {
+    let result = parse_agent(&agent).and_then(|agent| {
+        GatewayStore::default().update(|gateway| {
+            gateway.image_keep_urls.retain(|id| id != agent.as_str());
+            if !enabled {
+                gateway.image_keep_urls.push(agent.as_str().to_string());
+            }
+            Ok(())
+        })
+    });
+    respond("生图选项已保存。", "保存生图选项失败", result)
+}
+
 /// 供应商各模型内置的思考等级（编辑思考等级时当作没改过的显示值）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

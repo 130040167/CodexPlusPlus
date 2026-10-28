@@ -1091,6 +1091,9 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "保存生图选项": "Save image option",
+  "图片链接转成图片数据": "Convert image links to data",
+  "上游只返回图片链接时，网关把图下载下来转成图片数据再交给 Agent（Codex 只认图片数据）。关掉后原样转发链接。": "When the upstream only returns an image link, the gateway downloads it and passes the image data to the agent (Codex only accepts image data). Turn off to forward the link as is.",
   "调用统计与每条请求：按 Agent、供应商与模型汇总 token、缓存与费用": "Usage stats and every request: tokens, cache and cost by agent, provider and model",
   "统计": "Stats",
   "查看这些请求": "View these requests",
@@ -2829,6 +2832,8 @@ export const EN_TEMPLATE: Record<string, string> = {
 // at the display layer (showNotice wraps message with t()). Exact-match first,
 // then pattern-based for messages that embed dynamic values.
 export const EN_BACKEND: Record<string, string> = {
+  "生图选项已保存。": "Image option saved.",
+  "保存生图选项失败": "Failed to save image option",
   "生图模型已保存。": "Image model saved.",
   "保存生图模型失败": "Failed to save image model",
   "思考等级已保存。": "Reasoning levels saved.",

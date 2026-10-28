@@ -326,7 +326,7 @@ async fn handle_images(
             upstream.content_type.clone()
         };
         let mut answer = upstream.read_body().await?;
-        if upstream.is_success() {
+        if upstream.is_success() && gateway.inline_image_urls_for(agent) {
             // 只给了图片链接的，下载下来补成 b64_json（Codex 只认它）；走这家自己的代理。
             if let Ok(client) =
                 crate::http_client::proxied_client_for_relay(&relay.user_agent, &relay)
