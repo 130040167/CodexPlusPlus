@@ -751,7 +751,7 @@ impl DictationSettings {
 
 /// Agent 桌宠目前支持的宿主；其余值保存时过滤掉。
 pub const AGENT_PET_SUPPORTED_AGENTS: &[&str] = &["codex"];
-/// 内置桌宠音效组；其余值回落到 `duck`。
+/// 随启动器内嵌的桌宠音效组。设置里还认可下载音效组 id 和 `custom`，其余值回落到 `duck`。
 pub const AGENT_PET_SOUND_SETS: &[&str] = &["duck", "fx1"];
 pub const AGENT_PET_MIN_SIZE: u32 = 64;
 pub const AGENT_PET_MAX_SIZE: u32 = 240;
@@ -783,7 +783,12 @@ pub struct AgentPetSettings {
     pub custom_image_url: String,
     pub size: u32,
     pub sound_enabled: bool,
+    /// 内嵌音效组、下载音效组 id，或 `custom`（此时使用下面两个导入文件）。
     pub sound_set: String,
+    /// 导入的自定义按压音文件名（位于 `agent-pet-custom`），空表示没有。
+    pub custom_sound_press: String,
+    /// 导入的自定义松开音文件名，空表示没有。
+    pub custom_sound_release: String,
     pub volume: f64,
 }
 
@@ -797,6 +802,8 @@ impl Default for AgentPetSettings {
             size: AGENT_PET_DEFAULT_SIZE,
             sound_enabled: true,
             sound_set: "duck".to_string(),
+            custom_sound_press: String::new(),
+            custom_sound_release: String::new(),
             volume: AGENT_PET_DEFAULT_VOLUME,
         }
     }
@@ -841,6 +848,12 @@ impl AgentPetSettings {
         if let Some(value) = map.get("soundSet").and_then(Value::as_str) {
             settings.sound_set = value.to_string();
         }
+        if let Some(value) = map.get("customSoundPress").and_then(Value::as_str) {
+            settings.custom_sound_press = value.to_string();
+        }
+        if let Some(value) = map.get("customSoundRelease").and_then(Value::as_str) {
+            settings.custom_sound_release = value.to_string();
+        }
         if let Some(value) = map.get("volume").and_then(Value::as_f64) {
             settings.volume = value;
         }
@@ -868,11 +881,25 @@ impl AgentPetSettings {
         self.custom_image_url = self.custom_image_url.trim().to_string();
         self.size = self.size.clamp(AGENT_PET_MIN_SIZE, AGENT_PET_MAX_SIZE);
         let sound_set = self.sound_set.trim();
-        self.sound_set = if AGENT_PET_SOUND_SETS.contains(&sound_set) {
+        self.sound_set = if AGENT_PET_SOUND_SETS.contains(&sound_set)
+            || sound_set == crate::agent_pet::CUSTOM_SOUND_ID
+            || crate::agent_pet::is_download_sound(sound_set)
+        {
             sound_set.to_string()
         } else {
             "duck".to_string()
         };
+        for (value, slot) in [
+            (&mut self.custom_sound_press, "press"),
+            (&mut self.custom_sound_release, "release"),
+        ] {
+            let name = value.trim();
+            *value = if crate::agent_pet::is_custom_sound_file(name, slot) {
+                name.to_string()
+            } else {
+                String::new()
+            };
+        }
         self.volume = if self.volume.is_finite() {
             self.volume.clamp(0.0, 1.0)
         } else {
@@ -2661,6 +2688,8 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
             "size",
             "soundEnabled",
             "soundSet",
+            "customSoundPress",
+            "customSoundRelease",
             "volume",
         ] {
             if let Some(value) = patch.get(key) {

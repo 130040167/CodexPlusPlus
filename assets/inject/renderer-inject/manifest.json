@@ -138,7 +138,7 @@
     {
       "name": "97-agent-pet.js",
       "description": "Agent 桌宠：可拖动角色、按压压扁回弹与按压音效",
-      "lines": 297
+      "lines": 343
     },
     {
       "name": "98-scan-schedule.js",
