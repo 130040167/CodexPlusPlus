@@ -420,6 +420,7 @@ pub fn run() {
             commands::refresh_script_market,
             commands::refresh_plugin_market,
             commands::install_plugin_market_item,
+            commands::uninstall_plugin_market_item,
             commands::plugin_market_install_status,
             commands::refresh_user_script_inventory,
             commands::reload_user_scripts,

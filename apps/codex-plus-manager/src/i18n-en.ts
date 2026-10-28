@@ -614,6 +614,10 @@ export const EN_PLAIN: Record<string, string> = {
   "无法加载插件市场。": "Unable to load the plugin market.",
   "插件安装完成。": "Plugin installation completed.",
   "插件安装失败。": "Plugin installation failed.",
+  "卸载插件": "Uninstall plugin",
+  "插件已卸载。": "Plugin uninstalled.",
+  "插件卸载失败。": "Plugin uninstall failed.",
+  "卸载中…": "Uninstalling…",
   "加载中…": "Loading…",
   "刷新索引": "Refresh catalog",
   "插件市场来源": "Plugin market source",
@@ -2705,6 +2709,9 @@ export const EN_TEMPLATE: Record<string, string> = {
   "正在下载并安装 {0}…": "Downloading and installing {0}…",
   "已安装版本 {0}": "Installed version: {0}",
   "安装插件 {0}": "Install plugin {0}",
+  "卸载插件 {0}": "Uninstall plugin {0}",
+  "正在卸载 {0}…": "Uninstalling {0}…",
+  "卸载插件“{0}”？将删除它下载到本机的插件文件，并从 Codex 配置中移除该插件；不影响其他插件。": "Uninstall plugin \"{0}\"? Its downloaded files will be deleted and it will be removed from the Codex configuration. Other plugins are not affected.",
   "第 {0} / {1} 页": "Page {0} / {1}",
   "主题操作：{0}": "Theme actions: {0}",
   "{0} 的目录明细（{1}）": "{0} directory details ({1})",
@@ -2979,6 +2986,7 @@ export const EN_BACKEND: Record<string, string> = {
   "供应商已删除。": "Provider deleted.",
   "已把 Claude Code 当前配置保存为供应商。": "Saved the current Claude Code configuration as a provider.",
   "CC Switch 里没有新的 Claude 供应商。": "No new Claude providers in CC Switch.",
+  "插件已卸载，重启 Codex 后生效。": "Plugin uninstalled. Restart Codex for the change to take effect.",
 };
 
 // Pattern-based backend translations: [regex, replacement template].
