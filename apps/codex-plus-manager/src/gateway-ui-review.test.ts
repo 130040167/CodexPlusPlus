@@ -218,3 +218,11 @@ test("生图模型在 Agent 接入里按 Agent 选；供应商池按模型改思
   assert.match(dialog, /invoke<ReasoningResult>\("gateway_provider_reasoning", \{ id: entry\.id \}\)/);
   assert.match(read("GatewayProviders.tsx"), /"save_gateway_provider_metadata", \{ id: entry\.id, modelMetadata \}/);
 });
+
+test("用量与请求日志并成一页：两个页签各是一条路由，统计表点一行跳到请求并筛选", () => {
+  const app = read("App.tsx");
+  assert.match(app, /route === "gatewayUsage" \|\| route === "requestLog" \? <UsageTabs onChange=\{\(next\) => void navigate\(next\)\} value=\{route\} \/> : null/);
+  assert.match(app, /const selected = route === item\.id \|\| navAliasRoute\[route\] === item\.id;/, "在请求页签时侧栏「用量」也是选中");
+  assert.match(app, /useEffect\(\(\) => onOpenRequestLog\(\(focus\) => \{/);
+  assert.match(read("GatewayUsage.tsx"), /onClick=\{\(\) => openRequestLog\(split === "agent"/);
+});

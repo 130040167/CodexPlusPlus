@@ -13735,3 +13735,21 @@ button.side-item:hover {
   font-style: normal;
   font-weight: 600;
 }
+
+/* 「用量」页：统计 / 请求两个页签；统计表的行可点，点了看对应的请求。 */
+.shell .usage-tabs {
+  margin-bottom: 12px;
+}
+
+.shell .gw-usage-row-link {
+  cursor: pointer;
+}
+
+/* 请求页签：页签条按内容高度，日志面板占满剩下的高度。 */
+.shell .screen.request-log-screen {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.shell .screen.request-log-screen > .usage-tabs {
+  align-self: start;
+}

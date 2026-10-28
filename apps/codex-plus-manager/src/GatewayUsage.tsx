@@ -26,6 +26,7 @@ import {
 } from "./gateway-model";
 import { AGENT_ICONS, Avatar, type Notify, type Run } from "./gateway-ui";
 import { successRate } from "./hub-overview-model";
+import { openRequestLog } from "./UsageTabs";
 
 const memo: { range: UsageRange; summary: UsageSummary | null; balances: ProviderBalance[] | null } = { range: "30d", summary: null, balances: null };
 
@@ -206,7 +207,18 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
           const providerEntry = payload?.pool.find((entry) => entry.id === group.key);
           const name = split === "agent" ? agentName(group.key) : split === "model" ? prettyModelName(group.label) : maskAccountName(group.label);
           return (
-            <div className="gw-usage-row" key={group.key || "-"}>
+            <div
+              className="gw-usage-row gw-usage-row-link"
+              key={group.key || "-"}
+              // 点一行看这一项的每条请求：Agent 按 Agent 筛，供应商、模型按名字搜。
+              onClick={() => openRequestLog(split === "agent"
+                ? { agent: group.key === "claude" || group.key === "grok" ? group.key : "codex" }
+                : { query: group.label })}
+              onKeyDown={(event) => { if (event.key === "Enter") (event.currentTarget as HTMLElement).click(); }}
+              role="button"
+              tabIndex={0}
+              title={t("查看这些请求")}
+            >
               <span className="gw-usage-name">
                 {split === "agent" ? (
                   AGENT_ICONS[group.key] ? <img alt="" className="gw-usage-agent" src={AGENT_ICONS[group.key]} /> : <Avatar name={group.label} size="sm" />

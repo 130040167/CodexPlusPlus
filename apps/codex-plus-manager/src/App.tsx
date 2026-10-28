@@ -124,6 +124,7 @@ import { CommandPalette, type PaletteCommand } from "./CommandPalette";
 import { SessionsView } from "./GatewaySessions";
 import { agentName, maskAccountName, type GatewayResult } from "./gateway-model";
 import { SessionAgentTabs, type SessionTab } from "./SessionAgentTabs";
+import { UsageTabs, onOpenRequestLog } from "./UsageTabs";
 import { noticeDuration, noticeTone } from "./notice-model";
 import { agentTabGroups, agentTarget } from "./page-groups";
 import { TopbarActions } from "./TopbarActions";
@@ -1311,9 +1312,12 @@ const lastAgentRoute = new Map<string, Route>();
  */
 const globalNavigationRoutes: Route[] = ["hub", "gatewayProviders", "gateway", "gatewayRouting", "gatewayUsage", "gatewaySettings", "requestLog", "sessions", "context", "skills", "computerUse", "agentPet", "agentCollaboration", "agentCache", "recommendations", "about", "settings"];
 /** 侧栏「网关」分组：任意 Agent 经 Codex++ 接入任意供应商。 */
-const gatewayNavigationRoutes: Route[] = ["hub", "gatewayProviders", "gateway", "gatewayRouting", "gatewayUsage", "gatewaySettings"];
+// 「用量」并进全局管理：统计（gatewayUsage）与请求日志（requestLog）是同一页的两个页签。
+const gatewayNavigationRoutes: Route[] = ["hub", "gatewayProviders", "gateway", "gatewayRouting", "gatewaySettings"];
 /** 侧栏「全局管理」分组：同时管理所有 Agent 的请求日志、会话、MCP 与 Skills。 */
-const managementNavigationRoutes: Route[] = ["requestLog", "sessions", "context", "skills"];
+const managementNavigationRoutes: Route[] = ["gatewayUsage", "sessions", "context", "skills"];
+/** 侧栏里同一个入口的别名路由：请求日志是「用量」页的第二个页签。 */
+const navAliasRoute: Partial<Record<Route, Route>> = { requestLog: "gatewayUsage" };
 /** 侧栏「工具」分组：服务所有 Agent，但与供应商无关。关于、整体设置放在侧栏底部。 */
 const toolNavigationRoutes: Route[] = ["recommendations", "computerUse", "agentPet", "agentCollaboration", "agentCache"];
 /** 网关的各个页签由侧栏直接选中，页内不再显示标签条。 */
@@ -1534,6 +1538,7 @@ export function App() {
   const [sessionTab, setSessionTab] = useState<SessionTab>("all");
   /** 请求日志打开时的 Agent 过滤（从 Agent 概览跳过去时设置，用一次就清掉）。 */
   const [requestLogAgentFilter, setRequestLogAgentFilter] = useState<"all" | "codex" | "claude" | "grok">("all");
+  const [requestLogQuery, setRequestLogQuery] = useState("");
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "k") {
@@ -2623,6 +2628,14 @@ export function App() {
       await refreshAutoTakeover(true);
     }
   };
+  // 用量统计里点一行：切到「请求」页签并按它（Agent / 供应商 / 模型）筛选。
+  const navigateRef = useRef(navigate);
+  navigateRef.current = navigate;
+  useEffect(() => onOpenRequestLog((focus) => {
+    setRequestLogAgentFilter(focus.agent ?? "all");
+    setRequestLogQuery(focus.query ?? "");
+    void navigateRef.current("requestLog");
+  }), []);
 
   const consumePendingManagerNavigation = async (): Promise<boolean> => {
     try {
@@ -4365,7 +4378,7 @@ export function App() {
   const activeToolName = toolEntries.find((entry) => entry.id === activeTool)?.name ?? t("当前 Agent");
 
   const isGatewayPage = gatewayNavigationRoutes.includes(route);
-  const crumbGroup = isGatewayPage ? t("网关") : managementNavigationRoutes.includes(route) ? t("全局管理") : isGlobalPage ? "Codex++" : activeToolName;
+  const crumbGroup = isGatewayPage ? t("网关") : managementNavigationRoutes.includes(navAliasRoute[route] ?? route) ? t("全局管理") : isGlobalPage ? "Codex++" : activeToolName;
   // ⌘K：页面、各 Agent 的页面和常用操作。非当前 Agent 的页面会先切到那个 Agent。
   const paletteCommands: PaletteCommand[] = [];
   const routeCommand = (routeId: Route, group: string, run: () => void, keywords = ""): PaletteCommand | null => {
@@ -4377,6 +4390,7 @@ export function App() {
   const pushCommand = (command: PaletteCommand | null) => { if (command) paletteCommands.push(command); };
   gatewayNavigationRoutes.forEach((routeId) => pushCommand(routeCommand(routeId, t("网关"), () => void navigate(routeId), "gateway")));
   managementNavigationRoutes.forEach((routeId) => pushCommand(routeCommand(routeId, t("全局管理"), () => void navigate(routeId))));
+  pushCommand(routeCommand("requestLog", t("全局管理"), () => void navigate("requestLog"), "usage requests"));
   for (const tool of toolEntries.filter((entry) => entry.switchable)) {
     agentRoutes(tool.id).forEach((routeId) => pushCommand(routeCommand(routeId, tool.name, () => void switchTool(tool.id, routeId), tool.id)));
   }
@@ -4418,12 +4432,12 @@ export function App() {
             <div className="topbar-title">
               <span className="topbar-crumb">{crumbGroup}</span>
               <ChevronRight aria-hidden="true" className="topbar-crumb-sep" />
-              <h1>{route === "agentSettings" ? tf("{0} 设置", [activeToolName]) : routeTitle(route)}</h1>
+              <h1>{route === "agentSettings" ? tf("{0} 设置", [activeToolName]) : routeTitle(navAliasRoute[route] ?? route)}</h1>
             </div>
             <p>
               {route === "agentSettings"
                 ? tf("只作用于 {0}；界面主题、配置备份等整体设置在侧栏底部的齿轮里。", [activeToolName])
-                : routeSubtitle(route)}
+                : routeSubtitle(navAliasRoute[route] ?? route)}
             </p>
           </div>
           <div className="topbar-actions">
@@ -4492,8 +4506,13 @@ export function App() {
               actions={actions}
             />
           ) : null}
+          {route === "gatewayUsage" || route === "requestLog" ? <UsageTabs onChange={(next) => void navigate(next)} value={route} /> : null}
           {route === "requestLog" ? (
-            <RequestLogScreen initialAgent={requestLogAgentFilter} onConsumeInitialAgent={() => setRequestLogAgentFilter("all")} />
+            <RequestLogScreen
+              initialAgent={requestLogAgentFilter}
+              initialQuery={requestLogQuery}
+              onConsumeInitialAgent={() => { setRequestLogAgentFilter("all"); setRequestLogQuery(""); }}
+            />
           ) : null}
           {route === "claude" ? <ClaudeLocalizationScreen /> : null}
           {route === "sessions" ? <SessionAgentTabs onChange={setSessionTab} value={sessionTab} /> : null}
@@ -6088,16 +6107,16 @@ function isImageRequest(entry: { wireApi?: string }): boolean {
   return (entry.wireApi ?? "").startsWith("image");
 }
 
-function RequestLogScreen({ initialAgent = "all", onConsumeInitialAgent }: { initialAgent?: "all" | "codex" | "claude" | "grok"; onConsumeInitialAgent?: () => void }) {
+function RequestLogScreen({ initialAgent = "all", initialQuery = "", onConsumeInitialAgent }: { initialAgent?: "all" | "codex" | "claude" | "grok"; initialQuery?: string; onConsumeInitialAgent?: () => void }) {
   const [entries, setEntries] = useState<RequestLogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState(initialQuery);
   const [filter, setFilter] = useState<"all" | "running" | "success" | "failed" | "retried">("all");
   const [sessionFilter, setSessionFilter] = useState("all");
   const [agentFilter, setAgentFilter] = useState<"all" | "codex" | "claude" | "grok">(initialAgent);
   // 初始过滤只用一次：之后从侧栏进来仍是「全部」。
-  useEffect(() => { if (initialAgent !== "all") onConsumeInitialAgent?.(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (initialAgent !== "all" || initialQuery) onConsumeInitialAgent?.(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
@@ -15006,7 +15025,7 @@ function AppSidebar({
     const item = routes.find((candidate) => candidate.id === routeId);
     if (!item) return null;
     const Icon = item.icon;
-    const selected = route === item.id;
+    const selected = route === item.id || navAliasRoute[route] === item.id;
     return (
       <button
         aria-current={selected ? "page" : undefined}
@@ -15324,7 +15343,7 @@ function routeSubtitle(route: Route) {
     gateway: t("选择哪些 Agent 经 Codex++ 网关接入，以及它们默认用哪个模型"),
     gatewayProviders: t("所有接入的 Agent 共用的供应商池，支持多 Key 轮换"),
     gatewayRouting: t("多家都有的模型怎么分、你建的组怎么走：路由方式、会话固定、出错换谁"),
-    gatewayUsage: t("按 Agent、供应商与模型统计调用、token、缓存与费用"),
+    gatewayUsage: t("调用统计与每条请求：按 Agent、供应商与模型汇总 token、缓存与费用"),
     gatewaySettings: t("监听地址、Key 轮换方式与退出时的恢复策略"),
     maintenance: t("入口检查与修复、开机启动与应用路径"),
     about: t("版本信息、项目链接、GitHub Release 更新、日志与诊断"),
