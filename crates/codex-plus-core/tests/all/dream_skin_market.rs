@@ -55,7 +55,7 @@ async fn installs_verified_market_theme_into_local_library() {
     config.name = "Market Demo".to_string();
     config.style_preset = "cyber-neon".to_string();
     let config = serde_json::to_vec(&config).unwrap();
-    let image = include_bytes!("../../../assets/inject/dream-skin-default.png");
+    let image = include_bytes!("../../../../assets/inject/dream-skin-default.png");
     mount_theme(&server, &config, image).await;
 
     let installed = install_market_theme_from_base(

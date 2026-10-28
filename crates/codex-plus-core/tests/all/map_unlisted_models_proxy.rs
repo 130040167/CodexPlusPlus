@@ -10,13 +10,12 @@ use codex_plus_core::settings::{
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn settings_path_test_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+/// 设置路径覆盖是进程级状态，与其它测试模块共用同一把锁。
+fn settings_path_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::common::global_state_lock()
 }
 
 struct TestSettings {
@@ -107,7 +106,7 @@ async fn upstream_model_for(map_unlisted: Option<bool>, auto_review_model: &str,
 
 #[tokio::test]
 async fn unlisted_model_passes_through_when_switch_is_default_off() {
-    let _guard = settings_path_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = settings_path_test_lock();
     assert_eq!(upstream_model_for(None, "", "gpt-5.4").await, "gpt-5.4");
     assert_eq!(
         upstream_model_for(Some(false), "", "codex-auto-review").await,
@@ -117,7 +116,7 @@ async fn unlisted_model_passes_through_when_switch_is_default_off() {
 
 #[tokio::test]
 async fn unlisted_model_maps_to_default_when_switch_is_on() {
-    let _guard = settings_path_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = settings_path_test_lock();
     assert_eq!(upstream_model_for(Some(true), "", "gpt-5.4").await, "minimax-m2.5");
     // 列表内模型照原样转发。
     assert_eq!(
@@ -133,7 +132,7 @@ async fn unlisted_model_maps_to_default_when_switch_is_on() {
 
 #[tokio::test]
 async fn auto_review_model_wins_over_unlisted_mapping() {
-    let _guard = settings_path_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = settings_path_test_lock();
     // 两者同时开启：codex-auto-review 按 autoReviewModel 改写，不被映射成默认模型。
     assert_eq!(
         upstream_model_for(Some(true), "deepseek-v4-flash", "codex-auto-review").await,

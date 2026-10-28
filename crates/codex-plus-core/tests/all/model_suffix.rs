@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::sync::Mutex;
 
 use codex_plus_core::model_suffix::{
     build_model_catalog_json, build_model_catalog_json_with_template, builtin_model_metadata,
@@ -9,7 +8,9 @@ use codex_plus_core::model_suffix::{
 };
 
 /// CODEX_HOME 环境变量是进程级全局，运行时缓存测试必须串行执行。
-static RUNTIME_CACHE_ENV_LOCK: Mutex<()> = Mutex::new(());
+fn runtime_cache_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::common::global_state_lock()
+}
 
 #[test]
 fn priority_only_unknown_metadata_never_fabricates_native_descriptor_defaults() {
@@ -499,7 +500,7 @@ fn migrate_model_list_with_suffixes_splits_slug_and_window() {
 
 #[test]
 fn build_catalog_json_prefers_runtime_models_cache_entry() {
-    let _lock = RUNTIME_CACHE_ENV_LOCK.lock().unwrap();
+    let _lock = runtime_cache_env_lock();
     let temp = tempfile::tempdir().unwrap();
     let cache = serde_json::json!({
         "models": [{
@@ -535,7 +536,7 @@ fn build_catalog_json_prefers_runtime_models_cache_entry() {
 
 #[test]
 fn build_catalog_json_falls_back_to_bundled_without_runtime_cache() {
-    let _lock = RUNTIME_CACHE_ENV_LOCK.lock().unwrap();
+    let _lock = runtime_cache_env_lock();
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(&temp).unwrap();
     let _guard = CodexHomeEnvGuard::set(temp.path());
@@ -568,7 +569,7 @@ fn bundled_template_matches_slug_case_insensitively() {
     // codex bundled catalog 全小写 slug，界面填大写（GPT-5.4）也应命中模板：
     // 命中时保留官方 max_context_window 1000000，未命中回落首条模板的 272000。
     // 隔离 CODEX_HOME：否则查找链会先命中本机官方 models_cache.json，机器相关。
-    let _lock = RUNTIME_CACHE_ENV_LOCK.lock().unwrap();
+    let _lock = runtime_cache_env_lock();
     let _guard = CodexHomeEnvGuard::set(tempfile::tempdir().unwrap().path());
     let entries = collect_catalog_entries("GPT-5.4", &HashMap::new(), &HashMap::new(), "GPT-5.4");
     let catalog: serde_json::Value =
@@ -655,7 +656,7 @@ fn vendor_metadata_chain_matches_case_insensitively() {
 fn compat_overlay_composes_with_runtime_cache_base() {
     // 精调层与官方 App 热更新的冲突裁决：官方缓存做基座（未被精调覆盖的字段
     // 流入官方最新值），精调字段覆盖其上（产品特性不被官方数据冲掉）。
-    let _lock = RUNTIME_CACHE_ENV_LOCK.lock().unwrap();
+    let _lock = runtime_cache_env_lock();
     let temp = tempfile::tempdir().unwrap();
     let cache = serde_json::json!({
         "models": [{
@@ -688,7 +689,7 @@ fn compat_overlay_composes_with_runtime_cache_base() {
 fn builtin_model_metadata_matches_with_source() {
     // builtin_model_metadata 会读 CODEX_HOME/models_cache.json，与其他
     // 临时改写 CODEX_HOME 的测试互斥。
-    let _lock = RUNTIME_CACHE_ENV_LOCK.lock().unwrap();
+    let _lock = runtime_cache_env_lock();
 
     // 供应商事实层：附带来源名
     let kimi = builtin_model_metadata("kimi-k3").expect("kimi-k3 内置");
@@ -710,7 +711,7 @@ fn builtin_model_metadata_matches_with_source() {
 fn builtin_resolution_and_catalog_requirement_share_suffix_and_case_rules() {
     use codex_plus_core::model_suffix::requires_bundled_metadata_catalog;
 
-    let _lock = RUNTIME_CACHE_ENV_LOCK.lock().unwrap();
+    let _lock = runtime_cache_env_lock();
 
     let metadata = builtin_model_metadata("  GPT-6-SOL[1M]  ")
         .expect("规范化后应命中 gpt-6-sol 兼容元数据");
@@ -729,7 +730,7 @@ fn builtin_resolution_and_catalog_requirement_share_suffix_and_case_rules() {
 
 #[test]
 fn builtin_model_metadata_index_covers_all_embedded_entries() {
-    let _lock = RUNTIME_CACHE_ENV_LOCK.lock().unwrap();
+    let _lock = runtime_cache_env_lock();
 
     let index = builtin_model_metadata_index();
     // 60 条精调/供应商全量 + 官方 bundled 静态资产（随 sync_official_models.py
@@ -772,7 +773,7 @@ fn builtin_model_metadata_index_covers_all_embedded_entries() {
 fn builtin_model_metadata_hits_runtime_cache_layer() {
     // 运行时官方缓存（models_cache.json）命中的模型：来源标为官方内置，
     // 且预填/查询用运行时的窗口数据而不是静态资产的。
-    let _lock = RUNTIME_CACHE_ENV_LOCK.lock().unwrap();
+    let _lock = runtime_cache_env_lock();
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path()).unwrap();
     std::fs::write(
@@ -808,7 +809,7 @@ fn builtin_model_metadata_hits_runtime_cache_layer() {
 #[test]
 fn builtin_model_metadata_index_dedupes_case_variants_and_skips_invalid() {
     // 大小写变体去重 + 无 slug / 非对象条目跳过（脏数据防御）
-    let _lock = RUNTIME_CACHE_ENV_LOCK.lock().unwrap();
+    let _lock = runtime_cache_env_lock();
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path()).unwrap();
     std::fs::write(
@@ -855,7 +856,7 @@ fn gpt6_sol_luna_metadata_matches_official_efforts_fast_and_default_window() {
 
     // catalog 生成链会读 CODEX_HOME/models_cache.json，与其他临时改写
     // CODEX_HOME 的测试互斥。
-    let _lock = RUNTIME_CACHE_ENV_LOCK.lock().unwrap();
+    let _lock = runtime_cache_env_lock();
 
     let entries = collect_catalog_entries(
         "gpt-6-sol\ngpt-6-luna",

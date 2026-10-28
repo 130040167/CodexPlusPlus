@@ -1,8 +1,8 @@
 #[test]
 fn stepwise_fragments_expose_the_expected_contract() {
-    let suggestions = include_str!("../../../assets/inject/floating-panel/stepwise/suggestions.js")
+    let suggestions = include_str!("../../../../assets/inject/floating-panel/stepwise/suggestions.js")
         .replace("\r\n", "\n");
-    let generation = include_str!("../../../assets/inject/floating-panel/stepwise/generation.js")
+    let generation = include_str!("../../../../assets/inject/floating-panel/stepwise/generation.js")
         .replace("\r\n", "\n");
 
     assert!(suggestions.starts_with("/* Stepwise suggestions:"));

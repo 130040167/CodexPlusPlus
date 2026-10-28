@@ -4,7 +4,7 @@
 //! 官方 App 的机器上误报失败。手动跑：
 //!
 //! ```bash
-//! cargo test -p codex-plus-core --test auto_takeover_live -- --ignored --nocapture
+//! cargo test -p codex-plus-core --test all auto_takeover_live:: -- --ignored --nocapture
 //! ```
 //!
 //! 只做只读探测：列出进程、断言判据。不会 quit / kill / 注入任何进程。

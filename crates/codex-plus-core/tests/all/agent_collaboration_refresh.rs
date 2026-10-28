@@ -1,6 +1,6 @@
 use std::process::Command;
 
-const SCRIPT: &str = include_str!("../../../assets/inject/agent-collaboration-refresh.js");
+const SCRIPT: &str = include_str!("../../../../assets/inject/agent-collaboration-refresh.js");
 
 // 仅运行自有 vm fixture，不连接任何 CDP/真实页面，也不启动模型或 agent。
 const FIXTURE: &str = r#"

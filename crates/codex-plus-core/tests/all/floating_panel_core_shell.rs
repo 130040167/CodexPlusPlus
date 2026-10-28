@@ -1,10 +1,10 @@
 #[test]
 fn core_shell_fragments_expose_the_expected_contract() {
-    let host = include_str!("../../../assets/inject/floating-panel/core/host.js");
-    let geometry = include_str!("../../../assets/inject/floating-panel/core/geometry.js");
-    let interaction = include_str!("../../../assets/inject/floating-panel/core/interaction.js");
-    let scroll = include_str!("../../../assets/inject/floating-panel/core/scroll-state.js");
-    let views = include_str!("../../../assets/inject/floating-panel/core/views.js");
+    let host = include_str!("../../../../assets/inject/floating-panel/core/host.js");
+    let geometry = include_str!("../../../../assets/inject/floating-panel/core/geometry.js");
+    let interaction = include_str!("../../../../assets/inject/floating-panel/core/interaction.js");
+    let scroll = include_str!("../../../../assets/inject/floating-panel/core/scroll-state.js");
+    let views = include_str!("../../../../assets/inject/floating-panel/core/views.js");
 
     assert!(host.starts_with("/* Floating-panel host:"));
     assert!(host.contains("function resolveFabExpression"));

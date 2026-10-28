@@ -48,7 +48,7 @@ fn package_bytes_with_min_client_version(
         }
     }))
     .unwrap();
-    let image = include_bytes!("../../../assets/inject/dream-skin-default.png");
+    let image = include_bytes!("../../../../assets/inject/dream-skin-default.png");
     let manifest = serde_json::to_vec(&json!({
         "packageVersion": 1,
         "themeId": "community.theme",

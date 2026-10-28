@@ -117,6 +117,8 @@ fn copied_external_catalog_pointers_are_absolute_without_changing_source() {
 
 #[test]
 fn aggregate_model_catalog_pointer_is_absolute() {
+    // 设置路径覆盖是进程级状态，与其它测试模块串行。
+    let _state = crate::common::global_state_lock();
     let temp = tempfile::tempdir().unwrap();
     let member = profile();
     let aggregate = RelayProfile {

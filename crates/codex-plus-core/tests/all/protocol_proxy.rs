@@ -27,7 +27,6 @@ use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3181,7 +3180,7 @@ fn namespace_tool_null_type_parameters_normalized() {
 /// 发现 `type: null` 或缺失 required 字段时返回 400（对应 issue #2247 的拒绝行为），
 /// 合法则回 200。返回捕获到的上游请求体，供断言实际收到的 schema 形状。
 async fn strict_provider_accepts(tools: Value) -> Result<(Value, u16, Value), (u16, Value)> {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -4705,7 +4704,7 @@ async fn upstream_connect_failures_are_retried_before_reporting_502() {
 
 #[tokio::test]
 async fn aggregate_proxy_fails_over_to_next_member_in_same_request() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -4766,7 +4765,7 @@ async fn aggregate_proxy_fails_over_to_next_member_in_same_request() {
 /// 带 OAuth Bearer 与 `chatgpt-account-id`，不能带供应商 API Key。
 #[tokio::test]
 async fn aggregate_official_member_forwards_with_oauth_credentials() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
 
@@ -4905,7 +4904,7 @@ fn official_aggregate_test_settings(official_id: &str, aggregate_id: &str) -> Ba
 /// `tools` 为空，必须由代理补齐声明（且不能改写历史）。
 #[tokio::test]
 async fn aggregate_official_member_declares_web_search_for_tool_less_history() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
     // 隔离真实 ~/.codex/auth.json，避免 live 登录快照影响凭据解析。
@@ -4956,7 +4955,7 @@ async fn aggregate_official_member_declares_web_search_for_tool_less_history() {
 /// 官方登录通道只修「没有声明任何工具」的请求；带工具的普通轮次保持原样。
 #[tokio::test]
 async fn aggregate_official_member_leaves_tool_declaring_requests_unchanged() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
     let _codex_home = EnvVarGuard::set(
@@ -5000,7 +4999,7 @@ async fn aggregate_official_member_leaves_tool_declaring_requests_unchanged() {
 /// 第二次请求带刷新后的 Bearer；refresh 请求带轮换前的 refresh token。
 #[tokio::test]
 async fn aggregate_official_member_refreshes_and_retries_after_401() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
 
@@ -5365,7 +5364,7 @@ async fn model_route_rejects_missing_or_non_responses_targets() {
 
 #[tokio::test]
 async fn aggregate_stream_request_sends_sse_accept_header() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -5417,7 +5416,7 @@ async fn aggregate_stream_request_sends_sse_accept_header() {
 
 #[tokio::test]
 async fn aggregate_proxy_rewrites_requested_model_to_selected_member_default_model() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -5645,7 +5644,7 @@ async fn aggregate_auto_review_member_drift_does_not_fall_back() {
 
 #[tokio::test]
 async fn aggregate_live_settings_updates_preserve_selected_model_and_failover() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let settings_path = temp.path().join("settings.json");
     let _guard = SettingsPathGuard::set(settings_path.clone());
@@ -5985,7 +5984,7 @@ fn aggregate_proxy_settings(
 
 #[tokio::test]
 async fn aggregate_request_build_error_still_fails_over_with_and_without_exec() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     for with_exec in [false, true] {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -6022,7 +6021,7 @@ async fn aggregate_request_build_error_still_fails_over_with_and_without_exec() 
 
 #[tokio::test]
 async fn audio_transcriptions_proxy_forwards_multipart_body() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -6093,7 +6092,7 @@ async fn audio_transcriptions_proxy_forwards_multipart_body() {
 
 #[tokio::test]
 async fn image_generations_proxy_forwards_json_and_upstream_error() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -6142,7 +6141,7 @@ async fn image_generations_proxy_forwards_json_and_upstream_error() {
 
 #[tokio::test]
 async fn image_edits_proxy_preserves_multipart_body_and_content_type() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -6191,7 +6190,7 @@ async fn image_edits_proxy_preserves_multipart_body_and_content_type() {
 /// 转发到 chatgpt.com 后端，不能因为成员是官方登录就直接拒绝。
 #[tokio::test]
 async fn image_generations_for_official_login_member_uses_oauth_backend() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
     let _codex_home = EnvVarGuard::set("CODEX_HOME", temp.path().to_str().unwrap());
@@ -6248,7 +6247,7 @@ async fn image_generations_for_official_login_member_uses_oauth_backend() {
 /// 编辑接口走同一条官方登录通道，路径是 `images/edits`，请求体原样透传。
 #[tokio::test]
 async fn image_edits_for_official_login_member_uses_oauth_backend() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
     let _codex_home = EnvVarGuard::set("CODEX_HOME", temp.path().to_str().unwrap());
@@ -6304,7 +6303,7 @@ async fn image_edits_for_official_login_member_uses_oauth_backend() {
 
 #[tokio::test]
 async fn chat_completions_proxy_uses_configured_user_agent() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
     let server = spawn_chat_server();
@@ -6324,7 +6323,7 @@ async fn chat_completions_proxy_uses_configured_user_agent() {
 
 #[tokio::test]
 async fn chat_completions_proxy_passes_through_original_user_agent_when_unconfigured() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
     let server = spawn_chat_server();
@@ -6344,7 +6343,7 @@ async fn chat_completions_proxy_passes_through_original_user_agent_when_unconfig
 
 #[tokio::test]
 async fn responses_proxy_passes_through_original_user_agent_when_unconfigured() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
     let server = spawn_chat_server();
@@ -6566,7 +6565,7 @@ async fn responses_proxy_omits_empty_or_invalid_session_headers_and_keeps_legacy
 
 #[tokio::test]
 async fn models_proxy_passes_through_original_user_agent_when_unconfigured() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
     let server = spawn_chat_server();
@@ -6583,7 +6582,7 @@ async fn models_proxy_passes_through_original_user_agent_when_unconfigured() {
 
 #[tokio::test]
 async fn no_auth_proxy_endpoints_omit_authorization_header() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
 
@@ -6761,9 +6760,9 @@ impl Drop for EnvVarGuard {
     }
 }
 
-fn settings_path_test_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+/// 设置路径覆盖是进程级状态，与其它测试模块共用同一把锁。
+fn settings_path_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::common::global_state_lock()
 }
 
 impl SettingsPathGuard {
@@ -8718,14 +8717,10 @@ async fn buffered_mode_retries_overload_and_returns_complete_stream() {
     assert_eq!(server.await.unwrap().len(), 2);
 }
 
-/// 阶段标记是进程级开关（设置「第三方模型回答完自动折叠过程」）：相关用例串行执行，用完复原。
+/// 阶段标记是进程级开关（设置「第三方模型回答完自动折叠过程」），代理请求开始时会按设置
+/// 重写它；转换用例改用线程级覆盖，不受同进程里并发的代理用例影响。
 fn with_message_phase_fill<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    codex_plus_core::protocol_proxy::set_message_phase_fill(enabled);
-    let result = run();
-    codex_plus_core::protocol_proxy::set_message_phase_fill(false);
-    result
+    codex_plus_core::protocol_proxy::with_message_phase_fill_for_tests(enabled, run)
 }
 
 /// 取出 SSE 里助手消息 output_item.done 的 phase（按出现顺序）。

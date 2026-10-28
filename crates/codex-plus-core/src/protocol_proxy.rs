@@ -11788,8 +11788,30 @@ pub fn set_message_phase_fill(enabled: bool) {
     MESSAGE_PHASE_FILL.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
+thread_local! {
+    /// 测试用的线程级覆盖：任何代理请求都会按设置重写进程级开关，
+    /// 并发跑的转换用例只认自己线程上的值，才不会被别的用例改掉。
+    static MESSAGE_PHASE_FILL_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// 测试用：在当前线程内固定阶段标记开关执行 `run`，结束后复原。
+#[doc(hidden)]
+pub fn with_message_phase_fill_for_tests<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MESSAGE_PHASE_FILL_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(MESSAGE_PHASE_FILL_OVERRIDE.with(|cell| cell.replace(Some(enabled))));
+    run()
+}
+
 pub fn message_phase_fill_enabled() -> bool {
-    MESSAGE_PHASE_FILL.load(std::sync::atomic::Ordering::Relaxed)
+    MESSAGE_PHASE_FILL_OVERRIDE
+        .with(|cell| cell.get())
+        .unwrap_or_else(|| MESSAGE_PHASE_FILL.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 impl ResponsesSseTransformer {

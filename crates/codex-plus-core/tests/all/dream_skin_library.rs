@@ -11,7 +11,7 @@ use codex_plus_core::settings::{BackendSettings, DreamSkinThemeConfig};
 fn write_test_png(path: &Path) {
     std::fs::write(
         path,
-        include_bytes!("../../../assets/inject/dream-skin-default.png"),
+        include_bytes!("../../../../assets/inject/dream-skin-default.png"),
     )
     .unwrap();
 }

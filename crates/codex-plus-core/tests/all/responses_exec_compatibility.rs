@@ -8,7 +8,7 @@ use codex_plus_core::settings::{
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -16,9 +16,9 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 const EXEC_REJECTION: &str = "Unsupported custom tool: 'exec'. Only 'apply_patch' is supported.";
 const PROGRAM: &str = "const result = await tools.lookup({ query: \"a\\\\b\\n\" });\ntext(result);";
 
-fn settings_path_test_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+/// 设置路径覆盖是进程级状态，与其它测试模块共用同一把锁。
+fn settings_path_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    crate::common::global_state_lock()
 }
 
 struct TestSettings {
@@ -188,9 +188,7 @@ fn assert_client_exec(response: &Value, program: &str, call_id: &str) {
 
 #[tokio::test]
 async fn explicit_custom_exec_rejection_retries_once_and_restores_raw_json_input() {
-    let _lock = settings_path_test_lock()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let _lock = settings_path_test_lock();
     let server = MockServer::start().await;
     let _settings = TestSettings::new(&server);
     let attempts = Arc::new(AtomicUsize::new(0));
@@ -225,9 +223,7 @@ async fn explicit_custom_exec_rejection_retries_once_and_restores_raw_json_input
 
 #[tokio::test]
 async fn repeated_exact_validation_rejection_never_retries_more_than_once() {
-    let _lock = settings_path_test_lock()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let _lock = settings_path_test_lock();
     let server = MockServer::start().await;
     let _settings = TestSettings::new(&server);
     Mock::given(method("POST"))
@@ -257,9 +253,7 @@ async fn repeated_exact_validation_rejection_never_retries_more_than_once() {
 
 #[tokio::test]
 async fn first_rejected_400_honors_retry_after_before_exec_retry() {
-    let _lock = settings_path_test_lock()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let _lock = settings_path_test_lock();
     let server = MockServer::start().await;
     let settings = TestSettings::new(&server);
     Mock::given(method("POST"))
@@ -302,9 +296,7 @@ async fn first_rejected_400_honors_retry_after_before_exec_retry() {
 
 #[tokio::test]
 async fn first_rejected_400_honors_http_date_before_exec_retry() {
-    let _lock = settings_path_test_lock()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let _lock = settings_path_test_lock();
     let server = MockServer::start().await;
     let _settings = TestSettings::new(&server);
     let retry_at = Arc::new(Mutex::new(None));
@@ -346,9 +338,7 @@ async fn first_rejected_400_honors_http_date_before_exec_retry() {
 
 #[tokio::test]
 async fn past_http_date_allows_exec_retry_without_delay() {
-    let _lock = settings_path_test_lock()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let _lock = settings_path_test_lock();
     let server = MockServer::start().await;
     let _settings = TestSettings::new(&server);
     Mock::given(method("POST"))
@@ -376,9 +366,7 @@ async fn past_http_date_allows_exec_retry_without_delay() {
 
 #[tokio::test]
 async fn nonmatching_errors_do_not_trigger_exec_negotiation() {
-    let _lock = settings_path_test_lock()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let _lock = settings_path_test_lock();
     for (status, error_type, message, param) in [
         (
             400,
@@ -432,9 +420,7 @@ async fn nonmatching_errors_do_not_trigger_exec_negotiation() {
 
 #[tokio::test]
 async fn two_round_history_and_gpt_model_switch_keep_compatibility_isolated() {
-    let _lock = settings_path_test_lock()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let _lock = settings_path_test_lock();
     let server = MockServer::start().await;
     let _settings = TestSettings::new(&server);
     let adapted_round = Arc::new(AtomicUsize::new(0));
@@ -533,9 +519,7 @@ async fn two_round_history_and_gpt_model_switch_keep_compatibility_isolated() {
 
 #[tokio::test]
 async fn stateful_and_compaction_requests_bypass_negotiation_and_a_warm_cache() {
-    let _lock = settings_path_test_lock()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let _lock = settings_path_test_lock();
     let server = MockServer::start().await;
     let settings = TestSettings::new(&server);
     Mock::given(method("POST"))
@@ -600,9 +584,7 @@ async fn stateful_and_compaction_requests_bypass_negotiation_and_a_warm_cache() 
 
 #[tokio::test]
 async fn malformed_adapted_arguments_never_become_executable_custom_input() {
-    let _lock = settings_path_test_lock()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let _lock = settings_path_test_lock();
     for arguments in [
         r#"{"input":"safe","input":"injected"}"#,
         r#"{"input":"program","extra":true}"#,

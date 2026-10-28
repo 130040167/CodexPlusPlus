@@ -1067,6 +1067,8 @@ async fn core_runtime_manager_route_attempts_to_open_manager_binary() {
 
 #[tokio::test]
 async fn bridge_backend_status_writes_diagnostic_log() {
+    // 诊断日志路径是进程级状态，与其它测试模块串行。
+    let _state = crate::common::global_state_lock();
     let temp = tempfile::tempdir().unwrap();
     let log_path = temp.path().join("codex-plus.log");
     codex_plus_core::diagnostic_log::set_diagnostic_log_path_for_tests(Some(log_path.clone()));

@@ -1,7 +1,7 @@
 #[test]
 fn appearance_fragments_expose_the_expected_contract() {
-    let runtime = include_str!("../../../assets/inject/floating-panel/core/appearance-runtime.js");
-    let stylesheet = include_str!("../../../assets/inject/floating-panel/core/appearance.js");
+    let runtime = include_str!("../../../../assets/inject/floating-panel/core/appearance-runtime.js");
+    let stylesheet = include_str!("../../../../assets/inject/floating-panel/core/appearance.js");
 
     assert!(runtime.starts_with("/* Floating-panel appearance runtime:"));
     assert!(stylesheet.starts_with("/* Floating-panel appearance:"));

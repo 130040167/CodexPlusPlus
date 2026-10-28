@@ -326,7 +326,8 @@ fn cross_process_full_saves_have_exactly_one_winner() {
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "cas_child_process_worker",
+                    // 合并测试程序后用例名带模块前缀。
+                    "issue_repair_safety::cas_child_process_worker",
                     "--ignored",
                     "--test-threads=1",
                 ])

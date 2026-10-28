@@ -734,7 +734,7 @@ fn launcher_builds_debug_arguments_and_commands() {
 
 #[test]
 fn launcher_does_not_override_codex_app_environment() {
-    let source = include_str!("../src/launcher.rs");
+    let source = include_str!("../../src/launcher.rs");
 
     assert!(!source.contains(".envs(codex_process_environment())"));
     assert!(!source.contains("activate_packaged_app_with_environment"));
@@ -743,7 +743,7 @@ fn launcher_does_not_override_codex_app_environment() {
 
 #[test]
 fn launcher_uses_all_com_server_contexts_for_packaged_app_activation() {
-    let source = include_str!("../src/launcher.rs");
+    let source = include_str!("../../src/launcher.rs");
 
     assert!(source.contains("CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_ALL)?"));
     assert!(!source.contains("CLSCTX_LOCAL_SERVER"));
@@ -751,7 +751,7 @@ fn launcher_uses_all_com_server_contexts_for_packaged_app_activation() {
 
 #[test]
 fn launcher_does_not_prepare_projectless_main_window() {
-    let source = include_str!("../src/launcher.rs");
+    let source = include_str!("../../src/launcher.rs");
 
     assert!(!source.contains("prepare_projectless_main_window_nonfatal"));
     assert!(!source.contains("launcher.prelaunch"));
@@ -914,7 +914,7 @@ fn launcher_packaged_activation_can_preserve_process_id() {
 
 #[test]
 fn launcher_keeps_packaged_codex_taskbar_identity_and_icons() {
-    let source = include_str!("../src/launcher.rs");
+    let source = include_str!("../../src/launcher.rs");
     // 打包版 Codex 必须保留包自身的 AppUserModelID，否则任务栏白图标且不与原应用合并（#2499、#2668）。
     for forbidden in [
         "apply_codexplusplus_taskbar_after_launch",
@@ -930,8 +930,8 @@ fn launcher_keeps_packaged_codex_taskbar_identity_and_icons() {
         assert!(!source.contains(forbidden), "launcher must not override Codex icons: {forbidden}");
     }
     for production in [
-        include_str!("../src/windows_integration.rs"),
-        include_str!("../src/windows_taskbar.rs"),
+        include_str!("../../src/windows_integration.rs"),
+        include_str!("../../src/windows_taskbar.rs"),
     ] {
         for forbidden in ["PKEY_AppUserModel_RelaunchIconResource", "WM_SETICON", "ImplicitAppShortcuts"] {
             assert!(!production.contains(forbidden), "integration must not override Codex icons: {forbidden}");
@@ -964,9 +964,9 @@ assert.ok(!re.test(bundle + '.other/Contents/MacOS/CodexPlusPlus'));
 
 #[test]
 fn launcher_no_longer_contains_mobile_control_runtime() {
-    let launcher_source = include_str!("../src/launcher.rs");
-    let settings_source = include_str!("../src/settings.rs");
-    let workspace_toml = include_str!("../../../Cargo.toml");
+    let launcher_source = include_str!("../../src/launcher.rs");
+    let settings_source = include_str!("../../src/settings.rs");
+    let workspace_toml = include_str!("../../../../Cargo.toml");
 
     assert!(!workspace_toml.contains("apps/codex-plus-mobile-relay"));
     assert!(!launcher_source.contains("MobileRelay"));
@@ -978,12 +978,12 @@ fn launcher_no_longer_contains_mobile_control_runtime() {
 
 #[test]
 fn retired_plugin_cache_features_have_no_command_or_startup_entrypoints() {
-    let launcher_source = include_str!("../src/launcher.rs");
-    let core_source = include_str!("../src/lib.rs");
-    let launcher_binary_source = include_str!("../../../apps/codex-plus-launcher/src/main.rs");
-    let relay_source = include_str!("../src/relay_config.rs");
-    let command_source = include_str!("../../../apps/codex-plus-manager/src-tauri/src/commands.rs");
-    let command_registry = include_str!("../../../apps/codex-plus-manager/src-tauri/src/lib.rs");
+    let launcher_source = include_str!("../../src/launcher.rs");
+    let core_source = include_str!("../../src/lib.rs");
+    let launcher_binary_source = include_str!("../../../../apps/codex-plus-launcher/src/main.rs");
+    let relay_source = include_str!("../../src/relay_config.rs");
+    let command_source = include_str!("../../../../apps/codex-plus-manager/src-tauri/src/commands.rs");
+    let command_registry = include_str!("../../../../apps/codex-plus-manager/src-tauri/src/lib.rs");
 
     assert!(!core_source.contains("pub mod plugin_marketplace;"));
     assert!(!launcher_source.contains("ensure_plugin_marketplace_config"));
@@ -1015,7 +1015,7 @@ fn app_paths_uses_native_windows_package_api_without_powershell() {
 
 #[test]
 fn launcher_packaged_activation_does_not_directly_fallback_to_windowsapps_exe() {
-    let source = include_str!("../src/launcher.rs");
+    let source = include_str!("../../src/launcher.rs");
 
     assert!(!source.contains("launcher.packaged_activation_cdp_unready_direct_fallback"));
     assert!(!source.contains("terminate_windows_process_id(process_id).await"));
@@ -1138,6 +1138,8 @@ async fn default_helper_serves_backend_status_over_http() {
 
 #[tokio::test]
 async fn default_helper_accepts_diagnostic_log_events_over_http() {
+    // 诊断日志路径是进程级状态，与其它测试模块串行。
+    let _state = crate::common::global_state_lock();
     let temp = tempfile::tempdir().unwrap();
     let log_path = temp.path().join("codex-plus.log");
     codex_plus_core::diagnostic_log::set_diagnostic_log_path_for_tests(Some(log_path.clone()));

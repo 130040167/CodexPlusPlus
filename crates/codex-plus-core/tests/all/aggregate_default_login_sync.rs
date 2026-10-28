@@ -111,8 +111,7 @@ fn relay_profile() -> RelayProfile {
 
 /// 写一份 settings 并应用一次聚合切换；返回切换后的 home 目录（含 auth.json）。
 /// `set_settings_path_for_tests` 是进程级全局状态：这些用例必须串行跑，否则互相
-/// 覆盖 settings 路径（表现是"开关关着也读到了别的用例的同步配置"）。
-static SETTINGS_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// 覆盖 settings 路径（表现是"开关关着也读到了别的用例的同步配置"），统一用共享锁串行。
 
 fn apply_switch(
     member: RelayProfile,
@@ -121,9 +120,7 @@ fn apply_switch(
 ) -> (tempfile::TempDir, Value) {
     let default_member = aggregate.default_relay_id.clone();
     let sync = aggregate.sync_default_member_login;
-    let _serial = SETTINGS_GUARD
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _serial = crate::common::global_state_lock();
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("codex-home");
     std::fs::create_dir_all(&home).unwrap();

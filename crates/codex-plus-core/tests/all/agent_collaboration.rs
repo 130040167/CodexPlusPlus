@@ -286,7 +286,12 @@ fn two_processes_observe_the_same_store_and_only_one_can_claim_a_task() {
     let task = store.submit(request(&temp, "codex")).unwrap();
     let child = || {
         std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "child_claim_helper", "--nocapture"])
+            // 合并测试程序后用例名带模块前缀。
+            .args([
+                "--exact",
+                "agent_collaboration::child_claim_helper",
+                "--nocapture",
+            ])
             .env("CODEX_PLUS_COLLAB_TEST_DB", store.path())
             .env("CODEX_PLUS_COLLAB_TEST_TASK", &task.id)
             .stdout(std::process::Stdio::piped())

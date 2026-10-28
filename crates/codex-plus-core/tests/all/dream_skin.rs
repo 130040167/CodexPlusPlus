@@ -100,7 +100,7 @@ fn legacy_theme_name_migrates_without_losing_other_settings() {
 fn imports_supported_image_into_managed_theme_directory() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source.png");
-    let image = include_bytes!("../../../assets/inject/dream-skin-default.png");
+    let image = include_bytes!("../../../../assets/inject/dream-skin-default.png");
     std::fs::write(&source, image).unwrap();
 
     let imported = import_dream_skin_image(&source, temp.path()).unwrap();

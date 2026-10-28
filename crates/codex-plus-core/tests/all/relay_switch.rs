@@ -1024,6 +1024,8 @@ fn switch_current_relay_profile(
 /// 「不支持的官方认证存档格式」，整次切换失败、config.toml 不再写入。
 #[test]
 fn switch_from_default_official_ignores_live_api_key_auth() {
+    // 诊断日志路径是进程级状态，与其它测试模块串行。
+    let _state = crate::common::global_state_lock();
     for saved_auth in [
         String::new(),
         r#"{"auth_mode":"chatgpt","tokens":{"access_token":"official"}}"#.to_string(),

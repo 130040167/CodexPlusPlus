@@ -219,6 +219,8 @@ experimental_bearer_token = "relay-key"
 
 #[tokio::test]
 async fn model_catalog_uses_active_relay_profile_model_list_and_actual_provider() {
+    // 设置路径覆盖是进程级状态，与其它测试模块串行。
+    let _state = crate::common::global_state_lock();
     let temp = tempfile::tempdir().unwrap();
     let codex_home = temp.path().join("codex-home");
     std::fs::create_dir_all(&codex_home).unwrap();

@@ -32,6 +32,8 @@ fn aggregate_profile_with_config_contents() -> RelayProfile {
 
 #[test]
 fn aggregate_profile_with_backfilled_config_contents_loads_without_recursing() {
+    // 设置路径覆盖是进程级状态，与其它测试模块串行。
+    let _state = crate::common::global_state_lock();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("settings.json");
     let previous = set_settings_path_for_tests(Some(path.clone()));

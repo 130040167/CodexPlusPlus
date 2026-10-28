@@ -1,12 +1,12 @@
 #[test]
 fn outline_fragments_expose_the_expected_contract() {
-    let parser = include_str!("../../../assets/inject/floating-panel/outline/parser.js")
+    let parser = include_str!("../../../../assets/inject/floating-panel/outline/parser.js")
         .replace("\r\n", "\n");
-    let navigation = include_str!("../../../assets/inject/floating-panel/outline/navigation.js")
+    let navigation = include_str!("../../../../assets/inject/floating-panel/outline/navigation.js")
         .replace("\r\n", "\n");
-    let feature = include_str!("../../../assets/inject/floating-panel/outline/feature.js")
+    let feature = include_str!("../../../../assets/inject/floating-panel/outline/feature.js")
         .replace("\r\n", "\n");
-    let view = include_str!("../../../assets/inject/floating-panel/outline/view.js")
+    let view = include_str!("../../../../assets/inject/floating-panel/outline/view.js")
         .replace("\r\n", "\n");
 
     assert!(parser.starts_with("/* Answer Outline parser:"));

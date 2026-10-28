@@ -5343,6 +5343,9 @@ async fn list_targets_can_query_ipv6_loopback_cdp_endpoint() {
 
 #[tokio::test]
 async fn install_bridge_routes_binding_while_waiting_for_command_response() {
+    ensure_bridge_test_settings();
+    // 诊断日志路径是进程级状态，与其它测试模块串行。
+    let _state = crate::common::global_state_lock();
     let temp = tempfile::tempdir().unwrap();
     let log_path = temp.path().join("codex-plus.log");
     codex_plus_core::diagnostic_log::set_diagnostic_log_path_for_tests(Some(log_path.clone()));
@@ -6331,15 +6334,22 @@ async fn install_test_bridge(
     handler: bridge::BridgeHandler,
     new_document_scripts: &[String],
 ) -> anyhow::Result<()> {
-    // 桥接模拟协议使用缺省开关，不能受本机用户已开启的 Fast 等设置影响。
-    // 目录保留到进程结束，供安装后启动的后台任务继续读取。
+    ensure_bridge_test_settings();
+    bridge::install_bridge(websocket_url, binding_name, handler, new_document_scripts).await
+}
+
+/// 桥接模拟协议使用缺省开关，不能受本机用户已开启的 Fast 等设置影响。
+/// 目录保留到进程结束，供安装后启动的后台任务继续读取。
+/// 会取共享锁：已持锁的用例要在取锁之前先调用它，否则首次初始化会自锁。
+fn ensure_bridge_test_settings() {
     static SETTINGS_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
     SETTINGS_DIR.get_or_init(|| {
+        // 别的模块的用例可能正持锁临时覆盖设置路径，等它复原后再设，免得被它的复原冲掉。
+        let _state = crate::common::global_state_lock();
         let dir = tempfile::tempdir().unwrap();
         codex_plus_core::paths::set_settings_path_for_tests(Some(dir.path().join("settings.json")));
         dir
     });
-    bridge::install_bridge(websocket_url, binding_name, handler, new_document_scripts).await
 }
 
 fn noop_handler() -> bridge::BridgeHandler {

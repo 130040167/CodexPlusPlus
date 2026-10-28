@@ -4,7 +4,7 @@
 //! 读的是本机真实文件。刻意用文件副本、并且只写副本，原文件全程只读。
 //!
 //!   CODEX_PLUS_LIVE_SETTINGS=~/.codex-session-delete/settings.json \
-//!     cargo test -p codex-plus-core --test live_settings_migration
+//!     cargo test -p codex-plus-core --test all live_settings_migration::
 
 use codex_plus_core::settings::{BackendSettings, SettingsStore};
 use codex_plus_core::tools::ToolId;

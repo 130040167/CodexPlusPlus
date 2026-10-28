@@ -7,7 +7,7 @@
 //! LIVE_ANTHROPIC_BASE_URL=https://your-gateway.example.com \
 //! LIVE_ANTHROPIC_API_KEY=sk-... \
 //! LIVE_ANTHROPIC_MODEL=claude-sonnet-4-6 \
-//! cargo test -p codex-plus-core --test live_anthropic_upstream -- --ignored --nocapture --test-threads=1
+//! cargo test -p codex-plus-core --test all live_anthropic_upstream:: -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! 覆盖：认证/端点探针、非流式与流式转换、工具调用、**思考签名跨轮回放**、

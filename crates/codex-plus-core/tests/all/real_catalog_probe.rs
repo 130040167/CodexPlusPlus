@@ -1,6 +1,6 @@
 //! 用真实 settings.json 跑一遍目录生成，核对"成员自指前缀"不再套两层。
 //! 默认忽略（依赖本机用户设置），用 `--ignored` 显式运行：
-//!   cargo test -p codex-plus-core --test real_catalog_probe -- --ignored --nocapture
+//!   cargo test -p codex-plus-core --test all real_catalog_probe:: -- --ignored --nocapture
 use codex_plus_core::aggregate_catalog::build_catalog_json;
 use codex_plus_core::settings::SettingsStore;
 

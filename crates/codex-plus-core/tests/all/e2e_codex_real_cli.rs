@@ -4,7 +4,7 @@
 //! 可用 CODEX_E2E_CODEX_BIN 覆盖）：
 //!
 //! ```text
-//! cargo test -p codex-plus-core --test e2e_codex_real_cli -- --ignored --nocapture
+//! cargo test -p codex-plus-core --test all e2e_codex_real_cli:: -- --ignored --nocapture
 //! ```
 //!
 //! 步骤：
@@ -21,9 +21,9 @@ use std::process::Command;
 use codex_plus_core::relay_config::apply_relay_profile_to_home_with_switch_rules;
 use codex_plus_core::settings::{RelayMode, RelayProfile, RelayProtocol};
 
-const KIMI_JSON: &str = include_str!("../../../assets/kimi-model-metadata.json");
-const MINIMAX_JSON: &str = include_str!("../../../assets/minimax-model-metadata.json");
-const QWEN_JSON: &str = include_str!("../../../assets/qwen-model-metadata.json");
+const KIMI_JSON: &str = include_str!("../../../../assets/kimi-model-metadata.json");
+const MINIMAX_JSON: &str = include_str!("../../../../assets/minimax-model-metadata.json");
+const QWEN_JSON: &str = include_str!("../../../../assets/qwen-model-metadata.json");
 
 // 不写死本机路径：默认置空，要求显式提供 CODEX_E2E_CODEX_BIN。写死作者机器的
 // 绝对路径既对别人无用，也会在扩展升级后变成误导性的失效默认值。
@@ -151,7 +151,7 @@ base_url = "https://relay.example.test/v1"
     let codex = codex_bin();
     if codex.as_os_str().is_empty() {
         panic!("请设置 CODEX_E2E_CODEX_BIN 指向本机 codex 二进制，例如：
-  CODEX_E2E_CODEX_BIN=/path/to/codex cargo test -p codex-plus-core --test e2e_codex_real_cli -- --ignored --nocapture");
+  CODEX_E2E_CODEX_BIN=/path/to/codex cargo test -p codex-plus-core --test all e2e_codex_real_cli:: -- --ignored --nocapture");
     }
     assert!(codex.exists(), "codex 二进制不存在：{}", codex.display());
     let (ok, text) = run_codex_debug_models(&codex, temp.path());
@@ -197,6 +197,8 @@ base_url = "https://relay.example.test/v1"
 #[test]
 #[ignore = "E2E 需要本机 codex 二进制，手动用 --ignored 运行"]
 fn e2e_runtime_cache_base_composes_with_compat_overlay() {
+    // CODEX_HOME 是进程级环境变量，与其它测试模块串行。
+    let _state = crate::common::global_state_lock();
     struct CodexHomeGuard(std::ffi::OsString);
     impl CodexHomeGuard {
         fn set(path: &std::path::Path) -> Self {
