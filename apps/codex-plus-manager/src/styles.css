@@ -11049,11 +11049,11 @@ select {
 
 .request-log-row {
   display: grid;
-  grid-template-columns: 74px 44px 100px minmax(110px, 1.4fr) 74px 54px 54px 80px 54px;
+  grid-template-columns: 74px 44px 100px minmax(110px, 1.4fr) 74px 54px 54px 80px 60px 54px;
   gap: 8px;
   align-items: center;
   width: 100%;
-  min-width: 760px;
+  min-width: 828px;
   border: 0;
   padding: 8px 12px;
   color: inherit;
@@ -13752,4 +13752,42 @@ button.side-item:hover {
 
 .shell .screen.request-log-screen > .usage-tabs {
   align-self: start;
+}
+
+/* 请求页签：从统计点进来的供应商 / 模型筛选（点 × 去掉）、失败请求的错误摘要、日志范围提示。 */
+.shell .request-log-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.shell .request-log-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  background: hsl(var(--muted) / 0.5);
+  color: hsl(var(--foreground));
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.shell .request-log-chip:hover {
+  border-color: hsl(var(--primary) / 0.6);
+}
+
+.shell .request-log-error-cell {
+  grid-column: span 4;
+  min-width: 0;
+  overflow: hidden;
+  color: hsl(0 72% 60%);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shell .request-log-note {
+  margin: 0;
 }

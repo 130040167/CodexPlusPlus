@@ -1,11 +1,18 @@
 /** 「用量」页顶部的两个页签：统计（按 Agent、供应商、模型汇总）与请求（每条请求的日志）。
  * 两个页签各是一条路由（gatewayUsage / requestLog），侧栏里只有一个「用量」入口。 */
 import { t } from "./i18n";
+import type { UsageRange } from "./gateway-model";
 
 export type UsageRoute = "gatewayUsage" | "requestLog";
 
-/** 统计表里点一行，切到「请求」页签并按它筛选。 */
-export type RequestLogFocus = { agent?: "codex" | "claude" | "grok"; query?: string };
+/** 统计表里点一行，切到「请求」页签并按它筛选：Agent、供应商（id 与显示名）或模型，时间段跟着统计页。 */
+export type RequestLogFocus = {
+  agent?: "codex" | "claude" | "grok";
+  relayId?: string;
+  relayLabel?: string;
+  model?: string;
+  range?: UsageRange;
+};
 
 const OPEN_REQUESTS_EVENT = "codexplus:open-requests";
 

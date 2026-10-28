@@ -226,4 +226,9 @@ test("用量与请求日志并成一页：两个页签各是一条路由，统�
   assert.match(app, /const selected = route === item\.id \|\| navAliasRoute\[route\] === item\.id;/, "在请求页签时侧栏「用量」也是选中");
   assert.match(app, /useEffect\(\(\) => onOpenRequestLog\(\(focus\) => \{/);
   assert.match(read("GatewayUsage.tsx"), /onClick=\{\(\) => openRequestLog\(split === "agent"/);
+  assert.match(read("GatewayUsage.tsx"), /\{ relayId: group\.key, relayLabel: maskAccountName\(group\.label\), range \}/, "按供应商 id 精确筛，时间段跟着统计页");
+  assert.match(read("GatewayUsage.tsx"), /\{ model: group\.key, range \}/);
+  assert.match(app, /invoke<RequestLogsResult>\("load_request_logs", filterRef\.current\)/, "时间段、供应商、模型在后端筛，先截 300 条再筛会漏");
+  assert.match(app, /entry\.statusCode \|\| \(entry\.success \? "OK" : "ERR"\)/);
+  assert.match(read("GatewayPage.tsx"), /<TopbarActions>\{tab === "usage" \? null : refreshButton\}<\/TopbarActions>/, "用量页签只留一个刷新");
 });

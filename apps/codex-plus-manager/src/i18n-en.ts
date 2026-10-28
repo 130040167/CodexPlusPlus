@@ -1091,6 +1091,14 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "清空统计": "Clear stats",
+  "清空日志": "Clear log",
+  "全部状态": "All statuses",
+  "全部时间": "All time",
+  "近 7 天": "Last 7 days",
+  "近 30 天": "Last 30 days",
+  "时间段": "Time range",
+  "去掉这个筛选": "Remove this filter",
   "保存生图选项": "Save image option",
   "图片链接转成图片数据": "Convert image links to data",
   "上游只返回图片链接时，网关把图下载下来转成图片数据再交给 Agent（Codex 只认图片数据）。关掉后原样转发链接。": "When the upstream only returns an image link, the gateway downloads it and passes the image data to the agent (Codex only accepts image data). Turn off to forward the link as is.",
@@ -2531,6 +2539,11 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "生图 {0} 次": "{0} images",
+  "供应商：{0}": "Provider: {0}",
+  "模型：{0}": "Model: {0}",
+  "只显示最近 {0} 条。": "Showing the latest {0} only. ",
+  "请求日志按大小滚动，最早只到 {0}；更早的请求只计入统计。": "The request log rotates by size and only goes back to {0}; older requests are counted in stats only.",
   "{0} / {1} 个模型自定义": "{0} / {1} models customized",
   "默认：{0}": "Default: {0}",
   "{0} 的思考等级": "{0} reasoning levels",

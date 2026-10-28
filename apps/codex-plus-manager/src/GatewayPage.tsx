@@ -186,7 +186,8 @@ export function GatewayPage({
       {/* 页面标题由外层框架显示，这里只放分段标签和刷新。 */}
       {controlledTab ? (
         // 由外层侧栏控制时不显示页内工具条，刷新按钮放进外壳顶栏。
-        <TopbarActions>{refreshButton}</TopbarActions>
+        // 用量页签有自己的刷新（读用量和余额），这里的只刷新网关状态，放在一起会让人以为刷新了用量。
+        <TopbarActions>{tab === "usage" ? null : refreshButton}</TopbarActions>
       ) : (
         <div className="gw-toolbar">
           <nav aria-label={t("本地网关")} className="gw-tabs" role="tablist">
