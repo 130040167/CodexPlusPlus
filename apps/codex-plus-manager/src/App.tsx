@@ -557,6 +557,7 @@ export type RelayProfile = {
   modelRoutes?: RelayModelRoute[];
   standardOpenaiProtocol: boolean;
   webSearchHistoryCompat: boolean;
+  localCompactionPromptAtEnd?: boolean;
   trustUpstreamCatalogLite?: boolean;
   strictResponsesReasoning?: boolean;
   /** Anthropic 上游的认证字段：`x-api-key`（默认）或 `authorization`。 */
@@ -11242,6 +11243,7 @@ function RelayProfileEditor({
     profile.standardOpenaiProtocol,
     stabilizePromptPrefix,
     profile.webSearchHistoryCompat,
+    profile.localCompactionPromptAtEnd === true,
     profile.trustUpstreamCatalogLite === true,
     profile.strictResponsesReasoning === true,
   ].filter(Boolean).length;
@@ -12764,6 +12766,20 @@ function RelayProfileEditor({
                     <span>
                       <strong>{t("搜索历史压缩兼容（实验）")}</strong>
                       <small>response protection is unavailable</small>
+                    </span>
+                    <ToggleVisual />
+                  </label>
+                ) : null}
+                {showApiFields && profile.relayMode !== "aggregate" && profile.protocol !== "anthropicMessages" ? (
+                  <label className="switch-row compact relay-switch-row relay-field-local-compaction">
+                    <input
+                      checked={profile.localCompactionPromptAtEnd === true}
+                      onChange={(event) => updateDraft({ localCompactionPromptAtEnd: event.currentTarget.checked })}
+                      type="checkbox"
+                    />
+                    <span>
+                      <strong>{t("本地压缩缓存复用（实验）")}</strong>
+                      <small>{t("仅支持旧版直连供应商，暂不支持 2.0 网关。实测可改善压缩请求的缓存命中概率，但不保证每次命中，也不保证后置压缩提示不影响摘要质量。缓存按 Key 隔离，切换或轮换 Key 可能降低命中率。未命中供应商缓存时，补回的工具声明会增加输入 token 开销；上游若忽略禁用工具调用要求，可能返回空摘要。默认关闭。")}</small>
                     </span>
                     <ToggleVisual />
                   </label>
@@ -16394,6 +16410,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     sub2apiMultiplier: !profile.noAuth && profile.sub2apiEnabled === true ? profile.sub2apiMultiplier || "" : "",
     standardOpenaiProtocol: profile.standardOpenaiProtocol === true,
     webSearchHistoryCompat: profile.webSearchHistoryCompat === true,
+    localCompactionPromptAtEnd: profile.localCompactionPromptAtEnd === true,
     trustUpstreamCatalogLite: profile.trustUpstreamCatalogLite === true,
     strictResponsesReasoning: profile.strictResponsesReasoning === true,
     anthropicAuthHeader: normalizeAnthropicAuthHeader(profile.anthropicAuthHeader),
@@ -16667,14 +16684,18 @@ function withGeneratedRelayFiles(profile: RelayProfile): RelayProfile {
 }
 
 function buildRelayConfigToml(
-  profile: Pick<RelayProfile, "id" | "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider" | "relayMode" | "officialMixApiKey" | "webSearchHistoryCompat" | "strictResponsesReasoning" | "modelMetadata">,
+  profile: Pick<RelayProfile, "id" | "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider" | "relayMode" | "officialMixApiKey" | "webSearchHistoryCompat" | "localCompactionPromptAtEnd" | "strictResponsesReasoning" | "modelMetadata">,
   options: { includeBearerToken: boolean; requiresOpenAiAuth?: boolean },
 ): string {
   const searchHistoryCompat = profile.webSearchHistoryCompat === true
     && profile.protocol === "responses"
     && profile.relayMode !== "aggregate"
     && (profile.relayMode !== "official" || profile.officialMixApiKey);
-  const baseUrl = profile.protocol !== "responses" || independentProxyEnabled(profile) || searchHistoryCompat || requestCompatibilityEnabled(profile)
+  const localCompaction = profile.localCompactionPromptAtEnd === true
+    && (profile.protocol === "responses" || profile.protocol === "chatCompletions")
+    && profile.relayMode !== "aggregate"
+    && (profile.relayMode !== "official" || profile.officialMixApiKey);
+  const baseUrl = profile.protocol !== "responses" || independentProxyEnabled(profile) || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(profile)
     ? PROTOCOL_PROXY_BASE_URL
     : profile.baseUrl.trim();
   const apiKey = profile.apiKey.trim();
@@ -16825,12 +16846,16 @@ function applyRelayProfilePatchToFiles(
   if ("upstreamBaseUrl" in patch) {
     next.baseUrl = patch.upstreamBaseUrl || "";
   }
-  if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch || "webSearchHistoryCompat" in patch || "strictResponsesReasoning" in patch || "modelMetadata" in patch) {
+  if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch || "webSearchHistoryCompat" in patch || "localCompactionPromptAtEnd" in patch || "strictResponsesReasoning" in patch || "modelMetadata" in patch) {
     const searchHistoryCompat = next.webSearchHistoryCompat === true
       && next.protocol === "responses"
       && next.relayMode !== "aggregate"
       && (next.relayMode !== "official" || next.officialMixApiKey);
-    const baseUrlForConfig = next.protocol !== "responses" || independentProxyEnabled(next) || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat || requestCompatibilityEnabled(next)
+    const localCompaction = next.localCompactionPromptAtEnd === true
+      && (next.protocol === "responses" || next.protocol === "chatCompletions")
+      && next.relayMode !== "aggregate"
+      && (next.relayMode !== "official" || next.officialMixApiKey);
+    const baseUrlForConfig = next.protocol !== "responses" || independentProxyEnabled(next) || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(next)
       ? PROTOCOL_PROXY_BASE_URL
       : next.upstreamBaseUrl || next.baseUrl;
     next.configContents = setCodexProviderStringKey(next.configContents, "base_url", baseUrlForConfig, {

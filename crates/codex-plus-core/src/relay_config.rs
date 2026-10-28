@@ -1671,6 +1671,7 @@ fn recognized_managed_proxy_endpoint(profile: &RelayProfile, config: &str) -> bo
         || profile.uses_no_auth()
         || profile.uses_independent_proxy()
         || profile.web_search_history_compat_enabled()
+        || profile.local_compaction_prompt_at_end_enabled()
         || profile.request_compatibility_enabled()
         || profile.rewrites_auto_review_model()
         || profile.relay_mode == RelayMode::Aggregate;
@@ -5203,6 +5204,7 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
         || profile.uses_no_auth()
         || profile.uses_independent_proxy()
         || profile.web_search_history_compat_enabled()
+        || profile.local_compaction_prompt_at_end_enabled()
         || profile.request_compatibility_enabled()
         || profile.rewrites_auto_review_model()
         || has_managed_proxy_config
@@ -5410,6 +5412,7 @@ fn complete_relay_profile_config_with_proxy_port(
         || profile.uses_no_auth()
         || profile.uses_independent_proxy()
         || profile.web_search_history_compat_enabled()
+        || profile.local_compaction_prompt_at_end_enabled()
         || profile.request_compatibility_enabled()
         || profile.rewrites_auto_review_model()
     {
