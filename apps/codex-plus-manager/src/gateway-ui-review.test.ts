@@ -236,6 +236,6 @@ test("用量与请求日志并成一页：两个页签各是一条路由，统�
 test("启动落在网关「总览」，不落在上次那个 Agent 的概览", () => {
   const app = read("App.tsx");
   const body = app.slice(app.indexOf("function loadInitialRoute(): Route {"), app.indexOf("function initialTourOpen"));
-  assert.match(body, /return "hub";\n\}/);
+  assert.match(body, /return "hub";\r?\n\}/);
   assert.doesNotMatch(body, /return "overview"/);
 });
