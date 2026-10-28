@@ -13,7 +13,7 @@ enum Role {
     AppServer,
 }
 
-fn same_image(actual: &Path, expected: &Path) -> bool {
+fn same_resolved_path(actual: &Path, expected: &Path) -> bool {
     let normalize = |path: &Path| {
         path.to_string_lossy()
             .trim_start_matches(r"\\?\")
@@ -21,6 +21,16 @@ fn same_image(actual: &Path, expected: &Path) -> bool {
             .to_ascii_lowercase()
     };
     normalize(actual) == normalize(expected)
+}
+
+fn same_image(actual: &Path, expected: &Path) -> bool {
+    if !actual.is_absolute() || !expected.is_absolute() {
+        return false;
+    }
+    let (Ok(actual), Ok(expected)) = (actual.canonicalize(), expected.canonicalize()) else {
+        return false;
+    };
+    same_resolved_path(&actual, &expected)
 }
 
 fn flag_values<'a>(args: &'a [String], flag: &str) -> Option<Vec<&'a str>> {
@@ -76,14 +86,12 @@ fn child_role(
         }
         return Some(Role::Electron);
     }
-    let trusted = identity
-        .executable
-        .parent()?
-        .join("resources")
-        .join("codex.exe");
+    // 先解析安装目录的短/长路径别名，再拼接可信相对路径。
+    let desktop = identity.executable.canonicalize().ok()?;
+    let trusted = desktop.parent()?.join("resources").join("codex.exe");
     // 不接受 resources 的目录联接/符号链接跳转到安装目录之外。
     let canonical = trusted.canonicalize().ok()?;
-    if !same_image(&canonical, &trusted) || !same_image(image, &canonical) {
+    if !same_resolved_path(&canonical, &trusted) || !same_image(image, &canonical) {
         return None;
     }
     // 桌面内置 CLI 的角色必须是精确的第一个子命令。
@@ -189,7 +197,8 @@ impl CodexInstanceProcessTree {
         self.refresh()?;
         let mut members = self.lineage.clone();
         for (process, role) in &self.processes {
-            if let Some(member) = members.iter_mut()
+            if let Some(member) = members
+                .iter_mut()
                 .find(|member| member.pid == process.process_id && member.birth == process.birth_id)
             {
                 member.exit = process.exit_time()?;
@@ -203,8 +212,14 @@ impl CodexInstanceProcessTree {
                 role: *role,
             });
         }
-        anyhow::ensure!(members.len() <= Self::MAX_TRACKED, "进程树交接祖先记录超过安全上限");
-        let checkpoint = TreeCheckpoint { identity: self.identity.clone(), members };
+        anyhow::ensure!(
+            members.len() <= Self::MAX_TRACKED,
+            "进程树交接祖先记录超过安全上限"
+        );
+        let checkpoint = TreeCheckpoint {
+            identity: self.identity.clone(),
+            members,
+        };
         crate::settings::atomic_write(path, &serde_json::to_vec(&checkpoint)?)
     }
 
@@ -232,14 +247,19 @@ impl CodexInstanceProcessTree {
         let mut seen = std::collections::HashSet::from([root.pid]);
         for (index, member) in checkpoint.members.iter().enumerate().skip(1) {
             anyhow::ensure!(seen.insert(member.pid), "进程树交接记录包含重复 PID");
-            let parent = checkpoint.members[..index].iter()
+            let parent = checkpoint.members[..index]
+                .iter()
                 .find(|parent| parent.pid == member.parent)
                 .ok_or_else(|| anyhow::anyhow!("进程树交接记录祖先链断裂"))?;
             anyhow::ensure!(
                 parent.role != Role::AppServer
                     && member.role != Role::Desktop
                     && child_lifetime_matches(
-                        parent.pid, member.parent, parent.birth, parent.exit, member.birth
+                        parent.pid,
+                        member.parent,
+                        parent.birth,
+                        parent.exit,
+                        member.birth
                     ),
                 "进程树交接记录包含无效后代"
             );
@@ -252,11 +272,19 @@ impl CodexInstanceProcessTree {
             }
             anyhow::ensure!(
                 process.parent_id()? == member.parent
-                    && child_role(&self.identity, parent.role, &process.image()?, &process.arguments()?)
-                        == Some(member.role),
+                    && child_role(
+                        &self.identity,
+                        parent.role,
+                        &process.image()?,
+                        &process.arguments()?
+                    ) == Some(member.role),
                 "进程树交接后代身份冲突"
             );
-            if !self.processes.iter().any(|(known, _)| known.process_id == member.pid) {
+            if !self
+                .processes
+                .iter()
+                .any(|(known, _)| known.process_id == member.pid)
+            {
                 restored.push((process, member.role));
             }
         }
@@ -389,6 +417,7 @@ mod tests {
     use super::*;
 
     fn identity(root: &Path) -> CodexInstanceIdentity {
+        std::fs::write(root.join("ChatGPT.exe"), "").unwrap();
         CodexInstanceIdentity {
             instance_id: "own".into(),
             generation: 1,
@@ -400,6 +429,62 @@ mod tests {
             process_birth_id: 100,
             executable: root.join("ChatGPT.exe"),
         }
+    }
+
+    #[test]
+    fn unresolved_or_relative_images_never_match_even_identical_spellings() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.exe");
+        assert!(!same_image(&missing, &missing));
+        let existing = dir.path().join("ChatGPT.exe");
+        std::fs::write(&existing, "").unwrap();
+        assert!(same_image(&existing, &existing.canonicalize().unwrap()));
+        assert!(!same_image(&existing, &missing));
+        assert!(!same_image(
+            Path::new("ChatGPT.exe"),
+            Path::new("ChatGPT.exe")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resources_junction_outside_installation_is_not_a_trusted_app_server() {
+        use std::os::windows::process::CommandExt;
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let identity = identity(dir.path());
+        std::fs::write(outside.path().join("codex.exe"), "").unwrap();
+        let command = Path::new(&std::env::var_os("SystemRoot").unwrap())
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let link = dir
+            .path()
+            .join("resources")
+            .to_string_lossy()
+            .replace('\'', "''");
+        let target = outside.path().to_string_lossy().replace('\'', "''");
+        let result = std::process::Command::new(command)
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(format!("New-Item -ItemType Junction -Path '{link}' -Target '{target}' -ErrorAction Stop | Out-Null"))
+            .creation_flags(crate::windows_integration::CREATE_NO_WINDOW)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "junction fixture: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let cli = dir.path().join("resources/codex.exe");
+        // 映像指向同一真实文件仍不够：可信相对位置不能被重定向。
+        assert!(same_image(&cli, &outside.path().join("codex.exe")));
+        assert_eq!(
+            child_role(
+                &identity,
+                Role::Desktop,
+                &cli,
+                &["codex.exe".into(), "app-server".into()]
+            ),
+            None
+        );
     }
 
     #[test]

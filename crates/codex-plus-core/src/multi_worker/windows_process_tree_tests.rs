@@ -9,6 +9,22 @@ use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
+fn short_path(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+    let input: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut output = vec![0_u16; 32768];
+    let length =
+        unsafe { GetShortPathNameW(windows::core::PCWSTR(input.as_ptr()), Some(&mut output)) }
+            as usize;
+    assert!(
+        length > 0 && length < output.len(),
+        "short path: {}",
+        std::io::Error::last_os_error()
+    );
+    PathBuf::from(std::ffi::OsString::from_wide(&output[..length]))
+}
+
 // 只串行化会拷贝并派生原生进程的测试；纯规则和 CDP 单元测试仍并行。
 static FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const FIXTURE_NAME: &str = "multi_worker::windows_process_tree::native_tests::fixture_process";
@@ -266,8 +282,15 @@ struct FixtureGroup {
 
 impl FixtureGroup {
     fn start(port: u16) -> Self {
+        Self::start_with_paths(port, false)
+    }
+
+    fn start_with_paths(port: u16, use_short_paths: bool) -> Self {
         let mut group = Self {
-            dir: tempfile::tempdir().unwrap(),
+            dir: tempfile::Builder::new()
+                .prefix("Codex process safety fixture ")
+                .tempdir()
+                .unwrap(),
             root: None,
             neighbor: None,
         };
@@ -277,8 +300,18 @@ impl FixtureGroup {
         let image = std::env::current_exe().unwrap();
         std::fs::copy(&image, dir.join("Desktop fixture.exe")).unwrap();
         std::fs::copy(&image, dir.join("resources/codex.exe")).unwrap();
-        group.root = Some(spawn_fixture(dir, "root", port));
-        group.neighbor = Some(spawn_fixture(dir, "neighbor", 0));
+        let launch_dir = if use_short_paths {
+            let short = short_path(&dir.canonicalize().unwrap());
+            assert!(
+                !same_resolved_path(&short, &dir.canonicalize().unwrap()),
+                "regression requires a real 8.3 alias"
+            );
+            short
+        } else {
+            dir.to_path_buf()
+        };
+        group.root = Some(spawn_fixture(&launch_dir, "root", port));
+        group.neighbor = Some(spawn_fixture(&launch_dir, "neighbor", 0));
         wait_for_fixtures(dir, MODES, Duration::from_secs(10));
         group
     }
@@ -365,6 +398,51 @@ fn unused_port() -> u16 {
 }
 
 #[tokio::test]
+async fn short_path_launch_matches_long_identity_and_preserves_unowned_processes() {
+    let _guard = FIXTURE_LOCK.lock().await;
+    let port = unused_port();
+    let fixtures = FixtureGroup::start_with_paths(port, true);
+    let mut identity = fixtures.identity(port);
+    identity.executable = fixtures
+        .dir
+        .path()
+        .join("Desktop fixture.exe")
+        .canonicalize()
+        .unwrap();
+    let short_image = short_path(&identity.executable);
+    assert!(same_image(&short_image, &identity.executable));
+    assert!(same_image(&identity.executable, &short_image));
+    let cli = fixtures
+        .dir
+        .path()
+        .join("resources/codex.exe")
+        .canonicalize()
+        .unwrap();
+    assert_eq!(
+        child_role(
+            &identity,
+            Role::Desktop,
+            &short_path(&cli),
+            &["codex.exe".into(), "app-server".into()]
+        ),
+        Some(Role::AppServer)
+    );
+    let mut tree = CodexInstanceProcessTree::capture(&identity).unwrap();
+    assert_eq!(tree.processes.len(), 4);
+    let owned: Vec<_> = ["root", "renderer", "gpu", "appserver"]
+        .iter()
+        .map(|mode| fixtures.process(mode))
+        .collect();
+    let preserved: Vec<_> = ["shell", "independent", "user-tool", "neighbor"]
+        .iter()
+        .map(|mode| fixtures.process(mode))
+        .collect();
+    tree.stop_and_wait().unwrap();
+    assert!(owned.iter().all(|process| !process.is_alive().unwrap()));
+    assert!(preserved.iter().all(|process| process.is_alive().unwrap()));
+}
+
+#[tokio::test]
 async fn concurrent_stops_confirm_exit_of_the_same_owned_tree() {
     let _guard = FIXTURE_LOCK.lock().await;
     let port = unused_port();
@@ -426,7 +504,9 @@ async fn handoff_checkpoint_preserves_orphans_across_two_worker_replacements() {
     let renderer = fixtures.process("renderer");
     let gpu = fixtures.process("gpu");
     let preserved: Vec<_> = ["shell", "independent", "user-tool", "neighbor"]
-        .iter().map(|mode| fixtures.process(mode)).collect();
+        .iter()
+        .map(|mode| fixtures.process(mode))
+        .collect();
     renderer.terminate().unwrap();
     wait_for_exit(&renderer);
     assert!(gpu.is_alive().unwrap());
@@ -435,17 +515,34 @@ async fn handoff_checkpoint_preserves_orphans_across_two_worker_replacements() {
     drop(original);
     for _ in 0..2 {
         let mut resumed = CodexInstanceProcessTree::capture(&identity).unwrap();
-        assert!(!resumed.processes.iter().any(|(p, _)| p.process_id == gpu.process_id));
+        assert!(
+            !resumed
+                .processes
+                .iter()
+                .any(|(p, _)| p.process_id == gpu.process_id)
+        );
         resumed.restore_handoff_checkpoint(&checkpoint).unwrap();
-        assert!(resumed.processes.iter().any(|(p, _)| p.process_id == gpu.process_id));
+        assert!(
+            resumed
+                .processes
+                .iter()
+                .any(|(p, _)| p.process_id == gpu.process_id)
+        );
         resumed.save_handoff_checkpoint(&checkpoint).unwrap();
     }
     let mut final_worker = CodexInstanceProcessTree::capture(&identity).unwrap();
-    final_worker.restore_handoff_checkpoint(&checkpoint).unwrap();
-    let mut wrong: TreeCheckpoint = serde_json::from_slice(&std::fs::read(&checkpoint).unwrap()).unwrap();
+    final_worker
+        .restore_handoff_checkpoint(&checkpoint)
+        .unwrap();
+    let mut wrong: TreeCheckpoint =
+        serde_json::from_slice(&std::fs::read(&checkpoint).unwrap()).unwrap();
     wrong.identity.generation += 1;
     std::fs::write(&checkpoint, serde_json::to_vec(&wrong).unwrap()).unwrap();
-    assert!(final_worker.restore_handoff_checkpoint(&checkpoint).is_err());
+    assert!(
+        final_worker
+            .restore_handoff_checkpoint(&checkpoint)
+            .is_err()
+    );
     assert!(gpu.is_alive().unwrap());
     final_worker.stop_and_wait().unwrap();
     assert!(!gpu.is_alive().unwrap());
