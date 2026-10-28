@@ -18,6 +18,9 @@ const WIDTH: f64 = 380.0;
 const HEIGHT: f64 = 540.0;
 /// 面板与托盘图标之间的间距（逻辑像素）。
 const GAP: f64 = 6.0;
+/// macOS 上面板的圆角半径（逻辑像素），和菜单栏弹出面板的观感一致。
+#[cfg(target_os = "macos")]
+const CORNER_RADIUS: f64 = 12.0;
 
 /// 开关的内存缓存。托盘事件（含鼠标移入移出）很频繁，不能每次都读 gateway.json；
 /// 启动后第一次用到时读一次，之后只在设置里切换或 `refresh_tray_mode` 时更新。
@@ -131,7 +134,30 @@ fn toggle<R: Runtime>(app: &AppHandle<R>, anchor: PhysicalPosition<f64>) {
     }
     place(&window, anchor);
     let _ = window.show();
+    round_corners(app, &window);
     let _ = window.set_focus();
+}
+
+/// 无边框窗口默认是直角；显示后裁成圆角并按新轮廓重算阴影。AppKit 调用必须在主线程。
+fn round_corners<R: Runtime>(app: &AppHandle<R>, window: &tauri::WebviewWindow<R>) {
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(pointer) = window.ns_window() else {
+            return;
+        };
+        let address = pointer as usize;
+        let _ = app.run_on_main_thread(move || {
+            // SAFETY: 指针来自 Tauri 的 `ns_window()`，面板只隐藏不销毁，窗口一直有效。
+            unsafe {
+                codex_plus_core::macos_window::round_corners(
+                    address as *mut std::ffi::c_void,
+                    CORNER_RADIUS,
+                )
+            };
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, window);
 }
 
 fn create<R: Runtime>(app: &AppHandle<R>) -> Option<tauri::WebviewWindow<R>> {

@@ -72,6 +72,22 @@ fn manager_close_minimizes_to_tray_without_confirmation() {
 }
 
 #[test]
+fn macos_tray_panel_is_shown_with_rounded_corners() {
+    let panel_rs =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tray_panel.rs"))
+            .expect("read tray_panel.rs");
+
+    // 显示之后再裁圆角，阴影才会按圆角轮廓重算。
+    let shown = panel_rs.find("let _ = window.show();").expect("panel shows the window");
+    let rounded = panel_rs
+        .find("round_corners(app, &window);")
+        .expect("panel rounds its corners");
+    assert!(shown < rounded);
+    assert!(panel_rs.contains("codex_plus_core::macos_window::round_corners("));
+    assert!(panel_rs.contains("app.run_on_main_thread("));
+}
+
+#[test]
 fn manager_keeps_a_visible_brand_tray_and_click_menu_when_hiding_the_macos_dock_icon() {
     let lib_rs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
         .expect("read manager lib.rs");
