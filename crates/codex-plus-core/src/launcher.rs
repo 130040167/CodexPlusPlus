@@ -1133,26 +1133,6 @@ fn active_relay_profile_is_official_mix(settings: &BackendSettings) -> bool {
     let profile = settings.active_relay_profile();
     profile.relay_mode == crate::settings::RelayMode::Official && profile.official_mix_api_key
 }
-#[cfg(windows)]
-fn apply_codexplusplus_taskbar_after_launch(process_id: u32) {
-    tokio::spawn(async move {
-        for attempt in 1..=30 {
-            if crate::windows_integration::apply_codexplusplus_taskbar_to_process_window(process_id) {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if attempt == 30 {
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "launcher.taskbar.apply_failed",
-                    serde_json::json!({ "process_id": process_id }),
-                );
-            }
-        }
-    });
-}
-
-#[cfg(not(windows))]
-fn apply_codexplusplus_taskbar_after_launch(_process_id: u32) {}
 
 pub trait IntoLaunchHooks {
     fn into_launch_hooks(self) -> Arc<dyn LaunchHooks>;
@@ -1466,7 +1446,8 @@ impl LaunchHooks for DefaultLaunchHooks {
                             *self.packaged_activation_process.lock().await = process;
                             *self.packaged_launch_identity.lock().await = None;
                         }
-                        apply_codexplusplus_taskbar_after_launch(process_id);
+                        // 不改写打包版 Codex 窗口的 AppUserModelID：保留包身份，任务栏才能
+                        // 解析官方图标并与原应用合并分组（#2499、#2668）。
                         return Ok(match activation {
                             CodexLaunch::PackagedActivation {
                                 app_user_model_id,

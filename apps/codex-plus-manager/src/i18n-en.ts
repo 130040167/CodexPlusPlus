@@ -1092,6 +1092,8 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "Computer Use 暂不支持 Windows": "Computer Use is not supported on Windows yet",
+  "Computer Use 接入目前只支持 macOS：它依赖 macOS 版 ChatGPT.app 自带的 Computer Use 服务，当前平台还没有可接入的运行时。": "Computer Use integration currently supports macOS only: it relies on the Computer Use service bundled with ChatGPT.app on macOS, and there is no runtime to connect to on this platform yet.",
   "24 小时请求": "Requests (24h)",
   "断开失败": "Disconnect failed",
   "清空统计": "Clear stats",
