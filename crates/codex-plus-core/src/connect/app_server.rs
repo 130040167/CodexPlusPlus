@@ -769,12 +769,12 @@ fn attachment_tool_spec() -> Value {
     json!({
         "type": "function",
         "name": ATTACHMENT_TOOL,
-        "description": "将本地工作目录内的图片发送给当前微信用户。用户要求返回图片时，应调用本工具实际发送，不能只回复本地路径。path 可以是工作目录内的绝对或相对路径；kind=image 直接显示图片。发送成功后无需再次发送同一图片。",
+        "description": "将本地工作目录内的图片或文件发送给当前微信用户。用户要求返回、发送、提供图片或文件时，应调用本工具实际发送附件，不能只回复本地路径。path 可以是工作目录内的绝对或相对路径；kind=image 直接显示图片，kind=file 作为文件发送。发送成功后无需再次发送同一文件。",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "工作目录内的现有文件路径"},
-                "kind": {"type": "string", "enum": ["image"]}
+                "kind": {"type": "string", "enum": ["image", "file"]}
             },
             "required": ["path", "kind"],
             "additionalProperties": false
@@ -804,7 +804,8 @@ fn attachment_tool_arguments(
         .context("缺少附件路径")?;
     let kind = match arguments.get("kind").and_then(Value::as_str) {
         Some("image") => AttachmentKind::Image,
-        _ => bail!("附件类型必须为 image"),
+        Some("file") => AttachmentKind::File,
+        _ => bail!("附件类型必须为 image 或 file"),
     };
     let root = super::media::outbound_workspace(work_dir)?;
     let candidate = Path::new(path);
@@ -1293,7 +1294,7 @@ mod tests {
                 "params": {
                     "threadId": "thread-fixture", "turnId": "turn-1",
                     "callId": call_id, "tool": ATTACHMENT_TOOL, "namespace": null,
-                    "arguments": {"path": path, "kind": "image"}
+                    "arguments": {"path": path, "kind": "file"}
                 }
             }));
         }
@@ -1380,7 +1381,7 @@ mod tests {
                         emit(
                             json!({"id":"foreign-turn","method":"item/tool/call","params":{
                                 "threadId":"thread-fixture","turnId":"old-turn","callId":"first",
-                                "tool":ATTACHMENT_TOOL,"arguments":{"path":"result.txt","kind":"image"}
+                                "tool":ATTACHMENT_TOOL,"arguments":{"path":"result.txt","kind":"file"}
                             }}),
                         );
                     }
@@ -1389,7 +1390,7 @@ mod tests {
                         emit(
                             json!({"id":"foreign-tool","method":"item/tool/call","params":{
                                 "threadId":"thread-fixture","turnId":"turn-1","callId":"first",
-                                "tool":"other-tool","arguments":{"path":"result.txt","kind":"image"}
+                                "tool":"other-tool","arguments":{"path":"result.txt","kind":"file"}
                             }}),
                         );
                     }
@@ -1399,7 +1400,7 @@ mod tests {
                             json!({"id":"foreign-namespace","method":"item/tool/call","params":{
                                 "threadId":"thread-fixture","turnId":"turn-1","callId":"first",
                                 "tool":ATTACHMENT_TOOL,"namespace":"other",
-                                "arguments":{"path":"result.txt","kind":"image"}
+                                "arguments":{"path":"result.txt","kind":"file"}
                             }}),
                         );
                     }
@@ -1455,7 +1456,7 @@ mod tests {
             .and(path("/ilink/bot/sendmessage"))
             .and(body_partial_json(json!({"msg": {
                 "to_user_id": "fixture-peer", "context_token": "fixture-context",
-                "item_list": [{"type": 2}]
+                "item_list": [{"type": 4, "file_item": {"file_name": "result.txt"}}]
             }})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ret": 0})))
             .expect(2)
@@ -1734,14 +1735,14 @@ mod tests {
             })
         };
         let (path, kind) =
-            attachment_tool_arguments(&request("result.txt", "image"), &root).unwrap();
+            attachment_tool_arguments(&request("result.txt", "file"), &root).unwrap();
         assert_eq!(path, root.join("result.txt").canonicalize().unwrap());
-        assert_eq!(kind, AttachmentKind::Image);
-        assert!(attachment_tool_arguments(&request("../private.txt", "image"), &root).is_err());
-        assert!(attachment_tool_arguments(&request(".", "image"), &root).is_err());
-        assert!(attachment_tool_arguments(&request("missing.txt", "image"), &root).is_err());
+        assert_eq!(kind, AttachmentKind::File);
+        assert!(attachment_tool_arguments(&request("../private.txt", "file"), &root).is_err());
+        assert!(attachment_tool_arguments(&request(".", "file"), &root).is_err());
+        assert!(attachment_tool_arguments(&request("missing.txt", "file"), &root).is_err());
         assert!(attachment_tool_arguments(&request("result.txt", "unknown"), &root).is_err());
-        let mut other = request("result.txt", "image");
+        let mut other = request("result.txt", "file");
         other["params"]["tool"] = json!("other");
         assert!(attachment_tool_arguments(&other, &root).is_err());
     }
@@ -1790,7 +1791,7 @@ mod tests {
                 std::fs::write(&nested, "secret").unwrap();
                 let request = json!({
                     "params": {"tool": ATTACHMENT_TOOL, "arguments": {
-                        "path": nested, "kind": "image"
+                        "path": nested, "kind": "file"
                     }}
                 });
                 assert!(
@@ -1801,7 +1802,7 @@ mod tests {
                 std::fs::write(&path, "secret").unwrap();
                 let request = json!({
                     "params": {"tool": ATTACHMENT_TOOL, "arguments": {
-                        "path": path, "kind": "image"
+                        "path": path, "kind": "file"
                     }}
                 });
                 assert!(
@@ -1906,7 +1907,7 @@ mod tests {
         std::fs::write(temp.path().join("private.txt"), "private").unwrap();
         std::os::unix::fs::symlink(temp.path().join("private.txt"), root.join("link.txt")).unwrap();
         let request = json!({
-            "params": {"tool": ATTACHMENT_TOOL, "arguments": {"path": "link.txt", "kind": "image"}}
+            "params": {"tool": ATTACHMENT_TOOL, "arguments": {"path": "link.txt", "kind": "file"}}
         });
         assert!(attachment_tool_arguments(&request, &root).is_err());
     }

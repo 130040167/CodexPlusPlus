@@ -26,6 +26,7 @@ const MEDIA_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachmentKind {
     Image,
+    File,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +59,18 @@ pub struct WeixinImageItem {
     pub aeskey: String,
     #[serde(default)]
     pub url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WeixinFileItem {
+    #[serde(default)]
+    pub media: Option<WeixinCdnMedia>,
+    #[serde(default)]
+    pub file_name: String,
+    #[serde(default)]
+    pub len: String,
+    #[serde(default)]
+    pub md5: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -133,12 +146,40 @@ impl MediaClient {
         directory: &Path,
         max_bytes: usize,
     ) -> anyhow::Result<(LocalAttachment, usize)> {
-        let image = item.image_item.as_ref().context("缺少图片信息")?;
-        let kind = AttachmentKind::Image;
-        let media = image.media.as_ref();
-        let hex_key = image.aeskey.as_str();
-        let image_url = image.url.as_str();
-        if max_bytes == 0 {
+        let (kind, media, hex_key, filename, expected_size, expected_md5, image_url) =
+            match item.item_type {
+                2 => {
+                    let image = item.image_item.as_ref().context("缺少图片信息")?;
+                    (
+                        AttachmentKind::Image,
+                        image.media.as_ref(),
+                        image.aeskey.as_str(),
+                        "",
+                        None,
+                        "",
+                        image.url.as_str(),
+                    )
+                }
+                4 => {
+                    let file = item.file_item.as_ref().context("缺少文件信息")?;
+                    let size = if file.len.is_empty() {
+                        None
+                    } else {
+                        Some(file.len.parse::<u64>().context("附件大小格式无效")?)
+                    };
+                    (
+                        AttachmentKind::File,
+                        file.media.as_ref(),
+                        "",
+                        file.file_name.as_str(),
+                        size,
+                        file.md5.as_str(),
+                        "",
+                    )
+                }
+                _ => bail!("不支持此附件类型"),
+            };
+        if expected_size.is_some_and(|size| size > max_bytes as u64) || max_bytes == 0 {
             bail!("本条消息的附件总大小超过 100 MiB 限制");
         }
         let key = if !hex_key.trim().is_empty() {
@@ -148,6 +189,9 @@ impl MediaClient {
         } else {
             None
         };
+        if kind == AttachmentKind::File && key.is_none() {
+            bail!("文件附件缺少加密密钥");
+        }
         let url = self.download_url(media, image_url)?;
         let response = self.client.get(url).send().await.map_err(network_error)?;
         let status = response.status();
@@ -163,7 +207,19 @@ impl MediaClient {
         if bytes.len() > max_bytes {
             bail!("本条消息的附件总大小超过 100 MiB 限制");
         }
-        let filename = format!("image.{}", image_extension(&bytes));
+        if expected_size.is_some_and(|size| size != bytes.len() as u64) {
+            bail!("附件实际大小与文件信息不符");
+        }
+        if !expected_md5.is_empty()
+            && !format!("{:x}", Md5::digest(&bytes)).eq_ignore_ascii_case(expected_md5)
+        {
+            bail!("附件 MD5 校验失败");
+        }
+        let filename = if kind == AttachmentKind::Image {
+            format!("image.{}", image_extension(&bytes))
+        } else {
+            safe_filename(filename)
+        };
         let path = save_new(directory, &filename, &bytes).await?;
         Ok((LocalAttachment { path, kind }, bytes.len()))
     }
@@ -252,6 +308,7 @@ pub(super) struct PreparedUpload {
     pub md5: String,
     pub key_hex: String,
     pub filekey: String,
+    pub filename: String,
 }
 
 impl PreparedUpload {
@@ -338,6 +395,11 @@ impl PreparedUpload {
             md5: format!("{:x}", Md5::digest(&plaintext)),
             key_hex: hex(&key),
             filekey: Uuid::new_v4().simple().to_string(),
+            filename: safe_filename(
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("file.bin"),
+            ),
         })
     }
 }
@@ -633,7 +695,7 @@ fn attachment_items(message: &WeixinMessage) -> (Vec<&WeixinMessageItem>, bool) 
         let mut current = Some(item);
         let mut depth = 0;
         while let Some(item) = current {
-            if item.item_type == 2 {
+            if matches!(item.item_type, 2 | 4) {
                 if items.len() == MAX_ATTACHMENTS {
                     return (items, true);
                 }
@@ -855,6 +917,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn downloads_encrypted_image_and_quoted_file_without_bot_headers() {
+        let server = MockServer::start().await;
+        let key = parse_hex_key(KEY).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/cdn/download"))
+            .and(query_param("encrypted_query_param", "image+/=&"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(encrypt(PNG, &key)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(encrypt(b"report data", &key)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let message = message(json!([
+            {
+                "type": 2,
+                "image_item": {
+                    "aeskey": KEY,
+                    "media": {"encrypt_query_param": "image+/=&", "aes_key": "bad-key"}
+                }
+            },
+            {
+                "type": 1,
+                "text_item": {"text": "Please process these"},
+                "ref_msg": {"message_item": {
+                    "type": 4,
+                    "file_item": {
+                        "file_name": "../../report.txt",
+                        "len": "11",
+                        "md5": format!("{:x}", Md5::digest(b"report data")),
+                        "media": {"full_url": format!("{}/file", server.uri()), "aes_key": STANDARD.encode(KEY)}
+                    }
+                }}
+            }
+        ]));
+        assert!(message.has_attachments());
+        let dir = tempfile::tempdir().unwrap();
+        let result = client(&server)
+            .download_attachments(&message, dir.path())
+            .await;
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.attachments.len(), 2);
+        let image = &result.attachments[0];
+        assert_eq!(image.kind, AttachmentKind::Image);
+        assert_eq!(image.path.extension().unwrap(), "png");
+        assert_eq!(std::fs::read(&image.path).unwrap(), PNG);
+        let file = &result.attachments[1];
+        assert_eq!(file.kind, AttachmentKind::File);
+        assert!(
+            file.path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with("-report.txt")
+        );
+        assert_eq!(
+            file.path.parent().unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+        assert_eq!(std::fs::read(&file.path).unwrap(), b"report data");
+        for request in server.received_requests().await.unwrap() {
+            for secret_header in ["authorization", "authorizationtype", "skroutetag", "cookie"] {
+                assert!(!request.headers.contains_key(secret_header));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn accepts_raw_key_and_plain_image_full_urls_without_following_redirects() {
         let server = MockServer::start().await;
         let key = parse_hex_key(KEY).unwrap();
@@ -906,7 +1039,7 @@ mod tests {
         let message = message(json!([
             {"type": 1, "text_item": {"text": "Keep this text"}},
             {"type": 2, "image_item": {"media": {"full_url": format!("{}/denied?key=secret", server.uri())}}},
-            {"type": 2, "image_item": {"media": {"aes_key": "secret-invalid-key"}}},
+            {"type": 4, "file_item": {"media": {"aes_key": "secret-invalid-key"}}},
             {"type": 2, "image_item": {"url": "https://evil.test/file?token=secret"}}
         ]));
         let dir = tempfile::tempdir().unwrap();
@@ -923,6 +1056,45 @@ mod tests {
                 .all(|warning| !warning.contains("secret"))
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_truncated_media_metadata_mismatches_and_oversized_bodies() {
+        let server = MockServer::start().await;
+        Mock::given(path("/bad"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0; 15]))
+            .mount(&server)
+            .await;
+        Mock::given(path("/wrong-size"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(encrypt(b"abc", &parse_hex_key(KEY).unwrap())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/large"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0; 65]))
+            .mount(&server)
+            .await;
+        let message = message(json!([
+            {"type": 2, "image_item": {"media": {
+                "full_url": format!("{}/bad", server.uri()), "aes_key": STANDARD.encode(KEY)
+            }}},
+            {"type": 4, "file_item": {"len": "100", "media": {
+                "full_url": format!("{}/wrong-size", server.uri()), "aes_key": STANDARD.encode(KEY)
+            }}}
+        ]));
+        let dir = tempfile::tempdir().unwrap();
+        let result = client(&server)
+            .download_attachments(&message, dir.path())
+            .await;
+        assert!(result.attachments.is_empty());
+        assert_eq!(result.warnings.len(), 2);
+        let response = reqwest::get(format!("{}/large", server.uri()))
+            .await
+            .unwrap();
+        assert!(read_bytes_limited(response, 64).await.is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
@@ -1008,10 +1180,29 @@ mod tests {
         assert!(read_bytes_limited(response, 64).await.is_err());
     }
 
-    #[test]
-    fn image_commit_does_not_claim_file_message_support() {
-        let file = message(json!([{"type":4,"file_item":{"file_name":"report.txt"}}]));
-        assert!(!file.has_attachments());
+    #[tokio::test]
+    async fn rejects_file_checksum_mismatch_before_saving() {
+        let server = MockServer::start().await;
+        Mock::given(path("/file"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(encrypt(b"report data", &parse_hex_key(KEY).unwrap())),
+            )
+            .mount(&server)
+            .await;
+        let message = message(json!([{"type":4,"file_item":{
+            "file_name":"report.txt","len":"11","md5":"00000000000000000000000000000000",
+            "media":{"full_url":format!("{}/file",server.uri()),"aes_key":STANDARD.encode(KEY)}
+        }}]));
+        let dir = tempfile::tempdir().unwrap();
+        let result = client(&server)
+            .download_attachments(&message, dir.path())
+            .await;
+        assert!(message.has_attachments());
+        assert!(result.attachments.is_empty());
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("MD5"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     async fn assert_upload_pipeline(kind: AttachmentKind, full_url: bool, workspace_bound: bool) {
@@ -1025,7 +1216,7 @@ mod tests {
             .and(path("/ilink/bot/getuploadurl"))
             .and(header("authorization", "Bearer bot-secret"))
             .and(body_partial_json(json!({
-                "media_type": 1,
+                "media_type": if kind == AttachmentKind::Image { 1 } else { 3 },
                 "rawsize": 3,
                 "filesize": 16,
                 "rawfilemd5": "900150983cd24fb0d6963f7d28e17f72",
@@ -1095,9 +1286,16 @@ mod tests {
         assert_eq!(sent["msg"]["context_token"], "context-secret");
         assert_eq!(sent["msg"]["message_state"], 2);
         let item = &sent["msg"]["item_list"][0];
-        assert_eq!(item["type"], 2);
-        assert_eq!(item["image_item"]["mid_size"], 16);
-        let media = &item["image_item"]["media"];
+        let media = if kind == AttachmentKind::Image {
+            assert_eq!(item["type"], 2);
+            assert_eq!(item["image_item"]["mid_size"], 16);
+            &item["image_item"]["media"]
+        } else {
+            assert_eq!(item["type"], 4);
+            assert_eq!(item["file_item"]["len"], "3");
+            assert_eq!(item["file_item"]["file_name"], "report.txt");
+            &item["file_item"]["media"]
+        };
         assert_eq!(media["encrypt_query_param"], "download-secret");
         assert_eq!(media["encrypt_type"], 1);
         assert_eq!(
@@ -1112,8 +1310,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sends_file_with_full_upload_url_and_plaintext_size() {
+        assert_upload_pipeline(AttachmentKind::File, true, false).await;
+    }
+
+    #[tokio::test]
     async fn sends_workspace_attachment_through_the_same_protocol_pipeline() {
-        assert_upload_pipeline(AttachmentKind::Image, false, true).await;
+        assert_upload_pipeline(AttachmentKind::File, false, true).await;
     }
 
     #[tokio::test]
@@ -1132,7 +1335,7 @@ mod tests {
             let path = workspace.path().join(name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, b"fixture secret").unwrap();
-            for kind in [AttachmentKind::Image] {
+            for kind in [AttachmentKind::Image, AttachmentKind::File] {
                 let result = client(&gateway)
                     .send_workspace_attachment("peer", &path, kind, "fixture", workspace.path())
                     .await;
@@ -1197,7 +1400,7 @@ mod tests {
                 .send_workspace_attachment(
                     "peer",
                     &path,
-                    AttachmentKind::Image,
+                    AttachmentKind::File,
                     "context",
                     &workspace,
                 )
@@ -1344,7 +1547,7 @@ mod tests {
             .await;
         let file = tempfile::NamedTempFile::new().unwrap();
         let error = client(&server)
-            .send_attachment("peer", file.path(), AttachmentKind::Image, "context-secret")
+            .send_attachment("peer", file.path(), AttachmentKind::File, "context-secret")
             .await
             .unwrap_err();
         assert!(error.to_string().contains("403"));
@@ -1377,7 +1580,7 @@ mod tests {
         let client = client(&server);
         assert!(
             client
-                .send_attachment("peer", file.path(), AttachmentKind::Image, "")
+                .send_attachment("peer", file.path(), AttachmentKind::File, "")
                 .await
                 .is_err()
         );
@@ -1386,7 +1589,7 @@ mod tests {
             .unwrap();
         assert!(
             client
-                .send_attachment("peer", file.path(), AttachmentKind::Image, "context")
+                .send_attachment("peer", file.path(), AttachmentKind::File, "context")
                 .await
                 .is_err()
         );

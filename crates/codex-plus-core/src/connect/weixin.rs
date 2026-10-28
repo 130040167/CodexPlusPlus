@@ -97,6 +97,8 @@ pub struct WeixinMessageItem {
     #[serde(default)]
     pub image_item: Option<media::WeixinImageItem>,
     #[serde(default)]
+    pub file_item: Option<media::WeixinFileItem>,
+    #[serde(default)]
     pub ref_msg: Option<WeixinReferenceMessage>,
 }
 
@@ -204,7 +206,7 @@ impl WeixinClient {
     ) -> anyhow::Result<()> {
         let request = json!({
             "filekey": upload.filekey,
-            "media_type": match kind { AttachmentKind::Image => 1 },
+            "media_type": match kind { AttachmentKind::Image => 1, AttachmentKind::File => 3 },
             "to_user_id": to_user_id,
             "rawsize": upload.plaintext_size,
             "rawfilemd5": upload.md5,
@@ -226,6 +228,14 @@ impl WeixinClient {
             AttachmentKind::Image => json!({
                 "type": 2,
                 "image_item": { "media": media, "mid_size": upload.ciphertext.len() }
+            }),
+            AttachmentKind::File => json!({
+                "type": 4,
+                "file_item": {
+                    "media": media,
+                    "file_name": upload.filename,
+                    "len": upload.plaintext_size.to_string()
+                }
             }),
         };
         self.post_media_api(
