@@ -1584,6 +1584,10 @@ pub fn reapply_if_port_changed(ctx: &ApplyContext) -> anyhow::Result<usize> {
         .map(|(agent, _)| ToolId::parse(agent))
         .collect::<Vec<_>>();
     for agent in agents {
+        // 已被别的工具接管的不改回来（漂移检查只看是不是网关地址，不看端口，换端口不算接管）。
+        if taken_over(ctx, &agent).is_some() {
+            continue;
+        }
         let Some(binding) = gateway.bindings.get_mut(agent.as_str()) else {
             continue;
         };
