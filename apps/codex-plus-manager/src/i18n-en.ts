@@ -2470,6 +2470,9 @@ export const EN_PLAIN: Record<string, string> = {
     "Transport headers such as Host and Content-Length are managed by the proxy and cannot be overridden. When Authorization is set here it takes precedence and the API key is not injected.",
   // Claude 供应商页、从第三方导入弹层、添加供应商目录页
   "从 cc-switch 导入": "Import from cc-switch",
+  "从本地目录导入": "Import from local folder",
+  "选择 Skill 目录（含 SKILL.md）或其父目录": "Choose a skill folder (with SKILL.md) or a folder containing skills",
+  "本地导入": "Local import",
   "只读取 cc-switch 的数据库，不会改动它。": "Reads the cc-switch database only; nothing in it is changed.",
   "cc-switch 数据库路径": "cc-switch database path",
   "默认 ~/.cc-switch/cc-switch.db": "Default: ~/.cc-switch/cc-switch.db",
@@ -2990,6 +2993,9 @@ export const EN_BACKEND: Record<string, string> = {
 export const EN_BACKEND_PATTERNS: Array<[RegExp, string]> = [
   [/^已跳过 (.+)，出现更新的版本时再提示。$/, "Skipped $1. You'll be reminded when a newer version is released."],
   [/^保存跳过版本失败：(.+)$/, "Failed to save the skipped version: $1"],
+  [/^已从本地导入 (\d+) 个 Skill，默认停用，可在列表中勾选启用。$/, "Imported $1 skill(s) from the local folder. They start disabled; enable them in the list."],
+  [/^已从本地导入 (\d+) 个 Skill，(\d+) 个失败：(.+)$/, "Imported $1 skill(s) from the local folder; $2 failed: $3"],
+  [/^本地导入 Skill 失败：(.+)$/, "Local skill import failed: $1"],
   [/^保存跳过版本后重新读取设置失败：(.+)$/, "Saved the skipped version but failed to reload settings: $1"],
   [/^请先退出 (.+) 应用及其 CLI，再重新扫描清理。$/, "Quit $1 and its CLI, then scan again to clean caches."],
   [/^缓存扫描失败：(.+)$/, "Cache scan failed: $1"],
