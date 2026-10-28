@@ -8578,6 +8578,16 @@ async fn buffered_mode_retries_overload_and_returns_complete_stream() {
     assert_eq!(server.await.unwrap().len(), 2);
 }
 
+/// 阶段标记是进程级开关（设置「第三方模型回答完自动折叠过程」）：相关用例串行执行，用完复原。
+fn with_message_phase_fill<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    codex_plus_core::protocol_proxy::set_message_phase_fill(enabled);
+    let result = run();
+    codex_plus_core::protocol_proxy::set_message_phase_fill(false);
+    result
+}
+
 /// 取出 SSE 里助手消息 output_item.done 的 phase（按出现顺序）。
 fn assistant_message_done_phases(sse: &str) -> Vec<Value> {
     sse.split("\n\n")
@@ -8592,57 +8602,83 @@ fn assistant_message_done_phases(sse: &str) -> Vec<Value> {
 
 #[test]
 fn chat_sse_marks_text_without_tool_calls_as_final_answer() {
-    // issue #2659：Codex 桌面端靠 final_answer 折叠本轮过程，第三方上游不带该字段。
-    let sse = chat_sse_to_responses_sse(
-        r#"data: {"id":"chatcmpl_final","created":1,"model":"m","choices":[{"delta":{"content":"答案"},"finish_reason":"stop"}]}
+    with_message_phase_fill(true, || {
+        // issue #2659：Codex 桌面端靠 final_answer 折叠本轮过程，第三方上游不带该字段。
+        let sse = chat_sse_to_responses_sse(
+            r#"data: {"id":"chatcmpl_final","created":1,"model":"m","choices":[{"delta":{"content":"答案"},"finish_reason":"stop"}]}
 
 data: [DONE]
 
 "#,
-    );
-    assert_eq!(assistant_message_done_phases(&sse), vec![json!("final_answer")]);
-    let completed = sse
-        .split("\n\n")
-        .find(|event| event.starts_with("event: response.completed"))
-        .unwrap();
-    assert!(completed.contains("\"phase\":\"final_answer\""), "{completed}");
+        );
+        assert_eq!(assistant_message_done_phases(&sse), vec![json!("final_answer")]);
+        let completed = sse
+            .split("\n\n")
+            .find(|event| event.starts_with("event: response.completed"))
+            .unwrap();
+        assert!(completed.contains("\"phase\":\"final_answer\""), "{completed}");
+    });
 }
 
 #[test]
 fn chat_sse_marks_text_before_tool_calls_as_commentary() {
-    let sse = chat_sse_to_responses_sse(
-        r#"data: {"id":"chatcmpl_tool","created":1,"model":"m","choices":[{"delta":{"content":"先看看文件"}}]}
+    with_message_phase_fill(true, || {
+        let sse = chat_sse_to_responses_sse(
+            r#"data: {"id":"chatcmpl_tool","created":1,"model":"m","choices":[{"delta":{"content":"先看看文件"}}]}
 
 data: {"id":"chatcmpl_tool","created":1,"model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}
 
 data: [DONE]
 
 "#,
-    );
-    assert_eq!(assistant_message_done_phases(&sse), vec![json!("commentary")]);
+        );
+        assert_eq!(assistant_message_done_phases(&sse), vec![json!("commentary")]);
+    });
 }
 
 #[test]
 fn chat_completion_marks_message_phase_by_tool_calls() {
-    let final_answer = chat_completion_to_response(json!({
-        "id": "chatcmpl_a",
-        "choices": [{ "message": { "role": "assistant", "content": "答案" }, "finish_reason": "stop" }]
-    }))
-    .unwrap();
-    assert_eq!(final_answer["output"][0]["phase"], "final_answer");
+    with_message_phase_fill(true, || {
+        let final_answer = chat_completion_to_response(json!({
+            "id": "chatcmpl_a",
+            "choices": [{ "message": { "role": "assistant", "content": "答案" }, "finish_reason": "stop" }]
+        }))
+        .unwrap();
+        assert_eq!(final_answer["output"][0]["phase"], "final_answer");
 
-    let commentary = chat_completion_to_response(json!({
-        "id": "chatcmpl_b",
-        "choices": [{
-            "message": {
-                "role": "assistant",
-                "content": "先看看文件",
-                "tool_calls": [{ "id": "call_1", "type": "function", "function": { "name": "shell", "arguments": "{}" } }]
-            },
-            "finish_reason": "tool_calls"
-        }]
-    }))
-    .unwrap();
-    assert_eq!(commentary["output"][0]["phase"], "commentary");
-    assert_eq!(commentary["output"][1]["type"], "function_call");
+        let commentary = chat_completion_to_response(json!({
+            "id": "chatcmpl_b",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "先看看文件",
+                    "tool_calls": [{ "id": "call_1", "type": "function", "function": { "name": "shell", "arguments": "{}" } }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(commentary["output"][0]["phase"], "commentary");
+        assert_eq!(commentary["output"][1]["type"], "function_call");
+    });
+}
+
+#[test]
+fn chat_conversion_leaves_phase_out_unless_enabled() {
+    with_message_phase_fill(false, || {
+        let sse = chat_sse_to_responses_sse(
+            r#"data: {"id":"chatcmpl_off","created":1,"model":"m","choices":[{"delta":{"content":"答案"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#,
+        );
+        assert_eq!(assistant_message_done_phases(&sse), vec![Value::Null]);
+        let response = chat_completion_to_response(json!({
+            "id": "chatcmpl_off2",
+            "choices": [{ "message": { "role": "assistant", "content": "答案" }, "finish_reason": "stop" }]
+        }))
+        .unwrap();
+        assert!(response["output"][0].get("phase").is_none());
+    });
 }

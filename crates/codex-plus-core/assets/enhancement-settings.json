@@ -90,6 +90,14 @@
       "surfaces": ["manager", "codex"]
     },
     {
+      "key": "codexAppThirdPartyReasoningCollapse",
+      "group": "plugins",
+      "control": "bool",
+      "title": "第三方模型回答完自动折叠过程",
+      "description": "给第三方模型的回复补上「最终回答 / 过程」标记，回答完后像官方模型一样把推理和命令过程收起来。只对经过 Codex++ 本地代理或网关的请求生效；个别上游不接受这个标记时请关闭。",
+      "surfaces": ["manager"]
+    },
+    {
       "key": "codexAppSessionDelete",
       "group": "chat",
       "control": "bool",

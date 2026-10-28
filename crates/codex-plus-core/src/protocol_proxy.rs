@@ -1774,9 +1774,11 @@ fn chat_completion_to_response_with_context(
     }
     let tool_items = chat_tool_calls_to_response_output_items(message, tool_context);
     if let Some(mut message) = chat_message_to_response_output_item(message, &response_id) {
-        // 与流式转换一致：无工具调用的消息即本轮最终回答（issue #2659）。
-        message["phase"] =
-            json!(if tool_items.is_empty() { "final_answer" } else { "commentary" });
+        // 与流式转换一致：无工具调用的消息即本轮最终回答（issue #2659，设置里打开才补）。
+        if message_phase_fill_enabled() {
+            message["phase"] =
+                json!(if tool_items.is_empty() { "final_answer" } else { "commentary" });
+        }
         output.push(message);
     }
     output.extend(tool_items);
@@ -3338,6 +3340,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     live_request_id: Option<&str>,
     forced: Option<ForcedRelay>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
+    set_message_phase_fill(settings.codex_app_third_party_reasoning_collapse);
     let mut request_json: Value = serde_json::from_str(body)?;
     expand_local_compaction_history(&mut request_json);
     let local_compaction_request = !is_responses_compact_proxy_path(request_path)
@@ -6441,15 +6444,17 @@ impl ChatSseState {
         let output_index = self.text.output_index.unwrap_or(0);
         // 文本在整段流结束时才收尾，此时已知本响应有没有工具调用：没有工具调用时
         // 它就是本轮最终回答，Codex 桌面端据此折叠前面的过程（issue #2659）。
-        let phase = if self.tools.is_empty() { "final_answer" } else { "commentary" };
-        let item = json!({
+        let mut item = json!({
             "id": self.text.item_id,
             "type": "message",
             "status": "completed",
             "role": "assistant",
-            "content": [{ "type": "output_text", "text": self.text.text, "annotations": [] }],
-            "phase": phase
+            "content": [{ "type": "output_text", "text": self.text.text, "annotations": [] }]
         });
+        if message_phase_fill_enabled() {
+            item["phase"] =
+                json!(if self.tools.is_empty() { "final_answer" } else { "commentary" });
+        }
         self.output_items.push((output_index, item.clone()));
         self.text.done = true;
         push_sse(
@@ -11620,6 +11625,20 @@ fn is_backend_private_event(event_type: &str) -> bool {
 /// Codex 按断流重试，每次重新生图并重复计费。
 const RESPONSES_SSE_MAX_EVENT_BYTES: usize = 4 * 1024 * 1024;
 
+/// 「第三方模型回答完自动折叠过程」（#2659）：每个代理请求开始时按设置更新。
+/// Chat 转换在很深的调用链里，逐层传参改动面太大，所以用进程级开关；
+/// 并发请求读到的都是同一份设置，先后覆盖没有影响。
+static MESSAGE_PHASE_FILL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_message_phase_fill(enabled: bool) {
+    MESSAGE_PHASE_FILL.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn message_phase_fill_enabled() -> bool {
+    MESSAGE_PHASE_FILL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl ResponsesSseTransformer {
     /// 按原始请求声明的工具形态创建：只有 freeform（custom）的 `apply_patch`
     /// 才需要把被模型包成 JSON 的输入解包回补丁文本。
@@ -11637,9 +11656,14 @@ impl ResponsesSseTransformer {
             });
         Self {
             apply_patch_declared_as_function,
-            phase_fill: Some(MessagePhaseFill::default()),
             ..Self::default()
         }
+    }
+
+    /// 是否给没带阶段标记的助手消息补 `phase`（设置「第三方模型回答完自动折叠过程」，默认关）。
+    pub(crate) fn filling_message_phase(mut self, enabled: bool) -> Self {
+        self.phase_fill = enabled.then(MessagePhaseFill::default);
+        self
     }
 
     /// 转发给非 Codex 客户端时去掉后端私有事件，见 `strip_backend_events`。
@@ -12065,7 +12089,7 @@ mod responses_sse_transformer_tests {
 
     #[test]
     fn phaseless_message_without_tool_call_becomes_final_answer() {
-        let mut t = ResponsesSseTransformer::for_request(None);
+        let mut t = ResponsesSseTransformer::for_request(None).filling_message_phase(true);
         // 消息先暂存，等到 response.completed 才能判断它是最终回答。
         assert!(t.push_bytes(message_done(None).as_bytes()).is_empty());
         let completed = sse(json!({ "type": "response.completed", "response": {} }));
@@ -12078,7 +12102,7 @@ mod responses_sse_transformer_tests {
 
     #[test]
     fn phaseless_message_before_tool_call_becomes_commentary() {
-        let mut t = ResponsesSseTransformer::for_request(None);
+        let mut t = ResponsesSseTransformer::for_request(None).filling_message_phase(true);
         assert!(t.push_bytes(message_done(None).as_bytes()).is_empty());
         let added = sse(json!({
             "type": "response.output_item.added",
@@ -12092,7 +12116,7 @@ mod responses_sse_transformer_tests {
 
     #[test]
     fn message_after_tool_call_in_same_response_stays_commentary() {
-        let mut t = ResponsesSseTransformer::for_request(None);
+        let mut t = ResponsesSseTransformer::for_request(None).filling_message_phase(true);
         let call = sse(json!({
             "type": "response.output_item.done",
             "output_index": 0,
@@ -12106,21 +12130,31 @@ mod responses_sse_transformer_tests {
 
     #[test]
     fn upstream_phase_is_forwarded_untouched_without_delay() {
-        let mut t = ResponsesSseTransformer::for_request(None);
+        let mut t = ResponsesSseTransformer::for_request(None).filling_message_phase(true);
         let event = message_done(Some("commentary"));
         assert_eq!(t.push_bytes(event.as_bytes()), event.as_bytes());
     }
 
     #[test]
+    fn phase_fill_is_off_unless_enabled() {
+        // 设置里没打开时原样转发：不暂存、不补 phase。
+        let mut t = ResponsesSseTransformer::for_request(None);
+        let out = t.push_bytes(message_done(None).as_bytes());
+        assert_eq!(message_phases(&out), vec![None]);
+    }
+
+    #[test]
     fn phase_fill_is_skipped_for_foreign_clients() {
-        let mut t = ResponsesSseTransformer::for_request(None).stripping_backend_events(true);
+        let mut t = ResponsesSseTransformer::for_request(None)
+            .filling_message_phase(true)
+            .stripping_backend_events(true);
         let event = message_done(None);
         assert_eq!(t.push_bytes(event.as_bytes()), event.as_bytes());
     }
 
     #[test]
     fn pending_message_is_released_unchanged_on_failure_or_eof() {
-        let mut t = ResponsesSseTransformer::for_request(None);
+        let mut t = ResponsesSseTransformer::for_request(None).filling_message_phase(true);
         let event = message_done(None);
         t.push_bytes(event.as_bytes());
         let failed = sse(json!({ "type": "response.failed", "response": {} }));
@@ -12128,7 +12162,7 @@ mod responses_sse_transformer_tests {
         assert!(out.starts_with(&event), "{out}");
         assert!(t.finish().is_some());
 
-        let mut t = ResponsesSseTransformer::for_request(None);
+        let mut t = ResponsesSseTransformer::for_request(None).filling_message_phase(true);
         t.push_bytes(event.as_bytes());
         assert_eq!(t.flush_pending(), event.as_bytes());
         assert!(t.flush_pending().is_empty());

@@ -2877,6 +2877,7 @@ pub(crate) async fn handle_protocol_proxy_connection(
             // buffered 模式：整段 SSE 已由协议代理收齐并重试完成，这里一次性转发。
             let mut transformer =
                 crate::protocol_proxy::ResponsesSseTransformer::for_request(request_json.as_ref())
+                    .filling_message_phase(crate::protocol_proxy::message_phase_fill_enabled())
                     .stripping_backend_events(foreign_client);
             let mut out = transformer.push_bytes(&body);
             out.extend(transformer.flush_pending());
@@ -3731,6 +3732,7 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
     let mut first_output_at_ms = None;
     if wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
         let mut transformer = crate::protocol_proxy::ResponsesSseTransformer::for_request(request)
+            .filling_message_phase(crate::protocol_proxy::message_phase_fill_enabled())
             .stripping_backend_events(foreign_client);
         // 代理预读过的开头必须先原样补写，否则 Codex 会丢掉 response.created 等事件。
         if !prefix.is_empty() {

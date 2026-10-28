@@ -1094,6 +1094,8 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "第三方模型回答完自动折叠过程": "Collapse third-party model work after the answer",
+  "给第三方模型的回复补上「最终回答 / 过程」标记，回答完后像官方模型一样把推理和命令过程收起来。只对经过 Codex++ 本地代理或网关的请求生效；个别上游不接受这个标记时请关闭。": "Marks third-party model replies as final answer or progress, so reasoning and command steps collapse after the answer like official models. Only applies to requests through the Codex++ local proxy or gateway; turn off if an upstream rejects the marker.",
   "Computer Use 暂不支持 Windows": "Computer Use is not supported on Windows yet",
   "Computer Use 接入目前只支持 macOS：它依赖 macOS 版 ChatGPT.app 自带的 Computer Use 服务，当前平台还没有可接入的运行时。": "Computer Use integration currently supports macOS only: it relies on the Computer Use service bundled with ChatGPT.app on macOS, and there is no runtime to connect to on this platform yet.",
   "24 小时请求": "Requests (24h)",
