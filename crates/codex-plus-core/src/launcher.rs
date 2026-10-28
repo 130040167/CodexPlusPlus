@@ -3447,6 +3447,22 @@ async fn handle_image_proxy_connection(
     path: &str,
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
+    // Codex 接在网关上（以 ChatGPT 身份经本地代理）：生图交给网关按 Codex 的生图模型处理。
+    if crate::gateway::apply::codex_hops_through_gateway() {
+        return crate::gateway::server::handle_codex_images_from_helper(
+            stream,
+            crate::gateway::server::ImageRequest {
+                edits: !crate::protocol_proxy::is_image_generations_proxy_path(path),
+                body: request_body,
+                content_type: request_content_type.unwrap_or_default(),
+                user_agent: request_user_agent,
+            },
+            method,
+            path,
+            remote_addr_text,
+        )
+        .await;
+    }
     let upstream = if crate::protocol_proxy::is_image_generations_proxy_path(path) {
         crate::protocol_proxy::open_image_generations_proxy_request(
             request_body,

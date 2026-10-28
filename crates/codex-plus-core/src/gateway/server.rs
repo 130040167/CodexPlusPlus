@@ -178,14 +178,19 @@ pub(crate) async fn handle(
             .await
         }
         (_, "POST", "/images/generations" | "/images/edits") => {
-            let edits = tail == "/images/edits";
+            let content_type =
+                header_value_from_headers(headers, "content-type").unwrap_or_default();
+            let user_agent = header_value_from_headers(headers, "user-agent");
             handle_images(
                 stream,
                 &gateway,
                 &agent,
-                edits,
-                headers,
-                body,
+                ImageRequest {
+                    edits: tail == "/images/edits",
+                    body,
+                    content_type: &content_type,
+                    user_agent: user_agent.as_deref(),
+                },
                 method,
                 path,
                 remote_addr_text,
@@ -196,26 +201,58 @@ pub(crate) async fn handle(
     }
 }
 
-/// 生图：按「生图模型」排出上游依次试，鉴权失败、限流、上游出错时换下一家；最后一家的答复原样返回。
-#[allow(clippy::too_many_arguments)]
-async fn handle_images(
+/// 一个生图请求：`/images/edits`（multipart）或 `/images/generations`（JSON）。
+pub(crate) struct ImageRequest<'a> {
+    pub edits: bool,
+    pub body: &'a [u8],
+    pub content_type: &'a str,
+    pub user_agent: Option<&'a str>,
+}
+
+/// Codex 以 ChatGPT 官方身份接入网关时，它的生图请求发到本地代理的 `/v1/images/...`
+/// （`openai_base_url`），不经过 `/gw/codex/...`。这时 Codex 的供应商是网关托管的那一个，
+/// 按直连模式转发会指回本地代理自己；改由网关按 Codex 的生图模型处理。
+pub(crate) async fn handle_codex_images_from_helper(
     stream: &mut tokio::net::TcpStream,
-    gateway: &GatewaySettings,
-    agent: &ToolId,
-    edits: bool,
-    headers: &str,
-    body: &[u8],
+    request: ImageRequest<'_>,
     method: &str,
     path: &str,
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
-    let content_type = header_value_from_headers(headers, "content-type").unwrap_or_default();
-    let requested = crate::gateway::images::requested_model(body, &content_type);
+    let gateway = GatewayStore::default().load().unwrap_or_default();
+    handle_images(
+        stream,
+        &gateway,
+        &ToolId::Codex,
+        request,
+        method,
+        path,
+        remote_addr_text,
+    )
+    .await
+}
+
+/// 生图：按「生图模型」排出上游依次试，鉴权失败、限流、上游出错时换下一家；最后一家的答复原样返回。
+async fn handle_images(
+    stream: &mut tokio::net::TcpStream,
+    gateway: &GatewaySettings,
+    agent: &ToolId,
+    request: ImageRequest<'_>,
+    method: &str,
+    path: &str,
+    remote_addr_text: Option<String>,
+) -> anyhow::Result<()> {
+    let ImageRequest {
+        edits,
+        body,
+        content_type,
+        user_agent,
+    } = request;
+    let requested = crate::gateway::images::requested_model(body, content_type);
     let targets = match crate::gateway::images::targets(gateway, agent, requested.as_deref()) {
         Ok(targets) => targets,
         Err(message) => return write_error(stream, agent, 400, &message).await,
     };
-    let user_agent = header_value_from_headers(headers, "user-agent");
     let count = targets.len();
     let mut last_error = String::new();
     for (index, target) in targets.into_iter().enumerate() {
@@ -239,15 +276,15 @@ async fn handle_images(
             }
         };
         let request = match &target.model {
-            Some(model) => crate::gateway::images::rewrite_model(body, &content_type, model),
+            Some(model) => crate::gateway::images::rewrite_model(body, content_type, model),
             None => body.to_vec(),
         };
         let mut upstream = match crate::protocol_proxy::open_gateway_image_request(
             &relay,
             edits,
             &request,
-            &content_type,
-            user_agent.as_deref(),
+            content_type,
+            user_agent,
         )
         .await
         {

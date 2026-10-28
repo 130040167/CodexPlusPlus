@@ -1017,6 +1017,52 @@ async fn gateway_end_to_end() {
     assert!(response.text().await.unwrap().contains("生图已关闭"));
     gateway.image_models.clear();
 
+    // Codex 以 ChatGPT 身份接入（8d 里 Codex 的供应商已是网关托管的那个）：它的生图请求打到本地代理的
+    // `/v1/images/generations`，也要按 Codex 的生图模型走网关，不能按直连转回本地代理自己。
+    let (codex_image_base, codex_image_seen) = mock_upstream(vec![(
+        200,
+        "application/json",
+        json!({ "data": [{ "b64_json": "BBBB" }] }).to_string(),
+    )])
+    .await;
+    gateway.providers = providers(vec![
+        relay(
+            "chatonly",
+            &grok_base,
+            "sk-grok",
+            RelayProtocol::ChatCompletions,
+            "glm-5.3",
+        ),
+        relay(
+            "painter",
+            &codex_image_base,
+            "sk-paint",
+            RelayProtocol::Responses,
+            "gpt-image-2",
+        ),
+    ]);
+    save(&gateway);
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/images/generations"))
+        .bearer_auth("chatgpt-access-token")
+        .json(&json!({ "model": "gpt-image-2", "prompt": "a cat" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(response.text().await.unwrap().contains("BBBB"));
+    {
+        let seen = codex_image_seen.lock().unwrap();
+        let (head, body) = &seen[0];
+        assert!(head.starts_with("POST /v1/images/generations"), "{head}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("authorization: bearer sk-paint"),
+            "{head}"
+        );
+        assert_eq!(body["model"], "gpt-image-2");
+    }
+
     // —— 9. 关闭绑定后返回 503，旧的 Codex 代理路径不受影响 ——
     gateway.bindings.get_mut("claude").unwrap().enabled = false;
     save(&gateway);
