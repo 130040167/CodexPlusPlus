@@ -1887,6 +1887,14 @@ impl UpstreamProxyResponse {
         http_status_line(self.status_code)
     }
 
+    /// 适配过的响应里要还原成 custom_tool_call 的工具名；没有记录时按 exec 兼容重试处理。
+    pub(crate) fn exec_tool_names(&self) -> BTreeSet<String> {
+        self.exec_outcome
+            .as_ref()
+            .map(|outcome| outcome.names().clone())
+            .unwrap_or_else(crate::responses_exec::exec_tool_names)
+    }
+
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status_code)
     }
@@ -3598,8 +3606,18 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         let legacy_native_compaction = relay.protocol == RelayProtocol::Responses
             && is_responses_compact_proxy_path(request_path);
         let is_compaction_request = compaction || probe_native_compaction || legacy_native_compaction;
+        // xAI 的 Responses 接口不认 custom 工具类型，整个请求会被 422 拒掉：
+        // 声明和历史里的 custom 工具一律转成 function，响应再还原成 custom_tool_call。
+        let forced_custom_names = if wire_api == UpstreamWireApi::Responses
+            && upstream_rejects_custom_tools(&relay)
+        {
+            crate::responses_exec::custom_tool_names(&upstream_body)
+        } else {
+            BTreeSet::new()
+        };
         if local_exec_adapted
             && wire_api == UpstreamWireApi::Responses
+            && forced_custom_names.is_empty()
         {
             // 声明与当前全部历史同时转换，不能对已转换的声明再拼入原始新工具结果。
             upstream_body = crate::responses_exec::adapt_request(upstream_body)?;
@@ -3633,12 +3651,20 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             }),
         );
         let user_agent = effective_user_agent(&relay.user_agent, original_user_agent);
+        let forced_adapted = !forced_custom_names.is_empty();
+        let mut adapted_names = crate::responses_exec::exec_tool_names();
+        if forced_adapted {
+            upstream_body =
+                crate::responses_exec::adapt_request_for(upstream_body, &forced_custom_names)?;
+            adapted_names = forced_custom_names;
+        }
         let eligible = wire_api == UpstreamWireApi::Responses
+            && !forced_adapted
             && !is_compaction_request
             && !experimental_local_compaction
             && crate::responses_exec::should_adapt_request(&upstream_body, request_path);
         let mut key = None;
-        let mut exec_adapted = false;
+        let mut exec_adapted = forced_adapted;
         let send = async {
             let builder = build_responses_upstream_request(
                 &relay, &endpoint, &upstream_body, wire_api, is_stream,
@@ -4407,13 +4433,24 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             request_trace: Some(request_trace),
             exec_adapted,
             exec_outcome: (exec_adapted && (200..300).contains(&status_code)).then(|| {
-                crate::responses_exec_transport::ExecOutcome::new(
-                    key.expect("adapted request has a cache identity"), &settings,
-                )
+                crate::responses_exec_transport::ExecOutcome::new(key, adapted_names, &settings)
             }),
             response: Some(upstream),
         });
     }
+}
+
+/// xAI 的 Responses 接口（api.x.ai 与 SuperGrok 订阅代理）只认 function 等内置工具类型，
+/// 不认 Codex 的 custom 工具（apply_patch / exec），带上就整包 422。
+fn upstream_rejects_custom_tools(relay: &crate::settings::RelayProfile) -> bool {
+    reqwest::Url::parse(relay.base_url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| {
+            ["x.ai", "grok.com"]
+                .iter()
+                .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+        })
 }
 
 /// 目录外模型名 → 当前供应商默认模型的映射（#1183 / #1446 / #1457）。
@@ -5657,7 +5694,8 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
     if wire_api == UpstreamWireApi::Responses {
         let body = if upstream.exec_adapted {
             let (body, valid) = if is_stream {
-                let mut converter = crate::responses_exec_sse::ExecSseAdapter::new();
+                let mut converter =
+                    crate::responses_exec_sse::ExecSseAdapter::for_names(upstream.exec_tool_names());
                 let mut bytes = match converter.push_bytes(&upstream_body) {
                     Ok(bytes) => bytes,
                     Err(_) => converter.fail(),
@@ -5665,7 +5703,10 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
                 bytes.extend(converter.finish()?);
                 (bytes, converter.succeeded())
             } else {
-                crate::responses_exec_transport::adapted_json(&upstream_body)
+                crate::responses_exec_transport::adapted_json(
+                    &upstream_body,
+                    &upstream.exec_tool_names(),
+                )
             };
             if let Some(outcome) = upstream.exec_outcome.as_mut() {
                 outcome.finish(valid);
@@ -11010,6 +11051,29 @@ mod relay_custom_header_tests {
         )
         .build()
         .unwrap()
+    }
+
+    #[test]
+    fn only_xai_upstreams_get_custom_tools_rewritten() {
+        let relay = |base_url: &str| crate::settings::RelayProfile {
+            base_url: base_url.to_string(),
+            ..Default::default()
+        };
+        for base_url in [
+            "https://cli-chat-proxy.grok.com/v1",
+            "https://api.x.ai/v1",
+            " https://API.X.AI/v1 ",
+        ] {
+            assert!(upstream_rejects_custom_tools(&relay(base_url)), "{base_url}");
+        }
+        for base_url in [
+            "https://api.openai.com/v1",
+            "https://notx.ai/v1",
+            "https://x.ai.example.com/v1",
+            "",
+        ] {
+            assert!(!upstream_rejects_custom_tools(&relay(base_url)), "{base_url}");
+        }
     }
 
     #[test]
