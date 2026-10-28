@@ -774,7 +774,9 @@ function GatewayView({ payload, busy, run }: { payload: GatewayPayload | null; b
         <div className="gw-setting-row">
           <div>
             <strong>{t("退出 Codex++ 时恢复直连")}</strong>
-            <small>{t("网关只在 Codex++ 运行时可用。打开后退出时把 Agent 切回直连，下次启动再自动指回网关。")}</small>
+            <small>{restoreOnExit
+              ? t("网关只在 Codex++ 运行时可用。退出时把 Agent 切回直连，下次启动再自动指回网关。")
+              : t("Agent 一直指着网关：退出 Codex++ 后连不上，再打开就恢复。安装更新前照样会切回直连。")}</small>
           </div>
           <span />
           <Switch disabled={busy !== null} label={t("退出 Codex++ 时恢复直连")} on={restoreOnExit} onToggle={() => saveOptions(mode, !restoreOnExit)} />

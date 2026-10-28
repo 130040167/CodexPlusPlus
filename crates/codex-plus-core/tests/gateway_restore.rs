@@ -164,7 +164,7 @@ fn grok_disconnect_without_stash_or_provider_reports_an_error() {
     );
 }
 
-/// 退出（默认开着「退出时恢复直连」）把 Agent 还原，绑定保持开启并记下「已恢复」；
+/// 退出（打开了「退出时恢复直连」）把 Agent 还原，绑定保持开启并记下「已恢复」；
 /// 下次启动重新接回网关，再断开仍能回到最初的配置。
 #[test]
 fn exit_restore_then_startup_reapply_round_trip() {
@@ -173,7 +173,10 @@ fn exit_restore_then_startup_reapply_round_trip() {
     let path = ctx.grok_home.join("config.toml");
     std::fs::write(&path, GROK_HAND_WRITTEN).unwrap();
     enable_binding(ctx, &ToolId::Grok, binding()).unwrap();
-    assert!(ctx.gateway.load().unwrap().restore_on_exit, "默认开");
+    assert!(!ctx.gateway.load().unwrap().restore_on_exit, "默认关");
+    let mut gateway = ctx.gateway.load().unwrap();
+    gateway.restore_on_exit = true;
+    ctx.gateway.save(&gateway).unwrap();
 
     restore_all_for_exit(ctx, &BackendSettings::default(), false).unwrap();
     assert_eq!(read(&path), GROK_HAND_WRITTEN);
@@ -192,7 +195,7 @@ fn exit_restore_then_startup_reapply_round_trip() {
     assert_eq!(read(&path), GROK_HAND_WRITTEN);
 }
 
-/// 用户关掉了「退出时恢复直连」：普通退出不还原；安装更新前（force）照样还原。
+/// 「退出时恢复直连」关着（默认）：普通退出不还原；安装更新前（force）照样还原。
 #[test]
 fn update_restore_ignores_the_exit_switch() {
     let fixture = fixture(57415);
@@ -200,9 +203,6 @@ fn update_restore_ignores_the_exit_switch() {
     let path = ctx.grok_home.join("config.toml");
     std::fs::write(&path, GROK_HAND_WRITTEN).unwrap();
     enable_binding(ctx, &ToolId::Grok, binding()).unwrap();
-    let mut gateway = ctx.gateway.load().unwrap();
-    gateway.restore_on_exit = false;
-    ctx.gateway.save(&gateway).unwrap();
 
     restore_all_for_exit(ctx, &BackendSettings::default(), false).unwrap();
     assert!(read(&path).contains("/gw/grok"), "开关关着：普通退出不动");

@@ -14985,23 +14985,6 @@ function Toolbar({ children, className = "" }: { children: React.ReactNode; clas
   return <div className={`toolbar ${className}`.trim()}>{children}</div>;
 }
 
-type GrokProvidersResult = CommandResult<{
-  profiles: RelayProfile[];
-  activeRelayId: string;
-  live: {
-    grokHome: string;
-    configPath: string;
-    configExists: boolean;
-    cliPath: string | null;
-    cliInstalled: boolean;
-    revision: string;
-    defaultModel: string;
-    modelsBaseUrl: string;
-    models: Array<{ alias: string; model: string; baseUrl: string; contextWindow: number | null; apiKeyConfigured: boolean }>;
-  };
-  liveProfile: RelayProfile;
-}>;
-
 /**
  * Grok 分区的供应商管理。
  *

@@ -18,8 +18,8 @@ use crate::settings::RelayProfile;
 use crate::tools::ToolId;
 
 const STORE_FILE: &str = "gateway.json";
-/// 2：`restore_on_exit` 默认改为开启（见 [`read_store`] 里的迁移）。
-const STORE_VERSION: u32 = 3;
+/// 3：`auto_models` 默认改为开启；4：`restore_on_exit` 默认改为关闭（见 [`read_store`] 里的迁移）。
+const STORE_VERSION: u32 = 4;
 /// 客户端 token 前缀；日志里看到它就知道是网关签发的本地凭据，不是上游 Key。
 pub const CLIENT_TOKEN_PREFIX: &str = "cpx-gw-";
 
@@ -424,10 +424,10 @@ pub struct GatewaySettings {
     pub key_policy: KeyPolicy,
     /// 退出 Codex++ 时把走网关的 Agent 恢复成直连，避免网关不在时连不上。
     ///
-    /// 默认开：网关跟着 Codex++ 一起退出，不恢复的话 Agent 全都连不上；降级到不认识网关的旧版时同理。
-    /// 旧文件（version < 2）里的 `false` 多半是当年的默认值、不是用户选的，读的时候统一迁移成开，
-    /// 见 [`read_store`]。
-    #[serde(default = "enabled_by_default")]
+    /// 默认关：Agent 一直指着网关，下次打开 Codex++ 就能接着用，不用每次退出、启动都改一遍 Agent 的配置。
+    /// 安装更新前不看这个开关，照样还原（见 [`crate::gateway::apply::restore_all_for_exit`]）。
+    /// 2.0.0 发布前的开发版默认开、文件里总会写出 `true`，读的时候统一迁移成关，见 [`read_store`]。
+    #[serde(default)]
     pub restore_on_exit: bool,
     /// 退出或安装更新前已经把开着的 Agent 恢复成直连（绑定仍是开启）：下次启动要重新接回网关。
     #[serde(default, skip_serializing_if = "is_false")]
@@ -483,7 +483,7 @@ impl Default for GatewaySettings {
             version: 0,
             bindings: BTreeMap::new(),
             key_policy: KeyPolicy::default(),
-            restore_on_exit: true,
+            restore_on_exit: false,
             restored_at_exit: false,
             providers: Vec::new(),
             groups: Vec::new(),
@@ -647,11 +647,10 @@ fn read_store(path: &Path) -> anyhow::Result<GatewaySettings> {
     }
     let mut settings: GatewaySettings =
         serde_json::from_str(&text).with_context(|| format!("无法解析 {}", path.display()))?;
-    // 版本 1 及更早的文件里 `restoreOnExit` 总会写出来，默认值 false 与用户主动关掉的分不开。
-    // 不恢复的后果是退出或降级后 Agent 全部连不上，所以整体迁移成开；用户真想关，再关一次即可
-    // （之后的文件是版本 2，不再迁移）。
-    if settings.version < 2 {
-        settings.restore_on_exit = true;
+    // 版本 4 之前只有发布前的开发版，`restoreOnExit` 总会写出来，是当时的默认值（开）而不是用户选的：
+    // 统一迁移成关；用户想要，再打开一次即可（之后的文件是版本 4，不再迁移）。
+    if settings.version < 4 {
+        settings.restore_on_exit = false;
     }
     // 版本 2 的 `autoModels: false` 是那时「多家自动切换」的默认值；自动建组改成默认开以后统一迁移成开。
     if settings.version < 3 {
@@ -889,7 +888,7 @@ mod tests {
         );
         store.save(&settings).unwrap();
         let text = std::fs::read_to_string(&store.path).unwrap();
-        assert!(text.contains("\"version\": 3"), "{text}");
+        assert!(text.contains("\"version\": 4"), "{text}");
         assert!(
             text.contains(&format!("\"appVersion\": \"{}\"", crate::version::VERSION)),
             "记下写文件的版本：{text}"
@@ -994,7 +993,7 @@ mod tests {
         assert_eq!(binding.unknown_model, UnknownModelPolicy::MapToDefault);
         assert!(
             !settings.restore_on_exit,
-            "版本 2 之后的文件里显式关掉的保持关"
+            "版本 4 之后的文件里显式关掉的保持关"
         );
 
         // 改一点别的再保存。
@@ -1027,20 +1026,20 @@ mod tests {
     }
 
     #[test]
-    fn restore_on_exit_defaults_on_and_old_files_migrate() {
-        assert!(GatewaySettings::default().restore_on_exit);
+    fn restore_on_exit_defaults_off_and_old_files_migrate() {
+        assert!(!GatewaySettings::default().restore_on_exit);
         let temp = tempfile::tempdir().unwrap();
         let store = GatewayStore::at(temp.path().join("gateway.json"));
-        // 版本 1 的文件总会写出 false（当年的默认值），读的时候迁移成开。
-        std::fs::write(&store.path, r#"{"version":1,"restoreOnExit":false}"#).unwrap();
-        assert!(store.load().unwrap().restore_on_exit);
-        std::fs::write(&store.path, r#"{"bindings":{}}"#).unwrap();
-        assert!(store.load().unwrap().restore_on_exit);
-        // 迁移后用户再关掉：存成版本 2，之后保持关。
-        let mut settings = store.load().unwrap();
-        settings.restore_on_exit = false;
-        store.save(&settings).unwrap();
+        // 版本 4 之前的文件总会写出 true（开发版的默认值），读的时候迁移成关。
+        std::fs::write(&store.path, r#"{"version":3,"restoreOnExit":true}"#).unwrap();
         assert!(!store.load().unwrap().restore_on_exit);
+        std::fs::write(&store.path, r#"{"bindings":{}}"#).unwrap();
+        assert!(!store.load().unwrap().restore_on_exit);
+        // 迁移后用户再打开：存成版本 4，之后保持开。
+        let mut settings = store.load().unwrap();
+        settings.restore_on_exit = true;
+        store.save(&settings).unwrap();
+        assert!(store.load().unwrap().restore_on_exit);
     }
 
     #[test]
