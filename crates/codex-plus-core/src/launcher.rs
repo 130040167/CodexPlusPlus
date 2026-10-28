@@ -1424,6 +1424,44 @@ impl LaunchHooks for DefaultLaunchHooks {
                                         None
                                     }
                                 };
+                            // issue #2700：Codex 26.1021 起，带调试参数的 AUMID 激活会让
+                            // 进程立即退出、调试端口永不监听。这里短暂观察激活结果，确认
+                            // 秒退后改走包上下文 wrapper，而不是空等注入预算耗尽。
+                            let verdict = verify_packaged_activation(
+                                process_id,
+                                process.as_ref(),
+                                debug_port,
+                            )
+                            .await;
+                            if verdict
+                                == crate::packaged_launch::AumidActivationVerdict::FallbackToPackageContext
+                            {
+                                let _ = crate::diagnostic_log::append_diagnostic_log(
+                                    "launcher.packaged_activation_exited_early",
+                                    serde_json::json!({
+                                        "app_user_model_id": app_user_model_id,
+                                        "activation_pid": process_id,
+                                        "debug_port": debug_port,
+                                    }),
+                                );
+                                launch_packaged_main_in_package_context(
+                                    app_dir,
+                                    app_user_model_id,
+                                    debug_port,
+                                    &launch_extra_args,
+                                )
+                                .await?;
+                                *self.packaged_executable.lock().await = Some(executable);
+                                *self.packaged_activation_process.lock().await = None;
+                                *self.packaged_launch_identity.lock().await = None;
+                                // 包上下文里拉起的是 cmd.exe，拿不到应用进程 PID；
+                                // 退出等待按调试端口归属去发现实际进程。
+                                return Ok(CodexLaunch::PackagedActivation {
+                                    app_user_model_id: app_user_model_id.clone(),
+                                    arguments: arguments.clone(),
+                                    process_id: None,
+                                });
+                            }
                             *self.packaged_executable.lock().await = Some(executable);
                             *self.packaged_activation_process.lock().await = process;
                             *self.packaged_launch_identity.lock().await = None;
@@ -4590,6 +4628,90 @@ async fn launch_packaged_multi_instance(
             }
         }
     }
+}
+
+/// 包上下文兜底启动后等待调试端口就绪的上限。超过即报错，不再进入 90 秒注入预算。
+#[cfg(windows)]
+const PACKAGED_CONTEXT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// AUMID 激活后的观察：直到调试端口就绪、确认激活进程秒退、或验证窗口耗尽（issue #2700）。
+///
+/// 判定逻辑在 `packaged_launch::AumidActivationWatch`（纯函数，有单测）；这里只负责采样。
+#[cfg(windows)]
+async fn verify_packaged_activation(
+    process_id: u32,
+    process: Option<&crate::windows_integration::TrackedWindowsProcess>,
+    debug_port: u16,
+) -> crate::packaged_launch::AumidActivationVerdict {
+    use crate::packaged_launch::{AumidActivationVerdict, AumidActivationWatch};
+    let mut watch = AumidActivationWatch::new(std::time::Instant::now());
+    loop {
+        let cdp_ready =
+            tokio::task::spawn_blocking(move || crate::cdp::endpoint_available(debug_port))
+                .await
+                .unwrap_or(false);
+        let process_alive = match process {
+            Some(process) => process.is_alive().ok(),
+            // 激活后进程秒退时 OpenProcess 往往已经失败，拿不到句柄；
+            // 退回按进程快照判断该 PID 是否还在。
+            None => tokio::task::spawn_blocking(move || {
+                crate::windows_integration::enumerate_processes()
+                    .iter()
+                    .any(|info| info.process_id == process_id)
+            })
+            .await
+            .ok(),
+        };
+        let verdict = watch.observe(std::time::Instant::now(), cdp_ready, process_alive);
+        if verdict != AumidActivationVerdict::Pending {
+            return verdict;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// 主实例的包上下文兜底启动（issue #2700）：AUMID 激活后进程秒退时，改用
+/// `Invoke-CommandInDesktopPackage` wrapper 带同一份参数拉起 exe，并等待调试端口就绪。
+///
+/// 任一步失败都直接返回 Err，让用户立即看到错误，而不是空等注入预算耗尽。
+#[cfg(windows)]
+async fn launch_packaged_main_in_package_context(
+    app_dir: &Path,
+    app_user_model_id: &str,
+    debug_port: u16,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
+    let executable = crate::app_paths::build_codex_executable(app_dir);
+    let arguments = build_codex_arguments(debug_port, extra_args);
+    let wrapper_path = crate::packaged_launch::prepare_main_instance_wrapper(
+        &crate::paths::default_app_state_dir(),
+        &executable,
+        &arguments,
+    )?;
+    crate::packaged_launch::activate_in_package_context(app_user_model_id, &wrapper_path)
+        .await
+        .context("Codex 通过 AUMID 激活后立即退出，改用包上下文启动也失败")?;
+    let ready = tokio::task::spawn_blocking(move || {
+        crate::packaged_launch::wait_for_instance_ready(debug_port, PACKAGED_CONTEXT_READY_TIMEOUT)
+    })
+    .await
+    .unwrap_or(false);
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "launcher.packaged_context_main_launch",
+        serde_json::json!({
+            "app_user_model_id": app_user_model_id,
+            "wrapper_path": wrapper_path,
+            "debug_port": debug_port,
+            "ready": ready,
+        }),
+    );
+    if !ready {
+        anyhow::bail!(
+            "Codex 通过 AUMID 激活后立即退出，改用包上下文启动后 {} 秒内调试端口 {debug_port} 仍未就绪",
+            PACKAGED_CONTEXT_READY_TIMEOUT.as_secs()
+        );
+    }
+    Ok(())
 }
 
 /// 从启动参数里取出实例自己的 `--user-data-dir`（多开由管理器注入）。
