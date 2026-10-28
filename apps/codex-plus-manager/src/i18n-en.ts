@@ -1996,6 +1996,10 @@ export const EN_PLAIN: Record<string, string> = {
   "诊断供应商": "Diagnose provider",
   "检测": "Detect",
   "检测到 OPENAI 环境变量": "OPENAI environment variables detected",
+  "SSH 远端连不上本机中转地址": "SSH remotes can't reach the local relay address",
+  "当前中转地址是本机回环地址，在 SSH 服务器上它指向服务器自己。Codex++ 不会往远端写配置；如果远端 Codex 用的也是这个地址，连接时需要把端口反向转发回本机（本机 Codex++ 要保持运行），或在远端单独配置可访问的上游地址。":
+    "The current relay address is a loopback address; on an SSH server it points at the server itself. Codex++ doesn't write config to remotes; if the remote Codex uses this address too, forward the port back to this machine when connecting (keep Codex++ running here), or configure a reachable upstream address on the remote.",
+  "或写进 ~/.ssh/config 对应 Host 下：": "Or add under the matching Host in ~/.ssh/config:",
   "检测到来自网页的供应商配置导入请求，确认后会写入本机 Codex++。":
     "A provider config import request from the web was detected; confirming writes it to this machine's Codex++ manager.",
   "概览": "Overview",
@@ -2584,6 +2588,7 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "连接 {0} 时带上：": "When connecting to {0}, add:",
   "经 Codex++ 网关 · {0} 个模型": "Via Codex++ gateway · {0} models",
   "生图 {0} 次": "{0} images",
   "供应商：{0}": "Provider: {0}",

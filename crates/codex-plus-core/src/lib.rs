@@ -84,6 +84,7 @@ pub mod settings;
 pub mod settings_catalog;
 pub mod share;
 pub mod skills;
+pub mod ssh_remote_loopback;
 pub mod status;
 pub mod stepwise;
 pub mod sub2api;

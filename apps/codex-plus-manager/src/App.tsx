@@ -937,8 +937,16 @@ type EnvConflict = {
   valuePresent: boolean;
 };
 
+// 本机回环中转地址遇上 Codex 的 SSH 远端连接（issue #1195），后端只读检测。
+type SshRemoteLoopbackNoticeData = {
+  loopbackEndpoints: Array<{ key: string; url: string; port: number }>;
+  ports: number[];
+  remotes: Array<{ label: string; forwardCommand: string; sshConfigLines: string[] }>;
+};
+
 type EnvConflictsResult = CommandResult<{
   conflicts: EnvConflict[];
+  sshRemoteLoopback?: SshRemoteLoopbackNoticeData | null;
 }>;
 
 type RelayEnvironmentResult = CommandResult<{
@@ -1915,11 +1923,12 @@ export function App() {
     if (!(await appConfirm(tf("删除这些环境变量？\n\n{0}\n\n删除前会写入备份。", [uniqueNames.join("\n")]), { title: t("删除环境变量"), confirmText: t("删除"), danger: true }))) return;
     const result = await run(() => call<RemoveEnvConflictsResult>("remove_env_conflicts", { request: { names: uniqueNames } }));
     if (result) {
-      setEnvConflicts({
+      setEnvConflicts((current) => ({
         status: result.status,
         message: result.message,
         conflicts: result.remaining,
-      });
+        sshRemoteLoopback: current?.sshRemoteLoopback ?? null,
+      }));
       showNotice(t("环境变量清理"), result.message, result.status);
     }
   };
@@ -7234,6 +7243,7 @@ function RelayScreen({
         <Panel className="relay-management-panel">
           <CardContent>
           <EnvConflictNotice envConflicts={envConflicts} actions={actions} />
+          <SshRemoteLoopbackNotice notice={envConflicts?.sshRemoteLoopback ?? null} />
           {!normalized.relayProfilesEnabled ? (
             <p className="relay-switch-off-note" role="status">
               {t("供应商配置切换已关闭：Codex++ 不会写入 Codex 的 config.toml / auth.json，供应商列表已隐藏。需要切换时打开右上角的「配置切换」。")}
@@ -7595,6 +7605,56 @@ function EnvConflictNotice({
         <Button onClick={() => void actions.refreshEnvConflicts(false)} size="sm" variant="secondary">
           <RefreshCw className="h-4 w-4" />
           {t("检测")}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+const SSH_REMOTE_LOOPBACK_DISMISS_KEY = "codex-plus-ssh-remote-loopback-dismissed";
+
+// Codex++ 不往 SSH 远端写配置；远端 Codex 若沿用本机 127.0.0.1 中转地址会连到服务器自己（issue #1195）。
+// 这里只提示 ssh -R 反向转发的做法。「知道了」按端口 + 远端记住，组合变了再提示。
+function SshRemoteLoopbackNotice({ notice }: { notice: SshRemoteLoopbackNoticeData | null }) {
+  const signature = notice
+    ? `${notice.ports.join(",")}|${notice.remotes.map((remote) => remote.label).join(",")}`
+    : "";
+  const [dismissed, setDismissed] = useState<string>(() => {
+    try { return window.localStorage.getItem(SSH_REMOTE_LOOPBACK_DISMISS_KEY) ?? ""; } catch { return ""; }
+  });
+  if (!notice || !notice.remotes.length || dismissed === signature) return null;
+  const dismiss = () => {
+    setDismissed(signature);
+    try { window.localStorage.setItem(SSH_REMOTE_LOOPBACK_DISMISS_KEY, signature); } catch { /* 存不了就只影响本次 */ }
+  };
+  return (
+    <div className="env-conflict-notice ssh-remote-loopback-notice" role="note">
+      <div className="env-conflict-icon">
+        <ShieldAlert className="h-4 w-4" />
+      </div>
+      <div className="env-conflict-body">
+        <strong>{t("SSH 远端连不上本机中转地址")}</strong>
+        <p>{t("当前中转地址是本机回环地址，在 SSH 服务器上它指向服务器自己。Codex++ 不会往远端写配置；如果远端 Codex 用的也是这个地址，连接时需要把端口反向转发回本机（本机 Codex++ 要保持运行），或在远端单独配置可访问的上游地址。")}</p>
+        <div className="env-conflict-tags">
+          {notice.loopbackEndpoints.map((endpoint) => (
+            <span key={endpoint.key}>
+              {endpoint.url}
+              <small>{endpoint.key}</small>
+            </span>
+          ))}
+        </div>
+        {notice.remotes.map((remote) => (
+          <div className="ssh-remote-loopback-remote" key={remote.label}>
+            <p>{tf("连接 {0} 时带上：", [remote.label])}</p>
+            <code>{remote.forwardCommand}</code>
+            <p>{t("或写进 ~/.ssh/config 对应 Host 下：")}</p>
+            <code>{remote.sshConfigLines.join("\n")}</code>
+          </div>
+        ))}
+      </div>
+      <div className="env-conflict-actions">
+        <Button onClick={dismiss} size="sm" variant="secondary">
+          {t("知道了")}
         </Button>
       </div>
     </div>
