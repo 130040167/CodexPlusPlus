@@ -22,7 +22,6 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sha1 = "0.10"
-sherpa-onnx.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "sync"] }
 tokio-tungstenite.workspace = true
@@ -41,7 +40,11 @@ objc2-core-graphics = "0.3"
 objc2-foundation = "0.3"
 objc2-screen-capture-kit = "0.3"
 
+[target.'cfg(not(windows))'.dependencies]
+sherpa-onnx.workspace = true
+
 [target.'cfg(windows)'.dependencies]
+sherpa-onnx = { version = "1.13.8", default-features = false, features = ["shared"] }
 windows = { version = "0.58", features = [
   "Win32_Foundation",
   "Win32_Networking_WinHttp",
