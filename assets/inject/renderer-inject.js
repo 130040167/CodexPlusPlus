@@ -6069,6 +6069,12 @@
         codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
         nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
       });
+      // 原生输入预测只接收自己的开关和本机 API 布尔投影。
+      globalThis.window?.__codexPlusNativePredictions?.runtime?.update?.({
+        enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
+        codexAppNativePredictions: codexPlusBackendSettings.codexAppNativePredictions === true,
+        nativePredictionsLocalApiConfigured: codexPlusBackendSettings.nativePredictionsLocalApiConfigured === true,
+      });
     } catch (_) {
       return false;
     }
@@ -6229,6 +6235,11 @@
           enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
           codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
           nativeFastLocalApiConfigured: codexPlusBackendSettings.nativeFastLocalApiConfigured === true,
+        });
+        globalThis.window?.__codexPlusNativePredictions?.runtime?.update?.({
+          enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
+          codexAppNativePredictions: codexPlusBackendSettings.codexAppNativePredictions === true,
+          nativePredictionsLocalApiConfigured: codexPlusBackendSettings.nativePredictionsLocalApiConfigured === true,
         });
         globalThis.__CODEX_PLUS_ACTIVITY_OVERLAY_SYNC__?.();
       }

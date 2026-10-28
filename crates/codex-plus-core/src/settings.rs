@@ -1012,6 +1012,9 @@ pub struct BackendSettings {
     pub codex_app_native_browser_require_identification: bool,
     #[serde(rename = "codexAppNativeFastUnlock", default)]
     pub codex_app_native_fast_unlock: bool,
+    /// 原生输入预测（实验）：自定义 API 的本机对话使用 Codex 自带的灰字预测与 Tab 接受。默认关。
+    #[serde(rename = "codexAppNativePredictions", default)]
+    pub codex_app_native_predictions: bool,
     /// 第三方模型回答完自动折叠过程（#2659）：本地代理给没带阶段标记的助手消息补 `phase`。默认关。
     #[serde(rename = "codexAppThirdPartyReasoningCollapse", default)]
     pub codex_app_third_party_reasoning_collapse: bool,
@@ -1281,6 +1284,7 @@ impl Default for BackendSettings {
             codex_app_native_menu_placement: true,
             codex_app_native_browser_require_identification: false,
             codex_app_native_fast_unlock: false,
+            codex_app_native_predictions: false,
             codex_app_third_party_reasoning_collapse: false,
             codex_app_pet_real_mouse_look: false,
             codex_app_activity_overlay_right: false,
@@ -2585,6 +2589,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "codexAppNativeMenuPlacement");
     merge_bool_setting(target, source, "codexAppNativeBrowserRequireIdentification");
     merge_bool_setting(target, source, "codexAppNativeFastUnlock");
+    merge_bool_setting(target, source, "codexAppNativePredictions");
     merge_bool_setting(target, source, "codexAppThirdPartyReasoningCollapse");
     merge_bool_setting(target, source, "codexAppPetRealMouseLook");
     merge_bool_setting(target, source, "codexAppActivityOverlayRight");

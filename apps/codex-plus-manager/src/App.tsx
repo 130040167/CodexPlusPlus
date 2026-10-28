@@ -419,6 +419,8 @@ type BackendSettings = {
   codexAppNativeMenuPlacement: boolean;
   codexAppNativeBrowserRequireIdentification: boolean;
   codexAppNativeFastUnlock: boolean;
+  /** 原生输入预测（实验）：自定义 API 的本机对话使用 Codex 自带的灰字预测与 Tab 接受，默认关。 */
+  codexAppNativePredictions: boolean;
   /** 第三方模型回答完自动折叠过程（本地代理补阶段标记），默认关。 */
   codexAppThirdPartyReasoningCollapse: boolean;
   /** 纯 API Key 模式启动 Codex 前把 Work 视图写回 Codex，避开 Work browser access 报错。 */
@@ -1380,6 +1382,7 @@ const defaultSettings: BackendSettings = {
   codexAppNativeMenuPlacement: true,
   codexAppNativeBrowserRequireIdentification: false,
   codexAppNativeFastUnlock: false,
+  codexAppNativePredictions: false,
   codexAppThirdPartyReasoningCollapse: false,
   codexAppDisableWorkView: false,
   codexAppPetRealMouseLook: false,

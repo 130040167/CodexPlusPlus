@@ -1094,6 +1094,8 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "原生输入预测（实验）": "Native composer predictions (experimental)",
+  "实验功能，默认关闭。在 Codex 原生输入框显示下一句灰字预测，按 Tab 接受为可编辑草稿，不会自动发送。仅对使用 API Key / 自定义供应商的本机对话生效；每个回合结束都会用当前供应商额外请求一次，消耗该供应商额度。ChatGPT 登录与远程 / SSH / 云端对话保持原样。重新启动 Codex 后生效。": "Experimental, off by default. Shows a gray next-message prediction in the native Codex composer; press Tab to accept it as an editable draft. It is never sent automatically. Only applies to local conversations using an API key or custom provider; every finished turn makes one extra request to the current provider and consumes its quota. ChatGPT sign-in and remote, SSH or cloud conversations are unchanged. Restart Codex to apply.",
   "第三方模型回答完自动折叠过程": "Collapse third-party model work after the answer",
   "给第三方模型的回复补上「最终回答 / 过程」标记，回答完后像官方模型一样把推理和命令过程收起来。只对经过 Codex++ 本地代理或网关的请求生效；个别上游不接受这个标记时请关闭。": "Marks third-party model replies as final answer or progress, so reasoning and command steps collapse after the answer like official models. Only applies to requests through the Codex++ local proxy or gateway; turn off if an upstream rejects the marker.",
   "Computer Use 暂不支持 Windows": "Computer Use is not supported on Windows yet",
