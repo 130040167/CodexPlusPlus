@@ -961,6 +961,9 @@ pub struct BackendSettings {
     pub codex_app_model_whitelist_unlock: bool,
     #[serde(rename = "codexAppSessionDelete", default = "default_true")]
     pub codex_app_session_delete: bool,
+    /// 快速删除（#48）：本地会话删除时跳过确认弹窗；远端会话仍强制确认。默认关。
+    #[serde(rename = "codexAppSessionDeleteSkipConfirm", default)]
+    pub codex_app_session_delete_skip_confirm: bool,
     #[serde(rename = "codexAppSideChatSave", default)]
     pub codex_app_side_chat_save: bool,
     #[serde(rename = "codexAppMarkdownExport", default = "default_true")]
@@ -1280,6 +1283,7 @@ impl Default for BackendSettings {
             codex_app_plugin_marketplace_unlock: true,
             codex_app_model_whitelist_unlock: true,
             codex_app_session_delete: true,
+            codex_app_session_delete_skip_confirm: false,
             codex_app_side_chat_save: false,
             codex_app_markdown_export: true,
             codex_app_session_share: true,
@@ -2593,6 +2597,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "codexAppPluginMarketplaceUnlock");
     merge_bool_setting(target, source, "codexAppModelWhitelistUnlock");
     merge_bool_setting(target, source, "codexAppSessionDelete");
+    merge_bool_setting(target, source, "codexAppSessionDeleteSkipConfirm");
     merge_bool_setting(target, source, "codexAppSideChatSave");
     merge_bool_setting(target, source, "codexAppMarkdownExport");
     merge_bool_setting(target, source, "codexAppSessionShare");
@@ -5359,6 +5364,24 @@ experimental_bearer_token = "sk-existing""#
         assert!(store.load().unwrap().codex_app_turn_rewind);
         store.update(json!({ "codexAppTurnRewind": false })).unwrap();
         assert!(!store.load().unwrap().codex_app_turn_rewind);
+    }
+
+    #[test]
+    fn session_delete_skip_confirm_is_opt_in_and_round_trips_through_settings_file() {
+        // #48：快速删除默认关闭；旧设置文件没有这个字段时也按关闭读取。
+        let temp = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(temp.path().join("settings.json"));
+        assert!(!BackendSettings::default().codex_app_session_delete_skip_confirm);
+        store.save(&BackendSettings::default()).unwrap();
+        let updated = store
+            .update(json!({ "codexAppSessionDeleteSkipConfirm": true }))
+            .unwrap();
+        assert!(updated.codex_app_session_delete_skip_confirm);
+        assert!(store.load().unwrap().codex_app_session_delete_skip_confirm);
+        store
+            .update(json!({ "codexAppSessionDeleteSkipConfirm": false }))
+            .unwrap();
+        assert!(!store.load().unwrap().codex_app_session_delete_skip_confirm);
     }
 
 }
