@@ -3356,10 +3356,17 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         .map(str::trim)
         .unwrap_or("")
         .to_string();
+    // 聚合指定了审批成员（#2703）时，codex-auto-review 先按它解析，
+    // 不再交给默认成员 / 轮转（默认成员是官方登录时会消耗官方额度）。
     let aggregate_model = match if forced.is_some() {
         Ok(None)
     } else {
-        crate::aggregate_catalog::resolve_active_model(&settings, &source_model)
+        crate::aggregate_catalog::resolve_auto_review_member(&settings, &source_model).and_then(
+            |binding| match binding {
+                Some(binding) => Ok(Some(binding)),
+                None => crate::aggregate_catalog::resolve_active_model(&settings, &source_model),
+            },
+        )
     } {
         Ok(binding) => binding,
         Err(error) => {
@@ -5104,7 +5111,7 @@ fn project_strict_reasoning_history(body: &mut Value) -> anyhow::Result<()> {
 }
 
 /// Codex 自动审批（「替我审批」）请求使用的固定模型 slug。
-const CODEX_AUTO_REVIEW_MODEL: &str = "codex-auto-review";
+const CODEX_AUTO_REVIEW_MODEL: &str = crate::aggregate_catalog::CODEX_AUTO_REVIEW_MODEL;
 
 /// codex-auto-review 的改写目标：供应商配置了审批模型（#1446）时返回它，否则 `None`。
 /// 目录外模型映射（#1183）也用它判断是否让路，两处共用同一条规则。
@@ -11077,6 +11084,7 @@ mod unlisted_model_mapping_tests {
             routes: Vec::new(),
             default_relay_id: String::new(),
             sync_default_member_login: false,
+            auto_review_relay_id: String::new(),
         }];
         // 聚合有自己的按成员归因与「不做静默改派」策略，不在此映射。
         assert_eq!(unlisted_model_replacement(&settings, "gpt-5.4"), None);

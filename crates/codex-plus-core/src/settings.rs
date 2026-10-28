@@ -333,6 +333,12 @@ pub struct AggregateRelayProfile {
     /// 应当由用户显式选择。
     #[serde(rename = "syncDefaultMemberLogin", default)]
     pub sync_default_member_login: bool,
+    /// 审批成员（#2703）：Codex「替我审批」固定请求 `codex-auto-review`，默认跟普通请求一样
+    /// 交给默认成员 / 轮转选中的成员；默认成员是官方登录时就会消耗官方额度。
+    /// 指定后，审批请求只发给这个成员，模型取它的「自动审批模型」（没填用它的默认模型）。
+    /// 空串表示未设置，保持原有行为。
+    #[serde(rename = "autoReviewRelayId", default, skip_serializing_if = "String::is_empty")]
+    pub auto_review_relay_id: String,
 }
 
 impl Default for RelayProfile {
@@ -4486,6 +4492,7 @@ experimental_bearer_token = "sk-existing""#
                 session_provider: RelaySessionProvider::Openai,
                 model_aggregation_enabled: true,
                 sync_default_member_login: false,
+                auto_review_relay_id: String::new(),
                 strategy: AggregateRelayStrategy::WeightedRoundRobin,
                 members: vec![
                     AggregateRelayMember {

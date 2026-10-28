@@ -20,6 +20,8 @@ export type AgentBinding = {
   extraModels: string[];
   claudeRoles: ClaudeRoleModels;
   unknownModel: UnknownModelPolicy;
+  /** 审批模型（#2703，Codex 用）：codex-auto-review 改发到这个模型；空或没有是不单独指定（旧版后端没有）。 */
+  autoReviewModel?: string;
   contextWindow?: number | null;
   claudeEnableEffort: boolean;
   /** 这个 Agent 不用的池内供应商（「挑选」里取消勾选的）。 */
@@ -227,6 +229,7 @@ export type BindingDraft = {
   haiku: string;
   subagent: string;
   unknownModel: UnknownModelPolicy;
+  autoReviewModel: string;
   contextWindow: string;
   claudeEnableEffort: boolean;
   poolExclude: string[];
@@ -256,6 +259,7 @@ export function draftFromBinding(binding: AgentBinding | undefined): BindingDraf
     haiku: source.claudeRoles.haiku,
     subagent: source.claudeRoles.subagent,
     unknownModel: source.unknownModel,
+    autoReviewModel: source.autoReviewModel ?? "",
     contextWindow: source.contextWindow ? String(source.contextWindow) : "",
     claudeEnableEffort: source.claudeEnableEffort,
     poolExclude: [...(source.poolExclude ?? [])],
@@ -313,6 +317,7 @@ export function bindingFromDraft(draft: BindingDraft, previous: AgentBinding | u
       subagent: draft.subagent.trim(),
     },
     unknownModel: draft.unknownModel,
+    autoReviewModel: draft.autoReviewModel.trim(),
     contextWindow: window && Number.isFinite(window) ? window : null,
     claudeEnableEffort: draft.claudeEnableEffort,
     poolExclude: [...draft.poolExclude],

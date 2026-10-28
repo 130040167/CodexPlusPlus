@@ -4760,6 +4760,7 @@ async fn aggregate_official_member_forwards_with_oauth_credentials() {
             routes: Vec::new(),
             default_relay_id: String::new(),
             sync_default_member_login: false,
+            auto_review_relay_id: String::new(),
         }],
         ..BackendSettings::default()
     };
@@ -4832,6 +4833,7 @@ fn official_aggregate_test_settings(official_id: &str, aggregate_id: &str) -> Ba
             routes: Vec::new(),
             default_relay_id: String::new(),
             sync_default_member_login: false,
+            auto_review_relay_id: String::new(),
         }],
         ..BackendSettings::default()
     }
@@ -5033,6 +5035,7 @@ async fn aggregate_official_member_refreshes_and_retries_after_401() {
             routes: Vec::new(),
             default_relay_id: String::new(),
             sync_default_member_login: false,
+            auto_review_relay_id: String::new(),
         }],
         ..BackendSettings::default()
     };
@@ -5504,6 +5507,81 @@ async fn aggregate_default_provider_forwards_unbound_model() {
     other_server.abort();
 }
 
+/// #2703：聚合指定了审批成员时，codex-auto-review 只发给它（不走默认成员 / 轮转），
+/// 模型取它的「自动审批模型」，没填时用它的默认模型。按模型聚合与轮转池两种模式都生效。
+#[tokio::test]
+async fn aggregate_auto_review_member_takes_review_requests() {
+    let review = r#"{"model":"codex-auto-review","input":"review","stream":false}"#;
+    for model_aggregation in [true, false] {
+        for configured_model in ["deepseek-v4-flash", ""] {
+            let default_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let default_addr = default_listener.local_addr().unwrap();
+            let review_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let review_addr = review_listener.local_addr().unwrap();
+            let default_server = tokio::spawn(respond_once(
+                default_listener,
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n",
+            ));
+            let review_server = tokio::spawn(capture_json_request_once(review_listener));
+            let mut settings = aggregate_proxy_settings(
+                "auto-review-member",
+                format!("http://{default_addr}/v1"),
+                format!("http://{review_addr}/v1"),
+            );
+            settings.relay_profiles[1].model = "deepseek-v4-pro".to_string();
+            settings.relay_profiles[1].auto_review_model = configured_model.to_string();
+            let aggregate = &mut settings.aggregate_relay_profiles[0];
+            aggregate.model_aggregation_enabled = model_aggregation;
+            aggregate.strategy = AggregateRelayStrategy::Failover;
+            aggregate.default_relay_id = settings.relay_profiles[0].id.clone();
+            aggregate.auto_review_relay_id = settings.relay_profiles[1].id.clone();
+
+            let result = open_responses_proxy_request_with_settings(review, settings)
+                .await
+                .unwrap();
+            assert_eq!(result.status_code, 200, "aggregation={model_aggregation}");
+            let (_, body) = review_server.await.unwrap();
+            let expected = if configured_model.is_empty() {
+                "deepseek-v4-pro"
+            } else {
+                configured_model
+            };
+            assert_eq!(body["model"], expected, "aggregation={model_aggregation}");
+            default_server.abort();
+        }
+    }
+}
+
+/// #2703：审批成员已不是聚合成员时硬报错，不静默回落到默认成员（可能是官方登录）。
+#[tokio::test]
+async fn aggregate_auto_review_member_drift_does_not_fall_back() {
+    let default_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let default_addr = default_listener.local_addr().unwrap();
+    let default_server = tokio::spawn(capture_json_request_once(default_listener));
+    let mut settings = aggregate_proxy_settings(
+        "auto-review-drift",
+        format!("http://{default_addr}/v1"),
+        format!("http://{default_addr}/v1"),
+    );
+    settings.aggregate_relay_profiles[0].model_aggregation_enabled = true;
+    settings.aggregate_relay_profiles[0].default_relay_id = settings.relay_profiles[0].id.clone();
+    settings.aggregate_relay_profiles[0].auto_review_relay_id = "ghost".to_string();
+    let review = r#"{"model":"codex-auto-review","input":"review","stream":false}"#;
+    let result = open_responses_proxy_request_with_settings(review, settings.clone())
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 400);
+
+    // 普通请求不受审批成员影响，照旧交给默认成员。
+    let normal = r#"{"model":"gpt-9.9-unknown","input":"hi","stream":false}"#;
+    let result = open_responses_proxy_request_with_settings(normal, settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (_, body) = default_server.await.unwrap();
+    assert_eq!(body["model"], "gpt-9.9-unknown");
+}
+
 #[tokio::test]
 async fn aggregate_live_settings_updates_preserve_selected_model_and_failover() {
     let _lock = settings_path_test_lock().lock().unwrap();
@@ -5838,6 +5916,7 @@ fn aggregate_proxy_settings(
             routes: Vec::new(),
             default_relay_id: String::new(),
             sync_default_member_login: false,
+            auto_review_relay_id: String::new(),
         }],
         ..BackendSettings::default()
     }

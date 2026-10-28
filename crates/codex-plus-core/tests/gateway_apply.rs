@@ -1333,6 +1333,7 @@ fn direct_aggregates_move_into_the_gateway_as_pool_providers_and_a_group() {
         }],
         default_relay_id: String::new(),
         sync_default_member_login: false,
+        auto_review_relay_id: String::new(),
     };
     let settings = BackendSettings {
         relay_profiles: vec![

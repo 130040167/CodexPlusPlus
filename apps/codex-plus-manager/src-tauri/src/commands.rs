@@ -10501,6 +10501,7 @@ base_url = "https://example.invalid/v1"
                 routes: Vec::new(),
                 default_relay_id: String::new(),
                 sync_default_member_login: false,
+                auto_review_relay_id: String::new(),
             }],
             ..BackendSettings::default()
         };
@@ -10536,6 +10537,7 @@ base_url = "https://example.invalid/v1"
                 routes: Vec::new(),
                 default_relay_id: String::new(),
                 sync_default_member_login: false,
+                auto_review_relay_id: String::new(),
             }],
             ..BackendSettings::default()
         };
@@ -10593,6 +10595,7 @@ base_url = "https://example.invalid/v1"
                 routes: Vec::new(),
                 default_relay_id: String::new(),
                 sync_default_member_login: false,
+                auto_review_relay_id: String::new(),
             }],
             ..BackendSettings::default()
         };

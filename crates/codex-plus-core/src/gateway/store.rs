@@ -330,6 +330,12 @@ pub struct AgentBinding {
     pub claude_roles: ClaudeRoleModels,
     #[serde(default, deserialize_with = "lenient")]
     pub unknown_model: UnknownModelPolicy,
+    /// 审批模型（#2703，目前只有 Codex 用）：Codex「替我审批」固定请求 `codex-auto-review`，
+    /// 默认按「未知模型」策略改写成主模型；主模型是 ChatGPT 账号或含账号的模型组时会消耗订阅额度。
+    /// 填了就把审批请求改发到这个模型（`<供应商 id>/<模型>`、裸模型名或 `group/<组 id>`）。
+    /// 空串表示未设置，保持原有行为。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub auto_review_model: String,
     /// 写给 Agent 的上下文窗口（Claude Code 的 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
@@ -360,6 +366,7 @@ impl Default for AgentBinding {
             extra_models: Vec::new(),
             claude_roles: ClaudeRoleModels::default(),
             unknown_model: UnknownModelPolicy::default(),
+            auto_review_model: String::new(),
             context_window: None,
             claude_enable_effort: false,
             pool_exclude: Vec::new(),

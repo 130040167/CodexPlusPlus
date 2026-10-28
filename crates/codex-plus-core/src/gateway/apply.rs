@@ -2883,6 +2883,7 @@ mod tests {
                 routes: Vec::new(),
                 default_relay_id: String::new(),
                 sync_default_member_login: false,
+                auto_review_relay_id: String::new(),
             }],
             ..BackendSettings::default()
         };
