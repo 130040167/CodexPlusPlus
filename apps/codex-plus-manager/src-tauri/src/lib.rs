@@ -241,15 +241,10 @@ pub fn run() {
             cu_pip::start(app.handle().clone());
             commands::start_weixin_connect_from_saved_settings();
             register_main_window_events(main_window);
-            commands::resume_existing_codex_background(
+            commands::multi_instance_resume::resume_on_manager_start(
                 app.handle().clone(),
                 start_codex_at_login || start_codex_on_open,
             );
-            // 网关模式：有 Agent 走网关时常驻 helper 必须在线。
-            gateway_commands::start_from_saved_state();
-            gateway_commands::start_model_watch();
-            // 自动接管官方 App（默认关闭）：设置里开着才起守护线程。
-            auto_takeover::start_supervisor();
             if let Err(error) = global_dictation::apply_config() {
                 let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
                     "dictation.global_hotkey_start_failed",

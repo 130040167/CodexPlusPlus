@@ -241,6 +241,10 @@ pub struct LaunchInstance {
 }
 
 impl LaunchInstance {
+    pub fn requires_packaged_environment(&self) -> bool {
+        self.codex_home.is_some() || self.sqlite_home.is_some()
+    }
+
     pub fn from_options(options: &LaunchOptions) -> Self {
         Self {
             state_dir: options.state_dir.clone(),
@@ -823,6 +827,7 @@ pub async fn launch_and_inject_with_hooks<H>(
 where
     H: IntoLaunchHooks,
 {
+    validate_launch_native_directories(&options)?;
     let hooks = hooks.into_launch_hooks();
     let mut debug_port = hooks.select_debug_port(options.debug_port);
     let mut helper_port = hooks.select_helper_port(options.helper_port);
@@ -1113,6 +1118,32 @@ where
     }
 }
 
+fn validate_launch_native_directories(options: &LaunchOptions) -> anyhow::Result<()> {
+    for (name, explicit, effective) in [
+        ("CODEX_HOME", options.codex_home.as_ref(), crate::codex_home::default_codex_home_dir()),
+        (
+            "CODEX_SQLITE_HOME",
+            options.sqlite_home.as_ref(),
+            std::env::var_os("CODEX_SQLITE_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(crate::codex_home::default_codex_home_dir),
+        ),
+    ] {
+        let environment = std::env::var_os(name).map(PathBuf::from);
+        for directory in [explicit, environment.as_ref()].into_iter().flatten() {
+            anyhow::ensure!(
+                directory.is_absolute() && directory.is_dir(),
+                "{name} 必须指向已存在的绝对目录，拒绝回落默认目录"
+            );
+            anyhow::ensure!(
+                directory.canonicalize()? == effective.canonicalize()?,
+                "{name} 启动目录与配置处理目录不一致，未执行启动"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn should_start_isolated_quota_gate(settings: &BackendSettings) -> bool {
     !settings.enhancements_enabled && settings.codex_app_standalone_quota_unlock
 }
@@ -1308,6 +1339,11 @@ impl LaunchHooks for DefaultLaunchHooks {
             .with_context(|| {
                 format!("failed to bind helper runtime on {bind_host}:{helper_port}")
             })?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            crate::windows_integration::prevent_socket_inheritance(listener.as_raw_socket())?;
+        }
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "helper.listening",
             serde_json::json!({
@@ -1325,6 +1361,13 @@ impl LaunchHooks for DefaultLaunchHooks {
                     _ = &mut shutdown_rx => break,
                     accepted = listener.accept() => {
                         if let Ok((stream, addr)) = accepted {
+                            #[cfg(windows)]
+                            {
+                                use std::os::windows::io::AsRawSocket;
+                                if crate::windows_integration::prevent_socket_inheritance(stream.as_raw_socket()).is_err() {
+                                    continue;
+                                }
+                            }
                             tokio::spawn(async move {
                                 let _ = handle_helper_connection(stream, Some(addr)).await;
                             });
@@ -1361,13 +1404,19 @@ impl LaunchHooks for DefaultLaunchHooks {
         // 所以多开改为「包上下文里跑 wrapper」：`Invoke-CommandInDesktopPackage
         // -PreventBreakaway` 让 wrapper 及其子进程都带该 AppId 的包身份，wrapper 内再带
         // 上实例自己的 CODEX_HOME / --user-data-dir / 调试端口拉起 exe。该 cmdlet 属
-        // 非契约接口，失败时按下面的 fallback 退回原有按路径启动（至少不比旧行为更差）。
-        if cfg!(windows) && isolated_multi_instance {
+        // 非契约接口，失败时明确报错，不能丢掉目录后另起一份。
+        let explicit_package_launch =
+            instance.requires_packaged_environment() || !launch_extra_args.is_empty();
+        if cfg!(windows) && (isolated_multi_instance || explicit_package_launch) {
+            let package_state = instance
+                .state_dir
+                .clone()
+                .unwrap_or_else(crate::paths::default_app_state_dir);
             match launch_packaged_multi_instance(
                 app_dir,
                 debug_port,
                 &launch_extra_args,
-                instance.state_dir.as_deref(),
+                Some(&package_state),
                 instance.codex_home.as_deref(),
                 instance.sqlite_home.as_deref(),
             )
@@ -1376,14 +1425,8 @@ impl LaunchHooks for DefaultLaunchHooks {
                 Ok(Some(launch)) => return Ok(launch),
                 Ok(None) => {}
                 Err(error) => {
-                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "launcher.packaged_multi_instance_fallback",
-                        serde_json::json!({
-                            "app_dir": app_dir,
-                            "debug_port": debug_port,
-                            "message": format!("{error:#}"),
-                        }),
-                    );
+                    // 显式目录失败不能退回不继承环境的 AUMID，避免访问默认会话库。
+                    return Err(error.context("无法在包上下文中应用显式 Codex 数据目录"));
                 }
             }
         }
@@ -4461,7 +4504,7 @@ pub fn build_packaged_activation(
 ///
 /// 返回 `Ok(None)` 表示「这次不该走包上下文」（例如 app_dir 根本不是已注册包、
 /// 或缺少可用的状态目录），调用方按原路径继续；返回 `Err` 表示包上下文这条路
-/// 试过但失败了，调用方记录诊断后同样退回按路径启动。
+/// 试过但失败了，调用方必须返回错误，避免丢失显式目录或重复启动。
 ///
 /// 成功返回的 `CodexLaunch::Process` 里带的 `debug_port` 是**脚本实际使用**的端口：
 /// wrapper 里重新校验过一次端口可用性，极端竞争下可能与入参不同，注入必须打到
@@ -4484,10 +4527,16 @@ async fn launch_packaged_multi_instance(
         anyhow::bail!("多开实例缺少状态目录，无法准备包上下文 wrapper");
     };
 
-    let arguments = build_codex_arguments(debug_port, extra_args);
-    let user_data_dir = multi_instance_user_data_dir_from_args(&arguments)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| state_dir.join("user-data"));
+    let mut launch_args = extra_args.to_vec();
+    let user_data_dir = multi_instance_user_data_dir_from_args(&launch_args)?;
+    let multi_instance =
+        std::env::var_os("CODEX_PLUS_MULTI_INSTANCE").is_some_and(|value| value == "1");
+    if multi_instance && user_data_dir.is_none() {
+        launch_args.push(format!(
+            "--user-data-dir={}",
+            state_dir.join("user-data").display()
+        ));
+    }
     let resolved_codex_home = codex_home
         .map(Path::to_path_buf)
         .unwrap_or_else(|| codex_plus_default_codex_home());
@@ -4498,17 +4547,18 @@ async fn launch_packaged_multi_instance(
     // 端口选择在写脚本之前定：脚本里的端口就是实例身份的一部分，必须能让调用方
     // 知道（否则注入会打到旧端口）。
     let known_ports = [debug_port, crate::ports::find_available_loopback_port()];
-    let wrapper = crate::packaged_launch::prepare_wrapper_script_with_port(
+    let actual_port = crate::packaged_launch::select_debug_port(debug_port, &known_ports)
+        .ok_or_else(|| anyhow::anyhow!("没有可用的包实例调试端口"))?;
+    let arguments = build_codex_arguments(actual_port, &launch_args);
+    let script = crate::packaged_launch::build_wrapper_script_for_arguments(
         state_dir,
         &executable,
         &resolved_codex_home,
         &resolved_sqlite_home,
-        &user_data_dir,
-        debug_port,
-        &known_ports,
+        &arguments,
+        multi_instance,
     )?;
-    let actual_port = wrapper.debug_port;
-    let wrapper_path = wrapper.path;
+    let wrapper_path = crate::packaged_launch::write_wrapper_script(state_dir, &script)?;
     match crate::packaged_launch::activate_in_package_context(&app_user_model_id, &wrapper_path)
         .await
     {
@@ -4526,52 +4576,32 @@ async fn launch_packaged_multi_instance(
             );
             Ok(Some(CodexLaunch::Process {
                 command: std::iter::once(executable.to_string_lossy().to_string())
-                    .chain(build_codex_arguments(actual_port, extra_args))
+                    .chain(arguments)
                     .collect(),
                 wait_strategy: ProcessWaitStrategy::ExternalWaitCommand,
                 macos_cleanup_policy: None,
             }))
         }
-        Err(error) => {
-            // 包上下文不可用时退回按路径启动：打包版上它很可能仍会失败，
-            // 但至少不比改动前更差，而且失败会由多开 worker 的就绪校验如实报出。
-            match crate::packaged_launch::fallback_direct_launch(
-                &executable,
-                &build_codex_arguments(actual_port, extra_args),
-                state_dir,
-            ) {
-                Ok(pid) => {
-                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "launcher.packaged_multi_instance_direct_fallback",
-                        serde_json::json!({
-                            "process_id": pid,
-                            "debug_port": actual_port,
-                            "message": format!("{error:#}"),
-                        }),
-                    );
-                    Ok(Some(CodexLaunch::Process {
-                        command: std::iter::once(executable.to_string_lossy().to_string())
-                            .chain(build_codex_arguments(actual_port, extra_args))
-                            .collect(),
-                        wait_strategy: ProcessWaitStrategy::ExternalWaitCommand,
-                        macos_cleanup_policy: None,
-                    }))
-                }
-                Err(fallback_error) => Err(error.context(format!(
-                    "包上下文激活失败，按路径兜底启动也失败：{fallback_error:#}"
-                ))),
-            }
-        }
+        Err(error) => Err(error.context("包上下文激活失败，未尝试其他启动路径")),
     }
 }
 
 /// 从启动参数里取出实例自己的 `--user-data-dir`（多开由管理器注入）。
-fn multi_instance_user_data_dir_from_args(args: &[String]) -> Option<String> {
-    args.iter()
-        .find_map(|arg| arg.strip_prefix("--user-data-dir="))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+pub(crate) fn multi_instance_user_data_dir_from_args(args: &[String]) -> anyhow::Result<Option<String>> {
+    let mut result = None;
+    let mut tokens = args.iter();
+    while let Some(token) = tokens.next() {
+        let value = if token == "--user-data-dir" {
+            Some(tokens.next().ok_or_else(|| anyhow::anyhow!("缺少 Electron 数据目录"))?.as_str())
+        } else {
+            token.strip_prefix("--user-data-dir=")
+        };
+        if let Some(value) = value {
+            anyhow::ensure!(result.is_none() && !value.trim().is_empty(), "Electron 数据目录为空或重复");
+            result = Some(value.to_owned());
+        }
+    }
+    Ok(result)
 }
 
 fn codex_plus_default_codex_home() -> PathBuf {
@@ -5630,6 +5660,44 @@ fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> a
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn helper_socket_explicitly_disables_inheritance() {
+        use std::os::windows::io::AsRawSocket;
+        use windows::Win32::Foundation::{
+            GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation,
+        };
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let handle = HANDLE(listener.as_raw_socket() as *mut _);
+        unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }.unwrap();
+        crate::windows_integration::prevent_socket_inheritance(listener.as_raw_socket()).unwrap();
+        let mut flags = 0;
+        unsafe { GetHandleInformation(handle, &mut flags) }.unwrap();
+        assert_eq!(flags & HANDLE_FLAG_INHERIT.0, 0);
+    }
+
+    #[test]
+    fn native_preflight_rejects_missing_or_mismatched_explicit_home() {
+        let temp = tempfile::tempdir().unwrap();
+        for home in [temp.path().join("missing"), temp.path().to_path_buf()] {
+            let options = super::LaunchOptions {
+                codex_home: Some(home),
+                ..Default::default()
+            };
+            assert!(super::validate_launch_native_directories(&options).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_electron_directory_accepts_both_forms_and_rejects_ambiguity() {
+        use super::multi_instance_user_data_dir_from_args as parse;
+        assert_eq!(parse(&["--user-data-dir=C:/test".into()]).unwrap().as_deref(), Some("C:/test"));
+        assert_eq!(parse(&["--user-data-dir".into(), "C:/test".into()]).unwrap().as_deref(), Some("C:/test"));
+        assert!(parse(&["--user-data-dir".into()]).is_err());
+        assert!(parse(&["--user-data-dir=".into()]).is_err());
+        assert!(parse(&["--user-data-dir=C:/one".into(), "--user-data-dir=C:/two".into()]).is_err());
+    }
+
     use super::*;
     use std::sync::atomic::AtomicUsize;
 

@@ -350,6 +350,10 @@ pub struct LaunchReceipt {
 /// 与 start 相同，但只从已就绪的本进程会话返回实际端口，不读取旧状态文件猜测。
 pub fn start_with_receipt(options: LaunchOptions) -> Result<LaunchReceipt> {
     start(options)?;
+    ready_session_receipt()
+}
+
+fn ready_session_receipt() -> Result<LaunchReceipt> {
     let probe = session_probe_slot()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -370,6 +374,14 @@ pub fn resume_if_running(options: LaunchOptions) -> Result<bool> {
     let requested_at_ms = requested_launch_timestamp(&options);
     send_runtime_command(|reply| RuntimeCommand::Start(options, requested_at_ms, true, reply))?;
     Ok(true)
+}
+
+/// 仅 attach 已有桌面，并返回本进程已就绪会话的实际端口。
+pub fn resume_with_receipt(options: LaunchOptions) -> Result<Option<LaunchReceipt>> {
+    if !resume_if_running(options)? {
+        return Ok(None);
+    }
+    ready_session_receipt().map(Some)
 }
 
 /// 释放当前 session 的 helper、watchdog 和浏览器兼容状态，保留官方 Codex。
@@ -761,10 +773,38 @@ async fn activate_and_write_running_status(
     options: &LaunchOptions,
     started_at_ms: u64,
 ) -> Result<()> {
+    let latest = options.status_store.load_latest()?;
     activate_existing_codex_app(options).await?;
-    options.status_store.save_latest(&LaunchStatus {
-        status: "running".to_string(),
-        message: "Existing Codex instance activated".to_string(),
+    options.status_store.save_latest(&activated_launch_status(
+        options,
+        started_at_ms,
+        latest.as_ref(),
+    ))
+}
+
+fn activated_launch_status(
+    options: &LaunchOptions,
+    started_at_ms: u64,
+    latest: Option<&LaunchStatus>,
+) -> LaunchStatus {
+    // 激活窗口没有重新验证增强，不能把同代会话的降级状态升级为成功。
+    let degraded = latest.is_some_and(|latest| {
+        latest.started_at_ms == started_at_ms
+            && latest.debug_port == Some(options.debug_port)
+            && latest.status == "running_degraded"
+    });
+    LaunchStatus {
+        status: if degraded {
+            "running_degraded"
+        } else {
+            "running"
+        }
+        .to_string(),
+        message: if degraded {
+            latest.unwrap().message.clone()
+        } else {
+            "Existing Codex instance activated".to_string()
+        },
         started_at_ms,
         debug_port: Some(options.debug_port),
         helper_port: Some(options.helper_port),
@@ -774,7 +814,7 @@ async fn activate_and_write_running_status(
             .map(|path| path.to_string_lossy().to_string()),
         aumid: None,
         ..LaunchStatus::default()
-    })
+    }
 }
 
 async fn wait_for_session_exit_or_stop(
@@ -988,7 +1028,13 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
             json!({"message": error.to_string(), "phase": "activate_existing"}),
         );
     }
-    let process_ids = codex_plus_core::watcher::find_codex_processes();
+    // 仅激活本次启动返回的目标，不按全局同名进程选择其他窗口。
+    let process_ids: Vec<u32> = launch_result
+        .as_ref()
+        .ok()
+        .and_then(|launch| launch.process_id())
+        .into_iter()
+        .collect();
     #[cfg(windows)]
     let activated = process_ids
         .iter()
@@ -1303,6 +1349,9 @@ impl LaunchHooks for LauncherHooks {
         &self,
         settings: &codex_plus_core::settings::BackendSettings,
     ) -> anyhow::Result<()> {
+        if self.attach_only {
+            return Ok(());
+        }
         self.core
             .ensure_active_protocol_proxy_config(settings)
             .await
@@ -2137,11 +2186,10 @@ mod tests {
             + start;
         let body = &source[start..end];
         let multi_guard = body.find("if multi_instance_mode()").unwrap();
-        let activate = body.find("activate_and_write_running_status(&options").unwrap();
-        assert!(
-            multi_guard < activate,
-            "多开判断必须排在激活已有实例之前"
-        );
+        let activate = body
+            .find("activate_and_write_running_status(&options")
+            .unwrap();
+        assert!(multi_guard < activate, "多开判断必须排在激活已有实例之前");
         assert!(body[multi_guard..activate].contains("anyhow::bail!"));
     }
 
@@ -2773,6 +2821,25 @@ mod tests {
         };
         // 后台恢复不访问 CDP，因此相同的不可用端点也应成功跳过。
         hooks.apply_native_fast_unlock_on_launch(0).await.unwrap();
+    }
+
+    #[test]
+    fn activating_same_generation_keeps_degraded_status() {
+        let options = LaunchOptions::default();
+        let previous = LaunchStatus {
+            status: "running_degraded".into(),
+            message: "injection unavailable".into(),
+            started_at_ms: 7,
+            debug_port: Some(options.debug_port),
+            ..LaunchStatus::default()
+        };
+        let activated = activated_launch_status(&options, 7, Some(&previous));
+        assert_eq!(activated.status, "running_degraded");
+        assert_eq!(activated.message, previous.message);
+        assert_eq!(
+            activated_launch_status(&options, 8, Some(&previous)).status,
+            "running"
+        );
     }
 
     #[tokio::test]

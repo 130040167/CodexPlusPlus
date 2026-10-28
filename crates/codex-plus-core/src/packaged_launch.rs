@@ -201,11 +201,34 @@ fn build_wrapper_script_for_port(
     user_data_dir: &Path,
     port: u16,
 ) -> anyhow::Result<String> {
+    let arguments = vec![
+        format!("--remote-debugging-port={port}"),
+        format!("--remote-allow-origins=http://127.0.0.1:{port}"),
+        format!("--user-data-dir={}", user_data_dir.display()),
+    ];
+    build_wrapper_script_for_arguments(
+        state_dir, executable, codex_home, sqlite_home, &arguments, true,
+    )
+}
+
+/// 完整参数与显式配置目录一同进入包上下文，不强加主实例的 Electron 数据目录。
+pub fn build_wrapper_script_for_arguments(
+    state_dir: &Path,
+    executable: &Path,
+    codex_home: &Path,
+    sqlite_home: &Path,
+    arguments: &[String],
+    multi_instance: bool,
+) -> anyhow::Result<String> {
     let state_dir_literal = batch_path_literal(state_dir)?;
     let executable_literal = batch_path_literal(executable)?;
     let codex_home_literal = batch_path_literal(codex_home)?;
     let sqlite_home_literal = batch_path_literal(sqlite_home)?;
-    let user_data_dir_literal = batch_path_literal(user_data_dir)?;
+    let argument_literals = arguments
+        .iter()
+        .map(|argument| batch_argument_literal(argument))
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .join(" ");
     let executable_dir = executable
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
@@ -220,8 +243,14 @@ fn build_wrapper_script_for_port(
     script.push_str(&format!(
         "set \"CODEX_SQLITE_HOME={sqlite_home_literal}\"\r\n"
     ));
+    if let Some(user_data) = crate::launcher::multi_instance_user_data_dir_from_args(arguments)? {
+        let literal = batch_path_literal(Path::new(&user_data))?;
+        script.push_str(&format!("set \"CODEX_ELECTRON_USER_DATA_PATH={literal}\"\r\n"));
+    }
     script.push_str(&format!("set \"{STATE_DIR_ENV}={state_dir_literal}\"\r\n"));
-    script.push_str("set \"CODEX_PLUS_MULTI_INSTANCE=1\"\r\n");
+    if multi_instance {
+        script.push_str("set \"CODEX_PLUS_MULTI_INSTANCE=1\"\r\n");
+    }
     if let Some(dir) = executable_dir {
         // 尽力把工作目录设到包内 exe 所在目录：Electron 会用相对 cwd 找资源。
         // 失败（ACL 拒绝）时 cmd 只打印错误并继续下一行，不影响启动。
@@ -230,11 +259,20 @@ fn build_wrapper_script_for_port(
     // `start` 的第一个参数是窗口标题，必须是空标题，否则含空格的 exe 路径会被当成标题。
     // `/b` 不新建控制台窗口；`start` 立即返回，cmd 退出后应用继续跑。
     script.push_str(&format!(
-        "start \"\" /b \"{executable_literal}\" --remote-debugging-port={port} \
-         --remote-allow-origins=http://127.0.0.1:{port} --user-data-dir=\"{user_data_dir_literal}\"\r\n"
+        "start \"\" /b \"{executable_literal}\" {argument_literals}\r\n"
     ));
     script.push_str("endlocal\r\n");
     Ok(script)
+}
+
+fn batch_argument_literal(argument: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !argument.contains(['"', '\r', '\n', '\0']),
+        "启动参数包含无法安全传入包脚本的引号或控制字符"
+    );
+    // 每个参数始终加引号；尾部反斜杠翻倍，避免吞掉 Windows argv 的闭合引号。
+    let trailing = argument.chars().rev().take_while(|value| *value == '\\').count();
+    Ok(format!("\"{}{}\"", argument.replace('%', "%%"), "\\".repeat(trailing)))
 }
 
 /// 把 wrapper 内容写进 `<state_dir>/packaged-launch.cmd`，返回脚本路径。
@@ -583,6 +621,23 @@ fn first_non_empty_line(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn main_wrapper_preserves_extra_arguments_without_forcing_instance_defaults() {
+        let script = super::build_wrapper_script_for_arguments(
+            std::path::Path::new("C:/state"),
+            std::path::Path::new("C:/app/ChatGPT.exe"),
+            std::path::Path::new("C:/home"),
+            std::path::Path::new("C:/sqlite"),
+            &["--remote-debugging-port=9001".into(), "--flag=a b&c%".into()],
+            false,
+        ).unwrap();
+        assert!(script.contains("\"--flag=a b&c%%\""));
+        assert!(!script.contains("--user-data-dir"));
+        assert!(!script.contains("CODEX_PLUS_MULTI_INSTANCE"));
+        assert!(super::batch_argument_literal("bad\"argument").is_err());
+        assert_eq!(super::batch_argument_literal("C:\\").unwrap(), "\"C:\\\\\"");
+    }
+
     use super::*;
     use std::cell::Cell;
     use std::io::{Read, Write};
@@ -661,11 +716,11 @@ mod tests {
         assert!(script.contains("set \"CODEX_PLUS_MULTI_INSTANCE=1\"\r\n"));
         assert!(script.contains(&format!("--remote-debugging-port={port}")));
         assert!(script.contains(&format!("--remote-allow-origins=http://127.0.0.1:{port}")));
-        assert!(script.contains("--user-data-dir=\"/Users/a b/Codex++/instance 1/user-data\""));
+        assert!(script.contains("\"--user-data-dir=/Users/a b/Codex++/instance 1/user-data\""));
         // start 的第一个参数必须是空标题，否则含空格的 exe 路径会被当成窗口标题。
         assert!(script.contains(&format!(
             "start \"\" /b \"/Applications/Codex App/Contents/app/ChatGPT.exe\" \
-             --remote-debugging-port={port}"
+             \"--remote-debugging-port={port}\""
         )));
         assert!(script.contains("cd /d \"/Applications/Codex App/Contents/app\"\r\n"));
         // .cmd 一律 CRLF：LF 的批处理在 cmd.exe 上行为不可靠。
@@ -692,7 +747,7 @@ mod tests {
 
         assert!(script.contains(&format!("start \"\" /b \"{WINDOWS_EXE}\"")));
         assert!(script.contains(
-            "--user-data-dir=\"C:\\Users\\a b\\AppData\\Local\\Codex++\\instance 1\\user data\""
+            "\"--user-data-dir=C:\\Users\\a b\\AppData\\Local\\Codex++\\instance 1\\user data\""
         ));
         assert!(script.contains("set \"CODEX_HOME=C:\\Users\\a b\\.codex\""));
     }
@@ -843,7 +898,7 @@ mod tests {
         assert_eq!(path, state_dir.join(WRAPPER_FILE_NAME));
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains(&format!("--remote-debugging-port={port}")));
-        assert!(content.contains("--user-data-dir=\"/user data\""));
+        assert!(content.contains("\"--user-data-dir=/user data\""));
     }
 
     #[test]

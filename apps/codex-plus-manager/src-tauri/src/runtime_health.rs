@@ -39,13 +39,19 @@ impl RuntimeHealth {
 
 /// 仅在读取概览时检查本地端点，不启动服务、不请求供应商，也不创建后台监控线程。
 pub fn inspect(settings: &BackendSettings, latest: Option<&LaunchStatus>) -> RuntimeHealth {
-    inspect_with(
+    let running = crate::commands::main_codex_running(latest);
+    let mut health = inspect_with(
         settings,
         latest,
-        !codex_plus_core::watcher::find_codex_processes().is_empty(),
+        running.unwrap_or(false),
         helper_available,
         codex_plus_core::cdp::endpoint_available,
-    )
+    );
+    if running.is_none() {
+        health.codex_app.status = "not_checked";
+        health.codex_app.message = "无法确认主 Codex 身份，请重新连接或手动关闭后启动";
+    }
+    health
 }
 
 fn inspect_with(

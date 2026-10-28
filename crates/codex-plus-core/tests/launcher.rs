@@ -48,8 +48,8 @@ async fn launch_receipt_status_and_injection_follow_final_wrapper_port() {
             debug_port: 19450,
             helper_port: 19452,
             status_store: StatusStore::new(temp.path().join("status.json")),
-            codex_home: Some(temp.path().join("codex-home")),
-            sqlite_home: Some(temp.path().join("sqlite-home")),
+            codex_home: None,
+            sqlite_home: None,
             state_dir: Some(temp.path().join("state")),
         },
         &hooks,
@@ -730,6 +730,25 @@ fn launcher_builds_debug_arguments_and_commands() {
     let command = build_codex_command(&app_dir, 9229, &[]);
     assert_eq!(command[1], "--remote-debugging-port=9229");
     assert_eq!(command[2], "--remote-allow-origins=http://127.0.0.1:9229");
+}
+
+#[test]
+fn explicit_native_directories_require_packaged_environment() {
+    use codex_plus_core::launcher::LaunchInstance;
+    assert!(!LaunchInstance::default().requires_packaged_environment());
+    for (codex_home, sqlite_home) in [
+        (Some(PathBuf::from("isolated-home")), None),
+        (None, Some(PathBuf::from("isolated-sqlite"))),
+    ] {
+        assert!(
+            LaunchInstance {
+                codex_home,
+                sqlite_home,
+                ..Default::default()
+            }
+            .requires_packaged_environment()
+        );
+    }
 }
 
 #[test]

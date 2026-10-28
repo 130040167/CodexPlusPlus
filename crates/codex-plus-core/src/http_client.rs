@@ -1,5 +1,13 @@
 use anyhow::Context;
 
+pub fn local_helper_client() -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?)
+}
+
 fn apply_configured_ca_certificate(
     mut builder: reqwest::ClientBuilder,
 ) -> anyhow::Result<reqwest::ClientBuilder> {

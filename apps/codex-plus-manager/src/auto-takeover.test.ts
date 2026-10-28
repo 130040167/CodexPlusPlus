@@ -135,9 +135,13 @@ test("daemon waits for the manager startup sequence before probing", () => {
 test("supervisor lifecycle hooks survive refactors", () => {
   // 这两个钩子被并发编辑覆盖过一次：功能编译通过、命令也在，但守护线程从不启动，
   // 表现为「开关打开了却什么都不发生」。静态断言是最便宜的兜底。
+  const resumeSource = readFileSync(
+    path.join(root, "src-tauri/src/commands/multi_instance_resume.rs"), "utf8",
+  );
   assert.ok(
-    libSource.includes("auto_takeover::start_supervisor()"),
-    "lib.rs setup 必须调用 start_supervisor()，否则开关打开也不会启动守护线程",
+    libSource.includes("commands::multi_instance_resume::resume_on_manager_start(")
+      && resumeSource.includes("crate::auto_takeover::start_supervisor()"),
+    "setup 必须经续接协调入口启动守护，避免抢跑或丢失启动钩子",
   );
   assert.ok(
     libSource.includes("auto_takeover::stop_supervisor()"),

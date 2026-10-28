@@ -2719,7 +2719,7 @@ export function App() {
         // 界面要给出「启动失败 + 原因」，只留运行中的会让它彻底消失。
         setMultiLaunchInstances(
           Array.isArray(result.instances)
-            ? result.instances.filter((instance) => multiLaunchInstanceRunning(instance) || Boolean(multiLaunchInstanceFailure(instance)))
+            ? result.instances.filter((instance) => multiLaunchInstanceStatus(instance) !== "stopped")
             : [],
         );
         if (!silent && !isSuccessStatus(result.status)) showNotice(t("当前运行实例"), result.message, result.status);
@@ -2736,7 +2736,7 @@ export function App() {
     setMultiLaunchActionPending(instance.instanceId);
     try {
       const result = await run(() => call<MultiLaunchResult>("restart_codex_multi_instance", {
-        request: { instanceId: instance.instanceId },
+        request: { instanceId: instance.instanceId, generation: instance.generation },
       }));
       if (result) showNotice(t("重启 Codex 实例"), result.message, result.status);
       await refreshMultiLaunchInstances(true);
@@ -2752,7 +2752,7 @@ export function App() {
     setMultiLaunchActionPending(instance.instanceId);
     try {
       const result = await run(() => call<CommandResult<{ instanceId?: string }>>("stop_codex_multi_instance", {
-        request: { instanceId: instance.instanceId },
+        request: { instanceId: instance.instanceId, generation: instance.generation },
       }));
       if (result) showNotice(t("结束 Codex 实例"), result.message, result.status);
       await refreshMultiLaunchInstances(true);
@@ -2835,12 +2835,13 @@ export function App() {
   };
 
   const launchCommand = async (command: "launch_codex_plus" | "restart_codex_plus" | "stop_codex_plus", syncActiveRelay = false) => {
+    const currentLaunch = command === "launch_codex_plus" ? null : overview?.latest_launch;
     const result = await run(() =>
       call<LaunchCommandResult>(command, {
         request: {
-          appPath: launchForm.appPath,
-          debugPort: numberOrDefault(launchForm.debugPort, 9229),
-          helperPort: numberOrDefault(launchForm.helperPort, 57321),
+          appPath: currentLaunch?.codex_app || launchForm.appPath,
+          debugPort: currentLaunch?.debug_port ?? numberOrDefault(launchForm.debugPort, 9229),
+          helperPort: currentLaunch?.helper_port ?? numberOrDefault(launchForm.helperPort, 57321),
           syncActiveRelay,
         },
       }),
@@ -7273,6 +7274,7 @@ function CodexMultiLaunchScreen({
                 {actions.multiLaunchInstances.map((instance) => {
                   const status = multiLaunchInstanceStatus(instance);
                   const running = multiLaunchInstanceRunning(instance);
+                  const canStop = running || status === "unknown";
                   const pending = actions.multiLaunchActionPending === instance.instanceId;
                   const label = formatMultiLaunchInstanceLabel(instance, { main: t("主 Codex"), fallback: t("Codex 实例") });
                   // 启动失败的原因必须让用户看得见：Windows 上多开曾经完全不吭声。
@@ -7282,7 +7284,7 @@ function CodexMultiLaunchScreen({
                     typeof instance.pid === "number" ? `PID ${instance.pid}` : "",
                     typeof instance.debugPort === "number" ? `CDP ${instance.debugPort}` : "",
                     typeof instance.helperPort === "number" ? `API ${instance.helperPort}` : "",
-                    failure ? `${t("启动失败")}：${failure}` : "",
+                    failure ? `${instance.launchResult?.status === "cleanup_failed" ? t("失败") : t("启动失败")}：${failure}` : "",
                   ].filter(Boolean).join(" · ");
                   return (
                     <div className="multi-launch-instance-card" data-instance-id={instance.instanceId} key={instance.instanceId}>
@@ -7303,10 +7305,10 @@ function CodexMultiLaunchScreen({
                           {pending ? t("处理中") : t("重启")}
                         </Button>
                         <Button
-                          disabled={!running || pending}
+                          disabled={!canStop || pending}
                           onClick={() => void actions.stopMultiLaunchInstance(instance)}
                           size="sm"
-                          title={running ? t("结束此 Codex 实例") : t("实例当前未运行")}
+                          title={canStop ? t("结束此 Codex 实例") : t("实例当前未运行")}
                           variant="secondary"
                         >
                           <PowerOff className="h-4 w-4" />

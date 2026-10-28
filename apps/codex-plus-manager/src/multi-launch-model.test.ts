@@ -27,7 +27,8 @@ describe("Codex 多开运行实例模型", () => {
 
   it("状态归一化并识别可结束的运行态", () => {
     assert.equal(multiLaunchInstanceStatus(instance({ status: "  RUNNING " })), "running");
-    assert.equal(multiLaunchInstanceRunning(instance({ status: "starting" })), true);
+    assert.equal(multiLaunchInstanceRunning(instance({ status: "starting" })), false);
+    assert.equal(multiLaunchInstanceRunning(instance({ status: "unknown", running: false })), false);
     assert.equal(multiLaunchInstanceRunning(instance({ status: "running_degraded" })), true);
     assert.equal(multiLaunchInstanceRunning(instance({ status: "stopped", running: true })), true);
     assert.equal(multiLaunchInstanceRunning(instance({ status: "stopped" })), false);
@@ -61,5 +62,17 @@ describe("Codex 多开运行实例模型", () => {
       ),
       "",
     );
+  });
+
+  it("清理失败保留原因而不冒充运行中", () => {
+    const uncertain = instance({
+      status: "unknown",
+      running: false,
+      generation: 7,
+      launchResult: { status: "cleanup_failed", message: "自有进程尚未确认退出" },
+    });
+    assert.equal(multiLaunchInstanceStatus(uncertain), "unknown");
+    assert.equal(multiLaunchInstanceRunning(uncertain), false);
+    assert.equal(multiLaunchInstanceFailure(uncertain), "自有进程尚未确认退出");
   });
 });
