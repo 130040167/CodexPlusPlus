@@ -1265,9 +1265,16 @@ pub async fn list_agent_sessions(agent: String) -> CommandResult<AgentSessions> 
     ok("会话已加载。", AgentSessions { sessions })
 }
 
+/// 删掉的会话移到了哪里。CommandResult 会把 payload 摊平，只能是结构体，不能是字符串。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedSession {
+    pub trash_path: Option<String>,
+}
+
 /// 删除 Claude Code / Grok 的一个本地会话：移进废纸篓，可以找回。Codex 的会话走 `delete_local_session`。
 #[tauri::command]
-pub fn delete_agent_session(agent: String, id: String) -> CommandResult<Option<String>> {
+pub fn delete_agent_session(agent: String, id: String) -> CommandResult<DeletedSession> {
     use codex_plus_core::gateway::sessions;
     let trash = sessions::default_trash_dir();
     let result = match agent.as_str() {
@@ -1286,9 +1293,11 @@ pub fn delete_agent_session(agent: String, id: String) -> CommandResult<Option<S
     match result {
         Ok(path) => ok(
             "会话已移到废纸篓，需要时可以从废纸篓找回。",
-            Some(path.display().to_string()),
+            DeletedSession {
+                trash_path: Some(path.display().to_string()),
+            },
         ),
-        Err(error) => failed(&format!("删除失败：{error:#}"), None),
+        Err(error) => failed(&format!("删除失败：{error:#}"), DeletedSession::default()),
     }
 }
 
@@ -1312,13 +1321,17 @@ pub fn resume_agent_session(
 }
 
 /// 用系统默认浏览器打开登录页。
+/// Windows 不能用 `cmd /c start`：授权地址里的 `&` 会被 cmd 当成命令分隔符，参数全丢。
 fn open_in_browser(url: &str) {
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(url).spawn();
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/c", "start", "", url])
-        .spawn();
+    if let Err(error) = codex_plus_core::windows_open_url(url) {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "gateway.login_browser_failed",
+            serde_json::json!({ "error": format!("{error:#}") }),
+        );
+    }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
@@ -1350,6 +1363,15 @@ where
     T: Send + 'static,
     F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
 {
+    // 先中止上一次、等它放掉回调端口，再开始新的：不然新登录绑端口时旧的监听可能还没释放。
+    let previous = login_slot().take();
+    if let Some((_, abort_previous)) = previous {
+        abort_previous();
+        let _ = tauri::async_runtime::spawn_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_millis(200))
+        })
+        .await;
+    }
     let handle = tauri::async_runtime::spawn(login);
     let id = LOGIN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     {

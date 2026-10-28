@@ -365,8 +365,12 @@ pub fn shift_day(day: &str, delta: i64) -> String {
 }
 
 /// 请求结束时记一笔（从请求日志条目取数）。失败不影响请求本身。
+/// 在后台线程里记：请求结束时在本地服务的单线程运行时里调用，整份文件重写加 fsync 会卡住别的流。
 pub fn record_entry(entry: &RequestLogEntry) {
-    let _ = record_entry_in(&UsageStore::default(), entry);
+    let entry = entry.clone();
+    std::thread::spawn(move || {
+        let _ = record_entry_in(&UsageStore::default(), &entry);
+    });
 }
 
 pub fn record_entry_in(store: &UsageStore, entry: &RequestLogEntry) -> anyhow::Result<()> {

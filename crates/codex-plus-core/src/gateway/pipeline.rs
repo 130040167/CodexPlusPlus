@@ -77,6 +77,8 @@ pub struct GatewayRequest<'a> {
     pub live_request_id: Option<&'a str>,
     pub auto_retry: bool,
     pub is_stream: bool,
+    /// 发给上游的 Responses 路径：`/responses`，或旧版 Codex 远程压缩的 `/responses/compact`。
+    pub upstream_path: &'a str,
 }
 
 /// 依次尝试路由计划里的候选，并把路由过程记到路由动态里。
@@ -373,7 +375,7 @@ async fn attempt_pipeline(
         settings.clone(),
         forced,
         request.user_agent,
-        "/responses",
+        request.upstream_path,
         session_headers,
         request.live_request_id,
     )

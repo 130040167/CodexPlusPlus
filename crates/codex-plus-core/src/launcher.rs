@@ -2737,6 +2737,7 @@ pub(crate) async fn handle_protocol_proxy_connection(
             request_log.set_agent(agent);
             crate::gateway::server::open_responses_for_agent(
                 agent,
+                path,
                 request_body,
                 request_user_agent,
                 session_headers,

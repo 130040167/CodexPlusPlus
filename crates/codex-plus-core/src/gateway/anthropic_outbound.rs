@@ -102,11 +102,14 @@ impl ResponsesSseToAnthropicSse {
         data.extend_from_slice(bytes);
         let text = match std::str::from_utf8(&data) {
             Ok(text) => text.to_string(),
-            Err(error) => {
+            // 只有结尾那个字符还没收完（error_len 为 None）才留到下一块；中间夹着坏字节时按替换字符处理，
+            // 不然之后每一块都在第 0 个字节解码失败，整个流就卡住不再输出。
+            Err(error) if error.error_len().is_none() => {
                 let valid = error.valid_up_to();
                 self.utf8_remainder = data[valid..].to_vec();
                 String::from_utf8_lossy(&data[..valid]).to_string()
             }
+            Err(_) => String::from_utf8_lossy(&data).to_string(),
         };
         self.buffer.push_str(&text);
         let mut output = String::new();
@@ -955,6 +958,15 @@ mod tests {
             json!({"type":"response.output_item.done","output_index":2,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Bash","arguments":"{\"command\":\"ls\"}"}}),
             json!({"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":1000,"input_tokens_details":{"cached_tokens":800},"output_tokens":50}}}),
         ]) + "data: [DONE]\n\n"
+    }
+
+    #[test]
+    fn invalid_utf8_byte_does_not_stall_the_stream() {
+        let mut transformer = ResponsesSseToAnthropicSse::new("m", 0);
+        let first = transformer.push_bytes(b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n\xff");
+        let second = transformer.push_bytes(b"\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hi\"}\n\n");
+        let text = String::from_utf8_lossy(&[first, second].concat()).to_string();
+        assert!(text.contains("hi"), "坏字节之后的事件照常输出：{text}");
     }
 
     #[test]

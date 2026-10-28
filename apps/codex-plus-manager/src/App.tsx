@@ -121,7 +121,7 @@ import { AppDialogHost, appAlert, appConfirm, appPrompt } from "./app-dialog";
 import { GatewayPage, type GatewayTab } from "./GatewayPage";
 import { AgentGlyph, HubOverview, useGatewayPayload } from "./HubOverview";
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
-import { SessionsView } from "./GatewaySessions";
+import { SessionsView, sessionDeleteSucceeded } from "./GatewaySessions";
 import { agentName, formatRequestCost, maskAccountName, usageRangeStart, type GatewayResult, type UsageCost, type UsageRange } from "./gateway-model";
 import { SessionAgentTabs, type SessionTab } from "./SessionAgentTabs";
 import { UsageTabs, onOpenRequestLog, type RequestLogFocus } from "./UsageTabs";
@@ -2424,7 +2424,7 @@ export function App() {
       showResultNotice(t("会话删除"), result);
       await refreshLocalSessions(true, localSessions?.offset ?? 0);
     }
-    return !!result && isSuccessStatus(result.status);
+    return !!result && sessionDeleteSucceeded(result.status);
   };
 
   const deleteLocalSessions = async (sessions: LocalSession[]) => {
@@ -2448,7 +2448,7 @@ export function App() {
     const failed: string[] = [];
     for (const session of uniqueSessions) {
       const result = await run(() => requestDeleteLocalSession(session));
-      if (result && isSuccessStatus(result.status)) {
+      if (result && sessionDeleteSucceeded(result.status)) {
         succeeded += 1;
       } else {
         failed.push(session.title || session.id);

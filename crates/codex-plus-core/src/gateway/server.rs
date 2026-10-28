@@ -146,7 +146,9 @@ pub(crate) async fn handle(
             handle_claude_count_tokens(stream, &gateway, headers, body).await
         }
         (_, "GET", "/models") => handle_models(stream, &gateway, &agent).await,
-        (ToolId::Grok | ToolId::Codex, "POST", "/responses") => {
+        // 旧版 Codex 以 ChatGPT 身份接入时远程压缩发 `/responses/compact`，原路径一路带给上游。
+        (ToolId::Grok | ToolId::Codex, "POST", "/responses")
+        | (ToolId::Codex, "POST", "/responses/compact") => {
             let request_body = match decode_protocol_proxy_request_body(
                 body,
                 header_value_from_headers(headers, "content-encoding").as_deref(),
@@ -325,7 +327,14 @@ async fn handle_images(
         } else {
             upstream.content_type.clone()
         };
-        let mut answer = upstream.read_body().await?;
+        let mut answer = match upstream.read_body().await {
+            Ok(answer) => answer,
+            // 读答复时断了：和连不上一样，换下一家。
+            Err(error) => {
+                last_error = format!("{}：{error:#}", target.relay.name);
+                continue;
+            }
+        };
         if upstream.is_success() && gateway.inline_image_urls_for(agent) {
             // 只给了图片链接的，下载下来补成 b64_json（Codex 只认它）；走这家自己的代理。
             if let Ok(client) =
@@ -364,6 +373,7 @@ async fn handle_images(
 /// Grok 等 Responses 客户端：按 Agent 绑定选上游，返回值交给 Codex 代理的输出链路。
 pub(crate) async fn open_responses_for_agent(
     agent: &ToolId,
+    request_path: &str,
     request_body: &str,
     user_agent: Option<&str>,
     session_headers: ProxySessionHeaders<'_>,
@@ -391,6 +401,11 @@ pub(crate) async fn open_responses_for_agent(
             live_request_id,
             auto_retry: true,
             is_stream: false,
+            upstream_path: if request_path.ends_with("/responses/compact") {
+                "/responses/compact"
+            } else {
+                "/responses"
+            },
         },
     )
     .await?;
@@ -573,6 +588,7 @@ async fn handle_claude_messages(
             // 「请求避震」对新旧两套同时生效（只在用户打开时起作用）。
             auto_retry: true,
             is_stream: wants_stream,
+            upstream_path: "/responses",
         },
     )
     .await;
@@ -641,9 +657,10 @@ async fn handle_claude_messages(
             let upstream_json = response.content_type.to_ascii_lowercase().contains("json");
             if wants_stream && upstream_json {
                 // 上游没理会 stream:true、回了整段 JSON：转成完整消息后再拆成事件流。
-                let body = response.read_body().await?;
-                let responses_json =
-                    non_stream_body_to_responses(response.wire_api, &body, Some(&responses_body))?;
+                let responses_json = match read_pipeline_json(&mut response, &responses_body).await {
+                    Ok(json) => json,
+                    Err(error) => return write_bad_upstream(stream, &mut request_log, &error).await,
+                };
                 request_log.record_usage_json(&serde_json::to_vec(&responses_json)?);
                 request_log.record_stream(None, None, None);
                 let message = responses_json_to_anthropic(&responses_json, &client_model);
@@ -692,9 +709,10 @@ async fn handle_claude_messages(
                 stream.shutdown().await?;
                 return Ok(());
             }
-            let body = response.read_body().await?;
-            let responses_json =
-                non_stream_body_to_responses(response.wire_api, &body, Some(&responses_body))?;
+            let responses_json = match read_pipeline_json(&mut response, &responses_body).await {
+                Ok(json) => json,
+                Err(error) => return write_bad_upstream(stream, &mut request_log, &error).await,
+            };
             request_log.record_usage_json(&serde_json::to_vec(&responses_json)?);
             request_log.record_stream(None, None, None);
             let message = responses_json_to_anthropic(&responses_json, &client_model);
@@ -703,6 +721,30 @@ async fn handle_claude_messages(
             Ok(())
         }
     }
+}
+
+/// 读完上游的整段答复并转成 Responses JSON。
+async fn read_pipeline_json(
+    response: &mut crate::protocol_proxy::UpstreamProxyResponse,
+    responses_body: &Value,
+) -> anyhow::Result<Value> {
+    let body = response.read_body().await?;
+    non_stream_body_to_responses(response.wire_api, &body, Some(responses_body))
+}
+
+/// 上游答了 200 但读不出来或不是预期的格式（例如一段 HTML）：给客户端回 502 和原因，
+/// 请求日志记成失败，而不是直接断开连接、日志里还是 200。
+async fn write_bad_upstream(
+    stream: &mut tokio::net::TcpStream,
+    request_log: &mut ProxyRequestLog,
+    error: &anyhow::Error,
+) -> anyhow::Result<()> {
+    let message = format!("上游答复无法解析：{error:#}");
+    request_log.record_error("502 Bad Gateway", message.clone());
+    let body = serde_json::to_vec(&anthropic_error_body(502, &message))?;
+    write_http_response(stream, "502 Bad Gateway", JSON, &body).await?;
+    stream.shutdown().await?;
+    Ok(())
 }
 
 fn is_client_rejection(error: &anyhow::Error) -> bool {
@@ -818,6 +860,10 @@ struct AnthropicSseObserver {
 impl AnthropicSseObserver {
     fn push(&mut self, bytes: &[u8]) {
         self.buffer.push_str(&String::from_utf8_lossy(bytes));
+        // 有的上游用 CRLF 分隔事件；缓冲里只留着没切完的尾巴，统一换成 LF 再切。
+        if self.buffer.contains('\r') {
+            self.buffer = self.buffer.replace("\r\n", "\n");
+        }
         while let Some(index) = self.buffer.find("\n\n") {
             let block = self.buffer[..index].to_string();
             self.buffer.drain(..index + 2);

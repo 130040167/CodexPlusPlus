@@ -1909,6 +1909,10 @@ fn backup(path: &Path, contents: &str) -> anyhow::Result<PathBuf> {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "config".to_string());
     let backup_path = path.with_file_name(format!("{file_name}.codex-plus-backup-{stamp}"));
+    // 同一秒里连着保存两次：留第一份（改动前的原样）。直接覆盖写又不截断，会留下旧内容的尾巴。
+    if backup_path.exists() {
+        return Ok(backup_path);
+    }
     let mut file = open_private(&backup_path)?;
     file.write_all(contents.as_bytes())?;
     prune_backups(path);

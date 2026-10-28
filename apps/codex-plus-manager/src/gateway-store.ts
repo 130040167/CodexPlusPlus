@@ -13,6 +13,14 @@ export function publishGatewayPayload(result: GatewayResult) {
   for (const listener of listeners) listener(shared.payload);
 }
 
+/** 订阅别处推来的新数据（不轮询）；返回取消订阅。 */
+export function subscribeGatewayPayload(listener: (payload: GatewayPayload) => void): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
 export function useGatewayPayload(intervalMs: number): GatewayPayload | null {
   const [payload, setPayload] = useState<GatewayPayload | null>(shared.payload);
   useEffect(() => {

@@ -1092,6 +1092,8 @@ export const EN_PLAIN: Record<string, string> = {
   "例如 主力聚合池": "e.g. Primary aggregate pool",
   "供": "P",
   "供应商": "Provider",
+  "24 小时请求": "Requests (24h)",
+  "断开失败": "Disconnect failed",
   "清空统计": "Clear stats",
   "清空日志": "Clear log",
   "全部状态": "All statuses",
@@ -2540,6 +2542,7 @@ export const EN_PLAIN: Record<string, string> = {
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "经 Codex++ 网关 · {0} 个模型": "Via Codex++ gateway · {0} models",
   "生图 {0} 次": "{0} images",
   "供应商：{0}": "Provider: {0}",
   "模型：{0}": "Model: {0}",

@@ -48,7 +48,7 @@ import { shortProviderName } from "./GatewayModelMatrix";
 import { TopbarActions } from "./TopbarActions";
 import { GatewayNavContext } from "./gateway-store";
 import { useEscapeLayer } from "./use-escape-layer";
-import { publishGatewayPayload } from "./gateway-store";
+import { publishGatewayPayload, subscribeGatewayPayload } from "./gateway-store";
 import "./GatewayPage.css";
 
 type Tab = "agents" | "sessions" | "providers" | "routing" | "usage" | "gateway";
@@ -105,6 +105,15 @@ export function GatewayPage({
   };
 
   const run: Run = makeRun(setBusy, accept, notify);
+  // 别处改了网关数据（如模型下拉里收藏）也同步过来，不然这里还拿着旧数据，下次保存会把新改的盖掉。
+  useEffect(
+    () =>
+      subscribeGatewayPayload((next) => {
+        memo.payload = next;
+        setPayload(next);
+      }),
+    [],
+  );
 
   const refresh = async (silent = true) => {
     setBusy("load");
