@@ -1368,6 +1368,7 @@ fn launch_codex_multi_instance_blocking(request: CodexMultiLaunchRequest) -> Com
         .arg("--codex-plus-multi-worker")
         .arg(&worker_options_path)
         .env("HOME", &worker_home)
+        .env_remove("CODEX_ELECTRON_USER_DATA_PATH")
         .env("CODEX_HOME", &codex_home)
         .env("CODEX_SQLITE_HOME", &sqlite_home)
         .env("CODEX_PLUS_MULTI_INSTANCE", "1")
@@ -2060,9 +2061,14 @@ fn multi_instance_user_data_dir(slug: &str) -> PathBuf {
 }
 
 fn multi_instance_user_data_dir_with_root(slug: &str, electron_root: Option<PathBuf>) -> PathBuf {
-    // 显式隔离目录也约束多开；子实例仍各用独立子目录。
+    // 多开根与主实例 userData 同级，避免主实例清理时连带删除多开数据。
     if let Some(root) = electron_root.filter(|root| !root.as_os_str().is_empty()) {
-        return root.join("multi").join(slug);
+        let parent = root.parent().unwrap_or_else(|| Path::new("."));
+        let name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("CodexPlusPlus");
+        return parent.join(format!("{name}-multi")).join(slug);
     }
     directories::BaseDirs::new()
         .map(|dirs| {
@@ -9589,8 +9595,9 @@ mod tests {
         let root = temp.path().join("electron data");
         let first = multi_instance_user_data_dir_with_root("instance-a", Some(root.clone()));
         let second = multi_instance_user_data_dir_with_root("instance-b", Some(root.clone()));
-        assert_eq!(first, root.join("multi").join("instance-a"));
-        assert_eq!(second, root.join("multi").join("instance-b"));
+        let multi_root = root.parent().unwrap().join("electron data-multi");
+        assert_eq!(first, multi_root.join("instance-a"));
+        assert_eq!(second, multi_root.join("instance-b"));
         assert_ne!(first, second);
         assert!(!first.exists());
     }

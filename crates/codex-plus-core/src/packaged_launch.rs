@@ -668,6 +668,16 @@ fn direct_launch_command(executable: &Path, args: &[String], state_dir: &Path) -
         .stderr(Stdio::null())
         .env(STATE_DIR_ENV, state_dir)
         .env("CODEX_PLUS_MULTI_INSTANCE", "1");
+    if let Some(user_data_dir) = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--user-data-dir="))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        command.env("CODEX_ELECTRON_USER_DATA_PATH", user_data_dir);
+    } else {
+        command.env_remove("CODEX_ELECTRON_USER_DATA_PATH");
+    }
     if let Some(dir) = executable
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
@@ -1225,6 +1235,25 @@ mod tests {
         assert!(envs.contains(&(
             std::ffi::OsStr::new("CODEX_PLUS_MULTI_INSTANCE"),
             Some(std::ffi::OsStr::new("1"))
+        )));
+        assert!(envs.contains(&(
+            std::ffi::OsStr::new("CODEX_ELECTRON_USER_DATA_PATH"),
+            Some(std::ffi::OsStr::new("/user data"))
+        )));
+    }
+
+    #[test]
+    fn direct_launch_command_clears_inherited_electron_user_data_without_an_override() {
+        let command = direct_launch_command(
+            Path::new("/Applications/Codex App/ChatGPT.exe"),
+            &[],
+            Path::new("/state/instance 1"),
+        );
+
+        let envs = command.get_envs().collect::<Vec<_>>();
+        assert!(envs.contains(&(
+            std::ffi::OsStr::new("CODEX_ELECTRON_USER_DATA_PATH"),
+            None
         )));
     }
 

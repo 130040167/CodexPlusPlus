@@ -1538,6 +1538,11 @@ impl LaunchHooks for DefaultLaunchHooks {
             .args(&command[1..])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(user_data_dir) = multi_instance_user_data_dir_from_args(&launch_extra_args) {
+            child_command.env("CODEX_ELECTRON_USER_DATA_PATH", user_data_dir);
+        } else if isolated_multi_instance {
+            child_command.env_remove("CODEX_ELECTRON_USER_DATA_PATH");
+        }
         // 实例状态目录要显式传给子进程：多开原先只靠给 worker 换 HOME，
         // 而 Windows 上 `directories` 走 SHGetKnownFolderPath、不读 HOME。
         if let Some(state_dir) = instance.state_dir.as_deref() {
