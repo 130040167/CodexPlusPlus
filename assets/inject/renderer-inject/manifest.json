@@ -68,7 +68,7 @@
     {
       "name": "80-session-share.js",
       "description": "会话运行时工具；分享入口已撤出管理器扫描",
-      "lines": 768
+      "lines": 860
     },
     {
       "name": "81-capacity-auto-retry.js",
@@ -133,7 +133,7 @@
     {
       "name": "95-conversation-view.js",
       "description": "会话视图运行时、官方用量策略重写、扫描主循环",
-      "lines": 651
+      "lines": 653
     },
     {
       "name": "97-agent-pet.js",
