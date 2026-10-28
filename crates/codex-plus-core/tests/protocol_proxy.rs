@@ -12,7 +12,8 @@ use codex_plus_core::protocol_proxy::{
     open_responses_proxy_request_with_settings,
     open_responses_proxy_request_with_settings_for_path,
     open_responses_proxy_request_with_settings_for_path_and_session_headers,
-    request_has_compaction_trigger, responses_compact_url, responses_error_from_upstream,
+    annotate_gateway_upstream_error, request_has_compaction_trigger, responses_compact_url,
+    responses_error_from_upstream, upstream_error_log_text,
     responses_to_chat_completions, responses_to_chat_completions_with_options,
     send_upstream_request_with_header_timeout, upstream_header_timeout, upstream_http_client,
     upstream_stream_header_timeout, wrap_non_stream_response_as_compaction,
@@ -3746,6 +3747,66 @@ fn upstream_chat_error_is_regularized_as_responses_error_envelope() {
     assert_eq!(text_error["error"]["message"], "<html>bad gateway</html>");
     assert_eq!(text_error["error"]["type"], "upstream_error");
     assert_eq!(text_error["error"]["code"], "502");
+}
+
+/// #2741：Gemini 的 OpenAI 兼容端点把错误包在单元素数组里，拆开后消息、类型、状态码都能取到；
+/// 顶层 `status` 字符串不当类型（只认 error 对象里的）。
+#[test]
+fn array_wrapped_google_error_is_unwrapped() {
+    let body = br#"[{"error":{"code":400,"message":"Invalid JSON payload received. Unknown name \"store\": Cannot find field.","status":"INVALID_ARGUMENT"}}]"#;
+    let error = responses_error_from_upstream(400, "application/json; charset=UTF-8", body);
+    assert_eq!(
+        error["error"]["message"],
+        "Invalid JSON payload received. Unknown name \"store\": Cannot find field."
+    );
+    assert_eq!(error["error"]["type"], "INVALID_ARGUMENT");
+    assert_eq!(error["error"]["code"], "400");
+
+    let top_level = responses_error_from_upstream(
+        502,
+        "application/json",
+        br#"{"status":"failed","message":"relay down"}"#,
+    );
+    assert_eq!(top_level["error"]["message"], "relay down");
+    assert_eq!(top_level["error"]["type"], "upstream_error");
+}
+
+/// #2741：网关转给 Agent 的错误补上供应商、上游模型、协议和状态码；type / code 不动。
+/// 请求日志里带上状态码、类型和响应体原文。
+#[test]
+fn gateway_upstream_error_names_provider_model_and_status() {
+    let body = br#"{"error":{"message":"bad tool","type":"invalid_request_error","code":"unsupported_tool","details":[{"field":"tools[3].type"}]}}"#;
+    let mut error = responses_error_from_upstream(400, "application/json", body);
+    let trace = codex_plus_core::request_log::RequestTrace {
+        relay_id: "gem".to_string(),
+        relay_name: "Gemini 中转".to_string(),
+        upstream_model: "gemini-3-pro".to_string(),
+        wire_api: "Responses".to_string(),
+        ..Default::default()
+    };
+    let log = upstream_error_log_text(400, &error, body);
+    assert!(
+        log.starts_with("HTTP 400 · type=invalid_request_error · code=unsupported_tool：bad tool"),
+        "{log}"
+    );
+    assert!(log.contains("tools[3].type"), "日志里要有原文：{log}");
+
+    annotate_gateway_upstream_error(&mut error, 400, Some(&trace));
+    assert_eq!(
+        error["error"]["message"],
+        "bad tool（网关上游：Gemini 中转 · 模型 gemini-3-pro · Responses · HTTP 400）"
+    );
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(error["error"]["code"], "unsupported_tool");
+
+    // 没有路由信息（网关自己拒绝的请求）时原样不动。
+    let mut own = responses_error_from_upstream(
+        429,
+        "application/json",
+        br#"{"error":{"message":"cooling"}}"#,
+    );
+    annotate_gateway_upstream_error(&mut own, 429, None);
+    assert_eq!(own["error"]["message"], "cooling");
 }
 
 #[test]
