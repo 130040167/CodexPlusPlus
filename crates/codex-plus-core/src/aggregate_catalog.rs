@@ -199,6 +199,21 @@ fn resolve_by_default_provider(
 /// Codex 自动审批（「替我审批」）请求使用的固定模型 slug。
 pub const CODEX_AUTO_REVIEW_MODEL: &str = "codex-auto-review";
 
+/// 写进 Codex 模型目录的 `visibility`：审批模型只给「替我审批」内部用，和官方目录一样
+/// 标成 `hide`，不进 Codex 的模型选择器；`<供应商 id>/codex-auto-review` 同样隐藏。
+pub fn catalog_visibility(slug: &str) -> &'static str {
+    let slug = slug.trim();
+    let is_review = slug.eq_ignore_ascii_case(CODEX_AUTO_REVIEW_MODEL)
+        || slug
+            .rsplit_once('/')
+            .is_some_and(|(_, model)| model.eq_ignore_ascii_case(CODEX_AUTO_REVIEW_MODEL));
+    if is_review {
+        "hide"
+    } else {
+        "list"
+    }
+}
+
 /// 聚合的「审批成员」（#2703）：活动聚合（按模型聚合或轮转池都算）指定了审批成员时，
 /// `codex-auto-review` 只交给这个成员，模型取它的「自动审批模型」，没填用它的默认模型
 /// （第三方上游不认识 codex-auto-review，原样转发只会报错）。
@@ -466,7 +481,9 @@ pub fn build_catalog_json(
             // 聚合会切换上游；经典子代理任务使用明文，避免跨成员解密失败。
             model["multi_agent_version"] = json!("v1");
             model["use_responses_lite"] = json!(false);
-            model["visibility"] = json!("list");
+            model["visibility"] = json!(catalog_visibility(
+                model["slug"].as_str().unwrap_or_default()
+            ));
             model["priority"] = json!(1000 + models.len());
             models.push(model);
         }
