@@ -10,7 +10,7 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use crate::responses_exec::{
-    ToolAdaptation, adapt_response_for, decode_exec_input, restore_namespaced_event,
+    ToolAdaptation, adapt_response_for, decode_exec_input, restore_adapted_event,
 };
 
 const MAX_CALL_ARGUMENTS: usize = 1024 * 1024;
@@ -247,7 +247,7 @@ impl ExecSseAdapter {
 
         let mut event: Value = serde_json::from_str(&payload)
             .map_err(|_| self.reject("invalid JSON in Responses SSE frame"))?;
-        restore_namespaced_event(&mut event, &self.adaptation.namespaced);
+        restore_adapted_event(&mut event, &self.adaptation);
         let event_type = event
             .get("type")
             .and_then(Value::as_str)
