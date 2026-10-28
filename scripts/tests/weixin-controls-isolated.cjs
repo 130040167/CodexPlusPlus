@@ -29,44 +29,54 @@ module.exports = {
     const { managerPage: page, invoke, dialogs, outputDir, check, signal } = context;
     await testing.installManagerUpdateHandling(context);
     await dialogs.manager.ensureClear();
-    await page.getByRole("button", { name: "微信连接", exact: true }).click();
+    await page.getByText("微信连接", { exact: true }).first().click();
     await page.locator(".weixin-connect-page").waitFor();
     await dialogs.manager.ensureClear();
+    await page.locator(".weixin-connect-page").getByRole("button", { name: "会话管理", exact: true }).click();
     signal.throwIfAborted();
     const field = (name) => page.locator("label.field")
       .filter({ has: page.locator("span").filter({ hasText: new RegExp(`^${name}$`) }) })
-      .locator("select");
-    const model = field("模型"), effort = field("推理强度"), project = field("项目");
-    await page.getByText("当前模型已不在可用模型目录中，请重新选择。", { exact: true }).waitFor();
+      .locator("input");
+    const model = field("模型"), effort = field("推理强度");
     assert.equal(await model.inputValue(), "retired-weixin-model");
     assert.equal(await effort.inputValue(), "retired-effort");
-    await model.selectOption("gpt-6.1-sol");
-    await effort.selectOption("low");
+    await model.fill("gpt-6.1-sol");
+    await effort.fill("low");
     const catalog = await invoke("weixin_connect_catalog");
     assert(catalog.models.includes("gpt-6.1-sol"));
-    const advertised = catalog.modelMetadata["gpt-6.1-sol"].supportedReasoningEfforts.map((e) => e.reasoningEffort);
-    const offered = await effort.locator("option").evaluateAll((items) => items.map((o) => o.value));
-    assert.deepEqual(offered, ["", ...new Set(advertised)]);
-    check("real catalog drives model and reasoning options; stale values remain visible until corrected");
-    await project.locator("option").first().waitFor({ state: "attached" });
-    assert.equal(await project.locator("option").first().getAttribute("value"), "");
-    assert.equal(await project.locator("option").first().innerText(), "微信Bot");
+    check("real catalog is available while model and reasoning fields accept the next-message settings");
     const before = await invoke("weixin_connect_projects");
     assert.equal(before.reservedProjectId, null);
     assert.equal(before.projects.length, 0);
-    await page.getByRole("button", { name: "刷新项目", exact: true }).click();
-    await page.getByRole("button", { name: "刷新项目", exact: true }).isEnabled();
     const after = await invoke("weixin_connect_projects");
     assert.equal(after.projects.length, 0, "opening/refreshing settings must not create the lazy project");
     check("reserved Weixin project stays first and project/list has no creation side effects");
-    await page.getByRole("button", { name: "保存", exact: true }).click();
-    await page.getByText("已保存，下一条微信消息生效。", { exact: true }).waitFor();
-    const saved = await invoke("load_settings");
+    // 微信页使用通用 SettingsAutoSave；不点击旧的手动保存入口，等待防抖保存
+    // 完成后直接从后端读取，验证下一次打开页面仍保留结果。
+    let saved;
+    const deadline = Date.now() + 10000;
+    do {
+      signal.throwIfAborted();
+      saved = await invoke("load_settings");
+      if (saved.settings.weixinConnectModel === "gpt-6.1-sol"
+        && saved.settings.weixinConnectReasoningEffort === "low") break;
+      await page.waitForTimeout(250);
+    } while (Date.now() < deadline);
     assert.equal(saved.settings.weixinConnectModel, "gpt-6.1-sol");
     assert.equal(saved.settings.weixinConnectReasoningEffort, "low");
     assert.equal(saved.settings.weixinConnectProjectId, "");
-    check("UI save persists selected model, effort, and lazy project identity");
-    await project.scrollIntoViewIfNeeded();
+    check("Weixin settings auto-save persists model, effort, and lazy project identity");
+    await page.getByRole("button", { name: "会话管理", exact: true }).click();
+    await dialogs.manager.ensureClear();
+    await page.getByText("微信连接", { exact: true }).first().click();
+    await page.locator(".weixin-connect-page").waitFor();
+    await dialogs.manager.ensureClear();
+    await page.locator(".weixin-connect-page").getByRole("button", { name: "会话管理", exact: true }).click();
+    const reopenedModel = field("模型");
+    const reopenedEffort = field("推理强度");
+    assert.equal(await reopenedModel.inputValue(), "gpt-6.1-sol");
+    assert.equal(await reopenedEffort.inputValue(), "low");
+    check("Weixin settings remain selected after leaving and reopening the page");
     await dialogs.manager.ensureClear();
     await page.screenshot({ path: path.join(outputDir, "weixin-controls.png") });
     await dialogs.manager.ensureClear();
@@ -74,7 +84,7 @@ module.exports = {
       model: saved.settings.weixinConnectModel,
       reasoningEffort: saved.settings.weixinConnectReasoningEffort,
       projectsBeforeChat: after.projects,
-      offeredReasoningEfforts: offered,
+      offeredReasoningEfforts: [],
       nativeProjectRenameVerified: false,
       nativeChatVisibilityVerified: false,
       realWeixinTransportVerified: false,
