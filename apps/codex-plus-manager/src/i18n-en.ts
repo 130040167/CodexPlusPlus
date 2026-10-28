@@ -1741,6 +1741,18 @@ export const EN_PLAIN: Record<string, string> = {
   "Work 视图要求 ChatGPT 账号身份，纯 API Key 下发送消息会报 Work browser access requires an authenticated account。开启后每次启动 Codex 前把详情模式写回 Codex；重新启动 Codex 后生效。": "Work view requires a ChatGPT account identity; with a Pure API key, sending a message fails with \"Work browser access requires an authenticated account\". When enabled, the detail mode is switched back to Codex before each launch. Restart Codex to apply.",
   "自动审批模型": "Auto-review model",
   "留空则原样转发 codex-auto-review": "Leave empty to forward codex-auto-review unchanged",
+  "Multi Agent 协议": "Multi-Agent protocol",
+  "自动（推荐）": "Auto (recommended)",
+  "v1（经典，转 Chat 中转适用）": "v1 (classic; use for Chat-completions relays)",
+  "v2（新版，需上游支持加密载荷）": "v2 (new; requires an upstream that supports encrypted payloads)",
+  "子代理协议的供应商级默认；模型元数据里的 multi_agent_version 声明优先于它。选 v1 会在使用该供应商期间压下 [features] multi_agent_v2，切走时自动还原。仅对直连供应商生效，Codex 经新版网关接入时由网关配置决定。仅新会话生效。":
+    "Provider-level default for the sub-agent protocol; a per-model multi_agent_version declaration in model metadata takes precedence. Choosing v1 forces [features] multi_agent_v2 off only while this provider is active and restores it when you switch away. Direct providers only; when Codex connects through the new gateway this is decided by the gateway configuration. New sessions only.",
+  "跟随供应商设置": "Follow provider setting",
+  "v1（经典）": "v1 (classic)",
+  "v2（新版）": "v2 (new)",
+  "关闭子代理": "Disable sub-agents",
+  "v2 需上游支持加密子代理载荷，转 Chat 协议的中转请选 v1；仅新会话生效。":
+    "v2 requires an upstream that supports encrypted sub-agent payloads; pick v1 for Chat-completions relays. New sessions only.",
   "切换模型后旧会话跟随新默认": "Existing sessions follow the new default model",
   "切换供应商或默认模型后，下次启动前把仍停在旧默认模型的会话改为新默认；手动选过模型的会话不变。保存设置后生效。":
     "After switching provider or default model, sessions still on the previous default move to the new default before the next launch. Sessions with a manually chosen model are untouched. Takes effect after saving settings.",

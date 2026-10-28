@@ -710,8 +710,15 @@ pub(crate) fn build_member_catalog(profile: &RelayProfile) -> anyhow::Result<Val
         return Ok(json!({ "models": [] }));
     }
     let fallback = parse_window_token(&profile.context_window);
-    let catalog_json =
-        build_model_catalog_json_with_capabilities(&entries, fallback, None, Some(false), false);
+    // 聚合不适用供应商级 Multi-Agent 选择（#2683）：成员可能跨上游，保持钉 v1。
+    let catalog_json = build_model_catalog_json_with_capabilities(
+        &entries,
+        fallback,
+        None,
+        Some(false),
+        false,
+        None,
+    );
     let metadata = crate::relay_config::parse_model_metadata_map(&profile.model_metadata)?;
     let catalog_json =
         crate::relay_config::apply_model_metadata_overrides(&catalog_json, &metadata)?;
@@ -790,13 +797,25 @@ pub fn multi_agent_v2_enabled(config_text: &str) -> bool {
     })
 }
 
-/// 模型聚合处于活动状态、且用户用 `[features] multi_agent_v2` 覆盖了经典子代理设置时，
-/// 返回一条可展示给管理器的提示；无冲突或读取失败时返回 None。
+/// 用户配置与 `[features] multi_agent_v2` 冲突时返回一条可展示给管理器的提示；
+/// 无冲突或读取失败时返回 None。覆盖两类场景：
+/// - 模型聚合活动时被闸门覆盖经典子代理设置（原有行为）；
+/// - 普通供应商显式选择 v1（#2683）后被闸门重新打开——切换时 Codex++ 已写
+///   `multi_agent_v2 = false` 压闸，这里捕捉之后用户手改或 Codex 回写的漂移。
 pub fn subagent_conflict_warning(home: &Path, settings: &BackendSettings) -> Option<String> {
-    active_model_aggregation(settings)?;
     let config_text = std::fs::read_to_string(home.join("config.toml")).ok()?;
+    if active_model_aggregation(settings).is_some() {
+        return multi_agent_v2_enabled(&config_text).then(|| {
+            "检测到 config.toml 已启用 [features] multi_agent_v2：它优先于模型聚合目录中的经典子代理设置，跨供应商的子代理任务可能报无法解密。如遇到该问题，请移除或关闭该项，或让子代理与主代理使用同一供应商的模型。"
+                .to_string()
+        });
+    }
+    let profile = settings.active_relay_profile();
+    if profile.multi_agent.trim() != "v1" {
+        return None;
+    }
     multi_agent_v2_enabled(&config_text).then(|| {
-        "检测到 config.toml 已启用 [features] multi_agent_v2：它优先于模型聚合目录中的经典子代理设置，跨供应商的子代理任务可能报无法解密。如遇到该问题，请移除或关闭该项，或让子代理与主代理使用同一供应商的模型。"
+        "当前供应商已显式选择 Multi-Agent 协议 v1，但 config.toml 里 [features] multi_agent_v2 处于开启状态：它会覆盖目录中的 v1 声明，子代理任务可能无法与第三方上游通信。请关闭该项，或重新保存一次该供应商让 Codex++ 自动压下闸门。"
             .to_string()
     })
 }
@@ -1292,5 +1311,50 @@ mod tests {
         // 关闭模型聚合（故障转移类型）后不再提示。
         settings.aggregate_relay_profiles[0].model_aggregation_enabled = false;
         assert!(subagent_conflict_warning(temp.path(), &settings).is_none());
+    }
+
+    /// #2683：普通供应商显式 v1 后闸门被重新打开 → 提示；闸门关闭或未选择 v1 → 静默。
+    #[test]
+    fn subagent_conflict_warning_covers_provider_level_v1_choice() {
+        let temp = tempfile::tempdir().unwrap();
+        // 无聚合：普通 API 供应商。
+        let mut settings = settings();
+        settings.aggregate_relay_profiles.clear();
+        settings.active_aggregate_relay_id = String::new();
+        settings.active_relay_id = "relay-api".to_string();
+        settings.relay_profiles = vec![RelayProfile {
+            id: "relay-api".to_string(),
+            name: "API".to_string(),
+            multi_agent: "v1".to_string(),
+            ..RelayProfile::default()
+        }];
+
+        // 未显式选 v1 或闸门关闭时都静默。
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "model = \"x\"\n[features]\nmulti_agent_v2 = true\n",
+        )
+        .unwrap();
+        settings.relay_profiles[0].multi_agent = String::new();
+        assert!(subagent_conflict_warning(temp.path(), &settings).is_none());
+        settings.relay_profiles[0].multi_agent = "v2".to_string();
+        assert!(subagent_conflict_warning(temp.path(), &settings).is_none());
+        settings.relay_profiles[0].multi_agent = "v1".to_string();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "model = \"x\"\n[features]\nmulti_agent_v2 = false\n",
+        )
+        .unwrap();
+        assert!(subagent_conflict_warning(temp.path(), &settings).is_none());
+
+        // v1 + 闸门开启 → 提示（用户手改或 Codex 回写造成的漂移）。
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "model = \"x\"\n[features]\nmulti_agent_v2 = true\n",
+        )
+        .unwrap();
+        let warning = subagent_conflict_warning(temp.path(), &settings).unwrap();
+        assert!(warning.contains("v1"), "{warning}");
+        assert!(warning.contains("multi_agent_v2"), "{warning}");
     }
 }
