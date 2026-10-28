@@ -1563,6 +1563,14 @@ pub fn sync_codex_identity(ctx: &ApplyContext) -> anyhow::Result<bool> {
     if settings.active_relay_id != CODEX_GATEWAY_RELAY_ID {
         return Ok(false);
     }
+    if let Some(found) = taken_over(ctx, &ToolId::Codex) {
+        log_taken_over(
+            "gateway.identity_sync_skipped_taken_over",
+            &ToolId::Codex,
+            &found,
+        );
+        return Ok(false);
+    }
     let keeps_login =
         settings.active_relay_session_provider() == crate::settings::RelaySessionProvider::Openai;
     let can_sign_in = codex_signed_in(&ctx.codex_home) || lendable_login(&gateway).is_some();
@@ -1574,9 +1582,11 @@ pub fn sync_codex_identity(ctx: &ApplyContext) -> anyhow::Result<bool> {
 }
 
 /// 网关端口变了（例如 Windows 端口被占后换了新端口）：重写所有开着的 Agent 配置。
+/// 某个 Agent 失败时继续其它的，只记录成功项的端口，最后返回第一个错误。
 pub fn reapply_if_port_changed(ctx: &ApplyContext) -> anyhow::Result<usize> {
-    let mut gateway = ctx.gateway.load()?;
+    let gateway = ctx.gateway.load()?;
     let mut changed = 0;
+    let mut first_error = None;
     let agents = gateway
         .bindings
         .iter()
@@ -1588,24 +1598,31 @@ pub fn reapply_if_port_changed(ctx: &ApplyContext) -> anyhow::Result<usize> {
         if taken_over(ctx, &agent).is_some() {
             continue;
         }
-        let Some(binding) = gateway.bindings.get_mut(agent.as_str()) else {
+        let Some(binding) = gateway.bindings.get(agent.as_str()) else {
             continue;
         };
+        let mut binding = binding.clone();
         binding.restore.applied_port = Some(ctx.port);
-        let binding = binding.clone();
-        write_agent_config(ctx, &agent, &binding)?;
-        changed += 1;
-    }
-    if changed > 0 {
-        // 写配置时可能改过 gateway.json：只把端口记到最新的那份上。
-        ctx.gateway.update(|latest| {
-            for (agent, binding) in &gateway.bindings {
-                if let Some(target) = latest.bindings.get_mut(agent) {
-                    target.restore.applied_port = binding.restore.applied_port;
+        let result = write_agent_config(ctx, &agent, &binding).and_then(|_| {
+            // 写配置时可能改过 gateway.json：只更新本次成功项，不回写旧快照。
+            ctx.gateway.update(|latest| {
+                if let Some(target) = latest.bindings.get_mut(agent.as_str()) {
+                    target.restore.applied_port = Some(ctx.port);
                 }
-            }
+                Ok(())
+            })?;
             Ok(())
-        })?;
+        });
+        match result {
+            Ok(()) => changed += 1,
+            Err(error) => {
+                first_error
+                    .get_or_insert(error.context(format!("重新接入 {} 失败", agent.as_str())));
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
     }
     Ok(changed)
 }

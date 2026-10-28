@@ -4,7 +4,7 @@
 
 use codex_plus_core::gateway::apply::{
     ApplyContext, ProviderInput, create_provider, disable_binding, enable_binding, reapply_enabled,
-    refresh_enabled, restore_all_for_exit,
+    reapply_if_port_changed, refresh_enabled, restore_all_for_exit, sync_codex_identity,
 };
 use codex_plus_core::gateway::store::{AgentBinding, GatewayStore};
 use codex_plus_core::settings::{BackendSettings, RelayMode, RelayProfile, RelayProtocol};
@@ -666,4 +666,95 @@ fn startup_reapply_continues_after_one_agent_fails() {
     assert_eq!(reapply_enabled(ctx).unwrap(), 2);
     assert!(!ctx.gateway.load().unwrap().restored_at_exit);
     assert!(read(&ctx.claude.claude_home.join("settings.json")).contains("/gw/claude"));
+}
+
+fn port_change_with_failed_agent(failed: ToolId) {
+    let mut fixture = fixture(57429);
+    let ctx = &fixture.ctx;
+    seed_codex_direct(ctx);
+    for agent in [ToolId::Claude, ToolId::Codex, ToolId::Grok] {
+        enable_binding(ctx, &agent, binding()).unwrap();
+    }
+    let claude_store = read(&ctx.claude.store_path);
+    if failed == ToolId::Claude {
+        std::fs::write(&ctx.claude.store_path, "{ invalid json").unwrap();
+    } else {
+        let mut settings = ctx.settings.load().unwrap();
+        settings.relay_profiles_enabled = false;
+        ctx.settings.save(&settings).unwrap();
+    }
+    fixture.ctx.port = 57430;
+    let ctx = &fixture.ctx;
+    let error = reapply_if_port_changed(ctx).unwrap_err();
+    assert!(format!("{error:#}").contains(failed.as_str()), "{error:#}");
+    let gateway = ctx.gateway.load().unwrap();
+    for (agent, path) in [
+        (ToolId::Claude, ctx.claude.claude_home.join("settings.json")),
+        (ToolId::Codex, ctx.codex_home.join("config.toml")),
+        (ToolId::Grok, ctx.grok_home.join("config.toml")),
+    ] {
+        let expected = if agent == failed { 57429 } else { 57430 };
+        assert_eq!(
+            gateway.binding(&agent).unwrap().restore.applied_port,
+            Some(expected),
+            "{agent:?}"
+        );
+        assert!(read(&path).contains(&expected.to_string()), "{agent:?}");
+    }
+    if failed == ToolId::Claude {
+        std::fs::write(&ctx.claude.store_path, claude_store).unwrap();
+    } else {
+        let mut settings = ctx.settings.load().unwrap();
+        settings.relay_profiles_enabled = true;
+        ctx.settings.save(&settings).unwrap();
+    }
+    assert_eq!(reapply_if_port_changed(ctx).unwrap(), 1, "只重试失败项");
+    assert_eq!(reapply_if_port_changed(ctx).unwrap(), 0);
+}
+
+#[test]
+fn port_change_continues_after_first_agent_fails() {
+    port_change_with_failed_agent(ToolId::Claude);
+}
+
+#[test]
+fn port_change_records_successes_before_and_after_failed_codex() {
+    port_change_with_failed_agent(ToolId::Codex);
+}
+
+#[test]
+fn startup_identity_sync_preserves_external_takeover_in_both_reapply_paths() {
+    for restore_on_exit in [false, true] {
+        let fixture = fixture(57431);
+        let ctx = &fixture.ctx;
+        seed_codex_direct(ctx);
+        enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+        ctx.gateway
+            .update(|gateway| {
+                gateway.restore_on_exit = restore_on_exit;
+                Ok(())
+            })
+            .unwrap();
+        let config_path = ctx.codex_home.join("config.toml");
+        let auth_path = ctx.codex_home.join("auth.json");
+        let other = "model_provider = \"other\"\n[model_providers.other]\nbase_url = \"https://other.test/v1\"\n";
+        let login = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fake-new-login","refresh_token":"fake-refresh","account_id":"fake-account"}}"#;
+        std::fs::write(&config_path, other).unwrap();
+        std::fs::write(&auth_path, login).unwrap();
+        let settings = ctx.settings.revision().unwrap();
+        let gateway = read(&ctx.gateway.path);
+        if restore_on_exit {
+            assert_eq!(reapply_enabled(ctx).unwrap(), 0);
+        } else {
+            let mut moved = ctx.clone();
+            moved.port += 1;
+            assert_eq!(reapply_if_port_changed(&moved).unwrap(), 0);
+        }
+        assert!(!sync_codex_identity(ctx).unwrap());
+        assert_eq!(read(&config_path), other);
+        assert_eq!(read(&auth_path), login);
+        assert_eq!(ctx.settings.revision().unwrap(), settings);
+        assert_eq!(read(&ctx.gateway.path), gateway);
+        assert!(binding_enabled(ctx, &ToolId::Codex));
+    }
 }
