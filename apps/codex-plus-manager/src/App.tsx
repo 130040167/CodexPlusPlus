@@ -605,6 +605,8 @@ type RelayAggregateConfig = {
   defaultRelayId?: string;
   /** 把默认成员的官方登录同步进 Codex（写 auth.json 的 tokens 段）。默认关。 */
   syncDefaultMemberLogin?: boolean;
+  /** 审批成员（#2703）：codex-auto-review 只发给它，模型取它的「自动审批模型」；空串表示未设置。 */
+  autoReviewRelayId?: string;
 };
 type AggregateRelayMember = {
   relayId: string;
@@ -621,6 +623,8 @@ type AggregateRelayProfile = {
   defaultRelayId?: string;
   /** 把默认成员的官方登录同步进 Codex（auth.json 的 tokens 段）。默认关。 */
   syncDefaultMemberLogin?: boolean;
+  /** 审批成员（#2703），空串表示未设置。 */
+  autoReviewRelayId?: string;
 };
 
 type RelayContextSelection = {
@@ -13558,6 +13562,32 @@ function AggregateRelayProfileEditor({
           )}
         </div>
       ) : null}
+      {routeTargetOptions.length ? (
+        <div className="aggregate-default-provider aggregate-auto-review">
+          <Field label={t("审批成员")}>
+            <AppSelect
+              label={t("审批成员")}
+              onChange={(value) => updateAggregate({ ...aggregate, autoReviewRelayId: value })}
+              options={[
+                { value: "", label: t("不单独指定"), hint: t("审批请求跟普通请求一样交给默认成员或轮转选中的成员") },
+                ...routeTargetOptions.map((option) => {
+                  const candidate = candidates.find((item) => item.id === option.value);
+                  const reviewModel = candidate?.autoReviewModel?.trim() || candidate?.model.trim() || "";
+                  return {
+                    value: option.value,
+                    label: option.label,
+                    hint: reviewModel ? tf("审批请求发给它，模型 {0}", [reviewModel]) : t("审批请求发给它"),
+                  };
+                }),
+              ]}
+              value={aggregate.autoReviewRelayId ?? ""}
+            />
+            <p className="field-hint">
+              {t("Codex「替我审批」的请求（codex-auto-review）只发给这个成员，模型取它的「自动审批模型」，没填用它的默认模型。默认成员是官方登录时，指定一个 API 成员可避免审批消耗官方额度。")}
+            </p>
+          </Field>
+        </div>
+      ) : null}
       {!modelMode ? <div className="aggregate-routes">
         <div className="aggregate-routes-head">
           <div>
@@ -16608,6 +16638,7 @@ function hydrateAggregateRelayProfile(profile: RelayProfile, aggregate: Aggregat
       routes: normalizeAggregateRoutes(aggregate.routes ?? []),
       defaultRelayId: aggregate.defaultRelayId ?? "",
       syncDefaultMemberLogin: aggregate.syncDefaultMemberLogin === true,
+      autoReviewRelayId: aggregate.autoReviewRelayId ?? "",
     },
   };
 }
@@ -17643,6 +17674,7 @@ function normalizeAggregateProfilesFromRelayProfiles(profiles: RelayProfile[]): 
       })),
       defaultRelayId: aggregate.defaultRelayId ?? "",
       syncDefaultMemberLogin: aggregate.syncDefaultMemberLogin === true,
+      autoReviewRelayId: aggregate.autoReviewRelayId ?? "",
     };
   });
 }
@@ -17989,6 +18021,11 @@ function normalizeAggregateConfig(
     aggregate?.defaultRelayId,
     new Set(members.map((member) => member.profileId)),
   );
+  // 审批成员同样必须是当前成员；成员被移出时清空为「未设置」（#2703）。
+  const autoReviewRelayId = normalizeAggregateDefaultRelayId(
+    aggregate?.autoReviewRelayId,
+    new Set(members.map((member) => member.profileId)),
+  );
   return {
     strategy: modelAggregationEnabled ? "failover" : strategy,
     modelAggregationEnabled,
@@ -17996,6 +18033,7 @@ function normalizeAggregateConfig(
     routes,
     defaultRelayId,
     syncDefaultMemberLogin: aggregate?.syncDefaultMemberLogin === true,
+    autoReviewRelayId,
   };
 }
 

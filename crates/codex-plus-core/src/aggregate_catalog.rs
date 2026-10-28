@@ -196,6 +196,75 @@ fn resolve_by_default_provider(
     }))
 }
 
+/// Codex 自动审批（「替我审批」）请求使用的固定模型 slug。
+pub const CODEX_AUTO_REVIEW_MODEL: &str = "codex-auto-review";
+
+/// 聚合的「审批成员」（#2703）：活动聚合（按模型聚合或轮转池都算）指定了审批成员时，
+/// `codex-auto-review` 只交给这个成员，模型取它的「自动审批模型」，没填用它的默认模型
+/// （第三方上游不认识 codex-auto-review，原样转发只会报错）。
+///
+/// 未设置或请求不是审批请求时返回 Ok(None)，调用方照原有规则路由。
+/// 设置了但成员不可用（被移出成员、供应商被删、未就绪）时硬报错：
+/// 用户指定审批成员就是不想让审批落到别的成员（例如官方登录）上，不能静默回落。
+pub fn resolve_auto_review_member(
+    settings: &BackendSettings,
+    requested: &str,
+) -> anyhow::Result<Option<AggregateModelBinding>> {
+    if requested.trim() != CODEX_AUTO_REVIEW_MODEL {
+        return Ok(None);
+    }
+    let Some(aggregate) = settings.active_aggregate_relay_profile() else {
+        return Ok(None);
+    };
+    let relay_id = aggregate.auto_review_relay_id.trim();
+    if relay_id.is_empty() {
+        return Ok(None);
+    }
+    if !aggregate
+        .members
+        .iter()
+        .any(|member| member.relay_id == relay_id)
+    {
+        anyhow::bail!(
+            "聚合的审批成员（{relay_id}）已不是聚合成员：请到聚合供应商里重新选择审批成员，或清空让审批请求按原规则路由"
+        );
+    }
+    let Some(relay) = settings
+        .relay_profiles
+        .iter()
+        .find(|relay| relay.id == relay_id)
+    else {
+        anyhow::bail!("聚合的审批成员当前不可用：成员供应商不存在（{relay_id}），请检查聚合配置");
+    };
+    if !crate::relay_rotation::member_relay_ready(relay) {
+        anyhow::bail!(
+            "聚合的审批成员「{}」当前不可用：需要可用的 API 地址与认证配置，或完成官方登录",
+            relay.name
+        );
+    }
+    let configured = relay.auto_review_model.trim();
+    let upstream_model = if configured.is_empty() {
+        crate::relay_config::relay_profile_model(relay)
+            .trim()
+            .to_string()
+    } else {
+        configured.to_string()
+    };
+    if upstream_model.is_empty() {
+        anyhow::bail!(
+            "聚合的审批成员「{}」没有可用的模型：请给它填写「自动审批模型」或默认模型",
+            relay.name
+        );
+    }
+    // 不记诊断日志：请求日志里已有成员与上游模型，逐请求记录只会把诊断文件刷大（#2681）。
+    Ok(Some(AggregateModelBinding {
+        catalog_model: requested.trim().to_string(),
+        relay_id: relay.id.clone(),
+        upstream_model,
+        relay: relay.clone(),
+    }))
+}
+
 /// 默认供应商配置有效（指向当前成员）时，解析不到的模型名都能兜底转发；
 /// 供「最近使用」模型清理判断：此时任何目录外的名字都还有可能被服务，不再按目录清理。
 pub fn default_backs_unbound_models(aggregate: &AggregateRelayProfile) -> bool {
@@ -907,6 +976,7 @@ mod tests {
             session_provider: crate::settings::RelaySessionProvider::Custom,
             model_aggregation_enabled: true,
             sync_default_member_login: false,
+            auto_review_relay_id: String::new(),
             strategy: AggregateRelayStrategy::Failover,
             members: vec![
                 AggregateRelayMember {
@@ -1148,6 +1218,31 @@ mod tests {
             .expect("裸名交给默认供应商");
         assert_eq!(binding.relay_id, "deepseek");
         assert_eq!(binding.upstream_model, "deepseek-reasoner");
+    }
+
+    /// #2703：审批成员只接 codex-auto-review；未设置时不接管；成员未就绪时点名报错，不回落。
+    #[test]
+    fn auto_review_member_only_takes_review_requests() {
+        let mut settings = settings();
+        assert!(resolve_auto_review_member(&settings, "codex-auto-review").unwrap().is_none());
+
+        settings.aggregate_relay_profiles[0].auto_review_relay_id = "deepseek".to_string();
+        assert!(resolve_auto_review_member(&settings, "deepseek-reasoner").unwrap().is_none());
+        let binding = resolve_auto_review_member(&settings, "codex-auto-review")
+            .unwrap()
+            .expect("审批请求交给审批成员");
+        assert_eq!(binding.relay_id, "deepseek");
+        assert_eq!(binding.upstream_model, "deepseek-chat", "没填审批模型时用默认模型");
+
+        settings.relay_profiles[0].auto_review_model = " deepseek-reasoner ".to_string();
+        let binding = resolve_auto_review_member(&settings, "codex-auto-review")
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.upstream_model, "deepseek-reasoner");
+
+        settings.relay_profiles[0].api_key = String::new();
+        let error = resolve_auto_review_member(&settings, "codex-auto-review").unwrap_err();
+        assert!(error.to_string().contains("DeepSeek"), "{error}");
     }
 
     /// 活动目录发布的模型 ID：聚合是 `cpx-*`，普通供应商是它自己的目录条目加路由源模型名。

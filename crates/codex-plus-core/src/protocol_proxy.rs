@@ -3356,10 +3356,17 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         .map(str::trim)
         .unwrap_or("")
         .to_string();
+    // 聚合指定了审批成员（#2703）时，codex-auto-review 先按它解析，
+    // 不再交给默认成员 / 轮转（默认成员是官方登录时会消耗官方额度）。
     let aggregate_model = match if forced.is_some() {
         Ok(None)
     } else {
-        crate::aggregate_catalog::resolve_active_model(&settings, &source_model)
+        crate::aggregate_catalog::resolve_auto_review_member(&settings, &source_model).and_then(
+            |binding| match binding {
+                Some(binding) => Ok(Some(binding)),
+                None => crate::aggregate_catalog::resolve_active_model(&settings, &source_model),
+            },
+        )
     } {
         Ok(binding) => binding,
         Err(error) => {
@@ -5104,7 +5111,7 @@ fn project_strict_reasoning_history(body: &mut Value) -> anyhow::Result<()> {
 }
 
 /// Codex 自动审批（「替我审批」）请求使用的固定模型 slug。
-const CODEX_AUTO_REVIEW_MODEL: &str = "codex-auto-review";
+const CODEX_AUTO_REVIEW_MODEL: &str = crate::aggregate_catalog::CODEX_AUTO_REVIEW_MODEL;
 
 /// codex-auto-review 的改写目标：供应商配置了审批模型（#1446）时返回它，否则 `None`。
 /// 目录外模型映射（#1183）也用它判断是否让路，两处共用同一条规则。
@@ -6689,6 +6696,72 @@ pub(crate) fn http_status_line(status: u16) -> String {
     }
 }
 
+/// 网关里的上游失败（#2741）：Codex 只显示错误消息，池里有好几家时看不出是哪一家、
+/// 哪个模型、什么状态码出的错。在消息末尾补上这些；`type` / `code` 不动——Codex 按它们
+/// 判断重试与提示文案。没有路由信息（请求没发到任何上游）时不改。
+pub fn annotate_gateway_upstream_error(
+    error: &mut Value,
+    status_code: u16,
+    trace: Option<&crate::request_log::RequestTrace>,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    let relay = if trace.relay_name.trim().is_empty() {
+        trace.relay_id.trim()
+    } else {
+        trace.relay_name.trim()
+    };
+    if relay.is_empty() {
+        return;
+    }
+    let mut origin = format!("网关上游：{relay}");
+    if !trace.upstream_model.trim().is_empty() {
+        origin.push_str(&format!(" · 模型 {}", trace.upstream_model.trim()));
+    }
+    if !trace.wire_api.trim().is_empty() {
+        origin.push_str(&format!(" · {}", trace.wire_api.trim()));
+    }
+    origin.push_str(&format!(" · HTTP {status_code}"));
+    let Some(object) = error.get_mut("error").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let message = object
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let annotated = if message.is_empty() {
+        origin
+    } else {
+        format!("{message}（{origin}）")
+    };
+    object.insert("message".to_string(), Value::String(annotated));
+}
+
+/// 请求日志里记的上游错误：状态码、类型 / code、提取出的消息，外加响应体原文预览（#2741）。
+/// 提取出的消息可能只是一句概括（Google 系错误的 details、中转附带的说明都在别的字段里），
+/// 日志里留一份原文才能定位；只进本地请求日志，不发给客户端。
+pub fn upstream_error_log_text(status_code: u16, error: &Value, body: &[u8]) -> String {
+    let inner = error.get("error").unwrap_or(error);
+    let mut text = format!("HTTP {status_code}");
+    for key in ["type", "code"] {
+        if let Some(value) = inner.get(key).and_then(Value::as_str).filter(|value| !value.is_empty()) {
+            text.push_str(&format!(" · {key}={value}"));
+        }
+    }
+    let message = inner.get("message").and_then(Value::as_str).unwrap_or_default().trim();
+    if !message.is_empty() {
+        text.push_str(&format!("：{message}"));
+    }
+    let raw = truncate_error_preview(String::from_utf8_lossy(body).trim());
+    if !raw.is_empty() && !message.contains(raw.as_str()) {
+        text.push_str(&format!("\n上游原文：{raw}"));
+    }
+    text
+}
+
 pub fn responses_error_from_upstream(status_code: u16, content_type: &str, body: &[u8]) -> Value {
     let (message, error_type, code, param) = upstream_error_parts(status_code, content_type, body);
     let mut error = json!({
@@ -6711,6 +6784,15 @@ pub(crate) fn upstream_error_parts(
 ) -> (String, Option<String>, Option<String>, Option<String>) {
     if content_type.to_ascii_lowercase().contains("json") {
         if let Ok(value) = serde_json::from_slice::<Value>(body) {
+            // Gemini 的 OpenAI 兼容端点把错误包在单元素数组里：`[{"error":{...}}]`（#2741）。
+            // 不拆开时整段数组被当成消息、类型与状态码都丢了，看不出是哪种错误。
+            let value = match value {
+                Value::Array(mut items) if items.len() == 1 && items[0].is_object() => {
+                    items.remove(0)
+                }
+                other => other,
+            };
+            let wrapped = value.get("error").is_some_and(Value::is_object);
             let error = value.get("error").unwrap_or(&value);
             let message = error
                 .get("message")
@@ -6721,9 +6803,12 @@ pub(crate) fn upstream_error_parts(
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string)
                 .unwrap_or_else(|| truncate_error_preview(&value.to_string()));
+            // Google 系错误没有 type，用 `status`（如 INVALID_ARGUMENT）补上；
+            // 只认 `error` 对象里的，免得把顶层 `{"status":"failed"}` 这类包装误当类型。
             let error_type = error
                 .get("type")
                 .or_else(|| error.get("error_type"))
+                .or_else(|| wrapped.then(|| error.get("status")).flatten())
                 .and_then(Value::as_str)
                 .map(ToString::to_string);
             let code = error.get("code").and_then(|value| {
@@ -11077,6 +11162,7 @@ mod unlisted_model_mapping_tests {
             routes: Vec::new(),
             default_relay_id: String::new(),
             sync_default_member_login: false,
+            auto_review_relay_id: String::new(),
         }];
         // 聚合有自己的按成员归因与「不做静默改派」策略，不在此映射。
         assert_eq!(unlisted_model_replacement(&settings, "gpt-5.4"), None);
