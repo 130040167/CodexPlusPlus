@@ -1114,6 +1114,8 @@ pub struct BackendSettings {
     pub weixin_connect_work_dir: String,
     #[serde(rename = "weixinConnectModel", default)]
     pub weixin_connect_model: String,
+    #[serde(rename = "weixinConnectAllowOutboundAttachments", default)]
+    pub weixin_connect_allow_outbound_attachments: bool,
     #[serde(
         rename = "weixinConnectSandbox",
         default = "default_weixin_connect_sandbox"
@@ -1300,6 +1302,7 @@ impl Default for BackendSettings {
             weixin_connect_route_tag: String::new(),
             weixin_connect_work_dir: String::new(),
             weixin_connect_model: String::new(),
+            weixin_connect_allow_outbound_attachments: false,
             weixin_connect_sandbox: default_weixin_connect_sandbox(),
             weixin_connect_codex_path: String::new(),
             relay_base_url: default_relay_base_url(),
@@ -2748,6 +2751,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
         target.insert("codexGoalsEnabled".to_string(), Value::Bool(value));
     }
     merge_bool_setting(target, source, "weixinConnectEnabled");
+    merge_bool_setting(target, source, "weixinConnectAllowOutboundAttachments");
     for key in [
         "weixinConnectBaseUrl",
         "weixinConnectToken",

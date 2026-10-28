@@ -3432,6 +3432,7 @@ fn spawn_weixin_connect(
         route_tag: settings.weixin_connect_route_tag,
         work_dir: settings.weixin_connect_work_dir,
         model: settings.weixin_connect_model,
+        allow_outbound_attachments: settings.weixin_connect_allow_outbound_attachments,
         sandbox: settings.weixin_connect_sandbox,
         codex_path: settings.weixin_connect_codex_path,
     }

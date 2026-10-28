@@ -90,6 +90,7 @@ const demoSettings = {
   weixinConnectRouteTag: "",
   weixinConnectWorkDir: "",
   weixinConnectModel: "",
+  weixinConnectAllowOutboundAttachments: false,
   weixinConnectSandbox: "read-only",
   weixinConnectCodexPath: "",
   relayBaseUrl: "",

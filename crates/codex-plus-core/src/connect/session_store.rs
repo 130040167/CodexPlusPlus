@@ -14,6 +14,9 @@ pub struct ConnectState {
     pub get_updates_buf: String,
     #[serde(default)]
     pub thread_ids: BTreeMap<String, String>,
+    /// 旧会话不能补注册 dynamicTools；保留原映射，附件会话单独续接。
+    #[serde(default)]
+    pub media_thread_ids: BTreeMap<String, String>,
     #[serde(default)]
     pub context_tokens: BTreeMap<String, String>,
     #[serde(default)]
@@ -109,6 +112,9 @@ mod tests {
         state
             .thread_ids
             .insert("peer".to_string(), "thread".to_string());
+        state
+            .media_thread_ids
+            .insert("peer".to_string(), "media-thread".to_string());
         for id in 1..=600 {
             state.mark_processed(format!("message-{id}"));
         }
@@ -120,7 +126,22 @@ mod tests {
             loaded.thread_ids.get("peer").map(String::as_str),
             Some("thread")
         );
+        assert_eq!(
+            loaded.media_thread_ids.get("peer").map(String::as_str),
+            Some("media-thread")
+        );
         assert!(!loaded.is_processed("message-1"));
         assert!(loaded.is_processed("message-600"));
+    }
+
+    #[test]
+    fn old_state_keeps_legacy_threads_without_claiming_attachment_tool_support() {
+        let state: ConnectState =
+            serde_json::from_str(r#"{"threadIds":{"peer":"legacy"}}"#).unwrap();
+        assert_eq!(
+            state.thread_ids.get("peer").map(String::as_str),
+            Some("legacy")
+        );
+        assert!(state.media_thread_ids.is_empty());
     }
 }

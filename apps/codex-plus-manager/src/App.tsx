@@ -469,6 +469,7 @@ type BackendSettings = {
   weixinConnectRouteTag: string;
   weixinConnectWorkDir: string;
   weixinConnectModel: string;
+  weixinConnectAllowOutboundAttachments: boolean;
   weixinConnectSandbox: "read-only" | "workspace-write" | "danger-full-access";
   weixinConnectCodexPath: string;
   relayBaseUrl: string;
@@ -1421,6 +1422,7 @@ const defaultSettings: BackendSettings = {
   weixinConnectRouteTag: "",
   weixinConnectWorkDir: "",
   weixinConnectModel: "",
+  weixinConnectAllowOutboundAttachments: false,
   weixinConnectSandbox: "read-only",
   weixinConnectCodexPath: "",
   relayBaseUrl: "",
@@ -5439,6 +5441,14 @@ function WeixinConnectScreen({
                   onChange={(event) => onFormChange({ ...form, weixinConnectModel: event.target.value })}
                   placeholder={t("留空时使用 Codex 当前默认模型")}
                   value={form.weixinConnectModel}
+                />
+              </label>
+              <label className="field field-checkbox">
+                <span>{t("允许微信连接外发附件")}</span>
+                <input
+                  checked={form.weixinConnectAllowOutboundAttachments}
+                  onChange={(event) => onFormChange({ ...form, weixinConnectAllowOutboundAttachments: event.currentTarget.checked })}
+                  type="checkbox"
                 />
               </label>
               <label className="field">

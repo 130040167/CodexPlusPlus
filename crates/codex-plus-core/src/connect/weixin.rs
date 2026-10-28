@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use anyhow::{Context, bail};
 use base64::Engine;
@@ -7,6 +7,9 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
+
+use super::media;
+pub use super::media::{AttachmentKind, DownloadedAttachments, LocalAttachment};
 
 const CHANNEL_VERSION: &str = "codex-plus-weixin/1.0";
 const MAX_REPLY_CHARS: usize = 3_800;
@@ -19,6 +22,7 @@ pub struct WeixinClient {
     token: String,
     route_tag: String,
     client: reqwest::Client,
+    media_client: media::MediaClient,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -91,6 +95,8 @@ pub struct WeixinMessageItem {
     #[serde(default)]
     pub voice_item: Option<WeixinVoiceItem>,
     #[serde(default)]
+    pub image_item: Option<media::WeixinImageItem>,
+    #[serde(default)]
     pub ref_msg: Option<WeixinReferenceMessage>,
 }
 
@@ -136,7 +142,146 @@ impl WeixinClient {
             token: token.trim().to_string(),
             route_tag: route_tag.trim().to_string(),
             client,
+            media_client: media::MediaClient::new(media::DEFAULT_CDN_BASE_URL)?,
         })
+    }
+
+    /// 显式设置媒体端点；只接受官方 CDN 或本地回环测试服务。
+    pub fn with_media_base_url(mut self, base_url: &str) -> anyhow::Result<Self> {
+        self.media_client = media::MediaClient::new(base_url)?;
+        Ok(self)
+    }
+
+    pub async fn download_attachments(
+        &self,
+        message: &WeixinMessage,
+        directory: &Path,
+    ) -> DownloadedAttachments {
+        self.media_client
+            .download_attachments(message, directory)
+            .await
+    }
+
+    #[cfg(test)]
+    pub async fn send_attachment(
+        &self,
+        to_user_id: &str,
+        path: &Path,
+        kind: AttachmentKind,
+        context_token: &str,
+    ) -> anyhow::Result<()> {
+        if context_token.trim().is_empty() || to_user_id.trim().is_empty() {
+            bail!("微信附件发送缺少接收方或 context_token");
+        }
+        let upload = media::PreparedUpload::read(path).await?;
+        self.send_prepared_attachment(to_user_id, upload, kind, context_token)
+            .await
+    }
+
+    /// 仅发送工作区内的实际文件；媒体层核验并读取同一个文件句柄。
+    pub async fn send_workspace_attachment(
+        &self,
+        to_user_id: &str,
+        path: &Path,
+        kind: AttachmentKind,
+        context_token: &str,
+        workspace: &Path,
+    ) -> anyhow::Result<()> {
+        if context_token.trim().is_empty() || to_user_id.trim().is_empty() {
+            bail!("微信附件发送缺少接收方或 context_token");
+        }
+        let upload = media::PreparedUpload::read_workspace(path, workspace).await?;
+        self.send_prepared_attachment(to_user_id, upload, kind, context_token)
+            .await
+    }
+
+    async fn send_prepared_attachment(
+        &self,
+        to_user_id: &str,
+        upload: media::PreparedUpload,
+        kind: AttachmentKind,
+        context_token: &str,
+    ) -> anyhow::Result<()> {
+        let request = json!({
+            "filekey": upload.filekey,
+            "media_type": match kind { AttachmentKind::Image => 1 },
+            "to_user_id": to_user_id,
+            "rawsize": upload.plaintext_size,
+            "rawfilemd5": upload.md5,
+            "filesize": upload.ciphertext.len(),
+            "no_need_thumb": true,
+            "aeskey": upload.key_hex,
+            "base_info": { "channel_version": CHANNEL_VERSION }
+        });
+        let response = self
+            .post_media_api("ilink/bot/getuploadurl", &request)
+            .await?;
+        let download_param = self.media_client.upload(&upload, &response).await?;
+        let media = json!({
+            "encrypt_query_param": download_param,
+            "aes_key": base64::engine::general_purpose::STANDARD.encode(&upload.key_hex),
+            "encrypt_type": 1
+        });
+        let item = match kind {
+            AttachmentKind::Image => json!({
+                "type": 2,
+                "image_item": { "media": media, "mid_size": upload.ciphertext.len() }
+            }),
+        };
+        self.post_media_api(
+            "ilink/bot/sendmessage",
+            &json!({
+                "msg": {
+                    "from_user_id": "",
+                    "to_user_id": to_user_id,
+                    "client_id": Uuid::new_v4().to_string(),
+                    "message_type": 2,
+                    "message_state": 2,
+                    "item_list": [item],
+                    "context_token": context_token
+                },
+                "base_info": { "channel_version": CHANNEL_VERSION }
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn post_media_api(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<media::MediaApiResponse> {
+        let response = self
+            .client
+            .post(self.endpoint(path)?)
+            .headers(self.auth_headers()?)
+            .json(body)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("微信媒体 API 请求失败"))?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("微信媒体 API 请求失败：HTTP {status}");
+        }
+        let (_, bytes) =
+            read_response_limited(response, MAX_SMALL_RESPONSE_BYTES, "微信媒体 API").await?;
+        let result = if bytes.iter().all(u8::is_ascii_whitespace) {
+            media::MediaApiResponse::default()
+        } else {
+            serde_json::from_slice::<media::MediaApiResponse>(&bytes)
+                .map_err(|_| anyhow::anyhow!("微信媒体 API 响应格式无效"))?
+        };
+        if result.ret != 0 || result.errcode != 0 {
+            // 服务端错误文本可能包含带密钥的 URL，不写入诊断。
+            bail!(
+                "微信媒体 API 被拒绝：ret={} errcode={}",
+                result.ret,
+                result.errcode
+            );
+        }
+        Ok(result)
     }
 
     pub async fn fetch_qr_code(base_url: &str, route_tag: &str) -> anyhow::Result<WeixinQrCode> {
@@ -365,7 +510,7 @@ async fn read_response_limited(
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.with_context(|| format!("读取{label}失败"))?;
+        let chunk = chunk.map_err(|_| anyhow::anyhow!("读取{label}失败"))?;
         if bytes.len().saturating_add(chunk.len()) > max_bytes {
             bail!("{label}超过大小限制");
         }
@@ -375,6 +520,10 @@ async fn read_response_limited(
 }
 
 impl WeixinMessage {
+    pub fn has_attachments(&self) -> bool {
+        media::has_attachments(self)
+    }
+
     pub fn is_finished_user_message(&self) -> bool {
         self.message_type == 1 && self.message_state == 2 && !self.from_user_id.trim().is_empty()
     }
@@ -400,6 +549,10 @@ impl WeixinMessage {
 }
 
 fn message_item_text(item: &WeixinMessageItem) -> Option<String> {
+    message_item_text_at_depth(item, 0)
+}
+
+fn message_item_text_at_depth(item: &WeixinMessageItem, depth: usize) -> Option<String> {
     let body = match item.item_type {
         1 => item.text_item.as_ref().map(|item| item.text.trim()),
         3 => item.voice_item.as_ref().map(|item| item.text.trim()),
@@ -415,8 +568,9 @@ fn message_item_text(item: &WeixinMessageItem) -> Option<String> {
     if !reference.title.trim().is_empty() {
         reference_parts.push(reference.title.trim().to_string());
     }
-    if let Some(reference_item) = reference.message_item.as_deref()
-        && let Some(reference_text) = message_item_text(reference_item)
+    if depth < media::MAX_REFERENCE_DEPTH
+        && let Some(reference_item) = reference.message_item.as_deref()
+        && let Some(reference_text) = message_item_text_at_depth(reference_item, depth + 1)
     {
         reference_parts.push(reference_text);
     }
