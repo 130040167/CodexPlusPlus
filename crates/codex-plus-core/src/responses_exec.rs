@@ -143,6 +143,8 @@ pub(crate) struct ToolAdaptation {
     pub(crate) custom: BTreeSet<String>,
     /// 展开到顶层的 namespace 子工具：扁平名 → (namespace, 子工具名)。
     pub(crate) namespaced: BTreeMap<String, (String, String)>,
+    /// 客户端执行的 tool_search 以名为 `tool_search` 的 function 发出，调用要还原成 tool_search_call。
+    pub(crate) tool_search: bool,
 }
 
 impl ToolAdaptation {
@@ -150,17 +152,45 @@ impl ToolAdaptation {
     pub(crate) fn exec() -> Self {
         Self {
             custom: BTreeSet::from([EXEC_TOOL_NAME.to_string()]),
-            namespaced: BTreeMap::new(),
+            ..Self::default()
         }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.custom.is_empty() && self.namespaced.is_empty()
+        self.custom.is_empty() && self.namespaced.is_empty() && !self.tool_search
     }
 }
 
+/// Codex 把自己的内置函数放在这个 namespace 里，客户端当作没有 namespace 处理，展开时不加前缀。
+pub(crate) const LITE_NAMESPACE: &str = "functions";
+pub(crate) const TOOL_SEARCH_NAME: &str = "tool_search";
+/// 函数名长度上限（多数上游按 64 字符校验）。
+const MAX_TOOL_NAME_LEN: usize = 64;
+
+/// namespace 子工具展开后的名字：`namespace__name`，超长时截断并缀上整体哈希保证唯一。
+pub(crate) fn flat_tool_name(namespace: &str, name: &str) -> String {
+    if namespace == LITE_NAMESPACE {
+        return name.to_owned();
+    }
+    let flat = crate::protocol_proxy::flatten_namespace_tool_name(namespace, name);
+    if flat.len() <= MAX_TOOL_NAME_LEN {
+        return flat;
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{namespace}\0{name}").as_bytes());
+    let mut cut = MAX_TOOL_NAME_LEN - 9;
+    while !flat.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let hash = digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{}_{hash}", &flat[..cut])
+}
+
 /// 只认 function 等内置工具类型的上游（xAI）：custom 工具转 function，
-/// namespace（MCP 工具分组）展开成顶层 function。
+/// namespace（MCP 工具分组）展开成顶层 function，历史里带 namespace 的调用也按扁平名还原。
 pub(crate) fn tool_adaptation_without_custom_types(request: &Value) -> ToolAdaptation {
     let custom = custom_tool_names(request);
     let tools = request
@@ -168,33 +198,60 @@ pub(crate) fn tool_adaptation_without_custom_types(request: &Value) -> ToolAdapt
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
+    // 与顶层工具重名的子工具不展开：响应里分不清调的是哪个。
+    let taken = |flat: &str| {
+        custom.contains(flat)
+            || tools.iter().any(|tool| {
+                tool.get("type").and_then(Value::as_str) != Some("namespace")
+                    && tool.get("name").and_then(Value::as_str) == Some(flat)
+            })
+    };
     let mut namespaced = BTreeMap::new();
+    let mut add = |namespace: &str, name: &str| {
+        if namespace.is_empty() || namespace == LITE_NAMESPACE || name.is_empty() {
+            return;
+        }
+        let flat = flat_tool_name(namespace, name);
+        if !taken(&flat) {
+            namespaced
+                .entry(flat)
+                .or_insert_with(|| (namespace.to_owned(), name.to_owned()));
+        }
+    };
     for tool in tools {
         if tool.get("type").and_then(Value::as_str) != Some("namespace") {
             continue;
         }
         let namespace = tool.get("name").and_then(Value::as_str).unwrap_or_default();
         for child in namespace_function_children(tool) {
-            let name = child
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let flat = crate::protocol_proxy::flatten_namespace_tool_name(namespace, name);
-            // 与顶层工具重名的子工具不展开：响应里分不清调的是哪个。
-            if custom.contains(&flat)
-                || tools.iter().any(|tool| {
-                    tool.get("type").and_then(Value::as_str) != Some("namespace")
-                        && tool.get("name").and_then(Value::as_str) == Some(flat.as_str())
-                })
-            {
-                continue;
-            }
-            namespaced
-                .entry(flat)
-                .or_insert_with(|| (namespace.to_owned(), name.to_owned()));
+            add(
+                namespace,
+                child
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            );
         }
     }
-    ToolAdaptation { custom, namespaced }
+    for item in request
+        .get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+    {
+        if let Some(namespace) = item.get("namespace").and_then(Value::as_str) {
+            add(
+                namespace,
+                item.get("name").and_then(Value::as_str).unwrap_or_default(),
+            );
+        }
+    }
+    ToolAdaptation {
+        custom,
+        namespaced,
+        tool_search: false,
+    }
 }
 
 fn namespace_function_children(tool: &Value) -> impl Iterator<Item = &Value> {
@@ -256,12 +313,20 @@ pub(crate) fn adapt_request_for(request: Value, adaptation: &ToolAdaptation) -> 
 }
 
 /// namespace 声明展开成顶层 function，tool_choice 与历史里带 namespace 的调用改用扁平名。
+/// 没有 namespace 的请求原样不动。
 fn flatten_namespace_request(request: &mut Value, namespaced: &BTreeMap<String, (String, String)>) {
-    if namespaced.is_empty() {
-        return;
-    }
-    if let Some(tools) = request.get("tools").and_then(Value::as_array).cloned() {
-        let mut translated = Vec::with_capacity(tools.len());
+    if let Some(tools) = request.get("tools").and_then(Value::as_array).cloned()
+        && tools
+            .iter()
+            .any(|tool| tool.get("type").and_then(Value::as_str) == Some("namespace"))
+    {
+        let mut translated: Vec<Value> = Vec::with_capacity(tools.len());
+        let top_level = tools
+            .iter()
+            .filter(|tool| tool.get("type").and_then(Value::as_str) != Some("namespace"))
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
         for tool in tools {
             if tool.get("type").and_then(Value::as_str) != Some("namespace") {
                 translated.push(tool);
@@ -277,8 +342,18 @@ fn flatten_namespace_request(request: &mut Value, namespaced: &BTreeMap<String, 
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let flat = crate::protocol_proxy::flatten_namespace_tool_name(namespace, name);
-                if namespaced.get(&flat) != Some(&(namespace.to_owned(), name.to_owned())) {
+                let flat = flat_tool_name(namespace, name);
+                // `functions` 里的内置函数按原名上；其余只展开登记过的（未与顶层工具重名）。
+                let offered = if namespace == LITE_NAMESPACE {
+                    !top_level.contains(&flat)
+                } else {
+                    namespaced.get(&flat) == Some(&(namespace.to_owned(), name.to_owned()))
+                };
+                if !offered
+                    || translated
+                        .iter()
+                        .any(|tool| tool.get("name").and_then(Value::as_str) == Some(flat.as_str()))
+                {
                     continue;
                 }
                 let mut function = child.clone();
@@ -332,50 +407,73 @@ fn flatten_namespaced_call(value: &mut Value) {
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let flat = crate::protocol_proxy::flatten_namespace_tool_name(&namespace, name);
-    object.insert("name".to_string(), json!(flat));
+    if !namespace.is_empty() && !name.is_empty() {
+        let flat = flat_tool_name(&namespace, name);
+        object.insert("name".to_string(), json!(flat));
+    }
     object.remove("namespace");
 }
 
-/// 把展开过的 namespace 子工具调用还原成 Codex 认的 `name` + `namespace`。
-pub(crate) fn restore_namespaced_item(
-    item: &mut Value,
-    namespaced: &BTreeMap<String, (String, String)>,
-) {
+/// 把上游的调用还原成 Codex 认的形式：namespace 子工具回到 `name` + `namespace`，
+/// `tool_search` 函数回到客户端执行的 tool_search_call。
+pub(crate) fn restore_adapted_item(item: &mut Value, adaptation: &ToolAdaptation) {
     if item.get("type").and_then(Value::as_str) != Some("function_call")
         || item.get("namespace").is_some()
     {
         return;
     }
-    let Some((namespace, name)) = item
-        .get("name")
-        .and_then(Value::as_str)
-        .and_then(|flat| namespaced.get(flat))
-        .cloned()
-    else {
+    let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+    if adaptation.tool_search && name == TOOL_SEARCH_NAME {
+        let arguments = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .map(tool_search_arguments)
+            .unwrap_or_else(|| json!({}));
+        let Some(object) = item.as_object_mut() else {
+            return;
+        };
+        object.remove("name");
+        object.insert("type".to_string(), json!("tool_search_call"));
+        object.insert("execution".to_string(), json!("client"));
+        object.insert("arguments".to_string(), arguments);
+        return;
+    }
+    let Some((namespace, name)) = adaptation.namespaced.get(name).cloned() else {
         return;
     };
     item["name"] = json!(name);
     item["namespace"] = json!(namespace);
+    // 客户端把不带这个列表的 namespace 调用当作参数加密过（如 spawn_agent 的 message），
+    // 上游从不加密参数，必须显式声明为空。
+    item["encrypted_function_args"] = json!([]);
+}
+
+/// tool_search_call 的参数是 JSON 对象；上游给的不是对象时按原文放进 `input`。
+fn tool_search_arguments(arguments: &str) -> Value {
+    let arguments = arguments.trim();
+    if arguments.is_empty() {
+        return json!({});
+    }
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(value @ Value::Object(_)) => value,
+        _ => json!({ "input": arguments }),
+    }
 }
 
 /// SSE 事件里的 `item` 与终态 `response.output` 都要还原。
-pub(crate) fn restore_namespaced_event(
-    event: &mut Value,
-    namespaced: &BTreeMap<String, (String, String)>,
-) {
-    if namespaced.is_empty() {
+pub(crate) fn restore_adapted_event(event: &mut Value, adaptation: &ToolAdaptation) {
+    if adaptation.namespaced.is_empty() && !adaptation.tool_search {
         return;
     }
     if let Some(item) = event.get_mut("item") {
-        restore_namespaced_item(item, namespaced);
+        restore_adapted_item(item, adaptation);
     }
     if let Some(items) = event
         .pointer_mut("/response/output")
         .and_then(Value::as_array_mut)
     {
         for item in items {
-            restore_namespaced_item(item, namespaced);
+            restore_adapted_item(item, adaptation);
         }
     }
 }
@@ -594,7 +692,7 @@ pub(crate) fn adapt_response_for(response: Value, adaptation: &ToolAdaptation) -
     let mut response = restore_custom_response(response, &adaptation.custom)?;
     if let Some(items) = response.get_mut("output").and_then(Value::as_array_mut) {
         for item in items {
-            restore_namespaced_item(item, &adaptation.namespaced);
+            restore_adapted_item(item, adaptation);
         }
     }
     Ok(response)
