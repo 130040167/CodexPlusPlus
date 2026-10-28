@@ -3616,6 +3616,11 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             upstream_body = shaped;
             forced_adaptation = adaptation;
         }
+        let relay = if xai_upstream {
+            crate::xai_responses::with_conversation_header(relay, &upstream_body)
+        } else {
+            relay
+        };
         if local_exec_adapted
             && wire_api == UpstreamWireApi::Responses
             && !xai_upstream

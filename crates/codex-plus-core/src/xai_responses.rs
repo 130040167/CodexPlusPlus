@@ -31,8 +31,46 @@ const XAI_TOOL_TYPES: &[&str] = &[
     "tool_search",
 ];
 
+/// xAI 的 `include` 只认这一项。
+const XAI_INCLUDE: &str = "reasoning.encrypted_content";
+
 /// 联合类型嵌套时最多往里折叠几层。
 const MAX_UNION_DEPTH: usize = 8;
+
+/// SuperGrok 订阅代理按 `x-grok-conv-id` 认出同一段对话（命中缓存），
+/// 官方 CLI 取请求里的 `prompt_cache_key`。api.x.ai 不加。
+pub(crate) fn with_conversation_header(
+    mut relay: crate::settings::RelayProfile,
+    body: &Value,
+) -> crate::settings::RelayProfile {
+    const HEADER: &str = "x-grok-conv-id";
+    let subscription_proxy = reqwest::Url::parse(relay.base_url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "grok.com" || host.ends_with(".grok.com"));
+    let Some(key) = body
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    else {
+        return relay;
+    };
+    if subscription_proxy
+        && !relay
+            .custom_headers
+            .iter()
+            .any(|header| header.key.trim().eq_ignore_ascii_case(HEADER))
+    {
+        relay
+            .custom_headers
+            .push(crate::settings::RelayHeaderKeyValue {
+                key: HEADER.to_string(),
+                value: key.to_string(),
+            });
+    }
+    relay
+}
 
 /// 整理请求体，返回整理后的请求和响应还原需要的工具改写记录。
 pub(crate) fn shape_request(mut body: Value) -> Result<(Value, ToolAdaptation)> {
@@ -48,6 +86,7 @@ pub(crate) fn shape_request(mut body: Value) -> Result<(Value, ToolAdaptation)> 
         );
     }
     tidy_tool_choice(&mut body);
+    tidy_include(&mut body);
     tidy_input(&mut body);
     Ok((body, adaptation))
 }
@@ -253,6 +292,32 @@ fn tidy_tool_choice(body: &mut Value) {
         && let Some(object) = body.as_object_mut()
     {
         object.remove("tool_choice");
+    }
+}
+
+/// `include` 只保留 xAI 支持的 `reasoning.encrypted_content`（跨轮携带加密推理要用），
+/// 其余（如 `output.encrypted_content`）会让整个请求 400；剩不下就整个去掉。
+fn tidy_include(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    let kept = object
+        .get("include")
+        .and_then(Value::as_array)
+        .map(|include| {
+            include
+                .iter()
+                .filter(|value| value.as_str() == Some(XAI_INCLUDE))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+    match kept {
+        Some(kept) if !kept.is_empty() => {
+            object.insert("include".to_string(), Value::Array(kept));
+        }
+        _ => {
+            object.remove("include");
+        }
     }
 }
 
@@ -643,6 +708,48 @@ mod tests {
             ]})
         );
         assert_eq!(input[2]["type"], "agent_message", "加密的保持原样");
+    }
+
+    #[test]
+    fn subscription_proxy_gets_the_conversation_header() {
+        let relay = |base_url: &str| crate::settings::RelayProfile {
+            base_url: base_url.to_string(),
+            ..Default::default()
+        };
+        let body = json!({"prompt_cache_key": "conv-1"});
+        let headers = with_conversation_header(relay("https://cli-chat-proxy.grok.com/v1"), &body)
+            .custom_headers;
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].key, "x-grok-conv-id");
+        assert_eq!(headers[0].value, "conv-1");
+        assert!(
+            with_conversation_header(relay("https://api.x.ai/v1"), &body)
+                .custom_headers
+                .is_empty()
+        );
+        assert!(
+            with_conversation_header(relay("https://cli-chat-proxy.grok.com/v1"), &json!({}))
+                .custom_headers
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn include_keeps_only_reasoning_encrypted_content() {
+        let (shaped, _) = shape_request(json!({"include": [
+            "reasoning.encrypted_content", "output.encrypted_content", "message.output_text.logprobs"
+        ]}))
+        .unwrap();
+        assert_eq!(shaped["include"], json!(["reasoning.encrypted_content"]));
+
+        let (shaped, _) = shape_request(json!({"include": ["output.encrypted_content"]})).unwrap();
+        assert!(shaped.get("include").is_none(), "剩不下就整个去掉");
+
+        let (shaped, _) = shape_request(json!({"include": "reasoning.encrypted_content"})).unwrap();
+        assert!(shaped.get("include").is_none(), "不是数组的也去掉");
+
+        let (shaped, _) = shape_request(json!({"model": "grok"})).unwrap();
+        assert_eq!(shaped, json!({"model": "grok"}));
     }
 
     #[test]
