@@ -445,6 +445,11 @@ pub struct GatewaySettings {
     /// 左键点托盘图标弹出快捷面板（默认开）；关掉时托盘保持原来的点击行为。
     #[serde(default = "enabled_by_default")]
     pub tray_panel: bool,
+    /// 关闭管理器主窗口时进入轻量模式：销毁主窗口（连同 WebView 渲染进程）释放内存，
+    /// 后端、网关、托盘照常运行，再打开时按原配置重建窗口（默认开，#2677）。
+    /// 关掉时回到只隐藏窗口的旧行为。和 `tray_panel` 一样放在这里，由管理器的专用命令读写。
+    #[serde(default = "enabled_by_default")]
+    pub lightweight_on_close: bool,
     /// 自动建组：多家都有的模型自动成一个组（Agent 选不带供应商的模型名时走它）。默认开；
     /// 旧文件（version < 3）里的 false 是当时的默认值，读的时候迁移成开，见 [`read_store`]。
     #[serde(default = "enabled_by_default")]
@@ -492,6 +497,7 @@ impl Default for GatewaySettings {
             providers: Vec::new(),
             groups: Vec::new(),
             tray_panel: true,
+            lightweight_on_close: true,
             auto_models: true,
             model_suffix: true,
             auto_groups: BTreeMap::new(),
@@ -873,6 +879,8 @@ mod tests {
         assert!(settings.tray_panel, "托盘快捷面板默认开");
         let old: GatewaySettings = serde_json::from_str("{}").unwrap();
         assert!(old.tray_panel, "旧文件没有这个字段时也是开");
+        assert!(settings.lightweight_on_close, "关窗进入轻量模式默认开");
+        assert!(old.lightweight_on_close, "旧文件没有这个字段时也是开");
         assert!(settings.active_binding(&ToolId::Claude).is_none());
     }
 
@@ -1003,6 +1011,7 @@ mod tests {
         // 改一点别的再保存。
         settings.groups[1].mode = GroupMode::Weighted;
         settings.tray_panel = false;
+        settings.lightweight_on_close = false;
         store.save(&settings).unwrap();
         let saved: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&store.path).unwrap()).unwrap();
@@ -1024,6 +1033,7 @@ mod tests {
         assert_eq!(saved["groups"][0]["futureGroup"], 3);
         assert_eq!(saved["groups"][1]["mode"], "weighted", "改过的照新值写");
         assert_eq!(saved["trayPanel"], false);
+        assert_eq!(saved["lightweightOnClose"], false);
         // 再读一遍还是同样的内容。
         let again = store.load().unwrap();
         assert_eq!(again.groups[0].extra["futureGroup"], 3);
