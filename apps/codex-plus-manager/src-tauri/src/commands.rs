@@ -5755,6 +5755,24 @@ pub async fn install_plugin_market_item(source: String, id: String) -> Value {
 }
 
 #[tauri::command]
+pub async fn uninstall_plugin_market_item(source: String, id: String) -> Value {
+    // 只撤销插件市场安装时写入的目录与配置条目（#2701）；删目录放到阻塞线程，避免卡住界面。
+    match tauri::async_runtime::spawn_blocking(move || {
+        codex_plus_core::plugin_market::uninstall_plugin(
+            &codex_plus_core::codex_home::default_codex_home_dir(),
+            &source,
+            &id,
+        )
+    })
+    .await
+    {
+        Ok(Ok(payload)) => payload,
+        Ok(Err(error)) => json!({"status": "failed", "message": error.to_string()}),
+        Err(error) => json!({"status": "failed", "message": format!("插件卸载失败：{error}")}),
+    }
+}
+
+#[tauri::command]
 pub fn plugin_market_install_status(source: String, id: String) -> Value {
     match codex_plus_core::plugin_market::install_status(
         &codex_plus_core::codex_home::default_codex_home_dir(),
