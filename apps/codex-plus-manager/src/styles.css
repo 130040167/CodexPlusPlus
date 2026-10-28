@@ -13675,3 +13675,36 @@ button.side-item:hover {
   margin-right: -20px;
   padding-right: 20px;
 }
+
+/* —— 网关主体区域的字号再收一档：名字 13px，副标题、状态、说明 12px ——
+   只改字号，颜色与尺寸不动；放在最后，正式版里压过组件 CSS 与上面的紧凑密度层。 */
+.shell .gw-pool-main strong,
+.shell .gw-agent-title strong,
+.shell .gw-balance-name strong {
+  font-size: 13px;
+}
+
+.shell .gw-pool-main small,
+.shell .gw-pool-status,
+.shell .gw-detail-label,
+.shell .gw-detail-value .gw-muted {
+  font-size: 12px;
+}
+
+.shell .gw-text-button,
+.shell .gw-danger-link,
+.shell .gw-models-tabs button,
+.shell .gw-range-tabs button,
+.shell .gw-provider-search-row .gw-primary-button,
+.shell .gw-models-toolbar .gw-primary-button {
+  font-size: 12.5px;
+}
+
+.shell .gw-setting-row strong,
+.shell .gw-empty strong {
+  font-size: 13px;
+}
+
+.shell .gw-usage-stat strong {
+  font-size: 22px;
+}
