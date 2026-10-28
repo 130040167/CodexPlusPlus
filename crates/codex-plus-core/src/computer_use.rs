@@ -1865,6 +1865,8 @@ pub(crate) fn read_text(path: &Path) -> anyhow::Result<Option<String>> {
 }
 
 pub(crate) fn parse_json_object(text: &str, path: &Path) -> anyhow::Result<Map<String, Value>> {
+    // Windows 上的工具写出的 JSON 可能带 UTF-8 BOM（#2728），JSON 解析器不认，先去掉。
+    let text = text.trim_start_matches('\u{feff}');
     if text.trim().is_empty() {
         return Ok(Map::new());
     }
@@ -2068,6 +2070,12 @@ mod tests {
             app_version: Some("26.1016.61520".into()),
             package_version: Some("0.1.2".into()),
         }
+    }
+
+    #[test]
+    fn json_object_with_utf8_bom_parses() {
+        let map = parse_json_object("\u{feff}{\"mcpServers\":{}}", Path::new("claude_desktop_config.json")).unwrap();
+        assert!(map.contains_key("mcpServers"));
     }
 
     #[test]
