@@ -1,10 +1,13 @@
 (() => {
-  // 本机官登只要勾了混入 Key，就解除官方订阅额度的发送锁。不看上游地址。
+  // 本机官登只要勾了混入 Key，或接入了网关 / 聚合供应商，就解除官方订阅额度的发送锁。不看上游地址。
   function permitsExternalApi(settings, hostId) {
     if (hostId !== "local" || settings?.relayProfilesEnabled !== true) return false;
     if (!Array.isArray(settings.relayProfiles)) return false;
     const profile = settings.relayProfiles.find((item) => item?.id === settings.activeRelayId);
-    return !!profile && profile.relayMode === "official" && profile.officialMixApiKey === true;
+    if (!profile) return false;
+    if (profile.id === "codex-plus-gateway") return true;
+    if (profile.relayMode === "aggregate") return true;
+    return profile.relayMode === "official" && profile.officialMixApiKey === true;
   }
 
   function locate(text, url) {
