@@ -2053,6 +2053,17 @@ fn multi_instance_slug(value: &str) -> String {
 }
 
 fn multi_instance_user_data_dir(slug: &str) -> PathBuf {
+    multi_instance_user_data_dir_with_root(
+        slug,
+        std::env::var_os("CODEX_ELECTRON_USER_DATA_PATH").map(PathBuf::from),
+    )
+}
+
+fn multi_instance_user_data_dir_with_root(slug: &str, electron_root: Option<PathBuf>) -> PathBuf {
+    // 显式隔离目录也约束多开；子实例仍各用独立子目录。
+    if let Some(root) = electron_root.filter(|root| !root.as_os_str().is_empty()) {
+        return root.join("multi").join(slug);
+    }
     directories::BaseDirs::new()
         .map(|dirs| {
             dirs.data_local_dir()
@@ -9572,6 +9583,42 @@ fn default_log_lines() -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn multi_instance_user_data_respects_explicit_electron_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("electron data");
+        let first = multi_instance_user_data_dir_with_root("instance-a", Some(root.clone()));
+        let second = multi_instance_user_data_dir_with_root("instance-b", Some(root.clone()));
+        assert_eq!(first, root.join("multi").join("instance-a"));
+        assert_eq!(second, root.join("multi").join("instance-b"));
+        assert_ne!(first, second);
+        assert!(!first.exists());
+    }
+
+    #[test]
+    fn multi_instance_user_data_without_override_keeps_default_layout() {
+        let expected = directories::BaseDirs::new()
+            .map(|dirs| {
+                dirs.data_local_dir()
+                    .join("CodexPlusPlus")
+                    .join("multi")
+                    .join("instance-a")
+            })
+            .unwrap_or_else(|| {
+                codex_plus_core::paths::default_app_state_dir()
+                    .join("user-data")
+                    .join("instance-a")
+            });
+        assert_eq!(
+            multi_instance_user_data_dir_with_root("instance-a", None),
+            expected
+        );
+        assert_eq!(
+            multi_instance_user_data_dir_with_root("instance-a", Some(PathBuf::new())),
+            expected
+        );
+    }
+
     use super::*;
 
     #[test]
