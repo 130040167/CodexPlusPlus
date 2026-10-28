@@ -82,8 +82,8 @@
     },
     {
       "name": "83-usage-statusline.js",
-      "description": "输入框下方用量状态栏：生成速度、缓存命中率与上下文占用",
-      "lines": 491
+      "description": "输入框下方用量状态栏：输出吞吐、缓存命中率与上下文占用",
+      "lines": 528
     },
     {
       "name": "84-proxy-request-status.js",
