@@ -190,6 +190,21 @@ body {
   height: 100vh;
   overflow: hidden;
   background: hsl(var(--shell-bg));
+  /* 桌面应用：界面文字默认不能选中，指针也不变成文字光标，和原生 App 一致。 */
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+/* 需要复制的内容仍可选：输入框、代码与日志、会话和请求详情抽屉里的正文。 */
+:is(input, textarea, [contenteditable="true"], pre, code, kbd, samp, .mg-drawer-body),
+:is(pre, .mg-drawer-body) * {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+:is(input, textarea, [contenteditable="true"]) {
+  cursor: text;
 }
 
 .shell {
