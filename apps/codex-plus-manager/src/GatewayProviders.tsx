@@ -441,8 +441,8 @@ function PoolRow({
     if (await run(`models:${entry.id}`, "save_gateway_provider_models", { id: entry.id, models, defaultModel }, t("保存模型列表"))) setModelsOpen(false);
   };
   const price = priceSummary(entry);
-  // ChatGPT 订阅账号和 Copilot 能查额度（ChatGPT API 账号按量计费，没有额度窗口）。
-  const quotaSupported = entry.account === "chatgpt" || entry.account === "copilot";
+  // ChatGPT 订阅账号、Copilot 和 SuperGrok 能查额度（ChatGPT API 账号按量计费，没有额度窗口）。
+  const quotaSupported = entry.account === "chatgpt" || entry.account === "copilot" || entry.account === "grok";
   const saveExtras = async (nextPrice: ProviderPrice | null, modelPrices: Record<string, ProviderPrice> | null, proxy: string) => {
     const title = extrasOpen === "proxy" ? t("保存代理") : t("保存价格");
     if (await run(`extras:${entry.id}`, "save_gateway_provider_extras", { id: entry.id, price: nextPrice, modelPrices, proxy }, title)) setExtrasOpen(null);

@@ -1053,6 +1053,26 @@ pub async fn grok_login(open_browser: impl FnOnce(&str)) -> anyhow::Result<GrokT
     parse_grok_tokens(&value, "")
 }
 
+/// SuperGrok 订阅的额度（Grok CLI 的 `/usage` 读的同一个接口）。`relay` 要先经过 `prepare_relay`。
+pub async fn grok_billing(relay: &RelayProfile) -> anyhow::Result<Value> {
+    let mut request = http_client()?
+        .get(format!("{GROK_PROXY_BASE}/billing?format=credits"))
+        .bearer_auth(&relay.api_key)
+        .header(reqwest::header::USER_AGENT, grok_user_agent())
+        .header(reqwest::header::ACCEPT, "application/json");
+    for (key, value) in grok_proxy_headers() {
+        request = request.header(key, value);
+    }
+    let response = request.send().await.context("连不上 SuperGrok")?;
+    if !response.status().is_success() {
+        bail!(
+            "查询 SuperGrok 额度失败：HTTP {}",
+            response.status().as_u16()
+        );
+    }
+    Ok(response.json().await?)
+}
+
 /// SuperGrok 账号可用的模型；读不到时用常见的几个。
 pub async fn grok_models(access_token: &str) -> Vec<String> {
     refresh_grok_client_version().await;
