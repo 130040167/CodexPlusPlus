@@ -583,7 +583,8 @@ fn log_attempt_failure(
         "gateway.upstream_failed",
         serde_json::json!({
             "relayId": candidate.relay.id,
-            "relayName": candidate.relay.name,
+            // 账号类供应商的名字里带邮箱，日志里只留打码后的。
+            "relayName": crate::gateway::accounts::mask_account_name(&candidate.relay.name),
             "keyId": candidate.key.key_id,
             "upstreamModel": candidate.upstream_model,
             "class": class.map(FailureClass::label),

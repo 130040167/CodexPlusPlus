@@ -686,69 +686,69 @@ fn lendable_login(gateway: &GatewaySettings) -> Option<&GatewayProvider> {
 /// 把网关的 ChatGPT 账号借给 Codex 登录：token 写进 Codex 的 auth.json（其余字段不动），
 /// 网关里标记「借出」——之后这个账号以 Codex 那份为准，网关刷新也写回那里，两边始终同一代。
 fn lend_login_to_codex(ctx: &ApplyContext, provider_id: &str) -> anyhow::Result<()> {
-    let mut gateway = ctx.gateway.load()?;
-    let Some(provider) = gateway
-        .providers
-        .iter_mut()
-        .find(|provider| provider.relay.id == provider_id)
-    else {
-        return Ok(());
-    };
-    let path = ctx.codex_home.join("auth.json");
-    let live = std::fs::read_to_string(&path).unwrap_or_else(|_| "{}".to_string());
-    let merged = crate::official_login::auth_contents_with_member_login(
-        &live,
-        &provider.relay.auth_contents,
-        false,
-    )
-    .context("Codex 已经登录了别的 ChatGPT 账号，不能再借用网关的账号")?;
-    crate::settings::atomic_write(&path, merged.as_bytes())?;
-    let mut auth: Value = serde_json::from_str(&provider.relay.auth_contents)?;
-    auth[crate::official_login::LENT_TO_CODEX_MARKER] = Value::Bool(true);
-    provider.relay.auth_contents = serde_json::to_string_pretty(&auth)?;
-    ctx.gateway.save(&gateway)?;
+    // 带锁读改写：借出用的是锁内读到的最新一代 token，也不会把同时刷新写回的 token 盖掉。
+    ctx.gateway.update(|gateway| {
+        let Some(provider) = gateway
+            .providers
+            .iter_mut()
+            .find(|provider| provider.relay.id == provider_id)
+        else {
+            return Ok(());
+        };
+        let path = ctx.codex_home.join("auth.json");
+        let live = std::fs::read_to_string(&path).unwrap_or_else(|_| "{}".to_string());
+        let merged = crate::official_login::auth_contents_with_member_login(
+            &live,
+            &provider.relay.auth_contents,
+            false,
+        )
+        .context("Codex 已经登录了别的 ChatGPT 账号，不能再借用网关的账号")?;
+        crate::settings::atomic_write(&path, merged.as_bytes())?;
+        let mut auth: Value = serde_json::from_str(&provider.relay.auth_contents)?;
+        auth[crate::official_login::LENT_TO_CODEX_MARKER] = Value::Bool(true);
+        provider.relay.auth_contents = serde_json::to_string_pretty(&auth)?;
+        Ok(())
+    })?;
     Ok(())
 }
 
 /// 收回借给 Codex 的账号：Codex 那份是最新一代，token 写回网关、去掉「借出」标记，
 /// 再从 Codex 的 auth.json 里拿掉这个登录（借之前 Codex 本来就没登录）。
 pub fn return_lent_login(store: &GatewayStore, codex_home: &std::path::Path) -> anyhow::Result<()> {
-    let mut gateway = store.load()?;
     let path = codex_home.join("auth.json");
     let live = std::fs::read_to_string(&path).unwrap_or_default();
     let live_login = crate::official_login::official_login_from_auth_contents(&live);
-    let mut changed = false;
-    let mut strip_live = false;
-    for provider in gateway
-        .providers
-        .iter_mut()
-        .filter(|provider| crate::official_login::is_lent_to_codex(&provider.relay))
-    {
-        let mut auth: Value = serde_json::from_str(&provider.relay.auth_contents)?;
-        let account = auth
-            .pointer("/tokens/account_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if let Some(login) = live_login
-            .as_ref()
-            .filter(|login| !account.is_empty() && login.account_id == account)
+    // 带锁读改写：只动借出的那几个供应商，不拿旧状态覆盖同时写进来的改动（没有借出的就不写盘）。
+    let (_, strip_live) = store.update(|gateway| {
+        let mut strip_live = false;
+        for provider in gateway
+            .providers
+            .iter_mut()
+            .filter(|provider| crate::official_login::is_lent_to_codex(&provider.relay))
         {
-            auth["tokens"]["access_token"] = json!(login.access_token);
-            if !login.refresh_token.is_empty() {
-                auth["tokens"]["refresh_token"] = json!(login.refresh_token);
+            let mut auth: Value = serde_json::from_str(&provider.relay.auth_contents)?;
+            let account = auth
+                .pointer("/tokens/account_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if let Some(login) = live_login
+                .as_ref()
+                .filter(|login| !account.is_empty() && login.account_id == account)
+            {
+                auth["tokens"]["access_token"] = json!(login.access_token);
+                if !login.refresh_token.is_empty() {
+                    auth["tokens"]["refresh_token"] = json!(login.refresh_token);
+                }
+                strip_live = true;
             }
-            strip_live = true;
+            if let Some(object) = auth.as_object_mut() {
+                object.remove(crate::official_login::LENT_TO_CODEX_MARKER);
+            }
+            provider.relay.auth_contents = serde_json::to_string_pretty(&auth)?;
         }
-        if let Some(object) = auth.as_object_mut() {
-            object.remove(crate::official_login::LENT_TO_CODEX_MARKER);
-        }
-        provider.relay.auth_contents = serde_json::to_string_pretty(&auth)?;
-        changed = true;
-    }
-    if changed {
-        store.save(&gateway)?;
-    }
+        Ok(strip_live)
+    })?;
     if strip_live && let Ok(Value::Object(mut object)) = serde_json::from_str::<Value>(&live) {
         for key in ["tokens", "auth_mode", "last_refresh"] {
             object.remove(key);
@@ -1005,7 +1005,7 @@ pub fn enable_binding(
     agent: &ToolId,
     mut binding: AgentBinding,
 ) -> anyhow::Result<GatewaySettings> {
-    let mut gateway = ctx.gateway.load()?;
+    let gateway = ctx.gateway.load()?;
     ensure_routable(&gateway, &binding)?;
     let previous = gateway.binding(agent).cloned();
     binding.token = previous
@@ -1045,10 +1045,11 @@ pub fn enable_binding(
     {
         binding.restore.claude_previous_provider_id = snapshot;
     }
-    // 写配置时可能改过 gateway.json（借出账号等），以最新的为准再写绑定。
-    let mut gateway = ctx.gateway.load()?;
-    gateway.bindings.insert(agent.as_str().to_string(), binding);
-    ctx.gateway.save(&gateway)?;
+    // 写配置时可能改过 gateway.json（借出账号等），以最新的为准再写绑定（带锁，不盖掉同时刷新的 token）。
+    let (gateway, ()) = ctx.gateway.update(|gateway| {
+        gateway.bindings.insert(agent.as_str().to_string(), binding);
+        Ok(())
+    })?;
     Ok(gateway)
 }
 
@@ -1081,12 +1082,13 @@ pub fn disable_binding(
     };
     restore_agent(ctx, settings, agent, &binding)?;
     // 恢复时可能改过 gateway.json（收回借出的账号等），以最新的为准。
-    let mut gateway = ctx.gateway.load()?;
-    if let Some(binding) = gateway.bindings.get_mut(agent.as_str()) {
-        binding.enabled = false;
-        binding.restore = Default::default();
-    }
-    ctx.gateway.save(&gateway)?;
+    let (gateway, ()) = ctx.gateway.update(|gateway| {
+        if let Some(binding) = gateway.bindings.get_mut(agent.as_str()) {
+            binding.enabled = false;
+            binding.restore = Default::default();
+        }
+        Ok(())
+    })?;
     Ok(gateway)
 }
 
@@ -1306,27 +1308,29 @@ pub fn note_claude_switched(store: &GatewayStore, target_id: &str) -> anyhow::Re
     if target_id == GATEWAY_PROVIDER_ID {
         return Ok(());
     }
-    let mut gateway = store.load()?;
-    if let Some(binding) = gateway.bindings.get_mut(ToolId::Claude.as_str())
-        && binding.enabled
-    {
-        binding.enabled = false;
-        binding.restore = Default::default();
-        store.save(&gateway)?;
-    }
+    store.update(|gateway| {
+        if let Some(binding) = gateway.bindings.get_mut(ToolId::Claude.as_str())
+            && binding.enabled
+        {
+            binding.enabled = false;
+            binding.restore = Default::default();
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
 /// 用户在 Grok 页直接应用了别的供应商：网关绑定随之失效。
 pub fn note_grok_switched(store: &GatewayStore) -> anyhow::Result<()> {
-    let mut gateway = store.load()?;
-    if let Some(binding) = gateway.bindings.get_mut(ToolId::Grok.as_str())
-        && binding.enabled
-    {
-        binding.enabled = false;
-        binding.restore = Default::default();
-        store.save(&gateway)?;
-    }
+    store.update(|gateway| {
+        if let Some(binding) = gateway.bindings.get_mut(ToolId::Grok.as_str())
+            && binding.enabled
+        {
+            binding.enabled = false;
+            binding.restore = Default::default();
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -1337,20 +1341,21 @@ pub fn note_codex_switched(
     target_id: &str,
     previous_id: &str,
 ) -> anyhow::Result<()> {
-    let mut gateway = store.load()?;
-    let Some(binding) = gateway.bindings.get_mut(ToolId::Codex.as_str()) else {
-        return Ok(());
-    };
-    let connected = target_id == CODEX_GATEWAY_RELAY_ID;
-    if binding.enabled == connected {
-        return Ok(());
-    }
-    binding.enabled = connected;
-    binding.restore = Default::default();
-    if connected && previous_id != CODEX_GATEWAY_RELAY_ID {
-        binding.restore.codex_previous_relay_id = previous_id.to_string();
-    }
-    store.save(&gateway)?;
+    store.update(|gateway| {
+        let Some(binding) = gateway.bindings.get_mut(ToolId::Codex.as_str()) else {
+            return Ok(());
+        };
+        let connected = target_id == CODEX_GATEWAY_RELAY_ID;
+        if binding.enabled == connected {
+            return Ok(());
+        }
+        binding.enabled = connected;
+        binding.restore = Default::default();
+        if connected && previous_id != CODEX_GATEWAY_RELAY_ID {
+            binding.restore.codex_previous_relay_id = previous_id.to_string();
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -1419,13 +1424,14 @@ pub fn reapply_if_port_changed(ctx: &ApplyContext) -> anyhow::Result<usize> {
     }
     if changed > 0 {
         // 写配置时可能改过 gateway.json：只把端口记到最新的那份上。
-        let mut latest = ctx.gateway.load()?;
-        for (agent, binding) in &gateway.bindings {
-            if let Some(target) = latest.bindings.get_mut(agent) {
-                target.restore.applied_port = binding.restore.applied_port;
+        ctx.gateway.update(|latest| {
+            for (agent, binding) in &gateway.bindings {
+                if let Some(target) = latest.bindings.get_mut(agent) {
+                    target.restore.applied_port = binding.restore.applied_port;
+                }
             }
-        }
-        ctx.gateway.save(&latest)?;
+            Ok(())
+        })?;
     }
     Ok(changed)
 }
@@ -1456,9 +1462,10 @@ pub fn restore_all_for_exit(
         }
     }
     if restored {
-        let mut latest = ctx.gateway.load()?;
-        latest.restored_at_exit = true;
-        ctx.gateway.save(&latest)?;
+        ctx.gateway.update(|latest| {
+            latest.restored_at_exit = true;
+            Ok(())
+        })?;
     }
     match first_error {
         Some(error) => Err(error),
@@ -1518,16 +1525,16 @@ pub fn reapply_enabled(ctx: &ApplyContext) -> anyhow::Result<usize> {
         {
             binding.restore.claude_previous_provider_id = snapshot;
         }
-        let mut latest = ctx.gateway.load()?;
-        latest.bindings.insert(agent.as_str().to_string(), binding);
-        ctx.gateway.save(&latest)?;
+        ctx.gateway.update(|latest| {
+            latest.bindings.insert(agent.as_str().to_string(), binding);
+            Ok(())
+        })?;
         count += 1;
     }
-    let mut latest = ctx.gateway.load()?;
-    if latest.restored_at_exit {
+    ctx.gateway.update(|latest| {
         latest.restored_at_exit = false;
-        ctx.gateway.save(&latest)?;
-    }
+        Ok(())
+    })?;
     Ok(count)
 }
 

@@ -448,13 +448,14 @@ pub fn rotate_gateway_token(agent: String) -> CommandResult<Option<GatewayPayloa
     let result = (|| {
         let agent = parse_agent(&agent)?;
         let store = GatewayStore::default();
-        let mut gateway = store.load()?;
-        let Some(binding) = gateway.bindings.get_mut(agent.as_str()) else {
-            anyhow::bail!("还没有配置网关绑定");
-        };
-        binding.token = new_client_token(&agent);
-        let binding = binding.clone();
-        store.save(&gateway)?;
+        // 带锁读改写：只换这个 Agent 的 token，不拿旧状态覆盖同时刷新写回的登录 token。
+        let (gateway, binding) = store.update(|gateway| {
+            let Some(binding) = gateway.bindings.get_mut(agent.as_str()) else {
+                anyhow::bail!("还没有配置网关绑定");
+            };
+            binding.token = new_client_token(&agent);
+            Ok(binding.clone())
+        })?;
         if binding.enabled {
             return apply::enable_binding(&context(), &agent, binding);
         }
@@ -470,14 +471,14 @@ pub fn save_gateway_options(
     restore_on_exit: bool,
 ) -> CommandResult<Option<GatewayPayload>> {
     let result = (|| {
-        let store = GatewayStore::default();
-        let mut gateway = store.load()?;
-        gateway.key_policy.mode = match key_rotation.as_str() {
-            "roundRobin" => KeyRotationMode::RoundRobin,
-            _ => KeyRotationMode::Sticky,
-        };
-        gateway.restore_on_exit = restore_on_exit;
-        store.save(&gateway)?;
+        let (gateway, ()) = GatewayStore::default().update(|gateway| {
+            gateway.key_policy.mode = match key_rotation.as_str() {
+                "roundRobin" => KeyRotationMode::RoundRobin,
+                _ => KeyRotationMode::Sticky,
+            };
+            gateway.restore_on_exit = restore_on_exit;
+            Ok(())
+        })?;
         Ok(gateway)
     })();
     respond("网关选项已保存。", "保存网关选项失败", result)
@@ -1453,18 +1454,24 @@ pub async fn login_gateway_chatgpt(
     let outcome = cancellable_login(async move {
         let account = accounts::chatgpt_login(open_in_browser).await?;
         let store = GatewayStore::default();
-        let mut gateway = store.load()?;
-        // 同一个账号已经登录过：只换 token。
-        if !account.account_id.is_empty()
-            && let Some(provider) = gateway.providers.iter_mut().find(|provider| {
-                codex_plus_core::official_login::chatgpt_account_id_from_auth_contents(
-                    &provider.relay.auth_contents,
-                ) == account.account_id
-            })
-        {
-            provider.relay.auth_contents = account.auth_contents.clone();
-            let name = provider.relay.name.clone();
-            store.save(&gateway)?;
+        // 同一个人的同一个账号已经登录过：只换 token。工作区成员共用账号 id，还要比用户；
+        // 带锁读改写，只动这一个供应商。
+        let (_, updated) = store.update(|gateway| {
+            Ok(gateway
+                .providers
+                .iter_mut()
+                .find(|provider| {
+                    accounts::same_chatgpt_login(
+                        &provider.relay.auth_contents,
+                        &account.auth_contents,
+                    )
+                })
+                .map(|provider| {
+                    provider.relay.auth_contents = account.auth_contents.clone();
+                    provider.relay.name.clone()
+                }))
+        })?;
+        if let Some(name) = updated {
             return Ok(format!("已更新「{name}」的登录。"));
         }
         let mut relay = accounts::chatgpt_relay(&account, &[]);
@@ -1508,19 +1515,26 @@ fn add_account_provider(
             .filter(|value| !value.is_empty())
     };
     let store = GatewayStore::default();
-    let mut gateway = store.load()?;
-    if let Some(id) = identity(&relay.auth_contents)
-        && let Some(provider) = gateway.providers.iter_mut().find(|provider| {
-            identity(&provider.relay.auth_contents).as_deref() == Some(id.as_str())
-        })
-    {
-        provider.relay.auth_contents = relay.auth_contents.clone();
-        if !relay.model_list.trim().is_empty() {
-            provider.relay.model_list = relay.model_list.clone();
+    // 同一个账号已存在：带锁读改写，只换这一个供应商的凭据（和模型列表）。
+    if let Some(id) = identity(&relay.auth_contents) {
+        let (_, updated) = store.update(|gateway| {
+            Ok(gateway
+                .providers
+                .iter_mut()
+                .find(|provider| {
+                    identity(&provider.relay.auth_contents).as_deref() == Some(id.as_str())
+                })
+                .map(|provider| {
+                    provider.relay.auth_contents = relay.auth_contents.clone();
+                    if !relay.model_list.trim().is_empty() {
+                        provider.relay.model_list = relay.model_list.clone();
+                    }
+                    provider.relay.name.clone()
+                }))
+        })?;
+        if let Some(name) = updated {
+            return Ok(format!("已更新「{name}」的登录。"));
         }
-        let name = provider.relay.name.clone();
-        store.save(&gateway)?;
-        return Ok(format!("已更新「{name}」的登录。"));
     }
     let name = relay.name.clone();
     let count = relay
