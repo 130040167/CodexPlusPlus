@@ -10482,7 +10482,7 @@ function GlobalSettingsScreen({
               <span>{lightweight.error || t("关闭主窗口时连同界面一起释放，后台服务、网关和托盘照常运行，从托盘再打开时重新加载界面。未保存的编辑内容会丢失；关掉则关闭窗口时只隐藏。")}</span>
             </div>
             <div className="global-setting-actions">
-              <Switch disabled={lightweight.enabled === null || lightweight.saving} label={t("关闭窗口后释放界面内存")} on={lightweight.enabled ?? true} onToggle={() => void lightweight.toggle()} />
+              <Switch disabled={lightweight.enabled === null || lightweight.saving} label={t("关闭窗口后释放界面内存")} on={lightweight.enabled ?? false} onToggle={() => void lightweight.toggle()} />
             </div>
           </div>
           <div className="global-setting-row">

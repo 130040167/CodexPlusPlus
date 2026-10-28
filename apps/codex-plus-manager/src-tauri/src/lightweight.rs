@@ -42,7 +42,7 @@ fn read_enabled_from_disk() -> bool {
     codex_plus_core::gateway::store::GatewayStore::default()
         .load()
         .map(|settings| settings.lightweight_on_close)
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 fn cache() -> &'static AtomicBool {
