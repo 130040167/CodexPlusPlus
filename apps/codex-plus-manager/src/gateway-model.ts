@@ -22,6 +22,8 @@ export type AgentBinding = {
   unknownModel: UnknownModelPolicy;
   /** 审批模型（#2703，Codex 用）：codex-auto-review 改发到这个模型；空或没有是不单独指定（旧版后端没有）。 */
   autoReviewModel?: string;
+  /** 起名模型（Codex 用）：Codex 给会话起名的请求改发到这个模型；空或没有是不改（旧版后端没有）。 */
+  titleModel?: string;
   contextWindow?: number | null;
   claudeEnableEffort: boolean;
   /** 这个 Agent 不用的池内供应商（「挑选」里取消勾选的）。 */
@@ -232,6 +234,7 @@ export type BindingDraft = {
   subagent: string;
   unknownModel: UnknownModelPolicy;
   autoReviewModel: string;
+  titleModel: string;
   contextWindow: string;
   claudeEnableEffort: boolean;
   poolExclude: string[];
@@ -262,6 +265,7 @@ export function draftFromBinding(binding: AgentBinding | undefined): BindingDraf
     subagent: source.claudeRoles.subagent,
     unknownModel: source.unknownModel,
     autoReviewModel: source.autoReviewModel ?? "",
+    titleModel: source.titleModel ?? "",
     contextWindow: source.contextWindow ? String(source.contextWindow) : "",
     claudeEnableEffort: source.claudeEnableEffort,
     poolExclude: [...(source.poolExclude ?? [])],
@@ -320,6 +324,7 @@ export function bindingFromDraft(draft: BindingDraft, previous: AgentBinding | u
     },
     unknownModel: draft.unknownModel,
     autoReviewModel: draft.autoReviewModel.trim(),
+    titleModel: draft.titleModel.trim(),
     contextWindow: window && Number.isFinite(window) ? window : null,
     claudeEnableEffort: draft.claudeEnableEffort,
     poolExclude: [...draft.poolExclude],
