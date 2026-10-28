@@ -127,6 +127,8 @@ export const EN_PLAIN: Record<string, string> = {
   "订阅登录": "Subscription sign-in",
   "登录即可，无需密钥；与 Codex 自己的登录互不影响": "sign in, no key; separate from Codex's own sign-in",
   "点击托盘图标弹出快捷面板": "Click the tray icon to open the quick panel",
+  "关闭窗口后释放界面内存": "Free UI memory when the window is closed",
+  "关闭主窗口时连同界面一起释放，后台服务、网关和托盘照常运行，从托盘再打开时重新加载界面。未保存的编辑内容会丢失；关掉则关闭窗口时只隐藏。": "Closing the main window also unloads its UI; background services, the gateway and the tray keep running, and the UI reloads when you open it again from the tray. Unsaved edits are lost; turn off to only hide the window on close.",
   "打开 Codex++": "Open Codex++",
   "最近请求": "Recent requests",
   "还没有请求": "No requests yet",

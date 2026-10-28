@@ -115,7 +115,7 @@ import { rebaseSettingsEdits } from "./settings-rebase";
 import { summarizeRecentRequests, type RecentRequestSummary } from "./overview-model";
 import { AgentCollaborationPage } from "./AgentCollaborationPage";
 import { SectionLabel, Switch } from "./gateway-ui";
-import { parseTrayRequest, TRAY_REQUEST_EVENT, TRAY_RESULT_EVENT, type TrayRequest, type TrayResult } from "./tray-panel-model";
+import { MAIN_WINDOW_READY_EVENT, parseTrayRequest, TRAY_REQUEST_EVENT, TRAY_RESULT_EVENT, type TrayRequest, type TrayResult } from "./tray-panel-model";
 import { AppSelect, type AppSelectOption } from "./AppSelect";
 import { AppDialogHost, appAlert, appConfirm, appPrompt } from "./app-dialog";
 import { GatewayPage, type GatewayTab } from "./GatewayPage";
@@ -3813,6 +3813,14 @@ export function App() {
     showNotice(title, result.message, result.status);
   };
 
+  // 正在处理的快捷面板请求数。轻量模式下主窗口可能是为请求在后台重建的，
+  // 请求没做完时不能释放窗口，否则结果回不去（#2677）。
+  const trayRequestsInFlight = useRef(0);
+  // 主窗口仍隐藏时按轻量模式释放（窗口可见、开关关掉时后端不做任何事）。
+  const releaseMainWindowWhenHidden = () => {
+    if (trayRequestsInFlight.current === 0) void invoke("main_window_release_when_hidden").catch(() => {});
+  };
+
   useEffect(() => {
     // 工具栏只依赖本地配置，不能排在广告等网络请求之后。
     // 切换语言会重载窗口，串行等待会让三个 Agent 图标长时间消失。
@@ -3837,6 +3845,8 @@ export function App() {
       await refreshProviderSyncTargets(true);
       await refreshPendingProviderImport(true);
       await refreshPendingDreamSkinCommunity();
+      // 登录启动或为快捷面板请求在后台重建时窗口是隐藏的：启动流程走完后按轻量模式释放（#2677）。
+      releaseMainWindowWhenHidden();
     })();
   }, []);
 
@@ -3901,15 +3911,23 @@ export function App() {
     void listen<unknown>(TRAY_REQUEST_EVENT, (event) => {
       const request = parseTrayRequest(event.payload);
       if (disposed || !request) return;
+      trayRequestsInFlight.current += 1;
       void trayRequestHandlerRef.current(request)
         .catch((error): TrayResult => ({ id: request.id, ok: false, message: stringifyError(error) }))
         .then((result) => emit(TRAY_RESULT_EVENT, result))
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => {
+          trayRequestsInFlight.current -= 1;
+          // 做完仍隐藏就再释放；要显示主窗口的情况（失败、打开某页）后端会取消这次释放。
+          releaseMainWindowWhenHidden();
+        });
     }).then((unlisten) => {
       if (disposed) {
         unlisten();
       } else {
         stopListening = unlisten;
+        // 告诉后端监听已就绪：轻量模式下快捷面板会等这个信号再把请求发过来（#2677）。
+        void emit(MAIN_WINDOW_READY_EVENT).catch(() => {});
       }
     });
     return () => {
@@ -10309,6 +10327,34 @@ function useTrayPanelSetting() {
   return { enabled, saving, error, toggle };
 }
 
+/// 关闭窗口时进入轻量模式（#2677）。值存在 gateway.json 的 `lightweightOnClose`，由后端命令读写，
+/// 后端同时更新内存缓存，下次关窗即生效。
+function useLightweightModeSetting() {
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    void invoke<boolean>("lightweight_mode_enabled")
+      .then((value) => { if (!cancelled) setEnabled(value !== false); })
+      .catch(() => { if (!cancelled) setEnabled(true); });
+    return () => { cancelled = true; };
+  }, []);
+  const toggle = async () => {
+    if (enabled === null || saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      setEnabled(await invoke<boolean>("set_lightweight_mode_enabled", { enabled: !enabled }));
+    } catch (failure) {
+      setError(stringifyError(failure));
+    } finally {
+      setSaving(false);
+    }
+  };
+  return { enabled, saving, error, toggle };
+}
+
 /// 整体设置页（最左侧齿轮）。
 ///
 /// 只放与当前 Agent 无关的应用级选项，内容不随 Agent 切换而变。
@@ -10332,6 +10378,7 @@ function GlobalSettingsScreen({
 }) {
   const settingsPath = settings?.settings_path ?? "";
   const trayPanel = useTrayPanelSetting();
+  const lightweight = useLightweightModeSetting();
   // 每一项都是同一种行：左边标题 + 说明，右边操作。路径只在「配置文件路径」里出现一次。
   return (
     <div className="settings-page global-settings-page">
@@ -10355,6 +10402,15 @@ function GlobalSettingsScreen({
             </div>
             <div className="global-setting-actions">
               <Switch disabled={trayPanel.enabled === null || trayPanel.saving} label={t("点击托盘图标弹出快捷面板")} on={trayPanel.enabled ?? true} onToggle={() => void trayPanel.toggle()} />
+            </div>
+          </div>
+          <div className="global-setting-row">
+            <div className="global-setting-copy">
+              <strong>{t("关闭窗口后释放界面内存")}</strong>
+              <span>{lightweight.error || t("关闭主窗口时连同界面一起释放，后台服务、网关和托盘照常运行，从托盘再打开时重新加载界面。未保存的编辑内容会丢失；关掉则关闭窗口时只隐藏。")}</span>
+            </div>
+            <div className="global-setting-actions">
+              <Switch disabled={lightweight.enabled === null || lightweight.saving} label={t("关闭窗口后释放界面内存")} on={lightweight.enabled ?? true} onToggle={() => void lightweight.toggle()} />
             </div>
           </div>
           <div className="global-setting-row">
