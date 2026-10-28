@@ -1670,6 +1670,27 @@ pub fn restore_for_update() -> bool {
     true
 }
 
+/// 卸载前（卸载器带 `--codex-plus-uninstall-cleanup` 调用）：同安装更新前，不管开关都把走网关的
+/// Agent 恢复成直连。卸载后网关不在了，不还原的话 Codex / Claude Code / Grok 会一直连一个没人监听的
+/// 本机地址。结果只写诊断日志，不报错，后面的卸载清理照常进行。
+pub fn restore_for_uninstall() {
+    let has_enabled = GatewayStore::default()
+        .load()
+        .is_ok_and(|gateway| gateway.any_enabled());
+    if !has_enabled {
+        return;
+    }
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    let result = apply::restore_all_for_exit(&context(), &settings, true);
+    let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+        "uninstall.gateway_restore",
+        serde_json::json!({
+            "ok": result.is_ok(),
+            "message": result.as_ref().err().map(|error| format!("{error:#}")),
+        }),
+    );
+}
+
 /// 更新没装成、Codex++ 继续运行：把更新前恢复成直连的 Agent 重新接回网关。
 pub fn undo_restore_for_update() {
     start_from_saved_state();

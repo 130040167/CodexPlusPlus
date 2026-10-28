@@ -2517,9 +2517,10 @@ fn parse_toml_document(contents: &str) -> anyhow::Result<DocumentMut> {
     if contents.trim().is_empty() {
         Ok(DocumentMut::new())
     } else {
-        contents
-            .parse::<DocumentMut>()
-            .map_err(|error| anyhow::anyhow!("config.toml TOML 解析失败：{error}"))
+        // 解析错误不带原文（那一行可能是 Key），只报行列。
+        contents.parse::<DocumentMut>().map_err(|error| {
+            crate::gateway::restore::toml_syntax_error("config.toml", contents, error.span())
+        })
     }
 }
 
