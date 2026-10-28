@@ -454,3 +454,216 @@ fn codex_stuck_with_unreadable_gateway_store_and_missing_profile_switches_back()
         "不碰读不出来的 gateway.json"
     );
 }
+
+fn grok_stash_path(ctx: &ApplyContext) -> std::path::PathBuf {
+    ctx.backup_root.join("grok-before-gateway.json")
+}
+
+/// 别的工具把 Grok 指向了自己的地址。
+const GROK_OTHER_TOOL: &str = r#"[models]
+default = "grok-other"
+
+[model.grok-other]
+model = "grok-other"
+base_url = "http://127.0.0.1:15721/v1"
+api_backend = "responses"
+"#;
+
+fn binding_enabled(ctx: &ApplyContext, agent: &ToolId) -> bool {
+    ctx.gateway
+        .load()
+        .unwrap()
+        .binding(agent)
+        .is_some_and(|binding| binding.enabled)
+}
+
+/// 把存档里记下的改动清空，模拟「存下原文后、记下改动前进程就退出了」。
+fn forget_recorded_changes(path: &std::path::Path) {
+    let mut saved: Value = serde_json::from_str(&read(path)).unwrap();
+    saved["changed"] = json!([]);
+    std::fs::write(path, saved.to_string()).unwrap();
+}
+
+/// 存档没记下改了哪些键（接入写完配置就崩了），配置还指向网关：断开时按网关会写的键兜底，
+/// 不能把指向网关的配置当成「接入前」写回去。
+#[test]
+fn grok_disconnect_with_empty_change_list_falls_back_to_gateway_keys() {
+    let fixture = fixture(57422);
+    let ctx = &fixture.ctx;
+    let path = ctx.grok_home.join("config.toml");
+    std::fs::write(&path, GROK_HAND_WRITTEN).unwrap();
+    enable_binding(ctx, &ToolId::Grok, binding()).unwrap();
+    forget_recorded_changes(&grok_stash_path(ctx));
+
+    disable_binding(ctx, &BackendSettings::default(), &ToolId::Grok).unwrap();
+    assert_eq!(read(&path), GROK_HAND_WRITTEN);
+    assert!(!grok_stash_path(ctx).exists());
+}
+
+/// 同上，Claude Code：接入前没有当前供应商、手写的地址和 Key 只在 settings.json 里，
+/// 「上一个供应商」也没来得及记下。断开时按关键字段兜底，地址和 Key 不丢。
+#[test]
+fn claude_disconnect_with_empty_change_list_falls_back_to_provider_keys() {
+    let fixture = fixture(57423);
+    let ctx = &fixture.ctx;
+    let env = json!({
+        "ANTHROPIC_BASE_URL": "https://api.kimi.test/anthropic",
+        "ANTHROPIC_AUTH_TOKEN": "sk-fake-kimi",
+    });
+    let path = ctx.claude.claude_home.join("settings.json");
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(
+            &json!({ "env": env, "permissions": { "allow": ["Bash(ls)"] } }),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    enable_binding(ctx, &ToolId::Claude, binding()).unwrap();
+    assert!(read(&path).contains("/gw/claude"));
+    forget_recorded_changes(&ctx.backup_root.join("claude-before-gateway.json"));
+    let mut gateway = ctx.gateway.load().unwrap();
+    gateway
+        .bindings
+        .get_mut("claude")
+        .unwrap()
+        .restore
+        .claude_previous_provider_id
+        .clear();
+    ctx.gateway.save(&gateway).unwrap();
+
+    disable_binding(ctx, &BackendSettings::default(), &ToolId::Claude).unwrap();
+    let live: Value = serde_json::from_str(&read(&path)).unwrap();
+    assert_eq!(live["env"], env, "{live}");
+    assert_eq!(live["permissions"]["allow"][0], "Bash(ls)");
+}
+
+/// 接着网关时 Grok 被别的工具改走：退出 / 更新前还原不能写回存档盖掉用户的新选择；
+/// 存档丢掉、绑定关掉，下次启动也不再接回。
+#[test]
+fn grok_taken_over_by_another_tool_is_not_clobbered_on_restore() {
+    let fixture = fixture(57424);
+    let ctx = &fixture.ctx;
+    let path = ctx.grok_home.join("config.toml");
+    std::fs::write(&path, GROK_HAND_WRITTEN).unwrap();
+    enable_binding(ctx, &ToolId::Grok, binding()).unwrap();
+    std::fs::write(&path, GROK_OTHER_TOOL).unwrap();
+
+    // 池变化时的重写也不碰它（界面会提示漂移）。
+    assert_eq!(refresh_enabled(ctx).unwrap(), 0);
+    assert_eq!(read(&path), GROK_OTHER_TOOL);
+    assert!(binding_enabled(ctx, &ToolId::Grok));
+
+    restore_all_for_exit(ctx, &BackendSettings::default(), true).unwrap();
+    assert_eq!(read(&path), GROK_OTHER_TOOL, "用户的新选择不动");
+    assert!(!grok_stash_path(ctx).exists());
+    assert!(!binding_enabled(ctx, &ToolId::Grok), "等于用户自己断开了");
+
+    assert_eq!(reapply_enabled(ctx).unwrap(), 0);
+    assert_eq!(read(&path), GROK_OTHER_TOOL);
+}
+
+/// 接着网关时 Claude Code 被别的工具改走：断开时 settings.json 不动，
+/// 只删托管供应商、清掉 Codex++ 记的当前供应商和存档。
+#[test]
+fn claude_taken_over_by_another_tool_is_not_clobbered_on_disconnect() {
+    let fixture = fixture(57425);
+    let ctx = &fixture.ctx;
+    let path = ctx.claude.claude_home.join("settings.json");
+    std::fs::write(
+        &path,
+        r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.kimi.test/anthropic"}}"#,
+    )
+    .unwrap();
+    enable_binding(ctx, &ToolId::Claude, binding()).unwrap();
+    let other = r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:15721","ANTHROPIC_AUTH_TOKEN":"sk-other"}}"#;
+    std::fs::write(&path, other).unwrap();
+
+    disable_binding(ctx, &BackendSettings::default(), &ToolId::Claude).unwrap();
+    assert_eq!(read(&path), other);
+    assert!(!binding_enabled(ctx, &ToolId::Claude));
+    assert!(!ctx.backup_root.join("claude-before-gateway.json").exists());
+    let payload = claude::load(&ctx.claude).unwrap();
+    assert_ne!(payload.current_id, GATEWAY_PROVIDER_ID);
+    assert!(
+        payload
+            .providers
+            .iter()
+            .all(|provider| provider.id != GATEWAY_PROVIDER_ID)
+    );
+}
+
+/// 接着网关时 Codex 的 config.toml 被别的工具改走：更新前还原不写 ~/.codex，
+/// 只把直连模式的记录改回开启前的供应商、删掉托管供应商，绑定关掉。
+#[test]
+fn codex_taken_over_by_another_tool_is_not_clobbered_on_restore() {
+    let fixture = fixture(57426);
+    let ctx = &fixture.ctx;
+    seed_codex_direct(ctx);
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let config_path = ctx.codex_home.join("config.toml");
+    let other = "model_provider = \"other\"\nmodel = \"gpt-other\"\n\n[model_providers.other]\nname = \"other\"\nbase_url = \"http://127.0.0.1:15721/v1\"\n";
+    std::fs::write(&config_path, other).unwrap();
+
+    let settings = ctx.settings.load().unwrap();
+    restore_all_for_exit(ctx, &settings, true).unwrap();
+    assert_eq!(read(&config_path), other);
+    let settings = ctx.settings.load().unwrap();
+    assert_eq!(settings.active_relay_id, "direct");
+    assert!(
+        settings
+            .relay_profiles
+            .iter()
+            .all(|profile| profile.id != "codex-plus-gateway")
+    );
+    assert!(!binding_enabled(ctx, &ToolId::Codex));
+    assert_eq!(reapply_enabled(ctx).unwrap(), 0);
+    assert_eq!(read(&config_path), other);
+}
+
+/// 更新前还原成直连后、新版本启动前，用户用别的工具把 Grok 指向了别处：启动时不再接回网关。
+#[test]
+fn startup_reapply_skips_agent_changed_after_update_restore() {
+    let fixture = fixture(57427);
+    let ctx = &fixture.ctx;
+    let path = ctx.grok_home.join("config.toml");
+    std::fs::write(&path, GROK_HAND_WRITTEN).unwrap();
+    enable_binding(ctx, &ToolId::Grok, binding()).unwrap();
+    restore_all_for_exit(ctx, &BackendSettings::default(), true).unwrap();
+    assert_eq!(read(&path), GROK_HAND_WRITTEN);
+    std::fs::write(&path, GROK_OTHER_TOOL).unwrap();
+
+    assert_eq!(reapply_enabled(ctx).unwrap(), 0);
+    assert_eq!(read(&path), GROK_OTHER_TOOL);
+    assert!(!binding_enabled(ctx, &ToolId::Grok));
+    assert!(!ctx.gateway.load().unwrap().restored_at_exit);
+}
+
+/// 启动时重新接入：一个 Agent 失败不影响其它的；有失败时「已恢复」标记留着，下次启动再试。
+#[test]
+fn startup_reapply_continues_after_one_agent_fails() {
+    let fixture = fixture(57428);
+    let ctx = &fixture.ctx;
+    let path = ctx.grok_home.join("config.toml");
+    std::fs::write(&path, GROK_HAND_WRITTEN).unwrap();
+    enable_binding(ctx, &ToolId::Claude, binding()).unwrap();
+    enable_binding(ctx, &ToolId::Grok, binding()).unwrap();
+    restore_all_for_exit(ctx, &BackendSettings::default(), true).unwrap();
+    assert_eq!(read(&path), GROK_HAND_WRITTEN);
+    // Claude 的供应商列表坏了：它排在 Grok 前面，以前第一个错误就中断，Grok 永远接不回。
+    let store = read(&ctx.claude.store_path);
+    std::fs::write(&ctx.claude.store_path, "{ 坏掉的 json").unwrap();
+
+    let error = reapply_enabled(ctx).unwrap_err();
+    assert!(format!("{error:#}").contains("claude"), "{error:#}");
+    assert!(read(&path).contains("/gw/grok"), "Grok 照样接回");
+    assert!(
+        ctx.gateway.load().unwrap().restored_at_exit,
+        "有失败：标记留着"
+    );
+
+    std::fs::write(&ctx.claude.store_path, store).unwrap();
+    assert_eq!(reapply_enabled(ctx).unwrap(), 2);
+    assert!(!ctx.gateway.load().unwrap().restored_at_exit);
+    assert!(read(&ctx.claude.claude_home.join("settings.json")).contains("/gw/claude"));
+}

@@ -17,6 +17,7 @@ use anyhow::{Context, bail};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use crate::gateway::drift::{self, Drift};
 use crate::gateway::restore::{self as stash, ChangedKey, FileStash, KeyPath};
 use crate::gateway::route::{self, binding_default_model};
 use crate::gateway::store::{
@@ -1040,6 +1041,7 @@ pub fn enable_binding(
     };
     binding.enabled = true;
     binding.restore.applied_port = Some(ctx.port);
+    binding.restore.restored_endpoint = None;
     if let Some(snapshot) = write_agent_config(ctx, agent, &binding)?
         && binding.restore.claude_previous_provider_id.is_empty()
     {
@@ -1092,19 +1094,136 @@ pub fn disable_binding(
     Ok(gateway)
 }
 
+/// 还原一个 Agent 的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreOutcome {
+    /// 改回了接入前的样子（或本来就不用改）。
+    Restored,
+    /// 配置已经被别的工具改走：没写 Agent 的文件，只清掉了网关自己的记录，绑定该关掉。
+    TakenOver,
+}
+
 /// 把一个 Agent 的配置还原成接入网关前的样子。
+///
+/// Codex++ 的记录里它还接在网关上、配置却已经指向别处（用户用别的工具改过）时，写回存档
+/// 会盖掉用户的新选择：这时不写 Agent 的文件，只丢掉存档和网关自己的记录。
 fn restore_agent(
     ctx: &ApplyContext,
     settings: &BackendSettings,
     agent: &ToolId,
     binding: &AgentBinding,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RestoreOutcome> {
+    if let Some(found) = taken_over(ctx, agent) {
+        forget_gateway(ctx, agent, binding)?;
+        log_taken_over("gateway.restore_skipped_taken_over", agent, &found);
+        return Ok(RestoreOutcome::TakenOver);
+    }
     match agent {
         ToolId::Claude => restore_claude(ctx, binding),
         ToolId::Grok => restore_grok(ctx, settings),
         ToolId::Codex => restore_codex(ctx, binding),
         _ => Ok(()),
+    }?;
+    Ok(RestoreOutcome::Restored)
+}
+
+/// Codex++ 的记录里这个 Agent 还接在网关上（Codex：直连模式当前是托管供应商；Claude：当前是
+/// 网关供应商；Grok：接入时的存档还在，没还原过）。旧版接入、没有存档的 Grok 认不出，按没接算。
+fn recorded_on_gateway(ctx: &ApplyContext, agent: &ToolId) -> bool {
+    match agent {
+        ToolId::Grok => grok_stash_path(ctx).exists(),
+        ToolId::Codex | ToolId::Claude => agent_points_at_gateway(ctx, agent),
+        _ => false,
     }
+}
+
+/// 记录上接在网关、配置却已经指向别处：被别的工具接管了。
+fn taken_over(ctx: &ApplyContext, agent: &ToolId) -> Option<Drift> {
+    if !recorded_on_gateway(ctx, agent) {
+        return None;
+    }
+    drift::check(ctx, agent)
+}
+
+/// Agent 配置现在连的地址；还指向网关时为 None。
+fn live_endpoint(ctx: &ApplyContext, agent: &ToolId) -> Option<String> {
+    drift::check(ctx, agent).map(|found| found.endpoint)
+}
+
+/// 两个地址算同一个：相同，或都是 Codex++ 自己的本地代理（之间换过端口、启动时重写过也算）。
+fn same_endpoint(left: &str, right: &str) -> bool {
+    left.trim_end_matches('/') == right.trim_end_matches('/')
+        || (crate::protocol_proxy::is_managed_protocol_proxy_base_url(left)
+            && crate::protocol_proxy::is_managed_protocol_proxy_base_url(right))
+}
+
+/// 只记认得出的工具名，不记地址（地址里可能带凭据）。
+fn log_taken_over(event: &str, agent: &ToolId, found: &Drift) {
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        event,
+        serde_json::json!({ "agent": agent.as_str(), "by": found.by }),
+    );
+}
+
+/// Agent 已被别的工具接管时的断开：不写 Agent 的配置文件，只清掉网关自己的记录与存档。
+fn forget_gateway(
+    ctx: &ApplyContext,
+    agent: &ToolId,
+    binding: &AgentBinding,
+) -> anyhow::Result<()> {
+    match agent {
+        ToolId::Claude => {
+            if claude::current_provider_id(&ctx.claude)? == GATEWAY_PROVIDER_ID {
+                claude::forget_current(&ctx.claude)?;
+            }
+            if claude::load(&ctx.claude)?
+                .providers
+                .iter()
+                .any(|provider| provider.id == GATEWAY_PROVIDER_ID)
+            {
+                claude::delete_provider(&ctx.claude, GATEWAY_PROVIDER_ID)?;
+            }
+            stash::remove_stash(&claude_stash_path(ctx));
+        }
+        ToolId::Codex => {
+            // 借给 Codex 的账号照样收回：那是网关的登录，留在 Codex 里两边会抢着刷新 token。
+            if ctx.gateway.load().is_ok() {
+                return_lent_login(&ctx.gateway, &ctx.codex_home)?;
+            }
+            // 直连模式的记录改回开启前的供应商（不切换、不写 ~/.codex），删掉托管供应商。
+            let mut settings = ctx.settings.load()?;
+            if settings.active_relay_id == CODEX_GATEWAY_RELAY_ID {
+                let previous = binding.restore.codex_previous_relay_id.trim();
+                let known = |id: &str| {
+                    !id.is_empty()
+                        && id != CODEX_GATEWAY_RELAY_ID
+                        && (settings.relay_profiles.iter().any(|item| item.id == id)
+                            || settings
+                                .aggregate_relay_profiles
+                                .iter()
+                                .any(|item| item.id == id))
+                };
+                settings.active_relay_id = if known(previous) {
+                    previous.to_string()
+                } else {
+                    settings
+                        .relay_profiles
+                        .iter()
+                        .find(|profile| profile.id != CODEX_GATEWAY_RELAY_ID)
+                        .map(|profile| profile.id.clone())
+                        .unwrap_or_else(crate::settings::default_active_relay_id)
+                };
+            }
+            settings
+                .relay_profiles
+                .retain(|profile| profile.id != CODEX_GATEWAY_RELAY_ID);
+            ctx.settings.save(&settings)?;
+            stash::remove_stash(&codex_stash_path(ctx));
+        }
+        ToolId::Grok => stash::remove_stash(&grok_stash_path(ctx)),
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Agent 的配置现在还指向网关（不看 gateway.json 里的绑定）。
@@ -1131,6 +1250,9 @@ fn restore_claude(ctx: &ApplyContext, binding: &AgentBinding) -> anyhow::Result<
     let payload = claude::load(&ctx.claude)?;
     let stash_path = claude_stash_path(ctx);
     if payload.current_id == GATEWAY_PROVIDER_ID {
+        let live_path = ctx.claude.claude_home.join("settings.json");
+        // 切回之前的样子（还指向网关）：存档没记改了哪些键时据此兜底。
+        let on_gateway = stash::read_optional(&live_path)?;
         let previous = binding.restore.claude_previous_provider_id.trim();
         let can_switch_back = !previous.is_empty()
             && payload
@@ -1143,12 +1265,16 @@ fn restore_claude(ctx: &ApplyContext, binding: &AgentBinding) -> anyhow::Result<
             claude::clear_current(&ctx.claude)?;
         }
         if let Some(saved) = stash::load_stash::<FileStash>(&stash_path) {
-            let live_path = ctx.claude.claude_home.join("settings.json");
             let live = stash::read_optional(&live_path)?;
+            let changed = if saved.changed.is_empty() {
+                claude_fallback_changes(saved.before.as_deref(), on_gateway.as_deref())?
+            } else {
+                saved.changed.clone()
+            };
             let restored = stash::restore_json(
                 saved.before.as_deref(),
                 live.as_deref(),
-                &saved.changed,
+                &changed,
                 |_, _, _| false,
             )
             .context("还原 Claude Code 的 settings.json 失败")?;
@@ -1165,6 +1291,29 @@ fn restore_claude(ctx: &ApplyContext, binding: &AgentBinding) -> anyhow::Result<
         claude::delete_provider(&ctx.claude, GATEWAY_PROVIDER_ID)?;
     }
     Ok(())
+}
+
+/// 存档里没记改了哪些键（接入时存下原文后、记下改动前进程就退出了，或第二次写存档失败），
+/// 配置却指向网关：按切换供应商会动的关键字段兜底，与接入前不同的改回去。
+fn claude_fallback_changes(
+    before: Option<&str>,
+    on_gateway: Option<&str>,
+) -> anyhow::Result<Vec<ChangedKey>> {
+    let paths = stash::changed_paths(&stash::json_value(before)?, &stash::json_value(on_gateway)?);
+    Ok(paths
+        .into_iter()
+        .filter(|path| match path.as_slice() {
+            [env, key] if env == "env" => {
+                claude::is_floor_env(key) || claude::is_exclusive_env(key)
+            }
+            [key] => claude::is_floor_top(key),
+            _ => false,
+        })
+        .map(|path| ChangedKey {
+            path,
+            written: None,
+        })
+        .collect())
 }
 
 /// Codex 当前在用的直连供应商（不是托管的网关供应商时）。
@@ -1276,9 +1425,14 @@ fn restore_grok(ctx: &ApplyContext, settings: &BackendSettings) -> anyhow::Resul
     let stash_path = grok_stash_path(ctx);
     if let Some(saved) = stash::load_stash::<FileStash>(&stash_path) {
         if on_gateway {
-            let restored =
-                stash::restore_toml(saved.before.as_deref(), live.as_deref(), &saved.paths())
-                    .context("还原 Grok 的 config.toml 失败")?;
+            let paths = if saved.changed.is_empty() {
+                grok_fallback_paths(saved.before.as_deref(), live.as_deref())
+                    .context("还原 Grok 的 config.toml 失败")?
+            } else {
+                saved.paths()
+            };
+            let restored = stash::restore_toml(saved.before.as_deref(), live.as_deref(), &paths)
+                .context("还原 Grok 的 config.toml 失败")?;
             stash::write_or_remove(&live_path, restored.as_deref())
                 .context("写回 Grok 接入网关前的 config.toml 失败")?;
         }
@@ -1301,6 +1455,22 @@ fn restore_grok(ctx: &ApplyContext, settings: &BackendSettings) -> anyhow::Resul
         )?;
     crate::tools::grok::apply_profile_to_grok_at(&ctx.grok_home, &profile, &ctx.backup_root)?;
     Ok(())
+}
+
+/// Grok 应用供应商时会写的顶层键：默认模型、模型列表地址、各模型的配置。
+const GROK_GATEWAY_KEYS: &[&str] = &["models", "endpoints", "model"];
+
+/// 存档里没记改了哪些键、配置却指向网关（同 [`claude_fallback_changes`]）：
+/// 按网关会写的键兜底，与接入前不同的改回去。
+fn grok_fallback_paths(before: Option<&str>, live: Option<&str>) -> anyhow::Result<Vec<KeyPath>> {
+    let paths = stash::changed_paths(&stash::toml_value(before)?, &stash::toml_value(live)?);
+    Ok(paths
+        .into_iter()
+        .filter(|path| {
+            path.first()
+                .is_some_and(|key| GROK_GATEWAY_KEYS.contains(&key.as_str()))
+        })
+        .collect())
 }
 
 /// 用户在 Claude 供应商列表里直接切到别的供应商：网关绑定随之失效，不再尝试恢复。
@@ -1448,22 +1618,40 @@ pub fn restore_all_for_exit(
     if !force && !gateway.restore_on_exit {
         return Ok(());
     }
-    let mut restored = false;
+    let mut outcomes = Vec::new();
     let mut first_error = None;
     for (agent, binding) in &gateway.bindings {
         if !binding.enabled {
             continue;
         }
-        match restore_agent(ctx, settings, &ToolId::parse(agent), binding) {
-            Ok(()) => restored = true,
+        let tool = ToolId::parse(agent);
+        match restore_agent(ctx, settings, &tool, binding) {
+            Ok(outcome) => outcomes.push((agent.clone(), tool, outcome)),
             Err(error) => {
                 first_error.get_or_insert(error.context(format!("还原 {agent} 失败")));
             }
         }
     }
-    if restored {
+    if !outcomes.is_empty() {
+        // 带锁读改写：只动这几个绑定和标记，不盖掉同时写进来的 token。
         ctx.gateway.update(|latest| {
-            latest.restored_at_exit = true;
+            for (agent, tool, outcome) in &outcomes {
+                let Some(binding) = latest.bindings.get_mut(agent) else {
+                    continue;
+                };
+                match outcome {
+                    // 记下还原后连的地址：下次启动前用户又改了的话就不再接回。
+                    RestoreOutcome::Restored => {
+                        binding.restore.restored_endpoint = live_endpoint(ctx, tool);
+                        latest.restored_at_exit = true;
+                    }
+                    // 已被别的工具接管：等于用户自己断开了，绑定关掉，下次启动不再接回。
+                    RestoreOutcome::TakenOver => {
+                        binding.enabled = false;
+                        binding.restore = Default::default();
+                    }
+                }
+            }
             Ok(())
         })?;
     }
@@ -1475,6 +1663,7 @@ pub fn restore_all_for_exit(
 
 /// 供应商池或路由组变化后重写开着的 Agent 配置：Grok 的模型列表、Claude 的默认模型随池更新。
 /// 不碰恢复现场；某个 Agent 写失败时继续写其它的，最后返回第一个错误。
+/// 已被别的工具接管的 Agent 不重写（界面提示漂移，由用户决定要不要重新接入）。
 pub fn refresh_enabled(ctx: &ApplyContext) -> anyhow::Result<usize> {
     let gateway = ctx.gateway.load()?;
     let mut count = 0;
@@ -1483,7 +1672,11 @@ pub fn refresh_enabled(ctx: &ApplyContext) -> anyhow::Result<usize> {
         if !binding.enabled {
             continue;
         }
-        match write_agent_config(ctx, &ToolId::parse(agent), binding) {
+        let agent = ToolId::parse(agent);
+        if taken_over(ctx, &agent).is_some() {
+            continue;
+        }
+        match write_agent_config(ctx, &agent, binding) {
             Ok(_) => count += 1,
             Err(error) => {
                 first_error.get_or_insert(error);
@@ -1497,45 +1690,89 @@ pub fn refresh_enabled(ctx: &ApplyContext) -> anyhow::Result<usize> {
 }
 
 /// 启动时把开着的绑定重新写进 Agent 配置（退出 / 更新前恢复过直连，或端口变了），并清掉「已恢复」标记。
+///
+/// 某个 Agent 写失败时继续写其它的，最后返回第一个错误；有失败时「已恢复」标记留着，下次启动再试。
+/// 不接回的：还原之后用户又用别的工具改过的（绑定关掉），以及接着网关时被别的工具接管的（界面提示漂移）。
 pub fn reapply_enabled(ctx: &ApplyContext) -> anyhow::Result<usize> {
     let gateway = ctx.gateway.load()?;
     let mut count = 0;
+    let mut first_error = None;
     for (agent, binding) in &gateway.bindings {
         if !binding.enabled {
             continue;
         }
         let agent = ToolId::parse(agent);
-        let mut binding = binding.clone();
-        binding.restore.applied_port = Some(ctx.port);
-        // Claude 恢复过直连时，重新开启前的「上一个供应商」要重新记录。
-        if agent == ToolId::Claude {
-            let current = claude::current_provider_id(&ctx.claude)?;
-            if current != GATEWAY_PROVIDER_ID && !current.is_empty() {
-                binding.restore.claude_previous_provider_id = current;
+        match reapply_binding(ctx, &agent, binding, gateway.restored_at_exit) {
+            Ok(true) => count += 1,
+            Ok(false) => {}
+            Err(error) => {
+                first_error
+                    .get_or_insert(error.context(format!("重新接入 {} 失败", agent.as_str())));
             }
         }
-        if agent == ToolId::Codex {
-            let current = codex_active_relay_id(ctx)?;
-            if !current.is_empty() {
-                binding.restore.codex_previous_relay_id = current;
-            }
-        }
-        if let Some(snapshot) = write_agent_config(ctx, &agent, &binding)?
-            && binding.restore.claude_previous_provider_id.is_empty()
-        {
-            binding.restore.claude_previous_provider_id = snapshot;
-        }
-        ctx.gateway.update(|latest| {
-            latest.bindings.insert(agent.as_str().to_string(), binding);
-            Ok(())
-        })?;
-        count += 1;
+    }
+    if let Some(error) = first_error {
+        return Err(error);
     }
     ctx.gateway.update(|latest| {
         latest.restored_at_exit = false;
         Ok(())
     })?;
     Ok(count)
+}
+
+/// 把一个开着的绑定重新写进 Agent 配置；没写（被别的工具改过）时返回 false。
+fn reapply_binding(
+    ctx: &ApplyContext,
+    agent: &ToolId,
+    binding: &AgentBinding,
+    restored_at_exit: bool,
+) -> anyhow::Result<bool> {
+    // 退出 / 更新前还原过，之后用户又把 Agent 指向了别处：等于用户自己断开了，绑定关掉。
+    if restored_at_exit
+        && let Some(expected) = &binding.restore.restored_endpoint
+        && let Some(found) = drift::check(ctx, agent)
+        && !same_endpoint(&found.endpoint, expected)
+    {
+        ctx.gateway.update(|latest| {
+            if let Some(saved) = latest.bindings.get_mut(agent.as_str()) {
+                saved.enabled = false;
+                saved.restore = Default::default();
+            }
+            Ok(())
+        })?;
+        log_taken_over("gateway.reapply_skipped_taken_over", agent, &found);
+        return Ok(false);
+    }
+    if taken_over(ctx, agent).is_some() {
+        return Ok(false);
+    }
+    let mut binding = binding.clone();
+    binding.restore.applied_port = Some(ctx.port);
+    binding.restore.restored_endpoint = None;
+    // Claude 恢复过直连时，重新开启前的「上一个供应商」要重新记录。
+    if *agent == ToolId::Claude {
+        let current = claude::current_provider_id(&ctx.claude)?;
+        if current != GATEWAY_PROVIDER_ID && !current.is_empty() {
+            binding.restore.claude_previous_provider_id = current;
+        }
+    }
+    if *agent == ToolId::Codex {
+        let current = codex_active_relay_id(ctx)?;
+        if !current.is_empty() {
+            binding.restore.codex_previous_relay_id = current;
+        }
+    }
+    if let Some(snapshot) = write_agent_config(ctx, agent, &binding)?
+        && binding.restore.claude_previous_provider_id.is_empty()
+    {
+        binding.restore.claude_previous_provider_id = snapshot;
+    }
+    ctx.gateway.update(|latest| {
+        latest.bindings.insert(agent.as_str().to_string(), binding);
+        Ok(())
+    })?;
+    Ok(true)
 }
 
 /// 把一个 Claude 供应商复制成网关供应商（Anthropic 协议）。只读 Claude 的数据，不改它。

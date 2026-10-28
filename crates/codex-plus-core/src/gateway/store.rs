@@ -304,6 +304,10 @@ pub struct GatewayRestoreState {
     /// 写进各 Agent 配置时用的网关端口；端口变化后要重写。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_port: Option<u16>,
+    /// 退出 / 更新前还原成直连后，Agent 配置里连的地址。下次启动重新接回网关前比对：
+    /// 变了说明用户在这期间用别的工具改过，不再接回（会盖掉用户的新选择）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_endpoint: Option<String>,
     /// 不认识的字段原样保留。
     #[serde(flatten)]
     pub extra: Map<String, Value>,
