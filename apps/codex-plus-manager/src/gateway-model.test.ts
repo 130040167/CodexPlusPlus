@@ -393,3 +393,13 @@ test("赞助商单独一组放在「添加供应商」最前面，不再混在�
   const catalog = readFileSync(new URL("./GatewayProviders.tsx", import.meta.url), "utf8");
   assert.ok(catalog.indexOf('key: "sponsor"') < catalog.indexOf('key: "subscription"'));
 });
+
+test("起名模型随绑定草稿往返，空值和旧版后端缺字段都当成不指定", () => {
+  const legacy = { ...blankBinding(), enabled: true, model: "deepseek-v4-pro" };
+  assert.equal(draftFromBinding(legacy).titleModel, "");
+  const draft = { ...draftFromBinding(legacy), titleModel: " kimi/kimi-k3 " };
+  const binding = bindingFromDraft(draft, legacy);
+  assert.equal(binding.titleModel, "kimi/kimi-k3");
+  assert.equal(draftFromBinding(binding).titleModel, "kimi/kimi-k3");
+  assert.equal(bindingFromDraft({ ...draft, titleModel: "  " }, binding).titleModel, "");
+});

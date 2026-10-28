@@ -69,18 +69,30 @@ pub(crate) fn evict(key: &CacheKey) {
 }
 
 pub(crate) struct ExecOutcome {
-    key: CacheKey,
+    /// 协商得来的适配才有缓存键；按上游类型直接适配的没有，也不进协商缓存。
+    key: Option<CacheKey>,
+    adaptation: crate::responses_exec::ToolAdaptation,
     settings: BackendSettings,
     finished: bool,
 }
 
 impl ExecOutcome {
-    pub(crate) fn new(key: CacheKey, settings: &BackendSettings) -> Self {
+    pub(crate) fn new(
+        key: Option<CacheKey>,
+        adaptation: crate::responses_exec::ToolAdaptation,
+        settings: &BackendSettings,
+    ) -> Self {
         Self {
             key,
+            adaptation,
             settings: settings.clone(),
             finished: false,
         }
+    }
+
+    /// 响应要按哪些工具改写还原。
+    pub(crate) fn adaptation(&self) -> &crate::responses_exec::ToolAdaptation {
+        &self.adaptation
     }
 
     // Dropping an unfinished outcome is cancellation, not capability evidence.
@@ -89,13 +101,15 @@ impl ExecOutcome {
             return;
         }
         self.finished = true;
-        evict(&self.key);
-        if success {
-            let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
-            entries.retain(|(_, created)| created.elapsed() < CACHE_TTL);
-            entries.push_back((self.key, Instant::now()));
-            while entries.len() > CACHE_CAPACITY {
-                entries.pop_front();
+        if let Some(key) = self.key {
+            evict(&key);
+            if success {
+                let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
+                entries.retain(|(_, created)| created.elapsed() < CACHE_TTL);
+                entries.push_back((key, Instant::now()));
+                while entries.len() > CACHE_CAPACITY {
+                    entries.pop_front();
+                }
             }
         }
         crate::relay_rotation::record_relay_request_event(
@@ -168,7 +182,10 @@ pub(crate) async fn inspect_rejection(
     Ok((reqwest::Response::from(rebuilt), matches))
 }
 
-pub(crate) fn adapted_json(bytes: &[u8]) -> (Vec<u8>, bool) {
+pub(crate) fn adapted_json(
+    bytes: &[u8],
+    adaptation: &crate::responses_exec::ToolAdaptation,
+) -> (Vec<u8>, bool) {
     let result = (|| -> anyhow::Result<Value> {
         let value: Value = serde_json::from_slice(bytes)?;
         anyhow::ensure!(
@@ -176,7 +193,7 @@ pub(crate) fn adapted_json(bytes: &[u8]) -> (Vec<u8>, bool) {
                 && value.get("output").is_some_and(Value::is_array),
             "adapted response is not complete"
         );
-        crate::responses_exec::adapt_response(value)
+        crate::responses_exec::adapt_response_for(value, adaptation)
     })();
     match result {
         Ok(value) => (
@@ -255,7 +272,8 @@ mod tests {
     #[test]
     fn invalid_json_produces_no_executable_output() {
         for bytes in [b"{}".as_slice(), b"not JSON".as_slice()] {
-            let (output, valid) = adapted_json(bytes);
+            let (output, valid) =
+                adapted_json(bytes, &crate::responses_exec::ToolAdaptation::exec());
             assert!(!valid);
             let output: Value = serde_json::from_slice(&output).unwrap();
             assert_eq!(output["status"], "failed");
@@ -311,20 +329,37 @@ mod tests {
     fn only_completed_validated_outcomes_create_bounded_cache_evidence() {
         let settings = BackendSettings::default();
         let canceled_key = Sha256::digest(b"canceled-exec-outcome").into();
-        drop(ExecOutcome::new(canceled_key, &settings));
+        drop(ExecOutcome::new(
+            Some(canceled_key),
+            crate::responses_exec::ToolAdaptation::exec(),
+            &settings,
+        ));
         assert!(!cached(&canceled_key));
         let good_key = Sha256::digest(b"successful-exec-outcome").into();
-        let mut valid = ExecOutcome::new(good_key, &settings);
+        let mut valid = ExecOutcome::new(
+            Some(good_key),
+            crate::responses_exec::ToolAdaptation::exec(),
+            &settings,
+        );
         valid.finish(true);
         assert!(cached(&good_key));
         valid.finish(false);
         assert!(cached(&good_key), "outcomes are accounted exactly once");
-        let mut invalid = ExecOutcome::new(good_key, &settings);
+        let mut invalid = ExecOutcome::new(
+            Some(good_key),
+            crate::responses_exec::ToolAdaptation::exec(),
+            &settings,
+        );
         invalid.finish(false);
         assert!(!cached(&good_key));
         for index in 0..=CACHE_CAPACITY {
             let key = Sha256::digest(index.to_be_bytes()).into();
-            ExecOutcome::new(key, &settings).finish(true);
+            ExecOutcome::new(
+                Some(key),
+                crate::responses_exec::ToolAdaptation::exec(),
+                &settings,
+            )
+            .finish(true);
         }
         let mut entries = cache().lock().unwrap_or_else(|error| error.into_inner());
         assert_eq!(entries.len(), CACHE_CAPACITY);

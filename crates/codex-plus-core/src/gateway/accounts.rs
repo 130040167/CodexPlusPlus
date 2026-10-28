@@ -784,18 +784,118 @@ const GROK_REFRESH_AHEAD_MS: u64 = 5 * 60 * 1000;
 const GROK_DEFAULT_MODELS: &[&str] =
     &["grok-4.6", "grok-build-0.1", "grok-4.3", "grok-code-fast-1"];
 
-/// 冒充的 Grok CLI 版本。xAI 会抬高最低版本（低于时回 426 Upgrade Required），届时跟着改。
+/// 冒充的 Grok CLI 版本兜底值。xAI 会抬高最低版本（低于时回 426 Upgrade Required），
+/// 平时联网取官方稳定版，取不到或比这个旧时才用它。
 const GROK_CLIENT_VERSION: &str = "1.0.70";
+/// 官方安装脚本读的稳定渠道指针，正文第一行是版本号；x.ai 不通时脚本回退到 GCS 镜像。
+const GROK_STABLE_CHANNEL_URLS: &[&str] = &[
+    "https://x.ai/cli/stable",
+    "https://storage.googleapis.com/grok-build-public-artifacts/cli/stable",
+];
+const GROK_VERSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const GROK_VERSION_RETRY: Duration = Duration::from_secs(60 * 60);
+
+struct GrokVersionCache {
+    /// 最近一次取到的版本号；查询失败时保留上次的值。
+    version: Option<String>,
+    checked_at: std::time::Instant,
+    ok: bool,
+}
+
+static GROK_VERSION_CACHE: std::sync::Mutex<Option<GrokVersionCache>> = std::sync::Mutex::new(None);
 
 /// 推理代理要求的客户端标识，缺了会回 426。
-pub fn grok_proxy_headers() -> Vec<(&'static str, &'static str)> {
+pub fn grok_proxy_headers() -> Vec<(&'static str, String)> {
     vec![
-        ("X-XAI-Token-Auth", "xai-grok-cli"),
-        ("x-authenticateresponse", "authenticate-response"),
-        ("x-grok-client-mode", "headless"),
-        ("x-grok-client-version", GROK_CLIENT_VERSION),
-        ("x-grok-client-identifier", "grok-shell"),
+        ("X-XAI-Token-Auth", "xai-grok-cli".to_string()),
+        (
+            "x-authenticateresponse",
+            "authenticate-response".to_string(),
+        ),
+        ("x-grok-client-mode", "headless".to_string()),
+        ("x-grok-client-version", grok_client_version()),
+        ("x-grok-client-identifier", "grok-shell".to_string()),
     ]
+}
+
+fn grok_client_version() -> String {
+    let fetched = GROK_VERSION_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.as_ref().and_then(|cache| cache.version.clone()));
+    pick_grok_client_version(fetched.as_deref())
+}
+
+/// 联网值和兜底常量取较新的那个；联网值格式不对就不用。
+fn pick_grok_client_version(fetched: Option<&str>) -> String {
+    let fallback = parse_grok_version(GROK_CLIENT_VERSION).expect("兜底版本号格式正确");
+    let (major, minor, patch) = fetched
+        .and_then(parse_grok_version)
+        .filter(|version| *version > fallback)
+        .unwrap_or(fallback);
+    format!("{major}.{minor}.{patch}")
+}
+
+/// 只认 `X.Y.Z`，预发布后缀、HTML 错误页之类一律不用。
+fn parse_grok_version(value: &str) -> Option<(u64, u64, u64)> {
+    let value = value.lines().next()?.trim();
+    let mut parts = value.split('.').map(|part| {
+        (!part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| part.parse::<u64>().ok())
+            .flatten()
+    });
+    let version = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(version)
+}
+
+/// 缓存过期才联网，并发请求共用一次查询。查询失败只影响版本号来源，不挡请求本身。
+async fn refresh_grok_client_version() {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let _guard = LOCK.get_or_init(Default::default).lock().await;
+    let due = match GROK_VERSION_CACHE.lock() {
+        Ok(cache) => cache.as_ref().is_none_or(|cache| {
+            let ttl = if cache.ok {
+                GROK_VERSION_TTL
+            } else {
+                GROK_VERSION_RETRY
+            };
+            cache.checked_at.elapsed() >= ttl
+        }),
+        Err(_) => false,
+    };
+    if !due {
+        return;
+    }
+    let fetched = fetch_grok_stable_version().await;
+    if let Ok(mut cache) = GROK_VERSION_CACHE.lock() {
+        let previous = cache.take().and_then(|cache| cache.version);
+        *cache = Some(GrokVersionCache {
+            ok: fetched.is_some(),
+            version: fetched.or(previous),
+            checked_at: std::time::Instant::now(),
+        });
+    }
+}
+
+async fn fetch_grok_stable_version() -> Option<String> {
+    for url in GROK_STABLE_CHANNEL_URLS {
+        let Ok(client) = crate::http_client::proxied_client_for_url_with_timeouts(
+            "",
+            url,
+            Duration::from_secs(3),
+            Duration::from_secs(5),
+        ) else {
+            continue;
+        };
+        let body = match client.get(*url).send().await {
+            Ok(response) if response.status().is_success() => response.text().await.ok(),
+            _ => None,
+        };
+        if let Some((major, minor, patch)) = body.as_deref().and_then(parse_grok_version) {
+            return Some(format!("{major}.{minor}.{patch}"));
+        }
+    }
+    None
 }
 
 /// 登录时这些头已存进供应商配置，版本号升级后老账号仍带旧值。
@@ -814,7 +914,7 @@ fn sync_grok_proxy_headers(relay: &mut RelayProfile) {
                 .into_iter()
                 .map(|(key, value)| crate::settings::RelayHeaderKeyValue {
                     key: key.to_string(),
-                    value: value.to_string(),
+                    value,
                 }),
         );
 }
@@ -941,6 +1041,7 @@ pub async fn grok_login(open_browser: impl FnOnce(&str)) -> anyhow::Result<GrokT
 
 /// SuperGrok 账号可用的模型；读不到时用常见的几个。
 pub async fn grok_models(access_token: &str) -> Vec<String> {
+    refresh_grok_client_version().await;
     let fetched = async {
         let mut request = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
@@ -1017,7 +1118,7 @@ pub fn grok_relay(tokens: &GrokTokens, models: &[String]) -> RelayProfile {
             .into_iter()
             .map(|(key, value)| crate::settings::RelayHeaderKeyValue {
                 key: key.to_string(),
-                value: value.to_string(),
+                value,
             })
             .collect(),
         ..RelayProfile::default()
@@ -1044,6 +1145,7 @@ fn grok_from_auth(relay: &RelayProfile, value: &Value) -> Option<RelayProfile> {
 }
 
 async fn prepare_grok(relay: &RelayProfile, value: &Value) -> anyhow::Result<RelayProfile> {
+    refresh_grok_client_version().await;
     if let Some(ready) = grok_from_auth(relay, value) {
         return Ok(ready);
     }
@@ -2270,13 +2372,43 @@ mod tests {
             .filter(|header| header.key.eq_ignore_ascii_case("x-grok-client-version"))
             .map(|header| header.value.as_str())
             .collect();
-        assert_eq!(versions, vec![GROK_CLIENT_VERSION]);
+        assert_eq!(versions, vec![grok_client_version()]);
         assert!(
             ready
                 .custom_headers
                 .iter()
                 .any(|header| header.key == "X-Custom" && header.value == "keep")
         );
+    }
+
+    #[test]
+    fn grok_client_version_prefers_newer_stable_and_falls_back_to_constant() {
+        assert_eq!(parse_grok_version("1.0.70\n"), Some((1, 0, 70)));
+        assert_eq!(parse_grok_version("  2.10.3\r\nextra"), Some((2, 10, 3)));
+        for bad in [
+            "",
+            "1.0",
+            "1.0.70.1",
+            "1.0.70-rc1",
+            "+1.0.70",
+            "v1.0.70",
+            "<html>",
+        ] {
+            assert_eq!(parse_grok_version(bad), None, "{bad:?} 不是合法版本号");
+        }
+
+        assert_eq!(pick_grok_client_version(Some("1.0.73")), "1.0.73");
+        assert_eq!(pick_grok_client_version(Some("1.1.0")), "1.1.0");
+        assert_eq!(
+            pick_grok_client_version(Some("1.0.13")),
+            GROK_CLIENT_VERSION,
+            "联网值比兜底旧时用兜底"
+        );
+        assert_eq!(
+            pick_grok_client_version(Some("garbage")),
+            GROK_CLIENT_VERSION
+        );
+        assert_eq!(pick_grok_client_version(None), GROK_CLIENT_VERSION);
     }
 
     #[test]

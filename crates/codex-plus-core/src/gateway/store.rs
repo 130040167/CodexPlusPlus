@@ -336,6 +336,11 @@ pub struct AgentBinding {
     /// 空串表示未设置，保持原有行为。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub auto_review_model: String,
+    /// 起名模型（目前只有 Codex 用）：Codex 给会话起名 / 定期重新起名时另开临时线程，
+    /// 用它内置的轻量模型（如 gpt-6-luna）或会话当前模型，池里有 ChatGPT 账号时会落到订阅额度上。
+    /// 填了就把识别出的起名请求改发到这个模型（写法同审批模型）；空串表示不改，保持原有行为。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title_model: String,
     /// 写给 Agent 的上下文窗口（Claude Code 的 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
@@ -367,6 +372,7 @@ impl Default for AgentBinding {
             claude_roles: ClaudeRoleModels::default(),
             unknown_model: UnknownModelPolicy::default(),
             auto_review_model: String::new(),
+            title_model: String::new(),
             context_window: None,
             claude_enable_effort: false,
             pool_exclude: Vec::new(),

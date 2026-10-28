@@ -740,7 +740,8 @@ pub(crate) fn build_model_catalog_json_with_capabilities(
                 model["auto_compact_token_limit"] = Value::Null;
             }
             model["priority"] = json!(1000 + index);
-            model["visibility"] = json!("list");
+            model["visibility"] =
+                json!(crate::aggregate_catalog::catalog_visibility(&entry.slug));
             // Custom Responses relay catalogs must advertise the v2 multi-agent
             // contract so Codex exposes the sub-agent tools.
             // 供应商级显式选择（#2683）优先：链路能否承载 v2 加密载荷对整家供应商
