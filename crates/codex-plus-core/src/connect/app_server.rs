@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -13,12 +13,19 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// app-server 起不来时保留多少行 stderr 用于报错。
 const STDERR_TAIL_LINES: usize = 8;
 const TURN_TIMEOUT: Duration = Duration::from_secs(600);
+const MAX_PENDING_TURN_MESSAGES: usize = 256;
+
+pub struct SessionControlChannel<'a> {
+    pub options_store: &'a super::controls::SessionOptionsStore,
+    pub defaults: &'a super::controls::SessionOptions,
+}
 
 #[derive(Debug, Clone)]
 pub struct AppServerConfig {
     pub executable: String,
     pub work_dir: PathBuf,
     pub model: String,
+    pub reasoning_effort: String,
     pub sandbox: String,
 }
 
@@ -42,7 +49,10 @@ pub struct CodexAppServer {
     stdout: Lines<BufReader<ChildStdout>>,
     next_id: u64,
     running: bool,
+    named_permissions: bool,
     config: AppServerConfig,
+    #[cfg(test)]
+    test_catalog: Option<Value>,
 }
 
 fn collect_stderr_tail(sink: &Arc<Mutex<VecDeque<String>>>) -> String {
@@ -176,12 +186,14 @@ fn spawn_failure_hint(executable: &str, kind: std::io::ErrorKind) -> &'static st
 }
 
 impl CodexAppServer {
-    pub async fn start(config: AppServerConfig) -> anyhow::Result<Self> {
+    pub async fn start(mut config: AppServerConfig) -> anyhow::Result<Self> {
+        config.work_dir = std::path::absolute(&config.work_dir).context("无法解析微信工作目录")?;
         let executable = resolve_startup_executable(config.executable.trim());
         validate_codex_executable(&executable)?;
         let mut command = Command::new(&executable);
         command
             .arg("app-server")
+            .env_remove("CODEX_APP_TOOLS_PIPE_PATH")
             .current_dir(&config.work_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -235,7 +247,10 @@ impl CodexAppServer {
             stdout: BufReader::new(stdout).lines(),
             next_id: 1,
             running: true,
+            named_permissions: false,
             config,
+            #[cfg(test)]
+            test_catalog: None,
         };
         if let Err(error) = server.initialize().await {
             let detail = collect_stderr_tail(&stderr_tail);
@@ -252,24 +267,60 @@ impl CodexAppServer {
         self.running
     }
 
+    pub fn set_session_config(&mut self, config: &AppServerConfig) {
+        self.config = config.clone();
+    }
+
+    pub async fn api_request(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.request(method, params, REQUEST_TIMEOUT).await
+    }
+
     pub async fn prepare_thread(&mut self, thread_id: Option<&str>) -> anyhow::Result<String> {
+        self.prepare_thread_in_project(thread_id, None).await
+    }
+
+    pub async fn prepare_thread_in_project(
+        &mut self,
+        thread_id: Option<&str>,
+        project_id: Option<&str>,
+    ) -> anyhow::Result<String> {
+        self.negotiate_permissions().await?;
         let mut params = self.thread_params();
         let method = if let Some(thread_id) = thread_id.filter(|id| !id.trim().is_empty()) {
             params["threadId"] = Value::String(thread_id.trim().to_string());
-            params["persistExtendedHistory"] = Value::Bool(true);
+            params.as_object_mut().unwrap().remove("dynamicTools");
             "thread/resume"
         } else {
+            if let Some(project_id) = project_id {
+                params["projectId"] = json!(project_id);
+            }
             "thread/start"
         };
         let result = self.request(method, params, REQUEST_TIMEOUT).await?;
-        extract_thread_id(&result)
-            .with_context(|| format!("Codex app-server {method} 未返回 thread id"))
+        verify_sandbox_policy(&result, &self.config.sandbox)?;
+        let result_id = extract_thread_id(&result)
+            .with_context(|| format!("Codex app-server {method} 未返回 thread id"))?;
+        if let Some(expected) = thread_id.filter(|id| !id.trim().is_empty())
+            && result_id != expected.trim()
+        {
+            bail!("Codex app-server 恢复了不同的线程，原会话映射已保留");
+        }
+        Ok(result_id)
     }
 
     pub async fn run_turn(
         &mut self,
         thread_id: &str,
         prompt: &str,
+    ) -> anyhow::Result<AppServerTurnResult> {
+        self.run_turn_with_controls(thread_id, prompt, None).await
+    }
+
+    pub async fn run_turn_with_controls(
+        &mut self,
+        thread_id: &str,
+        prompt: &str,
+        channel: Option<SessionControlChannel<'_>>,
     ) -> anyhow::Result<AppServerTurnResult> {
         let id = self.take_request_id();
         let mut params = json!({
@@ -284,6 +335,13 @@ impl CodexAppServer {
         if !self.config.model.trim().is_empty() {
             params["model"] = Value::String(self.config.model.trim().to_string());
         }
+        params["cwd"] = json!(self.config.work_dir);
+        if !self.config.reasoning_effort.is_empty() {
+            params["effort"] = json!(self.config.reasoning_effort);
+        }
+        if self.named_permissions {
+            params["permissions"] = json!(permission_profile(&self.config.sandbox));
+        }
         self.write_json(&json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -293,6 +351,9 @@ impl CodexAppServer {
         .await?;
 
         let mut response_received = false;
+        let mut turn_id = String::new();
+        let mut pending_messages = VecDeque::new();
+        let mut session_results = HashMap::new();
         let mut turn_completed = false;
         let mut reply_parts = Vec::new();
         let mut model = self.config.model.trim().to_string();
@@ -303,19 +364,20 @@ impl CodexAppServer {
             if remaining.is_zero() {
                 bail!("等待 Codex 回复超时");
             }
-            let message = self.read_message(remaining).await?;
-            if is_server_request(&message) {
-                self.reject_server_request(&message).await?;
-                continue;
-            }
+            let message = if response_received {
+                match pending_messages.pop_front() {
+                    Some(message) => message,
+                    None => self.read_message(remaining).await?,
+                }
+            } else {
+                self.read_message(remaining).await?
+            };
             if response_id(&message) == Some(id) {
                 if let Some(error) = rpc_error(&message) {
                     bail!("Codex turn/start 失败：{error}");
                 }
                 let result = message.get("result").cloned().unwrap_or(Value::Null);
-                if extract_turn_id(&result).is_none() {
-                    bail!("Codex turn/start 未返回 turn id");
-                }
+                turn_id = extract_turn_id(&result).context("Codex turn/start 未返回 turn id")?;
                 if model.is_empty() {
                     model = extract_model(&result).unwrap_or_default();
                 }
@@ -323,6 +385,28 @@ impl CodexAppServer {
                     usage = reported_usage;
                 }
                 response_received = true;
+                continue;
+            }
+            if !response_received {
+                if pending_messages.len() >= MAX_PENDING_TURN_MESSAGES {
+                    bail!("Codex turn/start 响应前的消息数量超过限制");
+                }
+                pending_messages.push_back(message);
+                continue;
+            }
+            if is_server_request(&message) {
+                if message["method"] == "item/tool/call"
+                    && message_belongs_to_turn(&message, thread_id, &turn_id)
+                    && let Some(channel) = channel.as_ref()
+                {
+                    self.handle_session_tool(&message, thread_id, channel, &mut session_results)
+                        .await?;
+                } else {
+                    self.reject_server_request(&message).await?;
+                }
+                continue;
+            }
+            if !message_belongs_to_turn(&message, thread_id, &turn_id) {
                 continue;
             }
 
@@ -341,8 +425,13 @@ impl CodexAppServer {
                         }
                     }
                 }
-                Some("turn/completed") => turn_completed = true,
-                Some("thread/status/changed") if thread_status_is_idle(&message) => {
+                Some("turn/completed") => {
+                    if matches!(
+                        message["params"]["turn"]["status"].as_str(),
+                        Some("failed" | "interrupted")
+                    ) {
+                        bail!("Codex 处理失败：{}", message["params"]["turn"]["error"]);
+                    }
                     turn_completed = true;
                 }
                 Some("error") => {
@@ -399,18 +488,117 @@ impl CodexAppServer {
         .await
     }
 
+    async fn negotiate_permissions(&mut self) -> anyhow::Result<()> {
+        self.named_permissions = false;
+        if let Some(result) = self
+            .request_optional(
+                "permissionProfile/list",
+                json!({"cwd":self.config.work_dir}),
+                REQUEST_TIMEOUT,
+            )
+            .await?
+        {
+            let expected = permission_profile(&self.config.sandbox);
+            let profiles = result["data"]
+                .as_array()
+                .context("未返回可确认的权限配置列表")?;
+            if !profiles
+                .iter()
+                .any(|profile| profile["id"] == expected && profile["allowed"] == true)
+            {
+                bail!("Codex app-server 不允许微信连接请求的权限配置：{expected}");
+            }
+            self.named_permissions = true;
+        }
+        Ok(())
+    }
+
     fn thread_params(&self) -> Value {
         let mut params = json!({
             "cwd": self.config.work_dir.to_string_lossy(),
             "experimentalRawEvents": false,
-            "persistExtendedHistory": false,
+            "historyMode": "legacy",
+            "ephemeral": false,
             "approvalPolicy": "never",
-            "sandbox": normalize_sandbox(&self.config.sandbox)
+            "sandbox": normalize_sandbox(&self.config.sandbox),
+            "dynamicTools": [super::controls::session_tool_spec()]
         });
         if !self.config.model.trim().is_empty() {
             params["model"] = Value::String(self.config.model.trim().to_string());
         }
+        if !self.config.reasoning_effort.is_empty() {
+            params["config"] = json!({"model_reasoning_effort":self.config.reasoning_effort});
+        }
+        if self.named_permissions {
+            params.as_object_mut().unwrap().remove("sandbox");
+            params["permissions"] = json!(permission_profile(&self.config.sandbox));
+            params["runtimeWorkspaceRoots"] = json!([self.config.work_dir]);
+        }
         params
+    }
+
+    async fn handle_session_tool(
+        &mut self,
+        message: &Value,
+        thread_id: &str,
+        channel: &SessionControlChannel<'_>,
+        results: &mut HashMap<String, Value>,
+    ) -> anyhow::Result<()> {
+        let call_id = message["params"]["callId"]
+            .as_str()
+            .filter(|id| !id.is_empty());
+        let valid = message["params"]["tool"] == "weixin_session_settings"
+            && message["params"]["namespace"].is_null()
+            && message["params"]["threadId"] == thread_id;
+        if valid && let Some(cached) = call_id.and_then(|id| results.get(id)) {
+            return self
+                .write_json(&json!({"jsonrpc":"2.0","id":message["id"],"result":cached}))
+                .await;
+        }
+        let result = async {
+            if !valid || call_id.is_none() {
+                bail!("设置工具不属于当前微信会话");
+            }
+            let args = message["params"]["arguments"].as_object().context("设置参数必须是对象")?;
+            if args.keys().any(|key| !["action","model","reasoningEffort"].contains(&key.as_str())) {
+                bail!("不支持的设置参数");
+            }
+            #[cfg(test)]
+            let catalog = match &self.test_catalog {
+                Some(catalog) => catalog.clone(),
+                None => crate::model_catalog::read_codex_model_catalog().await,
+            };
+            #[cfg(not(test))]
+            let catalog = crate::model_catalog::read_codex_model_catalog().await;
+            let mut next = channel.options_store.load()?;
+            match args.get("action").and_then(Value::as_str) {
+                Some("set") => {
+                    next = super::controls::updated_options(&catalog, channel.defaults, &next, args)?;
+                    channel.options_store.save(next.clone())?;
+                }
+                Some("get") => {}
+                _ => bail!("未知设置操作"),
+            }
+            Ok::<_, anyhow::Error>(json!({
+                "currentTurn":{"model":self.config.model,"reasoningEffort":self.config.reasoning_effort},
+                "savedOverrides":next,"appliesFrom":"next-message",
+                "connectionDefaults":channel.defaults,
+                "models":catalog["models"],"modelMetadata":catalog["modelMetadata"]
+            }))
+        }.await;
+        let result = match result {
+            Ok(value) => {
+                json!({"success":true,"contentItems":[{"type":"inputText","text":value.to_string()}]})
+            }
+            Err(error) => {
+                json!({"success":false,"contentItems":[{"type":"inputText","text":error.to_string()}]})
+            }
+        };
+        if valid && let Some(id) = call_id {
+            results.insert(id.to_string(), result.clone());
+        }
+        self.write_json(&json!({"jsonrpc":"2.0","id":message["id"],"result":result}))
+            .await
     }
 
     async fn request(
@@ -419,6 +607,17 @@ impl CodexAppServer {
         params: Value,
         timeout: Duration,
     ) -> anyhow::Result<Value> {
+        self.request_optional(method, params, timeout)
+            .await?
+            .with_context(|| format!("Codex app-server 不支持 {method}"))
+    }
+
+    async fn request_optional(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<Value>> {
         let id = self.take_request_id();
         self.write_json(&json!({
             "jsonrpc": "2.0",
@@ -441,10 +640,13 @@ impl CodexAppServer {
             if response_id(&message) != Some(id) {
                 continue;
             }
+            if message["error"]["code"].as_i64() == Some(-32601) {
+                return Ok(None);
+            }
             if let Some(error) = rpc_error(&message) {
                 bail!("Codex app-server {method} 失败：{error}");
             }
-            return Ok(message.get("result").cloned().unwrap_or(Value::Null));
+            return Ok(Some(message.get("result").cloned().unwrap_or(Value::Null)));
         }
     }
 
@@ -543,6 +745,36 @@ fn normalize_sandbox(value: &str) -> &'static str {
         "danger-full-access" => "danger-full-access",
         _ => "read-only",
     }
+}
+
+fn permission_profile(sandbox: &str) -> &'static str {
+    match normalize_sandbox(sandbox) {
+        "workspace-write" => ":workspace",
+        "danger-full-access" => ":danger-full-access",
+        _ => ":read-only",
+    }
+}
+
+fn verify_sandbox_policy(result: &Value, expected: &str) -> anyhow::Result<()> {
+    let actual = match result["sandbox"]["type"].as_str() {
+        Some("readOnly" | "read-only") => "read-only",
+        Some("workspaceWrite" | "workspace-write") => "workspace-write",
+        Some("dangerFullAccess" | "danger-full-access") => "danger-full-access",
+        _ => bail!("Codex app-server 未确认微信会话权限"),
+    };
+    if actual != normalize_sandbox(expected) {
+        bail!("Codex app-server 返回的权限与微信连接设置不符");
+    }
+    Ok(())
+}
+
+fn message_belongs_to_turn(message: &Value, thread_id: &str, turn_id: &str) -> bool {
+    let params = &message["params"];
+    params["threadId"].as_str() == Some(thread_id)
+        && params["turnId"]
+            .as_str()
+            .or_else(|| params["turn"]["id"].as_str())
+            == Some(turn_id)
 }
 
 fn response_id(message: &Value) -> Option<u64> {
@@ -647,15 +879,6 @@ fn extract_completed_agent_text(message: &Value) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-fn thread_status_is_idle(message: &Value) -> bool {
-    message
-        .get("params")
-        .and_then(|params| params.get("status"))
-        .and_then(|status| status.get("type").or(Some(status)))
-        .and_then(Value::as_str)
-        == Some("idle")
-}
-
 fn deep_string(value: Option<&Value>, keys: &[&str]) -> Option<String> {
     let value = value?;
     if let Some(text) = value.as_str() {
@@ -685,6 +908,268 @@ fn deep_string(value: Option<&Value>, keys: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_server(root: &Path, mode: &str) -> CodexAppServer {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "connect::app_server::tests::session_stdio_fixture",
+                "--nocapture",
+            ])
+            .env("CODEX_PLUS_SESSION_FIXTURE", mode)
+            .current_dir(root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+        let mut child = command.spawn().unwrap();
+        CodexAppServer {
+            stdin: child.stdin.take().unwrap(),
+            stdout: BufReader::new(child.stdout.take().unwrap()).lines(),
+            child,
+            next_id: 1,
+            running: true,
+            named_permissions: false,
+            config: AppServerConfig {
+                executable: String::new(),
+                work_dir: root.to_owned(),
+                model: "fixture".into(),
+                reasoning_effort: "high".into(),
+                sandbox: "read-only".into(),
+            },
+            test_catalog: Some(json!({"models":["fixture"],"modelMetadata":{
+                "fixture":{"supportedReasoningEfforts":["low","high"]}
+            }})),
+        }
+    }
+
+    #[test]
+    fn session_stdio_fixture() {
+        use std::io::{BufRead, Write};
+        let Ok(mode) = std::env::var("CODEX_PLUS_SESSION_FIXTURE") else {
+            return;
+        };
+        let emit = |value: Value| {
+            println!("{value}");
+            std::io::stdout().flush().unwrap();
+        };
+        let tool = |id: &str, turn: &str, namespace: Option<&str>, args: Value| {
+            emit(json!({"id":id,"method":"item/tool/call","params":{
+                "threadId":"original","turnId":turn,"callId":id,
+                "tool":"weixin_session_settings","namespace":namespace,"arguments":args
+            }}));
+        };
+        let complete = |turn: &str| {
+            emit(json!({"method":"item/completed","params":{
+                "threadId":"other","turnId":turn,"item":{"type":"agentMessage","text":"FOREIGN"}
+            }}));
+            emit(json!({"method":"item/completed","params":{
+                "threadId":"original","turnId":turn,"item":{"type":"agentMessage","text":"checked"}
+            }}));
+            emit(json!({"method":"turn/completed","params":{
+                "threadId":"original","turn":{"id":turn,"status":"completed"}
+            }}));
+        };
+        let mut turns = 0;
+        let mut seen_set = false;
+        for line in std::io::stdin().lock().lines() {
+            let message: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let id = message["id"].clone();
+            let params = &message["params"];
+            match message["method"].as_str() {
+                Some("initialize") => emit(json!({"id":id,"result":{}})),
+                Some("initialized") => {}
+                Some("permissionProfile/list") => {
+                    if mode == "legacy" {
+                        emit(json!({"id":id,"error":{"code":-32601,"message":"unsupported"}}));
+                    } else {
+                        emit(json!({"id":id,"result":{"data":[
+                            {"id":":read-only","allowed":true},
+                            {"id":":workspace","allowed":true}
+                        ]}}));
+                    }
+                }
+                Some("thread/start") => {
+                    assert_eq!(params["projectId"], "project-1");
+                    assert_eq!(params["dynamicTools"].as_array().unwrap().len(), 1);
+                    assert_eq!(params["dynamicTools"][0]["name"], "weixin_session_settings");
+                    assert_eq!(params["config"]["model_reasoning_effort"], "high");
+                    emit(json!({"id":id,"result":{"thread":{"id":"original"},
+                        "sandbox":{"type":"readOnly"}}}));
+                }
+                Some("thread/resume") => {
+                    assert_eq!(params["threadId"], "original");
+                    assert!(params.get("dynamicTools").is_none());
+                    if mode != "legacy" {
+                        assert_eq!(params["runtimeWorkspaceRoots"].as_array().unwrap().len(), 1);
+                    }
+                    let result_id = if mode == "wrong-id" {
+                        "replacement"
+                    } else {
+                        "original"
+                    };
+                    let sandbox = if mode == "wrong-scope" {
+                        "dangerFullAccess"
+                    } else if turns > 0 {
+                        "workspaceWrite"
+                    } else {
+                        "readOnly"
+                    };
+                    emit(
+                        json!({"id":id,"result":{"thread":{"id":result_id},"sandbox":{"type":sandbox}}}),
+                    );
+                }
+                Some("turn/start") => {
+                    turns += 1;
+                    let turn = format!("t{turns}");
+                    assert_eq!(params["model"], "fixture");
+                    assert_eq!(params["effort"], if turns == 1 { "high" } else { "low" });
+                    if mode != "legacy" {
+                        assert_eq!(
+                            params["permissions"],
+                            if turns == 1 {
+                                ":read-only"
+                            } else {
+                                ":workspace"
+                            }
+                        );
+                    }
+                    // 工具可能先于 turn/start 响应抵达，必须等待身份确认再执行。
+                    if turns == 1 && mode == "settings" {
+                        tool(
+                            "set",
+                            &turn,
+                            None,
+                            json!({"action":"set","reasoningEffort":"low"}),
+                        );
+                    }
+                    emit(json!({"id":id,"result":{"turn":{"id":turn}}}));
+                    if turns > 1 || mode != "settings" {
+                        complete(&turn);
+                    }
+                }
+                None => match id.as_str() {
+                    Some("set") => {
+                        assert_eq!(message["result"]["success"], true);
+                        let result: Value = serde_json::from_str(
+                            message["result"]["contentItems"][0]["text"]
+                                .as_str()
+                                .unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(result["currentTurn"]["reasoningEffort"], "high");
+                        assert_eq!(result["savedOverrides"]["reasoningEffort"], "low");
+                        if !seen_set {
+                            seen_set = true;
+                            tool(
+                                "foreign",
+                                "old-turn",
+                                None,
+                                json!({"action":"set","reasoningEffort":"high"}),
+                            );
+                        }
+                    }
+                    Some("foreign") => {
+                        assert_eq!(message["result"]["success"], false);
+                        tool(
+                            "namespace",
+                            "t1",
+                            Some("other"),
+                            json!({"action":"set","reasoningEffort":"high"}),
+                        );
+                    }
+                    Some("namespace") => {
+                        assert_eq!(message["result"]["success"], false);
+                        tool(
+                            "invalid",
+                            "t1",
+                            None,
+                            json!({"action":"set","model":"unknown"}),
+                        );
+                    }
+                    Some("invalid") => {
+                        assert_eq!(message["result"]["success"], false);
+                        // 同 callId 的重放必须返回首个结果，不能再次写入。
+                        tool(
+                            "set",
+                            "t1",
+                            None,
+                            json!({"action":"set","reasoningEffort":"high"}),
+                        );
+                        tool("get", "t1", None, json!({"action":"get"}));
+                    }
+                    Some("get") => {
+                        assert_eq!(message["result"]["success"], true);
+                        complete("t1");
+                    }
+                    _ => panic!("Unexpected response: {message}"),
+                },
+                _ => panic!("Unexpected request: {message}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_tool_is_scoped_persistent_and_applies_on_next_turn() {
+        use super::super::controls::{SessionOptions, SessionOptionsStore};
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionOptionsStore::test_store(root.path().join("settings.json"), "peer-a");
+        let other = SessionOptionsStore::test_store(root.path().join("settings.json"), "peer-b");
+        let mut server = fixture_server(root.path(), "settings");
+        let defaults = SessionOptions {
+            model: "fixture".into(),
+            reasoning_effort: "high".into(),
+        };
+        let result = async {
+            server.initialize().await?;
+            let thread = server
+                .prepare_thread_in_project(None, Some("project-1"))
+                .await?;
+            let first = server
+                .run_turn_with_controls(
+                    &thread,
+                    "set low",
+                    Some(SessionControlChannel {
+                        options_store: &store,
+                        defaults: &defaults,
+                    }),
+                )
+                .await?;
+            assert_eq!(first.reply, "checked");
+            assert_eq!(server.config.reasoning_effort, "high");
+            assert_eq!(store.load()?.reasoning_effort, "low");
+            assert_eq!(other.load()?, SessionOptions::default());
+            let mut next = server.config.clone();
+            next.reasoning_effort = store.load()?.with_defaults(&defaults).reasoning_effort;
+            next.sandbox = "workspace-write".into();
+            server.set_session_config(&next);
+            assert_eq!(server.prepare_thread(Some(&thread)).await?, thread);
+            assert_eq!(server.run_turn(&thread, "next").await?.reply, "checked");
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        server.close().await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resumed_thread_cannot_change_identity_or_sandbox_silently() {
+        let root = tempfile::tempdir().unwrap();
+        for mode in ["wrong-id", "wrong-scope", "legacy"] {
+            let mut server = fixture_server(root.path(), mode);
+            server.initialize().await.unwrap();
+            let result = server.prepare_thread(Some("original")).await;
+            server.close().await;
+            if mode == "legacy" {
+                assert_eq!(result.unwrap(), "original");
+            } else {
+                assert!(result.is_err(), "{mode}");
+            }
+        }
+    }
 
     #[cfg(windows)]
     #[test]
@@ -865,8 +1350,7 @@ mod tests {
         assert!(store.contains("系统保护"), "{store}");
         assert!(store.contains("清空"), "{store}");
 
-        let plain =
-            spawn_failure_hint(r"C:\codex\codex.exe", std::io::ErrorKind::PermissionDenied);
+        let plain = spawn_failure_hint(r"C:\codex\codex.exe", std::io::ErrorKind::PermissionDenied);
         assert_eq!(plain, "：没有执行权限");
 
         let missing = spawn_failure_hint("codex", std::io::ErrorKind::NotFound);

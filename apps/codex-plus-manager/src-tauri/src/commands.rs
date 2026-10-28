@@ -3226,6 +3226,31 @@ pub async fn weixin_connect_qr_status() -> CommandResult<WeixinQrPayload> {
 }
 
 #[tauri::command]
+pub async fn weixin_connect_catalog() -> Value {
+    codex_plus_core::model_catalog::read_codex_model_catalog().await
+}
+
+#[tauri::command]
+pub async fn weixin_connect_projects(
+    codex_path: Option<String>,
+    work_dir: Option<String>,
+) -> Result<Value, String> {
+    let settings = SettingsStore::default()
+        .load()
+        .map_err(|error| format!("读取微信连接设置失败：{error}"))?;
+    let executable = codex_path.unwrap_or(settings.weixin_connect_codex_path);
+    let work_dir = work_dir.unwrap_or(settings.weixin_connect_work_dir);
+    let work_dir = if work_dir.trim().is_empty() {
+        std::env::current_dir().map_err(|error| format!("无法读取当前工作目录：{error}"))?
+    } else {
+        PathBuf::from(work_dir.trim())
+    };
+    codex_plus_core::connect::projects::list_projects(executable.trim().to_string(), work_dir)
+        .await
+        .map_err(|error| format!("读取微信连接项目失败：{error:#}"))
+}
+
+#[tauri::command]
 pub fn weixin_connect_status() -> CommandResult<codex_plus_core::connect::WeixinConnectStatus> {
     let status = weixin_status()
         .lock()
@@ -3432,6 +3457,8 @@ fn spawn_weixin_connect(
         route_tag: settings.weixin_connect_route_tag,
         work_dir: settings.weixin_connect_work_dir,
         model: settings.weixin_connect_model,
+        reasoning_effort: settings.weixin_connect_reasoning_effort,
+        project_id: settings.weixin_connect_project_id,
         sandbox: settings.weixin_connect_sandbox,
         codex_path: settings.weixin_connect_codex_path,
     }
@@ -3654,6 +3681,13 @@ pub fn save_settings(
                 && let Some(runtime) = runtime.as_ref()
             {
                 runtime.codex_path.set(&settings.weixin_connect_codex_path);
+                runtime.codex_path.set_defaults(codex_plus_core::connect::SessionDefaults {
+                    model: settings.weixin_connect_model.clone(),
+                    reasoning_effort: settings.weixin_connect_reasoning_effort.clone(),
+                    project_id: settings.weixin_connect_project_id.clone(),
+                    work_dir: settings.weixin_connect_work_dir.clone(),
+                    sandbox: settings.weixin_connect_sandbox.clone(),
+                });
             }
             // 自动接管是常驻行为，保存后立刻生效，不必重启管理器。
             crate::auto_takeover::apply_enabled(settings.codex_app_auto_takeover);

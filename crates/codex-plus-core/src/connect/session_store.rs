@@ -14,6 +14,12 @@ pub struct ConnectState {
     pub get_updates_buf: String,
     #[serde(default)]
     pub thread_ids: BTreeMap<String, String>,
+    /// 旧会话不能补注册 dynamicTools；保留原映射，附件会话单独续接。
+    #[serde(default)]
+    pub media_thread_ids: BTreeMap<String, String>,
+    /// 注册了附件和会话设置工具的新版线程；旧映射保留，便于回看。
+    #[serde(default)]
+    pub controlled_thread_ids: BTreeMap<String, String>,
     #[serde(default)]
     pub context_tokens: BTreeMap<String, String>,
     #[serde(default)]
