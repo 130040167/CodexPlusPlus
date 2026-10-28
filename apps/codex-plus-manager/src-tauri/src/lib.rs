@@ -365,6 +365,8 @@ pub fn run() {
             tray_panel::refresh_tray_mode,
             commands::weixin_connect_qr_start,
             commands::weixin_connect_qr_status,
+            commands::weixin_connect_catalog,
+            commands::weixin_connect_projects,
             commands::weixin_connect_status,
             commands::weixin_connect_start,
             commands::weixin_connect_stop,

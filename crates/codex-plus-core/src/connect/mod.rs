@@ -1,6 +1,8 @@
 pub mod app_server;
+pub mod controls;
 mod inbox;
 pub mod media;
+pub mod projects;
 pub mod session_store;
 pub mod weixin;
 
@@ -11,7 +13,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
-use self::app_server::{AppServerConfig, AppServerTurnResult, CodexAppServer, WeixinReplyChannel};
+use self::app_server::{
+    AppServerConfig, AppServerTurnResult, CodexAppServer, SessionControlChannel, WeixinReplyChannel,
+};
 use self::session_store::{ConnectSessionStore, ConnectState};
 use self::weixin::{
     AttachmentKind, DownloadedAttachments, LocalAttachment, WeixinClient, WeixinMessage,
@@ -39,6 +43,10 @@ pub struct WeixinConnectConfig {
     pub model: String,
     #[serde(default)]
     pub allow_outbound_attachments: bool,
+    #[serde(default)]
+    pub reasoning_effort: String,
+    #[serde(default)]
+    pub project_id: String,
     #[serde(default = "default_sandbox")]
     pub sandbox: String,
     #[serde(default)]
@@ -56,6 +64,8 @@ impl Default for WeixinConnectConfig {
             work_dir: String::new(),
             model: String::new(),
             allow_outbound_attachments: false,
+            reasoning_effort: String::new(),
+            project_id: String::new(),
             sandbox: default_sandbox(),
             codex_path: String::new(),
         }
@@ -74,6 +84,8 @@ impl WeixinConnectConfig {
         self.route_tag = self.route_tag.trim().to_string();
         self.work_dir = self.work_dir.trim().to_string();
         self.model = self.model.trim().to_string();
+        self.reasoning_effort = self.reasoning_effort.trim().to_string();
+        self.project_id = self.project_id.trim().to_string();
         self.sandbox = normalize_sandbox(&self.sandbox);
         self.codex_path = self.codex_path.trim().to_string();
         self
@@ -110,23 +122,49 @@ pub type SharedWeixinConnectStatus = Arc<Mutex<WeixinConnectStatus>>;
 
 /// 只在消息边界切换 CLI，避免中断正在执行的回合。
 #[derive(Clone)]
-pub struct WeixinCodexPath(Arc<Mutex<String>>);
+pub struct WeixinCodexPath(Arc<Mutex<(String, Option<SessionDefaults>)>>);
+
+#[derive(Clone)]
+pub struct SessionDefaults {
+    pub model: String,
+    pub reasoning_effort: String,
+    pub project_id: String,
+    pub work_dir: String,
+    pub sandbox: String,
+    pub allow_outbound_attachments: bool,
+}
 
 impl WeixinCodexPath {
     pub fn new(path: &str) -> Self {
-        Self(Arc::new(Mutex::new(path.trim().to_string())))
+        Self(Arc::new(Mutex::new((path.trim().to_string(), None))))
     }
 
     pub fn set(&self, path: &str) {
-        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = path.trim().to_string();
+        self.0.lock().unwrap_or_else(|error| error.into_inner()).0 = path.trim().to_string();
+    }
+
+    pub fn set_defaults(&self, defaults: SessionDefaults) {
+        self.0.lock().unwrap_or_else(|error| error.into_inner()).1 = Some(defaults);
+    }
+
+    fn apply_defaults(&self, config: &mut WeixinConnectConfig) {
+        let saved = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(defaults) = &saved.1 {
+            config.model = defaults.model.trim().to_string();
+            config.reasoning_effort = defaults.reasoning_effort.trim().to_string();
+            config.project_id = defaults.project_id.trim().to_string();
+            config.work_dir = defaults.work_dir.trim().to_string();
+            config.sandbox = normalize_sandbox(&defaults.sandbox);
+            config.allow_outbound_attachments = defaults.allow_outbound_attachments;
+        }
     }
 
     fn apply(&self, config: &mut AppServerConfig) -> bool {
         let path = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        if config.executable == *path {
+        if config.executable == path.0 {
             return false;
         }
-        config.executable.clone_from(&path);
+        config.executable.clone_from(&path.0);
         true
     }
 }
@@ -146,7 +184,7 @@ pub async fn run_weixin_connect_with_codex_path(
     status: SharedWeixinConnectStatus,
     codex_path: WeixinCodexPath,
 ) -> anyhow::Result<()> {
-    let config = config.normalized();
+    let mut config = config.normalized();
     if config.token.is_empty() {
         bail!("请先扫码登录微信");
     }
@@ -171,12 +209,14 @@ pub async fn run_weixin_connect_with_codex_path(
 
     let client = WeixinClient::new(&config.base_url, &config.token, &config.route_tag)?;
     let store = ConnectSessionStore::default_for_account(&config.account_id);
-    let mut state = store.load().unwrap_or_default();
+    let mut state = store.load()?;
     let mut app_config = AppServerConfig {
         executable: config.codex_path.clone(),
         work_dir,
         model: config.model.clone(),
         allow_outbound_attachments: config.allow_outbound_attachments,
+        reasoning_effort: config.reasoning_effort.clone(),
+        project_id: config.project_id.clone(),
         sandbox: config.sandbox.clone(),
     };
     let mut app_server: Option<CodexAppServer> = None;
@@ -253,6 +293,19 @@ pub async fn run_weixin_connect_with_codex_path(
             state
                 .context_tokens
                 .insert(message.from_user_id.clone(), message.context_token.clone());
+            codex_path.apply_defaults(&mut config);
+            app_config.model.clone_from(&config.model);
+            app_config
+                .reasoning_effort
+                .clone_from(&config.reasoning_effort);
+            app_config.project_id.clone_from(&config.project_id);
+            app_config.sandbox.clone_from(&config.sandbox);
+            app_config.allow_outbound_attachments = config.allow_outbound_attachments;
+            app_config.work_dir = if config.work_dir.is_empty() {
+                std::env::current_dir().context("无法读取当前工作目录")?
+            } else {
+                PathBuf::from(&config.work_dir)
+            };
             if codex_path.apply(&mut app_config) {
                 if let Some(mut server) = app_server.take() {
                     server.close().await;
@@ -266,6 +319,8 @@ pub async fn run_weixin_connect_with_codex_path(
                     &mut state,
                     &message,
                     &text,
+                    &config.account_id,
+                    !config.work_dir.is_empty(),
                 ),
                 &stop,
             )
@@ -329,7 +384,94 @@ async fn process_weixin_message(
     state: &mut ConnectState,
     message: &WeixinMessage,
     text: &str,
+    account_id: &str,
+    explicit_work_dir: bool,
 ) -> anyhow::Result<()> {
+    let options_store = controls::SessionOptionsStore::for_peer(account_id, &message.from_user_id);
+    let options = options_store.load()?;
+    let mut app_config = app_config.clone();
+    if let Some(reason) = local_model_endpoint_unreachable_reason().await {
+        bail!("{reason}");
+    }
+    if app_server
+        .as_ref()
+        .map(|server| !server.is_running())
+        .unwrap_or(true)
+    {
+        *app_server = Some(CodexAppServer::start(app_config.clone()).await?);
+    }
+    let server = app_server.as_mut().context("Codex app-server 未启动")?;
+    let project =
+        projects::resolve_project(server, &app_config.project_id, &app_config.work_dir).await?;
+    let project_id = project["id"].as_str().context("工作项目缺少 ID")?;
+    if !explicit_work_dir
+        && let Some(path) = project["roots"]
+            .as_array()
+            .and_then(|roots| roots.first())
+            .and_then(|root| root["path"].as_str())
+    {
+        app_config.work_dir = PathBuf::from(path);
+    }
+    if !app_config.work_dir.is_dir() {
+        bail!("工作项目目录不可用");
+    }
+    app_config.work_dir = std::path::absolute(&app_config.work_dir)?;
+    if app_config.allow_outbound_attachments {
+        media::outbound_workspace(&app_config.work_dir)?;
+    }
+    let config_response = server
+        .api_request(
+            "config/read",
+            serde_json::json!({"includeLayers":false,"cwd":app_config.work_dir}),
+        )
+        .await?;
+    let native = &config_response["config"];
+    let defaults = controls::SessionOptions {
+        model: if app_config.model.is_empty() {
+            native["model"].as_str().unwrap_or_default().to_string()
+        } else {
+            app_config.model.clone()
+        },
+        reasoning_effort: if app_config.reasoning_effort.is_empty() {
+            native["model_reasoning_effort"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            app_config.reasoning_effort.clone()
+        },
+    };
+    let catalog = server.session_catalog().await;
+    let mut effective = options.resolve(&defaults, &catalog);
+    if effective.model.is_empty() || effective.reasoning_effort.is_empty() {
+        let models = server
+            .api_request("model/list", serde_json::json!({"includeHidden":true}))
+            .await?;
+        if let Some(model) = models["data"].as_array().and_then(|models| {
+            models.iter().find(|model| {
+                if effective.model.is_empty() {
+                    model["isDefault"] == true
+                } else {
+                    model["model"].as_str() == Some(&effective.model)
+                        || model["id"].as_str() == Some(&effective.model)
+                }
+            })
+        }) {
+            if effective.model.is_empty() {
+                effective.model = model["model"].as_str().unwrap_or_default().to_string();
+            }
+            if effective.reasoning_effort.is_empty() {
+                effective.reasoning_effort = model["defaultReasoningEffort"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+            }
+        }
+    }
+    app_config.model = effective.model;
+    app_config.reasoning_effort = effective.reasoning_effort;
+    app_config.project_id = project_id.to_string();
+    server.set_session_config(&app_config);
     let mut attachments = Vec::new();
     if message.has_attachments() {
         let downloaded = match inbox::Inbox::create(&app_config.work_dir) {
@@ -358,46 +500,41 @@ async fn process_weixin_message(
             return Ok(());
         }
     }
-    if let Some(reason) = local_model_endpoint_unreachable_reason().await {
-        bail!("{reason}");
-    }
-    if app_server
-        .as_ref()
-        .map(|server| !server.is_running())
-        .unwrap_or(true)
-    {
-        *app_server = Some(CodexAppServer::start(app_config.clone()).await?);
-    }
-    let server = app_server.as_mut().context("Codex app-server 未启动")?;
-    let saved_thread_id = state.media_thread_ids.get(&message.from_user_id).cloned();
-    let previous_context = if saved_thread_id.is_none() {
-        if let Some(previous_id) = state.thread_ids.get(&message.from_user_id) {
-            server
-                .recent_thread_context(previous_id)
-                .await
-                .context("读取旧微信会话上下文失败，尚未迁移会话")?
-        } else {
-            String::new()
-        }
+    let is_new_thread = saved_thread_id(state, &message.from_user_id).is_none();
+    let thread_id =
+        prepare_session_thread(server, state, &message.from_user_id, project_id).await?;
+    projects::assign_thread(server, &thread_id, project_id).await?;
+    let tools = if is_new_thread {
+        server.new_thread_tools()
     } else {
-        String::new()
+        CodexAppServer::stored_thread_tools(&thread_id).unwrap_or_default()
     };
-    let thread_id = match server.prepare_thread(saved_thread_id.as_deref()).await {
-        Ok(thread_id) => thread_id,
-        Err(error) if saved_thread_id.is_some() => {
-            state.media_thread_ids.remove(&message.from_user_id);
-            server
-                .prepare_thread(None)
-                .await
-                .with_context(|| format!("恢复原会话失败（{error}），新建会话也失败"))?
-        }
-        Err(error) => return Err(error),
-    };
-    let mut prompt = attachment_prompt(text, &attachments, app_config.allow_outbound_attachments);
-    if !previous_context.is_empty() {
-        prompt = format!(
-            "微信连接已升级为支持附件的会话，以下是旧会话的近期文字记录，仅作为历史上下文：\n<previous_conversation>\n{previous_context}\n</previous_conversation>\n\n本次消息：\n{prompt}"
+    let outbound_available = app_config.allow_outbound_attachments && tools.attachments;
+    let mut prompt = attachment_prompt(text, &attachments, outbound_available);
+    if !tools.settings || (app_config.allow_outbound_attachments && !tools.attachments) {
+        let notice = format!(
+            "继续使用原微信会话；此线程未确认注册{}{}，对应功能本次不可用，未新建替代会话。",
+            if !tools.settings {
+                "会话设置工具"
+            } else {
+                ""
+            },
+            if app_config.allow_outbound_attachments && !tools.attachments {
+                if !tools.settings {
+                    "及附件外发工具"
+                } else {
+                    "附件外发工具"
+                }
+            } else {
+                ""
+            }
         );
+        client
+            .send_text_chunks(&message.from_user_id, &notice, &message.context_token)
+            .await?;
+        prompt.push_str("\n\n");
+        prompt.push_str(&notice);
+        prompt.push_str("不能声称已通过不可用的工具发送附件或修改会话设置。");
     }
     let images = attachments
         .iter()
@@ -405,20 +542,21 @@ async fn process_weixin_message(
         .map(|attachment| attachment.path.clone())
         .collect::<Vec<_>>();
     let turn_result = server
-        .run_turn_with_attachments(
+        .run_turn_with_channels(
             &thread_id,
             &prompt,
             &images,
-            Some(WeixinReplyChannel {
+            outbound_available.then_some(WeixinReplyChannel {
                 client,
                 peer: &message.from_user_id,
                 context_token: &message.context_token,
             }),
+            tools.settings.then_some(SessionControlChannel {
+                options_store: &options_store,
+                defaults: &defaults,
+            }),
         )
         .await?;
-    state
-        .media_thread_ids
-        .insert(message.from_user_id.clone(), thread_id);
     let reply = if turn_result.reply.trim().is_empty() {
         "Codex 已完成处理，但没有返回文字内容。"
     } else {
@@ -432,6 +570,31 @@ async fn process_weixin_message(
             &message.context_token,
         )
         .await
+}
+
+fn saved_thread_id(state: &ConnectState, peer: &str) -> Option<String> {
+    state
+        .thread_ids
+        .get(peer)
+        .or_else(|| state.controlled_thread_ids.get(peer))
+        .or_else(|| state.media_thread_ids.get(peer))
+        .cloned()
+}
+
+async fn prepare_session_thread(
+    server: &mut CodexAppServer,
+    state: &mut ConnectState,
+    peer: &str,
+    project_id: &str,
+) -> anyhow::Result<String> {
+    let saved = saved_thread_id(state, peer);
+    let thread_id = server
+        .prepare_thread_in_project(saved.as_deref(), Some(project_id))
+        .await
+        .map_err(|error| anyhow::anyhow!("准备微信会话失败，原会话映射已保留：{error:#}"))?;
+    // 在回合执行前记录线程；后续工具或回合失败仍应续接同一线程。
+    state.thread_ids.insert(peer.to_string(), thread_id.clone());
+    Ok(thread_id)
 }
 
 async fn cancel_on_stop<T>(
@@ -633,6 +796,44 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn defaults_reload_at_message_boundaries_and_original_thread_wins() {
+        let runtime = WeixinCodexPath::new("codex");
+        let mut config = WeixinConnectConfig::default();
+        runtime.set_defaults(SessionDefaults {
+            model: "next-model".into(),
+            reasoning_effort: "low".into(),
+            project_id: "project-2".into(),
+            work_dir: "next-workspace".into(),
+            sandbox: "workspace-write".into(),
+            allow_outbound_attachments: false,
+        });
+        assert!(config.model.is_empty());
+        config.allow_outbound_attachments = true;
+        runtime.apply_defaults(&mut config);
+        assert_eq!(config.model, "next-model");
+        assert_eq!(config.reasoning_effort, "low");
+        assert_eq!(config.project_id, "project-2");
+        assert_eq!(config.work_dir, "next-workspace");
+        assert_eq!(config.sandbox, "workspace-write");
+        assert!(!config.allow_outbound_attachments);
+        let mut state = ConnectState::default();
+        state.thread_ids.insert("peer".into(), "original".into());
+        state
+            .controlled_thread_ids
+            .insert("peer".into(), "controlled".into());
+        state.media_thread_ids.insert("peer".into(), "media".into());
+        assert_eq!(saved_thread_id(&state, "peer").as_deref(), Some("original"));
+        state.thread_ids.clear();
+        assert_eq!(
+            saved_thread_id(&state, "peer").as_deref(),
+            Some("controlled")
+        );
+        state.controlled_thread_ids.clear();
+        assert_eq!(saved_thread_id(&state, "peer").as_deref(), Some("media"));
+        assert_eq!(saved_thread_id(&state, "other"), None);
+    }
+
     #[tokio::test]
     async fn stopping_cancels_pending_download_or_poll_before_it_can_continue() {
         let stop = Arc::new(AtomicBool::new(false));
@@ -723,6 +924,8 @@ mod tests {
             work_dir: PathBuf::from("."),
             model: "test-model".to_string(),
             allow_outbound_attachments: false,
+            reasoning_effort: String::new(),
+            project_id: String::new(),
             sandbox: "read-only".to_string(),
         };
         assert!(!runtime_path.apply(&mut config));
@@ -806,6 +1009,8 @@ mod tests {
             work_dir: work_dir.path().display().to_string(),
             model: String::new(),
             allow_outbound_attachments: false,
+            reasoning_effort: String::new(),
+            project_id: String::new(),
             sandbox: "read-only".to_string(),
             codex_path: String::new(),
         };

@@ -19,10 +19,21 @@ const ATTACHMENT_TOOL: &str = "send_weixin_attachment";
 const MAX_ATTACHMENTS_PER_TURN: usize = 10;
 const MAX_PENDING_TURN_MESSAGES: usize = 256;
 
+#[derive(Debug, Clone, Default)]
+pub(super) struct ThreadToolSupport {
+    pub settings: bool,
+    pub attachments: bool,
+}
+
 pub struct WeixinReplyChannel<'a> {
     pub client: &'a WeixinClient,
     pub peer: &'a str,
     pub context_token: &'a str,
+}
+
+pub struct SessionControlChannel<'a> {
+    pub options_store: &'a super::controls::SessionOptionsStore,
+    pub defaults: &'a super::controls::SessionOptions,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +42,8 @@ pub struct AppServerConfig {
     pub work_dir: PathBuf,
     pub model: String,
     pub allow_outbound_attachments: bool,
+    pub reasoning_effort: String,
+    pub project_id: String,
     pub sandbox: String,
 }
 
@@ -56,6 +69,8 @@ pub struct CodexAppServer {
     running: bool,
     named_permissions: bool,
     config: AppServerConfig,
+    #[cfg(test)]
+    test_catalog: Option<Value>,
 }
 
 fn collect_stderr_tail(sink: &Arc<Mutex<VecDeque<String>>>) -> String {
@@ -189,11 +204,19 @@ fn spawn_failure_hint(executable: &str, kind: std::io::ErrorKind) -> &'static st
 }
 
 fn app_server_command(executable: &str, work_dir: &Path) -> Command {
+    let home = crate::codex_home::default_codex_home_dir();
+    let sqlite_home = std::env::var_os("CODEX_SQLITE_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.clone());
     let mut command = Command::new(executable);
     command
         .arg("app-server")
         // 微信工具由当前客户端处理，不能继承桌面实例的工具管道。
         .env_remove("CODEX_APP_TOOLS_PIPE_PATH")
+        // 显式沿用管理器的原生数据库目录；桌面实例也须使用同一 SQLITE 目录。
+        .env("CODEX_HOME", home)
+        .env("CODEX_SQLITE_HOME", sqlite_home)
         .current_dir(work_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -256,6 +279,8 @@ impl CodexAppServer {
             running: true,
             named_permissions: false,
             config,
+            #[cfg(test)]
+            test_catalog: None,
         };
         if let Err(error) = server.initialize().await {
             let detail = collect_stderr_tail(&stderr_tail);
@@ -272,14 +297,120 @@ impl CodexAppServer {
         self.running
     }
 
+    pub fn set_session_config(&mut self, config: &AppServerConfig) {
+        self.config = config.clone();
+    }
+
+    pub async fn api_request(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.request(method, params, REQUEST_TIMEOUT).await
+    }
+
+    pub(super) async fn session_catalog(&self) -> Value {
+        #[cfg(test)]
+        if let Some(catalog) = &self.test_catalog {
+            return catalog.clone();
+        }
+        crate::model_catalog::read_codex_model_catalog().await
+    }
+
+    pub(super) fn new_thread_tools(&self) -> ThreadToolSupport {
+        ThreadToolSupport {
+            settings: true,
+            attachments: self.config.allow_outbound_attachments
+                && super::media::outbound_workspace(&self.config.work_dir).is_ok(),
+        }
+    }
+
+    /// resume 无法补注册工具；只读 app-server 共用数据库，不能从旧映射推断工具存在。
+    pub(super) fn stored_thread_tools(thread_id: &str) -> anyhow::Result<ThreadToolSupport> {
+        let home = crate::codex_home::default_codex_home_dir();
+        Self::stored_thread_tools_in_databases(
+            thread_id,
+            crate::codex_sqlite::codex_session_db_paths_from_home(&home),
+        )
+    }
+
+    fn stored_thread_tools_in_databases(
+        thread_id: &str,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> anyhow::Result<ThreadToolSupport> {
+        let mut support = ThreadToolSupport::default();
+        for path in paths {
+            if !path.is_file() {
+                continue;
+            }
+            let db = rusqlite::Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .with_context(|| format!("无法打开微信线程能力数据库 {}", path.display()))?;
+            db.busy_timeout(Duration::from_millis(250))?;
+            let has_table = |name: &str| -> rusqlite::Result<bool> {
+                db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                    [name],
+                    |row| row.get(0),
+                )
+            };
+            // 旧会话库和 inbox/automation 库可能没有工具表，不能影响其他库的能力。
+            if !has_table("thread_dynamic_tools")? {
+                continue;
+            }
+            let owns_thread: bool = if has_table("threads")? {
+                db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM threads WHERE id = ?1)",
+                    [thread_id],
+                    |row| row.get(0),
+                )
+            } else {
+                // 独立工具库以实际工具记录确认归属，不能仅凭表存在推断。
+                db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM thread_dynamic_tools WHERE thread_id = ?1)",
+                    [thread_id],
+                    |row| row.get(0),
+                )
+            }
+            .with_context(|| format!("无法核验微信线程所属数据库 {}", path.display()))?;
+            if !owns_thread {
+                continue;
+            }
+            // 确认归属后读取失败必须保守拒绝，不能返回其他库已累计的成功能力。
+            let mut statement = db.prepare(
+                "SELECT name FROM thread_dynamic_tools WHERE thread_id = ?1 AND namespace IS NULL",
+            )
+            .with_context(|| format!("无法读取微信线程工具能力 {}", path.display()))?;
+            let names = statement.query_map([thread_id], |row| row.get::<_, String>(0))?;
+            for name in names {
+                match name?.as_str() {
+                    "weixin_session_settings" => support.settings = true,
+                    ATTACHMENT_TOOL => support.attachments = true,
+                    _ => {}
+                }
+            }
+        }
+        Ok(support)
+    }
+
     pub async fn prepare_thread(&mut self, thread_id: Option<&str>) -> anyhow::Result<String> {
+        let project_id = self.config.project_id.clone();
+        self.prepare_thread_in_project(thread_id, Some(&project_id))
+            .await
+    }
+
+    pub async fn prepare_thread_in_project(
+        &mut self,
+        thread_id: Option<&str>,
+        project_id: Option<&str>,
+    ) -> anyhow::Result<String> {
         let mut params = self.thread_params();
         let method = if let Some(thread_id) = thread_id.filter(|id| !id.trim().is_empty()) {
             params["threadId"] = Value::String(thread_id.trim().to_string());
-            params.as_object_mut().unwrap().remove("dynamicTools");
-            params["persistExtendedHistory"] = Value::Bool(true);
+            retain_resume_params(&mut params);
             "thread/resume"
         } else {
+            if let Some(project_id) = project_id.filter(|id| !id.trim().is_empty()) {
+                params["projectId"] = json!(project_id);
+            }
             "thread/start"
         };
         let mut result = self
@@ -292,7 +423,7 @@ impl CodexAppServer {
                 extract_thread_id(&result).context("Codex app-server 权限协商未返回 thread id")?;
             // 首次 start 已注册工具；协商权限时恢复同一线程，避免再创建一个线程。
             params["threadId"] = json!(created_id);
-            params.as_object_mut().unwrap().remove("dynamicTools");
+            retain_resume_params(&mut params);
             apply_named_permissions(&mut params, &self.config);
             result = self
                 .request("thread/resume", params, REQUEST_TIMEOUT)
@@ -302,8 +433,14 @@ impl CodexAppServer {
             }
         }
         verify_sandbox_policy(&result, &self.config.sandbox)?;
-        extract_thread_id(&result)
-            .with_context(|| format!("Codex app-server {method} 未返回 thread id"))
+        let result_id = extract_thread_id(&result)
+            .with_context(|| format!("Codex app-server {method} 未返回 thread id"))?;
+        if let Some(expected) = thread_id.filter(|id| !id.trim().is_empty())
+            && result_id != expected.trim()
+        {
+            bail!("Codex app-server 恢复了不同的线程，原会话映射已保留");
+        }
+        Ok(result_id)
     }
 
     pub async fn recent_thread_context(&mut self, thread_id: &str) -> anyhow::Result<String> {
@@ -346,6 +483,28 @@ impl CodexAppServer {
         image_paths: &[PathBuf],
         reply_channel: Option<WeixinReplyChannel<'_>>,
     ) -> anyhow::Result<AppServerTurnResult> {
+        self.run_turn_with_channels(thread_id, prompt, image_paths, reply_channel, None)
+            .await
+    }
+
+    pub async fn run_turn_with_controls(
+        &mut self,
+        thread_id: &str,
+        prompt: &str,
+        channel: Option<SessionControlChannel<'_>>,
+    ) -> anyhow::Result<AppServerTurnResult> {
+        self.run_turn_with_channels(thread_id, prompt, &[], None, channel)
+            .await
+    }
+
+    pub async fn run_turn_with_channels(
+        &mut self,
+        thread_id: &str,
+        prompt: &str,
+        image_paths: &[PathBuf],
+        reply_channel: Option<WeixinReplyChannel<'_>>,
+        control_channel: Option<SessionControlChannel<'_>>,
+    ) -> anyhow::Result<AppServerTurnResult> {
         let id = self.take_request_id();
         let mut params = json!({
             "threadId": thread_id,
@@ -354,6 +513,10 @@ impl CodexAppServer {
         });
         if !self.config.model.trim().is_empty() {
             params["model"] = Value::String(self.config.model.trim().to_string());
+        }
+        params["cwd"] = json!(self.config.work_dir);
+        if !self.config.reasoning_effort.is_empty() {
+            params["effort"] = json!(self.config.reasoning_effort);
         }
         if self.named_permissions {
             params["permissions"] = json!(permission_profile(&self.config.sandbox));
@@ -374,6 +537,7 @@ impl CodexAppServer {
         let mut model = self.config.model.trim().to_string();
         let mut usage = TurnUsage::default();
         let mut attachment_results = HashMap::new();
+        let mut session_results = HashMap::new();
         let mut sent_attachments = 0;
         let deadline = tokio::time::Instant::now() + TURN_TIMEOUT;
         while !response_received || !turn_completed {
@@ -415,16 +579,29 @@ impl CodexAppServer {
             if is_server_request(&message) {
                 if message.get("method").and_then(Value::as_str) == Some("item/tool/call")
                     && message_belongs_to_turn(&message, thread_id, &turn_id)
-                    && let Some(channel) = reply_channel.as_ref()
                 {
-                    self.handle_attachment_tool(
-                        &message,
-                        thread_id,
-                        channel,
-                        &mut attachment_results,
-                        &mut sent_attachments,
-                    )
-                    .await?;
+                    match message["params"]["tool"].as_str() {
+                        Some("weixin_session_settings") if control_channel.is_some() => {
+                            self.handle_session_tool(
+                                &message,
+                                thread_id,
+                                control_channel.as_ref().unwrap(),
+                                &mut session_results,
+                            )
+                            .await?;
+                        }
+                        Some(ATTACHMENT_TOOL) if reply_channel.is_some() => {
+                            self.handle_attachment_tool(
+                                &message,
+                                thread_id,
+                                reply_channel.as_ref().unwrap(),
+                                &mut attachment_results,
+                                &mut sent_attachments,
+                            )
+                            .await?;
+                        }
+                        _ => self.reject_server_request(&message).await?,
+                    }
                 } else {
                     self.reject_server_request(&message).await?;
                 }
@@ -524,10 +701,11 @@ impl CodexAppServer {
         let mut params = json!({
             "cwd": config.work_dir.to_string_lossy(),
             "experimentalRawEvents": false,
-            "persistExtendedHistory": false,
             "approvalPolicy": "never",
             "sandbox": normalize_sandbox(&config.sandbox),
-            "dynamicTools": []
+            "historyMode": "legacy",
+            "ephemeral": false,
+            "dynamicTools": [super::controls::session_tool_spec()]
         });
         if config.allow_outbound_attachments
             && super::media::outbound_workspace(&config.work_dir).is_ok()
@@ -540,10 +718,71 @@ impl CodexAppServer {
         if !config.model.trim().is_empty() {
             params["model"] = Value::String(config.model.trim().to_string());
         }
+        if !config.reasoning_effort.is_empty() {
+            params["config"] = json!({"model_reasoning_effort":config.reasoning_effort});
+        }
         if named_permissions {
             apply_named_permissions(&mut params, config);
         }
         params
+    }
+
+    async fn handle_session_tool(
+        &mut self,
+        message: &Value,
+        thread_id: &str,
+        channel: &SessionControlChannel<'_>,
+        results: &mut HashMap<String, Value>,
+    ) -> anyhow::Result<()> {
+        let call_id = message["params"]["callId"]
+            .as_str()
+            .filter(|id| !id.is_empty());
+        let valid = message["params"]["tool"] == "weixin_session_settings"
+            && message["params"]["namespace"].is_null()
+            && message["params"]["threadId"] == thread_id;
+        if valid && let Some(cached) = call_id.and_then(|id| results.get(id)) {
+            return self
+                .write_json(&json!({"jsonrpc":"2.0","id":message["id"],"result":cached}))
+                .await;
+        }
+        let result = async {
+            if !valid || call_id.is_none() {
+                bail!("设置工具不属于当前微信会话");
+            }
+            let args = message["params"]["arguments"].as_object().context("设置参数必须是对象")?;
+            if args.keys().any(|key| !["action","model","reasoningEffort"].contains(&key.as_str())) {
+                bail!("不支持的设置参数");
+            }
+            let catalog = self.session_catalog().await;
+            let mut next = channel.options_store.load()?;
+            match args.get("action").and_then(Value::as_str) {
+                Some("set") => {
+                    next = super::controls::updated_options(&catalog, channel.defaults, &next, args)?;
+                    channel.options_store.save(next.clone())?;
+                }
+                Some("get") => {}
+                _ => bail!("未知设置操作"),
+            }
+            Ok::<_, anyhow::Error>(json!({
+                "currentTurn":{"model":self.config.model,"reasoningEffort":self.config.reasoning_effort},
+                "savedOverrides":next,"effectiveNextTurn":next.resolve(channel.defaults,&catalog),
+                "appliesFrom":"next-message","connectionDefaults":channel.defaults,
+                "models":catalog["models"],"modelMetadata":catalog["modelMetadata"]
+            }))
+        }.await;
+        let result = match result {
+            Ok(value) => {
+                json!({"success":true,"contentItems":[{"type":"inputText","text":value.to_string()}]})
+            }
+            Err(error) => {
+                json!({"success":false,"contentItems":[{"type":"inputText","text":error.to_string()}]})
+            }
+        };
+        if valid && let Some(id) = call_id {
+            results.insert(id.to_string(), result.clone());
+        }
+        self.write_json(&json!({"jsonrpc":"2.0","id":message["id"],"result":result}))
+            .await
     }
 
     async fn handle_attachment_tool(
@@ -741,6 +980,19 @@ impl CodexAppServer {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         id
+    }
+}
+
+fn retain_resume_params(params: &mut Value) {
+    // 与 CLI 的 ThreadResumeParams 保持一致，不能把 start 专属字段带到 resume。
+    for key in [
+        "dynamicTools",
+        "projectId",
+        "historyMode",
+        "ephemeral",
+        "experimentalRawEvents",
+    ] {
+        params.as_object_mut().unwrap().remove(key);
     }
 }
 
@@ -1144,6 +1396,627 @@ fn deep_string(value: Option<&Value>, keys: &[&str]) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn capability_database(directory: &Path, name: &str, sql: &str) -> PathBuf {
+        let path = directory.join(name);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn stored_thread_tools_preserve_capabilities_across_mixed_databases() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = capability_database(
+            temp.path(),
+            "legacy.sqlite",
+            "CREATE TABLE threads (id TEXT);
+             INSERT INTO threads VALUES ('original');",
+        );
+        let unrelated = capability_database(
+            temp.path(),
+            "unrelated.sqlite",
+            "CREATE TABLE threads (id TEXT);
+             INSERT INTO threads VALUES ('other');
+             CREATE TABLE thread_dynamic_tools (obsolete_column TEXT);",
+        );
+        let owned = capability_database(
+            temp.path(),
+            "owned.sqlite",
+            "CREATE TABLE threads (id TEXT);
+             INSERT INTO threads VALUES ('original');
+             CREATE TABLE thread_dynamic_tools (thread_id TEXT, name TEXT, namespace TEXT);
+             INSERT INTO thread_dynamic_tools VALUES
+               ('original', 'weixin_session_settings', NULL),
+               ('original', 'send_weixin_attachment', NULL);",
+        );
+        for paths in [
+            vec![legacy.clone(), unrelated.clone(), owned.clone()],
+            vec![owned.clone(), unrelated.clone(), legacy.clone()],
+        ] {
+            let support =
+                CodexAppServer::stored_thread_tools_in_databases("original", paths).unwrap();
+            assert!(support.settings && support.attachments);
+        }
+        let absent = CodexAppServer::stored_thread_tools_in_databases(
+            "absent",
+            vec![legacy, unrelated, owned],
+        )
+        .unwrap();
+        assert!(!absent.settings && !absent.attachments);
+    }
+
+    #[test]
+    fn stored_thread_tools_require_original_thread_and_unnamespaced_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let orphan = capability_database(
+            temp.path(),
+            "orphan.sqlite",
+            "CREATE TABLE threads (id TEXT);
+             INSERT INTO threads VALUES ('other');
+             CREATE TABLE thread_dynamic_tools (thread_id TEXT, name TEXT, namespace TEXT);
+             INSERT INTO thread_dynamic_tools VALUES ('original', 'send_weixin_attachment', NULL);",
+        );
+        let standalone = capability_database(
+            temp.path(),
+            "tools.sqlite",
+            "CREATE TABLE thread_dynamic_tools (thread_id TEXT, name TEXT, namespace TEXT);
+             INSERT INTO thread_dynamic_tools VALUES
+               ('original', 'weixin_session_settings', NULL),
+               ('original', 'send_weixin_attachment', 'foreign'),
+               ('other', 'send_weixin_attachment', NULL);",
+        );
+        let support =
+            CodexAppServer::stored_thread_tools_in_databases("original", vec![orphan, standalone])
+                .unwrap();
+        assert!(support.settings);
+        assert!(!support.attachments);
+    }
+
+    #[test]
+    fn stored_thread_tools_reject_owned_schema_errors_even_after_valid_capabilities() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid = capability_database(
+            temp.path(),
+            "valid.sqlite",
+            "CREATE TABLE thread_dynamic_tools (thread_id TEXT, name TEXT, namespace TEXT);
+             INSERT INTO thread_dynamic_tools VALUES ('original', 'send_weixin_attachment', NULL);",
+        );
+        let broken = capability_database(
+            temp.path(),
+            "broken.sqlite",
+            "CREATE TABLE threads (id TEXT);
+             INSERT INTO threads VALUES ('original');
+             CREATE TABLE thread_dynamic_tools (thread_id TEXT, tool_name TEXT);",
+        );
+        for paths in [
+            vec![valid.clone(), broken.clone()],
+            vec![broken.clone(), valid.clone()],
+        ] {
+            let error =
+                CodexAppServer::stored_thread_tools_in_databases("original", paths).unwrap_err();
+            assert!(error.to_string().contains("无法读取微信线程工具能力"));
+            assert!(error.to_string().contains("broken.sqlite"));
+        }
+        let broken_standalone = capability_database(
+            temp.path(),
+            "broken-tools.sqlite",
+            "CREATE TABLE thread_dynamic_tools (thread_id TEXT, tool_name TEXT);
+             INSERT INTO thread_dynamic_tools VALUES ('original', 'send_weixin_attachment');",
+        );
+        assert!(
+            CodexAppServer::stored_thread_tools_in_databases("original", vec![broken_standalone])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn process_message_rpc_fixture() {
+        use std::io::{BufRead, Write};
+        let Ok(mode) = std::env::var("CODEX_PLUS_WEIXIN_PROCESS_RPC") else {
+            return;
+        };
+        let fresh = ["new", "turn-error"].contains(&mode.as_str());
+        let project = if mode == "switch" {
+            "next-project"
+        } else {
+            "project-fixture"
+        };
+        let thread = if fresh {
+            "new-thread"
+        } else {
+            "original-thread"
+        };
+        let mut assigned = false;
+        let mut trace = std::fs::File::create(format!("trace-{mode}.jsonl")).unwrap();
+        fn emit(value: Value) {
+            println!("\n{value}");
+            std::io::stdout().flush().unwrap();
+        }
+        let call = |id: &str, tool: &str, arguments: Value| {
+            emit(json!({
+                "id":id,"method":"item/tool/call","params":{
+                    "threadId":thread,"turnId":"turn-fixture","callId":id,
+                    "tool":tool,"namespace":null,"arguments":arguments
+                }
+            }))
+        };
+        for line in std::io::stdin().lock().lines() {
+            let request: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            writeln!(trace, "{request}").unwrap();
+            trace.flush().unwrap();
+            let params = &request["params"];
+            let result = match request["method"].as_str() {
+                Some("initialize") => json!({}),
+                Some("initialized") => continue,
+                Some("project/read") => {
+                    assert_eq!(params, &json!({"projectId":project}));
+                    if mode == "project-error" {
+                        emit(
+                            json!({"id":request["id"],"error":{"code":-32000,"message":"fixture project unavailable"}}),
+                        );
+                        continue;
+                    }
+                    json!({"project":{"id":project,"name":"Fixture",
+                        "roots":[{"path":std::env::current_dir().unwrap()}]}})
+                }
+                Some("config/read") => {
+                    assert_eq!(params["cwd"], json!(std::env::current_dir().unwrap()));
+                    json!({"config":{"model":"fixture-model","model_reasoning_effort":"high"}})
+                }
+                Some("thread/start") => {
+                    assert!(fresh, "不能给已有会话新建线程");
+                    assert_eq!(params["projectId"], project);
+                    assert!(params.get("persistExtendedHistory").is_none());
+                    assert_eq!(params["dynamicTools"].as_array().unwrap().len(), 2);
+                    json!({"thread":{"id":thread,"projectId":project},"sandbox":{"type":"readOnly"}})
+                }
+                Some("thread/resume") => {
+                    assert!(!fresh);
+                    assert_eq!(params["threadId"], thread);
+                    for field in [
+                        "dynamicTools",
+                        "projectId",
+                        "historyMode",
+                        "ephemeral",
+                        "experimentalRawEvents",
+                        "persistExtendedHistory",
+                    ] {
+                        assert!(
+                            params.get(field).is_none(),
+                            "ThreadResumeParams 不支持 {field}"
+                        );
+                    }
+                    if mode == "resume-error" {
+                        emit(
+                            json!({"id":request["id"],"error":{"code":-32000,"message":"fixture resume denied"}}),
+                        );
+                        continue;
+                    }
+                    json!({"thread":{"id":thread},"sandbox":{"type":"readOnly"}})
+                }
+                Some("thread/metadata/update") => {
+                    assert_eq!(params, &json!({"threadId":thread,"projectId":project}));
+                    if mode == "metadata-rpc-error" {
+                        emit(
+                            json!({"id":request["id"],"error":{"code":-32000,"message":"fixture assignment denied"}}),
+                        );
+                        continue;
+                    }
+                    assigned = mode != "metadata-error";
+                    json!({"thread":{"id":thread,"projectId":if assigned {project} else {"wrong-project"}}})
+                }
+                Some("turn/start") => {
+                    assert!(assigned, "项目归属确认之前不能发送回合");
+                    assert!(
+                        params.get("projectId").is_none(),
+                        "TurnStartParams 不支持 projectId"
+                    );
+                    assert_eq!(params["threadId"], thread);
+                    assert_eq!(params["model"], "fixture-model");
+                    assert_eq!(params["effort"], "high");
+                    assert_eq!(params["cwd"], json!(std::env::current_dir().unwrap()));
+                    assert_eq!(params["input"][1]["type"], "localImage");
+                    let image = params["input"][1]["path"].as_str().unwrap();
+                    assert!(Path::new(image).is_file());
+                    let text = params["input"][0]["text"].as_str().unwrap();
+                    if mode == "legacy" {
+                        assert!(text.contains("本次不可用"));
+                        assert!(!text.contains("调用 send_weixin_attachment 实际发送"));
+                    } else {
+                        assert!(text.contains("调用 send_weixin_attachment 实际发送"));
+                    }
+                    emit(json!({"id":request["id"],"result":{"turn":{"id":"turn-fixture"}}}));
+                    if mode == "turn-error" {
+                        emit(json!({"method":"turn/completed","params":{
+                            "threadId":thread,"turn":{"id":"turn-fixture","status":"failed",
+                                "error":{"message":"fixture first turn failed"}}
+                        }}));
+                        continue;
+                    }
+                    call(
+                        "settings",
+                        "weixin_session_settings",
+                        json!({"action":"set","model":"next-model","reasoningEffort":"low"}),
+                    );
+                    continue;
+                }
+                None => {
+                    let allowed = mode != "legacy";
+                    assert_eq!(request["result"]["success"], allowed);
+                    match request["id"].as_str() {
+                        Some("settings") => call(
+                            "attachment",
+                            ATTACHMENT_TOOL,
+                            json!({"path":"result.txt","kind":"file"}),
+                        ),
+                        Some("attachment") => {
+                            emit(json!({"method":"item/completed","params":{
+                                "threadId":thread,"turnId":"turn-fixture",
+                                "item":{"type":"agentMessage","text":"fixture complete"}
+                            }}));
+                            emit(json!({"method":"turn/completed","params":{
+                                "threadId":thread,"turn":{"id":"turn-fixture","status":"completed"}
+                            }}));
+                        }
+                        _ => panic!("unexpected tool reply"),
+                    }
+                    continue;
+                }
+                _ => panic!("unsupported RPC: {}", request["method"]),
+            };
+            emit(json!({"id":request["id"],"result":result}));
+        }
+    }
+
+    #[tokio::test]
+    async fn process_message_isolated_worker() {
+        use super::super::{controls::SessionOptionsStore, session_store::ConnectState};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let Ok(root) = std::env::var("CODEX_PLUS_WEIXIN_PROCESS_WORKER_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        if let Ok(cli) = std::env::var("CODEX_PLUS_WEIXIN_REVIEW_CLI") {
+            let result = tokio::time::timeout(
+                Duration::from_secs(15),
+                super::super::projects::list_projects(cli, root.clone()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result["projects"], json!([]));
+            assert!(result["reservedProjectId"].is_null());
+            let db = rusqlite::Connection::open_with_flags(
+                root.join("shared/state_5.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let projects: i64 = db
+                .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+                .unwrap();
+            let threads: i64 = db
+                .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                (projects, threads),
+                (0, 0),
+                "只读目录 API 不能创建项目或线程"
+            );
+            assert!(
+                !root.join("home/state_5.sqlite").exists(),
+                "CLI 必须使用指定的共享 SQLITE 目录"
+            );
+            println!(
+                "manager delegated core projects::list_projects: real CLI succeeded, projects=0, threads=0, shared SQLITE confirmed"
+            );
+            return;
+        }
+        let sqlite = root.join("shared/state_5.sqlite");
+        let db = rusqlite::Connection::open(&sqlite).unwrap();
+        db.execute_batch(
+            "CREATE TABLE threads (id TEXT);
+             INSERT INTO threads VALUES ('original-thread');
+             CREATE TABLE thread_dynamic_tools (thread_id TEXT, name TEXT, namespace TEXT);",
+        )
+        .unwrap();
+        let mixed = root.join("shared/sqlite");
+        std::fs::create_dir(&mixed).unwrap();
+        capability_database(
+            &mixed,
+            "legacy.sqlite",
+            "CREATE TABLE threads (id TEXT);
+             INSERT INTO threads VALUES ('original-thread');",
+        );
+        capability_database(
+            &mixed,
+            "unrelated.sqlite",
+            "CREATE TABLE threads (id TEXT);
+             INSERT INTO threads VALUES ('other-thread');
+             CREATE TABLE thread_dynamic_tools (obsolete_column TEXT);",
+        );
+        for mode in [
+            "new",
+            "legacy",
+            "stored",
+            "resume-error",
+            "project-error",
+            "metadata-error",
+            "metadata-rpc-error",
+            "turn-error",
+            "switch",
+        ] {
+            let work = root.join(mode);
+            std::fs::create_dir(&work).unwrap();
+            std::fs::write(work.join("result.txt"), "fixture output").unwrap();
+            db.execute("DELETE FROM thread_dynamic_tools", []).unwrap();
+            if ["stored", "switch"].contains(&mode) {
+                for name in ["weixin_session_settings", ATTACHMENT_TOOL] {
+                    db.execute(
+                        "INSERT INTO thread_dynamic_tools VALUES ('original-thread', ?1, NULL)",
+                        [name],
+                    )
+                    .unwrap();
+                }
+            }
+            let gateway = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/input.png"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(b"\x89PNG\r\n\x1a\nfixture-image".to_vec()),
+                )
+                .mount(&gateway)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/ilink/bot/sendmessage"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ret":0})))
+                .mount(&gateway)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/ilink/bot/getuploadurl"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "upload_full_url":format!("{}/upload",gateway.uri())
+                })))
+                .mount(&gateway)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/upload"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("x-encrypted-param", "fixture-download"),
+                )
+                .mount(&gateway)
+                .await;
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "connect::app_server::tests::process_message_rpc_fixture",
+                    "--nocapture",
+                ])
+                .env("CODEX_PLUS_WEIXIN_PROCESS_RPC", mode)
+                .current_dir(&work)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            #[cfg(windows)]
+            command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+            let mut child = command.spawn().unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let config = AppServerConfig {
+                executable: String::new(),
+                work_dir: work.clone(),
+                model: "fixture-model".into(),
+                reasoning_effort: "high".into(),
+                project_id: if mode == "switch" {
+                    "next-project"
+                } else {
+                    "project-fixture"
+                }
+                .into(),
+                allow_outbound_attachments: true,
+                sandbox: "read-only".into(),
+            };
+            let mut server = CodexAppServer {
+                child,
+                stdin,
+                stdout: BufReader::new(stdout).lines(),
+                next_id: 1,
+                running: true,
+                named_permissions: false,
+                config: config.clone(),
+                test_catalog: Some(json!({"models":["fixture-model","next-model"],
+                    "modelMetadata":{"next-model":{"supportedReasoningEfforts":["low"]}}})),
+            };
+            server.initialize().await.unwrap();
+            let client = WeixinClient::new(&gateway.uri(), "fixture-token", "")
+                .unwrap()
+                .with_media_base_url(&gateway.uri())
+                .unwrap();
+            let message = serde_json::from_value(json!({
+                "from_user_id":mode,"context_token":"fixture-context",
+                "item_list":[{"type":1,"text_item":{"text":"process media"}},
+                    {"type":2,"image_item":{"url":format!("{}/input.png",gateway.uri())}}]
+            }))
+            .unwrap();
+            let mut state = ConnectState::default();
+            if !["new", "turn-error"].contains(&mode) {
+                state
+                    .thread_ids
+                    .insert(mode.into(), "original-thread".into());
+                state
+                    .media_thread_ids
+                    .insert(mode.into(), "media-history".into());
+            }
+            let before = state.clone();
+            let mut active = Some(server);
+            let result = tokio::time::timeout(
+                Duration::from_secs(15),
+                super::super::process_weixin_message(
+                    &client,
+                    &config,
+                    &mut active,
+                    &mut state,
+                    &message,
+                    "process media",
+                    "process-fixture",
+                    true,
+                ),
+            )
+            .await;
+            active.as_mut().unwrap().close().await;
+            let result = result.unwrap();
+            let trace = std::fs::read_to_string(work.join(format!("trace-{mode}.jsonl")))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            let turns = trace
+                .iter()
+                .filter(|request| request["method"] == "turn/start")
+                .count();
+            if [
+                "resume-error",
+                "project-error",
+                "metadata-error",
+                "metadata-rpc-error",
+            ]
+            .contains(&mode)
+            {
+                assert!(result.is_err(), "{mode}");
+                assert_eq!(state, before, "{mode}: failure changed mapping");
+                assert_eq!(turns, 0);
+            } else if mode == "turn-error" {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("fixture first turn failed")
+                );
+                assert_eq!(turns, 1);
+                assert_eq!(state.thread_ids[mode], "new-thread");
+            } else {
+                result.unwrap();
+                assert_eq!(turns, 1);
+                let options = SessionOptionsStore::for_peer("process-fixture", mode)
+                    .load()
+                    .unwrap();
+                assert_eq!(
+                    options.model,
+                    if mode == "legacy" { "" } else { "next-model" }
+                );
+                assert_eq!(
+                    state.thread_ids[mode],
+                    if mode == "new" {
+                        "new-thread"
+                    } else {
+                        "original-thread"
+                    }
+                );
+            }
+            if turns > 0 {
+                let assignment = trace
+                    .iter()
+                    .position(|request| request["method"] == "thread/metadata/update")
+                    .unwrap();
+                let turn = trace
+                    .iter()
+                    .position(|request| request["method"] == "turn/start")
+                    .unwrap();
+                assert!(assignment < turn, "首条回合失败前也必须先完成项目归属");
+                assert_eq!(trace[assignment]["params"]["projectId"], config.project_id);
+                assert_eq!(
+                    trace[assignment]["params"]["threadId"],
+                    state.thread_ids[mode]
+                );
+            }
+            let requests = gateway.received_requests().await.unwrap();
+            let uploads = requests
+                .iter()
+                .filter(|request| request.url.path() == "/ilink/bot/getuploadurl")
+                .count();
+            assert_eq!(
+                uploads,
+                usize::from(["new", "stored", "switch"].contains(&mode))
+            );
+            if mode == "legacy" {
+                assert!(
+                    requests.iter().any(
+                        |request| String::from_utf8_lossy(&request.body).contains("本次不可用")
+                    )
+                );
+            }
+            println!(
+                "complete process_weixin_message: {mode}, RPC messages={}, turns={turns}",
+                trace.len()
+            );
+        }
+    }
+
+    #[test]
+    fn full_message_processing_uses_isolated_rpc_and_shared_sqlite() {
+        run_isolated_process_worker(None);
+    }
+
+    #[test]
+    fn installed_cli_projects_api_is_read_only() {
+        let Some(cli) = std::env::var_os("CODEX_PLUS_WEIXIN_REVIEW_CLI") else {
+            return;
+        };
+        run_isolated_process_worker(Some(cli));
+    }
+
+    fn run_isolated_process_worker(cli: Option<std::ffi::OsString>) {
+        let root = tempfile::tempdir().unwrap();
+        for directory in ["home", "shared", "manager", "appdata", "localappdata"] {
+            std::fs::create_dir(root.path().join(directory)).unwrap();
+        }
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.env_clear();
+        if let Some(cli) = cli {
+            command.env("CODEX_PLUS_WEIXIN_REVIEW_CLI", cli);
+        }
+        for key in ["PATH", "SystemRoot", "TEMP", "TMP"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        command
+            .args([
+                "--exact",
+                "connect::app_server::tests::process_message_isolated_worker",
+                "--nocapture",
+            ])
+            .env("CODEX_PLUS_WEIXIN_PROCESS_WORKER_ROOT", root.path())
+            .env("CODEX_HOME", root.path().join("home"))
+            .env("CODEX_SQLITE_HOME", root.path().join("shared"))
+            .env("CODEX_PLUS_STATE_DIR", root.path().join("manager"))
+            .env("HOME", root.path())
+            .env("USERPROFILE", root.path())
+            .env("APPDATA", root.path().join("appdata"))
+            .env("LOCALAPPDATA", root.path().join("localappdata"));
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+
     #[test]
     fn dedicated_app_server_does_not_inherit_desktop_tool_pipe() {
         let root = tempfile::tempdir().unwrap();
@@ -1151,6 +2024,13 @@ mod tests {
         let command = command.as_std();
         assert_eq!(command.get_current_dir(), Some(root.path()));
         assert_eq!(command.get_args().collect::<Vec<_>>(), ["app-server"]);
+        for key in ["CODEX_HOME", "CODEX_SQLITE_HOME"] {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(name, value)| name == key && value.is_some())
+            );
+        }
         assert!(
             command
                 .get_envs()
@@ -1173,6 +2053,7 @@ mod tests {
                 Some("initialize") => json!({}),
                 Some("initialized") => continue,
                 Some("thread/start") => {
+                    assert!(!mode.starts_with("resume-"), "恢复失败不得新建线程");
                     starts += 1;
                     assert_eq!(starts, 1);
                     assert!(params["dynamicTools"].is_array());
@@ -1186,6 +2067,39 @@ mod tests {
                     }
                 }
                 Some("thread/resume") => {
+                    for field in [
+                        "dynamicTools",
+                        "projectId",
+                        "historyMode",
+                        "ephemeral",
+                        "experimentalRawEvents",
+                        "persistExtendedHistory",
+                    ] {
+                        assert!(params.get(field).is_none(), "resume 不支持字段 {field}");
+                    }
+                    if mode.starts_with("resume-") {
+                        assert_eq!(starts, 0);
+                        assert_eq!(params["threadId"], "original-thread");
+                        assert!(params.get("dynamicTools").is_none());
+                        if mode == "resume-error" {
+                            println!(
+                                "{}",
+                                json!({"id":request["id"],"error":{
+                                    "code":-32000,"message":"fixture resume denied"
+                                }})
+                            );
+                            std::io::stdout().flush().unwrap();
+                            continue;
+                        }
+                        println!(
+                            "{}",
+                            json!({"id":request["id"],"result":{
+                                "thread":{"id":"different-thread"},"sandbox":{"type":"workspaceWrite"}
+                            }})
+                        );
+                        std::io::stdout().flush().unwrap();
+                        continue;
+                    }
                     resumes += 1;
                     assert_eq!(starts, 1);
                     assert_eq!(resumes, 1);
@@ -1226,6 +2140,8 @@ mod tests {
             "missing-policy",
             "wrong-thread",
             "wrong-policy",
+            "resume-error",
+            "resume-wrong-id",
         ] {
             // 用测试二进制替代 CLI，不读取用户配置或触发模型请求。
             let mut command = Command::new(std::env::current_exe().unwrap());
@@ -1258,12 +2174,48 @@ mod tests {
                     work_dir: root.path().to_owned(),
                     model: String::new(),
                     allow_outbound_attachments: true,
+                    reasoning_effort: String::new(),
+                    project_id: String::new(),
                     sandbox: "workspace-write".into(),
                 },
+                test_catalog: None,
             };
             let result = async {
                 server.initialize().await?;
-                server.prepare_thread(None).await
+                if mode.starts_with("resume-") {
+                    let mut state = super::super::session_store::ConnectState::default();
+                    state
+                        .thread_ids
+                        .insert("peer".into(), "original-thread".into());
+                    state
+                        .controlled_thread_ids
+                        .insert("peer".into(), "controlled-thread".into());
+                    state
+                        .media_thread_ids
+                        .insert("peer".into(), "media-thread".into());
+                    let before = state.clone();
+                    let result = super::super::prepare_session_thread(
+                        &mut server,
+                        &mut state,
+                        "peer",
+                        "project-fixture",
+                    )
+                    .await;
+                    assert!(result.is_err());
+                    assert!(
+                        format!("{:#}", result.as_ref().unwrap_err()).contains("原会话映射已保留")
+                    );
+                    let error = result.as_ref().unwrap_err().to_string();
+                    assert!(error.contains(if mode == "resume-error" {
+                        "fixture resume denied"
+                    } else {
+                        "恢复了不同的线程"
+                    }));
+                    assert_eq!(state, before);
+                    result
+                } else {
+                    server.prepare_thread(None).await
+                }
             }
             .await;
             let named = server.named_permissions;
@@ -1305,10 +2257,35 @@ mod tests {
             match message.get("method").and_then(Value::as_str) {
                 Some("initialize") => emit(json!({"id": message["id"], "result": {}})),
                 Some("initialized") => {}
+                Some("project/read") => {
+                    assert_eq!(message["params"]["projectId"], "project-fixture");
+                    emit(json!({"id":message["id"],"result":{"project":{
+                        "id":"project-fixture","name":"Fixture","roots":[{"path":std::env::current_dir().unwrap()}]
+                    }}}));
+                }
+                Some("thread/metadata/update") => {
+                    assert_eq!(message["params"]["threadId"], "thread-fixture");
+                    assert_eq!(message["params"]["projectId"], "project-fixture");
+                    emit(json!({"id":message["id"],"result":{"thread":{
+                        "id":"thread-fixture","projectId":"project-fixture"
+                    }}}));
+                }
                 Some("thread/start") => {
                     starts += 1;
                     assert_eq!(starts, 1, "权限协商不能再次创建线程");
                     assert_eq!(message["params"]["dynamicTools"][0]["type"], "function");
+                    let tools = message["params"]["dynamicTools"].as_array().unwrap();
+                    assert!(tools.iter().any(|tool| tool["name"] == ATTACHMENT_TOOL));
+                    assert!(
+                        tools
+                            .iter()
+                            .any(|tool| tool["name"] == "weixin_session_settings")
+                    );
+                    assert_eq!(message["params"]["projectId"], "project-fixture");
+                    assert_eq!(
+                        message["params"]["config"]["model_reasoning_effort"],
+                        "high"
+                    );
                     assert_eq!(message["params"]["sandbox"], "workspace-write");
                     assert!(message["params"].get("permissions").is_none());
                     emit(json!({"id": message["id"], "result": {
@@ -1339,6 +2316,13 @@ mod tests {
                 Some("turn/start") => {
                     turn += 1;
                     assert_eq!(message["params"]["permissions"], ":workspace");
+                    assert_eq!(message["params"]["effort"], "high");
+                    assert_eq!(message["params"]["model"], "fixture-model");
+                    assert!(message["params"].get("projectId").is_none());
+                    assert_eq!(
+                        message["params"]["cwd"],
+                        json!(std::env::current_dir().unwrap())
+                    );
                     // 上一回合残留的状态通知不能结束当前回合。
                     emit(
                         json!({"method": "thread/status/changed", "params": {"status": {"type": "idle"}}}),
@@ -1413,6 +2397,35 @@ mod tests {
                         call("updated", "second", "result.txt");
                     }
                     Some("updated") => {
+                        assert_eq!(message["result"]["success"], true);
+                        emit(json!({"id":"settings","method":"item/tool/call","params":{
+                            "threadId":"thread-fixture","turnId":"turn-1","callId":"first",
+                            "tool":"weixin_session_settings","arguments":{
+                                "action":"set","model":"next-model","reasoningEffort":"low"
+                            }
+                        }}));
+                    }
+                    Some("settings") => {
+                        assert_eq!(message["result"]["success"], true);
+                        let content: Value = serde_json::from_str(
+                            message["result"]["contentItems"][0]["text"]
+                                .as_str()
+                                .unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(content["currentTurn"]["model"], "fixture-model");
+                        assert_eq!(content["effectiveNextTurn"]["model"], "next-model");
+                        assert_eq!(content["appliesFrom"], "next-message");
+                        emit(
+                            json!({"id":"settings-replay","method":"item/tool/call","params":{
+                                "threadId":"thread-fixture","turnId":"turn-1","callId":"first",
+                                "tool":"weixin_session_settings","arguments":{
+                                    "action":"set","model":"invalid-model"
+                                }
+                            }}),
+                        );
+                    }
+                    Some("settings-replay") => {
                         assert_eq!(message["result"]["success"], true);
                         emit(
                             json!({"method": "item/completed", "params": {"threadId":"thread-fixture","turnId":"turn-1","item": {
@@ -1498,8 +2511,22 @@ mod tests {
                 work_dir: temp.path().to_path_buf(),
                 model: "fixture-model".to_string(),
                 allow_outbound_attachments: true,
+                reasoning_effort: "high".into(),
+                project_id: "project-fixture".into(),
                 sandbox: "workspace-write".to_string(),
             },
+            test_catalog: Some(json!({
+                "models":["fixture-model","next-model"],
+                "modelMetadata":{"next-model":{"supportedReasoningEfforts":["low"]}}
+            })),
+        };
+        let options_store = super::super::controls::SessionOptionsStore::test_store(
+            temp.path().join("options.json"),
+            "fixture-peer",
+        );
+        let defaults = super::super::controls::SessionOptions {
+            model: "fixture-model".into(),
+            reasoning_effort: "high".into(),
         };
         let client = WeixinClient::new(&gateway.uri(), "fixture-token", "")
             .unwrap()
@@ -1507,6 +2534,13 @@ mod tests {
             .unwrap();
         let result = async {
             server.initialize().await?;
+            let project = super::super::projects::resolve_project(
+                &mut server,
+                "project-fixture",
+                temp.path(),
+            )
+            .await?;
+            assert_eq!(project["id"], "project-fixture");
             let metadata = server
                 .request(
                     "thread/read",
@@ -1525,7 +2559,7 @@ mod tests {
             );
             let thread = server.prepare_thread(None).await?;
             let turn = server
-                .run_turn_with_attachments(
+                .run_turn_with_channels(
                     &thread,
                     "process image and return result",
                     &[temp.path().join("photo.png")],
@@ -1534,9 +2568,23 @@ mod tests {
                         peer: "fixture-peer",
                         context_token: "fixture-context",
                     }),
+                    Some(SessionControlChannel {
+                        options_store: &options_store,
+                        defaults: &defaults,
+                    }),
                 )
                 .await?;
             assert_eq!(turn.reply, "early reply\n\nfile delivered");
+            assert_eq!(options_store.load()?.model, "next-model");
+            assert_eq!(options_store.load()?.reasoning_effort, "low");
+            server
+                .api_request(
+                    "thread/metadata/update",
+                    json!({
+                        "threadId":thread,"projectId":"project-fixture"
+                    }),
+                )
+                .await?;
             server.prepare_thread(Some(&thread)).await?;
             let error = server.run_turn(&thread, "fail").await.unwrap_err();
             assert!(error.to_string().contains("fixture model failure"));
@@ -1759,19 +2807,27 @@ mod tests {
             work_dir: root.clone(),
             model: String::new(),
             allow_outbound_attachments: false,
+            reasoning_effort: String::new(),
+            project_id: String::new(),
             sandbox: "read-only".into(),
         };
         assert!(
             CodexAppServer::thread_params_for(&config, false)["dynamicTools"]
                 .as_array()
                 .unwrap()
-                .is_empty()
+                .iter()
+                .all(|tool| tool["name"] != ATTACHMENT_TOOL)
         );
         let mut enabled = config.clone();
         enabled.allow_outbound_attachments = true;
         assert_eq!(
-            CodexAppServer::thread_params_for(&enabled, false)["dynamicTools"][0]["name"],
-            ATTACHMENT_TOOL
+            CodexAppServer::thread_params_for(&enabled, false)["dynamicTools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|tool| tool["name"] == ATTACHMENT_TOOL)
+                .count(),
+            1
         );
 
         for name in [
@@ -1863,8 +2919,11 @@ mod tests {
                 work_dir: temp.path().into(),
                 model: String::new(),
                 allow_outbound_attachments: false,
+                reasoning_effort: String::new(),
+                project_id: String::new(),
                 sandbox: "read-only".into(),
             },
+            test_catalog: None,
         };
         let client = WeixinClient::new(&gateway.uri(), "fixture", "")
             .unwrap()
