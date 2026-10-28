@@ -135,7 +135,7 @@ import "./ToolPages.css";
 import { BACKEND_SETTINGS_CHANGED_EVENT, ComputerUsePage } from "./ComputerUsePage";
 import { PluginMarketScreen } from "./PluginMarketScreen";
 import { ReleaseNotes } from "./ReleaseNotes";
-import { UPDATE_CHECK_INTERVAL_MS, UpdateNotifications } from "./update-notification";
+import { UPDATE_CHECK_INTERVAL_MS, UpdateNotifications, updatePreferencesFrom } from "./update-notification";
 import { McpPage, PageHeader } from "./ManagementPages";
 import { SkillsPage } from "./ManagementExtra";
 import { ProjectSessionPage } from "./ProjectSessionPage";
@@ -398,6 +398,10 @@ type BackendSettings = {
   dictation: DictationSettings;
   providerSyncEnabled: boolean;
   threadModelFollowSwitchEnabled?: boolean;
+  /** 启动时及运行期间自动检查 Codex++ 更新（#1272），默认开。 */
+  updateAutoCheck?: boolean;
+  /** 更新提示里「跳过此版本」记下的版本（#1272）。 */
+  updateSkippedVersion?: string;
   ccsDbPath: string;
   providerSyncSavedProviders: string[];
   providerSyncManualProviders: string[];
@@ -1361,6 +1365,8 @@ const defaultSettings: BackendSettings = {
   dictation: defaultDictationSettings(),
   providerSyncEnabled: false,
   threadModelFollowSwitchEnabled: false,
+  updateAutoCheck: true,
+  updateSkippedVersion: "",
   ccsDbPath: "",
   providerSyncSavedProviders: [],
   providerSyncManualProviders: [],
@@ -1568,6 +1574,10 @@ export function App() {
   const updateNotifications = useRef(new UpdateNotifications());
   const updateCheckPending = useRef<{ manual: boolean } | null>(null);
   const updateInstallPending = useRef(false);
+  // 更新提醒偏好以已保存的设置为准；草稿里的开关等自动保存落盘后才生效。
+  useEffect(() => {
+    if (settings) updateNotifications.current.setPreferences(updatePreferencesFrom(settings.settings));
+  }, [settings]);
   const [updateInstallProgress, setUpdateInstallProgress] = useState<TaskProgress>({
     active: false,
     percent: 0,
@@ -2921,7 +2931,22 @@ export function App() {
     }
   };
 
+  // 启动时的后台检查早于设置加载：先单独读一次更新偏好，避免漏掉「跳过此版本」和「关闭自动检查」。
+  const ensureUpdatePreferences = async () => {
+    try {
+      const result = await call<SettingsResult>("load_settings");
+      if (!updateNotifications.current.preferencesLoaded) updateNotifications.current.setPreferences(updatePreferencesFrom(result.settings));
+    } catch {
+      // 读不到设置时按默认（自动检查、不跳过）继续，不打扰用户。
+    }
+  };
+
   const checkUpdate = async (silent = false) => {
+    if (silent) {
+      if (!updateNotifications.current.preferencesLoaded) await ensureUpdatePreferences();
+      // 关闭「启动时自动检查更新」后，启动与定时的后台检查都不再联网；手动检查不受影响。
+      if (!updateNotifications.current.autoCheckEnabled()) return;
+    }
     if (updateInstallPending.current) return;
     if (updateCheckPending.current) {
       // 手动检查复用正在进行的后台请求，但仍按用户主动检查显示结果。
@@ -2949,6 +2974,25 @@ export function App() {
   const closeUpdatePrompt = () => {
     if (updatePrompt?.latestVersion) updateNotifications.current.dismiss(updatePrompt.latestVersion);
     setUpdatePrompt(null);
+  };
+
+  // 「跳过此版本」：本次会话立即生效，并只把这一个键写进 settings.json；
+  // 写完只合并该键和版本号，别处没保存的草稿保持不动。
+  const skipUpdateVersion = async (version: string) => {
+    updateNotifications.current.skipVersion(version);
+    setUpdatePrompt(null);
+    try {
+      const result = await call<SettingsResult>("skip_update_version", { version });
+      if (!isSuccessStatus(result.status)) {
+        showNotice(t("跳过此版本"), result.message, "failed");
+        return;
+      }
+      const fresh = normalizeSettings(result.settings);
+      setSettings(result);
+      setSettingsForm((current) => ({ ...current, updateSkippedVersion: fresh.updateSkippedVersion, revision: fresh.revision }));
+    } catch (error) {
+      showNotice(t("跳过此版本"), stringifyError(error), "failed");
+    }
   };
 
   const performUpdate = async (selectedUpdate = update) => {
@@ -4710,6 +4754,8 @@ export function App() {
                   })()}
                 />
                 <AboutScreen
+                  form={settingsForm}
+                  onFormChange={setSettingsForm}
                   overview={overview}
                   update={update}
                   updateInstallProgress={updateInstallProgress}
@@ -4727,6 +4773,9 @@ export function App() {
           update={updatePrompt}
           progress={updateInstallProgress}
           onClose={closeUpdatePrompt}
+          onSkipVersion={() => {
+            if (updatePrompt.latestVersion) void skipUpdateVersion(updatePrompt.latestVersion);
+          }}
           onMuteToday={() => {
             updateNotifications.current.muteToday();
             setUpdatePrompt(null);
@@ -10084,7 +10133,11 @@ function AboutScreen({
   logs,
   diagnostics,
   actions,
+  form,
+  onFormChange,
 }: {
+  form: BackendSettings;
+  onFormChange: (value: BackendSettings) => void;
   overview: OverviewResult | null;
   update: UpdateResult | null;
   updateInstallProgress: TaskProgress;
@@ -10117,6 +10170,18 @@ function AboutScreen({
                   {updateInstallProgress.active ? t("正在下载安装包…") : t("下载并运行安装包")}
                 </Button>
               ) : null}
+            </div>
+          </div>
+          {/* 改的是设置草稿，由同页 GlobalSettingsScreen 的自动保存落盘（#1272）。 */}
+          <div className="global-settings-list app-update-preferences">
+            <div className="global-setting-row">
+              <div className="global-setting-copy">
+                <strong>{t("启动时自动检查更新")}</strong>
+                <span>{t("打开 Codex++ 时及运行期间每隔几小时在后台检查新版本并提示。关闭后不再自动检查，仍可随时点「检查更新」。")}</span>
+              </div>
+              <div className="global-setting-actions">
+                <Switch label={t("启动时自动检查更新")} on={form.updateAutoCheck !== false} onToggle={() => onFormChange({ ...form, updateAutoCheck: form.updateAutoCheck === false })} />
+              </div>
             </div>
           </div>
           {update?.updateAvailable && update.releaseSummary ? (
@@ -14279,10 +14344,11 @@ function DreamSkinUnsavedDialog({
   );
 }
 
-function UpdateDialog({ update, progress, onClose, onMuteToday, onUpdate, onOpenUrl }: {
+function UpdateDialog({ update, progress, onClose, onSkipVersion, onMuteToday, onUpdate, onOpenUrl }: {
   update: UpdateResult;
   progress: TaskProgress;
   onClose: () => void;
+  onSkipVersion: () => void;
   onMuteToday: () => void;
   onUpdate: () => void;
   onOpenUrl: (url: string) => void;
@@ -14316,6 +14382,7 @@ function UpdateDialog({ update, progress, onClose, onMuteToday, onUpdate, onOpen
         </Button>
         <Button variant="secondary" onClick={onClose}>{t("关闭提示")}</Button>
         <Button variant="ghost" onClick={onMuteToday}>{t("今日不再提示")}</Button>
+        <Button variant="ghost" onClick={onSkipVersion}>{t("跳过此版本")}</Button>
       </Toolbar>
     </dialog>
   );
