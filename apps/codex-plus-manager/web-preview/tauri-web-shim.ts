@@ -129,6 +129,7 @@ const demoSettings = {
     standardOpenaiProtocol: false,
     webSearchHistoryCompat: false,
     strictResponsesReasoning: false,
+    stripImageGenerationTool: false,
     anthropicAuthHeader: "x-api-key",
     anthropicMaxTokens: 0,
     anthropicPromptCache: true,

@@ -203,6 +203,7 @@ import {
   independentProxyEnabled,
   setIndependentProxyConfigured,
   requestCompatibilityEnabled,
+  stripImageGenerationToolEnabled,
   findRelayModelRouteIssue,
   modelRouteSaveRequiresRestart,
   normalizeRelayModelRoutes,
@@ -562,6 +563,8 @@ export type RelayProfile = {
   localCompactionPromptAtEnd?: boolean;
   trustUpstreamCatalogLite?: boolean;
   strictResponsesReasoning?: boolean;
+  /** #228：转发前移除托管生图工具（image_generation），默认关闭。 */
+  stripImageGenerationTool?: boolean;
   /** Anthropic 上游的认证字段：`x-api-key`（默认）或 `authorization`。 */
   anthropicAuthHeader?: string;
   /** Anthropic 的 `max_tokens` 兜底值，0/缺省表示用内置 8192；填了则优先于请求值。 */
@@ -11249,6 +11252,7 @@ function RelayProfileEditor({
     profile.localCompactionPromptAtEnd === true,
     profile.trustUpstreamCatalogLite === true,
     profile.strictResponsesReasoning === true,
+    profile.stripImageGenerationTool === true,
   ].filter(Boolean).length;
   const [stabilizePromptPrefixBusy, setStabilizePromptPrefixBusy] = useState(false);
   const useCommonConfig = profile.useCommonConfig !== false;
@@ -12795,6 +12799,10 @@ function RelayProfileEditor({
                   <label className="switch-row compact relay-switch-row">
                     <input type="checkbox" checked={profile.strictResponsesReasoning === true} onChange={(event) => updateDraft({ strictResponsesReasoning: event.currentTarget.checked })} />
                     <span><strong>{t("严格 Responses 推理历史兼容")}</strong><small>{t("仅当目标上游接受当前账号的加密历史时启用。混合推理只发送可识别的加密信封；占位或无效密文会明确报错。本地记录不变。")}</small></span><ToggleVisual />
+                  </label>
+                  <label className="switch-row compact relay-switch-row relay-field-strip-image-generation">
+                    <input type="checkbox" checked={profile.stripImageGenerationTool === true} onChange={(event) => updateDraft({ stripImageGenerationTool: event.currentTarget.checked })} />
+                    <span><strong>{t("移除请求里的托管生图工具（image_generation）")}</strong><small>{t("Codex App 每次请求都会带上托管生图工具，不支持生图的中转会整条请求返回 403 或报错。开启后转发前从 tools 里去掉它（及指向它的 tool_choice），请求改走本地代理；Codex 里将无法调用内置生图。默认关闭。")}</small></span><ToggleVisual />
                   </label>
                 </> : null}
                 </div>
@@ -16416,6 +16424,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     localCompactionPromptAtEnd: profile.localCompactionPromptAtEnd === true,
     trustUpstreamCatalogLite: profile.trustUpstreamCatalogLite === true,
     strictResponsesReasoning: profile.strictResponsesReasoning === true,
+    stripImageGenerationTool: profile.stripImageGenerationTool === true,
     anthropicAuthHeader: normalizeAnthropicAuthHeader(profile.anthropicAuthHeader),
     anthropicMaxTokens: normalizeAnthropicMaxTokens(profile.anthropicMaxTokens),
     anthropicPromptCache: profile.anthropicPromptCache !== false,
@@ -16687,7 +16696,7 @@ function withGeneratedRelayFiles(profile: RelayProfile): RelayProfile {
 }
 
 function buildRelayConfigToml(
-  profile: Pick<RelayProfile, "id" | "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider" | "relayMode" | "officialMixApiKey" | "webSearchHistoryCompat" | "localCompactionPromptAtEnd" | "strictResponsesReasoning" | "modelMetadata">,
+  profile: Pick<RelayProfile, "id" | "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider" | "relayMode" | "officialMixApiKey" | "webSearchHistoryCompat" | "localCompactionPromptAtEnd" | "strictResponsesReasoning" | "stripImageGenerationTool" | "modelMetadata">,
   options: { includeBearerToken: boolean; requiresOpenAiAuth?: boolean },
 ): string {
   const searchHistoryCompat = profile.webSearchHistoryCompat === true
@@ -16698,7 +16707,7 @@ function buildRelayConfigToml(
     && (profile.protocol === "responses" || profile.protocol === "chatCompletions")
     && profile.relayMode !== "aggregate"
     && (profile.relayMode !== "official" || profile.officialMixApiKey);
-  const baseUrl = profile.protocol !== "responses" || independentProxyEnabled(profile) || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(profile)
+  const baseUrl = profile.protocol !== "responses" || independentProxyEnabled(profile) || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(profile) || stripImageGenerationToolEnabled(profile)
     ? PROTOCOL_PROXY_BASE_URL
     : profile.baseUrl.trim();
   const apiKey = profile.apiKey.trim();
@@ -16849,7 +16858,7 @@ function applyRelayProfilePatchToFiles(
   if ("upstreamBaseUrl" in patch) {
     next.baseUrl = patch.upstreamBaseUrl || "";
   }
-  if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch || "webSearchHistoryCompat" in patch || "localCompactionPromptAtEnd" in patch || "strictResponsesReasoning" in patch || "modelMetadata" in patch) {
+  if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch || "webSearchHistoryCompat" in patch || "localCompactionPromptAtEnd" in patch || "strictResponsesReasoning" in patch || "stripImageGenerationTool" in patch || "modelMetadata" in patch) {
     const searchHistoryCompat = next.webSearchHistoryCompat === true
       && next.protocol === "responses"
       && next.relayMode !== "aggregate"
@@ -16858,7 +16867,7 @@ function applyRelayProfilePatchToFiles(
       && (next.protocol === "responses" || next.protocol === "chatCompletions")
       && next.relayMode !== "aggregate"
       && (next.relayMode !== "official" || next.officialMixApiKey);
-    const baseUrlForConfig = next.protocol !== "responses" || independentProxyEnabled(next) || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(next)
+    const baseUrlForConfig = next.protocol !== "responses" || independentProxyEnabled(next) || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(next) || stripImageGenerationToolEnabled(next)
       ? PROTOCOL_PROXY_BASE_URL
       : next.upstreamBaseUrl || next.baseUrl;
     next.configContents = setCodexProviderStringKey(next.configContents, "base_url", baseUrlForConfig, {
