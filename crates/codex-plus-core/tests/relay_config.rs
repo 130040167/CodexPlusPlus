@@ -7701,9 +7701,9 @@ base_url = "https://responses.example.test/v1"
 
 #[test]
 fn official_mix_profile_keeps_user_feature_flags_in_live_config() {
-    // #1010：混入模式下 Codex 直连中转 base_url，Codex++ 无法在转发时剥掉生图工具；
-    // 中转不支持生图时，用户在供应商配置里写 `[features] image_generation = false`
-    // 是唯一规避手段，切换供应商时必须原样落到 live config.toml。
+    // #1010：混入模式下 Codex 直连中转 base_url，Codex++ 不经手请求、剥不掉生图工具
+    // （#228 起可打开「移除托管生图工具」改走本地代理）；用户在供应商配置里写的
+    // `[features] image_generation = false` 切换供应商时仍必须原样落到 live config.toml。
     let temp = tempfile::tempdir().unwrap();
     let mut profile = RelayProfile {
         id: "mix".to_string(),
@@ -7933,6 +7933,26 @@ fn auto_review_model_routes_responses_profile_through_local_proxy() {
     assert!(!direct.contains("127.0.0.1:57321"));
 
     profile.auto_review_model = "deepseek-v4-flash".to_string();
+    apply_relay_profile_to_home_with_switch_rules_and_proxy_port(temp.path(), &profile, "", 57321)
+        .unwrap();
+    let proxied = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(proxied.contains("127.0.0.1:57321"), "{proxied}");
+}
+
+/// issue #228：托管生图工具的剥离发生在本地协议代理里，打开「移除托管生图工具」的
+/// Responses 供应商必须改走本地代理；关闭时保持上游直连。
+#[test]
+fn strip_image_generation_tool_routes_responses_profile_through_local_proxy() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut profile = responses_profile_with_model("gpt-5.6-sol");
+
+    apply_relay_profile_to_home_with_switch_rules_and_proxy_port(temp.path(), &profile, "", 57321)
+        .unwrap();
+    let direct = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(direct.contains("https://responses.example.test/v1"));
+    assert!(!direct.contains("127.0.0.1:57321"));
+
+    profile.strip_image_generation_tool = true;
     apply_relay_profile_to_home_with_switch_rules_and_proxy_port(temp.path(), &profile, "", 57321)
         .unwrap();
     let proxied = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();

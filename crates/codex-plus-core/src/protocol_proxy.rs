@@ -5110,6 +5110,65 @@ fn project_strict_reasoning_history(body: &mut Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Responses 托管生图工具的类型名。
+const IMAGE_GENERATION_TOOL_TYPE: &str = "image_generation";
+
+fn is_image_generation_tool(tool: &Value) -> bool {
+    tool.get("type").and_then(Value::as_str) == Some(IMAGE_GENERATION_TOOL_TYPE)
+}
+
+/// 从 Responses 请求里移除托管生图工具：顶层 `tools`、以输入项形式交来的
+/// `additional_tools`，以及指向它的 `tool_choice`。工具删空时连 `tool_choice` 一起去掉，
+/// 免得 `required` 落在空工具表上。返回是否改动过请求。
+pub fn strip_image_generation_tool(body: &mut Value) -> bool {
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    if let Some(Value::Array(items)) = object.get_mut("input") {
+        for item in items.iter_mut() {
+            if item.get("type").and_then(Value::as_str) == Some("additional_tools")
+                && let Some(Value::Array(tools)) = item.get_mut("tools")
+            {
+                let before = tools.len();
+                tools.retain(|tool| !is_image_generation_tool(tool));
+                changed |= tools.len() != before;
+            }
+        }
+    }
+    let mut tools_emptied = false;
+    if let Some(Value::Array(tools)) = object.get_mut("tools") {
+        let before = tools.len();
+        tools.retain(|tool| !is_image_generation_tool(tool));
+        if tools.len() != before {
+            changed = true;
+            tools_emptied = tools.is_empty();
+        }
+    }
+    if tools_emptied {
+        object.remove("tools");
+        object.remove("tool_choice");
+        return true;
+    }
+    match object.get_mut("tool_choice") {
+        // 指名要生图工具：工具已不在，退回默认的自动选择。
+        Some(choice) if is_image_generation_tool(choice) => {
+            object.remove("tool_choice");
+            changed = true;
+        }
+        // allowed_tools 白名单里的生图工具也一并去掉。
+        Some(choice) => {
+            if let Some(Value::Array(allowed)) = choice.get_mut("tools") {
+                let before = allowed.len();
+                allowed.retain(|tool| !is_image_generation_tool(tool));
+                changed |= allowed.len() != before;
+            }
+        }
+        None => {}
+    }
+    changed
+}
+
 /// Codex 自动审批（「替我审批」）请求使用的固定模型 slug。
 const CODEX_AUTO_REVIEW_MODEL: &str = crate::aggregate_catalog::CODEX_AUTO_REVIEW_MODEL;
 
@@ -5169,6 +5228,14 @@ async fn upstream_request_parts(
     if reasoning_mode == "omit" { strip_reasoning_parameters(&mut request_json); }
     if relay.protocol == RelayProtocol::Responses && relay.strict_responses_reasoning && compatibility_enabled {
         project_strict_reasoning_history(&mut request_json)?;
+    }
+    // #228：Codex App 固定带托管生图工具，不支持生图的第三方 Responses 上游会整条拒绝；
+    // 供应商打开「移除托管生图工具」时在转发前去掉。直连代理与 2.0 网关都经过这里。
+    if relay.strips_image_generation_tool() && strip_image_generation_tool(&mut request_json) {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "protocol_proxy.strip_image_generation_tool",
+            json!({ "relayId": relay.id }),
+        );
     }
     let mut body = match relay.protocol {
         RelayProtocol::Responses => request_json,
@@ -12732,6 +12799,73 @@ mod parallel_tool_call_pairing_tests {
                 .await
                 .unwrap();
         assert_eq!(out["model"], "deepseek-v4-pro");
+    }
+
+    /// #228：开关关着时托管生图工具原样转发；打开后从 tools、additional_tools
+    /// 与 tool_choice 里去掉，其它工具不动。
+    #[tokio::test]
+    async fn image_generation_tool_is_stripped_only_when_enabled() {
+        let mut relay = crate::settings::RelayProfile {
+            protocol: RelayProtocol::Responses,
+            relay_mode: crate::settings::RelayMode::PureApi,
+            base_url: "https://relay.example.test/v1".into(),
+            api_key: "sk-test".into(),
+            ..Default::default()
+        };
+        let body = || json!({
+            "model": "gpt-5.5",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "additional_tools", "tools": [{"type": "image_generation"}, {"type": "function", "name": "mcp_x"}]}
+            ],
+            "tools": [
+                {"type": "function", "name": "exec"},
+                {"type": "image_generation", "output_format": "png"},
+                {"type": "web_search"}
+            ],
+            "tool_choice": {"type": "image_generation"}
+        });
+        let run = |relay: crate::settings::RelayProfile, body: Value| async move {
+            upstream_request_parts(&relay, body, "/v1/responses", None, false, None, ProxySessionHeaders::default())
+                .await
+                .unwrap()
+                .1
+        };
+
+        let out = run(relay.clone(), body()).await;
+        assert!(out["tools"].as_array().unwrap().iter().any(is_image_generation_tool));
+        assert_eq!(out["tool_choice"]["type"], "image_generation");
+
+        relay.strip_image_generation_tool = true;
+        let out = run(relay.clone(), body()).await;
+        let tools: Vec<&str> = out["tools"].as_array().unwrap().iter()
+            .map(|tool| tool["type"].as_str().unwrap()).collect();
+        assert_eq!(tools, ["function", "web_search"]);
+        assert!(out.get("tool_choice").is_none(), "{out}");
+        let additional = out["input"].as_array().unwrap().iter()
+            .find(|item| item["type"] == "additional_tools").unwrap();
+        assert_eq!(additional["tools"], json!([{"type": "function", "name": "mcp_x"}]));
+
+        // 只剩生图工具：tools 与 tool_choice 一起去掉。
+        let only = json!({"model": "gpt-5.5", "input": "hi", "tools": [{"type": "image_generation"}], "tool_choice": "required"});
+        let out = run(relay.clone(), only).await;
+        assert!(out.get("tools").is_none() && out.get("tool_choice").is_none(), "{out}");
+
+        // Chat 上游不认这个开关（协议转换本来就不带托管工具），判定函数为假。
+        relay.protocol = RelayProtocol::ChatCompletions;
+        assert!(!relay.strips_image_generation_tool());
+    }
+
+    #[test]
+    fn strip_image_generation_tool_keeps_allowed_tools_choice_consistent() {
+        let mut body = json!({
+            "tools": [{"type": "function", "name": "exec"}, {"type": "image_generation"}],
+            "tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "image_generation"}, {"type": "function", "name": "exec"}]}
+        });
+        assert!(strip_image_generation_tool(&mut body));
+        assert_eq!(body["tool_choice"]["tools"], json!([{"type": "function", "name": "exec"}]));
+        let mut untouched = json!({"tools": [{"type": "function", "name": "exec"}], "tool_choice": "auto"});
+        assert!(!strip_image_generation_tool(&mut untouched));
     }
 
     fn assert_pairing(body: &Value, expected: usize) {
