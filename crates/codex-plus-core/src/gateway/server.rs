@@ -635,7 +635,7 @@ async fn handle_claude_messages(
             Ok(())
         }
         GatewayUpstream::Native(response) => {
-            write_native(stream, &mut request_log, &trace, response).await
+            write_native(stream, &mut request_log, &trace, response, wants_stream).await
         }
         GatewayUpstream::Pipeline(mut response) => {
             request_log.record_trace(&trace, response.status_code, wants_stream);
@@ -765,6 +765,7 @@ async fn write_native(
     request_log: &mut ProxyRequestLog,
     trace: &crate::request_log::RequestTrace,
     mut response: NativeAnthropicResponse,
+    wants_stream: bool,
 ) -> anyhow::Result<()> {
     request_log.record_trace(trace, response.status_code, response.is_stream);
     if let Some(body) = response.buffered_body.take() {
@@ -797,6 +798,16 @@ async fn write_native(
         let body = upstream.bytes().await?;
         request_log.record_usage_json(&body);
         request_log.record_stream(None, anthropic_usage(&body), None);
+        // 客户端要流式、上游没理会 stream:true 回了整段 JSON：拆成事件流再给，Claude Code 只认流。
+        if wants_stream
+            && let Ok(message) = serde_json::from_slice::<Value>(&body)
+            && message.get("type").and_then(Value::as_str) == Some("message")
+        {
+            write_stream_headers(stream).await?;
+            stream.write_all(&anthropic_message_to_sse(&message)).await?;
+            stream.shutdown().await?;
+            return Ok(());
+        }
         write_http_response(stream, "200 OK", &response.content_type, &body).await?;
         stream.shutdown().await?;
         return Ok(());

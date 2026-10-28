@@ -48,7 +48,7 @@ import { shortProviderName } from "./GatewayModelMatrix";
 import { TopbarActions } from "./TopbarActions";
 import { GatewayNavContext } from "./gateway-store";
 import { useEscapeLayer } from "./use-escape-layer";
-import { publishGatewayPayload, subscribeGatewayPayload } from "./gateway-store";
+import { gatewayGeneration, publishGatewayPayload, subscribeGatewayPayload } from "./gateway-store";
 import "./GatewayPage.css";
 
 type Tab = "agents" | "sessions" | "providers" | "routing" | "usage" | "gateway";
@@ -139,9 +139,11 @@ export function GatewayPage({
   useEffect(() => {
     let cancelled = false;
     const onFocus = () => {
+      const started = gatewayGeneration();
       void invoke<GatewayResult>("load_gateway")
         .then((result) => {
-          if (!cancelled) accept(result);
+          // 读的过程中保存过：这份是旧的，不用。
+          if (!cancelled && started === gatewayGeneration()) accept(result);
         })
         .catch(() => undefined);
     };
@@ -158,9 +160,10 @@ export function GatewayPage({
     if (tab !== "routing") return;
     let cancelled = false;
     const timer = window.setInterval(() => {
+      const started = gatewayGeneration();
       void invoke<GatewayResult>("load_gateway")
         .then((result) => {
-          if (!cancelled) accept(result);
+          if (!cancelled && started === gatewayGeneration()) accept(result);
         })
         .catch(() => undefined);
     }, LIVE_REFRESH_MS);

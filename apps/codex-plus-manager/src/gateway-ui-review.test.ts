@@ -239,3 +239,15 @@ test("启动落在网关「总览」，不落在上次那个 Agent 的概览", (
   assert.match(body, /return "hub";\r?\n\}/);
   assert.doesNotMatch(body, /return "overview"/);
 });
+
+test("保存之后才回来的轮询结果作废；新手引导的 Esc 走 Esc 栈", () => {
+  const store = read("gateway-store.ts");
+  assert.match(store, /generation \+= 1;/, "推新数据时版本加一");
+  assert.match(store, /started !== generation/, "共享数据的轮询丢掉旧答复");
+  const page = read("GatewayPage.tsx");
+  assert.equal((page.match(/started === gatewayGeneration\(\)/g) ?? []).length, 2, "网关页的回前台刷新和路由页轮询都丢旧答复");
+  const tour = read("OnboardingTour.tsx");
+  assert.match(tour, /useEscapeLayer\(true, \(\) => onClose\(false\)\)/);
+  assert.doesNotMatch(tour, /event\.key === "Escape"/, "不再自己监听 Esc");
+});
+

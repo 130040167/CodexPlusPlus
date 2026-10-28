@@ -1927,6 +1927,22 @@ async fn handle_helper_connection(
         }),
     );
 
+    // 浏览器里的网页能对 127.0.0.1 发「简单请求」（不触发预检），读不到答复，但请求照样执行、照样计费。
+    // Agent 都不带 Origin；带了的模型 / 生图 / 转写请求一律拒绝，免得本地服务被网页拿去用池里的额度。
+    if method == "POST"
+        && is_billable_proxy_path(path)
+        && header_value_from_headers(&request_headers, "origin")
+            .is_some_and(|origin| !origin.trim().is_empty())
+    {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "status": "forbidden",
+            "message": "本地代理不接受来自网页的请求。"
+        }))?;
+        write_http_response(&mut stream, "403 Forbidden", "application/json; charset=utf-8", &body)
+            .await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
     if crate::gateway::is_gateway_path(path) {
         return crate::gateway::server::handle(
             &mut stream,
@@ -3437,6 +3453,16 @@ async fn handle_audio_transcriptions_proxy_connection(
     );
     stream.shutdown().await?;
     Ok(())
+}
+
+/// 会花上游额度的本地代理接口（模型、生图、转写；网关路径 `/gw/...` 也算）。
+fn is_billable_proxy_path(path: &str) -> bool {
+    crate::gateway::is_gateway_path(path)
+        || crate::protocol_proxy::is_responses_proxy_path(path)
+        || crate::protocol_proxy::is_chat_completions_proxy_path(path)
+        || crate::protocol_proxy::is_image_generations_proxy_path(path)
+        || crate::protocol_proxy::is_image_edits_proxy_path(path)
+        || crate::protocol_proxy::is_audio_transcriptions_proxy_path(path)
 }
 
 async fn handle_image_proxy_connection(
@@ -5633,6 +5659,16 @@ fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> a
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn billable_paths_cover_model_image_and_gateway_endpoints() {
+        for path in ["/v1/responses", "/v1/chat/completions", "/v1/images/generations", "/v1/images/edits", "/v1/audio/transcriptions", "/gw/claude/v1/messages"] {
+            assert!(is_billable_proxy_path(path), "{path}");
+        }
+        for path in ["/dictation/status", "/v1/models", "/health"] {
+            assert!(!is_billable_proxy_path(path), "{path}");
+        }
+    }
 
     #[test]
     fn standalone_quota_unlock_is_opt_in_and_does_not_duplicate_full_enhancements() {
