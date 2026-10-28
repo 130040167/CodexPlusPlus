@@ -366,16 +366,46 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
             let Some(group) = gateway.group(id) else {
                 continue;
             };
-            let entry = crate::model_suffix::collect_catalog_entries(
-                &model,
-                &Default::default(),
-                &Default::default(),
-                &model,
-            );
-            let template: Value =
-                serde_json::from_str(&crate::model_suffix::build_model_catalog_json(&entry, None))
+            // 组的推理档位取第一个成员的；Fast 要每个成员都支持才开（#2740）：
+            // 请求轮到不支持的那家会被拒。成员一个都对不上时退回按组名生成的通用条目。
+            let mut member_fields = Vec::new();
+            for (relay, upstream) in route::model_entry_members(gateway, binding, &model) {
+                let Some(index) = relays.iter().position(|candidate| candidate.id == relay.id)
+                else {
+                    continue;
+                };
+                if let Some(entry) =
+                    member_catalog_entry(&mut member_catalogs, &relays, index, &upstream)
+                {
+                    member_fields.push(catalog_ui_fields(&entry));
+                }
+            }
+            let mut fields = match member_fields.first() {
+                Some(first) => first.clone(),
+                None => {
+                    let entry = crate::model_suffix::collect_catalog_entries(
+                        &model,
+                        &Default::default(),
+                        &Default::default(),
+                        &model,
+                    );
+                    let template: Value = serde_json::from_str(
+                        &crate::model_suffix::build_model_catalog_json(&entry, None),
+                    )
                     .unwrap_or(Value::Null);
-            let mut fields = catalog_ui_fields(&template["models"][0]);
+                    catalog_ui_fields(&template["models"][0])
+                }
+            };
+            let has_tiers = |fields: &Map<String, Value>| {
+                fields
+                    .get("service_tiers")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tiers| !tiers.is_empty())
+            };
+            if member_fields.is_empty() || !member_fields.iter().all(has_tiers) {
+                fields.insert("service_tiers".into(), json!([]));
+                fields.insert("additional_speed_tiers".into(), json!([]));
+            }
             fields.insert("display_name".into(), json!(group.name));
             fields.insert("description".into(), json!(format!("{model} · 模型组")));
             fields.insert("codex_plus_group".into(), json!("模型组"));
@@ -391,20 +421,11 @@ fn codex_model_metadata(gateway: &GatewaySettings, binding: &AgentBinding) -> St
             continue;
         };
         let relay = relays[index];
-        let catalog = member_catalogs[index].get_or_insert_with(|| {
-            crate::aggregate_catalog::build_member_catalog(relay)
-                .ok()
-                .and_then(|payload| payload["models"].as_array().cloned())
-                .unwrap_or_default()
-        });
-        let Some(entry) = catalog.iter().find(|entry| {
-            entry["slug"]
-                .as_str()
-                .is_some_and(|slug| slug.eq_ignore_ascii_case(&upstream))
-        }) else {
+        let Some(entry) = member_catalog_entry(&mut member_catalogs, &relays, index, &upstream)
+        else {
             continue;
         };
-        let mut fields = catalog_ui_fields(entry);
+        let mut fields = catalog_ui_fields(&entry);
         // 没有元数据的模型，成员目录的显示名就是原始 ID：换成规范写法（gpt-6.1-sol → GPT-6.1-Sol）。
         let display = fields
             .get("display_name")
@@ -521,6 +542,29 @@ fn codex_group_suffix(relay: &RelayProfile, group: &str, relays: &[&RelayProfile
     } else {
         relay.id.clone()
     }
+}
+
+/// 池里第 `index` 家的成员目录里这个上游模型的条目（不分大小写）；每家的目录只生成一次。
+fn member_catalog_entry(
+    cache: &mut [Option<Vec<Value>>],
+    relays: &[&RelayProfile],
+    index: usize,
+    upstream: &str,
+) -> Option<Value> {
+    let catalog = cache[index].get_or_insert_with(|| {
+        crate::aggregate_catalog::build_member_catalog(relays[index])
+            .ok()
+            .and_then(|payload| payload["models"].as_array().cloned())
+            .unwrap_or_default()
+    });
+    catalog
+        .iter()
+        .find(|entry| {
+            entry["slug"]
+                .as_str()
+                .is_some_and(|slug| slug.eq_ignore_ascii_case(upstream))
+        })
+        .cloned()
 }
 
 /// 目录条目里选择器要用的字段；整条（含基础指令等大字段）不进设置文件。
