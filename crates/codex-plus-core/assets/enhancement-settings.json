@@ -219,7 +219,7 @@
       "group": "chat",
       "control": "bool",
       "title": "用量状态栏",
-      "description": "在输入框下方显示生成速度、缓存命中率和上下文占用。数据来自本机 Codex 会话记录，不改变请求内容。",
+      "description": "在输入框下方显示输出吞吐、缓存命中率和上下文占用。数据来自本机 Codex 会话记录，不改变请求内容。",
       "surfaces": ["manager", "codex"]
     },
     {
