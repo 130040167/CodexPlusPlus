@@ -1,13 +1,43 @@
 use std::path::{Path, PathBuf};
 
 pub fn default_codex_home_dir() -> PathBuf {
-    std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .filter(|path| codex_home_env_dir_is_explicit(path))
-        .unwrap_or_else(default_user_codex_home_dir)
+    let Some(path) = std::env::var_os("CODEX_HOME").map(PathBuf::from) else {
+        return default_user_codex_home_dir();
+    };
+    if !codex_home_env_dir_is_explicit(&path) {
+        return default_user_codex_home_dir();
+    }
+    if !path.is_absolute() {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "codex_home.relative_path_rejected",
+            serde_json::json!({
+                "path": path,
+                "message": "CODEX_HOME must be an absolute path",
+            }),
+        );
+        return default_user_codex_home_dir();
+    }
+    if !path.exists() {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "codex_home.explicit_path_missing",
+            serde_json::json!({
+                "path": path,
+                "message": "显式 CODEX_HOME 不存在，仍保留该路径以避免越过隔离边界回退",
+            }),
+        );
+    } else if !path.is_dir() {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "codex_home.explicit_path_not_directory",
+            serde_json::json!({
+                "path": path,
+                "message": "显式 CODEX_HOME 不是目录，仍保留该路径并让后续 I/O 返回明确错误",
+            }),
+        );
+    }
+    path
 }
 
-fn codex_home_env_dir_is_explicit(path: &PathBuf) -> bool {
+fn codex_home_env_dir_is_explicit(path: &Path) -> bool {
     // 显式路径即使尚未创建或不可用也必须保留，不能跨过隔离边界回退到真实家目录。
     !path.as_os_str().is_empty() && !path.to_string_lossy().trim().is_empty()
 }
@@ -338,29 +368,48 @@ mod tests {
     }
 
     #[test]
-    fn default_codex_home_dir_preserves_missing_explicit_home() {
+    fn default_codex_home_dir_preserves_missing_explicit_home_and_logs_diagnostic() {
         let _lock = CODEX_HOME_ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing-codex-home");
+        let log_path = temp.path().join("diagnostics.jsonl");
+        crate::diagnostic_log::set_diagnostic_log_path_for_tests(Some(log_path.clone()));
         let _guard = CodexHomeEnvGuard::set(&missing);
 
         assert_eq!(default_codex_home_dir(), missing);
         assert_eq!(crate::relay_config::default_codex_home_dir(), missing);
         assert_eq!(crate::codex_sqlite::default_codex_home_dir(), missing);
         assert!(!missing.exists());
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("codex_home.explicit_path_missing"));
+        crate::diagnostic_log::set_diagnostic_log_path_for_tests(None);
     }
 
     #[test]
-    fn default_codex_home_dir_preserves_invalid_explicit_home_for_io_errors() {
+    fn default_codex_home_dir_rejects_relative_codex_home_env() {
+        let _lock = CODEX_HOME_ENV_LOCK.lock().unwrap();
+        let expected = default_user_codex_home_dir();
+        let _guard = CodexHomeEnvGuard::set_raw("relative-codex-home");
+
+        assert_eq!(default_codex_home_dir(), expected);
+    }
+
+    #[test]
+    fn default_codex_home_dir_preserves_invalid_explicit_home_and_logs_diagnostic() {
         let _lock = CODEX_HOME_ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("not-a-directory");
+        let log_path = temp.path().join("diagnostics.jsonl");
         std::fs::write(&file, b"").unwrap();
+        crate::diagnostic_log::set_diagnostic_log_path_for_tests(Some(log_path.clone()));
         let _guard = CodexHomeEnvGuard::set(&file);
 
         assert_eq!(default_codex_home_dir(), file);
         assert_eq!(crate::relay_config::default_codex_home_dir(), file);
         assert_eq!(crate::codex_sqlite::default_codex_home_dir(), file);
         assert!(std::fs::create_dir_all(default_codex_home_dir()).is_err());
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("codex_home.explicit_path_not_directory"));
+        crate::diagnostic_log::set_diagnostic_log_path_for_tests(None);
     }
 }
