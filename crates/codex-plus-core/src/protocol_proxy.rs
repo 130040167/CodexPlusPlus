@@ -3356,10 +3356,17 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         .map(str::trim)
         .unwrap_or("")
         .to_string();
+    // 聚合指定了审批成员（#2703）时，codex-auto-review 先按它解析，
+    // 不再交给默认成员 / 轮转（默认成员是官方登录时会消耗官方额度）。
     let aggregate_model = match if forced.is_some() {
         Ok(None)
     } else {
-        crate::aggregate_catalog::resolve_active_model(&settings, &source_model)
+        crate::aggregate_catalog::resolve_auto_review_member(&settings, &source_model).and_then(
+            |binding| match binding {
+                Some(binding) => Ok(Some(binding)),
+                None => crate::aggregate_catalog::resolve_active_model(&settings, &source_model),
+            },
+        )
     } {
         Ok(binding) => binding,
         Err(error) => {
@@ -5103,8 +5110,67 @@ fn project_strict_reasoning_history(body: &mut Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Responses 托管生图工具的类型名。
+const IMAGE_GENERATION_TOOL_TYPE: &str = "image_generation";
+
+fn is_image_generation_tool(tool: &Value) -> bool {
+    tool.get("type").and_then(Value::as_str) == Some(IMAGE_GENERATION_TOOL_TYPE)
+}
+
+/// 从 Responses 请求里移除托管生图工具：顶层 `tools`、以输入项形式交来的
+/// `additional_tools`，以及指向它的 `tool_choice`。工具删空时连 `tool_choice` 一起去掉，
+/// 免得 `required` 落在空工具表上。返回是否改动过请求。
+pub fn strip_image_generation_tool(body: &mut Value) -> bool {
+    let Some(object) = body.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    if let Some(Value::Array(items)) = object.get_mut("input") {
+        for item in items.iter_mut() {
+            if item.get("type").and_then(Value::as_str) == Some("additional_tools")
+                && let Some(Value::Array(tools)) = item.get_mut("tools")
+            {
+                let before = tools.len();
+                tools.retain(|tool| !is_image_generation_tool(tool));
+                changed |= tools.len() != before;
+            }
+        }
+    }
+    let mut tools_emptied = false;
+    if let Some(Value::Array(tools)) = object.get_mut("tools") {
+        let before = tools.len();
+        tools.retain(|tool| !is_image_generation_tool(tool));
+        if tools.len() != before {
+            changed = true;
+            tools_emptied = tools.is_empty();
+        }
+    }
+    if tools_emptied {
+        object.remove("tools");
+        object.remove("tool_choice");
+        return true;
+    }
+    match object.get_mut("tool_choice") {
+        // 指名要生图工具：工具已不在，退回默认的自动选择。
+        Some(choice) if is_image_generation_tool(choice) => {
+            object.remove("tool_choice");
+            changed = true;
+        }
+        // allowed_tools 白名单里的生图工具也一并去掉。
+        Some(choice) => {
+            if let Some(Value::Array(allowed)) = choice.get_mut("tools") {
+                let before = allowed.len();
+                allowed.retain(|tool| !is_image_generation_tool(tool));
+                changed |= allowed.len() != before;
+            }
+        }
+        None => {}
+    }
+    changed
+}
+
 /// Codex 自动审批（「替我审批」）请求使用的固定模型 slug。
-const CODEX_AUTO_REVIEW_MODEL: &str = "codex-auto-review";
+const CODEX_AUTO_REVIEW_MODEL: &str = crate::aggregate_catalog::CODEX_AUTO_REVIEW_MODEL;
 
 /// codex-auto-review 的改写目标：供应商配置了审批模型（#1446）时返回它，否则 `None`。
 /// 目录外模型映射（#1183）也用它判断是否让路，两处共用同一条规则。
@@ -5162,6 +5228,14 @@ async fn upstream_request_parts(
     if reasoning_mode == "omit" { strip_reasoning_parameters(&mut request_json); }
     if relay.protocol == RelayProtocol::Responses && relay.strict_responses_reasoning && compatibility_enabled {
         project_strict_reasoning_history(&mut request_json)?;
+    }
+    // #228：Codex App 固定带托管生图工具，不支持生图的第三方 Responses 上游会整条拒绝；
+    // 供应商打开「移除托管生图工具」时在转发前去掉。直连代理与 2.0 网关都经过这里。
+    if relay.strips_image_generation_tool() && strip_image_generation_tool(&mut request_json) {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "protocol_proxy.strip_image_generation_tool",
+            json!({ "relayId": relay.id }),
+        );
     }
     let mut body = match relay.protocol {
         RelayProtocol::Responses => request_json,
@@ -6689,6 +6763,72 @@ pub(crate) fn http_status_line(status: u16) -> String {
     }
 }
 
+/// 网关里的上游失败（#2741）：Codex 只显示错误消息，池里有好几家时看不出是哪一家、
+/// 哪个模型、什么状态码出的错。在消息末尾补上这些；`type` / `code` 不动——Codex 按它们
+/// 判断重试与提示文案。没有路由信息（请求没发到任何上游）时不改。
+pub fn annotate_gateway_upstream_error(
+    error: &mut Value,
+    status_code: u16,
+    trace: Option<&crate::request_log::RequestTrace>,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    let relay = if trace.relay_name.trim().is_empty() {
+        trace.relay_id.trim()
+    } else {
+        trace.relay_name.trim()
+    };
+    if relay.is_empty() {
+        return;
+    }
+    let mut origin = format!("网关上游：{relay}");
+    if !trace.upstream_model.trim().is_empty() {
+        origin.push_str(&format!(" · 模型 {}", trace.upstream_model.trim()));
+    }
+    if !trace.wire_api.trim().is_empty() {
+        origin.push_str(&format!(" · {}", trace.wire_api.trim()));
+    }
+    origin.push_str(&format!(" · HTTP {status_code}"));
+    let Some(object) = error.get_mut("error").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let message = object
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let annotated = if message.is_empty() {
+        origin
+    } else {
+        format!("{message}（{origin}）")
+    };
+    object.insert("message".to_string(), Value::String(annotated));
+}
+
+/// 请求日志里记的上游错误：状态码、类型 / code、提取出的消息，外加响应体原文预览（#2741）。
+/// 提取出的消息可能只是一句概括（Google 系错误的 details、中转附带的说明都在别的字段里），
+/// 日志里留一份原文才能定位；只进本地请求日志，不发给客户端。
+pub fn upstream_error_log_text(status_code: u16, error: &Value, body: &[u8]) -> String {
+    let inner = error.get("error").unwrap_or(error);
+    let mut text = format!("HTTP {status_code}");
+    for key in ["type", "code"] {
+        if let Some(value) = inner.get(key).and_then(Value::as_str).filter(|value| !value.is_empty()) {
+            text.push_str(&format!(" · {key}={value}"));
+        }
+    }
+    let message = inner.get("message").and_then(Value::as_str).unwrap_or_default().trim();
+    if !message.is_empty() {
+        text.push_str(&format!("：{message}"));
+    }
+    let raw = truncate_error_preview(String::from_utf8_lossy(body).trim());
+    if !raw.is_empty() && !message.contains(raw.as_str()) {
+        text.push_str(&format!("\n上游原文：{raw}"));
+    }
+    text
+}
+
 pub fn responses_error_from_upstream(status_code: u16, content_type: &str, body: &[u8]) -> Value {
     let (message, error_type, code, param) = upstream_error_parts(status_code, content_type, body);
     let mut error = json!({
@@ -6711,6 +6851,15 @@ pub(crate) fn upstream_error_parts(
 ) -> (String, Option<String>, Option<String>, Option<String>) {
     if content_type.to_ascii_lowercase().contains("json") {
         if let Ok(value) = serde_json::from_slice::<Value>(body) {
+            // Gemini 的 OpenAI 兼容端点把错误包在单元素数组里：`[{"error":{...}}]`（#2741）。
+            // 不拆开时整段数组被当成消息、类型与状态码都丢了，看不出是哪种错误。
+            let value = match value {
+                Value::Array(mut items) if items.len() == 1 && items[0].is_object() => {
+                    items.remove(0)
+                }
+                other => other,
+            };
+            let wrapped = value.get("error").is_some_and(Value::is_object);
             let error = value.get("error").unwrap_or(&value);
             let message = error
                 .get("message")
@@ -6721,9 +6870,12 @@ pub(crate) fn upstream_error_parts(
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string)
                 .unwrap_or_else(|| truncate_error_preview(&value.to_string()));
+            // Google 系错误没有 type，用 `status`（如 INVALID_ARGUMENT）补上；
+            // 只认 `error` 对象里的，免得把顶层 `{"status":"failed"}` 这类包装误当类型。
             let error_type = error
                 .get("type")
                 .or_else(|| error.get("error_type"))
+                .or_else(|| wrapped.then(|| error.get("status")).flatten())
                 .and_then(Value::as_str)
                 .map(ToString::to_string);
             let code = error.get("code").and_then(|value| {
@@ -11077,6 +11229,7 @@ mod unlisted_model_mapping_tests {
             routes: Vec::new(),
             default_relay_id: String::new(),
             sync_default_member_login: false,
+            auto_review_relay_id: String::new(),
         }];
         // 聚合有自己的按成员归因与「不做静默改派」策略，不在此映射。
         assert_eq!(unlisted_model_replacement(&settings, "gpt-5.4"), None);
@@ -12646,6 +12799,73 @@ mod parallel_tool_call_pairing_tests {
                 .await
                 .unwrap();
         assert_eq!(out["model"], "deepseek-v4-pro");
+    }
+
+    /// #228：开关关着时托管生图工具原样转发；打开后从 tools、additional_tools
+    /// 与 tool_choice 里去掉，其它工具不动。
+    #[tokio::test]
+    async fn image_generation_tool_is_stripped_only_when_enabled() {
+        let mut relay = crate::settings::RelayProfile {
+            protocol: RelayProtocol::Responses,
+            relay_mode: crate::settings::RelayMode::PureApi,
+            base_url: "https://relay.example.test/v1".into(),
+            api_key: "sk-test".into(),
+            ..Default::default()
+        };
+        let body = || json!({
+            "model": "gpt-5.5",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "additional_tools", "tools": [{"type": "image_generation"}, {"type": "function", "name": "mcp_x"}]}
+            ],
+            "tools": [
+                {"type": "function", "name": "exec"},
+                {"type": "image_generation", "output_format": "png"},
+                {"type": "web_search"}
+            ],
+            "tool_choice": {"type": "image_generation"}
+        });
+        let run = |relay: crate::settings::RelayProfile, body: Value| async move {
+            upstream_request_parts(&relay, body, "/v1/responses", None, false, None, ProxySessionHeaders::default())
+                .await
+                .unwrap()
+                .1
+        };
+
+        let out = run(relay.clone(), body()).await;
+        assert!(out["tools"].as_array().unwrap().iter().any(is_image_generation_tool));
+        assert_eq!(out["tool_choice"]["type"], "image_generation");
+
+        relay.strip_image_generation_tool = true;
+        let out = run(relay.clone(), body()).await;
+        let tools: Vec<&str> = out["tools"].as_array().unwrap().iter()
+            .map(|tool| tool["type"].as_str().unwrap()).collect();
+        assert_eq!(tools, ["function", "web_search"]);
+        assert!(out.get("tool_choice").is_none(), "{out}");
+        let additional = out["input"].as_array().unwrap().iter()
+            .find(|item| item["type"] == "additional_tools").unwrap();
+        assert_eq!(additional["tools"], json!([{"type": "function", "name": "mcp_x"}]));
+
+        // 只剩生图工具：tools 与 tool_choice 一起去掉。
+        let only = json!({"model": "gpt-5.5", "input": "hi", "tools": [{"type": "image_generation"}], "tool_choice": "required"});
+        let out = run(relay.clone(), only).await;
+        assert!(out.get("tools").is_none() && out.get("tool_choice").is_none(), "{out}");
+
+        // Chat 上游不认这个开关（协议转换本来就不带托管工具），判定函数为假。
+        relay.protocol = RelayProtocol::ChatCompletions;
+        assert!(!relay.strips_image_generation_tool());
+    }
+
+    #[test]
+    fn strip_image_generation_tool_keeps_allowed_tools_choice_consistent() {
+        let mut body = json!({
+            "tools": [{"type": "function", "name": "exec"}, {"type": "image_generation"}],
+            "tool_choice": {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "image_generation"}, {"type": "function", "name": "exec"}]}
+        });
+        assert!(strip_image_generation_tool(&mut body));
+        assert_eq!(body["tool_choice"]["tools"], json!([{"type": "function", "name": "exec"}]));
+        let mut untouched = json!({"tools": [{"type": "function", "name": "exec"}], "tool_choice": "auto"});
+        assert!(!strip_image_generation_tool(&mut untouched));
     }
 
     fn assert_pairing(body: &Value, expected: usize) {

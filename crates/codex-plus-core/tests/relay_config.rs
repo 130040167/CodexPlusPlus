@@ -956,10 +956,135 @@ base_url = "https://relay.example.test/v1"
     normalize_relay_profile_for_storage(&mut profile).unwrap();
 
     // name = "OpenAI" 会让 codex 误判官方身份启用 v2 远程压缩（issue #2217），
-    // 非官方会话身份必须改写为中性名。
-    assert!(profile.config_contents.contains(r#"name = "custom""#));
+    // 非官方会话身份必须改写为中性名（优先用供应商显示名，issue #192）。
+    assert!(profile.config_contents.contains(r#"name = "默认中转""#));
     assert!(!profile.config_contents.contains(r#"name = "OpenAI""#));
     let _ = temp;
+}
+
+/// 读 live config 里活动传输 provider 的 name（解析 TOML，校验转义后的真实值）。
+fn live_transport_provider_name(home: &std::path::Path) -> String {
+    let doc = std::fs::read_to_string(home.join("config.toml"))
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    let provider = doc["model_provider"].as_str().unwrap().to_string();
+    let provider = if provider == "openai" {
+        "custom".to_string()
+    } else {
+        provider
+    };
+    doc["model_providers"][provider.as_str()]["name"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn pure_api_profile_named(name: &str, config_contents: &str) -> RelayProfile {
+    RelayProfile {
+        id: "relay-a".to_string(),
+        name: name.to_string(),
+        model: "qwen3-coder".to_string(),
+        base_url: "https://relay.example/v1".to_string(),
+        api_key: "sk-test-redacted".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: config_contents.to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-test-redacted"}"#.to_string(),
+        ..RelayProfile::default()
+    }
+}
+
+/// issue #192：纯 API 模式下 provider name 跟供应商列表的显示名同步，
+/// 引号、反斜杠、换行等字符要经过 TOML 转义，不能写坏 config.toml。
+#[test]
+fn pure_api_provider_name_follows_profile_display_name_with_toml_escaping() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = pure_api_profile_named(
+        "  我的\"中转\" \\ A\nB  ",
+        "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\n",
+    );
+
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+
+    assert_eq!(
+        live_transport_provider_name(temp.path()),
+        "我的\"中转\" \\ A B"
+    );
+}
+
+/// issue #192：自定义 provider id 的表名也会被显示名接管（name 原本等于表名）。
+#[test]
+fn pure_api_provider_name_replaces_generated_custom_provider_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = pure_api_profile_named(
+        "Max 中转",
+        "model_provider = \"max_ai\"\n\n[model_providers.max_ai]\nname = \"max_ai\"\nbase_url = \"https://relay.example/v1\"\n",
+    );
+
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(config.contains("[model_providers.max_ai]"));
+    assert_eq!(live_transport_provider_name(temp.path()), "Max 中转");
+}
+
+/// 用户在配置里手写的 name 是自定义标签（issue #1886 / #2682），不被显示名覆盖。
+#[test]
+fn pure_api_provider_name_keeps_user_customized_label() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = pure_api_profile_named(
+        "列表里的名字",
+        "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"My relay\"\n",
+    );
+
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+
+    assert_eq!(live_transport_provider_name(temp.path()), "My relay");
+}
+
+/// 显示名为空或是 OpenAI 的大小写 / 空白变体时不能写进 name（issue #2217），退回 provider id。
+#[test]
+fn pure_api_provider_name_falls_back_when_display_name_is_empty_or_openai() {
+    for display_name in [
+        "", "   ", "OpenAI", "openai", " OPENAI ", "Open AI", "open\tai",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = pure_api_profile_named(
+            display_name,
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"OpenAI\"\n",
+        );
+
+        apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+
+        assert_eq!(
+            live_transport_provider_name(temp.path()),
+            "custom",
+            "display name {display_name:?}"
+        );
+    }
+}
+
+/// 回填 live config 不能把 Codex++ 写进去的显示名固化进快照，否则改名后不再同步（issue #192）。
+#[test]
+fn backfill_does_not_freeze_synced_display_name_so_rename_still_syncs() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut profile = pure_api_profile_named(
+        "旧名字",
+        "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\n",
+    );
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+    assert_eq!(live_transport_provider_name(temp.path()), "旧名字");
+
+    let mut common = String::new();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut common).unwrap();
+    assert!(!profile.config_contents.contains("旧名字"));
+    let mut simple = profile.clone();
+    backfill_relay_profile_from_home(temp.path(), &mut simple).unwrap();
+    assert!(!simple.config_contents.contains("旧名字"));
+
+    profile.name = "新名字".to_string();
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+    assert_eq!(live_transport_provider_name(temp.path()), "新名字");
 }
 
 /// issue #1097 问题 2：live config 的 `model =` 被污染成整段转义后的供应商配置时，
@@ -1325,7 +1450,7 @@ experimental_bearer_token = "sk-test-redacted"
 
     assert!(ensure_active_protocol_proxy_config_in_home(temp.path(), &settings).unwrap());
     let updated = std::fs::read_to_string(&config_path).unwrap();
-    assert!(updated.contains(r#"name = "custom""#));
+    assert!(updated.contains(r#"name = "默认中转""#));
     assert!(!updated.contains(r#"name = "OpenAI""#));
     assert!(updated.contains(r#"experimental_bearer_token = "sk-test-redacted""#));
     assert!(!ensure_active_protocol_proxy_config_in_home(temp.path(), &settings).unwrap());
@@ -4511,7 +4636,7 @@ experimental_bearer_token = "sk-new"
     assert!(config.contains(r#"model = "qwen3-coder""#));
     assert!(config.contains(r#"model_provider = "custom""#));
     assert!(config.contains("[model_providers.custom]"));
-    assert!(config.contains(r#"name = "custom""#));
+    assert!(config.contains(r#"name = "默认中转""#));
     assert!(config.contains(r#"wire_api = "responses""#));
     assert!(!config.contains("requires_openai_auth"));
     assert!(config.contains(r#"base_url = "https://relay.example/v1""#));
@@ -4548,7 +4673,7 @@ requires_openai_auth = true
     assert!(config.contains("disable_response_storage = true"));
     assert!(config.contains(r#"model_provider = "max_ai""#));
     assert!(config.contains("[model_providers.max_ai]"));
-    assert!(config.contains(r#"name = "max_ai""#));
+    assert!(config.contains(r#"name = "默认中转""#));
     assert!(config.contains(r#"base_url = "https://max2.jojocode.com/v1""#));
     assert!(config.contains("requires_openai_auth = true"));
     assert!(config.contains(r#"experimental_bearer_token = "sk-new""#));
@@ -5070,7 +5195,7 @@ experimental_bearer_token = "sk-new"
     assert!(config.contains(r#"model = "gpt-5.4""#));
     assert!(config.contains(r#"model_provider = "custom""#));
     assert!(config.contains("[model_providers.custom]"));
-    assert!(config.contains(r#"name = "custom""#));
+    assert!(config.contains(r#"name = "默认中转""#));
     assert!(config.contains(r#"base_url = "https://max2.jojocode.com/v1""#));
     assert!(config.contains(r#"wire_api = "responses""#));
     assert!(!config.contains("requires_openai_auth"));
@@ -7576,9 +7701,9 @@ base_url = "https://responses.example.test/v1"
 
 #[test]
 fn official_mix_profile_keeps_user_feature_flags_in_live_config() {
-    // #1010：混入模式下 Codex 直连中转 base_url，Codex++ 无法在转发时剥掉生图工具；
-    // 中转不支持生图时，用户在供应商配置里写 `[features] image_generation = false`
-    // 是唯一规避手段，切换供应商时必须原样落到 live config.toml。
+    // #1010：混入模式下 Codex 直连中转 base_url，Codex++ 不经手请求、剥不掉生图工具
+    // （#228 起可打开「移除托管生图工具」改走本地代理）；用户在供应商配置里写的
+    // `[features] image_generation = false` 切换供应商时仍必须原样落到 live config.toml。
     let temp = tempfile::tempdir().unwrap();
     let mut profile = RelayProfile {
         id: "mix".to_string(),
@@ -7808,6 +7933,26 @@ fn auto_review_model_routes_responses_profile_through_local_proxy() {
     assert!(!direct.contains("127.0.0.1:57321"));
 
     profile.auto_review_model = "deepseek-v4-flash".to_string();
+    apply_relay_profile_to_home_with_switch_rules_and_proxy_port(temp.path(), &profile, "", 57321)
+        .unwrap();
+    let proxied = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(proxied.contains("127.0.0.1:57321"), "{proxied}");
+}
+
+/// issue #228：托管生图工具的剥离发生在本地协议代理里，打开「移除托管生图工具」的
+/// Responses 供应商必须改走本地代理；关闭时保持上游直连。
+#[test]
+fn strip_image_generation_tool_routes_responses_profile_through_local_proxy() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut profile = responses_profile_with_model("gpt-5.6-sol");
+
+    apply_relay_profile_to_home_with_switch_rules_and_proxy_port(temp.path(), &profile, "", 57321)
+        .unwrap();
+    let direct = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(direct.contains("https://responses.example.test/v1"));
+    assert!(!direct.contains("127.0.0.1:57321"));
+
+    profile.strip_image_generation_tool = true;
     apply_relay_profile_to_home_with_switch_rules_and_proxy_port(temp.path(), &profile, "", 57321)
         .unwrap();
     let proxied = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();

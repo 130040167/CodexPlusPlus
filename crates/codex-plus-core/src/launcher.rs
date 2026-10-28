@@ -2831,17 +2831,29 @@ pub(crate) async fn handle_protocol_proxy_connection(
         let upstream_content_type = upstream.content_type.clone();
         let upstream_body = upstream.read_body().await?;
         request_log.record_usage_json(&upstream_body);
-        let error = crate::protocol_proxy::responses_error_from_upstream(
+        let mut error = crate::protocol_proxy::responses_error_from_upstream(
             upstream.status_code,
             &upstream_content_type,
             &upstream_body,
         );
         // 上游的错误原文记进请求日志（#2741）：之前只转给了 Agent，日志里错误一栏是空的，没法排查。
-        let message = error["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        request_log.record_error(&status, message);
+        // 日志里带上状态码、类型 / code 和响应体原文预览，提取出的消息丢掉的细节也能看到。
+        request_log.record_error(
+            &status,
+            crate::protocol_proxy::upstream_error_log_text(
+                upstream.status_code,
+                &error,
+                &upstream_body,
+            ),
+        );
+        // 网关池里有好几家：Agent 看到的错误补上是哪一家、哪个模型、什么状态码（#2741）。
+        if matches!(opener, ProxyOpener::Gateway(_)) {
+            crate::protocol_proxy::annotate_gateway_upstream_error(
+                &mut error,
+                upstream.status_code,
+                upstream.request_trace.as_ref(),
+            );
+        }
         let body = serde_json::to_vec(&error)?;
         write_http_response(stream, &status, "application/json; charset=utf-8", &body).await?;
         log_helper_response(

@@ -172,6 +172,10 @@ pub struct RelayProfile {
     /// 明确选择严格 Responses 历史契约；默认不改写历史。
     #[serde(default, skip_serializing_if = "is_false")]
     pub strict_responses_reasoning: bool,
+    /// 转发前从请求的 tools 里移除托管生图工具（`image_generation`）及指向它的 tool_choice。
+    /// Codex App 会固定带上这个工具，不支持生图的第三方 Responses 上游会整条请求报 403（#228）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strip_image_generation_tool: bool,
     /// Codex「替我审批」固定请求 `codex-auto-review`，第三方上游通常不认识这个模型；
     /// 填写后协议代理把它改写成这里的模型（#1446）。留空则原样转发。
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -340,6 +344,12 @@ pub struct AggregateRelayProfile {
     /// 应当由用户显式选择。
     #[serde(rename = "syncDefaultMemberLogin", default)]
     pub sync_default_member_login: bool,
+    /// 审批成员（#2703）：Codex「替我审批」固定请求 `codex-auto-review`，默认跟普通请求一样
+    /// 交给默认成员 / 轮转选中的成员；默认成员是官方登录时就会消耗官方额度。
+    /// 指定后，审批请求只发给这个成员，模型取它的「自动审批模型」（没填用它的默认模型）。
+    /// 空串表示未设置，保持原有行为。
+    #[serde(rename = "autoReviewRelayId", default, skip_serializing_if = "String::is_empty")]
+    pub auto_review_relay_id: String,
 }
 
 impl Default for RelayProfile {
@@ -383,6 +393,7 @@ impl Default for RelayProfile {
             local_compaction_prompt_at_end: false,
             trust_upstream_catalog_lite: false,
             strict_responses_reasoning: false,
+            strip_image_generation_tool: false,
             auto_review_model: String::new(),
             multi_agent: String::new(),
             anthropic_auth_header: String::new(),
@@ -421,6 +432,15 @@ impl RelayProfile {
     pub fn local_compaction_prompt_at_end_enabled(&self) -> bool {
         self.local_compaction_prompt_at_end
             && matches!(self.protocol, RelayProtocol::Responses | RelayProtocol::ChatCompletions)
+            && self.relay_mode != RelayMode::Aggregate
+            && (self.relay_mode != RelayMode::Official || self.official_mix_api_key)
+    }
+
+    /// 是否在转发前移除托管生图工具：只对经本地代理转发的第三方 Responses 上游生效。
+    /// Chat / Anthropic 上游在协议转换时本来就不会带托管工具。
+    pub fn strips_image_generation_tool(&self) -> bool {
+        self.strip_image_generation_tool
+            && self.protocol == RelayProtocol::Responses
             && self.relay_mode != RelayMode::Aggregate
             && (self.relay_mode != RelayMode::Official || self.official_mix_api_key)
     }
@@ -1461,6 +1481,7 @@ impl BackendSettings {
                 local_compaction_prompt_at_end: false,
                 trust_upstream_catalog_lite: false,
                 strict_responses_reasoning: false,
+                strip_image_generation_tool: false,
                 auto_review_model: String::new(),
                 multi_agent: String::new(),
                 anthropic_auth_header: String::new(),
@@ -1531,6 +1552,7 @@ impl BackendSettings {
             local_compaction_prompt_at_end: false,
             trust_upstream_catalog_lite: false,
             strict_responses_reasoning: false,
+            strip_image_generation_tool: false,
             auto_review_model: String::new(),
             multi_agent: String::new(),
             anthropic_auth_header: String::new(),
@@ -1599,6 +1621,7 @@ impl BackendSettings {
             || self.active_relay_profile().local_compaction_prompt_at_end_enabled()
             || self.active_relay_profile().request_compatibility_enabled()
             || self.active_relay_profile().rewrites_auto_review_model()
+            || self.active_relay_profile().strips_image_generation_tool()
     }
 
     pub fn active_relay_uses_protocol_proxy(&self) -> bool {
@@ -3139,6 +3162,7 @@ pub(crate) const RELAY_PROFILE_KNOWN_FIELDS: &[&str] = &[
     "localCompactionPromptAtEnd",
     "trustUpstreamCatalogLite",
     "strictResponsesReasoning",
+    "stripImageGenerationTool",
     "autoReviewModel",
     "anthropicAuthHeader",
     "anthropicMaxTokens",
@@ -4553,6 +4577,7 @@ experimental_bearer_token = "sk-existing""#
                 session_provider: RelaySessionProvider::Openai,
                 model_aggregation_enabled: true,
                 sync_default_member_login: false,
+                auto_review_relay_id: String::new(),
                 strategy: AggregateRelayStrategy::WeightedRoundRobin,
                 members: vec![
                     AggregateRelayMember {
@@ -5356,6 +5381,43 @@ experimental_bearer_token = "sk-existing""#
             assert_eq!(profile.web_search_history_compat_enabled(), expected);
         }
     }
+    #[test]
+    fn strip_image_generation_tool_is_default_off_and_only_for_api_responses() {
+        let legacy = serde_json::to_value(RelayProfile::default()).unwrap();
+        assert!(legacy.get("stripImageGenerationTool").is_none());
+        let enabled = RelayProfile {
+            relay_mode: RelayMode::PureApi,
+            strip_image_generation_tool: true,
+            ..RelayProfile::default()
+        };
+        let value = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(value["stripImageGenerationTool"], json!(true));
+        let restored: RelayProfile = serde_json::from_value(value).unwrap();
+        assert!(restored.strips_image_generation_tool());
+        let settings = BackendSettings {
+            active_relay_id: "on".to_string(),
+            relay_profiles: vec![RelayProfile { id: "on".to_string(), ..enabled }],
+            ..BackendSettings::default()
+        };
+        assert!(settings.active_relay_transport_uses_protocol_proxy());
+        for (mode, protocol, mixed, expected) in [
+            (RelayMode::Official, RelayProtocol::Responses, false, false),
+            (RelayMode::Official, RelayProtocol::Responses, true, true),
+            (RelayMode::Aggregate, RelayProtocol::Responses, false, false),
+            (RelayMode::PureApi, RelayProtocol::ChatCompletions, false, false),
+            (RelayMode::PureApi, RelayProtocol::Responses, false, true),
+        ] {
+            let profile = RelayProfile {
+                relay_mode: mode,
+                protocol,
+                official_mix_api_key: mixed,
+                strip_image_generation_tool: true,
+                ..RelayProfile::default()
+            };
+            assert_eq!(profile.strips_image_generation_tool(), expected);
+        }
+    }
+
     // 自动接管的两个设置字段必须走既有 settings.json 链路持久化：
     // 守护线程在另一个线程里读同一个文件，写不进就等于开关无效。
     #[test]

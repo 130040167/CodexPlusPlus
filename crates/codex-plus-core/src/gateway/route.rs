@@ -394,6 +394,15 @@ pub fn effective_model(
     if requested.is_empty() {
         return default_model.to_string();
     }
+    // 审批模型（#2703）：codex-auto-review 改发到绑定指定的模型，优先于目录匹配与未知模型策略
+    // （池里的 ChatGPT 账号可能把 codex-auto-review 列进模型表，那样会直接落到订阅额度上）。
+    if requested == crate::aggregate_catalog::CODEX_AUTO_REVIEW_MODEL {
+        let (review, _) = crate::model_suffix::parse_model_suffix(binding.auto_review_model.trim());
+        let review = review.trim();
+        if !review.is_empty() {
+            return review.to_string();
+        }
+    }
     let (requested_slug, _) = crate::model_suffix::parse_model_suffix(requested);
     let declared = binding.declared_models();
     if declared
@@ -1030,6 +1039,46 @@ mod tests {
         // 关掉的供应商不参与；不认识的模型改写成默认模型。
         assert_eq!(routed(&gateway, "off-model")[0].1, "deepseek-v4-pro");
         assert_eq!(routed(&gateway, "claude-opus-5-5")[0].1, "deepseek-v4-pro");
+    }
+
+    /// #2703：绑定指定了审批模型时，codex-auto-review 改发到它；没指定时行为不变
+    /// （池里有家把 codex-auto-review 列进模型表就发给它，否则改写成主模型）。
+    #[test]
+    fn auto_review_requests_follow_binding_review_model() {
+        let mut gateway = gateway("deepseek-v4-pro");
+        gateway
+            .providers
+            .insert(0, provider("chatgpt", "gpt-5.5\ncodex-auto-review"));
+        assert_eq!(
+            routed(&gateway, "codex-auto-review"),
+            vec![pair("chatgpt", "codex-auto-review")]
+        );
+        gateway.providers.remove(0);
+        assert_eq!(
+            routed(&gateway, "codex-auto-review"),
+            vec![
+                pair("ds", "deepseek-v4-pro"),
+                pair("mirror", "deepseek-v4-pro")
+            ]
+        );
+
+        gateway
+            .providers
+            .insert(0, provider("chatgpt", "gpt-5.5\ncodex-auto-review"));
+        gateway.bindings.get_mut("claude").unwrap().auto_review_model =
+            " kimi/kimi-k3 ".to_string();
+        assert_eq!(
+            routed(&gateway, "codex-auto-review"),
+            vec![pair("kimi", "kimi-k3")]
+        );
+        // 模型组也可以：按组的成员展开。
+        gateway.bindings.get_mut("claude").unwrap().auto_review_model = "group/fast".to_string();
+        assert_eq!(
+            routed(&gateway, "codex-auto-review"),
+            vec![pair("ds", "deepseek-v4-flash"), pair("kimi", "kimi-k3")]
+        );
+        // 只影响审批请求，其它模型照旧。
+        assert_eq!(routed(&gateway, "gpt-5.5"), vec![pair("chatgpt", "gpt-5.5")]);
     }
 
     #[test]

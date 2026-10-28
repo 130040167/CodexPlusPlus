@@ -558,6 +558,8 @@ pub struct ProviderDoctorPayload {
 #[serde(rename_all = "camelCase")]
 pub struct EnvConflictsPayload {
     pub conflicts: Vec<codex_plus_core::env_conflicts::EnvConflict>,
+    /// 本机回环中转地址遇上 Codex 的 SSH 远端连接时的转发提示（issue #1195）。
+    pub ssh_remote_loopback: Option<codex_plus_core::ssh_remote_loopback::SshRemoteLoopbackNotice>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -7339,15 +7341,24 @@ pub fn read_relay_files() -> CommandResult<RelayFilesPayload> {
 
 #[tauri::command]
 pub fn check_env_conflicts() -> CommandResult<EnvConflictsPayload> {
-    let conflicts = codex_plus_core::env_conflicts::detect_env_conflicts_for_home(
-        &codex_plus_core::relay_config::default_codex_home_dir(),
-    );
+    let codex_home = codex_plus_core::relay_config::default_codex_home_dir();
+    let conflicts = codex_plus_core::env_conflicts::detect_env_conflicts_for_home(&codex_home);
+    // Codex++ 不往 SSH 远端写配置；远端 Codex 若沿用本机 127.0.0.1 中转地址会连到服务器自己，
+    // 这里只读检测并把 ssh -R 转发做法交给供应商页提示。
+    let ssh_remote_loopback =
+        codex_plus_core::ssh_remote_loopback::inspect_ssh_remote_loopback_for_home(&codex_home);
     let message = if conflicts.is_empty() {
         "未检测到会覆盖 Codex 供应商配置的 OPENAI 环境变量。"
     } else {
         "检测到可能覆盖 Codex 供应商配置的 OPENAI 环境变量。"
     };
-    ok(message, EnvConflictsPayload { conflicts })
+    ok(
+        message,
+        EnvConflictsPayload {
+            conflicts,
+            ssh_remote_loopback,
+        },
+    )
 }
 
 #[tauri::command]
@@ -10591,6 +10602,7 @@ base_url = "https://example.invalid/v1"
                 routes: Vec::new(),
                 default_relay_id: String::new(),
                 sync_default_member_login: false,
+                auto_review_relay_id: String::new(),
             }],
             ..BackendSettings::default()
         };
@@ -10626,6 +10638,7 @@ base_url = "https://example.invalid/v1"
                 routes: Vec::new(),
                 default_relay_id: String::new(),
                 sync_default_member_login: false,
+                auto_review_relay_id: String::new(),
             }],
             ..BackendSettings::default()
         };
@@ -10683,6 +10696,7 @@ base_url = "https://example.invalid/v1"
                 routes: Vec::new(),
                 default_relay_id: String::new(),
                 sync_default_member_login: false,
+                auto_review_relay_id: String::new(),
             }],
             ..BackendSettings::default()
         };

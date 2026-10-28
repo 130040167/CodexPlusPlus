@@ -393,7 +393,10 @@ pub fn ensure_active_protocol_proxy_config_in_home(
                     "活动 provider 需要修复 model_providers.{transport_provider_id}.name"
                 )
             })?;
-        provider["name"] = toml_edit::value(transport_provider_id.as_str());
+        // 优先换成供应商显示名（issue #192），显示名不可用时退回 provider id。
+        let repaired_name =
+            codex_provider_display_name(&profile).unwrap_or_else(|| transport_provider_id.clone());
+        provider["name"] = toml_edit::value(repaired_name);
         changed = true;
     }
 
@@ -1437,7 +1440,13 @@ pub fn backfill_relay_profile_from_home(
     profile: &mut RelayProfile,
 ) -> anyhow::Result<()> {
     let live_contents = read_optional_text(&home.join("config.toml"))?;
+    let template_config = profile.config_contents.clone();
     profile.config_contents = strip_tool_written_model_from_config(home, profile, &live_contents);
+    profile.config_contents = restore_profile_provider_name_for_backfill(
+        &profile.config_contents,
+        &template_config,
+        profile,
+    )?;
     profile.auth_contents = read_optional_text(&home.join("auth.json"))?;
     let live_config = profile.config_contents.clone();
     sync_context_limits_from_config(profile, &live_config);
@@ -1565,6 +1574,11 @@ fn backfill_profile_from_text(
     };
     profile.config_contents =
         restore_profile_provider_id_for_backfill(&profile.config_contents, &template_config)?;
+    profile.config_contents = restore_profile_provider_name_for_backfill(
+        &profile.config_contents,
+        &template_config,
+        profile,
+    )?;
     profile.config_contents =
         strip_tool_written_model_from_config(home, profile, &profile.config_contents);
     if profile.protocol == RelayProtocol::Responses
@@ -1674,6 +1688,7 @@ fn recognized_managed_proxy_endpoint(profile: &RelayProfile, config: &str) -> bo
         || profile.local_compaction_prompt_at_end_enabled()
         || profile.request_compatibility_enabled()
         || profile.rewrites_auto_review_model()
+        || profile.strips_image_generation_tool()
         || profile.relay_mode == RelayMode::Aggregate;
     let saved_endpoint_matches = provider_string_from_config(&profile.config_contents, "base_url")
         .is_some_and(|saved| {
@@ -5497,6 +5512,7 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
         || profile.local_compaction_prompt_at_end_enabled()
         || profile.request_compatibility_enabled()
         || profile.rewrites_auto_review_model()
+        || profile.strips_image_generation_tool()
         || has_managed_proxy_config
     {
         if !profile.upstream_base_url.trim().is_empty() {
@@ -5564,6 +5580,83 @@ pub fn relay_profile_api_key(profile: &RelayProfile) -> String {
         })
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| profile.api_key.trim().to_string())
+}
+
+/// 写进 `[model_providers.<id>].name` 的供应商显示名（issue #192）。
+///
+/// 去掉首尾空白，换行等控制字符折成空格；为空、或会被 codex 当成官方 OpenAI
+/// （大小写 / 空白变体都算，issue #2217）时返回 None，由调用方退回原来的值。
+/// 引号、反斜杠等 TOML 转义交给 toml_edit 处理。
+pub(crate) fn codex_provider_display_name(profile: &RelayProfile) -> Option<String> {
+    let name: String = profile
+        .name
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    let name = name.trim();
+    let compact: String = name.chars().filter(|ch| !ch.is_whitespace()).collect();
+    (!name.is_empty() && !compact.eq_ignore_ascii_case("OpenAI")).then(|| name.to_string())
+}
+
+/// provider name 是否还是 Codex++ 自动填的值（空、provider id、旧版内置 id），
+/// 只有这种情况才会被显示名接管；用户手写的标签不动。
+fn provider_name_is_generated(name: &str, provider_id: &str) -> bool {
+    let name = name.trim();
+    name.is_empty()
+        || name == provider_id
+        || name == RELAY_PROVIDER
+        || LEGACY_RELAY_PROVIDERS.contains(&name)
+}
+
+/// 回填 live config 时，把 Codex++ 自己写进去的显示名换回快照里的原值，
+/// 免得显示名被固化成「用户手写的 name」，之后改名就不再同步（issue #192）。
+fn restore_profile_provider_name_for_backfill(
+    config: &str,
+    template_config: &str,
+    profile: &RelayProfile,
+) -> anyhow::Result<String> {
+    let Some(display_name) = codex_provider_display_name(profile) else {
+        return Ok(config.to_string());
+    };
+    if config.trim().is_empty() {
+        return Ok(config.to_string());
+    }
+    let mut doc = parse_toml_document(config)?;
+    let transport_provider_id = if active_session_provider_id(&doc) == "openai" {
+        RELAY_PROVIDER.to_string()
+    } else {
+        active_or_default_provider_id(&doc)
+    };
+    let live_name_is_display_name = doc
+        .get("model_providers")
+        .and_then(|providers| providers.get(&transport_provider_id))
+        .and_then(|provider| provider.get("name"))
+        .and_then(Item::as_str)
+        .is_some_and(|name| name.trim() == display_name);
+    if !live_name_is_display_name {
+        return Ok(config.to_string());
+    }
+    let template_name = parse_toml_document(template_config)
+        .ok()
+        .and_then(|template| {
+            template
+                .get("model_providers")?
+                .get(&transport_provider_id)?
+                .get("name")?
+                .as_str()
+                .map(str::trim)
+                .filter(|name| !name.is_empty() && *name != display_name)
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| transport_provider_id.clone());
+    if let Some(provider) = doc
+        .get_mut("model_providers")
+        .and_then(|providers| providers.get_mut(&transport_provider_id))
+        .and_then(Item::as_table_like_mut)
+    {
+        provider.insert("name", toml_edit::value(template_name));
+    }
+    Ok(doc.to_string())
 }
 
 fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<String> {
@@ -5656,25 +5749,27 @@ fn complete_relay_profile_config_with_proxy_port(
         }
     }
     let provider = ensure_provider_table(&mut doc, &transport_provider_id)?;
-    if provider
+    let current_name = provider
         .get("name")
         .and_then(Item::as_str)
         .map(str::trim)
-        .is_none_or(str::is_empty)
-    {
-        provider["name"] = toml_edit::value(transport_provider_id.as_str());
-    }
+        .unwrap_or_default()
+        .to_string();
     // codex 用 `name == "OpenAI"` 的严格匹配判定 provider 是否走 v2 远程压缩
     // （RemoteCompactionSupport::V2，见 openai/codex issue #42313），第三方中转
     // 顶着这个名字会被要求返回 `compaction` 输出项而稳定报错（issue #2217）。
     // 只有真正的 OpenAI 会话身份（官方 OAuth / 混合模式）可以保留该名称，
-    // 其余情况一律改写成 provider id，让 codex 回退到本地压缩。
-    if !uses_openai_provider
-        && provider
-            .get("name")
-            .and_then(Item::as_str)
-            .is_some_and(|name| name.trim().eq_ignore_ascii_case("OpenAI"))
-    {
+    // 其余情况一律改写，让 codex 回退到本地压缩。
+    let name_must_leave_openai =
+        !uses_openai_provider && current_name.eq_ignore_ascii_case("OpenAI");
+    // name 仍是 Codex++ 自动生成的值时，换成供应商列表里的显示名（issue #192）；
+    // 用户手写过的标签（issue #1886 / #2682）原样保留。
+    let display_name = codex_provider_display_name(profile).filter(|_| {
+        name_must_leave_openai || provider_name_is_generated(&current_name, &transport_provider_id)
+    });
+    if let Some(display_name) = display_name {
+        provider["name"] = toml_edit::value(display_name);
+    } else if current_name.is_empty() || name_must_leave_openai {
         provider["name"] = toml_edit::value(transport_provider_id.as_str());
     }
     // Codex 26.901 起不再支持 `wire_api = "chat"`（见 openai/codex discussion #7782），
@@ -5705,6 +5800,7 @@ fn complete_relay_profile_config_with_proxy_port(
         || profile.local_compaction_prompt_at_end_enabled()
         || profile.request_compatibility_enabled()
         || profile.rewrites_auto_review_model()
+        || profile.strips_image_generation_tool()
     {
         crate::protocol_proxy::local_responses_proxy_base_url(proxy_port)
     } else {

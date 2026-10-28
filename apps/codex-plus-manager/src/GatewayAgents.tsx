@@ -374,6 +374,21 @@ function AgentDetail({
       ) : null}
       {/* 目前只有 Codex 自己会发生图请求；别的 Agent 有了生图工具再显示。 */}
       {agent.agent === "codex" ? <ImageModelRow agent={agent.agent} busy={busy} payload={payload} run={run} /> : null}
+      {/* Codex「替我审批」固定请求 codex-auto-review：默认改写成主模型，可单独指定，避免落到 ChatGPT 订阅额度上（#2703）。 */}
+      {agent.agent === "codex" ? (
+        <div className="gw-detail-row">
+          <span className="gw-detail-label">{t("审批模型")}</span>
+          <div className="gw-detail-value gw-chip-row" title={t("Codex「替我审批」的请求（codex-auto-review）发给这个模型；同默认模型时按「未知模型名」规则处理")}>
+            <TierPicker
+              exclude={draft.poolExclude}
+              label={t("审批")}
+              onPick={(model) => onSave({ ...draft, autoReviewModel: model })}
+              payload={payload}
+              value={draft.autoReviewModel}
+            />
+          </div>
+        </div>
+      ) : null}
       <div className="gw-detail-row">
         <span className="gw-detail-label">{t("其它")}</span>
         <div className="gw-detail-value gw-chip-row">

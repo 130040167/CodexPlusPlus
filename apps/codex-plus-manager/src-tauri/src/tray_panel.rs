@@ -235,12 +235,16 @@ fn place<R: Runtime>(window: &tauri::WebviewWindow<R>, anchor: PhysicalPosition<
 }
 
 /// 面板上的按钮：打开主窗口、退出、收起。
+///
+/// 轻量模式下主窗口可能已销毁，「打开」要重建窗口：同步命令里建窗口在 Windows 上会死锁，
+/// 所以这里是异步命令，并把显示（含重建）放到主线程执行（#2677）。
 #[tauri::command]
-pub fn tray_panel_action<R: Runtime>(app: AppHandle<R>, action: String) {
+pub async fn tray_panel_action<R: Runtime>(app: AppHandle<R>, action: String) {
     match action.as_str() {
         "open" => {
             hide(&app);
-            crate::show_main_window_from(&app);
+            let handle = app.clone();
+            let _ = app.run_on_main_thread(move || crate::show_main_window_from(&handle));
         }
         "quit" => {
             crate::request_app_exit(&app);
@@ -280,6 +284,8 @@ pub fn set_tray_panel_enabled<R: Runtime>(
 #[tauri::command]
 pub fn refresh_tray_mode<R: Runtime>(app: AppHandle<R>) {
     set_cached(read_enabled_from_disk());
+    // 关窗进入轻量模式的开关也存在 gateway.json，一并重读。
+    crate::lightweight::refresh_from_disk();
     apply_tray_mode(&app, crate::TRAY_ID);
     if !enabled() {
         hide(&app);
