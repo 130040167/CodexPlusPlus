@@ -232,3 +232,10 @@ test("用量与请求日志并成一页：两个页签各是一条路由，统�
   assert.match(app, /entry\.statusCode \|\| \(entry\.success \? "OK" : "ERR"\)/);
   assert.match(read("GatewayPage.tsx"), /<TopbarActions>\{tab === "usage" \? null : refreshButton\}<\/TopbarActions>/, "用量页签只留一个刷新");
 });
+
+test("启动落在网关「总览」，不落在上次那个 Agent 的概览", () => {
+  const app = read("App.tsx");
+  const body = app.slice(app.indexOf("function loadInitialRoute(): Route {"), app.indexOf("function initialTourOpen"));
+  assert.match(body, /return "hub";\n\}/);
+  assert.doesNotMatch(body, /return "overview"/);
+});

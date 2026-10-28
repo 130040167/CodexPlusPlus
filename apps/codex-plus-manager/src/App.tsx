@@ -17857,8 +17857,9 @@ function loadInitialTheme(): Theme {
   return window.localStorage.getItem("codex-plus-theme") === "light" ? "light" : "dark";
 }
 
+/** 启动落在网关「总览」：Agent 概览跟着上次点的 Agent 走，落在那里像是停在了某个 Agent 里。 */
 function loadInitialRoute(): Route {
-  if (typeof window === "undefined") return "overview";
+  if (typeof window === "undefined") return "hub";
   const params = new URLSearchParams(window.location.search);
   const previewRoute = params.get("previewRoute");
   if (previewRoute && routes.some((item) => item.id === previewRoute)) {
@@ -17867,7 +17868,7 @@ function loadInitialRoute(): Route {
   if (params.get("showUpdate") === "1" || window.location.hash === "#about") {
     return "settings";
   }
-  return "overview";
+  return "hub";
 }
 
 /** 首次使用引导：没看过当前版本就自动打开；预览模式（?previewRoute=）不打开。 */
