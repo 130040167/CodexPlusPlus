@@ -899,6 +899,11 @@ fn settings_payload_value(
             "nativeFastLocalApiConfigured".to_string(),
             Value::Bool(native_fast.native_fast_local_api_configured),
         );
+        // 原生输入预测与 Fast 共用同一份本机自定义 API 判定，只读一次 config.toml。
+        object.insert(
+            "nativePredictionsLocalApiConfigured".to_string(),
+            Value::Bool(native_fast.native_fast_local_api_configured),
+        );
     }
     Ok(value)
 }

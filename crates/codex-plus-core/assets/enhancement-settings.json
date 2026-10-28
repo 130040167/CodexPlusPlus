@@ -90,6 +90,14 @@
       "surfaces": ["manager", "codex"]
     },
     {
+      "key": "codexAppNativePredictions",
+      "group": "plugins",
+      "control": "bool",
+      "title": "原生输入预测（实验）",
+      "description": "实验功能，默认关闭。在 Codex 原生输入框显示下一句灰字预测，按 Tab 接受为可编辑草稿，不会自动发送。仅对使用 API Key / 自定义供应商的本机对话生效；每个回合结束都会用当前供应商额外请求一次，消耗该供应商额度。ChatGPT 登录与远程 / SSH / 云端对话保持原样。重新启动 Codex 后生效。",
+      "surfaces": ["manager"]
+    },
+    {
       "key": "codexAppThirdPartyReasoningCollapse",
       "group": "plugins",
       "control": "bool",
