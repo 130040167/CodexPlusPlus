@@ -2878,7 +2878,8 @@ pub(crate) async fn handle_protocol_proxy_connection(
             let mut transformer =
                 crate::protocol_proxy::ResponsesSseTransformer::for_request(request_json.as_ref())
                     .stripping_backend_events(foreign_client);
-            let out = transformer.push_bytes(&body);
+            let mut out = transformer.push_bytes(&body);
+            out.extend(transformer.flush_pending());
             stream.write_all(&out).await?;
             let usage = transformer.take_usage();
             let detail = transformer.take_failure_detail();
@@ -3758,6 +3759,11 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
                     }
                 }
                 Err(error) => {
+                    // 断流时仍在暂存的消息原样补写，不丢事件。
+                    let pending = transformer.flush_pending();
+                    if !pending.is_empty() {
+                        stream.send(&pending).await?;
+                    }
                     let usage = transformer.take_usage();
                     let detail = transformer.take_failure_detail();
                     return Ok((
@@ -3768,6 +3774,10 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
                     ));
                 }
             }
+        }
+        let pending = transformer.flush_pending();
+        if !pending.is_empty() {
+            stream.send(&pending).await?;
         }
         let usage = transformer.take_usage();
         let detail = transformer.take_failure_detail();
