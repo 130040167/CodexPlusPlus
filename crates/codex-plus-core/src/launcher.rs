@@ -2835,6 +2835,12 @@ pub(crate) async fn handle_protocol_proxy_connection(
             &upstream_content_type,
             &upstream_body,
         );
+        // 上游的错误原文记进请求日志（#2741）：之前只转给了 Agent，日志里错误一栏是空的，没法排查。
+        let message = error["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        request_log.record_error(&status, message);
         let body = serde_json::to_vec(&error)?;
         write_http_response(stream, &status, "application/json; charset=utf-8", &body).await?;
         log_helper_response(
