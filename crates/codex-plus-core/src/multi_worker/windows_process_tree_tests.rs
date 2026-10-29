@@ -1,8 +1,5 @@
 use super::*;
-use crate::multi_worker::{
-    codex_instance_needs_worker, codex_instance_process_exited, terminate_verified_codex_instance,
-    verified_worker_is_running,
-};
+use crate::multi_worker::terminate_verified_codex_instance;
 use crate::windows_integration::{CREATE_NO_WINDOW, child_process_birth_id};
 use serde::{Deserialize, Serialize};
 use std::os::windows::process::CommandExt;
@@ -460,7 +457,6 @@ async fn concurrent_stops_confirm_exit_of_the_same_owned_tree() {
         one.join().unwrap().unwrap();
         two.join().unwrap().unwrap();
     });
-    assert!(codex_instance_process_exited(&identity));
     assert!(preserved.iter().all(|process| process.is_alive().unwrap()));
 }
 
@@ -472,8 +468,6 @@ async fn ready_tracking_cleans_owned_orphans_and_preserves_shell_tools_and_neigh
     let identity = fixtures.identity(port);
     let mut tree = CodexInstanceProcessTree::capture(&identity).unwrap();
     assert_eq!(tree.processes.len(), 4);
-    assert!(tree.cleanup_after_exit().is_err());
-    tree = CodexInstanceProcessTree::capture(&identity).unwrap();
     let owned: Vec<_> = ["root", "renderer", "gpu", "appserver"]
         .iter()
         .map(|mode| fixtures.process(mode))
@@ -482,70 +476,11 @@ async fn ready_tracking_cleans_owned_orphans_and_preserves_shell_tools_and_neigh
         .iter()
         .map(|mode| fixtures.process(mode))
         .collect();
-    assert!(codex_instance_needs_worker(&identity).await.unwrap());
     owned[0].terminate().unwrap();
     wait_for_exit(&owned[0]);
-    assert!(codex_instance_process_exited(&identity));
-    assert!(!codex_instance_needs_worker(&identity).await.unwrap());
     assert!(owned[1].is_alive().unwrap());
-    tree.refresh().unwrap();
-    tree.cleanup_after_exit().unwrap();
+    tree.stop_and_wait().unwrap();
     assert!(owned.iter().all(|p| !p.is_alive().unwrap()));
-    assert!(preserved.iter().all(|p| p.is_alive().unwrap()));
-}
-
-#[tokio::test]
-async fn handoff_checkpoint_preserves_orphans_across_two_worker_replacements() {
-    let _fixture_lock = FIXTURE_LOCK.lock().await;
-    let port = unused_port();
-    let fixtures = FixtureGroup::start(port);
-    let identity = fixtures.identity(port);
-    let mut original = CodexInstanceProcessTree::capture(&identity).unwrap();
-    let renderer = fixtures.process("renderer");
-    let gpu = fixtures.process("gpu");
-    let preserved: Vec<_> = ["shell", "independent", "user-tool", "neighbor"]
-        .iter()
-        .map(|mode| fixtures.process(mode))
-        .collect();
-    renderer.terminate().unwrap();
-    wait_for_exit(&renderer);
-    assert!(gpu.is_alive().unwrap());
-    let checkpoint = fixtures.dir.path().join("handoff.json");
-    original.save_handoff_checkpoint(&checkpoint).unwrap();
-    drop(original);
-    for _ in 0..2 {
-        let mut resumed = CodexInstanceProcessTree::capture(&identity).unwrap();
-        assert!(
-            !resumed
-                .processes
-                .iter()
-                .any(|(p, _)| p.process_id == gpu.process_id)
-        );
-        resumed.restore_handoff_checkpoint(&checkpoint).unwrap();
-        assert!(
-            resumed
-                .processes
-                .iter()
-                .any(|(p, _)| p.process_id == gpu.process_id)
-        );
-        resumed.save_handoff_checkpoint(&checkpoint).unwrap();
-    }
-    let mut final_worker = CodexInstanceProcessTree::capture(&identity).unwrap();
-    final_worker
-        .restore_handoff_checkpoint(&checkpoint)
-        .unwrap();
-    let mut wrong: TreeCheckpoint =
-        serde_json::from_slice(&std::fs::read(&checkpoint).unwrap()).unwrap();
-    wrong.identity.generation += 1;
-    std::fs::write(&checkpoint, serde_json::to_vec(&wrong).unwrap()).unwrap();
-    assert!(
-        final_worker
-            .restore_handoff_checkpoint(&checkpoint)
-            .is_err()
-    );
-    assert!(gpu.is_alive().unwrap());
-    final_worker.stop_and_wait().unwrap();
-    assert!(!gpu.is_alive().unwrap());
     assert!(preserved.iter().all(|p| p.is_alive().unwrap()));
 }
 
@@ -566,12 +501,10 @@ async fn wrong_birth_image_arguments_and_browser_conflict_never_stop_the_root() 
     wrong = identity.clone();
     wrong.executable = fixtures.dir.path().join("resources/codex.exe");
     assert!(terminate_verified_codex_instance(&wrong).await.is_err());
-    assert!(codex_instance_needs_worker(&wrong).await.is_err());
     assert!(root.is_alive().unwrap());
     wrong = identity.clone();
     wrong.user_data_dir = fixtures.dir.path().canonicalize().unwrap();
     assert!(terminate_verified_codex_instance(&wrong).await.is_err());
-    assert!(codex_instance_needs_worker(&wrong).await.is_err());
     assert!(root.is_alive().unwrap());
     wrong = identity.clone();
     wrong.debug_port = if port == 65535 { port - 1 } else { port + 1 };
@@ -585,8 +518,6 @@ async fn wrong_birth_image_arguments_and_browser_conflict_never_stop_the_root() 
         .mount(&server)
         .await;
     assert!(terminate_verified_codex_instance(&identity).await.is_err());
-    assert!(codex_instance_needs_worker(&identity).await.is_err());
-    assert!(!codex_instance_process_exited(&identity));
     assert!(root.is_alive().unwrap());
     drop(server);
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -602,13 +533,11 @@ async fn wrong_birth_image_arguments_and_browser_conflict_never_stop_the_root() 
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(codex_instance_needs_worker(&identity).await.unwrap());
     let preserved: Vec<_> = ["shell", "independent", "user-tool", "neighbor"]
         .iter()
         .map(|mode| fixtures.process(mode))
         .collect();
     assert!(terminate_verified_codex_instance(&identity).await.unwrap());
-    assert!(codex_instance_process_exited(&identity));
     assert!(preserved.iter().all(|p| p.is_alive().unwrap()));
 }
 
@@ -649,29 +578,8 @@ async fn default_main_without_user_data_can_be_captured_and_stopped_by_saved_ide
     // CDP 已断连，仍可从保存的同代身份捕获停止树。
     let tree = CodexInstanceProcessTree::capture(&identity).unwrap();
     assert_eq!(tree.processes.len(), 1);
-    assert!(codex_instance_needs_worker(&identity).await.unwrap());
     let mut wrong = identity.clone();
     wrong.user_data_dir = dir.path().canonicalize().unwrap();
     assert!(terminate_verified_codex_instance(&wrong).await.is_err());
     assert!(terminate_verified_codex_instance(&identity).await.unwrap());
-    assert!(codex_instance_process_exited(&identity));
-}
-
-#[tokio::test]
-async fn read_only_worker_probe_reports_conflicts_and_only_confirms_same_generation_exit() {
-    let _fixture_lock = FIXTURE_LOCK.lock().await;
-    let fixtures = FixtureGroup::start(unused_port());
-    let root = fixtures.process("root");
-    let options = fixtures.dir.path().join("worker-options.json");
-    std::fs::write(&options, "{}").unwrap();
-    assert!(verified_worker_is_running(root.process_id, &options, None).is_err());
-    assert!(
-        verified_worker_is_running(root.process_id, &options, Some(root.birth_id + 1)).is_err()
-    );
-    // fixture 的 argv 不是固定的三段 worker argv，存活查询必须报冲突且不结束它。
-    assert!(verified_worker_is_running(root.process_id, &options, Some(root.birth_id)).is_err());
-    assert!(root.is_alive().unwrap());
-    root.terminate().unwrap();
-    wait_for_exit(&root);
-    assert!(!verified_worker_is_running(root.process_id, &options, Some(root.birth_id)).unwrap());
 }

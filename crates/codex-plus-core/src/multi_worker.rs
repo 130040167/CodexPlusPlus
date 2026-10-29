@@ -7,43 +7,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(any(windows, test))]
 mod windows_process_tree;
 #[cfg(windows)]
-pub(crate) use windows_process_tree::CodexInstanceProcessTree;
-
-// 非 Windows 兼容接口仅确认原根退出，不提供 Windows 的自有后代清理能力。
-#[cfg(not(windows))]
-pub(crate) struct CodexInstanceProcessTree {
-    identity: CodexInstanceIdentity,
-}
-
-#[cfg(not(windows))]
-impl CodexInstanceProcessTree {
-    pub(crate) fn capture(identity: &CodexInstanceIdentity) -> anyhow::Result<Self> {
-        anyhow::ensure!(valid_stop_identity(identity), "多开实例身份字段不完整");
-        Ok(Self {
-            identity: identity.clone(),
-        })
-    }
-
-    pub(crate) fn refresh(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    pub(crate) fn save_handoff_checkpoint(&mut self, _path: &std::path::Path) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    pub(crate) fn restore_handoff_checkpoint(&mut self, _path: &std::path::Path) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    pub(crate) fn cleanup_after_exit(self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            codex_instance_process_exited(&self.identity),
-            "原代 Codex 尚未确认退出"
-        );
-        Ok(())
-    }
-}
+use windows_process_tree::CodexInstanceProcessTree;
 
 /// 端口只是连接地址；停止实例必须核验保存的进程身份，不能依赖 CDP 健康。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,83 +81,6 @@ fn codex_identity_arguments_match(arguments: &[String], identity: &CodexInstance
         codex_scoped_arguments_match(arguments, None, identity.debug_port)
     } else {
         codex_arguments_match(arguments, &identity.user_data_dir, identity.debug_port)
-    }
-}
-
-/// 只确认原代退出；权限、身份字段或查询不确定时返回 false，调用方须保留 worker。
-pub(crate) fn codex_instance_process_exited(identity: &CodexInstanceIdentity) -> bool {
-    if !valid_stop_identity(identity) {
-        return false;
-    }
-    #[cfg(windows)]
-    {
-        crate::windows_integration::process_generation_exited(
-            identity.process_id,
-            identity.process_birth_id,
-        )
-        .unwrap_or(false)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        match crate::watcher::inspect_process_instance(identity.process_id) {
-            crate::watcher::ProcessInstanceState::NotRunning => true,
-            crate::watcher::ProcessInstanceState::Running {
-                birth_id: Some(birth),
-                ..
-            } => macos_birth_hash(&birth) != identity.process_birth_id,
-            _ => false,
-        }
-    }
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        // 非 Windows 暂不根据一次 PID 查询推断创建代；保持保守行为。
-        false
-    }
-}
-
-/// 仅确认原根退出才返回 false；读取失败、映像/参数/CDP 矛盾均为 Err。
-pub(crate) async fn codex_instance_needs_worker(
-    identity: &CodexInstanceIdentity,
-) -> anyhow::Result<bool> {
-    anyhow::ensure!(valid_stop_identity(identity), "多开实例身份字段不完整");
-    #[cfg(windows)]
-    {
-        if crate::windows_integration::process_generation_exited(
-            identity.process_id,
-            identity.process_birth_id,
-        )? {
-            return Ok(false);
-        }
-        let process = windows_process_tree::capture_root(identity, false)?;
-        // CDP 断连不结束 worker；可读的不同 Browser 则必须报身份冲突。
-        check_stop_browser_identity(identity).await?;
-        return Ok(process.is_alive()?);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if codex_instance_process_exited(identity) {
-            return Ok(false);
-        }
-        anyhow::ensure!(
-            macos_birth_token(identity.process_id) == Some(identity.process_birth_id),
-            "无法核验原代多开进程创建身份"
-        );
-        let args = macos_process_arguments(identity.process_id)?;
-        anyhow::ensure!(
-            codex_identity_arguments_match(&args, identity)
-                && args
-                    .first()
-                    .and_then(|path| Path::new(path).canonicalize().ok())
-                    .as_ref()
-                    == Some(&identity.executable),
-            "多开进程映像或参数身份冲突"
-        );
-        check_stop_browser_identity(identity).await?;
-        return Ok(!codex_instance_process_exited(identity));
-    }
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        anyhow::bail!("当前系统尚不支持可靠确认多开进程退出")
     }
 }
 
@@ -422,14 +309,9 @@ fn macos_birth_token(pid: u32) -> Option<u64> {
     else {
         return None;
     };
-    Some(macos_birth_hash(&birth))
-}
-
-#[cfg(target_os = "macos")]
-fn macos_birth_hash(birth: &str) -> u64 {
-    birth.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+    Some(birth.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
         (hash ^ byte as u64).wrapping_mul(0x100000001b3)
-    })
+    }))
 }
 
 #[cfg(target_os = "macos")]
@@ -718,16 +600,6 @@ pub fn terminate_verified_worker(
     expected_birth: Option<u64>,
 ) -> anyhow::Result<bool> {
     crate::windows_integration::terminate_verified_multi_worker(pid, options_path, expected_birth)
-}
-
-/// 只读确认同代 worker；仅原代已退出返回 false，身份冲突或查询不确定均为 Err。
-#[cfg(windows)]
-pub fn verified_worker_is_running(
-    pid: u32,
-    options_path: &Path,
-    expected_birth: Option<u64>,
-) -> anyhow::Result<bool> {
-    crate::windows_integration::verified_multi_worker_is_running(pid, options_path, expected_birth)
 }
 
 #[cfg(test)]

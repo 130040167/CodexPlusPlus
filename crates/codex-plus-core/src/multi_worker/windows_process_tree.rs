@@ -6,7 +6,7 @@ use crate::windows_integration::{VerifiedStopProcess, bounded_process_snapshot};
 #[cfg(windows)]
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
     Desktop,
     Electron,
@@ -115,15 +115,12 @@ fn child_lifetime_matches(
 }
 
 #[cfg(windows)]
-pub(super) fn capture_root(
-    identity: &CodexInstanceIdentity,
-    terminate: bool,
-) -> anyhow::Result<VerifiedStopProcess> {
+pub(super) fn capture_root(identity: &CodexInstanceIdentity) -> anyhow::Result<VerifiedStopProcess> {
     anyhow::ensure!(
         super::valid_stop_identity(identity),
         "多开实例身份字段不完整"
     );
-    let process = VerifiedStopProcess::capture(identity.process_id, terminate)?
+    let process = VerifiedStopProcess::capture(identity.process_id, true)?
         .ok_or_else(|| anyhow::anyhow!("原代多开进程已退出"))?;
     anyhow::ensure!(
         process.birth_id == identity.process_birth_id,
@@ -149,27 +146,9 @@ pub(super) fn capture_root(
 /// `crashpad-handler`、终端、MCP 和用户启动的工具不在角色白名单中，故不会被
 /// 自动结束；它们由各自的父程序或操作系统负责生命周期。
 #[cfg(windows)]
-pub(crate) struct CodexInstanceProcessTree {
+pub(super) struct CodexInstanceProcessTree {
     identity: CodexInstanceIdentity,
     processes: Vec<(VerifiedStopProcess, Role)>,
-    lineage: Vec<TreeMember>,
-}
-
-#[cfg(windows)]
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct TreeMember {
-    pid: u32,
-    birth: u64,
-    parent: u32,
-    exit: u64,
-    role: Role,
-}
-
-#[cfg(windows)]
-#[derive(serde::Serialize, serde::Deserialize)]
-struct TreeCheckpoint {
-    identity: CodexInstanceIdentity,
-    members: Vec<TreeMember>,
 }
 
 #[cfg(windows)]
@@ -180,124 +159,18 @@ impl CodexInstanceProcessTree {
     const STOP_TIMEOUT: Duration = Duration::from_secs(8);
     const STOP_PASSES: usize = 8;
 
-    pub(crate) fn capture(identity: &CodexInstanceIdentity) -> anyhow::Result<Self> {
-        let root = capture_root(identity, true)?;
+    pub(super) fn capture(identity: &CodexInstanceIdentity) -> anyhow::Result<Self> {
+        let root = capture_root(identity)?;
         let mut tree = Self {
             identity: identity.clone(),
             processes: vec![(root, Role::Desktop)],
-            lineage: Vec::new(),
         };
         tree.refresh()?;
         Ok(tree)
     }
 
-    pub(crate) fn refresh(&mut self) -> anyhow::Result<()> {
+    fn refresh(&mut self) -> anyhow::Result<()> {
         self.refresh_until(Instant::now() + Self::MAX_REFRESH_TIME)
-    }
-
-    /// 交接保留已确认的祖先链，避免中间父进程退出后丢失仍活着的后代。
-    pub(crate) fn save_handoff_checkpoint(&mut self, path: &Path) -> anyhow::Result<()> {
-        self.refresh()?;
-        let mut members = self.lineage.clone();
-        for (process, role) in &self.processes {
-            if let Some(member) = members
-                .iter_mut()
-                .find(|member| member.pid == process.process_id && member.birth == process.birth_id)
-            {
-                member.exit = process.exit_time()?;
-                continue;
-            }
-            members.push(TreeMember {
-                pid: process.process_id,
-                birth: process.birth_id,
-                parent: process.parent_id()?,
-                exit: process.exit_time()?,
-                role: *role,
-            });
-        }
-        anyhow::ensure!(
-            members.len() <= Self::MAX_TRACKED,
-            "进程树交接祖先记录超过安全上限"
-        );
-        let checkpoint = TreeCheckpoint {
-            identity: self.identity.clone(),
-            members,
-        };
-        crate::settings::atomic_write(path, &serde_json::to_vec(&checkpoint)?)
-    }
-
-    pub(crate) fn restore_handoff_checkpoint(&mut self, path: &Path) -> anyhow::Result<()> {
-        let metadata = std::fs::symlink_metadata(path)?;
-        anyhow::ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 262144,
-            "进程树交接记录类型或大小无效"
-        );
-        let checkpoint: TreeCheckpoint = serde_json::from_slice(&std::fs::read(path)?)?;
-        anyhow::ensure!(
-            checkpoint.identity == self.identity
-                && !checkpoint.members.is_empty()
-                && checkpoint.members.len() <= Self::MAX_TRACKED,
-            "进程树交接记录不属于当前实例"
-        );
-        let root = &checkpoint.members[0];
-        anyhow::ensure!(
-            root.pid == self.identity.process_id
-                && root.birth == self.identity.process_birth_id
-                && root.role == Role::Desktop,
-            "进程树交接记录缺少原代根"
-        );
-        let mut restored = Vec::new();
-        let mut seen = std::collections::HashSet::from([root.pid]);
-        for (index, member) in checkpoint.members.iter().enumerate().skip(1) {
-            anyhow::ensure!(seen.insert(member.pid), "进程树交接记录包含重复 PID");
-            let parent = checkpoint.members[..index]
-                .iter()
-                .find(|parent| parent.pid == member.parent)
-                .ok_or_else(|| anyhow::anyhow!("进程树交接记录祖先链断裂"))?;
-            anyhow::ensure!(
-                parent.role != Role::AppServer
-                    && member.role != Role::Desktop
-                    && child_lifetime_matches(
-                        parent.pid,
-                        member.parent,
-                        parent.birth,
-                        parent.exit,
-                        member.birth
-                    ),
-                "进程树交接记录包含无效后代"
-            );
-            let Some(process) = VerifiedStopProcess::capture(member.pid, true)? else {
-                continue;
-            };
-            // PID 已复用表示原代退出；不收养或结束复用 PID 的新进程。
-            if process.birth_id != member.birth || !process.is_alive()? {
-                continue;
-            }
-            anyhow::ensure!(
-                process.parent_id()? == member.parent
-                    && child_role(
-                        &self.identity,
-                        parent.role,
-                        &process.image()?,
-                        &process.arguments()?
-                    ) == Some(member.role),
-                "进程树交接后代身份冲突"
-            );
-            if !self
-                .processes
-                .iter()
-                .any(|(known, _)| known.process_id == member.pid)
-            {
-                restored.push((process, member.role));
-            }
-        }
-        anyhow::ensure!(
-            self.processes.len() + restored.len() <= Self::MAX_TRACKED,
-            "续接后的自有进程数量超过安全上限"
-        );
-        self.processes.extend(restored);
-        self.lineage = checkpoint.members;
-        self.refresh()
     }
 
     fn refresh_until(&mut self, deadline: Instant) -> anyhow::Result<()> {
@@ -368,14 +241,6 @@ impl CodexInstanceProcessTree {
             index += 1;
         }
         Ok(())
-    }
-
-    pub(crate) fn cleanup_after_exit(mut self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.processes[0].0.is_alive()?,
-            "原代 Codex 仍存活，拒绝残留清理"
-        );
-        self.stop_and_wait()
     }
 
     pub(super) fn stop_and_wait(&mut self) -> anyhow::Result<()> {

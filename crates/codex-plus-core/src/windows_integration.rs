@@ -88,18 +88,6 @@ pub fn close_process_tree(process_id: u32, force: bool) -> bool {
 #[cfg(windows)]
 pub const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-#[cfg(windows)]
-pub(crate) fn prevent_socket_inheritance(
-    socket: std::os::windows::io::RawSocket,
-) -> anyhow::Result<()> {
-    use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation};
-    // SAFETY: 调用方在整个操作期间持有 socket；仅修改继承位，不关闭或转移句柄。
-    unsafe {
-        SetHandleInformation(HANDLE(socket as *mut _), HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))
-    }
-    .context("无法禁止 helper socket 被子进程继承")
-}
-
 /// 当前进程是否以提权（管理员 / 高完整性令牌）运行。
 ///
 /// 启动器用它守卫 MSIX 打包应用激活：Windows 不允许提权进程激活打包应用，
@@ -504,8 +492,7 @@ pub(crate) fn terminate_verified_multi_worker(
     options_path: &std::path::Path,
     expected_birth: Option<u64>,
 ) -> anyhow::Result<bool> {
-    let Some(process) =
-        capture_verified_multi_worker(process_id, options_path, expected_birth, true)?
+    let Some(process) = capture_verified_multi_worker(process_id, options_path, expected_birth)?
     else {
         return Ok(false);
     };
@@ -519,26 +506,15 @@ pub(crate) fn terminate_verified_multi_worker(
 }
 
 #[cfg(windows)]
-pub(crate) fn verified_multi_worker_is_running(
-    process_id: u32,
-    options_path: &std::path::Path,
-    expected_birth: Option<u64>,
-) -> anyhow::Result<bool> {
-    // 只授予 QUERY/VM_READ/SYNCHRONIZE，不为存活检查请求终止权限。
-    Ok(capture_verified_multi_worker(process_id, options_path, expected_birth, false)?.is_some())
-}
-
-#[cfg(windows)]
 fn capture_verified_multi_worker(
     process_id: u32,
     options_path: &std::path::Path,
     expected_birth: Option<u64>,
-    terminate: bool,
 ) -> anyhow::Result<Option<VerifiedStopProcess>> {
     let expected = expected_birth
         .filter(|birth| *birth != 0)
         .ok_or_else(|| anyhow::anyhow!("缺少可信 worker 创建身份"))?;
-    let Some(process) = VerifiedStopProcess::capture(process_id, terminate)? else {
+    let Some(process) = VerifiedStopProcess::capture(process_id, true)? else {
         return Ok(None);
     };
     anyhow::ensure!(process.birth_id == expected, "worker 创建身份冲突");
@@ -713,34 +689,6 @@ impl VerifiedStopProcess {
             }
         }
         Ok(())
-    }
-}
-
-#[cfg(windows)]
-pub(crate) fn process_generation_exited(pid: u32, expected_birth: u64) -> anyhow::Result<bool> {
-    use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
-    anyhow::ensure!(pid != 0 && expected_birth != 0, "进程创建身份不完整");
-    let native = match unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-            false,
-            pid,
-        )
-    } {
-        Ok(handle) => handle,
-        Err(error) if error.code().0 as u32 == 0x80070057 => return Ok(true),
-        Err(error) => return Err(error).context("无法确认原代进程是否退出"),
-    };
-    let _guard = HandleGuard(native);
-    let birth = process_birth_id_from_handle(native)
-        .ok_or_else(|| anyhow::anyhow!("无法读取原代进程创建身份"))?;
-    if birth != expected_birth {
-        return Ok(true);
-    }
-    match unsafe { WaitForSingleObject(native, 0) } {
-        WAIT_OBJECT_0 => Ok(true),
-        WAIT_TIMEOUT => Ok(false),
-        _ => Err(std::io::Error::last_os_error()).context("无法查询原代进程句柄"),
     }
 }
 
