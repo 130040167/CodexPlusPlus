@@ -2664,6 +2664,24 @@ export const EN_PLAIN: Record<string, string> = {
   "分组倍率取自最近一次消费记录": "Group rate taken from the latest usage record",
   // 子 Agent 任务排队（#2772）
   "任务已提交并进入排队，前面的任务结束后自动启动。": "Task submitted and queued. It starts automatically when the tasks ahead of it finish.",
+  // 脚本市场更新时间 / 排序与本地脚本合并状态（#2781）
+  "市场脚本排序": "Sort marketplace scripts",
+  "默认顺序": "Default order",
+  "最近更新": "Recently updated",
+  "市场清单暂未提供脚本更新时间": "The marketplace index does not list script update times yet",
+  "整体已关闭": "All scripts off",
+  "已加载": "Loaded",
+  "加载中": "Loading",
+  "加载失败": "Failed to load",
+  "未加载": "Not loaded",
+  "关闭该脚本": "Turn this script off",
+  "启用该脚本": "Turn this script on",
+  "该脚本已关闭，不会注入 Codex": "This script is off and will not be injected into Codex",
+  "脚本开着，但「启用本地脚本」整体开关关着，暂不注入": "This script is on, but \"Enable local scripts\" is off, so it is not injected",
+  "已在 Codex 里运行": "Running in Codex",
+  "正在 Codex 里加载": "Loading in Codex",
+  "脚本在 Codex 里运行出错": "The script threw an error in Codex",
+  "Codex 未运行或尚未热重载脚本": "Codex is not running or scripts have not been hot-reloaded yet",
 };
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
@@ -2998,6 +3016,12 @@ export const EN_TEMPLATE: Record<string, string> = {
   // Codex增强页自动保存
   "未保存：{0}": "Not saved: {0}",
   "自动保存失败：{0}": "Auto-save failed: {0}",
+  // 脚本市场更新时间（#2781）
+  "{0} 个月前": "{0} mo ago",
+  "{0} 年前": "{0} y ago",
+  "{0}更新": "Updated {0}",
+  "更新于 {0}": "Updated {0}",
+  "启用 {0}": "Enable {0}",
 };
 
 // Backend (Rust) messages returned via result.message. These are translated

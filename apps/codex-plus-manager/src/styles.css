@@ -4976,8 +4976,10 @@ input[type="range"]:disabled {
   display: grid;
 }
 
+/* 本地脚本行：名称 / 来源 / 开关 + 状态 / 操作（#2781 起开关与加载状态合并为一列）。
+ * 每行是独立网格，操作列给定宽：内置脚本没有删除按钮，用 auto 会让这一行的状态列错位。 */
 .table-row {
-  grid-template-columns: minmax(120px, 1.4fr) 110px 80px minmax(90px, 1fr) auto;
+  grid-template-columns: minmax(120px, 1.4fr) 110px minmax(130px, 1fr) 96px;
 }
 
 .script-row-actions {
@@ -13417,6 +13419,33 @@ button.side-item:hover {
   padding: 0 6px;
   font-size: 10.5px;
   line-height: 18px;
+}
+/* 市场排序下拉：按内容宽度，不占满工具栏（#2781） */
+.shell .user-scripts-page .app-select.script-market-sort {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 112px;
+}
+/* 本地脚本状态列：开关 + 加载状态标记 */
+.shell .user-script-row .user-script-state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.shell .user-script-row .user-script-state-label {
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: default;
+}
+.shell .user-script-row .user-script-state-label[data-state="loaded"] {
+  color: hsl(var(--status-success));
+}
+.shell .user-script-row .user-script-state-label[data-state="failed"] {
+  color: hsl(var(--status-error));
+}
+.shell .user-script-row .user-script-state-label[data-state="globalOff"] {
+  color: hsl(var(--status-warning));
 }
 
 /* ── 皮肤管理：顶部压成一条细栏；主题页签按内容宽度；主题卡片缩小、一行放更多 ── */

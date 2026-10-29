@@ -136,6 +136,7 @@ import { shouldShowTour, TOUR_STORAGE_KEY, TOUR_VERSION } from "./onboarding-mod
 import "./ToolPages.css";
 import { BACKEND_SETTINGS_CHANGED_EVENT, ComputerUsePage } from "./ComputerUsePage";
 import { PluginMarketScreen } from "./PluginMarketScreen";
+import { defaultMarketSort, localScriptState, parseMarketTime, relativeAge, sortMarketScripts, type LocalScriptState, type ScriptMarketSort } from "./script-market-model";
 import { ReleaseNotes } from "./ReleaseNotes";
 import { UPDATE_CHECK_INTERVAL_MS, UpdateNotifications, updatePreferencesFrom } from "./update-notification";
 import { McpPage, PageHeader } from "./ManagementPages";
@@ -1190,6 +1191,8 @@ type ScriptMarketItem = {
   tags: string[];
   homepage: string;
   script_url: string;
+  /// 该脚本最近更新时间（ISO），清单逐条提供；老清单没有时为空（#2781）。
+  updatedAt?: string;
   installed: boolean;
   installedVersion: string;
   updateAvailable: boolean;
@@ -9515,6 +9518,14 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
       return haystack.includes(query);
     });
   }, [marketSearch, marketScripts]);
+  // 用户没手动选排序时跟随数据：清单里每个脚本都标了更新时间就默认「最近更新」，否则保持清单原顺序。
+  const [marketSortChoice, setMarketSortChoice] = useState<ScriptMarketSort | null>(null);
+  const marketSort = marketSortChoice ?? defaultMarketSort(marketScripts);
+  const sortedMarketScripts = useMemo(
+    () => sortMarketScripts(filteredMarketScripts, marketSort),
+    [filteredMarketScripts, marketSort],
+  );
+  const hasMarketUpdateTimes = marketScripts.some((script) => parseMarketTime(script.updatedAt) !== null);
   const installedCount = marketScripts.filter((script) => script.installed).length;
   // market_id -> 本地脚本 key。只用 user 来源的脚本：内置脚本走的是 builtin: 前缀，
   // 后端 delete_user_script 只接受 user:，映射过去会直接报错。
@@ -9591,6 +9602,23 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
               value={marketSearch}
             />
           </div>
+          <AppSelect
+            ariaLabel={t("市场脚本排序")}
+            className="script-market-sort"
+            onChange={(value) => setMarketSortChoice(value)}
+            options={[
+              { value: "default", label: t("默认顺序") },
+              {
+                value: "updated",
+                label: t("最近更新"),
+                title: hasMarketUpdateTimes ? undefined : t("市场清单暂未提供脚本更新时间"),
+              },
+              { value: "name", label: t("名称") },
+            ]}
+            size="sm"
+            title={t("市场脚本排序")}
+            value={marketSort}
+          />
           <div className="script-market-view-toggle" role="group" aria-label={t("脚本排版")}>
             <Button aria-pressed={marketView === "grid"} onClick={() => setMarketView("grid")} size="sm" variant={marketView === "grid" ? "secondary" : "ghost"}>
               <LayoutGrid className="h-4 w-4" />
@@ -9607,7 +9635,7 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
         marketScripts.length ? (
           filteredMarketScripts.length ? (
             <div className={marketView === "list" ? "script-market-list" : "script-market-grid"}>
-              {filteredMarketScripts.map((script) => (
+              {sortedMarketScripts.map((script) => (
                 <MarketScriptCard
                   actions={actions}
                   installedKey={installedKeyByMarketId.get(script.id)}
@@ -9626,7 +9654,7 @@ function UserScriptsScreen({ settings, market, actions }: { settings: SettingsRe
       ) : (
         <Panel>
           <div className="table">
-            {scripts.length ? scripts.map((script) => <ScriptRow key={script.key} script={script} actions={actions} />) : <div className="empty">{t("未发现用户脚本。")}</div>}
+            {scripts.length ? scripts.map((script) => <ScriptRow key={script.key} script={script} globalEnabled={localEnabled} actions={actions} />) : <div className="empty">{t("未发现用户脚本。")}</div>}
           </div>
         </Panel>
       )}
@@ -11004,6 +11032,23 @@ function formatMarketUpdatedAt(value: string): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+/// 市场脚本更新时间的相对描述：刚刚 / N 小时前 / N 天前 / N 个月前 / N 年前。
+function formatRelativeAge(time: number, now = Date.now()): string {
+  const age = relativeAge(time, now);
+  switch (age.unit) {
+    case "justNow":
+      return t("刚刚");
+    case "hours":
+      return tf("{0} 小时前", [age.value]);
+    case "days":
+      return tf("{0} 天前", [age.value]);
+    case "months":
+      return tf("{0} 个月前", [age.value]);
+    case "years":
+      return tf("{0} 年前", [age.value]);
+  }
+}
+
 function MarketScriptCard({
   script,
   actions,
@@ -11024,12 +11069,20 @@ function MarketScriptCard({
   const hiddenTags = script.tags.slice(3);
   const isGitHubHomepage = script.homepage ? isGitHubRepositoryHomepage(script.homepage) : false;
   const githubSupportLabel = isGitHubHomepage ? tf("在 GitHub 上支持作者：{0}", [script.name]) : undefined;
+  const updatedTime = parseMarketTime(script.updatedAt);
   return (
     <div className="script-market-card" data-view={view}>
       <div className="script-market-title">
         <div>
           <strong>{script.name}</strong>
-          <span>{script.author || t("未知作者")} · v{script.version}</span>
+          <span>
+            {script.author || t("未知作者")} · v{script.version}
+            {updatedTime !== null ? (
+              <time dateTime={script.updatedAt} title={tf("更新于 {0}", [formatMarketUpdatedAt(script.updatedAt || "")])}>
+                {" · "}{tf("{0}更新", [formatRelativeAge(updatedTime)])}
+              </time>
+            ) : null}
+          </span>
         </div>
         {status ? <UiBadge className="script-market-status" variant={script.updateAvailable ? "default" : "secondary"}>{status}</UiBadge> : null}
       </div>
@@ -15933,20 +15986,50 @@ function Metric({ label, value }: { label: string; value: string }) {
   );
 }
 
-function ScriptRow({ script, actions }: { script: NonNullable<UserScriptInventory["scripts"]>[number]; actions: Actions }) {
+/// 本地脚本合并状态的文案与悬停说明。
+function localScriptStateLabel(state: LocalScriptState): { label: string; hint: string } {
+  switch (state) {
+    case "off":
+      return { label: t("已关闭"), hint: t("该脚本已关闭，不会注入 Codex") };
+    case "globalOff":
+      return { label: t("整体已关闭"), hint: t("脚本开着，但「启用本地脚本」整体开关关着，暂不注入") };
+    case "loaded":
+      return { label: t("已加载"), hint: t("已在 Codex 里运行") };
+    case "loading":
+      return { label: t("加载中"), hint: t("正在 Codex 里加载") };
+    case "failed":
+      return { label: t("加载失败"), hint: t("脚本在 Codex 里运行出错") };
+    case "notLoaded":
+      return { label: t("未加载"), hint: t("Codex 未运行或尚未热重载脚本") };
+  }
+}
+
+/// 本地脚本一行：名称 / 来源 / 开关 + 状态 / 操作。
+/// 以前「启用 / 关闭」和 loaded / disabled 各占一列、还另有启用按钮，三处说同一件事（#2781）；
+/// 现在开关直接放进状态列，状态只补充开关之外的信息（是否真正加载、失败原因）。
+function ScriptRow({ script, globalEnabled, actions }: { script: NonNullable<UserScriptInventory["scripts"]>[number]; globalEnabled: boolean; actions: Actions }) {
   const source = script.market_id ? tf("市场 · {0}", [script.version || t("未知版本")]) : script.source === "builtin" ? t("内置") : t("用户");
   const canDelete = script.source === "user";
+  const state = localScriptState(script, globalEnabled);
+  const { label, hint } = localScriptStateLabel(state);
+  const stateHint = state === "failed" && script.error ? `${hint}\n${script.error}` : hint;
   return (
-    <div className="table-row">
+    <div className="table-row user-script-row">
       <span>{script.name}</span>
       <span>{source}</span>
-      <span>{script.enabled ? t("启用") : t("关闭")}</span>
-      <span>{script.status}</span>
+      <div className="user-script-state">
+        <label className="relay-bare-switch" title={script.enabled ? t("关闭该脚本") : t("启用该脚本")}>
+          <input
+            aria-label={tf("启用 {0}", [script.name])}
+            checked={script.enabled}
+            onChange={() => void actions.setUserScriptEnabled(script.key, !script.enabled)}
+            type="checkbox"
+          />
+          <ToggleVisual />
+        </label>
+        <span className="user-script-state-label" data-state={state} title={stateHint}>{label}</span>
+      </div>
       <div className="script-row-actions">
-        <Button onClick={() => void actions.setUserScriptEnabled(script.key, !script.enabled)} size="sm" variant="secondary">
-          {script.enabled ? <PowerOff className="h-4 w-4" /> : <Power className="h-4 w-4" />}
-          {script.enabled ? t("禁用") : t("启用")}
-        </Button>
         {canDelete ? (
           <Button onClick={() => void actions.deleteUserScript(script.key)} size="sm" variant="outline">
             <Trash2 className="h-4 w-4" />
