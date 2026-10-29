@@ -1864,16 +1864,32 @@ fn terminate_multi_worker(
     #[cfg(windows)]
     {
         // 创建身份、精确参数与 exe 均验证后，使用同一句柄终止，不再按 PID taskkill。
-        let terminated = codex_plus_core::multi_worker::terminate_verified_worker(
+        let result = codex_plus_core::multi_worker::terminate_verified_worker(
             pid,
             options_path,
             worker_birth_id,
-        )?;
-        if !terminated {
-            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-                "manager.multi_worker_stop_skipped",
-                json!({ "pid": pid, "reason": "identity_unverified" }),
-            );
+        );
+        match result {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "manager.multi_worker_stop_skipped",
+                    json!({ "pid": pid, "reason": "identity_unverified" }),
+                );
+            }
+            Err(error) => {
+                // 多开停止调用方会故意忽略清理错误；这里先写诊断，避免身份冲突或
+                // 查询失败只表现为“停掉了”，却没有留下跳过依据。
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "manager.multi_worker_stop_skipped",
+                    json!({
+                        "pid": pid,
+                        "reason": "verification_error",
+                        "message": format!("{error:#}"),
+                    }),
+                );
+                return Err(error);
+            }
         }
     }
     #[cfg(not(any(unix, windows)))]

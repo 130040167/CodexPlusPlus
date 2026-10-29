@@ -145,8 +145,11 @@ pub(super) fn capture_root(
 
 /// worker 在 ready 时捕获并持续 refresh；保留所有已收养代的句柄直到清理确认。
 /// 只收养桌面自身的 Electron 角色和安装目录内的 app-server，绝不遍历用户工具。
+///
+/// `crashpad-handler`、终端、MCP 和用户启动的工具不在角色白名单中，故不会被
+/// 自动结束；它们由各自的父程序或操作系统负责生命周期。
 #[cfg(windows)]
-pub struct CodexInstanceProcessTree {
+pub(crate) struct CodexInstanceProcessTree {
     identity: CodexInstanceIdentity,
     processes: Vec<(VerifiedStopProcess, Role)>,
     lineage: Vec<TreeMember>,
@@ -177,7 +180,7 @@ impl CodexInstanceProcessTree {
     const STOP_TIMEOUT: Duration = Duration::from_secs(8);
     const STOP_PASSES: usize = 8;
 
-    pub fn capture(identity: &CodexInstanceIdentity) -> anyhow::Result<Self> {
+    pub(crate) fn capture(identity: &CodexInstanceIdentity) -> anyhow::Result<Self> {
         let root = capture_root(identity, true)?;
         let mut tree = Self {
             identity: identity.clone(),
@@ -188,12 +191,12 @@ impl CodexInstanceProcessTree {
         Ok(tree)
     }
 
-    pub fn refresh(&mut self) -> anyhow::Result<()> {
+    pub(crate) fn refresh(&mut self) -> anyhow::Result<()> {
         self.refresh_until(Instant::now() + Self::MAX_REFRESH_TIME)
     }
 
     /// 交接保留已确认的祖先链，避免中间父进程退出后丢失仍活着的后代。
-    pub fn save_handoff_checkpoint(&mut self, path: &Path) -> anyhow::Result<()> {
+    pub(crate) fn save_handoff_checkpoint(&mut self, path: &Path) -> anyhow::Result<()> {
         self.refresh()?;
         let mut members = self.lineage.clone();
         for (process, role) in &self.processes {
@@ -223,7 +226,7 @@ impl CodexInstanceProcessTree {
         crate::settings::atomic_write(path, &serde_json::to_vec(&checkpoint)?)
     }
 
-    pub fn restore_handoff_checkpoint(&mut self, path: &Path) -> anyhow::Result<()> {
+    pub(crate) fn restore_handoff_checkpoint(&mut self, path: &Path) -> anyhow::Result<()> {
         let metadata = std::fs::symlink_metadata(path)?;
         anyhow::ensure!(
             metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 262144,
@@ -367,7 +370,7 @@ impl CodexInstanceProcessTree {
         Ok(())
     }
 
-    pub fn cleanup_after_exit(mut self) -> anyhow::Result<()> {
+    pub(crate) fn cleanup_after_exit(mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.processes[0].0.is_alive()?,
             "原代 Codex 仍存活，拒绝残留清理"
@@ -558,6 +561,8 @@ mod tests {
         for args in [
             vec!["ChatGPT.exe".into()],
             vec!["ChatGPT.exe".into(), "--type=browser".into()],
+            // crashpad-handler 属于未收养进程，不能由多开停止流程强制结束。
+            vec!["ChatGPT.exe".into(), "--type=crashpad-handler".into()],
             vec![
                 "ChatGPT.exe".into(),
                 "--type=renderer".into(),

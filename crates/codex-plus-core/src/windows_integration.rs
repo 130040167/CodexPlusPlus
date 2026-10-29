@@ -598,7 +598,7 @@ fn command_line_arguments(command_line: &str) -> Option<Vec<String>> {
 
 #[cfg(windows)]
 /// 仅解析原始 Windows argv；此 PID 查询本身不证明进程身份或代际。
-pub fn process_arguments(process_id: u32) -> Option<Vec<String>> {
+pub(crate) fn process_arguments(process_id: u32) -> Option<Vec<String>> {
     command_line_arguments(&process_command_line(process_id)?)
 }
 

@@ -103,11 +103,6 @@ pub(crate) mod xai_responses;
 // 门控在模块级会导致 `if cfg!(windows)` 这类运行时分支在非 Windows 平台找不到符号。
 mod windows_integration;
 #[cfg(windows)]
-pub use windows_integration::{
-    WindowsProcessInfo, process_arguments as windows_process_arguments,
-    process_birth_id as windows_process_birth_id,
-};
-#[cfg(windows)]
 mod windows_taskbar;
 
 #[cfg(windows)]

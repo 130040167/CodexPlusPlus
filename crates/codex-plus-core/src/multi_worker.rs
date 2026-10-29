@@ -7,36 +7,36 @@ use serde::{Deserialize, Serialize};
 #[cfg(any(windows, test))]
 mod windows_process_tree;
 #[cfg(windows)]
-pub use windows_process_tree::CodexInstanceProcessTree;
+pub(crate) use windows_process_tree::CodexInstanceProcessTree;
 
 // 非 Windows 兼容接口仅确认原根退出，不提供 Windows 的自有后代清理能力。
 #[cfg(not(windows))]
-pub struct CodexInstanceProcessTree {
+pub(crate) struct CodexInstanceProcessTree {
     identity: CodexInstanceIdentity,
 }
 
 #[cfg(not(windows))]
 impl CodexInstanceProcessTree {
-    pub fn capture(identity: &CodexInstanceIdentity) -> anyhow::Result<Self> {
+    pub(crate) fn capture(identity: &CodexInstanceIdentity) -> anyhow::Result<Self> {
         anyhow::ensure!(valid_stop_identity(identity), "多开实例身份字段不完整");
         Ok(Self {
             identity: identity.clone(),
         })
     }
 
-    pub fn refresh(&mut self) -> anyhow::Result<()> {
+    pub(crate) fn refresh(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
 
-    pub fn save_handoff_checkpoint(&mut self, _path: &std::path::Path) -> anyhow::Result<()> {
+    pub(crate) fn save_handoff_checkpoint(&mut self, _path: &std::path::Path) -> anyhow::Result<()> {
         Ok(())
     }
 
-    pub fn restore_handoff_checkpoint(&mut self, _path: &std::path::Path) -> anyhow::Result<()> {
+    pub(crate) fn restore_handoff_checkpoint(&mut self, _path: &std::path::Path) -> anyhow::Result<()> {
         Ok(())
     }
 
-    pub fn cleanup_after_exit(self) -> anyhow::Result<()> {
+    pub(crate) fn cleanup_after_exit(self) -> anyhow::Result<()> {
         anyhow::ensure!(
             codex_instance_process_exited(&self.identity),
             "原代 Codex 尚未确认退出"
@@ -75,23 +75,30 @@ fn valid_stop_identity(identity: &CodexInstanceIdentity) -> bool {
         && identity.executable.is_absolute()
 }
 
-/// 主实例可沿用 Electron 默认目录；None 保存“没有目录参数”，不推测默认路径。
-pub async fn capture_main_codex_instance_identity(
-    generation: u64,
-    debug_port: u16,
-    helper_port: u16,
-    user_data_dir: Option<&std::path::Path>,
-    executable: &std::path::Path,
-) -> anyhow::Result<CodexInstanceIdentity> {
-    capture_codex_instance_identity(
-        "main",
-        generation,
-        debug_port,
-        helper_port,
-        user_data_dir.unwrap_or_else(|| std::path::Path::new("")),
-        executable,
-    )
-    .await
+fn record_stop_verification_failure(
+    identity: &CodexInstanceIdentity,
+    result: &anyhow::Result<bool>,
+) {
+    let detail = match result {
+        Ok(true) => return,
+        Ok(false) => serde_json::json!({
+            "reason": "identity_changed",
+        }),
+        Err(error) => serde_json::json!({
+            "reason": "verification_error",
+            "message": format!("{error:#}"),
+        }),
+    };
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "multi_worker.stop_verification_failed",
+        serde_json::json!({
+            "instanceId": identity.instance_id,
+            "generation": identity.generation,
+            "processId": identity.process_id,
+            "debugPort": identity.debug_port,
+            "detail": detail,
+        }),
+    );
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -114,7 +121,7 @@ fn codex_identity_arguments_match(arguments: &[String], identity: &CodexInstance
 }
 
 /// 只确认原代退出；权限、身份字段或查询不确定时返回 false，调用方须保留 worker。
-pub fn codex_instance_process_exited(identity: &CodexInstanceIdentity) -> bool {
+pub(crate) fn codex_instance_process_exited(identity: &CodexInstanceIdentity) -> bool {
     if !valid_stop_identity(identity) {
         return false;
     }
@@ -145,7 +152,9 @@ pub fn codex_instance_process_exited(identity: &CodexInstanceIdentity) -> bool {
 }
 
 /// 仅确认原根退出才返回 false；读取失败、映像/参数/CDP 矛盾均为 Err。
-pub async fn codex_instance_needs_worker(identity: &CodexInstanceIdentity) -> anyhow::Result<bool> {
+pub(crate) async fn codex_instance_needs_worker(
+    identity: &CodexInstanceIdentity,
+) -> anyhow::Result<bool> {
     anyhow::ensure!(valid_stop_identity(identity), "多开实例身份字段不完整");
     #[cfg(windows)]
     {
@@ -494,21 +503,26 @@ pub async fn codex_instance_identity_matches(
 pub async fn terminate_verified_codex_instance(
     identity: &CodexInstanceIdentity,
 ) -> anyhow::Result<bool> {
-    if !codex_instance_identity_matches(identity).await? {
-        return Ok(false);
+    let result = async {
+        if !codex_instance_identity_matches(identity).await? {
+            return Ok(false);
+        }
+        let browser = crate::cdp::browser_identity(identity.debug_port).await?;
+        if browser.browser_id()? != identity.browser_id {
+            return Ok(false);
+        }
+        // 发给这一代 Browser 的专属 WebSocket，不按 PID/端口发送 kill。
+        crate::bridge::send_cdp_command(
+            &browser.web_socket_debugger_url,
+            "Browser.close",
+            serde_json::json!({}),
+        )
+        .await?;
+        Ok(true)
     }
-    let browser = crate::cdp::browser_identity(identity.debug_port).await?;
-    if browser.browser_id()? != identity.browser_id {
-        return Ok(false);
-    }
-    // 发给这一代 Browser 的专属 WebSocket，不按 PID/端口发送 kill。
-    crate::bridge::send_cdp_command(
-        &browser.web_socket_debugger_url,
-        "Browser.close",
-        serde_json::json!({}),
-    )
-    .await?;
-    Ok(true)
+    .await;
+    record_stop_verification_failure(identity, &result);
+    result
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -621,14 +635,19 @@ pub async fn codex_instance_identity_matches(
 pub async fn terminate_verified_codex_instance(
     identity: &CodexInstanceIdentity,
 ) -> anyhow::Result<bool> {
-    if !valid_stop_identity(identity) {
-        return Ok(false);
+    let result = async {
+        if !valid_stop_identity(identity) {
+            return Ok(false);
+        }
+        // 捕获到退出确认全程持有句柄，CDP 只提供额外的否决证据。
+        let mut tree = CodexInstanceProcessTree::capture(identity)?;
+        check_stop_browser_identity(identity).await?;
+        tree.stop_and_wait()?;
+        Ok(true)
     }
-    // 捕获到退出确认全程持有句柄，CDP 只提供额外的否决证据。
-    let mut tree = CodexInstanceProcessTree::capture(identity)?;
-    check_stop_browser_identity(identity).await?;
-    tree.stop_and_wait()?;
-    Ok(true)
+    .await;
+    record_stop_verification_failure(identity, &result);
+    result
 }
 
 #[cfg(any(windows, test))]
