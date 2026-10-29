@@ -1417,7 +1417,7 @@ impl LaunchHooks for DefaultLaunchHooks {
                             }),
                         );
                     }
-                    // 「重启 Codex」：结束它们（连同各自的进程树）并等退出，再走下面的正常激活。
+                    // 「重启 Codex」：先请它们退出、再只结束主进程本身（不连树），等退出后走下面的正常激活。
                     if !blocking.is_empty() && instance.replace_blocking_main_instance {
                         stop_main_instances_blocking_debug_launch(
                             &executable,
@@ -4944,16 +4944,31 @@ fn same_package_codex_process_ids(
         .collect()
 }
 
-/// 结束挡路主进程后等它退出的上限。`taskkill /F` 是立即终止，正常一两秒内就退完。
+/// 向挡路主进程发 `WM_CLOSE` 后，等它自己退出的宽限期。
+///
+/// Codex 关窗口可能只是缩到托盘，此时等满宽限期再强制结束；没有可见窗口（只在托盘）时
+/// 投递不成功，直接跳过等待。
+#[cfg(windows)]
+const BLOCKING_MAIN_INSTANCE_GRACEFUL_TIMEOUT_MS: u64 = 5_000;
+
+/// 强制结束挡路主进程后等它退出的上限。`TerminateProcess` 是立即终止，正常一两秒内就退完。
 #[cfg(windows)]
 const BLOCKING_MAIN_INSTANCE_STOP_TIMEOUT_MS: u64 = 10_000;
 
+/// 主进程退出后，等同包残留进程（Electron 子进程、包内 codex.exe）自行退出的时间。
+#[cfg(windows)]
+const BLOCKING_MAIN_INSTANCE_LEFTOVER_TIMEOUT_MS: u64 = 2_000;
+
 /// 「重启 Codex」路径：结束挡住本次带调试端口启动的主 Codex（issue #2764 后续）。
 ///
-/// 只结束 [`existing_main_instances_blocking_debug_launch`] 认定的主进程；动手前用新快照
-/// 再核对一遍（期间进程可能已退出、PID 被复用）。每个目标按
-/// `packaged_launch::plan_blocking_main_instance_stop` 决定连树结束还是只结束主进程：
-/// 多开实例、别的 ChatGPT 桌面版、Codex++ 自身绝不在结束范围内。
+/// 只结束 [`existing_main_instances_blocking_debug_launch`] 认定的主进程本身，**不按进程树**：
+/// 从 Codex 里打开的 VS Code、浏览器、Agent 起的 dev server 都挂在它的树下，不能一起杀。
+/// 动手前用新快照再核对一遍（期间进程可能已退出、PID 被复用），然后：
+///
+/// 1. 先发 `WM_CLOSE`（与自动接管的优雅退出同一做法），给 Codex 落盘的机会，等宽限期；
+/// 2. 仍未退出的再 `TerminateProcess`，只结束主进程，Electron 子进程会随它退出；
+/// 3. 主进程退出后若还有残留，只清理 `packaged_launch::blocking_main_instance_leftovers`
+///    认定的同一 MSIX 包内的 Codex 进程（`ChatGPT.exe` 子进程 / 包内 `codex.exe`）。
 #[cfg(windows)]
 async fn stop_main_instances_blocking_debug_launch(
     executable: &Path,
@@ -4961,11 +4976,11 @@ async fn stop_main_instances_blocking_debug_launch(
     launch_args: &[String],
     targets: Vec<u32>,
 ) -> anyhow::Result<()> {
-    use crate::packaged_launch::BlockingMainInstanceStop;
-
     let executable = executable.to_path_buf();
     let launch_args = launch_args.to_vec();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        use crate::windows_integration::{process_birth_id, terminate_process};
+
         let processes = crate::windows_integration::enumerate_processes();
         let still_blocking = crate::packaged_launch::main_instances_blocking_debug_launch(
             same_package_codex_process_ids(&processes, &executable),
@@ -4973,16 +4988,19 @@ async fn stop_main_instances_blocking_debug_launch(
             &launch_args,
             crate::windows_integration::process_command_line,
         );
+        let self_process_id = std::process::id();
         let targets = targets
             .into_iter()
+            .filter(|process_id| *process_id != self_process_id)
             .filter(|process_id| still_blocking.contains(process_id))
             .collect::<Vec<_>>();
+        let target_births = targets
+            .iter()
+            .map(|process_id| (*process_id, process_birth_id(*process_id)))
+            .collect::<Vec<_>>();
+        // 残留候选要在主进程退出前记下：Windows 不会给孤儿进程改父 PID，但主进程退出后
+        // 它的创建时间就读不到了，父子边无法再证实。
         let executable_text = executable.to_string_lossy().into_owned();
-        let self_process_id = std::process::id();
-        let self_exe_name = std::env::current_exe().ok().and_then(|path| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        });
         let by_id = processes
             .iter()
             .map(|info| (info.process_id, info))
@@ -4991,81 +5009,123 @@ async fn stop_main_instances_blocking_debug_launch(
             .iter()
             .map(|info| (info.process_id, info.parent_process_id))
             .collect::<Vec<_>>();
-        let protected = |process_id: u32| -> bool {
+        let may_clean = |process_id: u32| -> bool {
             if process_id == self_process_id {
-                return true;
+                return false;
             }
-            // 快照里没有的进程：不认识就不动。
             let Some(info) = by_id.get(&process_id) else {
-                return true;
+                return false;
             };
             let executable_path = info
                 .executable_path
                 .as_deref()
                 .map(|path| path.to_string_lossy().into_owned());
-            !crate::packaged_launch::may_stop_with_blocking_main_instance(
+            crate::packaged_launch::may_clean_up_after_blocking_main_instance(
                 &info.exe_file,
                 executable_path.as_deref(),
                 crate::windows_integration::process_command_line(process_id).as_deref(),
                 &executable_text,
-                self_exe_name.as_deref(),
             )
         };
-        let plans = targets
+        let mut leftover_ids = Vec::new();
+        for process_id in &targets {
+            leftover_ids.extend(crate::packaged_launch::blocking_main_instance_leftovers(
+                *process_id,
+                &edges,
+                process_birth_id,
+                &may_clean,
+            ));
+        }
+        leftover_ids.sort_unstable();
+        leftover_ids.dedup();
+        leftover_ids.retain(|process_id| !targets.contains(process_id));
+        let leftover_births = leftover_ids
             .iter()
-            .map(|process_id| {
-                (
-                    *process_id,
-                    crate::packaged_launch::plan_blocking_main_instance_stop(
-                        *process_id,
-                        &edges,
-                        crate::windows_integration::process_birth_id,
-                        &protected,
-                    ),
-                )
-            })
+            .map(|process_id| (*process_id, process_birth_id(*process_id)))
             .collect::<Vec<_>>();
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "launcher.packaged_existing_main_instance_stopping",
             serde_json::json!({
                 "debug_port": debug_port,
                 "process_ids": targets,
-                "plans": plans
-                    .iter()
-                    .map(|(process_id, plan)| {
-                        serde_json::json!({"pid": process_id, "plan": format!("{plan:?}")})
-                    })
-                    .collect::<Vec<_>>(),
+                "leftover_candidates": leftover_ids,
             }),
         );
-        let mut stopping = Vec::new();
-        let mut requests = Vec::new();
-        for (process_id, plan) in &plans {
-            let accepted = match plan {
-                // 树结束失败（例如 taskkill 不可用）时至少把主进程结束掉。
-                BlockingMainInstanceStop::Tree => {
-                    crate::windows_integration::close_process_tree(*process_id, true)
-                        || crate::windows_integration::terminate_process(*process_id)
-                }
-                BlockingMainInstanceStop::MainOnly => {
-                    crate::windows_integration::terminate_process(*process_id)
-                }
-                BlockingMainInstanceStop::Skip => continue,
-            };
-            stopping.push(*process_id);
-            requests.push(serde_json::json!({"pid": process_id, "accepted": accepted}));
+
+        // 1. 优雅退出：WM_CLOSE，等宽限期。
+        let close_requested = targets
+            .iter()
+            .copied()
+            .filter(|process_id| crate::windows_integration::request_process_close(*process_id))
+            .collect::<Vec<_>>();
+        if !close_requested.is_empty() {
+            let _ = crate::watcher::wait_for_processes_to_exit(
+                &close_requested,
+                BLOCKING_MAIN_INSTANCE_GRACEFUL_TIMEOUT_MS,
+                crate::watcher::RESTART_STOP_WAIT_INTERVAL_MS,
+            );
         }
+
+        // 2. 仍在运行（且确认还是同一个进程）的主进程：只结束它本身，不连树。
+        let running = crate::watcher::process_ids_still_running(
+            &targets,
+            crate::windows_integration::enumerate_processes()
+                .into_iter()
+                .map(|process| process.process_id),
+        );
+        let to_force = crate::packaged_launch::processes_still_to_force_stop(
+            &target_births
+                .iter()
+                .copied()
+                .filter(|(process_id, _)| running.contains(process_id))
+                .collect::<Vec<_>>(),
+            process_birth_id,
+        );
+        let forced = to_force
+            .iter()
+            .map(|process_id| {
+                serde_json::json!({
+                    "pid": process_id,
+                    "accepted": terminate_process(*process_id),
+                })
+            })
+            .collect::<Vec<_>>();
         let remaining = crate::watcher::wait_for_processes_to_exit(
-            &stopping,
+            &to_force,
             BLOCKING_MAIN_INSTANCE_STOP_TIMEOUT_MS,
             crate::watcher::RESTART_STOP_WAIT_INTERVAL_MS,
         );
+
+        // 3. 主进程都退了：同包残留先等它们自己退，仍在的（同一进程）逐个结束，不连树。
+        let mut cleaned = Vec::new();
+        if remaining.is_empty() && !leftover_ids.is_empty() {
+            let still_running = crate::watcher::wait_for_processes_to_exit(
+                &leftover_ids,
+                BLOCKING_MAIN_INSTANCE_LEFTOVER_TIMEOUT_MS,
+                crate::watcher::RESTART_STOP_WAIT_INTERVAL_MS,
+            );
+            let recorded = leftover_births
+                .iter()
+                .copied()
+                .filter(|(process_id, _)| still_running.contains(process_id))
+                .collect::<Vec<_>>();
+            for process_id in
+                crate::packaged_launch::processes_still_to_force_stop(&recorded, process_birth_id)
+            {
+                cleaned.push(serde_json::json!({
+                    "pid": process_id,
+                    "accepted": terminate_process(process_id),
+                }));
+            }
+        }
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "launcher.packaged_existing_main_instance_stopped",
             serde_json::json!({
                 "debug_port": debug_port,
-                "process_ids": stopping,
-                "requests": requests,
+                "process_ids": targets,
+                "close_requested": close_requested,
+                "forced": forced,
+                "leftovers_cleaned": cleaned,
                 "remaining_process_ids": remaining,
                 "exited": remaining.is_empty(),
             }),

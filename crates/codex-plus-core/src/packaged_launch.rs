@@ -588,76 +588,70 @@ pub fn existing_main_instance_blocks_launch_message(
     )
 }
 
-/// 「重启 Codex」结束挡路主进程时采用的方式（issue #2764 后续）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockingMainInstanceStop {
-    /// 连同进程树一起结束（`taskkill /F /T`）：树里只有它自己派生、可以一并结束的进程。
-    Tree,
-    /// 只结束主进程本身：树里混进了不能动的进程，或父子关系不可信（PID 复用）。
-    /// `--type=` 子进程会随主进程退出，不影响释放单实例锁。
-    MainOnly,
-    /// 目标自身受保护（例如就是 Codex++ 自己）：什么都不结束。
-    Skip,
-}
-
-/// 决定如何结束一个挡路的主进程（纯逻辑，平台调用全部注入）。
+/// 挡路主进程退出后，可以顺带清理的残留进程（纯逻辑，平台调用全部注入；issue #2764 后续）。
 ///
-/// - `processes`：进程快照里的 `(pid, 父 pid)`；
-/// - `birth`：进程创建时间（读不到返回 `None`）；
-/// - `protected`：该进程是否绝不能被结束。
+/// 「重启 Codex」只结束检测认定的主进程本身，不按进程树（`taskkill /T`）结束：从 Codex
+/// 里打开的 VS Code、浏览器、Agent 起的 dev server 等都挂在它的进程树下，不能一起杀掉。
+/// Electron 子进程正常会随主进程退出；万一有残留，只允许清理这里返回的进程：
 ///
-/// `taskkill /T` 只看父 PID，而 Windows 会复用 PID：父进程早已退出的无关进程，
-/// 其父 PID 可能恰好等于 Codex 主进程。所以只有整棵树每条父子边都能用创建时间
-/// 证实（子进程晚于父进程创建）、且没有任何受保护进程时才按树结束，否则只结束主进程。
+/// - 从 `target` 出发、只经过「可清理」的进程向下走：遇到不可清理的进程（终端、编辑器、
+///   浏览器……）就停下，它和它的整棵子树都不碰；
+/// - 每条父子边都要用创建时间证实（子进程不早于父进程创建），防 PID 复用把无关进程算进来；
+/// - `may_clean` 由调用方按 [`may_clean_up_after_blocking_main_instance`] 判断。
+///
+/// `processes` 是进程快照里的 `(pid, 父 pid)`，`birth` 读进程创建时间（读不到返回 `None`）。
+/// 返回值已排序、去重，不含 `target` 本身。
 #[cfg(any(windows, test))]
-pub fn plan_blocking_main_instance_stop(
+pub fn blocking_main_instance_leftovers(
     target: u32,
     processes: &[(u32, u32)],
     mut birth: impl FnMut(u32) -> Option<u64>,
-    mut protected: impl FnMut(u32) -> bool,
-) -> BlockingMainInstanceStop {
-    if target == 0 || protected(target) {
-        return BlockingMainInstanceStop::Skip;
+    mut may_clean: impl FnMut(u32) -> bool,
+) -> Vec<u32> {
+    if target == 0 {
+        return Vec::new();
     }
     let mut visited = std::collections::HashSet::from([target]);
     let mut queue = std::collections::VecDeque::from([target]);
+    let mut leftovers = Vec::new();
     while let Some(parent) = queue.pop_front() {
         let parent_birth = birth(parent);
         for &(process_id, parent_process_id) in processes {
-            if parent_process_id != parent || process_id == parent || visited.contains(&process_id)
-            {
+            if parent_process_id != parent || process_id == 0 || visited.contains(&process_id) {
                 continue;
             }
             let verified_child = match (parent_birth, birth(process_id)) {
                 (Some(parent_birth), Some(child_birth)) => child_birth >= parent_birth,
                 _ => false,
             };
-            if !verified_child || protected(process_id) {
-                return BlockingMainInstanceStop::MainOnly;
+            if !verified_child || !may_clean(process_id) {
+                continue;
             }
             visited.insert(process_id);
             queue.push_back(process_id);
+            leftovers.push(process_id);
         }
     }
-    BlockingMainInstanceStop::Tree
+    leftovers.sort_unstable();
+    leftovers
 }
 
-/// 挡路主进程树里的某个进程能否随它一起被结束（纯函数）。
+/// 挡路主进程退出后残留的某个进程能否由 Codex++ 结束（纯函数）。
 ///
-/// - Codex++ 自身（当前 exe 名 / `codex-plus-plus.exe`）：不能；
-/// - 与 Codex 同名的进程：只有同一 MSIX 包族里的 `--type=` 子进程可以，多开实例
-///   （`--user-data-dir`）、别的主进程、另装的 ChatGPT 桌面版、读不到命令行的都不行；
-/// - 其他进程（Codex 拉起的 CLI、终端里的命令等）属于它的进程树，可以一并结束。
+/// 只认同一 MSIX 包内的 Codex 自家进程：
+/// - 与 Codex 同名（`ChatGPT.exe`）的 Electron 子进程（命令行带 `--type=`）；
+/// - 包内自带的 `codex.exe`（Codex 拉起的 app-server）。
+///
+/// 路径读不到、不在同一包族（另装的 ChatGPT 桌面版、用户自己装的 codex CLI）、
+/// 同名但不是子进程（多开实例、别的主进程、读不到命令行）、其他任何程序一律不碰。
 #[cfg(any(windows, test))]
-pub fn may_stop_with_blocking_main_instance(
+pub fn may_clean_up_after_blocking_main_instance(
     exe_file: &str,
     executable_path: Option<&str>,
     command_line: Option<&str>,
     codex_executable: &str,
-    self_exe_name: Option<&str>,
 ) -> bool {
-    if exe_file.eq_ignore_ascii_case("codex-plus-plus.exe")
-        || self_exe_name.is_some_and(|name| exe_file.eq_ignore_ascii_case(name))
+    if !executable_path.is_some_and(|path| same_windows_apps_package_family(path, codex_executable))
     {
         return false;
     }
@@ -665,11 +659,30 @@ pub fn may_stop_with_blocking_main_instance(
         .rsplit(['\\', '/'])
         .next()
         .unwrap_or(codex_executable);
-    if !exe_file.eq_ignore_ascii_case(codex_file_name) {
-        return true;
+    if exe_file.eq_ignore_ascii_case(codex_file_name) {
+        return classify_existing_codex_process(command_line, 0) == ExistingCodexProcess::Child;
     }
-    executable_path.is_some_and(|path| same_windows_apps_package_family(path, codex_executable))
-        && classify_existing_codex_process(command_line, 0) == ExistingCodexProcess::Child
+    exe_file.eq_ignore_ascii_case("codex.exe")
+}
+
+/// 等待期过后仍需强制结束的进程（纯函数，读创建时间通过参数注入）。
+///
+/// `recorded` 是动手前记下的 `(pid, 创建时间)`，调用方只传仍在运行的那些。等待期间
+/// 原进程可能已退出、PID 被别的进程复用：记录过创建时间的，必须与现在读到的一致才算
+/// 同一个进程；当时就读不到创建时间的（只有主进程本身可能出现）保持原判断。
+#[cfg(any(windows, test))]
+pub fn processes_still_to_force_stop(
+    recorded: &[(u32, Option<u64>)],
+    mut birth: impl FnMut(u32) -> Option<u64>,
+) -> Vec<u32> {
+    recorded
+        .iter()
+        .filter(|(process_id, recorded_birth)| match recorded_birth {
+            Some(recorded_birth) => birth(*process_id) == Some(*recorded_birth),
+            None => true,
+        })
+        .map(|(process_id, _)| *process_id)
+        .collect()
 }
 
 /// [`build_main_instance_wrapper_script`] + 写入 `<state_dir>/packaged-launch-main.cmd`。
@@ -2312,97 +2325,86 @@ mod tests {
     }
 
     #[test]
-    fn blocking_main_instance_is_stopped_as_a_tree_only_when_every_edge_is_verified() {
-        // 28480：挡路主进程；28524 / 28568：它的子进程；40000：子进程派生的 codex.exe。
+    fn leftovers_after_blocking_main_instance_never_include_foreign_subtrees() {
+        // 28480：挡路主进程；28524 / 28568：Electron 子进程；29000：包内 codex.exe；
+        // 31000：从 Codex 里打开的 VS Code；31100：VS Code 起的 node（dev server）；
+        // 32000：Codex 终端里的 pwsh，32100：pwsh 里跑的同包 codex.exe（用户自己起的）。
         let processes = [
             (28480, 4000),
             (28524, 28480),
             (28568, 28480),
-            (40000, 28524),
+            (29000, 28524),
+            (31000, 28480),
+            (31100, 31000),
+            (32000, 28480),
+            (32100, 32000),
             (50000, 1),
         ];
         let birth = |pid: u32| -> Option<u64> {
             match pid {
                 28480 => Some(100),
-                28524 | 28568 => Some(110),
-                40000 => Some(120),
-                _ => Some(1),
+                4000 | 1 | 50000 => Some(1),
+                _ => Some(pid as u64),
             }
         };
+        let cleanable = |pid: u32| matches!(pid, 28524 | 28568 | 29000 | 32100);
+        // 只沿可清理的进程向下走：VS Code / pwsh 及其子树一个都不碰，主进程本身也不在里面。
         assert_eq!(
-            plan_blocking_main_instance_stop(28480, &processes, birth, |_| false),
-            BlockingMainInstanceStop::Tree
+            blocking_main_instance_leftovers(28480, &processes, birth, cleanable),
+            vec![28524, 28568, 29000]
         );
-        // 树里有受保护进程（多开实例 / Codex++ 自身）：只结束主进程。
-        assert_eq!(
-            plan_blocking_main_instance_stop(28480, &processes, birth, |pid| pid == 40000),
-            BlockingMainInstanceStop::MainOnly
-        );
-        // PID 复用：父 PID 指向主进程、却比它更早创建的无关进程，taskkill /T 会误杀。
+        // PID 复用：父 PID 指向主进程、却比它更早创建的无关进程，不算残留。
         let reused = [(28480, 4000), (777, 28480)];
-        assert_eq!(
-            plan_blocking_main_instance_stop(
+        assert!(
+            blocking_main_instance_leftovers(
                 28480,
                 &reused,
                 |pid| Some(if pid == 777 { 5 } else { 100 }),
-                |_| false
-            ),
-            BlockingMainInstanceStop::MainOnly
+                |_| true
+            )
+            .is_empty()
         );
-        // 创建时间读不到：父子关系无法证实，同样不按树结束。
-        assert_eq!(
-            plan_blocking_main_instance_stop(
+        // 创建时间读不到：父子关系无法证实，同样不算。
+        assert!(
+            blocking_main_instance_leftovers(
                 28480,
                 &reused,
                 |pid| (pid == 28480).then_some(100),
-                |_| false
-            ),
-            BlockingMainInstanceStop::MainOnly
+                |_| true
+            )
+            .is_empty()
         );
-        // 没有子进程：按树结束等同于只结束它自己。
+        // 目标是 0、父子关系成环（快照里 PID 复用造成）：都能正常结束。
+        assert!(blocking_main_instance_leftovers(0, &processes, birth, |_| true).is_empty());
         assert_eq!(
-            plan_blocking_main_instance_stop(28480, &[(28480, 4000)], |_| None, |_| false),
-            BlockingMainInstanceStop::Tree
-        );
-        // 目标本身受保护或是 0：一个都不结束。
-        assert_eq!(
-            plan_blocking_main_instance_stop(28480, &processes, birth, |pid| pid == 28480),
-            BlockingMainInstanceStop::Skip
-        );
-        assert_eq!(
-            plan_blocking_main_instance_stop(0, &processes, birth, |_| false),
-            BlockingMainInstanceStop::Skip
-        );
-        // 父子关系成环（快照里 PID 复用造成）也能结束遍历。
-        assert_eq!(
-            plan_blocking_main_instance_stop(
+            blocking_main_instance_leftovers(
                 1,
                 &[(1, 2), (2, 1)],
                 |pid| Some(pid as u64),
-                |_| false
+                |_| true
             ),
-            BlockingMainInstanceStop::Tree
+            vec![2]
         );
     }
 
     #[test]
-    fn only_child_processes_of_the_same_package_go_down_with_the_main_instance() {
+    fn only_codex_processes_of_the_same_package_may_be_cleaned_up() {
         let codex = r"C:\Program Files\WindowsApps\OpenAI.Codex_26.1023.6621.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe";
+        let bundled_cli = r"C:\Program Files\WindowsApps\OpenAI.Codex_26.1023.6621.0_x64__2p2nqsd0c76g0\app\resources\codex.exe";
         let other_package = r"C:\Program Files\WindowsApps\OpenAI.ChatGPT-Desktop_1.2025.1.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe";
         let allowed = |exe: &str, path: Option<&str>, command_line: Option<&str>| {
-            may_stop_with_blocking_main_instance(
-                exe,
-                path,
-                command_line,
-                codex,
-                Some("CodexPlusPlus.exe"),
-            )
+            may_clean_up_after_blocking_main_instance(exe, path, command_line, codex)
         };
-        // 同包族的 Electron 子进程：随主进程一起结束。
+        // 同包族的 Electron 子进程、包内 codex.exe：可以清理。
         assert!(allowed(
             "ChatGPT.exe",
             Some(codex),
             Some(&format!("{STORE_EXE} --type=renderer"))
+        ));
+        assert!(allowed(
+            "codex.exe",
+            Some(bundled_cli),
+            Some("codex.exe app-server")
         ));
         // 多开实例、另一个主进程、读不到命令行：都不能动。
         assert!(!allowed(
@@ -2414,7 +2416,7 @@ mod tests {
         ));
         assert!(!allowed("ChatGPT.exe", Some(codex), Some(STORE_EXE)));
         assert!(!allowed("chatgpt.exe", Some(codex), None));
-        // 另装的 ChatGPT 桌面版（即使是它的子进程）、路径读不到：不能动。
+        // 另装的 ChatGPT 桌面版、路径读不到：不能动。
         assert!(!allowed(
             "ChatGPT.exe",
             Some(other_package),
@@ -2425,12 +2427,48 @@ mod tests {
             None,
             Some(&format!("{STORE_EXE} --type=gpu-process"))
         ));
-        // Codex++ 自身：不能动。
-        assert!(!allowed("CodexPlusPlus.exe", None, None));
-        assert!(!allowed("codex-plus-plus.exe", None, None));
-        // Codex 自己拉起的其他进程（CLI、终端命令）：属于它的进程树。
-        assert!(allowed("codex.exe", None, None));
-        assert!(allowed("node.exe", None, None));
+        // 包外的程序（用户装的 codex CLI、VS Code、node、浏览器、Codex++ 自身）：一律不碰。
+        assert!(!allowed(
+            "codex.exe",
+            Some(r"C:\Users\me\AppData\Roaming\npm\node_modules\@openai\codex\codex.exe"),
+            None
+        ));
+        assert!(!allowed("codex.exe", None, None));
+        assert!(!allowed(
+            "Code.exe",
+            Some(r"C:\Users\me\AppData\Local\Programs\Microsoft VS Code\Code.exe"),
+            None
+        ));
+        assert!(!allowed(
+            "node.exe",
+            Some(r"C:\Program Files\nodejs\node.exe"),
+            None
+        ));
+        assert!(!allowed(
+            "CodexPlusPlus.exe",
+            Some(r"C:\Program Files\Codex++\CodexPlusPlus.exe"),
+            None
+        ));
+    }
+
+    #[test]
+    fn force_stop_skips_processes_whose_pid_was_reused_while_waiting() {
+        let recorded = [(100, Some(10)), (200, Some(20)), (300, None)];
+        // 100 未变；200 已退出、PID 被创建时间不同的进程复用；300 当时就读不到创建时间。
+        let birth = |pid: u32| match pid {
+            100 => Some(10),
+            200 => Some(99),
+            _ => None,
+        };
+        assert_eq!(
+            processes_still_to_force_stop(&recorded, birth),
+            vec![100, 300]
+        );
+        // 现在读不到创建时间（进程刚退出）：记录过的就不再强杀。
+        assert_eq!(
+            processes_still_to_force_stop(&[(100, Some(10))], |_| None),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]
