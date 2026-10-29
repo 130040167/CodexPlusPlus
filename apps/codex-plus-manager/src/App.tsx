@@ -15737,11 +15737,6 @@ function AppSidebar({
           <div className="side-group-items">{gatewayNavigationRoutes.map((routeId) => renderItem(routeId))}</div>
         </section>
 
-        <section className={`side-group ${collapsed.includes("management") ? "collapsed" : ""}`} data-tour="management">
-          {groupLabel("management", t("全局管理"))}
-          <div className="side-group-items">{managementNavigationRoutes.map((routeId) => renderItem(routeId))}</div>
-        </section>
-
         <section className={`side-group ${collapsed.includes("agents") ? "collapsed" : ""}`} data-tour="agents">
           {groupLabel(
             "agents",
@@ -15798,6 +15793,11 @@ function AppSidebar({
               );
             })}
           </div>
+        </section>
+
+        <section className={`side-group ${collapsed.includes("management") ? "collapsed" : ""}`} data-tour="management">
+          {groupLabel("management", t("全局管理"))}
+          <div className="side-group-items">{managementNavigationRoutes.map((routeId) => renderItem(routeId))}</div>
         </section>
 
         <section className={`side-group ${collapsed.includes("tools") ? "collapsed" : ""}`}>
