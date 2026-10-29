@@ -846,9 +846,9 @@ fn stream_failure_payload(block: &str) -> (Option<String>, Option<String>) {
         .and_then(Value::as_str)
         .or_else(|| json.get("code").and_then(Value::as_str))
         .map(ToString::to_string);
+    // 有的上游（如 xAI）把 `error` 直接写成字符串：这时它本身就是 message。
     let message = error
-        .and_then(|error| error.get("message"))
-        .and_then(Value::as_str)
+        .and_then(|error| error.as_str().or_else(|| error.get("message")?.as_str()))
         .or_else(|| json.get("message").and_then(Value::as_str))
         .map(ToString::to_string);
     (code, message)
@@ -11895,6 +11895,27 @@ mod proxy_auto_retry_tests {
             code.as_deref(),
             Some("Selected model is at capacity. Please try a different model.")
         ));
+    }
+
+    #[test]
+    fn stream_failure_payload_reads_string_error_as_message() {
+        // xAI 可能把 error 直接写成字符串，code 放在顶层。
+        let block = "event: error\ndata: {\"type\":\"error\",\"code\":\"Client specified an invalid argument\",\"error\":\"Could not decrypt the provided encrypted_content.\"}";
+        let (code, message) = stream_failure_payload(block);
+        assert_eq!(code.as_deref(), Some("Client specified an invalid argument"));
+        assert_eq!(
+            message.as_deref(),
+            Some("Could not decrypt the provided encrypted_content.")
+        );
+        assert!(crate::foreign_reasoning::is_unverifiable_stream_failure(
+            code.as_deref(),
+            message.as_deref()
+        ));
+        // 包在 response 里的字符串 error 也一样。
+        let nested = "data: {\"type\":\"response.failed\",\"response\":{\"error\":\"upstream boom\"}}";
+        let (code, message) = stream_failure_payload(nested);
+        assert_eq!(code, None);
+        assert_eq!(message.as_deref(), Some("upstream boom"));
     }
 
     #[test]
