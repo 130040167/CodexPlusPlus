@@ -2084,10 +2084,15 @@ fn multi_instance_user_data_dir(slug: &str) -> PathBuf {
     multi_instance_user_data_dir_with_root(
         slug,
         std::env::var_os("CODEX_ELECTRON_USER_DATA_PATH").map(PathBuf::from),
+        codex_plus_core::paths::state_dir_override(),
     )
 }
 
-fn multi_instance_user_data_dir_with_root(slug: &str, electron_root: Option<PathBuf>) -> PathBuf {
+fn multi_instance_user_data_dir_with_root(
+    slug: &str,
+    electron_root: Option<PathBuf>,
+    state: Option<PathBuf>,
+) -> PathBuf {
     // 多开根与主实例 userData 同级，避免主实例清理时连带删除多开数据。
     if let Some(root) = electron_root.filter(|root| !root.as_os_str().is_empty()) {
         let parent = root.parent().unwrap_or_else(|| Path::new("."));
@@ -2097,6 +2102,14 @@ fn multi_instance_user_data_dir_with_root(slug: &str, electron_root: Option<Path
             .unwrap_or("CodexPlusPlus");
         return parent.join(format!("{name}-multi")).join(slug);
     }
+    // 显式状态目录是多开的隔离边界；普通实例继续使用历史布局。
+    if let Some(state) = state.filter(|path| !path.as_os_str().is_empty()) {
+        return state.join("codex-multi").join(slug).join("user-data");
+    }
+    legacy_multi_instance_user_data_dir(slug)
+}
+
+fn legacy_multi_instance_user_data_dir(slug: &str) -> PathBuf {
     directories::BaseDirs::new()
         .map(|dirs| {
             dirs.data_local_dir()
@@ -9658,13 +9671,35 @@ mod tests {
     fn multi_instance_user_data_respects_explicit_electron_root() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("electron data");
-        let first = multi_instance_user_data_dir_with_root("instance-a", Some(root.clone()));
-        let second = multi_instance_user_data_dir_with_root("instance-b", Some(root.clone()));
+        let state = temp.path().join("manager state");
+        let first = multi_instance_user_data_dir_with_root(
+            "instance-a",
+            Some(root.clone()),
+            Some(state.clone()),
+        );
+        let second = multi_instance_user_data_dir_with_root(
+            "instance-b",
+            Some(root.clone()),
+            Some(state.clone()),
+        );
         let multi_root = root.parent().unwrap().join("electron data-multi");
         assert_eq!(first, multi_root.join("instance-a"));
         assert_eq!(second, multi_root.join("instance-b"));
         assert_ne!(first, second);
         assert!(!first.exists());
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn multi_instance_user_data_uses_explicit_state_before_legacy_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("manager state");
+        let expected = state.join("codex-multi/instance-a/user-data");
+        assert_eq!(
+            multi_instance_user_data_dir_with_root("instance-a", None, Some(state.clone())),
+            expected
+        );
+        assert!(!state.exists());
     }
 
     #[test]
@@ -9682,11 +9717,15 @@ mod tests {
                     .join("instance-a")
             });
         assert_eq!(
-            multi_instance_user_data_dir_with_root("instance-a", None),
+            multi_instance_user_data_dir_with_root("instance-a", None, None),
             expected
         );
         assert_eq!(
-            multi_instance_user_data_dir_with_root("instance-a", Some(PathBuf::new())),
+            multi_instance_user_data_dir_with_root(
+                "instance-a",
+                Some(PathBuf::new()),
+                Some(PathBuf::new())
+            ),
             expected
         );
     }
@@ -12054,6 +12093,44 @@ model_reasoning_effort = "high"
         assert!(first > 0);
         assert!(second > 0);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn multi_instance_user_data_is_scoped_to_explicit_manager_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("manager a");
+        let second = temp.path().join("manager b");
+        assert_eq!(
+            multi_instance_user_data_dir_with_root("same-name", None, Some(first.clone())),
+            first.join("codex-multi/same-name/user-data")
+        );
+        assert_eq!(
+            multi_instance_user_data_dir_with_root("same-name", None, Some(second.clone())),
+            second.join("codex-multi/same-name/user-data")
+        );
+        assert_ne!(
+            multi_instance_user_data_dir_with_root("same-name", None, Some(first.clone())),
+            multi_instance_user_data_dir_with_root("same-name", None, Some(second.clone()))
+        );
+        assert_ne!(
+            multi_instance_user_data_dir_with_root("first", None, Some(first.clone())),
+            multi_instance_user_data_dir_with_root("second", None, Some(first.clone()))
+        );
+        assert!(!first.exists());
+        assert!(!second.exists());
+    }
+
+    #[test]
+    fn multi_instance_user_data_without_state_keeps_legacy_layout() {
+        let expected = legacy_multi_instance_user_data_dir("fixture");
+        assert_eq!(
+            multi_instance_user_data_dir_with_root("fixture", None, None),
+            expected
+        );
+        assert_eq!(
+            multi_instance_user_data_dir_with_root("fixture", None, Some(PathBuf::new())),
+            expected
+        );
     }
 
     #[test]
