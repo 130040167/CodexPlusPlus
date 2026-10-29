@@ -731,6 +731,61 @@ fn codex_with_externally_edited_config_connects_and_restores_it_byte_for_byte() 
     );
 }
 
+/// #2773：之前在 WSL 模式下写过 WSL 网卡地址、之后不在 WSL 里运行了，核对时改回回环地址；
+/// 本来就是回环时什么都不做（非 Windows 平台永远不会写出 WSL 地址）。
+#[test]
+fn codex_gateway_endpoint_returns_to_loopback_outside_wsl() {
+    use codex_plus_core::gateway::apply::sync_codex_wsl_endpoint;
+    let fixture = fixture(57398);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    let mut seeded = BackendSettings::default();
+    seeded.relay_profiles_enabled = true;
+    ctx.settings.save(&seeded).unwrap();
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let loopback = "127.0.0.1:57398/gw/codex/v1";
+    let config_path = ctx.codex_home.join("config.toml");
+    assert!(
+        std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains(loopback)
+    );
+    assert!(!sync_codex_wsl_endpoint(ctx).unwrap(), "回环地址不重写");
+
+    // 模拟 WSL 模式下写下的地址：托管供应商与实时配置一起换成 WSL 网卡地址。
+    let wsl = "172.29.16.1:57398/gw/codex/v1";
+    let mut settings = ctx.settings.load().unwrap();
+    let profile = settings
+        .relay_profiles
+        .iter_mut()
+        .find(|profile| profile.id == "codex-plus-gateway")
+        .unwrap();
+    profile.base_url = profile.base_url.replace(loopback, wsl);
+    profile.upstream_base_url = profile.upstream_base_url.replace(loopback, wsl);
+    profile.config_contents = profile.config_contents.replace(loopback, wsl);
+    ctx.settings.save(&settings).unwrap();
+    let live = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(&config_path, live.replace(loopback, wsl)).unwrap();
+    assert_eq!(
+        codex_plus_core::gateway::drift::check(ctx, &ToolId::Codex),
+        None,
+        "WSL 地址的网关入口也算指向网关"
+    );
+
+    assert!(sync_codex_wsl_endpoint(ctx).unwrap());
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    assert!(config.contains(loopback), "{config}");
+    assert!(!config.contains("172.29.16.1"), "{config}");
+    let settings = ctx.settings.load().unwrap();
+    let profile = settings
+        .relay_profiles
+        .iter()
+        .find(|profile| profile.id == "codex-plus-gateway")
+        .unwrap();
+    assert_eq!(profile.base_url, format!("http://{loopback}"));
+    assert!(!sync_codex_wsl_endpoint(ctx).unwrap(), "改回后不再重写");
+}
+
 /// Codex 用 ChatGPT 账号登录着：接入网关后保留官方登录身份（内置 OpenAI 供应商 + 登录 token），
 /// 请求经本地代理（openai_base_url）转给网关；断开后回到原来的供应商。
 #[test]

@@ -1737,6 +1737,8 @@ pub fn reset_gateway_key_health(relay_id: String) -> CommandResult<Option<Gatewa
 
 /// 管理器启动时：有 Agent 开着网关就拉起常驻 helper，并在端口变化或退出 / 更新前恢复过直连的情况下重写配置。
 pub fn start_from_saved_state() {
+    // Codex 在 WSL 里运行时（仅 Windows）定期核对网关的 WSL 网卡地址：WSL 往往比 Codex++ 晚启动（#2773）。
+    codex_plus_core::wsl_network::start_codex_gateway_wsl_watch();
     let Ok(gateway) = GatewayStore::default().load() else {
         return;
     };

@@ -70,7 +70,12 @@ impl ApplyContext {
 
 /// Agent 访问网关的根地址（不含 `/v1`）。
 pub fn gateway_base_url(port: u16, agent: &ToolId) -> String {
-    format!("http://127.0.0.1:{port}/gw/{}", agent.as_str())
+    gateway_base_url_on(crate::wsl_network::LOOPBACK_HOST, port, agent)
+}
+
+/// 指定主机的网关根地址：Codex 在 WSL 里运行时主机是 WSL 虚拟网卡地址（#2773）。
+pub fn gateway_base_url_on(host: &str, port: u16, agent: &ToolId) -> String {
+    format!("http://{host}:{port}/gw/{}", agent.as_str())
 }
 
 /// 开启前检查：池里有这个 Agent 能用的供应商，默认模型能路由。
@@ -160,13 +165,20 @@ pub fn grok_gateway_profile(
     binding: &AgentBinding,
     port: u16,
 ) -> RelayProfile {
-    agent_gateway_profile(gateway, binding, port, &ToolId::Grok)
+    agent_gateway_profile(
+        gateway,
+        binding,
+        crate::wsl_network::LOOPBACK_HOST,
+        port,
+        &ToolId::Grok,
+    )
 }
 
 /// Responses 类 Agent（Grok、Codex）的合成供应商：地址是该 Agent 的网关入口，模型列表是整个池。
 fn agent_gateway_profile(
     gateway: &GatewaySettings,
     binding: &AgentBinding,
+    host: &str,
     port: u16,
     agent: &ToolId,
 ) -> RelayProfile {
@@ -196,7 +208,7 @@ fn agent_gateway_profile(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let base = format!("{}/v1", gateway_base_url(port, agent));
+    let base = format!("{}/v1", gateway_base_url_on(host, port, agent));
     RelayProfile {
         id: "codex-plus-gateway".to_string(),
         name: "Codex++ 网关".to_string(),
@@ -316,7 +328,21 @@ pub fn codex_gateway_profile(
     port: u16,
     signed_in: bool,
 ) -> anyhow::Result<RelayProfile> {
-    let synthetic = agent_gateway_profile(gateway, binding, port, &ToolId::Codex);
+    codex_gateway_profile_on(gateway, binding, port, None, signed_in)
+}
+
+/// 同 [`codex_gateway_profile`]，`wsl_host` 是 Codex 在 WSL 里运行时网关额外监听的 WSL 网卡地址：
+/// 地址写成它，且不带官方会话身份（官方身份那一跳经本地代理，没有网关 token，WSL 监听不放行）。
+pub fn codex_gateway_profile_on(
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+    port: u16,
+    wsl_host: Option<std::net::Ipv4Addr>,
+    signed_in: bool,
+) -> anyhow::Result<RelayProfile> {
+    let signed_in = crate::wsl_network::codex_gateway_uses_official_identity(signed_in, wsl_host);
+    let host = crate::wsl_network::codex_gateway_host(wsl_host);
+    let synthetic = agent_gateway_profile(gateway, binding, &host, port, &ToolId::Codex);
     let mut profile = crate::provider_import::pool_relay_profile(
         "Codex++ 网关",
         &synthetic.base_url,
@@ -1106,13 +1132,21 @@ fn write_codex(
     if !settings.relay_profiles_enabled {
         bail!("Codex 的供应商配置总开关已关闭，无法接入网关：先在 Codex 设置里打开");
     }
+    // Codex 在 WSL 里运行：网关额外监听 WSL 网卡，地址写成它（#2773）；拿不到时保持回环。
+    let wsl_host = crate::wsl_network::codex_gateway_wsl_host(&ctx.codex_home, ctx.port);
     // Codex 自己没登录、池里有网关登录的 ChatGPT 账号：借给 Codex，让它以官方身份接入。
+    // WSL 模式下不用官方身份（见 [`codex_gateway_profile_on`]），也就不借。
     let signed_in = codex_signed_in(&ctx.codex_home);
-    let lend = (!signed_in)
+    let lend = (!signed_in && wsl_host.is_none())
         .then(|| lendable_login(gateway).map(|provider| provider.relay.id.clone()))
         .flatten();
-    let mut profile =
-        codex_gateway_profile(gateway, binding, ctx.port, signed_in || lend.is_some())?;
+    let mut profile = codex_gateway_profile_on(
+        gateway,
+        binding,
+        ctx.port,
+        wsl_host,
+        signed_in || lend.is_some(),
+    )?;
     // 用户写在实时配置里、与路由无关的根级设置跟着托管供应商走（#2771）：
     // 刚接入时来自上一个供应商写下的配置，已在网关上时来自用户之后的改动。
     if let Some(live) = std::fs::read_to_string(ctx.codex_home.join(CODEX_LIVE_FILES[0])).ok()
@@ -1773,6 +1807,10 @@ pub fn sync_codex_identity(ctx: &ApplyContext) -> anyhow::Result<bool> {
         );
         return Ok(false);
     }
+    // 在 WSL 里运行时不用官方身份，只核对写进去的网关地址（#2773）。
+    if crate::wsl_network::codex_runs_in_wsl(&ctx.codex_home) {
+        return sync_codex_wsl_endpoint(ctx);
+    }
     let keeps_login =
         settings.active_relay_session_provider() == crate::settings::RelaySessionProvider::Openai;
     let can_sign_in = codex_signed_in(&ctx.codex_home) || lendable_login(&gateway).is_some();
@@ -1780,6 +1818,48 @@ pub fn sync_codex_identity(ctx: &ApplyContext) -> anyhow::Result<bool> {
         return Ok(false);
     }
     write_codex(ctx, &gateway, &binding.clone())?;
+    Ok(true)
+}
+
+/// Codex 开着网关时，写进托管供应商的网关主机要跟 Codex 的运行位置一致（#2773）：
+/// 在 WSL 里运行时是 WSL 虚拟网卡地址（网卡地址每次开机可能变），否则是 `127.0.0.1`。
+/// 不一致就重写一次，返回是否重写了。WSL 还没启动、拿不到网卡时保持现状。
+pub fn sync_codex_wsl_endpoint(ctx: &ApplyContext) -> anyhow::Result<bool> {
+    let gateway = ctx.gateway.load()?;
+    let Some(binding) = gateway.active_binding(&ToolId::Codex).cloned() else {
+        return Ok(false);
+    };
+    let settings = ctx.settings.load()?;
+    if settings.active_relay_id != CODEX_GATEWAY_RELAY_ID {
+        return Ok(false);
+    }
+    let written_host = settings
+        .relay_profiles
+        .iter()
+        .find(|profile| profile.id == CODEX_GATEWAY_RELAY_ID)
+        .and_then(|profile| crate::wsl_network::url_host(&profile.base_url))
+        .map(str::to_string);
+    let in_wsl = crate::wsl_network::codex_runs_in_wsl(&ctx.codex_home);
+    // 地址对不上才看要不要识别网卡：不在 WSL 里、写的也是回环时（绝大多数情况）不做任何查询。
+    if !in_wsl
+        && !crate::wsl_network::codex_gateway_host_stale(written_host.as_deref(), false, None)
+    {
+        crate::wsl_network::stop_wsl_listener();
+        return Ok(false);
+    }
+    let wsl_host = crate::wsl_network::codex_gateway_wsl_host(&ctx.codex_home, ctx.port);
+    if !crate::wsl_network::codex_gateway_host_stale(written_host.as_deref(), in_wsl, wsl_host) {
+        return Ok(false);
+    }
+    if let Some(found) = taken_over(ctx, &ToolId::Codex) {
+        log_taken_over(
+            "gateway.wsl_endpoint_sync_skipped_taken_over",
+            &ToolId::Codex,
+            &found,
+        );
+        return Ok(false);
+    }
+    write_codex(ctx, &gateway, &binding)?;
     Ok(true)
 }
 
@@ -3081,6 +3161,64 @@ mod tests {
                 profile.config_contents
             );
         }
+    }
+
+    /// #2773：Codex 在 WSL 里运行时，托管供应商直连 WSL 网卡上的网关入口（带网关 token），
+    /// 即使 Codex 登录着 ChatGPT 也不走官方身份那一跳（本地代理 `/v1` 没有网关 token）。
+    #[test]
+    fn wsl_gateway_profile_points_at_wsl_adapter_with_gateway_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(temp.path().join("gateway.json"));
+        create_provider(
+            &store,
+            &ProviderInput {
+                name: "Relay".into(),
+                base_url: "https://relay.test/v1".into(),
+                protocol: RelayProtocol::Responses,
+                keys: vec!["sk-relay".into()],
+                model: "gpt-6-astra".into(),
+                model_list: "gpt-6-astra".into(),
+                price: None,
+                model_prices: None,
+                proxy: None,
+                strip_image_generation_tool: None,
+            },
+            "",
+            None,
+        )
+        .unwrap();
+        let gateway = store.load().unwrap();
+        let binding = AgentBinding {
+            model: "gpt-6-astra".into(),
+            token: crate::gateway::store::new_client_token(&ToolId::Codex),
+            ..AgentBinding::default()
+        };
+        let wsl = std::net::Ipv4Addr::new(172, 29, 16, 1);
+        for signed_in in [false, true] {
+            let profile =
+                codex_gateway_profile_on(&gateway, &binding, 57390, Some(wsl), signed_in).unwrap();
+            assert_eq!(
+                profile.base_url, "http://172.29.16.1:57390/gw/codex/v1",
+                "signed_in={signed_in}"
+            );
+            let config = &profile.config_contents;
+            assert!(
+                config.contains("http://172.29.16.1:57390/gw/codex/v1"),
+                "{config}"
+            );
+            assert!(!config.contains("127.0.0.1"), "{config}");
+            assert!(!config.contains("openai_base_url"), "{config}");
+            assert!(config.contains(&binding.token), "{config}");
+        }
+        // 没在 WSL 里：与原来完全一样。
+        for signed_in in [false, true] {
+            assert_eq!(
+                codex_gateway_profile_on(&gateway, &binding, 57390, None, signed_in).unwrap(),
+                codex_gateway_profile(&gateway, &binding, 57390, signed_in).unwrap()
+            );
+        }
+        let loopback = codex_gateway_profile(&gateway, &binding, 57390, false).unwrap();
+        assert_eq!(loopback.base_url, "http://127.0.0.1:57390/gw/codex/v1");
     }
 
     fn direct_relay(id: &str, base_url: &str, model: &str) -> RelayProfile {

@@ -1958,9 +1958,26 @@ fn remove_dictation_helper_receipt_at_for_port(path: &Path, helper_port: u16) {
     }
 }
 
+/// helper 的连接来自哪个监听。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelperListener {
+    /// 本机回环（默认，原有行为）。
+    Loopback,
+    /// Windows 上 WSL 虚拟网卡的额外监听（#2773）：只放行网关路径，见 [`crate::wsl_network`]。
+    Wsl,
+}
+
 async fn handle_helper_connection(
+    stream: tokio::net::TcpStream,
+    remote_addr: Option<SocketAddr>,
+) -> anyhow::Result<()> {
+    handle_helper_connection_on(stream, remote_addr, HelperListener::Loopback).await
+}
+
+pub(crate) async fn handle_helper_connection_on(
     mut stream: tokio::net::TcpStream,
     remote_addr: Option<SocketAddr>,
+    listener: HelperListener,
 ) -> anyhow::Result<()> {
     let request = match read_http_request(&mut stream).await {
         Ok(request) => request,
@@ -2008,6 +2025,19 @@ async fn handle_helper_connection(
         }),
     );
 
+    // WSL 网卡上的监听只服务网关：网关逐个请求校验 token；helper 其它接口（状态、设置、听写、
+    // 不带 token 的本地协议代理）都只给本机回环用，一律拒绝。
+    if listener == HelperListener::Wsl && !crate::wsl_network::wsl_listener_allows(path) {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "status": "forbidden",
+            "message": "WSL 网卡上只开放 Codex++ 网关接口。"
+        }))?;
+        write_http_response(&mut stream, "403 Forbidden", "application/json; charset=utf-8", &body)
+            .await?;
+        log_helper_response("helper.wsl_forbidden", method, path, "403 Forbidden", remote_addr_text);
+        stream.shutdown().await?;
+        return Ok(());
+    }
     // 浏览器里的网页能对 127.0.0.1 发「简单请求」（不触发预检），读不到答复，但请求照样执行、照样计费。
     // Agent 都不带 Origin；带了的模型 / 生图 / 转写请求一律拒绝，免得本地服务被网页拿去用池里的额度。
     if method == "POST"
@@ -3409,6 +3439,73 @@ mod dictation_receipt_tests {
         assert!(path.exists(), "非本端口的凭据必须保留");
         remove_dictation_helper_receipt_at_for_port(&path, 57322);
         assert!(!path.exists());
+    }
+}
+
+/// #2773：WSL 网卡上的额外监听只服务网关，网关照常校验 token。
+#[cfg(test)]
+mod wsl_listener_http_tests {
+    use super::*;
+
+    async fn send_on_wsl_listener(request: String) -> String {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, remote) = listener.accept().await.unwrap();
+            handle_helper_connection_on(stream, Some(remote), HelperListener::Wsl)
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(request.replace("{addr}", &addr.to_string()).as_bytes())
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        server.await.unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[tokio::test]
+    async fn wsl_listener_rejects_non_gateway_endpoints() {
+        for request in [
+            "GET /backend/status HTTP/1.1\r\nHost: {addr}\r\n\r\n",
+            "GET /proxy-status HTTP/1.1\r\nHost: {addr}\r\n\r\n",
+            "POST /settings/set HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 2\r\n\r\n{}",
+            "GET /dictation/status HTTP/1.1\r\nHost: {addr}\r\n\r\n",
+            "POST /v1/responses HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 2\r\n\r\n{}",
+            "GET /v1/models HTTP/1.1\r\nHost: {addr}\r\n\r\n",
+            "POST /gw/../v1/responses HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 2\r\n\r\n{}",
+        ] {
+            let response = send_on_wsl_listener(request.to_string()).await;
+            assert!(
+                response.starts_with("HTTP/1.1 403 Forbidden"),
+                "{request}\n{response}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wsl_listener_passes_gateway_paths_to_token_checked_gateway() {
+        // 预检直接放行（与回环一致），说明网关路径确实交给了网关处理。
+        let response = send_on_wsl_listener(
+            "OPTIONS /gw/codex/v1/responses HTTP/1.1\r\nHost: {addr}\r\n\r\n".to_string(),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 204"), "{response}");
+        // 不带 token 的模型请求：网关没开是 503，开着是 401，绝不会被放行。
+        let response = send_on_wsl_listener(
+            "POST /gw/codex/v1/responses HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"
+                .to_string(),
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 401") || response.starts_with("HTTP/1.1 503"),
+            "{response}"
+        );
     }
 }
 
