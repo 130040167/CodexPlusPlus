@@ -1,4 +1,8 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+static LOGGED_EXPLICIT_CODEX_HOME_PATHS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 pub fn default_codex_home_dir() -> PathBuf {
     let Some(path) = std::env::var_os("CODEX_HOME").map(PathBuf::from) else {
@@ -8,33 +12,45 @@ pub fn default_codex_home_dir() -> PathBuf {
         return default_user_codex_home_dir();
     }
     if !path.is_absolute() {
-        let _ = crate::diagnostic_log::append_diagnostic_log(
+        log_explicit_codex_home_issue_once(
             "codex_home.relative_path_rejected",
-            serde_json::json!({
-                "path": path,
-                "message": "CODEX_HOME must be an absolute path",
-            }),
+            &path,
+            "CODEX_HOME must be an absolute path; the value is ignored and the default directory is used",
         );
         return default_user_codex_home_dir();
     }
     if !path.exists() {
-        let _ = crate::diagnostic_log::append_diagnostic_log(
+        log_explicit_codex_home_issue_once(
             "codex_home.explicit_path_missing",
-            serde_json::json!({
-                "path": path,
-                "message": "显式 CODEX_HOME 不存在，仍保留该路径以避免越过隔离边界回退",
-            }),
+            &path,
+            "显式 CODEX_HOME 不存在，仍保留该路径以避免越过隔离边界回退",
         );
     } else if !path.is_dir() {
-        let _ = crate::diagnostic_log::append_diagnostic_log(
+        log_explicit_codex_home_issue_once(
             "codex_home.explicit_path_not_directory",
-            serde_json::json!({
-                "path": path,
-                "message": "显式 CODEX_HOME 不是目录，仍保留该路径并让后续 I/O 返回明确错误",
-            }),
+            &path,
+            "显式 CODEX_HOME 不是目录，仍保留该路径并让后续 I/O 返回明确错误",
         );
     }
     path
+}
+
+fn log_explicit_codex_home_issue_once(event: &str, path: &Path, message: &str) {
+    let key = path.to_string_lossy().into_owned();
+    let seen = LOGGED_EXPLICIT_CODEX_HOME_PATHS.get_or_init(|| Mutex::new(HashSet::new()));
+    let should_log = seen
+        .lock()
+        .map(|mut paths| paths.insert(key))
+        .unwrap_or(true);
+    if should_log {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            event,
+            serde_json::json!({
+                "path": path,
+                "message": message,
+            }),
+        );
+    }
 }
 
 fn codex_home_env_dir_is_explicit(path: &Path) -> bool {
@@ -382,6 +398,7 @@ mod tests {
         assert!(!missing.exists());
         let log = std::fs::read_to_string(log_path).unwrap();
         assert!(log.contains("codex_home.explicit_path_missing"));
+        assert_eq!(log.lines().count(), 1, "同一显式路径只记录一次");
         crate::diagnostic_log::set_diagnostic_log_path_for_tests(None);
     }
 
