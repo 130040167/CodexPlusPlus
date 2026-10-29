@@ -384,6 +384,131 @@ fn cleanup_stale_transactions(
     Ok(outcomes)
 }
 
+/// 记录本机更新建过的事务目录（JSON 字符串数组），放在 Codex++ 的 state 目录里（#2774 后续）。
+///
+/// 启动 / 下次更新时只清理记下来的这些路径，不再列出 app 所在目录：app 放在「下载 / 桌面 /
+/// 文稿」等受保护目录时，每次启动列目录都可能触发隐私授权提示。
+const TRANSACTION_RECORD_FILE: &str = "macos-update-transactions.json";
+
+/// 同一进程里启动清理（后台线程）与更新开始时的记录读写互斥。
+static TRANSACTION_RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn transaction_record_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(TRANSACTION_RECORD_FILE)
+}
+
+/// 读记录；文件不存在或内容损坏时当作空记录（损坏的记录下次写入时被覆盖）。
+fn read_transaction_record(record: &Path) -> Vec<PathBuf> {
+    fs::read(record)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Vec<PathBuf>>(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// 写记录；记录清空时删掉这一个记录文件，不在 state 目录里留空文件。
+fn write_transaction_record(record: &Path, paths: &[PathBuf]) -> anyhow::Result<()> {
+    if paths.is_empty() {
+        return match fs::remove_file(record) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        };
+    }
+    crate::settings::atomic_write(record, &serde_json::to_vec_pretty(paths)?)
+}
+
+/// 更新开始、建事务目录**之前**把它记下来：中途崩溃留下的目录下次也能按记录清理；
+/// 目录最终没建出来时，下次清理发现路径不存在就从记录里去掉。
+fn record_transaction(record: &Path, transaction: &Path) -> anyhow::Result<()> {
+    let _guard = TRANSACTION_RECORD_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut paths = read_transaction_record(record);
+    if !paths.iter().any(|path| path == transaction) {
+        paths.push(transaction.to_path_buf());
+    }
+    write_transaction_record(record, &paths)
+}
+
+/// 清理记录里的事务目录（不列任何目录）。每个路径仍走 [`remove_transaction`] 的全部安全校验：
+///
+/// - 名字不是「前缀 + UUID」、没有父目录：记录不可信，直接从记录里去掉，不碰文件系统；
+/// - 路径已经不存在（更新成功后 helper 已删掉、或目录没建出来）：从记录里去掉；
+/// - `lock_root` 返回 `None`（该安装目录有更新正在进行）、最近还有改动、校验或删除失败：
+///   保留在记录里，下次再试；
+/// - 删除成功：从记录里去掉。
+///
+/// 返回实际处理过的路径与结果（给调用方写诊断日志）。
+fn cleanup_recorded_transactions<G>(
+    record: &Path,
+    now: SystemTime,
+    mut lock_root: impl FnMut(&Path) -> Option<G>,
+) -> Vec<(PathBuf, Result<(), String>)> {
+    let _guard = TRANSACTION_RECORD_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let recorded = read_transaction_record(record);
+    if recorded.is_empty() {
+        return Vec::new();
+    }
+    let mut kept = Vec::new();
+    let mut outcomes = Vec::new();
+    for transaction in recorded {
+        let root = transaction.parent().filter(|_| {
+            transaction
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_transaction_dir_name)
+        });
+        let Some(root) = root else {
+            outcomes.push((
+                transaction,
+                Err("记录里的路径不是更新事务目录，已从记录中移除".to_string()),
+            ));
+            continue;
+        };
+        if let Err(error) = fs::symlink_metadata(&transaction) {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                continue;
+            }
+            outcomes.push((transaction.clone(), Err(format!("{error:#}"))));
+            kept.push(transaction);
+            continue;
+        }
+        let Some(_lock) = lock_root(root) else {
+            outcomes.push((
+                transaction.clone(),
+                Err("该安装目录有更新正在进行，留待下次清理".to_string()),
+            ));
+            kept.push(transaction);
+            continue;
+        };
+        let result = (|| -> anyhow::Result<()> {
+            let modified = fs::symlink_metadata(&transaction)?.modified()?;
+            if now.duration_since(modified).unwrap_or_default() < STALE_TRANSACTION_MIN_AGE {
+                bail!("更新事务目录最近还有改动，可能仍在使用，留待下次清理");
+            }
+            remove_transaction(root, &transaction)
+        })();
+        if result.is_err() {
+            kept.push(transaction.clone());
+        }
+        outcomes.push((transaction, result.map_err(|error| format!("{error:#}"))));
+    }
+    if let Err(error) = write_transaction_record(record, &kept) {
+        outcomes.push((
+            record.to_path_buf(),
+            Err(format!("更新事务记录写入失败：{error:#}")),
+        ));
+    }
+    outcomes
+}
+
+/// 2.1.2 留下、没有记录过的旧残留，只在标准应用目录（`/Applications`、`~/Applications`）里
+/// 按前缀扫描清理（纯函数）。其他位置（下载、桌面、文稿等）不扫描，避免反复触发隐私授权提示。
+fn legacy_transaction_scan_allowed(root: &Path, home: Option<&Path>) -> bool {
+    root == Path::new("/Applications") || home.is_some_and(|home| root == home.join("Applications"))
+}
+
 #[cfg(target_os = "macos")]
 mod runtime {
     use super::*;
@@ -772,33 +897,26 @@ mod runtime {
         Ok(helper)
     }
 
-    /// 清理安装目录里以前的更新留下的事务目录；只写诊断日志，从不报错。
-    pub(super) fn cleanup_stale(root: &Path) {
+    /// 拿安装目录的更新锁。更新 helper 运行期间一直持有这把锁；拿不到（或锁文件是符号链接）
+    /// 返回 `None`，说明有更新在进行，这次不碰该目录的任何事务目录。
+    /// 锁文件不存在时不创建，免得在安装目录里多留东西。
+    fn lock_install_root(root: &Path) -> Option<Option<File>> {
         let lock_path = root.join(".codex-plus-update.lock");
         if fs::symlink_metadata(&lock_path).is_ok_and(|meta| meta.file_type().is_symlink()) {
-            return;
+            return None;
         }
-        // 更新 helper 运行期间一直持有这把锁；拿不到说明有更新在进行，这次不碰任何事务目录。
-        // 锁文件不存在时不创建，免得在安装目录里多留东西。
-        let _lock = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+        match OpenOptions::new().read(true).write(true).open(&lock_path) {
             Ok(file) => {
                 if fs2::FileExt::try_lock_exclusive(&file).is_err() {
-                    return;
+                    return None;
                 }
-                Some(file)
+                Some(Some(file))
             }
-            Err(_) => None,
-        };
-        let outcomes = match cleanup_stale_transactions(root, std::time::SystemTime::now()) {
-            Ok(outcomes) => outcomes,
-            Err(error) => {
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "update.macos.transaction_cleanup_failed",
-                    serde_json::json!({"installRoot":root,"message":format!("{error:#}")}),
-                );
-                return;
-            }
-        };
+            Err(_) => Some(None),
+        }
+    }
+
+    fn log_cleanup_outcomes(outcomes: Vec<(PathBuf, Result<(), String>)>) {
         for (path, result) in outcomes {
             let (event, message) = match result {
                 Ok(()) => ("update.macos.transaction_cleaned", None),
@@ -808,6 +926,42 @@ mod runtime {
                 event,
                 serde_json::json!({"transaction":path,"message":message}),
             );
+        }
+    }
+
+    fn transaction_record() -> PathBuf {
+        transaction_record_path(&crate::paths::default_app_state_dir())
+    }
+
+    /// 清理以前的更新留下的事务目录；只写诊断日志，从不报错。
+    ///
+    /// 先按 state 目录里的记录清理（不列目录）；`root` 是 `/Applications` 或 `~/Applications`
+    /// 时再按前缀扫描一次，收掉 2.1.2 留下、没有记录的旧残留。
+    pub(super) fn cleanup_stale(root: &Path) {
+        let now = std::time::SystemTime::now();
+        log_cleanup_outcomes(cleanup_recorded_transactions(
+            &transaction_record(),
+            now,
+            lock_install_root,
+        ));
+        let home = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+            .map(|home| fs::canonicalize(&home).unwrap_or(home));
+        if !legacy_transaction_scan_allowed(root, home.as_deref()) {
+            return;
+        }
+        let Some(_lock) = lock_install_root(root) else {
+            return;
+        };
+        match cleanup_stale_transactions(root, now) {
+            Ok(outcomes) => log_cleanup_outcomes(outcomes),
+            Err(error) => {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "update.macos.transaction_cleanup_failed",
+                    serde_json::json!({"installRoot":root,"message":format!("{error:#}")}),
+                );
+            }
         }
     }
 
@@ -835,6 +989,14 @@ mod runtime {
         // 先清掉以前失败 / 中断留下的事务目录，再建本次的。
         cleanup_stale(&root);
         let transaction = root.join(transaction_dir_name(uuid::Uuid::new_v4()));
+        // 先记下再建目录，之后启动 / 下次更新只按记录清理，不必列出 app 所在目录。
+        // 记录失败不挡更新：成功后 helper 仍会删掉事务目录，只是中断时的残留要手动清。
+        if let Err(error) = record_transaction(&transaction_record(), &transaction) {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "update.macos.transaction_record_failed",
+                serde_json::json!({"transaction":transaction,"message":format!("{error:#}")}),
+            );
+        }
         fs::create_dir(&transaction)
             .context("安装目录不可写；未请求提升权限，请在可写位置手动安装完整 app")?;
         fs::set_permissions(&transaction, fs::Permissions::from_mode(0o700))?;
@@ -1810,6 +1972,130 @@ mod tests {
                 .join("Contents/Info.plist")
                 .is_file()
         );
+    }
+
+    #[test]
+    fn macos_update_recorded_cleanup_only_touches_recorded_transactions() {
+        let (temp, plan, _payload) = completed_fixture();
+        let root = plan.install_root.clone();
+        let record = transaction_record_path(&temp.path().join("state"));
+        // 2.1.2 留下、没有记录过的残留：按记录清理时不列目录，也就不会碰到它。
+        let (_other_temp, unrecorded, _) = completed_fixture();
+        let unrecorded_in_root = root.join(transaction_dir_name(uuid::Uuid::new_v4()));
+        fs::rename(&unrecorded.transaction, &unrecorded_in_root).unwrap();
+        // 目录最终没建出来的记录、被篡改成非事务路径的记录。
+        let never_created = root.join(transaction_dir_name(uuid::Uuid::new_v4()));
+        let outside = temp.path().join("外部用户数据");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), "keep").unwrap();
+        for path in [&plan.transaction, &never_created, &outside] {
+            record_transaction(&record, path).unwrap();
+        }
+        // 重复记录同一路径只留一条。
+        record_transaction(&record, &plan.transaction).unwrap();
+        assert_eq!(read_transaction_record(&record).len(), 3);
+
+        let mut locked_roots = Vec::new();
+        let outcomes = cleanup_recorded_transactions(&record, later(), |root: &Path| {
+            locked_roots.push(root.to_path_buf());
+            Some(())
+        });
+
+        assert!(!plan.transaction.exists());
+        assert!(unrecorded_in_root.exists());
+        assert!(outside.join("keep").is_file());
+        assert_eq!(locked_roots, vec![root.clone()]);
+        let removed: Vec<_> = outcomes
+            .iter()
+            .filter(|(_, result)| result.is_ok())
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(removed, vec![plan.transaction.clone()]);
+        // 全部处理完：记录文件删掉，不在 state 目录留空文件。
+        assert!(!record.exists());
+        assert!(cleanup_recorded_transactions(&record, later(), |_| Some(())).is_empty());
+    }
+
+    #[test]
+    fn macos_update_recorded_cleanup_keeps_busy_recent_and_unsafe_entries() {
+        let (temp, plan, _payload) = completed_fixture();
+        let record = transaction_record_path(&temp.path().join("state"));
+        record_transaction(&record, &plan.transaction).unwrap();
+        // 安装目录有更新正在进行：不碰，留在记录里。
+        let outcomes = cleanup_recorded_transactions(&record, later(), |_| None::<()>);
+        assert!(outcomes[0].1.as_ref().unwrap_err().contains("正在进行"));
+        assert!(plan.transaction.exists());
+        // 最近还有改动：不碰，留在记录里。
+        let outcomes = cleanup_recorded_transactions(&record, SystemTime::now(), |_| Some(()));
+        assert!(outcomes[0].1.as_ref().unwrap_err().contains("最近"));
+        assert!(plan.transaction.exists());
+        // 混进了非更新内容：安全校验拒绝，留在记录里。
+        fs::write(plan.transaction.join("用户笔记.txt"), "not ours").unwrap();
+        let outcomes = cleanup_recorded_transactions(&record, later(), |_| Some(()));
+        assert!(
+            outcomes[0]
+                .1
+                .as_ref()
+                .unwrap_err()
+                .contains("非更新暂存内容")
+        );
+        assert!(plan.transaction.join("用户笔记.txt").is_file());
+        assert_eq!(
+            read_transaction_record(&record),
+            vec![plan.transaction.clone()]
+        );
+        // 校验通过后照常删除并清空记录。
+        fs::remove_file(plan.transaction.join("用户笔记.txt")).unwrap();
+        let outcomes = cleanup_recorded_transactions(&record, later(), |_| Some(()));
+        assert!(outcomes[0].1.is_ok());
+        assert!(!plan.transaction.exists());
+        assert!(!record.exists());
+    }
+
+    #[test]
+    fn macos_update_corrupt_record_is_treated_as_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let record = transaction_record_path(temp.path());
+        fs::write(&record, "not json").unwrap();
+        assert!(read_transaction_record(&record).is_empty());
+        let transaction = temp.path().join(transaction_dir_name(uuid::Uuid::new_v4()));
+        record_transaction(&record, &transaction).unwrap();
+        assert_eq!(read_transaction_record(&record), vec![transaction]);
+    }
+
+    #[test]
+    fn macos_update_legacy_scan_only_in_standard_applications_dirs() {
+        let home = Path::new("/Users/me");
+        assert!(legacy_transaction_scan_allowed(
+            Path::new("/Applications"),
+            Some(home)
+        ));
+        assert!(legacy_transaction_scan_allowed(
+            Path::new("/Applications"),
+            None
+        ));
+        assert!(legacy_transaction_scan_allowed(
+            Path::new("/Users/me/Applications"),
+            Some(home)
+        ));
+        for root in [
+            "/Users/me/Downloads",
+            "/Users/me/Desktop",
+            "/Users/me/Documents",
+            "/Users/me/Applications/Tools",
+            "/Applications/Utilities",
+            "/Users/other/Applications",
+            "/",
+        ] {
+            assert!(
+                !legacy_transaction_scan_allowed(Path::new(root), Some(home)),
+                "{root}"
+            );
+        }
+        assert!(!legacy_transaction_scan_allowed(
+            Path::new("/Users/me/Applications"),
+            None
+        ));
     }
 
     #[test]
