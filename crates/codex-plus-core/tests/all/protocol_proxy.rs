@@ -8472,6 +8472,9 @@ async fn retry_budget_exhausted_commits_without_waiting_grace() {
             .write_all(proxy_sse_response(&first_attempt_failure).as_bytes())
             .await
             .unwrap();
+        // 这个假上游每条连接只答一次：答完就关，否则上游 client 复用连接（#2761）
+        // 会把重试发到这条不再读请求的连接上。
+        drop(stream);
         // 第二次尝试：写出首段正文后挂住连接。
         let (mut stream, _) = listener.accept().await.unwrap();
         let _ = read_http_request(&mut stream).await;

@@ -1959,6 +1959,25 @@ pub async fn send_upstream_request_for_responses(
     send_upstream_request_with_header_timeout(request, timeout).await
 }
 
+/// 连接在收到任何响应字节前就被对端关闭（hyper 的 IncompleteMessage）。
+/// hyper 不是直接依赖，按错误链里的固定文案识别。
+fn is_closed_before_response(error: &reqwest::Error) -> bool {
+    if error.is_connect() || error.is_timeout() || error.is_status() {
+        return false;
+    }
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if current
+            .to_string()
+            .contains("connection closed before message completed")
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
 pub async fn send_upstream_request_with_header_timeout(
     request: reqwest::RequestBuilder,
     timeout: Duration,
@@ -1967,11 +1986,27 @@ pub async fn send_upstream_request_with_header_timeout(
     let retry_source = request.try_clone();
     let mut pending = Some(request);
     let mut retries = 0_usize;
+    let mut stale_connection_retried = false;
     loop {
         let builder = pending.take().expect("upstream request builder missing");
         match tokio::time::timeout(timeout, builder.send()).await {
             Ok(Ok(response)) => return Ok(response),
             Ok(Err(error)) => {
+                // 上游 client 复用连接（#2761）后，空闲连接可能刚被对端关掉、本地还没察觉：
+                // 请求写出去后连一个响应字节都没收到就断了。对端没回应，换新连接立即重发一次，
+                // 与浏览器对复用连接的处理一致；只重发一次，再断就照常报错。
+                if !stale_connection_retried
+                    && is_closed_before_response(&error)
+                    && let Some(retry) = retry_source.as_ref().and_then(|source| source.try_clone())
+                {
+                    stale_connection_retried = true;
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "protocol_proxy.upstream_stale_connection_retry",
+                        json!({ "error": error_chain(&anyhow::Error::new(error)) }),
+                    );
+                    pending = Some(retry);
+                    continue;
+                }
                 // 只重试连接/TLS 握手失败：此时请求体尚未送达上游，重试是幂等的。
                 // 超时和其它错误可能已经在上游产生副作用，原样返回。
                 let retry_delay = error

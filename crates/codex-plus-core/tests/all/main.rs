@@ -103,6 +103,7 @@ mod typing_effect_settings;
 mod ui_issue_regressions;
 mod update_reminder_settings;
 mod updater;
+mod upstream_connection_reuse;
 mod upstream_theme_assets;
 mod upstream_worktree;
 mod usage_status_line_settings;

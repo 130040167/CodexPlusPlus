@@ -1,0 +1,216 @@
+//! 网关 / 协议代理转发上游时复用连接（#2761）：连续请求同一供应商只建一次 TCP 连接，
+//! 供应商的代理设置变了就换新的 client，不会沿用旧代理。
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use codex_plus_core::protocol_proxy::{
+    ForcedRelay, ProxySessionHeaders, open_responses_proxy_request_for_relay,
+};
+use codex_plus_core::settings::{BackendSettings, RelayMode, RelayProfile, RelayProtocol};
+use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+fn chat_completion() -> String {
+    json!({
+        "id": "c", "object": "chat.completion", "model": "m",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }]
+    })
+    .to_string()
+}
+
+/// 读一个完整的 HTTP/1.1 请求（头 + content-length 的体），连接已关时返回 None。
+async fn read_request(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Option<String> {
+    let mut chunk = [0_u8; 8192];
+    let (end, length) = loop {
+        if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buffer[..end]).to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            break (end + 4, length);
+        }
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    };
+    while buffer.len() < end + length {
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+    let head = String::from_utf8_lossy(&buffer[..end]).into_owned();
+    buffer.drain(..end + length);
+    Some(head)
+}
+
+/// 支持 keep-alive 的假上游：每条连接上可以连续回多个请求。
+/// `accepts` 记建立了几条 TCP 连接，`request_lines` 记收到的请求行。
+/// `drop_request` 为 Some(n) 时，第 n 个请求（从 1 数）读完后不回应、直接关连接，
+/// 模拟空闲连接刚被对端关掉。
+struct MockUpstream {
+    addr: std::net::SocketAddr,
+    accepts: Arc<AtomicUsize>,
+    request_lines: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+async fn mock_upstream(drop_request: Option<usize>) -> MockUpstream {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let request_lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (counter, lines) = (accepts.clone(), request_lines.clone());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            counter.fetch_add(1, Ordering::SeqCst);
+            let lines = lines.clone();
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                while let Some(head) = read_request(&mut stream, &mut buffer).await {
+                    let seen = {
+                        let mut lines = lines.lock().unwrap();
+                        lines.push(head.lines().next().unwrap_or_default().to_string());
+                        lines.len()
+                    };
+                    if drop_request == Some(seen) {
+                        return;
+                    }
+                    let body = chat_completion();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    if stream.write_all(response.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    MockUpstream {
+        addr,
+        accepts,
+        request_lines,
+    }
+}
+
+fn relay(id: &str, base_url: String, proxy: &str) -> RelayProfile {
+    RelayProfile {
+        id: id.into(),
+        name: id.into(),
+        relay_mode: RelayMode::PureApi,
+        protocol: RelayProtocol::ChatCompletions,
+        base_url,
+        api_key: format!("sk-{id}"),
+        model_list: "m".into(),
+        // 网关供应商自己的代理设置：测试里固定，不受本机系统代理影响。
+        gateway_proxy: Some(proxy.into()),
+        ..RelayProfile::default()
+    }
+}
+
+async fn send_once(relay: &RelayProfile, user_agent: Option<&str>) {
+    let body = json!({ "model": "m", "input": "hi" }).to_string();
+    let mut response = open_responses_proxy_request_for_relay(
+        &body,
+        BackendSettings::default(),
+        ForcedRelay {
+            relay: relay.clone(),
+            upstream_model: None,
+            auto_retry: false,
+        },
+        user_agent,
+        "/responses",
+        ProxySessionHeaders::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status_code, 200);
+    // 读完响应体，连接才会回到连接池。
+    response.read_body().await.unwrap();
+}
+
+#[tokio::test]
+async fn consecutive_requests_to_same_relay_reuse_one_connection() {
+    let upstream = mock_upstream(None).await;
+    let relay = relay(
+        "reuse-2761",
+        format!("http://{}/v1", upstream.addr),
+        "direct",
+    );
+    for _ in 0..5 {
+        send_once(&relay, Some("Codex Desktop/0.165.0")).await;
+    }
+    assert_eq!(upstream.request_lines.lock().unwrap().len(), 5);
+    assert_eq!(
+        upstream.accepts.load(Ordering::SeqCst),
+        1,
+        "连续请求同一供应商应复用同一条连接，不该每次重新握手"
+    );
+}
+
+#[tokio::test]
+async fn changing_relay_proxy_switches_to_new_client() {
+    // 两个假代理：HTTP 代理收到的是绝对地址的请求行。上游用不可解析的域名，
+    // 请求只能经代理到达；回环地址默认不走代理，所以这里不能用 127.0.0.1。
+    let first = mock_upstream(None).await;
+    let second = mock_upstream(None).await;
+    let base = "http://upstream-2761.invalid/v1".to_string();
+    let mut relay = relay("proxy-2761", base, &format!("http://{}", first.addr));
+    send_once(&relay, None).await;
+    send_once(&relay, None).await;
+    relay.gateway_proxy = Some(format!("http://{}", second.addr));
+    send_once(&relay, None).await;
+
+    let first_lines = first.request_lines.lock().unwrap().clone();
+    let second_lines = second.request_lines.lock().unwrap().clone();
+    assert_eq!(
+        first_lines.len(),
+        2,
+        "改代理前的请求走第一个代理：{first_lines:?}"
+    );
+    assert_eq!(
+        second_lines.len(),
+        1,
+        "改代理后必须换用新代理：{second_lines:?}"
+    );
+    assert!(
+        second_lines[0].contains("http://upstream-2761.invalid/v1/chat/completions"),
+        "{second_lines:?}"
+    );
+    assert_eq!(
+        first.accepts.load(Ordering::SeqCst),
+        1,
+        "同一代理设置复用连接"
+    );
+}
+
+#[tokio::test]
+async fn request_on_connection_closed_by_upstream_is_resent_once() {
+    // 第 2 个请求落在复用的连接上，对端读完不回应就关了：换新连接重发，调用方无感。
+    let upstream = mock_upstream(Some(2)).await;
+    let relay = relay(
+        "stale-2761",
+        format!("http://{}/v1", upstream.addr),
+        "direct",
+    );
+    send_once(&relay, None).await;
+    send_once(&relay, None).await;
+    assert_eq!(
+        upstream.request_lines.lock().unwrap().len(),
+        3,
+        "被丢掉的请求重发了一次"
+    );
+    assert_eq!(upstream.accepts.load(Ordering::SeqCst), 2);
+}
