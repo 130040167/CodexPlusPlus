@@ -543,8 +543,7 @@ async fn resolve_official_credential_with(
     let token_url = token_url_override
         .map(str::to_string)
         .unwrap_or_else(oauth_token_url);
-    // token 刷新属于这个供应商：按它自己的代理设置发，没开系统代理时也能刷新（#2775）。
-    let proxy = crate::relay_proxy::proxy_for_relay(profile);
+    let proxy = token_refresh_proxy(profile);
     let proxy = proxy.as_deref();
     let refreshed = match refresh_codex_tokens(&token_url, &login.refresh_token, proxy).await {
         Ok(tokens) => tokens,
@@ -614,6 +613,15 @@ fn current_auth_contents(store: &SettingsStore, profile_id: &str) -> Option<Stri
         .iter()
         .find(|profile| profile.id == profile_id)
         .map(|profile| profile.auth_contents.clone())
+}
+
+/// 官方登录 token 刷新用的代理。网关供应商（`gateway_proxy` 为 Some）的刷新属于这个供应商，
+/// 按它自己的代理设置发，没开系统代理时也能刷新（#2775）。直连模式的纯官方登录不走独立代理
+/// （与 [`RelayProfile::uses_independent_proxy`] 一致），不读残留的按 id 代理表或
+/// `CODEX_PLUS_PROXY`，保持原来的 reqwest 默认行为（系统代理 / 代理环境变量）。
+fn token_refresh_proxy(profile: &RelayProfile) -> Option<String> {
+    profile.gateway_proxy.as_ref()?;
+    crate::relay_proxy::proxy_for_relay(profile)
 }
 
 async fn refresh_codex_tokens(
@@ -833,6 +841,33 @@ mod tests {
             auth_contents: auth_contents.to_string(),
             ..RelayProfile::default()
         }
+    }
+
+    /// 直连模式的纯官方登录：即使按 id 代理表里残留了这个供应商的代理，token 刷新也不套用；
+    /// 网关供应商才按它自己的代理设置（含「直连」）刷新。
+    #[test]
+    fn token_refresh_proxy_applies_only_to_gateway_providers() {
+        let temp = tempfile::tempdir().unwrap();
+        let _scope = crate::relay_proxy::ProxyPathTestScope::new(temp.path());
+        crate::relay_proxy::set_proxy_for_profile("official", "http://127.0.0.1:9").unwrap();
+        let mut profile = official_profile("{}");
+        assert_eq!(
+            crate::relay_proxy::configured_proxy_for_profile("official").as_deref(),
+            Some("http://127.0.0.1:9")
+        );
+        assert!(!profile.uses_independent_proxy());
+        assert_eq!(token_refresh_proxy(&profile), None);
+
+        profile.gateway_proxy = Some("http://127.0.0.1:8".to_string());
+        assert_eq!(
+            token_refresh_proxy(&profile).as_deref(),
+            Some("http://127.0.0.1:8")
+        );
+        profile.gateway_proxy = Some(crate::relay_proxy::DIRECT_PROXY.to_string());
+        assert_eq!(
+            token_refresh_proxy(&profile).as_deref(),
+            Some(crate::relay_proxy::DIRECT_PROXY)
+        );
     }
 
     #[test]
