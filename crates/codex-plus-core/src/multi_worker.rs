@@ -24,6 +24,7 @@ pub struct CodexInstanceIdentity {
     pub executable: PathBuf,
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 fn valid_stop_identity(identity: &CodexInstanceIdentity) -> bool {
     !identity.instance_id.trim().is_empty()
         && identity.generation != 0
@@ -37,6 +38,7 @@ fn valid_stop_identity(identity: &CodexInstanceIdentity) -> bool {
         && identity.executable.is_absolute()
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 fn record_stop_verification_failure(
     identity: &CodexInstanceIdentity,
     result: &anyhow::Result<bool>,
