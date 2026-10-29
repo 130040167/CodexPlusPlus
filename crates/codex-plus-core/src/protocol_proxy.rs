@@ -274,6 +274,15 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 const UPSTREAM_IMAGE_HEADER_TIMEOUT: Duration = Duration::from_secs(600);
+/// 压缩请求、以及发给 Codex++ 网关的请求等响应头的上限（#2759）。
+///
+/// - 原生压缩要整段读完、确认拿到 checkpoint 才回响应头，大上下文压缩常超过两分钟；
+/// - Codex 登录 ChatGPT 时请求先到本地代理、再转给网关：网关这一跳自己也会等上游响应头、
+///   并按住推理阶段等首段可见输出（各最多 120 秒），压缩时整段读完才回响应头。
+///
+/// 按流式的 120 秒等，会把本来正常的长推理和压缩判成超时（502），Codex 每两分钟重连一次。
+/// 网关那一跳有自己的超时与换家，这里只兜底真正卡死的连接。
+const UPSTREAM_SLOW_HEADER_TIMEOUT: Duration = Duration::from_secs(600);
 /// 连接/TLS 握手阶段的失败发生在请求送达上游之前，可以安全重试。
 /// 系统代理抖动时（如 `client error (Connect): tls handshake eof`）直接返回 502
 /// 会让采样/压缩无故失败，两次短退避能把大部分瞬时故障挡在本地。
@@ -3636,7 +3645,10 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let header_timeout = response_header_timeout(is_stream);
+        // Codex 托管的网关供应商：这一跳的上游就是本机网关，它自己按候选控制超时。
+        let via_gateway = relay.id == crate::gateway::apply::CODEX_GATEWAY_RELAY_ID;
+        let header_timeout =
+            responses_request_header_timeout(is_stream, is_compaction_request, via_gateway);
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "protocol_proxy.upstream_request",
             json!({
@@ -3689,6 +3701,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             send_responses_upstream_request(
                 &relay, &endpoint, &upstream_body, wire_api, is_stream,
                 original_user_agent, beta_features, session_headers, official_credential.as_ref(),
+                header_timeout,
             ).await
         };
         let mut upstream = match send.await {
@@ -3769,6 +3782,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         beta_features,
                         session_headers,
                         official_credential.as_ref(),
+                        header_timeout,
                     )
                         .await
                     };
@@ -3838,6 +3852,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     upstream = send_responses_upstream_request(
                         &relay, &endpoint, &adapted, wire_api, is_stream,
                         original_user_agent, beta_features, session_headers, official_credential.as_ref(),
+                        header_timeout,
                     ).await?;
                 }
                 Ok::<_, anyhow::Error>(upstream)
@@ -4085,6 +4100,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 beta_features,
                 session_headers,
                 official_credential.as_ref(),
+                header_timeout,
             )
             .await
             {
@@ -4982,6 +4998,16 @@ fn response_header_timeout(is_stream: bool) -> Duration {
     }
 }
 
+/// Responses 代理一次上游请求等响应头的上限：压缩请求、发给 Codex++ 网关的请求放宽到
+/// [`UPSTREAM_SLOW_HEADER_TIMEOUT`]，其余按是否流式。
+fn responses_request_header_timeout(is_stream: bool, compaction: bool, via_gateway: bool) -> Duration {
+    if compaction || via_gateway {
+        UPSTREAM_SLOW_HEADER_TIMEOUT
+    } else {
+        response_header_timeout(is_stream)
+    }
+}
+
 pub async fn open_chat_completions_proxy_request(
     body: &str,
     original_user_agent: Option<&str>,
@@ -5425,12 +5451,13 @@ async fn send_responses_upstream_request(
     beta_features: Option<&str>,
     session_headers: ProxySessionHeaders<'_>,
     official_credential: Option<&crate::official_login::OfficialCredential>,
+    header_timeout: Duration,
 ) -> anyhow::Result<reqwest::Response> {
     let builder = build_responses_upstream_request(
         relay, endpoint, upstream_body, wire_api, is_stream,
         original_user_agent, beta_features, session_headers, official_credential,
     )?;
-    send_upstream_request_for_responses(builder, is_stream).await
+    send_upstream_request_with_header_timeout(builder, header_timeout).await
 }
 
 fn build_responses_upstream_request(
