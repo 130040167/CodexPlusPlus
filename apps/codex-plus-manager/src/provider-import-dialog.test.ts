@@ -16,5 +16,6 @@ test("pending provider import is confirmed and dismissed with the fingerprint sh
 test("pool imports warn that the provider starts serving requests right away", () => {
   const dialog = app.slice(app.indexOf("function PendingProviderImportDialog("), app.indexOf("function DreamSkinCommunityLinkDialog("));
   assert.ok(dialog.includes("「添加供应商时自动加入」"), "pool import hint should name the auto-join setting");
-  assert.ok(dialog.includes("{toPool ? (\n          <div className=\"hint-line\""), "hint is only shown for pool imports");
+  // Windows 检出是 CRLF 行尾，按 \r?\n 匹配。
+  assert.match(dialog, /\{toPool \? \(\r?\n\s*<div className="hint-line"/, "hint is only shown for pool imports");
 });
