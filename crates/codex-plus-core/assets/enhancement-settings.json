@@ -231,6 +231,14 @@
       "surfaces": ["manager", "codex"]
     },
     {
+      "key": "codexAppHistoryTurnRecovery",
+      "group": "chat",
+      "control": "bool",
+      "title": "历史轮次补载（实验）",
+      "description": "索引检查后补齐当前会话的历史消息和用时，默认关闭。",
+      "surfaces": ["manager", "codex"]
+    },
+    {
       "key": "codexAppUsageStatusLine",
       "group": "chat",
       "control": "bool",

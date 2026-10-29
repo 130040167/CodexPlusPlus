@@ -786,6 +786,14 @@ export const EN_PLAIN: Record<string, string> = {
   "检查次数：": "Checks: ",
   "修复已中止：": "Repair aborted: ",
   "修复警告：": "Repair warning: ",
+  "历史轮次补载：": "History turn recovery: ",
+  "后台补载中": "Recovering in background",
+  "部分完成": "Partially completed",
+  "已完成": "Completed",
+  "不可用": "Unavailable",
+  "已跳过": "Skipped",
+  "消息页": "Message pages",
+  "元数据页": "Metadata pages",
   "启动前整理会话归属并检查缺失消息；运行期间每 30 分钟复查索引。保存设置后生效。":
     "Repair session ownership and check for missing messages before launch; recheck the index every 30 minutes while running. Save settings to apply.",
   "自动检查需要从此界面启动 Codex，并保持 Codex++ 运行，且自动修复开关已开启并保存；每次检查完成后间隔 30 分钟复查。此页面每 15 秒刷新报告，不会单独启动修复；再次检查不保证恢复。":
@@ -1738,6 +1746,8 @@ export const EN_PLAIN: Record<string, string> = {
   "切换到浅色": "Switch to light",
   "切换到深色": "Switch to dark",
   "切换对话保留位置": "Preserve scroll position across threads",
+  "历史轮次补载（实验）": "Historical turn recovery (experimental)",
+  "索引检查后补齐当前会话的历史消息和用时，默认关闭。": "Recover historical messages and timing in the current conversation after an index check. Off by default.",
   "用量状态栏": "Usage status line",
   "在输入框下方显示输出吞吐、缓存命中率和上下文占用。数据来自本机 Codex 会话记录，不改变请求内容。": "Show output throughput, cache hit rate, and context usage below the composer. Read from local Codex session logs; requests are not modified.",
   "点击建议后自动发送；关闭时只填入输入框。": "Automatically sends after clicking a suggestion. When off, it only fills the composer.",

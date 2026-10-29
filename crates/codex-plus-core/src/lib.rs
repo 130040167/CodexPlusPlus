@@ -40,6 +40,7 @@ pub mod env_conflicts;
 pub mod gateway;
 pub mod grok_config;
 pub mod global_dictation;
+pub mod history_turn_recovery;
 pub mod http_client;
 pub mod install;
 pub mod launcher;
