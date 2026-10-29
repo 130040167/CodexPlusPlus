@@ -2999,6 +2999,9 @@ pub(crate) async fn handle_protocol_proxy_connection(
         {
             let mut converter =
                 crate::responses_exec_sse::ExecSseAdapter::for_adaptation(upstream.tool_adaptation());
+            // exec 兼容链路不经过 ResponsesSseTransformer，阶段标记要在它的输出上单独补（#2761）。
+            let mut phase = (crate::protocol_proxy::message_phase_fill_enabled() && !foreign_client)
+                .then(crate::protocol_proxy::ResponsesSseTransformer::phase_fill_only);
             let mut bytes_stream = upstream.take_response()?.bytes_stream();
             while let Some(chunk) = bytes_stream.next().await {
                 let converted = match chunk {
@@ -3008,12 +3011,21 @@ pub(crate) async fn handle_protocol_proxy_connection(
                     },
                     Err(_) => converter.fail(),
                 };
+                let converted = match phase.as_mut() {
+                    Some(phase) => phase.push_bytes(&converted),
+                    None => converted,
+                };
                 stream.write_all(&converted).await?;
                 if converter.is_complete() {
                     break;
                 }
             }
-            stream.write_all(&converter.finish()?).await?;
+            let mut tail = converter.finish()?;
+            if let Some(phase) = phase.as_mut() {
+                tail = phase.push_bytes(&tail);
+                tail.extend(phase.flush_pending());
+            }
+            stream.write_all(&tail).await?;
             let exec_succeeded = converter.succeeded();
             if let Some(outcome) = upstream.exec_outcome.as_mut() {
                 outcome.finish(exec_succeeded);
