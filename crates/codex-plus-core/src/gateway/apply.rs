@@ -14,10 +14,11 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::gateway::drift::{self, Drift};
+use crate::gateway::key_pool;
 use crate::gateway::restore::{self as stash, ChangedKey, FileStash, KeyPath};
 use crate::gateway::route::{self, binding_default_model};
 use crate::gateway::store::{
@@ -2748,6 +2749,12 @@ fn update_provider_in(
     }
     let mut relay = build_relay(&input)?;
     relay.id = id.to_string();
+    // 沿用原来的 Key 时连标识一起沿用：Key 池按标识记的冷却、会话固定不会错位到别的 Key 上（#2782）。
+    if keep_keys && !provider.relay.api_keys.is_empty() {
+        relay.api_keys = provider.relay.api_keys.clone();
+        relay.active_api_key_id = provider.relay.active_api_key_id.clone();
+        relay.api_key = provider.relay.api_key.clone();
+    }
     // 原来的请求头、User-Agent、Anthropic 鉴权方式这些高级设置保留。
     relay.custom_headers = provider.relay.custom_headers.clone();
     relay.user_agent = provider.relay.user_agent.clone();
@@ -2767,6 +2774,206 @@ fn update_provider_in(
         provider.proxy = clean_proxy(proxy)?;
     }
     Ok(())
+}
+
+/// 供应商详情里列出的一个已保存 Key（#2782）：只有标识和打码后的样子，Key 原文不出后端。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderKeyView {
+    /// 稳定标识：命名 Key 的 id（单 Key 供应商通常是 `default`），删除 / 替换按它找。
+    pub id: String,
+    /// 打码后的 Key，如 `sk-abc…wxyz`。
+    pub masked: String,
+}
+
+/// Key 打码：只露头尾，露出的总长不超过 Key 的三分之一左右。
+/// 长 Key 露前 6 位和后 4 位；短 Key 按长度少露，4 位及以下一个字符都不露。
+pub fn mask_api_key(key: &str) -> String {
+    let chars: Vec<char> = key.trim().chars().collect();
+    let head = (chars.len() / 5).min(6);
+    let tail = (chars.len() / 8).min(4);
+    if head == 0 {
+        return "••••".to_string();
+    }
+    let start: String = chars[..head].iter().collect();
+    let end: String = chars[chars.len() - tail..].iter().collect();
+    format!("{start}…{end}")
+}
+
+/// 能在界面上单独管理 API Key 的供应商。订阅账号（凭据是登录得到的 token）、官方登录、
+/// 聚合、不校验 Key 的本机服务都不列 Key。
+fn manages_api_keys(relay: &RelayProfile) -> bool {
+    !crate::official_login::member_uses_official_login_transport(relay)
+        && crate::gateway::accounts::relay_account_kind(relay).is_none()
+        && (relay.relay_mode != RelayMode::Official || relay.official_mix_api_key)
+        && relay.relay_mode != RelayMode::Aggregate
+        && !relay.uses_no_auth()
+}
+
+/// 单 Key 供应商的 Key 有时只在 `api_key` 里（旧数据）：补成一个命名 Key，后面统一按标识操作。
+const DEFAULT_KEY_ID: &str = "default";
+
+fn ensure_named_keys(relay: &mut RelayProfile) {
+    if relay.api_keys.is_empty() && !relay.api_key.trim().is_empty() {
+        relay.api_keys.push(RelayApiKey {
+            id: DEFAULT_KEY_ID.to_string(),
+            name: "默认".to_string(),
+            api_key: relay.api_key.trim().to_string(),
+        });
+        relay.active_api_key_id = DEFAULT_KEY_ID.to_string();
+    }
+}
+
+/// 供应商已保存的 Key（打码后），按保存顺序。不管 Key 的供应商返回空列表。
+pub fn provider_keys(relay: &RelayProfile) -> Vec<ProviderKeyView> {
+    if !manages_api_keys(relay) {
+        return Vec::new();
+    }
+    let mut relay = relay.clone();
+    ensure_named_keys(&mut relay);
+    relay
+        .api_keys
+        .iter()
+        .filter(|entry| !entry.api_key.trim().is_empty())
+        .map(|entry| ProviderKeyView {
+            id: entry.id.clone(),
+            masked: mask_api_key(&entry.api_key),
+        })
+        .collect()
+}
+
+/// 新填的 Key：去掉首尾空白，不能为空、不能夹空白（多半是一次粘了好几个）。
+fn clean_new_key(key: &str) -> anyhow::Result<String> {
+    let key = key.trim();
+    if key.is_empty() {
+        bail!("API Key 为空");
+    }
+    if key.chars().any(char::is_whitespace) {
+        bail!("Key 里不能有空格或换行，多个 Key 请逐个添加");
+    }
+    Ok(key.to_string())
+}
+
+/// 找到要改 Key 的供应商；订阅账号这类不用 Key 的报错。
+fn keyed_relay_mut<'a>(
+    gateway: &'a mut GatewaySettings,
+    id: &str,
+) -> anyhow::Result<&'a mut RelayProfile> {
+    let Some(provider) = gateway
+        .providers
+        .iter_mut()
+        .find(|provider| provider.relay.id == id)
+    else {
+        bail!("供应商不存在：{id}");
+    };
+    if !manages_api_keys(&provider.relay) {
+        bail!("这个供应商不用 API Key（订阅账号请重新登录）");
+    }
+    ensure_named_keys(&mut provider.relay);
+    Ok(&mut provider.relay)
+}
+
+/// 改完 Key 后整理：当前选中的 Key 被删时换成第一个，`api_key` 跟上，导入时带的 auth / config 文本同步。
+fn finish_key_edit(relay: &mut RelayProfile) -> anyhow::Result<()> {
+    crate::relay_config::normalize_relay_profile_for_storage(relay)?;
+    crate::relay_config::sync_stored_api_key(relay)
+}
+
+/// 给供应商再加一个 Key（#2782）。新 Key 的标识不和现有的重复。返回刷新后的网关状态。
+pub fn add_provider_key(
+    store: &GatewayStore,
+    id: &str,
+    key: &str,
+) -> anyhow::Result<GatewaySettings> {
+    let key = clean_new_key(key)?;
+    let (_, key_id) = store.update(|gateway| {
+        let relay = keyed_relay_mut(gateway, id)?;
+        if relay
+            .api_keys
+            .iter()
+            .any(|entry| entry.api_key.trim() == key)
+        {
+            bail!("这个 Key 已经在列表里了");
+        }
+        let number = (relay.api_keys.len() + 1..)
+            .find(|number| {
+                let candidate = format!("key-{number}");
+                !relay.api_keys.iter().any(|entry| entry.id == candidate)
+            })
+            .unwrap_or_default();
+        let key_id = format!("key-{number}");
+        relay.api_keys.push(RelayApiKey {
+            id: key_id.clone(),
+            name: format!("Key {number}"),
+            api_key: key,
+        });
+        finish_key_edit(relay)?;
+        Ok(key_id)
+    })?;
+    // 新标识按理没有旧状态；万一和早先删掉的 Key 同名，也不继承它的冷却。
+    key_pool::forget_key(id, &key_id);
+    store.load()
+}
+
+/// 把某个 Key 换成新值（#2782），标识不变。这个 Key 的冷却、停用、限速计数和会话固定一并清掉。
+pub fn replace_provider_key(
+    store: &GatewayStore,
+    id: &str,
+    key_id: &str,
+    key: &str,
+) -> anyhow::Result<GatewaySettings> {
+    let key = clean_new_key(key)?;
+    store.update(|gateway| {
+        let relay = keyed_relay_mut(gateway, id)?;
+        if relay
+            .api_keys
+            .iter()
+            .any(|entry| entry.id != key_id && entry.api_key.trim() == key)
+        {
+            bail!("这个 Key 已经在列表里了");
+        }
+        let Some(entry) = relay.api_keys.iter_mut().find(|entry| entry.id == key_id) else {
+            bail!("这个 Key 已经不在了，刷新后再试");
+        };
+        entry.api_key = key;
+        finish_key_edit(relay)
+    })?;
+    forget_key_state(id, key_id);
+    store.load()
+}
+
+/// 删掉某个 Key（#2782）。至少要留一个：最后一个只能替换，不能删。
+/// 删的是当前选中的 Key 时改选第一个；固定到它的会话下次重新选 Key。
+pub fn delete_provider_key(
+    store: &GatewayStore,
+    id: &str,
+    key_id: &str,
+) -> anyhow::Result<GatewaySettings> {
+    store.update(|gateway| {
+        let relay = keyed_relay_mut(gateway, id)?;
+        let Some(position) = relay.api_keys.iter().position(|entry| entry.id == key_id) else {
+            bail!("这个 Key 已经不在了，刷新后再试");
+        };
+        let remaining = relay
+            .api_keys
+            .iter()
+            .filter(|entry| entry.id != key_id && !entry.api_key.trim().is_empty())
+            .count();
+        if remaining == 0 {
+            bail!("至少要保留一个 Key；要换掉它请用「替换」");
+        }
+        relay.api_keys.remove(position);
+        finish_key_edit(relay)
+    })?;
+    forget_key_state(id, key_id);
+    store.load()
+}
+
+/// 清掉 Key 池里与这个 Key 相关的状态。只剩一个 Key 时 Key 池按 `primary` 记，一并清掉，
+/// 免得剩下的 Key 继承早先单 Key 时的冷却。
+fn forget_key_state(relay_id: &str, key_id: &str) {
+    key_pool::forget_key(relay_id, key_id);
+    key_pool::forget_key(relay_id, key_pool::PRIMARY_KEY_ID);
 }
 
 /// 只改供应商的价格与独立代理（订阅账号也能改；地址、Key、模型不动）。

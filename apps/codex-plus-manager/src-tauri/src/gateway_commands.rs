@@ -29,6 +29,8 @@ pub struct GatewayPoolEntry {
     pub official: bool,
     pub models: Vec<String>,
     pub key_count: usize,
+    /// 已保存的 Key（打码，#2782）：只有标识和头尾几位，Key 原文不传给界面。订阅账号等不用 Key 的为空。
+    pub keys: Vec<apply::ProviderKeyView>,
     pub enabled: bool,
     /// 预设 key 或导入来源，界面判断「已添加」用。
     pub source: String,
@@ -171,6 +173,7 @@ fn pool_entry(
         official: codex_plus_core::official_login::member_uses_official_login_transport(relay),
         models: codex_plus_core::gateway::route::relay_models(relay),
         key_count: key_pool::expand_keys(relay).len(),
+        keys: Vec::new(),
         enabled,
         source: source.to_string(),
         price,
@@ -213,6 +216,7 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
         .providers
         .iter()
         .map(|provider| GatewayPoolEntry {
+            keys: apply::provider_keys(&provider.relay),
             model_windows: provider.model_windows.clone(),
             context_window: provider.context_window,
             key_rpm: provider.key_rpm,
@@ -674,6 +678,52 @@ pub fn update_gateway_provider(
         autofill_prices(Some(id));
     }
     respond("供应商已保存。", "保存供应商失败", result)
+}
+
+/// 给网关供应商再加一个 Key（#2782，在供应商池的详情里操作）。
+#[tauri::command]
+pub fn add_gateway_provider_key(id: String, key: String) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "Key 已添加。",
+        "添加 Key 失败",
+        refresh_agents(apply::add_provider_key(&GatewayStore::default(), &id, &key)),
+    )
+}
+
+/// 把供应商的某个 Key 换成新值（按 Key 的标识找，#2782）。
+#[tauri::command]
+pub fn replace_gateway_provider_key(
+    id: String,
+    key_id: String,
+    key: String,
+) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "Key 已替换。",
+        "替换 Key 失败",
+        refresh_agents(apply::replace_provider_key(
+            &GatewayStore::default(),
+            &id,
+            &key_id,
+            &key,
+        )),
+    )
+}
+
+/// 删掉供应商的某个 Key（按 Key 的标识找，至少保留一个，#2782）。
+#[tauri::command]
+pub fn delete_gateway_provider_key(
+    id: String,
+    key_id: String,
+) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "Key 已删除。",
+        "删除 Key 失败",
+        refresh_agents(apply::delete_provider_key(
+            &GatewayStore::default(),
+            &id,
+            &key_id,
+        )),
+    )
 }
 
 /// 只改供应商的价格与独立代理（在供应商池的详情里编辑）。

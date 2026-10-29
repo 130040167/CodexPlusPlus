@@ -6172,6 +6172,22 @@ fn remove_experimental_bearer_token_from_config(config_contents: &str) -> anyhow
     Ok(ensure_trailing_newline(doc.to_string()))
 }
 
+/// 单独增删、替换 Key 后（#2782）：从直连模式导入的供应商在 auth / config 文本里也存着 Key，
+/// 有的话同步成当前选中的 Key，删掉或换掉的旧 Key 不会留在文件里。没有就不动。
+pub(crate) fn sync_stored_api_key(profile: &mut RelayProfile) -> anyhow::Result<()> {
+    let key = profile.api_key.trim().to_string();
+    if codex_auth_api_key(&profile.auth_contents).is_some() {
+        profile.auth_contents = set_openai_api_key_in_auth_contents(&profile.auth_contents, &key)?;
+    }
+    if !profile.config_contents.trim().is_empty()
+        && experimental_bearer_token_from_config(&profile.config_contents)?.is_some()
+    {
+        profile.config_contents =
+            set_experimental_bearer_token_in_config(&profile.config_contents, &key)?;
+    }
+    Ok(())
+}
+
 fn provider_tables(doc: &DocumentMut) -> Vec<&dyn TableLike> {
     let mut tables: Vec<&dyn TableLike> = Vec::new();
     if let Some(providers) = doc.get("model_providers").and_then(Item::as_table) {

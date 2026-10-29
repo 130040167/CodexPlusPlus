@@ -423,6 +423,20 @@ pub fn reset(relay_id: &str) {
     state.round_robin.remove(relay_id);
 }
 
+/// 某个 Key 被删除或换成新值（#2782）：清掉它的冷却 / 停用记录、限速计数，以及固定到它的会话。
+///
+/// 会话固定指向已删的 Key 时，下次请求按策略重新选 Key；进行中的请求名额释放时找不到计数，自然无事。
+/// 供应商级的熔断不动：那是上游地址的问题，与哪个 Key 无关。
+pub fn forget_key(relay_id: &str, key_id: &str) {
+    let mut state = lock();
+    state.keys.remove(&(relay_id.to_string(), key_id.to_string()));
+    state
+        .sticky
+        .retain(|(relay, _), pinned| !(relay == relay_id && pinned == key_id));
+    drop(state);
+    usage_lock().remove(&(relay_id.to_string(), key_id.to_string()));
+}
+
 /// UI 展示用的健康快照，不含 Key 原文。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
