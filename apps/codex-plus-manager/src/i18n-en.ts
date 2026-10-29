@@ -2223,6 +2223,8 @@ export const EN_PLAIN: Record<string, string> = {
   "Codex 多开实例已就绪。": "Codex multi-instance is ready.",
   "Codex 实例启动失败，请查看实例列表中的原因。": "Codex instance failed to start; see the reason in the instance list.",
   "启动失败": "Start failed",
+  "多开只使用「旧版供应商配置」里的供应商和 API Key，「供应商池」（网关）里添加的供应商与 Key 不会出现在这里。修改供应商或 Key 后，需在上方对运行中的实例点「重启」才会生效。":
+    "Multi-launch only uses providers and API keys from Provider configuration (legacy); providers and keys added to the Provider pool (gateway) do not appear here. After changing a provider or key, click Restart on the running instance above for it to take effect.",
   "自动接管官方 App": "Auto-takeover of the official app",
   "你自己双击启动官方 App 时，Codex++ 自动接管并注入增强": "When you launch the official app yourself, Codex++ takes over and injects its enhancements.",
   "接管状态": "Takeover state",

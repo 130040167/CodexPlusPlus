@@ -372,6 +372,8 @@ type LaunchCommandResult = CommandResult<{
 }>;
 
 type MultiLaunchResult = CommandResult<{
+  /** 实例已在运行、本次没有重新写入供应商配置（需要「重启」才生效）。 */
+  alreadyRunning?: boolean;
   instanceId?: string;
   profileId?: string;
   pid?: number;
@@ -2712,6 +2714,11 @@ export function App() {
         request: { profileId: profile.id },
       }));
       if (!result) return;
+      if (result.alreadyRunning) {
+        showNotice(t("Codex多开"), result.message, result.status);
+        await refreshMultiLaunchInstances(true);
+        return;
+      }
       // 父进程只知道「worker 已拉起」，真正起来没有要等它就绪（最长 90 秒），
       // 所以这里不直接报成功，改为轮询到有结论再给提示。
       await refreshMultiLaunchInstances(true);
@@ -7452,6 +7459,8 @@ function CodexMultiLaunchScreen({
           <CardHeader>
             <CardTitle>{t("选择供应商身份启动 Codex")}</CardTitle>
             <CardDescription>{t("每个身份使用独立的配置、会话和用户数据目录，可与其他单一 Responses 或 Chat Completions 供应商同时运行。")}</CardDescription>
+            {/* #2754：新版的 API 多加在「供应商池」，多开却只读旧版供应商配置，用户以为 Key 没生效。 */}
+            <CardDescription>{t("多开只使用「旧版供应商配置」里的供应商和 API Key，「供应商池」（网关）里添加的供应商与 Key 不会出现在这里。修改供应商或 Key 后，需在上方对运行中的实例点「重启」才会生效。")}</CardDescription>
           </CardHeader>
           <CardContent>
             <div className="relay-profile-list">
