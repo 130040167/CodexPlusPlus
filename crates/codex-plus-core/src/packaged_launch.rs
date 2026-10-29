@@ -260,6 +260,10 @@ fn build_wrapper_script_for_port(
     script.push_str(&format!(
         "set \"CODEX_SQLITE_HOME={sqlite_home_literal}\"\r\n"
     ));
+    // Electron 自身也会读取此变量，须与 Chromium 参数使用同一隔离目录。
+    script.push_str(&format!(
+        "set \"CODEX_ELECTRON_USER_DATA_PATH={user_data_dir_literal}\"\r\n"
+    ));
     script.push_str(&format!("set \"{STATE_DIR_ENV}={state_dir_literal}\"\r\n"));
     script.push_str("set \"CODEX_PLUS_MULTI_INSTANCE=1\"\r\n");
     if let Some(dir) = executable_dir {
@@ -883,6 +887,16 @@ fn direct_launch_command(executable: &Path, args: &[String], state_dir: &Path) -
         .stderr(Stdio::null())
         .env(STATE_DIR_ENV, state_dir)
         .env("CODEX_PLUS_MULTI_INSTANCE", "1");
+    if let Some(user_data_dir) = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--user-data-dir="))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        command.env("CODEX_ELECTRON_USER_DATA_PATH", user_data_dir);
+    } else {
+        command.env_remove("CODEX_ELECTRON_USER_DATA_PATH");
+    }
     if let Some(dir) = executable
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
@@ -1038,6 +1052,9 @@ mod tests {
         assert!(script.contains("setlocal\r\n"));
         assert!(script.contains("set \"CODEX_HOME=/Users/a b/.codex\"\r\n"));
         assert!(script.contains("set \"CODEX_SQLITE_HOME=/Users/a b/.codex-sqlite\"\r\n"));
+        assert!(script.contains(
+            "set \"CODEX_ELECTRON_USER_DATA_PATH=/Users/a b/Codex++/instance 1/user-data\"\r\n"
+        ));
         assert!(script.contains(&format!(
             "set \"CODEX_PLUS_STATE_DIR={}\"\r\n",
             state_dir.display()
@@ -1079,6 +1096,9 @@ mod tests {
             "--user-data-dir=\"C:\\Users\\a b\\AppData\\Local\\Codex++\\instance 1\\user data\""
         ));
         assert!(script.contains("set \"CODEX_HOME=C:\\Users\\a b\\.codex\""));
+        assert!(script.contains(
+            "set \"CODEX_ELECTRON_USER_DATA_PATH=C:\\Users\\a b\\AppData\\Local\\Codex++\\instance 1\\user data\""
+        ));
     }
 
     #[test]
@@ -1093,6 +1113,7 @@ mod tests {
             &[],
         )
         .unwrap();
+        assert!(script.contains("set \"CODEX_ELECTRON_USER_DATA_PATH=C:\\user data\"\r\n"));
 
         // `%` 不转义会被 cmd 当成变量展开，实例路径就被改写了。
         assert!(script.contains("set \"CODEX_HOME=C:\\codex 100%%\""));
@@ -1645,6 +1666,25 @@ mod tests {
         assert!(envs.contains(&(
             std::ffi::OsStr::new("CODEX_PLUS_MULTI_INSTANCE"),
             Some(std::ffi::OsStr::new("1"))
+        )));
+        assert!(envs.contains(&(
+            std::ffi::OsStr::new("CODEX_ELECTRON_USER_DATA_PATH"),
+            Some(std::ffi::OsStr::new("/user data"))
+        )));
+    }
+
+    #[test]
+    fn direct_launch_command_clears_inherited_electron_user_data_without_an_override() {
+        let command = direct_launch_command(
+            Path::new("/Applications/Codex App/ChatGPT.exe"),
+            &[],
+            Path::new("/state/instance 1"),
+        );
+
+        let envs = command.get_envs().collect::<Vec<_>>();
+        assert!(envs.contains(&(
+            std::ffi::OsStr::new("CODEX_ELECTRON_USER_DATA_PATH"),
+            None
         )));
     }
 

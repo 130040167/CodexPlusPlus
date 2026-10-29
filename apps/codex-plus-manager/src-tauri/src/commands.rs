@@ -1395,6 +1395,7 @@ fn launch_codex_multi_instance_blocking(request: CodexMultiLaunchRequest) -> Com
         .arg("--codex-plus-multi-worker")
         .arg(&worker_options_path)
         .env("HOME", &worker_home)
+        .env_remove("CODEX_ELECTRON_USER_DATA_PATH")
         .env("CODEX_HOME", &codex_home)
         .env("CODEX_SQLITE_HOME", &sqlite_home)
         .env("CODEX_PLUS_MULTI_INSTANCE", "1")
@@ -2080,6 +2081,22 @@ fn multi_instance_slug(value: &str) -> String {
 }
 
 fn multi_instance_user_data_dir(slug: &str) -> PathBuf {
+    multi_instance_user_data_dir_with_root(
+        slug,
+        std::env::var_os("CODEX_ELECTRON_USER_DATA_PATH").map(PathBuf::from),
+    )
+}
+
+fn multi_instance_user_data_dir_with_root(slug: &str, electron_root: Option<PathBuf>) -> PathBuf {
+    // 多开根与主实例 userData 同级，避免主实例清理时连带删除多开数据。
+    if let Some(root) = electron_root.filter(|root| !root.as_os_str().is_empty()) {
+        let parent = root.parent().unwrap_or_else(|| Path::new("."));
+        let name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("CodexPlusPlus");
+        return parent.join(format!("{name}-multi")).join(slug);
+    }
     directories::BaseDirs::new()
         .map(|dirs| {
             dirs.data_local_dir()
@@ -9599,6 +9616,43 @@ fn default_log_lines() -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn multi_instance_user_data_respects_explicit_electron_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("electron data");
+        let first = multi_instance_user_data_dir_with_root("instance-a", Some(root.clone()));
+        let second = multi_instance_user_data_dir_with_root("instance-b", Some(root.clone()));
+        let multi_root = root.parent().unwrap().join("electron data-multi");
+        assert_eq!(first, multi_root.join("instance-a"));
+        assert_eq!(second, multi_root.join("instance-b"));
+        assert_ne!(first, second);
+        assert!(!first.exists());
+    }
+
+    #[test]
+    fn multi_instance_user_data_without_override_keeps_default_layout() {
+        let expected = directories::BaseDirs::new()
+            .map(|dirs| {
+                dirs.data_local_dir()
+                    .join("CodexPlusPlus")
+                    .join("multi")
+                    .join("instance-a")
+            })
+            .unwrap_or_else(|| {
+                codex_plus_core::paths::default_app_state_dir()
+                    .join("user-data")
+                    .join("instance-a")
+            });
+        assert_eq!(
+            multi_instance_user_data_dir_with_root("instance-a", None),
+            expected
+        );
+        assert_eq!(
+            multi_instance_user_data_dir_with_root("instance-a", Some(PathBuf::new())),
+            expected
+        );
+    }
+
     use super::*;
 
     #[test]
