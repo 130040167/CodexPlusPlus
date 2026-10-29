@@ -18,6 +18,10 @@ const SHARD_URL = new URL(
   "../../../assets/inject/renderer-inject/71-model-picker-groups.js",
   import.meta.url,
 );
+const CATALOG_URL = new URL(
+  "../../../assets/inject/renderer-inject/70-model-catalog.js",
+  import.meta.url,
+);
 const MANIFEST_URL = new URL(
   "../../../assets/inject/renderer-inject/manifest.json",
   import.meta.url,
@@ -188,4 +192,36 @@ it("在 Codex++ 里收藏的模型在选择器行尾画星标，取消收藏或�
   // 星标节点带归属标记，扫描不会把它当成原生标签，也不会自喂循环。
   assert.match(source, /star\.setAttribute\("data-codex-plus-ext", codexPlusModelPickerGroupsExtMark\)/);
   assert.match(source, /content\.querySelector\(`\.\$\{codexPlusModelPickerFavoriteClass\}`\)\?\.remove\(\)/);
+});
+
+it("模型选择器用单行工具栏、明确默认模型和缩进后的分组模型", async () => {
+  const source = await readShard();
+  assert.match(source, /spacer\.textContent = "选择模型"/);
+  assert.match(source, /codexPlusModelPickerDefaultModel\(\)/);
+  assert.match(source, /codexPlusConfiguredDefaultModel\(\)/);
+  assert.match(source, /codexModelCatalog\?\.status !== "not_applied"/);
+  assert.match(source, /aggregate_model_catalog", "aggregate_pool_catalog/);
+  assert.match(source, /codex-plus-model-default-value/);
+  assert.match(source, /composer\.modelPicker\.default\.label/);
+  assert.match(source, /codex-plus-model-default-subtitle/);
+  assert.match(source, /codex-plus-model-group-toolbar-title\{flex:1/);
+  assert.match(source, /\[role="menuitemradio"\]\[data-codex-plus-model-group\]\{padding-left:30px/);
+  assert.match(source, /codexPlusModelPickerSyncDefaultRow\(list\)/);
+  assert.match(source, /codexPlusModelPickerSelectDefault/);
+  assert.match(source, /codexPlusModelPickerScheduleRescan\(\)/);
+  assert.match(source, /兼容 v1 早期把供应商直接存成字符串/);
+  assert.doesNotMatch(source, /codex-plus-model-recommendation/);
+});
+
+it("默认模型只取当前供应商允许的目录模型，目录未发布时才使用受限展示兜底", async () => {
+  const picker = await readShard();
+  const catalog = await readFile(CATALOG_URL, "utf8");
+  assert.match(catalog, /function codexAggregateAllowedModelSet\(hostId, allowUnpublished = false\)/);
+  assert.match(catalog, /function codexPlusConfiguredDefaultModel\(\)/);
+  assert.match(catalog, /function codexFallbackThreadModelSelection\(/);
+  assert.match(catalog, /previous\.attempts >= 3/);
+  assert.match(catalog, /codexFallbackThreadModelSelection\(node, picker, hostId, owner/);
+  assert.match(catalog, /allowed\.has\(model\)/);
+  assert.match(picker, /codexPlusConfiguredDefaultModel\(\)/);
+  assert.match(picker, /aggregate_model_catalog", "aggregate_pool_catalog/);
 });

@@ -125,8 +125,16 @@
       }
       if (parsed?.providers && typeof parsed.providers === "object") {
         for (const [key, value] of Object.entries(parsed.providers)) {
-          if (typeof key === "string" && typeof value === "string" && key && value) {
-            codexPlusModelPickerGroupsState.providerNames.set(key, value);
+          if (typeof key !== "string" || !key) continue;
+          if (typeof value === "string" && value) {
+            // 兼容 v1 早期把供应商直接存成字符串的格式。
+            codexPlusModelPickerGroupsState.providerNames.set(key, { name: value, parsed: true });
+          } else if (value && typeof value === "object"
+              && typeof value.name === "string" && value.name) {
+            codexPlusModelPickerGroupsState.providerNames.set(key, {
+              name: value.name,
+              parsed: value.parsed === true,
+            });
           }
         }
       }
@@ -176,19 +184,17 @@
    */
   function codexPlusModelPickerEnsureCatalog() {
     const state = codexPlusModelPickerGroupsState;
-    if (state.defaultGroupId) return;
     if (state.catalogPending) return;
     if (Date.now() < state.catalogRetryAt) return;
-    const loaded = !!(codexModelCatalog?.models?.length || codexModelCatalog?.modelMetadata);
-    if (loaded && typeof loadCodexModelCatalog !== "function") return;
     if (typeof loadCodexModelCatalog !== "function") return;
     state.catalogPending = true;
-    state.catalogRetryAt = Date.now() + 5000;
+    state.catalogRetryAt = Date.now() + 15000;
     Promise.resolve()
       .then(() => loadCodexModelCatalog(false))
       .catch(() => {})
       .then(() => {
         state.catalogPending = false;
+        codexPlusModelPickerScheduleRescan();
       });
   }
 
@@ -430,7 +436,7 @@
     const native = content.querySelector(`.${codexPlusModelPickerNativeLabelClass}`);
     const own = content.querySelector(`.${codexPlusModelPickerOwnLabelClass}`);
     const outer = content.querySelector("span.flex-1, span[class*='flex-1']");
-    const inner = outer?.firstElementChild;
+    const inner = outer?.classList.contains("flex-col") ? outer : outer?.firstElementChild;
     // 原始标签优先；没打过补丁时就是 inner 里的第一个 span。
     const labelElement = native || own || inner?.firstElementChild || inner;
     const text = (labelElement?.textContent || "").replace(/\s+/g, " ").trim();
@@ -457,6 +463,91 @@
     return codexPlusModelPickerRowIdentity(row)?.text || "";
   }
 
+  function codexPlusModelPickerDefaultModel() {
+    const configured = typeof codexPlusConfiguredDefaultModel === "function"
+      ? codexPlusConfiguredDefaultModel() : "";
+    if (configured) return configured;
+    // 目录尚未发布时仍可展示配置值；不放宽模型选择或线程恢复的准入。
+    if (codexModelCatalog?.status !== "not_applied" || !codexPlusBackendSettingsLoaded) return "";
+    const profile = codexRemoteSessionActiveProfile();
+    if (profile?.relayMode !== "aggregate" || !profile.id
+        || !codexModelCatalog.sources?.some((source) =>
+          source?.id === `aggregate:${profile.id}`
+          && ["aggregate_model_catalog", "aggregate_pool_catalog"].includes(source.type))) return "";
+    const models = new Set(Array.isArray(codexModelCatalog.models) ? codexModelCatalog.models : []);
+    return [codexModelCatalog.model, codexModelCatalog.default_model]
+      .find((model) => typeof model === "string" && models.has(model)) || "";
+  }
+
+  function codexPlusModelPickerSyncDefaultRow(list) {
+    const model = codexPlusModelPickerDefaultModel();
+    for (const row of list.querySelectorAll('[role="menuitemradio"]')) {
+      const identity = codexPlusModelPickerRowIdentity(row);
+      if (!identity) continue;
+      const fiberKey = Object.keys(row).find((key) => key.startsWith("__reactFiber$"));
+      let nativeDefault = false;
+      for (let fiber = fiberKey && row[fiberKey], depth = 0; fiber && depth < 16; depth++, fiber = fiber.return) {
+        if (fiber.memoizedProps?.children?.props?.id === "composer.modelPicker.default.label") {
+          nativeDefault = true;
+          break;
+        }
+      }
+      const isDefault = nativeDefault || (identity.spanCount > 1 && /^(默认|Default)$/iu.test(identity.text));
+      if (!isDefault || !model) continue;
+      row.classList.add("codex-plus-model-default-row");
+      codexPlusModelPickerInstallLabel({ row, name: "默认" });
+      const own = row.querySelector(`.${codexPlusModelPickerOwnLabelClass}`);
+      if (!own) continue;
+      own.classList.add("codex-plus-model-default-label");
+      row.classList.add("codex-plus-model-default-suppress-selection");
+      own.replaceChildren(
+        Object.assign(document.createElement("span"), { textContent: "默认" }),
+        Object.assign(document.createElement("span"), {
+          className: "codex-plus-model-default-value",
+          textContent: model,
+          title: model,
+        }),
+      );
+      for (const child of identity.inner?.children || []) {
+        if (child !== own && !child.classList.contains(codexPlusModelPickerNativeLabelClass)) {
+          child.classList.add("codex-plus-model-default-subtitle");
+          child.setAttribute("aria-hidden", "true");
+        }
+      }
+    }
+  }
+
+  function codexPlusModelPickerDefaultPicker(row) {
+    const fiberKey = Object.keys(row).find((key) => key.startsWith("__reactFiber$"));
+    for (let fiber = fiberKey && row[fiberKey], depth = 0; fiber && depth < 64; depth++, fiber = fiber.return) {
+      const props = fiber.memoizedProps || {};
+      if (typeof props.model === "string" && typeof props.onSelectModel === "function"
+          && Array.isArray(props.models)) return props;
+    }
+    return null;
+  }
+
+  function codexPlusModelPickerSelectDefault(event) {
+    if (!["click", "keydown"].includes(event.type)
+        || (event.type === "keydown" && !["Enter", " "].includes(event.key))) return;
+    const row = event.target?.closest?.(".codex-plus-model-default-row");
+    if (!row || row.getAttribute("aria-disabled") === "true"
+        || codexPlusModelPickerGroupsState.disposed) return;
+    const model = codexPlusModelPickerDefaultModel();
+    const picker = codexPlusModelPickerDefaultPicker(row);
+    if (!model || !picker || picker.disabled || !picker.models.some((entry) => entry?.model === model)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const efforts = modelReasoningEfforts(model);
+    const preferred = codexPlusModelMetadata(model)?.defaultReasoningEffort;
+    const effort = efforts.find((entry) => entry.reasoningEffort === picker.reasoningEffort)?.reasoningEffort
+      || efforts.find((entry) => entry.reasoningEffort === preferred)?.reasoningEffort
+      || efforts[0]?.reasoningEffort || "medium";
+    Promise.resolve(picker.onSelectModel(model, effort)).catch((error) => {
+      console.warn("[Codex++] default model selection failed", error);
+    });
+  }
+
   /**
    * 把行切成 `{ row, label, name, provider, groupId }`。
    * 已打过补丁的行直接读我们留下的标记，避免反复解析。
@@ -469,6 +560,7 @@
     const items = list.querySelectorAll('[role="menuitemradio"]');
     items.forEach((row) => {
       const identity = codexPlusModelPickerRowIdentity(row);
+      if (row.classList.contains("codex-plus-model-default-row")) return;
       if (!identity?.groupable) return;
       const split = codexPlusModelPickerSplitLabel(identity.text);
       if (split.provider) codexPlusModelPickerRememberProvider(split.name, split.provider, true);
@@ -678,7 +770,7 @@
       header.classList.toggle("codex-plus-model-group-header-collapsed", !expanded);
       const label = header.querySelector(".codex-plus-model-group-title");
       // 标题只放名字：数量右边有徽标，标题里再来一次就是重复。
-      if (label) label.textContent = group.name;
+      if (label) label.textContent = group.isDefault ? "默认" : group.name;
       codexPlusModelPickerSyncDefaultBadge(header, group, text);
       header.setAttribute("aria-label", text.groupAria(group.name, group.entries.length, expanded, group.isDefault));
     }
@@ -740,6 +832,11 @@
       native.removeAttribute("aria-hidden");
     }
     row.classList.remove(codexPlusModelPickerItemClass, "codex-plus-model-group-collapsed");
+    row.classList.remove("codex-plus-model-default-row", "codex-plus-model-default-suppress-selection");
+    content.querySelectorAll(".codex-plus-model-default-subtitle").forEach((node) => {
+      node.classList.remove("codex-plus-model-default-subtitle");
+      node.removeAttribute("aria-hidden");
+    });
     row.removeAttribute(codexPlusModelPickerGroupAttr);
     if (row.getAttribute("data-codex-plus-ext") === codexPlusModelPickerGroupsExtMark) {
       row.removeAttribute("data-codex-plus-ext");
@@ -839,7 +936,7 @@
     toolbar.setAttribute("data-codex-plus-ext", codexPlusModelPickerGroupsExtMark);
     const spacer = document.createElement("span");
     spacer.className = "codex-plus-model-group-toolbar-title";
-    spacer.textContent = "";
+    spacer.textContent = "选择模型";
     const button = document.createElement("button");
     button.type = "button";
     button.className = "codex-plus-model-group-toolbar-button";
@@ -896,6 +993,7 @@
   function codexPlusModelPickerPatch(list) {
     if (codexPlusModelPickerGroupsState.disposed) return false;
     codexPlusModelPickerStore();
+    codexPlusModelPickerSyncDefaultRow(list);
     const rows = codexPlusModelPickerRows(list);
     const groups = codexPlusModelPickerUniqueGroupIds(
       codexPlusModelPickerGroups(rows, codexPlusModelPickerDefaultProviderName()),
@@ -963,16 +1061,23 @@
          那一行多出徽标时 auto 外边距会被吃掉，数字就跟在徽标后面，与其它行不对齐。 */
       .codex-plus-model-group-title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       .codex-plus-model-group-count{flex:0 0 auto;padding:0 6px;border-radius:999px;background:var(--color-token-bg-secondary,rgba(255,255,255,.06));color:var(--color-token-text-secondary,rgba(205,205,215,.75));font-size:10px;font-weight:500;font-variant-numeric:tabular-nums}
+      [role="menuitemradio"].codex-plus-model-default-row{min-height:24px!important;height:auto!important;margin:2px 0 0!important;padding:4px 8px!important;color:var(--color-token-text-secondary,rgba(205,205,215,.8));font-size:11px!important;line-height:16px!important;font-weight:600!important}
+      .codex-plus-model-default-row [data-menu-row-content],.codex-plus-model-default-label{display:flex!important;align-items:center;gap:12px;width:100%;min-width:0}
+      .codex-plus-model-default-value{min-width:0;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right;color:var(--color-token-text-primary,#dfdfdf);font-weight:500}
+      .codex-plus-model-default-subtitle{display:none!important}
+      .codex-plus-model-default-suppress-selection svg{display:none!important}
       /* 「默认」标志：默认成员的模型是裸名发布的，跟"另一家没起名的成员"看名字分不出来。
          用主题强调色描边小标签，比再加一句解释文字省地方。 */
       .codex-plus-model-group-default{flex:0 0 auto;padding:0 5px;border:1px solid color-mix(in srgb,var(--color-token-text-primary,#dfdfdf) 26%,transparent);border-radius:999px;color:var(--color-token-text-primary,#dfdfdf);font-size:10px;line-height:14px;font-weight:500;letter-spacing:.02em}
       /* 徽标紧贴计数左侧时留一点缝（默认 gap 是 6px，这里收紧一点看起来更像一组）。 */
       .codex-plus-model-group-default + .codex-plus-model-group-count{margin-left:-2px}
       .codex-plus-model-group-toolbar{display:flex;align-items:center;gap:8px;box-sizing:border-box;padding:2px 8px 4px}
+      .codex-plus-model-group-toolbar-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--color-token-text-secondary,rgba(205,205,215,.8));font-size:12px;line-height:16px}
       .codex-plus-model-group-toolbar-button{margin-left:auto;border:0;border-radius:6px;background:none;padding:2px 6px;color:var(--color-token-text-secondary,rgba(205,205,215,.8));font:inherit;font-size:11px;cursor:pointer;appearance:none}
       .codex-plus-model-group-toolbar-button:hover{background:var(--color-token-bg-secondary,rgba(255,255,255,.04));color:var(--color-token-text-primary,#dfdfdf)}
       /* 折叠：只隐藏行，不移动行，React 的 child 对账不受影响。 */
       [role="menuitemradio"].codex-plus-model-group-collapsed{display:none!important}
+      [role="menuitemradio"][data-codex-plus-model-group]{padding-left:30px!important;padding-right:8px!important}
       .${codexPlusModelPickerNativeLabelClass}{display:none!important}
       .${codexPlusModelPickerOwnLabelClass}{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       .${codexPlusModelPickerFavoriteClass}{flex:none;margin-left:6px;color:#f5b94a;font-size:12px;line-height:1}
@@ -1056,6 +1161,14 @@
   }
 
   codexPlusModelPickerInstallStyle();
+  if (window.__codexPlusModelPickerDefaultClickHandler) {
+    document.removeEventListener("click", window.__codexPlusModelPickerDefaultClickHandler, true);
+    document.removeEventListener("keydown", window.__codexPlusModelPickerDefaultKeyHandler, true);
+  }
+  window.__codexPlusModelPickerDefaultClickHandler = codexPlusModelPickerSelectDefault;
+  window.__codexPlusModelPickerDefaultKeyHandler = codexPlusModelPickerSelectDefault;
+  document.addEventListener("click", codexPlusModelPickerSelectDefault, true);
+  document.addEventListener("keydown", codexPlusModelPickerSelectDefault, true);
   codexPlusModelPickerSchedule(300);
   window.__codexPlusModelPickerGroupsRuntime = {
     version: 1,
