@@ -4,6 +4,55 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Codex++</title>
+    <script>
+      // 启动兜底（#2753）：前端包在模块求值阶段就出错（例如旧版系统 WebKit 不认识某个语法 / API）时，
+      // React 根本没机会渲染，窗口只剩深色底像黑屏。这里用普通脚本（不依赖模块和打包产物）接住错误，
+      // 若 #app 仍是空的就把原因写出来。界面正常渲染后再出的错不会走到这里（#app 已经有内容）。
+      (function () {
+        var shown = false;
+        var details = [];
+        function render() {
+          var root = document.getElementById("app");
+          if (shown || !root || root.childElementCount > 0) return;
+          shown = true;
+          var box = document.createElement("div");
+          box.setAttribute("role", "alert");
+          box.style.cssText = "box-sizing:border-box;min-height:100vh;padding:32px;background:#111318;color:#e8e9ed;font:14px/1.6 -apple-system,BlinkMacSystemFont,sans-serif";
+          var title = document.createElement("h1");
+          title.style.cssText = "margin:0 0 8px;font-size:18px";
+          title.textContent = "Codex++ 界面加载失败 / Codex++ failed to load";
+          var hint = document.createElement("p");
+          hint.style.cssText = "margin:0 0 12px;color:#a9adb8";
+          hint.textContent = "可以先重新加载；如果仍然失败，请把 macOS 更新到最新版本，并把下面的错误信息附到 GitHub issue 里。 / Try reloading. If it keeps failing, update macOS and attach the error below to a GitHub issue.";
+          var pre = document.createElement("pre");
+          pre.style.cssText = "margin:0 0 16px;padding:12px;max-height:40vh;overflow:auto;white-space:pre-wrap;word-break:break-all;border-radius:8px;background:#1b1e25;color:#f2b8b5;font:12px/1.5 monospace";
+          pre.textContent = details.join("\n\n") || "(no details)";
+          var reload = document.createElement("button");
+          reload.type = "button";
+          reload.style.cssText = "padding:6px 14px;border:1px solid #3a3f4b;border-radius:6px;background:#2a2f3a;color:#e8e9ed;cursor:pointer";
+          reload.textContent = "重新加载 / Reload";
+          reload.onclick = function () { window.location.reload(); };
+          box.appendChild(title);
+          box.appendChild(hint);
+          box.appendChild(pre);
+          box.appendChild(reload);
+          root.appendChild(box);
+        }
+        function report(detail) {
+          if (shown) return;
+          details.push(detail);
+          // React 出错后要等它卸载完才会把 #app 清空，稍等再检查一次。
+          setTimeout(render, 0);
+          setTimeout(render, 1500);
+        }
+        // 只接同步错误：模块语法错误、模块顶层抛错、React 没被边界接住的错误都会走 window 的 error 事件。
+        // 不接 unhandledrejection：启动期偶发的后台请求失败不该把正常的界面盖掉。
+        window.addEventListener("error", function (event) {
+          var error = event.error;
+          report((error && (error.stack || error.message)) || event.message || String(error));
+        });
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>

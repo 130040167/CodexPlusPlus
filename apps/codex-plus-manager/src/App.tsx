@@ -128,6 +128,7 @@ import { UsageTabs, onOpenRequestLog, type RequestLogFocus } from "./UsageTabs";
 import { noticeDuration, noticeTone } from "./notice-model";
 import { agentTabGroups, agentTarget } from "./page-groups";
 import { TopbarActions } from "./TopbarActions";
+import { CodexLaunchButton, type CodexLaunchState } from "./CodexLaunchButton";
 import { OnboardingTour } from "./OnboardingTour";
 import { AgentDashboard, type DashboardAgent, type DashboardStat, type DashboardStatus } from "./AgentDashboard";
 import { shouldShowTour, TOUR_STORAGE_KEY, TOUR_VERSION } from "./onboarding-model";
@@ -4474,6 +4475,22 @@ export function App() {
   const isGlobalPage = globalNavigationRoutes.includes(route);
   const isManagementScreen = route === "relay" || route === "multiLaunch" || route === "sessions" || route === "context" || route === "skills";
   const codexAppRunning = overview?.runtime_health?.codex_app?.status === "running";
+  // 「启动 / 重启 Codex」：Codex 页面的顶栏按钮和侧栏播放键共用一份状态，都走 actions.launch / actions.restart。
+  const codexToolEntry = toolEntries.find((entry) => entry.id === "codex");
+  const codexLaunch: CodexLaunchState = {
+    running: codexAppRunning,
+    busy: launchPending,
+    unavailableReason: overview?.codex_app?.status === "missing"
+      ? t("没有找到 Codex 应用，请先安装 Codex")
+      : codexToolEntry && !codexToolEntry.switchable
+        ? t("Codex 暂未接入，无法从这里启动")
+        : null,
+    onLaunch: () => void actions.launch(),
+    onRestart: () => void actions.restart(),
+  };
+  // 当前页面属于 Codex：routes 里 tool 为 codex 的页面，以及当前 Agent 是 Codex 时的 Agent 概览。
+  // 网关、全局管理、工具类页面和 Claude Code / Grok 的页面都不算（Codex++ 不只服务 Codex）。
+  const onCodexPage = routeTool(route) === "codex" || (route === "overview" && activeTool === "codex");
   const activeToolName = toolEntries.find((entry) => entry.id === activeTool)?.name ?? t("当前 Agent");
 
   const isGatewayPage = gatewayNavigationRoutes.includes(route);
@@ -4521,7 +4538,7 @@ export function App() {
         onOpenPalette={() => setPaletteOpen(true)}
         pendingUpdateVersion={update?.updateAvailable && update.latestVersion ? update.latestVersion : null}
         onOpenUpdate={() => { if (update) setUpdatePrompt(update); }}
-        codexRun={{ running: codexAppRunning, busy: launchPending, onStart: () => void actions.launch(), onStop: () => void actions.stopCodex() }}
+        codexRun={{ running: codexAppRunning, busy: launchPending, unavailableReason: codexLaunch.unavailableReason, onStart: codexLaunch.onLaunch, onStop: () => void actions.stopCodex() }}
       />
       <CommandPalette commands={paletteCommands} onClose={() => setPaletteOpen(false)} open={paletteOpen} />
       {tourOpen ? <OnboardingTour onClose={closeTour} /> : null}
@@ -4540,9 +4557,11 @@ export function App() {
             </p>
           </div>
           <div className="topbar-actions">
-            {/* data-topbar-actions：页面级操作的挂载点（TopbarActions / PageHeader），Claude 增强页把「启动增强版」portal 进来。
-                Codex 的启动 / 停止在侧栏 Codex 行的播放键上，顶栏不再重复。 */}
+            {/* data-topbar-actions：页面级操作的挂载点（TopbarActions / PageHeader），Claude 增强页把「启动增强版」portal 进来。 */}
             <div className="topbar-page-actions" data-topbar-actions />
+            {/* 「启动 / 重启 Codex」：只在 Codex 的页面里放在顶栏最右侧（#2744 / #2745）；
+                其它页面靠侧栏 Codex 行常驻的播放键启动，停止也在那里。 */}
+            {onCodexPage ? <CodexLaunchButton className="topbar-codex-launch" size="sm" state={codexLaunch} /> : null}
           </div>
         </header>
         <section
@@ -15372,8 +15391,9 @@ function AppSidebar({
   onOpenUpdate,
   codexRun,
 }: {
-  /** Codex 行的播放 / 停止：只有桌面应用的 Codex 有，命令行 Agent 没有常驻进程可启停。 */
-  codexRun: { running: boolean; busy: boolean; onStart: () => void; onStop: () => void };
+  /** Codex 行的播放 / 停止：只有桌面应用的 Codex 有，命令行 Agent 没有常驻进程可启停。
+      unavailableReason 非空（如没找到 Codex 应用）时播放键置灰，悬停显示原因。 */
+  codexRun: { running: boolean; busy: boolean; unavailableReason: string | null; onStart: () => void; onStop: () => void };
   tools: ToolEntry[];
   activeTool: ToolId;
   route: Route;
@@ -15495,7 +15515,7 @@ function AppSidebar({
                   ? { tone: "direct", label: t("Codex 的供应商配置由 Codex++ 直接管理") }
                   : { tone: "off", label: t("未接入网关") };
               return (
-                <div className="side-agent-wrap" key={tool.id}>
+                <div className={`side-agent-wrap ${tool.id === "codex" && tool.switchable ? "has-run" : ""}`.trim()} key={tool.id}>
                   <button
                     aria-current={current && !onGlobalPage ? "true" : undefined}
                     aria-label={tool.switchable ? `${tool.name} · ${access.label}` : `${tool.name} · ${t("待接入")}`}
@@ -15514,9 +15534,10 @@ function AppSidebar({
                       aria-label={codexRun.running ? t("停止 Codex") : t("启动 Codex")}
                       className="side-agent-run"
                       data-running={codexRun.running}
-                      disabled={codexRun.busy}
+                      data-unavailable={!codexRun.running && Boolean(codexRun.unavailableReason)}
+                      disabled={codexRun.busy || (!codexRun.running && Boolean(codexRun.unavailableReason))}
                       onClick={codexRun.running ? codexRun.onStop : codexRun.onStart}
-                      title={codexRun.busy ? t("处理中…") : codexRun.running ? t("停止 Codex") : t("启动 Codex")}
+                      title={codexRun.busy ? t("处理中…") : codexRun.running ? t("停止 Codex") : codexRun.unavailableReason ?? t("启动 Codex")}
                       type="button"
                     >
                       {codexRun.busy ? <Loader2 aria-hidden="true" className="animate-spin" /> : codexRun.running ? <Square aria-hidden="true" /> : <Play aria-hidden="true" />}
