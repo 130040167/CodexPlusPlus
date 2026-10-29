@@ -11,6 +11,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 mod structured;
+pub use structured::{ProviderCollector, start_provider_collector};
 
 const READ_BUDGET: u64 = 8 * 1024 * 1024;
 const FILE_READ_BUDGET: u64 = 512 * 1024;
@@ -1435,7 +1436,10 @@ mod tests {
         assert_eq!(structured["days"][0]["breakdowns"][0]["model"], "model-a");
         assert_eq!(structured["days"][0]["breakdowns"][0]["role"], "main");
         assert_eq!(structured["scopedUsage"]["sessionIds"], json!([A]));
-        assert_eq!(structured["scopedUsage"]["days"][0]["usage"]["totalTokens"], 13);
+        assert_eq!(
+            structured["scopedUsage"]["days"][0]["usage"]["totalTokens"],
+            13
+        );
         assert!(structured.get("periods").is_none());
         assert!(structured.get("sessionCursors").is_none());
         let mut request = request;

@@ -1899,6 +1899,9 @@ pub fn run_codex_multi_worker(options_path: &Path) -> anyhow::Result<()> {
     // 行为。早先只靠父进程设置 HOME 来隔离也不成立——Windows 上 `directories` 走
     // SHGetKnownFolderPath、不读 HOME，worker 会读写主实例的状态文件。
     let instance_state_dir = PathBuf::from(options.state_dir.trim());
+    // Keep provider evidence isolated to this worker's CODEX_HOME, SQLite root,
+    // settings path and request-log state directory.
+    let _provider_collector = crate::start_provider_history_collector();
     // 真正生效的等待端口：父进程注入的 `CODEX_PLUS_PROTOCOL_PROXY_PORT` 优先于 options。
     let effective_helper_port = std::env::var("CODEX_PLUS_PROTOCOL_PROXY_PORT")
         .ok()

@@ -169,6 +169,10 @@ pub fn run() {
     let Some(_guard) = acquire_single_instance_guard() else {
         return;
     };
+    // Keep provider evidence collection alive for the lifetime of the manager.
+    // The collector is read-only with respect to Codex traffic and persists
+    // only bounded attribution metadata in the current instance's state.
+    let provider_collector = start_provider_history_collector();
     #[cfg(target_os = "macos")]
     if let Some(root) = codex_plus_core::install::default_install_root() {
         match codex_plus_core::install::macos::migrate_legacy_manager_bundle(&root) {
@@ -588,6 +592,30 @@ pub fn run() {
                     "error": error.to_string()
                 }),
             );
+        }
+    }
+    drop(provider_collector);
+}
+
+/// Start the bounded provider evidence collector for the current instance.
+///
+/// All paths are resolved from the current process environment so a multi-open
+/// worker cannot write into the main instance's cache.
+fn start_provider_history_collector() -> Option<codex_plus_data::usage_history::ProviderCollector> {
+    let home = codex_plus_core::codex_sqlite::default_codex_home_dir();
+    let sqlite_home = std::env::var_os("CODEX_SQLITE_HOME")
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.clone());
+    let settings_path = codex_plus_core::paths::default_settings_path();
+    match codex_plus_data::usage_history::start_provider_collector(home, sqlite_home, settings_path) {
+        Ok(collector) => Some(collector),
+        Err(error) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "usage.provider_capture.start_failed",
+                serde_json::json!({"message": error.to_string()}),
+            );
+            None
         }
     }
 }

@@ -15,7 +15,9 @@ mod index_budget;
 mod live_receipts;
 mod native_endpoints;
 mod provider_cache;
+mod provider_capture;
 mod tool_receipts;
+pub use provider_capture::{ProviderCollector, start_provider_collector};
 
 const RETENTION_DAYS: i64 = 62;
 const MAX_ACTIVITY: usize = 12_000;
