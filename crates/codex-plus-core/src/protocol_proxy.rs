@@ -556,6 +556,10 @@ enum StreamCommitMode {
     Immediate,
     /// 工具调用参数整项缓冲，首段可见输出后再等宽限窗口才提交。
     VisibleGrace,
+    /// 只按住响应生命周期事件（response.created 等），之后第一个事件就提交。
+    /// 没开「请求避震」时只为识别「先回 200、流里才拒收加密内容」（#2777）预读，
+    /// 不能为此拖慢推理摘要等内容的转发。
+    PreOutputOnly,
 }
 
 /// 流式预读的提交策略：决定什么时候把已缓冲字节交给 Codex。
@@ -595,6 +599,14 @@ impl StreamStartCommitPolicy {
             ..self
         }
     }
+
+    /// 没开「请求避震」、只为识别流内拒收加密内容（#2777）预读时的提交时机。
+    fn pre_output_only() -> Self {
+        Self {
+            mode: StreamCommitMode::PreOutputOnly,
+            first_visible_grace: Duration::ZERO,
+        }
+    }
 }
 
 /// 预读阶段单个事件的分类。
@@ -619,6 +631,14 @@ fn stream_start_event_kind(
     event: &str,
     mode: StreamCommitMode,
 ) -> StreamStartEventKind {
+    // 只按住生命周期事件：第一个其它事件（含推理增量、失败事件）就结束预读。
+    if mode == StreamCommitMode::PreOutputOnly {
+        return if is_pre_output_stream_event(event) {
+            StreamStartEventKind::Hold
+        } else {
+            StreamStartEventKind::Terminal
+        };
+    }
     if stream_event_is_retry_safe(block, event) {
         return StreamStartEventKind::Hold;
     }
@@ -3504,6 +3524,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     let buffered_mode = settings.protocol_proxy_auto_retry_mode == "buffered";
     let commit_policy = StreamStartCommitPolicy::from_settings(&settings);
     let mut retry_reasons: Vec<String> = Vec::new();
+    // 因别家签发的加密内容被拒而重发的次数（#2777），整个请求共用，不占「请求避震」的预算。
+    let mut foreign_retries = 0_u32;
     let mut request_trace = crate::request_log::RequestTrace {
         model: source_model.clone(),
         ..Default::default()
@@ -3682,12 +3704,13 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             .to_string();
         // Codex 托管的网关供应商：这一跳的上游就是本机网关，它自己按候选控制超时。
         let via_gateway = relay.id == crate::gateway::apply::CODEX_GATEWAY_RELAY_ID;
-        // 别家签发的加密推理（#2777）：只在发往真实上游时处理（网关那一跳由网关自己处理）；
+        // 别家签发的加密内容（#2777）：只在发往真实上游时处理（网关那一跳由网关自己处理）；
         // 「严格推理历史」的约定是认证失败不降级，开着时不动。
         let foreign_reasoning_handled = wire_api == UpstreamWireApi::Responses
             && !via_gateway
             && !relay.strict_responses_reasoning;
         if foreign_reasoning_handled {
+            // reasoning 与 compaction / compaction_summary 项一并按记忆提前去掉。
             let skipped = crate::foreign_reasoning::strip_remembered(&relay.id, &mut upstream_body);
             if skipped > 0 {
                 let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -3879,53 +3902,43 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             }
         }
 
-        // #2777：上游明确说历史里的加密推理校验不过（多半是同一对话里上一家签发的），
-        // 去掉加密推理项原样重发一次；没报这个错的请求不预读、不改动。
+        // #2777：上游明确说历史里的加密内容校验不过（多半是同一对话里上一家签发的），
+        // 去掉一批加密项（先推理、后压缩结果）后对同一候选重发；没报这个错的请求不预读、不改动。
+        // 各家拒收的状态码不一，4xx 都看，但只认错误体里的措辞。
         if foreign_reasoning_handled
-            && status_code == 400
-            && crate::foreign_reasoning::has_encrypted_reasoning(&upstream_body)
+            && (400..500).contains(&status_code)
+            && foreign_retries < crate::foreign_reasoning::MAX_RETRIES
+            && crate::foreign_reasoning::has_encrypted_items(&upstream_body)
         {
-            let retry = async {
-                let (inspected, rejected) = crate::responses_exec_transport::inspect_error_body(
-                    upstream,
-                    |status, _, body| {
-                        crate::foreign_reasoning::is_unverifiable_reasoning_rejection(status, body)
-                    },
-                )
-                .await?;
-                if !rejected {
-                    return Ok::<_, anyhow::Error>(inspected);
+            let mut error_text = String::new();
+            let inspected = crate::responses_exec_transport::inspect_error_body(
+                upstream,
+                |status, _, body| {
+                    let rejected =
+                        crate::foreign_reasoning::is_unverifiable_reasoning_rejection(status, body);
+                    if rejected {
+                        error_text = String::from_utf8_lossy(body).into_owned();
+                    }
+                    rejected
+                },
+            )
+            .await;
+            match inspected {
+                Ok((_, true))
+                    if prepare_foreign_reasoning_retry(
+                        &relay,
+                        &mut upstream_body,
+                        &error_text,
+                        "http_status",
+                        is_stream,
+                        &mut foreign_retries,
+                        &mut retry_reasons,
+                    ) =>
+                {
+                    candidate_index = attempt;
+                    continue 'request_attempts;
                 }
-                let mut stripped = upstream_body.clone();
-                let removed = crate::foreign_reasoning::strip_and_remember(&relay.id, &mut stripped);
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "protocol_proxy.foreign_reasoning_retry",
-                    json!({
-                        "relayId": relay.id,
-                        "relayName": relay.name,
-                        "stripped": removed,
-                        "stream": is_stream
-                    }),
-                );
-                retry_reasons.push(crate::foreign_reasoning::RETRY_REASON.to_string());
-                if let Some(id) = live_request_id {
-                    crate::request_log::update_running_retry(
-                        id,
-                        request_attempt as u32,
-                        retry_reasons.len() as u32,
-                        retry_reasons.clone(),
-                    );
-                }
-                let retried = send_responses_upstream_request(
-                    &relay, &endpoint, &stripped, wire_api, is_stream,
-                    original_user_agent, beta_features, session_headers, official_credential.as_ref(),
-                    header_timeout,
-                ).await?;
-                upstream_body = stripped;
-                Ok(retried)
-            };
-            upstream = match retry.await {
-                Ok(response) => response,
+                Ok((response, _)) => upstream = response,
                 Err(error) => {
                     if exec_adapted && let Some(key) = key.as_ref() {
                         crate::responses_exec_transport::evict(key);
@@ -3944,10 +3957,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         )
                     });
                 }
-            };
-            status_code = upstream.status().as_u16();
-            content_type = upstream.headers().get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok()).unwrap_or("").to_string();
+            }
         }
 
         if eligible && !exec_adapted && !exec_negotiation_used && status_code == 400 {
@@ -4365,6 +4375,13 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         // 200 的流式响应也可能带着 response.failed（官方 server_overloaded
         // 就是先回 200 再在流里失败）。在向 Codex 写出任何字节前先预读；
         // 若识别到容量失败就退避后重发同一次上游请求。
+        //
+        // 拒收别家签发的加密内容（#2777）也可能这样发生（ChatGPT 后端、Grok 先回 200 和
+        // response.created，再发 response.failed / error）。只要还没提交给 Codex，同样去掉一批
+        // 加密项后重发；没开「请求避震」时也为此预读，但只按住生命周期事件，不拖慢正常转发。
+        let foreign_stream_watch = foreign_reasoning_handled
+            && foreign_retries < crate::foreign_reasoning::MAX_RETRIES
+            && crate::foreign_reasoning::has_encrypted_items(&upstream_body);
         let mut stream_prefix = Vec::new();
         if is_stream
             && (200..300).contains(&status_code)
@@ -4383,6 +4400,26 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 } => {
                     if let Some(first_output_at_ms) = first_output_at_ms {
                         request_trace.first_output_at_ms = Some(first_output_at_ms);
+                    }
+                    // 整段缓冲：还没向 Codex 写出任何字节，流内拒收加密内容可以重发。
+                    if foreign_stream_watch
+                        && let Some((code, message)) = terminal_failure.as_ref()
+                        && crate::foreign_reasoning::is_unverifiable_stream_failure(
+                            code.as_deref(),
+                            message.as_deref(),
+                        )
+                        && prepare_foreign_reasoning_retry(
+                            &relay,
+                            &mut upstream_body,
+                            message.as_deref().or(code.as_deref()).unwrap_or(""),
+                            "buffered_stream",
+                            is_stream,
+                            &mut foreign_retries,
+                            &mut retry_reasons,
+                        )
+                    {
+                        candidate_index = attempt;
+                        continue 'request_attempts;
                     }
                     if let Some((code, message)) = terminal_failure
                         && stream_failure_is_retryable(code.as_deref(), message.as_deref())
@@ -4453,17 +4490,15 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             && !is_compaction_request
             && !experimental_local_compaction
             && !exec_adapted
-            && auto_retry.is_some()
+            && (auto_retry.is_some() || foreign_stream_watch)
         {
             // 重试预算已用尽时再缓冲没有收益，直接退回旧提交时机，
-            // 避免为首字白等一个宽限窗口。
-            let attempt_commit_policy = if auto_retry
-                .as_ref()
-                .is_some_and(|retry| retry.remaining > 0)
-            {
-                commit_policy
-            } else {
-                commit_policy.without_retry_budget()
+            // 避免为首字白等一个宽限窗口。没开「请求避震」、只为流内拒收加密内容预读时，
+            // 只按住生命周期事件。
+            let attempt_commit_policy = match auto_retry.as_ref() {
+                Some(retry) if retry.remaining > 0 => commit_policy,
+                Some(_) => commit_policy.without_retry_budget(),
+                None => StreamStartCommitPolicy::pre_output_only(),
             };
             match peek_responses_stream_start(
                 &mut upstream,
@@ -4487,8 +4522,28 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     message,
                     first_output_at_ms,
                 } => {
-                    let retryable =
-                        stream_failure_is_retryable(code.as_deref(), message.as_deref());
+                    // 预读还没提交给 Codex：流内拒收加密内容就去掉一批后对同一候选重发。
+                    if foreign_stream_watch
+                        && crate::foreign_reasoning::is_unverifiable_stream_failure(
+                            code.as_deref(),
+                            message.as_deref(),
+                        )
+                        && prepare_foreign_reasoning_retry(
+                            &relay,
+                            &mut upstream_body,
+                            message.as_deref().or(code.as_deref()).unwrap_or(""),
+                            "stream",
+                            is_stream,
+                            &mut foreign_retries,
+                            &mut retry_reasons,
+                        )
+                    {
+                        candidate_index = attempt;
+                        continue 'request_attempts;
+                    }
+                    // 没开「请求避震」时这里只是为 #2777 预读，其它失败照旧原样交给 Codex。
+                    let retryable = auto_retry.is_some()
+                        && stream_failure_is_retryable(code.as_deref(), message.as_deref());
                     let _ = crate::diagnostic_log::append_diagnostic_log(
                         "protocol_proxy.upstream_stream_failed",
                         json!({
@@ -4579,6 +4634,39 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             response: Some(upstream),
         });
     }
+}
+
+/// 上游拒收了别家签发的加密内容（#2777）：按报错去掉一批加密项并记住被这家拒收过，
+/// 调用方随后对同一候选重发——重发时请求从头重建，[`crate::foreign_reasoning::strip_remembered`]
+/// 会把记住的项提前去掉。返回 `false` 表示已经没有可去的项，错误照常交回。
+fn prepare_foreign_reasoning_retry(
+    relay: &crate::settings::RelayProfile,
+    upstream_body: &mut Value,
+    error_text: &str,
+    stage: &str,
+    is_stream: bool,
+    foreign_retries: &mut u32,
+    retry_reasons: &mut Vec<String>,
+) -> bool {
+    let removed =
+        crate::foreign_reasoning::strip_rejected_batch(&relay.id, upstream_body, error_text);
+    if removed == 0 {
+        return false;
+    }
+    *foreign_retries += 1;
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "protocol_proxy.foreign_reasoning_retry",
+        json!({
+            "relayId": relay.id,
+            "relayName": relay.name,
+            "stripped": removed,
+            "stage": stage,
+            "retry": *foreign_retries,
+            "stream": is_stream
+        }),
+    );
+    retry_reasons.push(crate::foreign_reasoning::RETRY_REASON.to_string());
+    true
 }
 
 /// xAI 的 Responses 接口（api.x.ai 与 SuperGrok 订阅代理）只认 function 等内置工具类型，
