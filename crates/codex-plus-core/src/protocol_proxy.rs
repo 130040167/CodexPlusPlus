@@ -3544,6 +3544,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     let mut retry_reasons: Vec<String> = Vec::new();
     // 因别家签发的加密内容被拒而重发的次数（#2777），整个请求共用，不占「请求避震」的预算。
     let mut foreign_retries = 0_u32;
+    // 这次请求去掉过别家签发的压缩上下文（#2777）：请求日志里单独标出来，较早的对话内容上游已看不到。
+    let mut foreign_compaction_dropped = false;
     let mut request_trace = crate::request_log::RequestTrace {
         model: source_model.clone(),
         ..Default::default()
@@ -3727,16 +3729,33 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         let foreign_reasoning_handled = wire_api == UpstreamWireApi::Responses
             && !via_gateway
             && !relay.strict_responses_reasoning;
+        // 被拒记忆按「供应商 + 这次实际使用的 Key / 账号」分开记（网关展开的 Key 候选、本地代理选中的 Key 都在
+        // relay.api_key 里；官方登录成员按账号）。
+        let foreign_scope = foreign_reasoning_scope(&relay, official_credential.as_ref());
+        let mut compaction_dropped_now = false;
         if foreign_reasoning_handled {
             // reasoning 与 compaction / compaction_summary 项一并按记忆提前去掉。
-            let skipped = crate::foreign_reasoning::strip_remembered(&relay.id, &mut upstream_body);
-            if skipped > 0 {
+            let skipped =
+                crate::foreign_reasoning::strip_remembered(&foreign_scope, &mut upstream_body);
+            if skipped.total() > 0 {
                 let _ = crate::diagnostic_log::append_diagnostic_log(
                     "protocol_proxy.foreign_reasoning_skipped",
-                    json!({"relayId": relay.id, "relayName": relay.name, "skipped": skipped}),
+                    json!({
+                        "relayId": relay.id,
+                        "relayName": relay.name,
+                        "skipped": skipped.total(),
+                        "compaction": skipped.compaction
+                    }),
                 );
             }
+            compaction_dropped_now = skipped.compaction > 0;
+            // 刚因拒收去掉压缩项而重发时，重发前已记过诊断日志，这里不重复记。
+            if compaction_dropped_now && !foreign_compaction_dropped {
+                log_foreign_compaction_dropped(&relay, skipped.compaction, "remembered");
+            }
         }
+        // 按这次实际发出的请求算：换到别的候选、压缩项没被去掉时不再标出。
+        foreign_compaction_dropped = compaction_dropped_now;
         let header_timeout =
             responses_request_header_timeout(is_stream, is_compaction_request, via_gateway);
         let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -3951,6 +3970,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         is_stream,
                         &mut foreign_retries,
                         &mut retry_reasons,
+                        &foreign_scope,
+                        &mut foreign_compaction_dropped,
                     ) =>
                 {
                     candidate_index = attempt;
@@ -4434,6 +4455,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                             is_stream,
                             &mut foreign_retries,
                             &mut retry_reasons,
+                            &foreign_scope,
+                            &mut foreign_compaction_dropped,
                         )
                     {
                         candidate_index = attempt;
@@ -4475,8 +4498,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         }
                     }
                     request_trace.attempts = request_attempt as u32;
-                    request_trace.auto_retries = retry_reasons.len() as u32;
-                    request_trace.retry_reasons = retry_reasons.clone();
+                    fill_retry_trace(&mut request_trace, &retry_reasons, foreign_compaction_dropped);
                     return Ok(UpstreamProxyResponse {
                         status_code,
                         is_stream: true,
@@ -4554,6 +4576,8 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                             is_stream,
                             &mut foreign_retries,
                             &mut retry_reasons,
+                            &foreign_scope,
+                            &mut foreign_compaction_dropped,
                         )
                     {
                         candidate_index = attempt;
@@ -4627,8 +4651,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         // 成功，或重试预算用尽：把（最后一个）上游响应交给 Codex。
         // 请求了 SSE 的兼容上游也可能返回 JSON 摘要；让调用方选择 JSON 包装器。
         request_trace.attempts = request_attempt as u32;
-        request_trace.auto_retries = retry_reasons.len() as u32;
-        request_trace.retry_reasons = retry_reasons.clone();
+        fill_retry_trace(&mut request_trace, &retry_reasons, foreign_compaction_dropped);
         let json_compaction = is_compaction_request
             && content_type
                 .split(';')
@@ -4654,9 +4677,58 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     }
 }
 
-/// 上游拒收了别家签发的加密内容（#2777）：按报错去掉一批加密项并记住被这家拒收过，
-/// 调用方随后对同一候选重发——重发时请求从头重建，[`crate::foreign_reasoning::strip_remembered`]
-/// 会把记住的项提前去掉。返回 `false` 表示已经没有可去的项，错误照常交回。
+/// 被拒记忆的作用域（#2777）：供应商 + 这次实际使用的凭据。官方登录成员按账号 id，
+/// 其它按发出去的 Key（网关展开多 Key 时 `relay.api_key` 已换成这个候选的 Key）；
+/// 都拿不到时退回只按供应商。
+fn foreign_reasoning_scope(
+    relay: &crate::settings::RelayProfile,
+    official_credential: Option<&crate::official_login::OfficialCredential>,
+) -> String {
+    let credential = match official_credential {
+        Some(credential) => credential.account_id.as_str(),
+        None => relay.api_key.as_str(),
+    };
+    crate::foreign_reasoning::memory_scope(&relay.id, Some(credential))
+}
+
+/// 去掉别家签发的压缩上下文会丢掉压缩前的对话内容：记诊断日志，便于事后查明为什么上游「忘了」前文。
+fn log_foreign_compaction_dropped(
+    relay: &crate::settings::RelayProfile,
+    dropped: usize,
+    stage: &str,
+) {
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "protocol_proxy.foreign_compaction_dropped",
+        json!({
+            "relayId": relay.id,
+            "relayName": relay.name,
+            "dropped": dropped,
+            "stage": stage
+        }),
+    );
+}
+
+/// 把重试原因写进请求日志轨迹。去掉过别家压缩上下文时追加
+/// [`crate::foreign_reasoning::COMPACTION_DROPPED_REASON`]，它只是说明，不计入自动重试次数。
+fn fill_retry_trace(
+    trace: &mut crate::request_log::RequestTrace,
+    retry_reasons: &[String],
+    foreign_compaction_dropped: bool,
+) {
+    trace.auto_retries = retry_reasons.len() as u32;
+    trace.retry_reasons = retry_reasons.to_vec();
+    if foreign_compaction_dropped {
+        trace
+            .retry_reasons
+            .push(crate::foreign_reasoning::COMPACTION_DROPPED_REASON.to_string());
+    }
+}
+
+/// 上游拒收了别家签发的加密内容（#2777）：按报错去掉一批加密项并记住被这家（`scope`，见
+/// [`foreign_reasoning_scope`]）拒收过，调用方随后对同一候选重发——重发时请求从头重建，
+/// [`crate::foreign_reasoning::strip_remembered`] 会把记住的项提前去掉。
+/// 返回 `false` 表示已经没有可去的项，错误照常交回。
+#[allow(clippy::too_many_arguments)]
 fn prepare_foreign_reasoning_retry(
     relay: &crate::settings::RelayProfile,
     upstream_body: &mut Value,
@@ -4665,10 +4737,11 @@ fn prepare_foreign_reasoning_retry(
     is_stream: bool,
     foreign_retries: &mut u32,
     retry_reasons: &mut Vec<String>,
+    scope: &str,
+    foreign_compaction_dropped: &mut bool,
 ) -> bool {
-    let removed =
-        crate::foreign_reasoning::strip_rejected_batch(&relay.id, upstream_body, error_text);
-    if removed == 0 {
+    let removed = crate::foreign_reasoning::strip_rejected_batch(scope, upstream_body, error_text);
+    if removed.total() == 0 {
         return false;
     }
     *foreign_retries += 1;
@@ -4677,12 +4750,18 @@ fn prepare_foreign_reasoning_retry(
         json!({
             "relayId": relay.id,
             "relayName": relay.name,
-            "stripped": removed,
+            "stripped": removed.total(),
+            "compaction": removed.compaction,
             "stage": stage,
             "retry": *foreign_retries,
             "stream": is_stream
         }),
     );
+    if removed.compaction > 0 {
+        // 重发时按记忆再提前去掉同一批，不重复记日志。
+        *foreign_compaction_dropped = true;
+        log_foreign_compaction_dropped(relay, removed.compaction, stage);
+    }
     retry_reasons.push(crate::foreign_reasoning::RETRY_REASON.to_string());
     true
 }

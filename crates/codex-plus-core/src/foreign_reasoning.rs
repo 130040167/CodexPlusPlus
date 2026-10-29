@@ -7,12 +7,15 @@
 //! 有的上游直接回 4xx，有的先回 200、再在流里发 `response.failed` / `error`。
 //!
 //! 处理方式偏保守：只有上游明确报了这类错误，才分批去掉请求里的加密项重发（每个请求最多
-//! [`MAX_RETRIES`] 次），并按「上游 + 内容摘要」记住被拒的项，同一对话后面的请求发往这一家时提前去掉，
-//! 不再每轮先失败一次。没被拒过的请求一律不动。
+//! [`MAX_RETRIES`] 次），并按「上游（供应商 + 实际使用的 Key / 账号，见 [`memory_scope`]）+ 内容摘要」
+//! 记住被拒的项，同一对话后面的请求发往这一家时提前去掉，不再每轮先失败一次。没被拒过的请求一律不动。
 //!
 //! 分批的顺序：先去 reasoning（只是模型的思考过程，去掉后上游照常按消息与工具历史继续），
 //! 还被拒才去 compaction 项（它代替了压缩前的整段历史，去掉会丢掉那段上下文，代价大，留到最后）。
-//! 上游报错里点名了某个项 id 时，先去那一批。
+//! 只有两种情况会去 compaction：报错点名了某个 compaction 项的 id；或者请求里已经没有带加密内容的
+//! 推理项（推理已在前一次重发或按记忆提前去掉，或本来就没有）却仍以同类报错被拒——这时被拒的只可能是
+//! 压缩结果，不去掉对话就无法继续。去掉 compaction 会丢掉压缩前的对话内容，调用方要在请求日志里
+//! 用 [`COMPACTION_DROPPED_REASON`] 标出来并记诊断日志，不能悄悄发生。
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -33,10 +36,45 @@ pub const MAX_RETRIES: u32 = 2;
 /// 请求日志里这次重试的原因。
 pub const RETRY_REASON: &str = "invalid_encrypted_content";
 
+/// 请求日志里的标记：这次请求去掉了别家签发的压缩上下文（compaction / compaction_summary），
+/// 较早的对话内容上游已经看不到。它只是说明，不算一次重试。
+pub const COMPACTION_DROPPED_REASON: &str = "foreign_compaction_dropped";
+
 /// 识别报错措辞时，两个关键短语之间最多隔多少个字符（例如中间夹着项 id、"provided" 等）。
 const PHRASE_GAP_LIMIT: usize = 160;
 
 type MemoryKey = (String, u64);
+
+/// 一次去掉了哪些加密项：推理项与压缩项各几个。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Stripped {
+    pub reasoning: usize,
+    pub compaction: usize,
+}
+
+impl Stripped {
+    pub fn total(&self) -> usize {
+        self.reasoning + self.compaction
+    }
+
+    fn count(&mut self, batch: Batch) {
+        match batch {
+            Batch::Reasoning => self.reasoning += 1,
+            Batch::Compaction => self.compaction += 1,
+        }
+    }
+}
+
+/// 被拒记忆的作用域：供应商 id，加上这次实际使用的 Key / 账号标识（只存摘要，不存原文）。
+///
+/// 一个供应商配了多个 Key 轮换、或中转背后是账号池时，A 签发的内容被 B 拒过，
+/// 不代表 A 也会拒；按 Key 分开记，轮回 A 时不会被提前去掉。拿不到标识时退回只按供应商记。
+pub fn memory_scope(relay_id: &str, credential: Option<&str>) -> String {
+    match credential.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(credential) => format!("{relay_id}#{:016x}", digest(credential)),
+        None => relay_id.to_string(),
+    }
+}
 
 /// 加密项分批：先去代价小的推理，再去代价大的压缩结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +219,9 @@ pub fn is_unverifiable_stream_failure(code: Option<&str>, message: Option<&str>)
 }
 
 /// 这次该去掉哪一批：报错点名了某个加密项的 id 就去它那一批，否则按 [`BATCH_ORDER`] 取第一批非空的。
+///
+/// 没点名时，只要请求里还有加密推理项就先去推理；compaction 只在推理已经不在请求里时才轮到
+/// （见模块说明）。
 fn rejected_batch(items: &[Value], error_text: &str) -> Option<Batch> {
     let error_text = error_text.to_ascii_lowercase();
     let named = items.iter().find_map(|item| {
@@ -197,29 +238,31 @@ fn rejected_batch(items: &[Value], error_text: &str) -> Option<Batch> {
     })
 }
 
-/// 上游拒收后去掉一批加密项（见 [`rejected_batch`]），并记住它们被 `relay_id` 拒收过。
-/// `error_text` 是上游的报错（错误体或流内失败事件的 message），用来认出点名的项。返回去掉了几项。
-pub fn strip_rejected_batch(relay_id: &str, body: &mut Value, error_text: &str) -> usize {
-    strip_rejected_batch_at(memory(), relay_id, body, error_text, Instant::now())
+/// 上游拒收后去掉一批加密项（见 [`rejected_batch`]），并记住它们被 `scope`（见 [`memory_scope`]）
+/// 拒收过。`error_text` 是上游的报错（错误体或流内失败事件的 message），用来认出点名的项。
+pub fn strip_rejected_batch(scope: &str, body: &mut Value, error_text: &str) -> Stripped {
+    strip_rejected_batch_at(memory(), scope, body, error_text, Instant::now())
 }
 
 fn strip_rejected_batch_at(
     memory: &Mutex<Memory>,
-    relay_id: &str,
+    scope: &str,
     body: &mut Value,
     error_text: &str,
     now: Instant,
-) -> usize {
+) -> Stripped {
+    let mut stripped = Stripped::default();
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
-        return 0;
+        return stripped;
     };
     let Some(batch) = rejected_batch(items, error_text) else {
-        return 0;
+        return stripped;
     };
     let mut rejected = Vec::new();
     items.retain(|item| match encrypted_item(item) {
         Some((found, content)) if found == batch => {
             rejected.push(digest(content));
+            stripped.count(found);
             false
         }
         _ => true,
@@ -227,36 +270,39 @@ fn strip_rejected_batch_at(
     let mut memory = memory.lock().unwrap_or_else(|error| error.into_inner());
     memory.forget_expired(now);
     for hash in &rejected {
-        memory.remember((relay_id.to_string(), *hash), now);
+        memory.remember((scope.to_string(), *hash), now);
     }
-    rejected.len()
+    stripped
 }
 
-/// 去掉 `relay_id` 之前拒收过的加密项（其余项保留）。返回去掉了几项。
-pub fn strip_remembered(relay_id: &str, body: &mut Value) -> usize {
-    strip_remembered_at(memory(), relay_id, body, Instant::now())
+/// 去掉 `scope`（见 [`memory_scope`]）之前拒收过的加密项（其余项保留）。
+pub fn strip_remembered(scope: &str, body: &mut Value) -> Stripped {
+    strip_remembered_at(memory(), scope, body, Instant::now())
 }
 
 fn strip_remembered_at(
     memory: &Mutex<Memory>,
-    relay_id: &str,
+    scope: &str,
     body: &mut Value,
     now: Instant,
-) -> usize {
+) -> Stripped {
+    let mut stripped = Stripped::default();
     let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
-        return 0;
+        return stripped;
     };
     let mut memory = memory.lock().unwrap_or_else(|error| error.into_inner());
     if memory.entries.is_empty() {
-        return 0;
+        return stripped;
     }
     memory.forget_expired(now);
-    let before = items.len();
-    items.retain(|item| {
-        encrypted_item(item)
-            .is_none_or(|(_, content)| !memory.touch(&(relay_id.to_string(), digest(content)), now))
+    items.retain(|item| match encrypted_item(item) {
+        Some((batch, content)) if memory.touch(&(scope.to_string(), digest(content)), now) => {
+            stripped.count(batch);
+            false
+        }
+        _ => true,
     });
-    before - items.len()
+    stripped
 }
 
 #[cfg(test)]
@@ -345,7 +391,7 @@ mod tests {
             {"type": "reasoning", "summary": [{"type": "summary_text", "text": "plain"}]},
         ]});
         assert!(has_encrypted_items(&body));
-        assert_eq!(strip_rejected_batch(relay, &mut body, ""), 1);
+        assert_eq!(strip_rejected_batch(relay, &mut body, "").total(), 1);
         assert_eq!(body["input"].as_array().unwrap().len(), 2);
         assert!(!has_encrypted_items(&body));
 
@@ -354,10 +400,10 @@ mod tests {
             {"type": "reasoning", "id": "rs_new", "summary": [], "encrypted_content": "unit-new"},
         ]});
         let mut elsewhere = next.clone();
-        assert_eq!(strip_remembered(relay, &mut next), 1);
+        assert_eq!(strip_remembered(relay, &mut next).total(), 1);
         assert_eq!(next["input"][0]["id"], "rs_new");
         // 另一家没拒收过：原样保留。
-        assert_eq!(strip_remembered("another-relay", &mut elsewhere), 0);
+        assert_eq!(strip_remembered("another-relay", &mut elsewhere).total(), 0);
         assert_eq!(elsewhere["input"].as_array().unwrap().len(), 2);
     }
 
@@ -375,11 +421,20 @@ mod tests {
         // 没点名：先去推理。
         assert_eq!(
             strip_rejected_batch_at(&memory, "r", &mut body, "could not be verified", now),
-            1
+            Stripped {
+                reasoning: 1,
+                compaction: 0
+            }
         );
         assert_eq!(body["input"].as_array().unwrap().len(), 4);
         // 再被拒：去压缩项（空内容的不算加密项，保留）。
-        assert_eq!(strip_rejected_batch_at(&memory, "r", &mut body, "", now), 2);
+        assert_eq!(
+            strip_rejected_batch_at(&memory, "r", &mut body, "", now),
+            Stripped {
+                reasoning: 0,
+                compaction: 2
+            }
+        );
         assert_eq!(
             body["input"],
             json!([
@@ -387,7 +442,10 @@ mod tests {
                 {"type": "message", "role": "user", "content": "hi"},
             ])
         );
-        assert_eq!(strip_rejected_batch_at(&memory, "r", &mut body, "", now), 0);
+        assert_eq!(
+            strip_rejected_batch_at(&memory, "r", &mut body, "", now).total(),
+            0
+        );
         assert_eq!(memory.lock().unwrap().entries.len(), 3);
     }
 
@@ -401,9 +459,87 @@ mod tests {
         let error = "The encrypted content for item CMP_77 could not be verified.";
         assert_eq!(
             strip_rejected_batch_at(&memory, "r", &mut body, error, Instant::now()),
-            1
+            Stripped {
+                reasoning: 0,
+                compaction: 1
+            }
         );
         assert_eq!(body["input"][0]["id"], "rs_1", "推理项不被连带去掉");
+    }
+
+    #[test]
+    fn compaction_is_kept_while_encrypted_reasoning_remains() {
+        let memory = Mutex::new(Memory::default());
+        let now = Instant::now();
+        let compaction =
+            json!({"type": "compaction", "id": "cmp_9", "encrypted_content": "unit-cmp-9"});
+        // 点名的是推理项：只去推理，压缩结果不动。
+        let mut body = json!({"input": [
+            compaction.clone(),
+            {"type": "reasoning", "id": "rs_9", "summary": [], "encrypted_content": "unit-rs-9"},
+        ]});
+        let error = "The encrypted content for item rs_9 could not be verified.";
+        assert_eq!(
+            strip_rejected_batch_at(&memory, "r", &mut body, error, now),
+            Stripped {
+                reasoning: 1,
+                compaction: 0
+            }
+        );
+        assert_eq!(body["input"], json!([compaction.clone()]));
+        // 推理已不在请求里、仍以同类报错被拒：这时才去压缩结果。
+        assert_eq!(
+            strip_rejected_batch_at(&memory, "r", &mut body, error, now),
+            Stripped {
+                reasoning: 0,
+                compaction: 1
+            }
+        );
+        // 下一轮按记忆提前去掉时，也能分清去掉的是压缩结果。
+        let mut next = json!({"input": [compaction]});
+        assert_eq!(
+            strip_remembered_at(&memory, "r", &mut next, now),
+            Stripped {
+                reasoning: 0,
+                compaction: 1
+            }
+        );
+    }
+
+    #[test]
+    fn memory_is_scoped_per_key_of_the_same_relay() {
+        let memory = Mutex::new(Memory::default());
+        let now = Instant::now();
+        let key_a = memory_scope("pool", Some("sk-key-a"));
+        let key_b = memory_scope("pool", Some("sk-key-b"));
+        assert_ne!(key_a, key_b);
+        assert!(!key_a.contains("sk-key-a"), "不存 Key 原文");
+        assert_eq!(
+            memory_scope("pool", Some("  ")),
+            "pool",
+            "拿不到标识时按供应商记"
+        );
+        assert_eq!(memory_scope("pool", None), "pool");
+
+        let item =
+            json!({"type": "reasoning", "summary": [], "encrypted_content": "unit-signed-by-a"});
+        let mut body = json!({"input": [item.clone()]});
+        assert_eq!(
+            strip_rejected_batch_at(&memory, &key_b, &mut body, "", now).total(),
+            1
+        );
+        // Key B 拒收过，发给 Key A 时原样保留；再发给 Key B 时提前去掉。
+        let mut to_a = json!({"input": [item.clone()]});
+        assert_eq!(
+            strip_remembered_at(&memory, &key_a, &mut to_a, now).total(),
+            0
+        );
+        assert_eq!(to_a["input"].as_array().unwrap().len(), 1);
+        let mut to_b = json!({"input": [item]});
+        assert_eq!(
+            strip_remembered_at(&memory, &key_b, &mut to_b, now).total(),
+            1
+        );
     }
 
     #[test]
@@ -417,17 +553,26 @@ mod tests {
         // 快到期时用到一次：刷新时间。
         let used = start + MEMORY_TTL - Duration::from_secs(60);
         let mut body = json!({"input": [item.clone()]});
-        assert_eq!(strip_remembered_at(&memory, "r", &mut body, used), 1);
+        assert_eq!(
+            strip_remembered_at(&memory, "r", &mut body, used).total(),
+            1
+        );
 
         // 从刷新时刻起还没到期：仍然记得。
         let later = used + MEMORY_TTL - Duration::from_secs(60);
         let mut body = json!({"input": [item.clone()]});
-        assert_eq!(strip_remembered_at(&memory, "r", &mut body, later), 1);
+        assert_eq!(
+            strip_remembered_at(&memory, "r", &mut body, later).total(),
+            1
+        );
 
         // 之后整整一天没用到：忘掉，请求原样发出。
         let expired = later + MEMORY_TTL;
         let mut body = json!({"input": [item.clone()]});
-        assert_eq!(strip_remembered_at(&memory, "r", &mut body, expired), 0);
+        assert_eq!(
+            strip_remembered_at(&memory, "r", &mut body, expired).total(),
+            0
+        );
         assert_eq!(body["input"].as_array().unwrap().len(), 1);
         assert!(memory.lock().unwrap().entries.is_empty());
     }
@@ -461,9 +606,9 @@ mod tests {
                         let content = format!("unit-concurrent-{thread}-{index}");
                         let item = json!({"type": "reasoning", "encrypted_content": content});
                         let mut body = json!({"input": [item.clone()]});
-                        assert_eq!(strip_rejected_batch(relay, &mut body, ""), 1);
+                        assert_eq!(strip_rejected_batch(relay, &mut body, "").total(), 1);
                         let mut again = json!({"input": [item]});
-                        assert_eq!(strip_remembered(relay, &mut again), 1);
+                        assert_eq!(strip_remembered(relay, &mut again).total(), 1);
                     }
                 })
             })

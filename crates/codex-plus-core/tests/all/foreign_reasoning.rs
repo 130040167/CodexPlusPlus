@@ -589,3 +589,140 @@ async fn second_rejection_strips_next_batch_and_third_is_not_retried() {
     assert_eq!(sent.len(), 3, "最多重发两次");
     assert_eq!(sent[2]["input"], json!([user]));
 }
+
+/// 同 [`send_forced`]，另外交回请求日志轨迹（重试原因、自动重试次数）。
+async fn send_forced_traced(
+    relay: &RelayProfile,
+    body: &Value,
+) -> (u16, codex_plus_core::request_log::RequestTrace) {
+    let mut response = open_responses_proxy_request_for_relay(
+        &body.to_string(),
+        BackendSettings::default(),
+        ForcedRelay {
+            relay: relay.clone(),
+            upstream_model: None,
+            auto_retry: false,
+        },
+        None,
+        "/responses",
+        ProxySessionHeaders::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    let status = response.status_code;
+    let trace = response.request_trace.take().expect("请求日志轨迹");
+    response.read_body().await.unwrap();
+    (status, trace)
+}
+
+#[tokio::test]
+async fn dropping_foreign_compaction_is_flagged_in_request_log() {
+    // 推理和压缩结果都是别家签发的：第二批去掉压缩结果时，请求日志单独标出「已去掉别家压缩上下文」，
+    // 它不算一次重试；之后按记忆提前去掉同一压缩结果的请求也照样标出。
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(|incoming: &Request| {
+            if contains_any(incoming, &[FOREIGN, FOREIGN_COMPACTION]) {
+                unverifiable()
+            } else {
+                completed()
+            }
+        })
+        .mount(&server)
+        .await;
+    let relay = relay(&server, "compaction-flag");
+    let user = json!({"type": "message", "role": "user", "content": "继续"});
+    let body = request(vec![
+        compaction("cmp_relay", "compaction", FOREIGN_COMPACTION),
+        user.clone(),
+        reasoning("rs_relay", FOREIGN),
+    ]);
+
+    let (status, trace) = send_forced_traced(&relay, &body).await;
+    assert_eq!(status, 200);
+    assert_eq!(trace.auto_retries, 2);
+    assert_eq!(
+        trace.retry_reasons,
+        vec![
+            "invalid_encrypted_content".to_string(),
+            "invalid_encrypted_content".to_string(),
+            "foreign_compaction_dropped".to_string(),
+        ]
+    );
+
+    // 下一轮：压缩结果按记忆提前去掉，一次就成功，但仍要标出来。
+    let (status, trace) = send_forced_traced(&relay, &body).await;
+    assert_eq!(status, 200);
+    assert_eq!(trace.auto_retries, 0);
+    assert_eq!(
+        trace.retry_reasons,
+        vec!["foreign_compaction_dropped".to_string()]
+    );
+    assert_eq!(received(&server).await.len(), 4);
+
+    // 只去掉推理的请求不带这个标记。
+    let reasoning_only = request(vec![user.clone(), reasoning("rs_relay", FOREIGN)]);
+    let (status, trace) = send_forced_traced(&relay, &reasoning_only).await;
+    assert_eq!(status, 200);
+    assert!(
+        !trace
+            .retry_reasons
+            .iter()
+            .any(|reason| reason == "foreign_compaction_dropped"),
+        "{:?}",
+        trace.retry_reasons
+    );
+}
+
+#[tokio::test]
+async fn rejection_by_one_key_does_not_strip_for_another_key_of_same_relay() {
+    // 同一供应商配了两个 Key：只有 Key B 背后的账号校验不过这段推理（它是 Key A 签发的）。
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(|incoming: &Request| {
+            let key_b = incoming
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("key-b"));
+            if key_b && contains_any(incoming, &[FOREIGN]) {
+                unverifiable()
+            } else {
+                completed()
+            }
+        })
+        .mount(&server)
+        .await;
+    let key_a = RelayProfile {
+        api_key: "sk-fixture-key-a".to_string(),
+        ..relay(&server, "two-keys")
+    };
+    let key_b = RelayProfile {
+        api_key: "sk-fixture-key-b".to_string(),
+        ..key_a.clone()
+    };
+    let user = json!({"type": "message", "role": "user", "content": "继续"});
+    let body = request(vec![user.clone(), reasoning("rs_a", FOREIGN)]);
+
+    // Key B 拒收：去掉推理重发。
+    let (status, _) = send_forced(&key_b, &body).await;
+    assert_eq!(status, 200);
+    let sent = received(&server).await;
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1]["input"], json!([user]));
+
+    // 轮回 Key A：它自己签发的推理原样发出，不被提前去掉。
+    let (status, _) = send_forced(&key_a, &body).await;
+    assert_eq!(status, 200);
+    let sent = received(&server).await;
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[2], body, "发给 Key A 的请求原样转发");
+
+    // 再发给 Key B：按记忆提前去掉，一次就成功。
+    let (status, _) = send_forced(&key_b, &body).await;
+    assert_eq!(status, 200);
+    let sent = received(&server).await;
+    assert_eq!(sent.len(), 4);
+    assert_eq!(sent[3]["input"], json!([user]));
+}
