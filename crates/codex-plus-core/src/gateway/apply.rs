@@ -1133,7 +1133,7 @@ fn write_codex(
         bail!("Codex 的供应商配置总开关已关闭，无法接入网关：先在 Codex 设置里打开");
     }
     // Codex 在 WSL 里运行：网关额外监听 WSL 网卡，地址写成它（#2773）；拿不到时保持回环。
-    let wsl_host = crate::wsl_network::codex_gateway_wsl_host(&ctx.codex_home, ctx.port);
+    let wsl_host = crate::wsl_network::codex_gateway_wsl_host(&ctx.codex_home, ctx.port).address();
     // Codex 自己没登录、池里有网关登录的 ChatGPT 账号：借给 Codex，让它以官方身份接入。
     // WSL 模式下不用官方身份（见 [`codex_gateway_profile_on`]），也就不借。
     let signed_in = codex_signed_in(&ctx.codex_home);
@@ -1823,7 +1823,8 @@ pub fn sync_codex_identity(ctx: &ApplyContext) -> anyhow::Result<bool> {
 
 /// Codex 开着网关时，写进托管供应商的网关主机要跟 Codex 的运行位置一致（#2773）：
 /// 在 WSL 里运行时是 WSL 虚拟网卡地址（网卡地址每次开机可能变），否则是 `127.0.0.1`。
-/// 不一致就重写一次，返回是否重写了。WSL 还没启动、拿不到网卡时保持现状。
+/// 不一致就重写一次，返回是否重写了。只有 WSL 还没启动、暂时拿不到网卡时保持现状；
+/// mirrored 网络、WSL 网卡上绑定失败时 WSL 监听已不在，写过的网卡地址改回回环。
 pub fn sync_codex_wsl_endpoint(ctx: &ApplyContext) -> anyhow::Result<bool> {
     let gateway = ctx.gateway.load()?;
     let Some(binding) = gateway.active_binding(&ToolId::Codex).cloned() else {
@@ -1842,13 +1843,18 @@ pub fn sync_codex_wsl_endpoint(ctx: &ApplyContext) -> anyhow::Result<bool> {
     let in_wsl = crate::wsl_network::codex_runs_in_wsl(&ctx.codex_home);
     // 地址对不上才看要不要识别网卡：不在 WSL 里、写的也是回环时（绝大多数情况）不做任何查询。
     if !in_wsl
-        && !crate::wsl_network::codex_gateway_host_stale(written_host.as_deref(), false, None)
+        && !crate::wsl_network::codex_gateway_host_stale(
+            written_host.as_deref(),
+            crate::wsl_network::WslGatewayHost::Loopback(
+                crate::wsl_network::LoopbackReason::CodexNotInWsl,
+            ),
+        )
     {
         crate::wsl_network::stop_wsl_listener();
         return Ok(false);
     }
     let wsl_host = crate::wsl_network::codex_gateway_wsl_host(&ctx.codex_home, ctx.port);
-    if !crate::wsl_network::codex_gateway_host_stale(written_host.as_deref(), in_wsl, wsl_host) {
+    if !crate::wsl_network::codex_gateway_host_stale(written_host.as_deref(), wsl_host) {
         return Ok(false);
     }
     if let Some(found) = taken_over(ctx, &ToolId::Codex) {

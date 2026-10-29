@@ -1735,6 +1735,24 @@ pub fn reset_gateway_key_health(relay_id: String) -> CommandResult<Option<Gatewa
     ok("已重置该供应商的 Key 状态。", current_payload())
 }
 
+/// 管理器启动（Tauri setup）时调用：[`start_from_saved_state`] 放到后台线程跑，不阻塞窗口出现。
+///
+/// Codex 在 WSL 里运行时，重写配置要先查 WSL 虚拟网卡（PowerShell，最多 8 秒）再等监听绑定
+/// （最多 10 秒），开机自启时同步跑会让窗口晚出现十几秒（#2773 后续）。
+pub fn start_from_saved_state_in_background() {
+    let spawned = std::thread::Builder::new()
+        .name("codex-plus-gateway-startup".to_string())
+        .spawn(start_from_saved_state);
+    if let Err(error) = spawned {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "gateway.startup_thread_failed",
+            serde_json::json!({ "message": error.to_string() }),
+        );
+        // 起不了线程时退回同步执行：宁可启动慢，也不能让走网关的 Agent 没有 helper。
+        start_from_saved_state();
+    }
+}
+
 /// 管理器启动时：有 Agent 开着网关就拉起常驻 helper，并在端口变化或退出 / 更新前恢复过直连的情况下重写配置。
 pub fn start_from_saved_state() {
     // Codex 在 WSL 里运行时（仅 Windows）定期核对网关的 WSL 网卡地址：WSL 往往比 Codex++ 晚启动（#2773）。

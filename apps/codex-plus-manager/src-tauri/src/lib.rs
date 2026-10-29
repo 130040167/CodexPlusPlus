@@ -249,8 +249,9 @@ pub fn run() {
                 app.handle().clone(),
                 start_codex_at_login || start_codex_on_open,
             );
-            // 网关模式：有 Agent 走网关时常驻 helper 必须在线。
-            gateway_commands::start_from_saved_state();
+            // 网关模式：有 Agent 走网关时常驻 helper 必须在线。后台线程里跑，
+            // WSL 网卡查询与监听绑定不拖慢窗口出现。
+            gateway_commands::start_from_saved_state_in_background();
             gateway_commands::start_model_watch();
             // 自动接管官方 App（默认关闭）：设置里开着才起守护线程。
             auto_takeover::start_supervisor();

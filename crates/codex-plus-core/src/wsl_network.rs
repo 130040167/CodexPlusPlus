@@ -35,6 +35,16 @@ pub enum WslGatewayHost {
     Wsl(Ipv4Addr),
 }
 
+impl WslGatewayHost {
+    /// 写给 Codex 的 WSL 网卡地址；保持回环时为 `None`。
+    pub fn address(self) -> Option<Ipv4Addr> {
+        match self {
+            Self::Wsl(addr) => Some(addr),
+            Self::Loopback(_) => None,
+        }
+    }
+}
+
 /// 为什么保持回环（诊断日志用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopbackReason {
@@ -42,8 +52,10 @@ pub enum LoopbackReason {
     CodexNotInWsl,
     /// `.wslconfig` 用的是 mirrored 网络，WSL 里的 127.0.0.1 就是 Windows。
     MirroredNetworking,
-    /// 找不到 WSL 虚拟网卡（WSL 还没启动、或查询失败）。
+    /// 找不到 WSL 虚拟网卡（WSL 还没启动、或查询失败）：暂时的，已写进 Codex 的地址保持现状。
     AdapterUnavailable,
+    /// 拿到了网卡地址，但在它上面监听失败：WSL 监听不在，写给 Codex 的地址要改回回环。
+    BindFailed,
 }
 
 impl LoopbackReason {
@@ -53,6 +65,7 @@ impl LoopbackReason {
             Self::CodexNotInWsl => "codex_not_in_wsl",
             Self::MirroredNetworking => "mirrored_networking",
             Self::AdapterUnavailable => "adapter_unavailable",
+            Self::BindFailed => "bind_failed",
         }
     }
 }
@@ -107,18 +120,15 @@ pub fn wsl_listener_allows(path: &str) -> bool {
 
 /// 已写进 Codex 的网关地址还对不对（纯函数）：要不要重写一次托管供应商。
 ///
-/// - 拿到了 WSL 地址：主机不同就重写；
+/// - 拿到了 WSL 地址且监听就绪：主机不同就重写；
 /// - Codex 在 WSL 里但暂时拿不到网卡（WSL 还没启动）：保持现状，等下一轮；
-/// - 不在 WSL 里：之前写过非回环地址（用户关掉了「在 WSL 中运行」）就改回回环。
-pub fn codex_gateway_host_stale(
-    written_host: Option<&str>,
-    codex_in_wsl: bool,
-    wsl_host: Option<Ipv4Addr>,
-) -> bool {
-    match wsl_host {
-        Some(addr) => written_host != Some(addr.to_string().as_str()),
-        None if codex_in_wsl => false,
-        None => written_host.is_some_and(|host| !is_loopback_host(host)),
+/// - 其余保持回环的情况（不在 WSL 里、`.wslconfig` 改成了 mirrored、WSL 网卡上绑定失败）：
+///   WSL 监听已经不在了，之前写过非回环地址就改回回环，不能让 Codex 一直连失效的 172.x 地址。
+pub fn codex_gateway_host_stale(written_host: Option<&str>, decision: WslGatewayHost) -> bool {
+    match decision {
+        WslGatewayHost::Wsl(addr) => written_host != Some(addr.to_string().as_str()),
+        WslGatewayHost::Loopback(LoopbackReason::AdapterUnavailable) => false,
+        WslGatewayHost::Loopback(_) => written_host.is_some_and(|host| !is_loopback_host(host)),
     }
 }
 
@@ -305,10 +315,12 @@ fn wslconfig_mirrored() -> bool {
 
 /// 识别当前该用的网关主机；在 WSL 模式下确保 WSL 监听已经起来。
 ///
-/// 返回 `Some(地址)` 时该地址上的监听已就绪，可以写进 Codex 的配置；其余情况（不是 Windows、
-/// Codex 不在 WSL 里、mirrored 网络、拿不到网卡、绑定失败）返回 `None`，调用方保持回环地址。
+/// 返回 [`WslGatewayHost::Wsl`] 时该地址上的监听已就绪，可以写进 Codex 的配置；其余情况
+/// （不是 Windows、Codex 不在 WSL 里、mirrored 网络、拿不到网卡、绑定失败）返回
+/// [`WslGatewayHost::Loopback`] 并带上原因：新写配置时用回环地址，核对已写地址时
+/// 按 [`codex_gateway_host_stale`] 决定改回回环还是保持现状。
 /// 不在 WSL 模式时顺手关掉之前开的 WSL 监听。
-pub fn codex_gateway_wsl_host(codex_home: &Path, port: u16) -> Option<Ipv4Addr> {
+pub fn codex_gateway_wsl_host(codex_home: &Path, port: u16) -> WslGatewayHost {
     let in_wsl = codex_runs_in_wsl(codex_home);
     let mirrored = in_wsl && wslconfig_mirrored();
     let adapter = if in_wsl && !mirrored {
@@ -317,20 +329,27 @@ pub fn codex_gateway_wsl_host(codex_home: &Path, port: u16) -> Option<Ipv4Addr> 
         None
     };
     let decision = select_wsl_gateway_host(cfg!(windows), in_wsl, mirrored, adapter);
-    let outcome = match decision {
+    let (decision, outcome) = match decision {
         WslGatewayHost::Wsl(addr) => match ensure_wsl_listener(addr, port) {
-            Ok(()) => Ok(addr),
-            Err(error) => Err(format!("{error:#}")),
+            Ok(()) => (decision, Ok(addr)),
+            // 绑定失败时 ensure_wsl_listener 已经撤掉了旧监听：按回环处理，不保持现状。
+            Err(error) => (
+                WslGatewayHost::Loopback(LoopbackReason::BindFailed),
+                Err(format!(
+                    "{}: {error:#}",
+                    LoopbackReason::BindFailed.as_str()
+                )),
+            ),
         },
         WslGatewayHost::Loopback(reason) => {
             if reason != LoopbackReason::AdapterUnavailable {
                 stop_wsl_listener();
             }
-            Err(reason.as_str().to_string())
+            (decision, Err(reason.as_str().to_string()))
         }
     };
     log_outcome_change(port, &outcome);
-    outcome.ok()
+    decision
 }
 
 /// 识别结果只在变化时记一次诊断日志：守护线程每半分钟查一次，不能刷屏。
@@ -357,6 +376,10 @@ fn log_outcome_change(port: u16, outcome: &Result<Ipv4Addr, String>) {
     };
     let _ = crate::diagnostic_log::append_diagnostic_log("gateway.wsl_host", detail);
 }
+
+/// WSL 监听绑定成功后写进诊断日志的排查提示。
+pub const WSL_LISTENER_FIREWALL_HINT: &str = "已在 WSL 虚拟网卡上监听；如 WSL 内的 Codex 仍连不上网关，\
+     检查 Windows 防火墙（含 Hyper-V 防火墙）是否放行 Codex++ 的入站连接";
 
 struct WslListener {
     addr: Ipv4Addr,
@@ -454,9 +477,14 @@ pub fn ensure_wsl_listener(addr: Ipv4Addr, port: u16) -> anyhow::Result<()> {
     };
     match ready {
         Ok(()) => {
+            // 这里只确认了 Windows 这边能绑定，WSL 能不能连进来还要看 Windows 防火墙；
+            // 不做连通性探测，只在诊断日志里给出排查方向。
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "gateway.wsl_listener.listening",
-                serde_json::json!({ "address": format!("{addr}:{port}") }),
+                serde_json::json!({
+                    "address": format!("{addr}:{port}"),
+                    "hint": WSL_LISTENER_FIREWALL_HINT,
+                }),
             );
             *slot = Some(listener);
             Ok(())
@@ -635,31 +663,65 @@ mod tests {
     }
 
     #[test]
-    fn stale_host_detection_keeps_status_quo_when_adapter_is_missing() {
+    fn stale_host_detection_keeps_status_quo_only_while_adapter_is_missing() {
+        let wsl = WslGatewayHost::Wsl(WSL_IP);
         // 拿到 WSL 地址：写的是回环或旧地址就重写，一致就不动。
-        assert!(codex_gateway_host_stale(
-            Some("127.0.0.1"),
-            true,
-            Some(WSL_IP)
-        ));
-        assert!(codex_gateway_host_stale(
-            Some("172.18.0.1"),
-            true,
-            Some(WSL_IP)
-        ));
-        assert!(!codex_gateway_host_stale(
-            Some("172.29.16.1"),
-            true,
-            Some(WSL_IP)
-        ));
-        // WSL 还没启动：不动。
-        assert!(!codex_gateway_host_stale(Some("172.18.0.1"), true, None));
-        assert!(!codex_gateway_host_stale(Some("127.0.0.1"), true, None));
-        // 关掉了「在 WSL 中运行」：改回回环；本来就是回环不动。
-        assert!(codex_gateway_host_stale(Some("172.18.0.1"), false, None));
-        assert!(!codex_gateway_host_stale(Some("127.0.0.1"), false, None));
-        assert!(!codex_gateway_host_stale(Some("localhost"), false, None));
-        assert!(!codex_gateway_host_stale(None, false, None));
+        assert!(codex_gateway_host_stale(Some("127.0.0.1"), wsl));
+        assert!(codex_gateway_host_stale(Some("172.18.0.1"), wsl));
+        assert!(!codex_gateway_host_stale(Some("172.29.16.1"), wsl));
+        // WSL 还没启动（暂时拿不到网卡）：不动，等下一轮。
+        let pending = WslGatewayHost::Loopback(LoopbackReason::AdapterUnavailable);
+        assert!(!codex_gateway_host_stale(Some("172.18.0.1"), pending));
+        assert!(!codex_gateway_host_stale(Some("127.0.0.1"), pending));
+        // 关掉了「在 WSL 中运行」、`.wslconfig` 改成 mirrored、WSL 网卡上绑定失败、不是 Windows：
+        // WSL 监听已经不在，写过的 172.x 地址改回回环；本来就是回环不动。
+        for reason in [
+            LoopbackReason::CodexNotInWsl,
+            LoopbackReason::MirroredNetworking,
+            LoopbackReason::BindFailed,
+            LoopbackReason::NotWindows,
+        ] {
+            let loopback = WslGatewayHost::Loopback(reason);
+            assert!(
+                codex_gateway_host_stale(Some("172.18.0.1"), loopback),
+                "{reason:?}"
+            );
+            assert!(
+                !codex_gateway_host_stale(Some("127.0.0.1"), loopback),
+                "{reason:?}"
+            );
+            assert!(
+                !codex_gateway_host_stale(Some("localhost"), loopback),
+                "{reason:?}"
+            );
+            assert!(!codex_gateway_host_stale(None, loopback), "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn gateway_host_address_only_for_wsl_listener() {
+        assert_eq!(WslGatewayHost::Wsl(WSL_IP).address(), Some(WSL_IP));
+        assert_eq!(
+            WslGatewayHost::Loopback(LoopbackReason::BindFailed).address(),
+            None
+        );
+        assert_eq!(
+            codex_gateway_host(WslGatewayHost::Wsl(WSL_IP).address()),
+            "172.29.16.1"
+        );
+        assert_eq!(
+            codex_gateway_host(
+                WslGatewayHost::Loopback(LoopbackReason::AdapterUnavailable).address()
+            ),
+            LOOPBACK_HOST
+        );
+    }
+
+    #[test]
+    fn listener_firewall_hint_points_to_windows_firewall() {
+        assert!(WSL_LISTENER_FIREWALL_HINT.contains("Windows 防火墙"));
+        assert!(WSL_LISTENER_FIREWALL_HINT.contains("Codex++"));
+        assert!(!WSL_LISTENER_FIREWALL_HINT.contains("  "));
     }
 
     #[test]
