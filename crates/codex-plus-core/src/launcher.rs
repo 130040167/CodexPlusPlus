@@ -2168,6 +2168,9 @@ pub(crate) async fn handle_helper_connection_on(
                 return Ok(());
             }
         };
+        // 只有转给网关的那一跳才用得上（见 handle_protocol_proxy_connection），这里先取出来（#2783）。
+        let request_client_identity =
+            crate::protocol_proxy::codex_client_identity_headers(&request_headers);
         return handle_protocol_proxy_connection(
             &mut stream,
             &request_body,
@@ -2177,6 +2180,7 @@ pub(crate) async fn handle_helper_connection_on(
                 session_id: request_session_id.as_deref(),
                 thread_id: request_thread_id.as_deref(),
                 opencode_session: request_opencode_session.as_deref(),
+                client_identity: &request_client_identity,
             },
             method,
             path,
@@ -2822,12 +2826,19 @@ pub(crate) async fn handle_protocol_proxy_connection(
     request_body: &str,
     request_user_agent: Option<&str>,
     request_beta_features: Option<&str>,
-    session_headers: crate::protocol_proxy::ProxySessionHeaders<'_>,
+    mut session_headers: crate::protocol_proxy::ProxySessionHeaders<'_>,
     method: &str,
     path: &str,
     remote_addr_text: Option<String>,
     opener: ProxyOpener,
 ) -> anyhow::Result<()> {
+    let hops_through_gateway =
+        matches!(opener, ProxyOpener::Legacy) && crate::gateway::apply::codex_hops_through_gateway();
+    // 直连代理只在「本地代理 → 网关」这一跳带 Codex 的身份头，让网关再转给上游（#2783）；
+    // 直连普通供应商的代理路径保持原样，不额外透传。
+    if matches!(opener, ProxyOpener::Legacy) && !hops_through_gateway {
+        session_headers.client_identity = &[];
+    }
     let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
     let request_thread_id = session_headers
         .thread_id
@@ -2835,8 +2846,7 @@ pub(crate) async fn handle_protocol_proxy_connection(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let quiet = matches!(opener, ProxyOpener::Legacy)
-        && crate::gateway::apply::codex_hops_through_gateway();
+    let quiet = hops_through_gateway;
     let mut request_log = ProxyRequestLog::begin_with(
         method,
         path,

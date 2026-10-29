@@ -159,6 +159,7 @@ async fn send(
                 session_id: conversation,
                 thread_id: None,
                 opencode_session: None,
+                client_identity: &[],
             },
             live_request_id: None,
             auto_retry: false,

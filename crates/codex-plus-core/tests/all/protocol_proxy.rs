@@ -6415,6 +6415,7 @@ async fn responses_proxy_preserves_session_headers_through_both_protocols() {
                     session_id: Some(session_id),
                     thread_id: Some(thread_id),
                     opencode_session: Some(opencode_session),
+                    client_identity: &[],
                 },
             )
             .await
@@ -6492,6 +6493,7 @@ async fn responses_proxy_session_headers_keep_custom_headers_authoritative() {
                 session_id: Some("client-session"),
                 thread_id: Some("client-thread"),
                 opencode_session: Some("client-opencode"),
+                client_identity: &[],
             },
         )
         .await
@@ -6542,6 +6544,7 @@ async fn responses_proxy_omits_empty_or_invalid_session_headers_and_keeps_legacy
                     session_id: Some("   "),
                     thread_id: Some("invalid\r\nx-injected: value"),
                     opencode_session: None,
+                    client_identity: &[],
                 },
             )
             .await

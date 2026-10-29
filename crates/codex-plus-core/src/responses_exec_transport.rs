@@ -46,7 +46,14 @@ pub(crate) fn cache_key(
             .as_bytes(),
     );
     field(user_agent.as_bytes());
-    let mut headers = request.headers().iter().collect::<Vec<_>>();
+    // Codex 透传的轮次级身份头每轮都变，算进键里协商结果就永远命不中（#2783）。
+    let mut headers = request
+        .headers()
+        .iter()
+        .filter(|(name, _)| {
+            !crate::protocol_proxy::is_volatile_client_identity_header(name.as_str())
+        })
+        .collect::<Vec<_>>();
     headers.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
     for (name, value) in headers {
         field(name.as_str().as_bytes());
@@ -272,6 +279,35 @@ mod tests {
         assert_ne!(
             cache_key("relay", &first, &body, "ua-one"),
             cache_key("relay", &second, &body, "ua-two")
+        );
+    }
+
+    #[test]
+    fn identity_ignores_per_turn_codex_headers_but_keeps_originator() {
+        // #2783：轮次级的身份头每轮都变，不能让协商缓存每轮失效；originator 这类稳定头照常算进键。
+        let body = serde_json::json!({"model":"one","tools":[{"type":"custom","name":"exec"}]});
+        let client = reqwest::Client::new();
+        let request = |turn: &str, originator: &str| {
+            client
+                .post("http://localhost/v1/responses")
+                .header("authorization", "Bearer same")
+                .header("originator", originator)
+                .header(
+                    "x-codex-turn-metadata",
+                    format!("{{\"turn_id\":\"{turn}\"}}"),
+                )
+                .header("x-codex-window-id", format!("win:{turn}"))
+                .header("x-client-request-id", turn)
+                .build()
+                .unwrap()
+        };
+        assert_eq!(
+            cache_key("relay", &request("t1", "codex_cli_rs"), &body, "ua"),
+            cache_key("relay", &request("t2", "codex_cli_rs"), &body, "ua")
+        );
+        assert_ne!(
+            cache_key("relay", &request("t1", "codex_cli_rs"), &body, "ua"),
+            cache_key("relay", &request("t1", "codex_exec"), &body, "ua")
         );
     }
 

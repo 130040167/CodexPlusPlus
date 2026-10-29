@@ -1897,6 +1897,58 @@ pub struct ProxySessionHeaders<'a> {
     pub session_id: Option<&'a str>,
     pub thread_id: Option<&'a str>,
     pub opencode_session: Option<&'a str>,
+    /// Codex 的客户端身份头（`originator`、`x-codex-*` 等，见 [`CODEX_CLIENT_IDENTITY_HEADERS`]）。
+    /// 只有 Codex 经网关时才非空，原样发给 Responses 上游（#2783）。
+    pub client_identity: &'a [(String, String)],
+}
+
+/// Codex 经网关时原样透传给上游的客户端身份 / 会话头（#2783）。
+///
+/// 中转站（如开了「仅允许 Codex 官方客户端」的 sub2api）按 UA、`originator` 和
+/// `x-codex-*` 头判断是不是官方客户端；网关只转发 UA 时会被 403 拒绝。
+/// 名单只收身份与会话类的头：鉴权、Host、Content-Length、Cookie 等一律不在其中；
+/// `x-codex-turn-state` 是上游签发的粘性路由令牌，网关可能换上游，不透传。
+pub const CODEX_CLIENT_IDENTITY_HEADERS: &[&str] = &[
+    "originator",
+    "x-codex-beta-features",
+    "x-codex-window-id",
+    "x-codex-turn-metadata",
+    "x-codex-installation-id",
+    "x-codex-parent-thread-id",
+    "x-openai-subagent",
+    "x-client-request-id",
+];
+
+/// 每轮甚至每个请求都会变的身份头：不参与 exec 适配协商缓存的键，否则缓存每轮都失效。
+pub(crate) fn is_volatile_client_identity_header(name: &str) -> bool {
+    [
+        "x-codex-window-id",
+        "x-codex-turn-metadata",
+        "x-codex-parent-thread-id",
+        "x-client-request-id",
+    ]
+    .iter()
+    .any(|volatile| name.eq_ignore_ascii_case(volatile))
+}
+
+/// 从原始 HTTP 请求头文本（首行是请求行）里取出 [`CODEX_CLIENT_IDENTITY_HEADERS`] 里的头。
+pub fn codex_client_identity_headers(raw_headers: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for line in raw_headers.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim();
+        if value.is_empty()
+            || !CODEX_CLIENT_IDENTITY_HEADERS.contains(&name.as_str())
+            || found.iter().any(|(seen, _): &(String, String)| *seen == name)
+        {
+            continue;
+        }
+        found.push((name, value.to_string()));
+    }
+    found
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -5820,8 +5872,49 @@ fn build_responses_upstream_request(
         if let Some(value) = beta_features.filter(|value| !value.is_empty()) {
             builder = builder.header("x-codex-beta-features", value);
         }
+        // 官方登录通道自己定 originator 等身份头，不叠加客户端带来的。
+        if official_credential.is_none() {
+            builder = with_client_identity_headers(
+                builder,
+                relay,
+                session_headers.client_identity,
+                beta_features.is_some_and(|value| !value.is_empty()),
+            );
+        }
     }
     Ok(builder)
+}
+
+/// Codex 的客户端身份头（#2783）：供应商显式配了同名头时以供应商为准，避免发出两个同名头。
+fn with_client_identity_headers(
+    mut builder: reqwest::RequestBuilder,
+    relay: &crate::settings::RelayProfile,
+    identity: &[(String, String)],
+    beta_features_sent: bool,
+) -> reqwest::RequestBuilder {
+    for (name, value) in identity {
+        // 名单外的头一律不发；调用方传进来的也再核对一次。
+        if !CODEX_CLIENT_IDENTITY_HEADERS
+            .iter()
+            .any(|allowed| name.eq_ignore_ascii_case(allowed))
+        {
+            continue;
+        }
+        if beta_features_sent && name.eq_ignore_ascii_case("x-codex-beta-features") {
+            continue;
+        }
+        if relay
+            .custom_headers
+            .iter()
+            .any(|header| header.key.trim().eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(value.trim()) {
+            builder = builder.header(name.as_str(), value);
+        }
+    }
+    builder
 }
 
 fn upstream_request_builder(

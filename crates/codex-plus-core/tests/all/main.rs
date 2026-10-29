@@ -46,6 +46,7 @@ mod force_chinese_locale_settings;
 mod foreign_reasoning;
 mod gateway_account_proxy;
 mod gateway_apply;
+mod gateway_codex_identity;
 mod gateway_forced_relay;
 mod gateway_key_limits;
 mod gateway_provider_keys;

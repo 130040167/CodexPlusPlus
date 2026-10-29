@@ -511,6 +511,8 @@ async fn attempt_pipeline(
             session_id: Some(cache_key.as_str()),
             thread_id: Some(cache_key.as_str()),
             opencode_session: None,
+            // ChatGPT 后端的身份头由官方登录通道自己定，不沿用客户端带来的。
+            client_identity: &[],
         }
     } else {
         request.session_headers
