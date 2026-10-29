@@ -456,9 +456,11 @@ function GroupCard({
         {group.members.length === 0 ? <li className="gw-route-member-empty">{t("没有成员")}</li> : null}
       </ol>
       <footer className="gw-route-group-foot">
-        <label className="gw-route-hide" title={t("打开后，组里的模型不再单独出现在 Agent 的模型列表里，只能通过这个组来选；直接写名字仍然能用。")}>
-          <Switch disabled={disabled} label={t("隐藏成员")} on={group.hideMembers === true} onToggle={() => onChange({ hideMembers: !group.hideMembers })} />
-          <span>{t("隐藏成员")}</span>
+        <label className="gw-route-hide" title={t(auto
+          ? "其他 Agent 隐藏组内成员；Codex 的供应商分组保持完整。"
+          : "在 Codex 模型列表隐藏这个组入口，供应商分组保持完整；直接写模型组名称仍可使用。")}>
+          <Switch disabled={disabled} label={t(auto ? "隐藏成员" : "在 Codex 隐藏模型组")} on={group.hideMembers === true} onToggle={() => onChange({ hideMembers: !group.hideMembers })} />
+          <span>{t(auto ? "隐藏成员" : "在 Codex 隐藏模型组")}</span>
         </label>
         <span className="gw-route-group-mode">{t(groupModeDescription(group.mode))}</span>
         <span className="gw-row-buttons">

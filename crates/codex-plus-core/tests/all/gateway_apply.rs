@@ -1773,7 +1773,6 @@ fn gateway_catalog_refresh_follows_model_sync_and_pool_changes() {
                 model: format!("{second}/synced-*"),
                 weight: 1,
             }],
-            hide_members: true,
             ..GroupInput::default()
         },
     )
@@ -1802,8 +1801,12 @@ fn gateway_catalog_refresh_follows_model_sync_and_pool_changes() {
     )
     .unwrap();
     refresh_enabled(ctx).unwrap();
-    assert!(!entries().iter().any(|entry| entry["slug"] == "synced-model"));
-    assert!(entries().iter().any(|entry| entry["display_name"] == "Renamed"));
+    assert!(entries().iter().any(|entry| entry["slug"] == "synced-model"));
+    assert!(
+        !entries()
+            .iter()
+            .any(|entry| entry["slug"] == format!("group/{group}"))
+    );
     delete_group(&ctx.gateway, &group).unwrap();
     refresh_enabled(ctx).unwrap();
     assert!(
@@ -1861,6 +1864,127 @@ fn gateway_catalog_refresh_follows_model_sync_and_pool_changes() {
             .iter()
             .any(|entry| entry["codex_plus_group_id"] == second)
     );
+}
+
+#[test]
+fn codex_hidden_group_preserves_supplier_models_and_other_groups() {
+    let fixture = fixture(57387);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    ctx.settings
+        .save(&BackendSettings {
+            relay_profiles_enabled: true,
+            ..BackendSettings::default()
+        })
+        .unwrap();
+    let mut input = deepseek_input();
+    input.name = "First".into();
+    input.model = "gpt-6.1-sol".into();
+    input.model_list = "gpt-6.1-sol".into();
+    let (_, first) = create_provider(&ctx.gateway, &input, "", None).unwrap();
+    input.name = "Second".into();
+    let (_, second) = create_provider(&ctx.gateway, &input, "", None).unwrap();
+    let (_, visible_group) = save_group(
+        &ctx.gateway,
+        &GroupInput {
+            name: "Coding".into(),
+            members: vec![GroupMember {
+                model: format!("{second}/gpt-6.1-sol"),
+                weight: 1,
+            }],
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    let (_, hidden_group) = save_group(
+        &ctx.gateway,
+        &GroupInput {
+            name: "Hidden".into(),
+            hide_members: true,
+            members: vec![
+                GroupMember {
+                    model: format!("group/{visible_group}"),
+                    weight: 1,
+                },
+                GroupMember {
+                    model: format!("{second}/gpt-6.1-sol"),
+                    weight: 1,
+                },
+            ],
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    enable_binding(
+        ctx,
+        &ToolId::Codex,
+        AgentBinding {
+            model: format!("group/{visible_group}"),
+            extra_models: vec![format!("group/{hidden_group}")],
+            ..AgentBinding::default()
+        },
+    )
+    .unwrap();
+    let catalog = codex_catalog(ctx);
+    let entries = catalog["models"].as_array().unwrap();
+    for (id, name) in [(&first, "First"), (&second, "Second")] {
+        let model = format!("{id}/gpt-6.1-sol");
+        let entry = entries.iter().find(|entry| entry["slug"] == model).unwrap();
+        assert_eq!(entry["codex_plus_group"], name);
+    }
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["slug"] == format!("group/{visible_group}"))
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry["slug"] == format!("group/{hidden_group}"))
+    );
+    assert!(
+        ctx.gateway
+            .load()
+            .unwrap()
+            .groups
+            .iter()
+            .any(|group| group.id == hidden_group)
+    );
+
+    // 默认恰好是隐藏组时，原生目录仍保留它的能力，但不能重新显示为可选入口。
+    let hidden_model = format!("group/{hidden_group}");
+    enable_binding(
+        ctx,
+        &ToolId::Codex,
+        AgentBinding {
+            model: hidden_model.clone(),
+            ..AgentBinding::default()
+        },
+    )
+    .unwrap();
+    let catalog = codex_catalog(ctx);
+    let entries = catalog["models"].as_array().unwrap();
+    let hidden = entries
+        .iter()
+        .find(|entry| entry["slug"] == hidden_model)
+        .unwrap();
+    assert_eq!(hidden["visibility"], "hide");
+    assert_eq!(hidden["display_name"], "Hidden");
+    assert_eq!(hidden["codex_plus_group"], "模型组");
+    assert_eq!(
+        codex_plus_core::model_suffix::model_ui_metadata_with_override(&hidden_model, Some(hidden))
+            .unwrap()["hidden"],
+        true
+    );
+    let config: toml::Value = toml::from_str(&codex_config(ctx)).unwrap();
+    assert_eq!(config["model"].as_str(), Some(hidden_model.as_str()));
+    for id in [&first, &second] {
+        let entry = entries
+            .iter()
+            .find(|entry| entry["slug"] == format!("{id}/gpt-6.1-sol"))
+            .unwrap();
+        assert_eq!(entry["visibility"], "list");
+    }
 }
 
 #[test]

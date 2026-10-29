@@ -11528,7 +11528,7 @@
       name: modelName,
       displayName: metadata?.displayName || modelName,
       description: metadata?.description || codexModelCatalog.provider_name || codexModelCatalog.model_provider || "当前供应商模型",
-      hidden: false,
+      hidden: metadata?.hidden === true,
       isDefault: false,
       defaultReasoningEffort: metadata?.defaultReasoningEffort || "medium",
       supportedReasoningEfforts: modelReasoningEfforts(modelName),
@@ -11703,8 +11703,9 @@
     const existing = new Map(models.map((item) => [item.model, item]));
     models.forEach((item) => {
       if (customModels.includes(item.model)) {
-        if (item.hidden !== false) {
-          item.hidden = false;
+        const hidden = codexPlusModelMetadata(item.model)?.hidden === true;
+        if (item.hidden !== hidden) {
+          item.hidden = hidden;
           changed = true;
         }
         if (applyCodexPlusModelMetadata(item, item.model)) changed = true;
@@ -11769,12 +11770,12 @@
     }
     if (Array.isArray(value.hiddenModels)) {
       const before = value.hiddenModels.length;
-      value.hiddenModels = value.hiddenModels.filter((name) => !names.includes(name));
+      value.hiddenModels = value.hiddenModels.filter((name) => !names.includes(name) || codexPlusModelMetadata(name)?.hidden === true);
       if (value.hiddenModels.length !== before) changed = true;
     }
     if (Array.isArray(value.hidden_models)) {
       const before = value.hidden_models.length;
-      value.hidden_models = value.hidden_models.filter((name) => !names.includes(name));
+      value.hidden_models = value.hidden_models.filter((name) => !names.includes(name) || codexPlusModelMetadata(name)?.hidden === true);
       if (value.hidden_models.length !== before) changed = true;
     }
     if (patchModelDefaults(value, allowed)) changed = true;

@@ -436,7 +436,16 @@ fn codex_model_metadata(
     let relays = route::binding_pool_relays(gateway, binding);
     let mut member_catalogs: Vec<Option<Vec<Value>>> = vec![None; relays.len()];
     let mut metadata = Map::new();
-    for (model, _) in crate::tools::grok::parse_grok_model_list(model_list) {
+    let mut models = crate::tools::grok::parse_grok_model_list(model_list);
+    let default_model = binding_default_model(gateway, binding);
+    if !models
+        .iter()
+        .any(|(model, _)| model.eq_ignore_ascii_case(&default_model))
+    {
+        // 当前默认仍要保留能力与显示名；隐藏只控制入口，不改变正在使用的路由。
+        models.push((default_model, None));
+    }
+    for (model, _) in models {
         if let Some(id) = model.strip_prefix(GROUP_MODEL_PREFIX) {
             let Some(group) = gateway
                 .groups
@@ -489,6 +498,9 @@ fn codex_model_metadata(
             fields.insert("description".into(), json!(format!("{model} · 模型组")));
             fields.insert("codex_plus_group".into(), json!("模型组"));
             fields.insert("codex_plus_group_id".into(), json!(CODEX_GROUPS_GROUP_ID));
+            if group.hide_members {
+                fields.insert("visibility".into(), json!("hide"));
+            }
             if codex_favorite(gateway, &relays, &model) {
                 fields.insert("codex_plus_favorite".into(), json!(true));
             }
@@ -3258,7 +3270,7 @@ pub struct GroupInput {
     pub sticky: GroupSticky,
     #[serde(default)]
     pub members: Vec<GroupMember>,
-    /// 隐藏成员：组里的模型不再单独出现在 Agent 的模型列表里。
+    /// Codex 隐藏本组入口，供应商模型池保持完整；其他 Agent 沿用成员隐藏行为。
     #[serde(default)]
     pub hide_members: bool,
     /// 手动模式下选中的成员。

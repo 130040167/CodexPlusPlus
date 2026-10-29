@@ -240,7 +240,7 @@ pub struct GatewayGroup {
     pub sticky: GroupSticky,
     #[serde(default)]
     pub members: Vec<GroupMember>,
-    /// 隐藏成员：组里的模型不再单独出现在 Agent 的模型列表里，只能通过这个组来选（直接写名字仍能用）。
+    /// Codex 隐藏本组入口，供应商模型池保持完整；其他 Agent 沿用成员隐藏行为。
     #[serde(default, skip_serializing_if = "is_false")]
     pub hide_members: bool,
     /// 手动模式下选中的成员（成员的模型名）；空串表示第一个成员。

@@ -36,7 +36,7 @@ function runtime(sharedWindow: any = {}) {
   const declarations = source.slice(source.indexOf("  let codexModelCatalog ="), source.indexOf("  if (window.__CODEX_PLUS_TEST_SERVICE_TIER__)"));
   const functions = source.slice(source.indexOf("  function codexPlusModelUnlockEnabled()"), source.indexOf("  function appServerModelRequestMethod("));
   const api = vm.runInContext(`(() => {${declarations}${functions}
-    return { loadCodexModelCatalog, refreshCodexModelCatalogForSettings, patchModelArray,
+    return { loadCodexModelCatalog, refreshCodexModelCatalogForSettings, patchModelArray, patchModelContainer,
       installModelJsonResponsePatch, patchStatsigModelWhitelist,
       catalog: () => codexModelCatalog }; })()`, context);
   return { api, pending, rejected, invalidated, queries, window: sharedWindow, tick: () => { now += 11000; },
@@ -96,6 +96,28 @@ it("same-id gateway metadata changes update names, reasoning levels and favorite
   await settle();
   assert.equal(r.api.catalog().modelMetadata["a/sol"].displayName, "Sol new");
   assert.equal(r.api.catalog().modelMetadata["a/sol"].codex_plus_favorite, true);
+});
+it("a hidden default group retains its model identity without being unhidden by catalog patches", async () => {
+  const r = runtime(), first = r.api.loadCodexModelCatalog();
+  r.pending.shift()!(catalog(["group/1", "a/sol"], {
+    "group/1": { displayName: "Routing group", hidden: true },
+  }));
+  await first;
+  const value = { hostId: "local", models: [{ model: "group/1", hidden: false }],
+    hiddenModels: ["group/1", "a/sol"], defaultModel: "group/1" };
+  r.api.patchModelContainer(value);
+  assert.equal(value.models.find(model => model.model === "group/1")?.hidden, true);
+  assert.equal(value.models.find(model => model.model === "a/sol")?.hidden, false);
+  assert.deepEqual([...value.hiddenModels], ["group/1"]);
+  assert.equal(value.defaultModel, "group/1", "hiding a group must not replace the configured default");
+  const models: any[] = [];
+  r.api.patchModelArray(models, true, "local");
+  assert.equal(models.find(model => model.model === "group/1").hidden, true, "new descriptors also respect visibility");
+  const refreshed = r.api.loadCodexModelCatalog(true);
+  r.pending.shift()!(catalog(["group/1", "a/sol"], { "group/1": { displayName: "Routing group" } }));
+  await refreshed;
+  r.api.patchModelArray(models, true, "local");
+  assert.equal(models.find(model => model.model === "group/1").hidden, false, "showing the group must restore its entry");
 });
 it("temporary failures keep the last successful catalog and retry with bounded backoff", async () => {
   const r = runtime(), first = r.api.loadCodexModelCatalog();
