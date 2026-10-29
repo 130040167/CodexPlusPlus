@@ -126,8 +126,20 @@ impl ExecOutcome {
 /// Rebuilds the response with every inspected byte followed by its unread body.
 /// A timeout or size overflow therefore retains ordinary upstream error handling.
 pub(crate) async fn inspect_rejection(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     request: &Value,
+) -> anyhow::Result<(reqwest::Response, bool)> {
+    inspect_error_body(response, |status, content_type, body| {
+        crate::responses_exec::is_explicit_exec_rejection(status, content_type, body, request)
+    })
+    .await
+}
+
+/// 有上限地预读错误响应体交给 `matcher` 判断，再把读过的字节接回去重建响应；
+/// 没读完整（超时、超长）时一律判为不匹配，原响应照常交给后续处理。
+pub(crate) async fn inspect_error_body(
+    mut response: reqwest::Response,
+    matcher: impl FnOnce(u16, &str, &[u8]) -> bool,
 ) -> anyhow::Result<(reqwest::Response, bool)> {
     let status = response.status();
     let version = response.version();
@@ -164,13 +176,7 @@ pub(crate) async fn inspect_rejection(
             Err(_) => break,
         }
     }
-    let matches = complete
-        && crate::responses_exec::is_explicit_exec_rejection(
-            status.as_u16(),
-            content_type,
-            &inspected,
-            request,
-        );
+    let matches = complete && matcher(status.as_u16(), content_type, &inspected);
     let body = reqwest::Body::wrap_stream(
         futures_util::stream::iter(chunks).chain(response.bytes_stream()),
     );

@@ -43,6 +43,7 @@ mod floating_panel_outline;
 mod floating_panel_runtime;
 mod floating_panel_stepwise;
 mod force_chinese_locale_settings;
+mod foreign_reasoning;
 mod gateway_account_proxy;
 mod gateway_apply;
 mod gateway_forced_relay;

@@ -3682,6 +3682,20 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             .to_string();
         // Codex 托管的网关供应商：这一跳的上游就是本机网关，它自己按候选控制超时。
         let via_gateway = relay.id == crate::gateway::apply::CODEX_GATEWAY_RELAY_ID;
+        // 别家签发的加密推理（#2777）：只在发往真实上游时处理（网关那一跳由网关自己处理）；
+        // 「严格推理历史」的约定是认证失败不降级，开着时不动。
+        let foreign_reasoning_handled = wire_api == UpstreamWireApi::Responses
+            && !via_gateway
+            && !relay.strict_responses_reasoning;
+        if foreign_reasoning_handled {
+            let skipped = crate::foreign_reasoning::strip_remembered(&relay.id, &mut upstream_body);
+            if skipped > 0 {
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "protocol_proxy.foreign_reasoning_skipped",
+                    json!({"relayId": relay.id, "relayName": relay.name, "skipped": skipped}),
+                );
+            }
+        }
         let header_timeout =
             responses_request_header_timeout(is_stream, is_compaction_request, via_gateway);
         let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -3863,6 +3877,77 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     );
                 }
             }
+        }
+
+        // #2777：上游明确说历史里的加密推理校验不过（多半是同一对话里上一家签发的），
+        // 去掉加密推理项原样重发一次；没报这个错的请求不预读、不改动。
+        if foreign_reasoning_handled
+            && status_code == 400
+            && crate::foreign_reasoning::has_encrypted_reasoning(&upstream_body)
+        {
+            let retry = async {
+                let (inspected, rejected) = crate::responses_exec_transport::inspect_error_body(
+                    upstream,
+                    |status, _, body| {
+                        crate::foreign_reasoning::is_unverifiable_reasoning_rejection(status, body)
+                    },
+                )
+                .await?;
+                if !rejected {
+                    return Ok::<_, anyhow::Error>(inspected);
+                }
+                let mut stripped = upstream_body.clone();
+                let removed = crate::foreign_reasoning::strip_and_remember(&relay.id, &mut stripped);
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "protocol_proxy.foreign_reasoning_retry",
+                    json!({
+                        "relayId": relay.id,
+                        "relayName": relay.name,
+                        "stripped": removed,
+                        "stream": is_stream
+                    }),
+                );
+                retry_reasons.push(crate::foreign_reasoning::RETRY_REASON.to_string());
+                if let Some(id) = live_request_id {
+                    crate::request_log::update_running_retry(
+                        id,
+                        request_attempt as u32,
+                        retry_reasons.len() as u32,
+                        retry_reasons.clone(),
+                    );
+                }
+                let retried = send_responses_upstream_request(
+                    &relay, &endpoint, &stripped, wire_api, is_stream,
+                    original_user_agent, beta_features, session_headers, official_credential.as_ref(),
+                    header_timeout,
+                ).await?;
+                upstream_body = stripped;
+                Ok(retried)
+            };
+            upstream = match retry.await {
+                Ok(response) => response,
+                Err(error) => {
+                    if exec_adapted && let Some(key) = key.as_ref() {
+                        crate::responses_exec_transport::evict(key);
+                    }
+                    if !strict_aggregate_model {
+                        crate::relay_rotation::record_relay_request_failure(&settings);
+                    }
+                    if has_more_candidates {
+                        continue;
+                    }
+
+                    return Err(error).with_context(|| {
+                        format!(
+                            "供应商「{}」请求上游失败，endpoint: {}",
+                            relay.name, endpoint
+                        )
+                    });
+                }
+            };
+            status_code = upstream.status().as_u16();
+            content_type = upstream.headers().get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()).unwrap_or("").to_string();
         }
 
         if eligible && !exec_adapted && !exec_negotiation_used && status_code == 400 {
