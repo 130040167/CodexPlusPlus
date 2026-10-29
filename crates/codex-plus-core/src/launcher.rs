@@ -1391,6 +1391,40 @@ impl LaunchHooks for DefaultLaunchHooks {
                 else {
                     unreachable!();
                 };
+                // issue #2764：主 Codex 已经开着（开始菜单 / 托盘）但没带本次调试端口时，
+                // 单实例锁在它手里，AUMID 激活和包上下文兜底拉起的进程都会把参数交给它后
+                // 立即退出，端口永远等不到。先识别出来直接给出可操作的提示，不再空跑兜底。
+                #[cfg(windows)]
+                {
+                    let executable = crate::app_paths::build_codex_executable(app_dir);
+                    let blocking = existing_main_instances_blocking_debug_launch(
+                        &executable,
+                        debug_port,
+                        &launch_extra_args,
+                    )
+                    .await;
+                    if !blocking.is_empty() {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.packaged_existing_main_instance_blocks_launch",
+                            serde_json::json!({
+                                "app_user_model_id": app_user_model_id,
+                                "debug_port": debug_port,
+                                "process_ids": blocking,
+                            }),
+                        );
+                        let executable_name = executable
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "Codex".to_string());
+                        anyhow::bail!(
+                            crate::packaged_launch::existing_main_instance_blocks_launch_message(
+                                debug_port,
+                                &executable_name,
+                                &blocking,
+                            )
+                        );
+                    }
+                }
                 match activate_packaged_app(app_user_model_id, arguments).await {
                     Ok(process_id) => {
                         #[cfg(windows)]
@@ -4734,6 +4768,56 @@ fn codex_process_ids_for_diagnostics(executable: &Path) -> Vec<u32> {
         .collect()
 }
 
+/// 找出会挡住本次带调试端口启动的主 Codex 进程（issue #2764）。
+///
+/// 只有「调试端口当前没有 Codex 在应答」且「确有没带本次端口的主进程」时才返回非空；
+/// 归类逻辑见 `packaged_launch::main_instances_blocking_debug_launch`（纯函数，有单测）。
+#[cfg(windows)]
+async fn existing_main_instances_blocking_debug_launch(
+    executable: &Path,
+    debug_port: u16,
+    launch_args: &[String],
+) -> Vec<u32> {
+    let executable = executable.to_path_buf();
+    let launch_args = launch_args.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let Some(file_name) = executable.file_name().map(|name| name.to_string_lossy()) else {
+            return Vec::new();
+        };
+        let executable_text = executable.to_string_lossy();
+        // 只认同一 MSIX 包族里的同名进程：另装的 ChatGPT 桌面版也叫 ChatGPT.exe。
+        let candidates = crate::windows_integration::enumerate_processes()
+            .into_iter()
+            .filter(|info| info.exe_file.eq_ignore_ascii_case(&file_name))
+            .filter(|info| {
+                info.executable_path.as_deref().is_some_and(|path| {
+                    crate::packaged_launch::same_windows_apps_package_family(
+                        &path.to_string_lossy(),
+                        &executable_text,
+                    )
+                })
+            })
+            .map(|info| info.process_id)
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let blocking = crate::packaged_launch::main_instances_blocking_debug_launch(
+            candidates,
+            debug_port,
+            &launch_args,
+            crate::windows_integration::process_command_line,
+        );
+        // 端口上已经有 Codex 在应答时交给原有流程（激活会复用它），不拦。
+        if blocking.is_empty() || crate::cdp::endpoint_available(debug_port) {
+            return Vec::new();
+        }
+        blocking
+    })
+    .await
+    .unwrap_or_default()
+}
+
 /// 主实例的包上下文兜底启动（issue #2700）：AUMID 激活后进程秒退时，改用
 /// `Invoke-CommandInDesktopPackage` wrapper 带同一份参数拉起 exe，并等待调试端口就绪。
 ///
@@ -4762,10 +4846,17 @@ async fn launch_packaged_main_in_package_context(
         crate::packaged_launch::present_scrubbed_env_vars(|name| std::env::var_os(name).is_some());
     let elevated = crate::windows_integration::current_process_is_elevated();
     let codex_pids_before = codex_process_ids_for_diagnostics(&executable);
+    // 宿主等端口期间顺带观察同名进程：区分「Codex 根本没起来」与「起来后又退了」。
+    let watch_process = executable
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned());
+    // wrapper 轨迹只认这之后写下的，避免把上一次的当成这次执行过。
+    let activation_started_at = std::time::SystemTime::now();
     let activation = match crate::packaged_launch::activate_in_package_context_with_report(
         app_user_model_id,
         &wrapper_path,
         Some(debug_port),
+        watch_process.as_deref(),
     )
     .await
     {
@@ -4782,6 +4873,10 @@ async fn launch_packaged_main_in_package_context(
                     "elevated": elevated,
                     "scrubbed_env": scrubbed_env,
                     "codex_pids_before": codex_pids_before,
+                    "wrapper_trace": crate::packaged_launch::read_main_wrapper_trace(
+                        &wrapper_path,
+                        activation_started_at,
+                    ),
                 }),
             );
             // 带上完整错误链：issue #2747 只看到外层一句话，根因被吞掉了。
@@ -4798,6 +4893,15 @@ async fn launch_packaged_main_in_package_context(
     .await
     .unwrap_or(false);
     let codex_pids_after = codex_process_ids_for_diagnostics(&executable);
+    // 宿主观察期间新出现过的进程（不在回退前的快照里）。
+    let codex_pids_new_in_host = activation.seen_process_ids.as_ref().map(|seen| {
+        seen.iter()
+            .copied()
+            .filter(|id| !codex_pids_before.contains(id))
+            .collect::<Vec<_>>()
+    });
+    let wrapper_trace =
+        crate::packaged_launch::read_main_wrapper_trace(&wrapper_path, activation_started_at);
     let _ = crate::diagnostic_log::append_diagnostic_log(
         "launcher.packaged_context_main_launch",
         serde_json::json!({
@@ -4817,18 +4921,25 @@ async fn launch_packaged_main_in_package_context(
             "scrubbed_env": scrubbed_env,
             "codex_pids_before": codex_pids_before,
             "codex_pids_after": codex_pids_after,
+            "codex_pids_seen_in_host": activation.seen_process_ids,
+            "codex_pids_new_in_host": codex_pids_new_in_host,
+            "wrapper_trace": wrapper_trace,
         }),
     );
     if !ready {
         anyhow::bail!(
             "Codex 通过 AUMID 激活后立即退出，改用包上下文启动后 {} 秒内调试端口 {debug_port} 仍未就绪\
-             （宿主内端口{}，当前 Codex 进程 {} 个；详见 codex-plus.log 的 launcher.packaged_context_main_launch）",
+             （宿主内端口{}，{}，当前 Codex 进程 {} 个；详见 codex-plus.log 的 launcher.packaged_context_main_launch）",
             PACKAGED_CONTEXT_READY_TIMEOUT.as_secs(),
             match activation.port_ready_in_host {
                 Some(true) => "曾可连接",
                 Some(false) => "始终不可连接",
                 None => "状态未知",
             },
+            crate::packaged_launch::package_context_launch_observation(
+                codex_pids_new_in_host.as_deref(),
+                wrapper_trace.is_some(),
+            ),
             codex_pids_after.len()
         );
     }

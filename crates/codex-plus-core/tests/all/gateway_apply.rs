@@ -1760,3 +1760,187 @@ fn unsigned_codex_gateway_declares_local_api_identity_for_native_fast() {
         config()
     );
 }
+
+/// 直连模式：供应商模板里有用户自己的根级设置（`model_instructions_file`）和直连上游的模型参数，
+/// 通用配置里有 `developer_instructions`（#2771）。
+fn seed_direct_with_user_root_settings(ctx: &ApplyContext) {
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    let mut direct = codex_plus_core::provider_import::pool_relay_profile(
+        "直连",
+        "https://api.direct.test/v1",
+        "sk-direct",
+        RelayProtocol::Responses,
+        "gpt-direct",
+        "gpt-direct",
+        &[],
+    )
+    .unwrap();
+    direct.id = "direct".into();
+    direct.relay_mode = RelayMode::PureApi;
+    direct.config_contents = format!(
+        "model_instructions_file = \"~/.codex/instruction.md\"\nreview_model = \"gpt-direct-review\"\nmodel_reasoning_effort = \"xhigh\"\n{}",
+        direct.config_contents
+    );
+    codex_plus_core::relay_config::normalize_relay_profile_for_storage(&mut direct).unwrap();
+    let mut seeded = BackendSettings::default();
+    seeded.relay_profiles_enabled = true;
+    seeded.relay_profiles = vec![direct];
+    seeded.active_relay_id = "direct".into();
+    seeded.relay_common_config_contents = "developer_instructions = \"按团队规范回答\"\n".into();
+    codex_plus_core::relay_switch::switch_relay_profile_in_home(
+        &ctx.settings,
+        &ctx.codex_home,
+        seeded,
+        "",
+    )
+    .unwrap();
+}
+
+fn codex_config(ctx: &ApplyContext) -> String {
+    std::fs::read_to_string(ctx.codex_home.join("config.toml")).unwrap()
+}
+
+/// 网关托管的键是网关的值，直连上游的路由 / 模型参数没有带进来。
+fn assert_gateway_owns_routing(config: &str, port: u16) {
+    let parsed: toml::Value = toml::from_str(config).unwrap();
+    assert_eq!(parsed["model"].as_str(), Some("deepseek-v4-pro"), "{config}");
+    assert_eq!(parsed["model_provider"].as_str(), Some("custom"), "{config}");
+    assert_eq!(
+        parsed["model_providers"]["custom"]["base_url"].as_str(),
+        Some(format!("http://127.0.0.1:{port}/gw/codex/v1").as_str()),
+        "{config}"
+    );
+    assert!(parsed.get("model_catalog_json").is_some(), "{config}");
+    assert!(parsed.get("review_model").is_none(), "{config}");
+    assert!(parsed.get("model_reasoning_effort").is_none(), "{config}");
+    assert!(!config.contains("api.direct.test"), "{config}");
+    assert!(!config.contains("sk-direct"), "{config}");
+}
+
+/// #2771：网关模式下用户自己的根级设置（来自直连供应商写下的实时配置、通用配置、接入期间对实时配置的改动）
+/// 都保留，网关托管的键仍由网关决定；断开后这些键还在、且只出现一次。
+#[test]
+fn codex_gateway_keeps_user_root_settings_and_disconnect_keeps_them_once() {
+    let fixture = fixture(57381);
+    let ctx = &fixture.ctx;
+    seed_direct_with_user_root_settings(ctx);
+    assert!(codex_config(ctx).contains("model_instructions_file"));
+
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let config = codex_config(ctx);
+    assert_gateway_owns_routing(&config, 57381);
+    let parsed: toml::Value = toml::from_str(&config).unwrap();
+    assert_eq!(
+        parsed["model_instructions_file"].as_str(),
+        Some("~/.codex/instruction.md"),
+        "直连供应商写下的指令文件跟进网关：{config}"
+    );
+    assert_eq!(
+        parsed["developer_instructions"].as_str(),
+        Some("按团队规范回答"),
+        "通用配置在网关模式下照样合并：{config}"
+    );
+    // 通用配置的键写盘时合并，不搬进托管供应商自己的配置（否则从通用配置删掉后删不干净）。
+    let settings = ctx.settings.load().unwrap();
+    let managed = settings
+        .relay_profiles
+        .iter()
+        .find(|profile| profile.id == "codex-plus-gateway")
+        .unwrap();
+    assert!(managed.config_contents.contains("model_instructions_file"));
+    assert!(!managed.config_contents.contains("developer_instructions"));
+
+    // 接入期间用户改了实时配置：换了指令文件、加了 web_search。重写（池变化 / 重启）后都还在。
+    let path = ctx.codex_home.join("config.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "web_search = \"live\"\n{}",
+            config.replace("~/.codex/instruction.md", "~/.codex/team.md")
+        ),
+    )
+    .unwrap();
+    refresh_enabled(ctx).unwrap();
+    let config = codex_config(ctx);
+    assert_gateway_owns_routing(&config, 57381);
+    let parsed: toml::Value = toml::from_str(&config).unwrap();
+    assert_eq!(
+        parsed["model_instructions_file"].as_str(),
+        Some("~/.codex/team.md"),
+        "{config}"
+    );
+    assert_eq!(parsed["web_search"].as_str(), Some("live"), "{config}");
+
+    let settings = ctx.settings.load().unwrap();
+    disable_binding(ctx, &settings, &ToolId::Codex).unwrap();
+    assert_eq!(ctx.settings.load().unwrap().active_relay_id, "direct");
+    let config = codex_config(ctx);
+    assert!(config.contains("api.direct.test"), "{config}");
+    assert!(!config.contains("/gw/codex"), "{config}");
+    let parsed: toml::Value = toml::from_str(&config).unwrap();
+    assert_eq!(parsed["model"].as_str(), Some("gpt-direct"), "{config}");
+    assert_eq!(
+        parsed["model_instructions_file"].as_str(),
+        Some("~/.codex/team.md"),
+        "接入期间的改动断开后保留：{config}"
+    );
+    assert_eq!(parsed["web_search"].as_str(), Some("live"), "{config}");
+    assert_eq!(parsed["review_model"].as_str(), Some("gpt-direct-review"));
+    for key in [
+        "model_instructions_file",
+        "developer_instructions",
+        "web_search",
+    ] {
+        assert_eq!(
+            config.matches(&format!("{key} =")).count(),
+            1,
+            "{key} 只出现一次：{config}"
+        );
+    }
+}
+
+/// #2771：退出时还原直连、下次启动再接入（默认流程）一圈下来，接入期间写进实时配置的根级设置不丢。
+#[test]
+fn codex_user_root_settings_survive_exit_restore_and_startup_reapply() {
+    let fixture = fixture(57382);
+    let ctx = &fixture.ctx;
+    seed_direct_with_user_root_settings(ctx);
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let path = ctx.codex_home.join("config.toml");
+    let config = codex_config(ctx);
+    std::fs::write(
+        &path,
+        format!("developer_instructions_extra = 1\nnotify = [\"notify-send\"]\n{config}"),
+    )
+    .unwrap();
+    let mut gateway = ctx.gateway.load().unwrap();
+    gateway.restore_on_exit = true;
+    ctx.gateway.save(&gateway).unwrap();
+
+    codex_plus_core::gateway::apply::restore_all_for_exit(ctx, &BackendSettings::default(), false)
+        .unwrap();
+    assert_eq!(ctx.settings.load().unwrap().active_relay_id, "direct");
+    let config = codex_config(ctx);
+    assert!(config.contains("api.direct.test"), "{config}");
+    assert!(config.contains("developer_instructions_extra"), "{config}");
+
+    assert_eq!(
+        codex_plus_core::gateway::apply::reapply_enabled(ctx).unwrap(),
+        1
+    );
+    let config = codex_config(ctx);
+    assert_gateway_owns_routing(&config, 57382);
+    let parsed: toml::Value = toml::from_str(&config).unwrap();
+    assert_eq!(
+        parsed["model_instructions_file"].as_str(),
+        Some("~/.codex/instruction.md"),
+        "{config}"
+    );
+    assert_eq!(parsed["developer_instructions_extra"].as_integer(), Some(1));
+    assert_eq!(
+        parsed["notify"].as_array().map(Vec::len),
+        Some(1),
+        "{config}"
+    );
+    assert_eq!(config.matches("model_instructions_file =").count(), 1);
+}

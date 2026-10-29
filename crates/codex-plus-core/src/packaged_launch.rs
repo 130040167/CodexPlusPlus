@@ -51,6 +51,10 @@
 //! 6. 包上下文里拉起的 Codex 是否依赖发起激活的 PowerShell 宿主存活（issue #2764：宿主一直
 //!    存活的交互式 shell 能拉起，宿主立刻退出的 Codex++ 拉不起）。主实例兜底因此让宿主活到
 //!    调试端口可连，再看 Codex 在宿主退出后是否仍在（诊断日志的 `codex_pids_after`）。
+//!    2.1.1 的日志表明另一类失败与宿主无关：主 Codex 已经开着但没带调试端口（回退前后同一批
+//!    进程原样存在），新进程拿不到单实例锁直接退出。launcher 现在启动前先识别这种情况
+//!    （`main_instances_blocking_debug_launch`）；其余失败靠 wrapper 轨迹与宿主内的
+//!    `SEEN_PIDS` 区分「wrapper 没执行 / Codex 没起来 / 起来又退了」。
 //!
 //! 以上任何一条都不要当成已验证；`cargo test` 只覆盖纯函数与 CDP 探测这两块。
 
@@ -382,6 +386,13 @@ pub fn build_main_instance_wrapper_script(
     let mut script = String::new();
     script.push_str("@echo off\r\n");
     script.push_str("setlocal\r\n");
+    // issue #2764：包上下文里的 cmd 输出拿不到，失败时分不清「wrapper 根本没执行」还是
+    // 「start 执行了但 Codex 起来又退了」。这里只往 wrapper 旁写两行轨迹（时间 + start 的
+    // errorlevel），不重定向 start 那一行，Codex 的标准输出/错误与原来一致。
+    // `%~dpn0` 是本脚本去掉扩展名的完整路径，不用把路径（可能含中文）写进脚本。
+    script.push_str(&format!(
+        ">\"%~dpn0{MAIN_WRAPPER_TRACE_SUFFIX}\" echo [%DATE% %TIME%] wrapper started\r\n"
+    ));
     push_env_scrub_lines(&mut script);
     if let Some(dir) = executable_dir {
         // 与多开 wrapper 一致：尽力切到 exe 所在目录，失败时 cmd 继续执行下一行。
@@ -394,8 +405,186 @@ pub fn build_main_instance_wrapper_script(
     }
     script.push_str(&start_line);
     script.push_str("\r\n");
+    script.push_str(&format!(
+        ">>\"%~dpn0{MAIN_WRAPPER_TRACE_SUFFIX}\" echo [%DATE% %TIME%] start errorlevel=%ERRORLEVEL%\r\n"
+    ));
     script.push_str("endlocal\r\n");
     Ok(script)
+}
+
+/// 主实例 wrapper 轨迹文件的后缀：`packaged-launch-main.cmd` → `packaged-launch-main.trace.log`。
+const MAIN_WRAPPER_TRACE_SUFFIX: &str = ".trace.log";
+
+/// 主实例 wrapper 写下的执行轨迹（见 [`build_main_instance_wrapper_script`]）。
+pub fn main_wrapper_trace_path(wrapper_path: &Path) -> PathBuf {
+    wrapper_path.with_extension(MAIN_WRAPPER_TRACE_SUFFIX.trim_start_matches('.'))
+}
+
+/// 读取本次启动写下的 wrapper 轨迹供诊断日志使用（只截取有限长度）。
+///
+/// 文件不存在、或修改时间早于 `written_since`（上一次留下的）都返回 `None`，
+/// 即「这次 wrapper 没有执行到第一行」。
+pub fn read_main_wrapper_trace(
+    wrapper_path: &Path,
+    written_since: std::time::SystemTime,
+) -> Option<String> {
+    let path = main_wrapper_trace_path(wrapper_path);
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    // 文件系统时间精度有限（FAT 2 秒），留一点余量。
+    let threshold = written_since
+        .checked_sub(Duration::from_secs(2))
+        .unwrap_or(written_since);
+    if modified < threshold {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    Some(truncate_chars(
+        String::from_utf8_lossy(&bytes).trim(),
+        ACTIVATION_OUTPUT_LIMIT,
+    ))
+}
+
+/// 包上下文兜底没等到端口时，把观察结果压成一句话放进报错（纯函数）。
+///
+/// `new_process_ids`：宿主观察期间新出现过的 Codex 进程（`None` 表示没观察到结果）；
+/// `wrapper_ran`：本次 wrapper 是否写下了轨迹。
+pub fn package_context_launch_observation(
+    new_process_ids: Option<&[u32]>,
+    wrapper_ran: bool,
+) -> String {
+    let wrapper = if wrapper_ran {
+        "wrapper 已执行"
+    } else {
+        "未见 wrapper 执行轨迹"
+    };
+    match new_process_ids {
+        Some([]) => format!("{wrapper}，期间未出现新的 Codex 进程"),
+        Some(ids) => format!("{wrapper}，期间出现过 {} 个新 Codex 进程", ids.len()),
+        None => wrapper.to_string(),
+    }
+}
+
+/// 已在运行的同名 Codex 进程，按命令行归类（issue #2764）。
+///
+/// Codex（Electron）同一份用户数据目录只允许一个主进程：新启动的进程拿不到单实例锁时，
+/// 会把命令行转交给已有主进程后立即退出。主 Codex 已经从开始菜单 / 托盘开着、却没带本次
+/// 的调试端口时，AUMID 激活与包上下文兜底拉起的进程都会这样秒退，调试端口永远等不到。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExistingCodexProcess {
+    /// Electron 子进程（renderer / gpu / utility / crashpad，命令行带 `--type=`）。
+    Child,
+    /// 带 `--user-data-dir` 的隔离实例（多开）：单实例锁各自独立，不挡主实例。
+    IsolatedInstance,
+    /// 主实例，且已带本次要用的调试端口：交给原有流程复用。
+    MainWithDebugPort,
+    /// 主实例，没带本次调试端口（没带或带的是别的端口）：新启动会被它接管后退出。
+    MainWithoutDebugPort,
+    /// 命令行读不到：无法判断，按不阻挡处理。
+    Unknown,
+}
+
+/// 按命令行给已在运行的 Codex 进程归类（纯函数）。
+#[cfg(any(windows, test))]
+pub fn classify_existing_codex_process(
+    command_line: Option<&str>,
+    debug_port: u16,
+) -> ExistingCodexProcess {
+    let Some(command_line) = command_line else {
+        return ExistingCodexProcess::Unknown;
+    };
+    let mut tokens = command_line
+        .split_whitespace()
+        .map(|token| token.trim_matches('"'));
+    if tokens.clone().any(|token| token.starts_with("--type=")) {
+        return ExistingCodexProcess::Child;
+    }
+    if tokens.any(|token| token.starts_with("--user-data-dir")) {
+        return ExistingCodexProcess::IsolatedInstance;
+    }
+    if crate::watcher::debug_port_from_command_line(command_line) == Some(debug_port) {
+        ExistingCodexProcess::MainWithDebugPort
+    } else {
+        ExistingCodexProcess::MainWithoutDebugPort
+    }
+}
+
+/// 会挡住本次带调试端口启动的主实例进程 PID（纯逻辑，读命令行通过参数注入）。
+///
+/// 只认「确定是没带本次端口的主进程」：命令行读不到、子进程、多开实例都不算，宁漏不误——
+/// 误判的代价是用户明明能启动却被拦下。本次启动自带 `--user-data-dir`（用户在附加参数里
+/// 指定了数据目录）时，与默认目录的主实例不共用单实例锁，直接返回空。
+#[cfg(any(windows, test))]
+pub fn main_instances_blocking_debug_launch(
+    candidates: impl IntoIterator<Item = u32>,
+    debug_port: u16,
+    launch_args: &[String],
+    mut command_line: impl FnMut(u32) -> Option<String>,
+) -> Vec<u32> {
+    if launch_args
+        .iter()
+        .any(|arg| arg.trim_start_matches('"').starts_with("--user-data-dir"))
+    {
+        return Vec::new();
+    }
+    let mut ids = candidates
+        .into_iter()
+        .filter(|process_id| {
+            classify_existing_codex_process(command_line(*process_id).as_deref(), debug_port)
+                == ExistingCodexProcess::MainWithoutDebugPort
+        })
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// 两个 exe 路径是否属于同一个 MSIX 包族（同名 + 同发布者，版本 / 架构可以不同）。
+///
+/// 只按 exe 名匹配会把另装的 ChatGPT 桌面版（同样叫 `ChatGPT.exe`、单实例锁互不相干）
+/// 也当成 Codex；更新后旧版本目录里还在跑的 Codex 则应当算同一个包族。
+/// 任一路径不在 `WindowsApps` 下或解析不出包全名时返回 false（宁漏不误）。
+pub fn same_windows_apps_package_family(left: &str, right: &str) -> bool {
+    match (
+        windows_apps_package_family(left),
+        windows_apps_package_family(right),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// 从 `…\WindowsApps\<Name>_<Version>_<Arch>_<ResourceId>_<PublisherId>\…` 取出
+/// `(name, publisher_id)`（小写）。包名本身不含 `_`。
+fn windows_apps_package_family(path: &str) -> Option<(String, String)> {
+    let normalized = path.replace('/', "\\").to_ascii_lowercase();
+    let (_, after) = normalized.split_once("\\windowsapps\\")?;
+    let package_full_name = after.split('\\').next()?;
+    let segments = package_full_name.split('_').collect::<Vec<_>>();
+    if segments.len() < 5 {
+        return None;
+    }
+    let name = segments.first()?.to_string();
+    let publisher_id = segments.last()?.to_string();
+    (!name.is_empty() && !publisher_id.is_empty()).then_some((name, publisher_id))
+}
+
+/// 已有主实例挡住启动时给用户看的提示。
+pub fn existing_main_instance_blocks_launch_message(
+    debug_port: u16,
+    executable_name: &str,
+    process_ids: &[u32],
+) -> String {
+    let ids = process_ids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "检测到 Codex 已在运行，但没有开启调试端口 {debug_port}（主进程 PID {ids}）。\
+         Codex 同时只允许一个主实例，Codex++ 再启动的实例会把请求交给它后立即退出，无法注入。\
+         请先完全退出 Codex：关掉窗口后若托盘里还有 Codex 图标，右键选择退出；\
+         或在任务管理器里结束所有 {executable_name} 进程。然后再点「启动 Codex」。"
+    )
 }
 
 /// [`build_main_instance_wrapper_script`] + 写入 `<state_dir>/packaged-launch-main.cmd`。
@@ -522,8 +711,26 @@ pub fn activation_script(
     wrapper_path: &Path,
     wait_port: Option<u16>,
 ) -> anyhow::Result<String> {
+    activation_script_watching(app_user_model_id, wrapper_path, wait_port, None)
+}
+
+/// 同 [`activation_script`]；`watch_process` 为进程名（不带 `.exe`）时，宿主等端口期间
+/// 顺带记下见过的同名进程，最后输出 `SEEN_PIDS=`（issue #2764：区分「Codex 根本没起来」
+/// 与「起来后又退了」）。不等端口时忽略。
+pub fn activation_script_watching(
+    app_user_model_id: &str,
+    wrapper_path: &Path,
+    wait_port: Option<u16>,
+    watch_process: Option<&str>,
+) -> anyhow::Result<String> {
     let (package_family_name, app_id) = split_app_user_model_id(app_user_model_id)?;
-    activation_script_for(&package_family_name, &app_id, wrapper_path, wait_port)
+    activation_script_for(
+        &package_family_name,
+        &app_id,
+        wrapper_path,
+        wait_port,
+        watch_process,
+    )
 }
 
 fn activation_script_for(
@@ -531,10 +738,16 @@ fn activation_script_for(
     app_id: &str,
     wrapper_path: &Path,
     wait_port: Option<u16>,
+    watch_process: Option<&str>,
 ) -> anyhow::Result<String> {
     let package_family_name = powershell_literal(package_family_name)?;
     let app_id = powershell_literal(app_id)?;
     let wrapper = powershell_literal(&path_text(wrapper_path)?)?;
+    let watch_process = watch_process
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(powershell_literal)
+        .transpose()?;
 
     let mut script = String::new();
     // cmdlet 报错时让 powershell.exe 以非零码退出；否则「激活失败」会被当成成功，调用方
@@ -558,15 +771,27 @@ fn activation_script_for(
     // 解析侧只认这个前缀，避免把无关数字当成 PID。
     script.push_str("if ($created -and $created.Id) { \"PID=$($created.Id)\" }");
     if let Some(port) = wait_port.filter(|port| *port != 0) {
+        // 等端口期间每轮记下同名进程（只诊断用，失败不影响激活）。
+        let (seen_init, seen_sample, seen_report) = match &watch_process {
+            Some(name) => (
+                "$seen = @{}; ".to_string(),
+                format!(
+                    "try {{ Get-Process -Name '{name}' -ErrorAction SilentlyContinue | \
+                     ForEach-Object {{ $seen[$_.Id] = 1 }} }} catch {{}}; "
+                ),
+                "; \"SEEN_PIDS=$(@($seen.Keys | Sort-Object) -join ',')\"".to_string(),
+            ),
+            None => (String::new(), String::new(), String::new()),
+        };
         // 只看端口能否连上（Codex 是否已启动）；是不是 Codex 的 CDP 由调用方再判。
         script.push_str(&format!(
-            "; $ready = $false; $deadline = [DateTime]::UtcNow.AddSeconds({HOST_PORT_WAIT_SECS}); \
+            "; {seen_init}$ready = $false; $deadline = [DateTime]::UtcNow.AddSeconds({HOST_PORT_WAIT_SECS}); \
              while (-not $ready -and [DateTime]::UtcNow -lt $deadline) {{ \
-             $client = New-Object System.Net.Sockets.TcpClient; \
+             {seen_sample}$client = New-Object System.Net.Sockets.TcpClient; \
              try {{ $ready = $client.ConnectAsync('127.0.0.1', {port}).Wait(500) -and $client.Connected }} \
              catch {{}} finally {{ $client.Close() }}; \
              if (-not $ready) {{ Start-Sleep -Milliseconds 250 }} }}; \
-             \"PORT_READY=$([int]$ready)\""
+             \"PORT_READY=$([int]$ready)\"{seen_report}"
         ));
     }
     Ok(script)
@@ -618,6 +843,9 @@ pub struct PackageContextActivation {
     pub process_id: u32,
     /// 要求宿主等端口时的 `PORT_READY` 标记；没要求或没输出时为 `None`。
     pub port_ready_in_host: Option<bool>,
+    /// 宿主等端口期间见过的同名进程（`SEEN_PIDS=` 标记）；没要求观察或没输出时为 `None`，
+    /// 观察了但一个都没见到时是空列表。
+    pub seen_process_ids: Option<Vec<u32>>,
     /// `HOST=` 标记：PowerShell 版本与位数。
     pub host: Option<String>,
     /// powershell.exe 退出码。
@@ -652,6 +880,7 @@ impl PackageContextActivation {
                     _ => None,
                 }
             }),
+            seen_process_ids: parse_seen_process_ids(output),
             host: activation_marker(output, "HOST=").map(str::to_string),
             exit_code,
             elapsed_ms,
@@ -670,7 +899,7 @@ impl PackageContextActivation {
                     .lines()
                     .filter(|line| {
                         let line = line.trim_start();
-                        !["HOST=", "PID=", "PORT_READY="]
+                        !["HOST=", "PID=", "PORT_READY=", "SEEN_PIDS="]
                             .iter()
                             .any(|marker| line.starts_with(marker))
                     })
@@ -696,19 +925,22 @@ pub async fn activate_in_package_context(
     app_user_model_id: &str,
     wrapper_path: &Path,
 ) -> anyhow::Result<u32> {
-    activate_in_package_context_with_report(app_user_model_id, wrapper_path, None)
+    activate_in_package_context_with_report(app_user_model_id, wrapper_path, None, None)
         .await
         .map(|activation| activation.process_id)
 }
 
 /// 同 [`activate_in_package_context`]，但返回完整诊断，并可要求 PowerShell 宿主等待
-/// `wait_port` 可连接后再退出（见 [`activation_script`]）。
+/// `wait_port` 可连接后再退出，并在等待期间观察名为 `watch_process` 的进程
+/// （见 [`activation_script_watching`]）。
 pub async fn activate_in_package_context_with_report(
     app_user_model_id: &str,
     wrapper_path: &Path,
     wait_port: Option<u16>,
+    watch_process: Option<&str>,
 ) -> anyhow::Result<PackageContextActivation> {
-    activate_in_package_context_impl(app_user_model_id, wrapper_path, wait_port).await
+    activate_in_package_context_impl(app_user_model_id, wrapper_path, wait_port, watch_process)
+        .await
 }
 
 #[cfg(windows)]
@@ -716,9 +948,11 @@ async fn activate_in_package_context_impl(
     app_user_model_id: &str,
     wrapper_path: &Path,
     wait_port: Option<u16>,
+    watch_process: Option<&str>,
 ) -> anyhow::Result<PackageContextActivation> {
     let (package_family_name, app_id) = split_app_user_model_id(app_user_model_id)?;
     let wrapper_path = wrapper_path.to_path_buf();
+    let watch_process = watch_process.map(str::to_string);
     if !wrapper_path.is_file() {
         bail!(
             "包上下文 wrapper 不存在，无法激活：{}",
@@ -732,6 +966,7 @@ async fn activate_in_package_context_impl(
             &app_id,
             &wrapper_path,
             wait_port,
+            watch_process.as_deref(),
         )
     });
     tokio::time::timeout(ACTIVATION_TIMEOUT, activation)
@@ -750,6 +985,7 @@ async fn activate_in_package_context_impl(
     _app_user_model_id: &str,
     _wrapper_path: &Path,
     _wait_port: Option<u16>,
+    _watch_process: Option<&str>,
 ) -> anyhow::Result<PackageContextActivation> {
     bail!("包上下文激活仅在 Windows 上可用（MSIX 包身份是 Windows 专有机制）")
 }
@@ -760,10 +996,17 @@ fn activate_in_package_context_blocking(
     app_id: &str,
     wrapper_path: &Path,
     wait_port: Option<u16>,
+    watch_process: Option<&str>,
 ) -> anyhow::Result<PackageContextActivation> {
     use std::os::windows::process::CommandExt;
 
-    let script = activation_script_for(package_family_name, app_id, wrapper_path, wait_port)?;
+    let script = activation_script_for(
+        package_family_name,
+        app_id,
+        wrapper_path,
+        wait_port,
+        watch_process,
+    )?;
     let powershell = windows_powershell_path(std::env::var_os("SystemRoot").as_deref());
     let arguments = activation_powershell_arguments(&script);
     let log_path = activation_log_path(wrapper_path);
@@ -950,6 +1193,22 @@ fn parse_reported_process_id(stdout: &str) -> Option<u32> {
             .and_then(|value| value.trim().parse::<u32>().ok())
             .filter(|id| *id != UNKNOWN_PROCESS_ID)
     })
+}
+
+/// 解析 `SEEN_PIDS=1,2,3`。标记存在但为空表示「观察了、没见到」，返回空列表；
+/// 无法解析的片段跳过。
+fn parse_seen_process_ids(output: &str) -> Option<Vec<u32>> {
+    let value = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("SEEN_PIDS="))?;
+    let mut ids = value
+        .split(',')
+        .filter_map(|part| part.trim().parse::<u32>().ok())
+        .filter(|id| *id != UNKNOWN_PROCESS_ID)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    Some(ids)
 }
 
 /// 取第一行以 `key` 开头的标记值（去掉首尾空白）；值为空视为没有。
@@ -1835,6 +2094,238 @@ mod tests {
         assert_eq!(
             watch.observe(start + Duration::from_secs(3), false, Some(false)),
             AumidActivationVerdict::Pending
+        );
+    }
+
+    const STORE_EXE: &str =
+        r#""C:\Program Files\WindowsApps\OpenAI.Codex_26.1023.6621.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe""#;
+
+    #[test]
+    fn existing_codex_processes_are_classified_by_command_line() {
+        // 开始菜单 / 托盘里开着的主进程：没有任何调试参数。
+        assert_eq!(
+            classify_existing_codex_process(Some(STORE_EXE), 9229),
+            ExistingCodexProcess::MainWithoutDebugPort
+        );
+        // 带的是别的端口，同样占着单实例锁。
+        assert_eq!(
+            classify_existing_codex_process(
+                Some(&format!("{STORE_EXE} --remote-debugging-port=9333")),
+                9229
+            ),
+            ExistingCodexProcess::MainWithoutDebugPort
+        );
+        assert_eq!(
+            classify_existing_codex_process(
+                Some(&format!(
+                    "{STORE_EXE} --remote-debugging-port=9229 --remote-allow-origins=http://127.0.0.1:9229"
+                )),
+                9229
+            ),
+            ExistingCodexProcess::MainWithDebugPort
+        );
+        assert_eq!(
+            classify_existing_codex_process(
+                Some(&format!(
+                    "{STORE_EXE} --type=renderer --user-data-dir=\"C:\\x\" --remote-debugging-port=9333"
+                )),
+                9229
+            ),
+            ExistingCodexProcess::Child
+        );
+        assert_eq!(
+            classify_existing_codex_process(
+                Some(&format!(
+                    "{STORE_EXE} --remote-debugging-port=9442 \"--user-data-dir=C:\\Users\\a b\\multi\""
+                )),
+                9229
+            ),
+            ExistingCodexProcess::IsolatedInstance
+        );
+        assert_eq!(
+            classify_existing_codex_process(None, 9229),
+            ExistingCodexProcess::Unknown
+        );
+    }
+
+    #[test]
+    fn only_main_processes_without_the_debug_port_block_the_launch() {
+        let command_lines = |pid: u32| -> Option<String> {
+            match pid {
+                // 主进程（无调试端口）
+                28480 => Some(STORE_EXE.to_string()),
+                // 它的子进程
+                28524 => Some(format!("{STORE_EXE} --type=gpu-process")),
+                28568 => Some(format!("{STORE_EXE} --type=renderer")),
+                // 多开实例
+                30000 => Some(format!(
+                    "{STORE_EXE} --remote-debugging-port=9442 --user-data-dir=C:\\m"
+                )),
+                // 读不到命令行
+                _ => None,
+            }
+        };
+        assert_eq!(
+            main_instances_blocking_debug_launch(
+                [28568, 28480, 28524, 30000, 31144, 28480],
+                9229,
+                &[],
+                command_lines
+            ),
+            vec![28480]
+        );
+        // 本次启动自带数据目录时，与默认目录的主实例互不影响。
+        assert!(
+            main_instances_blocking_debug_launch(
+                [28480],
+                9229,
+                &["--user-data-dir=C:\\custom".to_string()],
+                command_lines
+            )
+            .is_empty()
+        );
+        // 已带本次端口的主实例交给原有流程复用，不拦。
+        assert!(
+            main_instances_blocking_debug_launch([1], 9229, &[], |_| Some(format!(
+                "{STORE_EXE} --remote-debugging-port=9229"
+            )))
+            .is_empty()
+        );
+        // 命令行全都读不到：宁漏不误。
+        assert!(main_instances_blocking_debug_launch([1, 2], 9229, &[], |_| None).is_empty());
+    }
+
+    #[test]
+    fn package_family_match_ignores_version_but_not_other_packages() {
+        let ours = r"C:\Program Files\WindowsApps\OpenAI.Codex_26.1023.6621.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe";
+        // 更新后旧版本目录里还在跑的 Codex：同一包族。
+        assert!(same_windows_apps_package_family(
+            r"c:\program files\windowsapps\openai.codex_26.1021.3705.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe",
+            ours
+        ));
+        // 另装的 ChatGPT 桌面版同样叫 ChatGPT.exe，但不是同一个包。
+        assert!(!same_windows_apps_package_family(
+            r"C:\Program Files\WindowsApps\OpenAI.ChatGPT-Desktop_1.2025.1.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe",
+            ours
+        ));
+        // 不在 WindowsApps 下、或包全名不完整：不认。
+        assert!(!same_windows_apps_package_family(r"D:\Codex\ChatGPT.exe", ours));
+        assert!(!same_windows_apps_package_family(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex\app\ChatGPT.exe",
+            ours
+        ));
+    }
+
+    #[test]
+    fn blocking_instance_message_tells_the_user_how_to_quit_codex() {
+        let message = existing_main_instance_blocks_launch_message(9229, "ChatGPT.exe", &[28480, 31144]);
+        assert!(message.contains("9229"));
+        assert!(message.contains("28480, 31144"));
+        assert!(message.contains("ChatGPT.exe"));
+        assert!(message.contains("托盘"));
+    }
+
+    #[test]
+    fn main_instance_wrapper_traces_start_and_errorlevel_next_to_itself() {
+        let script = build_main_instance_wrapper_script(
+            Path::new(r"C:\app\ChatGPT.exe"),
+            &["--remote-debugging-port=9229".to_string()],
+        )
+        .unwrap();
+        let started = script
+            .find(">\"%~dpn0.trace.log\" echo [%DATE% %TIME%] wrapper started\r\n")
+            .unwrap();
+        let start = script.find("start \"\" /b ").unwrap();
+        let errorlevel = script
+            .find(">>\"%~dpn0.trace.log\" echo [%DATE% %TIME%] start errorlevel=%ERRORLEVEL%\r\n")
+            .unwrap();
+        assert!(started < start && start < errorlevel);
+        // start 那一行不重定向：Codex 的标准输出 / 错误保持原样。
+        let start_line = script[start..].lines().next().unwrap();
+        assert!(!start_line.contains('>'));
+        assert!(script.ends_with("endlocal\r\n"));
+    }
+
+    #[test]
+    fn wrapper_trace_is_only_read_when_written_by_this_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let wrapper = temp.path().join(MAIN_WRAPPER_FILE_NAME);
+        let trace = main_wrapper_trace_path(&wrapper);
+        assert_eq!(trace, temp.path().join("packaged-launch-main.trace.log"));
+
+        let before = std::time::SystemTime::now();
+        assert_eq!(read_main_wrapper_trace(&wrapper, before), None);
+        std::fs::write(&trace, "[x] wrapper started\r\n[x] start errorlevel=0\r\n").unwrap();
+        assert_eq!(
+            read_main_wrapper_trace(&wrapper, before).as_deref(),
+            Some("[x] wrapper started\r\n[x] start errorlevel=0")
+        );
+        // 上一次留下的轨迹不算这次执行过。
+        let later = std::time::SystemTime::now() + Duration::from_secs(60);
+        assert_eq!(read_main_wrapper_trace(&wrapper, later), None);
+    }
+
+    #[test]
+    fn activation_script_can_watch_codex_processes_while_waiting_for_the_port() {
+        let script =
+            activation_script_watching(AUMID, Path::new(r"C:\s\w.cmd"), Some(9229), Some("ChatGPT"))
+                .unwrap();
+        let init = script.find("$seen = @{}; $ready = $false;").unwrap();
+        let sample = script
+            .find("Get-Process -Name 'ChatGPT' -ErrorAction SilentlyContinue")
+            .unwrap();
+        let connect = script.find("ConnectAsync('127.0.0.1', 9229)").unwrap();
+        assert!(init < sample && sample < connect);
+        assert!(script.ends_with(
+            "\"PORT_READY=$([int]$ready)\"; \"SEEN_PIDS=$(@($seen.Keys | Sort-Object) -join ',')\""
+        ));
+        // 进程名同样走单引号字面量转义。
+        let quoted =
+            activation_script_watching(AUMID, Path::new(r"C:\s\w.cmd"), Some(9229), Some("a'b"))
+                .unwrap();
+        assert!(quoted.contains("Get-Process -Name 'a''b'"));
+        // 不等端口（多开）时不观察。
+        let no_wait =
+            activation_script_watching(AUMID, Path::new(r"C:\s\w.cmd"), None, Some("ChatGPT"))
+                .unwrap();
+        assert!(!no_wait.contains("SEEN_PIDS"));
+        assert!(!no_wait.contains("Get-Process"));
+        // 原入口保持原样。
+        let plain = activation_script(AUMID, Path::new(r"C:\s\w.cmd"), Some(9229)).unwrap();
+        assert!(!plain.contains("SEEN_PIDS"));
+    }
+
+    #[test]
+    fn activation_report_parses_seen_process_ids() {
+        let report = PackageContextActivation::from_output(
+            Vec::new(),
+            Some(0),
+            0,
+            "HOST=5.1;X64=True\r\nPORT_READY=0\r\nSEEN_PIDS=31144,x,28480,0\r\n",
+        );
+        assert_eq!(report.seen_process_ids, Some(vec![28480, 31144]));
+        let none_seen =
+            PackageContextActivation::from_output(Vec::new(), Some(0), 0, "PORT_READY=0\r\nSEEN_PIDS=");
+        assert_eq!(none_seen.seen_process_ids, Some(Vec::new()));
+        // 标记行不算错误输出。
+        assert_eq!(none_seen.failure_detail(), "（无错误输出）");
+        let not_watched = PackageContextActivation::from_output(Vec::new(), Some(0), 0, "PORT_READY=1");
+        assert_eq!(not_watched.seen_process_ids, None);
+    }
+
+    #[test]
+    fn package_context_observation_summarizes_wrapper_and_new_processes() {
+        assert_eq!(
+            package_context_launch_observation(Some(&[]), false),
+            "未见 wrapper 执行轨迹，期间未出现新的 Codex 进程"
+        );
+        assert_eq!(
+            package_context_launch_observation(Some(&[1, 2, 3]), true),
+            "wrapper 已执行，期间出现过 3 个新 Codex 进程"
+        );
+        assert_eq!(
+            package_context_launch_observation(None, true),
+            "wrapper 已执行"
         );
     }
 }
