@@ -330,6 +330,8 @@ mod tests {
             price: None,
             model_prices: Default::default(),
             proxy: String::new(),
+            key_rpm: None,
+            key_concurrency: None,
             upstream_new: Vec::new(),
             upstream_gone: Vec::new(),
             models_checked_at_ms: 0,

@@ -2398,6 +2398,8 @@ fn add_provider_with(
             model_windows: BTreeMap::new(),
             context_window: None,
             proxy: String::new(),
+            key_rpm: None,
+            key_concurrency: None,
             upstream_new: Vec::new(),
             upstream_gone: Vec::new(),
             models_checked_at_ms: 0,
@@ -2554,6 +2556,29 @@ pub fn set_provider_extras(
             provider.model_prices = clean_model_prices(prices);
         }
         provider.proxy = proxy;
+        Ok(())
+    })?;
+    store.load()
+}
+
+/// 供应商的主动限速（#1130 / #2726）：每个 Key 每分钟最多请求数、同时进行的最多请求数。
+/// None 或 0 表示不限。只影响网关发请求时怎么选 Key，不用重写 Agent 配置。
+pub fn set_provider_limits(
+    store: &GatewayStore,
+    id: &str,
+    rpm: Option<u32>,
+    concurrency: Option<u32>,
+) -> anyhow::Result<GatewaySettings> {
+    store.update(|gateway| {
+        let Some(provider) = gateway
+            .providers
+            .iter_mut()
+            .find(|provider| provider.relay.id == id)
+        else {
+            bail!("供应商不存在：{id}");
+        };
+        provider.key_rpm = rpm.filter(|value| *value > 0);
+        provider.key_concurrency = concurrency.filter(|value| *value > 0);
         Ok(())
     })?;
     store.load()

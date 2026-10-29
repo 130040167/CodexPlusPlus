@@ -19,6 +19,9 @@ import {
   prettyModelName,
   modelRoutable,
   parseContextWindow,
+  parseKeyLimit,
+  formatQueueWait,
+  queueWaitMs,
   pickerSections,
   presetAdded,
   presetHost,
@@ -402,4 +405,28 @@ test("起名模型随绑定草稿往返，空值和旧版后端缺字段都当�
   assert.equal(binding.titleModel, "kimi/kimi-k3");
   assert.equal(draftFromBinding(binding).titleModel, "kimi/kimi-k3");
   assert.equal(bindingFromDraft({ ...draft, titleModel: "  " }, binding).titleModel, "");
+});
+
+test("主动限速：留空不限，只认正整数", () => {
+  assert.equal(parseKeyLimit(""), null);
+  assert.equal(parseKeyLimit("  "), null);
+  assert.equal(parseKeyLimit("20"), 20);
+  assert.equal(parseKeyLimit(" 5 "), 5);
+  for (const bad of ["0", "-1", "1.5", "abc", "10k"]) assert.ok(Number.isNaN(parseKeyLimit(bad)), bad);
+});
+
+test("请求日志认出网关记的限速排队", () => {
+  assert.equal(queueWaitMs(undefined), null);
+  assert.equal(queueWaitMs(["upstream_stream_failed:server_is_overloaded"]), null);
+  assert.equal(queueWaitMs(["upstream_stream_failed:x", "local_rate_limit_wait_ms:3200"]), 3200);
+  assert.equal(formatQueueWait(3200), "3.2s");
+  assert.equal(formatQueueWait(400), "0.4s");
+  assert.equal(formatQueueWait(45_400), "45s");
+  assert.match(app, /tf\("限速排队 \{0\}", \[formatQueueWait\(queued\)\]\)/);
+});
+
+test("供应商池详情能编辑每个 Key 的限速", () => {
+  const providers = readFileSync(new URL("./GatewayProviders.tsx", import.meta.url), "utf8");
+  assert.match(providers, /"save_gateway_provider_limits", \{ id: entry\.id, rpm, concurrency \}/);
+  assert.match(lib, /gateway_commands::save_gateway_provider_limits,/);
 });

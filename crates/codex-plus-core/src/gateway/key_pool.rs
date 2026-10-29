@@ -2,7 +2,8 @@
 //!
 //! 一个供应商配了多个 Key（`RelayProfile.api_keys`）时，网关把每个 Key 展开成一个候选：
 //! 某个 Key 被限流（429）或额度耗尽就冷却它、换下一个；Key 失效（401）停用到 Key 本身被改掉；
-//! 上游连续 5xx 时熔断整个供应商一小段时间。
+//! 上游连续 5xx 时熔断整个供应商一小段时间。用户还可以按供应商给每个 Key 设 RPM / 并发上限
+//! （主动限速，见文件后半部分），满了的 Key 先跳过、都满了排队，不等 429 再冷却。
 //!
 //! 状态只放内存：网关跑在 Codex++ 管理器进程里，重启后从头探测即可，不值得落盘。
 //! 默认「会话粘性」：同一会话固定用一个 Key，出错才换，避免按请求轮换打散上游 prompt cache。
@@ -509,6 +510,182 @@ fn now_unix_ms() -> u64 {
         .unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// 主动限速（#1130 / #2726）
+//
+// 用户按供应商填「每个 Key 每分钟最多请求数」「每个 Key 同时进行的最多请求数」，网关发请求前先占名额：
+// 名额满了的 Key 像冷却中一样先跳过（换同一家的下一个 Key 或下一家），但不算失败、不冷却、不熔断，
+// 也不改会话固定；所有候选都满了由候选循环排队等最早空出的名额（见 `pipeline`）。
+// 计数和冷却一样只放内存：按 (供应商 id, Key id) 记最近 60 秒发出的时间和进行中的请求数。
+// 没填上限的 Key 完全不进这张表，行为和以前一样。
+// ---------------------------------------------------------------------------
+
+/// 所有候选都因限速满了时，最多排队等这么久；超时返回本地限速错误。
+pub const LIMIT_QUEUE_TIMEOUT: Duration = Duration::from_secs(120);
+/// RPM 的滑动窗口。
+const RPM_WINDOW: Duration = Duration::from_secs(60);
+
+/// 一个 Key 的主动限速上限；都为 None 表示不限。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyLimits {
+    /// 每分钟最多发出的请求数（滑动 60 秒）。
+    pub rpm: Option<u32>,
+    /// 同时进行中的最多请求数。
+    pub concurrency: Option<u32>,
+}
+
+impl KeyLimits {
+    pub fn is_unlimited(&self) -> bool {
+        self.rpm.is_none() && self.concurrency.is_none()
+    }
+}
+
+/// 某个 Key 现在能不能再发一个请求。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyLimitState {
+    Free,
+    /// 满了。`retry_in` 是按 RPM 窗口算出的最早空出时间；只因并发满了时为 None（要等进行中的请求结束）。
+    Full {
+        retry_in: Option<Duration>,
+    },
+}
+
+#[derive(Debug, Default)]
+struct KeyUsage {
+    /// 最近 60 秒内发出请求的时间，按先后排。
+    sent: std::collections::VecDeque<Instant>,
+    in_flight: u32,
+}
+
+impl KeyUsage {
+    fn prune(&mut self, now: Instant) {
+        while self
+            .sent
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= RPM_WINDOW)
+        {
+            self.sent.pop_front();
+        }
+    }
+
+    fn state(&self, limits: KeyLimits, now: Instant) -> KeyLimitState {
+        let rpm_full = limits
+            .rpm
+            .is_some_and(|rpm| self.sent.len() >= rpm as usize);
+        let busy = limits
+            .concurrency
+            .is_some_and(|concurrency| self.in_flight >= concurrency);
+        if !rpm_full && !busy {
+            return KeyLimitState::Free;
+        }
+        // 窗口里第 (len - rpm + 1) 早的那次滑出窗口后才有名额。
+        let retry_in = rpm_full
+            .then(|| {
+                let rpm = limits.rpm.unwrap_or_default() as usize;
+                self.sent
+                    .len()
+                    .checked_sub(rpm.max(1))
+                    .and_then(|index| self.sent.get(index))
+            })
+            .flatten()
+            .map(|at| (*at + RPM_WINDOW).saturating_duration_since(now));
+        KeyLimitState::Full { retry_in }
+    }
+}
+
+type UsageTable = HashMap<(String, String), KeyUsage>;
+
+fn usage_lock() -> std::sync::MutexGuard<'static, UsageTable> {
+    static USAGE: OnceLock<Mutex<UsageTable>> = OnceLock::new();
+    USAGE
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn limit_notify() -> &'static tokio::sync::Notify {
+    static NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    NOTIFY.get_or_init(tokio::sync::Notify::new)
+}
+
+/// 有名额被释放时会被唤醒的 future。排队方要先 `enable` 再检查名额，避免漏掉检查和等待之间的释放。
+pub fn limit_released() -> tokio::sync::futures::Notified<'static> {
+    limit_notify().notified()
+}
+
+/// 这个 Key 按上限看现在有没有名额（不占名额）。
+pub fn limit_state(key: &KeyRef, limits: KeyLimits, now: Instant) -> KeyLimitState {
+    if limits.is_unlimited() {
+        return KeyLimitState::Free;
+    }
+    let mut table = usage_lock();
+    match table.get_mut(&(key.relay_id.clone(), key.key_id.clone())) {
+        Some(usage) => {
+            usage.prune(now);
+            usage.state(limits, now)
+        }
+        None => KeyLimitState::Free,
+    }
+}
+
+/// 占一个名额：有名额时记一次发出（计入 RPM）并把进行中加一，返回的 [`KeySlot`] drop 时释放并发名额。
+/// 满了返回 None。没设上限时不记任何东西，直接给一个空名额。
+pub fn try_acquire(key: &KeyRef, limits: KeyLimits, now: Instant) -> Option<KeySlot> {
+    if limits.is_unlimited() {
+        return Some(KeySlot { held: None });
+    }
+    let id = (key.relay_id.clone(), key.key_id.clone());
+    let mut table = usage_lock();
+    let usage = table.entry(id.clone()).or_default();
+    usage.prune(now);
+    if usage.state(limits, now) != KeyLimitState::Free {
+        return None;
+    }
+    usage.sent.push_back(now);
+    usage.in_flight = usage.in_flight.saturating_add(1);
+    Some(KeySlot {
+        held: Some((id, now)),
+    })
+}
+
+/// 占着的一个名额。drop 时（响应转发完、出错、客户端断开）释放并发名额并唤醒排队的请求；
+/// RPM 的那一次留在窗口里，60 秒后自然滑出。
+#[derive(Debug)]
+#[must_use = "名额在 drop 时释放，要持有到请求真正结束"]
+pub struct KeySlot {
+    held: Option<((String, String), Instant)>,
+}
+
+impl KeySlot {
+    /// 请求其实没发出去（例如发之前换 token 失败）：连 RPM 的这一次也退掉。
+    pub fn cancel(mut self) {
+        if let Some((id, at)) = self.held.take() {
+            let mut table = usage_lock();
+            if let Some(usage) = table.get_mut(&id) {
+                if let Some(position) = usage.sent.iter().rposition(|sent| *sent == at) {
+                    usage.sent.remove(position);
+                }
+                usage.in_flight = usage.in_flight.saturating_sub(1);
+            }
+            drop(table);
+            limit_notify().notify_waiters();
+        }
+    }
+}
+
+impl Drop for KeySlot {
+    fn drop(&mut self) {
+        if let Some((id, _)) = self.held.take() {
+            let mut table = usage_lock();
+            if let Some(usage) = table.get_mut(&id) {
+                usage.in_flight = usage.in_flight.saturating_sub(1);
+            }
+            drop(table);
+            limit_notify().notify_waiters();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,5 +975,130 @@ mod tests {
         assert!(!record_failure(&key, &FailureClass::ClientError, now));
         let (keys, _) = order_keys(&relay, KeyRotationMode::Sticky, None, now);
         assert_eq!(keys.len(), 2);
+    }
+
+    fn limits(rpm: Option<u32>, concurrency: Option<u32>) -> KeyLimits {
+        KeyLimits { rpm, concurrency }
+    }
+
+    /// 选出第一个有名额的 Key（候选循环里跳过满了的 Key 就是这样）。
+    fn first_free(relay: &RelayProfile, limits: KeyLimits, now: Instant) -> Option<String> {
+        order_keys(relay, KeyRotationMode::Sticky, None, now)
+            .0
+            .into_iter()
+            .find(|key| limit_state(&key.key, limits, now) == KeyLimitState::Free)
+            .map(|key| key.key.key_id)
+    }
+
+    #[test]
+    fn rpm_full_key_is_skipped_for_the_next_key() {
+        let relay = relay("kp-rpm", &[("a", "sk-a"), ("b", "sk-b")]);
+        let limits = limits(Some(2), None);
+        let now = Instant::now();
+        let key_a = expand_keys(&relay)[0].key.clone();
+        for _ in 0..2 {
+            drop(try_acquire(&key_a, limits, now).expect("有名额"));
+        }
+        assert!(
+            try_acquire(&key_a, limits, now).is_none(),
+            "一分钟内第 3 次超出上限"
+        );
+        assert_eq!(first_free(&relay, limits, now).as_deref(), Some("b"));
+        assert_eq!(
+            limit_state(&key_a, limits, now + Duration::from_secs(10)),
+            KeyLimitState::Full {
+                retry_in: Some(Duration::from_secs(50))
+            },
+            "最早那次滑出 60 秒窗口才有名额"
+        );
+        // 滑动窗口：60 秒后又有名额。
+        let later = now + RPM_WINDOW;
+        assert_eq!(limit_state(&key_a, limits, later), KeyLimitState::Free);
+        assert_eq!(first_free(&relay, limits, later).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn concurrency_full_key_recovers_when_the_slot_is_released() {
+        let relay = relay("kp-conc", &[("a", "sk-a"), ("b", "sk-b")]);
+        let limits = limits(None, Some(1));
+        let now = Instant::now();
+        let key_a = expand_keys(&relay)[0].key.clone();
+        let slot = try_acquire(&key_a, limits, now).unwrap();
+        assert_eq!(
+            limit_state(&key_a, limits, now),
+            KeyLimitState::Full { retry_in: None },
+            "只因并发满了：要等进行中的请求结束"
+        );
+        assert!(try_acquire(&key_a, limits, now).is_none());
+        assert_eq!(first_free(&relay, limits, now).as_deref(), Some("b"));
+        drop(slot);
+        assert_eq!(limit_state(&key_a, limits, now), KeyLimitState::Free);
+        assert_eq!(first_free(&relay, limits, now).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn cancelled_slot_refunds_the_rpm_count() {
+        let relay = relay("kp-cancel", &[("a", "sk-a")]);
+        let limits = limits(Some(1), Some(1));
+        let now = Instant::now();
+        let key = expand_keys(&relay)[0].key.clone();
+        try_acquire(&key, limits, now).unwrap().cancel();
+        assert_eq!(limit_state(&key, limits, now), KeyLimitState::Free);
+        let slot = try_acquire(&key, limits, now).unwrap();
+        drop(slot);
+        assert!(
+            matches!(
+                limit_state(&key, limits, now),
+                KeyLimitState::Full { retry_in: Some(_) }
+            ),
+            "真正发出去的那次留在 RPM 窗口里"
+        );
+    }
+
+    #[test]
+    fn unlimited_keys_are_never_tracked() {
+        let relay = relay("kp-unlimited", &[("a", "sk-a")]);
+        let key = expand_keys(&relay)[0].key.clone();
+        let now = Instant::now();
+        let slots: Vec<KeySlot> = (0..100)
+            .map(|_| try_acquire(&key, KeyLimits::default(), now).unwrap())
+            .collect();
+        assert_eq!(
+            limit_state(&key, KeyLimits::default(), now),
+            KeyLimitState::Free
+        );
+        assert!(
+            !usage_lock().contains_key(&(key.relay_id.clone(), key.key_id.clone())),
+            "没设上限的 Key 不进计数表"
+        );
+        drop(slots);
+    }
+
+    #[test]
+    fn saturated_keys_do_not_cool_down_or_trip_the_breaker() {
+        let relay = relay("kp-limit-health", &[("a", "sk-a")]);
+        let limits = limits(Some(1), Some(1));
+        let now = Instant::now();
+        let key = expand_keys(&relay)[0].key.clone();
+        let _slot = try_acquire(&key, limits, now).unwrap();
+        for _ in 0..5 {
+            assert!(try_acquire(&key, limits, now).is_none());
+        }
+        let (keys, soonest) = order_keys(&relay, KeyRotationMode::Sticky, None, now);
+        assert_eq!(keys.len(), 1, "限速满了不算冷却，Key 仍在候选里");
+        assert_eq!(soonest, None);
+        let snapshot = snapshot(now);
+        assert!(
+            snapshot
+                .keys
+                .iter()
+                .all(|view| view.relay_id != "kp-limit-health")
+        );
+        assert!(
+            snapshot
+                .providers
+                .iter()
+                .all(|view| view.relay_id != "kp-limit-health")
+        );
     }
 }

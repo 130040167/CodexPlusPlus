@@ -43,6 +43,7 @@ mod floating_panel_stepwise;
 mod force_chinese_locale_settings;
 mod gateway_apply;
 mod gateway_forced_relay;
+mod gateway_key_limits;
 mod gateway_restore;
 mod helper_body_limit_settings;
 mod history_turn_recovery;

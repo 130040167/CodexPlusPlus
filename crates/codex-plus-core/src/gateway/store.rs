@@ -54,6 +54,13 @@ pub struct GatewayProvider {
     /// 与直连模式的「供应商独立代理」互不相干。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub proxy: String,
+    /// 主动限速（#1130 / #2726）：每个 Key 每分钟最多发出的请求数，按滑动 60 秒计。
+    /// 不填（None）表示不限，行为和没有这项设置时完全一样；旧文件读进来也是 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_rpm: Option<u32>,
+    /// 主动限速：每个 Key 同时进行中的最多请求数（流式响应读完才算结束）。不填表示不限。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_concurrency: Option<u32>,
     /// 上次检查上游时，上游有、列表里没有的模型（界面提示「有新模型」，保存模型列表后清掉）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upstream_new: Vec<String>,
@@ -86,6 +93,14 @@ impl GatewayProvider {
             })
             .map(|(_, price)| price)
             .or(self.price.as_ref())
+    }
+
+    /// 这家每个 Key 的主动限速上限；0 当作不限。
+    pub fn key_limits(&self) -> crate::gateway::key_pool::KeyLimits {
+        crate::gateway::key_pool::KeyLimits {
+            rpm: self.key_rpm.filter(|value| *value > 0),
+            concurrency: self.key_concurrency.filter(|value| *value > 0),
+        }
     }
 }
 
@@ -963,6 +978,8 @@ mod tests {
             model_windows: Default::default(),
             context_window: None,
             proxy: String::new(),
+            key_rpm: None,
+            key_concurrency: None,
             upstream_new: Vec::new(),
             upstream_gone: Vec::new(),
             models_checked_at_ms: 0,
@@ -974,6 +991,41 @@ mod tests {
         });
         assert_eq!(settings.unique_slug("DeepSeek", false), "deepseek-2");
         assert_eq!(settings.unique_slug("", true), "unnamed");
+    }
+
+    /// 主动限速：旧文件没有这两项时是不限；保存后写成 keyRpm / keyConcurrency，0 当作不限、不写出。
+    #[test]
+    fn key_limits_default_to_unlimited_and_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(temp.path().join("gateway.json"));
+        std::fs::write(
+            &store.path,
+            r#"{"version":4,"providers":[{"relay":{"id":"ds","name":"DS"}}]}"#,
+        )
+        .unwrap();
+        let settings = store.load().unwrap();
+        assert_eq!(settings.providers[0].key_rpm, None);
+        assert_eq!(settings.providers[0].key_concurrency, None);
+        assert!(settings.providers[0].key_limits().is_unlimited());
+
+        crate::gateway::apply::set_provider_limits(&store, "ds", Some(10), Some(0)).unwrap();
+        let text = std::fs::read_to_string(&store.path).unwrap();
+        assert!(text.contains("\"keyRpm\": 10"), "{text}");
+        assert!(
+            !text.contains("keyConcurrency"),
+            "0 表示不限，不写出：{text}"
+        );
+        let limits = store.load().unwrap().providers[0].key_limits();
+        assert_eq!(limits.rpm, Some(10));
+        assert_eq!(limits.concurrency, None);
+
+        crate::gateway::apply::set_provider_limits(&store, "ds", None, None).unwrap();
+        assert!(
+            store.load().unwrap().providers[0]
+                .key_limits()
+                .is_unlimited()
+        );
+        assert!(crate::gateway::apply::set_provider_limits(&store, "nope", Some(1), None).is_err());
     }
 
     /// 回滚到这一版后：更新版本写的未知字段、枚举新取值都要能读，保存后原样还在。

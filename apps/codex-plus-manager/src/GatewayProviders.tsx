@@ -37,7 +37,7 @@ import {
 } from "./gateway-model";
 import { AgentIcon, Avatar, KeyCount, MemberStatusLabel, QuotaBadge, QuotaWindows, Switch, type Notify, type Run } from "./gateway-ui";
 import { ProviderFormDialog, type ProviderFormState } from "./ProviderFormDialog";
-import { ProviderExtrasDialog, priceSummary } from "./ProviderExtrasDialog";
+import { ProviderExtrasDialog, ProviderLimitsDialog, keyLimitSummary, priceSummary } from "./ProviderExtrasDialog";
 import { ProviderWindowsDialog, windowSummary } from "./ProviderWindowsDialog";
 import { ProviderReasoningDialog, reasoningSummary } from "./ProviderReasoningDialog";
 import { ProviderModelsDialog } from "./ProviderModelsDialog";
@@ -419,6 +419,7 @@ function PoolRow({
   ).filter(Boolean).join(" · ");
   // 价格、代理各开各的弹窗。
   const [extrasOpen, setExtrasOpen] = useState<"price" | "proxy" | null>(null);
+  const [limitsOpen, setLimitsOpen] = useState(false);
   const [modelsOpen, setModelsOpen] = useState(false);
   const [windowsOpen, setWindowsOpen] = useState(false);
   // 生图模型单独一行，「模型」里只列能聊天的。
@@ -446,6 +447,10 @@ function PoolRow({
   const saveExtras = async (nextPrice: ProviderPrice | null, modelPrices: Record<string, ProviderPrice> | null, proxy: string) => {
     const title = extrasOpen === "proxy" ? t("保存代理") : t("保存价格");
     if (await run(`extras:${entry.id}`, "save_gateway_provider_extras", { id: entry.id, price: nextPrice, modelPrices, proxy }, title)) setExtrasOpen(null);
+  };
+  const keyLimits = keyLimitSummary(entry);
+  const saveLimits = async (rpm: number | null, concurrency: number | null) => {
+    if (await run(`limits:${entry.id}`, "save_gateway_provider_limits", { id: entry.id, rpm, concurrency }, t("保存限速"))) setLimitsOpen(false);
   };
   const remove = async () => {
     const ok = await appConfirm(tf("从网关删除「{0}」？直连模式里的供应商不受影响。", [maskAccountName(entry.name)]), { title: t("删除供应商"), confirmText: t("删除"), danger: true });
@@ -602,6 +607,15 @@ function PoolRow({
               <button className="gw-text-button" disabled={busy !== null} onClick={() => setExtrasOpen("proxy")} type="button">{t("编辑")}</button>
             </div>
           </div>
+          <div className="gw-detail-row">
+            <span className="gw-detail-label">{t("限速")}</span>
+            <div className="gw-detail-value gw-chip-row">
+              <span className={keyLimits ? undefined : "gw-muted"} title={t("按每个 Key 计；达到上限时先换别的 Key 或下一家，都满了就排队等待（最多 2 分钟）。")}>
+                {keyLimits || t("不限")}
+              </span>
+              <button className="gw-text-button" disabled={busy !== null} onClick={() => setLimitsOpen(true)} type="button">{t("编辑")}</button>
+            </div>
+          </div>
           <div className="gw-detail-row gw-detail-foot">
             <span className="gw-detail-label" />
             <div className="gw-detail-value">
@@ -631,6 +645,9 @@ function PoolRow({
       ) : null}
       {windowsOpen ? (
         <ProviderWindowsDialog busy={busy !== null} entry={entry} onCancel={() => setWindowsOpen(false)} onSave={(modelWindows, fallback) => void saveWindows(modelWindows, fallback)} />
+      ) : null}
+      {limitsOpen ? (
+        <ProviderLimitsDialog busy={busy !== null} entry={entry} onCancel={() => setLimitsOpen(false)} onSave={(rpm, concurrency) => void saveLimits(rpm, concurrency)} />
       ) : null}
       {extrasOpen ? (
         <ProviderExtrasDialog

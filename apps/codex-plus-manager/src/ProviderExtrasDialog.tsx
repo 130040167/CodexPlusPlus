@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { t, tf } from "./i18n";
 import { AppSelect } from "./AppSelect";
-import { maskAccountName, type GatewayPoolEntry, type ProviderPrice } from "./gateway-model";
+import { maskAccountName, parseKeyLimit, type GatewayPoolEntry, type ProviderPrice } from "./gateway-model";
 import {
   EMPTY_PRICE_ROW,
   formatPrice,
@@ -204,6 +204,77 @@ export function ProviderExtrasDialog({
           <span className="pf-error">{section === "proxy" ? proxyError : ""}</span>
           <Button onClick={onCancel} size="sm" type="button" variant="ghost">{t("取消")}</Button>
           <Button disabled={busy || (section === "proxy" && Boolean(proxyError))} size="sm" type="submit">{busy ? t("保存中") : t("保存")}</Button>
+        </footer>
+      </form>
+    </div>,
+    document.body,
+  );
+}
+
+/** 详情里「限速」一行的展示文字：没设上限时为空。 */
+export function keyLimitSummary(entry: GatewayPoolEntry): string {
+  const parts: string[] = [];
+  if (entry.keyRpm) parts.push(tf("每分钟 {0} 次", [entry.keyRpm]));
+  if (entry.keyConcurrency) parts.push(tf("同时 {0} 个", [entry.keyConcurrency]));
+  return parts.length ? tf("每个 Key · {0}", [parts.join(" · ")]) : "";
+}
+
+/** 供应商的主动限速（#1130 / #2726）：每个 Key 的 RPM / 并发上限，留空表示不限。 */
+export function ProviderLimitsDialog({
+  entry,
+  busy,
+  onSave,
+  onCancel,
+}: {
+  entry: GatewayPoolEntry;
+  busy: boolean;
+  onSave: (rpm: number | null, concurrency: number | null) => void;
+  onCancel: () => void;
+}) {
+  const [rpm, setRpm] = useState(entry.keyRpm ? String(entry.keyRpm) : "");
+  const [concurrency, setConcurrency] = useState(entry.keyConcurrency ? String(entry.keyConcurrency) : "");
+  const rpmValue = parseKeyLimit(rpm);
+  const concurrencyValue = parseKeyLimit(concurrency);
+  const invalid = Number.isNaN(rpmValue) || Number.isNaN(concurrencyValue);
+  useEscapeLayer(true, onCancel);
+
+  return createPortal(
+    <div className="gw-modal-backdrop gw-portal" onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel(); }}>
+      <form
+        className="pf-modal pf-extras-modal"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!invalid) onSave(rpmValue, concurrencyValue);
+        }}
+      >
+        <header className="pf-head">
+          <Avatar baseUrl={entry.baseUrl} name={entry.name} />
+          <div>
+            <strong>{tf("{0} 的限速", [maskAccountName(entry.name)])}</strong>
+            <small>{t("按每个 Key 计，留空表示不限")}</small>
+          </div>
+          <button aria-label={t("关闭")} className="pf-icon" onClick={onCancel} type="button"><X /></button>
+        </header>
+
+        <div className="pf-body">
+          <section className="pf-section">
+            <h4>{t("限速")}<small>{t("上游限制了 RPM 或并发时，在这里主动限住，不用等 429 再冷却")}</small></h4>
+            <label className="pf-field">
+              <span>{t("每分钟最多请求数")} <small>RPM</small></span>
+              <Input inputMode="numeric" onChange={(event) => setRpm(event.currentTarget.value)} placeholder={t("不限")} value={rpm} />
+            </label>
+            <label className="pf-field">
+              <span>{t("同时进行的最多请求数")} <small>{t("并发")}</small></span>
+              <Input inputMode="numeric" onChange={(event) => setConcurrency(event.currentTarget.value)} placeholder={t("不限")} value={concurrency} />
+            </label>
+            <p className="pf-note">{t("按每个 Key 计；达到上限时先换别的 Key 或下一家，都满了就排队等待（最多 2 分钟）。")}</p>
+          </section>
+        </div>
+
+        <footer className="pf-foot">
+          <span className="pf-error">{invalid ? t("上限要填正整数，留空表示不限") : ""}</span>
+          <Button onClick={onCancel} size="sm" type="button" variant="ghost">{t("取消")}</Button>
+          <Button disabled={busy || invalid} size="sm" type="submit">{busy ? t("保存中") : t("保存")}</Button>
         </footer>
       </form>
     </div>,

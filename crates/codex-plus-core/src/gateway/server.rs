@@ -20,6 +20,7 @@ use crate::gateway::anthropic_outbound::{
     ResponsesSseToAnthropicSse, anthropic_error_body, anthropic_message_to_sse,
     responses_json_to_anthropic,
 };
+use crate::gateway::key_pool::{self, KeySlot};
 use crate::gateway::pipeline::{
     self, AnthropicPassthrough, GatewayRequest, GatewayUpstream, NativeAnthropicResponse,
 };
@@ -279,8 +280,19 @@ async fn handle_images(
             std::time::Instant::now(),
             true,
         );
-        let Some(key) = keys.into_iter().next() else {
-            last_error = format!("{} 的 Key 都在冷却或熔断中", target.relay.name);
+        // 主动限速：跳过名额满了的 Key（不排队），占到的名额持有到这一家的答复读完。
+        let limits = gateway
+            .provider(&target.relay.id)
+            .map(crate::gateway::store::GatewayProvider::key_limits)
+            .unwrap_or_default();
+        let Some((key, _slot)) = keys.into_iter().find_map(|key| {
+            key_pool::try_acquire(&key.key, limits, std::time::Instant::now())
+                .map(|slot| (key, slot))
+        }) else {
+            last_error = format!(
+                "{} 的 Key 都在冷却、熔断中或达到了 Codex++ 本地限速上限",
+                target.relay.name
+            );
             continue;
         };
         let relay = match crate::gateway::accounts::prepare_relay(&key.relay).await {
@@ -371,6 +383,8 @@ async fn handle_images(
 }
 
 /// Grok 等 Responses 客户端：按 Agent 绑定选上游，返回值交给 Codex 代理的输出链路。
+///
+/// 第二项是成功时占着的限速名额：调用方要持有到响应转发完（流式读完、出错或客户端断开）再放掉。
 pub(crate) async fn open_responses_for_agent(
     agent: &ToolId,
     request_path: &str,
@@ -378,7 +392,8 @@ pub(crate) async fn open_responses_for_agent(
     user_agent: Option<&str>,
     session_headers: ProxySessionHeaders<'_>,
     live_request_id: Option<&str>,
-) -> anyhow::Result<UpstreamProxyResponse> {
+    client: Option<&tokio::net::TcpStream>,
+) -> anyhow::Result<(UpstreamProxyResponse, Option<KeySlot>)> {
     let settings = SettingsStore::default().load().unwrap_or_default();
     let gateway = GatewayStore::default().load().unwrap_or_default();
     let request: Value = serde_json::from_str(request_body)?;
@@ -410,10 +425,13 @@ pub(crate) async fn open_responses_for_agent(
             } else {
                 "/responses"
             },
+            client,
+            queue_timeout: key_pool::LIMIT_QUEUE_TIMEOUT,
         },
     )
     .await?;
     let trace = outcome.trace;
+    let slot = outcome.slot;
     match outcome.upstream {
         GatewayUpstream::Pipeline(mut response) => {
             let mut merged = response.request_trace.take().unwrap_or_default();
@@ -425,9 +443,9 @@ pub(crate) async fn open_responses_for_agent(
                 merged.upstream_model = trace.upstream_model;
             }
             response.request_trace = Some(merged);
-            Ok(response)
+            Ok((response, slot))
         }
-        GatewayUpstream::Cooling(wait) => Ok(cooling_response(wait)),
+        GatewayUpstream::Cooling(wait) => Ok((cooling_response(wait), None)),
         GatewayUpstream::Native(_) => anyhow::bail!("Responses 客户端不会走 Anthropic 原样转发"),
     }
 }
@@ -593,6 +611,8 @@ async fn handle_claude_messages(
             auto_retry: true,
             is_stream: wants_stream,
             upstream_path: "/responses",
+            client: Some(&*stream),
+            queue_timeout: key_pool::LIMIT_QUEUE_TIMEOUT,
         },
     )
     .await;
@@ -602,6 +622,9 @@ async fn handle_claude_messages(
             let message = crate::protocol_proxy::error_chain(&error);
             let status = if is_client_rejection(&error) {
                 400
+            } else if error.downcast_ref::<pipeline::LocalRateLimited>().is_some() {
+                // 本地限速排队超时：不是上游坏了，按限流回给客户端。
+                429
             } else {
                 502
             };
@@ -622,6 +645,8 @@ async fn handle_claude_messages(
     let trace = outcome.trace;
     // 持有到响应转发完：路由页据此显示「正在回答」。
     let _busy = outcome.busy;
+    // 限速名额同样持有到响应转发完（流式读完、出错或客户端断开时随函数返回释放）。
+    let _slot = outcome.slot;
     match outcome.upstream {
         GatewayUpstream::Cooling(wait) => {
             request_log.record_trace(&trace, 429, false);

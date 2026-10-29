@@ -143,6 +143,8 @@ fn providers(relays: Vec<RelayProfile>) -> Vec<GatewayProvider> {
             model_windows: Default::default(),
             context_window: None,
             proxy: String::new(),
+            key_rpm: None,
+            key_concurrency: None,
             upstream_new: Vec::new(),
             upstream_gone: Vec::new(),
             models_checked_at_ms: 0,

@@ -122,7 +122,7 @@ import { GatewayPage, type GatewayTab } from "./GatewayPage";
 import { AgentGlyph, HubOverview, useGatewayPayload } from "./HubOverview";
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
 import { SessionsView, sessionDeleteSucceeded } from "./GatewaySessions";
-import { agentName, formatRequestCost, maskAccountName, usageRangeStart, type GatewayResult, type UsageCost, type UsageRange } from "./gateway-model";
+import { agentName, formatQueueWait, formatRequestCost, maskAccountName, queueWaitMs, QUEUE_REASON_PREFIX, usageRangeStart, type GatewayResult, type UsageCost, type UsageRange } from "./gateway-model";
 import { SessionAgentTabs, type SessionTab } from "./SessionAgentTabs";
 import { UsageTabs, onOpenRequestLog, type RequestLogFocus } from "./UsageTabs";
 import { noticeDuration, noticeTone } from "./notice-model";
@@ -6228,9 +6228,26 @@ function formatRequestLogDuration(durationMs: number) {
 }
 
 function requestLogRetryLabel(entry: RequestLogEntry) {
-  if (entry.autoRetries > 0) return tf("自动重试 ×{0}", [String(entry.autoRetries)]);
-  if (entry.attempts > 1) return tf("切换 ×{0}", [String(entry.attempts)]);
-  return "-";
+  const base = entry.autoRetries > 0
+    ? tf("自动重试 ×{0}", [String(entry.autoRetries)])
+    : entry.attempts > 1
+      ? tf("切换 ×{0}", [String(entry.attempts)])
+      : "";
+  // 网关因 Codex++ 本地限速排过队：标出排了多久。
+  const queued = queueWaitMs(entry.retryReasons);
+  const queue = queued === null ? "" : tf("限速排队 {0}", [formatQueueWait(queued)]);
+  return [base, queue].filter(Boolean).join(" · ") || "-";
+}
+
+/** 重试原因的展示：网关记的限速排队换成「限速排队 Xs」，其它原样。 */
+function requestLogRetryReasons(entry: RequestLogEntry): string {
+  return (entry.retryReasons ?? [])
+    .map((reason) => {
+      if (!reason.startsWith(QUEUE_REASON_PREFIX)) return reason;
+      const queued = queueWaitMs([reason]);
+      return queued === null ? reason : tf("限速排队 {0}", [formatQueueWait(queued)]);
+    })
+    .join("、");
 }
 
 /** 请求来自哪个 Agent：网关记录带 agent 字段，Codex 直连代理的记录没有。 */
@@ -6582,8 +6599,8 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
                     ) : null}
                   </span>
                   <span
-                    className={entry.autoRetries > 0 ? "request-log-retry" : "request-log-muted"}
-                    title={(entry.retryReasons ?? []).join("、")}
+                    className={entry.autoRetries > 0 || queueWaitMs(entry.retryReasons) !== null ? "request-log-retry" : "request-log-muted"}
+                    title={requestLogRetryReasons(entry)}
                   >
                     {requestLogRetryLabel(entry)}
                   </span>
@@ -6657,7 +6674,7 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
                       <div><dt>{t("首字耗时")}</dt><dd>{entry.firstTokenMs == null ? (entry.state === "running" ? t("进行中") : "-") : formatRequestLogDuration(entry.firstTokenMs)}</dd></div>
                       <div><dt>{t("尝试次数")}</dt><dd>{entry.attempts || "-"}</dd></div>
                       <div><dt>{t("自动重试")}</dt><dd>{entry.autoRetries}</dd></div>
-                      <div><dt>{t("重试原因")}</dt><dd>{(entry.retryReasons ?? []).join("、") || "-"}</dd></div>
+                      <div><dt>{t("重试原因")}</dt><dd>{requestLogRetryReasons(entry) || "-"}</dd></div>
                       {entry.attemptDetails?.length ? (
                         <div className="request-log-attempts">
                           <dt>{t("尝试明细")}</dt>

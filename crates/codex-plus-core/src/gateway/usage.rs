@@ -491,6 +491,8 @@ mod tests {
             model_windows: Default::default(),
             context_window: None,
             proxy: String::new(),
+            key_rpm: None,
+            key_concurrency: None,
             price: Some(ProviderPrice {
                 currency: "cny".to_string(),
                 input: 2.0,

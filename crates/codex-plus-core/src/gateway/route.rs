@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 
-use crate::gateway::key_pool::{self, KeyRef};
+use crate::gateway::key_pool::{self, KeyLimits, KeyRef};
 use crate::gateway::store::{
     AgentBinding, AutoGroupSettings, GROUP_MODEL_PREFIX, GatewayGroup, GatewayProvider,
     GatewaySettings, GroupMember, GroupMode, GroupSticky, UnknownModelPolicy,
@@ -43,6 +43,8 @@ pub struct GatewayCandidate {
     pub upstream_model: String,
     /// 这家这个模型的上下文窗口（供应商池里写了才有）：请求比它还长时排到最后再试。
     pub window: Option<u64>,
+    /// 这家每个 Key 的主动限速上限（没填就是不限）；候选循环发请求前按它占名额。
+    pub limits: KeyLimits,
 }
 
 #[derive(Debug, Clone)]
@@ -949,9 +951,12 @@ fn resolve_plan_with(
     let mut candidates = Vec::new();
     let mut cooling: Option<Duration> = None;
     for (relay, upstream_model) in relays {
-        let window = gateway
-            .provider(&relay.id)
-            .and_then(|provider| provider.window_for(&upstream_model));
+        let provider = gateway.provider(&relay.id);
+        let window = provider.and_then(|provider| provider.window_for(&upstream_model));
+        // 限速满了的 Key 照样进候选：是否跳过、排队由候选循环在发请求时按实时名额决定。
+        let limits = provider
+            .map(GatewayProvider::key_limits)
+            .unwrap_or_default();
         let (keys, soonest) = key_pool::order_keys_with(
             &relay,
             gateway.key_policy.mode,
@@ -968,6 +973,7 @@ fn resolve_plan_with(
                 key: key.key,
                 upstream_model: upstream_model.clone(),
                 window,
+                limits,
             });
         }
     }
@@ -998,6 +1004,8 @@ mod tests {
             model_windows: Default::default(),
             context_window: None,
             proxy: String::new(),
+            key_rpm: None,
+            key_concurrency: None,
             upstream_new: Vec::new(),
             upstream_gone: Vec::new(),
             models_checked_at_ms: 0,
@@ -1838,5 +1846,39 @@ mod tests {
             !models.iter().any(|m| m == "kimi-k3"),
             "fast 组的成员 kimi-k3 被隐藏：{models:?}"
         );
+    }
+
+    /// 主动限速：上限按供应商带到每个候选上；没填（或填 0）就是不限。限速满了的 Key 不从候选里去掉。
+    #[test]
+    fn candidates_carry_their_provider_key_limits() {
+        let mut gateway = gateway("deepseek-v4-pro");
+        gateway.providers[0].key_rpm = Some(10);
+        gateway.providers[0].key_concurrency = Some(2);
+        gateway.providers[2].key_rpm = Some(0);
+        let plan = resolve_plan(&gateway, &ToolId::Claude, "deepseek-v4-pro", None).unwrap();
+        let limits: Vec<(String, KeyLimits)> = plan
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.relay.id.clone(), candidate.limits))
+            .collect();
+        assert_eq!(
+            limits,
+            vec![
+                (
+                    "ds".to_string(),
+                    KeyLimits {
+                        rpm: Some(10),
+                        concurrency: Some(2)
+                    }
+                ),
+                ("mirror".to_string(), KeyLimits::default()),
+            ]
+        );
+        let key = plan.candidates[0].key.clone();
+        let _slot = key_pool::try_acquire(&key, plan.candidates[0].limits, Instant::now());
+        let _second = key_pool::try_acquire(&key, plan.candidates[0].limits, Instant::now());
+        let again = resolve_plan(&gateway, &ToolId::Claude, "deepseek-v4-pro", None).unwrap();
+        assert_eq!(again.candidates.len(), 2, "并发满了也不算冷却");
+        assert_eq!(again.cooling, None);
     }
 }

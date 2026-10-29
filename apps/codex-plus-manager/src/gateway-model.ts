@@ -78,6 +78,10 @@ export type GatewayPoolEntry = {
   contextWindow?: number | null;
   /** 网关供应商单独走的 HTTP 代理，空串表示不单独走代理。 */
   proxy?: string;
+  /** 主动限速：每个 Key 每分钟最多请求数；没有或 null 表示不限。旧版后端没有。 */
+  keyRpm?: number | null;
+  /** 主动限速：每个 Key 同时进行的最多请求数；没有或 null 表示不限。旧版后端没有。 */
+  keyConcurrency?: number | null;
   /** 转发前移除托管生图工具（image_generation，#228）。旧版后端没有。 */
   stripImageGenerationTool?: boolean;
   /** 登录得到的账号：chatgpt / copilot / grok；普通供应商为空。 */
@@ -294,6 +298,31 @@ export function parseContextWindow(value: string): number | null {
   const base = Number(match[1]);
   const scale = match[2] === "m" ? 1_000_000 : match[2] === "k" ? 1_000 : 1;
   return Math.round(base * scale);
+}
+
+/** 主动限速的上限：留空是不限（null），正整数是上限；0、小数、负数或别的写法无效（NaN）。 */
+export function parseKeyLimit(value: string): number | null {
+  const text = value.trim();
+  if (!text) return null;
+  if (!/^\d+$/.test(text)) return Number.NaN;
+  const limit = Number(text);
+  return limit > 0 && limit <= 1_000_000 ? limit : Number.NaN;
+}
+
+/** 请求日志「重试原因」里网关记的限速排队：`local_rate_limit_wait_ms:<毫秒>`。 */
+export const QUEUE_REASON_PREFIX = "local_rate_limit_wait_ms:";
+
+/** 这次请求因 Codex++ 本地限速排队了多久（毫秒）；没排过队返回 null。 */
+export function queueWaitMs(reasons: string[] | null | undefined): number | null {
+  const reason = (reasons ?? []).find((item) => item.startsWith(QUEUE_REASON_PREFIX));
+  if (reason === undefined) return null;
+  const ms = Number(reason.slice(QUEUE_REASON_PREFIX.length));
+  return Number.isFinite(ms) && ms >= 0 ? ms : null;
+}
+
+/** 排队时长的写法：10 秒内保留一位小数（0.4s、3.2s），再长取整（45s）。 */
+export function formatQueueWait(ms: number): string {
+  return ms < 10_000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms / 1000)}s`;
 }
 
 export function splitModels(text: string): string[] {

@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::gateway::activity::{InFlight, RouteRecorder};
 use crate::gateway::anthropic_inbound;
-use crate::gateway::key_pool::{self, FailureClass};
+use crate::gateway::key_pool::{self, FailureClass, KeyLimitState, KeySlot};
 use crate::gateway::route::{GatewayCandidate, RoutePlan};
 use crate::protocol_proxy::{ForcedRelay, ProxySessionHeaders, UpstreamProxyResponse};
 use crate::request_log::RequestTrace;
@@ -45,6 +45,8 @@ pub struct GatewayOutcome {
     pub trace: RequestTrace,
     /// 成功时标记「正在由该上游回答」，持有到响应转发完为止。
     pub busy: Option<InFlight>,
+    /// 成功时占着的限速名额（没设上限时是空名额）：持有到响应转发完为止，drop 时释放并发名额。
+    pub slot: Option<KeySlot>,
 }
 
 impl GatewayUpstream {
@@ -79,6 +81,10 @@ pub struct GatewayRequest<'a> {
     pub is_stream: bool,
     /// 发给上游的 Responses 路径：`/responses`，或旧版 Codex 远程压缩的 `/responses/compact`。
     pub upstream_path: &'a str,
+    /// 客户端连接：因本地限速排队时用来发现客户端已断开，不再干等。
+    pub client: Option<&'a tokio::net::TcpStream>,
+    /// 所有候选都因本地限速满了时最多排队多久，一般是 [`key_pool::LIMIT_QUEUE_TIMEOUT`]。
+    pub queue_timeout: Duration,
 }
 
 /// 依次尝试路由计划里的候选，并把路由过程记到路由动态里。
@@ -114,138 +120,283 @@ async fn open_candidates(
                 upstream: GatewayUpstream::Cooling(wait),
                 trace,
                 busy: None,
+                slot: None,
             });
         }
         anyhow::bail!("网关没有可用的上游：请检查绑定的供应商或模型组是否配置了地址和 Key");
     }
-    let count = plan.candidates.len();
     let mut last_error: Option<anyhow::Error> = None;
-    let ordered = fit_first(&plan.candidates, estimate_tokens(&request));
-    for (index, candidate) in ordered.into_iter().enumerate() {
-        let has_more = index + 1 < count;
-        trace.attempts += 1;
-        trace.relay_id = candidate.relay.id.clone();
-        trace.relay_name = candidate.relay.name.clone();
-        trace.upstream_model = candidate.upstream_model.clone();
-        if let Some(id) = request.live_request_id {
-            crate::request_log::update_running_retry(id, trace.attempts, 0, Vec::new());
-        }
-        // 账号类供应商（如 Copilot）在请求前换好短期 token。
-        let prepared = match crate::gateway::accounts::prepare_relay(&candidate.relay).await {
-            Ok(relay) => GatewayCandidate {
-                relay,
-                ..candidate.clone()
-            },
-            Err(error) => {
-                recorder.step(candidate, "transport", Some("auth_invalid"), None);
-                crate::gateway::speed::record_failure(
-                    &candidate.relay.id,
-                    &candidate.upstream_model,
-                );
+    let mut pending = fit_first(&plan.candidates, estimate_tokens(&request));
+    // 主动限速：第一次因为候选都满了而排队的时刻，和累计排了多久。
+    let mut queue_started: Option<Instant> = None;
+    let mut queued = Duration::ZERO;
+    loop {
+        // 先登记「有名额释放」的通知再检查名额，检查和等待之间的释放不会漏掉。
+        let released = key_pool::limit_released();
+        tokio::pin!(released);
+        released.as_mut().enable();
+        let total = pending.len();
+        // 这一轮因限速满了跳过的候选（按原顺序）：不算失败、不冷却，都试完了再排队等它们。
+        let mut deferred: Vec<&GatewayCandidate> = Vec::new();
+        for (index, candidate) in pending.into_iter().enumerate() {
+            let Some(slot) =
+                key_pool::try_acquire(&candidate.key, candidate.limits, Instant::now())
+            else {
+                deferred.push(candidate);
+                continue;
+            };
+            let has_more = index + 1 < total || !deferred.is_empty();
+            trace.attempts += 1;
+            trace.relay_id = candidate.relay.id.clone();
+            trace.relay_name = candidate.relay.name.clone();
+            trace.upstream_model = candidate.upstream_model.clone();
+            if let Some(id) = request.live_request_id {
+                crate::request_log::update_running_retry(id, trace.attempts, 0, Vec::new());
+            }
+            // 账号类供应商（如 Copilot）在请求前换好短期 token。
+            let prepared = match crate::gateway::accounts::prepare_relay(&candidate.relay).await {
+                Ok(relay) => GatewayCandidate {
+                    relay,
+                    ..candidate.clone()
+                },
+                Err(error) => {
+                    // 请求没发出去：名额（连同 RPM 的这一次）退回。
+                    slot.cancel();
+                    recorder.step(candidate, "transport", Some("auth_invalid"), None);
+                    crate::gateway::speed::record_failure(
+                        &candidate.relay.id,
+                        &candidate.upstream_model,
+                    );
+                    log_attempt_failure(candidate, None, Some(&error), has_more);
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            // OpenCode Go / Zen：按模型换成它所在的协议和地址，带上会话头。
+            let mut prepared = prepared;
+            if let Err(reason) = crate::gateway::opencode::prepare(
+                &mut prepared.relay,
+                &prepared.upstream_model,
+                conversation_seed.as_deref(),
+            ) {
+                slot.cancel();
+                let error = anyhow::anyhow!(reason);
+                recorder.step(candidate, "transport", Some("unsupported_model"), None);
                 log_attempt_failure(candidate, None, Some(&error), has_more);
                 last_error = Some(error);
                 continue;
             }
-        };
-        // OpenCode Go / Zen：按模型换成它所在的协议和地址，带上会话头。
-        let mut prepared = prepared;
-        if let Err(reason) = crate::gateway::opencode::prepare(
-            &mut prepared.relay,
-            &prepared.upstream_model,
-            conversation_seed.as_deref(),
-        ) {
-            let error = anyhow::anyhow!(reason);
-            recorder.step(candidate, "transport", Some("unsupported_model"), None);
-            log_attempt_failure(candidate, None, Some(&error), has_more);
-            last_error = Some(error);
-            continue;
-        }
-        let candidate = &prepared;
-        let busy = recorder.begin(candidate);
-        let started = Instant::now();
-        let native = request
-            .anthropic
-            .as_ref()
-            .filter(|_| candidate.relay.protocol == RelayProtocol::AnthropicMessages);
-        let attempt = match native {
-            Some(passthrough) => {
-                trace.wire_api = "AnthropicMessages".to_string();
-                attempt_native(candidate, passthrough, &request).await
-            }
-            None => attempt_pipeline(settings, candidate, &request).await,
-        };
-        let failure = match attempt {
-            Ok(Attempt::Success(upstream)) => {
-                recorder.step(candidate, "answered", None, upstream.status_code());
-                key_pool::record_success(&candidate.key, plan.conversation.as_deref());
-                crate::gateway::speed::record(
-                    &candidate.relay.id,
-                    &candidate.upstream_model,
-                    started.elapsed(),
-                );
-                crate::gateway::route::remember_answer(plan, candidate);
-                observe_quota(&candidate.relay.id, &upstream);
-                if let GatewayUpstream::Pipeline(response) = &upstream
-                    && let Some(inner) = &response.request_trace
-                {
-                    trace.wire_api = inner.wire_api.clone();
-                    trace.first_output_at_ms = inner.first_output_at_ms;
-                    trace.auto_retries = inner.auto_retries;
-                    trace.retry_reasons = inner.retry_reasons.clone();
-                    trace.attempt_details = inner.attempt_details.clone();
+            let candidate = &prepared;
+            let busy = recorder.begin(candidate);
+            let started = Instant::now();
+            let native = request
+                .anthropic
+                .as_ref()
+                .filter(|_| candidate.relay.protocol == RelayProtocol::AnthropicMessages);
+            let attempt = match native {
+                Some(passthrough) => {
+                    trace.wire_api = "AnthropicMessages".to_string();
+                    attempt_native(candidate, passthrough, &request).await
                 }
-                return Ok(GatewayOutcome {
-                    upstream,
-                    trace,
-                    busy: Some(busy),
-                });
-            }
-            Ok(Attempt::Failed { upstream, class }) => {
-                recorder.step(
-                    candidate,
-                    "failed",
-                    Some(class.label()),
-                    upstream.status_code(),
-                );
-                let failover = key_pool::record_failure(&candidate.key, &class, Instant::now());
-                // 失败也算「试过了」：速度优先的组不再把它当没测过的排第一。
-                crate::gateway::speed::record_failure(
-                    &candidate.relay.id,
-                    &candidate.upstream_model,
-                );
-                log_attempt_failure(candidate, Some(&class), None, has_more && failover);
-                if !failover || !has_more {
+                None => attempt_pipeline(settings, candidate, &request).await,
+            };
+            let failure = match attempt {
+                Ok(Attempt::Success(mut upstream)) => {
+                    recorder.step(candidate, "answered", None, upstream.status_code());
+                    // 排在它前面的候选因为限速满了被跳过：这次只是临时顶替，不改会话固定
+                    // （同一家的 Key 粘性、模型组记住的成员都保持原样）。
+                    let same_relay_skipped = deferred
+                        .iter()
+                        .any(|skipped| skipped.relay.id == candidate.relay.id);
+                    let conversation = if same_relay_skipped {
+                        None
+                    } else {
+                        plan.conversation.as_deref()
+                    };
+                    key_pool::record_success(&candidate.key, conversation);
+                    crate::gateway::speed::record(
+                        &candidate.relay.id,
+                        &candidate.upstream_model,
+                        started.elapsed(),
+                    );
+                    if deferred.is_empty() {
+                        crate::gateway::route::remember_answer(plan, candidate);
+                    }
+                    observe_quota(&candidate.relay.id, &upstream);
+                    if let GatewayUpstream::Pipeline(response) = &upstream
+                        && let Some(inner) = &response.request_trace
+                    {
+                        trace.wire_api = inner.wire_api.clone();
+                        trace.first_output_at_ms = inner.first_output_at_ms;
+                        trace.auto_retries = inner.auto_retries;
+                        trace.retry_reasons = inner.retry_reasons.clone();
+                        trace.attempt_details = inner.attempt_details.clone();
+                    }
+                    if queue_started.is_some() {
+                        // 请求日志的重试 / 备注栏标出「限速排队 Xs」。
+                        let reason = queue_reason(queued);
+                        trace.retry_reasons.push(reason.clone());
+                        if let GatewayUpstream::Pipeline(response) = &mut upstream
+                            && let Some(inner) = response.request_trace.as_mut()
+                        {
+                            inner.retry_reasons.push(reason);
+                        }
+                    }
                     return Ok(GatewayOutcome {
                         upstream,
                         trace,
-                        busy: None,
+                        busy: Some(busy),
+                        slot: Some(slot),
                     });
                 }
-                None
+                Ok(Attempt::Failed { upstream, class }) => {
+                    recorder.step(
+                        candidate,
+                        "failed",
+                        Some(class.label()),
+                        upstream.status_code(),
+                    );
+                    let failover = key_pool::record_failure(&candidate.key, &class, Instant::now());
+                    // 失败也算「试过了」：速度优先的组不再把它当没测过的排第一。
+                    crate::gateway::speed::record_failure(
+                        &candidate.relay.id,
+                        &candidate.upstream_model,
+                    );
+                    log_attempt_failure(candidate, Some(&class), None, has_more && failover);
+                    if !failover || !has_more {
+                        return Ok(GatewayOutcome {
+                            upstream,
+                            trace,
+                            busy: None,
+                            slot: None,
+                        });
+                    }
+                    None
+                }
+                Err(AttemptError::Fatal(error)) => return Err(error),
+                Err(AttemptError::Transport(error)) => {
+                    recorder.step(candidate, "transport", Some("server_error"), None);
+                    key_pool::record_failure(
+                        &candidate.key,
+                        &FailureClass::ServerError,
+                        Instant::now(),
+                    );
+                    crate::gateway::speed::record_failure(
+                        &candidate.relay.id,
+                        &candidate.upstream_model,
+                    );
+                    log_attempt_failure(candidate, None, Some(&error), has_more);
+                    Some(error)
+                }
+            };
+            // 失败的响应体已经读完：并发名额马上还回去。
+            drop(slot);
+            drop(busy);
+            if let Some(error) = failure {
+                last_error = Some(error);
             }
-            Err(AttemptError::Fatal(error)) => return Err(error),
-            Err(AttemptError::Transport(error)) => {
-                recorder.step(candidate, "transport", Some("server_error"), None);
-                key_pool::record_failure(
-                    &candidate.key,
-                    &FailureClass::ServerError,
-                    Instant::now(),
-                );
-                crate::gateway::speed::record_failure(
-                    &candidate.relay.id,
-                    &candidate.upstream_model,
-                );
-                log_attempt_failure(candidate, None, Some(&error), has_more);
-                Some(error)
-            }
-        };
-        drop(busy);
-        if let Some(error) = failure {
-            last_error = Some(error);
         }
+        if deferred.is_empty() {
+            break;
+        }
+        // 剩下的候选都因为限速满了：排队等最早空出来的名额，有上限。
+        let now = Instant::now();
+        let deadline = *queue_started.get_or_insert(now) + request.queue_timeout;
+        if now >= deadline {
+            return Err(LocalRateLimited::new(&deferred, request.queue_timeout).into());
+        }
+        let retry_in = deferred
+            .iter()
+            .filter_map(|candidate| {
+                match key_pool::limit_state(&candidate.key, candidate.limits, now) {
+                    KeyLimitState::Free => Some(Duration::ZERO),
+                    KeyLimitState::Full { retry_in } => retry_in,
+                }
+            })
+            .min();
+        let remaining = deadline - now;
+        let sleep = retry_in.map_or(remaining, |retry_in| retry_in.min(remaining));
+        if let Some(id) = request.live_request_id {
+            crate::request_log::update_running_phase(id, "waiting");
+        }
+        tokio::select! {
+            _ = &mut released => {}
+            _ = tokio::time::sleep(sleep) => {}
+            _ = client_gone(request.client) => {
+                anyhow::bail!("客户端已断开，放弃等待 Codex++ 本地限速的名额");
+            }
+        }
+        queued += now.elapsed();
+        pending = deferred;
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("网关的所有上游都失败了")))
 }
+
+/// 请求日志里「限速排队」的记录：`local_rate_limit_wait_ms:<毫秒>`，界面显示成「限速排队 Xs」。
+pub const QUEUE_REASON_PREFIX: &str = "local_rate_limit_wait_ms:";
+
+fn queue_reason(queued: Duration) -> String {
+    format!("{QUEUE_REASON_PREFIX}{}", queued.as_millis())
+}
+
+/// 等到客户端断开才返回；没给连接、或客户端还连着（读到了多余数据）时一直挂着。
+async fn client_gone(client: Option<&tokio::net::TcpStream>) {
+    let Some(stream) = client else {
+        return std::future::pending().await;
+    };
+    let mut probe = [0_u8; 1];
+    match stream.peek(&mut probe).await {
+        Ok(0) | Err(_) => {}
+        Ok(_) => std::future::pending().await,
+    }
+}
+
+/// 所有候选都因 Codex++ 本地限速满了、排队超时：不是上游的错误，回给客户端时用 429。
+#[derive(Debug)]
+pub struct LocalRateLimited {
+    pub message: String,
+}
+
+impl LocalRateLimited {
+    fn new(candidates: &[&GatewayCandidate], waited: Duration) -> Self {
+        let mut providers: Vec<String> = Vec::new();
+        for candidate in candidates {
+            let limits = candidate.limits;
+            let mut parts = Vec::new();
+            if let Some(rpm) = limits.rpm {
+                parts.push(format!("每分钟 {rpm} 次"));
+            }
+            if let Some(concurrency) = limits.concurrency {
+                parts.push(format!("同时 {concurrency} 个"));
+            }
+            let name = crate::gateway::accounts::mask_account_name(&candidate.relay.name);
+            let entry = if parts.is_empty() {
+                format!("「{name}」")
+            } else {
+                format!("「{name}」（每个 Key {}）", parts.join("、"))
+            };
+            if !providers.contains(&entry) {
+                providers.push(entry);
+            }
+        }
+        Self {
+            message: format!(
+                "Codex++ 本地限速：{} 的 Key 都已达到你设置的请求上限，排队等待 {} 秒仍没有空出名额。\
+                 这是 Codex++ 网关自己的限速，不是上游返回的错误；可以在网关「供应商池」里调高这家的限速上限，或给它添加更多 Key。",
+                providers.join("、"),
+                waited.as_secs()
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for LocalRateLimited {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LocalRateLimited {}
 
 /// 请求比窗口还长的候选排到最后（不去掉）：它们多半只会拒绝，别家都不行时再试一次。
 /// 没写窗口的候选当作装得下。
@@ -615,6 +766,7 @@ mod window_tests {
             },
             upstream_model: "m".to_string(),
             window,
+            limits: Default::default(),
         }
     }
 
@@ -650,5 +802,72 @@ mod window_tests {
         });
         let tokens = text_bytes(&body) / 4;
         assert!((1_000..1_100).contains(&tokens), "{tokens}");
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+    use crate::gateway::key_pool::{KeyLimits, KeyRef};
+
+    /// 排队时客户端断开：等待马上结束，不再占着连接干等。
+    #[tokio::test]
+    async fn queue_notices_when_the_client_disconnects() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let waiting = tokio::spawn(async move { client_gone(Some(&server)).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "客户端还连着时一直等");
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("断开后马上发现")
+            .unwrap();
+    }
+
+    #[test]
+    fn timeout_message_names_the_provider_and_its_limits() {
+        let candidate = GatewayCandidate {
+            relay: crate::settings::RelayProfile {
+                id: "slow".to_string(),
+                name: "慢供应商".to_string(),
+                ..Default::default()
+            },
+            key: KeyRef {
+                relay_id: "slow".to_string(),
+                key_id: "a".to_string(),
+                fingerprint: 0,
+            },
+            upstream_model: "m".to_string(),
+            window: None,
+            limits: KeyLimits {
+                rpm: Some(5),
+                concurrency: Some(1),
+            },
+        };
+        let second = GatewayCandidate {
+            key: KeyRef {
+                key_id: "b".to_string(),
+                ..candidate.key.clone()
+            },
+            ..candidate.clone()
+        };
+        let error = LocalRateLimited::new(&[&candidate, &second], key_pool::LIMIT_QUEUE_TIMEOUT);
+        assert_eq!(
+            error.message.matches("「慢供应商」").count(),
+            1,
+            "同一家的多个 Key 只列一次：{}",
+            error.message
+        );
+        assert!(error.message.contains("每个 Key 每分钟 5 次、同时 1 个"));
+        assert!(error.message.contains("120 秒"));
+        assert_eq!(
+            queue_reason(Duration::from_millis(1_500)),
+            "local_rate_limit_wait_ms:1500"
+        );
     }
 }

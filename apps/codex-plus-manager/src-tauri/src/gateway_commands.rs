@@ -52,6 +52,10 @@ pub struct GatewayPoolEntry {
     pub lent_to_codex: bool,
     /// 网关供应商单独走的 HTTP 代理（空串表示不单独走代理）。
     pub proxy: String,
+    /// 主动限速：每个 Key 每分钟最多请求数；None 表示不限。
+    pub key_rpm: Option<u32>,
+    /// 主动限速：每个 Key 同时进行的最多请求数；None 表示不限。
+    pub key_concurrency: Option<u32>,
     /// 转发前移除托管生图工具（#228）。
     pub strip_image_generation_tool: bool,
     /// 上次检查时上游有、列表里没有的模型（界面提示新模型）。
@@ -179,6 +183,8 @@ fn pool_entry(
         plan: codex_plus_core::gateway::accounts::account_plan(relay),
         lent_to_codex: codex_plus_core::official_login::is_lent_to_codex(relay),
         proxy: relay.gateway_proxy.clone().unwrap_or_default(),
+        key_rpm: None,
+        key_concurrency: None,
         strip_image_generation_tool: relay.strip_image_generation_tool,
         upstream_new: upstream.0,
         upstream_gone: upstream.1,
@@ -209,6 +215,8 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
         .map(|provider| GatewayPoolEntry {
             model_windows: provider.model_windows.clone(),
             context_window: provider.context_window,
+            key_rpm: provider.key_rpm,
+            key_concurrency: provider.key_concurrency,
             ..pool_entry(
                 &provider.relay,
                 provider.enabled,
@@ -682,6 +690,20 @@ pub fn save_gateway_provider_extras(
         "已保存。",
         "保存失败",
         apply::set_provider_extras(&GatewayStore::default(), &id, price, model_prices, &proxy),
+    )
+}
+
+/// 改供应商的主动限速（每个 Key 的 RPM / 并发上限，留空不限）。只影响网关选 Key，不用重写 Agent 配置。
+#[tauri::command]
+pub fn save_gateway_provider_limits(
+    id: String,
+    rpm: Option<u32>,
+    concurrency: Option<u32>,
+) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        "限速已保存。",
+        "保存限速失败",
+        apply::set_provider_limits(&GatewayStore::default(), &id, rpm, concurrency),
     )
 }
 

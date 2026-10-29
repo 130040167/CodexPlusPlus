@@ -2773,6 +2773,7 @@ pub(crate) async fn handle_protocol_proxy_connection(
                 Some(live_request_id.as_str()),
             )
             .await
+            .map(|upstream| (upstream, None))
         }
         ProxyOpener::Gateway(agent) => {
             request_log.set_agent(agent);
@@ -2783,14 +2784,16 @@ pub(crate) async fn handle_protocol_proxy_connection(
                 request_user_agent,
                 session_headers,
                 Some(live_request_id.as_str()),
+                Some(&*stream),
             )
             .await
         }
     };
-    let mut upstream =
+    // `_key_slot`：网关的限速名额，持有到这个函数返回（响应转发完、出错或客户端断开）才释放。
+    let (mut upstream, _key_slot) =
         match opened
         {
-            Ok(upstream) => upstream,
+            Ok(opened) => opened,
             Err(error) => {
                 let unsupported =
                     error.downcast_ref::<crate::protocol_proxy::UnsupportedEncryptedAgentContent>();
@@ -2798,9 +2801,13 @@ pub(crate) async fn handle_protocol_proxy_connection(
                     error.downcast_ref::<crate::protocol_proxy::UnsupportedNativeWebSearch>();
                 let file_unsupported = error.downcast_ref::<crate::protocol_proxy::UnsupportedInputFile>();
                 let vlm_failure = error.downcast_ref::<crate::vision::VlmPreprocessError>();
+                let local_limited = error.downcast_ref::<crate::gateway::pipeline::LocalRateLimited>();
                 let status = if unsupported.is_some() || search_unsupported.is_some() || file_unsupported.is_some()
                     || matches!(vlm_failure, Some(crate::vision::VlmPreprocessError::MissingConfiguration)) {
                     "400 Bad Request"
+                } else if local_limited.is_some() {
+                    // 网关本地限速排队超时：按限流回给客户端，不当成上游故障。
+                    "429 Too Many Requests"
                 } else {
                     "502 Bad Gateway"
                 };
