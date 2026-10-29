@@ -2658,7 +2658,6 @@ export const EN_PLAIN: Record<string, string> = {
   "Key 不限额度": "Key has no quota limit",
   "这个 Key 还没有消费记录，拿不到分组倍率": "This key has no usage records yet, so the group rate is unknown",
   "分组倍率取自最近一次消费记录": "Group rate taken from the latest usage record",
-  "刷新 sub2api 倍率和余额": "Refresh sub2api rate and balance",
   // 子 Agent 任务排队（#2772）
   "任务已提交并进入排队，前面的任务结束后自动启动。": "Task submitted and queued. It starts automatically when the tasks ahead of it finish.",
 };
