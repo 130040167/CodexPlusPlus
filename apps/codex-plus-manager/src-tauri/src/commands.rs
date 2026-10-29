@@ -83,6 +83,14 @@ pub async fn claude_localization_status() -> CommandResult<Value> {
 }
 
 #[tauri::command]
+pub async fn claude_localization_bash_timeout_status() -> CommandResult<Value> {
+    match tauri::async_runtime::spawn_blocking(codex_plus_core::claude_localization::bash_timeout_status).await {
+        Ok(status) => ok("Claude Bash 加载状态已读取。", serde_json::to_value(status).unwrap_or_else(|_| json!({}))),
+        Err(error) => failed(&format!("Claude Bash 状态读取失败：{error}"), json!({})),
+    }
+}
+
+#[tauri::command]
 pub async fn claude_localization_action(
     app: tauri::AppHandle,
     action: String,
@@ -173,6 +181,22 @@ pub async fn claude_localization_set_computer_use(enabled: bool) -> CommandResul
             } else {
                 "Computer Use 已关闭；重新准备副本后移除。"
             },
+            serde_json::to_value(status).unwrap_or_else(|_| json!({})),
+        ),
+        Ok(Err(error)) => failed(&error.to_string(), json!({})),
+        Err(error) => failed(&format!("Claude 设置失败：{error}"), json!({})),
+    }
+}
+
+#[tauri::command]
+pub async fn claude_localization_set_bash_timeout(
+    timeout: codex_plus_core::settings::ClaudeBashTimeoutSettings,
+) -> CommandResult<Value> {
+    match tauri::async_runtime::spawn_blocking(move || {
+        codex_plus_core::claude_localization::set_bash_timeout(timeout)
+    }).await {
+        Ok(Ok(status)) => ok(
+            "Bash 时间限制设置已保存；重启增强版后生效。",
             serde_json::to_value(status).unwrap_or_else(|_| json!({})),
         ),
         Ok(Err(error)) => failed(&error.to_string(), json!({})),
