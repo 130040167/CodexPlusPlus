@@ -333,7 +333,33 @@ pub fn codex_gateway_profile(
         profile.config_contents = with_openai_session_identity(&profile.config_contents)?;
     }
     crate::relay_config::normalize_relay_profile_for_storage(&mut profile)?;
+    if !signed_in {
+        // 归一化会把导入时的旧版供应商表换成 `custom`，声明要在它之后写上。
+        profile.config_contents = with_local_api_identity(&profile.config_contents)?;
+    }
     Ok(profile)
+}
+
+/// 没登录 ChatGPT 时的托管供应商：显式写 `requires_openai_auth = false`，与直连模式手加的
+/// 纯 API 供应商一致。Codex 这时没有账号身份，原生 Fast 只认这个明确声明的本机 API 配置
+/// （见 [`crate::native_fast`]），缺这一行时 Fast 按钮整个不显示（#2746）。
+fn with_local_api_identity(contents: &str) -> anyhow::Result<String> {
+    let mut doc = contents
+        .parse::<toml_edit::DocumentMut>()
+        .context("托管供应商配置不是合法 TOML")?;
+    let provider = doc
+        .get("model_provider")
+        .and_then(toml_edit::Item::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let table = doc
+        .get_mut("model_providers")
+        .and_then(toml_edit::Item::as_table_mut)
+        .and_then(|providers| providers.get_mut(&provider))
+        .and_then(toml_edit::Item::as_table_mut)
+        .context("托管供应商配置里没有传输供应商")?;
+    table["requires_openai_auth"] = toml_edit::value(false);
+    Ok(doc.to_string())
 }
 
 /// 「模型名后带供应商」关掉时用的看不见的标记：各家那份追加 N 个零宽空格（N 是这家在池里的位置），
@@ -2851,6 +2877,50 @@ mod tests {
         );
         assert_eq!(fields["additional_speed_tiers"][0], "fast");
         assert!(!fields.contains_key("base_instructions"));
+    }
+
+    /// #2746：没登录时的托管供应商要被原生 Fast 认成本机 API 配置；登录后是 openai 身份，
+    /// 交给原生的账号门控。
+    #[test]
+    fn unsigned_gateway_profile_counts_as_local_api_for_native_fast() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(temp.path().join("gateway.json"));
+        create_provider(
+            &store,
+            &ProviderInput {
+                name: "Relay".into(),
+                base_url: "https://relay.test/v1".into(),
+                protocol: RelayProtocol::Responses,
+                keys: vec!["sk-relay".into()],
+                model: "gpt-6-astra".into(),
+                model_list: "gpt-6-astra".into(),
+                price: None,
+                model_prices: None,
+                proxy: None,
+                strip_image_generation_tool: None,
+            },
+            "",
+            None,
+        )
+        .unwrap();
+        let gateway = store.load().unwrap();
+        let binding = AgentBinding {
+            model: "gpt-6-astra".into(),
+            token: crate::gateway::store::new_client_token(&ToolId::Codex),
+            ..AgentBinding::default()
+        };
+        for (signed_in, expected) in [(false, true), (true, false)] {
+            let profile = codex_gateway_profile(&gateway, &binding, 57390, signed_in).unwrap();
+            let home = temp.path().join(format!("codex-{signed_in}"));
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(home.join("config.toml"), &profile.config_contents).unwrap();
+            assert_eq!(
+                crate::native_fast::local_api_configured_from_home(&home),
+                expected,
+                "signed_in={signed_in}：{}",
+                profile.config_contents
+            );
+        }
     }
 
     fn direct_relay(id: &str, base_url: &str, model: &str) -> RelayProfile {

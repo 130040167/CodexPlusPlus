@@ -274,6 +274,15 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 const UPSTREAM_IMAGE_HEADER_TIMEOUT: Duration = Duration::from_secs(600);
+/// 压缩请求、以及发给 Codex++ 网关的请求等响应头的上限（#2759）。
+///
+/// - 原生压缩要整段读完、确认拿到 checkpoint 才回响应头，大上下文压缩常超过两分钟；
+/// - Codex 登录 ChatGPT 时请求先到本地代理、再转给网关：网关这一跳自己也会等上游响应头、
+///   并按住推理阶段等首段可见输出（各最多 120 秒），压缩时整段读完才回响应头。
+///
+/// 按流式的 120 秒等，会把本来正常的长推理和压缩判成超时（502），Codex 每两分钟重连一次。
+/// 网关那一跳有自己的超时与换家，这里只兜底真正卡死的连接。
+const UPSTREAM_SLOW_HEADER_TIMEOUT: Duration = Duration::from_secs(600);
 /// 连接/TLS 握手阶段的失败发生在请求送达上游之前，可以安全重试。
 /// 系统代理抖动时（如 `client error (Connect): tls handshake eof`）直接返回 502
 /// 会让采样/压缩无故失败，两次短退避能把大部分瞬时故障挡在本地。
@@ -3636,7 +3645,10 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let header_timeout = response_header_timeout(is_stream);
+        // Codex 托管的网关供应商：这一跳的上游就是本机网关，它自己按候选控制超时。
+        let via_gateway = relay.id == crate::gateway::apply::CODEX_GATEWAY_RELAY_ID;
+        let header_timeout =
+            responses_request_header_timeout(is_stream, is_compaction_request, via_gateway);
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "protocol_proxy.upstream_request",
             json!({
@@ -3689,6 +3701,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             send_responses_upstream_request(
                 &relay, &endpoint, &upstream_body, wire_api, is_stream,
                 original_user_agent, beta_features, session_headers, official_credential.as_ref(),
+                header_timeout,
             ).await
         };
         let mut upstream = match send.await {
@@ -3769,6 +3782,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         beta_features,
                         session_headers,
                         official_credential.as_ref(),
+                        header_timeout,
                     )
                         .await
                     };
@@ -3838,6 +3852,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                     upstream = send_responses_upstream_request(
                         &relay, &endpoint, &adapted, wire_api, is_stream,
                         original_user_agent, beta_features, session_headers, official_credential.as_ref(),
+                        header_timeout,
                     ).await?;
                 }
                 Ok::<_, anyhow::Error>(upstream)
@@ -4085,6 +4100,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 beta_features,
                 session_headers,
                 official_credential.as_ref(),
+                header_timeout,
             )
             .await
             {
@@ -4982,6 +4998,16 @@ fn response_header_timeout(is_stream: bool) -> Duration {
     }
 }
 
+/// Responses 代理一次上游请求等响应头的上限：压缩请求、发给 Codex++ 网关的请求放宽到
+/// [`UPSTREAM_SLOW_HEADER_TIMEOUT`]，其余按是否流式。
+fn responses_request_header_timeout(is_stream: bool, compaction: bool, via_gateway: bool) -> Duration {
+    if compaction || via_gateway {
+        UPSTREAM_SLOW_HEADER_TIMEOUT
+    } else {
+        response_header_timeout(is_stream)
+    }
+}
+
 pub async fn open_chat_completions_proxy_request(
     body: &str,
     original_user_agent: Option<&str>,
@@ -5425,12 +5451,13 @@ async fn send_responses_upstream_request(
     beta_features: Option<&str>,
     session_headers: ProxySessionHeaders<'_>,
     official_credential: Option<&crate::official_login::OfficialCredential>,
+    header_timeout: Duration,
 ) -> anyhow::Result<reqwest::Response> {
     let builder = build_responses_upstream_request(
         relay, endpoint, upstream_body, wire_api, is_stream,
         original_user_agent, beta_features, session_headers, official_credential,
     )?;
-    send_upstream_request_for_responses(builder, is_stream).await
+    send_upstream_request_with_header_timeout(builder, header_timeout).await
 }
 
 fn build_responses_upstream_request(
@@ -11727,6 +11754,8 @@ pub(crate) struct ResponsesSseTransformer {
     strip_backend_events: bool,
     /// 给缺 `phase` 的助手消息补阶段标记（issue #2659），见 [`MessagePhaseFill`]。
     phase_fill: Option<MessagePhaseFill>,
+    /// 只补阶段标记、其余事件原样放行：接在别的 SSE 转换器后面用（见 [`Self::phase_fill_only`]）。
+    phase_only: bool,
 }
 
 /// 给第三方 Responses 上游缺失的助手消息 `phase` 补标记（issue #2659）。
@@ -11910,6 +11939,16 @@ impl ResponsesSseTransformer {
         self
     }
 
+    /// 只给缺 `phase` 的助手消息补阶段标记，不做其它改写、不判定成败：
+    /// 接在 exec 兼容等自带完整 SSE 转换的链路后面（#2761），那些链路自己负责终态与失败。
+    pub(crate) fn phase_fill_only() -> Self {
+        Self {
+            phase_fill: Some(MessagePhaseFill::default()),
+            phase_only: true,
+            ..Self::default()
+        }
+    }
+
     /// 转发给非 Codex 客户端时去掉后端私有事件，见 `strip_backend_events`。
     /// 阶段标记只给 Codex 桌面端折叠用，非 Codex 客户端不补。
     pub(crate) fn stripping_backend_events(mut self, strip: bool) -> Self {
@@ -11947,7 +11986,9 @@ impl ResponsesSseTransformer {
                 if boundary {
                     self.event_tail = [0; 4];
                     let event_type = self.passthrough_event.take().unwrap_or_default();
-                    self.observe_event_type(&event_type);
+                    if !self.phase_only {
+                        self.observe_event_type(&event_type);
+                    }
                     if self.failed {
                         return out;
                     }
@@ -12071,6 +12112,10 @@ impl ResponsesSseTransformer {
                 return bytes;
             }
             released = bytes;
+        }
+        if self.phase_only {
+            released.extend_from_slice(event_bytes);
+            return released;
         }
         let processed = self.process_parsed_event(event_bytes, event_str, event_type, &data_json);
         if released.is_empty() {
@@ -12329,6 +12374,39 @@ mod responses_sse_transformer_tests {
             })
             .map(|data| data["item"]["phase"].as_str().map(str::to_string))
             .collect()
+    }
+
+    /// #2761：exec 兼容链路的输出不经过完整转换器，接在后面的「只补阶段」模式照样补
+    /// final_answer / commentary；失败事件原样放行，成败仍由 exec 转换器自己判定。
+    #[test]
+    fn phase_fill_only_marks_messages_and_passes_everything_else_through() {
+        let completed = sse(json!({ "type": "response.completed", "response": {} }));
+        let mut t = ResponsesSseTransformer::phase_fill_only();
+        let mut out = t.push_bytes(message_done(None).as_bytes());
+        out.extend(t.push_bytes(completed.as_bytes()));
+        assert_eq!(message_phases(&out), vec![Some("final_answer".to_string())]);
+
+        let call = sse(json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": { "type": "custom_tool_call", "name": "apply_patch", "call_id": "c1", "input": "{\"input\":\"x\"}" }
+        }));
+        let mut t = ResponsesSseTransformer::phase_fill_only();
+        let mut out = t.push_bytes(message_done(None).as_bytes());
+        out.extend(t.push_bytes(call.as_bytes()));
+        out.extend(t.push_bytes(completed.as_bytes()));
+        assert_eq!(message_phases(&out), vec![Some("commentary".to_string())]);
+        assert!(
+            String::from_utf8_lossy(&out).contains(&call),
+            "工具调用原样放行，不做 apply_patch 解包"
+        );
+
+        let failed = sse(json!({ "type": "response.failed", "response": { "error": { "code": "x" } } }));
+        let mut t = ResponsesSseTransformer::phase_fill_only();
+        let mut out = t.push_bytes(failed.as_bytes());
+        out.extend(t.push_bytes(completed.as_bytes()));
+        assert_eq!(String::from_utf8(out).unwrap(), format!("{failed}{completed}"));
+        assert!(!t.has_failed());
     }
 
     #[test]

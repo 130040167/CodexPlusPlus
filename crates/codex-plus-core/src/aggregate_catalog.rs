@@ -397,9 +397,21 @@ fn aggregate_member_availability(
 pub(crate) fn profile_catalog_entries(
     profile: &RelayProfile,
 ) -> anyhow::Result<Vec<ModelCatalogEntry>> {
+    profile_catalog_entries_with_home(profile, &crate::codex_home::default_codex_home_dir())
+}
+
+fn profile_catalog_entries_with_home(
+    profile: &RelayProfile,
+    codex_home: &Path,
+) -> anyhow::Result<Vec<ModelCatalogEntry>> {
     let mut windows = parse_string_map(&profile.model_windows, "model_windows")?;
     validate_windows(&windows, "model_windows")?;
-    let (list, suffix_windows) = migrate_model_list_with_suffixes(&profile.model_list);
+    let model_list = if uses_official_model_directory(profile) {
+        official_directory_models(codex_home).join("\n")
+    } else {
+        profile.model_list.clone()
+    };
+    let (list, suffix_windows) = migrate_model_list_with_suffixes(&model_list);
     for (slug, window) in suffix_windows {
         windows.entry(slug).or_insert(window);
     }
@@ -411,6 +423,50 @@ pub(crate) fn profile_catalog_entries(
         &compact,
         &crate::relay_config::relay_profile_model(profile),
     ))
+}
+
+/// 官方登录成员一个模型都没填（模型列表和默认模型都空）：按 Codex 自己的官方模型目录发布（#2763）。
+/// 「系统默认」是从本机 config.toml 导入的，导入时 Codex 没在里面写 `model` 的话
+/// 它的模型列表就是空的，聚合里这一家一个模型都发布不出来，选择器里只看得到别的成员。
+fn uses_official_model_directory(profile: &RelayProfile) -> bool {
+    crate::official_login::is_official_login_profile(profile)
+        && profile.model_list.trim().is_empty()
+        && crate::relay_config::relay_profile_model(profile).trim().is_empty()
+}
+
+/// 本机 Codex 为登录的 ChatGPT 账号缓存的官方模型目录（`models_cache.json`）里列出的模型；
+/// 标成隐藏的（如自动审批模型）不算。读不到缓存时为空，保持「请填写模型列表」的原状。
+fn official_directory_models(codex_home: &Path) -> Vec<String> {
+    let Some(cache) = std::fs::read_to_string(codex_home.join("models_cache.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    else {
+        return Vec::new();
+    };
+    let mut models: Vec<String> = Vec::new();
+    for entry in cache
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(slug) = entry
+            .get("slug")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|slug| !slug.is_empty())
+        else {
+            continue;
+        };
+        let listed = entry
+            .get("visibility")
+            .and_then(Value::as_str)
+            .is_none_or(|visibility| visibility.is_empty() || visibility == "list");
+        if listed && !models.iter().any(|known| known == slug) {
+            models.push(slug.to_string());
+        }
+    }
+    models
 }
 
 /// 每个成员只构建一次目录，然后修改身份字段；先按真实模型应用元数据，
@@ -1326,6 +1382,52 @@ mod tests {
         assert!(resolve_active_model(&settings, "cpx-official/gpt-5.6-sol")
             .unwrap()
             .is_some());
+    }
+
+    /// #2763：官方登录成员一个模型都没填时，按本机 Codex 缓存的官方模型目录发布（隐藏的不算）；
+    /// 填过模型列表的照旧只发布自己填的；读不到缓存时保持空。
+    #[test]
+    fn official_member_without_models_publishes_codex_official_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let official = RelayProfile {
+            id: "official".to_string(),
+            name: "系统默认".to_string(),
+            relay_mode: RelayMode::Official,
+            auth_contents: r#"{"auth_mode":"chatgpt","tokens":{"access_token":"a","refresh_token":"r","account_id":"acct-1"}}"#.to_string(),
+            ..RelayProfile::default()
+        };
+        let slugs = |profile: &RelayProfile| -> Vec<String> {
+            profile_catalog_entries_with_home(profile, home.path())
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.slug)
+                .collect()
+        };
+        assert!(slugs(&official).is_empty(), "没有缓存时保持原状");
+
+        std::fs::write(
+            home.path().join("models_cache.json"),
+            json!({"models": [
+                {"slug": "gpt-6.1-sol", "visibility": "list"},
+                {"slug": "codex-auto-review", "visibility": "hide"},
+                {"slug": "gpt-6-astra"},
+                {"slug": "gpt-6.1-sol", "visibility": "list"},
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(slugs(&official), vec!["gpt-6.1-sol", "gpt-6-astra"]);
+
+        let listed = RelayProfile {
+            model_list: "gpt-5.6-sol".to_string(),
+            ..official.clone()
+        };
+        assert_eq!(slugs(&listed), vec!["gpt-5.6-sol"], "填过的只发布自己填的");
+        let api = RelayProfile {
+            relay_mode: RelayMode::PureApi,
+            ..official
+        };
+        assert!(slugs(&api).is_empty(), "只有官方登录成员用官方目录");
     }
 
     #[test]

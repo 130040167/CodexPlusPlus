@@ -1769,7 +1769,7 @@ export const EN_PLAIN: Record<string, string> = {
   "可勾选 API 供应商或已完成 ChatGPT 登录的官方账号；聚合供应商不会作为成员。":
     "API providers or official accounts with a completed ChatGPT login can be selected; aggregate providers can't be members.",
   "使用已登录的 ChatGPT 账号凭据": "Uses the signed-in ChatGPT account credentials",
-  "请填写该官方账号的模型列表": "Fill in this official account's model list",
+  "未填写：用 Codex 的官方模型目录": "Not set: uses Codex's official model directory",
   "可更新": "Update available",
   "同一对话保持一个成员，不同对话依次分配。": "Keeps one member per conversation; different conversations are assigned in turn.",
   "同步目标": "Sync target",
@@ -2786,6 +2786,7 @@ export const EN_TEMPLATE: Record<string, string> = {
   "已选择 {0}": "Selected: {0}",
   "目录明细（{0}）": "Directory details ({0})",
   "Codex 将看到 {0} 个裸名模型（来自 {1}）+ {2} 个 cpx- 前缀模型": "Codex will see {0} bare models (from {1}) + {2} cpx- prefixed models",
+  "Codex 将看到 {0} 的官方模型目录（裸名）+ {1} 个 cpx- 前缀模型": "Codex will see the official model directory of {0} (bare names) + {1} cpx- prefixed models",
   "Codex 将看到 {0} 个 cpx- 前缀模型；还没指定默认成员，不带前缀的请求会报错": "Codex will see {0} cpx- prefixed models; no default member yet, so unprefixed requests will fail",
   "发现新版本 {0}，点击查看更新": "Version {0} is available — click to update",
   "已开启 {0} 项": "{0} enabled",

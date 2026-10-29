@@ -399,3 +399,66 @@ fn same_named_client_search_survives_json_and_sse_round_trip() {
     );
     assert!(!restored.contains("web_search_call"));
 }
+
+/// #2759：原生压缩要整段读完才回响应头；经本地代理再转给网关时，网关那一跳还会按住推理
+/// 阶段等首段可见输出。压缩请求、发给 Codex++ 网关的请求等响应头放宽到 600 秒，
+/// 发给普通供应商的流式请求仍按 120 秒。
+#[tokio::test]
+async fn compaction_requests_wait_longer_for_upstream_headers() {
+    // 诊断日志路径是进程级状态，与其它测试模块串行。
+    let _state = crate::common::global_state_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let log_path = temp.path().join("codex-plus.log");
+    codex_plus_core::diagnostic_log::set_diagnostic_log_path_for_tests(Some(log_path.clone()));
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/event-stream")
+                .set_body_string(concat!(
+                    "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"checkpoint\"}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+                )),
+        )
+        .mount(&upstream)
+        .await;
+    // 网关托管的供应商（Codex 登录 ChatGPT 时本地代理把请求转给它）。
+    let mut via_gateway = settings(RelayProtocol::Responses, &upstream.uri());
+    via_gateway.relay_profiles[0].id =
+        codex_plus_core::gateway::apply::CODEX_GATEWAY_RELAY_ID.into();
+    via_gateway.active_relay_id = codex_plus_core::gateway::apply::CODEX_GATEWAY_RELAY_ID.into();
+    for (input, settings) in [
+        (
+            json!([{"type":"compaction_trigger"}]),
+            settings(RelayProtocol::Responses, &upstream.uri()),
+        ),
+        (
+            json!("hello"),
+            settings(RelayProtocol::Responses, &upstream.uri()),
+        ),
+        (json!("hello"), via_gateway),
+    ] {
+        let mut result = open_responses_proxy_request_with_settings(
+            &json!({"model":"fixture","stream":true,"input":input}).to_string(),
+            settings,
+        )
+        .await
+        .unwrap();
+        let _ = result.read_body().await;
+    }
+    codex_plus_core::diagnostic_log::set_diagnostic_log_path_for_tests(None);
+
+    let contents = std::fs::read_to_string(&log_path).unwrap();
+    let timeouts: Vec<u64> = contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| {
+            record["event"] == "protocol_proxy.upstream_request"
+                && record["detail"]["endpoint"]
+                    .as_str()
+                    .is_some_and(|endpoint| endpoint.starts_with(&upstream.uri()))
+        })
+        .filter_map(|record| record["detail"]["headerTimeoutSeconds"].as_u64())
+        .collect();
+    assert_eq!(timeouts, vec![600, 120, 600], "{contents}");
+}

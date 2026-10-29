@@ -13467,6 +13467,10 @@ function AggregateRelayProfileEditor({
   const selectedCandidates = candidates.filter((candidate) => memberIds.has(candidate.id));
   const defaultCandidate = selectedCandidates.find((candidate) => candidate.id === aggregate.defaultRelayId);
   const bareModelCount = defaultCandidate ? memberModelCount(defaultCandidate) : 0;
+  // 官方登录成员一个模型都没填时，后端按 Codex 缓存的官方模型目录发布（#2763），这里给不出确切数量。
+  const defaultUsesOfficialDirectory = !!defaultCandidate
+    && isOfficialLoginMemberProfile(defaultCandidate)
+    && bareModelCount === 0;
   const prefixedModelCount = selectedCandidates
     .filter((candidate) => candidate.id !== defaultCandidate?.id)
     .reduce((sum, candidate) => sum + memberModelCount(candidate), 0);
@@ -13534,7 +13538,9 @@ function AggregateRelayProfileEditor({
             </span>
             {modelMode && selectedCandidates.length ? (
               <span className="aggregate-model-summary">
-                {defaultCandidate
+                {defaultCandidate && defaultUsesOfficialDirectory
+                  ? tf("Codex 将看到 {0} 的官方模型目录（裸名）+ {1} 个 cpx- 前缀模型", [defaultCandidate.name || t("未命名供应商"), prefixedModelCount])
+                  : defaultCandidate
                   ? tf("Codex 将看到 {0} 个裸名模型（来自 {1}）+ {2} 个 cpx- 前缀模型", [bareModelCount, defaultCandidate.name || t("未命名供应商"), prefixedModelCount])
                   : tf("Codex 将看到 {0} 个 cpx- 前缀模型；还没指定默认成员，不带前缀的请求会报错", [prefixedModelCount])}
               </span>
@@ -13585,7 +13591,7 @@ function AggregateRelayProfileEditor({
                         {memberModelNames.length
                           ? tf("{0} 个模型", [memberModelNames.length])
                           : (isOfficialLoginMemberProfile(candidate)
-                            ? t("请填写该官方账号的模型列表")
+                            ? t("未填写：用 Codex 的官方模型目录")
                             : t("未填写模型"))}
                       </span>
                       {checked ? (isDefaultMember ? (
