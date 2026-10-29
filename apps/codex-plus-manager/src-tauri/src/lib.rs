@@ -13,6 +13,7 @@ mod lightweight;
 mod provider_lookup_commands;
 mod runtime_health;
 mod tray_panel;
+mod shutdown_watchdog;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -29,7 +30,7 @@ const MAIN_WINDOW_URL: &str = "/index.html";
 static APP_EXITING: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_COMPLETE: AtomicBool = AtomicBool::new(false);
-/// 退出清理的等待上限（秒）：超过就直接退出，避免卡在托盘里退不掉（#2611）。
+/// 整个退出流程的等待上限，包含清理完成后的最终框架退出。
 const SHUTDOWN_WATCHDOG: u64 = 10;
 const TRAY_MENU_SHOW: &str = "tray_show_main";
 const TRAY_MENU_QUIT: &str = "tray_quit_app";
@@ -37,6 +38,25 @@ const MANAGER_NAVIGATION_EVENT: &str = "manager-navigation-requested";
 
 pub(crate) fn app_is_exiting() -> bool {
     APP_EXITING.load(Ordering::SeqCst)
+}
+
+fn shutdown_entry_snapshot(code: Option<i32>) -> serde_json::Value {
+    serde_json::json!({
+        "code": code,
+        "appExiting": APP_EXITING.load(Ordering::SeqCst),
+        "shutdownStarted": SHUTDOWN_STARTED.load(Ordering::SeqCst),
+        "cleanupComplete": SHUTDOWN_COMPLETE.load(Ordering::SeqCst),
+        "observedAtMs": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    })
+}
+
+fn record_shutdown_entry(event: &'static str, detail: serde_json::Value) {
+    shutdown_watchdog::record_best_effort(move || {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(event, detail);
+    });
 }
 
 pub fn run_agent_collaboration_mcp(args: &[std::ffi::OsString]) -> anyhow::Result<()> {
@@ -523,51 +543,56 @@ pub fn run() {
         Ok(app) => app.run(|app_handle, event| {
             if let tauri::RunEvent::ExitRequested { api, code, .. } = &event {
                 if code.is_none() && !APP_EXITING.load(Ordering::SeqCst) {
-                    // 不带退出码的退出请求来自「最后一个窗口被销毁」：轻量模式销毁主窗口后
-                    // 后端、网关和托盘要继续运行，这不是用户要退出（#2677）。
-                    // 真正的退出（托盘退出、app.exit）都会带退出码并先置 APP_EXITING。
+                    // 轻量模式销毁主窗口时，Tauri 可能发出不带退出码的请求；后端、网关和托盘
+                    // 必须继续运行。真正退出由托盘、app.exit 或已设置 APP_EXITING 的路径触发。
                     api.prevent_exit();
-                } else if !SHUTDOWN_COMPLETE.load(Ordering::SeqCst) {
+                    return;
+                }
+                let detail = shutdown_entry_snapshot(*code);
+                let start_shutdown = if !SHUTDOWN_COMPLETE.load(Ordering::SeqCst) {
                     api.prevent_exit();
-                    if !SHUTDOWN_STARTED.swap(true, Ordering::SeqCst) {
-                        APP_EXITING.store(true, Ordering::SeqCst);
-                        auto_takeover::stop_supervisor();
-                        // 退出清理里任何一步卡住（例如等待启动器或常驻代理），
-                        // 进程就会停在「已阻止退出、尚未完成」的状态：托盘菜单点了没反应，
-                        // 再点也不会重来（SHUTDOWN_STARTED 已经是 true），任务管理器里也
-                        // 只能强杀（#2611）。这里给清理设一个上限，到点直接退出，
-                        // 先写日志留下是超时退出的证据。
-                        std::thread::spawn(|| {
-                            std::thread::sleep(std::time::Duration::from_secs(SHUTDOWN_WATCHDOG));
-                            if SHUTDOWN_COMPLETE.load(Ordering::SeqCst) {
-                                return;
-                            }
+                    !SHUTDOWN_STARTED.swap(true, Ordering::SeqCst)
+                } else {
+                    false
+                };
+                if start_shutdown {
+                    APP_EXITING.store(true, Ordering::SeqCst);
+                    shutdown_watchdog::arm(
+                        std::time::Duration::from_secs(SHUTDOWN_WATCHDOG),
+                        || {
                             let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
                                 "app.shutdown_watchdog_forced",
-                                serde_json::json!({ "waitedSeconds": SHUTDOWN_WATCHDOG }),
+                                serde_json::json!({
+                                    "waitedSeconds": SHUTDOWN_WATCHDOG,
+                                    "cleanupComplete": SHUTDOWN_COMPLETE.load(Ordering::SeqCst),
+                                }),
                             );
-                            std::process::exit(0);
-                        });
-                        let app = app_handle.clone();
-                        tauri::async_runtime::spawn_blocking(move || {
-                            // 退出前先等待自有 CLI 任务清理，避免进程退出后遗留执行器。
-                            tauri::async_runtime::block_on(
-                                codex_plus_core::agent_collaboration::executor::shutdown_owned_tasks(),
+                        },
+                    );
+                }
+                // 入口状态已采样；首次退出必须先启用兜底，再交给后台写盘。
+                record_shutdown_entry("app.exit_requested", detail);
+                if start_shutdown {
+                    auto_takeover::stop_supervisor();
+                    let app = app_handle.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        // 退出前先等待自有 CLI 任务清理，避免进程退出后遗留执行器。
+                        tauri::async_runtime::block_on(
+                            codex_plus_core::agent_collaboration::executor::shutdown_owned_tasks(),
+                        );
+                        if let Err(error) = codex_plus_launcher::shutdown() {
+                            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                                "app.shutdown_failed",
+                                serde_json::json!({ "message": error.to_string() }),
                             );
-                            if let Err(error) = codex_plus_launcher::shutdown() {
-                                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
-                                    "app.shutdown_failed",
-                                    serde_json::json!({ "message": error.to_string() }),
-                                );
-                            }
-                            // 常驻本地代理只在 Codex++ 退出时停止；Codex 会话结束
-                            // 不会关它（见 core::resident_helper）。
-                            gateway_commands::restore_for_exit();
-                            codex_plus_core::resident_helper::stop_resident_helper();
-                            SHUTDOWN_COMPLETE.store(true, Ordering::SeqCst);
-                            app.exit(0);
-                        });
-                    }
+                        }
+                        // 常驻本地代理只在 Codex++ 退出时停止；Codex 会话结束
+                        // 不会关它（见 core::resident_helper）。
+                        gateway_commands::restore_for_exit();
+                        codex_plus_core::resident_helper::stop_resident_helper();
+                        SHUTDOWN_COMPLETE.store(true, Ordering::SeqCst);
+                        app.exit(0);
+                    });
                 }
             }
             #[cfg(target_os = "macos")]
@@ -664,6 +689,7 @@ fn install_tray<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
                 show_main_window(app);
             }
             TRAY_MENU_QUIT => {
+                record_shutdown_entry("app.tray_quit", shutdown_entry_snapshot(None));
                 APP_EXITING.store(true, Ordering::SeqCst);
                 app.exit(0);
             }
@@ -912,6 +938,7 @@ fn register_main_window_events<R: tauri::Runtime>(window: tauri::WebviewWindow<R
 
 #[tauri::command]
 fn manager_exit_app<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
+    record_shutdown_entry("app.manager_exit_app", shutdown_entry_snapshot(None));
     APP_EXITING.store(true, Ordering::SeqCst);
     app.exit(0);
 }
