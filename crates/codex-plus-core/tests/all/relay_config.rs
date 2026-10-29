@@ -1645,6 +1645,13 @@ fn apply_aggregate_relay_points_codex_to_local_responses_proxy_without_snapshot(
     assert!(updated.contains("requires_openai_auth = false"));
     assert!(updated.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
     assert!(updated.contains(r#"experimental_bearer_token = "codex-plus-aggregate""#));
+    let doc = updated.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(doc["model_provider"].as_str(), Some("custom"));
+    assert_eq!(
+        doc["model_providers"]["codex_plus_managed"].to_string(),
+        doc["model_providers"]["custom"].to_string(),
+        "聚合会话的内部 provider 必须能由原生恢复入口直接解析"
+    );
 }
 
 #[test]

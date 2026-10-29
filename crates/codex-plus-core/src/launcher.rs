@@ -1224,6 +1224,12 @@ impl LaunchHooks for DefaultLaunchHooks {
     fn cleanup_unsupported_config(&self) -> anyhow::Result<()> {
         let home = crate::relay_config::default_codex_home_dir();
         crate::relay_config::cleanup_unsupported_approval_policies_in_home(&home)?;
+        if let Err(error) = crate::relay_config::ensure_managed_session_provider_in_home(&home) {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "launcher.managed_session_provider_repair_failed",
+                serde_json::json!({ "message": error.to_string() }),
+            );
+        }
         Ok(())
     }
 
