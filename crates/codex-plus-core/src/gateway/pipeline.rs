@@ -562,6 +562,30 @@ async fn attempt_pipeline(
     })
 }
 
+/// 只发一次、只发给这个候选（供应商池的「测试」用，见 [`crate::gateway::probe`]）。
+///
+/// 和候选循环里的一次尝试走同一条路（ChatGPT 后端的请求整理、协议转换、代理、认证都一样），
+/// 但调用方要自己先做 `prepare_relay` / OpenCode 的 prepare；这里不占限速名额、不记 Key 冷却 /
+/// 熔断 / 测速、不改会话固定、不写路由动态，也不记额度。
+///
+/// 成功时原样交回上游响应；上游报错时响应体已读进 `buffered_body`，并给出网关会怎么分类。
+/// `Err` 是请求没能发出或没收到响应（连接失败、超时、请求本身不被支持）。
+pub(crate) async fn attempt_once(
+    settings: &BackendSettings,
+    candidate: &GatewayCandidate,
+    request: &GatewayRequest<'_>,
+) -> anyhow::Result<(UpstreamProxyResponse, Option<FailureClass>)> {
+    let upstream = match attempt_pipeline(settings, candidate, request).await {
+        Ok(Attempt::Success(upstream)) => (upstream, None),
+        Ok(Attempt::Failed { upstream, class }) => (upstream, Some(class)),
+        Err(AttemptError::Fatal(error) | AttemptError::Transport(error)) => return Err(error),
+    };
+    match upstream {
+        (GatewayUpstream::Pipeline(response), class) => Ok((response, class)),
+        _ => anyhow::bail!("测试请求只走协议代理链路"),
+    }
+}
+
 /// ChatGPT 后端的响应头带着这个账号的额度，顺手记下（模型组「额度优先」、供应商池显示用）。
 fn observe_quota(relay_id: &str, upstream: &GatewayUpstream) {
     let headers = match upstream {

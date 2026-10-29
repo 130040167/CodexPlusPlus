@@ -50,6 +50,7 @@ mod gateway_codex_identity;
 mod gateway_forced_relay;
 mod gateway_key_limits;
 mod gateway_provider_keys;
+mod gateway_provider_probe;
 mod gateway_restore;
 mod helper_body_limit_settings;
 mod history_turn_recovery;

@@ -12,7 +12,7 @@
 //! - [`images`]：生图请求（`/images/generations`、`/images/edits`）发给哪家；
 //! - [`model_sync`]：重新拉上游模型、补公开价格、定期检查新模型；
 //! - [`usage`]：按天汇总的用量统计；[`balance`]：供应商余额；[`sessions`]：各 Agent 的本地会话；
-//! - [`pipeline`]：候选循环；
+//! - [`pipeline`]：候选循环；[`probe`]：供应商池的「测试」（单发一条短请求，不计入路由与统计）；
 //! - [`anthropic_inbound`] / [`anthropic_outbound`]：Claude Code 的协议转换；
 //! - [`server`]：HTTP 入口；
 //! - [`apply`]：开启 / 关闭时改写 Agent 配置；[`restore`]：接入前配置的存档与断开时的还原。
@@ -30,6 +30,7 @@ pub mod key_pool;
 pub mod model_sync;
 pub mod opencode;
 pub mod pipeline;
+pub mod probe;
 pub mod quota;
 pub mod restore;
 pub mod route;
