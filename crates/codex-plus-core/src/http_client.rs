@@ -134,6 +134,10 @@ struct RelayClientKey {
     proxy_env: [Option<String>; 4],
     /// CODEX_CA_CERTIFICATE 的值；是文件路径时再带上文件大小和修改时间，证书换了能感知。
     ca_certificate: Option<(String, Option<(u64, std::time::SystemTime)>)>,
+    /// 当前所在的 tokio 运行时。连接池里的连接由建立它的运行时驱动，那个运行时结束后
+    /// （常驻 helper 换端口重启、临时运行时用完）再复用就会报 `dispatch task is gone`；
+    /// 按运行时分开缓存，每个运行时只复用自己建的连接。不在运行时里调用时为 None。
+    runtime: Option<tokio::runtime::Id>,
 }
 
 impl RelayClientKey {
@@ -155,6 +159,9 @@ impl RelayClientKey {
             proxy,
             proxy_env,
             ca_certificate,
+            runtime: tokio::runtime::Handle::try_current()
+                .ok()
+                .map(|handle| handle.id()),
         }
     }
 }
