@@ -17,7 +17,6 @@ pub struct CodexInstanceIdentity {
     pub generation: u64,
     pub debug_port: u16,
     pub helper_port: u16,
-    /// 仅 instance_id == "main" 可为空，表示已验证 argv 没有 --user-data-dir。
     pub user_data_dir: PathBuf,
     pub browser_id: String,
     pub process_id: u32,
@@ -34,8 +33,7 @@ fn valid_stop_identity(identity: &CodexInstanceIdentity) -> bool {
         && identity.process_birth_id != 0
         && identity.debug_port != 0
         && identity.helper_port != 0
-        && (identity.user_data_dir.is_absolute()
-            || (identity.instance_id == "main" && identity.user_data_dir.as_os_str().is_empty()))
+        && identity.user_data_dir.is_absolute()
         && identity.executable.is_absolute()
 }
 
@@ -66,26 +64,18 @@ fn record_stop_verification_failure(
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-fn canonical_identity_user_data(instance_id: &str, path: &Path) -> anyhow::Result<PathBuf> {
-    if instance_id == "main" && path.as_os_str().is_empty() {
-        Ok(PathBuf::new())
-    } else {
-        anyhow::ensure!(!path.as_os_str().is_empty(), "多开实例必须指定精确数据目录");
-        Ok(path.canonicalize()?)
-    }
+fn canonical_identity_user_data(path: &Path) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(!path.as_os_str().is_empty(), "多开实例必须指定精确数据目录");
+    Ok(path.canonicalize()?)
 }
 
 #[cfg(any(windows, target_os = "macos", test))]
 fn codex_identity_arguments_match(arguments: &[String], identity: &CodexInstanceIdentity) -> bool {
-    if identity.instance_id == "main" && identity.user_data_dir.as_os_str().is_empty() {
-        codex_scoped_arguments_match(arguments, None, identity.debug_port)
-    } else {
-        codex_arguments_match(arguments, &identity.user_data_dir, identity.debug_port)
-    }
+    codex_arguments_match(arguments, &identity.user_data_dir, identity.debug_port)
 }
 
 /// 同时检查两个 loopback 地址族，不能用页面列表不可读掩盖 Browser 冲突。
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, test))]
 async fn check_stop_browser_identity(identity: &CodexInstanceIdentity) -> anyhow::Result<()> {
     use anyhow::Context;
     let client = reqwest::Client::builder()
@@ -143,7 +133,7 @@ async fn check_stop_browser_identity(identity: &CodexInstanceIdentity) -> anyhow
     Ok(())
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, test))]
 fn verify_stop_browser(
     identity: &CodexInstanceIdentity,
     browser: &crate::cdp::CdpBrowserIdentity,
@@ -160,15 +150,6 @@ fn verify_stop_browser(
 pub(crate) fn codex_arguments_match(
     arguments: &[String],
     user_data_dir: &Path,
-    debug_port: u16,
-) -> bool {
-    codex_scoped_arguments_match(arguments, Some(user_data_dir), debug_port)
-}
-
-#[cfg(any(windows, target_os = "macos", test))]
-fn codex_scoped_arguments_match(
-    arguments: &[String],
-    user_data_dir: Option<&Path>,
     debug_port: u16,
 ) -> bool {
     let mut user_paths = Vec::new();
@@ -194,10 +175,7 @@ fn codex_scoped_arguments_match(
     if ports.len() != 1 || ports[0].parse::<u16>().ok() != Some(debug_port) || debug_port == 0 {
         return false;
     }
-    let Some(user_data_dir) = user_data_dir else {
-        return user_paths.is_empty();
-    };
-    if user_paths.len() != 1 {
+    if user_paths.len() != 1 || user_data_dir.as_os_str().is_empty() {
         return false;
     }
     let Ok(expected) = user_data_dir.canonicalize() else {
@@ -338,7 +316,7 @@ pub async fn capture_codex_instance_identity(
         generation,
         debug_port,
         helper_port,
-        user_data_dir: canonical_identity_user_data(instance_id, user_data_dir)?,
+        user_data_dir: canonical_identity_user_data(user_data_dir)?,
         browser_id,
         process_id,
         process_birth_id,
@@ -445,7 +423,7 @@ pub async fn capture_codex_instance_identity(
         !instance_id.trim().is_empty() && generation != 0 && debug_port != 0 && helper_port != 0,
         "多开实例身份字段不完整"
     );
-    let user_data_dir = canonical_identity_user_data(instance_id, user_data_dir)?;
+    let user_data_dir = canonical_identity_user_data(user_data_dir)?;
     let executable = executable
         .canonicalize()
         .unwrap_or_else(|_| executable.to_path_buf());
@@ -522,7 +500,10 @@ pub async fn terminate_verified_codex_instance(
             return Ok(false);
         }
         // 捕获到退出确认全程持有句柄，CDP 只提供额外的否决证据。
-        let mut tree = CodexInstanceProcessTree::capture(identity)?;
+        let Some(mut tree) = CodexInstanceProcessTree::capture(identity)? else {
+            // 原代根已确认退出；不把正常退出竞争视为身份冲突或接管其他进程。
+            return Ok(true);
+        };
         check_stop_browser_identity(identity).await?;
         tree.stop_and_wait()?;
         Ok(true)
@@ -741,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn default_main_requires_absent_user_data_argument_and_does_not_relax_multi_instance() {
+    fn empty_user_data_is_rejected_for_every_instance() {
         let temp = tempfile::tempdir().unwrap();
         let mut identity = CodexInstanceIdentity {
             instance_id: "main".into(),
@@ -755,8 +736,8 @@ mod tests {
             executable: temp.path().join("ChatGPT.exe"),
         };
         let args = vec!["ChatGPT.exe".into(), "--remote-debugging-port=9341".into()];
-        assert!(valid_stop_identity(&identity));
-        assert!(codex_identity_arguments_match(&args, &identity));
+        assert!(!valid_stop_identity(&identity));
+        assert!(!codex_identity_arguments_match(&args, &identity));
         assert!(!codex_arguments_match(&args, Path::new(""), 9341));
         let mut explicit = args.clone();
         explicit.push(format!("--user-data-dir={}", temp.path().display()));

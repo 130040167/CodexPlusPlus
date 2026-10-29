@@ -2226,6 +2226,7 @@ fn write_multi_launch_result(path: &Path, result: &CodexMultiLaunchResult) -> an
 }
 
 /// 读取实例的启动结果；文件不存在或不是合法 JSON 时返回 `None`。
+#[cfg(test)]
 fn load_multi_launch_result(root: &Path) -> Option<CodexMultiLaunchResult> {
     let contents = std::fs::read_to_string(root.join(MULTI_LAUNCH_RESULT_FILE)).ok()?;
     serde_json::from_str(&contents).ok()

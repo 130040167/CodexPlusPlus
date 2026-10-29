@@ -201,14 +201,12 @@ fn spawn_fixture(dir: &Path, mode: &str, port: u16) -> Child {
         .stdin(Stdio::null());
     capture_logs(&mut command, dir, mode);
     match mode {
-        "root" | "default-main" | "replacement" => {
+        "root" | "replacement" => {
             command.arg(format!("--remote-debugging-port={port}"));
-            if mode != "default-main" {
-                command.arg(format!(
-                    "--user-data-dir={}",
-                    dir.join("user data").display()
-                ));
-            }
+            command.arg(format!(
+                "--user-data-dir={}",
+                dir.join("user data").display()
+            ));
         }
         "renderer" | "user-tool" => {
             command.arg("--type=renderer");
@@ -424,7 +422,7 @@ async fn short_path_launch_matches_long_identity_and_preserves_unowned_processes
         ),
         Some(Role::AppServer)
     );
-    let mut tree = CodexInstanceProcessTree::capture(&identity).unwrap();
+    let mut tree = CodexInstanceProcessTree::capture(&identity).unwrap().unwrap();
     assert_eq!(tree.processes.len(), 4);
     let owned: Vec<_> = ["root", "renderer", "gpu", "appserver"]
         .iter()
@@ -445,8 +443,8 @@ async fn concurrent_stops_confirm_exit_of_the_same_owned_tree() {
     let port = unused_port();
     let fixtures = FixtureGroup::start(port);
     let identity = fixtures.identity(port);
-    let mut first = CodexInstanceProcessTree::capture(&identity).unwrap();
-    let mut second = CodexInstanceProcessTree::capture(&identity).unwrap();
+    let mut first = CodexInstanceProcessTree::capture(&identity).unwrap().unwrap();
+    let mut second = CodexInstanceProcessTree::capture(&identity).unwrap().unwrap();
     let preserved: Vec<_> = ["shell", "independent", "user-tool", "neighbor"]
         .iter()
         .map(|mode| fixtures.process(mode))
@@ -461,12 +459,12 @@ async fn concurrent_stops_confirm_exit_of_the_same_owned_tree() {
 }
 
 #[tokio::test]
-async fn ready_tracking_cleans_owned_orphans_and_preserves_shell_tools_and_neighbors() {
+async fn stop_tracking_cleans_owned_orphans_and_preserves_shell_tools_and_neighbors() {
     let _fixture_lock = FIXTURE_LOCK.lock().await;
     let port = unused_port();
     let fixtures = FixtureGroup::start(port);
     let identity = fixtures.identity(port);
-    let mut tree = CodexInstanceProcessTree::capture(&identity).unwrap();
+    let mut tree = CodexInstanceProcessTree::capture(&identity).unwrap().unwrap();
     assert_eq!(tree.processes.len(), 4);
     let owned: Vec<_> = ["root", "renderer", "gpu", "appserver"]
         .iter()
@@ -542,46 +540,17 @@ async fn wrong_birth_image_arguments_and_browser_conflict_never_stop_the_root() 
 }
 
 #[tokio::test]
-async fn default_main_without_user_data_can_be_captured_and_stopped_by_saved_identity() {
+async fn already_exited_root_is_a_successful_stop_without_adopting_other_processes() {
     let _fixture_lock = FIXTURE_LOCK.lock().await;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::copy(
-        std::env::current_exe().unwrap(),
-        dir.path().join("Desktop fixture.exe"),
-    )
-    .unwrap();
-    struct Guard(Child);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
     let port = unused_port();
-    let child = Guard(spawn_fixture(dir.path(), "default-main", port));
-    wait_for_fixtures(dir.path(), &["default-main"], Duration::from_secs(5));
-    let identity = CodexInstanceIdentity {
-        instance_id: "main".into(),
-        generation: 1,
-        debug_port: port,
-        helper_port: 9342,
-        user_data_dir: PathBuf::new(),
-        browser_id: "fixture-browser".into(),
-        process_id: child.0.id(),
-        process_birth_id: child_process_birth_id(&child.0).unwrap(),
-        executable: dir
-            .path()
-            .join("Desktop fixture.exe")
-            .canonicalize()
-            .unwrap(),
-    };
-    // CDP 已断连，仍可从保存的同代身份捕获停止树。
-    let tree = CodexInstanceProcessTree::capture(&identity).unwrap();
-    assert_eq!(tree.processes.len(), 1);
-    let mut wrong = identity.clone();
-    wrong.user_data_dir = dir.path().canonicalize().unwrap();
-    assert!(terminate_verified_codex_instance(&wrong).await.is_err());
+    let fixtures = FixtureGroup::start(port);
+    let identity = fixtures.identity(port);
+    let root = fixtures.process("root");
+    let neighbor = fixtures.process("neighbor");
+    root.terminate().unwrap();
+    wait_for_exit(&root);
     assert!(terminate_verified_codex_instance(&identity).await.unwrap());
+    assert!(neighbor.is_alive().unwrap());
 }
 
 #[tokio::test]
@@ -616,7 +585,7 @@ async fn stopped_receipt_scope_excludes_neighbors_but_rejects_replacement_and_bu
         codex_process_generation_exited(identity.process_id, Some(identity.process_birth_id + 1))
             .unwrap()
     );
-    let mut tree = CodexInstanceProcessTree::capture(&identity).unwrap();
+    let mut tree = CodexInstanceProcessTree::capture(&identity).unwrap().unwrap();
     tree.stop_and_wait().unwrap();
     assert!(
         codex_process_generation_exited(identity.process_id, Some(identity.process_birth_id))

@@ -115,32 +115,42 @@ fn child_lifetime_matches(
 }
 
 #[cfg(windows)]
-pub(super) fn capture_root(identity: &CodexInstanceIdentity) -> anyhow::Result<VerifiedStopProcess> {
+fn capture_root(identity: &CodexInstanceIdentity) -> anyhow::Result<Option<VerifiedStopProcess>> {
     anyhow::ensure!(
         super::valid_stop_identity(identity),
         "多开实例身份字段不完整"
     );
-    let process = VerifiedStopProcess::capture(identity.process_id, true)?
-        .ok_or_else(|| anyhow::anyhow!("原代多开进程已退出"))?;
+    let Some(process) = VerifiedStopProcess::capture(identity.process_id, true)? else {
+        return Ok(None);
+    };
     anyhow::ensure!(
         process.birth_id == identity.process_birth_id,
         "多开进程创建身份冲突"
     );
+    if !process.is_alive()? {
+        return Ok(None);
+    }
+    let facts = process
+        .image()
+        .and_then(|image| process.arguments().map(|args| (image, args)));
+    let (image, args) = match facts {
+        Ok(facts) => facts,
+        Err(_) if !process.is_alive()? => return Ok(None),
+        Err(error) => return Err(error),
+    };
     anyhow::ensure!(
-        same_image(&process.image()?, &identity.executable),
+        same_image(&image, &identity.executable),
         "多开进程映像身份冲突"
     );
-    let args = process.arguments()?;
     anyhow::ensure!(
         codex_identity_arguments_match(&args, identity)
             && flag_values(&args, "--type").is_some_and(|types| types.is_empty()),
         "多开进程参数身份冲突"
     );
-    anyhow::ensure!(process.is_alive()?, "原代多开进程已退出");
-    Ok(process)
+    Ok(process.is_alive()?.then_some(process))
 }
 
-/// worker 在 ready 时捕获并持续 refresh；保留所有已收养代的句柄直到清理确认。
+/// 停止入口捕获并追踪自有进程树；保留所有已收养代的句柄直到清理确认。
 /// 只收养桌面自身的 Electron 角色和安装目录内的 app-server，绝不遍历用户工具。
 ///
 /// `crashpad-handler`、终端、MCP 和用户启动的工具不在角色白名单中，故不会被
@@ -159,14 +169,16 @@ impl CodexInstanceProcessTree {
     const STOP_TIMEOUT: Duration = Duration::from_secs(8);
     const STOP_PASSES: usize = 8;
 
-    pub(super) fn capture(identity: &CodexInstanceIdentity) -> anyhow::Result<Self> {
-        let root = capture_root(identity)?;
+    pub(super) fn capture(identity: &CodexInstanceIdentity) -> anyhow::Result<Option<Self>> {
+        let Some(root) = capture_root(identity)? else {
+            return Ok(None);
+        };
         let mut tree = Self {
             identity: identity.clone(),
             processes: vec![(root, Role::Desktop)],
         };
         tree.refresh()?;
-        Ok(tree)
+        Ok(Some(tree))
     }
 
     fn refresh(&mut self) -> anyhow::Result<()> {
