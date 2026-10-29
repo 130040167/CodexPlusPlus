@@ -48,8 +48,13 @@ function installForceChinese(fixture) {
   const begin = prelude.indexOf("  function installCodexPlusForceChineseLocale()");
   const end = prelude.indexOf("  const helperBase =", begin);
   assert.ok(begin >= 0 && end > begin);
+  // 读写 localeOverride 用的是 20-menu.js 里真实的宿主服务 / state API 双通道。
+  const menu = readFileSync(`${__dirname}/renderer-inject/20-menu.js`, "utf8");
+  const menuBegin = menu.indexOf("  function codexHostServicesFromModule(");
+  const menuEnd = menu.indexOf("  function codexAmbientSuggestionsDescription(", menuBegin);
+  assert.ok(menuBegin >= 0 && menuEnd > menuBegin);
   vm.runInContext(
-    `${prelude.slice(begin, end)}\nglobalThis.install = installCodexPlusForceChineseLocale;`,
+    `${menu.slice(menuBegin, menuEnd)}\n${prelude.slice(begin, end)}\nglobalThis.install = installCodexPlusForceChineseLocale;`,
     fixture.context,
   );
   fixture.context.install();
@@ -108,6 +113,44 @@ test("force Chinese locale retries while the Codex state API is still unavailabl
   assert.deepEqual(fixture.reloads, ["reload"]);
 });
 
+test("force Chinese locale writes through Codex host services when the state API is gone (#2755)", async () => {
+  // Codex 26.10+ 已没有 get-setting / set-setting，设置只能经宿主服务 settings.write 写入；
+  // 只走 state API 时 localeOverride 永远写不进去，也不会刷新，界面一直是英文。
+  const hostSettings = {};
+  const fixture = installForceChinese(forceChineseContext({ enabled: true, hostSettings }));
+  await fixture.settled();
+  await fixture.settled();
+  assert.deepEqual(fixture.calls, [], "the retired state API is not needed");
+  assert.deepEqual(fixture.hostCalls, [["readAll"], ["write", "localeOverride", "zh-CN"]]);
+  assert.equal(hostSettings.localeOverride, "zh-CN");
+  assert.equal(fixture.local.get(fixture.managedKey),
+    JSON.stringify({ appliedLocale: "zh-CN", previousValue: null }),
+    "an unset localeOverride is remembered as null so switching off clears it again");
+  assert.deepEqual(fixture.reloads, ["reload"], "the page reloads once so the locale takes effect");
+
+  // 已经是 zh-CN 时不再写入、不再刷新。
+  const again = installForceChinese(forceChineseContext({ enabled: true, hostSettings }));
+  await again.settled();
+  await again.settled();
+  assert.deepEqual(again.hostCalls, [["readAll"]]);
+  assert.deepEqual(again.reloads, []);
+});
+
+test("switching force Chinese off restores the previous locale through host services", async () => {
+  const hostSettings = { localeOverride: "zh-CN" };
+  const fixture = installForceChinese(forceChineseContext({
+    enabled: false,
+    hostSettings,
+    managed: { appliedLocale: "zh-CN", previousValue: "ja-JP" },
+  }));
+  await fixture.settled();
+  await fixture.settled();
+  assert.deepEqual(fixture.hostCalls, [["readAll"], ["write", "localeOverride", "ja-JP"]]);
+  assert.equal(hostSettings.localeOverride, "ja-JP");
+  assert.equal(fixture.local.has(fixture.managedKey), false);
+  assert.deepEqual(fixture.reloads, ["reload"]);
+});
+
 test("retired fast startup flags cannot change native fetch or Statsig initialization", () => {
   const prelude = readFileSync(`${__dirname}/renderer-inject/00-prelude.js`, "utf8");
   const end = prelude.indexOf("  const helperBase =");
@@ -143,13 +186,28 @@ test("retired fast startup flags cannot change native fetch or Statsig initializ
   assert.match(source, /patchStatsigModelWhitelist\(\);/);
 });
 
-function forceChineseContext({ enabled = true, managed = null, current = "en-US", failFirst = 0 } = {}) {
+// hostSettings 模拟 Codex 26.10+：设置只能经 app-shared 导出的宿主服务读写，state API 已不存在。
+function forceChineseContext({ enabled = true, managed = null, current = "en-US", failFirst = 0, hostSettings = null } = {}) {
   const managedKey = "codexPlus.forceChineseLocale.managed.v1";
   const local = new Map(managed ? [[managedKey, JSON.stringify(managed)]] : []);
   const session = new Map();
   const calls = [];
+  const hostCalls = [];
   const writes = [];
   const reloads = [];
+  const host = hostSettings && {
+    applicationState: {},
+    settings: {
+      readAll: async () => {
+        hostCalls.push(["readAll"]);
+        return { values: { ...hostSettings } };
+      },
+      write: async (key, value) => {
+        hostCalls.push(["write", key, value]);
+        hostSettings[key] = value;
+      },
+    },
+  };
   const context = vm.createContext({
     window: {
       __CODEX_PLUS_FORCE_CHINESE_LOCALE__: { enabled, locale: "zh-CN" },
@@ -171,7 +229,13 @@ function forceChineseContext({ enabled = true, managed = null, current = "en-US"
       clearTimeout: () => {},
     },
     navigator: { userAgent: "test", language: "en-US", languages: ["en-US"] },
+    loadCodexAppModule: async (assetPrefix) => {
+      // 宿主服务对象挂在压缩后的导出名上（实际产物里是活绑定）。
+      if (host && assetPrefix === "app-shared-") return { Qot: host, tst: () => {} };
+      throw Error(`未找到 Codex App asset: ${assetPrefix}`);
+    },
     codexStateCall: async (method, { params }) => {
+      if (host) throw Error("Codex 状态 API 不可用 (app-shared-: state export unavailable)");
       calls.push({ method, params });
       // failFirst 用来模拟注入早于 asset 就绪：state API 头几次调用必然失败。
       if (calls.length <= failFirst) throw Error("Codex 状态 API 不可用 (test)");
@@ -183,7 +247,7 @@ function forceChineseContext({ enabled = true, managed = null, current = "en-US"
     },
   });
   return {
-    context, calls, writes, reloads, local, session, managedKey,
+    context, calls, hostCalls, writes, reloads, local, session, managedKey,
     current: () => current,
     // 安装函数里同步读设置是 fire-and-forget，等微任务清空后再断言。
     settled: () => new Promise((resolve) => setImmediate(resolve)),
