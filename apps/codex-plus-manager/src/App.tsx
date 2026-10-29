@@ -123,7 +123,7 @@ import { AgentGlyph, HubOverview, useGatewayPayload } from "./HubOverview";
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
 import { paletteShortcut } from "./command-palette-model";
 import { SessionsView, sessionDeleteSucceeded } from "./GatewaySessions";
-import { agentName, formatQueueWait, formatRequestCost, maskAccountName, queueWaitMs, QUEUE_REASON_PREFIX, usageRangeStart, type GatewayResult, type UsageCost, type UsageRange } from "./gateway-model";
+import { agentName, formatQueueWait, formatRequestCost, maskAccountName, queueWaitMs, QUEUE_REASON_PREFIX, foreignCompactionDropped, FOREIGN_COMPACTION_DROPPED_REASON, usageRangeStart, type GatewayResult, type UsageCost, type UsageRange } from "./gateway-model";
 import { SessionAgentTabs, type SessionTab } from "./SessionAgentTabs";
 import { UsageTabs, onOpenRequestLog, type RequestLogFocus } from "./UsageTabs";
 import { noticeDuration, noticeTone } from "./notice-model";
@@ -6263,13 +6263,18 @@ function requestLogRetryLabel(entry: RequestLogEntry) {
   // 网关因 Codex++ 本地限速排过队：标出排了多久。
   const queued = queueWaitMs(entry.retryReasons);
   const queue = queued === null ? "" : tf("限速排队 {0}", [formatQueueWait(queued)]);
-  return [base, queue].filter(Boolean).join(" · ") || "-";
+  // 换上游后去掉了别家签发的压缩上下文：较早的对话内容上游已看不到，必须让用户看得见。
+  const compaction = foreignCompactionDropped(entry.retryReasons) ? t("已去掉别家压缩上下文") : "";
+  return [base, queue, compaction].filter(Boolean).join(" · ") || "-";
 }
 
-/** 重试原因的展示：网关记的限速排队换成「限速排队 Xs」，其它原样。 */
+/** 重试原因的展示：网关记的限速排队换成「限速排队 Xs」，去掉别家压缩上下文换成说明，其它原样。 */
 function requestLogRetryReasons(entry: RequestLogEntry): string {
   return (entry.retryReasons ?? [])
     .map((reason) => {
+      if (reason === FOREIGN_COMPACTION_DROPPED_REASON) {
+        return t("已去掉别家签发的压缩上下文，较早的对话内容不可用");
+      }
       if (!reason.startsWith(QUEUE_REASON_PREFIX)) return reason;
       const queued = queueWaitMs([reason]);
       return queued === null ? reason : tf("限速排队 {0}", [formatQueueWait(queued)]);
@@ -6626,7 +6631,7 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
                     ) : null}
                   </span>
                   <span
-                    className={entry.autoRetries > 0 || queueWaitMs(entry.retryReasons) !== null ? "request-log-retry" : "request-log-muted"}
+                    className={entry.autoRetries > 0 || queueWaitMs(entry.retryReasons) !== null || foreignCompactionDropped(entry.retryReasons) ? "request-log-retry" : "request-log-muted"}
                     title={requestLogRetryReasons(entry)}
                   >
                     {requestLogRetryLabel(entry)}

@@ -312,6 +312,17 @@ export function parseKeyLimit(value: string): number | null {
 /** 请求日志「重试原因」里网关记的限速排队：`local_rate_limit_wait_ms:<毫秒>`。 */
 export const QUEUE_REASON_PREFIX = "local_rate_limit_wait_ms:";
 
+/**
+ * 请求日志「重试原因」里的说明：换上游后被拒收，去掉了别家签发的压缩上下文（compaction），
+ * 较早的对话内容上游已经看不到。只是说明，不算一次重试。
+ */
+export const FOREIGN_COMPACTION_DROPPED_REASON = "foreign_compaction_dropped";
+
+/** 这次请求是否去掉过别家签发的压缩上下文。 */
+export function foreignCompactionDropped(reasons: string[] | null | undefined): boolean {
+  return (reasons ?? []).includes(FOREIGN_COMPACTION_DROPPED_REASON);
+}
+
 /** 这次请求因 Codex++ 本地限速排队了多久（毫秒）；没排过队返回 null。 */
 export function queueWaitMs(reasons: string[] | null | undefined): number | null {
   const reason = (reasons ?? []).find((item) => item.startsWith(QUEUE_REASON_PREFIX));

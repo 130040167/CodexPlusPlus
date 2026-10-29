@@ -24,6 +24,8 @@ import {
   parseKeyLimit,
   formatQueueWait,
   queueWaitMs,
+  foreignCompactionDropped,
+  FOREIGN_COMPACTION_DROPPED_REASON,
   pickerSections,
   presetAdded,
   presetHost,
@@ -425,6 +427,15 @@ test("请求日志认出网关记的限速排队", () => {
   assert.equal(formatQueueWait(400), "0.4s");
   assert.equal(formatQueueWait(45_400), "45s");
   assert.match(app, /tf\("限速排队 \{0\}", \[formatQueueWait\(queued\)\]\)/);
+});
+
+test("请求日志认出去掉别家签发的压缩上下文，并显示成说明文字", () => {
+  assert.equal(FOREIGN_COMPACTION_DROPPED_REASON, "foreign_compaction_dropped");
+  assert.equal(foreignCompactionDropped(undefined), false);
+  assert.equal(foreignCompactionDropped(["invalid_encrypted_content"]), false);
+  assert.equal(foreignCompactionDropped(["invalid_encrypted_content", "foreign_compaction_dropped"]), true);
+  assert.match(app, /t\("已去掉别家签发的压缩上下文，较早的对话内容不可用"\)/);
+  assert.match(app, /t\("已去掉别家压缩上下文"\)/);
 });
 
 test("供应商池详情能编辑每个 Key 的限速", () => {

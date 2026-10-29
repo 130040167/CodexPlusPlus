@@ -2761,6 +2761,8 @@ export const EN_TEMPLATE: Record<string, string> = {
   "同时 {0} 个": "{0} concurrent",
   "每个 Key · {0}": "Per key · {0}",
   "限速排队 {0}": "Rate-limit queue {0}",
+  "已去掉别家压缩上下文": "Foreign compacted context dropped",
+  "已去掉别家签发的压缩上下文，较早的对话内容不可用": "Dropped compacted context issued by another provider; earlier conversation content is unavailable",
   "上游有 {0} 个模型": "{0} models upstream",
   "{0} 的模型": "{0} models",
   "上游新增 {0}": "{0} new upstream",
