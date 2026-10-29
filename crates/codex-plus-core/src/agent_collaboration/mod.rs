@@ -5,7 +5,9 @@ pub mod executor;
 pub mod integration;
 pub mod mcp;
 pub mod native_refresh;
+mod queue_owner;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -163,6 +165,14 @@ pub struct TaskRecord {
 struct State {
     config: CollaborationConfig,
     tasks: Vec<TaskRecord>,
+    /// 排队任务的持有进程：任务 id → 持有者 id（见 [`queue_owner`]），只记录仍在排队的任务。
+    /// 旧版本读取时忽略此字段，回退不受影响。
+    #[serde(
+        default,
+        rename = "queueOwners",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    queue_owners: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +206,10 @@ impl Store {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn owners_dir(&self) -> PathBuf {
+        queue_owner::owners_dir(&self.path)
     }
 
     fn connect(&self) -> anyhow::Result<Connection> {
@@ -244,13 +258,8 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?;
-        let mut state: State = match payload.as_deref() {
-            Some(payload) => {
-                serde_json::from_str(payload).context("协作记录损坏，未覆盖现有数据")?
-            }
-            None => State::default(),
-        };
-        expire_abandoned_tasks(&mut state);
+        let mut state = parse_state(payload.as_deref())?;
+        expire_abandoned_tasks(&self.owners_dir(), &mut state);
         let result = change(&mut state)?;
         let updated = serde_json::to_string(&state)?;
         // 状态轮询仍经同一事务读取，但内容未变时不反复重写完整任务记录。
@@ -263,6 +272,22 @@ impl Store {
         }
         transaction.commit()?;
         Ok(result)
+    }
+
+    /// 只读取一份状态（不开写事务、不落盘）。租约过期只在这份内存视图里计算，
+    /// 由之后的写事务落盘。
+    fn read_state(&self) -> anyhow::Result<State> {
+        let connection = self.connect()?;
+        let payload: Option<String> = connection
+            .query_row(
+                "SELECT payload FROM collaboration_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut state = parse_state(payload.as_deref())?;
+        expire_abandoned_tasks(&self.owners_dir(), &mut state);
+        Ok(state)
     }
 
     pub fn config(&self) -> anyhow::Result<CollaborationConfig> {
@@ -433,51 +458,80 @@ impl Store {
 
     /// 排队任务的单次轮询：轮到时认领执行权，否则刷新排队进度并续租。
     /// 同一 Agent 按提交顺序启动；前一个任务结束（完成、失败、取消、中断）后下一个才会轮到。
+    /// 轮询的进程登记为该任务的持有者：之后租约因睡眠或卡顿过期时，只要持有进程还在就不判为失联。
     pub fn poll_queue(&self, id: &str) -> anyhow::Result<QueueTurn> {
+        let owners_dir = self.owners_dir();
         self.with_state(|state| {
             let index = state
                 .tasks
                 .iter()
                 .position(|task| task.id == id)
                 .context("找不到协作任务")?;
-            let agent_id = state.tasks[index].agent_id.clone();
-            let enabled = state.config.enabled
-                && state
-                    .config
-                    .agents
-                    .iter()
-                    .any(|agent| agent.enabled && agent.id == agent_id);
             let task = &state.tasks[index];
-            if task.status != "queued" || task.cancel_requested || !enabled {
+            if task.status != "queued"
+                || task.cancel_requested
+                || !agent_enabled(&state.config, &task.agent_id)
+            {
                 return Ok(QueueTurn::Stop);
             }
             let ahead = tasks_ahead(&state.tasks, index);
             let timestamp = now_ms();
-            let task = &mut state.tasks[index];
             if ahead == 0 {
+                state.queue_owners.remove(id);
+                let task = &mut state.tasks[index];
                 task.status = "running".to_string();
                 task.progress = "正在启动 CLI".to_string();
                 task.updated_at_ms = timestamp;
                 return Ok(QueueTurn::Start);
             }
-            let progress = queue_progress(ahead);
+            if let Some(owner) = queue_owner::acquire(&owners_dir) {
+                state.queue_owners.insert(id.to_string(), owner);
+            }
+            let task = &mut state.tasks[index];
             // 内容未变且租约仍新时不写库，避免排队轮询反复重写整份记录。
-            if task.progress != progress
-                || timestamp.saturating_sub(task.updated_at_ms) >= QUEUE_HEARTBEAT_MS
-            {
-                task.progress = progress;
+            if !queue_wait_is_current(task, ahead, timestamp) {
+                task.progress = queue_progress(ahead);
                 task.updated_at_ms = timestamp;
             }
             Ok(QueueTurn::Wait { ahead })
         })
     }
 
+    /// 排队任务的只读检查（不开写事务）：仍要等、且进度和租约都不用更新时返回 Some(前面的任务数)；
+    /// 轮到了、已不在排队、进度有变或该续租时返回 None，由调用方再走 [`Store::poll_queue`]。
+    fn peek_queue(&self, id: &str) -> anyhow::Result<Option<usize>> {
+        let state = self.read_state()?;
+        let Some(index) = state.tasks.iter().position(|task| task.id == id) else {
+            return Ok(None);
+        };
+        let task = &state.tasks[index];
+        if task.status != "queued"
+            || task.cancel_requested
+            || !agent_enabled(&state.config, &task.agent_id)
+        {
+            return Ok(None);
+        }
+        let ahead = tasks_ahead(&state.tasks, index);
+        Ok((ahead > 0 && queue_wait_is_current(task, ahead, now_ms())).then_some(ahead))
+    }
+
     /// 执行进程退出时放弃仍在排队的任务：任务从未启动，标记失败并说明可重新提交。
     /// 已不在排队（已启动或已结束）时不做改动并返回 false。
     pub fn abandon_queued(&self, id: &str, reason: &str) -> anyhow::Result<bool> {
+        self.abandon_before_launch(id, reason, false)
+    }
+
+    /// 同 [`Store::abandon_queued`]；`include_claimed` 时本进程已认领（running）但确定还没启动 CLI 的
+    /// 任务也按未启动处理。只有确知 CLI 未启动的调用方（认领后、启动前被中止）才能传 true。
+    fn abandon_before_launch(
+        &self,
+        id: &str,
+        reason: &str,
+        include_claimed: bool,
+    ) -> anyhow::Result<bool> {
         self.with_state(|state| {
             let task = find_task(state, id)?;
-            if task.status != "queued" {
+            if task.status != "queued" && !(include_claimed && task.status == "running") {
                 return Ok(false);
             }
             task.status = if task.cancel_requested {
@@ -618,6 +672,27 @@ fn tasks_ahead(tasks: &[TaskRecord], index: usize) -> usize {
         .count()
 }
 
+fn agent_enabled(config: &CollaborationConfig, agent_id: &str) -> bool {
+    config.enabled
+        && config
+            .agents
+            .iter()
+            .any(|agent| agent.enabled && agent.id == agent_id)
+}
+
+/// 排队任务的进度文字与 ahead 一致、且租约还新，不需要写库。
+fn queue_wait_is_current(task: &TaskRecord, ahead: usize, timestamp: u64) -> bool {
+    task.progress == queue_progress(ahead)
+        && timestamp.saturating_sub(task.updated_at_ms) < QUEUE_HEARTBEAT_MS
+}
+
+fn parse_state(payload: Option<&str>) -> anyhow::Result<State> {
+    match payload {
+        Some(payload) => serde_json::from_str(payload).context("协作记录损坏，未覆盖现有数据"),
+        None => Ok(State::default()),
+    }
+}
+
 fn queue_progress(ahead: usize) -> String {
     if ahead == 0 {
         "等待启动 CLI".to_string()
@@ -702,9 +777,20 @@ fn bounded_text(text: &str, max: usize) -> String {
     text[..end].to_string()
 }
 
-fn expire_abandoned_tasks(state: &mut State) {
+fn expire_abandoned_tasks(owners_dir: &Path, state: &mut State) {
     let timestamp = now_ms();
-    for task in &mut state.tasks {
+    let State {
+        tasks,
+        queue_owners,
+        ..
+    } = state;
+    // 持有者记录只对仍在排队的任务有意义。
+    queue_owners.retain(|id, _| {
+        tasks
+            .iter()
+            .any(|task| task.id == *id && task.status == "queued")
+    });
+    for task in tasks.iter_mut() {
         let lease = if task.status == "queued" {
             QUEUED_LEASE_MS
         } else {
@@ -712,6 +798,15 @@ fn expire_abandoned_tasks(state: &mut State) {
         };
         if !is_terminal(&task.status) && timestamp.saturating_sub(task.updated_at_ms) > lease {
             if task.status == "queued" {
+                // 租约过期不一定是进程没了：电脑睡眠或进程卡顿也会让续租停下。持有进程还在
+                // 就继续等它下一次轮询续租，不能把它的任务判成失联（#2772）。
+                if queue_owners
+                    .get(&task.id)
+                    .is_some_and(|owner| queue_owner::is_alive(owners_dir, owner))
+                {
+                    continue;
+                }
+                queue_owners.remove(&task.id);
                 // 排队任务从未启动 CLI，结果是确定的：没有执行任何操作，可以放心重新提交。
                 task.status = if task.cancel_requested {
                     "cancelled"

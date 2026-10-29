@@ -164,8 +164,8 @@ fn cancelling_a_queued_task_removes_it_from_the_queue() {
     assert_eq!(store.task(&second.id).unwrap().status, "cancelled");
 }
 
-/// 直接改写持久化记录里某个任务的字段，模拟执行进程失联后租约过期。
-fn rewrite_task(store: &Store, index: usize, field: &str, value: Value) {
+/// 直接改写持久化记录，模拟执行进程失联或电脑睡眠后租约过期。
+fn rewrite_state(store: &Store, change: impl FnOnce(&mut Value)) {
     let connection = rusqlite::Connection::open(store.path()).unwrap();
     let payload: String = connection
         .query_row(
@@ -175,13 +175,69 @@ fn rewrite_task(store: &Store, index: usize, field: &str, value: Value) {
         )
         .unwrap();
     let mut state: Value = serde_json::from_str(&payload).unwrap();
-    state["tasks"][index][field] = value;
+    change(&mut state);
     connection
         .execute(
             "UPDATE collaboration_state SET payload=?1 WHERE id=1",
             [state.to_string()],
         )
         .unwrap();
+}
+
+/// 改写持久化记录里某个任务的字段。
+fn rewrite_task(store: &Store, index: usize, field: &str, value: Value) {
+    rewrite_state(store, |state| state["tasks"][index][field] = value);
+}
+
+/// 电脑睡眠或进程卡顿超过租约：排队任务的持有进程（这里是测试进程自己）仍在，
+/// 任务不能被判成失联；持有者下一次轮询照常续租。持有进程真的不在了才按失联处理。
+#[test]
+fn queued_task_survives_an_expired_lease_while_its_owner_process_is_alive() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(&temp);
+    enable(&store, &["codex"]);
+    let running = store.submit(request(&temp, "codex", "运行中")).unwrap();
+    assert!(store.claim(&running.id).unwrap());
+    let waiting = store.submit(request(&temp, "codex", "睡眠前排队")).unwrap();
+    // 第一次轮询登记本进程为持有者。
+    assert_eq!(
+        store.poll_queue(&waiting.id).unwrap(),
+        QueueTurn::Wait { ahead: 1 }
+    );
+
+    // 睡眠醒来：租约早已过期，但持有进程还在。
+    rewrite_task(&store, 1, "updatedAtMs", json!(1));
+    let task = store.task(&waiting.id).unwrap();
+    assert_eq!(task.status, "queued", "{}", task.error);
+    assert_eq!(
+        store.poll_queue(&waiting.id).unwrap(),
+        QueueTurn::Wait { ahead: 1 }
+    );
+    assert!(
+        store.task(&waiting.id).unwrap().updated_at_ms > 1,
+        "持有者轮询时续租"
+    );
+    store
+        .finish(&running.id, "completed", "done", "", "native-1")
+        .unwrap();
+    assert_eq!(store.poll_queue(&waiting.id).unwrap(), QueueTurn::Start);
+
+    // 持有者换成一个已经不在的进程（标记文件不存在）：租约过期后照常按失联处理。
+    let orphan = store
+        .submit(request(&temp, "codex", "持有进程已退出"))
+        .unwrap();
+    assert_eq!(
+        store.poll_queue(&orphan.id).unwrap(),
+        QueueTurn::Wait { ahead: 1 }
+    );
+    let orphan_id = orphan.id.clone();
+    rewrite_state(&store, move |state| {
+        state["queueOwners"][orphan_id.as_str()] = json!(uuid::Uuid::new_v4().to_string());
+        state["tasks"][2]["updatedAtMs"] = json!(1);
+    });
+    let result = store.task(&orphan.id).unwrap();
+    assert_eq!(result.status, "failed");
+    assert!(result.error.contains("未启动"), "{}", result.error);
 }
 
 #[test]
