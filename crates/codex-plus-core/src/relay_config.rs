@@ -1086,7 +1086,14 @@ pub fn apply_relay_profile_to_home_with_switch_rules_and_proxy_port(
     let result =
         apply_relay_profile_to_home_inner(home, profile, common_config_contents, proxy_port)?;
     if profile.id != crate::gateway::apply::CODEX_GATEWAY_RELAY_ID {
-        repair_managed_session_provider_in_home(home, ManagedSessionProviderScan::LegacyRollouts)?;
+        if let Err(error) =
+            repair_managed_session_provider_in_home(home, ManagedSessionProviderScan::LegacyRollouts)
+        {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "relay_config.managed_session_provider_repair_failed",
+                serde_json::json!({ "message": format!("{error:#}") }),
+            );
+        }
     }
     // issue #2081：默认模型变了就记一笔，旧会话迁移留到下次启动前执行（opt-in）。
     let new_model = live_root_model(home);

@@ -7961,6 +7961,46 @@ base_url = "https://responses.example.test/v1"
     }
 }
 
+#[test]
+fn managed_provider_repair_failure_after_apply_does_not_report_switch_failure() {
+    let _state = crate::common::global_state_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let log_path = home.join("codex-plus.log");
+    codex_plus_core::diagnostic_log::set_diagnostic_log_path_for_tests(Some(log_path.clone()));
+    let db = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads (model_provider TEXT); \
+         INSERT INTO threads VALUES ('codex_plus_managed');",
+    )
+    .unwrap();
+    drop(db);
+    std::fs::write(home.join("backups"), "blocks only the post-write backup").unwrap();
+
+    let applied = apply_relay_profile_to_home_with_switch_rules_and_proxy_port(
+        home,
+        &responses_profile_with_model("gpt-5.4"),
+        "",
+        57321,
+    );
+    codex_plus_core::diagnostic_log::set_diagnostic_log_path_for_tests(None);
+
+    let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    assert_eq!(
+        config
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap()["model"]
+            .as_str(),
+        Some("gpt-5.4"),
+    );
+    assert!(applied.is_ok(), "the profile has already been written: {applied:?}");
+    assert!(
+        std::fs::read_to_string(log_path)
+            .unwrap()
+            .contains("relay_config.managed_session_provider_repair_failed")
+    );
+}
+
 /// issue #2081：切换默认模型时只记录待迁移项，不碰 sqlite；
 /// 下次启动前（opt-in）才把仍停在旧默认的会话迁到新默认，手选模型保持不变。
 #[test]
