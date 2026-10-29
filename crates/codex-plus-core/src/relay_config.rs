@@ -2554,7 +2554,7 @@ fn remove_provider_specific_common_keys(table: &mut dyn TableLike) {
     table.remove("model_providers");
 }
 
-fn is_provider_specific_common_root_key(key: &str) -> bool {
+pub(crate) fn is_provider_specific_common_root_key(key: &str) -> bool {
     let key = key.trim().trim_matches(['\"', '\'']);
     PROVIDER_SPECIFIC_COMMON_ROOT_KEYS.contains(&key) || is_provider_credential_root_key(key)
 }
