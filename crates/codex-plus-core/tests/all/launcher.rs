@@ -51,6 +51,7 @@ async fn launch_receipt_status_and_injection_follow_final_wrapper_port() {
             codex_home: Some(temp.path().join("codex-home")),
             sqlite_home: Some(temp.path().join("sqlite-home")),
             state_dir: Some(temp.path().join("state")),
+            replace_blocking_main_instance: false,
         },
         &hooks,
     )

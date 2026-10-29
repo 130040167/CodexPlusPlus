@@ -12,7 +12,7 @@ pub const WATCHER_INTERVAL_SECONDS: f64 = 3.0;
 pub const CDP_PROBE_TIMEOUT_SECONDS: f64 = 0.5;
 pub const TAKEOVER_FAILURE_BACKOFF_SECONDS: f64 = 30.0;
 pub const RESTART_STOP_WAIT_TIMEOUT_MS: u64 = 5_000;
-const RESTART_STOP_WAIT_INTERVAL_MS: u64 = 100;
+pub(crate) const RESTART_STOP_WAIT_INTERVAL_MS: u64 = 100;
 /// 「等旧启动器退出」轮询退避的上限。
 const LAUNCHER_WAIT_BACKOFF_MAX_MS: u64 = 1_000;
 /// 强制结束后，再等多久确认残留实例已经消失。
@@ -2011,23 +2011,33 @@ fn terminate_and_wait_for_exit(process_ids: Vec<u32>, timeout_ms: u64, interval_
     for process_id in &process_ids {
         let _ = crate::windows_integration::terminate_process(*process_id);
     }
+    let remaining = wait_for_processes_to_exit(&process_ids, timeout_ms, interval_ms);
+    if !remaining.is_empty() {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "watcher.stop_wait_timeout",
+            serde_json::json!({
+                "remaining_process_ids": remaining,
+                "timeout_ms": timeout_ms
+            }),
+        );
+    }
+}
+
+/// 轮询等待指定进程全部退出，返回超时后仍在运行的 PID（全部退出时为空）。
+#[cfg(windows)]
+pub(crate) fn wait_for_processes_to_exit(
+    process_ids: &[u32],
+    timeout_ms: u64,
+    interval_ms: u64,
+) -> Vec<u32> {
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         let running_process_ids = crate::windows_integration::enumerate_processes()
             .into_iter()
             .map(|process| process.process_id);
-        let remaining = process_ids_still_running(&process_ids, running_process_ids);
+        let remaining = process_ids_still_running(process_ids, running_process_ids);
         if remaining.is_empty() || std::time::Instant::now() >= deadline {
-            if !remaining.is_empty() {
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "watcher.stop_wait_timeout",
-                    serde_json::json!({
-                        "remaining_process_ids": remaining,
-                        "timeout_ms": timeout_ms
-                    }),
-                );
-            }
-            break;
+            return remaining;
         }
         std::thread::sleep(Duration::from_millis(interval_ms));
     }

@@ -583,8 +583,93 @@ pub fn existing_main_instance_blocks_launch_message(
         "检测到 Codex 已在运行，但没有开启调试端口 {debug_port}（主进程 PID {ids}）。\
          Codex 同时只允许一个主实例，Codex++ 再启动的实例会把请求交给它后立即退出，无法注入。\
          请先完全退出 Codex：关掉窗口后若托盘里还有 Codex 图标，右键选择退出；\
-         或在任务管理器里结束所有 {executable_name} 进程。然后再点「启动 Codex」。"
+         或在任务管理器里结束所有 {executable_name} 进程。然后再点「启动 Codex」。\
+         也可以点「重启 Codex」，由 Codex++ 结束它并重新启动。"
     )
+}
+
+/// 「重启 Codex」结束挡路主进程时采用的方式（issue #2764 后续）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockingMainInstanceStop {
+    /// 连同进程树一起结束（`taskkill /F /T`）：树里只有它自己派生、可以一并结束的进程。
+    Tree,
+    /// 只结束主进程本身：树里混进了不能动的进程，或父子关系不可信（PID 复用）。
+    /// `--type=` 子进程会随主进程退出，不影响释放单实例锁。
+    MainOnly,
+    /// 目标自身受保护（例如就是 Codex++ 自己）：什么都不结束。
+    Skip,
+}
+
+/// 决定如何结束一个挡路的主进程（纯逻辑，平台调用全部注入）。
+///
+/// - `processes`：进程快照里的 `(pid, 父 pid)`；
+/// - `birth`：进程创建时间（读不到返回 `None`）；
+/// - `protected`：该进程是否绝不能被结束。
+///
+/// `taskkill /T` 只看父 PID，而 Windows 会复用 PID：父进程早已退出的无关进程，
+/// 其父 PID 可能恰好等于 Codex 主进程。所以只有整棵树每条父子边都能用创建时间
+/// 证实（子进程晚于父进程创建）、且没有任何受保护进程时才按树结束，否则只结束主进程。
+#[cfg(any(windows, test))]
+pub fn plan_blocking_main_instance_stop(
+    target: u32,
+    processes: &[(u32, u32)],
+    mut birth: impl FnMut(u32) -> Option<u64>,
+    mut protected: impl FnMut(u32) -> bool,
+) -> BlockingMainInstanceStop {
+    if target == 0 || protected(target) {
+        return BlockingMainInstanceStop::Skip;
+    }
+    let mut visited = std::collections::HashSet::from([target]);
+    let mut queue = std::collections::VecDeque::from([target]);
+    while let Some(parent) = queue.pop_front() {
+        let parent_birth = birth(parent);
+        for &(process_id, parent_process_id) in processes {
+            if parent_process_id != parent || process_id == parent || visited.contains(&process_id)
+            {
+                continue;
+            }
+            let verified_child = match (parent_birth, birth(process_id)) {
+                (Some(parent_birth), Some(child_birth)) => child_birth >= parent_birth,
+                _ => false,
+            };
+            if !verified_child || protected(process_id) {
+                return BlockingMainInstanceStop::MainOnly;
+            }
+            visited.insert(process_id);
+            queue.push_back(process_id);
+        }
+    }
+    BlockingMainInstanceStop::Tree
+}
+
+/// 挡路主进程树里的某个进程能否随它一起被结束（纯函数）。
+///
+/// - Codex++ 自身（当前 exe 名 / `codex-plus-plus.exe`）：不能；
+/// - 与 Codex 同名的进程：只有同一 MSIX 包族里的 `--type=` 子进程可以，多开实例
+///   （`--user-data-dir`）、别的主进程、另装的 ChatGPT 桌面版、读不到命令行的都不行；
+/// - 其他进程（Codex 拉起的 CLI、终端里的命令等）属于它的进程树，可以一并结束。
+#[cfg(any(windows, test))]
+pub fn may_stop_with_blocking_main_instance(
+    exe_file: &str,
+    executable_path: Option<&str>,
+    command_line: Option<&str>,
+    codex_executable: &str,
+    self_exe_name: Option<&str>,
+) -> bool {
+    if exe_file.eq_ignore_ascii_case("codex-plus-plus.exe")
+        || self_exe_name.is_some_and(|name| exe_file.eq_ignore_ascii_case(name))
+    {
+        return false;
+    }
+    let codex_file_name = codex_executable
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(codex_executable);
+    if !exe_file.eq_ignore_ascii_case(codex_file_name) {
+        return true;
+    }
+    executable_path.is_some_and(|path| same_windows_apps_package_family(path, codex_executable))
+        && classify_existing_codex_process(command_line, 0) == ExistingCodexProcess::Child
 }
 
 /// [`build_main_instance_wrapper_script`] + 写入 `<state_dir>/packaged-launch-main.cmd`。
@@ -2223,6 +2308,129 @@ mod tests {
         assert!(message.contains("28480, 31144"));
         assert!(message.contains("ChatGPT.exe"));
         assert!(message.contains("托盘"));
+        assert!(message.contains("重启 Codex"));
+    }
+
+    #[test]
+    fn blocking_main_instance_is_stopped_as_a_tree_only_when_every_edge_is_verified() {
+        // 28480：挡路主进程；28524 / 28568：它的子进程；40000：子进程派生的 codex.exe。
+        let processes = [
+            (28480, 4000),
+            (28524, 28480),
+            (28568, 28480),
+            (40000, 28524),
+            (50000, 1),
+        ];
+        let birth = |pid: u32| -> Option<u64> {
+            match pid {
+                28480 => Some(100),
+                28524 | 28568 => Some(110),
+                40000 => Some(120),
+                _ => Some(1),
+            }
+        };
+        assert_eq!(
+            plan_blocking_main_instance_stop(28480, &processes, birth, |_| false),
+            BlockingMainInstanceStop::Tree
+        );
+        // 树里有受保护进程（多开实例 / Codex++ 自身）：只结束主进程。
+        assert_eq!(
+            plan_blocking_main_instance_stop(28480, &processes, birth, |pid| pid == 40000),
+            BlockingMainInstanceStop::MainOnly
+        );
+        // PID 复用：父 PID 指向主进程、却比它更早创建的无关进程，taskkill /T 会误杀。
+        let reused = [(28480, 4000), (777, 28480)];
+        assert_eq!(
+            plan_blocking_main_instance_stop(
+                28480,
+                &reused,
+                |pid| Some(if pid == 777 { 5 } else { 100 }),
+                |_| false
+            ),
+            BlockingMainInstanceStop::MainOnly
+        );
+        // 创建时间读不到：父子关系无法证实，同样不按树结束。
+        assert_eq!(
+            plan_blocking_main_instance_stop(
+                28480,
+                &reused,
+                |pid| (pid == 28480).then_some(100),
+                |_| false
+            ),
+            BlockingMainInstanceStop::MainOnly
+        );
+        // 没有子进程：按树结束等同于只结束它自己。
+        assert_eq!(
+            plan_blocking_main_instance_stop(28480, &[(28480, 4000)], |_| None, |_| false),
+            BlockingMainInstanceStop::Tree
+        );
+        // 目标本身受保护或是 0：一个都不结束。
+        assert_eq!(
+            plan_blocking_main_instance_stop(28480, &processes, birth, |pid| pid == 28480),
+            BlockingMainInstanceStop::Skip
+        );
+        assert_eq!(
+            plan_blocking_main_instance_stop(0, &processes, birth, |_| false),
+            BlockingMainInstanceStop::Skip
+        );
+        // 父子关系成环（快照里 PID 复用造成）也能结束遍历。
+        assert_eq!(
+            plan_blocking_main_instance_stop(
+                1,
+                &[(1, 2), (2, 1)],
+                |pid| Some(pid as u64),
+                |_| false
+            ),
+            BlockingMainInstanceStop::Tree
+        );
+    }
+
+    #[test]
+    fn only_child_processes_of_the_same_package_go_down_with_the_main_instance() {
+        let codex = r"C:\Program Files\WindowsApps\OpenAI.Codex_26.1023.6621.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe";
+        let other_package = r"C:\Program Files\WindowsApps\OpenAI.ChatGPT-Desktop_1.2025.1.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe";
+        let allowed = |exe: &str, path: Option<&str>, command_line: Option<&str>| {
+            may_stop_with_blocking_main_instance(
+                exe,
+                path,
+                command_line,
+                codex,
+                Some("CodexPlusPlus.exe"),
+            )
+        };
+        // 同包族的 Electron 子进程：随主进程一起结束。
+        assert!(allowed(
+            "ChatGPT.exe",
+            Some(codex),
+            Some(&format!("{STORE_EXE} --type=renderer"))
+        ));
+        // 多开实例、另一个主进程、读不到命令行：都不能动。
+        assert!(!allowed(
+            "ChatGPT.exe",
+            Some(codex),
+            Some(&format!(
+                "{STORE_EXE} --remote-debugging-port=9442 --user-data-dir=C:\\m"
+            ))
+        ));
+        assert!(!allowed("ChatGPT.exe", Some(codex), Some(STORE_EXE)));
+        assert!(!allowed("chatgpt.exe", Some(codex), None));
+        // 另装的 ChatGPT 桌面版（即使是它的子进程）、路径读不到：不能动。
+        assert!(!allowed(
+            "ChatGPT.exe",
+            Some(other_package),
+            Some("ChatGPT.exe --type=renderer")
+        ));
+        assert!(!allowed(
+            "ChatGPT.exe",
+            None,
+            Some(&format!("{STORE_EXE} --type=gpu-process"))
+        ));
+        // Codex++ 自身：不能动。
+        assert!(!allowed("CodexPlusPlus.exe", None, None));
+        assert!(!allowed("codex-plus-plus.exe", None, None));
+        // Codex 自己拉起的其他进程（CLI、终端命令）：属于它的进程树。
+        assert!(allowed("codex.exe", None, None));
+        assert!(allowed("node.exe", None, None));
     }
 
     #[test]

@@ -749,6 +749,9 @@ async fn launcher_session(
             state.options.app_dir = Some(handle.app_dir.clone());
             state.options.debug_port = handle.debug_port;
             state.options.helper_port = handle.helper_port;
+            // 「重启」许可只对这一次启动有效：之后再点「启动」复用本会话激活时，
+            // 不能沿用它去结束用户另开的 Codex。
+            state.options.replace_blocking_main_instance = false;
             state.status_started_at_ms = handle
                 .status_store
                 .load_latest()

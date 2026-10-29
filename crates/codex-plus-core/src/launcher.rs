@@ -209,6 +209,10 @@ pub struct LaunchOptions {
     pub codex_home: Option<PathBuf>,
     /// Codex SQLite 目录（`CODEX_SQLITE_HOME`），多开实例各自独立。
     pub sqlite_home: Option<PathBuf>,
+    /// 由「重启 Codex」发起（issue #2764 后续）：Windows 商店版主 Codex 已在运行却没带
+    /// 本次调试端口时，结束它再按正常流程启动。普通「启动 Codex」保持 `false`，
+    /// 只提示用户自行退出，不结束用户正在用的 Codex。
+    pub replace_blocking_main_instance: bool,
 }
 
 impl Default for LaunchOptions {
@@ -221,6 +225,7 @@ impl Default for LaunchOptions {
             state_dir: None,
             codex_home: None,
             sqlite_home: None,
+            replace_blocking_main_instance: false,
         }
     }
 }
@@ -238,6 +243,8 @@ pub struct LaunchInstance {
     pub codex_home: Option<PathBuf>,
     /// Codex SQLite 目录（`CODEX_SQLITE_HOME`）。
     pub sqlite_home: Option<PathBuf>,
+    /// 见 [`LaunchOptions::replace_blocking_main_instance`]。
+    pub replace_blocking_main_instance: bool,
 }
 
 impl LaunchInstance {
@@ -246,6 +253,7 @@ impl LaunchInstance {
             state_dir: options.state_dir.clone(),
             codex_home: options.codex_home.clone(),
             sqlite_home: options.sqlite_home.clone(),
+            replace_blocking_main_instance: options.replace_blocking_main_instance,
         }
     }
 }
@@ -1387,7 +1395,8 @@ impl LaunchHooks for DefaultLaunchHooks {
                 };
                 // issue #2764：主 Codex 已经开着（开始菜单 / 托盘）但没带本次调试端口时，
                 // 单实例锁在它手里，AUMID 激活和包上下文兜底拉起的进程都会把参数交给它后
-                // 立即退出，端口永远等不到。先识别出来直接给出可操作的提示，不再空跑兜底。
+                // 立即退出，端口永远等不到。先识别出来：「重启 Codex」结束它再启动，
+                // 「启动 Codex」直接给出可操作的提示，都不再空跑兜底。
                 #[cfg(windows)]
                 {
                     let executable = crate::app_paths::build_codex_executable(app_dir);
@@ -1404,8 +1413,21 @@ impl LaunchHooks for DefaultLaunchHooks {
                                 "app_user_model_id": app_user_model_id,
                                 "debug_port": debug_port,
                                 "process_ids": blocking,
+                                "replace": instance.replace_blocking_main_instance,
                             }),
                         );
+                    }
+                    // 「重启 Codex」：结束它们（连同各自的进程树）并等退出，再走下面的正常激活。
+                    if !blocking.is_empty() && instance.replace_blocking_main_instance {
+                        stop_main_instances_blocking_debug_launch(
+                            &executable,
+                            debug_port,
+                            &launch_extra_args,
+                            blocking,
+                        )
+                        .await?;
+                    } else if !blocking.is_empty() {
+                        // 「启动 Codex」：不结束用户正在用的 Codex，只提示怎么退出。
                         let executable_name = executable
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
@@ -4775,24 +4797,10 @@ async fn existing_main_instances_blocking_debug_launch(
     let executable = executable.to_path_buf();
     let launch_args = launch_args.to_vec();
     tokio::task::spawn_blocking(move || {
-        let Some(file_name) = executable.file_name().map(|name| name.to_string_lossy()) else {
-            return Vec::new();
-        };
-        let executable_text = executable.to_string_lossy();
-        // 只认同一 MSIX 包族里的同名进程：另装的 ChatGPT 桌面版也叫 ChatGPT.exe。
-        let candidates = crate::windows_integration::enumerate_processes()
-            .into_iter()
-            .filter(|info| info.exe_file.eq_ignore_ascii_case(&file_name))
-            .filter(|info| {
-                info.executable_path.as_deref().is_some_and(|path| {
-                    crate::packaged_launch::same_windows_apps_package_family(
-                        &path.to_string_lossy(),
-                        &executable_text,
-                    )
-                })
-            })
-            .map(|info| info.process_id)
-            .collect::<Vec<_>>();
+        let candidates = same_package_codex_process_ids(
+            &crate::windows_integration::enumerate_processes(),
+            &executable,
+        );
         if candidates.is_empty() {
             return Vec::new();
         }
@@ -4810,6 +4818,177 @@ async fn existing_main_instances_blocking_debug_launch(
     })
     .await
     .unwrap_or_default()
+}
+
+/// 快照里与 `executable` 同名、且属于同一 MSIX 包族的进程 PID。
+///
+/// 只认同一包族：另装的 ChatGPT 桌面版也叫 ChatGPT.exe，单实例锁互不相干。
+#[cfg(windows)]
+fn same_package_codex_process_ids(
+    processes: &[crate::windows_integration::WindowsProcessInfo],
+    executable: &Path,
+) -> Vec<u32> {
+    let Some(file_name) = executable.file_name().map(|name| name.to_string_lossy()) else {
+        return Vec::new();
+    };
+    let executable_text = executable.to_string_lossy();
+    processes
+        .iter()
+        .filter(|info| info.exe_file.eq_ignore_ascii_case(&file_name))
+        .filter(|info| {
+            info.executable_path.as_deref().is_some_and(|path| {
+                crate::packaged_launch::same_windows_apps_package_family(
+                    &path.to_string_lossy(),
+                    &executable_text,
+                )
+            })
+        })
+        .map(|info| info.process_id)
+        .collect()
+}
+
+/// 结束挡路主进程后等它退出的上限。`taskkill /F` 是立即终止，正常一两秒内就退完。
+#[cfg(windows)]
+const BLOCKING_MAIN_INSTANCE_STOP_TIMEOUT_MS: u64 = 10_000;
+
+/// 「重启 Codex」路径：结束挡住本次带调试端口启动的主 Codex（issue #2764 后续）。
+///
+/// 只结束 [`existing_main_instances_blocking_debug_launch`] 认定的主进程；动手前用新快照
+/// 再核对一遍（期间进程可能已退出、PID 被复用）。每个目标按
+/// `packaged_launch::plan_blocking_main_instance_stop` 决定连树结束还是只结束主进程：
+/// 多开实例、别的 ChatGPT 桌面版、Codex++ 自身绝不在结束范围内。
+#[cfg(windows)]
+async fn stop_main_instances_blocking_debug_launch(
+    executable: &Path,
+    debug_port: u16,
+    launch_args: &[String],
+    targets: Vec<u32>,
+) -> anyhow::Result<()> {
+    use crate::packaged_launch::BlockingMainInstanceStop;
+
+    let executable = executable.to_path_buf();
+    let launch_args = launch_args.to_vec();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let processes = crate::windows_integration::enumerate_processes();
+        let still_blocking = crate::packaged_launch::main_instances_blocking_debug_launch(
+            same_package_codex_process_ids(&processes, &executable),
+            debug_port,
+            &launch_args,
+            crate::windows_integration::process_command_line,
+        );
+        let targets = targets
+            .into_iter()
+            .filter(|process_id| still_blocking.contains(process_id))
+            .collect::<Vec<_>>();
+        let executable_text = executable.to_string_lossy().into_owned();
+        let self_process_id = std::process::id();
+        let self_exe_name = std::env::current_exe().ok().and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        });
+        let by_id = processes
+            .iter()
+            .map(|info| (info.process_id, info))
+            .collect::<std::collections::HashMap<_, _>>();
+        let edges = processes
+            .iter()
+            .map(|info| (info.process_id, info.parent_process_id))
+            .collect::<Vec<_>>();
+        let protected = |process_id: u32| -> bool {
+            if process_id == self_process_id {
+                return true;
+            }
+            // 快照里没有的进程：不认识就不动。
+            let Some(info) = by_id.get(&process_id) else {
+                return true;
+            };
+            let executable_path = info
+                .executable_path
+                .as_deref()
+                .map(|path| path.to_string_lossy().into_owned());
+            !crate::packaged_launch::may_stop_with_blocking_main_instance(
+                &info.exe_file,
+                executable_path.as_deref(),
+                crate::windows_integration::process_command_line(process_id).as_deref(),
+                &executable_text,
+                self_exe_name.as_deref(),
+            )
+        };
+        let plans = targets
+            .iter()
+            .map(|process_id| {
+                (
+                    *process_id,
+                    crate::packaged_launch::plan_blocking_main_instance_stop(
+                        *process_id,
+                        &edges,
+                        crate::windows_integration::process_birth_id,
+                        &protected,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "launcher.packaged_existing_main_instance_stopping",
+            serde_json::json!({
+                "debug_port": debug_port,
+                "process_ids": targets,
+                "plans": plans
+                    .iter()
+                    .map(|(process_id, plan)| {
+                        serde_json::json!({"pid": process_id, "plan": format!("{plan:?}")})
+                    })
+                    .collect::<Vec<_>>(),
+            }),
+        );
+        let mut stopping = Vec::new();
+        let mut requests = Vec::new();
+        for (process_id, plan) in &plans {
+            let accepted = match plan {
+                // 树结束失败（例如 taskkill 不可用）时至少把主进程结束掉。
+                BlockingMainInstanceStop::Tree => {
+                    crate::windows_integration::close_process_tree(*process_id, true)
+                        || crate::windows_integration::terminate_process(*process_id)
+                }
+                BlockingMainInstanceStop::MainOnly => {
+                    crate::windows_integration::terminate_process(*process_id)
+                }
+                BlockingMainInstanceStop::Skip => continue,
+            };
+            stopping.push(*process_id);
+            requests.push(serde_json::json!({"pid": process_id, "accepted": accepted}));
+        }
+        let remaining = crate::watcher::wait_for_processes_to_exit(
+            &stopping,
+            BLOCKING_MAIN_INSTANCE_STOP_TIMEOUT_MS,
+            crate::watcher::RESTART_STOP_WAIT_INTERVAL_MS,
+        );
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "launcher.packaged_existing_main_instance_stopped",
+            serde_json::json!({
+                "debug_port": debug_port,
+                "process_ids": stopping,
+                "requests": requests,
+                "remaining_process_ids": remaining,
+                "exited": remaining.is_empty(),
+            }),
+        );
+        if !remaining.is_empty() {
+            let ids = remaining
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "已尝试结束没有开启调试端口 {debug_port} 的 Codex 主进程，但 PID {ids} 在 {} 秒内\
+                 仍未退出。请在任务管理器里结束所有 Codex 进程后再点「重启 Codex」。",
+                BLOCKING_MAIN_INSTANCE_STOP_TIMEOUT_MS / 1000
+            );
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("结束已运行的 Codex 主进程时后台任务失败：{error}"))?
 }
 
 /// 主实例的包上下文兜底启动（issue #2700）：AUMID 激活后进程秒退时，改用

@@ -1907,6 +1907,8 @@ pub fn run_codex_multi_worker(options_path: &Path) -> anyhow::Result<()> {
         state_dir: Some(instance_state_dir.clone()),
         codex_home: std::env::var_os("CODEX_HOME").map(PathBuf::from),
         sqlite_home: std::env::var_os("CODEX_SQLITE_HOME").map(PathBuf::from),
+        // 多开实例自带 --user-data-dir，与主实例的单实例锁无关，绝不结束主 Codex。
+        replace_blocking_main_instance: false,
     };
     let receipt = match codex_plus_launcher::start_with_receipt(launch_options) {
         Ok(receipt) => receipt,
@@ -2318,7 +2320,13 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
     let app_running = codex_plus_core::cdp::endpoint_available(request.debug_port);
     if restart_disposition(request.sync_active_relay, app_running) == RestartDisposition::LaunchOnly
     {
-        return spawn_codex_plus_launch(request, "Codex 未运行，已按直接启动方式在后台唤起。");
+        // 调试端口不可连不代表 Codex 没在跑：Windows 商店版主 Codex 可能开着却没带端口
+        // （issue #2764）。走重启专用的启动，由 launcher 识别并结束它后再启动。
+        return spawn_codex_plus_launch_with(
+            request,
+            "Codex 未运行，已按直接启动方式在后台唤起。",
+            start_embedded_launcher_for_restart,
+        );
     }
     let Ok(_guard) = relay_switch_mutex().try_lock() else {
         return failed(
@@ -2415,7 +2423,11 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
     }
     let mut restart_message = "Codex 已请求重启，启动任务正在后台运行。".to_string();
     match restart_codex_plus_after_stop(&request, &home, settings.as_ref(), |request| {
-        spawn_after_provider_guard_release(provider_guard, request, start_embedded_launcher)
+        spawn_after_provider_guard_release(
+            provider_guard,
+            request,
+            start_embedded_launcher_for_restart,
+        )
     }) {
         Ok(warnings) => {
             for warning in warnings {
@@ -2884,6 +2896,14 @@ fn normalize_launch_request(mut request: LaunchRequest) -> LaunchRequest {
 }
 
 fn spawn_codex_plus_launch(request: LaunchRequest, accepted_message: &str) -> CommandResult<Value> {
+    spawn_codex_plus_launch_with(request, accepted_message, start_embedded_launcher)
+}
+
+fn spawn_codex_plus_launch_with(
+    request: LaunchRequest,
+    accepted_message: &str,
+    start: impl FnOnce(&LaunchRequest) -> anyhow::Result<()>,
+) -> CommandResult<Value> {
     let request = normalize_launch_request(request);
     let debug_port = request.debug_port;
     let helper_port = request.helper_port;
@@ -2910,7 +2930,7 @@ fn spawn_codex_plus_launch(request: LaunchRequest, accepted_message: &str) -> Co
             }),
         );
     }
-    match start_embedded_launcher(&request) {
+    match start(&request) {
         Ok(()) => {
             let (debug_port, helper_port, started_at_ms) =
                 accepted_launch_identity(&request, launch_started_at_ms);
@@ -3023,6 +3043,19 @@ fn current_timestamp_ms() -> u64 {
 }
 
 fn start_embedded_launcher(request: &LaunchRequest) -> anyhow::Result<()> {
+    start_embedded_launcher_with(request, false)
+}
+
+/// 「重启 Codex」专用：允许 launcher 结束挡住本次启动的 Windows 商店版主 Codex
+/// （已在运行却没带调试端口，issue #2764）。普通启动只提示用户自行退出。
+fn start_embedded_launcher_for_restart(request: &LaunchRequest) -> anyhow::Result<()> {
+    start_embedded_launcher_with(request, true)
+}
+
+fn start_embedded_launcher_with(
+    request: &LaunchRequest,
+    replace_blocking_main_instance: bool,
+) -> anyhow::Result<()> {
     anyhow::ensure!(!crate::app_is_exiting(), "Codex++ 正在退出，未启动 Codex");
     // 先让常驻 helper 占住协议代理端口：启动链路会识别并复用，Codex 会话退出
     // 时就不再关闭它，从而实现「Codex++ 在跑，本地代理就一直可用」。
@@ -3033,6 +3066,7 @@ fn start_embedded_launcher(request: &LaunchRequest) -> anyhow::Result<()> {
         debug_port: request.debug_port,
         helper_port: request.helper_port,
         status_store: StatusStore::default(),
+        replace_blocking_main_instance,
         ..Default::default()
     })
 }
