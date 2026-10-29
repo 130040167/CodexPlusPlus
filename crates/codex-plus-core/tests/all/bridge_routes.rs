@@ -75,6 +75,10 @@ async fn bridge_routes_cover_all_current_paths() {
             "/thread-usage-live",
             json!({"session_id": "s1", "title": "First"}),
         ),
+        (
+            "/usage/history",
+            json!({"includeActivity": true, "includeSessionCursors": true}),
+        ),
         ("/archived-thread", json!({"title": "Archived"})),
     ];
 
@@ -758,6 +762,15 @@ async fn data_routes_forward_payloads_to_data_service() {
                 }
             ]
         })
+    );
+    let usage_query = json!({
+        "includeActivity": true,
+        "includeSessionCursors": true,
+        "scopeSessionId": "scope-1"
+    });
+    assert_eq!(
+        handle_bridge_request(ctx.clone(), "/usage/history", usage_query.clone()).await,
+        json!({"status": "ok", "query": usage_query})
     );
     assert_eq!(
         handle_bridge_request(
@@ -1567,6 +1580,10 @@ impl BridgeDataService for FakeData {
                 }
             ]
         }))
+    }
+
+    async fn usage_history(&self, query: Value) -> anyhow::Result<Value> {
+        Ok(json!({"status": "ok", "query": query}))
     }
 
     async fn find_archived_thread_by_title(

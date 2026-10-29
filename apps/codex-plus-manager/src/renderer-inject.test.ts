@@ -2641,6 +2641,7 @@ describe("拓展接口层", () => {
     assert.ok(routes.includes("/diagnostics/log"), "诊断上报应保持开放");
     assert.ok(routes.includes("/cdp/targets"), "CDP 页面列表应开放给拓展");
     assert.ok(routes.includes("/cdp/evaluate"), "CDP evaluate 应开放给拓展");
+    assert.ok(routes.includes("/usage/history"), "结构化用量历史应开放给拓展");
   });
 
   it("接口对象在 IIFE 收尾前挂载", async () => {

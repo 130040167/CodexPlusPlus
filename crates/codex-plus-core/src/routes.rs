@@ -186,6 +186,17 @@ pub trait BridgeDataService: Send + Sync {
     async fn thread_usage_live(&self, _session: SessionRef) -> anyhow::Result<Value> {
         Ok(json!({"status": "unavailable", "message": "本机用量快照暂不可用", "events": []}))
     }
+    /// Structured rollout usage for read-only local extensions.
+    ///
+    /// This is separate from the lightweight status-line endpoints and from
+    /// Gateway usage accounting.
+    async fn usage_history(&self, _query: Value) -> anyhow::Result<Value> {
+        Ok(json!({
+            "status": "unavailable",
+            "complete": false,
+            "message": "结构化用量历史服务未接入",
+        }))
+    }
     async fn find_archived_thread_by_title(
         &self,
         title: String,
@@ -388,6 +399,7 @@ pub async fn handle_bridge_request(
                 .thread_usage_live(session_from_payload(&payload))
                 .await
         }
+        "/usage/history" => ctx.data.usage_history(payload.clone()).await,
         // 仅内置 Agent 桌宠使用，不加入第三方拓展路由白名单。payload 忽略，只按当前设置取图。
         "/agent-pet/image" => match ctx.settings.get_settings().await {
             Ok(settings) if crate::agent_pet::enabled_for(&settings.agent_pet, "codex") => {
