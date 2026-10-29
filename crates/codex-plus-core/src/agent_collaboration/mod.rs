@@ -284,9 +284,12 @@ impl Store {
                 .agents
                 .iter()
                 .map(|agent| {
-                    let path = executor::resolve_executable(agent);
-                    json!({"id": agent.id, "available": path.is_some(),
-                    "path": path.map(|path| path.to_string_lossy().into_owned())})
+                    let resolution = executor::resolve_executable_detailed(agent);
+                    // configuredMissing / recovered：已保存路径失效、以及是否已自动改用当前 CLI（#2751）。
+                    json!({"id": agent.id, "available": resolution.path.is_some(),
+                    "configuredMissing": resolution.configured_missing,
+                    "recovered": resolution.recovered(),
+                    "path": resolution.path.map(|path| path.to_string_lossy().into_owned())})
                 })
                 .collect();
             let mut tasks = state.tasks.clone();

@@ -919,6 +919,29 @@ pub(crate) fn find_desktop_managed_codex_cli_from_var(
         .map(|(_, exe)| exe)
 }
 
+/// 保存的路径是否指向桌面版托管目录下的 CLI（`bin\codex.exe` 或 `bin\<哈希>\codex.exe`）。
+///
+/// 桌面版更新会删掉旧哈希目录，之前保存的路径随之失效（#2751）。只认这两种布局，
+/// 用户自定义的其他路径不在此列；分隔符和大小写按 Windows 规则归一后比较。
+pub fn is_desktop_managed_codex_cli_path(configured: &str, local_appdata: &Path) -> bool {
+    let normalize = |value: &str| value.replace('\\', "/").to_ascii_lowercase();
+    let bin = local_appdata.join("OpenAI").join("Codex").join("bin");
+    let prefix = format!(
+        "{}/",
+        normalize(&bin.to_string_lossy()).trim_end_matches('/')
+    );
+    normalize(configured.trim())
+        .strip_prefix(&prefix)
+        .is_some_and(|suffix| {
+            let parts: Vec<_> = suffix.split('/').collect();
+            parts == ["codex.exe"]
+                || (parts.len() == 2
+                    && !parts[0].is_empty()
+                    && parts[0].bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && parts[1] == "codex.exe")
+        })
+}
+
 pub fn codex_app_version(app_dir: &Path) -> Option<String> {
     if app_dir.extension() == Some(OsStr::new("app")) {
         return macos_app_version(app_dir);

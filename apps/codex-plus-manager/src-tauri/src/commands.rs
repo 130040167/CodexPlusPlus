@@ -1138,9 +1138,12 @@ fn launch_codex_multi_instance_blocking(request: CodexMultiLaunchRequest) -> Com
     if let Ok(existing) = load_multi_instance_manifest(&root)
         && multi_instance_is_running(&existing)
     {
+        // 运行中的实例不会重新写入供应商配置（#2754：改了 Key 再点「启动」仍用旧配置），
+        // 明确告诉用户要点「重启」，前端据 alreadyRunning 直接展示这句提示。
         return ok(
-            "Codex 多开实例已经在运行。",
+            "Codex 多开实例已经在运行；如刚修改过供应商或 API Key，请在「当前运行实例」中点「重启」使新配置生效。",
             json!({
+                "alreadyRunning": true,
                 "instanceId": existing.instance_id,
                 "profileId": existing.profile_id,
                 "pid": existing.pid,
