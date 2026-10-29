@@ -328,6 +328,12 @@
       .replace(/[^\p{L}\p{N}]+/gu, "");
   }
 
+  function codexPlusModelPickerNativeLabelKey(value) {
+    // 原生会缩写 GPT 前缀与连字符，但仍保留网关用来区分同名供应商的零宽标记。
+    const marks = String(value || "").match(/[\u200b-\u200d\ufeff]/gu)?.join("") || "";
+    return `native\u0000${codexPlusModelPickerNormalizeLoose(value)}\u0000${marks}`;
+  }
+
   /**
    * 目录里的键和选择器里的名字不一定逐字相同。
    *
@@ -429,6 +435,7 @@
       // 宽松归一化会把它们抹掉，必须先按原文比对。
       const rawKey = `raw\u0000${String(displayName).replace(/\s+/g, " ").trim()}`;
       setUnique(rawKey, value);
+      setUnique(codexPlusModelPickerNativeLabelKey(displayName), value);
       const fullKey = codexPlusModelPickerNormalizeLoose(displayName);
       setUnique(fullKey, value);
       const split = codexPlusModelPickerSplitLabel(displayName);
@@ -647,6 +654,7 @@
       const model = codexPlusModelPickerRowModel(row);
       const exactKnown = (model ? exact.get(`model\u0000${model}`) : null)
         || exact.get(`raw\u0000${identity.text}`)
+        || exact.get(codexPlusModelPickerNativeLabelKey(identity.text))
         || exact.get(codexPlusModelPickerNormalizeLoose(identity.text))
         || (pairKey ? exact.get(pairKey) : null);
       const known = exactKnown

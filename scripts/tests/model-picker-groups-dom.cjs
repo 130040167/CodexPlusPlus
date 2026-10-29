@@ -94,16 +94,17 @@ async function main() {
     assert((await picker.innerText()).includes("推荐默认集"));
     assert.equal(await picker.locator("[data-codex-plus-model-ordering]").count(), 0);
     const gateway = {
-      "a/sol": { displayName: "GPT-Sol\u200b", codex_plus_group: "供应商甲", codex_plus_group_id: "a" },
-      "b/sol": { displayName: "GPT-Sol\u200b\u200b", codex_plus_group: "供应商乙", codex_plus_group_id: "b" },
-      sol: { displayName: "GPT-Sol\u200c", codex_plus_group: "自动组", codex_plus_group_id: "codex-plus-gateway-auto" },
+      "a/sol": { displayName: "GPT-6.1-Sol\u200b", codex_plus_group: "供应商甲", codex_plus_group_id: "a" },
+      "b/sol": { displayName: "GPT-6.1-Sol\u200b\u200b", codex_plus_group: "供应商乙", codex_plus_group_id: "b" },
+      sol: { displayName: "GPT-6.1-Sol\u200c", codex_plus_group: "自动组", codex_plus_group_id: "codex-plus-gateway-auto" },
       "group/coding": { displayName: "编程模型组", codex_plus_group: "模型组", codex_plus_group_id: "codex-plus-gateway-groups", codex_plus_favorite: true },
     };
     await page.evaluate(({ metadata, html }) => {
       document.querySelector("._ModelList_test").innerHTML = html;
       window.testPicker.refresh({ status: "ok", models: Object.keys(metadata), modelMetadata: metadata });
       window.testPicker.patch();
-    }, { metadata: gateway, html: `<div data-menu-section-label>选择模型</div>${row("默认", "推荐模型集")}${Object.values(gateway).map(entry => row(entry.displayName)).join("")}` });
+    }, { metadata: gateway, html: `<div data-menu-section-label>选择模型</div>${row("默认", "推荐模型集")}${Object.values(gateway).map(entry =>
+      row(entry.displayName.replace(/^GPT-/u, "").replace(/-/gu, " "))).join("")}` });
     assert.deepEqual(await picker.locator(".codex-plus-model-group-title").allTextContents(), ["供应商甲", "供应商乙", "自动组", "模型组"]);
     const membership = await picker.locator("[data-codex-plus-model-group]").evaluateAll(rows =>
       rows.map(row => row.getAttribute("data-codex-plus-model-group")));
@@ -165,7 +166,7 @@ async function main() {
       const fresh = old.cloneNode(true);
       fresh.querySelectorAll(".codex-plus-model-group-header, .codex-plus-model-group-toolbar").forEach(node => node.remove());
       // clone 不复制 React fiber；用唯一完整名重新渲染真实行。
-      const labels = ["GPT-Sol\u200b", "GPT-Sol\u200b\u200b", "GPT-Sol\u200c", "编程模型组"];
+      const labels = ["6.1 Sol\u200b", "6.1 Sol\u200b\u200b", "6.1 Sol\u200c", "编程模型组"];
       [...fresh.querySelectorAll('[role="menuitemradio"]')].slice(1).forEach((row, n) => {
         (row.querySelector(".codex-plus-model-group-native-label")
           || row.querySelector("[data-menu-row-content] .flex-1 span span")).textContent = labels[n];
