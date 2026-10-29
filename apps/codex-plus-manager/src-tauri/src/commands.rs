@@ -8300,20 +8300,20 @@ pub async fn fetch_relay_profile_models(
     }
 }
 
-/// 识别供应商是不是 sub2api，并顺带取回倍率和余额。供应商卡片在后台静默调用，
-/// 不是 sub2api 也返回 ok，前端按 `isSub2api` 决定是否显示。
+/// 识别供应商是哪种中转站（sub2api / new-api），并顺带取回倍率和余额。供应商卡片在后台静默调用，
+/// 识别不出也返回 ok，前端按 `platform` 决定是否显示。
 #[tauri::command]
-pub async fn probe_sub2api(
+pub async fn probe_relay_billing(
     profile: RelayProfile,
-) -> CommandResult<codex_plus_core::sub2api::Sub2ApiProbe> {
-    let probe = codex_plus_core::sub2api::probe_sub2api(&profile).await;
-    let message = match (&probe.billing, &probe.usage) {
-        (Some(billing), _) => format!(
-            "已识别为 sub2api，倍率 {}x。",
-            format_multiplier(billing.effective_rate_multiplier)
+) -> CommandResult<codex_plus_core::relay_billing::RelayBillingProbe> {
+    let probe = codex_plus_core::relay_billing::probe_relay_billing(&profile).await;
+    let message = match (&probe.platform, &probe.rate) {
+        (Some(platform), Some(rate)) => format!(
+            "已识别为 {platform}，倍率 {}x。",
+            format_multiplier(rate.multiplier)
         ),
-        (None, Some(_)) => "已识别为 sub2api。".to_string(),
-        (None, None) => "不是 sub2api。".to_string(),
+        (Some(platform), None) => format!("已识别为 {platform}。"),
+        (None, _) => "不是已知的中转站。".to_string(),
     };
     ok(&message, probe)
 }

@@ -11772,9 +11772,9 @@ select {
 .relay-tag[data-tone="aggregate"] { border-color: hsl(var(--brand-accent) / 0.4); color: hsl(var(--brand-accent)); }
 .relay-tag[data-tone="protocol"] { border-style: dashed; }
 .relay-tag[data-tone="gateway"] { border-color: hsl(var(--status-success) / 0.4); color: hsl(var(--status-success)); }
-.relay-tag[data-tone="sub2api"] { border-color: hsl(190 70% 55% / 0.4); color: hsl(190 70% 62%); }
-/* sub2api 供应商的倍率 / 余额行：在地址下面，一行放不下就换行。 */
-.relay-sub2api-line {
+.relay-tag[data-tone="billing"] { border-color: hsl(190 70% 55% / 0.4); color: hsl(190 70% 62%); }
+/* 中转站（sub2api / new-api）的倍率 / 余额行：在地址下面，一行放不下就换行。 */
+.relay-billing-line {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -11783,11 +11783,11 @@ select {
   color: hsl(var(--muted-foreground));
   font-size: 12px;
 }
-.relay-sub2api-part { white-space: nowrap; font-variant-numeric: tabular-nums; }
-.relay-sub2api-part + .relay-sub2api-part::before { content: "·"; margin-right: 8px; opacity: 0.6; }
-.relay-sub2api-part[data-tone="warning"] { color: hsl(var(--status-warning)); }
-.relay-sub2api-part[data-tone="danger"] { color: hsl(var(--destructive)); }
-.relay-sub2api-refresh {
+.relay-billing-part { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.relay-billing-part + .relay-billing-part::before { content: "·"; margin-right: 8px; opacity: 0.6; }
+.relay-billing-part[data-tone="warning"] { color: hsl(var(--status-warning)); }
+.relay-billing-part[data-tone="danger"] { color: hsl(var(--destructive)); }
+.relay-billing-refresh {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -11800,12 +11800,12 @@ select {
   cursor: pointer;
   opacity: 0.7;
 }
-.relay-sub2api-refresh:hover:not(:disabled) { background: hsl(var(--muted)); opacity: 1; }
-.relay-sub2api-refresh:disabled { cursor: default; }
-/* 网关供应商池右侧：倍率 + 余额徽章，复用订阅额度徽章（.gw-quota-badge）的样式。 */
-.gw-sub2api-label { font-variant-numeric: tabular-nums; }
-.gw-sub2api-label em { margin-left: 6px; color: hsl(var(--status-warning)); font-style: normal; }
-.gw-sub2api-status { display: inline-flex; align-items: center; gap: 2px; }
+.relay-billing-refresh:hover:not(:disabled) { background: hsl(var(--muted)); opacity: 1; }
+.relay-billing-refresh:disabled { cursor: default; }
+/* 网关供应商池右侧：中转站倍率 + 余额徽章，复用订阅额度徽章（.gw-quota-badge）的样式。 */
+.gw-billing-label { font-variant-numeric: tabular-nums; }
+.gw-billing-label em { margin-left: 6px; color: hsl(var(--status-warning)); font-style: normal; }
+.gw-billing-status { display: inline-flex; align-items: center; gap: 2px; }
 /* 第二行只剩地址：不再用主题色，弱化成辅助信息。 */
 .relay-management-page .relay-summary small {
   overflow: hidden;

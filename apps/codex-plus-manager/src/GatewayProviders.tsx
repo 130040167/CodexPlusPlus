@@ -8,8 +8,8 @@ import { createPortal } from "react-dom";
 import { appConfirm } from "./app-dialog";
 import { Check, ChevronRight, Copy, GripVertical, Plus, RefreshCw, Search, X } from "lucide-react";
 import { t, tf } from "./i18n";
-import { Sub2ApiPoolBadge, Sub2ApiPoolLabel, useSub2ApiProbe } from "./Sub2ApiCardLine";
-import { sub2apiGatewayCacheKey, type Sub2ApiProbe } from "./sub2api-status";
+import { RelayBillingPoolBadge, RelayBillingPoolLabel, useRelayBillingProbe } from "./RelayBillingLine";
+import { relayBillingGatewayCacheKey, type RelayBillingProbe } from "./relay-billing";
 import {
   defaultProviderAgents,
   failureLabel,
@@ -416,9 +416,9 @@ function PoolRow({
   const failures = (payload?.health.keys ?? []).filter((key) => key.relayId === entry.id && key.state !== "ok");
   const breaker = payload?.health.providers.some((item) => item.relayId === entry.id && item.breakerOpen);
   const tone = !enabled ? "off" : status.state === "cooling" ? "error" : "on";
-  const sub2api = useSub2ApiProbe(
-    sub2apiGatewayCacheKey(entry),
-    () => invoke<Partial<Sub2ApiProbe> & { status: string }>("probe_gateway_provider_sub2api", { id: entry.id }),
+  const billing = useRelayBillingProbe(
+    relayBillingGatewayCacheKey(entry),
+    () => invoke<Partial<RelayBillingProbe> & { status: string }>("probe_gateway_provider_billing", { id: entry.id }),
   );
   const sub = (entry.account
     ? [t("订阅登录"), entry.lentToCodex ? t("Codex 正用它登录") : "", tf("{0} 个模型", [entry.models.length])]
@@ -493,11 +493,11 @@ function PoolRow({
             </button>
           ) : null}
           <i className="gw-dot" data-tone={tone} />
-          {/* 订阅账号空闲时显示套餐（和剩余额度），sub2api 显示倍率（和余额），其它供应商显示 Key 数。 */}
+          {/* 订阅账号空闲时显示套餐（和剩余额度），中转站（sub2api / new-api）显示倍率（和余额），其它供应商显示 Key 数。 */}
           {!enabled ? t("已关闭") : status.state === "idle" && entry.account && entry.plan ? entry.plan
-            : status.state === "idle" && sub2api.probe ? <Sub2ApiPoolLabel probe={sub2api.probe} /> : <MemberStatusLabel status={status} />}
+            : status.state === "idle" && billing.probe ? <RelayBillingPoolLabel probe={billing.probe} /> : <MemberStatusLabel status={status} />}
           {enabled && entry.quota ? <QuotaBadge quota={entry.quota} /> : null}
-          {enabled && sub2api.probe ? <Sub2ApiPoolBadge loading={sub2api.loading} onRefresh={sub2api.refresh} probe={sub2api.probe} /> : null}
+          {enabled && billing.probe ? <RelayBillingPoolBadge loading={billing.loading} onRefresh={billing.refresh} probe={billing.probe} /> : null}
         </span>
         <Switch
           disabled={busy !== null}

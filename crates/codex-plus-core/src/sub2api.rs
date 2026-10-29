@@ -2,9 +2,11 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::relay_billing::{
+    BillingTarget, RelayBillingProbe, RelayRateInfo, RelayRateLimitWindow, RelayUsageInfo,
+    get_json,
+};
 use crate::settings::RelayProfile;
-
-const SUB2API_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,48 +43,20 @@ struct Sub2ApiBillingResponse {
 pub async fn fetch_sub2api_billing_info(
     profile: &RelayProfile,
 ) -> anyhow::Result<Sub2ApiBillingInfo> {
-    let (base_url, api_key) = sub2api_request_target(profile)?;
+    let base_url = if profile.upstream_base_url.trim().is_empty() {
+        profile.base_url.trim()
+    } else {
+        profile.upstream_base_url.trim()
+    };
+    if base_url.is_empty() {
+        anyhow::bail!("Base URL 不能为空");
+    }
+    let api_key = crate::relay_config::relay_profile_api_key(profile);
+    if api_key.trim().is_empty() {
+        anyhow::bail!("API Key 不能为空");
+    }
     let client = crate::http_client::proxied_client_for_relay(&profile.user_agent, profile)?;
-    fetch_billing_with_client(&client, &base_url, &api_key).await
-}
-
-/// 识别结果：两个接口任一按 sub2api 的结构返回，就认定是 sub2api。
-/// 新版 sub2api 两个接口都有；老版本没有 `/sub2api/billing`，只能拿到余额。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Sub2ApiProbe {
-    pub is_sub2api: bool,
-    pub billing: Option<Sub2ApiBillingInfo>,
-    pub usage: Option<Sub2ApiUsageInfo>,
-    /// 不是 sub2api 或请求失败时的原因，仅供排查，前端不弹窗。
-    pub detail: String,
-}
-
-/// `/v1/usage` 的余额摘要。sub2api 按 Key 的计费方式分三种返回：
-/// - `keyQuota`：Key 自己设了总额度或限速（`mode = quota_limited`）
-/// - `subscription`：订阅分组，`remaining` 是日/周/月限额里最紧的那个
-/// - `wallet`：钱包余额
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Sub2ApiUsageInfo {
-    pub endpoint: String,
-    pub kind: String,
-    pub is_valid: bool,
-    pub plan_name: Option<String>,
-    pub remaining: Option<f64>,
-    pub quota_limit: Option<f64>,
-    pub quota_used: Option<f64>,
-    pub unit: String,
-    pub rate_limits: Vec<Sub2ApiRateLimitWindow>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Sub2ApiRateLimitWindow {
-    pub window: String,
-    pub limit: f64,
-    pub used: f64,
-    pub remaining: f64,
+    fetch_billing_with_client(&client, base_url, api_key.trim()).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,7 +75,7 @@ struct Sub2ApiUsageResponse {
     #[serde(default)]
     quota: Option<Sub2ApiUsageQuota>,
     #[serde(default)]
-    rate_limits: Vec<Sub2ApiRateLimitWindow>,
+    rate_limits: Vec<RelayRateLimitWindow>,
     #[serde(default)]
     subscription: Option<Value>,
 }
@@ -113,38 +87,12 @@ struct Sub2ApiUsageQuota {
     remaining: f64,
 }
 
-pub async fn fetch_sub2api_usage_info(profile: &RelayProfile) -> anyhow::Result<Sub2ApiUsageInfo> {
-    let (base_url, api_key) = sub2api_request_target(profile)?;
-    let client = crate::http_client::proxied_client_for_relay(&profile.user_agent, profile)?;
-    fetch_usage_with_client(&client, &base_url, &api_key).await
-}
-
-/// 同时请求倍率和余额接口来识别 sub2api。官方登录、聚合、免鉴权供应商不发请求。
-pub async fn probe_sub2api(profile: &RelayProfile) -> Sub2ApiProbe {
-    let not_sub2api = |detail: String| Sub2ApiProbe {
-        is_sub2api: false,
-        billing: None,
-        usage: None,
-        detail,
-    };
-    if crate::official_login::is_official_login_profile(profile)
-        || profile.relay_mode == crate::settings::RelayMode::Aggregate
-        || profile.uses_no_auth()
-    {
-        return not_sub2api("官方登录、聚合或免鉴权供应商不识别 sub2api".to_string());
-    }
-    let (base_url, api_key) = match sub2api_request_target(profile) {
-        Ok(target) => target,
-        Err(error) => return not_sub2api(error.to_string()),
-    };
-    let client = match crate::http_client::proxied_client_for_relay(&profile.user_agent, profile)
-    {
-        Ok(client) => client,
-        Err(error) => return not_sub2api(error.to_string()),
-    };
+/// 同时请求倍率和余额接口，任一按 sub2api 的结构返回就认定是 sub2api。
+/// 新版 sub2api 两个接口都有；老版本没有 `/sub2api/billing`，只能拿到余额。
+pub(crate) async fn probe(target: &BillingTarget) -> RelayBillingProbe {
     let (billing, usage) = tokio::join!(
-        fetch_billing_with_client(&client, &base_url, &api_key),
-        fetch_usage_with_client(&client, &base_url, &api_key),
+        fetch_billing_with_client(&target.client, &target.base_url, &target.api_key),
+        fetch_usage_with_client(&target.client, &target.base_url, &target.api_key),
     );
     let detail = [
         billing.as_ref().err().map(|error| format!("倍率：{error}")),
@@ -154,56 +102,19 @@ pub async fn probe_sub2api(profile: &RelayProfile) -> Sub2ApiProbe {
     .flatten()
     .collect::<Vec<_>>()
     .join("；");
-    let billing = billing.ok();
+    let rate = billing.ok().map(|billing| RelayRateInfo {
+        endpoint: billing.endpoint,
+        multiplier: billing.effective_rate_multiplier,
+        applied_peak_multiplier: billing.applied_peak_multiplier,
+        group: None,
+    });
     let usage = usage.ok();
-    Sub2ApiProbe {
-        is_sub2api: billing.is_some() || usage.is_some(),
-        billing,
+    RelayBillingProbe {
+        platform: (rate.is_some() || usage.is_some()).then(|| "sub2api".to_string()),
+        rate,
         usage,
         detail,
     }
-}
-
-fn sub2api_request_target(profile: &RelayProfile) -> anyhow::Result<(String, String)> {
-    let base_url = if profile.upstream_base_url.trim().is_empty() {
-        profile.base_url.trim()
-    } else {
-        profile.upstream_base_url.trim()
-    };
-    if base_url.is_empty() {
-        anyhow::bail!("Base URL 不能为空");
-    }
-    let api_key = crate::relay_config::relay_profile_api_key(profile);
-    if api_key.trim().is_empty() {
-        anyhow::bail!("API Key 不能为空");
-    }
-    Ok((base_url.to_string(), api_key.trim().to_string()))
-}
-
-async fn get_sub2api_json(
-    client: &reqwest::Client,
-    endpoint: &str,
-    api_key: &str,
-) -> anyhow::Result<String> {
-    let response = client
-        .get(endpoint)
-        .bearer_auth(api_key)
-        .header("x-api-key", api_key)
-        // 卡片后台识别用，上游卡住时不能让刷新一直转。
-        .timeout(SUB2API_REQUEST_TIMEOUT)
-        .send()
-        .await
-        .with_context(|| format!("请求 {endpoint} 失败"))?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        anyhow::bail!(
-            "HTTP {}：{}",
-            status.as_u16(),
-            sub2api_error_message(&body).unwrap_or_else(|| "上游拒绝请求".to_string())
-        );
-    }
-    Ok(body)
 }
 
 async fn fetch_billing_with_client(
@@ -212,7 +123,7 @@ async fn fetch_billing_with_client(
     api_key: &str,
 ) -> anyhow::Result<Sub2ApiBillingInfo> {
     let endpoint = sub2api_billing_endpoint(base_url);
-    let body = get_sub2api_json(client, &endpoint, api_key).await?;
+    let body = get_json(client, &endpoint, Some(api_key)).await?;
     let parsed: Sub2ApiBillingResponse =
         serde_json::from_str(&body).context("倍率接口没有返回有效 JSON")?;
     validate_sub2api_billing_response(&parsed)?;
@@ -233,9 +144,9 @@ async fn fetch_usage_with_client(
     client: &reqwest::Client,
     base_url: &str,
     api_key: &str,
-) -> anyhow::Result<Sub2ApiUsageInfo> {
+) -> anyhow::Result<RelayUsageInfo> {
     let endpoint = sub2api_usage_endpoint(base_url);
-    let body = get_sub2api_json(client, &endpoint, api_key).await?;
+    let body = get_json(client, &endpoint, Some(api_key)).await?;
     let parsed: Sub2ApiUsageResponse =
         serde_json::from_str(&body).context("余额接口返回结构不是 sub2api 用量")?;
     sub2api_usage_info(endpoint, parsed)
@@ -244,7 +155,7 @@ async fn fetch_usage_with_client(
 fn sub2api_usage_info(
     endpoint: String,
     parsed: Sub2ApiUsageResponse,
-) -> anyhow::Result<Sub2ApiUsageInfo> {
+) -> anyhow::Result<RelayUsageInfo> {
     // `mode` 只有这两种取值是 sub2api 独有的形状，其它中转的 /v1/usage 不认。
     let kind = match parsed.mode.as_str() {
         "quota_limited" => "keyQuota",
@@ -258,7 +169,7 @@ fn sub2api_usage_info(
     let remaining = finite(parsed.remaining)
         .or_else(|| finite(parsed.balance))
         .or_else(|| parsed.quota.as_ref().and_then(|quota| finite(Some(quota.remaining))));
-    Ok(Sub2ApiUsageInfo {
+    Ok(RelayUsageInfo {
         endpoint,
         kind: kind.to_string(),
         is_valid: parsed.is_valid,
@@ -334,24 +245,6 @@ fn validate_sub2api_billing_response(response: &Sub2ApiBillingResponse) -> anyho
     Ok(())
 }
 
-fn sub2api_error_message(body: &str) -> Option<String> {
-    let payload: Value = serde_json::from_str(body).ok()?;
-    for path in [&["error", "message"][..], &["message"][..], &["error"][..]] {
-        let mut current = &payload;
-        for key in path {
-            current = current.get(*key)?;
-        }
-        if let Some(message) = current
-            .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            return Some(message.to_string());
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,7 +315,7 @@ mod tests {
         );
     }
 
-    fn parse_usage(body: &str) -> anyhow::Result<Sub2ApiUsageInfo> {
+    fn parse_usage(body: &str) -> anyhow::Result<RelayUsageInfo> {
         sub2api_usage_info(String::new(), serde_json::from_str(body)?)
     }
 
@@ -469,76 +362,6 @@ mod tests {
     fn rejects_usage_shapes_from_other_relays() {
         assert!(parse_usage(r#"{"object":"list","data":[]}"#).is_err());
         assert!(parse_usage(r#"{"mode":"daily","isValid":true}"#).is_err());
-    }
-
-    #[tokio::test]
-    async fn probe_recognizes_old_sub2api_without_billing_endpoint() {
-        use wiremock::matchers::{header, method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/sub2api/billing"))
-            .respond_with(ResponseTemplate::new(404).set_body_string(r#"{"error":{"message":"not found"}}"#))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/v1/usage"))
-            .and(header("authorization", "Bearer sk-test"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"{"mode":"unrestricted","isValid":true,"planName":"钱包余额","remaining":8,"unit":"USD","balance":8}"#,
-            ))
-            .mount(&server)
-            .await;
-        let profile = RelayProfile {
-            base_url: server.uri(),
-            api_key: "sk-test".to_string(),
-            relay_mode: crate::settings::RelayMode::PureApi,
-            ..RelayProfile::default()
-        };
-
-        let probe = probe_sub2api(&profile).await;
-
-        assert!(probe.is_sub2api);
-        assert!(probe.billing.is_none());
-        assert_eq!(probe.usage.unwrap().remaining, Some(8.0));
-        assert!(probe.detail.contains("HTTP 404"));
-    }
-
-    #[tokio::test]
-    async fn probe_reports_non_sub2api_relays() {
-        use wiremock::MockServer;
-
-        let server = MockServer::start().await;
-        let profile = RelayProfile {
-            base_url: server.uri(),
-            api_key: "sk-test".to_string(),
-            relay_mode: crate::settings::RelayMode::PureApi,
-            ..RelayProfile::default()
-        };
-
-        let probe = probe_sub2api(&profile).await;
-
-        assert!(!probe.is_sub2api);
-        assert!(probe.billing.is_none() && probe.usage.is_none());
-    }
-
-    #[tokio::test]
-    async fn probe_skips_profiles_without_upstream_credentials() {
-        let aggregate = RelayProfile {
-            base_url: "http://127.0.0.1:9".to_string(),
-            api_key: "sk-test".to_string(),
-            relay_mode: crate::settings::RelayMode::Aggregate,
-            ..RelayProfile::default()
-        };
-        let missing_key = RelayProfile {
-            base_url: "http://127.0.0.1:9".to_string(),
-            relay_mode: crate::settings::RelayMode::PureApi,
-            ..RelayProfile::default()
-        };
-
-        assert!(!probe_sub2api(&aggregate).await.is_sub2api);
-        assert!(!probe_sub2api(&missing_key).await.is_sub2api);
     }
 
     struct BillingServer {

@@ -290,6 +290,7 @@ const gateway = ok({
     { id: "kimi", name: "Kimi", baseUrl: "https://api.moonshot.cn/v1", protocol: "chatCompletions", official: true, models: ["kimi-k2-turbo"], keyCount: 2 },
     { id: "zhipu", name: "智谱 GLM", baseUrl: "https://open.bigmodel.cn/api/paas/v4", protocol: "chatCompletions", official: true, models: ["glm-5"], keyCount: 1 },
     { id: "sub2api-pool", name: "sub2api 站点（演示）", baseUrl: "https://sub2api.example.com", protocol: "responses", official: false, models: ["gpt-5.5"], keyCount: 1 },
+    { id: "newapi-pool", name: "new-api 站点（演示）", baseUrl: "https://newapi.example.com/v1", protocol: "chatCompletions", official: false, models: ["claude-sonnet-5-5"], keyCount: 1 },
   ],
   groups: [],
   agents: [
@@ -488,25 +489,32 @@ export async function invoke<T = unknown>(command: string, args: Record<string, 
     case "list_local_sessions": return ok({ dbPath: "演示模式", dbPaths: [], sessions: [], offset: 0, limit: 50, hasMore: false, totalCount: 0 }) as T;
     case "load_relay_environment":
     case "check_relay_environment": return ok({ clashVergeTun: { enabled: false, configPath: null }, proxyEnvironment: { variables: [] }, codexEnvFile: { exists: false, path: "" } }) as T;
-    // sub2api 识别：演示供应商（地址含 sub2api）返回倍率与钱包余额，其余视为非 sub2api。
-    case "probe_sub2api": {
+    // 中转站识别：演示供应商按地址返回 sub2api（倍率 + 钱包余额）或 new-api（分组倍率 + Key 额度），其余识别不出。
+    case "probe_relay_billing": {
       const profile = (args as { profile?: { baseUrl?: string } } | undefined)?.profile;
-      if (!profile?.baseUrl?.includes("sub2api")) return ok({ isSub2api: false, billing: null, usage: null, detail: "演示模式" }) as T;
+      if (!profile?.baseUrl?.includes("sub2api")) return ok({ platform: null, rate: null, usage: null, detail: "演示模式" }) as T;
       return ok({
-        isSub2api: true,
-        billing: { endpoint: "https://sub2api.example.com/v1/sub2api/billing", groupRateMultiplier: 0.6, userRateMultiplier: null, resolvedRateMultiplier: 0.6, peakRateEnabled: true, peakRateMultiplier: 1.5, appliedPeakMultiplier: 1.5, effectiveRateMultiplier: 0.9, observedAt: "2026-10-29T10:00:00Z" },
+        platform: "sub2api",
+        rate: { endpoint: "https://sub2api.example.com/v1/sub2api/billing", multiplier: 0.9, appliedPeakMultiplier: 1.5, group: null },
         usage: { endpoint: "https://sub2api.example.com/v1/usage", kind: "wallet", isValid: true, planName: "钱包余额", remaining: 12.345, quotaLimit: null, quotaUsed: null, unit: "USD", rateLimits: [] },
         detail: "",
       }) as T;
     }
-    case "probe_gateway_provider_sub2api": {
-      if ((args as { id?: string }).id !== "sub2api-pool") return ok({ isSub2api: false, billing: null, usage: null, detail: "演示模式" }) as T;
-      return ok({
-        isSub2api: true,
-        billing: { endpoint: "https://sub2api.example.com/v1/sub2api/billing", groupRateMultiplier: 0.28, userRateMultiplier: null, resolvedRateMultiplier: 0.28, peakRateEnabled: false, peakRateMultiplier: null, appliedPeakMultiplier: null, effectiveRateMultiplier: 0.28, observedAt: "2026-10-29T10:00:00Z" },
+    case "probe_gateway_provider_billing": {
+      const id = (args as { id?: string }).id;
+      if (id === "sub2api-pool") return ok({
+        platform: "sub2api",
+        rate: { endpoint: "https://sub2api.example.com/v1/sub2api/billing", multiplier: 0.28, appliedPeakMultiplier: null, group: null },
         usage: { endpoint: "https://sub2api.example.com/v1/usage", kind: "wallet", isValid: true, planName: "钱包余额", remaining: 97505834.07, quotaLimit: null, quotaUsed: null, unit: "USD", rateLimits: [] },
         detail: "",
       }) as T;
+      if (id === "newapi-pool") return ok({
+        platform: "newapi",
+        rate: { endpoint: "https://newapi.example.com/api/log/token", multiplier: 1.5, appliedPeakMultiplier: null, group: "vip" },
+        usage: { endpoint: "https://newapi.example.com/api/usage/token/", kind: "keyQuota", isValid: true, planName: "codex", remaining: 36.5, quotaLimit: 50, quotaUsed: 13.5, unit: "CNY", rateLimits: [] },
+        detail: "",
+      }) as T;
+      return ok({ platform: null, rate: null, usage: null, detail: "演示模式" }) as T;
     }
     default: return ok() as T;
   }

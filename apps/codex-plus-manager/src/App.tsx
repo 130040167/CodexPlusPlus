@@ -244,8 +244,8 @@ import {
   normalizeAggregateDefaultRelayId,
 } from "./aggregate-members";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
-import { sub2apiProbeCacheKey, sub2apiProbeEligible, type Sub2ApiProbe } from "./sub2api-status";
-import { Sub2ApiCardLine, useSub2ApiProbe } from "./Sub2ApiCardLine";
+import { relayBillingCacheKey, relayBillingProbeEligible, type RelayBillingProbe } from "./relay-billing";
+import { RelayBillingLine, useRelayBillingProbe } from "./RelayBillingLine";
 import { apiKeyPreview, createRelayApiKey, normalizeRelayApiKeys, relayProfileWithNormalizedApiKeys, relayProfileWithUpdatedApiKey, type RelayApiKey } from "./provider-api-keys";
 import { relayHeadersValidationMessage, serializeRelayHeaders } from "./relay-headers";
 import { sessionProviderForProtocol } from "./relay-session";
@@ -10803,9 +10803,9 @@ function SortableRelayProfileCard({
   const active = profile.id === form.activeRelayId;
   // 网关托管的供应商：由「Agent 接入」管理，这里只能「使用」（重新接入）。
   const gatewayManaged = profile.id === CODEX_GATEWAY_RELAY_ID;
-  const sub2api = useSub2ApiProbe(
-    !gatewayManaged && sub2apiProbeEligible(profile) ? sub2apiProbeCacheKey(profile) : "",
-    () => invoke<CommandResult<Sub2ApiProbe>>("probe_sub2api", { profile }),
+  const billing = useRelayBillingProbe(
+    !gatewayManaged && relayBillingProbeEligible(profile) ? relayBillingCacheKey(profile) : "",
+    () => invoke<CommandResult<RelayBillingProbe>>("probe_relay_billing", { profile }),
   );
   const style: CSSProperties = {
     transform: CSS.Transform.toString(transform),
@@ -10866,8 +10866,8 @@ function SortableRelayProfileCard({
               : t("使用 Codex 当前登录的 ChatGPT 账号")
             : relayProfileConfigBrief(profile)}
         </small>
-        {sub2api.probe ? (
-          <Sub2ApiCardLine loading={sub2api.loading} onRefresh={sub2api.refresh} probe={sub2api.probe} />
+        {billing.probe ? (
+          <RelayBillingLine loading={billing.loading} onRefresh={billing.refresh} probe={billing.probe} />
         ) : null}
       </span>
       <span className="relay-card-actions">

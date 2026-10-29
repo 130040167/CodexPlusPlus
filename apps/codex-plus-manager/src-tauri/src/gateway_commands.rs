@@ -1288,11 +1288,11 @@ pub struct GatewayBalances {
     pub balances: Vec<codex_plus_core::gateway::balance::ProviderBalance>,
 }
 
-/// 识别网关供应商是不是 sub2api，并取回倍率和余额。Key 只在后端，前端按 id 调。
+/// 识别网关供应商是哪种中转站（sub2api / new-api），并取回倍率和余额。Key 只在后端，前端按 id 调。
 #[tauri::command]
-pub async fn probe_gateway_provider_sub2api(
+pub async fn probe_gateway_provider_billing(
     id: String,
-) -> CommandResult<codex_plus_core::sub2api::Sub2ApiProbe> {
+) -> CommandResult<codex_plus_core::relay_billing::RelayBillingProbe> {
     let relay = GatewayStore::default()
         .load()
         .ok()
@@ -1300,17 +1300,20 @@ pub async fn probe_gateway_provider_sub2api(
     let Some(relay) = relay else {
         return failed(
             &format!("供应商不存在：{id}"),
-            codex_plus_core::sub2api::Sub2ApiProbe {
-                is_sub2api: false,
-                billing: None,
+            codex_plus_core::relay_billing::RelayBillingProbe {
+                platform: None,
+                rate: None,
                 usage: None,
                 detail: String::new(),
             },
         );
     };
-    let probe = codex_plus_core::sub2api::probe_sub2api(&relay).await;
-    let message = if probe.is_sub2api { "已识别为 sub2api。" } else { "不是 sub2api。" };
-    ok(message, probe)
+    let probe = codex_plus_core::relay_billing::probe_relay_billing(&relay).await;
+    let message = match &probe.platform {
+        Some(platform) => format!("已识别为 {platform}。"),
+        None => "不是已知的中转站。".to_string(),
+    };
+    ok(&message, probe)
 }
 
 /// 查池里有余额接口的供应商的余额（联网，每家最多 10 秒）。
