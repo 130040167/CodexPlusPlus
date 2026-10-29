@@ -45,6 +45,7 @@ mod gateway_apply;
 mod gateway_forced_relay;
 mod gateway_restore;
 mod helper_body_limit_settings;
+mod history_turn_recovery;
 mod installers;
 mod issue_20261018_compat;
 mod issue_renderer_regressions;
