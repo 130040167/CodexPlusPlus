@@ -6,11 +6,39 @@ export type ScriptMarketSort = "default" | "updated" | "name";
 
 type SortableMarketScript = { name: string; updatedAt?: string };
 
-/** 解析清单里的更新时间；空串、非法值返回 null（视为「未标注」）。 */
-export function parseMarketTime(value: string | undefined | null): number | null {
+// `YYYY-MM-DD HH:mm[:ss[.sss]]`，后面可跟时区（Z、+08:00、UTC 等）。
+const SPACED_DATE_TIME = /^(\d{4}-\d{2}-\d{2})\s+(\d{1,2})(:\d{2}(?::\d{2}(?:\.\d+)?)?)\s*(.*)$/;
+// 早于 1973 年的数字不当成 Unix 时间（避免把「2026」这种年份当成秒数）。
+const MIN_UNIX_SECONDS = 1e8;
+// 小于这个值按秒，否则按毫秒（1e11 秒已是公元 5000 年后）。
+const UNIX_MS_THRESHOLD = 1e11;
+
+function unixTime(value: number): number | null {
+  if (!Number.isFinite(value) || value < MIN_UNIX_SECONDS) return null;
+  return value < UNIX_MS_THRESHOLD ? Math.round(value * 1000) : Math.round(value);
+}
+
+/**
+ * 解析清单里的更新时间；空串、非法值返回 null（视为「未标注」）。
+ *
+ * 不能直接 `new Date(text)`：「2026-10-29 12:00」这种带空格的写法 Windows WebView2 能解析，
+ * macOS WKWebView 却得到 Invalid Date。这里支持 ISO 8601、`YYYY-MM-DD`、
+ * `YYYY-MM-DD HH:mm[:ss]`（空格换成 T 再解析，不带时区按本地时间）和 Unix 秒 / 毫秒数字。
+ */
+export function parseMarketTime(value: string | number | undefined | null): number | null {
+  if (typeof value === "number") return unixTime(value);
   const text = (value ?? "").trim();
   if (!text) return null;
-  const time = new Date(text).getTime();
+  // 纯数字：Unix 秒 / 毫秒；只有 4 位年份（ISO 8601 的 `YYYY`）交给下面按日期解析，其余当没有时间。
+  if (/^\d+(\.\d+)?$/.test(text) && !/^\d{4}$/.test(text)) return unixTime(Number(text));
+  const spaced = SPACED_DATE_TIME.exec(text);
+  let normalized = text;
+  if (spaced) {
+    const [, date, hour, rest, zone] = spaced;
+    const offset = /^(utc|gmt)$/i.test(zone) ? "Z" : zone;
+    normalized = `${date}T${hour.padStart(2, "0")}${rest}${offset}`;
+  }
+  const time = Date.parse(normalized);
   return Number.isNaN(time) ? null : time;
 }
 

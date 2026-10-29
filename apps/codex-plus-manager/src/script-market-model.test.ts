@@ -13,6 +13,28 @@ test("market time parsing treats empty and invalid values as missing", () => {
   assert.equal(parseMarketTime("2026-10-20T08:00:00Z"), Date.parse("2026-10-20T08:00:00Z"));
 });
 
+test("market time parsing accepts space-separated date times that WKWebView rejects", () => {
+  // 带空格的写法换成 T 再解析：不带时区按本地时间，与 ISO 本地时间写法一致。
+  assert.equal(parseMarketTime("2026-10-29 12:00"), Date.parse("2026-10-29T12:00"));
+  assert.equal(parseMarketTime("2026-10-29 12:00:30"), Date.parse("2026-10-29T12:00:30"));
+  assert.equal(parseMarketTime("2026-10-29  9:05"), Date.parse("2026-10-29T09:05"));
+  assert.equal(parseMarketTime("2026-10-29 12:00:00Z"), Date.parse("2026-10-29T12:00:00Z"));
+  assert.equal(parseMarketTime("2026-10-29 12:00:00 +08:00"), Date.parse("2026-10-29T04:00:00Z"));
+  assert.equal(parseMarketTime("2026-10-29 12:00 UTC"), Date.parse("2026-10-29T12:00Z"));
+  assert.equal(parseMarketTime("2026-10-29 25:99"), null);
+});
+
+test("market time parsing accepts unix seconds and milliseconds", () => {
+  const time = Date.parse("2026-10-29T12:00:00Z");
+  assert.equal(parseMarketTime(String(time / 1000)), time);
+  assert.equal(parseMarketTime(String(time)), time);
+  assert.equal(parseMarketTime(time / 1000), time);
+  assert.equal(parseMarketTime(time), time);
+  // 太小的数字不当成时间戳。
+  assert.equal(parseMarketTime(0), null);
+  assert.equal(parseMarketTime("12345"), null);
+});
+
 test("default sort switches to recently updated only when every script has a date", () => {
   assert.equal(defaultMarketSort([]), "default");
   assert.equal(defaultMarketSort([script("a", "2026-10-01"), script("b")]), "default");
