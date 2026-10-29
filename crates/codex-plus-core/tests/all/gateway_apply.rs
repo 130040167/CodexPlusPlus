@@ -1868,6 +1868,8 @@ fn gateway_catalog_refresh_follows_model_sync_and_pool_changes() {
 
 #[test]
 fn codex_hidden_group_preserves_supplier_models_and_other_groups() {
+    use codex_plus_core::gateway::model_sync::{ModelDiff, append_upstream_models};
+
     let fixture = fixture(57387);
     let ctx = &fixture.ctx;
     std::fs::create_dir_all(&ctx.codex_home).unwrap();
@@ -1884,6 +1886,12 @@ fn codex_hidden_group_preserves_supplier_models_and_other_groups() {
     let (_, first) = create_provider(&ctx.gateway, &input, "", None).unwrap();
     input.name = "Second".into();
     let (_, second) = create_provider(&ctx.gateway, &input, "", None).unwrap();
+    ctx.gateway
+        .update(|gateway| {
+            gateway.auto_models = false;
+            Ok(())
+        })
+        .unwrap();
     let (_, visible_group) = save_group(
         &ctx.gateway,
         &GroupInput {
@@ -1950,6 +1958,56 @@ fn codex_hidden_group_preserves_supplier_models_and_other_groups() {
             .iter()
             .any(|group| group.id == hidden_group)
     );
+
+    append_upstream_models(
+        &ctx.gateway,
+        &second,
+        &ModelDiff {
+            added: vec!["gpt-6.1-terra".into()],
+            ..ModelDiff::default()
+        },
+    )
+    .unwrap();
+    ctx.gateway
+        .update(|gateway| {
+            gateway
+                .providers
+                .iter_mut()
+                .find(|provider| provider.relay.id == first)
+                .unwrap()
+                .upstream_new = vec!["gpt-6.1-terra".into()];
+            Ok(())
+        })
+        .unwrap();
+    refresh_enabled(ctx).unwrap();
+    let catalog = codex_catalog(ctx);
+    let entries = catalog["models"].as_array().unwrap();
+    let terra = entries
+        .iter()
+        .find(|entry| entry["slug"] == "gpt-6.1-terra")
+        .unwrap();
+    assert_eq!(terra["codex_plus_group_id"], second);
+    // 上游检查的待加入项不属于用户已采用的模型池；采用后即时更新两家的归属。
+    append_upstream_models(
+        &ctx.gateway,
+        &first,
+        &ModelDiff {
+            added: vec!["gpt-6.1-terra".into()],
+            ..ModelDiff::default()
+        },
+    )
+    .unwrap();
+    refresh_enabled(ctx).unwrap();
+    let catalog = codex_catalog(ctx);
+    let entries = catalog["models"].as_array().unwrap();
+    assert!(!entries.iter().any(|entry| entry["slug"] == "gpt-6.1-terra"));
+    for id in [&first, &second] {
+        let terra = entries
+            .iter()
+            .find(|entry| entry["slug"] == format!("{id}/gpt-6.1-terra"))
+            .unwrap();
+        assert_eq!(terra["codex_plus_group_id"], id.as_str());
+    }
 
     // 默认恰好是隐藏组时，原生目录仍保留它的能力，但不能重新显示为可选入口。
     let hidden_model = format!("group/{hidden_group}");
