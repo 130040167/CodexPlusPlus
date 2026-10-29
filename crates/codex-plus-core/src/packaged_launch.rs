@@ -47,7 +47,10 @@
 //! 3. cmdlet 是否返回带 `Id` 的对象——决定 [`activate_in_package_context`] 返回的 PID 是否
 //!    可用；返回 [`UNKNOWN_PROCESS_ID`] 说明没报回；
 //! 4. `start /b` 出来的子进程在 cmd.exe 退出后是否继续存活（控制台生命周期）；
-//! 5. 含非 ASCII 的路径（中文用户名）在 cmd 按 OEM 代码页解析 .cmd 时是否仍然正确。
+//! 5. 含非 ASCII 的路径（中文用户名）在 cmd 按 OEM 代码页解析 .cmd 时是否仍然正确；
+//! 6. 包上下文里拉起的 Codex 是否依赖发起激活的 PowerShell 宿主存活（issue #2764：宿主一直
+//!    存活的交互式 shell 能拉起，宿主立刻退出的 Codex++ 拉不起）。主实例兜底因此让宿主活到
+//!    调试端口可连，再看 Codex 在宿主退出后是否仍在（诊断日志的 `codex_pids_after`）。
 //!
 //! 以上任何一条都不要当成已验证；`cargo test` 只覆盖纯函数与 CDP 探测这两块。
 
@@ -69,8 +72,44 @@ pub const WRAPPER_FILE_NAME: &str = "packaged-launch.cmd";
 pub const UNKNOWN_PROCESS_ID: u32 = 0;
 
 /// 激活命令的整体超时。powershell 正常是秒级返回；卡死说明环境异常，交给 fallback。
+///
+/// 必须大于 [`HOST_PORT_WAIT_SECS`]：要求 PowerShell 宿主等端口时，它最多多活这么久。
 #[cfg(windows)]
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 要求 PowerShell 宿主等待调试端口时的上限（秒），见 [`activation_script`]。
+pub const HOST_PORT_WAIT_SECS: u64 = 20;
+
+/// 不能从 Codex++ 进程一路继承给 Codex 的环境变量（issue #2764）。
+///
+/// AUMID 激活（开始菜单同款）由系统代为创建进程，拿的是用户默认环境；包上下文兜底则是
+/// Codex++ → powershell → cmd → Codex 逐级继承，Codex++ 进程环境里的东西会被带进 Codex。
+/// 这里只列「会让 Electron 不按桌面应用启动」的运行时开关：
+/// - `ELECTRON_RUN_AS_NODE`：exe 退化成 Node，遇到 `--remote-debugging-port` 直接报错退出；
+/// - `ELECTRON_NO_ASAR`：关掉 asar 支持，应用包读不出来；
+/// - `NODE_OPTIONS`：主进程按它预加载脚本 / 解析 Node 参数，非法值直接退出。
+///
+/// `CODEX_HOME` / `CODEX_PLUS_STATE_DIR` 等**不**在此列：用户有意设置时，开始菜单启动的
+/// Codex 同样看得到它们，清掉反而让两条启动路径不一致。
+pub const SCRUBBED_CODEX_ENV_VARS: [&str; 3] =
+    ["ELECTRON_RUN_AS_NODE", "ELECTRON_NO_ASAR", "NODE_OPTIONS"];
+
+/// 当前环境里出现了哪些需要清掉的变量。只返回变量名、不读值，供诊断日志使用。
+pub fn present_scrubbed_env_vars(is_set: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    SCRUBBED_CODEX_ENV_VARS
+        .iter()
+        .copied()
+        .filter(|name| is_set(name))
+        .collect()
+}
+
+/// wrapper 里清掉 [`SCRUBBED_CODEX_ENV_VARS`]：不管 cmd 从哪条链继承了环境，
+/// `start` 出来的 Codex 都拿不到这些开关。`set "X="` 在 cmd 里就是删除变量。
+fn push_env_scrub_lines(script: &mut String) {
+    for name in SCRUBBED_CODEX_ENV_VARS {
+        script.push_str(&format!("set \"{name}=\"\r\n"));
+    }
+}
 
 /// CDP 就绪轮询间隔。
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -216,6 +255,7 @@ fn build_wrapper_script_for_port(
     script.push_str("@echo off\r\n");
     // 只 setlocal，不开 delayedexpansion：路径里的 `!` 在 delayedexpansion 下会被吃掉。
     script.push_str("setlocal\r\n");
+    push_env_scrub_lines(&mut script);
     script.push_str(&format!("set \"CODEX_HOME={codex_home_literal}\"\r\n"));
     script.push_str(&format!(
         "set \"CODEX_SQLITE_HOME={sqlite_home_literal}\"\r\n"
@@ -318,7 +358,8 @@ pub const MAIN_WRAPPER_FILE_NAME: &str = "packaged-launch-main.cmd";
 /// - 不设置 `CODEX_HOME` / `CODEX_PLUS_STATE_DIR` / `CODEX_PLUS_MULTI_INSTANCE`，主实例沿用
 ///   默认数据目录与实例身份；
 /// - 参数原样取自 AUMID 激活要用的那份（调试端口 + 用户附加参数），保证两条路径启动出的
-///   实例一致。
+///   实例一致；
+/// - 只清掉 [`SCRUBBED_CODEX_ENV_VARS`]（issue #2764），其余环境原样保留。
 pub fn build_main_instance_wrapper_script(
     executable: &Path,
     args: &[String],
@@ -337,6 +378,7 @@ pub fn build_main_instance_wrapper_script(
     let mut script = String::new();
     script.push_str("@echo off\r\n");
     script.push_str("setlocal\r\n");
+    push_env_scrub_lines(&mut script);
     if let Some(dir) = executable_dir {
         // 与多开 wrapper 一致：尽力切到 exe 所在目录，失败时 cmd 继续执行下一行。
         script.push_str(&format!("cd /d \"{dir}\"\r\n"));
@@ -457,23 +499,34 @@ impl AumidActivationWatch {
 
 /// 拼出在包上下文里执行 wrapper 的 PowerShell 脚本（纯函数，可在 macOS 上单测）。
 ///
-/// 形状是
+/// 核心是
 /// `Invoke-CommandInDesktopPackage -PackageFamilyName '<PFN>' -AppId '<AppId>' -Command 'cmd.exe'
-/// -Args '/d /c "<wrapper>"' -PreventBreakaway`；与社区配方相比只多了两处：
-/// 前置 `$ErrorActionPreference = 'Stop'`（失败要变成非零退出码，否则会被当成激活成功）、
-/// 以及仅在 cmdlet 真报回 `Id` 时输出 `PID=` 标记。所有动态值都走 PowerShell 单引号字面量，
-/// 内部的 `'` 按 `''` 转义。
+/// -Args '/d /c "<wrapper>"' -PreventBreakaway`，外加：
+/// - 前置 `$ErrorActionPreference = 'Stop'`：失败要变成非零退出码，否则会被当成激活成功；
+/// - 输出 UTF-8 并打 `HOST=` 标记（PowerShell 版本 / 是否 64 位），cmdlet 抛错时打 `ERROR=`
+///   标记（异常类型、HRESULT、消息）后 `exit 1`，下次失败能直接从日志看出原因（issue #2747）；
+/// - 仅在 cmdlet 真报回 `Id` 时输出 `PID=` 标记；
+/// - `wait_port` 为 `Some` 时，PowerShell 宿主激活后继续存活，直到该回环端口可连接或
+///   [`HOST_PORT_WAIT_SECS`] 秒耗尽，再输出 `PORT_READY=1/0`。issue #2764 的对照实验里，
+///   同一份 wrapper 在「宿主一直存活」的交互式 PowerShell 里能拉起 Codex，而 Codex++ 的宿主
+///   激活后立刻退出；这里让宿主活过 Codex 的启动阶段，与可用的形态保持一致。
 ///
+/// 所有动态值都走 PowerShell 单引号字面量，内部的 `'` 按 `''` 转义。
 /// 只做形状校验与转义，不查注册表、不碰系统状态。
-pub fn activation_script(app_user_model_id: &str, wrapper_path: &Path) -> anyhow::Result<String> {
+pub fn activation_script(
+    app_user_model_id: &str,
+    wrapper_path: &Path,
+    wait_port: Option<u16>,
+) -> anyhow::Result<String> {
     let (package_family_name, app_id) = split_app_user_model_id(app_user_model_id)?;
-    activation_script_for(&package_family_name, &app_id, wrapper_path)
+    activation_script_for(&package_family_name, &app_id, wrapper_path, wait_port)
 }
 
 fn activation_script_for(
     package_family_name: &str,
     app_id: &str,
     wrapper_path: &Path,
+    wait_port: Option<u16>,
 ) -> anyhow::Result<String> {
     let package_family_name = powershell_literal(package_family_name)?;
     let app_id = powershell_literal(app_id)?;
@@ -483,34 +536,152 @@ fn activation_script_for(
     // cmdlet 报错时让 powershell.exe 以非零码退出；否则「激活失败」会被当成成功，调用方
     // 就不会走 fallback，用户侧表现是点了没反应。
     script.push_str("$ErrorActionPreference = 'Stop'; ");
-    // 返回值不是文档化契约（见模块头）：只有真报回带 Id 的对象时才输出 PID 标记，
-    // 解析侧只认这个前缀，避免把无关数字当成 PID。
-    script.push_str("$created = Invoke-CommandInDesktopPackage ");
+    // 输出重定向到日志文件时默认按 OEM 代码页编码，中文错误会变乱码；设置失败也不影响激活。
+    script.push_str("try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}; ");
+    script.push_str("\"HOST=$($PSVersionTable.PSVersion);X64=$([Environment]::Is64BitProcess)\"; ");
+    script.push_str("try { $created = Invoke-CommandInDesktopPackage ");
     script.push_str(&format!(
         "-PackageFamilyName '{package_family_name}' -AppId '{app_id}' "
     ));
     script.push_str("-Command 'cmd.exe' ");
     script.push_str(&format!("-Args '/d /c \"{wrapper}\"' "));
-    script.push_str("-PreventBreakaway; ");
+    script.push_str("-PreventBreakaway } ");
+    script.push_str(
+        "catch { \"ERROR=$($_.Exception.GetType().FullName) \
+         0x$('{0:X8}' -f $_.Exception.HResult): $($_.Exception.Message)\"; exit 1 }; ",
+    );
+    // 返回值不是文档化契约（见模块头）：只有真报回带 Id 的对象时才输出 PID 标记，
+    // 解析侧只认这个前缀，避免把无关数字当成 PID。
     script.push_str("if ($created -and $created.Id) { \"PID=$($created.Id)\" }");
+    if let Some(port) = wait_port.filter(|port| *port != 0) {
+        // 只看端口能否连上（Codex 是否已启动）；是不是 Codex 的 CDP 由调用方再判。
+        script.push_str(&format!(
+            "; $ready = $false; $deadline = [DateTime]::UtcNow.AddSeconds({HOST_PORT_WAIT_SECS}); \
+             while (-not $ready -and [DateTime]::UtcNow -lt $deadline) {{ \
+             $client = New-Object System.Net.Sockets.TcpClient; \
+             try {{ $ready = $client.ConnectAsync('127.0.0.1', {port}).Wait(500) -and $client.Connected }} \
+             catch {{}} finally {{ $client.Close() }}; \
+             if (-not $ready) {{ Start-Sleep -Milliseconds 250 }} }}; \
+             \"PORT_READY=$([int]$ready)\""
+        ));
+    }
     Ok(script)
 }
 
 /// `powershell.exe` 的参数（`-Command` 之后整段脚本作为一个参数传入，避免二次引用解析）。
+///
+/// `-ExecutionPolicy Bypass` 只作用于本进程，避免机器策略影响 Appx 模块的自动加载；
+/// 与 `claude_localization` 里调用 PowerShell 的形状一致。
 #[cfg(any(windows, test))]
 fn activation_powershell_arguments(script: &str) -> Vec<String> {
     vec![
         "-NoProfile".to_string(),
         "-NonInteractive".to_string(),
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
         "-Command".to_string(),
         script.to_string(),
     ]
 }
 
+/// 系统自带 Windows PowerShell 的绝对路径；拿不到 `SystemRoot` 时退回按 PATH 查找。
+///
+/// 不依赖 PATH：Codex++ 进程的 PATH 可能与用户交互式 shell 不同（issue #2764 的差异排查项）。
+#[cfg(any(windows, test))]
+fn windows_powershell_path(system_root: Option<&std::ffi::OsStr>) -> PathBuf {
+    match system_root.filter(|root| !root.is_empty()) {
+        Some(root) => PathBuf::from(root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe"),
+        None => PathBuf::from("powershell.exe"),
+    }
+}
+
+/// 激活输出（stdout + stderr）落盘的位置：与 wrapper 同目录、同主名。
+///
+/// 用文件而不是管道：包上下文里的 cmd / Codex 若继承了输出句柄，管道会一直等不到 EOF，
+/// 宿主进程早已退出、调用方却卡到超时；文件句柄被继承也不会阻塞任何人。
+pub fn activation_log_path(wrapper_path: &Path) -> PathBuf {
+    wrapper_path.with_extension("activation.log")
+}
+
+/// 包上下文激活的结果与诊断信息（只含包身份、路径、端口与 PowerShell 输出，不含凭据）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PackageContextActivation {
+    /// cmdlet 报回的 PID；没报回时是 [`UNKNOWN_PROCESS_ID`]。
+    pub process_id: u32,
+    /// 要求宿主等端口时的 `PORT_READY` 标记；没要求或没输出时为 `None`。
+    pub port_ready_in_host: Option<bool>,
+    /// `HOST=` 标记：PowerShell 版本与位数。
+    pub host: Option<String>,
+    /// powershell.exe 退出码。
+    pub exit_code: Option<i32>,
+    /// 从拉起 powershell 到它退出的耗时。
+    pub elapsed_ms: u64,
+    /// 截断后的 PowerShell 输出（stdout + stderr）。
+    pub output: String,
+    /// 实际执行的命令：PowerShell 路径 + 参数。
+    pub command: Vec<String>,
+}
+
+/// 诊断日志里保留的 PowerShell 输出上限（字符）。
+const ACTIVATION_OUTPUT_LIMIT: usize = 2000;
+
+impl PackageContextActivation {
+    /// 由 powershell 的退出码与输出组装结果（纯函数，可在任意平台单测）。
+    pub fn from_output(
+        command: Vec<String>,
+        exit_code: Option<i32>,
+        elapsed_ms: u64,
+        output: &str,
+    ) -> Self {
+        // 切到 UTF-8 输出时 .NET 可能先写 BOM，不去掉的话第一行标记会认不出来。
+        let output = output.trim_start_matches('\u{feff}');
+        Self {
+            process_id: parse_reported_process_id(output).unwrap_or(UNKNOWN_PROCESS_ID),
+            port_ready_in_host: activation_marker(output, "PORT_READY=").and_then(|value| {
+                match value {
+                    "1" => Some(true),
+                    "0" => Some(false),
+                    _ => None,
+                }
+            }),
+            host: activation_marker(output, "HOST=").map(str::to_string),
+            exit_code,
+            elapsed_ms,
+            output: truncate_chars(output.trim(), ACTIVATION_OUTPUT_LIMIT),
+            command,
+        }
+    }
+
+    /// 激活失败时给用户看的一句话：优先 `ERROR=` 标记，其次第一行非标记的非空输出。
+    pub fn failure_detail(&self) -> String {
+        activation_marker(&self.output, "ERROR=")
+            .map(str::to_string)
+            .or_else(|| {
+                let unmarked = self
+                    .output
+                    .lines()
+                    .filter(|line| {
+                        let line = line.trim_start();
+                        !["HOST=", "PID=", "PORT_READY="]
+                            .iter()
+                            .any(|marker| line.starts_with(marker))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                first_non_empty_line(&unmarked)
+            })
+            .unwrap_or_else(|| "（无错误输出）".to_string())
+    }
+}
+
 /// 在 MSIX 包上下文里执行 wrapper，返回激活时拿到的进程 PID。
 ///
 /// Windows 实现调用
-/// `powershell.exe -NoProfile -NonInteractive -Command "Invoke-CommandInDesktopPackage …"`；
+/// `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Invoke-CommandInDesktopPackage …"`；
 /// 非 Windows 平台返回 Err（原因见模块头的「平台约定」）。
 ///
 /// 返回值：cmdlet 报回了 `Id` 时是它的 PID，否则是 [`UNKNOWN_PROCESS_ID`]。**不要**把它当成
@@ -521,14 +692,27 @@ pub async fn activate_in_package_context(
     app_user_model_id: &str,
     wrapper_path: &Path,
 ) -> anyhow::Result<u32> {
-    activate_in_package_context_impl(app_user_model_id, wrapper_path).await
+    activate_in_package_context_with_report(app_user_model_id, wrapper_path, None)
+        .await
+        .map(|activation| activation.process_id)
+}
+
+/// 同 [`activate_in_package_context`]，但返回完整诊断，并可要求 PowerShell 宿主等待
+/// `wait_port` 可连接后再退出（见 [`activation_script`]）。
+pub async fn activate_in_package_context_with_report(
+    app_user_model_id: &str,
+    wrapper_path: &Path,
+    wait_port: Option<u16>,
+) -> anyhow::Result<PackageContextActivation> {
+    activate_in_package_context_impl(app_user_model_id, wrapper_path, wait_port).await
 }
 
 #[cfg(windows)]
 async fn activate_in_package_context_impl(
     app_user_model_id: &str,
     wrapper_path: &Path,
-) -> anyhow::Result<u32> {
+    wait_port: Option<u16>,
+) -> anyhow::Result<PackageContextActivation> {
     let (package_family_name, app_id) = split_app_user_model_id(app_user_model_id)?;
     let wrapper_path = wrapper_path.to_path_buf();
     if !wrapper_path.is_file() {
@@ -539,7 +723,12 @@ async fn activate_in_package_context_impl(
     }
 
     let activation = tokio::task::spawn_blocking(move || {
-        activate_in_package_context_blocking(&package_family_name, &app_id, &wrapper_path)
+        activate_in_package_context_blocking(
+            &package_family_name,
+            &app_id,
+            &wrapper_path,
+            wait_port,
+        )
     });
     tokio::time::timeout(ACTIVATION_TIMEOUT, activation)
         .await
@@ -556,7 +745,8 @@ async fn activate_in_package_context_impl(
 async fn activate_in_package_context_impl(
     _app_user_model_id: &str,
     _wrapper_path: &Path,
-) -> anyhow::Result<u32> {
+    _wait_port: Option<u16>,
+) -> anyhow::Result<PackageContextActivation> {
     bail!("包上下文激活仅在 Windows 上可用（MSIX 包身份是 Windows 专有机制）")
 }
 
@@ -565,33 +755,62 @@ fn activate_in_package_context_blocking(
     package_family_name: &str,
     app_id: &str,
     wrapper_path: &Path,
-) -> anyhow::Result<u32> {
+    wait_port: Option<u16>,
+) -> anyhow::Result<PackageContextActivation> {
     use std::os::windows::process::CommandExt;
 
-    let script = activation_script_for(package_family_name, app_id, wrapper_path)?;
-    let output = Command::new("powershell.exe")
-        .args(activation_powershell_arguments(&script))
-        .creation_flags(crate::windows_integration::CREATE_NO_WINDOW)
-        .output()
-        .context("启动 powershell.exe 执行包上下文激活失败")?;
+    let script = activation_script_for(package_family_name, app_id, wrapper_path, wait_port)?;
+    let powershell = windows_powershell_path(std::env::var_os("SystemRoot").as_deref());
+    let arguments = activation_powershell_arguments(&script);
+    let log_path = activation_log_path(wrapper_path);
+    // 日志只是诊断：建不出来（例如被上一次的进程占着）就丢弃输出，不影响激活本身。
+    let (stdout, stderr) = match std::fs::File::create(&log_path)
+        .and_then(|log| log.try_clone().map(|log_for_stderr| (log, log_for_stderr)))
+    {
+        Ok((log, log_for_stderr)) => (Stdio::from(log), Stdio::from(log_for_stderr)),
+        Err(_) => (Stdio::null(), Stdio::null()),
+    };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = first_non_empty_line(&stderr).unwrap_or_else(|| "（无错误输出）".to_string());
-        bail!(
-            "Invoke-CommandInDesktopPackage 激活失败（退出码 {}）：{detail}",
-            output
-                .status
-                .code()
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "unknown".to_string())
-        );
+    let mut command = Command::new(&powershell);
+    command
+        .args(&arguments)
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+    // issue #2764：这些开关会经 powershell → cmd 一路传给 Codex，先在源头去掉。
+    for name in SCRUBBED_CODEX_ENV_VARS {
+        command.env_remove(name);
     }
 
-    Ok(
-        parse_reported_process_id(&String::from_utf8_lossy(&output.stdout))
-            .unwrap_or(UNKNOWN_PROCESS_ID),
-    )
+    let started_at = Instant::now();
+    let status = command
+        .spawn()
+        .with_context(|| format!("启动 {} 执行包上下文激活失败", powershell.display()))?
+        .wait()
+        .context("等待 powershell.exe 执行包上下文激活失败")?;
+    let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let output = std::fs::read(&log_path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+
+    let mut command_shape = vec![powershell.to_string_lossy().into_owned()];
+    command_shape.extend(arguments);
+    let activation =
+        PackageContextActivation::from_output(command_shape, status.code(), elapsed_ms, &output);
+    if !status.success() {
+        bail!(
+            "Invoke-CommandInDesktopPackage 激活失败（退出码 {}，{} ms）：{}；完整输出见 {}",
+            activation
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            activation.elapsed_ms,
+            activation.failure_detail(),
+            log_path.display()
+        );
+    }
+    Ok(activation)
 }
 
 /// 该实例是否已就绪：CDP 端口能连上并返回 Codex 页面 == 启动成功。
@@ -710,7 +929,6 @@ fn powershell_literal(value: &str) -> anyhow::Result<String> {
 }
 
 /// 只认 `PID=<数字>` 这一种输出，避免把 cmdlet 的其它数字输出误当成进程号。
-#[cfg(any(windows, test))]
 fn parse_reported_process_id(stdout: &str) -> Option<u32> {
     stdout.lines().find_map(|line| {
         line.trim()
@@ -720,12 +938,31 @@ fn parse_reported_process_id(stdout: &str) -> Option<u32> {
     })
 }
 
-#[cfg(any(windows, test))]
+/// 取第一行以 `key` 开头的标记值（去掉首尾空白）；值为空视为没有。
+fn activation_marker<'a>(output: &'a str, key: &str) -> Option<&'a str> {
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(key)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+}
+
 fn first_non_empty_line(text: &str) -> Option<String> {
     text.lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(str::to_string)
+}
+
+/// 按字符截断（不切坏多字节字符），超出时以 `…` 结尾。
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut truncated: String = text.chars().take(limit).collect();
+    truncated.push('…');
+    truncated
 }
 
 #[cfg(test)]
@@ -996,7 +1233,7 @@ mod tests {
     #[test]
     fn activation_script_targets_the_package_family_name_and_app_id() {
         let script =
-            activation_script(AUMID, Path::new(r"C:\state dir\packaged-launch.cmd")).unwrap();
+            activation_script(AUMID, Path::new(r"C:\state dir\packaged-launch.cmd"), None).unwrap();
 
         assert!(script.contains("-PackageFamilyName 'OpenAI.Codex_2p2nqsd0c76g0'"));
         assert!(script.contains("-AppId 'App'"));
@@ -1013,7 +1250,7 @@ mod tests {
 
     #[test]
     fn activation_script_escapes_single_quotes_in_the_wrapper_path() {
-        let script = activation_script(AUMID, Path::new(r"C:\Users\O'Brien\w.cmd")).unwrap();
+        let script = activation_script(AUMID, Path::new(r"C:\Users\O'Brien\w.cmd"), None).unwrap();
 
         assert!(script.contains(r#"-Args '/d /c "C:\Users\O''Brien\w.cmd"'"#));
     }
@@ -1029,7 +1266,7 @@ mod tests {
             "OpenAI.Codex_2p2nqsd0c76g0!App!Extra",
         ] {
             assert!(
-                activation_script(aumid, wrapper).is_err(),
+                activation_script(aumid, wrapper, None).is_err(),
                 "AUMID 应当被拒绝：{aumid}"
             );
         }
@@ -1039,8 +1276,202 @@ mod tests {
     fn activation_powershell_arguments_match_the_non_interactive_form() {
         assert_eq!(
             activation_powershell_arguments("Get-Date"),
-            vec!["-NoProfile", "-NonInteractive", "-Command", "Get-Date"]
+            vec![
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "Get-Date"
+            ]
         );
+    }
+
+    #[test]
+    fn activation_script_reports_host_and_cmdlet_errors_without_waiting_by_default() {
+        let script = activation_script(AUMID, Path::new(r"C:\s\w.cmd"), None).unwrap();
+
+        assert!(script.contains("\"HOST=$($PSVersionTable.PSVersion);X64="));
+        // cmdlet 抛错要带上异常类型 / HRESULT / 消息，并以非零码退出（issue #2747 丢了原因）。
+        assert!(script.contains("try { $created = Invoke-CommandInDesktopPackage "));
+        assert!(script.contains("\"ERROR=$($_.Exception.GetType().FullName) 0x$('{0:X8}' -f"));
+        assert!(script.contains("exit 1 }"));
+        assert!(script.contains("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8"));
+        // 多开路径不要求宿主等端口：激活后立即退出，保持原行为。
+        assert!(!script.contains("PORT_READY"));
+        assert!(!script.contains("TcpClient"));
+        assert!(script.ends_with("if ($created -and $created.Id) { \"PID=$($created.Id)\" }"));
+    }
+
+    #[test]
+    fn activation_script_keeps_the_host_alive_until_the_debug_port_listens() {
+        let script = activation_script(AUMID, Path::new(r"C:\s\w.cmd"), Some(9229)).unwrap();
+
+        let pid_marker = script.find("\"PID=$($created.Id)\"").unwrap();
+        let wait = script
+            .find("ConnectAsync('127.0.0.1', 9229).Wait(500)")
+            .unwrap();
+        assert!(pid_marker < wait, "先报 PID，再在宿主里等端口");
+        assert!(script.contains(&format!(
+            "[DateTime]::UtcNow.AddSeconds({HOST_PORT_WAIT_SECS})"
+        )));
+        assert!(script.ends_with("\"PORT_READY=$([int]$ready)\""));
+        // 端口 0 没有意义，不生成等待段。
+        let no_wait = activation_script(AUMID, Path::new(r"C:\s\w.cmd"), Some(0)).unwrap();
+        assert!(!no_wait.contains("PORT_READY"));
+    }
+
+    #[test]
+    fn host_port_wait_fits_inside_the_activation_timeout() {
+        // 宿主等端口的时长必须留出 PowerShell 启动的余量，否则正常启动也会被判超时。
+        const { assert!(HOST_PORT_WAIT_SECS + 5 <= 30) };
+    }
+
+    #[test]
+    fn powershell_path_prefers_the_system_copy_over_path_lookup() {
+        let path = windows_powershell_path(Some(std::ffi::OsStr::new(r"C:\Windows")));
+        let components: Vec<_> = path
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        assert!(components.ends_with(&[
+            "System32".to_string(),
+            "WindowsPowerShell".to_string(),
+            "v1.0".to_string(),
+            "powershell.exe".to_string(),
+        ]));
+        assert_eq!(
+            windows_powershell_path(None),
+            PathBuf::from("powershell.exe")
+        );
+        assert_eq!(
+            windows_powershell_path(Some(std::ffi::OsStr::new(""))),
+            PathBuf::from("powershell.exe")
+        );
+    }
+
+    #[test]
+    fn activation_log_sits_next_to_the_wrapper() {
+        let wrapper = Path::new("state").join(MAIN_WRAPPER_FILE_NAME);
+        assert_eq!(
+            activation_log_path(&wrapper),
+            Path::new("state").join("packaged-launch-main.activation.log")
+        );
+        assert_eq!(
+            activation_log_path(&Path::new("state").join(WRAPPER_FILE_NAME)),
+            Path::new("state").join("packaged-launch.activation.log")
+        );
+    }
+
+    #[test]
+    fn activation_report_parses_markers_from_the_host_output() {
+        let output = "HOST=5.1.26100.1;X64=True\r\nPID=111628\r\nPORT_READY=0\r\n";
+        let report = PackageContextActivation::from_output(
+            vec!["powershell.exe".to_string()],
+            Some(0),
+            1234,
+            output,
+        );
+        assert_eq!(report.process_id, 111628);
+        assert_eq!(report.host.as_deref(), Some("5.1.26100.1;X64=True"));
+        assert_eq!(report.port_ready_in_host, Some(false));
+        assert_eq!(report.exit_code, Some(0));
+        assert_eq!(report.elapsed_ms, 1234);
+
+        let ready = PackageContextActivation::from_output(Vec::new(), Some(0), 0, "PORT_READY=1");
+        assert_eq!(ready.port_ready_in_host, Some(true));
+        assert_eq!(ready.process_id, UNKNOWN_PROCESS_ID);
+        let silent = PackageContextActivation::from_output(Vec::new(), Some(0), 0, "");
+        assert_eq!(silent.port_ready_in_host, None);
+        assert_eq!(silent.host, None);
+        // UTF-8 输出可能带 BOM：第一行的标记照样要认出来。
+        let with_bom = PackageContextActivation::from_output(
+            Vec::new(),
+            Some(0),
+            0,
+            "\u{feff}HOST=5.1;X64=True",
+        );
+        assert_eq!(with_bom.host.as_deref(), Some("5.1;X64=True"));
+    }
+
+    #[test]
+    fn activation_failure_detail_prefers_the_error_marker_over_other_lines() {
+        let report = PackageContextActivation::from_output(
+            Vec::new(),
+            Some(1),
+            10,
+            "HOST=5.1;X64=True\r\nERROR=System.UnauthorizedAccessException 0x80070005: 拒绝访问。\r\n",
+        );
+        assert_eq!(
+            report.failure_detail(),
+            "System.UnauthorizedAccessException 0x80070005: 拒绝访问。"
+        );
+
+        // 没有 ERROR 标记时跳过 HOST 等标记行，取真正的错误输出。
+        let stderr_only = PackageContextActivation::from_output(
+            Vec::new(),
+            Some(1),
+            10,
+            "HOST=5.1;X64=True\r\n\r\nInvoke-CommandInDesktopPackage : 无法识别\r\n",
+        );
+        assert_eq!(
+            stderr_only.failure_detail(),
+            "Invoke-CommandInDesktopPackage : 无法识别"
+        );
+        let empty = PackageContextActivation::from_output(Vec::new(), Some(1), 10, "HOST=5.1");
+        assert_eq!(empty.failure_detail(), "（无错误输出）");
+    }
+
+    #[test]
+    fn activation_report_truncates_long_output_on_char_boundaries() {
+        let long = "错".repeat(ACTIVATION_OUTPUT_LIMIT + 10);
+        let report = PackageContextActivation::from_output(Vec::new(), Some(1), 0, &long);
+        assert_eq!(report.output.chars().count(), ACTIVATION_OUTPUT_LIMIT + 1);
+        assert!(report.output.ends_with('…'));
+        assert_eq!(truncate_chars("短", 5), "短");
+    }
+
+    #[test]
+    fn scrubbed_env_vars_cover_electron_node_mode_and_keep_codex_identity() {
+        for name in ["ELECTRON_RUN_AS_NODE", "ELECTRON_NO_ASAR", "NODE_OPTIONS"] {
+            assert!(SCRUBBED_CODEX_ENV_VARS.contains(&name), "{name}");
+        }
+        // 用户有意设置的 Codex 数据目录 / Codex++ 状态目录不能被清掉。
+        for name in ["CODEX_HOME", "CODEX_SQLITE_HOME", STATE_DIR_ENV, "PATH"] {
+            assert!(!SCRUBBED_CODEX_ENV_VARS.contains(&name), "{name}");
+        }
+        assert_eq!(
+            present_scrubbed_env_vars(|name| name == "NODE_OPTIONS" || name == "PATH"),
+            vec!["NODE_OPTIONS"]
+        );
+        assert!(present_scrubbed_env_vars(|_| false).is_empty());
+    }
+
+    #[test]
+    fn both_wrappers_clear_the_scrubbed_env_vars_before_starting_codex() {
+        let main = build_main_instance_wrapper_script(
+            Path::new(r"C:\app\ChatGPT.exe"),
+            &["--remote-debugging-port=9229".to_string()],
+        )
+        .unwrap();
+        let multi = build_wrapper_script_for_port(
+            Path::new(r"C:\state"),
+            Path::new(r"C:\app\ChatGPT.exe"),
+            Path::new(r"C:\home"),
+            Path::new(r"C:\home"),
+            Path::new(r"C:\user-data"),
+            9333,
+        )
+        .unwrap();
+        for script in [&main, &multi] {
+            let start = script.find("start \"\" /b").unwrap();
+            for name in SCRUBBED_CODEX_ENV_VARS {
+                let clear = script
+                    .find(&format!("set \"{name}=\"\r\n"))
+                    .unwrap_or_else(|| panic!("缺少清除 {name}：{script}"));
+                assert!(clear < start, "{name} 必须在 start 之前清掉");
+            }
+        }
     }
 
     #[test]

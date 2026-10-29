@@ -4686,8 +4686,31 @@ async fn verify_packaged_activation(
     }
 }
 
+/// 宿主已经等过端口时，`wait_for_instance_ready` 至少再等这么久（判 CDP 页面是否就绪）。
+#[cfg(windows)]
+const PACKAGED_CONTEXT_READY_MIN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 与 Codex 主程序同名的进程 PID（仅诊断用：判断 Codex 是「没起来 / 起来又退了」
+/// 还是「活着但没开调试端口」，以及回退前 AUMID 激活是否有残留进程）。
+#[cfg(windows)]
+fn codex_process_ids_for_diagnostics(executable: &Path) -> Vec<u32> {
+    let Some(file_name) = executable.file_name().map(|name| name.to_string_lossy()) else {
+        return Vec::new();
+    };
+    crate::windows_integration::enumerate_processes()
+        .into_iter()
+        .filter(|info| info.exe_file.eq_ignore_ascii_case(&file_name))
+        .map(|info| info.process_id)
+        .collect()
+}
+
 /// 主实例的包上下文兜底启动（issue #2700）：AUMID 激活后进程秒退时，改用
 /// `Invoke-CommandInDesktopPackage` wrapper 带同一份参数拉起 exe，并等待调试端口就绪。
+///
+/// issue #2764：同一份 wrapper 在用户的交互式 PowerShell 里能拉起 Codex，从 Codex++ 里却
+/// 不行。对照差异做了三处收敛：PowerShell 宿主激活后继续存活到端口可连（不再立刻退出）、
+/// 去掉会经 powershell → cmd 继承给 Codex 的 Electron/Node 运行时开关、按系统路径调用
+/// powershell.exe；并把激活的退出码、输出、命令形状与前后的 Codex 进程写进诊断日志。
 ///
 /// 任一步失败都直接返回 Err，让用户立即看到错误，而不是空等注入预算耗尽。
 #[cfg(windows)]
@@ -4704,14 +4727,47 @@ async fn launch_packaged_main_in_package_context(
         &executable,
         &arguments,
     )?;
-    crate::packaged_launch::activate_in_package_context(app_user_model_id, &wrapper_path)
-        .await
-        .context("Codex 通过 AUMID 激活后立即退出，改用包上下文启动也失败")?;
+    // 只记变量名，不记值。
+    let scrubbed_env =
+        crate::packaged_launch::present_scrubbed_env_vars(|name| std::env::var_os(name).is_some());
+    let elevated = crate::windows_integration::current_process_is_elevated();
+    let codex_pids_before = codex_process_ids_for_diagnostics(&executable);
+    let activation = match crate::packaged_launch::activate_in_package_context_with_report(
+        app_user_model_id,
+        &wrapper_path,
+        Some(debug_port),
+    )
+    .await
+    {
+        Ok(activation) => activation,
+        Err(error) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "launcher.packaged_context_main_launch",
+                serde_json::json!({
+                    "app_user_model_id": app_user_model_id,
+                    "wrapper_path": wrapper_path,
+                    "debug_port": debug_port,
+                    "ready": false,
+                    "error": format!("{error:#}"),
+                    "elevated": elevated,
+                    "scrubbed_env": scrubbed_env,
+                    "codex_pids_before": codex_pids_before,
+                }),
+            );
+            // 带上完整错误链：issue #2747 只看到外层一句话，根因被吞掉了。
+            anyhow::bail!("Codex 通过 AUMID 激活后立即退出，改用包上下文启动也失败：{error:#}");
+        }
+    };
+    // 宿主已经等过端口时只补一段短等待，总时长与原先的 30 秒上限保持一致。
+    let ready_timeout = PACKAGED_CONTEXT_READY_TIMEOUT
+        .saturating_sub(std::time::Duration::from_millis(activation.elapsed_ms))
+        .max(PACKAGED_CONTEXT_READY_MIN_WAIT);
     let ready = tokio::task::spawn_blocking(move || {
-        crate::packaged_launch::wait_for_instance_ready(debug_port, PACKAGED_CONTEXT_READY_TIMEOUT)
+        crate::packaged_launch::wait_for_instance_ready(debug_port, ready_timeout)
     })
     .await
     .unwrap_or(false);
+    let codex_pids_after = codex_process_ids_for_diagnostics(&executable);
     let _ = crate::diagnostic_log::append_diagnostic_log(
         "launcher.packaged_context_main_launch",
         serde_json::json!({
@@ -4719,12 +4775,31 @@ async fn launch_packaged_main_in_package_context(
             "wrapper_path": wrapper_path,
             "debug_port": debug_port,
             "ready": ready,
+            "cmd_pid": (activation.process_id != crate::packaged_launch::UNKNOWN_PROCESS_ID)
+                .then_some(activation.process_id),
+            "port_ready_in_host": activation.port_ready_in_host,
+            "host": activation.host,
+            "exit_code": activation.exit_code,
+            "activation_elapsed_ms": activation.elapsed_ms,
+            "activation_output": activation.output,
+            "command": activation.command,
+            "elevated": elevated,
+            "scrubbed_env": scrubbed_env,
+            "codex_pids_before": codex_pids_before,
+            "codex_pids_after": codex_pids_after,
         }),
     );
     if !ready {
         anyhow::bail!(
-            "Codex 通过 AUMID 激活后立即退出，改用包上下文启动后 {} 秒内调试端口 {debug_port} 仍未就绪",
-            PACKAGED_CONTEXT_READY_TIMEOUT.as_secs()
+            "Codex 通过 AUMID 激活后立即退出，改用包上下文启动后 {} 秒内调试端口 {debug_port} 仍未就绪\
+             （宿主内端口{}，当前 Codex 进程 {} 个；详见 codex-plus.log 的 launcher.packaged_context_main_launch）",
+            PACKAGED_CONTEXT_READY_TIMEOUT.as_secs(),
+            match activation.port_ready_in_host {
+                Some(true) => "曾可连接",
+                Some(false) => "始终不可连接",
+                None => "状态未知",
+            },
+            codex_pids_after.len()
         );
     }
     Ok(())
