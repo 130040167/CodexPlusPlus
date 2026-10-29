@@ -59,6 +59,7 @@ mod live_settings_migration;
 mod local_compaction;
 mod local_compaction_settings;
 mod local_config_provider;
+mod managed_session_provider;
 mod map_unlisted_models_proxy;
 mod map_unlisted_models_settings;
 mod model_catalog;

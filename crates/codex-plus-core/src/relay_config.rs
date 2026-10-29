@@ -13,6 +13,13 @@ use crate::settings::{
 
 const RELAY_PROVIDER: &str = "custom";
 const MANAGED_SESSION_PROVIDER: &str = "codex_plus_managed";
+
+#[derive(Clone, Copy)]
+enum ManagedSessionProviderScan {
+    IndexOnly,
+    LegacyRollouts,
+}
+
 const LEGACY_RELAY_PROVIDERS: &[&str] = &["CodexPlusPlus", "CodexPP"];
 const CC_SWITCH_MODEL_CATALOG_FILENAME: &str = "cc-switch-model-catalog.json";
 const CHAT_UPSTREAM_BASE_URL_KEY: &str = "codex_plus_chat_base_url";
@@ -435,7 +442,9 @@ pub fn ensure_active_protocol_proxy_config_in_home(
         changed |= before != after;
     }
 
-    changed |= sync_managed_session_provider(&mut doc, managed_session_provider_needed(home));
+    if settings.active_relay_id != crate::gateway::apply::CODEX_GATEWAY_RELAY_ID {
+        changed |= sync_managed_session_provider(&mut doc, false);
+    }
 
     if !changed {
         return Ok(false);
@@ -462,7 +471,7 @@ fn sync_managed_session_provider(doc: &mut DocumentMut, needed: bool) -> bool {
         None => "openai",
         Some(item) => match item.as_str().map(str::trim).filter(|id| !id.is_empty()) {
             Some(id) => id,
-            None => return false,
+            None => return remove_managed_session_provider(doc),
         },
     }
     .to_string();
@@ -489,7 +498,7 @@ fn sync_managed_session_provider(doc: &mut DocumentMut, needed: bool) -> bool {
         provider = Some(Item::Table(builtin));
     }
     let Some(mut provider) = provider else {
-        return false;
+        return remove_managed_session_provider(doc);
     };
     if let Some(inline) = provider.as_inline_table().cloned() {
         provider = Item::Table(inline.into_table());
@@ -516,14 +525,25 @@ fn sync_managed_session_provider(doc: &mut DocumentMut, needed: bool) -> bool {
     true
 }
 
-fn managed_session_provider_needed(home: &Path) -> bool {
+fn remove_managed_session_provider(doc: &mut DocumentMut) -> bool {
+    doc.get_mut("model_providers")
+        .and_then(Item::as_table_like_mut)
+        .and_then(|providers| providers.remove(MANAGED_SESSION_PROVIDER))
+        .is_some()
+}
+
+fn managed_session_provider_needed(home: &Path, scan: ManagedSessionProviderScan) -> bool {
     let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
     crate::codex_sqlite::codex_session_db_paths_from_home(&home)
         .iter()
-        .any(|path| managed_session_provider_needed_in_db(path, &home))
+        .any(|path| managed_session_provider_needed_in_db(path, &home, scan))
 }
 
-fn managed_session_provider_needed_in_db(path: &Path, home: &Path) -> bool {
+fn managed_session_provider_needed_in_db(
+    path: &Path,
+    home: &Path,
+    scan: ManagedSessionProviderScan,
+) -> bool {
     let Ok(connection) =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
     else {
@@ -538,6 +558,10 @@ fn managed_session_provider_needed_in_db(path: &Path, home: &Path) -> bool {
         .unwrap_or(false)
     {
         return true;
+    }
+
+    if matches!(scan, ManagedSessionProviderScan::IndexOnly) {
+        return false;
     }
 
     // 旧版修复流程可能已经把 state_5.sqlite 中的 provider 改成 custom，
@@ -621,11 +645,33 @@ fn rollout_declares_managed_provider(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-pub fn ensure_managed_session_provider_in_home(home: &Path) -> anyhow::Result<bool> {
+pub fn ensure_managed_session_provider_in_home(
+    home: &Path,
+    settings: &BackendSettings,
+) -> anyhow::Result<bool> {
+    if !settings.relay_profiles_enabled
+        || settings.active_relay_id == crate::gateway::apply::CODEX_GATEWAY_RELAY_ID
+    {
+        return Ok(false);
+    }
+    repair_managed_session_provider_in_home(home, ManagedSessionProviderScan::IndexOnly)
+}
+
+fn repair_managed_session_provider_in_home(
+    home: &Path,
+    scan: ManagedSessionProviderScan,
+) -> anyhow::Result<bool> {
     let path = home.join("config.toml");
     let text = read_optional_text(&path)?;
     let mut doc = parse_toml_document(&text)?;
-    if !sync_managed_session_provider(&mut doc, managed_session_provider_needed(home)) {
+    let has_managed = doc
+        .get("model_providers")
+        .and_then(|providers| providers.get(MANAGED_SESSION_PROVIDER))
+        .is_some();
+    if !sync_managed_session_provider(
+        &mut doc,
+        !has_managed && managed_session_provider_needed(home, scan),
+    ) {
         return Ok(false);
     }
     if read_optional_text(&path)? != text {
@@ -1039,6 +1085,9 @@ pub fn apply_relay_profile_to_home_with_switch_rules_and_proxy_port(
     let previous_model = live_root_model(home);
     let result =
         apply_relay_profile_to_home_inner(home, profile, common_config_contents, proxy_port)?;
+    if profile.id != crate::gateway::apply::CODEX_GATEWAY_RELAY_ID {
+        repair_managed_session_provider_in_home(home, ManagedSessionProviderScan::LegacyRollouts)?;
+    }
     // issue #2081：默认模型变了就记一笔，旧会话迁移留到下次启动前执行（opt-in）。
     let new_model = live_root_model(home);
     if let Err(error) = crate::codex_sqlite::record_pending_thread_model_migration(
@@ -2534,7 +2583,7 @@ fn write_codex_live_atomic(
             let live = read_optional_text(&config_path)?;
             let had_managed = parse_toml_document(&live)
                 .is_ok_and(|live| live.get("model_providers").and_then(|providers| providers.get(MANAGED_SESSION_PROVIDER)).is_some());
-            sync_managed_session_provider(&mut doc, had_managed || managed_session_provider_needed(home));
+            sync_managed_session_provider(&mut doc, had_managed);
             Some(ensure_trailing_newline(doc.to_string()))
         }
         None => None,
@@ -6744,6 +6793,25 @@ http_headers = { "Authorization" = "unused" }
     }
 
     #[test]
+    fn managed_session_provider_removes_stale_alias_when_active_provider_is_unresolved() {
+        for active in ["'missing'", "''", "7", "'broken'"] {
+            for providers in [
+                "[model_providers]\nbroken = 7\n[model_providers.unrelated]\nname = 'Keep'\n[model_providers.codex_plus_managed]\nexperimental_bearer_token = 'synthetic-old'\n",
+                "model_providers = { broken = 7, unrelated = { name = 'Keep' }, codex_plus_managed = { experimental_bearer_token = 'synthetic-old' } }\n",
+            ] {
+                let mut doc = parse_toml_document(&format!("model_provider = {active}\n{providers}")).unwrap();
+                let original_active = doc["model_provider"].to_string();
+                assert!(sync_managed_session_provider(&mut doc, true));
+                assert!(doc["model_providers"].get(MANAGED_SESSION_PROVIDER).is_none());
+                assert_eq!(doc["model_providers"]["unrelated"]["name"].as_str(), Some("Keep"));
+                assert_eq!(doc["model_provider"].to_string(), original_active);
+                assert!(!doc.to_string().contains("synthetic-old"));
+                assert!(!sync_managed_session_provider(&mut doc, true));
+            }
+        }
+    }
+
+    #[test]
     fn managed_session_provider_supports_inline_provider_tables() {
         for text in [
             "model_provider = 'relay'\nmodel_providers = { relay = { name = 'Relay', wire_api = 'responses' }, codex_plus_managed = { name = 'old' } }",
@@ -6777,10 +6845,11 @@ requires_openai_auth = false
 "#,
         )
         .unwrap();
-        assert!(ensure_managed_session_provider_in_home(home.path()).unwrap());
+        let settings = BackendSettings::default();
+        assert!(ensure_managed_session_provider_in_home(home.path(), &settings).unwrap());
         let text = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
         assert!(text.contains("[model_providers.codex_plus_managed]"));
-        assert!(!ensure_managed_session_provider_in_home(home.path()).unwrap());
+        assert!(!ensure_managed_session_provider_in_home(home.path(), &settings).unwrap());
         assert_eq!(
             db.query_row("SELECT model_provider FROM threads", [], |row| row
                 .get::<_, String>(0))
@@ -6824,7 +6893,8 @@ requires_openai_auth = false
         .unwrap();
         drop(db);
 
-        assert!(managed_session_provider_needed_in_db(&db_path, home.path()));
+        assert!(!managed_session_provider_needed_in_db(&db_path, home.path(), ManagedSessionProviderScan::IndexOnly));
+        assert!(managed_session_provider_needed_in_db(&db_path, home.path(), ManagedSessionProviderScan::LegacyRollouts));
         std::fs::write(
             home.path().join("config.toml"),
             r#"model_provider = "custom"
@@ -6836,7 +6906,20 @@ requires_openai_auth = false
 "#,
         )
         .unwrap();
-        assert!(ensure_managed_session_provider_in_home(home.path()).unwrap());
+        let settings = BackendSettings::default();
+        assert!(!ensure_managed_session_provider_in_home(home.path(), &settings).unwrap());
+        assert!(!ensure_active_protocol_proxy_config_in_home(home.path(), &settings).unwrap());
+        apply_pure_api_config_to_home(home.path(), "https://next.invalid/v1", "synthetic-key")
+            .unwrap();
+        let before_switch = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        assert!(!before_switch.contains("[model_providers.codex_plus_managed]"));
+        let profile = RelayProfile {
+            relay_mode: RelayMode::PureApi,
+            base_url: "https://next.invalid/v1".to_string(),
+            api_key: "synthetic-key".to_string(),
+            ..RelayProfile::default()
+        };
+        apply_relay_profile_to_home_with_switch_rules(home.path(), &profile, "").unwrap();
         assert!(
             std::fs::read_to_string(home.path().join("config.toml"))
                 .unwrap()
@@ -6883,6 +6966,57 @@ requires_openai_auth = false
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn managed_session_provider_accepts_symlinked_home_and_rejects_external_rollouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let alias = temp.path().join("alias");
+        std::fs::create_dir(&home).unwrap();
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        let rollout = home.join("legacy.jsonl");
+        std::fs::write(&rollout, "{}").unwrap();
+        let expected = rollout.canonicalize().unwrap();
+        assert_eq!(managed_rollout_path(&alias, &rollout), Some(expected.clone()));
+        assert_eq!(managed_rollout_path(&home, &alias.join("legacy.jsonl")), Some(expected.clone()));
+        assert_eq!(managed_rollout_path(&alias, Path::new("legacy.jsonl")), Some(expected));
+        let external = temp.path().join("external.jsonl");
+        std::fs::write(&external, "{}").unwrap();
+        std::os::unix::fs::symlink(&external, home.join("escape.jsonl")).unwrap();
+        assert!(managed_rollout_path(&alias, Path::new("escape.jsonl")).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_session_provider_accepts_var_and_private_var_home_spellings() {
+        let home = tempfile::Builder::new().prefix("managed-resume-").tempdir_in("/var/tmp").unwrap();
+        let rollout = home.path().join("legacy.jsonl");
+        std::fs::write(&rollout, "{}").unwrap();
+        let canonical_home = home.path().canonicalize().unwrap();
+        let canonical_rollout = rollout.canonicalize().unwrap();
+        assert_eq!(managed_rollout_path(home.path(), &canonical_rollout), Some(canonical_rollout.clone()));
+        assert_eq!(managed_rollout_path(&canonical_home, &rollout), Some(canonical_rollout));
+    }
+
+    #[test]
+    fn managed_session_provider_repair_respects_disabled_profiles_and_gateway_mode() {
+        for (enabled, active_id) in [(false, "relay"), (true, crate::gateway::apply::CODEX_GATEWAY_RELAY_ID)] {
+            let home = tempfile::tempdir().unwrap();
+            let settings = BackendSettings {
+                relay_profiles_enabled: enabled,
+                active_relay_id: active_id.to_string(),
+                ..BackendSettings::default()
+            };
+            let config = "model_provider = 'relay'\n[model_providers.relay]\nname = 'Relay'\n[model_providers.codex_plus_managed]\nname = 'Leave alone'\n";
+            for text in [config, "invalid toml = ["] {
+                std::fs::write(home.path().join("config.toml"), text).unwrap();
+                assert!(!ensure_managed_session_provider_in_home(home.path(), &settings).unwrap());
+                assert_eq!(std::fs::read_to_string(home.path().join("config.toml")).unwrap(), text);
+                assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 1);
+            }
+        }
+    }
+
     #[test]
     fn managed_session_provider_ignores_rollouts_outside_home_and_unrelated_metadata() {
         let temp = tempfile::tempdir().unwrap();
@@ -6913,7 +7047,7 @@ requires_openai_auth = false
             )
             .unwrap();
         }
-        assert!(!managed_session_provider_needed_in_db(&db_path, &home));
+        assert!(!managed_session_provider_needed_in_db(&db_path, &home, ManagedSessionProviderScan::LegacyRollouts));
         assert!(managed_rollout_path(&home, Path::new("local.jsonl")).is_some());
         assert!(managed_rollout_path(&home, &outside).is_none());
     }

@@ -988,6 +988,7 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
     run_activation_provider_sync(&hooks, &settings).await;
     if let Err(error) = codex_plus_core::relay_config::ensure_managed_session_provider_in_home(
         &codex_plus_core::relay_config::default_codex_home_dir(),
+        &settings,
     ) {
         let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
             "launcher.managed_session_provider_repair_failed",
@@ -1122,8 +1123,11 @@ impl LaunchHooks for LauncherHooks {
         }
     }
 
-    fn cleanup_unsupported_config(&self) -> anyhow::Result<()> {
-        self.core.cleanup_unsupported_config()
+    fn cleanup_unsupported_config(
+        &self,
+        settings: &codex_plus_core::settings::BackendSettings,
+    ) -> anyhow::Result<()> {
+        self.core.cleanup_unsupported_config(settings)
     }
 
     async fn run_provider_sync(&self) -> anyhow::Result<()> {
