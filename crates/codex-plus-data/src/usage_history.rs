@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
+mod structured;
 
 const READ_BUDGET: u64 = 8 * 1024 * 1024;
 const FILE_READ_BUDGET: u64 = 512 * 1024;
@@ -39,6 +40,9 @@ pub fn query_history(codex_home: &Path, query: &Value) -> Value {
     let Ok(home) = fs::canonicalize(codex_home) else {
         return json!({"status":"unavailable","complete":false,"message":"本机会话目录尚不可用","records":[],"updatedAt":now.timestamp_millis()});
     };
+    if query["includeActivity"] == true {
+        return structured::query(&home, &options, query);
+    }
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, HistoryIndex>>> = OnceLock::new();
     let Ok(mut cache) = CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock() else {
         return json!({"status":"unavailable","complete":false,"message":"用量索引暂不可用","records":[],"updatedAt":now.timestamp_millis()});
@@ -1397,6 +1401,50 @@ mod tests {
             now.to_rfc3339(),
             (now - ChronoDuration::days(2)).to_rfc3339(),
         )
+    }
+
+    #[test]
+    fn public_query_selects_structured_activity_mode() {
+        let f = Fixture::new();
+        let (now, _) = times();
+        f.write(
+            A,
+            &[
+                context(&now, "model-a", "turn"),
+                tokens(&now, 10, 2, 3),
+                event(&now, "task_complete", "turn"),
+            ],
+        );
+
+        let legacy = f.query(json!({"includeActivity":false}));
+        assert!(legacy.get("periods").is_some());
+        assert!(legacy.get("accountingVersion").is_none());
+
+        let request = json!({"includeActivity":true,"scopeSessionId":A});
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let structured = loop {
+            let response = f.query(request.clone());
+            if response["scan"]["ready"] == true && response["scan"]["processing"] == false {
+                break response;
+            }
+            assert!(Instant::now() < deadline, "structured scan did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(structured["accountingVersion"], 2);
+        assert_eq!(structured["days"][0]["usage"]["totalTokens"], 13);
+        assert_eq!(structured["days"][0]["breakdowns"][0]["model"], "model-a");
+        assert_eq!(structured["days"][0]["breakdowns"][0]["role"], "main");
+        assert_eq!(structured["scopedUsage"]["sessionIds"], json!([A]));
+        assert_eq!(structured["scopedUsage"]["days"][0]["usage"]["totalTokens"], 13);
+        assert!(structured.get("periods").is_none());
+        assert!(structured.get("sessionCursors").is_none());
+        let mut request = request;
+        request["includeSessionCursors"] = json!(false);
+        assert!(f.query(request.clone()).get("sessionCursors").is_none());
+        request["includeSessionCursors"] = json!(true);
+        let cursors = f.query(request)["sessionCursors"].clone();
+        assert_eq!(cursors[0]["sessionId"], A);
+        assert_eq!(cursors[0]["total"]["totalTokens"], 13);
     }
 
     pub(super) fn usage_regression_rows(time: &str) -> Vec<Value> {

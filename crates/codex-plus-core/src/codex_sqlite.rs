@@ -4,6 +4,46 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+/// Return a stable identity for an opened SQLite file.
+///
+/// The provider evidence collector keeps a file handle while a source may be
+/// replaced or rotated. A path and creation time are not sufficient to tell
+/// those files apart, so use the OS file identity when available.
+pub fn opened_file_identity(file: &fs::File) -> std::io::Result<(u64, u64)> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe {
+            GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info)
+                .map_err(|_| std::io::Error::last_os_error())?;
+        }
+        Ok((
+            u64::from(info.dwVolumeSerialNumber),
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ))
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = file;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "opened file identity is unavailable on this platform",
+        ))
+    }
+}
+
 pub fn default_codex_home_dir() -> PathBuf {
     crate::codex_home::default_codex_home_dir()
 }
