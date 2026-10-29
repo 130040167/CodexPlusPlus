@@ -543,16 +543,16 @@ function PoolRow({
                 </button>
               ) : null}
               <EditIcon disabled={busy !== null} label={t("编辑模型列表")} onClick={() => setModelsOpen(true)} />
-              {/* 一键拉上游：新增的直接加进列表，已有的不删；要删下架的进「编辑」。 */}
+              {/* 一键按上游同步：多删少补，上游已没有的删掉、新增的加进来；拉取失败不改列表。 */}
               <button
                 className="gw-text-button gw-sync-button"
                 disabled={busy !== null}
-                onClick={() => void run(`fetch-models:${entry.id}`, "fetch_gateway_provider_models", { id: entry.id }, t("从上游获取"))}
-                title={t("用已保存的 Key 或登录重新获取，新增的模型直接加进列表")}
+                onClick={() => void run(`fetch-models:${entry.id}`, "fetch_gateway_provider_models", { id: entry.id }, t("从上游同步"))}
+                title={t("用已保存的 Key 或登录重新获取，上游已没有的模型移除，新增的加进列表")}
                 type="button"
               >
                 <RefreshCw className={busy === `fetch-models:${entry.id}` ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
-                {t("从上游获取")}
+                {t("从上游同步")}
               </button>
             </div>
           </div>

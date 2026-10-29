@@ -795,35 +795,38 @@ pub async fn check_gateway_provider_models(
     }
 }
 
-/// 供应商详情里的「从上游获取」：上游新增的模型直接加进列表，已有的不删。
+/// 供应商详情里的「从上游同步」：按上游多删少补——上游已没有的从列表删掉，新增的加进来。
+/// 拉取失败或上游返回空列表时不改列表。
 #[tauri::command]
 pub async fn fetch_gateway_provider_models(id: String) -> CommandResult<Option<GatewayPayload>> {
     let result = model_sync::fetch_provider_models(&GatewayStore::default(), &id).await;
     let message = match &result {
-        Ok((_, diff)) if diff.added.is_empty() => format!(
-            "上游有 {} 个模型，列表已是最新。",
-            diff.upstream.len()
-        ),
-        Ok((_, diff)) => format!(
-            "上游有 {} 个模型，已加入 {} 个：{}。",
-            diff.upstream.len(),
-            diff.added.len(),
-            diff.added.join("、")
-        ),
+        Ok((_, diff)) => sync_models_message(diff),
         Err(_) => String::new(),
-    };
-    let gone = result.as_ref().map_or(0, |(_, diff)| diff.removed.len());
-    let message = if gone > 0 {
-        format!("{message}另有 {gone} 个上游已没有，可在「编辑」里移除。")
-    } else {
-        message
     };
     let added = result.as_ref().is_ok_and(|(_, diff)| !diff.added.is_empty());
     let result = refresh_agents(result);
     if added {
         autofill_prices(Some(id));
     }
-    respond(&message, "获取模型列表失败", result)
+    respond(&message, "从上游同步模型失败", result)
+}
+
+/// 「从上游同步」的结果提示：新增、移除各几个（列出模型名），都没有就说已是最新。
+fn sync_models_message(diff: &model_sync::ModelDiff) -> String {
+    let total = diff.upstream.len();
+    let mut parts = Vec::new();
+    if !diff.added.is_empty() {
+        parts.push(format!("新增 {} 个：{}", diff.added.len(), diff.added.join("、")));
+    }
+    if !diff.removed.is_empty() {
+        parts.push(format!("移除 {} 个：{}", diff.removed.len(), diff.removed.join("、")));
+    }
+    if parts.is_empty() {
+        format!("上游有 {total} 个模型，列表已是最新。")
+    } else {
+        format!("上游有 {total} 个模型，{}。", parts.join("；"))
+    }
 }
 
 /// 保存手动编辑或刷新后的模型列表；新加的模型按公开价格表补价格。

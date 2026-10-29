@@ -1399,6 +1399,8 @@ export const EN_PLAIN: Record<string, string> = {
   "用已保存的 Key 或登录重新获取": "Fetch again with the saved key or login",
   "从上游刷新": "Refresh from upstream",
   "用已保存的 Key 或登录重新获取，新增的模型直接加进列表": "Fetch again with the saved key or login; new models are added to the list",
+  "从上游同步": "Sync from upstream",
+  "用已保存的 Key 或登录重新获取，上游已没有的模型移除，新增的加进列表": "Fetch again with the saved key or login; models no longer offered upstream are removed and new ones are added",
   "加入列表": "Add to list",
   "全部加入": "Add all",
   "全部移除": "Remove all",
@@ -3198,6 +3200,11 @@ export const EN_BACKEND: Record<string, string> = {
 // Pattern-based backend translations: [regex, replacement template].
 // Checked when EN_BACKEND exact match fails — covers messages with dynamic values.
 export const EN_BACKEND_PATTERNS: Array<[RegExp, string]> = [
+  [/^上游有 (\d+) 个模型，列表已是最新。$/, "$1 models upstream; the list is already up to date."],
+  [/^上游有 (\d+) 个模型，新增 (\d+) 个：(.+?)；移除 (\d+) 个：(.+)。$/, "$1 models upstream. Added $2: $3. Removed $4: $5."],
+  [/^上游有 (\d+) 个模型，新增 (\d+) 个：(.+)。$/, "$1 models upstream. Added $2: $3."],
+  [/^上游有 (\d+) 个模型，移除 (\d+) 个：(.+)。$/, "$1 models upstream. Removed $2: $3."],
+  [/^从上游同步模型失败：(.+)$/, "Failed to sync models from upstream: $1"],
   [/^已跳过 (.+)，出现更新的版本时再提示。$/, "Skipped $1. You'll be reminded when a newer version is released."],
   [/^保存跳过版本失败：(.+)$/, "Failed to save the skipped version: $1"],
   [/^已从本地导入 (\d+) 个 Skill，默认停用，可在列表中勾选启用。$/, "Imported $1 skill(s) from the local folder. They start disabled; enable them in the list."],
