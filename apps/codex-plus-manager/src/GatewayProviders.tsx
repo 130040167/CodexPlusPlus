@@ -42,9 +42,10 @@ import {
 import { AgentIcon, Avatar, KeyCount, MemberStatusLabel, QuotaBadge, QuotaWindows, Switch, type Notify, type Run } from "./gateway-ui";
 import { ProviderFormDialog, type ProviderFormState } from "./ProviderFormDialog";
 import { ProviderExtrasDialog, ProviderLimitsDialog, keyLimitSummary, priceSummary } from "./ProviderExtrasDialog";
-import { ProviderWindowsDialog, windowSummary } from "./ProviderWindowsDialog";
+import { ProviderWindowsDialog, windowSummary, withUnlistedWindows } from "./ProviderWindowsDialog";
 import { ProviderReasoningDialog, reasoningSummary } from "./ProviderReasoningDialog";
 import { ProviderModelsDialog } from "./ProviderModelsDialog";
+import { ProviderSyncDialog } from "./ProviderSyncDialog";
 import { ProviderKeyList } from "./ProviderKeyList";
 import { ProviderTestDialog } from "./ProviderTestDialog";
 import { gatewayJump } from "./gateway-store";
@@ -164,9 +165,22 @@ export function ProvidersView({
   };
 
   const { login, pending: loginPending, dialog: loginDialog } = useAccountLogin(run, notify);
+  // 编辑弹窗里打开的上下文窗口弹窗：按编辑中的模型列表列出（null 表示没打开）。
+  const [formWindows, setFormWindows] = useState<string[] | null>(null);
+  // 编辑中的供应商取最新数据（窗口刚保存过，弹窗里要显示新的）。
+  const editingEntry = form?.mode === "edit" ? pool.find((entry) => entry.id === form.entry.id) ?? form.entry : null;
+  const closeForm = () => {
+    setForm(null);
+    setFormWindows(null);
+  };
   const saveEdit = async (draft: ProviderDraft) => {
     if (form?.mode !== "edit") return;
-    if (await run(`edit:${form.entry.id}`, "update_gateway_provider", { id: form.entry.id, input: providerInput(draft) }, t("保存供应商"))) setForm(null);
+    if (await run(`edit:${form.entry.id}`, "update_gateway_provider", { id: form.entry.id, input: providerInput(draft) }, t("保存供应商"))) closeForm();
+  };
+  const saveFormWindows = async (modelWindows: Record<string, number>, fallback: number | null) => {
+    if (!editingEntry || !formWindows) return;
+    const windows = withUnlistedWindows(editingEntry, formWindows, modelWindows);
+    if (await run(`windows:${editingEntry.id}`, "save_gateway_provider_windows", { id: editingEntry.id, windows, fallback }, t("保存上下文窗口"))) setFormWindows(null);
   };
 
   return (
@@ -246,7 +260,25 @@ export function ProvidersView({
       ) : null}
       {adding ? <ProviderAdder busy={busy} notify={notify} onClose={() => setAdding(false)} payload={payload} run={run} startWith={adding === "import" ? "import" : "catalog"} /> : null}
       {loginDialog}
-      {form ? <ProviderFormDialog busy={busy} form={form} onCancel={() => setForm(null)} onSubmit={(draft) => void saveEdit(draft)} /> : null}
+      {form ? (
+        <ProviderFormDialog
+          busy={busy}
+          form={form}
+          onCancel={closeForm}
+          onEditWindows={(models) => setFormWindows(models)}
+          onSubmit={(draft) => void saveEdit(draft)}
+          windowsEntry={editingEntry ?? undefined}
+        />
+      ) : null}
+      {/* 编辑弹窗里的「上下文窗口」：复用详情里的窗口弹窗，叠在编辑弹窗上，存完回到编辑弹窗。 */}
+      {editingEntry && formWindows ? (
+        <ProviderWindowsDialog
+          busy={busy !== null}
+          entry={{ ...editingEntry, models: formWindows }}
+          onCancel={() => setFormWindows(null)}
+          onSave={(modelWindows, fallback) => void saveFormWindows(modelWindows, fallback)}
+        />
+      ) : null}
     </>
   );
 }
@@ -450,6 +482,10 @@ function PoolRow({
     if (await run(`windows:${entry.id}`, "save_gateway_provider_windows", { id: entry.id, windows: modelWindows, fallback }, t("保存上下文窗口"))) setWindowsOpen(false);
   };
   const newModels = entry.upstreamNew?.length ?? 0;
+  const [syncOpen, setSyncOpen] = useState(false);
+  const applySync = async (remove: string[], add: string[]) => {
+    if (await run(`sync-models:${entry.id}`, "apply_gateway_provider_models_sync", { id: entry.id, remove, add }, t("从上游同步"))) setSyncOpen(false);
+  };
   const saveModels = async (models: string[], defaultModel: string) => {
     if (await run(`models:${entry.id}`, "save_gateway_provider_models", { id: entry.id, models, defaultModel }, t("保存模型列表"))) setModelsOpen(false);
   };
@@ -546,15 +582,15 @@ function PoolRow({
                 </button>
               ) : null}
               <EditIcon disabled={busy !== null} label={t("编辑模型列表")} onClick={() => setModelsOpen(true)} />
-              {/* 一键按上游同步：多删少补，上游已没有的删掉、新增的加进来；拉取失败不改列表。 */}
+              {/* 从上游同步（#2785）：先拉上游列出差异，勾选要删、要加的再写入；拉取失败不改列表。 */}
               <button
                 className="gw-text-button gw-sync-button"
                 disabled={busy !== null}
-                onClick={() => void run(`fetch-models:${entry.id}`, "fetch_gateway_provider_models", { id: entry.id }, t("从上游同步"))}
-                title={t("用已保存的 Key 或登录重新获取，上游已没有的模型移除，新增的加进列表")}
+                onClick={() => setSyncOpen(true)}
+                title={t("用已保存的 Key 或登录拉取上游模型，先列出差异，勾选后再改列表")}
                 type="button"
               >
-                <RefreshCw className={busy === `fetch-models:${entry.id}` ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
+                <RefreshCw className={busy === `sync-models:${entry.id}` ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
                 {t("从上游同步")}
               </button>
             </div>
@@ -679,6 +715,9 @@ function PoolRow({
         </div>
       ) : null}
       {testKey !== undefined ? <ProviderTestDialog entry={entry} keyId={testKey} onClose={() => setTestKey(undefined)} /> : null}
+      {syncOpen ? (
+        <ProviderSyncDialog busy={busy !== null} entry={entry} onApply={(remove, add) => void applySync(remove, add)} onCancel={() => setSyncOpen(false)} />
+      ) : null}
       {modelsOpen ? (
         <ProviderModelsDialog busy={busy !== null} entry={entry} onCancel={() => setModelsOpen(false)} onSave={(models, defaultModel) => void saveModels(models, defaultModel)} />
       ) : null}
