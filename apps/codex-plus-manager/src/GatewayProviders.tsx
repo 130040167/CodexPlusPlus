@@ -32,6 +32,7 @@ import {
   type ProviderDraft,
   type ProviderPrice,
   maskAccountName,
+  isDirectProxy,
   type ImportCandidate,
   type ImportSource,
 } from "./gateway-model";
@@ -603,7 +604,7 @@ function PoolRow({
           <div className="gw-detail-row">
             <span className="gw-detail-label">{t("代理")}</span>
             <div className="gw-detail-value gw-chip-row">
-              {entry.proxy ? <code className="gw-chip">{entry.proxy}</code> : <span className="gw-muted">{t("沿用系统代理")}</span>}
+              {isDirectProxy(entry.proxy) ? <span>{t("不使用代理（直连）")}</span> : entry.proxy ? <code className="gw-chip">{entry.proxy}</code> : <span className="gw-muted">{t("沿用系统代理")}</span>}
               <button className="gw-text-button" disabled={busy !== null} onClick={() => setExtrasOpen("proxy")} type="button">{t("编辑")}</button>
             </div>
           </div>

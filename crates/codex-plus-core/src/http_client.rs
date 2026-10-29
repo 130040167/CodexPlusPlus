@@ -46,7 +46,10 @@ fn build_proxied_client_with_timeouts(
     if let Some(policy) = redirect {
         builder = builder.redirect(policy);
     }
-    if let Some(proxy) = proxy_override
+    if proxy_override.is_some_and(crate::relay_proxy::is_direct_proxy) {
+        // 供应商设成直连：系统代理、PAC 和代理环境变量一律不用（#2760）。
+        builder = builder.no_proxy();
+    } else if let Some(proxy) = proxy_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)

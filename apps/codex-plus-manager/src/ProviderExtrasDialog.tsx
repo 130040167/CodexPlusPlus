@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { t, tf } from "./i18n";
 import { AppSelect } from "./AppSelect";
-import { maskAccountName, parseKeyLimit, type GatewayPoolEntry, type ProviderPrice } from "./gateway-model";
+import { DIRECT_PROXY, isDirectProxy, maskAccountName, parseKeyLimit, proxyAddressError, type GatewayPoolEntry, type ProviderPrice } from "./gateway-model";
 import {
   EMPTY_PRICE_ROW,
   formatPrice,
@@ -86,12 +86,18 @@ export function ProviderExtrasDialog({
     return initial;
   });
   const [currency, setCurrency] = useState(() => Object.values(entry.modelPrices ?? {})[0]?.currency || entry.price?.currency || "USD");
-  const [proxy, setProxy] = useState(entry.proxy ?? "");
+  // 代理三种：沿用系统代理（留空）、单独代理（填地址）、不使用代理（直连，#2760）。
+  const [proxyMode, setProxyMode] = useState<"system" | "custom" | "direct">(
+    isDirectProxy(entry.proxy) ? "direct" : (entry.proxy ?? "").trim() ? "custom" : "system",
+  );
+  const [proxy, setProxy] = useState(isDirectProxy(entry.proxy) ? "" : entry.proxy ?? "");
   const [price, setPrice] = useState<PriceState>({ state: "idle" });
   const setRow = (model: string, patch: Partial<PriceRow>) => setRows((previous) => ({ ...previous, [model]: { ...(previous[model] ?? EMPTY_PRICE_ROW), ...patch } }));
-  const proxyError = proxy.trim() && !/^(https?|socks5h?):\/\/\S+$/i.test(proxy.trim())
-    ? t("代理地址要写成 http://主机:端口（也支持 https:// 与 socks5://）")
-    : "";
+  const proxyValue = proxyMode === "direct" ? DIRECT_PROXY : proxyMode === "custom" ? proxy.trim() : "";
+  const proxyAddressProblem = proxyMode === "custom" ? proxyAddressError(proxy) : null;
+  const proxyError = proxyAddressProblem
+    ? t(proxyAddressProblem)
+    : proxyMode === "custom" && !proxy.trim() ? t("请填写代理地址") : "";
 
   // Esc 栈：币种下拉开着时 Esc 只关下拉，不会把整个价格弹窗（和填了一半的价格）关掉。
   useEscapeLayer(true, onCancel);
@@ -131,7 +137,7 @@ export function ProviderExtrasDialog({
         onSubmit={(event) => {
           event.preventDefault();
           if (section === "proxy") {
-            if (!proxyError) onSave(entry.price ?? null, null, proxy.trim());
+            if (!proxyError) onSave(entry.price ?? null, null, proxyValue);
             return;
           }
           const perModel: Record<string, PriceRow> = { ...rows };
@@ -194,8 +200,27 @@ export function ProviderExtrasDialog({
           </section>
           ) : (
           <section className="pf-section">
-            <h4>{t("代理")}<small>{t("只这个供应商单独走的 HTTP 代理，留空沿用系统代理")}</small></h4>
-            <Input className="pf-mono" onChange={(event) => setProxy(event.currentTarget.value)} placeholder="http://127.0.0.1:7890" spellCheck={false} value={proxy} />
+            <h4>{t("代理")}<small>{t("这个供应商的请求怎么走代理")}</small></h4>
+            <div className="pf-seg" role="radiogroup" aria-label={t("代理")}>
+              {([
+                ["system", t("沿用系统代理")],
+                ["custom", t("单独代理")],
+                ["direct", t("不使用代理（直连）")],
+              ] as const).map(([mode, label]) => (
+                <button aria-checked={proxyMode === mode} data-active={proxyMode === mode} key={mode} onClick={() => setProxyMode(mode)} role="radio" type="button">
+                  {label}
+                </button>
+              ))}
+            </div>
+            {proxyMode === "custom" ? (
+              <Input autoFocus className="pf-mono" onChange={(event) => setProxy(event.currentTarget.value)} placeholder="http://127.0.0.1:7890" spellCheck={false} value={proxy} />
+            ) : (
+              <p className="pf-hint">
+                {proxyMode === "direct"
+                  ? t("不走系统代理和代理环境变量，直接连这个供应商；适合国内可直连的中转。")
+                  : t("跟随系统代理（以及代理环境变量）；没有设置系统代理时就是直连。")}
+              </p>
+            )}
           </section>
           )}
         </div>

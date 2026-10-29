@@ -1124,14 +1124,27 @@ export function priceFromDraft(draft: ProviderDraft): ProviderPrice | null {
   return price.input || price.cachedInput || price.output ? price : null;
 }
 
+/** 供应商代理设成这个值：不走任何代理，直接连上游（与后端 `relay_proxy::DIRECT_PROXY` 一致，#2760）。 */
+export const DIRECT_PROXY = "direct";
+
+export function isDirectProxy(proxy: string | undefined): boolean {
+  return (proxy ?? "").trim().toLowerCase() === DIRECT_PROXY;
+}
+
+/** 代理地址格式错误时返回中文错误原文；留空或直连都合法。 */
+export function proxyAddressError(proxy: string): string | null {
+  const value = proxy.trim();
+  if (!value || isDirectProxy(value)) return null;
+  return /^(https?|socks5h?):\/\/\S+$/i.test(value) ? null : "代理地址要写成 http://主机:端口（也支持 https:// 与 socks5://）";
+}
+
 /** 表单校验：返回中文错误原文，没问题返回 null。编辑时可以不填 Key。 */
 export function validateProviderDraft(draft: ProviderDraft, editing = false): string | null {
   if (!draft.name.trim()) return "请填写名称";
   if (!/^https?:\/\/\S+$/i.test(draft.baseUrl.trim())) return "地址要以 http:// 或 https:// 开头";
   if (!editing && !draft.keys.trim()) return "请填写 API Key";
   if (!draft.model.trim() && splitModels(draft.modelList).length === 0) return "至少填一个模型";
-  if (draft.proxy.trim() && !/^(https?|socks5h?):\/\/\S+$/i.test(draft.proxy.trim())) return "代理地址要写成 http://主机:端口（也支持 https:// 与 socks5://）";
-  return null;
+  return proxyAddressError(draft.proxy);
 }
 
 /* —————————————— 用量 —————————————— */

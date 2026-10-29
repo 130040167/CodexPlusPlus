@@ -13,6 +13,12 @@ test("价格和代理是两个弹窗，各自保存时不动另一项", () => {
   assert.match(providers, /setExtrasOpen\("price"\)/);
   assert.match(providers, /setExtrasOpen\("proxy"\)/);
   const dialog = read("ProviderExtrasDialog.tsx");
-  assert.match(dialog, /onSave\(entry\.price \?\? null, null, proxy\.trim\(\)\)/);
+  assert.match(dialog, /onSave\(entry\.price \?\? null, null, proxyValue\)/);
   assert.match(dialog, /modelPricesFromRows\(perModel, currency\), entry\.proxy \?\? ""\)/);
+});
+
+test("代理三种：沿用系统代理、单独代理、不使用代理（直连）（#2760）", () => {
+  const dialog = read("ProviderExtrasDialog.tsx");
+  assert.match(dialog, /proxyMode === "direct" \? DIRECT_PROXY : proxyMode === "custom" \? proxy\.trim\(\) : ""/);
+  assert.match(read("GatewayProviders.tsx"), /isDirectProxy\(entry\.proxy\) \? <span>\{t\("不使用代理（直连）"\)\}/);
 });

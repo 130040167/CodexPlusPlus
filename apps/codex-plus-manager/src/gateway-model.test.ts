@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
 import {
+  isDirectProxy,
+  proxyAddressError,
   agentModels,
   bindingFromDraft,
   blankBinding,
@@ -429,4 +431,15 @@ test("供应商池详情能编辑每个 Key 的限速", () => {
   const providers = readFileSync(new URL("./GatewayProviders.tsx", import.meta.url), "utf8");
   assert.match(providers, /"save_gateway_provider_limits", \{ id: entry\.id, rpm, concurrency \}/);
   assert.match(lib, /gateway_commands::save_gateway_provider_limits,/);
+});
+
+test("供应商代理：留空和直连都合法，直连不分大小写（#2760）", () => {
+  assert.equal(proxyAddressError(""), null);
+  assert.equal(proxyAddressError(" direct "), null);
+  assert.equal(proxyAddressError("DIRECT"), null);
+  assert.equal(proxyAddressError("socks5://127.0.0.1:1080"), null);
+  assert.match(proxyAddressError("127.0.0.1:7890") ?? "", /代理地址要写成/);
+  assert.equal(isDirectProxy("Direct"), true);
+  assert.equal(isDirectProxy(""), false);
+  assert.equal(isDirectProxy("http://direct.example:8080"), false);
 });

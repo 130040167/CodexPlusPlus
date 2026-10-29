@@ -67,10 +67,20 @@ pub fn configured_proxy_for_profile(profile_id: &str) -> Option<String> {
         .or_else(|| non_empty_proxy(std::env::var("CODEX_PLUS_PROXY").ok()))
 }
 
+/// 网关供应商的代理设成这个值：不走任何代理（不看系统代理和代理环境变量），直接连上游（#2760）。
+pub const DIRECT_PROXY: &str = "direct";
+
+/// 代理设置是不是「直连」。
+pub fn is_direct_proxy(proxy: &str) -> bool {
+    proxy.trim().eq_ignore_ascii_case(DIRECT_PROXY)
+}
+
 /// 供应商实际要用的代理。网关供应商（`gateway_proxy` 为 Some）只看自己的设置，
-/// 没填时退回进程级的 `CODEX_PLUS_PROXY`；直连模式的按 id 查。
+/// 没填时退回进程级的 `CODEX_PLUS_PROXY`；设成直连时原样返回 [`DIRECT_PROXY`]，
+/// 由建 client 的地方关掉所有代理。直连模式的按 id 查。
 pub fn proxy_for_relay(relay: &crate::settings::RelayProfile) -> Option<String> {
     match &relay.gateway_proxy {
+        Some(proxy) if is_direct_proxy(proxy) => Some(DIRECT_PROXY.to_string()),
         Some(proxy) => non_empty_proxy(Some(proxy.clone()))
             .or_else(|| non_empty_proxy(std::env::var("CODEX_PLUS_PROXY").ok())),
         None => configured_proxy_for_profile(&relay.id),
