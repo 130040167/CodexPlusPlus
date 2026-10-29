@@ -11772,6 +11772,36 @@ select {
 .relay-tag[data-tone="aggregate"] { border-color: hsl(var(--brand-accent) / 0.4); color: hsl(var(--brand-accent)); }
 .relay-tag[data-tone="protocol"] { border-style: dashed; }
 .relay-tag[data-tone="gateway"] { border-color: hsl(var(--status-success) / 0.4); color: hsl(var(--status-success)); }
+.relay-tag[data-tone="sub2api"] { border-color: hsl(190 70% 55% / 0.4); color: hsl(190 70% 62%); }
+/* sub2api 供应商的倍率 / 余额行：在地址下面，一行放不下就换行。 */
+.relay-sub2api-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px 8px;
+  min-width: 0;
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+}
+.relay-sub2api-part { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.relay-sub2api-part + .relay-sub2api-part::before { content: "·"; margin-right: 8px; opacity: 0.6; }
+.relay-sub2api-part[data-tone="warning"] { color: hsl(var(--status-warning)); }
+.relay-sub2api-part[data-tone="danger"] { color: hsl(var(--destructive)); }
+.relay-sub2api-refresh {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.7;
+}
+.relay-sub2api-refresh:hover:not(:disabled) { background: hsl(var(--muted)); opacity: 1; }
+.relay-sub2api-refresh:disabled { cursor: default; }
 /* 第二行只剩地址：不再用主题色，弱化成辅助信息。 */
 .relay-management-page .relay-summary small {
   overflow: hidden;

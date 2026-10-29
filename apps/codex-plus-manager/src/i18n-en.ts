@@ -2650,10 +2650,26 @@ export const EN_PLAIN: Record<string, string> = {
   "移除": "Remove",
   "Codex 配置里残留了旧版本写入的 Codex++ Computer Use 条目，会和 Codex 自带的重复，可能出现 ambiguous 报错。移除后重启 Codex 生效。":
     "Codex's config still has a Codex++ Computer Use entry left by an older version. It duplicates Codex's built-in Computer Use and can cause \"ambiguous\" errors. Remove it, then restart Codex.",
+  // sub2api 倍率 / 余额
+  "Key 已失效": "Key is no longer valid",
+  "这个 sub2api 版本没有倍率接口": "This sub2api version has no rate endpoint",
+  "余额接口不可用": "Balance endpoint unavailable",
+  "刷新 sub2api 倍率和余额": "Refresh sub2api rate and balance",
 };
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  // sub2api 倍率 / 余额
+  "倍率 {0}": "Rate {0}",
+  "含高峰 ×{0}": "incl. peak ×{0}",
+  "Key 额度剩余 {0} / {1}": "Key quota left {0} / {1}",
+  "Key 额度剩余 {0}": "Key quota left {0}",
+  "{0} 剩余 {1}": "{0}: {1} left",
+  "订阅剩余 {0}": "Subscription left {0}",
+  "余额 {0}": "Balance {0}",
+  "{0} 剩 {1}": "{0}: {1} left",
+  "倍率接口：{0}": "Rate endpoint: {0}",
+  "余额接口：{0}": "Balance endpoint: {0}",
   "连接 {0} 时带上：": "When connecting to {0}, add:",
   "用到时下载并缓存在本机。来源：{0}（{1}）": "Downloaded when needed and cached locally. Source: {0} ({1})",
   "清除{0}": "Clear {0}",

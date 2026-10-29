@@ -1288,6 +1288,31 @@ pub struct GatewayBalances {
     pub balances: Vec<codex_plus_core::gateway::balance::ProviderBalance>,
 }
 
+/// 识别网关供应商是不是 sub2api，并取回倍率和余额。Key 只在后端，前端按 id 调。
+#[tauri::command]
+pub async fn probe_gateway_provider_sub2api(
+    id: String,
+) -> CommandResult<codex_plus_core::sub2api::Sub2ApiProbe> {
+    let relay = GatewayStore::default()
+        .load()
+        .ok()
+        .and_then(|gateway| gateway.provider(&id).map(|provider| provider.relay.clone()));
+    let Some(relay) = relay else {
+        return failed(
+            &format!("供应商不存在：{id}"),
+            codex_plus_core::sub2api::Sub2ApiProbe {
+                is_sub2api: false,
+                billing: None,
+                usage: None,
+                detail: String::new(),
+            },
+        );
+    };
+    let probe = codex_plus_core::sub2api::probe_sub2api(&relay).await;
+    let message = if probe.is_sub2api { "已识别为 sub2api。" } else { "不是 sub2api。" };
+    ok(message, probe)
+}
+
 /// 查池里有余额接口的供应商的余额（联网，每家最多 10 秒）。
 #[tauri::command]
 pub async fn load_gateway_balances() -> CommandResult<GatewayBalances> {

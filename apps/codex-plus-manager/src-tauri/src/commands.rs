@@ -547,20 +547,6 @@ pub struct RelayProfileModelsPayload {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Sub2ApiBillingPayload {
-    pub endpoint: String,
-    pub group_rate_multiplier: f64,
-    pub user_rate_multiplier: Option<f64>,
-    pub resolved_rate_multiplier: f64,
-    pub peak_rate_enabled: bool,
-    pub peak_rate_multiplier: Option<f64>,
-    pub applied_peak_multiplier: Option<f64>,
-    pub effective_rate_multiplier: f64,
-    pub observed_at: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ProviderDoctorCheck {
     pub id: String,
     pub title: String,
@@ -8314,52 +8300,22 @@ pub async fn fetch_relay_profile_models(
     }
 }
 
+/// 识别供应商是不是 sub2api，并顺带取回倍率和余额。供应商卡片在后台静默调用，
+/// 不是 sub2api 也返回 ok，前端按 `isSub2api` 决定是否显示。
 #[tauri::command]
-pub async fn fetch_sub2api_billing(profile: RelayProfile) -> CommandResult<Sub2ApiBillingPayload> {
-    let profile_name = if profile.name.trim().is_empty() {
-        "未命名供应商"
-    } else {
-        profile.name.trim()
+pub async fn probe_sub2api(
+    profile: RelayProfile,
+) -> CommandResult<codex_plus_core::sub2api::Sub2ApiProbe> {
+    let probe = codex_plus_core::sub2api::probe_sub2api(&profile).await;
+    let message = match (&probe.billing, &probe.usage) {
+        (Some(billing), _) => format!(
+            "已识别为 sub2api，倍率 {}x。",
+            format_multiplier(billing.effective_rate_multiplier)
+        ),
+        (None, Some(_)) => "已识别为 sub2api。".to_string(),
+        (None, None) => "不是 sub2api。".to_string(),
     };
-    match codex_plus_core::sub2api::fetch_sub2api_billing_info(&profile).await {
-        Ok(info) => ok(
-            &format!(
-                "已从「{profile_name}」获取倍率：{}x。",
-                format_multiplier(info.effective_rate_multiplier)
-            ),
-            Sub2ApiBillingPayload {
-                endpoint: info.endpoint,
-                group_rate_multiplier: info.group_rate_multiplier,
-                user_rate_multiplier: info.user_rate_multiplier,
-                resolved_rate_multiplier: info.resolved_rate_multiplier,
-                peak_rate_enabled: info.peak_rate_enabled,
-                peak_rate_multiplier: info.peak_rate_multiplier,
-                applied_peak_multiplier: info.applied_peak_multiplier,
-                effective_rate_multiplier: info.effective_rate_multiplier,
-                observed_at: info.observed_at,
-            },
-        ),
-        Err(error) => failed(
-            &format!("从「{profile_name}」获取 sub2api 倍率失败：{error}"),
-            Sub2ApiBillingPayload {
-                endpoint: codex_plus_core::sub2api::sub2api_billing_endpoint(
-                    if profile.upstream_base_url.trim().is_empty() {
-                        profile.base_url.trim()
-                    } else {
-                        profile.upstream_base_url.trim()
-                    },
-                ),
-                group_rate_multiplier: 0.0,
-                user_rate_multiplier: None,
-                resolved_rate_multiplier: 0.0,
-                peak_rate_enabled: false,
-                peak_rate_multiplier: None,
-                applied_peak_multiplier: None,
-                effective_rate_multiplier: 0.0,
-                observed_at: String::new(),
-            },
-        ),
-    }
+    ok(&message, probe)
 }
 
 fn format_multiplier(value: f64) -> String {

@@ -136,6 +136,47 @@ const demoSettings = {
     anthropicPromptCache: true,
     anthropicImpersonateClaudeCode: false,
     anthropicThinkingMode: "",
+  }, {
+    id: "sub2api-demo",
+    name: "sub2api 中转（演示）",
+    model: "deepseek-v4-pro[1M]",
+    baseUrl: "https://sub2api.example.com/v1",
+    upstreamBaseUrl: "https://sub2api.example.com/v1",
+    apiKey: "sk-demo",
+    protocol: "responses",
+    relayMode: "mixedApi",
+    officialMixApiKey: false,
+    hideOfficialUsageAlert: false,
+    testModel: "deepseek-v4-pro",
+    configContents: "",
+    authContents: "",
+    useCommonConfig: true,
+    contextSelection: { mcpServers: [], skills: [], plugins: [] },
+    contextSelectionInitialized: true,
+    contextWindow: "1000000",
+    autoCompactLimit: "800000",
+    modelList: "deepseek-v4-pro[1M]\ndeepseek-v4-flash[128K]",
+    modelWindows: "",
+    modelAutoCompact: "",
+    modelMetadata: "",
+    modelVlm: "",
+    vlmApiKey: "",
+    vlmModel: "",
+    vlmBaseUrl: "",
+    userAgent: "",
+    customHeaders: [],
+    sub2apiEnabled: false,
+    noAuth: false,
+    sub2apiMultiplier: "",
+    standardOpenaiProtocol: false,
+    webSearchHistoryCompat: false,
+    strictResponsesReasoning: false,
+    stripImageGenerationTool: false,
+    anthropicAuthHeader: "x-api-key",
+    anthropicMaxTokens: 0,
+    anthropicPromptCache: true,
+    anthropicImpersonateClaudeCode: false,
+    anthropicThinkingMode: "",
   }],
   relayCommonConfigContents: "",
   relayPreserveNonproviderSettings: false,
@@ -248,6 +289,7 @@ const gateway = ok({
     { id: "deepseek", name: "DeepSeek", baseUrl: "https://api.deepseek.com/v1", protocol: "chatCompletions", official: true, models: ["deepseek-v4-pro", "deepseek-v4-flash"], keyCount: 3 },
     { id: "kimi", name: "Kimi", baseUrl: "https://api.moonshot.cn/v1", protocol: "chatCompletions", official: true, models: ["kimi-k2-turbo"], keyCount: 2 },
     { id: "zhipu", name: "智谱 GLM", baseUrl: "https://open.bigmodel.cn/api/paas/v4", protocol: "chatCompletions", official: true, models: ["glm-5"], keyCount: 1 },
+    { id: "sub2api-pool", name: "sub2api 站点（演示）", baseUrl: "https://sub2api.example.com", protocol: "responses", official: false, models: ["gpt-5.5"], keyCount: 1 },
   ],
   groups: [],
   agents: [
@@ -446,6 +488,26 @@ export async function invoke<T = unknown>(command: string, args: Record<string, 
     case "list_local_sessions": return ok({ dbPath: "演示模式", dbPaths: [], sessions: [], offset: 0, limit: 50, hasMore: false, totalCount: 0 }) as T;
     case "load_relay_environment":
     case "check_relay_environment": return ok({ clashVergeTun: { enabled: false, configPath: null }, proxyEnvironment: { variables: [] }, codexEnvFile: { exists: false, path: "" } }) as T;
+    // sub2api 识别：演示供应商（地址含 sub2api）返回倍率与钱包余额，其余视为非 sub2api。
+    case "probe_sub2api": {
+      const profile = (args as { profile?: { baseUrl?: string } } | undefined)?.profile;
+      if (!profile?.baseUrl?.includes("sub2api")) return ok({ isSub2api: false, billing: null, usage: null, detail: "演示模式" }) as T;
+      return ok({
+        isSub2api: true,
+        billing: { endpoint: "https://sub2api.example.com/v1/sub2api/billing", groupRateMultiplier: 0.6, userRateMultiplier: null, resolvedRateMultiplier: 0.6, peakRateEnabled: true, peakRateMultiplier: 1.5, appliedPeakMultiplier: 1.5, effectiveRateMultiplier: 0.9, observedAt: "2026-10-29T10:00:00Z" },
+        usage: { endpoint: "https://sub2api.example.com/v1/usage", kind: "wallet", isValid: true, planName: "钱包余额", remaining: 12.345, quotaLimit: null, quotaUsed: null, unit: "USD", rateLimits: [] },
+        detail: "",
+      }) as T;
+    }
+    case "probe_gateway_provider_sub2api": {
+      if ((args as { id?: string }).id !== "sub2api-pool") return ok({ isSub2api: false, billing: null, usage: null, detail: "演示模式" }) as T;
+      return ok({
+        isSub2api: true,
+        billing: null,
+        usage: { endpoint: "https://sub2api.example.com/v1/usage", kind: "keyQuota", isValid: true, planName: null, remaining: 30, quotaLimit: 50, quotaUsed: 20, unit: "USD", rateLimits: [{ window: "5h", limit: 10, used: 10, remaining: 0 }] },
+        detail: "",
+      }) as T;
+    }
     default: return ok() as T;
   }
 }
