@@ -2689,6 +2689,19 @@ export const EN_PLAIN: Record<string, string> = {
   "正在 Codex 里加载": "Loading in Codex",
   "脚本在 Codex 里运行出错": "The script threw an error in Codex",
   "Codex 未运行或尚未热重载脚本": "Codex is not running or scripts have not been hot-reloaded yet",
+  // 供应商池：编辑图标与单独管理 Key（#2782）
+  "编辑名称、地址、协议与模型": "Edit name, URL, protocol, and models",
+  "编辑模型列表": "Edit model list",
+  "编辑价格": "Edit pricing",
+  "编辑上下文窗口": "Edit context windows",
+  "编辑思考等级": "Edit reasoning levels",
+  "编辑代理": "Edit proxy",
+  "编辑限速": "Edit rate limits",
+  "替换 Key": "Replace key",
+  "替换这个 Key": "Replace this key",
+  "至少要保留一个 Key，要换掉它请用替换": "At least one key must remain; use Replace to change it",
+  "新的 API Key": "New API key",
+  "在供应商详情的「Key」一行里单独替换、删除或添加": "Replace, delete, or add keys one by one in the Key row of the provider details",
 };
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
@@ -3033,6 +3046,11 @@ export const EN_TEMPLATE: Record<string, string> = {
   "{0}更新": "Updated {0}",
   "更新于 {0}": "Updated {0}",
   "启用 {0}": "Enable {0}",
+  // 供应商池：单独管理 Key（#2782）
+  "替换 Key {0}": "Replace key {0}",
+  "删除 Key {0}": "Delete key {0}",
+  "替换 {0} 的新 Key": "New key to replace {0}",
+  "删除 Key「{0}」？删除后它不再参与轮换，用它的会话会换用别的 Key。": "Delete key “{0}”? It will no longer be rotated in, and conversations using it will switch to another key.",
 };
 
 // Backend (Rust) messages returned via result.message. These are translated
@@ -3168,6 +3186,13 @@ export const EN_BACKEND: Record<string, string> = {
   "已把 Claude Code 当前配置保存为供应商。": "Saved the current Claude Code configuration as a provider.",
   "CC Switch 里没有新的 Claude 供应商。": "No new Claude providers in CC Switch.",
   "插件已卸载，重启 Codex 后生效。": "Plugin uninstalled. Restart Codex for the change to take effect.",
+  // 供应商池：单独管理 Key（#2782）
+  "Key 已添加。": "Key added.",
+  "添加 Key 失败": "Failed to add key",
+  "Key 已替换。": "Key replaced.",
+  "替换 Key 失败": "Failed to replace key",
+  "Key 已删除。": "Key deleted.",
+  "删除 Key 失败": "Failed to delete key",
 };
 
 // Pattern-based backend translations: [regex, replacement template].
@@ -3266,4 +3291,8 @@ export const EN_BACKEND_PATTERNS: Array<[RegExp, string]> = [
   [/^切换 Claude 供应商失败：(.+)$/, "Failed to switch Claude provider: $1"],
   [/^导入 Claude 当前配置失败：(.+)$/, "Failed to import the current Claude configuration: $1"],
   [/^从 CC Switch 导入失败：(.+)$/, "Import from CC Switch failed: $1"],
+  // 供应商池：单独管理 Key（#2782）
+  [/^添加 Key 失败：(.+)$/, "Failed to add key: $1"],
+  [/^替换 Key 失败：(.+)$/, "Failed to replace key: $1"],
+  [/^删除 Key 失败：(.+)$/, "Failed to delete key: $1"],
 ];

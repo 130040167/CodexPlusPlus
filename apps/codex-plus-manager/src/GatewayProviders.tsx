@@ -6,7 +6,7 @@ import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointer
 import { invoke } from "@tauri-apps/api/core";
 import { createPortal } from "react-dom";
 import { appConfirm } from "./app-dialog";
-import { Check, ChevronRight, Copy, GripVertical, Plus, RefreshCw, Search, X } from "lucide-react";
+import { Check, ChevronRight, Copy, GripVertical, Pencil, Plus, RefreshCw, Search, X } from "lucide-react";
 import { t, tf } from "./i18n";
 import { RelayBillingPoolBadge, RelayBillingPoolLabel, RelayBillingRetry, useRelayBillingProbe } from "./RelayBillingLine";
 import { relayBillingGatewayCacheKey, type RelayBillingProbe } from "./relay-billing";
@@ -35,6 +35,7 @@ import {
   type ProviderPrice,
   maskAccountName,
   isDirectProxy,
+  keyLabel,
   type ImportCandidate,
   type ImportSource,
 } from "./gateway-model";
@@ -44,6 +45,7 @@ import { ProviderExtrasDialog, ProviderLimitsDialog, keyLimitSummary, priceSumma
 import { ProviderWindowsDialog, windowSummary } from "./ProviderWindowsDialog";
 import { ProviderReasoningDialog, reasoningSummary } from "./ProviderReasoningDialog";
 import { ProviderModelsDialog } from "./ProviderModelsDialog";
+import { ProviderKeyList } from "./ProviderKeyList";
 import { gatewayJump } from "./gateway-store";
 import { ModelMatrix } from "./GatewayModelMatrix";
 import { useEscapeLayer } from "./use-escape-layer";
@@ -502,12 +504,28 @@ function PoolRow({
             <RelayBillingRetry failure={billing.failure} loading={billing.loading} onRefresh={billing.refresh} />
           ) : null}
         </span>
-        <Switch
-          disabled={busy !== null}
-          label={tf("{0} 参与调度", [maskAccountName(entry.name)])}
-          on={enabled}
-          onToggle={() => void run(`toggle:${entry.id}`, "set_gateway_provider_enabled", { id: entry.id, enabled: !enabled }, t("切换供应商"), true)}
-        />
+        <span className="gw-pool-actions">
+          {/* 编辑放在标题栏（#2782）；订阅账号没有可编辑的连接，留同宽的空位让开关对齐。 */}
+          {entry.account ? (
+            <span aria-hidden="true" className="gw-pool-edit-slot" />
+          ) : (
+            <button
+              aria-label={tf("编辑 {0}", [maskAccountName(entry.name)])}
+              className="gw-icon-button gw-pool-edit"
+              onClick={onEdit}
+              title={t("编辑名称、地址、协议与模型")}
+              type="button"
+            >
+              <Pencil className="h-4 w-4" />
+            </button>
+          )}
+          <Switch
+            disabled={busy !== null}
+            label={tf("{0} 参与调度", [maskAccountName(entry.name)])}
+            on={enabled}
+            onToggle={() => void run(`toggle:${entry.id}`, "set_gateway_provider_enabled", { id: entry.id, enabled: !enabled }, t("切换供应商"), true)}
+          />
+        </span>
         <button aria-expanded={expanded} aria-label={t("详情")} className="gw-chevron" data-open={expanded} onClick={onToggleExpand} type="button">
           <ChevronRight className="h-4 w-4" />
         </button>
@@ -524,7 +542,7 @@ function PoolRow({
                   {allModels ? t("收起") : tf("显示全部 {0} 个模型", [chatModels.length])}
                 </button>
               ) : null}
-              <button className="gw-text-button" disabled={busy !== null} onClick={() => setModelsOpen(true)} type="button">{t("编辑")}</button>
+              <EditIcon disabled={busy !== null} label={t("编辑模型列表")} onClick={() => setModelsOpen(true)} />
               {/* 一键拉上游：新增的直接加进列表，已有的不删；要删下架的进「编辑」。 */}
               <button
                 className="gw-text-button gw-sync-button"
@@ -550,10 +568,10 @@ function PoolRow({
           <div className="gw-detail-row">
             <span className="gw-detail-label">{entry.account ? t("套餐") : "Key"}</span>
             <div className="gw-detail-value gw-chip-row">
-              {entry.account ? <span>{entry.plan || t("未知")}</span> : <KeyCount count={entry.keyCount} />}
+              {entry.account ? <span>{entry.plan || t("未知")}</span> : entry.keys?.length ? <ProviderKeyList busy={busy} entry={entry} run={run} /> : <KeyCount count={entry.keyCount} />}
               {failures.map((key) => (
                 <span className="gw-key-failure" key={key.keyId}>
-                  {`${key.keyId}${t("：")}${[t(failureLabel(key.lastFailure)) || t(key.state === "disabled" ? "已停用" : "冷却中"), formatRemaining(key.remainingMs)].filter(Boolean).join(" · ")}`}
+                  {`${keyLabel(entry.keys, key.keyId)}${t("：")}${[t(failureLabel(key.lastFailure)) || t(key.state === "disabled" ? "已停用" : "冷却中"), formatRemaining(key.remainingMs)].filter(Boolean).join(" · ")}`}
                 </span>
               ))}
               {failures.length || breaker ? (
@@ -584,7 +602,7 @@ function PoolRow({
             <span className="gw-detail-label">{t("价格")}</span>
             <div className="gw-detail-value gw-chip-row">
               <span className={price ? undefined : "gw-muted"}>{price || t("未填写，不估算费用")}</span>
-              <button className="gw-text-button" disabled={busy !== null} onClick={() => setExtrasOpen("price")} type="button">{t("编辑")}</button>
+              <EditIcon disabled={busy !== null} label={t("编辑价格")} onClick={() => setExtrasOpen("price")} />
               {/* 一键按公开价格表更新所有模型的价格，不用打开弹窗。 */}
               <button
                 className="gw-text-button gw-sync-button"
@@ -602,21 +620,21 @@ function PoolRow({
             <span className="gw-detail-label">{t("上下文窗口")}</span>
             <div className="gw-detail-value gw-chip-row">
               <span className={windows ? undefined : "gw-muted"}>{windows || t("未填写，用模型自带资料")}</span>
-              <button className="gw-text-button" disabled={busy !== null || entry.models.length === 0} onClick={() => setWindowsOpen(true)} type="button">{t("编辑")}</button>
+              <EditIcon disabled={busy !== null || entry.models.length === 0} label={t("编辑上下文窗口")} onClick={() => setWindowsOpen(true)} />
             </div>
           </div>
           <div className="gw-detail-row">
             <span className="gw-detail-label">{t("思考等级")}</span>
             <div className="gw-detail-value gw-chip-row">
               <span className={reasoning ? undefined : "gw-muted"}>{reasoning || t("按内置资料")}</span>
-              <button className="gw-text-button" disabled={busy !== null || entry.models.length === 0} onClick={() => setReasoningOpen(true)} type="button">{t("编辑")}</button>
+              <EditIcon disabled={busy !== null || entry.models.length === 0} label={t("编辑思考等级")} onClick={() => setReasoningOpen(true)} />
             </div>
           </div>
           <div className="gw-detail-row">
             <span className="gw-detail-label">{t("代理")}</span>
             <div className="gw-detail-value gw-chip-row">
               {isDirectProxy(entry.proxy) ? <span>{t("不使用代理（直连）")}</span> : entry.proxy ? <code className="gw-chip">{entry.proxy}</code> : <span className="gw-muted">{t("沿用系统代理")}</span>}
-              <button className="gw-text-button" disabled={busy !== null} onClick={() => setExtrasOpen("proxy")} type="button">{t("编辑")}</button>
+              <EditIcon disabled={busy !== null} label={t("编辑代理")} onClick={() => setExtrasOpen("proxy")} />
             </div>
           </div>
           <div className="gw-detail-row">
@@ -625,23 +643,19 @@ function PoolRow({
               <span className={keyLimits ? undefined : "gw-muted"} title={t("按每个 Key 计；达到上限时先换别的 Key 或下一家，都满了就排队等待（最多 2 分钟）。")}>
                 {keyLimits || t("不限")}
               </span>
-              <button className="gw-text-button" disabled={busy !== null} onClick={() => setLimitsOpen(true)} type="button">{t("编辑")}</button>
+              <EditIcon disabled={busy !== null} label={t("编辑限速")} onClick={() => setLimitsOpen(true)} />
             </div>
           </div>
           <div className="gw-detail-row gw-detail-foot">
             <span className="gw-detail-label" />
             <div className="gw-detail-value">
+              {/* 普通供应商的「编辑」在标题栏；这里只留订阅账号的重新登录。 */}
               {entry.account ? (
                 <button className="gw-text-button" disabled={busy !== null || loggingIn} onClick={onRelogin} type="button">
                   {loggingIn ? t("登录中…") : t("重新登录")}
                   <ChevronRight className="h-3.5 w-3.5" />
                 </button>
-              ) : (
-                <button className="gw-text-button" onClick={onEdit} type="button">
-                  {t("编辑")}
-                  <ChevronRight className="h-3.5 w-3.5" />
-                </button>
-              )}
+              ) : <span />}
               <button className="gw-danger-link" disabled={busy !== null} onClick={() => void remove()} type="button">
                 {t("删除")}
               </button>
@@ -671,6 +685,15 @@ function PoolRow({
         />
       ) : null}
     </div>
+  );
+}
+
+/** 详情里各项的「编辑」：铅笔图标按钮，文案放在无障碍名和悬停提示里（#2782）。 */
+function EditIcon({ label, disabled, onClick }: { label: string; disabled: boolean; onClick: () => void }) {
+  return (
+    <button aria-label={label} className="gw-icon-button gw-inline-icon" disabled={disabled} onClick={onClick} title={label} type="button">
+      <Pencil className="h-3.5 w-3.5" />
+    </button>
   );
 }
 

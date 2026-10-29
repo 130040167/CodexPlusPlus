@@ -96,7 +96,19 @@ export type GatewayPoolEntry = {
   lentToCodex?: boolean;
   /** 订阅账号的剩余额度；查不到或普通供应商为空。 */
   quota?: ProviderQuota | null;
+  /** 已保存的 Key（打码，#2782）：订阅账号等不用 Key 的为空。旧版后端没有。 */
+  keys?: ProviderKeyView[];
 };
+
+/** 供应商已保存的一个 Key：后端只给标识和打码后的样子，原文不出后端。删除 / 替换按 `id`。 */
+export type ProviderKeyView = { id: string; masked: string };
+
+/** Key 池健康状态里的 Key 标识换成打码后的 Key 显示；只剩一个 Key 时 Key 池按 `primary` 记。找不到就原样显示标识。 */
+export function keyLabel(keys: ProviderKeyView[] | undefined, keyId: string): string {
+  const list = keys ?? [];
+  const found = list.find((key) => key.id === keyId) ?? (keyId === "primary" && list.length === 1 ? list[0] : undefined);
+  return found ? found.masked : keyId;
+}
 
 export type ProviderPrice = { currency: string; input: number; cachedInput: number; output: number };
 

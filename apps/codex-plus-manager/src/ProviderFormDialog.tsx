@@ -122,7 +122,10 @@ export function ProviderFormDialog({
 
   const title = form.mode === "edit" ? tf("编辑 {0}", [maskAccountName(form.entry.name)]) : preset ? tf("添加 {0}", [preset.name]) : t("添加自定义供应商");
   const subtitle = preset?.apiKeyUrl ? tf("在 {0} 获取 Key", [presetHost(preset.apiKeyUrl)]) : editing ? tf("现有 {0} 个 Key", [form.entry.keyCount]) : t("任意 OpenAI / Anthropic 兼容接口");
-  const keyHint = editing ? t("留空表示不改") : preset?.defaultKey ? t("本机服务不校验 Key，保留默认值即可") : t("多个自动轮换");
+  // 编辑时已保存的 Key 只列打码后的样子，增删、替换在供应商池详情的「Key」一行里单独做（#2782）；
+  // 旧版后端没给 Key 列表时仍是「留空表示不改」的输入框。
+  const savedKeys = form.mode === "edit" ? form.entry.keys ?? [] : [];
+  const keyHint = editing ? (savedKeys.length ? t("在供应商详情的「Key」一行里单独替换、删除或添加") : t("留空表示不改")) : preset?.defaultKey ? t("本机服务不校验 Key，保留默认值即可") : t("多个自动轮换");
 
   return createPortal(
     <div className="gw-modal-backdrop gw-portal" onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel(); }}>
@@ -167,7 +170,12 @@ export function ProviderFormDialog({
             </label>
             <div className="pf-field">
               <span>{t("API Key")} <small>{keyHint}</small></span>
-              {keys.map((key, index) => (
+              {savedKeys.length ? (
+                <div className="pf-chips">
+                  {savedKeys.map((key) => <span className="pf-chip" key={key.id}><span className="pf-mono">{key.masked}</span></span>)}
+                </div>
+              ) : null}
+              {savedKeys.length ? null : keys.map((key, index) => (
                 <div className="pf-key" key={index}>
                   <Input
                     autoComplete="off"
@@ -188,9 +196,11 @@ export function ProviderFormDialog({
                   ) : null}
                 </div>
               ))}
-              <button className="pf-link" onClick={() => setDraft((previous) => withKeys(previous, [...draftKeys(previous), ""]))} type="button">
-                <Plus />{t("再加一个 Key")}
-              </button>
+              {savedKeys.length ? null : (
+                <button className="pf-link" onClick={() => setDraft((previous) => withKeys(previous, [...draftKeys(previous), ""]))} type="button">
+                  <Plus />{t("再加一个 Key")}
+                </button>
+              )}
             </div>
           </section>
 
