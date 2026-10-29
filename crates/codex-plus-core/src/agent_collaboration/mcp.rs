@@ -13,7 +13,7 @@ pub const MAX_REQUEST_BYTES: usize = 128 * 1024;
 const MAX_WAIT_MS: u64 = 30_000;
 const MAX_CONCURRENT_WAITS: usize = 8;
 
-const INSTRUCTIONS: &str = "在当前 Codex 对话中承接用户的自然语言委派。用户明确要求 DeepSeek/DeepSeek Harness 时调用 delegate_to_deepseek；明确要求 Claude/Claude Code 时调用 delegate_to_claude_code；明确要求另一个 Codex 时调用 delegate_to_codex，不能用默认 Agent 替换用户点名的对象。用户泛指委派给其他 Agent、未指定对象时使用 delegate_task，省略 agentId 会采用 Codex++ 配置的默认 Agent；显式 agentId 始终优先。用户的委派请求已构成执行该任务的授权，不要再要求每次确认，也不要让用户去管理面板手工提交任务。提供完整、自包含的 prompt 和已存在的绝对 cwd。工具可能编辑该目录并消耗原生 CLI 账户额度，权限仍由各 CLI 控制。返回 queued/taskId 只代表任务已接收；先继续独立工作，再用 wait_task（每次最多 30 秒）或 get_task 收取结果，必须把结果带回当前对话。pending=true 时可继续工作并稍后查询；只有 task.status=completed 才能报告子任务成功，failed/cancelled/interrupted 必须如实说明，结果不确定时禁止自动重发。目标未启用、繁忙或不可用时报告该目标的问题，不擅自改派。continueTaskId 只续本工具先前创建的同 Agent、同目录已完成 CLI 会话。这些是外部 harness/CLI 协作任务，不是原生 spawn_agent 子树，也不能接管或唤醒同窗口中已有桌面会话。";
+const INSTRUCTIONS: &str = "在当前 Codex 对话中承接用户的自然语言委派。用户明确要求 DeepSeek/DeepSeek Harness 时调用 delegate_to_deepseek；明确要求 Claude/Claude Code 时调用 delegate_to_claude_code；明确要求另一个 Codex 时调用 delegate_to_codex，不能用默认 Agent 替换用户点名的对象。用户泛指委派给其他 Agent、未指定对象时使用 delegate_task，省略 agentId 会采用 Codex++ 配置的默认 Agent；显式 agentId 始终优先。用户的委派请求已构成执行该任务的授权，不要再要求每次确认，也不要让用户去管理面板手工提交任务。提供完整、自包含的 prompt 和已存在的绝对 cwd。工具可能编辑该目录并消耗原生 CLI 账户额度，权限仍由各 CLI 控制。返回 queued/taskId 只代表任务已接收；先继续独立工作，再用 wait_task（每次最多 30 秒）或 get_task 收取结果，必须把结果带回当前对话。pending=true 时可继续工作并稍后查询；只有 task.status=completed 才能报告子任务成功，failed/cancelled/interrupted 必须如实说明，结果不确定时禁止自动重发。同一 Agent 已有任务时新任务会排队（返回 queued 和排队进度），前一个结束后按提交顺序自动启动，不同 Agent 可并行；只有排队已满、目标未启用或不可用时才报错，此时报告该目标的问题，不擅自改派。continueTaskId 只续本工具先前创建的同 Agent、同目录已完成 CLI 会话。这些是外部 harness/CLI 协作任务，不是原生 spawn_agent 子树，也不能接管或唤醒同窗口中已有桌面会话。";
 
 enum InputLine {
     Data(Vec<u8>),
@@ -299,7 +299,7 @@ fn dispatch_task(store: &Store, request: TaskRequest) -> anyhow::Result<Value> {
     let task = store.submit(request)?;
     executor::spawn_task(store.clone(), task.id.clone());
     Ok(json!({"taskId": task.id, "task": task, "pending": true,
-        "next": "任务已接收，queued 不代表成功。继续独立工作，随后使用 wait_task/get_task 查询这个 taskId，将终态和答案带回当前对话；不要重复派发。"}))
+        "next": "任务已接收，queued 不代表成功；同一 Agent 繁忙时会排队，前一个结束后自动启动（见 task.progress）。继续独立工作，随后使用 wait_task/get_task 查询这个 taskId，将终态和答案带回当前对话；不要重复派发。"}))
 }
 
 #[derive(Deserialize)]
@@ -329,8 +329,9 @@ fn wait_arguments(arguments: Value) -> anyhow::Result<WaitArguments> {
 fn wait_snapshot(task: TaskRecord, timed_out: bool) -> Value {
     let pending = !is_terminal(&task.status);
     let succeeded = task.status == "completed";
+    let queued = task.status == "queued";
     json!({"taskId": task.id, "task": task, "pending": pending, "timedOut": timed_out && pending, "succeeded": succeeded,
-        "next": if pending { "任务仍在运行。继续独立工作或稍后用同一 taskId 调用 wait_task/get_task；不要重发任务。" } else if succeeded { "任务已完成，将答案带回当前对话。" } else { "任务未成功完成，向用户如实汇报 task.status 和 task.error，不要自动重发或报告成功。" }})
+        "next": if queued { "任务仍在排队，轮到后自动启动（见 task.progress）。继续独立工作或稍后用同一 taskId 调用 wait_task/get_task；不要重发任务。" } else if pending { "任务仍在运行。继续独立工作或稍后用同一 taskId 调用 wait_task/get_task；不要重发任务。" } else if succeeded { "任务已完成，将答案带回当前对话。" } else { "任务未成功完成，向用户如实汇报 task.status 和 task.error，不要自动重发或报告成功。" }})
 }
 
 async fn wait_task(store: &Store, arguments: Value) -> anyhow::Result<Value> {
@@ -427,15 +428,15 @@ fn tool_definitions() -> Vec<Value> {
         json!({"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false});
     vec![
         json!({"name": "list_agents", "description": "只读：列出默认 Agent、固定 CLI worker 与启用状态。available 只验证本机文件，不代表登录成功；配置在 Codex++ 中管理。", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}, "annotations": {"readOnlyHint": true}}),
-        json!({"name": "delegate_to_deepseek", "description": "把用户指定的子任务交给 DeepSeek Harness。用户点名 DeepSeek 时使用本工具，固定目标不受默认 Agent 设置影响。异步启动真实外部 CLI，可能编辑 cwd 并消耗账户额度；返回 taskId 后先做独立工作，再 wait_task/get_task 收取结果带回当前对话。不是原生 spawn_agent 子树，不接管已有桌面会话。失败或 busy 不自动重发。", "inputSchema": fixed_schema, "annotations": dispatch_annotations}),
-        json!({"name": "delegate_to_claude_code", "description": "把用户指定的子任务交给 Claude Code。用户点名 Claude/Claude Code 时使用本工具，固定目标不受默认 Agent 设置影响。异步启动真实外部 CLI，可能编辑 cwd 并消耗账户额度；返回 taskId 后先做独立工作，再 wait_task/get_task 收取结果带回当前对话。调用的是 Claude Code harness，不是 Claude Desktop 普通 Chat，也不接管已有会话。失败或 busy 不自动重发。", "inputSchema": fixed_schema, "annotations": dispatch_annotations}),
-        json!({"name": "delegate_to_codex", "description": "把子任务交给另一个 Codex CLI 会话。用户明确要求另一个 Codex 时使用本工具，固定目标不受默认 Agent 设置影响。可能编辑 cwd 并消耗账户额度；异步返回 taskId 后先做独立工作，再 wait_task/get_task 收结果。不是当前对话原生 spawn_agent 子树，也不接管已有桌面会话。失败或 busy 不自动重发。", "inputSchema": fixed_schema, "annotations": dispatch_annotations}),
+        json!({"name": "delegate_to_deepseek", "description": "把用户指定的子任务交给 DeepSeek Harness。用户点名 DeepSeek 时使用本工具，固定目标不受默认 Agent 设置影响。异步启动真实外部 CLI，可能编辑 cwd 并消耗账户额度；返回 taskId 后先做独立工作，再 wait_task/get_task 收取结果带回当前对话。不是原生 spawn_agent 子树，不接管已有桌面会话。同一 Agent 繁忙时排队、按提交顺序自动启动，排队已满会报错。失败不自动重发。", "inputSchema": fixed_schema, "annotations": dispatch_annotations}),
+        json!({"name": "delegate_to_claude_code", "description": "把用户指定的子任务交给 Claude Code。用户点名 Claude/Claude Code 时使用本工具，固定目标不受默认 Agent 设置影响。异步启动真实外部 CLI，可能编辑 cwd 并消耗账户额度；返回 taskId 后先做独立工作，再 wait_task/get_task 收取结果带回当前对话。调用的是 Claude Code harness，不是 Claude Desktop 普通 Chat，也不接管已有会话。同一 Agent 繁忙时排队、按提交顺序自动启动，排队已满会报错。失败不自动重发。", "inputSchema": fixed_schema, "annotations": dispatch_annotations}),
+        json!({"name": "delegate_to_codex", "description": "把子任务交给另一个 Codex CLI 会话。用户明确要求另一个 Codex 时使用本工具，固定目标不受默认 Agent 设置影响。可能编辑 cwd 并消耗账户额度；异步返回 taskId 后先做独立工作，再 wait_task/get_task 收结果。不是当前对话原生 spawn_agent 子树，也不接管已有桌面会话。同一 Agent 繁忙时排队、按提交顺序自动启动，排队已满会报错。失败不自动重发。", "inputSchema": fixed_schema, "annotations": dispatch_annotations}),
         json!({"name": "delegate_task", "description": "用户泛指委派给其他 Agent 时使用：省略 agentId 会路由到 Codex++ 配置的默认 Agent，显式 agentId 始终优先。目标未启用或不可用时直接报错，不改派别家。可能编辑 cwd 并消耗原生 CLI 账户额度；异步返回 taskId 后先做独立工作，再 wait_task/get_task 收取终态及答案并带回当前对话。不是原生 spawn_agent 子树，不接管已有桌面会话。", "inputSchema": delegate_schema, "annotations": dispatch_annotations}),
-        json!({"name": "send_task", "description": "兼容入口：向显式 agentId 异步派发真实 CLI 任务。可能编辑 cwd 并消耗账户额度；continueTaskId 只续本工具创建的同 Agent、同目录已完成会话。返回 taskId 后先做独立工作，再 wait_task/get_task 收结果；queued 不代表成功，失败或 busy 不自动重发。不唤醒已有桌面会话。", "inputSchema": send_schema, "annotations": dispatch_annotations}),
+        json!({"name": "send_task", "description": "兼容入口：向显式 agentId 异步派发真实 CLI 任务。可能编辑 cwd 并消耗账户额度；continueTaskId 只续本工具创建的同 Agent、同目录已完成会话。返回 taskId 后先做独立工作，再 wait_task/get_task 收结果；queued 不代表成功；同一 Agent 繁忙时排队，失败不自动重发。不唤醒已有桌面会话。", "inputSchema": send_schema, "annotations": dispatch_annotations}),
         json!({"name": "wait_task", "description": "只读：用 taskId 等待先前委派任务，timeoutMs 为 0..30000，默认最多等待 30 秒；终态立即返回。返回 task、pending、timedOut、succeeded。pending=true 时继续独立工作并稍后查询同一 taskId；只有 task.status=completed 才成功，failed/cancelled/interrupted 必须如实报告，绝不因此自动重发。", "inputSchema": {"type": "object", "properties": {"taskId": {"type": "string"}, "timeoutMs": {"type": "integer", "minimum": 0, "maximum": 30000, "default": 30000}}, "required": ["taskId"], "additionalProperties": false}, "annotations": {"readOnlyHint": true}}),
         json!({"name": "get_task", "description": "只读：立即查询任务持久化状态与输出。completed/failed/cancelled/interrupted 为终态；只有 completed 代表成功，interrupted 表示结果不确定，不应自动重发。把子任务结果带回当前对话。", "inputSchema": id_schema, "annotations": {"readOnlyHint": true}}),
         json!({"name": "list_tasks", "description": "只读：活跃任务优先，随后列出最近的持久化协作任务，最多 50 条；不会启动 Agent。", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50}}, "additionalProperties": false}, "annotations": {"readOnlyHint": true}}),
-        json!({"name": "cancel_task", "description": "请求停止指定任务。排队任务立即取消；运行任务等待 worker 停止 CLI 后结束。取消不会回滚已经发生的文件或外部操作。", "inputSchema": id_schema, "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true}}),
+        json!({"name": "cancel_task", "description": "请求停止指定任务。排队任务立即取消并移出队列；运行任务等待 worker 停止 CLI 后结束。取消不会回滚已经发生的文件或外部操作。", "inputSchema": id_schema, "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true}}),
     ]
 }
 

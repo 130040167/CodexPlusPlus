@@ -11,8 +11,12 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
-use super::{AgentConfig, MAX_OUTPUT_BYTES, MAX_PROMPT_BYTES, Store, TaskRecord};
+use super::{AgentConfig, MAX_OUTPUT_BYTES, MAX_PROMPT_BYTES, QueueTurn, Store, TaskRecord};
 
+/// 排队任务检查是否轮到的间隔；本进程内任务结束时会立即唤醒，不必等满。
+const QUEUE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// 连续读取队列失败这么多次才放弃，避免偶发的 SQLite 忙碌让排队任务直接失败。
+const MAX_QUEUE_POLL_FAILURES: u32 = 5;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 const MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 2 * 1024 * 1024;
@@ -255,14 +259,7 @@ pub fn spawn_task(store: Store, id: String) {
     let retained_store = store.clone();
     let retained_id = id.clone();
     let handle = tokio::spawn(async move {
-        let claimed = match store.claim(&id) {
-            Ok(claimed) => claimed,
-            Err(_) => {
-                let _ = store.finish(&id, "failed", "", "无法认领协作任务，CLI 未启动", "");
-                return;
-            }
-        };
-        if !claimed {
+        if !wait_for_turn(&store, &id).await {
             return;
         }
         let outcome = match run_task(&store, &id).await {
@@ -281,12 +278,47 @@ pub fn spawn_task(store: Store, id: String) {
             &outcome.error,
             &outcome.session_id,
         );
+        // 本进程排在后面的任务立即重新检查，不必等到下一次轮询。
+        queue_wakeup().notify_waiters();
     });
     owned.tasks.push(OwnedTask {
         handle,
         store: retained_store,
         id: retained_id,
     });
+}
+
+fn queue_wakeup() -> &'static tokio::sync::Notify {
+    static WAKEUP: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    WAKEUP.get_or_init(tokio::sync::Notify::new)
+}
+
+/// 同一 Agent 的任务按提交顺序排队：轮询直到轮到本任务并认领执行权（#2772）。
+/// 返回 false 表示任务已取消、已结束或协作已关闭，不再启动。轮询同时为排队任务续租，
+/// 本进程退出或失联后租约过期，任务会被标记为未启动的失败，不会卡在 queued。
+async fn wait_for_turn(store: &Store, id: &str) -> bool {
+    let mut failures = 0;
+    loop {
+        // 先登记唤醒再检查，避免检查后、等待前恰好有任务结束而错过通知。
+        let wakeup = queue_wakeup().notified();
+        match store.poll_queue(id) {
+            Ok(QueueTurn::Start) => return true,
+            Ok(QueueTurn::Stop) => return false,
+            Ok(QueueTurn::Wait { .. }) => failures = 0,
+            Err(_) => {
+                failures += 1;
+                if failures >= MAX_QUEUE_POLL_FAILURES {
+                    let _ = store.abandon_queued(
+                        id,
+                        "无法读取协作任务队列，任务未启动，没有执行任何操作；可以重新提交",
+                    );
+                    return false;
+                }
+            }
+        }
+        // 其他进程拥有的任务结束时不会通知这里，靠定时轮询兜底。
+        let _ = tokio::time::timeout(QUEUE_POLL_INTERVAL, wakeup).await;
+    }
 }
 
 /// 只中止当前进程登记的任务；其他 manager/MCP 进程拥有的任务不受影响。
@@ -308,6 +340,16 @@ async fn stop_owned_tasks(tasks: Vec<OwnedTask>) {
     for task in tasks {
         // await 完成意味着 run_task 的 future 已析构，独立进程组 guard 已发送终止信号。
         let _ = task.handle.await;
+        // 还在排队的任务从未启动 CLI，单独说明，提示可以重新提交。
+        if matches!(
+            task.store.abandon_queued(
+                &task.id,
+                "协作执行进程已退出，排队中的任务未启动，没有执行任何操作；可以重新提交",
+            ),
+            Ok(true)
+        ) {
+            continue;
+        }
         let _ = task.store.finish(
             &task.id,
             "interrupted",
@@ -1360,6 +1402,41 @@ mod tests {
             !directory.path().join("escaped.txt").exists(),
             "退出后登记的子进程组不能继续写文件"
         );
+    }
+
+    /// 退出时仍在排队的任务从未启动，标记为失败并说明可重新提交，而不是「结果不确定」的中断。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_marks_owned_queued_task_as_not_started() {
+        let (directory, store, running, _command) = fixture(":");
+        let queued = store
+            .submit(super::super::TaskRequest {
+                agent_id: "codex".to_owned(),
+                prompt: "排在后面".to_owned(),
+                cwd: directory.path().to_string_lossy().into_owned(),
+                continue_task_id: None,
+            })
+            .unwrap();
+        let waiter_store = store.clone();
+        let waiter_id = queued.id.clone();
+        let handle = tokio::spawn(async move {
+            assert!(
+                !wait_for_turn(&waiter_store, &waiter_id).await,
+                "前一个任务仍在运行，不应轮到"
+            );
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(store.task(&queued.id).unwrap().status, "queued");
+        stop_owned_tasks(vec![OwnedTask {
+            handle,
+            store: store.clone(),
+            id: queued.id.clone(),
+        }])
+        .await;
+        let abandoned = store.task(&queued.id).unwrap();
+        assert_eq!(abandoned.status, "failed");
+        assert!(abandoned.error.contains("未启动"), "{}", abandoned.error);
+        assert_eq!(store.task(&running.id).unwrap().status, "running");
     }
 
     fn codex_agent(executable: &str) -> AgentConfig {

@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { ArrowRightLeft, Check, Copy, Loader2, Play, RefreshCw, Save, Square } from "lucide-react";
 import { PageHeader } from "./ManagementPages";
 import { AppSelect } from "./AppSelect";
+import { agentQueueState } from "./agent-collaboration-queue";
+import { t, tf } from "./i18n";
 import "./AgentCollaborationPage.css";
 
 type Agent = { id: string; name: string; executable: string; enabled: boolean; model: string; reuseSavedAuth: boolean };
@@ -42,6 +44,8 @@ type Snapshot = {
   availability?: { id: string; available: boolean; path?: string | null; configuredMissing?: boolean; recovered?: boolean }[];
   integration?: Integration;
   runtime?: CodexRuntime;
+  /** maxQueuedPerAgent：每个 Agent 最多排队的任务数（#2772）。 */
+  capabilities?: { maxQueuedPerAgent?: number };
 };
 type McpConfig = { codexToml: string; claudeJson: string; command: string; args: string[] };
 
@@ -246,13 +250,14 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
     : enabledAgents.find((agent) => agent.id === snapshot?.config.defaultAgentId)?.id ?? enabledAgents[0]?.id ?? "");
   const targetAgent = enabledAgents.find((agent) => agent.id === targetId);
   const targetUnavailable = snapshot?.availability?.find((item) => item.id === targetId)?.available === false;
-  const targetBusy = tasks.some((task) => task.agentId === targetId && unfinished(task));
+  // 同一 Agent 繁忙时新任务排队，前一个结束后自动启动；只有排队已满才禁止提交（#2772）。
+  const targetQueue = agentQueueState(tasks, targetId, snapshot?.capabilities?.maxQueuedPerAgent);
   const targetCwd = continuation?.cwd ?? cwd;
   const formDisabledReason = !snapshot ? "正在读取协作配置。"
     : !snapshot.config.enabled ? "请先启用外部子 Agent 并保存设置。"
     : !targetAgent ? "请先启用至少一个 CLI 并保存配置。"
     : targetUnavailable ? "目标 CLI 的可执行文件不可用，请检查路径并保存。"
-    : targetBusy ? "此 Agent 已有排队或执行中的任务，请等待结束后再提交。"
+    : targetQueue.full ? tf("此 Agent 的排队任务已达上限（{0} 个），请等待前面的任务结束或取消部分排队任务。", [targetQueue.limit])
     : continuation && (continuation.status !== "completed" || !continuation.sessionId) ? "该任务目前无法续聊，请创建新任务。"
     : "";
   const agentName = (id: string) => snapshot?.config.agents.find((agent) => agent.id === id)?.name ?? id;
@@ -295,7 +300,7 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
       setPrompt("");
       setContinueTaskId("");
       setCwd(targetCwd);
-      setNotice("任务已提交，可在下方查看执行状态。");
+      setNotice(targetQueue.active ? t("任务已提交并进入排队，前面的任务结束后自动启动。") : "任务已提交，可在下方查看执行状态。");
     });
   };
   const continueTask = (task: TaskRecord) => {
@@ -439,7 +444,7 @@ export function AgentCollaborationPage({ defaultCwd = "" }: { defaultCwd?: strin
             <label className="mg-field" htmlFor="agent-collaboration-cwd"><span>工作目录</span><input id="agent-collaboration-cwd" value={targetCwd} disabled={Boolean(continuation) || busy === "submit"} placeholder="/absolute/path/to/project" spellCheck={false} autoCapitalize="off" autoCorrect="off" onChange={(event) => setCwd(event.target.value)} /></label>
           </div>
           <label className="mg-field" htmlFor="agent-collaboration-prompt"><span>{continuation ? "追加任务或问题" : "任务内容"}</span><textarea id="agent-collaboration-prompt" ref={promptRef} rows={4} value={prompt} disabled={busy === "submit"} placeholder={continuation ? "基于刚才的结果，继续…" : "描述目标、需要检查的文件，以及希望返回的结果…"} onChange={(event) => setPrompt(event.target.value)} /></label>
-          <div className="agent-collaboration-form-footer"><p className="agent-collaboration-hint" id="agent-collaboration-submit-hint">{formDisabledReason || "新任务会创建 CLI 会话。已有任务可在结果区选择“继续该任务”。"}</p><button type="submit" className="mg-button mg-primary" aria-describedby="agent-collaboration-submit-hint" disabled={Boolean(busy) || Boolean(formDisabledReason) || !prompt.trim() || !targetCwd.trim()}>{busy === "submit" ? <Loader2 size={15} className="agent-collaboration-spin" /> : <Play size={15} />}{busy === "submit" ? "提交中…" : continuation ? "发送并续聊" : "提交任务"}</button></div>
+          <div className="agent-collaboration-form-footer"><p className="agent-collaboration-hint" id="agent-collaboration-submit-hint">{formDisabledReason || (targetQueue.active ? tf("此 Agent 还有 {0} 个任务未结束，新任务会排队，前面的结束后按提交顺序自动启动。", [targetQueue.active]) : "新任务会创建 CLI 会话。已有任务可在结果区选择“继续该任务”。")}</p><button type="submit" className="mg-button mg-primary" aria-describedby="agent-collaboration-submit-hint" disabled={Boolean(busy) || Boolean(formDisabledReason) || !prompt.trim() || !targetCwd.trim()}>{busy === "submit" ? <Loader2 size={15} className="agent-collaboration-spin" /> : <Play size={15} />}{busy === "submit" ? "提交中…" : continuation ? "发送并续聊" : "提交任务"}</button></div>
         </form>
       </section>
 

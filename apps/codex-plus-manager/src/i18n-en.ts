@@ -2658,6 +2658,9 @@ export const EN_PLAIN: Record<string, string> = {
   "Key 不限额度": "Key has no quota limit",
   "这个 Key 还没有消费记录，拿不到分组倍率": "This key has no usage records yet, so the group rate is unknown",
   "分组倍率取自最近一次消费记录": "Group rate taken from the latest usage record",
+  "刷新 sub2api 倍率和余额": "Refresh sub2api rate and balance",
+  // 子 Agent 任务排队（#2772）
+  "任务已提交并进入排队，前面的任务结束后自动启动。": "Task submitted and queued. It starts automatically when the tasks ahead of it finish.",
 };
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
@@ -2676,6 +2679,9 @@ export const EN_TEMPLATE: Record<string, string> = {
   "{0} 剩 {1}": "{0}: {1} left",
   "倍率接口：{0}": "Rate endpoint: {0}",
   "余额接口：{0}": "Balance endpoint: {0}",
+  // 子 Agent 任务排队（#2772）
+  "此 Agent 的排队任务已达上限（{0} 个），请等待前面的任务结束或取消部分排队任务。": "This agent's queue is full ({0} tasks). Wait for earlier tasks to finish or cancel some queued tasks.",
+  "此 Agent 还有 {0} 个任务未结束，新任务会排队，前面的结束后按提交顺序自动启动。": "This agent still has {0} unfinished task(s). New tasks are queued and start automatically in submission order.",
   "连接 {0} 时带上：": "When connecting to {0}, add:",
   "用到时下载并缓存在本机。来源：{0}（{1}）": "Downloaded when needed and cached locally. Source: {0} ({1})",
   "清除{0}": "Clear {0}",

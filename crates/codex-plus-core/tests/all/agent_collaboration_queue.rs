@@ -1,0 +1,326 @@
+//! 同一 Agent 的任务排队（#2772）：繁忙时新任务排队、按提交顺序启动、有上限、
+//! 可取消排队中的任务，前一个失败后下一个仍会启动；执行进程失联时排队任务不会卡在 queued。
+//! 这些用例只用各自的临时状态文件，不改进程级状态，无需全局锁。
+
+use codex_plus_core::agent_collaboration::{
+    CollaborationConfig, MAX_QUEUED_PER_AGENT, QueueTurn, Store, TaskRequest,
+};
+use serde_json::{Value, json};
+
+fn store(temp: &tempfile::TempDir) -> Store {
+    Store::new(temp.path().join("collaboration.sqlite3"))
+}
+
+fn enable(store: &Store, ids: &[&str]) {
+    let mut config = CollaborationConfig::default();
+    config.enabled = true;
+    for agent in &mut config.agents {
+        agent.enabled = ids.contains(&agent.id.as_str());
+        // 仅作为真实存在、可执行的文件通过路径探测；Store 层用例不会启动它。
+        agent.executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+    }
+    store.save_config(config).unwrap();
+}
+
+fn request(temp: &tempfile::TempDir, agent: &str, prompt: &str) -> TaskRequest {
+    TaskRequest {
+        agent_id: agent.to_string(),
+        prompt: prompt.to_string(),
+        cwd: temp.path().to_string_lossy().into_owned(),
+        continue_task_id: None,
+    }
+}
+
+#[test]
+fn busy_agent_queues_new_tasks_and_starts_them_in_submission_order_even_after_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(&temp);
+    enable(&store, &["codex", "claude"]);
+    let first = store.submit(request(&temp, "codex", "第一个")).unwrap();
+    let second = store.submit(request(&temp, "codex", "第二个")).unwrap();
+    let third = store.submit(request(&temp, "codex", "第三个")).unwrap();
+    assert_eq!(first.progress, "等待启动 CLI");
+    assert_eq!(second.status, "queued");
+    assert!(
+        second.progress.contains("前面还有 1 个"),
+        "{}",
+        second.progress
+    );
+    assert!(
+        third.progress.contains("前面还有 2 个"),
+        "{}",
+        third.progress
+    );
+
+    // 不同 Agent 之间仍然并行。
+    let other = store.submit(request(&temp, "claude", "并行")).unwrap();
+    assert!(store.claim(&other.id).unwrap());
+
+    // 后提交的任务不能插队。
+    assert!(!store.claim(&third.id).unwrap());
+    assert!(!store.claim(&second.id).unwrap());
+    assert!(store.claim(&first.id).unwrap());
+    assert_eq!(
+        store.poll_queue(&third.id).unwrap(),
+        QueueTurn::Wait { ahead: 2 }
+    );
+    assert_eq!(store.task(&third.id).unwrap().status, "queued");
+
+    // 前一个失败后，下一个照常按顺序启动。
+    store
+        .finish(&first.id, "failed", "", "原生 CLI 登录失败", "")
+        .unwrap();
+    assert!(!store.claim(&third.id).unwrap());
+    assert_eq!(
+        store.poll_queue(&third.id).unwrap(),
+        QueueTurn::Wait { ahead: 1 }
+    );
+    assert!(
+        store
+            .task(&third.id)
+            .unwrap()
+            .progress
+            .contains("前面还有 1 个")
+    );
+    assert!(store.claim(&second.id).unwrap());
+    assert_eq!(store.task(&second.id).unwrap().status, "running");
+
+    store
+        .finish(&second.id, "completed", "done", "", "native-2")
+        .unwrap();
+    assert_eq!(store.poll_queue(&third.id).unwrap(), QueueTurn::Start);
+    assert_eq!(store.task(&third.id).unwrap().status, "running");
+    // 已认领的任务不会被重复启动。
+    assert_eq!(store.poll_queue(&third.id).unwrap(), QueueTurn::Stop);
+}
+
+#[test]
+fn queue_has_a_per_agent_limit_with_a_clear_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(&temp);
+    enable(&store, &["codex", "claude"]);
+    let running = store.submit(request(&temp, "codex", "运行中")).unwrap();
+    assert!(store.claim(&running.id).unwrap());
+    let mut queued = Vec::new();
+    for index in 0..MAX_QUEUED_PER_AGENT {
+        queued.push(
+            store
+                .submit(request(&temp, "codex", &format!("排队 {index}")))
+                .unwrap(),
+        );
+    }
+    let error = store
+        .submit(request(&temp, "codex", "超出上限"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("上限"), "{error}");
+    assert!(error.contains(&MAX_QUEUED_PER_AGENT.to_string()), "{error}");
+    assert_eq!(
+        store.snapshot().unwrap()["tasks"].as_array().unwrap().len(),
+        MAX_QUEUED_PER_AGENT + 1,
+        "超限时不写入任务"
+    );
+    assert_eq!(
+        store.snapshot().unwrap()["capabilities"]["maxQueuedPerAgent"],
+        MAX_QUEUED_PER_AGENT
+    );
+
+    // 上限按 Agent 计算，其他 Agent 不受影响。
+    store
+        .submit(request(&temp, "claude", "其他 Agent"))
+        .unwrap();
+    // 取消一个排队任务后腾出位置。
+    store.cancel(&queued[0].id).unwrap();
+    store.submit(request(&temp, "codex", "补位")).unwrap();
+}
+
+#[test]
+fn cancelling_a_queued_task_removes_it_from_the_queue() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(&temp);
+    enable(&store, &["codex"]);
+    let first = store.submit(request(&temp, "codex", "第一个")).unwrap();
+    let second = store.submit(request(&temp, "codex", "第二个")).unwrap();
+    let third = store.submit(request(&temp, "codex", "第三个")).unwrap();
+    assert!(store.claim(&first.id).unwrap());
+
+    let cancelled = store.cancel(&second.id).unwrap();
+    assert_eq!(cancelled.status, "cancelled");
+    assert!(cancelled.progress.contains("尚未启动"));
+    assert_eq!(store.poll_queue(&second.id).unwrap(), QueueTurn::Stop);
+    assert!(!store.claim(&second.id).unwrap());
+    assert_eq!(
+        store.poll_queue(&third.id).unwrap(),
+        QueueTurn::Wait { ahead: 1 }
+    );
+
+    store
+        .finish(&first.id, "completed", "done", "", "native-1")
+        .unwrap();
+    assert!(store.claim(&third.id).unwrap());
+    assert_eq!(store.task(&second.id).unwrap().status, "cancelled");
+}
+
+/// 直接改写持久化记录里某个任务的字段，模拟执行进程失联后租约过期。
+fn rewrite_task(store: &Store, index: usize, field: &str, value: Value) {
+    let connection = rusqlite::Connection::open(store.path()).unwrap();
+    let payload: String = connection
+        .query_row(
+            "SELECT payload FROM collaboration_state WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut state: Value = serde_json::from_str(&payload).unwrap();
+    state["tasks"][index][field] = value;
+    connection
+        .execute(
+            "UPDATE collaboration_state SET payload=?1 WHERE id=1",
+            [state.to_string()],
+        )
+        .unwrap();
+}
+
+#[test]
+fn queued_tasks_of_a_lost_process_fail_with_a_reason_instead_of_staying_queued() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(&temp);
+    enable(&store, &["codex"]);
+    let running = store.submit(request(&temp, "codex", "运行中")).unwrap();
+    assert!(store.claim(&running.id).unwrap());
+    let lost = store
+        .submit(request(&temp, "codex", "失联进程的排队任务"))
+        .unwrap();
+    let next = store.submit(request(&temp, "codex", "之后提交")).unwrap();
+
+    // 提交 lost 的进程崩溃，不再续租：租约过期后标记为未启动的失败。
+    rewrite_task(&store, 1, "updatedAtMs", json!(1));
+    let result = store.task(&lost.id).unwrap();
+    assert_eq!(result.status, "failed");
+    assert!(result.error.contains("未启动"), "{}", result.error);
+    assert!(result.error.contains("重新提交"), "{}", result.error);
+    assert_eq!(
+        store.poll_queue(&next.id).unwrap(),
+        QueueTurn::Wait { ahead: 1 },
+        "失联的排队任务不再挡住后面的任务"
+    );
+
+    // 正常退出时由执行进程主动放弃仍在排队的任务；已启动的任务不受影响。
+    assert!(
+        store
+            .abandon_queued(&next.id, "协作执行进程已退出，任务未启动")
+            .unwrap()
+    );
+    let abandoned = store.task(&next.id).unwrap();
+    assert_eq!(abandoned.status, "failed");
+    assert_eq!(abandoned.error, "协作执行进程已退出，任务未启动");
+    assert!(!store.abandon_queued(&running.id, "不应生效").unwrap());
+    assert_eq!(store.task(&running.id).unwrap().status, "running");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_delegations_to_a_busy_agent_queue_and_run_one_after_another() {
+    use codex_plus_core::agent_collaboration::mcp;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(&temp);
+    let log = temp.path().join("order.log");
+    let executable = temp.path().join("controlled-codex");
+    // 测试逐字定义的可控 CLI：记录开始/结束顺序，prompt 以 fail 开头时失败退出。
+    std::fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\np=$(/bin/cat)\necho \"start $p\" >> '{log}'\n/bin/sleep 0.2\necho \"end $p\" >> '{log}'\ncase \"$p\" in fail*) exit 2;; esac\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"native-1\"}}' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"done\"}}}}' '{{\"type\":\"turn.completed\",\"usage\":{{}}}}'\n",
+            log = log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut config = CollaborationConfig::default();
+    config.enabled = true;
+    let agent = config
+        .agents
+        .iter_mut()
+        .find(|agent| agent.id == "codex")
+        .unwrap();
+    agent.enabled = true;
+    agent.executable = executable.to_string_lossy().into_owned();
+    store.save_config(config).unwrap();
+
+    let mut ids = Vec::new();
+    for (index, prompt) in ["fail-1", "ok-2", "ok-3"].into_iter().enumerate() {
+        let response = mcp::handle_request(
+            &store,
+            json!({"jsonrpc":"2.0","id":index,"method":"tools/call","params":{"name":"delegate_to_codex",
+                "arguments":{"prompt":prompt,"cwd":temp.path().to_str().unwrap()}}}),
+        )
+        .unwrap();
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let result: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(result["task"]["status"], "queued");
+        if index > 0 {
+            let progress = result["task"]["progress"].as_str().unwrap();
+            assert!(
+                progress.contains(&format!("前面还有 {index} 个")),
+                "{progress}"
+            );
+        }
+        ids.push(result["taskId"].as_str().unwrap().to_owned());
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while !ids.iter().all(|id| {
+            codex_plus_core::agent_collaboration::is_terminal(&store.task(id).unwrap().status)
+        }) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("排队任务应在前一个结束后自动启动并完成");
+
+    // 各自按 taskId 收取结果。
+    let statuses: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            let response = mcp::handle_request(
+                &store,
+                json!({"jsonrpc":"2.0","id":"get","method":"tools/call","params":{"name":"get_task","arguments":{"taskId":id}}}),
+            )
+            .unwrap();
+            let task: Value =
+                serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            (task["status"].as_str().unwrap().to_owned(), task["answer"].as_str().unwrap().to_owned())
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            ("failed".to_owned(), String::new()),
+            ("completed".to_owned(), "done".to_owned()),
+            ("completed".to_owned(), "done".to_owned()),
+        ]
+    );
+    // 同一 Agent 严格串行：上一个结束后下一个才开始。
+    assert_eq!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            "start fail-1",
+            "end fail-1",
+            "start ok-2",
+            "end ok-2",
+            "start ok-3",
+            "end ok-3"
+        ]
+    );
+}

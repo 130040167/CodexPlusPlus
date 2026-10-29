@@ -19,6 +19,22 @@ pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_TASKS: usize = 1000;
 const WORKER_LEASE_MS: u64 = 30 * 1000;
 const QUEUED_LEASE_MS: u64 = 60 * 1000;
+/// 排队任务由提交它的进程定期续租；间隔远小于 QUEUED_LEASE_MS，进程失联后才会过期。
+const QUEUE_HEARTBEAT_MS: u64 = 10 * 1000;
+/// 每个 Agent 同一时间只运行一个任务；繁忙时新任务排队，最多排这么多个（不含正在运行的，#2772）。
+pub const MAX_QUEUED_PER_AGENT: usize = 8;
+const QUEUE_ABANDONED_PROGRESS: &str = "排队任务未启动";
+
+/// 排队任务轮询一次的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueTurn {
+    /// 已轮到并认领执行权，状态已转为 running。
+    Start,
+    /// 仍在排队；ahead 为同一 Agent 排在前面的未结束任务数（含正在运行的）。
+    Wait { ahead: usize },
+    /// 已取消、已结束或 Agent/协作已关闭，不再启动。
+    Stop,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -306,7 +322,8 @@ impl Store {
             tasks.truncate(50.max(active_count));
             Ok(
                 json!({"config": state.config, "availability": availability, "tasks": tasks,
-                "capabilities": {"cliTasks": true, "desktopSessionWake": false}}),
+                "capabilities": {"cliTasks": true, "desktopSessionWake": false,
+                    "maxQueuedPerAgent": MAX_QUEUED_PER_AGENT}}),
             )
         })
     }
@@ -344,13 +361,22 @@ impl Store {
             if state.tasks.len() >= MAX_TASKS {
                 bail!("协作记录已达到 1000 条上限，请使用新的协作状态文件");
             }
-            if state
+            // 同一 Agent 繁忙时排队而不是拒绝；排队数有上限，避免无界堆积（#2772）。
+            let queued = state
                 .tasks
                 .iter()
-                .any(|task| task.agent_id == request.agent_id && !is_terminal(&task.status))
-            {
-                bail!("此 agent 已有排队或运行中的任务，请等待结束后再提交");
+                .filter(|task| task.agent_id == request.agent_id && task.status == "queued")
+                .count();
+            if queued >= MAX_QUEUED_PER_AGENT {
+                bail!(
+                    "此 agent 已有 {queued} 个排队任务，达到每个 Agent 最多排队 {MAX_QUEUED_PER_AGENT} 个的上限；请等待前面的任务结束，或取消部分排队任务后再提交"
+                );
             }
+            let ahead = state
+                .tasks
+                .iter()
+                .filter(|task| task.agent_id == request.agent_id && !is_terminal(&task.status))
+                .count();
             let (parent_task_id, session_id) =
                 if let Some(parent_id) = request.continue_task_id.as_deref() {
                     let parent = state
@@ -389,7 +415,7 @@ impl Store {
                 created_at_ms: timestamp,
                 updated_at_ms: timestamp,
                 cancel_requested: false,
-                progress: "等待启动 CLI".to_string(),
+                progress: queue_progress(ahead),
             };
             state.tasks.push(task.clone());
             Ok(task)
@@ -400,23 +426,68 @@ impl Store {
         self.with_state(|state| Ok(find_task(state, id)?.clone()))
     }
 
-    /// 事务内竞争唯一执行权，重复 spawn 不会重复运行同一任务。
+    /// 事务内竞争唯一执行权，重复 spawn 不会重复运行同一任务；未轮到时返回 false。
     pub fn claim(&self, id: &str) -> anyhow::Result<bool> {
+        Ok(self.poll_queue(id)? == QueueTurn::Start)
+    }
+
+    /// 排队任务的单次轮询：轮到时认领执行权，否则刷新排队进度并续租。
+    /// 同一 Agent 按提交顺序启动；前一个任务结束（完成、失败、取消、中断）后下一个才会轮到。
+    pub fn poll_queue(&self, id: &str) -> anyhow::Result<QueueTurn> {
         self.with_state(|state| {
+            let index = state
+                .tasks
+                .iter()
+                .position(|task| task.id == id)
+                .context("找不到协作任务")?;
+            let agent_id = state.tasks[index].agent_id.clone();
             let enabled = state.config.enabled
-                && state.config.agents.iter().any(|agent| {
-                    agent.enabled
-                        && state
-                            .tasks
-                            .iter()
-                            .any(|task| task.id == id && task.agent_id == agent.id)
-                });
-            let task = find_task(state, id)?;
+                && state
+                    .config
+                    .agents
+                    .iter()
+                    .any(|agent| agent.enabled && agent.id == agent_id);
+            let task = &state.tasks[index];
             if task.status != "queued" || task.cancel_requested || !enabled {
+                return Ok(QueueTurn::Stop);
+            }
+            let ahead = tasks_ahead(&state.tasks, index);
+            let timestamp = now_ms();
+            let task = &mut state.tasks[index];
+            if ahead == 0 {
+                task.status = "running".to_string();
+                task.progress = "正在启动 CLI".to_string();
+                task.updated_at_ms = timestamp;
+                return Ok(QueueTurn::Start);
+            }
+            let progress = queue_progress(ahead);
+            // 内容未变且租约仍新时不写库，避免排队轮询反复重写整份记录。
+            if task.progress != progress
+                || timestamp.saturating_sub(task.updated_at_ms) >= QUEUE_HEARTBEAT_MS
+            {
+                task.progress = progress;
+                task.updated_at_ms = timestamp;
+            }
+            Ok(QueueTurn::Wait { ahead })
+        })
+    }
+
+    /// 执行进程退出时放弃仍在排队的任务：任务从未启动，标记失败并说明可重新提交。
+    /// 已不在排队（已启动或已结束）时不做改动并返回 false。
+    pub fn abandon_queued(&self, id: &str, reason: &str) -> anyhow::Result<bool> {
+        self.with_state(|state| {
+            let task = find_task(state, id)?;
+            if task.status != "queued" {
                 return Ok(false);
             }
-            task.status = "running".to_string();
-            task.progress = "正在启动 CLI".to_string();
+            task.status = if task.cancel_requested {
+                "cancelled"
+            } else {
+                "failed"
+            }
+            .to_string();
+            task.error = bounded_text(reason, 8192);
+            task.progress = QUEUE_ABANDONED_PROGRESS.to_string();
             task.updated_at_ms = now_ms();
             Ok(true)
         })
@@ -531,6 +602,30 @@ impl Store {
     }
 }
 
+/// 同一 Agent 排在 index 之前的未结束任务数：所有运行中的任务加上更早提交的排队任务。
+/// 任务按提交顺序追加且不删除，向量顺序即排队顺序。
+fn tasks_ahead(tasks: &[TaskRecord], index: usize) -> usize {
+    let agent_id = &tasks[index].agent_id;
+    tasks
+        .iter()
+        .enumerate()
+        .filter(|(position, task)| {
+            *position != index
+                && task.agent_id == *agent_id
+                && !is_terminal(&task.status)
+                && (task.status != "queued" || *position < index)
+        })
+        .count()
+}
+
+fn queue_progress(ahead: usize) -> String {
+    if ahead == 0 {
+        "等待启动 CLI".to_string()
+    } else {
+        format!("排队中：同一 Agent 前面还有 {ahead} 个任务，轮到后自动启动")
+    }
+}
+
 fn find_task<'a>(state: &'a mut State, id: &str) -> anyhow::Result<&'a mut TaskRecord> {
     state
         .tasks
@@ -616,6 +711,19 @@ fn expire_abandoned_tasks(state: &mut State) {
             WORKER_LEASE_MS
         };
         if !is_terminal(&task.status) && timestamp.saturating_sub(task.updated_at_ms) > lease {
+            if task.status == "queued" {
+                // 排队任务从未启动 CLI，结果是确定的：没有执行任何操作，可以放心重新提交。
+                task.status = if task.cancel_requested {
+                    "cancelled"
+                } else {
+                    "failed"
+                }
+                .to_string();
+                task.error = "排队期间提交此任务的执行进程（Codex++ 或 MCP）已退出或失联，任务未启动，没有执行任何操作；可以重新提交。".to_string();
+                task.progress = QUEUE_ABANDONED_PROGRESS.to_string();
+                task.updated_at_ms = timestamp;
+                continue;
+            }
             task.status = if task.cancel_requested {
                 "cancelled"
             } else {

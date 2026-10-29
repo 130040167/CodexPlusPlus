@@ -17,6 +17,7 @@ mod common;
 mod ads;
 mod agent_collaboration;
 mod agent_collaboration_integration;
+mod agent_collaboration_queue;
 mod agent_collaboration_refresh;
 mod agent_pet_settings;
 mod aggregate_default_login_sync;
