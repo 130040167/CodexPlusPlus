@@ -2667,6 +2667,7 @@ export const EN_TEMPLATE: Record<string, string> = {
   "{0} 剩余 {1}": "{0}: {1} left",
   "订阅剩余 {0}": "Subscription left {0}",
   "余额 {0}": "Balance {0}",
+  "剩 {0}": "{0} left",
   "{0} 剩 {1}": "{0}: {1} left",
   "倍率接口：{0}": "Rate endpoint: {0}",
   "余额接口：{0}": "Balance endpoint: {0}",

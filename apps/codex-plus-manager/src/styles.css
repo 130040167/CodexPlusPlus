@@ -11802,6 +11802,10 @@ select {
 }
 .relay-sub2api-refresh:hover:not(:disabled) { background: hsl(var(--muted)); opacity: 1; }
 .relay-sub2api-refresh:disabled { cursor: default; }
+/* 网关供应商池右侧：倍率 + 余额徽章，复用订阅额度徽章（.gw-quota-badge）的样式。 */
+.gw-sub2api-label { font-variant-numeric: tabular-nums; }
+.gw-sub2api-label em { margin-left: 6px; color: hsl(var(--status-warning)); font-style: normal; }
+.gw-sub2api-status { display: inline-flex; align-items: center; gap: 2px; }
 /* 第二行只剩地址：不再用主题色，弱化成辅助信息。 */
 .relay-management-page .relay-summary small {
   overflow: hidden;

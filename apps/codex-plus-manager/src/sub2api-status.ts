@@ -136,7 +136,7 @@ export function formatSub2ApiMultiplier(value: number): string {
 }
 
 export function formatSub2ApiAmount(value: number, unit: string): string {
-  const amount = value.toFixed(2);
+  const amount = value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const normalized = unit.trim().toUpperCase();
   if (!normalized || normalized === "USD") return `$${amount}`;
   if (normalized === "CNY" || normalized === "RMB") return `¥${amount}`;
@@ -147,4 +147,15 @@ export function formatSub2ApiAmount(value: number, unit: string): string {
 export function sub2apiAppliedPeak(billing: Sub2ApiBillingInfo | null): number | null {
   const peak = billing?.appliedPeakMultiplier;
   return typeof peak === "number" && Number.isFinite(peak) && peak !== 1 ? peak : null;
+}
+
+/** 供应商池右侧徽章：剩余金额，以及有上限时的剩余比例（画额度条）。 */
+export function sub2apiBalanceBadge(usage: Sub2ApiUsageInfo): { amount: string; ratio: number | null; tone: "ok" | "mid" | "low" } | null {
+  if (usage.remaining === null) return null;
+  const ratio = usage.kind === "keyQuota" && usage.quotaLimit && usage.quotaLimit > 0
+    ? Math.min(1, Math.max(0, usage.remaining / usage.quotaLimit))
+    : null;
+  const exhausted = usage.remaining <= 0 || !usage.isValid || usage.rateLimits.some((window) => window.remaining <= 0);
+  const tone = exhausted ? "low" : ratio !== null && ratio <= 0.1 ? "low" : ratio !== null && ratio <= 0.3 ? "mid" : "ok";
+  return { amount: formatSub2ApiAmount(usage.remaining, usage.unit), ratio, tone };
 }

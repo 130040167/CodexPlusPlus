@@ -5,6 +5,7 @@ import {
   formatSub2ApiMultiplier,
   rememberSub2ApiNegative,
   sub2apiAppliedPeak,
+  sub2apiBalanceBadge,
   sub2apiGatewayCacheKey,
   sub2apiNegativeCached,
   sub2apiProbeCacheKey,
@@ -12,6 +13,7 @@ import {
   SUB2API_NEGATIVE_TTL_MS,
   type Sub2ApiBillingInfo,
   type Sub2ApiProbeProfile,
+  type Sub2ApiUsageInfo,
 } from "./sub2api-status.ts";
 
 const profile = (patch: Partial<Sub2ApiProbeProfile> = {}): Sub2ApiProbeProfile => ({
@@ -66,6 +68,7 @@ test("formats multipliers, amounts and peak hints", () => {
   assert.equal(formatSub2ApiMultiplier(0.9), "0.9x");
   assert.equal(formatSub2ApiMultiplier(1.234567), "1.2346x");
   assert.equal(formatSub2ApiAmount(12.345, "USD"), "$12.35");
+  assert.equal(formatSub2ApiAmount(97505834.07, "USD"), "$97,505,834.07");
   assert.equal(formatSub2ApiAmount(3, "CNY"), "¥3.00");
   assert.equal(formatSub2ApiAmount(3, "credits"), "3.00 credits");
   const billing = { appliedPeakMultiplier: 1.5 } as Sub2ApiBillingInfo;
@@ -86,4 +89,16 @@ test("gateway pool entries are probed by id unless they are accounts or official
   assert.equal(sub2apiGatewayCacheKey({ ...entry, account: "chatgpt" }), "");
   assert.equal(sub2apiGatewayCacheKey({ ...entry, keyCount: 0 }), "");
   assert.equal(sub2apiGatewayCacheKey({ ...entry, baseUrl: " " }), "");
+});
+
+test("pool badge shows remaining amount, quota ratio and exhausted tone", () => {
+  const usage = (patch: Partial<Sub2ApiUsageInfo>): Sub2ApiUsageInfo => ({
+    endpoint: "", kind: "wallet", isValid: true, planName: null, remaining: 12, quotaLimit: null, quotaUsed: null,
+    unit: "USD", rateLimits: [], ...patch,
+  });
+  assert.deepEqual(sub2apiBalanceBadge(usage({})), { amount: "$12.00", ratio: null, tone: "ok" });
+  assert.deepEqual(sub2apiBalanceBadge(usage({ kind: "keyQuota", remaining: 10, quotaLimit: 50 })), { amount: "$10.00", ratio: 0.2, tone: "mid" });
+  assert.equal(sub2apiBalanceBadge(usage({ remaining: 0 }))?.tone, "low");
+  assert.equal(sub2apiBalanceBadge(usage({ rateLimits: [{ window: "5h", limit: 10, used: 10, remaining: 0 }] }))?.tone, "low");
+  assert.equal(sub2apiBalanceBadge(usage({ remaining: null })), null);
 });

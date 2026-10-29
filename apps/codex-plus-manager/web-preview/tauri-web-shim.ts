@@ -503,8 +503,8 @@ export async function invoke<T = unknown>(command: string, args: Record<string, 
       if ((args as { id?: string }).id !== "sub2api-pool") return ok({ isSub2api: false, billing: null, usage: null, detail: "演示模式" }) as T;
       return ok({
         isSub2api: true,
-        billing: null,
-        usage: { endpoint: "https://sub2api.example.com/v1/usage", kind: "keyQuota", isValid: true, planName: null, remaining: 30, quotaLimit: 50, quotaUsed: 20, unit: "USD", rateLimits: [{ window: "5h", limit: 10, used: 10, remaining: 0 }] },
+        billing: { endpoint: "https://sub2api.example.com/v1/sub2api/billing", groupRateMultiplier: 0.28, userRateMultiplier: null, resolvedRateMultiplier: 0.28, peakRateEnabled: false, peakRateMultiplier: null, appliedPeakMultiplier: null, effectiveRateMultiplier: 0.28, observedAt: "2026-10-29T10:00:00Z" },
+        usage: { endpoint: "https://sub2api.example.com/v1/usage", kind: "wallet", isValid: true, planName: "钱包余额", remaining: 97505834.07, quotaLimit: null, quotaUsed: null, unit: "USD", rateLimits: [] },
         detail: "",
       }) as T;
     }

@@ -8,7 +8,7 @@ import { createPortal } from "react-dom";
 import { appConfirm } from "./app-dialog";
 import { Check, ChevronRight, Copy, GripVertical, Plus, RefreshCw, Search, X } from "lucide-react";
 import { t, tf } from "./i18n";
-import { Sub2ApiCardLine, useSub2ApiProbe } from "./Sub2ApiCardLine";
+import { Sub2ApiPoolBadge, Sub2ApiPoolLabel, useSub2ApiProbe } from "./Sub2ApiCardLine";
 import { sub2apiGatewayCacheKey, type Sub2ApiProbe } from "./sub2api-status";
 import {
   defaultProviderAgents,
@@ -485,7 +485,6 @@ function PoolRow({
         <div className="gw-pool-main">
           <strong>{maskAccountName(entry.name)}</strong>
           <small>{sub}</small>
-          {sub2api.probe ? <Sub2ApiCardLine loading={sub2api.loading} onRefresh={sub2api.refresh} probe={sub2api.probe} /> : null}
         </div>
         <span className="gw-pool-status">
           {newModels ? (
@@ -494,9 +493,11 @@ function PoolRow({
             </button>
           ) : null}
           <i className="gw-dot" data-tone={tone} />
-          {/* 订阅账号空闲时显示套餐（和剩余额度），其它供应商显示 Key 数。 */}
-          {!enabled ? t("已关闭") : status.state === "idle" && entry.account && entry.plan ? entry.plan : <MemberStatusLabel status={status} />}
+          {/* 订阅账号空闲时显示套餐（和剩余额度），sub2api 显示倍率（和余额），其它供应商显示 Key 数。 */}
+          {!enabled ? t("已关闭") : status.state === "idle" && entry.account && entry.plan ? entry.plan
+            : status.state === "idle" && sub2api.probe ? <Sub2ApiPoolLabel probe={sub2api.probe} /> : <MemberStatusLabel status={status} />}
           {enabled && entry.quota ? <QuotaBadge quota={entry.quota} /> : null}
+          {enabled && sub2api.probe ? <Sub2ApiPoolBadge loading={sub2api.loading} onRefresh={sub2api.refresh} probe={sub2api.probe} /> : null}
         </span>
         <Switch
           disabled={busy !== null}

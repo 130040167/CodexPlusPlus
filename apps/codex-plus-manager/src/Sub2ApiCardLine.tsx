@@ -1,6 +1,6 @@
 // 供应商卡片上的 sub2api 倍率 / 余额行。直连供应商和网关供应商池共用：
 // 两边只是识别请求不同（直连传整个 profile，网关按 id 由后端取 Key）。
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { RefreshCw } from "lucide-react";
 import { t, tf } from "./i18n";
 import {
@@ -8,6 +8,7 @@ import {
   formatSub2ApiMultiplier,
   rememberSub2ApiNegative,
   sub2apiAppliedPeak,
+  sub2apiBalanceBadge,
   sub2apiNegativeCached,
   SUB2API_POSITIVE_TTL_MS,
   type Sub2ApiProbe,
@@ -85,7 +86,7 @@ export function useSub2ApiProbe(key: string, request: () => Promise<ProbeRespons
   return { probe, loading: state.key === key && state.loading, refresh: () => load(true) };
 }
 
-export function Sub2ApiCardLine({ probe, loading, onRefresh }: { probe: Sub2ApiProbe; loading: boolean; onRefresh: () => void }) {
+function sub2apiParts(probe: Sub2ApiProbe): { text: string; tone?: string }[] {
   const { billing, usage } = probe;
   const peak = sub2apiAppliedPeak(billing);
   const parts: { text: string; tone?: string }[] = [];
@@ -120,30 +121,71 @@ export function Sub2ApiCardLine({ probe, loading, onRefresh }: { probe: Sub2ApiP
       });
     }
   }
-  const title = [
-    billing ? tf("倍率接口：{0}", [billing.endpoint]) : t("这个 sub2api 版本没有倍率接口"),
-    usage ? tf("余额接口：{0}", [usage.endpoint]) : t("余额接口不可用"),
+  return parts;
+}
+
+function sub2apiTitle(probe: Sub2ApiProbe): string {
+  return [
+    probe.billing ? tf("倍率接口：{0}", [probe.billing.endpoint]) : t("这个 sub2api 版本没有倍率接口"),
+    probe.usage ? tf("余额接口：{0}", [probe.usage.endpoint]) : t("余额接口不可用"),
   ].join("\n");
+}
+
+function Sub2ApiRefreshButton({ loading, onRefresh }: { loading: boolean; onRefresh: () => void }) {
   return (
-    <span className="relay-sub2api-line" title={title}>
+    <button
+      aria-label={t("刷新 sub2api 倍率和余额")}
+      className="relay-sub2api-refresh"
+      disabled={loading}
+      onClick={(event) => {
+        event.stopPropagation();
+        onRefresh();
+      }}
+      onKeyDown={(event) => event.stopPropagation()}
+      title={t("刷新 sub2api 倍率和余额")}
+      type="button"
+    >
+      <RefreshCw className={`h-3 w-3 ${loading ? "animate-spin" : ""}`} />
+    </button>
+  );
+}
+
+export function Sub2ApiCardLine({ probe, loading, onRefresh }: { probe: Sub2ApiProbe; loading: boolean; onRefresh: () => void }) {
+  const parts = sub2apiParts(probe);
+  return (
+    <span className="relay-sub2api-line" title={sub2apiTitle(probe)}>
       <span className="relay-tag" data-tone="sub2api">sub2api</span>
       {parts.map((part, index) => (
         <span className="relay-sub2api-part" data-tone={part.tone} key={index}>{part.text}</span>
       ))}
-      <button
-        aria-label={t("刷新 sub2api 倍率和余额")}
-        className="relay-sub2api-refresh"
-        disabled={loading}
-        onClick={(event) => {
-          event.stopPropagation();
-          onRefresh();
-        }}
-        onKeyDown={(event) => event.stopPropagation()}
-        title={t("刷新 sub2api 倍率和余额")}
-        type="button"
-      >
-        <RefreshCw className={`h-3 w-3 ${loading ? "animate-spin" : ""}`} />
-      </button>
+      <Sub2ApiRefreshButton loading={loading} onRefresh={onRefresh} />
+    </span>
+  );
+}
+
+/** 网关供应商池右侧：和订阅账号的「套餐 + 额度条」同一位置、同一样式。 */
+export function Sub2ApiPoolLabel({ probe }: { probe: Sub2ApiProbe }) {
+  const peak = sub2apiAppliedPeak(probe.billing);
+  return (
+    <span className="gw-sub2api-label" title={sub2apiParts(probe).map((part) => part.text).join(" · ")}>
+      {probe.billing ? tf("倍率 {0}", [formatSub2ApiMultiplier(probe.billing.effectiveRateMultiplier)]) : "sub2api"}
+      {peak !== null ? <em>{tf("含高峰 ×{0}", [String(Number(peak.toFixed(4)))])}</em> : null}
+    </span>
+  );
+}
+
+export function Sub2ApiPoolBadge({ probe, loading, onRefresh }: { probe: Sub2ApiProbe; loading: boolean; onRefresh: () => void }) {
+  const badge = probe.usage ? sub2apiBalanceBadge(probe.usage) : null;
+  const details = sub2apiParts(probe).map((part) => part.text).join("\n");
+  return (
+    <span className="gw-sub2api-status">
+      {badge ? (
+        <span className="gw-quota-badge" data-tone={badge.tone} title={`${details}\n${sub2apiTitle(probe)}`}>
+          {badge.ratio !== null ? <i style={{ "--gw-quota": `${Math.round(badge.ratio * 100)}%` } as CSSProperties} /> : null}
+          {probe.usage?.kind === "wallet" ? tf("余额 {0}", [badge.amount]) : tf("剩 {0}", [badge.amount])}
+        </span>
+      ) : null}
+      <Sub2ApiRefreshButton loading={loading} onRefresh={onRefresh} />
     </span>
   );
 }
