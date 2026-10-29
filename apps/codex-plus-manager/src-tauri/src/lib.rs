@@ -269,6 +269,7 @@ pub fn run() {
             commands::startup_options,
             commands::consume_pending_manager_navigation,
             commands::load_overview,
+            commands::codex_app_running,
             commands::launch_codex_plus,
             commands::launch_codex_multi_instance,
             commands::list_codex_multi_instances,

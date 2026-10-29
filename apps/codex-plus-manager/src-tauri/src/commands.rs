@@ -963,6 +963,18 @@ where
     args.into_iter().any(|arg| arg.as_ref() == "--show-update") || env_value == Some("1")
 }
 
+/// 只查 Codex 桌面端进程还在不在，给前端定期轻量轮询用（#2778：在 Codex 自己的窗口里
+/// 退出后，侧栏和顶栏仍显示「运行中 / 停止 Codex」）。不读设置、不探测端口，状态变了
+/// 前端再走完整的 `load_overview`。后台任务失败返回 None，前端忽略这一轮。
+#[tauri::command]
+pub async fn codex_app_running() -> Option<bool> {
+    tauri::async_runtime::spawn_blocking(|| {
+        !codex_plus_core::watcher::find_codex_processes().is_empty()
+    })
+    .await
+    .ok()
+}
+
 #[tauri::command]
 pub async fn load_overview() -> CommandResult<OverviewPayload> {
     let payload = tauri::async_runtime::spawn_blocking(load_overview_payload).await;

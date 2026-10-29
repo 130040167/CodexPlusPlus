@@ -426,3 +426,22 @@ test("添加供应商是弹出框，不再铺在供应商池页面里；池为�
   assert.doesNotMatch(providers, /showCatalog/);
   assert.match(providers, /className="gw-card gw-pool-empty"/);
 });
+
+test("侧栏一级分组标题比子项醒目，快速跳转的快捷键按平台显示且弱化（#2778）", () => {
+  assert.match(functionSource("AppSidebar"), /<kbd>\{paletteShortcut\}<\/kbd>/);
+  assert.doesNotMatch(functionSource("AppSidebar"), /<kbd>⌘K<\/kbd>/);
+  const label = styles.match(/\.side-group-label > button:first-child \{[^}]*\}/)?.[0] ?? "";
+  const item = styles.match(/\n\.side-item \{[^}]*\}/)?.[0] ?? "";
+  const size = (rule: string) => Number(rule.match(/font-size: ([\d.]+)px/)?.[1] ?? 0);
+  assert.ok(size(item) > 0 && size(label) >= size(item), "分组标题字号不能比子项小");
+  assert.match(label, /font-weight: 700/);
+  assert.match(styles, /\.side-search kbd \{[^}]*font-size: 9\.5px/);
+});
+
+test("Codex 在它自己的窗口里退出后，侧栏 / 顶栏的运行状态能跟上（#2778）", () => {
+  const entry = functionSource("App");
+  assert.match(entry, /invoke<boolean \| null>\("codex_app_running"\)/);
+  assert.match(entry, /if \(document\.visibilityState !== "visible"\) return;/);
+  assert.match(entry, /running !== codexAppRunning\) void refreshOverview\(true\)/);
+  assert.match(text, /const codexRunningPollMs = 5_000;/);
+});

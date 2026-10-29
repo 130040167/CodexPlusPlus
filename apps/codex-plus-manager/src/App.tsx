@@ -121,6 +121,7 @@ import { AppDialogHost, appAlert, appConfirm, appPrompt } from "./app-dialog";
 import { GatewayPage, type GatewayTab } from "./GatewayPage";
 import { AgentGlyph, HubOverview, useGatewayPayload } from "./HubOverview";
 import { CommandPalette, type PaletteCommand } from "./CommandPalette";
+import { paletteShortcut } from "./command-palette-model";
 import { SessionsView, sessionDeleteSucceeded } from "./GatewaySessions";
 import { agentName, formatQueueWait, formatRequestCost, maskAccountName, queueWaitMs, QUEUE_REASON_PREFIX, usageRangeStart, type GatewayResult, type UsageCost, type UsageRange } from "./gateway-model";
 import { SessionAgentTabs, type SessionTab } from "./SessionAgentTabs";
@@ -1382,6 +1383,8 @@ const gatewayRouteByTab = { ...Object.fromEntries(Object.entries(gatewayTabByRou
  * 要么不接入、照它自己的配置文件直连。
  */
 const agentHomeRoute: Record<string, Route> = { codex: "overview", claude: "claude", grok: "overview" };
+/** 轻量检查 Codex 进程是否还在的间隔（只在管理器窗口可见时查）。 */
+const codexRunningPollMs = 5_000;
 const agentEntryRoute = (toolId: ToolId) => agentTarget(agentRoutes(toolId), lastAgentRoute.get(toolId), agentHomeRoute[toolId] ?? "overview");
 
 const defaultSettings: BackendSettings = {
@@ -4490,6 +4493,23 @@ export function App() {
   const isGlobalPage = globalNavigationRoutes.includes(route);
   const isManagementScreen = route === "relay" || route === "multiLaunch" || route === "sessions" || route === "context" || route === "skills";
   const codexAppRunning = overview?.runtime_health?.codex_app?.status === "running";
+  // Codex 可能在它自己的窗口里被退出，既不经过 Codex++ 也不触发窗口聚焦（#2778）。
+  // 窗口可见时每 5 秒只查一次进程是否还在，和当前显示不一致再完整刷新概览。
+  useEffect(() => {
+    let disposed = false;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      void invoke<boolean | null>("codex_app_running")
+        .then((running) => {
+          if (!disposed && typeof running === "boolean" && running !== codexAppRunning) void refreshOverview(true);
+        })
+        .catch(() => undefined);
+    }, codexRunningPollMs);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [codexAppRunning]);
   // 「启动 / 重启 Codex」：Codex 页面的顶栏按钮和侧栏播放键共用一份状态，都走 actions.launch / actions.restart。
   const codexToolEntry = toolEntries.find((entry) => entry.id === "codex");
   const codexLaunch: CodexLaunchState = {
@@ -15758,7 +15778,7 @@ function AppSidebar({
       <button className="side-search" data-tour="palette" onClick={onOpenPalette} type="button">
         <Search aria-hidden="true" className="side-item-icon" />
         <span>{t("快速跳转")}</span>
-        <kbd>⌘K</kbd>
+        <kbd>{paletteShortcut}</kbd>
       </button>
 
       <nav aria-label={t("主导航")} className="side-nav">
