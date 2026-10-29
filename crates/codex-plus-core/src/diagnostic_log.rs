@@ -53,7 +53,9 @@ pub fn append_diagnostic_log(event: &str, detail: impl Serialize) -> std::io::Re
         .create(true)
         .append(true)
         .open(path)?;
-    writeln!(file, "{line}")?;
+    // 记录和换行一次写完：`writeln!` 会分两次写，并发写日志时别的记录会插进来，
+    // 两条挤成一行、谁都解析不了。
+    file.write_all(format!("{line}\n").as_bytes())?;
     Ok(())
 }
 
