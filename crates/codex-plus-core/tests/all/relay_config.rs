@@ -101,8 +101,13 @@ command = "npx"
 /// 去掉，否则 codex 以 `invalid transport` 拒载整份 config.toml、桌面版起不来。
 #[test]
 fn preserve_live_app_settings_drops_mcp_entries_without_transport() {
+    // 去掉条目会写诊断日志：日志路径是进程级状态，拿锁并指到临时目录，不写进真实日志。
+    let _state = crate::common::global_state_lock();
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
+    codex_plus_core::diagnostic_log::set_diagnostic_log_path_for_tests(Some(
+        dir.path().join("codex-plus.log"),
+    ));
     std::fs::write(
         home.join("config.toml"),
         r#"[mcp_servers.filled]
@@ -125,11 +130,15 @@ TOKEN = "x"
 
 [mcp_servers.stale]
 enabled = false
+
+[mcp_servers.blank]
+command = ""
 "#;
 
     let preserved =
         codex_plus_core::relay_config::preserve_live_app_settings_for_test(home, template)
             .unwrap();
+    codex_plus_core::diagnostic_log::set_diagnostic_log_path_for_tests(None);
     let doc = preserved.parse::<toml_edit::DocumentMut>().unwrap();
     let servers = doc["mcp_servers"].as_table().expect("合法条目要保留");
 
@@ -141,6 +150,11 @@ enabled = false
         "live 里本来就坏的条目也要去掉，Codex 才能启动：{preserved}"
     );
     assert_eq!(servers["remote"]["url"].as_str(), Some("https://mcp.example/mcp"));
+    assert_eq!(
+        servers["blank"]["command"].as_str(),
+        Some(""),
+        "空串 Codex 也能加载，不算残缺：{preserved}"
+    );
 }
 
 /// 回归（issue #2147）：profile 里本来完整的 MCP 条目，不能被通用配置里的残缺
