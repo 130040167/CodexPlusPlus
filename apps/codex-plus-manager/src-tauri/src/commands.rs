@@ -4626,12 +4626,20 @@ pub fn load_pending_provider_import() -> CommandResult<PendingProviderImportPayl
 
 #[tauri::command]
 pub fn confirm_pending_provider_import() -> CommandResult<SettingsPayload> {
+    let to_pool = codex_plus_core::provider_import::load_pending_provider_import()
+        .ok()
+        .flatten()
+        .is_some_and(|request| codex_plus_core::provider_import::is_pool_import(&request));
     match codex_plus_core::provider_import::confirm_pending_provider_import() {
         Ok(Some(result)) => {
-            let message = if result.imported {
-                format!("已导入供应商配置：{}。", result.profile_name)
-            } else {
-                format!("供应商配置已存在：{}。", result.profile_name)
+            let message = match (to_pool, result.imported) {
+                (true, true) => {
+                    crate::gateway_commands::after_url_pool_import(result.profile_id.clone());
+                    format!("已加入网关供应商池：{}，正在从上游获取模型。", result.profile_name)
+                }
+                (true, false) => format!("供应商池里已有相同地址和 Key 的供应商：{}。", result.profile_name),
+                (false, true) => format!("已导入供应商配置：{}。", result.profile_name),
+                (false, false) => format!("供应商配置已存在：{}。", result.profile_name),
             };
             settings_payload(&message, "供应商导入后重新读取设置失败")
         }

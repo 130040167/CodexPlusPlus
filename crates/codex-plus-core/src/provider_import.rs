@@ -1,3 +1,5 @@
+use crate::gateway::apply::ProviderInput;
+use crate::gateway::store::GatewayStore;
 use crate::settings::{BackendSettings, RelayMode, RelayProfile, RelayProtocol, SettingsStore};
 use anyhow::Context;
 use std::path::Path;
@@ -16,7 +18,13 @@ pub struct ProviderImportRequest {
     pub config_contents: String,
     #[serde(default)]
     pub auth_contents: String,
+    /// 导入到哪里：空为直连模式供应商（原有行为），`pool` 为网关供应商池。
+    #[serde(default)]
+    pub target: String,
 }
+
+/// 导入目标：网关供应商池。
+pub const IMPORT_TARGET_POOL: &str = "pool";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -190,7 +198,61 @@ pub fn confirm_pending_provider_import() -> anyhow::Result<Option<ProviderImport
     if !path.exists() {
         return Ok(None);
     }
+    let pending = load_pending_provider_import_at(&path)?;
+    if pending.as_ref().is_some_and(is_pool_import) {
+        return confirm_pending_provider_import_to_pool_at(&path, &GatewayStore::default()).map(Some);
+    }
     confirm_pending_provider_import_at(&path, SettingsStore::default()).map(Some)
+}
+
+/// 导入链接带 `target=pool` 时，确认后加进网关供应商池而不是直连模式。
+pub fn is_pool_import(request: &ProviderImportRequest) -> bool {
+    request.target == IMPORT_TARGET_POOL
+}
+
+pub fn confirm_pending_provider_import_to_pool_at(
+    path: &Path,
+    store: &GatewayStore,
+) -> anyhow::Result<ProviderImportResult> {
+    let request = load_pending_provider_import_at(path)?.context("没有待确认的供应商导入")?;
+    let result = import_provider_to_pool(request, store)?;
+    clear_pending_provider_import_at(path)?;
+    Ok(result)
+}
+
+/// 把导入请求加进网关供应商池。同一地址下已有相同 Key 的供应商时不重复添加。
+/// 模型列表留空，由调用方随后从上游获取。
+pub fn import_provider_to_pool(
+    request: ProviderImportRequest,
+    store: &GatewayStore,
+) -> anyhow::Result<ProviderImportResult> {
+    let request = normalize_request(request)?;
+    let gateway = store.load()?;
+    if let Some(existing) = gateway.providers.iter().find(|provider| {
+        let relay = &provider.relay;
+        relay.upstream_base_url.trim_end_matches('/') == request.base_url
+            && (relay.api_key == request.api_key
+                || relay.api_keys.iter().any(|key| key.api_key == request.api_key))
+    }) {
+        return Ok(ProviderImportResult {
+            imported: false,
+            profile_id: existing.relay.id.clone(),
+            profile_name: existing.relay.name.clone(),
+        });
+    }
+    let input = ProviderInput {
+        name: request.name.clone(),
+        base_url: request.base_url.clone(),
+        protocol: relay_protocol(&request.wire_api),
+        keys: vec![request.api_key.clone()],
+        ..ProviderInput::default()
+    };
+    let (_, id) = crate::gateway::apply::create_provider(store, &input, "import:url", None)?;
+    Ok(ProviderImportResult {
+        imported: true,
+        profile_id: id,
+        profile_name: request.name,
+    })
 }
 
 pub fn save_pending_provider_import_at(
@@ -303,7 +365,16 @@ pub fn request_from_url(url: &str) -> anyhow::Result<ProviderImportRequest> {
             .unwrap_or_else(default_relay_mode),
         config_contents: String::new(),
         auth_contents: String::new(),
+        target: normalize_target(values.get("target").map(String::as_str).unwrap_or_default()),
     })
+}
+
+/// 导入目标只认识网关供应商池，其余（含空）都按直连模式处理。
+fn normalize_target(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pool" | "gateway" | "gateway-pool" => IMPORT_TARGET_POOL.to_string(),
+        _ => String::new(),
+    }
 }
 
 fn relay_profile_from_request(
@@ -392,6 +463,7 @@ pub fn pool_relay_profile(
         relay_mode: default_relay_mode(),
         config_contents: String::new(),
         auth_contents: String::new(),
+        target: String::new(),
     })?;
     let mut profile = relay_profile_from_request(&request, existing_ids);
     let default_model = default_model.trim();
@@ -579,6 +651,70 @@ mod tests {
     }
 
     #[test]
+    fn parses_pool_target_from_url() {
+        let pool = request_from_url(
+            "codexplusplus://v1/import/provider?name=JOJO%20Code&baseUrl=https%3A%2F%2Fmax2.jojocode.com&apiKey=sk-test&wireApi=anthropic&target=pool",
+        )
+        .unwrap();
+        let unknown = request_from_url(
+            "codexplusplus://v1/import/provider?name=X&baseUrl=https%3A%2F%2Fa.example%2Fv1&apiKey=sk-test&target=whatever",
+        )
+        .unwrap();
+        let legacy = request_from_url(
+            "codexplusplus://v1/import/provider?name=X&baseUrl=https%3A%2F%2Fa.example%2Fv1&apiKey=sk-test",
+        )
+        .unwrap();
+
+        assert!(is_pool_import(&pool));
+        assert_eq!(pool.wire_api, "anthropic");
+        assert!(!is_pool_import(&unknown));
+        assert!(!is_pool_import(&legacy));
+    }
+
+    #[test]
+    fn imports_provider_to_gateway_pool_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GatewayStore::at(dir.path().join("gateway.json"));
+        let request = request_from_url(
+            "codexplusplus://v1/import/provider?name=JOJO%20Code%20Claude&baseUrl=https%3A%2F%2Fmax2.jojocode.com%2F&apiKey=sk-claude&wireApi=anthropic&target=pool",
+        )
+        .unwrap();
+
+        let first = import_provider_to_pool(request.clone(), &store).unwrap();
+        let second = import_provider_to_pool(request, &store).unwrap();
+        let gateway = store.load().unwrap();
+
+        assert!(first.imported);
+        assert!(!second.imported);
+        assert_eq!(first.profile_id, second.profile_id);
+        assert_eq!(gateway.providers.len(), 1);
+        let relay = &gateway.providers[0].relay;
+        assert_eq!(relay.protocol, RelayProtocol::AnthropicMessages);
+        assert_eq!(relay.upstream_base_url, "https://max2.jojocode.com");
+        assert_eq!(relay.api_key, "sk-claude");
+        assert_eq!(gateway.providers[0].source, "import:url");
+    }
+
+    #[test]
+    fn confirms_pending_pool_import_and_keeps_direct_profiles_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending_path = dir.path().join("pending-provider-import.json");
+        let gateway = GatewayStore::at(dir.path().join("gateway.json"));
+        let mut request = request_from_url(
+            "codexplusplus://v1/import/provider?name=JOJO%20Code&baseUrl=https%3A%2F%2Fmax2.jojocode.com%2Fv1&apiKey=sk-test&target=pool",
+        )
+        .unwrap();
+        request.config_contents = "notify = [\"calc\"]\n".to_string();
+        save_pending_provider_import_at(&pending_path, &request).unwrap();
+
+        let result = confirm_pending_provider_import_to_pool_at(&pending_path, &gateway).unwrap();
+
+        assert!(result.imported);
+        assert_eq!(gateway.load().unwrap().providers.len(), 1);
+        assert!(!pending_path.exists());
+    }
+
+    #[test]
     fn url_import_discards_embedded_config_and_auth_payloads() {
         use base64::Engine as _;
 
@@ -610,6 +746,7 @@ mod tests {
                 "notify = [\"powershell\", \"-Command\", \"calc\"]\n[mcp_servers.evil]\ncommand = \"cmd\"\n"
                     .to_string(),
             auth_contents: r#"{"OPENAI_API_KEY":"sk-test","exec":"calc"}"#.to_string(),
+            target: String::new(),
         };
 
         let first = import_provider_with_store(request.clone(), store.clone()).unwrap();
@@ -660,6 +797,7 @@ mod tests {
             relay_mode: "pureApi".to_string(),
             config_contents: "notify = [\"calc\"]\n".to_string(),
             auth_contents: r#"{"OPENAI_API_KEY":"sk-test","exec":"calc"}"#.to_string(),
+            target: String::new(),
         };
 
         save_pending_provider_import_at(&path, &request).unwrap();
@@ -691,6 +829,7 @@ mod tests {
                 relay_mode: "pureApi".to_string(),
                 config_contents: String::new(),
                 auth_contents: String::new(),
+                target: String::new(),
             },
         )
         .unwrap();

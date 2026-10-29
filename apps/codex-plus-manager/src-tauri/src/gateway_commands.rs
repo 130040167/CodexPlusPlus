@@ -804,6 +804,18 @@ fn refresh_added<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
     refresh_agents(result)
 }
 
+/// 网页导入链接（`target=pool`）加进供应商池之后：重写开着的 Agent 配置，
+/// 并在后台从上游获取模型列表（导入链接不带模型），拿到后再补价格。
+pub(crate) fn after_url_pool_import(id: String) {
+    let _ = refresh_added(Ok(()));
+    tauri::async_runtime::spawn(async move {
+        let result = model_sync::fetch_provider_models(&GatewayStore::default(), &id).await;
+        if refresh_agents(result).is_ok() {
+            autofill_prices(Some(id));
+        }
+    });
+}
+
 /// 一键同步价格：按公开价格表更新这个供应商所有模型的价格并保存。
 #[tauri::command]
 pub async fn sync_gateway_provider_prices(id: String) -> CommandResult<Option<GatewayPayload>> {

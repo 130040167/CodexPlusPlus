@@ -937,6 +937,8 @@ type ProviderImportRequest = {
   relayMode: string;
   configContents: string;
   authContents: string;
+  /** 空为直连模式供应商；"pool" 为网关供应商池。 */
+  target?: string;
 };
 
 type PendingProviderImportResult = CommandResult<{
@@ -14837,21 +14839,23 @@ function PendingProviderImportDialog({
   onConfirm: () => void;
   onDismiss: () => void;
 }) {
+  const toPool = request.target === "pool";
   return (
     <div className="modal-backdrop" role="dialog" aria-modal="true">
       <div className="modal-card provider-import-modal">
         <div className="modal-head">
           <div>
             <h2>{t("导入 Codex++ 供应商")}</h2>
-            <p>{t("检测到来自网页的供应商配置导入请求，确认后会写入本机 Codex++。")}</p>
+            <p>{toPool ? t("检测到来自网页的供应商导入请求，确认后会加进网关供应商池，并自动从上游获取模型。") : t("检测到来自网页的供应商配置导入请求，确认后会写入本机 Codex++。")}</p>
           </div>
           <button className="toast-close" onClick={onDismiss} type="button">×</button>
         </div>
         <div className="metric-list">
           <Metric label={t("名称")} value={request.name || t("未命名供应商")} />
+          <Metric label={t("导入到")} value={toPool ? t("网关供应商池") : t("直连模式供应商")} />
           <Metric label="Base URL" value={request.baseUrl || t("未填写")} />
           <Metric label={t("协议")} value={providerImportWireApiLabel(request.wireApi)} />
-          <Metric label={t("模式")} value={providerImportRelayModeLabel(request.relayMode)} />
+          {toPool ? null : <Metric label={t("模式")} value={providerImportRelayModeLabel(request.relayMode)} />}
           <Metric label="API Key" value={maskSecret(request.apiKey)} />
         </div>
         <div className="hint-line" role="note">
@@ -17148,6 +17152,9 @@ function providerImportWireApiLabel(value: string): string {
   const normalized = value.trim().toLowerCase();
   if (normalized === "chat" || normalized === "chat_completions" || normalized === "chat-completions") {
     return "Chat Completions";
+  }
+  if (normalized === "anthropic" || normalized === "anthropic_messages" || normalized === "anthropic-messages" || normalized === "messages") {
+    return "Anthropic Messages";
   }
   return "Responses";
 }
