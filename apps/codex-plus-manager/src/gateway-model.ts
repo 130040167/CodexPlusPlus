@@ -1265,15 +1265,23 @@ export function relativeTime(ms: number, now: number): { text: string; args: Arr
   return { text: "{0}", args: [`${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`] };
 }
 
-/** 名字里的邮箱。前面紧挨着 `*` 等字符的不算（那是已经打过码的邮箱尾巴），保证打码可以重复调用。 */
-const EMAIL_PATTERN = /(?<![A-Za-z0-9._%+*-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+/**
+ * 名字里的邮箱。前面紧挨着 `*` 等字符的不算（那是已经打过码的邮箱尾巴），保证打码可以重复调用。
+ * 不用后行断言 `(?<!…)`：旧版系统 WebKit（16.4 以前的版本）不支持，模块一加载就抛 SyntaxError，
+ * 整个管理器白屏 / 黑屏（#2753）。改成把前一个字符（或行首）捕获进第 1 组，替换时原样放回。
+ */
+const EMAIL_PATTERN = /(^|[^A-Za-z0-9._%+*-])([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/g;
+
+function maskEmailsIn(text: string): string {
+  return text.replace(EMAIL_PATTERN, (_match, lead: string, email: string) => lead + maskEmail(email));
+}
 
 /**
  * 订阅账号的显示名打码：「ChatGPT Pro · me@example.com」「Copilot · octocat」这类名字里的账号部分只露头尾，
  * 名字里出现的邮箱也一样。只在显示时处理，存储的名字不变；普通供应商名不受影响。
  */
 export function maskAccountName(name: string): string {
-  const masked = name.replace(EMAIL_PATTERN, maskEmail);
+  const masked = maskEmailsIn(name);
   const match = /^((?:ChatGPT|Copilot|SuperGrok|GitHub Copilot)[^·]*·\s*)(.+)$/.exec(masked);
   // 已经打过码的（带 *）原样返回：名字可能先打码再传给头像等组件，再打一次会变形。
   if (!match || match[2].includes("@") || match[2].includes("*")) return masked;
@@ -1290,7 +1298,7 @@ export function maskAccountText(text: string): string {
     .split(/(「[^」]+」)/)
     .map((part) => (part.startsWith("「") && part.endsWith("」")
       ? `「${maskAccountName(part.slice(1, -1))}」`
-      : part.replace(EMAIL_PATTERN, maskEmail)))
+      : maskEmailsIn(part)))
     .join("");
 }
 

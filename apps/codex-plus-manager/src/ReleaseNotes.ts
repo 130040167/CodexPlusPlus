@@ -48,8 +48,19 @@ const heading = /^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/;
 const rule = /^\s{0,3}(?:\*\s*){3,}$|^\s{0,3}(?:-\s*){3,}$|^\s{0,3}(?:_\s*){3,}$/;
 const tableDivider = /^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/;
 
+/** 按未转义的 `|` 切表格列。手写循环而不用后行断言 `(?<!\\)`：旧版系统 WebKit 不支持，打开更新说明会直接报错（#2753）。 */
 function cells(line: string): string[] {
-  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split(/(?<!\\)\|/).map((cell) => cell.trim());
+  const row = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  const result: string[] = [];
+  let start = 0;
+  for (let index = 0; index < row.length; index += 1) {
+    if (row[index] === "|" && row[index - 1] !== "\\") {
+      result.push(row.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  result.push(row.slice(start).trim());
+  return result;
 }
 
 function blocks(lines: string[], onOpenUrl: OpenUrl, depth = 0): ReactNode[] {
