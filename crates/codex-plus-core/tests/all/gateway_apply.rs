@@ -1999,3 +1999,69 @@ fn codex_user_root_settings_survive_exit_restore_and_startup_reapply() {
     );
     assert_eq!(config.matches("model_instructions_file =").count(), 1);
 }
+
+/// #2771：断开时接入前的供应商已被删掉、回退到别的供应商：原供应商带进网关的根级设置
+/// 只补新供应商缺的键，不覆盖新供应商自己的设置。网关下的 Fast（`service_tier`）也不从直连配置带入。
+#[test]
+fn codex_disconnect_to_a_fallback_provider_only_fills_missing_user_root_settings() {
+    let fixture = fixture(57383);
+    let ctx = &fixture.ctx;
+    seed_direct_with_user_root_settings(ctx);
+    let mut other = codex_plus_core::provider_import::pool_relay_profile(
+        "备用",
+        "https://api.other.test/v1",
+        "sk-other",
+        RelayProtocol::Responses,
+        "gpt-other",
+        "gpt-other",
+        &[],
+    )
+    .unwrap();
+    other.id = "other".into();
+    other.relay_mode = RelayMode::PureApi;
+    other.config_contents = format!(
+        "model_instructions_file = \"~/.codex/other.md\"\n{}",
+        other.config_contents
+    );
+    codex_plus_core::relay_config::normalize_relay_profile_for_storage(&mut other).unwrap();
+    // 放在列表最前：断开时找不到原供应商就回退到它。
+    let mut settings = ctx.settings.load().unwrap();
+    settings.relay_profiles.insert(0, other);
+    ctx.settings.save(&settings).unwrap();
+    let path = ctx.codex_home.join("config.toml");
+    std::fs::write(
+        &path,
+        format!("service_tier = \"fast\"\n{}", codex_config(ctx)),
+    )
+    .unwrap();
+
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let config = codex_config(ctx);
+    let parsed: toml::Value = toml::from_str(&config).unwrap();
+    assert!(parsed.get("service_tier").is_none(), "{config}");
+    // 接入期间加了 web_search。
+    std::fs::write(&path, format!("web_search = \"live\"\n{config}")).unwrap();
+    refresh_enabled(ctx).unwrap();
+
+    // 接入前的供应商被删掉，断开时回退到列表里的另一个。
+    let mut settings = ctx.settings.load().unwrap();
+    settings.relay_profiles.retain(|profile| profile.id != "direct");
+    ctx.settings.save(&settings).unwrap();
+    let settings = ctx.settings.load().unwrap();
+    disable_binding(ctx, &settings, &ToolId::Codex).unwrap();
+    assert_eq!(ctx.settings.load().unwrap().active_relay_id, "other");
+    let config = codex_config(ctx);
+    assert!(config.contains("api.other.test"), "{config}");
+    let parsed: toml::Value = toml::from_str(&config).unwrap();
+    assert_eq!(
+        parsed["model_instructions_file"].as_str(),
+        Some("~/.codex/other.md"),
+        "新供应商自己的设置不被原供应商的覆盖：{config}"
+    );
+    assert_eq!(
+        parsed["web_search"].as_str(),
+        Some("live"),
+        "新供应商缺的键照样补回：{config}"
+    );
+    assert_eq!(config.matches("model_instructions_file =").count(), 1);
+}

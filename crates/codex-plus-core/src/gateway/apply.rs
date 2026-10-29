@@ -948,6 +948,12 @@ const CODEX_GATEWAY_KEYS: &[&str] = &[
 /// （地址、凭据、`model_catalog_json` 等，见 `relay_config::is_provider_specific_common_root_key`），
 /// 还有会把请求导向别的供应商 / 模型（`profile`、`oss_provider`、`review_model`）、描述直连上游模型能力、
 /// 或强制登录方式的键：这些由网关决定，带进去会改变路由结果或让网关的模型收到不认识的参数。
+///
+/// - `service_tier`：网关下的 Fast 由网关和 Codex 原生 Fast 按钮处理，不从直连配置带入直连上游的服务等级；
+/// - `plan_mode_reasoning_effort`：与网关托管的 `model_reasoning_effort` 同类，是按直连上游模型挑的推理档位，
+///   网关的模型未必支持（档位由网关的模型目录给出）；
+/// - `model_reasoning_summary` 不在此列：它只是推理摘要的详略偏好，模型是否支持摘要由网关的模型目录
+///   （及上面的 `model_supports_reasoning_summaries`）决定，不支持时 Codex 不会发，跟着走不影响路由。
 const CODEX_GATEWAY_ROUTING_KEYS: &[&str] = &[
     "profile",
     "oss_provider",
@@ -955,6 +961,8 @@ const CODEX_GATEWAY_ROUTING_KEYS: &[&str] = &[
     "model_verbosity",
     "model_supports_reasoning_summaries",
     "model_max_output_tokens",
+    "plan_mode_reasoning_effort",
+    "service_tier",
     "forced_login_method",
     "forced_chatgpt_workspace_id",
 ];
@@ -1579,7 +1587,10 @@ fn restore_codex(ctx: &ApplyContext, binding: &AgentBinding) -> anyhow::Result<(
                         .iter()
                         .any(|profile| profile.id == id))
         };
-        let target = if exists(previous) {
+        // 切回的就是接入前的供应商时，接入期间的根级设置以切回前的为准覆盖；回退到别的供应商时
+        // 只补它缺的键，不拿原供应商带进网关的值覆盖新供应商自己的设置（#2771）。
+        let restoring_previous = exists(previous);
+        let target = if restoring_previous {
             previous.to_string()
         } else {
             settings
@@ -1635,8 +1646,12 @@ fn restore_codex(ctx: &ApplyContext, binding: &AgentBinding) -> anyhow::Result<(
             // 走的也是这条路，不补的话重启一次就没了。存过副本的那条路只改回网关改过的键，不需要。
             let path = ctx.codex_home.join(CODEX_LIVE_FILES[0]);
             if let Some(current) = stash::read_optional(&path)?
-                && let Some(carried) =
-                    carry_codex_user_root_settings(&current, before, &common_keys, true)
+                && let Some(carried) = carry_codex_user_root_settings(
+                    &current,
+                    before,
+                    &common_keys,
+                    restoring_previous,
+                )
             {
                 stash::write_or_remove(&path, Some(&carried))?;
             }
