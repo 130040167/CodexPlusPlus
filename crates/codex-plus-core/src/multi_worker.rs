@@ -556,6 +556,103 @@ pub(crate) fn worker_identity_matches(
     expected == actual
 }
 
+#[cfg(windows)]
+pub fn codex_process_generation_exited(
+    pid: u32,
+    expected_birth: Option<u64>,
+) -> anyhow::Result<bool> {
+    if pid == 0 || pid == std::process::id() || expected_birth == Some(0) {
+        return Ok(false);
+    }
+    let Some(process) = crate::windows_integration::VerifiedStopProcess::capture(pid, false)?
+    else {
+        return Ok(true);
+    };
+    Ok(expected_birth.is_some_and(|birth| birth != process.birth_id) || !process.is_alive()?)
+}
+
+#[cfg(windows)]
+pub fn codex_user_data_is_absent(
+    executable: &Path,
+    user_data_dir: &Path,
+    debug_port: u16,
+    helper_port: u16,
+) -> anyhow::Result<bool> {
+    use crate::windows_integration::{VerifiedStopProcess, bounded_process_snapshot};
+    anyhow::ensure!(
+        debug_port != 0 && helper_port != 0 && debug_port != helper_port,
+        "实例端口无效"
+    );
+    anyhow::ensure!(
+        executable.is_absolute() && user_data_dir.is_absolute(),
+        "多开路径必须是绝对路径"
+    );
+    let executable = executable.canonicalize()?;
+    let user_data_dir = user_data_dir.canonicalize()?;
+    let name = executable
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("缺少桌面程序名"))?;
+    for entry in bounded_process_snapshot(32768)? {
+        if !entry.exe_file.eq_ignore_ascii_case(&name.to_string_lossy()) {
+            continue;
+        }
+        let Some(process) = VerifiedStopProcess::capture(entry.process_id, false)? else {
+            continue;
+        };
+        if !process.is_alive()? {
+            continue;
+        }
+        let image = process.image()?.canonicalize()?;
+        if image
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&executable.to_string_lossy())
+            && arguments_use_user_data(&process.arguments()?, &user_data_dir)?
+        {
+            return Ok(false);
+        }
+    }
+    let mut reservations = Vec::new();
+    for port in [debug_port, helper_port] {
+        if !crate::windows_integration::loopback_listener_process_ids(port)?.is_empty() {
+            return Ok(false);
+        }
+        for host in ["127.0.0.1", "::1"] {
+            let Ok(listener) = std::net::TcpListener::bind((host, port)) else {
+                return Ok(false);
+            };
+            reservations.push(listener);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(any(windows, test))]
+fn arguments_use_user_data(arguments: &[String], expected: &Path) -> anyhow::Result<bool> {
+    let mut paths = Vec::new();
+    let mut tokens = arguments.iter().skip(1);
+    while let Some(token) = tokens.next() {
+        if token == "--user-data-dir" {
+            paths.push(
+                tokens
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("数据目录参数缺少值"))?
+                    .as_str(),
+            );
+        } else if let Some(value) = token.strip_prefix("--user-data-dir=") {
+            paths.push(value);
+        }
+    }
+    anyhow::ensure!(paths.len() <= 1, "数据目录参数重复，无法确认归属");
+    let Some(path) = paths.first() else {
+        return Ok(false);
+    };
+    anyhow::ensure!(!path.is_empty(), "数据目录参数为空");
+    let actual = Path::new(path).canonicalize()?;
+    Ok(actual
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&expected.to_string_lossy()))
+}
+
 #[cfg(any(windows, test))]
 pub(crate) fn worker_image_matches(image: &Path, arguments: &[String]) -> bool {
     let Some(argv_image) = arguments.first().map(Path::new) else {

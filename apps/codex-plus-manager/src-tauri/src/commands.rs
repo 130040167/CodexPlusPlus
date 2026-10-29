@@ -1560,8 +1560,7 @@ fn list_codex_multi_instances_blocking() -> CommandResult<CodexMultiInstancesPay
             let running = multi_instance_is_running(&instance);
             let mut current = instance;
             current.running = running;
-            current.status =
-                multi_instance_status(running, current.launch_result.as_ref()).to_string();
+            current.status = multi_instance_snapshot_status(&current, running).to_string();
             if !running {
                 current.pid = None;
             }
@@ -1789,18 +1788,37 @@ fn multi_manifest_identity_matches(
 }
 
 fn load_multi_instance_manifest(root: &Path) -> anyhow::Result<CodexMultiInstance> {
-    let mut instance: CodexMultiInstance =
-        serde_json::from_slice(&std::fs::read(multi_instance_manifest_path(root))?)?;
-    if let Some(result) = load_multi_launch_result(root).filter(|result| {
-        result.generation != 0
-            && result.generation == instance.generation
-            && result.instance_id == instance.instance_id
-    }) {
+    load_multi_instance_manifest_with_absence(root, stale_multi_instance_is_absent)
+}
+
+fn load_multi_instance_manifest_with_absence(
+    root: &Path,
+    absent: impl Fn(&CodexMultiInstance) -> anyhow::Result<bool>,
+) -> anyhow::Result<CodexMultiInstance> {
+    let manifest_bytes = std::fs::read(multi_instance_manifest_path(root))?;
+    let mut instance: CodexMultiInstance = serde_json::from_slice(&manifest_bytes)?;
+    let result_bytes = std::fs::read(root.join(MULTI_LAUNCH_RESULT_FILE)).ok();
+    let mut manifest_changed = false;
+    let mut stopped_receipt_confirmed = false;
+    if let Some(result) = result_bytes
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice::<CodexMultiLaunchResult>(bytes).ok())
+        .filter(|result| {
+            result.generation != 0
+                && result.generation == instance.generation
+                && result.instance_id == instance.instance_id
+        })
+    {
         if let Some(identity) = &result.identity {
             let mut updated = instance.clone();
             updated.debug_port = result.debug_port.unwrap_or(0);
             updated.helper_port = result.helper_port.unwrap_or(0);
-            if multi_manifest_identity_matches(&updated, identity) {
+            if multi_manifest_identity_matches(&updated, identity)
+                && instance
+                    .identity
+                    .as_ref()
+                    .is_none_or(|saved| saved == identity)
+            {
                 updated.identity = Some(identity.clone());
                 updated.launch_result = Some(result.clone());
                 // 同一代启动回执才可更新清单；读列表不会把旧结果提升为新实例。
@@ -1808,14 +1826,112 @@ fn load_multi_instance_manifest(root: &Path) -> anyhow::Result<CodexMultiInstanc
                     || instance.debug_port != updated.debug_port
                     || instance.helper_port != updated.helper_port
                 {
-                    save_multi_instance_manifest(root, &updated)?;
+                    manifest_changed = true;
                 }
                 instance = updated;
             }
         }
+        stopped_receipt_confirmed = multi_instance_stopped_receipt_matches(&instance, &result);
         instance.launch_result = Some(result);
     }
+    if instance.status != "stopped"
+        && stopped_receipt_confirmed
+        && absent(&instance).unwrap_or(false)
+        && absent(&instance).unwrap_or(false)
+    {
+        instance.status = "stopped".into();
+        instance.running = false;
+        instance.pid = None;
+        instance.worker_birth_id = None;
+        manifest_changed = true;
+    }
+    if manifest_changed {
+        anyhow::ensure!(
+            std::fs::read(multi_instance_manifest_path(root))? == manifest_bytes,
+            "实例清单在状态核验期间改变，未覆盖记录"
+        );
+        anyhow::ensure!(
+            std::fs::read(root.join(MULTI_LAUNCH_RESULT_FILE)).ok() == result_bytes,
+            "实例回执在状态核验期间改变，未覆盖记录"
+        );
+        save_multi_instance_manifest(root, &instance)?;
+    }
     Ok(instance)
+}
+
+fn multi_instance_stopped_receipt_matches(
+    instance: &CodexMultiInstance,
+    result: &CodexMultiLaunchResult,
+) -> bool {
+    instance.generation != 0
+        && !instance.is_main
+        && result.instance_id == instance.instance_id
+        && result.generation == instance.generation
+        && result.status == "stopped"
+        && result.debug_port == Some(instance.debug_port)
+        && result.helper_port == Some(instance.helper_port)
+        && match instance.identity.as_ref() {
+            Some(identity) => {
+                identity.process_id != 0
+                    && identity.process_birth_id != 0
+                    && !identity.browser_id.is_empty()
+                    && multi_manifest_identity_matches(instance, identity)
+                    && result.identity.as_ref() == Some(identity)
+                    && result.pid == Some(identity.process_id)
+            }
+            None => false,
+        }
+}
+
+fn stale_multi_instance_is_absent(instance: &CodexMultiInstance) -> anyhow::Result<bool> {
+    #[cfg(windows)]
+    {
+        use codex_plus_core::multi_worker::{
+            codex_process_generation_exited, codex_user_data_is_absent,
+        };
+        anyhow::ensure!(
+            !instance.is_main && instance.instance_id != "main" && instance.generation != 0,
+            "多开身份无效"
+        );
+        let Some(pid) = instance.pid else {
+            return Ok(instance.status == "stopped");
+        };
+        if !codex_process_generation_exited(pid, instance.worker_birth_id)? {
+            return Ok(false);
+        }
+        if let Some(identity) = instance.identity.as_ref() {
+            anyhow::ensure!(
+                multi_manifest_identity_matches(instance, identity),
+                "多开清单身份不一致"
+            );
+            if !codex_process_generation_exited(
+                identity.process_id,
+                Some(identity.process_birth_id),
+            )? {
+                return Ok(false);
+            }
+        }
+        let app = instance
+            .app_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("多开清单缺少程序路径"))?;
+        let executable = codex_plus_core::app_paths::build_codex_executable(Path::new(app));
+        let user_data = instance
+            .user_data_dir
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("多开清单缺少数据目录"))?;
+        codex_user_data_is_absent(
+            &executable,
+            Path::new(user_data),
+            instance.debug_port,
+            instance.helper_port,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = instance;
+        Ok(false)
+    }
 }
 
 fn multi_instance_is_running(instance: &CodexMultiInstance) -> bool {
@@ -1830,6 +1946,47 @@ fn multi_instance_is_running(instance: &CodexMultiInstance) -> bool {
         codex_plus_core::multi_worker::codex_instance_identity_matches(identity),
     )
     .unwrap_or(false)
+}
+
+fn multi_instance_snapshot_status(instance: &CodexMultiInstance, running: bool) -> &'static str {
+    if running {
+        return multi_instance_status(true, instance.launch_result.as_ref());
+    }
+    if instance
+        .launch_result
+        .as_ref()
+        .is_some_and(|result| result.status == "cleanup_failed")
+    {
+        return "unknown";
+    }
+    if instance.status != "stopped"
+        && instance
+            .launch_result
+            .as_ref()
+            .is_some_and(|result| result.status == "stopped")
+    {
+        return "unknown";
+    }
+    if let Some(identity) = instance.identity.as_ref() {
+        if !multi_manifest_identity_matches(instance, identity)
+            || !instance
+                .launch_result
+                .as_ref()
+                .is_some_and(|result| multi_instance_stopped_receipt_matches(instance, result))
+        {
+            return "unknown";
+        }
+        #[cfg(windows)]
+        if !codex_plus_core::multi_worker::codex_process_generation_exited(
+            identity.process_id,
+            Some(identity.process_birth_id),
+        )
+        .unwrap_or(false)
+        {
+            return "unknown";
+        }
+    }
+    multi_instance_status(false, instance.launch_result.as_ref())
 }
 
 /// 列表里显示的状态：能跑就是运行中；跑不起来且 worker 明确报了失败才是失败，
@@ -12196,6 +12353,209 @@ model_reasoning_effort = "high"
         let _ = child.wait();
         result.unwrap();
         assert!(remained_alive);
+    }
+
+    fn stopped_multi_instance_fixture(root: &Path) -> CodexMultiInstance {
+        let data = root.join("user-data");
+        let app = root.join("Codex.app");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        std::fs::write(app.join("Contents/MacOS/Codex"), "fixture").unwrap();
+        std::fs::write(app.join("Codex.exe"), "fixture").unwrap();
+        let identity = codex_plus_core::multi_worker::CodexInstanceIdentity {
+            instance_id: "fixture-stopped".into(),
+            generation: 7,
+            debug_port: 19401,
+            helper_port: 19402,
+            user_data_dir: data.canonicalize().unwrap(),
+            browser_id: "browser-stopped".into(),
+            process_id: 123,
+            process_birth_id: 456,
+            executable: codex_plus_core::app_paths::build_codex_executable(&app)
+                .canonicalize()
+                .unwrap(),
+        };
+        let result = CodexMultiLaunchResult {
+            instance_id: identity.instance_id.clone(),
+            generation: identity.generation,
+            helper_port: Some(identity.helper_port),
+            identity: Some(identity.clone()),
+            status: "stopped".into(),
+            message: "fixture stopped".into(),
+            finished_at_ms: 8,
+            debug_port: Some(identity.debug_port),
+            pid: Some(identity.process_id),
+        };
+        let instance = CodexMultiInstance {
+            instance_id: identity.instance_id.clone(),
+            generation: identity.generation,
+            identity: Some(identity),
+            profile_id: "fixture".into(),
+            profile_name: "Fixture".into(),
+            pid: Some(124),
+            worker_birth_id: Some(457),
+            debug_port: 19401,
+            helper_port: 19402,
+            status: "starting".into(),
+            running: true,
+            started_at_ms: 7,
+            is_main: false,
+            app_path: Some(app.to_string_lossy().into_owned()),
+            codex_home: None,
+            sqlite_home: None,
+            user_data_dir: Some(data.to_string_lossy().into_owned()),
+            launch_result: Some(result.clone()),
+        };
+        save_multi_instance_manifest(root, &instance).unwrap();
+        write_multi_launch_result(&root.join(MULTI_LAUNCH_RESULT_FILE), &result).unwrap();
+        instance
+    }
+
+    #[test]
+    fn stopped_receipt_reconciliation_persists_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = stopped_multi_instance_fixture(temp.path());
+        let probes = std::cell::Cell::new(0);
+        let current = load_multi_instance_manifest_with_absence(temp.path(), |instance| {
+            assert_eq!(instance.pid, original.pid);
+            probes.set(probes.get() + 1);
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(probes.get(), 2);
+        assert_eq!(current.status, "stopped");
+        assert!(!current.running);
+        assert_eq!(current.pid, None);
+        assert_eq!(current.worker_birth_id, None);
+        assert_eq!(current.identity, original.identity);
+        assert_eq!(
+            current.launch_result.as_ref().unwrap().message,
+            "fixture stopped"
+        );
+        let persisted: CodexMultiInstance =
+            serde_json::from_slice(&std::fs::read(multi_instance_manifest_path(temp.path())).unwrap())
+                .unwrap();
+        assert_eq!(persisted.status, "stopped");
+        assert_eq!(persisted.pid, None);
+        let again =
+            load_multi_instance_manifest_with_absence(temp.path(), |_| panic!("already synchronized"))
+                .unwrap();
+        assert_eq!(again.status, "stopped");
+        assert_eq!(multi_instance_snapshot_status(&again, false), "stopped");
+    }
+
+    #[test]
+    fn stopped_receipt_reconciliation_keeps_uncertain_or_changed_instances() {
+        for failed_probe in [0, 1, 2] {
+            let temp = tempfile::tempdir().unwrap();
+            stopped_multi_instance_fixture(temp.path());
+            let original = std::fs::read(multi_instance_manifest_path(temp.path())).unwrap();
+            let probes = std::cell::Cell::new(0);
+            let current = load_multi_instance_manifest_with_absence(temp.path(), |_| {
+                probes.set(probes.get() + 1);
+                if failed_probe == 0 {
+                    anyhow::bail!("query unavailable");
+                }
+                Ok(probes.get() != failed_probe)
+            })
+            .unwrap();
+            assert_eq!(current.status, "starting");
+            assert_eq!(current.pid, Some(124));
+            assert_eq!(multi_instance_snapshot_status(&current, false), "unknown");
+            assert_eq!(
+                std::fs::read(multi_instance_manifest_path(temp.path())).unwrap(),
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn stopped_receipt_reconciliation_rejects_mismatched_or_incomplete_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = stopped_multi_instance_fixture(temp.path());
+        let receipt = original.launch_result.clone().unwrap();
+        assert!(multi_instance_stopped_receipt_matches(&original, &receipt));
+        let mut variants = Vec::new();
+        let mut result = receipt.clone();
+        result.generation += 1;
+        variants.push(result);
+        let mut result = receipt.clone();
+        result.instance_id = "neighbor".into();
+        variants.push(result);
+        let mut result = receipt.clone();
+        result.status = "cleanup_failed".into();
+        variants.push(result);
+        let mut result = receipt.clone();
+        result.debug_port = Some(19403);
+        variants.push(result);
+        let mut result = receipt.clone();
+        result.helper_port = None;
+        variants.push(result);
+        let mut result = receipt.clone();
+        result.pid = None;
+        variants.push(result);
+        let mut result = receipt.clone();
+        result.identity = None;
+        variants.push(result);
+        let mut result = receipt.clone();
+        result.identity.as_mut().unwrap().process_birth_id += 1;
+        variants.push(result);
+        let mut result = receipt;
+        result.identity.as_mut().unwrap().user_data_dir = temp.path().into();
+        variants.push(result);
+        for result in variants {
+            assert!(!multi_instance_stopped_receipt_matches(&original, &result));
+            write_multi_launch_result(&temp.path().join(MULTI_LAUNCH_RESULT_FILE), &result).unwrap();
+            let current = load_multi_instance_manifest_with_absence(temp.path(), |_| {
+                panic!("must not probe mismatched receipt")
+            })
+            .unwrap();
+            assert_eq!(current.status, "starting");
+            assert_eq!(current.pid, original.pid);
+        }
+    }
+
+    #[test]
+    fn stopped_receipt_reconciliation_does_not_overwrite_replaced_files() {
+        for replace_receipt in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let original = stopped_multi_instance_fixture(temp.path());
+            let probes = std::cell::Cell::new(0);
+            let loaded = load_multi_instance_manifest_with_absence(temp.path(), |_| {
+                probes.set(probes.get() + 1);
+                if probes.get() == 2 {
+                    if replace_receipt {
+                        let mut result = original.launch_result.clone().unwrap();
+                        result.generation += 1;
+                        write_multi_launch_result(
+                            &temp.path().join(MULTI_LAUNCH_RESULT_FILE),
+                            &result,
+                        )?;
+                    } else {
+                        let mut next = original.clone();
+                        next.generation += 1;
+                        save_multi_instance_manifest(temp.path(), &next)?;
+                    }
+                }
+                Ok(true)
+            });
+            assert!(loaded.is_err());
+            let saved: CodexMultiInstance = serde_json::from_slice(
+                &std::fs::read(multi_instance_manifest_path(temp.path())).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(saved.status, "starting");
+            assert_eq!(saved.pid, original.pid);
+            assert_eq!(
+                saved.generation,
+                original.generation + u64::from(!replace_receipt)
+            );
+            let result = load_multi_launch_result(temp.path()).unwrap();
+            assert_eq!(
+                result.generation,
+                original.generation + u64::from(replace_receipt)
+            );
+        }
     }
 
     // 多开在 Windows 上曾经「窗口没出现、列表却显示运行中」：现在状态由

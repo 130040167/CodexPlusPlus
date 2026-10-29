@@ -201,9 +201,9 @@ fn spawn_fixture(dir: &Path, mode: &str, port: u16) -> Child {
         .stdin(Stdio::null());
     capture_logs(&mut command, dir, mode);
     match mode {
-        "root" | "default-main" => {
+        "root" | "default-main" | "replacement" => {
             command.arg(format!("--remote-debugging-port={port}"));
-            if mode == "root" {
+            if mode != "default-main" {
                 command.arg(format!(
                     "--user-data-dir={}",
                     dir.join("user data").display()
@@ -582,4 +582,69 @@ async fn default_main_without_user_data_can_be_captured_and_stopped_by_saved_ide
     wrong.user_data_dir = dir.path().canonicalize().unwrap();
     assert!(terminate_verified_codex_instance(&wrong).await.is_err());
     assert!(terminate_verified_codex_instance(&identity).await.unwrap());
+}
+
+#[tokio::test]
+async fn stopped_receipt_scope_excludes_neighbors_but_rejects_replacement_and_busy_ports() {
+    let _fixture_lock = FIXTURE_LOCK.lock().await;
+    use crate::multi_worker::{codex_process_generation_exited, codex_user_data_is_absent};
+    let port = unused_port();
+    let fixtures = FixtureGroup::start(port);
+    let mut identity = fixtures.identity(port);
+    identity.helper_port = loop {
+        let candidate = unused_port();
+        if candidate != port {
+            break candidate;
+        }
+    };
+    let absent = || {
+        codex_user_data_is_absent(
+            &identity.executable,
+            &identity.user_data_dir,
+            identity.debug_port,
+            identity.helper_port,
+        )
+        .unwrap()
+    };
+    assert!(!absent());
+    assert!(
+        !codex_process_generation_exited(identity.process_id, Some(identity.process_birth_id))
+            .unwrap()
+    );
+    assert!(!codex_process_generation_exited(identity.process_id, None).unwrap());
+    assert!(
+        codex_process_generation_exited(identity.process_id, Some(identity.process_birth_id + 1))
+            .unwrap()
+    );
+    let mut tree = CodexInstanceProcessTree::capture(&identity).unwrap();
+    tree.stop_and_wait().unwrap();
+    assert!(
+        codex_process_generation_exited(identity.process_id, Some(identity.process_birth_id))
+            .unwrap()
+    );
+    assert!(fixtures.process("neighbor").is_alive().unwrap());
+    assert!(fixtures.process("independent").is_alive().unwrap());
+    assert!(absent());
+    let debug = std::net::TcpListener::bind(("127.0.0.1", identity.debug_port)).unwrap();
+    assert!(!absent());
+    drop(debug);
+    let helper = std::net::TcpListener::bind(("::1", identity.helper_port)).unwrap();
+    assert!(!absent());
+    drop(helper);
+    assert!(absent());
+    struct Replacement(std::process::Child);
+    impl Drop for Replacement {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let replacement = Replacement(spawn_fixture(fixtures.dir.path(), "replacement", port));
+    wait_for_fixtures(
+        fixtures.dir.path(),
+        &["replacement"],
+        Duration::from_secs(10),
+    );
+    assert!(!absent());
+    drop(replacement);
 }
