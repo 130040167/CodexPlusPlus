@@ -38,7 +38,7 @@ export function multiLaunchInstanceStatus(instance: MultiLaunchInstance): string
 
 export function multiLaunchInstanceRunning(instance: MultiLaunchInstance): boolean {
   if (typeof instance.running === "boolean") return instance.running;
-  return ["running", "running_degraded", "ready", "connected", "ok"].includes(multiLaunchInstanceStatus(instance));
+  return ["running", "running_degraded", "starting", "ready", "connected", "ok"].includes(multiLaunchInstanceStatus(instance));
 }
 
 /**
@@ -50,6 +50,6 @@ export function multiLaunchInstanceRunning(instance: MultiLaunchInstance): boole
 export function multiLaunchInstanceFailure(instance: MultiLaunchInstance): string {
   if (multiLaunchInstanceRunning(instance)) return "";
   const result = instance.launchResult;
-  if (!result || !["failed", "cleanup_failed"].includes(result.status ?? "")) return "";
+  if (!result || result.status !== "failed") return "";
   return result.message?.trim() || "Codex 实例启动失败，原因未记录。";
 }

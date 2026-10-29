@@ -27,7 +27,7 @@ describe("Codex 多开运行实例模型", () => {
 
   it("状态归一化并识别可结束的运行态", () => {
     assert.equal(multiLaunchInstanceStatus(instance({ status: "  RUNNING " })), "running");
-    assert.equal(multiLaunchInstanceRunning(instance({ status: "starting" })), false);
+    assert.equal(multiLaunchInstanceRunning(instance({ status: "starting" })), true);
     assert.equal(multiLaunchInstanceRunning(instance({ status: "running_degraded" })), true);
     assert.equal(multiLaunchInstanceRunning(instance({ status: "stopped", running: true })), true);
     assert.equal(multiLaunchInstanceRunning(instance({ status: "stopped" })), false);
@@ -41,13 +41,6 @@ describe("Codex 多开运行实例模型", () => {
       launchResult: { status: "failed", message: "调试端口 9456 未就绪" },
     });
     assert.equal(multiLaunchInstanceFailure(failed), "调试端口 9456 未就绪");
-    assert.equal(
-      multiLaunchInstanceFailure(instance({
-        status: "unknown", running: false,
-        launchResult: { status: "cleanup_failed", message: "实例清理未完成" },
-      })),
-      "实例清理未完成",
-    );
 
     assert.equal(
       multiLaunchInstanceFailure(instance({ status: "failed", running: false, launchResult: { status: "failed" } })),
