@@ -473,14 +473,12 @@ describe("managed aggregate session connection", () => {
     }
   });
 
-  it("migrates protected threads to the effective native provider after disabling protection", async () => {
+  it("migrates protected threads to the selected provider after disabling protection", async () => {
     const api = runtime();
     api.state.profile.relayMode = "pureApi";
     const params = { threadId: "thread" };
     const patched = await api.prepare("thread/resume", params, "local",
-      async (method: string) => method === "config/read"
-        ? { config: { model_provider: "custom", model_providers: { custom: { base_url: "http://127.0.0.1:62021/v1" } } } }
-        : { thread: { modelProvider: "codex_plus_managed" } });
+      async () => ({ thread: { modelProvider: "codex_plus_managed" } }));
     assert.equal(patched.modelProvider, "custom");
     const ordinary = await api.prepare("thread/resume", params, "local",
       async () => ({ thread: { modelProvider: "other" } }));

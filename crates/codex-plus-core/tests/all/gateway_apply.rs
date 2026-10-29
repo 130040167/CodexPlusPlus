@@ -1693,9 +1693,7 @@ fn gateway_catalog_includes_declared_models_with_provider_metadata() {
 #[test]
 fn gateway_catalog_refresh_follows_model_sync_and_pool_changes() {
     use codex_plus_core::gateway::apply::save_auto_group;
-    use codex_plus_core::gateway::model_sync::{
-        ModelDiff, append_upstream_models, set_provider_models,
-    };
+    use codex_plus_core::gateway::model_sync::{set_provider_models, sync_upstream_models};
     use codex_plus_core::gateway::store::AutoGroupSettings;
 
     let fixture = fixture(57388);
@@ -1727,13 +1725,14 @@ fn gateway_catalog_refresh_follows_model_sync_and_pool_changes() {
             .any(|entry| entry["codex_plus_group"] == "自动组")
     );
 
-    append_upstream_models(
+    sync_upstream_models(
         &ctx.gateway,
         &second,
-        &ModelDiff {
-            added: vec!["synced-model".into()],
-            ..ModelDiff::default()
-        },
+        &[
+            "deepseek-v4-pro".into(),
+            "mirror-only".into(),
+            "synced-model".into(),
+        ],
     )
     .unwrap();
     set_provider_metadata(
@@ -1868,7 +1867,7 @@ fn gateway_catalog_refresh_follows_model_sync_and_pool_changes() {
 
 #[test]
 fn codex_hidden_group_preserves_supplier_models_and_other_groups() {
-    use codex_plus_core::gateway::model_sync::{ModelDiff, append_upstream_models};
+    use codex_plus_core::gateway::model_sync::sync_upstream_models;
 
     let fixture = fixture(57387);
     let ctx = &fixture.ctx;
@@ -1959,13 +1958,10 @@ fn codex_hidden_group_preserves_supplier_models_and_other_groups() {
             .any(|group| group.id == hidden_group)
     );
 
-    append_upstream_models(
+    sync_upstream_models(
         &ctx.gateway,
         &second,
-        &ModelDiff {
-            added: vec!["gpt-6.1-terra".into()],
-            ..ModelDiff::default()
-        },
+        &["gpt-6.1-sol".into(), "gpt-6.1-terra".into()],
     )
     .unwrap();
     ctx.gateway
@@ -1988,13 +1984,10 @@ fn codex_hidden_group_preserves_supplier_models_and_other_groups() {
         .unwrap();
     assert_eq!(terra["codex_plus_group_id"], second);
     // 上游检查的待加入项不属于用户已采用的模型池；采用后即时更新两家的归属。
-    append_upstream_models(
+    sync_upstream_models(
         &ctx.gateway,
         &first,
-        &ModelDiff {
-            added: vec!["gpt-6.1-terra".into()],
-            ..ModelDiff::default()
-        },
+        &["gpt-6.1-sol".into(), "gpt-6.1-terra".into()],
     )
     .unwrap();
     refresh_enabled(ctx).unwrap();
