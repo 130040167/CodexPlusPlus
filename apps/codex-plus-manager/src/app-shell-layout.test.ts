@@ -72,11 +72,11 @@ test("⌘K 打开命令面板，总览页渲染在 hub 路由", () => {
   assert.match(entry, /route === "hub" \? \(\s*<HubOverview/);
 });
 
-test("启动 Codex 一眼可见：总览页头一个主按钮，其它页面顶栏最右侧一个，都复用 launch / restart（#2744 / #2745）", () => {
+test("启动 Codex 一眼可见：Codex 页面顶栏最右侧一个主按钮，侧栏播放键常显，都复用 launch / restart（#2744 / #2745）", () => {
   const entry = functionSource("App");
   const button = readSource("./CodexLaunchButton.tsx");
   const hub = readSource("./HubOverview.tsx");
-  // 一份状态喂给总览、顶栏、侧栏：运行中是「重启 Codex」，没找到 Codex 时置灰并说明原因。
+  // 一份状态喂给顶栏、侧栏：运行中是「重启 Codex」，没找到 Codex 时置灰并说明原因。
   assert.match(entry, /const codexLaunch: CodexLaunchState = \{\n\s*running: codexAppRunning,\n\s*busy: launchPending,/);
   assert.match(entry, /overview\?\.codex_app\?\.status === "missing"\n\s*\? t\("没有找到 Codex 应用，请先安装 Codex"\)/);
   assert.match(entry, /onLaunch: \(\) => void actions\.launch\(\),\n\s*onRestart: \(\) => void actions\.restart\(\),/);
@@ -88,14 +88,25 @@ test("启动 Codex 一眼可见：总览页头一个主按钮，其它页面顶�
   assert.match(button, /disabled=\{state\.busy \|\| unavailable\}/);
   assert.match(button, /<span className=\{`codex-launch \$\{className\}`\.trim\(\)\} data-running=\{state\.running\} data-unavailable=\{unavailable\} title=\{hint\}>/);
   assert.match(button, /variant="default"/);
-  // 顶栏：页面操作挂载点之后、任何页面都在；总览页头已有同一个按钮，顶栏不重复。
+  // 顶栏：只在 Codex 的页面里、排在页面操作挂载点之后。Codex++ 不只服务 Codex，
+  // 网关、全局管理、工具类页面和 Claude Code / Grok 的页面都不放。
+  assert.match(entry, /const onCodexPage = routeTool\(route\) === "codex" \|\| \(route === "overview" && activeTool === "codex"\);/);
   assert.match(
     entry,
-    /<div className="topbar-page-actions" data-topbar-actions \/>\n[\s\S]{0,400}\{route !== "hub" \? <CodexLaunchButton className="topbar-codex-launch" size="sm" state=\{codexLaunch\} \/> : null\}/,
+    /<div className="topbar-page-actions" data-topbar-actions \/>\n[\s\S]{0,400}\{onCodexPage \? <CodexLaunchButton className="topbar-codex-launch" size="sm" state=\{codexLaunch\} \/> : null\}/,
   );
-  // 总览页头右侧的主按钮。
-  assert.match(entry, /<HubOverview\n\s*codex=\{[^\n]*\}\n\s*codexLaunch=\{codexLaunch\}/);
-  assert.match(hub, /<header className="hub-intro">[\s\S]*?<CodexLaunchButton className="hub-codex-launch" state=\{codexLaunch\} \/>\n\s*<\/header>/);
+  assert.equal(entry.match(/<CodexLaunchButton\b/g)?.length, 1, "启动按钮只在顶栏出现一次");
+  const codexRoutes = text.slice(text.indexOf("const routes: Array"), text.indexOf("const navigationSections")).split("\n")
+    .filter((line) => line.includes('tool: "codex"')).map((line) => /id: "(\w+)"/.exec(line)?.[1]);
+  for (const id of ["relay", "multiLaunch", "enhance", "dreamSkin", "userScripts", "pluginMarket", "weixin", "agentSettings"]) {
+    assert.ok(codexRoutes.includes(id), `${id} 属于 Codex，顶栏要显示启动按钮`);
+  }
+  for (const id of ["hub", "gatewayProviders", "gateway", "gatewayUsage", "sessions", "claude", "settings", "agentPet"]) {
+    assert.ok(!codexRoutes.includes(id), `${id} 不属于 Codex，顶栏不放启动按钮`);
+  }
+  // 网关总览面向所有 Agent，不放专门的「启动 Codex」按钮。
+  assert.doesNotMatch(hub, /CodexLaunchButton|codexLaunch/);
+  assert.doesNotMatch(entry, /codexLaunch=\{codexLaunch\}/);
   // 侧栏播放键：常显、点击区放大、不依赖悬停；没找到 Codex 时置灰。
   const sidebar = functionSource("AppSidebar");
   assert.match(sidebar, /tool\.id === "codex" && tool\.switchable \? "has-run" : ""/);
@@ -107,7 +118,6 @@ test("启动 Codex 一眼可见：总览页头一个主按钮，其它页面顶�
   // 不用 :has()：旧版系统 WebKit 不认，整条规则会失效。
   assert.doesNotMatch(styles, /:has\(\.side-agent-run\)/);
   assert.match(styles, /\.shell \.side-agent-wrap\.has-run \.side-item-label \{/);
-  assert.match(styles, /\.shell \.hub-intro \{\n  display: flex;/);
 });
 
 test("提示卡按语气分色、悬停暂停、不显示进度条，失败可复制详情", () => {

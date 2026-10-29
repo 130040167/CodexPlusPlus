@@ -4475,7 +4475,7 @@ export function App() {
   const isGlobalPage = globalNavigationRoutes.includes(route);
   const isManagementScreen = route === "relay" || route === "multiLaunch" || route === "sessions" || route === "context" || route === "skills";
   const codexAppRunning = overview?.runtime_health?.codex_app?.status === "running";
-  // 「启动 / 重启 Codex」：总览页头、顶栏、侧栏播放键共用一份状态，都走 actions.launch / actions.restart。
+  // 「启动 / 重启 Codex」：Codex 页面的顶栏按钮和侧栏播放键共用一份状态，都走 actions.launch / actions.restart。
   const codexToolEntry = toolEntries.find((entry) => entry.id === "codex");
   const codexLaunch: CodexLaunchState = {
     running: codexAppRunning,
@@ -4488,6 +4488,9 @@ export function App() {
     onLaunch: () => void actions.launch(),
     onRestart: () => void actions.restart(),
   };
+  // 当前页面属于 Codex：routes 里 tool 为 codex 的页面，以及当前 Agent 是 Codex 时的 Agent 概览。
+  // 网关、全局管理、工具类页面和 Claude Code / Grok 的页面都不算（Codex++ 不只服务 Codex）。
+  const onCodexPage = routeTool(route) === "codex" || (route === "overview" && activeTool === "codex");
   const activeToolName = toolEntries.find((entry) => entry.id === activeTool)?.name ?? t("当前 Agent");
 
   const isGatewayPage = gatewayNavigationRoutes.includes(route);
@@ -4556,9 +4559,9 @@ export function App() {
           <div className="topbar-actions">
             {/* data-topbar-actions：页面级操作的挂载点（TopbarActions / PageHeader），Claude 增强页把「启动增强版」portal 进来。 */}
             <div className="topbar-page-actions" data-topbar-actions />
-            {/* 「启动 / 重启 Codex」常驻顶栏最右侧，任何页面都能一眼找到（#2744 / #2745）；
-                总览页头已经有同一个主按钮，这里就不重复。停止仍在侧栏 Codex 行的播放键上。 */}
-            {route !== "hub" ? <CodexLaunchButton className="topbar-codex-launch" size="sm" state={codexLaunch} /> : null}
+            {/* 「启动 / 重启 Codex」：只在 Codex 的页面里放在顶栏最右侧（#2744 / #2745）；
+                其它页面靠侧栏 Codex 行常驻的播放键启动，停止也在那里。 */}
+            {onCodexPage ? <CodexLaunchButton className="topbar-codex-launch" size="sm" state={codexLaunch} /> : null}
           </div>
         </header>
         <section
@@ -4746,7 +4749,6 @@ export function App() {
           {route === "hub" ? (
             <HubOverview
               codex={{ running: codexAppRunning, providerName: toolEntries.find((entry) => entry.id === "codex")?.activeRelayName ?? null }}
-              codexLaunch={codexLaunch}
               notify={actions.showMessage}
               onNavigate={(next) => void navigate(next)}
               onOpenAgent={(agent) => void switchTool(agent, agentHomeRoute[agent] ?? "overview")}

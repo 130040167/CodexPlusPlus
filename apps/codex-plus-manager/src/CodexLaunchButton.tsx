@@ -1,5 +1,5 @@
 /**
- * 「启动 Codex / 重启 Codex」主按钮：网关总览页头和外壳顶栏共用（#2744 / #2745：2.x 升级后用户找不到启动入口）。
+ * 「启动 Codex / 重启 Codex」主按钮：Codex 页面的外壳顶栏右侧（#2744 / #2745：2.x 升级后用户找不到启动入口）。
  * 状态和动作都由 App 传进来，和侧栏播放键、⌘K、托盘面板走同一套 launch / restart 流程，这里只负责画按钮。
  */
 import { Loader2, Play, RotateCw } from "lucide-react";
