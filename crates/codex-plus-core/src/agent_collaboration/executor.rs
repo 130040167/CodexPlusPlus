@@ -55,15 +55,103 @@ impl Provider {
     }
 }
 
+/// 可执行文件的定位结果，附带「已保存路径失效」的诊断信息。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecutableResolution {
+    pub path: Option<PathBuf>,
+    /// 用户保存了一个看起来是路径的值，但该文件已不存在。
+    pub configured_missing: bool,
+}
+
+impl ExecutableResolution {
+    /// 已保存路径失效，本次改用自动查找到的 CLI（不回写用户设置）。
+    pub fn recovered(&self) -> bool {
+        self.configured_missing && self.path.is_some()
+    }
+}
+
 /// 只定位可执行文件，不读取登录状态，也不运行检测命令。
 pub fn resolve_executable(agent: &AgentConfig) -> Option<PathBuf> {
-    let provider = Provider::from_id(&agent.id).ok()?;
-    let configured = agent.executable.trim();
-    if !configured.is_empty() {
-        return resolve_command(configured);
-    }
+    resolve_executable_detailed(agent).path
+}
 
+/// 同 [`resolve_executable`]，额外返回已保存路径是否失效、是否发生了回退。
+pub fn resolve_executable_detailed(agent: &AgentConfig) -> ExecutableResolution {
+    let local_appdata = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    resolve_executable_with(agent, local_appdata.as_deref(), |provider| {
+        auto_detect_executable(provider, local_appdata.as_deref())
+    })
+}
+
+/// 解析逻辑本体；托管目录根与自动查找由调用方注入，便于用临时目录测试。
+fn resolve_executable_with(
+    agent: &AgentConfig,
+    local_appdata: Option<&Path>,
+    auto_detect: impl FnOnce(Provider) -> Option<PathBuf>,
+) -> ExecutableResolution {
+    let Ok(provider) = Provider::from_id(&agent.id) else {
+        return ExecutableResolution::default();
+    };
+    let configured = agent.executable.trim();
+    if configured.is_empty() {
+        return ExecutableResolution {
+            path: auto_detect(provider),
+            configured_missing: false,
+        };
+    }
+    if let Some(path) = resolve_command(configured) {
+        return ExecutableResolution {
+            path: Some(path),
+            configured_missing: false,
+        };
+    }
+    let looks_like_path = Path::new(configured).is_absolute()
+        || configured.contains('/')
+        || configured.contains('\\');
+    if !looks_like_path || Path::new(configured).exists() {
+        // 裸命令名找不到、或文件存在但不可执行：保持原样报错，不替用户换 CLI。
+        return ExecutableResolution::default();
+    }
+    // 已保存的文件不存在。桌面版更新会换掉 bin\<哈希>\ 目录（#2751），
+    // 这里只在运行时改用当前安装的 CLI，不覆盖用户保存的路径。
+    let path = if provider == Provider::Codex {
+        local_appdata
+            .filter(|local| crate::app_paths::is_desktop_managed_codex_cli_path(configured, local))
+            .and_then(|local| {
+                crate::app_paths::find_desktop_managed_codex_cli_from_var(Some(local))
+            })
+            // 原来指向的就是 codex 本体（如包管理器升级后旧版本目录被删）时，
+            // 再按留空时的顺序自动查找：桌面版托管 CLI → 用户目录 → PATH。
+            .or_else(|| {
+                is_codex_file_name(configured)
+                    .then(|| auto_detect(provider))
+                    .flatten()
+            })
+    } else {
+        None
+    };
+    ExecutableResolution {
+        path,
+        configured_missing: true,
+    }
+}
+
+/// 路径最后一段是否是 codex 本体；Windows 风格的反斜杠在其他平台上也要能拆开。
+fn is_codex_file_name(configured: &str) -> bool {
+    configured.rsplit(['/', '\\']).next().is_some_and(|name| {
+        name.eq_ignore_ascii_case("codex") || name.eq_ignore_ascii_case("codex.exe")
+    })
+}
+
+/// 未填写路径时的自动查找顺序。
+fn auto_detect_executable(provider: Provider, local_appdata: Option<&Path>) -> Option<PathBuf> {
     let mut candidates = Vec::new();
+    if cfg!(windows) && provider == Provider::Codex {
+        // Windows 桌面版把可独立运行的 CLI 维护在 %LOCALAPPDATA%\OpenAI\Codex\bin\<哈希>\ 下。
+        candidates.extend(crate::app_paths::find_desktop_managed_codex_cli_from_var(
+            local_appdata,
+        ));
+    }
     if cfg!(target_os = "macos") {
         match provider {
             Provider::Codex => {
@@ -252,8 +340,17 @@ async fn run_task(store: &Store, id: &str) -> anyhow::Result<Outcome> {
         .find(|agent| agent.id == task.agent_id && agent.enabled)
         .context("协作 Agent 已停用或不存在")?;
     let provider = Provider::from_id(&agent.id)?;
-    let executable =
-        resolve_executable(agent).context("未找到原生 CLI，请在协作设置中填写可执行文件路径")?;
+    let resolution = resolve_executable_detailed(agent);
+    let Some(executable) = resolution.path else {
+        if resolution.configured_missing {
+            bail!(
+                "协作设置中保存的 CLI 路径已不存在：{}\n桌面版更新后版本目录可能已变化，\
+                 请清空路径保存（留空自动查找）或重新填写。",
+                agent.executable.trim()
+            );
+        }
+        bail!("未找到原生 CLI，请在协作设置中填写可执行文件路径");
+    };
     if task.prompt.trim().is_empty() || task.prompt.len() > MAX_PROMPT_BYTES {
         bail!("协作提示词为空或超过 64 KiB 限制");
     }
@@ -1263,5 +1360,156 @@ mod tests {
             !directory.path().join("escaped.txt").exists(),
             "退出后登记的子进程组不能继续写文件"
         );
+    }
+
+    fn codex_agent(executable: &str) -> AgentConfig {
+        AgentConfig {
+            id: "codex".to_owned(),
+            name: "Codex".to_owned(),
+            executable: executable.to_owned(),
+            enabled: true,
+            model: String::new(),
+            reuse_saved_auth: false,
+        }
+    }
+
+    /// 模拟桌面版更新：旧哈希目录被删除，新哈希目录里放着当前 CLI。
+    fn managed_bin_with_updated_hash() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("OpenAI").join("Codex").join("bin");
+        let old = bin.join("08d187884f2330d1").join("codex.exe");
+        let new = bin.join("0ab0e7a8f3779036").join("codex.exe");
+        std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+        std::fs::write(&new, "new").unwrap();
+        (temp, old, new)
+    }
+
+    /// #2751：保存的 bin\<旧哈希>\codex.exe 失效后，运行时改用当前哈希目录里的 CLI，
+    /// 并标记为回退，便于界面提示；不需要再走自动查找。
+    #[test]
+    fn stale_managed_codex_path_recovers_to_current_hash_dir() {
+        let (temp, old, new) = managed_bin_with_updated_hash();
+        let agent = codex_agent(&old.to_string_lossy());
+        let resolution = resolve_executable_with(&agent, Some(temp.path()), |_| {
+            panic!("托管路径能直接恢复时不应再走自动查找")
+        });
+        assert_eq!(resolution.path.as_deref(), Some(new.as_path()));
+        assert!(resolution.configured_missing);
+        assert!(resolution.recovered());
+        // 用户保存的路径保持原样，不被静默覆盖。
+        assert_eq!(agent.executable, old.to_string_lossy());
+    }
+
+    /// Windows 风格的反斜杠路径（大小写不同）同样识别为托管路径。
+    #[test]
+    fn stale_managed_codex_path_matches_windows_separators() {
+        let (temp, _old, new) = managed_bin_with_updated_hash();
+        let configured = format!(
+            "{}\\OPENAI\\Codex\\bin\\08D187884F2330D1\\codex.exe",
+            temp.path().to_string_lossy()
+        );
+        let resolution =
+            resolve_executable_with(&codex_agent(&configured), Some(temp.path()), |_| None);
+        assert_eq!(resolution.path.as_deref(), Some(new.as_path()));
+        assert!(resolution.recovered());
+    }
+
+    /// 已保存的路径仍存在时照常使用，即使托管目录里有更新的 CLI。
+    #[cfg(unix)]
+    #[test]
+    fn existing_configured_path_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, _old, _new) = managed_bin_with_updated_hash();
+        let custom = temp.path().join("custom").join("codex");
+        std::fs::create_dir_all(custom.parent().unwrap()).unwrap();
+        std::fs::write(&custom, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&custom, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let resolution = resolve_executable_with(
+            &codex_agent(&custom.to_string_lossy()),
+            Some(temp.path()),
+            |_| panic!("路径有效时不应自动查找"),
+        );
+        assert_eq!(
+            resolution.path,
+            Some(std::fs::canonicalize(&custom).unwrap())
+        );
+        assert!(!resolution.configured_missing);
+    }
+
+    /// 失效的非托管 codex 路径（如包管理器升级删掉旧版本目录）回退到自动查找（含 PATH）。
+    #[test]
+    fn stale_non_managed_codex_path_falls_back_to_auto_detect() {
+        let temp = tempfile::tempdir().unwrap();
+        let stale = temp
+            .path()
+            .join("cellar")
+            .join("0.1.0")
+            .join("bin")
+            .join("codex");
+        let on_path = temp.path().join("path-bin").join("codex");
+        let expected = on_path.clone();
+        let resolution = resolve_executable_with(
+            &codex_agent(&stale.to_string_lossy()),
+            None,
+            move |provider| {
+                assert_eq!(provider, Provider::Codex);
+                Some(on_path)
+            },
+        );
+        assert_eq!(resolution.path, Some(expected));
+        assert!(resolution.recovered());
+    }
+
+    /// 失效的自定义文件名不替用户换 CLI，只报告路径失效；其他 Agent 也不回退。
+    #[test]
+    fn stale_custom_or_non_codex_paths_report_missing_without_fallback() {
+        let (temp, _old, _new) = managed_bin_with_updated_hash();
+        let custom = temp.path().join("tools").join("codex-nightly");
+        let resolution = resolve_executable_with(
+            &codex_agent(&custom.to_string_lossy()),
+            Some(temp.path()),
+            |_| panic!("自定义文件名失效时不应回退"),
+        );
+        assert_eq!(resolution.path, None);
+        assert!(resolution.configured_missing);
+        assert!(!resolution.recovered());
+
+        let mut claude = codex_agent(&temp.path().join("old").join("claude").to_string_lossy());
+        claude.id = "claude".to_owned();
+        let resolution = resolve_executable_with(&claude, Some(temp.path()), |_| {
+            panic!("非 Codex Agent 不做回退")
+        });
+        assert_eq!(resolution.path, None);
+        assert!(resolution.configured_missing);
+    }
+
+    /// 托管目录里已经没有任何 CLI 时，再按自动查找顺序兜底。
+    #[test]
+    fn stale_managed_path_without_new_install_uses_auto_detect() {
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp
+            .path()
+            .join("OpenAI")
+            .join("Codex")
+            .join("bin")
+            .join("08d187884f2330d1")
+            .join("codex.exe");
+        let fallback = temp.path().join("npm").join("codex.exe");
+        let expected = fallback.clone();
+        let resolution = resolve_executable_with(
+            &codex_agent(&old.to_string_lossy()),
+            Some(temp.path()),
+            move |_| Some(fallback),
+        );
+        assert_eq!(resolution.path, Some(expected));
+        assert!(resolution.recovered());
+
+        let none = resolve_executable_with(
+            &codex_agent(&old.to_string_lossy()),
+            Some(temp.path()),
+            |_| None,
+        );
+        assert_eq!(none.path, None);
+        assert!(none.configured_missing);
     }
 }

@@ -358,9 +358,12 @@ fn call_tool(store: &Store, name: &str, arguments: Value) -> anyhow::Result<Valu
             let snapshot = store.snapshot()?;
             let enabled = snapshot["config"]["enabled"].as_bool().unwrap_or(false);
             let agents: Vec<Value> = snapshot["config"]["agents"].as_array().into_iter().flatten().map(|agent| {
-                let available = snapshot["availability"].as_array().into_iter().flatten()
-                    .find(|entry| entry["id"] == agent["id"]).and_then(|entry| entry["available"].as_bool()).unwrap_or(false);
-                json!({"id": agent["id"], "name": agent["name"], "enabled": agent["enabled"], "available": available})
+                let entry = snapshot["availability"].as_array().into_iter().flatten()
+                    .find(|entry| entry["id"] == agent["id"]);
+                let flag = |key: &str| entry.and_then(|entry| entry[key].as_bool()).unwrap_or(false);
+                // 已保存路径失效时如实告知，便于区分「没装」和「桌面版更新后路径变了」（#2751）。
+                json!({"id": agent["id"], "name": agent["name"], "enabled": agent["enabled"], "available": flag("available"),
+                "configuredPathMissing": flag("configuredMissing"), "usingFallbackPath": flag("recovered")})
             }).collect();
             Ok(
                 json!({"enabled": enabled, "defaultAgentId": snapshot["config"]["defaultAgentId"], "agents": agents, "desktopSessionWake": false,
