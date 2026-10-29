@@ -907,6 +907,39 @@ fn pool_chatgpt_account_is_lent_to_codex_and_taken_back() {
     assert_eq!(ctx.settings.load().unwrap().active_relay_id, "direct");
 }
 
+/// #2760：网关供应商可以设成「不使用代理（直连）」：存成 `direct`（不分大小写），
+/// 解析出的代理就是它（不退回系统代理或进程级代理），建 client 时关掉所有代理。
+#[test]
+fn gateway_provider_proxy_can_be_direct() {
+    let fixture = fixture(57402);
+    let ctx = &fixture.ctx;
+    let mut input = deepseek_input();
+    input.name = "直连测试".into();
+    input.proxy = Some(" Direct ".into());
+    let (_, id) = create_provider(&ctx.gateway, &input, "preset:deepseek", None).unwrap();
+    let loaded = ctx.gateway.load().unwrap();
+    let provider = loaded.provider(&id).unwrap();
+    assert_eq!(provider.proxy, codex_plus_core::relay_proxy::DIRECT_PROXY);
+    assert_eq!(
+        codex_plus_core::relay_proxy::proxy_for_relay(&provider.relay).as_deref(),
+        Some(codex_plus_core::relay_proxy::DIRECT_PROXY)
+    );
+    assert!(
+        codex_plus_core::http_client::proxied_client_for_relay("test", &provider.relay).is_ok(),
+        "直连不能被当成代理地址去解析"
+    );
+    // 详情里单独改代理也认直连。
+    let mut input = deepseek_input();
+    input.proxy = Some(String::new());
+    update_provider(&ctx.gateway, &id, &input).unwrap();
+    input.proxy = Some("DIRECT".into());
+    update_provider(&ctx.gateway, &id, &input).unwrap();
+    assert_eq!(
+        ctx.gateway.load().unwrap().provider(&id).unwrap().proxy,
+        codex_plus_core::relay_proxy::DIRECT_PROXY
+    );
+}
+
 /// 网关供应商的独立代理存在 gateway.json，载入后只用它（不按 id 查直连模式的代理表）；
 /// 编辑时不传表示不改，空串表示清掉，写错的地址拦下。
 #[test]

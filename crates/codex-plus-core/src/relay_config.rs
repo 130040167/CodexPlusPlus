@@ -2019,12 +2019,11 @@ pub fn merge_common_config_into_config(
 /// 用户表现为「编辑通用配置后 MCP 连接配置丢失」，实际是整份配置都没加载
 /// （#2147 / #1997 / #2123 同源）。
 fn mcp_server_entry_has_transport(table: &dyn TableLike) -> bool {
-    ["command", "url"].iter().any(|key| {
-        table
-            .get(key)
-            .and_then(Item::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-    })
+    // 和 Codex 的判断一致：只看有没有 command / url 字符串，空串 Codex 也能加载（只是起不来那一个），
+    // 不能当成残缺条目删掉。
+    ["command", "url"]
+        .iter()
+        .any(|key| table.get(key).and_then(Item::as_str).is_some())
 }
 
 /// 落盘前的 MCP 完整性校验（#2147）。

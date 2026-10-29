@@ -2305,6 +2305,9 @@ fn clean_proxy(proxy: &str) -> anyhow::Result<String> {
     if proxy.is_empty() {
         return Ok(String::new());
     }
+    if crate::relay_proxy::is_direct_proxy(proxy) {
+        return Ok(crate::relay_proxy::DIRECT_PROXY.to_string());
+    }
     let ok = ["http://", "https://", "socks5://", "socks5h://"]
         .iter()
         .any(|scheme| proxy.to_ascii_lowercase().starts_with(scheme));
