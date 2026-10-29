@@ -874,16 +874,41 @@ pub async fn check_gateway_provider_models(
     }
 }
 
-/// 供应商详情里的「从上游同步」：按上游多删少补——上游已没有的从列表删掉，新增的加进来。
-/// 拉取失败或上游返回空列表时不改列表。
+/// 供应商详情里「从上游同步」的第一步（#2785）：拉上游模型，返回和现有列表的差异供用户勾选，
+/// 不改任何数据。拉取失败或上游返回空列表时报错。
 #[tauri::command]
-pub async fn fetch_gateway_provider_models(id: String) -> CommandResult<Option<GatewayPayload>> {
-    let result = model_sync::fetch_provider_models(&GatewayStore::default(), &id).await;
+pub async fn preview_gateway_provider_models_sync(
+    id: String,
+) -> CommandResult<Option<model_sync::ModelSyncPreview>> {
+    match model_sync::preview_provider_models(&GatewayStore::default(), &id).await {
+        Ok(preview) => ok(
+            &format!(
+                "上游有 {} 个模型：新增 {} 个，已下架 {} 个。",
+                preview.upstream.len(),
+                preview.added.len(),
+                preview.removed.len()
+            ),
+            Some(preview),
+        ),
+        Err(error) => failed(&format!("获取模型列表失败：{error:#}"), None),
+    }
+}
+
+/// 「从上游同步」的第二步：只删用户勾选移除的、只加勾选新增的；被删模型的价格、窗口、思考等级一并清掉。
+#[tauri::command]
+pub fn apply_gateway_provider_models_sync(
+    id: String,
+    remove: Vec<String>,
+    add: Vec<String>,
+) -> CommandResult<Option<GatewayPayload>> {
+    let result = model_sync::apply_upstream_sync(&GatewayStore::default(), &id, &remove, &add);
     let message = match &result {
-        Ok((_, diff)) => sync_models_message(diff),
+        Ok((_, changes)) => sync_models_message(changes),
         Err(_) => String::new(),
     };
-    let added = result.as_ref().is_ok_and(|(_, diff)| !diff.added.is_empty());
+    let added = result
+        .as_ref()
+        .is_ok_and(|(_, changes)| !changes.added.is_empty());
     let result = refresh_agents(result);
     if added {
         autofill_prices(Some(id));
@@ -891,20 +916,27 @@ pub async fn fetch_gateway_provider_models(id: String) -> CommandResult<Option<G
     respond(&message, "从上游同步模型失败", result)
 }
 
-/// 「从上游同步」的结果提示：新增、移除各几个（列出模型名），都没有就说已是最新。
-fn sync_models_message(diff: &model_sync::ModelDiff) -> String {
-    let total = diff.upstream.len();
+/// 「从上游同步」的结果提示：新增、移除各几个（列出模型名），都没有就说列表没变。
+fn sync_models_message(changes: &model_sync::ModelChanges) -> String {
     let mut parts = Vec::new();
-    if !diff.added.is_empty() {
-        parts.push(format!("新增 {} 个：{}", diff.added.len(), diff.added.join("、")));
+    if !changes.added.is_empty() {
+        parts.push(format!(
+            "新增 {} 个：{}",
+            changes.added.len(),
+            changes.added.join("、")
+        ));
     }
-    if !diff.removed.is_empty() {
-        parts.push(format!("移除 {} 个：{}", diff.removed.len(), diff.removed.join("、")));
+    if !changes.removed.is_empty() {
+        parts.push(format!(
+            "移除 {} 个：{}",
+            changes.removed.len(),
+            changes.removed.join("、")
+        ));
     }
     if parts.is_empty() {
-        format!("上游有 {total} 个模型，列表已是最新。")
+        "模型列表没有变化。".to_string()
     } else {
-        format!("上游有 {total} 个模型，{}。", parts.join("；"))
+        format!("已同步模型：{}。", parts.join("；"))
     }
 }
 
