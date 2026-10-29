@@ -110,4 +110,5 @@ mod upstream_worktree;
 mod usage_status_line_settings;
 mod user_scripts_reload;
 mod watcher;
+mod windows_console_spawn;
 mod zed_remote;

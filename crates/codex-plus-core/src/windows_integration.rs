@@ -79,8 +79,11 @@ pub fn close_process_tree(process_id: u32, force: bool) -> bool {
     if !force {
         return request_process_close(process_id);
     }
+    use std::os::windows::process::CommandExt;
+    // taskkill 是控制台程序，不加 CREATE_NO_WINDOW 会从 GUI 进程里闪出黑色终端。
     let output = std::process::Command::new("taskkill")
         .args(["/PID", process_id.to_string().as_str(), "/T", "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
     matches!(output, Ok(output) if output.status.success())
 }

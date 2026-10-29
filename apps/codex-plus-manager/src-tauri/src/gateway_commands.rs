@@ -1203,13 +1203,19 @@ fn probe_cli_version(binary: &str) -> Option<String> {
         .into_iter()
         .map(|dir| dir.join(binary))
         .find(|candidate| candidate.is_file())?;
-    let mut child = std::process::Command::new(path)
+    let mut command = std::process::Command::new(path);
+    command
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(std::process::Stdio::null());
+    // CLI 是控制台程序：Windows 上不加 CREATE_NO_WINDOW，打开 Agent 页时会闪黑色终端（#2778）。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(codex_plus_core::windows_create_no_window());
+    }
+    let mut child = command.spawn().ok()?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
     loop {
         match child.try_wait() {
