@@ -13433,18 +13433,20 @@ button.side-item:hover {
 .shell .side-agent-wrap {
   position: relative;
 }
-/* 只给名字留出播放键的位置，状态点仍贴在行的最右边。 */
-.shell .side-agent-wrap:has(.side-agent-run) .side-item-label {
-  margin-right: 30px;
+/* 只给名字留出播放键的位置，状态点仍贴在行的最右边。
+   用 has-run 类而不是 :has()：旧版系统 WebKit（15.4 以前的版本）不认 :has()，整条规则会被丢掉。 */
+.shell .side-agent-wrap.has-run .side-item-label {
+  margin-right: 32px;
 }
+/* 播放键常显（不靠悬停才出现）：未运行时是绿色播放键加浅底，一眼能看到；点击区 24px。 */
 .shell .side-agent-run {
   position: absolute;
   top: 50%;
-  right: 22px;
+  right: 20px;
   display: grid;
   place-items: center;
-  width: 22px;
-  height: 22px;
+  width: 24px;
+  height: 24px;
   padding: 0;
   border: 0;
   border-radius: 6px;
@@ -13453,11 +13455,16 @@ button.side-item:hover {
   cursor: pointer;
   transform: translateY(-50%);
 }
+.shell .side-agent-run[data-running="false"] {
+  background: hsl(var(--status-success) / 0.14);
+  color: hsl(var(--status-success));
+}
 .shell .side-agent-run:hover:not(:disabled) {
   background: hsl(var(--accent));
   color: hsl(var(--foreground));
 }
 .shell .side-agent-run[data-running="false"]:hover:not(:disabled) {
+  background: hsl(var(--status-success) / 0.24);
   color: hsl(var(--status-success));
 }
 .shell .side-agent-run[data-running="true"]:hover:not(:disabled) {
@@ -13467,13 +13474,18 @@ button.side-item:hover {
   cursor: progress;
   opacity: 0.6;
 }
+.shell .side-agent-run[data-unavailable="true"] {
+  background: transparent;
+  color: hsl(var(--muted-foreground));
+  cursor: not-allowed;
+}
 .shell .side-agent-run:focus-visible {
   outline: 2px solid hsl(var(--ring));
   outline-offset: 1px;
 }
 .shell .side-agent-run svg {
-  width: 12px;
-  height: 12px;
+  width: 13px;
+  height: 13px;
 }
 .shell .side-agent-run[data-running="false"] svg {
   fill: currentColor;
@@ -13814,4 +13826,30 @@ button.side-item:hover {
 
 .shell .request-log-note {
   margin: 0;
+}
+
+/* 「启动 / 重启 Codex」主按钮（#2744 / #2745）：网关总览页头右侧一个，其它页面在顶栏最右侧一个。 */
+.shell .codex-launch {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+.shell .codex-launch[data-unavailable="true"] {
+  cursor: not-allowed;
+}
+.shell .hub-intro {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.shell .hub-intro > p {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.shell .hub-codex-launch .codex-launch-button {
+  height: 34px;
+  padding: 0 16px;
+  font-size: 13px;
+}
+.shell .topbar-codex-launch .codex-launch-button {
+  padding: 0 12px;
 }

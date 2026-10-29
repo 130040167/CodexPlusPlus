@@ -18,6 +18,7 @@ import { hubAgents, hubFeed, hubLinks, hubPoolState, hubProviders, hubTotals, su
 import { AGENT_ICONS, APP_LOGO_URL, Avatar, KeyCount, MemberStatusLabel, makeRun, type Notify, type Run } from "./gateway-ui";
 import { publishGatewayPayload, useGatewayPayload } from "./gateway-store";
 import { AgentConnectDialog } from "./GatewayAgents";
+import { CodexLaunchButton, type CodexLaunchState } from "./CodexLaunchButton";
 import { ProviderAdder } from "./GatewayProviders";
 import "./HubOverview.css";
 
@@ -55,11 +56,14 @@ export function AgentGlyph({ agent, className = "" }: { agent: string; className
 
 export function HubOverview({
   codex,
+  codexLaunch,
   notify,
   onOpenAgent,
   onNavigate,
 }: {
   codex: CodexSummary;
+  /** 页头右侧的「启动 / 重启 Codex」：总览是默认落脚页，启动入口放在这里最显眼。 */
+  codexLaunch: CodexLaunchState;
   notify: Notify;
   onOpenAgent: (agent: string) => void;
   /** 跳到网关的某个页签或其它页面。 */
@@ -86,13 +90,14 @@ export function HubOverview({
 
   return (
     <div className="hub-page">
-      {/* 页面标题已在外壳顶栏，这里只留一句现状说明。 */}
+      {/* 页面标题已在外壳顶栏，这里留一句现状说明，右侧是启动 Codex 的主按钮（顶栏在总览页不再重复）。 */}
       <header className="hub-intro">
         <p>
           {payload
             ? tf("{0} 个 Agent 通过 Codex++ 共用 {1} 个供应商。请求按模型名路由，Key 冷却或供应商熔断时自动换上游。", [connected, providers.length])
             : t("正在读取网关状态…")}
         </p>
+        <CodexLaunchButton className="hub-codex-launch" state={codexLaunch} />
       </header>
 
       <section className="hub-card">
