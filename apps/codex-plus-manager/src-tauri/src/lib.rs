@@ -187,6 +187,10 @@ pub fn run() {
             }
         }
     }
+    // 清理以前自动更新留在 app 同级目录里的 .codex-plus-update-<uuid> 残留（#2774）。
+    // 删旧 app 备份要些时间，放后台线程；失败只记诊断日志，不影响启动。
+    #[cfg(target_os = "macos")]
+    std::thread::spawn(codex_plus_core::update::macos::cleanup_stale_update_transactions);
     if let Ok(settings) = codex_plus_core::settings::SettingsStore::default().load() {
         // 请求体上限是运行期策略：管理器启动即按设置应用，之后启动的 helper 直接继承，
         // 不必等完整启动流程。环境变量仍由 launcher 侧统一优先。
