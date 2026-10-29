@@ -226,8 +226,8 @@ export function RelayBillingLine({
   if (!probe.platform) return null;
   const parts = relayBillingParts(probe);
   return (
-    <span className="relay-billing-line" title={relayBillingTitle(probe, failure)}>
-      <span className="relay-tag" data-tone="billing">{relayPlatformLabel(probe.platform)}</span>
+    // 卡片上不显示中转站类型（sub2api / new-api），只放在悬停提示里。
+    <span className="relay-billing-line" title={`${relayPlatformLabel(probe.platform)}\n${relayBillingTitle(probe, failure)}`}>
       {parts.map((part, index) => (
         <span className="relay-billing-part" data-tone={part.tone} key={index}>{part.text}</span>
       ))}
@@ -237,14 +237,15 @@ export function RelayBillingLine({
   );
 }
 
-/** 网关供应商池右侧：和订阅账号的「套餐 + 额度条」同一位置、同一样式。 */
+/** 网关供应商池右侧：和订阅账号的「套餐 + 额度条」同一位置、同一样式。只显示倍率，
+ * 中转站类型（sub2api / new-api）放在悬停提示里；没有倍率时不显示，由调用方显示 Key 数。 */
 export function RelayBillingPoolLabel({ probe }: { probe: RelayBillingProbe }) {
-  if (!probe.platform) return null;
+  if (!probe.platform || !probe.rate) return null;
   const peak = relayAppliedPeak(probe.rate);
   const platform = relayPlatformLabel(probe.platform);
   return (
-    <span className="gw-billing-label" title={`${relayBillingParts(probe).map((part) => part.text).join(" · ")}\n${relayRateSource(probe)}`}>
-      {probe.rate ? tf("{0} · 倍率 {1}", [platform, formatRelayMultiplier(probe.rate.multiplier)]) : platform}
+    <span className="gw-billing-label" title={`${platform}\n${relayBillingParts(probe).map((part) => part.text).join(" · ")}\n${relayRateSource(probe)}`}>
+      {tf("倍率 {0}", [formatRelayMultiplier(probe.rate.multiplier)])}
       {peak !== null ? <em>{tf("含高峰 ×{0}", [String(Number(peak.toFixed(4)))])}</em> : null}
     </span>
   );

@@ -2739,7 +2739,6 @@ export const EN_PLAIN: Record<string, string> = {
 export const EN_TEMPLATE: Record<string, string> = {
   // 中转站（sub2api / new-api）倍率 / 余额
   "倍率 {0}": "Rate {0}",
-  "{0} · 倍率 {1}": "{0} · rate {1}",
   "分组倍率取自最近一次消费记录（分组 {0}）": "Group rate taken from the latest usage record (group {0})",
   "含高峰 ×{0}": "incl. peak ×{0}",
   "Key 额度剩余 {0} / {1}": "Key quota left {0} / {1}",
