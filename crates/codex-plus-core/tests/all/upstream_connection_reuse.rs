@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use codex_plus_core::protocol_proxy::{
     ForcedRelay, ProxySessionHeaders, open_responses_proxy_request_for_relay,
@@ -55,6 +56,7 @@ async fn read_request(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Option<St
 /// `accepts` 记建立了几条 TCP 连接，`request_lines` 记收到的请求行。
 /// `drop_request` 为 Some(n) 时，第 n 个请求（从 1 数）读完后不回应、直接关连接，
 /// 模拟空闲连接刚被对端关掉。
+/// `drop_delay` 是读完那个请求后等多久再关连接：等得久模拟上游处理到一半被中间设备断开。
 struct MockUpstream {
     addr: std::net::SocketAddr,
     accepts: Arc<AtomicUsize>,
@@ -62,6 +64,13 @@ struct MockUpstream {
 }
 
 async fn mock_upstream(drop_request: Option<usize>) -> MockUpstream {
+    mock_upstream_with_drop_delay(drop_request, Duration::ZERO).await
+}
+
+async fn mock_upstream_with_drop_delay(
+    drop_request: Option<usize>,
+    drop_delay: Duration,
+) -> MockUpstream {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let accepts = Arc::new(AtomicUsize::new(0));
@@ -83,6 +92,7 @@ async fn mock_upstream(drop_request: Option<usize>) -> MockUpstream {
                         lines.len()
                     };
                     if drop_request == Some(seen) {
+                        tokio::time::sleep(drop_delay).await;
                         return;
                     }
                     let body = chat_completion();
@@ -120,6 +130,12 @@ fn relay(id: &str, base_url: String, proxy: &str) -> RelayProfile {
 }
 
 async fn send_once(relay: &RelayProfile, user_agent: Option<&str>) {
+    let status = try_send_once(relay, user_agent).await.unwrap();
+    assert_eq!(status, 200);
+}
+
+/// 发一次请求，成功时读完响应体并返回状态码，上游失败时返回错误。
+async fn try_send_once(relay: &RelayProfile, user_agent: Option<&str>) -> anyhow::Result<u16> {
     let body = json!({ "model": "m", "input": "hi" }).to_string();
     let mut response = open_responses_proxy_request_for_relay(
         &body,
@@ -134,11 +150,10 @@ async fn send_once(relay: &RelayProfile, user_agent: Option<&str>) {
         ProxySessionHeaders::default(),
         None,
     )
-    .await
-    .unwrap();
-    assert_eq!(response.status_code, 200);
+    .await?;
     // 读完响应体，连接才会回到连接池。
-    response.read_body().await.unwrap();
+    response.read_body().await?;
+    Ok(response.status_code)
 }
 
 #[tokio::test]
@@ -213,6 +228,30 @@ async fn request_on_connection_closed_by_upstream_is_resent_once() {
         "被丢掉的请求重发了一次"
     );
     assert_eq!(upstream.accepts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn request_closed_long_after_sending_is_not_resent() {
+    // 第 2 个请求上游读完后过了重发窗口才断开：可能已收全请求、处理到一半被中转或 NAT 断开，
+    // 重发会让请求在上游执行两次，所以原样报错，上游只收到这一次。
+    let upstream = mock_upstream_with_drop_delay(Some(2), Duration::from_millis(1500)).await;
+    let relay = relay(
+        "stale-late-2761",
+        format!("http://{}/v1", upstream.addr),
+        "direct",
+    );
+    send_once(&relay, None).await;
+    let second = try_send_once(&relay, None).await;
+    assert!(
+        !matches!(second, Ok(200)),
+        "过了重发窗口才断开的请求不该被悄悄重发成功：{second:?}"
+    );
+    assert_eq!(
+        upstream.request_lines.lock().unwrap().len(),
+        2,
+        "断开的请求不重发"
+    );
+    assert_eq!(upstream.accepts.load(Ordering::SeqCst), 1);
 }
 
 /// 复用的 client 按 tokio 运行时分开：连接由建立它的运行时驱动，一个运行时正在结束时

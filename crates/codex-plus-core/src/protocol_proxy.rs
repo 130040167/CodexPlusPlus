@@ -288,6 +288,13 @@ const UPSTREAM_SLOW_HEADER_TIMEOUT: Duration = Duration::from_secs(600);
 /// 会让采样/压缩无故失败，两次短退避能把大部分瞬时故障挡在本地。
 const UPSTREAM_CONNECT_RETRY_DELAYS: [Duration; 2] =
     [Duration::from_millis(150), Duration::from_millis(400)];
+/// 复用连接被对端关闭时，只有请求发出后这么短时间内就断开才换新连接重发（#2761）。
+///
+/// 空闲连接早已被对端关掉、本地还没察觉时，请求一写出去就会读到 EOF，几乎是立刻失败；
+/// 而上游收全请求、处理到一半才被中转或 NAT 断开时，往往已经过了一段时间，
+/// 这时重发会让非流式 / 压缩请求在上游完整执行两次（重复计费），所以超过这个时长断开的原样报错。
+/// 请求根本没发出去的情况由底层 HTTP 库自己重试，不归这里管。
+const UPSTREAM_STALE_CONNECTION_RETRY_WINDOW: Duration = Duration::from_secs(1);
 
 /// 容量错误自动重试：单次等待上限，避免把 Codex 的请求挂太久。
 const PROXY_AUTO_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -2007,22 +2014,33 @@ pub async fn send_upstream_request_with_header_timeout(
     let mut pending = Some(request);
     let mut retries = 0_usize;
     let mut stale_connection_retried = false;
+    // 复用连接失效后的重发不重新计满响应头超时：重发那次只等首次剩下的时间。
+    let mut attempt_timeout = timeout;
     loop {
         let builder = pending.take().expect("upstream request builder missing");
-        match tokio::time::timeout(timeout, builder.send()).await {
+        let attempt_started = Instant::now();
+        match tokio::time::timeout(attempt_timeout, builder.send()).await {
             Ok(Ok(response)) => return Ok(response),
             Ok(Err(error)) => {
                 // 上游 client 复用连接（#2761）后，空闲连接可能刚被对端关掉、本地还没察觉：
-                // 请求写出去后连一个响应字节都没收到就断了。对端没回应，换新连接立即重发一次，
-                // 与浏览器对复用连接的处理一致；只重发一次，再断就照常报错。
+                // 请求写出去后连一个响应字节都没收到就断了。只有发出后很快就断开（见
+                // UPSTREAM_STALE_CONNECTION_RETRY_WINDOW）才认为是旧连接失效、换新连接重发一次；
+                // 过了这段时间才断开的，可能是上游已收全请求、处理到一半被中间设备断开，
+                // 重发会让请求在上游执行两次，原样报错。只重发一次，再断就照常报错。
+                let elapsed = attempt_started.elapsed();
                 if !stale_connection_retried
+                    && elapsed < UPSTREAM_STALE_CONNECTION_RETRY_WINDOW
                     && is_closed_before_response(&error)
                     && let Some(retry) = retry_source.as_ref().and_then(|source| source.try_clone())
                 {
                     stale_connection_retried = true;
+                    attempt_timeout = attempt_timeout.saturating_sub(elapsed);
                     let _ = crate::diagnostic_log::append_diagnostic_log(
                         "protocol_proxy.upstream_stale_connection_retry",
-                        json!({ "error": error_chain(&anyhow::Error::new(error)) }),
+                        json!({
+                            "elapsedMs": elapsed.as_millis(),
+                            "error": error_chain(&anyhow::Error::new(error))
+                        }),
                     );
                     pending = Some(retry);
                     continue;
