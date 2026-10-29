@@ -1318,17 +1318,20 @@ pub async fn probe_gateway_provider_billing(
     let Some(relay) = relay else {
         return failed(
             &format!("供应商不存在：{id}"),
-            codex_plus_core::relay_billing::RelayBillingProbe {
-                platform: None,
-                rate: None,
-                usage: None,
-                detail: String::new(),
-            },
+            codex_plus_core::relay_billing::RelayBillingProbe::unrecognized(
+                codex_plus_core::relay_billing::RelayBillingOutcome::NotRelay,
+                String::new(),
+            ),
         );
     };
     let probe = codex_plus_core::relay_billing::probe_relay_billing(&relay).await;
     let message = match &probe.platform {
         Some(platform) => format!("已识别为 {platform}。"),
+        None if probe.outcome
+            == codex_plus_core::relay_billing::RelayBillingOutcome::Unavailable =>
+        {
+            "暂时获取不到倍率和余额。".to_string()
+        }
         None => "不是已知的中转站。".to_string(),
     };
     ok(&message, probe)

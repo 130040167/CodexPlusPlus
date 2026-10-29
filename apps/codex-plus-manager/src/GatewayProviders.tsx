@@ -8,7 +8,7 @@ import { createPortal } from "react-dom";
 import { appConfirm } from "./app-dialog";
 import { Check, ChevronRight, Copy, GripVertical, Plus, RefreshCw, Search, X } from "lucide-react";
 import { t, tf } from "./i18n";
-import { RelayBillingPoolBadge, RelayBillingPoolLabel, useRelayBillingProbe } from "./RelayBillingLine";
+import { RelayBillingPoolBadge, RelayBillingPoolLabel, RelayBillingRetry, useRelayBillingProbe } from "./RelayBillingLine";
 import { relayBillingGatewayCacheKey, type RelayBillingProbe } from "./relay-billing";
 import {
   defaultProviderAgents,
@@ -497,7 +497,10 @@ function PoolRow({
           {!enabled ? t("已关闭") : status.state === "idle" && entry.account && entry.plan ? entry.plan
             : status.state === "idle" && billing.probe ? <RelayBillingPoolLabel probe={billing.probe} /> : <MemberStatusLabel status={status} />}
           {enabled && entry.quota ? <QuotaBadge quota={entry.quota} /> : null}
-          {enabled && billing.probe ? <RelayBillingPoolBadge loading={billing.loading} onRefresh={billing.refresh} probe={billing.probe} /> : null}
+          {enabled && billing.probe ? <RelayBillingPoolBadge failure={billing.failure} loading={billing.loading} onRefresh={billing.refresh} probe={billing.probe} /> : null}
+          {enabled && !billing.probe && billing.settled ? (
+            <RelayBillingRetry failure={billing.failure} loading={billing.loading} onRefresh={billing.refresh} />
+          ) : null}
         </span>
         <Switch
           disabled={busy !== null}

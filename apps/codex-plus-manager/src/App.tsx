@@ -247,7 +247,7 @@ import {
 } from "./aggregate-members";
 import { relayAuthForLiveDraft, shouldBackfillRelayProfileBeforeSwitch } from "./relay-live-files";
 import { relayBillingCacheKey, relayBillingProbeEligible, type RelayBillingProbe } from "./relay-billing";
-import { RelayBillingLine, useRelayBillingProbe } from "./RelayBillingLine";
+import { RelayBillingLine, RelayBillingRetry, useRelayBillingProbe } from "./RelayBillingLine";
 import { apiKeyPreview, createRelayApiKey, normalizeRelayApiKeys, relayProfileWithNormalizedApiKeys, relayProfileWithUpdatedApiKey, type RelayApiKey } from "./provider-api-keys";
 import { relayHeadersValidationMessage, serializeRelayHeaders } from "./relay-headers";
 import { sessionProviderForProtocol } from "./relay-session";
@@ -945,7 +945,15 @@ type ProviderImportRequest = {
 
 type PendingProviderImportResult = CommandResult<{
   pending: ProviderImportRequest | null;
+  /** pending 文件内容的指纹，确认 / 取消时带回。 */
+  fingerprint?: string | null;
 }>;
+
+type PendingProviderImport = { request: ProviderImportRequest; fingerprint: string };
+
+function pendingProviderImportFromResult(result: { pending: ProviderImportRequest | null; fingerprint?: string | null }): PendingProviderImport | null {
+  return result.pending ? { request: result.pending, fingerprint: result.fingerprint ?? "" } : null;
+}
 
 type EnvConflict = {
   name: string;
@@ -1561,7 +1569,7 @@ export function App() {
   const [envConflicts, setEnvConflicts] = useState<EnvConflictsResult | null>(null);
   const [relayEnvironment, setRelayEnvironment] = useState<RelayEnvironmentResult | null>(null);
   const [ccsProviders, setCcsProviders] = useState<CcsProvidersResult | null>(null);
-  const [pendingProviderImport, setPendingProviderImport] = useState<ProviderImportRequest | null>(null);
+  const [pendingProviderImport, setPendingProviderImport] = useState<PendingProviderImport | null>(null);
   const [localSessions, setLocalSessions] = useState<LocalSessionsResult | null>(null);
   const [liveContextEntries, setLiveContextEntries] = useState<CodexContextEntries | null>(null);
   const [logs, setLogs] = useState<LogsResult | null>(null);
@@ -1978,27 +1986,31 @@ export function App() {
   const refreshPendingProviderImport = async (silent = true) => {
     const result = await run(() => call<PendingProviderImportResult>("load_pending_provider_import"));
     if (result) {
-      setPendingProviderImport(result.pending);
+      setPendingProviderImport(pendingProviderImportFromResult(result));
       if (!silent && !isSuccessStatus(result.status)) showResultNotice(t("Codex++ 导入"), result, { silentSuccess: true });
     }
     return result;
   };
 
+  // 确认 / 取消都带上弹窗展示时的指纹：期间被新链接覆盖时后端拒绝写入，弹窗换成新的那条重新确认。
   const confirmPendingProviderImport = async () => {
-    const result = await run(() => call<SettingsResult>("confirm_pending_provider_import"));
+    const fingerprint = pendingProviderImport?.fingerprint ?? "";
+    const result = await run(() => call<SettingsResult>("confirm_pending_provider_import", { fingerprint }));
     if (result) {
-      setPendingProviderImport(null);
       setSettings(result);
       setSettingsForm(normalizeSettings(result.settings));
       showResultNotice(t("Codex++ 导入"), result);
+      if (isSuccessStatus(result.status)) setPendingProviderImport(null);
+      else await refreshPendingProviderImport(true);
       await refreshCcsProviders(true);
     }
   };
 
   const dismissPendingProviderImport = async () => {
-    const result = await run(() => call<PendingProviderImportResult>("dismiss_pending_provider_import"));
+    const fingerprint = pendingProviderImport?.fingerprint ?? null;
+    const result = await run(() => call<PendingProviderImportResult>("dismiss_pending_provider_import", { fingerprint }));
     if (result) {
-      setPendingProviderImport(null);
+      setPendingProviderImport(isSuccessStatus(result.status) ? pendingProviderImportFromResult(result) : null);
       showResultNotice(t("Codex++ 导入"), result, { silentSuccess: true });
     }
   };
@@ -4948,7 +4960,7 @@ export function App() {
       ) : null}
       {pendingProviderImport ? (
         <PendingProviderImportDialog
-          request={pendingProviderImport}
+          request={pendingProviderImport.request}
           onConfirm={() => void confirmPendingProviderImport()}
           onDismiss={() => void dismissPendingProviderImport()}
         />
@@ -10909,6 +10921,9 @@ function SortableRelayProfileCard({
             <span className="relay-tag" data-tone="protocol">{relayProtocolShortLabel(profile.protocol)}</span>
           ) : null}
           {active ? <span className="relay-active-badge">{t("使用中")}</span> : null}
+          {!billing.probe && billing.settled ? (
+            <RelayBillingRetry failure={billing.failure} loading={billing.loading} onRefresh={billing.refresh} />
+          ) : null}
         </strong>
         <small>
           {gatewayManaged
@@ -10922,7 +10937,7 @@ function SortableRelayProfileCard({
             : relayProfileConfigBrief(profile)}
         </small>
         {billing.probe ? (
-          <RelayBillingLine loading={billing.loading} onRefresh={billing.refresh} probe={billing.probe} />
+          <RelayBillingLine failure={billing.failure} loading={billing.loading} onRefresh={billing.refresh} probe={billing.probe} />
         ) : null}
       </span>
       <span className="relay-card-actions">
@@ -14936,6 +14951,11 @@ function PendingProviderImportDialog({
           {toPool ? null : <Metric label={t("模式")} value={providerImportRelayModeLabel(request.relayMode)} />}
           <Metric label="API Key" value={maskSecret(request.apiKey)} />
         </div>
+        {toPool ? (
+          <div className="hint-line" role="note">
+            {t("导入后供应商默认启用，会按「Agent 接入」里各 Agent 的「添加供应商时自动加入」设置立即承接请求。")}
+          </div>
+        ) : null}
         <div className="hint-line" role="note">
           {t("安全提示：网页链接中的自定义 config.toml 和 auth.json 不会执行；管理工具只会使用上方字段生成受管配置。")}
         </div>

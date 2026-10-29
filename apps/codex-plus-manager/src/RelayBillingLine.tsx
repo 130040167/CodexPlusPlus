@@ -6,58 +6,63 @@ import { t, tf } from "./i18n";
 import {
   formatRelayAmount,
   formatRelayMultiplier,
+  mergeRelayBillingResult,
+  normalizeRelayBillingProbe,
   rememberRelayBillingNegative,
   relayAppliedPeak,
   relayPlatformLabel,
   relayBalanceBadge,
+  relayBillingCacheUsable,
   relayBillingNegativeCached,
-  RELAY_BILLING_POSITIVE_TTL_MS,
+  type RelayBillingCacheEntry,
   type RelayBillingProbe,
 } from "./relay-billing";
 
 type ProbeResponse = Partial<RelayBillingProbe> & { status?: string };
 
-// 识别出中转站的只在内存里缓存（余额会变），识别不出的记在 localStorage。
-const probeCache = new Map<string, { probe: RelayBillingProbe; at: number }>();
-const probeInflight = new Map<string, Promise<RelayBillingProbe | null>>();
+// 识别结果在内存里缓存（余额会变；请求失败只记几分钟），明确不是的才记进 localStorage。
+const probeCache = new Map<string, RelayBillingCacheEntry>();
+const probeInflight = new Map<string, Promise<RelayBillingCacheEntry | null | undefined>>();
 
 function storage(): Storage | null {
   try { return window.localStorage; } catch { return null; }
 }
 
-function requestProbe(key: string, request: () => Promise<ProbeResponse>): Promise<RelayBillingProbe | null> {
+/** 返回并入后的缓存项；null 表示明确不是中转站；undefined 表示命令本身失败、没有结论。 */
+function requestProbe(key: string, request: () => Promise<ProbeResponse>): Promise<RelayBillingCacheEntry | null | undefined> {
   const pending = probeInflight.get(key);
   if (pending) return pending;
   const next = request()
     .then((result) => {
       // 命令本身失败（如网关里已删掉这个供应商）不算识别结论，下次再试。
-      if (result.status && result.status !== "ok") return null;
-      const platform = result.platform === "sub2api" || result.platform === "newapi" ? result.platform : null;
-      const probe: RelayBillingProbe = {
-        platform,
-        rate: result.rate ?? null,
-        usage: result.usage ?? null,
-        detail: result.detail ?? "",
-      };
-      if (platform) probeCache.set(key, { probe, at: Date.now() });
+      if (result.status && result.status !== "ok") return undefined;
+      const { entry, negative } = mergeRelayBillingResult(probeCache.get(key), normalizeRelayBillingProbe(result), Date.now());
+      if (entry) probeCache.set(key, entry);
       else probeCache.delete(key);
-      rememberRelayBillingNegative(storage(), key, !platform);
-      return probe;
+      if (negative !== "keep") rememberRelayBillingNegative(storage(), key, negative === "remember");
+      return entry;
     })
     // 识别失败不打扰用户，卡片照常显示，只是没有倍率 / 余额。
-    .catch(() => null)
+    .catch(() => undefined)
     .finally(() => probeInflight.delete(key));
   probeInflight.set(key, next);
   return next;
 }
 
+type ProbeState = {
+  key: string;
+  entry: RelayBillingCacheEntry | null;
+  /** 已有结论（识别过、或命中「明确不是」的缓存）：没识别出时据此显示刷新入口。 */
+  settled: boolean;
+  loading: boolean;
+};
+
 /** `key` 为空表示这个供应商不识别；key 变化（换地址 / Key）会重新识别。 */
 export function useRelayBillingProbe(key: string, request: () => Promise<ProbeResponse>) {
-  const [state, setState] = useState<{ key: string; probe: RelayBillingProbe | null; loading: boolean }>(() => ({
-    key,
-    probe: key ? probeCache.get(key)?.probe ?? null : null,
-    loading: false,
-  }));
+  const [state, setState] = useState<ProbeState>(() => {
+    const entry = key ? probeCache.get(key) ?? null : null;
+    return { key, entry, settled: entry !== null, loading: false };
+  });
   const requestRef = useRef(request);
   requestRef.current = request;
 
@@ -65,27 +70,40 @@ export function useRelayBillingProbe(key: string, request: () => Promise<ProbeRe
     if (!key) return;
     const cached = probeCache.get(key);
     if (!force) {
-      if (cached && Date.now() - cached.at < RELAY_BILLING_POSITIVE_TTL_MS) {
-        setState({ key, probe: cached.probe, loading: false });
+      if (relayBillingCacheUsable(cached, Date.now())) {
+        setState({ key, entry: cached ?? null, settled: true, loading: false });
         return;
       }
       if (!cached && relayBillingNegativeCached(storage(), key)) {
-        setState({ key, probe: null, loading: false });
+        setState({ key, entry: null, settled: true, loading: false });
         return;
       }
     }
-    setState({ key, probe: cached?.probe ?? null, loading: true });
-    void requestProbe(key, () => requestRef.current()).then((probe) => {
+    setState((current) => ({
+      key,
+      entry: cached ?? null,
+      settled: current.key === key && current.settled,
+      loading: true,
+    }));
+    void requestProbe(key, () => requestRef.current()).then((entry) => {
       setState((current) => current.key === key
-        ? { key, probe: probe ? (probe.platform ? probe : null) : current.probe, loading: false }
+        ? { key, entry: entry === undefined ? current.entry : entry, settled: true, loading: false }
         : current);
     });
   }, [key]);
 
   useEffect(() => { load(false); }, [load]);
 
-  const probe = state.key === key ? state.probe : null;
-  return { probe, loading: state.key === key && state.loading, refresh: () => load(true) };
+  const current = state.key === key ? state : null;
+  return {
+    /** 最近一次识别成功的结果（请求失败时仍保留旧值）。 */
+    probe: current?.entry?.probe ?? null,
+    /** 最近一次请求失败（时间与原因）；成功或明确不是时为 null。 */
+    failure: current?.entry?.failure ?? null,
+    settled: Boolean(key && current?.settled),
+    loading: Boolean(current?.loading),
+    refresh: () => load(true),
+  };
 }
 
 function relayBillingParts(probe: RelayBillingProbe): { text: string; tone?: string }[] {
@@ -139,25 +157,44 @@ function relayRateSource(probe: RelayBillingProbe): string {
   return rate ? tf("倍率接口：{0}", [rate.endpoint]) : t("这个 sub2api 版本没有倍率接口");
 }
 
-function relayBillingTitle(probe: RelayBillingProbe): string {
+type RelayBillingFailure = { at: number; detail: string } | null;
+
+function relayBillingFailureText(failure: NonNullable<RelayBillingFailure>): string {
+  return failure.detail
+    ? tf("暂时获取失败，显示的是上次的结果：{0}", [failure.detail])
+    : t("暂时获取失败，显示的是上次的结果");
+}
+
+function relayBillingTitle(probe: RelayBillingProbe, failure: RelayBillingFailure = null): string {
   return [
     relayRateSource(probe),
     probe.usage ? tf("余额接口：{0}", [probe.usage.endpoint]) : t("余额接口不可用"),
-  ].join("\n");
+    failure ? relayBillingFailureText(failure) : "",
+  ].filter(Boolean).join("\n");
 }
 
-function RelayBillingRefreshButton({ loading, onRefresh }: { loading: boolean; onRefresh: () => void }) {
+function RelayBillingRefreshButton({
+  loading,
+  onRefresh,
+  className = "",
+  title = t("刷新倍率和余额"),
+}: {
+  loading: boolean;
+  onRefresh: () => void;
+  className?: string;
+  title?: string;
+}) {
   return (
     <button
-      aria-label={t("刷新倍率和余额")}
-      className="relay-billing-refresh"
+      aria-label={title}
+      className={`relay-billing-refresh ${className}`.trim()}
       disabled={loading}
       onClick={(event) => {
         event.stopPropagation();
         onRefresh();
       }}
       onKeyDown={(event) => event.stopPropagation()}
-      title={t("刷新倍率和余额")}
+      title={title}
       type="button"
     >
       <RefreshCw className={`h-3 w-3 ${loading ? "animate-spin" : ""}`} />
@@ -165,15 +202,36 @@ function RelayBillingRefreshButton({ loading, onRefresh }: { loading: boolean; o
   );
 }
 
-export function RelayBillingLine({ probe, loading, onRefresh }: { probe: RelayBillingProbe; loading: boolean; onRefresh: () => void }) {
+/** 没识别出中转站（明确不是或暂时获取失败）时的刷新入口：平时隐藏，悬停卡片才出现。 */
+export function RelayBillingRetry({ failure, loading, onRefresh }: { failure: RelayBillingFailure; loading: boolean; onRefresh: () => void }) {
+  const title = failure
+    ? failure.detail
+      ? tf("暂时获取不到倍率和余额，点击重试：{0}", [failure.detail])
+      : t("暂时获取不到倍率和余额，点击重试")
+    : t("没有识别出 sub2api / new-api 中转站，点击重新识别");
+  return <RelayBillingRefreshButton className="relay-billing-retry" loading={loading} onRefresh={onRefresh} title={title} />;
+}
+
+export function RelayBillingLine({
+  probe,
+  failure = null,
+  loading,
+  onRefresh,
+}: {
+  probe: RelayBillingProbe;
+  failure?: RelayBillingFailure;
+  loading: boolean;
+  onRefresh: () => void;
+}) {
   if (!probe.platform) return null;
   const parts = relayBillingParts(probe);
   return (
-    <span className="relay-billing-line" title={relayBillingTitle(probe)}>
+    <span className="relay-billing-line" title={relayBillingTitle(probe, failure)}>
       <span className="relay-tag" data-tone="billing">{relayPlatformLabel(probe.platform)}</span>
       {parts.map((part, index) => (
         <span className="relay-billing-part" data-tone={part.tone} key={index}>{part.text}</span>
       ))}
+      {failure ? <span className="relay-billing-part" data-tone="warning">{t("暂时获取失败")}</span> : null}
       <RelayBillingRefreshButton loading={loading} onRefresh={onRefresh} />
     </span>
   );
@@ -192,13 +250,24 @@ export function RelayBillingPoolLabel({ probe }: { probe: RelayBillingProbe }) {
   );
 }
 
-export function RelayBillingPoolBadge({ probe, loading, onRefresh }: { probe: RelayBillingProbe; loading: boolean; onRefresh: () => void }) {
+export function RelayBillingPoolBadge({
+  probe,
+  failure = null,
+  loading,
+  onRefresh,
+}: {
+  probe: RelayBillingProbe;
+  failure?: RelayBillingFailure;
+  loading: boolean;
+  onRefresh: () => void;
+}) {
   const badge = probe.usage ? relayBalanceBadge(probe.usage) : null;
   const details = relayBillingParts(probe).map((part) => part.text).join("\n");
   return (
     <span className="gw-billing-status">
+      {failure ? <em className="gw-billing-stale" title={relayBillingFailureText(failure)}>{t("暂时获取失败")}</em> : null}
       {badge ? (
-        <span className="gw-quota-badge" data-tone={badge.tone} title={`${details}\n${relayBillingTitle(probe)}`}>
+        <span className="gw-quota-badge" data-tone={badge.tone} title={`${details}\n${relayBillingTitle(probe, failure)}`}>
           {badge.ratio !== null ? <i style={{ "--gw-quota": `${Math.round(badge.ratio * 100)}%` } as CSSProperties} /> : null}
           {probe.usage?.kind === "wallet" ? tf("余额 {0}", [badge.amount]) : tf("剩 {0}", [badge.amount])}
         </span>

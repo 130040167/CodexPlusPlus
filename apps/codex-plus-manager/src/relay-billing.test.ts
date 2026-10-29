@@ -11,7 +11,13 @@ import {
   relayBillingNegativeCached,
   relayBillingCacheKey,
   relayBillingProbeEligible,
+  mergeRelayBillingResult,
+  normalizeRelayBillingProbe,
+  relayBillingCacheUsable,
+  RELAY_BILLING_FAILURE_TTL_MS,
   RELAY_BILLING_NEGATIVE_TTL_MS,
+  RELAY_BILLING_POSITIVE_TTL_MS,
+  type RelayBillingProbe,
   type RelayRateInfo,
   type RelayBillingProfile,
   type RelayUsageInfo,
@@ -112,4 +118,51 @@ test("platform labels and unlimited keys", () => {
     unit: "USD", rateLimits: [],
   };
   assert.equal(relayBalanceBadge(unlimited), null);
+});
+
+const recognized = (patch: Partial<RelayBillingProbe> = {}): RelayBillingProbe => ({
+  platform: "sub2api", rate: null, usage: null, detail: "", outcome: "recognized", ...patch,
+});
+
+test("probe outcome distinguishes not-a-relay from temporary failures", () => {
+  assert.equal(normalizeRelayBillingProbe({ platform: "newapi" }).outcome, "recognized");
+  assert.equal(normalizeRelayBillingProbe({ platform: null, outcome: "unavailable", detail: "HTTP 503" }).outcome, "unavailable");
+  assert.equal(normalizeRelayBillingProbe({ platform: null, outcome: "notRelay" }).outcome, "notRelay");
+  // 老后端没有 outcome：按 platform 推断。
+  assert.equal(normalizeRelayBillingProbe({ platform: null }).outcome, "notRelay");
+  assert.equal(normalizeRelayBillingProbe({ platform: "other", outcome: "recognized" }).platform, null);
+});
+
+test("only a definite not-a-relay answer writes the long negative cache", () => {
+  const now = 1_000_000;
+  const positive = { probe: recognized(), at: now - 1000, failure: null };
+
+  const ok = mergeRelayBillingResult(undefined, recognized(), now);
+  assert.equal(ok.negative, "clear");
+  assert.deepEqual(ok.entry, { probe: recognized(), at: now, failure: null });
+
+  const notRelay = mergeRelayBillingResult(positive, normalizeRelayBillingProbe({ platform: null, outcome: "notRelay" }), now);
+  assert.equal(notRelay.negative, "remember");
+  assert.equal(notRelay.entry, null);
+
+  // 请求失败：保留上次成功的结果并标注失败，不碰长期负缓存。
+  const failed = mergeRelayBillingResult(positive, normalizeRelayBillingProbe({ platform: null, outcome: "unavailable", detail: "超时" }), now);
+  assert.equal(failed.negative, "keep");
+  assert.deepEqual(failed.entry, { probe: positive.probe, at: positive.at, failure: { at: now, detail: "超时" } });
+
+  // 从没识别成功过时请求失败：只记失败，没有旧值。
+  const firstFailure = mergeRelayBillingResult(undefined, normalizeRelayBillingProbe({ platform: null, outcome: "unavailable" }), now);
+  assert.equal(firstFailure.negative, "keep");
+  assert.equal(firstFailure.entry?.probe, null);
+});
+
+test("failed probes are retried after a few minutes, recognized ones after the positive TTL", () => {
+  const now = 10_000_000;
+  assert.equal(relayBillingCacheUsable(undefined, now), false);
+  assert.equal(relayBillingCacheUsable({ probe: recognized(), at: now - 1000, failure: null }, now), true);
+  assert.equal(relayBillingCacheUsable({ probe: recognized(), at: now - RELAY_BILLING_POSITIVE_TTL_MS, failure: null }, now), false);
+  const failure = (at: number) => ({ probe: recognized(), at: 0, failure: { at, detail: "" } });
+  assert.equal(relayBillingCacheUsable(failure(now - 1000), now), true);
+  assert.equal(relayBillingCacheUsable(failure(now - RELAY_BILLING_FAILURE_TTL_MS), now), false);
+  assert.ok(RELAY_BILLING_FAILURE_TTL_MS < RELAY_BILLING_NEGATIVE_TTL_MS);
 });

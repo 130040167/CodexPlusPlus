@@ -317,6 +317,25 @@ pub fn proxied_client_for_relay(
     cached_relay_client(user_agent, resolve_proxy_choice(proxy.as_deref(), None))
 }
 
+/// 代理取法与 [`proxied_client_for_relay`] 完全一致，但不进缓存，并使用调用方给的重定向策略。
+/// 中转站倍率 / 余额识别会同时带 Bearer 和 `x-api-key`，reqwest 跨主机重定向只去掉
+/// Authorization / Cookie，不去 `x-api-key`，所以识别要用不跟随跨主机重定向的 client。
+pub fn relay_client_with_redirect(
+    user_agent: &str,
+    relay: &crate::settings::RelayProfile,
+    redirect: reqwest::redirect::Policy,
+) -> anyhow::Result<reqwest::Client> {
+    let proxy = crate::relay_proxy::proxy_for_relay(relay);
+    build_client_with_proxy_choice(
+        user_agent,
+        &resolve_proxy_choice(proxy.as_deref(), None),
+        ClientOptions {
+            redirect: Some(redirect),
+            ..ClientOptions::default()
+        },
+    )
+}
+
 /// 用调用方配好的 builder（超时、UA 等不变）建 client，并按给定的供应商代理设置走代理：
 /// 填了代理就走它，`direct` 时不走任何代理，没填（None）时保持 reqwest 默认的系统代理 / 环境变量。
 /// 账号类供应商的 token 刷新、额度 / 账号查询、模型列表这些属于某个网关供应商的请求都要走这里，

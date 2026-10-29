@@ -2662,6 +2662,13 @@ export const EN_PLAIN: Record<string, string> = {
   "Key 不限额度": "Key has no quota limit",
   "这个 Key 还没有消费记录，拿不到分组倍率": "This key has no usage records yet, so the group rate is unknown",
   "分组倍率取自最近一次消费记录": "Group rate taken from the latest usage record",
+  "暂时获取失败": "Temporarily unavailable",
+  "暂时获取失败，显示的是上次的结果": "Temporarily unavailable; showing the last result",
+  "暂时获取不到倍率和余额，点击重试": "Rate and balance are temporarily unavailable. Click to retry",
+  "没有识别出 sub2api / new-api 中转站，点击重新识别": "Not recognized as a sub2api / new-api relay. Click to check again",
+  // 导入链接导入到供应商池
+  "导入后供应商默认启用，会按「Agent 接入」里各 Agent 的「添加供应商时自动加入」设置立即承接请求。":
+    "The imported provider is enabled by default and starts serving requests right away for agents that have \"Auto-join new providers\" turned on under Agent access.",
   // 子 Agent 任务排队（#2772）
   "任务已提交并进入排队，前面的任务结束后自动启动。": "Task submitted and queued. It starts automatically when the tasks ahead of it finish.",
   // 脚本市场更新时间 / 排序与本地脚本合并状态（#2781）
@@ -2700,6 +2707,8 @@ export const EN_TEMPLATE: Record<string, string> = {
   "{0} 剩 {1}": "{0}: {1} left",
   "倍率接口：{0}": "Rate endpoint: {0}",
   "余额接口：{0}": "Balance endpoint: {0}",
+  "暂时获取失败，显示的是上次的结果：{0}": "Temporarily unavailable; showing the last result: {0}",
+  "暂时获取不到倍率和余额，点击重试：{0}": "Rate and balance are temporarily unavailable. Click to retry: {0}",
   // 子 Agent 任务排队（#2772）
   "此 Agent 的排队任务已达上限（{0} 个），请等待前面的任务结束或取消部分排队任务。": "This agent's queue is full ({0} tasks). Wait for earlier tasks to finish or cancel some queued tasks.",
   "此 Agent 还有 {0} 个任务未结束，新任务会排队，前面的结束后按提交顺序自动启动。": "This agent still has {0} unfinished task(s). New tasks are queued and start automatically in submission order.",
@@ -3074,6 +3083,7 @@ export const EN_BACKEND: Record<string, string> = {
   "待确认供应商导入已读取。": "Pending provider import loaded.",
   "没有待确认的供应商导入。": "No pending provider import.",
   "已取消供应商导入。": "Provider import cancelled.",
+  "导入内容已变化，请重新确认": "The import request has changed. Please review and confirm again.",
   "会话 ID 不能为空。": "Session ID must not be empty.",
   "推荐内容已加载。": "Recommendations loaded.",
   "拓展已刷新。": "Extensions refreshed.",

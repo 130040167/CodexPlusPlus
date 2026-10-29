@@ -395,6 +395,27 @@ pub struct CcsProvidersPayload {
 #[serde(rename_all = "camelCase")]
 pub struct PendingProviderImportPayload {
     pub pending: Option<codex_plus_core::provider_import::ProviderImportRequest>,
+    /// pending 文件内容的指纹：确认 / 取消时带回，后端比对一致才动手。
+    pub fingerprint: Option<String>,
+}
+
+impl PendingProviderImportPayload {
+    fn empty() -> Self {
+        Self {
+            pending: None,
+            fingerprint: None,
+        }
+    }
+
+    fn from_pending(pending: Option<codex_plus_core::provider_import::PendingProviderImport>) -> Self {
+        match pending {
+            Some(pending) => Self {
+                pending: Some(pending.request),
+                fingerprint: Some(pending.fingerprint),
+            },
+            None => Self::empty(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4637,27 +4658,26 @@ pub fn import_ccs_providers(
 
 #[tauri::command]
 pub fn load_pending_provider_import() -> CommandResult<PendingProviderImportPayload> {
-    match codex_plus_core::provider_import::load_pending_provider_import() {
+    match codex_plus_core::provider_import::load_pending_provider_import_with_fingerprint() {
         Ok(pending) => ok(
             "待确认供应商导入已读取。",
-            PendingProviderImportPayload { pending },
+            PendingProviderImportPayload::from_pending(pending),
         ),
         Err(error) => failed(
             &format!("读取待确认供应商导入失败：{error}"),
-            PendingProviderImportPayload { pending: None },
+            PendingProviderImportPayload::empty(),
         ),
     }
 }
 
+/// `fingerprint` 是弹窗展示时拿到的指纹；pending 期间被新链接覆盖时拒绝写入，让用户重新确认。
+/// 导入目标与导入内容取自同一次读取。
 #[tauri::command]
-pub fn confirm_pending_provider_import() -> CommandResult<SettingsPayload> {
-    let to_pool = codex_plus_core::provider_import::load_pending_provider_import()
-        .ok()
-        .flatten()
-        .is_some_and(|request| codex_plus_core::provider_import::is_pool_import(&request));
-    match codex_plus_core::provider_import::confirm_pending_provider_import() {
-        Ok(Some(result)) => {
-            let message = match (to_pool, result.imported) {
+pub fn confirm_pending_provider_import(fingerprint: String) -> CommandResult<SettingsPayload> {
+    match codex_plus_core::provider_import::confirm_pending_provider_import_matching(&fingerprint) {
+        Ok(Some(confirmed)) => {
+            let result = confirmed.result;
+            let message = match (confirmed.to_pool, result.imported) {
                 (true, true) => {
                     crate::gateway_commands::after_url_pool_import(result.profile_id.clone());
                     format!("已加入网关供应商池：{}，正在从上游获取模型。", result.profile_name)
@@ -4669,6 +4689,16 @@ pub fn confirm_pending_provider_import() -> CommandResult<SettingsPayload> {
             settings_payload(&message, "供应商导入后重新读取设置失败")
         }
         Ok(None) => settings_payload("没有待确认的供应商导入。", "设置读取失败"),
+        Err(error)
+            if error
+                .downcast_ref::<codex_plus_core::provider_import::PendingProviderImportChanged>()
+                .is_some() =>
+        {
+            failed(
+                &error.to_string(),
+                settings_payload_value().unwrap_or_else(|(_, payload)| payload),
+            )
+        }
         Err(error) => failed(
             &format!("导入供应商配置失败：{error}"),
             settings_payload_value().unwrap_or_else(|(_, payload)| payload),
@@ -4676,16 +4706,21 @@ pub fn confirm_pending_provider_import() -> CommandResult<SettingsPayload> {
     }
 }
 
+/// 只取消用户看到的那一条；期间被新链接覆盖时保留新的，并返回给界面重新展示。
 #[tauri::command]
-pub fn dismiss_pending_provider_import() -> CommandResult<PendingProviderImportPayload> {
-    match codex_plus_core::provider_import::clear_pending_provider_import() {
-        Ok(()) => ok(
+pub fn dismiss_pending_provider_import(
+    fingerprint: Option<String>,
+) -> CommandResult<PendingProviderImportPayload> {
+    match codex_plus_core::provider_import::dismiss_pending_provider_import_matching(
+        fingerprint.as_deref(),
+    ) {
+        Ok(remaining) => ok(
             "已取消供应商导入。",
-            PendingProviderImportPayload { pending: None },
+            PendingProviderImportPayload::from_pending(remaining),
         ),
         Err(error) => failed(
             &format!("取消供应商导入失败：{error}"),
-            PendingProviderImportPayload { pending: None },
+            PendingProviderImportPayload::empty(),
         ),
     }
 }
@@ -8380,6 +8415,12 @@ pub async fn probe_relay_billing(
             format_multiplier(rate.multiplier)
         ),
         (Some(platform), None) => format!("已识别为 {platform}。"),
+        (None, _)
+            if probe.outcome
+                == codex_plus_core::relay_billing::RelayBillingOutcome::Unavailable =>
+        {
+            "暂时获取不到倍率和余额。".to_string()
+        }
         (None, _) => "不是已知的中转站。".to_string(),
     };
     ok(&message, probe)

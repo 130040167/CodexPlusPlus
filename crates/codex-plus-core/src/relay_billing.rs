@@ -1,15 +1,29 @@
 //! 供应商卡片上的倍率 / 余额：识别中转站类型（sub2api、new-api），用供应商自己的 Key
 //! 查倍率和余额。识别结果只用于展示，失败不影响任何转发。
 
-use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::settings::RelayProfile;
 
 const BILLING_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// 同站重定向最多跟几次。
+const BILLING_MAX_REDIRECTS: usize = 5;
 
-/// 识别结果。`platform` 为空表示不是已知的中转站（或这个供应商不识别）。
+/// 识别结论。前端据此决定缓存多久：
+/// - `recognized`：识别出中转站
+/// - `notRelay`：明确不是（404、返回结构不符、重定向到别处等），可以长时间不再识别
+/// - `unavailable`：这次没拿到结论（断网、代理没起、超时、429、5xx、401/403），不能当成「不是」
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RelayBillingOutcome {
+    Recognized,
+    #[default]
+    NotRelay,
+    Unavailable,
+}
+
+/// 识别结果。`platform` 为空表示没识别出中转站，原因看 `outcome`。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RelayBillingProbe {
@@ -19,7 +33,61 @@ pub struct RelayBillingProbe {
     pub usage: Option<RelayUsageInfo>,
     /// 识别不出或请求失败的原因，仅供排查，前端不弹窗。
     pub detail: String,
+    #[serde(default)]
+    pub outcome: RelayBillingOutcome,
 }
+
+impl RelayBillingProbe {
+    /// 没识别出中转站的结果。
+    pub fn unrecognized(outcome: RelayBillingOutcome, detail: String) -> Self {
+        Self {
+            platform: None,
+            rate: None,
+            usage: None,
+            detail,
+            outcome,
+        }
+    }
+}
+
+/// 单个识别请求失败：区分「这个接口明确不是」和「这次请求没成功」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BillingFetchError {
+    pub unavailable: bool,
+    pub message: String,
+}
+
+impl BillingFetchError {
+    pub(crate) fn not_relay(message: impl Into<String>) -> Self {
+        Self {
+            unavailable: false,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            unavailable: true,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn outcome(&self) -> RelayBillingOutcome {
+        if self.unavailable {
+            RelayBillingOutcome::Unavailable
+        } else {
+            RelayBillingOutcome::NotRelay
+        }
+    }
+}
+
+impl std::fmt::Display for BillingFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BillingFetchError {}
 
 /// 倍率。sub2api 来自 `/v1/sub2api/billing`（已含高峰倍率）；
 /// new-api 来自这个 Key 最近一条消费记录里的分组倍率。
@@ -70,21 +138,18 @@ pub(crate) struct BillingTarget {
 
 /// 先试 sub2api，不是再试 new-api。官方登录、聚合、免鉴权供应商不发请求。
 pub async fn probe_relay_billing(profile: &RelayProfile) -> RelayBillingProbe {
-    let unknown = |detail: String| RelayBillingProbe {
-        platform: None,
-        rate: None,
-        usage: None,
-        detail,
-    };
     if crate::official_login::is_official_login_profile(profile)
         || profile.relay_mode == crate::settings::RelayMode::Aggregate
         || profile.uses_no_auth()
     {
-        return unknown("官方登录、聚合或免鉴权供应商不识别中转站类型".to_string());
+        return RelayBillingProbe::unrecognized(
+            RelayBillingOutcome::NotRelay,
+            "官方登录、聚合或免鉴权供应商不识别中转站类型".to_string(),
+        );
     }
     let target = match billing_target(profile) {
         Ok(target) => target,
-        Err(error) => return unknown(error.to_string()),
+        Err(error) => return RelayBillingProbe::unrecognized(error.outcome(), error.message),
     };
     let sub2api = crate::sub2api::probe(&target).await;
     if sub2api.platform.is_some() {
@@ -94,35 +159,86 @@ pub async fn probe_relay_billing(profile: &RelayProfile) -> RelayBillingProbe {
     if newapi.platform.is_some() {
         return newapi;
     }
-    unknown(format!("sub2api：{}；new-api：{}", sub2api.detail, newapi.detail))
+    // 两边都没识别出：只要有一边是「这次请求没成功」，就不能断定不是中转站。
+    let outcome = if sub2api.outcome == RelayBillingOutcome::Unavailable
+        || newapi.outcome == RelayBillingOutcome::Unavailable
+    {
+        RelayBillingOutcome::Unavailable
+    } else {
+        RelayBillingOutcome::NotRelay
+    };
+    RelayBillingProbe::unrecognized(
+        outcome,
+        format!("sub2api：{}；new-api：{}", sub2api.detail, newapi.detail),
+    )
 }
 
-fn billing_target(profile: &RelayProfile) -> anyhow::Result<BillingTarget> {
+fn billing_target(profile: &RelayProfile) -> Result<BillingTarget, BillingFetchError> {
     let base_url = if profile.upstream_base_url.trim().is_empty() {
         profile.base_url.trim()
     } else {
         profile.upstream_base_url.trim()
     };
     if base_url.is_empty() {
-        anyhow::bail!("Base URL 不能为空");
+        return Err(BillingFetchError::not_relay("Base URL 不能为空"));
     }
     let api_key = crate::relay_config::relay_profile_api_key(profile);
     if api_key.trim().is_empty() {
-        anyhow::bail!("API Key 不能为空");
+        return Err(BillingFetchError::not_relay("API Key 不能为空"));
     }
+    // 建 client 失败（代理地址无效、证书读不了）属于环境问题，修好后应能识别。
+    let client = billing_client(profile)
+        .map_err(|error| BillingFetchError::unavailable(format!("{error:#}")))?;
     Ok(BillingTarget {
-        client: crate::http_client::proxied_client_for_relay(&profile.user_agent, profile)?,
+        client,
         base_url: base_url.trim_end_matches('/').to_string(),
         api_key: api_key.trim().to_string(),
     })
 }
 
+/// 识别 / 查询倍率余额用的 client：按供应商代理建，只跟随同站重定向。
+/// 请求同时带 Bearer 和 `x-api-key`，reqwest 跨主机重定向只去掉 Authorization，
+/// 所以跨主机（含换端口）的重定向一律不跟，免得 Key 发到别的主机。
+pub(crate) fn billing_client(profile: &RelayProfile) -> anyhow::Result<reqwest::Client> {
+    crate::http_client::relay_client_with_redirect(
+        &profile.user_agent,
+        profile,
+        reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() > BILLING_MAX_REDIRECTS {
+                return attempt.error("重定向次数过多");
+            }
+            let same_site = attempt
+                .previous()
+                .last()
+                .is_some_and(|from| same_site_redirect(from, attempt.url()));
+            if same_site {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }),
+    )
+}
+
+/// 同主机同端口的重定向，或同主机默认端口的 http → https 升级，才算同站。
+fn same_site_redirect(from: &reqwest::Url, to: &reqwest::Url) -> bool {
+    if from.host_str() != to.host_str() {
+        return false;
+    }
+    if from.scheme() == to.scheme() {
+        return from.port_or_known_default() == to.port_or_known_default();
+    }
+    from.scheme() == "http" && to.scheme() == "https" && from.port().is_none() && to.port().is_none()
+}
+
 /// GET 一个 JSON 接口；`api_key` 为空时不带鉴权（如 new-api 的公开 `/api/status`）。
+/// 断网、代理没起、超时、限流、上游故障、Key 暂时被拒都算「这次没拿到」，
+/// 其余（404、405、没跟随的 3xx 等）算「这个接口明确不是」。
 pub(crate) async fn get_json(
     client: &reqwest::Client,
     endpoint: &str,
     api_key: Option<&str>,
-) -> anyhow::Result<String> {
+) -> Result<String, BillingFetchError> {
     let mut request = client
         .get(endpoint)
         // 卡片后台识别用，上游卡住时不能让刷新一直转。
@@ -130,20 +246,58 @@ pub(crate) async fn get_json(
     if let Some(api_key) = api_key {
         request = request.bearer_auth(api_key).header("x-api-key", api_key);
     }
-    let response = request
-        .send()
-        .await
-        .with_context(|| format!("请求 {endpoint} 失败"))?;
+    let response = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            let message = format!("请求 {endpoint} 失败：{error}");
+            // 重定向次数过多是站点自身的行为，不是网络问题。
+            return Err(if error.is_redirect() {
+                BillingFetchError::not_relay(message)
+            } else {
+                BillingFetchError::unavailable(message)
+            });
+        }
+    };
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    if status.is_redirection() {
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        return Err(BillingFetchError::not_relay(format!(
+            "HTTP {}：上游重定向到 {location}，为保护 Key 未跟随",
+            status.as_u16()
+        )));
+    }
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(error) if status.is_success() => {
+            return Err(BillingFetchError::unavailable(format!(
+                "读取 {endpoint} 响应失败：{error}"
+            )));
+        }
+        Err(_) => String::new(),
+    };
     if !status.is_success() {
-        anyhow::bail!(
+        let message = format!(
             "HTTP {}：{}",
             status.as_u16(),
             error_message(&body).unwrap_or_else(|| "上游拒绝请求".to_string())
         );
+        return Err(if status_is_transient(status) {
+            BillingFetchError::unavailable(message)
+        } else {
+            BillingFetchError::not_relay(message)
+        });
     }
     Ok(body)
+}
+
+/// 这些状态码说明接口可能存在、只是这次没拿到：鉴权暂时失败、超时、限流、上游故障。
+fn status_is_transient(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 401 | 403 | 408 | 425 | 429) || status.is_server_error()
 }
 
 fn error_message(body: &str) -> Option<String> {
@@ -232,6 +386,7 @@ mod tests {
         let probe = probe_relay_billing(&relay_profile(format!("{}/v1", server.uri()))).await;
 
         assert_eq!(probe.platform.as_deref(), Some("newapi"));
+        assert_eq!(probe.outcome, RelayBillingOutcome::Recognized);
         let usage = probe.usage.unwrap();
         assert_eq!(usage.kind, "keyQuota");
         assert_eq!(usage.remaining, Some(1.5));
@@ -246,6 +401,139 @@ mod tests {
 
         assert!(probe.platform.is_none());
         assert!(probe.rate.is_none() && probe.usage.is_none());
+        // 所有接口都 404：明确不是中转站。
+        assert_eq!(probe.outcome, RelayBillingOutcome::NotRelay);
+    }
+
+    #[tokio::test]
+    async fn probe_marks_recognized_relays() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/usage"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"mode":"unrestricted","isValid":true,"remaining":8,"unit":"USD","balance":8}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let probe = probe_relay_billing(&relay_profile(server.uri())).await;
+
+        assert_eq!(probe.outcome, RelayBillingOutcome::Recognized);
+    }
+
+    #[tokio::test]
+    async fn probe_treats_transient_http_failures_as_unavailable() {
+        for status in [401u16, 403, 429, 500, 502, 503] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+
+            let probe = probe_relay_billing(&relay_profile(server.uri())).await;
+
+            assert!(probe.platform.is_none(), "HTTP {status}");
+            assert_eq!(probe.outcome, RelayBillingOutcome::Unavailable, "HTTP {status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_treats_network_errors_as_unavailable() {
+        // 先占一个端口再放掉，确保连上去是「连接被拒」。
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+
+        let probe = probe_relay_billing(&relay_profile(format!("http://127.0.0.1:{port}"))).await;
+
+        assert!(probe.platform.is_none());
+        assert_eq!(probe.outcome, RelayBillingOutcome::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn probe_does_not_follow_cross_host_redirects_with_api_key() {
+        // 第二个服务（另一个端口）返回合法的 sub2api 余额：只要 Key 被带过去就会被识别出来。
+        let other = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"mode":"unrestricted","isValid":true,"remaining":8,"unit":"USD","balance":8}"#,
+            ))
+            .mount(&other)
+            .await;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/v1/usage", other.uri()).as_str()),
+            )
+            .mount(&server)
+            .await;
+
+        let probe = probe_relay_billing(&relay_profile(server.uri())).await;
+
+        let leaked = other
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| {
+                request.headers.contains_key("x-api-key")
+                    || request.headers.contains_key("authorization")
+            })
+            .count();
+        assert_eq!(leaked, 0, "Key 不能被带到重定向后的另一个主机");
+        assert!(probe.platform.is_none());
+        assert_eq!(probe.outcome, RelayBillingOutcome::NotRelay);
+    }
+
+    #[tokio::test]
+    async fn probe_follows_same_site_redirects() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/usage"))
+            .respond_with(
+                ResponseTemplate::new(301).insert_header("location", "/v2/usage"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/usage"))
+            .and(header("x-api-key", "sk-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"mode":"unrestricted","isValid":true,"remaining":8,"unit":"USD","balance":8}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let probe = probe_relay_billing(&relay_profile(server.uri())).await;
+
+        assert_eq!(probe.platform.as_deref(), Some("sub2api"));
+    }
+
+    #[test]
+    fn same_site_redirect_only_allows_same_origin_or_https_upgrade() {
+        let url = |value: &str| reqwest::Url::parse(value).unwrap();
+        assert!(same_site_redirect(&url("https://a.example/v1"), &url("https://a.example/v2")));
+        assert!(same_site_redirect(&url("http://a.example/v1"), &url("https://a.example/v1")));
+        assert!(!same_site_redirect(&url("https://a.example/v1"), &url("https://b.example/v1")));
+        assert!(!same_site_redirect(&url("http://127.0.0.1:1000/"), &url("http://127.0.0.1:2000/")));
+        assert!(!same_site_redirect(&url("https://a.example/"), &url("http://a.example/")));
+    }
+
+    #[test]
+    fn probe_outcome_defaults_to_not_relay_when_missing() {
+        let probe: RelayBillingProbe =
+            serde_json::from_str(r#"{"platform":null,"rate":null,"usage":null,"detail":""}"#)
+                .unwrap();
+        assert_eq!(probe.outcome, RelayBillingOutcome::NotRelay);
+        let json = serde_json::to_value(RelayBillingProbe::unrecognized(
+            RelayBillingOutcome::Unavailable,
+            String::new(),
+        ))
+        .unwrap();
+        assert_eq!(json["outcome"], "unavailable");
     }
 
     #[tokio::test]

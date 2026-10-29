@@ -11804,6 +11804,15 @@ select {
 }
 .relay-billing-refresh:hover:not(:disabled) { background: hsl(var(--muted)); opacity: 1; }
 .relay-billing-refresh:disabled { cursor: default; }
+/* 没识别出中转站时的刷新入口：不占眼，悬停卡片 / 键盘聚焦 / 正在刷新时才显示。 */
+.relay-billing-refresh.relay-billing-retry { flex-shrink: 0; color: hsl(var(--muted-foreground)); opacity: 0; }
+.relay-profile-card:hover .relay-billing-retry,
+.relay-profile-card:focus-within .relay-billing-retry,
+.gw-pool-row:hover .relay-billing-retry,
+.gw-pool-row:focus-within .relay-billing-retry,
+.relay-billing-refresh.relay-billing-retry:disabled { opacity: 0.7; }
+.relay-billing-refresh.relay-billing-retry:hover:not(:disabled) { opacity: 1; }
+.gw-billing-stale { margin-right: 4px; color: hsl(var(--status-warning)); font-size: 11px; font-style: normal; white-space: nowrap; }
 /* 网关供应商池右侧：中转站倍率 + 余额徽章，复用订阅额度徽章（.gw-quota-badge）的样式。 */
 .gw-billing-label { font-variant-numeric: tabular-nums; }
 .gw-billing-label em { margin-left: 6px; color: hsl(var(--status-warning)); font-style: normal; }

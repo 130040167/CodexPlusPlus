@@ -10,7 +10,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::relay_billing::{
-    BillingTarget, RelayBillingProbe, RelayRateInfo, RelayUsageInfo, get_json, site_root,
+    BillingFetchError, BillingTarget, RelayBillingOutcome, RelayBillingProbe, RelayRateInfo,
+    RelayUsageInfo, get_json, site_root,
 };
 
 const DEFAULT_QUOTA_PER_UNIT: f64 = 500_000.0;
@@ -82,16 +83,14 @@ pub(crate) async fn probe(target: &BillingTarget) -> RelayBillingProbe {
         get_json(&target.client, &log_endpoint, Some(&target.api_key)),
         get_json(&target.client, &status_endpoint, None),
     );
-    let usage = usage.and_then(|body| parse_token_usage(&body));
+    let usage = usage.and_then(|body| {
+        parse_token_usage(&body).map_err(|error| BillingFetchError::not_relay(error.to_string()))
+    });
     let token = match usage {
         Ok(token) => token,
         Err(error) => {
-            return RelayBillingProbe {
-                platform: None,
-                rate: None,
-                usage: None,
-                detail: format!("余额：{error}"),
-            };
+            // 请求失败（断网、超时、429 / 5xx、401/403）只是这次没拿到，不等于不是 new-api。
+            return RelayBillingProbe::unrecognized(error.outcome(), format!("余额：{error}"));
         }
     };
     let unit = status
@@ -108,6 +107,7 @@ pub(crate) async fn probe(target: &BillingTarget) -> RelayBillingProbe {
         },
         rate,
         usage: Some(usage_info(usage_endpoint, token, &unit, now_secs())),
+        outcome: RelayBillingOutcome::Recognized,
     }
 }
 

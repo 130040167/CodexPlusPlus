@@ -1,10 +1,9 @@
-use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::relay_billing::{
-    BillingTarget, RelayBillingProbe, RelayRateInfo, RelayRateLimitWindow, RelayUsageInfo,
-    get_json,
+    BillingFetchError, BillingTarget, RelayBillingOutcome, RelayBillingProbe, RelayRateInfo,
+    RelayRateLimitWindow, RelayUsageInfo, get_json,
 };
 use crate::settings::RelayProfile;
 
@@ -55,8 +54,9 @@ pub async fn fetch_sub2api_billing_info(
     if api_key.trim().is_empty() {
         anyhow::bail!("API Key 不能为空");
     }
-    let client = crate::http_client::proxied_client_for_relay(&profile.user_agent, profile)?;
-    fetch_billing_with_client(&client, base_url, api_key.trim()).await
+    // 与识别共用 client：只跟随同站重定向，Key 不会被带到别的主机。
+    let client = crate::relay_billing::billing_client(profile)?;
+    Ok(fetch_billing_with_client(&client, base_url, api_key.trim()).await?)
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +102,11 @@ pub(crate) async fn probe(target: &BillingTarget) -> RelayBillingProbe {
     .flatten()
     .collect::<Vec<_>>()
     .join("；");
+    // 两个接口都没拿到：只要有一个是「这次请求没成功」，就不能断定不是 sub2api。
+    let any_unavailable = [billing.as_ref().err(), usage.as_ref().err()]
+        .into_iter()
+        .flatten()
+        .any(|error| error.unavailable);
     let rate = billing.ok().map(|billing| RelayRateInfo {
         endpoint: billing.endpoint,
         multiplier: billing.effective_rate_multiplier,
@@ -109,11 +114,20 @@ pub(crate) async fn probe(target: &BillingTarget) -> RelayBillingProbe {
         group: None,
     });
     let usage = usage.ok();
+    let platform = (rate.is_some() || usage.is_some()).then(|| "sub2api".to_string());
+    let outcome = if platform.is_some() {
+        RelayBillingOutcome::Recognized
+    } else if any_unavailable {
+        RelayBillingOutcome::Unavailable
+    } else {
+        RelayBillingOutcome::NotRelay
+    };
     RelayBillingProbe {
-        platform: (rate.is_some() || usage.is_some()).then(|| "sub2api".to_string()),
+        platform,
         rate,
         usage,
         detail,
+        outcome,
     }
 }
 
@@ -121,12 +135,13 @@ async fn fetch_billing_with_client(
     client: &reqwest::Client,
     base_url: &str,
     api_key: &str,
-) -> anyhow::Result<Sub2ApiBillingInfo> {
+) -> Result<Sub2ApiBillingInfo, BillingFetchError> {
     let endpoint = sub2api_billing_endpoint(base_url);
     let body = get_json(client, &endpoint, Some(api_key)).await?;
-    let parsed: Sub2ApiBillingResponse =
-        serde_json::from_str(&body).context("倍率接口没有返回有效 JSON")?;
-    validate_sub2api_billing_response(&parsed)?;
+    let parsed: Sub2ApiBillingResponse = serde_json::from_str(&body)
+        .map_err(|_| BillingFetchError::not_relay("倍率接口没有返回有效 JSON"))?;
+    validate_sub2api_billing_response(&parsed)
+        .map_err(|error| BillingFetchError::not_relay(error.to_string()))?;
     Ok(Sub2ApiBillingInfo {
         endpoint,
         group_rate_multiplier: parsed.group_rate_multiplier,
@@ -144,12 +159,13 @@ async fn fetch_usage_with_client(
     client: &reqwest::Client,
     base_url: &str,
     api_key: &str,
-) -> anyhow::Result<RelayUsageInfo> {
+) -> Result<RelayUsageInfo, BillingFetchError> {
     let endpoint = sub2api_usage_endpoint(base_url);
     let body = get_json(client, &endpoint, Some(api_key)).await?;
-    let parsed: Sub2ApiUsageResponse =
-        serde_json::from_str(&body).context("余额接口返回结构不是 sub2api 用量")?;
+    let parsed: Sub2ApiUsageResponse = serde_json::from_str(&body)
+        .map_err(|_| BillingFetchError::not_relay("余额接口返回结构不是 sub2api 用量"))?;
     sub2api_usage_info(endpoint, parsed)
+        .map_err(|error| BillingFetchError::not_relay(error.to_string()))
 }
 
 fn sub2api_usage_info(

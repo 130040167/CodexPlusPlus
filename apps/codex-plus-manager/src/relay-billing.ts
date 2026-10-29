@@ -28,12 +28,21 @@ export type RelayUsageInfo = {
   rateLimits: RelayRateLimitWindow[];
 };
 
+/**
+ * 后端给的识别结论：
+ * - recognized：识别出中转站
+ * - notRelay：明确不是（404、返回结构不符等），长时间不再识别
+ * - unavailable：这次请求没成功（断网、代理没起、超时、429 / 5xx、401/403），不能当成「不是」
+ */
+export type RelayBillingOutcome = "recognized" | "notRelay" | "unavailable";
+
 export type RelayBillingProbe = {
-  /** 识别出的中转站；null 表示不是已知的中转站。 */
+  /** 识别出的中转站；null 表示没识别出，原因看 outcome。 */
   platform: RelayBillingPlatform | null;
   rate: RelayRateInfo | null;
   usage: RelayUsageInfo | null;
   detail: string;
+  outcome: RelayBillingOutcome;
 };
 
 export function relayPlatformLabel(platform: RelayBillingPlatform): string {
@@ -52,10 +61,65 @@ export type RelayBillingProfile = {
   noAuth: boolean;
 };
 
-/** 识别出中转站时余额会变，缓存 5 分钟；识别不出的记 1 天，免得每次打开都去敲门。 */
+/** 识别出中转站时余额会变，缓存 5 分钟；明确不是的记 1 天，免得每次打开都去敲门；
+ *  请求失败（暂时不可用）只在内存里记 5 分钟，过后重试，不写长期负缓存。 */
 export const RELAY_BILLING_POSITIVE_TTL_MS = 5 * 60_000;
 export const RELAY_BILLING_NEGATIVE_TTL_MS = 24 * 60 * 60_000;
+export const RELAY_BILLING_FAILURE_TTL_MS = 5 * 60_000;
 export const RELAY_BILLING_NEGATIVE_STORAGE_KEY = "codex-plus-relay-billing-negative-probes";
+
+/** 把命令返回的原始结果整理成 RelayBillingProbe；老后端没有 outcome 时按 platform 推断。 */
+export function normalizeRelayBillingProbe(result: {
+  platform?: string | null;
+  rate?: RelayRateInfo | null;
+  usage?: RelayUsageInfo | null;
+  detail?: string | null;
+  outcome?: string | null;
+}): RelayBillingProbe {
+  const platform = result.platform === "sub2api" || result.platform === "newapi" ? result.platform : null;
+  return {
+    platform,
+    rate: result.rate ?? null,
+    usage: result.usage ?? null,
+    detail: result.detail ?? "",
+    outcome: platform ? "recognized" : result.outcome === "unavailable" ? "unavailable" : "notRelay",
+  };
+}
+
+/** 内存里的识别缓存。 */
+export type RelayBillingCacheEntry = {
+  /** 最近一次识别成功的结果；没有则为 null。 */
+  probe: RelayBillingProbe | null;
+  /** probe 的取得时间。 */
+  at: number;
+  /** 最近一次请求失败的时间与原因；之后识别成功或明确不是时清掉。 */
+  failure: { at: number; detail: string } | null;
+};
+
+/**
+ * 把一次识别结果并入缓存。`entry` 为 null 表示删掉内存缓存；`negative` 是对长期负缓存
+ * （localStorage）要做的事：remember 记下、clear 清掉、keep 不动。
+ * 请求失败时保留上次成功的结果（标注暂时获取失败），也不写长期负缓存。
+ */
+export function mergeRelayBillingResult(
+  previous: RelayBillingCacheEntry | undefined,
+  probe: RelayBillingProbe,
+  now: number,
+): { entry: RelayBillingCacheEntry | null; negative: "remember" | "clear" | "keep" } {
+  if (probe.outcome === "recognized") return { entry: { probe, at: now, failure: null }, negative: "clear" };
+  if (probe.outcome === "notRelay") return { entry: null, negative: "remember" };
+  return {
+    entry: { probe: previous?.probe ?? null, at: previous?.at ?? 0, failure: { at: now, detail: probe.detail } },
+    negative: "keep",
+  };
+}
+
+/** 不强制刷新时能否直接用内存缓存：刚失败过的 5 分钟内不重试，识别成功的 5 分钟内不重查。 */
+export function relayBillingCacheUsable(entry: RelayBillingCacheEntry | undefined, now: number): boolean {
+  if (!entry) return false;
+  if (entry.failure) return now - entry.failure.at < RELAY_BILLING_FAILURE_TTL_MS;
+  return entry.probe !== null && now - entry.at < RELAY_BILLING_POSITIVE_TTL_MS;
+}
 
 function activeApiKey(profile: RelayBillingProfile): string {
   const keys = profile.apiKeys ?? [];
