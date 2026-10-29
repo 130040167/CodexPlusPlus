@@ -560,6 +560,7 @@ fn managed_session_provider_needed_in_db(path: &Path, home: &Path) -> bool {
 }
 
 fn managed_rollout_path(home: &Path, raw: &Path) -> Option<std::path::PathBuf> {
+    let home = home.canonicalize().ok()?;
     let raw = raw.to_string_lossy();
     let raw = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
     let path = Path::new(raw);
@@ -569,7 +570,7 @@ fn managed_rollout_path(home: &Path, raw: &Path) -> Option<std::path::PathBuf> {
         home.join(path)
     };
     let path = path.canonicalize().ok()?;
-    if !path_is_within(home, &path) {
+    if !path_is_within(&home, &path) {
         return None;
     }
     Some(path)
@@ -6840,6 +6841,45 @@ requires_openai_auth = false
             std::fs::read_to_string(home.path().join("config.toml"))
                 .unwrap()
                 .contains("[model_providers.codex_plus_managed]")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_session_provider_accepts_short_home_aliases() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+
+        let home = tempfile::Builder::new()
+            .prefix("Codex legacy home ")
+            .tempdir()
+            .unwrap();
+        let canonical_home = home.path().canonicalize().unwrap();
+        let input: Vec<u16> = canonical_home
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut output = vec![0_u16; 32768];
+        let length = unsafe {
+            GetShortPathNameW(windows::core::PCWSTR(input.as_ptr()), Some(&mut output))
+        } as usize;
+        assert!(length > 0 && length < output.len());
+        let short_home = std::path::PathBuf::from(std::ffi::OsString::from_wide(&output[..length]));
+        if short_home == canonical_home {
+            eprintln!("当前文件系统未提供 8.3 别名，跳过该别名场景");
+            return;
+        }
+        let rollout = home.path().join("legacy.jsonl");
+        std::fs::write(&rollout, "{}").unwrap();
+        let expected = rollout.canonicalize().unwrap();
+        assert_eq!(
+            managed_rollout_path(&short_home, Path::new("legacy.jsonl")),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            managed_rollout_path(&short_home, &rollout),
+            Some(expected)
         );
     }
 
