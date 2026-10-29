@@ -59,6 +59,8 @@ pub async fn upstream_models(relay: &RelayProfile) -> anyhow::Result<Vec<String>
             .await?
             .0);
     }
+    // 模型列表也按供应商自己的代理设置拉（#2775）。
+    let proxy = crate::relay_proxy::proxy_for_relay(relay);
     let models = match accounts::relay_account_kind(relay).as_deref() {
         Some("copilot") => {
             let prepared = accounts::prepare_relay(relay).await?;
@@ -68,17 +70,18 @@ pub async fn upstream_models(relay: &RelayProfile) -> anyhow::Result<Vec<String>
                 api_base: prepared.base_url.trim_end_matches('#').to_string(),
                 sku: String::new(),
             };
-            accounts::copilot_models(&token).await
+            accounts::copilot_models(&token, proxy.as_deref()).await
         }
         Some("grok") => {
             let prepared = accounts::prepare_relay(relay).await?;
-            accounts::grok_models(&prepared.api_key).await
+            accounts::grok_models(&prepared.api_key, proxy.as_deref()).await
         }
         Some("chatgpt-api") => {
             let prepared = accounts::prepare_relay(relay).await?;
             accounts::chatgpt_api_models(
                 &prepared.api_key,
                 &crate::relay_config::default_codex_home_dir(),
+                proxy.as_deref(),
             )
             .await
         }

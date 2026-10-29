@@ -1688,7 +1688,8 @@ pub async fn login_gateway_grok(
     use codex_plus_core::gateway::accounts;
     let outcome = cancellable_login(async move {
         let tokens = accounts::grok_login(open_in_browser).await?;
-        let models = accounts::grok_models(&tokens.access_token).await;
+        // 登录时还没有供应商（也就没有它的代理设置），走系统代理。
+        let models = accounts::grok_models(&tokens.access_token, None).await;
         add_account_provider(
             accounts::grok_relay(&tokens, &models),
             "grok",
@@ -1713,6 +1714,7 @@ pub async fn login_gateway_chatgpt_api(
         let models = accounts::chatgpt_api_models(
             &account.access_token,
             &codex_plus_core::codex_home::default_codex_home_dir(),
+            None,
         )
         .await;
         add_account_provider(

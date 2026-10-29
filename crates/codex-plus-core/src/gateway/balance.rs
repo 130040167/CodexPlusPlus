@@ -143,7 +143,8 @@ async fn fetch_one(relay: &RelayProfile, api: BalanceApi) -> Result<(f64, String
     if key.is_empty() {
         return Err("没有 Key".to_string());
     }
-    let client = crate::http_client::proxied_client("CodexPlusPlus")
+    // 余额查询属于这个供应商：按它自己的代理设置发（#2775）。
+    let client = crate::http_client::proxied_client_for_relay("CodexPlusPlus", relay)
         .map_err(|error| format!("{error:#}"))?;
     let response = client
         .get(api.url())

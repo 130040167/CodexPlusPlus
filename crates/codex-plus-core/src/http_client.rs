@@ -157,6 +157,40 @@ pub fn proxied_client_for_relay(
     build_proxied_client(user_agent, proxy.as_deref())
 }
 
+/// 用调用方配好的 builder（超时、UA 等不变）建 client，并按给定的供应商代理设置走代理：
+/// 填了代理就走它，`direct` 时不走任何代理，没填（None）时保持 reqwest 默认的系统代理 / 环境变量。
+/// 账号类供应商的 token 刷新、额度 / 账号查询、模型列表这些属于某个网关供应商的请求都要走这里，
+/// 否则供应商单独填的代理管不到它们，没开系统代理时直连 OpenAI 失败（#2775）。
+pub fn build_with_relay_proxy(
+    builder: reqwest::ClientBuilder,
+    proxy: Option<&str>,
+) -> anyhow::Result<reqwest::Client> {
+    let proxy = proxy.map(str::trim).filter(|value| !value.is_empty());
+    let builder = match proxy {
+        Some(proxy) if crate::relay_proxy::is_direct_proxy(proxy) => builder.no_proxy(),
+        Some(proxy) => {
+            // 与 build_proxied_client_with_timeouts 一致：补回 NO_PROXY，回环地址始终直连。
+            let no_proxy = reqwest::NoProxy::from_env()
+                .or_else(|| reqwest::NoProxy::from_string("localhost,127.0.0.1,::1"));
+            builder.proxy(
+                reqwest::Proxy::all(proxy)
+                    .context("供应商代理地址无效")?
+                    .no_proxy(no_proxy),
+            )
+        }
+        None => builder,
+    };
+    Ok(apply_configured_ca_certificate(builder)?.build()?)
+}
+
+/// 同 [`build_with_relay_proxy`]，代理取这个供应商自己的设置（[`crate::relay_proxy::proxy_for_relay`]）。
+pub fn build_for_relay(
+    builder: reqwest::ClientBuilder,
+    relay: &crate::settings::RelayProfile,
+) -> anyhow::Result<reqwest::Client> {
+    build_with_relay_proxy(builder, crate::relay_proxy::proxy_for_relay(relay).as_deref())
+}
+
 /// VLM 专用 HTTP client（带超时）。
 /// 不复用通用 proxied_client，避免 VLM 服务无响应时永久阻塞整个代理。
 pub fn vlm_http_client() -> anyhow::Result<reqwest::Client> {
