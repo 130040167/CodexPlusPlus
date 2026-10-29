@@ -9,8 +9,7 @@
    *   1. 找到原生面板（挂在 popper 里、可见的 `[data-model-picker-view]`，宫格视图跳过），
    *      从行文本尾部的 `（供应商）` 解析归属；解析不到时回退去 `/codex-model-catalog`
    *      的 `modelMetadata[slug]`（聚合目录发布的 `codex_plus_group`，或 `description`
-   *      里的 `上游 · 供应商`）取权威归属。已知归属会在会话内累积，目录快照被整体替换
-   *      也不会把默认成员那一组变成空标题。
+   *      里的 `上游 · 供应商`）取权威归属。行的真实模型 ID 优先，显示名仅作无歧义兜底。
    *   2. 在每组第一行前插一个自己的分组标题按钮，点它只折叠/展开这一组；
    *      行本身的选中逻辑完全交给原生（这里不监听行的点击）。行内原生的
    *      `xxx（供应商）` 标签隐藏并退出无障碍树，由我们插入的裸模型名顶替。
@@ -47,8 +46,6 @@
   const codexPlusModelPickerGroupIdAttr = "data-codex-plus-model-group-id";
   /** 一行最多解析多少字符的供应商名；超长的一律当成模型名不拆。 */
   const codexPlusModelPickerGroupNameMaxLength = 24;
-  /** 列表 DOM 变化后的合并重扫延迟。 */
-  const codexPlusModelPickerRescanDelayMs = 60;
   /**
    * 菜单开着的兜底轮询间隔。
    *
@@ -67,8 +64,9 @@
     /** 轮询用的菜单节点；菜单关闭后置空。 */
     activeList: null,
     timer: 0,
-    rescanTimer: 0,
+    rescanPending: false,
     observer: null,
+    menuObserver: null,
     /** 本次菜单打开期间是否已经做过"自动只留当前分组展开"。 */
     autoCollapsed: false,
     /** 用户手动点过标题的分组 id。 */
@@ -365,8 +363,7 @@
    */
   function codexPlusModelPickerCatalogProviderMap() {
     const modelMetadata = codexModelCatalog?.modelMetadata || codexModelCatalog?.model_metadata;
-    // 会话内已记下的归属先铺一层：目录快照可能被整体替换（重连 / 重新生成），
-    // 只认当前快照会让默认供应商的分组名在某一刻变空。
+    // 只认当前目录；删除的模型不能从持久缓存重新出现。
     const map = new Map();
     if (!modelMetadata || typeof modelMetadata !== "object") return map;
     const slugList = Array.isArray(codexModelCatalog?.models)
@@ -412,7 +409,12 @@
     const map = new Map();
     const modelMetadata = codexModelCatalog?.modelMetadata || codexModelCatalog?.model_metadata;
     if (!modelMetadata || typeof modelMetadata !== "object") return map;
-    const register = (entry) => {
+    const setUnique = (key, value) => {
+      if (!key) return;
+      if (!map.has(key)) map.set(key, value);
+      else if (map.get(key)?.slug !== value.slug) map.set(key, null);
+    };
+    const register = (entry, slug) => {
       if (!entry || typeof entry !== "object") return;
       const displayName = entry.displayName || entry.display_name;
       if (typeof displayName !== "string" || !displayName) return;
@@ -421,26 +423,27 @@
         typeof entry.codex_plus_group_id === "string" ? entry.codex_plus_group_id.trim() : "";
       if (!provider || !groupId) return;
       // 在 Codex++ 里收藏过的模型（网关写的 `codex_plus_favorite`）：行尾画星标。
-      const value = { provider, groupId, favorite: entry.codex_plus_favorite === true };
+      const value = { slug, provider, groupId, favorite: entry.codex_plus_favorite === true };
+      map.set(`model\u0000${slug}`, value);
       // 原文键：网关关掉「模型名后带供应商」时，同名的几份只差末尾看不见的零宽字符，
       // 宽松归一化会把它们抹掉，必须先按原文比对。
       const rawKey = `raw\u0000${String(displayName).replace(/\s+/g, " ").trim()}`;
-      if (!map.has(rawKey)) map.set(rawKey, value);
+      setUnique(rawKey, value);
       const fullKey = codexPlusModelPickerNormalizeLoose(displayName);
-      if (fullKey && !map.has(fullKey)) map.set(fullKey, value);
+      setUnique(fullKey, value);
       const split = codexPlusModelPickerSplitLabel(displayName);
       if (split.name && split.provider) {
         const pairKey = `${codexPlusModelPickerNormalizeLoose(split.name)}\u0000${codexPlusModelPickerNormalizeLoose(split.provider)}`;
-        if (!map.has(pairKey)) map.set(pairKey, value);
+        setUnique(pairKey, value);
       }
     };
     const slugList = Array.isArray(codexModelCatalog?.models)
       ? codexModelCatalog.models.filter((slug) => typeof slug === "string" && slug)
       : [];
     const bySlug = new Map(Object.entries(modelMetadata));
-    for (const slug of slugList) register(bySlug.get(slug));
+    for (const slug of slugList) register(bySlug.get(slug), slug);
     if (!Array.isArray(codexModelCatalog?.models)) {
-      for (const entry of Object.values(modelMetadata)) register(entry);
+      for (const [slug, entry] of Object.entries(modelMetadata)) register(entry, slug);
     }
     return map;
   }
@@ -484,6 +487,20 @@
 
   function codexPlusModelPickerRowLabel(row) {
     return codexPlusModelPickerRowIdentity(row)?.text || "";
+  }
+
+  function codexPlusModelPickerRowModel(row) {
+    const metadata = codexModelCatalog?.modelMetadata || codexModelCatalog?.model_metadata || {};
+    const key = Object.keys(row).find((name) => name.startsWith("__reactFiber$"));
+    for (let fiber = key && row[key], depth = 0; fiber && depth < 16; depth++, fiber = fiber.return) {
+      const props = fiber.memoizedProps || {};
+      // 到选择器父组件就停止，那里 model 是当前选中值，不是这一行。
+      if (typeof props.onSelectModel === "function" && Array.isArray(props.models)) break;
+      for (const value of [fiber.key, props.model, props.model?.model, props.value, props.item?.model]) {
+        if (typeof value === "string" && Object.hasOwn(metadata, value)) return value;
+      }
+    }
+    return "";
   }
 
   function codexPlusModelPickerDefaultModel() {
@@ -591,6 +608,9 @@
     const effort = efforts.find((entry) => entry.reasoningEffort === picker.reasoningEffort)?.reasoningEffort
       || efforts.find((entry) => entry.reasoningEffort === preferred)?.reasoningEffort
       || efforts[0]?.reasoningEffort || "medium";
+    if (typeof noteCodexThreadModelPickerIntent === "function") {
+      noteCodexThreadModelPickerIntent(row, captureCodexThreadModelSelection({ model, effort }));
+    }
     Promise.resolve(picker.onSelectModel(model, effort)).catch((error) => {
       console.warn("[Codex++] default model selection failed", error);
     });
@@ -624,7 +644,9 @@
       const pairKey = split.provider
         ? `${codexPlusModelPickerNormalizeLoose(split.name)}\u0000${codexPlusModelPickerNormalizeLoose(split.provider)}`
         : "";
-      const exactKnown = exact.get(`raw\u0000${identity.text}`)
+      const model = codexPlusModelPickerRowModel(row);
+      const exactKnown = (model ? exact.get(`model\u0000${model}`) : null)
+        || exact.get(`raw\u0000${identity.text}`)
         || exact.get(codexPlusModelPickerNormalizeLoose(identity.text))
         || (pairKey ? exact.get(pairKey) : null);
       const known = exactKnown
@@ -1061,9 +1083,13 @@
     const groups = codexPlusModelPickerUniqueGroupIds(
       codexPlusModelPickerGroups(rows, codexPlusModelPickerDefaultProviderName()),
     );
-    // 只有一个供应商时不折叠：直连供应商本来就是一组，插标题只是多一层噪音。
-    if (groups.length < 2) {
-      if (codexPlusModelPickerGroupsState.patchedLists.has(list)) codexPlusModelPickerClear(list);
+    const catalogGroups = new Set([...codexPlusModelPickerCatalogExactMap().values()]
+      .filter(Boolean).map((entry) => entry.groupId));
+    // 原生分批重绘或搜索只剩一组时仍保留标题；确实单供应商才恢复原生列表。
+    if (groups.length < 2 && (groups.length === 0 || catalogGroups.size < 2)) {
+      if (!["ok", "not_applied", "not_configured"].includes(codexModelCatalog?.status)
+          && list.hasAttribute("data-codex-plus-model-groups")) return false;
+      if (list.hasAttribute("data-codex-plus-model-groups")) codexPlusModelPickerClear(list);
       else codexPlusModelPickerRemoveOwnNodes(list);
       codexPlusModelPickerSyncDefaultRow(list);
       return false;
@@ -1162,7 +1188,14 @@
   }
 
   function codexPlusModelPickerNeedsRescan(records) {
+    // React 回收我们插的标题时，removedNodes 已没有父节点，必须明确识别。
+    if (records.some((record) => [...record.removedNodes].some((node) =>
+      node.nodeType === 1 && (node.matches?.(".codex-plus-model-group-header, .codex-plus-model-group-toolbar")
+        || node.querySelector?.('[role="menuitemradio"]'))))) return true;
     const changed = records.some((record) => {
+      if (record.type === "characterData") {
+        return !record.target.parentElement?.closest?.(`[data-codex-plus-ext="${codexPlusModelPickerGroupsExtMark}"]`);
+      }
       const nodes = [...record.addedNodes, ...record.removedNodes];
       return nodes.some((node) => node.nodeType === 1 && !node.closest?.(`[data-codex-plus-ext="${codexPlusModelPickerGroupsExtMark}"]`));
     });
@@ -1178,11 +1211,14 @@
   }
 
   function codexPlusModelPickerScheduleRescan() {
-    clearTimeout(codexPlusModelPickerGroupsState.rescanTimer);
-    codexPlusModelPickerGroupsState.rescanTimer = setTimeout(() => {
-      codexPlusModelPickerGroupsState.rescanTimer = 0;
+    const state = codexPlusModelPickerGroupsState;
+    if (state.disposed || state.rescanPending) return;
+    state.rescanPending = true;
+    // MutationObserver 后、浏览器绘制前修复，避免定时器留下 60~250ms 的平铺帧。
+    queueMicrotask(() => {
+      state.rescanPending = false;
       codexPlusModelPickerScan();
-    }, codexPlusModelPickerRescanDelayMs);
+    });
   }
 
   function codexPlusModelPickerObserveList(list) {
@@ -1194,14 +1230,27 @@
       if (!codexPlusModelPickerNeedsRescan(records)) return;
       codexPlusModelPickerScheduleRescan();
     });
-    state.observer.observe(list, { childList: true, subtree: true });
+    state.observer.observe(list, { childList: true, characterData: true, subtree: true });
+  }
+
+  function codexPlusModelPickerObserveMenus() {
+    const state = codexPlusModelPickerGroupsState;
+    state.menuObserver = new MutationObserver((records) => {
+      if (state.activeList?.isConnected) return;
+      if (records.some((record) => [...record.addedNodes].some((node) =>
+        node.nodeType === 1 && (node.matches?.('[data-model-picker-view], [class*="_ModelList_"]')
+          || node.querySelector?.('[data-model-picker-view], [class*="_ModelList_"]'))))) {
+        codexPlusModelPickerScheduleRescan();
+      }
+    });
+    if (document.body) state.menuObserver.observe(document.body, { childList: true, subtree: true });
   }
 
   /**
    * 一次扫描：菜单开着就确保分组已打好；关了就清理并停止轮询。
    *
    * 为什么还要轮询：React 复用行节点时不会产生 childList 变更，只靠 MutationObserver
-   * 会漏掉"标签变了"这种情况。600ms 一次、且只在菜单开着时跑，开销可以忽略。
+   * 会漏掉"标签变了"这种情况。250ms 一次、且只在菜单开着时跑，开销可以忽略。
    */
   function codexPlusModelPickerScan() {
     const state = codexPlusModelPickerGroupsState;
@@ -1250,7 +1299,9 @@
   window.__codexPlusModelPickerDefaultKeyHandler = codexPlusModelPickerSelectDefault;
   document.addEventListener("click", codexPlusModelPickerSelectDefault, true);
   document.addEventListener("keydown", codexPlusModelPickerSelectDefault, true);
-  codexPlusModelPickerSchedule(300);
+  codexPlusModelPickerObserveMenus();
+  codexPlusModelPickerScheduleRescan();
+  codexPlusModelPickerSchedule(250);
   window.__codexPlusModelPickerGroupsRuntime = {
     version: 1,
     sync: () => codexPlusModelPickerSchedule(0),
@@ -1303,8 +1354,8 @@
       state.disposed = true;
       document.removeEventListener("keydown", codexPlusModelPickerNavigateGroups, true);
       clearTimeout(state.timer);
-      clearTimeout(state.rescanTimer);
       state.observer?.disconnect();
+      state.menuObserver?.disconnect();
       state.observer = null;
       state.activeList = null;
       state.timer = 0;

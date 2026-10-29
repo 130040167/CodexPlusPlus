@@ -6242,8 +6242,12 @@
       if (seq !== codexPlusBackendSettingsSeq) {
         return false;
       }
+      const previousSettings = codexPlusBackendSettings;
       codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
       codexPlusBackendSettingsLoaded = true;
+      if (typeof refreshCodexModelCatalogForSettings === "function") {
+        refreshCodexModelCatalogForSettings(previousSettings, codexPlusBackendSettings);
+      }
       globalThis.window?.__codexPlusNativeFastUnlock?.runtime?.update?.({
         enhancementsEnabled: codexPlusBackendSettings.enhancementsEnabled !== false,
         codexAppNativeFastUnlock: codexPlusBackendSettings.codexAppNativeFastUnlock === true,
@@ -11270,9 +11274,21 @@
     return Array.from(new Set(values.filter((value) => typeof value === "string" && value.trim().length > 0)));
   }
 
-  let codexModelCatalog = { status: "loading", model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
+  let codexModelCatalog = window.__codexPlusModelCatalogRuntime?.catalog || { status: "loading", model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
   let codexModelCatalogLoadedAt = 0;
   let codexModelCatalogPromise = null;
+  let codexModelCatalogRevision = 0;
+  // 目录不依赖 DOM；热重注入接续成功快照，并阻止旧闭包的迟到请求重新发布。
+  const codexModelCatalogRuntime = {
+    catalog: codexModelCatalog,
+    source: window.__codexPlusModelCatalogRuntime?.source || "",
+    patchJson: patchModelJsonResponse,
+    patchStatsig: patchStatsigModelDynamicConfig,
+    recordRequest: recordModelListRequest,
+    patchMcp: patchMcpModelResponseData,
+    retryAt: 0,
+  };
+  window.__codexPlusModelCatalogRuntime = codexModelCatalogRuntime;
   let codexModelWhitelistRefreshTimer = 0;
   let codexModelWhitelistRefreshUntil = 0;
   const codexPlusModelListRequestIds = new Set();
@@ -11352,13 +11368,67 @@
     ]);
   }
 
+  function codexModelSettingsSignature(settings) {
+    const profile = settings?.relayProfiles?.find((entry) => entry?.id === settings.activeRelayId);
+    return JSON.stringify([settings?.relayProfilesEnabled, settings?.activeRelayId,
+      profile?.relayMode, profile?.model, profile?.modelList, profile?.modelMetadata,
+      profile?.modelWindows, profile?.modelAutoCompact, profile?.modelRoutes,
+      settings?.aggregateRelayProfiles]);
+  }
+
+  function refreshCodexModelCatalogForSettings(previous, next) {
+    if (codexModelSettingsSignature(previous) === codexModelSettingsSignature(next)) {
+      if (codexModelCatalogRuntime.retryAt && Date.now() >= codexModelCatalogRuntime.retryAt) {
+        void loadCodexModelCatalog();
+      }
+      return;
+    }
+    const source = JSON.stringify([next?.relayProfilesEnabled, next?.activeRelayId]);
+    if (codexModelCatalogRuntime.source && codexModelCatalogRuntime.source !== source) {
+      codexModelCatalog = { status: "loading", models: [], sources: [] };
+      codexModelCatalogRuntime.catalog = codexModelCatalog;
+    }
+    codexModelCatalogRuntime.source = source;
+    codexModelCatalogLoadedAt = 0;
+    void loadCodexModelCatalog(true);
+  }
+
+  function refreshCodexNativeModelQueries() {
+    // 只失效本机模型查询，交给原生重新获取并发布；不刷新远程主机或整个查询缓存。
+    const client = typeof findCodexQueryClient === "function" ? findCodexQueryClient() : null;
+    if (typeof client?.invalidateQueries !== "function") return;
+    const queries = client.getQueryCache?.()?.getAll?.() || [];
+    for (const query of queries) {
+      const key = query.queryKey;
+      if (!Array.isArray(key) || !key.some((part) => typeof part === "string"
+          && /^(models|model-list|list-models-for-host|available-models)$/u.test(part))) continue;
+      if (!key.some((part) => part === "local" || part?.hostId === "local")) continue;
+      try { Promise.resolve(client.invalidateQueries({ queryKey: key, exact: true })).catch(() => {}); }
+      catch {}
+    }
+  }
+
   async function loadCodexModelCatalog(force = false) {
     if (!force && codexModelCatalogPromise) return codexModelCatalogPromise;
+    if (!force && Date.now() < codexModelCatalogRuntime.retryAt) return codexModelCatalog;
     if (!force && codexModelCatalogLoadedAt && Date.now() - codexModelCatalogLoadedAt < 10000) return codexModelCatalog;
-    codexModelCatalogPromise = readCodexAppServerPreparation("/codex-model-catalog", {})
+    const revision = ++codexModelCatalogRevision;
+    const current = () => revision === codexModelCatalogRevision
+      && window.__codexPlusModelCatalogRuntime === codexModelCatalogRuntime;
+    if (codexPlusBackendSettingsLoaded) {
+      codexModelCatalogRuntime.source = JSON.stringify([
+        codexPlusBackendSettings.relayProfilesEnabled, codexPlusBackendSettings.activeRelayId,
+      ]);
+    }
+    const request = readCodexAppServerPreparation("/codex-model-catalog", {})
       .then(async (result) => {
-        codexModelCatalog = result && typeof result === "object" ? result : { status: "failed", model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
-        if ((!codexModelCatalog.models || codexModelCatalog.models.length === 0) && codexModelCatalog.status === "not_configured") {
+        let nextCatalog = result && typeof result === "object" ? result : { status: "failed", model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
+        if (!current()) return codexModelCatalog;
+        if (!["ok", "not_applied", "not_configured"].includes(nextCatalog.status)
+            || !Array.isArray(nextCatalog.models)) {
+          throw new Error(nextCatalog.message || "Model catalog is temporarily unavailable");
+        }
+        if ((!nextCatalog.models || nextCatalog.models.length === 0) && nextCatalog.status === "not_configured") {
           try {
             const settingsResp = await readCodexAppServerPreparation("/settings/get", {});
             if (settingsResp && settingsResp.relayProfiles && Array.isArray(settingsResp.relayProfiles)) {
@@ -11367,8 +11437,8 @@
               if (profile && profile.modelList) {
                 const extraModels = profile.modelList.split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean);
                 if (extraModels.length > 0) {
-                  codexModelCatalog.models = extraModels;
-                  codexModelCatalog.default_model = codexModelCatalog.default_model || extraModels[0];
+                  nextCatalog.models = extraModels;
+                  nextCatalog.default_model = nextCatalog.default_model || extraModels[0];
                   sendCodexPlusDiagnostic("model_catalog_fallback_applied", { count: extraModels.length });
                 }
               }
@@ -11377,20 +11447,34 @@
             sendCodexPlusDiagnostic("model_catalog_fallback_error", { error: String(fallbackError?.message || fallbackError) });
           }
         }
+        if (!current()) return codexModelCatalog;
+        const changed = JSON.stringify(codexModelCatalog) !== JSON.stringify(nextCatalog);
+        codexModelCatalog = nextCatalog;
+        codexModelCatalogRuntime.catalog = nextCatalog;
+        codexModelCatalogRuntime.retryAt = 0;
         codexModelCatalogLoadedAt = Date.now();
-        if (typeof codexPlusModelPickerCatalogChanged === "function") codexPlusModelPickerCatalogChanged();
+        if (changed && typeof codexPlusModelPickerCatalogChanged === "function") codexPlusModelPickerCatalogChanged();
+        if (changed) refreshCodexNativeModelQueries();
         renderCodexPlusMenu();
         scheduleCodexModelWhitelistRefresh();
         return codexModelCatalog;
       })
       .catch((error) => {
-        codexModelCatalog = { status: "failed", message: String(error?.message || error), model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
-        codexModelCatalogLoadedAt = Date.now();
+        if (!current()) return codexModelCatalog;
+        // 暂时断连不能撤销当前成功目录；切换配置时已先隔离旧来源。
+        if (!["ok", "not_applied"].includes(codexModelCatalog.status)) {
+          codexModelCatalog = { status: "failed", message: String(error?.message || error), models: [], sources: [] };
+          codexModelCatalogRuntime.catalog = codexModelCatalog;
+        }
+        codexModelCatalogLoadedAt = 0;
+        codexModelCatalogRuntime.retryAt = Date.now() + 1000;
+        sendCodexPlusDiagnostic("model_catalog_refresh_failed", { error: String(error?.message || error) });
         return codexModelCatalog;
       })
       .finally(() => {
-        codexModelCatalogPromise = null;
+        if (codexModelCatalogPromise === request) codexModelCatalogPromise = null;
       });
+    codexModelCatalogPromise = request;
     return codexModelCatalogPromise;
   }
 
@@ -11408,17 +11492,8 @@
   function modelReasoningEfforts(modelName) {
     const supported = codexPlusModelMetadata(modelName)?.supportedReasoningEfforts;
     if (Array.isArray(supported) && supported.length > 0) {
-      const efforts = supported.map((entry) => ({ ...entry }));
-      const hasMax = efforts.some((e) => e.reasoningEffort === "max");
-      const hasUltra = efforts.some((e) => e.reasoningEffort === "ultra");
-      if (!hasMax) efforts.push({ reasoningEffort: "max", description: "Maximum reasoning depth for the hardest problems" });
-      if (!hasUltra) {
-        // 名单里的模型确认支持 ultra。不要再把 deepseek 放进来：它的档位上限是 max，
-        // 补出来的第四档会让「思考等级」列里只勾了 low/high/max 的模型在客户端多显示一档。
-        const shouldAddUltra = /sol|terra|gpt-5\.6|gpt-5\.5|gpt-5\.4/i.test(String(modelName || ""));
-        if (shouldAddUltra || efforts.length >= 4) efforts.push({ reasoningEffort: "ultra", description: "Maximum reasoning with automatic task delegation" });
-      }
-      return efforts;
+      // 网关/供应商池发布的档位是权威配置，不能按模型名称补出未声明的 max / ultra。
+      return supported.map((entry) => ({ ...entry }));
     }
     return ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({ reasoningEffort, description: `${reasoningEffort} effort` }));
   }
@@ -11745,15 +11820,17 @@
   }
 
   function installModelJsonResponsePatch() {
-    if (window.__codexPlusModelJsonResponsePatchInstalled === "3") return;
-    window.__codexPlusModelJsonResponsePatchInstalled = "3";
+    if (window.__codexPlusModelCatalogRuntime !== codexModelCatalogRuntime) return;
+    codexModelCatalogRuntime.patchJson = patchModelJsonResponse;
+    if (window.__codexPlusModelJsonResponsePatchInstalled === "4") return;
+    window.__codexPlusModelJsonResponsePatchInstalled = "4";
     window.__codexPlusModelJsonResponseOriginals = window.__codexPlusModelJsonResponseOriginals || {};
     const originals = window.__codexPlusModelJsonResponseOriginals;
     originals.responseJson = originals.responseJson || Response.prototype.json;
     if (typeof originals.responseJson !== "function") return;
     Response.prototype.json = async function codexPlusPatchedResponseJson(...args) {
       const payload = await originals.responseJson.apply(this, args);
-      return await patchModelJsonResponse(payload);
+      return await window.__codexPlusModelCatalogRuntime.patchJson(payload);
     };
   }
 
@@ -11787,15 +11864,17 @@
   }
 
   function patchStatsigModelWhitelist() {
+    if (window.__codexPlusModelCatalogRuntime !== codexModelCatalogRuntime) return;
+    codexModelCatalogRuntime.patchStatsig = patchStatsigModelDynamicConfig;
     statsigClients().forEach((client) => {
       if (typeof client.getDynamicConfig !== "function") return;
-      if (client.__codexPlusModelWhitelistPatched !== "3") {
+      if (client.__codexPlusModelWhitelistPatched !== "4") {
         const originalGetDynamicConfig = client.getDynamicConfig.bind(client);
         client.getDynamicConfig = (name, options) => {
           const result = originalGetDynamicConfig(name, options);
-          return String(name) === "107580212" ? patchStatsigModelDynamicConfig(result) : result;
+          return String(name) === "107580212" ? window.__codexPlusModelCatalogRuntime.patchStatsig(result) : result;
         };
-        client.__codexPlusModelWhitelistPatched = "3";
+        client.__codexPlusModelWhitelistPatched = "4";
       }
       try {
         patchStatsigModelDynamicConfig(client.getDynamicConfig("107580212", { disableExposureLog: true }));
@@ -11805,8 +11884,11 @@
   }
 
   function patchAppServerModelMessages() {
-    if (window.__codexPlusModelMessagePatchInstalled === "3") return;
-    window.__codexPlusModelMessagePatchInstalled = "3";
+    if (window.__codexPlusModelCatalogRuntime !== codexModelCatalogRuntime) return;
+    codexModelCatalogRuntime.recordRequest = recordModelListRequest;
+    codexModelCatalogRuntime.patchMcp = patchMcpModelResponseData;
+    if (window.__codexPlusModelMessagePatchInstalled === "4") return;
+    window.__codexPlusModelMessagePatchInstalled = "4";
     window.addEventListener("codex-message-from-view", (event) => {
       try {
         const detail = event?.detail;
@@ -11815,7 +11897,7 @@
           request.params = { ...(request.params || {}), includeHidden: true };
           if (request.id != null) {
             const requestId = String(request.id);
-            recordModelListRequest(requestId, modelResponseHostId(detail, request, request.params));
+            window.__codexPlusModelCatalogRuntime.recordRequest(requestId, modelResponseHostId(detail, request, request.params));
           }
         }
       } catch (error) {
@@ -11826,7 +11908,7 @@
 
     window.addEventListener("message", (event) => {
       try {
-        patchMcpModelResponseData(event?.data);
+        window.__codexPlusModelCatalogRuntime.patchMcp(event?.data);
       } catch (error) {
         window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
         window.__codexPlusModelPatchFailures.push(String(error?.stack || error));
@@ -11897,6 +11979,18 @@
   }
 
   // 原生 next-turn 设置可能仅存活到线程卸载；只记录已成功提交的模型设置。
+  function codexThreadModelProfile() {
+    const active = codexRemoteSessionActiveProfile();
+    if (active) return active;
+    // 多开锁定供应商时不开放切换，但仍按其权威目录保存各对话选择。
+    const profile = codexPlusBackendSettings.relayProfiles?.find((entry) =>
+      entry?.id === codexPlusBackendSettings.activeRelayId);
+    if (codexModelCatalog.status !== "ok" || !profile?.id) return null;
+    const source = profile.relayMode === "aggregate" ? `aggregate:${profile.id}`
+      : profile.relayMode === "pureApi" ? `relay-profile:${profile.id}` : "";
+    return source && codexModelCatalog.sources?.some((entry) => entry?.id === source) ? profile : null;
+  }
+
   function codexRememberedThreadModels() {
     try {
       const value = JSON.parse(localStorage.getItem("codexPlus.threadModels.v1") || "[]");
@@ -11906,7 +12000,7 @@
   }
 
   function codexThreadModelStorageKey(hostId, threadId) {
-    const profile = codexRemoteSessionActiveProfile();
+    const profile = codexThreadModelProfile();
     return hostId === "local" && codexPlusBackendSettingsLoaded && profile?.id && threadId
       ? JSON.stringify([hostId, profile.id, threadId]) : "";
   }
@@ -11914,7 +12008,7 @@
   function codexRetainedThreadModel(hostId, threadId) {
     const key = codexThreadModelStorageKey(hostId, threadId);
     if (!key || codexModelCatalog.status !== "ok") return null;
-    const profile = codexRemoteSessionActiveProfile();
+    const profile = codexThreadModelProfile();
     if (Array.isArray(codexModelCatalog.sources) && codexModelCatalog.sources.length
         && !codexModelCatalog.sources.some((source) =>
           source?.id === `${profile?.relayMode === "aggregate" ? "aggregate" : "relay-profile"}:${profile?.id}`)) return null;
@@ -11940,7 +12034,7 @@
   }
 
   function codexThreadModelSourceGroup(model) {
-    const profile = codexRemoteSessionActiveProfile();
+    const profile = codexThreadModelProfile();
     return codexPlusModelMetadata(model)?.codex_plus_group_id
       || (profile?.relayMode === "pureApi" ? profile.id : "");
   }
@@ -11948,8 +12042,15 @@
   function resolveCodexThreadModelSelection(saved) {
     if (codexModelCatalog.status !== "ok") return "";
     const names = codexPlusModelNames();
-    const baseName = (model) => model.startsWith("cpx-") ? model.slice(model.indexOf("/") + 1) : model;
-    const matches = names.filter((model) => baseName(model) === baseName(saved.model));
+    const baseName = (model, sourceGroup) => {
+      if (model.startsWith("cpx-") && model.includes("/")) return model.slice(model.indexOf("/") + 1);
+      const group = sourceGroup || codexPlusModelMetadata(model)?.codex_plus_group_id;
+      // 网关用 <供应商 id>/<模型> 固定路由；group/<id> 是独立入口，不能当供应商前缀剥掉。
+      return group && !model.startsWith("group/") && model.startsWith(`${group}/`)
+        ? model.slice(group.length + 1) : model;
+    };
+    const savedBase = baseName(saved.model, saved.groupId);
+    const matches = names.filter((model) => baseName(model) === savedBase);
     let groupId = saved.groupId;
     if (!groupId) {
       try {
@@ -11963,7 +12064,8 @@
     const compatible = saved.effort == null ? matches : matches.filter((model) =>
       modelReasoningEfforts(model).some((entry) => entry.reasoningEffort === saved.effort));
     const candidates = compatible.length ? compatible : matches;
-    return candidates.find((model) => model === baseName(saved.model)) || candidates[0] || "";
+    return candidates.find((model) => model === saved.model)
+      || candidates.find((model) => model === savedBase) || candidates[0] || "";
   }
 
   function captureCodexThreadModelSelection(params) {
@@ -11985,15 +12087,18 @@
     // 发消息可能携带原生回退值；已有明确选择时不能用它覆盖。
     const latest = codexLatestThreadModel(hostId, threadId);
     if (String(method) === "turn/start" && !explicit && latest) return;
+    // 原生恢复/全局 next-turn 设置的回写不能取代用户在这个对话里的明确选择。
+    if (!explicit && latest?.explicit) return;
     // 自动恢复到替代供应商不能覆盖原始来源，否则切回时将无法找回原选择。
     const retained = latest && codexRetainedThreadModel(hostId, threadId);
     if (!explicit && latest && latest.key !== key && !retained) return;
     if (!explicit && retained && retained.model === selection.model && retained.effort === selection.effort) return;
     const remembered = previous.find((item) => item.key === key);
     // 自动恢复的重复确认不改变记录版本，否则会把三次重试额度不断重置。
-    if (remembered && remembered.groupId === selection.groupId && remembered.effort === selection.effort
+    if (remembered && (remembered.explicit || !explicit)
+        && remembered.groupId === selection.groupId && remembered.effort === selection.effort
         && resolveCodexThreadModelSelection(remembered) === resolveCodexThreadModelSelection(selection)) return;
-    const entry = { key, ...selection, at: Date.now() };
+    const entry = { key, ...selection, explicit, at: Date.now() };
     try {
       localStorage.setItem("codexPlus.threadModels.v1", JSON.stringify([
         entry, ...previous.filter((item) => item.key !== key),
@@ -12005,9 +12110,20 @@
     if (String(method) !== "thread/resume") return params;
     const saved = codexRetainedThreadModel(hostId, params?.threadId);
     if (!saved) return params;
-    const crossProfile = saved.key !== codexThreadModelStorageKey(hostId, params?.threadId);
-    if (!crossProfile && params?.model && params.model !== saved.model) return params;
-    return { ...params, model: saved.model, reasoningEffort: crossProfile ? saved.effort : params?.reasoningEffort ?? saved.effort };
+    const intent = codexThreadModelIntent(hostId, params?.threadId, params);
+    if (intent) return params;
+    return { ...params, model: saved.model, reasoningEffort: saved.effort ?? params?.reasoningEffort };
+  }
+
+  function codexThreadModelIntent(hostId, threadId, params) {
+    const key = codexThreadModelStorageKey(hostId, threadId);
+    const intent = window.__codexPlusThreadModelSelections?.get(key);
+    if (!intent || Date.now() - intent.at >= 30000) return null;
+    const selection = captureCodexThreadModelSelection(params);
+    if (!selection || (intent.selection.model !== selection.model
+        && resolveCodexThreadModelSelection(intent.selection) !== selection.model)) return null;
+    return intent.powerSelection && intent.awaitPowerChange
+      || selection.effort == null || intent.selection.effort === selection.effort ? intent : null;
   }
 
   async function sendCodexRetainedModelRequest(client, send, method, params, options) {
@@ -12017,13 +12133,11 @@
           { ...params, method: nestedMethod, params: nestedParams }, nestedOptions),
         String(params.method), params.params, options);
     }
-    const profileId = codexRemoteSessionActiveProfile()?.id;
+    const profileId = codexThreadModelProfile()?.id;
     const key = codexThreadModelStorageKey(client.hostId, params?.threadId);
     const selection = captureCodexThreadModelSelection(params);
-    const intent = window.__codexPlusThreadModelSelections?.get(key);
-    const explicit = intent && Date.now() - intent.at < 30000
-      && (intent.selection.model === params?.model
-        || resolveCodexThreadModelSelection(intent.selection) === params?.model);
+    const intent = codexThreadModelIntent(client.hostId, params?.threadId, params);
+    const explicit = !!intent;
     const pending = window.__codexPlusThreadModelPending || (window.__codexPlusThreadModelPending = new Map());
     const tracks = key && String(method) === "thread/settings/update";
     if (tracks) pending.set(key, (pending.get(key) || 0) + 1);
@@ -12033,7 +12147,7 @@
       if (result?.applied === false || result?.error) {
         if (explicit && window.__codexPlusThreadModelSelections?.get(key) === intent) window.__codexPlusThreadModelSelections.delete(key);
       }
-      if (profileId === codexRemoteSessionActiveProfile()?.id) {
+      if (profileId === codexThreadModelProfile()?.id) {
         const confirmedSelection = explicit && !intent.powerSelection ? intent.selection : selection;
         rememberCodexThreadModel(method, next, result, client.hostId, confirmedSelection, !!explicit);
       }
@@ -12091,12 +12205,22 @@
       effort: slider ? picker.reasoningEffort : selectedEffort || null,
     });
     if (!selection) return;
+    noteCodexThreadModelPickerIntent(row, selection, {
+      powerSelection: !!slider, awaitPowerChange: !!slider && event.type === "keydown", effortOnly: !selectedModel,
+    });
+  }
+
+  function noteCodexThreadModelPickerIntent(node, selection, options = {}) {
+    if (!codexThreadModelObserverActive()) return;
+    const { picker, owner, hostId } = codexThreadModelPickerContext(node);
+    const key = codexThreadModelStorageKey(hostId, owner);
+    if (!key || !picker || picker.lockedModelSlug || picker.modelOptionsDisabled || picker.modelSelectionDisabled) return;
     const selections = window.__codexPlusThreadModelSelections || (window.__codexPlusThreadModelSelections = new Map());
-    // 只记用户激活原生模型行的意图；原生实际选中后才持久化，取消和自动回退不算选择。
-    selections.set(key, { selection, powerSelection: !!slider, awaitPowerChange: !!slider && event.type === "keydown",
-      effortOnly: !selectedModel, at: Date.now(), confirmedSince: 0 });
+    // 只记意图；原生实际选中后才持久化，取消和自动回退不算选择。
+    selections.set(key, { selection, ...options, at: Date.now(), confirmedSince: 0 });
     for (const [entryKey, value] of selections) if (Date.now() - value.at >= 30000) selections.delete(entryKey);
     window.setTimeout?.(syncCodexRetainedThreadModels, 300);
+    window.setTimeout?.(syncCodexRetainedThreadModels, 0);
   }
 
   function codexThreadModelObserverActive() {
@@ -12167,15 +12291,19 @@
             intent.confirmedSince = 0;
           }
           if (intent.awaitPowerChange) {
-            selections.delete(key);
-            states.delete(node);
+            if (Date.now() - intent.at >= 600) selections.delete(key);
             window.setTimeout?.(syncCodexRetainedThreadModels, 300);
             continue;
           }
         }
         const target = resolveCodexThreadModelSelection(intent.selection);
         if (picker?.model === target && (!intent.effortOnly || picker.reasoningEffort === intent.selection.effort)) {
-          if (!intent.confirmedSince) {
+          if (intent.effortOnly || intent.powerSelection) {
+            // 档位已与用户提交一致即可保存；切走对话前不再额外等待 250ms。
+            rememberCodexThreadModel("thread/settings/update", { threadId: owner }, {}, hostId,
+              { ...intent.selection, effort: picker.reasoningEffort ?? null }, true);
+            selections.delete(key);
+          } else if (!intent.confirmedSince) {
             intent.confirmedSince = Date.now();
             window.setTimeout?.(syncCodexRetainedThreadModels, 300);
           } else if (Date.now() - intent.confirmedSince >= 250) {
@@ -12302,11 +12430,13 @@
 
   function patchAppServerModelRequestClient(client) {
     if (!client || typeof client.sendRequest !== "function") return false;
+    if (window.__codexPlusModelCatalogRuntime !== codexModelCatalogRuntime) return false;
     registerNativeHostClient(client);
     try {
       if (!Object.isExtensible(client)) return false;
       for (const key of [
         "__codexPlusModelRequestPatch",
+        "__codexPlusModelRequestRuntime",
         "__codexPlusModelOriginalSendRequest",
         "__codexPlusThreadModels",
         "__codexPlusServiceTierOriginalPrewarmThreadStart",
@@ -12319,7 +12449,8 @@
     } catch {
       return false;
     }
-    if (client.__codexPlusModelRequestPatch === codexAppServerModelRequestPatchVersion) return true;
+    if (client.__codexPlusModelRequestPatch === codexAppServerModelRequestPatchVersion
+        && client.__codexPlusModelRequestRuntime === codexModelCatalogRuntime) return true;
     const nativeSendRequest = (client.__codexPlusModelOriginalSendRequest || client.sendRequest).bind(client);
     client.__codexPlusModelOriginalSendRequest = nativeSendRequest;
     const originalSendRequest = (method, params, options) =>
@@ -12382,6 +12513,7 @@
       };
     }
     client.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
+    client.__codexPlusModelRequestRuntime = codexModelCatalogRuntime;
     return true;
   }
 
@@ -12501,7 +12633,9 @@
   }
 
     function installCodexAppServerClientPrototypePatch() {
-    if (window.__codexPlusAppServerClientPrototypePatchInstalled === codexAppServerModelRequestPatchVersion) return true;
+    if (window.__codexPlusModelCatalogRuntime !== codexModelCatalogRuntime) return false;
+    if (window.__codexPlusAppServerClientPrototypePatchInstalled === codexAppServerModelRequestPatchVersion
+        && window.__codexPlusAppServerClientPrototypePatchRuntime === codexModelCatalogRuntime) return true;
     const wanted = codexPlusModelUnlockEnabled()
       || codexPluginMarketplacePatchEnabled()
       || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
@@ -12510,8 +12644,10 @@
     const klass = window.__codexPlusAppServerClientClass;
     if (!klass || typeof klass !== "function" || !klass.prototype) return false;
     const proto = klass.prototype;
-    if (proto.__codexPlusModelRequestPatch === codexAppServerModelRequestPatchVersion) {
+    if (proto.__codexPlusModelRequestPatch === codexAppServerModelRequestPatchVersion
+        && proto.__codexPlusModelRequestRuntime === codexModelCatalogRuntime) {
       window.__codexPlusAppServerClientPrototypePatchInstalled = codexAppServerModelRequestPatchVersion;
+      window.__codexPlusAppServerClientPrototypePatchRuntime = codexModelCatalogRuntime;
       return true;
     }
     try {
@@ -12590,7 +12726,9 @@
       };
     }
     proto.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
+    proto.__codexPlusModelRequestRuntime = codexModelCatalogRuntime;
     window.__codexPlusAppServerClientPrototypePatchInstalled = codexAppServerModelRequestPatchVersion;
+    window.__codexPlusAppServerClientPrototypePatchRuntime = codexModelCatalogRuntime;
     sendCodexPlusDiagnostic("app_server_client_prototype_patch_installed", {});
     return true;
   }
@@ -12648,12 +12786,15 @@
   }
 
   function installAppServerModelRequestPatch() {
-    if (window.__codexPlusAppServerModelRequestPatchInstalled === codexAppServerModelRequestPatchVersion) return;
+    if (window.__codexPlusModelCatalogRuntime !== codexModelCatalogRuntime) return;
+    if (window.__codexPlusAppServerModelRequestPatchInstalled === codexAppServerModelRequestPatchVersion
+        && window.__codexPlusAppServerModelRequestPatchRuntime === codexModelCatalogRuntime) return;
     if (appServerModelRequestPatchDisabled) return;
     if (appServerModelRequestPatchPromise) return;
     const patch = async () => {
       try {
         const { modules, candidates, sources, discovery } = await loadAppServerRequestCandidates();
+        if (window.__codexPlusModelCatalogRuntime !== codexModelCatalogRuntime) return;
         if (modules.length === 0) {
           noteAppServerModelRequestPatchMiss("model_app_server_request_patch_skipped", {
             reason: "app_server_request_assets_missing",
@@ -12670,6 +12811,7 @@
           appServerModelRequestPatchMissCount = 0;
           appServerModelRequestPatchRetryDelayMs = 250;
           window.__codexPlusAppServerModelRequestPatchInstalled = codexAppServerModelRequestPatchVersion;
+          window.__codexPlusAppServerModelRequestPatchRuntime = codexModelCatalogRuntime;
           sendCodexPlusDiagnostic("model_app_server_request_patch_installed", {
             moduleCount: modules.length,
             candidateCount: candidates.length,
@@ -12713,6 +12855,7 @@
   }
 
   function runCodexModelWhitelistRefreshPass() {
+    if (window.__codexPlusModelCatalogRuntime !== codexModelCatalogRuntime) return false;
     syncCodexRetainedThreadModels();
     if (!codexPlusModelUnlockEnabled() || !codexPlusModelNames().length) return false;
     try {
@@ -12779,8 +12922,7 @@
    *   1. 找到原生面板（挂在 popper 里、可见的 `[data-model-picker-view]`，宫格视图跳过），
    *      从行文本尾部的 `（供应商）` 解析归属；解析不到时回退去 `/codex-model-catalog`
    *      的 `modelMetadata[slug]`（聚合目录发布的 `codex_plus_group`，或 `description`
-   *      里的 `上游 · 供应商`）取权威归属。已知归属会在会话内累积，目录快照被整体替换
-   *      也不会把默认成员那一组变成空标题。
+   *      里的 `上游 · 供应商`）取权威归属。行的真实模型 ID 优先，显示名仅作无歧义兜底。
    *   2. 在每组第一行前插一个自己的分组标题按钮，点它只折叠/展开这一组；
    *      行本身的选中逻辑完全交给原生（这里不监听行的点击）。行内原生的
    *      `xxx（供应商）` 标签隐藏并退出无障碍树，由我们插入的裸模型名顶替。
@@ -12817,8 +12959,6 @@
   const codexPlusModelPickerGroupIdAttr = "data-codex-plus-model-group-id";
   /** 一行最多解析多少字符的供应商名；超长的一律当成模型名不拆。 */
   const codexPlusModelPickerGroupNameMaxLength = 24;
-  /** 列表 DOM 变化后的合并重扫延迟。 */
-  const codexPlusModelPickerRescanDelayMs = 60;
   /**
    * 菜单开着的兜底轮询间隔。
    *
@@ -12837,8 +12977,9 @@
     /** 轮询用的菜单节点；菜单关闭后置空。 */
     activeList: null,
     timer: 0,
-    rescanTimer: 0,
+    rescanPending: false,
     observer: null,
+    menuObserver: null,
     /** 本次菜单打开期间是否已经做过"自动只留当前分组展开"。 */
     autoCollapsed: false,
     /** 用户手动点过标题的分组 id。 */
@@ -13135,8 +13276,7 @@
    */
   function codexPlusModelPickerCatalogProviderMap() {
     const modelMetadata = codexModelCatalog?.modelMetadata || codexModelCatalog?.model_metadata;
-    // 会话内已记下的归属先铺一层：目录快照可能被整体替换（重连 / 重新生成），
-    // 只认当前快照会让默认供应商的分组名在某一刻变空。
+    // 只认当前目录；删除的模型不能从持久缓存重新出现。
     const map = new Map();
     if (!modelMetadata || typeof modelMetadata !== "object") return map;
     const slugList = Array.isArray(codexModelCatalog?.models)
@@ -13182,7 +13322,12 @@
     const map = new Map();
     const modelMetadata = codexModelCatalog?.modelMetadata || codexModelCatalog?.model_metadata;
     if (!modelMetadata || typeof modelMetadata !== "object") return map;
-    const register = (entry) => {
+    const setUnique = (key, value) => {
+      if (!key) return;
+      if (!map.has(key)) map.set(key, value);
+      else if (map.get(key)?.slug !== value.slug) map.set(key, null);
+    };
+    const register = (entry, slug) => {
       if (!entry || typeof entry !== "object") return;
       const displayName = entry.displayName || entry.display_name;
       if (typeof displayName !== "string" || !displayName) return;
@@ -13191,26 +13336,27 @@
         typeof entry.codex_plus_group_id === "string" ? entry.codex_plus_group_id.trim() : "";
       if (!provider || !groupId) return;
       // 在 Codex++ 里收藏过的模型（网关写的 `codex_plus_favorite`）：行尾画星标。
-      const value = { provider, groupId, favorite: entry.codex_plus_favorite === true };
+      const value = { slug, provider, groupId, favorite: entry.codex_plus_favorite === true };
+      map.set(`model\u0000${slug}`, value);
       // 原文键：网关关掉「模型名后带供应商」时，同名的几份只差末尾看不见的零宽字符，
       // 宽松归一化会把它们抹掉，必须先按原文比对。
       const rawKey = `raw\u0000${String(displayName).replace(/\s+/g, " ").trim()}`;
-      if (!map.has(rawKey)) map.set(rawKey, value);
+      setUnique(rawKey, value);
       const fullKey = codexPlusModelPickerNormalizeLoose(displayName);
-      if (fullKey && !map.has(fullKey)) map.set(fullKey, value);
+      setUnique(fullKey, value);
       const split = codexPlusModelPickerSplitLabel(displayName);
       if (split.name && split.provider) {
         const pairKey = `${codexPlusModelPickerNormalizeLoose(split.name)}\u0000${codexPlusModelPickerNormalizeLoose(split.provider)}`;
-        if (!map.has(pairKey)) map.set(pairKey, value);
+        setUnique(pairKey, value);
       }
     };
     const slugList = Array.isArray(codexModelCatalog?.models)
       ? codexModelCatalog.models.filter((slug) => typeof slug === "string" && slug)
       : [];
     const bySlug = new Map(Object.entries(modelMetadata));
-    for (const slug of slugList) register(bySlug.get(slug));
+    for (const slug of slugList) register(bySlug.get(slug), slug);
     if (!Array.isArray(codexModelCatalog?.models)) {
-      for (const entry of Object.values(modelMetadata)) register(entry);
+      for (const [slug, entry] of Object.entries(modelMetadata)) register(entry, slug);
     }
     return map;
   }
@@ -13254,6 +13400,20 @@
 
   function codexPlusModelPickerRowLabel(row) {
     return codexPlusModelPickerRowIdentity(row)?.text || "";
+  }
+
+  function codexPlusModelPickerRowModel(row) {
+    const metadata = codexModelCatalog?.modelMetadata || codexModelCatalog?.model_metadata || {};
+    const key = Object.keys(row).find((name) => name.startsWith("__reactFiber$"));
+    for (let fiber = key && row[key], depth = 0; fiber && depth < 16; depth++, fiber = fiber.return) {
+      const props = fiber.memoizedProps || {};
+      // 到选择器父组件就停止，那里 model 是当前选中值，不是这一行。
+      if (typeof props.onSelectModel === "function" && Array.isArray(props.models)) break;
+      for (const value of [fiber.key, props.model, props.model?.model, props.value, props.item?.model]) {
+        if (typeof value === "string" && Object.hasOwn(metadata, value)) return value;
+      }
+    }
+    return "";
   }
 
   function codexPlusModelPickerDefaultModel() {
@@ -13361,6 +13521,9 @@
     const effort = efforts.find((entry) => entry.reasoningEffort === picker.reasoningEffort)?.reasoningEffort
       || efforts.find((entry) => entry.reasoningEffort === preferred)?.reasoningEffort
       || efforts[0]?.reasoningEffort || "medium";
+    if (typeof noteCodexThreadModelPickerIntent === "function") {
+      noteCodexThreadModelPickerIntent(row, captureCodexThreadModelSelection({ model, effort }));
+    }
     Promise.resolve(picker.onSelectModel(model, effort)).catch((error) => {
       console.warn("[Codex++] default model selection failed", error);
     });
@@ -13394,7 +13557,9 @@
       const pairKey = split.provider
         ? `${codexPlusModelPickerNormalizeLoose(split.name)}\u0000${codexPlusModelPickerNormalizeLoose(split.provider)}`
         : "";
-      const exactKnown = exact.get(`raw\u0000${identity.text}`)
+      const model = codexPlusModelPickerRowModel(row);
+      const exactKnown = (model ? exact.get(`model\u0000${model}`) : null)
+        || exact.get(`raw\u0000${identity.text}`)
         || exact.get(codexPlusModelPickerNormalizeLoose(identity.text))
         || (pairKey ? exact.get(pairKey) : null);
       const known = exactKnown
@@ -13831,9 +13996,13 @@
     const groups = codexPlusModelPickerUniqueGroupIds(
       codexPlusModelPickerGroups(rows, codexPlusModelPickerDefaultProviderName()),
     );
-    // 只有一个供应商时不折叠：直连供应商本来就是一组，插标题只是多一层噪音。
-    if (groups.length < 2) {
-      if (codexPlusModelPickerGroupsState.patchedLists.has(list)) codexPlusModelPickerClear(list);
+    const catalogGroups = new Set([...codexPlusModelPickerCatalogExactMap().values()]
+      .filter(Boolean).map((entry) => entry.groupId));
+    // 原生分批重绘或搜索只剩一组时仍保留标题；确实单供应商才恢复原生列表。
+    if (groups.length < 2 && (groups.length === 0 || catalogGroups.size < 2)) {
+      if (!["ok", "not_applied", "not_configured"].includes(codexModelCatalog?.status)
+          && list.hasAttribute("data-codex-plus-model-groups")) return false;
+      if (list.hasAttribute("data-codex-plus-model-groups")) codexPlusModelPickerClear(list);
       else codexPlusModelPickerRemoveOwnNodes(list);
       codexPlusModelPickerSyncDefaultRow(list);
       return false;
@@ -13932,7 +14101,14 @@
   }
 
   function codexPlusModelPickerNeedsRescan(records) {
+    // React 回收我们插的标题时，removedNodes 已没有父节点，必须明确识别。
+    if (records.some((record) => [...record.removedNodes].some((node) =>
+      node.nodeType === 1 && (node.matches?.(".codex-plus-model-group-header, .codex-plus-model-group-toolbar")
+        || node.querySelector?.('[role="menuitemradio"]'))))) return true;
     const changed = records.some((record) => {
+      if (record.type === "characterData") {
+        return !record.target.parentElement?.closest?.(`[data-codex-plus-ext="${codexPlusModelPickerGroupsExtMark}"]`);
+      }
       const nodes = [...record.addedNodes, ...record.removedNodes];
       return nodes.some((node) => node.nodeType === 1 && !node.closest?.(`[data-codex-plus-ext="${codexPlusModelPickerGroupsExtMark}"]`));
     });
@@ -13948,11 +14124,14 @@
   }
 
   function codexPlusModelPickerScheduleRescan() {
-    clearTimeout(codexPlusModelPickerGroupsState.rescanTimer);
-    codexPlusModelPickerGroupsState.rescanTimer = setTimeout(() => {
-      codexPlusModelPickerGroupsState.rescanTimer = 0;
+    const state = codexPlusModelPickerGroupsState;
+    if (state.disposed || state.rescanPending) return;
+    state.rescanPending = true;
+    // MutationObserver 后、浏览器绘制前修复，避免定时器留下 60~250ms 的平铺帧。
+    queueMicrotask(() => {
+      state.rescanPending = false;
       codexPlusModelPickerScan();
-    }, codexPlusModelPickerRescanDelayMs);
+    });
   }
 
   function codexPlusModelPickerObserveList(list) {
@@ -13964,14 +14143,27 @@
       if (!codexPlusModelPickerNeedsRescan(records)) return;
       codexPlusModelPickerScheduleRescan();
     });
-    state.observer.observe(list, { childList: true, subtree: true });
+    state.observer.observe(list, { childList: true, characterData: true, subtree: true });
+  }
+
+  function codexPlusModelPickerObserveMenus() {
+    const state = codexPlusModelPickerGroupsState;
+    state.menuObserver = new MutationObserver((records) => {
+      if (state.activeList?.isConnected) return;
+      if (records.some((record) => [...record.addedNodes].some((node) =>
+        node.nodeType === 1 && (node.matches?.('[data-model-picker-view], [class*="_ModelList_"]')
+          || node.querySelector?.('[data-model-picker-view], [class*="_ModelList_"]'))))) {
+        codexPlusModelPickerScheduleRescan();
+      }
+    });
+    if (document.body) state.menuObserver.observe(document.body, { childList: true, subtree: true });
   }
 
   /**
    * 一次扫描：菜单开着就确保分组已打好；关了就清理并停止轮询。
    *
    * 为什么还要轮询：React 复用行节点时不会产生 childList 变更，只靠 MutationObserver
-   * 会漏掉"标签变了"这种情况。600ms 一次、且只在菜单开着时跑，开销可以忽略。
+   * 会漏掉"标签变了"这种情况。250ms 一次、且只在菜单开着时跑，开销可以忽略。
    */
   function codexPlusModelPickerScan() {
     const state = codexPlusModelPickerGroupsState;
@@ -14020,7 +14212,9 @@
   window.__codexPlusModelPickerDefaultKeyHandler = codexPlusModelPickerSelectDefault;
   document.addEventListener("click", codexPlusModelPickerSelectDefault, true);
   document.addEventListener("keydown", codexPlusModelPickerSelectDefault, true);
-  codexPlusModelPickerSchedule(300);
+  codexPlusModelPickerObserveMenus();
+  codexPlusModelPickerScheduleRescan();
+  codexPlusModelPickerSchedule(250);
   window.__codexPlusModelPickerGroupsRuntime = {
     version: 1,
     sync: () => codexPlusModelPickerSchedule(0),
@@ -14073,8 +14267,8 @@
       state.disposed = true;
       document.removeEventListener("keydown", codexPlusModelPickerNavigateGroups, true);
       clearTimeout(state.timer);
-      clearTimeout(state.rescanTimer);
       state.observer?.disconnect();
+      state.menuObserver?.disconnect();
       state.observer = null;
       state.activeList = null;
       state.timer = 0;

@@ -2274,6 +2274,7 @@ describe("renderer injection app-server model request patch", () => {
     const diagnostics: string[] = [];
     const timers: Array<number> = [];
     const fakeWindow: Record<string, unknown> = {
+      __codexPlusModelCatalogRuntime: {},
       setTimeout: ((fn: () => void) => {
         timers.push(0);
         pending.push(fn);
@@ -2284,6 +2285,7 @@ describe("renderer injection app-server model request patch", () => {
 
     const factory = new Function(
       "window",
+      "codexModelCatalogRuntime",
       "codexAppServerModelRequestPatchVersion",
       "codexRemoteSessionProviderPatchEnabled",
       "loadAppServerRequestCandidates",
@@ -2295,6 +2297,7 @@ describe("renderer injection app-server model request patch", () => {
 
     const install = factory(
       fakeWindow,
+      fakeWindow.__codexPlusModelCatalogRuntime,
       1,
       // provider patch 开关两态都要测：以前 enabled 时走提前 return 绕过熔断。
       () => true,
@@ -3095,7 +3098,7 @@ describe("renderer model reasoning efforts patch", () => {
     );
   });
 
-  it("仍为名单内确认支持 ultra 的模型补 max 与 ultra", async () => {
+  it("网关已声明档位时不按 Sol 名称补出 max 与 ultra", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
     const efforts = reasoningRuntime(renderer, {
       supportedReasoningEfforts: ["low", "medium", "high", "xhigh"].map((reasoningEffort) => ({ reasoningEffort })),
@@ -3103,10 +3106,19 @@ describe("renderer model reasoning efforts patch", () => {
 
     assert.deepEqual(
       efforts.map((entry) => entry.reasoningEffort),
-      ["low", "medium", "high", "xhigh", "max", "ultra"],
+      ["low", "medium", "high", "xhigh"],
     );
   });
 
+  it("供应商仅声明 low 和 high 时精确保留配置，并保留显式声明的 ultra", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    for (const levels of [["low", "high"], ["high", "ultra"]]) {
+      const efforts = reasoningRuntime(renderer, {
+        supportedReasoningEfforts: levels.map(reasoningEffort => ({ reasoningEffort })),
+      })("supplier/gpt-6.1-sol");
+      assert.deepEqual(efforts.map(entry => entry.reasoningEffort), levels);
+    }
+  });
   it("没有档位声明时仍回落到完整兜底列表", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
     const efforts = reasoningRuntime(renderer, null)("deepseek-flash");

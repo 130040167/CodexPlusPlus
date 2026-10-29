@@ -4,13 +4,14 @@ import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 const source = await readFile(new URL("../../../assets/inject/renderer-inject/70-model-catalog.js", import.meta.url), "utf8");
 function runtime(storage = new Map<string,string>(), sharedWindow: any = {}) {
-  let profile = "aggregate", now = 10000;
+  let profile = "aggregate", now = 10000, active = true;
   let configuredDefault = "gpt-5.5";
   const catalog = { status: "ok", codex_plus_default_group_id: "a" };
   let names = ["gpt-5.5", "sol", "cpx-b/sol", "cpx-a/sol"];
   let mode = "aggregate";
   let supported = ["low", "medium", "high", "xhigh", "max", "ultra"];
   const effortByModel: Record<string,string[]> = {};
+  const groups: Record<string,string> = {};
   const nodes: any[] = [];
   const context = vm.createContext({
     window: sharedWindow, document: { querySelectorAll: () => nodes },
@@ -18,19 +19,25 @@ function runtime(storage = new Map<string,string>(), sharedWindow: any = {}) {
     Date: { now: () => now }, Map, WeakMap, Promise, Set,
     codexPlusBackendSettingsLoaded: true,
     codexPlusBackendSettings: { relayProfiles: [{id:"a",relayMode:"pureApi"}] },
-    codexRemoteSessionActiveProfile: () => ({ id: profile, relayMode: mode }),
+    codexRemoteSessionActiveProfile: () => active ? ({ id: profile, relayMode: mode }) : null,
     codexModelCatalog: catalog,
     codexPlusConfiguredDefaultModel: () => configuredDefault,
     codexPlusModelNames: () => names,
     modelReasoningEfforts: (model:string) => (effortByModel[model] || supported).map(reasoningEffort=>({reasoningEffort})),
     codexPlusModelMetadata: (model:string) => ({ defaultReasoningEffort:"medium",
-      codex_plus_group_id: mode==="pureApi" ? undefined : model.startsWith("cpx-") ? model.slice(4,model.indexOf("/")) : catalog.codex_plus_default_group_id }),
+      codex_plus_group_id: groups[model] || (mode==="pureApi" ? undefined : model.startsWith("cpx-") ? model.slice(4,model.indexOf("/")) : catalog.codex_plus_default_group_id) }),
   });
-  const start = source.indexOf("  function codexRememberedThreadModels()");
+  const start = source.indexOf("  function codexThreadModelProfile()");
   const end = source.indexOf("  function codexPerModelContextEnabled()", start);
-  const api = vm.runInContext(`(()=>{${source.slice(start,end)};return {rememberCodexThreadModel,codexRetainedThreadModel,retainCodexThreadResumeModel,sendCodexRetainedModelRequest,syncCodexRetainedThreadModels,observeCodexThreadModelSelection}})()`,context);
-  return { api, storage, catalog, nodes, effortByModel, profile: (v:string) => { profile=v; },
+  const api = vm.runInContext(`(()=>{${source.slice(start,end)};return {rememberCodexThreadModel,codexRetainedThreadModel,retainCodexThreadResumeModel,sendCodexRetainedModelRequest,syncCodexRetainedThreadModels,observeCodexThreadModelSelection,noteCodexThreadModelPickerIntent}})()`,context);
+  return { api, storage, catalog, nodes, effortByModel, groups, window: sharedWindow, profile: (v:string) => { profile=v; },
     setDefault: (v:string) => { configuredDefault=v; },
+    lockProfile: () => {
+      active = false;
+      context.codexPlusBackendSettings.activeRelayId = profile;
+      context.codexPlusBackendSettings.relayProfiles = [{ id: profile, relayMode: mode }];
+      (catalog as any).sources = [{ id: `${mode === "aggregate" ? "aggregate" : "relay-profile"}:${profile}` }];
+    },
     configure: (id:string,relayMode:string,models:string[],efforts=supported) => {profile=id;mode=relayMode;names=models;supported=efforts;},
     tick: () => { now+=2000; } };
 }
@@ -138,18 +145,99 @@ it("failed settings, read/resume fallback, and late responses after profile chan
   r.profile("other");done({});await p;
   assert.equal(r.api.codexRetainedThreadModel("local","one").model,"sol");
 });
-it("resume fills missing model but respects an explicit context/model switch",()=>{
+it("resume restores its own model even when navigation carries another conversation model",()=>{
   const r=runtime();r.api.rememberCodexThreadModel("turn/start",{threadId:"one",model:"sol",effort:"low"},{},"local");
   assert.equal(r.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one"},"local").model,"sol");
-  assert.equal(r.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one",model:"gpt-5.5"},"local").model,"gpt-5.5");
+  assert.equal(r.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one",model:"gpt-5.5"},"local").model,"sol");
 });
-it("same-model resumes restore saved effort while explicit efforts and other models stay intact",()=>{
+it("same-model resumes restore the conversation effort instead of an inherited native default",()=>{
   const r=runtime();
   r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
   const restarted=runtime(r.storage);
   assert.equal(restarted.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one",model:"sol"},"local").reasoningEffort,"high");
-  assert.equal(restarted.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one",model:"sol",reasoningEffort:"low"},"local").reasoningEffort,"low");
-  assert.equal(restarted.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one",model:"gpt-5.5"},"local").reasoningEffort,undefined);
+  assert.equal(restarted.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one",model:"sol",reasoningEffort:"low"},"local").reasoningEffort,"high");
+  assert.equal(restarted.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one",model:"gpt-5.5"},"local").reasoningEffort,"high");
+});
+it("gateway pinned routes preserve provider identity across direct, gateway and aggregate catalogs",()=>{
+  const r=runtime();
+  r.configure("a","pureApi",["sol"]);
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"ultra"},{},"local");
+  r.configure("codex-plus-gateway","pureApi",["sol","a/sol","b/sol","group/coding"]);
+  Object.assign(r.groups,{"sol":"codex-plus-gateway-auto","a/sol":"a","b/sol":"b","group/coding":"codex-plus-gateway-groups"});
+  assert.equal(r.api.codexRetainedThreadModel("local","one").model,"a/sol");
+  r.tick();
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"b/sol",effort:"high"},{},"local",undefined,true);
+  r.configure("aggregate","aggregate",["sol","cpx-b/sol"]);
+  assert.equal(r.api.codexRetainedThreadModel("local","one").model,"cpx-b/sol");
+  r.configure("b","pureApi",["sol"]);
+  assert.equal(r.api.codexRetainedThreadModel("local","one").model,"sol");
+  assert.equal(r.api.codexRetainedThreadModel("local","one").effort,"high");
+});
+it("gateway automatic routes and named groups remain distinct from pinned supplier routes",()=>{
+  const r=runtime();
+  r.configure("codex-plus-gateway","pureApi",["sol","a/sol","group/coding","group/review"]);
+  Object.assign(r.groups,{"sol":"codex-plus-gateway-auto","a/sol":"a","group/coding":"codex-plus-gateway-groups","group/review":"codex-plus-gateway-groups"});
+  for(const model of ["sol","a/sol","group/coding","group/review"]) {
+    r.tick();
+    r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model,effort:"high"},{},"local",undefined,true);
+    assert.equal(r.api.codexRetainedThreadModel("local","one").model,model);
+  }
+  r.configure("codex-plus-gateway","pureApi",["sol","a/sol","group/coding"]);
+  assert.equal(r.api.codexRetainedThreadModel("local","one"),null,"a removed group must not resolve to another group");
+});
+it("automatic settings acknowledgements cannot replace an explicit conversation effort",async()=>{
+  const r=runtime(),f=pickerFixture(r,"sol");
+  f.picker.reasoningEffort="high";f.choose("high");
+  r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();
+  await r.api.sendCodexRetainedModelRequest({hostId:"local"},async()=>({}),
+    "thread/settings/update",{threadId:"one",model:"sol",effort:"low"});
+  assert.equal(r.api.codexRetainedThreadModel("local","one").effort,"high");
+});
+it("rapid A to B to A navigation saves a confirmed picker choice before the settle timer",()=>{
+  const r=runtime(),f=pickerFixture(r,"sol");
+  f.choose("high");f.picker.reasoningEffort="high";
+  r.api.syncCodexRetainedThreadModels();
+  f.owner.conversationId="two";f.picker.reasoningEffort="low";
+  r.api.syncCodexRetainedThreadModels();
+  r.tick();
+  f.owner.conversationId="one";
+  assert.equal(r.api.codexRetainedThreadModel("local","one")?.effort,"high");
+});
+it("a new explicit effort is respected on resume while cancelled and unrelated intents are ignored",()=>{
+  const r=runtime(),f=pickerFixture(r,"sol");
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
+  f.choose("low");
+  assert.equal(r.api.retainCodexThreadResumeModel("thread/resume",
+    {threadId:"one",model:"sol",reasoningEffort:"low"},"local").reasoningEffort,"low");
+  r.tick();
+  r.window.__codexPlusThreadModelSelections?.clear();
+  assert.equal(r.api.retainCodexThreadResumeModel("thread/resume",
+    {threadId:"one",model:"sol",reasoningEffort:"low"},"local").reasoningEffort,"high");
+});
+it("a fixed multi-instance profile retains conversations only when the catalog confirms its identity",()=>{
+  const r=runtime(),f=pickerFixture(r,"sol");
+  r.lockProfile();
+  f.choose("high");f.picker.reasoningEffort="high";
+  r.api.syncCodexRetainedThreadModels();
+  assert.equal(r.api.codexRetainedThreadModel("local","one").effort,"high");
+  (r.catalog as any).sources=[{id:"aggregate:another"}];
+  assert.equal(r.api.codexRetainedThreadModel("local","one"),null);
+});
+it("choosing the configured default is an explicit choice and replaces the old selection",()=>{
+  const r=runtime(),f=pickerFixture(r,"sol");
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local",undefined,true);
+  r.api.noteCodexThreadModelPickerIntent(r.nodes[0],{model:"gpt-5.5",effort:"low",groupId:"a"});
+  f.picker.model="gpt-5.5";
+  r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();
+  assert.equal(r.api.codexRetainedThreadModel("local","one").model,"gpt-5.5");
+});
+it("confirming the same effort upgrades old records so later automatic writes cannot replace them",async()=>{
+  const r=runtime(),f=pickerFixture(r,"sol");
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
+  f.picker.reasoningEffort="high";f.choose("high");r.api.syncCodexRetainedThreadModels();
+  await r.api.sendCodexRetainedModelRequest({hostId:"local"},async()=>({}),
+    "thread/settings/update",{threadId:"one",model:"sol",effort:"low"});
+  assert.equal(r.api.codexRetainedThreadModel("local","one").effort,"high");
 });
 it("native power slider pointer and keyboard commits survive renderer restart and thread unload",async()=>{
   for (const type of ["pointerup","keydown"]) {
