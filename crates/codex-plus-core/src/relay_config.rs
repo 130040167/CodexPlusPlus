@@ -3075,9 +3075,11 @@ fn preserve_live_app_settings(home: &Path, config_text: &str) -> anyhow::Result<
     remove_unsupported_approval_policies(&mut target_doc);
     let live_text = read_optional_text(&home.join("config.toml"))?;
     if live_text.trim().is_empty() {
+        repair_merged_mcp_servers(&mut target_doc, &HashMap::new());
         return Ok(normalize_optional_toml(target_doc));
     }
     let Ok(live_doc) = parse_toml_document(&live_text) else {
+        repair_merged_mcp_servers(&mut target_doc, &HashMap::new());
         return Ok(normalize_optional_toml(target_doc));
     };
     if let Some(live_desktop) = live_doc.get("desktop").cloned() {
@@ -3100,6 +3102,9 @@ fn preserve_live_app_settings(home: &Path, config_text: &str) -> anyhow::Result<
     // 以 live 为准，避免旧快照把已删除的目录写回（#2583）。
     prefer_live_codex_managed_entries(&mut target_doc, &live_doc);
     repair_mcp_servers_from_live(&mut target_doc, &live_doc);
+    // 写盘前兜底：用 live 补过仍缺 command / url 的条目（模板减出来的残表，或 live 里本来就坏的），
+    // Codex 会以 invalid transport 拒绝整份 config.toml、桌面版起不来，这里去掉并记诊断（#2765）。
+    repair_merged_mcp_servers(&mut target_doc, &HashMap::new());
     // Preserve user-managed feature flags such as multi_agent_v2 and memories.
     // #2683：补回前先记下目标是否自己声明了 multi_agent_v2（v1 闸门写入或模板自带），
     // 补回之后据此决定要不要还原 v1 压下的闸门。

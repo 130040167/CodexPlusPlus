@@ -96,6 +96,53 @@ command = "npx"
     assert_eq!(servers["context7"]["command"].as_str(), Some("npx"));
 }
 
+/// 回归（issue #2765）：不走通用配置合并时（没有通用配置、或 profile 不用通用配置），
+/// 写盘前也要兜底——模板里减出来的残表用 live 补齐，补不上的（包括 live 里本来就坏的）
+/// 去掉，否则 codex 以 `invalid transport` 拒载整份 config.toml、桌面版起不来。
+#[test]
+fn preserve_live_app_settings_drops_mcp_entries_without_transport() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    std::fs::write(
+        home.join("config.toml"),
+        r#"[mcp_servers.filled]
+command = "npx"
+args = ["-y", "filled-mcp"]
+
+[mcp_servers.broken_live]
+startup_timeout_sec = 30
+
+[mcp_servers.remote]
+url = "https://mcp.example/mcp"
+"#,
+    )
+    .unwrap();
+    // 模板里 filled 只剩 env 子表（逐键减掉 command 后的残表），stale 在 live 里也没有。
+    let template = r#"model = "gpt-5"
+
+[mcp_servers.filled.env]
+TOKEN = "x"
+
+[mcp_servers.stale]
+enabled = false
+"#;
+
+    let preserved =
+        codex_plus_core::relay_config::preserve_live_app_settings_for_test(home, template)
+            .unwrap();
+    let doc = preserved.parse::<toml_edit::DocumentMut>().unwrap();
+    let servers = doc["mcp_servers"].as_table().expect("合法条目要保留");
+
+    assert_eq!(servers["filled"]["command"].as_str(), Some("npx"), "{preserved}");
+    assert_eq!(servers["filled"]["env"]["TOKEN"].as_str(), Some("x"));
+    assert!(servers.get("stale").is_none(), "补不上的残表要去掉：{preserved}");
+    assert!(
+        servers.get("broken_live").is_none(),
+        "live 里本来就坏的条目也要去掉，Codex 才能启动：{preserved}"
+    );
+    assert_eq!(servers["remote"]["url"].as_str(), Some("https://mcp.example/mcp"));
+}
+
 /// 回归（issue #2147）：profile 里本来完整的 MCP 条目，不能被通用配置里的残缺
 /// 同名条目覆盖掉——合并前备份、合并后按备份回填缺键。
 #[test]
