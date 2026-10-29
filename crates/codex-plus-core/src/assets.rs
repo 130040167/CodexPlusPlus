@@ -504,6 +504,22 @@ fn renderer_after_document_ready(script: &str) -> String {
     )
 }
 
+/// 注入脚本里的皮肤运行时：等文档就绪再安装（#2680）。
+///
+/// 注入脚本同时登记为新文档脚本；只要启动器发过 Page.enable（开了原生 Fast / 输入预测），
+/// Page.reload、启动壳自救重载等每次新文档都会在根节点建立前执行它。这时
+/// `document.documentElement` 为空，皮肤 API 引导里的 `root.style.setProperty` 和
+/// `observer.observe(document.documentElement)` 直接抛错，整个皮肤运行时没装上，
+/// 页面里只剩 Codex++ 的其它增强，看起来就是「重启 Codex 后皮肤不生效」。
+/// 实时注入（Runtime.evaluate，body 已在）仍立即执行；没开皮肤时为空串，不加任何包装。
+fn dream_skin_target_runtime_after_document_ready(settings: &BackendSettings) -> String {
+    let runtime = dream_skin_target_runtime_script(settings, false);
+    if runtime.is_empty() {
+        return runtime;
+    }
+    renderer_after_document_ready(&runtime)
+}
+
 pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettings) -> String {
     let helper_url = format!("http://127.0.0.1:{helper_port}");
     let instance_label = std::env::var("CODEX_PLUS_INSTANCE_LABEL")
@@ -523,7 +539,7 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
     let dream_skin_art = dream_skin_art_data_uri(settings);
     let dream_skin_art_signature = dream_skin_art_content_signature(settings);
     let dream_skin_theme = &settings.codex_app_dream_skin_theme_config;
-    let dream_skin_target_runtime = dream_skin_target_runtime_script(settings, false);
+    let dream_skin_target_runtime = dream_skin_target_runtime_after_document_ready(settings);
     let paste_fix = paste_fix_enabled_config(settings);
     let force_chinese_locale = force_chinese_locale_config(settings);
     let hide_official_usage_alert = hide_official_usage_alert_config(settings);
@@ -691,6 +707,65 @@ mod tests {
             if(!ready){{document.body={{}};listener();assert.equal(window.started,1);}}
           }}
         "#, serde_json::to_string(&wrapped).unwrap());
+        let output = std::process::Command::new("node").arg("-e").arg(test).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    // 回归 #2680：注入脚本作为新文档脚本执行时根节点还不存在，皮肤运行时必须等文档就绪。
+    #[test]
+    fn dream_skin_runtime_in_injection_waits_for_document_ready() {
+        let mut settings = BackendSettings::default();
+        settings.codex_app_dream_skin_enabled = true;
+        let runtime = dream_skin_target_runtime_script(&settings, false);
+        assert!(!runtime.is_empty());
+        let script = injection_script_with_settings(57321, &settings);
+        assert!(script.contains(&renderer_after_document_ready(&runtime)));
+        // 皮肤运行时只出现在包装里，不能另有一份在根节点建立前直接执行。
+        assert_eq!(script.matches(runtime.as_str()).count(), 1);
+
+        // 没开或暂停皮肤时不注入任何皮肤运行时，也不加包装。
+        for (enabled, paused) in [(false, false), (true, true)] {
+            settings.codex_app_dream_skin_enabled = enabled;
+            settings.codex_app_dream_skin_paused = paused;
+            assert!(dream_skin_target_runtime_after_document_ready(&settings).is_empty());
+        }
+    }
+
+    #[test]
+    fn dream_skin_api_bootstrap_throws_before_root_but_wrapped_installs_after_ready() {
+        let bootstrap = dream_skin_skin_api_bootstrap_script(r##"{"colors":{"background":"#102030"}}"##);
+        let test = format!(r#"
+          const vm=require('node:vm'),assert=require('node:assert/strict');
+          const run=(source)=>{{
+            let listener=null,observed=null;
+            const props={{}};
+            const root={{style:{{setProperty:(name,value)=>{{props[name]=value;}}}}}};
+            // 与 Chromium 新文档脚本一致：根节点、head、body 都还是 null。
+            const document={{documentElement:null,body:null,querySelectorAll:()=>[],
+              addEventListener:(name,callback,options)=>{{
+                assert.equal(name,'DOMContentLoaded');assert.equal(options.once,true);listener=callback;
+              }}}};
+            class MutationObserver{{
+              observe(node){{if(!node)throw new TypeError("parameter 1 is not of type 'Node'");observed=node;}}
+              disconnect(){{}}
+            }}
+            const window={{}};
+            vm.runInNewContext(source,{{window,document,MutationObserver,setTimeout,clearTimeout}});
+            return {{document,root,props,ready:()=>{{document.documentElement=root;document.body={{}};listener();}},observed:()=>observed}};
+          }};
+          // 未包装：新文档阶段直接抛错，整份皮肤运行时就此中断。
+          // vm 里抛出的 TypeError 属于另一个 realm，按 name 判断。
+          assert.throws(()=>run({raw}),(error)=>error.name==='TypeError');
+          // 包装后：新文档阶段不碰 DOM，文档就绪时正常写主题变量、监听根节点。
+          const env=run({wrapped});
+          assert.deepEqual(env.props,{{}});
+          env.ready();
+          assert.equal(env.props['--ds-theme-color-background'],'#102030');
+          assert.equal(env.observed(),env.root);
+        "#,
+            raw = serde_json::to_string(&bootstrap).unwrap(),
+            wrapped = serde_json::to_string(&renderer_after_document_ready(&bootstrap)).unwrap(),
+        );
         let output = std::process::Command::new("node").arg("-e").arg(test).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     }

@@ -1576,7 +1576,7 @@ fn codex_process_ids_for_debug_port(
 ///
 /// 按整词解析而不是子串匹配：`--remote-debugging-port=9229` 不能被端口 922 命中。
 #[cfg(any(windows, test))]
-fn debug_port_from_command_line(command_line: &str) -> Option<u16> {
+pub(crate) fn debug_port_from_command_line(command_line: &str) -> Option<u16> {
     let mut tokens = command_line
         .split_whitespace()
         .map(|token| token.trim_matches('"'));

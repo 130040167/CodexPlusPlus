@@ -1,4 +1,6 @@
-use codex_plus_core::relay_config::{normalize_relay_profile_for_storage, relay_profile_api_key};
+use codex_plus_core::relay_config::{
+    normalize_relay_profile_for_storage, relay_profile_api_key, relay_test_auth_failure_hint,
+};
 use codex_plus_core::settings::{
     BackendSettings, RelayApiKey, RelayMode, RelayProfile, SettingsStore,
 };
@@ -137,4 +139,60 @@ fn edited_selected_key_survives_storage_apply_and_backfill() {
         config["model_providers"]["custom"]["experimental_bearer_token"].as_str(),
         Some("rotated-key")
     );
+}
+
+/// #2754：添加了新 Key 却没勾选，测试 / 多开一直带旧 Key，上游只回「尾号 xxxx 无效」。
+/// 鉴权失败的测试结果要指出本次用的是哪个 Key（名称 + 末 4 位），不泄露整串。
+#[test]
+fn auth_failure_hint_names_the_selected_key_by_tail() {
+    let mut profile = profile();
+    profile.api_keys = vec![
+        RelayApiKey {
+            id: "main".into(),
+            name: "默认".into(),
+            api_key: "sk-old-deepseek-key-5e36".into(),
+        },
+        RelayApiKey {
+            id: "new".into(),
+            name: "Key 2".into(),
+            api_key: "sk-new-deepseek-key-9a1b".into(),
+        },
+    ];
+    profile.active_api_key_id = "main".into();
+
+    let hint = relay_test_auth_failure_hint(&profile, 401).expect("401 要给出 Key 提示");
+    assert!(hint.contains("「默认」"), "{hint}");
+    assert!(hint.contains("5e36"), "{hint}");
+    assert!(hint.contains("勾"), "{hint}");
+    assert!(!hint.contains("sk-old"), "提示不能泄露整串 Key：{hint}");
+    assert!(!hint.contains("9a1b"), "未选中的 Key 不该出现：{hint}");
+    assert!(relay_test_auth_failure_hint(&profile, 403).is_some());
+
+    // 成功或非鉴权错误不附提示。
+    assert!(relay_test_auth_failure_hint(&profile, 200).is_none());
+    assert!(relay_test_auth_failure_hint(&profile, 404).is_none());
+
+    // 只有一个 Key 时不提「多个 Key」，只给末 4 位。
+    profile.api_keys.truncate(1);
+    let hint = relay_test_auth_failure_hint(&profile, 401).unwrap();
+    assert!(hint.contains("末 4 位 5e36"), "{hint}");
+    assert!(!hint.contains("多个 Key"), "{hint}");
+}
+
+#[test]
+fn auth_failure_hint_skips_short_keys_and_keyless_profiles() {
+    let mut profile = profile();
+    profile.api_keys = vec![RelayApiKey {
+        id: "main".into(),
+        name: "默认".into(),
+        api_key: "short-key".into(),
+    }];
+    assert!(relay_test_auth_failure_hint(&profile, 401).is_none());
+
+    let official = RelayProfile {
+        id: "official".into(),
+        relay_mode: RelayMode::Official,
+        ..Default::default()
+    };
+    assert!(relay_test_auth_failure_hint(&official, 401).is_none());
 }
