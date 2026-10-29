@@ -726,6 +726,85 @@ pub fn delete_gateway_provider_key(
     )
 }
 
+/// 进行中的供应商测试：(序号, 中止函数)。同一时间只留一个，开始新的测试时中止上一个。
+static PROBE_TASK: std::sync::Mutex<Option<(u64, Box<dyn FnOnce() + Send>)>> =
+    std::sync::Mutex::new(None);
+static PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 测试被用户取消时的提示；界面按 status `cancelled` 识别。
+const PROBE_CANCELLED: &str = "测试已取消。";
+
+fn probe_slot() -> std::sync::MutexGuard<'static, Option<(u64, Box<dyn FnOnce() + Send>)>> {
+    PROBE_TASK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 测试供应商池里的一家供应商：发一条很短的请求（见 `gateway::probe`），不计入路由与统计。
+/// `key_id` 给了就只用这个 Key（按标识选，完整 Key 不经过界面）；`model` 为空时用默认模型。
+/// 在后台任务里跑、最多 60 秒，可用 [`cancel_gateway_provider_test`] 取消。
+#[tauri::command]
+pub async fn test_gateway_provider(
+    id: String,
+    model: Option<String>,
+    key_id: Option<String>,
+) -> CommandResult<Option<codex_plus_core::gateway::probe::ProbeResult>> {
+    let handle = tauri::async_runtime::spawn(async move {
+        let settings = SettingsStore::default().load().unwrap_or_default();
+        let gateway = GatewayStore::default().load()?;
+        codex_plus_core::gateway::probe::probe_provider(
+            &settings,
+            &gateway,
+            &id,
+            model.as_deref().unwrap_or_default(),
+            key_id.as_deref(),
+        )
+        .await
+    });
+    let seq = PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let abort = handle.inner().abort_handle();
+    if let Some((_, previous)) = probe_slot().replace((seq, Box::new(move || abort.abort()))) {
+        previous();
+    }
+    let joined = handle.await;
+    {
+        let mut slot = probe_slot();
+        if slot.as_ref().is_some_and(|(current, _)| *current == seq) {
+            *slot = None;
+        }
+    }
+    match joined {
+        Ok(Ok(result)) => ok(
+            if result.ok {
+                "测试成功。"
+            } else {
+                "测试失败。"
+            },
+            Some(result),
+        ),
+        Ok(Err(error)) => failed(&format!("测试失败：{error:#}"), None),
+        Err(tauri::Error::JoinError(error)) if error.is_cancelled() => CommandResult {
+            status: "cancelled".to_string(),
+            message: PROBE_CANCELLED.to_string(),
+            payload: None,
+        },
+        Err(error) => failed(&format!("测试失败：测试任务异常退出：{error}"), None),
+    }
+}
+
+/// 取消进行中的供应商测试（关掉测试弹窗、点「取消」时调用）。没有进行中的测试时什么也不做。
+#[tauri::command]
+pub fn cancel_gateway_provider_test() -> CommandResult<()> {
+    let cancelled = probe_slot().take().map(|(_, abort)| abort()).is_some();
+    ok(
+        if cancelled {
+            PROBE_CANCELLED
+        } else {
+            "没有进行中的测试。"
+        },
+        (),
+    )
+}
+
 /// 只改供应商的价格与独立代理（在供应商池的详情里编辑）。
 #[tauri::command]
 pub fn save_gateway_provider_extras(

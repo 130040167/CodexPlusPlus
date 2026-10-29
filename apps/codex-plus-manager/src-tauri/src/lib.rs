@@ -364,6 +364,8 @@ pub fn run() {
             gateway_commands::add_gateway_provider_key,
             gateway_commands::replace_gateway_provider_key,
             gateway_commands::delete_gateway_provider_key,
+            gateway_commands::test_gateway_provider,
+            gateway_commands::cancel_gateway_provider_test,
             gateway_commands::delete_gateway_provider,
             gateway_commands::check_gateway_provider_models,
             gateway_commands::fetch_gateway_provider_models,

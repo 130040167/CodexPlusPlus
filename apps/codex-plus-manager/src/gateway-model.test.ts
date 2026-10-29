@@ -457,7 +457,7 @@ test("供应商池：编辑在标题栏、各处编辑是图标按钮；已保�
   for (const label of ["编辑模型列表", "编辑价格", "编辑上下文窗口", "编辑思考等级", "编辑代理", "编辑限速"]) {
     assert.match(providers, new RegExp(`<EditIcon [^>]*label=\\{t\\("${label}"\\)\\}`), label);
   }
-  assert.match(providers, /<ProviderKeyList busy=\{busy\} entry=\{entry\} run=\{run\} \/>/);
+  assert.match(providers, /<ProviderKeyList busy=\{busy\} entry=\{entry\} onTest=\{\(keyId\) => setTestKey\(keyId\)\} run=\{run\} \/>/);
   const keys = readFileSync(new URL("./ProviderKeyList.tsx", import.meta.url), "utf8");
   assert.match(keys, /"add_gateway_provider_key", \{ id: entry\.id, key \}/);
   assert.match(keys, /"replace_gateway_provider_key", \{ id: entry\.id, keyId: editing\.keyId, key \}/);

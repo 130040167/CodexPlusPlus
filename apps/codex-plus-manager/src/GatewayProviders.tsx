@@ -6,7 +6,7 @@ import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointer
 import { invoke } from "@tauri-apps/api/core";
 import { createPortal } from "react-dom";
 import { appConfirm } from "./app-dialog";
-import { Check, ChevronRight, Copy, GripVertical, Pencil, Plus, RefreshCw, Search, X } from "lucide-react";
+import { Check, ChevronRight, Copy, GripVertical, Pencil, Plus, RefreshCw, Search, X, Zap } from "lucide-react";
 import { t, tf } from "./i18n";
 import { RelayBillingPoolBadge, RelayBillingPoolLabel, RelayBillingRetry, useRelayBillingProbe } from "./RelayBillingLine";
 import { relayBillingGatewayCacheKey, type RelayBillingProbe } from "./relay-billing";
@@ -46,6 +46,7 @@ import { ProviderWindowsDialog, windowSummary } from "./ProviderWindowsDialog";
 import { ProviderReasoningDialog, reasoningSummary } from "./ProviderReasoningDialog";
 import { ProviderModelsDialog } from "./ProviderModelsDialog";
 import { ProviderKeyList } from "./ProviderKeyList";
+import { ProviderTestDialog } from "./ProviderTestDialog";
 import { gatewayJump } from "./gateway-store";
 import { ModelMatrix } from "./GatewayModelMatrix";
 import { useEscapeLayer } from "./use-escape-layer";
@@ -438,6 +439,8 @@ function PoolRow({
   const modelsCollapsible = chatModels.length > MODEL_CHIP_COLLAPSE;
   const shownModels = modelsCollapsible && !allModels ? chatModels.slice(0, MODEL_CHIP_PREVIEW) : chatModels;
   const [reasoningOpen, setReasoningOpen] = useState(false);
+  // 「测试」弹窗：null 时用当前选中的 Key，给了标识就只用那个 Key；undefined 表示没打开。
+  const [testKey, setTestKey] = useState<string | null | undefined>(undefined);
   const reasoning = reasoningSummary(entry);
   const saveReasoning = async (modelMetadata: string) => {
     if (await run(`reasoning:${entry.id}`, "save_gateway_provider_metadata", { id: entry.id, modelMetadata }, t("保存思考等级"))) setReasoningOpen(false);
@@ -568,7 +571,7 @@ function PoolRow({
           <div className="gw-detail-row">
             <span className="gw-detail-label">{entry.account ? t("套餐") : "Key"}</span>
             <div className="gw-detail-value gw-chip-row">
-              {entry.account ? <span>{entry.plan || t("未知")}</span> : entry.keys?.length ? <ProviderKeyList busy={busy} entry={entry} run={run} /> : <KeyCount count={entry.keyCount} />}
+              {entry.account ? <span>{entry.plan || t("未知")}</span> : entry.keys?.length ? <ProviderKeyList busy={busy} entry={entry} onTest={(keyId) => setTestKey(keyId)} run={run} /> : <KeyCount count={entry.keyCount} />}
               {failures.map((key) => (
                 <span className="gw-key-failure" key={key.keyId}>
                   {`${keyLabel(entry.keys, key.keyId)}${t("：")}${[t(failureLabel(key.lastFailure)) || t(key.state === "disabled" ? "已停用" : "冷却中"), formatRemaining(key.remainingMs)].filter(Boolean).join(" · ")}`}
@@ -649,13 +652,25 @@ function PoolRow({
           <div className="gw-detail-row gw-detail-foot">
             <span className="gw-detail-label" />
             <div className="gw-detail-value">
-              {/* 普通供应商的「编辑」在标题栏；这里只留订阅账号的重新登录。 */}
-              {entry.account ? (
-                <button className="gw-text-button" disabled={busy !== null || loggingIn} onClick={onRelogin} type="button">
-                  {loggingIn ? t("登录中…") : t("重新登录")}
-                  <ChevronRight className="h-3.5 w-3.5" />
+              {/* 普通供应商的「编辑」在标题栏；这里是测试和订阅账号的重新登录。 */}
+              <span className="gw-detail-foot-actions">
+                <button
+                  className="gw-text-button gw-sync-button"
+                  disabled={busy !== null}
+                  onClick={() => setTestKey(null)}
+                  title={t("发一条很短的请求，看这家供应商能不能用、多快回复；不计入路由与统计")}
+                  type="button"
+                >
+                  <Zap className="h-3.5 w-3.5" />
+                  {t("测试")}
                 </button>
-              ) : <span />}
+                {entry.account ? (
+                  <button className="gw-text-button" disabled={busy !== null || loggingIn} onClick={onRelogin} type="button">
+                    {loggingIn ? t("登录中…") : t("重新登录")}
+                    <ChevronRight className="h-3.5 w-3.5" />
+                  </button>
+                ) : null}
+              </span>
               <button className="gw-danger-link" disabled={busy !== null} onClick={() => void remove()} type="button">
                 {t("删除")}
               </button>
@@ -663,6 +678,7 @@ function PoolRow({
           </div>
         </div>
       ) : null}
+      {testKey !== undefined ? <ProviderTestDialog entry={entry} keyId={testKey} onClose={() => setTestKey(undefined)} /> : null}
       {modelsOpen ? (
         <ProviderModelsDialog busy={busy !== null} entry={entry} onCancel={() => setModelsOpen(false)} onSave={(models, defaultModel) => void saveModels(models, defaultModel)} />
       ) : null}

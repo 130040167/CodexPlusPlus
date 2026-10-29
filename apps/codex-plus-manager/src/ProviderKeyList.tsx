@@ -1,9 +1,9 @@
 /** 供应商池详情里的「Key」一行（#2782）：列出已保存的 Key（只显示头尾），每个可单独替换、删除，也能再加一个。
  *
- * Key 原文从不发到界面：后端只给标识和打码后的样子，替换 / 删除按标识操作；新填的 Key 只在提交时发给后端。
+ * Key 原文从不发到界面：后端只给标识和打码后的样子，替换 / 删除 / 测试按标识操作；新填的 Key 只在提交时发给后端。
  */
 import { useState, type FormEvent } from "react";
-import { Pencil, Plus, Trash2 } from "lucide-react";
+import { Pencil, Plus, Trash2, Zap } from "lucide-react";
 import { appConfirm } from "./app-dialog";
 import { t, tf } from "./i18n";
 import type { GatewayPoolEntry } from "./gateway-model";
@@ -12,7 +12,7 @@ import type { Run } from "./gateway-ui";
 /** 正在填写的 Key：替换某个已保存的 Key，或新加一个。 */
 type Editing = { mode: "replace"; keyId: string; masked: string } | { mode: "add" };
 
-export function ProviderKeyList({ entry, busy, run }: { entry: GatewayPoolEntry; busy: string | null; run: Run }) {
+export function ProviderKeyList({ entry, busy, run, onTest }: { entry: GatewayPoolEntry; busy: string | null; run: Run; onTest: (keyId: string) => void }) {
   const keys = entry.keys ?? [];
   const [editing, setEditing] = useState<Editing | null>(null);
   const [value, setValue] = useState("");
@@ -43,6 +43,17 @@ export function ProviderKeyList({ entry, busy, run }: { entry: GatewayPoolEntry;
       {keys.map((key) => (
         <span className="gw-key-item" data-editing={editing?.mode === "replace" && editing.keyId === key.id} key={key.id}>
           <code className="gw-chip">{key.masked}</code>
+          {/* 只用这个 Key 发一条测试请求（按标识选，Key 原文不经过界面）。 */}
+          <button
+            aria-label={tf("测试 Key {0}", [key.masked])}
+            className="gw-icon-button gw-inline-icon"
+            disabled={busy !== null}
+            onClick={() => onTest(key.id)}
+            title={t("只用这个 Key 发一条测试请求")}
+            type="button"
+          >
+            <Zap className="h-3.5 w-3.5" />
+          </button>
           <button
             aria-label={tf("替换 Key {0}", [key.masked])}
             className="gw-icon-button gw-inline-icon"

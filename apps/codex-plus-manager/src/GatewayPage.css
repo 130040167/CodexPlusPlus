@@ -2531,6 +2531,14 @@ body.gw-sorting * {
   box-shadow: 0 0 0 1px var(--gw-line);
 }
 
+/* 详情底栏左侧：「测试」与订阅账号的「重新登录」并排，「删除」仍靠右。 */
+.shell .gw-detail-foot .gw-detail-foot-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+}
+
 .shell .gw-key-editor {
   display: inline-flex;
   align-items: center;

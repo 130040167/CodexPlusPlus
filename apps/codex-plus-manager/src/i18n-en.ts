@@ -2704,6 +2704,35 @@ export const EN_PLAIN: Record<string, string> = {
   "至少要保留一个 Key，要换掉它请用替换": "At least one key must remain; use Replace to change it",
   "新的 API Key": "New API key",
   "在供应商详情的「Key」一行里单独替换、删除或添加": "Replace, delete, or add keys one by one in the Key row of the provider details",
+  // 供应商池：测试供应商
+  "测试": "Test",
+  "发一条很短的请求，看这家供应商能不能用、多快回复；不计入路由与统计": "Send a very short request to see whether this provider works and how fast it replies; not counted in routing or stats",
+  "只用这个 Key 发一条测试请求": "Send a test request using only this key",
+  "发一条很短的请求，不计入路由、限速与统计": "Sends a very short request; not counted in routing, rate limits, or stats",
+  "测试用的模型": "Model to test",
+  "测试用的 Key": "Key to test",
+  "当前选中的 Key": "Currently selected key",
+  "这个供应商还没有模型，先在「模型」一行添加": "This provider has no models yet; add some in the Models row first",
+  "按这家的协议、代理和 Key 发送，让模型只回一个词；最多等 60 秒。": "Sent with this provider's protocol, proxy, and key, asking the model to reply with one word; waits up to 60 seconds.",
+  "测试中…": "Testing…",
+  "首字": "First token",
+  "总耗时": "Total time",
+  "回复": "Reply",
+  "上游没有返回文字（输出额度可能都用在思考上了），但请求本身是通的。": "The upstream returned no text (the output budget may have gone to reasoning), but the request itself works.",
+  "错误原文": "Raw error",
+  "取消测试": "Cancel test",
+  "再测一次": "Test again",
+  "开始测试": "Start test",
+  "登录凭据无效或已过期：请在详情底部点「重新登录」。": "The login credentials are invalid or expired: click “Sign in again” at the bottom of the details.",
+  "Key 无效、已过期，或没有这个模型的权限：核对 Key 是否填对，并在供应商后台确认它已启用。": "The key is invalid, expired, or lacks access to this model: check that the key is correct and enabled in the provider's dashboard.",
+  "模型名不对，或上游没有这个模型：用「从上游获取」刷新模型列表，或换一个模型再试。": "Wrong model name, or the upstream doesn't have this model: refresh the list with “Fetch from upstream”, or try another model.",
+  "被上游限速，或额度已用完：稍等一会儿再试，或到供应商后台查看用量与余额。": "Rate limited by the upstream, or out of quota: wait a moment and retry, or check usage and balance in the provider's dashboard.",
+  "额度或余额已用完：充值、等额度重置，或换一个 Key。": "Quota or balance used up: top up, wait for the quota to reset, or use another key.",
+  "等待超时：检查 Base URL 和代理是否正确可用；上游过忙时也会这样。": "Timed out: check that the Base URL and proxy are correct and reachable; a busy upstream can also cause this.",
+  "连不上上游：检查 Base URL 和代理设置（这家供应商的代理或系统代理），确认网络能访问这个地址。": "Couldn't reach the upstream: check the Base URL and proxy settings (this provider's proxy or the system proxy) and make sure the network can reach this address.",
+  "上游服务出错：多半是上游临时故障，稍后再试。": "The upstream service failed: most likely a temporary upstream outage; try again later.",
+  "上游开始回复后又报错或断开：见下方的错误原文。": "The upstream started replying, then errored or disconnected: see the raw error below.",
+  "请求没有成功：见下方的错误原文。": "The request didn't succeed: see the raw error below.",
 };
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
@@ -3053,6 +3082,11 @@ export const EN_TEMPLATE: Record<string, string> = {
   "删除 Key {0}": "Delete key {0}",
   "替换 {0} 的新 Key": "New key to replace {0}",
   "删除 Key「{0}」？删除后它不再参与轮换，用它的会话会换用别的 Key。": "Delete key “{0}”? It will no longer be rotated in, and conversations using it will switch to another key.",
+  // 供应商池：测试供应商
+  "测试 {0}": "Test {0}",
+  "测试 Key {0}": "Test key {0}",
+  "本次用的是 Key「{0}」（末 4 位 {1}）。": "This test used key “{0}” (ending in {1}).",
+  "本次用的是末 4 位为 {0} 的 Key。": "This test used the key ending in {0}.",
 };
 
 // Backend (Rust) messages returned via result.message. These are translated
@@ -3195,6 +3229,11 @@ export const EN_BACKEND: Record<string, string> = {
   "替换 Key 失败": "Failed to replace key",
   "Key 已删除。": "Key deleted.",
   "删除 Key 失败": "Failed to delete key",
+  // 供应商池：测试供应商
+  "测试成功。": "Test succeeded.",
+  "测试失败。": "Test failed.",
+  "测试已取消。": "Test cancelled.",
+  "没有进行中的测试。": "No test is running.",
 };
 
 // Pattern-based backend translations: [regex, replacement template].
@@ -3302,4 +3341,6 @@ export const EN_BACKEND_PATTERNS: Array<[RegExp, string]> = [
   [/^添加 Key 失败：(.+)$/, "Failed to add key: $1"],
   [/^替换 Key 失败：(.+)$/, "Failed to replace key: $1"],
   [/^删除 Key 失败：(.+)$/, "Failed to delete key: $1"],
+  // 供应商池：测试供应商
+  [/^测试失败：(.+)$/, "Test failed: $1"],
 ];
