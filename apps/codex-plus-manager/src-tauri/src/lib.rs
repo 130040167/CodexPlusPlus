@@ -573,7 +573,7 @@ pub fn run() {
             match event {
                 tauri::RunEvent::Opened { urls } => {
                     for url in urls {
-                        if handle_dream_skin_url(url.as_str()) {
+                        if handle_dream_skin_url(url.as_str()) || handle_provider_import_url(url.as_str()) {
                             show_main_window(app_handle);
                         }
                     }
@@ -594,6 +594,36 @@ pub fn run() {
                     "error": error.to_string()
                 }),
             );
+        }
+    }
+}
+
+/// 网页导入链接（codexplusplus://v1/import/provider?…）：存为待确认导入，界面轮询到后弹出确认框。
+/// Windows 从启动参数传进来，macOS 由系统的「打开 URL」事件送达（应用已在运行时也走这里）。
+pub fn handle_provider_import_url(url: &str) -> bool {
+    if !url.starts_with("codexplusplus://") {
+        return false;
+    }
+    match codex_plus_core::provider_import::save_pending_provider_import_from_url(url) {
+        Ok(request) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.provider_import_url.pending",
+                serde_json::json!({
+                    "name": request.name,
+                    "baseUrl": request.base_url,
+                    "target": request.target
+                }),
+            );
+            true
+        }
+        Err(error) => {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "manager.provider_import_url.failed",
+                serde_json::json!({
+                    "error": error.to_string()
+                }),
+            );
+            false
         }
     }
 }
