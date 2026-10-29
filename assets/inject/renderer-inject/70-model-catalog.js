@@ -128,6 +128,7 @@
           }
         }
         codexModelCatalogLoadedAt = Date.now();
+        if (typeof codexPlusModelPickerCatalogChanged === "function") codexPlusModelPickerCatalogChanged();
         renderCodexPlusMenu();
         scheduleCodexModelWhitelistRefresh();
         return codexModelCatalog;

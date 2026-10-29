@@ -196,7 +196,7 @@ it("在 Codex++ 里收藏的模型在选择器行尾画星标，取消收藏或�
 
 it("模型选择器用单行工具栏、明确默认模型和缩进后的分组模型", async () => {
   const source = await readShard();
-  assert.match(source, /spacer\.textContent = "选择模型"/);
+  assert.match(source, /spacer\.textContent = .*text\.selectModel/);
   assert.match(source, /codexPlusModelPickerDefaultModel\(\)/);
   assert.match(source, /codexPlusConfiguredDefaultModel\(\)/);
   assert.match(source, /codexModelCatalog\?\.status !== "not_applied"/);
@@ -211,6 +211,73 @@ it("模型选择器用单行工具栏、明确默认模型和缩进后的分组�
   assert.match(source, /codexPlusModelPickerScheduleRescan\(\)/);
   assert.match(source, /兼容 v1 早期把供应商直接存成字符串/);
   assert.doesNotMatch(source, /codex-plus-model-recommendation/);
+});
+
+it("复用原生标题且默认供应商显示真实名称，热重注入更新样式", async () => {
+  const source = await readShard();
+  assert.match(source, /\[data-codex-plus-model-groups="true"\] > \[data-menu-section-label\]\{display:none!important\}/);
+  assert.match(source, /if \(label\) label\.textContent = group\.name/);
+  assert.doesNotMatch(source, /group\.isDefault \? "默认" : group\.name/);
+  assert.match(source, /content\.querySelector\("\.flex-1"\)/);
+  assert.doesNotMatch(source, /if \(!isDefault \|\| !model\) continue/);
+  assert.match(source, /document\.getElementById\(codexPlusModelPickerGroupsStyleId\) \|\| document\.createElement/);
+});
+
+it("不搬动原生节点也让同组模型连续排列，目录刷新清除旧归属", async () => {
+  const source = await readShard();
+  const catalog = await readFile(CATALOG_URL, "utf8");
+  assert.match(source, /order:var\(--codex-plus-model-order,0\)/);
+  assert.match(source, /row\.style\.removeProperty\("--codex-plus-model-order"\)/);
+  assert.match(source, /const fallbackId = `provider:/);
+  assert.match(source, /providerIds\.has\(split\.provider\)/);
+  assert.match(source, /state\.providerNames\.clear\(\)/);
+  assert.match(catalog, /codexPlusModelPickerCatalogChanged\(\)/);
+});
+
+it("打开模型菜单时补读尚未就绪的供应商设置，再同步默认模型", async () => {
+  const source = await readShard();
+  const start = source.indexOf("  function codexPlusModelPickerEnsureCatalog() {");
+  const end = source.indexOf("\n  /**", start);
+  for (const loaded of [false, true]) {
+    const calls: string[] = [];
+    const state = { catalogPending: false, catalogRetryAt: 0 };
+    const ensure = new Function(
+      "codexPlusModelPickerGroupsState", "loadCodexModelCatalog",
+      "loadBackendSettingsState", "codexPlusModelPickerScheduleRescan",
+      "codexPlusBackendSettingsLoaded", "codexAppServerPreparationTimeoutMs",
+      `${source.slice(start, end)}\nreturn codexPlusModelPickerEnsureCatalog;`,
+    )(state, async () => calls.push("catalog"), async () => calls.push("settings"),
+      () => calls.push("sync"), loaded, 2000);
+    ensure();
+    ensure();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(calls, loaded ? ["catalog", "sync"] : ["settings", "catalog", "sync"]);
+    assert.equal(state.catalogPending, false);
+  }
+});
+
+it("多开禁用供应商切换后仍显示固定供应商默认模型，拒绝其他目录来源", async () => {
+  const source = await readShard();
+  const start = source.indexOf("  function codexPlusModelPickerDefaultModel() {");
+  const end = source.indexOf("\n  function codexPlusModelPickerSyncDefaultRow", start);
+  const settings = {
+    activeRelayId: "fixed", relayProfilesEnabled: false,
+    relayProfiles: [{ id: "fixed", relayMode: "pureApi" }],
+  };
+  const resolve = new Function(
+    "codexPlusConfiguredDefaultModel", "codexPlusBackendSettingsLoaded",
+    "codexRemoteSessionActiveProfile", "codexPlusBackendSettings", "codexModelCatalog",
+    `${source.slice(start, end)}\nreturn codexPlusModelPickerDefaultModel();`,
+  );
+  const catalog = {
+    status: "ok", model: "gpt-6.1-sol", models: ["gpt-6.1-sol"],
+    sources: [{ id: "relay-profile:fixed" }],
+  };
+  assert.equal(resolve(() => "", true, () => null, settings, catalog), "gpt-6.1-sol");
+  assert.equal(resolve(() => "", true, () => null, settings, {
+    ...catalog, sources: [{ id: "relay-profile:other" }],
+  }), "");
+  assert.equal(resolve(() => "", false, () => null, settings, catalog), "");
 });
 
 it("默认模型只取当前供应商允许的目录模型，目录未发布时才使用受限展示兜底", async () => {
