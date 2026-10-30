@@ -2712,6 +2712,11 @@ export const EN_PLAIN: Record<string, string> = {
     "The imported provider is enabled by default and starts serving requests right away for agents that have \"Auto-join new providers\" turned on under Agent access.",
   // 子 Agent 任务排队（#2772）
   "任务已提交并进入排队，前面的任务结束后自动启动。": "Task submitted and queued. It starts automatically when the tasks ahead of it finish.",
+  // 同一 Agent 并发执行（#2800）
+  "同时执行任务数": "Concurrent tasks",
+  "1（逐个执行，其余排队）": "1 (one at a time, others queue)",
+  "同一 Agent 最多同时运行的任务数。超出时排队，任一任务结束后按提交顺序启动下一个；并发任务请使用不同的工作目录，避免互相修改相同文件。": "Maximum number of tasks this agent runs at the same time. Extra tasks queue and start in submission order as soon as any task finishes. Give concurrent tasks different working directories so they don't edit the same files.",
+  "各 Agent 并发情况": "Per-agent concurrency",
   // 脚本市场更新时间 / 排序与本地脚本合并状态（#2781）
   "市场脚本排序": "Sort marketplace scripts",
   "默认顺序": "Default order",
@@ -2802,6 +2807,11 @@ export const EN_TEMPLATE: Record<string, string> = {
   // 子 Agent 任务排队（#2772）
   "此 Agent 的排队任务已达上限（{0} 个），请等待前面的任务结束或取消部分排队任务。": "This agent's queue is full ({0} tasks). Wait for earlier tasks to finish or cancel some queued tasks.",
   "此 Agent 还有 {0} 个任务未结束，新任务会排队，前面的结束后按提交顺序自动启动。": "This agent still has {0} unfinished task(s). New tasks are queued and start automatically in submission order.",
+  // 同一 Agent 并发执行（#2800）
+  "{0} 同时执行任务数": "{0} concurrent tasks",
+  "此 Agent 正在执行 {0} 个任务（同时最多 {1} 个），新任务会直接并发启动。": "This agent is running {0} task(s) (up to {1} at a time). A new task starts right away in parallel.",
+  " 同一工作目录已有 {0} 个任务在运行，并发执行可能互相修改相同文件，建议使用不同的工作目录。": " {0} task(s) are already running in this working directory. Concurrent tasks may edit the same files; consider a different working directory.",
+  "{0}：执行中 {1}/{2}，排队 {3}": "{0}: running {1}/{2}, queued {3}",
   "连接 {0} 时带上：": "When connecting to {0}, add:",
   "用到时下载并缓存在本机。来源：{0}（{1}）": "Downloaded when needed and cached locally. Source: {0} ({1})",
   "清除{0}": "Clear {0}",
