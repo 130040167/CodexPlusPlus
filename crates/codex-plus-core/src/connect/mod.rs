@@ -1,6 +1,7 @@
 pub mod app_server;
 mod inbox;
 pub mod media;
+pub mod outbound;
 pub mod session_store;
 pub mod weixin;
 

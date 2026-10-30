@@ -1255,6 +1255,8 @@ pub struct BackendSettings {
     pub weixin_connect_account_id: String,
     #[serde(rename = "weixinConnectAllowFrom", default)]
     pub weixin_connect_allow_from: String,
+    #[serde(rename = "weixinConnectAllowOutboundAttachments", default)]
+    pub weixin_connect_allow_outbound_attachments: bool,
     #[serde(rename = "weixinConnectRouteTag", default)]
     pub weixin_connect_route_tag: String,
     #[serde(rename = "weixinConnectWorkDir", default)]
@@ -1451,6 +1453,7 @@ impl Default for BackendSettings {
             weixin_connect_token: String::new(),
             weixin_connect_account_id: String::new(),
             weixin_connect_allow_from: String::new(),
+            weixin_connect_allow_outbound_attachments: false,
             weixin_connect_route_tag: String::new(),
             weixin_connect_work_dir: String::new(),
             weixin_connect_model: String::new(),
@@ -2924,6 +2927,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
         target.insert("codexGoalsEnabled".to_string(), Value::Bool(value));
     }
     merge_bool_setting(target, source, "weixinConnectEnabled");
+    merge_bool_setting(target, source, "weixinConnectAllowOutboundAttachments");
     for key in [
         "weixinConnectBaseUrl",
         "weixinConnectToken",
@@ -4952,6 +4956,7 @@ experimental_bearer_token = "sk-existing""#
     fn settings_store_update_persists_weixin_connect_settings() {
         let dir = temp_dir();
         let store = SettingsStore::new(dir.join("settings.json"));
+        assert!(!store.load().unwrap().weixin_connect_allow_outbound_attachments);
 
         let updated = store
             .update(json!({
@@ -4960,6 +4965,7 @@ experimental_bearer_token = "sk-existing""#
                 "weixinConnectToken": " token ",
                 "weixinConnectAccountId": " bot-1 ",
                 "weixinConnectAllowFrom": " user@im.wechat ",
+                "weixinConnectAllowOutboundAttachments": true,
                 "weixinConnectRouteTag": " route ",
                 "weixinConnectWorkDir": " /workspace ",
                 "weixinConnectModel": " gpt-test ",
@@ -4969,6 +4975,7 @@ experimental_bearer_token = "sk-existing""#
             .unwrap();
 
         assert!(updated.weixin_connect_enabled);
+        assert!(updated.weixin_connect_allow_outbound_attachments);
         assert_eq!(
             updated.weixin_connect_base_url,
             "https://ilink.example.test"
@@ -4982,6 +4989,9 @@ experimental_bearer_token = "sk-existing""#
         assert_eq!(updated.weixin_connect_sandbox, "workspace-write");
         assert_eq!(updated.weixin_connect_codex_path, "/usr/local/bin/codex");
         assert_eq!(store.load().unwrap(), updated);
+        let disabled = store.update(json!({ "weixinConnectAllowOutboundAttachments": false })).unwrap();
+        assert!(!disabled.weixin_connect_allow_outbound_attachments);
+        assert!(!store.load().unwrap().weixin_connect_allow_outbound_attachments);
     }
 
     /// #2028 存量迁移：系统保护目录（WindowsApps）里的 CLI 无法被第三方进程执行，
