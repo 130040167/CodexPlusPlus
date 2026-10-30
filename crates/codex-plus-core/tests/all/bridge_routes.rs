@@ -34,6 +34,7 @@ async fn bridge_routes_cover_all_current_paths() {
         ("/user-scripts/load", json!({})),
         ("/cdp/targets", json!({})),
         ("/cdp/evaluate", json!({"kind":"avatar-overlay","expression":"1"})),
+        ("/thread-goal/set-in-owner", json!({"params":{"objective":"goal"}})),
         ("/devtools/open", json!({})),
         ("/manager/open", json!({})),
         ("/manager/open-transient", json!({})),
@@ -108,6 +109,26 @@ async fn cdp_routes_are_wired_for_extensions() {
         "{}",
         result
     );
+}
+
+#[tokio::test]
+async fn thread_goal_route_preserves_payload_and_checks_the_live_enhancement_switch() {
+    let settings = Arc::new(FakeSettings::default());
+    let runtime = Arc::new(FakeRuntime::default());
+    let ctx = BridgeContext::new(settings.clone(), runtime.clone(), Arc::new(FakeData));
+    let payload = json!({
+        "hostId": "local", "threadId": "test-thread", "requestId": "goal-request",
+        "params": { "objective": "native goal", "appendTranscriptItem": false,
+            "threadSettings": { "model": "selected-model" } }
+    });
+    settings.settings.lock().unwrap().enhancements_enabled = false;
+    let disabled = handle_bridge_request(ctx.clone(), "/thread-goal/set-in-owner", payload.clone()).await;
+    assert_eq!(disabled["status"], "failed");
+    assert!(runtime.goal_payloads.lock().unwrap().is_empty());
+    settings.settings.lock().unwrap().enhancements_enabled = true;
+    let enabled = handle_bridge_request(ctx, "/thread-goal/set-in-owner", payload.clone()).await;
+    assert_eq!(enabled["status"], "ok");
+    assert_eq!(*runtime.goal_payloads.lock().unwrap(), vec![payload]);
 }
 
 #[tokio::test]
@@ -1399,6 +1420,7 @@ struct FakeRuntime {
     enabled: Mutex<bool>,
     script_enabled: Mutex<bool>,
     manager_payload: Mutex<Value>,
+    goal_payloads: Mutex<Vec<Value>>,
 }
 
 impl Default for FakeRuntime {
@@ -1407,12 +1429,18 @@ impl Default for FakeRuntime {
             enabled: Mutex::new(true),
             script_enabled: Mutex::new(true),
             manager_payload: Mutex::new(json!({})),
+            goal_payloads: Mutex::new(Vec::new()),
         }
     }
 }
 
 #[async_trait]
 impl BridgeRuntimeService for FakeRuntime {
+    async fn set_thread_goal_in_owner(&self, payload: Value) -> anyhow::Result<Value> {
+        self.goal_payloads.lock().unwrap().push(payload);
+        Ok(json!({"status": "ok"}))
+    }
+
     async fn user_script_inventory(&self) -> anyhow::Result<Value> {
         Ok(self.inventory(false))
     }

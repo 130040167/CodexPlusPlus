@@ -1087,6 +1087,7 @@
   }
 
   function ensureCodexModelWhitelistInstalls() {
+    installCodexThreadGoalForwarding();
     if (codexPlusModelUnlockEnabled()
         || codexPluginMarketplacePatchEnabled()
         || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())

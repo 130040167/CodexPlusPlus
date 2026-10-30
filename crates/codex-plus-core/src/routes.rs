@@ -103,6 +103,9 @@ pub trait BridgeRuntimeService: Send + Sync {
     async fn cdp_evaluate(&self, _payload: Value) -> anyhow::Result<Value> {
         anyhow::bail!("CDP evaluate is unavailable")
     }
+    async fn set_thread_goal_in_owner(&self, _payload: Value) -> anyhow::Result<Value> {
+        anyhow::bail!("会话目标转发暂不可用")
+    }
     /// 拉市场清单，并合并本地已安装状态。
     async fn script_market_list(&self) -> anyhow::Result<Value> {
         anyhow::bail!("script market is unavailable")
@@ -330,6 +333,11 @@ pub async fn handle_bridge_request(
         "/user-scripts/reload" => ctx.runtime.reload_user_scripts().await,
         "/cdp/targets" => ctx.runtime.cdp_targets().await,
         "/cdp/evaluate" => ctx.runtime.cdp_evaluate(payload.clone()).await,
+        "/thread-goal/set-in-owner" => match ctx.settings.get_settings().await {
+            Ok(settings) if settings.enhancements_enabled =>
+                ctx.runtime.set_thread_goal_in_owner(payload.clone()).await,
+            _ => Err(anyhow::anyhow!("Codex++ 增强已关闭")),
+        },
         "/devtools/open" => ctx.runtime.open_devtools().await,
         "/manager/open" => ctx.runtime.open_manager(payload.clone()).await,
         "/manager/open-transient" => ctx.runtime.open_transient_manager(payload.clone()).await,
@@ -714,6 +722,10 @@ impl BridgeRuntimeService for CoreRuntimeService {
 
     async fn cdp_evaluate(&self, payload: Value) -> anyhow::Result<Value> {
         evaluate_extension_cdp(self.debug_port, &payload).await
+    }
+
+    async fn set_thread_goal_in_owner(&self, payload: Value) -> anyhow::Result<Value> {
+        crate::native_thread_goal::set_in_owner(self.debug_port, payload).await
     }
 
     async fn open_devtools(&self) -> anyhow::Result<Value> {
