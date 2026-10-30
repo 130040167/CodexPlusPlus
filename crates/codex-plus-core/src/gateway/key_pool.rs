@@ -377,6 +377,15 @@ pub fn order_keys_with(
     (order.available, order.soonest)
 }
 
+/// 供应商是否正处于熔断中（只读，诊断与测试用）。
+pub fn breaker_open(relay_id: &str, now: Instant) -> bool {
+    lock()
+        .providers
+        .get(relay_id)
+        .and_then(|provider| provider.open_until)
+        .is_some_and(|open_until| open_until > now)
+}
+
 /// 暂时不可用的 Key 为什么不可用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitReason {

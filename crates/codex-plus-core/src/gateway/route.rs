@@ -1035,7 +1035,9 @@ fn resolve_plan_with(
                 .map(|item| item.remaining)
                 .or(cooling);
         } else {
+            // 熔断中的供应商已放行成候选：`cooling` 只在一个候选都没有时才有意义（#2761）。
             waiting_candidates.clear();
+            cooling = None;
         }
     }
     Ok(RoutePlan {
