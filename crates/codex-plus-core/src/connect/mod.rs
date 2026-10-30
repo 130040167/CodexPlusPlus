@@ -1,5 +1,6 @@
 pub mod app_server;
 pub mod controls;
+pub mod desktop_sync;
 mod inbox;
 pub mod media;
 pub mod outbound;
@@ -636,6 +637,7 @@ async fn process_weixin_message(
             )
             .await;
     }
+    let _ = desktop_sync::record(&thread_id, project.as_ref());
 
     let turn_result = {
         let turn = server.run_turn_with_reply_and_controls(
@@ -670,6 +672,7 @@ async fn process_weixin_message(
     } else {
         turn_result.reply.trim()
     };
+    let _ = desktop_sync::record(&thread_id, project.as_ref());
     let reply = if input.warnings.is_empty() {
         reply.to_owned()
     } else {
