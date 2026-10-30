@@ -164,28 +164,33 @@ describe("native thread goal forwarding", () => {
     assert.deepEqual(f.state.reports, []);
   });
 
-  it("only compensates the known ownership assertion when resume changes the role", async () => {
+  it("does not replay an uncertain owner failure when resume changes the role", async () => {
     const f = fixture();
     f.state.onResume = () => { f.state.role = "follower"; };
     await f.install();
-    assert.equal(await f.manager.setThreadGoal(threadId, { objective: "race" }), f.remoteGoal);
+    await assert.rejects(f.manager.setThreadGoal(threadId, { objective: "race" }), { message: ownerError });
     assert.equal(f.state.nativeCalls.length, 1);
-    assert.equal(f.state.forwards.length, 1);
+    assert.equal(f.state.forwards.length, 0);
     assert.deepEqual(f.state.events, ["native", "resume"]);
+    assert.equal(await f.manager.setThreadGoal(threadId, { objective: "retry" }), f.remoteGoal);
+    assert.equal(f.state.forwards.length, 1);
   });
 
   it("does not forward other errors or replay a write whose outcome is unknown", async () => {
-    for (const [message, finalRole] of [[ownerError, "owner"], ["Timeout after write", "follower"],
+    for (const [message, finalRole] of [[ownerError, "owner"], [ownerError, "follower"],
+      ["Timeout after write", "follower"],
       [`${ownerError} retry`, "follower"]]) {
       const f = fixture();
       const error = new Error(message);
       f.state.implementation = async () => {
+        f.state.events.push("goal-request");
         f.state.role = finalRole;
         throw error;
       };
       await f.install();
       await assert.rejects(f.manager.setThreadGoal(threadId, { objective: "failed" }), value => value === error);
       assert.equal(f.state.nativeCalls.length, 1, message);
+      assert.deepEqual(f.state.events, ["native", "goal-request"]);
       assert.equal(f.state.forwards.length, 0, message);
     }
   });
@@ -206,7 +211,7 @@ describe("native thread goal forwarding", () => {
 
   it("reports structured owner failures without retrying or calling the native method", async () => {
     for (const response of [{ status: "failed", code: "owner-unavailable", message: "owner not ready" },
-      { status: "ok" }, null]) {
+      null]) {
       const f = fixture();
       f.state.role = "follower";
       let calls = 0;
@@ -216,6 +221,18 @@ describe("native thread goal forwarding", () => {
       assert.equal(f.state.nativeCalls.length, 0);
       assert.equal(f.state.reports.length, 1);
       assert.equal(f.state.reports[0], response?.code || "goal-forward-failed");
+    }
+  });
+
+  it("preserves null or absent native results after a successful forward", async () => {
+    for (const [response, expected] of [[{ status: "ok", goal: null }, null],
+      [{ status: "ok" }, undefined]] as const) {
+      const f = fixture();
+      f.state.role = "follower";
+      await f.install({ forward: async () => response });
+      assert.equal(await f.manager.setThreadGoal(threadId, { objective: "" }), expected);
+      assert.equal(f.state.nativeCalls.length, 0);
+      assert.deepEqual(f.state.reports, []);
     }
   });
 
@@ -237,6 +254,8 @@ describe("native thread goal forwarding", () => {
     const wrapper = f.manager.setThreadGoal;
     vm.runInContext(runtimeSource, f.context);
     assert.equal(f.context.window.__codexPlusNativeThreadGoal, f.api);
+    f.context.document.getElementById = () => { throw new Error("unexpected React traversal"); };
+    vm.runInContext(`Function.prototype.toString = () => { throw new Error("unexpected export inspection"); };`, f.context);
     let forwards = 0;
     await f.install({ forward: async () => { forwards += 1; return { status: "ok", goal: f.goal }; } });
     assert.equal(f.manager.setThreadGoal, wrapper);
@@ -246,9 +265,75 @@ describe("native thread goal forwarding", () => {
     assert.equal(f.state.nativeCalls.length, 0);
     assert.equal(f.state.loads, 1);
   });
+
+  it("rediscovers a manager when it is disposed or the host or thread changes", async () => {
+    const f = fixture();
+    f.state.role = "follower";
+    await f.install();
+
+    function replacementManager(activeThread: string) {
+      return new class {
+        disposed = false;
+        getHostId() { return f.state.hostId; }
+        getConversation(id: string) { return id === activeThread ? { id } : null; }
+        getStreamRole() { return { role: f.state.role }; }
+        async setThreadGoal(_id: string, _params: { objective: string }) {
+          throw new Error("unpatched replacement manager");
+        }
+      }();
+    }
+
+    f.manager.disposed = true;
+    const replacement = replacementManager(threadId);
+    f.state.manager = replacement;
+    assert.equal(await f.install(), true);
+    assert.equal(await replacement.setThreadGoal(threadId, { objective: "replacement" }), f.remoteGoal);
+
+    f.state.hostId = "remote";
+    const otherHostManager = replacementManager(threadId);
+    f.state.manager = otherHostManager;
+    assert.equal(await f.api.install(threadId, { ...f.options, hostId: "remote" }), true);
+    assert.equal(await otherHostManager.setThreadGoal(threadId, { objective: "host" }), f.remoteGoal);
+
+    const otherThreadManager = replacementManager("other-thread");
+    f.state.manager = otherThreadManager;
+    assert.equal(await f.api.install("other-thread", { ...f.options, hostId: "remote" }), true);
+    assert.equal(await otherThreadManager.setThreadGoal("other-thread", { objective: "thread" }), f.remoteGoal);
+    assert.equal(f.state.forwards.length, 3);
+    assert.deepEqual(f.state.forwards.map(({ hostId, threadId }: any) => ({ hostId, threadId })), [
+      { hostId, threadId },
+      { hostId: "remote", threadId },
+      { hostId: "remote", threadId: "other-thread" },
+    ]);
+    assert.equal(f.state.loads, 1);
+  });
 });
 
 describe("native thread goal discovery and execution", () => {
+  it("refuses ambiguous getters before calling them or inspecting React state", async () => {
+    const f = fixture();
+    let calls = 0;
+    function lookalike(e: any, t: string) {
+      calls += 1;
+      if (!t) return null;
+      return e.get({}).find((candidate: any) => candidate.getConversation(t));
+    }
+    f.module.lookalike = lookalike;
+    f.context.document.getElementById = () => { throw new Error("unexpected React traversal"); };
+    await assert.rejects(f.install(), { message: "goal-native-getter-ambiguous" });
+    await assert.rejects(f.api.probe({ threadId, hostId }), { message: "goal-native-getter-ambiguous" });
+    assert.equal(calls, 0);
+    assert.equal(f.state.nativeCalls.length, 0);
+    assert.deepEqual(f.state.reports, ["goal-native-getter-ambiguous"]);
+  });
+
+  it("allows multiple export names for the same getter function", async () => {
+    const f = fixture();
+    f.module.sameGetter = f.module.renamedGetter;
+    assert.equal(await f.install(), true);
+    assert.equal((await f.api.probe({ threadId, hostId })).status, "owner");
+  });
+
   it("skips exports whose instrumented function serialization throws", async () => {
     const f = fixture();
     const blocked = () => {};

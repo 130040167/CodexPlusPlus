@@ -7,15 +7,7 @@ struct GoalRequest {
     host_id: String,
     thread_id: String,
     request_id: String,
-    params: GoalParams,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct GoalParams {
-    objective: String,
-    append_transcript_item: Option<bool>,
-    thread_settings: Option<Value>,
+    params: Value,
 }
 
 fn validate_request(payload: &Value) -> anyhow::Result<()> {
@@ -23,15 +15,8 @@ fn validate_request(payload: &Value) -> anyhow::Result<()> {
     for value in [&request.host_id, &request.thread_id, &request.request_id] {
         anyhow::ensure!(!value.trim().is_empty() && value.len() <= 256, "无效的会话目标标识");
     }
-    anyhow::ensure!(
-        !request.params.objective.trim().is_empty() && request.params.objective.len() <= 100_000,
-        "目标内容不能为空或过长"
-    );
-    anyhow::ensure!(
-        request.params.thread_settings.as_ref().is_none_or(|value| value.is_object() || value.is_null()),
-        "无效的会话设置"
-    );
-    let _ = request.params.append_transcript_item;
+    // 参数由原生接口解释，避免拦截清空目标或未来新增字段。
+    anyhow::ensure!(request.params.is_object(), "无效的会话目标参数");
     Ok(())
 }
 
@@ -45,9 +30,10 @@ fn is_app_window(target: &crate::cdp::CdpTarget) -> bool {
 
 async fn evaluate(websocket: &str, method: &str, payload: &Value) -> anyhow::Result<Value> {
     // 原始 Runtime.evaluate 默认不序列化对象；异步完成后显式编码，不能把 Promise 当成功。
+    let argument = serde_json::to_string(&payload.to_string())?;
     let script = format!(
-        "{}\n;(async()=>JSON.stringify(await window.__codexPlusNativeThreadGoal.{}({})))()",
-        crate::assets::NATIVE_THREAD_GOAL_SCRIPT, method, payload,
+        "{}\n;(async()=>JSON.stringify(await window.__codexPlusNativeThreadGoal.{}(JSON.parse({}))))()",
+        crate::assets::NATIVE_THREAD_GOAL_SCRIPT, method, argument,
     );
     let timeout = std::time::Duration::from_secs(if method == "execute" { 20 } else { 3 });
     let response = crate::bridge::evaluate_script_with_timeout(websocket, &script, true, timeout).await?;
@@ -187,9 +173,10 @@ mod tests {
                         "await window.__codexPlusNativeThreadGoal."
                     ).unwrap().1;
                     let (operation, arguments) = call.split_once('(').unwrap();
-                    let payload = serde_json::from_str(
-                        arguments.strip_suffix(")))()").unwrap()
-                    ).unwrap();
+                    let encoded = arguments.strip_prefix("JSON.parse(").unwrap()
+                        .strip_suffix("))))()").unwrap();
+                    let json_text: String = serde_json::from_str(encoded).unwrap();
+                    let payload = serde_json::from_str(&json_text).unwrap();
                     observed.lock().unwrap().push(ObservedCommand {
                         target: target.to_string(),
                         operation: operation.to_string(),
@@ -295,7 +282,10 @@ mod tests {
         let fixture = FakeCdp::start(vec![
             window("main", "follower"), spotlight, external,
         ]).await;
-        let payload = goal_payload();
+        let mut payload = goal_payload();
+        payload["params"]["objective"] = json!("");
+        payload["params"]["futureOptions"] = json!({"nested": [true, null, "value"]});
+        payload["params"]["__proto__"] = json!({"keep": "own property"});
         assert_eq!(
             set_in_owner(fixture.port, payload.clone()).await.unwrap(),
             json!({ "ok": true }),
@@ -378,14 +368,25 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_goal_parameters() {
+    fn accepts_extensible_goal_parameters_but_validates_the_envelope() {
         let payload = json!({"hostId":"local","threadId":"thread","requestId":"request",
             "params":{"objective":"test","appendTranscriptItem":false,"threadSettings":null}});
         assert!(validate_request(&payload).is_ok());
+        for params in [
+            json!({"objective":""}),
+            json!({"objective":null,"newField":{"nested":[1, true, null]}}),
+            json!({"futureField":42,"threadSettings":[]}),
+            json!({}),
+        ] {
+            let mut extended = payload.clone();
+            extended["params"] = params;
+            assert!(validate_request(&extended).is_ok());
+        }
         for invalid in [
-            json!({"params":{"objective":""}}),
-            json!({"hostId":"local","threadId":"thread","requestId":"request",
-                "params":{"objective":"test","threadSettings":[]}}),
+            json!({"params":{"objective":"test"}}),
+            json!({"hostId":"local","threadId":"thread","requestId":"request","params":[]}),
+            json!({"hostId":"local","threadId":"thread","requestId":"request","params":null}),
+            json!({"hostId":"  ","threadId":"thread","requestId":"request","params":{}}),
         ] {
             assert!(validate_request(&invalid).is_err());
         }

@@ -5,6 +5,8 @@
   const requests = new Map();
   let modulePromise = null;
   let adapters = null;
+  let installedFor = null;
+  let reportedAmbiguousGetter = false;
 
   async function nativeModule() {
     if (!modulePromise) {
@@ -61,15 +63,25 @@
   async function managerFor(threadId, hostId) {
     const module = await nativeModule();
     // 已验证的原生 getter：按 thread 查 host，再从该 AppScope 的 managers 中查找。
-    const getters = Object.values(module).filter(value => {
+    const getters = [...new Set(Object.values(module).filter(value => {
       if (typeof value !== "function") return false;
       try {
         const source = Function.prototype.toString.call(value);
         return source.includes(".getConversation(") && source.includes(".find(")
           && source.includes(".get(") && source.includes("return null");
       } catch { return false; }
-    });
-    for (const scope of appScopes(module)) for (const getter of getters) {
+    }))];
+    if (getters.length > 1) {
+      if (!reportedAmbiguousGetter) {
+        reportedAmbiguousGetter = true;
+        try { adapters?.report?.("goal-native-getter-ambiguous"); } catch {}
+        root.console?.warn?.("[Codex++] Native thread goal getter is ambiguous.");
+      }
+      throw new Error("goal-native-getter-ambiguous");
+    }
+    if (!getters.length) return null;
+    const getter = getters[0];
+    for (const scope of appScopes(module)) {
       let manager;
       try { manager = getter(scope, threadId); } catch { continue; }
       if (manager && manager.disposed !== true && typeof manager.setThreadGoal === "function"
@@ -121,10 +133,20 @@
 
   async function install(threadId, options) {
     adapters = options;
+    if (installedFor?.threadId === threadId && installedFor.hostId === options.hostId
+        && installedFor.manager.disposed !== true) {
+      try {
+        if (installedFor.manager.getHostId() === options.hostId
+            && installedFor.manager.getConversation(threadId)) return true;
+      } catch {}
+    }
     const manager = await managerFor(threadId, options.hostId);
     if (!manager) return false;
     const proto = Object.getPrototypeOf(manager);
-    if (patches.has(proto)) return true;
+    if (patches.has(proto)) {
+      installedFor = { threadId, hostId: options.hostId, manager };
+      return true;
+    }
     const descriptor = Object.getOwnPropertyDescriptor(proto, "setThreadGoal");
     if (!descriptor?.writable || typeof descriptor.value !== "function") return false;
     const original = descriptor.value;
@@ -134,22 +156,18 @@
         const result = await adapters.forward({
           threadId: id, hostId: this.getHostId(), requestId: crypto.randomUUID(), params,
         });
-        if (result?.status !== "ok" || !result.goal) {
+        if (result?.status !== "ok") {
           adapters.report(result?.code || "goal-forward-failed");
           throw new Error(result?.message || "会话所在窗口暂不可用，请稍后重试设置目标");
         }
         return result.goal;
       };
       if (this.getStreamRole(id)?.role === "follower") return forward();
-      try { return await original.call(this, id, params); }
-      catch (error) {
-        // 仅补偿 resume 期间转为 follower 的已知断言；它发生在任何目标写入之前。
-        if (error?.message === "Please continue this conversation on the window where it was started."
-            && this.getStreamRole(id)?.role === "follower") return forward();
-        throw error;
-      }
+      // 原生调用失败后不能确认是否已经写入，不能按错误文案自动重试。
+      return original.call(this, id, params);
     };
     patches.set(proto, { original });
+    installedFor = { threadId, hostId: options.hostId, manager };
     return true;
   }
 
