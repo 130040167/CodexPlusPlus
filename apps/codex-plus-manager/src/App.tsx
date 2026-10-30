@@ -295,6 +295,7 @@ import {
   multiLaunchInstanceLabel as formatMultiLaunchInstanceLabel,
   multiLaunchInstanceRunning,
   multiLaunchInstanceStatus,
+  multiLaunchInstanceVisible,
   runningInstancesForProfile,
   type MultiLaunchInstance,
 } from "./multi-launch-model";
@@ -2799,7 +2800,7 @@ export function App() {
         // 界面要给出「启动失败 + 原因」，只留运行中的会让它彻底消失。
         setMultiLaunchInstances(
           Array.isArray(result.instances)
-            ? result.instances.filter((instance) => multiLaunchInstanceStatus(instance) !== "stopped")
+            ? result.instances.filter(multiLaunchInstanceVisible)
             : [],
         );
         if (!silent && !isSuccessStatus(result.status)) showNotice(t("当前运行实例"), result.message, result.status);
