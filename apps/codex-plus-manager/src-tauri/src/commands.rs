@@ -1219,39 +1219,32 @@ fn launch_codex_multi_instance_blocking(request: CodexMultiLaunchRequest) -> Com
         );
     }
 
-    // 官方 profile 通常没有 authContents；复制一次当前默认 CODEX_HOME 的登录态，
-    // 用户也可以在新窗口中重新登录。纯 API 实例不复制官方 auth，避免两个身份
-    // 重新混在一起。永远不覆盖实例已有 auth.json。
     let default_home = codex_plus_core::relay_config::default_codex_home_dir();
-    let instance_auth = codex_home.join("auth.json");
-    if profile.relay_mode == codex_plus_core::settings::RelayMode::Official
-        && !instance_auth.exists()
-    {
-        let default_auth = default_home.join("auth.json");
-        if let Ok(contents) = std::fs::read(&default_auth) {
-            let _ = codex_plus_core::settings::atomic_write(&instance_auth, &contents);
-        }
-    }
     let common_config = if settings.relay_profiles_enabled {
         settings.relay_common_config_contents.as_str()
     } else {
         ""
     };
-    if let Err(error) = codex_plus_core::relay_config::apply_relay_profile_with_preservation(
+    // 纯 API 实例写入的是去掉 ChatGPT 登录态后的 profile（#2794），worker 设置也用它。
+    let profile = match write_multi_instance_codex_home(
         &codex_home,
+        &default_home,
         &profile,
         common_config,
         helper_port,
         settings.relay_preserve_nonprovider_settings,
     ) {
-        return failed(
-            &format!("应用供应商到多开实例失败：{error}"),
-            json!({
-                "profileId": profile_id,
-                "codexHome": codex_home.to_string_lossy()
-            }),
-        );
-    }
+        Ok(profile) => profile,
+        Err(error) => {
+            return failed(
+                &format!("应用供应商到多开实例失败：{error}"),
+                json!({
+                    "profileId": profile_id,
+                    "codexHome": codex_home.to_string_lossy()
+                }),
+            );
+        }
+    };
     if let Err(error) = absolutize_multi_instance_model_catalog(&codex_home) {
         return failed(
             &format!("修正多开实例 model_catalog_json 路径失败：{error}"),
@@ -2176,6 +2169,43 @@ fn absolutize_multi_instance_model_catalog(home: &Path) -> anyhow::Result<()> {
     doc["model_catalog_json"] = toml_edit::value(absolute.to_string_lossy().to_string());
     codex_plus_core::settings::atomic_write(&config_path, doc.to_string().as_bytes())?;
     Ok(())
+}
+
+/// 把供应商写进多开实例自己的 CODEX_HOME，返回实际写入的 profile。
+///
+/// - 官方登录（含官方 + API 混合）：实例还没有 auth.json 时复制一次主实例的登录态，
+///   用户也可以在新窗口里重新登录；永远不覆盖实例已有 auth.json。
+/// - 纯 API（#2794）：不复制主实例的 auth，并且先经
+///   `pure_api_profile_for_isolated_instance` 去掉快照里残留的 ChatGPT 登录态、把
+///   `openai` 会话身份改回 `custom`。否则实例会以主进程的官方账号登录、消耗官方额度。
+///
+/// 只读主实例的 `default_home`，不改动它。
+fn write_multi_instance_codex_home(
+    codex_home: &Path,
+    default_home: &Path,
+    profile: &RelayProfile,
+    common_config: &str,
+    helper_port: u16,
+    preserve_nonprovider: bool,
+) -> anyhow::Result<RelayProfile> {
+    let instance_auth = codex_home.join("auth.json");
+    if profile.relay_mode == codex_plus_core::settings::RelayMode::Official
+        && !instance_auth.exists()
+    {
+        let default_auth = default_home.join("auth.json");
+        if let Ok(contents) = std::fs::read(&default_auth) {
+            let _ = codex_plus_core::settings::atomic_write(&instance_auth, &contents);
+        }
+    }
+    let profile = codex_plus_core::relay_config::pure_api_profile_for_isolated_instance(profile)?;
+    codex_plus_core::relay_config::apply_relay_profile_with_preservation(
+        codex_home,
+        &profile,
+        common_config,
+        helper_port,
+        preserve_nonprovider,
+    )?;
+    Ok(profile)
 }
 
 fn seed_multi_instance_onboarding_state(home: &Path) -> anyhow::Result<()> {
@@ -12145,6 +12175,81 @@ model_reasoning_effort = "high"
         assert!(first > 0);
         assert!(second > 0);
         assert_ne!(first, second);
+    }
+
+    const MAIN_CHATGPT_AUTH: &str = "{\n  \"auth_mode\": \"chatgpt\",\n  \"tokens\": {\n    \"id_token\": \"main-id\",\n    \"access_token\": \"main-access\",\n    \"refresh_token\": \"main-refresh\",\n    \"account_id\": \"acct-main\"\n  },\n  \"last_refresh\": \"2026-10-01T00:00:00Z\"\n}\n";
+
+    #[test]
+    fn multi_instance_pure_api_does_not_inherit_main_chatgpt_login() {
+        // issue #2794：主实例官方登录，用纯 API 供应商多开，实例只能用供应商 Key。
+        let temp = tempfile::tempdir().unwrap();
+        let main_home = temp.path().join("main-codex");
+        let instance_home = temp.path().join("instance/codex-home");
+        std::fs::create_dir_all(&main_home).unwrap();
+        std::fs::create_dir_all(&instance_home).unwrap();
+        std::fs::write(main_home.join("auth.json"), MAIN_CHATGPT_AUTH).unwrap();
+        std::fs::write(main_home.join("config.toml"), "model = \"gpt-5.5\"\n").unwrap();
+        // 旧版本留在实例里的官方登录态也要被换掉。
+        std::fs::write(instance_home.join("auth.json"), MAIN_CHATGPT_AUTH).unwrap();
+        // 从官方 profile 改成纯 API 时，快照会留着 ChatGPT tokens；会话身份选的是 openai。
+        let mut snapshot: Value = serde_json::from_str(MAIN_CHATGPT_AUTH).unwrap();
+        snapshot["OPENAI_API_KEY"] = json!("sk-relay");
+        let profile = RelayProfile {
+            id: "relay".into(),
+            name: "中转".into(),
+            relay_mode: RelayMode::PureApi,
+            protocol: codex_plus_core::settings::RelayProtocol::Responses,
+            config_contents: "model_provider = \"openai\"\nmodel = \"gpt-5.5\"\nopenai_base_url = \"http://127.0.0.1:57321/v1\"\n\n[model_providers.custom]\nname = \"中转\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nbase_url = \"https://relay.example.com/v1\"\nexperimental_bearer_token = \"sk-relay\"\n".into(),
+            auth_contents: serde_json::to_string_pretty(&snapshot).unwrap(),
+            api_key: "sk-relay".into(),
+            ..RelayProfile::default()
+        };
+
+        let written =
+            write_multi_instance_codex_home(&instance_home, &main_home, &profile, "", 61234, false)
+                .unwrap();
+
+        let auth: Value =
+            serde_json::from_str(&std::fs::read_to_string(instance_home.join("auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(auth, json!({ "OPENAI_API_KEY": "sk-relay" }));
+        let config = std::fs::read_to_string(instance_home.join("config.toml")).unwrap();
+        let doc = config.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(doc["model_provider"].as_str(), Some("custom"), "{config}");
+        assert!(doc.get("openai_base_url").is_none(), "{config}");
+        let provider = &doc["model_providers"]["custom"];
+        assert_eq!(provider["base_url"].as_str(), Some("https://relay.example.com/v1"));
+        assert_eq!(provider["experimental_bearer_token"].as_str(), Some("sk-relay"));
+        assert_ne!(provider.get("requires_openai_auth").and_then(|v| v.as_bool()), Some(true));
+        assert!(!written.auth_contents.contains("tokens"));
+        // 主实例的登录态原样保留。
+        assert_eq!(
+            std::fs::read_to_string(main_home.join("auth.json")).unwrap(),
+            MAIN_CHATGPT_AUTH
+        );
+    }
+
+    #[test]
+    fn multi_instance_official_profile_still_copies_main_login() {
+        let temp = tempfile::tempdir().unwrap();
+        let main_home = temp.path().join("main-codex");
+        let instance_home = temp.path().join("instance/codex-home");
+        std::fs::create_dir_all(&main_home).unwrap();
+        std::fs::create_dir_all(&instance_home).unwrap();
+        std::fs::write(main_home.join("auth.json"), MAIN_CHATGPT_AUTH).unwrap();
+        let profile = RelayProfile {
+            id: "official".into(),
+            relay_mode: RelayMode::Official,
+            ..RelayProfile::default()
+        };
+
+        write_multi_instance_codex_home(&instance_home, &main_home, &profile, "", 61235, false)
+            .unwrap();
+
+        let auth: Value =
+            serde_json::from_str(&std::fs::read_to_string(instance_home.join("auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(auth["tokens"]["account_id"], json!("acct-main"));
     }
 
     #[test]

@@ -823,6 +823,57 @@ pub fn apply_relay_profile_with_preservation(
     apply_relay_profile_to_home_with_switch_rules_and_proxy_port(home, &effective, common, proxy_port)
 }
 
+/// 多开实例专用（issue #2794）：把纯 API 供应商整理成「只用供应商 Key」的形态。
+///
+/// 主实例切到纯 API 时会保留 live 的 ChatGPT 登录态（#2173，CUA 插件靠它），profile
+/// 快照里也可能留着从官方 profile 改过来时的 `tokens` / `auth_mode`。这些原样写进多开
+/// 实例的 auth.json，实例就以官方账号登录；会话身份为 `openai` 时 `openai_base_url`
+/// 指向的还是主进程的本地代理（端口按主进程算），主进程按它自己的官方登录转发，结果
+/// 消耗官方额度、调不到供应商。多开实例要与主实例互不干扰，所以这里：
+/// - auth.json 只保留 `OPENAI_API_KEY`（与 `apply_pure_api_config_to_home_*` 的写法一致）；
+/// - 会话身份 `openai` 改回 `custom`，并去掉 `openai_base_url`；
+/// - 当前 provider 的 `requires_openai_auth` 置为 false，不让 Codex 去读账号登录态。
+///
+/// 非纯 API 的 profile（官方登录、官方 + API 混合）原样返回，行为不变。
+pub fn pure_api_profile_for_isolated_instance(
+    profile: &RelayProfile,
+) -> anyhow::Result<RelayProfile> {
+    let mut profile = profile.clone();
+    if profile.relay_mode != RelayMode::PureApi {
+        return Ok(profile);
+    }
+    // 与写进 `experimental_bearer_token` 的是同一把 Key（当前选中的 Key 优先）；
+    // 免 Key 供应商返回空串，auth.json 写空对象。
+    let api_key = relay_profile_api_key(&profile);
+    let auth = if api_key.is_empty() {
+        json!({})
+    } else {
+        json!({ "OPENAI_API_KEY": api_key })
+    };
+    profile.auth_contents = format!("{}\n", serde_json::to_string_pretty(&auth)?);
+
+    if !profile.config_contents.trim().is_empty() {
+        let mut doc = parse_toml_document(&profile.config_contents)?;
+        if active_provider_id(&doc).as_deref() == Some("openai") {
+            // `openai` 会话身份下真正的传输 provider 就是 `custom`（见补全逻辑）。
+            set_provider_id(&mut doc, RELAY_PROVIDER);
+            doc.as_table_mut().remove(OPENAI_BASE_URL_KEY);
+        }
+        let provider_id = active_or_default_provider_id(&doc);
+        if let Some(provider) = doc
+            .get_mut("model_providers")
+            .and_then(Item::as_table_like_mut)
+            .and_then(|providers| providers.get_mut(&provider_id))
+            .and_then(Item::as_table_like_mut)
+            && provider.get("requires_openai_auth").is_some()
+        {
+            provider.insert("requires_openai_auth", toml_edit::value(false));
+        }
+        profile.config_contents = ensure_trailing_newline(doc.to_string());
+    }
+    Ok(profile)
+}
+
 pub fn preserve_live_nonprovider_settings(home: &Path, config: &str) -> anyhow::Result<String> {
     let mut target = parse_toml_document(config)?;
     let live = read_optional_text(&home.join("config.toml"))?;
