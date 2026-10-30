@@ -23,6 +23,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// app-server 起不来时保留多少行 stderr 用于报错。
 const STDERR_TAIL_LINES: usize = 8;
 const TURN_TIMEOUT: Duration = Duration::from_secs(600);
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_PENDING_TURN_MESSAGES: usize = 256;
 
 #[derive(Debug)]
@@ -69,7 +70,7 @@ pub struct AppServerTurnResult {
 
 pub struct CodexAppServer {
     child: Child,
-    stdin: tokio::process::ChildStdin,
+    stdin: Option<tokio::process::ChildStdin>,
     stdout: Lines<BufReader<ChildStdout>>,
     next_id: u64,
     running: bool,
@@ -290,7 +291,7 @@ impl CodexAppServer {
 
         let mut server = Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             stdout: BufReader::new(stdout).lines(),
             next_id: 1,
             running: true,
@@ -379,6 +380,17 @@ impl CodexAppServer {
                 params.as_object_mut().unwrap().remove("projectId");
                 params.as_object_mut().unwrap().remove("dynamicTools");
                 self.request(method, params, REQUEST_TIMEOUT).await?
+            }
+            Err(error)
+                if method == "thread/resume"
+                    && error.downcast_ref::<RpcFailure>().is_some_and(|failure| {
+                        failure.message.contains("already has an active writer")
+                    }) =>
+            {
+                bail!(
+                    "原会话正由其他应用占用，请先在该应用中关闭会话；若仍占用则退出该应用后重新发送。\
+                     原会话映射已保留，未启动新回合"
+                );
             }
             result => result?,
         };
@@ -642,11 +654,49 @@ impl CodexAppServer {
             .await
     }
 
+    pub async fn run_turn_and_release(
+        &mut self,
+        thread_id: &str,
+        prompt: &str,
+        channel: Option<SessionControlChannel<'_>>,
+    ) -> anyhow::Result<AppServerTurnResult> {
+        self.run_turn_with_images_and_release(thread_id, prompt, &[], None, channel)
+            .await
+    }
+
+    pub(super) async fn run_turn_with_images_and_release(
+        &mut self,
+        thread_id: &str,
+        prompt: &str,
+        image_paths: &[PathBuf],
+        reply_channel: Option<WeixinReplyChannel<'_>>,
+        channel: Option<SessionControlChannel<'_>>,
+    ) -> anyhow::Result<AppServerTurnResult> {
+        let result = self
+            .run_turn_with_reply_and_controls(
+                thread_id,
+                prompt,
+                image_paths,
+                reply_channel,
+                channel,
+            )
+            .await;
+        // unsubscribe 不保证释放跨进程写租约；仅退出本连接创建的独立 peer。
+        self.close().await;
+        result
+    }
+
     pub async fn close(&mut self) {
         self.running = false;
-        let _ = self.stdin.shutdown().await;
-        let _ = self.child.start_kill();
-        let _ = self.child.wait().await;
+        // ChildStdin::shutdown 在 Windows 上不关闭句柄，必须 drop 才能送达 EOF。
+        drop(self.stdin.take());
+        if !matches!(
+            tokio::time::timeout(CLOSE_TIMEOUT, self.child.wait()).await,
+            Ok(Ok(_))
+        ) {
+            let _ = self.child.start_kill();
+            let _ = self.child.wait().await;
+        }
     }
 
     async fn initialize(&mut self) -> anyhow::Result<()> {
@@ -917,11 +967,15 @@ impl CodexAppServer {
     async fn write_json(&mut self, value: &Value) -> anyhow::Result<()> {
         let mut bytes = serde_json::to_vec(value)?;
         bytes.push(b'\n');
-        self.stdin
+        let stdin = self
+            .stdin
+            .as_mut()
+            .context("Codex app-server stdin 已关闭")?;
+        stdin
             .write_all(&bytes)
             .await
             .context("写入 Codex app-server 失败")?;
-        self.stdin.flush().await?;
+        stdin.flush().await?;
         Ok(())
     }
 
@@ -1292,6 +1346,7 @@ mod tests {
                 "--nocapture",
             ])
             .env("CODEX_PLUS_SESSION_FIXTURE", mode)
+            .env("CODEX_PLUS_SESSION_FIXTURE_ROOT", root)
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1301,7 +1356,7 @@ mod tests {
         command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
         let mut child = command.spawn().unwrap();
         CodexAppServer {
-            stdin: child.stdin.take().unwrap(),
+            stdin: child.stdin.take(),
             stdout: BufReader::new(child.stdout.take().unwrap()).lines(),
             child,
             next_id: 1,
@@ -1388,6 +1443,11 @@ mod tests {
                         "sandbox":{"type":"readOnly"}}}));
                 }
                 Some("thread/resume") => {
+                    if mode == "release-busy" {
+                        emit(json!({"id":id,"error":{"code":-32600,
+                            "message":"thread original already has an active writer"}}));
+                        continue;
+                    }
                     if mode == "resume-failed" {
                         emit(
                             json!({"id":id,"error":{"code":-32000,"message":"thread unavailable"}}),
@@ -1416,6 +1476,16 @@ mod tests {
                     );
                 }
                 Some("turn/start") => {
+                    assert_ne!(mode, "release-busy", "占用中的原线程不能开始回合");
+                    if mode == "release-images" {
+                        assert_eq!(params["input"][1]["type"], "localImage");
+                        assert!(
+                            params["input"][1]["path"]
+                                .as_str()
+                                .unwrap()
+                                .ends_with("fixture.png")
+                        );
+                    }
                     turns += 1;
                     let turn = format!("t{turns}");
                     assert_eq!(params["model"], "fixture");
@@ -1440,6 +1510,18 @@ mod tests {
                         );
                     }
                     emit(json!({"id":id,"result":{"turn":{"id":turn}}}));
+                    if mode.starts_with("release-") {
+                        let root = std::env::var_os("CODEX_PLUS_SESSION_FIXTURE_ROOT").unwrap();
+                        std::fs::write(Path::new(&root).join("active"), "active").unwrap();
+                        std::thread::sleep(Duration::from_millis(200));
+                        if mode == "release-failed" {
+                            emit(json!({"method":"turn/completed","params":{
+                                "threadId":"original","turn":{"id":turn,"status":"failed",
+                                "error":{"message":"fixture failure"}}
+                            }}));
+                            continue;
+                        }
+                    }
                     if turns > 1 || mode != "settings" {
                         complete(&turn);
                     }
@@ -1512,6 +1594,116 @@ mod tests {
                 _ => panic!("Unexpected request: {message}"),
             }
         }
+        if mode.starts_with("release-") {
+            let root = std::env::var_os("CODEX_PLUS_SESSION_FIXTURE_ROOT").unwrap();
+            std::fs::write(Path::new(&root).join("exited"), "stdin EOF").unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_peer_exits_after_completed_or_failed_turn_without_unsubscribe_rpc() {
+        for mode in ["release-current", "release-failed"] {
+            let root = tempfile::tempdir().unwrap();
+            let mut server = fixture_server(root.path(), mode);
+            server.initialize().await.unwrap();
+            let thread = server.prepare_thread(Some("original")).await.unwrap();
+            let monitor = async {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while !root.path().join("active").exists() {
+                    assert!(tokio::time::Instant::now() < deadline);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert!(!root.path().join("exited").exists());
+            };
+            let (result, ()) = tokio::join!(
+                server.run_turn_and_release(&thread, "local fixture only", None),
+                monitor
+            );
+            assert_eq!(result.is_err(), mode == "release-failed");
+            assert!(!server.is_running());
+            assert!(server.child.try_wait().unwrap().unwrap().success());
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("exited")).unwrap(),
+                "stdin EOF"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_peer_releases_without_requiring_new_rpcs() {
+        let root = tempfile::tempdir().unwrap();
+        let mut server = fixture_server(root.path(), "legacy");
+        server.initialize().await.unwrap();
+        let thread = server.prepare_thread(Some("original")).await.unwrap();
+        assert_eq!(
+            server
+                .run_turn_and_release(&thread, "legacy", None)
+                .await
+                .unwrap()
+                .reply,
+            "checked"
+        );
+        assert!(!server.is_running());
+        assert!(server.child.try_wait().unwrap().unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn images_and_session_controls_share_the_releasing_turn() {
+        use super::super::controls::{SessionOptions, SessionOptionsStore};
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionOptionsStore::test_store(root.path().join("settings.json"), "peer");
+        let defaults = SessionOptions::default();
+        let mut server = fixture_server(root.path(), "release-images");
+        server.initialize().await.unwrap();
+        let thread = server.prepare_thread(Some("original")).await.unwrap();
+        let result = server
+            .run_turn_with_images_and_release(
+                &thread,
+                "caption",
+                &[root.path().join("fixture.png")],
+                None,
+                Some(SessionControlChannel {
+                    options_store: &store,
+                    defaults: &defaults,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.reply, "checked");
+        assert!(server.child.try_wait().unwrap().unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn next_owned_peer_resumes_the_original_thread() {
+        let root = tempfile::tempdir().unwrap();
+        for _ in 0..2 {
+            let mut server = fixture_server(root.path(), "release-current");
+            server.initialize().await.unwrap();
+            let thread = server.prepare_thread(Some("original")).await.unwrap();
+            assert_eq!(thread, "original");
+            assert_eq!(
+                server
+                    .run_turn_and_release(&thread, "next message", None)
+                    .await
+                    .unwrap()
+                    .reply,
+                "checked"
+            );
+            assert!(server.child.try_wait().unwrap().unwrap().success());
+        }
+    }
+
+    #[tokio::test]
+    async fn external_writer_is_not_reset_replaced_or_started() {
+        let root = tempfile::tempdir().unwrap();
+        let mut server = fixture_server(root.path(), "release-busy");
+        server.initialize().await.unwrap();
+        let error = server.prepare_thread(Some("original")).await.unwrap_err();
+        assert!(error.to_string().contains("其他应用占用"));
+        assert!(error.to_string().contains("原会话映射已保留，未启动新回合"));
+        assert!(!root.path().join("active").exists());
+        server.close().await;
+        assert!(server.child.try_wait().unwrap().unwrap().success());
     }
 
     #[tokio::test]
@@ -1584,7 +1776,7 @@ mod tests {
             let stdout = child.stdout.take().unwrap();
             let mut server = CodexAppServer {
                 child,
-                stdin,
+                stdin: Some(stdin),
                 stdout: BufReader::new(stdout).lines(),
                 next_id: 1,
                 running: true,

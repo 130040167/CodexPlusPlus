@@ -326,6 +326,10 @@ pub async fn run_weixin_connect_with_outbound(
             )
             .await;
 
+            if let Some(mut server) = app_server.take() {
+                server.close().await;
+            }
+
             if stop.load(Ordering::SeqCst) {
                 app_server = None;
                 break;
@@ -614,7 +618,7 @@ async fn process_weixin_message(
             allow_attachments,
         )
         .await
-        .with_context(|| "原会话映射已保留，可在微信连接设置中填写联系人并显式重置后重试")?;
+        .map_err(|error| anyhow::anyhow!("无法准备微信会话，原映射已保留：{error}"))?;
     state
         .thread_ids
         .insert(message.from_user_id.clone(), thread_id.clone());
@@ -640,7 +644,7 @@ async fn process_weixin_message(
     let _ = desktop_sync::record(&thread_id, project.as_ref());
 
     let turn_result = {
-        let turn = server.run_turn_with_reply_and_controls(
+        let turn = server.run_turn_with_images_and_release(
             &thread_id,
             &input.prompt,
             &input.image_paths,
