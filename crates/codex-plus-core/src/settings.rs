@@ -757,17 +757,14 @@ pub const AGENT_PET_MIN_SIZE: u32 = 64;
 pub const AGENT_PET_MAX_SIZE: u32 = 240;
 const AGENT_PET_DEFAULT_SIZE: u32 = 112;
 const AGENT_PET_DEFAULT_VOLUME: f64 = 0.6;
-/// 已移除的旧用量挂件开关；只在迁移时读取，保存时不再写出。
+/// 桌宠类型：图库 / 自定义图片的简单桌宠（默认）。
+pub const AGENT_PET_KIND_IMAGE: &str = "image";
+/// 桌宠类型：完整的旧版「大肥鱼」（DeepSeek 鲸鱼）用量挂件，含余额、价格 / 用量统计、泡泡与音效。
+pub const AGENT_PET_KIND_WHALE_WIDGET: &str = "whaleWidget";
+/// 旧版「Codex 用量挂件」开关；已并入 `agentPet`（类型选大肥鱼），只在迁移时读取，保存时不再写出。
+/// 余额相关的 `codexAppWhaleBalance*` 仍是大肥鱼的配置，照常保留。
 const LEGACY_PET_WIDGET_KEY: &str = "codexAppWhaleWidgetEnabled";
-/// 旧用量挂件（余额 / 价格 / 用量统计）留下的全部键，读写时一并清理。
-const LEGACY_PET_WIDGET_KEYS: [&str; 6] = [
-    LEGACY_PET_WIDGET_KEY,
-    "codexAppWhaleBalanceProtocol",
-    "codexAppWhaleBalancePath",
-    "codexAppWhaleBalanceField",
-    "codexAppWhaleBalanceCurrency",
-    "codexAppWhaleBalanceScale",
-];
+const LEGACY_PET_WIDGET_KEYS: [&str; 1] = [LEGACY_PET_WIDGET_KEY];
 
 /// Agent 桌宠设置。反序列化是宽松的：任一字段类型不对只回落该字段默认值，
 /// 不能因为桌宠配置写坏就让整份 settings.json 解析失败。
@@ -775,6 +772,9 @@ const LEGACY_PET_WIDGET_KEYS: [&str; 6] = [
 #[serde(rename_all = "camelCase")]
 pub struct AgentPetSettings {
     pub enabled: bool,
+    /// 桌宠类型：`image`（图库 / 自定义图片的简单桌宠）或 `whaleWidget`（完整的大肥鱼挂件）。
+    /// 两者互斥，同一时间只显示一个。
+    pub kind: String,
     /// 在哪些 Agent 里显示桌宠；目前只认 `codex`。
     pub agents: Vec<String>,
     /// 内置图库 id，或 `custom`（此时使用 `custom_image_url`）。
@@ -796,6 +796,7 @@ impl Default for AgentPetSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            kind: AGENT_PET_KIND_IMAGE.to_string(),
             agents: vec!["codex".to_string()],
             image: crate::agent_pet::DEFAULT_IMAGE_ID.to_string(),
             custom_image_url: String::new(),
@@ -825,6 +826,9 @@ impl AgentPetSettings {
         };
         if let Some(value) = map.get("enabled").and_then(Value::as_bool) {
             settings.enabled = value;
+        }
+        if let Some(value) = map.get("kind").and_then(Value::as_str) {
+            settings.kind = value.to_string();
         }
         if let Some(items) = map.get("agents").and_then(Value::as_array) {
             settings.agents = items
@@ -870,6 +874,12 @@ impl AgentPetSettings {
             }
         }
         self.agents = agents;
+        // 未知类型回落到简单桌宠，不能因为写坏的值意外加载完整挂件。
+        self.kind = if self.kind.trim() == AGENT_PET_KIND_WHALE_WIDGET {
+            AGENT_PET_KIND_WHALE_WIDGET.to_string()
+        } else {
+            AGENT_PET_KIND_IMAGE.to_string()
+        };
         let image = self.image.trim();
         self.image = if image == crate::agent_pet::CUSTOM_IMAGE_ID
             || crate::agent_pet::is_builtin_image(image)
@@ -907,9 +917,33 @@ impl AgentPetSettings {
         };
     }
 
-    /// 是否在指定 Agent 里显示桌宠。
+    /// 是否在指定 Agent 里显示桌宠（不区分类型）。
     pub fn enabled_for(&self, agent: &str) -> bool {
         self.enabled && self.agents.iter().any(|item| item == agent)
+    }
+
+    /// 选中的是不是大肥鱼（完整用量挂件）。
+    pub fn is_whale_widget(&self) -> bool {
+        self.kind == AGENT_PET_KIND_WHALE_WIDGET
+    }
+
+    /// Codex 里是否显示简单桌宠（图库 / 自定义图片）；选了大肥鱼时为 false。
+    pub fn image_pet_active(&self) -> bool {
+        self.enabled_for("codex") && !self.is_whale_widget()
+    }
+
+    /// Codex 里是否显示大肥鱼；与简单桌宠互斥。
+    pub fn whale_widget_active(&self) -> bool {
+        self.enabled_for("codex") && self.is_whale_widget()
+    }
+
+    /// 已开启并选中大肥鱼的设置（迁移与测试用）。
+    pub fn whale_widget() -> Self {
+        Self {
+            enabled: true,
+            kind: AGENT_PET_KIND_WHALE_WIDGET.to_string(),
+            ..Self::default()
+        }
     }
 }
 
@@ -922,19 +956,17 @@ fn clamp_agent_pet_size(value: f64) -> u32 {
         .clamp(AGENT_PET_MIN_SIZE as f64, AGENT_PET_MAX_SIZE as f64) as u32
 }
 
-/// 旧版只有用量挂件开关：开着且还没有 `agentPet` 时，迁移成「桌宠已开启」。
+/// 旧版只有用量挂件开关：开着且还没有 `agentPet` 时，迁移成「桌宠已开启、类型为大肥鱼」，
+/// 让还停在旧版的用户升级后看到的仍是原来的鲸鱼挂件。已经有 `agentPet` 的用户保持现状。
 fn legacy_pet_widget_enabled(raw: &Map<String, Value>) -> bool {
     !raw.contains_key("agentPet")
         && raw.get(LEGACY_PET_WIDGET_KEY).and_then(Value::as_bool) == Some(true)
 }
 
-/// 把旧用量挂件开关迁移进原始设置对象，并删掉旧挂件的全部键。
+/// 把旧用量挂件开关迁移进原始设置对象，并删掉旧开关（余额配置保留）。
 fn migrate_legacy_pet_widget(raw: &mut Map<String, Value>) {
     if legacy_pet_widget_enabled(raw) {
-        let settings = AgentPetSettings {
-            enabled: true,
-            ..AgentPetSettings::default()
-        };
+        let settings = AgentPetSettings::whale_widget();
         raw.insert(
             "agentPet".to_string(),
             serde_json::to_value(settings).unwrap_or_else(|_| Value::Object(Map::new())),
@@ -1153,6 +1185,26 @@ pub struct BackendSettings {
     pub codex_app_capacity_auto_retry: bool,
     #[serde(rename = "codexAppTurnRewind", default)]
     pub codex_app_turn_rewind: bool,
+    /// 大肥鱼（旧版鲸鱼挂件）的余额查询方式：`auto` / `custom` / `off`。
+    #[serde(
+        rename = "codexAppWhaleBalanceProtocol",
+        default = "default_whale_balance_protocol"
+    )]
+    pub codex_app_whale_balance_protocol: String,
+    #[serde(rename = "codexAppWhaleBalancePath", default)]
+    pub codex_app_whale_balance_path: String,
+    #[serde(rename = "codexAppWhaleBalanceField", default)]
+    pub codex_app_whale_balance_field: String,
+    #[serde(
+        rename = "codexAppWhaleBalanceCurrency",
+        default = "default_whale_balance_currency"
+    )]
+    pub codex_app_whale_balance_currency: String,
+    #[serde(
+        rename = "codexAppWhaleBalanceScale",
+        default = "default_whale_balance_scale"
+    )]
+    pub codex_app_whale_balance_scale: f64,
     /// Agent 桌宠；旧的 `codexAppWhaleWidgetEnabled` 在读取时迁移到这里。
     #[serde(rename = "agentPet", default)]
     pub agent_pet: AgentPetSettings,
@@ -1422,6 +1474,11 @@ impl Default for BackendSettings {
             codex_app_activity_overlay_right: false,
             codex_app_capacity_auto_retry: false,
             codex_app_turn_rewind: false,
+            codex_app_whale_balance_protocol: default_whale_balance_protocol(),
+            codex_app_whale_balance_path: String::new(),
+            codex_app_whale_balance_field: String::new(),
+            codex_app_whale_balance_currency: default_whale_balance_currency(),
+            codex_app_whale_balance_scale: default_whale_balance_scale(),
             agent_pet: AgentPetSettings::default(),
             codex_app_stepwise_enabled: false,
             codex_app_stepwise_generation_mode: default_stepwise_generation_mode(),
@@ -1902,6 +1959,18 @@ pub fn default_computer_use_approval() -> String {
 
 /// Computer Use 默认用 JS（cua_repl）：与 Codex 当前主要的 CU 路径一致，
 /// 自带完整使用说明与确认规则，并能用 paste 输入中文。离散工具需要用户主动切换。
+fn default_whale_balance_protocol() -> String {
+    "auto".to_string()
+}
+
+fn default_whale_balance_currency() -> String {
+    "USD".to_string()
+}
+
+fn default_whale_balance_scale() -> f64 {
+    1.0
+}
+
 pub fn default_computer_use_mode() -> String {
     "js".to_string()
 }
@@ -2284,7 +2353,7 @@ impl SettingsStore {
         if contents.contains(LEGACY_PET_WIDGET_KEY) {
             if let Ok(Value::Object(raw)) = serde_json::from_str::<Value>(&contents) {
                 if legacy_pet_widget_enabled(&raw) {
-                    parsed.agent_pet.enabled = true;
+                    parsed.agent_pet = AgentPetSettings::whale_widget();
                 }
             }
         }
@@ -2742,6 +2811,30 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "codexAppActivityOverlayRight");
     merge_bool_setting(target, source, "codexAppCapacityAutoRetry");
     merge_bool_setting(target, source, "codexAppTurnRewind");
+    if let Some(value @ ("auto" | "custom" | "off")) =
+        source.get("codexAppWhaleBalanceProtocol").and_then(Value::as_str)
+    {
+        target.insert(
+            "codexAppWhaleBalanceProtocol".to_string(),
+            Value::String(value.to_string()),
+        );
+    }
+    for key in [
+        "codexAppWhaleBalancePath",
+        "codexAppWhaleBalanceField",
+        "codexAppWhaleBalanceCurrency",
+    ] {
+        if let Some(value) = source.get(key).and_then(Value::as_str) {
+            target.insert(key.to_string(), Value::String(value.trim().to_string()));
+        }
+    }
+    if let Some(value) = source
+        .get("codexAppWhaleBalanceScale")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value > 0.0)
+    {
+        target.insert("codexAppWhaleBalanceScale".to_string(), Value::from(value));
+    }
     if let Some(patch) = source.get("agentPet").and_then(Value::as_object) {
         // 只合并补丁里出现的已知字段，再整体归一化写回。
         let mut merged = target
@@ -2751,6 +2844,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
             .unwrap_or_default();
         for key in [
             "enabled",
+            "kind",
             "agents",
             "image",
             "customImageUrl",
@@ -3349,6 +3443,24 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
     settings.dictation.normalize();
     settings.claude_app_bash_timeout.normalize();
     settings.agent_pet.normalize();
+    settings.codex_app_whale_balance_protocol =
+        match settings.codex_app_whale_balance_protocol.trim() {
+            "custom" => "custom",
+            "off" => "off",
+            _ => "auto",
+        }
+        .to_string();
+    settings.codex_app_whale_balance_path = settings.codex_app_whale_balance_path.trim().to_string();
+    settings.codex_app_whale_balance_field = settings.codex_app_whale_balance_field.trim().to_string();
+    settings.codex_app_whale_balance_currency = settings
+        .codex_app_whale_balance_currency
+        .trim()
+        .to_ascii_uppercase();
+    if !settings.codex_app_whale_balance_scale.is_finite()
+        || settings.codex_app_whale_balance_scale <= 0.0
+    {
+        settings.codex_app_whale_balance_scale = default_whale_balance_scale();
+    }
     settings.codex_app_typing_effect = normalize_typing_effect(&settings.codex_app_typing_effect);
     settings.ccs_db_path = settings.ccs_db_path.trim().to_string();
     settings.ccs_import_sources.retain(|id, _| settings.relay_profiles.iter().any(|profile| &profile.id == id));

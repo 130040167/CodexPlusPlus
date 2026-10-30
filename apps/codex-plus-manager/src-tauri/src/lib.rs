@@ -347,6 +347,7 @@ pub fn run() {
             agent_pet_commands::agent_pet_sound_catalog,
             agent_pet_commands::agent_pet_sound,
             agent_pet_commands::agent_pet_import_sound,
+            agent_pet_commands::agent_pet_whale_image,
             agent_launch_commands::open_agent_terminal,
             agent_mcp_commands::load_agent_mcp,
             agent_mcp_commands::save_agent_mcp,

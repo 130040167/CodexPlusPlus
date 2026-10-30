@@ -99,6 +99,8 @@ pub mod user_scripts;
 pub mod version;
 pub mod vision;
 pub mod watcher;
+pub mod whale;
+pub mod whale_full;
 pub mod work_view;
 pub mod wsl_network;
 pub(crate) mod xai_responses;

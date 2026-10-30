@@ -155,7 +155,8 @@ import {
   type EnhancementSettingItem,
 } from "./enhancement-catalog";
 import { DEFAULT_AUTO_COMPACT_PERCENT, autoCompactOptions, normalizeAutoCompactPercent } from "./auto-compact";
-import { agentPetSettingsIssue, defaultAgentPetSettings, normalizeAgentPetSettings, type AgentPetIssue, type AgentPetSettings } from "./agent-pet-settings";
+import { agentPetSettingsIssue, defaultAgentPetSettings, isAgentPetWhaleWidgetActive, normalizeAgentPetSettings, type AgentPetIssue, type AgentPetSettings } from "./agent-pet-settings";
+import { defaultWhaleBalanceSettings, normalizeWhaleBalanceSettings, whaleBalanceSettingsIssue, type WhaleBalanceIssue, type WhaleBalanceSettings } from "./whale-settings";
 import { AgentPetPage } from "./AgentPetPage";
 import {
   applyDictationPreset,
@@ -396,7 +397,8 @@ type MultiLaunchInstancesResult = CommandResult<{
   instances: MultiLaunchInstance[];
 }>;
 
-type BackendSettings = {
+/** 顶层的 `codexAppWhaleBalance*` 是大肥鱼（Agent 桌宠类型之一）的余额配置。 */
+type BackendSettings = WhaleBalanceSettings & {
   revision?: string;
   /** Agent 桌宠（与 Rust `agent_pet` 对应）。 */
   agentPet: AgentPetSettings;
@@ -1400,6 +1402,7 @@ const codexRunningPollMs = 5_000;
 const agentEntryRoute = (toolId: ToolId) => agentTarget(agentRoutes(toolId), lastAgentRoute.get(toolId), agentHomeRoute[toolId] ?? "overview");
 
 const defaultSettings: BackendSettings = {
+  ...defaultWhaleBalanceSettings(),
   agentPet: defaultAgentPetSettings(),
   codexAppPath: "",
   codexAppAutoTakeover: false,
@@ -3131,7 +3134,7 @@ export function App() {
 
   const saveSettings = async () => {
     const next = normalizeSettings(settingsForm);
-    const petIssue = agentPetValidationMessage(agentPetSettingsIssue(next.agentPet));
+    const petIssue = agentPetSaveIssue(next);
     if (petIssue) {
       showNotice(t("Agent 桌宠"), petIssue, "failed");
       return;
@@ -3153,7 +3156,7 @@ export function App() {
 
   const saveSettingsValue = async (next: BackendSettings, silent = true) => {
     const normalized = normalizeSettings(next);
-    const petIssue = agentPetValidationMessage(agentPetSettingsIssue(normalized.agentPet));
+    const petIssue = agentPetSaveIssue(normalized);
     if (petIssue) {
       showNotice(t("Agent 桌宠"), petIssue, "failed");
       return null;
@@ -3182,7 +3185,7 @@ export function App() {
   /// 草稿仍是「有修改」，由页面下一轮再存。
   const autoSaveSettings = async (snapshot: BackendSettings): Promise<AutoSaveOutcome> => {
     const normalized = normalizeSettings(snapshot);
-    const issue = agentPetValidationMessage(agentPetSettingsIssue(normalized.agentPet))
+    const issue = agentPetSaveIssue(normalized)
       || dictationSettingsValidationMessage(dictationSettingsIssue(normalized.dictation));
     if (issue) return { status: "invalid", message: issue };
     try {
@@ -4797,6 +4800,9 @@ export function App() {
             <AgentPetPage
               settings={settingsForm.agentPet}
               onChange={(agentPet) => setSettingsForm((current) => ({ ...current, agentPet }))}
+              whaleBalance={settingsForm}
+              onWhaleBalanceChange={(patch) => setSettingsForm((current) => ({ ...current, ...patch }))}
+              whaleBalanceIssue={whaleBalanceValidationMessage(whaleBalanceSettingsIssue(normalizeWhaleBalanceSettings(settingsForm), isAgentPetWhaleWidgetActive(settingsForm.agentPet)))}
               autoSave={<SettingsAutoSave dirty={settingsDirty} form={settingsForm} actions={actions} />}
             />
           ) : null}
@@ -7863,6 +7869,20 @@ function envConflictSourceLabel(source: string): string {
 function agentPetValidationMessage(issue: AgentPetIssue | null): string | null {
   if (issue === "customUrl") return t("自定义图片地址无效，请填写 https:// 开头的图片地址。");
   return null;
+}
+
+function whaleBalanceValidationMessage(issue: WhaleBalanceIssue | null): string | null {
+  if (issue === "path") return t("请填写供应商同域下的余额接口路径，不包含网址、查询参数或片段。");
+  if (issue === "field") return t("请填写余额字段路径，例如 data.balance 或 data.accounts[0].balance。");
+  if (issue === "currency") return t("币种请使用三位代码，例如 USD 或 CNY。");
+  if (issue === "scale") return t("金额倍率必须是大于 0 且不超过 1e12 的有限数值。");
+  return null;
+}
+
+/** 保存前校验 Agent 桌宠：简单桌宠的自定义图片地址；选了大肥鱼时校验它的自定义余额接口。 */
+function agentPetSaveIssue(settings: BackendSettings): string | null {
+  return agentPetValidationMessage(agentPetSettingsIssue(settings.agentPet))
+    || whaleBalanceValidationMessage(whaleBalanceSettingsIssue(settings, isAgentPetWhaleWidgetActive(settings.agentPet)));
 }
 
 type DictationLocalModelState = {
@@ -17029,7 +17049,8 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
   return syncLegacyRelayFields({
     ...defaultSettings,
     ...settings,
-    // 旧版「Codex 用量挂件」开着、还没有桌宠设置的用户，升级后桌宠保持开启。
+    ...normalizeWhaleBalanceSettings(settings),
+    // 旧版「Codex 用量挂件」开着、还没有桌宠设置的用户，升级后桌宠开启并选中大肥鱼。
     agentPet: normalizeAgentPetSettings(settings.agentPet, (settings as { codexAppWhaleWidgetEnabled?: unknown }).codexAppWhaleWidgetEnabled === true),
     ccsDbPath: (settings.ccsDbPath || "").trim(),
     dictation: normalizeDictationSettings(settings.dictation),

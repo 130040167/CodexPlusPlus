@@ -7,6 +7,7 @@
     if (loaded) syncOfficialUsagePolicy();
     if (loaded) runScanStep(syncCodexPlusTypingEffects);
     if (loaded && typeof syncCodexPlusAgentPet === "function") runScanStep(syncCodexPlusAgentPet);
+    if (loaded && typeof syncCodexPlusWhaleWidget === "function") runScanStep(syncCodexPlusWhaleWidget);
     // typeof 守卫：这两个函数会被 session-share-runtime / typing-effects-settings
     // 之类的用例切片到不带其它分片的沙箱里执行，缺函数时不能直接 ReferenceError。
     if (loaded && typeof syncCodexPlusCapacityAutoRetry === "function") runScanStep(syncCodexPlusCapacityAutoRetry);
@@ -53,6 +54,7 @@
         syncOfficialUsagePolicy();
         runScanStep(syncCodexPlusTypingEffects);
         if (typeof syncCodexPlusAgentPet === "function") runScanStep(syncCodexPlusAgentPet);
+        if (typeof syncCodexPlusWhaleWidget === "function") runScanStep(syncCodexPlusWhaleWidget);
         if (typeof syncCodexPlusCapacityAutoRetry === "function") runScanStep(syncCodexPlusCapacityAutoRetry);
         // 启动期读取全部失败时，心跳是之后唯一的设置来源；读到就补一次皮肤（#2680）。
         if (typeof refreshDreamSkin === "function") runScanStep(refreshDreamSkin);
@@ -118,6 +120,7 @@
     syncStepwisePanel();
     runScanStep(syncCodexPlusTypingEffects);
     if (typeof syncCodexPlusAgentPet === "function") runScanStep(syncCodexPlusAgentPet);
+    if (typeof syncCodexPlusWhaleWidget === "function") runScanStep(syncCodexPlusWhaleWidget);
     renderCodexPlusMenu();
     scan();
   }
