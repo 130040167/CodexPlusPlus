@@ -491,6 +491,23 @@ async fn process_weixin_message(
     project_id: &str,
     explicit_work_dir: bool,
 ) -> anyhow::Result<()> {
+    let options_store = controls::SessionOptionsStore::for_peer(account_id, &message.from_user_id);
+    if matches!(text.trim(), "/reset" | "/reset-session") {
+        options_store.request_reset()?;
+        state.thread_ids.remove(&message.from_user_id);
+        state.completed_resets.remove(&message.from_user_id);
+        ConnectSessionStore::default_for_account(account_id).save(state)?;
+        if let Some(mut server) = app_server.take() {
+            server.close().await;
+        }
+        return client
+            .send_text_chunks(
+                &message.from_user_id,
+                "已重置当前微信会话并清除模型、推理强度覆盖值。下一条消息将按当前连接默认设置创建新会话，原会话历史保留。",
+                &message.context_token,
+            )
+            .await;
+    }
     let permit = outbound
         .permit(&message.from_user_id)
         .ok()
@@ -508,7 +525,6 @@ async fn process_weixin_message(
             .send_text_chunks(&message.from_user_id, reply, &message.context_token)
             .await;
     }
-    let options_store = controls::SessionOptionsStore::for_peer(account_id, &message.from_user_id);
     let options = options_store.load()?;
     let mut app_config = app_config.clone();
     if let Some(reason) = local_model_endpoint_unreachable_reason().await {
@@ -564,7 +580,7 @@ async fn process_weixin_message(
         .await
         .unwrap_or_default();
     let native = &config_response["config"];
-    let defaults = controls::SessionOptions {
+    let mut defaults = controls::SessionOptions {
         model: if app_config.model.is_empty() {
             native["model"].as_str().unwrap_or_default().to_string()
         } else {
@@ -580,33 +596,24 @@ async fn process_weixin_message(
         },
         reset_request: None,
     };
-    let catalog = crate::model_catalog::read_codex_model_catalog().await;
-    let mut effective = options.resolve(&defaults, &catalog);
-    if effective.model.is_empty() || effective.reasoning_effort.is_empty() {
+    let mut catalog = crate::model_catalog::read_codex_model_catalog().await;
+    let unresolved = options.resolve(&defaults, &catalog);
+    if defaults.model.is_empty() || unresolved.model.is_empty() || unresolved.reasoning_effort.is_empty() {
         let models = server
             .api_request("model/list", serde_json::json!({"includeHidden":true}))
             .await
             .unwrap_or_default();
-        if let Some(model) = models["data"].as_array().and_then(|models| {
-            models.iter().find(|model| {
-                if effective.model.is_empty() {
-                    model["isDefault"] == true
-                } else {
-                    model["model"].as_str() == Some(&effective.model)
-                        || model["id"].as_str() == Some(&effective.model)
-                }
-            })
-        }) {
-            if effective.model.is_empty() {
-                effective.model = model["model"].as_str().unwrap_or_default().to_string();
-            }
-            if effective.reasoning_effort.is_empty() {
-                effective.reasoning_effort = model["defaultReasoningEffort"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string();
-            }
-        }
+        controls::apply_native_model_defaults(&mut defaults, &mut catalog, &models);
+    }
+    let (effective, recovered_options) = options.resolve_for_turn(&defaults, &catalog);
+    if recovered_options {
+        client
+            .send_text_chunks(
+                &message.from_user_id,
+                "已保存的模型或推理强度在当前配置下不可用，本条消息改用连接默认设置。发送 /reset 可清除覆盖值并重置当前微信会话。",
+                &message.context_token,
+            )
+            .await?;
     }
     app_config.model = effective.model;
     app_config.reasoning_effort = effective.reasoning_effort;
@@ -618,7 +625,7 @@ async fn process_weixin_message(
             allow_attachments,
         )
         .await
-        .map_err(|error| anyhow::anyhow!("无法准备微信会话，原映射已保留：{error}"))?;
+        .map_err(|error| anyhow::anyhow!("无法准备微信会话，原映射已保留：{error}；可发送 /reset 重置当前微信会话后重试"))?;
     state
         .thread_ids
         .insert(message.from_user_id.clone(), thread_id.clone());

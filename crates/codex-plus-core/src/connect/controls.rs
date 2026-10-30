@@ -81,8 +81,13 @@ impl SessionOptionsStore {
     pub fn request_reset(&self) -> anyhow::Result<()> {
         let _guard = WRITE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let mut all = self.load_all()?;
-        all.entry(self.peer.clone()).or_default().reset_request =
-            Some(uuid::Uuid::new_v4().to_string());
+        all.insert(
+            self.peer.clone(),
+            SessionOptions {
+                reset_request: Some(uuid::Uuid::new_v4().to_string()),
+                ..SessionOptions::default()
+            },
+        );
         crate::settings::atomic_write(&self.path, &serde_json::to_vec_pretty(&all)?)
     }
 
@@ -118,7 +123,7 @@ pub fn effective_options(defaults: &SessionOptions, overrides: &SessionOptions) 
 pub fn session_tool_spec() -> Value {
     json!({
         "type": "function", "name": "weixin_session_settings",
-        "description": "查看或按用户明确要求修改当前微信联系人的模型及推理强度。get 查看，set 保存 model/reasoningEffort，空字符串继承连接默认值，reset 显式重置会话。设置及重置均从下一条消息生效，保留原历史，不改当前回合或全局配置。",
+        "description": "查看或按用户明确要求修改当前微信联系人的模型及推理强度。get 查看，set 保存 model/reasoningEffort，空字符串继承连接默认值，reset 显式重置会话并清除联系人覆盖值。设置及重置均从下一条消息生效，保留原历史，不改当前回合或全局配置。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -132,6 +137,27 @@ pub fn session_tool_spec() -> Value {
 }
 
 impl SessionOptions {
+    pub fn resolve_for_turn(&self, defaults: &Self, catalog: &Value) -> (Self, bool) {
+        let resolved = self.resolve(defaults, catalog);
+        if self.model.is_empty() && self.reasoning_effort.is_empty() {
+            return (resolved, false);
+        }
+        // 连接默认模型可能来自原生配置而不在公开目录中，只校验联系人的覆盖值。
+        let mut checked_catalog = catalog.clone();
+        if self.model.is_empty()
+            && let Some(models) = checked_catalog["models"].as_array_mut()
+            && !models
+                .iter()
+                .any(|model| model.as_str() == Some(&resolved.model))
+        {
+            models.push(json!(resolved.model));
+        }
+        if validate_options(&checked_catalog, &resolved).is_ok() {
+            return (resolved, false);
+        }
+        (Self::default().resolve(defaults, catalog), true)
+    }
+
     pub fn with_defaults(&self, defaults: &Self) -> Self {
         effective_options(defaults, self)
     }
@@ -184,6 +210,31 @@ pub fn updated_options(
     Ok(next)
 }
 
+pub fn apply_native_model_defaults(
+    defaults: &mut SessionOptions,
+    catalog: &mut Value,
+    response: &Value,
+) {
+    let Some(models) = response["data"].as_array() else {
+        return;
+    };
+    for model in models {
+        let Some(name) = model["model"].as_str().or_else(|| model["id"].as_str()) else {
+            continue;
+        };
+        if defaults.model.is_empty() && model["isDefault"] == true {
+            defaults.model = name.to_string();
+        }
+        for key in ["defaultReasoningEffort", "supportedReasoningEfforts"] {
+            if catalog["modelMetadata"][name][key].is_null()
+                && let Some(value) = model.get(key)
+            {
+                catalog["modelMetadata"][name][key] = value.clone();
+            }
+        }
+    }
+}
+
 pub fn validate_options(catalog: &Value, options: &SessionOptions) -> anyhow::Result<()> {
     if !options.model.is_empty() {
         let available = catalog["models"].as_array().context("当前模型目录不可用")?;
@@ -228,10 +279,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn explicit_resets_survive_reload_preserve_options_and_do_not_clear_newer_requests() {
+    fn explicit_resets_clear_overrides_and_do_not_clear_newer_requests() {
         let temp = tempfile::tempdir().unwrap();
         let first = SessionOptionsStore::in_directory(temp.path(), "Bot.1@wx", "peer-a");
         let other = SessionOptionsStore::in_directory(temp.path(), "Bot.1@wx", "peer-b");
+        other
+            .save(SessionOptions {
+                model: "other-model".into(),
+                ..SessionOptions::default()
+            })
+            .unwrap();
         first.request_reset().unwrap();
         let request = first.load().unwrap().reset_request.unwrap();
         first
@@ -251,7 +308,77 @@ mod tests {
         assert_ne!(request, next);
         first.complete_reset(&next).unwrap();
         assert!(first.load().unwrap().reset_request.is_none());
-        assert_eq!(first.load().unwrap().model, "m");
+        assert_eq!(first.load().unwrap(), SessionOptions::default());
+        assert_eq!(other.load().unwrap().model, "other-model");
+    }
+
+    #[test]
+    fn stale_contact_options_fall_back_to_current_defaults_before_a_turn() {
+        let defaults = SessionOptions {
+            model: "current".into(),
+            reasoning_effort: "low".into(),
+            ..SessionOptions::default()
+        };
+        let catalog = json!({"models":["current","other"],"modelMetadata":{
+            "current":{"supportedReasoningEfforts":["low"]},
+            "other":{"supportedReasoningEfforts":["high"]}
+        }});
+        for options in [
+            SessionOptions {
+                model: "removed".into(),
+                ..SessionOptions::default()
+            },
+            SessionOptions {
+                model: "current".into(),
+                reasoning_effort: "high".into(),
+                ..SessionOptions::default()
+            },
+        ] {
+            let (resolved, recovered) = options.resolve_for_turn(&defaults, &catalog);
+            assert!(recovered);
+            assert_eq!(resolved, defaults);
+        }
+        let valid = SessionOptions {
+            model: "other".into(),
+            reasoning_effort: "high".into(),
+            ..SessionOptions::default()
+        };
+        assert_eq!(
+            valid.resolve_for_turn(&defaults, &catalog),
+            (valid.clone(), false)
+        );
+        assert_eq!(
+            SessionOptions::default().resolve_for_turn(&defaults, &json!({})),
+            (defaults, false)
+        );
+    }
+
+    #[test]
+    fn native_default_model_is_resolved_before_validating_saved_effort() {
+        let mut defaults = SessionOptions::default();
+        let mut catalog = json!({"model":"", "models":[], "modelMetadata":{}});
+        apply_native_model_defaults(
+            &mut defaults,
+            &mut catalog,
+            &json!({"data":[{
+                "model":"native-default", "isDefault":true, "defaultReasoningEffort":"low",
+                "supportedReasoningEfforts":[{"reasoningEffort":"low"}]
+            }]}),
+        );
+        let saved = SessionOptions {
+            reasoning_effort: "high".into(),
+            ..SessionOptions::default()
+        };
+        let (resolved, recovered) = saved.resolve_for_turn(&defaults, &catalog);
+        assert!(recovered);
+        assert_eq!(resolved.model, "native-default");
+        assert_eq!(resolved.reasoning_effort, "low");
+        let saved = SessionOptions {
+            reasoning_effort: "low".into(),
+            ..SessionOptions::default()
+        };
+        assert!(!saved.resolve_for_turn(&defaults, &catalog).1);
+        assert!(defaults.reasoning_effort.is_empty());
     }
 
     #[test]
