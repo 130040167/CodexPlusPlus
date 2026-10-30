@@ -6823,6 +6823,10 @@ fn skill_install_origin_matches(
     }
 }
 
+fn skill_install_failure_message(failure_prefix: &str, error: &anyhow::Error) -> String {
+    format!("{failure_prefix}：{error:#}")
+}
+
 async fn install_or_update_skill(
     repo_key: &str,
     id: &str,
@@ -6855,7 +6859,7 @@ async fn install_or_update_skill(
         Ok(bytes) => bytes,
         Err(error) => {
             return failed(
-                &format!("{failure_prefix}：{error}"),
+                &skill_install_failure_message(failure_prefix, &error),
                 current_skills_payload(&manager),
             );
         }
@@ -6868,7 +6872,7 @@ async fn install_or_update_skill(
         }
         Err(error) => {
             return failed(
-                &format!("{failure_prefix}：{error}"),
+                &skill_install_failure_message(failure_prefix, &error),
                 current_skills_payload(&manager),
             );
         }
@@ -6879,7 +6883,7 @@ async fn install_or_update_skill(
             Ok(skill) => skill,
             Err(error) => {
                 return failed(
-                    &format!("{failure_prefix}：{error:#}"),
+                    &skill_install_failure_message(failure_prefix, &error),
                     current_skills_payload(&manager),
                 );
             }
@@ -6887,7 +6891,7 @@ async fn install_or_update_skill(
         return match manager.install_new_from_zip(&skill, &zip) {
             Ok(_) => ok(success_message, current_skills_payload(&manager)),
             Err(error) => failed(
-                &format!("{failure_prefix}：{error:#}"),
+                &skill_install_failure_message(failure_prefix, &error),
                 current_skills_payload(&manager),
             ),
         };
@@ -6914,7 +6918,7 @@ async fn install_or_update_skill(
     match manager.update_existing_from_zip_with_confirmation(&skill, &zip, expected_snapshot) {
         Ok(_) => ok(success_message, current_skills_payload(&manager)),
         Err(error) => failed(
-            &format!("{failure_prefix}：{error}"),
+            &skill_install_failure_message(failure_prefix, &error),
             current_skills_payload(&manager),
         ),
     }
@@ -10452,6 +10456,17 @@ mod tests {
             skills_payload(&manager, &remote, Vec::new())
                 .skills
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn skill_install_failure_message_preserves_the_error_chain() {
+        let error = anyhow::anyhow!("root cause")
+            .context("download context")
+            .context("repository context");
+        assert_eq!(
+            skill_install_failure_message("update failed", &error),
+            "update failed：repository context: download context: root cause"
         );
     }
 
