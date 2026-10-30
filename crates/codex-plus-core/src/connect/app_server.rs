@@ -383,7 +383,10 @@ impl CodexAppServer {
                 let result = message.get("result").cloned().unwrap_or(Value::Null);
                 calls.turn = extract_turn_id(&result);
                 if calls.turn.is_none() {
-                    eprintln!("[weixin] turn/start 未返回回合 ID，附件调用将被拒绝");
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "weixin.turn_start.missing_turn_id",
+                        json!({ "request_id": id }),
+                    );
                 }
                 if model.is_empty() {
                     model = extract_model(&result).unwrap_or_default();
@@ -866,7 +869,8 @@ mod tests {
         let Ok(mode) = std::env::var("CODEX_PLUS_W2_STDIO_FIXTURE_MODE") else {
             return;
         };
-        let enabled = mode == "enabled";
+        let missing_turn_id = mode == "missing-turn-id";
+        let enabled = mode == "enabled" || missing_turn_id;
         let emit = |value: Value| {
             println!("{value}");
             std::io::Write::flush(&mut std::io::stdout()).unwrap();
@@ -900,10 +904,17 @@ mod tests {
                     emit(json!({"id": message["id"], "result": {"thread": {"id": "thread"}}}));
                 }
                 Some("turn/start") => {
-                    emit(json!({"id": message["id"], "result": {"turn": {"id": "turn"}}}));
-                    emit(
-                        json!({"method": "turn/completed", "params": {"threadId": "thread", "turn": {"id": "old-turn", "status": "completed"}}}),
-                    );
+                    let turn = if missing_turn_id {
+                        json!({})
+                    } else {
+                        json!({"id": "turn"})
+                    };
+                    emit(json!({"id": message["id"], "result": {"turn": turn}}));
+                    if !missing_turn_id {
+                        emit(
+                            json!({"method": "turn/completed", "params": {"threadId": "thread", "turn": {"id": "old-turn", "status": "completed"}}}),
+                        );
+                    }
                     emit(tool("stale", "old-turn"));
                 }
                 None => match message["id"].as_str().unwrap() {
@@ -912,11 +923,11 @@ mod tests {
                         emit(tool("first", "turn"));
                     }
                     "first" => {
-                        assert_eq!(message["result"]["success"], enabled);
+                        assert_eq!(message["result"]["success"], enabled && !missing_turn_id);
                         emit(tool("repeat", "turn"));
                     }
                     "repeat" => {
-                        assert_eq!(message["result"]["success"], enabled);
+                        assert_eq!(message["result"]["success"], enabled && !missing_turn_id);
                         emit(
                             json!({"method": "item/completed", "params": {"threadId": "thread", "turnId": "turn", "item": {"type": "agentMessage", "text": "done"}}}),
                         );
@@ -940,10 +951,14 @@ mod tests {
         };
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("result.txt"), b"result").unwrap();
+        let missing_turn_id = std::env::var_os("CODEX_PLUS_W2_MISSING_TURN_ID").is_some();
         for enabled in [false, true] {
+            if missing_turn_id && !enabled {
+                continue;
+            }
             let api = MockServer::start().await;
             let cdn = MockServer::start().await;
-            let count = if enabled { 1 } else { 0 };
+            let count = if enabled && !missing_turn_id { 1 } else { 0 };
             Mock::given(method("POST"))
                 .and(path("/ilink/bot/getuploadurl"))
                 .respond_with(
@@ -980,7 +995,13 @@ mod tests {
                 ])
                 .env(
                     "CODEX_PLUS_W2_STDIO_FIXTURE_MODE",
-                    if enabled { "enabled" } else { "disabled" },
+                    if missing_turn_id {
+                        "missing-turn-id"
+                    } else if enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
                 )
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -1015,12 +1036,12 @@ mod tests {
                 server
                     .run_turn_with_reply(
                         &thread,
-                        "send",
+                        "send private prompt",
                         &[],
                         Some(WeixinReplyChannel {
                             client: &client,
                             peer: "peer",
-                            context_token: "context",
+                            context_token: "private context token",
                             permit: policy.permit("peer").ok(),
                         }),
                     )
@@ -1030,6 +1051,51 @@ mod tests {
             server.close().await;
             assert_eq!(result.unwrap().unwrap().reply, "done");
         }
+    }
+
+    #[test]
+    fn missing_turn_id_is_persistently_logged_without_user_content() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "connect::app_server::tests::outbound_stdio_registers_only_when_enabled_and_sends_each_call_once",
+        ]);
+        command.env("CODEX_PLUS_W2_MISSING_TURN_ID", "1");
+        for (name, directory) in [
+            ("CODEX_PLUS_STATE_DIR", "state"),
+            ("CODEX_HOME", "home"),
+            ("CODEX_SQLITE_HOME", "sqlite"),
+            ("APPDATA", "appdata"),
+        ] {
+            command.env(name, root.path().join(directory));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(crate::windows_create_no_window());
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let log = std::fs::read_to_string(state.join("codex-plus.log")).unwrap();
+        let records: Vec<Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let record = records
+            .iter()
+            .find(|record| record["event"] == "weixin.turn_start.missing_turn_id")
+            .unwrap();
+        assert!(record["detail"]["request_id"].as_u64().is_some());
+        assert_eq!(record["detail"].as_object().unwrap().len(), 1);
+        assert!(!log.contains("private prompt"));
+        assert!(!log.contains("private context token"));
     }
 
     #[cfg(windows)]
