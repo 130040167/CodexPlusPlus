@@ -17965,6 +17965,7 @@
     "/diagnostics/log",
     "/session/export",
     "/thread-usage-history",
+    "/usage/history",
     "/archived-thread",
     "/export-markdown",
     "/user-scripts/list",
