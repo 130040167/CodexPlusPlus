@@ -208,7 +208,8 @@ pub fn run() {
         }
     }
     // 清理以前自动更新留在 app 同级目录里的 .codex-plus-update-<uuid> 残留（#2774）。
-    // 删旧 app 备份要些时间，放后台线程；失败只记诊断日志，不影响启动。
+    // 删旧 app 备份要些时间，放后台线程；刚由旧版 helper 完成的更新会在 helper 退出后补跑清掉。
+    // 失败只记诊断日志，不影响启动。
     #[cfg(target_os = "macos")]
     std::thread::spawn(codex_plus_core::update::macos::cleanup_stale_update_transactions);
     if let Ok(settings) = codex_plus_core::settings::SettingsStore::default().load() {
@@ -346,6 +347,7 @@ pub fn run() {
             agent_pet_commands::agent_pet_sound_catalog,
             agent_pet_commands::agent_pet_sound,
             agent_pet_commands::agent_pet_import_sound,
+            agent_pet_commands::agent_pet_whale_image,
             agent_launch_commands::open_agent_terminal,
             agent_mcp_commands::load_agent_mcp,
             agent_mcp_commands::save_agent_mcp,
@@ -368,7 +370,11 @@ pub fn run() {
             gateway_commands::cancel_gateway_provider_test,
             gateway_commands::delete_gateway_provider,
             gateway_commands::check_gateway_provider_models,
-            gateway_commands::fetch_gateway_provider_models,
+            gateway_commands::preview_gateway_provider_models_sync,
+            gateway_commands::apply_gateway_provider_models_sync,
+            gateway_commands::preview_gateway_provider_meta_sync,
+            gateway_commands::apply_gateway_provider_windows_sync,
+            gateway_commands::apply_gateway_provider_reasoning_sync,
             gateway_commands::save_gateway_provider_models,
             gateway_commands::refresh_gateway_quota,
             gateway_commands::sync_gateway_provider_prices,
@@ -393,6 +399,7 @@ pub fn run() {
             gateway_commands::import_gateway_providers,
             gateway_commands::save_gateway_provider_extras,
             gateway_commands::save_gateway_provider_limits,
+            gateway_commands::save_gateway_provider_newapi_access,
             gateway_commands::save_gateway_provider_windows,
             gateway_commands::save_gateway_provider_metadata,
             gateway_commands::gateway_provider_reasoning,

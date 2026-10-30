@@ -1594,6 +1594,7 @@ mod tests {
             enabled: true,
             model: String::new(),
             reuse_saved_auth: false,
+            max_concurrent_tasks: 1,
         }
     }
 

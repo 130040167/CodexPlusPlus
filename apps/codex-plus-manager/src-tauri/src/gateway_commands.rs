@@ -8,6 +8,7 @@ use serde::Serialize;
 use codex_plus_core::gateway::activity::{self, ActivitySnapshot};
 use codex_plus_core::gateway::apply::{self, ApplyContext, GroupInput, ProviderInput};
 use codex_plus_core::gateway::key_pool::{self, PoolSnapshot};
+use codex_plus_core::gateway::meta_sync;
 use codex_plus_core::gateway::model_sync;
 use codex_plus_core::gateway::store::{
     AgentBinding, GatewayGroup, GatewaySettings, GatewayStore, KeyRotationMode, new_client_token,
@@ -66,6 +67,10 @@ pub struct GatewayPoolEntry {
     pub upstream_gone: Vec<String>,
     /// 订阅账号的额度（ChatGPT 5 小时 / 每周、Copilot 本月高级请求）；查不到或普通供应商为空。
     pub quota: Option<codex_plus_core::gateway::quota::ProviderQuota>,
+    /// 有余额接口的厂商（DeepSeek、Kimi 等，#2793）：卡片用「用量」页同一份余额，不当中转站识别。
+    pub balance_api: bool,
+    /// new-api 访问令牌（打码，#2793）；没配置为空。令牌原文不传给界面。
+    pub newapi_access: Option<apply::NewApiAccessView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -192,6 +197,8 @@ fn pool_entry(
         upstream_new: upstream.0,
         upstream_gone: upstream.1,
         quota: codex_plus_core::gateway::quota::get(&relay.id),
+        balance_api: codex_plus_core::gateway::balance::has_balance_api(relay),
+        newapi_access: None,
     }
 }
 
@@ -217,6 +224,7 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
         .iter()
         .map(|provider| GatewayPoolEntry {
             keys: apply::provider_keys(&provider.relay),
+            newapi_access: apply::provider_newapi_access(provider),
             model_windows: provider.model_windows.clone(),
             context_window: provider.context_window,
             key_rpm: provider.key_rpm,
@@ -836,6 +844,32 @@ pub fn save_gateway_provider_limits(
     )
 }
 
+/// 改 new-api 供应商的访问令牌与用户 ID（#2793，在供应商池的详情里编辑）。
+/// `token` 留空沿用已保存的；`clear` 删掉令牌，之后不再查账户余额。令牌不写进返回的消息。
+#[tauri::command]
+pub fn save_gateway_provider_newapi_access(
+    id: String,
+    token: Option<String>,
+    user_id: String,
+    clear: bool,
+) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        if clear {
+            "访问令牌已清除。"
+        } else {
+            "访问令牌已保存。"
+        },
+        "保存访问令牌失败",
+        apply::set_provider_newapi_access(
+            &GatewayStore::default(),
+            &id,
+            token.as_deref(),
+            &user_id,
+            clear,
+        ),
+    )
+}
+
 /// 改供应商的上下文窗口（按模型的和其余模型用的默认值）；窗口写在 Agent 的模型资料里，存完重写 Agent 配置。
 #[tauri::command]
 pub fn save_gateway_provider_windows(
@@ -874,16 +908,41 @@ pub async fn check_gateway_provider_models(
     }
 }
 
-/// 供应商详情里的「从上游同步」：按上游多删少补——上游已没有的从列表删掉，新增的加进来。
-/// 拉取失败或上游返回空列表时不改列表。
+/// 供应商详情里「从上游同步」的第一步（#2785）：拉上游模型，返回和现有列表的差异供用户勾选，
+/// 不改任何数据。拉取失败或上游返回空列表时报错。
 #[tauri::command]
-pub async fn fetch_gateway_provider_models(id: String) -> CommandResult<Option<GatewayPayload>> {
-    let result = model_sync::fetch_provider_models(&GatewayStore::default(), &id).await;
+pub async fn preview_gateway_provider_models_sync(
+    id: String,
+) -> CommandResult<Option<model_sync::ModelSyncPreview>> {
+    match model_sync::preview_provider_models(&GatewayStore::default(), &id).await {
+        Ok(preview) => ok(
+            &format!(
+                "上游有 {} 个模型：新增 {} 个，已下架 {} 个。",
+                preview.upstream.len(),
+                preview.added.len(),
+                preview.removed.len()
+            ),
+            Some(preview),
+        ),
+        Err(error) => failed(&format!("获取模型列表失败：{error:#}"), None),
+    }
+}
+
+/// 「从上游同步」的第二步：只删用户勾选移除的、只加勾选新增的；被删模型的价格、窗口、思考等级一并清掉。
+#[tauri::command]
+pub fn apply_gateway_provider_models_sync(
+    id: String,
+    remove: Vec<String>,
+    add: Vec<String>,
+) -> CommandResult<Option<GatewayPayload>> {
+    let result = model_sync::apply_upstream_sync(&GatewayStore::default(), &id, &remove, &add);
     let message = match &result {
-        Ok((_, diff)) => sync_models_message(diff),
+        Ok((_, changes)) => sync_models_message(changes),
         Err(_) => String::new(),
     };
-    let added = result.as_ref().is_ok_and(|(_, diff)| !diff.added.is_empty());
+    let added = result
+        .as_ref()
+        .is_ok_and(|(_, changes)| !changes.added.is_empty());
     let result = refresh_agents(result);
     if added {
         autofill_prices(Some(id));
@@ -891,20 +950,83 @@ pub async fn fetch_gateway_provider_models(id: String) -> CommandResult<Option<G
     respond(&message, "从上游同步模型失败", result)
 }
 
-/// 「从上游同步」的结果提示：新增、移除各几个（列出模型名），都没有就说已是最新。
-fn sync_models_message(diff: &model_sync::ModelDiff) -> String {
-    let total = diff.upstream.len();
-    let mut parts = Vec::new();
-    if !diff.added.is_empty() {
-        parts.push(format!("新增 {} 个：{}", diff.added.len(), diff.added.join("、")));
+/// 「从上游同步上下文窗口 / 思考等级」的第一步（#2807）：拉上游 `/models`，读每个模型的元数据，
+/// 返回和现有设置的差异供用户勾选，不改任何数据。
+#[tauri::command]
+pub async fn preview_gateway_provider_meta_sync(
+    id: String,
+) -> CommandResult<Option<meta_sync::MetaSyncPreview>> {
+    match meta_sync::preview_provider_meta(&GatewayStore::default(), &id).await {
+        Ok(preview) => ok(
+            &format!(
+                "上游有 {} 个模型：上下文窗口有 {} 处不同，思考等级有 {} 处不同。",
+                preview.upstream_models,
+                preview.windows.len(),
+                preview.reasoning.len()
+            ),
+            Some(preview),
+        ),
+        Err(error) => failed(&format!("读取上游模型资料失败：{error:#}"), None),
     }
-    if !diff.removed.is_empty() {
-        parts.push(format!("移除 {} 个：{}", diff.removed.len(), diff.removed.join("、")));
+}
+
+/// 第二步：只写用户勾选的上下文窗口；窗口写在 Agent 的模型资料里，存完重写 Agent 配置。
+#[tauri::command]
+pub fn apply_gateway_provider_windows_sync(
+    id: String,
+    picks: Vec<meta_sync::WindowPick>,
+) -> CommandResult<Option<GatewayPayload>> {
+    let result = refresh_agents(meta_sync::apply_window_sync(
+        &GatewayStore::default(),
+        &id,
+        &picks,
+    ));
+    let message = match &result {
+        Ok((_, written)) => format!("已从上游同步 {written} 个模型的上下文窗口。"),
+        Err(_) => String::new(),
+    };
+    respond(&message, "同步上下文窗口失败", result)
+}
+
+/// 第二步：只写用户勾选的思考等级；写进模型资料，存完重写 Agent 配置。
+#[tauri::command]
+pub fn apply_gateway_provider_reasoning_sync(
+    id: String,
+    picks: Vec<meta_sync::ReasoningPick>,
+) -> CommandResult<Option<GatewayPayload>> {
+    let result = refresh_agents(meta_sync::apply_reasoning_sync(
+        &GatewayStore::default(),
+        &id,
+        &picks,
+    ));
+    let message = match &result {
+        Ok((_, written)) => format!("已从上游同步 {written} 个模型的思考等级。"),
+        Err(_) => String::new(),
+    };
+    respond(&message, "同步思考等级失败", result)
+}
+
+/// 「从上游同步」的结果提示：新增、移除各几个（列出模型名），都没有就说列表没变。
+fn sync_models_message(changes: &model_sync::ModelChanges) -> String {
+    let mut parts = Vec::new();
+    if !changes.added.is_empty() {
+        parts.push(format!(
+            "新增 {} 个：{}",
+            changes.added.len(),
+            changes.added.join("、")
+        ));
+    }
+    if !changes.removed.is_empty() {
+        parts.push(format!(
+            "移除 {} 个：{}",
+            changes.removed.len(),
+            changes.removed.join("、")
+        ));
     }
     if parts.is_empty() {
-        format!("上游有 {total} 个模型，列表已是最新。")
+        "模型列表没有变化。".to_string()
     } else {
-        format!("上游有 {total} 个模型，{}。", parts.join("；"))
+        format!("已同步模型：{}。", parts.join("；"))
     }
 }
 
@@ -1443,11 +1565,12 @@ pub struct GatewayBalances {
 pub async fn probe_gateway_provider_billing(
     id: String,
 ) -> CommandResult<codex_plus_core::relay_billing::RelayBillingProbe> {
-    let relay = GatewayStore::default()
-        .load()
-        .ok()
-        .and_then(|gateway| gateway.provider(&id).map(|provider| provider.relay.clone()));
-    let Some(relay) = relay else {
+    let provider = GatewayStore::default().load().ok().and_then(|gateway| {
+        gateway
+            .provider(&id)
+            .map(|provider| (provider.relay.clone(), provider.newapi_access.clone()))
+    });
+    let Some((relay, newapi_access)) = provider else {
         return failed(
             &format!("供应商不存在：{id}"),
             codex_plus_core::relay_billing::RelayBillingProbe::unrecognized(
@@ -1456,7 +1579,12 @@ pub async fn probe_gateway_provider_billing(
             ),
         );
     };
-    let probe = codex_plus_core::relay_billing::probe_relay_billing(&relay).await;
+    // 识别成 new-api 且配置了访问令牌时，顺带查账户余额（#2793）。
+    let probe = codex_plus_core::relay_billing::probe_relay_billing_with_access(
+        &relay,
+        newapi_access.as_ref(),
+    )
+    .await;
     let message = match &probe.platform {
         Some(platform) => format!("已识别为 {platform}。"),
         None if probe.outcome

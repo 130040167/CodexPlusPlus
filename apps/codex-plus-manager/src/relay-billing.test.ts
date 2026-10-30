@@ -12,6 +12,7 @@ import {
   relayBillingCacheKey,
   relayBillingProbeEligible,
   mergeRelayBillingResult,
+  newApiAccessHint,
   normalizeRelayBillingProbe,
   relayBillingCacheUsable,
   RELAY_BILLING_FAILURE_TTL_MS,
@@ -96,6 +97,36 @@ test("gateway pool entries are probed by id unless they are accounts or official
   assert.equal(relayBillingGatewayCacheKey({ ...entry, account: "chatgpt" }), "");
   assert.equal(relayBillingGatewayCacheKey({ ...entry, keyCount: 0 }), "");
   assert.equal(relayBillingGatewayCacheKey({ ...entry, baseUrl: " " }), "");
+  // 有余额接口的厂商（DeepSeek 等）余额另走「用量」页那份，不当中转站识别（#2793）。
+  assert.equal(relayBillingGatewayCacheKey({ ...entry, balanceApi: true }), "");
+  // 配上 / 换掉 new-api 访问令牌后重新识别，才能带上账户余额。
+  const withAccess = relayBillingGatewayCacheKey({ ...entry, newapiAccess: { masked: "nap_ab…wxyz", userId: "42" } });
+  assert.notEqual(withAccess, key);
+  assert.notEqual(relayBillingGatewayCacheKey({ ...entry, newapiAccess: { masked: "nap_ab…wxyz", userId: "7" } }), withAccess);
+  assert.equal(relayBillingGatewayCacheKey({ ...entry, newapiAccess: null }), key);
+});
+
+test("new-api 卡片：Key 不限额度时提示配置访问令牌，配了但失败给出原因（#2793）", () => {
+  const usage = (kind: string): RelayUsageInfo => ({
+    endpoint: "", kind, isValid: true, planName: null, remaining: kind === "wallet" ? 8.23 : null,
+    quotaLimit: null, quotaUsed: null, unit: "USD", rateLimits: [],
+  });
+  const probe = (kind: string, newapiAccess: unknown, platform = "newapi") => normalizeRelayBillingProbe({
+    platform, rate: null, usage: usage(kind), detail: "", outcome: "recognized",
+    newapiAccess: newapiAccess as RelayBillingProbe["newapiAccess"],
+  });
+  assert.deepEqual(newApiAccessHint(probe("unlimited", { configured: false, error: null })), { text: "", failed: false });
+  // 旧后端没有这个字段时也按「没配置」提示。
+  assert.deepEqual(newApiAccessHint(probe("unlimited", undefined)), { text: "", failed: false });
+  assert.deepEqual(
+    newApiAccessHint(probe("unlimited", { configured: true, error: "HTTP 401：无权进行此操作" })),
+    { text: "HTTP 401：无权进行此操作", failed: true },
+  );
+  // 查到了余额、Key 自己有额度、或者不是 new-api：不提示。
+  assert.equal(newApiAccessHint(probe("wallet", { configured: true, error: null })), null);
+  assert.equal(newApiAccessHint(probe("keyQuota", { configured: false, error: null })), null);
+  assert.equal(newApiAccessHint(probe("unlimited", null, "sub2api")), null);
+  assert.equal(probe("unlimited", { configured: true, error: null }, "sub2api").newapiAccess, null);
 });
 
 test("pool badge shows remaining amount, quota ratio and exhausted tone", () => {

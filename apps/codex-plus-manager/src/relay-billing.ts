@@ -36,6 +36,9 @@ export type RelayUsageInfo = {
  */
 export type RelayBillingOutcome = "recognized" | "notRelay" | "unavailable";
 
+/** new-api 访问令牌查账户余额的情况（#2793）：没配置、查到了（error 为空）或失败原因（不含令牌）。 */
+export type NewApiAccessStatus = { configured: boolean; error: string | null };
+
 export type RelayBillingProbe = {
   /** 识别出的中转站；null 表示没识别出，原因看 outcome。 */
   platform: RelayBillingPlatform | null;
@@ -43,6 +46,8 @@ export type RelayBillingProbe = {
   usage: RelayUsageInfo | null;
   detail: string;
   outcome: RelayBillingOutcome;
+  /** new-api 才有；旧后端没有这个字段。 */
+  newapiAccess?: NewApiAccessStatus | null;
 };
 
 export function relayPlatformLabel(platform: RelayBillingPlatform): string {
@@ -75,6 +80,7 @@ export function normalizeRelayBillingProbe(result: {
   usage?: RelayUsageInfo | null;
   detail?: string | null;
   outcome?: string | null;
+  newapiAccess?: NewApiAccessStatus | null;
 }): RelayBillingProbe {
   const platform = result.platform === "sub2api" || result.platform === "newapi" ? result.platform : null;
   return {
@@ -83,7 +89,20 @@ export function normalizeRelayBillingProbe(result: {
     usage: result.usage ?? null,
     detail: result.detail ?? "",
     outcome: platform ? "recognized" : result.outcome === "unavailable" ? "unavailable" : "notRelay",
+    newapiAccess: platform === "newapi" ? result.newapiAccess ?? null : null,
   };
+}
+
+/**
+ * 供应商池里 new-api 卡片的余额提示（#2793）：Key 不限额度、拿不到余额时，说明配访问令牌能显示余额，
+ * 或者配了但查询失败的原因。查到余额、或不是 new-api 时为 null。只给供应商池用（直连模式没有这个设置）。
+ */
+export function newApiAccessHint(probe: RelayBillingProbe): { text: string; failed: boolean } | null {
+  if (probe.platform !== "newapi" || probe.usage?.kind !== "unlimited") return null;
+  const access = probe.newapiAccess;
+  if (access?.configured && access.error) return { text: access.error, failed: true };
+  if (access?.configured) return null;
+  return { text: "", failed: false };
 }
 
 /** 内存里的识别缓存。 */
@@ -153,8 +172,8 @@ export function relayBillingCacheKey(profile: RelayBillingProfile): string {
   return `${profile.id}|${fingerprint(`${upstreamUrl(profile)}\n${activeApiKey(profile)}`)}`;
 }
 
-/** 网关供应商池：前端看不到 Key，按地址、Key 数和代理变化重新识别。
- *  订阅登录账号和内置的官方厂商（DeepSeek、Kimi 等）不识别。 */
+/** 网关供应商池：前端看不到 Key，按地址、Key 数、代理和 new-api 访问令牌变化重新识别。
+ *  订阅登录账号、官方登录，以及有余额接口的厂商（DeepSeek、Kimi 等，余额另走「用量」页那份）不识别。 */
 export function relayBillingGatewayCacheKey(entry: {
   id: string;
   baseUrl: string;
@@ -162,10 +181,13 @@ export function relayBillingGatewayCacheKey(entry: {
   official?: boolean;
   proxy?: string;
   account?: string | null;
+  balanceApi?: boolean;
+  newapiAccess?: { masked: string; userId: string } | null;
 }): string {
-  if (entry.account || entry.official || entry.keyCount <= 0 || !entry.baseUrl.trim()) return "";
+  if (entry.account || entry.official || entry.balanceApi || entry.keyCount <= 0 || !entry.baseUrl.trim()) return "";
   const url = entry.baseUrl.trim().replace(/\/+$/, "");
-  return `gateway:${entry.id}|${fingerprint(`${url}\n${entry.keyCount}\n${entry.proxy ?? ""}`)}`;
+  const access = entry.newapiAccess ? `\n${entry.newapiAccess.masked}\n${entry.newapiAccess.userId}` : "";
+  return `gateway:${entry.id}|${fingerprint(`${url}\n${entry.keyCount}\n${entry.proxy ?? ""}${access}`)}`;
 }
 
 type StorageLike = Pick<Storage, "getItem" | "setItem">;

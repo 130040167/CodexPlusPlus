@@ -23,8 +23,12 @@ const WORKER_LEASE_MS: u64 = 30 * 1000;
 const QUEUED_LEASE_MS: u64 = 60 * 1000;
 /// 排队任务由提交它的进程定期续租；间隔远小于 QUEUED_LEASE_MS，进程失联后才会过期。
 const QUEUE_HEARTBEAT_MS: u64 = 10 * 1000;
-/// 每个 Agent 同一时间只运行一个任务；繁忙时新任务排队，最多排这么多个（不含正在运行的，#2772）。
+/// 同一 Agent 运行中的任务达到并发上限时新任务排队，最多排这么多个（不含正在运行的，#2772）。
 pub const MAX_QUEUED_PER_AGENT: usize = 8;
+/// 每个 Agent 默认同时只运行一个任务，与 2.1.3 的排队行为一致（#2800）。
+pub const DEFAULT_MAX_CONCURRENT_TASKS: u32 = 1;
+/// 每个 Agent 同时运行的任务数上限的可选范围上界（#2800）。
+pub const MAX_CONCURRENT_TASKS_LIMIT: u32 = 4;
 const QUEUE_ABANDONED_PROGRESS: &str = "排队任务未启动";
 
 /// 排队任务轮询一次的结果。
@@ -32,7 +36,8 @@ const QUEUE_ABANDONED_PROGRESS: &str = "排队任务未启动";
 pub enum QueueTurn {
     /// 已轮到并认领执行权，状态已转为 running。
     Start,
-    /// 仍在排队；ahead 为同一 Agent 排在前面的未结束任务数（含正在运行的）。
+    /// 仍在排队；ahead 为还要结束几个任务才轮到本任务：更早提交的排队任务数，
+    /// 加上运行中的任务超出「并发上限 - 1」的部分。并发上限为 1 时即前面的未结束任务数。
     Wait { ahead: usize },
     /// 已取消、已结束或 Agent/协作已关闭，不再启动。
     Stop,
@@ -51,10 +56,25 @@ pub struct AgentConfig {
     /// 仅 DSH 可选择由原生 CLI 复用已保存的认证，本工具不保存凭据。
     #[serde(default, skip_serializing_if = "is_false")]
     pub reuse_saved_auth: bool,
+    /// 同一 Agent 最多同时运行的任务数（1–4），达到上限后新任务排队（#2800）。
+    /// 旧配置没有此字段时取 1；取默认值时不写出，回退到 deny_unknown_fields 的旧版本仍能读取。
+    #[serde(
+        default = "default_max_concurrent_tasks",
+        skip_serializing_if = "is_default_max_concurrent_tasks"
+    )]
+    pub max_concurrent_tasks: u32,
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn default_max_concurrent_tasks() -> u32 {
+    DEFAULT_MAX_CONCURRENT_TASKS
+}
+
+fn is_default_max_concurrent_tasks(value: &u32) -> bool {
+    *value == DEFAULT_MAX_CONCURRENT_TASKS
 }
 
 /// DSH 的临时模型配置需要同时指定供应商与模型，不能推测桌面当前选中的路由。
@@ -126,6 +146,7 @@ impl Default for CollaborationConfig {
                 enabled: false,
                 model: String::new(),
                 reuse_saved_auth: false,
+                max_concurrent_tasks: DEFAULT_MAX_CONCURRENT_TASKS,
             })
             .collect(),
             max_runtime_minutes: DEFAULT_MAX_RUNTIME_MINUTES,
@@ -348,7 +369,8 @@ impl Store {
             Ok(
                 json!({"config": state.config, "availability": availability, "tasks": tasks,
                 "capabilities": {"cliTasks": true, "desktopSessionWake": false,
-                    "maxQueuedPerAgent": MAX_QUEUED_PER_AGENT}}),
+                    "maxQueuedPerAgent": MAX_QUEUED_PER_AGENT,
+                    "maxConcurrentTasksLimit": MAX_CONCURRENT_TASKS_LIMIT}}),
             )
         })
     }
@@ -386,7 +408,7 @@ impl Store {
             if state.tasks.len() >= MAX_TASKS {
                 bail!("协作记录已达到 1000 条上限，请使用新的协作状态文件");
             }
-            // 同一 Agent 繁忙时排队而不是拒绝；排队数有上限，避免无界堆积（#2772）。
+            // 同一 Agent 达到并发上限时排队而不是拒绝；排队数有上限，避免无界堆积（#2772）。
             let queued = state
                 .tasks
                 .iter()
@@ -397,11 +419,13 @@ impl Store {
                     "此 agent 已有 {queued} 个排队任务，达到每个 Agent 最多排队 {MAX_QUEUED_PER_AGENT} 个的上限；请等待前面的任务结束，或取消部分排队任务后再提交"
                 );
             }
-            let ahead = state
-                .tasks
-                .iter()
-                .filter(|task| task.agent_id == request.agent_id && !is_terminal(&task.status))
-                .count();
+            // 新任务排在所有已有任务之后（下标即 tasks.len()）。
+            let ahead = tasks_ahead(
+                &state.tasks,
+                &request.agent_id,
+                state.tasks.len(),
+                concurrency_limit(&state.config, &request.agent_id),
+            );
             let (parent_task_id, session_id) =
                 if let Some(parent_id) = request.continue_task_id.as_deref() {
                     let parent = state
@@ -457,7 +481,9 @@ impl Store {
     }
 
     /// 排队任务的单次轮询：轮到时认领执行权，否则刷新排队进度并续租。
-    /// 同一 Agent 按提交顺序启动；前一个任务结束（完成、失败、取消、中断）后下一个才会轮到。
+    /// 同一 Agent 按提交顺序启动：运行中的任务数小于该 Agent 的并发上限、且前面没有更早的排队任务
+    /// 时才轮到（#2800）；达到上限时，任一运行中的任务结束（完成、失败、取消、中断）后下一个轮到。
+    /// 判断与认领在同一个 IMMEDIATE 写事务里，多个进程同时轮询也不会超过上限。
     /// 轮询的进程登记为该任务的持有者：之后租约因睡眠或卡顿过期时，只要持有进程还在就不判为失联。
     pub fn poll_queue(&self, id: &str) -> anyhow::Result<QueueTurn> {
         let owners_dir = self.owners_dir();
@@ -474,13 +500,23 @@ impl Store {
             {
                 return Ok(QueueTurn::Stop);
             }
-            let ahead = tasks_ahead(&state.tasks, index);
+            let ahead = tasks_ahead(
+                &state.tasks,
+                &task.agent_id,
+                index,
+                concurrency_limit(&state.config, &task.agent_id),
+            );
             let timestamp = now_ms();
             if ahead == 0 {
                 state.queue_owners.remove(id);
+                let sharing = running_in_same_cwd(&state.tasks, index);
                 let task = &mut state.tasks[index];
                 task.status = "running".to_string();
-                task.progress = "正在启动 CLI".to_string();
+                task.progress = if sharing == 0 {
+                    "正在启动 CLI".to_string()
+                } else {
+                    format!("正在启动 CLI；{}", same_cwd_hint(sharing))
+                };
                 task.updated_at_ms = timestamp;
                 return Ok(QueueTurn::Start);
             }
@@ -511,8 +547,36 @@ impl Store {
         {
             return Ok(None);
         }
-        let ahead = tasks_ahead(&state.tasks, index);
+        let ahead = tasks_ahead(
+            &state.tasks,
+            &task.agent_id,
+            index,
+            concurrency_limit(&state.config, &task.agent_id),
+        );
         Ok((ahead > 0 && queue_wait_is_current(task, ahead, now_ms())).then_some(ahead))
+    }
+
+    /// 与该任务同一工作目录、且可能与它同时运行的其他未结束任务数（只读，#2800）。
+    /// 不同 Agent 的任务总可能并行；同一 Agent 只有并发上限大于 1 时才会并行。
+    /// 不强制分目录，只用于给调用方一句提示。
+    pub fn overlapping_cwd_tasks(&self, id: &str) -> anyhow::Result<usize> {
+        let state = self.read_state()?;
+        let task = state
+            .tasks
+            .iter()
+            .find(|task| task.id == id)
+            .context("找不到协作任务")?;
+        let same_agent_parallel = concurrency_limit(&state.config, &task.agent_id) > 1;
+        Ok(state
+            .tasks
+            .iter()
+            .filter(|other| {
+                other.id != task.id
+                    && other.cwd == task.cwd
+                    && !is_terminal(&other.status)
+                    && (other.agent_id != task.agent_id || same_agent_parallel)
+            })
+            .count())
     }
 
     /// 执行进程退出时放弃仍在排队的任务：任务从未启动，标记失败并说明可重新提交。
@@ -656,20 +720,55 @@ impl Store {
     }
 }
 
-/// 同一 Agent 排在 index 之前的未结束任务数：所有运行中的任务加上更早提交的排队任务。
-/// 任务按提交顺序追加且不删除，向量顺序即排队顺序。
-fn tasks_ahead(tasks: &[TaskRecord], index: usize) -> usize {
-    let agent_id = &tasks[index].agent_id;
+/// 排在 index 处的 agent_id 任务还要等几个任务结束才轮到：更早提交的排队任务数，
+/// 加上运行中的任务超出「并发上限 - 1」的部分（#2800）。为 0 即运行中的任务数小于上限、
+/// 且前面没有更早的排队任务，可以启动。并发上限为 1 时等于前面的未结束任务数，与 #2772 一致。
+/// 任务按提交顺序追加且不删除，向量顺序即排队顺序；index 可以等于 tasks.len()（尚未写入的新任务）。
+fn tasks_ahead(tasks: &[TaskRecord], agent_id: &str, index: usize, limit: usize) -> usize {
+    let (mut running, mut earlier_queued) = (0usize, 0usize);
+    for (position, task) in tasks.iter().enumerate() {
+        if position == index || task.agent_id != agent_id || is_terminal(&task.status) {
+            continue;
+        }
+        if task.status != "queued" {
+            running += 1;
+        } else if position < index {
+            earlier_queued += 1;
+        }
+    }
+    earlier_queued + (running + 1).saturating_sub(limit.max(1))
+}
+
+/// 该 Agent 的并发上限；未知 Agent 按 1 处理。
+fn concurrency_limit(config: &CollaborationConfig, agent_id: &str) -> usize {
+    config
+        .agents
+        .iter()
+        .find(|agent| agent.id == agent_id)
+        .map_or(DEFAULT_MAX_CONCURRENT_TASKS, |agent| agent.max_concurrent_tasks)
+        .max(1) as usize
+}
+
+/// 与 index 处任务同一工作目录、正在运行的其他任务数（任意 Agent）。
+fn running_in_same_cwd(tasks: &[TaskRecord], index: usize) -> usize {
+    let cwd = &tasks[index].cwd;
     tasks
         .iter()
         .enumerate()
         .filter(|(position, task)| {
             *position != index
-                && task.agent_id == *agent_id
+                && task.cwd == *cwd
                 && !is_terminal(&task.status)
-                && (task.status != "queued" || *position < index)
+                && task.status != "queued"
         })
         .count()
+}
+
+/// 并发任务共用工作目录时的提示：不阻止执行，只提醒调用方分目录。
+pub fn same_cwd_hint(count: usize) -> String {
+    format!(
+        "提示：同一工作目录还有 {count} 个任务可能同时运行，可能互相修改相同文件；并发任务建议使用不同的工作目录（例如各自的 git worktree）"
+    )
 }
 
 fn agent_enabled(config: &CollaborationConfig, agent_id: &str) -> bool {
@@ -757,6 +856,9 @@ fn normalize_config(config: CollaborationConfig) -> anyhow::Result<Collaboration
         }
         if agent.id == "deepseek" {
             parse_deepseek_model(&agent.model)?;
+        }
+        if !(1..=MAX_CONCURRENT_TASKS_LIMIT).contains(&agent.max_concurrent_tasks) {
+            bail!("同一 Agent 同时执行的任务数必须在 1 到 {MAX_CONCURRENT_TASKS_LIMIT} 之间");
         }
         if agent.name.is_empty() {
             agent.name.clone_from(&target.name);

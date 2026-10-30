@@ -1645,6 +1645,67 @@ fn apply_aggregate_relay_points_codex_to_local_responses_proxy_without_snapshot(
     assert!(updated.contains("requires_openai_auth = false"));
     assert!(updated.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
     assert!(updated.contains(r#"experimental_bearer_token = "codex-plus-aggregate""#));
+    let doc = updated.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(doc["model_provider"].as_str(), Some("custom"));
+    assert_eq!(
+        doc["model_providers"]["codex_plus_managed"].to_string(),
+        doc["model_providers"]["custom"].to_string(),
+        "聚合会话的内部 provider 必须能由原生恢复入口直接解析"
+    );
+}
+
+#[test]
+fn managed_session_provider_official_native_resume_config_preserves_login_and_transport() {
+    for official_http in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let rollout = home.join("legacy.jsonl");
+        let metadata = r#"{"type":"session_meta","payload":{"model_provider":"codex_plus_managed"}}"#;
+        std::fs::write(&rollout, metadata).unwrap();
+        let db = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (model_provider TEXT); INSERT INTO threads VALUES ('codex_plus_managed');").unwrap();
+        let login = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"synthetic-official-login"}}"#;
+        std::fs::write(home.join("auth.json"), login).unwrap();
+        std::fs::write(home.join("config.toml"), r#"
+model_provider = "custom"
+[model_providers.custom]
+name = "Relay"
+wire_api = "responses"
+base_url = "https://old.invalid/v1"
+experimental_bearer_token = "synthetic-old-key"
+[model_providers.codex_plus_managed]
+experimental_bearer_token = "synthetic-old-key"
+"#).unwrap();
+        let settings = BackendSettings::default();
+        let snapshot = if official_http {
+            "model_provider = 'openai-http'\n[model_providers.openai-http]\nname = 'OpenAI (HTTP)'\nwire_api = 'responses'\nrequires_openai_auth = true\nsupports_websockets = false\n"
+        } else {
+            ""
+        };
+        if official_http {
+            apply_relay_config_file_to_home(home, snapshot).unwrap();
+        }
+        clear_relay_config_to_home_with_auth(home, Some(login)).unwrap();
+        for _ in 0..2 {
+            codex_plus_core::relay_config::ensure_managed_session_provider_in_home(home, &settings).unwrap();
+            let text = std::fs::read_to_string(home.join("config.toml")).unwrap();
+            let doc = text.parse::<toml_edit::DocumentMut>().unwrap();
+            assert_eq!(doc.get("model_provider").and_then(toml_edit::Item::as_str), official_http.then_some("openai-http"));
+            let provider = &doc["model_providers"]["codex_plus_managed"];
+            assert_eq!(provider["requires_openai_auth"].as_bool(), Some(true));
+            assert_eq!(provider["wire_api"].as_str(), Some("responses"));
+            assert_eq!(provider.get("supports_websockets").and_then(toml_edit::Item::as_bool), official_http.then_some(false));
+            for credential in ["base_url", "experimental_bearer_token", "env_key", "http_headers"] {
+                assert!(provider.get(credential).is_none());
+            }
+            assert!(!text.contains("synthetic-old-key"));
+            assert!(!text.contains("old.invalid"));
+            assert_eq!(std::fs::read_to_string(home.join("auth.json")).unwrap(), login);
+            assert_eq!(std::fs::read_to_string(&rollout).unwrap(), metadata);
+            assert_eq!(db.query_row("SELECT model_provider FROM threads", [], |row| row.get::<_, String>(0)).unwrap(), "codex_plus_managed");
+            clear_relay_config_to_home_with_auth(home, Some(login)).unwrap();
+        }
+    }
 }
 
 #[test]
@@ -7898,6 +7959,46 @@ base_url = "https://responses.example.test/v1"
         auth_contents: r#"{"OPENAI_API_KEY":"sk-test-redacted"}"#.to_string(),
         ..RelayProfile::default()
     }
+}
+
+#[test]
+fn managed_provider_repair_failure_after_apply_does_not_report_switch_failure() {
+    let _state = crate::common::global_state_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let log_path = home.join("codex-plus.log");
+    codex_plus_core::diagnostic_log::set_diagnostic_log_path_for_tests(Some(log_path.clone()));
+    let db = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads (model_provider TEXT); \
+         INSERT INTO threads VALUES ('codex_plus_managed');",
+    )
+    .unwrap();
+    drop(db);
+    std::fs::write(home.join("backups"), "blocks only the post-write backup").unwrap();
+
+    let applied = apply_relay_profile_to_home_with_switch_rules_and_proxy_port(
+        home,
+        &responses_profile_with_model("gpt-5.4"),
+        "",
+        57321,
+    );
+    codex_plus_core::diagnostic_log::set_diagnostic_log_path_for_tests(None);
+
+    let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    assert_eq!(
+        config
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap()["model"]
+            .as_str(),
+        Some("gpt-5.4"),
+    );
+    assert!(applied.is_ok(), "the profile has already been written: {applied:?}");
+    assert!(
+        std::fs::read_to_string(log_path)
+            .unwrap()
+            .contains("relay_config.managed_session_provider_repair_failed")
+    );
 }
 
 /// issue #2081：切换默认模型时只记录待迁移项，不碰 sqlite；

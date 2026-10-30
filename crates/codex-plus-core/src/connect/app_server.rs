@@ -45,6 +45,29 @@ pub struct CodexAppServer {
     config: AppServerConfig,
 }
 
+fn turn_params(
+    config: &AppServerConfig,
+    thread_id: &str,
+    prompt: &str,
+    image_paths: &[PathBuf],
+) -> Value {
+    let mut input = vec![json!({"type": "text", "text": prompt, "text_elements": []})];
+    input.extend(
+        image_paths
+            .iter()
+            .map(|path| json!({"type": "localImage", "path": path.to_string_lossy()})),
+    );
+    let mut params = json!({
+        "threadId": thread_id,
+        "input": input,
+        "approvalPolicy": "never"
+    });
+    if !config.model.trim().is_empty() {
+        params["model"] = Value::String(config.model.trim().to_string());
+    }
+    params
+}
+
 fn collect_stderr_tail(sink: &Arc<Mutex<VecDeque<String>>>) -> String {
     sink.lock()
         .map(|lines| lines.iter().cloned().collect::<Vec<_>>().join("；"))
@@ -271,19 +294,17 @@ impl CodexAppServer {
         thread_id: &str,
         prompt: &str,
     ) -> anyhow::Result<AppServerTurnResult> {
+        self.run_turn_with_images(thread_id, prompt, &[]).await
+    }
+
+    pub async fn run_turn_with_images(
+        &mut self,
+        thread_id: &str,
+        prompt: &str,
+        image_paths: &[PathBuf],
+    ) -> anyhow::Result<AppServerTurnResult> {
         let id = self.take_request_id();
-        let mut params = json!({
-            "threadId": thread_id,
-            "input": [{
-                "type": "text",
-                "text": prompt,
-                "text_elements": []
-            }],
-            "approvalPolicy": "never"
-        });
-        if !self.config.model.trim().is_empty() {
-            params["model"] = Value::String(self.config.model.trim().to_string());
-        }
+        let params = turn_params(&self.config, thread_id, prompt, image_paths);
         self.write_json(&json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -686,6 +707,45 @@ fn deep_string(value: Option<&Value>, keys: &[&str]) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn turn_params_preserve_text_and_encode_local_images_without_tools() {
+        let config = AppServerConfig {
+            executable: "unused".into(),
+            work_dir: PathBuf::from("workspace"),
+            model: " existing-model ".into(),
+            sandbox: "read-only".into(),
+        };
+        let images = [
+            PathBuf::from("workspace/image one.png"),
+            PathBuf::from("workspace/two.jpg"),
+        ];
+        let params = turn_params(&config, "saved-thread", "caption and file path", &images);
+        assert_eq!(
+            params,
+            json!({
+                "threadId": "saved-thread",
+                "input": [
+                    {"type":"text", "text":"caption and file path", "text_elements":[]},
+                    {"type":"localImage", "path":images[0]},
+                    {"type":"localImage", "path":images[1]}
+                ],
+                "approvalPolicy":"never",
+                "model":"existing-model"
+            })
+        );
+        let mut default_config = config;
+        default_config.model.clear();
+        let text_only = turn_params(&default_config, "saved-thread", "original text", &[]);
+        assert_eq!(
+            text_only,
+            json!({
+                "threadId":"saved-thread",
+                "input":[{"type":"text", "text":"original text", "text_elements":[]}],
+                "approvalPolicy":"never"
+            })
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn expired_managed_executable_resolves_after_desktop_update() {
@@ -865,8 +925,7 @@ mod tests {
         assert!(store.contains("系统保护"), "{store}");
         assert!(store.contains("清空"), "{store}");
 
-        let plain =
-            spawn_failure_hint(r"C:\codex\codex.exe", std::io::ErrorKind::PermissionDenied);
+        let plain = spawn_failure_hint(r"C:\codex\codex.exe", std::io::ErrorKind::PermissionDenied);
         assert_eq!(plain, "：没有执行权限");
 
         let missing = spawn_failure_hint("codex", std::io::ErrorKind::NotFound);
