@@ -11,10 +11,12 @@ anyhow.workspace = true
 async-trait = "0.1"
 base64.workspace = true
 directories.workspace = true
+ecb = { version = "0.1", features = ["alloc"] }
 futures-util = "0.3"
 http.workspace = true
 httpdate.workspace = true
 fs2.workspace = true
+md-5 = "0.10"
 reqwest.workspace = true
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rusqlite.workspace = true

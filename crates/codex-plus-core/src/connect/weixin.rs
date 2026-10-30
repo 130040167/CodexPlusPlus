@@ -1,5 +1,7 @@
+use std::path::Path;
 use std::time::Duration;
 
+use super::media::{self, DownloadedAttachments};
 use anyhow::{Context, bail};
 use base64::Engine;
 use futures_util::StreamExt;
@@ -19,6 +21,7 @@ pub struct WeixinClient {
     token: String,
     route_tag: String,
     client: reqwest::Client,
+    media_client: media::MediaClient,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -91,6 +94,10 @@ pub struct WeixinMessageItem {
     #[serde(default)]
     pub voice_item: Option<WeixinVoiceItem>,
     #[serde(default)]
+    pub image_item: Option<media::WeixinImageItem>,
+    #[serde(default)]
+    pub file_item: Option<media::WeixinFileItem>,
+    #[serde(default)]
     pub ref_msg: Option<WeixinReferenceMessage>,
 }
 
@@ -136,7 +143,24 @@ impl WeixinClient {
             token: token.trim().to_string(),
             route_tag: route_tag.trim().to_string(),
             client,
+            media_client: media::MediaClient::new(media::DEFAULT_CDN_BASE_URL)?,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_media_base_url(mut self, base_url: &str) -> anyhow::Result<Self> {
+        self.media_client = media::MediaClient::new(base_url)?;
+        Ok(self)
+    }
+
+    pub async fn download_attachments(
+        &self,
+        message: &WeixinMessage,
+        directory: &Path,
+    ) -> DownloadedAttachments {
+        self.media_client
+            .download_attachments(message, directory)
+            .await
     }
 
     pub async fn fetch_qr_code(base_url: &str, route_tag: &str) -> anyhow::Result<WeixinQrCode> {
@@ -375,6 +399,10 @@ async fn read_response_limited(
 }
 
 impl WeixinMessage {
+    pub fn has_attachments(&self) -> bool {
+        media::has_attachments(self)
+    }
+
     pub fn is_finished_user_message(&self) -> bool {
         self.message_type == 1 && self.message_state == 2 && !self.from_user_id.trim().is_empty()
     }
