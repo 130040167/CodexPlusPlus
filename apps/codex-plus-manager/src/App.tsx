@@ -289,6 +289,8 @@ import {
 import { subscribeLanguage, getLanguage, t, tf, toggleLanguage } from "@/i18n";
 import { vlmTestTranslation } from "./vlm-test-translation";
 import {
+  multiLaunchInstanceCanRestart,
+  multiLaunchInstanceCanStop,
   multiLaunchInstanceFailure,
   multiLaunchInstanceLabel as formatMultiLaunchInstanceLabel,
   multiLaunchInstanceRunning,
@@ -7557,8 +7559,7 @@ function CodexMultiLaunchScreen({
               <div className="multi-launch-instance-list">
                 {actions.multiLaunchInstances.map((instance) => {
                   const status = multiLaunchInstanceStatus(instance);
-                  const running = multiLaunchInstanceRunning(instance);
-                  const canStop = running || status === "unknown" || status === "failed";
+                  const canStop = multiLaunchInstanceCanStop(instance);
                   const pending = actions.multiLaunchActionPending === instance.instanceId;
                   const label = formatMultiLaunchInstanceLabel(instance, { main: t("主 Codex"), fallback: t("Codex 实例") });
                   // 启动失败的原因必须让用户看得见：Windows 上多开曾经完全不吭声。
@@ -7580,7 +7581,7 @@ function CodexMultiLaunchScreen({
                       <UiBadge className={`multi-launch-instance-status ${statusClass(status)}`} variant="secondary">{statusLabel(status)}</UiBadge>
                       <span className="relay-card-actions">
                         <Button
-                          disabled={pending}
+                          disabled={!multiLaunchInstanceCanRestart(instance) || pending}
                           onClick={() => void actions.restartMultiLaunchInstance(instance)}
                           size="sm"
                           title={t("重启此 Codex 实例")}
