@@ -1377,6 +1377,12 @@ impl LaunchHooks for DefaultLaunchHooks {
             }
         }
         if cfg!(windows) && !isolated_multi_instance {
+            // issue #2789：Codex++ 以管理员身份运行时，Codex 会被 Chromium 经 explorer 降权
+            // 重启而脱离包上下文，这里补上豁免开关（见 `packaged_launch::DO_NOT_DE_ELEVATE_SWITCH`）。
+            // 只影响打包版主实例这条分支；未提权时参数原样不变。
+            let elevated = crate::windows_integration::current_process_is_elevated();
+            let launch_extra_args =
+                crate::packaged_launch::packaged_launch_extra_args(&launch_extra_args, elevated);
             // AUMID 解析留在调用点：它要查系统里的 Store 注册表（#2140），是有副作用
             // 的一步；下面的构造函数只做纯拼接。解析不出来（目录名像包、但系统里没
             // 这个包）就不再走打包激活，继续往下按路径启动——与既有回退路径一致。
@@ -1441,6 +1447,16 @@ impl LaunchHooks for DefaultLaunchHooks {
                         );
                     }
                 }
+                // 激活前留一条记录：日志停在这里就说明卡在激活调用本身（#2795）。
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.packaged_activation_begin",
+                    serde_json::json!({
+                        "app_user_model_id": app_user_model_id,
+                        "debug_port": debug_port,
+                        "elevated": elevated,
+                        "arguments": arguments,
+                    }),
+                );
                 match activate_packaged_app(app_user_model_id, arguments).await {
                     Ok(process_id) => {
                         #[cfg(windows)]
@@ -1529,6 +1545,25 @@ impl LaunchHooks for DefaultLaunchHooks {
                                 "error": error.to_string()
                             }),
                         );
+                        // 激活调用超时（#2795）：按路径启动同样拿不到包身份，回退没有意义，
+                        // 直接给出可操作的提示。
+                        if error
+                            .downcast_ref::<crate::packaged_launch::AumidActivationTimedOut>()
+                            .is_some()
+                        {
+                            let executable = crate::app_paths::build_codex_executable(app_dir);
+                            let executable_name = executable
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "Codex".to_string());
+                            anyhow::bail!(
+                                crate::packaged_launch::aumid_activation_timed_out_message(
+                                    crate::packaged_launch::AUMID_ACTIVATION_CALL_TIMEOUT
+                                        .as_secs(),
+                                    &executable_name,
+                                )
+                            );
+                        }
                         // 提权进程激活打包应用必然失败，按路径启动的进程会因缺少
                         // 包身份立即退出、注入也必然失败；此时必须如实失败并给出
                         // 指引，而不是静默回退导致 latest-status.json 误报 running
@@ -6304,11 +6339,20 @@ pub async fn activate_packaged_app(
 ) -> anyhow::Result<u32> {
     let app_user_model_id = app_user_model_id.to_string();
     let arguments = arguments.to_string();
-    tokio::task::spawn_blocking(move || {
+    let activation = tokio::task::spawn_blocking(move || {
         activate_packaged_app_blocking(&app_user_model_id, &arguments)
-    })
-    .await
-    .context("packaged app activation task failed")?
+    });
+    // issue #2795：ActivateApplication 可能一直不返回，必须有上限；超时后阻塞线程留给系统，
+    // 启动流程如实报错，不再无声地停在「启动 Codex」。
+    let timeout = crate::packaged_launch::AUMID_ACTIVATION_CALL_TIMEOUT;
+    match tokio::time::timeout(timeout, activation).await {
+        Ok(result) => result.context("packaged app activation task failed")?,
+        Err(_) => Err(anyhow::Error::new(
+            crate::packaged_launch::AumidActivationTimedOut {
+                seconds: timeout.as_secs(),
+            },
+        )),
+    }
 }
 
 #[cfg(windows)]
