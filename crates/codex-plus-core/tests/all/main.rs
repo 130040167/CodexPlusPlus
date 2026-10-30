@@ -53,6 +53,7 @@ mod gateway_model_sync;
 mod gateway_newapi_access;
 mod gateway_provider_keys;
 mod gateway_provider_probe;
+mod gateway_rate_limit;
 mod gateway_restore;
 mod helper_body_limit_settings;
 mod history_turn_recovery;

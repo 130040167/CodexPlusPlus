@@ -3585,6 +3585,9 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     let strict_aggregate_model = aggregate_model.is_some() || forced.is_some();
     let relay_count = relays.len();
     let mut exec_negotiation_used = false;
+    // 网关模式（#2802）：上游 429 不在这里对同一个 Key 退避重发——那只会让同一个 Key 在限流中
+    // 再挨几次、拖住换 Key；交给网关去冷却这个 Key、换下一个，或都在冷却时等最早恢复的那个。
+    let gateway_forced = forced.is_some();
     let mut auto_retry = if forced.as_ref().is_some_and(|forced| !forced.auto_retry) {
         None
     } else {
@@ -4419,7 +4422,9 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             let retry_after = exec_retry_after_duration(upstream.headers(), SystemTime::now());
             let scheduled = auto_retry
                 .as_mut()
-                .filter(|retry| retry.retries_status(status_code))
+                .filter(|retry| {
+                    retry.retries_status(status_code) && !(gateway_forced && status_code == 429)
+                })
                 .and_then(|retry| {
                     retry
                         .schedule(retry_after)
