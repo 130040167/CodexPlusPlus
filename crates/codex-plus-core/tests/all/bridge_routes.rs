@@ -1266,19 +1266,25 @@ fn install_market_script_ignores_checksum_mismatch_and_replaces_existing_file() 
 
 #[tokio::test]
 async fn launch_lifecycle_uses_hook_supplied_bridge_context_for_injection() {
+    let _state = crate::common::IsolatedTestState::new();
     let temp = tempfile::tempdir().unwrap();
+    let debug_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let helper_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let debug_port = debug_listener.local_addr().unwrap().port();
+    let helper_port = helper_listener.local_addr().unwrap().port();
     let app_dir = temp.path().join("Codex.app");
     std::fs::create_dir_all(&app_dir).unwrap();
     let events = Arc::new(Mutex::new(Vec::<String>::new()));
     let hooks = ContextHooks {
+        directory: Arc::new(tempfile::tempdir().unwrap()),
         events: events.clone(),
     };
 
     launch_and_inject_with_hooks(
         LaunchOptions {
             app_dir: Some(app_dir),
-            debug_port: 9229,
-            helper_port: 57321,
+            debug_port,
+            helper_port,
             status_store: StatusStore::new(temp.path().join("latest-status.json")),
             ..Default::default()
         },
@@ -1290,12 +1296,20 @@ async fn launch_lifecycle_uses_hook_supplied_bridge_context_for_injection() {
     assert_eq!(
         *events.lock().unwrap(),
         vec![
-            "bridge-context:9229",
-            "inject-bridge:9229:57321",
-            "watchdog:9229:57321",
-            "status:running",
+            format!("bridge-context:{debug_port}"),
+            format!("inject-bridge:{debug_port}:{helper_port}"),
+            format!("sanitize-local-storage:{debug_port}"),
+            format!("watchdog:{debug_port}:{helper_port}"),
+            "status:running".to_string(),
         ]
     );
+    for listener in [debug_listener, helper_listener] {
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
 }
 
 fn test_context() -> BridgeContext {
@@ -1587,6 +1601,7 @@ impl BridgeDataService for FakeData {
 
 #[derive(Clone)]
 struct ContextHooks {
+    directory: Arc<tempfile::TempDir>,
     events: Arc<Mutex<Vec<String>>>,
 }
 
@@ -1598,6 +1613,22 @@ impl ContextHooks {
 
 #[async_trait(?Send)]
 impl LaunchHooks for ContextHooks {
+    fn codex_home_dir(&self) -> std::path::PathBuf {
+        self.directory.path().to_path_buf()
+    }
+
+    fn state_dir(&self) -> std::path::PathBuf {
+        self.directory.path().join("state")
+    }
+
+    fn select_protocol_proxy_port(&self) -> u16 {
+        panic!("bridge fixture must not start a protocol proxy")
+    }
+
+    async fn sanitize_local_storage_model_suffixes(&self, debug_port: u16) {
+        self.event(format!("sanitize-local-storage:{debug_port}"));
+    }
+
     fn resolve_app_dir(
         &self,
         app_dir: Option<&std::path::Path>,
