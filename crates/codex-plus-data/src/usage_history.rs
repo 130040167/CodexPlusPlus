@@ -3,7 +3,8 @@
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, Metadata, ReadDir};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -262,6 +263,25 @@ struct Record {
     date: Option<NaiveDate>,
     status: &'static str,
     usage: Option<Tokens>,
+    #[serde(skip)]
+    observations: Vec<UsageObservation>,
+}
+
+#[derive(Clone)]
+struct UsageObservation {
+    sequence: u64,
+    ordinal: Option<u64>,
+    timestamp: Option<i64>,
+    before: Option<Tokens>,
+    total: Tokens,
+    last: Option<Tokens>,
+    continuation: bool,
+}
+
+impl Record {
+    fn detail_size(&self) -> usize {
+        1 + self.observations.len()
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -704,19 +724,17 @@ impl HistoryIndex {
                 break;
             }
         }
-        let count: usize = self.files.values().map(|file| file.records.len()).sum();
+        let count: usize = self.files.values().map(|file| file.detail_size).sum();
         if count > MAX_TOTAL_RECORDS {
             changed = true;
             let mut remove = count - MAX_TOTAL_RECORDS;
             for file in self.files.values_mut() {
-                let n = remove.min(file.records.len());
-                if n > 0 {
-                    for _ in 0..n {
-                        if let Some(record) = file.records.pop_front() {
-                            file.archive_record(record);
-                        }
-                    }
-                    remove -= n;
+                while remove > 0 {
+                    let Some(record) = file.records.pop_front() else {
+                        break;
+                    };
+                    remove = remove.saturating_sub(record.detail_size());
+                    file.archive_record(record);
                 }
                 if remove == 0 {
                     break;
@@ -772,10 +790,14 @@ impl HistoryIndex {
         response
     }
     fn response(&self, query: &Query, today: NaiveDate, now: i64) -> Value {
-        let mut effective: BTreeMap<&str, &FileIndex> = BTreeMap::new();
+        // 同一会话可有多个分页分段；仅合并用量流完全相同的物理副本。
+        let mut effective: BTreeMap<(&str, [u8; 32]), &FileIndex> = BTreeMap::new();
         for file in self.files.values().filter(|f| f.verified) {
-            let id = file.session.as_deref().unwrap();
-            if effective.get(id).is_none_or(|old| {
+            let id = (
+                file.session.as_deref().unwrap(),
+                file.usage_digest.clone().finalize().into(),
+            );
+            if effective.get(&id).is_none_or(|old| {
                 file.modified > old.modified
                     || file.modified == old.modified && file.offset > old.offset
             }) {
@@ -783,6 +805,9 @@ impl HistoryIndex {
             }
         }
         let mut record_map: BTreeMap<String, Record> = BTreeMap::new();
+        let mut observations = BTreeMap::new();
+        let mut successors: BTreeMap<_, HashSet<_>> = BTreeMap::new();
+        let mut observed_rows = HashSet::new();
         let mut limits = Vec::new();
         let mut latest_limit = i64::MIN;
         let mut plan_type = None;
@@ -806,11 +831,9 @@ impl HistoryIndex {
                 || file.pending.len() > 0
                 || file.skipping
                 || !file.verified;
-            if file
-                .session
-                .as_deref()
-                .and_then(|id| effective.get(id))
-                .is_some_and(|candidate| std::ptr::eq(*candidate, file))
+            if effective
+                .values()
+                .any(|candidate| std::ptr::eq(*candidate, file))
             {
                 archived_records += file
                     .archived_all
@@ -818,6 +841,7 @@ impl HistoryIndex {
                     .map(|a| a.record_count)
                     .sum::<usize>();
                 incomplete_records |= file.undated_archived > 0;
+                let mut file_order = Vec::new();
                 for record in &file.records {
                     let replace = record_map.get(&record.id).is_none_or(|previous| {
                         record_timestamp(record) > record_timestamp(previous)
@@ -826,7 +850,52 @@ impl HistoryIndex {
                                     > previous.usage.map(|u| u.total_tokens)
                     });
                     if replace {
-                        record_map.insert(record.id.clone(), record.clone());
+                        let mut row = record.clone();
+                        row.observations.clear();
+                        if !record.observations.is_empty() {
+                            row.usage = None;
+                        }
+                        record_map.insert(record.id.clone(), row);
+                    }
+                    for observation in &record.observations {
+                        observed_rows.insert(record.id.as_str());
+                        let key = (
+                            record.session_id.as_str(),
+                            observation.timestamp,
+                            observation.ordinal,
+                            observation.total.input_tokens,
+                            observation.total.output_tokens,
+                            observation.total.cached_input_tokens,
+                            observation.total.reasoning_output_tokens,
+                            record.turn_id.as_str(),
+                        );
+                        file_order.push((observation.sequence, key));
+                        let candidate =
+                            observations
+                                .entry(key)
+                                .or_insert((record, observation, false));
+                        candidate.2 |= candidate.0.model.is_some()
+                            && record.model.is_some()
+                            && candidate.0.model != record.model;
+                        if candidate.0.model.is_none() && record.model.is_some() {
+                            candidate.0 = record;
+                        }
+                        if observation.before.is_some_and(|before| {
+                            candidate.1.before.is_none()
+                                || observation.total.is_monotonic_after(before)
+                                    && candidate
+                                        .1
+                                        .before
+                                        .is_some_and(|old| before.is_monotonic_after(old))
+                        }) {
+                            candidate.1 = observation;
+                        }
+                    }
+                }
+                file_order.sort_unstable_by_key(|(sequence, _)| *sequence);
+                for pair in file_order.windows(2) {
+                    if pair[0].1 != pair[1].1 {
+                        successors.entry(pair[0].1).or_default().insert(pair[1].1);
                     }
                 }
                 if file.limits_observed > latest_limit {
@@ -837,6 +906,116 @@ impl HistoryIndex {
             }
         }
         let effective: Vec<_> = effective.into_values().collect();
+        let mut source_counts = BTreeMap::new();
+        for file in &effective {
+            *source_counts
+                .entry(file.session.as_deref().unwrap())
+                .or_insert(0usize) += 1;
+        }
+        let compacted_overlap: HashSet<_> = effective
+            .iter()
+            .filter(|file| !file.archived_all.is_empty())
+            .map(|file| file.session.as_deref().unwrap())
+            .filter(|session| source_counts[session] > 1)
+            .collect();
+        // 超过明细限额后无法证明跨文件旧汇总互不重叠，只返回可去重的观测下界。
+        incomplete_records |= !compacted_overlap.is_empty();
+        // 每份文件内部的观测先后比时钟或跨文件 ordinal 更可靠；共享事件连接各分页。
+        fn component_root(roots: &mut [usize], mut index: usize) -> usize {
+            while roots[index] != index {
+                roots[index] = roots[roots[index]];
+                index = roots[index];
+            }
+            index
+        }
+        let mut incoming: BTreeMap<_, _> = observations
+            .keys()
+            .enumerate()
+            .map(|(index, key)| (*key, (0usize, index)))
+            .collect();
+        let mut roots: Vec<_> = (0..incoming.len()).collect();
+        for (previous, nexts) in &successors {
+            for next in nexts {
+                let from = component_root(&mut roots, incoming[previous].1);
+                let to = component_root(&mut roots, incoming[next].1);
+                roots[to] = from;
+                incoming.get_mut(next).unwrap().0 += 1;
+            }
+        }
+        let mut ready: BTreeSet<_> = incoming
+            .iter()
+            .filter_map(|(key, (count, _))| (*count == 0).then_some(*key))
+            .collect();
+        let mut ordered = Vec::new();
+        while let Some(key) = ready.pop_first() {
+            let component = component_root(&mut roots, incoming[&key].1);
+            ordered.push((observations.remove(&key).unwrap(), component));
+            for next in successors.get(&key).into_iter().flatten() {
+                let count = &mut incoming.get_mut(next).unwrap().0;
+                *count -= 1;
+                if *count == 0 {
+                    ready.insert(*next);
+                }
+            }
+        }
+        // 相互矛盾的物理来源不能强行排序后宣称完整。
+        incomplete_records |= !observations.is_empty();
+        let mut cursors = BTreeMap::new();
+        let mut stream_cursors = BTreeMap::new();
+        let mut selected_rows = HashSet::new();
+        for ((source, observation, model_conflict), component) in ordered {
+            // 只有共享原生观测证明相连的计数流，才可共用累计水位。
+            let previous = stream_cursors.get(&component).copied().or_else(|| {
+                (observation.continuation && observation.last.is_none())
+                    .then(|| cursors.get(source.session_id.as_str()).copied())
+                    .flatten()
+            });
+            let before = if observation.before.is_none() && observation.last.is_some() {
+                None
+            } else {
+                previous
+                    .filter(|previous| {
+                        observation.total.is_monotonic_after(*previous)
+                            && observation
+                                .before
+                                .is_none_or(|before| previous.is_monotonic_after(before))
+                    })
+                    .or(observation.before)
+            };
+            let delta = if compacted_overlap.contains(source.session_id.as_str()) {
+                // 已丢失重叠依据时，只累计每条唯一观测明确提供的末次消费。
+                observation.last
+            } else if before.is_none() && observation.last.is_none() && observation.continuation {
+                incomplete_records = true;
+                None
+            } else {
+                Some(observation.total.usage_delta(before, observation.last))
+            };
+            stream_cursors.insert(component, observation.total);
+            cursors.insert(source.session_id.as_str(), observation.total);
+            let mut row = source.clone();
+            row.observations.clear();
+            if model_conflict {
+                incomplete_records = true;
+                row.model = None;
+                row.id = format!(
+                    "{}:{}::{}",
+                    row.session_id,
+                    row.turn_id,
+                    row.date.map(|date| date.to_string()).unwrap_or_default()
+                );
+            }
+            let row = record_map.entry(row.id.clone()).or_insert_with(|| {
+                row.usage = None;
+                row
+            });
+            selected_rows.insert(row.id.clone());
+            if let Some(delta) = delta {
+                row.usage.get_or_insert_with(Tokens::default).add(delta);
+            }
+        }
+        record_map
+            .retain(|id, _| !observed_rows.contains(id.as_str()) || selected_rows.contains(id));
         let mut records: Vec<_> = record_map.into_values().collect();
         records.sort_by(|a, b| {
             record_timestamp(b)
@@ -845,6 +1024,12 @@ impl HistoryIndex {
         });
         let week = today - ChronoDuration::days(6);
         let month = today.with_day(1).unwrap();
+        let detail_cutoff = today - ChronoDuration::days(89);
+        let daily_cutoff = today - ChronoDuration::days(364);
+        archived_records += records
+            .iter()
+            .filter(|record| record.date.is_some_and(|date| date < detail_cutoff))
+            .count();
         let mut periods: BTreeMap<&str, Aggregate> = ["today", "week", "month", "all"]
             .into_iter()
             .map(|s| (s, Aggregate::default()))
@@ -861,6 +1046,9 @@ impl HistoryIndex {
                 .or_default()
                 .add(record, price);
             if let Some(day) = record.date {
+                if day < daily_cutoff {
+                    continue;
+                }
                 all_days.entry(day).or_default().add(record, price);
                 day_models
                     .entry(day)
@@ -878,6 +1066,9 @@ impl HistoryIndex {
             }
         }
         for file in &effective {
+            if compacted_overlap.contains(file.session.as_deref().unwrap()) {
+                continue;
+            }
             for (model, archive) in &file.archived_all {
                 let price = query.price_for(model);
                 periods.get_mut("all").unwrap().add_archive(archive, price);
@@ -905,18 +1096,28 @@ impl HistoryIndex {
                 }
             }
         }
-        let selected: Vec<_> = records.iter().filter(|r| query.accepts(r)).collect();
+        let selected: Vec<_> = records
+            .iter()
+            .filter(|r| r.date.is_none_or(|date| date >= detail_cutoff) && query.accepts(r))
+            .collect();
         let mut models: BTreeMap<String, Aggregate> = BTreeMap::new();
         let mut days: BTreeMap<NaiveDate, Aggregate> = BTreeMap::new();
         let mut selected_day_models: BTreeMap<NaiveDate, BTreeMap<String, Aggregate>> =
             BTreeMap::new();
-        for record in &selected {
+        for record in records.iter().filter(|record| {
+            query.accepts(record)
+                && (query.from.is_none() && query.to.is_none()
+                    || record.date.is_none_or(|date| date >= daily_cutoff))
+        }) {
             let price = record.model.as_ref().and_then(|m| query.price_for(m));
             models
                 .entry(record.model.clone().unwrap_or_default())
                 .or_default()
                 .add(record, price);
             if let Some(day) = record.date {
+                if day < daily_cutoff {
+                    continue;
+                }
                 days.entry(day).or_default().add(record, price);
                 selected_day_models
                     .entry(day)
@@ -927,10 +1128,11 @@ impl HistoryIndex {
             }
         }
         for file in &effective {
-            if query
-                .session_id
-                .as_ref()
-                .is_some_and(|id| Some(id) != file.session.as_ref())
+            if compacted_overlap.contains(file.session.as_deref().unwrap())
+                || query
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|id| Some(id) != file.session.as_ref())
                 || query.turn_id.is_some()
             {
                 continue;
@@ -1109,20 +1311,35 @@ impl HistoryIndex {
             "source":"local-rollout-estimate","today":today_summary,"days7":days7,"all":{"days":daily,"events":rows,"pagination":{"page":page,"pageSize":query.page_size,"total":selected.len(),"pages":pages}},"machineSummary":machine_summary,"codex":codex,"periods":periods.iter().map(|(name,aggregate)|(*name,aggregate.value())).collect::<BTreeMap<_,_>>(),
             "models":model_rows,"days":day_rows,"records":rows,"pagination":{"page":page,"pageSize":query.page_size,"total":selected.len(),"pages":pages},"rateLimits":limits,
             "archive":{"recordCount":archived_records,"detailRetentionDays":90,"dailyRetentionDays":365,"recordsPerSessionLimit":MAX_RECORDS,"totalDetailLimit":MAX_TOTAL_RECORDS},
-            "scan":{"discoveredFiles":self.files.len(),"indexedFiles":indexed,"pendingFiles":pending,"ignoredFiles":ignored,"identityMismatchFiles":identity_mismatches,"truncated":self.truncated||incomplete_records||self.discovery_errors,"discovering":self.discovering},
-            "message":if complete { Value::Null } else if ignored > 0 { json!("部分会话缺少有效会话头或包含冲突的会话 ID；未确认部分未计入汇总") } else { json!("正在分批索引，或部分记录缺少日期/用量；以下仅汇总已观测数据") }});
+            "scan":{"discoveredFiles":self.files.len(),"indexedFiles":indexed,"pendingFiles":pending,"ignoredFiles":ignored,"identityMismatchFiles":identity_mismatches,"compactedOverlapSessions":compacted_overlap.len(),"truncated":self.truncated||incomplete_records||self.discovery_errors,"discovering":self.discovering},
+            "message":if complete { Value::Null } else if !compacted_overlap.is_empty() { json!("部分分段的去重证据超过内存限额；无法确认重叠的旧汇总未计入，当前仅返回可核验的用量下界") } else if ignored > 0 { json!("部分会话缺少有效会话头或包含冲突的会话 ID；未确认部分未计入汇总") } else { json!("正在分批索引，或部分记录缺少日期/用量；以下仅汇总已观测数据") }});
         if query.include_session_cursors {
             // 游标是当前索引的会话累计水位，不按日期或模型切分，也不受明细分页影响。
             response["sessionCursors"] = json!(
                 effective
                     .iter()
-                    .filter(|file| query
+                    .filter_map(|file| {
+                        file.session
+                            .as_deref()
+                            .zip(file.previous)
+                            .map(|(session, total)| (session, (file.latest_count_at, total)))
+                    })
+                    .fold(BTreeMap::new(), |mut cursors, (session, candidate)| {
+                        let selected = cursors.entry(session).or_insert(candidate);
+                        if candidate.0 > selected.0
+                            || candidate.0 == selected.0
+                                && candidate.1.is_monotonic_after(selected.1)
+                        {
+                            *selected = candidate;
+                        }
+                        cursors
+                    })
+                    .into_iter()
+                    .filter(|(session, _)| query
                         .session_id
                         .as_ref()
-                        .is_none_or(|id| file.session.as_ref() == Some(id)))
-                    .filter_map(|file| file
-                        .previous
-                        .map(|total| json!({"sessionId":file.session,"total":total})))
+                        .is_none_or(|id| *session == id))
+                    .map(|(session, (_, total))| json!({"sessionId":session,"total":total}))
                     .take(MAX_FILES)
                     .collect::<Vec<_>>()
             );
@@ -1249,6 +1466,11 @@ struct FileIndex {
     current_model: Option<String>,
     current_turn: Option<String>,
     records: VecDeque<Record>,
+    detail_size: usize,
+    usage_digest: Sha256,
+    continuation: bool,
+    latest_count_at: Option<i64>,
+    usage_sequence: u64,
     archived_all: BTreeMap<String, Archived>,
     archived_days: BTreeMap<(NaiveDate, String), Archived>,
     undated_archived: usize,
@@ -1277,6 +1499,11 @@ impl FileIndex {
             current_model: None,
             current_turn: None,
             records: VecDeque::new(),
+            detail_size: 0,
+            usage_digest: Sha256::new(),
+            continuation: false,
+            latest_count_at: None,
+            usage_sequence: 0,
             archived_all: BTreeMap::new(),
             archived_days: BTreeMap::new(),
             undated_archived: 0,
@@ -1415,24 +1642,21 @@ impl FileIndex {
         Ok(bytes.len() as u64)
     }
     fn retain_recent(&mut self, today: NaiveDate) {
-        // 追平前不按年龄归档：同一历史轮次可能跨越两次读取预算。
-        if !self.catching_up {
-            let cutoff = today - ChronoDuration::days(89);
-            let mut retained = VecDeque::new();
-            while let Some(record) = self.records.pop_front() {
-                if record.date.is_some_and(|day| day < cutoff) {
-                    self.archive_record(record);
-                } else {
-                    retained.push_back(record);
-                }
-            }
-            self.records = retained;
-        }
+        // 限额内保留用量去重证据；响应仍只开放 90 天明细和 365 天日汇总。
+        // 过早压成按日总数会使分页副本的重叠部分无法核对。
         let daily_cutoff = today - ChronoDuration::days(364);
         self.archived_days
             .retain(|(day, _), _| *day >= daily_cutoff);
     }
-    fn archive_record(&mut self, record: Record) {
+    fn archive_record(&mut self, mut record: Record) {
+        self.detail_size = self.detail_size.saturating_sub(record.detail_size());
+        if record.observations.iter().any(|observation| {
+            observation.continuation && observation.before.is_none() && observation.last.is_none()
+        }) {
+            // 丢弃去重依据前也不能把缺少前段基线的累计值当成本段消费。
+            record.usage = None;
+            self.invalid_usage = true;
+        }
         let model = record.model.clone().unwrap_or_default();
         self.archived_all
             .entry(model.clone())
@@ -1456,6 +1680,27 @@ impl FileIndex {
         let kind = event["type"].as_str().unwrap_or("");
         let payload = &event["payload"];
         let inherited = self.history_boundary.contains(event["ordinal"].as_u64());
+        if !inherited
+            && (matches!(kind, "session_meta" | "turn_context")
+                || kind == "event_msg"
+                    && matches!(
+                        payload["type"].as_str(),
+                        Some(
+                            "token_count"
+                                | "task_started"
+                                | "turn_started"
+                                | "task_complete"
+                                | "turn_completed"
+                                | "task_failed"
+                                | "turn_aborted"
+                                | "task_aborted"
+                                | "error"
+                                | "stream_error"
+                        )
+                    ))
+        {
+            self.usage_digest.update(event.to_string().as_bytes());
+        }
         if kind == "session_meta" {
             if inherited {
                 return;
@@ -1474,6 +1719,9 @@ impl FileIndex {
                 self.verified = self.session.is_some();
                 self.history_boundary =
                     UsageHistoryBoundary::from_meta(payload, self.session.as_deref().unwrap_or(""));
+                self.continuation = payload["history_base"]["end_ordinal_exclusive"]
+                    .as_u64()
+                    .is_some_and(|ordinal| ordinal > 0);
             } else if session.is_some() && session != self.session {
                 // 复制的继承头已在上方排除；两个自有头不能混记为同一会话。
                 self.verified = false;
@@ -1616,11 +1864,19 @@ impl FileIndex {
         let Some(next) = Tokens::parse(&payload["info"]["total_token_usage"]) else {
             return;
         };
-        let delta = next.usage_delta(
-            self.previous,
-            Tokens::parse(&payload["info"]["last_token_usage"]),
-        );
+        let observation = UsageObservation {
+            sequence: self.usage_sequence,
+            ordinal: event["ordinal"].as_u64(),
+            timestamp: time.map(|time| time.timestamp_millis()),
+            before: self.previous,
+            total: next,
+            last: Tokens::parse(&payload["info"]["last_token_usage"]),
+            continuation: self.continuation,
+        };
+        let delta = next.usage_delta(observation.before, observation.last);
         self.previous = Some(next);
+        self.usage_sequence = self.usage_sequence.saturating_add(1);
+        self.latest_count_at = observation.timestamp;
         if delta.total_tokens == 0 && self.records.back().is_some_and(|r| r.usage.is_some()) {
             return;
         }
@@ -1632,6 +1888,14 @@ impl FileIndex {
         }
         let row = self.current_record(timestamp, day);
         row.usage.get_or_insert_with(Tokens::default).add(delta);
+        row.observations.push(observation);
+        self.detail_size += 1;
+        while self.detail_size > MAX_RECORDS {
+            let Some(record) = self.records.pop_front() else {
+                break;
+            };
+            self.archive_record(record);
+        }
     }
     fn current_record(&mut self, timestamp: Option<String>, day: Option<NaiveDate>) -> &mut Record {
         let turn = self
@@ -1650,9 +1914,11 @@ impl FileIndex {
             }
             return row;
         }
-        if self.records.len() >= MAX_RECORDS {
+        while self.detail_size >= MAX_RECORDS {
             if let Some(record) = self.records.pop_front() {
                 self.archive_record(record);
+            } else {
+                break;
             }
         }
         let session = self.session.clone().unwrap();
@@ -1670,7 +1936,9 @@ impl FileIndex {
             date: day,
             status: "unknown",
             usage: None,
+            observations: Vec::new(),
         });
+        self.detail_size += 1;
         self.records.back_mut().unwrap()
     }
 }
