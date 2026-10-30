@@ -29,7 +29,7 @@ struct Directory {
 
 impl Directory {
     fn open(path: &Path) -> anyhow::Result<Self> {
-        let file = open_path(path, true, false)?;
+        let file = open_path(path, true, false, false)?;
         Ok(Self {
             path: path.into(),
             _file: file,
@@ -59,6 +59,16 @@ impl Directory {
     }
 
     fn open_file(&self, name: &str, directory: bool, create: bool) -> anyhow::Result<File> {
+        self.open_file_with_append(name, directory, create, false)
+    }
+
+    fn open_file_with_append(
+        &self,
+        name: &str,
+        directory: bool,
+        create: bool,
+        append: bool,
+    ) -> anyhow::Result<File> {
         if !matches!(
             Path::new(name).components().collect::<Vec<_>>().as_slice(),
             [Component::Normal(_)]
@@ -75,6 +85,8 @@ impl Directory {
                 | if directory { libc::O_DIRECTORY } else { 0 }
                 | if create {
                     libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL
+                } else if append {
+                    libc::O_WRONLY | libc::O_APPEND
                 } else {
                     libc::O_RDONLY
                 };
@@ -90,7 +102,54 @@ impl Directory {
             Ok(file)
         }
         #[cfg(not(unix))]
-        open_path(&self.path.join(name), directory, create)
+        open_path(&self.path.join(name), directory, create, append)
+    }
+
+    fn ensure_gitignore(&self) -> anyhow::Result<()> {
+        let mut file = match self.open_file(".gitignore", false, true) {
+            Ok(mut file) => {
+                file.write_all(b"*\n")?;
+                file.sync_all()?;
+                return Ok(());
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) =>
+            {
+                self.open_file(".gitignore", false, false)?
+            }
+            Err(error) => return Err(error),
+        };
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        if contents.lines().last() != Some("*") {
+            // 保留用户已有内容，末尾规则覆盖先前的反向匹配；不跟随链接。
+            let mut file = self.open_file_with_append(".gitignore", false, false, true)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if file.metadata()?.nlink() != 1 {
+                    bail!("Git 忽略文件不允许硬链接");
+                }
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                use windows::Win32::Foundation::HANDLE;
+                use windows::Win32::Storage::FileSystem::{
+                    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+                };
+                let mut metadata = BY_HANDLE_FILE_INFORMATION::default();
+                unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut metadata)? };
+                if metadata.nNumberOfLinks != 1 {
+                    bail!("Git 忽略文件不允许硬链接");
+                }
+            }
+            file.write_all(b"\n*\n")?;
+            file.sync_all()?;
+        }
+        Ok(())
     }
 
     fn remove(&self, name: &str, directory: bool) -> anyhow::Result<()> {
@@ -144,9 +203,13 @@ impl Directory {
     }
 }
 
-fn open_path(path: &Path, directory: bool, create: bool) -> anyhow::Result<File> {
+fn open_path(path: &Path, directory: bool, create: bool, append: bool) -> anyhow::Result<File> {
     let mut options = std::fs::OpenOptions::new();
-    options.read(!create).write(create).create_new(create);
+    options
+        .read(!create && !append)
+        .write(create)
+        .create_new(create)
+        .append(append);
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -194,7 +257,13 @@ impl Inbox {
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error.into()),
             }
-            parents.push(parent.child(name).context("微信附件目录不允许链接")?);
+            let directory = parent.child(name).context("微信附件目录不允许链接")?;
+            if name == ".codex-plus" {
+                directory
+                    .ensure_gitignore()
+                    .context("无法设置微信附件 Git 忽略保护")?;
+            }
+            parents.push(directory);
         }
         let inbox = parents.last().unwrap();
         if let Err(error) = cleanup(inbox, SystemTime::now(), MAX_DIRECTORIES - 1) {
@@ -710,7 +779,7 @@ mod tests {
             let old_path = old.path().to_path_buf();
             drop(old);
             let parent = Directory::open(old_path.parent().unwrap()).unwrap();
-            let held = open_path(&old_path.join(name), name == ".", false).unwrap();
+            let held = open_path(&old_path.join(name), name == ".", false, false).unwrap();
             cleanup(&parent, SystemTime::now() + RETENTION * 2, 0).unwrap();
             assert!(old_path.exists(), "{name}");
             let new = Inbox::create(root.path()).unwrap();
@@ -731,6 +800,150 @@ mod tests {
             std::fs::read(parent.join("inbox")).unwrap(),
             b"not a directory"
         );
+    }
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(["-c", "core.excludesFile=", "-c", "core.autocrlf=false"])
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[tokio::test]
+    async fn git_ignores_inbound_files_and_preserves_existing_ignore_content() {
+        for original in [
+            None,
+            Some("# custom\n!weixin/\n!weixin/**"),
+            Some("# custom\r\n*\r\n"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            git(root.path(), &["init", "-q"]);
+            let ignore = root.path().join(".codex-plus/.gitignore");
+            if let Some(original) = original {
+                std::fs::create_dir(ignore.parent().unwrap()).unwrap();
+                std::fs::write(&ignore, original).unwrap();
+            }
+            std::fs::write(root.path().join("public.txt"), b"public").unwrap();
+            let inbox = Inbox::create(root.path()).unwrap();
+            let attachment = inbox
+                .save("private.txt", b"private attachment")
+                .await
+                .unwrap();
+            inbox
+                .record(&[LocalAttachment {
+                    path: attachment.clone(),
+                    kind: AttachmentKind::File,
+                }])
+                .unwrap();
+            let contents = std::fs::read_to_string(&ignore).unwrap();
+            if let Some(original) = original {
+                assert!(contents.starts_with(original));
+            }
+            assert_eq!(contents.lines().last(), Some("*"));
+            let workspace = root.path().canonicalize().unwrap();
+            let relative = attachment
+                .strip_prefix(workspace)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .replace('\\', "/");
+            let ignored = git(root.path(), &["check-ignore", "-v", "--", &relative]);
+            assert!(ignored.starts_with(".codex-plus/.gitignore:"), "{ignored}");
+            assert!(ignored.contains(":*\t"), "{ignored}");
+            assert_eq!(
+                git(
+                    root.path(),
+                    &["status", "--porcelain", "--untracked-files=all"]
+                ),
+                "?? public.txt\n"
+            );
+            git(root.path(), &["add", "-A"]);
+            assert_eq!(
+                git(root.path(), &["diff", "--cached", "--name-only"]),
+                "public.txt\n"
+            );
+            assert_eq!(
+                git(
+                    root.path(),
+                    &["status", "--porcelain", "--untracked-files=all"]
+                ),
+                "A  public.txt\n"
+            );
+            drop(Inbox::create(root.path()).unwrap());
+            assert_eq!(std::fs::read_to_string(ignore).unwrap(), contents);
+        }
+    }
+
+    #[test]
+    fn inbox_rejects_directory_or_hardlink_at_gitignore_before_creating_inbox() {
+        for hardlink in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let parent = root.path().join(".codex-plus");
+            std::fs::create_dir(&parent).unwrap();
+            let outside = root.path().join("outside.txt");
+            std::fs::write(&outside, b"keep").unwrap();
+            let ignore = parent.join(".gitignore");
+            if hardlink {
+                std::fs::hard_link(&outside, &ignore).unwrap();
+            } else {
+                std::fs::create_dir(&ignore).unwrap();
+            }
+            assert!(Inbox::create(root.path()).is_err());
+            assert_eq!(std::fs::read(outside).unwrap(), b"keep");
+            assert!(!parent.join("weixin").exists());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inbox_rejects_gitignore_write_sharing_conflict_before_creating_inbox() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join(".codex-plus");
+        std::fs::create_dir(&parent).unwrap();
+        let ignore = parent.join(".gitignore");
+        std::fs::write(&ignore, b"# keep").unwrap();
+        let _held = File::options()
+            .read(true)
+            .share_mode(1)
+            .open(&ignore)
+            .unwrap();
+        assert!(Inbox::create(root.path()).is_err());
+        assert_eq!(std::fs::read(ignore).unwrap(), b"# keep");
+        assert!(!parent.join("weixin").exists());
+    }
+
+    #[test]
+    fn inbox_rejects_linked_gitignore_before_creating_inbox() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("keep"), b"keep").unwrap();
+        let parent = root.path().join(".codex-plus");
+        std::fs::create_dir(&parent).unwrap();
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(parent.join(".gitignore"))
+                .arg(outside.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path().join("keep"), parent.join(".gitignore")).unwrap();
+        assert!(Inbox::create(root.path()).is_err());
+        assert_eq!(std::fs::read(outside.path().join("keep")).unwrap(), b"keep");
+        assert!(!parent.join("weixin").exists());
     }
 
     #[test]
