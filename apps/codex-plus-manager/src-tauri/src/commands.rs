@@ -132,9 +132,7 @@ pub async fn claude_localization_set_voice_input(enabled: bool) -> CommandResult
             sync_resident_helper();
         }
         status
-    })
-    .await
-    {
+    }).await {
         Ok(Ok(status)) => ok(
             if enabled {
                 "语音输入已开启。"
@@ -194,7 +192,9 @@ pub async fn claude_localization_set_bash_timeout(
 ) -> CommandResult<Value> {
     match tauri::async_runtime::spawn_blocking(move || {
         codex_plus_core::claude_localization::set_bash_timeout(timeout)
-    }).await {
+    })
+    .await
+    {
         Ok(Ok(status)) => ok(
             "Bash 时间限制设置已保存；重启增强版后生效。",
             serde_json::to_value(status).unwrap_or_else(|_| json!({})),
@@ -320,6 +320,8 @@ struct WeixinQrSession {
 struct WeixinRuntime {
     stop: Arc<AtomicBool>,
     codex_path: codex_plus_core::connect::WeixinCodexPath,
+    outbound: codex_plus_core::connect::outbound::OutboundPolicy,
+    outbound_account: (String, String, String, String),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3404,7 +3406,12 @@ pub fn weixin_connect_stop() -> CommandResult<codex_plus_core::connect::WeixinCo
     let stopping = weixin_runtime()
         .lock()
         .ok()
-        .and_then(|runtime| runtime.as_ref().map(|runtime| Arc::clone(&runtime.stop)))
+        .and_then(|runtime| {
+            runtime.as_ref().map(|runtime| {
+                runtime.outbound.set(false, "", "");
+                Arc::clone(&runtime.stop)
+            })
+        })
         .map(|stop| {
             stop.store(true, Ordering::SeqCst);
             true
@@ -3571,6 +3578,7 @@ fn spawn_weixin_connect(
         token: settings.weixin_connect_token,
         account_id: settings.weixin_connect_account_id,
         allow_from: settings.weixin_connect_allow_from,
+        allow_outbound_attachments: settings.weixin_connect_allow_outbound_attachments,
         route_tag: settings.weixin_connect_route_tag,
         work_dir: settings.weixin_connect_work_dir,
         model: settings.weixin_connect_model,
@@ -3578,6 +3586,7 @@ fn spawn_weixin_connect(
         codex_path: settings.weixin_connect_codex_path,
     }
     .normalized();
+    config.validate_outbound()?;
     if config.token.is_empty() {
         anyhow::bail!("微信连接 token 为空");
     }
@@ -3589,9 +3598,21 @@ fn spawn_weixin_connect(
         anyhow::bail!("微信连接已在运行或正在停止");
     }
     let codex_path = codex_plus_core::connect::WeixinCodexPath::new(&config.codex_path);
+    let outbound = codex_plus_core::connect::outbound::OutboundPolicy::new(
+        config.allow_outbound_attachments,
+        &config.allow_from,
+        &config.work_dir,
+    );
     *runtime = Some(WeixinRuntime {
         stop: Arc::clone(&stop),
         codex_path: codex_path.clone(),
+        outbound: outbound.clone(),
+        outbound_account: (
+            config.account_id.clone(),
+            config.token.clone(),
+            config.base_url.clone(),
+            config.route_tag.clone(),
+        ),
     });
     drop(runtime);
     let status = weixin_status();
@@ -3604,11 +3625,12 @@ fn spawn_weixin_connect(
     let task_status = Arc::clone(&status);
     let task_stop = Arc::clone(&stop);
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = codex_plus_core::connect::run_weixin_connect_with_codex_path(
+        if let Err(error) = codex_plus_core::connect::run_weixin_connect_with_outbound(
             config,
             stop,
             Arc::clone(&task_status),
             codex_path,
+            outbound,
         )
         .await
             && let Ok(mut current) = task_status.lock()
@@ -3740,6 +3762,23 @@ pub fn save_settings(
         settings.settings_revision = revision;
     }
     let settings = normalize_settings_before_save(settings);
+    if let Err(error) = codex_plus_core::connect::outbound::validate_settings(
+        settings.weixin_connect_allow_outbound_attachments,
+        &settings.weixin_connect_allow_from,
+        &settings.weixin_connect_work_dir,
+    ) {
+        return failed(
+            &error.to_string(),
+            SettingsPayload {
+                revision: settings.settings_revision.clone(),
+                settings,
+                settings_path: codex_plus_core::paths::default_settings_path()
+                    .to_string_lossy()
+                    .to_string(),
+                user_scripts: user_script_inventory(),
+            },
+        );
+    }
     // 保存诊断：供应商模型列表被改小/改大时能直接看出「提交上来的到底是什么」。
     // 用户反馈过「删掉一行保存后又变回三行」，只有把每次保存的行数记下来才能区分
     // 「界面没提交改动」和「提交了又被别处覆盖」。
@@ -3796,6 +3835,19 @@ pub fn save_settings(
                 && let Some(runtime) = runtime.as_ref()
             {
                 runtime.codex_path.set(&settings.weixin_connect_codex_path);
+                runtime.outbound.set(
+                    settings.weixin_connect_allow_outbound_attachments
+                        && !runtime.stop.load(Ordering::SeqCst)
+                        && runtime.outbound_account
+                            == (
+                                settings.weixin_connect_account_id.clone(),
+                                settings.weixin_connect_token.clone(),
+                                settings.weixin_connect_base_url.clone(),
+                                settings.weixin_connect_route_tag.clone(),
+                            ),
+                    &settings.weixin_connect_allow_from,
+                    &settings.weixin_connect_work_dir,
+                );
             }
             // 自动接管是常驻行为，保存后立刻生效，不必重启管理器。
             crate::auto_takeover::apply_enabled(settings.codex_app_auto_takeover);
