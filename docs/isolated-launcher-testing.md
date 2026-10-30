@@ -16,7 +16,7 @@
 | 设置及诊断日志 | 使用 `common::IsolatedTestState`，持有共享状态锁并在结束时恢复 |
 | `StatusStore` | 使用临时目录中的状态文件 |
 
-`IsolatedTestState` 自己获取 `global_state_lock()`，同一用例不要再次获取该锁。临时目录需要覆盖整个启动和收尾过程；不要在仍有异步任务使用时提前释放。
+`IsolatedTestState` 自己获取 `global_state_lock()`，同一用例不要再次获取该锁。设置及日志路径的原始覆盖值（包括未设置的 `None`）在释放锁前恢复，避免将默认路径意外固定为测试覆盖。临时目录需要覆盖整个启动和收尾过程；不要在仍有异步任务使用时提前释放。
 
 模拟网络调用的用例可以保留由系统分配的临时监听端口作为哨兵，结束时断言没有连接。这样既不依赖正式端口，也能发现绕过 hook 的实际网络操作。`bridge_routes::launch_lifecycle_uses_hook_supplied_bridge_context_for_injection` 同时断言本地存储维护经过测试 hook，且 CDP/helper 哨兵没有收到连接。
 
@@ -25,6 +25,7 @@
 ```text
 cargo test -p codex-plus-core --test all launcher::
 cargo test -p codex-plus-core --test all bridge_routes::
+cargo test -p codex-plus-core --test all common::isolated_paths_
 ```
 
 ## 真实桌面测试
