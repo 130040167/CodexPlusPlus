@@ -1051,6 +1051,11 @@ pub async fn launch_codex_plus(request: LaunchRequest) -> CommandResult<Value> {
             Ok(guard) => guard,
             Err(message) => return failed(message, json!({})),
         };
+        let manager = default_skills_manager();
+        let _skills_guard = match manager.lock_recovered_transactions() {
+            Ok(guard) => guard,
+            Err(error) => return failed(&skill_launch_recovery_error(&error), json!({})),
+        };
         spawn_codex_plus_launch(request, "启动任务已在后台开始，可稍后查看概览状态。")
     })
     .await
@@ -2359,6 +2364,11 @@ fn restart_codex_plus_blocking(request: LaunchRequest) -> CommandResult<Value> {
         Ok(guard) => guard,
         Err(message) => return failed(message, json!({})),
     };
+    let manager = default_skills_manager();
+    let _skills_guard = match manager.lock_recovered_transactions() {
+        Ok(guard) => guard,
+        Err(error) => return failed(&skill_launch_recovery_error(&error), json!({})),
+    };
     let request = normalize_launch_request(request);
     // 按本实例的调试端口判定是否在跑。
     // 早先用 `find_codex_processes_for_debug_port`，但它在非 macOS 上返回全部
@@ -3124,6 +3134,22 @@ pub fn resume_existing_codex_background(app: tauri::AppHandle, start_if_missing:
         if crate::app_is_exiting() {
             return;
         }
+        let _launch_guard = match try_acquire_launch_guard() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        let manager = default_skills_manager();
+        let _skills_guard = match manager.lock_recovered_transactions() {
+            Ok(guard) => guard,
+            Err(error) => {
+                let message = skill_launch_recovery_error(&error);
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "manager.skills_startup_recovery_failed",
+                    json!({ "message": message }),
+                );
+                return;
+            }
+        };
         // 必须先于 resume：resume 会走 launch_and_inject，如果它先 bind 了 helper，
         // Codex 退出时就把端口带走了；这里先托管常驻实例，会话会复用同一监听。
         sync_resident_helper();
@@ -6320,7 +6346,11 @@ pub(super) fn prepare_skills_on_startup() -> anyhow::Result<()> {
 }
 
 #[tauri::command]
-pub fn resolve_skill_conflict(id: String, keep_codex: bool) -> CommandResult<SkillsPayload> {
+pub async fn resolve_skill_conflict(id: String, keep_codex: bool) -> CommandResult<SkillsPayload> {
+    run_skill_command(move || resolve_skill_conflict_blocking(id, keep_codex)).await
+}
+
+fn resolve_skill_conflict_blocking(id: String, keep_codex: bool) -> CommandResult<SkillsPayload> {
     let manager = default_skills_manager();
     match manager.resolve_codex_conflict(id.trim(), keep_codex) {
         Ok(()) => ok(
@@ -6337,7 +6367,11 @@ pub fn resolve_skill_conflict(id: String, keep_codex: bool) -> CommandResult<Ski
 /// 导入 cc-switch 已安装的 Skills。cc-switch 的 Skill 文件位于
 /// `%USERPROFILE%/.cc-switch/skills/<id>/SKILL.md`，不在其 SQLite 数据库中。
 #[tauri::command]
-pub fn import_ccs_skills() -> CommandResult<SkillsPayload> {
+pub async fn import_ccs_skills() -> CommandResult<SkillsPayload> {
+    run_skill_command(import_ccs_skills_blocking).await
+}
+
+fn import_ccs_skills_blocking() -> CommandResult<SkillsPayload> {
     let manager = default_skills_manager();
     let root = codex_plus_core::ccs_import::default_ccs_skills_dir();
     let Ok(dir) = std::fs::read_dir(&root) else {
@@ -6887,7 +6921,11 @@ async fn install_or_update_skill(
 }
 
 #[tauri::command]
-pub fn set_skill_enabled(id: String, enabled: bool) -> CommandResult<SkillsPayload> {
+pub async fn set_skill_enabled(id: String, enabled: bool) -> CommandResult<SkillsPayload> {
+    run_skill_command(move || set_skill_enabled_blocking(id, enabled)).await
+}
+
+fn set_skill_enabled_blocking(id: String, enabled: bool) -> CommandResult<SkillsPayload> {
     let manager = default_skills_manager();
     match manager.set_enabled(id.trim(), enabled) {
         Ok(()) => ok(
@@ -6906,7 +6944,11 @@ pub fn set_skill_enabled(id: String, enabled: bool) -> CommandResult<SkillsPaylo
 }
 
 #[tauri::command]
-pub fn uninstall_skill(id: String) -> CommandResult<SkillsPayload> {
+pub async fn uninstall_skill(id: String) -> CommandResult<SkillsPayload> {
+    run_skill_command(move || uninstall_skill_blocking(id)).await
+}
+
+fn uninstall_skill_blocking(id: String) -> CommandResult<SkillsPayload> {
     let manager = default_skills_manager();
     match manager.uninstall(id.trim()) {
         Ok(_) => ok(
@@ -6921,7 +6963,11 @@ pub fn uninstall_skill(id: String) -> CommandResult<SkillsPayload> {
 }
 
 #[tauri::command]
-pub fn restore_skill_backup(backup_id: String) -> CommandResult<SkillsPayload> {
+pub async fn restore_skill_backup(backup_id: String) -> CommandResult<SkillsPayload> {
+    run_skill_command(move || restore_skill_backup_blocking(backup_id)).await
+}
+
+fn restore_skill_backup_blocking(backup_id: String) -> CommandResult<SkillsPayload> {
     let manager = default_skills_manager();
     match manager.restore_backup(backup_id.trim()) {
         Ok(_) => ok("Skill 已从备份恢复。", current_skills_payload(&manager)),
@@ -6933,7 +6979,11 @@ pub fn restore_skill_backup(backup_id: String) -> CommandResult<SkillsPayload> {
 }
 
 #[tauri::command]
-pub fn delete_skill_backup(backup_id: String) -> CommandResult<SkillsPayload> {
+pub async fn delete_skill_backup(backup_id: String) -> CommandResult<SkillsPayload> {
+    run_skill_command(move || delete_skill_backup_blocking(backup_id)).await
+}
+
+fn delete_skill_backup_blocking(backup_id: String) -> CommandResult<SkillsPayload> {
     let manager = default_skills_manager();
     match manager.delete_backup(backup_id.trim()) {
         Ok(_) => ok("备份已删除。", current_skills_payload(&manager)),
@@ -7086,7 +7136,11 @@ pub async fn inspect_skill_repo(
 }
 
 #[tauri::command]
-pub fn delete_skill_repo(key: String) -> CommandResult<SkillsPayload> {
+pub async fn delete_skill_repo(key: String) -> CommandResult<SkillsPayload> {
+    run_skill_command(move || delete_skill_repo_blocking(key)).await
+}
+
+fn delete_skill_repo_blocking(key: String) -> CommandResult<SkillsPayload> {
     let manager = default_skills_manager();
     match manager.delete_repo(key.trim()) {
         Ok(_) => {
@@ -7181,7 +7235,7 @@ fn current_skills_payload(manager: &codex_plus_core::skills::SkillsManager) -> S
     skills_payload(manager, &all_cached_repo_skills(), Vec::new())
 }
 
-fn default_skills_manager() -> codex_plus_core::skills::SkillsManager {
+pub(super) fn default_skills_manager() -> codex_plus_core::skills::SkillsManager {
     codex_plus_core::skills::SkillsManager::new(
         codex_plus_core::paths::default_skills_source_dir(),
         codex_plus_core::paths::default_skill_backups_dir(),
@@ -7202,9 +7256,34 @@ fn default_skills_manager() -> codex_plus_core::skills::SkillsManager {
     ])
 }
 
+pub(super) fn skill_launch_recovery_error(error: &anyhow::Error) -> String {
+    format!("Skill 事务恢复失败，未停止或启动 Codex；日志和副本已保留：{error:#}")
+}
+
+async fn run_skill_command(
+    operation: impl FnOnce() -> CommandResult<SkillsPayload> + Send + 'static,
+) -> CommandResult<SkillsPayload> {
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .unwrap_or_else(|error| {
+            failed(
+                &format!("Skill 后台任务失败：{error}"),
+                current_skills_payload(&default_skills_manager()),
+            )
+        })
+}
+
 /// 把 Skill 启用到 / 停用于某个 Agent（codex / claude / grok）。
 #[tauri::command]
-pub fn set_skill_enabled_for(
+pub async fn set_skill_enabled_for(
+    agent: String,
+    id: String,
+    enabled: bool,
+) -> CommandResult<SkillsPayload> {
+    run_skill_command(move || set_skill_enabled_for_blocking(agent, id, enabled)).await
+}
+
+fn set_skill_enabled_for_blocking(
     agent: String,
     id: String,
     enabled: bool,

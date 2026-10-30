@@ -477,6 +477,16 @@ impl SkillsManager {
         self.codex_home.join("skills")
     }
 
+    /// 启动 Codex 前恢复事务，并在调用方完成启动或重启前阻止新的 Skill 写入。
+    pub fn lock_recovered_transactions(&self) -> anyhow::Result<std::sync::MutexGuard<'_, ()>> {
+        let operation = self.operation_lock.lock().unwrap();
+        {
+            let _state = self.state_lock.lock().unwrap();
+            self.recover_skill_transactions()?;
+        }
+        Ok(operation)
+    }
+
     /// 恢复中断事务，并将旧版指向管理库的软链迁移为独立副本。
     pub fn prepare_managed_skills(&self) -> anyhow::Result<()> {
         let _operation = self.operation_lock.lock().unwrap();

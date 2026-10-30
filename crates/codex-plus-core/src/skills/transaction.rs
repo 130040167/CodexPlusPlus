@@ -350,6 +350,7 @@ mod tests {
         save_state: bool,
         committed: bool,
         via_repo_write: bool,
+        via_launch_gate: bool,
     ) {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("library");
@@ -411,6 +412,8 @@ mod tests {
         let added_repo = super::super::parse_repo_key("example/recovered@main").unwrap();
         if via_repo_write {
             reopened.save_repo(added_repo.clone(), None).unwrap();
+        } else if via_launch_gate {
+            let _guard = reopened.lock_recovered_transactions().unwrap();
         } else {
             reopened.recover_skill_transactions().unwrap();
         }
@@ -453,24 +456,66 @@ mod tests {
 
     #[test]
     fn interruption_before_publish_restores_original() {
-        interrupted_transaction(false, false, false, false);
+        interrupted_transaction(false, false, false, false, false);
     }
     #[test]
     fn interruption_after_publish_rolls_back_and_preserves_both() {
-        interrupted_transaction(true, false, false, false);
+        interrupted_transaction(true, false, false, false, false);
     }
     #[test]
     fn interruption_after_state_write_rolls_back_state_and_files() {
-        interrupted_transaction(true, true, false, false);
+        interrupted_transaction(true, true, false, false, false);
     }
     #[test]
     fn interruption_after_commit_finishes_backup() {
-        interrupted_transaction(true, true, true, false);
+        interrupted_transaction(true, true, true, false, false);
     }
 
     #[test]
     fn repository_write_recovers_interrupted_skill_transaction_before_saving() {
-        interrupted_transaction(true, true, false, true);
+        interrupted_transaction(true, true, false, true, false);
+    }
+
+    #[test]
+    fn launch_gate_recovers_interrupted_transaction_before_action() {
+        interrupted_transaction(true, true, false, false, true);
+    }
+
+    #[test]
+    fn launch_gate_retains_invalid_journal_and_rejects_action() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = SkillsManager::new(
+            temp.path().join("library"),
+            temp.path().join("backups"),
+            temp.path().join("skills.json"),
+            temp.path().join("home"),
+        );
+        let journal_dir = manager.transaction_dir().unwrap();
+        std::fs::create_dir_all(&journal_dir).unwrap();
+        let journal = journal_dir.join("invalid.json");
+        std::fs::write(&journal, b"invalid journal").unwrap();
+        let mut stopped_or_started = false;
+        if let Ok(_guard) = manager.lock_recovered_transactions() {
+            stopped_or_started = true;
+        }
+        assert!(!stopped_or_started);
+        assert_eq!(std::fs::read(&journal).unwrap(), b"invalid journal");
+    }
+
+    #[test]
+    fn launch_gate_blocks_other_skill_operations_until_released() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = SkillsManager::new(
+            temp.path().join("library"),
+            temp.path().join("backups"),
+            temp.path().join("skills.json"),
+            temp.path().join("home"),
+        );
+        let second = manager.clone();
+        let guard = manager.lock_recovered_transactions().unwrap();
+        assert!(second.operation_lock.try_lock().is_err());
+        drop(guard);
+        assert!(second.operation_lock.try_lock().is_ok());
     }
 
     #[test]
