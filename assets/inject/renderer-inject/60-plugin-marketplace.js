@@ -429,7 +429,8 @@
     try {
       // 新版 Codex 不再把 queryClient 挂到 window 上：从 React 树里找（与官方用量共用，找到后缓存）。
       // 插件列表、搜索、详情的查询键都以 `plugins` 开头，按前缀一起失效。
-      const queryClient = findCodexQueryClient();
+      const explicit = window.__REACT_QUERY_CLIENT__ || window.__codexQueryClient;
+      const queryClient = explicit && typeof explicit.invalidateQueries === "function" ? explicit : findCodexQueryClient();
       if (queryClient && typeof queryClient.invalidateQueries === "function") {
         Promise.resolve(queryClient.invalidateQueries({ queryKey: ["plugins"] })).catch(() => {});
       } else if (!window.__codexPlusPluginQueryClientMissingReported) {
