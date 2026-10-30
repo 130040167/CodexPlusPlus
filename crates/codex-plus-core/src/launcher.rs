@@ -407,7 +407,7 @@ pub trait LaunchHooks: Send + Sync {
     async fn load_settings(&self) -> anyhow::Result<BackendSettings>;
     async fn start_native_browser_compatibility(&self, _settings: &BackendSettings) {}
     async fn stop_native_browser_compatibility(&self) {}
-    fn cleanup_unsupported_config(&self) -> anyhow::Result<()> {
+    fn cleanup_unsupported_config(&self, _settings: &BackendSettings) -> anyhow::Result<()> {
         Ok(())
     }
     async fn run_provider_sync(&self) -> anyhow::Result<()>;
@@ -855,7 +855,7 @@ where
         hooks.start_native_browser_compatibility(&settings).await;
         let home = crate::relay_config::default_codex_home_dir();
         timeline.mark("cleanup_unsupported_config", 10);
-        hooks.cleanup_unsupported_config()?;
+        hooks.cleanup_unsupported_config(&settings)?;
         crate::relay_config::ensure_windows_sandbox_usable_for_current_user(&home)?;
         if settings.provider_sync_enabled {
             timeline.mark("provider_sync", 15);
@@ -1229,9 +1229,17 @@ impl LaunchHooks for DefaultLaunchHooks {
         SettingsStore::default().load()
     }
 
-    fn cleanup_unsupported_config(&self) -> anyhow::Result<()> {
+    fn cleanup_unsupported_config(&self, settings: &BackendSettings) -> anyhow::Result<()> {
         let home = crate::relay_config::default_codex_home_dir();
         crate::relay_config::cleanup_unsupported_approval_policies_in_home(&home)?;
+        if let Err(error) =
+            crate::relay_config::ensure_managed_session_provider_in_home(&home, settings)
+        {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "launcher.managed_session_provider_repair_failed",
+                serde_json::json!({ "message": error.to_string() }),
+            );
+        }
         Ok(())
     }
 

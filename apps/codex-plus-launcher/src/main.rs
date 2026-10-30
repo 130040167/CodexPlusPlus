@@ -989,6 +989,15 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
     // 于是「切换登录方式后 model_provider 没跟着切换」「历史会话没被自动修复」，
     // 只有管理工具的「重启」才生效（issue #2080）。失败不阻断激活，只记日志。
     run_activation_provider_sync(&hooks, &settings).await;
+    if let Err(error) = codex_plus_core::relay_config::ensure_managed_session_provider_in_home(
+        &codex_plus_core::relay_config::default_codex_home_dir(),
+        &settings,
+    ) {
+        let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+            "launcher.managed_session_provider_repair_failed",
+            json!({ "message": error.to_string(), "phase": "activate_existing" }),
+        );
+    }
     let launch_result = hooks
         .launch_codex(
             &app_dir,
@@ -1117,8 +1126,11 @@ impl LaunchHooks for LauncherHooks {
         }
     }
 
-    fn cleanup_unsupported_config(&self) -> anyhow::Result<()> {
-        self.core.cleanup_unsupported_config()
+    fn cleanup_unsupported_config(
+        &self,
+        settings: &codex_plus_core::settings::BackendSettings,
+    ) -> anyhow::Result<()> {
+        self.core.cleanup_unsupported_config(settings)
     }
 
     async fn run_provider_sync(&self) -> anyhow::Result<()> {
