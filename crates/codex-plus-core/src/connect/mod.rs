@@ -1,4 +1,5 @@
 pub mod app_server;
+mod inbox;
 pub mod media;
 pub mod session_store;
 pub mod weixin;

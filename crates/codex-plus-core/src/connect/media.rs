@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use aes_gcm::aes::{
@@ -11,9 +11,8 @@ use futures_util::StreamExt;
 use md5::{Digest, Md5};
 use reqwest::{Url, redirect::Policy};
 use serde::Deserialize;
-use tokio::io::AsyncWriteExt;
-use uuid::Uuid;
 
+use super::inbox::Inbox;
 use super::weixin::{WeixinMessage, WeixinMessageItem};
 
 #[cfg(test)]
@@ -107,7 +106,7 @@ impl MediaClient {
     pub(super) async fn download_attachments(
         &self,
         message: &WeixinMessage,
-        directory: &Path,
+        directory: &Inbox,
     ) -> DownloadedAttachments {
         let mut result = DownloadedAttachments::default();
         let (items, truncated) = attachment_items(message);
@@ -130,13 +129,18 @@ impl MediaClient {
                 }
             }
         }
+        if directory.record(&result.attachments).is_err() {
+            // 归属登记失败的文件保留供排查，但不能作为已接收附件交给会话。
+            result.attachments.clear();
+            result.warnings.push("无法登记微信附件归属".into());
+        }
         result
     }
 
     async fn download_item(
         &self,
         item: &WeixinMessageItem,
-        directory: &Path,
+        directory: &Inbox,
         max_bytes: usize,
     ) -> anyhow::Result<(LocalAttachment, usize)> {
         let (kind, media, hex_key, filename, expected_size, expected_md5, image_url) =
@@ -213,7 +217,7 @@ impl MediaClient {
         } else {
             safe_filename(filename)
         };
-        let path = save_new(directory, &filename, &bytes).await?;
+        let path = directory.save(&filename, &bytes).await?;
         Ok((LocalAttachment { path, kind }, bytes.len()))
     }
 
@@ -407,39 +411,6 @@ fn safe_filename(filename: &str) -> String {
     } else {
         result.into()
     }
-}
-
-async fn save_new(directory: &Path, filename: &str, bytes: &[u8]) -> anyhow::Result<PathBuf> {
-    tokio::fs::create_dir_all(directory)
-        .await
-        .context("无法创建附件目录")?;
-    let directory = tokio::fs::canonicalize(directory)
-        .await
-        .context("无法解析附件目录")?;
-    // Unique create_new prevents overwriting files and following existing file symlinks.
-    let path = directory.join(format!(
-        "{}-{}",
-        Uuid::new_v4().simple(),
-        safe_filename(filename)
-    ));
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .await
-        .map_err(|_| anyhow::anyhow!("无法创建附件文件"))?;
-    let saved = async {
-        file.write_all(bytes).await?;
-        // 等待 Tokio 后台写入完成，返回后同步读取也必须看到完整附件。
-        file.flush().await
-    }
-    .await;
-    if let Err(error) = saved {
-        drop(file);
-        let _ = tokio::fs::remove_file(&path).await;
-        return Err(error).context("无法保存附件文件");
-    }
-    Ok(path)
 }
 
 fn image_extension(bytes: &[u8]) -> &'static str {

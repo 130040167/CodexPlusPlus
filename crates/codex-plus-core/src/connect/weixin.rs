@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::time::Duration;
 
 use super::media::{self, DownloadedAttachments};
@@ -153,10 +152,10 @@ impl WeixinClient {
         Ok(self)
     }
 
-    pub async fn download_attachments(
+    pub(super) async fn download_attachments(
         &self,
         message: &WeixinMessage,
-        directory: &Path,
+        directory: &super::inbox::Inbox,
     ) -> DownloadedAttachments {
         self.media_client
             .download_attachments(message, directory)

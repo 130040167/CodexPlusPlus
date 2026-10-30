@@ -12,10 +12,11 @@ const PNG: &[u8] = b"\x89PNG\r\n\x1a\nweixin-test-image";
 
 #[tokio::test]
 async fn saved_attachment_is_immediately_readable_by_std_fs() {
-    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let dir = Inbox::create(root.path()).unwrap();
     for bytes in [b"report data".as_slice(), PNG, &[42u8; 128 * 1024]] {
         for _ in 0..8 {
-            let path = save_new(dir.path(), "attachment.bin", bytes).await.unwrap();
+            let path = dir.save("attachment.bin", bytes).await.unwrap();
             assert_eq!(std::fs::read(path).unwrap(), bytes);
         }
     }
@@ -162,10 +163,9 @@ async fn downloads_encrypted_image_and_quoted_file_without_bot_headers() {
         }
     ]));
     assert!(message.has_attachments());
-    let dir = tempfile::tempdir().unwrap();
-    let result = client(&server)
-        .download_attachments(&message, dir.path())
-        .await;
+    let root = tempfile::tempdir().unwrap();
+    let dir = Inbox::create(root.path()).unwrap();
+    let result = client(&server).download_attachments(&message, &dir).await;
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     assert_eq!(result.attachments.len(), 2);
     let image = &result.attachments[0];
@@ -224,10 +224,9 @@ async fn accepts_raw_key_and_plain_image_full_urls_without_following_redirects()
         {"type": 2, "image_item": {"url": format!("{}/plain", server.uri())}},
         {"type": 2, "image_item": {"media": {"full_url": format!("{}/redirect?key=secret", server.uri())}}}
     ]));
-    let dir = tempfile::tempdir().unwrap();
-    let result = client(&server)
-        .download_attachments(&message, dir.path())
-        .await;
+    let root = tempfile::tempdir().unwrap();
+    let dir = Inbox::create(root.path()).unwrap();
+    let result = client(&server).download_attachments(&message, &dir).await;
     assert_eq!(result.attachments.len(), 2);
     assert_eq!(result.warnings.len(), 1);
     assert!(result.warnings[0].contains("302"));
@@ -248,10 +247,9 @@ async fn attachment_failures_leave_caption_and_other_attachments_available() {
         {"type": 4, "file_item": {"media": {"aes_key": "secret-invalid-key"}}},
         {"type": 2, "image_item": {"url": "https://evil.test/file?token=secret"}}
     ]));
-    let dir = tempfile::tempdir().unwrap();
-    let result = client(&server)
-        .download_attachments(&message, dir.path())
-        .await;
+    let root = tempfile::tempdir().unwrap();
+    let dir = Inbox::create(root.path()).unwrap();
+    let result = client(&server).download_attachments(&message, &dir).await;
     assert_eq!(message.text().as_deref(), Some("Keep this text"));
     assert!(result.attachments.is_empty());
     assert_eq!(result.warnings.len(), 3);
@@ -290,17 +288,16 @@ async fn rejects_truncated_media_metadata_mismatches_and_oversized_bodies() {
             "full_url": format!("{}/wrong-size", server.uri()), "aes_key": STANDARD.encode(KEY)
         }}}
     ]));
-    let dir = tempfile::tempdir().unwrap();
-    let result = client(&server)
-        .download_attachments(&message, dir.path())
-        .await;
+    let root = tempfile::tempdir().unwrap();
+    let dir = Inbox::create(root.path()).unwrap();
+    let result = client(&server).download_attachments(&message, &dir).await;
     assert!(result.attachments.is_empty());
     assert_eq!(result.warnings.len(), 2);
     let response = reqwest::get(format!("{}/large", server.uri()))
         .await
         .unwrap();
     assert!(read_bytes_limited(response, 64).await.is_err());
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }
 
 #[tokio::test]
@@ -313,9 +310,11 @@ async fn quote_depth_and_attachment_count_are_bounded() {
     let deeply_quoted = message(json!([nested]));
     assert!(!deeply_quoted.has_attachments());
     assert!(deeply_quoted.text().unwrap().len() < 200);
+    let root = tempfile::tempdir().unwrap();
+    let dir = Inbox::create(root.path()).unwrap();
     let result = MediaClient::new(DEFAULT_CDN_BASE_URL)
         .unwrap()
-        .download_attachments(&deeply_quoted, Path::new("unused"))
+        .download_attachments(&deeply_quoted, &dir)
         .await;
     assert_eq!(result.warnings.len(), 1);
     let many = message(serde_json::Value::Array(
@@ -341,10 +340,9 @@ async fn downloads_encrypted_and_quoted_images_without_bot_headers() {
             "media":{"encrypt_query_param":"image+/=&","aes_key":"ignored"}}});
     let message = message(json!([image,
             {"type":1,"text_item":{"text":"caption"},"ref_msg":{"message_item":image}}]));
-    let dir = tempfile::tempdir().unwrap();
-    let result = client(&server)
-        .download_attachments(&message, dir.path())
-        .await;
+    let root = tempfile::tempdir().unwrap();
+    let dir = Inbox::create(root.path()).unwrap();
+    let result = client(&server).download_attachments(&message, &dir).await;
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     assert_eq!(result.attachments.len(), 2);
     assert_eq!(message.text().as_deref(), Some("caption"));
@@ -374,13 +372,12 @@ async fn rejects_truncated_images_and_oversized_response_bodies() {
         .await;
     let message = message(json!([{"type":2,"image_item":{"media":{
             "full_url":format!("{}/bad",server.uri()),"aes_key":STANDARD.encode(KEY)}}}]));
-    let dir = tempfile::tempdir().unwrap();
-    let result = client(&server)
-        .download_attachments(&message, dir.path())
-        .await;
+    let root = tempfile::tempdir().unwrap();
+    let dir = Inbox::create(root.path()).unwrap();
+    let result = client(&server).download_attachments(&message, &dir).await;
     assert!(result.attachments.is_empty());
     assert_eq!(result.warnings.len(), 1);
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     let response = reqwest::get(format!("{}/large", server.uri()))
         .await
         .unwrap();
@@ -401,17 +398,55 @@ async fn rejects_file_checksum_mismatch_before_saving() {
         "file_name":"report.txt","len":"11","md5":"00000000000000000000000000000000",
         "media":{"full_url":format!("{}/file",server.uri()),"aes_key":STANDARD.encode(KEY)}
     }}]));
-    let dir = tempfile::tempdir().unwrap();
-    let result = client(&server)
-        .download_attachments(&message, dir.path())
-        .await;
+    let root = tempfile::tempdir().unwrap();
+    let dir = Inbox::create(root.path()).unwrap();
+    let result = client(&server).download_attachments(&message, &dir).await;
     assert!(message.has_attachments());
     assert!(result.attachments.is_empty());
     assert_eq!(result.warnings.len(), 1);
     assert!(result.warnings[0].contains("MD5"));
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }
 
 fn encrypt(plaintext: &[u8], key: &[u8; 16]) -> Vec<u8> {
     ecb::Encryptor::<Aes128>::new(key.into()).encrypt_padded_vec_mut::<Pkcs7>(plaintext)
+}
+
+#[tokio::test]
+async fn downloaded_files_are_owned_before_exposure_and_registration_failure_is_reported() {
+    let server = MockServer::start().await;
+    Mock::given(path("/plain"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(PNG))
+        .mount(&server)
+        .await;
+    let message = message(json!([{"type":2,"image_item":{
+        "url":format!("{}/plain", server.uri())
+    }}]));
+    let root = tempfile::tempdir().unwrap();
+    let inbox = Inbox::create(root.path()).unwrap();
+    let result = client(&server).download_attachments(&message, &inbox).await;
+    assert_eq!(result.attachments.len(), 1);
+    assert!(result.warnings.is_empty());
+    let marker: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(inbox.path().join(".weixin-media.json")).unwrap())
+            .unwrap();
+    assert_eq!(marker["files"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        marker["files"][0][0].as_str(),
+        result.attachments[0].path.file_name().unwrap().to_str()
+    );
+
+    let blocked = Inbox::create(root.path()).unwrap();
+    std::fs::rename(
+        blocked.path().join(".weixin-media.json"),
+        blocked.path().join("marker.backup"),
+    )
+    .unwrap();
+    std::fs::create_dir(blocked.path().join(".weixin-media.json")).unwrap();
+    let result = client(&server)
+        .download_attachments(&message, &blocked)
+        .await;
+    assert!(result.attachments.is_empty());
+    assert_eq!(result.warnings, ["无法登记微信附件归属"]);
+    assert!(blocked.path().join("marker.backup").exists());
 }

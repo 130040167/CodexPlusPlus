@@ -469,6 +469,7 @@ dependencies = [
  "futures-util",
  "http",
  "httpdate",
+ "libc",
  "md-5",
  "objc2",
  "objc2-app-kit",

@@ -34,6 +34,9 @@ uuid.workspace = true
 zip.workspace = true
 zstd.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # 窗口取流（ScreenCaptureKit）——仅 macOS 有这套框架
 block2 = "0.6"
