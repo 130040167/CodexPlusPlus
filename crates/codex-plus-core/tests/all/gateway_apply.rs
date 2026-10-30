@@ -1281,6 +1281,42 @@ fn groups_are_saved_validated_and_unlinked_on_delete() {
     assert_eq!(saved.members[0].weight, 1, "权重至少为 1");
     assert_eq!(saved.mode, GroupMode::Rotate);
     assert_eq!(saved.sticky, GroupSticky::Cache, "没填时默认缓存期内固定");
+    assert!(!saved.hide_codex_group, "旧配置没有新字段时默认不隐藏组");
+    let (_, _) = save_group(
+        store,
+        &GroupInput {
+            id: fast.clone(),
+            name: "Fast".into(),
+            members: vec![member("deepseek-v4-flash")],
+            hide_codex_group: Some(true),
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    let (gateway, _) = save_group(
+        store,
+        &GroupInput {
+            id: fast.clone(),
+            name: "Fast renamed".into(),
+            members: vec![member("deepseek-v4-flash")],
+            hide_members: true,
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    let saved = gateway.group(&fast).unwrap();
+    assert!(saved.hide_codex_group, "旧调用方未传新字段时保留已有设置");
+    assert!(saved.hide_members, "旧字段仍保留原语义");
+    let stored = serde_json::to_value(saved).unwrap();
+    assert_eq!(stored["hideMembers"], true);
+    assert_eq!(stored["hideCodexGroup"], true);
+    let legacy: codex_plus_core::gateway::store::GatewayGroup = serde_json::from_value(json!({
+        "id": "legacy", "name": "Legacy", "hideMembers": true,
+        "members": [{"model": "deepseek-v4-flash", "weight": 1}]
+    }))
+    .unwrap();
+    assert!(legacy.hide_members);
+    assert!(!legacy.hide_codex_group);
     let gateway = delete_group(store, &fast).unwrap();
     assert_eq!(
         gateway.group(&coder).unwrap().members.len(),
@@ -1794,7 +1830,7 @@ fn gateway_catalog_refresh_follows_model_sync_and_pool_changes() {
                 model: format!("{second}/synced-model"),
                 weight: 1,
             }],
-            hide_members: true,
+            hide_codex_group: Some(true),
             ..GroupInput::default()
         },
     )
@@ -1907,7 +1943,7 @@ fn codex_hidden_group_preserves_supplier_models_and_other_groups() {
         &ctx.gateway,
         &GroupInput {
             name: "Hidden".into(),
-            hide_members: true,
+            hide_codex_group: Some(true),
             members: vec![
                 GroupMember {
                     model: format!("group/{visible_group}"),

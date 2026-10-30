@@ -126,8 +126,10 @@ export type GatewayGroupEntry = {
   mode: GroupMode;
   sticky?: GroupSticky;
   members: GroupMember[];
-  /** Codex 隐藏本组入口，供应商模型池保持完整；其他 Agent 沿用成员隐藏行为。 */
+  /** 隐藏成员：组里的模型不再单独出现在 Agent 的模型列表里，只能通过组来选。 */
   hideMembers?: boolean;
+  /** 只在 Codex 模型列表中隐藏本组入口。 */
+  hideCodexGroup?: boolean;
   /** 手动模式下选中的成员（成员的模型名）。 */
   pick?: string;
 };
@@ -547,7 +549,7 @@ export function pickerSections(
   const sections: PickerSection[] = [];
   const providers = agentPoolProviders(payload, exclude);
   // 多家都有的模型：每家名下那份固定发给这一家（`<供应商 id>/<模型>`）；它的自动组生效时另列一份裸名，
-  // 选它按自动组的方式走。只有一家的模型用裸名。供应商模型池不受模型组可见性影响。
+  // 选它按自动组的方式走。只有一家的模型用裸名。隐藏了成员的组，成员不单独列出。
   const unlisted = unlistedModels(payload);
   const shared: string[] = [];
   for (const entry of providers) {
@@ -558,6 +560,7 @@ export function pickerSections(
         const multi = servingProviders(payload, model, exclude).length > 1;
         if (multi && !shared.some((known) => known.toLowerCase() === model.toLowerCase())) shared.push(model);
         const value = multi ? `${entry.id}/${model}` : model;
+        if (unlisted.has(value.toLowerCase())) return [];
         return [{ model: value, label: prettyModelName(model), sub: maskAccountName(entry.name), avatar: avatar(entry.name) }];
       });
     if (items.length) sections.push({ key: `provider:${entry.id}`, title: maskAccountName(entry.name), avatar: avatar(entry.name), items });
@@ -572,8 +575,7 @@ export function pickerSections(
     }));
   if (autoItems.length) sections.push({ key: "auto", title: "自动组", avatar: "", items: autoItems });
   const groups = payload.groups
-    .filter((group) => group.id !== skipGroup && !unlisted.has(groupModelId(group.id).toLowerCase())
-      && group.members.length && matches(query, group.name, groupModelId(group.id)))
+    .filter((group) => group.id !== skipGroup && group.members.length && matches(query, group.name, groupModelId(group.id)))
     .map((group) => ({ model: groupModelId(group.id), label: group.name, sub: groupModelId(group.id), avatar: avatar(group.name) }));
   if (groups.length) sections.push({ key: "group", title: "我的组", avatar: "", items: groups });
   const typed = rawQuery.trim();
@@ -1464,10 +1466,20 @@ export function activeAutoGroup(payload: GatewayPayload | null, model: string): 
   return found && !found.hidden ? found : null;
 }
 
-/** 模型组可见性只作用于组入口；供应商池始终完整展示（小写）。 */
+/** 隐藏了成员的组（自建的、生效中的自动组）里，不再单独出现在模型列表里的模型（小写）。 */
 export function unlistedModels(payload: GatewayPayload | null): Set<string> {
-  return new Set((payload?.groups ?? []).filter(group => group.hideMembers)
-    .map(group => groupModelId(group.id).toLowerCase()));
+  const hidden = new Set<string>();
+  const add = (group: GatewayGroupEntry) => {
+    for (const member of group.members) {
+      const model = member.model.trim();
+      if (model && !model.includes("*") && !model.startsWith(GROUP_MODEL_PREFIX)) hidden.add(model.toLowerCase());
+    }
+  };
+  for (const group of payload?.groups ?? []) if (group.hideMembers) add(group);
+  if (payload?.gateway.autoModels !== false) {
+    for (const group of payload?.autoGroups ?? []) if (group.hideMembers && !group.hidden) add(group);
+  }
+  return hidden;
 }
 
 /** 组成员指向的具体上游：`<供应商 id>/<模型>` 或只有一家的裸模型名才有；多家的裸名、组、通配符返回 null。 */

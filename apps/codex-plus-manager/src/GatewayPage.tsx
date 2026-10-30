@@ -256,7 +256,7 @@ function RoutingView({ payload, busy, run }: { payload: GatewayPayload | null; b
   const saveMine = (group: GatewayGroupEntry, patch: Partial<GatewayGroupEntry>) => {
     const next = { ...group, ...patch };
     void run(`group:${group.id}`, "save_gateway_group", {
-      group: { id: next.id, name: next.name, mode: next.mode, sticky: next.sticky ?? "cache", members: next.members, hideMembers: next.hideMembers ?? false, pick: next.pick ?? "" },
+      group: { id: next.id, name: next.name, mode: next.mode, sticky: next.sticky ?? "cache", members: next.members, hideMembers: next.hideMembers ?? false, hideCodexGroup: next.hideCodexGroup ?? false, pick: next.pick ?? "" },
     }, t("保存组"), true);
   };
   const saveAuto = (group: AutoGroupEntry, patch: Partial<AutoGroupEntry>) => {
@@ -373,9 +373,9 @@ function RoutingView({ payload, busy, run }: { payload: GatewayPayload | null; b
           group={editing === "new" ? null : editing}
           onCancel={() => setEditing(null)}
           onSave={async (input) => {
-            // 编辑器不管「隐藏成员」和手动选中的成员：沿用卡片上已有的。
+            // 编辑器不管可见性和手动选中的成员：沿用卡片上已有的。
             const previous = editing === "new" ? null : editing;
-            const group = { ...input, hideMembers: previous?.hideMembers ?? false, pick: previous?.pick ?? "" };
+            const group = { ...input, hideMembers: previous?.hideMembers ?? false, hideCodexGroup: previous?.hideCodexGroup ?? false, pick: previous?.pick ?? "" };
             if (await run("group:save", "save_gateway_group", { group }, t("保存组"))) setEditing(null);
           }}
           payload={payload}
@@ -456,12 +456,14 @@ function GroupCard({
         {group.members.length === 0 ? <li className="gw-route-member-empty">{t("没有成员")}</li> : null}
       </ol>
       <footer className="gw-route-group-foot">
-        <label className="gw-route-hide" title={t(auto
-          ? "其他 Agent 隐藏组内成员；Codex 的供应商分组保持完整。"
-          : "在 Codex 模型列表隐藏这个组入口，供应商分组保持完整；直接写模型组名称仍可使用。")}>
-          <Switch disabled={disabled} label={t(auto ? "隐藏成员" : "在 Codex 隐藏模型组")} on={group.hideMembers === true} onToggle={() => onChange({ hideMembers: !group.hideMembers })} />
-          <span>{t(auto ? "隐藏成员" : "在 Codex 隐藏模型组")}</span>
+        <label className="gw-route-hide" title={t("打开后，组里的模型不再单独出现在 Agent 的模型列表里，只能通过这个组来选；直接写名字仍然能用。")}>
+          <Switch disabled={disabled} label={t("隐藏成员")} on={group.hideMembers === true} onToggle={() => onChange({ hideMembers: !group.hideMembers })} />
+          <span>{t("隐藏成员")}</span>
         </label>
+        {!auto ? <label className="gw-route-hide" title={t("仅在 Codex 模型列表隐藏这个组入口，不改变成员显示或路由。")}>
+          <Switch disabled={disabled} label={t("在 Codex 隐藏模型组")} on={group.hideCodexGroup === true} onToggle={() => onChange({ hideCodexGroup: !group.hideCodexGroup })} />
+          <span>{t("在 Codex 隐藏模型组")}</span>
+        </label> : null}
         <span className="gw-route-group-mode">{t(groupModeDescription(group.mode))}</span>
         <span className="gw-row-buttons">
           {onEdit ? <button className="gw-text-button" disabled={disabled} onClick={onEdit} type="button">{t("编辑")}</button> : null}

@@ -3065,6 +3065,7 @@ describe("renderer injection conversation view alignment", () => {
 });
 
 describe("renderer model reasoning efforts patch", () => {
+  const modelCatalogPath = new URL("../../../assets/inject/renderer-inject/70-model-catalog.js", import.meta.url);
   // 补全逻辑只依赖 codexPlusModelMetadata，抽出来单独跑，避免再复制一份实现。
   function reasoningRuntime(renderer: string, metadata: Record<string, unknown> | null) {
     const start = renderer.indexOf("function modelReasoningEfforts(");
@@ -3089,7 +3090,7 @@ describe("renderer model reasoning efforts patch", () => {
   };
 
   it("不会给只声明三档的 deepseek 模型补出 ultra", async () => {
-    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const renderer = await readFile(modelCatalogPath, "utf8");
     const efforts = reasoningRuntime(renderer, threeLevelDeclaration)("cpx-relay-mv5bil9a/deepseek-flash");
 
     assert.deepEqual(
@@ -3098,29 +3099,36 @@ describe("renderer model reasoning efforts patch", () => {
     );
   });
 
-  it("网关已声明档位时不按 Sol 名称补出 max 与 ultra", async () => {
-    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
-    const efforts = reasoningRuntime(renderer, {
+  it("为 Sol、Terra 和 GPT-5.4 至 5.6 补 max 与 ultra", async () => {
+    const renderer = await readFile(modelCatalogPath, "utf8");
+    const declared = {
       supportedReasoningEfforts: ["low", "medium", "high", "xhigh"].map((reasoningEffort) => ({ reasoningEffort })),
-    })("gpt-5.6-sol");
-
-    assert.deepEqual(
-      efforts.map((entry) => entry.reasoningEffort),
-      ["low", "medium", "high", "xhigh"],
-    );
+    };
+    for (const model of ["supplier/gpt-6.1-sol", "supplier/gpt-6.1-terra", "gpt-5.4", "gpt-5.5", "gpt-5.6"]) {
+      const efforts = reasoningRuntime(renderer, declared)(model);
+      assert.deepEqual(efforts.map((entry) => entry.reasoningEffort), ["low", "medium", "high", "xhigh", "max", "ultra"], model);
+    }
+    assert.deepEqual(declared.supportedReasoningEfforts.map((entry) => entry.reasoningEffort), ["low", "medium", "high", "xhigh"]);
   });
 
-  it("供应商仅声明 low 和 high 时精确保留配置，并保留显式声明的 ultra", async () => {
-    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
-    for (const levels of [["low", "high"], ["high", "ultra"]]) {
+  it("补齐已声明档位时不重复 max 或 ultra，并保留旧的非名单模型规则", async () => {
+    const renderer = await readFile(modelCatalogPath, "utf8");
+    const cases = [
+      { model: "supplier/gpt-6.1-sol", levels: ["low", "high"], expected: ["low", "high", "max", "ultra"] },
+      { model: "supplier/gpt-6.1-sol", levels: ["high", "ultra"], expected: ["high", "ultra", "max"] },
+      { model: "supplier/gpt-6.1-terra", levels: ["high", "max", "ultra"], expected: ["high", "max", "ultra"] },
+      { model: "deepseek", levels: ["low", "high"], expected: ["low", "high", "max"] },
+      { model: "other", levels: ["low", "medium", "high"], expected: ["low", "medium", "high", "max", "ultra"] },
+    ];
+    for (const { model, levels, expected } of cases) {
       const efforts = reasoningRuntime(renderer, {
         supportedReasoningEfforts: levels.map(reasoningEffort => ({ reasoningEffort })),
-      })("supplier/gpt-6.1-sol");
-      assert.deepEqual(efforts.map(entry => entry.reasoningEffort), levels);
+      })(model);
+      assert.deepEqual(efforts.map(entry => entry.reasoningEffort), expected, model);
     }
   });
   it("没有档位声明时仍回落到完整兜底列表", async () => {
-    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const renderer = await readFile(modelCatalogPath, "utf8");
     const efforts = reasoningRuntime(renderer, null)("deepseek-flash");
 
     assert.deepEqual(

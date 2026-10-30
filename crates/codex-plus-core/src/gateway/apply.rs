@@ -498,7 +498,7 @@ fn codex_model_metadata(
             fields.insert("description".into(), json!(format!("{model} · 模型组")));
             fields.insert("codex_plus_group".into(), json!("模型组"));
             fields.insert("codex_plus_group_id".into(), json!(CODEX_GROUPS_GROUP_ID));
-            if group.hide_members {
+            if group.hide_codex_group {
                 fields.insert("visibility".into(), json!("hide"));
             }
             if codex_favorite(gateway, &relays, &model) {
@@ -3356,9 +3356,12 @@ pub struct GroupInput {
     pub sticky: GroupSticky,
     #[serde(default)]
     pub members: Vec<GroupMember>,
-    /// Codex 隐藏本组入口，供应商模型池保持完整；其他 Agent 沿用成员隐藏行为。
+    /// 隐藏组内成员的单独入口。
     #[serde(default)]
     pub hide_members: bool,
+    /// 仅隐藏 Codex 的组入口；旧调用方省略时保留已有设置。
+    #[serde(default)]
+    pub hide_codex_group: Option<bool>,
     /// 手动模式下选中的成员。
     #[serde(default)]
     pub pick: String,
@@ -3399,6 +3402,13 @@ fn save_group_in(gateway: &mut GatewaySettings, input: &GroupInput) -> anyhow::R
     if members.is_empty() {
         bail!("模型组至少要有一个成员");
     }
+    let hide_codex_group = input.hide_codex_group.unwrap_or_else(|| {
+        gateway
+            .groups
+            .iter()
+            .find(|group| group.id == id)
+            .is_some_and(|group| group.hide_codex_group)
+    });
     let mut group = GatewayGroup {
         id: id.clone(),
         name: name.to_string(),
@@ -3406,6 +3416,7 @@ fn save_group_in(gateway: &mut GatewaySettings, input: &GroupInput) -> anyhow::R
         sticky: input.sticky,
         members,
         hide_members: input.hide_members,
+        hide_codex_group,
         pick: input.pick.trim().to_string(),
         extra: Default::default(),
     };

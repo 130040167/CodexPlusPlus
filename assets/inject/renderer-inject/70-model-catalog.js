@@ -33,8 +33,12 @@
     recordRequest: recordModelListRequest,
     patchMcp: patchMcpModelResponseData,
     retryAt: 0,
+    failure: null,
   };
   window.__codexPlusModelCatalogRuntime = codexModelCatalogRuntime;
+  if (typeof codexThreadModelRetentionSettingsChanged === "function") {
+    window.__codexPlusThreadModelRetentionRefresh = codexThreadModelRetentionSettingsChanged;
+  }
   let codexModelWhitelistRefreshTimer = 0;
   let codexModelWhitelistRefreshUntil = 0;
   const codexPlusModelListRequestIds = new Set();
@@ -156,7 +160,7 @@
 
   async function loadCodexModelCatalog(force = false) {
     if (!force && codexModelCatalogPromise) return codexModelCatalogPromise;
-    if (!force && Date.now() < codexModelCatalogRuntime.retryAt) return codexModelCatalog;
+    if (!force && Date.now() < codexModelCatalogRuntime.retryAt) return codexModelCatalogRuntime.failure || codexModelCatalog;
     if (!force && codexModelCatalogLoadedAt && Date.now() - codexModelCatalogLoadedAt < 10000) return codexModelCatalog;
     const revision = ++codexModelCatalogRevision;
     const current = () => revision === codexModelCatalogRevision
@@ -198,6 +202,7 @@
         codexModelCatalog = nextCatalog;
         codexModelCatalogRuntime.catalog = nextCatalog;
         codexModelCatalogRuntime.retryAt = 0;
+        codexModelCatalogRuntime.failure = null;
         codexModelCatalogLoadedAt = Date.now();
         if (changed && typeof codexPlusModelPickerCatalogChanged === "function") codexPlusModelPickerCatalogChanged();
         if (changed) refreshCodexNativeModelQueries();
@@ -207,15 +212,16 @@
       })
       .catch((error) => {
         if (!current()) return codexModelCatalog;
-        // 暂时断连不能撤销当前成功目录；切换配置时已先隔离旧来源。
+        const failure = { status: "failed", message: String(error?.message || error), models: [], sources: [] };
         if (!["ok", "not_applied"].includes(codexModelCatalog.status)) {
-          codexModelCatalog = { status: "failed", message: String(error?.message || error), models: [], sources: [] };
+          codexModelCatalog = failure;
           codexModelCatalogRuntime.catalog = codexModelCatalog;
         }
         codexModelCatalogLoadedAt = 0;
         codexModelCatalogRuntime.retryAt = Date.now() + 1000;
+        codexModelCatalogRuntime.failure = failure;
         sendCodexPlusDiagnostic("model_catalog_refresh_failed", { error: String(error?.message || error) });
-        return codexModelCatalog;
+        return failure;
       })
       .finally(() => {
         if (codexModelCatalogPromise === request) codexModelCatalogPromise = null;
@@ -238,8 +244,15 @@
   function modelReasoningEfforts(modelName) {
     const supported = codexPlusModelMetadata(modelName)?.supportedReasoningEfforts;
     if (Array.isArray(supported) && supported.length > 0) {
-      // 网关/供应商池发布的档位是权威配置，不能按模型名称补出未声明的 max / ultra。
-      return supported.map((entry) => ({ ...entry }));
+      const efforts = supported.map((entry) => ({ ...entry }));
+      const hasMax = efforts.some((entry) => entry.reasoningEffort === "max");
+      const hasUltra = efforts.some((entry) => entry.reasoningEffort === "ultra");
+      if (!hasMax) efforts.push({ reasoningEffort: "max", description: "Maximum reasoning depth for the hardest problems" });
+      if (!hasUltra) {
+        const shouldAddUltra = /sol|terra|gpt-5\.6|gpt-5\.5|gpt-5\.4/i.test(String(modelName || ""));
+        if (shouldAddUltra || efforts.length >= 4) efforts.push({ reasoningEffort: "ultra", description: "Maximum reasoning with automatic task delegation" });
+      }
+      return efforts;
     }
     return ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({ reasoningEffort, description: `${reasoningEffort} effort` }));
   }
@@ -727,7 +740,33 @@
     return result;
   }
 
-  // 原生 next-turn 设置可能仅存活到线程卸载；只记录已成功提交的模型设置。
+  function codexThreadModelRetentionSettingsChanged() {
+    const enabled = codexPlusBackendSettingsLoaded && codexPlusBackendSettings.enhancementsEnabled !== false
+      && codexPlusBackendSettings.codexAppThreadModelRetention === true;
+    const state = window.__codexPlusThreadModelRetentionState
+      || (window.__codexPlusThreadModelRetentionState = { enabled: false, epoch: 0, cache: null, threads: new Map() });
+    if (state.enabled !== enabled) {
+      state.enabled = enabled;
+      state.epoch += 1;
+      state.cache = null;
+      state.threads = new Map();
+      window.__codexPlusThreadModelSelections = new Map();
+      window.__codexPlusThreadModelPending = new Map();
+      window.__codexPlusThreadModelRestoreStates = new WeakMap();
+      window.__codexPlusThreadModelFallbackStates = new WeakMap();
+    }
+    return state;
+  }
+
+  function scheduleCodexThreadModelSync(delay) {
+    const epoch = codexThreadModelRetentionSettingsChanged().epoch;
+    window.setTimeout?.(() => {
+      if (codexThreadModelObserverActive() && codexThreadModelRetentionSettingsChanged().epoch === epoch) {
+        syncCodexRetainedThreadModels();
+      }
+    }, delay);
+  }
+
   function codexThreadModelProfile() {
     const active = codexRemoteSessionActiveProfile();
     if (active) return active;
@@ -741,16 +780,43 @@
   }
 
   function codexRememberedThreadModels() {
+    if (!codexThreadModelObserverActive()) return [];
+    const state = codexThreadModelRetentionSettingsChanged();
+    if (state.cache) return state.cache.entries;
+    if (!window.__codexPlusThreadModelStorageListener && typeof window.addEventListener === "function") {
+      window.__codexPlusThreadModelStorageListener = (event) => {
+        if (event.key === "codexPlus.threadModels.v1" || event.key === null) {
+          const current = window.__codexPlusThreadModelRetentionState;
+          if (current) current.cache = null;
+        }
+      };
+      window.addEventListener("storage", window.__codexPlusThreadModelStorageListener);
+    }
+    let entries = [];
     try {
       const value = JSON.parse(localStorage.getItem("codexPlus.threadModels.v1") || "[]");
-      return Array.isArray(value) ? value.filter((entry) => entry && typeof entry.key === "string"
-        && typeof entry.model === "string" && Number.isFinite(entry.at)).slice(0, 2000) : [];
-    } catch { return []; }
+      if (Array.isArray(value)) entries = value.filter((entry) => entry && typeof entry.key === "string"
+        && typeof entry.model === "string" && Number.isFinite(entry.at)).slice(0, 2000);
+    } catch {}
+    const latest = new Map();
+    const scopes = new Map();
+    for (const entry of entries) {
+      try {
+        const scope = JSON.parse(entry.key);
+        if (!Array.isArray(scope) || typeof scope[0] !== "string" || typeof scope[2] !== "string") continue;
+        scopes.set(entry.key, scope);
+        const key = JSON.stringify([scope[0], scope[2]]);
+        if (!latest.has(key) || latest.get(key).at < entry.at) latest.set(key, entry);
+      } catch {}
+    }
+    state.cache = { entries, latest, scopes };
+    return entries;
   }
 
   function codexThreadModelStorageKey(hostId, threadId) {
+    if (!codexThreadModelObserverActive() || hostId !== "local") return "";
     const profile = codexThreadModelProfile();
-    return hostId === "local" && codexPlusBackendSettingsLoaded && profile?.id && threadId
+    return profile?.id && threadId
       ? JSON.stringify([hostId, profile.id, threadId]) : "";
   }
 
@@ -773,13 +839,9 @@
   }
 
   function codexLatestThreadModel(hostId, threadId) {
-    // 兼容旧的按配置保存记录；跨直连/聚合读取同一对话最近一次选择。
-    return codexRememberedThreadModels().filter((entry) => {
-      try {
-        const scope = JSON.parse(entry.key);
-        return Array.isArray(scope) && scope[0] === hostId && scope[2] === threadId;
-      } catch { return false; }
-    }).sort((a, b) => b.at - a.at)[0] || null;
+    if (!codexThreadModelObserverActive() || hostId !== "local" || !threadId) return null;
+    codexRememberedThreadModels();
+    return codexThreadModelRetentionSettingsChanged().cache?.latest.get(JSON.stringify([hostId, threadId])) || null;
   }
 
   function codexThreadModelSourceGroup(model) {
@@ -802,11 +864,9 @@
     const matches = names.filter((model) => baseName(model) === savedBase);
     let groupId = saved.groupId;
     if (!groupId) {
-      try {
-        const profileId = JSON.parse(saved.key)[1];
-        const profile = codexPlusBackendSettings.relayProfiles?.find((entry) => entry.id === profileId);
-        if (profile?.relayMode === "pureApi") groupId = profile.id;
-      } catch { /* 无来源的旧记录仍可按模型名匹配。 */ }
+      const profileId = codexThreadModelRetentionSettingsChanged().cache?.scopes.get(saved.key)?.[1];
+      const profile = codexPlusBackendSettings.relayProfiles?.find((entry) => entry.id === profileId);
+      if (profile?.relayMode === "pureApi") groupId = profile.id;
     }
     const sameSource = groupId && matches.find((model) => codexThreadModelSourceGroup(model) === groupId);
     if (sameSource) return sameSource;
@@ -852,16 +912,8 @@
       localStorage.setItem("codexPlus.threadModels.v1", JSON.stringify([
         entry, ...previous.filter((item) => item.key !== key),
       ].slice(0, 2000)));
+      codexThreadModelRetentionSettingsChanged().cache = null;
     } catch { /* 存储不可用时继续原生流程。 */ }
-  }
-
-  function retainCodexThreadResumeModel(method, params, hostId) {
-    if (String(method) !== "thread/resume") return params;
-    const saved = codexRetainedThreadModel(hostId, params?.threadId);
-    if (!saved) return params;
-    const intent = codexThreadModelIntent(hostId, params?.threadId, params);
-    if (intent) return params;
-    return { ...params, model: saved.model, reasoningEffort: saved.effort ?? params?.reasoningEffort };
   }
 
   function codexThreadModelIntent(hostId, threadId, params) {
@@ -876,38 +928,55 @@
   }
 
   async function sendCodexRetainedModelRequest(client, send, method, params, options) {
+    if (!codexThreadModelObserverActive()) return await send(method, params, options);
     if (String(method) === "send-cli-request-for-host" && params?.method) {
-      return sendCodexRetainedModelRequest({ hostId: params.hostId || client.hostId },
-        (nestedMethod, nestedParams, nestedOptions) => send(method,
-          { ...params, method: nestedMethod, params: nestedParams }, nestedOptions),
+      return sendCodexRetainedModelRequest({ hostId: modelResponseHostId(client, params, params.params) },
+        (_nestedMethod, _nestedParams, nestedOptions) => send(method, params, nestedOptions),
         String(params.method), params.params, options);
     }
-    const profileId = codexThreadModelProfile()?.id;
-    const key = codexThreadModelStorageKey(client.hostId, params?.threadId);
+    const hostId = modelResponseHostId(client, params);
+    if (hostId !== "local") return await send(method, params, options);
+    const state = codexThreadModelRetentionSettingsChanged();
+    const epoch = state.epoch;
+    if (String(method) === "thread/resume" && params?.threadId) state.threads.set(params.threadId, "resumed");
+    const profile = codexThreadModelProfile();
+    const profileId = profile?.id;
+    const settingsAtStart = codexPlusBackendSettings;
+    const eligibleStart = String(method) === "thread/start" && profile?.relayMode === "pureApi"
+      && !codexPlusBackendSettings.managedSessionConnection && typeof codexManagedSessionConnection === "function"
+      && !codexManagedSessionConnection();
+    const key = codexThreadModelStorageKey(hostId, params?.threadId);
     const selection = captureCodexThreadModelSelection(params);
-    const intent = codexThreadModelIntent(client.hostId, params?.threadId, params);
+    const intent = codexThreadModelIntent(hostId, params?.threadId, params);
     const explicit = !!intent;
     const pending = window.__codexPlusThreadModelPending || (window.__codexPlusThreadModelPending = new Map());
     const tracks = key && String(method) === "thread/settings/update";
     if (tracks) pending.set(key, (pending.get(key) || 0) + 1);
     try {
-      const next = retainCodexThreadResumeModel(method, params, client.hostId);
-      const result = await send(method, next, options);
+      const result = await send(method, params, options);
+      if (!codexThreadModelObserverActive() || state.epoch !== epoch) return result;
+      const startedThread = result?.thread?.id || result?.threadId;
+      if (eligibleStart && settingsAtStart === codexPlusBackendSettings && profileId === codexThreadModelProfile()?.id
+          && modelResponseHostId(hostId, result, result?.thread) === "local"
+          && result?.modelProvider !== "codex_plus_managed" && result?.thread?.modelProvider !== "codex_plus_managed"
+          && !codexManagedSessionConnection() && startedThread && !result?.error && result?.applied !== false
+          && !state.threads.has(startedThread)) state.threads.set(startedThread, "fresh");
       if (result?.applied === false || result?.error) {
         if (explicit && window.__codexPlusThreadModelSelections?.get(key) === intent) window.__codexPlusThreadModelSelections.delete(key);
       }
       if (profileId === codexThreadModelProfile()?.id) {
         const confirmedSelection = explicit && !intent.powerSelection ? intent.selection : selection;
-        rememberCodexThreadModel(method, next, result, client.hostId, confirmedSelection, !!explicit);
+        rememberCodexThreadModel(method, params, result, hostId, confirmedSelection, !!explicit);
       }
       return result;
     } catch (error) {
       // 不支持的 RPC 会由原生回退到本地状态；其它失败不能确认用户选择。
       const unsupported = error?.code === -32601 || /method (?:not found|unsupported|not supported)/i.test(String(error?.message || error));
-      if (explicit && !unsupported && window.__codexPlusThreadModelSelections?.get(key) === intent) window.__codexPlusThreadModelSelections.delete(key);
+      if (codexThreadModelObserverActive() && state.epoch === epoch && explicit && !unsupported
+          && window.__codexPlusThreadModelSelections?.get(key) === intent) window.__codexPlusThreadModelSelections.delete(key);
       throw error;
     } finally {
-      if (tracks) {
+      if (tracks && codexThreadModelObserverActive() && state.epoch === epoch) {
         const count = (pending.get(key) || 1) - 1;
         if (count) pending.set(key, count); else pending.delete(key);
       }
@@ -927,7 +996,7 @@
           && Array.isArray(props.models)) picker = props;
       if (!conversationId && typeof props.conversationId === "string") conversationId = props.conversationId;
       if (!threadId && typeof props.threadId === "string") threadId = props.threadId;
-      if (!hostId && typeof props.permissionsHostId === "string") hostId = props.permissionsHostId;
+      hostId = modelResponseHostId(hostId, props, { hostId: props.permissionsHostId, host_id: props.permissions_host_id });
     }
     return { picker, owner: conversationId || threadId, hostId, selectedModel, selectedEffort };
   }
@@ -968,13 +1037,25 @@
     // 只记意图；原生实际选中后才持久化，取消和自动回退不算选择。
     selections.set(key, { selection, ...options, at: Date.now(), confirmedSince: 0 });
     for (const [entryKey, value] of selections) if (Date.now() - value.at >= 30000) selections.delete(entryKey);
-    window.setTimeout?.(syncCodexRetainedThreadModels, 300);
-    window.setTimeout?.(syncCodexRetainedThreadModels, 0);
+    scheduleCodexThreadModelSync(300);
+    scheduleCodexThreadModelSync(0);
   }
 
   function codexThreadModelObserverActive() {
-    return !observeCodexThreadModelSelection.__codexPlusInstalled
-      || window.__codexPlusThreadModelSelectionObserver === observeCodexThreadModelSelection;
+    if (window.__codexPlusThreadModelRetentionRefresh
+        && window.__codexPlusThreadModelRetentionRefresh !== codexThreadModelRetentionSettingsChanged) return false;
+    return codexThreadModelRetentionSettingsChanged().enabled
+      && (!observeCodexThreadModelSelection.__codexPlusInstalled
+        || window.__codexPlusThreadModelSelectionObserver === observeCodexThreadModelSelection);
+  }
+
+  function codexThreadModelAutomaticSyncAllowed(owner) {
+    if (!codexThreadModelObserverActive() || !owner) return false;
+    if (codexThreadModelProfile()?.relayMode !== "pureApi") return false;
+    if (codexPlusBackendSettings.managedSessionConnection
+        || typeof codexManagedSessionConnection !== "function" || codexManagedSessionConnection()) return false;
+    if (window.__codexPlusManagedSessionStarts?.has(owner) || window.__codexPlusConnectionRecoveryPending?.has(owner)) return false;
+    return codexThreadModelRetentionSettingsChanged().threads.get(owner) === "fresh";
   }
 
   function installCodexThreadModelSelectionObserver() {
@@ -991,6 +1072,7 @@
   }
 
   function codexFallbackThreadModelSelection(node, picker, hostId, owner, latest) {
+    if (!codexThreadModelAutomaticSyncAllowed(owner) || hostId !== "local") return false;
     const fallback = typeof codexPlusConfiguredDefaultModel === "function"
       ? codexPlusConfiguredDefaultModel() : "";
     if (!latest || !fallback || !picker.models.some((entry) => entry?.model === fallback)) return false;
@@ -1002,7 +1084,7 @@
     const previous = fallbackStates.get(node);
     if (!previous || previous.signature !== signature) {
       fallbackStates.set(node, { signature, attempts: 0 });
-      window.setTimeout?.(syncCodexRetainedThreadModels, 300);
+      scheduleCodexThreadModelSync(300);
       return true;
     }
     if (previous.attempts >= 3) return true;
@@ -1010,10 +1092,12 @@
     const efforts = modelReasoningEfforts(fallback);
     const effort = efforts.some((entry) => entry.reasoningEffort === picker.reasoningEffort)
       ? picker.reasoningEffort : codexPlusModelMetadata(fallback)?.defaultReasoningEffort || efforts[0]?.reasoningEffort;
+    const epoch = codexThreadModelRetentionSettingsChanged().epoch;
     try {
       Promise.resolve(picker.onSelectModel(fallback, effort)).then(() => {
-        if (window.__codexPlusThreadModelFallbackStates?.get(node) === previous) {
-          window.setTimeout?.(syncCodexRetainedThreadModels, 300);
+        if (codexThreadModelAutomaticSyncAllowed(owner) && codexThreadModelRetentionSettingsChanged().epoch === epoch
+            && window.__codexPlusThreadModelFallbackStates?.get(node) === previous) {
+          scheduleCodexThreadModelSync(300);
         }
       }, () => {});
     } catch {}
@@ -1041,7 +1125,7 @@
           }
           if (intent.awaitPowerChange) {
             if (Date.now() - intent.at >= 600) selections.delete(key);
-            window.setTimeout?.(syncCodexRetainedThreadModels, 300);
+            scheduleCodexThreadModelSync(300);
             continue;
           }
         }
@@ -1054,7 +1138,7 @@
             selections.delete(key);
           } else if (!intent.confirmedSince) {
             intent.confirmedSince = Date.now();
-            window.setTimeout?.(syncCodexRetainedThreadModels, 300);
+            scheduleCodexThreadModelSync(300);
           } else if (Date.now() - intent.confirmedSince >= 250) {
             rememberCodexThreadModel("thread/settings/update", { threadId: owner }, {}, hostId,
               { ...intent.selection, effort: picker.reasoningEffort ?? null }, true);
@@ -1065,6 +1149,10 @@
         continue;
       }
       if (intent) selections.delete(key);
+      if (hostId !== "local" || !codexThreadModelAutomaticSyncAllowed(owner)) {
+        states.delete(node);
+        continue;
+      }
       const saved = codexRetainedThreadModel(hostId, owner);
       if (!picker || picker.lockedModelSlug || picker.modelOptionsDisabled || picker.modelSelectionDisabled) {
         states.delete(node);
@@ -1090,7 +1178,7 @@
       const previous = states.get(node);
       if (!previous || previous.signature !== signature) {
         states.set(node, { signature, since: Date.now(), attempts: 0, inFlight: false });
-        window.setTimeout?.(syncCodexRetainedThreadModels, 1600);
+        scheduleCodexThreadModelSync(1600);
         continue;
       }
       // 避免在原生乐观更新、会话加载或用户切换模型过程中抢写。
@@ -1101,11 +1189,13 @@
       }
       previous.attempts += 1;
       previous.inFlight = true;
+      const epoch = codexThreadModelRetentionSettingsChanged().epoch;
       const settled = () => {
+        if (!codexThreadModelAutomaticSyncAllowed(owner) || codexThreadModelRetentionSettingsChanged().epoch !== epoch) return;
         previous.inFlight = false;
         previous.since = Date.now();
         // 原生回调可能不返回 Promise，下一轮按实际 picker 状态确认；最多尝试三次。
-        if (codexThreadModelObserverActive() && states.get(node) === previous) window.setTimeout?.(syncCodexRetainedThreadModels, 1600);
+        if (states.get(node) === previous) scheduleCodexThreadModelSync(1600);
       };
       try {
         Promise.resolve(picker.onSelectModel(saved.model, saved.effort)).then(settled, settled);
@@ -1597,7 +1687,7 @@
   }
 
   function ensureCodexModelWhitelistInstalls() {
-    if (codexPlusModelUnlockEnabled()
+    if (codexPlusModelUnlockEnabled() || codexThreadModelObserverActive()
         || codexPluginMarketplacePatchEnabled()
         || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
           || codexPlusSettings().sessionDelete || codexPlusSettings().sideChatSave) {

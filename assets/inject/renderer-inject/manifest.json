@@ -13,7 +13,7 @@
     {
       "name": "10-style.js",
       "description": "样式注入、默认设置、后端设置映射、梦皮主题变量与持久化",
-      "lines": 2799
+      "lines": 2802
     },
     {
       "name": "20-menu.js",
@@ -58,7 +58,7 @@
     {
       "name": "70-model-catalog.js",
       "description": "全局状态、模型目录、模型白名单与解锁",
-      "lines": 1669
+      "lines": 1759
     },
     {
       "name": "71-model-picker-groups.js",

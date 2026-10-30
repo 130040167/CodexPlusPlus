@@ -3,8 +3,14 @@ import { it } from "node:test";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 const source = await readFile(new URL("../../../assets/inject/renderer-inject/70-model-catalog.js", import.meta.url), "utf8");
-function runtime(storage = new Map<string,string>(), sharedWindow: any = {}) {
+const serviceSource = await readFile(new URL("../../../assets/inject/renderer-inject/30-service-tier.js", import.meta.url), "utf8");
+function runtime(storage = new Map<string,string>(), sharedWindow: any = {}, enabled = true) {
   let profile = "aggregate", now = 10000, active = true;
+  let managed = false, modelWindows = "", reads = 0, writes = 0, parses = 0;
+  const listeners = new Map<string, (event: any) => void>();
+  const timers: Array<() => void> = [];
+  sharedWindow.addEventListener ??= (type: string, callback: (event: any) => void) => listeners.set(type, callback);
+  sharedWindow.setTimeout ??= (callback: () => void) => { timers.push(callback); return timers.length; };
   let configuredDefault = "gpt-5.5";
   const catalog = { status: "ok", codex_plus_default_group_id: "a" };
   let names = ["gpt-5.5", "sol", "cpx-b/sol", "cpx-a/sol"];
@@ -15,11 +21,18 @@ function runtime(storage = new Map<string,string>(), sharedWindow: any = {}) {
   const nodes: any[] = [];
   const context = vm.createContext({
     window: sharedWindow, document: { querySelectorAll: () => nodes },
-    localStorage: { getItem: (k: string) => storage.get(k), setItem: (k:string,v:string) => storage.set(k,v) },
+    localStorage: { getItem: (k: string) => { reads++; return storage.get(k); }, setItem: (k:string,v:string) => { writes++; storage.set(k,v); } },
     Date: { now: () => now }, Map, WeakMap, Promise, Set,
+    JSON: { parse: (value: string) => { parses++; return JSON.parse(value); }, stringify: JSON.stringify },
     codexPlusBackendSettingsLoaded: true,
-    codexPlusBackendSettings: { relayProfiles: [{id:"a",relayMode:"pureApi"}] },
-    codexRemoteSessionActiveProfile: () => active ? ({ id: profile, relayMode: mode }) : null,
+    codexPlusBackendSettings: { codexAppThreadModelRetention: enabled, relayProfiles: [{id:"a",relayMode:"pureApi"}] },
+    codexRemoteSessionActiveProfile: () => active ? ({ id: profile, relayMode: mode, modelWindows }) : null,
+    codexManagedSessionConnection: () => managed ? {} : null,
+    codexManagedSessionRecoveryOptions: (options: any) => options,
+    assertCodexManagedSessionConnection: () => {},
+    applyCodexRemoteSessionProviderOverride: (_method: string, params: any) => params,
+    applyCodexManagedSessionConnection: (_method: string, params: any) => params,
+    sendCodexPlusDiagnostic: () => {},
     codexModelCatalog: catalog,
     codexPlusConfiguredDefaultModel: () => configuredDefault,
     codexPlusModelNames: () => names,
@@ -27,10 +40,24 @@ function runtime(storage = new Map<string,string>(), sharedWindow: any = {}) {
     codexPlusModelMetadata: (model:string) => ({ defaultReasoningEffort:"medium",
       codex_plus_group_id: groups[model] || (mode==="pureApi" ? undefined : model.startsWith("cpx-") ? model.slice(4,model.indexOf("/")) : catalog.codex_plus_default_group_id) }),
   });
-  const start = source.indexOf("  function codexThreadModelProfile()");
-  const end = source.indexOf("  function codexPerModelContextEnabled()", start);
-  const api = vm.runInContext(`(()=>{${source.slice(start,end)};return {rememberCodexThreadModel,codexRetainedThreadModel,retainCodexThreadResumeModel,sendCodexRetainedModelRequest,syncCodexRetainedThreadModels,observeCodexThreadModelSelection,noteCodexThreadModelPickerIntent}})()`,context);
+  const start = source.indexOf("  function codexThreadModelRetentionSettingsChanged()");
+  const end = source.indexOf("  function patchAppServerModelRequestClient(", start);
+  const hostStart = source.indexOf("  function modelResponseHostId(");
+  const hostEnd = source.indexOf("  function codexPureApiAllowedModelSet(", hostStart);
+  const recoveryStart = serviceSource.indexOf("  async function reloadCodexManagedSessionConnection(");
+  const recoveryEnd = serviceSource.indexOf("  async function sendCodexManagedSessionTurn(", recoveryStart);
+  const api = vm.runInContext(`(()=>{${source.slice(hostStart,hostEnd)}${source.slice(start,end)}${serviceSource.slice(recoveryStart,recoveryEnd)};return {codexThreadModelRetentionSettingsChanged,rememberCodexThreadModel,codexRetainedThreadModel,sendCodexRetainedModelRequest,syncCodexRetainedThreadModels,observeCodexThreadModelSelection,noteCodexThreadModelPickerIntent,refreshCodexThreadModelBeforeTurn,reloadCodexManagedSessionConnection}})()`,context);
+  sharedWindow.__codexPlusThreadModelRetentionRefresh = api.codexThreadModelRetentionSettingsChanged;
+  api.codexThreadModelRetentionSettingsChanged();
   return { api, storage, catalog, nodes, effortByModel, groups, window: sharedWindow, profile: (v:string) => { profile=v; },
+    enabled: (value: boolean) => { context.codexPlusBackendSettings.codexAppThreadModelRetention=value; api.codexThreadModelRetentionSettingsChanged(); },
+    master: (value: boolean) => { (context.codexPlusBackendSettings as any).enhancementsEnabled=value; api.codexThreadModelRetentionSettingsChanged(); },
+    replaceSettings: () => { context.codexPlusBackendSettings = { ...context.codexPlusBackendSettings }; },
+    managed: (value: boolean) => { managed=value; }, contextWindows: (value: string) => { modelWindows=value; },
+    fresh: (id="one") => { api.codexThreadModelRetentionSettingsChanged().threads.set(id,"fresh"); },
+    direct: () => { profile="a"; mode="pureApi"; },
+    counts: () => ({reads,writes}), parseCount: () => parses, storageEvent: (key: string | null) => listeners.get("storage")?.({key}),
+    runTimers: () => { const scheduled=timers.splice(0); scheduled.forEach(callback=>callback()); }, timers,
     setDefault: (v:string) => { configuredDefault=v; },
     lockProfile: () => {
       active = false;
@@ -65,8 +92,6 @@ it("source provider survives direct to aggregate to another aggregate and back",
   r.configure("aggregate-1","aggregate",["sol","cpx-a/sol"]);
   r.catalog.codex_plus_default_group_id="b";
   assert.equal(r.api.codexRetainedThreadModel("local","one").model,"cpx-a/sol");
-  const resume=r.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one",model:"sol",reasoningEffort:"low"},"local");
-  assert.equal(resume.model,"cpx-a/sol");assert.equal(resume.reasoningEffort,"high");
   r.configure("aggregate-2","aggregate",["sol","cpx-a/sol"]);
   assert.equal(r.api.codexRetainedThreadModel("local","one").model,"cpx-a/sol");
   r.configure("a","pureApi",["sol"]);
@@ -93,8 +118,6 @@ it("missing source uses same-name model and supported effort before native defau
   assert.equal(r.api.codexRetainedThreadModel("local","one").effort,"medium");
   r.configure("d","pureApi",["different"]);
   assert.equal(r.api.codexRetainedThreadModel("local","one"),null);
-  const original={threadId:"one",model:"different",reasoningEffort:"low"};
-  assert.equal(r.api.retainCodexThreadResumeModel("thread/resume",original,"local"),original);
   r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"different",effort:"low"},{},"local");
   r.configure("a","pureApi",["sol"],["low","medium","high","ultra"]);
   assert.equal(r.api.codexRetainedThreadModel("local","one").groupId,"a");
@@ -145,19 +168,6 @@ it("failed settings, read/resume fallback, and late responses after profile chan
   r.profile("other");done({});await p;
   assert.equal(r.api.codexRetainedThreadModel("local","one").model,"sol");
 });
-it("resume restores its own model even when navigation carries another conversation model",()=>{
-  const r=runtime();r.api.rememberCodexThreadModel("turn/start",{threadId:"one",model:"sol",effort:"low"},{},"local");
-  assert.equal(r.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one"},"local").model,"sol");
-  assert.equal(r.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one",model:"gpt-5.5"},"local").model,"sol");
-});
-it("same-model resumes restore the conversation effort instead of an inherited native default",()=>{
-  const r=runtime();
-  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
-  const restarted=runtime(r.storage);
-  assert.equal(restarted.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one",model:"sol"},"local").reasoningEffort,"high");
-  assert.equal(restarted.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one",model:"sol",reasoningEffort:"low"},"local").reasoningEffort,"high");
-  assert.equal(restarted.api.retainCodexThreadResumeModel("thread/resume",{threadId:"one",model:"gpt-5.5"},"local").reasoningEffort,"high");
-});
 it("gateway pinned routes preserve provider identity across direct, gateway and aggregate catalogs",()=>{
   const r=runtime();
   r.configure("a","pureApi",["sol"]);
@@ -203,16 +213,15 @@ it("rapid A to B to A navigation saves a confirmed picker choice before the sett
   f.owner.conversationId="one";
   assert.equal(r.api.codexRetainedThreadModel("local","one")?.effort,"high");
 });
-it("a new explicit effort is respected on resume while cancelled and unrelated intents are ignored",()=>{
+it("a new explicit effort and cancelled intent do not alter resume parameters",async()=>{
   const r=runtime(),f=pickerFixture(r,"sol");
   r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
   f.choose("low");
-  assert.equal(r.api.retainCodexThreadResumeModel("thread/resume",
-    {threadId:"one",model:"sol",reasoningEffort:"low"},"local").reasoningEffort,"low");
+  const params={threadId:"one",model:"sol",reasoningEffort:"low"};
+  await r.api.sendCodexRetainedModelRequest({hostId:"local"},async(_method:any,value:any)=>assert.equal(value,params),"thread/resume",params);
   r.tick();
   r.window.__codexPlusThreadModelSelections?.clear();
-  assert.equal(r.api.retainCodexThreadResumeModel("thread/resume",
-    {threadId:"one",model:"sol",reasoningEffort:"low"},"local").reasoningEffort,"high");
+  await r.api.sendCodexRetainedModelRequest({hostId:"local"},async(_method:any,value:any)=>assert.equal(value,params),"thread/resume",params);
 });
 it("a fixed multi-instance profile retains conversations only when the catalog confirms its identity",()=>{
   const r=runtime(),f=pickerFixture(r,"sol");
@@ -239,7 +248,7 @@ it("confirming the same effort upgrades old records so later automatic writes ca
     "thread/settings/update",{threadId:"one",model:"sol",effort:"low"});
   assert.equal(r.api.codexRetainedThreadModel("local","one").effort,"high");
 });
-it("native power slider pointer and keyboard commits survive renderer restart and thread unload",async()=>{
+it("native power slider choices survive restart without automatically overriding an existing thread",async()=>{
   for (const type of ["pointerup","keydown"]) {
     const r=runtime(),f=pickerFixture(r,"sol");
     const slider={__reactFiber$test:{memoizedProps:{},return:r.nodes[0].__reactFiber$test},
@@ -255,12 +264,12 @@ it("native power slider pointer and keyboard commits survive renderer restart an
     const calls:any[]=[];
     fresh.picker.onSelectModel=(model:string,effort:string)=>{calls.push([model,effort]);fresh.picker.reasoningEffort=effort};
     next.api.syncCodexRetainedThreadModels();next.tick();next.api.syncCodexRetainedThreadModels();
-    assert.deepEqual(calls,[["sol","high"]]);
+    assert.deepEqual(calls,[]);
     await Promise.resolve();
     fresh.owner.conversationId="two";next.api.syncCodexRetainedThreadModels();
     fresh.owner.conversationId="one";fresh.picker.reasoningEffort="low";
     next.api.syncCodexRetainedThreadModels();next.tick();next.api.syncCodexRetainedThreadModels();
-    assert.equal(calls.length,2);
+    assert.equal(calls.length,0);
   }
 });
 it("power-slider settings acknowledgements save the submitted effort, not the previous effort",async()=>{
@@ -294,6 +303,7 @@ it("an arrow at the slider boundary does not confirm a native fallback as a new 
 });
 it("stable native fallback restores once; pending user selection and locked pickers are respected",async()=>{
   const r=runtime(); const calls:any[]=[];
+  r.direct();r.fresh();
   r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
   const picker={model:"gpt-5.5",reasoningEffort:"low",models:[{model:"sol"}],onSelectModel:(...v:any[])=>{calls.push(v);picker.model=v[0];picker.reasoningEffort=v[1];}};
   const node={__reactFiber$test:{memoizedProps:picker,return:{memoizedProps:{conversationId:"one",threadId:"wrong",permissionsHostId:"local"}}}};
@@ -309,8 +319,9 @@ it("stable native fallback restores once; pending user selection and locked pick
 });
 it("an unavailable historical model falls back to the configured default without replacing history",()=>{
   const r=runtime(),f=pickerFixture(r,"sol"),calls:any[]=[];
+  r.direct();r.fresh();
   r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
-  r.configure("new","aggregate",["gpt-5.5"]);
+  r.configure("new","pureApi",["gpt-5.5"]);
   f.picker.models=[{model:"gpt-5.5"}];
   f.picker.onSelectModel=(model:string,effort:string)=>{calls.push([model,effort]);f.picker.model=model;f.picker.reasoningEffort=effort};
   const before=r.storage.get("codexPlus.threadModels.v1");
@@ -320,6 +331,7 @@ it("an unavailable historical model falls back to the configured default without
 });
 it("a retained model missing from the refreshed picker also uses the default after restore failure",()=>{
   const r=runtime(),f=pickerFixture(r,"sol"),calls:any[]=[];
+  r.direct();r.fresh();
   r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
   f.picker.models=[{model:"gpt-5.5"}];
   f.picker.onSelectModel=(model:string,effort:string)=>{calls.push([model,effort]);f.picker.model=model;f.picker.reasoningEffort=effort};
@@ -328,6 +340,7 @@ it("a retained model missing from the refreshed picker also uses the default aft
 });
 it("three failed native restores trigger default selection while preserving the saved choice",async()=>{
   const r=runtime(),f=pickerFixture(r,"gpt-5.5"),calls:any[]=[];
+  r.direct();r.fresh();
   r.setDefault("cpx-b/sol");
   r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
   f.picker.models.push({model:"cpx-b/sol"});
@@ -387,6 +400,7 @@ it("local user selection also retains the provider captured before catalog chang
 });
 it("failed restores retry when native callback is ready and stop after three attempts",async()=>{
   const r=runtime(),f=pickerFixture(r);let failed=0,ready=0;
+  r.direct();r.fresh();
   r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
   f.picker.onSelectModel=async()=>{failed++;return false};
   r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();await Promise.resolve();
@@ -401,6 +415,7 @@ it("failed restores retry when native callback is ready and stop after three att
 });
 it("undefined native callback results are verified from picker state and do not spin",async()=>{
   const r=runtime(),f=pickerFixture(r);let calls=0;
+  r.direct();r.fresh();
   r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol"},{},"local");
   f.picker.onSelectModel=()=>{calls++};
   r.api.syncCodexRetainedThreadModels();
@@ -409,6 +424,7 @@ it("undefined native callback results are verified from picker state and do not 
 });
 it("successful duplicate settings acknowledgements cannot reset the restore retry budget",async()=>{
   const r=runtime(),f=pickerFixture(r);let calls=0;
+  r.direct();r.fresh();
   r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
   f.picker.onSelectModel=async(model:string,effort:string)=>{
     calls++;
@@ -463,7 +479,7 @@ it("an automatic fallback turn cannot replace the last explicit model and host e
   assert.equal(r.api.codexRetainedThreadModel("local","one").model,"sol");
   let actual:any;
   await send({hostId:"local"},async(_m:any,p:any)=>{actual=p;return{}},"send-cli-request-for-host",{hostId:"local",method:"thread/resume",params:{threadId:"one"}});
-  assert.equal(actual.params.model,"sol");assert.equal(actual.params.reasoningEffort,"high");
+  assert.deepEqual(actual,{hostId:"local",method:"thread/resume",params:{threadId:"one"}});
 });
 it("locked and remote picker contexts are never restored",()=>{
   const r=runtime();let calls=0;
@@ -474,4 +490,143 @@ it("locked and remote picker contexts are never restored",()=>{
   r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();assert.equal(calls,0);
   delete picker.lockedModelSlug;props.permissionsHostId="ssh";
   r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();assert.equal(calls,0);
+});
+
+it("disabled retention does not read, write, install a picker action, or alter requests",async()=>{
+  const saved=JSON.stringify([{key:JSON.stringify(["local","a","one"]),model:"sol",effort:"high",at:1}]);
+  const r=runtime(new Map([["codexPlus.threadModels.v1",saved]]),{},false), f=pickerFixture(r);
+  r.direct();r.fresh();let calls=0;f.picker.onSelectModel=()=>calls++;
+  const params={threadId:"one",model:"gpt-5.5",config:{model_reasoning_effort:"low"}};
+  await r.api.sendCodexRetainedModelRequest({hostId:"local"},async(_method:any,value:any)=>assert.equal(value,params),"thread/resume",params);
+  r.api.rememberCodexThreadModel("thread/settings/update",params,{},"local");
+  assert.equal(r.api.codexRetainedThreadModel("local","one"),null);
+  r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();r.runTimers();
+  assert.deepEqual(r.counts(),{reads:0,writes:0});assert.equal(calls,0);
+  assert.equal(r.storage.get("codexPlus.threadModels.v1"),saved);
+});
+
+it("only observed new unmanaged local threads can automatically synchronize",async()=>{
+  const r=runtime(),f=pickerFixture(r),calls:any[]=[];r.direct();
+  f.picker.onSelectModel=(...args:any[])=>{calls.push(args);};
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
+  r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();
+  assert.equal(calls.length,0);
+  await r.api.sendCodexRetainedModelRequest({hostId:"local"},async()=>({thread:{id:"one"}}),"thread/start",{});
+  r.managed(true);r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();assert.equal(calls.length,0);
+  r.managed(false);r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();
+  assert.deepEqual(calls,[["sol","high"]]);
+  await Promise.resolve();
+  let done:any;
+  const resume=r.api.sendCodexRetainedModelRequest({hostId:"local"},()=>new Promise(resolve=>{done=resolve}),"thread/resume",{threadId:"one"});
+  r.tick();r.api.syncCodexRetainedThreadModels();assert.equal(calls.length,1);
+  done({});await resume;r.tick();r.api.syncCodexRetainedThreadModels();assert.equal(calls.length,1);
+});
+
+it("aggregate, managed history, and recovery-pending sessions never auto-select",()=>{
+  const r=runtime(),f=pickerFixture(r);let calls=0;f.picker.onSelectModel=()=>calls++;
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
+  r.fresh();r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();
+  r.direct();r.window.__codexPlusManagedSessionStarts=new Map([["one",{}]]);
+  r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();
+  r.window.__codexPlusManagedSessionStarts.clear();r.window.__codexPlusConnectionRecoveryPending=new Set(["one"]);
+  r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();assert.equal(calls,0);
+});
+
+it("uncertain, managed, remote or stale start responses do not authorize automatic selection",async()=>{
+  for (const scenario of ["managed-result","remote-result","changed-settings","changed-profile"]) {
+    const r=runtime(),f=pickerFixture(r);r.direct();let calls=0,finish:any;f.picker.onSelectModel=()=>calls++;
+    r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
+    const start=r.api.sendCodexRetainedModelRequest({hostId:"local"},()=>new Promise(resolve=>{finish=resolve}),"thread/start",{});
+    if(scenario==="changed-settings") r.replaceSettings();
+    if(scenario==="changed-profile") r.configure("other","pureApi",["sol","gpt-5.5"]);
+    finish({thread:{id:"one",...(scenario==="managed-result"?{modelProvider:"codex_plus_managed"}:{})},
+      ...(scenario==="remote-result"?{host_id:"ssh"}:{})});
+    await start;r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();
+    assert.equal(calls,0,scenario);
+  }
+});
+
+it("disabling invalidates pending requests, timers and picker completions across re-enabling",async()=>{
+  const r=runtime(),f=pickerFixture(r);r.direct();r.fresh();
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
+  let finishRequest:any,finishPicker:any,calls=0;
+  f.picker.onSelectModel=()=>{calls++;return new Promise(resolve=>{finishPicker=resolve});};
+  r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();assert.equal(calls,1);
+  const request=r.api.sendCodexRetainedModelRequest({hostId:"local"},()=>new Promise(resolve=>{finishRequest=resolve}),
+    "thread/settings/update",{threadId:"one",model:"gpt-5.5",effort:"low"});
+  const saved=r.storage.get("codexPlus.threadModels.v1"), counts=r.counts();
+  r.enabled(false);r.enabled(true);finishRequest({});finishPicker({});await request;await Promise.resolve();
+  r.runTimers();r.tick();r.runTimers();
+  assert.deepEqual(r.counts(),counts);assert.equal(r.storage.get("codexPlus.threadModels.v1"),saved);assert.equal(calls,1);
+});
+
+it("master switch disables retention and invalidates pending work",async()=>{
+  const r=runtime();r.direct();let finish:any;
+  const request=r.api.sendCodexRetainedModelRequest({hostId:"local"},()=>new Promise(resolve=>{finish=resolve}),
+    "thread/settings/update",{threadId:"one",model:"sol"});
+  r.master(false);r.master(true);finish({});await request;
+  assert.deepEqual(r.counts(),{reads:0,writes:0});
+});
+
+it("storage records are parsed once and invalidated after writes and other-window events",()=>{
+  const key="codexPlus.threadModels.v1", record=(model:string,at:number)=>JSON.stringify([{key:JSON.stringify(["local","a","one"]),model,effort:"high",at}]);
+  const r=runtime(new Map([[key,record("sol",1)]]));r.direct();
+  assert.equal(r.api.codexRetainedThreadModel("local","one").model,"sol");
+  const first=r.counts().reads, firstParses=r.parseCount();
+  for(let index=0;index<5;index++) assert.equal(r.api.codexRetainedThreadModel("local","one").model,"sol");
+  assert.equal(r.counts().reads,first);assert.equal(r.parseCount(),firstParses);
+  r.storage.set(key,record("gpt-5.5",2));r.storageEvent(key);
+  assert.equal(r.api.codexRetainedThreadModel("local","one").model,"gpt-5.5");assert.equal(r.counts().reads,first+1);
+  r.tick();r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"low"},{},"local",undefined,true);
+  assert.equal(r.api.codexRetainedThreadModel("local","one").model,"sol");assert.equal(r.counts().reads,first+2);
+  r.storage.clear();r.storageEvent(null);assert.equal(r.api.codexRetainedThreadModel("local","one"),null);
+});
+
+it("conflicting host aliases and nested envelopes are treated as remote",async()=>{
+  const r=runtime(),f=pickerFixture(r);r.direct();r.fresh();let calls=0;f.picker.onSelectModel=()=>calls++;
+  const send=r.api.sendCodexRetainedModelRequest;
+  for (const [client,method,params] of [
+    [{hostId:"local",host_id:"ssh"},"thread/settings/update",{threadId:"one",model:"sol"}],
+    [{hostId:"local"},"thread/settings/update",{hostId:"local",host_id:"ssh",threadId:"one",model:"sol"}],
+    [{hostId:"local"},"send-cli-request-for-host",{hostId:"local",host_id:"ssh",method:"thread/settings/update",params:{threadId:"one",model:"sol"}}],
+    [{hostId:"local"},"send-cli-request-for-host",{hostId:"local",method:"thread/settings/update",params:{host_id:"ssh",threadId:"one",model:"sol"}}],
+  ] as const) await send(client,async(_method:any,value:any)=>{assert.equal(value,params);return{};},method,params);
+  (f.owner as any).host_id="ssh";
+  r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();
+  assert.deepEqual(r.counts(),{reads:0,writes:0});assert.equal(calls,0);
+});
+
+it("all direct and enveloped resume payloads retain explicit and missing models and efforts",async()=>{
+  const r=runtime();r.direct();
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
+  for(const params of [
+    {threadId:"one"},
+    {threadId:"one",model:"gpt-5.5",reasoningEffort:"low",config:{model_reasoning_effort:"medium"}},
+    {threadId:"one",config:{model_reasoning_effort:"ultra"}},
+  ]) {
+    for(const wrapped of [false,true]) {
+      const value=wrapped?{hostId:"local",method:"thread/resume",params}:params;
+      const method=wrapped?"send-cli-request-for-host":"thread/resume";
+      const snapshot=JSON.stringify(value);
+      await r.api.sendCodexRetainedModelRequest({hostId:"local"},async(actualMethod:any,actual:any)=>{
+        assert.equal(actualMethod,method);assert.equal(actual,value);assert.equal(JSON.stringify(actual),snapshot);return{};
+      },method,value);
+    }
+  }
+});
+
+it("per-model context refresh and managed connection recovery keep their own resume selections",async()=>{
+  const r=runtime();r.direct();r.contextWindows('{"sol":100000}');
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
+  const client={hostId:"local",__codexPlusThreadModels:new Map([["one","sol"]])},requests:any[]=[];
+  const native=async(method:string,params:any)=>{requests.push({method,params});return {modelProvider:"codex_plus_managed"};};
+  const send=(method:string,params:any,options:any)=>r.api.sendCodexRetainedModelRequest(client,native,method,params,options);
+  assert.equal(await r.api.refreshCodexThreadModelBeforeTurn(client,send,"turn/start",{threadId:"one",model:"gpt-5.5",effort:"low"},{}),true);
+  assert.equal(requests[0].method,"thread/resume");assert.equal(requests[0].params.model,"gpt-5.5");
+  r.managed(true);
+  await r.api.reloadCodexManagedSessionConnection("one",{thread:{status:{type:"notLoaded"}}},
+    {model:"gpt-5.5",effort:"low"},send,{},"managed");
+  assert.equal(requests[1].method,"thread/unsubscribe");
+  assert.equal(requests[2].method,"thread/resume");assert.equal(requests[2].params.model,"gpt-5.5");
+  assert.equal(requests[2].params.config.model_reasoning_effort,"low");
 });

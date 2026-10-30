@@ -160,6 +160,7 @@ fn build_auto_group(
         sticky: settings.sticky,
         members,
         hide_members: settings.hide_members,
+        hide_codex_group: false,
         pick: settings.pick,
         extra: Default::default(),
     })
@@ -313,7 +314,7 @@ pub fn codex_binding_models(gateway: &GatewaySettings, binding: &AgentBinding) -
                     .iter()
                     .find(|group| group.id.eq_ignore_ascii_case(id))
             })
-            .is_some_and(|group| group.hide_members)
+            .is_some_and(|group| group.hide_codex_group)
         {
             continue;
         }
@@ -346,13 +347,14 @@ fn codex_pool_blocks(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<V
     };
     let mut blocks: Vec<Vec<String>> = Vec::new();
     let mut shared: Vec<String> = Vec::new();
-    // 供应商分组独立展示完整模型池，模型组的可见性不能删掉供应商模型。
+    // 隐藏成员沿用原有语义；仅隐藏组入口由独立设置控制。
+    let unlisted = unlisted_members(gateway);
     for relay in &relays {
         let mut block = Vec::new();
         for model in chat_models(relay) {
             if serving_count(&relays, &model) > 1 {
                 let pinned = format!("{}/{model}", relay.id);
-                if fresh(&pinned) {
+                if !unlisted.contains(&pinned.to_ascii_lowercase()) && fresh(&pinned) {
                     block.push(pinned);
                 }
                 if !shared
@@ -361,7 +363,7 @@ fn codex_pool_blocks(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<V
                 {
                     shared.push(model);
                 }
-            } else if fresh(&model) {
+            } else if !unlisted.contains(&model.to_ascii_lowercase()) && fresh(&model) {
                 block.push(model);
             }
         }
@@ -379,7 +381,7 @@ fn codex_pool_blocks(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<V
         gateway
             .groups
             .iter()
-            .filter(|group| !group.members.is_empty() && !group.hide_members)
+            .filter(|group| !group.members.is_empty() && !group.hide_codex_group)
             .map(GatewayGroup::model_id)
             .collect(),
     );
@@ -2028,10 +2030,10 @@ mod tests {
     }
 
     #[test]
-    fn group_visibility_does_not_remove_codex_supplier_models() {
+    fn hide_members_keeps_group_and_hides_members_in_codex() {
         let mut gateway = gateway("deepseek-v4-pro");
         let binding = gateway.binding(&ToolId::Claude).unwrap().clone();
-        // 自动组的成员开关不能移除各供应商分组的固定入口。
+        // 自动组的成员开关隐藏供应商的固定入口，但保留自动组入口。
         gateway.auto_groups.insert(
             "deepseek-v4-pro".into(),
             AutoGroupSettings {
@@ -2040,8 +2042,8 @@ mod tests {
             },
         );
         let models = codex_pool_models(&gateway, &binding);
-        assert!(models.iter().any(|m| m == "ds/deepseek-v4-pro"));
-        assert!(models.iter().any(|m| m == "mirror/deepseek-v4-pro"));
+        assert!(!models.iter().any(|m| m == "ds/deepseek-v4-pro"));
+        assert!(!models.iter().any(|m| m == "mirror/deepseek-v4-pro"));
         assert!(models.iter().any(|m| m == "deepseek-v4-pro"));
         assert_eq!(
             routed(&gateway, "ds/deepseek-v4-pro"),
@@ -2050,18 +2052,22 @@ mod tests {
         );
         // 自建组隐藏成员：成员里的裸模型名不再出现在 Claude / Grok 的列表里。
         gateway.groups[0].hide_members = true;
+        let codex = codex_pool_models(&gateway, &binding);
+        assert!(!codex.iter().any(|m| m == "kimi-k3"));
+        assert!(codex.iter().any(|m| m == "group/fast"));
         let models = pool_models(&gateway, &binding);
         assert!(
             !models.iter().any(|m| m == "kimi-k3"),
             "fast 组的成员 kimi-k3 被隐藏：{models:?}"
         );
+        assert!(models.iter().any(|m| m == "group/fast"));
     }
 
     #[test]
     fn codex_hidden_group_only_removes_its_own_entry() {
         let mut gateway = gateway("deepseek-v4-pro");
         gateway.groups = vec![GatewayGroup {
-            hide_members: true,
+            hide_codex_group: true,
             ..group(
                 "hidden",
                 GroupMode::InOrder,
@@ -2075,6 +2081,11 @@ mod tests {
         assert!(models.iter().any(|model| model == "mirror/deepseek-v4-pro"));
         assert!(models.iter().any(|model| model == "deepseek-v4-pro"));
         assert!(!models.iter().any(|model| model == "group/hidden"));
+        assert!(
+            pool_models(&gateway, &binding)
+                .iter()
+                .any(|model| model == "group/hidden")
+        );
         assert!(models.iter().any(|model| model == "deepseek-v4-flash"));
         assert_eq!(
             routed(&gateway, "kimi/kimi-k3"),
@@ -2086,6 +2097,26 @@ mod tests {
         let models = codex_pool_models(&gateway, &binding);
         assert!(models.iter().any(|model| model == "kimi-k3"));
         assert!(models.iter().any(|model| model == "kimi/kimi-k3"));
+    }
+
+    #[test]
+    fn codex_models_endpoint_uses_the_same_list_as_the_binding() {
+        let mut gateway = gateway("deepseek-v4-pro");
+        let mut binding = gateway.binding(&ToolId::Claude).unwrap().clone();
+        binding.extra_models.push("group/coder".into());
+        gateway.groups[0].hide_members = true;
+        gateway.groups[1].hide_codex_group = true;
+        gateway.bindings.insert("codex".into(), binding.clone());
+        let models = crate::gateway::server::exposed_models(&gateway, &ToolId::Codex);
+        assert_eq!(models, codex_binding_models(&gateway, &binding));
+        assert!(models.iter().any(|model| model == "group/fast"));
+        assert!(!models.iter().any(|model| model == "group/coder"));
+        assert!(!models.iter().any(|model| model == "kimi-k3"));
+        assert!(
+            crate::gateway::server::exposed_models(&gateway, &ToolId::Claude)
+                .iter()
+                .any(|model| model == "group/coder")
+        );
     }
 
     #[test]
