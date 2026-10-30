@@ -405,9 +405,22 @@ pub trait LaunchHooks: Send + Sync {
     fn select_debug_port(&self, requested: u16) -> u16;
     fn select_helper_port(&self, requested: u16) -> u16;
     async fn load_settings(&self) -> anyhow::Result<BackendSettings>;
+    fn codex_home_dir(&self) -> PathBuf {
+        crate::relay_config::default_codex_home_dir()
+    }
+    fn state_dir(&self) -> PathBuf {
+        crate::paths::default_app_state_dir()
+    }
+    fn select_protocol_proxy_port(&self) -> u16 {
+        crate::protocol_proxy::ensure_protocol_proxy_port_available()
+    }
+    async fn sanitize_local_storage_model_suffixes(&self, debug_port: u16) {
+        crate::codex_local_storage::sanitize_local_storage_model_suffixes_nonfatal(debug_port)
+            .await;
+    }
     async fn start_native_browser_compatibility(&self, _settings: &BackendSettings) {}
     async fn stop_native_browser_compatibility(&self) {}
-    fn cleanup_unsupported_config(&self) -> anyhow::Result<()> {
+    fn cleanup_unsupported_config(&self, _settings: &BackendSettings) -> anyhow::Result<()> {
         Ok(())
     }
     async fn run_provider_sync(&self) -> anyhow::Result<()>;
@@ -853,9 +866,9 @@ where
         let timeline = LaunchTimeline::new(options.status_store.clone());
         timeline.mark("start_native_browser_compatibility", 5);
         hooks.start_native_browser_compatibility(&settings).await;
-        let home = crate::relay_config::default_codex_home_dir();
+        let home = hooks.codex_home_dir();
         timeline.mark("cleanup_unsupported_config", 10);
-        hooks.cleanup_unsupported_config()?;
+        hooks.cleanup_unsupported_config(&settings)?;
         crate::relay_config::ensure_windows_sandbox_usable_for_current_user(&home)?;
         if settings.provider_sync_enabled {
             timeline.mark("provider_sync", 15);
@@ -878,7 +891,10 @@ where
             );
         }
         timeline.mark("dream_skin_theme", 30);
-        crate::dream_skin::sync_default_dream_skin_base_theme(
+        #[cfg(windows)]
+        crate::dream_skin::sync_dream_skin_base_theme_in_home(
+            &home,
+            &hooks.state_dir(),
             settings.enhancements_enabled
                 && settings.codex_app_dream_skin_enabled
                 && !settings.codex_app_dream_skin_paused,
@@ -977,7 +993,7 @@ where
             timeline.mark("protocol_proxy_config", 55);
             // 端口落在 Windows 排除区间（10013）时永久不可绑，先迁移并持久化，
             // 再写 config.toml，保证 base_url、helper 与路由使用同一个端口（#1163）。
-            helper_port = crate::protocol_proxy::ensure_protocol_proxy_port_available();
+            helper_port = hooks.select_protocol_proxy_port();
             hooks.ensure_active_protocol_proxy_config(&settings).await?;
         }
         if settings.enhancements_enabled || protocol_proxy_enabled {
@@ -1045,10 +1061,9 @@ where
                 }
                 // 注入成功后页面已加载，此时可以通过 CDP 清理 Electron Local Storage
                 // 中残留的带后缀模型名，避免模型选择器继续显示废弃项。
-                crate::codex_local_storage::sanitize_local_storage_model_suffixes_nonfatal(
-                    debug_port,
-                )
-                .await;
+                hooks
+                    .sanitize_local_storage_model_suffixes(debug_port)
+                    .await;
             } else {
                 let degraded = launch_status(
                     "running_degraded",
@@ -1229,9 +1244,17 @@ impl LaunchHooks for DefaultLaunchHooks {
         SettingsStore::default().load()
     }
 
-    fn cleanup_unsupported_config(&self) -> anyhow::Result<()> {
+    fn cleanup_unsupported_config(&self, settings: &BackendSettings) -> anyhow::Result<()> {
         let home = crate::relay_config::default_codex_home_dir();
         crate::relay_config::cleanup_unsupported_approval_policies_in_home(&home)?;
+        if let Err(error) =
+            crate::relay_config::ensure_managed_session_provider_in_home(&home, settings)
+        {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "launcher.managed_session_provider_repair_failed",
+                serde_json::json!({ "message": error.to_string() }),
+            );
+        }
         Ok(())
     }
 
@@ -1377,6 +1400,12 @@ impl LaunchHooks for DefaultLaunchHooks {
             }
         }
         if cfg!(windows) && !isolated_multi_instance {
+            // issue #2789：Codex++ 以管理员身份运行时，Codex 会被 Chromium 经 explorer 降权
+            // 重启而脱离包上下文，这里补上豁免开关（见 `packaged_launch::DO_NOT_DE_ELEVATE_SWITCH`）。
+            // 只影响打包版主实例这条分支；未提权时参数原样不变。
+            let elevated = crate::windows_integration::current_process_is_elevated();
+            let launch_extra_args =
+                crate::packaged_launch::packaged_launch_extra_args(&launch_extra_args, elevated);
             // AUMID 解析留在调用点：它要查系统里的 Store 注册表（#2140），是有副作用
             // 的一步；下面的构造函数只做纯拼接。解析不出来（目录名像包、但系统里没
             // 这个包）就不再走打包激活，继续往下按路径启动——与既有回退路径一致。
@@ -1441,6 +1470,16 @@ impl LaunchHooks for DefaultLaunchHooks {
                         );
                     }
                 }
+                // 激活前留一条记录：日志停在这里就说明卡在激活调用本身（#2795）。
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "launcher.packaged_activation_begin",
+                    serde_json::json!({
+                        "app_user_model_id": app_user_model_id,
+                        "debug_port": debug_port,
+                        "elevated": elevated,
+                        "arguments": arguments,
+                    }),
+                );
                 match activate_packaged_app(app_user_model_id, arguments).await {
                     Ok(process_id) => {
                         #[cfg(windows)]
@@ -1529,6 +1568,25 @@ impl LaunchHooks for DefaultLaunchHooks {
                                 "error": error.to_string()
                             }),
                         );
+                        // 激活调用超时（#2795）：按路径启动同样拿不到包身份，回退没有意义，
+                        // 直接给出可操作的提示。
+                        if error
+                            .downcast_ref::<crate::packaged_launch::AumidActivationTimedOut>()
+                            .is_some()
+                        {
+                            let executable = crate::app_paths::build_codex_executable(app_dir);
+                            let executable_name = executable
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "Codex".to_string());
+                            anyhow::bail!(
+                                crate::packaged_launch::aumid_activation_timed_out_message(
+                                    crate::packaged_launch::AUMID_ACTIVATION_CALL_TIMEOUT
+                                        .as_secs(),
+                                    &executable_name,
+                                )
+                            );
+                        }
                         // 提权进程激活打包应用必然失败，按路径启动的进程会因缺少
                         // 包身份立即退出、注入也必然失败；此时必须如实失败并给出
                         // 指引，而不是静默回退导致 latest-status.json 误报 running
@@ -4013,7 +4071,7 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
                     if converter.has_failed() {
                         return Ok((
                             Some("上游返回了流式错误事件".to_string()),
-                            None,
+                            converter.request_usage(),
                             None,
                             first_output_at_ms,
                         ));
@@ -4027,7 +4085,7 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
                     stream.send(&failed).await?;
                     return Ok((
                         Some(error.without_url().to_string()),
-                        None,
+                        converter.request_usage(),
                         None,
                         first_output_at_ms,
                     ));
@@ -4044,13 +4102,13 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
             stream.send(&failed).await?;
             return Ok((
                 Some("上游缺少完成事件".to_string()),
-                None,
+                converter.request_usage(),
                 None,
                 first_output_at_ms,
             ));
         }
         stream.send(&converter.finish()).await?;
-        return Ok((None, None, None, first_output_at_ms));
+        return Ok((None, converter.request_usage(), None, first_output_at_ms));
     }
     let mut converter = request
         .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
@@ -4066,7 +4124,7 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
                 if converter.has_failed() {
                     return Ok((
                         Some("上游返回了流式错误事件".to_string()),
-                        None,
+                        converter.request_usage(),
                         None,
                         first_output_at_ms,
                     ));
@@ -4080,7 +4138,7 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
                 stream.send(&failed).await?;
                 return Ok((
                     Some(error.without_url().to_string()),
-                    None,
+                    converter.request_usage(),
                     None,
                     first_output_at_ms,
                 ));
@@ -4096,14 +4154,15 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
         stream.send(&failed).await?;
         return Ok((
             Some("上游缺少完成事件".to_string()),
-            None,
+            converter.request_usage(),
             None,
             first_output_at_ms,
         ));
     }
     stream.send(&converter.finish()).await?;
     record_chat_converter_usage(thread_id, &converter);
-    Ok((None, None, None, first_output_at_ms))
+    // 流式 Chat 上游的用量也要进请求日志和网关用量统计（#2803）。
+    Ok((None, converter.request_usage(), None, first_output_at_ms))
 }
 
 fn record_chat_converter_usage(
@@ -5556,7 +5615,18 @@ fn launcher_owned_process_alive(launch: &CodexLaunch, debug_port: u16) -> bool {
     ) && !crate::watcher::find_macos_codex_processes_for_debug_port(debug_port).is_empty()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn launcher_owned_process_alive(launch: &CodexLaunch, debug_port: u16) -> bool {
+    matches!(
+        launch,
+        CodexLaunch::Process {
+            wait_strategy: ProcessWaitStrategy::ExternalWaitCommand,
+            ..
+        }
+    ) && !crate::watcher::find_codex_processes_for_debug_port(debug_port).is_empty()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn launcher_owned_process_alive(_launch: &CodexLaunch, _debug_port: u16) -> bool {
     false
 }
@@ -6304,11 +6374,20 @@ pub async fn activate_packaged_app(
 ) -> anyhow::Result<u32> {
     let app_user_model_id = app_user_model_id.to_string();
     let arguments = arguments.to_string();
-    tokio::task::spawn_blocking(move || {
+    let activation = tokio::task::spawn_blocking(move || {
         activate_packaged_app_blocking(&app_user_model_id, &arguments)
-    })
-    .await
-    .context("packaged app activation task failed")?
+    });
+    // issue #2795：ActivateApplication 可能一直不返回，必须有上限；超时后阻塞线程留给系统，
+    // 启动流程如实报错，不再无声地停在「启动 Codex」。
+    let timeout = crate::packaged_launch::AUMID_ACTIVATION_CALL_TIMEOUT;
+    match tokio::time::timeout(timeout, activation).await {
+        Ok(result) => result.context("packaged app activation task failed")?,
+        Err(_) => Err(anyhow::Error::new(
+            crate::packaged_launch::AumidActivationTimedOut {
+                seconds: timeout.as_secs(),
+            },
+        )),
+    }
 }
 
 #[cfg(windows)]
@@ -8276,7 +8355,7 @@ mod proxy_stream_tests {
         truncated: bool,
         wire: UpstreamWireApi,
     ) -> (Option<String>, String) {
-        let (failure, output, _) =
+        let (failure, output, _, _) =
             forward_fixture_with_prefix_and_delay(&[], body, truncated, wire, Duration::ZERO)
                 .await;
         (failure, output)
@@ -8288,7 +8367,7 @@ mod proxy_stream_tests {
         truncated: bool,
         wire: UpstreamWireApi,
     ) -> (Option<String>, String) {
-        let (failure, output, _) =
+        let (failure, output, _, _) =
             forward_fixture_with_prefix_and_delay(prefix, body, truncated, wire, Duration::ZERO)
                 .await;
         (failure, output)
@@ -8300,7 +8379,12 @@ mod proxy_stream_tests {
         truncated: bool,
         wire: UpstreamWireApi,
         initial_delay: Duration,
-    ) -> (Option<String>, String, Option<u64>) {
+    ) -> (
+        Option<String>,
+        String,
+        Option<u64>,
+        Option<crate::request_log::RequestUsage>,
+    ) {
         let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = upstream.local_addr().unwrap();
         let body = body.to_owned();
@@ -8340,18 +8424,69 @@ mod proxy_stream_tests {
             .unwrap();
         let (mut writer, _) = downstream.accept().await.unwrap();
         let forwarded = tokio::spawn(async move {
-            let (result, _usage, _detail, first_output_at_ms) =
+            let (result, usage, _detail, first_output_at_ms) =
                 forward_protocol_proxy_stream(&mut writer, &prefix, response, wire, None, None)
                     .await
                     .unwrap();
             writer.shutdown().await.unwrap();
-            (result, first_output_at_ms)
+            (result, first_output_at_ms, usage)
         });
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await.unwrap();
-        let (result, first_output_at_ms) = forwarded.await.unwrap();
+        let (result, first_output_at_ms, usage) = forwarded.await.unwrap();
         upstream_task.await.unwrap();
-        (result, String::from_utf8(bytes).unwrap(), first_output_at_ms)
+        (result, String::from_utf8(bytes).unwrap(), first_output_at_ms, usage)
+    }
+
+    #[tokio::test]
+    async fn chat_stream_usage_is_returned_for_request_log() {
+        // #2803：流式 Chat 上游的用量要进请求日志，口径与非流式一致（输入含缓存）。
+        let (failure, _, _, usage) = forward_fixture_with_prefix_and_delay(
+            &[],
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":30,",
+                "\"prompt_tokens_details\":{\"cached_tokens\":100},",
+                "\"completion_tokens_details\":{\"reasoning_tokens\":8}}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            false,
+            UpstreamWireApi::ChatCompletions,
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(failure, None);
+        let usage = usage.expect("流式 Chat 上游应返回用量");
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 30);
+        assert_eq!(usage.cached_tokens, 100);
+        assert_eq!(usage.reasoning_tokens, 8);
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_usage_merges_start_and_delta() {
+        // Anthropic 的输入在 message_start、输出在 message_delta，两边都要记上。
+        let (failure, _, _, usage) = forward_fixture_with_prefix_and_delay(
+            &[],
+            concat!(
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-5\",",
+                "\"usage\":{\"input_tokens\":7,\"cache_read_input_tokens\":50,\"output_tokens\":1}}}\n\n",
+                "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+            ),
+            false,
+            UpstreamWireApi::AnthropicMessages,
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(failure, None);
+        let usage = usage.expect("流式 Anthropic 上游应返回用量");
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.cached_tokens, 50);
     }
 
     #[tokio::test]
@@ -8360,7 +8495,7 @@ mod proxy_stream_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let (_, _, first_output_at_ms) = forward_fixture_with_prefix_and_delay(
+        let (_, _, first_output_at_ms, _) = forward_fixture_with_prefix_and_delay(
             &[],
             "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n",
             false,

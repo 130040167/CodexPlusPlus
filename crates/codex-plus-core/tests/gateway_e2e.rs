@@ -148,6 +148,8 @@ fn providers(relays: Vec<RelayProfile>) -> Vec<GatewayProvider> {
             upstream_new: Vec::new(),
             upstream_gone: Vec::new(),
             models_checked_at_ms: 0,
+            newapi_access: None,
+            upstream_meta: Default::default(),
             relay,
             extra: Default::default(),
         })

@@ -2462,7 +2462,7 @@ fn zip_archive_root(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> anyhow::Res
 /// 从仓库 zip 里只解出 `repo_path` 这一棵子树。
 ///
 /// GitHub 的 zip 统一带一层 `repo-ref/` 前缀，`zip_entry_relative_path` 会剥掉它
-/// 并同时挡住路径逃逸。目标子树里的符号链接条目一律拒绝——与 codex 内置 skill-installer 的
+/// 并同时挡住路径逃逸。目标子树中的符号链接条目一律拒绝——与 codex 内置 skill-installer 的
 /// `_validate_skill` 一致，避免装进来的 skill 指到仓库外面。
 pub fn extract_skill_subtree(
     zip_bytes: &[u8],
@@ -4647,49 +4647,6 @@ mod tests {
     }
 
     #[test]
-    fn extraction_rejects_only_symlinks_in_the_selected_subtree() {
-        let mut buffer = Cursor::new(Vec::<u8>::new());
-        {
-            let mut writer = zip::ZipWriter::new(&mut buffer);
-            let options = zip::write::SimpleFileOptions::default();
-            writer
-                .start_file("kit-main/alpha/SKILL.md", options)
-                .unwrap();
-            writer.write_all(b"alpha").unwrap();
-            writer
-                .start_file("kit-main/beta/SKILL.md", options)
-                .unwrap();
-            writer.write_all(b"beta").unwrap();
-            writer
-                .add_symlink("kit-main/beta/link", "../../outside", options)
-                .unwrap();
-            writer.finish().unwrap();
-        }
-        let zip = buffer.into_inner();
-        let temp = tempfile::tempdir().unwrap();
-        let repo = parse_repo_key("acme/kit@main").unwrap();
-        assert_eq!(
-            parse_skills_from_zip(&repo, &zip, &BTreeMap::new())
-                .unwrap()
-                .len(),
-            2
-        );
-        extract_skill_subtree(&zip, "alpha", &temp.path().join("alpha")).unwrap();
-        assert!(
-            extract_skill_subtree(&zip, "beta", &temp.path().join("beta"))
-                .unwrap_err()
-                .to_string()
-                .contains("符号链接")
-        );
-        assert!(
-            extract_skill_subtree(&zip, ".", &temp.path().join("root"))
-                .unwrap_err()
-                .to_string()
-                .contains("符号链接")
-        );
-    }
-
-    #[test]
     fn snapshot_rejects_inconsistent_roots_and_paths() {
         let repo = parse_repo_key("acme/kit@main").unwrap();
         for zip in [
@@ -5024,6 +4981,48 @@ mod tests {
         assert!(destination.join("SKILL.md").is_file());
         assert!(destination.join("scripts").join("run.py").is_file());
         assert!(!destination.join("beta").exists());
+    }
+
+    #[test]
+    fn extraction_rejects_only_symlinks_in_the_selected_subtree() {
+        let mut buffer = Cursor::new(Vec::<u8>::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buffer);
+            let options = zip::write::SimpleFileOptions::default();
+            writer
+                .start_file("kit-main/alpha/SKILL.md", options)
+                .unwrap();
+            writer.write_all(b"alpha").unwrap();
+            writer
+                .start_file("kit-main/beta/SKILL.md", options)
+                .unwrap();
+            writer.write_all(b"beta").unwrap();
+            writer
+                .add_symlink("kit-main/beta/link", "../../outside", options)
+                .unwrap();
+            writer
+                .add_symlink("kit-main/alpha-other", "../../outside", options)
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        let zip = buffer.into_inner();
+        let temp = tempfile::tempdir().unwrap();
+        let repo = parse_repo_key("acme/kit@main").unwrap();
+        assert_eq!(
+            parse_skills_from_zip(&repo, &zip, &BTreeMap::new())
+                .unwrap()
+                .len(),
+            2
+        );
+
+        extract_skill_subtree(&zip, "alpha", &temp.path().join("alpha")).unwrap();
+        assert!(temp.path().join("alpha/SKILL.md").is_file());
+        assert!(!temp.path().join("alpha/alpha-other").exists());
+        for path in ["beta", ".", "alpha-other"] {
+            let error =
+                extract_skill_subtree(&zip, path, &temp.path().join("rejected")).unwrap_err();
+            assert!(error.to_string().contains("符号链接"));
+        }
     }
 
     #[test]

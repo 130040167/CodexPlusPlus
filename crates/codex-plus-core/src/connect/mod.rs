@@ -1,4 +1,6 @@
 pub mod app_server;
+mod inbox;
+pub mod media;
 pub mod session_store;
 pub mod weixin;
 
@@ -10,6 +12,8 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
 use self::app_server::{AppServerConfig, AppServerTurnResult, CodexAppServer};
+use self::inbox::Inbox;
+use self::media::{AttachmentKind, DownloadedAttachments};
 use self::session_store::{ConnectSessionStore, ConnectState};
 use self::weixin::{WeixinClient, WeixinMessage};
 
@@ -220,10 +224,11 @@ pub async fn run_weixin_connect_with_codex_path(
                 });
                 continue;
             }
-            let Some(text) = message.text() else {
+            let text = message.text().unwrap_or_default();
+            if text.is_empty() && !message.has_attachments() {
                 state.mark_processed(&message_key);
                 continue;
-            };
+            }
             if message.context_token.trim().is_empty() {
                 update_status(&status, |current| {
                     current.state = "running".to_string();
@@ -301,6 +306,90 @@ pub async fn run_weixin_connect_with_codex_path(
     Ok(())
 }
 
+struct PreparedWeixinInput {
+    prompt: String,
+    image_paths: Vec<PathBuf>,
+    warnings: Vec<String>,
+    _inbox: Option<Inbox>,
+}
+
+fn attachment_turn_input(
+    text: &str,
+    downloaded: &DownloadedAttachments,
+) -> anyhow::Result<(String, Vec<PathBuf>)> {
+    if downloaded.attachments.is_empty() {
+        if text.trim().is_empty() {
+            bail!(
+                "微信附件接收失败：{}",
+                downloaded
+                    .warnings
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("没有可用附件")
+            );
+        }
+        return Ok((text.to_owned(), Vec::new()));
+    }
+    let mut prompt = if text.trim().is_empty() {
+        "请查看本条微信消息中的附件。".to_string()
+    } else {
+        text.to_owned()
+    };
+    prompt.push_str("\n\n微信附件已保存到本地，附件路径如下：");
+    let mut image_paths = Vec::new();
+    for attachment in &downloaded.attachments {
+        let label = match attachment.kind {
+            AttachmentKind::Image => {
+                image_paths.push(attachment.path.clone());
+                "图片"
+            }
+            AttachmentKind::File => "文件",
+        };
+        // 引号和控制字符按 JSON 转义，文件名不能伪造额外的提示行。
+        let path = serde_json::to_string(&attachment.path.to_string_lossy())?;
+        prompt.push_str(&format!("\n- {label}：{path}"));
+    }
+    Ok((prompt, image_paths))
+}
+
+async fn prepare_weixin_input(
+    client: &WeixinClient,
+    work_dir: &std::path::Path,
+    message: &WeixinMessage,
+    text: &str,
+) -> anyhow::Result<PreparedWeixinInput> {
+    let (inbox, downloaded) = if message.has_attachments() {
+        match Inbox::create(work_dir) {
+            Ok(inbox) => {
+                let downloaded = client.download_attachments(message, &inbox).await;
+                (Some(inbox), downloaded)
+            }
+            Err(_) => (
+                None,
+                DownloadedAttachments {
+                    warnings: vec!["无法准备微信附件收件目录".into()],
+                    ..Default::default()
+                },
+            ),
+        }
+    } else {
+        (None, DownloadedAttachments::default())
+    };
+    let (prompt, image_paths) = attachment_turn_input(text, &downloaded)?;
+    Ok(PreparedWeixinInput {
+        prompt,
+        image_paths,
+        warnings: downloaded.warnings,
+        _inbox: inbox,
+    })
+}
+
+async fn wait_for_stop(stop: &AtomicBool) {
+    while !stop.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 async fn process_weixin_message(
     client: &WeixinClient,
     app_config: &AppServerConfig,
@@ -313,6 +402,10 @@ async fn process_weixin_message(
     if let Some(reason) = local_model_endpoint_unreachable_reason().await {
         bail!("{reason}");
     }
+    let input = tokio::select! {
+        input = prepare_weixin_input(client, &app_config.work_dir, message, text) => input?,
+        _ = wait_for_stop(stop) => bail!("微信连接已停止"),
+    };
     if app_server
         .as_ref()
         .map(|server| !server.is_running())
@@ -337,7 +430,7 @@ async fn process_weixin_message(
         .thread_ids
         .insert(message.from_user_id.clone(), thread_id.clone());
 
-    let turn = server.run_turn(&thread_id, text);
+    let turn = server.run_turn_with_images(&thread_id, &input.prompt, &input.image_paths);
     tokio::pin!(turn);
     let turn_result = loop {
         tokio::select! {
@@ -354,7 +447,15 @@ async fn process_weixin_message(
     } else {
         turn_result.reply.trim()
     };
-    let reply_with_footer = append_reply_footer(reply, &turn_result, &app_config.work_dir);
+    let reply = if input.warnings.is_empty() {
+        reply.to_owned()
+    } else {
+        format!(
+            "微信附件接收提示：\n{}\n\n{reply}",
+            input.warnings.join("\n")
+        )
+    };
+    let reply_with_footer = append_reply_footer(&reply, &turn_result, &app_config.work_dir);
     client
         .send_text_chunks(
             &message.from_user_id,
@@ -412,7 +513,12 @@ fn compact_work_dir(work_dir: &std::path::Path) -> String {
 /// 只取首行、隐去用户目录并截断，避免把长堆栈或本机路径整段发到聊天里。
 fn weixin_failure_reply(error: &str) -> String {
     const MAX_REASON_CHARS: usize = 160;
-    let mut reason = error.lines().map(str::trim).find(|line| !line.is_empty()).unwrap_or("").to_string();
+    let mut reason = error
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_string();
     for key in ["USERPROFILE", "HOME"] {
         if let Some(home) = std::env::var_os(key) {
             let home = home.to_string_lossy().to_string();
@@ -445,11 +551,12 @@ fn is_allowed_peer(allow_from: &str, peer: &str) -> bool {
 /// 由 Codex++ 的单模型路由写入），该代理只随从 Codex++ 启动的桌面版存在。
 /// 提前探测，避免 turn 失败后只剩一句模糊的「处理失败」。
 async fn local_model_endpoint_unreachable_reason() -> Option<String> {
-    let base_url = std::fs::read_to_string(
-        crate::relay_config::default_codex_home_dir().join("config.toml"),
-    )
-    .ok()
-    .and_then(|contents| crate::relay_config::root_key_string(&contents, "openai_base_url"))?;
+    let base_url =
+        std::fs::read_to_string(crate::relay_config::default_codex_home_dir().join("config.toml"))
+            .ok()
+            .and_then(|contents| {
+                crate::relay_config::root_key_string(&contents, "openai_base_url")
+            })?;
     let (host, port) = localhost_endpoint(&base_url)?;
     let connect = tokio::net::TcpStream::connect((host.as_str(), port));
     if tokio::time::timeout(std::time::Duration::from_millis(300), connect)
@@ -514,6 +621,120 @@ mod tests {
     use super::*;
 
     #[test]
+    fn attachment_input_keeps_caption_and_file_paths_with_only_images_in_local_image_input() {
+        let image = PathBuf::from("workspace/inbox/image.png");
+        let file = PathBuf::from("workspace/inbox/report.txt");
+        let downloaded = DownloadedAttachments {
+            attachments: vec![
+                media::LocalAttachment {
+                    path: image.clone(),
+                    kind: AttachmentKind::Image,
+                },
+                media::LocalAttachment {
+                    path: file.clone(),
+                    kind: AttachmentKind::File,
+                },
+            ],
+            warnings: vec!["one attachment failed".into()],
+        };
+        let (prompt, images) = attachment_turn_input("keep caption", &downloaded).unwrap();
+        assert!(prompt.starts_with("keep caption\n"));
+        assert!(prompt.contains(&serde_json::to_string(&file.to_string_lossy()).unwrap()));
+        assert!(prompt.contains(&serde_json::to_string(&image.to_string_lossy()).unwrap()));
+        assert!(!prompt.contains("one attachment failed"));
+        assert_eq!(images, [image]);
+        assert!(
+            attachment_turn_input("", &downloaded)
+                .unwrap()
+                .0
+                .contains("请查看")
+        );
+        let failed = DownloadedAttachments {
+            warnings: vec!["附件 1：下载失败".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            attachment_turn_input("original text", &failed).unwrap(),
+            ("original text".into(), vec![])
+        );
+        assert!(
+            attachment_turn_input("", &failed)
+                .unwrap_err()
+                .to_string()
+                .contains("下载失败")
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_inbound_handles_media_only_partial_failure_and_text_without_starting_a_server()
+    {
+        use serde_json::json;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+
+        let cdn = MockServer::start().await;
+        Mock::given(path("/image"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"\x89PNG\r\n\x1a\nfixture"))
+            .mount(&cdn)
+            .await;
+        let client = WeixinClient::new(&cdn.uri(), "test-token", "test-route")
+            .unwrap()
+            .with_media_base_url(&cdn.uri())
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let message: WeixinMessage = serde_json::from_value(json!({
+            "item_list":[{"type":2,"image_item":{"url":format!("{}/image",cdn.uri())}}]
+        }))
+        .unwrap();
+        assert!(message.text().is_none() && message.has_attachments());
+        let input = prepare_weixin_input(&client, root.path(), &message, "")
+            .await
+            .unwrap();
+        assert_eq!(input.image_paths.len(), 1);
+        assert_eq!(
+            std::fs::read(&input.image_paths[0]).unwrap(),
+            b"\x89PNG\r\n\x1a\nfixture"
+        );
+        assert!(input.warnings.is_empty());
+        assert!(input._inbox.is_some());
+
+        let message: WeixinMessage = serde_json::from_value(json!({
+            "item_list":[
+                {"type":2,"image_item":{"url":format!("{}/image",cdn.uri())}},
+                {"type":4,"file_item":{}}
+            ]
+        }))
+        .unwrap();
+        let partial = prepare_weixin_input(&client, root.path(), &message, "caption")
+            .await
+            .unwrap();
+        assert!(partial.prompt.starts_with("caption\n"));
+        assert_eq!(partial.image_paths.len(), 1);
+        assert_eq!(partial.warnings.len(), 1);
+
+        let invalid = root.path().join("not-a-directory");
+        std::fs::write(&invalid, b"keep").unwrap();
+        let failed = prepare_weixin_input(&client, &invalid, &message, "keep text")
+            .await
+            .unwrap();
+        assert_eq!(failed.prompt, "keep text");
+        assert_eq!(failed.warnings, ["无法准备微信附件收件目录"]);
+        assert!(failed.image_paths.is_empty());
+        assert!(
+            prepare_weixin_input(&client, &invalid, &message, "")
+                .await
+                .is_err()
+        );
+
+        let plain: WeixinMessage = serde_json::from_value(json!({"item_list":[]})).unwrap();
+        let text_only = prepare_weixin_input(&client, root.path(), &plain, "plain text")
+            .await
+            .unwrap();
+        assert_eq!(text_only.prompt, "plain text");
+        assert!(text_only._inbox.is_none());
+        assert!(text_only.image_paths.is_empty());
+    }
+
+    #[test]
     fn saved_cli_path_replaces_startup_path_at_next_message() {
         let path = WeixinCodexPath::new("missing-codex");
         let runtime_path = path.clone();
@@ -537,7 +758,8 @@ mod tests {
 
     #[test]
     fn weixin_failure_reply_carries_a_short_first_line_reason() {
-        let reply = weixin_failure_reply("app-server 启动失败：拒绝访问\nstack line 1\nstack line 2");
+        let reply =
+            weixin_failure_reply("app-server 启动失败：拒绝访问\nstack line 1\nstack line 2");
         assert!(reply.contains("app-server 启动失败：拒绝访问"), "{reply}");
         assert!(!reply.contains("stack line"), "{reply}");
         let long = "x".repeat(500);
@@ -636,7 +858,8 @@ mod tests {
         );
         // 清理循环写入真实 app state 目录的测试状态文件
         let _ = std::fs::remove_file(
-            crate::paths::default_app_state_dir().join("weixin-connect-state-unit-test-ignore.json"),
+            crate::paths::default_app_state_dir()
+                .join("weixin-connect-state-unit-test-ignore.json"),
         );
     }
 

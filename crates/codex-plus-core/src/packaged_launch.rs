@@ -55,6 +55,9 @@
 //!    进程原样存在），新进程拿不到单实例锁直接退出。launcher 现在启动前先识别这种情况
 //!    （`main_instances_blocking_debug_launch`）；其余失败靠 wrapper 轨迹与宿主内的
 //!    `SEEN_PIDS` 区分「wrapper 没执行 / Codex 没起来 / 起来又退了」。
+//! 7. Codex++ 以管理员身份运行时，Codex 继承提权令牌，会被 Chromium 经 explorer 降权重启而
+//!    脱离包上下文（issue #2789 的 `elevated:true` + 「出现过 1 个进程、随后 0 个」）。现在提权
+//!    时带上 [`DO_NOT_DE_ELEVATE_SWITCH`]；这一推断同样只能靠实机日志确认。
 //!
 //! 以上任何一条都不要当成已验证；`cargo test` 只覆盖纯函数与 CDP 探测这两块。
 
@@ -113,6 +116,73 @@ fn push_env_scrub_lines(script: &mut String) {
     for name in SCRUBBED_CODEX_ENV_VARS {
         script.push_str(&format!("set \"{name}=\"\r\n"));
     }
+}
+
+/// Chromium「提权启动时自动降权重启」的豁免开关（issue #2789 #2764）。
+///
+/// Chromium 在 Windows 上发现浏览器进程以「拆分令牌的提权部分」运行（UAC 开启、管理员
+/// 「以管理员身份运行」）时，会经 `base::win::RunDeElevated` 由 explorer 以普通权限重新
+/// 拉起自己并让当前进程退出，重启出来的进程带上本开关防止循环（`chrome_main_delegate.cc`
+/// 的 `MaybeAutoDeElevate`，开关定义在 `chrome/common/chrome_switches.h` 的
+/// `kDoNotDeElevateOnLaunch`）。Codex 的 Windows 版基于含 chrome 层的 Chromium 外壳，
+/// 主进程 JS 也在读这个开关（`hasDoNotDeElevateSwitch`），说明这条逻辑在 Codex 里生效。
+///
+/// 对 Codex++ 的影响：Codex++ 被以管理员身份运行时，包上下文 wrapper 拉起的 Codex 继承
+/// 提权令牌，Chromium 随即经 explorer 降权重启——重启出来的进程不再处于 MSIX 包上下文
+/// （没有包身份），也拿不到 wrapper 设置的环境；表现就是「出现过 1 个 Codex 进程，随后
+/// 一个不剩、调试端口始终不监听」。所以 Codex++ 提权时显式带上本开关，让 Codex 留在
+/// 包上下文里启动（与 Codex++ 同权限）。未提权时 Chromium 本来就不会降权，不加。
+pub const DO_NOT_DE_ELEVATE_SWITCH: &str = "--do-not-de-elevate";
+
+/// 打包版主实例的启动附加参数：Codex++ 提权运行时补上 [`DO_NOT_DE_ELEVATE_SWITCH`]
+/// （纯函数）。用户自己已经写了该开关时不重复添加；未提权时原样返回。
+pub fn packaged_launch_extra_args(extra_args: &[String], elevated: bool) -> Vec<String> {
+    let mut args = extra_args.to_vec();
+    let already_present = args.iter().any(|arg| {
+        arg.trim()
+            .split('=')
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case(DO_NOT_DE_ELEVATE_SWITCH))
+    });
+    if elevated && !already_present {
+        args.push(DO_NOT_DE_ELEVATE_SWITCH.to_string());
+    }
+    args
+}
+
+/// `IApplicationActivationManager::ActivateApplication` 的调用上限（issue #2795）。
+///
+/// 正常几秒内返回。#2795 的日志停在 `launch_codex` 阶段十几分钟没有下文，同时任务管理器里
+/// 有一个「已挂起」、内存 0.1 MB 的 Codex 进程——激活调用原先没有超时，一旦卡住 Codex++
+/// 就一直停在「启动 Codex」、没有任何报错。超过上限即放弃本次激活并给出提示。
+pub const AUMID_ACTIVATION_CALL_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// AUMID 激活调用超时（见 [`AUMID_ACTIVATION_CALL_TIMEOUT`]），供调用方 `downcast_ref` 区分。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AumidActivationTimedOut {
+    pub seconds: u64,
+}
+
+impl std::fmt::Display for AumidActivationTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Windows 激活 Codex（ActivateApplication）{} 秒内没有返回",
+            self.seconds
+        )
+    }
+}
+
+impl std::error::Error for AumidActivationTimedOut {}
+
+/// AUMID 激活调用超时后给用户看的提示（纯函数）。
+pub fn aumid_activation_timed_out_message(seconds: u64, executable_name: &str) -> String {
+    format!(
+        "启动 Codex 失败：Windows 激活 Codex {seconds} 秒内没有返回。\
+         可能是系统里残留了「已挂起」的 Codex 进程（任务管理器「进程」页里 ChatGPT / Codex \
+         状态显示为已挂起、内存只有零点几 MB）。请在任务管理器「详细信息」页结束所有 \
+         {executable_name} 进程（或注销 / 重启电脑）后，再点「启动 Codex」。"
+    )
 }
 
 /// CDP 就绪轮询间隔。
@@ -1823,6 +1893,52 @@ mod tests {
             vec!["NODE_OPTIONS"]
         );
         assert!(present_scrubbed_env_vars(|_| false).is_empty());
+    }
+
+    #[test]
+    fn elevated_packaged_launch_keeps_codex_from_de_elevating() {
+        let extra = vec!["--lang=zh-CN".to_string()];
+        // 未提权：参数原样不变。
+        assert_eq!(packaged_launch_extra_args(&extra, false), extra);
+        // 提权：补上 Chromium 的降权豁免开关（issue #2789）。
+        assert_eq!(
+            packaged_launch_extra_args(&extra, true),
+            vec!["--lang=zh-CN".to_string(), "--do-not-de-elevate".to_string()]
+        );
+        // 用户已写过（大小写、首尾空白不同）时不重复添加。
+        let user = vec![" --Do-Not-De-Elevate ".to_string()];
+        assert_eq!(packaged_launch_extra_args(&user, true), user);
+        // 只认完整开关名，前缀相同的别的开关不算。
+        let similar = vec!["--do-not-de-elevate-later".to_string()];
+        assert_eq!(packaged_launch_extra_args(&similar, true).len(), 2);
+    }
+
+    #[test]
+    fn elevated_main_wrapper_passes_do_not_de_elevate_to_codex() {
+        let args = packaged_launch_extra_args(&[], true);
+        let mut launch_args = vec!["--remote-debugging-port=9229".to_string()];
+        launch_args.extend(args);
+        let script =
+            build_main_instance_wrapper_script(Path::new(r"C:\app\ChatGPT.exe"), &launch_args)
+                .unwrap();
+        assert!(script.contains(
+            "start \"\" /b \"C:\\app\\ChatGPT.exe\" --remote-debugging-port=9229 --do-not-de-elevate\r\n"
+        ));
+    }
+
+    #[test]
+    fn aumid_activation_timeout_is_typed_and_actionable() {
+        let error = anyhow::Error::new(AumidActivationTimedOut { seconds: 20 });
+        assert_eq!(
+            error.downcast_ref::<AumidActivationTimedOut>(),
+            Some(&AumidActivationTimedOut { seconds: 20 })
+        );
+        assert!(error.to_string().contains("20 秒内没有返回"));
+        let message = aumid_activation_timed_out_message(20, "ChatGPT.exe");
+        assert!(message.contains("20 秒"));
+        assert!(message.contains("已挂起"));
+        assert!(message.contains("ChatGPT.exe"));
+        assert!(AUMID_ACTIVATION_CALL_TIMEOUT >= Duration::from_secs(10));
     }
 
     #[test]
