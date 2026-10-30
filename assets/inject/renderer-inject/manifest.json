@@ -68,7 +68,7 @@
     {
       "name": "80-session-share.js",
       "description": "会话运行时工具；分享入口已撤出管理器扫描",
-      "lines": 874
+      "lines": 910
     },
     {
       "name": "81-capacity-auto-retry.js",
@@ -158,7 +158,7 @@
     {
       "name": "99-startup.js",
       "description": "启动序列：resize 处理、MutationObserver 与事件绑定",
-      "lines": 95
+      "lines": 99
     },
     {
       "name": "99-tail.js",
