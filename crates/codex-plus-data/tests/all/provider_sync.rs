@@ -2287,8 +2287,8 @@ fn provider_sync_catalog_preserves_paginated_threads_without_rollout_files() {
         .unwrap();
     }
 
-    // Native history may live entirely in SQLite after migration removes the old JSONL.
-    // The first repair must also work without opening or creating that history database.
+    // 迁移删掉旧 JSONL 后，原生历史可能完全存在 SQLite 里。
+    // 第一次修复也要能在不打开、不创建历史库的情况下完成。
     let first = run_provider_sync(Some(&home));
     assert_eq!(first.status, ProviderSyncStatus::Synced, "{first:?}");
     for path in &catalogs {
@@ -2432,7 +2432,7 @@ fn provider_sync_catalog_merges_equal_timestamp_storage_copies() {
 
 #[test]
 fn provider_sync_catalog_equal_timestamp_exclusions_are_order_independent() {
-    // Available history, missing legacy storage and an archived copy can be observed in any order.
+    // 历史可用、缺旧版存储、已归档副本三种情况可能以任意顺序出现。
     for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
         let tmp = tempdir().unwrap();
         let home = tmp.path().join(".codex");

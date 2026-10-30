@@ -5814,7 +5814,7 @@ fn collect_catalog_repair_plan(
                 });
             let non_root = is_catalog_non_root_agent(&thread, &spawned_child_ids);
             let source_is_exec = thread.source_kind.trim().eq_ignore_ascii_case("exec");
-            // Native paginated migration can remove JSONL after storing history in SQLite.
+            // 原生分页迁移把历史存进 SQLite 后，可能删掉 JSONL。
             let history_available = history_mode == "paginated"
                 || catalog_rollout_path_exists(home, &thread.source_detail);
             let excluded_by_metadata = archived != 0
@@ -5827,8 +5827,8 @@ fn collect_catalog_repair_plan(
             let replace = observed_threads
                 .get(&thread.id)
                 .map(|current: &CatalogRepairObservedThread| {
-                    // Metadata exclusions win ties; missing legacy storage cannot veto
-                    // an equally recent copy with available history.
+                    // 时间戳相同时元数据排除优先；只缺旧版存储不能否决
+                    // 同样新、且历史可用的副本。
                     thread.source_updated_at > current.thread.source_updated_at
                         || (thread.source_updated_at == current.thread.source_updated_at
                             && (excluded_by_metadata, eligible)
