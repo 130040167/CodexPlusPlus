@@ -4048,7 +4048,7 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
                     if converter.has_failed() {
                         return Ok((
                             Some("上游返回了流式错误事件".to_string()),
-                            None,
+                            converter.request_usage(),
                             None,
                             first_output_at_ms,
                         ));
@@ -4062,7 +4062,7 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
                     stream.send(&failed).await?;
                     return Ok((
                         Some(error.without_url().to_string()),
-                        None,
+                        converter.request_usage(),
                         None,
                         first_output_at_ms,
                     ));
@@ -4079,13 +4079,13 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
             stream.send(&failed).await?;
             return Ok((
                 Some("上游缺少完成事件".to_string()),
-                None,
+                converter.request_usage(),
                 None,
                 first_output_at_ms,
             ));
         }
         stream.send(&converter.finish()).await?;
-        return Ok((None, None, None, first_output_at_ms));
+        return Ok((None, converter.request_usage(), None, first_output_at_ms));
     }
     let mut converter = request
         .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
@@ -4101,7 +4101,7 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
                 if converter.has_failed() {
                     return Ok((
                         Some("上游返回了流式错误事件".to_string()),
-                        None,
+                        converter.request_usage(),
                         None,
                         first_output_at_ms,
                     ));
@@ -4115,7 +4115,7 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
                 stream.send(&failed).await?;
                 return Ok((
                     Some(error.without_url().to_string()),
-                    None,
+                    converter.request_usage(),
                     None,
                     first_output_at_ms,
                 ));
@@ -4131,14 +4131,15 @@ pub(crate) async fn forward_protocol_proxy_stream_for_client<S: SseSink>(
         stream.send(&failed).await?;
         return Ok((
             Some("上游缺少完成事件".to_string()),
-            None,
+            converter.request_usage(),
             None,
             first_output_at_ms,
         ));
     }
     stream.send(&converter.finish()).await?;
     record_chat_converter_usage(thread_id, &converter);
-    Ok((None, None, None, first_output_at_ms))
+    // 流式 Chat 上游的用量也要进请求日志和网关用量统计（#2803）。
+    Ok((None, converter.request_usage(), None, first_output_at_ms))
 }
 
 fn record_chat_converter_usage(
@@ -8320,7 +8321,7 @@ mod proxy_stream_tests {
         truncated: bool,
         wire: UpstreamWireApi,
     ) -> (Option<String>, String) {
-        let (failure, output, _) =
+        let (failure, output, _, _) =
             forward_fixture_with_prefix_and_delay(&[], body, truncated, wire, Duration::ZERO)
                 .await;
         (failure, output)
@@ -8332,7 +8333,7 @@ mod proxy_stream_tests {
         truncated: bool,
         wire: UpstreamWireApi,
     ) -> (Option<String>, String) {
-        let (failure, output, _) =
+        let (failure, output, _, _) =
             forward_fixture_with_prefix_and_delay(prefix, body, truncated, wire, Duration::ZERO)
                 .await;
         (failure, output)
@@ -8344,7 +8345,12 @@ mod proxy_stream_tests {
         truncated: bool,
         wire: UpstreamWireApi,
         initial_delay: Duration,
-    ) -> (Option<String>, String, Option<u64>) {
+    ) -> (
+        Option<String>,
+        String,
+        Option<u64>,
+        Option<crate::request_log::RequestUsage>,
+    ) {
         let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = upstream.local_addr().unwrap();
         let body = body.to_owned();
@@ -8384,18 +8390,69 @@ mod proxy_stream_tests {
             .unwrap();
         let (mut writer, _) = downstream.accept().await.unwrap();
         let forwarded = tokio::spawn(async move {
-            let (result, _usage, _detail, first_output_at_ms) =
+            let (result, usage, _detail, first_output_at_ms) =
                 forward_protocol_proxy_stream(&mut writer, &prefix, response, wire, None, None)
                     .await
                     .unwrap();
             writer.shutdown().await.unwrap();
-            (result, first_output_at_ms)
+            (result, first_output_at_ms, usage)
         });
         let mut bytes = Vec::new();
         reader.read_to_end(&mut bytes).await.unwrap();
-        let (result, first_output_at_ms) = forwarded.await.unwrap();
+        let (result, first_output_at_ms, usage) = forwarded.await.unwrap();
         upstream_task.await.unwrap();
-        (result, String::from_utf8(bytes).unwrap(), first_output_at_ms)
+        (result, String::from_utf8(bytes).unwrap(), first_output_at_ms, usage)
+    }
+
+    #[tokio::test]
+    async fn chat_stream_usage_is_returned_for_request_log() {
+        // #2803：流式 Chat 上游的用量要进请求日志，口径与非流式一致（输入含缓存）。
+        let (failure, _, _, usage) = forward_fixture_with_prefix_and_delay(
+            &[],
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":30,",
+                "\"prompt_tokens_details\":{\"cached_tokens\":100},",
+                "\"completion_tokens_details\":{\"reasoning_tokens\":8}}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            false,
+            UpstreamWireApi::ChatCompletions,
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(failure, None);
+        let usage = usage.expect("流式 Chat 上游应返回用量");
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.output_tokens, 30);
+        assert_eq!(usage.cached_tokens, 100);
+        assert_eq!(usage.reasoning_tokens, 8);
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_usage_merges_start_and_delta() {
+        // Anthropic 的输入在 message_start、输出在 message_delta，两边都要记上。
+        let (failure, _, _, usage) = forward_fixture_with_prefix_and_delay(
+            &[],
+            concat!(
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-5\",",
+                "\"usage\":{\"input_tokens\":7,\"cache_read_input_tokens\":50,\"output_tokens\":1}}}\n\n",
+                "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+            ),
+            false,
+            UpstreamWireApi::AnthropicMessages,
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(failure, None);
+        let usage = usage.expect("流式 Anthropic 上游应返回用量");
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.cached_tokens, 50);
     }
 
     #[tokio::test]
@@ -8404,7 +8461,7 @@ mod proxy_stream_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let (_, _, first_output_at_ms) = forward_fixture_with_prefix_and_delay(
+        let (_, _, first_output_at_ms, _) = forward_fixture_with_prefix_and_delay(
             &[],
             "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n",
             false,
