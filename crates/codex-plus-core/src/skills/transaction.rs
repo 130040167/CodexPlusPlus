@@ -425,8 +425,10 @@ mod tests {
         );
         let mut expected: SkillsState =
             serde_json::from_slice(if committed { &after } else { &before }).unwrap();
-        if via_repo_write {
-            expected.repos.push(added_repo);
+        if via_repo_write || via_launch_gate {
+            if via_repo_write {
+                expected.repos.push(added_repo);
+            }
             let actual = reopened.load_state();
             assert_eq!(actual.repos, expected.repos);
             assert_eq!(
@@ -516,6 +518,48 @@ mod tests {
         assert!(second.operation_lock.try_lock().is_err());
         drop(guard);
         assert!(second.operation_lock.try_lock().is_ok());
+    }
+
+    #[test]
+    fn launch_gate_rejects_corrupt_state_before_action() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("skills.json");
+        std::fs::write(&state_path, b"invalid state").unwrap();
+        let manager = SkillsManager::new(
+            temp.path().join("library"),
+            temp.path().join("backups"),
+            &state_path,
+            temp.path().join("home"),
+        );
+        let mut stopped_or_started = false;
+        if let Ok(_guard) = manager.lock_recovered_transactions() {
+            stopped_or_started = true;
+        }
+        assert!(!stopped_or_started);
+        assert_eq!(std::fs::read(&state_path).unwrap(), b"invalid state");
+        assert!(manager.operation_lock.try_lock().is_ok());
+    }
+
+    #[test]
+    fn launch_gate_rejects_failed_legacy_migration_before_action() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("legacy");
+        std::fs::write(&legacy, b"not a directory").unwrap();
+        let manager = SkillsManager::new(
+            temp.path().join("library"),
+            temp.path().join("backups"),
+            temp.path().join("skills.json"),
+            temp.path().join("home"),
+        )
+        .with_legacy_source_dir(&legacy);
+        let mut stopped_or_started = false;
+        if let Ok(_guard) = manager.lock_recovered_transactions() {
+            stopped_or_started = true;
+        }
+        assert!(!stopped_or_started);
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"not a directory");
+        assert!(!manager.load_state().independent_library_migrated);
+        assert!(manager.operation_lock.try_lock().is_ok());
     }
 
     #[test]

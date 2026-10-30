@@ -36,6 +36,7 @@ use transaction::{PreparedSkillChange, SkillPlace};
 
 const SKILL_MANIFEST_FILE: &str = "SKILL.md";
 const BUNDLED_SKILLS_DIR: &str = ".system";
+const UNVERIFIED_CC_SWITCH_BASELINE: &str = "unverified-cc-switch-origin";
 /// 从本地目录导入的 Skill 的来源标记（#511），前端按它显示「本地导入」分组。
 pub const LOCAL_IMPORT_REPO_KEY: &str = "local";
 /// 单个仓库 zip 的下载上限。skill 仓库都是纯文本，64 MiB 足够宽松了。
@@ -489,13 +490,10 @@ impl SkillsManager {
         self.codex_home.join("skills")
     }
 
-    /// 启动 Codex 前恢复事务，并在调用方完成启动或重启前阻止新的 Skill 写入。
+    /// 启动 Codex 前准备独立库，并在调用方完成启动或重启前阻止新的 Skill 写入。
     pub fn lock_recovered_transactions(&self) -> anyhow::Result<std::sync::MutexGuard<'_, ()>> {
         let operation = self.operation_lock.lock().unwrap();
-        {
-            let _state = self.state_lock.lock().unwrap();
-            self.recover_skill_transactions()?;
-        }
+        self.prepare_managed_skills_unlocked()?;
         Ok(operation)
     }
 
@@ -1440,6 +1438,8 @@ impl SkillsManager {
         expected_target: Option<&str>,
         expected_update: Option<&str>,
     ) -> anyhow::Result<SkillsState> {
+        let unverified_cc_switch_import =
+            installed.import_source == "cc-switch" && !installed.repo_path.is_empty();
         let _operation = self.operation_lock.lock().unwrap();
         self.prepare_managed_skills_unlocked()?;
         let id = installed.id.clone();
@@ -1542,7 +1542,11 @@ impl SkillsManager {
         };
         let previous_hash = snapshot.directory_hashes[0].clone();
         let operation = uuid::Uuid::new_v4().to_string();
-        installed.local_baseline_hash = skill_directory_hash(staging)?;
+        installed.local_baseline_hash = if unverified_cc_switch_import {
+            UNVERIFIED_CC_SWITCH_BASELINE.to_string()
+        } else {
+            skill_directory_hash(staging)?
+        };
         let library_stage = self.transaction_stage(&operation, 0, &SkillPlace::Library)?;
         std::fs::rename(staging, &library_stage)?;
         let mut changes = vec![PreparedSkillChange {
@@ -3489,6 +3493,92 @@ mod tests {
     }
 
     #[test]
+    fn cc_switch_origin_requires_confirmation_until_a_verified_update() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let incoming = temp.path().join("cc-switch/alpha");
+        write_skill(&incoming, "customized import");
+        let repo = parse_repo_key("example/skills@main").unwrap();
+        let mut origins = BTreeMap::new();
+        origins.insert(
+            "alpha".to_string(),
+            crate::ccs_import::CcsSkillOrigin {
+                repo_key: repo.key(),
+                repo_path: "skills/alpha".to_string(),
+            },
+        );
+        let candidates = vec![("alpha".to_string(), incoming.clone())];
+        let preview = manager.preview_skill_import(&candidates, &origins).unwrap();
+        let selection = SkillImportSelection {
+            id: "alpha".to_string(),
+            source_hash: preview[0].source_hash.clone(),
+            repo_key: preview[0].repo_key.clone(),
+            repo_path: preview[0].repo_path.clone(),
+            target_id: None,
+            target_snapshot: None,
+        };
+        let (count, errors) = manager
+            .apply_skill_import(&candidates, &origins, "cc-switch", &[selection])
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(errors.is_empty());
+        manager.set_enabled("alpha", true).unwrap();
+        let imported = manager.load_state().installed["alpha"].clone();
+        assert_eq!(imported.local_baseline_hash, UNVERIFIED_CC_SWITCH_BASELINE);
+        assert_eq!(
+            imported.content_hash,
+            skill_git_tree_hash(&incoming).unwrap()
+        );
+
+        let zip = repo_zip(&[("skills-main/skills/alpha/SKILL.md", "remote update")]);
+        let mut remote = parse_skills_from_zip(&repo, &zip, &BTreeMap::new())
+            .unwrap()
+            .remove(0);
+        remote.id = "alpha".to_string();
+        assert!(entry(&manager.merge_entries(&[remote.clone()]), "alpha").update_available);
+        let snapshot = manager.update_local_snapshot("alpha").unwrap().unwrap();
+        assert!(
+            manager
+                .update_existing_from_zip_with_confirmation(&remote, &zip, None)
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(manager.source_dir.join("alpha/SKILL.md")).unwrap(),
+            "customized import"
+        );
+        manager
+            .update_existing_from_zip_with_confirmation(&remote, &zip, Some(&snapshot))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(manager.linked_dir().join("alpha/SKILL.md")).unwrap(),
+            "remote update"
+        );
+        assert_eq!(
+            std::fs::read_to_string(incoming.join("SKILL.md")).unwrap(),
+            "customized import"
+        );
+        assert!(manager.list_backups().iter().any(|backup| {
+            std::fs::read_to_string(manager.backups_dir.join(&backup.id).join("SKILL.md"))
+                .is_ok_and(|content| content == "customized import")
+        }));
+        assert_eq!(
+            manager.load_state().installed["alpha"].import_source,
+            "cc-switch"
+        );
+        assert!(manager.update_local_snapshot("alpha").unwrap().is_none());
+
+        let next_zip = repo_zip(&[("skills-main/skills/alpha/SKILL.md", "next update")]);
+        let mut next = parse_skills_from_zip(&repo, &next_zip, &BTreeMap::new())
+            .unwrap()
+            .remove(0);
+        next.id = "alpha".to_string();
+        manager
+            .update_existing_from_zip_with_confirmation(&next, &next_zip, None)
+            .unwrap();
+        assert!(manager.update_local_snapshot("alpha").unwrap().is_none());
+    }
+
+    #[test]
     fn ccs_import_preserves_both_conflicting_user_copies() {
         let temp = tempfile::tempdir().unwrap();
         let manager = manager(&temp);
@@ -5032,6 +5122,42 @@ mod tests {
             CloseHandle(handle);
         }
         assert_ne!(result, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn launch_gate_migrates_legacy_junction_before_action() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("legacy/alpha");
+        write_skill(&legacy, "original");
+        let manager = manager(&temp).with_legacy_source_dir(temp.path().join("legacy"));
+        let codex = manager.linked_dir().join("alpha");
+        make_junction(&codex, &legacy);
+
+        let guard = manager.lock_recovered_transactions().unwrap();
+        assert!(manager.load_state().independent_library_migrated);
+        assert!(
+            !std::fs::symlink_metadata(&codex)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(manager.source_dir.join("alpha/SKILL.md")).unwrap(),
+            "original"
+        );
+        assert!(manager.operation_lock.try_lock().is_err());
+        std::fs::write(codex.join("SKILL.md"), "codex edit").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("SKILL.md")).unwrap(),
+            "original"
+        );
+        assert_eq!(
+            std::fs::read_to_string(manager.source_dir.join("alpha/SKILL.md")).unwrap(),
+            "original"
+        );
+        drop(guard);
+        assert!(manager.operation_lock.try_lock().is_ok());
     }
 
     #[test]
