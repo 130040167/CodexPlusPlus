@@ -82,8 +82,8 @@
     },
     {
       "name": "83-usage-statusline.js",
-      "description": "输入框下方用量状态栏：输出吞吐、缓存命中率与上下文占用",
-      "lines": 528
+      "description": "输入框下方用量状态栏：输出吞吐、缓存命中率与上下文占用；旧版 Codex 挂载兜底与诊断",
+      "lines": 700
     },
     {
       "name": "84-proxy-request-status.js",
