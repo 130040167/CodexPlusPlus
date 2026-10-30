@@ -227,6 +227,17 @@ enum LegacyUpdateState {
     Unknown,
 }
 
+#[derive(Debug)]
+struct LocalSkillStageError(anyhow::Error);
+
+impl std::fmt::Display for LocalSkillStageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "无法暂存本地 Skill：{:#}", self.0)
+    }
+}
+
+impl std::error::Error for LocalSkillStageError {}
+
 fn legacy_update_state(
     installed: &InstalledSkill,
     source: &Path,
@@ -435,7 +446,8 @@ impl SkillsManager {
             "Skill 目录不能包含受控源目录"
         );
         let operation = uuid::Uuid::new_v4().to_string();
-        self.stage_skill_copy(&operation, 0, &SkillPlace::Library, &candidate, false)?;
+        self.stage_skill_copy(&operation, 0, &SkillPlace::Library, &candidate, false)
+            .map_err(LocalSkillStageError)?;
         let baseline =
             skill_directory_hash(&self.transaction_stage(&operation, 0, &SkillPlace::Library)?)?;
         let (name, description) = read_skill_manifest(&candidate.join(SKILL_MANIFEST_FILE), id);
@@ -555,9 +567,20 @@ impl SkillsManager {
         // 旧版未登记的 Codex 自建 Skill 和孤立管理库目录也需要纳入独立库。
         let mut registered: std::collections::BTreeSet<_> =
             self.load_state().installed.into_keys().collect();
+        std::fs::create_dir_all(&self.source_dir)?;
         for skill in self.list_local_skills() {
             if registered.insert(skill.id.clone()) {
-                self.ensure_managed_source(&skill.id)?;
+                let local = self.linked_dir().join(&skill.id);
+                if let Err(error) = self.ensure_managed_source(&skill.id) {
+                    if !is_managed_copy(&local) && error.is::<LocalSkillStageError>() {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "skills.local_adoption_skipped",
+                            serde_json::json!({ "id": skill.id, "message": format!("{error:#}") }),
+                        );
+                        continue;
+                    }
+                    return Err(error);
+                }
             }
         }
         for (id, _) in scan_skill_dirs(&self.source_dir) {
@@ -591,11 +614,9 @@ impl SkillsManager {
                 continue;
             }
             let source_was_link = std::fs::symlink_metadata(&source)?.file_type().is_symlink();
-            let original_target = source.canonicalize().ok();
             if source_was_link {
                 let operation = uuid::Uuid::new_v4().to_string();
                 let expected = skill_directory_hash(&source)?;
-                let source_target = source.canonicalize()?;
                 let mut changes = Vec::new();
                 let mut dependent = vec![(SkillPlace::Codex, self.linked_dir())];
                 dependent.extend(
@@ -608,7 +629,7 @@ impl SkillsManager {
                     let target = root.join(id);
                     if std::fs::symlink_metadata(&target)
                         .is_ok_and(|meta| meta.file_type().is_symlink())
-                        && target.canonicalize().ok().as_ref() == Some(&source_target)
+                        && link_points_to(&target, &source)
                     {
                         self.stage_skill_copy(&operation, changes.len(), &place, &source, true)?;
                         changes.push(PreparedSkillChange {
@@ -647,15 +668,12 @@ impl SkillsManager {
                 {
                     continue;
                 }
-                let owned_link = target.canonicalize().ok().is_some()
-                    && (target.canonicalize().ok() == source.canonicalize().ok()
-                        || (source_was_link && target.canonicalize().ok() == original_target)
-                        || self
-                            .legacy_source_dir
-                            .as_ref()
-                            .and_then(|root| root.join(id).canonicalize().ok())
-                            == target.canonicalize().ok());
-                if !owned_link && !matches!(place, SkillPlace::Codex) {
+                let owned_link = link_points_to(&target, &source)
+                    || self
+                        .legacy_source_dir
+                        .as_ref()
+                        .is_some_and(|root| link_points_to(&target, &root.join(id)));
+                if !owned_link {
                     continue;
                 }
                 if skill_directory_hash(&target)? != skill_directory_hash(&source)? {
@@ -2926,6 +2944,23 @@ fn copy_skill_directory(source: &Path, destination: &Path, root: bool) -> anyhow
 }
 
 /// 比较完整目录而不仅是 SKILL.md；标记文件是副本元数据，不参与比较。
+fn link_points_to(link: &Path, target: &Path) -> bool {
+    let Ok(destination) = std::fs::read_link(link) else {
+        return false;
+    };
+    let destination = if destination.is_absolute() {
+        destination
+    } else {
+        link.parent().unwrap_or(Path::new(".")).join(destination)
+    };
+    let normalize = |path: &Path| -> Option<PathBuf> {
+        Some(path.parent()?.canonicalize().ok()?.join(path.file_name()?))
+    };
+    normalize(&destination)
+        .zip(normalize(target))
+        .is_some_and(|(left, right)| left == right)
+}
+
 fn skill_directory_hash(root: &Path) -> anyhow::Result<String> {
     fn visit(
         root: &Path,
@@ -4911,9 +4946,8 @@ mod tests {
         assert!(error.to_string().contains("SKILL.md"));
     }
 
-    #[test]
     #[cfg(windows)]
-    fn legacy_junctions_detach_codex_and_other_agents_from_library() {
+    fn make_junction(link: &Path, target: &Path) {
         use std::ffi::c_void;
         use std::os::windows::ffi::OsStrExt;
         #[link(name = "kernel32")]
@@ -4941,60 +4975,68 @@ mod tests {
         }
         const GENERIC_WRITE: u32 = 0x40000000;
         const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
-        fn make_junction(link: &Path, target: &Path) {
-            std::fs::create_dir_all(link).unwrap();
-            let absolute = target.canonicalize().unwrap();
-            let target = absolute
-                .to_str()
-                .unwrap()
-                .strip_prefix(r"\\?\")
-                .unwrap_or(absolute.to_str().unwrap());
-            let substitute: Vec<u16> = format!(r"\??\{target}").encode_utf16().collect();
-            let print: Vec<u16> = target.encode_utf16().collect();
-            let mut data = Vec::new();
-            data.extend_from_slice(&0xA000_0003u32.to_le_bytes());
-            data.extend_from_slice(
-                &((8 + (substitute.len() + print.len() + 2) * 2) as u16).to_le_bytes(),
-            );
-            data.extend_from_slice(&0u16.to_le_bytes());
-            data.extend_from_slice(&0u16.to_le_bytes());
-            data.extend_from_slice(&((substitute.len() * 2) as u16).to_le_bytes());
-            data.extend_from_slice(&(((substitute.len() + 1) * 2) as u16).to_le_bytes());
-            data.extend_from_slice(&((print.len() * 2) as u16).to_le_bytes());
-            for unit in substitute.into_iter().chain([0]).chain(print).chain([0]) {
-                data.extend_from_slice(&unit.to_le_bytes());
-            }
-            let wide: Vec<u16> = link.as_os_str().encode_wide().chain(Some(0)).collect();
-            let handle = unsafe {
-                CreateFileW(
-                    wide.as_ptr(),
-                    GENERIC_WRITE,
-                    7,
-                    std::ptr::null(),
-                    3,
-                    0x0220_0000,
-                    std::ptr::null_mut(),
-                )
-            };
-            assert_ne!(handle as isize, -1);
-            let mut returned = 0;
-            let result = unsafe {
-                DeviceIoControl(
-                    handle,
-                    FSCTL_SET_REPARSE_POINT,
-                    data.as_ptr().cast(),
-                    data.len() as u32,
-                    std::ptr::null_mut(),
-                    0,
-                    &mut returned,
-                    std::ptr::null_mut(),
-                )
-            };
-            unsafe {
-                CloseHandle(handle);
-            }
-            assert_ne!(result, 0, "{}", std::io::Error::last_os_error());
+        std::fs::create_dir_all(link).unwrap();
+        let absolute = target
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join(target.file_name().unwrap());
+        let target = absolute
+            .to_str()
+            .unwrap()
+            .strip_prefix(r"\\?\")
+            .unwrap_or(absolute.to_str().unwrap());
+        let substitute: Vec<u16> = format!(r"\??\{target}").encode_utf16().collect();
+        let print: Vec<u16> = target.encode_utf16().collect();
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xA000_0003u32.to_le_bytes());
+        data.extend_from_slice(
+            &((8 + (substitute.len() + print.len() + 2) * 2) as u16).to_le_bytes(),
+        );
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&((substitute.len() * 2) as u16).to_le_bytes());
+        data.extend_from_slice(&(((substitute.len() + 1) * 2) as u16).to_le_bytes());
+        data.extend_from_slice(&((print.len() * 2) as u16).to_le_bytes());
+        for unit in substitute.into_iter().chain([0]).chain(print).chain([0]) {
+            data.extend_from_slice(&unit.to_le_bytes());
         }
+        let wide: Vec<u16> = link.as_os_str().encode_wide().chain(Some(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_WRITE,
+                7,
+                std::ptr::null(),
+                3,
+                0x0220_0000,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(handle as isize, -1);
+        let mut returned = 0;
+        let result = unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_SET_REPARSE_POINT,
+                data.as_ptr().cast(),
+                data.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        unsafe {
+            CloseHandle(handle);
+        }
+        assert_ne!(result, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn legacy_junctions_detach_codex_and_other_agents_from_library() {
         let temp = tempfile::tempdir().unwrap();
         let manager = multi_agent_manager(&temp);
         let source = manager.source_dir.join("alpha");
@@ -5049,7 +5091,7 @@ mod tests {
         )
         .unwrap();
         manager.prepare_managed_skills().unwrap();
-        for path in [&library_link, &codex_link, &claude_link] {
+        for path in [&library_link, &codex_link] {
             assert!(
                 !std::fs::symlink_metadata(path)
                     .unwrap()
@@ -5061,6 +5103,12 @@ mod tests {
                 "outside original"
             );
         }
+        assert!(
+            std::fs::symlink_metadata(&claude_link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         std::fs::write(third_party.join("SKILL.md"), "outside edit").unwrap();
         assert_eq!(
             std::fs::read_to_string(library_link.join("SKILL.md")).unwrap(),
@@ -5164,6 +5212,215 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn unmanaged_codex_junction_stays_linked_after_adoption() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let external = temp.path().join("external/custom");
+        let codex = manager.linked_dir().join("custom");
+        write_skill(&external, "original");
+        make_junction(&codex, &external);
+
+        manager.prepare_managed_skills().unwrap();
+        manager.prepare_managed_skills().unwrap();
+
+        assert!(manager.load_state().installed.contains_key("custom"));
+        assert!(
+            std::fs::symlink_metadata(&codex)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            codex.canonicalize().unwrap(),
+            external.canonicalize().unwrap()
+        );
+        std::fs::write(external.join("SKILL.md"), "edited externally").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(codex.join("SKILL.md")).unwrap(),
+            "edited externally"
+        );
+        assert_eq!(
+            std::fs::read_to_string(manager.source_dir.join("custom/SKILL.md")).unwrap(),
+            "original"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn external_codex_junction_sharing_library_link_target_is_not_detached() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = multi_agent_manager(&temp);
+        let external = temp.path().join("external/shared");
+        let source = manager.source_dir.join("shared");
+        let codex = manager.linked_dir().join("shared");
+        let agent = temp.path().join("claude-skills/shared");
+        write_skill(&external, "original");
+        make_junction(&source, &external);
+        make_junction(&codex, &external);
+        make_junction(&agent, &source);
+        std::fs::write(
+            &manager.state_path,
+            r#"{"repos":[],"installed":{"shared":{"id":"shared"}}}"#,
+        )
+        .unwrap();
+
+        manager.prepare_managed_skills().unwrap();
+
+        assert!(
+            !std::fs::symlink_metadata(&source)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(&codex)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !std::fs::symlink_metadata(&agent)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        std::fs::write(external.join("SKILL.md"), "external edit").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(codex.join("SKILL.md")).unwrap(),
+            "external edit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join("SKILL.md")).unwrap(),
+            "original"
+        );
+        assert_eq!(
+            std::fs::read_to_string(agent.join("SKILL.md")).unwrap(),
+            "original"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn startup_skips_unmanaged_codex_skills_with_internal_links_or_oversized_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let linked = manager.linked_dir().join("linked");
+        let oversized = manager.linked_dir().join("oversized");
+        let healthy = manager.linked_dir().join("healthy");
+        let external = temp.path().join("external/nested");
+        write_skill(&linked, "linked original");
+        write_skill(&oversized, "oversized original");
+        write_skill(&healthy, "healthy original");
+        write_skill(&external, "nested original");
+        make_junction(&linked.join("nested"), &external);
+        std::fs::File::create(oversized.join("large.bin"))
+            .unwrap()
+            .set_len(256 * 1024 * 1024 + 1)
+            .unwrap();
+
+        manager.prepare_managed_skills().unwrap();
+
+        let state = manager.load_state();
+        assert!(!state.installed.contains_key("linked"));
+        assert!(!state.installed.contains_key("oversized"));
+        assert!(state.installed.contains_key("healthy"));
+        assert!(
+            std::fs::symlink_metadata(linked.join("nested"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(external.join("SKILL.md")).unwrap(),
+            "nested original"
+        );
+        assert_eq!(
+            std::fs::metadata(oversized.join("large.bin"))
+                .unwrap()
+                .len(),
+            256 * 1024 * 1024 + 1
+        );
+        assert!(!manager.source_dir.join("linked").exists());
+        assert!(!manager.source_dir.join("oversized").exists());
+        assert_eq!(
+            std::fs::read_to_string(manager.source_dir.join("healthy/SKILL.md")).unwrap(),
+            "healthy original"
+        );
+        assert!(
+            manager
+                .local_inventory()
+                .iter()
+                .any(|entry| entry.id == "linked" && !entry.managed)
+        );
+        assert!(
+            manager
+                .local_inventory()
+                .iter()
+                .any(|entry| entry.id == "oversized" && !entry.managed)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn managed_codex_copy_with_internal_link_still_fails_preparation() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let codex = manager.linked_dir().join("managed");
+        let external = temp.path().join("external/nested");
+        write_skill(&codex, "managed original");
+        write_skill(&external, "external original");
+        std::fs::write(codex.join(MANAGED_COPY_MARKER), "").unwrap();
+        make_junction(&codex.join("nested"), &external);
+
+        let error = manager.prepare_managed_skills().unwrap_err();
+
+        assert!(format!("{error:#}").contains("符号链接"));
+        assert!(!manager.source_dir.join("managed").exists());
+        assert!(codex.join("nested/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn corrupted_recovery_journal_is_not_skipped_during_adoption() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let local = manager.linked_dir().join("custom");
+        write_skill(&local, "original");
+        let journal_dir = temp.path().join(".skill-transactions");
+        std::fs::create_dir_all(&journal_dir).unwrap();
+        let journal = journal_dir.join(format!("{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&journal, "{broken").unwrap();
+
+        assert!(manager.prepare_managed_skills().is_err());
+        assert_eq!(std::fs::read_to_string(&journal).unwrap(), "{broken");
+        assert_eq!(
+            std::fs::read_to_string(local.join("SKILL.md")).unwrap(),
+            "original"
+        );
+        assert!(!manager.source_dir.join("custom").exists());
+    }
+
+    #[test]
+    fn unavailable_library_is_not_skipped_during_unmanaged_adoption() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let local = manager.linked_dir().join("custom");
+        write_skill(&local, "original");
+        std::fs::write(&manager.source_dir, "not a directory").unwrap();
+
+        assert!(manager.prepare_managed_skills().is_err());
+        assert_eq!(
+            std::fs::read_to_string(&manager.source_dir).unwrap(),
+            "not a directory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(local.join("SKILL.md")).unwrap(),
+            "original"
+        );
+        assert!(!manager.load_state().installed.contains_key("custom"));
     }
 
     #[test]
