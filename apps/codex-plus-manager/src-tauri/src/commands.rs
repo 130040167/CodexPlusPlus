@@ -6882,7 +6882,7 @@ pub async fn check_update() -> CommandResult<Value> {
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 #[tauri::command]
 pub async fn perform_update(
     app: tauri::AppHandle,
@@ -6919,7 +6919,7 @@ pub async fn perform_update(
     result
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 #[tauri::command]
 pub async fn perform_update(
     release: Option<codex_plus_core::update::Release>,
@@ -9304,9 +9304,17 @@ fn open_url(url: &str) -> anyhow::Result<()> {
     {
         codex_plus_core::windows_open_url(url)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!("启动系统浏览器失败：{error}"))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
             .arg(url)
             .spawn()
             .map(|_| ())
