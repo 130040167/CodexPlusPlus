@@ -395,6 +395,7 @@ pub fn run() {
             gateway_commands::import_gateway_providers,
             gateway_commands::save_gateway_provider_extras,
             gateway_commands::save_gateway_provider_limits,
+            gateway_commands::save_gateway_provider_newapi_access,
             gateway_commands::save_gateway_provider_windows,
             gateway_commands::save_gateway_provider_metadata,
             gateway_commands::gateway_provider_reasoning,

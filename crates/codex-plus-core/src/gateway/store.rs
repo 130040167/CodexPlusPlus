@@ -70,6 +70,10 @@ pub struct GatewayProvider {
     /// 上次检查上游模型的时间（毫秒），0 表示没检查过。
     #[serde(default, skip_serializing_if = "is_zero")]
     pub models_checked_at_ms: u64,
+    /// new-api 中转站的访问令牌与用户 ID（#2793）：只用来查账户余额，留空不查。
+    /// 和 Key 一样只存在 gateway.json，界面只拿到打码后的样子。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newapi_access: Option<crate::relay_billing::NewApiAccess>,
     pub relay: RelayProfile,
     /// 不认识的字段（更新版本写的）原样保留，保存时写回，回滚后再升级不丢数据。
     #[serde(flatten)]
@@ -983,6 +987,7 @@ mod tests {
             upstream_new: Vec::new(),
             upstream_gone: Vec::new(),
             models_checked_at_ms: 0,
+            newapi_access: None,
             relay: RelayProfile {
                 id: "deepseek".to_string(),
                 ..RelayProfile::default()

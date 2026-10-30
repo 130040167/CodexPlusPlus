@@ -35,6 +35,9 @@ pub struct RelayBillingProbe {
     pub detail: String,
     #[serde(default)]
     pub outcome: RelayBillingOutcome,
+    /// new-api：访问令牌查账户余额的情况（#2793）。其它中转站、没识别出时为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newapi_access: Option<NewApiAccessStatus>,
 }
 
 impl RelayBillingProbe {
@@ -46,8 +49,39 @@ impl RelayBillingProbe {
             usage: None,
             detail,
             outcome,
+            newapi_access: None,
         }
     }
+}
+
+/// new-api 的访问令牌（new-api「个人设置 → 安全设置」里生成的系统访问令牌，区别于 API Key，#2793）。
+/// API Key 只能查 Key 自己的额度；Key 不限额度时，要用访问令牌查账户余额（`GET /api/user/self`）。
+/// 和 Key 同等对待：只存在本机配置里，界面只拿到打码后的样子，`Debug` 也不打印原文。
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewApiAccess {
+    pub token: String,
+    /// new-api 的用户 ID，放在请求头 `New-Api-User` 里：旧版 new-api 必须带，且要和令牌的主人一致。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub user_id: String,
+}
+
+impl std::fmt::Debug for NewApiAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewApiAccess")
+            .field("token", &"<redacted>")
+            .field("user_id", &self.user_id)
+            .finish()
+    }
+}
+
+/// 访问令牌查余额的情况：没配置、查到了（`error` 为空），或者查询失败的原因。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewApiAccessStatus {
+    pub configured: bool,
+    /// 查询失败的原因（只有地址和上游的提示，不含令牌）；没配置或查到了余额时为空。
+    pub error: Option<String>,
 }
 
 /// 单个识别请求失败：区分「这个接口明确不是」和「这次请求没成功」。
@@ -138,6 +172,14 @@ pub(crate) struct BillingTarget {
 
 /// 先试 sub2api，不是再试 new-api。官方登录、聚合、免鉴权供应商不发请求。
 pub async fn probe_relay_billing(profile: &RelayProfile) -> RelayBillingProbe {
+    probe_relay_billing_with_access(profile, None).await
+}
+
+/// 同 [`probe_relay_billing`]；识别成 new-api 且 Key 不限额度时，再用访问令牌查账户余额（#2793）。
+pub async fn probe_relay_billing_with_access(
+    profile: &RelayProfile,
+    newapi_access: Option<&NewApiAccess>,
+) -> RelayBillingProbe {
     if crate::official_login::is_official_login_profile(profile)
         || profile.relay_mode == crate::settings::RelayMode::Aggregate
         || profile.uses_no_auth()
@@ -155,7 +197,7 @@ pub async fn probe_relay_billing(profile: &RelayProfile) -> RelayBillingProbe {
     if sub2api.platform.is_some() {
         return sub2api;
     }
-    let newapi = crate::newapi::probe(&target).await;
+    let newapi = crate::newapi::probe(&target, newapi_access).await;
     if newapi.platform.is_some() {
         return newapi;
     }
@@ -239,13 +281,33 @@ pub(crate) async fn get_json(
     endpoint: &str,
     api_key: Option<&str>,
 ) -> Result<String, BillingFetchError> {
-    let mut request = client
-        .get(endpoint)
-        // 卡片后台识别用，上游卡住时不能让刷新一直转。
-        .timeout(BILLING_REQUEST_TIMEOUT);
+    let mut request = client.get(endpoint);
     if let Some(api_key) = api_key {
         request = request.bearer_auth(api_key).header("x-api-key", api_key);
     }
+    send_json(request, endpoint).await
+}
+
+/// 同 [`get_json`]，鉴权头由调用方给（如 new-api 访问令牌的 `Authorization` + `New-Api-User`）。
+/// 出错时的信息只有地址和上游的提示，不含请求头。
+pub(crate) async fn get_json_with_headers(
+    client: &reqwest::Client,
+    endpoint: &str,
+    headers: &[(&str, &str)],
+) -> Result<String, BillingFetchError> {
+    let mut request = client.get(endpoint);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    send_json(request, endpoint).await
+}
+
+async fn send_json(
+    request: reqwest::RequestBuilder,
+    endpoint: &str,
+) -> Result<String, BillingFetchError> {
+    // 卡片后台识别用，上游卡住时不能让刷新一直转。
+    let request = request.timeout(BILLING_REQUEST_TIMEOUT);
     let response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
@@ -303,10 +365,13 @@ fn status_is_transient(status: reqwest::StatusCode) -> bool {
 fn error_message(body: &str) -> Option<String> {
     let payload: Value = serde_json::from_str(body).ok()?;
     for path in [&["error", "message"][..], &["message"][..], &["error"][..]] {
-        let mut current = &payload;
-        for key in path {
-            current = current.get(*key)?;
-        }
+        // 这一条路径走不通就试下一条（如 new-api 只有顶层 `message`）。
+        let Some(current) = path
+            .iter()
+            .try_fold(&payload, |current, key| current.get(*key))
+        else {
+            continue;
+        };
         if let Some(message) = current
             .as_str()
             .map(str::trim)
@@ -391,6 +456,178 @@ mod tests {
         assert_eq!(usage.kind, "keyQuota");
         assert_eq!(usage.remaining, Some(1.5));
         assert_eq!(usage.quota_limit, Some(2.0));
+    }
+
+    /// new-api：Key 不限额度，站点不给账户余额。
+    async fn mount_unlimited_newapi(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/api/usage/token/"))
+            .and(header("authorization", "Bearer sk-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"code":true,"message":"ok","data":{"object":"token_usage","name":"k",
+                    "total_granted":0,"total_used":0,"total_available":0,"unlimited_quota":true,"expires_at":0}}"#,
+            ))
+            .mount(server)
+            .await;
+    }
+
+    fn access(token: &str, user_id: &str) -> NewApiAccess {
+        NewApiAccess {
+            token: token.to_string(),
+            user_id: user_id.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn newapi_without_access_token_reports_unlimited_and_not_configured() {
+        let server = MockServer::start().await;
+        mount_unlimited_newapi(&server).await;
+
+        let probe = probe_relay_billing_with_access(&relay_profile(server.uri()), None).await;
+
+        assert_eq!(probe.platform.as_deref(), Some("newapi"));
+        assert_eq!(probe.usage.as_ref().unwrap().kind, "unlimited");
+        assert_eq!(
+            probe.newapi_access,
+            Some(NewApiAccessStatus {
+                configured: false,
+                error: None
+            })
+        );
+        // 没配置访问令牌时不去敲账户接口。
+        let asked_self = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|request| request.url.path() == "/api/user/self");
+        assert!(!asked_self);
+    }
+
+    #[tokio::test]
+    async fn newapi_access_token_reads_account_balance() {
+        let server = MockServer::start().await;
+        mount_unlimited_newapi(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/user/self"))
+            .and(header("authorization", "Bearer acc-token"))
+            .and(header("new-api-user", "42"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"success":true,"message":"","data":{"id":42,"quota":4115000,"used_quota":10}}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let probe = probe_relay_billing_with_access(
+            &relay_profile(format!("{}/v1", server.uri())),
+            Some(&access(" acc-token ", "42")),
+        )
+        .await;
+
+        let usage = probe.usage.unwrap();
+        assert_eq!(usage.kind, "wallet");
+        assert_eq!(usage.remaining, Some(8.23));
+        assert!(usage.endpoint.ends_with("/api/user/self"));
+        assert_eq!(
+            probe.newapi_access,
+            Some(NewApiAccessStatus {
+                configured: true,
+                error: None
+            })
+        );
+        // 账户接口只带访问令牌，不带 API Key。
+        let self_requests: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| request.url.path() == "/api/user/self")
+            .collect();
+        assert_eq!(self_requests.len(), 1);
+        assert!(!self_requests[0].headers.contains_key("x-api-key"));
+    }
+
+    #[tokio::test]
+    async fn newapi_access_token_failures_keep_card_and_report_reason() {
+        // 旧版 new-api：鉴权失败也回 200，只是 success = false。
+        let server = MockServer::start().await;
+        mount_unlimited_newapi(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/user/self"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"success":false,"message":"无权进行此操作，access token 无效"}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let probe =
+            probe_relay_billing_with_access(&relay_profile(server.uri()), Some(&access("bad", "")))
+                .await;
+
+        assert_eq!(probe.platform.as_deref(), Some("newapi"));
+        assert_eq!(probe.outcome, RelayBillingOutcome::Recognized);
+        assert_eq!(probe.usage.as_ref().unwrap().kind, "unlimited");
+        let status = probe.newapi_access.unwrap();
+        assert!(status.configured);
+        let error = status.error.unwrap();
+        assert!(error.contains("access token 无效"), "{error}");
+        assert!(!error.contains("bad"), "出错信息不能带出令牌：{error}");
+
+        // 新版：401 / 403（如缺 New-Api-User、令牌没勾「个人资料 · 查看」）。
+        let server = MockServer::start().await;
+        mount_unlimited_newapi(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/user/self"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                r#"{"success":false,"message":"The access token lacks the required permission: profile:read"}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let probe = probe_relay_billing_with_access(
+            &relay_profile(server.uri()),
+            Some(&access("nap_secret", "7")),
+        )
+        .await;
+
+        assert_eq!(probe.usage.as_ref().unwrap().kind, "unlimited");
+        let error = probe.newapi_access.unwrap().error.unwrap();
+        assert!(error.contains("HTTP 403") && error.contains("profile:read"), "{error}");
+        assert!(!error.contains("nap_secret"));
+    }
+
+    #[tokio::test]
+    async fn newapi_access_token_is_not_used_when_key_has_its_own_quota() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/usage/token/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"code":true,"data":{"object":"token_usage","total_granted":1000000,
+                    "total_used":0,"total_available":1000000,"unlimited_quota":false}}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let probe =
+            probe_relay_billing_with_access(&relay_profile(server.uri()), Some(&access("t", "1")))
+                .await;
+
+        assert_eq!(probe.usage.unwrap().kind, "keyQuota");
+        assert_eq!(probe.newapi_access.unwrap().error, None);
+        let asked_self = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|request| request.url.path() == "/api/user/self");
+        assert!(!asked_self);
+    }
+
+    #[test]
+    fn newapi_access_debug_hides_token() {
+        let text = format!("{:?}", access("nap_secret", "7"));
+        assert!(!text.contains("nap_secret"));
+        assert!(text.contains("7"));
     }
 
     #[tokio::test]

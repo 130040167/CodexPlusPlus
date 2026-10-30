@@ -104,6 +104,12 @@ pub fn balance_api(relay: &RelayProfile) -> Option<BalanceApi> {
     }
 }
 
+/// 供应商池卡片据此显示余额（#2793）：有余额接口的供应商（DeepSeek 等）不当中转站识别，
+/// 余额和「用量」页、托盘面板同一个来源（[`fetch_balances`]），界面共用一份查询结果。
+pub fn has_balance_api(relay: &RelayProfile) -> bool {
+    balance_api(relay).is_some()
+}
+
 /// 查池里所有打开、且有余额接口的供应商。并发请求，每个最多等 10 秒。
 pub async fn fetch_balances(gateway: &GatewaySettings) -> Vec<ProviderBalance> {
     let tasks = gateway
@@ -139,6 +145,15 @@ pub async fn fetch_balances(gateway: &GatewaySettings) -> Vec<ProviderBalance> {
 }
 
 async fn fetch_one(relay: &RelayProfile, api: BalanceApi) -> Result<(f64, String), String> {
+    fetch_one_at(relay, api, api.url()).await
+}
+
+/// 同 [`fetch_one`]，地址由调用方给（测试里换成本机的模拟上游）。
+async fn fetch_one_at(
+    relay: &RelayProfile,
+    api: BalanceApi,
+    url: &str,
+) -> Result<(f64, String), String> {
     let key = relay.api_key.trim();
     if key.is_empty() {
         return Err("没有 Key".to_string());
@@ -147,7 +162,7 @@ async fn fetch_one(relay: &RelayProfile, api: BalanceApi) -> Result<(f64, String
     let client = crate::http_client::proxied_client_for_relay("CodexPlusPlus", relay)
         .map_err(|error| format!("{error:#}"))?;
     let response = client
-        .get(api.url())
+        .get(url)
         .bearer_auth(key)
         .timeout(Duration::from_secs(10))
         .send()
@@ -220,5 +235,54 @@ mod tests {
             Some((12.5, "CNY".to_string()))
         );
         assert_eq!(BalanceApi::OpenRouter.parse(&json!({})), None);
+    }
+
+    #[test]
+    fn pool_cards_show_balance_only_for_vendors_with_balance_api() {
+        // 供应商池卡片的余额来源（#2793）：DeepSeek 这类走余额接口，不当中转站识别；中转站不走。
+        assert!(has_balance_api(&relay("https://api.deepseek.com")));
+        assert!(has_balance_api(&relay("https://api.siliconflow.cn/v1")));
+        assert!(!has_balance_api(&relay("https://jojocode.com/v1")));
+    }
+
+    #[tokio::test]
+    async fn deepseek_balance_comes_from_its_balance_api_with_provider_key() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/user/balance"))
+            .and(header("authorization", "Bearer sk-deepseek"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "is_available": true,
+                "balance_infos": [{ "currency": "CNY", "total_balance": "14.60" }]
+            })))
+            .mount(&server)
+            .await;
+        let provider = RelayProfile {
+            api_key: "sk-deepseek".to_string(),
+            ..relay("https://api.deepseek.com")
+        };
+        let url = format!("{}/user/balance", server.uri());
+
+        let result = fetch_one_at(&provider, BalanceApi::DeepSeek, &url).await;
+
+        assert_eq!(result, Ok((14.6, "CNY".to_string())));
+
+        // 上游拒绝时给出原因，不带 Key。
+        let failing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&failing)
+            .await;
+        let error = fetch_one_at(
+            &provider,
+            BalanceApi::DeepSeek,
+            &format!("{}/user/balance", failing.uri()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "查询余额失败：HTTP 401");
     }
 }

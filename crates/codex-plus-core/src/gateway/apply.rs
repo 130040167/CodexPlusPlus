@@ -2640,6 +2640,7 @@ fn add_provider_with(
             upstream_new: Vec::new(),
             upstream_gone: Vec::new(),
             models_checked_at_ms: 0,
+            newapi_access: None,
             relay,
             extra: Default::default(),
         };
@@ -2764,6 +2765,10 @@ fn update_provider_in(
     // 没传「移除托管生图工具」时沿用原来的选择。
     if input.strip_image_generation_tool.is_none() {
         relay.strip_image_generation_tool = provider.relay.strip_image_generation_tool;
+    }
+    // 地址换到别的站点时丢掉 new-api 访问令牌，免得把它发给新站点（#2793）。
+    if newapi_access_origin(&relay) != newapi_access_origin(&provider.relay) {
+        provider.newapi_access = None;
     }
     provider.relay = relay;
     provider.price = clean_price(input.price.clone());
@@ -3025,6 +3030,86 @@ pub fn set_provider_limits(
         Ok(())
     })?;
     store.load()
+}
+
+/// 界面上看到的 new-api 访问令牌（#2793）：只有打码后的令牌和用户 ID，原文不出后端。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewApiAccessView {
+    pub masked: String,
+    pub user_id: String,
+}
+
+/// 供应商已保存的 new-api 访问令牌（打码后）；没配置返回 None。
+pub fn provider_newapi_access(provider: &GatewayProvider) -> Option<NewApiAccessView> {
+    provider
+        .newapi_access
+        .as_ref()
+        .filter(|access| !access.token.trim().is_empty())
+        .map(|access| NewApiAccessView {
+            masked: mask_api_key(&access.token),
+            user_id: access.user_id.clone(),
+        })
+}
+
+/// 改 new-api 访问令牌（#2793）。`token` 为 None 或空串表示沿用已保存的（只改用户 ID）；
+/// `clear` 为 true 时删掉令牌和用户 ID，之后不再查账户余额。用户 ID 只能是数字或留空。
+pub fn set_provider_newapi_access(
+    store: &GatewayStore,
+    id: &str,
+    token: Option<&str>,
+    user_id: &str,
+    clear: bool,
+) -> anyhow::Result<GatewaySettings> {
+    let token = token.map(str::trim).filter(|token| !token.is_empty());
+    if token.is_some_and(|token| token.chars().any(char::is_whitespace)) {
+        bail!("访问令牌里不能有空格或换行");
+    }
+    let user_id = user_id.trim();
+    if !user_id.chars().all(|char| char.is_ascii_digit()) {
+        bail!("用户 ID 只能是数字（new-api 个人设置里能看到）");
+    }
+    store.update(|gateway| {
+        let Some(provider) = gateway
+            .providers
+            .iter_mut()
+            .find(|provider| provider.relay.id == id)
+        else {
+            bail!("供应商不存在：{id}");
+        };
+        if clear {
+            provider.newapi_access = None;
+            return Ok(());
+        }
+        let token = match (token, provider.newapi_access.as_ref()) {
+            (Some(token), _) => token.to_string(),
+            (None, Some(saved)) if !saved.token.trim().is_empty() => saved.token.clone(),
+            _ => bail!("访问令牌为空"),
+        };
+        provider.newapi_access = Some(crate::relay_billing::NewApiAccess {
+            token,
+            user_id: user_id.to_string(),
+        });
+        Ok(())
+    })?;
+    store.load()
+}
+
+/// 访问令牌绑定的站点：上游地址的协议 + 主机 + 端口。换了站点就不能再把令牌发过去。
+fn newapi_access_origin(relay: &RelayProfile) -> Option<String> {
+    let base = if relay.upstream_base_url.trim().is_empty() {
+        relay.base_url.trim()
+    } else {
+        relay.upstream_base_url.trim()
+    };
+    reqwest::Url::parse(base).ok().map(|url| {
+        format!(
+            "{}://{}:{}",
+            url.scheme(),
+            url.host_str().unwrap_or_default(),
+            url.port_or_known_default().unwrap_or_default()
+        )
+    })
 }
 
 /// 供应商的上下文窗口：按模型的（键是上游模型名）和其余模型用的默认值。0 或不写表示不设。

@@ -8,7 +8,7 @@ import { createPortal } from "react-dom";
 import { appConfirm } from "./app-dialog";
 import { Check, ChevronRight, Copy, GripVertical, Pencil, Plus, RefreshCw, Search, X, Zap } from "lucide-react";
 import { t, tf } from "./i18n";
-import { RelayBillingPoolBadge, RelayBillingPoolLabel, RelayBillingRetry, useRelayBillingProbe } from "./RelayBillingLine";
+import { ProviderBalancePoolBadge, RelayBillingPoolBadge, RelayBillingPoolLabel, RelayBillingRetry, useProviderBalance, useRelayBillingProbe } from "./RelayBillingLine";
 import { relayBillingGatewayCacheKey, type RelayBillingProbe } from "./relay-billing";
 import {
   defaultProviderAgents,
@@ -41,7 +41,7 @@ import {
 } from "./gateway-model";
 import { AgentIcon, Avatar, KeyCount, MemberStatusLabel, QuotaBadge, QuotaWindows, Switch, type Notify, type Run } from "./gateway-ui";
 import { ProviderFormDialog, type ProviderFormState } from "./ProviderFormDialog";
-import { ProviderExtrasDialog, ProviderLimitsDialog, keyLimitSummary, priceSummary } from "./ProviderExtrasDialog";
+import { ProviderExtrasDialog, ProviderLimitsDialog, ProviderNewApiAccessDialog, keyLimitSummary, priceSummary } from "./ProviderExtrasDialog";
 import { ProviderWindowsDialog, windowSummary, withUnlistedWindows } from "./ProviderWindowsDialog";
 import { ProviderReasoningDialog, reasoningSummary } from "./ProviderReasoningDialog";
 import { ProviderModelsDialog } from "./ProviderModelsDialog";
@@ -455,6 +455,15 @@ function PoolRow({
     relayBillingGatewayCacheKey(entry),
     () => invoke<Partial<RelayBillingProbe> & { status: string }>("probe_gateway_provider_billing", { id: entry.id }),
   );
+  // DeepSeek、Kimi 等有余额接口的厂商：卡片余额和「用量」页、托盘面板同一来源（#2793）。
+  const vendorBalance = useProviderBalance(entry.id, enabled && Boolean(entry.balanceApi));
+  // new-api 的访问令牌（#2793）：识别成 new-api 或已经配过时，详情里才有这一行。
+  const [accessOpen, setAccessOpen] = useState(false);
+  const showAccess = !entry.account && (billing.probe?.platform === "newapi" || Boolean(entry.newapiAccess));
+  const saveAccess = async (token: string | null, userId: string, clear: boolean) => {
+    const title = clear ? t("清除访问令牌") : t("保存访问令牌");
+    if (await run(`newapi-access:${entry.id}`, "save_gateway_provider_newapi_access", { id: entry.id, token, userId, clear }, title)) setAccessOpen(false);
+  };
   const sub = (entry.account
     ? [t("订阅登录"), entry.lentToCodex ? t("Codex 正用它登录") : "", tf("{0} 个模型", [entry.models.length])]
     : [protocolLabel(entry.protocol), presetHost(entry.baseUrl), tf("{0} 个模型", [entry.models.length])]
@@ -539,6 +548,7 @@ function PoolRow({
             : status.state === "idle" && billing.probe?.rate ? <RelayBillingPoolLabel probe={billing.probe} /> : <MemberStatusLabel status={status} />}
           {enabled && entry.quota ? <QuotaBadge quota={entry.quota} /> : null}
           {enabled && billing.probe ? <RelayBillingPoolBadge failure={billing.failure} loading={billing.loading} onRefresh={billing.refresh} probe={billing.probe} /> : null}
+          {vendorBalance.balance ? <ProviderBalancePoolBadge balance={vendorBalance.balance} loading={vendorBalance.loading} onRefresh={vendorBalance.refresh} /> : null}
           {enabled && !billing.probe && billing.settled ? (
             <RelayBillingRetry failure={billing.failure} loading={billing.loading} onRefresh={billing.refresh} />
           ) : null}
@@ -620,6 +630,20 @@ function PoolRow({
               ) : null}
             </div>
           </div>
+          {showAccess ? (
+            <div className="gw-detail-row">
+              <span className="gw-detail-label">{t("访问令牌")}</span>
+              <div className="gw-detail-value gw-chip-row">
+                {entry.newapiAccess ? (
+                  <code className="gw-chip">{entry.newapiAccess.masked}</code>
+                ) : (
+                  <span className="gw-muted">{t("未填写：Key 不限额度时查不到账户余额")}</span>
+                )}
+                {entry.newapiAccess?.userId ? <span className="gw-muted">{tf("用户 ID {0}", [entry.newapiAccess.userId])}</span> : null}
+                <EditIcon disabled={busy !== null} label={t("编辑访问令牌")} onClick={() => setAccessOpen(true)} />
+              </div>
+            </div>
+          ) : null}
           {quotaSupported ? (
             <div className="gw-detail-row">
               <span className="gw-detail-label">{t("额度")}</span>
@@ -726,6 +750,15 @@ function PoolRow({
       ) : null}
       {windowsOpen ? (
         <ProviderWindowsDialog busy={busy !== null} entry={entry} onCancel={() => setWindowsOpen(false)} onSave={(modelWindows, fallback) => void saveWindows(modelWindows, fallback)} />
+      ) : null}
+      {accessOpen ? (
+        <ProviderNewApiAccessDialog
+          busy={busy !== null}
+          entry={entry}
+          onCancel={() => setAccessOpen(false)}
+          onClear={() => void saveAccess(null, "", true)}
+          onSave={(token, userId) => void saveAccess(token, userId, false)}
+        />
       ) : null}
       {limitsOpen ? (
         <ProviderLimitsDialog busy={busy !== null} entry={entry} onCancel={() => setLimitsOpen(false)} onSave={(rpm, concurrency) => void saveLimits(rpm, concurrency)} />

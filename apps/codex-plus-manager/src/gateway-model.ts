@@ -98,7 +98,14 @@ export type GatewayPoolEntry = {
   quota?: ProviderQuota | null;
   /** 已保存的 Key（打码，#2782）：订阅账号等不用 Key 的为空。旧版后端没有。 */
   keys?: ProviderKeyView[];
+  /** 有余额接口的厂商（DeepSeek、Kimi 等，#2793）：卡片用「用量」页同一份余额。旧版后端没有。 */
+  balanceApi?: boolean;
+  /** new-api 访问令牌（打码，#2793）：只用来查账户余额；没配置为空。令牌原文不出后端。 */
+  newapiAccess?: NewApiAccessView | null;
 };
+
+/** 已保存的 new-api 访问令牌：只有打码后的样子和用户 ID。 */
+export type NewApiAccessView = { masked: string; userId: string };
 
 /** 供应商已保存的一个 Key：后端只给标识和打码后的样子，原文不出后端。删除 / 替换按 `id`。 */
 export type ProviderKeyView = { id: string; masked: string };

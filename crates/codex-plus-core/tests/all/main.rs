@@ -50,6 +50,7 @@ mod gateway_codex_identity;
 mod gateway_forced_relay;
 mod gateway_key_limits;
 mod gateway_model_sync;
+mod gateway_newapi_access;
 mod gateway_provider_keys;
 mod gateway_provider_probe;
 mod gateway_restore;

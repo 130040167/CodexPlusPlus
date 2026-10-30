@@ -66,6 +66,10 @@ pub struct GatewayPoolEntry {
     pub upstream_gone: Vec<String>,
     /// 订阅账号的额度（ChatGPT 5 小时 / 每周、Copilot 本月高级请求）；查不到或普通供应商为空。
     pub quota: Option<codex_plus_core::gateway::quota::ProviderQuota>,
+    /// 有余额接口的厂商（DeepSeek、Kimi 等，#2793）：卡片用「用量」页同一份余额，不当中转站识别。
+    pub balance_api: bool,
+    /// new-api 访问令牌（打码，#2793）；没配置为空。令牌原文不传给界面。
+    pub newapi_access: Option<apply::NewApiAccessView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -192,6 +196,8 @@ fn pool_entry(
         upstream_new: upstream.0,
         upstream_gone: upstream.1,
         quota: codex_plus_core::gateway::quota::get(&relay.id),
+        balance_api: codex_plus_core::gateway::balance::has_balance_api(relay),
+        newapi_access: None,
     }
 }
 
@@ -217,6 +223,7 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
         .iter()
         .map(|provider| GatewayPoolEntry {
             keys: apply::provider_keys(&provider.relay),
+            newapi_access: apply::provider_newapi_access(provider),
             model_windows: provider.model_windows.clone(),
             context_window: provider.context_window,
             key_rpm: provider.key_rpm,
@@ -833,6 +840,32 @@ pub fn save_gateway_provider_limits(
         "限速已保存。",
         "保存限速失败",
         apply::set_provider_limits(&GatewayStore::default(), &id, rpm, concurrency),
+    )
+}
+
+/// 改 new-api 供应商的访问令牌与用户 ID（#2793，在供应商池的详情里编辑）。
+/// `token` 留空沿用已保存的；`clear` 删掉令牌，之后不再查账户余额。令牌不写进返回的消息。
+#[tauri::command]
+pub fn save_gateway_provider_newapi_access(
+    id: String,
+    token: Option<String>,
+    user_id: String,
+    clear: bool,
+) -> CommandResult<Option<GatewayPayload>> {
+    respond(
+        if clear {
+            "访问令牌已清除。"
+        } else {
+            "访问令牌已保存。"
+        },
+        "保存访问令牌失败",
+        apply::set_provider_newapi_access(
+            &GatewayStore::default(),
+            &id,
+            token.as_deref(),
+            &user_id,
+            clear,
+        ),
     )
 }
 
@@ -1475,11 +1508,12 @@ pub struct GatewayBalances {
 pub async fn probe_gateway_provider_billing(
     id: String,
 ) -> CommandResult<codex_plus_core::relay_billing::RelayBillingProbe> {
-    let relay = GatewayStore::default()
-        .load()
-        .ok()
-        .and_then(|gateway| gateway.provider(&id).map(|provider| provider.relay.clone()));
-    let Some(relay) = relay else {
+    let provider = GatewayStore::default().load().ok().and_then(|gateway| {
+        gateway
+            .provider(&id)
+            .map(|provider| (provider.relay.clone(), provider.newapi_access.clone()))
+    });
+    let Some((relay, newapi_access)) = provider else {
         return failed(
             &format!("供应商不存在：{id}"),
             codex_plus_core::relay_billing::RelayBillingProbe::unrecognized(
@@ -1488,7 +1522,12 @@ pub async fn probe_gateway_provider_billing(
             ),
         );
     };
-    let probe = codex_plus_core::relay_billing::probe_relay_billing(&relay).await;
+    // 识别成 new-api 且配置了访问令牌时，顺带查账户余额（#2793）。
+    let probe = codex_plus_core::relay_billing::probe_relay_billing_with_access(
+        &relay,
+        newapi_access.as_ref(),
+    )
+    .await;
     let message = match &probe.platform {
         Some(platform) => format!("已识别为 {platform}。"),
         None if probe.outcome

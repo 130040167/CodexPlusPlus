@@ -2686,6 +2686,27 @@ export const EN_PLAIN: Record<string, string> = {
   "暂时获取失败，显示的是上次的结果": "Temporarily unavailable; showing the last result",
   "暂时获取不到倍率和余额，点击重试": "Rate and balance are temporarily unavailable. Click to retry",
   "没有识别出 sub2api / new-api 中转站，点击重新识别": "Not recognized as a sub2api / new-api relay. Click to check again",
+  // new-api 访问令牌查账户余额、厂商余额显示在供应商池卡片上（#2793）
+  "配置访问令牌后可显示余额（展开供应商详情，在「访问令牌」里填写）":
+    "Set an access token to show the balance (expand the provider details and fill in \"Access token\")",
+  "余额查询失败": "Balance check failed",
+  "余额接口查询，和「用量」页、托盘面板同一来源": "From the balance API, the same source as the Usage page and the tray panel",
+  "刷新余额": "Refresh balance",
+  "可选：只用来查 new-api 账户余额，留空不查": "Optional: only used to check the new-api account balance. Leave empty to skip",
+  "访问令牌": "Access token",
+  "在 new-api 的「个人设置 → 安全设置」里生成，不是 API Key": "Generate it in new-api under Personal settings → Security. It is not an API key",
+  "粘贴访问令牌": "Paste the access token",
+  "用户 ID": "User ID",
+  "个人设置里显示的 ID": "The ID shown in personal settings",
+  "按 new-api 文档，查余额要同时带访问令牌和用户 ID（旧版必须填用户 ID）；新版的分权限令牌需要勾选「个人资料 · 查看」。令牌只存在本机，和 Key 一样不显示原文。":
+    "Per the new-api docs, the balance request carries both the access token and the user ID (older versions require the user ID); scoped tokens in newer versions need \"Profile · View\". The token stays on this computer and, like keys, is never shown in full.",
+  "清除令牌": "Clear token",
+  "访问令牌里不能有空格或换行": "The access token can't contain spaces or line breaks",
+  "用户 ID 只能是数字": "The user ID must be a number",
+  "保存访问令牌": "Save access token",
+  "清除访问令牌": "Clear access token",
+  "未填写：Key 不限额度时查不到账户余额": "Not set: the account balance can't be checked when the key has no quota limit",
+  "编辑访问令牌": "Edit access token",
   // 导入链接导入到供应商池
   "导入后供应商默认启用，会按「Agent 接入」里各 Agent 的「添加供应商时自动加入」设置立即承接请求。":
     "The imported provider is enabled by default and starts serving requests right away for agents that have \"Auto-join new providers\" turned on under Agent access.",
@@ -2764,6 +2785,10 @@ export const EN_TEMPLATE: Record<string, string> = {
   "{0} 剩余 {1}": "{0}: {1} left",
   "订阅剩余 {0}": "Subscription left {0}",
   "余额 {0}": "Balance {0}",
+  "访问令牌查询余额失败：{0}": "Checking the balance with the access token failed: {0}",
+  "{0} 的访问令牌": "Access token for {0}",
+  "已保存 {0}，留空不改": "Saved {0}; leave empty to keep it",
+  "用户 ID {0}": "User ID {0}",
   "剩 {0}": "{0} left",
   "{0} 剩 {1}": "{0}: {1} left",
   "倍率接口：{0}": "Rate endpoint: {0}",
@@ -3127,6 +3152,9 @@ export const EN_BACKEND: Record<string, string> = {
   "保存上下文窗口失败": "Failed to save context windows",
   "限速已保存。": "Rate limit saved.",
   "保存限速失败": "Failed to save rate limit",
+  "访问令牌已保存。": "Access token saved.",
+  "访问令牌已清除。": "Access token cleared.",
+  "保存访问令牌失败": "Failed to save the access token",
   "扫描已失效，请重新扫描。": "The scan is no longer valid. Scan again.",
   "扫描已过期，请重新扫描。": "The scan has expired. Scan again.",
   "请选择缓存项目。": "Select cache items first.",
@@ -3360,6 +3388,7 @@ export const EN_BACKEND_PATTERNS: Array<[RegExp, string]> = [
   [/^从 CC Switch 导入失败：(.+)$/, "Import from CC Switch failed: $1"],
   // 供应商池：单独管理 Key（#2782）
   [/^添加 Key 失败：(.+)$/, "Failed to add key: $1"],
+  [/^保存访问令牌失败：(.+)$/, "Failed to save the access token: $1"],
   [/^替换 Key 失败：(.+)$/, "Failed to replace key: $1"],
   [/^删除 Key 失败：(.+)$/, "Failed to delete key: $1"],
   // 供应商池：测试供应商

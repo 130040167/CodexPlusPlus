@@ -588,6 +588,7 @@ mod tests {
             upstream_new: vec!["b".into()],
             upstream_gone: vec!["x".into()],
             models_checked_at_ms: 1,
+            newapi_access: None,
             relay: RelayProfile {
                 id: "p".into(),
                 model: "a".into(),
@@ -635,6 +636,7 @@ mod tests {
             upstream_new: Vec::new(),
             upstream_gone: Vec::new(),
             models_checked_at_ms: 1,
+            newapi_access: None,
             relay,
             extra: Default::default(),
         }
