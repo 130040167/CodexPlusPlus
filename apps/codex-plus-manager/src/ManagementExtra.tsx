@@ -36,7 +36,7 @@ type RepoInspection = Result & { repo: Repo; skills: Skill[]; skillCount: number
 type PendingSkillBatchOperation = SkillBatchOperation & { settledSkillIds: string[] };
 type RepoCheck = { state: "queued" | "running" | "done" | "failed"; message?: string };
 type SkillImportMatch = { id: string; name: string; reasons: string[]; snapshot: string };
-type SkillImportCandidate = { id: string; name: string; description: string; sourceHash: string; repoKey: string; repoPath: string; matches: SkillImportMatch[]; duplicateCandidates: string[] };
+type SkillImportCandidate = { id: string; name: string; description: string; sourceHash: string; repoKey: string; repoPath: string; matches: SkillImportMatch[]; duplicateCandidates: string[]; error: string | null };
 type SkillImportPreview = Result & { candidates: SkillImportCandidate[]; warning: string };
 type ImportRequest = { source: "local" | "cc-switch"; path: string | null; preview: SkillImportPreview; revision: number };
 const skillUpdateQueue = new SkillTaskQueue<SkillPayload>();
@@ -218,9 +218,9 @@ function SkillDetailDrawer({ skill, count, group, originGroup, groups, onAssign,
 function SkillImportDrawer({ request, busy, onClose, onRefresh, onApply }: { request: ImportRequest; busy: boolean; onClose: () => void; onRefresh: () => void;
   onApply: (selections: { id: string; sourceHash: string; repoKey: string; repoPath: string; targetId: string | null; targetSnapshot: string | null }[]) => void }) {
   const candidates = request.preview.candidates;
-  const [selected, setSelected] = useState<Set<string>>(() => new Set(candidates.filter((item) => !item.matches.length && !item.duplicateCandidates.length).map((item) => item.id)));
-  const [targets, setTargets] = useState<Record<string, string>>(() => Object.fromEntries(candidates.filter((item) => item.matches.length === 1).map((item) => [item.id, item.matches[0].id])));
-  const chosen = candidates.filter((item) => selected.has(item.id));
+  const [selected, setSelected] = useState<Set<string>>(() => new Set(candidates.filter((item) => !item.error && !item.matches.length && !item.duplicateCandidates.length).map((item) => item.id)));
+  const [targets, setTargets] = useState<Record<string, string>>(() => Object.fromEntries(candidates.filter((item) => !item.error && item.matches.length === 1).map((item) => [item.id, item.matches[0].id])));
+  const chosen = candidates.filter((item) => !item.error && selected.has(item.id));
   const invalidTargets = chosen.some((item) => item.matches.length > 0 && !item.matches.some((match) => match.id === targets[item.id]));
   const duplicateIncoming = chosen.some((item) => item.duplicateCandidates.some((id) => selected.has(id)));
   const targetList = chosen.map((item) => targets[item.id]).filter(Boolean);
@@ -234,8 +234,8 @@ function SkillImportDrawer({ request, busy, onClose, onRefresh, onApply }: { req
     {request.preview.warning && <p className="mg-notice mg-warning">{request.preview.warning}</p>}
     <p className="mg-skill-import-note">{t("覆盖时会同步已启用的 Agent 副本，并保留原版本备份。")}</p>
     <div className="mg-skill-import-toolbar"><span>{tf("共 {0} 项，已选 {1} 项", [candidates.length, chosen.length])}</span><div className="mg-row-actions">
-      <Button disabled={busy} onClick={() => setSelected(new Set(candidates.filter((item) => !item.matches.length && !item.duplicateCandidates.length).map((item) => item.id)))}>{t("选择无重复项")}</Button>
-      <Button disabled={busy} onClick={() => setSelected(new Set(candidates.map((item) => item.id)))}>{t("选择全部含覆盖")}</Button>
+      <Button disabled={busy} onClick={() => setSelected(new Set(candidates.filter((item) => !item.error && !item.matches.length && !item.duplicateCandidates.length).map((item) => item.id)))}>{t("选择无重复项")}</Button>
+      <Button disabled={busy} onClick={() => setSelected(new Set(candidates.filter((item) => !item.error).map((item) => item.id)))}>{t("选择全部含覆盖")}</Button>
       <Button disabled={busy} onClick={() => setSelected(new Set())}>{t("清空选择")}</Button>
     </div></div>
     {(invalidTargets || duplicateIncoming || duplicateTargets) && <p className="mg-notice mg-warning" role="alert">{duplicateIncoming ? t("所选导入项互相重复，请只保留其中一个。") : duplicateTargets ? t("多个导入项不能覆盖同一个已有 Skill。") : t("请为每个重复项选择要覆盖的 Skill。")}</p>}
@@ -245,9 +245,9 @@ function SkillImportDrawer({ request, busy, onClose, onRefresh, onApply }: { req
         return { value: match.id, label, title: label };
       });
       return <div className="mg-skill-import-row" key={item.id}>
-      <label><input type="checkbox" checked={selected.has(item.id)} disabled={busy} onChange={(event) => { const checked = event.currentTarget.checked; setSelected((old) => { const next = new Set(old); checked ? next.add(item.id) : next.delete(item.id); return next; }); }}/>
+      <label><input type="checkbox" checked={!item.error && selected.has(item.id)} disabled={busy || !!item.error} onChange={(event) => { const checked = event.currentTarget.checked; setSelected((old) => { const next = new Set(old); checked ? next.add(item.id) : next.delete(item.id); return next; }); }}/>
         <span><strong>{item.name || item.id}</strong><small title={item.description}>{item.id}{item.repoKey ? ` · ${item.repoKey.split("@", 1)[0]}` : ` · ${t("用户")}`}</small></span></label>
-      {item.matches.length ? <div className="mg-skill-import-target"><span>{t("覆盖已有")}</span><AppSelect value={targets[item.id] || ""} className="mg-skill-long-select" title={targetOptions.find((option) => option.value === targets[item.id])?.label || ""} ariaLabel={`${t("选择覆盖目标")} ${item.name || item.id}`} placeholder={t("选择覆盖目标")}
+      {item.error ? <small className="mg-skill-import-error" role="alert">{item.error}</small> : item.matches.length ? <div className="mg-skill-import-target"><span>{t("覆盖已有")}</span><AppSelect value={targets[item.id] || ""} className="mg-skill-long-select" title={targetOptions.find((option) => option.value === targets[item.id])?.label || ""} ariaLabel={`${t("选择覆盖目标")} ${item.name || item.id}`} placeholder={t("选择覆盖目标")}
         disabled={!selected.has(item.id) || busy} options={targetOptions}
         onChange={(target) => setTargets((old) => ({ ...old, [item.id]: target }))}/></div> : item.duplicateCandidates.length ? <small className="mg-skill-import-duplicate">{t("导入清单中重复")}</small> : <small>{t("新增")}</small>}
     </div>; })}</div>

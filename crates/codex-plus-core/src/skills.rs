@@ -5037,7 +5037,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn make_junction(link: &Path, target: &Path) {
+    pub(super) fn make_junction(link: &Path, target: &Path) {
         use std::ffi::c_void;
         use std::os::windows::ffi::OsStrExt;
         #[link(name = "kernel32")]

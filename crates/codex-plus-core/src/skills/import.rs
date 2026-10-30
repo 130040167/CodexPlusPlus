@@ -26,6 +26,7 @@ pub struct SkillImportCandidate {
     pub repo_path: String,
     pub matches: Vec<SkillImportMatch>,
     pub duplicate_candidates: Vec<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,64 +52,86 @@ impl SkillsManager {
         let state = self.load_state_checked_unlocked()?;
         let mut result = Vec::new();
         for (id, path) in candidates {
-            validate_skill_id(id)?;
-            anyhow::ensure!(
-                path.join(SKILL_MANIFEST_FILE).is_file(),
-                "{id} 没有 SKILL.md"
-            );
-            let source_hash = skill_directory_hash(path)?;
-            let (name, description) = read_skill_manifest(&path.join(SKILL_MANIFEST_FILE), id);
             let origin = origins.get(id);
-            let mut matches = self.import_matches_unlocked(&state, id, &name, &source_hash)?;
-            if let Some(origin) =
-                origin.and_then(|item| known_repository_origin(&item.repo_key, &item.repo_path))
-            {
-                for (target, installed) in &state.installed {
-                    if known_repository_origin(&installed.repo_key, &installed.repo_path).as_ref()
-                        != Some(&origin)
-                    {
-                        continue;
-                    }
-                    if let Some(existing) = matches.iter_mut().find(|item| item.id == *target) {
-                        existing.reasons.push("origin".into());
-                    } else {
-                        matches.push(SkillImportMatch {
-                            id: target.clone(),
-                            name: if installed.name.is_empty() {
-                                target.clone()
-                            } else {
-                                installed.name.clone()
-                            },
-                            reasons: vec!["origin".into()],
-                            snapshot: self.import_target_snapshot_unlocked(&state, target)?,
-                        });
-                    }
-                }
-                matches.sort_by(|left, right| left.id.cmp(&right.id));
-            }
-            result.push(SkillImportCandidate {
+            let mut candidate = SkillImportCandidate {
                 id: id.clone(),
-                name,
-                description,
-                source_hash,
+                name: id.clone(),
+                description: String::new(),
+                source_hash: String::new(),
                 repo_key: origin.map(|item| item.repo_key.clone()).unwrap_or_default(),
                 repo_path: origin
                     .map(|item| item.repo_path.clone())
                     .unwrap_or_default(),
-                matches,
+                matches: Vec::new(),
                 duplicate_candidates: Vec::new(),
-            });
+                error: None,
+            };
+            let checked = (|| -> anyhow::Result<()> {
+                validate_skill_id(id).context("导入项标识无效")?;
+                anyhow::ensure!(
+                    path.join(SKILL_MANIFEST_FILE).is_file(),
+                    "{id} 没有 SKILL.md"
+                );
+                candidate.source_hash = skill_directory_hash(path).context("检查导入源失败")?;
+                (candidate.name, candidate.description) =
+                    read_skill_manifest(&path.join(SKILL_MANIFEST_FILE), id);
+                candidate.matches = self
+                    .import_matches_unlocked(&state, id, &candidate.name, &candidate.source_hash)
+                    .context("检查已有 Skill 冲突失败")?;
+                if let Some(origin) =
+                    origin.and_then(|item| known_repository_origin(&item.repo_key, &item.repo_path))
+                {
+                    for (target, installed) in &state.installed {
+                        if known_repository_origin(&installed.repo_key, &installed.repo_path)
+                            .as_ref()
+                            != Some(&origin)
+                        {
+                            continue;
+                        }
+                        if let Some(existing) =
+                            candidate.matches.iter_mut().find(|item| item.id == *target)
+                        {
+                            existing.reasons.push("origin".into());
+                        } else {
+                            candidate.matches.push(SkillImportMatch {
+                                id: target.clone(),
+                                name: if installed.name.is_empty() {
+                                    target.clone()
+                                } else {
+                                    installed.name.clone()
+                                },
+                                reasons: vec!["origin".into()],
+                                snapshot: self
+                                    .import_target_snapshot_unlocked(&state, target)
+                                    .with_context(|| format!("无法比较已有 Skill：{target}"))?,
+                            });
+                        }
+                    }
+                    candidate
+                        .matches
+                        .sort_by(|left, right| left.id.cmp(&right.id));
+                }
+                Ok(())
+            })();
+            if let Err(error) = checked {
+                candidate.error = Some(format!("{error:#}"));
+            }
+            result.push(candidate);
         }
         let candidate_origins: Vec<_> = result
             .iter()
             .map(|item| known_repository_origin(&item.repo_key, &item.repo_path))
             .collect();
         for index in 0..result.len() {
+            if result[index].error.is_some() {
+                continue;
+            }
             result[index].duplicate_candidates = result
                 .iter()
                 .enumerate()
                 .filter(|(other, candidate)| {
                     *other != index
+                        && candidate.error.is_none()
                         && (same_name(&candidate.name, &result[index].name)
                             || candidate.source_hash == result[index].source_hash
                             || (candidate_origins[index].is_some()
@@ -163,6 +186,10 @@ impl SkillsManager {
                     continue;
                 }
             };
+            if let Some(error) = &candidate.error {
+                errors.push(format!("{}：{}", selection.id, error));
+                continue;
+            }
             if candidate.source_hash != selection.source_hash {
                 errors.push(format!("{}：导入源已变化，请重新预览", selection.id));
                 continue;
@@ -232,12 +259,27 @@ impl SkillsManager {
                 .iter()
                 .find(|item| item.id == selection.id)
                 .expect("unchanged candidate list");
+            if let Some(error) = &current.error {
+                errors.push(format!("{}：重新检查失败：{}", selection.id, error));
+                continue;
+            }
             if current.source_hash != selection.source_hash
                 || current.repo_key != selection.repo_key
                 || current.repo_path != selection.repo_path
             {
                 errors.push(format!(
                     "{}：导入源或仓库来源已变化，请重新预览",
+                    selection.id
+                ));
+                continue;
+            }
+            if current
+                .duplicate_candidates
+                .iter()
+                .any(|id| selected_ids.contains(id))
+            {
+                errors.push(format!(
+                    "{}：所选导入项的重复关系已变化，请重新预览",
                     selection.id
                 ));
                 continue;
@@ -373,18 +415,20 @@ impl SkillsManager {
             if same_name(name, &existing_name) {
                 reasons.push("name".into());
             }
-            let path = std::iter::once(self.source_dir.join(&target))
-                .chain(std::iter::once(self.linked_dir().join(&target)))
-                .chain(self.agent_dirs.iter().map(|(_, root)| root.join(&target)))
-                .find(|path| path.join(SKILL_MANIFEST_FILE).is_file());
-            if let Some(path) = path {
-                if skill_directory_hash(&path)? == source_hash {
-                    reasons.push("content".into());
-                }
+            let snapshot = self
+                .import_target_snapshot_details_unlocked(state, &target)
+                .with_context(|| format!("无法比较已有 Skill：{target}"))?;
+            if snapshot
+                .directory_hashes
+                .iter()
+                .flatten()
+                .any(|hash| hash == source_hash)
+            {
+                reasons.push("content".into());
             }
             if !reasons.is_empty() {
                 matches.push(SkillImportMatch {
-                    snapshot: self.import_target_snapshot_unlocked(state, &target)?,
+                    snapshot: snapshot.token,
                     id: target,
                     name: existing_name,
                     reasons,
@@ -431,6 +475,345 @@ mod tests {
             format!("---\nname: {name}\n---\n{body}"),
         )
         .unwrap();
+    }
+
+    fn selection(candidate: &SkillImportCandidate) -> SkillImportSelection {
+        SkillImportSelection {
+            id: candidate.id.clone(),
+            source_hash: candidate.source_hash.clone(),
+            repo_key: candidate.repo_key.clone(),
+            repo_path: candidate.repo_path.clone(),
+            target_id: None,
+            target_snapshot: None,
+        }
+    }
+
+    fn add_oversized_file(dir: &Path) {
+        std::fs::File::create(dir.join("oversized.bin"))
+            .unwrap()
+            .set_len(256 * 1024 * 1024 + 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn invalid_source_isolated_from_other_candidates_for_both_import_channels() {
+        for import_source in ["local", "cc-switch"] {
+            let (temp, manager) = fixture();
+            let bundle = temp.path().join("bundle");
+            let bad = bundle.join("bad");
+            let good = bundle.join("good");
+            write_skill(&bad, "Bad", "unsafe source");
+            write_skill(&good, "Good", "safe source");
+            add_oversized_file(&bad);
+            let candidates = local_skill_import_candidates(&bundle).unwrap();
+            let mut origins = BTreeMap::new();
+            if import_source == "cc-switch" {
+                let origin = crate::ccs_import::CcsSkillOrigin {
+                    repo_key: "owner/repo@main".into(),
+                    repo_path: "skills/shared".into(),
+                };
+                origins.insert("bad".into(), origin.clone());
+                origins.insert("good".into(), origin);
+            }
+            let preview = manager.preview_skill_import(&candidates, &origins).unwrap();
+            assert!(preview[0].error.as_ref().unwrap().contains("256 MiB"));
+            assert!(preview[1].error.is_none());
+            assert!(preview[1].duplicate_candidates.is_empty());
+            let payload = serde_json::to_value(&preview).unwrap();
+            assert!(payload[0]["error"].as_str().unwrap().contains("256 MiB"));
+            assert!(payload[1]["error"].is_null());
+            let selections: Vec<_> = preview.iter().map(selection).collect();
+            let (count, errors) = manager
+                .apply_skill_import(&candidates, &origins, import_source, &selections)
+                .unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(errors.len(), 1);
+            assert!(errors[0].contains("bad") && errors[0].contains("256 MiB"));
+            assert!(!manager.source_dir.join("bad").exists());
+            assert!(manager.source_dir.join("good/SKILL.md").is_file());
+            assert!(bad.join("oversized.bin").exists());
+            assert_eq!(
+                manager.load_state().installed["good"].import_source,
+                import_source
+            );
+        }
+    }
+
+    #[test]
+    fn source_becoming_unsafe_after_preview_does_not_block_other_selection() {
+        let (temp, manager) = fixture();
+        let bundle = temp.path().join("bundle");
+        let bad = bundle.join("bad");
+        let good = bundle.join("good");
+        write_skill(&bad, "Bad", "original");
+        write_skill(&good, "Good", "safe");
+        let candidates = local_skill_import_candidates(&bundle).unwrap();
+        let preview = manager
+            .preview_skill_import(&candidates, &BTreeMap::new())
+            .unwrap();
+        let selections: Vec<_> = preview.iter().map(selection).collect();
+        add_oversized_file(&bad);
+        let (count, errors) = manager
+            .apply_skill_import(&candidates, &BTreeMap::new(), "local", &selections)
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("bad") && errors[0].contains("256 MiB"));
+        assert!(!manager.source_dir.join("bad").exists());
+        assert!(manager.source_dir.join("good/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn failed_target_copy_comparison_never_becomes_a_new_import() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent_root = temp.path().join("agent");
+        let manager = SkillsManager::new(
+            temp.path().join("library"),
+            temp.path().join("backups"),
+            temp.path().join("state.json"),
+            temp.path().join("home"),
+        )
+        .with_agent_dirs(vec![("claude".into(), agent_root.clone())]);
+        let original = temp.path().join("original");
+        let incoming = temp.path().join("incoming");
+        write_skill(&original, "Original", "original");
+        write_skill(&incoming, "Unrelated", "incoming");
+        manager
+            .import_from_local_directory("existing", &original)
+            .unwrap();
+        manager.set_enabled_for("claude", "existing", true).unwrap();
+        let candidates = vec![("new".into(), incoming)];
+        let before = manager
+            .preview_skill_import(&candidates, &BTreeMap::new())
+            .unwrap();
+        assert!(before[0].error.is_none());
+        assert!(before[0].matches.is_empty());
+        add_oversized_file(&agent_root.join("existing"));
+        let preview = manager
+            .preview_skill_import(&candidates, &BTreeMap::new())
+            .unwrap();
+        let error = preview[0].error.as_ref().unwrap();
+        assert!(
+            error.contains("已有 Skill") && error.contains("existing") && error.contains("256 MiB")
+        );
+        for candidate in [&before[0], &preview[0]] {
+            let (count, errors) = manager
+                .apply_skill_import(
+                    &candidates,
+                    &BTreeMap::new(),
+                    "local",
+                    &[selection(candidate)],
+                )
+                .unwrap();
+            assert_eq!(count, 0);
+            assert_eq!(errors.len(), 1);
+            assert!(errors[0].contains("existing") && errors[0].contains("256 MiB"));
+        }
+        assert!(!manager.source_dir.join("new").exists());
+        assert!(
+            std::fs::read_to_string(manager.source_dir.join("existing/SKILL.md"))
+                .unwrap()
+                .contains("original")
+        );
+    }
+
+    #[test]
+    fn mixed_bad_source_and_target_allow_good_import_after_target_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent_root = temp.path().join("agent");
+        let manager = SkillsManager::new(
+            temp.path().join("library"),
+            temp.path().join("backups"),
+            temp.path().join("state.json"),
+            temp.path().join("home"),
+        )
+        .with_agent_dirs(vec![("claude".into(), agent_root.clone())]);
+        let original = temp.path().join("original");
+        let bundle = temp.path().join("bundle");
+        let bad = bundle.join("bad");
+        let good = bundle.join("good");
+        write_skill(&original, "Existing", "original");
+        write_skill(&bad, "Bad", "unsafe");
+        write_skill(&good, "Good", "safe");
+        manager
+            .import_from_local_directory("existing", &original)
+            .unwrap();
+        manager.set_enabled_for("claude", "existing", true).unwrap();
+        add_oversized_file(&bad);
+        let agent_copy = agent_root.join("existing");
+        add_oversized_file(&agent_copy);
+        let candidates = local_skill_import_candidates(&bundle).unwrap();
+        let preview = manager
+            .preview_skill_import(&candidates, &BTreeMap::new())
+            .unwrap();
+        let source_error = preview[0].error.as_ref().unwrap();
+        let target_error = preview[1].error.as_ref().unwrap();
+        assert!(source_error.contains("导入源") && source_error.contains("256 MiB"));
+        assert!(target_error.contains("已有 Skill") && target_error.contains("existing"));
+        let selections: Vec<_> = preview.iter().map(selection).collect();
+        let (count, errors) = manager
+            .apply_skill_import(&candidates, &BTreeMap::new(), "local", &selections)
+            .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(errors.len(), 2);
+        assert!(!manager.source_dir.join("bad").exists());
+        assert!(!manager.source_dir.join("good").exists());
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(agent_copy.join("oversized.bin"))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let repaired = manager
+            .preview_skill_import(&candidates, &BTreeMap::new())
+            .unwrap();
+        assert!(repaired[0].error.as_ref().unwrap().contains("导入源"));
+        assert!(repaired[1].error.is_none());
+        assert!(repaired[1].matches.is_empty());
+        let selections: Vec<_> = repaired.iter().map(selection).collect();
+        let (count, errors) = manager
+            .apply_skill_import(&candidates, &BTreeMap::new(), "local", &selections)
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("bad") && errors[0].contains("256 MiB"));
+        assert!(!manager.source_dir.join("bad").exists());
+        assert!(manager.source_dir.join("good/SKILL.md").is_file());
+        assert!(
+            std::fs::read_to_string(manager.source_dir.join("existing/SKILL.md"))
+                .unwrap()
+                .contains("original")
+        );
+    }
+
+    #[test]
+    fn duplicate_content_checks_independent_agent_copies() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent_root = temp.path().join("agent");
+        let manager = SkillsManager::new(
+            temp.path().join("library"),
+            temp.path().join("backups"),
+            temp.path().join("state.json"),
+            temp.path().join("home"),
+        )
+        .with_agent_dirs(vec![("claude".into(), agent_root.clone())]);
+        let original = temp.path().join("original");
+        let incoming = temp.path().join("incoming");
+        write_skill(&original, "Original", "original");
+        write_skill(&incoming, "Different", "agent content");
+        manager
+            .import_from_local_directory("existing", &original)
+            .unwrap();
+        manager.set_enabled_for("claude", "existing", true).unwrap();
+        write_skill(&agent_root.join("existing"), "Different", "agent content");
+        let preview = manager
+            .preview_skill_import(&[("new".into(), incoming)], &BTreeMap::new())
+            .unwrap();
+        assert!(preview[0].error.is_none());
+        assert_eq!(preview[0].matches.len(), 1);
+        assert_eq!(preview[0].matches[0].id, "existing");
+        assert!(
+            preview[0].matches[0]
+                .reasons
+                .iter()
+                .any(|reason| reason == "content")
+        );
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn internal_symlink_is_reported_per_candidate() {
+        let (temp, manager) = fixture();
+        let bad = temp.path().join("bad");
+        let good = temp.path().join("good");
+        write_skill(&bad, "Bad", "source");
+        write_skill(&good, "Good", "source");
+        #[cfg(unix)]
+        let link = std::os::unix::fs::symlink(bad.join("SKILL.md"), bad.join("link"));
+        #[cfg(windows)]
+        let link = std::os::windows::fs::symlink_file(bad.join("SKILL.md"), bad.join("link"));
+        if let Err(error) = link {
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(1314)
+            {
+                eprintln!("符号链接测试跳过：{error}");
+                return;
+            }
+            panic!("创建符号链接失败：{error}");
+        }
+        let candidates = vec![("bad".into(), bad), ("good".into(), good)];
+        let preview = manager
+            .preview_skill_import(&candidates, &BTreeMap::new())
+            .unwrap();
+        assert!(preview[0].error.as_ref().unwrap().contains("符号链接"));
+        assert!(preview[1].error.is_none());
+        let (count, errors) = manager
+            .apply_skill_import(
+                &candidates,
+                &BTreeMap::new(),
+                "local",
+                &[selection(&preview[1])],
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn internal_junction_is_reported_per_candidate() {
+        let (temp, manager) = fixture();
+        let bad = temp.path().join("bad");
+        let good = temp.path().join("good");
+        let external = temp.path().join("external");
+        write_skill(&bad, "Bad", "source");
+        write_skill(&good, "Good", "source");
+        write_skill(&external, "External", "untouched");
+        super::super::tests::make_junction(&bad.join("link"), &external);
+        let candidates = vec![("bad".into(), bad), ("good".into(), good)];
+        let preview = manager
+            .preview_skill_import(&candidates, &BTreeMap::new())
+            .unwrap();
+        assert!(preview[0].error.as_ref().unwrap().contains("符号链接"));
+        assert!(preview[1].error.is_none());
+        let selections: Vec<_> = preview.iter().map(selection).collect();
+        let (count, errors) = manager
+            .apply_skill_import(&candidates, &BTreeMap::new(), "local", &selections)
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("bad") && errors[0].contains("符号链接"));
+        assert!(!manager.source_dir.join("bad").exists());
+        assert!(manager.source_dir.join("good/SKILL.md").is_file());
+        assert!(
+            std::fs::read_to_string(external.join("SKILL.md"))
+                .unwrap()
+                .contains("untouched")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn special_file_is_reported_per_candidate() {
+        let (temp, manager) = fixture();
+        let bad = temp.path().join("bad");
+        let good = temp.path().join("good");
+        write_skill(&bad, "Bad", "source");
+        write_skill(&good, "Good", "source");
+        let _socket = std::os::unix::net::UnixListener::bind(bad.join("socket")).unwrap();
+        let candidates = vec![("bad".into(), bad), ("good".into(), good)];
+        let preview = manager
+            .preview_skill_import(&candidates, &BTreeMap::new())
+            .unwrap();
+        assert!(
+            preview[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("不支持的文件类型")
+        );
+        assert!(preview[1].error.is_none());
     }
 
     #[test]
@@ -1106,11 +1489,10 @@ mod tests {
         let incoming = temp.path().join("incoming");
         write_skill(&builtin, "Built-in", "original");
         write_skill(&incoming, "Built-in", "replacement");
-        assert!(
-            manager
-                .preview_skill_import(&[("new".into(), incoming.clone())], &BTreeMap::new())
-                .is_err()
-        );
+        let preview = manager
+            .preview_skill_import(&[("new".into(), incoming.clone())], &BTreeMap::new())
+            .unwrap();
+        assert!(preview[0].error.as_ref().unwrap().contains("内置 Skill"));
         assert!(
             manager
                 .import_from_local_directory("builtin", &incoming)

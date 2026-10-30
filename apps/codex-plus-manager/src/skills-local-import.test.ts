@@ -21,6 +21,15 @@ test("skills page previews a picked local folder before importing selected entri
   assert.match(commands, /pub async fn import_local_skills\(path: String\) -> CommandResult<SkillsPayload>/);
 });
 
+test("import preview shows per-item errors and never selects those entries", () => {
+  const drawer = extra.slice(extra.indexOf("function SkillImportDrawer"), extra.indexOf("function SortableSkillGroup"));
+  assert.match(drawer, /candidates\.filter\(\(item\) => !item\.error && !item\.matches\.length/);
+  assert.match(drawer, /candidates\.filter\(\(item\) => !item\.error && selected\.has\(item\.id\)\)/);
+  assert.match(drawer, /candidates\.filter\(\(item\) => !item\.error\)\.map\(\(item\) => item\.id\)/);
+  assert.match(drawer, /disabled=\{busy \|\| !!item\.error\}/);
+  assert.match(drawer, /item\.error \? <small className="mg-skill-import-error" role="alert">\{item\.error\}<\/small>/);
+});
+
 test("manager resumes Codex only after Skill recovery succeeds", () => {
   const start = lib.indexOf("let startup_app = app.handle().clone();");
   const end = lib.indexOf("// 网关模式", start);
