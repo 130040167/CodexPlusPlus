@@ -33,6 +33,8 @@ pub struct WeixinConnectConfig {
     #[serde(default)]
     pub allow_from: String,
     #[serde(default)]
+    pub allow_outbound_attachments: bool,
+    #[serde(default)]
     pub route_tag: String,
     #[serde(default)]
     pub work_dir: String,
@@ -51,6 +53,7 @@ impl Default for WeixinConnectConfig {
             token: String::new(),
             account_id: String::new(),
             allow_from: String::new(),
+            allow_outbound_attachments: false,
             route_tag: String::new(),
             work_dir: String::new(),
             model: String::new(),
@@ -75,6 +78,14 @@ impl WeixinConnectConfig {
         self.sandbox = normalize_sandbox(&self.sandbox);
         self.codex_path = self.codex_path.trim().to_string();
         self
+    }
+
+    pub fn validate_outbound(&self) -> anyhow::Result<()> {
+        outbound::validate_settings(
+            self.allow_outbound_attachments,
+            &self.allow_from,
+            &self.work_dir,
+        )
     }
 }
 
@@ -144,7 +155,23 @@ pub async fn run_weixin_connect_with_codex_path(
     status: SharedWeixinConnectStatus,
     codex_path: WeixinCodexPath,
 ) -> anyhow::Result<()> {
+    let outbound = outbound::OutboundPolicy::new(
+        config.allow_outbound_attachments,
+        &config.allow_from,
+        &config.work_dir,
+    );
+    run_weixin_connect_with_outbound(config, stop, status, codex_path, outbound).await
+}
+
+pub async fn run_weixin_connect_with_outbound(
+    config: WeixinConnectConfig,
+    stop: Arc<AtomicBool>,
+    status: SharedWeixinConnectStatus,
+    codex_path: WeixinCodexPath,
+    outbound: outbound::OutboundPolicy,
+) -> anyhow::Result<()> {
     let config = config.normalized();
+    config.validate_outbound()?;
     if config.token.is_empty() {
         bail!("请先扫码登录微信");
     }
@@ -255,6 +282,7 @@ pub async fn run_weixin_connect_with_codex_path(
                 &message,
                 &text,
                 &stop,
+                &outbound,
             )
             .await;
 
@@ -399,7 +427,25 @@ async fn process_weixin_message(
     message: &WeixinMessage,
     text: &str,
     stop: &AtomicBool,
+    outbound: &outbound::OutboundPolicy,
 ) -> anyhow::Result<()> {
+    let permit = outbound
+        .permit(&message.from_user_id)
+        .ok()
+        .filter(|permit| {
+            app_config.work_dir.canonicalize().ok().as_ref() == Some(&permit.workspace)
+        });
+    if text.trim() == "/reset-attachments" {
+        let reply = if permit.is_some() {
+            state.thread_ids.remove(&message.from_user_id);
+            "已重置当前联系人的微信会话。下一条消息将创建带附件工具的新会话；原会话历史保留。"
+        } else {
+            "请先开启附件回传并配置允许的微信用户和工作区，再发送 /reset-attachments。"
+        };
+        return client
+            .send_text_chunks(&message.from_user_id, reply, &message.context_token)
+            .await;
+    }
     if let Some(reason) = local_model_endpoint_unreachable_reason().await {
         bail!("{reason}");
     }
@@ -415,13 +461,17 @@ async fn process_weixin_message(
         *app_server = Some(CodexAppServer::start(app_config.clone()).await?);
     }
     let server = app_server.as_mut().context("Codex app-server 未启动")?;
+    let allow_attachments = permit.as_ref().is_some_and(|permit| permit.check().is_ok());
     let saved_thread_id = state.thread_ids.get(&message.from_user_id).cloned();
-    let thread_id = match server.prepare_thread(saved_thread_id.as_deref()).await {
+    let thread_id = match server
+        .prepare_thread_with_attachments(saved_thread_id.as_deref(), allow_attachments)
+        .await
+    {
         Ok(thread_id) => thread_id,
         Err(error) if saved_thread_id.is_some() => {
             state.thread_ids.remove(&message.from_user_id);
             server
-                .prepare_thread(None)
+                .prepare_thread_with_attachments(None, allow_attachments)
                 .await
                 .with_context(|| format!("恢复原会话失败（{error}），新建会话也失败"))?
         }
@@ -431,7 +481,17 @@ async fn process_weixin_message(
         .thread_ids
         .insert(message.from_user_id.clone(), thread_id.clone());
 
-    let turn = server.run_turn_with_images(&thread_id, &input.prompt, &input.image_paths);
+    let turn = server.run_turn_with_reply(
+        &thread_id,
+        &input.prompt,
+        &input.image_paths,
+        Some(app_server::WeixinReplyChannel {
+            client,
+            peer: &message.from_user_id,
+            context_token: &message.context_token,
+            permit,
+        }),
+    );
     tokio::pin!(turn);
     let turn_result = loop {
         tokio::select! {
@@ -757,6 +817,83 @@ mod tests {
         assert_eq!(config.executable, "");
     }
 
+    #[tokio::test]
+    async fn outbound_reset_is_explicit_authorized_and_keeps_other_contact_history() {
+        use serde_json::json;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+        let api = MockServer::start().await;
+        Mock::given(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ret":0})))
+            .mount(&api)
+            .await;
+        let client = WeixinClient::new(&api.uri(), "fixture", "").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = AppServerConfig {
+            executable: "unused".into(),
+            work_dir: workspace.path().to_path_buf(),
+            model: String::new(),
+            sandbox: "read-only".into(),
+        };
+        let policy =
+            outbound::OutboundPolicy::new(false, "peer", workspace.path().to_str().unwrap());
+        let mut state = ConnectState::default();
+        state.thread_ids.insert("peer".into(), "original".into());
+        state
+            .thread_ids
+            .insert("other".into(), "other-history".into());
+        let message: WeixinMessage = serde_json::from_value(json!({
+            "from_user_id":"peer", "context_token":"context"
+        }))
+        .unwrap();
+        let stop = AtomicBool::new(false);
+        let mut server = None;
+        process_weixin_message(
+            &client,
+            &config,
+            &mut server,
+            &mut state,
+            &message,
+            "/reset-attachments",
+            &stop,
+            &policy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.thread_ids["peer"], "original");
+        policy.set(true, "peer", workspace.path().to_str().unwrap());
+        process_weixin_message(
+            &client,
+            &config,
+            &mut server,
+            &mut state,
+            &message,
+            "/reset-attachments",
+            &stop,
+            &policy,
+        )
+        .await
+        .unwrap();
+        assert!(!state.thread_ids.contains_key("peer"));
+        assert_eq!(state.thread_ids["other"], "other-history");
+        assert!(server.is_none());
+        let requests = api.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let denied: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let accepted: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert!(
+            denied["msg"]["item_list"][0]["text_item"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("请先开启")
+        );
+        assert!(
+            accepted["msg"]["item_list"][0]["text_item"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("原会话历史保留")
+        );
+    }
+
     #[test]
     fn weixin_failure_reply_carries_a_short_first_line_reason() {
         let reply =
@@ -822,6 +959,7 @@ mod tests {
             token: "tok".to_string(),
             account_id: "unit-test-ignore".to_string(),
             allow_from: "only-me@im.wechat".to_string(),
+            allow_outbound_attachments: false,
             route_tag: String::new(),
             work_dir: work_dir.path().display().to_string(),
             model: String::new(),
