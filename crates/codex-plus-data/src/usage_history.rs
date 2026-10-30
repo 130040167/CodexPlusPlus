@@ -7,7 +7,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File, Metadata, ReadDir};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 const READ_BUDGET: u64 = 8 * 1024 * 1024;
@@ -18,14 +19,77 @@ const MAX_RECORDS: usize = 20_000;
 const MAX_TOTAL_RECORDS: usize = 100_000;
 const DISCOVERY_BUDGET: usize = 4096;
 const MAX_HOMES: usize = 2;
-static CACHE: OnceLock<Mutex<HashMap<PathBuf, HistoryIndex>>> = OnceLock::new();
+const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
+static PENDING_BYTES: AtomicUsize = AtomicUsize::new(0);
+static CACHE: OnceLock<Mutex<HistoryCache>> = OnceLock::new();
+
+#[derive(Default)]
+struct HistoryCache {
+    homes: HashMap<PathBuf, CachedHome>,
+    reaper_running: bool,
+}
+struct CachedHome {
+    index: Arc<Mutex<HistoryIndex>>,
+    touched: Instant,
+}
+impl HistoryCache {
+    fn expire(&mut self) {
+        self.homes.retain(|_, home| {
+            home.touched.elapsed() < IDLE_TIMEOUT || Arc::strong_count(&home.index) > 1
+        });
+    }
+    fn get(&mut self, home: PathBuf) -> Arc<Mutex<HistoryIndex>> {
+        self.expire();
+        if !self.homes.contains_key(&home) && self.homes.len() >= MAX_HOMES {
+            if let Some(oldest) = self
+                .homes
+                .iter()
+                .min_by_key(|(_, h)| h.touched)
+                .map(|(p, _)| p.clone())
+            {
+                self.homes.remove(&oldest);
+            }
+        }
+        let entry = self.homes.entry(home).or_insert_with(|| CachedHome {
+            index: Arc::new(Mutex::new(HistoryIndex::new())),
+            touched: Instant::now(),
+        });
+        entry.touched = Instant::now();
+        Arc::clone(&entry.index)
+    }
+}
+
+// 仅在首次查询后启动内存回收；不轮询文件，缓存清空后线程也退出。
+fn expire_idle() {
+    loop {
+        let delay = {
+            let Ok(mut cache) = CACHE.get().unwrap().lock() else {
+                return;
+            };
+            cache.expire();
+            if cache.homes.is_empty() {
+                cache.reaper_running = false;
+                return;
+            }
+            cache
+                .homes
+                .values()
+                .map(|h| IDLE_TIMEOUT.saturating_sub(h.touched.elapsed()))
+                .min()
+                .unwrap_or(IDLE_TIMEOUT)
+                .max(Duration::from_secs(1))
+        };
+        std::thread::sleep(delay);
+    }
+}
 
 /// 只释放内存，不修改会话文件。
 pub fn clear_history(codex_home: &Path) {
     if let Some(cache) = CACHE.get() {
         if let Ok(mut cache) = cache.lock() {
             if let Ok(home) = fs::canonicalize(codex_home) {
-                cache.remove(&home);
+                cache.homes.remove(&home);
             }
         }
     }
@@ -50,22 +114,25 @@ pub fn query_history(codex_home: &Path, query: &Value) -> Value {
     let Ok(home) = fs::canonicalize(codex_home) else {
         return json!({"status":"unavailable","complete":false,"message":"本机会话目录尚不可用","records":[],"updatedAt":now.timestamp_millis()});
     };
-    let Ok(mut cache) = CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock() else {
+    let Ok(mut cache) = CACHE
+        .get_or_init(|| Mutex::new(HistoryCache::default()))
+        .lock()
+    else {
         return json!({"status":"unavailable","complete":false,"message":"用量索引暂不可用","records":[],"updatedAt":now.timestamp_millis()});
     };
-    if !cache.contains_key(&home) && cache.len() >= MAX_HOMES {
-        if let Some(oldest) = cache
-            .iter()
-            .min_by_key(|(_, index)| index.touched)
-            .map(|(p, _)| p.clone())
-        {
-            cache.remove(&oldest);
-        }
+    let shared = cache.get(home.clone());
+    if !cache.reaper_running {
+        cache.reaper_running = std::thread::Builder::new()
+            .name("usage-idle-release".to_owned())
+            .spawn(expire_idle)
+            .is_ok();
     }
-    let index = cache.entry(home.clone()).or_insert_with(HistoryIndex::new);
-    index.touched = Instant::now();
+    drop(cache);
+    let Ok(mut index) = shared.lock() else {
+        return json!({"status":"unavailable","complete":false,"message":"用量索引暂不可用","records":[],"updatedAt":now.timestamp_millis()});
+    };
     index.update(&home);
-    index.response(&options, now.date_naive(), now.timestamp_millis())
+    index.cached_response(&options, now.date_naive(), now.timestamp_millis())
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
@@ -197,7 +264,7 @@ struct Record {
     usage: Option<Tokens>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct Price {
     currency: String,
     input: f64,
@@ -222,6 +289,7 @@ impl Price {
     }
 }
 
+#[derive(Clone, PartialEq)]
 struct Query {
     from: Option<NaiveDate>,
     to: Option<NaiveDate>,
@@ -515,7 +583,8 @@ struct HistoryIndex {
     roots: Vec<PathBuf>,
     last_scan: Instant,
     next_file: usize,
-    touched: Instant,
+    cached: Option<(Query, NaiveDate, Value)>,
+    retained_on: NaiveDate,
     truncated: bool,
     discovery_errors: bool,
 }
@@ -528,12 +597,15 @@ impl HistoryIndex {
             roots: Vec::new(),
             last_scan: Instant::now() - Duration::from_secs(60),
             next_file: 0,
-            touched: Instant::now(),
+            cached: None,
+            retained_on: Local::now().date_naive(),
             truncated: false,
             discovery_errors: false,
         }
     }
     fn update(&mut self, home: &Path) {
+        let scan_before = (self.discovering, self.truncated, self.discovery_errors);
+        let mut changed = false;
         if !self.discovering && self.last_scan.elapsed() >= Duration::from_secs(10) {
             self.roots = ["sessions", "archived_sessions"]
                 .into_iter()
@@ -596,34 +668,37 @@ impl HistoryIndex {
                         continue;
                     }
                     self.files.insert(path, FileIndex::new());
+                    changed = true;
                 }
             }
         }
-        // 已删除的会话应从统计移除。无法访问的文件保留未知标记，避免把错误当成零。
-        self.files.retain(|path, _| !matches!(fs::metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound));
+        changed |= scan_before != (self.discovering, self.truncated, self.discovery_errors);
         let paths: Vec<_> = self.files.keys().cloned().collect();
         if paths.is_empty() {
+            if changed {
+                self.cached = None;
+            }
             return;
         }
         let mut budget = READ_BUDGET;
         let start = self.next_file;
         for step in 0..paths.len() {
             let position = (start + step) % paths.len();
-            let file = self.files.get_mut(&paths[position]).unwrap();
-            let allowed = budget.min(FILE_READ_BUDGET);
-            let valid = fs::canonicalize(&paths[position]).ok().is_some_and(|path| {
-                path == paths[position] && self.roots.iter().any(|root| path.starts_with(root))
-            }) && fs::symlink_metadata(&paths[position])
-                .ok()
-                .is_some_and(|meta| meta.file_type().is_file());
-            if !valid {
-                file.unreadable = true;
+            // 每文件只取一次元数据；内容变化时再做规范路径及打开后身份校验。
+            let metadata = fs::symlink_metadata(&paths[position]);
+            if matches!(&metadata, Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+                self.files.remove(&paths[position]);
+                changed = true;
                 continue;
             }
-            match file.read(&paths[position], allowed) {
+            let file = self.files.get_mut(&paths[position]).unwrap();
+            let before = file.revision();
+            let allowed = budget.min(FILE_READ_BUDGET);
+            match metadata.and_then(|meta| file.read_observed(&paths[position], allowed, &meta)) {
                 Ok(consumed) => budget = budget.saturating_sub(consumed),
                 Err(_) => file.unreadable = true,
             }
+            changed |= before != file.revision();
             self.next_file = (position + 1) % paths.len();
             if budget == 0 {
                 break;
@@ -631,6 +706,7 @@ impl HistoryIndex {
         }
         let count: usize = self.files.values().map(|file| file.records.len()).sum();
         if count > MAX_TOTAL_RECORDS {
+            changed = true;
             let mut remove = count - MAX_TOTAL_RECORDS;
             for file in self.files.values_mut() {
                 let n = remove.min(file.records.len());
@@ -647,6 +723,53 @@ impl HistoryIndex {
                 }
             }
         }
+        if changed {
+            self.cached = None;
+        }
+    }
+    fn cached_response(&mut self, query: &Query, today: NaiveDate, now: i64) -> Value {
+        // 保留期随日期推进，与文件是否变化无关；归档只收拢明细，累计总量保留。
+        if self.retained_on != today {
+            for file in self.files.values_mut() {
+                file.retain_recent(today);
+            }
+            self.retained_on = today;
+            self.cached = None;
+        }
+        if self
+            .cached
+            .as_ref()
+            .is_none_or(|(old, date, _)| old != query || *date != today)
+        {
+            self.cached = Some((query.clone(), today, self.response(query, today, now)));
+        }
+        let mut response = self.cached.as_ref().unwrap().2.clone();
+        response["updatedAt"] = json!(now);
+        // 时间状态不依赖文件变化，缓存命中时仍按当前时间更新。
+        for field in ["rateLimits", "machineSummary"] {
+            let limits = if field == "rateLimits" {
+                response.get_mut(field)
+            } else {
+                response.get_mut(field).and_then(|v| v.get_mut("windows"))
+            };
+            if let Some(limits) = limits.and_then(Value::as_array_mut) {
+                for limit in limits {
+                    limit["expired"] =
+                        json!(limit["resetAt"].as_i64().is_some_and(|t| t <= now / 1000));
+                }
+            }
+        }
+        if let Some(windows) = response["codex"]["windows"].as_object_mut() {
+            for window in windows.values_mut() {
+                window["expired"] = json!(window["resetAt"].as_i64().is_some_and(|t| t <= now));
+            }
+        }
+        response["codex"]["stale"] = json!(
+            response["machineSummary"]["rateLimitsTs"]
+                .as_i64()
+                .is_none_or(|t| now / 1000 - t > 120)
+        );
+        response
     }
     fn response(&self, query: &Query, today: NaiveDate, now: i64) -> Value {
         let mut effective: BTreeMap<&str, &FileIndex> = BTreeMap::new();
@@ -659,7 +782,6 @@ impl HistoryIndex {
                 effective.insert(id, file);
             }
         }
-        let effective: Vec<_> = effective.into_values().collect();
         let mut record_map: BTreeMap<String, Record> = BTreeMap::new();
         let mut limits = Vec::new();
         let mut latest_limit = i64::MIN;
@@ -676,9 +798,11 @@ impl HistoryIndex {
             }
             incomplete_records |=
                 file.truncated || file.invalid_usage || file.pending.len() > 0 || file.skipping;
-            if effective
-                .iter()
-                .any(|candidate| std::ptr::eq(*candidate, file))
+            if file
+                .session
+                .as_deref()
+                .and_then(|id| effective.get(id))
+                .is_some_and(|candidate| std::ptr::eq(*candidate, file))
             {
                 archived_records += file
                     .archived_all
@@ -704,6 +828,7 @@ impl HistoryIndex {
                 }
             }
         }
+        let effective: Vec<_> = effective.into_values().collect();
         let mut records: Vec<_> = record_map.into_values().collect();
         records.sort_by(|a, b| {
             record_timestamp(b)
@@ -998,6 +1123,115 @@ impl HistoryIndex {
     }
 }
 
+// 只为跨读取边界的半行保留空间；所有 home 共用总量上限，Drop 同步归还。
+#[derive(Default)]
+struct PendingLine(Vec<u8>);
+impl PendingLine {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn extend(&mut self, part: &[u8]) -> bool {
+        if self.0.capacity() == 0 {
+            if PENDING_BYTES
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    n.checked_add(MAX_LINE).filter(|n| *n <= MAX_PENDING_BYTES)
+                })
+                .is_err()
+            {
+                return false;
+            }
+            self.0 = Vec::with_capacity(MAX_LINE);
+        }
+        self.0.extend_from_slice(part);
+        true
+    }
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+impl Drop for PendingLine {
+    fn drop(&mut self) {
+        if self.0.capacity() != 0 {
+            PENDING_BYTES.fetch_sub(MAX_LINE, Ordering::AcqRel);
+        }
+    }
+}
+
+// 仅辨认 JSON 顶层和 payload 的 type，不匹配图片、文本里的同名字符串。
+// 无法从有限前缀确认类型时保持保守，避免跳过真实用量后声称完整。
+struct UsagePrefix<'a> {
+    payload: bool,
+    result: &'a std::cell::Cell<Option<bool>>,
+}
+impl<'de> serde::de::DeserializeSeed<'de> for UsagePrefix<'_> {
+    type Value = bool;
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<bool, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+impl<'de> serde::de::Visitor<'de> for UsagePrefix<'_> {
+    type Value = bool;
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("rollout event")
+    }
+    fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<bool, M::Error> {
+        let mut event_msg = false;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "type" {
+                let kind = map.next_value::<String>()?;
+                if self.payload {
+                    let relevant = matches!(
+                        kind.as_str(),
+                        "token_count"
+                            | "task_started"
+                            | "turn_started"
+                            | "task_complete"
+                            | "turn_completed"
+                            | "task_failed"
+                            | "turn_aborted"
+                            | "task_aborted"
+                            | "error"
+                            | "stream_error"
+                    );
+                    self.result.set(Some(relevant));
+                    return Ok(relevant);
+                }
+                match kind.as_str() {
+                    "session_meta" | "turn_context" => {
+                        self.result.set(Some(true));
+                        return Ok(true);
+                    }
+                    "event_msg" => event_msg = true,
+                    _ => {
+                        self.result.set(Some(false));
+                        return Ok(false);
+                    }
+                }
+            } else if key == "payload" && event_msg {
+                return map.next_value_seed(UsagePrefix {
+                    payload: true,
+                    result: self.result,
+                });
+            } else {
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+        }
+        Ok(true)
+    }
+}
+fn oversized_may_affect_usage(prefix: &[u8]) -> bool {
+    let result = std::cell::Cell::new(None);
+    // 前缀可能没有闭合括号；已确认的类型独立保存，不依赖完整 JSON 解析成功。
+    let _ = serde::Deserializer::deserialize_map(
+        &mut serde_json::Deserializer::from_slice(prefix),
+        UsagePrefix {
+            payload: false,
+            result: &result,
+        },
+    );
+    result.get().unwrap_or(true)
+}
+
 struct FileIndex {
     session: Option<String>,
     expected_id: Option<String>,
@@ -1011,7 +1245,7 @@ struct FileIndex {
     archived_days: BTreeMap<(NaiveDate, String), Archived>,
     undated_archived: usize,
     offset: u64,
-    pending: Vec<u8>,
+    pending: PendingLine,
     skipping: bool,
     identity: Option<(u64, u64)>,
     created: Option<SystemTime>,
@@ -1039,7 +1273,7 @@ impl FileIndex {
             archived_days: BTreeMap::new(),
             undated_archived: 0,
             offset: 0,
-            pending: Vec::new(),
+            pending: PendingLine::default(),
             skipping: false,
             identity: None,
             created: None,
@@ -1053,8 +1287,48 @@ impl FileIndex {
             plan_type: None,
         }
     }
-    fn read(&mut self, path: &Path, budget: u64) -> std::io::Result<u64> {
-        let before = fs::symlink_metadata(path)?;
+    fn revision(
+        &self,
+    ) -> (
+        u64,
+        Option<(u64, u64)>,
+        Option<SystemTime>,
+        Option<SystemTime>,
+        bool,
+        bool,
+        bool,
+        usize,
+        bool,
+    ) {
+        (
+            self.offset,
+            self.identity,
+            self.created,
+            self.modified,
+            self.unreadable,
+            self.catching_up,
+            self.verified,
+            self.pending.len(),
+            self.skipping,
+        )
+    }
+    fn read_observed(
+        &mut self,
+        path: &Path,
+        budget: u64,
+        before: &Metadata,
+    ) -> std::io::Result<u64> {
+        let observed_identity = observed_file_identity(path, before)?;
+        if before.file_type().is_file()
+            && self.expected_id.is_some()
+            && !self.unreadable
+            && before.len() == self.offset
+            && self.identity == observed_identity
+            && self.created == before.created().ok()
+            && self.modified == before.modified().ok()
+        {
+            return Ok(0);
+        }
         if !before.file_type().is_file() || fs::canonicalize(path)? != path {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -1063,13 +1337,13 @@ impl FileIndex {
         }
         let mut file = File::open(path)?;
         let meta = file.metadata()?;
-        if file_identity(&meta) != file_identity(&before) || fs::canonicalize(path)? != path {
+        let identity = opened_file_identity(&file, &meta)?;
+        if identity != observed_identity || fs::canonicalize(path)? != path {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "rollout identity changed",
             ));
         }
-        let identity = file_identity(&meta);
         let created = meta.created().ok();
         let modified = meta.modified().ok();
         if meta.len() < self.offset
@@ -1088,30 +1362,54 @@ impl FileIndex {
         file.seek(SeekFrom::Start(self.offset))?;
         let mut bytes = Vec::new();
         file.take(budget).read_to_end(&mut bytes)?;
-        self.offset += bytes.len() as u64;
-        self.catching_up = self.offset < meta.len();
+        let mut processed = 0;
         for part in bytes.split_inclusive(|b| *b == b'\n') {
+            if !self.skipping
+                && self.pending.len() == 0
+                && part.len() <= MAX_LINE
+                && part.last() == Some(&b'\n')
+            {
+                self.accept(part);
+                processed += part.len();
+                continue;
+            }
             if !self.skipping {
                 if self.pending.len() + part.len() <= MAX_LINE {
-                    self.pending.extend_from_slice(part);
+                    // 缓冲预算不足时停在本段之前；之后继续，不丢弃半行或用量。
+                    if !self.pending.extend(part) {
+                        break;
+                    }
                 } else {
+                    let remaining = MAX_LINE - self.pending.len();
+                    if self.pending.len() == 0 {
+                        self.invalid_usage |= oversized_may_affect_usage(&part[..MAX_LINE]);
+                    } else {
+                        self.pending.extend(&part[..remaining]);
+                        self.invalid_usage |= oversized_may_affect_usage(&self.pending.0);
+                    }
                     self.pending.clear();
                     self.skipping = true;
-                    self.invalid_usage = true;
                 }
             }
             if part.last() == Some(&b'\n') {
                 if !self.skipping {
                     let line = std::mem::take(&mut self.pending);
-                    self.accept(&line);
+                    self.accept(&line.0);
                 }
                 self.pending.clear();
                 self.skipping = false;
             }
+            processed += part.len();
         }
+        self.offset += processed as u64;
+        self.catching_up = self.offset < meta.len();
+        self.retain_recent(Local::now().date_naive());
+        Ok(bytes.len() as u64)
+    }
+    fn retain_recent(&mut self, today: NaiveDate) {
         // 追平前不按年龄归档：同一历史轮次可能跨越两次读取预算。
         if !self.catching_up {
-            let cutoff = Local::now().date_naive() - ChronoDuration::days(89);
+            let cutoff = today - ChronoDuration::days(89);
             let mut retained = VecDeque::new();
             while let Some(record) = self.records.pop_front() {
                 if record.date.is_some_and(|day| day < cutoff) {
@@ -1122,10 +1420,9 @@ impl FileIndex {
             }
             self.records = retained;
         }
-        let daily_cutoff = Local::now().date_naive() - ChronoDuration::days(364);
+        let daily_cutoff = today - ChronoDuration::days(364);
         self.archived_days
             .retain(|(day, _), _| *day >= daily_cutoff);
-        Ok(bytes.len() as u64)
     }
     fn archive_record(&mut self, record: Record) {
         let model = record.model.clone().unwrap_or_default();
@@ -1407,7 +1704,49 @@ fn file_identity(meta: &Metadata) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     Some((meta.dev(), meta.ino()))
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn file_identity(_: &Metadata) -> Option<(u64, u64)> {
     None
+}
+
+fn observed_file_identity(path: &Path, meta: &Metadata) -> std::io::Result<Option<(u64, u64)>> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        // 零访问权限只查文件身份，避免未变文件打开内容；NTFS 轮转可能保留创建时间。
+        let file = fs::OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(path)?;
+        opened_file_identity(&file, meta)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(file_identity(meta))
+    }
+}
+fn opened_file_identity(file: &File, meta: &Metadata) -> std::io::Result<Option<(u64, u64)>> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let _ = meta;
+        let mut identity = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut identity) }
+            .map_err(std::io::Error::other)?;
+        Ok(Some((
+            identity.dwVolumeSerialNumber as u64,
+            (identity.nFileIndexHigh as u64) << 32 | identity.nFileIndexLow as u64,
+        )))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        Ok(file_identity(meta))
+    }
 }
