@@ -128,6 +128,7 @@ pub(crate) async fn probe(target: &BillingTarget) -> RelayBillingProbe {
         usage,
         detail,
         outcome,
+        newapi_access: None,
     }
 }
 

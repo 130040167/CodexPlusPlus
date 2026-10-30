@@ -1219,39 +1219,32 @@ fn launch_codex_multi_instance_blocking(request: CodexMultiLaunchRequest) -> Com
         );
     }
 
-    // 官方 profile 通常没有 authContents；复制一次当前默认 CODEX_HOME 的登录态，
-    // 用户也可以在新窗口中重新登录。纯 API 实例不复制官方 auth，避免两个身份
-    // 重新混在一起。永远不覆盖实例已有 auth.json。
     let default_home = codex_plus_core::relay_config::default_codex_home_dir();
-    let instance_auth = codex_home.join("auth.json");
-    if profile.relay_mode == codex_plus_core::settings::RelayMode::Official
-        && !instance_auth.exists()
-    {
-        let default_auth = default_home.join("auth.json");
-        if let Ok(contents) = std::fs::read(&default_auth) {
-            let _ = codex_plus_core::settings::atomic_write(&instance_auth, &contents);
-        }
-    }
     let common_config = if settings.relay_profiles_enabled {
         settings.relay_common_config_contents.as_str()
     } else {
         ""
     };
-    if let Err(error) = codex_plus_core::relay_config::apply_relay_profile_with_preservation(
+    // 纯 API 实例写入的是去掉 ChatGPT 登录态后的 profile（#2794），worker 设置也用它。
+    let profile = match write_multi_instance_codex_home(
         &codex_home,
+        &default_home,
         &profile,
         common_config,
         helper_port,
         settings.relay_preserve_nonprovider_settings,
     ) {
-        return failed(
-            &format!("应用供应商到多开实例失败：{error}"),
-            json!({
-                "profileId": profile_id,
-                "codexHome": codex_home.to_string_lossy()
-            }),
-        );
-    }
+        Ok(profile) => profile,
+        Err(error) => {
+            return failed(
+                &format!("应用供应商到多开实例失败：{error}"),
+                json!({
+                    "profileId": profile_id,
+                    "codexHome": codex_home.to_string_lossy()
+                }),
+            );
+        }
+    };
     if let Err(error) = absolutize_multi_instance_model_catalog(&codex_home) {
         return failed(
             &format!("修正多开实例 model_catalog_json 路径失败：{error}"),
@@ -2176,6 +2169,43 @@ fn absolutize_multi_instance_model_catalog(home: &Path) -> anyhow::Result<()> {
     doc["model_catalog_json"] = toml_edit::value(absolute.to_string_lossy().to_string());
     codex_plus_core::settings::atomic_write(&config_path, doc.to_string().as_bytes())?;
     Ok(())
+}
+
+/// 把供应商写进多开实例自己的 CODEX_HOME，返回实际写入的 profile。
+///
+/// - 官方登录（含官方 + API 混合）：实例还没有 auth.json 时复制一次主实例的登录态，
+///   用户也可以在新窗口里重新登录；永远不覆盖实例已有 auth.json。
+/// - 纯 API（#2794）：不复制主实例的 auth，并且先经
+///   `pure_api_profile_for_isolated_instance` 去掉快照里残留的 ChatGPT 登录态、把
+///   `openai` 会话身份改回 `custom`。否则实例会以主进程的官方账号登录、消耗官方额度。
+///
+/// 只读主实例的 `default_home`，不改动它。
+fn write_multi_instance_codex_home(
+    codex_home: &Path,
+    default_home: &Path,
+    profile: &RelayProfile,
+    common_config: &str,
+    helper_port: u16,
+    preserve_nonprovider: bool,
+) -> anyhow::Result<RelayProfile> {
+    let instance_auth = codex_home.join("auth.json");
+    if profile.relay_mode == codex_plus_core::settings::RelayMode::Official
+        && !instance_auth.exists()
+    {
+        let default_auth = default_home.join("auth.json");
+        if let Ok(contents) = std::fs::read(&default_auth) {
+            let _ = codex_plus_core::settings::atomic_write(&instance_auth, &contents);
+        }
+    }
+    let profile = codex_plus_core::relay_config::pure_api_profile_for_isolated_instance(profile)?;
+    codex_plus_core::relay_config::apply_relay_profile_with_preservation(
+        codex_home,
+        &profile,
+        common_config,
+        helper_port,
+        preserve_nonprovider,
+    )?;
+    Ok(profile)
 }
 
 fn seed_multi_instance_onboarding_state(home: &Path) -> anyhow::Result<()> {
@@ -4776,8 +4806,31 @@ pub async fn list_project_sessions(
 }
 
 fn normalized_project_path(path: &str) -> String {
-    // 与前端 sessionGroups 一致：只统一分隔符和末尾斜杠，保留大小写及路径中的空格。
-    path.replace('\\', "/").trim_end_matches('/').to_string()
+    // 与前端 normalizeProjectPath 一致：统一分隔符和末尾斜杠，保留大小写及路径中的空格；
+    // 去掉 Windows 长路径前缀（\\?\C:\ → C:/，\\?\UNC\srv\share → //srv/share），
+    // 否则同一项目带不带前缀会被当成两个目录（#2791）。
+    let path = path.replace('\\', "/");
+    let path = path.trim_end_matches('/');
+    for prefix in ["//?/", "//./"] {
+        let Some(rest) = path.strip_prefix(prefix) else {
+            continue;
+        };
+        if rest
+            .get(..4)
+            .is_some_and(|head| head.eq_ignore_ascii_case("UNC/"))
+        {
+            return format!("//{}", &rest[4..]);
+        }
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes.len() == 2 || bytes[2] == b'/')
+        {
+            return rest.to_string();
+        }
+    }
+    path.to_string()
 }
 
 fn list_project_sessions_blocking(cwd: String) -> CommandResult<LocalSessionsPayload> {
@@ -5411,6 +5464,10 @@ fn merge_manual_provider_sync_targets(
     codex_home: Option<&Path>,
 ) {
     for id in manual {
+        // 旧版本可能把内部会话别名存进已保存列表；它不是可选目标，不再补回列表（#2791）。
+        if codex_plus_data::is_provider_sync_internal_alias(id) {
+            continue;
+        }
         if let Some(existing) = targets.targets.iter_mut().find(|target| target.id == *id) {
             if !existing
                 .sources
@@ -6825,7 +6882,7 @@ pub async fn check_update() -> CommandResult<Value> {
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 #[tauri::command]
 pub async fn perform_update(
     app: tauri::AppHandle,
@@ -6862,7 +6919,7 @@ pub async fn perform_update(
     result
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 #[tauri::command]
 pub async fn perform_update(
     release: Option<codex_plus_core::update::Release>,
@@ -9247,9 +9304,17 @@ fn open_url(url: &str) -> anyhow::Result<()> {
     {
         codex_plus_core::windows_open_url(url)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!("启动系统浏览器失败：{error}"))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
             .arg(url)
             .spawn()
             .map(|_| ())
@@ -10268,6 +10333,36 @@ base_url = "https://example.invalid/v1"
     }
 
     #[test]
+    fn saved_internal_session_alias_is_not_merged_back_into_sync_targets() {
+        // #2791：旧版本存下的内部别名不能再以「选不了」的选项挂回同步目标。
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\n",
+        )
+        .unwrap();
+        let mut settings = BackendSettings::default();
+        settings.provider_sync_saved_providers =
+            vec!["custom".to_string(), "codex_plus_managed".to_string()];
+        let manual = settings.provider_sync_saved_providers.clone();
+        let mut targets = codex_plus_data::ProviderSyncTargetList {
+            current_provider: "custom".to_string(),
+            targets: Vec::new(),
+        };
+
+        merge_manual_provider_sync_targets(&mut targets, &manual, &settings, Some(temp.path()));
+
+        assert_eq!(
+            targets
+                .targets
+                .iter()
+                .map(|target| target.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["custom"]
+        );
+    }
+
+    #[test]
     fn provider_sync_synced_is_reported_as_command_success() {
         let result = provider_sync_command_result(provider_sync_result_for_test(
             codex_plus_data::ProviderSyncStatus::Synced,
@@ -11259,6 +11354,20 @@ base_url = "https://example.invalid/v1"
             "C:/Projects/Foo"
         );
         assert_eq!(normalized_project_path("/Projects/Foo///"), "/Projects/Foo");
+        // Windows 长路径前缀不进入项目身份（#2791）。
+        assert_eq!(
+            normalized_project_path(r"\\?\C:\Projects\Foo\"),
+            "C:/Projects/Foo"
+        );
+        assert_eq!(
+            normalized_project_path(r"\\?\UNC\server\share\Foo"),
+            normalized_project_path(r"\\server\share\Foo")
+        );
+        assert_eq!(normalized_project_path(r"\\?\C:\"), "C:");
+        assert_eq!(
+            normalized_project_path(r"\\?\Volume{abc}\Foo"),
+            "//?/Volume{abc}/Foo"
+        );
         assert_ne!(
             normalized_project_path("/Projects/Foo"),
             normalized_project_path("/Projects/foo")
@@ -12145,6 +12254,81 @@ model_reasoning_effort = "high"
         assert!(first > 0);
         assert!(second > 0);
         assert_ne!(first, second);
+    }
+
+    const MAIN_CHATGPT_AUTH: &str = "{\n  \"auth_mode\": \"chatgpt\",\n  \"tokens\": {\n    \"id_token\": \"main-id\",\n    \"access_token\": \"main-access\",\n    \"refresh_token\": \"main-refresh\",\n    \"account_id\": \"acct-main\"\n  },\n  \"last_refresh\": \"2026-10-01T00:00:00Z\"\n}\n";
+
+    #[test]
+    fn multi_instance_pure_api_does_not_inherit_main_chatgpt_login() {
+        // issue #2794：主实例官方登录，用纯 API 供应商多开，实例只能用供应商 Key。
+        let temp = tempfile::tempdir().unwrap();
+        let main_home = temp.path().join("main-codex");
+        let instance_home = temp.path().join("instance/codex-home");
+        std::fs::create_dir_all(&main_home).unwrap();
+        std::fs::create_dir_all(&instance_home).unwrap();
+        std::fs::write(main_home.join("auth.json"), MAIN_CHATGPT_AUTH).unwrap();
+        std::fs::write(main_home.join("config.toml"), "model = \"gpt-5.5\"\n").unwrap();
+        // 旧版本留在实例里的官方登录态也要被换掉。
+        std::fs::write(instance_home.join("auth.json"), MAIN_CHATGPT_AUTH).unwrap();
+        // 从官方 profile 改成纯 API 时，快照会留着 ChatGPT tokens；会话身份选的是 openai。
+        let mut snapshot: Value = serde_json::from_str(MAIN_CHATGPT_AUTH).unwrap();
+        snapshot["OPENAI_API_KEY"] = json!("sk-relay");
+        let profile = RelayProfile {
+            id: "relay".into(),
+            name: "中转".into(),
+            relay_mode: RelayMode::PureApi,
+            protocol: codex_plus_core::settings::RelayProtocol::Responses,
+            config_contents: "model_provider = \"openai\"\nmodel = \"gpt-5.5\"\nopenai_base_url = \"http://127.0.0.1:57321/v1\"\n\n[model_providers.custom]\nname = \"中转\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nbase_url = \"https://relay.example.com/v1\"\nexperimental_bearer_token = \"sk-relay\"\n".into(),
+            auth_contents: serde_json::to_string_pretty(&snapshot).unwrap(),
+            api_key: "sk-relay".into(),
+            ..RelayProfile::default()
+        };
+
+        let written =
+            write_multi_instance_codex_home(&instance_home, &main_home, &profile, "", 61234, false)
+                .unwrap();
+
+        let auth: Value =
+            serde_json::from_str(&std::fs::read_to_string(instance_home.join("auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(auth, json!({ "OPENAI_API_KEY": "sk-relay" }));
+        let config = std::fs::read_to_string(instance_home.join("config.toml")).unwrap();
+        let doc = config.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(doc["model_provider"].as_str(), Some("custom"), "{config}");
+        assert!(doc.get("openai_base_url").is_none(), "{config}");
+        let provider = &doc["model_providers"]["custom"];
+        assert_eq!(provider["base_url"].as_str(), Some("https://relay.example.com/v1"));
+        assert_eq!(provider["experimental_bearer_token"].as_str(), Some("sk-relay"));
+        assert_ne!(provider.get("requires_openai_auth").and_then(|v| v.as_bool()), Some(true));
+        assert!(!written.auth_contents.contains("tokens"));
+        // 主实例的登录态原样保留。
+        assert_eq!(
+            std::fs::read_to_string(main_home.join("auth.json")).unwrap(),
+            MAIN_CHATGPT_AUTH
+        );
+    }
+
+    #[test]
+    fn multi_instance_official_profile_still_copies_main_login() {
+        let temp = tempfile::tempdir().unwrap();
+        let main_home = temp.path().join("main-codex");
+        let instance_home = temp.path().join("instance/codex-home");
+        std::fs::create_dir_all(&main_home).unwrap();
+        std::fs::create_dir_all(&instance_home).unwrap();
+        std::fs::write(main_home.join("auth.json"), MAIN_CHATGPT_AUTH).unwrap();
+        let profile = RelayProfile {
+            id: "official".into(),
+            relay_mode: RelayMode::Official,
+            ..RelayProfile::default()
+        };
+
+        write_multi_instance_codex_home(&instance_home, &main_home, &profile, "", 61235, false)
+            .unwrap();
+
+        let auth: Value =
+            serde_json::from_str(&std::fs::read_to_string(instance_home.join("auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(auth["tokens"]["account_id"], json!("acct-main"));
     }
 
     #[test]

@@ -265,6 +265,7 @@ fn apply_model_changes(
     let gone = |name: &str| has_model(&removed, name) && !has_model(&list, name);
     provider.model_prices.retain(|name, _| !gone(name));
     provider.model_windows.retain(|name, _| !gone(name));
+    provider.upstream_meta.retain_models(|name| !gone(name));
     provider.relay.model_metadata = prune_model_metadata(&provider.relay.model_metadata, &gone);
     provider.upstream_new.clear();
     provider.upstream_gone.clear();
@@ -588,6 +589,8 @@ mod tests {
             upstream_new: vec!["b".into()],
             upstream_gone: vec!["x".into()],
             models_checked_at_ms: 1,
+            newapi_access: None,
+            upstream_meta: Default::default(),
             relay: RelayProfile {
                 id: "p".into(),
                 model: "a".into(),
@@ -635,6 +638,8 @@ mod tests {
             upstream_new: Vec::new(),
             upstream_gone: Vec::new(),
             models_checked_at_ms: 1,
+            newapi_access: None,
+            upstream_meta: Default::default(),
             relay,
             extra: Default::default(),
         }

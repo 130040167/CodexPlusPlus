@@ -3152,6 +3152,15 @@ impl ChatSseToResponsesConverter {
         self.state.latest_usage.as_ref()
     }
 
+    /// 本次请求的用量（请求日志 / 网关用量统计用），按上游原始 usage 解析，
+    /// 口径与非流式请求一致（#2803）。
+    pub(crate) fn request_usage(&self) -> Option<crate::request_log::RequestUsage> {
+        self.state
+            .upstream_usage
+            .as_ref()
+            .and_then(crate::request_log::usage_from_usage_value)
+    }
+
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
         append_utf8_safe(&mut self.buffer, &mut self.utf8_remainder, bytes);
         let mut output = String::new();
@@ -3585,6 +3594,9 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     let strict_aggregate_model = aggregate_model.is_some() || forced.is_some();
     let relay_count = relays.len();
     let mut exec_negotiation_used = false;
+    // 网关模式（#2802）：上游 429 不在这里对同一个 Key 退避重发——那只会让同一个 Key 在限流中
+    // 再挨几次、拖住换 Key；交给网关去冷却这个 Key、换下一个，或都在冷却时等最早恢复的那个。
+    let gateway_forced = forced.is_some();
     let mut auto_retry = if forced.as_ref().is_some_and(|forced| !forced.auto_retry) {
         None
     } else {
@@ -4419,7 +4431,9 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             let retry_after = exec_retry_after_duration(upstream.headers(), SystemTime::now());
             let scheduled = auto_retry
                 .as_mut()
-                .filter(|retry| retry.retries_status(status_code))
+                .filter(|retry| {
+                    retry.retries_status(status_code) && !(gateway_forced && status_code == 429)
+                })
                 .and_then(|retry| {
                     retry
                         .schedule(retry_after)
@@ -6485,6 +6499,8 @@ struct ChatSseState {
     tools: BTreeMap<usize, ToolCallState>,
     output_items: Vec<(u32, Value)>,
     latest_usage: Option<Value>,
+    /// 上游原始 usage，逐块合并：Anthropic 的输入在 message_start、输出在 message_delta 里分开到。
+    upstream_usage: Option<Value>,
     finish_reason: Option<String>,
     tool_context: CodexToolContext,
     original_request: Option<Value>,
@@ -6505,6 +6521,7 @@ impl Default for ChatSseState {
             tools: BTreeMap::new(),
             output_items: Vec::new(),
             latest_usage: None,
+            upstream_usage: None,
             finish_reason: None,
             tool_context: CodexToolContext::default(),
             original_request: None,
@@ -6538,6 +6555,12 @@ impl ChatSseState {
 
         if let Some(usage) = chunk.get("usage").filter(|value| !value.is_null()) {
             self.latest_usage = Some(chat_usage_to_responses_usage(Some(usage)));
+            match (self.upstream_usage.as_mut(), usage.as_object()) {
+                (Some(Value::Object(merged)), Some(fields)) => {
+                    merged.extend(fields.iter().map(|(key, value)| (key.clone(), value.clone())));
+                }
+                _ => self.upstream_usage = Some(usage.clone()),
+            }
         }
 
         let Some(choice) = chunk
