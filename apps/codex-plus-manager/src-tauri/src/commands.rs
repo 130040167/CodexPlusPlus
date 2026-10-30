@@ -132,7 +132,9 @@ pub async fn claude_localization_set_voice_input(enabled: bool) -> CommandResult
             sync_resident_helper();
         }
         status
-    }).await {
+    })
+    .await
+    {
         Ok(Ok(status)) => ok(
             if enabled {
                 "语音输入已开启。"
@@ -192,9 +194,7 @@ pub async fn claude_localization_set_bash_timeout(
 ) -> CommandResult<Value> {
     match tauri::async_runtime::spawn_blocking(move || {
         codex_plus_core::claude_localization::set_bash_timeout(timeout)
-    })
-    .await
-    {
+    }).await {
         Ok(Ok(status)) => ok(
             "Bash 时间限制设置已保存；重启增强版后生效。",
             serde_json::to_value(status).unwrap_or_else(|_| json!({})),
@@ -3582,7 +3582,6 @@ fn spawn_weixin_connect(
         codex_path: settings.weixin_connect_codex_path,
     }
     .normalized();
-    config.validate_outbound()?;
     if config.token.is_empty() {
         anyhow::bail!("微信连接 token 为空");
     }
@@ -3748,23 +3747,6 @@ pub fn save_settings(
         settings.settings_revision = revision;
     }
     let settings = normalize_settings_before_save(settings);
-    if let Err(error) = codex_plus_core::connect::outbound::validate_settings(
-        settings.weixin_connect_allow_outbound_attachments,
-        &settings.weixin_connect_allow_from,
-        &settings.weixin_connect_work_dir,
-    ) {
-        return failed(
-            &error.to_string(),
-            SettingsPayload {
-                revision: settings.settings_revision.clone(),
-                settings,
-                settings_path: codex_plus_core::paths::default_settings_path()
-                    .to_string_lossy()
-                    .to_string(),
-                user_scripts: user_script_inventory(),
-            },
-        );
-    }
     // 保存诊断：供应商模型列表被改小/改大时能直接看出「提交上来的到底是什么」。
     // 用户反馈过「删掉一行保存后又变回三行」，只有把每次保存的行数记下来才能区分
     // 「界面没提交改动」和「提交了又被别处覆盖」。
@@ -3794,6 +3776,19 @@ pub fn save_settings(
     };
     let store = SettingsStore::default();
     let previous = store.load().unwrap_or_default();
+    if let Err(error) = codex_plus_core::connect::outbound::validate_settings_change(&previous, &settings) {
+        return failed(
+            &error.to_string(),
+            SettingsPayload {
+                revision: settings.settings_revision.clone(),
+                settings,
+                settings_path: codex_plus_core::paths::default_settings_path()
+                    .to_string_lossy()
+                    .to_string(),
+                user_scripts: user_script_inventory(),
+            },
+        );
+    }
     let dream_skin_enabled = settings.enhancements_enabled && settings.codex_app_dream_skin_enabled;
     if let Err(error) = codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
         dream_skin_enabled,

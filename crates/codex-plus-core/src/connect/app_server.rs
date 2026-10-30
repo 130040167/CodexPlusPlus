@@ -382,6 +382,9 @@ impl CodexAppServer {
                 }
                 let result = message.get("result").cloned().unwrap_or(Value::Null);
                 calls.turn = extract_turn_id(&result);
+                if calls.turn.is_none() {
+                    eprintln!("[weixin] turn/start 未返回回合 ID，附件调用将被拒绝");
+                }
                 if model.is_empty() {
                     model = extract_model(&result).unwrap_or_default();
                 }

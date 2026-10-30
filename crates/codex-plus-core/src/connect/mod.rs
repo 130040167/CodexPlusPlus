@@ -80,13 +80,6 @@ impl WeixinConnectConfig {
         self
     }
 
-    pub fn validate_outbound(&self) -> anyhow::Result<()> {
-        outbound::validate_settings(
-            self.allow_outbound_attachments,
-            &self.allow_from,
-            &self.work_dir,
-        )
-    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -171,18 +164,10 @@ pub async fn run_weixin_connect_with_outbound(
     outbound: outbound::OutboundPolicy,
 ) -> anyhow::Result<()> {
     let config = config.normalized();
-    config.validate_outbound()?;
     if config.token.is_empty() {
         bail!("请先扫码登录微信");
     }
-    let work_dir = if config.work_dir.is_empty() {
-        std::env::current_dir().context("无法读取当前工作目录")?
-    } else {
-        PathBuf::from(&config.work_dir)
-    };
-    if !work_dir.is_dir() {
-        bail!("工作目录不存在：{}", work_dir.display());
-    }
+    let work_dir = connection_work_dir(&config, &crate::paths::default_app_state_dir())?;
 
     update_status(&status, |current| {
         current.state = "starting".to_string();
@@ -205,7 +190,7 @@ pub async fn run_weixin_connect_with_outbound(
 
     update_status(&status, |current| {
         current.state = "running".to_string();
-        current.message = "微信连接正在运行。".to_string();
+        current.message = outbound.status_message("微信连接正在运行。");
     });
 
     while !stop.load(Ordering::SeqCst) {
@@ -269,7 +254,10 @@ pub async fn run_weixin_connect_with_outbound(
             state
                 .context_tokens
                 .insert(message.from_user_id.clone(), message.context_token.clone());
-            if codex_path.apply(&mut app_config) {
+            let work_dir = connection_work_dir(&config, &crate::paths::default_app_state_dir())?;
+            let changed_work_dir = app_config.work_dir != work_dir;
+            app_config.work_dir = work_dir;
+            if codex_path.apply(&mut app_config) || changed_work_dir {
                 if let Some(mut server) = app_server.take() {
                     server.close().await;
                 }
@@ -296,7 +284,7 @@ pub async fn run_weixin_connect_with_outbound(
                     state.mark_processed(&message_key);
                     update_status(&status, |current| {
                         current.state = "running".to_string();
-                        current.message = "最近一条微信消息已处理。".to_string();
+                        current.message = outbound.status_message("最近一条微信消息已处理。");
                         current.last_peer_id = message.from_user_id.clone();
                         current.last_message_at_ms = now_ms();
                         current.processed_messages = current.processed_messages.saturating_add(1);
@@ -333,6 +321,21 @@ pub async fn run_weixin_connect_with_outbound(
         current.message = "微信连接已停止。".to_string();
     });
     Ok(())
+}
+
+fn connection_work_dir(config: &WeixinConnectConfig, state_dir: &std::path::Path) -> anyhow::Result<PathBuf> {
+    let work_dir = if config.work_dir.is_empty() {
+        std::env::current_dir().context("无法读取当前工作目录")?
+    } else {
+        PathBuf::from(&config.work_dir)
+    };
+    if work_dir.is_dir() {
+        return Ok(work_dir);
+    }
+    // 设置可能在连接启动后开启回传；目录降级不能依赖启动时的开关快照。
+    let fallback = state_dir.join("weixin-text-workspace");
+    std::fs::create_dir_all(&fallback).context("无法创建微信文字连接的临时工作目录")?;
+    Ok(fallback)
 }
 
 struct PreparedWeixinInput {
@@ -815,6 +818,42 @@ mod tests {
         path.set("   ");
         assert!(runtime_path.apply(&mut config));
         assert_eq!(config.executable, "");
+    }
+
+    #[tokio::test]
+    async fn unavailable_attachment_workspace_keeps_text_input_and_recovers_when_restored() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let config = WeixinConnectConfig {
+            allow_outbound_attachments: false,
+            allow_from: "peer".into(),
+            work_dir: workspace.to_str().unwrap().into(),
+            ..Default::default()
+        };
+        let state_dir = root.path().join("state");
+        assert_eq!(connection_work_dir(&config, &state_dir).unwrap(), workspace);
+        let policy = outbound::OutboundPolicy::new(false, "peer", &config.work_dir);
+        assert!(policy.permit("peer").is_err());
+        policy.set(true, "peer", &config.work_dir);
+        assert!(policy.permit("peer").is_ok());
+        std::fs::rename(&workspace, root.path().join("moved-workspace")).unwrap();
+        let fallback = connection_work_dir(&config, &state_dir).unwrap();
+        assert_eq!(fallback, state_dir.join("weixin-text-workspace"));
+        assert!(fallback.is_dir());
+        assert!(!workspace.exists(), "the unavailable workspace must not be recreated");
+        assert!(!config.allow_outbound_attachments, "runtime permission must not rewrite the startup snapshot");
+        assert!(policy.permit("peer").is_err());
+        assert!(policy.status_message("running").contains("附件回传暂不可用"));
+        let client = WeixinClient::new("http://127.0.0.1:1", "test", "").unwrap();
+        let message: WeixinMessage = serde_json::from_value(serde_json::json!({"item_list":[]})).unwrap();
+        let input = prepare_weixin_input(&client, &fallback, &message, "still text").await.unwrap();
+        assert_eq!(input.prompt, "still text");
+        assert!(input._inbox.is_none());
+        std::fs::create_dir(&workspace).unwrap();
+        assert_eq!(connection_work_dir(&config, &state_dir).unwrap(), workspace);
+        assert!(policy.permit("peer").is_ok());
+        assert_eq!(policy.status_message("running"), "running");
     }
 
     #[tokio::test]

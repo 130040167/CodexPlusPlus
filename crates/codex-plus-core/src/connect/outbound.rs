@@ -163,6 +163,17 @@ impl OutboundPolicy {
         self.0.stop.as_ref().is_some_and(|stop| stop.load(Ordering::SeqCst))
     }
 
+    pub(super) fn status_message(&self, message: &str) -> String {
+        let result = self.refresh().and_then(|()| {
+            let state = self.0.state.borrow();
+            validate_settings(state.enabled, &state.peers, &state.workspace.to_string_lossy())
+        });
+        match result {
+            Ok(()) => message.to_string(),
+            Err(error) => format!("{message} 附件回传暂不可用：{error}；文字连接不受影响。"),
+        }
+    }
+
     pub(super) fn permit(&self, peer: &str) -> anyhow::Result<OutboundPermit> {
         self.refresh()?;
         let state = self.0.state.borrow().clone();
@@ -198,6 +209,17 @@ pub fn validate_settings(enabled: bool, peers: &str, workspace: &str) -> anyhow:
     if enabled {
         validate_allow_from(peers)?;
         outbound_workspace(Path::new(workspace.trim()))?;
+    }
+    Ok(())
+}
+
+pub fn validate_settings_change(previous: &BackendSettings, next: &BackendSettings) -> anyhow::Result<()> {
+    if next.weixin_connect_allow_outbound_attachments
+        && (!previous.weixin_connect_allow_outbound_attachments
+            || previous.weixin_connect_allow_from != next.weixin_connect_allow_from
+            || previous.weixin_connect_work_dir != next.weixin_connect_work_dir)
+    {
+        validate_settings(true, &next.weixin_connect_allow_from, &next.weixin_connect_work_dir)?;
     }
     Ok(())
 }
@@ -314,6 +336,9 @@ fn reject_sensitive_path(path: &Path) -> anyhow::Result<()> {
                 || matches!(
                     name,
                     ".git"
+                        | ".gitconfig"
+                        | ".git-credentials"
+                        | ".docker"
                         | ".ssh"
                         | ".gnupg"
                         | ".aws"
@@ -543,7 +568,7 @@ impl OutboundPermit {
         future: impl std::future::Future<Output = anyhow::Result<T>>,
     ) -> anyhow::Result<T> {
         let mut changes = self.policy.0.state.subscribe();
-        self.check()?;
+        self.check_async().await?;
         let mut refresh = tokio::time::interval(Duration::from_millis(100));
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tokio::pin!(future);
@@ -551,10 +576,15 @@ impl OutboundPermit {
             tokio::select! {
                 biased;
                 _ = changes.changed() => bail!("附件回传权限已改变，已取消发送"),
-                _ = refresh.tick() => self.check()?,
-                result = &mut future => { self.check()?; return result; }
+                _ = refresh.tick() => self.check_async().await?,
+                result = &mut future => { self.check_async().await?; return result; }
             }
         }
+    }
+
+    async fn check_async(&self) -> anyhow::Result<()> {
+        let permit = self.clone();
+        tokio::task::spawn_blocking(move || permit.check()).await?
     }
 }
 
@@ -1128,6 +1158,40 @@ mod tests {
         assert!(validate_settings(true, "peer", root).is_ok());
     }
 
+    #[test]
+    fn outbound_invalid_existing_workspace_does_not_block_unrelated_settings() {
+        let fixture = SettingsFixture::new();
+        let previous = fixture.store.load().unwrap();
+        std::fs::rename(&previous.weixin_connect_work_dir, fixture.dir.path().join("moved")).unwrap();
+        let mut next = previous.clone();
+        next.weixin_connect_model = "next-model".into();
+        next.enhancements_enabled = !next.enhancements_enabled;
+        assert!(validate_settings_change(&previous, &next).is_ok());
+        next.weixin_connect_allow_from = "other-peer".into();
+        assert!(validate_settings_change(&previous, &next).is_err());
+        next.weixin_connect_allow_outbound_attachments = false;
+        assert!(validate_settings_change(&previous, &next).is_ok());
+        assert!(validate_settings_change(&next, &previous).is_err());
+        next = previous.clone();
+        next.weixin_connect_work_dir = fixture.dir.path().join("missing").to_str().unwrap().into();
+        assert!(validate_settings_change(&previous, &next).is_err());
+    }
+
+    #[tokio::test]
+    async fn outbound_workspace_disappearing_cancels_only_attachment_and_reports_warning() {
+        let fixture = SettingsFixture::new();
+        let permit = fixture.policy.permit("peer").unwrap();
+        assert_settings_revoke_cancels(permit, || {
+            std::fs::rename(&fixture.config.work_dir, fixture.dir.path().join("moved")).unwrap();
+        }).await;
+        assert!(fixture.policy.permit("peer").is_err());
+        let warning = fixture.policy.status_message("text-ready");
+        assert!(warning.starts_with("text-ready"));
+        assert!(warning.contains("文字连接不受影响"));
+        fixture.store.update(json!({"weixinConnectAllowOutboundAttachments":false})).unwrap();
+        assert_eq!(fixture.policy.status_message("text-ready"), "text-ready");
+    }
+
     #[tokio::test]
     async fn outbound_revoke_cancels_inflight_and_invalidates_old_permit() {
         let workspace = tempfile::tempdir().unwrap();
@@ -1238,12 +1302,17 @@ mod tests {
     #[test]
     fn outbound_rejects_sensitive_files_inside_workspace() {
         let workspace = tempfile::tempdir().unwrap();
-        for name in [".codex", ".ssh", ".aws", "Codex++"] {
+        for name in [".codex", ".ssh", ".aws", "Codex++", ".docker"] {
             let directory = workspace.path().join(name);
             std::fs::create_dir(&directory).unwrap();
             std::fs::write(directory.join("result.txt"), b"private").unwrap();
             assert!(outbound_workspace(&directory).is_err());
             assert!(read_workspace_file(&directory.join("result.txt"), workspace.path()).is_err());
+        }
+        for name in [".gitconfig", ".git-credentials"] {
+            let file = workspace.path().join(name);
+            std::fs::write(&file, b"private").unwrap();
+            assert!(read_workspace_file(&file, workspace.path()).is_err());
         }
     }
 
