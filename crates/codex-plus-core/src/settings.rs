@@ -2237,6 +2237,29 @@ impl SettingsStore {
         Self { path }
     }
 
+    /// 与设置提交串行绑定，不能让启动时加载的旧授权跨过后续撤销。
+    pub fn weixin_outbound_policy(
+        &self,
+        config: &crate::connect::WeixinConnectConfig,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> anyhow::Result<crate::connect::outbound::OutboundPolicy> {
+        let _lock = self.write_lock()?;
+        let settings = self.load()?;
+        Ok(crate::connect::outbound::OutboundPolicy::bind_settings(
+            self.clone(), config, &settings, stop,
+        ))
+    }
+
+    /// 不读取可能回滚的事务中间值，也不阻塞正在发送附件的异步任务。
+    pub(crate) fn try_load_committed(&self) -> anyhow::Result<Option<BackendSettings>> {
+        let file = OpenOptions::new().read(true).write(true).open(self.path.with_extension("json.lock"))?;
+        match FileExt::try_lock_shared(&file) {
+            Ok(()) => self.load().map(Some),
+            Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(None),
+            Err(error) => Err(error).context("核验微信附件权限时获取设置读锁失败"),
+        }
+    }
+
     fn write_lock(&self) -> anyhow::Result<File> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -2380,6 +2403,8 @@ impl SettingsStore {
         // 完整表单不能擦除新版本或拓展写入的未知字段；profile 以稳定 ID 对齐。
         preserve_unknown_settings_fields(&mut next, &raw)?;
         next.remove("revision");
+        // 即使设置值恢复原样也必须产生新提交版本；失败回滚会恢复原 nonce。
+        next.insert("_settingsCommitId".to_string(), Value::String(uuid::Uuid::new_v4().to_string()));
         serialize_settings_bounded(&Value::Object(next))
     }
 
@@ -2491,6 +2516,7 @@ impl SettingsStore {
             );
         }
         raw.remove("revision");
+        raw.insert("_settingsCommitId".to_string(), Value::String(uuid::Uuid::new_v4().to_string()));
         let bytes = serialize_settings_bounded(&Value::Object(raw))?;
         atomic_write(&self.path, &bytes)?;
         settings.settings_revision = settings_revision(Some(&bytes));

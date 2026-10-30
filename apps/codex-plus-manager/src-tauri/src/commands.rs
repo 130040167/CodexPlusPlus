@@ -321,7 +321,6 @@ struct WeixinRuntime {
     stop: Arc<AtomicBool>,
     codex_path: codex_plus_core::connect::WeixinCodexPath,
     outbound: codex_plus_core::connect::outbound::OutboundPolicy,
-    outbound_account: (String, String, String, String),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3408,13 +3407,10 @@ pub fn weixin_connect_stop() -> CommandResult<codex_plus_core::connect::WeixinCo
         .ok()
         .and_then(|runtime| {
             runtime.as_ref().map(|runtime| {
+                runtime.stop.store(true, Ordering::SeqCst);
                 runtime.outbound.set(false, "", "");
-                Arc::clone(&runtime.stop)
+                true
             })
-        })
-        .map(|stop| {
-            stop.store(true, Ordering::SeqCst);
-            true
         })
         .unwrap_or(false);
     let store = SettingsStore::default();
@@ -3598,21 +3594,11 @@ fn spawn_weixin_connect(
         anyhow::bail!("微信连接已在运行或正在停止");
     }
     let codex_path = codex_plus_core::connect::WeixinCodexPath::new(&config.codex_path);
-    let outbound = codex_plus_core::connect::outbound::OutboundPolicy::new(
-        config.allow_outbound_attachments,
-        &config.allow_from,
-        &config.work_dir,
-    );
+    let outbound = SettingsStore::default().weixin_outbound_policy(&config, Arc::clone(&stop))?;
     *runtime = Some(WeixinRuntime {
         stop: Arc::clone(&stop),
         codex_path: codex_path.clone(),
         outbound: outbound.clone(),
-        outbound_account: (
-            config.account_id.clone(),
-            config.token.clone(),
-            config.base_url.clone(),
-            config.route_tag.clone(),
-        ),
     });
     drop(runtime);
     let status = weixin_status();
@@ -3835,19 +3821,6 @@ pub fn save_settings(
                 && let Some(runtime) = runtime.as_ref()
             {
                 runtime.codex_path.set(&settings.weixin_connect_codex_path);
-                runtime.outbound.set(
-                    settings.weixin_connect_allow_outbound_attachments
-                        && !runtime.stop.load(Ordering::SeqCst)
-                        && runtime.outbound_account
-                            == (
-                                settings.weixin_connect_account_id.clone(),
-                                settings.weixin_connect_token.clone(),
-                                settings.weixin_connect_base_url.clone(),
-                                settings.weixin_connect_route_tag.clone(),
-                            ),
-                    &settings.weixin_connect_allow_from,
-                    &settings.weixin_connect_work_dir,
-                );
             }
             // 自动接管是常驻行为，保存后立刻生效，不必重启管理器。
             crate::auto_takeover::apply_enabled(settings.codex_app_auto_takeover);

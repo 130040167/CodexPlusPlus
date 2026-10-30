@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
@@ -9,6 +12,7 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 
 use super::media::MAX_ATTACHMENT_BYTES;
+use crate::settings::{BackendSettings, SettingsStore};
 pub const ATTACHMENT_TOOL: &str = "weixin_send_attachment";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,10 +21,39 @@ struct PolicyState {
     peers: String,
     workspace: PathBuf,
     revision: u64,
+    settings_revision: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-pub struct OutboundPolicy(watch::Sender<PolicyState>);
+#[derive(Clone)]
+pub struct OutboundPolicy(Arc<LivePolicy>);
+
+struct LivePolicy {
+    state: watch::Sender<PolicyState>,
+    stop: Option<Arc<AtomicBool>>,
+    settings: Option<SettingsPolicyBinding>,
+}
+
+struct SettingsPolicyBinding {
+    store: SettingsStore,
+    account: [String; 4],
+}
+
+impl std::fmt::Debug for OutboundPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 绑定的账号凭据不能进入 permit、错误或调试日志。
+        f.debug_struct("OutboundPolicy").field("state", &self.0.state).finish_non_exhaustive()
+    }
+}
+
+fn account_identity(account: &str, token: &str, base_url: &str, route: &str) -> [String; 4] {
+    let base_url = base_url.trim().trim_end_matches('/');
+    [
+        account.trim().to_string(),
+        token.trim().to_string(),
+        if base_url.is_empty() { super::DEFAULT_WEIXIN_BASE_URL } else { base_url }.to_string(),
+        route.trim().to_string(),
+    ]
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct OutboundPermit {
@@ -33,33 +66,106 @@ pub(super) struct OutboundPermit {
 
 impl OutboundPolicy {
     pub fn new(enabled: bool, peers: &str, workspace: &str) -> Self {
-        Self(watch::Sender::new(PolicyState {
-            enabled,
-            peers: peers.trim().to_string(),
-            workspace: PathBuf::from(workspace.trim()),
-            revision: 0,
+        Self(Arc::new(LivePolicy {
+            state: watch::Sender::new(PolicyState {
+                enabled,
+                peers: peers.trim().to_string(),
+                workspace: PathBuf::from(workspace.trim()),
+                revision: 0,
+                settings_revision: None,
+            }),
+            stop: None,
+            settings: None,
         }))
     }
 
+    pub(crate) fn bind_settings(
+        store: SettingsStore,
+        config: &super::WeixinConnectConfig,
+        settings: &BackendSettings,
+        stop: Arc<AtomicBool>,
+    ) -> Self {
+        let policy = Self(Arc::new(LivePolicy {
+            state: watch::Sender::new(PolicyState {
+                enabled: false,
+                peers: String::new(),
+                workspace: PathBuf::new(),
+                revision: 0,
+                settings_revision: None,
+            }),
+            stop: Some(stop),
+            settings: Some(SettingsPolicyBinding {
+                store,
+                account: account_identity(&config.account_id, &config.token, &config.base_url, &config.route_tag),
+            }),
+        }));
+        policy.apply_settings(settings);
+        policy
+    }
+
+    fn apply_settings(&self, settings: &BackendSettings) {
+        let Some(binding) = &self.0.settings else { return; };
+        let same_account = binding.account == account_identity(
+            &settings.weixin_connect_account_id,
+            &settings.weixin_connect_token,
+            &settings.weixin_connect_base_url,
+            &settings.weixin_connect_route_tag,
+        );
+        self.update(
+            settings.weixin_connect_enabled && settings.weixin_connect_allow_outbound_attachments && same_account,
+            &settings.weixin_connect_allow_from,
+            &settings.weixin_connect_work_dir,
+            Some(&settings.settings_revision),
+        );
+    }
+
+    fn refresh(&self) -> anyhow::Result<()> {
+        if let Some(binding) = &self.0.settings {
+            match binding.store.try_load_committed() {
+                Ok(Some(settings)) => self.apply_settings(&settings),
+                Ok(None) => {} // 写事务尚未提交，保留上一个已提交的授权。
+                Err(error) => {
+                    self.set(false, "", "");
+                    return Err(error).context("无法核验微信附件回传权限");
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn set(&self, enabled: bool, peers: &str, workspace: &str) {
-        self.0.send_if_modified(|state| {
+        self.update(enabled, peers, workspace, None);
+    }
+
+    fn update(&self, enabled: bool, peers: &str, workspace: &str, settings_revision: Option<&str>) {
+        self.0.state.send_if_modified(|state| {
+            let enabled = enabled && !self.stopped();
             if state.enabled == enabled
                 && state.peers == peers.trim()
                 && state.workspace == Path::new(workspace.trim())
+                && settings_revision.is_none_or(|revision| state.settings_revision.as_deref() == Some(revision))
             {
                 return false;
             }
             state.enabled = enabled;
             state.peers = peers.trim().to_string();
             state.workspace = PathBuf::from(workspace.trim());
+            if let Some(revision) = settings_revision {
+                state.settings_revision = Some(revision.to_string());
+            }
             state.revision = state.revision.wrapping_add(1);
             true
         });
     }
 
+    fn stopped(&self) -> bool {
+        self.0.stop.as_ref().is_some_and(|stop| stop.load(Ordering::SeqCst))
+    }
+
     pub(super) fn permit(&self, peer: &str) -> anyhow::Result<OutboundPermit> {
-        let state = self.0.borrow().clone();
-        if !state.enabled {
+        self.refresh()?;
+        let state = self.0.state.borrow().clone();
+        if !state.enabled || self.stopped() {
             bail!("微信附件回传未开启");
         }
         validate_allow_from(&state.peers)?;
@@ -419,7 +525,8 @@ impl OutboundPermit {
         Ok(())
     }
     pub fn check(&self) -> anyhow::Result<()> {
-        if *self.policy.0.borrow() != self.state {
+        self.policy.refresh()?;
+        if self.policy.stopped() || *self.policy.0.state.borrow() != self.state {
             bail!("附件回传权限已改变，请在新回合重试");
         }
         if outbound_workspace(&self.state.workspace)? != self.workspace
@@ -434,12 +541,18 @@ impl OutboundPermit {
         &self,
         future: impl std::future::Future<Output = anyhow::Result<T>>,
     ) -> anyhow::Result<T> {
-        let mut changes = self.policy.0.subscribe();
+        let mut changes = self.policy.0.state.subscribe();
         self.check()?;
-        tokio::select! {
-            biased;
-            _ = changes.changed() => bail!("附件回传权限已改变，已取消发送"),
-            result = future => { self.check()?; result }
+        let mut refresh = tokio::time::interval(Duration::from_millis(100));
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tokio::pin!(future);
+        loop {
+            tokio::select! {
+                biased;
+                _ = changes.changed() => bail!("附件回传权限已改变，已取消发送"),
+                _ = refresh.tick() => self.check()?,
+                result = &mut future => { self.check()?; return result; }
+            }
         }
     }
 }
@@ -547,6 +660,298 @@ pub(super) fn attachment_tool_spec() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connect::WeixinConnectConfig;
+
+    struct SettingsFixture {
+        dir: tempfile::TempDir,
+        store: SettingsStore,
+        config: WeixinConnectConfig,
+        stop: Arc<AtomicBool>,
+        policy: OutboundPolicy,
+    }
+
+    impl SettingsFixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let workspace = dir.path().join("workspace");
+            std::fs::create_dir(&workspace).unwrap();
+            let store = SettingsStore::new(dir.path().join("settings.json"));
+            let mut settings = store.load().unwrap();
+            settings.weixin_connect_enabled = true;
+            settings.weixin_connect_allow_outbound_attachments = true;
+            settings.weixin_connect_allow_from = "peer".into();
+            settings.weixin_connect_work_dir = workspace.to_str().unwrap().into();
+            settings.weixin_connect_account_id = "old-account".into();
+            settings.weixin_connect_token = "fake-test-token".into();
+            store.save(&settings).unwrap();
+            let config = WeixinConnectConfig {
+                account_id: settings.weixin_connect_account_id,
+                token: settings.weixin_connect_token,
+                base_url: settings.weixin_connect_base_url,
+                route_tag: settings.weixin_connect_route_tag,
+                allow_outbound_attachments: true,
+                allow_from: settings.weixin_connect_allow_from,
+                work_dir: settings.weixin_connect_work_dir,
+                ..WeixinConnectConfig::default()
+            }.normalized();
+            let stop = Arc::new(AtomicBool::new(false));
+            let policy = store.weixin_outbound_policy(&config, Arc::clone(&stop)).unwrap();
+            Self { dir, store, config, stop, policy }
+        }
+    }
+
+    async fn assert_settings_revoke_cancels(permit: OutboundPermit, revoke: impl FnOnce()) {
+        let old = permit.clone();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            permit.guard(async {
+                let _ = entered.send(());
+                std::future::pending::<anyhow::Result<()>>().await
+            }).await
+        });
+        ready.await.unwrap();
+        revoke();
+        assert!(old.check().is_err(), "committed settings must revoke the old permit immediately");
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await.expect("inflight attachment was not cancelled").unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn outbound_settings_qr_save_revokes_old_account_and_cancels_inflight() {
+        // 与扫码确认一致：load -> 更新账号字段 -> save，不经过 manager save_settings。
+        for field in ["account", "token", "base", "route"] {
+            let fixture = SettingsFixture::new();
+            let mut settings = fixture.store.load().unwrap();
+            let mut original = settings.clone();
+            match field {
+                "account" => settings.weixin_connect_account_id = "new-account".into(),
+                "token" => settings.weixin_connect_token = "new-fake-token".into(),
+                "base" => settings.weixin_connect_base_url = "https://example.invalid".into(),
+                _ => settings.weixin_connect_route_tag = "new-route".into(),
+            }
+            let permit = fixture.policy.permit("peer").unwrap();
+            let old = permit.clone();
+            assert_settings_revoke_cancels(permit, || fixture.store.save(&settings).unwrap()).await;
+            assert!(fixture.policy.permit("peer").is_err());
+            let current = fixture.store.load().unwrap();
+            fixture.store.save(&current).unwrap();
+            assert!(fixture.policy.permit("peer").is_err());
+            original.settings_revision = fixture.store.revision().unwrap();
+            fixture.store.save(&original).unwrap();
+            assert!(fixture.policy.permit("peer").is_ok());
+            assert!(old.check().is_err(), "restoring the account resurrected an old permit");
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_settings_bridge_set_revokes_permits_and_cancels_inflight() {
+        use crate::routes::BridgeContext;
+
+        for field in ["disabled", "connection-disabled", "peers", "wildcard", "workspace", "account"] {
+            let fixture = SettingsFixture::new();
+            let other_workspace = fixture.dir.path().join("other");
+            std::fs::create_dir(&other_workspace).unwrap();
+            let payload = match field {
+                "disabled" => json!({"weixinConnectAllowOutboundAttachments": false}),
+                "connection-disabled" => json!({"weixinConnectEnabled": false}),
+                "peers" => json!({"weixinConnectAllowFrom": "other"}),
+                "wildcard" => json!({"weixinConnectAllowFrom": "*"}),
+                "workspace" => json!({"weixinConnectWorkDir": other_workspace}),
+                _ => json!({"weixinConnectAccountId": "new-account"}),
+            };
+            let ctx = BridgeContext::with_test_settings(fixture.store.clone(), fixture.dir.path().join("app"));
+            let permit = fixture.policy.permit("peer").unwrap();
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let old = permit.clone();
+            let task = tokio::spawn(async move {
+                permit.guard(async {
+                    let _ = entered.send(());
+                    std::future::pending::<anyhow::Result<()>>().await
+                }).await
+            });
+            ready.await.unwrap();
+            let response = crate::routes::handle_bridge_request(ctx, "/settings/set", payload.clone()).await;
+            for (key, expected) in payload.as_object().unwrap() {
+                assert_eq!(&response[key], expected, "bridge settings write failed for {key}");
+            }
+            assert!(old.check().is_err(), "bridge field {field} did not revoke the permit");
+            assert!(tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await.expect("bridge did not cancel inflight attachment").unwrap().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_settings_writer_process_fixture() {
+        let Some(path) = std::env::var_os("CODEX_PLUS_OUTBOUND_TEST_SETTINGS") else { return; };
+        let path = PathBuf::from(path);
+        let store = SettingsStore::new(path.clone());
+        match std::env::var("CODEX_PLUS_OUTBOUND_TEST_WRITE").unwrap().as_str() {
+            "fast-off-on" => {
+                store.update(json!({"weixinConnectAllowOutboundAttachments": false})).unwrap();
+                store.update(json!({"weixinConnectAllowOutboundAttachments": true})).unwrap();
+            }
+            "qr-account" => {
+                let mut settings = store.load().unwrap();
+                settings.weixin_connect_account_id = "new-account".into();
+                settings.weixin_connect_token = "new-fake-token".into();
+                store.save(&settings).unwrap();
+            }
+            mode => {
+                let payload = if mode == "connection-disabled" {
+                    json!({"weixinConnectEnabled": false})
+                } else {
+                    json!({"weixinConnectAllowOutboundAttachments": false})
+                };
+                let ctx = crate::routes::BridgeContext::with_test_settings(store, path.parent().unwrap().join("app"));
+                let result = crate::routes::handle_bridge_request(ctx, "/settings/set", payload.clone()).await;
+                for (key, expected) in payload.as_object().unwrap() {
+                    assert_eq!(&result[key], expected);
+                }
+            }
+        }
+    }
+
+    async fn run_settings_writer(fixture: &SettingsFixture, mode: &str) {
+        let mut writer = tokio::process::Command::new(std::env::current_exe().unwrap());
+        writer.args(["--exact", "connect::outbound::tests::outbound_settings_writer_process_fixture"])
+            .env("CODEX_PLUS_OUTBOUND_TEST_SETTINGS", fixture.dir.path().join("settings.json"))
+            .env("CODEX_PLUS_OUTBOUND_TEST_WRITE", mode)
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        writer.creation_flags(0x08000000);
+        let result = tokio::time::timeout(Duration::from_secs(10), writer.output()).await.unwrap().unwrap();
+        assert!(result.status.success(), "settings writer fixture failed for {mode}");
+    }
+
+    #[tokio::test]
+    async fn outbound_settings_another_process_revokes_new_and_inflight_permits() {
+        for mode in ["qr-account", "connection-disabled", "attachments-disabled"] {
+            let fixture = SettingsFixture::new();
+            let idle_policy = fixture.store.weixin_outbound_policy(&fixture.config, Arc::clone(&fixture.stop)).unwrap();
+            let permit = fixture.policy.permit("peer").unwrap();
+            let old = permit.clone();
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                permit.guard(async {
+                    let _ = entered.send(());
+                    std::future::pending::<anyhow::Result<()>>().await
+                }).await
+            });
+            ready.await.unwrap();
+            run_settings_writer(&fixture, mode).await;
+            // 不先调用 check/permit，必须由 guard 的只读轮询主动取消在途操作。
+            assert!(tokio::time::timeout(Duration::from_secs(1), task)
+                .await.expect("cross-process revocation exceeded the polling bound").unwrap().is_err());
+            assert!(old.check().is_err());
+            assert!(idle_policy.permit("peer").is_err(), "new permit used a stale process-local snapshot");
+        }
+    }
+
+    #[test]
+    fn outbound_settings_failed_saves_leave_current_policy_unchanged() {
+        let fixture = SettingsFixture::new();
+        let permit = fixture.policy.permit("peer").unwrap();
+        let mut settings = fixture.store.load().unwrap();
+        settings.weixin_connect_allow_outbound_attachments = false;
+        assert!(fixture.store.save_with_commit(&settings, |_| {
+            assert!(permit.check().is_ok(), "an uncommitted candidate changed the active policy");
+            anyhow::bail!("test publish failure")
+        }).is_err());
+        assert!(fixture.store.load().unwrap().weixin_connect_allow_outbound_attachments);
+        assert!(permit.check().is_ok());
+        settings.settings_revision = "stale".into();
+        assert!(fixture.store.save(&settings).is_err());
+        assert!(fixture.store.update(json!({"revision": "stale", "weixinConnectAllowOutboundAttachments": false})).is_err());
+        assert!(permit.check().is_ok());
+
+        fixture.store.update(json!({"weixinConnectAllowOutboundAttachments": false})).unwrap();
+        let mut enable = fixture.store.load().unwrap();
+        enable.weixin_connect_allow_outbound_attachments = true;
+        assert!(fixture.store.save_with_commit(&enable, |_| anyhow::bail!("test publish failure")).is_err());
+        assert!(fixture.policy.permit("peer").is_err());
+    }
+
+    #[test]
+    fn outbound_settings_full_save_and_reenable_do_not_restore_old_permits_or_cache() {
+        let fixture = SettingsFixture::new();
+        let permit = fixture.policy.permit("peer").unwrap();
+        let mut calls = AttachmentCalls::new("peer", "thread", Some(permit.clone()));
+        calls.turn = Some("turn".into());
+        let request = call("thread", "turn", "call");
+        let (id, arguments, _) = calls.validate(&request).unwrap();
+        calls.record(id, arguments, json!({"success": true}));
+        let mut settings = fixture.store.load().unwrap();
+        settings.weixin_connect_allow_outbound_attachments = false;
+        fixture.store.save_with_commit(&settings, |_| Ok(())).unwrap();
+        assert!(permit.check().is_err());
+        let mut settings = fixture.store.load().unwrap();
+        settings.weixin_connect_allow_outbound_attachments = true;
+        fixture.store.save(&settings).unwrap();
+        assert!(fixture.policy.permit("peer").is_ok());
+        assert!(permit.check().is_err());
+        assert!(calls.validate(&request).is_err());
+    }
+
+    #[tokio::test]
+    async fn outbound_settings_fast_off_on_invalidates_old_permit_and_success_cache() {
+        for another_process in [false, true] {
+            let fixture = SettingsFixture::new();
+            let permit = fixture.policy.permit("peer").unwrap();
+            let mut calls = AttachmentCalls::new("peer", "thread", Some(permit.clone()));
+            calls.turn = Some("turn".into());
+            let request = call("thread", "turn", "call");
+            let (id, arguments, _) = calls.validate(&request).unwrap();
+            calls.record(id, arguments, json!({"success": true}));
+            if another_process {
+                run_settings_writer(&fixture, "fast-off-on").await;
+            } else {
+                fixture.store.update(json!({"weixinConnectAllowOutboundAttachments": false})).unwrap();
+                fixture.store.update(json!({"weixinConnectAllowOutboundAttachments": true})).unwrap();
+            }
+            // 两次提交之间没有任何权限刷新，当前权限值已经完全恢复。
+            assert!(permit.check().is_err(), "fast off/on resurrected an old permit");
+            assert!(calls.validate(&request).is_err(), "fast off/on restored a cached success");
+            assert!(fixture.policy.permit("peer").is_ok());
+        }
+    }
+
+    #[test]
+    fn outbound_settings_binding_is_current_isolated_and_stop_is_sticky() {
+        let fixture = SettingsFixture::new();
+        let permit = fixture.policy.permit("peer").unwrap();
+        let other = SettingsFixture::new();
+        other.store.update(json!({"weixinConnectAllowOutboundAttachments": false})).unwrap();
+        assert!(permit.check().is_ok(), "unrelated store changed policy");
+        fixture.store.update(json!({"weixinConnectToken": " fake-test-token ", "weixinConnectBaseUrl": ""})).unwrap();
+        assert!(permit.check().is_err(), "a committed settings write must invalidate old permits");
+        assert!(fixture.policy.permit("peer").is_ok(), "normalized account identity should still allow new permits");
+
+        fixture.store.update(json!({"weixinConnectAllowOutboundAttachments": false})).unwrap();
+        let rebound = fixture.store.weixin_outbound_policy(&fixture.config, Arc::clone(&fixture.stop)).unwrap();
+        assert!(rebound.permit("peer").is_err(), "stale startup config restored revoked permission");
+        fixture.store.update(json!({"weixinConnectAllowOutboundAttachments": true})).unwrap();
+        let permit = fixture.policy.permit("peer").unwrap();
+        fixture.stop.store(true, Ordering::SeqCst);
+        fixture.policy.set(false, "", "");
+        fixture.store.save(&fixture.store.load().unwrap()).unwrap();
+        assert!(permit.check().is_err());
+        assert!(fixture.policy.permit("peer").is_err());
+        assert!(rebound.permit("peer").is_err());
+    }
+
+    #[test]
+    fn outbound_settings_snapshot_restore_and_missing_file_revoke_permits() {
+        let fixture = SettingsFixture::new();
+        let original = fixture.store.snapshot_raw_bytes().unwrap();
+        fixture.store.update(json!({"weixinConnectAllowFrom": "other"})).unwrap();
+        let permit = fixture.policy.permit("other").unwrap();
+        fixture.store.restore_raw_snapshot(original.as_deref(), &fixture.store.revision().unwrap()).unwrap();
+        assert!(permit.check().is_err());
+        let permit = fixture.policy.permit("peer").unwrap();
+        fixture.store.restore_raw_snapshot(None, &fixture.store.revision().unwrap()).unwrap();
+        assert!(permit.check().is_err());
+        assert!(fixture.policy.permit("peer").is_err());
+    }
 
     fn call(thread: &str, turn: &str, id: &str) -> Value {
         json!({ "id": 1, "method": "item/tool/call", "params": {
