@@ -99,6 +99,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn account_paths_preserve_at_dot_and_uppercase_without_migrating_state() {
+        let temp = tempfile::tempdir().unwrap();
+        for account in ["Bot.ABC123@im.bot", "Sender.XYZ@im.wechat"] {
+            let default = ConnectSessionStore::default_for_account(account);
+            let filename = format!("weixin-connect-state-{account}.json");
+            assert_eq!(
+                default.path.file_name().unwrap().to_str(),
+                Some(filename.as_str())
+            );
+            assert_eq!(sanitize_account_id(account), account);
+            let store = ConnectSessionStore::new(temp.path().join(filename));
+            let mut state = ConnectState::default();
+            state.get_updates_buf = format!("cursor-{account}");
+            state
+                .thread_ids
+                .insert("peer".into(), format!("thread-{account}"));
+            state
+                .context_tokens
+                .insert("peer".into(), "saved-context".into());
+            state.mark_processed("inbound-message");
+            store.save(&state).unwrap();
+            assert_eq!(store.load().unwrap(), state);
+        }
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2);
+        assert_eq!(sanitize_account_id("  "), "default");
+        assert_eq!(sanitize_account_id("  Bot/A\\B:C\0  "), "Bot_A_B_C_");
+    }
+
+    #[test]
     fn state_store_round_trips_and_limits_dedup_history() {
         let temp = tempfile::tempdir().unwrap();
         let store = ConnectSessionStore::new(temp.path().join("state.json"));

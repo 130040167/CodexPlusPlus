@@ -1,12 +1,21 @@
 // 供应商卡片上的中转站（sub2api / new-api）倍率 / 余额。直连供应商和网关供应商池共用：
 // 两边只是识别请求不同（直连传整个 profile，网关按 id 由后端取 Key）。
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { RefreshCw } from "lucide-react";
 import { t, tf } from "./i18n";
+import type { ProviderBalance } from "./gateway-model";
+import {
+  cachedProviderBalances,
+  loadProviderBalances,
+  providerBalanceFor,
+  subscribeProviderBalances,
+} from "./provider-balances";
 import {
   formatRelayAmount,
   formatRelayMultiplier,
   mergeRelayBillingResult,
+  newApiAccessHint,
   normalizeRelayBillingProbe,
   rememberRelayBillingNegative,
   relayAppliedPeak,
@@ -237,14 +246,24 @@ export function RelayBillingLine({
   );
 }
 
+/** 供应商池 new-api 卡片的余额提示（#2793）：没配访问令牌时说明配了能显示余额，配了但失败时给原因。 */
+function newApiAccessText(probe: RelayBillingProbe): { text: string; failed: boolean } | null {
+  const hint = newApiAccessHint(probe);
+  if (!hint) return null;
+  return hint.failed
+    ? { text: tf("访问令牌查询余额失败：{0}", [hint.text]), failed: true }
+    : { text: t("配置访问令牌后可显示余额（展开供应商详情，在「访问令牌」里填写）"), failed: false };
+}
+
 /** 网关供应商池右侧：和订阅账号的「套餐 + 额度条」同一位置、同一样式。只显示倍率，
  * 中转站类型（sub2api / new-api）放在悬停提示里；没有倍率时不显示，由调用方显示 Key 数。 */
 export function RelayBillingPoolLabel({ probe }: { probe: RelayBillingProbe }) {
   if (!probe.platform || !probe.rate) return null;
   const peak = relayAppliedPeak(probe.rate);
   const platform = relayPlatformLabel(probe.platform);
+  const access = newApiAccessText(probe);
   return (
-    <span className="gw-billing-label" title={`${platform}\n${relayBillingParts(probe).map((part) => part.text).join(" · ")}\n${relayRateSource(probe)}`}>
+    <span className="gw-billing-label" title={[platform, relayBillingParts(probe).map((part) => part.text).join(" · "), relayRateSource(probe), access?.text ?? ""].filter(Boolean).join("\n")}>
       {tf("倍率 {0}", [formatRelayMultiplier(probe.rate.multiplier)])}
       {peak !== null ? <em>{tf("含高峰 ×{0}", [String(Number(peak.toFixed(4)))])}</em> : null}
     </span>
@@ -264,20 +283,74 @@ export function RelayBillingPoolBadge({
 }) {
   const badge = probe.usage ? relayBalanceBadge(probe.usage) : null;
   const details = relayBillingParts(probe).map((part) => part.text).join("\n");
+  const access = newApiAccessText(probe);
   return (
     <span className="gw-billing-status">
       {failure ? <em className="gw-billing-stale" title={relayBillingFailureText(failure)}>{t("暂时获取失败")}</em> : null}
+      {access?.failed ? <em className="gw-billing-stale" title={access.text}>{t("余额查询失败")}</em> : null}
       {badge ? (
         <span className="gw-quota-badge" data-tone={badge.tone} title={`${details}\n${relayBillingTitle(probe, failure)}`}>
           {badge.ratio !== null ? <i style={{ "--gw-quota": `${Math.round(badge.ratio * 100)}%` } as CSSProperties} /> : null}
           {probe.usage?.kind === "wallet" ? tf("余额 {0}", [badge.amount]) : tf("剩 {0}", [badge.amount])}
         </span>
       ) : probe.usage?.kind === "unlimited" ? (
-        <span className="gw-quota-badge" data-tone={probe.usage.isValid ? "ok" : "low"} title={`${details}\n${relayBillingTitle(probe)}`}>
+        <span className="gw-quota-badge" data-tone={probe.usage.isValid ? "ok" : "low"} title={[details, relayBillingTitle(probe), access?.text ?? ""].filter(Boolean).join("\n")}>
           {t("Key 不限额度")}
         </span>
       ) : null}
       <RelayBillingRefreshButton loading={loading} onRefresh={onRefresh} />
+    </span>
+  );
+}
+
+/**
+ * 有余额接口的厂商（DeepSeek、Kimi 等）在供应商池卡片上的余额（#2793）：和「用量」页用同一份查询结果，
+ * 几张卡片一起要也只查一次；卡片 5 分钟内不重查，点刷新才强制重查。
+ */
+export function useProviderBalance(id: string, enabled: boolean) {
+  const [balances, setBalances] = useState<ProviderBalance[] | null>(() => cachedProviderBalances().balances);
+  const [loading, setLoading] = useState(false);
+  const load = useCallback((force: boolean) => {
+    setLoading(true);
+    void loadProviderBalances(() => invoke<{ status: string; balances?: ProviderBalance[] }>("load_gateway_balances"), { force })
+      .then(setBalances)
+      .finally(() => setLoading(false));
+  }, []);
+  useEffect(() => subscribeProviderBalances(setBalances), []);
+  useEffect(() => {
+    if (!enabled) return;
+    // 缓存里没有这家（刚添加、刚打开）时重查一次，其余按缓存时间。
+    const cached = cachedProviderBalances().balances;
+    load(cached !== null && !providerBalanceFor(cached, id));
+  }, [enabled, id, load]);
+  return {
+    balance: enabled ? providerBalanceFor(balances, id) : null,
+    loading,
+    refresh: () => load(true),
+  };
+}
+
+/** 供应商池右侧的厂商余额：样式与中转站余额一致（同一个徽章和刷新按钮）。 */
+export function ProviderBalancePoolBadge({
+  balance,
+  loading,
+  onRefresh,
+}: {
+  balance: ProviderBalance;
+  loading: boolean;
+  onRefresh: () => void;
+}) {
+  const amount = typeof balance.amount === "number" && Number.isFinite(balance.amount) ? balance.amount : null;
+  return (
+    <span className="gw-billing-status">
+      {amount !== null ? (
+        <span className="gw-quota-badge" data-tone={amount <= 0 ? "low" : "ok"} title={t("余额接口查询，和「用量」页、托盘面板同一来源")}>
+          {tf("余额 {0}", [formatRelayAmount(amount, balance.currency)])}
+        </span>
+      ) : (
+        <em className="gw-billing-stale" title={t(balance.error || "查不到")}>{t("暂时获取失败")}</em>
+      )}
+      <RelayBillingRefreshButton loading={loading} onRefresh={onRefresh} title={t("刷新余额")} />
     </span>
   );
 }

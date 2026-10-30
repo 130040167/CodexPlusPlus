@@ -155,7 +155,8 @@ import {
   type EnhancementSettingItem,
 } from "./enhancement-catalog";
 import { DEFAULT_AUTO_COMPACT_PERCENT, autoCompactOptions, normalizeAutoCompactPercent } from "./auto-compact";
-import { agentPetSettingsIssue, defaultAgentPetSettings, normalizeAgentPetSettings, type AgentPetIssue, type AgentPetSettings } from "./agent-pet-settings";
+import { agentPetSettingsIssue, defaultAgentPetSettings, isAgentPetWhaleWidgetActive, normalizeAgentPetSettings, type AgentPetIssue, type AgentPetSettings } from "./agent-pet-settings";
+import { defaultWhaleBalanceSettings, normalizeWhaleBalanceSettings, whaleBalanceSettingsIssue, type WhaleBalanceIssue, type WhaleBalanceSettings } from "./whale-settings";
 import { AgentPetPage } from "./AgentPetPage";
 import {
   applyDictationPreset,
@@ -292,6 +293,7 @@ import {
   multiLaunchInstanceLabel as formatMultiLaunchInstanceLabel,
   multiLaunchInstanceRunning,
   multiLaunchInstanceStatus,
+  runningInstancesForProfile,
   type MultiLaunchInstance,
 } from "./multi-launch-model";
 
@@ -395,7 +397,8 @@ type MultiLaunchInstancesResult = CommandResult<{
   instances: MultiLaunchInstance[];
 }>;
 
-type BackendSettings = {
+/** 顶层的 `codexAppWhaleBalance*` 是大肥鱼（Agent 桌宠类型之一）的余额配置。 */
+type BackendSettings = WhaleBalanceSettings & {
   revision?: string;
   /** Agent 桌宠（与 Rust `agent_pet` 对应）。 */
   agentPet: AgentPetSettings;
@@ -488,6 +491,7 @@ type BackendSettings = {
   weixinConnectToken: string;
   weixinConnectAccountId: string;
   weixinConnectAllowFrom: string;
+  weixinConnectAllowOutboundAttachments: boolean;
   weixinConnectRouteTag: string;
   weixinConnectWorkDir: string;
   weixinConnectModel: string;
@@ -1399,6 +1403,7 @@ const codexRunningPollMs = 5_000;
 const agentEntryRoute = (toolId: ToolId) => agentTarget(agentRoutes(toolId), lastAgentRoute.get(toolId), agentHomeRoute[toolId] ?? "overview");
 
 const defaultSettings: BackendSettings = {
+  ...defaultWhaleBalanceSettings(),
   agentPet: defaultAgentPetSettings(),
   codexAppPath: "",
   codexAppAutoTakeover: false,
@@ -1478,6 +1483,7 @@ const defaultSettings: BackendSettings = {
   weixinConnectToken: "",
   weixinConnectAccountId: "",
   weixinConnectAllowFrom: "",
+  weixinConnectAllowOutboundAttachments: false,
   weixinConnectRouteTag: "",
   weixinConnectWorkDir: "",
   weixinConnectModel: "",
@@ -3130,7 +3136,7 @@ export function App() {
 
   const saveSettings = async () => {
     const next = normalizeSettings(settingsForm);
-    const petIssue = agentPetValidationMessage(agentPetSettingsIssue(next.agentPet));
+    const petIssue = agentPetSaveIssue(next);
     if (petIssue) {
       showNotice(t("Agent 桌宠"), petIssue, "failed");
       return;
@@ -3152,7 +3158,7 @@ export function App() {
 
   const saveSettingsValue = async (next: BackendSettings, silent = true) => {
     const normalized = normalizeSettings(next);
-    const petIssue = agentPetValidationMessage(agentPetSettingsIssue(normalized.agentPet));
+    const petIssue = agentPetSaveIssue(normalized);
     if (petIssue) {
       showNotice(t("Agent 桌宠"), petIssue, "failed");
       return null;
@@ -3181,7 +3187,7 @@ export function App() {
   /// 草稿仍是「有修改」，由页面下一轮再存。
   const autoSaveSettings = async (snapshot: BackendSettings): Promise<AutoSaveOutcome> => {
     const normalized = normalizeSettings(snapshot);
-    const issue = agentPetValidationMessage(agentPetSettingsIssue(normalized.agentPet))
+    const issue = agentPetSaveIssue(normalized)
       || dictationSettingsValidationMessage(dictationSettingsIssue(normalized.dictation));
     if (issue) return { status: "invalid", message: issue };
     try {
@@ -4662,7 +4668,12 @@ export function App() {
             />
           ) : null}
           {route === "multiLaunch" ? (
-            <CodexMultiLaunchScreen form={settingsForm} actions={actions} />
+            <CodexMultiLaunchScreen
+              form={settingsForm}
+              relayFiles={relayFiles}
+              onOpenRelay={() => void navigate("relay")}
+              actions={actions}
+            />
           ) : null}
           {route === "relayEnvironment" ? (
             <ProxySettingsScreen
@@ -4791,6 +4802,9 @@ export function App() {
             <AgentPetPage
               settings={settingsForm.agentPet}
               onChange={(agentPet) => setSettingsForm((current) => ({ ...current, agentPet }))}
+              whaleBalance={settingsForm}
+              onWhaleBalanceChange={(patch) => setSettingsForm((current) => ({ ...current, ...patch }))}
+              whaleBalanceIssue={whaleBalanceValidationMessage(whaleBalanceSettingsIssue(normalizeWhaleBalanceSettings(settingsForm), isAgentPetWhaleWidgetActive(settingsForm.agentPet)))}
               autoSave={<SettingsAutoSave dirty={settingsDirty} form={settingsForm} actions={actions} />}
             />
           ) : null}
@@ -5545,6 +5559,19 @@ function WeixinConnectScreen({
                   value={form.weixinConnectAllowFrom}
                 />
               </label>
+              <div className="field">
+                <span>{t("工作区附件回传")}</span>
+                <Switch
+                  label={t("允许向指定微信用户回传工作区文件")}
+                  on={form.weixinConnectAllowOutboundAttachments}
+                  disabled={!form.weixinConnectAllowOutboundAttachments && (
+                    !form.weixinConnectAllowFrom.split(",").some((peer) => peer.trim())
+                    || form.weixinConnectAllowFrom.split(",").some((peer) => peer.trim() === "*")
+                    || !form.weixinConnectWorkDir.trim()
+                  )}
+                  onToggle={() => onFormChange({ ...form, weixinConnectAllowOutboundAttachments: !form.weixinConnectAllowOutboundAttachments })}
+                />
+              </div>
               <label className="field">
                 <span>{t("账号标识")}</span>
                 <Input
@@ -7209,11 +7236,13 @@ function RelayScreen({
       <PageHeader
         icon={<KeyRound className="h-5 w-5" />}
         title={t("供应商列表")}
-        actions={takenOverByGateway ? null : (
+        actions={(
           <>
             {/* 总开关很少改动：收成标题栏里的小开关，完整说明放在悬停提示里；关闭时下方另有提示条。 */}
-            {/* Codex 被新版网关接管时，旧版的切换、导入、添加都不起作用，整组隐藏；先「断开并还原」。 */}
-            <label
+            {/* Codex 被新版网关接管时，旧版的切换、添加都不起作用，直接隐藏；先「断开并还原」。
+                「从第三方导入」保留（#2801）：导入只写旧版供应商列表、不动 Codex 配置，
+                导进来的供应商可以直接多开，也能在网关「添加供应商 → 导入…」里复制进供应商池。 */}
+            {takenOverByGateway ? null : <label
               className="switch-row compact relay-master-switch relay-master-switch-compact"
               title={t("关闭后本工具不会在手动切换时写入 Codex 的 config.toml / auth.json；启动 Codex 时始终不会自动改这些文件。")}
             >
@@ -7228,7 +7257,7 @@ function RelayScreen({
               />
               <span>{t("配置切换")}</span>
               <ToggleVisual />
-            </label>
+            </label>}
             <div className="third-party-import" ref={thirdPartyImportTriggerRef}>
               <Button
                 onClick={openThirdPartyImport}
@@ -7327,12 +7356,14 @@ function RelayScreen({
                 </div>
               ) : null}
             </div>
-            <Button
-              onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}
-            >
-              <Plus className="h-4 w-4" />
-              {t("添加供应商")}
-            </Button>
+            {takenOverByGateway ? null : (
+              <Button
+                onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}
+              >
+                <Plus className="h-4 w-4" />
+                {t("添加供应商")}
+              </Button>
+            )}
           </>
         )}
       />
@@ -7350,6 +7381,8 @@ function RelayScreen({
           {normalized.relayProfilesEnabled && takenOverByGateway ? (
             <p className="relay-switch-off-note" role="status">
               {t("Codex 正由 Codex++ 网关接管，旧版供应商列表已隐藏。点上方「断开并还原」（或「切回直连」）后恢复。")}
+              {/* #2801：列表藏起来后用户找不到编辑 / 删除和 cc-switch 导入，在这里指路。 */}
+              {" "}{t("这些供应商仍可在「多开」页悬停卡片编辑、删除；右上角「从第三方导入」可以继续导入 cc-switch 的供应商。")}
             </p>
           ) : null}
           {/* 总开关关闭时供应商切换不会写入 Codex：分页和列表都没有意义，整块隐藏，只留上方提示条。 */}
@@ -7447,22 +7480,72 @@ function multiLaunchSupported(profile: RelayProfile): boolean {
 
 function CodexMultiLaunchScreen({
   form,
+  relayFiles,
+  onOpenRelay,
   actions,
 }: {
   form: BackendSettings;
+  relayFiles: RelayFilesResult | null;
+  onOpenRelay: () => void;
   actions: Actions;
 }) {
   const normalized = normalizeSettings(form);
+  // #2801：Codex 被网关接管、或「配置切换」关闭时，旧版供应商页的列表整块隐藏，
+  // 多开里这些供应商（多是早年从 cc-switch 导入的）就没地方编辑、删除了，这里直接给入口。
+  const [detailProfileId, setDetailProfileId] = useState<string | null>(null);
+  const detailProfile = detailProfileId
+    ? normalized.relayProfiles.find((profile) => profile.id === detailProfileId) || null
+    : null;
+  useEffect(() => {
+    if (detailProfileId && !normalized.relayProfiles.some((profile) => profile.id === detailProfileId)) {
+      setDetailProfileId(null);
+    }
+  }, [detailProfileId, normalized.relayProfiles]);
+  const deleteProfile = async (profile: RelayProfile) => {
+    const name = profile.name || t("未命名供应商");
+    // 当前正在使用、或是聚合配置的默认 / 最后成员：和旧版列表一样直接说明原因，不弹确认。
+    const deleteIssue = relayProfileDeleteIssue(normalized, profile.id);
+    if (deleteIssue) {
+      await actions.showMessage(t("删除供应商"), deleteIssue, "failed");
+      return;
+    }
+    const running = runningInstancesForProfile(actions.multiLaunchInstances, profile.id);
+    const message = running.length
+      ? tf("删除供应商「{0}」？它还有 {1} 个多开实例在运行，删除后实例不会被结束，但之后不能再用它启动。", [name, running.length])
+      : tf("删除供应商「{0}」？删除后不能再用它启动多开实例，旧版供应商列表里也会一并移除。", [name]);
+    if (!(await appConfirm(message, { title: t("删除供应商"), confirmText: t("删除"), danger: true }))) return;
+    await actions.saveSettingsValue(removeRelayProfile(normalized, profile.id), true);
+  };
+  if (detailProfile) {
+    return (
+      <RelayProfileDetail
+        profile={detailProfile}
+        relayFiles={detailProfile.id === normalized.activeRelayId ? relayFiles : null}
+        form={normalized}
+        onBack={() => setDetailProfileId(null)}
+        onFormChange={(next) => actions.saveSettingsValue(next, true)}
+        onSaved={() => setDetailProfileId(null)}
+        actions={actions}
+      />
+    );
+  }
   return (
     <div className="mg-page relay-management-page">
       <PageHeader
         icon={<Layers3 className="h-5 w-5" />}
         title={t("Codex多开")}
         actions={(
-          <Button onClick={() => void actions.refreshSettings(true)} variant="secondary">
-            <RefreshCw className="h-4 w-4" />
-            {t("刷新供应商")}
-          </Button>
+          <>
+            {/* cc-switch 导入和添加供应商都在旧版供应商页；网关接管时那里只留「从第三方导入」。 */}
+            <Button onClick={onOpenRelay} title={t("到「旧版供应商配置」添加供应商，或用「从第三方导入」导入 cc-switch 的供应商")} variant="secondary">
+              <Download className="h-4 w-4" />
+              {t("导入或添加供应商")}
+            </Button>
+            <Button onClick={() => void actions.refreshSettings(true)} variant="secondary">
+              <RefreshCw className="h-4 w-4" />
+              {t("刷新供应商")}
+            </Button>
+          </>
         )}
       />
       <div className="mg-content">
@@ -7552,13 +7635,22 @@ function CodexMultiLaunchScreen({
                 const aggregate = isAggregateRelayProfile(profile);
                 const unsupported = !multiLaunchSupported(profile);
                 const pending = actions.multiLaunchPending === profile.id;
+                // 网关托管的那一项由「Agent 接入」管理，和旧版列表一样不给编辑、删除。
+                const gatewayManaged = profile.id === CODEX_GATEWAY_RELAY_ID;
+                const active = profile.id === normalized.activeRelayId;
+                const runningCount = runningInstancesForProfile(actions.multiLaunchInstances, profile.id).length;
                 return (
                   <div className="relay-profile-card multi-launch-card" data-relay-profile-id={profile.id} key={profile.id}>
                     <span className="relay-index" title={profile.name || t("未命名供应商")}>{providerInitial(profile.name)}</span>
                     <span className="relay-summary">
-                      <strong>{profile.name || t("未命名供应商")}</strong>
+                      <strong>
+                        <span className="relay-summary-name">{profile.name || t("未命名供应商")}</span>
+                        {active ? <span className="relay-active-badge">{t("使用中")}</span> : null}
+                        {runningCount ? <span className="relay-tag" data-tone="official">{tf("{0} 个实例运行中", [runningCount])}</span> : null}
+                      </strong>
                       <small>{relayProfileModeLabel(profile)} · {relayProtocolLabel(profile.protocol)} · {relayProfileConfigBrief(profile)}</small>
                     </span>
+                    {/* 操作区是 row-reverse：「启动」写在最前面贴右，编辑 / 删除悬停时出现在它左边，与旧版列表一致。 */}
                     <span className="relay-card-actions">
                       <Button
                         disabled={unsupported || pending}
@@ -7573,6 +7665,29 @@ function CodexMultiLaunchScreen({
                         <Rocket className="h-4 w-4" />
                         {pending ? t("启动中") : t("启动")}
                       </Button>
+                      {gatewayManaged ? null : (
+                        <span className="relay-card-extra">
+                          <Button
+                            aria-label={tf("编辑供应商「{0}」", [profile.name || t("未命名供应商")])}
+                            onClick={() => setDetailProfileId(profile.id)}
+                            size="icon"
+                            title={t("编辑")}
+                            variant="ghost"
+                          >
+                            <Edit3 className="h-4 w-4" />
+                          </Button>
+                          <Button
+                            aria-label={tf("删除供应商「{0}」", [profile.name || t("未命名供应商")])}
+                            disabled={normalized.relayProfiles.length <= 1}
+                            onClick={() => void deleteProfile(profile)}
+                            size="icon"
+                            title={t("删除供应商")}
+                            variant="ghost"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </span>
+                      )}
                     </span>
                   </div>
                 );
@@ -7769,6 +7884,20 @@ function envConflictSourceLabel(source: string): string {
 function agentPetValidationMessage(issue: AgentPetIssue | null): string | null {
   if (issue === "customUrl") return t("自定义图片地址无效，请填写 https:// 开头的图片地址。");
   return null;
+}
+
+function whaleBalanceValidationMessage(issue: WhaleBalanceIssue | null): string | null {
+  if (issue === "path") return t("请填写供应商同域下的余额接口路径，不包含网址、查询参数或片段。");
+  if (issue === "field") return t("请填写余额字段路径，例如 data.balance 或 data.accounts[0].balance。");
+  if (issue === "currency") return t("币种请使用三位代码，例如 USD 或 CNY。");
+  if (issue === "scale") return t("金额倍率必须是大于 0 且不超过 1e12 的有限数值。");
+  return null;
+}
+
+/** 保存前校验 Agent 桌宠：简单桌宠的自定义图片地址；选了大肥鱼时校验它的自定义余额接口。 */
+function agentPetSaveIssue(settings: BackendSettings): string | null {
+  return agentPetValidationMessage(agentPetSettingsIssue(settings.agentPet))
+    || whaleBalanceValidationMessage(whaleBalanceSettingsIssue(settings, isAgentPetWhaleWidgetActive(settings.agentPet)));
 }
 
 type DictationLocalModelState = {
@@ -10276,7 +10405,7 @@ function MaintenanceScreen({
               {autoTakeover?.lastTakeoverAtMs ? (
                 <p className="hint">{tf("上次接管：{0}", [new Date(autoTakeover.lastTakeoverAtMs).toLocaleString()])}</p>
               ) : null}
-              {autoTakeover?.platformSupported ? null : <p className="hint">{t("自动接管目前只支持 macOS。")}</p>}
+              {autoTakeover?.platformSupported ? null : <p className="hint">{t("自动接管目前只支持 macOS 和 Linux。")}</p>}
               <p className="hint">{t("仅在 Codex++ 正在运行时生效；需要重启官方 App 时会自动重启。")}</p>
               <Toolbar>
                 <Button variant="secondary" onClick={() => void actions.takeOverNow()}>{t("立即接管")}</Button>
@@ -11380,7 +11509,8 @@ function RelayProfileDetail({
           {aggregateProfile ? (
             <UiBadge variant="secondary">{aggregateModeRequired ? t("聚合")
               : draft.aggregate?.modelAggregationEnabled === true ? t("模型聚合") : t("故障转移")}</UiBadge>
-          ) : isNew ? null : (
+          ) : isNew || form.activeRelayId === CODEX_GATEWAY_RELAY_ID ? null : (
+            // 网关接管期间（从多开页进来编辑）不给「设为当前」：切走会绕过「断开并还原」（#2801）。
             <Button
               disabled={actions.relaySwitching}
               onClick={switchDraft}
@@ -16934,7 +17064,8 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
   return syncLegacyRelayFields({
     ...defaultSettings,
     ...settings,
-    // 旧版「Codex 用量挂件」开着、还没有桌宠设置的用户，升级后桌宠保持开启。
+    ...normalizeWhaleBalanceSettings(settings),
+    // 旧版「Codex 用量挂件」开着、还没有桌宠设置的用户，升级后桌宠开启并选中大肥鱼。
     agentPet: normalizeAgentPetSettings(settings.agentPet, (settings as { codexAppWhaleWidgetEnabled?: unknown }).codexAppWhaleWidgetEnabled === true),
     ccsDbPath: (settings.ccsDbPath || "").trim(),
     dictation: normalizeDictationSettings(settings.dictation),
@@ -16960,6 +17091,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     codexAppDreamSkinThemeConfig: normalizeDreamSkinTheme(settings.codexAppDreamSkinThemeConfig),
     codexAppDreamSkinImagePath: (settings.codexAppDreamSkinImagePath || "").trim(),
     codexAppStepwiseProtocol: normalizeStepwiseProtocol(settings.codexAppStepwiseProtocol),
+    weixinConnectAllowOutboundAttachments: settings.weixinConnectAllowOutboundAttachments === true,
     codexAppStepwiseGenerationMode: normalizeStepwiseGenerationMode(settings.codexAppStepwiseGenerationMode),
     codexAppStepwiseMaxItems: clampNumber(settings.codexAppStepwiseMaxItems ?? 4, 0, 6),
     codexAppStepwiseMaxInputChars: clampNumber(settings.codexAppStepwiseMaxInputChars || 6000, 1000, 24000),
