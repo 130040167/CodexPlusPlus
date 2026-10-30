@@ -28,6 +28,7 @@ function createHarness(saved = "{}") {
   const storage = new Map([["codex-plus-plus.skill-groups.v1", saved]]);
   const notices: Array<{ message: string; status?: string }> = [];
   const pending: Array<{ id: string; resolve: (result: any) => void }> = [];
+  const failures = new Set(["a2"]);
   const updateCalls: Array<{ command: string; args: any }> = [];
   const installCalls: Array<{ command: string; args: any }> = [];
   const updateQueue = new SkillTaskQueue<any>();
@@ -59,9 +60,12 @@ function createHarness(saved = "{}") {
       target.agents = [args.agent];
       return snapshot();
     }
-    if (args.id === "a") target.agents = [args.agent];
+    if (args.id === "a" && !failures.has(args.id)) {
+      target.agents = target.agents.filter((agent) => agent !== args.agent);
+      if (args.enabled) target.agents.push(args.agent);
+    }
     const result = snapshot();
-    if (args.id === "a2") { result.status = "failed"; result.message = "fixture failure"; }
+    if (failures.has(args.id)) { result.status = "failed"; result.message = "fixture failure"; }
     return new Promise((resolve) => pending.push({ id: args.id, resolve: () => resolve(result) }));
   };
   const context: Record<string, any> = {
@@ -134,7 +138,7 @@ function createHarness(saved = "{}") {
     collect(context.SkillRepoDrawer(props));
     return elements;
   };
-  return { render, renderDrawer, find, groupSelect, groupInput, row, sort, order, expand, pending, notices, storage, server, updateCalls, installCalls, updateQueue, releasePreview: () => releasePreview?.() };
+  return { render, renderDrawer, find, groupSelect, groupInput, row, sort, order, expand, pending, failures, notices, storage, server, updateCalls, installCalls, updateQueue, releasePreview: () => releasePreview?.() };
 }
 
 test("discover installs the selected repository path with its distinct local identity", async () => {
@@ -231,6 +235,122 @@ test("batch selection leaves unrelated buttons and agent controls enabled and pr
   input.props.ref(element);
   assert.equal(element.indeterminate, true);
   assert.ok(ui.notices.some((notice) => notice.status === "failed" && notice.message.includes("fixture failure")));
+});
+
+test("filter changes keep the same group and agent locked without projecting untouched skills", async () => {
+  const ui = createHarness();
+  ui.server.skills[0].name = "first-target";
+  ui.server.skills[1].name = "second-visible";
+  ui.render(); await tick(); ui.render();
+  ui.find((node) => node.type === "SearchField").props.onChange("first-target"); ui.render();
+  const initial = ui.groupInput("repo:a/repo", "codex");
+  initial.props.onChange({ target: { checked: true } });
+  initial.props.onChange({ target: { checked: true } });
+  assert.equal(ui.pending.length, 1);
+  ui.render();
+  ui.find((node) => node.type === "SearchField").props.onChange("second-visible"); ui.render();
+  const filtered = ui.groupInput("repo:a/repo", "codex");
+  assert.equal(filtered.props.disabled, true);
+  assert.equal(filtered.props.checked, false);
+  filtered.props.onChange({ target: { checked: true } });
+  assert.equal(ui.pending.length, 1);
+  ui.find((node) => node.type === "SearchField").props.onChange(""); ui.render();
+  const full = ui.groupInput("repo:a/repo", "codex");
+  const element = { indeterminate: false };
+  full.props.ref(element);
+  assert.equal(full.props.checked, false);
+  assert.equal(element.indeterminate, true);
+  assert.equal(ui.groupInput("repo:a/repo", "claude").props.disabled, false);
+  assert.equal(ui.groupInput("repo:z/repo", "codex").props.disabled, false);
+  ui.groupInput("repo:z/repo", "codex").props.onChange({ target: { checked: true } });
+  await tick(); ui.render();
+  assert.equal(ui.server.skills[2].agents.includes("codex"), true);
+  ui.pending.shift()!.resolve(null);
+  await tick(); ui.render();
+  assert.equal(ui.groupInput("repo:a/repo", "codex").props.disabled, false);
+});
+
+test("filtering to an already-enabled member keeps its real checked state and blocks a second batch", async () => {
+  const ui = createHarness();
+  ui.server.skills[0].name = "first-target";
+  ui.server.skills[1].name = "second-visible";
+  ui.server.skills[1].agents = ["codex"];
+  ui.render(); await tick(); ui.render();
+  ui.find((node) => node.type === "SearchField").props.onChange("first-target"); ui.render();
+  ui.groupInput("repo:a/repo", "codex").props.onChange({ target: { checked: true } });
+  ui.render();
+  ui.find((node) => node.type === "SearchField").props.onChange("second-visible"); ui.render();
+  const filtered = ui.groupInput("repo:a/repo", "codex");
+  assert.equal(filtered.props.checked, true);
+  assert.equal(filtered.props.disabled, true);
+  filtered.props.onChange({ target: { checked: false } });
+  assert.equal(ui.pending.length, 1);
+  ui.pending.shift()!.resolve(null);
+  await tick(); ui.render();
+  assert.equal(ui.groupInput("repo:a/repo", "codex").props.checked, true);
+  assert.equal(ui.groupInput("repo:a/repo", "codex").props.disabled, false);
+});
+
+test("a filtered-out pending disable does not change another enabled member's display", async () => {
+  const ui = createHarness();
+  ui.server.skills[0].name = "first-target";
+  ui.server.skills[1].name = "second-visible";
+  ui.server.skills[0].agents = ["codex"];
+  ui.server.skills[1].agents = ["codex"];
+  ui.render(); await tick(); ui.render();
+  ui.find((node) => node.type === "SearchField").props.onChange("first-target"); ui.render();
+  ui.groupInput("repo:a/repo", "codex").props.onChange({ target: { checked: false } });
+  ui.render();
+  ui.find((node) => node.type === "SearchField").props.onChange("second-visible"); ui.render();
+  const filtered = ui.groupInput("repo:a/repo", "codex");
+  assert.equal(filtered.props.checked, true);
+  assert.equal(filtered.props.disabled, true);
+  ui.pending.shift()!.resolve(null);
+  await tick(); ui.render();
+  assert.equal(ui.groupInput("repo:a/repo", "codex").props.checked, true);
+});
+
+test("moving a pending target to another group keeps that group locked even when the target is filtered out", async () => {
+  const ui = createHarness();
+  ui.server.skills[0].name = "first-target";
+  ui.server.skills[1].name = "second-visible";
+  ui.server.skills[1].repoKey = "";
+  ui.render(); await tick(); ui.render();
+  ui.find((node) => node.type === "SearchField").props.onChange("first-target"); ui.render();
+  ui.groupInput("repo:a/repo", "codex").props.onChange({ target: { checked: true } });
+  ui.render();
+  ui.find((node) => node.type === "SkillActionMenu" && node.props.skill.id === "a").props.onAssign("user");
+  ui.render();
+  ui.find((node) => node.type === "SearchField").props.onChange("second-visible"); ui.render();
+  const filtered = ui.groupInput("user", "codex");
+  assert.equal(filtered.props.disabled, true);
+  assert.equal(filtered.props.checked, false);
+  filtered.props.onChange({ target: { checked: true } });
+  assert.equal(ui.pending.length, 1);
+  ui.pending.shift()!.resolve(null);
+  await tick(); ui.render();
+  assert.equal(ui.groupInput("user", "codex").props.disabled, false);
+});
+
+test("a failed completed target shows its actual state while the remaining target is pending", async () => {
+  const ui = createHarness();
+  ui.failures.add("a");
+  ui.render(); await tick(); ui.render();
+  ui.groupInput("repo:a/repo", "codex").props.onChange({ target: { checked: true } });
+  ui.render();
+  assert.equal(ui.groupInput("repo:a/repo", "codex").props.checked, true);
+  ui.pending.shift()!.resolve(null);
+  await tick(); ui.render();
+  assert.equal(ui.pending[0].id, "a2");
+  const input = ui.groupInput("repo:a/repo", "codex");
+  const element = { indeterminate: false };
+  input.props.ref(element);
+  assert.equal(input.props.disabled, true);
+  assert.equal(input.props.checked, false);
+  assert.equal(element.indeterminate, true);
+  ui.pending.shift()!.resolve(null);
+  await tick(); ui.render();
+  assert.equal(ui.groupInput("repo:a/repo", "codex").props.disabled, false);
 });
 
 test("group update queues the complete group even when filtered and deduplicates pending tasks", async () => {

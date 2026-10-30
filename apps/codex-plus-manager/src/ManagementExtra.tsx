@@ -33,6 +33,7 @@ type Skill = { id: string; name: string; description: string; repoKey: string; r
 type Repo = { owner: string; name: string; branch: string; subdir: string; enabled: boolean };
 type SkillPayload = Result & { skills: Skill[]; repos: Repo[]; pendingImportedRepos?: Repo[]; repositorySkills: Skill[]; repoCounts: Record<string, number>; repoErrors: string[]; skillsDir: string; codexSkillsDir: string; agentSkillsDirs?: Record<string, string> };
 type RepoInspection = Result & { repo: Repo; skills: Skill[]; skillCount: number };
+type PendingSkillBatchOperation = SkillBatchOperation & { settledSkillIds: string[] };
 type RepoCheck = { state: "queued" | "running" | "done" | "failed"; message?: string };
 type SkillImportMatch = { id: string; name: string; reasons: string[]; snapshot: string };
 type SkillImportCandidate = { id: string; name: string; description: string; sourceHash: string; repoKey: string; repoPath: string; matches: SkillImportMatch[]; duplicateCandidates: string[] };
@@ -200,9 +201,9 @@ function SkillDetailDrawer({ skill, count, group, originGroup, groups, onAssign,
   const canMatch = skill.installed && !skill.bundled;
   return <ManagementDrawer dismissOnBackdrop={false} title={skill.name || skill.id} onClose={onClose}>
     <dl className="mg-detail"><dt>{t("所属分组")}</dt><dd>{group && skill.installed && !skill.bundled
-      ? <AppSelect value={group.key} ariaLabel={`${t("切换分组")} ${skill.name || skill.id}`} onChange={onAssign}
-          options={[...groups.filter((item) => item.kind !== "builtin").map((item) => ({ value: item.key, label: item.label })),
-            ...(originGroup ? [{ value: "", label: `${t("按来源自动分组")} · ${originGroup.label}` }] : [])]} />
+      ? <AppSelect value={group.key} className="mg-skill-long-select" title={group.label} ariaLabel={`${t("切换分组")} ${skill.name || skill.id}`} onChange={onAssign}
+          options={[...groups.filter((item) => item.kind !== "builtin").map((item) => ({ value: item.key, label: item.label, title: item.label })),
+            ...(originGroup ? [{ value: "", label: `${t("按来源自动分组")} · ${originGroup.label}`, title: `${t("按来源自动分组")} · ${originGroup.label}` }] : [])]} />
       : group?.label || t("未安装")}</dd>
       <dt>{t("来源")}</dt><dd>{url ? <button className="mg-link-button mg-skill-repo-link" type="button" onClick={onOpenRepo}>{sourceLabel(skill)}{count === undefined ? "" : ` · ${count} Skills`}<ArrowRight size={13}/></button> : sourceLabel(skill)}</dd>
       {importChannel(skill) && <><dt>{t("导入渠道")}</dt><dd>{importChannel(skill)}</dd></>}
@@ -238,13 +239,18 @@ function SkillImportDrawer({ request, busy, onClose, onRefresh, onApply }: { req
       <Button disabled={busy} onClick={() => setSelected(new Set())}>{t("清空选择")}</Button>
     </div></div>
     {(invalidTargets || duplicateIncoming || duplicateTargets) && <p className="mg-notice mg-warning" role="alert">{duplicateIncoming ? t("所选导入项互相重复，请只保留其中一个。") : duplicateTargets ? t("多个导入项不能覆盖同一个已有 Skill。") : t("请为每个重复项选择要覆盖的 Skill。")}</p>}
-    <div className="mg-skill-import-list">{candidates.map((item) => <div className="mg-skill-import-row" key={item.id}>
+    <div className="mg-skill-import-list">{candidates.map((item) => {
+      const targetOptions = item.matches.map((match) => {
+        const label = `${match.name} (${match.id})`;
+        return { value: match.id, label, title: label };
+      });
+      return <div className="mg-skill-import-row" key={item.id}>
       <label><input type="checkbox" checked={selected.has(item.id)} disabled={busy} onChange={(event) => { const checked = event.currentTarget.checked; setSelected((old) => { const next = new Set(old); checked ? next.add(item.id) : next.delete(item.id); return next; }); }}/>
         <span><strong>{item.name || item.id}</strong><small title={item.description}>{item.id}{item.repoKey ? ` · ${item.repoKey.split("@", 1)[0]}` : ` · ${t("用户")}`}</small></span></label>
-      {item.matches.length ? <div className="mg-skill-import-target"><span>{t("覆盖已有")}</span><AppSelect value={targets[item.id] || ""} ariaLabel={`${t("选择覆盖目标")} ${item.name || item.id}`} placeholder={t("选择覆盖目标")}
-        disabled={!selected.has(item.id) || busy} options={item.matches.map((match) => ({ value: match.id, label: `${match.name} (${match.id})` }))}
+      {item.matches.length ? <div className="mg-skill-import-target"><span>{t("覆盖已有")}</span><AppSelect value={targets[item.id] || ""} className="mg-skill-long-select" title={targetOptions.find((option) => option.value === targets[item.id])?.label || ""} ariaLabel={`${t("选择覆盖目标")} ${item.name || item.id}`} placeholder={t("选择覆盖目标")}
+        disabled={!selected.has(item.id) || busy} options={targetOptions}
         onChange={(target) => setTargets((old) => ({ ...old, [item.id]: target }))}/></div> : item.duplicateCandidates.length ? <small className="mg-skill-import-duplicate">{t("导入清单中重复")}</small> : <small>{t("新增")}</small>}
-    </div>)}</div>
+    </div>; })}</div>
   </ManagementDrawer>;
 }
 function SortableSkillGroup({ group, disabled, children }: { group: SkillGroup<Skill>; disabled: boolean; children: (handle: ReactNode) => ReactNode }) {
@@ -254,12 +260,24 @@ function SortableSkillGroup({ group, disabled, children }: { group: SkillGroup<S
   return <section className="mg-skill-group" ref={setNodeRef} data-dragging={isDragging}
     style={{ transform: CSS.Transform.toString(transform), transition }}>{children(handle)}</section>;
 }
-function GroupAgentSelect({ group, agent, busy, pending, onChange }: { group: SkillGroup<Skill>; agent: McpAgentId; busy: boolean; pending: boolean | null; onChange: (enabled: boolean) => void }) {
-  const state = skillBatchState(group.items, agent);
+function GroupAgentSelect({ group, agent, busy, operations, onChange }: { group: SkillGroup<Skill>; agent: McpAgentId; busy: boolean; operations: PendingSkillBatchOperation[]; onChange: (enabled: boolean) => void }) {
+  const pendingById = new Map<string, boolean>();
+  for (const operation of operations) {
+    if (operation.agent !== agent) continue;
+    const settled = new Set(operation.settledSkillIds);
+    for (const id of operation.skillIds) if (!settled.has(id)) pendingById.set(id, operation.enabled);
+  }
+  const state = skillBatchState(group.items.map((skill) => {
+    const pending = pendingById.get(skill.id);
+    if (pending === undefined) return skill;
+    const agents = skillAgents(skill).filter((value) => value !== agent);
+    if (pending) agents.push(agent);
+    return { ...skill, agents };
+  }), agent);
   const name = agent === "codex" ? "Codex" : agent === "claude" ? "Claude Code" : "Grok";
   return <label className="mg-skill-batch-cell" title={`${group.label} · ${name} · ${t("全选")}`}>
-    <input type="checkbox" aria-label={`${group.label} · ${name} · ${t("全选")}`} checked={pending ?? state.checked}
-      ref={(element) => { if (element) element.indeterminate = pending === null && state.mixed; }} disabled={busy || !state.total}
+    <input type="checkbox" aria-label={`${group.label} · ${name} · ${t("全选")}`} checked={state.checked}
+      ref={(element) => { if (element) element.indeterminate = state.mixed; }} disabled={busy || !state.total}
       onChange={(event) => onChange(event.target.checked)} />
   </label>;
 }
@@ -312,8 +330,8 @@ export function SkillsPage({ notify }: { notify: Notify }) {
   const [tab, setTab] = useState<"discover" | "installed">("installed");
   const [query, setQuery] = useState("");
   const [busy, setBusy] = useState(false);
-  const [batchOperations, setBatchOperations] = useState<SkillBatchOperation[]>([]);
-  const batchOperationsRef = useRef<SkillBatchOperation[]>([]);
+  const [batchOperations, setBatchOperations] = useState<PendingSkillBatchOperation[]>([]);
+  const batchOperationsRef = useRef<PendingSkillBatchOperation[]>([]);
   const [repoOpen, setRepoOpen] = useState(false);
   const [detail, setDetail] = useState<Skill | null>(null);
   const [conflict, setConflict] = useState<Skill | null>(null);
@@ -465,13 +483,15 @@ export function SkillsPage({ notify }: { notify: Notify }) {
     }
   };
   const runBatch = async (group: SkillGroup<Skill>, agent: McpAgentId, enabled: boolean) => {
-    if (skillBatchHasPending(batchOperationsRef.current, group.items, agent)) return;
+    const groupItems = allGroups.find((item) => item.key === group.key)?.items || group.items;
+    if (batchOperationsRef.current.some((operation) => operation.groupKey === group.key && operation.agent === agent)
+      || skillBatchHasPending(batchOperationsRef.current, groupItems, agent)) return;
     const targets = skillBatchTargets(group.items, agent, enabled);
     if (!targets.length) {
       await notify("Skills", enabled ? t("该组没有可启用的 Skill") : t("该组没有可停用的 Skill"), "ok");
       return;
     }
-    const operation: SkillBatchOperation = { groupKey: group.key, agent, enabled, skillIds: targets.map((skill) => skill.id) };
+    let operation: PendingSkillBatchOperation = { groupKey: group.key, agent, enabled, skillIds: targets.map((skill) => skill.id), settledSkillIds: [] };
     batchOperationsRef.current = [...batchOperationsRef.current, operation];
     setBatchOperations(batchOperationsRef.current);
     let completed = 0;
@@ -487,6 +507,12 @@ export function SkillsPage({ notify }: { notify: Notify }) {
           if (ok(result)) completed++;
           else errors.push(`${skill.name || skill.id}：${result.message}`);
         } catch (error) { errors.push(`${skill.name || skill.id}：${String(error)}`); }
+        finally {
+          const previous = operation;
+          operation = { ...operation, settledSkillIds: [...operation.settledSkillIds, skill.id] };
+          batchOperationsRef.current = batchOperationsRef.current.map((item) => item === previous ? operation : item);
+          if (mounted.current) setBatchOperations(batchOperationsRef.current);
+        }
       }
     } finally {
       batchOperationsRef.current = batchOperationsRef.current.filter((item) => item !== operation);
@@ -680,8 +706,9 @@ export function SkillsPage({ notify }: { notify: Notify }) {
           const groupItems = group.items;
           const collapsed = !expandedGroups.has(group.key) && !query.trim();
           const movable = group.kind === "custom" || group.kind === "repo";
+          const allGroupItems = allGroups.find((item) => item.key === group.key)?.items || groupItems;
           const updateItems = tab === "installed"
-            ? (allGroups.find((item) => item.key === group.key)?.items || []).filter((skill) => skill.installed && !skill.bundled && skill.updateAvailable)
+            ? allGroupItems.filter((skill) => skill.installed && !skill.bundled && skill.updateAvailable)
             : [];
           const updates = updateItems.length;
           const hasUnqueuedUpdate = updateItems.some((skill) => !updateTasks.some((task) =>
@@ -693,8 +720,8 @@ export function SkillsPage({ notify }: { notify: Notify }) {
               </button></div>
               <span className="mg-skill-batch-label">{t("全选")}</span>
               {MCP_AGENTS.map((agent) => <GroupAgentSelect group={group} agent={agent} key={agent}
-                busy={busy || skillBatchHasPending(batchOperations, groupItems, agent)}
-                pending={batchOperations.find((operation) => operation.groupKey === group.key && operation.agent === agent)?.enabled ?? null}
+                busy={busy || batchOperations.some((operation) => operation.groupKey === group.key && operation.agent === agent) || skillBatchHasPending(batchOperations, allGroupItems, agent)}
+                operations={batchOperations}
                 onChange={(enabled) => void runBatch(group, agent, enabled)}/>)}
               <div className="mg-row-actions">
                 {updates ? <button type="button" className="mg-icon-button" disabled={!hasUnqueuedUpdate}

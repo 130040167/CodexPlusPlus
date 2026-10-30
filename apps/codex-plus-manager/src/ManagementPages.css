@@ -351,6 +351,11 @@
 .mg-skill-import-row small { color:hsl(var(--muted-foreground)); font-size:11px; }
 .mg-skill-import-target { display:flex; flex-direction:column; gap:3px; min-width:0; font-size:11px; color:hsl(var(--muted-foreground)); }
 .mg-skill-import-target .app-select { width:100%; min-width:0; }
+.app-select.mg-skill-long-select { min-width:0; max-width:100%; }
+.app-select.mg-skill-long-select .app-select-trigger { height:auto; padding-block:7px; }
+.app-select-menu.mg-skill-long-select .app-select-option { padding-block:6px; }
+.app-select.mg-skill-long-select .app-select-trigger > span,
+.app-select-menu.mg-skill-long-select .app-select-option-label { overflow:visible; overflow-wrap:anywhere; text-overflow:clip; white-space:normal; }
 .mg-skill-import-duplicate { color:hsl(var(--status-warning)) !important; }
 @media (max-width:620px) { .mg-skill-import-row { grid-template-columns:minmax(0,1fr); } }
 /* 多 Agent 表头（MCP / Skills）：Agent 列是图标 + 名字 + 数量三行，比普通表头高，上下留出边距 */
