@@ -197,7 +197,9 @@ impl Inbox {
             parents.push(parent.child(name).context("微信附件目录不允许链接")?);
         }
         let inbox = parents.last().unwrap();
-        cleanup(inbox, SystemTime::now(), MAX_DIRECTORIES - 1)?;
+        if let Err(error) = cleanup(inbox, SystemTime::now(), MAX_DIRECTORIES - 1) {
+            log_cleanup_error(&error);
+        }
         let name = uuid::Uuid::new_v4().to_string();
         inbox.create_child(&name)?;
         let directory = inbox.child(&name)?;
@@ -328,7 +330,13 @@ fn owned_manifest(directory: &Directory, name: &str) -> anyhow::Result<(Manifest
 fn cleanup(inbox: &Directory, now: SystemTime, retain: usize) -> anyhow::Result<()> {
     let mut owned = Vec::new();
     for entry in std::fs::read_dir(&inbox.path)? {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                log_cleanup_error(&error.into());
+                continue;
+            }
+        };
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
@@ -351,30 +359,44 @@ fn cleanup(inbox: &Directory, now: SystemTime, retain: usize) -> anyhow::Result<
         if index >= excess && now.duration_since(modified).unwrap_or_default() <= RETENTION {
             continue;
         }
-        let directory = inbox.child(&name)?;
-        let Ok(lease) = directory.open_file(LEASE, false, false) else {
-            continue;
-        };
-        if lease.try_lock().is_err() {
-            continue;
+        // 单个旧目录清理失败不能阻断其他清理或本次收件。
+        if let Err(error) = cleanup_directory(inbox, &name, modified) {
+            log_cleanup_error(&error);
         }
-        let Ok((marker, current_modified)) = owned_manifest(&directory, &name) else {
-            continue;
-        };
-        if current_modified != modified {
-            continue;
-        }
-        for (filename, _, _) in marker.files {
-            directory.remove(&filename, false)?;
-        }
-        directory.remove(MARKER, false)?;
-        drop(lease);
-        directory.remove(LEASE, false)?;
-        drop(directory);
-        // 仅移除空目录；额外内容永不递归删除。
-        inbox.remove(&name, true)?;
     }
     Ok(())
+}
+
+fn cleanup_directory(inbox: &Directory, name: &str, modified: SystemTime) -> anyhow::Result<()> {
+    let directory = inbox.child(name)?;
+    let Ok(lease) = directory.open_file(LEASE, false, false) else {
+        return Ok(());
+    };
+    if lease.try_lock().is_err() {
+        return Ok(());
+    }
+    let Ok((marker, current_modified)) = owned_manifest(&directory, name) else {
+        return Ok(());
+    };
+    if current_modified != modified {
+        return Ok(());
+    }
+    for (filename, _, _) in marker.files {
+        directory.remove(&filename, false)?;
+    }
+    directory.remove(MARKER, false)?;
+    drop(lease);
+    directory.remove(LEASE, false)?;
+    drop(directory);
+    // 仅移除空目录；额外内容永不递归删除。
+    inbox.remove(name, true)
+}
+
+fn log_cleanup_error(error: &anyhow::Error) {
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "weixin.inbox.cleanup_skipped",
+        serde_json::json!({ "error": format!("{error:#}") }),
+    );
 }
 
 #[cfg(test)]
@@ -603,6 +625,112 @@ mod tests {
         drop(active);
         cleanup(&parent, SystemTime::now() + RETENTION * 2, 0).unwrap();
         assert!(!path.exists());
+    }
+
+    #[cfg(windows)]
+    async fn check_delete_locked_attachment_does_not_block_inbound(expired: bool) {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let old = Inbox::create(root.path()).unwrap();
+        let old_path = old.path().to_path_buf();
+        let file = old.save("locked.txt", b"old attachment").await.unwrap();
+        old.record(&[LocalAttachment {
+            path: file.clone(),
+            kind: AttachmentKind::File,
+        }])
+        .unwrap();
+        let modified = SystemTime::now()
+            - if expired {
+                RETENTION * 2
+            } else {
+                Duration::from_secs(60)
+            };
+        File::options()
+            .write(true)
+            .open(old_path.join(MARKER))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        drop(old);
+        // 可共享读写但不共享删除，真实复现 Windows 附件被占用。
+        let held = File::options()
+            .read(true)
+            .share_mode(1 | 2)
+            .open(&file)
+            .unwrap();
+        assert_eq!(
+            std::fs::remove_file(&file).unwrap_err().raw_os_error(),
+            Some(32)
+        );
+        if !expired {
+            for _ in 1..MAX_DIRECTORIES {
+                drop(Inbox::create(root.path()).unwrap());
+            }
+        }
+        let new = Inbox::create(root.path()).unwrap();
+        let saved = new.save("new.txt", b"new attachment").await.unwrap();
+        new.record(&[LocalAttachment {
+            path: saved.clone(),
+            kind: AttachmentKind::File,
+        }])
+        .unwrap();
+        assert_eq!(std::fs::read(&saved).unwrap(), b"new attachment");
+        assert_eq!(std::fs::read(&file).unwrap(), b"old attachment");
+        let parent = Directory::open(old_path.parent().unwrap()).unwrap();
+        cleanup(&parent, SystemTime::now() + RETENTION * 2, 0).unwrap();
+        assert!(old_path.join(MARKER).is_file());
+        assert!(old_path.join(LEASE).is_file());
+        // 被占用目录不妨碍其他已归属旧目录清理，活动新目录继续保留。
+        assert_eq!(std::fs::read_dir(&parent.path).unwrap().count(), 2);
+        drop(held);
+        cleanup(&parent, SystemTime::now() + RETENTION * 2, 0).unwrap();
+        assert!(!old_path.exists());
+        assert_eq!(std::fs::read(saved).unwrap(), b"new attachment");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn expired_delete_locked_attachment_does_not_block_new_inbound() {
+        check_delete_locked_attachment_does_not_block_inbound(true).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn excess_delete_locked_attachment_does_not_block_new_inbound() {
+        check_delete_locked_attachment_does_not_block_inbound(false).await;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn delete_locked_marker_lease_or_directory_does_not_block_new_inbound() {
+        for name in [MARKER, LEASE, "."] {
+            let root = tempfile::tempdir().unwrap();
+            let old = Inbox::create(root.path()).unwrap();
+            let old_path = old.path().to_path_buf();
+            drop(old);
+            let parent = Directory::open(old_path.parent().unwrap()).unwrap();
+            let held = open_path(&old_path.join(name), name == ".", false).unwrap();
+            cleanup(&parent, SystemTime::now() + RETENTION * 2, 0).unwrap();
+            assert!(old_path.exists(), "{name}");
+            let new = Inbox::create(root.path()).unwrap();
+            assert_ne!(new.path(), old_path);
+            drop(held);
+        }
+    }
+
+    #[test]
+    fn inbox_creation_still_reports_invalid_workspace_and_directory_errors() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(Inbox::create(&root.path().join("missing")).is_err());
+        let parent = root.path().join(".codex-plus/weixin");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(parent.join("inbox"), b"not a directory").unwrap();
+        assert!(Inbox::create(root.path()).is_err());
+        assert_eq!(
+            std::fs::read(parent.join("inbox")).unwrap(),
+            b"not a directory"
+        );
     }
 
     #[test]
