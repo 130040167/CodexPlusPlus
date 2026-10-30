@@ -292,6 +292,7 @@ import {
   multiLaunchInstanceLabel as formatMultiLaunchInstanceLabel,
   multiLaunchInstanceRunning,
   multiLaunchInstanceStatus,
+  runningInstancesForProfile,
   type MultiLaunchInstance,
 } from "./multi-launch-model";
 
@@ -4662,7 +4663,12 @@ export function App() {
             />
           ) : null}
           {route === "multiLaunch" ? (
-            <CodexMultiLaunchScreen form={settingsForm} actions={actions} />
+            <CodexMultiLaunchScreen
+              form={settingsForm}
+              relayFiles={relayFiles}
+              onOpenRelay={() => void navigate("relay")}
+              actions={actions}
+            />
           ) : null}
           {route === "relayEnvironment" ? (
             <ProxySettingsScreen
@@ -7209,11 +7215,13 @@ function RelayScreen({
       <PageHeader
         icon={<KeyRound className="h-5 w-5" />}
         title={t("供应商列表")}
-        actions={takenOverByGateway ? null : (
+        actions={(
           <>
             {/* 总开关很少改动：收成标题栏里的小开关，完整说明放在悬停提示里；关闭时下方另有提示条。 */}
-            {/* Codex 被新版网关接管时，旧版的切换、导入、添加都不起作用，整组隐藏；先「断开并还原」。 */}
-            <label
+            {/* Codex 被新版网关接管时，旧版的切换、添加都不起作用，直接隐藏；先「断开并还原」。
+                「从第三方导入」保留（#2801）：导入只写旧版供应商列表、不动 Codex 配置，
+                导进来的供应商可以直接多开，也能在网关「添加供应商 → 导入…」里复制进供应商池。 */}
+            {takenOverByGateway ? null : <label
               className="switch-row compact relay-master-switch relay-master-switch-compact"
               title={t("关闭后本工具不会在手动切换时写入 Codex 的 config.toml / auth.json；启动 Codex 时始终不会自动改这些文件。")}
             >
@@ -7228,7 +7236,7 @@ function RelayScreen({
               />
               <span>{t("配置切换")}</span>
               <ToggleVisual />
-            </label>
+            </label>}
             <div className="third-party-import" ref={thirdPartyImportTriggerRef}>
               <Button
                 onClick={openThirdPartyImport}
@@ -7327,12 +7335,14 @@ function RelayScreen({
                 </div>
               ) : null}
             </div>
-            <Button
-              onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}
-            >
-              <Plus className="h-4 w-4" />
-              {t("添加供应商")}
-            </Button>
+            {takenOverByGateway ? null : (
+              <Button
+                onClick={() => { setNewProfileDraft(null); setDetailProfileId(null); setProviderCatalogOpen(true); }}
+              >
+                <Plus className="h-4 w-4" />
+                {t("添加供应商")}
+              </Button>
+            )}
           </>
         )}
       />
@@ -7350,6 +7360,8 @@ function RelayScreen({
           {normalized.relayProfilesEnabled && takenOverByGateway ? (
             <p className="relay-switch-off-note" role="status">
               {t("Codex 正由 Codex++ 网关接管，旧版供应商列表已隐藏。点上方「断开并还原」（或「切回直连」）后恢复。")}
+              {/* #2801：列表藏起来后用户找不到编辑 / 删除和 cc-switch 导入，在这里指路。 */}
+              {" "}{t("这些供应商仍可在「多开」页悬停卡片编辑、删除；右上角「从第三方导入」可以继续导入 cc-switch 的供应商。")}
             </p>
           ) : null}
           {/* 总开关关闭时供应商切换不会写入 Codex：分页和列表都没有意义，整块隐藏，只留上方提示条。 */}
@@ -7447,22 +7459,72 @@ function multiLaunchSupported(profile: RelayProfile): boolean {
 
 function CodexMultiLaunchScreen({
   form,
+  relayFiles,
+  onOpenRelay,
   actions,
 }: {
   form: BackendSettings;
+  relayFiles: RelayFilesResult | null;
+  onOpenRelay: () => void;
   actions: Actions;
 }) {
   const normalized = normalizeSettings(form);
+  // #2801：Codex 被网关接管、或「配置切换」关闭时，旧版供应商页的列表整块隐藏，
+  // 多开里这些供应商（多是早年从 cc-switch 导入的）就没地方编辑、删除了，这里直接给入口。
+  const [detailProfileId, setDetailProfileId] = useState<string | null>(null);
+  const detailProfile = detailProfileId
+    ? normalized.relayProfiles.find((profile) => profile.id === detailProfileId) || null
+    : null;
+  useEffect(() => {
+    if (detailProfileId && !normalized.relayProfiles.some((profile) => profile.id === detailProfileId)) {
+      setDetailProfileId(null);
+    }
+  }, [detailProfileId, normalized.relayProfiles]);
+  const deleteProfile = async (profile: RelayProfile) => {
+    const name = profile.name || t("未命名供应商");
+    // 当前正在使用、或是聚合配置的默认 / 最后成员：和旧版列表一样直接说明原因，不弹确认。
+    const deleteIssue = relayProfileDeleteIssue(normalized, profile.id);
+    if (deleteIssue) {
+      await actions.showMessage(t("删除供应商"), deleteIssue, "failed");
+      return;
+    }
+    const running = runningInstancesForProfile(actions.multiLaunchInstances, profile.id);
+    const message = running.length
+      ? tf("删除供应商「{0}」？它还有 {1} 个多开实例在运行，删除后实例不会被结束，但之后不能再用它启动。", [name, running.length])
+      : tf("删除供应商「{0}」？删除后不能再用它启动多开实例，旧版供应商列表里也会一并移除。", [name]);
+    if (!(await appConfirm(message, { title: t("删除供应商"), confirmText: t("删除"), danger: true }))) return;
+    await actions.saveSettingsValue(removeRelayProfile(normalized, profile.id), true);
+  };
+  if (detailProfile) {
+    return (
+      <RelayProfileDetail
+        profile={detailProfile}
+        relayFiles={detailProfile.id === normalized.activeRelayId ? relayFiles : null}
+        form={normalized}
+        onBack={() => setDetailProfileId(null)}
+        onFormChange={(next) => actions.saveSettingsValue(next, true)}
+        onSaved={() => setDetailProfileId(null)}
+        actions={actions}
+      />
+    );
+  }
   return (
     <div className="mg-page relay-management-page">
       <PageHeader
         icon={<Layers3 className="h-5 w-5" />}
         title={t("Codex多开")}
         actions={(
-          <Button onClick={() => void actions.refreshSettings(true)} variant="secondary">
-            <RefreshCw className="h-4 w-4" />
-            {t("刷新供应商")}
-          </Button>
+          <>
+            {/* cc-switch 导入和添加供应商都在旧版供应商页；网关接管时那里只留「从第三方导入」。 */}
+            <Button onClick={onOpenRelay} title={t("到「旧版供应商配置」添加供应商，或用「从第三方导入」导入 cc-switch 的供应商")} variant="secondary">
+              <Download className="h-4 w-4" />
+              {t("导入或添加供应商")}
+            </Button>
+            <Button onClick={() => void actions.refreshSettings(true)} variant="secondary">
+              <RefreshCw className="h-4 w-4" />
+              {t("刷新供应商")}
+            </Button>
+          </>
         )}
       />
       <div className="mg-content">
@@ -7552,13 +7614,22 @@ function CodexMultiLaunchScreen({
                 const aggregate = isAggregateRelayProfile(profile);
                 const unsupported = !multiLaunchSupported(profile);
                 const pending = actions.multiLaunchPending === profile.id;
+                // 网关托管的那一项由「Agent 接入」管理，和旧版列表一样不给编辑、删除。
+                const gatewayManaged = profile.id === CODEX_GATEWAY_RELAY_ID;
+                const active = profile.id === normalized.activeRelayId;
+                const runningCount = runningInstancesForProfile(actions.multiLaunchInstances, profile.id).length;
                 return (
                   <div className="relay-profile-card multi-launch-card" data-relay-profile-id={profile.id} key={profile.id}>
                     <span className="relay-index" title={profile.name || t("未命名供应商")}>{providerInitial(profile.name)}</span>
                     <span className="relay-summary">
-                      <strong>{profile.name || t("未命名供应商")}</strong>
+                      <strong>
+                        <span className="relay-summary-name">{profile.name || t("未命名供应商")}</span>
+                        {active ? <span className="relay-active-badge">{t("使用中")}</span> : null}
+                        {runningCount ? <span className="relay-tag" data-tone="official">{tf("{0} 个实例运行中", [runningCount])}</span> : null}
+                      </strong>
                       <small>{relayProfileModeLabel(profile)} · {relayProtocolLabel(profile.protocol)} · {relayProfileConfigBrief(profile)}</small>
                     </span>
+                    {/* 操作区是 row-reverse：「启动」写在最前面贴右，编辑 / 删除悬停时出现在它左边，与旧版列表一致。 */}
                     <span className="relay-card-actions">
                       <Button
                         disabled={unsupported || pending}
@@ -7573,6 +7644,29 @@ function CodexMultiLaunchScreen({
                         <Rocket className="h-4 w-4" />
                         {pending ? t("启动中") : t("启动")}
                       </Button>
+                      {gatewayManaged ? null : (
+                        <span className="relay-card-extra">
+                          <Button
+                            aria-label={tf("编辑供应商「{0}」", [profile.name || t("未命名供应商")])}
+                            onClick={() => setDetailProfileId(profile.id)}
+                            size="icon"
+                            title={t("编辑")}
+                            variant="ghost"
+                          >
+                            <Edit3 className="h-4 w-4" />
+                          </Button>
+                          <Button
+                            aria-label={tf("删除供应商「{0}」", [profile.name || t("未命名供应商")])}
+                            disabled={normalized.relayProfiles.length <= 1}
+                            onClick={() => void deleteProfile(profile)}
+                            size="icon"
+                            title={t("删除供应商")}
+                            variant="ghost"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </span>
+                      )}
                     </span>
                   </div>
                 );
@@ -11380,7 +11474,8 @@ function RelayProfileDetail({
           {aggregateProfile ? (
             <UiBadge variant="secondary">{aggregateModeRequired ? t("聚合")
               : draft.aggregate?.modelAggregationEnabled === true ? t("模型聚合") : t("故障转移")}</UiBadge>
-          ) : isNew ? null : (
+          ) : isNew || form.activeRelayId === CODEX_GATEWAY_RELAY_ID ? null : (
+            // 网关接管期间（从多开页进来编辑）不给「设为当前」：切走会绕过「断开并还原」（#2801）。
             <Button
               disabled={actions.relaySwitching}
               onClick={switchDraft}

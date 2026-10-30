@@ -2772,6 +2772,10 @@ export const EN_PLAIN: Record<string, string> = {
   "上游服务出错：多半是上游临时故障，稍后再试。": "The upstream service failed: most likely a temporary upstream outage; try again later.",
   "上游开始回复后又报错或断开：见下方的错误原文。": "The upstream started replying, then errored or disconnected: see the raw error below.",
   "请求没有成功：见下方的错误原文。": "The request didn't succeed: see the raw error below.",
+  // 多开页：编辑 / 删除供应商，cc-switch 导入指路（#2801）
+  "导入或添加供应商": "Import or add providers",
+  "到「旧版供应商配置」添加供应商，或用「从第三方导入」导入 cc-switch 的供应商": "Go to Legacy provider settings to add a provider, or use Import from third party to import cc-switch providers",
+  "这些供应商仍可在「多开」页悬停卡片编辑、删除；右上角「从第三方导入」可以继续导入 cc-switch 的供应商。": "You can still edit or delete these providers by hovering a card on the Multi-instance page; use Import from third party at the top right to import cc-switch providers.",
 };
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
@@ -3132,6 +3136,12 @@ export const EN_TEMPLATE: Record<string, string> = {
   "测试 Key {0}": "Test key {0}",
   "本次用的是 Key「{0}」（末 4 位 {1}）。": "This test used key “{0}” (ending in {1}).",
   "本次用的是末 4 位为 {0} 的 Key。": "This test used the key ending in {0}.",
+  // 多开页：编辑 / 删除供应商（#2801）
+  "删除供应商「{0}」？它还有 {1} 个多开实例在运行，删除后实例不会被结束，但之后不能再用它启动。": "Delete provider “{0}”? {1} multi-instance window(s) are still running with it. They won't be closed, but you won't be able to launch with this provider again.",
+  "删除供应商「{0}」？删除后不能再用它启动多开实例，旧版供应商列表里也会一并移除。": "Delete provider “{0}”? You won't be able to launch instances with it, and it will also be removed from the legacy provider list.",
+  "{0} 个实例运行中": "{0} running",
+  "编辑供应商「{0}」": "Edit provider “{0}”",
+  "删除供应商「{0}」": "Delete provider “{0}”",
 };
 
 // Backend (Rust) messages returned via result.message. These are translated
