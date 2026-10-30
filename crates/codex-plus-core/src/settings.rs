@@ -3673,18 +3673,14 @@ mod tests {
             .map(|entry| entry.file_name()).collect();
         assert_eq!(leftovers.len(), 1, "链接所在目录不应残留临时文件：{leftovers:?}");
     }
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
-
+    /// 每次新建一个随机命名的空目录。不能用「进程号 + 计数器」命名：目录不会删除，
+    /// 进程号复用后会撞上上次留下的 settings.json，保存时报 settings_revision_conflict。
     fn temp_dir() -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "codex-plus-core-settings-test-{}-{}",
-            std::process::id(),
-            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        path
+        tempfile::Builder::new()
+            .prefix("codex-plus-core-settings-test-")
+            .tempdir()
+            .unwrap()
+            .keep()
     }
 
     #[test]
