@@ -2633,23 +2633,16 @@ impl GithubClient {
     }
 }
 
+fn github_https_proxy_from_env(mut get: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+        .into_iter()
+        .find_map(|key| get(key).filter(|value| !value.trim().is_empty()))
+}
+
 async fn github_client() -> anyhow::Result<GithubClient> {
     tokio::task::spawn_blocking(|| {
         let agent = format!("Codex++/{}", crate::version::VERSION);
-        if let Some(proxy) = [
-            "HTTPS_PROXY",
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-            "HTTP_PROXY",
-            "http_proxy",
-        ]
-        .iter()
-        .find_map(|key| {
-            std::env::var(key)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        }) {
+        if let Some(proxy) = github_https_proxy_from_env(|key| std::env::var(key).ok()) {
             return Ok(GithubClient {
                 primary: crate::http_client::proxied_client_with_proxy(&agent, &proxy)?,
                 direct: None,
@@ -3156,6 +3149,109 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Write;
+
+    fn github_https_proxy_for_test(values: &[(&str, &str)]) -> Option<String> {
+        github_https_proxy_from_env(|key| {
+            values
+                .iter()
+                .find_map(|(name, value)| (*name == key).then(|| value.to_string()))
+        })
+    }
+
+    #[test]
+    fn github_https_proxy_ignores_http_proxy() {
+        for values in [
+            &[][..],
+            &[("HTTP_PROXY", "http://upper-http")][..],
+            &[("http_proxy", "http://lower-http")][..],
+            &[
+                ("HTTP_PROXY", "invalid proxy"),
+                ("http_proxy", "http://lower-http"),
+            ][..],
+        ] {
+            assert_eq!(github_https_proxy_for_test(values), None);
+        }
+    }
+
+    #[test]
+    fn github_https_proxy_prefers_https_then_all_with_uppercase_first() {
+        let cases: &[(&[(&str, &str)], &str)] = &[
+            (
+                &[("HTTPS_PROXY", "http://upper-https")],
+                "http://upper-https",
+            ),
+            (
+                &[("https_proxy", "http://lower-https")],
+                "http://lower-https",
+            ),
+            (&[("ALL_PROXY", "http://upper-all")], "http://upper-all"),
+            (&[("all_proxy", "http://lower-all")], "http://lower-all"),
+            (
+                &[
+                    ("HTTPS_PROXY", "http://upper-https"),
+                    ("https_proxy", "http://lower-https"),
+                    ("ALL_PROXY", "http://upper-all"),
+                    ("all_proxy", "http://lower-all"),
+                    ("HTTP_PROXY", "http://upper-http"),
+                ],
+                "http://upper-https",
+            ),
+            (
+                &[
+                    ("https_proxy", "http://lower-https"),
+                    ("ALL_PROXY", "http://upper-all"),
+                    ("HTTP_PROXY", "http://upper-http"),
+                ],
+                "http://lower-https",
+            ),
+            (
+                &[
+                    ("ALL_PROXY", "http://upper-all"),
+                    ("all_proxy", "http://lower-all"),
+                    ("http_proxy", "http://lower-http"),
+                ],
+                "http://upper-all",
+            ),
+        ];
+        for (values, expected) in cases {
+            assert_eq!(
+                github_https_proxy_for_test(values).as_deref(),
+                Some(*expected)
+            );
+        }
+    }
+
+    #[test]
+    fn github_https_proxy_skips_empty_values() {
+        let cases: &[(&[(&str, &str)], Option<&str>)] = &[
+            (
+                &[("HTTPS_PROXY", ""), ("https_proxy", "http://lower-https")],
+                Some("http://lower-https"),
+            ),
+            (
+                &[
+                    ("HTTPS_PROXY", "  \t"),
+                    ("https_proxy", ""),
+                    ("ALL_PROXY", "\n"),
+                    ("all_proxy", "http://lower-all"),
+                ],
+                Some("http://lower-all"),
+            ),
+            (
+                &[
+                    ("HTTPS_PROXY", ""),
+                    ("https_proxy", " "),
+                    ("ALL_PROXY", ""),
+                    ("all_proxy", "\t"),
+                    ("HTTP_PROXY", "http://upper-http"),
+                ],
+                None,
+            ),
+        ];
+        for (values, expected) in cases {
+            assert_eq!(github_https_proxy_for_test(values).as_deref(), *expected);
+        }
+    }
 
     fn manager(temp: &tempfile::TempDir) -> SkillsManager {
         SkillsManager::new(
