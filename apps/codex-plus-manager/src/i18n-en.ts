@@ -660,7 +660,7 @@ export const EN_PLAIN: Record<string, string> = {
   "插件市场来源": "Plugin market source",
   "公开精选": "Public collection",
   "完整缓存": "Full collection",
-  "完整缓存为私有仓库，需要 GitHub 访问权限。": "The full collection is a private repository and requires GitHub access.",
+  "完整市场收录全部插件，索引较大，首次加载可能需要几秒。": "The full market includes every plugin. Its index is large, so the first load may take a few seconds.",
   "收录已确认可公开分发的插件。": "Plugins with verified public redistribution licenses.",
   "搜索插件": "Search plugins",
   "搜索名称、作者、描述或标签": "Search names, authors, descriptions or tags",
