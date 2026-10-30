@@ -4806,8 +4806,31 @@ pub async fn list_project_sessions(
 }
 
 fn normalized_project_path(path: &str) -> String {
-    // 与前端 sessionGroups 一致：只统一分隔符和末尾斜杠，保留大小写及路径中的空格。
-    path.replace('\\', "/").trim_end_matches('/').to_string()
+    // 与前端 normalizeProjectPath 一致：统一分隔符和末尾斜杠，保留大小写及路径中的空格；
+    // 去掉 Windows 长路径前缀（\\?\C:\ → C:/，\\?\UNC\srv\share → //srv/share），
+    // 否则同一项目带不带前缀会被当成两个目录（#2791）。
+    let path = path.replace('\\', "/");
+    let path = path.trim_end_matches('/');
+    for prefix in ["//?/", "//./"] {
+        let Some(rest) = path.strip_prefix(prefix) else {
+            continue;
+        };
+        if rest
+            .get(..4)
+            .is_some_and(|head| head.eq_ignore_ascii_case("UNC/"))
+        {
+            return format!("//{}", &rest[4..]);
+        }
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes.len() == 2 || bytes[2] == b'/')
+        {
+            return rest.to_string();
+        }
+    }
+    path.to_string()
 }
 
 fn list_project_sessions_blocking(cwd: String) -> CommandResult<LocalSessionsPayload> {
@@ -11289,6 +11312,20 @@ base_url = "https://example.invalid/v1"
             "C:/Projects/Foo"
         );
         assert_eq!(normalized_project_path("/Projects/Foo///"), "/Projects/Foo");
+        // Windows 长路径前缀不进入项目身份（#2791）。
+        assert_eq!(
+            normalized_project_path(r"\\?\C:\Projects\Foo\"),
+            "C:/Projects/Foo"
+        );
+        assert_eq!(
+            normalized_project_path(r"\\?\UNC\server\share\Foo"),
+            normalized_project_path(r"\\server\share\Foo")
+        );
+        assert_eq!(normalized_project_path(r"\\?\C:\"), "C:");
+        assert_eq!(
+            normalized_project_path(r"\\?\Volume{abc}\Foo"),
+            "//?/Volume{abc}/Foo"
+        );
         assert_ne!(
             normalized_project_path("/Projects/Foo"),
             normalized_project_path("/Projects/foo")
