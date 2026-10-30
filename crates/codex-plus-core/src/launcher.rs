@@ -405,6 +405,19 @@ pub trait LaunchHooks: Send + Sync {
     fn select_debug_port(&self, requested: u16) -> u16;
     fn select_helper_port(&self, requested: u16) -> u16;
     async fn load_settings(&self) -> anyhow::Result<BackendSettings>;
+    fn codex_home_dir(&self) -> PathBuf {
+        crate::relay_config::default_codex_home_dir()
+    }
+    fn state_dir(&self) -> PathBuf {
+        crate::paths::default_app_state_dir()
+    }
+    fn select_protocol_proxy_port(&self) -> u16 {
+        crate::protocol_proxy::ensure_protocol_proxy_port_available()
+    }
+    async fn sanitize_local_storage_model_suffixes(&self, debug_port: u16) {
+        crate::codex_local_storage::sanitize_local_storage_model_suffixes_nonfatal(debug_port)
+            .await;
+    }
     async fn start_native_browser_compatibility(&self, _settings: &BackendSettings) {}
     async fn stop_native_browser_compatibility(&self) {}
     fn cleanup_unsupported_config(&self) -> anyhow::Result<()> {
@@ -853,7 +866,7 @@ where
         let timeline = LaunchTimeline::new(options.status_store.clone());
         timeline.mark("start_native_browser_compatibility", 5);
         hooks.start_native_browser_compatibility(&settings).await;
-        let home = crate::relay_config::default_codex_home_dir();
+        let home = hooks.codex_home_dir();
         timeline.mark("cleanup_unsupported_config", 10);
         hooks.cleanup_unsupported_config()?;
         crate::relay_config::ensure_windows_sandbox_usable_for_current_user(&home)?;
@@ -878,7 +891,10 @@ where
             );
         }
         timeline.mark("dream_skin_theme", 30);
-        crate::dream_skin::sync_default_dream_skin_base_theme(
+        #[cfg(windows)]
+        crate::dream_skin::sync_dream_skin_base_theme_in_home(
+            &home,
+            &hooks.state_dir(),
             settings.enhancements_enabled
                 && settings.codex_app_dream_skin_enabled
                 && !settings.codex_app_dream_skin_paused,
@@ -977,7 +993,7 @@ where
             timeline.mark("protocol_proxy_config", 55);
             // 端口落在 Windows 排除区间（10013）时永久不可绑，先迁移并持久化，
             // 再写 config.toml，保证 base_url、helper 与路由使用同一个端口（#1163）。
-            helper_port = crate::protocol_proxy::ensure_protocol_proxy_port_available();
+            helper_port = hooks.select_protocol_proxy_port();
             hooks.ensure_active_protocol_proxy_config(&settings).await?;
         }
         if settings.enhancements_enabled || protocol_proxy_enabled {
@@ -1045,10 +1061,9 @@ where
                 }
                 // 注入成功后页面已加载，此时可以通过 CDP 清理 Electron Local Storage
                 // 中残留的带后缀模型名，避免模型选择器继续显示废弃项。
-                crate::codex_local_storage::sanitize_local_storage_model_suffixes_nonfatal(
-                    debug_port,
-                )
-                .await;
+                hooks
+                    .sanitize_local_storage_model_suffixes(debug_port)
+                    .await;
             } else {
                 let degraded = launch_status(
                     "running_degraded",
