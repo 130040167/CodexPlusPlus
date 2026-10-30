@@ -333,11 +333,13 @@ pub async fn handle_bridge_request(
         "/user-scripts/reload" => ctx.runtime.reload_user_scripts().await,
         "/cdp/targets" => ctx.runtime.cdp_targets().await,
         "/cdp/evaluate" => ctx.runtime.cdp_evaluate(payload.clone()).await,
-        "/thread-goal/set-in-owner" => match ctx.settings.get_settings().await {
-            Ok(settings) if settings.enhancements_enabled =>
+        "/thread-goal/set-in-owner" => Ok(match ctx.settings.get_settings().await {
+            Ok(settings) if settings.enhancements_enabled => thread_goal_result_value(
                 ctx.runtime.set_thread_goal_in_owner(payload.clone()).await,
-            _ => Err(anyhow::anyhow!("Codex++ 增强已关闭")),
-        },
+            ),
+            Ok(_) => crate::native_thread_goal::GoalForwardError::EnhancementsDisabled.response(),
+            Err(_) => crate::native_thread_goal::GoalForwardError::ForwardFailed.response(),
+        }),
         "/devtools/open" => ctx.runtime.open_devtools().await,
         "/manager/open" => ctx.runtime.open_manager(payload.clone()).await,
         "/manager/open-transient" => ctx.runtime.open_transient_manager(payload.clone()).await,
@@ -1318,6 +1320,14 @@ fn failed_from_error(payload: &Value, error: anyhow::Error) -> Value {
     })
 }
 
+fn thread_goal_result_value(result: anyhow::Result<Value>) -> Value {
+    match result {
+        Ok(value) if value.get("status").and_then(Value::as_str) == Some("ok") => value,
+        Ok(_) => crate::native_thread_goal::GoalForwardError::ForwardFailed.response(),
+        Err(error) => crate::native_thread_goal::failed_response(&error),
+    }
+}
+
 fn session_from_payload(payload: &Value) -> SessionRef {
     let parse_host = |value: &Value| {
         value
@@ -1362,6 +1372,34 @@ fn empty_user_script_inventory() -> Value {
         "enabled": true,
         "scripts": []
     })
+}
+
+#[cfg(test)]
+mod thread_goal_route_tests {
+    use super::*;
+    use crate::native_thread_goal::GoalForwardError;
+
+    #[test]
+    fn goal_route_keeps_only_known_structured_error_codes() {
+        for (error, expected_code) in [
+            (GoalForwardError::OwnerChanged, "goal-owner-changed"),
+            (GoalForwardError::RequestLimit, "goal-request-limit"),
+            (GoalForwardError::RequestIdConflict, "goal-request-id-conflict"),
+            (GoalForwardError::NativeGetterAmbiguous, "goal-native-getter-ambiguous"),
+        ] {
+            let response = thread_goal_result_value(Err(error.into()));
+            assert_eq!(response, json!({
+                "status": "failed", "code": expected_code,
+                "message": "会话所在窗口暂不可用，请稍后重试设置目标"
+            }));
+        }
+        let response = thread_goal_result_value(Err(anyhow::anyhow!(
+            "Runtime.evaluate: secret-token at app://-/private.js"
+        )));
+        assert_eq!(response["code"], "goal-forward-failed");
+        assert!(!response.to_string().contains("secret"));
+        assert!(!response.to_string().contains("app://"));
+    }
 }
 
 #[cfg(test)]

@@ -1,6 +1,84 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+const NATIVE_RUNTIME_VERSION: u32 = 1;
+const NATIVE_RUNTIME_REVISION: u32 = 2;
+const NATIVE_ERROR_CODES: &[&str] = &[
+    "goal-native-getter-ambiguous",
+    "goal-owner-changed",
+    "goal-request-id-conflict",
+    "goal-request-limit",
+    "goal-runtime-reload-required",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GoalForwardError {
+    InvalidRequest,
+    EnhancementsDisabled,
+    ProbeFailed,
+    OwnerUnavailable,
+    NativeGetterAmbiguous,
+    OwnerChanged,
+    RequestIdConflict,
+    RequestLimit,
+    RuntimeReloadRequired,
+    ForwardFailed,
+}
+
+impl GoalForwardError {
+    fn from_native_code(code: Option<&str>) -> Self {
+        match code {
+            Some("goal-native-getter-ambiguous") => Self::NativeGetterAmbiguous,
+            Some("goal-owner-changed") => Self::OwnerChanged,
+            Some("goal-request-id-conflict") => Self::RequestIdConflict,
+            Some("goal-request-limit") => Self::RequestLimit,
+            Some("goal-runtime-reload-required") => Self::RuntimeReloadRequired,
+            _ => Self::ForwardFailed,
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "goal-invalid-request",
+            Self::EnhancementsDisabled => "goal-enhancements-disabled",
+            Self::ProbeFailed => "goal-probe-failed",
+            Self::OwnerUnavailable => "goal-owner-unavailable",
+            Self::NativeGetterAmbiguous => "goal-native-getter-ambiguous",
+            Self::OwnerChanged => "goal-owner-changed",
+            Self::RequestIdConflict => "goal-request-id-conflict",
+            Self::RequestLimit => "goal-request-limit",
+            Self::RuntimeReloadRequired => "goal-runtime-reload-required",
+            Self::ForwardFailed => "goal-forward-failed",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "会话目标请求无效，请重新设置目标",
+            Self::EnhancementsDisabled => "Codex++ 增强已关闭",
+            Self::RuntimeReloadRequired => "会话目标组件已更新，请刷新或重新打开此窗口后重试",
+            _ => "会话所在窗口暂不可用，请稍后重试设置目标",
+        }
+    }
+
+    pub(crate) fn response(self) -> Value {
+        json!({ "status": "failed", "code": self.code(), "message": self.message() })
+    }
+}
+
+impl std::fmt::Display for GoalForwardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for GoalForwardError {}
+
+pub(crate) fn failed_response(error: &anyhow::Error) -> Value {
+    error.downcast_ref::<GoalForwardError>().copied()
+        .unwrap_or(GoalForwardError::ForwardFailed).response()
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GoalRequest {
@@ -11,12 +89,13 @@ struct GoalRequest {
 }
 
 fn validate_request(payload: &Value) -> anyhow::Result<()> {
-    let request: GoalRequest = serde_json::from_value(payload.clone())?;
+    let request: GoalRequest = serde_json::from_value(payload.clone())
+        .map_err(|_| GoalForwardError::InvalidRequest)?;
     for value in [&request.host_id, &request.thread_id, &request.request_id] {
-        anyhow::ensure!(!value.trim().is_empty() && value.len() <= 256, "无效的会话目标标识");
+        anyhow::ensure!(!value.trim().is_empty() && value.len() <= 256, GoalForwardError::InvalidRequest);
     }
     // 参数由原生接口解释，避免拦截清空目标或未来新增字段。
-    anyhow::ensure!(request.params.is_object(), "无效的会话目标参数");
+    anyhow::ensure!(request.params.is_object(), GoalForwardError::InvalidRequest);
     Ok(())
 }
 
@@ -29,28 +108,55 @@ fn is_app_window(target: &crate::cdp::CdpTarget) -> bool {
 }
 
 async fn evaluate(websocket: &str, method: &str, payload: &Value) -> anyhow::Result<Value> {
-    // 原始 Runtime.evaluate 默认不序列化对象；异步完成后显式编码，不能把 Promise 当成功。
-    let argument = serde_json::to_string(&payload.to_string())?;
-    let script = format!(
-        "{}\n;(async()=>JSON.stringify(await window.__codexPlusNativeThreadGoal.{}(JSON.parse({}))))()",
-        crate::assets::NATIVE_THREAD_GOAL_SCRIPT, method, argument,
-    );
     let timeout = std::time::Duration::from_secs(if method == "execute" { 20 } else { 3 });
-    let response = crate::bridge::evaluate_script_with_timeout(websocket, &script, true, timeout).await?;
-    anyhow::ensure!(
-        response.pointer("/result/exceptionDetails").is_none(),
-        "会话所在窗口未能完成目标操作"
-    );
+    evaluate_with_timeout(websocket, method, payload, timeout).await
+}
+
+async fn evaluate_with_timeout(
+    websocket: &str,
+    method: &str,
+    payload: &Value,
+    timeout: std::time::Duration,
+) -> anyhow::Result<Value> {
+    let script = evaluation_script(method, payload)?;
+    // 底层 CDP 错误可能包含 URL、调用栈及异常原文，不能送到原生界面。
+    let response = crate::bridge::evaluate_script_with_timeout(websocket, &script, true, timeout)
+        .await.map_err(|_| GoalForwardError::ForwardFailed)?;
     let text = response.pointer("/result/result/value").and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("会话所在窗口未返回目标操作结果"))?;
-    Ok(serde_json::from_str(text)?)
+        .ok_or(GoalForwardError::ForwardFailed)?;
+    decode_evaluation(text)
+}
+
+fn evaluation_script(method: &str, payload: &Value) -> anyhow::Result<String> {
+    // 原始 Runtime.evaluate 默认不序列化对象；异步完成后显式编码，不能把 Promise 当成功。
+    let argument = serde_json::to_string(&payload.to_string())
+        .map_err(|_| GoalForwardError::ForwardFailed)?;
+    let codes = serde_json::to_string(NATIVE_ERROR_CODES)
+        .map_err(|_| GoalForwardError::ForwardFailed)?;
+    Ok(format!(
+        "{}\n;(async()=>{{try{{const runtime=window.__codexPlusNativeThreadGoal;if(runtime?.version!=={}||runtime?.revision!=={})return JSON.stringify({{ok:false,code:'goal-runtime-reload-required'}});return JSON.stringify({{ok:true,value:await runtime.{}(JSON.parse({}))}})}}catch(error){{const code=error?.code;return JSON.stringify({{ok:false,code:{}.includes(code)?code:null}})}}}})()",
+        crate::assets::NATIVE_THREAD_GOAL_SCRIPT, NATIVE_RUNTIME_VERSION,
+        NATIVE_RUNTIME_REVISION, method, argument, codes,
+    ))
+}
+
+fn decode_evaluation(text: &str) -> anyhow::Result<Value> {
+    let envelope: Value = serde_json::from_str(text).map_err(|_| GoalForwardError::ForwardFailed)?;
+    match envelope.get("ok").and_then(Value::as_bool) {
+        Some(true) => envelope.get("value").cloned().ok_or_else(|| GoalForwardError::ForwardFailed.into()),
+        Some(false) => Err(GoalForwardError::from_native_code(
+            envelope.get("code").and_then(Value::as_str),
+        ).into()),
+        None => Err(GoalForwardError::ForwardFailed.into()),
+    }
 }
 
 /// 只在指定 Codex 实例的唯一原生 owner 窗口中设置目标。
 pub async fn set_in_owner(debug_port: u16, payload: Value) -> anyhow::Result<Value> {
     validate_request(&payload)?;
     let probe = json!({ "hostId": payload["hostId"], "threadId": payload["threadId"] });
-    let targets = crate::cdp::list_targets(debug_port).await?;
+    let targets = crate::cdp::list_targets(debug_port).await
+        .map_err(|_| GoalForwardError::ProbeFailed)?;
     let mut owners = Vec::new();
     let candidates: Vec<_> = targets.iter().filter(|target| is_app_window(target))
         .filter_map(|target| target.web_socket_debugger_url.as_deref()).collect();
@@ -61,12 +167,26 @@ pub async fn set_in_owner(debug_port: u16, payload: Value) -> anyhow::Result<Val
         match result {
             Ok(result) if result["status"] == "owner" => owners.push(websocket),
             Ok(_) => {}
-            Err(_) => anyhow::bail!("暂时无法确认会话窗口状态，请稍后重试"),
+            Err(error) => {
+                let kind = error.downcast_ref::<GoalForwardError>().copied();
+                return Err(match kind {
+                    Some(GoalForwardError::NativeGetterAmbiguous) => GoalForwardError::NativeGetterAmbiguous,
+                    Some(GoalForwardError::RuntimeReloadRequired) => GoalForwardError::RuntimeReloadRequired,
+                    _ => GoalForwardError::ProbeFailed,
+                }.into());
+            }
         }
     }
-    anyhow::ensure!(owners.len() == 1, "未找到唯一的会话所属窗口，请打开原窗口后重试");
+    anyhow::ensure!(owners.len() == 1, GoalForwardError::OwnerUnavailable);
     // CDP 超时不会取消已经执行的 JS；写入只发给这个 owner 一次，禁止改投其他窗口。
-    evaluate(owners[0], "execute", &payload).await
+    let result = evaluate(owners[0], "execute", &payload).await?;
+    match result.get("status").and_then(Value::as_str) {
+        Some("ok") => Ok(result),
+        Some("failed") => Err(GoalForwardError::from_native_code(
+            result.get("code").and_then(Value::as_str),
+        ).into()),
+        _ => Err(GoalForwardError::ForwardFailed.into()),
+    }
 }
 
 #[cfg(test)]
@@ -83,8 +203,10 @@ mod tests {
     #[derive(Clone)]
     enum FixtureReply {
         Json(Value),
+        Rejected(Option<String>),
         Disconnect,
         Exception,
+        Hang,
     }
 
     struct FixtureWindow {
@@ -99,7 +221,7 @@ mod tests {
             id: id.to_string(),
             url: "app://-/index.html",
             probe: FixtureReply::Json(json!({ "status": status })),
-            execute: FixtureReply::Json(json!({ "ok": true })),
+            execute: FixtureReply::Json(json!({ "status": "ok" })),
         }
     }
 
@@ -169,13 +291,11 @@ mod tests {
                     let command: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
                     assert_eq!(command["method"], "Runtime.evaluate");
                     let expression = command["params"]["expression"].as_str().unwrap();
-                    let call = expression.rsplit_once(
-                        "await window.__codexPlusNativeThreadGoal."
-                    ).unwrap().1;
+                    let call = expression.rsplit_once("await runtime.").unwrap().1;
                     let (operation, arguments) = call.split_once('(').unwrap();
-                    let encoded = arguments.strip_prefix("JSON.parse(").unwrap()
-                        .strip_suffix("))))()").unwrap();
-                    let json_text: String = serde_json::from_str(encoded).unwrap();
+                    let encoded = arguments.strip_prefix("JSON.parse(").unwrap();
+                    let json_text = serde_json::Deserializer::from_str(encoded)
+                        .into_iter::<String>().next().unwrap().unwrap();
                     let payload = serde_json::from_str(&json_text).unwrap();
                     observed.lock().unwrap().push(ObservedCommand {
                         target: target.to_string(),
@@ -192,14 +312,27 @@ mod tests {
                         FixtureReply::Json(value) => json!({
                             "result": {
                                 "type": "string",
-                                "value": serde_json::to_string(&value).unwrap(),
+                                "value": serde_json::to_string(&json!({"ok":true,"value":value})).unwrap(),
+                            }
+                        }),
+                        FixtureReply::Rejected(code) => json!({
+                            "result": {
+                                "type": "string",
+                                "value": serde_json::to_string(&json!({"ok":false,"code":code})).unwrap(),
                             }
                         }),
                         FixtureReply::Disconnect => continue,
                         FixtureReply::Exception => json!({
                             "result": { "type": "undefined" },
-                            "exceptionDetails": { "text": "native setter rejected" },
+                            "exceptionDetails": {
+                                "text": "secret-token: native setter rejected",
+                                "exception": {"description": "Error at app://-/secret/path.js:123\nsecret-stack"},
+                            },
                         }),
+                        FixtureReply::Hang => {
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            continue;
+                        }
                     };
                     let response = json!({ "id": command["id"], "result": result });
                     socket.send(Message::Text(response.to_string().into())).await.unwrap();
@@ -252,7 +385,7 @@ mod tests {
             window("second", "missing"),
         ]).await;
         let error = set_in_owner(fixture.port, goal_payload()).await.unwrap_err();
-        assert!(error.to_string().contains("未找到唯一"));
+        assert_eq!(failed_response(&error)["code"], "goal-owner-unavailable");
         let commands = fixture.commands();
         assert_eq!(commands.len(), 2);
         assert!(commands.iter().all(|command| command.operation == "probe"));
@@ -266,7 +399,7 @@ mod tests {
             window("second", "owner"),
         ]).await;
         let error = set_in_owner(fixture.port, goal_payload()).await.unwrap_err();
-        assert!(error.to_string().contains("未找到唯一"));
+        assert_eq!(failed_response(&error)["code"], "goal-owner-unavailable");
         let commands = fixture.commands();
         assert_eq!(commands.len(), 2);
         assert!(commands.iter().all(|command| command.operation == "probe"));
@@ -288,7 +421,7 @@ mod tests {
         payload["params"]["__proto__"] = json!({"keep": "own property"});
         assert_eq!(
             set_in_owner(fixture.port, payload.clone()).await.unwrap(),
-            json!({ "ok": true }),
+            json!({ "status": "ok" }),
         );
         let commands = fixture.commands();
         assert_eq!(commands.len(), 3);
@@ -313,7 +446,7 @@ mod tests {
             window("owner", "owner"), unreachable,
         ]).await;
         let error = set_in_owner(fixture.port, goal_payload()).await.unwrap_err();
-        assert!(error.to_string().contains("暂时无法确认"));
+        assert_eq!(failed_response(&error)["code"], "goal-probe-failed");
         let commands = fixture.commands();
         assert_eq!(commands.len(), 2);
         assert!(commands.iter().all(|command| command.operation == "probe"));
@@ -356,13 +489,232 @@ mod tests {
             let fixture = FakeCdp::start(vec![
                 window("follower", "follower"), owner,
             ]).await;
-            assert!(set_in_owner(fixture.port, goal_payload()).await.is_err());
+            let error = set_in_owner(fixture.port, goal_payload()).await.unwrap_err();
+            assert_eq!(failed_response(&error), json!({
+                "status": "failed", "code": "goal-forward-failed",
+                "message": "会话所在窗口暂不可用，请稍后重试设置目标"
+            }));
+            assert!(!error.to_string().contains("secret"));
             let commands = fixture.commands();
             assert_eq!(commands.len(), 3);
             let executed: Vec<_> = commands.iter()
                 .filter(|command| command.operation == "execute").collect();
             assert_eq!(executed.len(), 1);
             assert_eq!(executed[0].target, "owner");
+            fixture.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn known_native_error_codes_are_preserved_and_unknown_codes_are_redacted() {
+        for (native_code, expected) in [
+            (Some("goal-owner-changed"), "goal-owner-changed"),
+            (Some("goal-request-limit"), "goal-request-limit"),
+            (Some("goal-request-id-conflict"), "goal-request-id-conflict"),
+            (Some("secret-token app://-/private.js"), "goal-forward-failed"),
+            (None, "goal-forward-failed"),
+        ] {
+            let mut owner = window("owner", "owner");
+            owner.execute = FixtureReply::Rejected(native_code.map(str::to_string));
+            let fixture = FakeCdp::start(vec![window("follower", "follower"), owner]).await;
+            let error = set_in_owner(fixture.port, goal_payload()).await.unwrap_err();
+            let response = failed_response(&error);
+            assert_eq!(response["code"], expected);
+            assert_eq!(response["message"], "会话所在窗口暂不可用，请稍后重试设置目标");
+            assert!(!response.to_string().contains("secret"));
+            let commands = fixture.commands();
+            assert_eq!(commands.iter().filter(|command| command.operation == "execute").count(), 1);
+            fixture.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_getter_probe_preserves_its_code_without_executing() {
+        let mut ambiguous = window("ambiguous", "follower");
+        ambiguous.probe = FixtureReply::Rejected(Some("goal-native-getter-ambiguous".to_string()));
+        let fixture = FakeCdp::start(vec![window("owner", "owner"), ambiguous]).await;
+        let error = set_in_owner(fixture.port, goal_payload()).await.unwrap_err();
+        assert_eq!(failed_response(&error)["code"], "goal-native-getter-ambiguous");
+        assert!(fixture.commands().iter().all(|command| command.operation == "probe"));
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    async fn outdated_runtime_probe_reports_that_a_refresh_is_required() {
+        let mut outdated = window("outdated", "follower");
+        outdated.probe = FixtureReply::Rejected(Some("goal-runtime-reload-required".to_string()));
+        let fixture = FakeCdp::start(vec![window("owner", "owner"), outdated]).await;
+        let error = set_in_owner(fixture.port, goal_payload()).await.unwrap_err();
+        assert_eq!(failed_response(&error), json!({
+            "status": "failed", "code": "goal-runtime-reload-required",
+            "message": "会话目标组件已更新，请刷新或重新打开此窗口后重试"
+        }));
+        assert!(fixture.commands().iter().all(|command| command.operation == "probe"));
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    async fn cdp_timeout_is_a_generic_failure_without_transport_details() {
+        let mut owner = window("owner", "owner");
+        owner.execute = FixtureReply::Hang;
+        let fixture = FakeCdp::start(vec![owner]).await;
+        let error = evaluate_with_timeout(
+            &fixture.websocket("owner"), "execute", &goal_payload(),
+            std::time::Duration::from_millis(100),
+        ).await.unwrap_err();
+        assert_eq!(failed_response(&error), json!({
+            "status": "failed", "code": "goal-forward-failed",
+            "message": "会话所在窗口暂不可用，请稍后重试设置目标"
+        }));
+        assert!(!error.to_string().contains("127.0.0.1"));
+        assert_eq!(fixture.commands().len(), 1);
+        fixture.stop().await;
+    }
+
+    #[test]
+    fn actual_javascript_rejects_unknown_runtime_without_invoking_it() {
+        let harness = r#"
+const vm = require('node:vm');
+const [expression, version, revision] = process.argv.slice(1);
+const calls = {probe:0, execute:0};
+const runtime = {
+  probe() { calls.probe++; return {status:'owner'}; },
+  execute() { calls.execute++; return {status:'ok', goal:{objective:'test'}}; },
+};
+if (version !== 'missing') runtime.version = JSON.parse(version);
+if (revision !== 'missing') runtime.revision = JSON.parse(revision);
+Object.freeze(runtime);
+const context = vm.createContext({window:{__codexPlusNativeThreadGoal:runtime}});
+(async () => {
+  const result = await vm.runInContext(expression, context);
+  process.stdout.write(JSON.stringify({result, calls}));
+})().catch(error => { process.stderr.write(String(error.stack || error)); process.exitCode = 1; });
+"#;
+        let current_version = NATIVE_RUNTIME_VERSION.to_string();
+        let current_revision = NATIVE_RUNTIME_REVISION.to_string();
+        for method in ["probe", "execute"] {
+            for (version, revision, accepted) in [
+                ("1", "missing", false),
+                ("1", "null", false),
+                ("1", "1", false),
+                ("1", "3", false),
+                ("2", "2", false),
+                ("missing", "2", false),
+                (current_version.as_str(), current_revision.as_str(), true),
+            ] {
+                let script = evaluation_script(method, &goal_payload()).unwrap();
+                let output = std::process::Command::new("node")
+                    .arg("-e").arg(harness).arg(script).arg(version).arg(revision)
+                    .output().unwrap();
+                assert!(output.status.success(), "{method} {version}/{revision}: {}", String::from_utf8_lossy(&output.stderr));
+                let outcome: Value = serde_json::from_slice(&output.stdout).unwrap();
+                let result = decode_evaluation(outcome["result"].as_str().unwrap());
+                if accepted {
+                    assert!(result.is_ok(), "{method} {version}/{revision}");
+                    assert_eq!(outcome["calls"][method], 1);
+                } else {
+                    assert_eq!(failed_response(&result.unwrap_err())["code"], "goal-runtime-reload-required");
+                    assert_eq!(outcome["calls"]["probe"], 0);
+                    assert_eq!(outcome["calls"]["execute"], 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn actual_javascript_errors_cross_the_rust_result_contract() {
+        // 与前端同样使用 Node，执行 Rust 真正发送的表达式与完整原生脚本。
+        let harness = r#"
+const vm = require('node:vm');
+const expression = process.argv[1], mode = process.argv[2];
+let role = 'owner';
+class Manager {
+  getHostId() { return 'local'; }
+  getConversation(id) { return id === 'thread' ? {id} : null; }
+  getStreamRole() { return {role}; }
+  setThreadGoal() {
+    if (mode === 'native-error') throw new Error('secret-token at app://-/private.js\nsecret-stack');
+    if (mode === 'limit' || mode === 'conflict') return new Promise(() => {});
+    return {objective:'success'};
+  }
+}
+const manager = new Manager(), identity = {};
+const signal = {kind:'signal-family', scope:identity}, list = {};
+const scope = {scope:identity, get(key) { return key === signal ? manager : [manager]; }};
+function getter(e, t) {
+  if (!t) return null;
+  const m = e.get(signal);
+  return m.getConversation(t) ? m : e.get(list).find(x => x.getConversation(t));
+}
+function otherGetter(e, t) {
+  if (!t) return null;
+  const m = e.get(signal);
+  return m.getConversation(t) ? m : e.get(list).find(x => x.getConversation(t));
+}
+const module = {signal, getter, ...(mode === 'ambiguous' ? {otherGetter} : {})};
+const fiber = {memoizedState:{memoizedState:{current:scope}, next:null}};
+const root = {__reactContainer$fixture:{stateNode:{current:fiber}}};
+const context = vm.createContext({
+  window:{location:new URL('app://-/index.html')},
+  document:{getElementById:() => root, body:{}, documentElement:{}, querySelectorAll:() => []},
+  performance:{getEntriesByType:() => []}, URL,
+});
+const marker = '\n;(async()=>{try{';
+const split = expression.lastIndexOf(marker);
+if (split < 0) throw new Error('missing evaluation wrapper');
+vm.runInContext(expression.slice(0, split), context);
+(async () => {
+  const api = context.window.__codexPlusNativeThreadGoal;
+  try {
+    await api.install('thread', {hostId:'local', loadModule:async () => module,
+      enabled:() => true, forward:async () => ({}), report:() => {}});
+  } catch (error) { if (mode !== 'ambiguous') throw error; }
+  if (mode === 'owner-changed') role = 'follower';
+  if (mode === 'limit' || mode === 'conflict') {
+    const count = mode === 'limit' ? 128 : 1;
+    for (let i = 0; i < count; i++) void api.execute({hostId:'local', threadId:'thread',
+      requestId: mode === 'conflict' ? 'request' : `pending-${i}`, params:{objective:'pending'}});
+    await new Promise(setImmediate);
+  }
+  process.stdout.write(await vm.runInContext(expression, context));
+})().catch(error => { process.stderr.write(String(error.stack || error)); process.exitCode = 1; });
+"#;
+        for (mode, method, expected_code) in [
+            ("owner-changed", "execute", "goal-owner-changed"),
+            ("limit", "execute", "goal-request-limit"),
+            ("conflict", "execute", "goal-request-id-conflict"),
+            ("ambiguous", "probe", "goal-native-getter-ambiguous"),
+            ("native-error", "execute", "goal-forward-failed"),
+        ] {
+            let script = evaluation_script(method, &goal_payload()).unwrap();
+            let output = std::process::Command::new("node")
+                .arg("-e").arg(harness).arg(script).arg(mode).output().unwrap();
+            assert!(output.status.success(), "{mode}: {}", String::from_utf8_lossy(&output.stderr));
+            let text = String::from_utf8(output.stdout).unwrap();
+            let error = decode_evaluation(&text).unwrap_err();
+            let response = failed_response(&error);
+            assert_eq!(response["code"], expected_code, "{mode}");
+            assert!(!response.to_string().contains("secret"));
+            assert!(!response.to_string().contains("app://"));
+        }
+    }
+
+    #[tokio::test]
+    async fn returned_failures_only_preserve_known_codes() {
+        for (code, expected) in [
+            ("goal-owner-changed", "goal-owner-changed"),
+            ("private error and stack", "goal-forward-failed"),
+        ] {
+            let mut owner = window("owner", "owner");
+            owner.execute = FixtureReply::Json(json!({
+                "status": "failed", "code": code, "message": "secret-token app://-/private.js"
+            }));
+            let fixture = FakeCdp::start(vec![owner]).await;
+            let error = set_in_owner(fixture.port, goal_payload()).await.unwrap_err();
+            let response = failed_response(&error);
+            assert_eq!(response["code"], expected);
+            assert!(!response.to_string().contains("secret"));
+            assert!(!response.to_string().contains("private"));
             fixture.stop().await;
         }
     }

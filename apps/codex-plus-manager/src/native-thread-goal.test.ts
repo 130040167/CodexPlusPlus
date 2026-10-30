@@ -13,6 +13,89 @@ const threadId = "fixture-thread";
 const hostId = "local";
 const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 
+// v1 的关键闭包行为：安装包装器、owner 调用补偿重试和私有请求去重。
+const legacyRuntimeSource = `
+(() => {
+  const root = window;
+  if (root.__codexPlusNativeThreadGoal?.version === 1) return;
+  const patches = new WeakMap();
+  const requests = new Map();
+  let adapters = null;
+  async function managerFor(id, host) {
+    await root.__legacyManagerReady?.();
+    const manager = root.__legacyManager;
+    return manager?.getHostId() === host && manager.getConversation(id) ? manager : null;
+  }
+  async function probe({ threadId, hostId }) {
+    const manager = await managerFor(threadId, hostId);
+    return { status: manager?.getStreamRole(threadId)?.role || "unavailable" };
+  }
+  async function execute(request) {
+    const { threadId, hostId, requestId, params } = request;
+    const key = JSON.stringify([hostId, threadId, params]);
+    const previous = requests.get(requestId);
+    if (previous) {
+      if (previous.key !== key) throw new Error("goal-request-id-conflict");
+      return previous.promise;
+    }
+    const manager = await managerFor(threadId, hostId);
+    if (!manager || manager.getStreamRole(threadId)?.role !== "owner") throw new Error("goal-owner-changed");
+    const duplicate = requests.get(requestId);
+    if (duplicate) {
+      if (duplicate.key !== key) throw new Error("goal-request-id-conflict");
+      return duplicate.promise;
+    }
+    const original = patches.get(Object.getPrototypeOf(manager))?.original || manager.setThreadGoal;
+    const entry = { key, promise: null };
+    entry.promise = Promise.resolve().then(() => original.call(manager, threadId, params))
+      .then(goal => ({ status: "ok", goal }));
+    requests.set(requestId, entry);
+    return entry.promise;
+  }
+  async function install(threadId, options) {
+    adapters = options;
+    const manager = await managerFor(threadId, options.hostId);
+    if (!manager) return false;
+    const proto = Object.getPrototypeOf(manager);
+    if (patches.has(proto)) return true;
+    const original = Object.getOwnPropertyDescriptor(proto, "setThreadGoal").value;
+    proto.setThreadGoal = async function (id, params) {
+      if (!adapters?.enabled()) return original.call(this, id, params);
+      const forward = async () => {
+        const result = await adapters.forward({ threadId: id, hostId: this.getHostId(),
+          requestId: crypto.randomUUID(), params });
+        if (result?.status !== "ok" || !result.goal) throw new Error("forward failed");
+        return result.goal;
+      };
+      if (this.getStreamRole(id)?.role === "follower") return forward();
+      try { return await original.call(this, id, params); }
+      catch (error) {
+        if (error?.message === "Please continue this conversation on the window where it was started."
+            && this.getStreamRole(id)?.role === "follower") return forward();
+        throw error;
+      }
+    };
+    patches.set(proto, { original });
+    return true;
+  }
+  root.__codexPlusNativeThreadGoal = { version: 1, probe, execute, install };
+})();`;
+const legacyRuntimeFastPathSource = legacyRuntimeSource
+  .replace("  let adapters = null;", "  let adapters = null;\n  let installedFor = null;")
+  .replace("    const manager = await managerFor(threadId, options.hostId);\n    if (!manager) return false;",
+    `    if (installedFor?.threadId === threadId && installedFor.hostId === options.hostId
+        && installedFor.manager.disposed !== true) return true;
+    const manager = await managerFor(threadId, options.hostId);
+    if (!manager) return false;`)
+  .replace("    patches.set(proto, { original });\n    return true;",
+    "    patches.set(proto, { original });\n    installedFor = { threadId, hostId: options.hostId, manager };\n    return true;")
+  .replace(`      try { return await original.call(this, id, params); }
+      catch (error) {
+        if (error?.message === "Please continue this conversation on the window where it was started."
+            && this.getStreamRole(id)?.role === "follower") return forward();
+        throw error;
+      }`, "      return original.call(this, id, params);");
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason: unknown) => void;
@@ -20,7 +103,7 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function fixture() {
+function fixture(source = runtimeSource) {
   const goal = { objective: "native objective", status: "active", updatedAt: 123 };
   const remoteGoal = { objective: "owner objective", status: "active", updatedAt: 456 };
   const state = {
@@ -97,7 +180,7 @@ function fixture() {
   const body: any = {};
   const documentElement: any = {};
   const context = vm.createContext({
-    window: { location: new URL("app://-/index.html?initialRoute=%2Fspotlight") },
+    window: { location: new URL("app://-/index.html?initialRoute=%2Fspotlight"), __legacyManager: manager },
     document: {
       getElementById: (id: string) => id === "root" ? root : null,
       body,
@@ -108,7 +191,7 @@ function fixture() {
     URL,
     crypto: { randomUUID: () => `fixture-request-${++state.uuidCount}` },
   });
-  vm.runInContext(runtimeSource, context);
+  vm.runInContext(source, context);
   const api = context.window.__codexPlusNativeThreadGoal;
   const options = {
     hostId,
@@ -220,8 +303,54 @@ describe("native thread goal forwarding", () => {
       assert.equal(calls, 1);
       assert.equal(f.state.nativeCalls.length, 0);
       assert.equal(f.state.reports.length, 1);
-      assert.equal(f.state.reports[0], response?.code || "goal-forward-failed");
+      assert.equal(f.state.reports[0], "goal-forward-failed");
     }
+  });
+
+  it("uses only whitelisted failure codes and fixed messages for old backend responses", async () => {
+    const generic = "会话所在窗口暂不可用，请稍后重试设置目标";
+    const cases: Array<[unknown, string, string]> = [
+      ["goal-invalid-request", "goal-invalid-request", "会话目标请求无效，请重新设置目标"],
+      ["goal-enhancements-disabled", "goal-enhancements-disabled", "Codex++ 增强已关闭"],
+      ["goal-runtime-reload-required", "goal-runtime-reload-required", "会话目标组件已更新，请刷新或重新打开此窗口后重试"],
+      ...["goal-probe-failed", "goal-owner-unavailable", "goal-native-getter-ambiguous",
+        "goal-owner-changed", "goal-request-id-conflict", "goal-request-limit", "goal-forward-failed"]
+        .map(code => [code, code, generic] as [string, string, string]),
+      ["__proto__", "goal-forward-failed", generic],
+      ["constructor", "goal-forward-failed", generic],
+      ["secret-token http://internal.invalid/private", "goal-forward-failed", generic],
+      [{ secret: "secret-token" }, "goal-forward-failed", generic],
+      [undefined, "goal-forward-failed", generic],
+    ];
+    for (const [untrustedCode, expectedCode, expectedMessage] of cases) {
+      const f = fixture();
+      f.state.role = "follower";
+      let calls = 0;
+      const response = { status: "failed", code: untrustedCode,
+        message: "secret-token http://internal.invalid/private at internal stack" };
+      await f.install({ forward: async () => { calls += 1; return response; } });
+      await assert.rejects(f.manager.setThreadGoal(threadId, { objective: "failed" }), value => {
+        assert.equal(value.message, expectedMessage);
+        assert.doesNotMatch(String(value.stack), /secret-token|internal\.invalid/);
+        return true;
+      });
+      assert.equal(calls, 1);
+      assert.equal(f.state.nativeCalls.length, 0);
+      assert.deepEqual(f.state.reports, [expectedCode]);
+    }
+  });
+
+  it("never reads a failed response's message", async () => {
+    const f = fixture();
+    f.state.role = "follower";
+    const response = {
+      status: "failed", code: "goal-runtime-reload-required",
+      get message() { throw new Error("secret-token http://internal.invalid"); },
+    };
+    await f.install({ forward: async () => response });
+    await assert.rejects(f.manager.setThreadGoal(threadId, { objective: "failed" }),
+      { message: "会话目标组件已更新，请刷新或重新打开此窗口后重试" });
+    assert.deepEqual(f.state.reports, ["goal-runtime-reload-required"]);
   });
 
   it("preserves null or absent native results after a successful forward", async () => {
@@ -236,13 +365,33 @@ describe("native thread goal forwarding", () => {
     }
   });
 
-  it("propagates rejected forwarding without retrying an unknown result", async () => {
+  it("sanitizes rejected forwarding without retrying an unknown result", async () => {
     const f = fixture();
-    const error = new Error("CDP connection closed after dispatch");
+    const error = new Error("CDP connection closed after dispatch with secret-token at http://internal.invalid");
     let calls = 0;
     f.state.role = "follower";
     await f.install({ forward: async () => { calls += 1; throw error; } });
-    await assert.rejects(f.manager.setThreadGoal(threadId, { objective: "unknown" }), value => value === error);
+    await assert.rejects(f.manager.setThreadGoal(threadId, { objective: "unknown" }), value => {
+      assert.notEqual(value, error);
+      assert.equal(value.message, "会话所在窗口暂不可用，请稍后重试设置目标");
+      assert.doesNotMatch(value.message, /secret-token|internal\.invalid/);
+      return true;
+    });
+    assert.equal(calls, 1);
+    assert.equal(f.state.nativeCalls.length, 0);
+    assert.deepEqual(f.state.reports, ["goal-forward-failed"]);
+  });
+
+  it("keeps the sanitized failure when the diagnostic callback also throws", async () => {
+    const f = fixture();
+    f.state.role = "follower";
+    let calls = 0;
+    await f.install({
+      forward: async () => { calls += 1; throw new Error("secret-forward"); },
+      report: () => { throw new Error("secret-diagnostic"); },
+    });
+    await assert.rejects(f.manager.setThreadGoal(threadId, { objective: "unknown" }),
+      { message: "会话所在窗口暂不可用，请稍后重试设置目标" });
     assert.equal(calls, 1);
     assert.equal(f.state.nativeCalls.length, 0);
   });
@@ -264,6 +413,119 @@ describe("native thread goal forwarding", () => {
     assert.equal(f.state.forwards.length, 0);
     assert.equal(f.state.nativeCalls.length, 0);
     assert.equal(f.state.loads, 1);
+  });
+
+  it("does not let an older injected script replace the newer runtime", async () => {
+    const f = fixture();
+    await f.install();
+    const wrapper = f.manager.setThreadGoal;
+    vm.runInContext(legacyRuntimeSource, f.context);
+    assert.equal(f.context.window.__codexPlusNativeThreadGoal, f.api);
+    assert.equal(f.api.version, 1);
+    assert.equal(f.api.revision, 2);
+    assert.equal(f.manager.setThreadGoal, wrapper);
+  });
+
+  it("requires a reload when a known legacy runtime has not installed a wrapper", async () => {
+    for (const source of [legacyRuntimeSource, legacyRuntimeFastPathSource]) {
+      const f = fixture(source);
+      const original = f.manager.setThreadGoal;
+      const warnings: string[] = [];
+      f.context.window.console = { warn: (message: string) => warnings.push(message) };
+      vm.runInContext(runtimeSource, f.context);
+      vm.runInContext(runtimeSource, f.context);
+      assert.equal(f.context.window.__codexPlusNativeThreadGoal, f.api);
+      assert.equal(f.manager.setThreadGoal, original);
+      await assert.rejects(f.api.install(threadId, f.options), { code: "goal-runtime-reload-required" });
+      await assert.rejects(f.api.probe({ threadId, hostId }), { code: "goal-runtime-reload-required" });
+      assert.deepEqual(f.state.reports, ["goal-runtime-reload-required"]);
+      assert.equal(warnings.length, 1);
+      assert.equal(f.state.nativeCalls.length, 0);
+      assert.equal(f.state.forwards.length, 0);
+    }
+  });
+
+  it("does not claim to guard an unrecognized legacy implementation", async () => {
+    const f = fixture(legacyRuntimeSource);
+    const install = async () => true;
+    const probe = async () => ({ status: "owner" });
+    f.api.install = install;
+    f.api.probe = probe;
+    const warnings: string[] = [];
+    f.context.window.console = { warn: (message: string) => warnings.push(message) };
+    vm.runInContext(runtimeSource, f.context);
+    assert.equal(f.context.window.__codexPlusNativeThreadGoal, f.api);
+    assert.equal(f.api.install, install);
+    assert.equal(f.api.probe, probe);
+    assert.equal(f.api.__reloadGuard, undefined);
+    assert.equal(warnings.length, 1);
+  });
+
+  it("retains legacy in-flight request deduplication without nesting wrappers", async () => {
+    for (const source of [legacyRuntimeSource, legacyRuntimeFastPathSource]) {
+      const f = fixture(source);
+      const server = deferred<void>();
+      f.state.serverPending = server.promise;
+      await f.install();
+      const wrapper = f.manager.setThreadGoal;
+      const request = f.request("legacy-pending");
+      const first = f.api.execute(request);
+      await flush();
+      assert.equal(f.state.nativeCalls.length, 1);
+      vm.runInContext(runtimeSource, f.context);
+      const duplicate = f.api.execute(request);
+      await assert.rejects(f.api.execute(f.request("legacy-pending", { objective: "different" })),
+        { message: "goal-request-id-conflict" });
+      await assert.rejects(f.api.install(threadId, f.options), { code: "goal-runtime-reload-required" });
+      vm.runInContext(runtimeSource, f.context);
+      vm.runInContext(source, f.context);
+      assert.equal(f.context.window.__codexPlusNativeThreadGoal, f.api);
+      assert.equal(f.manager.setThreadGoal, wrapper);
+      assert.equal(f.state.nativeCalls.length, 1);
+      server.resolve();
+      const [one, two] = await Promise.all([first, duplicate]);
+      assert.equal(one.goal, f.goal);
+      assert.equal(two.goal, f.goal);
+      assert.equal((await f.api.execute(request)).goal, f.goal);
+      assert.equal(f.state.nativeCalls.length, 1);
+    }
+  });
+
+  it("prevents a legacy in-flight owner race from forwarding after reinjection", async () => {
+    for (const source of [legacyRuntimeSource, legacyRuntimeFastPathSource]) {
+      const f = fixture(source);
+      const resume = deferred<void>();
+      f.state.onResume = async () => { await resume.promise; f.state.role = "follower"; };
+      await f.install();
+      const pending = f.manager.setThreadGoal(threadId, { objective: "legacy-race" });
+      await flush();
+      vm.runInContext(runtimeSource, f.context);
+      resume.resolve();
+      await assert.rejects(pending, source === legacyRuntimeSource
+        ? { code: "goal-runtime-reload-required" } : { message: ownerError });
+      await assert.rejects(f.manager.setThreadGoal(threadId, { objective: "legacy-follower" }),
+        { code: "goal-runtime-reload-required" });
+      assert.equal(f.state.nativeCalls.length, 1);
+      assert.equal(f.state.forwards.length, 0);
+    }
+  });
+
+  it("keeps an already-running legacy installation suspended after it resumes", async () => {
+    for (const source of [legacyRuntimeSource, legacyRuntimeFastPathSource]) {
+      const f = fixture(source);
+      const ready = deferred<void>();
+      f.context.window.__legacyManagerReady = () => ready.promise;
+      const pending = f.install();
+      await flush();
+      vm.runInContext(runtimeSource, f.context);
+      ready.resolve();
+      assert.equal(await pending, true);
+      f.state.role = "follower";
+      await assert.rejects(f.manager.setThreadGoal(threadId, { objective: "late-install" }),
+        { code: "goal-runtime-reload-required" });
+      assert.equal(f.state.nativeCalls.length, 0);
+      assert.equal(f.state.forwards.length, 0);
+    }
   });
 
   it("rediscovers a manager when it is disposed or the host or thread changes", async () => {
@@ -307,9 +569,137 @@ describe("native thread goal forwarding", () => {
     ]);
     assert.equal(f.state.loads, 1);
   });
+
+  it("backs off only installation after a missing manager and recovers within eight seconds", async () => {
+    const f = fixture();
+    let now = 0;
+    let traversals = 0;
+    f.context.performance.now = () => now;
+    const getRoot = f.context.document.getElementById;
+    f.context.document.getElementById = (id: string) => { traversals += 1; return getRoot(id); };
+    f.state.manager = null;
+    assert.equal(await f.install(), false);
+    assert.equal(traversals, 1);
+    now = 2_000;
+    assert.equal(await f.install(), false);
+    assert.equal(traversals, 1);
+    now = 4_000;
+    assert.equal(await f.install(), false);
+    assert.equal(traversals, 2);
+    f.state.manager = f.manager;
+    now = 11_999;
+    assert.equal((await f.api.probe({ threadId, hostId })).status, "owner");
+    assert.equal(traversals, 3);
+    assert.equal(await f.install(), false);
+    assert.equal(traversals, 3);
+    now = 12_000;
+    assert.equal(await f.install(), true);
+    assert.equal(traversals, 4);
+    now = 13_000;
+    assert.equal(await f.install(), true);
+    assert.equal(traversals, 4);
+  });
+
+  it("retries missing installation immediately when the thread or host changes", async () => {
+    for (const change of ["thread", "host"]) {
+      const f = fixture();
+      f.context.performance.now = () => 0;
+      f.state.manager = null;
+      assert.equal(await f.install(), false);
+      if (change === "host") {
+        f.state.hostId = "remote";
+        f.state.manager = f.manager;
+        assert.equal(await f.api.install(threadId, { ...f.options, hostId: "remote" }), true);
+      } else {
+        const other = new class {
+          disposed = false;
+          getHostId() { return hostId; }
+          getConversation(id: string) { return id === "other-thread" ? { id } : null; }
+          getStreamRole() { return { role: "follower" }; }
+          async setThreadGoal(_id: string, _params: any) { throw new Error("unpatched"); }
+        }();
+        f.state.manager = other;
+        assert.equal(await f.api.install("other-thread", f.options), true);
+        assert.equal(await other.setThreadGoal("other-thread", { objective: "other" }), f.remoteGoal);
+      }
+    }
+  });
 });
 
 describe("native thread goal discovery and execution", () => {
+  it("caches unique, absent and ambiguous getters once per loaded module", async () => {
+    for (const outcome of ["unique", "absent", "ambiguous"]) {
+      const f = fixture();
+      let exportScans = 0;
+      let getterCalls = 0;
+      if (outcome === "absent") delete f.module.renamedGetter;
+      if (outcome === "ambiguous") {
+        f.module.lookalike = function (e: any, t: string) {
+          getterCalls += 1;
+          if (!t) return null;
+          return e.get({}).find((candidate: any) => candidate.getConversation(t));
+        };
+      }
+      const module = new Proxy(f.module, {
+        ownKeys(target) { exportScans += 1; return Reflect.ownKeys(target); },
+      });
+      const options = { ...f.options, loadModule: async () => module };
+      if (outcome === "unique") {
+        assert.equal(await f.api.install(threadId, options), true);
+        assert.equal((await f.api.probe({ threadId, hostId })).status, "owner");
+        assert.equal((await f.api.execute(f.request("cached-getter"))).goal, f.goal);
+        const newScope = {};
+        f.module.renamedSignal.scope = newScope;
+        f.scope.scope = newScope;
+        assert.equal((await f.api.probe({ threadId, hostId })).status, "owner");
+      } else if (outcome === "absent") {
+        f.context.document.getElementById = () => { throw new Error("unexpected React traversal"); };
+        assert.equal(await f.api.install(threadId, options), false);
+        assert.equal((await f.api.probe({ threadId, hostId })).status, "unavailable");
+        await assert.rejects(f.api.execute(f.request()),
+          { message: "goal-owner-changed", code: "goal-owner-changed" });
+      } else {
+        f.context.document.getElementById = () => { throw new Error("unexpected React traversal"); };
+        await assert.rejects(f.api.install(threadId, options),
+          { message: "goal-native-getter-ambiguous", code: "goal-native-getter-ambiguous" });
+        await assert.rejects(f.api.probe({ threadId, hostId }),
+          { message: "goal-native-getter-ambiguous", code: "goal-native-getter-ambiguous" });
+        assert.equal(getterCalls, 0);
+        assert.deepEqual(f.state.reports, ["goal-native-getter-ambiguous"]);
+      }
+      assert.equal(exportScans, 1, outcome);
+    }
+  });
+
+  it("retries an unavailable module and caches its discovery after a successful load", async () => {
+    const f = fixture();
+    let attempts = 0;
+    let scans = 0;
+    const module = new Proxy(f.module, {
+      ownKeys(target) { scans += 1; return Reflect.ownKeys(target); },
+    });
+    const options = { ...f.options, loadModule: async () => ++attempts === 1 ? null : module };
+    await assert.rejects(f.api.install(threadId, options),
+      { message: "native-module-unavailable", code: "native-module-unavailable" });
+    assert.equal(await f.api.install(threadId, options), true);
+    assert.equal((await f.api.probe({ threadId, hostId })).status, "owner");
+    assert.equal(attempts, 2);
+    assert.equal(scans, 1);
+  });
+
+  it("reports a cached ambiguous getter when a diagnostic adapter becomes available", async () => {
+    const f = fixture();
+    f.module.lookalike = function (e: any, t: string) {
+      if (!t) return null;
+      return e.get({}).find((candidate: any) => candidate.getConversation(t));
+    };
+    await assert.rejects(f.install({ report: undefined }), { message: "goal-native-getter-ambiguous" });
+    assert.deepEqual(f.state.reports, []);
+    await assert.rejects(f.install(), { message: "goal-native-getter-ambiguous" });
+    await assert.rejects(f.install(), { message: "goal-native-getter-ambiguous" });
+    assert.deepEqual(f.state.reports, ["goal-native-getter-ambiguous"]);
+  });
+
   it("refuses ambiguous getters before calling them or inspecting React state", async () => {
     const f = fixture();
     let calls = 0;
@@ -381,7 +771,8 @@ describe("native thread goal discovery and execution", () => {
       assert.equal(await f.install(), false);
       assert.equal(f.manager.setThreadGoal, original);
       assert.equal((await f.api.probe({ threadId, hostId })).status, "unavailable");
-      await assert.rejects(f.api.execute(f.request()), { message: "goal-owner-changed" });
+      await assert.rejects(f.api.execute(f.request()),
+        { message: "goal-owner-changed", code: "goal-owner-changed" });
       assert.equal(f.state.nativeCalls.length, 0);
       assert.equal(f.state.forwards.length, 0);
     }
@@ -485,7 +876,8 @@ describe("native thread goal discovery and execution", () => {
       f.state.onRoleRead = () => {
         if (f.state.roleReads === 1) change(f);
       };
-      await assert.rejects(f.api.execute(f.request()), { message: "goal-owner-changed" });
+      await assert.rejects(f.api.execute(f.request()),
+        { message: "goal-owner-changed", code: "goal-owner-changed" });
       assert.equal(f.state.nativeCalls.length, 0);
       assert.equal(f.state.forwards.length, 0);
       assert.deepEqual(f.state.events, []);
@@ -513,7 +905,7 @@ describe("native thread goal discovery and execution", () => {
     await flush();
     assert.equal(f.state.nativeCalls.length, 1);
     await assert.rejects(f.api.execute(f.request("same-id", { objective: "different objective" })),
-      { message: "goal-request-id-conflict" });
+      { message: "goal-request-id-conflict", code: "goal-request-id-conflict" });
     server.resolve();
     const [firstResult, concurrentResult] = await Promise.all([first, concurrent]);
     assert.equal(firstResult.goal, f.goal);
@@ -545,7 +937,8 @@ describe("native thread goal discovery and execution", () => {
     const pending = Array.from({ length: 128 }, (_, index) => f.api.execute(f.request(`pending-${index}`)));
     await flush();
     assert.equal(f.state.nativeCalls.length, 128);
-    await assert.rejects(f.api.execute(f.request("overflow")), { message: "goal-request-limit" });
+    await assert.rejects(f.api.execute(f.request("overflow")),
+      { message: "goal-request-limit", code: "goal-request-limit" });
     const duplicate = f.api.execute(f.request("pending-0"));
     assert.equal(f.state.nativeCalls.length, 128);
     server.resolve();
