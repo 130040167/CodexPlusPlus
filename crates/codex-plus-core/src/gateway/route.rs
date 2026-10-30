@@ -374,6 +374,7 @@ fn codex_pool_blocks(gateway: &GatewaySettings, binding: &AgentBinding) -> Vec<V
         shared
             .into_iter()
             .filter(|model| gateway.auto_models && !auto_group_settings(gateway, model).hidden)
+            .filter(|model| !unlisted.contains(&model.to_ascii_lowercase()))
             .filter(|model| fresh(model))
             .collect(),
     );
@@ -2061,6 +2062,50 @@ mod tests {
             "fast 组的成员 kimi-k3 被隐藏：{models:?}"
         );
         assert!(models.iter().any(|m| m == "group/fast"));
+    }
+
+    #[test]
+    fn hidden_shared_bare_member_is_not_reexposed_by_codex_models() {
+        let mut gateway = gateway("kimi-k3");
+        gateway.auto_models = true;
+        gateway.groups.push(GatewayGroup {
+            hide_members: true,
+            ..group(
+                "shared",
+                GroupMode::InOrder,
+                vec![member("DeepSeek-V4-Pro")],
+            )
+        });
+        let mut binding = gateway.binding(&ToolId::Claude).unwrap().clone();
+        gateway.bindings.insert("codex".into(), binding.clone());
+
+        let pool = codex_pool_models(&gateway, &binding);
+        let exposed = crate::gateway::server::exposed_models(&gateway, &ToolId::Codex);
+        for models in [&pool, &exposed] {
+            assert!(
+                !models
+                    .iter()
+                    .any(|model| model.eq_ignore_ascii_case("deepseek-v4-pro"))
+            );
+            assert!(models.iter().any(|model| model == "ds/deepseek-v4-pro"));
+            assert!(models.iter().any(|model| model == "mirror/deepseek-v4-pro"));
+            assert!(models.iter().any(|model| model == "group/shared"));
+        }
+
+        // 默认模型及绑定显式声明沿用上游例外，仍可出现在目录中。
+        binding.extra_models.push("deepseek-v4-pro".into());
+        assert!(
+            codex_binding_models(&gateway, &binding)
+                .iter()
+                .any(|model| model == "deepseek-v4-pro")
+        );
+        binding.extra_models.clear();
+        binding.model = "deepseek-v4-pro".into();
+        assert!(
+            codex_binding_models(&gateway, &binding)
+                .iter()
+                .any(|model| model == "deepseek-v4-pro")
+        );
     }
 
     #[test]

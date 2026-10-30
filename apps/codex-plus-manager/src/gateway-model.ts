@@ -567,6 +567,7 @@ export function pickerSections(
   }
   const autoItems = shared
     .filter((model) => activeAutoGroup(payload, model))
+    .filter((model) => !unlisted.has(model.toLowerCase()))
     .map((model) => ({
       model,
       label: prettyModelName(model),

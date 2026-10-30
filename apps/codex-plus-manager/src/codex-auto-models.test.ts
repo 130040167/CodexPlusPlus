@@ -50,6 +50,22 @@ test("自动组可隐藏自己的入口，隐藏成员保留自动组并隐藏�
   assert.match(page, /"save_gateway_auto_models", \{ enabled: !autoOn \}/, "自动建组开关在路由页");
 });
 
+test("自建组隐藏共享裸模型时保留供应商固定入口", () => {
+  const data = payload();
+  data.groups = [{
+    id: "shared", name: "Shared", mode: "inOrder", hideMembers: true,
+    members: [{ model: "GPT-6.1-SOL", weight: 1 }],
+  }];
+  const sections = pickerSections(data, "", () => "");
+  assert.equal(sections.some(section => section.key === "auto"), false);
+  for (const id of ["chatgpt", "jojo"]) {
+    assert(sections.find(section => section.key === `provider:${id}`)?.items
+      .some(item => item.model === `${id}/gpt-6.1-sol`));
+  }
+  assert.deepEqual(sections.find(section => section.key === "group")?.items.map(item => item.model), ["group/shared"]);
+  assert.equal(pickerSections(data, "sol", () => "").some(section => section.key === "auto"), false);
+});
+
 test("旧的隐藏成员设置保留模型组，Codex 专用组隐藏不影响管理器的 Agent 选择器", () => {
   const data = payload();
   data.groups = [
