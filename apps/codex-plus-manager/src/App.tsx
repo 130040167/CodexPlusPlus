@@ -5744,25 +5744,22 @@ function WeixinConnectScreen({
                 />
                 <small className="weixin-field-hint">{t("选择后自动带入该会话的工作目录，微信联系人仍保持独立会话。")}</small>
               </label>
-              <label className="field">
+              <label aria-invalid={modelUnavailable || Boolean(catalogError)} className="field">
                 <span>{t("模型")}</span>
                 <div className="weixin-path-row">
-                  <select
-                    aria-invalid={modelUnavailable || Boolean(catalogError)}
-                    className="field-select"
-                    onChange={(event) => onFormChange({ ...form, weixinConnectModel: event.target.value })}
+                  <AppSelect
+                    ariaLabel={t("模型")}
+                    onChange={(next) => onFormChange({ ...form, weixinConnectModel: next })}
+                    options={[
+                      { value: "", label: `${t("继承 Codex 默认模型")}${inheritedModel ? ` (${inheritedModel})` : ""}` },
+                      ...(form.weixinConnectModel && !models.includes(form.weixinConnectModel) ? [{
+                        value: form.weixinConnectModel,
+                        label: `${form.weixinConnectModel} (${modelUnavailable ? t("不可用") : t("当前值")})`,
+                      }] : []),
+                      ...models.map((model) => ({ value: model, label: catalog?.modelMetadata?.[model]?.displayName || model })),
+                    ]}
                     value={form.weixinConnectModel}
-                  >
-                    <option value="">{t("继承 Codex 默认模型")}{inheritedModel ? ` (${inheritedModel})` : ""}</option>
-                    {form.weixinConnectModel && !models.includes(form.weixinConnectModel) ? (
-                      <option value={form.weixinConnectModel}>
-                        {form.weixinConnectModel} ({modelUnavailable ? t("不可用") : t("当前值")})
-                      </option>
-                    ) : null}
-                    {models.map((model) => (
-                      <option key={model} value={model}>{catalog?.modelMetadata?.[model]?.displayName || model}</option>
-                    ))}
-                  </select>
+                  />
                   <Button aria-label={t("刷新模型目录")} disabled={catalogLoading} onClick={() => setCatalogRevision((value) => value + 1)} size="icon" title={t("刷新模型目录")} type="button" variant="outline">
                     <RefreshCw className={`h-4 w-4${catalogLoading ? " animate-spin" : ""}`} />
                   </Button>
@@ -5771,32 +5768,29 @@ function WeixinConnectScreen({
                 {modelUnavailable ? <small className="weixin-field-hint request-log-error" role="alert">{t("当前模型已不在可用模型目录中，请重新选择。")}</small> : null}
                 {catalog && !catalogError && !models.length ? <small className="weixin-field-hint" role="status">{t("当前没有可用模型，请检查供应商配置。")}</small> : null}
               </label>
-              <label className="field">
+              <label aria-invalid={reasoningUnavailable} className="field">
                 <span>{t("推理强度")}</span>
-                <select
-                  aria-invalid={reasoningUnavailable}
-                  className="field-select"
-                  onChange={(event) => onFormChange({ ...form, weixinConnectReasoningEffort: event.target.value })}
+                <AppSelect
+                  ariaLabel={t("推理强度")}
+                  onChange={(next) => onFormChange({ ...form, weixinConnectReasoningEffort: next })}
+                  options={[
+                    { value: "", label: t("继承 Codex 推理强度") },
+                    ...(form.weixinConnectReasoningEffort && !reasoningEfforts.includes(form.weixinConnectReasoningEffort) ? [{
+                      value: form.weixinConnectReasoningEffort,
+                      label: `${form.weixinConnectReasoningEffort} (${reasoningUnavailable ? t("不可用") : t("当前值")})`,
+                    }] : []),
+                    ...reasoningEfforts.map((effort) => ({ value: effort, label: effort })),
+                  ]}
                   value={form.weixinConnectReasoningEffort}
-                >
-                  <option value="">{t("继承 Codex 推理强度")}</option>
-                  {form.weixinConnectReasoningEffort && !reasoningEfforts.includes(form.weixinConnectReasoningEffort) ? (
-                    <option value={form.weixinConnectReasoningEffort}>
-                      {form.weixinConnectReasoningEffort} ({reasoningUnavailable ? t("不可用") : t("当前值")})
-                    </option>
-                  ) : null}
-                  {reasoningEfforts.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
-                </select>
+                />
                 {reasoningUnavailable ? <small className="weixin-field-hint request-log-error" role="alert">{t("当前模型不支持已选推理强度，请重新选择或继承。")}</small> : null}
               </label>
-              <label className="field">
+              <label aria-invalid={projectUnavailable || Boolean(projectsError)} className="field">
                 <span>{t("新会话项目")}</span>
                 <div className="weixin-path-row">
-                  <select
-                    aria-invalid={projectUnavailable || Boolean(projectsError)}
-                    className="field-select"
-                    onChange={(event) => {
-                      const id = event.target.value;
+                  <AppSelect
+                    ariaLabel={t("新会话项目")}
+                    onChange={(id) => {
                       const selected = projectOptions.find((project) => project.id === id);
                       onFormChange({
                         ...form,
@@ -5804,16 +5798,16 @@ function WeixinConnectScreen({
                         weixinConnectWorkDir: selected?.roots?.[0]?.path || form.weixinConnectWorkDir,
                       });
                     }}
+                    options={[
+                      { value: "", label: t("不归属项目") },
+                      ...(form.weixinConnectProjectId && !projectOptions.some((project) => project.id === form.weixinConnectProjectId) ? [{
+                        value: form.weixinConnectProjectId,
+                        label: `${form.weixinConnectProjectId} (${projectUnavailable ? t("不可用") : t("当前值")})`,
+                      }] : []),
+                      ...projectOptions.map((project) => ({ value: project.id, label: project.name || project.id })),
+                    ]}
                     value={form.weixinConnectProjectId}
-                  >
-                    <option value="">{t("不归属项目")}</option>
-                    {form.weixinConnectProjectId && !projectOptions.some((project) => project.id === form.weixinConnectProjectId) ? (
-                      <option value={form.weixinConnectProjectId}>
-                        {form.weixinConnectProjectId} ({projectUnavailable ? t("不可用") : t("当前值")})
-                      </option>
-                    ) : null}
-                    {projectOptions.map((project) => <option key={project.id} value={project.id}>{project.name || project.id}</option>)}
-                  </select>
+                  />
                   <Button aria-label={t("刷新项目")} disabled={projectsLoading} onClick={() => setProjectsRevision((value) => value + 1)} size="icon" title={t("刷新项目")} type="button" variant="outline">
                     <RefreshCw className={`h-4 w-4${projectsLoading ? " animate-spin" : ""}`} />
                   </Button>
