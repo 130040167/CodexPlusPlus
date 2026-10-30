@@ -407,7 +407,9 @@ impl WeixinMessage {
     }
 
     pub fn text(&self) -> Option<String> {
-        self.item_list.iter().find_map(message_item_text)
+        self.item_list
+            .iter()
+            .find_map(|item| message_item_text(item, 0))
     }
 
     pub fn dedup_key(&self) -> String {
@@ -426,7 +428,7 @@ impl WeixinMessage {
     }
 }
 
-fn message_item_text(item: &WeixinMessageItem) -> Option<String> {
+fn message_item_text(item: &WeixinMessageItem, depth: usize) -> Option<String> {
     let body = match item.item_type {
         1 => item.text_item.as_ref().map(|item| item.text.trim()),
         3 => item.voice_item.as_ref().map(|item| item.text.trim()),
@@ -442,8 +444,9 @@ fn message_item_text(item: &WeixinMessageItem) -> Option<String> {
     if !reference.title.trim().is_empty() {
         reference_parts.push(reference.title.trim().to_string());
     }
-    if let Some(reference_item) = reference.message_item.as_deref()
-        && let Some(reference_text) = message_item_text(reference_item)
+    if depth < media::MAX_REFERENCE_DEPTH
+        && let Some(reference_item) = reference.message_item.as_deref()
+        && let Some(reference_text) = message_item_text(reference_item, depth + 1)
     {
         reference_parts.push(reference_text);
     }
@@ -483,6 +486,21 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quoted_text_recursion_uses_the_same_bound_as_media() {
+        let mut item = json!({"type":1,"text_item":{"text":"too-deep"}});
+        for depth in (0..8).rev() {
+            item = json!({
+                "type":1,"text_item":{"text":format!("level-{depth}")},
+                "ref_msg":{"message_item":item}
+            });
+        }
+        let message: WeixinMessage = serde_json::from_value(json!({"item_list":[item]})).unwrap();
+        let text = message.text().unwrap();
+        assert!(text.contains("level-0") && text.contains("level-4"));
+        assert!(!text.contains("level-5") && !text.contains("too-deep"));
+    }
 
     #[test]
     fn extracts_text_and_voice_transcription() {

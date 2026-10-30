@@ -12,6 +12,7 @@ use super::media::LocalAttachment;
 const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_DIRECTORIES: usize = 100;
 const MARKER: &str = ".weixin-media.json";
+const LEASE: &str = ".weixin-media.lock";
 
 #[derive(Deserialize, Serialize)]
 struct Manifest {
@@ -179,6 +180,7 @@ pub(super) struct Inbox {
     // 保持整个目录链的句柄直到下载和登记完成。
     _parents: Vec<Directory>,
     directory: Directory,
+    _lease: File,
 }
 
 impl Inbox {
@@ -199,9 +201,12 @@ impl Inbox {
         let name = uuid::Uuid::new_v4().to_string();
         inbox.create_child(&name)?;
         let directory = inbox.child(&name)?;
+        let lease = directory.open_file(LEASE, false, true)?;
+        lease.try_lock().context("无法锁定本次微信收件目录")?;
         let result = Self {
             _parents: parents,
             directory,
+            _lease: lease,
         };
         result.record(&[])?;
         Ok(result)
@@ -303,12 +308,12 @@ fn owned_manifest(directory: &Directory, name: &str) -> anyhow::Result<(Manifest
         bail!("收件目录标记无效");
     }
     let entries = std::fs::read_dir(&directory.path)?.collect::<Result<Vec<_>, _>>()?;
-    if entries.len() != marker.files.len() + 1 {
+    if entries.len() != marker.files.len() + 2 {
         bail!("收件目录含有未登记内容");
     }
     let mut names = std::collections::HashSet::new();
     for (name, size, modified) in &marker.files {
-        if name == MARKER || !names.insert(name) {
+        if name == MARKER || name == LEASE || !names.insert(name) {
             bail!("收件标记包含重复文件");
         }
         let file = directory.open_file(name, false, false)?;
@@ -330,6 +335,12 @@ fn cleanup(inbox: &Directory, now: SystemTime, retain: usize) -> anyhow::Result<
         let Ok(directory) = inbox.child(&name) else {
             continue;
         };
+        let Ok(lease) = directory.open_file(LEASE, false, false) else {
+            continue;
+        };
+        if lease.try_lock().is_err() {
+            continue;
+        }
         if let Ok((_, modified)) = owned_manifest(&directory, &name) {
             owned.push((modified, name));
         }
@@ -341,6 +352,12 @@ fn cleanup(inbox: &Directory, now: SystemTime, retain: usize) -> anyhow::Result<
             continue;
         }
         let directory = inbox.child(&name)?;
+        let Ok(lease) = directory.open_file(LEASE, false, false) else {
+            continue;
+        };
+        if lease.try_lock().is_err() {
+            continue;
+        }
         let Ok((marker, current_modified)) = owned_manifest(&directory, &name) else {
             continue;
         };
@@ -351,6 +368,8 @@ fn cleanup(inbox: &Directory, now: SystemTime, retain: usize) -> anyhow::Result<
             directory.remove(&filename, false)?;
         }
         directory.remove(MARKER, false)?;
+        drop(lease);
+        directory.remove(LEASE, false)?;
         drop(directory);
         // 仅移除空目录；额外内容永不递归删除。
         inbox.remove(&name, true)?;
@@ -384,7 +403,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(marker.files.len(), 2);
-        assert_eq!(std::fs::read_dir(inbox.path()).unwrap().count(), 3);
+        assert_eq!(std::fs::read_dir(inbox.path()).unwrap().count(), 4);
         assert!(std::fs::read_dir(inbox.path()).unwrap().all(|entry| {
             !entry
                 .unwrap()
@@ -420,7 +439,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(std::fs::read(outside).unwrap(), b"keep");
-        assert_eq!(std::fs::read_dir(inbox.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(inbox.path()).unwrap().count(), 2);
     }
 
     #[cfg(unix)]
@@ -484,16 +503,18 @@ mod tests {
                 kind: AttachmentKind::Image,
             }])
             .unwrap();
-        let inbox = managed._parents.last().unwrap();
+        let inbox_path = managed.path().parent().unwrap().to_path_buf();
+        drop(managed);
+        let inbox = Directory::open(&inbox_path).unwrap();
         let modified = std::fs::metadata(path.join(MARKER))
             .unwrap()
             .modified()
             .unwrap();
-        cleanup(inbox, modified + RETENTION, MAX_DIRECTORIES).unwrap();
+        cleanup(&inbox, modified + RETENTION, MAX_DIRECTORIES).unwrap();
         assert!(file.exists());
         std::fs::write(path.join("keep.txt"), b"foreign").unwrap();
         cleanup(
-            inbox,
+            &inbox,
             modified + RETENTION + Duration::from_secs(1),
             MAX_DIRECTORIES,
         )
@@ -512,7 +533,7 @@ mod tests {
             )
             .unwrap();
         cleanup(
-            inbox,
+            &inbox,
             modified + RETENTION + Duration::from_secs(1),
             MAX_DIRECTORIES,
         )
@@ -525,11 +546,8 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(original_time))
             .unwrap();
-        // Windows 删除目录前须释放本次持有的目录句柄。
-        let inbox_path = inbox.path.clone();
-        drop(managed);
         cleanup(
-            &Directory::open(&inbox_path).unwrap(),
+            &inbox,
             modified + RETENTION + Duration::from_secs(1),
             MAX_DIRECTORIES,
         )
@@ -547,21 +565,44 @@ mod tests {
         let managed = Inbox::create(root.path()).unwrap();
         std::fs::create_dir(managed.path().join("user-subdir")).unwrap();
         std::fs::write(managed.path().join("user-subdir/keep"), b"keep").unwrap();
+        let inbox_path = managed.path().parent().unwrap().to_path_buf();
+        let path = managed.path().to_path_buf();
+        drop(managed);
         cleanup(
-            managed._parents.last().unwrap(),
+            &Directory::open(&inbox_path).unwrap(),
             SystemTime::now() + RETENTION * 2,
             0,
         )
         .unwrap();
-        assert!(managed.path().join("user-subdir/keep").exists());
-        std::fs::write(managed.path().join(MARKER), b"invalid").unwrap();
+        assert!(path.join("user-subdir/keep").exists());
+        std::fs::write(path.join(MARKER), b"invalid").unwrap();
         cleanup(
-            managed._parents.last().unwrap(),
+            &Directory::open(&inbox_path).unwrap(),
             SystemTime::now() + RETENTION * 2,
             0,
         )
         .unwrap();
-        assert!(managed.path().join("user-subdir/keep").exists());
+        assert!(path.join("user-subdir/keep").exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_skips_a_directory_until_the_inbound_turn_releases_it() {
+        let root = tempfile::tempdir().unwrap();
+        let active = Inbox::create(root.path()).unwrap();
+        let path = active.path().to_path_buf();
+        let file = active.save("input.txt", b"in use").await.unwrap();
+        active
+            .record(&[LocalAttachment {
+                path: file.clone(),
+                kind: AttachmentKind::File,
+            }])
+            .unwrap();
+        let parent = Directory::open(path.parent().unwrap()).unwrap();
+        cleanup(&parent, SystemTime::now() + RETENTION * 2, 0).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"in use");
+        drop(active);
+        cleanup(&parent, SystemTime::now() + RETENTION * 2, 0).unwrap();
+        assert!(!path.exists());
     }
 
     #[test]

@@ -294,6 +294,7 @@ fn parse_base64_key(encoded: &str) -> anyhow::Result<[u8; 16]> {
     }
 }
 
+#[cfg(test)]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

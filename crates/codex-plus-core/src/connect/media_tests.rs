@@ -297,7 +297,7 @@ async fn rejects_truncated_media_metadata_mismatches_and_oversized_bodies() {
         .await
         .unwrap();
     assert!(read_bytes_limited(response, 64).await.is_err());
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
 }
 
 #[tokio::test]
@@ -377,7 +377,7 @@ async fn rejects_truncated_images_and_oversized_response_bodies() {
     let result = client(&server).download_attachments(&message, &dir).await;
     assert!(result.attachments.is_empty());
     assert_eq!(result.warnings.len(), 1);
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     let response = reqwest::get(format!("{}/large", server.uri()))
         .await
         .unwrap();
@@ -405,7 +405,7 @@ async fn rejects_file_checksum_mismatch_before_saving() {
     assert!(result.attachments.is_empty());
     assert_eq!(result.warnings.len(), 1);
     assert!(result.warnings[0].contains("MD5"));
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
 }
 
 fn encrypt(plaintext: &[u8], key: &[u8; 16]) -> Vec<u8> {
