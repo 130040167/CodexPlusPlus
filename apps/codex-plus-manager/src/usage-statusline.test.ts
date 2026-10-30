@@ -377,7 +377,7 @@ test("宿主没有数据或记录缺字段时照样显示，只各记一次诊�
     await pending;
   }
   assert.notEqual(ui.node.dataset.hidden, "true", "没数据也保留占位栏位");
-  assert.deepEqual(ui.diagnostics.map((item) => item.event), ["usage_statusline_data_unavailable"]);
+  assert.deepEqual(ui.diagnostics.map((item: { event: string }) => item.event), ["usage_statusline_data_unavailable"]);
   assert.equal(ui.diagnostics[0].detail.status, "not_found");
 
   // 旧版 Codex 的 rollout 没有窗口与轮 id：上下文占用显示 --，并记下缺了什么。
@@ -385,7 +385,7 @@ test("宿主没有数据或记录缺字段时照样显示，只各记一次诊�
   ui.respond([event(0, 100, { context_window: undefined, turn_id: undefined })]);
   await partial;
   assert.equal(ui.renders.at(-1).context, null);
-  const gap = ui.diagnostics.find((item) => item.event === "usage_statusline_data_partial");
+  const gap = ui.diagnostics.find((item: { event: string }) => item.event === "usage_statusline_data_partial");
   assert.deepEqual(gap?.detail.missing, ["context_window", "turn_id"]);
 });
 
