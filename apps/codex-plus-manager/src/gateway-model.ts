@@ -1204,7 +1204,7 @@ export type UsageSummary = {
   byModel: UsageGroup[];
   costs: UsageCost[];
 };
-export type ProviderBalance = { providerId: string; provider: string; baseUrl: string; amount?: number | null; currency: string; error?: string | null };
+export type ProviderBalance = { providerId: string; provider: string; baseUrl: string; amount?: number | null; currency: string; error?: string | null; note?: string | null };
 export type UsageRange = "today" | "7d" | "30d" | "all";
 
 /** 统计范围从哪一刻开始（本地时间当天零点往前推）；「全部」没有起点。 */

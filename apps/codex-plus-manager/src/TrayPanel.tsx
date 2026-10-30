@@ -130,6 +130,7 @@ export function TrayPanel() {
   const [usage, setUsage] = useState<Partial<Record<UsageRange, UsageSummary>>>({});
   const [balances, setBalances] = useState<ProviderBalance[] | null>(null);
   const [balancesLoading, setBalancesLoading] = useState(false);
+  const [balancesFailed, setBalancesFailed] = useState(false);
   const [pending, setPending] = useState<Pending | null>(null);
   const [flash, setFlash] = useState<Flash | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -183,8 +184,10 @@ export function TrayPanel() {
     try {
       const result = await invoke<{ balances?: ProviderBalance[] }>("load_gateway_balances");
       setBalances(result.balances ?? []);
+      setBalancesFailed(false);
     } catch {
-      setBalances([]);
+      // 查询本身失败不能说成「没有可以查询余额的供应商」。
+      setBalancesFailed(true);
     } finally {
       setBalancesLoading(false);
     }
@@ -364,6 +367,7 @@ export function TrayPanel() {
         {tab === "usage" ? (
           <UsageTab
             balances={balances}
+            balancesFailed={balancesFailed}
             balancesLoading={balancesLoading}
             onLoadBalances={() => void loadBalances()}
             onOpenRoute={openRoute}
@@ -557,6 +561,7 @@ function UsageTab({
   summary,
   payload,
   balances,
+  balancesFailed,
   balancesLoading,
   onRange,
   onLoadBalances,
@@ -566,6 +571,7 @@ function UsageTab({
   summary: UsageSummary | null;
   payload: GatewayPayload | null;
   balances: ProviderBalance[] | null;
+  balancesFailed: boolean;
   balancesLoading: boolean;
   onRange: (range: UsageRange) => void;
   onLoadBalances: () => void;
@@ -645,8 +651,10 @@ function UsageTab({
           )}
           title={t("余额")}
         >
-          {balances === null ? (
-            <p className="tp-note">{t("会联网查询网关供应商池里支持余额接口的供应商。")}</p>
+          {balancesFailed ? (
+            <p className="tp-note">{t("余额查询失败，请稍后重试。")}</p>
+          ) : balances === null ? (
+            <p className="tp-note">{t("会联网查询网关供应商池里中转站和 DeepSeek 等厂商的余额。")}</p>
           ) : balances.length === 0 ? (
             <p className="tp-note">{t("没有可以查询余额的供应商。")}</p>
           ) : (
@@ -655,7 +663,7 @@ function UsageTab({
                 <div className="tp-balance" key={balance.providerId}>
                   <Avatar baseUrl={balance.baseUrl} name={balance.provider} size="sm" />
                   <strong>{maskAccountName(balance.provider)}</strong>
-                  <span data-tone={balance.error ? "error" : undefined}>
+                  <span data-tone={balance.error ? "error" : undefined} title={balance.error ?? (balance.note ? t(balance.note) : undefined)}>
                     {balance.error ? t("查询失败") : balance.amount != null ? formatMoney(balance.amount, balance.currency) : "—"}
                   </span>
                 </div>

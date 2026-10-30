@@ -127,7 +127,7 @@ export function UsageView({ payload, busy, run, notify }: { payload: GatewayPayl
               </div>
               <div className="gw-balance-row">
                 <span>{t("余额")}</span>
-                {balance.amount !== null && balance.amount !== undefined ? <strong>{formatMoney(balance.amount, balance.currency)}</strong> : <small title={balance.error ?? ""}>{t(balance.error ?? "查不到")}</small>}
+                {balance.amount !== null && balance.amount !== undefined ? <strong>{formatMoney(balance.amount, balance.currency)}</strong> : <small title={balance.error ?? (balance.note ? t(balance.note) : "")}>{balance.error ? t(balance.error) : balance.note ? "—" : t("查不到")}</small>}
               </div>
             </div>
           ))}
