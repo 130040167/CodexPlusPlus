@@ -7,6 +7,20 @@ export function sourceMatchKey(item: SkillSourceMatch): string {
   return JSON.stringify([item.repoKey, item.repoPath]);
 }
 
+function sourceMatchOriginKey(item: SkillSourceMatch): string {
+  const repoPart = item.repoKey.split(":", 1)[0];
+  const separator = repoPart.indexOf("@");
+  const ownerRepo = separator < 0 ? repoPart : repoPart.slice(0, separator);
+  const branch = separator < 0 ? "main" : repoPart.slice(separator + 1).trim() || "main";
+  const parts = ownerRepo.split("/");
+  const owner = parts[0]?.trim();
+  const repo = parts[1]?.trim();
+  if (parts.length !== 2 || !owner || !repo || !/^[a-z0-9._-]+$/i.test(owner) || !/^[a-z0-9._-]+$/i.test(repo)) {
+    return JSON.stringify(["raw", item.repoKey, item.repoPath]);
+  }
+  return JSON.stringify(["github", owner.toLowerCase(), repo.toLowerCase(), branch, item.repoPath]);
+}
+
 export function sourceMatchLabel(item: SkillSourceMatch): string {
   return `${item.repoKey} / ${item.repoPath}`;
 }
@@ -34,8 +48,10 @@ export function selectedSourceMatches(groups: Map<string, SkillSourceMatch[]>, s
   const origins = new Set<string>();
   for (const [id, key] of Object.entries(selected)) {
     const item = groups.get(id)?.find((candidate) => sourceMatchKey(candidate) === key);
-    if (!item || origins.has(key)) return null;
-    origins.add(key);
+    if (!item) return null;
+    const origin = sourceMatchOriginKey(item);
+    if (origins.has(origin)) return null;
+    origins.add(origin);
     result.push(item);
   }
   return result;

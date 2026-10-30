@@ -58,8 +58,34 @@ impl SkillsManager {
             );
             let source_hash = skill_directory_hash(path)?;
             let (name, description) = read_skill_manifest(&path.join(SKILL_MANIFEST_FILE), id);
-            let matches = self.import_matches_unlocked(&state, id, &name, &source_hash)?;
             let origin = origins.get(id);
+            let mut matches = self.import_matches_unlocked(&state, id, &name, &source_hash)?;
+            if let Some(origin) =
+                origin.and_then(|item| known_repository_origin(&item.repo_key, &item.repo_path))
+            {
+                for (target, installed) in &state.installed {
+                    if known_repository_origin(&installed.repo_key, &installed.repo_path).as_ref()
+                        != Some(&origin)
+                    {
+                        continue;
+                    }
+                    if let Some(existing) = matches.iter_mut().find(|item| item.id == *target) {
+                        existing.reasons.push("origin".into());
+                    } else {
+                        matches.push(SkillImportMatch {
+                            id: target.clone(),
+                            name: if installed.name.is_empty() {
+                                target.clone()
+                            } else {
+                                installed.name.clone()
+                            },
+                            reasons: vec!["origin".into()],
+                            snapshot: self.import_target_snapshot_unlocked(&state, target)?,
+                        });
+                    }
+                }
+                matches.sort_by(|left, right| left.id.cmp(&right.id));
+            }
             result.push(SkillImportCandidate {
                 id: id.clone(),
                 name,
@@ -73,6 +99,10 @@ impl SkillsManager {
                 duplicate_candidates: Vec::new(),
             });
         }
+        let candidate_origins: Vec<_> = result
+            .iter()
+            .map(|item| known_repository_origin(&item.repo_key, &item.repo_path))
+            .collect();
         for index in 0..result.len() {
             result[index].duplicate_candidates = result
                 .iter()
@@ -80,7 +110,9 @@ impl SkillsManager {
                 .filter(|(other, candidate)| {
                     *other != index
                         && (same_name(&candidate.name, &result[index].name)
-                            || candidate.source_hash == result[index].source_hash)
+                            || candidate.source_hash == result[index].source_hash
+                            || (candidate_origins[index].is_some()
+                                && candidate_origins[index] == candidate_origins[*other]))
                 })
                 .map(|(_, candidate)| candidate.id.clone())
                 .collect();
@@ -99,7 +131,11 @@ impl SkillsManager {
             matches!(import_source, LOCAL_IMPORT_REPO_KEY | "cc-switch"),
             "不支持的导入渠道"
         );
-        let preview = self.preview_skill_import(candidates, origins)?;
+        let _operation = self.operation_lock.lock().unwrap();
+        // 外层持有共享操作锁；临时克隆只在本次导入内使用，避免现有方法重复获取同一把锁。
+        let mut manager = self.clone();
+        manager.operation_lock = Arc::new(Mutex::new(()));
+        let preview = manager.preview_skill_import(candidates, origins)?;
         let mut selected_ids = std::collections::BTreeSet::new();
         let mut target_ids = std::collections::BTreeSet::new();
         let mut protected_targets = std::collections::BTreeSet::new();
@@ -143,7 +179,7 @@ impl SkillsManager {
                 .any(|id| selected_ids.contains(id))
             {
                 errors.push(format!(
-                    "{}：所选导入项之间存在同名或相同内容，请只选择一个",
+                    "{}：所选导入项之间存在同名、相同内容或相同仓库来源，请只选择一个",
                     selection.id
                 ));
                 continue;
@@ -166,12 +202,26 @@ impl SkillsManager {
                     continue;
                 }
             };
+            let origin_matches: Vec<_> = candidate
+                .matches
+                .iter()
+                .filter(|item| item.reasons.iter().any(|reason| reason == "origin"))
+                .collect();
+            if !origin_matches.is_empty()
+                && (origin_matches.len() != 1 || origin_matches[0].id != target)
+            {
+                errors.push(format!(
+                    "{}：仓库路径已关联其他 Skill，请选择该已有项",
+                    selection.id
+                ));
+                continue;
+            }
             let path = &candidates
                 .iter()
                 .find(|(id, _)| id == &selection.id)
                 .expect("preview candidate")
                 .1;
-            let current = match self.preview_skill_import(candidates, origins) {
+            let current = match manager.preview_skill_import(candidates, origins) {
                 Ok(current) => current,
                 Err(error) => {
                     errors.push(format!("{}：重新检查失败：{error:#}", selection.id));
@@ -210,7 +260,7 @@ impl SkillsManager {
                 errors.push(format!("{}：重复项已变化，请重新预览", selection.id));
                 continue;
             }
-            match self.import_directory_with_source(
+            match manager.import_directory_with_source(
                 &candidate.id,
                 target,
                 path,
@@ -343,6 +393,16 @@ impl SkillsManager {
         }
         Ok(matches)
     }
+}
+
+fn known_repository_origin(repo_key: &str, repo_path: &str) -> Option<(String, String)> {
+    if repo_path.is_empty() {
+        return None;
+    }
+    normalize_repo(parse_repo_key(repo_key)?).ok()?;
+    Some(super::source_match::repository_match_origin(
+        repo_key, repo_path,
+    ))
 }
 
 fn same_name(left: &str, right: &str) -> bool {
@@ -628,6 +688,302 @@ mod tests {
         assert_eq!(
             installed.content_hash,
             parse_skills_from_tree(&repo, &tree)[0].content_hash
+        );
+    }
+
+    #[test]
+    fn cc_switch_same_origin_requires_the_existing_target_and_preserves_updates() {
+        let (temp, manager) = fixture();
+        let original = temp.path().join("original");
+        let incoming = temp.path().join("incoming");
+        let unrelated = temp.path().join("unrelated");
+        write_skill(&original, "Old name", "old content");
+        write_skill(&incoming, "New name", "new content");
+        write_skill(&unrelated, "New name", "unrelated content");
+        let old_origin = crate::ccs_import::CcsSkillOrigin {
+            repo_key: "Owner/Repo@main:skills".into(),
+            repo_path: "skills/alpha".into(),
+        };
+        manager
+            .import_directory_with_source(
+                "old",
+                "existing",
+                &original,
+                "cc-switch",
+                Some(&old_origin),
+                None,
+                None,
+            )
+            .unwrap();
+        manager
+            .import_from_local_directory("unrelated", &unrelated)
+            .unwrap();
+        let candidates = vec![("new".into(), incoming.clone())];
+        let origin = crate::ccs_import::CcsSkillOrigin {
+            repo_key: "owner/repo@main".into(),
+            repo_path: "skills/alpha".into(),
+        };
+        let origins = BTreeMap::from([("new".into(), origin.clone())]);
+        let preview = manager.preview_skill_import(&candidates, &origins).unwrap();
+        let existing = preview[0]
+            .matches
+            .iter()
+            .find(|item| item.id == "existing")
+            .unwrap();
+        assert!(existing.reasons.iter().any(|reason| reason == "origin"));
+        let unrelated = preview[0]
+            .matches
+            .iter()
+            .find(|item| item.id == "unrelated")
+            .unwrap();
+        let mut chosen = SkillImportSelection {
+            id: "new".into(),
+            source_hash: preview[0].source_hash.clone(),
+            repo_key: origin.repo_key.clone(),
+            repo_path: origin.repo_path.clone(),
+            target_id: None,
+            target_snapshot: None,
+        };
+        let before = std::fs::read(&manager.state_path).unwrap();
+        assert_eq!(
+            manager
+                .apply_skill_import(&candidates, &origins, "cc-switch", &[chosen.clone()])
+                .unwrap()
+                .0,
+            0
+        );
+        chosen.target_id = Some(unrelated.id.clone());
+        chosen.target_snapshot = Some(unrelated.snapshot.clone());
+        assert_eq!(
+            manager
+                .apply_skill_import(&candidates, &origins, "cc-switch", &[chosen.clone()])
+                .unwrap()
+                .0,
+            0
+        );
+        assert_eq!(std::fs::read(&manager.state_path).unwrap(), before);
+        chosen.target_id = Some(existing.id.clone());
+        chosen.target_snapshot = Some(existing.snapshot.clone());
+        let (count, errors) = manager
+            .apply_skill_import(&candidates, &origins, "cc-switch", &[chosen])
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(errors.is_empty());
+        let state = manager.load_state();
+        assert!(!state.installed.contains_key("new"));
+        assert_eq!(state.installed["existing"].repo_key, origin.repo_key);
+        assert!(
+            std::fs::read_to_string(manager.source_dir.join("existing/SKILL.md"))
+                .unwrap()
+                .contains("new content")
+        );
+        let remote = RemoteSkill {
+            id: "remote".into(),
+            name: "Remote".into(),
+            description: String::new(),
+            repo_key: origin.repo_key,
+            repo_path: origin.repo_path,
+            content_hash: "updated upstream".into(),
+        };
+        assert!(
+            manager
+                .merge_entries(&[remote])
+                .iter()
+                .any(|item| item.id == "existing" && item.update_available)
+        );
+    }
+
+    #[test]
+    fn cc_switch_batch_rejects_same_origin_but_not_other_branches_or_paths() {
+        let (temp, manager) = fixture();
+        let candidates: Vec<_> = ["one", "two", "three", "four"]
+            .iter()
+            .map(|id| {
+                let path = temp.path().join(id);
+                write_skill(&path, id, id);
+                (id.to_string(), path)
+            })
+            .collect();
+        let origins = BTreeMap::from([
+            (
+                "one".into(),
+                crate::ccs_import::CcsSkillOrigin {
+                    repo_key: "Owner/Repo@main".into(),
+                    repo_path: "skills/alpha".into(),
+                },
+            ),
+            (
+                "two".into(),
+                crate::ccs_import::CcsSkillOrigin {
+                    repo_key: "owner/repo@main:skills".into(),
+                    repo_path: "skills/alpha".into(),
+                },
+            ),
+            (
+                "three".into(),
+                crate::ccs_import::CcsSkillOrigin {
+                    repo_key: "owner/repo@Main:skills".into(),
+                    repo_path: "skills/alpha".into(),
+                },
+            ),
+            (
+                "four".into(),
+                crate::ccs_import::CcsSkillOrigin {
+                    repo_key: "owner/repo@main:skills".into(),
+                    repo_path: "skills/Alpha".into(),
+                },
+            ),
+        ]);
+        let preview = manager.preview_skill_import(&candidates, &origins).unwrap();
+        assert_eq!(preview[0].duplicate_candidates, vec!["two"]);
+        assert_eq!(preview[1].duplicate_candidates, vec!["one"]);
+        assert!(preview[2].duplicate_candidates.is_empty());
+        assert!(preview[3].duplicate_candidates.is_empty());
+        let selections: Vec<_> = preview
+            .iter()
+            .map(|item| SkillImportSelection {
+                id: item.id.clone(),
+                source_hash: item.source_hash.clone(),
+                repo_key: item.repo_key.clone(),
+                repo_path: item.repo_path.clone(),
+                target_id: None,
+                target_snapshot: None,
+            })
+            .collect();
+        let (count, errors) = manager
+            .apply_skill_import(&candidates, &origins, "cc-switch", &selections)
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(errors.len(), 2);
+        let state = manager.load_state();
+        assert!(!state.installed.contains_key("one"));
+        assert!(!state.installed.contains_key("two"));
+        assert!(state.installed.contains_key("three"));
+        assert!(state.installed.contains_key("four"));
+    }
+
+    #[test]
+    fn concurrent_cc_switch_imports_cannot_create_duplicate_origins() {
+        let (temp, manager) = fixture();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut threads = Vec::new();
+        for id in ["one", "two"] {
+            let path = temp.path().join(id);
+            write_skill(&path, id, id);
+            let candidates = vec![(id.to_string(), path)];
+            let origins = BTreeMap::from([(
+                id.to_string(),
+                crate::ccs_import::CcsSkillOrigin {
+                    repo_key: "owner/repo@main".into(),
+                    repo_path: "skills/alpha".into(),
+                },
+            )]);
+            let item = manager
+                .preview_skill_import(&candidates, &origins)
+                .unwrap()
+                .remove(0);
+            let chosen = SkillImportSelection {
+                id: item.id,
+                source_hash: item.source_hash,
+                repo_key: item.repo_key,
+                repo_path: item.repo_path,
+                target_id: None,
+                target_snapshot: None,
+            };
+            let manager = manager.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                manager
+                    .apply_skill_import(&candidates, &origins, "cc-switch", &[chosen])
+                    .unwrap()
+            }));
+        }
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().map(|(count, _)| count).sum::<usize>(), 1);
+        assert_eq!(manager.load_state().installed.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_cc_switch_import_and_source_match_cannot_claim_the_same_origin() {
+        let (temp, manager) = fixture();
+        let incoming = temp.path().join("incoming");
+        let local = manager.linked_dir().join("local");
+        write_skill(&incoming, "Incoming", "new content");
+        write_skill(&local, "Local", "existing content");
+        let repo = parse_repo_key("owner/repo@main").unwrap();
+        manager.upsert_repo(repo.clone()).unwrap();
+        let remote = vec![RemoteSkill {
+            id: "remote".into(),
+            name: "Local".into(),
+            description: String::new(),
+            repo_key: repo.key(),
+            repo_path: "skills/alpha".into(),
+            content_hash: skill_git_tree_hash(&local).unwrap(),
+        }];
+        let preview = manager
+            .preview_repository_matches(&repo, &remote, Some("local"))
+            .unwrap();
+        let matched = &preview.matches[0];
+        let match_selection = SkillRepositoryMatchSelection {
+            local_id: matched.local_id.clone(),
+            local_hash: matched.local_hash.clone(),
+            snapshot: matched.snapshot.clone(),
+            repo_key: matched.repo_key.clone(),
+            repo_path: matched.repo_path.clone(),
+            remote_hash: matched.remote_hash.clone(),
+            manual: false,
+        };
+        let candidates = vec![("incoming".into(), incoming)];
+        let origins = BTreeMap::from([(
+            "incoming".into(),
+            crate::ccs_import::CcsSkillOrigin {
+                repo_key: repo.key(),
+                repo_path: "skills/alpha".into(),
+            },
+        )]);
+        let candidate = manager
+            .preview_skill_import(&candidates, &origins)
+            .unwrap()
+            .remove(0);
+        let import_selection = SkillImportSelection {
+            id: candidate.id,
+            source_hash: candidate.source_hash,
+            repo_key: candidate.repo_key,
+            repo_path: candidate.repo_path,
+            target_id: None,
+            target_snapshot: None,
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let import_manager = manager.clone();
+        let import_barrier = barrier.clone();
+        let import = std::thread::spawn(move || {
+            import_barrier.wait();
+            import_manager
+                .apply_skill_import(&candidates, &origins, "cc-switch", &[import_selection])
+                .unwrap()
+                .0
+        });
+        let match_manager = manager.clone();
+        let matching = std::thread::spawn(move || {
+            barrier.wait();
+            match_manager
+                .apply_repository_matches(&[match_selection], &remote)
+                .unwrap()
+                .0
+        });
+        assert_eq!(import.join().unwrap() + matching.join().unwrap(), 1);
+        assert_eq!(
+            manager
+                .load_state()
+                .installed
+                .values()
+                .filter(|item| item.repo_path == "skills/alpha")
+                .count(),
+            1
         );
     }
 

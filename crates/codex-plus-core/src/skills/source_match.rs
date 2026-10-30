@@ -48,6 +48,21 @@ fn source_missing(installed: Option<&InstalledSkill>) -> bool {
         .is_none_or(|item| item.repo_path.is_empty() || parse_repo_key(&item.repo_key).is_none())
 }
 
+pub(super) fn repository_match_origin(repo_key: &str, repo_path: &str) -> (String, String) {
+    let key = parse_repo_key(repo_key)
+        .and_then(|repo| normalize_repo(repo).ok())
+        .map(|repo| {
+            format!(
+                "{}/{}@{}",
+                repo.owner.to_ascii_lowercase(),
+                repo.name.to_ascii_lowercase(),
+                repo.branch
+            )
+        })
+        .unwrap_or_else(|| repo_key.to_string());
+    (key, repo_path.to_string())
+}
+
 fn comparable_name(name: &str) -> String {
     name.trim()
         .to_lowercase()
@@ -306,13 +321,13 @@ impl SkillsManager {
                 == selection.snapshot,
             "Skill 或 Agent 副本在确认后发生变化，请重新匹配"
         );
+        let origin = repository_match_origin(&selection.repo_key, &selection.repo_path);
         anyhow::ensure!(
             !state
                 .installed
                 .values()
                 .any(|item| item.id != selection.local_id
-                    && item.repo_key == selection.repo_key
-                    && item.repo_path == selection.repo_path),
+                    && repository_match_origin(&item.repo_key, &item.repo_path) == origin),
             "仓库路径已关联其他 Skill"
         );
         Ok(())
@@ -337,7 +352,7 @@ impl SkillsManager {
                 "同一个 Skill 只能选择一个来源"
             );
             anyhow::ensure!(
-                origins.insert((item.repo_key.clone(), item.repo_path.clone())),
+                origins.insert(repository_match_origin(&item.repo_key, &item.repo_path)),
                 "同一个仓库路径不能关联多个 Skill"
             );
         }
@@ -1660,6 +1675,122 @@ mod tests {
                 .0,
             0
         );
+    }
+
+    #[test]
+    fn repository_origin_identity_preserves_branch_and_path_case() {
+        let origin = repository_match_origin("Owner/Repo@main:skills", "skills/Alpha");
+        assert_eq!(
+            origin,
+            repository_match_origin("owner/repo@main", "skills/Alpha")
+        );
+        assert_eq!(
+            origin,
+            repository_match_origin("OWNER/REPO", "skills/Alpha")
+        );
+        assert_ne!(
+            origin,
+            repository_match_origin("owner/repo@Main", "skills/Alpha")
+        );
+        assert_ne!(
+            origin,
+            repository_match_origin("owner/repo@main", "skills/alpha")
+        );
+        assert_ne!(
+            origin,
+            repository_match_origin("owner/repo@main", "skills/Alpha/nested")
+        );
+        assert_ne!(
+            origin,
+            repository_match_origin("owner/other@main", "skills/Alpha")
+        );
+        assert_eq!(
+            repository_match_origin("local", "."),
+            ("local".into(), ".".into())
+        );
+    }
+
+    #[test]
+    fn overlapping_sources_reject_duplicate_batch_and_existing_origins() {
+        for root_first in [true, false] {
+            let (_temp, manager, root) = fixture();
+            let subdir = parse_repo_key("Example/Skills@main:skills").unwrap();
+            manager.upsert_repo(subdir.clone()).unwrap();
+            let codex = manager.linked_dir();
+            write_skill(&codex.join("alpha"), "---\nname: Shared\n---\n");
+            write_skill(&codex.join("beta"), "---\nname: Shared\n---\n");
+            let hash = skill_git_tree_hash(&codex.join("alpha")).unwrap();
+            let remote = vec![
+                remote(&root, "skills/alpha", "Shared", &hash),
+                remote(&subdir, "skills/alpha", "Shared", &hash),
+            ];
+            let root_preview = manager
+                .preview_repository_matches(&root, &remote, None)
+                .unwrap();
+            let subdir_preview = manager
+                .preview_repository_matches(&subdir, &remote, None)
+                .unwrap();
+            let (first_preview, second_preview) = if root_first {
+                (&root_preview, &subdir_preview)
+            } else {
+                (&subdir_preview, &root_preview)
+            };
+            let first = selection(
+                first_preview
+                    .matches
+                    .iter()
+                    .find(|item| item.local_id == "alpha")
+                    .unwrap(),
+            );
+            let second = selection(
+                second_preview
+                    .matches
+                    .iter()
+                    .find(|item| item.local_id == "beta")
+                    .unwrap(),
+            );
+            let before = std::fs::read(&manager.state_path).unwrap();
+            assert!(
+                manager
+                    .apply_repository_matches(&[first.clone(), second.clone()], &remote)
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(&manager.state_path).unwrap(), before);
+            assert_eq!(
+                manager
+                    .apply_repository_matches(&[first], &remote)
+                    .unwrap()
+                    .0,
+                1
+            );
+            let after_first = std::fs::read(&manager.state_path).unwrap();
+            let (count, errors) = manager
+                .apply_repository_matches(&[second], &remote)
+                .unwrap();
+            assert_eq!(count, 0);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("仓库路径已关联其他 Skill"))
+            );
+            assert_eq!(std::fs::read(&manager.state_path).unwrap(), after_first);
+
+            let other_repo = if root_first { &subdir } else { &root };
+            let rematch = manager
+                .preview_repository_matches(other_repo, &remote, Some("alpha"))
+                .unwrap();
+            assert_eq!(
+                manager
+                    .apply_repository_matches(&[selection(&rematch.matches[0])], &remote)
+                    .unwrap()
+                    .0,
+                1
+            );
+            assert_eq!(
+                manager.load_state().installed["alpha"].repo_key,
+                other_repo.key()
+            );
+        }
     }
 
     #[test]
