@@ -887,7 +887,17 @@ impl CodexAppServer {
             if response_id(&message) != Some(id) {
                 continue;
             }
-            if message["error"]["code"].as_i64() == Some(-32601) {
+            let code = message["error"]["code"].as_i64();
+            let unknown_method = code == Some(-32600)
+                && message["error"]["message"].as_str().is_some_and(|error| {
+                    let error = error.strip_prefix("Invalid request: ").unwrap_or(error);
+                    ["unknown variant", "unknown method"].iter().any(|kind| {
+                        ['`', '\'', '"'].iter().any(|quote| {
+                            error.starts_with(&format!("{kind} {quote}{method}{quote}"))
+                        })
+                    })
+                });
+            if code == Some(-32601) || unknown_method {
                 return Ok(None);
             }
             if let Some(error) = rpc_error(&message) {
@@ -1412,7 +1422,20 @@ mod tests {
                 Some("initialize") => emit(json!({"id":id,"result":{}})),
                 Some("initialized") => {}
                 Some("permissionProfile/list") => {
-                    if mode == "legacy" || mode.starts_with("optional-") {
+                    if let Some(case) = mode.strip_prefix("optional-permissions-") {
+                        let error = match case {
+                            "unknown-variant" => "Invalid request: unknown variant `permissionProfile/list`, expected one of `initialize`, `thread/start`, `thread/resume`, `turn/start`",
+                            "unknown-method" => "Invalid request: unknown method `permissionProfile/list`",
+                            "unknown-method-unprefixed" => "unknown method \"permissionProfile/list\"",
+                            "invalid-request" => "Invalid request: missing field `cwd`",
+                            "invalid-variant" => "Invalid request: unknown variant `invalid`, expected `read-only` or `workspace-write`",
+                            "invalid-method" => "Invalid request: unknown method `another/method`",
+                            "invalid-nested-message" => "Invalid request: invalid cwd: unknown method `permissionProfile/list`",
+                            "invalid-active-writer" => "thread original already has an active writer",
+                            _ => panic!("Unexpected permission fixture: {case}"),
+                        };
+                        emit(json!({"id":id,"error":{"code":-32600,"message":error}}));
+                    } else if mode == "legacy" || mode.starts_with("optional-") {
                         emit(json!({"id":id,"error":{"code":-32601,"message":"unsupported"}}));
                     } else {
                         emit(json!({"id":id,"result":{"data":[
@@ -1862,6 +1885,68 @@ mod tests {
                 );
                 assert_eq!(server.config.reasoning_effort, "high");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_permissions_unknown_methods_fall_back_to_legacy_sandbox() {
+        let root = tempfile::tempdir().unwrap();
+        for mode in [
+            "optional-unavailable",
+            "optional-permissions-unknown-variant",
+            "optional-permissions-unknown-method",
+            "optional-permissions-unknown-method-unprefixed",
+        ] {
+            let mut server = fixture_server(root.path(), mode);
+            server.initialize().await.unwrap();
+            server.named_permissions = true;
+            let thread = server.prepare_thread(None).await.unwrap();
+            assert_eq!(thread, "original");
+            assert!(!server.named_permissions, "{mode}");
+            let params = server.thread_params();
+            assert_eq!(params["sandbox"], "read-only");
+            assert!(params.get("permissions").is_none());
+            assert!(params.get("runtimeWorkspaceRoots").is_none());
+            assert_eq!(server.prepare_thread(Some(&thread)).await.unwrap(), thread);
+            assert_eq!(
+                server.run_turn(&thread, "basic text").await.unwrap().reply,
+                "checked"
+            );
+            server.close().await;
+            assert!(server.child.try_wait().unwrap().unwrap().success());
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_permissions_invalid_requests_are_not_downgraded() {
+        let root = tempfile::tempdir().unwrap();
+        for (mode, expected) in [
+            ("optional-permissions-invalid-request", "missing field `cwd`"),
+            (
+                "optional-permissions-invalid-variant",
+                "unknown variant `invalid`",
+            ),
+            (
+                "optional-permissions-invalid-method",
+                "unknown method `another/method`",
+            ),
+            (
+                "optional-permissions-invalid-nested-message",
+                "invalid cwd: unknown method `permissionProfile/list`",
+            ),
+            (
+                "optional-permissions-invalid-active-writer",
+                "already has an active writer",
+            ),
+        ] {
+            let mut server = fixture_server(root.path(), mode);
+            server.initialize().await.unwrap();
+            let error = server.prepare_thread(None).await.unwrap_err();
+            let failure = error.downcast_ref::<RpcFailure>().unwrap();
+            assert_eq!(failure.code, -32600, "{mode}");
+            assert!(failure.message.contains(expected), "{mode}: {error}");
+            server.close().await;
+            assert!(server.child.try_wait().unwrap().unwrap().success());
         }
     }
 
