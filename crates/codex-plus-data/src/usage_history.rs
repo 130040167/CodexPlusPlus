@@ -788,16 +788,24 @@ impl HistoryIndex {
         let mut plan_type = None;
         let mut pending = 0;
         let mut indexed = 0;
+        let mut ignored = 0;
+        let mut identity_mismatches = 0;
         let mut incomplete_records = false;
         let mut archived_records = 0;
         for file in self.files.values() {
-            if file.catching_up || file.unreadable || !file.verified {
+            if file.catching_up || file.unreadable {
                 pending += 1;
-            } else {
+            } else if file.verified {
                 indexed += 1;
+            } else {
+                ignored += 1;
             }
-            incomplete_records |=
-                file.truncated || file.invalid_usage || file.pending.len() > 0 || file.skipping;
+            identity_mismatches += usize::from(file.verified && file.session != file.expected_id);
+            incomplete_records |= file.truncated
+                || file.invalid_usage
+                || file.pending.len() > 0
+                || file.skipping
+                || !file.verified;
             if file
                 .session
                 .as_deref()
@@ -1101,8 +1109,8 @@ impl HistoryIndex {
             "source":"local-rollout-estimate","today":today_summary,"days7":days7,"all":{"days":daily,"events":rows,"pagination":{"page":page,"pageSize":query.page_size,"total":selected.len(),"pages":pages}},"machineSummary":machine_summary,"codex":codex,"periods":periods.iter().map(|(name,aggregate)|(*name,aggregate.value())).collect::<BTreeMap<_,_>>(),
             "models":model_rows,"days":day_rows,"records":rows,"pagination":{"page":page,"pageSize":query.page_size,"total":selected.len(),"pages":pages},"rateLimits":limits,
             "archive":{"recordCount":archived_records,"detailRetentionDays":90,"dailyRetentionDays":365,"recordsPerSessionLimit":MAX_RECORDS,"totalDetailLimit":MAX_TOTAL_RECORDS},
-            "scan":{"discoveredFiles":self.files.len(),"indexedFiles":indexed,"pendingFiles":pending,"truncated":self.truncated||incomplete_records||self.discovery_errors,"discovering":self.discovering},
-            "message":if complete { Value::Null } else { json!("正在分批索引，或部分记录缺少日期/用量；以下仅汇总已观测数据") }});
+            "scan":{"discoveredFiles":self.files.len(),"indexedFiles":indexed,"pendingFiles":pending,"ignoredFiles":ignored,"identityMismatchFiles":identity_mismatches,"truncated":self.truncated||incomplete_records||self.discovery_errors,"discovering":self.discovering},
+            "message":if complete { Value::Null } else if ignored > 0 { json!("部分会话缺少有效会话头或包含冲突的会话 ID；未确认部分未计入汇总") } else { json!("正在分批索引，或部分记录缺少日期/用量；以下仅汇总已观测数据") }});
         if query.include_session_cursors {
             // 游标是当前索引的会话累计水位，不按日期或模型切分，也不受明细分页影响。
             response["sessionCursors"] = json!(
@@ -1452,14 +1460,24 @@ impl FileIndex {
             if inherited {
                 return;
             }
+            let session = payload["id"]
+                .as_str()
+                .and_then(normalize_session_id)
+                .or_else(|| {
+                    payload["session_id"]
+                        .as_str()
+                        .and_then(normalize_session_id)
+                });
             if self.session.is_none() {
-                self.session = payload["id"]
-                    .as_str()
-                    .or_else(|| payload["session_id"].as_str())
-                    .and_then(normalize_session_id);
-                self.verified = self.session.is_some() && self.session == self.expected_id;
+                // 分页历史或迁移文件的名字可能沿用旧 ID；有效会话头才是实际归属。
+                self.session = session;
+                self.verified = self.session.is_some();
                 self.history_boundary =
                     UsageHistoryBoundary::from_meta(payload, self.session.as_deref().unwrap_or(""));
+            } else if session.is_some() && session != self.session {
+                // 复制的继承头已在上方排除；两个自有头不能混记为同一会话。
+                self.verified = false;
+                self.invalid_usage = true;
             }
             return;
         }
