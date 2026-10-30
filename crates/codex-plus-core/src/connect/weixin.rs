@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use super::media::{self, DownloadedAttachments};
+use super::media::{self, AttachmentKind, DownloadedAttachments};
 use anyhow::{Context, bail};
 use base64::Engine;
 use futures_util::StreamExt;
@@ -131,6 +131,98 @@ struct WeixinSendResponse {
 }
 
 impl WeixinClient {
+    pub(super) async fn send_workspace_attachment(
+        &self,
+        to_user_id: &str,
+        path: &std::path::Path,
+        kind: AttachmentKind,
+        context_token: &str,
+        permit: &super::outbound::OutboundPermit,
+    ) -> anyhow::Result<()> {
+        permit.check_peer(to_user_id)?;
+        if context_token.trim().is_empty() {
+            bail!("微信附件发送缺少 context_token");
+        }
+        permit.guard(async {
+            let upload = media::PreparedUpload::read_workspace(path, &permit.workspace).await?;
+            permit.check_peer(to_user_id)?;
+            let response = self.post_media_api("ilink/bot/getuploadurl", &json!({
+                "filekey": upload.filekey,
+                "media_type": match kind { AttachmentKind::Image => 1, AttachmentKind::File => 3 },
+                "to_user_id": to_user_id,
+                "rawsize": upload.plaintext_size,
+                "rawfilemd5": upload.md5,
+                "filesize": upload.ciphertext.len(),
+                "no_need_thumb": true,
+                "aeskey": upload.key_hex,
+                "base_info": { "channel_version": CHANNEL_VERSION }
+            })).await?;
+            permit.check_peer(to_user_id)?;
+            let download_param = self.media_client.upload(&upload, &response).await?;
+            permit.check_peer(to_user_id)?;
+            let media = json!({
+                "encrypt_query_param": download_param,
+                "aes_key": base64::engine::general_purpose::STANDARD.encode(&upload.key_hex),
+                "encrypt_type": 1
+            });
+            let item = match kind {
+                AttachmentKind::Image => json!({
+                    "type": 2, "image_item": { "media": media, "mid_size": upload.ciphertext.len() }
+                }),
+                AttachmentKind::File => json!({
+                    "type": 4, "file_item": {
+                        "media": media, "file_name": upload.filename, "len": upload.plaintext_size.to_string()
+                    }
+                }),
+            };
+            self.post_media_api("ilink/bot/sendmessage", &json!({
+                "msg": {
+                    "from_user_id": "", "to_user_id": to_user_id,
+                    "client_id": Uuid::new_v4().to_string(),
+                    "message_type": 2, "message_state": 2,
+                    "item_list": [item], "context_token": context_token
+                },
+                "base_info": { "channel_version": CHANNEL_VERSION }
+            })).await?;
+            Ok(())
+        }).await
+    }
+
+    async fn post_media_api(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> anyhow::Result<media::MediaApiResponse> {
+        let response = self
+            .client
+            .post(self.endpoint(path)?)
+            .headers(self.auth_headers()?)
+            .json(body)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("微信媒体 API 请求失败"))?;
+        let (status, bytes) =
+            read_response_limited(response, MAX_SMALL_RESPONSE_BYTES, "微信媒体 API").await?;
+        if !status.is_success() {
+            bail!("微信媒体 API 请求失败：HTTP {status}");
+        }
+        let result = if bytes.iter().all(u8::is_ascii_whitespace) {
+            media::MediaApiResponse::default()
+        } else {
+            serde_json::from_slice::<media::MediaApiResponse>(&bytes)
+                .map_err(|_| anyhow::anyhow!("微信媒体 API 响应格式无效"))?
+        };
+        if result.ret != 0 || result.errcode != 0 {
+            bail!(
+                "微信媒体 API 被拒绝：ret={} errcode={}",
+                result.ret,
+                result.errcode
+            );
+        }
+        Ok(result)
+    }
+
     pub fn new(base_url: &str, token: &str, route_tag: &str) -> anyhow::Result<Self> {
         let base_url = normalize_base_url(base_url);
         let client = reqwest::Client::builder()

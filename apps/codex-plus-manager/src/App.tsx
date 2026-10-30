@@ -491,6 +491,7 @@ type BackendSettings = WhaleBalanceSettings & {
   weixinConnectToken: string;
   weixinConnectAccountId: string;
   weixinConnectAllowFrom: string;
+  weixinConnectAllowOutboundAttachments: boolean;
   weixinConnectRouteTag: string;
   weixinConnectWorkDir: string;
   weixinConnectModel: string;
@@ -1482,6 +1483,7 @@ const defaultSettings: BackendSettings = {
   weixinConnectToken: "",
   weixinConnectAccountId: "",
   weixinConnectAllowFrom: "",
+  weixinConnectAllowOutboundAttachments: false,
   weixinConnectRouteTag: "",
   weixinConnectWorkDir: "",
   weixinConnectModel: "",
@@ -5557,6 +5559,19 @@ function WeixinConnectScreen({
                   value={form.weixinConnectAllowFrom}
                 />
               </label>
+              <div className="field">
+                <span>{t("工作区附件回传")}</span>
+                <Switch
+                  label={t("允许向指定微信用户回传工作区文件")}
+                  on={form.weixinConnectAllowOutboundAttachments}
+                  disabled={!form.weixinConnectAllowOutboundAttachments && (
+                    !form.weixinConnectAllowFrom.split(",").some((peer) => peer.trim())
+                    || form.weixinConnectAllowFrom.split(",").some((peer) => peer.trim() === "*")
+                    || !form.weixinConnectWorkDir.trim()
+                  )}
+                  onToggle={() => onFormChange({ ...form, weixinConnectAllowOutboundAttachments: !form.weixinConnectAllowOutboundAttachments })}
+                />
+              </div>
               <label className="field">
                 <span>{t("账号标识")}</span>
                 <Input
@@ -17076,6 +17091,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     codexAppDreamSkinThemeConfig: normalizeDreamSkinTheme(settings.codexAppDreamSkinThemeConfig),
     codexAppDreamSkinImagePath: (settings.codexAppDreamSkinImagePath || "").trim(),
     codexAppStepwiseProtocol: normalizeStepwiseProtocol(settings.codexAppStepwiseProtocol),
+    weixinConnectAllowOutboundAttachments: settings.weixinConnectAllowOutboundAttachments === true,
     codexAppStepwiseGenerationMode: normalizeStepwiseGenerationMode(settings.codexAppStepwiseGenerationMode),
     codexAppStepwiseMaxItems: clampNumber(settings.codexAppStepwiseMaxItems ?? 4, 0, 6),
     codexAppStepwiseMaxInputChars: clampNumber(settings.codexAppStepwiseMaxInputChars || 6000, 1000, 24000),
