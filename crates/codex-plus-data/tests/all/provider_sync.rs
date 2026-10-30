@@ -1,6 +1,6 @@
 use codex_plus_data::{
     ProviderSyncProgressPhase, ProviderSyncStatus, ProviderSyncTargetSource,
-    apply_session_index_cleanup,
+    apply_session_index_cleanup, is_provider_sync_internal_alias,
     load_provider_sync_targets, preview_session_index_cleanup,
     remote_control_session_recovery_candidate_exists, run_provider_sync,
     run_provider_sync_with_target, run_provider_sync_with_target_and_progress,
@@ -626,6 +626,46 @@ fn provider_sync_resolves_exact_generic_provider_ids_case_sensitively() {
         .unwrap();
     assert!(!history_only.is_resolvable);
     assert!(history_only.unavailable_reason.is_some());
+}
+
+#[test]
+fn provider_sync_targets_hide_the_internal_managed_session_alias() {
+    // #2791：受管会话的 session_meta 记下了内部别名 codex_plus_managed，当前配置没有
+    // 对应表时，它以「选不了」的状态一直挂在同步目标下拉里。
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".codex");
+    fs::create_dir(&home).unwrap();
+    write_provider_config_with_tables(&home, "custom", &[]);
+    write_rollout(
+        &home.join("sessions/rollout-managed.jsonl"),
+        "codex_plus_managed",
+        "thread-managed",
+        "C:/workspace",
+    );
+
+    let targets = load_provider_sync_targets(Some(&home));
+    assert!(
+        targets
+            .targets
+            .iter()
+            .all(|target| target.id != "codex_plus_managed")
+    );
+    let current = targets.targets.first().unwrap();
+    assert_eq!(current.id, "custom");
+    assert!(current.is_resolvable);
+
+    // 配置里即便有同名兼容表，也不能把历史会话迁移到内部别名上。
+    write_provider_config_with_tables(&home, "custom", &["codex_plus_managed"]);
+    let targets = load_provider_sync_targets(Some(&home));
+    assert!(
+        targets
+            .targets
+            .iter()
+            .all(|target| target.id != "codex_plus_managed")
+    );
+    assert!(validate_provider_sync_target(Some(&home), Some("codex_plus_managed")).is_err());
+    assert!(is_provider_sync_internal_alias("codex_plus_managed"));
+    assert!(!is_provider_sync_internal_alias("custom"));
 }
 
 #[test]

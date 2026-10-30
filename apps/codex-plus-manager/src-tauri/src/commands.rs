@@ -5464,6 +5464,10 @@ fn merge_manual_provider_sync_targets(
     codex_home: Option<&Path>,
 ) {
     for id in manual {
+        // 旧版本可能把内部会话别名存进已保存列表；它不是可选目标，不再补回列表（#2791）。
+        if codex_plus_data::is_provider_sync_internal_alias(id) {
+            continue;
+        }
         if let Some(existing) = targets.targets.iter_mut().find(|target| target.id == *id) {
             if !existing
                 .sources
@@ -10318,6 +10322,36 @@ base_url = "https://example.invalid/v1"
             .unwrap();
         assert!(!history.is_resolvable);
         assert!(history.unavailable_reason.is_some());
+    }
+
+    #[test]
+    fn saved_internal_session_alias_is_not_merged_back_into_sync_targets() {
+        // #2791：旧版本存下的内部别名不能再以「选不了」的选项挂回同步目标。
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\n",
+        )
+        .unwrap();
+        let mut settings = BackendSettings::default();
+        settings.provider_sync_saved_providers =
+            vec!["custom".to_string(), "codex_plus_managed".to_string()];
+        let manual = settings.provider_sync_saved_providers.clone();
+        let mut targets = codex_plus_data::ProviderSyncTargetList {
+            current_provider: "custom".to_string(),
+            targets: Vec::new(),
+        };
+
+        merge_manual_provider_sync_targets(&mut targets, &manual, &settings, Some(temp.path()));
+
+        assert_eq!(
+            targets
+                .targets
+                .iter()
+                .map(|target| target.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["custom"]
+        );
     }
 
     #[test]
