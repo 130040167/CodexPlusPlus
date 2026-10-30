@@ -22,7 +22,7 @@ pub struct CodexInstanceIdentity {
     pub executable: PathBuf,
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn valid_stop_identity(identity: &CodexInstanceIdentity) -> bool {
     !identity.instance_id.trim().is_empty()
         && identity.generation != 0
@@ -36,7 +36,7 @@ fn valid_stop_identity(identity: &CodexInstanceIdentity) -> bool {
         && identity.executable.is_absolute()
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 fn record_stop_verification_failure(
     identity: &CodexInstanceIdentity,
     result: &anyhow::Result<bool>,
@@ -63,7 +63,7 @@ fn record_stop_verification_failure(
     );
 }
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 fn canonical_identity_user_data(path: &Path) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(!path.as_os_str().is_empty(), "多开实例必须指定精确数据目录");
     Ok(path.canonicalize()?)
