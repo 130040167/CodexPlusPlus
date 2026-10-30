@@ -51,6 +51,7 @@ mod gateway_breaker;
 mod gateway_codex_identity;
 mod gateway_forced_relay;
 mod gateway_key_limits;
+mod gateway_meta_sync;
 mod gateway_model_sync;
 mod gateway_newapi_access;
 mod gateway_provider_keys;

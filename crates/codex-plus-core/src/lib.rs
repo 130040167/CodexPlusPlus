@@ -95,6 +95,7 @@ pub mod newapi;
 pub mod sub2api;
 pub mod tools;
 pub mod update;
+pub mod upstream_model_meta;
 pub mod user_scripts;
 pub mod version;
 pub mod vision;
