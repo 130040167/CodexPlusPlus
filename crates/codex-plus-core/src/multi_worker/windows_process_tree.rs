@@ -27,10 +27,10 @@ fn same_image(actual: &Path, expected: &Path) -> bool {
     if !actual.is_absolute() || !expected.is_absolute() {
         return false;
     }
-    let (Ok(actual), Ok(expected)) = (actual.canonicalize(), expected.canonicalize()) else {
-        return false;
-    };
-    same_resolved_path(&actual, &expected)
+    match (actual.canonicalize(), expected.canonicalize()) {
+        (Ok(actual), Ok(expected)) => same_resolved_path(&actual, &expected),
+        _ => same_resolved_path(actual, expected),
+    }
 }
 
 fn flag_values<'a>(args: &'a [String], flag: &str) -> Option<Vec<&'a str>> {
@@ -312,18 +312,55 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_or_relative_images_never_match_even_identical_spellings() {
+    fn unresolved_images_use_original_paths_but_relative_images_never_match() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.exe");
-        assert!(!same_image(&missing, &missing));
+        assert!(missing.canonicalize().is_err());
+        assert!(same_image(&missing, &missing));
+        assert!(!same_image(&missing, &dir.path().join("neighbor.exe")));
         let existing = dir.path().join("ChatGPT.exe");
         std::fs::write(&existing, "").unwrap();
         assert!(same_image(&existing, &existing.canonicalize().unwrap()));
         assert!(!same_image(&existing, &missing));
+        assert!(!same_image(&missing, &existing));
         assert!(!same_image(
             Path::new("ChatGPT.exe"),
             Path::new("ChatGPT.exe")
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unresolved_images_normalize_case_prefix_and_separators() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("WindowsApps").join("Codex.exe");
+        let spelling = missing.to_string_lossy();
+        let spelling = spelling.trim_start_matches(r"\\?\");
+        let extended = std::path::PathBuf::from(format!(r"\\?\{}", spelling.to_ascii_uppercase()));
+        let slashes = std::path::PathBuf::from(spelling.to_ascii_lowercase().replace('\\', "/"));
+        assert!(missing.canonicalize().is_err());
+        for equivalent in [&extended, &slashes] {
+            assert!(equivalent.canonicalize().is_err());
+            assert!(same_image(&missing, equivalent));
+            assert!(same_image(equivalent, &missing));
+        }
+        let neighbor = dir.path().join("OtherWindowsApps").join("Codex.exe");
+        assert!(!same_image(&extended, &neighbor));
+    }
+
+    #[test]
+    fn resolved_images_compare_actual_paths_before_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        let image = dir.path().join("Codex.exe");
+        let alias = dir.path().join("nested").join("..").join("Codex.exe");
+        std::fs::write(&image, "").unwrap();
+        assert!(!same_resolved_path(&image, &alias));
+        assert_eq!(image.canonicalize().unwrap(), alias.canonicalize().unwrap());
+        assert!(same_image(&image, &alias));
+        let neighbor = dir.path().join("Neighbor.exe");
+        std::fs::write(&neighbor, "").unwrap();
+        assert!(!same_image(&image, &neighbor));
     }
 
     #[cfg(windows)]
