@@ -63,7 +63,7 @@
     {
       "name": "71-model-picker-groups.js",
       "description": "原生模型选择器按供应商分组折叠（聚合供应商场景）",
-      "lines": 1124
+      "lines": 1177
     },
     {
       "name": "80-session-share.js",
@@ -83,7 +83,7 @@
     {
       "name": "83-usage-statusline.js",
       "description": "输入框下方用量状态栏：输出吞吐、缓存命中率与上下文占用；旧版 Codex 挂载兜底与诊断",
-      "lines": 700
+      "lines": 708
     },
     {
       "name": "84-proxy-request-status.js",
