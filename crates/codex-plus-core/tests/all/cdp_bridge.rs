@@ -828,6 +828,12 @@ fn injection_script_installs_image_overlay_from_data_uri() {
     assert!(script.contains("image.src = resource.imageSource"));
     assert!(!script.contains("JSON.stringify(source)"));
     assert!(overlay_script.contains("zIndex: String(wallpaperLayer)"));
+    // #2813：祖先带 translate/transform 时 fixed 背景会退化为元素局部坐标，受影响表面改按视口换算。
+    assert!(overlay_script.contains("[paint.transform, paint.translate, paint.scale, paint.rotate]"));
+    assert!(overlay_script.contains(
+        "background-attachment:scroll!important;background-size:${geometry.size}!important"
+    ));
+    assert!(overlay_script.contains("[document, \"transitionend\", onPaintMotionEnd, true]"));
     assert!(script.contains("pointerEvents: \"none\""));
     assert!(!script.contains("codexPlusImageOverlayTransparentTargetSelector"));
     assert!(!script.contains("function installCodexPlusImageOverlayForeground"));
