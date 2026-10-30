@@ -2244,20 +2244,32 @@ impl SettingsStore {
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<crate::connect::outbound::OutboundPolicy> {
         let _lock = self.write_lock()?;
-        let settings = self.load()?;
+        let (settings, outbound_revision) = self.load_outbound_settings()?;
         Ok(crate::connect::outbound::OutboundPolicy::bind_settings(
-            self.clone(), config, &settings, stop,
+            self.clone(), config, &settings, &outbound_revision, stop,
         ))
     }
 
     /// 不读取可能回滚的事务中间值，也不阻塞正在发送附件的异步任务。
-    pub(crate) fn try_load_committed(&self) -> anyhow::Result<Option<BackendSettings>> {
+    pub(crate) fn try_load_committed(&self) -> anyhow::Result<Option<(BackendSettings, String)>> {
         let file = OpenOptions::new().read(true).write(true).open(self.path.with_extension("json.lock"))?;
         match FileExt::try_lock_shared(&file) {
-            Ok(()) => self.load().map(Some),
+            Ok(()) => self.load_outbound_settings().map(Some),
             Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(None),
             Err(error) => Err(error).context("核验微信附件权限时获取设置读锁失败"),
         }
+    }
+
+    // 调用方持有同一个设置锁，授权值与 epoch 必须来自同一次已提交快照。
+    fn load_outbound_settings(&self) -> anyhow::Result<(BackendSettings, String)> {
+        let settings = self.load()?;
+        let raw = self.load_raw_object()?;
+        let revision = match raw.get("_weixinOutboundRevision") {
+            Some(Value::String(revision)) => revision.clone(),
+            None => String::new(),
+            _ => anyhow::bail!("微信附件授权版本不是字符串"),
+        };
+        Ok((settings, revision))
     }
 
     fn write_lock(&self) -> anyhow::Result<File> {
@@ -2403,8 +2415,7 @@ impl SettingsStore {
         // 完整表单不能擦除新版本或拓展写入的未知字段；profile 以稳定 ID 对齐。
         preserve_unknown_settings_fields(&mut next, &raw)?;
         next.remove("revision");
-        // 即使设置值恢复原样也必须产生新提交版本；失败回滚会恢复原 nonce。
-        next.insert("_settingsCommitId".to_string(), Value::String(uuid::Uuid::new_v4().to_string()));
+        update_weixin_outbound_revision(&mut next, &raw);
         serialize_settings_bounded(&Value::Object(next))
     }
 
@@ -2516,7 +2527,7 @@ impl SettingsStore {
             );
         }
         raw.remove("revision");
-        raw.insert("_settingsCommitId".to_string(), Value::String(uuid::Uuid::new_v4().to_string()));
+        update_weixin_outbound_revision(&mut raw, &original_raw);
         let bytes = serialize_settings_bounded(&Value::Object(raw))?;
         atomic_write(&self.path, &bytes)?;
         settings.settings_revision = settings_revision(Some(&bytes));
@@ -2586,6 +2597,34 @@ fn validate_settings_snapshot(bytes: &[u8]) -> anyhow::Result<()> {
         anyhow::bail!("settings 快照顶层不是 JSON 对象，原文件未修改");
     }
     Ok(())
+}
+
+fn update_weixin_outbound_revision(next: &mut Map<String, Value>, previous: &Map<String, Value>) {
+    let changed = [
+        "weixinConnectEnabled",
+        "weixinConnectAllowOutboundAttachments",
+        "weixinConnectAllowFrom",
+        "weixinConnectWorkDir",
+        "weixinConnectAccountId",
+        "weixinConnectToken",
+        "weixinConnectBaseUrl",
+        "weixinConnectRouteTag",
+    ].into_iter().any(|key| {
+        let default = match key {
+            "weixinConnectEnabled" | "weixinConnectAllowOutboundAttachments" => Value::Bool(false),
+            "weixinConnectBaseUrl" => Value::String(crate::connect::DEFAULT_WEIXIN_BASE_URL.to_string()),
+            _ => Value::String(String::new()),
+        };
+        previous.get(key).unwrap_or(&default) != next.get(key).unwrap_or(&default)
+    });
+    // 只记录授权变更；快速关闭再开启也不能恢复旧 permit，无关保存不影响在途附件。
+    next.remove("_settingsCommitId");
+    next.remove("_weixinOutboundRevision");
+    if changed {
+        next.insert("_weixinOutboundRevision".to_string(), Value::String(uuid::Uuid::new_v4().to_string()));
+    } else if let Some(revision) = previous.get("_weixinOutboundRevision") {
+        next.insert("_weixinOutboundRevision".to_string(), revision.clone());
+    }
 }
 
 fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<String, Value>) {
@@ -3681,6 +3720,27 @@ fn temp_path_for(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn settings_weixin_outbound_revision_ignores_defaults_and_unrelated_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let store = SettingsStore::new(path);
+        store.save(&store.load().unwrap()).unwrap();
+        assert!(!store.load_raw_object().unwrap().contains_key("_weixinOutboundRevision"));
+        store.update(json!({"weixinConnectModel": "next-turn-model", "_weixinOutboundRevision": "untrusted"})).unwrap();
+        assert!(!store.load_raw_object().unwrap().contains_key("_weixinOutboundRevision"));
+        store.update(json!({"weixinConnectEnabled": true})).unwrap();
+        let revision = store.load_raw_object().unwrap()["_weixinOutboundRevision"].clone();
+        store.update(json!({"weixinConnectEnabled": true, "_weixinOutboundRevision": "untrusted"})).unwrap();
+        let mut settings = store.load().unwrap();
+        settings.weixin_connect_model = "another-next-turn-model".into();
+        store.save(&settings).unwrap();
+        assert_eq!(store.load_raw_object().unwrap()["_weixinOutboundRevision"], revision);
+        store.update(json!({"weixinConnectEnabled": false})).unwrap();
+        assert_ne!(store.load_raw_object().unwrap()["_weixinOutboundRevision"], revision);
+    }
 
     #[cfg(unix)]
     #[test]

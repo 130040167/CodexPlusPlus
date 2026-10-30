@@ -21,7 +21,7 @@ struct PolicyState {
     peers: String,
     workspace: PathBuf,
     revision: u64,
-    settings_revision: Option<String>,
+    outbound_revision: Option<String>,
 }
 
 #[derive(Clone)]
@@ -72,7 +72,7 @@ impl OutboundPolicy {
                 peers: peers.trim().to_string(),
                 workspace: PathBuf::from(workspace.trim()),
                 revision: 0,
-                settings_revision: None,
+                outbound_revision: None,
             }),
             stop: None,
             settings: None,
@@ -83,6 +83,7 @@ impl OutboundPolicy {
         store: SettingsStore,
         config: &super::WeixinConnectConfig,
         settings: &BackendSettings,
+        outbound_revision: &str,
         stop: Arc<AtomicBool>,
     ) -> Self {
         let policy = Self(Arc::new(LivePolicy {
@@ -91,7 +92,7 @@ impl OutboundPolicy {
                 peers: String::new(),
                 workspace: PathBuf::new(),
                 revision: 0,
-                settings_revision: None,
+                outbound_revision: None,
             }),
             stop: Some(stop),
             settings: Some(SettingsPolicyBinding {
@@ -99,11 +100,11 @@ impl OutboundPolicy {
                 account: account_identity(&config.account_id, &config.token, &config.base_url, &config.route_tag),
             }),
         }));
-        policy.apply_settings(settings);
+        policy.apply_settings(settings, outbound_revision);
         policy
     }
 
-    fn apply_settings(&self, settings: &BackendSettings) {
+    fn apply_settings(&self, settings: &BackendSettings, outbound_revision: &str) {
         let Some(binding) = &self.0.settings else { return; };
         let same_account = binding.account == account_identity(
             &settings.weixin_connect_account_id,
@@ -115,14 +116,14 @@ impl OutboundPolicy {
             settings.weixin_connect_enabled && settings.weixin_connect_allow_outbound_attachments && same_account,
             &settings.weixin_connect_allow_from,
             &settings.weixin_connect_work_dir,
-            Some(&settings.settings_revision),
+            Some(outbound_revision),
         );
     }
 
     fn refresh(&self) -> anyhow::Result<()> {
         if let Some(binding) = &self.0.settings {
             match binding.store.try_load_committed() {
-                Ok(Some(settings)) => self.apply_settings(&settings),
+                Ok(Some((settings, revision))) => self.apply_settings(&settings, &revision),
                 Ok(None) => {} // 写事务尚未提交，保留上一个已提交的授权。
                 Err(error) => {
                     self.set(false, "", "");
@@ -137,21 +138,21 @@ impl OutboundPolicy {
         self.update(enabled, peers, workspace, None);
     }
 
-    fn update(&self, enabled: bool, peers: &str, workspace: &str, settings_revision: Option<&str>) {
+    fn update(&self, enabled: bool, peers: &str, workspace: &str, outbound_revision: Option<&str>) {
         self.0.state.send_if_modified(|state| {
             let enabled = enabled && !self.stopped();
             if state.enabled == enabled
                 && state.peers == peers.trim()
                 && state.workspace == Path::new(workspace.trim())
-                && settings_revision.is_none_or(|revision| state.settings_revision.as_deref() == Some(revision))
+                && outbound_revision.is_none_or(|revision| state.outbound_revision.as_deref() == Some(revision))
             {
                 return false;
             }
             state.enabled = enabled;
             state.peers = peers.trim().to_string();
             state.workspace = PathBuf::from(workspace.trim());
-            if let Some(revision) = settings_revision {
-                state.settings_revision = Some(revision.to_string());
+            if let Some(revision) = outbound_revision {
+                state.outbound_revision = Some(revision.to_string());
             }
             state.revision = state.revision.wrapping_add(1);
             true
@@ -796,6 +797,15 @@ mod tests {
                 settings.weixin_connect_token = "new-fake-token".into();
                 store.save(&settings).unwrap();
             }
+            "unrelated" => {
+                let ctx = crate::routes::BridgeContext::with_test_settings(store, path.parent().unwrap().join("app"));
+                let result = crate::routes::handle_bridge_request(ctx, "/settings/set", json!({
+                    "weixinConnectModel": "next-turn-model",
+                    "codexAppDreamSkinTheme": "pink",
+                })).await;
+                assert_eq!(result["weixinConnectModel"], "next-turn-model");
+                assert_eq!(result["codexAppDreamSkinTheme"], "pink");
+            }
             mode => {
                 let payload = if mode == "connection-disabled" {
                     json!({"weixinConnectEnabled": false})
@@ -912,6 +922,76 @@ mod tests {
             assert!(permit.check().is_err(), "fast off/on resurrected an old permit");
             assert!(calls.validate(&request).is_err(), "fast off/on restored a cached success");
             assert!(fixture.policy.permit("peer").is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_settings_unrelated_saves_preserve_permit_cache_and_inflight() {
+        let fixture = SettingsFixture::new();
+        let permit = fixture.policy.permit("peer").unwrap();
+        let mut calls = AttachmentCalls::new("peer", "thread", Some(permit.clone()));
+        calls.turn = Some("turn".into());
+        let request = call("thread", "turn", "call");
+        let (id, arguments, _) = calls.validate(&request).unwrap();
+        calls.record(id, arguments, json!({"success": true}));
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let active = permit.clone();
+        let task = tokio::spawn(async move {
+            active.guard(async {
+                let _ = entered.send(());
+                finished.await.unwrap();
+                Ok(())
+            }).await
+        });
+        ready.await.unwrap();
+        let mut settings = fixture.store.load().unwrap();
+        settings.codex_app_dream_skin_theme = "miku".into();
+        fixture.store.save(&settings).unwrap();
+        assert_eq!(fixture.store.load().unwrap().codex_app_dream_skin_theme, "miku");
+        assert!(permit.check().is_ok(), "full unrelated save revoked the permit");
+        run_settings_writer(&fixture, "unrelated").await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(permit.check().is_ok(), "cross-process unrelated patch revoked the permit");
+        assert_eq!(calls.validate(&request).unwrap().2, Some(json!({"success": true})));
+        assert!(!task.is_finished(), "unrelated save cancelled the inflight attachment");
+        finish.send(()).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap().is_ok());
+    }
+
+    #[test]
+    fn outbound_settings_authorization_roundtrips_invalidate_old_permits() {
+        for (field, replacement) in [
+            ("weixinConnectEnabled", json!(false)),
+            ("weixinConnectAllowOutboundAttachments", json!(false)),
+            ("weixinConnectAllowFrom", json!("other")),
+            ("weixinConnectWorkDir", json!("other-workspace")),
+            ("weixinConnectAccountId", json!("other-account")),
+            ("weixinConnectToken", json!("other-fake-token")),
+            ("weixinConnectBaseUrl", json!("https://example.invalid")),
+            ("weixinConnectRouteTag", json!("other-route")),
+        ] {
+            for full_save in [false, true] {
+                let fixture = SettingsFixture::new();
+                let permit = fixture.policy.permit("peer").unwrap();
+                let mut original = fixture.store.load().unwrap();
+                let mut changed = serde_json::to_value(&original).unwrap();
+                changed[field] = replacement.clone();
+                if full_save {
+                    fixture.store.save(&serde_json::from_value(changed).unwrap()).unwrap();
+                    original.settings_revision = fixture.store.revision().unwrap();
+                    fixture.store.save(&original).unwrap();
+                } else {
+                    let mut patch = json!({});
+                    patch[field] = replacement.clone();
+                    fixture.store.update(patch).unwrap();
+                    let mut patch = json!({});
+                    patch[field] = serde_json::to_value(&original).unwrap()[field].clone();
+                    fixture.store.update(patch).unwrap();
+                }
+                assert!(permit.check().is_err(), "{field} roundtrip resurrected an old permit (full_save={full_save})");
+                assert!(fixture.policy.permit("peer").is_ok());
+            }
         }
     }
 
