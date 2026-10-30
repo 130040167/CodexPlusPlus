@@ -208,7 +208,8 @@ pub fn run() {
         }
     }
     // 清理以前自动更新留在 app 同级目录里的 .codex-plus-update-<uuid> 残留（#2774）。
-    // 删旧 app 备份要些时间，放后台线程；失败只记诊断日志，不影响启动。
+    // 删旧 app 备份要些时间，放后台线程；刚由旧版 helper 完成的更新会在 helper 退出后补跑清掉。
+    // 失败只记诊断日志，不影响启动。
     #[cfg(target_os = "macos")]
     std::thread::spawn(codex_plus_core::update::macos::cleanup_stale_update_transactions);
     if let Ok(settings) = codex_plus_core::settings::SettingsStore::default().load() {

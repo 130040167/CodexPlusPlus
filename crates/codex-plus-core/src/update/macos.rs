@@ -245,13 +245,25 @@ const TRANSACTION_PREFIX: &str = ".codex-plus-update-";
 /// 历史事务目录至少闲置这么久才清理，避免碰到别的实例刚建好、helper 还没拿锁的事务。
 const STALE_TRANSACTION_MIN_AGE: Duration = Duration::from_secs(15 * 60);
 /// 事务目录顶层只会出现这些文件（含 atomic_write 的临时文件）；另有 `decision-<uuid>`。
-const TRANSACTION_FILES: [&str; 6] = [
+/// 2.1.2 及更早版本的 helper 留下的也是同一组文件。`.DS_Store` 是用户在访达里点开过残留
+/// 目录时由访达写入的显示元数据，不是用户数据；不放行的话，看过一眼的残留就永远清不掉。
+const TRANSACTION_FILES: [&str; 7] = [
     "plan.json",
     "manager-update-helper",
     "helper-stderr.log",
     "result.json",
     "result.json.tmp",
     "decision",
+    ".DS_Store",
+];
+/// helper 结束时写进 `result.json` 的终态；写完后 helper 只剩重新打开 app、退出。
+const TRANSACTION_FINISHED_STATES: [&str; 3] = ["installed", "installed_restart_failed", "failed"];
+/// 启动清理之后的补跑间隔（累计）：上一轮有留待下次的事务目录时才继续。
+/// 第一次补跑等刚完成更新的 helper 退出、放开更新锁；第二次补跑在闲置期过后，
+/// 收掉没写终态（如中途被杀）的事务。
+const STARTUP_CLEANUP_RETRY_DELAYS: [Duration; 2] = [
+    Duration::from_secs(60),
+    Duration::from_secs(STALE_TRANSACTION_MIN_AGE.as_secs() + 60),
 ];
 /// 事务目录顶层只会出现这些子目录。
 const TRANSACTION_DIRS: [&str; 4] = ["mount", "staged", "backups", "rejected"];
@@ -345,6 +357,59 @@ fn ensure_removable_transaction(install_root: &Path, transaction: &Path) -> anyh
     Ok(())
 }
 
+/// `result.json` 是否已写成终态（安装完成 / 失败）。只认事务目录里的普通小文件，
+/// 符号链接、超大、解析失败一律当作「未结束」，回落到闲置时间判断。
+fn transaction_finished(transaction: &Path) -> bool {
+    let path = transaction.join("result.json");
+    let Ok(meta) = fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() > 64 * 1024 {
+        return false;
+    }
+    fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|state| state["status"].as_str().map(str::to_string))
+        .is_some_and(|status| TRANSACTION_FINISHED_STATES.contains(&status.as_str()))
+}
+
+/// 事务目录能否现在清理（不含 [`ensure_removable_transaction`] 的结构校验）。
+///
+/// **调用方必须已拿到该安装目录的更新锁**：helper 从开始到退出一直持有这把锁，只在拿到锁
+/// 之后写 `result.json`。所以「拿到锁 + 终态」说明写终态的 helper 已经退出，刚完成的更新
+/// 也可以马上清（#2774：2.1.2 → 2.1.3 由旧 helper 替换、不删目录，新版第一次启动时目录
+/// 才改动过几秒，按闲置时间一律跳过，用户就一直看得到）。
+/// 没有终态的（另一个实例刚建好、helper 还没拿锁，或中途被杀）仍要闲置够久才清。
+fn ensure_transaction_idle(transaction: &Path, now: SystemTime) -> anyhow::Result<()> {
+    if transaction_finished(transaction) {
+        return Ok(());
+    }
+    let modified = fs::symlink_metadata(transaction)?.modified()?;
+    if now.duration_since(modified).unwrap_or_default() < STALE_TRANSACTION_MIN_AGE {
+        bail!("更新事务目录最近还有改动，可能仍在使用，留待下次清理");
+    }
+    Ok(())
+}
+
+/// 启动清理：先跑一次，之后只要上一轮还有留待下次的事务目录，就按 `delays` 依次补跑；
+/// `cleanup` 返回是否仍有留待下次的。补跑次数有上限，不常驻轮询。
+fn run_cleanup_with_retries(
+    delays: &[Duration],
+    mut sleep: impl FnMut(Duration),
+    mut cleanup: impl FnMut() -> bool,
+) {
+    if !cleanup() {
+        return;
+    }
+    for delay in delays {
+        sleep(*delay);
+        if !cleanup() {
+            return;
+        }
+    }
+}
+
 /// 严格校验后删除一个更新事务目录（暂存副本、旧 app 备份、helper 副本等）。
 fn remove_transaction(install_root: &Path, transaction: &Path) -> anyhow::Result<()> {
     ensure_removable_transaction(install_root, transaction)?;
@@ -354,7 +419,7 @@ fn remove_transaction(install_root: &Path, transaction: &Path) -> anyhow::Result
 
 /// 清理 `install_root` 下以前的更新留下的事务目录（issue #2774）。
 /// 只看名字是「前缀 + UUID」的直接子项，逐个校验后删除；单个失败不影响其它，
-/// 每一项的结果交给调用方写诊断日志。
+/// 每一项的结果交给调用方写诊断日志。调用方须持有该安装目录的更新锁。
 fn cleanup_stale_transactions(
     install_root: &Path,
     now: SystemTime,
@@ -373,10 +438,7 @@ fn cleanup_stale_transactions(
         }
         let path = entry.path();
         let result = (|| -> anyhow::Result<()> {
-            let modified = fs::symlink_metadata(&path)?.modified()?;
-            if now.duration_since(modified).unwrap_or_default() < STALE_TRANSACTION_MIN_AGE {
-                bail!("更新事务目录最近还有改动，可能仍在使用，留待下次清理");
-            }
+            ensure_transaction_idle(&path, now)?;
             remove_transaction(install_root, &path)
         })();
         outcomes.push((path, result.map_err(|error| format!("{error:#}"))));
@@ -483,10 +545,7 @@ fn cleanup_recorded_transactions<G>(
             continue;
         };
         let result = (|| -> anyhow::Result<()> {
-            let modified = fs::symlink_metadata(&transaction)?.modified()?;
-            if now.duration_since(modified).unwrap_or_default() < STALE_TRANSACTION_MIN_AGE {
-                bail!("更新事务目录最近还有改动，可能仍在使用，留待下次清理");
-            }
+            ensure_transaction_idle(&transaction, now)?;
             remove_transaction(root, &transaction)
         })();
         if result.is_err() {
@@ -933,29 +992,48 @@ mod runtime {
         transaction_record_path(&crate::paths::default_app_state_dir())
     }
 
+    /// 同一进程里的清理（启动后台线程、补跑、更新开始前）串行执行，避免同时拿安装目录的更新锁。
+    static CLEANUP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// 本进程已开始自动更新：后台补跑不再去碰更新锁，免得 helper 拿锁时撞上。
+    static UPDATE_STARTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
     /// 清理以前的更新留下的事务目录；只写诊断日志，从不报错。
+    /// 返回是否还有留待下次的事务目录（更新锁被占、最近改动过、校验未通过等）。
     ///
     /// 先按 state 目录里的记录清理（不列目录）；`root` 是 `/Applications` 或 `~/Applications`
     /// 时再按前缀扫描一次，收掉 2.1.2 留下、没有记录的旧残留。
-    pub(super) fn cleanup_stale(root: &Path) {
+    fn cleanup_stale(root: &Path) -> bool {
+        let _guard = CLEANUP_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        cleanup_stale_locked(root)
+    }
+
+    fn cleanup_stale_locked(root: &Path) -> bool {
         let now = std::time::SystemTime::now();
+        let record = transaction_record();
         log_cleanup_outcomes(cleanup_recorded_transactions(
-            &transaction_record(),
+            &record,
             now,
             lock_install_root,
         ));
+        let mut pending = !read_transaction_record(&record).is_empty();
         let home = std::env::var_os("HOME")
             .filter(|home| !home.is_empty())
             .map(PathBuf::from)
             .map(|home| fs::canonicalize(&home).unwrap_or(home));
         if !legacy_transaction_scan_allowed(root, home.as_deref()) {
-            return;
+            return pending;
         }
         let Some(_lock) = lock_install_root(root) else {
-            return;
+            return true;
         };
         match cleanup_stale_transactions(root, now) {
-            Ok(outcomes) => log_cleanup_outcomes(outcomes),
+            Ok(outcomes) => {
+                pending |= outcomes.iter().any(|(_, result)| result.is_err());
+                log_cleanup_outcomes(outcomes);
+            }
             Err(error) => {
                 let _ = crate::diagnostic_log::append_diagnostic_log(
                     "update.macos.transaction_cleanup_failed",
@@ -963,16 +1041,31 @@ mod runtime {
                 );
             }
         }
+        pending
     }
 
-    /// 启动时调用：只处理当前运行的 Codex++.app 所在目录；不是标准安装布局（如开发构建）就跳过。
+    /// 启动时调用（后台线程）：只处理当前运行的 Codex++.app 所在目录；不是标准安装布局
+    /// （如开发构建）就跳过。
+    ///
+    /// 旧版 helper 完成的更新（如 2.1.2 → 2.1.3）不删事务目录，新版启动时 helper 可能还没退出、
+    /// 目录也刚改动过，第一次清理会跳过；所以有留待下次的就按 [`STARTUP_CLEANUP_RETRY_DELAYS`]
+    /// 补跑，最多两次（#2774）。本进程开始自动更新后不再补跑。
     pub(super) fn cleanup_stale_for_current_app() {
         let Ok(executable) = std::env::current_exe().and_then(fs::canonicalize) else {
             return;
         };
-        if let Ok(root) = installed_root_from_executable(&executable) {
-            cleanup_stale(&root);
-        }
+        let Ok(root) = installed_root_from_executable(&executable) else {
+            return;
+        };
+        run_cleanup_with_retries(&STARTUP_CLEANUP_RETRY_DELAYS, sleep, || {
+            let _guard = CLEANUP_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if UPDATE_STARTED.load(std::sync::atomic::Ordering::SeqCst) {
+                return false;
+            }
+            cleanup_stale_locked(&root)
+        });
     }
 
     pub(super) fn launch(installer: &Path, version: &str) -> anyhow::Result<()> {
@@ -986,7 +1079,9 @@ mod runtime {
         if !super::super::is_newer_version(version, &old_bundles[0].version)? {
             bail!("更新版本未高于当前 Codex++ 版本。");
         }
-        // 先清掉以前失败 / 中断留下的事务目录，再建本次的。
+        // 先清掉以前失败 / 中断留下的事务目录，再建本次的。先置标记：等后台清理这一轮
+        // 结束（放开更新锁）后，它不会再补跑，helper 拿锁不会撞上。
+        UPDATE_STARTED.store(true, std::sync::atomic::Ordering::SeqCst);
         cleanup_stale(&root);
         let transaction = root.join(transaction_dir_name(uuid::Uuid::new_v4()));
         // 先记下再建目录，之后启动 / 下次更新只按记录清理，不必列出 app 所在目录。
@@ -2050,6 +2145,171 @@ mod tests {
         assert!(outcomes[0].1.is_ok());
         assert!(!plan.transaction.exists());
         assert!(!record.exists());
+    }
+
+    /// 把事务的 `result.json` 写成 helper 的某个状态（与 `write_state` 的格式一致）。
+    fn write_result_state(transaction: &Path, status: &str) {
+        fs::write(
+            transaction.join("result.json"),
+            serde_json::to_vec(&serde_json::json!({"status":status,"message":"fixture"})).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn macos_update_legacy_helper_leftover_is_cleaned() {
+        // 2.1.2 的 helper 完成更新后留下的完整结构：plan / helper 副本 / stderr / 终态
+        // result.json / decision(-uuid) / 空挂载点 / 空 staged / backups 里的旧 app / 空 rejected。
+        let (_temp, plan, _payload) = completed_fixture();
+        let root = plan.install_root.clone();
+        write_result_state(&plan.transaction, "installed");
+        assert!(plan.transaction.join("staged").is_dir());
+        assert!(plan.transaction.join("rejected").is_dir());
+        assert!(
+            plan.transaction
+                .join("backups")
+                .join(BUNDLES[0].name)
+                .is_dir()
+        );
+        // 新版刚启动：目录几秒前才改动过，helper 写了终态且已放开更新锁，马上就能清。
+        let outcomes = cleanup_stale_transactions(&root, SystemTime::now()).unwrap();
+        assert!(outcomes[0].1.is_ok(), "{outcomes:?}");
+        assert!(!plan.transaction.exists());
+        assert!(
+            root.join(BUNDLES[0].name)
+                .join("Contents/Info.plist")
+                .is_file()
+        );
+
+        // 用户在访达里点开过的旧残留（多了 .DS_Store），没有终态但早已闲置：照样清。
+        let (_temp, plan, _payload) = completed_fixture();
+        write_result_state(&plan.transaction, "ready");
+        fs::write(plan.transaction.join(".DS_Store"), "finder").unwrap();
+        let outcomes = cleanup_stale_transactions(&plan.install_root, later()).unwrap();
+        assert!(outcomes[0].1.is_ok(), "{outcomes:?}");
+        assert!(!plan.transaction.exists());
+    }
+
+    #[test]
+    fn macos_update_finished_transaction_cleaned_once_lock_is_free() {
+        let (temp, plan, _payload) = completed_fixture();
+        let record = transaction_record_path(&temp.path().join("state"));
+        write_result_state(&plan.transaction, "installed_restart_failed");
+        record_transaction(&record, &plan.transaction).unwrap();
+        // helper 还没退出、仍持有更新锁：即使已写终态也不碰。
+        let outcomes = cleanup_recorded_transactions(&record, SystemTime::now(), |_| None::<()>);
+        assert!(outcomes[0].1.as_ref().unwrap_err().contains("正在进行"));
+        assert!(plan.transaction.exists());
+        assert_eq!(
+            read_transaction_record(&record),
+            vec![plan.transaction.clone()]
+        );
+        // helper 退出、锁放开后，不必等闲置期。
+        let outcomes = cleanup_recorded_transactions(&record, SystemTime::now(), |_| Some(()));
+        assert!(outcomes[0].1.is_ok(), "{outcomes:?}");
+        assert!(!plan.transaction.exists());
+        assert!(!record.exists());
+    }
+
+    #[test]
+    fn macos_update_finished_state_does_not_bypass_safety_checks() {
+        let now = SystemTime::now();
+        let keep = |prepare: &dyn Fn(&UpdatePlan), expected: &str| {
+            let (_temp, plan, _payload) = completed_fixture();
+            prepare(&plan);
+            let outcomes = cleanup_stale_transactions(&plan.install_root, now).unwrap();
+            let message = outcomes[0].1.as_ref().unwrap_err();
+            assert!(message.contains(expected), "{expected}: {message}");
+            assert!(plan.transaction.is_dir());
+        };
+        // 没有终态（helper 还在准备 / 刚建好还没拿锁）：仍按闲置期跳过。
+        keep(
+            &|plan| write_result_state(&plan.transaction, "ready"),
+            "最近",
+        );
+        keep(&|_| {}, "最近");
+        // 终态文件是指向别处的符号链接：不认，回落到闲置期判断。
+        #[cfg(unix)]
+        keep(
+            &|plan| {
+                let fake = plan.install_root.parent().unwrap().join("伪造终态.json");
+                fs::write(&fake, r#"{"status":"installed"}"#).unwrap();
+                fs::remove_file(plan.transaction.join("result.json")).unwrap();
+                std::os::unix::fs::symlink(&fake, plan.transaction.join("result.json")).unwrap();
+            },
+            "最近",
+        );
+        // 已写终态，但结构校验不通过：照样保留。
+        keep(
+            &|plan| {
+                write_result_state(&plan.transaction, "installed");
+                fs::write(plan.transaction.join("用户笔记.txt"), "not ours").unwrap();
+            },
+            "非更新暂存内容",
+        );
+        keep(
+            &|plan| {
+                write_result_state(&plan.transaction, "failed");
+                fs::write(plan.transaction.join("mount").join("卷内容"), "dmg").unwrap();
+            },
+            "挂载点非空",
+        );
+        keep(
+            &|plan| {
+                write_result_state(&plan.transaction, "failed");
+                fs::rename(
+                    plan.install_root.join(BUNDLES[0].name),
+                    plan.transaction.join("rejected").join(BUNDLES[0].name),
+                )
+                .unwrap();
+            },
+            "备份需保留",
+        );
+        keep(
+            &|plan| {
+                write_result_state(&plan.transaction, "installed");
+                fs::create_dir(plan.transaction.join(".DS_Store")).unwrap();
+            },
+            "类型异常",
+        );
+        #[cfg(unix)]
+        keep(
+            &|plan| {
+                use std::os::unix::fs::PermissionsExt;
+                write_result_state(&plan.transaction, "installed");
+                fs::set_permissions(&plan.transaction, fs::Permissions::from_mode(0o755)).unwrap();
+            },
+            "私有目录",
+        );
+    }
+
+    #[test]
+    fn macos_update_startup_cleanup_retries_only_while_pending() {
+        let run = |results: &[bool]| {
+            let mut slept = Vec::new();
+            let mut calls = 0;
+            run_cleanup_with_retries(
+                &STARTUP_CLEANUP_RETRY_DELAYS,
+                |delay| slept.push(delay),
+                || {
+                    calls += 1;
+                    results[calls - 1]
+                },
+            );
+            (calls, slept)
+        };
+        assert_eq!(run(&[false]), (1, vec![]));
+        assert_eq!(
+            run(&[true, false]),
+            (2, vec![STARTUP_CLEANUP_RETRY_DELAYS[0]])
+        );
+        // 一直有留待下次的：补跑次数有上限，不常驻。
+        assert_eq!(
+            run(&[true, true, true]),
+            (3, STARTUP_CLEANUP_RETRY_DELAYS.to_vec())
+        );
+        // 最后一次补跑落在闲置期之后，没写终态的残留也能在本次运行中收掉。
+        assert!(STARTUP_CLEANUP_RETRY_DELAYS.iter().sum::<Duration>() > STALE_TRANSACTION_MIN_AGE);
     }
 
     #[test]
