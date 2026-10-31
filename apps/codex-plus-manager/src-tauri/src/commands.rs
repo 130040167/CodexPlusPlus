@@ -6394,6 +6394,10 @@ pub async fn update_skill(repo_key: String, id: String) -> CommandResult<SkillsP
     install_or_update_skill(&repo_key, &id, "Skill 已更新。", "更新 Skill 失败").await
 }
 
+fn skill_install_failure_message(failure_prefix: &str, error: &anyhow::Error) -> String {
+    format!("{failure_prefix}：{error:#}")
+}
+
 async fn install_or_update_skill(
     repo_key: &str,
     id: &str,
@@ -6417,7 +6421,7 @@ async fn install_or_update_skill(
         }
         Err(error) => {
             return failed(
-                &format!("{failure_prefix}：{error}"),
+                &skill_install_failure_message(failure_prefix, &error),
                 current_skills_payload(&manager),
             );
         }
@@ -6455,7 +6459,7 @@ async fn install_or_update_skill(
         Ok(bytes) => bytes,
         Err(error) => {
             return failed(
-                &format!("{failure_prefix}：{error}"),
+                &skill_install_failure_message(failure_prefix, &error),
                 current_skills_payload(&manager),
             );
         }
@@ -6463,7 +6467,7 @@ async fn install_or_update_skill(
     match manager.install_from_zip(&skill, &zip) {
         Ok(_) => ok(success_message, current_skills_payload(&manager)),
         Err(error) => failed(
-            &format!("{failure_prefix}：{error}"),
+            &skill_install_failure_message(failure_prefix, &error),
             current_skills_payload(&manager),
         ),
     }
@@ -9884,6 +9888,17 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn skill_install_failure_message_preserves_the_error_chain() {
+        let error = anyhow::anyhow!("root cause")
+            .context("download context")
+            .context("repository context");
+        assert_eq!(
+            skill_install_failure_message("update failed", &error),
+            "update failed：repository context: download context: root cause"
+        );
+    }
 
     #[test]
     fn skills_payload_hides_disabled_repository_catalog() {
