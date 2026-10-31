@@ -1112,6 +1112,9 @@ pub struct BackendSettings {
     /// 本机用量历史默认关闭，仅显式开启后允许只读查询。
     #[serde(rename = "usageHistoryEnabled", default)]
     pub usage_history_enabled: bool,
+    // 默认开启：输入框上方的请求状态条（#2824），纯展示层；关掉后注入层停止轮询 /proxy-status。
+    #[serde(rename = "codexAppProxyRequestStatus", default = "default_true")]
+    pub codex_app_proxy_request_status: bool,
     // 默认开启：只在受管副本的页面里加一个语音入口，识别走 Codex++ 自己的听写服务，
     // 不改官方应用、不动输入框已有内容；关掉只是没有入口，已运行的副本需重启才生效。
     #[serde(rename = "claudeAppVoiceInput", default = "default_true")]
@@ -1310,12 +1313,18 @@ pub struct BackendSettings {
     pub weixin_connect_account_id: String,
     #[serde(rename = "weixinConnectAllowFrom", default)]
     pub weixin_connect_allow_from: String,
+    #[serde(rename = "weixinConnectAllowOutboundAttachments", default)]
+    pub weixin_connect_allow_outbound_attachments: bool,
     #[serde(rename = "weixinConnectRouteTag", default)]
     pub weixin_connect_route_tag: String,
     #[serde(rename = "weixinConnectWorkDir", default)]
     pub weixin_connect_work_dir: String,
     #[serde(rename = "weixinConnectModel", default)]
     pub weixin_connect_model: String,
+    #[serde(rename = "weixinConnectReasoningEffort", default)]
+    pub weixin_connect_reasoning_effort: String,
+    #[serde(rename = "weixinConnectProjectId", default)]
+    pub weixin_connect_project_id: String,
     #[serde(
         rename = "weixinConnectSandbox",
         default = "default_weixin_connect_sandbox"
@@ -1455,6 +1464,7 @@ impl Default for BackendSettings {
             codex_app_session_share: true,
             codex_app_usage_status_line: true,
             usage_history_enabled: false,
+            codex_app_proxy_request_status: true,
             claude_app_voice_input: true,
             claude_app_localization: true,
             claude_app_computer_use: false,
@@ -1512,9 +1522,12 @@ impl Default for BackendSettings {
             weixin_connect_token: String::new(),
             weixin_connect_account_id: String::new(),
             weixin_connect_allow_from: String::new(),
+            weixin_connect_allow_outbound_attachments: false,
             weixin_connect_route_tag: String::new(),
             weixin_connect_work_dir: String::new(),
             weixin_connect_model: String::new(),
+            weixin_connect_reasoning_effort: String::new(),
+            weixin_connect_project_id: String::new(),
             weixin_connect_sandbox: default_weixin_connect_sandbox(),
             weixin_connect_codex_path: String::new(),
             relay_base_url: default_relay_base_url(),
@@ -2245,6 +2258,15 @@ pub struct SettingsStore {
     path: PathBuf,
 }
 
+struct SettingsFileLock(File);
+
+impl Drop for SettingsFileLock {
+    fn drop(&mut self) {
+        // 并发启动子进程可能继承句柄；事务结束时主动解锁，不能只等最后一个句柄关闭。
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
 /// 配置不应承载无界的转义膨胀或文件内容。超限时只报错，不覆盖原文件。
 pub const MAX_SETTINGS_FILE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -2307,7 +2329,45 @@ impl SettingsStore {
         Self { path }
     }
 
-    fn write_lock(&self) -> anyhow::Result<File> {
+    /// 与设置提交串行绑定，不能让启动时加载的旧授权跨过后续撤销。
+    pub fn weixin_outbound_policy(
+        &self,
+        config: &crate::connect::WeixinConnectConfig,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> anyhow::Result<crate::connect::outbound::OutboundPolicy> {
+        let _lock = self.write_lock()?;
+        let (settings, outbound_revision) = self.load_outbound_settings()?;
+        Ok(crate::connect::outbound::OutboundPolicy::bind_settings(
+            self.clone(), config, &settings, &outbound_revision, stop,
+        ))
+    }
+
+    /// 不读取可能回滚的事务中间值，也不阻塞正在发送附件的异步任务。
+    pub(crate) fn try_load_committed(&self) -> anyhow::Result<Option<(BackendSettings, String)>> {
+        let file = OpenOptions::new().read(true).write(true).open(self.path.with_extension("json.lock"))?;
+        match FileExt::try_lock_shared(&file) {
+            Ok(()) => {
+                let _lock = SettingsFileLock(file);
+                self.load_outbound_settings().map(Some)
+            }
+            Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(None),
+            Err(error) => Err(error).context("核验微信附件权限时获取设置读锁失败"),
+        }
+    }
+
+    // 调用方持有同一个设置锁，授权值与 epoch 必须来自同一次已提交快照。
+    fn load_outbound_settings(&self) -> anyhow::Result<(BackendSettings, String)> {
+        let settings = self.load()?;
+        let raw = self.load_raw_object()?;
+        let revision = match raw.get("_weixinOutboundRevision") {
+            Some(Value::String(revision)) => revision.clone(),
+            None => String::new(),
+            _ => anyhow::bail!("微信附件授权版本不是字符串"),
+        };
+        Ok((settings, revision))
+    }
+
+    fn write_lock(&self) -> anyhow::Result<SettingsFileLock> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -2315,7 +2375,7 @@ impl SettingsStore {
         let path = self.path.with_extension("json.lock");
         let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
         file.lock_exclusive().context("获取设置写锁失败")?;
-        Ok(file)
+        Ok(SettingsFileLock(file))
     }
 
     pub fn revision(&self) -> anyhow::Result<String> {
@@ -2450,6 +2510,7 @@ impl SettingsStore {
         // 完整表单不能擦除新版本或拓展写入的未知字段；profile 以稳定 ID 对齐。
         preserve_unknown_settings_fields(&mut next, &raw)?;
         next.remove("revision");
+        update_weixin_outbound_revision(&mut next, &raw);
         serialize_settings_bounded(&Value::Object(next))
     }
 
@@ -2561,6 +2622,7 @@ impl SettingsStore {
             );
         }
         raw.remove("revision");
+        update_weixin_outbound_revision(&mut raw, &original_raw);
         let bytes = serialize_settings_bounded(&Value::Object(raw))?;
         atomic_write(&self.path, &bytes)?;
         settings.settings_revision = settings_revision(Some(&bytes));
@@ -2630,6 +2692,34 @@ fn validate_settings_snapshot(bytes: &[u8]) -> anyhow::Result<()> {
         anyhow::bail!("settings 快照顶层不是 JSON 对象，原文件未修改");
     }
     Ok(())
+}
+
+fn update_weixin_outbound_revision(next: &mut Map<String, Value>, previous: &Map<String, Value>) {
+    let changed = [
+        "weixinConnectEnabled",
+        "weixinConnectAllowOutboundAttachments",
+        "weixinConnectAllowFrom",
+        "weixinConnectWorkDir",
+        "weixinConnectAccountId",
+        "weixinConnectToken",
+        "weixinConnectBaseUrl",
+        "weixinConnectRouteTag",
+    ].into_iter().any(|key| {
+        let default = match key {
+            "weixinConnectEnabled" | "weixinConnectAllowOutboundAttachments" => Value::Bool(false),
+            "weixinConnectBaseUrl" => Value::String(crate::connect::DEFAULT_WEIXIN_BASE_URL.to_string()),
+            _ => Value::String(String::new()),
+        };
+        previous.get(key).unwrap_or(&default) != next.get(key).unwrap_or(&default)
+    });
+    // 只记录授权变更；快速关闭再开启也不能恢复旧 permit，无关保存不影响在途附件。
+    next.remove("_settingsCommitId");
+    next.remove("_weixinOutboundRevision");
+    if changed {
+        next.insert("_weixinOutboundRevision".to_string(), Value::String(uuid::Uuid::new_v4().to_string()));
+    } else if let Some(revision) = previous.get("_weixinOutboundRevision") {
+        next.insert("_weixinOutboundRevision".to_string(), revision.clone());
+    }
 }
 
 fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<String, Value>) {
@@ -2793,6 +2883,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "codexAppSessionShare");
     merge_bool_setting(target, source, "codexAppUsageStatusLine");
     merge_bool_setting(target, source, "usageHistoryEnabled");
+    merge_bool_setting(target, source, "codexAppProxyRequestStatus");
     merge_bool_setting(target, source, "codexAppPasteFix");
     merge_bool_setting(target, source, "codexAppForceChineseLocale");
     if let Some(value @ ("off" | "rainbow" | "fireworks" | "stars")) =
@@ -3023,6 +3114,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
         target.insert("codexGoalsEnabled".to_string(), Value::Bool(value));
     }
     merge_bool_setting(target, source, "weixinConnectEnabled");
+    merge_bool_setting(target, source, "weixinConnectAllowOutboundAttachments");
     for key in [
         "weixinConnectBaseUrl",
         "weixinConnectToken",
@@ -3031,6 +3123,8 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
         "weixinConnectRouteTag",
         "weixinConnectWorkDir",
         "weixinConnectModel",
+        "weixinConnectReasoningEffort",
+        "weixinConnectProjectId",
         "weixinConnectSandbox",
         "weixinConnectCodexPath",
     ] {
@@ -3529,6 +3623,9 @@ fn normalize_settings_config_sections(mut settings: BackendSettings) -> BackendS
     settings.weixin_connect_route_tag = settings.weixin_connect_route_tag.trim().to_string();
     settings.weixin_connect_work_dir = settings.weixin_connect_work_dir.trim().to_string();
     settings.weixin_connect_model = settings.weixin_connect_model.trim().to_string();
+    settings.weixin_connect_reasoning_effort =
+        settings.weixin_connect_reasoning_effort.trim().to_string();
+    settings.weixin_connect_project_id = settings.weixin_connect_project_id.trim().to_string();
     settings.weixin_connect_sandbox = match settings.weixin_connect_sandbox.trim() {
         "workspace-write" => "workspace-write",
         "danger-full-access" => "danger-full-access",
@@ -3769,6 +3866,43 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn settings_weixin_outbound_revision_ignores_defaults_and_unrelated_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"{}").unwrap();
+        let store = SettingsStore::new(path);
+        store.save(&store.load().unwrap()).unwrap();
+        assert!(!store.load_raw_object().unwrap().contains_key("_weixinOutboundRevision"));
+        store.update(json!({"weixinConnectModel": "next-turn-model", "_weixinOutboundRevision": "untrusted"})).unwrap();
+        assert!(!store.load_raw_object().unwrap().contains_key("_weixinOutboundRevision"));
+        store.update(json!({"weixinConnectEnabled": true})).unwrap();
+        let revision = store.load_raw_object().unwrap()["_weixinOutboundRevision"].clone();
+        store.update(json!({"weixinConnectEnabled": true, "_weixinOutboundRevision": "untrusted"})).unwrap();
+        let mut settings = store.load().unwrap();
+        settings.weixin_connect_model = "another-next-turn-model".into();
+        store.save(&settings).unwrap();
+        assert_eq!(store.load_raw_object().unwrap()["_weixinOutboundRevision"], revision);
+        store.update(json!({"weixinConnectEnabled": false})).unwrap();
+        assert_ne!(store.load_raw_object().unwrap()["_weixinOutboundRevision"], revision);
+    }
+
+    #[test]
+    fn settings_committed_read_does_not_wait_for_a_cloned_write_lock_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(dir.path().join("settings.json"));
+        store.save(&store.load().unwrap()).unwrap();
+        let lock = store.write_lock().unwrap();
+        let inherited = lock.0.try_clone().unwrap();
+        assert!(store.try_load_committed().unwrap().is_none());
+        drop(lock);
+        assert!(
+            store.try_load_committed().unwrap().is_some(),
+            "a completed transaction kept its lock through a cloned handle"
+        );
+        drop(inherited);
+    }
+
     #[cfg(unix)]
     #[test]
     fn atomic_write_keeps_symlink_and_updates_its_target() {
@@ -3918,6 +4052,8 @@ mod tests {
             crate::connect::DEFAULT_WEIXIN_BASE_URL
         );
         assert!(settings.weixin_connect_token.is_empty());
+        assert!(settings.weixin_connect_reasoning_effort.is_empty());
+        assert!(settings.weixin_connect_project_id.is_empty());
         assert_eq!(settings.weixin_connect_sandbox, "read-only");
     }
 
@@ -5069,6 +5205,7 @@ experimental_bearer_token = "sk-existing""#
     fn settings_store_update_persists_weixin_connect_settings() {
         let dir = temp_dir();
         let store = SettingsStore::new(dir.join("settings.json"));
+        assert!(!store.load().unwrap().weixin_connect_allow_outbound_attachments);
 
         let updated = store
             .update(json!({
@@ -5077,15 +5214,19 @@ experimental_bearer_token = "sk-existing""#
                 "weixinConnectToken": " token ",
                 "weixinConnectAccountId": " bot-1 ",
                 "weixinConnectAllowFrom": " user@im.wechat ",
+                "weixinConnectAllowOutboundAttachments": true,
                 "weixinConnectRouteTag": " route ",
                 "weixinConnectWorkDir": " /workspace ",
                 "weixinConnectModel": " gpt-test ",
+                "weixinConnectReasoningEffort": " high ",
+                "weixinConnectProjectId": " project-1 ",
                 "weixinConnectSandbox": "workspace-write",
                 "weixinConnectCodexPath": " /usr/local/bin/codex "
             }))
             .unwrap();
 
         assert!(updated.weixin_connect_enabled);
+        assert!(updated.weixin_connect_allow_outbound_attachments);
         assert_eq!(
             updated.weixin_connect_base_url,
             "https://ilink.example.test"
@@ -5096,9 +5237,54 @@ experimental_bearer_token = "sk-existing""#
         assert_eq!(updated.weixin_connect_route_tag, "route");
         assert_eq!(updated.weixin_connect_work_dir, "/workspace");
         assert_eq!(updated.weixin_connect_model, "gpt-test");
+        assert_eq!(updated.weixin_connect_reasoning_effort, "high");
+        assert_eq!(updated.weixin_connect_project_id, "project-1");
         assert_eq!(updated.weixin_connect_sandbox, "workspace-write");
         assert_eq!(updated.weixin_connect_codex_path, "/usr/local/bin/codex");
         assert_eq!(store.load().unwrap(), updated);
+        let disabled = store.update(json!({ "weixinConnectAllowOutboundAttachments": false })).unwrap();
+        assert!(!disabled.weixin_connect_allow_outbound_attachments);
+        assert!(!store.load().unwrap().weixin_connect_allow_outbound_attachments);
+    }
+
+    #[test]
+    fn settings_store_weixin_connect_options_preserve_values_until_explicitly_cleared() {
+        let legacy: BackendSettings = serde_json::from_str("{}").unwrap();
+        assert!(legacy.weixin_connect_reasoning_effort.is_empty());
+        assert!(legacy.weixin_connect_project_id.is_empty());
+
+        let dir = temp_dir();
+        let store = SettingsStore::new(dir.join("settings.json"));
+        let mut settings = BackendSettings::default();
+        // 目录可随供应商和项目变化；保留失效值交给 UI 提示，不能静默重置。
+        settings.weixin_connect_reasoning_effort = " future-effort ".to_string();
+        settings.weixin_connect_project_id = " deleted-project ".to_string();
+        store.save(&settings).unwrap();
+        let saved = store.load().unwrap();
+        assert_eq!(saved.weixin_connect_reasoning_effort, "future-effort");
+        assert_eq!(saved.weixin_connect_project_id, "deleted-project");
+
+        let updated = store.update(json!({"weixinConnectModel": "new-model"})).unwrap();
+        assert_eq!(updated.weixin_connect_reasoning_effort, "future-effort");
+        assert_eq!(updated.weixin_connect_project_id, "deleted-project");
+        let updated = store
+            .update(json!({
+                "weixinConnectReasoningEffort": null,
+                "weixinConnectProjectId": 42
+            }))
+            .unwrap();
+        assert_eq!(updated.weixin_connect_reasoning_effort, "future-effort");
+        assert_eq!(updated.weixin_connect_project_id, "deleted-project");
+
+        let cleared = store
+            .update(json!({
+                "weixinConnectReasoningEffort": " ",
+                "weixinConnectProjectId": ""
+            }))
+            .unwrap();
+        assert!(cleared.weixin_connect_reasoning_effort.is_empty());
+        assert!(cleared.weixin_connect_project_id.is_empty());
+        assert_eq!(store.load().unwrap(), cleared);
     }
 
     /// #2028 存量迁移：系统保护目录（WindowsApps）里的 CLI 无法被第三方进程执行，

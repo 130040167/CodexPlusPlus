@@ -2036,3 +2036,6 @@ fn opened_file_identity(file: &File, meta: &Metadata) -> std::io::Result<Option<
         Ok(file_identity(meta))
     }
 }
+
+#[cfg(test)]
+mod tests;
