@@ -31,6 +31,11 @@
       "lines": 67
     },
     {
+      "name": "32-fork-readiness-fallback.js",
+      "description": "无账号时原生 Fork 放置门控读不到的兜底（#2826）",
+      "lines": 77
+    },
+    {
       "name": "40-backend-settings.js",
       "description": "后端设置读写、心跳同步、按清单生成的设置页、用户脚本与市场状态、拓展 UI",
       "lines": 2165
@@ -173,7 +178,7 @@
     {
       "name": "99-startup.js",
       "description": "启动序列：resize 处理、MutationObserver 与事件绑定",
-      "lines": 100
+      "lines": 101
     },
     {
       "name": "99-tail.js",
