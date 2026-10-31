@@ -11,6 +11,165 @@ const KEY: &str = "000102030405060708090a0b0c0d0e0f";
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\nweixin-test-image";
 
 #[tokio::test]
+async fn outbound_encrypts_snapshot_and_preserves_protocol_lengths_and_recipient() {
+    use crate::connect::outbound::OutboundPolicy;
+    let workspace = tempfile::tempdir().unwrap();
+    let policy = OutboundPolicy::new(true, "peer", workspace.path().to_str().unwrap());
+    let permit = policy.permit("peer").unwrap();
+    for (index, (kind, bytes)) in [
+        (AttachmentKind::Image, PNG),
+        (AttachmentKind::File, b"".as_slice()),
+        (AttachmentKind::File, b"0123456789abcdef".as_slice()),
+        (AttachmentKind::File, "{\"result\":\"测试\"}".as_bytes()),
+        (AttachmentKind::File, b"PK\x03\x04\0\x01\xff".as_slice()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let server = MockServer::start().await;
+        let upload_response = if index % 2 == 0 {
+            json!({"upload_full_url":format!("{}/cdn/upload", server.uri())})
+        } else {
+            json!({"upload_param":"upload-secret"})
+        };
+        Mock::given(path("/ilink/bot/getuploadurl"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upload_response))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/cdn/upload"))
+            .respond_with(
+                ResponseTemplate::new(200).insert_header("x-encrypted-param", "download-secret"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ret":0})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let filename = format!("结果-{index}.bin");
+        std::fs::write(workspace.path().join(&filename), bytes).unwrap();
+        client(&server)
+            .send_workspace_attachment(
+                "peer",
+                Path::new(&filename),
+                kind,
+                "context-secret",
+                &permit,
+            )
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        let request: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(request["to_user_id"], "peer");
+        assert_eq!(request["rawsize"], bytes.len());
+        assert_eq!(request["rawfilemd5"], hex(&Md5::digest(bytes)));
+        assert_eq!(request["filesize"], (bytes.len() / 16 + 1) * 16);
+        assert_eq!(
+            request["media_type"],
+            if kind == AttachmentKind::Image { 1 } else { 3 }
+        );
+        let key = request["aeskey"].as_str().unwrap();
+        assert_eq!(
+            decrypt(&requests[1].body, &parse_hex_key(key).unwrap()).unwrap(),
+            bytes
+        );
+        assert_eq!(requests[1].method, "POST");
+        for name in [
+            "authorization",
+            "authorizationtype",
+            "x-wechat-uin",
+            "x-wechat-route-tag",
+            "cookie",
+        ] {
+            assert!(!requests[1].headers.contains_key(name), "CDN leaked {name}");
+        }
+        assert_eq!(
+            requests[1].headers["content-type"],
+            "application/octet-stream"
+        );
+        let message: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+        assert_eq!(message["msg"]["to_user_id"], "peer");
+        assert_eq!(message["msg"]["context_token"], "context-secret");
+        let item = &message["msg"]["item_list"][0];
+        let payload = if kind == AttachmentKind::Image {
+            &item["image_item"]
+        } else {
+            &item["file_item"]
+        };
+        assert_eq!(payload["media"]["aes_key"], STANDARD.encode(key));
+        assert_eq!(payload["media"]["encrypt_query_param"], "download-secret");
+        if kind == AttachmentKind::File {
+            assert_eq!(item["type"], 4);
+            assert_eq!(payload["file_name"], filename);
+            assert_eq!(payload["len"], bytes.len().to_string());
+        } else {
+            assert_eq!(item["type"], 2);
+            assert_eq!(payload["mid_size"], requests[1].body.len());
+        }
+    }
+}
+
+#[tokio::test]
+async fn outbound_rejects_upload_failures_and_untrusted_urls_without_sending_or_leaking_keys() {
+    use crate::connect::outbound::OutboundPolicy;
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("result.txt"), b"result").unwrap();
+    let policy = OutboundPolicy::new(true, "peer", workspace.path().to_str().unwrap());
+    let permit = policy.permit("peer").unwrap();
+    for (response, cdn_status, header, expected_uploads) in [
+        (json!({"ret":-1,"errmsg":"token=secret"}), 200, true, 0),
+        (
+            json!({"upload_full_url":"https://evil.test/?token=secret"}),
+            200,
+            true,
+            0,
+        ),
+        (json!({"upload_param":"token=secret"}), 302, true, 1),
+        (json!({"upload_param":"token=secret"}), 200, false, 1),
+        (json!({}), 200, true, 0),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(path("/ilink/bot/getuploadurl"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut template = ResponseTemplate::new(cdn_status)
+            .insert_header("location", "https://evil.test/?token=secret");
+        if header {
+            template = template.insert_header("x-encrypted-param", "token=secret");
+        }
+        Mock::given(path("/cdn/upload"))
+            .respond_with(template)
+            .expect(expected_uploads)
+            .mount(&server)
+            .await;
+        Mock::given(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let error = client(&server)
+            .send_workspace_attachment(
+                "peer",
+                Path::new("result.txt"),
+                AttachmentKind::File,
+                "context",
+                &permit,
+            )
+            .await
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(!error.contains("secret"), "{error}");
+        assert!(!error.contains("evil.test"), "{error}");
+    }
+}
+
+#[tokio::test]
 async fn saved_attachment_is_immediately_readable_by_std_fs() {
     let root = tempfile::tempdir().unwrap();
     let dir = Inbox::create(root.path()).unwrap();
@@ -20,6 +179,86 @@ async fn saved_attachment_is_immediately_readable_by_std_fs() {
             assert_eq!(std::fs::read(path).unwrap(), bytes);
         }
     }
+}
+
+#[tokio::test]
+async fn outbound_revocation_between_http_stages_stops_remaining_requests() {
+    use crate::connect::outbound::OutboundPolicy;
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("result.txt"), b"result").unwrap();
+    for revoke_at_upload in [false, true] {
+        let policy = OutboundPolicy::new(true, "peer", workspace.path().to_str().unwrap());
+        let permit = policy.permit("peer").unwrap();
+        let server = MockServer::start().await;
+        let at_api = policy.clone();
+        Mock::given(path("/ilink/bot/getuploadurl"))
+            .respond_with(move |_: &wiremock::Request| {
+                if !revoke_at_upload {
+                    at_api.set(false, "", "");
+                }
+                ResponseTemplate::new(200).set_body_json(json!({"upload_param":"upload"}))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let at_cdn = policy.clone();
+        Mock::given(path("/cdn/upload"))
+            .respond_with(move |_: &wiremock::Request| {
+                at_cdn.set(false, "", "");
+                ResponseTemplate::new(200).insert_header("x-encrypted-param", "download")
+            })
+            .expect(if revoke_at_upload { 1 } else { 0 })
+            .mount(&server)
+            .await;
+        Mock::given(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let error = client(&server)
+            .send_workspace_attachment(
+                "peer",
+                Path::new("result.txt"),
+                AttachmentKind::File,
+                "context",
+                &permit,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("权限已改变"));
+        assert!(permit.check().is_err());
+    }
+}
+
+#[tokio::test]
+async fn outbound_invalid_binding_and_files_make_no_http_requests() {
+    use crate::connect::outbound::OutboundPolicy;
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("result.txt"), b"result").unwrap();
+    std::fs::write(workspace.path().join("auth.json"), b"credential").unwrap();
+    let policy = OutboundPolicy::new(true, "peer,other", workspace.path().to_str().unwrap());
+    let permit = policy.permit("peer").unwrap();
+    let server = MockServer::start().await;
+    for (peer, path, context) in [
+        ("other", "result.txt", "context"),
+        ("peer", "result.txt", ""),
+        ("peer", "auth.json", "context"),
+        ("peer", "missing", "context"),
+    ] {
+        assert!(
+            client(&server)
+                .send_workspace_attachment(
+                    peer,
+                    Path::new(path),
+                    AttachmentKind::File,
+                    context,
+                    &permit
+                )
+                .await
+                .is_err()
+        );
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 fn client(server: &MockServer) -> WeixinClient {

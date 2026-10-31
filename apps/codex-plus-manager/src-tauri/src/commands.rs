@@ -320,6 +320,7 @@ struct WeixinQrSession {
 struct WeixinRuntime {
     stop: Arc<AtomicBool>,
     codex_path: codex_plus_core::connect::WeixinCodexPath,
+    outbound: codex_plus_core::connect::outbound::OutboundPolicy,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3473,10 +3474,12 @@ pub fn weixin_connect_stop() -> CommandResult<codex_plus_core::connect::WeixinCo
     let stopping = weixin_runtime()
         .lock()
         .ok()
-        .and_then(|runtime| runtime.as_ref().map(|runtime| Arc::clone(&runtime.stop)))
-        .map(|stop| {
-            stop.store(true, Ordering::SeqCst);
-            true
+        .and_then(|runtime| {
+            runtime.as_ref().map(|runtime| {
+                runtime.stop.store(true, Ordering::SeqCst);
+                runtime.outbound.set(false, "", "");
+                true
+            })
         })
         .unwrap_or(false);
     let store = SettingsStore::default();
@@ -3640,6 +3643,7 @@ fn spawn_weixin_connect(
         token: settings.weixin_connect_token,
         account_id: settings.weixin_connect_account_id,
         allow_from: settings.weixin_connect_allow_from,
+        allow_outbound_attachments: settings.weixin_connect_allow_outbound_attachments,
         route_tag: settings.weixin_connect_route_tag,
         work_dir: settings.weixin_connect_work_dir,
         model: settings.weixin_connect_model,
@@ -3658,9 +3662,11 @@ fn spawn_weixin_connect(
         anyhow::bail!("微信连接已在运行或正在停止");
     }
     let codex_path = codex_plus_core::connect::WeixinCodexPath::new(&config.codex_path);
+    let outbound = SettingsStore::default().weixin_outbound_policy(&config, Arc::clone(&stop))?;
     *runtime = Some(WeixinRuntime {
         stop: Arc::clone(&stop),
         codex_path: codex_path.clone(),
+        outbound: outbound.clone(),
     });
     drop(runtime);
     let status = weixin_status();
@@ -3673,11 +3679,12 @@ fn spawn_weixin_connect(
     let task_status = Arc::clone(&status);
     let task_stop = Arc::clone(&stop);
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = codex_plus_core::connect::run_weixin_connect_with_codex_path(
+        if let Err(error) = codex_plus_core::connect::run_weixin_connect_with_outbound(
             config,
             stop,
             Arc::clone(&task_status),
             codex_path,
+            outbound,
         )
         .await
             && let Ok(mut current) = task_status.lock()
@@ -3838,6 +3845,19 @@ pub fn save_settings(
     };
     let store = SettingsStore::default();
     let previous = store.load().unwrap_or_default();
+    if let Err(error) = codex_plus_core::connect::outbound::validate_settings_change(&previous, &settings) {
+        return failed(
+            &error.to_string(),
+            SettingsPayload {
+                revision: settings.settings_revision.clone(),
+                settings,
+                settings_path: codex_plus_core::paths::default_settings_path()
+                    .to_string_lossy()
+                    .to_string(),
+                user_scripts: user_script_inventory(),
+            },
+        );
+    }
     let dream_skin_enabled = settings.enhancements_enabled && settings.codex_app_dream_skin_enabled;
     if let Err(error) = codex_plus_core::dream_skin::sync_default_dream_skin_base_theme(
         dream_skin_enabled,

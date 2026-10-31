@@ -14,7 +14,7 @@ import { MCP_AGENTS, type McpAgentId } from "./agent-mcp-model";
 import "./ManagementPages.css";
 import { parseSkillRepository } from "./skill-repository";
 import { SkillListViewport } from "./SkillListViewport";
-import { customSkillGroupKey, defaultSkillGroupKey, groupSkills, moveSkillGroup, nextSkillGroupSortDirection, sortSkillGroupKeys, sortSkillGroupsByName, type SkillGroup, type SkillGroupSortDirection } from "./skill-groups";
+import { customSkillGroupKey, defaultSkillGroupKey, groupSkills, legacySkillCustomGroupName, moveSkillGroup, nextSkillGroupSortDirection, readSkillGroupStorage, skillGroupAssignment, skillIdentityKey, sortSkillGroupKeys, sortSkillGroupsByName, type SkillGroup, type SkillGroupSortDirection } from "./skill-groups";
 import { mergeSkillAgentResult, skillAgents, skillBatchHasPending, skillBatchState, skillBatchTargets, type SkillBatchOperation } from "./skill-agent-batch";
 import { checkRepositories, SkillTaskQueue } from "./skill-task-queue";
 import { usePopoverLayer } from "./use-popover-layer";
@@ -348,39 +348,17 @@ export function SkillsPage({ notify }: { notify: Notify }) {
   const dataRequest = useRef(0);
   const checkGeneration = useRef(0);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
-  const [customGroupNames, setCustomGroupNames] = useState<string[]>(() => {
-    try {
-      const raw = JSON.parse(localStorage.getItem(SKILL_GROUP_STORAGE_KEY) || "{}");
-      return Array.isArray(raw.names) ? raw.names.filter((name: unknown): name is string => typeof name === "string" && name.trim().length > 0) : [];
-    } catch { return []; }
-  });
-  const [customGroupAssignments, setCustomGroupAssignments] = useState<Record<string, string>>(() => {
-    try {
-      const raw = JSON.parse(localStorage.getItem(SKILL_GROUP_STORAGE_KEY) || "{}");
-      return raw.assignments && typeof raw.assignments === "object" ? raw.assignments : {};
-    } catch { return {}; }
-  });
-  const [groupOrder, setGroupOrder] = useState<string[]>(() => {
-    try {
-      const raw = JSON.parse(localStorage.getItem(SKILL_GROUP_STORAGE_KEY) || "{}");
-      return Array.isArray(raw.order) ? raw.order.filter((key: unknown): key is string => typeof key === "string") : [];
-    } catch { return []; }
-  });
-  const [groupSortDirection, setGroupSortDirection] = useState<SkillGroupSortDirection | null>(() => {
-    try {
-      const raw = JSON.parse(localStorage.getItem(SKILL_GROUP_STORAGE_KEY) || "{}");
-      return raw.sortDirection === "asc" || raw.sortDirection === "desc" ? raw.sortDirection : null;
-    } catch { return null; }
-  });
-  const [groupAliases, setGroupAliases] = useState<Record<string, string>>(() => {
-    try {
-      const raw = JSON.parse(localStorage.getItem(SKILL_GROUP_STORAGE_KEY) || "{}");
-      return raw.aliases && typeof raw.aliases === "object" ? raw.aliases : {};
-    } catch { return {}; }
-  });
+  const [storedGroups] = useState(() => readSkillGroupStorage(localStorage.getItem(SKILL_GROUP_STORAGE_KEY)));
+  const [customGroupNames, setCustomGroupNames] = useState<string[]>(storedGroups.names);
+  const [customGroupAssignments, setCustomGroupAssignments] = useState<Record<string, string>>(storedGroups.assignments);
+  const [assignmentsByIdentity, setAssignmentsByIdentity] = useState<Record<string, string>>(storedGroups.assignmentsByIdentity);
+  const [groupOrder, setGroupOrder] = useState<string[]>(storedGroups.order);
+  const [groupSortDirection, setGroupSortDirection] = useState<SkillGroupSortDirection | null>(storedGroups.sortDirection);
+  const [groupAliases, setGroupAliases] = useState<Record<string, string>>(storedGroups.aliases);
   useEffect(() => {
-    localStorage.setItem(SKILL_GROUP_STORAGE_KEY, JSON.stringify({ names: customGroupNames, assignments: customGroupAssignments, order: groupOrder, aliases: groupAliases, sortDirection: groupSortDirection }));
-  }, [customGroupNames, customGroupAssignments, groupOrder, groupAliases, groupSortDirection]);
+    const stored = readSkillGroupStorage(localStorage.getItem(SKILL_GROUP_STORAGE_KEY));
+    localStorage.setItem(SKILL_GROUP_STORAGE_KEY, JSON.stringify({ ...stored, names: customGroupNames, assignments: customGroupAssignments, assignmentsByIdentity, order: groupOrder, aliases: groupAliases, sortDirection: groupSortDirection }));
+  }, [customGroupNames, customGroupAssignments, assignmentsByIdentity, groupOrder, groupAliases, groupSortDirection]);
   const groupSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
@@ -577,18 +555,22 @@ export function SkillsPage({ notify }: { notify: Notify }) {
     .filter((s) => (tab === "installed" ? s.installed : !s.installed || s.bundled))
     .filter((s) => matchesManagementQuery([s.id, s.name, s.description, s.repoKey, s.repoPath || "", sourceLabel(s)], deferredQuery)), [data, tab, deferredQuery]);
   const knownSkills = useMemo(() => (data?.skills || []).filter((skill) => skill.installed), [data]);
+  const knownRepositories = useMemo(() => data?.repos || [], [data]);
+  const builtinGroupLabel = t("内置");
+  const userGroupLabel = t("用户");
+  const localGroupLabel = t("本地导入");
   const allGroups = useMemo(() => {
     const result = groupSkills(knownSkills, knownSkills, customGroupNames, customGroupAssignments, groupOrder,
-      { builtin: t("内置"), user: t("用户") }, true, groupAliases);
+      { builtin: builtinGroupLabel, user: userGroupLabel, source: sourceLabel }, true, groupAliases, assignmentsByIdentity, knownRepositories);
     return groupSortDirection ? sortSkillGroupsByName(result, groupSortDirection) : result;
-  }, [knownSkills, customGroupNames, customGroupAssignments, groupOrder, groupAliases, groupSortDirection]);
+  }, [knownSkills, knownRepositories, customGroupNames, customGroupAssignments, assignmentsByIdentity, groupOrder, groupAliases, groupSortDirection, builtinGroupLabel, userGroupLabel, localGroupLabel]);
   const groupsByKey = useMemo(() => new Map(allGroups.map((group) => [group.key, group])), [allGroups]);
-  const groupsBySkillId = useMemo(() => new Map(allGroups.flatMap((group) => group.items.map((skill) => [skill.id, group] as const))), [allGroups]);
+  const groupsBySkillIdentity = useMemo(() => new Map(allGroups.flatMap((group) => group.items.map((skill) => [skillIdentityKey(skill), group] as const))), [allGroups]);
   const groups = useMemo(() => {
     const result = groupSkills(items, knownSkills, customGroupNames, customGroupAssignments, groupOrder,
-      { builtin: t("内置"), user: t("用户") }, tab === "installed", groupAliases);
+      { builtin: builtinGroupLabel, user: userGroupLabel, source: sourceLabel }, !query.trim(), groupAliases, assignmentsByIdentity, knownRepositories);
     return groupSortDirection ? sortSkillGroupsByName(result, groupSortDirection) : result;
-  }, [items, knownSkills, customGroupNames, customGroupAssignments, groupOrder, tab, groupAliases, groupSortDirection]);
+  }, [items, knownSkills, knownRepositories, customGroupNames, customGroupAssignments, assignmentsByIdentity, groupOrder, tab, groupAliases, groupSortDirection, builtinGroupLabel, userGroupLabel, localGroupLabel, query]);
   const openUrl = async (url: string) => {
     try { await invoke("open_external_url", { url }); }
     catch (e) { await notify("Skills", String(e), "failed"); }
@@ -615,29 +597,38 @@ export function SkillsPage({ notify }: { notify: Notify }) {
     const oldName = group.key.slice(7);
     const nextKey = customSkillGroupKey(normalized);
     setCustomGroupNames((old) => old.map((item) => item === oldName ? normalized : item));
-    setCustomGroupAssignments((old) => Object.fromEntries(Object.entries(old).map(([id, value]) => [id, value === oldName || value === group.key ? nextKey : value])));
+    setCustomGroupAssignments((old) => Object.fromEntries(Object.entries(old).map(([id, group]) => {
+      const name = legacySkillCustomGroupName(group, customGroupNames);
+      return [id, name === oldName ? normalized : name ?? group];
+    })));
+    setAssignmentsByIdentity((old) => Object.fromEntries(Object.entries(old).map(([key, group]) => [key,
+      group === customSkillGroupKey(oldName) ? nextKey : group])));
     setGroupOrder((old) => old.map((key) => key === group.key ? nextKey : key));
+    setExpandedGroups((old) => {
+      const next = new Set(old);
+      if (next.delete(group.key)) next.add(nextKey);
+      return next;
+    });
   };
   const deleteCustomGroup = async (name: string) => {
     if (!(await appConfirm(tf("删除分组“{0}”？其中的 Skill 将回到来源分组。", [name]), { title: t("删除分组"), confirmText: t("删除"), danger: true }))) return;
     setCustomGroupNames((old) => old.filter((item) => item !== name));
-    setCustomGroupAssignments((old) => Object.fromEntries(Object.entries(old).filter(([, group]) => group !== name && group !== customSkillGroupKey(name))));
+    setCustomGroupAssignments((old) => Object.fromEntries(Object.entries(old).filter(([, group]) =>
+      legacySkillCustomGroupName(group, customGroupNames) !== name)));
+    setAssignmentsByIdentity((old) => Object.fromEntries(Object.entries(old).map(([key, group]) => [key,
+      group === customSkillGroupKey(name) ? "" : group])));
     setGroupOrder((old) => old.filter((key) => key !== customSkillGroupKey(name)));
   };
-  const assignSkillGroup = (skillId: string, group: string) => {
+  const assignSkillGroup = (skill: Skill, group: string) => {
     setGroupOrder(allGroups.filter((item) => item.kind === "repo" || item.kind === "custom").map((item) => item.key));
-    setCustomGroupAssignments((old) => {
-      const next = { ...old };
-      if (group) next[skillId] = group;
-      else delete next[skillId];
-      return next;
-    });
+    setAssignmentsByIdentity((old) => ({ ...old, [skillIdentityKey(skill)]: group }));
   };
   const handleGroupDragEnd = ({ active, over }: DragEndEvent) => {
-    if (over && active.id !== over.id && allGroups.some((group) => group.key === over.id && (group.kind === "repo" || group.kind === "custom"))) {
-      setGroupOrder(moveSkillGroup(allGroups, String(active.id), String(over.id)));
-      setGroupSortDirection(null);
-    }
+    if (!over || active.id === over.id || query.trim() || busy || loading || tab !== "installed") return;
+    const movable = new Set(groups.filter((group) => group.kind === "repo" || group.kind === "custom").map((group) => group.key));
+    if (!movable.has(String(active.id)) || !movable.has(String(over.id))) return;
+    setGroupOrder(moveSkillGroup(allGroups, String(active.id), String(over.id)));
+    setGroupSortDirection(null);
   };
   const agentCount = (agent: McpAgentId) => (data?.skills || []).filter((s) => s.installed && skillAgents(s).includes(agent)).length;
   // 与 MCP 页同一张表：名称 | 来源 | 每个 Agent 一列勾选 | 操作。分组、详情、卸载收进行末的「更多」菜单。
@@ -645,7 +636,8 @@ export function SkillsPage({ notify }: { notify: Notify }) {
     // 只卸载 Codex++ 管理的或 Codex 目录里的；Claude / Grok 自己目录里的 Skill 不动。
     const canUninstall = s.installed && !s.bundled && (s.managed || skillAgents(s).includes("codex") || s.agents === undefined);
     const task = updateTasks.find((item) => item.key === `${s.repoKey}\0${s.id}` && (item.state === "queued" || item.state === "running"));
-    return <div className="mg-matrix-row" key={s.repoKey + ":" + s.id}>
+    const assignment = skillGroupAssignment(s, customGroupNames, customGroupAssignments, assignmentsByIdentity);
+    return <div className="mg-matrix-row" key={skillIdentityKey(s)}>
       <button type="button" className="mg-row-main" onClick={() => setDetail(s)}>
         <div><strong title={s.name || s.id}>{s.name || s.id}</strong>{s.updateAvailable ? <span className="mg-badge">{t("可更新")}</span> : null}{s.codexConflict ? <span className="mg-badge mg-skill-conflict-badge">{t("版本不一致")}</span> : null}</div>
         <small title={[s.repoPath, s.description].filter(Boolean).join(" · ")}>{[s.repoPath, s.description].filter(Boolean).join(" · ") || t("暂无描述")}</small>
@@ -663,9 +655,9 @@ export function SkillsPage({ notify }: { notify: Notify }) {
         {s.codexConflict ? <button type="button" className="mg-icon-button mg-skill-conflict-action" title={t("处理版本不一致")} aria-label={`${t("处理版本不一致")} ${s.name || s.id}`} onClick={() => setConflict(s)}><AlertTriangle size={16}/></button> : null}
         {!s.installed && !s.bundled ? <Button primary onClick={() => void run("install_skill", { repoKey: s.repoKey, id: s.id, expectedRepoPath: s.repoPath ?? null })} disabled={busy}>{t("安装")}</Button> : null}
         {s.installed && (s.updateAvailable || task) ? <Button onClick={() => enqueueUpdate(s)} disabled={!!task}>{task?.state === "queued" ? t("排队中") : task?.state === "running" ? t("更新中") : t("更新")}</Button> : null}
-        <SkillActionMenu skill={s} groups={allGroups} group={groupsBySkillId.get(s.id)}
-          originGroup={groupsByKey.get(defaultSkillGroupKey(s))} assignment={customGroupAssignments[s.id]} busy={busy} canUninstall={canUninstall}
-          onDetail={() => setDetail(s)} onAssign={(group) => assignSkillGroup(s.id, group)} onUninstall={() => void run("uninstall_skill", { id: s.id })}/>
+        <SkillActionMenu skill={s} groups={allGroups} group={groupsBySkillIdentity.get(skillIdentityKey(s))}
+          originGroup={groupsByKey.get(defaultSkillGroupKey(s))} assignment={assignment} busy={busy} canUninstall={canUninstall}
+          onDetail={() => setDetail(s)} onAssign={(group) => assignSkillGroup(s, group)} onUninstall={() => void run("uninstall_skill", { id: s.id })}/>
       </div>
     </div>;
   };
@@ -713,7 +705,7 @@ export function SkillsPage({ notify }: { notify: Notify }) {
           const updates = updateItems.length;
           const hasUnqueuedUpdate = updateItems.some((skill) => !updateTasks.some((task) =>
             task.key === `${skill.repoKey}\0${skill.id}` && (task.state === "queued" || task.state === "running")));
-          return <SortableSkillGroup group={group} key={group.key} disabled={!movable || tab !== "installed" || !!query.trim()}>{(handle) => <>
+          return <SortableSkillGroup group={group} key={group.key} disabled={!movable || tab !== "installed" || !!query.trim() || busy || loading}>{(handle) => <>
             <div className="mg-skill-group-row">
               <div className="mg-skill-group-name">{handle}<button type="button" className="mg-group-head" aria-expanded={!collapsed} onClick={() => setExpandedGroups((old) => { const next = new Set(old); next.has(group.key) ? next.delete(group.key) : next.add(group.key); return next; })}>
                 <ChevronDown size={15} className={collapsed ? "mg-chevron-collapsed" : ""}/><strong title={group.label}>{group.label}</strong><small>{updates ? `${updates} ${t("可更新")} · ` : ""}{groupItems.length} {t("个 Skill")}</small>
@@ -739,8 +731,8 @@ export function SkillsPage({ notify }: { notify: Notify }) {
     </div>
     {repoOpen && <SkillRepoDrawer repos={data?.repos || []} pendingRepos={data?.pendingImportedRepos || []} catalog={data?.repositorySkills || []} counts={data?.repoCounts || {}} checks={repoChecks} initialKey={repoSelection} busy={busy} onClose={() => setRepoOpen(false)} onSave={saveRepo} onDelete={(r) => void deleteRepo(r)} onInspect={inspectRepo} onOpenUrl={(url) => void openUrl(url)} onOpenSkill={setDetail} onRun={(cmd, args) => void run(cmd, args)} />}
     {detail && <SkillDetailDrawer skill={detail} count={data?.repoCounts?.[detail.repoKey]} groups={allGroups}
-      group={groupsBySkillId.get(detail.id)} originGroup={groupsByKey.get(defaultSkillGroupKey(detail))}
-      onAssign={(group) => assignSkillGroup(detail.id, group)} onClose={() => setDetail(null)} onOpenUrl={(url) => void openUrl(url)}
+      group={groupsBySkillIdentity.get(skillIdentityKey(detail))} originGroup={groupsByKey.get(defaultSkillGroupKey(detail))}
+      onAssign={(group) => assignSkillGroup(detail, group)} onClose={() => setDetail(null)} onOpenUrl={(url) => void openUrl(url)}
       onOpenRepo={() => repoOpen ? setDetail(null) : openRepo(detail.repoKey)}
       onEditSource={() => setMatchRequest({ id: detail.id, initialManual: true })} onMatch={() => setMatchRequest({ id: detail.id })}/>}
     {matchRequest && <SkillRepositoryMatchDrawer repos={data?.repos || []} id={matchRequest.id} initialManual={matchRequest.initialManual} onClose={() => setMatchRequest(null)} notify={notify}

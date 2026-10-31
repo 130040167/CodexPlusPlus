@@ -313,7 +313,7 @@
 .mg-skill-matrix .mg-skill-batch-cell input:disabled { cursor:not-allowed; opacity:.45; }
 .mg-skill-matrix .mg-cell:disabled { cursor:not-allowed; }
 .mg-skill-matrix .mg-cell:disabled > span[data-on="true"] { background:hsl(var(--muted-foreground) / .42); border-color:transparent; box-shadow:none; }
-.mg-skill-matrix .mg-skill-group-row .mg-row-actions { display:flex; gap:4px; }
+.mg-skill-matrix .mg-skill-group-row .mg-row-actions { display:flex; flex:none; gap:4px; }
 .mg-skill-matrix .mg-skill-group-row .mg-button { height:24px; padding:0 8px; font-size:12px; }
 .mg-skill-matrix .mg-skill-drag, .mg-skill-matrix .mg-skill-drag-placeholder { flex:none; width:24px; height:24px; }
 .mg-skill-matrix .mg-skill-drag { cursor:grab; touch-action:none; color:hsl(var(--muted-foreground)); }

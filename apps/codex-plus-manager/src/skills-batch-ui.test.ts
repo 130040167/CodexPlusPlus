@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
-import { customSkillGroupKey, defaultSkillGroupKey, groupSkills, moveSkillGroup, nextSkillGroupSortDirection, sortSkillGroupKeys, sortSkillGroupsByName } from "./skill-groups.ts";
+import { customSkillGroupKey, defaultSkillGroupKey, groupSkills, legacySkillCustomGroupName, moveSkillGroup, nextSkillGroupSortDirection, readSkillGroupStorage, skillGroupAssignment, skillIdentityKey, sortSkillGroupKeys, sortSkillGroupsByName } from "./skill-groups.ts";
 import { mergeSkillAgentResult, skillAgents, skillBatchHasPending, skillBatchState, skillBatchTargets } from "./skill-agent-batch.ts";
 import { SkillTaskQueue } from "./skill-task-queue.ts";
 
@@ -90,12 +90,12 @@ function createHarness(saved = "{}") {
     window: { addEventListener: () => {}, removeEventListener: () => {} },
     invoke, ok: (result: { status: string }) => result.status === "ok", SKILL_GROUP_STORAGE_KEY: "codex-plus-plus.skill-groups.v1",
     t: (value: string) => value, tf: (value: string, args: any[]) => value.replace(/\{(\d+)\}/g, (_, index) => String(args[Number(index)])),
-    groupSkills, moveSkillGroup, nextSkillGroupSortDirection, sortSkillGroupKeys, sortSkillGroupsByName, customSkillGroupKey, defaultSkillGroupKey,
+    groupSkills, legacySkillCustomGroupName, moveSkillGroup, nextSkillGroupSortDirection, readSkillGroupStorage, skillGroupAssignment, skillIdentityKey, sortSkillGroupKeys, sortSkillGroupsByName, customSkillGroupKey, defaultSkillGroupKey,
     mergeSkillAgentResult, skillAgents, skillBatchHasPending, skillBatchState, skillBatchTargets,
     matchesManagementQuery: (values: string[], query: string) => !query || values.some((value) => value?.toLowerCase().includes(query.toLowerCase())),
     repoKey: (repo: any) => `${repo.owner}/${repo.name}@${repo.branch}${repo.subdir ? `:${repo.subdir}` : ""}`,
     repoFromKey: () => null,
-    repoUrl: () => "", sourceLabel: (item: FixtureSkill) => item.repoKey, importChannel: () => "",
+    repoUrl: () => "", sourceLabel: (item: FixtureSkill) => item.repoKey.split("@", 1)[0], importChannel: () => "",
     MCP_AGENTS: ["codex", "claude", "grok"], skillUpdateQueue: updateQueue,
     checkRepositories: async () => {}, openDialog: async () => null, appConfirm: async () => true, appPrompt: async () => null,
   };
@@ -152,7 +152,7 @@ test("discover installs the selected repository path with its distinct local ide
   ui.find((node) => node.type === "SearchField").props.onChange("z/alpha");
   ui.render();
   const candidateRow = ui.find((node) => node.props.className === "mg-matrix-row");
-  assert.equal(candidateRow.props.key, "a/repo@main:cpx-skill-alias");
+  assert.equal(candidateRow.props.key, skillIdentityKey(candidate));
   assert.equal(candidateRow.children[0].children[1].props.title, "z/alpha");
   ui.find((node) => node.type === "Button" && node.children.includes("安装")).props.onClick();
   await tick();
@@ -166,7 +166,7 @@ test("discover installs the selected repository path with its distinct local ide
   ui.find((node) => node.type === "button" && node.children.includes("已安装")).props.onClick();
   ui.render();
   const installedRow = ui.find((node) => node.props.className === "mg-matrix-row");
-  assert.equal(installedRow.props.key, "a/repo@main:alpha-original");
+  assert.equal(installedRow.props.key, skillIdentityKey(installed));
   assert.equal(installedRow.children[0].children[1].props.title, "a/alpha");
 });
 
