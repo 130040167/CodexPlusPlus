@@ -430,6 +430,7 @@ type BackendSettings = WhaleBalanceSettings & {
   codexAppMarkdownExport: boolean;
   codexAppSessionShare: boolean;
   codexAppUsageStatusLine: boolean;
+  codexAppProxyRequestStatus: boolean;
   codexAppPasteFix: boolean;
   codexAppForceChineseLocale: boolean;
   codexAppTypingEffect: TypingEffect;
@@ -1448,6 +1449,7 @@ const defaultSettings: BackendSettings = {
   codexAppMarkdownExport: true,
   codexAppSessionShare: true,
   codexAppUsageStatusLine: true,
+  codexAppProxyRequestStatus: true,
   codexAppPasteFix: false,
   codexAppForceChineseLocale: false,
   codexAppTypingEffect: "off",

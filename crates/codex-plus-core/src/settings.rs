@@ -1109,6 +1109,9 @@ pub struct BackendSettings {
     // 默认开启：纯展示层状态栏，不改变 Codex 的请求内容与本地数据，误开没有副作用。
     #[serde(rename = "codexAppUsageStatusLine", default = "default_true")]
     pub codex_app_usage_status_line: bool,
+    // 默认开启：输入框上方的请求状态条（#2824），纯展示层；关掉后注入层停止轮询 /proxy-status。
+    #[serde(rename = "codexAppProxyRequestStatus", default = "default_true")]
+    pub codex_app_proxy_request_status: bool,
     // 默认开启：只在受管副本的页面里加一个语音入口，识别走 Codex++ 自己的听写服务，
     // 不改官方应用、不动输入框已有内容；关掉只是没有入口，已运行的副本需重启才生效。
     #[serde(rename = "claudeAppVoiceInput", default = "default_true")]
@@ -1457,6 +1460,7 @@ impl Default for BackendSettings {
             codex_app_markdown_export: true,
             codex_app_session_share: true,
             codex_app_usage_status_line: true,
+            codex_app_proxy_request_status: true,
             claude_app_voice_input: true,
             claude_app_localization: true,
             claude_app_computer_use: false,
@@ -2874,6 +2878,7 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "codexAppMarkdownExport");
     merge_bool_setting(target, source, "codexAppSessionShare");
     merge_bool_setting(target, source, "codexAppUsageStatusLine");
+    merge_bool_setting(target, source, "codexAppProxyRequestStatus");
     merge_bool_setting(target, source, "codexAppPasteFix");
     merge_bool_setting(target, source, "codexAppForceChineseLocale");
     if let Some(value @ ("off" | "rainbow" | "fireworks" | "stars")) =
