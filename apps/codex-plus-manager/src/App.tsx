@@ -289,6 +289,16 @@ import {
 import { subscribeLanguage, getLanguage, t, tf, toggleLanguage } from "@/i18n";
 import { vlmTestTranslation } from "./vlm-test-translation";
 import {
+  applyResolvedTheme,
+  loadThemePreference,
+  resolveTheme,
+  storeThemePreference,
+  systemPrefersDark,
+  toggledThemePreference,
+  watchSystemTheme,
+  type ThemePreference,
+} from "./theme-mode";
+import {
   multiLaunchInstanceFailure,
   multiLaunchInstanceLabel as formatMultiLaunchInstanceLabel,
   multiLaunchInstanceRunning,
@@ -1563,7 +1573,9 @@ const defaultSettings: BackendSettings = {
 
 export function App() {
   useSyncExternalStore(subscribeLanguage, getLanguage, getLanguage);
-  const [theme, setTheme] = useState<Theme>(() => loadInitialTheme());
+  const [themePreference, setThemePreference] = useState<ThemePreference>(() => loadThemePreference());
+  const [systemDark, setSystemDark] = useState(() => systemPrefersDark());
+  const theme: Theme = resolveTheme(themePreference, systemDark);
   const [route, setRoute] = useState<Route>(() => loadInitialRoute());
   /** 合并后的「设置」页里要滚到的分组（原来跳「关于」的地方滚到版本与更新、日志）。 */
   const [settingsFocus, setSettingsFocus] = useState<string | null>(() => initialSettingsFocus());
@@ -4182,11 +4194,15 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [route]);
 
+  useEffect(() => watchSystemTheme(setSystemDark), []);
+
   useEffect(() => {
-    document.documentElement.classList.toggle("dark", theme === "dark");
-    document.documentElement.classList.toggle("light", theme === "light");
-    window.localStorage.setItem("codex-plus-theme", theme);
+    applyResolvedTheme(theme);
   }, [theme]);
+
+  useEffect(() => {
+    storeThemePreference(themePreference);
+  }, [themePreference]);
 
   useEffect(() => {
     const refresh = () => { void refreshOverview(true); };
@@ -4531,7 +4547,8 @@ export function App() {
       refreshAutoTakeover: () => refreshAutoTakeover(false),
       takeOverNow: () => runAutoTakeoverCommand("take_over_codex_now"),
       pauseAutoTakeover: () => runAutoTakeoverCommand("pause_auto_takeover_for_instance"),
-      toggleTheme: () => setTheme((current) => (current === "dark" ? "light" : "dark")),
+      toggleTheme: () => setThemePreference(toggledThemePreference(theme)),
+      setThemePreference,
     }),
     [route, launchForm, settingsForm, settings, overview, update, updateInstallProgress.active, logs, diagnostics, theme, relayFiles, localSessions, selectedProviderSyncTarget, envConflicts, relayEnvironment, ccsProviders, multiLaunchPending, multiLaunchInstances, multiLaunchInstancesLoading, multiLaunchActionPending, dreamSkinLibrary, dreamSkinMarket, dreamSkinCommunity, selectedDreamSkinTheme, savedDreamSkinThemeDraft, dreamSkinThemeDraft, dreamSkinDraftDirty, pendingDreamSkinRestart, getLanguage()],
   );
@@ -4893,6 +4910,7 @@ export function App() {
                   form={settingsForm}
                   settings={settings}
                   theme={theme}
+                  themePreference={themePreference}
                   actions={actions}
                   onOpenAgentSettings={() => void (async () => {
                     if (activeTool !== "codex") await switchTool("codex");
@@ -5263,6 +5281,7 @@ type Actions = {
   takeOverNow: () => Promise<void>;
   pauseAutoTakeover: () => Promise<void>;
   toggleTheme: () => void;
+  setThemePreference: (preference: ThemePreference) => void;
   checkHealth: () => Promise<void>;
 };
 
@@ -10964,6 +10983,7 @@ function GlobalSettingsScreen({
   form,
   settings,
   theme,
+  themePreference,
   actions,
   onOpenAgentSettings,
   onOpenTour,
@@ -10973,6 +10993,7 @@ function GlobalSettingsScreen({
   form: BackendSettings;
   settings: SettingsResult | null;
   theme: Theme;
+  themePreference: ThemePreference;
   actions: Actions;
   onOpenAgentSettings: () => void;
 }) {
@@ -10989,10 +11010,28 @@ function GlobalSettingsScreen({
           <div className="global-setting-row">
             <div className="global-setting-copy">
               <strong>{t("界面主题")}</strong>
-              <span>{t("当前为")}{theme === "dark" ? t("深色") : t("浅色")}{t("模式。")}</span>
+              <span>{themePreference === "system"
+                ? `${t("跟随系统外观，当前为")}${theme === "dark" ? t("深色") : t("浅色")}${t("模式。")}`
+                : `${t("当前为")}${theme === "dark" ? t("深色") : t("浅色")}${t("模式。")}`}</span>
             </div>
             <div className="global-setting-actions">
-              <Button size="sm" variant="secondary" onClick={actions.toggleTheme}>{t("切换主题")}</Button>
+              <div aria-label={t("界面主题")} className="segmented" role="group">
+                {([
+                  ["system", t("跟随系统")],
+                  ["light", t("浅色")],
+                  ["dark", t("深色")],
+                ] as const).map(([value, label]) => (
+                  <button
+                    aria-pressed={themePreference === value}
+                    className={themePreference === value ? "active" : ""}
+                    key={value}
+                    onClick={() => actions.setThemePreference(value)}
+                    type="button"
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
           <div className="global-setting-row">
@@ -18949,11 +18988,6 @@ function formatDuration(startedAtMs: number): string {
 function stringifyError(error: unknown) {
   if (error instanceof Error) return error.message;
   return String(error);
-}
-
-function loadInitialTheme(): Theme {
-  if (typeof window === "undefined") return "dark";
-  return window.localStorage.getItem("codex-plus-theme") === "light" ? "light" : "dark";
 }
 
 /** 启动落在网关「总览」：Agent 概览跟着上次点的 Agent 走，落在那里像是停在了某个 Agent 里。 */

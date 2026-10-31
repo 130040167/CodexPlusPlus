@@ -2210,6 +2210,8 @@ export const EN_PLAIN: Record<string, string> = {
   "用户": "User",
   "用户环境": "User environment",
   "界面主题": "UI theme",
+  "跟随系统": "Follow system",
+  "跟随系统外观，当前为": "Following the system appearance, currently ",
   "留空不改写，例如 160000": "Leave empty to keep unchanged, e.g. 160000",
   "留空不改写，例如 200000": "Leave empty to keep unchanged, e.g. 200000",
   "留空使用默认值": "Leave empty to use the default",
