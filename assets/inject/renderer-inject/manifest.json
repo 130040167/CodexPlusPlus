@@ -113,7 +113,7 @@
     {
       "name": "85-weixin-desktop-sync.js",
       "description": "微信线程目录与显式项目归属同步",
-      "lines": 100
+      "lines": 113
     },
     {
       "name": "90-action-groups.js",

@@ -17382,6 +17382,7 @@
   const weixinDesktopSync = window.__codexPlusWeixinDesktopSync ||= {
     revisions: new Map(), flight: null, services: null, retryAt: 0,
   };
+  weixinDesktopSync.retries ||= new Map();
 
   async function syncWeixinThreadProject(services, entry) {
     const project = entry.project;
@@ -17421,11 +17422,22 @@
 
   async function syncWeixinDesktopThreads() {
     const entries = codexPlusBackendSettings.weixinDesktopSync;
-    if (!codexPlusBackendSettingsLoaded || !Array.isArray(entries) || !entries.length
-        || entries.length > 128 || weixinDesktopSync.flight || Date.now() < weixinDesktopSync.retryAt) return;
+    const now = Date.now();
+    if (!codexPlusBackendSettingsLoaded || !Array.isArray(entries)
+        || entries.length > 128 || weixinDesktopSync.flight || now < weixinDesktopSync.retryAt) return;
     const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    const pending = entries.filter((entry) => uuid.test(entry?.threadId) && uuid.test(entry?.revision)
-      && weixinDesktopSync.revisions.get(entry.threadId) !== entry.revision);
+    const currentIds = new Set(entries.map((entry) => entry?.threadId));
+    for (const records of [weixinDesktopSync.revisions, weixinDesktopSync.retries]) {
+      for (const id of records.keys()) {
+        if (!currentIds.has(id)) records.delete(id);
+      }
+    }
+    const pending = entries.filter((entry) => {
+      const retry = weixinDesktopSync.retries.get(entry?.threadId);
+      return uuid.test(entry?.threadId) && uuid.test(entry?.revision)
+        && weixinDesktopSync.revisions.get(entry.threadId) !== entry.revision
+        && (retry?.revision !== entry.revision || now >= retry.retryAt);
+    }).map((entry) => ({ ...entry }));
     if (!pending.length) return;
     weixinDesktopSync.flight = (async () => {
       try {
@@ -17460,13 +17472,14 @@
           weixinDesktopSync.keys = keys[0];
         }
         for (const entry of pending) {
-          await syncWeixinThreadProject(weixinDesktopSync.services, entry);
-          await weixinDesktopSync.services.localThreadCatalog.notifyThread({ hostId: "local", threadId: entry.threadId }, "update");
-          weixinDesktopSync.revisions.set(entry.threadId, entry.revision);
-        }
-        const currentIds = new Set(entries.map((entry) => entry.threadId));
-        for (const id of weixinDesktopSync.revisions.keys()) {
-          if (!currentIds.has(id)) weixinDesktopSync.revisions.delete(id);
+          try {
+            await syncWeixinThreadProject(weixinDesktopSync.services, entry);
+            await weixinDesktopSync.services.localThreadCatalog.notifyThread({ hostId: "local", threadId: entry.threadId }, "update");
+            weixinDesktopSync.revisions.set(entry.threadId, entry.revision);
+            weixinDesktopSync.retries.delete(entry.threadId);
+          } catch {
+            weixinDesktopSync.retries.set(entry.threadId, { revision: entry.revision, retryAt: Date.now() + 30000 });
+          }
         }
       } catch {
         // 桌面启动或升级期间可能没有 catalog；下一次心跳退避重试，不重载页面。
