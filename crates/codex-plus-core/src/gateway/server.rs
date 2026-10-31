@@ -415,7 +415,7 @@ pub(crate) async fn open_responses_for_agent(
         && !route::is_codex_title_request(&request)
         && request["model"] != crate::aggregate_catalog::CODEX_AUTO_REVIEW_MODEL
     {
-        super::subagent_models::prepare(&gateway, agent, &mut request, session_headers)?;
+        super::subagent_models::prepare(&gateway, agent, &mut request, session_headers).await?;
     }
     let model = title_model
         .as_deref()
