@@ -196,11 +196,17 @@ fn claude_request(stream: bool) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gateway_end_to_end() {
     let state_dir = tempfile::tempdir().unwrap();
+    let codex_home = state_dir.path().join("codex-home");
+    let sqlite_home = state_dir.path().join("codex-sqlite");
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::create_dir_all(&sqlite_home).unwrap();
     unsafe {
         std::env::set_var(
             codex_plus_core::paths::STATE_DIR_ENV,
             state_dir.path().to_str().unwrap(),
         );
+        std::env::set_var("CODEX_HOME", &codex_home);
+        std::env::set_var("CODEX_SQLITE_HOME", &sqlite_home);
     }
     let port = {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -993,7 +999,9 @@ async fn gateway_end_to_end() {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status().as_u16(), 200, "{url}");
+        let status = response.status().as_u16();
+        let response_body = response.text().await.unwrap();
+        assert_eq!(status, 200, "{url}: {response_body}");
         let seen = identity_seen.lock().unwrap();
         let (head, _) = seen.last().unwrap();
         let head = head.to_ascii_lowercase();
@@ -1019,6 +1027,12 @@ async fn gateway_end_to_end() {
         assert_eq!(head.matches("originator:").count(), 1, "{head}");
     }
     assert_eq!(identity_seen.lock().unwrap().len(), 2);
+    assert!(
+        state_dir
+            .path()
+            .join("gateway-subagent-models.sqlite")
+            .is_file()
+    );
 
     // —— 8e. 生图：自动选池里的生图模型，第一家 5xx 换下一家，请求里的模型名换成那一家的 ——
     let (bad_base, _) = mock_upstream(vec![(
