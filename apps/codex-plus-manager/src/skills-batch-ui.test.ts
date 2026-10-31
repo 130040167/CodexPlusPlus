@@ -28,6 +28,11 @@ function createHarness(saved = "{}") {
   const storage = new Map([["codex-plus-plus.skill-groups.v1", saved]]);
   const notices: Array<{ message: string; status?: string }> = [];
   const pending: Array<{ id: string; resolve: (result: any) => void }> = [];
+  const pendingLoads: Array<() => void> = [];
+  const pendingDataUpdates: Array<() => void> = [];
+  let holdLoads = 0;
+  let deferDataUpdates = false;
+  const windowListeners = new Map<string, () => void>();
   const failures = new Set(["a2"]);
   const updateCalls: Array<{ command: string; args: any }> = [];
   const installCalls: Array<{ command: string; args: any }> = [];
@@ -40,7 +45,14 @@ function createHarness(saved = "{}") {
     repos: [], pendingImportedRepos: [], repositorySkills: [], repoCounts: {}, repoErrors: [], skillsDir: "", codexSkillsDir: "" };
   const snapshot = () => structuredClone(server);
   const invoke = async (command: string, args: any = {}) => {
-    if (command === "list_installed_skills") return snapshot();
+    if (command === "list_installed_skills") {
+      const result = snapshot();
+      if (holdLoads > 0) {
+        holdLoads--;
+        return new Promise((resolve) => pendingLoads.push(() => resolve(result)));
+      }
+      return result;
+    }
     if (command === "preview_skill_update") {
       updateCalls.push({ command, args });
       if (args.id === "a") await previewGate;
@@ -73,7 +85,11 @@ function createHarness(saved = "{}") {
     useState: (initial: any) => {
       const index = cursor++;
       if (!(index in slots)) slots[index] = typeof initial === "function" ? initial() : initial;
-      return [slots[index], (value: any) => { slots[index] = typeof value === "function" ? value(slots[index]) : value; }];
+      return [slots[index], (value: any) => {
+        const apply = () => { slots[index] = typeof value === "function" ? value(slots[index]) : value; };
+        if (index === 0 && deferDataUpdates) pendingDataUpdates.push(apply);
+        else apply();
+      }];
     },
     useRef: (initial: any) => { const index = cursor++; if (!(index in slots)) slots[index] = { current: initial }; return slots[index]; },
     useEffect: (run: () => void, deps?: any[]) => {
@@ -82,12 +98,14 @@ function createHarness(saved = "{}") {
       if (!previous || !deps || deps.some((value, i) => !Object.is(value, previous[i]))) effects.push(run);
       slots[index] = deps;
     },
-    useMemo: (run: () => any) => run(), useDeferredValue: (value: any) => value, startTransition: (run: () => void) => run(),
+    useMemo: (run: () => any) => run(), useDeferredValue: (value: any) => value,
+    startTransition: (run: () => void) => run(),
     useSyncExternalStore: (_subscribe: any, getSnapshot: () => any) => getSnapshot(),
     useSensors: (...values: any[]) => values, useSensor: () => null, PointerSensor: "pointer", KeyboardSensor: "keyboard",
     sortableKeyboardCoordinates: null, closestCenter: null, verticalListSortingStrategy: null,
     localStorage: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value) },
-    window: { addEventListener: () => {}, removeEventListener: () => {} },
+    window: { addEventListener: (name: string, listener: () => void) => windowListeners.set(name, listener),
+      removeEventListener: (name: string) => windowListeners.delete(name) },
     invoke, ok: (result: { status: string }) => result.status === "ok", SKILL_GROUP_STORAGE_KEY: "codex-plus-plus.skill-groups.v1",
     t: (value: string) => value, tf: (value: string, args: any[]) => value.replace(/\{(\d+)\}/g, (_, index) => String(args[Number(index)])),
     groupSkills, legacySkillCustomGroupName, moveSkillGroup, nextSkillGroupSortDirection, readSkillGroupStorage, skillGroupAssignment, skillIdentityKey, sortSkillGroupKeys, sortSkillGroupsByName, customSkillGroupKey, defaultSkillGroupKey,
@@ -138,7 +156,9 @@ function createHarness(saved = "{}") {
     collect(context.SkillRepoDrawer(props));
     return elements;
   };
-  return { render, renderDrawer, find, groupSelect, groupInput, row, sort, order, expand, pending, failures, notices, storage, server, updateCalls, installCalls, updateQueue, releasePreview: () => releasePreview?.() };
+  return { render, renderDrawer, find, groupSelect, groupInput, row, sort, order, expand, pending, pendingLoads, pendingDataUpdates, failures, notices, storage, server, updateCalls, installCalls, updateQueue,
+    holdLoads: (count: number) => { holdLoads = count; }, deferDataUpdates: () => { deferDataUpdates = true; },
+    focus: () => windowListeners.get("focus")?.(), releasePreview: () => releasePreview?.() };
 }
 
 test("discover installs the selected repository path with its distinct local identity", async () => {
@@ -235,6 +255,60 @@ test("batch selection leaves unrelated buttons and agent controls enabled and pr
   input.props.ref(element);
   assert.equal(element.indeterminate, true);
   assert.ok(ui.notices.some((notice) => notice.status === "failed" && notice.message.includes("fixture failure")));
+});
+
+test("a delayed batch response cannot overwrite a newer refresh for the same agent", async () => {
+  const ui = createHarness();
+  ui.server.skills = [skill("a", "a/repo@main")];
+  ui.render(); await tick(); ui.render(); ui.expand("repo:a/repo");
+  ui.groupInput("repo:a/repo", "codex").props.onChange({ target: { checked: true } });
+  ui.render();
+  assert.equal(ui.pending.length, 1);
+
+  // The pending response captured the enabled state; a later external change disables it.
+  ui.server.skills[0].agents = [];
+  ui.focus(); await tick(); ui.render();
+  ui.holdLoads(10);
+  ui.pending.shift()!.resolve(null);
+  await tick(); ui.render();
+  assert.equal(ui.row("a", "codex").props.enabled, false);
+  assert.ok(ui.pendingLoads.length > 0);
+  ui.pendingLoads.forEach((resolve) => resolve());
+  await tick(); ui.render();
+  assert.equal(ui.row("a", "codex").props.enabled, false);
+});
+
+test("a delayed refresh response cannot overwrite a newer batch result", async () => {
+  const ui = createHarness();
+  ui.server.skills = [skill("a", "a/repo@main")];
+  ui.render(); await tick(); ui.render(); ui.expand("repo:a/repo");
+  ui.holdLoads(1);
+  ui.focus(); await tick();
+  assert.equal(ui.pendingLoads.length, 1);
+
+  ui.groupInput("repo:a/repo", "codex").props.onChange({ target: { checked: true } });
+  ui.pending.shift()!.resolve(null);
+  await tick(); ui.render();
+  assert.equal(ui.row("a", "codex").props.enabled, true);
+  ui.pendingLoads.shift()!();
+  await tick(); ui.render();
+  assert.equal(ui.row("a", "codex").props.enabled, true);
+});
+
+test("a successful batch result is not dropped while its follow-up refresh is pending", async () => {
+  const ui = createHarness();
+  ui.server.skills = [skill("a", "a/repo@main")];
+  ui.render(); await tick(); ui.render(); ui.expand("repo:a/repo");
+  ui.groupInput("repo:a/repo", "codex").props.onChange({ target: { checked: true } });
+  ui.deferDataUpdates();
+  ui.holdLoads(10);
+  ui.pending.shift()!.resolve(null);
+  await tick();
+  assert.equal(ui.pendingDataUpdates.length, 1);
+  assert.ok(ui.pendingLoads.length > 0);
+  ui.pendingDataUpdates.shift()!();
+  ui.render();
+  assert.equal(ui.row("a", "codex").props.enabled, true);
 });
 
 test("filter changes keep the same group and agent locked without projecting untouched skills", async () => {

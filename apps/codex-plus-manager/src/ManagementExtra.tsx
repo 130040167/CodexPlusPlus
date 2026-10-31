@@ -367,7 +367,9 @@ export function SkillsPage({ notify }: { notify: Notify }) {
     const request = ++dataRequest.current;
     try {
       const result = await invoke<SkillPayload>("list_installed_skills");
-      if (mounted.current && request === dataRequest.current) startTransition(() => setData(result));
+      if (mounted.current && request === dataRequest.current) {
+        startTransition(() => setData(result));
+      }
       return result;
     } catch (e) {
       if (mounted.current) await notify("Skills", String(e), "failed");
@@ -477,11 +479,14 @@ export function SkillsPage({ notify }: { notify: Notify }) {
     try {
       for (const skill of targets) {
         try {
-          dataRequest.current++;
+          const request = ++dataRequest.current;
           const result = await invoke<SkillPayload>("set_skill_enabled_for", { agent, id: skill.id, enabled });
-          dataRequest.current++;
-          if (mounted.current) setData((current) => current && result.skills
-            ? { ...current, skills: mergeSkillAgentResult(current.skills, result.skills, skill.id, agent) } : current);
+          if (mounted.current && request === dataRequest.current) {
+            setData((current) => current && result.skills
+              ? { ...current, skills: mergeSkillAgentResult(current.skills, result.skills, skill.id, agent) } : current);
+          } else if (mounted.current) {
+            void reloadLocal();
+          }
           if (ok(result)) completed++;
           else errors.push(`${skill.name || skill.id}：${result.message}`);
         } catch (error) { errors.push(`${skill.name || skill.id}：${String(error)}`); }
