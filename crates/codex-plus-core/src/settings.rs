@@ -2244,6 +2244,15 @@ pub struct SettingsStore {
     path: PathBuf,
 }
 
+struct SettingsFileLock(File);
+
+impl Drop for SettingsFileLock {
+    fn drop(&mut self) {
+        // 并发启动子进程可能继承句柄；事务结束时主动解锁，不能只等最后一个句柄关闭。
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
 /// 配置不应承载无界的转义膨胀或文件内容。超限时只报错，不覆盖原文件。
 pub const MAX_SETTINGS_FILE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -2323,7 +2332,10 @@ impl SettingsStore {
     pub(crate) fn try_load_committed(&self) -> anyhow::Result<Option<(BackendSettings, String)>> {
         let file = OpenOptions::new().read(true).write(true).open(self.path.with_extension("json.lock"))?;
         match FileExt::try_lock_shared(&file) {
-            Ok(()) => self.load_outbound_settings().map(Some),
+            Ok(()) => {
+                let _lock = SettingsFileLock(file);
+                self.load_outbound_settings().map(Some)
+            }
             Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(None),
             Err(error) => Err(error).context("核验微信附件权限时获取设置读锁失败"),
         }
@@ -2341,7 +2353,7 @@ impl SettingsStore {
         Ok((settings, revision))
     }
 
-    fn write_lock(&self) -> anyhow::Result<File> {
+    fn write_lock(&self) -> anyhow::Result<SettingsFileLock> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -2349,7 +2361,7 @@ impl SettingsStore {
         let path = self.path.with_extension("json.lock");
         let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)?;
         file.lock_exclusive().context("获取设置写锁失败")?;
-        Ok(file)
+        Ok(SettingsFileLock(file))
     }
 
     pub fn revision(&self) -> anyhow::Result<String> {
@@ -3852,6 +3864,22 @@ mod tests {
         assert_eq!(store.load_raw_object().unwrap()["_weixinOutboundRevision"], revision);
         store.update(json!({"weixinConnectEnabled": false})).unwrap();
         assert_ne!(store.load_raw_object().unwrap()["_weixinOutboundRevision"], revision);
+    }
+
+    #[test]
+    fn settings_committed_read_does_not_wait_for_a_cloned_write_lock_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(dir.path().join("settings.json"));
+        store.save(&store.load().unwrap()).unwrap();
+        let lock = store.write_lock().unwrap();
+        let inherited = lock.0.try_clone().unwrap();
+        assert!(store.try_load_committed().unwrap().is_none());
+        drop(lock);
+        assert!(
+            store.try_load_committed().unwrap().is_some(),
+            "a completed transaction kept its lock through a cloned handle"
+        );
+        drop(inherited);
     }
 
     #[cfg(unix)]
