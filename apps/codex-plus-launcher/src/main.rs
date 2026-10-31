@@ -2660,7 +2660,7 @@ mod tests {
         })).await;
         let served = tokio::time::timeout(std::time::Duration::from_secs(3), server).await;
         assert!(served.unwrap().is_ok());
-        assert!(result.unwrap_err().to_string().contains("未找到唯一"));
+        assert_eq!(result.unwrap_err().to_string(), "会话所在窗口暂不可用，请稍后重试设置目标");
     }
 
     #[test]
