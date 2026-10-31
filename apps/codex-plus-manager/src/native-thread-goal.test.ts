@@ -330,8 +330,9 @@ describe("native thread goal forwarding", () => {
         message: "secret-token http://internal.invalid/private at internal stack" };
       await f.install({ forward: async () => { calls += 1; return response; } });
       await assert.rejects(f.manager.setThreadGoal(threadId, { objective: "failed" }), value => {
+        assert.ok(value && typeof value === "object" && "message" in value);
         assert.equal(value.message, expectedMessage);
-        assert.doesNotMatch(String(value.stack), /secret-token|internal\.invalid/);
+        assert.doesNotMatch(String("stack" in value ? value.stack : undefined), /secret-token|internal\.invalid/);
         return true;
       });
       assert.equal(calls, 1);
@@ -372,9 +373,10 @@ describe("native thread goal forwarding", () => {
     f.state.role = "follower";
     await f.install({ forward: async () => { calls += 1; throw error; } });
     await assert.rejects(f.manager.setThreadGoal(threadId, { objective: "unknown" }), value => {
+      assert.ok(value && typeof value === "object" && "message" in value);
       assert.notEqual(value, error);
       assert.equal(value.message, "会话所在窗口暂不可用，请稍后重试设置目标");
-      assert.doesNotMatch(value.message, /secret-token|internal\.invalid/);
+      assert.doesNotMatch(String(value.message), /secret-token|internal\.invalid/);
       return true;
     });
     assert.equal(calls, 1);
