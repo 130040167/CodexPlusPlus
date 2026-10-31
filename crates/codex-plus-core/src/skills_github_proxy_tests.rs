@@ -165,6 +165,11 @@ fn exercise(
         .collect();
     let address = |i: usize| listeners[i].local_addr().unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(crate::windows_create_no_window());
+    }
     command
         .args(["--exact", CHILD, "--nocapture"])
         .stdout(Stdio::piped())
@@ -754,6 +759,11 @@ fn tls_redirect_client_child() {
 
 fn tls_isolated_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(crate::windows_create_no_window());
+    }
     command.env_clear();
     for key in [
         "PATH",
