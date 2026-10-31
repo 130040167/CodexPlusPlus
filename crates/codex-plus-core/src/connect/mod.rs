@@ -553,7 +553,7 @@ async fn process_weixin_message(
     let project = if saved_thread_id.is_none() {
         projects::resolve_project(server, project_id)
             .await
-            .unwrap_or_default()
+            .context("读取所选工作项目失败，未创建会话；请检查项目选择后重试")?
     } else {
         None
     };

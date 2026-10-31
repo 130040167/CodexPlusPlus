@@ -1951,6 +1951,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_project_read_failure_preserves_contact_mapping() {
+        use std::sync::atomic::AtomicBool;
+
+        use super::super::{
+            outbound::OutboundPolicy,
+            session_store::{ConnectSessionStore, ConnectState},
+            weixin::{WeixinClient, WeixinMessage},
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let account = format!(
+            "project-read-{}",
+            root.path().file_name().unwrap().to_string_lossy()
+        );
+        let store = ConnectSessionStore::default_for_account(&account);
+        let mut state = ConnectState::default();
+        state
+            .thread_ids
+            .insert("other".into(), "other-history".into());
+        store.save(&state).unwrap();
+        let original = state.clone();
+        let api = wiremock::MockServer::start().await;
+        let client = WeixinClient::new(&api.uri(), "fixture", "").unwrap();
+        let message: WeixinMessage = serde_json::from_value(json!({
+            "from_user_id":"peer", "context_token":"context"
+        }))
+        .unwrap();
+        let policy = OutboundPolicy::new(false, "peer", root.path().to_str().unwrap());
+        let mut server = fixture_server(root.path(), "optional-unavailable");
+        server.initialize().await.unwrap();
+        let config = server.config.clone();
+        let mut server = Some(server);
+        let result = super::super::process_weixin_message(
+            &client,
+            &config,
+            &mut server,
+            &mut state,
+            &message,
+            "new project message",
+            &AtomicBool::new(false),
+            &policy,
+            &account,
+            "selected",
+            true,
+        )
+        .await;
+        server.as_mut().unwrap().close().await;
+
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("读取所选工作项目失败"), "{error:#}");
+        assert_eq!(error.root_cause().to_string(), "Codex app-server 不支持 project/read");
+        assert_eq!(state, original);
+        assert_eq!(store.load().unwrap(), original);
+        assert!(api.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn optional_project_rpcs_do_not_block_basic_threads_or_resume_originals() {
         let root = tempfile::tempdir().unwrap();
         for mode in [
