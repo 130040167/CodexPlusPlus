@@ -106,6 +106,7 @@ mod retired_layout;
 mod script_market;
 mod settings_load_recursion;
 mod side_chat;
+mod skill_github_live;
 mod skills_lifecycle;
 mod ssh_remote_loopback;
 mod standalone_quota_settings;
