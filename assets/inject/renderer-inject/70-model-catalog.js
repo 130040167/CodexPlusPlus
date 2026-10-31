@@ -24,6 +24,7 @@
   let codexModelCatalogLoadedAt = 0;
   let codexModelCatalogPromise = null;
   let codexModelCatalogRevision = 0;
+  const codexModelSettingsSalt = Array.from({ length: 4 }, () => (Math.random() * 0x100000000) >>> 0);
   // 目录不依赖 DOM；热重注入接续成功快照，并阻止旧闭包的迟到请求重新发布。
   const codexModelCatalogRuntime = {
     catalog: codexModelCatalog,
@@ -32,8 +33,9 @@
     patchStatsig: patchStatsigModelDynamicConfig,
     recordRequest: recordModelListRequest,
     patchMcp: patchMcpModelResponseData,
-    retryAt: 0,
-    failure: null,
+    retryAt: window.__codexPlusModelCatalogRuntime?.retryAt || 0,
+    failure: window.__codexPlusModelCatalogRuntime?.failure || null,
+    matchesSettings: window.__codexPlusModelCatalogRuntime?.matchesSettings || null,
   };
   window.__codexPlusModelCatalogRuntime = codexModelCatalogRuntime;
   if (typeof codexThreadModelRetentionSettingsChanged === "function") {
@@ -119,27 +121,64 @@
   }
 
   function codexModelSettingsSignature(settings) {
-    const profile = settings?.relayProfiles?.find((entry) => entry?.id === settings.activeRelayId);
-    return JSON.stringify([settings?.relayProfilesEnabled, settings?.activeRelayId,
-      profile?.relayMode, profile?.model, profile?.modelList, profile?.modelMetadata,
-      profile?.modelWindows, profile?.modelAutoCompact, profile?.modelRoutes,
-      settings?.aggregateRelayProfiles]);
+    const profiles = Array.isArray(settings?.relayProfiles) ? settings.relayProfiles : [];
+    const profile = profiles.find((entry) => entry?.id === settings?.activeRelayId);
+    const aggregates = Array.isArray(settings?.aggregateRelayProfiles) ? settings.aggregateRelayProfiles : [];
+    const aggregate = profile?.relayMode === "aggregate"
+      ? aggregates.find((entry) => entry?.id === (settings.activeAggregateRelayId || settings.activeRelayId))
+      : null;
+    const members = Array.isArray(aggregate?.members) ? aggregate.members : [];
+    const value = JSON.stringify([settings?.relayProfilesEnabled, settings?.activeRelayId,
+      settings?.activeAggregateRelayId, settings?.activeRelayCodexProvider, profile, aggregate,
+      members.map((entry) => profiles.find((item) => item?.id === entry?.relayId))]);
+    let first = codexModelSettingsSalt[0] ^ 0x811c9dc5;
+    let second = codexModelSettingsSalt[1] ^ 0x9e3779b9;
+    let third = codexModelSettingsSalt[2] ^ 0x85ebca6b;
+    let fourth = codexModelSettingsSalt[3] ^ 0xc2b2ae35;
+    for (let index = 0; index < value.length; index += 1) {
+      const code = value.charCodeAt(index);
+      first = Math.imul(first ^ code, 0x01000193);
+      second = Math.imul(second ^ code, 0x85ebca6b);
+      third = Math.imul(third ^ code, 0xc2b2ae35);
+      fourth = Math.imul(fourth ^ code, 0x27d4eb2d);
+    }
+    return `${value.length}:${first >>> 0}:${second >>> 0}:${third >>> 0}:${fourth >>> 0}`;
+  }
+
+  function codexModelSettingsMatcher(signature) {
+    return (next) => codexModelSettingsSignature(next) === signature;
+  }
+
+  function rememberCodexModelSettings(settings) {
+    codexModelCatalogRuntime.matchesSettings = codexModelSettingsMatcher(codexModelSettingsSignature(settings));
   }
 
   function refreshCodexModelCatalogForSettings(previous, next) {
-    if (codexModelSettingsSignature(previous) === codexModelSettingsSignature(next)) {
+    const previousLoaded = Array.isArray(previous?.relayProfiles) && typeof previous?.activeRelayId === "string";
+    const source = JSON.stringify([next?.relayProfilesEnabled, next?.activeRelayId]);
+    const sameSource = !codexModelCatalogRuntime.source || codexModelCatalogRuntime.source === source;
+    const unchanged = sameSource && (previousLoaded
+      ? codexModelSettingsSignature(previous) === codexModelSettingsSignature(next)
+      : typeof codexModelCatalogRuntime.matchesSettings === "function"
+        ? codexModelCatalogRuntime.matchesSettings(next)
+        : Date.now() < codexModelCatalogRuntime.retryAt);
+    rememberCodexModelSettings(next);
+    if (unchanged) {
       if (codexModelCatalogRuntime.retryAt && Date.now() >= codexModelCatalogRuntime.retryAt) {
         void loadCodexModelCatalog();
+      } else if (!previousLoaded && !codexModelCatalogRuntime.retryAt) {
+        void loadCodexModelCatalog(true);
       }
       return;
     }
-    const source = JSON.stringify([next?.relayProfilesEnabled, next?.activeRelayId]);
     if (codexModelCatalogRuntime.source && codexModelCatalogRuntime.source !== source) {
       codexModelCatalog = { status: "loading", models: [], sources: [] };
       codexModelCatalogRuntime.catalog = codexModelCatalog;
     }
     codexModelCatalogRuntime.source = source;
     codexModelCatalogLoadedAt = 0;
+    codexModelCatalogRuntime.retryAt = 0;
+    codexModelCatalogRuntime.failure = null;
     void loadCodexModelCatalog(true);
   }
 
@@ -169,13 +208,16 @@
       codexModelCatalogRuntime.source = JSON.stringify([
         codexPlusBackendSettings.relayProfilesEnabled, codexPlusBackendSettings.activeRelayId,
       ]);
+      rememberCodexModelSettings(codexPlusBackendSettings);
     }
+    let failedCatalog = null;
     const request = readCodexAppServerPreparation("/codex-model-catalog", {})
       .then(async (result) => {
         let nextCatalog = result && typeof result === "object" ? result : { status: "failed", model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
         if (!current()) return codexModelCatalog;
         if (!["ok", "not_applied", "not_configured"].includes(nextCatalog.status)
             || !Array.isArray(nextCatalog.models)) {
+          failedCatalog = nextCatalog;
           throw new Error(nextCatalog.message || "Model catalog is temporarily unavailable");
         }
         if ((!nextCatalog.models || nextCatalog.models.length === 0) && nextCatalog.status === "not_configured") {
@@ -212,13 +254,16 @@
       })
       .catch((error) => {
         if (!current()) return codexModelCatalog;
-        const failure = { status: "failed", message: String(error?.message || error), models: [], sources: [] };
+        const failure = { status: "failed", message: String(error?.message || error),
+          model: typeof failedCatalog?.model === "string" ? failedCatalog.model : "",
+          default_model: typeof failedCatalog?.default_model === "string" ? failedCatalog.default_model : "",
+          models: [], sources: [] };
         if (!["ok", "not_applied"].includes(codexModelCatalog.status)) {
           codexModelCatalog = failure;
           codexModelCatalogRuntime.catalog = codexModelCatalog;
         }
         codexModelCatalogLoadedAt = 0;
-        codexModelCatalogRuntime.retryAt = Date.now() + 1000;
+        codexModelCatalogRuntime.retryAt = Date.now() + 10000;
         codexModelCatalogRuntime.failure = failure;
         sendCodexPlusDiagnostic("model_catalog_refresh_failed", { error: String(error?.message || error) });
         return failure;
@@ -249,6 +294,8 @@
       const hasUltra = efforts.some((entry) => entry.reasoningEffort === "ultra");
       if (!hasMax) efforts.push({ reasoningEffort: "max", description: "Maximum reasoning depth for the hardest problems" });
       if (!hasUltra) {
+        // 名单里的模型确认支持 ultra。不要再把 deepseek 放进来：它的档位上限是 max，
+        // 补出来的第四档会让「思考等级」列里只勾了 low/high/max 的模型在客户端多显示一档。
         const shouldAddUltra = /sol|terra|gpt-5\.6|gpt-5\.5|gpt-5\.4/i.test(String(modelName || ""));
         if (shouldAddUltra || efforts.length >= 4) efforts.push({ reasoningEffort: "ultra", description: "Maximum reasoning with automatic task delegation" });
       }
@@ -462,10 +509,12 @@
     const existing = new Map(models.map((item) => [item.model, item]));
     models.forEach((item) => {
       if (customModels.includes(item.model)) {
-        const hidden = codexPlusModelMetadata(item.model)?.hidden === true;
-        if (item.hidden !== hidden) {
-          item.hidden = hidden;
-          changed = true;
+        if (["ok", "not_applied"].includes(codexModelCatalog.status)) {
+          const hidden = codexPlusModelMetadata(item.model)?.hidden === true;
+          if (item.hidden !== hidden) {
+            item.hidden = hidden;
+            changed = true;
+          }
         }
         if (applyCodexPlusModelMetadata(item, item.model)) changed = true;
       }
@@ -527,12 +576,12 @@
     if (Array.isArray(value.available_models)) {
       if (patchModelNameArray(value.available_models, hostId)) changed = true;
     }
-    if (Array.isArray(value.hiddenModels)) {
+    if (["ok", "not_applied"].includes(codexModelCatalog.status) && Array.isArray(value.hiddenModels)) {
       const before = value.hiddenModels.length;
       value.hiddenModels = value.hiddenModels.filter((name) => !names.includes(name) || codexPlusModelMetadata(name)?.hidden === true);
       if (value.hiddenModels.length !== before) changed = true;
     }
-    if (Array.isArray(value.hidden_models)) {
+    if (["ok", "not_applied"].includes(codexModelCatalog.status) && Array.isArray(value.hidden_models)) {
       const before = value.hidden_models.length;
       value.hidden_models = value.hidden_models.filter((name) => !names.includes(name) || codexPlusModelMetadata(name)?.hidden === true);
       if (value.hidden_models.length !== before) changed = true;
@@ -753,7 +802,6 @@
       window.__codexPlusThreadModelSelections = new Map();
       window.__codexPlusThreadModelPending = new Map();
       window.__codexPlusThreadModelRestoreStates = new WeakMap();
-      window.__codexPlusThreadModelFallbackStates = new WeakMap();
     }
     return state;
   }
@@ -964,7 +1012,8 @@
       if (result?.applied === false || result?.error) {
         if (explicit && window.__codexPlusThreadModelSelections?.get(key) === intent) window.__codexPlusThreadModelSelections.delete(key);
       }
-      if (profileId === codexThreadModelProfile()?.id) {
+      if (profileId === codexThreadModelProfile()?.id
+          && (!explicit || window.__codexPlusThreadModelSelections?.get(key) === intent)) {
         const confirmedSelection = explicit && !intent.powerSelection ? intent.selection : selection;
         rememberCodexThreadModel(method, params, result, hostId, confirmedSelection, !!explicit);
       }
@@ -1034,6 +1083,8 @@
     const key = codexThreadModelStorageKey(hostId, owner);
     if (!key || !picker || picker.lockedModelSlug || picker.modelOptionsDisabled || picker.modelSelectionDisabled) return;
     const selections = window.__codexPlusThreadModelSelections || (window.__codexPlusThreadModelSelections = new Map());
+    // 用户开始选择后，本次会话不再由历史记录主动切换模型或档位。
+    codexThreadModelRetentionSettingsChanged().threads.set(owner, "manual");
     // 只记意图；原生实际选中后才持久化，取消和自动回退不算选择。
     selections.set(key, { selection, ...options, at: Date.now(), confirmedSince: 0 });
     for (const [entryKey, value] of selections) if (Date.now() - value.at >= 30000) selections.delete(entryKey);
@@ -1069,39 +1120,6 @@
     observeCodexThreadModelSelection.__codexPlusInstalled = true;
     window.__codexPlusThreadModelSelectionObserver = observeCodexThreadModelSelection;
     window.__codexPlusThreadModelRestoreStates = new WeakMap();
-  }
-
-  function codexFallbackThreadModelSelection(node, picker, hostId, owner, latest) {
-    if (!codexThreadModelAutomaticSyncAllowed(owner) || hostId !== "local") return false;
-    const fallback = typeof codexPlusConfiguredDefaultModel === "function"
-      ? codexPlusConfiguredDefaultModel() : "";
-    if (!latest || !fallback || !picker.models.some((entry) => entry?.model === fallback)) return false;
-    if (picker.model === fallback) return true;
-    const fallbackStates = window.__codexPlusThreadModelFallbackStates
-      || (window.__codexPlusThreadModelFallbackStates = new WeakMap());
-    const key = codexThreadModelStorageKey(hostId, owner);
-    const signature = JSON.stringify([key, picker.model, fallback, latest.at]);
-    const previous = fallbackStates.get(node);
-    if (!previous || previous.signature !== signature) {
-      fallbackStates.set(node, { signature, attempts: 0 });
-      scheduleCodexThreadModelSync(300);
-      return true;
-    }
-    if (previous.attempts >= 3) return true;
-    previous.attempts += 1;
-    const efforts = modelReasoningEfforts(fallback);
-    const effort = efforts.some((entry) => entry.reasoningEffort === picker.reasoningEffort)
-      ? picker.reasoningEffort : codexPlusModelMetadata(fallback)?.defaultReasoningEffort || efforts[0]?.reasoningEffort;
-    const epoch = codexThreadModelRetentionSettingsChanged().epoch;
-    try {
-      Promise.resolve(picker.onSelectModel(fallback, effort)).then(() => {
-        if (codexThreadModelAutomaticSyncAllowed(owner) && codexThreadModelRetentionSettingsChanged().epoch === epoch
-            && window.__codexPlusThreadModelFallbackStates?.get(node) === previous) {
-          scheduleCodexThreadModelSync(300);
-        }
-      }, () => {});
-    } catch {}
-    return true;
   }
 
   function syncCodexRetainedThreadModels() {
@@ -1158,20 +1176,20 @@
         states.delete(node);
         continue;
       }
-      // 只有确实存在历史选择、且最新目录已经无法恢复它时，才回退到当前默认模型。
-      // 没有历史记录的全新会话交给 Codex 原生默认值，避免这里抢先改写初始状态。
+      // 目录就绪后没有可恢复的模型时保留原生选择，不强制切到默认模型。
       if (!saved) {
-        const latest = owner ? codexLatestThreadModel(hostId, owner) : null;
-        if (!latest || !codexFallbackThreadModelSelection(node, picker, hostId, owner, latest)) states.delete(node);
+        if (codexModelCatalog.status === "ok") codexThreadModelRetentionSettingsChanged().threads.set(owner, "settled");
+        states.delete(node);
         continue;
       }
       if (!picker.models.some((entry) => entry?.model === saved.model)) {
+        codexThreadModelRetentionSettingsChanged().threads.set(owner, "settled");
         states.delete(node);
-        codexFallbackThreadModelSelection(node, picker, hostId, owner, codexLatestThreadModel(hostId, owner));
         continue;
       }
       const signature = JSON.stringify([key, picker.model, picker.reasoningEffort, saved.model, saved.effort, saved.at]);
       if (picker.model === saved.model && (saved.effort == null || picker.reasoningEffort === saved.effort)) {
+        codexThreadModelRetentionSettingsChanged().threads.set(owner, "settled");
         states.delete(node);
         continue;
       }
@@ -1184,7 +1202,8 @@
       // 避免在原生乐观更新、会话加载或用户切换模型过程中抢写。
       if (previous.inFlight || Date.now() - previous.since < 1500) continue;
       if (previous.attempts >= 3) {
-        codexFallbackThreadModelSelection(node, picker, hostId, owner, codexLatestThreadModel(hostId, owner));
+        codexThreadModelRetentionSettingsChanged().threads.set(owner, "settled");
+        states.delete(node);
         continue;
       }
       previous.attempts += 1;

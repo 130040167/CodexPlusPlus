@@ -301,7 +301,7 @@ it("an arrow at the slider boundary does not confirm a native fallback as a new 
   r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();
   assert.equal(r.api.codexRetainedThreadModel("local","one").effort,"high");
 });
-it("stable native fallback restores once; pending user selection and locked pickers are respected",async()=>{
+it("stable native selection restores once and does not override subsequent changes",async()=>{
   const r=runtime(); const calls:any[]=[];
   r.direct();r.fresh();
   r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
@@ -312,12 +312,12 @@ it("stable native fallback restores once; pending user selection and locked pick
   assert.deepEqual(calls,[["sol","high"]]);r.tick();r.api.syncCodexRetainedThreadModels();assert.equal(calls.length,1);
   await Promise.resolve();
   picker.model="sol";picker.reasoningEffort="high";r.api.syncCodexRetainedThreadModels();
-  picker.model="gpt-5.5";r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();assert.equal(calls.length,2);
+  picker.model="gpt-5.5";r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();assert.equal(calls.length,1);
   let done:any; const p=r.api.sendCodexRetainedModelRequest({hostId:"local"},()=>new Promise(resolve=>{done=resolve}),"thread/settings/update",{threadId:"one",model:"gpt-5.5",effort:"low"});
-  r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();assert.equal(calls.length,2);done({});await p;
-  r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();assert.equal(calls.length,2);
+  r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();assert.equal(calls.length,1);done({});await p;
+  r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();assert.equal(calls.length,1);
 });
-it("an unavailable historical model falls back to the configured default without replacing history",()=>{
+it("an unavailable historical model leaves the native selection and saved history unchanged",()=>{
   const r=runtime(),f=pickerFixture(r,"sol"),calls:any[]=[];
   r.direct();r.fresh();
   r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
@@ -326,19 +326,19 @@ it("an unavailable historical model falls back to the configured default without
   f.picker.onSelectModel=(model:string,effort:string)=>{calls.push([model,effort]);f.picker.model=model;f.picker.reasoningEffort=effort};
   const before=r.storage.get("codexPlus.threadModels.v1");
   r.api.syncCodexRetainedThreadModels();r.api.syncCodexRetainedThreadModels();
-  assert.deepEqual(calls,[["gpt-5.5","low"]]);
+  assert.deepEqual(calls,[]);assert.equal(f.picker.model,"sol");
   assert.equal(r.storage.get("codexPlus.threadModels.v1"),before);
 });
-it("a retained model missing from the refreshed picker also uses the default after restore failure",()=>{
+it("a retained model missing from the refreshed picker does not force a default",()=>{
   const r=runtime(),f=pickerFixture(r,"sol"),calls:any[]=[];
   r.direct();r.fresh();
   r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
   f.picker.models=[{model:"gpt-5.5"}];
   f.picker.onSelectModel=(model:string,effort:string)=>{calls.push([model,effort]);f.picker.model=model;f.picker.reasoningEffort=effort};
   r.api.syncCodexRetainedThreadModels();r.api.syncCodexRetainedThreadModels();
-  assert.deepEqual(calls,[["gpt-5.5","low"]]);
+  assert.deepEqual(calls,[]);assert.equal(f.picker.model,"sol");
 });
-it("three failed native restores trigger default selection while preserving the saved choice",async()=>{
+it("three failed native restores stop without forcing a default or replacing history",async()=>{
   const r=runtime(),f=pickerFixture(r,"gpt-5.5"),calls:any[]=[];
   r.direct();r.fresh();
   r.setDefault("cpx-b/sol");
@@ -355,7 +355,7 @@ it("three failed native restores trigger default selection while preserving the 
     await Promise.resolve();await Promise.resolve();
   }
   assert.deepEqual(calls.slice(0,3),[["sol","high"],["sol","high"],["sol","high"]]);
-  assert.deepEqual(calls[3],["cpx-b/sol","low"]);
+  assert.equal(calls.length,3);assert.equal(f.picker.model,"gpt-5.5");
   assert.equal(r.storage.get("codexPlus.threadModels.v1"),before);
 });
 it("explicit native local selections update memory even when settings RPC is unsupported or skipped", async()=>{
@@ -398,7 +398,7 @@ it("local user selection also retains the provider captured before catalog chang
   r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();
   assert.equal(r.api.codexRetainedThreadModel("local","one").groupId,"a");
 });
-it("failed restores retry when native callback is ready and stop after three attempts",async()=>{
+it("failed restores retry while pending and stop once the native callback succeeds",async()=>{
   const r=runtime(),f=pickerFixture(r);let failed=0,ready=0;
   r.direct();r.fresh();
   r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
@@ -411,7 +411,7 @@ it("failed restores retry when native callback is ready and stop after three att
   f.picker.model="gpt-5.5";f.picker.onSelectModel=()=>{failed++;throw Error("not ready")};
   r.api.syncCodexRetainedThreadModels();
   for(let i=0;i<8;i++){r.tick();r.api.syncCodexRetainedThreadModels();await Promise.resolve();}
-  assert.equal(failed,4);
+  assert.equal(failed,1);
 });
 it("undefined native callback results are verified from picker state and do not spin",async()=>{
   const r=runtime(),f=pickerFixture(r);let calls=0;
@@ -520,6 +520,68 @@ it("only observed new unmanaged local threads can automatically synchronize",asy
   const resume=r.api.sendCodexRetainedModelRequest({hostId:"local"},()=>new Promise(resolve=>{done=resolve}),"thread/resume",{threadId:"one"});
   r.tick();r.api.syncCodexRetainedThreadModels();assert.equal(calls.length,1);
   done({});await resume;r.tick();r.api.syncCodexRetainedThreadModels();assert.equal(calls.length,1);
+});
+
+it("a resumed conversation keeps a later manual model and effort across scans",async()=>{
+  for(const mode of ["pureApi", "aggregate"]) for(const enabled of [false,true]) {
+    const r=runtime(),f=pickerFixture(r,"sol"),calls:any[]=[];
+    if(mode === "pureApi") r.direct();
+    f.picker.reasoningEffort="high";
+    r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
+    r.enabled(enabled);
+    f.picker.onSelectModel=(...args:any[])=>{calls.push(args);};
+    let finish:any;
+    const params={threadId:"one",model:"sol",reasoningEffort:"high"};
+    const resume=r.api.sendCodexRetainedModelRequest({hostId:"local"},(_method:any,value:any)=>{
+      assert.equal(value,params);
+      return new Promise(resolve=>{finish=resolve;});
+    },"thread/resume",params);
+    f.choose("gpt-5.5");f.picker.model="gpt-5.5";f.picker.reasoningEffort="low";
+    finish({});await resume;
+    for(let i=0;i<5;i++){r.api.syncCodexRetainedThreadModels();r.tick();r.runTimers();await Promise.resolve();}
+    assert.deepEqual(calls,[],`${mode} retention=${enabled}`);
+    assert.equal(f.picker.model,"gpt-5.5");assert.equal(f.picker.reasoningEffort,"low");
+    if(enabled) {
+      assert.equal(r.api.codexRetainedThreadModel("local","one").model,"gpt-5.5");
+      assert.equal(r.api.codexRetainedThreadModel("local","one").effort,"low");
+    }
+  }
+});
+
+it("a fresh conversation stops automatic restoration after the initial choice has settled",async()=>{
+  for(const initiallyMatched of [true,false]) {
+    const r=runtime(),f=pickerFixture(r,initiallyMatched ? "sol" : "gpt-5.5"),calls:any[]=[];
+    r.direct();r.fresh();
+    r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local");
+    if(initiallyMatched) f.picker.reasoningEffort="high";
+    f.picker.onSelectModel=(model:string,effort:string)=>{
+      calls.push([model,effort]);f.picker.model=model;f.picker.reasoningEffort=effort;
+    };
+    r.api.syncCodexRetainedThreadModels();r.tick();r.api.syncCodexRetainedThreadModels();await Promise.resolve();
+    r.api.syncCodexRetainedThreadModels();
+    assert.equal(calls.length,initiallyMatched ? 0 : 1);
+    // Native selection can change through paths the injected event observer does not see.
+    f.picker.model="gpt-5.5";f.picker.reasoningEffort="low";
+    for(let i=0;i<5;i++){r.tick();r.api.syncCodexRetainedThreadModels();await Promise.resolve();}
+    assert.equal(calls.length,initiallyMatched ? 0 : 1);
+    assert.equal(f.picker.model,"gpt-5.5");assert.equal(f.picker.reasoningEffort,"low");
+  }
+});
+
+it("late acknowledgements for an older manual choice cannot replace the newer one",async()=>{
+  const r=runtime(),f=pickerFixture(r,"sol");r.direct();r.fresh();
+  r.api.rememberCodexThreadModel("thread/settings/update",{threadId:"one",model:"sol",effort:"high"},{},"local",undefined,true);
+  let finishOld:any,finishNew:any;
+  f.choose("gpt-5.5");
+  const old=r.api.sendCodexRetainedModelRequest({hostId:"local"},()=>new Promise(resolve=>{finishOld=resolve;}),
+    "thread/settings/update",{threadId:"one",model:"gpt-5.5"});
+  r.tick();f.choose("high");
+  const current=r.api.sendCodexRetainedModelRequest({hostId:"local"},()=>new Promise(resolve=>{finishNew=resolve;}),
+    "thread/settings/update",{threadId:"one",model:"sol",effort:"high"});
+  f.picker.model="sol";f.picker.reasoningEffort="high";
+  finishNew({});await current;finishOld({});await old;
+  assert.equal(r.api.codexRetainedThreadModel("local","one").model,"sol");
+  assert.equal(r.api.codexRetainedThreadModel("local","one").effort,"high");
 });
 
 it("aggregate, managed history, and recovery-pending sessions never auto-select",()=>{

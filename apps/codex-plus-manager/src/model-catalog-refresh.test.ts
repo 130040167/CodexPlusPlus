@@ -5,12 +5,14 @@ import vm from "node:vm";
 
 const source = await readFile(new URL("../../../assets/inject/renderer-inject/70-model-catalog.js", import.meta.url), "utf8");
 const preparationSource = await readFile(new URL("../../../assets/inject/renderer-inject/30-service-tier.js", import.meta.url), "utf8");
-function runtime(sharedWindow: any = {}) {
+function runtime(sharedWindow: any = {}, initialSettings?: any, settingsLoaded = true) {
   let now = 10000;
   let nextTimerId = 0;
-  let settings: any = { relayProfilesEnabled: true, activeRelayId: "codex-plus-gateway",
+  let whitelistUnlock = true;
+  let settings: any = initialSettings || { relayProfilesEnabled: true, activeRelayId: "codex-plus-gateway",
     relayProfiles: [{ id: "codex-plus-gateway", relayMode: "pureApi", model: "a/sol", modelList: "a/sol" }] };
   const pending: Array<(value: any) => void> = [], rejected: Array<(error: Error) => void> = [], invalidated: any[] = [];
+  const requests: string[] = [];
   const diagnostics: Array<{ name: string; details: any }> = [];
   const timers = new Map<number, { at: number; callback: () => void }>();
   const queries = [
@@ -25,11 +27,14 @@ function runtime(sharedWindow: any = {}) {
   const context = vm.createContext({
     window: sharedWindow, Response, Map, WeakMap, Set, Promise, Date: { now: () => now },
     uniqueValues: (values: any[]) => [...new Set(values.filter(value => typeof value === "string" && value.trim()))],
-    codexPlusSettings: () => ({ modelWhitelistUnlock: true }),
-    codexPlusBackendSettingsLoaded: true, codexPlusBackendSettings: settings,
-    codexRemoteSessionActiveProfile: () => settings.relayProfiles.find((entry: any) => entry.id === settings.activeRelayId),
+    codexPlusSettings: () => ({ modelWhitelistUnlock: whitelistUnlock }),
+    codexPlusBackendSettingsLoaded: settingsLoaded, codexPlusBackendSettings: settings,
+    codexRemoteSessionActiveProfile: () => settings.relayProfiles?.find((entry: any) => entry.id === settings.activeRelayId),
     codexServiceTierModelFromValue: (value: any) => value,
-    postJson: () => new Promise((resolve, reject) => { pending.push(resolve); rejected.push(reject); }),
+    postJson: (path: string) => {
+      requests.push(path);
+      return new Promise((resolve, reject) => { pending.push(resolve); rejected.push(reject); });
+    },
     setTimeout: (callback: () => void, delay: number) => {
       const id = ++nextTimerId;
       timers.set(id, { at: now + delay, callback });
@@ -42,18 +47,22 @@ function runtime(sharedWindow: any = {}) {
     }),
     renderCodexPlusMenu: () => {}, scheduleCodexModelWhitelistRefresh: () => {},
     codexPlusModelPickerCatalogChanged: () => {},
+    ensureCodexModelWhitelistInstalls: () => {}, runCodexModelWhitelistRefreshPass: () => {},
     sendCodexPlusDiagnostic: (name: string, details: any) => diagnostics.push({ name, details }),
   });
   const declarations = source.slice(source.indexOf("  let codexModelCatalog ="), source.indexOf("  if (window.__CODEX_PLUS_TEST_SERVICE_TIER__)"));
   const functions = source.slice(source.indexOf("  function codexPlusModelUnlockEnabled()"), source.indexOf("  function appServerModelRequestMethod("));
+  const scan = source.slice(source.indexOf("  function refreshCodexModelWhitelistFromScan("), source.indexOf("  function threadIdVariants("));
   const preparation = preparationSource.slice(preparationSource.indexOf("  const codexAppServerPreparationTimeoutMs ="),
     preparationSource.indexOf("  async function loadBackendSettingsState("));
   assert.ok(preparation.includes("async function readCodexAppServerPreparation("));
-  const api = vm.runInContext(`(() => {${preparation}${declarations}${functions}
+  assert.ok(scan.includes("function refreshCodexModelWhitelistFromScan("));
+  const api = vm.runInContext(`(() => {${preparation}${declarations}${functions}${scan}
     return { loadCodexModelCatalog, refreshCodexModelCatalogForSettings, patchModelArray, patchModelContainer,
-      installModelJsonResponsePatch, patchStatsigModelWhitelist,
+      installModelJsonResponsePatch, patchStatsigModelWhitelist, refreshCodexModelWhitelistFromScan,
       catalog: () => codexModelCatalog }; })()`, context);
-  return { api, pending, rejected, invalidated, diagnostics, queries, window: sharedWindow, tick: (duration = 11000) => {
+  return { api, pending, rejected, invalidated, diagnostics, queries, requests, window: sharedWindow,
+    setWhitelistUnlock: (enabled: boolean) => { whitelistUnlock = enabled; }, tick: (duration = 11000) => {
       const until = now + duration;
       for (;;) {
         const next = [...timers.entries()].sort((left, right) => left[1].at - right[1].at)[0];
@@ -68,6 +77,7 @@ function runtime(sharedWindow: any = {}) {
       const previous = settings;
       settings = next;
       context.codexPlusBackendSettings = settings;
+      context.codexPlusBackendSettingsLoaded = true;
       api.refreshCodexModelCatalogForSettings(previous, next);
     }, settings: () => settings };
 }
@@ -162,8 +172,12 @@ it("temporary failures keep the last successful catalog and retry with bounded b
   assert.equal(r.pending.length, 0, "scan ticks must not flood a disconnected backend");
   r.tick();
   const retry = r.api.loadCodexModelCatalog();
-  r.pending.shift()!({ status: "failed", models: [], message: "backend restarting" });
-  await retry;
+  r.pending.shift()!({ status: "failed", model: "backend/current", default_model: "backend/default", models: [], message: "backend restarting" });
+  const backendFailure = await retry;
+  assert.equal(backendFailure.model, "backend/current");
+  assert.equal(backendFailure.default_model, "backend/default");
+  assert.equal(r.api.catalog().model, "a/sol");
+  assert.equal(r.api.catalog().default_model, "a/sol");
   assert.deepEqual([...r.api.catalog().models], ["a/sol", "b/sol"]);
   assert.equal(r.invalidated.length, 1, "failures must not invalidate native model data");
   r.tick();
@@ -172,6 +186,323 @@ it("temporary failures keep the last successful catalog and retry with bounded b
   r.pending.shift()!(catalog(["a/new"]));
   await settle();
   assert.deepEqual([...r.api.catalog().models], ["a/new"]);
+});
+for (const status of ["failed", "missing"]) {
+  it(`${status} responses do not retry during 200ms scans for ten seconds`, async () => {
+    const runtimeState = runtime();
+    runtimeState.setWhitelistUnlock(false);
+    runtimeState.api.refreshCodexModelWhitelistFromScan([]);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      runtimeState.pending.shift()!({ status, model: "", default_model: "", models: [], message: status });
+      await settle();
+      for (let elapsed = 200; elapsed < 10000; elapsed += 200) {
+        runtimeState.tick(200);
+        runtimeState.api.refreshCodexModelWhitelistFromScan([]);
+        await settle();
+        assert.equal(runtimeState.requests.length, attempt, `unexpected retry at ${elapsed}ms`);
+      }
+      runtimeState.tick(199);
+      runtimeState.api.refreshCodexModelWhitelistFromScan([]);
+      assert.equal(runtimeState.requests.length, attempt);
+      assert.equal(runtimeState.diagnostics.filter(entry => entry.name === "model_catalog_refresh_failed").length, attempt);
+      runtimeState.tick(1);
+      runtimeState.api.refreshCodexModelWhitelistFromScan([]);
+      assert.equal(runtimeState.requests.length, attempt + 1, "retry begins at the ten-second boundary");
+    }
+    runtimeState.pending.shift()!(catalog(["a/recovered"]));
+    await settle();
+    assert.deepEqual([...runtimeState.api.catalog().models], ["a/recovered"]);
+  });
+
+  it(`${status} responses preserve backend model fields and retry on a settings heartbeat`, async () => {
+    const runtimeState = runtime();
+    const first = runtimeState.api.loadCodexModelCatalog();
+    runtimeState.pending.shift()!({ status, model: "provider/current", default_model: "provider/default", models: [] });
+    const failure = await first;
+    assert.equal(failure.status, "failed");
+    assert.equal(failure.model, "provider/current");
+    assert.equal(failure.default_model, "provider/default");
+    assert.equal(runtimeState.api.catalog().model, "provider/current");
+    assert.equal(runtimeState.api.catalog().default_model, "provider/default");
+    assert.equal((await runtimeState.api.loadCodexModelCatalog()).default_model, "provider/default");
+    runtimeState.tick(9999);
+    runtimeState.update({ ...runtimeState.settings() });
+    assert.equal(runtimeState.requests.length, 1);
+    runtimeState.tick(1);
+    runtimeState.update({ ...runtimeState.settings() });
+    assert.equal(runtimeState.requests.length, 2);
+    runtimeState.pending.shift()!(catalog(["a/recovered"]));
+    await settle();
+    assert.deepEqual([...runtimeState.api.catalog().models], ["a/recovered"]);
+  });
+
+  it(`${status} catalog fields do not change native hidden state without a successful snapshot`, async () => {
+    const runtimeState = runtime();
+    const first = runtimeState.api.loadCodexModelCatalog();
+    runtimeState.pending.shift()!({ status, model: "a/current", default_model: "a/default", models: [] });
+    const failure = await first;
+    assert.equal(failure.model, "a/current");
+    assert.equal(failure.default_model, "a/default");
+    const hiddenModels = ["a/current", "a/default", "native"];
+    const hidden_models = [...hiddenModels];
+    const value = { hostId: "local", models: [{ model: "a/current", hidden: true },
+      { model: "a/default", hidden: true }], hiddenModels, hidden_models };
+    runtimeState.api.patchModelContainer(value);
+    assert.equal(value.models[0].hidden, true);
+    assert.equal(value.models[1].hidden, true);
+    assert.equal(value.hiddenModels, hiddenModels);
+    assert.equal(value.hidden_models, hidden_models);
+    assert.deepEqual(value.hiddenModels, ["a/current", "a/default", "native"]);
+    assert.deepEqual(value.hidden_models, ["a/current", "a/default", "native"]);
+  });
+}
+
+it("successful snapshot visibility remains authoritative after a failed refresh", async () => {
+  const runtimeState = runtime();
+  const initial = runtimeState.api.loadCodexModelCatalog();
+  runtimeState.pending.shift()!(catalog(["a/hidden", "a/visible"], { "a/hidden": { hidden: true } }));
+  await initial;
+  const refresh = runtimeState.api.loadCodexModelCatalog(true);
+  runtimeState.pending.shift()!({ status: "failed", model: "other", default_model: "other", models: [] });
+  assert.equal((await refresh).model, "other");
+  const value = { hostId: "local", models: [{ model: "a/hidden", hidden: false },
+    { model: "a/visible", hidden: true }], hiddenModels: ["a/hidden", "a/visible"] };
+  runtimeState.api.patchModelContainer(value);
+  assert.equal(value.models[0].hidden, true);
+  assert.equal(value.models[1].hidden, false);
+  assert.deepEqual([...value.hiddenModels], ["a/hidden"]);
+});
+
+it("first full settings after reinjection preserves cooldown for the same actual provider", async () => {
+  const settings = { relayProfilesEnabled: true, activeRelayId: "provider-a", aggregateRelayProfiles: [],
+    relayProfiles: [{ id: "provider-a", relayMode: "pureApi", modelList: "a/current\na/default",
+      configContents: 'model = "a/current"\n[model_providers.custom]\napi_key = "private-config-token"',
+      authContents: '{"OPENAI_API_KEY":"private-auth-token"}', apiKeys: [{ apiKey: "private-api-token" }] }] };
+  const firstRuntime = runtime({}, settings);
+  const first = firstRuntime.api.loadCodexModelCatalog();
+  firstRuntime.pending.shift()!({ status: "missing", model: "a/current", default_model: "a/default", models: [] });
+  await first;
+  const nextRuntime = runtime(firstRuntime.window, { providerSyncEnabled: false, enhancementsEnabled: true }, false);
+  nextRuntime.update(structuredClone(settings));
+  assert.equal(nextRuntime.requests.length, 0, "initial settings must not clear the existing cooldown");
+  assert.doesNotMatch(JSON.stringify(nextRuntime.window.__codexPlusModelCatalogRuntime), /private-(config|auth|api)-token/);
+  nextRuntime.tick(9999);
+  nextRuntime.update(structuredClone(settings));
+  assert.equal(nextRuntime.requests.length, 0);
+  nextRuntime.tick(1);
+  nextRuntime.update(structuredClone(settings));
+  assert.equal(nextRuntime.requests.length, 1);
+  nextRuntime.pending.shift()!(catalog(["a/recovered"]));
+  await settle();
+});
+
+it("first full settings after reinjection still refreshes a successful catalog", async () => {
+  const firstRuntime = runtime();
+  const first = firstRuntime.api.loadCodexModelCatalog();
+  firstRuntime.pending.shift()!(catalog(["a/old"]));
+  await first;
+  const nextRuntime = runtime(firstRuntime.window, { providerSyncEnabled: false, enhancementsEnabled: true }, false);
+  nextRuntime.update(structuredClone(firstRuntime.settings()));
+  assert.equal(nextRuntime.requests.length, 1);
+  nextRuntime.pending.shift()!(catalog(["a/new"]));
+  await settle();
+  assert.equal(nextRuntime.api.catalog().model, "a/new");
+});
+
+it("a changed configContents default on first settings load bypasses cooldown and ignores the old runtime", async () => {
+  const settings = { relayProfilesEnabled: true, activeRelayId: "provider-a", aggregateRelayProfiles: [],
+    relayProfiles: [{ id: "provider-a", relayMode: "pureApi", modelList: "a/old\na/new",
+      configContents: 'model = "a/old"\n[model_providers.custom]\napi_key = "private-token"' }] };
+  const firstRuntime = runtime({}, settings);
+  const first = firstRuntime.api.loadCodexModelCatalog();
+  firstRuntime.pending.shift()!({ status: "failed", models: [] });
+  await first;
+  const old = firstRuntime.api.loadCodexModelCatalog(true);
+  const resolveOld = firstRuntime.pending.shift()!;
+  const nextRuntime = runtime(firstRuntime.window, { providerSyncEnabled: false, enhancementsEnabled: true }, false);
+  const changed = structuredClone(settings);
+  changed.relayProfiles[0].configContents = changed.relayProfiles[0].configContents.replace('model = "a/old"', 'model = "a/new"');
+  nextRuntime.update(changed);
+  assert.equal(nextRuntime.requests.length, 1, "the real default changed even though serialized profile.model is absent");
+  nextRuntime.pending.shift()!(catalog(["a/new"]));
+  await settle();
+  resolveOld(catalog(["a/old"]));
+  await old;
+  assert.equal(nextRuntime.api.catalog().model, "a/new");
+  assert.doesNotMatch(JSON.stringify(nextRuntime.window.__codexPlusModelCatalogRuntime), /private-token/);
+});
+
+it("a changed aggregate member catalog on first settings load bypasses cooldown", async () => {
+  const settings = { relayProfilesEnabled: true, activeRelayId: "aggregate-a", activeAggregateRelayId: "aggregate-a",
+    aggregateRelayProfiles: [{ id: "aggregate-a", modelAggregationEnabled: true,
+      members: [{ relayId: "provider-a", weight: 1 }], defaultRelayId: "provider-a" }],
+    relayProfiles: [{ id: "aggregate-a", relayMode: "aggregate", modelList: "" },
+      { id: "provider-a", relayMode: "pureApi", modelList: "a/old", configContents: 'model = "a/old"' }] };
+  const firstRuntime = runtime({}, settings);
+  const first = firstRuntime.api.loadCodexModelCatalog();
+  firstRuntime.pending.shift()!({ status: "failed", models: [] });
+  await first;
+  const nextRuntime = runtime(firstRuntime.window, { providerSyncEnabled: false, enhancementsEnabled: true }, false);
+  const changed = structuredClone(settings);
+  changed.relayProfiles[1].modelList = "a/new";
+  nextRuntime.update(changed);
+  assert.equal(nextRuntime.requests.length, 1);
+  nextRuntime.pending.shift()!(catalog(["a/new"]));
+  await settle();
+});
+
+it("changing a serialized profile default invalidates an in-flight read immediately", async () => {
+  const settings = { relayProfilesEnabled: true, activeRelayId: "provider-a", aggregateRelayProfiles: [],
+    relayProfiles: [{ id: "provider-a", relayMode: "pureApi", modelList: "a/old\na/new",
+      configContents: 'model = "a/old"\n[model_providers.custom]\napi_key = "private-token"' }] };
+  const runtimeState = runtime({}, settings);
+  const old = runtimeState.api.loadCodexModelCatalog();
+  const resolveOld = runtimeState.pending.shift()!;
+  const changed = structuredClone(settings);
+  changed.relayProfiles[0].configContents = changed.relayProfiles[0].configContents.replace('model = "a/old"', 'model = "a/new"');
+  runtimeState.update(changed);
+  assert.equal(runtimeState.requests.length, 2);
+  runtimeState.pending.shift()!(catalog(["a/new"]));
+  await settle();
+  resolveOld(catalog(["a/old"]));
+  await old;
+  assert.equal(runtimeState.api.catalog().model, "a/new");
+});
+
+it("changing an aggregate member model list triggers a refresh with unchanged aggregate settings", async () => {
+  const settings = { relayProfilesEnabled: true, activeRelayId: "aggregate-a", activeAggregateRelayId: "aggregate-a",
+    aggregateRelayProfiles: [{ id: "aggregate-a", modelAggregationEnabled: true,
+      members: [{ relayId: "provider-a", weight: 1 }], defaultRelayId: "provider-a" }],
+    relayProfiles: [{ id: "aggregate-a", relayMode: "aggregate", modelList: "" },
+      { id: "provider-a", relayMode: "pureApi", modelList: "a/old", configContents: 'model = "a/old"' }] };
+  const runtimeState = runtime({}, settings);
+  const first = runtimeState.api.loadCodexModelCatalog();
+  runtimeState.pending.shift()!({ status: "failed", models: [] });
+  await first;
+  const changed = structuredClone(settings);
+  changed.relayProfiles[1].modelList = "a/new";
+  runtimeState.update(changed);
+  assert.equal(runtimeState.requests.length, 2);
+  runtimeState.pending.shift()!(catalog(["a/new"]));
+  await settle();
+});
+
+it("a failed read before any settings load keeps its cooldown through first full settings", async () => {
+  const defaults = { providerSyncEnabled: false, enhancementsEnabled: true };
+  const firstRuntime = runtime({}, defaults, false);
+  const first = firstRuntime.api.loadCodexModelCatalog();
+  firstRuntime.pending.shift()!({ status: "missing", models: [] });
+  await first;
+  const nextRuntime = runtime(firstRuntime.window, defaults, false);
+  nextRuntime.update({ ...defaults, relayProfilesEnabled: true, activeRelayId: "provider-a",
+    relayProfiles: [{ id: "provider-a", relayMode: "pureApi", modelList: "a/model" }] });
+  assert.equal(nextRuntime.requests.length, 0);
+  nextRuntime.tick(10000);
+  nextRuntime.api.refreshCodexModelWhitelistFromScan([]);
+  assert.equal(nextRuntime.requests.length, 1);
+  nextRuntime.pending.shift()!(catalog(["a/model"]));
+  await settle();
+});
+
+it("a legacy runtime with a known different provider does not transfer its cooldown", async () => {
+  const firstRuntime = runtime();
+  const first = firstRuntime.api.loadCodexModelCatalog();
+  firstRuntime.pending.shift()!({ status: "failed", models: [] });
+  await first;
+  delete firstRuntime.window.__codexPlusModelCatalogRuntime.matchesSettings;
+  const nextRuntime = runtime(firstRuntime.window, { providerSyncEnabled: false, enhancementsEnabled: true }, false);
+  nextRuntime.update({ relayProfilesEnabled: true, activeRelayId: "another",
+    relayProfiles: [{ id: "another", relayMode: "pureApi", modelList: "new/model" }] });
+  assert.equal(nextRuntime.requests.length, 1);
+  nextRuntime.pending.shift()!(catalog(["new/model"]));
+  await settle();
+});
+
+it("a serialized model provider change invalidates an in-flight read", async () => {
+  const settings = { relayProfilesEnabled: true, activeRelayId: "provider-a", aggregateRelayProfiles: [],
+    relayProfiles: [{ id: "provider-a", relayMode: "pureApi", modelList: "a/model",
+      configContents: 'model = "a/model"\nmodel_provider = "old"\n[model_providers.old]\napi_key = "private-token"' }] };
+  const runtimeState = runtime({}, settings);
+  const old = runtimeState.api.loadCodexModelCatalog();
+  const resolveOld = runtimeState.pending.shift()!;
+  const changed = structuredClone(settings);
+  changed.relayProfiles[0].configContents = changed.relayProfiles[0].configContents.replace('model_provider = "old"', 'model_provider = "new"');
+  runtimeState.update(changed);
+  assert.equal(runtimeState.requests.length, 2);
+  runtimeState.pending.shift()!(catalog(["a/new"]));
+  await settle();
+  resolveOld(catalog(["a/old"]));
+  await old;
+  assert.equal(runtimeState.api.catalog().model, "a/new");
+});
+
+for (const field of ["configContents", "authContents"] as const) {
+  it(`a changed ${field} after reinjection refreshes without exposing its private value`, async () => {
+    const settings = { relayProfilesEnabled: true, activeRelayId: "provider-a", aggregateRelayProfiles: [],
+      relayProfiles: [{ id: "provider-a", relayMode: "pureApi", modelList: "a/model",
+        configContents: 'model = "a/model"\n[model_providers.custom]\nbase_url = "https://old.invalid/v1"\napi_key = "private-config-token"',
+        authContents: '{"OPENAI_API_KEY":"private-old-token"}' }] };
+    const firstRuntime = runtime({}, settings);
+    const first = firstRuntime.api.loadCodexModelCatalog();
+    firstRuntime.pending.shift()!({ status: "failed", models: [] });
+    await first;
+    const nextRuntime = runtime(firstRuntime.window, { providerSyncEnabled: false, enhancementsEnabled: true }, false);
+    const changed = structuredClone(settings);
+    changed.relayProfiles[0][field] = field === "configContents"
+      ? changed.relayProfiles[0][field].replace("old.invalid", "new.invalid")
+      : changed.relayProfiles[0][field].replace("private-old-token", "private-new-token");
+    nextRuntime.update(changed);
+    assert.equal(nextRuntime.requests.length, 1);
+    assert.doesNotMatch(JSON.stringify(nextRuntime.window.__codexPlusModelCatalogRuntime), /private-(config|old|new)-token/);
+    nextRuntime.pending.shift()!(catalog(["a/model"]));
+    await settle();
+  });
+}
+it("hot reinjection retains the failed catalog cooldown", async () => {
+  const firstRuntime = runtime();
+  const first = firstRuntime.api.loadCodexModelCatalog();
+  firstRuntime.pending.shift()!({ status: "missing", model: "", default_model: "", models: [] });
+  await first;
+  const nextRuntime = runtime(firstRuntime.window);
+  nextRuntime.api.refreshCodexModelWhitelistFromScan([]);
+  assert.equal(nextRuntime.requests.length, 0);
+  nextRuntime.tick(9999);
+  nextRuntime.api.refreshCodexModelWhitelistFromScan([]);
+  assert.equal(nextRuntime.requests.length, 0);
+  nextRuntime.tick(1);
+  nextRuntime.api.refreshCodexModelWhitelistFromScan([]);
+  assert.equal(nextRuntime.requests.length, 1);
+  nextRuntime.pending.shift()!(catalog(["a/recovered"]));
+  await settle();
+  assert.deepEqual([...nextRuntime.api.catalog().models], ["a/recovered"]);
+});
+it("a changed profile can refresh immediately during a failed catalog cooldown", async () => {
+  const runtimeState = runtime();
+  const first = runtimeState.api.loadCodexModelCatalog();
+  runtimeState.pending.shift()!({ status: "failed", model: "old/model", default_model: "old/default", models: [] });
+  await first;
+  runtimeState.update({ ...runtimeState.settings(), activeRelayId: "another" });
+  assert.equal(runtimeState.requests.length, 2);
+  runtimeState.pending.shift()!(catalog(["new/model"]));
+  await settle();
+  assert.equal((await runtimeState.api.loadCodexModelCatalog()).model, "new/model");
+});
+it("changing profiles does not carry the old failure through reinjection", async () => {
+  const firstRuntime = runtime();
+  const first = firstRuntime.api.loadCodexModelCatalog();
+  firstRuntime.pending.shift()!({ status: "failed", model: "old/model", default_model: "old/default", models: [] });
+  await first;
+  firstRuntime.update({ ...firstRuntime.settings(), activeRelayId: "another" });
+  const resolveOldRuntime = firstRuntime.pending.shift()!;
+  const nextRuntime = runtime(firstRuntime.window, firstRuntime.settings());
+  const current = nextRuntime.api.loadCodexModelCatalog();
+  assert.equal(nextRuntime.requests.length, 1, "the previous profile's cooldown must not suppress the new read");
+  nextRuntime.pending.shift()!(catalog(["new/model"]));
+  assert.equal((await current).model, "new/model");
+  resolveOldRuntime({ status: "failed", model: "old/late", default_model: "old/late-default", models: [] });
+  await settle();
+  assert.equal(nextRuntime.api.catalog().model, "new/model");
+  assert.equal((await nextRuntime.api.loadCodexModelCatalog()).status, "ok");
 });
 it("a timed-out initial read rejects its late result and permits retry after cooldown", async () => {
   const r = runtime();
@@ -195,11 +526,43 @@ it("a timed-out initial read rejects its late result and permits retry after coo
   assert.equal(r.api.catalog().status, "failed");
   assert.equal(r.invalidated.length, 0);
   assert.ok(r.diagnostics.some((entry) => entry.name === "app_server_preparation_read_timeout"));
-  r.tick(1000);
+  r.tick(9999);
+  assert.equal((await r.api.loadCodexModelCatalog()).status, "failed");
+  assert.equal(r.pending.length, 0);
+  r.tick(1);
   const retry = r.api.loadCodexModelCatalog();
   r.pending.shift()!(catalog(["a/retry"]));
   assert.equal((await retry).status, "ok");
   assert.deepEqual([...r.api.catalog().models], ["a/retry"]);
+});
+it("a late failed response cannot replace a newer successful catalog", async () => {
+  const runtimeState = runtime();
+  const old = runtimeState.api.loadCodexModelCatalog();
+  const resolveOld = runtimeState.pending.shift()!;
+  runtimeState.tick(2000);
+  assert.equal((await old).status, "failed");
+  const fresh = runtimeState.api.loadCodexModelCatalog(true);
+  runtimeState.pending.shift()!(catalog(["a/fresh"]));
+  await fresh;
+  resolveOld({ status: "failed", model: "a/stale", default_model: "a/stale-default", models: [] });
+  await settle();
+  assert.equal(runtimeState.api.catalog().model, "a/fresh");
+  assert.equal(runtimeState.api.catalog().default_model, "a/fresh");
+  assert.equal((await runtimeState.api.loadCodexModelCatalog()).status, "ok");
+  assert.equal(runtimeState.diagnostics.filter(entry => entry.name === "model_catalog_refresh_failed").length, 1);
+});
+it("an obsolete failed response cannot start a cooldown for a newer catalog", async () => {
+  const runtimeState = runtime();
+  const old = runtimeState.api.loadCodexModelCatalog();
+  const resolveOld = runtimeState.pending.shift()!;
+  const fresh = runtimeState.api.loadCodexModelCatalog(true);
+  runtimeState.pending.shift()!(catalog(["a/fresh"]));
+  await fresh;
+  resolveOld({ status: "missing", model: "a/stale", default_model: "a/stale-default", models: [] });
+  assert.equal((await old).model, "a/fresh");
+  assert.equal(runtimeState.api.catalog().model, "a/fresh");
+  assert.equal((await runtimeState.api.loadCodexModelCatalog()).status, "ok");
+  assert.equal(runtimeState.diagnostics.filter(entry => entry.name === "model_catalog_refresh_failed").length, 0);
 });
 it("a timed-out refresh preserves the visible snapshot without interrupting a new generation", async () => {
   const r = runtime();

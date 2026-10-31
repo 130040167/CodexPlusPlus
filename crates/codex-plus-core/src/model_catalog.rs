@@ -92,6 +92,9 @@ pub async fn read_codex_model_catalog() -> Value {
 fn relay_profile_model_catalog_value(home: &Path, profile: &RelayProfile) -> Value {
     let models = relay_profile_model_ids(profile);
     let model = profile.model.trim().to_string();
+    let effective_config_model = std::fs::read_to_string(home.join("config.toml"))
+        .map(|contents| effective_config_model(&contents))
+        .unwrap_or_default();
     let codex_model_provider = codex_model_provider_for_relay_profile(home, profile);
     let configured_model = crate::relay_config::relay_profile_model(profile);
     let default_model = if models.iter().any(|item| item == &configured_model) {
@@ -111,6 +114,7 @@ fn relay_profile_model_catalog_value(home: &Path, profile: &RelayProfile) -> Val
         "path": home.join("config.toml").to_string_lossy(),
         "service_tier": config_service_tier_value(home),
         "model": model,
+        "effective_config_model": effective_config_model,
         "model_provider": profile.id.trim(),
         "codex_model_provider": codex_model_provider,
         "provider_name": provider_name,
@@ -130,6 +134,40 @@ fn relay_profile_model_catalog_value(home: &Path, profile: &RelayProfile) -> Val
         ],
         "responses_api": responses_api_status("unknown", "", "")
     })
+}
+
+/// 只报告实际配置中显式声明的模型，并考虑当前启用的 profile。
+pub(crate) fn effective_config_model(contents: &str) -> String {
+    let Ok(config) = contents.parse::<toml::Value>() else {
+        return String::new();
+    };
+    let Some(root) = config.as_table() else {
+        return String::new();
+    };
+    let profile = match root.get("profile") {
+        Some(profile) => {
+            let Some(profile) = profile.as_str() else {
+                return String::new();
+            };
+            let Some(profile) = root
+                .get("profiles")
+                .and_then(toml::Value::as_table)
+                .and_then(|profiles| profiles.get(profile))
+                .and_then(toml::Value::as_table)
+            else {
+                return String::new();
+            };
+            Some(profile)
+        }
+        None => None,
+    };
+    profile
+        .and_then(|profile| profile.get("model"))
+        .or_else(|| root.get("model"))
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub fn codex_model_provider_for_relay_profile(home: &Path, profile: &RelayProfile) -> String {
@@ -1363,6 +1401,64 @@ mod model_fetch_tests {
         let catalog = relay_profile_model_catalog_value(home.path(), &profile);
 
         assert_eq!(catalog["default_model"], "qwen3-coder");
+    }
+
+    #[test]
+    fn relay_profile_catalog_reports_only_the_live_effective_config_model() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = RelayProfile {
+            model: "candidate".into(),
+            model_list: "candidate\nlive-root\nlive-profile".into(),
+            ..RelayProfile::default()
+        };
+        let config = home.path().join("config.toml");
+
+        assert_eq!(
+            relay_profile_model_catalog_value(home.path(), &profile)["effective_config_model"],
+            ""
+        );
+        std::fs::write(&config, "model = 'live-root'\n").unwrap();
+        assert_eq!(
+            relay_profile_model_catalog_value(home.path(), &profile)["effective_config_model"],
+            "live-root"
+        );
+        std::fs::write(
+            &config,
+            "model = 'live-root'\nprofile = 'work'\n[profiles.work]\nmodel = 'live-profile'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            relay_profile_model_catalog_value(home.path(), &profile)["effective_config_model"],
+            "live-profile"
+        );
+        std::fs::write(
+            &config,
+            "model = 'live-root'\nprofile = 'work'\n[profiles.work]\nother = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            relay_profile_model_catalog_value(home.path(), &profile)["effective_config_model"],
+            "live-root"
+        );
+        std::fs::write(&config, "model = 'live-root'\nprofile = 'missing'\n").unwrap();
+        assert_eq!(
+            relay_profile_model_catalog_value(home.path(), &profile)["effective_config_model"],
+            ""
+        );
+        std::fs::write(
+            &config,
+            "model = 'live-root'\nprofile = 'work'\n[profiles.work]\nmodel = 5\n",
+        )
+        .unwrap();
+        assert_eq!(
+            relay_profile_model_catalog_value(home.path(), &profile)["effective_config_model"],
+            ""
+        );
+        std::fs::write(&config, "model = [invalid\n").unwrap();
+        assert_eq!(
+            relay_profile_model_catalog_value(home.path(), &profile)["effective_config_model"],
+            ""
+        );
     }
 
     #[test]

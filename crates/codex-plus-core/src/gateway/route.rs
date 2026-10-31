@@ -1978,6 +1978,27 @@ mod tests {
     }
 
     #[test]
+    fn codex_binding_list_keeps_the_default_models_group_together() {
+        let mut gateway = gateway("deepseek-v4-pro");
+        gateway.auto_models = true;
+        let mut binding = gateway.binding(&ToolId::Claude).unwrap().clone();
+        binding.extra_models.push("declared-only".into());
+
+        let models = codex_binding_models(&gateway, &binding);
+        assert_eq!(models[0], "deepseek-v4-pro");
+        assert!(models.iter().any(|model| model == "declared-only"));
+
+        binding.model = "kimi-k3".into();
+        let models = codex_binding_models(&gateway, &binding);
+        assert_eq!(models[0], "kimi-k3");
+        assert!(models
+            .windows(2)
+            .any(|pair| pair == ["ds/deepseek-v4-pro", "deepseek-v4-flash"]));
+        assert_eq!(models.iter().filter(|model| *model == "kimi-k3").count(), 1);
+        assert!(models.iter().any(|model| model == "declared-only"));
+    }
+
+    #[test]
     fn shared_bare_models_route_through_their_auto_group() {
         let mut gateway = gateway("deepseek-v4-pro");
         // 自动组：成员是两家各自固定的那份，按池顺序；默认依次。

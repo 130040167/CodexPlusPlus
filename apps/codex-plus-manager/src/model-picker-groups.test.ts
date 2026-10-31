@@ -79,7 +79,7 @@ it("隐藏原生标签时同步退出无障碍树，避免读屏念两遍", asyn
 
 it("只有一个供应商时不接管原生列表", async () => {
   const source = await readShard();
-  assert.match(source, /if \(groups\.length < 2 &&/);
+  assert.match(source, /groups\.length < 2 &&/);
   assert.match(source, /catalogGroups\.size < 2/);
   // 单组时要能退回原始状态。
   assert.match(source, /codexPlusModelPickerClear\(list\)/);
@@ -201,16 +201,16 @@ it("模型选择器用单行工具栏、明确默认模型和缩进后的分组�
   const source = await readShard();
   assert.match(source, /spacer\.textContent = .*text\.selectModel/);
   assert.match(source, /codexPlusModelPickerDefaultModel\(\)/);
-  assert.match(source, /codexPlusConfiguredDefaultModel\(\)/);
-  assert.match(source, /codexModelCatalog\?\.status !== "not_applied"/);
+  assert.match(source, /codexModelCatalog\.effective_config_model/);
+  assert.match(source, /codexModelCatalog\?\.status !== "ok"/);
   assert.match(source, /aggregate_model_catalog", "aggregate_pool_catalog/);
   assert.match(source, /codex-plus-model-default-value/);
   assert.match(source, /composer\.modelPicker\.default\.label/);
-  assert.match(source, /codex-plus-model-default-subtitle/);
+  assert.match(source, /codex-plus-model-default-recommendation/);
   assert.match(source, /codex-plus-model-group-toolbar-title\{flex:1/);
   assert.match(source, /\[role="menuitemradio"\]\[data-codex-plus-model-group\]\{padding-left:30px/);
-  assert.match(source, /codexPlusModelPickerSyncDefaultRow\(list\)/);
-  assert.match(source, /codexPlusModelPickerSelectDefault/);
+  assert.match(source, /codexPlusModelPickerSyncDefaultRow\(list,/);
+  assert.doesNotMatch(source, /codexPlusModelPickerSelectDefault/);
   assert.match(source, /codexPlusModelPickerScheduleRescan\(\)/);
   assert.match(source, /兼容 v1 早期把供应商直接存成字符串/);
   assert.doesNotMatch(source, /codex-plus-model-recommendation/);
@@ -268,31 +268,32 @@ it("多开禁用供应商切换后仍显示固定供应商默认模型，拒绝�
     relayProfiles: [{ id: "fixed", relayMode: "pureApi" }],
   };
   const resolve = new Function(
-    "codexPlusConfiguredDefaultModel", "codexPlusBackendSettingsLoaded",
+    "codexPlusBackendSettingsLoaded",
     "codexRemoteSessionActiveProfile", "codexPlusBackendSettings", "codexModelCatalog",
     `${source.slice(start, end)}\nreturn codexPlusModelPickerDefaultModel();`,
   );
   const catalog = {
-    status: "ok", model: "gpt-6.1-sol", models: ["gpt-6.1-sol"],
-    sources: [{ id: "relay-profile:fixed" }],
+    status: "ok", model: "gpt-6.1-sol", effective_config_model: "gpt-6.1-sol", models: ["gpt-6.1-sol"],
+    sources: [{ id: "relay-profile:fixed", type: "relay_profile_model_list" }],
   };
-  assert.equal(resolve(() => "", true, () => null, settings, catalog), "gpt-6.1-sol");
-  assert.equal(resolve(() => "", true, () => null, settings, {
-    ...catalog, sources: [{ id: "relay-profile:other" }],
+  assert.equal(resolve(true, () => null, settings, catalog), "gpt-6.1-sol");
+  assert.equal(resolve(true, () => null, settings, {
+    ...catalog, sources: [{ id: "relay-profile:other", type: "relay_profile_model_list" }],
   }), "");
-  assert.equal(resolve(() => "", false, () => null, settings, catalog), "");
+  assert.equal(resolve(false, () => null, settings, catalog), "");
+  assert.equal(resolve(true, () => null, settings, { ...catalog, status: "not_applied" }), "");
+  assert.equal(resolve(true, () => null, settings, { ...catalog, effective_config_model: "unknown" }), "");
 });
 
-it("默认模型只取当前供应商允许的目录模型，目录未发布时才使用受限展示兜底", async () => {
+it("默认模型只显示已确认的配置值，恢复失败不强制切换", async () => {
   const picker = await readShard();
   const catalog = await readFile(CATALOG_URL, "utf8");
   assert.match(catalog, /function codexAggregateAllowedModelSet\(hostId, allowUnpublished = false\)/);
   assert.match(catalog, /function codexPlusConfiguredDefaultModel\(\)/);
-  assert.match(catalog, /function codexFallbackThreadModelSelection\(/);
   assert.match(catalog, /previous\.attempts >= 3/);
-  assert.match(catalog, /codexFallbackThreadModelSelection\(node, picker, hostId, owner/);
+  assert.doesNotMatch(catalog, /function codexFallbackThreadModelSelection\(/);
   assert.match(catalog, /allowed\.has\(model\)/);
-  assert.match(picker, /codexPlusConfiguredDefaultModel\(\)/);
+  assert.match(picker, /codexModelCatalog\.effective_config_model/);
   assert.match(picker, /aggregate_model_catalog", "aggregate_pool_catalog/);
 });
 
