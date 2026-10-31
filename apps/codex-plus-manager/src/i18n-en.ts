@@ -1807,6 +1807,8 @@ export const EN_PLAIN: Record<string, string> = {
   "重命名 Skill 分组": "Rename Skill group",
   "删除分组“{0}”？其中的 Skill 将回到来源分组。": "Delete group “{0}”? Its Skills will return to their source groups.",
   "新建分组": "New group",
+  "按名称排序": "Sort by name",
+  "拖动分组排序": "Drag to reorder group",
   "重命名": "Rename",
   "删除分组": "Delete group",
   "分配 Skill 分组": "Assign Skill group",

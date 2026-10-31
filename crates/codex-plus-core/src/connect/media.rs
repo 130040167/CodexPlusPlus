@@ -1,9 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use aes_gcm::aead::rand_core::{OsRng, RngCore};
 use aes_gcm::aes::{
     Aes128,
-    cipher::{BlockDecryptMut, KeyInit, block_padding::Pkcs7},
+    cipher::{BlockDecryptMut, BlockEncryptMut, KeyInit, block_padding::Pkcs7},
 };
 use anyhow::{Context, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -73,6 +74,54 @@ pub struct WeixinFileItem {
     pub len: String,
     #[serde(default)]
     pub md5: String,
+}
+
+#[derive(Default, Deserialize)]
+pub(super) struct MediaApiResponse {
+    #[serde(default)]
+    pub ret: i64,
+    #[serde(default)]
+    pub errcode: i64,
+    pub upload_param: Option<String>,
+    pub upload_full_url: Option<String>,
+}
+
+pub(super) struct PreparedUpload {
+    pub ciphertext: Vec<u8>,
+    pub plaintext_size: usize,
+    pub md5: String,
+    pub key_hex: String,
+    pub filekey: String,
+    pub filename: String,
+}
+
+impl PreparedUpload {
+    pub(super) async fn read_workspace(path: &Path, workspace: &Path) -> anyhow::Result<Self> {
+        let path = path.to_owned();
+        let workspace = workspace.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let (path, bytes) = super::outbound::read_workspace_file(&path, &workspace)?;
+            let mut key = [0u8; 16];
+            OsRng
+                .try_fill_bytes(&mut key)
+                .map_err(|_| anyhow::anyhow!("无法生成微信媒体加密密钥"))?;
+            Ok(Self {
+                plaintext_size: bytes.len(),
+                md5: hex(&Md5::digest(&bytes)),
+                ciphertext: ecb::Encryptor::<Aes128>::new((&key).into())
+                    .encrypt_padded_vec_mut::<Pkcs7>(&bytes),
+                key_hex: hex(&key),
+                filekey: uuid::Uuid::new_v4().to_string(),
+                filename: safe_filename(
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("file.bin"),
+                ),
+            })
+        })
+        .await
+        .context("读取外发附件任务失败")?
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +289,52 @@ impl MediaClient {
         Ok(url)
     }
 
+    pub(super) async fn upload(
+        &self,
+        upload: &PreparedUpload,
+        response: &MediaApiResponse,
+    ) -> anyhow::Result<String> {
+        let url = if let Some(url) = response
+            .upload_full_url
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            parse_url(url.trim())?
+        } else if let Some(param) = response
+            .upload_param
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            let mut url = self.endpoint("upload")?;
+            url.query_pairs_mut()
+                .append_pair("encrypted_query_param", param)
+                .append_pair("filekey", &upload.filekey);
+            url
+        } else {
+            bail!("微信响应缺少 CDN 上传信息");
+        };
+        validate_url(&url, self.local_origin.as_ref())?;
+        let response = self
+            .client
+            .post(url)
+            .header("content-type", "application/octet-stream")
+            .body(upload.ciphertext.clone())
+            .send()
+            .await
+            .map_err(network_error)?;
+        if response.status() != reqwest::StatusCode::OK {
+            bail!("微信 CDN 上传失败：HTTP {}", response.status());
+        }
+        response
+            .headers()
+            .get("x-encrypted-param")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .context("微信 CDN 上传响应缺少下载参数")
+    }
+
     fn endpoint(&self, path: &str) -> anyhow::Result<Url> {
         let mut url = self.base_url.clone();
         url.set_path(&format!(
@@ -294,7 +389,6 @@ fn parse_base64_key(encoded: &str) -> anyhow::Result<[u8; 16]> {
     }
 }
 
-#[cfg(test)]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

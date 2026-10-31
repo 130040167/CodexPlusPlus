@@ -9,6 +9,16 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdout, Command};
 
+use super::outbound::{AttachmentCalls, OutboundPermit, attachment_tool_spec};
+use super::weixin::WeixinClient;
+
+pub(super) struct WeixinReplyChannel<'a> {
+    pub client: &'a WeixinClient,
+    pub peer: &'a str,
+    pub context_token: &'a str,
+    pub permit: Option<OutboundPermit>,
+}
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// app-server 起不来时保留多少行 stderr 用于报错。
 const STDERR_TAIL_LINES: usize = 8;
@@ -276,12 +286,23 @@ impl CodexAppServer {
     }
 
     pub async fn prepare_thread(&mut self, thread_id: Option<&str>) -> anyhow::Result<String> {
+        self.prepare_thread_with_attachments(thread_id, false).await
+    }
+
+    pub(super) async fn prepare_thread_with_attachments(
+        &mut self,
+        thread_id: Option<&str>,
+        enabled: bool,
+    ) -> anyhow::Result<String> {
         let mut params = self.thread_params();
         let method = if let Some(thread_id) = thread_id.filter(|id| !id.trim().is_empty()) {
             params["threadId"] = Value::String(thread_id.trim().to_string());
             params["persistExtendedHistory"] = Value::Bool(true);
             "thread/resume"
         } else {
+            if enabled {
+                params["dynamicTools"] = json!([attachment_tool_spec()]);
+            }
             "thread/start"
         };
         let result = self.request(method, params, REQUEST_TIMEOUT).await?;
@@ -303,6 +324,25 @@ impl CodexAppServer {
         prompt: &str,
         image_paths: &[PathBuf],
     ) -> anyhow::Result<AppServerTurnResult> {
+        self.run_turn_with_reply(thread_id, prompt, image_paths, None)
+            .await
+    }
+
+    pub(super) async fn run_turn_with_reply(
+        &mut self,
+        thread_id: &str,
+        prompt: &str,
+        image_paths: &[PathBuf],
+        channel: Option<WeixinReplyChannel<'_>>,
+    ) -> anyhow::Result<AppServerTurnResult> {
+        let mut calls = AttachmentCalls::new(
+            channel
+                .as_ref()
+                .map(|channel| channel.peer)
+                .unwrap_or_default(),
+            thread_id,
+            channel.as_ref().and_then(|channel| channel.permit.clone()),
+        );
         let id = self.take_request_id();
         let params = turn_params(&self.config, thread_id, prompt, image_paths);
         self.write_json(&json!({
@@ -326,7 +366,14 @@ impl CodexAppServer {
             }
             let message = self.read_message(remaining).await?;
             if is_server_request(&message) {
-                self.reject_server_request(&message).await?;
+                if message["method"] == "item/tool/call"
+                    && let Some(channel) = channel.as_ref()
+                {
+                    self.handle_attachment_tool(&message, channel, &mut calls)
+                        .await?;
+                } else {
+                    self.reject_server_request(&message).await?;
+                }
                 continue;
             }
             if response_id(&message) == Some(id) {
@@ -334,8 +381,9 @@ impl CodexAppServer {
                     bail!("Codex turn/start 失败：{error}");
                 }
                 let result = message.get("result").cloned().unwrap_or(Value::Null);
-                if extract_turn_id(&result).is_none() {
-                    bail!("Codex turn/start 未返回 turn id");
+                calls.turn = extract_turn_id(&result);
+                if calls.turn.is_none() {
+                    eprintln!("[weixin] turn/start 未返回回合 ID，附件调用将被拒绝");
                 }
                 if model.is_empty() {
                     model = extract_model(&result).unwrap_or_default();
@@ -344,6 +392,10 @@ impl CodexAppServer {
                     usage = reported_usage;
                 }
                 response_received = true;
+                continue;
+            }
+
+            if !notification_matches_turn(&message, thread_id, calls.turn.as_deref()) {
                 continue;
             }
 
@@ -379,6 +431,46 @@ impl CodexAppServer {
             model,
             usage,
         })
+    }
+
+    async fn handle_attachment_tool(
+        &mut self,
+        message: &Value,
+        channel: &WeixinReplyChannel<'_>,
+        calls: &mut AttachmentCalls,
+    ) -> anyhow::Result<()> {
+        let result = match calls.validate(message) {
+            Err(error) => attachment_result(Err(error)),
+            Ok((_, _, Some(cached))) => cached,
+            Ok((call, arguments, None)) => {
+                let result = async {
+                    calls.begin_send()?;
+                    let permit = calls.permit.as_ref().context("附件回传未开启")?;
+                    let kind = if arguments.kind == "image" {
+                        super::media::AttachmentKind::Image
+                    } else {
+                        super::media::AttachmentKind::File
+                    };
+                    channel
+                        .client
+                        .send_workspace_attachment(
+                            channel.peer,
+                            Path::new(&arguments.path),
+                            kind,
+                            channel.context_token,
+                            permit,
+                        )
+                        .await?;
+                    Ok(())
+                }
+                .await;
+                let result = attachment_result(result);
+                calls.record(call, arguments, result.clone());
+                result
+            }
+        };
+        self.write_json(&json!({"jsonrpc": "2.0", "id": message["id"], "result": result}))
+            .await
     }
 
     pub async fn close(&mut self) {
@@ -548,6 +640,28 @@ impl CodexAppServer {
         self.next_id = self.next_id.saturating_add(1);
         id
     }
+}
+
+fn attachment_result(result: anyhow::Result<()>) -> Value {
+    let (success, text) = match result {
+        Ok(()) => (true, "附件已回传给当前微信联系人。".to_string()),
+        Err(error) => (false, format!("附件未发送：{error}")),
+    };
+    json!({"success": success, "contentItems": [{"type": "inputText", "text": text}]})
+}
+
+fn notification_matches_turn(message: &Value, thread: &str, turn: Option<&str>) -> bool {
+    let params = &message["params"];
+    if params["threadId"]
+        .as_str()
+        .is_some_and(|actual| actual != thread)
+    {
+        return false;
+    }
+    let actual_turn = params["turnId"]
+        .as_str()
+        .or_else(|| params["turn"]["id"].as_str());
+    !turn.is_some_and(|expected| actual_turn.is_some_and(|actual| actual != expected))
 }
 
 impl Drop for CodexAppServer {
@@ -744,6 +858,178 @@ mod tests {
                 "approvalPolicy":"never"
             })
         );
+    }
+
+    #[test]
+    fn outbound_stdio_fixture() {
+        use std::io::BufRead;
+        let Ok(mode) = std::env::var("CODEX_PLUS_W2_STDIO_FIXTURE_MODE") else {
+            return;
+        };
+        let enabled = mode == "enabled";
+        let emit = |value: Value| {
+            println!("{value}");
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        };
+        let tool = |id: &str, turn: &str| {
+            json!({
+                "id": id, "method": "item/tool/call", "params": {
+                    "threadId": "thread", "turnId": turn, "callId": "call",
+                    "tool": super::super::outbound::ATTACHMENT_TOOL, "namespace": null,
+                    "arguments": {"path": "result.txt", "kind": "file"}
+                }
+            })
+        };
+        for line in std::io::stdin().lock().lines() {
+            let message: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            match message["method"].as_str() {
+                Some("initialize") => emit(json!({"id": message["id"], "result": {}})),
+                Some("initialized") => {}
+                Some("thread/start") => {
+                    assert_eq!(message["params"]["dynamicTools"].is_array(), enabled);
+                    if enabled {
+                        assert_eq!(
+                            message["params"]["dynamicTools"][0]["name"],
+                            super::super::outbound::ATTACHMENT_TOOL
+                        );
+                    }
+                    emit(json!({"id": message["id"], "result": {"thread": {"id": "thread"}}}));
+                }
+                Some("thread/resume") => {
+                    assert!(message["params"].get("dynamicTools").is_none());
+                    emit(json!({"id": message["id"], "result": {"thread": {"id": "thread"}}}));
+                }
+                Some("turn/start") => {
+                    emit(json!({"id": message["id"], "result": {"turn": {"id": "turn"}}}));
+                    emit(
+                        json!({"method": "turn/completed", "params": {"threadId": "thread", "turn": {"id": "old-turn", "status": "completed"}}}),
+                    );
+                    emit(tool("stale", "old-turn"));
+                }
+                None => match message["id"].as_str().unwrap() {
+                    "stale" => {
+                        assert_eq!(message["result"]["success"], false);
+                        emit(tool("first", "turn"));
+                    }
+                    "first" => {
+                        assert_eq!(message["result"]["success"], enabled);
+                        emit(tool("repeat", "turn"));
+                    }
+                    "repeat" => {
+                        assert_eq!(message["result"]["success"], enabled);
+                        emit(
+                            json!({"method": "item/completed", "params": {"threadId": "thread", "turnId": "turn", "item": {"type": "agentMessage", "text": "done"}}}),
+                        );
+                        emit(
+                            json!({"method": "turn/completed", "params": {"threadId": "thread", "turn": {"id": "turn", "status": "completed"}}}),
+                        );
+                    }
+                    other => panic!("unexpected tool result: {other}"),
+                },
+                other => panic!("unexpected request: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_stdio_registers_only_when_enabled_and_sends_each_call_once() {
+        use super::super::outbound::OutboundPolicy;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("result.txt"), b"result").unwrap();
+        for enabled in [false, true] {
+            let api = MockServer::start().await;
+            let cdn = MockServer::start().await;
+            let count = if enabled { 1 } else { 0 };
+            Mock::given(method("POST"))
+                .and(path("/ilink/bot/getuploadurl"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"upload_param": "upload"})),
+                )
+                .expect(count)
+                .mount(&api)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/upload"))
+                .respond_with(
+                    ResponseTemplate::new(200).insert_header("x-encrypted-param", "download"),
+                )
+                .expect(count)
+                .mount(&cdn)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/ilink/bot/sendmessage"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ret": 0})))
+                .expect(count)
+                .mount(&api)
+                .await;
+            let client = WeixinClient::new(&api.uri(), "fixture", "")
+                .unwrap()
+                .with_media_base_url(&cdn.uri())
+                .unwrap();
+            let policy = OutboundPolicy::new(enabled, "peer", workspace.path().to_str().unwrap());
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "connect::app_server::tests::outbound_stdio_fixture",
+                    "--nocapture",
+                ])
+                .env(
+                    "CODEX_PLUS_W2_STDIO_FIXTURE_MODE",
+                    if enabled { "enabled" } else { "disabled" },
+                )
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            #[cfg(windows)]
+            command.creation_flags(crate::windows_create_no_window());
+            let mut child = command.spawn().unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let mut server = CodexAppServer {
+                child,
+                stdin,
+                stdout: BufReader::new(stdout).lines(),
+                next_id: 1,
+                running: true,
+                config: AppServerConfig {
+                    executable: String::new(),
+                    work_dir: workspace.path().to_path_buf(),
+                    model: String::new(),
+                    sandbox: "read-only".into(),
+                },
+            };
+            let result = tokio::time::timeout(Duration::from_secs(15), async {
+                server.initialize().await?;
+                let thread = server
+                    .prepare_thread_with_attachments(None, enabled)
+                    .await?;
+                server
+                    .prepare_thread_with_attachments(Some(&thread), enabled)
+                    .await?;
+                server
+                    .run_turn_with_reply(
+                        &thread,
+                        "send",
+                        &[],
+                        Some(WeixinReplyChannel {
+                            client: &client,
+                            peer: "peer",
+                            context_token: "context",
+                            permit: policy.permit("peer").ok(),
+                        }),
+                    )
+                    .await
+            })
+            .await;
+            server.close().await;
+            assert_eq!(result.unwrap().unwrap().reply, "done");
+        }
     }
 
     #[cfg(windows)]

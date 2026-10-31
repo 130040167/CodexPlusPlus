@@ -23,6 +23,15 @@ pub struct BridgeContext {
 }
 
 impl BridgeContext {
+    #[cfg(test)]
+    pub(crate) fn with_test_settings(store: SettingsStore, app_dir: PathBuf) -> Self {
+        Self::new(
+            Arc::new(CoreSettingsService { store, app_dir: Some(app_dir.clone()) }),
+            Arc::new(CoreRuntimeService::new(0, StatusStore::new(app_dir.join("status.json")))),
+            Arc::new(UnavailableDataService),
+        )
+    }
+
     pub fn new(
         settings: Arc<dyn BridgeSettingsService>,
         runtime: Arc<dyn BridgeRuntimeService>,
