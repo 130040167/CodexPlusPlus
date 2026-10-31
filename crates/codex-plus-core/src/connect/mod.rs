@@ -20,6 +20,8 @@ use self::weixin::{WeixinClient, WeixinMessage};
 
 pub const DEFAULT_WEIXIN_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
 const MAX_INBOUND_MESSAGE_AGE_MS: u64 = 5 * 60 * 1_000;
+const FALLBACK_WORKSPACE_NOTICE: &str =
+    " 原项目目录不可用，当前为状态目录中的备用空目录，无法访问原项目文件。";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -169,7 +171,7 @@ pub async fn run_weixin_connect_with_outbound(
     }
     let work_dir = connection_work_dir(&config, &crate::paths::default_app_state_dir())?;
 
-    update_status(&status, |current| {
+    update_status(&status, &config, |current| {
         current.state = "starting".to_string();
         current.message = "正在连接微信和 Codex app-server...".to_string();
         current.account_id = config.account_id.clone();
@@ -188,19 +190,20 @@ pub async fn run_weixin_connect_with_outbound(
     let mut app_server: Option<CodexAppServer> = None;
     let mut long_poll_timeout_ms = 35_000;
 
-    update_status(&status, |current| {
+    update_status(&status, &config, |current| {
         current.state = "running".to_string();
         current.message = outbound.status_message("微信连接正在运行。");
     });
 
     while !stop.load(Ordering::SeqCst) {
+        update_status(&status, &config, |_| {});
         let updates = match client
             .get_updates(&state.get_updates_buf, long_poll_timeout_ms)
             .await
         {
             Ok(updates) => updates,
             Err(error) => {
-                update_status(&status, |current| {
+                update_status(&status, &config, |current| {
                     current.state = "retrying".to_string();
                     current.message = format!("微信长轮询失败，稍后重试：{error}");
                 });
@@ -230,7 +233,7 @@ pub async fn run_weixin_connect_with_outbound(
             // 白名单外的消息以前完全静默：不回复也没有任何提示，
             // 用户无法区分「消息没到」和「被过滤了」。
             if !is_allowed_peer(&config.allow_from, &message.from_user_id) {
-                update_status(&status, |current| {
+                update_status(&status, &config, |current| {
                     current.state = "running".to_string();
                     current.message =
                         format!("已忽略来自非白名单发送方的消息：{}", message.from_user_id);
@@ -243,7 +246,7 @@ pub async fn run_weixin_connect_with_outbound(
                 continue;
             }
             if message.context_token.trim().is_empty() {
-                update_status(&status, |current| {
+                update_status(&status, &config, |current| {
                     current.state = "running".to_string();
                     current.message = "收到缺少 context_token 的微信消息，已忽略。".to_string();
                 });
@@ -282,7 +285,7 @@ pub async fn run_weixin_connect_with_outbound(
             match result {
                 Ok(()) => {
                     state.mark_processed(&message_key);
-                    update_status(&status, |current| {
+                    update_status(&status, &config, |current| {
                         current.state = "running".to_string();
                         current.message = outbound.status_message("最近一条微信消息已处理。");
                         current.last_peer_id = message.from_user_id.clone();
@@ -300,7 +303,7 @@ pub async fn run_weixin_connect_with_outbound(
                             &message.context_token,
                         )
                         .await;
-                    update_status(&status, |current| {
+                    update_status(&status, &config, |current| {
                         current.state = "retrying".to_string();
                         current.message = format!("处理微信消息失败，等待下一条消息重试：{error}");
                         current.last_peer_id = message.from_user_id.clone();
@@ -316,7 +319,7 @@ pub async fn run_weixin_connect_with_outbound(
     if let Some(mut server) = app_server {
         server.close().await;
     }
-    update_status(&status, |current| {
+    update_status(&status, &config, |current| {
         current.state = "stopped".to_string();
         current.message = "微信连接已停止。".to_string();
     });
@@ -666,10 +669,21 @@ fn default_sandbox() -> String {
 
 fn update_status(
     status: &SharedWeixinConnectStatus,
+    config: &WeixinConnectConfig,
     update: impl FnOnce(&mut WeixinConnectStatus),
 ) {
     if let Ok(mut current) = status.lock() {
         update(&mut current);
+        current.message = current
+            .message
+            .trim_end_matches(FALLBACK_WORKSPACE_NOTICE)
+            .to_string();
+        if current.state != "stopped"
+            && !config.work_dir.is_empty()
+            && !std::path::Path::new(&config.work_dir).is_dir()
+        {
+            current.message.push_str(FALLBACK_WORKSPACE_NOTICE);
+        }
     }
 }
 
@@ -854,6 +868,40 @@ mod tests {
         assert_eq!(connection_work_dir(&config, &state_dir).unwrap(), workspace);
         assert!(policy.permit("peer").is_ok());
         assert_eq!(policy.status_message("running"), "running");
+    }
+
+    #[test]
+    fn fallback_workspace_status_without_attachments_clears_when_directory_recovers() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("unavailable-workspace");
+        let config = WeixinConnectConfig {
+            work_dir: workspace.to_str().unwrap().into(),
+            ..Default::default()
+        };
+        assert!(!config.allow_outbound_attachments);
+        let fallback = connection_work_dir(&config, &root.path().join("state")).unwrap();
+        assert!(fallback.is_dir());
+        assert!(!workspace.exists());
+        let status = Arc::new(Mutex::new(WeixinConnectStatus::default()));
+        for state in ["starting", "running", "retrying"] {
+            update_status(&status, &config, |current| {
+                current.state = state.into();
+                current.message = "text-ready".into();
+            });
+            let message = status.lock().unwrap().message.clone();
+            assert!(message.starts_with("text-ready"));
+            assert!(message.contains("原项目目录不可用"));
+            assert!(message.contains("备用空目录"));
+            update_status(&status, &config, |_| {});
+            assert_eq!(status.lock().unwrap().message, message);
+        }
+        std::fs::create_dir(&workspace).unwrap();
+        assert_eq!(
+            connection_work_dir(&config, &root.path().join("state")).unwrap(),
+            workspace,
+        );
+        update_status(&status, &config, |_| {});
+        assert_eq!(status.lock().unwrap().message, "text-ready");
     }
 
     #[tokio::test]
