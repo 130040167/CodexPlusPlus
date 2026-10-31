@@ -495,6 +495,8 @@ type BackendSettings = WhaleBalanceSettings & {
   weixinConnectRouteTag: string;
   weixinConnectWorkDir: string;
   weixinConnectModel: string;
+  weixinConnectReasoningEffort: string;
+  weixinConnectProjectId: string;
   weixinConnectSandbox: "read-only" | "workspace-write" | "danger-full-access";
   weixinConnectCodexPath: string;
   relayBaseUrl: string;
@@ -790,6 +792,22 @@ type WeixinQrResult = CommandResult<{
   linkedUserId: string;
   hasToken: boolean;
 }>;
+
+type WeixinConnectCatalog = {
+  status: string;
+  message?: string;
+  model?: string;
+  default_model?: string;
+  models: string[];
+  modelMetadata?: Record<string, {
+    displayName?: string;
+    supportedReasoningEfforts?: { reasoningEffort: string; description?: string }[];
+  }>;
+};
+
+type WeixinConnectProjects = {
+  projects: { id: string; name: string; roots?: { path: string }[] }[];
+};
 
 type DesktopCodexCliResult = CommandResult<{
   path: string | null;
@@ -1487,6 +1505,8 @@ const defaultSettings: BackendSettings = {
   weixinConnectRouteTag: "",
   weixinConnectWorkDir: "",
   weixinConnectModel: "",
+  weixinConnectReasoningEffort: "",
+  weixinConnectProjectId: "",
   weixinConnectSandbox: "read-only",
   weixinConnectCodexPath: "",
   relayBaseUrl: "",
@@ -3152,7 +3172,9 @@ export function App() {
         setSettings(result);
         setSettingsForm(normalizeSettings(result.settings));
       }
-      showNotice(t("设置保存"), result.message, result.status);
+      showNotice(t("设置保存"), route === "weixin" && result.status === "ok"
+        ? t("已保存，下一条微信消息生效。")
+        : result.message, result.status);
     }
   };
 
@@ -5412,6 +5434,100 @@ function WeixinConnectScreen({
   onCopyQr: (url: string) => void;
 }) {
   const [selectedSessionId, setSelectedSessionId] = useState("");
+  const [catalog, setCatalog] = useState<WeixinConnectCatalog | null>(null);
+  const [catalogError, setCatalogError] = useState("");
+  const [catalogLoading, setCatalogLoading] = useState(true);
+  const [catalogRevision, setCatalogRevision] = useState(0);
+  const [projects, setProjects] = useState<WeixinConnectProjects | null>(null);
+  const [projectsError, setProjectsError] = useState("");
+  const [projectsLoading, setProjectsLoading] = useState(false);
+  const [projectsRevision, setProjectsRevision] = useState(0);
+  const [resetPeerId, setResetPeerId] = useState("");
+  const [resetPending, setResetPending] = useState(false);
+  const [resetMessage, setResetMessage] = useState("");
+
+  useEffect(() => {
+    let disposed = false;
+    let inFlight = false;
+    const refresh = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      setCatalogLoading(true);
+      try {
+        const result = await invoke<WeixinConnectCatalog>("weixin_connect_catalog");
+        if (disposed) return;
+        if (result.status === "failed" || !Array.isArray(result.models)) {
+          throw new Error(result.message || t("读取模型目录失败。"));
+        }
+        setCatalog(result);
+        setCatalogError("");
+      } catch (error) {
+        if (!disposed) setCatalogError(String(error));
+      } finally {
+        inFlight = false;
+        if (!disposed) setCatalogLoading(false);
+      }
+    };
+    void refresh();
+    return () => {
+      disposed = true;
+    };
+  }, [catalogRevision]);
+
+  const projectCodexPath = form.weixinConnectCodexPath.trim();
+  const projectWorkDir = form.weixinConnectWorkDir.trim();
+  useEffect(() => {
+    let disposed = false;
+    let inFlight = false;
+    setProjects(null);
+    setProjectsError("");
+    if (!projectsRevision && !form.weixinConnectProjectId) {
+      setProjectsLoading(false);
+      return;
+    }
+    const refresh = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      setProjectsLoading(true);
+      try {
+        const result = await invoke<WeixinConnectProjects>("weixin_connect_projects", {
+          codexPath: projectCodexPath,
+          workDir: projectWorkDir,
+        });
+        if (disposed) return;
+        if (!Array.isArray(result.projects)) throw new Error(t("读取项目列表失败。"));
+        setProjects(result);
+        setProjectsError("");
+      } catch (error) {
+        if (!disposed) setProjectsError(String(error));
+      } finally {
+        inFlight = false;
+        if (!disposed) setProjectsLoading(false);
+      }
+    };
+    // 输入目录或 CLI 路径时稍等，避免每个按键都启动一次项目查询。
+    const initialTimer = window.setTimeout(() => void refresh(), 350);
+    return () => {
+      disposed = true;
+      window.clearTimeout(initialTimer);
+    };
+  }, [projectCodexPath, projectWorkDir, projectsRevision]);
+
+  const models = catalog?.models ?? [];
+  const inheritedModel = catalog?.model || catalog?.default_model || "";
+  const effectiveModel = form.weixinConnectModel || inheritedModel;
+  const reasoningEfforts = Array.from(new Set(
+    (catalog?.modelMetadata?.[effectiveModel]?.supportedReasoningEfforts ?? [])
+      .map((entry) => entry.reasoningEffort)
+      .filter(Boolean),
+  ));
+  const modelUnavailable = Boolean(catalog && !catalogError && form.weixinConnectModel
+    && !models.includes(form.weixinConnectModel));
+  const reasoningUnavailable = Boolean(catalog && !catalogError && form.weixinConnectReasoningEffort
+    && !reasoningEfforts.includes(form.weixinConnectReasoningEffort));
+  const projectOptions = projects?.projects ?? [];
+  const projectUnavailable = Boolean(projects && !projectsError && form.weixinConnectProjectId
+    && !projectOptions.some((project) => project.id === form.weixinConnectProjectId));
   const workDirOptions = useMemo(
     () => Array.from(new Set(sessions.map((session) => session.cwd.trim()).filter(Boolean))).sort(),
     [sessions],
@@ -5628,14 +5744,95 @@ function WeixinConnectScreen({
                 />
                 <small className="weixin-field-hint">{t("选择后自动带入该会话的工作目录，微信联系人仍保持独立会话。")}</small>
               </label>
-              <label className="field">
+              <label aria-invalid={modelUnavailable || Boolean(catalogError)} className="field">
                 <span>{t("模型")}</span>
-                <Input
-                  className="h-10"
-                  onChange={(event) => onFormChange({ ...form, weixinConnectModel: event.target.value })}
-                  placeholder={t("留空时使用 Codex 当前默认模型")}
-                  value={form.weixinConnectModel}
+                <div className="weixin-path-row">
+                  <AppSelect
+                    ariaLabel={t("模型")}
+                    onChange={(next) => onFormChange({ ...form, weixinConnectModel: next })}
+                    options={[
+                      { value: "", label: `${t("继承 Codex 默认模型")}${inheritedModel ? ` (${inheritedModel})` : ""}` },
+                      ...(form.weixinConnectModel && !models.includes(form.weixinConnectModel) ? [{
+                        value: form.weixinConnectModel,
+                        label: `${form.weixinConnectModel} (${modelUnavailable ? t("不可用") : t("当前值")})`,
+                      }] : []),
+                      ...models.map((model) => ({ value: model, label: catalog?.modelMetadata?.[model]?.displayName || model })),
+                    ]}
+                    value={form.weixinConnectModel}
+                  />
+                  <Button aria-label={t("刷新模型目录")} disabled={catalogLoading} onClick={() => setCatalogRevision((value) => value + 1)} size="icon" title={t("刷新模型目录")} type="button" variant="outline">
+                    <RefreshCw className={`h-4 w-4${catalogLoading ? " animate-spin" : ""}`} />
+                  </Button>
+                </div>
+                {catalogError ? <small className="weixin-field-hint request-log-error" role="alert">{catalogError}</small> : null}
+                {modelUnavailable ? <small className="weixin-field-hint request-log-error" role="alert">{t("当前模型已不在可用模型目录中，请重新选择。")}</small> : null}
+                {catalog && !catalogError && !models.length ? <small className="weixin-field-hint" role="status">{t("当前没有可用模型，请检查供应商配置。")}</small> : null}
+              </label>
+              <label aria-invalid={reasoningUnavailable} className="field">
+                <span>{t("推理强度")}</span>
+                <AppSelect
+                  ariaLabel={t("推理强度")}
+                  onChange={(next) => onFormChange({ ...form, weixinConnectReasoningEffort: next })}
+                  options={[
+                    { value: "", label: t("继承 Codex 推理强度") },
+                    ...(form.weixinConnectReasoningEffort && !reasoningEfforts.includes(form.weixinConnectReasoningEffort) ? [{
+                      value: form.weixinConnectReasoningEffort,
+                      label: `${form.weixinConnectReasoningEffort} (${reasoningUnavailable ? t("不可用") : t("当前值")})`,
+                    }] : []),
+                    ...reasoningEfforts.map((effort) => ({ value: effort, label: effort })),
+                  ]}
+                  value={form.weixinConnectReasoningEffort}
                 />
+                {reasoningUnavailable ? <small className="weixin-field-hint request-log-error" role="alert">{t("当前模型不支持已选推理强度，请重新选择或继承。")}</small> : null}
+              </label>
+              <label aria-invalid={projectUnavailable || Boolean(projectsError)} className="field">
+                <span>{t("新会话项目")}</span>
+                <div className="weixin-path-row">
+                  <AppSelect
+                    ariaLabel={t("新会话项目")}
+                    onChange={(id) => {
+                      const selected = projectOptions.find((project) => project.id === id);
+                      onFormChange({
+                        ...form,
+                        weixinConnectProjectId: id,
+                        weixinConnectWorkDir: selected?.roots?.[0]?.path || form.weixinConnectWorkDir,
+                      });
+                    }}
+                    options={[
+                      { value: "", label: t("不归属项目") },
+                      ...(form.weixinConnectProjectId && !projectOptions.some((project) => project.id === form.weixinConnectProjectId) ? [{
+                        value: form.weixinConnectProjectId,
+                        label: `${form.weixinConnectProjectId} (${projectUnavailable ? t("不可用") : t("当前值")})`,
+                      }] : []),
+                      ...projectOptions.map((project) => ({ value: project.id, label: project.name || project.id })),
+                    ]}
+                    value={form.weixinConnectProjectId}
+                  />
+                  <Button aria-label={t("刷新项目")} disabled={projectsLoading} onClick={() => setProjectsRevision((value) => value + 1)} size="icon" title={t("刷新项目")} type="button" variant="outline">
+                    <RefreshCw className={`h-4 w-4${projectsLoading ? " animate-spin" : ""}`} />
+                  </Button>
+                </div>
+                {projectsError ? <small className="weixin-field-hint request-log-error" role="alert">{projectsError}</small> : null}
+                {projectUnavailable ? <small className="weixin-field-hint request-log-error" role="alert">{t("当前项目已不在项目列表中，请重新选择。")}</small> : null}
+              </label>
+              <label className="field">
+                <span>{t("重置联系人会话")}</span>
+                <div className="weixin-path-row">
+                  <Input aria-label={t("需要重置的联系人 ID")} placeholder={status?.lastPeerId || t("联系人 ID")} value={resetPeerId} onChange={(event) => setResetPeerId(event.target.value)} />
+                  <Button aria-label={t("重置该联系人会话")} title={t("重置该联系人会话，下一条消息生效并保留原历史")} size="icon" variant="outline" type="button" disabled={resetPending || !resetPeerId.trim()} onClick={async () => {
+                    setResetPending(true);
+                    setResetMessage("");
+                    try {
+                      await invoke("weixin_connect_reset_session", { peerId: resetPeerId.trim(), accountId: form.weixinConnectAccountId.trim() });
+                      setResetMessage(t("已保存重置请求，下一条消息开启新会话，原历史保留。"));
+                    } catch (error) {
+                      setResetMessage(String(error));
+                    } finally {
+                      setResetPending(false);
+                    }
+                  }}><RefreshCw className={`h-4 w-4${resetPending ? " animate-spin" : ""}`} /></Button>
+                </div>
+                {resetMessage ? <small className="weixin-field-hint" role="status">{resetMessage}</small> : null}
               </label>
               <label className="field">
                 <span>{t("沙箱权限")}</span>
@@ -17068,6 +17265,8 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     // 旧版「Codex 用量挂件」开着、还没有桌宠设置的用户，升级后桌宠开启并选中大肥鱼。
     agentPet: normalizeAgentPetSettings(settings.agentPet, (settings as { codexAppWhaleWidgetEnabled?: unknown }).codexAppWhaleWidgetEnabled === true),
     ccsDbPath: (settings.ccsDbPath || "").trim(),
+    weixinConnectReasoningEffort: (settings.weixinConnectReasoningEffort || "").trim(),
+    weixinConnectProjectId: (settings.weixinConnectProjectId || "").trim(),
     dictation: normalizeDictationSettings(settings.dictation),
     codexAppTypingEffect: normalizeTypingEffect(settings.codexAppTypingEffect),
     relayProfilesEnabled: settings.relayProfilesEnabled !== false,

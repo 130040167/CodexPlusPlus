@@ -33,7 +33,7 @@
     {
       "name": "40-backend-settings.js",
       "description": "后端设置读写、心跳同步、按清单生成的设置页、用户脚本与市场状态、拓展 UI",
-      "lines": 2163
+      "lines": 2165
     },
     {
       "name": "50-navigation.js",
@@ -109,6 +109,11 @@
       "name": "85-side-chat-save.js",
       "description": "本地旁支保存：主历史读取引用、原生缓存采集与普通会话恢复",
       "lines": 333
+    },
+    {
+      "name": "85-weixin-desktop-sync.js",
+      "description": "微信线程目录与显式项目归属同步",
+      "lines": 113
     },
     {
       "name": "90-action-groups.js",
