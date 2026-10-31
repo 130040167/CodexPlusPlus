@@ -2334,6 +2334,27 @@ fn try_acquire_launch_guard() -> Result<LaunchGuard, &'static str> {
         .map_err(|_| "启动或重启正在进行，请等待本次操作完成。")
 }
 
+fn resume_launch_guard_or_report<T>(
+    result: Result<T, &'static str>,
+    start_if_missing: bool,
+    report: impl FnOnce(&'static str, Value),
+) -> Option<T> {
+    match result {
+        Ok(guard) => Some(guard),
+        Err(message) => {
+            report(
+                "manager.resume_existing_skipped",
+                json!({
+                    "reason": "launch_in_progress",
+                    "message": message,
+                    "start_if_missing": start_if_missing,
+                }),
+            );
+            None
+        }
+    }
+}
+
 /// 供自动接管守护线程复用同一把串行锁：它与用户点「启动/重启」必须互斥，
 /// 否则会出现两套 launcher 会话抢同一个官方 App。
 pub fn try_acquire_launch_guard_for_takeover() -> Result<impl Drop, &'static str> {
@@ -3180,9 +3201,14 @@ pub fn resume_existing_codex_background(app: tauri::AppHandle, start_if_missing:
         if crate::app_is_exiting() {
             return;
         }
-        let _launch_guard = match try_acquire_launch_guard() {
-            Ok(guard) => guard,
-            Err(_) => return,
+        let Some(_launch_guard) = resume_launch_guard_or_report(
+            try_acquire_launch_guard(),
+            start_if_missing,
+            |event, detail| {
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(event, detail);
+            },
+        ) else {
+            return;
         };
         let manager = default_skills_manager();
         let _skills_guard = match manager.lock_recovered_transactions() {
@@ -11129,6 +11155,27 @@ base_url = "https://example.invalid/v1"
         assert!(try_acquire_launch_guard().is_err());
         drop(first);
         assert!(try_acquire_launch_guard().is_ok());
+    }
+
+    #[test]
+    fn background_resume_records_launch_guard_contention() {
+        let mut recorded = None;
+        let guard = resume_launch_guard_or_report::<()>(
+            Err("启动或重启正在进行，请等待本次操作完成。"),
+            true,
+            |event, detail| recorded = Some((event, detail)),
+        );
+        assert!(guard.is_none());
+        let (event, detail) = recorded.unwrap();
+        assert_eq!(event, "manager.resume_existing_skipped");
+        assert_eq!(detail["reason"], "launch_in_progress");
+        assert_eq!(detail["start_if_missing"], true);
+        assert!(detail["message"].as_str().unwrap().contains("正在进行"));
+
+        let guard = resume_launch_guard_or_report(Ok(42), false, |_, _| {
+            panic!("successful acquisition must not report a failure")
+        });
+        assert_eq!(guard, Some(42));
     }
 
     #[test]
