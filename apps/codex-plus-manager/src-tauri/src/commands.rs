@@ -2024,14 +2024,21 @@ pub fn run_codex_multi_worker(options_path: &Path) -> anyhow::Result<()> {
         let _ = codex_plus_launcher::shutdown();
         return Ok(());
     };
-    while tauri::async_runtime::block_on(
-        codex_plus_core::multi_worker::codex_instance_identity_matches(&identity),
-    )
-    .unwrap_or(false)
-    {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-    codex_plus_launcher::shutdown()
+    #[cfg(windows)]
+    let lifetime = codex_plus_core::multi_worker::wait_for_codex_instance_exit(&identity);
+    #[cfg(not(windows))]
+    let lifetime = {
+        while tauri::async_runtime::block_on(
+            codex_plus_core::multi_worker::codex_instance_identity_matches(&identity),
+        )
+        .unwrap_or(false)
+        {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    let cleanup = codex_plus_launcher::shutdown();
+    lifetime.and(cleanup)
 }
 
 /// 多开实例启动结果文件名（与 `worker-options.json` 同目录）。
