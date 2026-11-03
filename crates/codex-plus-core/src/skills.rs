@@ -385,7 +385,7 @@ impl SkillsManager {
             anyhow::bail!("skill 源目录不存在：{}", source.display());
         }
         std::fs::create_dir_all(&dir).with_context(|| format!("创建 {} 失败", dir.display()))?;
-        link_or_copy(&source, &link)
+        link_or_copy(&source, &link).map(|_| ())
     }
 
     /// 没有受控源时，从 Codex 或其它 Agent 目录里找到这个 Skill 的真实目录，纳入受控源。
@@ -417,9 +417,8 @@ impl SkillsManager {
             let candidate = dir.join(id);
             if physical(&candidate) {
                 let (staging, installed) = self.stage_directory_import(id, &candidate, "cc-switch")?;
-                let result = self.commit_staged_skill_unlocked(&staging, installed, false, true, false, coordination);
-                if result.is_err() { let _ = remove_link(&staging); }
-                result?;
+                let result = self.commit_staged_skill_unlocked(&staging, installed, false, true, false, false, coordination);
+                result.map_err(|error| retain_staging_context(error, &staging))?;
                 return Ok(());
             }
         }
@@ -833,8 +832,7 @@ impl SkillsManager {
         };
         let (staging, installed) = self.stage_directory_import(id, external_dir, repo_key)?;
         let result = self.commit_staged_import_if_unchanged(&staging, installed, generation);
-        if result.is_err() { let _ = remove_link(&staging); }
-        result
+        result.map_err(|error| retain_staging_context(error, &staging))
     }
 
     fn commit_staged_import_if_unchanged(
@@ -847,7 +845,7 @@ impl SkillsManager {
         if coordination.skill_generation(&installed.id) != generation {
             anyhow::bail!("导入期间 Skill 已改变，请重新导入");
         }
-        self.commit_staged_skill_unlocked(staging, installed, false, true, false, &mut coordination)
+        self.commit_staged_skill_unlocked(staging, installed, false, true, false, false, &mut coordination)
     }
 
     fn stage_directory_import(
@@ -876,9 +874,10 @@ impl SkillsManager {
             anyhow::bail!("导入目录不能包含受控源目录");
         }
         let staging = self.source_dir.join(format!(".import-{id}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&staging)
+            .with_context(|| format!("创建 Skill 暂存目录失败：{}", staging.display()))?;
         if let Err(error) = copy_dir_all(external_dir, &staging) {
-            let _ = remove_link(&staging);
-            return Err(error);
+            return Err(retain_staging_context(error, &staging));
         }
         let (name, description) = read_skill_manifest(&manifest, id);
         Ok((staging, InstalledSkill {
@@ -896,6 +895,7 @@ impl SkillsManager {
         enabled: bool,
         replace_identity: bool,
         update_agent_copies: bool,
+        require_empty: bool,
         coordination: &mut SkillsCoordination,
     ) -> anyhow::Result<SkillsState> {
         let id = installed.id.clone();
@@ -906,71 +906,101 @@ impl SkillsManager {
         state.installed.insert(id.clone(), installed);
         let link = self.linked_dir().join(&id);
         let mut agent_copies = Vec::new();
-        if update_agent_copies {
+        if update_agent_copies && require_empty {
+            for (_, dir) in &self.agent_dirs {
+                let copy = dir.join(&id);
+                if is_managed_copy(&copy) {
+                    anyhow::bail!("Agent 已有同名托管 Skill 副本，请先处理：{}", copy.display());
+                }
+            }
+        }
+        if update_agent_copies && !require_empty {
             let source_digest = skill_directory_digest(&destination)?;
             for (_, dir) in &self.agent_dirs {
                 let copy = dir.join(&id);
                 if is_managed_copy(&copy) {
-                    if skill_directory_digest(&copy)? != source_digest {
+                    let identity = skill_path_identity(&copy)?;
+                    if skill_directory_digest(&copy)? != source_digest
+                        || skill_path_identity(&copy)? != identity
+                    {
                         anyhow::bail!("Agent 的 Skill 副本与受控源内容不一致，请先停用并备份副本，未更新");
                     }
-                    agent_copies.push(copy);
+                    agent_copies.push((copy, identity));
                 }
             }
         }
         let mut displaced = Vec::new();
-        let mut published = false;
+        let mut published = None;
         let mut created_links = Vec::new();
         let result = (|| -> anyhow::Result<()> {
             // 两处原内容都先保留，成功后仍作为可恢复备份，不覆盖同名用户目录。
-            for original in [&link, &destination].into_iter().chain(agent_copies.iter()) {
-                if std::fs::symlink_metadata(original).is_ok() {
-                    let backup = self.backup_directory(&id, original)?;
-                    displaced.push((original.clone(), backup));
+            if !require_empty {
+                for original in [&link, &destination] {
+                    if std::fs::symlink_metadata(original).is_ok() {
+                        let identity = skill_path_identity(original)?;
+                        let backup = self.backup_directory_checked(&id, original, identity)?;
+                        displaced.push((original.clone(), backup, identity));
+                    }
                 }
             }
+            for (original, identity) in &agent_copies {
+                let backup = self.backup_directory_checked(&id, original, *identity)?;
+                displaced.push((original.clone(), backup, *identity));
+            }
+            let identity = skill_path_identity(staging)?;
             move_path_no_replace(staging, &destination)?;
-            published = true;
+            published = Some(identity);
+            #[cfg(test)]
+            run_source_publication_hook(staging)?;
+            if skill_path_identity(&destination)? != identity {
+                anyhow::bail!("Skill 发布期间源目录发生变化：{}", destination.display());
+            }
             if enabled {
                 std::fs::create_dir_all(self.linked_dir())?;
-                link_or_copy(&destination, &link)?;
-                created_links.push(link.clone());
+                let mut published_link = None;
+                let result = link_or_copy_tracked(&destination, &link, &mut published_link);
+                if let Some(identity) = published_link {
+                    created_links.push((link.clone(), identity));
+                }
+                result?;
             }
-            for copy in &agent_copies {
-                link_or_copy(&destination, copy)?;
-                created_links.push(copy.clone());
+            for (copy, _) in &agent_copies {
+                let mut published_copy = None;
+                let result = link_or_copy_tracked(&destination, copy, &mut published_copy);
+                if let Some(identity) = published_copy {
+                    created_links.push((copy.clone(), identity));
+                }
+                result?;
             }
             self.save_state_unlocked(&state)?;
             Ok(())
         })();
         if let Err(error) = result {
-            let rollback = (|| -> anyhow::Result<()> {
-                for created in created_links.iter().rev() {
-                    if std::fs::symlink_metadata(created).is_ok() {
-                        self.backup_directory(&id, created)?;
-                    }
+            let mut rollback_errors = Vec::new();
+            let mut recoveries = Vec::new();
+            for (created, identity) in created_links.iter().rev()
+                .map(|(path, identity)| (path, identity))
+                .chain(published.iter().map(|identity| (&destination, identity)))
+            {
+                match recover_published_path(created, *identity) {
+                    Ok(Some(path)) => recoveries.push(path),
+                    Ok(None) => {}
+                    Err(error) => rollback_errors.push(format!("{error:#}")),
                 }
-                if published && std::fs::symlink_metadata(&destination).is_ok() {
-                    self.backup_directory(&id, &destination)?;
-                }
-                for (original, backup) in displaced.iter().rev() {
-                    move_path_no_replace(backup, original)?;
-                }
-                Ok(())
-            })();
-            if let Err(rollback_error) = rollback {
-                return Err(error.context(format!("回滚失败，原内容保留在备份目录：{rollback_error:#}")));
             }
-            let _ = remove_link(&staging);
+            for (original, backup, identity) in displaced.iter().rev() {
+                if let Err(error) = restore_skill_backup(backup, original, *identity) {
+                    rollback_errors.push(format!("原内容保留在 {}：{error:#}", backup.display()));
+                }
+            }
+            if !rollback_errors.is_empty() || !recoveries.is_empty() {
+                let paths = recoveries.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join("、");
+                return Err(error.context(format!(
+                    "回滚检查：{}；新内容保留位置：{}",
+                    rollback_errors.join("；"), paths
+                )));
+            }
             return Err(error);
-        }
-        // 旧安装软链不含独立内容，实体目录备份则必须保留。
-        for (_, backup) in &displaced {
-            if std::fs::symlink_metadata(backup).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-                if let Err(error) = remove_link(backup) {
-                    eprintln!("清理已提交的 Skill 软链备份失败：{error:#}");
-                }
-            }
         }
         if identity_changed {
             coordination.changed_skill(&id);
@@ -1150,12 +1180,11 @@ impl SkillsManager {
             anyhow::bail!("Skill 路径或版本与下载的 ZIP 不匹配");
         }
         let staging = self.staging_dir(&guard.id);
-        if std::fs::symlink_metadata(&staging).is_ok() {
-            anyhow::bail!("Skill 暂存位置已存在：{}", staging.display());
-        }
+        std::fs::create_dir_all(&self.source_dir)?;
+        std::fs::create_dir(&staging)
+            .with_context(|| format!("创建 Skill 暂存目录失败：{}", staging.display()))?;
         if let Err(error) = extract_skill_subtree(zip, &skill.repo_path, &staging) {
-            let _ = remove_link(&staging);
-            return Err(error);
+            return Err(retain_staging_context(error, &staging));
         }
         let result = (|| {
             // 目录内容扫描不占用操作锁；非受控的跨进程写入仍不能与最后替换原子同步。
@@ -1180,10 +1209,9 @@ impl SkillsManager {
                 repo_path: skill.repo_path.clone(),
                 content_hash: skill.content_hash.clone(),
                 installed_at: current_unix_timestamp_string(),
-            }, enabled, true, true, &mut coordination)
+            }, enabled, true, true, guard.install_only, &mut coordination)
         })();
-        if result.is_err() { let _ = remove_link(&staging); }
-        result
+        result.map_err(|error| retain_staging_context(error, &staging))
     }
 
     /// 把一份已下载的仓库 zip 里的某个 skill 子树装到 SSOT，并建立软链。
@@ -1194,15 +1222,11 @@ impl SkillsManager {
     ) -> anyhow::Result<SkillsState> {
         validate_skill_id(&skill.id)?;
         let staging = self.staging_dir(&skill.id);
-        if staging.exists() {
-            std::fs::remove_dir_all(&staging)
-                .with_context(|| format!("清理暂存目录失败：{}", staging.display()))?;
-        }
+        std::fs::create_dir_all(&self.source_dir)?;
+        std::fs::create_dir(&staging)
+            .with_context(|| format!("创建 Skill 暂存目录失败：{}", staging.display()))?;
         let result = extract_skill_subtree(zip_bytes, &skill.repo_path, &staging);
-        if result.is_err() {
-            let _ = std::fs::remove_dir_all(&staging);
-        }
-        result?;
+        result.map_err(|error| retain_staging_context(error, &staging))?;
 
         let result = (|| {
             let mut coordination = skills_coordination();
@@ -1223,10 +1247,9 @@ impl SkillsManager {
                 repo_path: skill.repo_path.clone(),
                 content_hash: skill.content_hash.clone(),
                 installed_at: current_unix_timestamp_string(),
-            }, enable_after_install, true, true, &mut coordination)
+            }, enable_after_install, true, true, false, &mut coordination)
         })();
-        if result.is_err() { let _ = remove_link(&staging); }
-        result
+        result.map_err(|error| retain_staging_context(error, &staging))
     }
 
     /// 启用 = 在 `$CODEX_HOME/skills/` 下建一个指向源目录的软链；停用 = 删掉它。
@@ -1256,9 +1279,10 @@ impl SkillsManager {
                     anyhow::bail!("Skill 目录不能包含受控源目录，未执行停用");
                 }
                 let staging = self.staging_dir(id);
+                std::fs::create_dir(&staging)
+                    .with_context(|| format!("创建 Skill 暂存目录失败：{}", staging.display()))?;
                 if let Err(error) = copy_dir_all(&link, &staging) {
-                    let _ = remove_link(&staging);
-                    return Err(error);
+                    return Err(retain_staging_context(error, &staging));
                 }
                 let contents_changed = match (
                     skill_directory_digest(&source),
@@ -1278,8 +1302,8 @@ impl SkillsManager {
                     installed_at: current_unix_timestamp_string(),
                 });
                 self.commit_staged_skill_unlocked(
-                    &staging, installed, false, contents_changed, false, coordination,
-                )?;
+                    &staging, installed, false, contents_changed, false, false, coordination,
+                ).map_err(|error| retain_staging_context(error, &staging))?;
                 return Ok(());
             }
             return remove_link(&link);
@@ -1295,7 +1319,7 @@ impl SkillsManager {
         }
         std::fs::create_dir_all(self.linked_dir())
             .with_context(|| format!("创建 {} 失败", self.linked_dir().display()))?;
-        link_or_copy(&source, &link)
+        link_or_copy(&source, &link).map(|_| ())
     }
 
     /// 卸载：删软链，源目录整体移进备份目录。不做自动轮转删除。
@@ -1311,7 +1335,8 @@ impl SkillsManager {
             if std::fs::symlink_metadata(&link).is_ok_and(|metadata| metadata.file_type().is_symlink())
                 || is_managed_copy(&link)
             {
-                agent_paths.push(link);
+                let identity = skill_path_identity(&link)?;
+                agent_paths.push((link, identity));
             }
         }
         let link = self.linked_dir().join(id);
@@ -1319,32 +1344,48 @@ impl SkillsManager {
         state.installed.remove(id);
         let mut displaced = Vec::new();
         let result = (|| -> anyhow::Result<()> {
-            for original in [&link, &source].into_iter().chain(agent_paths.iter()) {
+            for original in [&link, &source] {
                 if std::fs::symlink_metadata(original).is_ok() {
-                    let backup = self.backup_directory(id, original)?;
-                    displaced.push((original.clone(), backup));
+                    let identity = skill_path_identity(original)?;
+                    let backup = self.backup_directory_checked(id, original, identity)?;
+                    displaced.push((original.clone(), backup, identity));
                 }
+            }
+            for (original, identity) in &agent_paths {
+                let backup = self.backup_directory_checked(id, original, *identity)?;
+                displaced.push((original.clone(), backup, *identity));
             }
             self.save_state_unlocked(&state)?;
             Ok(())
         })();
         if let Err(error) = result {
-            for (original, backup) in displaced.iter().rev() {
-                if let Err(rollback_error) = move_path_no_replace(backup, original) {
-                    return Err(error.context(format!("卸载回滚失败，原内容保留在备份目录：{rollback_error}")));
+            let mut rollback_errors = Vec::new();
+            for (original, backup, identity) in displaced.iter().rev() {
+                if let Err(rollback_error) = restore_skill_backup(backup, original, *identity) {
+                    rollback_errors.push(format!("原内容保留在 {}：{rollback_error:#}", backup.display()));
                 }
+            }
+            if !rollback_errors.is_empty() {
+                return Err(error.context(format!("卸载回滚未完成：{}", rollback_errors.join("；"))));
             }
             return Err(error);
         }
-        for (_, backup) in &displaced {
-            if std::fs::symlink_metadata(backup).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-                if let Err(error) = remove_link(backup) {
-                    eprintln!("清理已卸载的 Skill 软链备份失败：{error:#}");
-                }
-            }
-        }
         coordination.changed_skill(id);
         Ok(state)
+    }
+
+    fn backup_directory_checked(&self, id: &str, source: &Path, expected: SkillPathIdentity) -> anyhow::Result<PathBuf> {
+        if skill_path_identity(source)? != expected {
+            anyhow::bail!("Skill 路径已被其他内容替换，未备份：{}", source.display());
+        }
+        let backup = self.backup_directory(id, source)?;
+        if skill_path_identity(&backup).ok() != Some(expected) {
+            if let Err(error) = move_path_no_replace(&backup, source) {
+                anyhow::bail!("Skill 备份期间路径发生变化，内容保留在 {}：{error:#}", backup.display());
+            }
+            anyhow::bail!("Skill 备份期间路径发生变化，未覆盖：{}", source.display());
+        }
+        Ok(backup)
     }
 
     fn backup_directory(&self, id: &str, source: &Path) -> anyhow::Result<PathBuf> {
@@ -1369,7 +1410,7 @@ impl SkillsManager {
         let mut backups = Vec::new();
         for entry in dir.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
+            if !std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_dir()) {
                 continue;
             }
             let Some(id) = path.file_name().and_then(|name| name.to_str()) else {
@@ -1411,9 +1452,10 @@ impl SkillsManager {
         std::fs::create_dir_all(&self.source_dir)
             .with_context(|| format!("创建目录失败：{}", self.source_dir.display()))?;
         let staging = self.staging_dir(&skill_id);
+        std::fs::create_dir(&staging)
+            .with_context(|| format!("创建 Skill 暂存目录失败：{}", staging.display()))?;
         if let Err(error) = copy_dir_all(&backup, &staging) {
-            let _ = remove_link(&staging);
-            return Err(error);
+            return Err(retain_staging_context(error, &staging));
         }
         let (name, description) =
             read_skill_manifest(&staging.join(SKILL_MANIFEST_FILE), &skill_id);
@@ -1431,10 +1473,10 @@ impl SkillsManager {
             true,
             true,
             false,
+            false,
             &mut coordination,
         );
-        if result.is_err() { let _ = remove_link(&staging); }
-        let state = result?;
+        let state = result.map_err(|error| retain_staging_context(error, &staging))?;
         // 提交前始终保留原备份；提交后清理失败也不撤销已恢复的安装。
         if let Err(error) = remove_link(&backup) {
             eprintln!("清理已恢复的 Skill 备份失败：{error:#}");
@@ -2520,25 +2562,170 @@ fn skill_directory_digest(path: &Path) -> anyhow::Result<Option<[u8; 32]>> {
     Ok(Some(hasher.finalize().into()))
 }
 
-/// 软链优先，失败时先在同目录暂存副本，再以不覆盖现有目录的方式发布。
-fn link_or_copy(source: &Path, link: &Path) -> anyhow::Result<()> {
-    if symlink_dir(source, link).is_ok() {
-        return Ok(());
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SkillPathIdentity {
+    device: u64,
+    file: u64,
+}
+
+fn retain_staging_context(error: anyhow::Error, staging: &Path) -> anyhow::Error {
+    if std::fs::symlink_metadata(staging).is_ok() {
+        error.context(format!("暂存路径仍存在且未自动清理：{}", staging.display()))
+    } else {
+        error
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SOURCE_PUBLICATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&Path) -> anyhow::Result<()>>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_source_publication_hook(staging: &Path) -> anyhow::Result<()> {
+    SOURCE_PUBLICATION_HOOK.with(|hook| match hook.borrow_mut().take() {
+        Some(hook) => hook(staging),
+        None => Ok(()),
+    })
+}
+
+#[cfg(windows)]
+fn skill_path_identity(path: &Path) -> anyhow::Result<SkillPathIdentity> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+        },
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+        .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+        .open(path)?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info)? };
+    Ok(SkillPathIdentity {
+        device: info.dwVolumeSerialNumber as u64,
+        file: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+    })
+}
+
+#[cfg(unix)]
+fn skill_path_identity(path: &Path) -> anyhow::Result<SkillPathIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    Ok(SkillPathIdentity { device: metadata.dev(), file: metadata.ino() })
+}
+
+#[cfg(not(any(windows, unix)))]
+fn skill_path_identity(_path: &Path) -> anyhow::Result<SkillPathIdentity> {
+    anyhow::bail!("当前平台不支持核验 Skill 路径身份")
+}
+
+/// 把本次发布的对象移到同卷的恢复位置；身份不符时保留现有路径。
+fn recover_published_path(path: &Path, expected: SkillPathIdentity) -> anyhow::Result<Option<PathBuf>> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    if skill_path_identity(path)? != expected {
+        anyhow::bail!("Skill 路径已被其他内容替换，未移动：{}", path.display());
+    }
+    let parent = path.parent().context("Skill 恢复位置没有父目录")?;
+    let recovery = parent.join(format!(".codex-plus-recovery-{}", uuid::Uuid::new_v4()));
+    move_path_no_replace(path, &recovery)?;
+    if skill_path_identity(&recovery).ok() != Some(expected) {
+        if let Err(error) = move_path_no_replace(&recovery, path) {
+            anyhow::bail!("Skill 路径在回滚期间发生变化，内容保留在 {}：{error:#}", recovery.display());
+        }
+        anyhow::bail!("Skill 路径在回滚期间发生变化，未覆盖：{}", path.display());
+    }
+    Ok(Some(recovery))
+}
+
+fn restore_skill_backup(backup: &Path, original: &Path, expected: SkillPathIdentity) -> anyhow::Result<()> {
+    if skill_path_identity(backup)? != expected {
+        anyhow::bail!("Skill 备份已被其他内容替换，未恢复：{}", backup.display());
+    }
+    move_path_no_replace(backup, original)?;
+    if skill_path_identity(original)? != expected {
+        anyhow::bail!("Skill 恢复期间路径发生变化：{}", original.display());
+    }
+    Ok(())
+}
+
+/// 软链优先，在同目录暂存后以不覆盖现有目录的方式发布。
+fn link_or_copy(source: &Path, link: &Path) -> anyhow::Result<SkillPathIdentity> {
+    let mut published = None;
+    match link_or_copy_tracked(source, link, &mut published) {
+        Ok(identity) => Ok(identity),
+        Err(error) => {
+            if let Some(identity) = published {
+                match recover_published_path(link, identity) {
+                    Ok(Some(path)) => return Err(error.context(format!("未完成的 Skill 内容保留在 {}", path.display()))),
+                    Ok(None) => {}
+                    Err(recovery_error) => return Err(error.context(format!("Skill 回滚未完成：{recovery_error:#}"))),
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+fn link_or_copy_tracked(
+    source: &Path,
+    link: &Path,
+    published: &mut Option<SkillPathIdentity>,
+) -> anyhow::Result<SkillPathIdentity> {
     let parent = link.parent().context("Skill 启用位置没有父目录")?;
     let staging = parent.join(format!(".codex-plus-copy-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&staging)
-        .with_context(|| format!("创建 Skill 副本暂存目录 {} 失败", staging.display()))?;
-    let result = (|| -> anyhow::Result<()> {
-        copy_dir_all(source, &staging)?;
-        std::fs::write(staging.join(MANAGED_COPY_MARKER), "")?;
-        move_path_no_replace(&staging, link)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = remove_link(&staging);
+    link_or_copy_at(source, link, &staging, published, || Ok(()))
+}
+
+fn link_or_copy_at(
+    source: &Path,
+    link: &Path,
+    staging: &Path,
+    published: &mut Option<SkillPathIdentity>,
+    after_publish: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<SkillPathIdentity> {
+    match std::fs::symlink_metadata(link) {
+        Ok(_) => anyhow::bail!("Skill 启用位置已有其他内容：{}", link.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
-    result.with_context(|| format!("复制 Skill 到 {} 失败（软链也没建成）", link.display()))
+    let mut created_staging = false;
+    let result = (|| -> anyhow::Result<SkillPathIdentity> {
+        if symlink_dir(source, staging).is_ok() {
+            created_staging = true;
+        } else {
+            std::fs::create_dir(&staging)
+                .with_context(|| format!("创建 Skill 副本暂存目录 {} 失败", staging.display()))?;
+            created_staging = true;
+            copy_dir_all(source, staging)?;
+            std::fs::write(staging.join(MANAGED_COPY_MARKER), "")?;
+        }
+        let identity = skill_path_identity(staging)?;
+        move_path_no_replace(staging, link)?;
+        *published = Some(identity);
+        after_publish()?;
+        if skill_path_identity(link)? != identity {
+            anyhow::bail!("Skill 发布期间路径发生变化，未覆盖：{}", link.display());
+        }
+        Ok(identity)
+    })();
+    match result {
+        Err(error) if created_staging && published.is_none() => {
+            Err(error.context(format!("未完成的 Skill 暂存内容保留在 {}", staging.display())))
+        }
+        other => other.with_context(|| format!("发布 Skill 到 {} 失败", link.display())),
+    }
 }
 
 #[cfg(windows)]
@@ -2547,8 +2734,14 @@ fn move_path_no_replace(source: &Path, target: &Path) -> anyhow::Result<()> {
     use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::MoveFileW;
 
-    let source = source.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
-    let target = target.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
+    // 只解析父目录，避免解析最后一级软链，同时支持 Windows 扩展长度路径。
+    let extended = |path: &Path| -> anyhow::Result<PathBuf> {
+        let name = path.file_name().context("Skill 路径没有文件名")?;
+        let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        Ok(parent.canonicalize()?.join(name))
+    };
+    let source = extended(source)?.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
+    let target = extended(target)?.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
     unsafe { MoveFileW(PCWSTR(source.as_ptr()), PCWSTR(target.as_ptr())) }?;
     Ok(())
 }
@@ -3027,6 +3220,31 @@ mod tests {
     }
 
     #[test]
+    fn failed_source_publication_preserves_a_recreated_staging_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        SOURCE_PUBLICATION_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|staging| {
+                write_skill(staging, "external");
+                anyhow::bail!("injected failure after source publication")
+            }));
+        });
+
+        let error = manager.install_from_zip(
+            &sample_skill("alpha", "alpha", "one"),
+            &repo_zip(&[("kit-main/alpha/SKILL.md", "download")]),
+        ).unwrap_err();
+        let staging = std::fs::read_dir(&manager.source_dir).unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.file_name().unwrap().to_string_lossy().starts_with(".staging-alpha-"))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(staging.join(SKILL_MANIFEST_FILE)).unwrap(), "external");
+        assert!(format!("{error:#}").contains("暂存路径仍存在且未自动清理"));
+        assert!(!manager.source_dir.join("alpha").exists());
+        assert!(!manager.load_state().installed.contains_key("alpha"));
+    }
+
+    #[test]
     fn updating_skill_rolls_back_source_when_state_cannot_be_saved() {
         let temp = tempfile::tempdir().unwrap();
         let manager = manager(&temp);
@@ -3364,7 +3582,7 @@ mod tests {
         let new_zip = repo_zip(&[("kit-main/alpha/SKILL.md", "updated")]);
         let updated = zip_skill(&repo, &new_zip, "alpha");
         let error = manager.install_downloaded_zip_if_unchanged(&updated, &new_zip, &guard).unwrap_err();
-        assert!(error.to_string().contains("副本与受控源内容不一致"), "{error:#}");
+        assert!(format!("{error:#}").contains("副本与受控源内容不一致"), "{error:#}");
         assert_eq!(std::fs::read_to_string(copy.join(SKILL_MANIFEST_FILE)).unwrap(), "agent edit");
         assert_eq!(std::fs::read_to_string(manager.source_dir.join(&old.id).join(SKILL_MANIFEST_FILE)).unwrap(), "original");
         assert_eq!(manager.load_state().installed[&old.id].content_hash, old.content_hash);
@@ -3392,6 +3610,43 @@ mod tests {
     }
 
     #[test]
+    fn publishing_does_not_remove_an_existing_staging_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        let staging = temp.path().join("staging");
+        write_skill(&source, "managed");
+        write_skill(&staging, "external");
+        let mut published = None;
+
+        assert!(link_or_copy_at(&source, &target, &staging, &mut published, || Ok(())).is_err());
+        assert!(published.is_none());
+        assert_eq!(std::fs::read_to_string(staging.join(SKILL_MANIFEST_FILE)).unwrap(), "external");
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn publication_failure_tracks_the_published_copy_without_cleaning_a_replaced_staging_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        let staging = temp.path().join("staging");
+        write_skill(&source, "managed");
+        let mut published = None;
+
+        let result = link_or_copy_at(&source, &target, &staging, &mut published, || {
+            write_skill(&staging, "external");
+            anyhow::bail!("injected failure after publication")
+        });
+        assert!(result.is_err());
+        let identity = published.expect("published copy must be tracked before the failure");
+        assert_eq!(std::fs::read_to_string(staging.join(SKILL_MANIFEST_FILE)).unwrap(), "external");
+        let recovery = recover_published_path(&target, identity).unwrap().unwrap();
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_to_string(recovery.join(SKILL_MANIFEST_FILE)).unwrap(), "managed");
+    }
+
+    #[test]
     fn moving_directory_does_not_replace_an_existing_target() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
@@ -3402,6 +3657,157 @@ mod tests {
         assert!(move_path_no_replace(&source, &target).is_err());
         assert_eq!(std::fs::read_to_string(source.join(SKILL_MANIFEST_FILE)).unwrap(), "source");
         assert_eq!(std::fs::read_to_string(target.join(SKILL_MANIFEST_FILE)).unwrap(), "target");
+    }
+
+    #[test]
+    fn rollback_does_not_move_a_replaced_published_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let published = temp.path().join("published");
+        let owned = temp.path().join("owned");
+        write_skill(&published, "managed");
+        let identity = skill_path_identity(&published).unwrap();
+        move_path_no_replace(&published, &owned).unwrap();
+        write_skill(&published, "external");
+
+        assert!(recover_published_path(&published, identity).is_err());
+        assert_eq!(std::fs::read_to_string(published.join(SKILL_MANIFEST_FILE)).unwrap(), "external");
+        assert_eq!(std::fs::read_to_string(owned.join(SKILL_MANIFEST_FILE)).unwrap(), "managed");
+    }
+
+    #[test]
+    fn rollback_recovers_published_content_on_its_own_volume() {
+        let temp = tempfile::tempdir().unwrap();
+        let published = temp.path().join("agent").join("published");
+        write_skill(&published, "managed");
+        let identity = skill_path_identity(&published).unwrap();
+
+        let recovery = recover_published_path(&published, identity).unwrap().unwrap();
+        assert_eq!(recovery.parent(), published.parent());
+        assert!(!published.exists());
+        assert_eq!(std::fs::read_to_string(recovery.join(SKILL_MANIFEST_FILE)).unwrap(), "managed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires SKILL_TEST_SECOND_VOLUME on a different volume"]
+    fn rollback_recovers_cross_volume_agent_copy() {
+        let local = tempfile::tempdir().unwrap();
+        let second_volume = std::env::var_os("SKILL_TEST_SECOND_VOLUME").unwrap();
+        let remote = tempfile::tempdir_in(second_volume).unwrap();
+        assert_ne!(skill_path_identity(local.path()).unwrap().device, skill_path_identity(remote.path()).unwrap().device);
+        let manager = manager(&local);
+        let published = remote.path().join("published");
+        write_skill(&published, "managed");
+        let identity = skill_path_identity(&published).unwrap();
+
+        assert!(manager.backup_directory("alpha", &published).is_err());
+        let recovery = recover_published_path(&published, identity).unwrap().unwrap();
+        assert_eq!(recovery.parent(), published.parent());
+        assert_eq!(std::fs::read_to_string(recovery.join(SKILL_MANIFEST_FILE)).unwrap(), "managed");
+    }
+
+    #[test]
+    fn checked_backup_rejects_a_replaced_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let source = temp.path().join("source");
+        let previous = temp.path().join("previous");
+        write_skill(&source, "managed");
+        let identity = skill_path_identity(&source).unwrap();
+        move_path_no_replace(&source, &previous).unwrap();
+        write_skill(&source, "external");
+
+        assert!(manager.backup_directory_checked("alpha", &source, identity).is_err());
+        assert_eq!(std::fs::read_to_string(source.join(SKILL_MANIFEST_FILE)).unwrap(), "external");
+        assert_eq!(std::fs::read_to_string(previous.join(SKILL_MANIFEST_FILE)).unwrap(), "managed");
+    }
+
+    #[test]
+    fn new_download_does_not_displace_a_newly_created_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(&temp);
+        let source = manager.source_dir.join("alpha");
+        let staging = temp.path().join("staging");
+        write_skill(&source, "external");
+        write_skill(&staging, "download");
+        let installed = InstalledSkill {
+            id: "alpha".into(),
+            name: "Alpha".into(),
+            description: String::new(),
+            repo_key: "acme/kit@main".into(),
+            repo_path: "alpha".into(),
+            content_hash: "hash".into(),
+            installed_at: "1".into(),
+        };
+
+        let mut coordination = skills_coordination();
+        assert!(manager.commit_staged_skill_unlocked(
+            &staging, installed, true, true, true, true, &mut coordination,
+        ).is_err());
+        assert_eq!(std::fs::read_to_string(source.join(SKILL_MANIFEST_FILE)).unwrap(), "external");
+        assert!(!manager.state_path.exists());
+    }
+
+    #[test]
+    fn new_download_rejects_an_existing_managed_agent_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = multi_agent_manager(&temp);
+        let copy = temp.path().join("claude-skills/alpha");
+        let staging = temp.path().join("staging");
+        write_skill(&copy, "existing agent copy");
+        std::fs::write(copy.join(MANAGED_COPY_MARKER), "").unwrap();
+        write_skill(&staging, "download");
+        let installed = InstalledSkill {
+            id: "alpha".into(),
+            name: "Alpha".into(),
+            description: String::new(),
+            repo_key: "acme/kit@main".into(),
+            repo_path: "alpha".into(),
+            content_hash: "hash".into(),
+            installed_at: "1".into(),
+        };
+
+        let mut coordination = skills_coordination();
+        assert!(manager.commit_staged_skill_unlocked(
+            &staging, installed, true, true, true, true, &mut coordination,
+        ).is_err());
+        assert_eq!(std::fs::read_to_string(copy.join(SKILL_MANIFEST_FILE)).unwrap(), "existing agent copy");
+        assert!(!manager.source_dir.join("alpha").exists());
+    }
+
+    #[test]
+    fn rollback_does_not_restore_a_replaced_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let backup = temp.path().join("backup");
+        let previous = temp.path().join("previous");
+        let original = temp.path().join("original");
+        write_skill(&backup, "managed");
+        let identity = skill_path_identity(&backup).unwrap();
+        move_path_no_replace(&backup, &previous).unwrap();
+        write_skill(&backup, "external");
+
+        assert!(restore_skill_backup(&backup, &original, identity).is_err());
+        assert!(!original.exists());
+        assert_eq!(std::fs::read_to_string(backup.join(SKILL_MANIFEST_FILE)).unwrap(), "external");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn moving_directory_supports_long_windows_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut parent = temp.path().to_path_buf();
+        for _ in 0..8 {
+            parent.push("long-directory-name-for-skill-test");
+        }
+        std::fs::create_dir_all(&parent).unwrap();
+        let source = parent.join("source");
+        let target = parent.join("target");
+        assert!(source.to_string_lossy().len() > 260);
+        write_skill(&source, "source");
+
+        move_path_no_replace(&source, &target).unwrap();
+        assert!(!source.exists());
+        assert_eq!(std::fs::read_to_string(target.join(SKILL_MANIFEST_FILE)).unwrap(), "source");
     }
 
     #[test]
