@@ -432,7 +432,7 @@
   const codexPlusSettingsKey = "codexPlusSettings";
   const codexThreadScrollKey = "codexThreadScroll";
   const codexServiceTierRequestOverrideVersion = "10";
-  const codexAppServerModelRequestPatchVersion = "38";
+  const codexAppServerModelRequestPatchVersion = "39";
   const codexAppServerClientCaptureMarker = "AppServerRequestClient is missing a message dispatcher";
   const codexAppServerClientCaptureAnchor = "async sendRequest(";
   const codexRemoteSessionRecoveryVersion = "8";
@@ -4264,6 +4264,10 @@
     const threadId = params.threadId || params.conversationId;
     if (!threadId) return null; // 原生也支持按 path 恢复；没有 thread id 时不改写。
     let state = codexThreadProviderPreparations.get(threadId);
+    // 显式恢复经过同一 RPC 拦截器；放行本次正在建立的同一连接，避免等待自身。
+    if (state?.resuming && state.resuming === params.modelProvider
+        && params.threadId === threadId && Object.keys(params).length === 4
+        && params.model === null && params.config === null) return null;
     if (!state) codexThreadProviderPreparations.set(threadId, state = { pending: null, tail: null });
     const previous = state.tail;
     let release;
@@ -4286,12 +4290,18 @@
       const sourceProvider = read.thread.modelProvider;
       const targetProvider = params.modelProvider ?? params.model_provider
         ?? params.config?.model_provider ?? config.config.model_provider ?? "openai";
-      const runtimeProvider = cached?.resumeState === "resumed" ? cached.modelProvider : sourceProvider;
+      if (read.thread.status.type === "notLoaded") state.preparedProvider = null;
+      // 原生恢复不会刷新缓存的 provider 标签；只信任本层实际恢复响应确认过的连接。
+      const runtimeProvider = client && state.client === client && state.preparedProvider
+        ? state.preparedProvider
+        : cached?.resumeState === "resumed" ? cached.modelProvider : sourceProvider;
       if (typeof sourceProvider !== "string" || !sourceProvider
           || typeof targetProvider !== "string" || !targetProvider
           || (sourceProvider === targetProvider && runtimeProvider === targetProvider && !state.pending)) return null;
       const loaded = read.thread.status.type !== "notLoaded" || cached?.resumeState === "resumed";
       if (loaded) {
+        state.preparedProvider = null;
+        state.client = null;
         const current = await sendRequest("thread/read", { threadId, includeTurns: false }, options);
         if (current.thread.status.type === "active") return null;
       }
@@ -4316,13 +4326,27 @@
           await sendRequest("thread/unsubscribe", { threadId }, options);
         }
       }
+      if (client && loaded) {
+        state.resuming = targetProvider;
+        try {
+          const resumed = await sendRequest("thread/resume", {
+            threadId, modelProvider: targetProvider, model: null, config: null,
+          }, options);
+          if (resumed.modelProvider !== targetProvider) throw new Error("会话尚未切换到目标供应商，请重试");
+          if (signature() !== before) throw new Error("供应商配置已变化，请重新打开会话");
+          state.client = client;
+          state.preparedProvider = targetProvider;
+        } finally {
+          state.resuming = null;
+        }
+      }
       const prepared = state.pending;
       state.pending = null;
       // 宿主使用原来的 resume 候选恢复；旧客户端也保留原始 model/effort 参数。
       return prepared;
     } finally {
       release();
-      if (state.tail === tail && !state.pending) codexThreadProviderPreparations.delete(threadId);
+      if (state.tail === tail && !state.pending && !state.preparedProvider) codexThreadProviderPreparations.delete(threadId);
     }
   }
 
@@ -20839,7 +20863,7 @@
    *   - `agent/request`：params `{ agent, turn, step, signal }`，返回 `{ provider, model, reasoningEffort }`。
    * 同一条用户消息只跑一次这两条链（按 clientUserMessageId 缓存），结果套用到它的所有候选帧上。
    */
-  const codexPlusRpcInterceptorVersion = 9;
+  const codexPlusRpcInterceptorVersion = 10;
   const codexPlusRpcMiddlewareTimeoutMs = 5000;
   const codexPlusRpcOpaque = Symbol("codexPlusRpcOpaque");
   const codexPlusRpcSourceItem = Symbol("codexPlusRpcSourceItem");

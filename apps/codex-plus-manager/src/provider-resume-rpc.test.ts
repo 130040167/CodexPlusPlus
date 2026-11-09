@@ -78,7 +78,8 @@ function runtime() {
       }
       if (method === "thread/resume") {
         state.status = "idle";
-        return { thread: { id: params.threadId, modelProvider: state.source } };
+        return { modelProvider: params.modelProvider ?? state.source,
+          thread: { id: params.threadId, modelProvider: state.source } };
       }
       assert.equal(method, "config/read");
       return { config: { model_provider: state.target } };
@@ -245,7 +246,7 @@ describe("provider resume RPC gate without context helpers", () => {
     env.state.bridgeFailure = "";
     env.window.__codexPlusRpcFrameInterceptor.version = 7;
     env.install();
-    assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 9);
+    assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 10);
     assert.equal(env.window.__codexPlusRpcFrameInterceptor.original, original);
     env.port.postMessage(frame);
     await env.settle();
@@ -335,6 +336,90 @@ describe("provider preparation", () => {
     assert.equal(env.calls.filter((call) => call.method === "unsubscribeInactiveConversation").length, 2);
     assert.equal(env.calls.some((call) => call.method === "thread/unsubscribe"), false);
     assert.deepEqual(params, { conversationId: "thread", model: null, reasoningEffort: null });
+  });
+
+  it("confirms the actual connection once despite stale host labels and switches back after index sync", async () => {
+    const env = runtime();
+    env.subscribe();
+    env.state.status = "idle";
+    env.state.source = "custom";
+    env.state.target = "openai";
+    env.state.cached = { modelProvider: "custom", resumeState: "resumed" };
+    const host = {
+      getConversation: env.client.getConversation,
+      async unsubscribeInactiveConversation() {
+        env.calls.push({ method: "unsubscribeInactiveConversation" });
+        env.state.cached.resumeState = "needs_resume";
+      },
+    };
+    const send = async (method: string, params: any, options: any) => {
+      if (method === "thread/resume") {
+        assert.equal(await env.api.align(params, "local", send, host), null,
+          "The internal explicit resume must not await its own preparation lock.");
+      }
+      return env.client.sendRequest(method, params, options);
+    };
+    const params = { conversationId: "thread", model: null, reasoningEffort: null };
+    assert.deepEqual(await env.api.align(params, "local", send, host), {
+      sourceProvider: "custom", targetProvider: "openai",
+    });
+    // Ordinary native hydration retains this old label even after the real connection changes.
+    env.state.cached.resumeState = "resumed";
+    assert.equal(await env.api.align(params, "local", send, host), null);
+    assert.equal(await env.api.align(params, "local", send, host), null);
+    assert.equal(env.calls.filter(call => call.method === "unsubscribeInactiveConversation").length, 1);
+    // The same RPC client can survive a native unload; its earlier connection proof then expires.
+    env.state.status = "notLoaded";
+    assert.deepEqual(await env.api.align(params, "local", send, host), {
+      sourceProvider: "custom", targetProvider: "openai",
+    });
+    assert.equal(env.calls.filter(call => call.method === "unsubscribeInactiveConversation").length, 2);
+    env.state.cached.resumeState = "resumed";
+    // Startup synchronization can align the index before the next reverse transition.
+    env.state.source = "custom";
+    env.state.target = "custom";
+    assert.deepEqual(await env.api.align(params, "local", send, host), {
+      sourceProvider: "openai", targetProvider: "custom",
+    });
+    assert.equal(env.calls.filter(call => call.method === "unsubscribeInactiveConversation").length, 3);
+    assert.equal(env.calls.filter(call => call.route).length, 1);
+    assert.deepEqual(env.calls.filter(call => call.method === "thread/resume").map(call => call.params), [
+      { threadId: "thread", modelProvider: "openai", model: null, config: null },
+      { threadId: "thread", modelProvider: "openai", model: null, config: null },
+      { threadId: "thread", modelProvider: "custom", model: null, config: null },
+    ]);
+  });
+
+  it("does not record failed or wrong-provider resumes as successfully prepared", async () => {
+    for (const failure of ["reject", "wrong-provider", "configuration"]) {
+      const env = runtime();
+      env.subscribe();
+      env.state.status = "idle";
+      env.state.cached = { modelProvider: "openai", resumeState: "resumed" };
+      const host = {
+        getConversation: env.client.getConversation,
+        async unsubscribeInactiveConversation() { env.state.cached.resumeState = "needs_resume"; },
+      };
+      let failed = true;
+      const send = async (method: string, params: any, options: any) => {
+        if (failed && method === "thread/resume") {
+          if (failure === "reject") throw new Error("LOCAL_RESUME_FAILED");
+          if (failure === "wrong-provider") return { modelProvider: "openai" };
+          env.settings.relayProfiles[0].configContents = 'model_provider = "changed"';
+        }
+        return env.client.sendRequest(method, params, options);
+      };
+      await assert.rejects(env.api.align({ threadId: "thread" }, "local", send, host),
+        failure === "reject" ? /LOCAL_RESUME_FAILED/
+          : failure === "wrong-provider" ? /目标供应商/ : /配置已变化/);
+      failed = false;
+      assert.deepEqual(await env.api.align({ threadId: "thread" }, "local", send, host), {
+        sourceProvider: "openai", targetProvider: "custom",
+      });
+      assert.equal(env.calls.filter(call => call.route).length, 1);
+      assert.equal(env.calls.filter(call => call.method === "thread/resume").length,
+        failure === "configuration" ? 2 : 1);
+    }
   });
 
   it("does not unload a thread which becomes active before or after the canonical write", async () => {

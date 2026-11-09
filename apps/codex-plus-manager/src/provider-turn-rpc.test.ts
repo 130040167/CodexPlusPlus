@@ -265,7 +265,7 @@ describe("installed Capnweb prepared turn provider gate", { skip: !existsSync(as
       assert.equal(env.state.prepares, 2);
       assert.equal(await env.send(env.client.getTurnCoordinator()).promise, "thread");
       assert.equal(env.state.prepares, 3);
-      assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 9);
+      assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 10);
       assert.deepEqual(env.failures, []);
     } finally { env.close(); }
   });
