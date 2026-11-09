@@ -159,14 +159,16 @@ describe("nullable restoration through existing upstream wrappers", () => {
               mode === "envelope" ? { hostId: "local", method: "thread/resume", params } : params);
             const dispatched = calls.slice(callCount);
             assert.deepEqual(dispatched.map((call) => call.method), !enabled ? ["thread/resume"]
-              : status === "notLoaded" ? ["thread/read", "config/read", "thread/resume"] : ["thread/read", "thread/resume"]);
+              : status === "notLoaded" ? ["thread/read", "config/read", "thread/resume"]
+              : status === "active" ? ["thread/read", "thread/resume"]
+              : ["thread/read", "config/read", "thread/read", "thread/read", "thread/unsubscribe", "thread/resume"]);
             assert.equal(dispatched.at(-1).params.model, choice.model);
             assert.equal(dispatched.at(-1).params.reasoningEffort, choice.reasoningEffort);
             assert.equal(dispatched.at(-1).params.config.model_reasoning_effort, choice.config.model_reasoning_effort);
             assert.deepEqual(params, before);
             assert.equal(result.model, "native-saved");
             assert.equal(result.reasoningEffort, "native-saved");
-            assert.equal(bridges.length - bridgeCount, enabled && status === "notLoaded" ? 1 : 0,
+            assert.equal(bridges.length - bridgeCount, enabled && status !== "active" ? 1 : 0,
               `${mode}: ${relayMode}/${officialMixApiKey}: ${source} -> ${target}, ${enabled}/${status}`);
             if (bridges.length > bridgeCount) {
               assert.deepEqual({ ...bridges.at(-1) }, { host_id: "local", thread_id: "a",
@@ -179,7 +181,7 @@ describe("nullable restoration through existing upstream wrappers", () => {
   }
 
   for (const mode of ["instance", "prototype"]) {
-    it(`replaces the ${mode} v36 helper closure on reinjection without stacking sends`, async () => {
+    it(`replaces the ${mode} v37 helper closure on reinjection without stacking sends`, async () => {
       const helpers: string[] = [];
       const sent: any[] = [];
       class Client {
@@ -211,7 +213,7 @@ describe("nullable restoration through existing upstream wrappers", () => {
         ${prototype}
         return ${mode === "instance" ? "patchAppServerModelRequestClient(client)" : "installCodexAppServerClientPrototypePatch()"};
       })(helper)`, context);
-      assert.equal(inject("36"), true);
+      assert.equal(inject("37"), true);
       const oldWrapper = client.sendRequest;
       const params = { threadId: "a", model: null, reasoningEffort: null };
       const options = { timeoutMs: 2000 };

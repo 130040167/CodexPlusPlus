@@ -19,7 +19,7 @@ function runtime() {
     relayProfiles: [{ id: "relay", relayMode: "pureApi", configContents: 'model_provider = "custom"' }] };
   const state = { status: "notLoaded", source: "openai", target: "custom", cached: null as any,
     failure: null as Error | null, bridgeFailure: "", discoveries: 0, disposals: 0,
-    wait: null as Promise<void> | null, afterRead: () => {} };
+    wait: null as Promise<void> | null, afterRead: () => {}, afterPrepare: () => {} };
   const interceptors = new Map();
   let chain = async (value: any) => value;
   const acknowledgements = new Map<string, () => void>();
@@ -44,6 +44,10 @@ function runtime() {
   const postJson = async (route: string, payload: any) => {
     assert.equal(route, "/thread-provider/prepare");
     calls.push({ route, payload });
+    if (!state.bridgeFailure) {
+      state.source = payload.target_provider;
+      state.afterPrepare();
+    }
     return state.bridgeFailure ? { status: "failed", message: state.bridgeFailure } : { status: "ok" };
   };
   const api = new Function("codexPlusBackendSettings", "codexModelCatalog", "sendCodexPlusDiagnostic",
@@ -67,6 +71,14 @@ function runtime() {
       if (method === "thread/read") {
         return { thread: { id: params.threadId, cwd: "C:/fixture",
           status: { type: state.status }, modelProvider: state.source } };
+      }
+      if (method === "thread/unsubscribe") {
+        state.status = "notLoaded";
+        return { status: "ok" };
+      }
+      if (method === "thread/resume") {
+        state.status = "idle";
+        return { thread: { id: params.threadId, modelProvider: state.source } };
       }
       assert.equal(method, "config/read");
       return { config: { model_provider: state.target } };
@@ -283,7 +295,7 @@ describe("provider resume RPC gate without context helpers", () => {
 });
 
 describe("provider preparation", () => {
-  it("supports both provider directions and leaves loaded or same-provider threads unwritten", async () => {
+  it("switches both unloaded and idle providers in either direction without touching active turns", async () => {
     for (const [source, target] of [["openai", "custom"], ["custom", "openai"]]) {
       for (const status of ["notLoaded", "idle", "active"]) {
         const env = runtime();
@@ -293,10 +305,77 @@ describe("provider preparation", () => {
         const before = structuredClone(params);
         const result = await env.api.align(params, "local", env.client.sendRequest);
         assert.deepEqual(params, before);
-        assert.equal(env.calls.some((call) => call.route), status === "notLoaded");
-        assert.deepEqual(result, status === "notLoaded" ? { sourceProvider: source, targetProvider: target } : null);
+        assert.equal(env.calls.some((call) => call.route), status !== "active");
+        assert.deepEqual(result, status !== "active" ? { sourceProvider: source, targetProvider: target } : null);
+        assert.equal(env.calls.some((call) => call.method === "thread/unsubscribe"), status === "idle");
       }
     }
+  });
+
+  it("uses the host lifecycle and retries after disk alignment when unsubscribe fails", async () => {
+    const env = runtime();
+    env.subscribe();
+    env.state.status = "idle";
+    env.state.cached = { modelProvider: "openai", resumeState: "resumed", threadRuntimeStatus: { type: "idle" } };
+    let failed = true;
+    const host = {
+      getConversation: env.client.getConversation,
+      async unsubscribeInactiveConversation(threadId: string) {
+        env.calls.push({ method: "unsubscribeInactiveConversation", threadId });
+        if (!failed) env.state.cached.resumeState = "needs_resume";
+      },
+    };
+    const params = { conversationId: "thread", model: null, reasoningEffort: null };
+    await assert.rejects(env.api.align(params, "local", env.client.sendRequest, host), /尚未卸载/);
+    assert.equal(env.state.source, "custom");
+    failed = false;
+    const result = await env.api.align(params, "local", env.client.sendRequest, host);
+    assert.deepEqual(result, { sourceProvider: "openai", targetProvider: "custom" });
+    assert.equal(env.calls.filter((call) => call.route).length, 1);
+    assert.equal(env.calls.filter((call) => call.method === "unsubscribeInactiveConversation").length, 2);
+    assert.equal(env.calls.some((call) => call.method === "thread/unsubscribe"), false);
+    assert.deepEqual(params, { conversationId: "thread", model: null, reasoningEffort: null });
+  });
+
+  it("does not unload a thread which becomes active before or after the canonical write", async () => {
+    for (const stage of ["before", "after"]) {
+      const env = runtime();
+      env.subscribe();
+      env.state.status = "idle";
+      if (stage === "before") env.state.afterRead = () => { env.state.status = "active"; };
+      else env.state.afterPrepare = () => { env.state.status = "active"; };
+      assert.equal(await env.api.align({ threadId: "thread" }, "local", env.client.sendRequest), null);
+      assert.equal(env.calls.some((call) => call.method === "thread/unsubscribe"), false);
+      assert.equal(env.calls.some((call) => call.route), stage === "after");
+      env.state.afterRead = () => {};
+      env.state.afterPrepare = () => {};
+      env.state.status = "idle";
+      assert.deepEqual(await env.api.align({ threadId: "thread" }, "local", env.client.sendRequest), {
+        sourceProvider: "openai", targetProvider: "custom",
+      });
+      assert.equal(env.calls.some((call) => call.method === "thread/unsubscribe"), true);
+    }
+  });
+
+  it("serializes same-thread preparations and lets native resume keep the legacy turn choices", async () => {
+    const env = runtime();
+    env.subscribe();
+    env.state.status = "idle";
+    const params = { threadId: "thread", model: "chosen", effort: "high",
+      input: [{ type: "text", text: "next" }] };
+    const before = structuredClone(params);
+    const results = await Promise.all([
+      env.api.prepare("turn/start", params, "local", false, env.client.sendRequest),
+      env.api.prepare("turn/start", params, "local", false, env.client.sendRequest),
+    ]);
+    assert.equal(env.calls.filter((call) => call.route).length, 1);
+    assert.equal(env.calls.filter((call) => call.method === "thread/unsubscribe").length, 1);
+    assert.equal(env.calls.filter((call) => call.method === "thread/resume").length, 1);
+    assert.deepEqual(env.calls.find((call) => call.method === "thread/resume").params, {
+      threadId: "thread", modelProvider: "custom", model: null, config: null,
+    });
+    assert(results.every((result) => result === params));
+    assert.deepEqual(params, before);
   });
 
   it("rejects a changed provider configuration before the bridge write", async () => {

@@ -140,42 +140,87 @@
       assertEnvelope();
       return nested === params.params ? params : { ...params, params: nested };
     }
-    if (method !== "thread/resume" || !params || typeof params !== "object" || Array.isArray(params)) {
+    if (!["thread/resume", "turn/start"].includes(method)
+        || !params || typeof params !== "object" || Array.isArray(params)) {
       return params;
     }
-    await prepareCodexThreadProviderResume(params, hostId, sendRequest);
+    const prepared = await prepareCodexThreadProviderResume(params, hostId, sendRequest);
+    if (prepared && method === "turn/start") {
+      await sendRequest("thread/resume", {
+        threadId: params.threadId, modelProvider: prepared.targetProvider, model: null, config: null,
+      }, { timeoutMs: codexAppServerPreparationTimeoutMs });
+    }
     return params;
   }
 
-  async function prepareCodexThreadProviderResume(params, hostId, sendRequest) {
+  const codexThreadProviderPreparations = new Map();
+
+  async function prepareCodexThreadProviderResume(params, hostId, sendRequest, client) {
     if (hostId !== "local" || !codexPlusBackendSettings.providerSyncEnabled
         || [params?.hostId, params?.host_id].some((host) => typeof host === "string" && host !== "local")) return null;
     const threadId = params.threadId || params.conversationId;
     if (!threadId) return null; // 原生也支持按 path 恢复；没有 thread id 时不改写。
-    const signature = () => {
-      const profile = codexRemoteSessionActiveProfile();
-      return JSON.stringify([profile?.id, profile?.relayMode, profile?.configContents]);
-    };
-    const before = signature();
-    const options = { timeoutMs: codexAppServerPreparationTimeoutMs };
-    const read = await sendRequest("thread/read", { threadId, includeTurns: false }, options);
-    if (read.thread.status.type !== "notLoaded") return null;
-    const config = await sendRequest("config/read", {
-      cwd: params.cwd ?? read.thread.cwd ?? null, includeLayers: false,
-    }, options);
-    if (signature() !== before) throw new Error("供应商配置已变化，请重新打开会话");
-    const sourceProvider = read.thread.modelProvider;
-    const targetProvider = params.modelProvider ?? params.model_provider
-      ?? params.config?.model_provider ?? config.config.model_provider ?? "openai";
-    if (typeof sourceProvider !== "string" || !sourceProvider
-        || typeof targetProvider !== "string" || !targetProvider || sourceProvider === targetProvider) return null;
-    const result = await postJson("/thread-provider/prepare", {
-      host_id: "local", thread_id: threadId, source_provider: sourceProvider, target_provider: targetProvider,
-    });
-    if (result?.status !== "ok") throw new Error(result?.message || result?.error || "会话供应商准备失败");
-    if (signature() !== before) throw new Error("供应商配置已变化，请重新打开会话");
-    // 只对齐磁盘 provider；nullable model/effort 继续由原生恢复保存选择。
-    return { sourceProvider, targetProvider };
+    let state = codexThreadProviderPreparations.get(threadId);
+    if (!state) codexThreadProviderPreparations.set(threadId, state = { pending: null, tail: null });
+    const previous = state.tail;
+    let release;
+    const tail = state.tail = new Promise((resolve) => { release = resolve; });
+    await previous;
+    try {
+      const signature = () => {
+        const profile = codexRemoteSessionActiveProfile();
+        return JSON.stringify([profile?.id, profile?.relayMode, profile?.configContents]);
+      };
+      const before = signature();
+      const options = { timeoutMs: codexAppServerPreparationTimeoutMs };
+      const read = await sendRequest("thread/read", { threadId, includeTurns: false }, options);
+      const cached = client ? await client.getConversation(threadId) : null;
+      if (read.thread.status.type === "active" || cached?.threadRuntimeStatus?.type === "active") return null;
+      const config = await sendRequest("config/read", {
+        cwd: params.cwd ?? read.thread.cwd ?? null, includeLayers: false,
+      }, options);
+      if (signature() !== before) throw new Error("供应商配置已变化，请重新打开会话");
+      const sourceProvider = read.thread.modelProvider;
+      const targetProvider = params.modelProvider ?? params.model_provider
+        ?? params.config?.model_provider ?? config.config.model_provider ?? "openai";
+      const runtimeProvider = cached?.resumeState === "resumed" ? cached.modelProvider : sourceProvider;
+      if (typeof sourceProvider !== "string" || !sourceProvider
+          || typeof targetProvider !== "string" || !targetProvider
+          || (sourceProvider === targetProvider && runtimeProvider === targetProvider && !state.pending)) return null;
+      const loaded = read.thread.status.type !== "notLoaded" || cached?.resumeState === "resumed";
+      if (loaded) {
+        const current = await sendRequest("thread/read", { threadId, includeTurns: false }, options);
+        if (current.thread.status.type === "active") return null;
+      }
+      if (sourceProvider !== targetProvider) {
+        const result = await postJson("/thread-provider/prepare", {
+          host_id: "local", thread_id: threadId, source_provider: sourceProvider, target_provider: targetProvider,
+        });
+        if (result?.status !== "ok") throw new Error(result?.message || result?.error || "会话供应商准备失败");
+      }
+      if (state.pending?.targetProvider !== targetProvider) {
+        state.pending = { sourceProvider: runtimeProvider, targetProvider };
+      }
+      if (signature() !== before) throw new Error("供应商配置已变化，请重新打开会话");
+      if (loaded) {
+        const current = await sendRequest("thread/read", { threadId, includeTurns: false }, options);
+        if (current.thread.status.type === "active") return null;
+        if (client) {
+          if (cached?.resumeState !== "needs_resume") await client.unsubscribeInactiveConversation(threadId);
+          const after = await client.getConversation(threadId);
+          if (after?.resumeState !== "needs_resume") throw new Error("旧供应商会话尚未卸载，请稍后重试");
+        } else {
+          await sendRequest("thread/unsubscribe", { threadId }, options);
+        }
+      }
+      const prepared = state.pending;
+      state.pending = null;
+      // 宿主使用原来的 resume 候选恢复；旧客户端也保留原始 model/effort 参数。
+      return prepared;
+    } finally {
+      release();
+      if (state.tail === tail && !state.pending) codexThreadProviderPreparations.delete(threadId);
+    }
   }
 
   // 兼容 70 分片调用；nullable 恢复的模型选择归原生负责。

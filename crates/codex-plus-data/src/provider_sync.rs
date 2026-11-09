@@ -628,7 +628,7 @@ pub fn run_provider_sync(codex_home: Option<&Path>) -> ProviderSyncResult {
     run_provider_sync_with_target(codex_home, None)
 }
 
-/// 仅为原生未加载会话续接对齐索引；调用方须先通过原生 thread/read 确认 notLoaded。
+/// 为原生会话续接对齐索引；调用方须先确认会话空闲，并在恢复前卸载仍使用旧供应商的运行对象。
 /// 不读取 rollout，也不覆盖原生保存的模型、推理强度或会话内容。
 pub fn prepare_thread_provider(
     home: &Path,
