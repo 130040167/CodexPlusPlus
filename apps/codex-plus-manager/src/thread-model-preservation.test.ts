@@ -6,6 +6,9 @@ import vm from "node:vm";
 const source = readFileSync(new URL(
   "../../../assets/inject/renderer-inject/30-service-tier.js", import.meta.url), "utf8");
 const override = source.slice(0, source.indexOf("  function codexManagedSessionConnection("));
+const requestPatchVersion = readFileSync(new URL(
+  "../../../assets/inject/renderer-inject/00-prelude.js", import.meta.url), "utf8")
+  .match(/const codexAppServerModelRequestPatchVersion = "([^"]+)";/)![1];
 
 function runtime(mode = "pureApi", providerSyncEnabled = false) {
   return new Function("codexPlusBackendSettings", "codexModelCatalog", "sendCodexPlusDiagnostic",
@@ -118,11 +121,11 @@ describe("nullable restoration through existing upstream wrappers", () => {
             }
           }
           const client = new Client();
-          const profile = { id: "relay", relayMode: mode === "prototype" ? "pureApi" : relayMode,
+          const profile = { id: "relay", relayMode,
             officialMixApiKey, configContents: `model_provider = "${target}"` };
           const context = vm.createContext({
             window: { __codexPlusAppServerClientClass: Client, __codexSessionDeleteBridge: () => {} }, client,
-            codexAppServerModelRequestPatchVersion: "36",
+            codexAppServerModelRequestPatchVersion: requestPatchVersion,
             codexPlusBackendSettings: { relayProfilesEnabled: true, activeRelayId: "relay", providerSyncEnabled: enabled,
               relayProfiles: [profile] },
             codexModelCatalog: {}, codexPlusBackendSettingsLoaded: true, codexAppServerPreparationTimeoutMs: 2000,
@@ -142,9 +145,8 @@ describe("nullable restoration through existing upstream wrappers", () => {
           });
           vm.runInContext(override + instance + prototype, context);
           assert.equal(vm.runInContext(mode === "prototype"
-            ? "installCodexAppServerClientPrototypePatch()" : "patchAppServerModelRequestClient(client)", context), true);
-          // 已安装的 prototype wrapper 必须在切换到 official/mixedApi 后继续准备 provider。
-          profile.relayMode = relayMode;
+            ? "installCodexAppServerClientPrototypePatch()" : "patchAppServerModelRequestClient(client)", context),
+          mode !== "prototype" || enabled || relayMode === "pureApi" || officialMixApiKey);
           for (const choice of [
             { model: null, reasoningEffort: null, config: { model_reasoning_effort: null } },
             { model: "chosen", reasoningEffort: "low", config: { model_reasoning_effort: "high" } },
@@ -173,6 +175,159 @@ describe("nullable restoration through existing upstream wrappers", () => {
           }
         }
       }
+    });
+  }
+
+  for (const mode of ["instance", "prototype"]) {
+    it(`replaces the ${mode} v36 helper closure on reinjection without stacking sends`, async () => {
+      const helpers: string[] = [];
+      const sent: any[] = [];
+      class Client {
+        hostId = "local";
+        async sendRequest(method: string, params: any, options: any) {
+          sent.push({ method, params, options, hostId: this.hostId });
+          return { thread: { id: "a" } };
+        }
+      }
+      const client = new Client();
+      const context = vm.createContext({
+        client, window: { __codexPlusAppServerClientClass: Client },
+        codexPlusBackendSettingsLoaded: true, codexPlusBackendSettings: { providerSyncEnabled: true },
+        codexPlusSettings: () => ({}), codexPlusModelUnlockEnabled: () => false,
+        codexPluginMarketplacePatchEnabled: () => false, codexRemoteSessionProviderPatchEnabled: () => false,
+        registerNativeHostClient() {}, codexPlusPluginNativeInterceptClient: () => null,
+        appServerModelRequestMethod: (method: string) => method,
+        codexRemoteSessionProviderRequestMethod: () => false, codexRemoteSessionProviderOverrideEnabled: () => false,
+        applyCodexRemoteSessionProviderOverride: (_method: string, params: any) => params,
+        prepareCodexManagedSessionConnection: async (_method: string, params: any) => params,
+        refreshCodexThreadModelBeforeTurn: async () => null, sendCodexManagedSessionTurn: async () => null,
+        verifyCodexPureApiResumeResult() {}, noteCodexManagedSessionStart() {}, codexThreadModelRequestState: () => ({}),
+        sendCodexPlusDiagnostic() {},
+        helper: async (_method: string, params: any) => { helpers.push("old"); return params; },
+      });
+      const inject = (version: string) => vm.runInContext(`((prepareCodexPureApiResume) => {
+        const codexAppServerModelRequestPatchVersion = ${JSON.stringify(version)};
+        ${instance}
+        ${prototype}
+        return ${mode === "instance" ? "patchAppServerModelRequestClient(client)" : "installCodexAppServerClientPrototypePatch()"};
+      })(helper)`, context);
+      assert.equal(inject("36"), true);
+      const oldWrapper = client.sendRequest;
+      const params = { threadId: "a", model: null, reasoningEffort: null };
+      const options = { timeoutMs: 2000 };
+      await client.sendRequest("thread/resume", params, options);
+      context.helper = async (_method: string, input: any) => { helpers.push("new"); return input; };
+      assert.equal(inject(requestPatchVersion), true);
+      assert.notEqual(client.sendRequest, oldWrapper);
+      const newWrapper = client.sendRequest;
+      assert.equal(inject(requestPatchVersion), true);
+      assert.equal(client.sendRequest, newWrapper);
+      await client.sendRequest("thread/resume", params, options);
+      assert.deepEqual(helpers, ["old", "new"]);
+      assert.equal(sent.length, 2);
+      for (const call of sent) {
+        assert.equal(call.params, params);
+        assert.equal(call.options, options);
+        assert.equal(call.hostId, "local");
+      }
+    });
+  }
+});
+
+describe("legacy provider sync cold installation", () => {
+  const catalog = readFileSync(new URL("../../../assets/inject/renderer-inject/70-model-catalog.js", import.meta.url), "utf8");
+  const installs = catalog.slice(catalog.indexOf("  const appServerModelRequestPatchMaxMisses"),
+    catalog.indexOf("  function runCodexModelWhitelistRefreshPass("));
+
+  function startup(relayMode: string, foundOnSweep = 2) {
+    const timers = new Map<number, { callback: () => void; delay: number }>();
+    const delays: number[] = [];
+    const routes: string[] = [];
+    let sweeps = 0;
+    let captures = 0;
+    let patched = 0;
+    let timerId = 0;
+    const settings = { providerSyncEnabled: false, relayProfilesEnabled: true, activeRelayId: "relay",
+      relayProfiles: [{ id: "relay", relayMode }] };
+    const context = vm.createContext({
+      codexPlusBackendSettings: settings, codexPlusBackendSettingsLoaded: false,
+      window: { setTimeout(callback: () => void, delay: number) {
+        timers.set(++timerId, { callback, delay });
+        delays.push(delay);
+        return timerId;
+      } },
+      clearTimeout: (id: number) => timers.delete(id),
+      codexAppServerModelRequestPatchVersion: requestPatchVersion,
+      codexPlusModelUnlockEnabled: () => false, codexPluginMarketplacePatchEnabled: () => false,
+      codexPlusSettings: () => ({}), installCodexThreadGoalForwarding() {}, installDictationSupportPatch() {},
+      installModelJsonResponsePatch: () => assert.fail("provider sync must not unlock models"),
+      patchAppServerModelMessages: () => assert.fail("provider sync must not patch model responses"),
+      installCodexAppServerClientCapture: async () => { captures++; },
+      postJson: async (route: string) => { routes.push(route); },
+      loadAppServerRequestCandidates: async () => {
+        sweeps++;
+        return { modules: [{}], candidates: sweeps >= foundOnSweep ? [{}] : [], sources: [], discovery: "fixture" };
+      },
+      patchAppServerModelRequestClient: () => { patched++; return true; },
+      sendCodexPlusDiagnostic() {},
+    });
+    vm.runInContext(override + installs, context);
+    return {
+      settings, routes, timers, delays, context,
+      ensure: () => vm.runInContext("ensureCodexModelWhitelistInstalls()", context),
+      settle: () => vm.runInContext("appServerModelRequestPatchPromise", context),
+      counts: () => ({ sweeps, captures, patched }),
+    };
+  }
+
+  for (const relayMode of ["official", "mixedApi"]) {
+    it(`cold-starts ${relayMode} sync only after settings load and retries late client discovery`, async () => {
+      const env = startup(relayMode);
+      env.settings.providerSyncEnabled = true;
+      env.ensure();
+      assert.deepEqual(env.counts(), { sweeps: 0, captures: 0, patched: 0 });
+      env.settings.providerSyncEnabled = false;
+      env.context.codexPlusBackendSettingsLoaded = true;
+      env.ensure();
+      assert.deepEqual(env.counts(), { sweeps: 0, captures: 0, patched: 0 });
+      assert.deepEqual(env.routes, []);
+      assert.equal(env.timers.size, 0);
+
+      env.settings.providerSyncEnabled = true;
+      env.ensure();
+      await env.settle();
+      assert.deepEqual(env.counts(), { sweeps: 1, captures: 1, patched: 0 });
+      assert.deepEqual(env.routes, ["/extensions/request-capture"]);
+      const [id, timer] = env.timers.entries().next().value!;
+      env.timers.delete(id);
+      timer.callback();
+      await env.settle();
+      env.ensure();
+      assert.equal(env.counts().sweeps, 2);
+      assert.equal(env.counts().patched, 1);
+      assert.deepEqual(env.routes, ["/extensions/request-capture"]);
+      assert.deepEqual(env.delays, [250]);
+      assert.equal(env.timers.size, 0);
+    });
+
+    it(`bounds ${relayMode} opt-in discovery retries without a legacy client`, async () => {
+      const env = startup(relayMode, Infinity);
+      env.settings.providerSyncEnabled = true;
+      env.context.codexPlusBackendSettingsLoaded = true;
+      env.ensure();
+      await env.settle();
+      for (let round = 0; round < 10 && env.timers.size; round++) {
+        const [id, timer] = env.timers.entries().next().value!;
+        env.timers.delete(id);
+        timer.callback();
+        await env.settle();
+      }
+      env.ensure();
+      assert.equal(env.counts().sweeps, 8);
+      assert.equal(env.counts().patched, 0);
+      assert.deepEqual(env.delays, [250, 1000, 4000, 16000, 30000, 30000, 30000]);
+      assert.equal(env.timers.size, 0);
+      assert.deepEqual(env.routes, ["/extensions/request-capture"]);
     });
   }
 });

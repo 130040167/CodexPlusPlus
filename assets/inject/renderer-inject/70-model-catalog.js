@@ -1280,7 +1280,8 @@
     if (window.__codexPlusAppServerClientPrototypePatchInstalled === codexAppServerModelRequestPatchVersion) return true;
     const wanted = codexPlusModelUnlockEnabled()
       || codexPluginMarketplacePatchEnabled()
-      || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
+      || (codexPlusBackendSettingsLoaded
+        && (codexRemoteSessionProviderPatchEnabled() || codexPlusBackendSettings.providerSyncEnabled))
       || codexPlusSettings().sessionDelete || codexPlusSettings().sideChatSave
       || (typeof codexPlusExtensionWantsRequestMiddleware === "function" && codexPlusExtensionWantsRequestMiddleware());
     if (!wanted) return false;
@@ -1399,7 +1400,8 @@
   let appServerModelRequestPatchRetryDelayMs = 250;
 
   function scheduleAppServerModelRequestPatchRetry() {
-    if (!codexRemoteSessionProviderPatchEnabled()) return;
+    if (!codexRemoteSessionProviderPatchEnabled()
+        && !(codexPlusBackendSettingsLoaded && codexPlusBackendSettings.providerSyncEnabled)) return;
     if (appServerModelRequestPatchRetryTimer) return;
     // issue #2256/#2255：固定 250ms 重试在 Codex 改 asset 命名后变成每秒 4 轮的全量
     // rescan（每轮 fetch 全部 app asset）。改为指数退避， miss 计满后由熔断停掉。
@@ -1498,16 +1500,19 @@
     if (codexPerModelContextEnabled()) void installCodexThreadContextObserver();
     const extensionWantsRequests = typeof codexPlusExtensionWantsRequestMiddleware === "function"
       && codexPlusExtensionWantsRequestMiddleware();
+    const providerSyncEnabled = codexPlusBackendSettingsLoaded && codexPlusBackendSettings.providerSyncEnabled;
     if (codexPlusModelUnlockEnabled()
         || codexPluginMarketplacePatchEnabled()
+        || providerSyncEnabled
         || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
           || codexPlusSettings().sessionDelete || codexPlusSettings().sideChatSave
           || extensionWantsRequests) {
       installAppServerModelRequestPatch();
       void installCodexAppServerClientCapture().catch(() => {});
     }
-    // 启动器平时只在模型解锁 / 会话删除开启时捕获客户端类；只有拓展需要时，请它按需补开（每页一次）。
-    if (extensionWantsRequests && !window.__codexPlusAppServerClientClass && !window.__codexPlusExtensionRequestCaptureAsked) {
+    // 启动器平时只在模型解锁 / 会话删除开启时捕获客户端类；供应商同步或拓展需要时按需补开（每页一次）。
+    if ((extensionWantsRequests || providerSyncEnabled)
+        && !window.__codexPlusAppServerClientClass && !window.__codexPlusExtensionRequestCaptureAsked) {
       window.__codexPlusExtensionRequestCaptureAsked = true;
       void postJson("/extensions/request-capture", {}).catch(() => {});
     }
