@@ -666,12 +666,8 @@ pub fn prepare_thread_provider(
         anyhow::bail!("Provider sync recovery is pending: {}", path.display());
     }
     let config_path = home.join("config.toml");
-    let snapshot = resolve_provider_sync_target_snapshot(&config_path, None)
+    let snapshot = resolve_provider_sync_target_snapshot(&config_path, Some(target_provider))
         .map_err(anyhow::Error::msg)?;
-    anyhow::ensure!(
-        snapshot.target_provider == target_provider,
-        "Current configured provider does not match target provider"
-    );
 
     let mut canonical_path = None;
     let mut catalog_path = None;
@@ -744,7 +740,7 @@ pub fn prepare_thread_provider(
         catalog_path.is_none() || catalog_host.is_some(),
         "Local catalog thread changed during preparation"
     );
-    revalidate_provider_sync_target_snapshot(&config_path, None, &snapshot)
+    revalidate_provider_sync_target_snapshot(&config_path, Some(target_provider), &snapshot)
         .map_err(anyhow::Error::msg)?;
     if source_provider == target_provider {
         return Ok(json!({
@@ -794,7 +790,7 @@ pub fn prepare_thread_provider(
             anyhow::ensure!(changed == 1, "Local catalog provider CAS conflict");
             rows += changed;
         }
-        revalidate_provider_sync_target_snapshot(&config_path, None, &snapshot)
+        revalidate_provider_sync_target_snapshot(&config_path, Some(target_provider), &snapshot)
             .map_err(anyhow::Error::msg)?;
         Ok(rows)
     })();

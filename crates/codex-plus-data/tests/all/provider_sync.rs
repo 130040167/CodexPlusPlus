@@ -142,7 +142,7 @@ fn thread_provider_prepare_preserves_history_settings_and_supports_metadata_rest
 
 #[test]
 fn thread_provider_prepare_rejects_identity_and_provider_conflicts_without_backup() {
-    for scenario in ["remote", "missing_host", "conflicting_host", "internal_source", "bad_target", "source_changed", "catalog_changed", "missing_thread"] {
+    for scenario in ["remote", "missing_host", "conflicting_host", "internal_source", "internal_target", "bad_target", "source_changed", "catalog_changed", "missing_thread"] {
         let temp = tempdir().unwrap();
         let home = temp.path();
         write_provider_config(home, "custom");
@@ -155,6 +155,7 @@ fn thread_provider_prepare_rejects_identity_and_provider_conflicts_without_backu
             "missing_host" => { request.as_object_mut().unwrap().remove("host_id"); },
             "conflicting_host" => request["hostId"] = json!("remote"),
             "internal_source" => request["source_provider"] = json!("codex_plus_managed"),
+            "internal_target" => request["target_provider"] = json!("codex_plus_managed"),
             "bad_target" => request["target_provider"] = json!("another"),
             "source_changed" => request["source_provider"] = json!("another"),
             "catalog_changed" => {
@@ -164,7 +165,10 @@ fn thread_provider_prepare_rejects_identity_and_provider_conflicts_without_backu
             _ => unreachable!(),
         }
         let before = fs::read(&db_path).unwrap();
-        assert!(prepare_thread_provider(home, true, &request).is_err(), "{scenario}");
+        let error = prepare_thread_provider(home, true, &request).unwrap_err();
+        if scenario == "bad_target" {
+            assert!(error.to_string().contains("not resolvable"), "{error}");
+        }
         assert_eq!(fs::read(&db_path).unwrap(), before, "{scenario}");
         assert!(!home.join("backups_state").exists(), "{scenario}");
     }
@@ -226,19 +230,76 @@ fn thread_provider_prepare_supports_return_to_native_default_provider() {
 }
 
 #[test]
+fn thread_provider_prepare_explicit_target_overrides_root_without_changing_config() {
+    for target in ["openai", "relay-beta"] {
+        let temp = tempdir().unwrap();
+        let home = temp.path();
+        write_provider_config_with_tables(home, "custom", &["relay-beta"]);
+        let config_before = fs::read(home.join("config.toml")).unwrap();
+        let db_path = home.join("state_5.sqlite");
+        create_state_db_with_providers(&db_path, &[("thread-1", "custom", 0), ("other", "custom", 0)]);
+        create_local_thread_catalog_db(&db_path, &[("thread-1", "custom")]);
+        let mut request = thread_provider_prepare_request();
+        request["source_provider"] = json!("custom");
+        request["target_provider"] = json!(target);
+
+        let result = prepare_thread_provider(home, true, &request).unwrap();
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["target_provider"], target);
+        assert_eq!(result["changed"], true);
+        assert_eq!(result["sqlite_rows_updated"], 2);
+        let db = Connection::open(&db_path).unwrap();
+        for (table, key) in [("threads", "id"), ("local_thread_catalog", "thread_id")] {
+            assert_eq!(db.query_row(
+                &format!("SELECT model_provider FROM {table} WHERE {key}='thread-1'"),
+                [], |row| row.get::<_, String>(0),
+            ).unwrap(), target);
+        }
+        assert_eq!(db.query_row(
+            "SELECT model_provider FROM threads WHERE id='other'", [], |row| row.get::<_, String>(0),
+        ).unwrap(), "custom");
+        let backup: serde_json::Value = serde_json::from_slice(
+            &fs::read(result["backup_path"].as_str().unwrap()).unwrap(),
+        ).unwrap();
+        assert_eq!(backup["changes"].as_array().unwrap().len(), 2);
+        for change in backup["changes"].as_array().unwrap() {
+            assert_eq!(change["before"]["model_provider"], "custom");
+            assert_eq!(change["after"]["model_provider"], target);
+        }
+
+        request["source_provider"] = json!(target);
+        let aligned = prepare_thread_provider(home, true, &request).unwrap();
+        assert_eq!(aligned["changed"], false);
+        assert_eq!(aligned["sqlite_rows_updated"], 0);
+        assert!(aligned["backup_path"].is_null());
+        assert_eq!(fs::read(home.join("config.toml")).unwrap(), config_before);
+        assert_eq!(fs::read_dir(home.join("backups_state/thread-provider-prepare")).unwrap().count(), 1);
+    }
+}
+
+#[test]
 fn thread_provider_prepare_invalid_live_config_never_writes_indexes() {
-    for config in [
-        "model_provider = 'custom'\n",
-        "model_provider = 'other'\n[model_providers.other]\nname='other'\n",
-        "model_provider = [\n",
+    for (target, config) in [
+        ("custom", Some("model_provider = 'custom'\n")),
+        ("custom", Some("model_provider = 'other'\n[model_providers.other]\nname='other'\n")),
+        ("custom", Some("model_provider = 'custom'\n[model_providers]\ncustom='invalid'\n")),
+        ("custom", Some("model_provider = 'openai'\n[profiles.project.model_providers.custom]\nname='custom'\n")),
+        ("custom", Some("model_provider = [\n")),
+        ("openai", Some("model_provider = [\n")),
+        ("openai", Some("model_providers = 'invalid'\n")),
+        ("openai", None),
     ] {
         let temp = tempdir().unwrap();
         let home = temp.path();
-        fs::write(home.join("config.toml"), config).unwrap();
+        if let Some(config) = config {
+            fs::write(home.join("config.toml"), config).unwrap();
+        }
         let db_path = home.join("state_5.sqlite");
         create_state_db_with_providers(&db_path, &[("thread-1", "openai", 0)]);
         let before = fs::read(&db_path).unwrap();
-        assert!(prepare_thread_provider(home, true, &thread_provider_prepare_request()).is_err());
+        let mut request = thread_provider_prepare_request();
+        request["target_provider"] = json!(target);
+        assert!(prepare_thread_provider(home, true, &request).is_err(), "{target}: {config:?}");
         assert_eq!(fs::read(&db_path).unwrap(), before);
         assert!(!home.join("backups_state").exists());
     }
