@@ -52,7 +52,8 @@ function runtime() {
   };
   const api = new Function("codexPlusBackendSettings", "codexModelCatalog", "sendCodexPlusDiagnostic",
     "postJson", "codexAppServerPreparationTimeoutMs", `${provider}
-      return { prepare: prepareCodexPureApiResume, align: prepareCodexThreadProviderResume };`)(
+      return { prepare: prepareCodexPureApiResume, align: prepareCodexThreadProviderResume,
+        preparations: codexThreadProviderPreparations };`)(
     settings, {}, () => {}, postJson, 2000);
   const subscribe = (hostId = "local", receiver = -19, target = port) =>
     target.postMessage(["push", ["pipeline", receiver, ["subscribe"], [{
@@ -101,10 +102,11 @@ function runtime() {
     return client;
   };
   const install = new Function("window", "codexPlusBackendSettings", "prepareCodexThreadProviderResume",
+    "codexThreadProviderPreparations",
     "codexPlusAppServerClient", "codexPlusExtensionListeners", "codexPlusExtensionInterceptors",
     "codexPlusRunWaterfall", "codexPlusMarkExtensionFailure", "showToast",
     `${rpc}\nreturn installCodexPlusRpcFrameInterceptor;`)(
-    window, settings, api.align, discover, new Map(), interceptors,
+    window, settings, api.align, api.preparations, discover, new Map(), interceptors,
     (_name: string, value: any) => chain(value),
     (_key: string, message: string) => failures.push(message), (message: string) => toasts.push(message));
   const settle = async () => {
@@ -246,7 +248,7 @@ describe("provider resume RPC gate without context helpers", () => {
     env.state.bridgeFailure = "";
     env.window.__codexPlusRpcFrameInterceptor.version = 7;
     env.install();
-    assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 10);
+    assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 11);
     assert.equal(env.window.__codexPlusRpcFrameInterceptor.original, original);
     env.port.postMessage(frame);
     await env.settle();
@@ -388,6 +390,32 @@ describe("provider preparation", () => {
       { threadId: "thread", modelProvider: "openai", model: null, config: null },
       { threadId: "thread", modelProvider: "custom", model: null, config: null },
     ]);
+  });
+
+  it("keeps internal resume middleware without reentering the held preparation lock", async () => {
+    const env = runtime();
+    env.subscribe();
+    env.state.status = "idle";
+    env.state.cached = { modelProvider: "openai", resumeState: "resumed" };
+    env.interceptors.set("codex/request", true);
+    env.setChain(async (value) => value.method === "thread/resume"
+      ? { ...value, params: { ...value.params, config: { model_reasoning_effort: "high" } } }
+      : value);
+    const host = {
+      getConversation: env.client.getConversation,
+      async unsubscribeInactiveConversation() { env.state.cached.resumeState = "needs_resume"; },
+    };
+    assert.deepEqual(await env.api.align({ threadId: "thread" }, "local", env.client.sendRequest, host), {
+      sourceProvider: "openai", targetProvider: "custom",
+    });
+    const frames = env.sent.filter(frame => frame[0] === "push" && frame[1][2][0] === "sendRequest"
+      && frame[1][3][0] === "thread/resume");
+    assert.equal(frames.length, 1);
+    assert.deepEqual(frames[0][1][3][1], {
+      threadId: "thread", modelProvider: "custom", model: null, config: { model_reasoning_effort: "high" },
+    });
+    assert.equal(env.window.__codexPlusRpcResumeGates.has(env.port), false);
+    assert.equal(env.calls.filter(call => call.route).length, 1);
   });
 
   it("does not record failed or wrong-provider resumes as successfully prepared", async () => {

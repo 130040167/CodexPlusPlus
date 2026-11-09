@@ -20863,7 +20863,7 @@
    *   - `agent/request`：params `{ agent, turn, step, signal }`，返回 `{ provider, model, reasoningEffort }`。
    * 同一条用户消息只跑一次这两条链（按 clientUserMessageId 缓存），结果套用到它的所有候选帧上。
    */
-  const codexPlusRpcInterceptorVersion = 10;
+  const codexPlusRpcInterceptorVersion = 11;
   const codexPlusRpcMiddlewareTimeoutMs = 5000;
   const codexPlusRpcOpaque = Symbol("codexPlusRpcOpaque");
   const codexPlusRpcSourceItem = Symbol("codexPlusRpcSourceItem");
@@ -21199,6 +21199,12 @@
         || !codexPlusRpcIsPlainObject(expr[3][index])) return plan;
     if ([expr[3][index].hostId, expr[3][index].host_id]
         .some((host) => typeof host === "string" && host !== "local")) return plan;
+    // 在中间件改写前识别内部恢复；它已持有会话准备锁，不能再次排队等待自己。
+    const original = expr[3][index];
+    if (method === "sendRequest" && typeof codexThreadProviderPreparations !== "undefined"
+        && original.modelProvider && original.model === null && original.config === null
+        && Object.keys(original).length === 4
+        && codexThreadProviderPreparations.get(original.threadId)?.resuming === original.modelProvider) return plan;
     plan ||= async () => null;
     plan.resumeIndex = index;
     plan.before = async (wireParams, dataOnly) => {
