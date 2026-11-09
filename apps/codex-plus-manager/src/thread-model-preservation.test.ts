@@ -88,61 +88,93 @@ describe("nullable restoration through existing upstream wrappers", () => {
   const prototype = catalog.slice(catalog.indexOf("    function installCodexAppServerClientPrototypePatch()"),
     catalog.indexOf("  const appServerModelRequestPatchMaxMisses"));
 
-  it("retains native model and effort ownership without context helpers or metadata reads", async () => {
-    for (const mode of ["instance", "prototype", "envelope"]) {
-      for (const enabled of [false, true]) {
-        const calls: any[] = [];
-        const bridges: any[] = [];
-        class Client {
-          hostId = "local";
-          async sendRequest(method: string, params: any) {
-            const name = method === "send-cli-request-for-host" ? params.method : method;
-            const input = method === "send-cli-request-for-host" ? params.params : params;
-            calls.push({ method: name, params: input });
-            if (name === "thread/read") {
-              return { thread: { id: "a", cwd: "C:/fixture", status: { type: "notLoaded" }, modelProvider: "openai" } };
+  for (const [relayMode, officialMixApiKey, source, target] of [
+    ["pureApi", false, "openai", "custom"],
+    ["pureApi", false, "custom", "openai"],
+    ["official", false, "custom", "openai"],
+    ["mixedApi", false, "openai", "custom"],
+    ["mixedApi", false, "custom", "openai"],
+    ["official", true, "openai", "custom"],
+    ["official", true, "custom", "openai"],
+  ] as const) {
+    it(`retains native choices for ${relayMode}/${officialMixApiKey}: ${source} -> ${target}`, async () => {
+      for (const mode of ["instance", "prototype", "envelope"]) {
+        for (const [enabled, status] of [
+          [false, "notLoaded"], [true, "notLoaded"], [true, "idle"], [true, "active"],
+        ] as const) {
+          const calls: any[] = [];
+          const bridges: any[] = [];
+          class Client {
+            hostId = "local";
+            async sendRequest(method: string, params: any) {
+              const name = method === "send-cli-request-for-host" ? params.method : method;
+              const input = method === "send-cli-request-for-host" ? params.params : params;
+              calls.push({ method: name, params: input });
+              if (name === "thread/read") {
+                return { thread: { id: "a", cwd: "C:/fixture", status: { type: status }, modelProvider: source } };
+              }
+              if (name === "config/read") return { config: { model_provider: target } };
+              return { thread: { id: "a" }, model: "native-saved", reasoningEffort: "native-saved" };
             }
-            if (name === "config/read") return { config: { model_provider: "custom" } };
-            return { thread: { id: "a" }, model: "native-saved", reasoningEffort: "native-saved" };
+          }
+          const client = new Client();
+          const profile = { id: "relay", relayMode: mode === "prototype" ? "pureApi" : relayMode,
+            officialMixApiKey, configContents: `model_provider = "${target}"` };
+          const context = vm.createContext({
+            window: { __codexPlusAppServerClientClass: Client, __codexSessionDeleteBridge: () => {} }, client,
+            codexAppServerModelRequestPatchVersion: "36",
+            codexPlusBackendSettings: { relayProfilesEnabled: true, activeRelayId: "relay", providerSyncEnabled: enabled,
+              relayProfiles: [profile] },
+            codexModelCatalog: {}, codexPlusBackendSettingsLoaded: true, codexAppServerPreparationTimeoutMs: 2000,
+            postJson: async (route: string, payload: any) => {
+              assert.equal(route, "/thread-provider/prepare");
+              bridges.push(payload);
+              return { status: "ok" };
+            },
+            registerNativeHostClient() {}, sendCodexPlusDiagnostic() {}, codexPlusPluginNativeInterceptClient: () => null,
+            appServerModelRequestMethod: (method: string, params: any) => method === "send-cli-request-for-host" ? params.method : method,
+            loadBackendSettingsState: async () => true, loadCodexModelCatalog: async () => ({}),
+            prepareCodexManagedSessionConnection: async (_method: string, params: any) => params,
+            codexManagedSessionConnection: () => null, refreshCodexThreadModelBeforeTurn: async () => null,
+            sendCodexManagedSessionTurn: async () => null, noteCodexManagedSessionStart() {},
+            codexThreadModelRequestState: () => ({}), codexPlusModelUnlockEnabled: () => false,
+            codexPluginMarketplacePatchEnabled: () => false, codexPlusSettings: () => ({}), setTimeout, clearTimeout,
+          });
+          vm.runInContext(override + instance + prototype, context);
+          assert.equal(vm.runInContext(mode === "prototype"
+            ? "installCodexAppServerClientPrototypePatch()" : "patchAppServerModelRequestClient(client)", context), true);
+          // 已安装的 prototype wrapper 必须在切换到 official/mixedApi 后继续准备 provider。
+          profile.relayMode = relayMode;
+          for (const choice of [
+            { model: null, reasoningEffort: null, config: { model_reasoning_effort: null } },
+            { model: "chosen", reasoningEffort: "low", config: { model_reasoning_effort: "high" } },
+          ]) {
+            const params = { threadId: "a", ...choice };
+            const before = structuredClone(params);
+            const bridgeCount = bridges.length;
+            const callCount = calls.length;
+            const result = await client.sendRequest(mode === "envelope" ? "send-cli-request-for-host" : "thread/resume",
+              mode === "envelope" ? { hostId: "local", method: "thread/resume", params } : params);
+            const dispatched = calls.slice(callCount);
+            assert.deepEqual(dispatched.map((call) => call.method), !enabled ? ["thread/resume"]
+              : status === "notLoaded" ? ["thread/read", "config/read", "thread/resume"] : ["thread/read", "thread/resume"]);
+            assert.equal(dispatched.at(-1).params.model, choice.model);
+            assert.equal(dispatched.at(-1).params.reasoningEffort, choice.reasoningEffort);
+            assert.equal(dispatched.at(-1).params.config.model_reasoning_effort, choice.config.model_reasoning_effort);
+            assert.deepEqual(params, before);
+            assert.equal(result.model, "native-saved");
+            assert.equal(result.reasoningEffort, "native-saved");
+            assert.equal(bridges.length - bridgeCount, enabled && status === "notLoaded" ? 1 : 0,
+              `${mode}: ${relayMode}/${officialMixApiKey}: ${source} -> ${target}, ${enabled}/${status}`);
+            if (bridges.length > bridgeCount) {
+              assert.deepEqual({ ...bridges.at(-1) }, { host_id: "local", thread_id: "a",
+                source_provider: source, target_provider: target });
+            }
           }
         }
-        const client = new Client();
-        const context = vm.createContext({
-          window: { __codexPlusAppServerClientClass: Client, __codexSessionDeleteBridge: () => {} }, client,
-          codexAppServerModelRequestPatchVersion: "36",
-          codexPlusBackendSettings: { relayProfilesEnabled: true, activeRelayId: "relay", providerSyncEnabled: enabled,
-            relayProfiles: [{ id: "relay", relayMode: "pureApi", configContents: 'model_provider = "custom"' }] },
-          codexModelCatalog: {}, codexPlusBackendSettingsLoaded: true, codexAppServerPreparationTimeoutMs: 2000,
-          postJson: async (route: string, payload: any) => {
-            assert.equal(route, "/thread-provider/prepare");
-            bridges.push(payload);
-            return { status: "ok" };
-          },
-          registerNativeHostClient() {}, sendCodexPlusDiagnostic() {}, codexPlusPluginNativeInterceptClient: () => null,
-          appServerModelRequestMethod: (method: string, params: any) => method === "send-cli-request-for-host" ? params.method : method,
-          loadBackendSettingsState: async () => true, loadCodexModelCatalog: async () => ({}),
-          prepareCodexManagedSessionConnection: async (_method: string, params: any) => params,
-          codexManagedSessionConnection: () => null, refreshCodexThreadModelBeforeTurn: async () => null,
-          sendCodexManagedSessionTurn: async () => null, noteCodexManagedSessionStart() {},
-          codexThreadModelRequestState: () => ({}), codexPlusModelUnlockEnabled: () => false,
-          codexPluginMarketplacePatchEnabled: () => false, codexPlusSettings: () => ({}), setTimeout, clearTimeout,
-        });
-        vm.runInContext(override + instance + prototype, context);
-        vm.runInContext(mode === "prototype" ? "installCodexAppServerClientPrototypePatch()" : "patchAppServerModelRequestClient(client)", context);
-        const params = { threadId: "a", model: null, config: { model_reasoning_effort: null } };
-        const result = await client.sendRequest(mode === "envelope" ? "send-cli-request-for-host" : "thread/resume",
-          mode === "envelope" ? { hostId: "local", method: "thread/resume", params } : params);
-        const resumes = calls.filter((call) => call.method === "thread/resume");
-        assert.equal(resumes.length, 1);
-        assert.equal(resumes[0].params.model, null);
-        assert.equal(resumes[0].params.config.model_reasoning_effort, null);
-        assert.equal(result.model, "native-saved");
-        assert.equal(result.reasoningEffort, "native-saved");
-        assert.equal(bridges.length, enabled ? 1 : 0);
       }
-    }
-  });
-
+    });
+  }
 });
 
 describe("settings-driven catalog refresh ownership", () => {

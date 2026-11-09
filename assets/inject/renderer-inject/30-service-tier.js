@@ -140,8 +140,7 @@
       assertEnvelope();
       return nested === params.params ? params : { ...params, params: nested };
     }
-    if (method !== "thread/resume" || !params || typeof params !== "object" || Array.isArray(params)
-        || codexRemoteSessionActiveProfile()?.relayMode !== "pureApi") {
+    if (method !== "thread/resume" || !params || typeof params !== "object" || Array.isArray(params)) {
       return params;
     }
     await prepareCodexThreadProviderResume(params, hostId, sendRequest);
