@@ -432,7 +432,7 @@
   const codexPlusSettingsKey = "codexPlusSettings";
   const codexThreadScrollKey = "codexThreadScroll";
   const codexServiceTierRequestOverrideVersion = "10";
-  const codexAppServerModelRequestPatchVersion = "37";
+  const codexAppServerModelRequestPatchVersion = "38";
   const codexAppServerClientCaptureMarker = "AppServerRequestClient is missing a message dispatcher";
   const codexAppServerClientCaptureAnchor = "async sendRequest(";
   const codexRemoteSessionRecoveryVersion = "8";
@@ -4247,106 +4247,43 @@
         || codexRemoteSessionActiveProfile()?.relayMode !== "pureApi") {
       return params;
     }
-    const specified = (value) => typeof value === "string" && !!value.trim();
-    const target = codexRemoteSessionTargetProvider();
-    if (target === "openai") return params;
-    const requestedProvider = String(params.modelProvider || params.model_provider || "").trim();
-    // nullable 字段和仅指定供应商不是模型选择；补供应商时必须同时保留保存的模型设置。
-    if (specified(params.model) || (requestedProvider && requestedProvider !== "openai" && requestedProvider !== target)) return params;
-    if (specified(params.config?.model)) {
-      return applyCodexRemoteSessionProviderOverride(method, { ...params, model: params.config.model });
-    }
-    if (!target) throw new Error("当前纯 API 供应商不可用");
-    const requestSignature = () => JSON.stringify([params.threadId,
-      ...["model", "modelProvider", "model_provider"].map((key) => [Object.prototype.hasOwnProperty.call(params, key), params[key]]),
-      params.config]);
-    const requestBefore = requestSignature();
-    const signature = () => {
-      const profile = codexRemoteSessionActiveProfile();
-      return JSON.stringify([profile?.id, profile?.relayMode, profile?.configContents, codexRemoteSessionTargetProvider()]);
-    };
-    const before = signature();
-    const assertUnchanged = () => {
-      if (signature() !== before) throw new Error("供应商配置已变化，请重新打开会话");
-      if (requestSignature() !== requestBefore) throw new Error("会话设置已变化，请重新打开会话");
-    };
-    let metadata;
-    let fallbackReason = refreshFailed ? "provider_refresh_failed" : "";
-    if (!fallbackReason) {
-      try {
-        metadata = await readCodexAppServerPreparation("/thread-resume-model-metadata",
-          { thread_id: params.threadId, host_id: "local" }, codexAppServerPreparationTimeoutMs);
-      } catch {
-        fallbackReason = "metadata_unavailable";
-      }
-    }
-    assertUnchanged();
-    if (metadata?.status !== "ok" || metadata.threadId !== params.threadId
-        || typeof metadata.model !== "string" || !metadata.model.trim()
-        || !Object.prototype.hasOwnProperty.call(metadata, "reasoningEffort")
-        || (metadata.reasoningEffort !== null
-          && (typeof metadata.reasoningEffort !== "string" || !metadata.reasoningEffort.trim()))) {
-      fallbackReason ||= "metadata_unavailable";
-    }
-    if (sendRequest) {
-      // 已加载会话可能忽略连接覆盖；不卸载正在被原生界面使用的实例。
-      let timer;
-      let read;
-      try {
-        read = await Promise.race([
-          sendRequest("thread/read", { threadId: params.threadId, includeTurns: false },
-            { timeoutMs: codexAppServerPreparationTimeoutMs }),
-          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("读取会话状态超时")), codexAppServerPreparationTimeoutMs); }),
-        ]);
-      } catch {
-        fallbackReason = "thread_state_unavailable";
-      } finally { clearTimeout(timer); }
-      assertUnchanged();
-      const status = read?.thread?.status?.type;
-      if (!["idle", "notLoaded", "active"].includes(status)) {
-        fallbackReason = "thread_state_unavailable";
-      } else if (status !== "notLoaded") {
-        if (read.thread.modelProvider !== target) {
-          throw new Error("此会话仍使用旧供应商连接，请重新启动 Codex 后重试");
-        }
-        return params;
-      }
-    }
-    const config = { ...(params.config || {}) };
-    delete config.model;
-    // 降级时不带入部分历史设置，显式请求档位始终优先。
-    if (!specified(config.model_reasoning_effort)) {
-      delete config.model_reasoning_effort;
-      if (!fallbackReason && metadata.reasoningEffort !== null) config.model_reasoning_effort = metadata.reasoningEffort;
-    }
-    const next = { ...params, modelProvider: target, config };
-    if (fallbackReason) {
-      // 旧线程缺少可靠设置时优先保持可打开，由原生选择默认模型。
-      delete next.model;
-      sendCodexPlusDiagnostic("pure_api_resume_model_fallback", { reason: fallbackReason });
-    } else {
-      next.model = metadata.model;
-    }
-    delete next.model_provider;
-    (window.__codexPlusPureApiPreparedResumes ||= new WeakSet()).add(next);
-    return next;
+    await prepareCodexThreadProviderResume(params, hostId, sendRequest);
+    return params;
   }
 
-  function verifyCodexPureApiResumeResult(method, params, result, hostId) {
-    if (hostId !== "local") return;
-    if (method === "send-cli-request-for-host" && params?.method) {
-      return verifyCodexPureApiResumeResult(String(params.method), params.params, result, hostId);
-    }
-    if (method !== "thread/resume" || !window.__codexPlusPureApiPreparedResumes?.has(params)) return;
-    const modelMismatch = !!params.model && result?.model !== params.model;
-    const providerMismatch = result?.modelProvider !== params.modelProvider;
-    const reasoningEffortMismatch = Object.prototype.hasOwnProperty.call(params.config, "model_reasoning_effort")
-      && result?.reasoningEffort !== params.config.model_reasoning_effort;
-    if (modelMismatch || providerMismatch || reasoningEffortMismatch) {
-      sendCodexPlusDiagnostic("pure_api_resume_result_mismatch",
-        { modelMismatch, providerMismatch, reasoningEffortMismatch });
-    }
+  async function prepareCodexThreadProviderResume(params, hostId, sendRequest) {
+    if (hostId !== "local" || !codexPlusBackendSettings.providerSyncEnabled
+        || [params?.hostId, params?.host_id].some((host) => typeof host === "string" && host !== "local")) return null;
+    const threadId = params.threadId || params.conversationId;
+    if (!threadId) return null; // 原生也支持按 path 恢复；没有 thread id 时不改写。
+    const signature = () => {
+      const profile = codexRemoteSessionActiveProfile();
+      return JSON.stringify([profile?.id, profile?.relayMode, profile?.configContents]);
+    };
+    const before = signature();
+    const options = { timeoutMs: codexAppServerPreparationTimeoutMs };
+    const read = await sendRequest("thread/read", { threadId, includeTurns: false }, options);
+    if (read.thread.status.type !== "notLoaded") return null;
+    const config = await sendRequest("config/read", {
+      cwd: params.cwd ?? read.thread.cwd ?? null, includeLayers: false,
+    }, options);
+    if (signature() !== before) throw new Error("供应商配置已变化，请重新打开会话");
+    const sourceProvider = read.thread.modelProvider;
+    const targetProvider = params.modelProvider ?? params.model_provider
+      ?? params.config?.model_provider ?? config.config.model_provider ?? "openai";
+    if (typeof sourceProvider !== "string" || !sourceProvider
+        || typeof targetProvider !== "string" || !targetProvider || sourceProvider === targetProvider) return null;
+    const result = await postJson("/thread-provider/prepare", {
+      host_id: "local", thread_id: threadId, source_provider: sourceProvider, target_provider: targetProvider,
+    });
+    if (result?.status !== "ok") throw new Error(result?.message || result?.error || "会话供应商准备失败");
+    if (signature() !== before) throw new Error("供应商配置已变化，请重新打开会话");
+    // 只对齐磁盘 provider；nullable model/effort 继续由原生恢复保存选择。
+    return { sourceProvider, targetProvider };
   }
+
+  // 兼容 70 分片调用；nullable 恢复的模型选择归原生负责。
+  function verifyCodexPureApiResumeResult() {}
 
   function codexManagedSessionConnection() {
     const profile = codexRemoteSessionActiveProfile();
@@ -5148,6 +5085,23 @@
     // service-tier harness 在 70 分片提前返回，尚未初始化 93 分片的录音状态。
     // 语音听写由内置拓展「语音听写」登记成扫描步骤；它停用 / 被顶替时这里什么也不做。
     if (!window.__CODEX_PLUS_TEST_SERVICE_TIER__ && typeof runCodexPlusScanStep === "function") runCodexPlusScanStep("builtin:dictation");
+    if (codexPlusBackendSettings.providerSyncEnabled && typeof codexPlusAppServerClient === "function") {
+      // 短暂订阅只登记本机 receiver；不依赖上下文 observer，也不保留通知监听器。
+      void codexPlusAppServerClient("local").then(async (client) => {
+        const subscription = client.subscribe({
+          type: "notification", key: { hostId: "local" },
+          methods: ["thread/tokenUsage/updated"], listener: () => {},
+        });
+        try {
+          const handle = await subscription;
+          handle[Symbol.dispose]();
+        } finally {
+          subscription[Symbol.dispose]();
+        }
+      }).catch((error) => sendCodexPlusDiagnostic("provider_resume_receiver_binding_failed", {
+        errorMessage: String(error?.message || error),
+      }));
+    }
     return true;
   }
   // 原生准备会话时会读取本地配置；该 fetch 没有默认超时，丢失响应会同时
@@ -20844,6 +20798,7 @@
   const codexPlusRpcPortQueues = new WeakMap();
   const codexPlusRpcRejectionPorts = window.__codexPlusRpcRejectionPorts ||= new WeakMap();
   const codexPlusRpcCreationFailures = window.__codexPlusRpcCreationFailures ||= new WeakMap();
+  const codexPlusRpcResumeGates = window.__codexPlusRpcResumeGates ||= new WeakMap();
   const codexPlusRpcTurnCache = new Map();
   const codexPlusRpcTurnCacheLimit = 64;
   const codexPlusRpcHostReceivers = window.__codexPlusRpcHostReceivers
@@ -21161,6 +21116,43 @@
     return plan;
   }
 
+  function codexPlusRpcPlanResume(frame, hostId, plan) {
+    const expr = frame[1];
+    const method = expr[2][0];
+    const index = method === "sendRequest" ? 1 : 0;
+    if (hostId !== "local" || typeof prepareCodexThreadProviderResume !== "function"
+        || !codexPlusBackendSettings.providerSyncEnabled
+        || (method === "sendRequest" && expr[3][0] !== "thread/resume")
+        || !codexPlusRpcIsPlainObject(expr[3][index])) return plan;
+    if ([expr[3][index].hostId, expr[3][index].host_id]
+        .some((host) => typeof host === "string" && host !== "local")) return plan;
+    plan ||= async () => null;
+    plan.resumeIndex = index;
+    plan.before = async (wireParams, dataOnly) => {
+      const params = codexPlusRpcDecode(wireParams);
+      const client = await codexPlusAppServerClient(hostId);
+      const prepared = await prepareCodexThreadProviderResume(params, hostId,
+        (method, params, options) => client.sendRequest(method, params, options));
+      if (prepared && dataOnly && method === "resumeConversation") {
+        const cached = await client.getConversation(params.conversationId);
+        const error = cached?.providerBlock?.error;
+        if (error?.type === "modelProviderMismatch" && error.modelProvider === prepared.sourceProvider
+            && error.currentModelProvider === prepared.targetProvider) {
+          return { ...wireParams, intent: "open" };
+        }
+      }
+      return wireParams;
+    };
+    return plan;
+  }
+
+  function codexPlusRpcDataOnly(value) {
+    if (Array.isArray(value)) {
+      return value.length === 1 && Array.isArray(value[0]) && value[0].every(codexPlusRpcDataOnly);
+    }
+    return !codexPlusRpcIsPlainObject(value) || Object.values(value).every(codexPlusRpcDataOnly);
+  }
+
   function codexPlusRpcPlanResolve(frame) {
     const value = frame[2];
     if (!codexPlusRpcIsPlainObject(value)) return null;
@@ -21235,7 +21227,12 @@
         return null;
       }
       const hostId = codexPlusRpcReceiverHost(port, expr);
-      if (expr[2][0] === "sendRequest") return codexPlusRpcPlanSendRequest(frame, hostId);
+      if (expr[2][0] === "sendRequest") {
+        return codexPlusRpcPlanResume(frame, hostId, codexPlusRpcPlanSendRequest(frame, hostId));
+      }
+      if (["resumeConversation", "resumeThread"].includes(expr[2][0])) {
+        return codexPlusRpcPlanResume(frame, hostId, null);
+      }
       if (expr[2][0] === "startConversation") return codexPlusRpcPlanStartConversation(frame, hostId);
       return null;
     }
@@ -21276,14 +21273,16 @@
   function codexPlusRpcIncomingFrame(port, incoming) {
     const creation = codexPlusRpcCreationFailures.get(port);
     const rejections = codexPlusRpcRejectionPorts.get(port);
-    if (!creation && !rejections) return incoming;
+    const gates = codexPlusRpcResumeGates.get(port);
+    if (!creation && !rejections && !gates) return incoming;
     if (incoming === null) {
       creation?.callbacks.clear();
+      gates?.pending.clear();
       return incoming;
     }
     if (incoming?.[0] === "release") {
       creation?.callbacks.delete(incoming[1]);
-      if (rejections?.pending.delete(incoming[1])) {
+      if (rejections?.pending.delete(incoming[1]) || gates?.pending.delete(incoming[1])) {
         // 未知 import 的 resolve 是协议空操作；正半整数不属于任何原生或本层编号。
         return ["resolve", 0.5, ["undefined"]];
       }
@@ -21344,6 +21343,34 @@
             original.call(port, ["push", [...expr.slice(0, 3), [...expr[3], ["promise", id]],
               ...expr.slice(4)], ...replaced.slice(2)], ...rest);
             original.call(port, ["reject", id, failure]);
+          } else if (plan?.before && replaced?.[0] !== "reject") {
+            let gates = codexPlusRpcResumeGates.get(port);
+            if (!gates) {
+              gates = { nextId: -0.25, pending: new Set() };
+              codexPlusRpcResumeGates.set(port, gates);
+            }
+            const id = gates.nextId--;
+            gates.pending.add(id);
+            const next = replaced || message;
+            const expr = next[1];
+            const args = [...expr[3]];
+            const params = args[plan.resumeIndex];
+            const dataOnly = codexPlusRpcDataOnly(params);
+            // 含 export 的参数留在原 push 导入，失败时由 Capnweb 正常释放。
+            if (dataOnly) args[plan.resumeIndex] = ["promise", id];
+            else args.push(["promise", id]);
+            original.call(port, ["push", [...expr.slice(0, 3), args, ...expr.slice(4)], ...next.slice(2)], ...rest);
+            // 先释放整个发送队列，再让预检经同一端口发出。
+            void state.done.then(() => gates.pending.has(id) ? plan.before(params, dataOnly) : params).then(
+              (prepared) => {
+                if (gates.pending.has(id)) original.call(port, ["resolve", id, dataOnly ? prepared : ["undefined"]]);
+              },
+              (error) => {
+                const reason = String(error?.message || error);
+                codexPlusRpcRejectNotice(reason);
+                if (gates.pending.has(id)) original.call(port, ["reject", id, ["error", error?.name || "Error", reason]]);
+              },
+            ).catch((error) => codexPlusMarkExtensionFailure("", `rpc 帧发送失败：${String(error?.message || error)}`));
           } else {
             original.call(port, replaced || message, ...rest);
           }

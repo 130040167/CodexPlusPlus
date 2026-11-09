@@ -29,6 +29,7 @@
   const codexPlusRpcPortQueues = new WeakMap();
   const codexPlusRpcRejectionPorts = window.__codexPlusRpcRejectionPorts ||= new WeakMap();
   const codexPlusRpcCreationFailures = window.__codexPlusRpcCreationFailures ||= new WeakMap();
+  const codexPlusRpcResumeGates = window.__codexPlusRpcResumeGates ||= new WeakMap();
   const codexPlusRpcTurnCache = new Map();
   const codexPlusRpcTurnCacheLimit = 64;
   const codexPlusRpcHostReceivers = window.__codexPlusRpcHostReceivers
@@ -346,6 +347,43 @@
     return plan;
   }
 
+  function codexPlusRpcPlanResume(frame, hostId, plan) {
+    const expr = frame[1];
+    const method = expr[2][0];
+    const index = method === "sendRequest" ? 1 : 0;
+    if (hostId !== "local" || typeof prepareCodexThreadProviderResume !== "function"
+        || !codexPlusBackendSettings.providerSyncEnabled
+        || (method === "sendRequest" && expr[3][0] !== "thread/resume")
+        || !codexPlusRpcIsPlainObject(expr[3][index])) return plan;
+    if ([expr[3][index].hostId, expr[3][index].host_id]
+        .some((host) => typeof host === "string" && host !== "local")) return plan;
+    plan ||= async () => null;
+    plan.resumeIndex = index;
+    plan.before = async (wireParams, dataOnly) => {
+      const params = codexPlusRpcDecode(wireParams);
+      const client = await codexPlusAppServerClient(hostId);
+      const prepared = await prepareCodexThreadProviderResume(params, hostId,
+        (method, params, options) => client.sendRequest(method, params, options));
+      if (prepared && dataOnly && method === "resumeConversation") {
+        const cached = await client.getConversation(params.conversationId);
+        const error = cached?.providerBlock?.error;
+        if (error?.type === "modelProviderMismatch" && error.modelProvider === prepared.sourceProvider
+            && error.currentModelProvider === prepared.targetProvider) {
+          return { ...wireParams, intent: "open" };
+        }
+      }
+      return wireParams;
+    };
+    return plan;
+  }
+
+  function codexPlusRpcDataOnly(value) {
+    if (Array.isArray(value)) {
+      return value.length === 1 && Array.isArray(value[0]) && value[0].every(codexPlusRpcDataOnly);
+    }
+    return !codexPlusRpcIsPlainObject(value) || Object.values(value).every(codexPlusRpcDataOnly);
+  }
+
   function codexPlusRpcPlanResolve(frame) {
     const value = frame[2];
     if (!codexPlusRpcIsPlainObject(value)) return null;
@@ -420,7 +458,12 @@
         return null;
       }
       const hostId = codexPlusRpcReceiverHost(port, expr);
-      if (expr[2][0] === "sendRequest") return codexPlusRpcPlanSendRequest(frame, hostId);
+      if (expr[2][0] === "sendRequest") {
+        return codexPlusRpcPlanResume(frame, hostId, codexPlusRpcPlanSendRequest(frame, hostId));
+      }
+      if (["resumeConversation", "resumeThread"].includes(expr[2][0])) {
+        return codexPlusRpcPlanResume(frame, hostId, null);
+      }
       if (expr[2][0] === "startConversation") return codexPlusRpcPlanStartConversation(frame, hostId);
       return null;
     }
@@ -461,14 +504,16 @@
   function codexPlusRpcIncomingFrame(port, incoming) {
     const creation = codexPlusRpcCreationFailures.get(port);
     const rejections = codexPlusRpcRejectionPorts.get(port);
-    if (!creation && !rejections) return incoming;
+    const gates = codexPlusRpcResumeGates.get(port);
+    if (!creation && !rejections && !gates) return incoming;
     if (incoming === null) {
       creation?.callbacks.clear();
+      gates?.pending.clear();
       return incoming;
     }
     if (incoming?.[0] === "release") {
       creation?.callbacks.delete(incoming[1]);
-      if (rejections?.pending.delete(incoming[1])) {
+      if (rejections?.pending.delete(incoming[1]) || gates?.pending.delete(incoming[1])) {
         // 未知 import 的 resolve 是协议空操作；正半整数不属于任何原生或本层编号。
         return ["resolve", 0.5, ["undefined"]];
       }
@@ -529,6 +574,34 @@
             original.call(port, ["push", [...expr.slice(0, 3), [...expr[3], ["promise", id]],
               ...expr.slice(4)], ...replaced.slice(2)], ...rest);
             original.call(port, ["reject", id, failure]);
+          } else if (plan?.before && replaced?.[0] !== "reject") {
+            let gates = codexPlusRpcResumeGates.get(port);
+            if (!gates) {
+              gates = { nextId: -0.25, pending: new Set() };
+              codexPlusRpcResumeGates.set(port, gates);
+            }
+            const id = gates.nextId--;
+            gates.pending.add(id);
+            const next = replaced || message;
+            const expr = next[1];
+            const args = [...expr[3]];
+            const params = args[plan.resumeIndex];
+            const dataOnly = codexPlusRpcDataOnly(params);
+            // 含 export 的参数留在原 push 导入，失败时由 Capnweb 正常释放。
+            if (dataOnly) args[plan.resumeIndex] = ["promise", id];
+            else args.push(["promise", id]);
+            original.call(port, ["push", [...expr.slice(0, 3), args, ...expr.slice(4)], ...next.slice(2)], ...rest);
+            // 先释放整个发送队列，再让预检经同一端口发出。
+            void state.done.then(() => gates.pending.has(id) ? plan.before(params, dataOnly) : params).then(
+              (prepared) => {
+                if (gates.pending.has(id)) original.call(port, ["resolve", id, dataOnly ? prepared : ["undefined"]]);
+              },
+              (error) => {
+                const reason = String(error?.message || error);
+                codexPlusRpcRejectNotice(reason);
+                if (gates.pending.has(id)) original.call(port, ["reject", id, ["error", error?.name || "Error", reason]]);
+              },
+            ).catch((error) => codexPlusMarkExtensionFailure("", `rpc 帧发送失败：${String(error?.message || error)}`));
           } else {
             original.call(port, replaced || message, ...rest);
           }
