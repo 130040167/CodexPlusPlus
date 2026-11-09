@@ -272,7 +272,7 @@ describe("provider resume RPC gate without context helpers", () => {
     env.port.postMessage(first);
     await env.settle();
     env.port.postMessage(resume("resumeThread", { threadId: "thread" }));
-    assert.deepEqual(env.calls, []);
+    assert.equal(env.calls.length, 0);
     release();
     await env.settle();
     assert.equal(env.sent[1], first);
@@ -321,7 +321,7 @@ describe("provider preparation", () => {
           assert.equal(envelope.hostId, "local");
           return env.client.sendRequest(envelope.method, envelope.params, options);
         });
-      assert.equal(env.calls.findLast((call) => call.route).payload.target_provider, "chosen");
+      assert.equal(env.calls.filter((call) => call.route).at(-1).payload.target_provider, "chosen");
       assert.deepEqual(params, before);
     }
   });
