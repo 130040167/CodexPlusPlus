@@ -165,8 +165,8 @@ describe("provider resume RPC gate without context helpers", () => {
         assert.equal(env.sent[2], later);
         assert.deepEqual(env.sent.at(-1), ["resolve", -0.25, params]);
         assert.deepEqual(frame, before);
-        assert.deepEqual(env.calls.slice(0, 3).map((call) => call.method || call.route),
-          ["thread/read", "config/read", "/thread-provider/prepare"]);
+        assert.deepEqual(env.calls.slice(0, 4).map((call) => call.method || call.route),
+          ["thread/read", "getConversation", "config/read", "/thread-provider/prepare"]);
         assert.equal(env.window.__codexPlusRpcResumeGates.get(env.port).pending.size, 1);
         env.release();
         assert.equal(env.window.__codexPlusRpcResumeGates.get(env.port).pending.size, 0);
@@ -245,7 +245,7 @@ describe("provider resume RPC gate without context helpers", () => {
     env.state.bridgeFailure = "";
     env.window.__codexPlusRpcFrameInterceptor.version = 7;
     env.install();
-    assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 8);
+    assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 9);
     assert.equal(env.window.__codexPlusRpcFrameInterceptor.original, original);
     env.port.postMessage(frame);
     await env.settle();

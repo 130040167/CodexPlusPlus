@@ -21,7 +21,7 @@
    *   - `agent/request`：params `{ agent, turn, step, signal }`，返回 `{ provider, model, reasoningEffort }`。
    * 同一条用户消息只跑一次这两条链（按 clientUserMessageId 缓存），结果套用到它的所有候选帧上。
    */
-  const codexPlusRpcInterceptorVersion = 8;
+  const codexPlusRpcInterceptorVersion = 9;
   const codexPlusRpcMiddlewareTimeoutMs = 5000;
   const codexPlusRpcOpaque = Symbol("codexPlusRpcOpaque");
   const codexPlusRpcSourceItem = Symbol("codexPlusRpcSourceItem");
@@ -363,7 +363,7 @@
       const params = codexPlusRpcDecode(wireParams);
       const client = await codexPlusAppServerClient(hostId);
       const prepared = await prepareCodexThreadProviderResume(params, hostId,
-        (method, params, options) => client.sendRequest(method, params, options));
+        (method, params, options) => client.sendRequest(method, params, options), client);
       if (prepared && dataOnly && method === "resumeConversation") {
         const cached = await client.getConversation(params.conversationId);
         const error = cached?.providerBlock?.error;
@@ -390,8 +390,16 @@
     const hasStart = codexPlusRpcIsPlainObject(value.start?.request) && Array.isArray(value.start.request.input);
     const hasSteer = codexPlusRpcIsPlainObject(value.steer) && Array.isArray(value.steer.input);
     const refreshContext = hasStart && value.executionHostId === "local" && codexPlusRpcContextEnabled();
-    if ((!hasStart && !hasSteer) || (!codexPlusRpcWantsTurnHooks() && !refreshContext)) return null;
+    if (!hasStart && !hasSteer) return null;
+    const prepareProvider = typeof prepareCodexThreadProviderResume === "function"
+      && codexPlusBackendSettings.providerSyncEnabled && value.executionHostId === "local"
+      && codexPlusRpcIsPlainObject(value.resume)
+      && typeof value.conversationId === "string" && value.conversationId === value.resume.conversationId
+      && (value.start?.request?.threadId === undefined || value.start.request.threadId === value.conversationId);
+    const wantsHooks = codexPlusRpcWantsTurnHooks();
+    if (!wantsHooks && !prepareProvider && !refreshContext) return null;
     const plan = async (signal) => {
+      if (!wantsHooks) return null;
       const decoded = codexPlusRpcDecode(value);
       const conversationId = decoded.conversationId;
       const carriers = [];
@@ -446,6 +454,25 @@
       };
       plan.contextFailure = (reason) => ["reject", frame[1], ["error", "Error", reason]];
     }
+    if (prepareProvider) {
+      // 暂存纯数据字段，其余候选/export 先交原生导入，失败时照常释放。
+      plan.resumeIndex = "conversationId";
+      plan.before = async (conversationId, _dataOnly, candidate) => {
+        if (candidate.executionHostId !== "local" || conversationId !== candidate.resume?.conversationId
+            || (candidate.start?.request?.threadId !== undefined
+              && candidate.start.request.threadId !== conversationId)) return conversationId;
+        const decoded = codexPlusRpcDecode(candidate);
+        const params = { ...decoded.resume };
+        const provider = decoded.resume.modelProvider
+          ?? decoded.resume.model_provider ?? decoded.resume.config?.model_provider
+          ?? decoded.steer?.restoreMessage?.submissionOptions?.modelProvider;
+        if (provider !== undefined) params.modelProvider = provider;
+        const client = await codexPlusAppServerClient("local");
+        await prepareCodexThreadProviderResume(params, "local",
+          (method, params, options) => client.sendRequest(method, params, options), client);
+        return conversationId;
+      };
+    }
     return plan;
   }
 
@@ -472,7 +499,7 @@
   }
 
   /** 带超时地跑一个改写计划；超时或出错返回 null（原样发出），同时 abort 交给拓展的 signal。 */
-  async function codexPlusRpcRunPlan(plan, frame) {
+  async function codexPlusRpcRunPlan(plan, frame, deferContext = false) {
     const controller = new AbortController();
     let timer = null;
     let replaced = null;
@@ -491,7 +518,7 @@
     } finally {
       clearTimeout(timer);
     }
-    if (!plan.context || replaced?.[codexPlusRpcPushFailure]) return replaced;
+    if (!plan.context || deferContext || replaced?.[codexPlusRpcPushFailure]) return replaced;
     try {
       return await plan.context(replaced || frame);
     } catch (error) {
@@ -545,7 +572,8 @@
       let entry = first;
       while (entry) {
         const [message, rest, plan] = entry;
-        const replaced = plan ? await codexPlusRpcRunPlan(plan, message) : null;
+        const deferContext = message[0] === "resolve" && plan?.before && plan.context;
+        const replaced = plan ? await codexPlusRpcRunPlan(plan, message, deferContext) : null;
         try {
           const failure = replaced?.[codexPlusRpcPushFailure];
           const readInputs = failure && replaced[1][2][0] === "startConversation"
@@ -583,16 +611,24 @@
             const id = gates.nextId--;
             gates.pending.add(id);
             const next = replaced || message;
+            const resolving = next[0] === "resolve";
             const expr = next[1];
-            const args = [...expr[3]];
+            const args = resolving ? { ...next[2] } : [...expr[3]];
             const params = args[plan.resumeIndex];
             const dataOnly = codexPlusRpcDataOnly(params);
             // 含 export 的参数留在原 push 导入，失败时由 Capnweb 正常释放。
-            if (dataOnly) args[plan.resumeIndex] = ["promise", id];
+            if (resolving || dataOnly) args[plan.resumeIndex] = ["promise", id];
             else args.push(["promise", id]);
-            original.call(port, ["push", [...expr.slice(0, 3), args, ...expr.slice(4)], ...next.slice(2)], ...rest);
+            original.call(port, resolving
+              ? ["resolve", next[1], args, ...next.slice(3)]
+              : ["push", [...expr.slice(0, 3), args, ...expr.slice(4)], ...next.slice(2)], ...rest);
             // 先释放整个发送队列，再让预检经同一端口发出。
-            void state.done.then(() => gates.pending.has(id) ? plan.before(params, dataOnly) : params).then(
+            void state.done.then(async () => {
+              if (!gates.pending.has(id)) return params;
+              const prepared = await plan.before(params, dataOnly, resolving ? next[2] : args);
+              if (deferContext && gates.pending.has(id)) await plan.context(next);
+              return prepared;
+            }).then(
               (prepared) => {
                 if (gates.pending.has(id)) original.call(port, ["resolve", id, dataOnly ? prepared : ["undefined"]]);
               },
@@ -659,7 +695,7 @@
         plan = codexPlusRpcPlanFrame(message, this);
       } catch {}
       // resolve 不分配隐式 RPC 序号。单独等待它，预检发出的请求才能通过同一端口。
-      if (message?.[0] === "resolve" && plan?.context) {
+      if (message?.[0] === "resolve" && plan?.context && !plan.before) {
         const port = this;
         void (async () => {
           if (state) await state.done;
