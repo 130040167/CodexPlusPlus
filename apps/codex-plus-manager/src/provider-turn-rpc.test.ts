@@ -4,7 +4,11 @@ import { describe, it } from "node:test";
 import { MessageChannel, MessagePort } from "node:worker_threads";
 
 const asarPath = process.env.CODEX_PLUS_CAPNWEB_ASAR || "";
-const rpc = readFileSync(new URL("../../../assets/inject/renderer-inject/91-extension-rpc.js", import.meta.url), "utf8");
+const fragment = readFileSync(new URL("../../../assets/inject/renderer-inject/91-extension-rpc.js", import.meta.url), "utf8");
+const bundle = readFileSync(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+const rpcStart = bundle.indexOf(fragment);
+assert.notEqual(rpcStart, -1, "the generated bundle must contain the installed RPC fragment");
+const rpc = bundle.slice(rpcStart, rpcStart + fragment.length);
 
 function installedCapnweb() {
   const fd = openSync(asarPath, "r");
@@ -47,6 +51,7 @@ function runtime() {
   const settings = { providerSyncEnabled: true };
   const state = { active: false, prepares: 0, started: 0, dispatches: 0, leases: 0,
     discoveries: 0, failAt: 0, waitAt: 0, wait: null as Promise<void> | null,
+    contextEnabled: false, contextFailure: "", contextCalls: 0,
     replay: null as (() => Promise<void>) | null, candidates: [] as any[], params: [] as any[],
     candidate: (value: any, _intent: string) => value,
     middleware: async (value: any) => value };
@@ -115,11 +120,21 @@ function runtime() {
   const install = (source = rpc) => new Function("window", "codexPlusBackendSettings",
     "prepareCodexThreadProviderResume", "codexPlusAppServerClient", "codexPlusExtensionListeners",
     "codexPlusExtensionInterceptors", "codexPlusMarkExtensionFailure", "showToast",
-    "codexPlusRunWaterfall", "runCodexPlusExtensionCallback", source)(
+    "codexPlusRunWaterfall", "runCodexPlusExtensionCallback", "codexPerModelContextEnabled",
+    "refreshCodexThreadModelBeforeTurn", source)(
     window, settings, align, async () => { state.discoveries++; return client; }, listeners, interceptors,
     (_key: string, message: string) => failures.push(message), () => {},
     (_name: string, value: any) => state.middleware(value),
-    (_key: string, _name: string, callback: () => any) => ({ ok: true, value: callback() }));
+    (_key: string, _name: string, callback: () => any) => ({ ok: true, value: callback() }),
+    () => state.contextEnabled,
+    async (host: any, sendRequest: any, method: string, params: any) => {
+      assert.deepEqual(host, { hostId: "local" });
+      assert.equal(method, "turn/start");
+      state.contextCalls++;
+      calls.push({ context: state.contextCalls, params });
+      await sendRequest("context-check", { threadId: params.threadId });
+      if (state.contextFailure) throw new Error(state.contextFailure);
+    });
   const subscribe = (hostId = "local") => client.subscribe({ key: { hostId } });
   const send = (coordinator: any, choice: any = {}, embedded = false) => {
     const callbacks: string[] = [];
@@ -153,6 +168,54 @@ function runtime() {
 }
 
 describe("installed Capnweb prepared turn provider gate", { skip: !existsSync(asarPath), timeout: 10000 }, () => {
+  it("runs provider preparation and context refresh in order before a turn", async () => {
+    const env = runtime();
+    try {
+      env.state.contextEnabled = true;
+      env.install();
+      await env.subscribe();
+      const result = env.send(await env.client.getTurnCoordinator(), { model: "chosen" }, true);
+      assert.equal(await result.promise, "thread");
+      assert.equal(env.state.prepares, 1);
+      assert.equal(env.state.contextCalls, 1);
+      assert.equal(env.state.started, 1);
+      assert.deepEqual(env.calls.map((call) => call.prepare ? "provider"
+        : call.context ? "context" : call.method),
+      ["provider", "thread/read", "config/read", "context", "context-check"]);
+      assert.equal(env.state.candidates[0].start.request.model, "chosen");
+      await env.until(() => env.state.leases === 1);
+      await env.until(() => env.window.__codexPlusRpcResumeGates.get(env.port1).pending.size === 0);
+      assert.deepEqual(env.failures, []);
+    } finally { env.close(); }
+  });
+
+  it("rejects either preflight failure, releases candidate exports and allows retry", async () => {
+    for (const failing of ["provider", "context"]) {
+      const env = runtime();
+      try {
+        env.state.contextEnabled = true;
+        env.state.failAt = failing === "provider" ? 1 : 0;
+        env.state.contextFailure = failing === "context" ? "CONTEXT_REFRESH_FAILED" : "";
+        env.install();
+        await env.subscribe();
+        const coordinator = await env.client.getTurnCoordinator();
+        await assert.rejects(Promise.resolve(env.send(coordinator, {}, true).promise),
+          failing === "provider" ? /LOCAL_PROVIDER_PREPARE_FAILED/ : /CONTEXT_REFRESH_FAILED/);
+        assert.equal(env.state.started, 0);
+        assert.equal(env.state.contextCalls, failing === "provider" ? 0 : 1);
+        await env.until(() => env.state.leases === 1);
+        await env.until(() => env.window.__codexPlusRpcResumeGates.get(env.port1).pending.size === 0);
+        env.state.failAt = 0;
+        env.state.contextFailure = "";
+        assert.equal(await env.send(coordinator, {}, true).promise, "thread");
+        await env.until(() => env.state.leases === 2);
+        assert.equal(env.state.started, 1);
+        assert.equal(await env.client.sendRequest("ping", {}), "pong");
+        assert.deepEqual(env.failures, []);
+      } finally { env.close(); }
+    }
+  });
+
   it("preserves send arguments and candidate choices without rewriting coordinator frames", async () => {
     const env = runtime();
     try {
@@ -265,7 +328,7 @@ describe("installed Capnweb prepared turn provider gate", { skip: !existsSync(as
       assert.equal(env.state.prepares, 2);
       assert.equal(await env.send(env.client.getTurnCoordinator()).promise, "thread");
       assert.equal(env.state.prepares, 3);
-      assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 11);
+      assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 12);
       assert.deepEqual(env.failures, []);
     } finally { env.close(); }
   });
@@ -368,7 +431,7 @@ describe("installed Capnweb prepared turn provider gate", { skip: !existsSync(as
   it("shares existing gate ids on upgrade and keeps the resume path functional", async () => {
     const env = runtime();
     try {
-      env.install(rpc.replace("codexPlusRpcInterceptorVersion = 9", "codexPlusRpcInterceptorVersion = 8"));
+      env.install(rpc.replace("codexPlusRpcInterceptorVersion = 12", "codexPlusRpcInterceptorVersion = 11"));
       await env.subscribe();
       assert.deepEqual(await env.client.resumeThread({ threadId: "thread", model: null }),
         { threadId: "thread", model: null });

@@ -229,7 +229,7 @@ describe("provider resume RPC gate without context helpers", () => {
     assert.equal(env.calls.some((call) => call.route), false);
   });
 
-  it("keeps native errors, releases failed gates and permits retry after upgrading v7 to v8", async () => {
+  it("keeps native errors, releases failed gates and permits retry after upgrading", async () => {
     const env = runtime();
     env.subscribe();
     const original = env.window.__codexPlusRpcFrameInterceptor.original;
@@ -246,9 +246,9 @@ describe("provider resume RPC gate without context helpers", () => {
     assert.deepEqual(env.sent.at(-1), ["reject", -1.25, ["error", "Error", "CAS conflict"]]);
     env.release(-1.25);
     env.state.bridgeFailure = "";
-    env.window.__codexPlusRpcFrameInterceptor.version = 7;
+    env.window.__codexPlusRpcFrameInterceptor.version = 11;
     env.install();
-    assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 11);
+    assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 12);
     assert.equal(env.window.__codexPlusRpcFrameInterceptor.original, original);
     env.port.postMessage(frame);
     await env.settle();
