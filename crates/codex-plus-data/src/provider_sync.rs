@@ -19,6 +19,7 @@ const DEFAULT_PROVIDER: &str = "openai";
 const MANAGED_SESSION_PROVIDER_ALIAS: &str = "codex_plus_managed";
 const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
 const BACKUP_KEEP_COUNT: usize = 5;
+const THREAD_PROVIDER_BACKUP_KEEP_COUNT: usize = 100;
 const REMOTE_CONTROL_CREATION_WINDOW_SECS: i64 = 15 * 60;
 const PROVIDER_SYNC_PROGRESS_INTERVAL: usize = 32;
 /// 全局状态的旁路备份名；解析失败时指向它作为恢复来源（issue #2160）。
@@ -774,6 +775,7 @@ pub fn prepare_thread_provider(
     let mut file = crate::backup::new_private_file(&backup_path)?;
     file.write_all(&serde_json::to_vec_pretty(&backup)?)?;
     file.sync_all()?;
+    drop(file);
     crate::backup::sync_directory(&backup_root)?;
 
     let update = (|| -> anyhow::Result<usize> {
@@ -804,10 +806,48 @@ pub fn prepare_thread_provider(
     tx.commit().map_err(|error| anyhow::anyhow!(
         "Thread provider preparation commit failed: {error}; backup: {}", backup_path.display()
     ))?;
+    // 清理不属于事务；不能将已经提交的供应商变更误报为失败。
+    let mut backup_retention_warnings = Vec::new();
+    let prune = (|| -> anyhow::Result<()> {
+        let mut previous_backups = Vec::new();
+        for entry in fs::read_dir(&backup_root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path == backup_path || !entry.file_type()?.is_file()
+                || path.extension().and_then(|ext| ext.to_str()) != Some("json")
+                || !path.file_stem().and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| uuid::Uuid::parse_str(stem).is_ok())
+            {
+                continue;
+            }
+            let value: Value = match serde_json::from_slice(&fs::read(&path)?) {
+                Ok(value) => value,
+                Err(error) => {
+                    backup_retention_warnings.push(format!("Invalid backup {}: {error}", path.display()));
+                    continue;
+                }
+            };
+            if value.get("version").and_then(Value::as_u64) == Some(1)
+                && value.get("operation").and_then(Value::as_str) == Some("thread-provider-prepare")
+            {
+                previous_backups.push((entry.metadata()?.modified()?, path));
+            }
+        }
+        previous_backups.sort_unstable_by(|a, b| b.cmp(a));
+        for (_, path) in previous_backups.into_iter().skip(THREAD_PROVIDER_BACKUP_KEEP_COUNT - 1) {
+            fs::remove_file(&path)
+                .map_err(|error| anyhow::anyhow!("Cannot remove backup {}: {error}", path.display()))?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = prune {
+        backup_retention_warnings.push(format!("Backup retention failed: {error:#}"));
+    }
     Ok(json!({
         "status": "ok", "host_id": "local", "thread_id": thread_id,
         "source_provider": source_provider, "target_provider": target_provider,
         "changed": true, "sqlite_rows_updated": rows, "backup_path": backup_path,
+        "backup_retention_warnings": backup_retention_warnings,
     }))
 }
 

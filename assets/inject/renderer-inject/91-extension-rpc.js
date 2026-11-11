@@ -21,8 +21,9 @@
    *   - `agent/request`：params `{ agent, turn, step, signal }`，返回 `{ provider, model, reasoningEffort }`。
    * 同一条用户消息只跑一次这两条链（按 clientUserMessageId 缓存），结果套用到它的所有候选帧上。
    */
-  const codexPlusRpcInterceptorVersion = 14;
+  const codexPlusRpcInterceptorVersion = 15;
   const codexPlusRpcMiddlewareTimeoutMs = 5000;
+  const codexPlusRpcPreparationTimeoutMs = 120000;
   const codexPlusRpcOpaque = Symbol("codexPlusRpcOpaque");
   const codexPlusRpcSourceItem = Symbol("codexPlusRpcSourceItem");
   const codexPlusRpcPushFailure = Symbol("codexPlusRpcPushFailure");
@@ -367,6 +368,18 @@
     const expr = frame[1];
     const method = expr[2][0];
     const index = method === "sendRequest" ? 1 : 0;
+    const isResumeRequest = expr[3][0] === "thread/resume"
+      || (expr[3][0] === "send-cli-request-for-host" && expr[3][1]?.method === "thread/resume");
+    const options = method === "sendRequest" && isResumeRequest ? expr[3][2] : null;
+    const internalResume = options?.__codexPlusProviderResume;
+    if (internalResume !== undefined) {
+      const inner = plan;
+      plan = async (signal) => {
+        expr[3][2] = { ...options };
+        delete expr[3][2].__codexPlusProviderResume;
+        return inner ? inner(signal) : null;
+      };
+    }
     if (hostId !== "local" || typeof prepareCodexThreadProviderResume !== "function"
         || (method === "sendRequest" && expr[3][0] !== "thread/resume")
         || !codexPlusRpcIsPlainObject(expr[3][index])) return plan;
@@ -377,28 +390,32 @@
     const preparation = typeof codexThreadProviderPreparations !== "undefined"
       ? codexThreadProviderPreparations.get(original.threadId || original.conversationId) : null;
     const resuming = preparation?.resuming;
-    if (method === "sendRequest" && resuming && expr[3][2]?.__codexPlusProviderResume === resuming) {
-      const inner = plan;
-      return async (signal) => {
-        expr[3][2] = { ...expr[3][2] };
-        delete expr[3][2].__codexPlusProviderResume;
-        return inner ? inner(signal) : null;
-      };
-    }
-    if (!codexPlusBackendSettings.providerSyncEnabled && !preparation?.tail) return plan;
+    if (method === "sendRequest" && resuming && internalResume === resuming) return plan;
+    const managed = typeof codexManagedSessionConnection === "function" && codexManagedSessionConnection();
+    const previousManaged = (original.modelProvider ?? original.model_provider
+      ?? original.config?.model_provider) === "codex_plus_managed";
+    const inspectManaged = typeof codexRemoteSessionActiveProfile === "function" && !!codexRemoteSessionActiveProfile();
+    if (!codexPlusBackendSettings.providerSyncEnabled && !preparation?.tail
+        && !managed && !previousManaged && !inspectManaged) return plan;
     plan ||= async () => null;
     plan.resumeIndex = index;
-    plan.before = async (wireParams, dataOnly) => {
+    plan.before = async (wireParams, dataOnly, _candidate, signal) => {
+      signal?.throwIfAborted();
       const params = codexPlusRpcDecode(wireParams);
-      if (!codexPlusBackendSettings.providerSyncEnabled) {
+      if (!codexPlusBackendSettings.providerSyncEnabled && !managed && !previousManaged && !inspectManaged) {
         await preparation.tail;
+        signal?.throwIfAborted();
         return wireParams;
       }
       const client = await codexPlusAppServerClient(hostId);
+      signal?.throwIfAborted();
       const prepared = await prepareCodexThreadProviderResume(params, hostId,
-        (method, params, options) => client.sendRequest(method, params, options), client);
+        (method, params, options) => client.sendRequest(method, params, options), client, null, null, signal,
+        false, previousManaged || inspectManaged);
+      signal?.throwIfAborted();
       if (prepared && dataOnly && method === "resumeConversation") {
         const cached = await client.getConversation(params.conversationId);
+        signal?.throwIfAborted();
         const error = cached?.providerBlock?.error;
         if (error?.type === "modelProviderMismatch" && error.modelProvider === prepared.sourceProvider
             && error.currentModelProvider === prepared.targetProvider) {
@@ -470,21 +487,27 @@
       return ["resolve", frame[1], codexPlusRpcEncode(decoded), ...frame.slice(3)];
     };
     if (refreshContext) {
-      plan.context = async (nextFrame) => {
+      plan.context = async (nextFrame, signal) => {
+        signal?.throwIfAborted();
         if (nextFrame[0] !== "resolve") return nextFrame;
         const decoded = codexPlusRpcDecode(nextFrame[2]);
         const client = await codexPlusAppServerClient("local");
+        signal?.throwIfAborted();
         const sendRequest = async (method, params, options) => {
+          signal?.throwIfAborted();
           if (method === "thread/unsubscribe") {
             await client.unsubscribeInactiveConversation(params.threadId);
+            signal?.throwIfAborted();
             // 宿主方法会内部记录并吞掉失败；原始请求幂等，确保原生错误传回当前发送。
-            return client.sendRequest(method, params, options);
           }
-          if (method === "thread/resume" && params.config) return client.resumeThread(params);
-          return client.sendRequest(method, params, options);
+          const result = method === "thread/resume" && params.config
+            ? await client.resumeThread(params) : await client.sendRequest(method, params, options);
+          signal?.throwIfAborted();
+          return result;
         };
         await refreshCodexThreadModelBeforeTurn({ hostId: "local" }, sendRequest,
           "turn/start", decoded.start.request);
+        signal?.throwIfAborted();
         return nextFrame;
       };
       plan.contextFailure = (reason) => ["reject", frame[1], ["error", "Error", reason]];
@@ -492,7 +515,8 @@
     if (prepareProvider) {
       // 暂存纯数据字段，其余候选/export 先交原生导入，失败时照常释放。
       plan.resumeIndex = "conversationId";
-      plan.before = async (conversationId, _dataOnly, candidate) => {
+      plan.before = async (conversationId, _dataOnly, candidate, signal) => {
+        signal?.throwIfAborted();
         if (candidate.executionHostId !== "local" || conversationId !== candidate.resume?.conversationId
             || (candidate.start?.request?.threadId !== undefined
               && candidate.start.request.threadId !== conversationId)) return conversationId;
@@ -505,18 +529,28 @@
           ?? decoded.resume.model_provider ?? decoded.resume.config?.model_provider
           ?? decoded.steer?.restoreMessage?.submissionOptions?.modelProvider;
         if (provider !== undefined) params.modelProvider = provider;
+        const inspectManaged = provider === "codex_plus_managed"
+          || (typeof codexRemoteSessionActiveProfile === "function" && !!codexRemoteSessionActiveProfile())
+          || (typeof codexThreadProviderPreparations !== "undefined"
+            && !!codexThreadProviderPreparations.get(conversationId)?.tail);
         let client;
         const sendRequest = async (method, requestParams, options) => {
+          signal?.throwIfAborted();
           client ||= await codexPlusAppServerClient("local");
+          signal?.throwIfAborted();
           return client.sendRequest(method, requestParams, options);
         };
         let gateway = hasStart && typeof codexGatewayConnectionGeneration === "function"
-          ? await codexGatewayConnectionGeneration(sendRequest, params.cwd) : null;
-        if (!codexPlusBackendSettings.providerSyncEnabled && !gateway?.active) return conversationId;
+          ? await codexGatewayConnectionGeneration(sendRequest, params.cwd, signal) : null;
+        signal?.throwIfAborted();
+        if (!codexPlusBackendSettings.providerSyncEnabled && !gateway?.active && !(hasStart && inspectManaged)) return conversationId;
         client ||= await codexPlusAppServerClient("local");
-        if (gateway?.active) gateway = await codexGatewayConnectionGeneration(sendRequest, params.cwd);
-        if (!codexPlusBackendSettings.providerSyncEnabled && !gateway?.active) return conversationId;
-        await prepareCodexThreadProviderResume(params, "local", sendRequest, client, null, gateway);
+        signal?.throwIfAborted();
+        if (gateway?.active) gateway = await codexGatewayConnectionGeneration(sendRequest, params.cwd, signal);
+        signal?.throwIfAborted();
+        if (!codexPlusBackendSettings.providerSyncEnabled && !gateway?.active && !(hasStart && inspectManaged)) return conversationId;
+        await prepareCodexThreadProviderResume(params, "local", sendRequest, client, null, gateway, signal, hasStart);
+        signal?.throwIfAborted();
         return conversationId;
       };
     }
@@ -583,11 +617,20 @@
     if (incoming === null) {
       creation?.callbacks.clear();
       gates?.pending.clear();
+      for (const controller of gates?.controllers?.values() || []) {
+        controller.abort(new Error("会话准备已取消"));
+      }
+      gates?.controllers?.clear();
       return incoming;
     }
     if (incoming?.[0] === "release") {
       creation?.callbacks.delete(incoming[1]);
-      if (rejections?.pending.delete(incoming[1]) || gates?.pending.delete(incoming[1])) {
+      const releasedGate = gates?.pending.delete(incoming[1]);
+      if (releasedGate) {
+        gates.controllers?.get(incoming[1])?.abort(new Error("会话准备已取消"));
+        gates.controllers?.delete(incoming[1]);
+      }
+      if (rejections?.pending.delete(incoming[1]) || releasedGate) {
         // 未知 import 的 resolve 是协议空操作；正半整数不属于任何原生或本层编号。
         return ["resolve", 0.5, ["undefined"]];
       }
@@ -657,6 +700,8 @@
             }
             const id = gates.nextId--;
             gates.pending.add(id);
+            const controller = new AbortController();
+            (gates.controllers ||= new Map()).set(id, controller);
             const next = replaced || message;
             const resolving = next[0] === "resolve";
             const expr = next[1];
@@ -671,21 +716,42 @@
               : ["push", [...expr.slice(0, 3), args, ...expr.slice(4)], ...next.slice(2)], ...rest);
             // 先释放整个发送队列，再让预检经同一端口发出。
             void state.done.then(async () => {
-              const prepare = async () => {
+              let timer;
+              try {
+                controller.signal.throwIfAborted();
                 if (!gates.pending.has(id)) return params;
-                const prepared = await plan.before(params, dataOnly, resolving ? next[2] : args);
-                if (deferContext && gates.pending.has(id)) await plan.context(next);
-                return prepared;
-              };
-              return resolving ? codexPlusRpcSerializeTurn(next[2].conversationId, prepare) : prepare();
+                const timeout = new Promise((_, reject) => {
+                  timer = setTimeout(() => {
+                    const error = new Error("会话准备超时，请重试");
+                    controller.abort(error);
+                    reject(error);
+                  }, codexPlusRpcPreparationTimeoutMs);
+                });
+                const prepare = async () => {
+                  controller.signal.throwIfAborted();
+                  if (!gates.pending.has(id)) return params;
+                  const prepared = await plan.before(params, dataOnly, resolving ? next[2] : args, controller.signal);
+                  controller.signal.throwIfAborted();
+                  if (deferContext && gates.pending.has(id)) await plan.context(next, controller.signal);
+                  controller.signal.throwIfAborted();
+                  return prepared;
+                };
+                const work = resolving ? codexPlusRpcSerializeTurn(next[2].conversationId, prepare) : prepare();
+                return await Promise.race([work, timeout]);
+              } finally {
+                clearTimeout(timer);
+                gates.controllers.delete(id);
+              }
             }).then(
               (prepared) => {
                 if (gates.pending.has(id)) original.call(port, ["resolve", id, dataOnly ? prepared : ["undefined"]]);
               },
               (error) => {
-                const reason = String(error?.message || error);
-                codexPlusRpcRejectNotice(reason);
-                if (gates.pending.has(id)) original.call(port, ["reject", id, ["error", error?.name || "Error", reason]]);
+                if (gates.pending.has(id)) {
+                  const reason = String(error?.message || error);
+                  codexPlusRpcRejectNotice(reason);
+                  original.call(port, ["reject", id, ["error", error?.name || "Error", reason]]);
+                }
               },
             ).catch((error) => codexPlusMarkExtensionFailure("", `rpc 帧发送失败：${String(error?.message || error)}`));
           } else {

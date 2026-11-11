@@ -85,6 +85,92 @@ describe("thread model restoration ownership", () => {
   });
 });
 
+const readSource = source.slice(source.indexOf("  async function readCodexAppServerPreparation("),
+  source.indexOf("  async function loadBackendSettingsState("));
+
+function snapshotRuntime(read?: (payload: any) => Promise<any>) {
+  const settings: any = { relayProfilesEnabled: true, activeRelayId: "relay", providerSyncEnabled: false,
+    relayProfiles: [{ id: "relay", relayMode: "pureApi", configContents: 'model_provider = "custom"' }] };
+  const calls: any[] = [];
+  const diagnostics: any[] = [];
+  const api = new Function("codexPlusBackendSettings", "codexModelCatalog", "sendCodexPlusDiagnostic",
+    "postJson", "codexAppServerPreparationTimeoutMs", "window", `${override}\n${readSource}
+      return { prepare: prepareCodexPureApiResume, apply: applyCodexRemoteSessionProviderOverride,
+        verify: verifyCodexPureApiResumeResult };`)(
+    settings, {}, (event: string, detail: any) => diagnostics.push({ event, detail }),
+    async (route: string, payload: any) => {
+      assert.equal(route, "/thread-resume-model-metadata");
+      calls.push(payload);
+      return read ? read(payload) : { status: "ok", threadId: payload.thread_id,
+        model: `saved-${payload.thread_id}`, reasoningEffort: "high" };
+    }, 30, {});
+  return { ...api, settings, calls, diagnostics };
+}
+
+describe("pure API persisted model snapshot with provider sync disabled", () => {
+  it("restores each saved model and effort after provider routing without mutating the request", async () => {
+    for (const optional of [{}, { model: null }, { modelProvider: "openai" },
+      { model_provider: "openai" }, { config: { model_reasoning_effort: "low" } }]) {
+      const api = snapshotRuntime();
+      const params = { threadId: "a", ...optional };
+      const before = structuredClone(params);
+      const result = await api.prepare("thread/resume", api.apply("thread/resume", params), "local");
+      assert.equal(result.model, "saved-a");
+      assert.equal(result.modelProvider, "custom");
+      assert.equal(result.config.model_reasoning_effort,
+        "config" in optional ? "low" : "high");
+      assert.deepEqual(params, before);
+      assert.equal(api.calls.length, 1);
+      api.verify("thread/resume", result,
+        { model: "wrong", modelProvider: "custom", reasoningEffort: result.config.model_reasoning_effort }, "local");
+      assert.equal(api.diagnostics.at(-1).event, "pure_api_resume_result_mismatch");
+    }
+  });
+
+  it("preserves explicit choices, remote requests and native OpenAI resumes", async () => {
+    const api = snapshotRuntime();
+    for (const params of [{ threadId: "a", model: "chosen" }, { threadId: "a", modelProvider: "other" }]) {
+      assert.equal(await api.prepare("thread/resume", params, "local"), params);
+    }
+    const remote = { threadId: "a" };
+    assert.equal(await api.prepare("thread/resume", remote, "remote"), remote);
+    api.settings.relayProfiles[0].configContents = 'model_provider = "openai"';
+    assert.equal(await api.prepare("thread/resume", remote, "local"), remote);
+    assert.equal(api.calls.length, 0);
+  });
+
+  it("leaves path-only resumes to the native client", async () => {
+    const api = snapshotRuntime();
+    const params = { path: "C:/fixture/rollout.jsonl" };
+    assert.equal(await api.prepare("thread/resume", params, "local"), params);
+    assert.deepEqual(api.calls, []);
+  });
+
+  it("does not use stale or incomplete metadata and rejects concurrent changes", async () => {
+    const missing = snapshotRuntime(async () => ({ status: "failed" }));
+    const result = await missing.prepare("thread/resume", { threadId: "a" }, "local");
+    assert.equal(result.modelProvider, "custom");
+    assert.equal(Object.hasOwn(result, "model"), false);
+    assert.equal(missing.diagnostics.at(-1).detail.reason, "metadata_unavailable");
+
+    const changed = snapshotRuntime(async ({ thread_id }) => {
+      changed.settings.relayProfiles[0].configContents = 'model_provider = "changed"';
+      return { status: "ok", threadId: thread_id, model: "saved", reasoningEffort: "high" };
+    });
+    await assert.rejects(changed.prepare("thread/resume", { threadId: "a" }, "local"), /配置已变化/);
+  });
+
+  it("keeps the loaded-provider guard and supports local request envelopes", async () => {
+    const api = snapshotRuntime();
+    await assert.rejects(api.prepare("thread/resume", { threadId: "a" }, "local", false,
+      async () => ({ thread: { modelProvider: "openai", status: { type: "idle" } } })), /旧供应商连接/);
+    const envelope = { hostId: "local", method: "thread/resume", params: { threadId: "b" } };
+    const result = await api.prepare("send-cli-request-for-host", envelope, "local");
+    assert.equal(result.params.model, "saved-b");
+    assert.deepEqual(envelope.params, { threadId: "b" });
+  });
+});
+
 describe("nullable restoration through existing upstream wrappers", () => {
   const catalog = readFileSync(new URL("../../../assets/inject/renderer-inject/70-model-catalog.js", import.meta.url), "utf8");
   const instance = catalog.slice(catalog.indexOf("  function patchAppServerModelRequestClient("), catalog.indexOf("  // issue #2177"));
@@ -107,6 +193,7 @@ describe("nullable restoration through existing upstream wrappers", () => {
         ] as const) {
           const calls: any[] = [];
           const bridges: any[] = [];
+          let currentStatus: string = status;
           class Client {
             hostId = "local";
             async sendRequest(method: string, params: any) {
@@ -114,9 +201,10 @@ describe("nullable restoration through existing upstream wrappers", () => {
               const input = method === "send-cli-request-for-host" ? params.params : params;
               calls.push({ method: name, params: input });
               if (name === "thread/read") {
-                return { thread: { id: "a", cwd: "C:/fixture", status: { type: status }, modelProvider: source } };
+                return { thread: { id: "a", cwd: "C:/fixture", status: { type: currentStatus }, modelProvider: source } };
               }
               if (name === "config/read") return { config: { model_provider: target } };
+              if (name === "thread/unsubscribe") currentStatus = "notLoaded";
               return { thread: { id: "a" }, model: "native-saved", reasoningEffort: "native-saved" };
             }
           }
@@ -124,11 +212,14 @@ describe("nullable restoration through existing upstream wrappers", () => {
           const profile = { id: "relay", relayMode,
             officialMixApiKey, configContents: `model_provider = "${target}"` };
           const context = vm.createContext({
-            window: { __codexPlusAppServerClientClass: Client, __codexSessionDeleteBridge: () => {} }, client,
+            window: { __codexPlusAppServerClientClass: Client, __codexSessionDeleteBridge: () => {} }, client, AbortController,
             codexAppServerModelRequestPatchVersion: requestPatchVersion,
             codexPlusBackendSettings: { relayProfilesEnabled: true, activeRelayId: "relay", providerSyncEnabled: enabled,
               relayProfiles: [profile] },
             codexModelCatalog: {}, codexPlusBackendSettingsLoaded: true, codexAppServerPreparationTimeoutMs: 2000,
+            readCodexAppServerPreparation: async (_route: string, payload: any) => ({
+              status: "ok", threadId: payload.thread_id, model: "native-saved", reasoningEffort: "native-saved",
+            }),
             postJson: async (route: string, payload: any) => {
               assert.equal(route, "/thread-provider/prepare");
               bridges.push(payload);
@@ -154,19 +245,23 @@ describe("nullable restoration through existing upstream wrappers", () => {
             { model: "chosen", reasoningEffort: "low", config: { model_reasoning_effort: "high" } },
           ]) {
             const params = { threadId: "a", ...choice };
+            currentStatus = status;
             const before = structuredClone(params);
             const bridgeCount = bridges.length;
             const callCount = calls.length;
             const result = await client.sendRequest(mode === "envelope" ? "send-cli-request-for-host" : "thread/resume",
               mode === "envelope" ? { hostId: "local", method: "thread/resume", params } : params);
             const dispatched = calls.slice(callCount);
-            assert.deepEqual(dispatched.map((call) => call.method), !enabled ? ["thread/resume"]
+            const restoreSnapshot = !enabled && relayMode === "pureApi" && target !== "openai" && choice.model === null;
+            assert.deepEqual(dispatched.map((call) => call.method), !enabled
+              ? restoreSnapshot ? ["thread/read", "thread/resume"] : ["thread/resume"]
               : status === "notLoaded" ? ["thread/read", "config/read", "thread/resume"]
               : status === "active" ? ["thread/read", "thread/resume"]
-              : ["thread/read", "config/read", "thread/read", "thread/read", "thread/unsubscribe", "thread/resume"]);
-            assert.equal(dispatched.at(-1).params.model, choice.model);
+              : ["thread/read", "config/read", "thread/read", "thread/read", "thread/unsubscribe", "thread/read", "thread/resume"]);
+            assert.equal(dispatched.at(-1).params.model, restoreSnapshot ? "native-saved" : choice.model);
             assert.equal(dispatched.at(-1).params.reasoningEffort, choice.reasoningEffort);
-            assert.equal(dispatched.at(-1).params.config.model_reasoning_effort, choice.config.model_reasoning_effort);
+            assert.equal(dispatched.at(-1).params.config.model_reasoning_effort,
+              restoreSnapshot ? "native-saved" : choice.config.model_reasoning_effort);
             assert.deepEqual(params, before);
             assert.equal(result.model, "native-saved");
             assert.equal(result.reasoningEffort, "native-saved");

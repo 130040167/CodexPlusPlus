@@ -141,6 +141,108 @@ fn thread_provider_prepare_preserves_history_settings_and_supports_metadata_rest
 }
 
 #[test]
+fn thread_provider_prepare_prunes_only_old_owned_backups() {
+    let temp = tempdir().unwrap();
+    let home = temp.path();
+    write_provider_config(home, "custom");
+    create_state_db_with_providers(&home.join("state_5.sqlite"), &[("thread-1", "openai", 0)]);
+    let root = home.join("backups_state/thread-provider-prepare");
+    fs::create_dir_all(&root).unwrap();
+
+    let mut previous = Vec::new();
+    for index in 0..101 {
+        let path = root.join(format!("{}.json", uuid::Uuid::new_v4()));
+        fs::write(&path, br#"{"version":1,"operation":"thread-provider-prepare","changes":[]}"#).unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(index + 1))).unwrap();
+        previous.push(path);
+    }
+    let unrelated = root.join("notes.json");
+    fs::write(&unrelated, b"keep this file").unwrap();
+    let unrelated_uuid = root.join(format!("{}.json", uuid::Uuid::new_v4()));
+    fs::write(&unrelated_uuid, br#"{"version":1,"operation":"another-operation"}"#).unwrap();
+    let truncated = root.join(format!("{}.json", uuid::Uuid::new_v4()));
+    fs::write(&truncated, br#"{"version":"#).unwrap();
+
+    let result = prepare_thread_provider(home, true, &thread_provider_prepare_request()).unwrap();
+    let current = Path::new(result["backup_path"].as_str().unwrap());
+    assert!(current.is_file());
+    assert!(previous[..2].iter().all(|path| !path.exists()));
+    assert!(previous[2..].iter().all(|path| path.is_file()));
+    assert_eq!(fs::read(&unrelated).unwrap(), b"keep this file");
+    assert!(unrelated_uuid.is_file());
+    assert!(truncated.is_file());
+    assert!(result["backup_retention_warnings"][0].as_str().unwrap()
+        .contains(truncated.to_str().unwrap()));
+}
+
+#[test]
+fn thread_provider_prepare_rollback_does_not_prune_old_backups() {
+    let temp = tempdir().unwrap();
+    let home = temp.path();
+    write_provider_config(home, "custom");
+    let db_path = home.join("state_5.sqlite");
+    create_state_db_with_providers(&db_path, &[("thread-1", "openai", 0)]);
+    create_local_thread_catalog_db(&db_path, &[("thread-1", "openai")]);
+    let db = Connection::open(&db_path).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER reject_catalog BEFORE UPDATE ON local_thread_catalog BEGIN SELECT RAISE(IGNORE); END;",
+    ).unwrap();
+    let root = home.join("backups_state/thread-provider-prepare");
+    fs::create_dir_all(&root).unwrap();
+    let previous: Vec<_> = (0..100).map(|_| {
+        let path = root.join(format!("{}.json", uuid::Uuid::new_v4()));
+        fs::write(&path, br#"{"version":1,"operation":"thread-provider-prepare","changes":[]}"#).unwrap();
+        path
+    }).collect();
+
+    for _ in 0..2 {
+        let error = prepare_thread_provider(home, true, &thread_provider_prepare_request()).unwrap_err();
+        assert!(error.to_string().contains("CAS conflict"), "{error}");
+    }
+    assert!(previous.iter().all(|path| path.is_file()));
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 102);
+}
+
+#[cfg(windows)]
+#[test]
+fn thread_provider_prepare_reports_retention_failure_after_commit() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let temp = tempdir().unwrap();
+    let home = temp.path();
+    write_provider_config(home, "custom");
+    let db_path = home.join("state_5.sqlite");
+    create_state_db_with_providers(&db_path, &[("thread-1", "openai", 0)]);
+    let root = home.join("backups_state/thread-provider-prepare");
+    fs::create_dir_all(&root).unwrap();
+    let mut oldest = None;
+    for index in 0..100 {
+        let path = root.join(format!("{}.json", uuid::Uuid::new_v4()));
+        fs::write(&path, br#"{"version":1,"operation":"thread-provider-prepare","changes":[]}"#).unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(index + 1))).unwrap();
+        if index == 0 {
+            oldest = Some(path);
+        }
+    }
+    let oldest = oldest.unwrap();
+    let held = fs::OpenOptions::new().read(true).share_mode(0x3).open(&oldest).unwrap();
+    let result = prepare_thread_provider(home, true, &thread_provider_prepare_request());
+    drop(held);
+
+    let result = result.unwrap();
+    assert_eq!(result["status"], "ok");
+    assert_eq!(result["changed"], true);
+    assert!(result["backup_retention_warnings"][0].as_str().unwrap()
+        .contains(oldest.to_str().unwrap()));
+    assert_eq!(Connection::open(&db_path).unwrap().query_row(
+        "SELECT model_provider FROM threads WHERE id='thread-1'",
+        [], |row| row.get::<_, String>(0),
+    ).unwrap(), "custom");
+}
+
+#[test]
 fn thread_provider_prepare_rejects_identity_and_provider_conflicts_without_backup() {
     for scenario in ["remote", "missing_host", "conflicting_host", "internal_source", "internal_target", "bad_target", "source_changed", "catalog_changed", "missing_thread"] {
         let temp = tempdir().unwrap();

@@ -75,7 +75,7 @@ test("generated renderer installs provider RPC preparation and completes startup
   context.globalThis = context;
 
   new Function(...Object.keys(context), bundle)(...Object.values(context));
-  assert.equal(context.__codexPlusRpcFrameInterceptor?.version, 14);
+  assert.equal(context.__codexPlusRpcFrameInterceptor?.version, 15);
   assert.ok(context.__codexSessionDeleteObserver, "startup must install its observer after the RPC fragment");
   assert.ok(context.codexPlus, "startup must expose the extension API after the RPC fragment");
 

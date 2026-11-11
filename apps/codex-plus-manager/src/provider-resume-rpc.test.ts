@@ -13,6 +13,7 @@ function runtime() {
   const sent: Frame[] = [];
   const received: any[] = [];
   const calls: any[] = [];
+  const diagnostics: any[] = [];
   const toasts: string[] = [];
   const failures: string[] = [];
   const settings: any = { providerSyncEnabled: true, relayProfilesEnabled: true, activeRelayId: "relay",
@@ -21,7 +22,7 @@ function runtime() {
       { id: "codex-plus-gateway", relayMode: "pureApi", configContents: 'model_provider = "custom"' },
     ] };
   const state = { status: "notLoaded", source: "openai", target: "custom", cached: null as any,
-    failure: null as Error | null, bridgeFailure: "", discoveries: 0, disposals: 0, gatewayReads: 0,
+    failure: null as Error | null, bridgeFailure: "", retentionWarnings: [] as string[], discoveries: 0, disposals: 0, gatewayReads: 0,
     wait: null as Promise<void> | null, afterRead: () => {}, afterPrepare: () => {}, onDiscover: () => {},
     gateway: { active: true, generation: "initial" }, turns: 1, turnsError: null as Error | null,
     model: "saved-model", effort: "medium" as string | null, statusListener: null as any,
@@ -56,7 +57,8 @@ function runtime() {
       state.source = payload.target_provider;
       state.afterPrepare();
     }
-    return state.bridgeFailure ? { status: "failed", message: state.bridgeFailure } : { status: "ok" };
+    return state.bridgeFailure ? { status: "failed", message: state.bridgeFailure }
+      : { status: "ok", backup_retention_warnings: state.retentionWarnings };
   };
   const api = new Function("window", "codexPlusBackendSettings", "codexModelCatalog", "sendCodexPlusDiagnostic",
     "postJson", "readCodexAppServerPreparation", "codexAppServerPreparationTimeoutMs", "Date", `${provider}
@@ -64,7 +66,7 @@ function runtime() {
         verify: verifyCodexPureApiResumeResult, enabled: codexGatewayRecoveryEnabled,
         gateway: codexGatewayConnectionGeneration,
         preparations: codexThreadProviderPreparations };`)(
-    window, settings, {}, () => {}, postJson, async (route: string) => {
+    window, settings, {}, (event: string, detail: any) => diagnostics.push({ event, detail }), postJson, async (route: string) => {
       assert.equal(route, "/gateway/connection-generation");
       state.gatewayReads++;
       if (state.gatewayFailure) throw state.gatewayFailure;
@@ -166,7 +168,7 @@ function runtime() {
     new PortMessageEvent("message", { data: ["release", id, 1] }));
   const alignGateway = (params: any, sendRequest = client.sendRequest, host = client) =>
     api.align(params, "local", sendRequest, host, undefined, { status: "ok", ...state.gateway });
-  return { api, alignGateway, settings, state, client, discover, window, port, sent, received, calls, toasts, failures,
+  return { api, alignGateway, settings, state, client, discover, window, port, sent, received, calls, toasts, failures, diagnostics,
     install, subscribe, settle, release, interceptors, setChain: (next: typeof chain) => { chain = next; } };
 }
 
@@ -189,6 +191,35 @@ describe("provider resume RPC gate without context helpers", () => {
       assert.equal(env.state.discoveries, 0);
       assert.deepEqual(env.calls, []);
       assert.equal(env.sent.at(-1), frame);
+    }
+  });
+
+  it("reports backup retention warnings without rejecting the committed preparation", async () => {
+    const env = runtime();
+    env.state.retentionWarnings = ["backup removal failed"];
+    env.subscribe();
+    env.port.postMessage(resume("resumeThread", { threadId: "thread" }));
+    await env.settle();
+    assert.equal(env.sent.at(-1)?.[0], "resolve");
+    assert.deepEqual(env.diagnostics, [{
+      event: "thread_provider_backup_retention_warning",
+      detail: { warnings: ["backup removal failed"] },
+    }]);
+    env.release();
+  });
+
+  it("removes the internal resume marker even when the receiver is unknown or conflicting", async () => {
+    for (const mode of ["unknown", "conflicting"]) {
+      const env = runtime();
+      env.subscribe();
+      if (mode === "conflicting") env.subscribe("ssh");
+      env.api.preparations.set("thread", { resuming: 42 });
+      const frame = resume("sendRequest", { threadId: "thread" },
+        { __codexPlusProviderResume: 42, timeoutMs: 2000 }, mode === "unknown" ? -20 : -19);
+      env.port.postMessage(frame);
+      await env.settle();
+      assert.deepEqual(env.sent.at(-1)?.[1][3][2], { timeoutMs: 2000 });
+      assert.equal(env.calls.length, 0);
     }
   });
 
@@ -318,7 +349,7 @@ describe("provider resume RPC gate without context helpers", () => {
     env.state.bridgeFailure = "";
     env.window.__codexPlusRpcFrameInterceptor.version = 11;
     env.install();
-    assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 14);
+    assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 15);
     assert.equal(env.window.__codexPlusRpcFrameInterceptor.original, original);
     env.port.postMessage(frame);
     await env.settle();
@@ -638,7 +669,10 @@ describe("provider preparation", () => {
       getConversation: env.client.getConversation,
       async unsubscribeInactiveConversation(threadId: string) {
         env.calls.push({ method: "unsubscribeInactiveConversation", threadId });
-        if (!failed) env.state.cached.resumeState = "needs_resume";
+        if (!failed) {
+          env.state.cached.resumeState = "needs_resume";
+          env.state.status = "notLoaded";
+        }
       },
     };
     const params = { conversationId: "thread", model: null, reasoningEffort: null };
@@ -665,6 +699,7 @@ describe("provider preparation", () => {
       async unsubscribeInactiveConversation() {
         env.calls.push({ method: "unsubscribeInactiveConversation" });
         env.state.cached.resumeState = "needs_resume";
+        env.state.status = "notLoaded";
       },
     };
     const send = async (method: string, params: any, options: any) => {
@@ -748,7 +783,10 @@ describe("provider preparation", () => {
       : value);
     const host = {
       getConversation: env.client.getConversation,
-      async unsubscribeInactiveConversation() { env.state.cached.resumeState = "needs_resume"; },
+      async unsubscribeInactiveConversation() {
+        env.state.cached.resumeState = "needs_resume";
+        env.state.status = "notLoaded";
+      },
     };
     assert.deepEqual(await env.api.align({ threadId: "thread" }, "local", env.client.sendRequest, host), {
       sourceProvider: "openai", targetProvider: "custom",
@@ -772,7 +810,10 @@ describe("provider preparation", () => {
       env.state.cached = { modelProvider: "openai", resumeState: "resumed" };
       const host = {
         getConversation: env.client.getConversation,
-        async unsubscribeInactiveConversation() { env.state.cached.resumeState = "needs_resume"; },
+        async unsubscribeInactiveConversation() {
+          env.state.cached.resumeState = "needs_resume";
+          env.state.status = "notLoaded";
+        },
       };
       let failed = true;
       const send = async (method: string, params: any, options: any) => {
@@ -792,7 +833,7 @@ describe("provider preparation", () => {
       });
       assert.equal(env.calls.filter(call => call.route).length, 1);
       assert.equal(env.calls.filter(call => call.method === "thread/resume").length,
-        failure === "configuration" ? 2 : 1);
+        failure === "configuration" ? 2 : 0);
     }
   });
 
@@ -863,6 +904,27 @@ describe("provider preparation", () => {
       assert.equal(env.calls.filter((call) => call.route).at(-1).payload.target_provider, "chosen");
       assert.deepEqual(params, before);
     }
+  });
+
+  it("keeps managed aliases out of index synchronization while unloading an old managed connection", async () => {
+    const target = runtime();
+    target.subscribe();
+    target.state.source = "custom";
+    target.state.target = "codex_plus_managed";
+    target.state.status = "idle";
+    assert.equal(await target.api.align({ threadId: "thread" }, "local", target.client.sendRequest), null);
+    assert.equal(target.calls.some((call) => call.route), false);
+    assert.equal(target.calls.some((call) => call.method === "thread/unsubscribe"), false);
+
+    const source = runtime();
+    source.subscribe();
+    source.state.source = "codex_plus_managed";
+    source.state.target = "custom";
+    source.state.status = "idle";
+    const prepared = await source.api.align({ threadId: "thread" }, "local", source.client.sendRequest);
+    assert.equal(prepared.targetProvider, "custom");
+    assert.equal(source.calls.some((call) => call.route), false);
+    assert.equal(source.calls.some((call) => call.method === "thread/unsubscribe"), true);
   });
 
   it("binds the local receiver from settings without a context observer and immediately disposes the subscription", async () => {

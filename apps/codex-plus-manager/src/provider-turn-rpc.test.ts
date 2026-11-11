@@ -485,7 +485,7 @@ describe("installed Capnweb prepared turn provider gate", { skip: !existsSync(as
       assert.equal(env.state.prepares, 2);
       assert.equal(await env.send(env.client.getTurnCoordinator()).promise, "thread");
       assert.equal(env.state.prepares, 3);
-      assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 14);
+      assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 15);
       assert.deepEqual(env.failures, []);
     } finally { env.close(); }
   });
@@ -592,7 +592,7 @@ describe("installed Capnweb prepared turn provider gate", { skip: !existsSync(as
   it("shares existing gate ids on upgrade and keeps the resume path functional", async () => {
     const env = runtime();
     try {
-      env.install(rpc.replace("codexPlusRpcInterceptorVersion = 14", "codexPlusRpcInterceptorVersion = 13"));
+      env.install(rpc.replace("codexPlusRpcInterceptorVersion = 15", "codexPlusRpcInterceptorVersion = 14"));
       await env.subscribe();
       assert.deepEqual(await env.client.resumeThread({ threadId: "thread", model: null }),
         { threadId: "thread", model: null });
