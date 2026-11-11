@@ -5,6 +5,8 @@ import { MessageChannel, MessagePort } from "node:worker_threads";
 
 const asarPath = process.env.CODEX_PLUS_CAPNWEB_ASAR || "";
 const fragment = readFileSync(new URL("../../../assets/inject/renderer-inject/91-extension-rpc.js", import.meta.url), "utf8");
+const service = readFileSync(new URL("../../../assets/inject/renderer-inject/30-service-tier.js", import.meta.url), "utf8");
+const provider = service.slice(0, service.indexOf("  function codexManagedSessionConnection("));
 const bundle = readFileSync(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
 const rpcStart = bundle.indexOf(fragment);
 assert.notEqual(rpcStart, -1, "the generated bundle must contain the installed RPC fragment");
@@ -39,7 +41,7 @@ function installedCapnweb() {
   return cap;
 }
 
-function runtime() {
+function runtime(actualRecovery = false) {
   const cap = installedCapnweb();
   const { port1, port2 } = new MessageChannel();
   const proto = MessagePort.prototype;
@@ -48,10 +50,15 @@ function runtime() {
   const frames: { side: string; frame: any }[] = [];
   const calls: any[] = [];
   const failures: string[] = [];
-  const settings = { providerSyncEnabled: true };
+  const settings: any = { providerSyncEnabled: true, relayProfilesEnabled: true, activeRelayId: "relay",
+    relayProfiles: [{ id: "codex-plus-gateway", relayMode: "pureApi", configContents: 'model_provider = "custom"' }] };
   const state = { active: false, prepares: 0, started: 0, dispatches: 0, leases: 0,
     discoveries: 0, failAt: 0, waitAt: 0, wait: null as Promise<void> | null,
     contextEnabled: false, contextFailure: "", contextCalls: 0,
+    contextWaitAt: 0, contextWait: null as Promise<void> | null,
+    gatewayActive: true, gatewayGeneration: "initial", gatewayReads: 0,
+    loaded: true, resumeState: "resumed", unloads: 0, resumes: 0,
+    resumeWait: null as Promise<void> | null,
     replay: null as (() => Promise<void>) | null, candidates: [] as any[], params: [] as any[],
     candidate: (value: any, _intent: string) => value,
     middleware: async (value: any) => value };
@@ -76,6 +83,7 @@ function runtime() {
       try {
         await added?.("added");
         if (state.active) {
+          // This fixture explicitly replays the callback; the native server queue does not.
           const retained = prepare.dup();
           state.replay = async () => {
             try {
@@ -95,18 +103,38 @@ function runtime() {
   class Manager extends cap.TF {
     subscribe() { return undefined; }
     getTurnCoordinator() { return coordinator; }
-    async sendRequest(method: string, params: any) {
-      calls.push({ method, params });
-      if (method === "thread/read") return { thread: { status: { type: state.active ? "active" : "idle" } } };
+    getConversation() {
+      return { modelProvider: "custom", resumeState: state.resumeState,
+        threadRuntimeStatus: { type: state.active ? "active" : "idle" } };
+    }
+    unsubscribeInactiveConversation() {
+      assert.equal(state.active, false);
+      state.unloads++;
+      state.loaded = false;
+      state.resumeState = "needs_resume";
+    }
+    async sendRequest(method: string, params: any, options: any) {
+      calls.push({ method, params, options });
+      if (method === "thread/read") return { thread: { modelProvider: "custom", cwd: "C:/fixture",
+        model: "saved-model", reasoningEffort: "medium",
+        status: { type: state.active ? "active" : state.loaded ? "idle" : "notLoaded" } } };
       if (method === "config/read") return { config: { model_provider: "custom" } };
+      if (method === "thread/turns/list") return { data: [{}] };
+      if (method === "thread/unsubscribe") { state.unloads++; state.loaded = false; return {}; }
+      if (method === "thread/resume") {
+        state.resumes++;
+        await state.resumeWait;
+        state.loaded = true;
+        return { modelProvider: "custom" };
+      }
       return "pong";
     }
     resumeThread(params: any) { return params; }
   }
   cap.ab(port2, new Manager());
   const client = cap.ab(port1);
-  const window: any = { MessagePort, MessageEvent };
-  const align = async (params: any, hostId: string, sendRequest: any, host: any) => {
+  const window: any = { MessagePort, MessageEvent, __codexPlusGatewayInitialGeneration: "initial" };
+  const mockedAlign = async (params: any, hostId: string, sendRequest: any, host: any) => {
     assert.equal(hostId, "local");
     assert.equal(host, client);
     const index = ++state.prepares;
@@ -117,12 +145,25 @@ function runtime() {
     if (index === state.failAt) throw new TypeError("LOCAL_PROVIDER_PREPARE_FAILED");
     return null;
   };
+  const recovery = new Function("window", "codexPlusBackendSettings", "codexModelCatalog", "sendCodexPlusDiagnostic",
+    "postJson", "readCodexAppServerPreparation", "codexAppServerPreparationTimeoutMs", `${provider}
+      return { align: prepareCodexThreadProviderResume, enabled: codexGatewayRecoveryEnabled,
+        gateway: codexGatewayConnectionGeneration, preparations: codexThreadProviderPreparations };`)(
+    window, settings, {}, () => {}, () => assert.fail("same-provider recovery must not update the index"),
+    async () => {
+      state.gatewayReads++;
+      return { status: "ok", active: state.gatewayActive, generation: state.gatewayGeneration };
+    }, 2000);
+  const align = actualRecovery ? recovery.align : mockedAlign;
   const install = (source = rpc) => new Function("window", "codexPlusBackendSettings",
-    "prepareCodexThreadProviderResume", "codexPlusAppServerClient", "codexPlusExtensionListeners",
+    "prepareCodexThreadProviderResume", "codexThreadProviderPreparations",
+    "codexGatewayRecoveryEnabled", "codexGatewayConnectionGeneration",
+    "codexPlusAppServerClient", "codexPlusExtensionListeners",
     "codexPlusExtensionInterceptors", "codexPlusMarkExtensionFailure", "showToast",
     "codexPlusRunWaterfall", "runCodexPlusExtensionCallback", "codexPerModelContextEnabled",
     "refreshCodexThreadModelBeforeTurn", source)(
-    window, settings, align, async () => { state.discoveries++; return client; }, listeners, interceptors,
+    window, settings, align, recovery.preparations, recovery.enabled, recovery.gateway,
+    async () => { state.discoveries++; return client; }, listeners, interceptors,
     (_key: string, message: string) => failures.push(message), () => {},
     (_name: string, value: any) => state.middleware(value),
     (_key: string, _name: string, callback: () => any) => ({ ok: true, value: callback() }),
@@ -133,6 +174,7 @@ function runtime() {
       state.contextCalls++;
       calls.push({ context: state.contextCalls, params });
       await sendRequest("context-check", { threadId: params.threadId });
+      if (state.contextCalls === state.contextWaitAt) await state.contextWait;
       if (state.contextFailure) throw new Error(state.contextFailure);
     });
   const subscribe = (hostId = "local") => client.subscribe({ key: { hostId } });
@@ -168,6 +210,22 @@ function runtime() {
 }
 
 describe("installed Capnweb prepared turn provider gate", { skip: !existsSync(asarPath), timeout: 10000 }, () => {
+  it("keeps direct turns independent of native client discovery when provider sync is off", async () => {
+    const env = runtime(true);
+    try {
+      env.settings.providerSyncEnabled = false;
+      env.state.gatewayActive = false;
+      env.install();
+      await env.subscribe();
+      const result = env.send(await env.client.getTurnCoordinator());
+      assert.equal(await result.promise, "thread");
+      assert.equal(env.state.gatewayReads, 1);
+      assert.equal(env.state.discoveries, 0);
+      assert.equal(env.state.started, 1);
+      assert.deepEqual(env.failures, []);
+    } finally { env.close(); }
+  });
+
   it("runs provider preparation and context refresh in order before a turn", async () => {
     const env = runtime();
     try {
@@ -186,6 +244,23 @@ describe("installed Capnweb prepared turn provider gate", { skip: !existsSync(as
       await env.until(() => env.state.leases === 1);
       await env.until(() => env.window.__codexPlusRpcResumeGates.get(env.port1).pending.size === 0);
       assert.deepEqual(env.failures, []);
+    } finally { env.close(); }
+  });
+
+  it("uses the current turn collaboration mode when preparing a resume", async () => {
+    const env = runtime();
+    try {
+      env.state.candidate = (value) => {
+        value.resume.collaborationMode = { settings: { model: "old-model", reasoning_effort: "low" } };
+        value.start.request.collaborationMode = { settings: { model: "new-model", reasoning_effort: "high" } };
+        return value;
+      };
+      env.install();
+      await env.subscribe();
+      const result = env.send(await env.client.getTurnCoordinator());
+      assert.equal(await result.promise, "thread");
+      assert.deepEqual(env.calls.find((call) => call.prepare)?.params.collaborationMode,
+        { settings: { model: "new-model", reasoning_effort: "high" } });
     } finally { env.close(); }
   });
 
@@ -266,6 +341,59 @@ describe("installed Capnweb prepared turn provider gate", { skip: !existsSync(as
     } finally { release?.(); env.close(); }
   });
 
+  it("serializes concurrent provider and context preparation for the same thread", async () => {
+    const env = runtime();
+    let release!: () => void;
+    try {
+      env.state.contextEnabled = true;
+      env.state.contextWaitAt = 1;
+      env.state.contextWait = new Promise<void>((resolve) => { release = resolve; });
+      env.install();
+      await env.subscribe();
+      const coordinator = await env.client.getTurnCoordinator();
+      const first = env.send(coordinator, { model: "first" });
+      await env.until(() => env.state.contextCalls === 1);
+      const second = env.send(coordinator, { model: "second" });
+      await env.until(() => env.state.dispatches === 2);
+      assert.equal(await env.client.sendRequest("ping", {}), "pong");
+      assert.equal(env.state.prepares, 1);
+      assert.equal(env.state.started, 0);
+      release();
+      assert.deepEqual(await Promise.all([first.promise, second.promise]), ["thread", "thread"]);
+      assert.equal(env.state.prepares, 2);
+      assert.equal(env.state.contextCalls, 2);
+      assert.equal(env.state.started, 2);
+      assert.deepEqual(env.failures, []);
+    } finally { release?.(); env.close(); }
+  });
+
+  it("holds an independent matching resume until the internal resume finishes", async () => {
+    const env = runtime(true);
+    let release!: () => void;
+    try {
+      Object.assign(env.settings, { providerSyncEnabled: false, activeRelayId: "codex-plus-gateway" });
+      env.state.gatewayGeneration = "reconnected";
+      env.state.resumeWait = new Promise<void>((resolve) => { release = resolve; });
+      env.install();
+      await env.subscribe();
+      const first = env.send(await env.client.getTurnCoordinator());
+      await env.until(() => env.state.resumes === 1);
+      const second = env.client.sendRequest("thread/resume", {
+        threadId: "thread", modelProvider: "custom", model: null, config: null,
+      });
+      await env.settle();
+      await env.settle();
+      assert.equal(env.state.resumes, 1, "the independent request must wait for the internal resume");
+      release();
+      assert.equal(await first.promise, "thread");
+      await second;
+      assert.equal(env.state.resumes, 2);
+      const internal = env.calls.find((call) => call.method === "thread/resume");
+      assert.equal(Object.hasOwn(internal.options, "__codexPlusProviderResume"), false);
+      assert.deepEqual(env.failures, []);
+    } finally { release?.(); env.close(); }
+  });
+
   it("gates automatic prepare replay after an active send without another sendMessage push", async () => {
     const env = runtime();
     let release!: () => void;
@@ -292,6 +420,35 @@ describe("installed Capnweb prepared turn provider gate", { skip: !existsSync(as
         && frame?.[1]?.[2]?.[0] === "sendMessage").length, 1);
       assert.deepEqual(env.failures, []);
     } finally { release?.(); env.close(); }
+  });
+
+  it("recovers a reconnected gateway before replaying a retained preparation callback", async () => {
+    for (const ending of ["failed", "interrupted", "completed"]) {
+      const env = runtime(true);
+      try {
+        Object.assign(env.settings, { providerSyncEnabled: false, activeRelayId: "codex-plus-gateway" });
+        env.state.gatewayGeneration = `after-${ending}`;
+        env.install();
+        await env.subscribe();
+        const coordinator = await env.client.getTurnCoordinator();
+        env.state.active = true;
+        const queued = env.send(coordinator, { model: "chosen", reasoningEffort: "high" });
+        assert.equal(await queued.promise, "queued", ending);
+        assert.equal(env.state.unloads, 0, ending);
+        assert.equal(env.state.started, 0, ending);
+        env.state.active = false;
+        await env.state.replay!();
+        assert.equal(env.state.unloads, 2, ending);
+        assert.equal(env.state.resumes, 1, ending);
+        assert.equal(env.state.started, 1, ending);
+        assert.equal(env.state.dispatches, 1, ending);
+        assert.equal(env.state.candidates.at(-1).start.request.model, "chosen", ending);
+        assert.equal(env.state.candidates.at(-1).resume.reasoningEffort, "high", ending);
+        assert.equal(env.frames.filter(({ side, frame }) => side === "page"
+          && frame?.[1]?.[2]?.[0] === "sendMessage").length, 1, ending);
+        assert.deepEqual(env.failures, []);
+      } finally { env.close(); }
+    }
   });
 
   it("keeps callback failure original, imports/releases candidate exports and allows retry", async () => {
@@ -328,7 +485,7 @@ describe("installed Capnweb prepared turn provider gate", { skip: !existsSync(as
       assert.equal(env.state.prepares, 2);
       assert.equal(await env.send(env.client.getTurnCoordinator()).promise, "thread");
       assert.equal(env.state.prepares, 3);
-      assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 12);
+      assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 14);
       assert.deepEqual(env.failures, []);
     } finally { env.close(); }
   });
@@ -410,7 +567,11 @@ describe("installed Capnweb prepared turn provider gate", { skip: !existsSync(as
       const env = runtime();
       try {
         env.install();
-        if (mode === "disabled") env.settings.providerSyncEnabled = false;
+        if (mode === "disabled") {
+          env.settings.providerSyncEnabled = false;
+          env.settings.relayProfilesEnabled = false;
+          env.state.gatewayActive = false;
+        }
         env.state.candidate = (value) => {
           if (mode === "remote") value.executionHostId = "ssh";
           if (mode === "unknown") delete value.executionHostId;
@@ -422,7 +583,7 @@ describe("installed Capnweb prepared turn provider gate", { skip: !existsSync(as
         assert.equal(await env.send(coordinator).promise, "thread");
         assert.equal(env.state.prepares, 0, mode);
         assert.equal(env.state.discoveries, 0, mode);
-        assert.equal(env.window.__codexPlusRpcResumeGates.has(env.port1), false, mode);
+        assert.equal(env.window.__codexPlusRpcResumeGates.has(env.port1), mode === "disabled", mode);
         assert.deepEqual(env.failures, []);
       } finally { env.close(); }
     }
@@ -431,7 +592,7 @@ describe("installed Capnweb prepared turn provider gate", { skip: !existsSync(as
   it("shares existing gate ids on upgrade and keeps the resume path functional", async () => {
     const env = runtime();
     try {
-      env.install(rpc.replace("codexPlusRpcInterceptorVersion = 12", "codexPlusRpcInterceptorVersion = 11"));
+      env.install(rpc.replace("codexPlusRpcInterceptorVersion = 14", "codexPlusRpcInterceptorVersion = 13"));
       await env.subscribe();
       assert.deepEqual(await env.client.resumeThread({ threadId: "thread", model: null }),
         { threadId: "thread", model: null });

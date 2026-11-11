@@ -61,7 +61,9 @@ test("generated renderer installs provider RPC preparation and completes startup
     MutationObserver: class { observe() {} disconnect() {} },
     fetch: async () => ({ ok: false, text: async () => "" }),
     __codexSessionDeleteBridge: async (path: string, payload: any) => {
-      if (path === "/settings/get") return { enhancementsEnabled: true, providerSyncEnabled: true };
+      if (path === "/settings/get") return {
+        enhancementsEnabled: true, providerSyncEnabled: true,
+      };
       if (path === "/thread-provider/prepare") {
         preparations.push(payload);
         return { status: "ok" };
@@ -73,7 +75,7 @@ test("generated renderer installs provider RPC preparation and completes startup
   context.globalThis = context;
 
   new Function(...Object.keys(context), bundle)(...Object.values(context));
-  assert.equal(context.__codexPlusRpcFrameInterceptor?.version, 12);
+  assert.equal(context.__codexPlusRpcFrameInterceptor?.version, 14);
   assert.ok(context.__codexSessionDeleteObserver, "startup must install its observer after the RPC fragment");
   assert.ok(context.codexPlus, "startup must expose the extension API after the RPC fragment");
 

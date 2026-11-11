@@ -1081,7 +1081,8 @@
       const providerParams = providerRefreshFailed
         ? params
         : applyCodexRemoteSessionProviderOverride(requestMethod, params);
-      const resumeParams = await prepareCodexPureApiResume(String(method || ""), providerParams, client.hostId, providerRefreshFailed, originalSendRequest);
+      const resumeParams = await prepareCodexPureApiResume(String(method || ""), providerParams, client.hostId,
+        providerRefreshFailed, originalSendRequest, options?.__codexPlusProviderResume);
       const connectionParams = await prepareCodexManagedSessionConnection(String(method || ""),
         resumeParams, client.hostId, originalSendRequest);
       const nextParams = await prepareCodexThreadContextStart(String(method || ""), connectionParams, client.hostId);
@@ -1097,7 +1098,7 @@
       if (managedTurn) return managedTurn.result;
       const result = await sendAppServerRequestThroughExchange(client, method, nextParams,
         () => originalSendRequest(method, nextParams, options));
-      verifyCodexPureApiResumeResult(String(method || ""), nextParams, result, client.hostId);
+      await verifyCodexPureApiResumeResult(String(method || ""), nextParams, result, client.hostId);
       noteCodexManagedSessionStart(String(method || ""), nextParams, result, client.hostId);
       noteCodexThreadRuntimeContext(String(method || ""), nextParams, result, client.hostId);
       const threadState = codexThreadModelRequestState(String(method || ""), nextParams, result);
@@ -1333,7 +1334,8 @@
       const providerParams = providerRefreshFailed
         ? params
         : applyCodexRemoteSessionProviderOverride(requestMethod, params);
-      const resumeParams = await prepareCodexPureApiResume(String(method || ""), providerParams, client.hostId, providerRefreshFailed, originalSendRequest.bind(client));
+      const resumeParams = await prepareCodexPureApiResume(String(method || ""), providerParams, client.hostId,
+        providerRefreshFailed, originalSendRequest.bind(client), options?.__codexPlusProviderResume);
       // 拓展的 codex/request 中间件不在这里跑：新版 Codex 的部分请求（如 turn/start）绕过 sendRequest，
       // 直接 enqueueRequest → createRequest，所以统一挂在下面的 createRequest 上，每个请求只经过一次。
       const connectionParams = await prepareCodexManagedSessionConnection(String(method || ""),
@@ -1351,7 +1353,7 @@
       if (managedTurn) return managedTurn.result;
       const result = await sendAppServerRequestThroughExchange(client, method, nextParams,
         () => originalSendRequest.call(client, method, nextParams, options));
-      verifyCodexPureApiResumeResult(String(method || ""), nextParams, result, client.hostId);
+      await verifyCodexPureApiResumeResult(String(method || ""), nextParams, result, client.hostId);
       noteCodexManagedSessionStart(String(method || ""), nextParams, result, client.hostId);
       noteCodexThreadRuntimeContext(String(method || ""), nextParams, result, client.hostId);
       const threadState = codexThreadModelRequestState(String(method || ""), nextParams, result);
@@ -1511,7 +1513,7 @@
       void installCodexAppServerClientCapture().catch(() => {});
     }
     // 启动器平时只在模型解锁 / 会话删除开启时捕获客户端类；供应商同步或拓展需要时按需补开（每页一次）。
-    if ((extensionWantsRequests || providerSyncEnabled)
+    if ((extensionWantsRequests || providerSyncEnabled || codexGatewayRecoveryEnabled())
         && !window.__codexPlusAppServerClientClass && !window.__codexPlusExtensionRequestCaptureAsked) {
       window.__codexPlusExtensionRequestCaptureAsked = true;
       void postJson("/extensions/request-capture", {}).catch(() => {});

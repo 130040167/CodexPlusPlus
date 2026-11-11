@@ -813,12 +813,21 @@ pub fn disable_gateway_binding_full_switch(
 pub fn save_gateway_binding(
     agent: String,
     binding: AgentBinding,
+    reconnect: Option<bool>,
 ) -> CommandResult<Option<GatewayPayload>> {
     let result = (|| {
         let agent = parse_agent(&agent)?;
-        let saved = apply::enable_binding(&context(), &agent, binding)?;
+        let ctx = context();
+        let (saved, changed) = if agent == ToolId::Codex {
+            apply::enable_binding_deferred(&ctx, &agent, binding)?
+        } else {
+            (apply::enable_binding(&ctx, &agent, binding)?, false)
+        };
         if sync_resident_helper().is_none() {
             anyhow::bail!("网关绑定已写入，但本地网关没能启动，请查看诊断日志");
+        }
+        if agent == ToolId::Codex && (changed || reconnect.unwrap_or(false)) {
+            codex_plus_core::gateway::connection_generation::publish(&ctx.codex_home)?;
         }
         Ok(saved)
     })();
@@ -899,6 +908,15 @@ pub fn rotate_gateway_token(agent: String) -> CommandResult<Option<GatewayPayloa
             Ok(binding.clone())
         })?;
         if binding.enabled {
+            if agent == ToolId::Codex {
+                let ctx = context();
+                let (saved, _) = apply::enable_binding_deferred(&ctx, &agent, binding)?;
+                if sync_resident_helper().is_none() {
+                    anyhow::bail!("网关 token 已更换，但本地网关没能启动，请查看诊断日志");
+                }
+                codex_plus_core::gateway::connection_generation::publish(&ctx.codex_home)?;
+                return Ok(saved);
+            }
             return apply::enable_binding(&context(), &agent, binding);
         }
         Ok(gateway)

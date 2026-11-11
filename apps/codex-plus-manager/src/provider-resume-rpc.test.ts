@@ -16,10 +16,17 @@ function runtime() {
   const toasts: string[] = [];
   const failures: string[] = [];
   const settings: any = { providerSyncEnabled: true, relayProfilesEnabled: true, activeRelayId: "relay",
-    relayProfiles: [{ id: "relay", relayMode: "pureApi", configContents: 'model_provider = "custom"' }] };
+    relayProfiles: [
+      { id: "relay", relayMode: "pureApi", configContents: 'model_provider = "custom"' },
+      { id: "codex-plus-gateway", relayMode: "pureApi", configContents: 'model_provider = "custom"' },
+    ] };
   const state = { status: "notLoaded", source: "openai", target: "custom", cached: null as any,
-    failure: null as Error | null, bridgeFailure: "", discoveries: 0, disposals: 0,
-    wait: null as Promise<void> | null, afterRead: () => {}, afterPrepare: () => {} };
+    failure: null as Error | null, bridgeFailure: "", discoveries: 0, disposals: 0, gatewayReads: 0,
+    wait: null as Promise<void> | null, afterRead: () => {}, afterPrepare: () => {}, onDiscover: () => {},
+    gateway: { active: true, generation: "initial" }, turns: 1, turnsError: null as Error | null,
+    model: "saved-model", effort: "medium" as string | null, statusListener: null as any,
+    gatewayFailure: null as Error | null, configProviders: {} as Record<string, any>, openaiBaseUrl: null as string | null,
+    retainLoaded: false, rebuildOnResume: false, readsUntilUnload: 0, clock: 0, clockStep: 0 };
   const interceptors = new Map();
   let chain = async (value: any) => value;
   const acknowledgements = new Map<string, () => void>();
@@ -39,7 +46,8 @@ function runtime() {
       return true;
     }
   }
-  const window = { MessagePort, MessageEvent: PortMessageEvent } as any;
+  const window = { MessagePort, MessageEvent: PortMessageEvent,
+    __codexPlusGatewayInitialGeneration: "initial" } as any;
   const port = new MessagePort();
   const postJson = async (route: string, payload: any) => {
     assert.equal(route, "/thread-provider/prepare");
@@ -50,11 +58,18 @@ function runtime() {
     }
     return state.bridgeFailure ? { status: "failed", message: state.bridgeFailure } : { status: "ok" };
   };
-  const api = new Function("codexPlusBackendSettings", "codexModelCatalog", "sendCodexPlusDiagnostic",
-    "postJson", "codexAppServerPreparationTimeoutMs", `${provider}
+  const api = new Function("window", "codexPlusBackendSettings", "codexModelCatalog", "sendCodexPlusDiagnostic",
+    "postJson", "readCodexAppServerPreparation", "codexAppServerPreparationTimeoutMs", "Date", `${provider}
       return { prepare: prepareCodexPureApiResume, align: prepareCodexThreadProviderResume,
+        verify: verifyCodexPureApiResumeResult, enabled: codexGatewayRecoveryEnabled,
+        gateway: codexGatewayConnectionGeneration,
         preparations: codexThreadProviderPreparations };`)(
-    settings, {}, () => {}, postJson, 2000);
+    window, settings, {}, () => {}, postJson, async (route: string) => {
+      assert.equal(route, "/gateway/connection-generation");
+      state.gatewayReads++;
+      if (state.gatewayFailure) throw state.gatewayFailure;
+      return { status: "ok", ...state.gateway };
+    }, 2000, { now: () => (state.clock += state.clockStep) });
   const subscribe = (hostId = "local", receiver = -19, target = port) =>
     target.postMessage(["push", ["pipeline", receiver, ["subscribe"], [{
       type: "notification", key: { hostId }, methods: [["thread/tokenUsage/updated"]], listener: ["export", -3],
@@ -70,27 +85,60 @@ function runtime() {
       if (state.failure) throw state.failure;
       state.afterRead();
       if (method === "thread/read") {
+        if (state.readsUntilUnload > 0 && --state.readsUntilUnload === 0) {
+          state.status = "notLoaded";
+          state.statusListener?.({ params: { threadId: params.threadId, status: { type: "notLoaded" } } });
+        }
         return { thread: { id: params.threadId, cwd: "C:/fixture",
-          status: { type: state.status }, modelProvider: state.source } };
+          status: { type: state.status }, modelProvider: state.source,
+          model: state.model, reasoningEffort: state.effort } };
       }
       if (method === "thread/unsubscribe") {
-        state.status = "notLoaded";
+        if (!state.retainLoaded) {
+          state.status = "notLoaded";
+          state.statusListener?.({ params: { threadId: params.threadId, status: { type: "notLoaded" } } });
+        }
         return { status: "ok" };
       }
       if (method === "thread/resume") {
+        if (state.rebuildOnResume) {
+          state.statusListener?.({ params: { threadId: params.threadId, status: { type: "notLoaded" } } });
+        }
         state.status = "idle";
         return { modelProvider: params.modelProvider ?? state.source,
-          thread: { id: params.threadId, modelProvider: state.source } };
+          thread: { id: params.threadId, modelProvider: state.source },
+          collaborationMode: { mode: "default", settings: {
+            model: params.model, reasoning_effort: "high", developer_instructions: null,
+          } } };
       }
+      if (method === "thread/turns/list") {
+        if (state.turnsError) throw state.turnsError;
+        return { data: Array(state.turns).fill({}) };
+      }
+      if (method === "thread/settings/update") return {};
       assert.equal(method, "config/read");
-      return { config: { model_provider: state.target } };
+      return { config: { model_provider: state.target, model_providers: state.configProviders,
+        openai_base_url: state.openaiBaseUrl } };
     },
     async getConversation(conversationId: string) {
       calls.push({ method: "getConversation", conversationId });
       return state.cached;
     },
+    async unsubscribeInactiveConversation(threadId: string) {
+      calls.push({ method: "unsubscribeInactiveConversation", threadId });
+      state.cached.resumeState = "needs_resume";
+      if (!state.retainLoaded) {
+        state.status = "notLoaded";
+        state.statusListener?.({ params: { threadId, status: { type: "notLoaded" } } });
+      }
+    },
     subscribe(params: any) {
       assert.equal(params.key.hostId, "local");
+      if (params.methods?.includes("thread/status/changed")) {
+        state.statusListener = params.listener;
+        return Object.assign(Promise.resolve({ [Symbol.dispose]() { state.disposals++; } }),
+          { [Symbol.dispose]() { state.disposals++; state.statusListener = null; } });
+      }
       subscribe(params.key.hostId);
       return Object.assign(Promise.resolve({ [Symbol.dispose]() { state.disposals++; } }),
         { [Symbol.dispose]() { state.disposals++; } });
@@ -99,14 +147,15 @@ function runtime() {
   const discover = async (hostId: string) => {
     assert.equal(hostId, "local");
     state.discoveries++;
+    state.onDiscover();
     return client;
   };
   const install = new Function("window", "codexPlusBackendSettings", "prepareCodexThreadProviderResume",
-    "codexThreadProviderPreparations",
+    "codexThreadProviderPreparations", "codexGatewayRecoveryEnabled", "codexGatewayConnectionGeneration",
     "codexPlusAppServerClient", "codexPlusExtensionListeners", "codexPlusExtensionInterceptors",
     "codexPlusRunWaterfall", "codexPlusMarkExtensionFailure", "showToast",
     `${rpc}\nreturn installCodexPlusRpcFrameInterceptor;`)(
-    window, settings, api.align, api.preparations, discover, new Map(), interceptors,
+    window, settings, api.align, api.preparations, api.enabled, api.gateway, discover, new Map(), interceptors,
     (_name: string, value: any) => chain(value),
     (_key: string, message: string) => failures.push(message), (message: string) => toasts.push(message));
   const settle = async () => {
@@ -115,7 +164,9 @@ function runtime() {
   };
   const release = (id = -0.25) => port.dispatchEvent(
     new PortMessageEvent("message", { data: ["release", id, 1] }));
-  return { api, settings, state, client, discover, window, port, sent, received, calls, toasts, failures,
+  const alignGateway = (params: any, sendRequest = client.sendRequest, host = client) =>
+    api.align(params, "local", sendRequest, host, undefined, { status: "ok", ...state.gateway });
+  return { api, alignGateway, settings, state, client, discover, window, port, sent, received, calls, toasts, failures,
     install, subscribe, settle, release, interceptors, setChain: (next: typeof chain) => { chain = next; } };
 }
 
@@ -125,11 +176,30 @@ function resume(method: string, params: any, callbacks: any = {}, receiver = -19
 }
 
 describe("provider resume RPC gate without context helpers", () => {
+  it("does not discover a native client for direct connections when provider sync is off", async () => {
+    for (const method of ["resumeConversation", "resumeThread", "sendRequest"]) {
+      const env = runtime();
+      env.subscribe();
+      env.settings.providerSyncEnabled = false;
+      env.state.gateway.active = false;
+      const frame = resume(method, { threadId: "thread", conversationId: "thread" });
+      env.port.postMessage(frame);
+      await env.settle();
+      assert.equal(env.state.gatewayReads, 0);
+      assert.equal(env.state.discoveries, 0);
+      assert.deepEqual(env.calls, []);
+      assert.equal(env.sent.at(-1), frame);
+    }
+  });
+
   it("passes disabled, remote, unknown and conflicting hosts through synchronously", () => {
     for (const mode of ["disabled", "remote", "unknown", "other-port", "conflicting", "envelope"]) {
       const env = runtime();
       env.subscribe(mode === "remote" ? "ssh" : "local");
-      if (mode === "disabled") env.settings.providerSyncEnabled = false;
+      if (mode === "disabled") {
+        env.settings.providerSyncEnabled = false;
+        env.settings.relayProfilesEnabled = false;
+      }
       if (mode === "conflicting") env.subscribe("ssh");
       for (const method of ["resumeConversation", "resumeThread", "sendRequest"]) {
         const params = { threadId: "thread", conversationId: "thread", model: null,
@@ -248,7 +318,7 @@ describe("provider resume RPC gate without context helpers", () => {
     env.state.bridgeFailure = "";
     env.window.__codexPlusRpcFrameInterceptor.version = 11;
     env.install();
-    assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 12);
+    assert.equal(env.window.__codexPlusRpcFrameInterceptor.version, 14);
     assert.equal(env.window.__codexPlusRpcFrameInterceptor.original, original);
     env.port.postMessage(frame);
     await env.settle();
@@ -298,6 +368,249 @@ describe("provider resume RPC gate without context helpers", () => {
 });
 
 describe("provider preparation", () => {
+  it("treats a loaded thread as unknown after page startup even when its generation matches", async () => {
+    const env = runtime();
+    env.subscribe();
+    Object.assign(env.settings, { providerSyncEnabled: false, activeRelayId: "codex-plus-gateway" });
+    Object.assign(env.state, { source: "custom", target: "custom", status: "idle",
+      cached: { modelProvider: "custom", resumeState: "resumed", threadRuntimeStatus: { type: "idle" } } });
+    await env.alignGateway({ conversationId: "thread" });
+    assert.equal(env.calls.filter(call => call.method === "unsubscribeInactiveConversation").length, 1);
+    assert.equal(env.calls.filter(call => call.method === "thread/resume").length, 1);
+  });
+
+  it("reconnects a loaded gateway session once with provider sync on or off", async () => {
+    for (const providerSyncEnabled of [false, true]) {
+      const env = runtime();
+      env.subscribe();
+      Object.assign(env.settings, { providerSyncEnabled, activeRelayId: "codex-plus-gateway" });
+      Object.assign(env.state, { source: "custom", target: "custom", status: "idle",
+        cached: { modelProvider: "custom", resumeState: "resumed", threadRuntimeStatus: { type: "idle" } } });
+      env.state.gateway.generation = "reconnected";
+      const params = { conversationId: "thread", model: "chosen", reasoningEffort: "high" };
+      const before = structuredClone(params);
+      assert.deepEqual(await env.alignGateway(params), {
+        sourceProvider: "custom", targetProvider: "custom", gatewayGeneration: "reconnected",
+      });
+      env.state.cached.resumeState = "resumed";
+      assert.equal(await env.alignGateway(params), null);
+      assert.equal(env.calls.filter(call => call.method === "unsubscribeInactiveConversation").length, 1);
+      assert.equal(env.calls.filter(call => call.method === "thread/resume").length, 1);
+      assert.deepEqual(env.calls.find(call => call.method === "thread/resume").params, {
+        threadId: "thread", modelProvider: "custom", model: "chosen",
+        config: { model_reasoning_effort: "high" },
+      });
+      assert.equal(env.calls.filter(call => call.route === "/thread-provider/prepare").length, 0);
+      assert.deepEqual(params, before);
+    }
+  });
+
+  it("retains the loaded thread model and effort when the next message does not override them", async () => {
+    const env = runtime();
+    Object.assign(env.settings, { providerSyncEnabled: false, activeRelayId: "codex-plus-gateway" });
+    Object.assign(env.state, { source: "custom", target: "custom", status: "idle",
+      cached: { modelProvider: "custom", resumeState: "resumed", threadRuntimeStatus: { type: "idle" } } });
+    env.state.gateway.generation = "reconnected";
+    await env.alignGateway({ conversationId: "thread", model: null, reasoningEffort: null });
+    assert.deepEqual(env.calls.find(call => call.method === "thread/resume").params, {
+      threadId: "thread", modelProvider: "custom", model: "saved-model",
+      config: { model_reasoning_effort: "medium" },
+    });
+  });
+
+  it("uses the selected collaboration mode when preparing a resumed turn", async () => {
+    const env = runtime();
+    Object.assign(env.settings, { providerSyncEnabled: false, activeRelayId: "codex-plus-gateway" });
+    Object.assign(env.state, { source: "custom", target: "custom", status: "idle",
+      cached: { modelProvider: "custom", resumeState: "resumed", threadRuntimeStatus: { type: "idle" } } });
+    env.state.gateway.generation = "reconnected";
+    const params = { conversationId: "thread", model: null, reasoningEffort: null,
+      collaborationMode: { settings: { model: "selected-model", reasoning_effort: "high" } } };
+    await env.alignGateway(params);
+    assert.deepEqual(env.calls.find(call => call.method === "thread/resume").params, {
+      threadId: "thread", modelProvider: "custom", model: "selected-model",
+      config: { model_reasoning_effort: "high" },
+    });
+  });
+
+  it("restores a real null effort and the selected collaboration mode after a cold resume", async () => {
+    for (const selected of [false, true]) {
+      const env = runtime();
+      env.subscribe();
+      Object.assign(env.settings, { providerSyncEnabled: false, activeRelayId: "codex-plus-gateway" });
+      Object.assign(env.state, { source: "custom", target: "custom", status: "idle",
+        effort: selected ? "high" : null,
+        cached: { modelProvider: "custom", resumeState: "resumed", threadRuntimeStatus: { type: "idle" } } });
+      const params = selected ? { conversationId: "thread", collaborationMode: { mode: "plan", settings: {
+        model: "chosen", reasoning_effort: null, developer_instructions: null,
+      } } } : { conversationId: "thread" };
+      await env.alignGateway(params);
+      assert.deepEqual(env.calls.find(call => call.method === "thread/resume").params.config, {});
+      const update = env.calls.find(call => call.method === "thread/settings/update").params;
+      assert.equal(update.collaborationMode.settings.reasoning_effort, null);
+      assert.equal(update.collaborationMode.mode, selected ? "plan" : "default");
+      assert.equal(update.collaborationMode.settings.model, selected ? "chosen" : "saved-model");
+    }
+  });
+
+  it("accepts an immediate idle rebuild only after observing notLoaded", async () => {
+    const env = runtime();
+    env.subscribe();
+    Object.assign(env.settings, { providerSyncEnabled: false, activeRelayId: "codex-plus-gateway" });
+    Object.assign(env.state, { source: "custom", target: "custom", status: "idle",
+      retainLoaded: true, rebuildOnResume: true,
+      cached: { modelProvider: "custom", resumeState: "resumed", threadRuntimeStatus: { type: "idle" } } });
+    await env.alignGateway({ conversationId: "thread" });
+    assert.equal(env.calls.filter(call => call.method === "thread/resume").length, 1);
+    assert.equal(env.calls.filter(call => call.method === "thread/unsubscribe").length, 1);
+    assert.equal(env.api.preparations.get("thread").gatewayGeneration, "initial");
+  });
+
+  it("waits for natural unload after an error before resuming", async () => {
+    const env = runtime();
+    env.subscribe();
+    Object.assign(env.settings, { providerSyncEnabled: false, activeRelayId: "codex-plus-gateway" });
+    Object.assign(env.state, { source: "custom", target: "custom", status: "systemError",
+      retainLoaded: true, readsUntilUnload: 3,
+      cached: { modelProvider: "custom", resumeState: "resumed", threadRuntimeStatus: { type: "systemError" } } });
+    await env.alignGateway({ conversationId: "thread" });
+    const methods = env.calls.map(call => call.method);
+    assert.ok(methods.lastIndexOf("thread/read") > methods.indexOf("thread/unsubscribe"));
+    assert.ok(methods.indexOf("thread/resume") > methods.lastIndexOf("thread/read"));
+    assert.equal(env.api.preparations.get("thread").gatewayGeneration, "initial");
+  });
+
+  it("rejects a successful resume that did not unload while another subscriber remains", async () => {
+    const env = runtime();
+    env.subscribe();
+    Object.assign(env.settings, { providerSyncEnabled: false, activeRelayId: "codex-plus-gateway" });
+    Object.assign(env.state, { source: "custom", target: "custom", status: "idle",
+      retainLoaded: true, clockStep: 71000,
+      cached: { modelProvider: "custom", resumeState: "resumed", threadRuntimeStatus: { type: "idle" } } });
+    await assert.rejects(env.alignGateway({ conversationId: "thread" }), /仍被占用/);
+    assert.equal(env.calls.filter(call => call.method === "thread/resume").length, 1);
+    assert.equal(env.calls.filter(call => call.method === "thread/unsubscribe").length, 2);
+    assert.equal(env.api.preparations.get("thread").gatewayGeneration, undefined);
+  });
+
+  it("checks native configuration when the gateway bridge is unavailable", async () => {
+    const env = runtime();
+    env.state.gatewayFailure = new Error("bridge unavailable");
+    env.state.gateway.active = false;
+    assert.deepEqual(await env.api.gateway(env.client.sendRequest), { active: false, generation: "" });
+    env.state.configProviders = { custom: { base_url: "http://127.0.0.1:1234/gw/codex/v1" } };
+    await assert.rejects(env.api.gateway(env.client.sendRequest), /bridge unavailable/);
+    env.state.target = "direct";
+    env.state.configProviders.direct = { base_url: "https://direct.example/v1" };
+    assert.deepEqual(await env.api.gateway(env.client.sendRequest), { active: false, generation: "" });
+    env.state.target = "openai";
+    assert.deepEqual(await env.api.gateway(env.client.sendRequest), { active: false, generation: "" });
+    env.state.openaiBaseUrl = "http://127.0.0.1:1234/v1";
+    await assert.rejects(env.api.gateway(env.client.sendRequest), /bridge unavailable/);
+    env.state.openaiBaseUrl = "https://official.example/v1";
+    assert.deepEqual(await env.api.gateway(env.client.sendRequest), { active: false, generation: "" });
+  });
+
+  it("retains the model and effort when a direct turn requires an internal resume", async () => {
+    const env = runtime();
+    env.state.gateway.active = false;
+    env.state.status = "idle";
+    const params = { threadId: "thread", model: null, effort: null };
+    await env.api.prepare("turn/start", params, "local", false, env.client.sendRequest);
+    assert.deepEqual(env.calls.find(call => call.method === "thread/resume").params, {
+      threadId: "thread", modelProvider: "custom", model: "saved-model",
+      config: { model_reasoning_effort: "medium" },
+    });
+    assert.deepEqual(params, { threadId: "thread", model: null, effort: null });
+  });
+
+  it("notices a gateway attach before the cached active profile updates", async () => {
+    const env = runtime();
+    env.subscribe();
+    Object.assign(env.settings, { providerSyncEnabled: false, activeRelayId: "relay" });
+    Object.assign(env.state, { source: "custom", target: "custom", status: "idle",
+      cached: { modelProvider: "custom", resumeState: "resumed", threadRuntimeStatus: { type: "idle" } } });
+    env.state.gateway.generation = "just-attached";
+    assert.deepEqual(await env.alignGateway({ conversationId: "thread" }), {
+      sourceProvider: "custom", targetProvider: "custom", gatewayGeneration: "just-attached",
+    });
+    assert.equal(env.calls.filter(call => call.method === "thread/resume").length, 1);
+  });
+
+  it("keeps a changed gateway pending across active errors, queued sends and interruptions", async () => {
+    for (const ending of ["failed", "interrupted", "queued", "completed"]) {
+      const env = runtime();
+      env.subscribe();
+      Object.assign(env.settings, { providerSyncEnabled: false, activeRelayId: "codex-plus-gateway" });
+      Object.assign(env.state, { source: "custom", target: "custom", status: "active",
+        cached: { modelProvider: "custom", resumeState: "resumed", threadRuntimeStatus: { type: "active" } } });
+      env.state.gateway.generation = `after-${ending}`;
+      env.state.turnsError = new Error("thread is not materialized yet");
+      const params = { conversationId: "thread", model: "chosen", reasoningEffort: "high" };
+      assert.equal(await env.alignGateway(params), null, ending);
+      assert.equal(env.calls.some(call => call.method === "unsubscribeInactiveConversation"), false, ending);
+      assert.equal(env.calls.some(call => call.method === "thread/turns/list"), false, ending);
+      env.state.status = ending === "failed" ? "systemError" : "idle";
+      env.state.cached.threadRuntimeStatus.type = env.state.status;
+      env.state.turnsError = null;
+      assert.deepEqual(await env.alignGateway(params), {
+        sourceProvider: "custom", targetProvider: "custom", gatewayGeneration: `after-${ending}`,
+      }, ending);
+      assert.equal(env.calls.filter(call => call.method === "thread/resume").length, 1, ending);
+      assert.deepEqual(params, { conversationId: "thread", model: "chosen", reasoningEffort: "high" });
+    }
+  });
+
+  it("retries a newer gateway when reconnection happens during resume", async () => {
+    const env = runtime();
+    env.subscribe();
+    Object.assign(env.settings, { providerSyncEnabled: false, activeRelayId: "codex-plus-gateway" });
+    Object.assign(env.state, { source: "custom", target: "custom", status: "idle",
+      cached: { modelProvider: "custom", resumeState: "resumed", threadRuntimeStatus: { type: "idle" } } });
+    env.state.gateway.generation = "first";
+    let reconnectDuringResume = true;
+    const send = async (method: string, params: any, options: any) => {
+      const result = await env.client.sendRequest(method, params, options);
+      if (method === "thread/resume" && reconnectDuringResume) {
+        reconnectDuringResume = false;
+        env.state.gateway.generation = "second";
+      }
+      return result;
+    };
+    const params = { conversationId: "thread" };
+    await assert.rejects(env.alignGateway(params, send), /网关连接已变化/);
+    assert.deepEqual(await env.alignGateway(params, send), {
+      sourceProvider: "custom", targetProvider: "custom", gatewayGeneration: "second",
+    });
+    assert.equal(env.calls.filter(call => call.method === "thread/resume").length, 2);
+    assert.ok(env.calls.filter(call => call.method === "thread/unsubscribe").length >= 2);
+  });
+
+  it("leaves an unmaterialized new session to the native first turn", async () => {
+    for (const turnsError of [null, new Error("thread is not materialized yet; thread/turns/list is unavailable")]) {
+      const env = runtime();
+      env.subscribe();
+      Object.assign(env.settings, { providerSyncEnabled: false, activeRelayId: "codex-plus-gateway" });
+      Object.assign(env.state, { source: "custom", target: "custom", status: "idle", turns: 0, turnsError,
+        cached: { modelProvider: "custom", resumeState: "resumed", threadRuntimeStatus: { type: "idle" } } });
+      env.state.gateway.generation = "reconnected";
+      assert.equal(await env.alignGateway({ conversationId: "thread" }), null);
+      assert.equal(env.calls.some(call => call.method === "unsubscribeInactiveConversation"), false);
+      assert.equal(env.calls.some(call => call.method === "thread/resume"), false);
+    }
+  });
+
+  it("keeps provider synchronization disabled for a different gateway provider", async () => {
+    const env = runtime();
+    env.subscribe();
+    Object.assign(env.settings, { providerSyncEnabled: false, activeRelayId: "codex-plus-gateway" });
+    env.state.status = "idle";
+    env.state.gateway.generation = "reconnected";
+    await assert.rejects(env.alignGateway({ threadId: "thread" }, env.client.sendRequest, null as any), /开启供应商同步/);
+    assert.equal(env.calls.some(call => call.route === "/thread-provider/prepare"), false);
+    assert.equal(env.calls.some(call => call.method === "thread/unsubscribe"), false);
+  });
+
   it("switches both unloaded and idle providers in either direction without touching active turns", async () => {
     for (const [source, target] of [["openai", "custom"], ["custom", "openai"]]) {
       for (const status of ["notLoaded", "idle", "active"]) {
@@ -356,7 +669,7 @@ describe("provider preparation", () => {
     };
     const send = async (method: string, params: any, options: any) => {
       if (method === "thread/resume") {
-        assert.equal(await env.api.align(params, "local", send, host), null,
+        assert.equal(await env.api.align(params, "local", send, host, options.__codexPlusProviderResume), null,
           "The internal explicit resume must not await its own preparation lock.");
       }
       return env.client.sendRequest(method, params, options);
@@ -386,10 +699,42 @@ describe("provider preparation", () => {
     assert.equal(env.calls.filter(call => call.method === "unsubscribeInactiveConversation").length, 3);
     assert.equal(env.calls.filter(call => call.route).length, 1);
     assert.deepEqual(env.calls.filter(call => call.method === "thread/resume").map(call => call.params), [
-      { threadId: "thread", modelProvider: "openai", model: null, config: null },
-      { threadId: "thread", modelProvider: "openai", model: null, config: null },
-      { threadId: "thread", modelProvider: "custom", model: null, config: null },
+      { threadId: "thread", modelProvider: "openai", model: "saved-model", config: { model_reasoning_effort: "medium" } },
+      { threadId: "thread", modelProvider: "openai", model: "saved-model", config: { model_reasoning_effort: "medium" } },
+      { threadId: "thread", modelProvider: "custom", model: "saved-model", config: { model_reasoning_effort: "medium" } },
     ]);
+  });
+
+  it("serializes a second matching resume while an internal resume is pending", async () => {
+    const env = runtime();
+    env.state.status = "idle";
+    env.state.cached = { modelProvider: "openai", resumeState: "resumed" };
+    let release!: () => void;
+    let started!: () => void;
+    let internalParams: any;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const entered = new Promise<void>((resolve) => { started = resolve; });
+    const send = async (method: string, params: any, options: any) => {
+      if (method === "thread/resume") {
+        internalParams = structuredClone(params);
+        assert.equal(await env.api.align(params, "local", send, env.client, options.__codexPlusProviderResume), null);
+        started();
+        await pending;
+      }
+      return env.client.sendRequest(method, params, options);
+    };
+    const first = env.api.align({ conversationId: "thread" }, "local", send, env.client);
+    await entered;
+    let secondFinished = false;
+    const second = env.api.align(internalParams, "local", send, env.client).then((result: any) => {
+      secondFinished = true;
+      return result;
+    });
+    await env.settle();
+    assert.equal(secondFinished, false, "the independent resume must wait for the first");
+    release();
+    await first;
+    await second;
   });
 
   it("keeps internal resume middleware without reentering the held preparation lock", async () => {
@@ -412,8 +757,9 @@ describe("provider preparation", () => {
       && frame[1][3][0] === "thread/resume");
     assert.equal(frames.length, 1);
     assert.deepEqual(frames[0][1][3][1], {
-      threadId: "thread", modelProvider: "custom", model: null, config: { model_reasoning_effort: "high" },
+      threadId: "thread", modelProvider: "custom", model: "saved-model", config: { model_reasoning_effort: "high" },
     });
+    assert.equal(Object.hasOwn(frames[0][1][3][2], "__codexPlusProviderResume"), false);
     assert.equal(env.window.__codexPlusRpcResumeGates.has(env.port), false);
     assert.equal(env.calls.filter(call => call.route).length, 1);
   });
@@ -485,7 +831,8 @@ describe("provider preparation", () => {
     assert.equal(env.calls.filter((call) => call.method === "thread/unsubscribe").length, 1);
     assert.equal(env.calls.filter((call) => call.method === "thread/resume").length, 1);
     assert.deepEqual(env.calls.find((call) => call.method === "thread/resume").params, {
-      threadId: "thread", modelProvider: "custom", model: null, config: null,
+      threadId: "thread", modelProvider: "custom", model: "chosen",
+      config: { model_reasoning_effort: "high" },
     });
     assert(results.every((result) => result === params));
     assert.deepEqual(params, before);

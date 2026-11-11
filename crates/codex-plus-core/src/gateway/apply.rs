@@ -248,7 +248,8 @@ fn write_agent_config(
     ctx: &ApplyContext,
     agent: &ToolId,
     binding: &AgentBinding,
-) -> anyhow::Result<Option<String>> {
+    reapply: bool,
+) -> anyhow::Result<(Option<String>, bool)> {
     // 拓展声明的供应商也写进 Agent 的模型资料（只读，不落盘）。
     let gateway = ctx.gateway.load()?.with_extension_providers();
     if route::is_disabled_group_model(&gateway, &binding.model)
@@ -286,7 +287,7 @@ fn write_agent_config(
                 );
                 stash::save_stash(&claude_stash_path(ctx), file_stash)?;
             }
-            return Ok(snapshot);
+            return Ok((snapshot, false));
         }
         ToolId::Grok => {
             // 同上：Grok 的 config.toml 接入前原样存一份。
@@ -309,13 +310,13 @@ fn write_agent_config(
                 stash::save_stash(&grok_stash_path(ctx), file_stash)?;
             }
         }
-        ToolId::Codex => write_codex(ctx, &gateway, binding)?,
+        ToolId::Codex => return Ok((None, write_codex(ctx, &gateway, binding, reapply)?)),
         other => match agents::spec(other.as_str()) {
             Some(spec) => agents::connect::write(ctx, spec, &gateway, binding)?,
             None => bail!("{} 不支持网关模式", other.as_str()),
         },
     }
-    Ok(None)
+    Ok((None, false))
 }
 
 /// 开始改写一个 Agent 的配置文件前准备存档：
@@ -1499,11 +1500,13 @@ fn write_codex(
     ctx: &ApplyContext,
     gateway: &GatewaySettings,
     binding: &AgentBinding,
-) -> anyhow::Result<()> {
+    reapply: bool,
+) -> anyhow::Result<bool> {
     let mut settings = ctx.settings.load()?;
     if !settings.relay_profiles_enabled {
         bail!("Codex 的供应商配置总开关已关闭，无法接入网关：请在 Codex++ 的「供应商列表」里打开「配置切换」");
     }
+    let connection_before = codex_connection_state(&ctx.codex_home)?;
     // Codex 在 WSL 里运行：网关额外监听 WSL 网卡，地址写成它（#2773）；拿不到时保持回环。
     let wsl_host = crate::wsl_network::codex_gateway_wsl_host(&ctx.codex_home, ctx.port).address();
     // Codex 自己没登录、池里有网关登录的 ChatGPT 账号：借给 Codex，让它以官方身份接入。
@@ -1593,7 +1596,52 @@ fn write_codex(
     if let Some(provider_id) = lend {
         lend_login_to_codex(ctx, &provider_id)?;
     }
-    Ok(())
+    Ok(reapply || switching_in || connection_before != codex_connection_state(&ctx.codex_home)?)
+}
+
+fn codex_connection_state(
+    home: &std::path::Path,
+) -> anyhow::Result<(Option<Result<toml::Value, String>>, Option<Result<Value, String>>)> {
+    // 损坏的外部配置也可能由重新接入修复；保留原文作为比较值，不能让解析失败阻止修复。
+    let config = stash::read_optional(&home.join("config.toml"))?
+        .map(|text| text.parse::<toml::Value>().map_err(|_| text))
+        .map(|parsed| parsed.map(|config| {
+            let mut connection = toml::map::Map::new();
+            for key in ["model_provider", "openai_base_url", "chatgpt_base_url"] {
+                if let Some(value) = config.get(key) {
+                    connection.insert(key.to_string(), value.clone());
+                }
+            }
+            let provider = config
+                .get("model_provider")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("openai");
+            let provider = if provider == "openai" { "custom" } else { provider };
+            if let Some(table) = config.get("model_providers").and_then(|item| item.get(provider)) {
+                let mut selected = toml::map::Map::new();
+                for key in [
+                    "base_url",
+                    "wire_api",
+                    "requires_openai_auth",
+                    "experimental_bearer_token",
+                    "env_key",
+                ] {
+                    if let Some(value) = table.get(key) {
+                        selected.insert(key.to_string(), value.clone());
+                    }
+                }
+                connection.insert("provider".to_string(), toml::Value::Table(selected));
+            }
+            toml::Value::Table(connection)
+        }));
+    let auth = stash::read_optional(&home.join("auth.json"))?
+        .map(|text| serde_json::from_str::<Value>(&text).map_err(|_| text))
+        .map(|parsed| parsed.map(|auth| serde_json::json!({
+            "OPENAI_API_KEY": auth.get("OPENAI_API_KEY"),
+            "auth_mode": auth.get("auth_mode"),
+            "tokens": auth.get("tokens")
+        })));
+    Ok((config, auth))
 }
 
 /// 开启（或更新）一个 Agent 的网关绑定，并把它的配置指向网关。
@@ -1602,8 +1650,29 @@ fn write_codex(
 pub fn enable_binding(
     ctx: &ApplyContext,
     agent: &ToolId,
-    mut binding: AgentBinding,
+    binding: AgentBinding,
 ) -> anyhow::Result<GatewaySettings> {
+    let (gateway, changed) = enable_binding_inner(ctx, agent, binding)?;
+    if changed {
+        crate::gateway::connection_generation::publish(&ctx.codex_home)?;
+    }
+    Ok(gateway)
+}
+
+/// 返回连接是否变化，由调用方在 helper 成功启动后发布连接代际。
+pub fn enable_binding_deferred(
+    ctx: &ApplyContext,
+    agent: &ToolId,
+    binding: AgentBinding,
+) -> anyhow::Result<(GatewaySettings, bool)> {
+    enable_binding_inner(ctx, agent, binding)
+}
+
+fn enable_binding_inner(
+    ctx: &ApplyContext,
+    agent: &ToolId,
+    mut binding: AgentBinding,
+) -> anyhow::Result<(GatewaySettings, bool)> {
     let gateway = ctx.gateway.load()?;
     ensure_routable(&gateway, &binding)?;
     let previous = gateway.binding(agent).cloned();
@@ -1640,7 +1709,8 @@ pub fn enable_binding(
     binding.enabled = true;
     binding.restore.applied_port = Some(ctx.port);
     binding.restore.restored_endpoint = None;
-    if let Some(snapshot) = write_agent_config(ctx, agent, &binding)?
+    let (snapshot, changed) = write_agent_config(ctx, agent, &binding, false)?;
+    if let Some(snapshot) = snapshot
         && binding.restore.claude_previous_provider_id.is_empty()
     {
         binding.restore.claude_previous_provider_id = snapshot;
@@ -1650,7 +1720,7 @@ pub fn enable_binding(
         gateway.bindings.insert(agent.as_str().to_string(), binding);
         Ok(())
     })?;
-    Ok(gateway)
+    Ok((gateway, changed))
 }
 
 /// 关闭一个 Agent 的网关绑定，把它的配置恢复成直连。绑定本身（目标、模型）保留，方便再次开启。
@@ -2226,7 +2296,9 @@ pub fn sync_codex_identity(ctx: &ApplyContext) -> anyhow::Result<bool> {
     if keeps_login == can_sign_in && image_config_matches {
         return Ok(false);
     }
-    write_codex(ctx, &gateway, &binding.clone())?;
+    if write_codex(ctx, &gateway, &binding.clone(), false)? {
+        crate::gateway::connection_generation::publish(&ctx.codex_home)?;
+    }
     Ok(true)
 }
 
@@ -2274,7 +2346,9 @@ pub fn sync_codex_wsl_endpoint(ctx: &ApplyContext) -> anyhow::Result<bool> {
         );
         return Ok(false);
     }
-    write_codex(ctx, &gateway, &binding)?;
+    if write_codex(ctx, &gateway, &binding, false)? {
+        crate::gateway::connection_generation::publish(&ctx.codex_home)?;
+    }
     Ok(true)
 }
 
@@ -2300,7 +2374,7 @@ pub fn reapply_if_port_changed(ctx: &ApplyContext) -> anyhow::Result<usize> {
         };
         let mut binding = binding.clone();
         binding.restore.applied_port = Some(ctx.port);
-        let result = write_agent_config(ctx, &agent, &binding).and_then(|_| {
+        let result = write_agent_config(ctx, &agent, &binding, false).and_then(|(_, changed)| {
             // 写配置时可能改过 gateway.json：只更新本次成功项，不回写旧快照。
             ctx.gateway.update(|latest| {
                 if let Some(target) = latest.bindings.get_mut(agent.as_str()) {
@@ -2308,6 +2382,9 @@ pub fn reapply_if_port_changed(ctx: &ApplyContext) -> anyhow::Result<usize> {
                 }
                 Ok(())
             })?;
+            if changed {
+                crate::gateway::connection_generation::publish(&ctx.codex_home)?;
+            }
             Ok(())
         });
         match result {
@@ -2394,7 +2471,13 @@ pub fn refresh_enabled(ctx: &ApplyContext) -> anyhow::Result<usize> {
         if taken_over(ctx, &agent).is_some() {
             continue;
         }
-        match write_agent_config(ctx, &agent, binding) {
+        let result = write_agent_config(ctx, &agent, binding, false).and_then(|(_, changed)| {
+            if changed {
+                crate::gateway::connection_generation::publish(&ctx.codex_home)?;
+            }
+            Ok(())
+        });
+        match result {
             Ok(_) => count += 1,
             Err(error) => {
                 first_error.get_or_insert(error.context(format!("刷新 {} 失败", agent.as_str())));
@@ -2481,7 +2564,8 @@ fn reapply_binding(
             binding.restore.codex_previous_relay_id = current;
         }
     }
-    if let Some(snapshot) = write_agent_config(ctx, agent, &binding)?
+    let (snapshot, changed) = write_agent_config(ctx, agent, &binding, true)?;
+    if let Some(snapshot) = snapshot
         && binding.restore.claude_previous_provider_id.is_empty()
     {
         binding.restore.claude_previous_provider_id = snapshot;
@@ -2490,6 +2574,9 @@ fn reapply_binding(
         latest.bindings.insert(agent.as_str().to_string(), binding);
         Ok(())
     })?;
+    if changed {
+        crate::gateway::connection_generation::publish(&ctx.codex_home)?;
+    }
     Ok(true)
 }
 

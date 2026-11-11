@@ -21,7 +21,7 @@
    *   - `agent/request`：params `{ agent, turn, step, signal }`，返回 `{ provider, model, reasoningEffort }`。
    * 同一条用户消息只跑一次这两条链（按 clientUserMessageId 缓存），结果套用到它的所有候选帧上。
    */
-  const codexPlusRpcInterceptorVersion = 12;
+  const codexPlusRpcInterceptorVersion = 14;
   const codexPlusRpcMiddlewareTimeoutMs = 5000;
   const codexPlusRpcOpaque = Symbol("codexPlusRpcOpaque");
   const codexPlusRpcSourceItem = Symbol("codexPlusRpcSourceItem");
@@ -34,6 +34,22 @@
   const codexPlusRpcTurnCacheLimit = 64;
   const codexPlusRpcHostReceivers = window.__codexPlusRpcHostReceivers
     ||= new WeakMap();
+  const codexPlusRpcTurnPreparations = window.__codexPlusRpcTurnPreparations ||= new Map();
+
+  async function codexPlusRpcSerializeTurn(threadId, prepare) {
+    if (typeof threadId !== "string" || !threadId) return prepare();
+    const previous = codexPlusRpcTurnPreparations.get(threadId);
+    let release;
+    const tail = new Promise((resolve) => { release = resolve; });
+    codexPlusRpcTurnPreparations.set(threadId, tail);
+    await previous;
+    try {
+      return await prepare();
+    } finally {
+      if (codexPlusRpcTurnPreparations.get(threadId) === tail) codexPlusRpcTurnPreparations.delete(threadId);
+      release();
+    }
+  }
 
   function codexPlusRpcContextEnabled() {
     return typeof codexPerModelContextEnabled === "function" && codexPerModelContextEnabled();
@@ -352,21 +368,32 @@
     const method = expr[2][0];
     const index = method === "sendRequest" ? 1 : 0;
     if (hostId !== "local" || typeof prepareCodexThreadProviderResume !== "function"
-        || !codexPlusBackendSettings.providerSyncEnabled
         || (method === "sendRequest" && expr[3][0] !== "thread/resume")
         || !codexPlusRpcIsPlainObject(expr[3][index])) return plan;
     if ([expr[3][index].hostId, expr[3][index].host_id]
         .some((host) => typeof host === "string" && host !== "local")) return plan;
     // 在中间件改写前识别内部恢复；它已持有会话准备锁，不能再次排队等待自己。
     const original = expr[3][index];
-    if (method === "sendRequest" && typeof codexThreadProviderPreparations !== "undefined"
-        && original.modelProvider && original.model === null && original.config === null
-        && Object.keys(original).length === 4
-        && codexThreadProviderPreparations.get(original.threadId)?.resuming === original.modelProvider) return plan;
+    const preparation = typeof codexThreadProviderPreparations !== "undefined"
+      ? codexThreadProviderPreparations.get(original.threadId || original.conversationId) : null;
+    const resuming = preparation?.resuming;
+    if (method === "sendRequest" && resuming && expr[3][2]?.__codexPlusProviderResume === resuming) {
+      const inner = plan;
+      return async (signal) => {
+        expr[3][2] = { ...expr[3][2] };
+        delete expr[3][2].__codexPlusProviderResume;
+        return inner ? inner(signal) : null;
+      };
+    }
+    if (!codexPlusBackendSettings.providerSyncEnabled && !preparation?.tail) return plan;
     plan ||= async () => null;
     plan.resumeIndex = index;
     plan.before = async (wireParams, dataOnly) => {
       const params = codexPlusRpcDecode(wireParams);
+      if (!codexPlusBackendSettings.providerSyncEnabled) {
+        await preparation.tail;
+        return wireParams;
+      }
       const client = await codexPlusAppServerClient(hostId);
       const prepared = await prepareCodexThreadProviderResume(params, hostId,
         (method, params, options) => client.sendRequest(method, params, options), client);
@@ -398,7 +425,9 @@
     const refreshContext = hasStart && value.executionHostId === "local" && codexPlusRpcContextEnabled();
     if (!hasStart && !hasSteer) return null;
     const prepareProvider = typeof prepareCodexThreadProviderResume === "function"
-      && codexPlusBackendSettings.providerSyncEnabled && value.executionHostId === "local"
+      && (codexPlusBackendSettings.providerSyncEnabled
+        || (hasStart && typeof codexGatewayConnectionGeneration === "function"))
+      && value.executionHostId === "local"
       && codexPlusRpcIsPlainObject(value.resume)
       && typeof value.conversationId === "string" && value.conversationId === value.resume.conversationId
       && (value.start?.request?.threadId === undefined || value.start.request.threadId === value.conversationId);
@@ -469,13 +498,25 @@
               && candidate.start.request.threadId !== conversationId)) return conversationId;
         const decoded = codexPlusRpcDecode(candidate);
         const params = { ...decoded.resume };
+        if (decoded.start?.request?.collaborationMode != null) {
+          params.collaborationMode = decoded.start.request.collaborationMode;
+        }
         const provider = decoded.resume.modelProvider
           ?? decoded.resume.model_provider ?? decoded.resume.config?.model_provider
           ?? decoded.steer?.restoreMessage?.submissionOptions?.modelProvider;
         if (provider !== undefined) params.modelProvider = provider;
-        const client = await codexPlusAppServerClient("local");
-        await prepareCodexThreadProviderResume(params, "local",
-          (method, params, options) => client.sendRequest(method, params, options), client);
+        let client;
+        const sendRequest = async (method, requestParams, options) => {
+          client ||= await codexPlusAppServerClient("local");
+          return client.sendRequest(method, requestParams, options);
+        };
+        let gateway = hasStart && typeof codexGatewayConnectionGeneration === "function"
+          ? await codexGatewayConnectionGeneration(sendRequest, params.cwd) : null;
+        if (!codexPlusBackendSettings.providerSyncEnabled && !gateway?.active) return conversationId;
+        client ||= await codexPlusAppServerClient("local");
+        if (gateway?.active) gateway = await codexGatewayConnectionGeneration(sendRequest, params.cwd);
+        if (!codexPlusBackendSettings.providerSyncEnabled && !gateway?.active) return conversationId;
+        await prepareCodexThreadProviderResume(params, "local", sendRequest, client, null, gateway);
         return conversationId;
       };
     }
@@ -630,10 +671,13 @@
               : ["push", [...expr.slice(0, 3), args, ...expr.slice(4)], ...next.slice(2)], ...rest);
             // 先释放整个发送队列，再让预检经同一端口发出。
             void state.done.then(async () => {
-              if (!gates.pending.has(id)) return params;
-              const prepared = await plan.before(params, dataOnly, resolving ? next[2] : args);
-              if (deferContext && gates.pending.has(id)) await plan.context(next);
-              return prepared;
+              const prepare = async () => {
+                if (!gates.pending.has(id)) return params;
+                const prepared = await plan.before(params, dataOnly, resolving ? next[2] : args);
+                if (deferContext && gates.pending.has(id)) await plan.context(next);
+                return prepared;
+              };
+              return resolving ? codexPlusRpcSerializeTurn(next[2].conversationId, prepare) : prepare();
             }).then(
               (prepared) => {
                 if (gates.pending.has(id)) original.call(port, ["resolve", id, dataOnly ? prepared : ["undefined"]]);
@@ -705,7 +749,8 @@
         const port = this;
         void (async () => {
           if (state) await state.done;
-          const replaced = await codexPlusRpcRunPlan(plan, message);
+          const replaced = await codexPlusRpcSerializeTurn(message[2]?.conversationId,
+            () => codexPlusRpcRunPlan(plan, message));
           original.call(port, replaced || message, ...rest);
         })().catch((error) => {
           codexPlusMarkExtensionFailure("", `rpc 帧发送失败：${String(error?.message || error)}`);

@@ -478,6 +478,96 @@ fn codex_enable_switches_to_managed_gateway_profile_and_disable_switches_back() 
     assert_eq!(binding.restore.codex_previous_relay_id, "direct");
 }
 
+#[test]
+fn codex_connection_generation_tracks_connection_writes_without_catalog_noise() {
+    use codex_plus_core::gateway::connection_generation;
+
+    let fixture = fixture(57395);
+    let ctx = &fixture.ctx;
+    seed_direct_with_user_root_settings(ctx);
+    assert_eq!(connection_generation::read(&ctx.codex_home).unwrap(), "");
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let first = connection_generation::read(&ctx.codex_home).unwrap();
+    uuid::Uuid::parse_str(&first).unwrap();
+
+    refresh_enabled(ctx).unwrap();
+    assert_eq!(connection_generation::read(&ctx.codex_home).unwrap(), first);
+    let mut changed_model = binding();
+    changed_model.model = "deepseek-v4-flash".into();
+    enable_binding(ctx, &ToolId::Codex, changed_model.clone()).unwrap();
+    assert_eq!(connection_generation::read(&ctx.codex_home).unwrap(), first);
+
+    let mut moved = ctx.clone();
+    moved.port += 1;
+    assert_eq!(reapply_if_port_changed(&moved).unwrap(), 1);
+    let port_generation = connection_generation::read(&ctx.codex_home).unwrap();
+    assert_ne!(port_generation, first);
+
+    let path = ctx.codex_home.join("config.toml");
+    let live = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, live.replace("/gw/codex/v1", "/external/v1")).unwrap();
+    enable_binding(&moved, &ToolId::Codex, changed_model).unwrap();
+    let restored = connection_generation::read(&ctx.codex_home).unwrap();
+    assert_ne!(restored, port_generation);
+
+    assert_eq!(codex_plus_core::gateway::apply::reapply_enabled(&moved).unwrap(), 1);
+    let reapply = connection_generation::read(&ctx.codex_home).unwrap();
+    assert_ne!(reapply, restored);
+    assert_eq!(connection_generation::read(&fixture._temp.path().join("other-home")).unwrap(), "");
+}
+
+#[test]
+fn codex_connection_generation_serializes_concurrent_publications() {
+    use codex_plus_core::gateway::connection_generation;
+
+    let temp = tempfile::tempdir().unwrap();
+    let threads: Vec<_> = (0..8).map(|_| {
+        let home = temp.path().to_path_buf();
+        std::thread::spawn(move || connection_generation::publish(&home).unwrap())
+    }).collect();
+    let generations: std::collections::HashSet<_> =
+        threads.into_iter().map(|thread| thread.join().unwrap()).collect();
+    assert_eq!(generations.len(), 8);
+    assert!(generations.contains(&connection_generation::read(temp.path()).unwrap()));
+}
+
+#[test]
+fn codex_connection_generation_allows_reconnect_from_invalid_external_config() {
+    use codex_plus_core::gateway::connection_generation;
+
+    let fixture = fixture(57395);
+    let ctx = &fixture.ctx;
+    seed_direct_with_user_root_settings(ctx);
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let first = connection_generation::read(&ctx.codex_home).unwrap();
+    std::fs::write(ctx.codex_home.join("config.toml"), "model_provider = [").unwrap();
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    assert_ne!(connection_generation::read(&ctx.codex_home).unwrap(), first);
+    assert!(codex_config(ctx).contains("/gw/codex/v1"));
+}
+
+#[test]
+fn codex_connection_generation_waits_for_explicit_reconnect_publication() {
+    use codex_plus_core::gateway::connection_generation;
+
+    let fixture = fixture(57395);
+    let ctx = &fixture.ctx;
+    seed_direct_with_user_root_settings(ctx);
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let first = connection_generation::read(&ctx.codex_home).unwrap();
+    std::fs::write(ctx.codex_home.join("config.toml"), "model_provider = [").unwrap();
+    let (_, changed) = codex_plus_core::gateway::apply::enable_binding_deferred(ctx, &ToolId::Codex, binding()).unwrap();
+    assert!(changed);
+    assert!(codex_config(ctx).contains("/gw/codex/v1"));
+    assert_eq!(connection_generation::read(&ctx.codex_home).unwrap(), first);
+    let second = connection_generation::publish(&ctx.codex_home).unwrap();
+    assert_ne!(second, first);
+    let (_, changed) = codex_plus_core::gateway::apply::enable_binding_deferred(ctx, &ToolId::Codex, binding()).unwrap();
+    assert!(!changed);
+    assert_eq!(connection_generation::read(&ctx.codex_home).unwrap(), second);
+    assert_ne!(connection_generation::publish(&ctx.codex_home).unwrap(), second);
+}
+
 /// 网关模式给 Codex 的模型目录与直连模式的按模型聚合一样：显示名、推理档位、按供应商分组，
 /// 模型组单独一组。没有内置元数据的模型（第三方的 claude-*）也要有推理档位。
 #[test]
@@ -851,6 +941,8 @@ fn codex_gateway_endpoint_returns_to_loopback_outside_wsl() {
     seeded.relay_profiles_enabled = true;
     ctx.settings.save(&seeded).unwrap();
     enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let initial_generation =
+        codex_plus_core::gateway::connection_generation::read(&ctx.codex_home).unwrap();
     let loopback = "127.0.0.1:57398/gw/codex/v1";
     let config_path = ctx.codex_home.join("config.toml");
     assert!(
@@ -881,6 +973,10 @@ fn codex_gateway_endpoint_returns_to_loopback_outside_wsl() {
     );
 
     assert!(sync_codex_wsl_endpoint(ctx).unwrap());
+    assert_ne!(
+        codex_plus_core::gateway::connection_generation::read(&ctx.codex_home).unwrap(),
+        initial_generation
+    );
     let config = std::fs::read_to_string(&config_path).unwrap();
     assert!(config.contains(loopback), "{config}");
     assert!(!config.contains("172.29.16.1"), "{config}");
@@ -933,6 +1029,8 @@ fn signed_in_codex_keeps_its_chatgpt_identity_through_the_gateway() {
     .unwrap();
 
     enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let initial_generation =
+        codex_plus_core::gateway::connection_generation::read(&ctx.codex_home).unwrap();
     let config = std::fs::read_to_string(ctx.codex_home.join("config.toml")).unwrap();
     assert!(config.contains("model_provider = \"openai\""), "{config}");
     assert!(config.contains("openai_base_url"), "{config}");
@@ -963,6 +1061,10 @@ fn signed_in_codex_keeps_its_chatgpt_identity_through_the_gateway() {
     )
     .unwrap();
     assert!(codex_plus_core::gateway::apply::sync_codex_identity(ctx).unwrap());
+    assert_ne!(
+        codex_plus_core::gateway::connection_generation::read(&ctx.codex_home).unwrap(),
+        initial_generation
+    );
     assert_eq!(
         ctx.settings.load().unwrap().active_relay_session_provider(),
         codex_plus_core::settings::RelaySessionProvider::Custom
@@ -2935,6 +3037,8 @@ fn codex_startup_upgrades_image_registration_without_a_port_change_or_resave() {
     seeded.relay_profiles_enabled = true;
     ctx.settings.save(&seeded).unwrap();
     enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let initial_generation =
+        codex_plus_core::gateway::connection_generation::read(&ctx.codex_home).unwrap();
     let original = ctx.gateway.load().unwrap().binding(&ToolId::Codex).unwrap().clone();
     let (_, image_id) = create_provider(
         &ctx.gateway,
@@ -2961,6 +3065,10 @@ fn codex_startup_upgrades_image_registration_without_a_port_change_or_resave() {
     assert_eq!(reapply_if_port_changed(ctx).unwrap(), 0);
 
     assert!(codex_plus_core::gateway::apply::sync_codex_identity(ctx).unwrap());
+    assert_eq!(
+        codex_plus_core::gateway::connection_generation::read(&ctx.codex_home).unwrap(),
+        initial_generation
+    );
     assert!(codex_config(ctx).contains("codex-plus-gateway-image-generation"));
     assert!(codex_config(ctx).contains("http://127.0.0.1:57377/gw/codex/v1"));
     let refreshed = ctx.gateway.load().unwrap().binding(&ToolId::Codex).unwrap().clone();
