@@ -174,7 +174,7 @@ Codex++ 是 AI 编程 Agent 的统一管理应用，构建于万物皆拓展的�
   </tr>
   <tr>
     <td valign="top"><strong>🖱️ Computer Use 共享</strong><br>把 Codex 的桌面与浏览器控制接给其他 Agent。</td>
-    <td valign="top"><strong>🤝 子 Agent 协作</strong><br>在 Codex 对话里委派 DeepSeek、Claude Code，可排队并发。</td>
+    <td valign="top"><strong>🤝 子 Agent 协作</strong><br>在 Codex 对话里委派 DeepSeek、Claude Code、Google Antigravity，可排队并发。</td>
   </tr>
   <tr>
     <td valign="top"><strong>💬 会话管理</strong><br>Codex、Claude Code、Claude Desktop、Grok 的会话放在一起；删除撤销、导出、<a href="docs/turn-rewind.md">轮次回退</a>。</td>
@@ -401,6 +401,8 @@ Codex++ 是 AI 编程 Agent 的统一管理应用，构建于万物皆拓展的�
 | **直连 · 聚合供应商** | **故障转移**：多个供应商之间失败切换与轮转。**模型聚合**：带 `cpx-供应商ID/模型名` 前缀的模型固定发往对应成员。 |
 
 Codex 用哪种，在「Codex → 连接与供应商」顶部的「连接方式」里一键切换；直连供应商也能一键加进网关的供应商池。
+
+原生 Responses 上游可经普通代理或网关使用 WebSocket `response.create`，支持多轮、工具续接和命名流。客户端需启用 `supports_websockets`，上游也需支持 WS；HTTP-only 兼容路由继续使用 HTTP。[配置、能力边界与恢复方式](docs/specs/2026-11-14-responses-websocket.md)。
 
 网关里的模型名有三种写法：
 

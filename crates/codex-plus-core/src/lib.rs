@@ -20,8 +20,6 @@ pub mod cdp;
 mod claude_ion_asar;
 pub mod claude_hooks;
 pub mod claude_local_backend;
-pub mod claude_mom;
-pub mod claude_session_sync;
 pub mod claude_localization;
 pub mod codex_app_state;
 pub mod config_doctor;
@@ -82,6 +80,7 @@ pub mod ports;
 // 独立插件市场按需下载安装，不调用原生授权安装流程。
 pub mod plugin_market;
 pub mod protocol_proxy;
+pub(crate) mod responses_websocket;
 pub mod provider_import;
 pub mod proxy;
 pub mod relay_billing;

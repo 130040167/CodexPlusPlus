@@ -51,6 +51,8 @@ pub struct GatewayPoolEntry {
     pub model_windows: std::collections::BTreeMap<String, u64>,
     /// 没单独写窗口的模型用的窗口。
     pub context_window: Option<u64>,
+    /// 自动压缩阈值（窗口的百分比，按模型 + 默认值，#3100）；没设时为空。
+    pub auto_compact: codex_plus_core::gateway::store::ProviderAutoCompact,
     /// 登录得到的账号：`chatgpt` / `copilot` / `grok`；普通供应商为空。
     pub account: String,
     /// 订阅账号的套餐（如「ChatGPT Pro」「Copilot Pro+」）；普通供应商为空。
@@ -149,6 +151,8 @@ pub struct NativeAuthState {
     pub actual_label: String,
     pub accounts: Vec<NativeAuthAccount>,
     pub drift: Option<String>,
+    /// 当前连接不能应用所选身份时，提示先处理连接而非反复重启。
+    pub restart_blocked_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -246,6 +250,7 @@ fn pool_entry(
         model_prices,
         model_windows: Default::default(),
         context_window: None,
+        auto_compact: Default::default(),
         model_metadata: relay.model_metadata.clone(),
         image_models: codex_plus_core::gateway::images::provider_image_models(relay),
         account: account_kind(relay),
@@ -329,6 +334,7 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
             subscription_block_reason: codex_plus_core::gateway::quota::dispatch_decision(&gateway, &provider.relay).err().map(|blocked| blocked.message),
             model_windows: provider.model_windows.clone(),
             context_window: provider.context_window,
+            auto_compact: provider.auto_compact.clone(),
             key_rpm: provider.key_rpm,
             key_concurrency: provider.key_concurrency,
             ..pool_entry(
@@ -538,7 +544,7 @@ fn native_auth_state() -> anyhow::Result<NativeAuthState> {
             source: provider.source.clone(),
         });
     }
-    let drift = match settings.native_auth_selection.as_ref() {
+    let mut drift = match settings.native_auth_selection.as_ref() {
         Some(codex_plus_core::settings::NativeAuthSelection::None) if has_native_login => {
             Some("当前 auth 仍有登录凭据".to_string())
         }
@@ -549,6 +555,31 @@ fn native_auth_state() -> anyhow::Result<NativeAuthState> {
         }
         _ => None,
     };
+    let managed = settings.active_relay_id == apply::CODEX_GATEWAY_RELAY_ID;
+    let config = std::fs::read_to_string(home.join("config.toml")).unwrap_or_default();
+    let live_official = codex_plus_core::relay_config::relay_session_provider_from_config(&config)
+        == codex_plus_core::settings::RelaySessionProvider::Openai;
+    let blocked_reason = if let Some(selection) = settings.native_auth_selection.as_ref() {
+        let binding_enabled = gateway.binding(&ToolId::Codex).is_some_and(|binding| binding.enabled);
+        let taken_over = codex_plus_core::gateway::drift::check(&context(), &ToolId::Codex).is_some();
+        let wants_account = matches!(selection, codex_plus_core::settings::NativeAuthSelection::Account { .. });
+        native_auth_restart_blocker(managed, binding_enabled, taken_over,
+            wants_account && codex_plus_core::wsl_network::codex_runs_in_wsl(&home),
+            wants_account, live_official)
+    } else {
+        None
+    };
+    if drift.is_none() && blocked_reason.is_none()
+        && settings.active_relay_id == apply::CODEX_GATEWAY_RELAY_ID
+        && let Some(selection) = settings.native_auth_selection.as_ref()
+    {
+        let expected = matches!(selection, codex_plus_core::settings::NativeAuthSelection::Account { .. });
+        let saved_official = settings.active_relay_session_provider()
+            == codex_plus_core::settings::RelaySessionProvider::Openai;
+        if expected != live_official || expected != saved_official {
+            drift = Some("当前连接尚未切换到所选登录身份，请重新应用".to_string());
+        }
+    }
     Ok(NativeAuthState {
         managed: settings.native_auth_selection.is_some(),
         selection: settings.native_auth_selection,
@@ -556,7 +587,29 @@ fn native_auth_state() -> anyhow::Result<NativeAuthState> {
         actual_label,
         accounts,
         drift,
+        restart_blocked_reason: blocked_reason.map(str::to_string),
     })
+}
+
+fn native_auth_restart_blocker(
+    managed: bool,
+    binding_enabled: bool,
+    taken_over: bool,
+    wsl_account: bool,
+    wants_account: bool,
+    live_official: bool,
+) -> Option<&'static str> {
+    if managed && !binding_enabled {
+        Some("Codex 网关连接未启用；登录选择已保存，接入后再应用")
+    } else if managed && taken_over {
+        Some("Codex 配置已由其他工具接管；请先恢复网关连接")
+    } else if wsl_account {
+        Some("WSL 连接不使用官方登录身份；当前选择无法在此连接生效")
+    } else if wants_account != live_official && !managed {
+        Some("当前直连配置不支持所选登录状态；请先调整连接身份")
+    } else {
+        None
+    }
 }
 
 #[tauri::command]
@@ -570,6 +623,7 @@ pub fn get_native_auth_state() -> CommandResult<NativeAuthState> {
             actual_label: String::new(),
             accounts: Vec::new(),
             drift: Some(error.to_string()),
+            restart_blocked_reason: None,
         }),
     }
 }
@@ -592,18 +646,42 @@ pub fn set_native_auth_account(account_ref: Option<String>) -> CommandResult<Nat
         }
         codex_plus_core::native_auth::set_native_auth_selection(account_ref.as_deref())?;
         notify_settings_changed();
+        // 复用网关已有的官方会话身份转换，不能只写 auth 而继续留下 requires_openai_auth=false。
+        if apply::sync_codex_identity_after_selection(&context()).is_err() {
+            anyhow::bail!("登录选择已保存，但连接身份同步失败，请重新应用；尚未重启 Codex");
+        }
+        notify_settings_changed();
         native_auth_state()
     })();
     match result {
         Ok(state) => ok("原生登录选择已保存。", state),
-        Err(error) => failed(&format!("保存原生登录选择失败：{error}"), NativeAuthState {
-            managed: false,
-            selection: None,
-            actual_account_ref: None,
-            actual_label: String::new(),
-            accounts: Vec::new(),
-            drift: Some(error.to_string()),
-        }),
+        Err(error) => failed(&format!("保存原生登录选择失败：{error}"),
+            native_auth_state().unwrap_or(NativeAuthState {
+                managed: false,
+                selection: None,
+                actual_account_ref: None,
+                actual_label: String::new(),
+                accounts: Vec::new(),
+                drift: Some(error.to_string()),
+                restart_blocked_reason: None,
+            })),
+    }
+}
+
+#[cfg(test)]
+mod native_auth_restart_tests {
+    use super::native_auth_restart_blocker;
+
+    #[test]
+    fn unavailable_connection_never_promises_that_a_restart_will_apply_the_login() {
+        assert!(native_auth_restart_blocker(true, false, false, false, true, false).is_some());
+        assert!(native_auth_restart_blocker(true, true, true, false, true, false).is_some());
+        assert!(native_auth_restart_blocker(true, true, false, true, true, false).is_some());
+        assert!(native_auth_restart_blocker(false, false, false, false, true, false).is_some());
+        assert!(native_auth_restart_blocker(false, false, false, false, false, true).is_some());
+        assert_eq!(native_auth_restart_blocker(false, false, false, false, true, true), None);
+        assert_eq!(native_auth_restart_blocker(false, false, false, false, false, false), None);
+        assert_eq!(native_auth_restart_blocker(true, true, false, false, true, true), None);
     }
 }
 
@@ -855,12 +933,21 @@ pub fn disable_gateway_binding_full_switch(
 pub fn save_gateway_binding(
     agent: String,
     binding: AgentBinding,
+    reconnect: Option<bool>,
 ) -> CommandResult<Option<GatewayPayload>> {
     let result = (|| {
         let agent = parse_agent(&agent)?;
-        let saved = apply::enable_binding(&context(), &agent, binding)?;
+        let ctx = context();
+        let (saved, changed) = if agent == ToolId::Codex {
+            apply::enable_binding_deferred(&ctx, &agent, binding)?
+        } else {
+            (apply::enable_binding(&ctx, &agent, binding)?, false)
+        };
         if sync_resident_helper().is_none() {
             anyhow::bail!("网关绑定已写入，但本地网关没能启动，请查看诊断日志");
+        }
+        if agent == ToolId::Codex && (changed || reconnect.unwrap_or(false)) {
+            codex_plus_core::gateway::connection_generation::publish(&ctx.codex_home)?;
         }
         Ok(saved)
     })();
@@ -931,7 +1018,15 @@ pub fn use_gateway_own_model(
 pub fn rotate_gateway_token(agent: String) -> CommandResult<Option<GatewayPayload>> {
     let result = (|| {
         let agent = parse_agent(&agent)?;
-        apply::rotate_binding_token(&context(), &agent)
+        let ctx = context();
+        let (saved, changed) = apply::rotate_binding_token(&ctx, &agent)?;
+        if agent == ToolId::Codex && changed {
+            if sync_resident_helper().is_none() {
+                anyhow::bail!("网关 token 已更换，但本地网关没能启动，请查看诊断日志");
+            }
+            codex_plus_core::gateway::connection_generation::publish(&ctx.codex_home)?;
+        }
+        Ok(saved)
     })();
     respond("已更换网关 token。", "更换网关 token 失败", result)
 }
@@ -1429,14 +1524,22 @@ pub fn save_gateway_provider_newapi_access(
     )
 }
 
-/// 改供应商的上下文窗口（按模型的和其余模型用的默认值）；窗口写在 Agent 的模型资料里，存完重写 Agent 配置。
+/// 改供应商的上下文窗口（按模型的和其余模型用的默认值）与自动压缩阈值（#3100，可不传）；
+/// 都写在 Agent 的模型资料里，存完重写 Agent 配置。
 #[tauri::command]
 pub fn save_gateway_provider_windows(
     id: String,
     windows: std::collections::BTreeMap<String, u64>,
     fallback: Option<u64>,
+    auto_compact: Option<codex_plus_core::gateway::store::ProviderAutoCompact>,
 ) -> CommandResult<Option<GatewayPayload>> {
-    let result = apply::set_provider_windows(&GatewayStore::default(), &id, windows, fallback)
+    let store = GatewayStore::default();
+    let result = apply::set_provider_windows(&store, &id, windows, fallback)
+        .and_then(|saved| match auto_compact {
+            // 旧界面不传压缩阈值：原样保留（#3100）。
+            Some(auto_compact) => apply::set_provider_auto_compact(&store, &id, auto_compact),
+            None => Ok(saved),
+        })
         .and_then(|saved| {
             apply::refresh_enabled(&context())
                 .context("窗口已保存，但刷新 Agent 配置失败")?;

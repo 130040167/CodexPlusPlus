@@ -251,8 +251,9 @@ fn agent_gateway_model_list(
 fn write_agent_config(
     ctx: &ApplyContext,
     agent: &ToolId,
-    binding: &AgentBinding,
-) -> anyhow::Result<Option<String>> {
+    binding: &mut AgentBinding,
+    reapply: bool,
+) -> anyhow::Result<(Option<String>, bool)> {
     // 拓展声明的供应商也写进 Agent 的模型资料（只读，不落盘）。
     let gateway = ctx.gateway.load()?.with_extension_providers();
     let default_model = binding_default_model(&gateway, binding);
@@ -297,7 +298,7 @@ fn write_agent_config(
                 );
                 stash::save_stash(&claude_stash_path(ctx), file_stash)?;
             }
-            return Ok(snapshot);
+            return Ok((snapshot, false));
         }
         ToolId::Grok => {
             // 同上：Grok 的 config.toml 接入前原样存一份。
@@ -320,13 +321,22 @@ fn write_agent_config(
                 stash::save_stash(&grok_stash_path(ctx), file_stash)?;
             }
         }
-        ToolId::Codex => write_codex(ctx, &gateway, binding)?,
+        ToolId::Codex => {
+            let changed = write_codex(ctx, &gateway, binding, reapply)?;
+            let models = route::codex_binding_models(&gateway, binding)
+                .into_iter()
+                .filter(|model| route::codex_model_available(&gateway, binding, model))
+                .map(|model| model.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            binding.known_models.extend(models);
+            return Ok((None, changed));
+        }
         other => match agents::spec(other.as_str()) {
             Some(spec) => agents::connect::write(ctx, spec, &gateway, binding)?,
             None => bail!("{} 不支持网关模式", other.as_str()),
         },
     }
-    Ok(None)
+    Ok((None, false))
 }
 
 /// 开始改写一个 Agent 的配置文件前准备存档：
@@ -397,6 +407,9 @@ pub fn codex_gateway_profile_on(
     profile.id = CODEX_GATEWAY_RELAY_ID.to_string();
     profile.relay_mode = RelayMode::PureApi;
     profile.model_metadata = catalog.model_metadata;
+    // 供应商池里设了压缩阈值的模型（#3100）：与直连模式同一份 `model_auto_compact`，
+    // 生成目录时写 `auto_compact_token_limit = 窗口 × 百分比`；没设的模型照旧留空。
+    profile.model_auto_compact = catalog.model_auto_compact;
     if signed_in {
         profile.config_contents = with_openai_session_identity(&profile.config_contents)?;
     }
@@ -417,6 +430,9 @@ pub fn codex_gateway_profile_on(
 pub struct CodexGatewayModelCatalog {
     pub model_list: String,
     pub model_metadata: String,
+    /// 按模型的自动压缩百分比（`{"模型":"85%"}`，格式同直连模式的 `model_auto_compact`）；
+    /// 一个都没设时为空串（#3100）。
+    pub model_auto_compact: String,
 }
 
 pub fn codex_gateway_model_catalog(
@@ -425,10 +441,40 @@ pub fn codex_gateway_model_catalog(
 ) -> CodexGatewayModelCatalog {
     let model_list = agent_gateway_model_list(gateway, binding, &ToolId::Codex);
     let model_metadata = codex_model_metadata(gateway, binding, &model_list);
+    let model_auto_compact = codex_model_auto_compact(gateway, binding, &model_list);
     CodexGatewayModelCatalog {
         model_list,
         model_metadata,
+        model_auto_compact,
     }
+}
+
+/// Codex 模型列表里每项的自动压缩百分比（#3100），键是 Codex 看到的模型名（含 `<供应商 id>/`、
+/// `group/` 前缀）。百分比保留两位小数，写成直连模式认的 `"85%"` 文本；换算不出合法值的跳过，
+/// 不让一项写坏的设置拦住整份配置。没有任何一项时返回空串，生成的目录与没有这项设置时一致。
+fn codex_model_auto_compact(
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+    model_list: &str,
+) -> String {
+    let mut map = BTreeMap::new();
+    for line in model_list.lines() {
+        let (model, _) = crate::model_suffix::parse_model_suffix(line);
+        if model.is_empty() || map.contains_key(&model) {
+            continue;
+        }
+        let Some(percent) = route::model_entry_auto_compact(gateway, binding, &model) else {
+            continue;
+        };
+        let token = format!("{}%", (percent * 100.0).round() / 100.0);
+        if crate::model_suffix::parse_compact_percent(&token).is_some() {
+            map.insert(model, token);
+        }
+    }
+    if map.is_empty() {
+        return String::new();
+    }
+    serde_json::to_string(&map).unwrap_or_default()
 }
 
 /// 没登录 ChatGPT 时的托管供应商：显式写 `requires_openai_auth = false`，与直连模式手加的
@@ -549,6 +595,8 @@ fn codex_model_metadata(
                 fields.insert("service_tiers".into(), json!([]));
                 fields.insert("additional_speed_tiers".into(), json!([]));
             }
+            // 组里轮到不收图的那家就会失败：图片能力取各成员的交集。
+            narrow_image_capability(&mut fields, &member_fields);
             fields.insert("display_name".into(), json!(group.name));
             fields.insert(
                 "description".into(),
@@ -601,17 +649,9 @@ fn codex_model_metadata(
             {
                 fields.insert("supports_search_tool".into(), json!(false));
             }
-            if let Some(mut modalities) = member_entries
-                .first()
-                .and_then(|entry| entry["input_modalities"].as_array().cloned())
-            {
-                for entry in member_entries.iter().skip(1) {
-                    if let Some(other) = entry["input_modalities"].as_array() {
-                        modalities.retain(|modality| other.contains(modality));
-                    }
-                }
-                fields.insert("input_modalities".into(), json!(modalities));
-            }
+            let member_fields: Vec<Map<String, Value>> =
+                member_entries.iter().map(catalog_ui_fields).collect();
+            narrow_image_capability(&mut fields, &member_fields);
             let all_support_fast = !members.is_empty()
                 && members.iter().all(|(relay, _)| {
                     relays
@@ -678,6 +718,22 @@ fn codex_model_metadata(
                 );
                 fields.insert("codex_plus_group".into(), json!("自动组"));
                 fields.insert("codex_plus_group_id".into(), json!(CODEX_AUTO_GROUP_ID));
+                // 按顺序切到的每一家都可能接这次请求：图片能力取各家的交集。
+                let member_fields: Vec<Map<String, Value>> =
+                    route::codex_model_members(gateway, binding, &model)
+                        .iter()
+                        .filter_map(|(member, member_upstream)| {
+                            let index = relays.iter().position(|relay| relay.id == member.id)?;
+                            member_catalog_entry(
+                                &mut member_catalogs,
+                                &relays,
+                                index,
+                                member_upstream,
+                            )
+                        })
+                        .map(|entry| catalog_ui_fields(&entry))
+                        .collect();
+                narrow_image_capability(&mut fields, &member_fields);
             } else {
                 fields.insert("display_name".into(), json!(display));
                 fields.insert("codex_plus_group_id".into(), Value::Null);
@@ -851,12 +907,45 @@ fn catalog_ui_fields(entry: &Value) -> Map<String, Value> {
         // Fast（优先处理）按这两个字段判断能不能开；不带过去 Codex 里的 Fast 按钮就一直是灰的。
         "service_tiers",
         "additional_speed_tiers",
+        // 图片输入能力（#3042）：不带过去，原生目录的 `<供应商>/<模型>` 条目会退回通用模板，
+        // 纯文本模型也宣称收图，供应商里声明了收图的模型反而丢掉声明。
+        "input_modalities",
+        "supports_image_detail_original",
     ] {
         if let Some(value) = entry.get(key).filter(|value| !value.is_null()) {
             fields.insert(key.to_string(), value.clone());
         }
     }
     fields
+}
+
+/// 一项会发给几家（模型组、多家自动切换、未知声明按默认模型兜底）时，图片能力取各家的交集：
+/// `input_modalities` 只留每家都声明了的，`supports_image_detail_original` 有一家为 false 就是 false。
+/// 没写这个字段的那家不参与收窄；第一家都没写时不凭空补。
+fn narrow_image_capability(fields: &mut Map<String, Value>, members: &[Map<String, Value>]) {
+    fn modalities_of(member: &Map<String, Value>) -> Option<&Vec<Value>> {
+        member.get("input_modalities").and_then(Value::as_array)
+    }
+    if let Some(mut modalities) = members.first().and_then(modalities_of).cloned() {
+        for other in members.iter().skip(1).filter_map(modalities_of) {
+            modalities.retain(|modality| other.contains(modality));
+        }
+        fields.insert("input_modalities".into(), json!(modalities));
+    }
+    let originals: Vec<bool> = members
+        .iter()
+        .filter_map(|member| {
+            member
+                .get("supports_image_detail_original")
+                .and_then(Value::as_bool)
+        })
+        .collect();
+    if !originals.is_empty() {
+        fields.insert(
+            "supports_image_detail_original".into(),
+            json!(originals.iter().all(|original| *original)),
+        );
+    }
 }
 
 /// 模型 ID 的显示写法，和管理器界面一致：品牌词按正式写法（GPT、DeepSeek、GLM），
@@ -1108,30 +1197,31 @@ fn codex_signed_in(codex_home: &std::path::Path) -> bool {
         })
 }
 
-/// 接入前对账 auth.json 里的 ChatGPT 登录：若它属于池里某个已停用的网关自有账号，
-/// 那份 token 多半是过期代际——留着它启动 Codex 只会弹官方登录门，而用户要的其实是
-/// 纯 API Key 模式。把这种登录从 auth.json 里拿掉（OPENAI_API_KEY 等其余字段不动）。
-/// 不属于池里任何账号的登录视为用户自己登的，不碰。
-fn reconcile_codex_sign_in(ctx: &ApplyContext, gateway: &GatewaySettings) -> bool {
+/// 接入前对账 ChatGPT 登录：只清理同一身份、已停用且仍标记借出的网关登录。
+/// 用户在原生 Codex 中自行建立的会话不因供应商池的启用状态而被移除。
+fn reconcile_codex_sign_in(
+    ctx: &ApplyContext,
+    gateway: &GatewaySettings,
+    settings: &mut BackendSettings,
+) -> anyhow::Result<bool> {
+    match settings.native_auth_selection.as_ref() {
+        // 网关是否消费这个供应商与用户显式选择的原生登录相互独立。
+        Some(crate::settings::NativeAuthSelection::Account { .. }) => {
+            return Ok(codex_signed_in(&ctx.codex_home));
+        }
+        Some(crate::settings::NativeAuthSelection::None) => {
+            return release_signed_out_selection_after_native_login(ctx, settings);
+        }
+        None => {}
+    }
     let path = ctx.codex_home.join("auth.json");
     let live = std::fs::read_to_string(&path).unwrap_or_default();
-    let account = serde_json::from_str::<Value>(&live)
-        .ok()
-        .and_then(|auth| {
-            auth.pointer("/tokens/account_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
-    let owner = (!account.is_empty()).then(|| {
-        gateway.providers.iter().find(|provider| {
-            crate::official_login::is_gateway_owned_login(&provider.relay)
-                && crate::official_login::chatgpt_account_id_from_auth_contents(
-                    &provider.relay.auth_contents,
-                ) == account
-        })
+    let owner = gateway.providers.iter().find(|provider| {
+        crate::official_login::is_gateway_owned_login(&provider.relay)
+            && crate::native_auth::same_account(&provider.relay.auth_contents, &live)
     });
-    if let Some(Some(provider)) = owner.filter(|entry| entry.is_some_and(|p| !p.enabled))
+    if let Some(provider) = owner.filter(|provider|
+        !provider.enabled && crate::official_login::is_lent_to_codex(&provider.relay))
         && let Ok(Value::Object(mut object)) = serde_json::from_str::<Value>(&live)
     {
         let removed = object.remove("tokens").is_some()
@@ -1156,7 +1246,39 @@ fn reconcile_codex_sign_in(ctx: &ApplyContext, gateway: &GatewaySettings) -> boo
             );
         }
     }
-    codex_signed_in(&ctx.codex_home)
+    Ok(codex_signed_in(&ctx.codex_home))
+}
+
+fn release_signed_out_selection_after_native_login(
+    ctx: &ApplyContext,
+    settings: &mut BackendSettings,
+) -> anyhow::Result<bool> {
+    if settings.native_auth_selection != Some(crate::settings::NativeAuthSelection::None)
+        || !codex_signed_in(&ctx.codex_home)
+    {
+        return Ok(false);
+    }
+    // 显式退出已在当时移除凭据；此后出现的新登录由 Codex 用户自己控制。
+    let live = std::fs::read_to_string(ctx.codex_home.join("auth.json"))?;
+    ctx.gateway.update(|gateway| {
+        for provider in &mut gateway.providers {
+            if crate::official_login::is_lent_to_codex(&provider.relay)
+                && crate::native_auth::same_account(&provider.relay.auth_contents, &live)
+            {
+                let mut auth: Value = serde_json::from_str(&provider.relay.auth_contents)?;
+                if let Some(object) = auth.as_object_mut() {
+                    object.remove(crate::official_login::LENT_TO_CODEX_MARKER);
+                }
+                provider.relay.auth_contents = serde_json::to_string_pretty(&auth)?;
+            }
+        }
+        Ok(())
+    })?;
+    let mut adopted = settings.clone();
+    adopted.native_auth_selection = None;
+    adopted.settings_revision = ctx.settings.save_versioned(&adopted)?;
+    *settings = adopted;
+    Ok(true)
 }
 
 /// 接入网关前 Codex 实时配置的副本。只在实时配置与直连模式的记录对不上时才存：
@@ -1530,14 +1652,16 @@ fn write_codex(
     ctx: &ApplyContext,
     gateway: &GatewaySettings,
     binding: &AgentBinding,
-) -> anyhow::Result<()> {
+    reapply: bool,
+) -> anyhow::Result<bool> {
     let mut settings = ctx.settings.load()?;
     validate_codex_model(&settings, gateway, binding)?;
+    let connection_before = codex_connection_state(&ctx.codex_home)?;
     // Codex 在 WSL 里运行：网关额外监听 WSL 网卡，地址写成它（#2773）；拿不到时保持回环。
     let wsl_host = crate::wsl_network::codex_gateway_wsl_host(&ctx.codex_home, ctx.port).address();
     // Codex 自己没登录、池里有网关登录的 ChatGPT 账号：借给 Codex，让它以官方身份接入。
     // WSL 模式下不用官方身份（见 [`codex_gateway_profile_on`]），也就不借。
-    let signed_in = reconcile_codex_sign_in(ctx, gateway);
+    let signed_in = reconcile_codex_sign_in(ctx, gateway, &mut settings)?;
     let lend = (!signed_in
         && wsl_host.is_none()
         && crate::native_auth::selection_allows_auto_lend(&settings))
@@ -1622,7 +1746,52 @@ fn write_codex(
     if let Some(provider_id) = lend {
         lend_login_to_codex(ctx, &provider_id)?;
     }
-    Ok(())
+    Ok(reapply || switching_in || connection_before != codex_connection_state(&ctx.codex_home)?)
+}
+
+fn codex_connection_state(
+    home: &std::path::Path,
+) -> anyhow::Result<(Option<Result<toml::Value, String>>, Option<Result<Value, String>>)> {
+    // 损坏的外部配置也可能由重新接入修复；保留原文作为比较值，不能让解析失败阻止修复。
+    let config = stash::read_optional(&home.join("config.toml"))?
+        .map(|text| text.parse::<toml::Value>().map_err(|_| text))
+        .map(|parsed| parsed.map(|config| {
+            let mut connection = toml::map::Map::new();
+            for key in ["model_provider", "openai_base_url", "chatgpt_base_url"] {
+                if let Some(value) = config.get(key) {
+                    connection.insert(key.to_string(), value.clone());
+                }
+            }
+            let provider = config
+                .get("model_provider")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("openai");
+            let provider = if provider == "openai" { "custom" } else { provider };
+            if let Some(table) = config.get("model_providers").and_then(|item| item.get(provider)) {
+                let mut selected = toml::map::Map::new();
+                for key in [
+                    "base_url",
+                    "wire_api",
+                    "requires_openai_auth",
+                    "experimental_bearer_token",
+                    "env_key",
+                ] {
+                    if let Some(value) = table.get(key) {
+                        selected.insert(key.to_string(), value.clone());
+                    }
+                }
+                connection.insert("provider".to_string(), toml::Value::Table(selected));
+            }
+            toml::Value::Table(connection)
+        }));
+    let auth = stash::read_optional(&home.join("auth.json"))?
+        .map(|text| serde_json::from_str::<Value>(&text).map_err(|_| text))
+        .map(|parsed| parsed.map(|auth| serde_json::json!({
+            "OPENAI_API_KEY": auth.get("OPENAI_API_KEY"),
+            "auth_mode": auth.get("auth_mode"),
+            "tokens": auth.get("tokens")
+        })));
+    Ok((config, auth))
 }
 
 /// 开启（或更新）一个 Agent 的网关绑定，并把它的配置指向网关。
@@ -1634,14 +1803,28 @@ pub fn enable_binding(
     binding: AgentBinding,
 ) -> anyhow::Result<GatewaySettings> {
     let _guard = AGENT_CONFIG_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    enable_binding_locked(ctx, agent, binding)
+    let (gateway, changed) = enable_binding_inner(ctx, agent, binding)?;
+    if changed {
+        crate::gateway::connection_generation::publish(&ctx.codex_home)?;
+    }
+    Ok(gateway)
 }
 
-fn enable_binding_locked(
+/// 返回连接是否变化，由调用方在 helper 成功启动后发布连接代际。
+pub fn enable_binding_deferred(
+    ctx: &ApplyContext,
+    agent: &ToolId,
+    binding: AgentBinding,
+) -> anyhow::Result<(GatewaySettings, bool)> {
+    let _guard = AGENT_CONFIG_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    enable_binding_inner(ctx, agent, binding)
+}
+
+fn enable_binding_inner(
     ctx: &ApplyContext,
     agent: &ToolId,
     mut binding: AgentBinding,
-) -> anyhow::Result<GatewaySettings> {
+) -> anyhow::Result<(GatewaySettings, bool)> {
     let gateway = ctx.gateway.load()?;
     ensure_routable(&gateway, &binding)?;
     if *agent == ToolId::Codex {
@@ -1667,6 +1850,7 @@ fn enable_binding_locked(
         .as_ref()
         .map(|previous| previous.model_selections.clone())
         .unwrap_or_default();
+    binding.known_models = previous.as_ref().map(|binding| binding.known_models.clone()).unwrap_or_default();
     if let Some(selection) = &mut binding.default_model_selection {
         selection.upstream_model = selection.upstream_model_name();
     }
@@ -1732,7 +1916,8 @@ fn enable_binding_locked(
             Ok(previous.clone())
         }
     })?;
-    if let Some(snapshot) = write_agent_config(ctx, agent, &binding)?
+    let (snapshot, changed) = write_agent_config(ctx, agent, &mut binding, false)?;
+    if let Some(snapshot) = snapshot
         && binding.restore.claude_previous_provider_id.is_empty()
     {
         binding.restore.claude_previous_provider_id = snapshot;
@@ -1745,11 +1930,11 @@ fn enable_binding_locked(
         gateway.bindings.insert(agent.as_str().to_string(), binding);
         Ok(())
     })?;
-    Ok(gateway)
+    Ok((gateway, changed))
 }
 
 /// 令牌轮换与配置重写必须串行，避免覆盖正在保存的绑定。
-pub fn rotate_binding_token(ctx: &ApplyContext, agent: &ToolId) -> anyhow::Result<GatewaySettings> {
+pub fn rotate_binding_token(ctx: &ApplyContext, agent: &ToolId) -> anyhow::Result<(GatewaySettings, bool)> {
     let _guard = AGENT_CONFIG_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let (gateway, binding) = ctx.gateway.update(|gateway| {
         let Some(binding) = gateway.bindings.get_mut(agent.as_str()) else {
@@ -1759,9 +1944,9 @@ pub fn rotate_binding_token(ctx: &ApplyContext, agent: &ToolId) -> anyhow::Resul
         Ok(binding.clone())
     })?;
     if binding.enabled {
-        enable_binding_locked(ctx, agent, binding)
+        enable_binding_inner(ctx, agent, binding)
     } else {
-        Ok(gateway)
+        Ok((gateway, false))
     }
 }
 
@@ -2344,6 +2529,24 @@ pub fn codex_switch_blocked_by_gateway(settings: &SettingsStore, target_id: &str
 
 /// Codex 开着网关时，同步托管供应商的会话身份和原生生图注册条件。
 /// 不一致（登录 / 退出，或旧版配置缺少生图标记）就重写一次，端口没变也要检查。
+pub fn sync_codex_identity_after_selection(ctx: &ApplyContext) -> anyhow::Result<()> {
+    let changed = sync_codex_identity(ctx)?;
+    // A/B 同为官方身份时配置不变，但已有线程仍需读到新的凭据代际。
+    // 连接代际仅供重连，不代表运行中的原生 OAuth 已重载。
+    if !changed {
+        let settings = ctx.settings.load()?;
+        let gateway = ctx.gateway.load()?;
+        if settings.active_relay_id == CODEX_GATEWAY_RELAY_ID
+            && gateway.binding(&ToolId::Codex).is_some_and(|binding| binding.enabled)
+            && !crate::wsl_network::codex_runs_in_wsl(&ctx.codex_home)
+            && taken_over(ctx, &ToolId::Codex).is_none()
+        {
+            crate::gateway::connection_generation::publish(&ctx.codex_home)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn sync_codex_identity(ctx: &ApplyContext) -> anyhow::Result<bool> {
     let _guard = AGENT_CONFIG_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let gateway = ctx.gateway.load()?;
@@ -2353,7 +2556,7 @@ pub fn sync_codex_identity(ctx: &ApplyContext) -> anyhow::Result<bool> {
     else {
         return Ok(false);
     };
-    let settings = ctx.settings.load()?;
+    let mut settings = ctx.settings.load()?;
     if settings.active_relay_id != CODEX_GATEWAY_RELAY_ID {
         return Ok(false);
     }
@@ -2393,9 +2596,12 @@ pub fn sync_codex_identity(ctx: &ApplyContext) -> anyhow::Result<bool> {
         registered == crate::gateway::images::targets(&gateway, &ToolId::Codex, None).is_ok()
     };
     if keeps_login == can_sign_in && image_config_matches {
+        release_signed_out_selection_after_native_login(ctx, &mut settings)?;
         return Ok(false);
     }
-    write_codex(ctx, &gateway, &binding.clone())?;
+    if write_codex(ctx, &gateway, &binding.clone(), false)? {
+        crate::gateway::connection_generation::publish(&ctx.codex_home)?;
+    }
     Ok(true)
 }
 
@@ -2448,7 +2654,9 @@ fn sync_codex_wsl_endpoint_locked(ctx: &ApplyContext) -> anyhow::Result<bool> {
         );
         return Ok(false);
     }
-    write_codex(ctx, &gateway, &binding)?;
+    if write_codex(ctx, &gateway, &binding, false)? {
+        crate::gateway::connection_generation::publish(&ctx.codex_home)?;
+    }
     Ok(true)
 }
 
@@ -2475,14 +2683,18 @@ pub fn reapply_if_port_changed(ctx: &ApplyContext) -> anyhow::Result<usize> {
         };
         let mut binding = binding.clone();
         binding.restore.applied_port = Some(ctx.port);
-        let result = write_agent_config(ctx, &agent, &binding).and_then(|_| {
+        let result = write_agent_config(ctx, &agent, &mut binding, false).and_then(|(_, changed)| {
             // 写配置时可能改过 gateway.json：只更新本次成功项，不回写旧快照。
             ctx.gateway.update(|latest| {
                 if let Some(target) = latest.bindings.get_mut(agent.as_str()) {
                     target.restore.applied_port = Some(ctx.port);
+                    target.known_models.extend(binding.known_models.clone());
                 }
                 Ok(())
             })?;
+            if changed {
+                crate::gateway::connection_generation::publish(&ctx.codex_home)?;
+            }
             Ok(())
         });
         match result {
@@ -2571,7 +2783,24 @@ pub fn refresh_enabled(ctx: &ApplyContext) -> anyhow::Result<usize> {
         if taken_over(ctx, &agent).is_some() {
             continue;
         }
-        match write_agent_config(ctx, &agent, binding) {
+        let mut published = binding.clone();
+        let result = write_agent_config(ctx, &agent, &mut published, false).and_then(|(_, changed)| {
+            if published.known_models != binding.known_models {
+                ctx.gateway.update(|latest| {
+                    if let Some(current) = latest.bindings.get_mut(agent.as_str())
+                        && current.enabled && current.token == binding.token
+                    {
+                        current.known_models.extend(published.known_models);
+                    }
+                    Ok(())
+                })?;
+            }
+            if changed {
+                crate::gateway::connection_generation::publish(&ctx.codex_home)?;
+            }
+            Ok(())
+        });
+        match result {
             Ok(_) => count += 1,
             Err(error) => {
                 first_error.get_or_insert(error.context(format!("刷新 {} 失败", agent.as_str())));
@@ -2660,7 +2889,8 @@ fn reapply_binding(
             binding.restore.codex_previous_relay_id = current;
         }
     }
-    if let Some(snapshot) = write_agent_config(ctx, agent, &binding)?
+    let (snapshot, changed) = write_agent_config(ctx, agent, &mut binding, true)?;
+    if let Some(snapshot) = snapshot
         && binding.restore.claude_previous_provider_id.is_empty()
     {
         binding.restore.claude_previous_provider_id = snapshot;
@@ -2672,6 +2902,9 @@ fn reapply_binding(
         latest.bindings.insert(agent.as_str().to_string(), binding);
         Ok(())
     })?;
+    if changed {
+        crate::gateway::connection_generation::publish(&ctx.codex_home)?;
+    }
     Ok(true)
 }
 
@@ -3235,6 +3468,7 @@ fn add_provider_with(
             newapi_access: None,
             subscription_policy: None,
             upstream_meta: Default::default(),
+            auto_compact: Default::default(),
             relay,
             extra: Default::default(),
         };
@@ -3779,6 +4013,42 @@ pub fn set_provider_windows(
     store.load()
 }
 
+/// 供应商的自动压缩阈值（#3100）：按模型的（键是上游模型名）和其余模型用的默认值，单位是窗口的百分比，
+/// 整表替换。空表加 `fallback = None` 即清掉，回到 Codex 默认。百分比要在 1~100 之间，保留两位小数。
+/// 阈值写进 Agent 的模型资料，保存后要重新写一遍 Agent 配置（调用方负责）。
+pub fn set_provider_auto_compact(
+    store: &GatewayStore,
+    id: &str,
+    auto_compact: crate::gateway::store::ProviderAutoCompact,
+) -> anyhow::Result<GatewaySettings> {
+    let clean = |percent: f64| -> anyhow::Result<f64> {
+        if !crate::gateway::store::ProviderAutoCompact::valid_percent(percent) {
+            bail!("自动压缩阈值要在 1% ~ 100% 之间：{percent}");
+        }
+        Ok((percent * 100.0).round() / 100.0)
+    };
+    let mut models = BTreeMap::new();
+    for (model, percent) in auto_compact.models {
+        let model = model.trim().to_string();
+        if !model.is_empty() {
+            models.insert(model, clean(percent)?);
+        }
+    }
+    let fallback = auto_compact.fallback.map(clean).transpose()?;
+    store.update(|gateway| {
+        let Some(provider) = gateway
+            .providers
+            .iter_mut()
+            .find(|provider| provider.relay.id == id)
+        else {
+            bail!("供应商不存在：{id}");
+        };
+        provider.auto_compact = crate::gateway::store::ProviderAutoCompact { models, fallback };
+        Ok(())
+    })?;
+    store.load()
+}
+
 /// 供应商一个模型的思考等级：内置资料里的（不含用户改过的），界面拿它当没改时的显示值。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -4207,7 +4477,7 @@ mod tests {
             port: 57394,
             agent_env: crate::gateway::agents::AgentEnv::at(temp.path().join("home")),
         };
-        let error = write_codex(&ctx, &gateway, &binding).unwrap_err();
+        let error = write_codex(&ctx, &gateway, &binding, false).unwrap_err();
         assert!(
             error.to_string().contains("默认模型无法写入 Codex 配置"),
             "{error:#}"

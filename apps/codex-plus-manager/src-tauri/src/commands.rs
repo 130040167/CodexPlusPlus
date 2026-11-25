@@ -2977,6 +2977,16 @@ fn write_multi_instance_codex_home(
         helper_port,
         preserve_nonprovider,
     )?;
+    if profile.id == codex_plus_core::gateway::apply::CODEX_GATEWAY_RELAY_ID
+        && let Some(catalog) = codex_plus_core::model_catalog::gateway_catalog_path(default_home)
+        && catalog == default_home.join("model-catalogs/codex-plus-gateway.json")
+        && catalog.is_file()
+    {
+        let config_path = codex_home.join("config.toml");
+        let mut doc = std::fs::read_to_string(&config_path)?.parse::<toml_edit::DocumentMut>()?;
+        doc["model_catalog_json"] = toml_edit::value(catalog.to_string_lossy().to_string());
+        codex_plus_core::settings::atomic_write(&config_path, doc.to_string().as_bytes())?;
+    }
     Ok(profile)
 }
 
@@ -3744,6 +3754,25 @@ fn restore_optional_file_bytes(path: &Path, contents: Option<&[u8]>) -> anyhow::
     Ok(())
 }
 
+/// 按完整文件写入供应商，并遵守「切换时保留」（`relayPreserveNonproviderSettings`）。
+///
+/// 切换供应商、网关重写走 core 的 `relay_switch`，早已读这个开关；但重启同步、手动「应用」
+/// 这几条管理器自己的写入路径以前直接调不带保留的版本，开关打开也照样用快照覆盖 live
+/// 里改过的 MCP 等设置（#3115）。这里统一成同一条规则；开关关闭时与原来完全一致。
+fn apply_relay_profile_honoring_preservation(
+    home: &Path,
+    relay: &RelayProfile,
+    settings: &BackendSettings,
+) -> anyhow::Result<codex_plus_core::relay_config::RelayApplyResult> {
+    codex_plus_core::relay_config::apply_relay_profile_with_preservation(
+        home,
+        relay,
+        &relay_combined_common_config(settings),
+        codex_plus_core::protocol_proxy::protocol_proxy_port(),
+        settings.relay_preserve_nonprovider_settings,
+    )
+}
+
 fn sync_active_relay_to_home(
     settings: &BackendSettings,
     home: &Path,
@@ -3760,11 +3789,7 @@ fn sync_active_relay_to_home(
             .active_aggregate_relay_profile()
             .ok_or_else(|| anyhow::anyhow!("当前聚合供应商配置不完整"))?;
         if aggregate.model_aggregation_enabled {
-            return codex_plus_core::relay_config::apply_relay_profile_to_home_with_switch_rules(
-                home,
-                &relay,
-                &relay_combined_common_config(settings),
-            );
+            return apply_relay_profile_honoring_preservation(home, &relay, settings);
         }
         return codex_plus_core::relay_config::apply_relay_config_to_home_with_session_provider(
             home,
@@ -3788,11 +3813,7 @@ fn sync_active_relay_to_home(
         );
     }
     if relay_has_complete_files(&relay) {
-        return codex_plus_core::relay_config::apply_relay_profile_to_home_with_switch_rules(
-            home,
-            &relay,
-            &relay_combined_common_config(settings),
-        );
+        return apply_relay_profile_honoring_preservation(home, &relay, settings);
     }
 
     let mut base_url = relay.base_url.trim().to_string();
@@ -4383,12 +4404,6 @@ pub async fn weixin_connect_start() -> CommandResult<codex_plus_core::connect::W
 #[tauri::command]
 pub async fn weixin_connect_stop() -> CommandResult<codex_plus_core::connect::WeixinConnectStatus> {
     let _control = weixin_control().lock().await;
-    if let Err(error) = SettingsStore::default().update(json!({"weixinConnectEnabled": false})) {
-        return failed(
-            &format!("保存微信连接设置失败：{error}"),
-            current_weixin_status(),
-        );
-    }
     let stopping = weixin_runtime()
         .lock()
         .ok()
@@ -4408,6 +4423,12 @@ pub async fn weixin_connect_stop() -> CommandResult<codex_plus_core::connect::We
             status.state = "stopped".to_string();
             status.message = "微信连接已停止。".to_string();
         }
+    }
+    if let Err(error) = SettingsStore::default().update(json!({"weixinConnectEnabled": false})) {
+        let message = format!("已请求停止微信连接，但保存设置失败，下次启动时可能自动连接：{error}");
+        let mut status = current_weixin_status();
+        status.message = message.clone();
+        return failed(&message, status);
     }
     ok(
         if stopping {
@@ -4748,7 +4769,7 @@ pub fn save_settings(
     if let Some(revision) = expected_revision {
         settings.settings_revision = revision;
     }
-    let settings = normalize_settings_before_save(settings);
+    let mut settings = normalize_settings_before_save(settings);
     // 保存诊断：供应商模型列表被改小/改大时能直接看出「提交上来的到底是什么」。
     // 用户反馈过「删掉一行保存后又变回三行」，只有把每次保存的行数记下来才能区分
     // 「界面没提交改动」和「提交了又被别处覆盖」。
@@ -4778,6 +4799,8 @@ pub fn save_settings(
     };
     let store = SettingsStore::default();
     let previous = store.load().unwrap_or_default();
+    // 原生登录仅由独立选择命令更新，普通偏好表单不能覆盖刚发布的身份。
+    settings.native_auth_selection = previous.native_auth_selection.clone();
     if let Err(error) = codex_plus_core::connect::outbound::validate_settings_change(&previous, &settings) {
         return failed(
             &error.to_string(),
@@ -7481,6 +7504,131 @@ pub async fn list_installed_skills() -> Result<CommandResult<SkillsPayload>, Str
     }).await.map_err(|error| format!("读取本地 Skills 失败：{error}"))
 }
 
+async fn resolve_skill_repo_for_operation(
+    manager: &codex_plus_core::skills::SkillsManager,
+    repo_key: &str,
+) -> anyhow::Result<Vec<codex_plus_core::skills::RemoteSkill>> {
+    let (guard, snapshot) = {
+        let _coordination = skills_repo_coordination();
+        (manager.capture_repo_guard(repo_key)?, repo_skill_cache_snapshot(repo_key))
+    };
+    let (resolved, skills) =
+        codex_plus_core::skills::resolve_repo_skills(guard.repo.clone(), &snapshot.skills).await?;
+    anyhow::ensure!(resolved.key() == repo_key, "仓库分支已变化，请先重新检查仓库");
+    let _coordination = skills_repo_coordination();
+    anyhow::ensure!(manager.repo_guard_is_current(&guard)?, "仓库在检查期间已改变，请重试");
+    store_repo_skills_if_current(repo_key, &skills, &snapshot);
+    Ok(skills)
+}
+
+#[tauri::command]
+pub async fn find_skill_repository_matches(
+    repo_key: String,
+    id: Option<String>,
+    local_path: Option<String>,
+) -> CommandResult<codex_plus_core::skills::SkillRepositoryMatchPreview> {
+    let manager = default_skills_manager();
+    let result = async {
+        let skills = resolve_skill_repo_for_operation(&manager, &repo_key).await?;
+        let repo = manager.list_repos().into_iter().find(|repo| repo.key() == repo_key)
+            .ok_or_else(|| anyhow::anyhow!("仓库已不存在"))?;
+        tauri::async_runtime::spawn_blocking(move || {
+            match (id.as_deref(), local_path.as_deref()) {
+                (Some(id), Some(path)) => manager.preview_repository_matches_for_instance(
+                    &repo, &skills, id, std::path::Path::new(path),
+                ),
+                (None, Some(_)) => anyhow::bail!("选择安装位置时必须指定 Skill"),
+                (_, None) => manager.preview_repository_matches(&repo, &skills, id.as_deref()),
+            }
+        }).await?
+    }.await;
+    match result {
+        Ok(preview) => ok("来源候选已检查，请确认后关联。", preview),
+        Err(error) => failed(
+            &format!("匹配 Skill 来源失败：{error:#}"),
+            codex_plus_core::skills::SkillRepositoryMatchPreview::default(),
+        ),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRepositoryApplyPayload {
+    #[serde(flatten)]
+    skills: SkillsPayload,
+    applied: Vec<codex_plus_core::skills::SkillRepositoryMatchApplied>,
+    errors: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn apply_skill_repository_matches(
+    selections: Vec<codex_plus_core::skills::SkillRepositoryMatchSelection>,
+) -> Result<CommandResult<SkillRepositoryApplyPayload>, String> {
+    let manager = default_skills_manager();
+    let keys: std::collections::BTreeSet<_> = selections.iter()
+        .map(|selection| selection.repo_key.clone()).collect();
+    let mut remote = Vec::new();
+    let mut errors = Vec::new();
+    let mut available = std::collections::BTreeSet::new();
+    for key in keys {
+        match resolve_skill_repo_for_operation(&manager, &key).await {
+            Ok(skills) => {
+                available.insert(key);
+                remote.extend(skills);
+            }
+            Err(error) => errors.push(format!("{key}：{error:#}")),
+        }
+    }
+    let valid: Vec<_> = selections.into_iter()
+        .filter(|selection| available.contains(&selection.repo_key)).collect();
+    tauri::async_runtime::spawn_blocking(move || {
+        let applied = match manager.apply_repository_matches(&valid, &remote) {
+            Ok(outcome) => {
+                errors.extend(outcome.errors);
+                outcome.applied
+            }
+            Err(error) => {
+                errors.push(format!("{error:#}"));
+                Vec::new()
+            }
+        };
+        let payload = SkillRepositoryApplyPayload {
+            skills: current_skills_payload(&manager),
+            applied,
+            errors,
+        };
+        if payload.errors.is_empty() {
+            ok("已关联所选来源，更新方式未改变。", payload)
+        } else {
+            failed(&format!("部分来源未关联：{}", payload.errors.join("；")), payload)
+        }
+    }).await.map_err(|error| format!("关联 Skill 来源失败：{error}"))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillSourceEvidencePayload {
+    evidence: Vec<codex_plus_core::skills::SkillSourceEvidence>,
+}
+
+#[tauri::command]
+pub async fn discover_skill_source_evidence(id: String, local_path: Option<String>) -> Result<CommandResult<SkillSourceEvidencePayload>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let manager = default_skills_manager();
+        let evidence = match local_path.as_deref() {
+            Some(path) => manager.discover_skill_source_evidence_for_instance(id.trim(), std::path::Path::new(path)),
+            None => manager.discover_skill_source_evidence(id.trim()),
+        };
+        match evidence {
+            Ok(evidence) => ok("已检查本地来源线索。", SkillSourceEvidencePayload { evidence }),
+            Err(error) => failed(
+                &format!("检查来源线索失败：{error:#}"),
+                SkillSourceEvidencePayload { evidence: Vec::new() },
+            ),
+        }
+    }).await.map_err(|error| format!("检查来源线索失败：{error}"))
+}
+
 /// 导入 cc-switch 已安装的 Skills。cc-switch 的 Skill 文件位于
 /// `%USERPROFILE%/.cc-switch/skills/<id>/SKILL.md`，不在其 SQLite 数据库中。
 #[tauri::command]
@@ -8257,23 +8405,8 @@ pub fn skip_update_version(version: String) -> CommandResult<SettingsPayload> {
     }
 }
 
-/// ClaudeMom 还没有自己的发布渠道：Codex++ 的更新包装上去会把它换成 Codex++，所以检查、下载、安装都拦住。
-const CLAUDE_MOM_UPDATE_UNSUPPORTED: &str = "ClaudeMom 暂不支持自动更新，请重新构建。";
-
 #[tauri::command]
 pub async fn check_update() -> CommandResult<Value> {
-    if crate::flavor::is_claude_mom() {
-        return CommandResult {
-            status: "not_checked".to_string(),
-            message: CLAUDE_MOM_UPDATE_UNSUPPORTED.to_string(),
-            payload: json!({
-                "currentVersion": codex_plus_core::version::VERSION,
-                "updateAvailable": false,
-                "downloaded": false,
-                "progress": 0
-            }),
-        };
-    }
     match codex_plus_core::update::check_for_update(codex_plus_core::version::VERSION).await {
         Ok(update) => {
             let status = if update.update_available {
@@ -8338,9 +8471,6 @@ pub async fn download_update(
     app: tauri::AppHandle,
     release: Option<codex_plus_core::update::Release>,
 ) -> CommandResult<Value> {
-    if crate::flavor::is_claude_mom() {
-        return failed(CLAUDE_MOM_UPDATE_UNSUPPORTED, json!({ "downloaded": false }));
-    }
     let Some(release) = release else {
         return failed(
             "请先检查更新并选择可下载的 Release asset。",
@@ -8421,12 +8551,6 @@ async fn perform_update_inner<F>(
 where
     F: FnMut(codex_plus_core::update::UpdateProgress) + Send,
 {
-    if crate::flavor::is_claude_mom() {
-        return failed(
-            CLAUDE_MOM_UPDATE_UNSUPPORTED,
-            json!({ "currentVersion": codex_plus_core::version::VERSION, "progress": 0 }),
-        );
-    }
     let Some(release) = release else {
         return failed(
             "请先检查更新并选择可下载的 Release asset。",
@@ -9247,14 +9371,34 @@ pub fn switch_relay_profile(
                 }),
             );
             // 在 Codex 供应商页切到别的供应商等于断开网关，切回「Codex++ 网关」等于重新接入。
-            let _ = codex_plus_core::gateway::apply::note_codex_switched(
+            let binding_update = codex_plus_core::gateway::apply::note_codex_switched(
                 &codex_plus_core::gateway::store::GatewayStore::default(),
                 &result.settings.active_relay_id,
                 &previous_active_relay_id,
             );
             // 新配置已经写进 config.toml：需要本地代理时立即让它常驻，
             // 这样不经过 Codex++ 启动的客户端也能直接用。
-            sync_resident_helper();
+            let helper = sync_resident_helper();
+            if result.settings.active_relay_id == codex_plus_core::gateway::apply::CODEX_GATEWAY_RELAY_ID {
+                if let Err(error) = binding_update {
+                    return failed(
+                        &format!("供应商已切换，但网关绑定更新失败：{error:#}"),
+                        relay_switch_payload(result.settings, status, result.backup_path),
+                    );
+                }
+                if helper.is_none() {
+                    return failed(
+                        "供应商已切换，但本地网关没能启动，请查看诊断日志",
+                        relay_switch_payload(result.settings, status, result.backup_path),
+                    );
+                }
+                if let Err(error) = codex_plus_core::gateway::connection_generation::publish(&home) {
+                    return failed(
+                        &format!("供应商已切换，但通知网关重新连接失败：{error:#}"),
+                        relay_switch_payload(result.settings, status, result.backup_path),
+                    );
+                }
+            }
             let imported_name = outcome.imported_profile_id.as_ref().and_then(|id| {
                 result
                     .settings
@@ -10287,11 +10431,7 @@ pub fn apply_relay_injection() -> CommandResult<RelayPayload> {
         return response;
     }
     if relay_has_complete_files(&relay) {
-        return match codex_plus_core::relay_config::apply_relay_profile_to_home_with_switch_rules(
-            &home,
-            &relay,
-            &relay_combined_common_config(&settings),
-        ) {
+        return match apply_relay_profile_honoring_preservation(&home, &relay, &settings) {
             Ok(result) => {
                 finish_codex_app_state_after_provider_switch(
                     &home,
@@ -10401,12 +10541,7 @@ fn apply_aggregate_relay_injection_to_home(
                 .active_aggregate_relay_profile()
                 .is_some_and(|aggregate| aggregate.model_aggregation_enabled)
         {
-            let common_config = relay_combined_common_config(&settings);
-            match codex_plus_core::relay_config::apply_relay_profile_to_home_with_switch_rules(
-                home,
-                &profile,
-                &common_config,
-            ) {
+            match apply_relay_profile_honoring_preservation(home, &profile, &settings) {
                 Ok(result) => {
                     let status = codex_plus_core::relay_config::relay_status_from_home(home);
                     let mut message =
@@ -10484,11 +10619,7 @@ pub fn apply_pure_api_injection() -> CommandResult<RelayPayload> {
     let relay = settings.active_relay_profile();
     log_relay_apply_request("manager.apply_pure_api_injection", &settings, &relay);
     if relay_has_complete_files(&relay) {
-        return match codex_plus_core::relay_config::apply_relay_profile_to_home_with_switch_rules(
-            &home,
-            &relay,
-            &relay_combined_common_config(&settings),
-        ) {
+        return match apply_relay_profile_honoring_preservation(&home, &relay, &settings) {
             Ok(result) => {
                 finish_codex_app_state_after_provider_switch(
                     &home,
@@ -11852,6 +11983,39 @@ cwd = \"/tmp\"
     }
 
     #[test]
+    fn manager_preferences_save_preserves_the_latest_explicit_native_login() {
+        let _guard = lock_codex_home_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let previous = codex_plus_core::paths::set_settings_path_for_tests(
+            Some(temp.path().join("settings.json")),
+        );
+        let store = SettingsStore::default();
+        store.save(&BackendSettings {
+            enhancements_enabled: false,
+            codex_app_auto_takeover: false,
+            ..BackendSettings::default()
+        }).unwrap();
+        let stale = store.load().unwrap();
+        let mut outcomes = Vec::new();
+        for selection in [
+            Some(codex_plus_core::settings::NativeAuthSelection::Account { account_ref: "fixture-a".into() }),
+            Some(codex_plus_core::settings::NativeAuthSelection::None),
+        ] {
+            let mut current = store.load().unwrap();
+            current.native_auth_selection = selection.clone();
+            store.save(&current).unwrap();
+            let revision = store.revision().unwrap();
+            let result = save_settings(stale.clone(), Some(revision));
+            outcomes.push((result.status, store.load().unwrap().native_auth_selection, selection));
+        }
+        codex_plus_core::paths::set_settings_path_for_tests(previous);
+        for (status, actual, expected) in outcomes {
+            assert_eq!(status, "ok");
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
     fn provider_sync_success_reports_backup_directory_when_something_changed() {
         let mut sync = provider_sync_result_for_test(
             codex_plus_data::ProviderSyncStatus::Synced,
@@ -12463,6 +12627,45 @@ base_url = "https://example.invalid/v1"
         let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
         assert!(config.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
         assert!(!config.contains(r#"base_url = "https://source.example/v1""#));
+    }
+
+    /// #3115：重启时的同步也要遵守「切换时保留」——live 里改过的 MCP 条目（路径、超时、env）
+    /// 不被供应商快照里的旧条目顶掉；不开时仍按快照写，默认行为不变。
+    #[test]
+    fn active_relay_sync_honors_preserve_nonprovider_setting() {
+        for preserve in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                temp.path().join("config.toml"),
+                "model = \"gpt-5\"\n\n[mcp_servers.my_tool]\ncommand = \"/new/my-tool\"\ntool_timeout_sec = 120\n\n[mcp_servers.my_tool.env]\nMY_TOKEN = \"live-token\"\n",
+            )
+            .unwrap();
+            let settings = BackendSettings {
+                active_relay_id: "relay".to_string(),
+                relay_preserve_nonprovider_settings: preserve,
+                relay_profiles: vec![RelayProfile {
+                    id: "relay".to_string(),
+                    relay_mode: RelayMode::PureApi,
+                    base_url: "https://relay.example/v1".to_string(),
+                    api_key: "sk-relay".to_string(),
+                    config_contents: "model = \"qwen3-coder\"\nmodel_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\nbase_url = \"https://relay.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"sk-relay\"\n\n[mcp_servers.my_tool]\ncommand = \"/old/my-tool\"\n".to_string(),
+                    auth_contents: "{\"OPENAI_API_KEY\":\"sk-relay\"}\n".to_string(),
+                    ..RelayProfile::default()
+                }],
+                ..BackendSettings::default()
+            };
+
+            sync_active_relay_to_home(&settings, temp.path()).unwrap();
+
+            let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+            assert!(config.contains("https://relay.example/v1"), "{config}");
+            // 开：live 的新路径、超时、env 胜出；关：快照里的旧条目胜出（与切换路径一致）。
+            assert_eq!(config.contains("/new/my-tool"), preserve, "preserve={preserve}：{config}");
+            assert_eq!(config.contains("/old/my-tool"), !preserve, "preserve={preserve}：{config}");
+            if preserve {
+                assert!(config.contains("tool_timeout_sec = 120") && config.contains("live-token"), "{config}");
+            }
+        }
     }
 
     #[test]
@@ -13888,6 +14091,37 @@ model_reasoning_effort = "high"
             std::fs::read_to_string(main_home.join("auth.json")).unwrap(),
             MAIN_CHATGPT_AUTH
         );
+    }
+
+    #[test]
+    fn multi_instance_gateway_uses_the_manager_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let main_home = temp.path().join("main-codex");
+        let instance_home = temp.path().join("instance/codex-home");
+        let catalog = main_home.join("model-catalogs/codex-plus-gateway.json");
+        std::fs::create_dir_all(catalog.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&instance_home).unwrap();
+        std::fs::write(&catalog, r#"{"models":[{"slug":"old"}]}"#).unwrap();
+        std::fs::write(main_home.join("config.toml"),
+            "model_catalog_json = 'model-catalogs/codex-plus-gateway.json'\n").unwrap();
+        let profile = RelayProfile {
+            id: codex_plus_core::gateway::apply::CODEX_GATEWAY_RELAY_ID.into(),
+            name: "gateway".into(),
+            relay_mode: RelayMode::PureApi,
+            protocol: codex_plus_core::settings::RelayProtocol::Responses,
+            model: "old".into(),
+            model_list: "old\nother".into(),
+            config_contents: "model_provider = 'custom'\nmodel = 'old'\n[model_providers.custom]\nname = 'gateway'\nwire_api = 'responses'\nbase_url = 'http://127.0.0.1:61234/gw/codex/v1'\n".into(),
+            auth_contents: r#"{"OPENAI_API_KEY":"test"}"#.into(),
+            api_key: "test".into(),
+            ..RelayProfile::default()
+        };
+
+        write_multi_instance_codex_home(&instance_home, &main_home, &profile, "", 61235, false).unwrap();
+        assert_eq!(codex_plus_core::model_catalog::gateway_catalog_path(&instance_home), Some(catalog.clone()));
+        std::fs::write(&catalog, r#"{"models":[{"slug":"new"}]}"#).unwrap();
+        let shared = codex_plus_core::model_catalog::gateway_catalog_path(&instance_home).unwrap();
+        assert!(std::fs::read_to_string(shared).unwrap().contains(r#""new""#));
     }
 
     #[test]
