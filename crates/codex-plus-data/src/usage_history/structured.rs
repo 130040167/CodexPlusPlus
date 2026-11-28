@@ -29,27 +29,22 @@ mod tool_receipts;
 const RETENTION_DAYS: i64 = 365;
 const MAX_ACTIVITY: usize = 12_000;
 const MAX_EVENTS: usize = 100_000;
-const MAX_FILES: usize = 4096;
 // 单行保护与文件大小无关；所有文件均可增量读取。巨大正文不传入渲染进程。
 const MAX_LINE: usize = 1024 * 1024;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_REQUEST_LOG_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_REQUEST_LOG_LINE: usize = 16 * 1024;
-const MAX_REQUEST_EVIDENCE: usize = 8192;
-const MAX_ROWS_CAPTURED_PROXY: usize = 20_000;
 const REQUEST_MATCH_WINDOW_MS: i64 = 30_000;
 const DELAYED_REQUEST_MATCH_WINDOW_MS: i64 = 120_000;
-const MAX_NATIVE_RECEIPT_LINE: usize = 8192;
 const REQUEST_SUPPLIER_PROOF: &str = "request-log-recovered-supplier-only";
 
-struct AttributionScope {
+struct AttributionScope<'a> {
     targets: Range<usize>,
     gateway_blocked: bool,
     native_blocked: bool,
+    matches_terminal: Option<&'a dyn Fn(&UsageEvent, &str) -> anyhow::Result<bool>>,
 }
 
-fn observed_file_identity(path: &Path, metadata: &fs::Metadata) -> io::Result<Option<(u64, u64)>> {
+fn observed_file_identity(path: &Path, metadata: &fs::Metadata) -> io::Result<(u64, u64)> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -60,12 +55,13 @@ fn observed_file_identity(path: &Path, metadata: &fs::Metadata) -> io::Result<Op
             .access_mode(0)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
             .open(path)?;
-        codex_plus_core::codex_sqlite::opened_file_identity(&file).map(Some)
+        codex_plus_core::codex_sqlite::opened_file_identity(&file)
     }
     #[cfg(not(windows))]
     {
         let _ = path;
-        Ok(file_identity(metadata))
+        file_identity(metadata)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "file identity unavailable"))
     }
 }
 
@@ -342,16 +338,7 @@ impl RequestEvidence {
     }
 
     fn valid_request(&self) -> bool {
-        let strings = [
-            &self.id,
-            &self.thread_id,
-            &self.model,
-            &self.upstream_model,
-            &self.relay_id,
-            &self.relay_name,
-        ];
-        if strings.iter().any(|s| s.len() > 256)
-            || self.id.is_empty()
+        if self.id.is_empty()
             || self.thread_id.is_empty()
             || !self.agent.is_empty()
             || !self.success
@@ -370,24 +357,27 @@ impl RequestEvidence {
     }
 
     fn valid_capture(&self) -> bool {
-        if !self.valid_request() {
+        if !self.valid_request()
+            || self.actual_model().is_none()
+            || self
+                .final_response_id
+                .as_ref()
+                .is_some_and(String::is_empty)
+        {
             return false;
         }
-        let Some(RequestEvidenceUsage {
+        // 成功但未返回用量的请求仍参与竞争，只有完整计数能产生匹配键。
+        let Some(usage) = self.usage else { return true };
+        let RequestEvidenceUsage {
             input_tokens: Some(input),
             output_tokens: Some(output),
             cached_tokens,
             cached_tokens_known,
-        }) = self.usage
+        } = usage
         else {
             return false;
         };
-        self.actual_model().is_some()
-            && self
-                .final_response_id
-                .as_ref()
-                .is_none_or(|id| !id.is_empty() && id.len() <= 256)
-            && cached_tokens.is_none_or(|cached| cached <= input)
+        cached_tokens.is_none_or(|cached| cached <= input)
             && !(cached_tokens_known == Some(true) && cached_tokens.is_none())
             && !(cached_tokens_known == Some(false) && cached_tokens.is_some_and(|n| n > 0))
             && input.saturating_add(output) > 0
@@ -405,13 +395,13 @@ impl RequestEvidence {
         let Some(cached) = cached.filter(|_| self.valid_capture()) else {
             return Vec::new();
         };
-        let RequestEvidenceUsage {
+        let Some(RequestEvidenceUsage {
             input_tokens: Some(input),
             output_tokens: Some(output),
             ..
-        } = self.usage.unwrap()
+        }) = self.usage
         else {
-            unreachable!("validated request counts")
+            return Vec::new();
         };
         let mut models: Vec<_> = [&self.model, &self.upstream_model]
             .into_iter()
@@ -458,11 +448,13 @@ struct RequestEvidenceCache {
     path: PathBuf,
     stamp: Option<(u64, Option<SystemTime>, Option<(u64, u64)>)>,
     records: Vec<RequestEvidence>,
+    replay_window: Option<(i64, i64)>,
     captured_start: Option<usize>,
-    captured_cursor: usize,
     captured_complete: Option<HashSet<[u8; 32]>>,
+    legacy_uncovered: HashSet<[u8; 32]>,
     captured_rejected: HashSet<String>,
-    captured_id_check_failed: bool,
+    captured_coverage_error: Option<String>,
+    captured_id_check_error: Option<String>,
     verified: HashMap<[u8; 32], VerifiedAttribution>,
     reads: u64,
     bytes_read: u64,
@@ -479,7 +471,7 @@ impl RequestEvidenceCache {
                 if *previous != saved {
                     previous.rejected = true;
                 }
-            } else if self.verified.len() < MAX_EVENTS {
+            } else {
                 self.verified.insert(id, saved);
             }
         }
@@ -488,25 +480,23 @@ impl RequestEvidenceCache {
     fn reject_conflicting_event(&mut self, event: &UsageEvent) {
         if let Some(saved) = self.verified.get_mut(&event.id) {
             saved.rejected = true;
-        } else if self.verified.len() < MAX_EVENTS {
-            if let Ok(at) = DateTime::parse_from_rfc3339(&event.timestamp) {
-                self.verified.insert(
-                    event.id,
-                    VerifiedAttribution {
-                        key: RequestMatchKey {
-                            session: String::new(),
-                            model: String::new(),
-                            input: 0,
-                            output: 0,
-                            cached: 0,
-                        },
-                        at: at.timestamp_millis(),
-                        request: RequestEvidence::default(),
-                        rejected: true,
-                        version: 1,
+        } else if let Ok(at) = DateTime::parse_from_rfc3339(&event.timestamp) {
+            self.verified.insert(
+                event.id,
+                VerifiedAttribution {
+                    key: RequestMatchKey {
+                        session: String::new(),
+                        model: String::new(),
+                        input: 0,
+                        output: 0,
+                        cached: 0,
                     },
-                );
-            }
+                    at: at.timestamp_millis(),
+                    request: RequestEvidence::default(),
+                    rejected: true,
+                    version: 1,
+                },
+            );
         }
     }
 
@@ -593,6 +583,7 @@ impl RequestEvidenceCache {
         self.bytes_read = 0;
         let Ok(guard) = codex_plus_core::request_log::lock_request_log() else {
             self.records.clear();
+            self.replay_window = None;
             self.stamp = None;
             return;
         };
@@ -605,7 +596,8 @@ impl RequestEvidenceCache {
         }
         self.stamp = stamp;
         self.records.clear();
-        let Some(metadata) = metadata.filter(|m| m.len() <= MAX_REQUEST_LOG_BYTES) else {
+        self.replay_window = None;
+        let Some(metadata) = metadata else {
             return;
         };
         let Ok(mut file) = File::open(path) else {
@@ -621,81 +613,71 @@ impl RequestEvidenceCache {
             return;
         }
         self.reads += 1;
-        let mut contents = Vec::with_capacity(metadata.len() as usize);
+        let mut contents = Vec::new();
         let read_result = (&mut file).take(metadata.len()).read_to_end(&mut contents);
         drop(guard);
         if read_result.is_err() {
             self.stamp = None;
             return;
         }
-        // 总量和单行均有界；serde 跳过未声明字段，不分配 error/正文字符串。
-        let mut reader = BufReader::new(contents.as_slice());
-        let mut line = Vec::new();
-        let mut oversized = false;
-        let result = (|| -> io::Result<()> {
-            loop {
-                let buffer = reader.fill_buf()?;
-                if buffer.is_empty() {
-                    break;
-                }
-                let newline = buffer.iter().position(|b| *b == b'\n');
-                let length = newline.map_or(buffer.len(), |i| i + 1);
-                if !oversized {
-                    if line.len() + length > MAX_REQUEST_LOG_LINE {
-                        line.clear();
-                        oversized = true;
-                    } else {
-                        line.extend_from_slice(&buffer[..length]);
-                    }
-                }
-                reader.consume(length);
-                self.bytes_read += length as u64;
-                if newline.is_some() {
-                    if !oversized {
-                        #[derive(Deserialize)]
-                        struct Identity {
-                            id: String,
-                        }
-                        let record = serde_json::from_slice::<RequestEvidence>(&line)
-                            .ok()
-                            .or_else(|| {
-                                // 字段类型损坏但身份仍明确时，撤销该 ID 的旧补证，不能当作轮转缺失。
-                                serde_json::from_slice::<Identity>(&line)
-                                    .ok()
-                                    .map(|identity| RequestEvidence {
-                                        id: identity.id,
-                                        ..Default::default()
-                                    })
-                            });
-                        if let Some(record) = record {
-                            if self.records.len() == MAX_REQUEST_EVIDENCE {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "request evidence limit",
-                                ));
-                            }
-                            self.records.push(record);
-                        }
-                    }
-                    line.clear();
-                    oversized = false;
-                }
+        self.bytes_read = contents.len() as u64;
+        #[derive(Deserialize)]
+        struct Identity {
+            id: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PhysicalEntry {
+            #[serde(flatten)]
+            request: RequestEvidence,
+            appended_at_ms: Option<i64>,
+        }
+        let mut timed_rows = contents.ends_with(b"\n") && contents.len() as u64 == metadata.len();
+        let mut first_append = None;
+        let mut last_append = None;
+        for line in contents.split_inclusive(|&byte| byte == b'\n') {
+            if !line.ends_with(b"\n") {
+                break;
             }
-            Ok(())
-        })();
+            let record = serde_json::from_slice::<PhysicalEntry>(line)
+                .ok()
+                .map(|entry| {
+                    if let Some(at) = entry.appended_at_ms {
+                        timed_rows &= at >= entry.request.timestamp_ms
+                            && last_append.is_none_or(|prior| prior <= at);
+                        first_append.get_or_insert(at);
+                        last_append = Some(at);
+                    } else if first_append.is_some() {
+                        timed_rows = false;
+                    }
+                    entry.request
+                })
+                .or_else(|| {
+                    // 字段损坏但身份明确时，撤销该 ID 的旧证明。
+                    serde_json::from_slice::<Identity>(line)
+                        .ok()
+                        .map(|identity| RequestEvidence {
+                            id: identity.id,
+                            ..Default::default()
+                        })
+                });
+            timed_rows &= record.as_ref().is_some_and(|r| !r.id.is_empty() && r.timestamp_ms > 0);
+            if let Some(record) = record {
+                self.records.push(record);
+            }
+        }
         // 未换行的尾记录不接受；读取期间被替换或追加时，下轮重新投影。
         let after = fs::symlink_metadata(path)
             .ok()
             .map(|m| (m.len(), m.modified().ok(), file_identity(&m)));
-        if let Err(error) = result {
-            self.records.clear();
-            if error.kind() != io::ErrorKind::InvalidData {
-                self.stamp = None;
-            }
-        }
         if after != stamp {
             self.records.clear();
             self.stamp = None;
+        } else if timed_rows && let (Some(first), Some(last)) = (first_append, last_append) {
+            // 首尾毫秒允许同刻追加；旧格式单份尾部无法证明何时裁去了前缀。
+            let first = first.saturating_add(1);
+            let last = last.saturating_sub(1);
+            self.replay_window = (first <= last).then_some((first, last));
         }
     }
 
@@ -719,6 +701,8 @@ impl RequestEvidenceCache {
             self.records.truncate(start);
         }
         self.captured_complete = Some(HashSet::new());
+        self.legacy_uncovered.clear();
+        self.captured_coverage_error = None;
         let aliases = RequestSessionAliases::new(aliases);
         let mut source_aliases: HashMap<String, Vec<String>> = HashMap::new();
         for alias in aliases.canonical.keys() {
@@ -734,13 +718,7 @@ impl RequestEvidenceCache {
         let mut targets: BTreeMap<String, Vec<(i64, [u8; 32])>> = BTreeMap::new();
         let targets_slice = scope.map_or(events, |scope| &events[scope.targets.clone()]);
         for event in targets_slice.iter().filter(|e| {
-            (unknown_provider(&e.provider)
-                || unknown_model(&e.model)
-                || e.native_response_id
-                    .as_ref()
-                    .is_some_and(|proof| !proof.full_counts)
-                || codex_plus_core::aggregate_catalog::is_aggregate_model(&e.model))
-                && !e.context_conflicts.any()
+            !e.context_conflicts.any()
                 && !e.count_uncertain
                 && !e.count_incomplete
                 && (e.delta.cached_known || e.native_response_id.is_some())
@@ -757,6 +735,16 @@ impl RequestEvidenceCache {
         if targets.is_empty() {
             return (0, false);
         }
+        let mut coverage = match cache.proxy_coverage() {
+            Ok(coverage) => coverage,
+            Err(error) => {
+                self.captured_coverage_error = Some(format!("read proxy coverage: {error:#}"));
+                self.legacy_uncovered
+                    .extend(targets_slice.iter().map(|event| event.id));
+                return (0, true);
+            }
+        };
+        coverage.extend(self.replay_window);
         // refresh 每轮丢弃旧补充；文件 stamp 不承担完成缓存的更新通知。
         self.captured_start = Some(self.records.len());
         let mut observed: HashMap<_, _> = self
@@ -766,12 +754,8 @@ impl RequestEvidenceCache {
             .map(|(index, r)| (r.id.clone(), index))
             .collect();
         let mut recovered = 0;
-        let mut limited = targets.len() > 256;
-        let targets: Vec<_> = targets.into_iter().collect();
-        let offset = self.captured_cursor % targets.len();
-        let count = targets.len().min(256);
-        self.captured_cursor = offset + count;
-        for (session, events) in targets.iter().cycle().skip(offset).take(count) {
+        let mut limited = false;
+        for (session, events) in targets {
             let since = events
                 .iter()
                 .map(|(at, _)| *at)
@@ -784,13 +768,9 @@ impl RequestEvidenceCache {
                 .max()
                 .unwrap()
                 .saturating_add(DELAYED_REQUEST_MATCH_WINDOW_MS);
-            let mut sources = source_aliases.remove(session).unwrap_or_default();
-            sources.push(session.clone());
+            let mut sources = source_aliases.remove(&session).unwrap_or_default();
+            sources.push(session);
             sources.sort();
-            if sources.len() > 16 {
-                limited = true;
-                continue;
-            }
             let mut rows = Vec::new();
             let mut complete = true;
             let mut floor = 0;
@@ -801,26 +781,15 @@ impl RequestEvidenceCache {
                         floor = floor.max(batch.floor);
                         rows.extend(batch.rows);
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        self.captured_coverage_error = Some(format!("read captured requests: {error:#}"));
                         complete = false;
                         break;
                     }
                 }
             }
-            // 一个别名的截断边界同样约束整组；不让更早的部分窗口推断唯一性。
+            // 整组别名都要覆盖匹配窗口，才能确认请求唯一。
             rows.retain(|row| row.timestamp_ms >= floor);
-            let additional = rows
-                .iter()
-                .filter(|row| {
-                    !observed
-                        .get(&row.id)
-                        .is_some_and(|&index| self.records[index].merge_observation(row).is_some())
-                })
-                .count();
-            if self.records.len().saturating_add(additional) > MAX_ROWS_CAPTURED_PROXY {
-                limited = true;
-                continue;
-            }
             for row in rows {
                 if let Some(&index) = observed.get(&row.id)
                     && let Some(merged) = self.records[index].merge_observation(&row)
@@ -835,8 +804,15 @@ impl RequestEvidenceCache {
                 recovered += 1;
             }
             for (at, id) in events {
+                if !coverage.iter().any(|&(first, last)| {
+                    first <= at.saturating_sub(DELAYED_REQUEST_MATCH_WINDOW_MS)
+                        && last >= at.saturating_add(DELAYED_REQUEST_MATCH_WINDOW_MS)
+                }) {
+                    self.legacy_uncovered.insert(id);
+                    limited = true;
+                }
                 if complete && at.saturating_sub(DELAYED_REQUEST_MATCH_WINDOW_MS) >= floor {
-                    self.captured_complete.as_mut().unwrap().insert(*id);
+                    self.captured_complete.as_mut().unwrap().insert(id);
                 } else {
                     limited = true;
                 }
@@ -868,8 +844,14 @@ impl RequestEvidenceCache {
                 .iter()
                 .chain(self.verified.values().map(|saved| &saved.request)),
         );
-        self.captured_id_check_failed = checked.is_err();
-        self.captured_rejected = checked.unwrap_or_default();
+        self.captured_id_check_error = self.captured_coverage_error.clone();
+        match checked {
+            Ok(rejected) => self.captured_rejected = rejected,
+            Err(error) => {
+                self.captured_id_check_error = Some(format!("validate rejected request IDs: {error:#}"));
+                self.captured_rejected.clear();
+            }
+        }
         self.attribute_scoped(events, names, aliases, scope)
     }
 
@@ -898,7 +880,7 @@ impl RequestEvidenceCache {
         let mut requests = BTreeMap::new();
         let mut blocked = self.captured_rejected.clone();
         for record in &self.records {
-            if record.id.is_empty() || record.id.len() > 256 {
+            if record.id.is_empty() {
                 continue;
             }
             if !record.valid_capture()
@@ -1129,7 +1111,7 @@ impl RequestEvidenceCache {
                     saved.rejected = true;
                 }
             }
-            if !self.captured_id_check_failed
+            if self.captured_id_check_error.is_none()
                 && !event.count_uncertain
                 && !event.count_incomplete
                 && !self
@@ -1167,7 +1149,7 @@ impl RequestEvidenceCache {
                 }
                 continue;
             }
-            if self.captured_id_check_failed
+            if self.captured_id_check_error.is_some()
                 || scope.is_some_and(|scope| scope.gateway_blocked)
                 || event.count_uncertain
                 || event.count_incomplete
@@ -1226,17 +1208,62 @@ impl RequestEvidenceCache {
                     let end = records.partition_point(|record| {
                         record.timestamp_ms <= at.saturating_add(DELAYED_REQUEST_MATCH_WINDOW_MS)
                     });
-                    if records[start..end].iter().any(|record| {
-                        record.could_fit_counts(key.input, key.output, key.cached)
-                            && !(paired
-                                && record.usage.is_none()
-                                && record.final_response_id.is_none()
-                                && record.valid_request()
-                                && record.relay_id == request.relay_id
-                                && record.actual_model() == request.actual_model()
-                                && record.model == request.model)
-                    }) {
-                        return None;
+                    let mut later_request = false;
+                    for other in records[start..end]
+                        .iter()
+                        .filter(|r| r.could_fit_counts(key.input, key.output, key.cached))
+                    {
+                        // 持久索引有独立的终态核验，仍按网关时序处理缺计量的竞争记录。
+                        if scope.is_none()
+                            && paired
+                            && !blocked.contains(&other.id)
+                            && other.usage.is_none()
+                            && other.final_response_id.is_none()
+                            && other.valid_request()
+                            && other.relay_id == request.relay_id
+                            && other.actual_model() == request.actual_model()
+                            && other.model == request.model
+                        {
+                            continue;
+                        }
+                        if other.thread_id != event.session
+                            || blocked.contains(&other.id)
+                            || !other.valid_request()
+                            || other.started_at_ms <= (*at).max(request.timestamp_ms)
+                        {
+                            return None;
+                        }
+                        later_request = true;
+                    }
+                    if later_request {
+                        // 原生终态与网关最终响应配对后，才用同一网关的先后顺序排除后发请求。
+                        let final_id = request.final_response_id.as_deref()?;
+                        if event.inherited
+                            || event.session != request.thread_id
+                            || request.final_response_evidence.as_deref()
+                                != Some("final-response-v1")
+                            || !request.valid_request_counts()
+                            || !live_receipts::within_receipt_window(
+                                request,
+                                *at,
+                                REQUEST_MATCH_WINDOW_MS,
+                            )
+                            || !event.last.is_some_and(|last| {
+                                last.cached_known && last.same_counts(event.delta)
+                            })
+                        {
+                            return None;
+                        }
+                        let matches = scope?.matches_terminal?;
+                        match matches(event, final_id) {
+                            Ok(true) => {}
+                            Ok(false) => return None,
+                            Err(error) => {
+                                self.captured_id_check_error =
+                                    Some(format!("validate native response identity: {error:#}"));
+                                return None;
+                            }
+                        }
                     }
                 }
                 if request.known_cached().is_none()
@@ -1309,6 +1336,9 @@ impl RequestEvidenceCache {
                 continue;
             };
             let request = &requests[i];
+            if self.legacy_uncovered.contains(&event.id) {
+                continue;
+            }
             let legacy = self
                 .verified
                 .get(&event.id)
@@ -1339,8 +1369,11 @@ impl RequestEvidenceCache {
                 continue;
             };
             let routed_model = unknown_model(&event.model)
-                || (codex_plus_core::aggregate_catalog::is_aggregate_model(&event.model)
-                    && (legacy || request.model == event.model && event.model != actual_model));
+                || (legacy && codex_plus_core::aggregate_catalog::is_aggregate_model(&event.model))
+                || (!legacy && request.model == event.model && event.model != actual_model
+                    && (codex_plus_core::aggregate_catalog::is_aggregate_model(&event.model)
+                        || (request.final_response_evidence.as_deref() == Some("final-response-v1")
+                            && request.final_response_id.is_some())));
             if !routed_model
                 && !paired_receipt
                 && !request_keys[i].iter().any(|key| {
@@ -1379,7 +1412,7 @@ impl RequestEvidenceCache {
             if !unknown_provider(&event.provider) && !routed_model && !paired_receipt {
                 continue;
             }
-            if !self.verified.contains_key(&event.id) && self.verified.len() < MAX_EVENTS {
+            if !self.verified.contains_key(&event.id) {
                 let (key, at) = evidence.as_ref().unwrap();
                 self.verified.insert(
                     event.id,
@@ -1538,6 +1571,17 @@ fn context_fields(raw: &str) -> serde_json::Result<[(&'static str, Option<&RawVa
     ])
 }
 
+fn selected_payload<const N: usize>(
+    fields: [(&str, Option<&RawValue>); N],
+) -> serde_json::Result<Value> {
+    fields
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| (key, value)))
+        .map(|(key, value)| serde_json::from_str(value.get()).map(|value| (key.to_owned(), value)))
+        .collect::<serde_json::Result<serde_json::Map<String, Value>>>()
+        .map(Value::Object)
+}
+
 fn merge_context_value(
     current: &mut String,
     incoming: &str,
@@ -1652,6 +1696,8 @@ enum ClassificationEvidence {
     RequestExact,
     SupplierOnly,
     RecoveredRequestSupplier,
+    NamespaceInferred,
+    SessionContextInferred,
 }
 
 impl ClassificationEvidence {
@@ -1664,6 +1710,8 @@ impl ClassificationEvidence {
             Some("request-log-exact") => Self::RequestExact,
             Some("upstream-counter-bidirectional-supplier-only") => Self::SupplierOnly,
             Some(REQUEST_SUPPLIER_PROOF) => Self::RecoveredRequestSupplier,
+            Some("model-namespace") => Self::NamespaceInferred,
+            Some("session-context-inferred") => Self::SessionContextInferred,
             _ => Self::None,
         }
     }
@@ -1672,6 +1720,8 @@ impl ClassificationEvidence {
         match (self, next) {
             (Self::UpstreamExact, Self::RequestExact)
             | (Self::RequestExact, Self::UpstreamExact) => Self::RequestExact,
+            (Self::NamespaceInferred, Self::SessionContextInferred)
+            | (Self::SessionContextInferred, Self::NamespaceInferred) => Self::SessionContextInferred,
             (left, right) if left == right => left,
             _ => Self::None,
         }
@@ -1692,6 +1742,9 @@ impl ClassificationEvidence {
             }
             Self::RecoveredRequestSupplier => {
                 row["supplierClassificationEvidence"] = json!(REQUEST_SUPPLIER_PROOF);
+            }
+            Self::NamespaceInferred | Self::SessionContextInferred => {
+                row["providerInferred"] = json!(true);
             }
         }
     }
@@ -1798,7 +1851,15 @@ struct FileState {
     reader: Option<index_budget::ReadCursor>,
     retained_charge: usize,
     pending: index_budget::PendingLine,
+    oversized: Option<oversized::Spool>,
+    recheck_large_meter: bool,
+    legacy_identity_prefix: u64,
+    legacy_tools_only: bool,
+    identity_probe: Option<bool>,
+    replay_tool_activity: bool,
     skipping: bool,
+    skipped_ordinal: Option<u64>,
+    nul_padding_end: Option<u64>,
     skip_activity: bool,
     activity_truncated: bool,
     session: String,
@@ -1886,10 +1947,10 @@ struct Cache {
     storage: PathBuf,
     runtime: Option<token_checkpoint::Runtime>,
     snapshot: Arc<token_checkpoint::ReadState>,
+    refresh_reader: Option<token_checkpoint::HistoryReader>,
     active: bool,
     refreshed: Option<Instant>,
     touched: Instant,
-    _collector: Option<provider_capture::ProviderCollector>,
     worker: Option<std::thread::JoinHandle<()>>,
     archive: ArchiveSlot,
 }
@@ -1933,18 +1994,53 @@ fn homes() -> &'static HistoryCaches {
     HOMES.get_or_init(Default::default)
 }
 
+type ProviderCollectors =
+    Mutex<HashMap<PathBuf, (PathBuf, provider_capture::ProviderCollector)>>;
+
+fn collectors() -> &'static ProviderCollectors {
+    static COLLECTORS: OnceLock<ProviderCollectors> = OnceLock::new();
+    COLLECTORS.get_or_init(Default::default)
+}
+
+fn ensure_provider_capture(home: &Path, settings: &Path) -> io::Result<()> {
+    let mut collectors = collectors().lock().unwrap_or_else(|error| error.into_inner());
+    if collectors.get(home).is_some_and(|(path, _)| path == settings) {
+        return Ok(());
+    }
+    // 采集独立于查询缓存；设置路径变化时先等待旧写者退出。
+    collectors.remove(home);
+    let sqlite_home = std::env::var_os("CODEX_SQLITE_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.to_owned());
+    let collector = provider_capture::start_provider_collector(
+        home.to_owned(),
+        sqlite_home,
+        settings.to_owned(),
+    )?;
+    collectors.insert(home.to_owned(), (settings.to_owned(), collector));
+    Ok(())
+}
+
+pub(super) fn sync_provider_capture(home: &Path, settings: &Path) -> anyhow::Result<()> {
+    if read_history_settings(settings)?.enabled {
+        ensure_provider_capture(home, settings)?;
+    } else {
+        clear(home);
+    }
+    Ok(())
+}
+
 fn stop_cache(cache: Arc<Mutex<Cache>>) {
-    let (collector, worker, archive) = {
+    let (worker, archive) = {
         let mut state = cache.lock().unwrap_or_else(|error| error.into_inner());
         state.archive.cancelled.store(true, Ordering::Relaxed);
         (
-            state._collector.take(),
             state.worker.take(),
             state.archive.worker.take(),
         )
     };
     // 不持有索引锁等待退出；其他强引用不能延迟后台任务的收尾。
-    drop(collector);
     if let Some(worker) = worker {
         let _ = worker.join();
     }
@@ -1962,6 +2058,10 @@ pub(super) fn clear(home: &Path) {
     if let Some(cache) = homes.remove(home) {
         stop_cache(cache);
     }
+    collectors()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(home);
     // 并发 clear 也须等待已移除缓存的后台任务退出。
     drop(homes);
 }
@@ -1983,18 +2083,22 @@ struct HistorySettings {
 }
 
 fn read_history_settings(settings: &Path) -> anyhow::Result<HistorySettings> {
-    const MAX_BYTES: u64 = 8 * 1024 * 1024;
     let file = File::open(settings)?;
-    let metadata = file.metadata()?;
-    anyhow::ensure!(
-        metadata.is_file() && metadata.len() <= MAX_BYTES,
-        "用量设置文件无效"
-    );
-    Ok(serde_json::from_reader(file.take(MAX_BYTES + 1))?)
+    anyhow::ensure!(file.metadata()?.is_file(), "用量设置路径不是文件");
+    Ok(serde_json::from_reader(BufReader::new(file))?)
 }
 
-fn history_enabled(settings: &Path) -> bool {
-    read_history_settings(settings).is_ok_and(|settings| settings.enabled)
+fn require_history_enabled(settings: &Path) -> Result<(), Value> {
+    match read_history_settings(settings) {
+        Ok(settings) if settings.enabled => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.downcast_ref::<io::Error>()
+            .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) => {}
+        Err(error) => {
+            return Err(json!({"status":"unavailable","complete":false,"message":error.to_string()}));
+        }
+    }
+    Err(json!({"status":"unavailable","complete":false,"enabled":false}))
 }
 
 fn evict_idle(home: &Path, cache: &Arc<Mutex<Cache>>) -> bool {
@@ -2076,8 +2180,8 @@ pub(super) fn query_executions(home: &Path, request: &Value) -> Value {
 
 pub(super) fn query_execution_detail(home: &Path, request: &Value) -> Value {
     let settings = codex_plus_core::paths::default_settings_path();
-    if !history_enabled(&settings) {
-        return json!({"status":"unavailable","enabled":false});
+    if let Err(response) = require_history_enabled(&settings) {
+        return response;
     }
     let request = match token_checkpoint::DetailQuery::parse(request) {
         Ok(request) => request,
@@ -2117,9 +2221,14 @@ fn query_with_settings(home: &Path, options: &Query, request: &Value, settings: 
     let storage = state.storage.clone();
     let processing = state.active;
     let archived = state.archive.result();
+    let reader = state.refresh_reader.clone().map_or_else(
+        || token_checkpoint::ReadState::open_reader(&storage),
+        Ok,
+    );
     drop(state);
     let (mut response, schedule) = snapshot.read_with_archive(
         &storage,
+        reader,
         options,
         request,
         scope_session.as_deref(),
@@ -2166,23 +2275,7 @@ fn touch_history(home: &Path, settings: &Path) -> Result<Arc<Mutex<Cache>>, Valu
         return Err(json!({"status":"unavailable","complete":false}));
     };
     // 与缓存创建共用锁，拦住已通过上层开关检查、关闭后才抵达的请求。
-    if !history_enabled(settings) {
-        return Err(json!({"status":"unavailable","enabled":false,"complete":false}));
-    }
-    if !homes.contains_key(home) && homes.len() >= 2 {
-        // 只回收空闲索引；运行中的扫描不能因另一个 home 查询而被反复创建。
-        let idle = homes
-            .iter()
-            .find(|(_, cache)| cache.lock().is_ok_and(|c| !c.active))
-            .map(|(path, _)| path.clone());
-        if let Some(idle) = idle {
-            if let Some(removed) = homes.remove(&idle) {
-                stop_cache(removed);
-            }
-        } else {
-            return Err(json!({"status":"unavailable","complete":false}));
-        }
-    }
+    require_history_enabled(settings)?;
     let cache = if let Some(cache) = homes.get(home) {
         cache.clone()
     } else {
@@ -2194,10 +2287,10 @@ fn touch_history(home: &Path, settings: &Path) -> Result<Arc<Mutex<Cache>>, Valu
             runtime: Some(runtime),
             storage: storage_dir,
             snapshot,
+            refresh_reader: None,
             active: false,
             refreshed: None,
             touched: Instant::now(),
-            _collector: None,
             worker: None,
             archive: ArchiveSlot::default(),
         }));
@@ -2223,29 +2316,22 @@ fn touch_history(home: &Path, settings: &Path) -> Result<Arc<Mutex<Cache>>, Valu
         return touch_history(home, settings);
     }
     state.touched = Instant::now();
-    if state._collector.is_none() {
-        let sqlite_home = std::env::var_os("CODEX_SQLITE_HOME")
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.to_owned());
-        // 启动失败不影响只读查询；下一次请求会重试，而非永久静默停采。
-        state._collector = provider_capture::start_provider_collector(
-            home.to_owned(),
-            sqlite_home,
-            state.settings_path.clone(),
-        )
-        .ok();
-    }
+    ensure_provider_capture(home, &state.settings_path)
+        .map_err(|error| json!({"status":"unavailable","complete":false,"message":error.to_string()}))?;
     if !state.active
         && state
             .refreshed
             .is_none_or(|at| at.elapsed() >= REFRESH_INTERVAL)
     {
+        let reader = state.runtime.as_ref().expect("idle worker owns runtime")
+            .pin_refresh_reader(&state.snapshot)
+            .map_err(|error| json!({"status":"unavailable","complete":false,"message":error.to_string()}))?;
         let mut runtime = state
             .runtime
             .take()
             .expect("idle usage worker owns its runtime");
         state.active = true;
+        state.refresh_reader = reader;
         let shared = cache.clone();
         let home = home.to_owned();
         match std::thread::Builder::new()
@@ -2259,12 +2345,14 @@ fn touch_history(home: &Path, settings: &Path) -> Result<Arc<Mutex<Cache>>, Valu
                         state.snapshot = Arc::new(snapshot);
                     }
                     state.runtime = Some(runtime);
+                    state.refresh_reader = None;
                     state.active = false;
                     state.refreshed = Some(Instant::now());
                 }
             }) {
             Ok(worker) => state.worker = Some(worker),
             Err(error) => {
+                state.refresh_reader = None;
                 state.active = false;
                 state.refreshed = Some(Instant::now());
                 state.runtime = Some(token_checkpoint::Runtime::new(
@@ -2323,10 +2411,6 @@ fn discover(home: &Path, cold_start: bool, errors: &mut usize) -> Vec<PathBuf> {
                     pending.push(entry.path());
                 }
             } else if kind.is_file() && log_file(&entry.path()) {
-                if files.len() >= MAX_FILES {
-                    *errors += 1;
-                    continue;
-                }
                 match fs::canonicalize(entry.path()) {
                     Ok(path) if path.starts_with(home) => {
                         // 修改时间只用于冷启动排序；读取时仍校验路径和文件身份。
@@ -2356,38 +2440,39 @@ struct LegacyEvidenceDocument {
     records: Vec<LegacyProviderEvidence>,
 }
 
+fn read_evidence_document<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> anyhow::Result<Option<T>> {
+    let before = match FileState::source_stamp(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        other => other?,
+    };
+    let file = File::open(path)?;
+    let opened_stamp = || -> io::Result<_> {
+        let metadata = file.metadata()?;
+        Ok((
+            metadata.len(),
+            metadata.modified().ok(),
+            Some(codex_plus_core::codex_sqlite::opened_file_identity(&file)?),
+        ))
+    };
+    anyhow::ensure!(opened_stamp()? == before, "evidence replaced");
+    let mut input = BufReader::new(&file).take(before.0);
+    let document = serde_json::from_reader(&mut input)?;
+    anyhow::ensure!(
+        input.limit() == 0 && opened_stamp()? == before && FileState::source_stamp(path)? == before,
+        "evidence changed"
+    );
+    Ok(Some(document))
+}
+
 impl LegacyEvidenceDocument {
     fn read(settings: &Path) -> anyhow::Result<Option<Self>> {
-        const LIMIT: u64 = 32 * 1024 * 1024;
         let path = settings.with_file_name("usage-provider-evidence.json");
-        let metadata = match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(None);
-            }
-            other => other?,
+        let Some(document) = read_evidence_document::<Self>(&path)? else {
+            return Ok(None);
         };
-        anyhow::ensure!(
-            metadata.is_file() && metadata.len() <= LIMIT,
-            "evidence size/type"
-        );
-        let stamp = |m: &fs::Metadata| (m.len(), m.modified().ok(), file_identity(m));
-        let file = File::open(&path)?;
-        anyhow::ensure!(
-            stamp(&file.metadata()?) == stamp(&metadata),
-            "evidence replaced"
-        );
-        let mut bytes = Vec::new();
-        file.take(LIMIT + 1).read_to_end(&mut bytes)?;
-        anyhow::ensure!(
-            bytes.len() as u64 == metadata.len()
-                && stamp(&fs::symlink_metadata(&path)?) == stamp(&metadata),
-            "evidence changed"
-        );
-        let document: Self = serde_json::from_slice(&bytes)?;
-        anyhow::ensure!(
-            document.version == 1 && document.records.len() <= MAX_EVENTS,
-            "evidence version/count"
-        );
+        anyhow::ensure!(document.version == 1, "evidence version");
         Ok(Some(document))
     }
 
@@ -2412,160 +2497,207 @@ struct LegacyEvidenceCache {
     signatures: HashMap<String, Option<[u8; 32]>>,
 }
 
+#[derive(Default)]
+struct EvidenceIdentities {
+    seen: HashSet<[u8; 32]>,
+    duplicates: HashSet<[u8; 32]>,
+    aliases: HashMap<[u8; 32], usize>,
+}
+
+impl EvidenceIdentities {
+    fn observe(&mut self, id: [u8; 32], alias: Option<[u8; 32]>) {
+        if !self.seen.insert(id) {
+            self.duplicates.insert(id);
+        }
+        if let Some(alias) = alias {
+            *self.aliases.entry(alias).or_default() += 1;
+        }
+    }
+}
+
+#[derive(Default)]
+struct LegacyMatches {
+    records: HashMap<String, Option<LegacyProviderEvidence>>,
+    invalid: usize,
+    applied: usize,
+    conflicts: usize,
+    mismatches: usize,
+    migrated: usize,
+    sources: BTreeMap<String, usize>,
+}
+
 impl LegacyEvidenceCache {
     fn apply(
         &mut self,
         document: anyhow::Result<Option<LegacyEvidenceDocument>>,
         snapshot: &mut Snapshot,
     ) {
-        // 不写入请求缓存，删除文件即可撤销，改写身份在本轮索引内不再信任。
-        let result = (|| -> anyhow::Result<Value> {
-            let Some(document) = document? else {
-                return Ok(json!({"status":"absent"}));
-            };
-            let mut records = HashMap::new();
-            let mut invalid = 0usize;
-            for record in document.records {
-                let id = record.event_id.to_ascii_lowercase();
-                if id.len() != 64
-                    || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    || (!self.signatures.contains_key(&id) && self.signatures.len() >= MAX_EVENTS)
-                {
-                    invalid += 1;
-                    continue;
-                }
-                let signature: [u8; 32] = Sha256::digest(serde_json::to_vec(&record)?).into();
-                let valid = [
-                    &record.session,
-                    &record.timestamp,
-                    &record.model,
-                    &record.provider,
-                ]
-                .iter()
-                .all(|s| {
-                    !s.trim().is_empty() && s.len() <= 256 && !s.chars().any(char::is_control)
-                }) && record.provider_name.len() <= 256
-                    && !record.provider_name.chars().any(char::is_control)
-                    && record.provider.trim() == record.provider
-                    && record.model.trim() == record.model
-                    && !unknown_provider(&record.provider)
-                    && !unknown_model(&record.model)
-                    && !unknown_model(request_base_model(&record.model))
-                    && matches!(record.role.as_str(), "main" | "subagent")
-                    && matches!(
-                        record.source.as_str(),
-                        "upstream-exact-bidirectional"
-                            | "user-classified"
-                            | "user-provider-classification"
-                    )
-                    && DateTime::parse_from_rfc3339(&record.timestamp).is_ok()
-                    && record.cached <= record.input
-                    && record
-                        .input
-                        .checked_add(record.output)
-                        .is_some_and(|n| n > 0)
-                    && !records.contains_key(&id)
-                    && self
-                        .signatures
-                        .get(&id)
-                        .is_none_or(|previous| *previous == Some(signature));
-                self.signatures
-                    .insert(id.clone(), valid.then_some(signature));
-                invalid += usize::from(!valid);
-                records.insert(id, valid.then_some(record));
-            }
-            let mut unique = HashSet::new();
-            let mut duplicates = HashSet::new();
-            let mut legacy_counts = HashMap::new();
-            for event in &snapshot.events {
-                if !unique.insert(event.id) {
-                    duplicates.insert(event.id);
-                }
-                if let Some(legacy) = &event.legacy_identity {
-                    *legacy_counts.entry(legacy.id).or_insert(0usize) += 1;
-                }
-            }
-            let (mut applied, mut conflicts, mut mismatches, mut migrated) =
-                (0usize, 0usize, 0usize, 0usize);
-            let mut sources = BTreeMap::<String, usize>::new();
+        let mut records = self.prepare(document);
+        let mut ids = EvidenceIdentities::default();
+        for event in &snapshot.events {
+            ids.observe(event.id, event.legacy_identity.as_ref().map(|old| old.id));
+        }
+        if let Ok(Some(matches)) = &mut records {
             for event in &mut snapshot.events {
-                let id: String = event.id.iter().map(|byte| format!("{byte:02x}")).collect();
-                let direct = records.get(&id).and_then(Option::as_ref);
-                // 只兼容明确复制头形成的旧身份，两端唯一且完整签名一致；不借父供应商推断。
-                let legacy = event.legacy_identity.as_ref().and_then(|identity| {
-                    if unique.contains(&identity.id) || legacy_counts.get(&identity.id) != Some(&1)
-                    {
-                        return None;
-                    }
-                    let id: String = identity
-                        .id
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect();
-                    records
-                        .get(&id)
-                        .and_then(Option::as_ref)
-                        .filter(|record| record.matches(event, Some(identity)))
-                });
-                if records.get(&id).is_some_and(Option::is_none) {
-                    continue;
-                }
-                if direct
-                    .zip(legacy)
-                    .is_some_and(|(a, b)| a.provider != b.provider)
-                {
-                    conflicts += 1;
-                    continue;
-                }
-                let Some(record) = direct.or(legacy) else {
-                    continue;
-                };
-                if event.context_conflicts.any()
-                    || event.count_uncertain
-                    || event.count_incomplete
-                    || !event.delta.cached_known
-                {
-                    conflicts += 1;
-                    continue;
-                }
-                let missing_model = unknown_model(&event.model);
-                if duplicates.contains(&event.id)
-                    || direct.is_some_and(|record| !record.matches(event, None))
-                {
-                    mismatches += 1;
-                    continue;
-                }
-                if !unknown_provider(&event.provider) && event.provider != record.provider {
-                    conflicts += 1;
-                    continue;
-                }
-                if unknown_provider(&event.provider) {
-                    event.provider.clone_from(&record.provider);
-                    event.provider_source = Some(record.source.clone());
-                    applied += 1;
-                    migrated += usize::from(direct.is_none());
-                    *sources.entry(record.source.clone()).or_default() += 1;
-                }
-                if missing_model {
-                    event.model.clone_from(&record.model);
-                }
-                if !record.provider_name.trim().is_empty() {
-                    let name = snapshot
-                        .provider_names
-                        .entry(record.provider.clone())
-                        .or_default();
-                    if name.trim().is_empty() {
-                        name.clone_from(&record.provider_name);
-                    }
-                }
+                matches.apply(event, &ids, &mut snapshot.provider_names);
             }
-            Ok(
-                json!({"status":"ok","source":"legacy-provider-evidence","appliedEvents":applied,
-                "sources":sources,"invalid":invalid,"conflictedEvents":conflicts,"signatureMismatches":mismatches,
-                "migratedEvents":migrated}),
-            )
-        })();
-        snapshot.provider_evidence = result.unwrap_or_else(|_| json!({"status":"rejected"}));
+        }
+        snapshot.provider_evidence = LegacyMatches::report(records);
+    }
+
+    fn prepare(
+        &mut self,
+        document: anyhow::Result<Option<LegacyEvidenceDocument>>,
+    ) -> anyhow::Result<Option<LegacyMatches>> {
+        let Some(document) = document? else {
+            return Ok(None);
+        };
+        let mut records = HashMap::new();
+        let mut invalid = 0usize;
+        for record in document.records {
+            let id = record.event_id.to_ascii_lowercase();
+            if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                invalid += 1;
+                continue;
+            }
+            let signature: [u8; 32] = Sha256::digest(serde_json::to_vec(&record)?).into();
+            let valid = [
+                &record.session,
+                &record.timestamp,
+                &record.model,
+                &record.provider,
+            ]
+            .iter()
+            .all(|s| !s.trim().is_empty() && !s.chars().any(char::is_control))
+                && !record.provider_name.chars().any(char::is_control)
+                && record.provider.trim() == record.provider
+                && record.model.trim() == record.model
+                && !unknown_provider(&record.provider)
+                && !unknown_model(&record.model)
+                && !unknown_model(request_base_model(&record.model))
+                && matches!(record.role.as_str(), "main" | "subagent")
+                && matches!(
+                    record.source.as_str(),
+                    "upstream-exact-bidirectional"
+                        | "user-classified"
+                        | "user-provider-classification"
+                        | "request-log-recovered-supplier-only"
+                        | "model-namespace"
+                        | "session-context-inferred"
+                )
+                && (record.source != "model-namespace"
+                    || record.model.split_once('/').is_some_and(|(namespace, _)| {
+                        namespace == record.provider && namespace != "group"
+                    }))
+                && DateTime::parse_from_rfc3339(&record.timestamp).is_ok()
+                && record.cached <= record.input
+                && record
+                    .input
+                    .checked_add(record.output)
+                    .is_some_and(|n| n > 0)
+                && !records.contains_key(&id)
+                && self
+                    .signatures
+                    .get(&id)
+                    .is_none_or(|previous| *previous == Some(signature));
+            self.signatures
+                .insert(id.clone(), valid.then_some(signature));
+            invalid += usize::from(!valid);
+            records.insert(id, valid.then_some(record));
+        }
+        Ok(Some(LegacyMatches {
+            records,
+            invalid,
+            ..Default::default()
+        }))
+    }
+}
+
+impl LegacyMatches {
+    fn apply(
+        &mut self,
+        event: &mut UsageEvent,
+        ids: &EvidenceIdentities,
+        names: &mut BTreeMap<String, String>,
+    ) {
+        let records = &self.records;
+        let id: String = event.id.iter().map(|byte| format!("{byte:02x}")).collect();
+        let direct = records.get(&id).and_then(Option::as_ref);
+        // 只兼容明确复制头形成的旧身份，两端唯一且完整签名一致；不借父供应商推断。
+        let legacy = event.legacy_identity.as_ref().and_then(|identity| {
+            if ids.seen.contains(&identity.id) || ids.aliases.get(&identity.id) != Some(&1) {
+                return None;
+            }
+            let id: String = identity
+                .id
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            records
+                .get(&id)
+                .and_then(Option::as_ref)
+                .filter(|record| record.matches(event, Some(identity)))
+        });
+        if records.get(&id).is_some_and(Option::is_none) {
+            return;
+        }
+        if direct
+            .zip(legacy)
+            .is_some_and(|(a, b)| a.provider != b.provider)
+        {
+            self.conflicts += 1;
+            return;
+        }
+        let Some(record) = direct.or(legacy) else {
+            return;
+        };
+        if event.context_conflicts.any()
+            || event.count_uncertain
+            || event.count_incomplete
+            || !event.delta.cached_known
+        {
+            self.conflicts += 1;
+            return;
+        }
+        let missing_model = unknown_model(&event.model);
+        if ids.duplicates.contains(&event.id)
+            || direct.is_some_and(|record| !record.matches(event, None))
+        {
+            self.mismatches += 1;
+            return;
+        }
+        if !unknown_provider(&event.provider) && event.provider != record.provider {
+            self.conflicts += 1;
+            return;
+        }
+        if unknown_provider(&event.provider) {
+            event.provider.clone_from(&record.provider);
+            event.provider_source = Some(record.source.clone());
+            self.applied += 1;
+            self.migrated += usize::from(direct.is_none());
+            *self.sources.entry(record.source.clone()).or_default() += 1;
+        }
+        if missing_model {
+            event.model.clone_from(&record.model);
+        }
+        if !record.provider_name.trim().is_empty() {
+            let name = names.entry(record.provider.clone()).or_default();
+            if name.trim().is_empty() {
+                name.clone_from(&record.provider_name);
+            }
+        }
+    }
+
+    fn report(records: anyhow::Result<Option<Self>>) -> Value {
+        match records {
+            Ok(Some(r)) => {
+                json!({"status":"ok","source":"legacy-provider-evidence","appliedEvents":r.applied,
+               "sources":r.sources,"invalid":r.invalid,"conflictedEvents":r.conflicts,
+               "signatureMismatches":r.mismatches,"migratedEvents":r.migrated})
+            }
+            Ok(None) => json!({"status":"absent"}),
+            Err(_) => json!({"status":"rejected"}),
+        }
     }
 }
 
@@ -2596,11 +2728,11 @@ impl Index {
         cutoff: NaiveDate,
     ) -> anyhow::Result<bool> {
         self.sync_native_evidence(cutoff)?;
-        let available = native_endpoints::cache_below_limit(
+        let available = native_endpoints::count_evidence_available(
             self.storage_dir.as_deref().unwrap_or(home),
             cutoff,
         )?;
-        // 容量和全局屏障必须与重载的事件屏障属于同一未变更版本。
+        // 全局屏障必须与重载的事件屏障属于同一未变更版本。
         Ok(available && self.native_cache_version == Some(self.provider_cache.data_version()?))
     }
 
@@ -3075,9 +3207,8 @@ impl Index {
             self.native_cache_version = None;
             cache_available = false;
         }
-        // 加载器会跳过无效条目；仅比较加载后的数量无法证明 LIMIT 未截断。
         if cache_available {
-            cache_available = native_endpoints::cache_below_limit(
+            cache_available = native_endpoints::count_evidence_available(
                 self.storage_dir.as_deref().unwrap_or(home),
                 cutoff,
             )
@@ -3172,7 +3303,7 @@ impl Index {
         self.select_observations(cutoff, &mut snapshot, &mut current_aliases, MAX_EVENTS);
         let seen = self.resolve_counts(&mut snapshot);
         let scan_complete = snapshot.errors == 0 && snapshot.issues == 0;
-        let count_cache_has_room = self.native_evidence.observe_count_conflicts(
+        let count_conflicts_available = self.native_evidence.observe_count_conflicts(
             &mut snapshot.events,
             scan_complete && collision_identity_available,
         );
@@ -3181,7 +3312,7 @@ impl Index {
                 event.count_incomplete = true;
             }
         }
-        snapshot.count_cache_available = cache_available && count_cache_has_room;
+        snapshot.count_cache_available = cache_available && count_conflicts_available;
         snapshot.unobserved_count_conflicts =
             self.native_evidence.unobserved_count_conflicts(&seen);
         snapshot.events.retain(|event| {
@@ -3197,70 +3328,13 @@ impl Index {
             &self.provider_cache,
         );
         let aliases = RequestSessionAliases::new(&snapshot.aliases);
-        let mut observations =
-            HashMap::<String, (&SessionModelObservation, bool, bool, bool)>::new();
-        let mut unavailable_session_models = HashSet::new();
-        for state in self
-            .files
-            .values()
-            .filter(|state| !state.identity_conflict && !state.session.is_empty())
-        {
-            for (session, observation) in &state.model_observations {
-                let Some(session) = aliases.resolve(session) else {
-                    if observation.had_unavailable {
-                        unavailable_session_models.insert(session.clone());
-                    }
-                    continue;
-                };
-                let entry =
-                    observations
-                        .entry(session)
-                        .or_insert((observation, false, false, false));
-                entry.1 |= observation.had_unavailable;
-                entry.3 |= observation.unordered;
-                if observation.at > entry.0.at {
-                    entry.0 = observation;
-                    entry.2 = false;
-                } else if observation.at == entry.0.at
-                    && (observation.model != entry.0.model
-                        || observation.provider != entry.0.provider
-                        || observation.role != entry.0.role
-                        || observation.unavailable != entry.0.unavailable)
-                {
-                    entry.2 = true;
-                }
-            }
-        }
-        for (session, (latest, had_unavailable, tied, unordered)) in observations {
-            if !had_unavailable {
-                continue;
-            }
-            if latest.unavailable || unknown_model(&latest.model) || tied || unordered {
-                if let Some(info) = snapshot.session_info.get_mut(&session) {
-                    info["model"] = json!("");
-                    if tied || unordered {
-                        info["provider"] = json!("");
-                        info["role"] = json!("unknown");
-                    } else {
-                        info["provider"] = json!(usage_provider(
-                            &latest.model,
-                            &latest.provider,
-                            &self.provider_names
-                        ));
-                        info["role"] = json!(latest.role);
-                    }
-                }
-                unavailable_session_models.insert(session);
-            } else if let Some(info) = snapshot.session_info.get_mut(&session) {
-                info["model"] = json!(latest.model);
-                info["provider"] = json!(usage_provider(
-                    &latest.model,
-                    &latest.provider,
-                    &self.provider_names
-                ));
-                info["role"] = json!(latest.role);
-            }
-        }
+        let unavailable_session_models = snapshot.apply_session_models(
+            &aliases,
+            self.files.values()
+                .filter(|state| !state.identity_conflict && !state.session.is_empty())
+                .flat_map(|state| &state.model_observations),
+            &self.provider_names,
+        );
         self.request_evidence.supplement_missing_session_models(
             &mut snapshot.session_info,
             &unavailable_session_models,
@@ -3278,7 +3352,7 @@ impl Index {
         );
         snapshot.live_requests = self.request_evidence.records.clone();
         for record in &mut snapshot.live_requests {
-            if self.request_evidence.captured_id_check_failed
+            if self.request_evidence.captured_id_check_error.is_some()
                 || self.request_evidence.captured_rejected.contains(&record.id)
             {
                 // 拒绝记录仍作为合并屏障和竞争证据，不能过滤后拼接两侧请求。
@@ -3288,7 +3362,7 @@ impl Index {
         snapshot.provider_recovery["capturedProxyRequestsRead"] = json!(captured.0);
         snapshot.provider_recovery["capturedProxyLimited"] = json!(captured.1);
         snapshot.provider_recovery["nativeEndpoint"] = self.native_evidence.attribute(
-            home,
+            || native_endpoints::log_paths_for_home(home),
             &mut snapshot.events,
             &self.provider_endpoints,
             self.provider_endpoint_since,
@@ -3336,8 +3410,7 @@ impl Index {
         snapshot.count_cache_available &= cache_available
             && native_writes
                 .as_ref()
-                .is_ok_and(|(_, available)| *available)
-            && self.native_evidence.verified.len() < MAX_EVENTS;
+                .is_ok_and(|(_, available)| *available);
         // 精确事件证据供尚未合并的实时回执使用；不把最后供应商推广到整段会话。
         let now = Local::now().timestamp_millis();
         let mut recent: Vec<_> = snapshot
@@ -3544,7 +3617,10 @@ impl FileState {
         };
         meter.refresh(self, cursor_bytes);
         if self.stamp == Some(stamp) && self.reader.is_none() && !self.resume_pending {
-            return Ok((self.pending.is_empty() && !self.skipping, false));
+            return Ok((
+                self.committed_offset() == self.offset && !self.skipping,
+                false,
+            ));
         }
         let replaced = self.source_replaced(stamp, compressed);
         if replaced {
@@ -3606,6 +3682,39 @@ impl FileState {
                     budget.charge_read(length as usize);
                     continue;
                 }
+                if let Some(spool) = &mut self.oversized
+                    && spool.complete
+                {
+                    let physical_bytes = spool.bytes;
+                    let skill_output = |id: &str| {
+                        self.exec_polls.contains_key(id) || self.calls.get(id).is_some_and(|call| {
+                            call.payload["arguments"]["skillNames"].as_array().is_some_and(|names| !names.is_empty())
+                        })
+                    };
+                    match spool.finish(path, self.offset, stamp.2, &self.session, &self.turn, skill_output)? {
+                        oversized::Projected::Line(line) => {
+                            if budget.event_blocked(self, &line) {
+                                return Ok(false);
+                            }
+                            // 投影已经只剩计量字段，直接消费并保留原始字节范围。
+                            self.accept_record(&line, cutoff, physical_bytes);
+                            meter.refresh(self, index_budget::CURSOR_BYTES);
+                        }
+                        oversized::Projected::Skipped {
+                            affects_usage,
+                            ordinal,
+                        } => {
+                            self.issues += usize::from(affects_usage);
+                            self.activity_truncated |= !affects_usage;
+                            self.observe_rollout_position(if affects_usage {
+                                None
+                            } else {
+                                ordinal
+                            });
+                        }
+                    }
+                    self.oversized = None;
+                }
                 if self.pending.last() == Some(&b'\n') {
                     if !self.accept_pending_line(cutoff, budget, &mut meter) {
                         return Ok(false);
@@ -3616,13 +3725,23 @@ impl FileState {
                 }
                 let bytes = input.fill_buf()?;
                 if bytes.is_empty() {
+                    if compressed && let Some(spool) = &mut self.oversized {
+                        spool.complete = true;
+                        continue;
+                    }
                     if compressed && !self.pending.is_empty() {
                         if !self.accept_pending_line(cutoff, budget, &mut meter) {
                             return Ok(false);
                         }
                     }
-                    waiting_for_append = !compressed && (!self.pending.is_empty() || self.skipping);
-                    return Ok(self.pending.is_empty() && !self.skipping);
+                    if compressed && self.skipping {
+                        self.skipping = false;
+                        let ordinal = self.skipped_ordinal.take();
+                        self.observe_rollout_position(ordinal);
+                    }
+                    let complete = self.committed_offset() == self.offset && !self.skipping;
+                    waiting_for_append = !compressed && !complete;
+                    return Ok(complete);
                 }
                 let length = bytes
                     .iter()
@@ -3635,18 +3754,33 @@ impl FileState {
                 let part = &bytes[..length];
                 let complete = part.last() == Some(&b'\n');
                 let pending_capacity = self.pending.capacity();
-                if !self.skipping {
+                if let Some(spool) = &mut self.oversized {
+                    spool.extend(part)?;
+                } else if !self.skipping {
                     if self.pending.len() + part.len() <= MAX_LINE {
                         if !self.pending.try_extend(part) {
                             return Ok(false);
                         }
                     } else {
-                        let affects_usage = oversized::may_affect_usage(&self.pending);
-                        self.issues += usize::from(affects_usage);
-                        self.activity_truncated |= !affects_usage;
-                        self.pending_response = None;
+                        let (affects_usage, ordinal, may_meter) = oversized::inspect(&self.pending);
+                        if may_meter
+                            && self
+                                .pending
+                                .iter()
+                                .find(|b| !b.is_ascii_whitespace())
+                                .is_none_or(|b| *b == b'{')
+                        {
+                            let mut spool = oversized::Spool::new(&self.pending, compressed)?;
+                            spool.extend(part)?;
+                            self.oversized = Some(spool);
+                        } else {
+                            self.issues += usize::from(affects_usage);
+                            self.activity_truncated |= !affects_usage;
+                            self.pending_response = None;
+                            self.skipped_ordinal = if affects_usage { None } else { ordinal };
+                            self.skipping = true;
+                        }
                         self.pending.clear();
-                        self.skipping = true;
                     }
                 }
                 self.offset += length as u64;
@@ -3656,6 +3790,8 @@ impl FileState {
                     self.retained_charge.saturating_sub(pending_capacity) + self.pending.capacity();
                 if complete && self.skipping {
                     self.skipping = false;
+                    let ordinal = self.skipped_ordinal.take();
+                    self.observe_rollout_position(ordinal);
                 }
                 input.consume(length);
             }
@@ -3705,7 +3841,7 @@ impl FileState {
         Ok((
             metadata.len(),
             metadata.modified().ok(),
-            observed_file_identity(path, &metadata)?,
+            Some(observed_file_identity(path, &metadata)?),
         ))
     }
 
@@ -3714,14 +3850,15 @@ impl FileState {
         stamp: (u64, Option<SystemTime>, Option<(u64, u64)>),
         compressed: bool,
     ) -> bool {
-        self.stamp.is_some_and(|old| {
-            old != stamp
-                && (compressed
-                    || self.invalid_counts
-                    || old.0 > stamp.0
-                    || old.2 != stamp.2
-                    || old.0 == stamp.0 && old.1 != stamp.1)
-        })
+        self.recheck_large_meter
+            || self.stamp.is_some_and(|old| {
+                old != stamp
+                    && (compressed
+                        || self.invalid_counts
+                        || old.0 > stamp.0
+                        || old.2 != stamp.2
+                        || old.0 == stamp.0 && old.1 != stamp.1)
+            })
     }
 
     fn accept_pending_line(
@@ -3754,7 +3891,31 @@ impl FileState {
         true
     }
 
+    fn committed_offset(&self) -> u64 {
+        self.offset
+            - self
+                .oversized
+                .as_ref()
+                .map(|spool| spool.bytes)
+                .unwrap_or(self.pending.len() as u64)
+    }
+
+    fn observe_rollout_position(&mut self, ordinal: Option<u64>) {
+        if let Some(ordinal) = ordinal {
+            let extent = self.rollout_extent.get_or_insert((ordinal, ordinal, 0));
+            self.rollout_out_of_order |= extent.2 != 0 && extent.1.checked_add(1) != Some(ordinal);
+            extent.1 = ordinal;
+            extent.2 = self.offset;
+        } else if self.rollout_extent.is_some() {
+            self.rollout_out_of_order = true;
+        }
+    }
+
     fn accept(&mut self, line: &[u8], cutoff: NaiveDate) {
+        self.accept_record(line, cutoff, line.len() as u64);
+    }
+
+    fn accept_record(&mut self, line: &[u8], cutoff: NaiveDate, line_bytes: u64) {
         if self.identity_conflict {
             return;
         }
@@ -3767,30 +3928,47 @@ impl FileState {
             #[serde(borrow)]
             payload: &'a RawValue,
         }
+        let line_start = self.offset.checked_sub(line_bytes);
+        let preceding_padding = self.nul_padding_end.take();
         let Ok(envelope) = serde_json::from_slice::<Envelope>(line) else {
             if !line.iter().all(u8::is_ascii_whitespace) {
                 self.pending_response = None;
                 self.issues += 1;
+                // A NUL-only physical line stays an issue until both adjacent ordinals prove continuity.
+                if !self.rollout_out_of_order
+                    && self
+                        .rollout_extent
+                        .is_some_and(|(_, _, end)| Some(end) == line_start)
+                    && line.strip_suffix(b"\n").is_some_and(|bytes| {
+                        !bytes.is_empty() && bytes.iter().all(|&byte| byte == 0)
+                    })
+                {
+                    self.nul_padding_end = Some(self.offset);
+                }
             }
             return;
         };
         let ordinal = envelope.ordinal.and_then(|n| u64::try_from(n).ok());
-        if let Some(ordinal) = ordinal {
-            let extent = self.rollout_extent.get_or_insert((ordinal, ordinal, 0));
-            self.rollout_out_of_order |= extent.2 != 0 && ordinal != extent.1 + 1;
-            extent.1 = ordinal;
-            extent.2 = self.offset;
-        } else if self.rollout_extent.is_some() {
-            self.rollout_out_of_order = true;
+        if preceding_padding.is_some()
+            && preceding_padding == line_start
+            && self.rollout_extent.is_some_and(|(_, prev, _)| {
+                ordinal.is_some_and(|next| prev.checked_add(1) == Some(next))
+            })
+        {
+            self.issues -= 1;
+        }
+        self.observe_rollout_position(ordinal);
+        if self.replay_tool_activity && !matches!(envelope.kind, "session_meta" | "response_item") {
+            return;
         }
         let inherited = self.history_boundary.contains(ordinal);
         if envelope.kind == "token_usage_record" {
-            if inherited || line.len() > MAX_NATIVE_RECEIPT_LINE {
+            if inherited {
                 self.pending_response = Some(PendingUsageReceipt::Unusable);
                 return;
             }
             let (Ok(payload), Some(time)) = (
-                serde_json::from_str::<Value>(envelope.payload.get()),
+                terminal_receipts::fields(envelope.payload.get()).and_then(selected_payload),
                 envelope.timestamp.and_then(|at| DateTime::parse_from_rfc3339(at).ok()),
             ) else {
                 self.pending_response = Some(PendingUsageReceipt::Unusable);
@@ -3805,9 +3983,9 @@ impl FileState {
                 {
                     return None;
                 }
-                let response = payload["response_id"].as_str().filter(|id| {
-                    !id.is_empty() && id.len() <= 256 && id.bytes().all(|byte| byte.is_ascii_graphic())
-                })?;
+                let response = payload["response_id"]
+                    .as_str()
+                    .filter(|id| terminal_receipts::valid_response_id(id))?;
                 let usage = Tokens::parse(&payload["usage"])?;
                 let usage = usage.normalize_cache_input(
                     CacheAccounting::parse(&payload["usage"], usage),
@@ -3831,6 +4009,9 @@ impl FileState {
                     date,
                 )
             {
+                if let Some(found) = &mut self.identity_probe {
+                    *found |= receipt.terminal_response.as_ref().is_some_and(|id| id.len() > 256);
+                }
                 self.record_token_day(date);
                 if date >= cutoff {
                     if self.events.len() >= MAX_EVENTS {
@@ -3839,7 +4020,7 @@ impl FileState {
                         receipt.rollout_position = ordinal.map(|ordinal| {
                             (
                                 ordinal,
-                                self.offset.saturating_sub(line.len() as u64),
+                                self.offset.saturating_sub(line_bytes),
                                 self.offset,
                             )
                         });
@@ -3860,18 +4041,29 @@ impl FileState {
         }
         // 忽略消息/推理正文，而不是把多 MB 的文本分配成 Value。
         if envelope.kind == "response_item" {
+            if self.identity_probe.is_some() && line_bytes <= MAX_LINE as u64 {
+                return;
+            }
             let Ok(item) =
                 serde_json::from_str::<execution_observations::Item>(envelope.payload.get())
             else {
                 return;
             };
+            if let Some(found) = &mut self.identity_probe {
+                let now = Local::now().timestamp_millis();
+                *found |= oversized::tool_kind(item.kind) && envelope.timestamp
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .is_some_and(|at| (now - execution_observations::DETAIL_MS..=now)
+                        .contains(&at.timestamp_millis()));
+                return;
+            }
             if let Some(batch) = &mut self.executions
                 && !self.session.is_empty()
                 && !self.history_boundary.contains(ordinal)
                 && !batch.capture(
                     &item,
                     envelope.timestamp,
-                    self.offset - line.len() as u64,
+                    self.offset - line_bytes,
                     self.offset,
                     cutoff,
                     self.skip_activity,
@@ -3894,7 +4086,7 @@ impl FileState {
                 return;
             }
             if item.kind.ends_with("_output")
-                && item.call_id.is_none_or(|id| {
+                && item.call_id().is_none_or(|id| {
                     !self.calls.contains_key(id) && !self.exec_polls.contains_key(id)
                 })
             {
@@ -3931,25 +4123,23 @@ impl FileState {
                 return;
             }
         }
-        let parsed = if matches!(envelope.kind, "session_meta" | "turn_context") {
-            context_fields(envelope.payload.get()).and_then(|fields| {
-                fields
-                    .into_iter()
-                    .filter_map(|(key, value)| value.map(|value| (key, value)))
-                    .map(|(key, value)| {
-                        serde_json::from_str(value.get()).map(|value| (key.to_owned(), value))
-                    })
-                    .collect::<serde_json::Result<serde_json::Map<String, Value>>>()
-                    .map(Value::Object)
-            })
-        } else {
-            serde_json::from_str::<Value>(envelope.payload.get())
+        let parsed = match envelope.kind {
+            "session_meta" | "turn_context" => {
+                context_fields(envelope.payload.get()).and_then(selected_payload)
+            }
+            _ => serde_json::from_str::<Value>(envelope.payload.get()),
         };
         let Ok(payload) = parsed else {
             self.pending_response = None;
             self.issues += 1;
             return;
         };
+        if line_bytes > MAX_LINE as u64 && let Some(found) = &mut self.identity_probe {
+            let kind = payload["type"].as_str().unwrap_or("");
+            *found |= matches!(envelope.kind, "session_meta" | "turn_context")
+                || envelope.kind == "event_msg" && (kind.starts_with("thread_settings")
+                    || matches!(kind, "task_started" | "turn_started"));
+        }
         if envelope.kind == "session_meta" {
             let id = payload["id"]
                 .as_str()
@@ -4065,6 +4255,19 @@ impl FileState {
         let timestamp = time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let date = time.with_timezone(&Local).date_naive();
         if envelope.kind == "turn_context" || event_type.starts_with("thread_settings") {
+            let updated_provider = payload["model_provider"]
+                .as_str()
+                .or_else(|| payload["modelProvider"].as_str())
+                .or_else(|| payload["thread_settings"]["model_provider"].as_str())
+                .or_else(|| payload["thread_settings"]["modelProvider"].as_str())
+                .filter(|provider| !provider.is_empty());
+            let updated_model = payload["model"]
+                .as_str()
+                .or_else(|| payload["thread_settings"]["model"].as_str());
+            if let Some(found) = &mut self.identity_probe {
+                *found |= updated_model.is_some_and(|s| s.len() > 256)
+                    || updated_provider.is_some_and(|s| s.len() > 200);
+            }
             let observation = {
                 let (session, role, provider, model, model_unavailable, turn, ambiguous) =
                     if inherited {
@@ -4089,26 +4292,12 @@ impl FileState {
                             false,
                         )
                     };
-                let updated_provider = payload["model_provider"]
-                    .as_str()
-                    .or_else(|| payload["modelProvider"].as_str())
-                    .or_else(|| payload["thread_settings"]["model_provider"].as_str())
-                    .or_else(|| payload["thread_settings"]["modelProvider"].as_str())
-                    .filter(|provider| !provider.is_empty() && provider.len() <= 200);
                 if let Some(value) = updated_provider {
                     *provider = value.to_owned();
                 }
-                let updated_model = payload["model"]
-                    .as_str()
-                    .or_else(|| payload["thread_settings"]["model"].as_str());
                 if let Some(value) = updated_model {
-                    if value.len() <= 256 {
-                        *model = value.to_owned();
-                        *model_unavailable = false;
-                    } else {
-                        model.clear();
-                        *model_unavailable = true;
-                    }
+                    *model = value.to_owned();
+                    *model_unavailable = false;
                 }
                 if let Some(value) = payload["turn_id"].as_str() {
                     *turn = value.to_owned();
@@ -4156,7 +4345,7 @@ impl FileState {
         }
         if envelope.kind == "response_item" && date >= cutoff {
             if !inherited {
-                self.accept_tool(payload, timestamp, date);
+                self.accept_tool(payload, timestamp, date, line_bytes > MAX_LINE as u64);
             }
             return;
         }
@@ -4197,13 +4386,8 @@ impl FileState {
         let delta = total.usage_delta(self.previous, last);
         self.previous = Some(total);
         self.previous_cache_accounting = cumulative;
-        let rollout_position = ordinal.map(|ordinal| {
-            (
-                ordinal,
-                self.offset.saturating_sub(line.len() as u64),
-                self.offset,
-            )
-        });
+        let rollout_position =
+            ordinal.map(|ordinal| (ordinal, self.offset.saturating_sub(line_bytes), self.offset));
         if date < cutoff {
             if let Some(position) = rollout_position {
                 self.expired_count = Some((position, total));
@@ -4332,11 +4516,11 @@ impl FileState {
         }
     }
 
-    fn accept_tool(&mut self, mut payload: Value, timestamp: String, date: NaiveDate) {
+    fn accept_tool(&mut self, mut payload: Value, timestamp: String, date: NaiveDate, projected: bool) {
         let Some(id) = payload["call_id"]
             .as_str()
             .or_else(|| payload["id"].as_str())
-            .filter(|id| id.len() <= 300)
+            .filter(|id| !id.is_empty())
             .map(str::to_owned)
         else {
             return;
@@ -4350,41 +4534,27 @@ impl FileState {
                 .or_else(|| payload["input"].as_str())
                 .unwrap_or("");
             if name.rsplit('.').next() == Some("write_stdin") {
-                #[derive(Deserialize)]
-                struct PollArgs {
-                    session_id: Option<u64>,
-                }
-                if let Ok(args) = serde_json::from_str::<PollArgs>(arguments) {
-                    let session = args.session_id.map(|id| id.to_string());
-                    if let Some(session) = session.filter(|id| self.exec_skills.contains_key(id)) {
-                        if self.exec_polls.len() >= 512 {
-                            self.exec_polls.clear();
-                        }
-                        self.exec_polls.insert(id, session);
-                    }
-                }
-                return;
-            }
-            if !name.starts_with("mcp__")
-                && !namespace.starts_with("mcp__")
-                && !arguments.to_lowercase().contains("skill.md")
-            {
-                return;
-            }
-            if arguments.len() > 64_000 {
-                self.issues += 1;
-                return;
-            }
-            payload = tool_receipts::call(&payload);
-            if self.calls.len() >= 512 {
-                if let Some(oldest) = self
-                    .calls
-                    .iter()
-                    .min_by(|a, b| a.1.timestamp.cmp(&b.1.timestamp))
-                    .map(|(id, _)| id.clone())
+                let session = if let Some(args) = payload["arguments"].as_object() {
+                    args.get("session_id").and_then(Value::as_u64)
+                } else {
+                    execution_observations::poll_session(arguments)
+                };
+                if let Some(session) = session.map(|id| id.to_string())
+                    && self.exec_skills.contains_key(&session)
                 {
-                    self.calls.remove(&oldest);
+                    self.exec_polls.insert(id, session);
                 }
+                return;
+            }
+            let mcp = name.starts_with("mcp__") || namespace.starts_with("mcp__");
+            if !mcp && !tool_receipts::may_read_skill(name) {
+                return;
+            }
+            if !projected {
+                payload = tool_receipts::call(&payload);
+            }
+            if !mcp && !payload["arguments"]["skillNames"].as_array().is_some_and(|names| !names.is_empty()) {
+                return;
             }
             self.calls.insert(
                 id,
@@ -4421,10 +4591,12 @@ impl FileState {
             let failed = payload["isError"] == true
                 || payload["error"].is_object()
                 || payload["error"].is_string()
+                || payload["error"] == true
                 || payload["output"]["success"] == false
                 || payload["output"]["isError"] == true
                 || payload["output"]["error"].is_object()
                 || payload["output"]["error"].is_string()
+                || payload["output"]["error"] == true
                 || matches!(
                     payload["output"]["status"].as_str(),
                     Some("failed" | "error" | "cancelled" | "canceled" | "interrupted")
@@ -4448,16 +4620,6 @@ impl FileState {
             {
                 let session = session.or_else(|| receipt.map(|(_, id)| id)).unwrap();
                 let evidence = compact_evidence(&evidence, &payload["output"]);
-                if self.exec_skills.len() >= 256 {
-                    if let Some(oldest) = self
-                        .exec_skills
-                        .iter()
-                        .min_by(|a, b| a.1.call.timestamp.cmp(&b.1.call.timestamp))
-                        .map(|(id, _)| id.clone())
-                    {
-                        self.exec_skills.remove(&oldest);
-                    }
-                }
                 let mut call = call;
                 // 后台完成时间包含轮询等待，不能作为同步技能读取耗时。
                 call.payload["arguments"]["singleRead"] = json!(false);
@@ -4473,7 +4635,7 @@ impl FileState {
                 .to_owned();
             // 不返回完整工具输入/输出正文，保持调用身份与失败判定所需字段。
             let mut output = json!({"type":kind,"call_id":id,"timestamp":timestamp,"output":payload["output"],
-                "isError":payload["isError"],"error":payload["error"].is_object() || payload["error"].is_string()});
+                "isError":payload["isError"],"error":payload["error"].is_object() || payload["error"].is_string() || payload["error"] == true});
             if !evidence.is_empty() {
                 output["skillReadEvidence"] = json!(evidence);
             }
@@ -4503,7 +4665,6 @@ fn exec_receipt(value: &Value) -> Option<(bool, String)> {
             "Chunk ID:",
             "Wall time:",
             "Original token count:",
-            "Final output:",
         ]
         .iter()
         .any(|prefix| line.starts_with(prefix))
@@ -4571,6 +4732,58 @@ fn usage_provider<'a>(
 }
 
 impl Snapshot {
+    fn apply_session_models<'a>(
+        &mut self,
+        aliases: &RequestSessionAliases,
+        source_observations: impl Iterator<Item = (&'a String, &'a SessionModelObservation)>,
+        provider_names: &BTreeMap<String, String>,
+    ) -> HashSet<String> {
+        let mut observations = HashMap::new();
+        let mut unavailable = HashSet::new();
+        for (session, observation) in source_observations {
+            let Some(session) = aliases.resolve(session) else {
+                if observation.had_unavailable {
+                    unavailable.insert(session.clone());
+                }
+                continue;
+            };
+            let (latest, had_unavailable, tied, unordered) = observations
+                .entry(session)
+                .or_insert((observation, false, false, false));
+            *had_unavailable |= observation.had_unavailable;
+            *unordered |= observation.unordered;
+            if observation.at > latest.at {
+                *latest = observation;
+                *tied = false;
+            } else if observation.at == latest.at
+                && (observation.model != latest.model || observation.provider != latest.provider
+                    || observation.role != latest.role || observation.unavailable != latest.unavailable)
+            {
+                *tied = true;
+            }
+        }
+        for (session, (latest, had_unavailable, tied, unordered)) in observations {
+            // 仅有未知型号时沿用已有回退；冲突或时间无序时不能选任一来源。
+            let unknown = unknown_model(&latest.model);
+            if unknown && !had_unavailable && !tied && !unordered {
+                continue;
+            }
+            let ambiguous = tied || unordered;
+            let missing = latest.unavailable || unknown || ambiguous;
+            if let Some(info) = self.session_info.get_mut(&session) {
+                info["model"] = json!(if missing { "" } else { latest.model.as_str() });
+                info["provider"] = if ambiguous { json!("") } else {
+                    json!(usage_provider(&latest.model, &latest.provider, provider_names))
+                };
+                info["role"] = json!(if ambiguous { "unknown" } else { latest.role.as_str() });
+            }
+            if missing {
+                unavailable.insert(session);
+            }
+        }
+        unavailable
+    }
+
     fn collect_scope_parents<'a>(&mut self, files: impl Iterator<Item = &'a FileState>) {
         self.collect_scope_candidates(files.filter_map(|file| {
             file.scope_parent_candidates

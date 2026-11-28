@@ -5,12 +5,12 @@ use super::{
         Store,
         archive::{ArchiveKey, Recovered},
         executions::{DetailQuery, ExecutionQuery},
-        projection::ArchiveAnswer,
+        projection::{ArchiveAnswer, classification_lookback_ms},
     },
 };
 use crate::usage_history::{
     Query, TOKEN_INDEX_DB,
-    structured::{Index, RequestEvidence, live_receipts, read_history_settings},
+    structured::{Index, RequestEvidence, index_budget::MAX_RETAINED_BYTES, live_receipts, read_history_settings},
 };
 use anyhow::{Context, Result, ensure};
 use chrono::{Days, Local, NaiveDate};
@@ -28,9 +28,13 @@ use std::sync::{
 };
 use std::time::Duration;
 
-const RECONCILIATION_BYTES: usize = 32 * 1024 * 1024;
-const CLASSIFICATION_SESSIONS_PER_ROUND: usize = 6;
-const CLASSIFICATION_SLICE_MS: i64 = 300_000;
+const HISTORICAL_CLASSIFICATION_WINDOWS_PER_ROUND: usize = 2;
+
+struct RecentClassification {
+    latest: i64,
+    before: i64,
+    older_next: bool,
+}
 
 pub(in super::super) struct Runtime {
     storage: PathBuf,
@@ -40,7 +44,8 @@ pub(in super::super) struct Runtime {
     retry_full: bool,
     evidence: Index,
     evidence_cursor: usize,
-    evidence_before: BTreeMap<String, i64>,
+    evidence_before: BTreeMap<String, RecentClassification>,
+    historical_cursor: Option<(i64, i64)>,
     historical: Option<Arc<Historical>>,
     historical_verifier: Arc<Mutex<EvidenceVerifier>>,
 }
@@ -57,6 +62,8 @@ pub(in super::super) struct ReadState {
     historical_error: Option<String>,
     historical_verifier: Arc<Mutex<EvidenceVerifier>>,
 }
+
+pub(in super::super) type HistoryReader = Arc<Mutex<Connection>>;
 
 fn open_database(storage: &Path, write: bool) -> Result<Connection> {
     if write {
@@ -80,7 +87,12 @@ fn open_database(storage: &Path, write: bool) -> Result<Connection> {
         storage.join(TOKEN_INDEX_DB),
         flags | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
-    db.busy_timeout(Duration::from_millis(50))?;
+    // 冷备份切换 WAL 需要等前台读事务结束；后台写者不沿用前台的短等待。
+    db.busy_timeout(if write {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_millis(50)
+    })?;
     Ok(db)
 }
 
@@ -98,6 +110,7 @@ impl Runtime {
             retry_full: false,
             evidence_cursor: 0,
             evidence_before: BTreeMap::new(),
+            historical_cursor: Some((0, i64::MAX)),
             historical: None,
             historical_verifier: Arc::default(),
         }
@@ -112,6 +125,21 @@ impl Runtime {
             historical_verifier: Arc::clone(&self.historical_verifier),
             ..ReadState::default()
         }
+    }
+
+    pub(in super::super) fn pin_refresh_reader(
+        &self,
+        state: &ReadState,
+    ) -> Result<Option<HistoryReader>> {
+        if state.historical.is_none() {
+            return Ok(None);
+        }
+        let budget = u64::from(read_history_settings(&self.settings)?.storage_mib) * 1024 * 1024;
+        // Leave WAL reclamation to the writer before pinning the next round.
+        if working_index_bytes(&self.storage)? >= budget {
+            return Ok(None);
+        }
+        ReadState::open_reader(&self.storage).map(Some)
     }
 
     fn update_with_request_log(&mut self, home: &Path, request_log: &Path) -> ReadState {
@@ -148,7 +176,9 @@ impl Runtime {
             &mut state,
         ) {
             Ok(true) if evidence_available => {
-                if let Err(error) = self.classify_recent(home, proof_cutoff, &mut state) {
+                if let Err(error) =
+                    self.classify_retained(home, proof_cutoff, MAX_RETAINED_BYTES, &mut state)
+                {
                     state.classification_error = Some(format!("{error:#}"));
                 }
             }
@@ -179,7 +209,7 @@ impl Runtime {
             .clone_from(&self.evidence.request_evidence.records);
         for request in &mut state.requests {
             let evidence = &self.evidence.request_evidence;
-            if evidence.captured_id_check_failed || evidence.captured_rejected.contains(&request.id)
+            if evidence.captured_id_check_error.is_some() || evidence.captured_rejected.contains(&request.id)
             {
                 request.success = false;
             }
@@ -187,83 +217,151 @@ impl Runtime {
         state
     }
 
-    fn classify_recent(
+    fn classify_retained(
         &mut self,
         home: &Path,
         cutoff: NaiveDate,
+        byte_budget: usize,
         state: &mut ReadState,
     ) -> Result<()> {
         let store = self
             .store
             .as_mut()
             .expect("successful scan owns a usage index");
-        let now = Local::now().timestamp_millis();
-        let sessions = store.recent_sessions(now - 86_400_000)?;
+        let recent_since = Local::now().timestamp_millis() - 86_400_000;
+        let sessions = store.recent_sessions(recent_since)?;
         let active: std::collections::BTreeSet<_> = sessions.iter().map(|(id, _)| id).collect();
         self.evidence_before.retain(|id, _| active.contains(id));
-        if sessions.is_empty() {
-            self.evidence_cursor = 0;
+        let slots = sessions.len() + usize::from(self.historical_cursor.is_some());
+        if slots == 0 {
             return Ok(());
         }
-        let offset = self.evidence_cursor % sessions.len();
-        let count = CLASSIFICATION_SESSIONS_PER_ROUND.min(sessions.len());
-        self.evidence_cursor = offset + count;
+        let offset = self.evidence_cursor % slots;
+        self.evidence_cursor = offset + 1;
         let index = &mut self.evidence;
+        let mut remaining = byte_budget;
+        let mut classify_page = |store: &mut Store, session: &str, from, to, shares: usize| {
+            if remaining == 0 {
+                return Ok(None);
+            }
+            // 每轮首个窗口可完整读取竞争记录，后续窗口共享剩余预算。
+            let available = if remaining == byte_budget {
+                usize::MAX
+            } else {
+                remaining
+            };
+            let Some((window, bytes)) =
+                store.classification_page(session, from, to, remaining / shares, available)?
+            else {
+                return Ok(None);
+            };
+            remaining = remaining.saturating_sub(bytes);
+            let start = window.start;
+            store.reclassify_window(
+                session,
+                Some(window),
+                bytes,
+                self.scan.scoped_count_gaps(),
+                self.scan.sealed_pending(),
+                |events, aliases, scope| {
+                    ensure!(
+                        index.native_evidence.observe_count_conflicts(events, true),
+                        "native count conflict has an invalid timestamp"
+                    );
+                    index.request_evidence.supplement_captured_scoped(
+                        events,
+                        aliases,
+                        &index.provider_cache,
+                        Some(scope),
+                    );
+                    index.request_evidence.attribute_with_cache_scoped(
+                        events,
+                        &mut state.provider_names,
+                        aliases,
+                        &index.provider_cache,
+                        Some(scope),
+                    );
+                    if let Some(error) = &index.request_evidence.captured_id_check_error {
+                        anyhow::bail!("captured request validation failed: {error}");
+                    }
+                    index.native_evidence.attribute(
+                        || super::super::native_endpoints::log_paths_for_home(home),
+                        events,
+                        &index.provider_endpoints,
+                        index.provider_endpoint_since,
+                        aliases,
+                        &index.provider_cache,
+                        true,
+                        Some(scope),
+                    );
+                    index.native_evidence.apply_count_conflicts(events);
+                    Ok(())
+                },
+            )?;
+            Ok::<_, anyhow::Error>(Some(start))
+        };
         let mut failure = None;
-        for (session, latest) in sessions.iter().cycle().skip(offset).take(count) {
-            let tail = latest.saturating_sub(CLASSIFICATION_SLICE_MS - 1)..latest.saturating_add(1);
-            let before = self
-                .evidence_before
-                .entry(session.clone())
-                .or_insert(tail.start);
-            let older = store
-                .classification_before(session, (*before).min(tail.start))?
-                .map(|at| at.saturating_sub(CLASSIFICATION_SLICE_MS - 1)..at.saturating_add(1));
-            *before = older.as_ref().map_or(tail.start, |window| window.start);
-            for window in older.into_iter().chain(std::iter::once(tail)) {
-                let result = store.reclassify_window(
-                    session,
-                    Some(window),
-                    RECONCILIATION_BYTES,
-                    self.scan.scoped_count_gaps(),
-                    |events, aliases, scope| {
-                        ensure!(
-                            index.native_evidence.observe_count_conflicts(events, true),
-                            "native count evidence exceeds capacity"
+        for step in 0..slots {
+            let slot = (offset + step) % slots;
+            let shares = slots - step;
+            if let Some((session, latest)) = sessions.get(slot) {
+                let cursor = self.evidence_before.get(session);
+                let older = match cursor.filter(|cursor| cursor.older_next) {
+                    Some(cursor) => store.classification_before(session, cursor.before)?,
+                    None => None,
+                };
+                // 先覆盖最近一天，再交替回访尾部和向前翻页；每次从真实事件继续。
+                let (from, to) = match (cursor, older) {
+                    (_, Some(at)) => (i64::MIN, at),
+                    (Some(cursor), None) => (
+                        cursor
+                            .latest
+                            .min(*latest)
+                            .saturating_sub(classification_lookback_ms()),
+                        *latest,
+                    ),
+                    (None, None) => (recent_since, *latest),
+                };
+                match classify_page(store, session, from, to, shares) {
+                    Ok(Some(start)) => {
+                        let before = match cursor {
+                            Some(cursor) if !cursor.older_next => cursor.before,
+                            _ => start,
+                        };
+                        self.evidence_before.insert(
+                            session.clone(),
+                            RecentClassification {
+                                latest: match (cursor, older) {
+                                    (Some(cursor), Some(_)) => cursor.latest,
+                                    _ => *latest,
+                                },
+                                before,
+                                older_next: older.is_none(),
+                            },
                         );
-                        index.request_evidence.supplement_captured_scoped(
-                            events,
-                            aliases,
-                            &index.provider_cache,
-                            Some(scope),
-                        );
-                        index.request_evidence.attribute_with_cache_scoped(
-                            events,
-                            &mut state.provider_names,
-                            aliases,
-                            &index.provider_cache,
-                            Some(scope),
-                        );
-                        ensure!(
-                            !index.request_evidence.captured_id_check_failed,
-                            "captured request validation failed"
-                        );
-                        index.native_evidence.attribute(
-                            home,
-                            events,
-                            &index.provider_endpoints,
-                            index.provider_endpoint_since,
-                            aliases,
-                            &index.provider_cache,
-                            true,
-                            Some(scope),
-                        );
-                        index.native_evidence.apply_count_conflicts(events);
-                        Ok(())
-                    },
-                );
-                if let Err(error) = result {
-                    failure.get_or_insert(error);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
+                }
+            } else {
+                for left in (1..=HISTORICAL_CLASSIFICATION_WINDOWS_PER_ROUND).rev() {
+                    let (session_id, before) = self.historical_cursor.unwrap();
+                    let Some((id, session, at)) =
+                        store.historical_classification_before(session_id, before, recent_since)?
+                    else {
+                        self.historical_cursor = None;
+                        break;
+                    };
+                    match classify_page(store, &session, i64::MIN, at, shares * left) {
+                        Ok(Some(start)) => self.historical_cursor = Some((id, start)),
+                        Ok(None) => break,
+                        Err(error) => {
+                            failure.get_or_insert(error);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -273,7 +371,7 @@ impl Runtime {
         let (_, available) = index
             .native_evidence
             .save_bounded(&self.storage, cutoff, &[])?;
-        ensure!(available, "native evidence cache exceeds capacity");
+        ensure!(available, "native count evidence has an unresolved global conflict");
         if let Some(error) = failure {
             return Err(error);
         }
@@ -345,13 +443,9 @@ impl Runtime {
             home,
             cutoff,
             &state.provider_names,
-            RECONCILIATION_BYTES,
+            MAX_RETAINED_BYTES,
         );
         state.failed_sources = report.errors.len();
-        let can_classify = report.complete
-            || (report.pending_sources == 0
-                && report.issues != 0
-                && report.issues == self.scan.scoped_count_gaps().len());
         if let Some(error) = report.maintenance_error {
             self.retry_full = disk_full(&error);
             return Err(error.context("maintaining usage index"));
@@ -364,7 +458,7 @@ impl Runtime {
             self.retry_full = true;
             return Err(error.context("writing usage index"));
         }
-        Ok(can_classify)
+        Ok(report.can_classify)
     }
 }
 
@@ -382,19 +476,20 @@ fn allocated_pages(db: &Connection) -> Result<(u64, u64)> {
 }
 
 // 长读事务会阻止 WAL 回收；先暂停摄取，避免每一轮继续累加日志。
-fn checkpoint_if_over_budget(db: &Connection, storage: &Path, budget: u64) -> Result<bool> {
-    let bytes = || -> Result<u64> {
-        let mut used = 0;
-        for suffix in ["", "-wal", "-shm", "-journal"] {
-            match fs::metadata(storage.join(format!("{TOKEN_INDEX_DB}{suffix}"))) {
-                Ok(metadata) => used += metadata.len(),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
+fn working_index_bytes(storage: &Path) -> Result<u64> {
+    let mut used = 0;
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        match fs::metadata(storage.join(format!("{TOKEN_INDEX_DB}{suffix}"))) {
+            Ok(metadata) => used += metadata.len(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
-        Ok(used)
-    };
-    if bytes()? >= budget {
+    }
+    Ok(used)
+}
+
+fn checkpoint_if_over_budget(db: &Connection, storage: &Path, budget: u64) -> Result<bool> {
+    if working_index_bytes(storage)? >= budget {
         let (busy, _, _): (i64, i64, i64) =
             db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -403,12 +498,19 @@ fn checkpoint_if_over_budget(db: &Connection, storage: &Path, budget: u64) -> Re
             busy == 0,
             "usage index working budget exhausted (WAL reader active)"
         );
-        return Ok(bytes()? < budget);
+        return Ok(working_index_bytes(storage)? < budget);
     }
     Ok(true)
 }
 
 impl ReadState {
+    pub(in super::super) fn open_reader(storage: &Path) -> Result<HistoryReader> {
+        let db = open_database(storage, false)?;
+        db.execute_batch("BEGIN")?;
+        db.query_row("SELECT revision FROM token_revision", [], |row| row.get::<_, i64>(0))?;
+        Ok(Arc::new(Mutex::new(db)))
+    }
+
     pub(in super::super) fn read_executions(
         &self,
         storage: &Path,
@@ -443,22 +545,25 @@ impl ReadState {
         scope_session: Option<&str>,
         processing: bool,
     ) -> Value {
-        self.read_with_archive(storage, options, request, scope_session, processing, None)
-            .0
+        self.read_with_archive(
+            storage, Self::open_reader(storage), options, request, scope_session, processing, None,
+        ).0
     }
 
     pub(in super::super) fn read_with_archive(
         &self,
         storage: &Path,
+        reader: Result<HistoryReader>,
         options: &Query,
         request: &Value,
         scope_session: Option<&str>,
         processing: bool,
         archive: Option<&ArchiveAnswer>,
     ) -> (Value, Option<ArchiveKey>) {
-        let (mut response, schedule) = match open_database(storage, false).and_then(|mut db| {
-            Store::read_response_with_archive(
-                &mut db,
+        let (mut response, schedule) = match reader.and_then(|reader| {
+            let db = reader.lock().map_err(|_| anyhow::anyhow!("usage snapshot reader panicked"))?;
+            Store::read_snapshot(
+                &db,
                 options,
                 request,
                 scope_session,
@@ -577,8 +682,53 @@ pub(in super::super) fn recover_archive(
 }
 
 #[cfg(test)]
+mod classification_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_seed_writer_waits_for_a_foreground_reader_before_enabling_wal() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(open_database(root.path(), true).unwrap()).unwrap();
+        store
+            .db
+            .execute("UPDATE token_revision SET revision=6245", [])
+            .unwrap();
+        store.db.pragma_update(None, "journal_mode", "DELETE").unwrap();
+        drop(store);
+
+        let storage = root.path().to_owned();
+        let (pinned, ready) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut db = open_database(&storage, false).unwrap();
+            let read = db.transaction().unwrap();
+            let revision: i64 = read
+                .query_row("SELECT revision FROM token_revision", [], |row| row.get(0))
+                .unwrap();
+            pinned.send(revision).unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+            read.commit().unwrap();
+        });
+        assert_eq!(ready.recv().unwrap(), 6245);
+        let opened = Store::open(open_database(root.path(), true).unwrap());
+        reader.join().unwrap();
+        let store = opened.expect("writer must wait for the foreground read to finish");
+        assert_eq!(
+            store
+                .db
+                .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
+        assert_eq!(read_revision(root.path()), 6245);
+        store
+            .db
+            .execute("UPDATE token_revision SET revision=revision+1", [])
+            .unwrap();
+        assert_eq!(read_revision(root.path()), 6246);
+    }
 
     #[test]
     fn storage_policy_applies_to_the_live_writer_without_rewinding_retained_history() {
@@ -775,6 +925,115 @@ mod tests {
     }
 
     #[test]
+    fn cold_historical_attribution_is_batched_and_preserves_counts_and_conflicts() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        let home = fs::canonicalize(home).unwrap();
+        let settings = root.path().join("settings.json");
+        fs::write(&settings, r#"{"usageHistoryEnabled":true}"#).unwrap();
+        let request_log = root.path().join("requests.jsonl");
+        let now = Local::now();
+        let at = now - chrono::Duration::days(3);
+        let stamp = at.to_rfc3339();
+        let usage = json!({"input_tokens":100,"cached_input_tokens":20,"output_tokens":10});
+        let mut log = String::new();
+        for i in 1..=4 {
+            let session = format!("00000000-0000-4000-8000-{i:012}");
+            let model = format!("gpt-fixture-{i}");
+            let meta = json!({"type":"session_meta","timestamp":stamp,
+                "payload":{"id":session,"model_provider":"custom","source":"vscode"}});
+            let turn = json!({"type":"turn_context","timestamp":stamp,
+                "payload":{"turn_id":"test-turn","model":model}});
+            let count = json!({"type":"event_msg","timestamp":stamp,"payload":{
+                "type":"token_count","info":{"total_token_usage":usage,"last_token_usage":usage}}});
+            fs::write(
+                home.join(format!("sessions/rollout-{i}.jsonl")),
+                format!("{meta}\n{turn}\n{count}\n"),
+            )
+            .unwrap();
+            let mut proof = json!({"id":format!("proof-{i}"),"threadId":session,"model":model,
+                "upstreamModel":model,"relayId":"fixture-relay","relayName":"Fixture",
+                "success":true,"state":"success","statusCode":200,"timestampMs":at.timestamp_millis(),
+                "startedAtMs":at.timestamp_millis()-100,"attempts":1,"autoRetries":0,
+                "usage":{"inputTokens":100,"cachedTokens":20,"outputTokens":10}});
+            log.push_str(&format!("{proof}\n"));
+            if i == 4 {
+                proof["id"] = json!("competing-proof");
+                proof["relayId"] = json!("competing-relay");
+                log.push_str(&format!("{proof}\n"));
+            }
+        }
+        fs::write(&request_log, log).unwrap();
+        let day = at.date_naive().to_string();
+        let request = json!({"from":day,"to":day});
+        let query = Query::parse(&request, now.date_naive()).unwrap();
+        let exact_models = |result: &Value| {
+            let mut models: Vec<_> = result["days"][0]["breakdowns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["classificationEvidence"] == "request-log-exact")
+                .map(|row| row["model"].as_str().unwrap().to_owned())
+                .collect();
+            models.sort_unstable();
+            models
+        };
+        // 冷启动按文件修改时间摄取，使有竞争证明的会话分别落在第二批、第一批。
+        for (order, expected_first) in [
+            ([1, 2, 3, 4], &["gpt-fixture-1", "gpt-fixture-2"][..]),
+            ([3, 4, 1, 2], &["gpt-fixture-3"][..]),
+        ] {
+            for (rank, i) in order.iter().enumerate() {
+                let path = home.join(format!("sessions/rollout-{i}.jsonl"));
+                let modified =
+                    std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000 - rank as u64 * 60);
+                fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_modified(modified)
+                    .unwrap();
+            }
+            let storage = root.path().join(format!("history-{}", order[0]));
+            let mut worker = Runtime::new(storage.clone(), settings.clone());
+            let pass = |worker: &mut Runtime| {
+                let state = worker.update_with_request_log(&home, &request_log);
+                assert!(
+                    state.classification_error.is_none(),
+                    "{:?}",
+                    state.classification_error
+                );
+                state.read(&storage, &query, &request, None, false)
+            };
+            let first = pass(&mut worker);
+            assert_eq!(exact_models(&first), expected_first, "{first}");
+            assert_eq!(worker.historical_cursor.unwrap().0, 2);
+            let second = pass(&mut worker);
+            assert_eq!(
+                exact_models(&second),
+                ["gpt-fixture-1", "gpt-fixture-2", "gpt-fixture-3"],
+                "{second}"
+            );
+            assert_eq!(second["days"][0]["usage"], first["days"][0]["usage"]);
+            let usage = &second["days"][0]["usage"];
+            assert_eq!(usage["inputTokens"], 400);
+            assert_eq!(usage["cachedInputTokens"], 80);
+            assert_eq!(usage["outputTokens"], 40);
+            assert_eq!(usage["totalTokens"], 440);
+            assert_eq!(second["days"][0]["recordCount"], 4);
+            assert_eq!(second["classificationStatus"]["uncertainEvents"], 1);
+            let complete = pass(&mut worker);
+            assert!(worker.historical_cursor.is_none());
+            assert_eq!(complete["revision"], second["revision"]);
+            drop(worker);
+            let reopened = pass(&mut Runtime::new(storage.clone(), settings.clone()));
+            assert_eq!(reopened["days"], second["days"]);
+            assert_eq!(reopened["revision"], second["revision"]);
+        }
+    }
+
+    #[test]
     fn late_gateway_attribution_with_an_unrelated_count_gap_survives_restart() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
@@ -847,5 +1106,145 @@ mod tests {
             .read(&storage, &query, &request, None, false);
         assert_eq!(cold["days"], after["days"]);
         assert_eq!(cold["revision"], after["revision"]);
+    }
+
+    #[test]
+    fn sealed_queued_sources_allow_gateway_evidence_and_a_new_or_replaced_archive_withdraws_it() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let sources = home.join("sessions");
+        fs::create_dir_all(&sources).unwrap();
+        let home = fs::canonicalize(home).unwrap();
+        let settings = root.path().join("settings.json");
+        fs::write(&settings, r#"{"usageHistoryEnabled":true}"#).unwrap();
+        let log = root.path().join("requests.jsonl");
+        let storage = root.path().join("history");
+        let now = Local::now();
+        let session = "00000000-0000-4000-8000-000000000001";
+        let other = "00000000-0000-4000-8000-000000000002";
+        let head = |id: &str| {
+            json!({"type":"session_meta","timestamp":now.to_rfc3339(),
+                                     "payload":{"id":id,"model_provider":"custom"}})
+        };
+        let turn = json!({"type":"turn_context","timestamp":now.to_rfc3339(),
+                          "payload":{"turn_id":"turn","model":"gpt-fixture"}});
+        let usage = json!({"input_tokens":100,"cached_input_tokens":20,"output_tokens":10});
+        let mut count = json!({"type":"event_msg","timestamp":now.to_rfc3339(),"payload":{
+            "type":"token_count","info":{"total_token_usage":usage,"last_token_usage":usage}}});
+        fs::write(
+            sources.join("rollout-000.jsonl"),
+            format!("{}\n{turn}\n{count}\n", head(session)),
+        )
+        .unwrap();
+        for i in 1..74 {
+            fs::write(
+                sources.join(format!("rollout-{i:03}.jsonl")),
+                format!("{}\n", head(other)),
+            )
+            .unwrap();
+        }
+        count["payload"]["info"]["total_token_usage"]["input_tokens"] = json!("invalid");
+        let archived = sources.join("rollout-last.jsonl.zst");
+        let data = format!("{}\n{count}\n", head(other));
+        fs::write(
+            &archived,
+            zstd::stream::encode_all(data.as_bytes(), 1).unwrap(),
+        )
+        .unwrap();
+        let oldest = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&archived)
+            .unwrap()
+            .set_modified(oldest)
+            .unwrap();
+        let request = json!({"period":"today","includeSessionCursors":true});
+        let query = Query::parse(&request, now.date_naive()).unwrap();
+        let pass = |worker: &mut Runtime| {
+            let state = worker.update_with_request_log(&home, &log);
+            assert!(state.storage_error.is_none(), "{:?}", state.storage_error);
+            assert!(
+                state.classification_error.is_none(),
+                "{:?}",
+                state.classification_error
+            );
+            state.read(&storage, &query, &request, None, false)
+        };
+        let mut worker = Runtime::new(storage.clone(), settings.clone());
+        pass(&mut worker);
+        let native = pass(&mut worker);
+        assert_eq!(native["days"][0]["recordCount"], 1);
+        assert_eq!(native["scan"]["sourceIssues"], 1);
+        let proof = json!({"id":"test-proof","threadId":session,"model":"gpt-fixture",
+            "upstreamModel":"gpt-fixture","relayId":"fixture-relay","relayName":"Fixture",
+            "success":true,"state":"success","statusCode":200,"timestampMs":now.timestamp_millis(),
+            "startedAtMs":now.timestamp_millis()-100,"attempts":1,"autoRetries":0,
+            "usage":{"inputTokens":100,"cachedTokens":20,"outputTokens":10}});
+        fs::write(&log, format!("{proof}\n")).unwrap();
+        drop(worker);
+        let exact = |view: &Value| {
+            view["days"][0]["breakdowns"][0]["classificationEvidence"] == "request-log-exact"
+        };
+        for case in ["new", "replaced"] {
+            let mut worker = Runtime::new(storage.clone(), settings.clone());
+            let known = pass(&mut worker);
+            assert!(known["scan"]["pendingFiles"].as_u64().unwrap() > 0);
+            assert_eq!(known["countStatus"]["complete"], false);
+            assert!(
+                exact(&known),
+                "{case}: sealed backlog must allow exact evidence"
+            );
+            drop(worker);
+            let disturb = if case == "new" {
+                sources.join("rollout-new-last.jsonl.zst")
+            } else {
+                archived.clone()
+            };
+            let fresh = format!("{}\n", head(other));
+            fs::write(
+                &disturb,
+                zstd::stream::encode_all(fresh.as_bytes(), 1).unwrap(),
+            )
+            .unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&disturb)
+                .unwrap()
+                .set_modified(oldest)
+                .unwrap();
+            let mut worker = Runtime::new(storage.clone(), settings.clone());
+            let unverified = pass(&mut worker);
+            assert!(unverified["scan"]["pendingFiles"].as_u64().unwrap() > 0);
+            assert!(
+                !exact(&unverified),
+                "{case}: unverified backlog retained exact evidence"
+            );
+            assert_eq!(unverified["days"][0]["usage"], native["days"][0]["usage"]);
+            assert_eq!(unverified["sessionCursors"], native["sessionCursors"]);
+            assert!(
+                exact(&pass(&mut worker)),
+                "{case}: resolved backlog must recover"
+            );
+        }
+        use std::io::Write;
+        let mut active = fs::OpenOptions::new()
+            .append(true)
+            .open(sources.join("rollout-000.jsonl"))
+            .unwrap();
+        active.write_all(b"{").unwrap();
+        let mut worker = Runtime::new(storage.clone(), settings.clone());
+        let partial = pass(&mut worker);
+        assert!(
+            !exact(&partial),
+            "an unfinished same-session tail retained evidence"
+        );
+        assert_eq!(partial["days"][0]["usage"], native["days"][0]["usage"]);
+        active
+            .write_all(b"\"type\":\"fixture-ignored\",\"payload\":{}}\n")
+            .unwrap();
+        drop(active);
+        drop(worker);
+        let mut reopened = Runtime::new(storage.clone(), settings);
+        assert!(exact(&pass(&mut reopened)));
     }
 }

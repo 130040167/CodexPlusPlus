@@ -3,7 +3,7 @@ use super::{Store, decode_path};
 use crate::usage_history::{
     normalize_session_id,
     structured::{
-        FileState, MAX_LINE, exec_receipt,
+        FileState, exec_receipt,
         execution_observations::{DETAIL_MS, LIST_MS},
         log_file,
     },
@@ -20,9 +20,6 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::LazyLock;
 
-const MAX_DETAIL_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_ARCHIVE_DETAIL_OFFSET: u64 = 32 * 1024 * 1024;
-const MAX_OUTPUTS: usize = 64;
 pub(super) const COMPACTABLE_METADATA: &str =
     "name IS NOT NULL AND name != 'write_stdin' AND substr(name,-12) != '.write_stdin'
      AND substr(name, 1, 5) != 'mcp__' AND substr(COALESCE(namespace,''), 1, 5) != 'mcp__'";
@@ -245,7 +242,6 @@ impl ExecutionQuery {
             "工具时间范围无效"
         );
         ensure!((1..=200).contains(&query.limit), "工具分页大小无效");
-        ensure!(query.search.len() <= 512, "工具搜索过长");
         ensure!(
             query
                 .kind
@@ -268,12 +264,9 @@ impl ExecutionQuery {
         let Some(cursor) = &self.cursor else {
             return Ok(None);
         };
-        ensure!(cursor.len() <= 1024, "工具游标过长");
         let cursor: Cursor = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(cursor)?)?;
         ensure!(
-            normalize_session_id(&cursor.1).is_some()
-                && !cursor.2.is_empty()
-                && cursor.2.len() <= 300,
+            normalize_session_id(&cursor.1).is_some() && !cursor.2.is_empty(),
             "工具游标无效"
         );
         Ok(Some(cursor))
@@ -564,10 +557,7 @@ impl DetailQuery {
     pub(in crate::usage_history::structured) fn parse(request: &Value) -> Result<Self> {
         let mut query = Self::deserialize(request)?;
         query.session_id = normalize_session_id(&query.session_id).context("会话 ID 无效")?;
-        ensure!(
-            !query.id.is_empty() && query.id.len() <= 300,
-            "工具调用 ID 无效"
-        );
+        ensure!(!query.id.is_empty(), "工具调用 ID 无效");
         ensure!(query.revision >= 0, "工具版本无效");
         Ok(query)
     }
@@ -639,9 +629,7 @@ impl Store {
             values
         };
         let (source_id, call, path, committed_offset, expected) = location;
-        let mut outputs = Vec::new();
-        {
-            let mut statement = tx.prepare(
+        let mut statement = tx.prepare(
                 "WITH direct AS (
                     SELECT e.* FROM execution_observations e
                     WHERE e.session_id = (SELECT id FROM token_sessions WHERE session = ?1)
@@ -657,7 +645,7 @@ impl Store {
                     AND NOT EXISTS (
                         SELECT 1 FROM execution_process r JOIN execution_observations e USING(source_id,position)
                         WHERE r.process = c.process AND e.session_id = c.session_id
-                          AND e.timestamp_ms > ?8 AND e.timestamp_ms <= ?6 AND (
+                          AND e.timestamp_ms > ?7 AND e.timestamp_ms <= ?6 AND (
                             e.source_id != ?3 OR (e.is_output = 1 AND e.call_id != ?2 AND NOT EXISTS (
                                 SELECT 1 FROM execution_observations poll
                                   JOIN execution_process p USING(source_id,position)
@@ -683,20 +671,20 @@ impl Store {
                    ON o.source_id = p.source_id AND o.session_id = p.session_id AND o.call_id = p.call_id
                  WHERE o.is_output = 1 AND o.end IS NOT NULL AND o.position >= p.end
                    AND o.timestamp_ms >= p.timestamp_ms AND o.timestamp_ms <= ?6
-                 ORDER BY position LIMIT ?7",
-            )?;
-            let mut rows = statement.query(params![
+                 ORDER BY position",
+        )?;
+        let outputs = statement.query_map(
+            params![
                 query.session_id,
                 query.id,
                 source_id,
                 call.end,
                 call.at,
                 cutoff,
-                MAX_OUTPUTS + 1,
                 cutoff - DETAIL_MS,
-            ])?;
-            while let Some(row) = rows.next()? {
-                outputs.push((
+            ],
+            |row| {
+                Ok((
                     Location {
                         start: row.get(0)?,
                         end: row.get(1)?,
@@ -704,10 +692,9 @@ impl Store {
                     },
                     row.get::<_, String>(3)?,
                     row.get::<_, Option<String>>(4)?,
-                ));
-            }
-        }
-        tx.commit()?;
+                ))
+            },
+        )?;
         if !recent(call.at, now()) {
             return Ok(not_found());
         }
@@ -737,7 +724,7 @@ impl Store {
         } else {
             DetailReader::Plain(file)
         };
-        let item = reader.read_item(&call, committed_offset, &query.id, false)?;
+        let mut item = reader.read_item(&call, committed_offset, &query.id, false)?;
         let shell = item["type"] == "local_shell_call"
             || item["name"].as_str().is_some_and(|name| {
                 !item["namespace"]
@@ -745,23 +732,20 @@ impl Store {
                     .is_some_and(|namespace| namespace.starts_with("mcp__"))
                     && matches!(name.rsplit('.').next(), Some("exec_command" | "shell"))
             });
-        let input = item
-            .get("arguments")
-            .or_else(|| item.get("input"))
-            .or_else(|| item.get("action"))
-            .cloned()
+        let input = ["arguments", "input", "action"].into_iter()
+            .find_map(|key| item.get_mut(key).map(Value::take))
             .unwrap_or(Value::Null);
         let input = match input {
             Value::String(text) => serde_json::from_str(&text).unwrap_or(Value::String(text)),
             value => value,
         };
-        let mut used = call.end - call.start;
         let mut positions_end = call.end;
         let mut parts = Vec::new();
-        let mut partial = outputs.len() > MAX_OUTPUTS;
+        let mut partial = false;
         let mut running = None;
         let mut terminal_at = None;
-        for (location, id, process) in outputs.into_iter().take(MAX_OUTPUTS) {
+        for output in outputs {
+            let (location, id, process) = output?;
             if let Some(process) = &process
                 && (!shell
                     || before != expected
@@ -770,19 +754,12 @@ impl Store {
             {
                 continue;
             }
-            let length = location
-                .end
-                .checked_sub(location.start)
-                .context("工具定位范围尾部无效")?;
-            if location.start < positions_end
-                || used + length > MAX_DETAIL_BYTES
-                || compressed && location.end > MAX_ARCHIVE_DETAIL_OFFSET
-            {
+            if location.start < positions_end {
                 partial = true;
                 break;
             }
-            let item = reader.read_item(&location, committed_offset, &id, true)?;
-            let output = item.get("output").cloned().unwrap_or(Value::Null);
+            let mut item = reader.read_item(&location, committed_offset, &id, true)?;
+            let output = item.get_mut("output").map(Value::take).unwrap_or(Value::Null);
             if shell && let Some((started, id)) = exec_receipt(&output) {
                 if started {
                     let observed = id.parse::<u64>().ok().map(|id| id.to_string());
@@ -796,9 +773,10 @@ impl Store {
                 }
             }
             parts.push((location.at, output));
-            used += length;
             positions_end = location.end;
         }
+        drop(statement);
+        tx.commit()?;
         ensure!(
             FileState::source_stamp(&path)? == before && fs::canonicalize(&path)? == path,
             "读取期间工具原会话发生变化"
@@ -840,29 +818,27 @@ impl DetailReader {
     ) -> Result<Value> {
         let size = at.end.checked_sub(at.start).context("工具定位范围无效")?;
         ensure!(
-            size > 0 && size <= MAX_LINE as u64 && at.end <= committed_end,
+            size > 0 && at.end <= committed_end,
             "工具定位超出已提交范围"
         );
-        let mut bytes = vec![0; size as usize];
+        let mut bytes = Vec::new();
         match self {
             Self::Plain(file) => {
                 file.seek(SeekFrom::Start(at.start))?;
-                file.read_exact(&mut bytes)?;
+                file.take(size).read_to_end(&mut bytes)?;
             }
             Self::Compressed(reader, offset) => {
-                ensure!(
-                    at.start >= *offset && at.end <= MAX_ARCHIVE_DETAIL_OFFSET,
-                    "归档工具详情超出读取范围"
-                );
+                ensure!(at.start >= *offset, "归档工具定位顺序无效");
                 let skip = at.start - *offset;
                 ensure!(
                     io::copy(&mut reader.take(skip), &mut io::sink())? == skip,
                     "归档工具位置缺失"
                 );
-                reader.read_exact(&mut bytes)?;
+                reader.take(size).read_to_end(&mut bytes)?;
                 *offset = at.end;
             }
         }
+        ensure!(bytes.len() as u64 == size, "工具原会话位置缺失");
         let row: Value = serde_json::from_slice(&bytes)?;
         let timestamp = row["timestamp"]
             .as_str()
@@ -1198,9 +1174,12 @@ mod tests {
         .unwrap();
         db.execute("INSERT INTO token_sessions VALUES(1,?1)", [SESSION])
             .unwrap();
+        let id = "a".repeat(1200);
+        let name = format!("exec_command_{}", "a".repeat(750));
+        let search_term = "A".repeat(750);
         for (source, position, id, at, name) in [
-            (1, 1, "a", at, "exec_command"),
-            (2, 1, "a", at, "exec_command"),
+            (1, 1, id.as_str(), at, name.as_str()),
+            (2, 1, id.as_str(), at, name.as_str()),
             (1, 2, "b", at, "apply_patch"),
             (1, 3, "c", at - 1, "mcp__fixture"),
             (1, 4, "d", at - 3, "functions.write_stdin"),
@@ -1231,7 +1210,9 @@ mod tests {
         assert_eq!(page["summary"]["conflicts"], 1);
         assert_eq!(page["status"], "partial");
         assert_eq!(page["items"][0]["id"], "b");
-        assert_eq!(page["items"][1]["id"], "a");
+        assert_eq!(page["items"][1]["id"], id);
+        assert!(page["nextCursor"].as_str().unwrap().len() > 1024);
+        assert!(DetailQuery::parse(&json!({"sessionId":SESSION,"id":id,"revision":1})).is_ok());
         let mut later = request.clone();
         later["cursor"] = page["nextCursor"].clone();
         later["revision"] = page["revision"].clone();
@@ -1244,6 +1225,10 @@ mod tests {
         assert_eq!(search["summary"]["total"], 3);
         assert_eq!(search["summary"]["matched"], 1);
         assert_eq!(search["items"][0]["id"], "b");
+        filtered["search"] = json!(search_term);
+        let search = read(db, &filtered);
+        assert_eq!(search["summary"]["matched"], 1);
+        assert_eq!(search["items"][0]["id"], id);
         db.execute("UPDATE token_revision SET revision=2", [])
             .unwrap();
         assert_eq!(read(db, &later)["status"], "stale");

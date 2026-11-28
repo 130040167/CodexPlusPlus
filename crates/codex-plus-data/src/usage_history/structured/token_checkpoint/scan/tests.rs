@@ -4,6 +4,8 @@ use rusqlite::Connection;
 use serde_json::json;
 use std::fs;
 
+mod live_tail;
+
 const FIRST: &str = "00000000-0000-4000-8000-000000000001";
 const SECOND: &str = "00000000-0000-4000-8000-000000000002";
 
@@ -16,6 +18,100 @@ fn rollout(session: &str) -> String {
         "input_tokens":100,"cached_input_tokens":20,"output_tokens":10
         },"last_token_usage":usage}}});
     format!("{header}\n{count}\n")
+}
+
+#[test]
+fn oversized_component_yields_then_publishes_atomically_after_reopen() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let first = root.join("rollout-first.jsonl");
+    let second = root.join("rollout-second.jsonl");
+    fs::write(&first, rollout(FIRST))?;
+    fs::write(&second, rollout(FIRST).replace("12:01:00", "12:02:00").replace("100", "200"))?;
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let names = BTreeMap::new();
+    let database = root.join("index.sqlite");
+    let mut reference = Store::open(Connection::open_in_memory()?)?;
+    let mut store = Store::open(Connection::open(&database)?)?;
+    let step = |reader: &mut SourceReader, target: &mut Store, limit| {
+        reader.step(target, cutoff, &mut Budget::new(std::iter::empty()), &names, limit)
+    };
+    for target in [&mut reference, &mut store] {
+        assert!(step(&mut SourceReader::restore(target, &first)?, target, 64 << 20)?);
+    }
+    assert!(step(&mut SourceReader::restore(&reference, &second)?, &mut reference, 64 << 20)?);
+    let rows = |store: &Store| -> rusqlite::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        store.db.prepare("SELECT event_id,payload FROM token_resolved ORDER BY event_id")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect()
+    };
+    let before = rows(&store)?;
+    let expected = rows(&reference)?;
+    assert!(expected.len() > before.len());
+    let mut reader = SourceReader::restore(&store, &second)?;
+    assert!(!step(&mut reader, &mut store, 128)?);
+    assert!(store.checkpoint(&second)?.is_none());
+    assert_eq!(rows(&store)?, before);
+    store.db.execute_batch("CREATE TRIGGER block_component BEFORE INSERT ON token_sources
+        BEGIN SELECT RAISE(ABORT, 'blocked component'); END;")?;
+    let error = step(&mut reader, &mut store, 128).unwrap_err();
+    assert!(error.to_string().contains("blocked component"), "{error:#}");
+    assert!(store.checkpoint(&second)?.is_none());
+    assert_eq!(rows(&store)?, before);
+    store.db.execute_batch("DROP TRIGGER block_component")?;
+    drop(store);
+    let mut store = Store::open(Connection::open(&database)?)?;
+    let mut reader = SourceReader::restore(&store, &second)?;
+    assert!(!step(&mut reader, &mut store, 128)?);
+    assert!(step(&mut reader, &mut store, 128)?);
+    assert_eq!(store.checkpoint(&second)?.unwrap().1.offset, fs::metadata(&second)?.len());
+    assert_eq!(rows(&store)?, expected);
+    let mut reader = SourceReader::restore(&store, &second)?;
+    assert!(step(&mut reader, &mut store, 128)?);
+    assert_eq!(rows(&store)?, expected);
+    Ok(())
+}
+
+#[test]
+fn oversized_live_appends_and_retirement_finish_in_normal_scan() -> anyhow::Result<()> {
+    use std::io::Write;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let sessions = root.join("sessions");
+    fs::create_dir(&sessions)?;
+    let files = [sessions.join("rollout-01.jsonl"), sessions.join("rollout-02.jsonl")];
+    for (path, session) in files.iter().zip([FIRST, SECOND]) {
+        fs::write(path, rollout(session))?;
+    }
+    let mut store = Store::open(Connection::open_in_memory()?)?;
+    let mut scan = Scan::default();
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let names = BTreeMap::new();
+    assert!(scan.round(&mut store, &root, cutoff, &names, 8192).complete);
+    for (path, session) in files.iter().zip([FIRST, SECOND]) {
+        let mut row: serde_json::Value = serde_json::from_str(rollout(session).lines().nth(1).unwrap())?;
+        row["timestamp"] = json!("2026-01-02T12:02:00Z");
+        row["payload"]["info"]["total_token_usage"]["input_tokens"] = json!(200);
+        writeln!(fs::OpenOptions::new().append(true).open(path)?, "{row}")?;
+    }
+    for _ in 0..4 {
+        let report = scan.round(&mut store, &root, cutoff, &names, 128);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        if report.complete { break; }
+    }
+    for path in &files {
+        assert_eq!(store.checkpoint(path)?.unwrap().1.offset, fs::metadata(path)?.len());
+    }
+    fs::remove_file(&files[0])?;
+    let report = Scan::default().round(&mut store, &root, cutoff, &names, 128);
+    assert!(report.complete, "{:?}", report.errors);
+    assert!(store.checkpoint(&files[0])?.is_none());
+    let mut counts = Vec::new();
+    Store::read_committed(&mut store.db, i64::MIN, i64::MAX, |event| {
+        counts.push((event.session.clone(), event.delta.input_tokens));
+        Ok(())
+    })?;
+    assert_eq!(counts, [(SECOND.to_owned(), 100), (SECOND.to_owned(), 100)]);
+    Ok(())
 }
 
 #[test]
@@ -100,6 +196,227 @@ fn deferred_batch_is_discarded_when_its_source_is_replaced() {
     })
     .unwrap();
     assert_eq!(seen, [SECOND]);
+}
+
+#[test]
+fn growing_live_source_refreshes_while_historical_queue_advances() {
+    use std::io::Write;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let sessions = root.join("sessions");
+    let archived = root.join("archived_sessions");
+    fs::create_dir(&sessions).unwrap();
+    fs::create_dir(&archived).unwrap();
+    let mtime = UNIX_EPOCH + Duration::from_secs(1_770_000_000);
+    for i in 0..3 * SOURCES_PER_ROUND {
+        fs::File::create(archived.join(format!("rollout-{i}.jsonl")))
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+    let live = sessions.join("rollout-live.jsonl");
+    let mut file = fs::File::create(&live).unwrap();
+    file.write_all(rollout(FIRST).as_bytes()).unwrap();
+    file.set_modified(mtime + Duration::from_secs(1)).unwrap();
+    let mut scan = Scan::default();
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let mut store = Store::open(Connection::open_in_memory().unwrap()).unwrap();
+    let first = scan.round(&mut store, &root, cutoff, &BTreeMap::new(), 8192);
+    assert_eq!(first.pending_sources, 2 * SOURCES_PER_ROUND + 1);
+    assert!(store.checkpoint(&live).unwrap().is_some());
+
+    let second = rollout(FIRST);
+    let mut row: serde_json::Value = serde_json::from_str(second.lines().nth(1).unwrap()).unwrap();
+    row["timestamp"] = json!("2026-01-02T12:02:00Z");
+    row["payload"]["info"]["total_token_usage"]["input_tokens"] = json!(200);
+    row["payload"]["info"]["last_token_usage"] =
+        json!({"input_tokens":100,"cached_input_tokens":0,"output_tokens":0});
+    writeln!(file, "{row}").unwrap();
+    file.set_modified(mtime + Duration::from_secs(1)).unwrap();
+    let next = scan.round(&mut store, &root, cutoff, &BTreeMap::new(), 8192);
+    assert!(next.errors.is_empty() && next.pending_sources > 0);
+    assert_eq!(
+        store.checkpoint(&live).unwrap().unwrap().1.offset,
+        file.metadata().unwrap().len()
+    );
+    let mut tokens = 0;
+    Store::read_committed(&mut store.db, i64::MIN, i64::MAX, |event| {
+        tokens += event.delta.total_tokens;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(tokens, 210);
+    assert_eq!(
+        first.pending_sources - next.pending_sources,
+        SOURCES_PER_ROUND - 1
+    );
+}
+
+#[test]
+fn growing_live_source_refreshes_during_cold_archive_prefix_and_suffix() -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let sessions = root.join("sessions");
+    let archives = root.join("archived_sessions");
+    fs::create_dir(&sessions)?;
+    fs::create_dir(&archives)?;
+    let live = sessions.join("rollout-live.jsonl");
+    let archive = archives.join("rollout-history.jsonl.zst");
+    let stamp = UNIX_EPOCH + Duration::from_secs(1_770_000_000);
+    let mut file = fs::File::create(&live)?;
+    file.write_all(rollout(FIRST).as_bytes())?;
+    file.set_modified(stamp + Duration::from_secs(2))?;
+    let mut compressed = zstd::stream::write::Encoder::new(fs::File::create(&archive)?, 1)?;
+    compressed.write_all(rollout(SECOND).as_bytes())?;
+    let filler = format!(
+        "{{\"type\":\"ignored\",\"payload\":\"{}\"}}\n",
+        "x".repeat(65536)
+    );
+    for _ in 0..384 {
+        compressed.write_all(filler.as_bytes())?;
+    }
+    compressed.finish()?.set_modified(stamp)?;
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let names = BTreeMap::new();
+    let db = root.join("index.sqlite");
+    let mut store = Store::open(Connection::open(&db)?)?;
+    let mut read = Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut scan = Scan::default();
+    for _ in 0..3 {
+        assert!(
+            !scan
+                .round(&mut store, &root, cutoff, &names, 32 << 20)
+                .complete
+        );
+    }
+    let seed = store.checkpoint(&archive)?.unwrap().1.offset;
+    assert!(seed > 8 << 20);
+    let mut scan = Scan::default();
+    assert!(
+        !scan
+            .round(&mut store, &root, cutoff, &names, 32 << 20)
+            .complete
+    );
+    let mut total = 100;
+    for (timestamp, delta) in [("2026-01-02T12:02:00Z", 101), ("2026-01-02T12:03:00Z", 103)] {
+        total += delta;
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"event_msg","timestamp":timestamp,
+            "payload":{"type":"token_count","info":{
+                "total_token_usage":{"input_tokens":total,"cached_input_tokens":20,"output_tokens":10},
+                "last_token_usage":{"input_tokens":delta,"cached_input_tokens":0,"output_tokens":0}
+            }}})
+        )?;
+        let report = scan.round(&mut store, &root, cutoff, &names, 32 << 20);
+        assert!(!report.complete && report.errors.is_empty() && report.issues == 0);
+        assert_eq!(
+            store.checkpoint(&live)?.unwrap().1.offset,
+            file.metadata()?.len()
+        );
+        let mut visible = Vec::new();
+        Store::read_committed(&mut read, i64::MIN, i64::MAX, |event| {
+            if event.session == FIRST {
+                visible.push(event.delta.input_tokens);
+            }
+            Ok(())
+        })?;
+        assert_eq!(visible, if delta == 101 { vec![100, 101] } else { vec![100, 101, 103] });
+        if delta == 101 {
+            assert_eq!(store.checkpoint(&archive)?.unwrap().1.offset, seed);
+            for _ in 0..5 {
+                if store.checkpoint(&archive)?.unwrap().1.offset > seed {
+                    break;
+                }
+                scan.round(&mut store, &root, cutoff, &names, 32 << 20);
+            }
+            let progress = store.checkpoint(&archive)?.unwrap().1;
+            assert!(progress.resume_pending && progress.offset > seed);
+        }
+    }
+    for _ in 0..8 {
+        if scan
+            .round(&mut store, &root, cutoff, &names, 32 << 20)
+            .complete
+        {
+            break;
+        }
+    }
+    assert!(!store.checkpoint(&archive)?.unwrap().1.resume_pending);
+    let mut counts = Vec::new();
+    Store::read_committed(&mut read, i64::MIN, i64::MAX, |event| {
+        if event.session == FIRST {
+            counts.push(event.delta.input_tokens);
+        }
+        Ok(())
+    })?;
+    counts.sort();
+    assert_eq!(counts, [100, 101, 103]);
+    Ok(())
+}
+
+#[test]
+fn legacy_encoding_yields_to_growing_live_source_with_a_backlog() -> anyhow::Result<()> {
+    use std::io::Write;
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let sessions = root.join("sessions");
+    let archives = root.join("archived_sessions");
+    fs::create_dir(&sessions)?;
+    fs::create_dir(&archives)?;
+    let history = archives.join("rollout-history.jsonl");
+    let live = sessions.join("rollout-live.jsonl");
+    fs::write(&history, rollout(FIRST))?;
+    fs::write(&live, rollout(SECOND))?;
+    let mut store = Store::open(Connection::open_in_memory()?)?;
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let names = BTreeMap::new();
+    let mut scan = Scan::default();
+    assert!(scan.round(&mut store, &root, cutoff, &names, 8192).complete);
+    store.db.execute("DELETE FROM token_linear_sources", [])?;
+    store.db.execute(
+        "WITH RECURSIVE n(i) AS (VALUES (1) UNION ALL SELECT i+1 FROM n WHERE i<768)
+         INSERT INTO token_observations
+         SELECT o.source_id,o.revision,o.position+n.i,o.session_id,o.event_id,
+                CAST(json_set(CAST(o.payload AS TEXT),'$.legacy_identity',NULL) AS BLOB)
+         FROM token_observations o JOIN token_sessions s ON s.id=o.session_id CROSS JOIN n
+         WHERE s.session=?1",
+        [FIRST],
+    )?;
+    for path in [&history, &live] {
+        writeln!(
+            fs::OpenOptions::new().append(true).open(path)?,
+            "{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"next\"}}}}"
+        )?;
+    }
+    let mut reader = SourceReader::restore(&store, &history)?;
+    assert!(!reader.step(
+        &mut store,
+        cutoff,
+        &mut Budget::new(std::iter::empty()),
+        &names,
+        8192
+    )?);
+    assert!(reader.encoding_pending());
+    scan.deferred = Some(reader);
+    for n in 0..2 * SOURCES_PER_ROUND {
+        let path = archives.join(format!("rollout-empty-{n}.jsonl"));
+        fs::File::create(&path)?;
+        scan.remaining.push_back(path);
+    }
+    let next = scan.round(&mut store, &root, cutoff, &names, 8192);
+    assert!(next.errors.is_empty() && next.pending_sources > 0);
+    assert_eq!(
+        store.checkpoint(&live)?.unwrap().1.offset,
+        fs::metadata(live)?.len()
+    );
+    Ok(())
 }
 
 #[test]
@@ -801,14 +1118,230 @@ fn missing_sources_are_retired_in_batches_and_reappearance_is_not_a_deletion() {
             .count(),
         3
     );
-    assert!(!scan.round(&mut store, &root, cutoff, &names, 8192).complete);
-    assert!(scan.round(&mut store, &root, cutoff, &names, 8192).complete);
+    let final_retirement = scan.round(&mut store, &root, cutoff, &names, 8192);
+    assert!(final_retirement.complete && final_retirement.errors.is_empty());
     for path in removed {
         assert_eq!(
             store.checkpoint(&path).unwrap().is_some(),
             path == reappeared
         );
     }
+}
+
+#[test]
+fn missing_owner_is_retired_while_verified_sources_remain_queued() {
+    for malformed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let sessions = root.join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        for n in 0..SOURCES_PER_ROUND + 2 {
+            fs::write(sessions.join(format!("rollout-{n:03}.jsonl")), "").unwrap();
+        }
+        if malformed {
+            let bad =
+                rollout(SECOND).replace("\"input_tokens\":100", "\"input_tokens\":\"invalid\"");
+            fs::write(sessions.join("rollout-gap.jsonl"), bad).unwrap();
+        }
+        let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let names = BTreeMap::new();
+        let mut store = Store::open(Connection::open_in_memory().unwrap()).unwrap();
+        let mut scan = Scan::default();
+        while scan
+            .round(&mut store, &root, cutoff, &names, 8192)
+            .pending_sources
+            != 0
+        {}
+        let old = sessions.join("rollout-000.jsonl");
+        fs::remove_file(&old).unwrap();
+        let mut scan = Scan::default();
+        let report = scan.round(&mut store, &root, cutoff, &names, 8192);
+        assert!(report.errors.is_empty() && report.maintenance_error.is_none());
+        assert!(store.checkpoint(&old).unwrap().is_none());
+        assert!(report.pending_sources > 0);
+        assert_eq!(report.pending_sources, scan.sealed_pending());
+        assert_eq!(report.issues, usize::from(malformed));
+        assert_eq!(report.issues, scan.scoped_count_gaps().len());
+    }
+}
+
+#[test]
+fn missing_known_source_only_blocks_its_component_during_archive_replay() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let sessions = root.join("sessions");
+    fs::create_dir(&sessions)?;
+    let old = sessions.join("rollout-old.jsonl");
+    let archived = sessions.join("rollout-old.jsonl.zst");
+    let archive = rollout(FIRST) + &format!(
+        "{{\"type\":\"ignored\",\"payload\":\"{}\"}}\n",
+        "a".repeat(16384)
+    ).repeat(400);
+    fs::write(&old, rollout(FIRST))?;
+    fs::write(&archived, zstd::stream::encode_all(archive.as_bytes(), 1)?)?;
+    fs::write(sessions.join("rollout-current.jsonl"), rollout(SECOND))?;
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let names = BTreeMap::new();
+    let mut store = Store::open(Connection::open_in_memory()?)?;
+    let mut scan = Scan::default();
+    for _ in 0..10 {
+        let report = scan.round(&mut store, &root, cutoff, &names, 32 << 20);
+        assert!(report.errors.is_empty());
+        if report.complete {
+            break;
+        }
+    }
+    assert!(store.checkpoint(&old)?.is_some());
+    assert!(store.checkpoint(&archived)?.is_some());
+    store.db.execute(
+        "UPDATE token_sources SET checkpoint=CAST(json_remove(CAST(checkpoint AS TEXT),
+          '$.legacy_identity_prefix') AS BLOB) WHERE offset=?1",
+        [archive.len()],
+    )?;
+    fs::remove_file(&old)?;
+    let mut scan = Scan::default();
+    let report = scan.round(&mut store, &root, cutoff, &names, 32 << 20);
+    assert!(report.errors.is_empty() && report.maintenance_error.is_none());
+    assert!(scan.missing.iter().any(|(path, _)| path == &old));
+    assert!(report.can_classify);
+    let actual: String = store.db.query_row(
+        "SELECT blocked_sessions FROM token_attribution_coverage",
+        [],
+        |row| row.get(0),
+    )?;
+    let expected: i64 = store.db.query_row(
+        "SELECT id FROM token_sessions WHERE session=?1",
+        [FIRST],
+        |row| row.get(0),
+    )?;
+    assert_eq!(serde_json::from_str::<Vec<i64>>(&actual)?, vec![expected]);
+    Ok(())
+}
+
+#[test]
+fn retirement_checks_unknown_and_replaced_archives_after_discovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let sessions = root.join("sessions");
+    let archives = root.join("archived_sessions");
+    fs::create_dir(&sessions).unwrap();
+    fs::create_dir(&archives).unwrap();
+    for n in 0..4 * SOURCES_PER_ROUND {
+        fs::write(sessions.join(format!("rollout-{n:03}.jsonl")), "").unwrap();
+    }
+    let old = sessions.join("rollout-000.jsonl");
+    fs::write(&old, rollout(FIRST)).unwrap();
+    let changed = archives.join("rollout-changed.jsonl.zst");
+    fs::write(
+        &changed,
+        zstd::stream::encode_all(rollout(SECOND).as_bytes(), 1).unwrap(),
+    )
+    .unwrap();
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let names = BTreeMap::new();
+    let mut store = Store::open(Connection::open_in_memory().unwrap()).unwrap();
+    let mut scan = Scan::default();
+    while scan
+        .round(&mut store, &root, cutoff, &names, 1 << 25)
+        .pending_sources
+        != 0
+    {}
+    fs::remove_file(&old).unwrap();
+    let large = rollout(SECOND)
+        + &format!(
+            "{{\"type\":\"ignored\",\"payload\":\"{}\"}}\n",
+            "z".repeat(16384)
+        )
+        .repeat(400);
+    let bytes = zstd::stream::encode_all(large.as_bytes(), 1).unwrap();
+    let ongoing = archives.join("rollout-unread.jsonl.zst");
+    fs::write(&ongoing, &bytes).unwrap();
+    let mut scan = Scan::default();
+    let report = scan.round(&mut store, &root, cutoff, &names, 1 << 25);
+    assert!(!report.complete);
+    assert!(!report.can_classify);
+    assert!(store.checkpoint(&old).unwrap().is_some());
+    fs::write(&changed, &bytes).unwrap();
+    let new = archives.join("rollout-new.jsonl.zst");
+    fs::write(&new, &bytes).unwrap();
+    for _ in 0..32 {
+        let report = scan.round(&mut store, &root, cutoff, &names, 1 << 25);
+        assert!(report.errors.is_empty() && report.maintenance_error.is_none());
+        if store.checkpoint(&old).unwrap().is_none() {
+            for path in [&ongoing, &changed, &new] {
+                let (_, state) = store.checkpoint(path).unwrap().unwrap();
+                assert!(!state.resume_pending);
+                assert_eq!(state.stamp, Some(FileState::source_stamp(path).unwrap()));
+                assert_eq!(state.offset, large.len() as u64);
+            }
+            return;
+        }
+    }
+    panic!("missing source still retained after the archives closed");
+}
+
+#[test]
+fn formerly_empty_queue_rediscovers_late_archive_before_retiring_its_old_source()
+-> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = fs::canonicalize(dir.path())?;
+    let sessions = root.join("sessions");
+    let archives = root.join("archived_sessions");
+    fs::create_dir(&sessions)?;
+    fs::create_dir(&archives)?;
+    let old = sessions.join("rollout-old.jsonl");
+    fs::write(&old, rollout(FIRST))?;
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let names = BTreeMap::new();
+    let mut scan = Scan::default();
+    let mut store = Store::open(Connection::open_in_memory()?)?;
+    const LIMIT: usize = 32 << 20;
+    assert!(
+        scan.round(&mut store, &root, cutoff, &names, LIMIT)
+            .complete
+    );
+
+    fs::remove_file(&old)?;
+    let padding = format!(
+        "{{\"type\":\"ignored\",\"payload\":\"{}\"}}\n",
+        "x".repeat(16384)
+    )
+    .repeat(440);
+    let running = archives.join("rollout-running.jsonl.zst");
+    let active = rollout(SECOND) + &padding;
+    fs::write(&running, zstd::stream::encode_all(active.as_bytes(), 1)?)?;
+    let mut scan = Scan::default();
+    assert!(
+        !scan
+            .round(&mut store, &root, cutoff, &names, LIMIT)
+            .complete
+    );
+    assert_eq!(scan.remaining.len(), 0);
+    assert_eq!(scan.sealed_pending(), 0);
+    assert!(store.checkpoint(&old)?.is_some());
+
+    let moved = archives.join("rollout-late.jsonl.zst");
+    let original = rollout(FIRST) + &padding;
+    fs::write(&moved, zstd::stream::encode_all(original.as_bytes(), 1)?)?;
+    for _ in 0..8 {
+        let report = scan.round(&mut store, &root, cutoff, &names, LIMIT);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let mut deltas = Vec::new();
+        Store::read_committed(&mut store.db, i64::MIN, i64::MAX, |event| {
+            if event.session == FIRST {
+                deltas.push(event.delta.input_tokens);
+            }
+            Ok(())
+        })?;
+        assert_eq!(deltas, [100]);
+        if store.checkpoint(&old)?.is_none() {
+            let state = store.checkpoint(&moved)?.unwrap().1;
+            assert!(!state.resume_pending);
+            assert_eq!(state.offset, original.len() as u64);
+            return Ok(());
+        }
+    }
+    panic!("old source outlived its replacement archive");
 }
 
 #[test]
@@ -1096,6 +1629,282 @@ fn execution_locators_commit_with_the_source_and_expire_without_losing_the_call(
 }
 
 #[test]
+fn compressed_execution_details_read_verified_calls_and_outputs_past_32_mib() -> anyhow::Result<()>
+{
+    use crate::usage_history::structured::token_checkpoint::DetailQuery;
+    use std::io::Write;
+    let dir = tempfile::tempdir()?;
+    let home = fs::canonicalize(dir.path())?;
+    let archives = home.join("archived_sessions");
+    fs::create_dir(&archives)?;
+    let source = archives.join(format!("rollout-{FIRST}.jsonl.zst"));
+    let now = chrono::Local::now();
+    let at = now - chrono::Duration::seconds(10);
+    let wrap =
+        |payload| json!({"type":"response_item","timestamp":at.to_rfc3339(),"payload":payload});
+    let call = |id| {
+        wrap(
+            json!({"type":"function_call","name":"test_tool","call_id":id,"arguments":{"input":id}}),
+        )
+    };
+    let output = |id| wrap(json!({"type":"function_call_output","call_id":id,"output":id}));
+    let mut archive = zstd::stream::write::Encoder::new(fs::File::create(&source)?, 1)?;
+    archive.write_all(rollout(FIRST).as_bytes())?;
+    writeln!(archive, "{}", call("early"))?;
+    let filler = wrap(json!({"type":"message","role":"user","content":"x".repeat(256 * 1024)}));
+    let filler = format!("{filler}\n");
+    for _ in 0..128 {
+        archive.write_all(filler.as_bytes())?;
+    }
+    for row in [call("late"), output("early"), output("late")] {
+        writeln!(archive, "{row}")?;
+    }
+    archive.finish()?;
+
+    let mut store = Store::open(Connection::open_in_memory()?)?;
+    let mut scan = Scan::default();
+    let names = BTreeMap::new();
+    for _ in 0..32 {
+        let report = scan.round(&mut store, &home, at.date_naive(), &names, 1 << 20);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        if report.complete {
+            break;
+        }
+    }
+    let (revision, committed): (i64, u64) = store.db.query_row(
+        "SELECT r.revision,s.offset FROM token_revision r,token_sources s",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let positions = store
+        .db
+        .prepare("SELECT position FROM execution_observations ORDER BY position")?
+        .query_map([], |row| row.get::<_, u64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    assert_eq!(positions.len(), 4);
+    assert!(positions[0] < 32 << 20 && positions[1] > 32 << 20 && positions[3] < committed);
+    let read = |store: &mut Store, id: &str| {
+        let request = DetailQuery::parse(&json!({"sessionId":FIRST,"id":id,"revision":revision}))?;
+        Store::read_execution_detail(&mut store.db, &home, &request, || now.timestamp_millis())
+    };
+    for id in ["early", "late"] {
+        let started = std::time::Instant::now();
+        let detail = read(&mut store, id)?;
+        eprintln!(
+            "{id} archive detail at {positions:?}: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(detail["status"], "ok", "{detail}");
+        assert_eq!(detail["detail"]["input"], json!({"input":id}));
+        assert_eq!(detail["detail"]["output"], json!([id]));
+    }
+    store
+        .db
+        .execute("UPDATE token_sources SET offset=?1", [positions[3]])?;
+    assert!(
+        read(&mut store, "late")
+            .unwrap_err()
+            .to_string()
+            .contains("已提交范围")
+    );
+    store
+        .db
+        .execute("UPDATE token_sources SET offset=?1", [committed])?;
+    let original = home.join("original.zst");
+    fs::rename(&source, &original)?;
+    fs::copy(&original, &source)?;
+    assert!(
+        read(&mut store, "late")
+            .unwrap_err()
+            .to_string()
+            .contains("文件已变化")
+    );
+    Ok(())
+}
+
+#[test]
+fn tool_detail_reads_all_output_parts() -> anyhow::Result<()> {
+    use crate::usage_history::structured::token_checkpoint::DetailQuery;
+    use std::io::Write;
+
+    let dir = tempfile::tempdir()?;
+    let home = fs::canonicalize(dir.path())?;
+    let sessions = home.join("sessions");
+    fs::create_dir(&sessions)?;
+    let now = chrono::Local::now();
+    let at = now - chrono::Duration::seconds(5);
+    let row =
+        |payload| json!({"type":"response_item","timestamp":at.to_rfc3339(),"payload":payload});
+    let mut file = fs::File::create(sessions.join(format!("rollout-{FIRST}.jsonl")))?;
+    file.write_all(rollout(FIRST).as_bytes())?;
+    let small: Vec<String> = (0..80).map(|n| format!("part-{n}")).collect();
+    let large = "x".repeat(512 * 1024);
+    for (id, parts) in [("small", small.clone()), ("large", vec![large.clone(); 10])] {
+        writeln!(
+            file,
+            "{}",
+            row(json!({"type":"function_call","call_id":id,"name":"example","arguments":"{}"}))
+        )?;
+        for part in parts {
+            writeln!(
+                file,
+                "{}",
+                row(json!({"type":"function_call_output","call_id":id,"output":part}))
+            )?;
+        }
+    }
+    drop(file);
+    let mut store = Store::open(Connection::open_in_memory()?)?;
+    let mut scan = Scan::default();
+    loop {
+        let report = scan.round(
+            &mut store,
+            &home,
+            at.date_naive(),
+            &BTreeMap::new(),
+            1 << 20,
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        if report.complete {
+            break;
+        }
+    }
+    let revision: i64 = store
+        .db
+        .query_row("SELECT revision FROM token_revision", [], |r| r.get(0))?;
+    let mut read = |id: &str| {
+        let query = DetailQuery::parse(&json!({"sessionId":FIRST,"id":id,"revision":revision}))?;
+        Store::read_execution_detail(&mut store.db, &home, &query, || now.timestamp_millis())
+    };
+    let result = read("small")?;
+    assert_eq!(result["status"], "ok");
+    assert_eq!(result["detail"]["output"], json!(small));
+    let result = read("large")?;
+    assert_eq!(result["status"], "ok");
+    let parts = result["detail"]["output"].as_array().unwrap();
+    assert_eq!(parts.len(), 10);
+    assert!(
+        parts
+            .iter()
+            .all(|part| part.as_str() == Some(large.as_str()))
+    );
+    assert_eq!(result["detail"]["durationMs"], 0);
+    Ok(())
+}
+
+#[test]
+fn tool_detail_reads_large_lines_in_plain_and_archived_sources() -> anyhow::Result<()> {
+    use crate::usage_history::structured::token_checkpoint::DetailQuery;
+    use std::io::Write;
+    let now = chrono::Local::now();
+    let at = now - chrono::Duration::seconds(5);
+    let large = "x".repeat((1 << 20) + 51);
+    let arguments = json!({"value": &large}).to_string();
+    for archived in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let home = dir.path().canonicalize()?;
+        let sessions = home.join("sessions");
+        fs::create_dir(&sessions)?;
+        let mut source = rollout(FIRST)
+            .replace("2026-01-02T12:00:00Z", &at.to_rfc3339())
+            .replace("2026-01-02T12:01:00Z", &at.to_rfc3339());
+        for (id, input) in [("mixed", "{}"), ("long-input", arguments.as_str())] {
+            if id == "long-input" {
+                let padding = format!("{{\"type\":\"ignored\",\"payload\":\"{}\"}}\n", "x".repeat(65536));
+                source.push_str(&padding.repeat(65));
+            }
+            let mut append = |payload| {
+                source.push_str(&json!({"type":"response_item", "timestamp":at.to_rfc3339(), "payload":payload}).to_string());
+                source.push('\n');
+            };
+            append(json!({"type":"function_call","call_id":id,"name":"example","arguments":input}));
+            for value in ["prefix", large.as_str(), "tail"] {
+                append(json!({"type":"function_call_output","call_id":id,"output":value}));
+            }
+        }
+        let path = sessions.join(format!("rollout-{FIRST}.jsonl{}", if archived { ".zst" } else { "" }));
+        if archived {
+            fs::write(&path, zstd::stream::encode_all(source.as_bytes(), 1)?)?;
+        } else {
+            fs::write(&path, &source)?;
+        }
+        let db_path = home.join("index.sqlite");
+        let mut store = Store::open(Connection::open(&db_path)?)?;
+        let mut scan = Scan::default();
+        loop {
+            let report = scan.round(&mut store, &home, at.date_naive(), &BTreeMap::new(), 1 << 20);
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            if report.complete { break; }
+        }
+        let revision: i64 = store.db.query_row("SELECT revision FROM token_revision", [], |r| r.get(0))?;
+        for id in ["mixed", "long-input"] {
+            let query = DetailQuery::parse(&json!({"sessionId":FIRST,"id":id,"revision":revision}))?;
+            let result = Store::read_execution_detail(&mut store.db, &home, &query, || now.timestamp_millis())?;
+            assert_eq!(result["status"], "ok");
+            let output = result["detail"]["output"].as_array().unwrap();
+            assert_eq!(output.len(), 3, "{id}, archived={archived}");
+            assert_eq!(output[0], "prefix");
+            assert!(output[1].as_str() == Some(large.as_str()));
+            assert_eq!(output[2], "tail");
+            if id == "long-input" {
+                assert!(result["detail"]["input"]["value"].as_str() == Some(large.as_str()));
+            }
+        }
+        let observations = |store: &Store| -> rusqlite::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+            store.db.prepare("SELECT event_id,payload FROM token_resolved ORDER BY event_id")?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+        };
+        store.reclassify_session(FIRST, 1 << 20, &BTreeSet::new(), |events, _| {
+            for event in events {
+                event.provider = "recorded-relay".into();
+                event.provider_source = Some("request-log-exact".into());
+            }
+            Ok(())
+        })?.unwrap();
+        let original = observations(&store)?;
+        assert_eq!(original.len(), 1);
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&original[0].1)?["provider"], "recorded-relay");
+        store.db.execute("DELETE FROM execution_observations WHERE end-position>1048576", [])?;
+        store.db.execute("UPDATE token_sources SET activity_truncated=1,checkpoint=CAST(
+            json_set(json_remove(CAST(checkpoint AS TEXT),'$.large_tools_checked'),
+                '$.activity_truncated', json('true')) AS BLOB)", [])?;
+        drop(store);
+        let mut store = Store::open(Connection::open(&db_path)?)?;
+        if !archived {
+            // 先提交实时追加，再冷开。工具补查的类型必须随新的检查点保留。
+            let mut append = fs::OpenOptions::new().append(true).open(&path)?;
+            writeln!(append, "{{\"type\":\"ignored\",\"payload\":{{}}}}")?;
+            let mut reader = SourceReader::restore(&store, &path)?;
+            assert!(reader.step(&mut store, at.date_naive(), &mut Budget::new(std::iter::empty()),
+                &BTreeMap::new(), 1 << 20)?);
+            assert_eq!(observations(&store)?, original);
+            drop(reader);
+            drop(store);
+            store = Store::open(Connection::open(&db_path)?)?;
+            assert!(store.checkpoint(&path)?.unwrap().1.legacy_tools_only);
+        }
+        let mut scan = Scan::default();
+        for round in 0..24 {
+            let report = scan.round(&mut store, &home, at.date_naive(), &BTreeMap::new(), 1 << 20);
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert_eq!(observations(&store)?, original);
+            if round == 0 { assert!(!report.complete); }
+            if report.complete { break; }
+        }
+        assert_eq!(observations(&store)?, original);
+        let revision: i64 = store.db.query_row("SELECT revision FROM token_revision", [], |r| r.get(0))?;
+        let query = DetailQuery::parse(&json!({"sessionId":FIRST,"id":"long-input","revision":revision}))?;
+        let result = Store::read_execution_detail(&mut store.db, &home, &query, || now.timestamp_millis())?;
+        assert_eq!(result["status"], "ok", "upgrade, archived={archived}");
+        assert!(result["detail"]["input"]["value"].as_str() == Some(large.as_str()));
+        assert!(result["detail"]["output"][1].as_str() == Some(large.as_str()));
+        assert_eq!(result["detail"]["output"][2], "tail");
+        assert_eq!(store.checkpoint(&path)?.unwrap().1.legacy_identity_prefix, 0);
+    }
+    Ok(())
+}
+
+#[test]
 fn detail_follows_a_verified_shell_process_and_rejects_reused_process_ids() {
     use crate::usage_history::structured::token_checkpoint::DetailQuery;
     let dir = tempfile::tempdir().unwrap();
@@ -1127,7 +1936,7 @@ fn detail_follows_a_verified_shell_process_and_rejects_reused_process_ids() {
         row(
             30,
             json!({"type":"function_call_output","call_id":"open","output":format!(
-                "Chunk ID: x\nProcess running with session ID 831\nOutput:\n{}", "x".repeat(8192)
+                "Chunk ID: x\nProcess running with session ID 831\nOutput:\n{}", "x".repeat((1 << 20) + 51)
             )}),
         ),
         row(
@@ -1140,7 +1949,8 @@ fn detail_follows_a_verified_shell_process_and_rejects_reused_process_ids() {
         ),
         row(
             500,
-            json!({"type":"function_call","name":"functions.write_stdin","call_id":"finish","arguments":{"session_id":831}}),
+            json!({"type":"function_call","name":"functions.write_stdin","call_id":"finish",
+                "arguments":json!({"chars":"x".repeat(8192),"session_id":831}).to_string()}),
         ),
         row(
             700,
@@ -1415,4 +2225,86 @@ fn response_includes_scoped_trend_and_preserves_archived_day_totals() {
     assert_eq!(calendar["coverage"]["precision"], "day");
     assert_eq!(calendar["rangeApplied"], true);
     assert_eq!(calendar["days"][0]["usage"]["totalTokens"], 220);
+}
+
+#[test]
+fn rescan_consumes_registered_appends_before_sealed_files_and_retracts_only_competing_counts()
+-> anyhow::Result<()> {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let archive = root.join("archived_sessions");
+    let sessions = root.join("sessions");
+    fs::create_dir(&archive)?;
+    fs::create_dir(&sessions)?;
+    for index in 0..=SOURCES_PER_ROUND {
+        let header = json!({"type":"session_meta","timestamp":"2026-01-02T12:00:00Z",
+            "payload":{"id":format!("10000000-0000-4000-8000-{index:012x}")}});
+        fs::write(archive.join(format!("rollout-{index:03}.jsonl")), format!("{header}\n"))?;
+    }
+    let later = sessions.join("rollout-second.jsonl");
+    fs::write(sessions.join("rollout-first.jsonl"), rollout(FIRST))?;
+    fs::write(&later, rollout(SECOND))?;
+    let mut other_appends = Vec::new();
+    for index in 0..3 {
+        let path = sessions.join(format!("rollout-extra-{index}.jsonl"));
+        let header = json!({"type":"session_meta","timestamp":"2026-01-02T12:00:00Z",
+            "payload":{"id":format!("20000000-0000-4000-8000-{index:012x}")}});
+        fs::write(&path, format!("{header}\n"))?;
+        other_appends.push(path);
+    }
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let mut store = Store::open(Connection::open_in_memory()?)?;
+    let mut scan = Scan::default();
+    let names = BTreeMap::new();
+    let round = |scan: &mut Scan, store: &mut Store| scan.round(store, &root, cutoff, &names, 8 << 20);
+    assert!(!round(&mut scan, &mut store).complete);
+    assert!(round(&mut scan, &mut store).complete);
+    for session in [FIRST, SECOND] {
+        assert!(store.reclassify_session(session, 1 << 20, &BTreeSet::new(), |events, _| {
+            assert_eq!(events.len(), 1);
+            events[0].provider = "gateway".into();
+            events[0].provider_source = Some("request-log-exact".into());
+            Ok(())
+        })?.is_some());
+    }
+    let exact_sessions = |store: &Store| -> rusqlite::Result<Vec<String>> {
+        store.db.prepare("SELECT s.session FROM token_resolved r JOIN token_sessions s ON s.id=r.session_id
+            WHERE json_extract(CAST(r.payload AS TEXT),'$.provider_source')='request-log-exact' ORDER BY s.session")?
+            .query_map([], |row| row.get(0))?.collect()
+    };
+    assert_eq!(exact_sessions(&store)?, [FIRST, SECOND]);
+    let mut extra: serde_json::Value = serde_json::from_str(rollout(SECOND).lines().nth(1).unwrap())?;
+    extra["timestamp"] = json!("2026-01-02T12:01:01Z");
+    extra["payload"]["info"]["total_token_usage"] =
+        json!({"input_tokens":200,"cached_input_tokens":40,"output_tokens":20});
+    // 一批 4 MiB 的读取预算会停在 compacted 行中间，后面仍有真正的竞争计数。
+    let compacted = json!({"type":"compacted","payload":{"text":"x".repeat(96 * 1024)}});
+    let mut append = fs::OpenOptions::new().append(true).open(&later)?;
+    for _ in 0..50 {
+        writeln!(append, "{compacted}")?;
+    }
+    drop(append);
+    writeln!(fs::OpenOptions::new().append(true).open(&later)?, "{extra}")?;
+    for path in &other_appends {
+        let done = json!({"type":"event_msg","timestamp":"2026-01-02T12:01:01Z",
+            "payload":{"type":"task_complete"}});
+        writeln!(fs::OpenOptions::new().append(true).open(path)?, "{done}")?;
+    }
+
+    let next = round(&mut scan, &mut store);
+    assert!(next.errors.is_empty() && next.pending_sources > 0);
+    for path in other_appends.iter().chain([&later]) {
+        assert_eq!(store.checkpoint(path)?.unwrap().1.offset, fs::metadata(path)?.len());
+    }
+    assert_eq!(exact_sessions(&store)?, [FIRST], "unrelated proof must survive this inventory");
+    assert_eq!(store.db.query_row("SELECT count(*) FROM token_resolved", [], |r| r.get::<_, i64>(0))?, 3);
+    assert!(round(&mut scan, &mut store).complete);
+
+    // 半行仍可能补出别的会话或竞争计数。
+    fs::OpenOptions::new().append(true).open(&later)?.write_all(b"{")?;
+    assert!(!round(&mut scan, &mut store).complete);
+    assert!(exact_sessions(&store)?.is_empty());
+    Ok(())
 }

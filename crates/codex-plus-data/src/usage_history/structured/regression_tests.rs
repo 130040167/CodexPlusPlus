@@ -4,6 +4,35 @@ const BASE_ROLLOUT: &str = "00000000-0000-4000-8000-000000000081";
 const NEXT_ROLLOUT: &str = "00000000-0000-4000-8000-000000000082";
 
 #[test]
+fn discovers_active_and_archived_rollouts_beyond_4096_sources() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path().canonicalize()?;
+    let active = home.join("sessions");
+    let archive = home.join("archived_sessions");
+    fs::create_dir(&active)?;
+    fs::create_dir(&archive)?;
+    let mut expected = Vec::new();
+    for index in 0..4097 {
+        let path = if index % 2 == 0 {
+            active.join(format!("rollout-{index:04}.jsonl"))
+        } else {
+            archive.join(format!("rollout-{index:04}.jsonl.zst"))
+        };
+        File::create(&path)?;
+        expected.push(path);
+    }
+    expected.sort_unstable();
+    for cold in [true, false] {
+        let mut errors = 0;
+        let mut paths = discover(&home, cold, &mut errors);
+        assert_eq!(errors, 0);
+        paths.sort_unstable();
+        assert_eq!(paths, expected);
+    }
+    Ok(())
+}
+
+#[test]
 fn cold_scan_reads_recently_changed_rollout_before_historical_backlog() {
     let mut fixture = Fixture::new();
     let older = fixture.home.join("sessions/rollout-a.jsonl");
@@ -1442,13 +1471,13 @@ fn assert_accounting(snapshot: &Snapshot, count: usize) {
 }
 
 #[test]
-fn model_lengths_are_indexed_and_filtered_by_utf8_bytes() {
+fn long_model_names_are_indexed_and_queryable_after_reopen() {
     let mut fixture = Fixture::new();
     let models = [
         "a".repeat(200),
         "b".repeat(201),
-        "c".repeat(256),
-        format!("{}a", "模".repeat(85)),
+        "c".repeat(640),
+        format!("{}a", "模".repeat(240)),
     ];
     let mut rows = Vec::new();
     for (position, model) in models.iter().enumerate() {
@@ -1474,25 +1503,18 @@ fn model_lengths_are_indexed_and_filtered_by_utf8_bytes() {
             "{phase}"
         );
     }
-    assert!(Query::parse(&json!({"model":"a".repeat(257)}), Local::now().date_naive()).is_none());
-    assert!(
-        Query::parse(
-            &json!({"turnId":"a".repeat(201)}),
-            Local::now().date_naive()
-        )
-        .is_none()
-    );
-    assert!(
-        Query::parse(
-            &json!({"search":"a".repeat(201)}),
-            Local::now().date_naive()
-        )
-        .is_none()
-    );
+    let long = &models[3];
+    let filters = Query::parse(
+        &json!({"turnId":long,"search":long}),
+        Local::now().date_naive(),
+    )
+    .unwrap();
+    assert_eq!(filters.turn_id.as_deref(), Some(long.as_str()));
+    assert_eq!(&filters.search, long);
 }
 
 #[test]
-fn oversized_model_blocks_old_context_evidence_and_duplicate_recovery() {
+fn conflicting_models_stay_ambiguous_when_one_name_is_long() {
     let mut fixture = Fixture::new();
     let oversized = "x".repeat(257);
     let rows = vec![
@@ -1529,12 +1551,15 @@ fn oversized_model_blocks_old_context_evidence_and_duplicate_recovery() {
         assert_eq!(events[0].model, "old-model", "{phase}");
         assert!(events[1].model.is_empty(), "{phase}");
         assert!(events[1].context_conflicts.model, "{phase}");
-        assert_eq!(snapshot.session_info[SESSION]["model"], "", "{phase}");
+        assert_eq!(snapshot.session_info[SESSION]["model"], oversized, "{phase}");
     }
+    fixture.write_segment("rollout-c.jsonl", vec![fixture.context(1_500, "other-model")]);
+    let tied = fixture.snapshot();
+    assert_eq!(tied.session_info[SESSION]["model"], "");
 }
 
 #[test]
-fn oversized_context_recovers_on_a_later_continuation() {
+fn long_model_context_survives_continuation_until_the_next_model_change() {
     let mut fixture = Fixture::new();
     let prefix = fixture.paged_segment(
         SESSION,
@@ -1566,7 +1591,7 @@ fn oversized_context_recovers_on_a_later_continuation() {
         let mut events = snapshot.events.clone();
         events.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
         assert_eq!(events[0].model, "old-model", "{phase}");
-        assert!(events[1].model.is_empty(), "{phase}");
+        assert_eq!(events[1].model, "x".repeat(257), "{phase}");
         assert_eq!(events[2].model, "new-model", "{phase}");
         assert_eq!(
             snapshot.session_info[SESSION]["model"], "new-model",
@@ -1611,6 +1636,48 @@ fn request() -> RequestEvidence {
         }),
         agent: String::new(),
     }
+}
+
+#[test]
+fn gateway_proofs_and_rejections_survive_the_old_row_limit_on_reopen() {
+    let mut fixture = Fixture::new();
+    fixture.write_classified_segment("rollout-a.jsonl", "auto", "custom", "main");
+    let mut event = fixture.snapshot().events.remove(0);
+    let at = DateTime::parse_from_rfc3339(&event.timestamp).unwrap().timestamp_millis();
+    let cutoff = Local::now().date_naive() - Days::days(RETENTION_DAYS - 1);
+    let root = tempfile::tempdir().unwrap();
+    let mut storage = provider_cache::ProviderCache::default();
+    storage.open(root.path(), cutoff).unwrap();
+    let mut cache = RequestEvidenceCache::default();
+    let mut conflict = event.clone();
+    conflict.id = [0xfe; 32];
+    cache.reject_conflicting_event(&conflict);
+    let marker = cache.verified.remove(&conflict.id).unwrap();
+    let db = rusqlite::Connection::open(provider_cache::database_path(root.path()).unwrap()).unwrap();
+    db.execute(
+        "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1)
+         INSERT INTO verified_requests SELECT CAST(printf('%032d',i) AS BLOB),?2,?3 FROM n",
+        rusqlite::params![MAX_EVENTS, at, serde_json::to_string(&marker).unwrap()],
+    ).unwrap();
+    drop(db);
+    cache.restore_verified(storage.load_verified(cutoff).unwrap());
+    let mut proof = request();
+    proof.timestamp_ms = at - 10;
+    proof.started_at_ms = at - 100;
+    cache.records.push(proof);
+    cache.attribute(std::slice::from_mut(&mut event), &mut BTreeMap::new(), &BTreeMap::new());
+    assert_eq!(event.provider_source.as_deref(), Some("request-log-exact"));
+    cache.reject_conflicting_event(&conflict);
+    assert_eq!(storage.save(&cache.verified, &BTreeMap::new()).unwrap(), 2);
+    drop(cache);
+    drop(storage);
+    let mut storage = provider_cache::ProviderCache::default();
+    storage.open(root.path(), cutoff).unwrap();
+    let mut restored = RequestEvidenceCache::default();
+    restored.restore_verified(storage.load_verified(cutoff).unwrap());
+    assert_eq!(restored.verified.len(), MAX_EVENTS + 2);
+    assert_eq!(restored.verified[&event.id].request.id, "request-1");
+    assert!(restored.verified[&conflict.id].rejected);
 }
 
 #[test]
@@ -2721,7 +2788,7 @@ fn unsupported_cache_version_is_not_modified() {
 }
 
 #[test]
-fn native_cache_capacity_keeps_unpersisted_conflicts_closed_after_restart() {
+fn native_cache_persists_conflicts_past_the_old_row_limit_after_restart() {
     let mut fixture = Fixture::new();
     fixture.snapshot();
     let db = rusqlite::Connection::open(
@@ -2778,7 +2845,7 @@ fn native_cache_capacity_keeps_unpersisted_conflicts_closed_after_restart() {
     let first = fixture.snapshot();
     assert_eq!(
         snapshot_response(&first)["scan"]["countCacheAvailable"],
-        false
+        true
     );
     let db = rusqlite::Connection::open(
         fixture
@@ -2792,23 +2859,11 @@ fn native_cache_capacity_keeps_unpersisted_conflicts_closed_after_restart() {
             row.get(0)
         })
         .unwrap();
-    assert!(
-        count <= MAX_EVENTS,
-        "native attribution rows exceed budget: {count}"
-    );
-    let guard_at: i64 = db
-        .query_row(
-            "SELECT at FROM structured_count_guard WHERE singleton=1",
-            [],
-            |row| row.get(0),
-        )
+    assert_eq!(count, MAX_EVENTS + 1);
+    let guarded: bool = db
+        .query_row("SELECT EXISTS(SELECT 1 FROM structured_count_guard)", [], |row| row.get(0))
         .unwrap();
-    assert!(guard_at >= at);
-    db.execute(
-        "DELETE FROM native_attributions WHERE id=CAST(printf('%032d',1) AS BLOB)",
-        [],
-    )
-    .unwrap();
+    assert!(!guarded);
     drop(db);
 
     for name in ["rollout-one-a.jsonl", "rollout-two-a.jsonl"] {
@@ -2819,9 +2874,9 @@ fn native_cache_capacity_keeps_unpersisted_conflicts_closed_after_restart() {
     assert_eq!(snapshot_response(&restarted)["complete"], false);
     assert_eq!(
         snapshot_response(&restarted)["scan"]["countCacheAvailable"],
-        false
+        true
     );
-    assert_eq!(snapshot_response(&restarted)["days"], json!([]));
+    assert_eq!(snapshot_response(&restarted)["scan"]["uncertainCountEvents"], 2);
 }
 
 #[test]

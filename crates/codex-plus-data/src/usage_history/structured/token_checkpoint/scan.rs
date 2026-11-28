@@ -1,4 +1,5 @@
 use super::{
+    SourceStamp,
     ingest::SourceReader,
     store::{
         Coverage, Store,
@@ -6,9 +7,9 @@ use super::{
         replicas::{Comparison, Probe},
     },
 };
-use crate::usage_history::structured::{discover, index_budget::Budget};
+use crate::usage_history::structured::{FileState, discover, index_budget::Budget};
 use chrono::NaiveDate;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 const SOURCES_PER_ROUND: usize = 64;
@@ -20,10 +21,18 @@ pub(super) struct Scan {
     missing: VecDeque<(PathBuf, i64)>,
     more_missing: bool,
     active: Option<SourceReader>,
+    revisiting: Option<SourceReader>,
     comparing: Option<Box<Comparison>>,
     deferred: Option<SourceReader>,
     rescan: bool,
+    live: BTreeMap<PathBuf, SourceStamp>,
+    waiting_for_newline: BTreeMap<PathBuf, (SourceStamp, bool)>,
+    last_revisited: Option<PathBuf>,
+    waiting_prefixes: HashSet<PathBuf>,
     issues: usize,
+    unknown_count_scope: bool,
+    sealed_queue: HashSet<PathBuf>,
+    legacy_prefixes: BTreeMap<PathBuf, (SourceStamp, bool)>,
     scoped_count_gaps: BTreeSet<PathBuf>,
     maintenance_day: Option<NaiveDate>,
     details_pending: bool,
@@ -34,6 +43,7 @@ pub(super) struct Scan {
 
 pub(super) struct Report {
     pub(super) complete: bool,
+    pub(super) can_classify: bool,
     pub(super) pending_sources: usize,
     pub(super) issues: usize,
     pub(super) errors: Vec<(PathBuf, anyhow::Error)>,
@@ -41,8 +51,20 @@ pub(super) struct Report {
 }
 
 impl Scan {
+    pub(super) fn sealed_pending(&self) -> usize {
+        self.sealed_queue.len()
+    }
+
     pub(super) fn scoped_count_gaps(&self) -> &BTreeSet<PathBuf> {
         &self.scoped_count_gaps
+    }
+
+    fn retirement_blocked(&self) -> bool {
+        self.unknown_count_scope
+            || self.issues != self.scoped_count_gaps.len()
+            || self.deferred.is_some()
+            || self.revisiting.is_some()
+            || !self.waiting_for_newline.is_empty()
     }
 
     pub(super) fn maintain(&mut self, store: &mut Store, cutoff: NaiveDate) -> anyhow::Result<()> {
@@ -85,15 +107,28 @@ impl Scan {
     ) -> Report {
         let maintenance_error = self.maintain(store, cutoff).err();
         let mut errors = Vec::new();
+        let mut budget = Budget::new(std::iter::empty());
+        let batch_bytes = budget.read_left;
+        let mut finish_appends = false;
+        let backlogged = !self.remaining.is_empty();
+        let recheck_missing = !self.missing.is_empty()
+            && self.remaining.len() == self.sealed_queue.len()
+            && !self.retirement_blocked();
+        let mut current_inventory = false;
+        let sessions_dir = home.join("sessions");
         if self.active.is_none()
             && self.comparing.is_none()
-            && self.remaining.is_empty()
-            && self.missing.is_empty()
+            && (self.remaining.is_empty() || recheck_missing)
         {
             self.issues = 0;
+            let previous_queue = std::mem::take(&mut self.sealed_queue);
+            self.legacy_prefixes.clear();
+            self.waiting_prefixes.clear();
             self.scoped_count_gaps.clear();
+            self.missing.clear();
             self.more_missing = false;
             let paths = discover(home, !self.rescan, &mut self.issues);
+            self.unknown_count_scope = self.issues != 0;
             if self.issues == 0 {
                 match store.missing_sources(&paths, SOURCES_PER_ROUND) {
                     Ok((missing, more)) => {
@@ -102,17 +137,94 @@ impl Scan {
                     }
                     Err(error) => {
                         self.issues += 1;
+                        self.unknown_count_scope = true;
                         errors.push((home.to_owned(), error));
                     }
                 }
             }
-            self.remaining = paths.into();
+            let waiting = std::mem::take(&mut self.waiting_for_newline);
+            self.remaining = paths
+                .into_iter()
+                .filter(|path| {
+                    // 有计数缺口的前缀需从持久检查点恢复诊断，只有干净的半行可以跳过。
+                    if let Some(&(stamp, false)) = waiting.get(path)
+                        && FileState::source_stamp(path).is_ok_and(|current| current == stamp)
+                    {
+                        self.waiting_for_newline.insert(path.clone(), (stamp, false));
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .collect();
             self.rescan = true;
-            if let Some(reader) = &self.deferred {
+            for reader in self.deferred.iter().chain(&self.revisiting) {
                 self.remaining.retain(|source| source != &reader.source);
             }
+            if self.issues == 0 {
+                match store.sealed_queued_sources(self.remaining.make_contiguous()) {
+                    Ok((sealed, gaps, growing, unchecked, prefixes)) => {
+                        for (path, &stamp) in sealed.iter().chain(&unchecked) {
+                            if path.starts_with(&sessions_dir)
+                                && path.extension().is_some_and(|ext| ext == "jsonl")
+                                && stamp.0 > 0 && !gaps.contains(path)
+                            {
+                                self.live.insert(path.clone(), stamp);
+                            }
+                        }
+                        self.sealed_queue = sealed.into_keys().collect();
+                        self.legacy_prefixes = prefixes;
+                        self.issues += gaps.len();
+                        self.scoped_count_gaps = gaps;
+                        current_inventory = true;
+                        if recheck_missing {
+                            // 已处理过、且本轮仍证实封存的路径无需重新排队。
+                            self.remaining.retain(|path| {
+                                !self.sealed_queue.contains(path) || previous_queue.contains(path)
+                            });
+                            self.sealed_queue
+                                .retain(|path| previous_queue.contains(path));
+                        }
+                        if !self.missing.is_empty() {
+                            let names: HashSet<_> = self.missing.iter()
+                                .filter_map(|(path, _)| path.file_name())
+                                .collect();
+                            self.remaining.make_contiguous().sort_by_key(|path| {
+                                (
+                                    self.sealed_queue.contains(path),
+                                    !path.file_name().is_some_and(|name| names.contains(name)),
+                                )
+                            });
+                        } else if !growing.is_empty() {
+                            // 优先解析追加内容，读完并提交后才可按新的计数范围保留归属。
+                            if let Err(error) = store.prioritize_growing(&growing, &mut self.remaining) {
+                                self.issues += 1;
+                                self.unknown_count_scope = true;
+                                errors.push((home.to_owned(), error));
+                            }
+                            if !self.retirement_blocked()
+                                && !self.more_missing
+                                && self.remaining.len() == self.sealed_queue.len() + growing.len()
+                            {
+                                // 再留一个字节探测 EOF；每批仍按普通预算提交。
+                                let observed = growing.values().sum::<u64>().saturating_add(1);
+                                if observed > batch_bytes && observed <= reconciliation_limit as u64
+                                {
+                                    budget.read_left = observed;
+                                    budget.source_left = observed;
+                                    finish_appends = true;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        self.issues += 1;
+                        self.unknown_count_scope = true;
+                        errors.push((home.to_owned(), error));
+                    }
+                }
+            }
         }
-        let mut budget = Budget::new(std::iter::empty());
         let mut retry = if self.active.is_none() {
             self.deferred.take()
         } else {
@@ -120,33 +232,119 @@ impl Scan {
         };
         let mut compared = false;
         let mut verify_later = Vec::new();
-        'sources: for _ in 0..SOURCES_PER_ROUND {
+        let mut changed = VecDeque::new();
+        if !current_inventory && (backlogged || self.active.is_some() || self.comparing.is_some()) {
+            self.live.retain(|path, stamp| {
+                if self
+                    .active
+                    .iter()
+                    .chain(&retry)
+                    .chain(&self.deferred)
+                    .chain(&self.revisiting)
+                    .any(|r| &r.source == path)
+                    || self.comparing.as_ref().is_some_and(|probe| probe.compares(path))
+                {
+                    return true;
+                }
+                let stamp = self.waiting_for_newline.get(path).map_or(*stamp, |tail| tail.0);
+                match FileState::source_stamp(path) {
+                    Ok(current) if current != stamp => {
+                        changed.push_back(path.clone());
+                        true
+                    }
+                    Ok(_) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => {
+                        self.issues += 1;
+                        self.unknown_count_scope = true;
+                        errors.push((path.clone(), error.into()));
+                        false
+                    }
+                }
+            });
+            if let Some(last) = &self.last_revisited {
+                let next = changed.partition_point(|path| path <= last);
+                changed.rotate_left(next);
+            }
+        }
+        if !changed.is_empty() {
+            if self.active.is_none() && retry.is_none() && self.comparing.is_none()
+                && let Some(head) = self.remaining.front()
+                && self.waiting_prefixes.remove(head)
+            {
+                changed.retain(|path| path != head);
+            }
+            let growing: HashSet<_> = changed.iter().collect();
+            self.remaining.retain(|path| !growing.contains(path));
+            for path in &changed {
+                let was_waiting = self.waiting_for_newline.remove(path).is_some_and(|(_, gap)| gap);
+                let was_sealed = self.sealed_queue.remove(path);
+                let was_prefix = self.legacy_prefixes.remove(path).is_some();
+                let removed_gap = (was_waiting || was_sealed || was_prefix) && self.scoped_count_gaps.remove(path);
+                if was_waiting || removed_gap {
+                    self.issues -= 1;
+                }
+            }
+        }
+        let history_pending = self.active.is_some() || retry.is_some()
+            || self.comparing.is_some() || !self.remaining.is_empty();
+        let mut live_bytes = if history_pending { budget.read_left / 2 } else { budget.read_left };
+        let mut live_source_bytes = if history_pending { budget.source_left / 2 } else { budget.source_left };
+        'sources: for slot in 0..SOURCES_PER_ROUND {
             if budget.read_left == 0 || budget.source_left == 0 {
                 break;
             }
-            let mut reader = match self.active.take().or_else(|| retry.take()) {
+            let revisit = live_bytes > 0 && live_source_bytes > 0
+                && (!history_pending || slot + 1 < SOURCES_PER_ROUND)
+                && if self.revisiting.is_some() { slot == 0 } else { !changed.is_empty() };
+            let resumed = if revisit {
+                self.revisiting.take()
+            } else {
+                self.active.take().or_else(|| retry.take())
+            };
+            let mut reader = match resumed {
                 Some(source) => source,
                 None => {
-                    let comparing = if compared {
+                    let comparing = if compared || revisit {
                         None
                     } else {
                         self.comparing.take()
                     };
-                    let path = comparing
-                        .as_ref()
-                        .map(|check| check.path().to_owned())
-                        .or_else(|| self.remaining.pop_front());
+                    let blocked_retirement = self.retirement_blocked();
+                    // 只在本轮已核实所有潜在迁移目的地时优先处理缺失路径。
+                    let retire_first = current_inventory
+                        && !blocked_retirement
+                        && !self.missing.is_empty()
+                        && self.remaining.len() == self.sealed_queue.len()
+                        && self.comparing.is_none()
+                        && verify_later.is_empty();
+                    let live_path = if revisit {
+                        let path = changed.pop_front().unwrap();
+                        self.last_revisited = Some(path.clone());
+                        Some(path)
+                    } else {
+                        None
+                    };
+                    let path = live_path
+                        .or_else(|| comparing.as_ref().map(|check| check.path().to_owned()))
+                        .or_else(|| {
+                            if retire_first { None } else { self.remaining.pop_front() }
+                        });
                     let Some(path) = path else {
                         // 先摄取完整的新来源，再处理旧路径，避免归档移动产生用量空窗。
                         if self.comparing.is_some() || !verify_later.is_empty() {
                             break;
                         }
-                        if self.issues != 0 || self.deferred.is_some() {
+                        if blocked_retirement {
                             if !self.missing.is_empty() || self.more_missing {
+                                self.unknown_count_scope = true;
                                 self.scoped_count_gaps.clear();
                             }
                             self.missing.clear();
                             self.more_missing = false;
+                            break;
+                        }
+                        if !current_inventory {
                             break;
                         }
                         let Some((source, revision)) = self.missing.pop_front() else {
@@ -160,19 +358,24 @@ impl Scan {
                                     revision,
                                     cutoff,
                                     provider_names.clone(),
-                                    reconciliation_limit,
                                 ) {
                                     self.issues += 1;
+                                    self.unknown_count_scope = true;
                                     errors.push((source, error));
                                 }
                             }
                             Err(error) => {
                                 self.issues += 1;
+                                self.unknown_count_scope = true;
                                 errors.push((source, error.into()));
                             }
                         }
                         continue;
                     };
+                    self.sealed_queue.remove(&path);
+                    if self.scoped_count_gaps.remove(&path) {
+                        self.issues -= 1;
+                    }
                     if self
                         .comparing
                         .as_ref()
@@ -195,13 +398,14 @@ impl Scan {
                                 Ok(false) => {}
                                 Err(error) => {
                                     self.issues += 1;
+                                    self.unknown_count_scope = true;
                                     errors.push((path, error));
                                     continue 'sources;
                                 }
                             }
                         }
                         store.probe_copy(&path).and_then(|probe| match probe {
-                            Probe::Compare(comparison) if !compared => {
+                            Probe::Compare(comparison) if !compared && self.comparing.is_none() => {
                                 compared = true;
                                 comparison.step(store, &mut budget)
                             }
@@ -238,6 +442,7 @@ impl Scan {
                         Ok(Probe::ReadSource) => {}
                         Err(error) => {
                             self.issues += 1;
+                            self.unknown_count_scope = true;
                             errors.push((path, error));
                             continue;
                         }
@@ -250,63 +455,223 @@ impl Scan {
                         Ok(reader) => reader,
                         Err(error) => {
                             self.issues += 1;
+                            self.unknown_count_scope = true;
                             errors.push((path, error));
                             continue;
                         }
                     }
                 }
             };
-            let allowance = (budget.read_left, budget.source_left);
-            match reader.step(
+            let parked = self
+                .active
+                .iter()
+                .chain(&self.revisiting)
+                .chain(&self.deferred)
+                .chain(&retry);
+            let mut slot_budget = budget.checkpoint_slot(parked.flat_map(|r| r.states()));
+            if revisit {
+                slot_budget.read_left = slot_budget.read_left.min(live_bytes);
+                slot_budget.source_left = slot_budget.source_left.min(live_source_bytes);
+            }
+            slot_budget.read_left = slot_budget.read_left.min(batch_bytes);
+            slot_budget.source_left = slot_budget.source_left.min(batch_bytes);
+            let allowance = (slot_budget.read_left, slot_budget.source_left);
+            let step = if revisit { SourceReader::step } else { SourceReader::step_in_history_slot };
+            let result = step(
+                &mut reader,
                 store,
                 cutoff,
-                &mut budget,
+                &mut slot_budget,
                 provider_names,
                 reconciliation_limit,
-            ) {
-                Ok(true) => {
+            );
+            let consumed = (
+                allowance.0 - slot_budget.read_left,
+                allowance.1 - slot_budget.source_left,
+            );
+            budget.read_left -= consumed.0;
+            budget.source_left -= consumed.1;
+            if revisit {
+                live_bytes -= consumed.0;
+                live_source_bytes -= consumed.1;
+            }
+            if result.is_ok() && let Some(prefix) = reader.closed_legacy_prefix() {
+                self.legacy_prefixes.insert(reader.source.clone(), prefix);
+                if let Some(stamp) = self.live.get_mut(&reader.source) {
+                    *stamp = prefix.0;
+                }
+            } else if reader.state.identity_conflict {
+                self.legacy_prefixes.remove(&reader.source);
+            }
+            match result {
+                Ok(true) if reader.state.legacy_identity_prefix != 0 => {
+                    // 尾部已提交，旧前缀由历史队列复核，实时名额留给下一次追加。
+                    if let Some(stamp) = self.live.get_mut(&reader.source) {
+                        *stamp = reader.state.stamp.unwrap();
+                    }
+                    self.waiting_prefixes.insert(reader.source.clone());
+                    verify_later.push(reader.source);
+                }
+                Ok(complete) if complete || reader.waiting_for_newline() => {
+                    self.legacy_prefixes.remove(&reader.source);
+                    if !complete {
+                        self.waiting_for_newline.insert(
+                            reader.source.clone(),
+                            (reader.state.stamp.unwrap(), reader.has_count_gap()),
+                        );
+                    }
                     if reader.has_only_malformed_token_counts() {
                         self.scoped_count_gaps.insert(reader.source);
                         self.issues += 1;
-                    } else {
-                        self.issues += usize::from(reader.has_count_gap());
+                    } else if reader.has_count_gap() {
+                        self.issues += 1;
+                        self.unknown_count_scope = true;
+                    } else if reader.source.starts_with(&sessions_dir)
+                        && reader.source.extension().is_some_and(|ext| ext == "jsonl")
+                        && let Some(stamp) = reader.state.stamp
+                        && stamp.0 > 0
+                    {
+                        self.live.insert(reader.source, stamp);
                     }
                 }
+                Ok(false) if revisit && consumed != (0, 0) && reader.can_yield_plain_batch() => {
+                    // 已提交的普通前缀可直接 seek；下一轮把实时名额交给下一个变化的源。
+                    verify_later.push(reader.source);
+                }
                 Ok(false)
-                    if reader.has_open_reader()
-                        && allowance != (budget.read_left, budget.source_left) =>
+                    if revisit
+                        && (reader.encoding_pending()
+                            || reader.has_open_reader() && consumed != (0, 0)) =>
                 {
+                    self.revisiting = Some(reader);
+                }
+                Ok(false) if reader.encoding_pending() => {
+                    if self.deferred.is_none() {
+                        self.deferred = Some(reader);
+                    } else {
+                        verify_later.push(reader.source);
+                    }
+                }
+                Ok(false) if reader.has_open_reader() && consumed != (0, 0) => {
                     self.active = Some(reader);
+                    if finish_appends && (slot_budget.read_left == 0 || slot_budget.source_left == 0)
+                    {
+                        continue;
+                    }
                     break;
                 }
-                Ok(false) => self.issues += 1,
+                Ok(_) => {
+                    // 本轮没有读取名额时保留队列，不把等待当作来源损坏。
+                    verify_later.push(reader.source);
+                }
                 Err(error) => {
                     self.issues += 1;
+                    self.unknown_count_scope |= !reader.can_retry_write();
                     errors.push((reader.source.clone(), error));
-                    if reader.can_retry_write() && self.deferred.is_none() {
+                    if revisit && reader.can_retry_write() {
+                        self.revisiting = Some(reader);
+                    } else if reader.can_retry_write() && self.deferred.is_none() {
                         self.deferred = Some(reader);
                     }
                 }
             }
         }
-        self.remaining.extend(verify_later);
+        // 已变化但尚未获分配的来源仍属于未处理队列，不能沿用封存时的覆盖结论。
+        self.remaining.extend(changed);
+        let (prefixes, later): (Vec<_>, Vec<_>) = verify_later
+            .into_iter()
+            .partition(|path| self.waiting_prefixes.contains(path));
+        self.remaining.extend(later);
+        // 已追平的活跃来源优先补完旧前缀，不再排到全部无关归档之后。
+        for path in prefixes.into_iter().rev() {
+            self.remaining.push_front(path);
+        }
         let pending_sources = self.remaining.len()
+            + self.waiting_for_newline.len()
             + self.missing.len()
             + usize::from(self.more_missing)
             + usize::from(self.active.is_some())
+            + usize::from(self.revisiting.is_some())
             + usize::from(self.comparing.is_some())
             + usize::from(self.deferred.is_some());
         let mut issues = self.issues;
-        if let Err(error) = store.record_coverage(Coverage {
-            pending_sources,
-            issues,
-            maintenance_blocked: maintenance_error.is_some(),
-        }) {
+        // The previous snapshot stays intact until this known append actually commits.
+        let unpublished_append = self
+            .deferred
+            .iter()
+            .chain(&self.revisiting)
+            .filter(|reader| reader.retrying_closed_append())
+            .count();
+        // 盘点之后，路径也可能被替换。旧前缀只对同一份已提交内容限定会话范围。
+        let mut affected = self.scoped_count_gaps.clone();
+        let mut rechecking = BTreeSet::new();
+        let mut covered = 0;
+        // 已登记的完整旧路径只影响其关联会话；未知的新来源仍会阻止归类。
+        for (path, revision) in &self.missing {
+            match store.checkpoint(path) {
+                Ok(Some((saved_revision, state))) if saved_revision == *revision
+                    && !state.session.is_empty()
+                    && !state.resume_pending && !state.skipping
+                    && !state.invalid_counts && !state.identity_conflict && state.issues == 0
+                    && path.extension().is_some_and(|ext| ext == "jsonl")
+                    && state.stamp.is_some_and(|(size, modified, identity)|
+                        size == state.offset && modified.is_some() && identity.is_some()) =>
+                {
+                    affected.insert(path.clone());
+                    covered += 1;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    issues += 1;
+                    self.unknown_count_scope = true;
+                    errors.push((path.clone(), error));
+                }
+            }
+        }
+        for path in self.remaining.iter().chain(self.active.iter().chain(&self.revisiting)
+            .chain(&self.deferred).map(|reader| &reader.source)) {
+            if self.sealed_queue.contains(path) {
+                covered += 1;
+            } else if let Some(&(stamp, affects_counts)) = self.legacy_prefixes.get(path) {
+                match FileState::source_stamp(path) {
+                    Ok(current) if current == stamp => {
+                        covered += 1;
+                        if affects_counts { rechecking.insert(path.clone()); }
+                    }
+                    Ok(_) => { self.legacy_prefixes.remove(path); }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        self.legacy_prefixes.remove(path);
+                    }
+                    Err(error) => {
+                        self.unknown_count_scope = true;
+                        issues += 1;
+                        errors.push((path.clone(), error.into()));
+                    }
+                }
+            }
+        }
+        let unknown = self.unknown_count_scope || pending_sources > covered + unpublished_append;
+        let can_classify = !unknown && unpublished_append == 0 && issues == self.scoped_count_gaps.len();
+        let coverage = Coverage { pending_sources, issues, maintenance_blocked: maintenance_error.is_some() };
+        let recorded = if can_classify {
+            store.record_scoped_coverage(coverage, &affected, &rechecking)
+        } else {
+            store.record_coverage(coverage, unknown)
+        };
+        if let Err(error) = recorded {
             issues += 1;
-            errors.push((home.to_owned(), error));
+            return Report {
+                complete: false,
+                can_classify: false,
+                pending_sources,
+                issues,
+                errors,
+                maintenance_error: Some(error),
+            };
         }
         Report {
             complete: pending_sources == 0 && issues == 0 && maintenance_error.is_none(),
+            can_classify: can_classify && maintenance_error.is_none(),
             pending_sources,
             issues,
             errors,

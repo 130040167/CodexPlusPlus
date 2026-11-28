@@ -6,7 +6,7 @@ use crate::usage_history::structured::token_checkpoint::{
 };
 use crate::usage_history::structured::{
     AttributionScope, ClassificationEvidence, DELAYED_REQUEST_MATCH_WINDOW_MS, FileState, Index,
-    MAX_ACTIVITY, MAX_FILES, Query, RequestSessionAliases, Snapshot, UsageEvent, native_endpoints,
+    MAX_ACTIVITY, Query, RequestSessionAliases, SessionModelObservation, Snapshot, UsageEvent, native_endpoints,
     ordered_scope_ids, segments, terminal_receipts, unknown_model, unknown_provider,
     usage_provider,
 };
@@ -21,13 +21,34 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-pub(super) fn links(path: &Path, state: &FileState) -> BTreeSet<String> {
+mod prefix;
+mod request_proofs;
+
+const CLASSIFICATION_RIGHT_MS: i64 = 2 * DELAYED_REQUEST_MATCH_WINDOW_MS;
+
+pub(in super::super) fn classification_lookback_ms() -> i64 {
+    native_endpoints::WINDOW_MS.max(CLASSIFICATION_RIGHT_MS)
+}
+
+#[derive(Debug)]
+pub(in super::super) struct ComponentInputLimit;
+
+impl std::fmt::Display for ComponentInputLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Token component exceeds reconciliation input budget")
+    }
+}
+
+impl std::error::Error for ComponentInputLimit {}
+
+pub(super) fn links(path: &Path, state: &FileState, include_contexts: bool) -> BTreeSet<String> {
     let mut result = BTreeSet::new();
     for session in std::iter::once(&state.session)
         .chain(
             state
                 .inherited_contexts
                 .iter()
+                .filter(|_| include_contexts)
                 .map(|context| &context.session),
         )
         .chain(state.events.iter().map(|event| &event.session))
@@ -54,6 +75,7 @@ pub(in super::super) struct Prepared<'a> {
     linear: Option<NativeTail>,
     superseded: Vec<SupersededReceipt>,
     receipt_origins: HashMap<[u8; 32], Counter>,
+    classification_origins: HashMap<[u8; 32], EventClassification>,
     events: Vec<UsageEvent>,
 }
 
@@ -257,12 +279,21 @@ impl Selection {
     }
 }
 
+const PROVIDER_INFERRED: u8 = 1 << 4;
+const RECOVERED_REQUEST_SUPPLIER: u8 = 1 << 5;
+
 fn group_key(event: &UsageEvent) -> (String, String, String, u8) {
     let conflict = event.context_conflicts;
     let flags = u8::from(conflict.model)
         | u8::from(conflict.provider) << 1
         | u8::from(conflict.role) << 2
-        | u8::from(conflict.turn) << 3;
+        | u8::from(conflict.turn) << 3
+        | match ClassificationEvidence::of(event) {
+            ClassificationEvidence::NamespaceInferred
+            | ClassificationEvidence::SessionContextInferred => PROVIDER_INFERRED,
+            ClassificationEvidence::RecoveredRequestSupplier => RECOVERED_REQUEST_SUPPLIER,
+            _ => 0,
+        };
     (
         event.model.clone(),
         event.provider.clone(),
@@ -292,6 +323,84 @@ fn local_time(ms: i64) -> Result<DateTime<Local>> {
 fn local_midnight(time: DateTime<Local>) -> bool {
     time.time() == NaiveTime::MIN
         && Local.from_local_datetime(&time.naive_local()).single() == Some(time)
+}
+
+pub(super) fn retract_attribution(db: &Connection, sessions: Option<&str>) -> Result<()> {
+    let mut changed_days = BTreeSet::new();
+    let mut cursor = (0_i64, i64::MIN, [0_u8; 32]);
+    let selected = if sessions.is_some() {
+        "r.session_id IN (SELECT value FROM json_each(?4))"
+    } else {
+        "?4 IS NULL"
+    };
+    let mut select = db.prepare_cached(&format!(
+        "SELECT r.session_id, r.timestamp_ms, r.event_id, s.session, r.payload
+         FROM token_resolved r INDEXED BY token_classified_time
+         JOIN token_sessions s ON s.id = r.session_id
+         WHERE json_type(CAST(r.payload AS TEXT), '$.classification_origin') = 'object'
+           AND {selected}
+           AND r.day >= (SELECT precise_from FROM token_revision)
+           AND (r.session_id, r.timestamp_ms, r.event_id) > (?1, ?2, ?3)
+         ORDER BY r.session_id, r.timestamp_ms, r.event_id LIMIT 128"
+    ))?;
+    let mut write =
+        db.prepare_cached("UPDATE token_resolved SET payload = ?2 WHERE event_id = ?1")?;
+    loop {
+        let mut updates = Vec::new();
+        let mut rows = select.query(params![cursor.0, cursor.1, cursor.2.as_slice(), sessions])?;
+        let mut loaded = 0;
+        while let Some(row) = rows.next()? {
+            loaded += 1;
+            cursor = (
+                row.get(0)?,
+                row.get(1)?,
+                row.get_ref(2)?.as_blob()?.try_into()?,
+            );
+            let session: String = row.get(3)?;
+            let mut stored: Observation = serde_json::from_slice(row.get_ref(4)?.as_blob()?)?;
+            let origin = stored
+                .classification_origin
+                .take()
+                .context("missing classification origin")?;
+            let receipt = stored.receipt_count_origin;
+            let mut event = stored.into_event(cursor.2, session.clone())?;
+            let current = EventClassification::of(&event);
+            origin.apply(&mut event);
+            // Losing a supplier proof does not resolve an independently disputed count.
+            event.count_uncertain = current.count_uncertain;
+            if current != EventClassification::of(&event) {
+                changed_days.insert((session, event.date));
+                let mut restored = Observation::capture(&event);
+                restored.receipt_count_origin = receipt;
+                restored.classification_origin =
+                    (origin.count_uncertain != event.count_uncertain).then_some(origin);
+                updates.push((cursor.2, serde_json::to_vec(&restored)?));
+            }
+        }
+        drop(rows);
+        for (id, data) in updates {
+            write.execute(params![id.as_slice(), data])?;
+        }
+        if loaded < 128 {
+            break;
+        }
+    }
+    if !changed_days.is_empty() {
+        let mut update = db.prepare_cached(
+            "UPDATE token_days SET groups = ?3 WHERE day = ?2
+             AND session_id = (SELECT id FROM token_sessions WHERE session = ?1)",
+        )?;
+        for (session, date) in changed_days {
+            let date = date.to_string();
+            let groups = committed_day_groups(db, &session, &date)?;
+            update.execute(params![session, date, encode_groups(groups)?])?;
+        }
+        db.execute(
+            "UPDATE token_revision SET revision = revision + 1, updated_at = max(updated_at + 1, ?1)",
+            [Local::now().timestamp_millis()],
+        )?;
+    }
+    Ok(())
 }
 
 fn retract_append_proofs(
@@ -455,7 +564,7 @@ fn correct_sealed_counters(
         };
         budget = budget
             .checked_sub(payload.len())
-            .context("Token counter corrections exceed reconciliation input budget")?;
+            .ok_or(ComponentInputLimit)?;
         let id: [u8; 32] = id.as_slice().try_into()?;
         let target = serde_json::from_slice::<Observation>(&payload)?;
         if target.turn != receipt.turn
@@ -554,7 +663,7 @@ fn reconcile_append_receipts(
         let payload = row.get_ref(1)?.as_blob()?;
         remaining = remaining
             .checked_sub(payload.len())
-            .context("Token receipt suffix exceeds reconciliation input budget")?;
+            .ok_or(ComponentInputLimit)?;
         let mut observation: Observation = serde_json::from_slice(payload)?;
         let origin = observation.classification_origin.take();
         let mut event =
@@ -643,6 +752,245 @@ fn reconcile_append_receipts(
 }
 
 impl Store {
+    fn append_continuation(
+        read: &Connection,
+        update: &SourceUpdate<'_>,
+        cutoff: NaiveDate,
+        provider_names: &BTreeMap<String, String>,
+        mut remaining: usize,
+    ) -> Result<Option<Vec<UsageEvent>>> {
+        let state = update.state;
+        let Some(rollout) = segments::rollout_id(update.source) else {
+            return Ok(None);
+        };
+        if !state.continuation
+            || state.history_base.is_none()
+            || state.rollout_out_of_order
+            || state.identity_conflict
+            || state.invalid_counts
+            || !state.inherited_contexts.is_empty()
+            || state.issues != 0
+            || state.events.is_empty()
+            || state
+                .events
+                .iter()
+                .any(|event| event.terminal_response.is_some())
+        {
+            return Ok(None);
+        }
+        let checkpoint: Option<(i64, u64, Vec<u8>, i64)> = read
+            .query_row(
+                "SELECT src.id, src.offset, src.checkpoint, s.id
+             FROM token_sources src JOIN token_sessions s ON s.session = ?3
+             WHERE src.source = ?1 AND src.revision = ?2",
+                params![
+                    encode_path(update.source),
+                    update.previous_revision,
+                    state.session
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((id, offset, blob, session)) = checkpoint else {
+            return Ok(None);
+        };
+        let (_, next_checkpoint) = Checkpoint::capture(state);
+        let next_bytes = serde_json::to_vec(&next_checkpoint)?.len();
+        let Some(left) = remaining
+            .checked_sub(blob.len())
+            .and_then(|left| left.checked_sub(next_bytes))
+        else {
+            return Ok(None);
+        };
+        remaining = left;
+        let prior: Checkpoint = serde_json::from_slice(&blob)?;
+        let Some((first_ordinal, last_ordinal, end)) = prior.rollout_extent else {
+            return Ok(None);
+        };
+        if prior.session != state.session
+            || prior.rollout_out_of_order
+            || prior.identity_conflict
+            || prior.invalid_counts
+            || prior.issues != 0
+            || end != offset
+            || state
+                .rollout_extent
+                .is_none_or(|(first, _, _)| first != first_ordinal)
+            || prior.history_base
+                != state
+                    .history_base
+                    .as_ref()
+                    .map(|base| (*base.rollout.as_bytes(), base.end_ordinal, base.end_offset))
+            || prior
+                .expired_count
+                .map(|(position, counter)| (position, counter.0))
+                != state.expired_count
+        {
+            return Ok(None);
+        }
+
+        // A materialized copy or a child can add another predecessor in the full resolver.
+        if read.query_row(
+            "SELECT EXISTS(SELECT 1 FROM token_source_links WHERE link = ?1 AND source_id != ?2)
+                  OR EXISTS(SELECT 1 FROM token_source_copies WHERE owner_id = ?2)
+                  OR EXISTS(SELECT 1 FROM token_resolved INDEXED BY token_resolved_open_receipt
+                     WHERE session_id = ?3 AND day >= ?4
+                     AND json_type(CAST(payload AS TEXT), '$.terminal_response') = 'text')",
+            params![format!("r:{rollout}"), id, session, cutoff.to_string()],
+            |row| row.get(0),
+        )? {
+            return Ok(None);
+        }
+        let first_time = state.events[0].timestamp.as_str();
+        // 游标按时间文本取最大值；带时区偏移的时间还必须在实际时刻上严格更晚。
+        let strictly_after = |later: &str, earlier: &str| {
+            later > earlier
+                && DateTime::parse_from_rfc3339(later).unwrap()
+                    > DateTime::parse_from_rfc3339(earlier).unwrap()
+        };
+        let mut sources = read.prepare_cached(
+            "SELECT s.checkpoint FROM token_source_links l
+             JOIN token_sources s ON s.id = l.source_id WHERE l.link = ?1 AND s.id != ?2",
+        )?;
+        let mut rows = sources.query(params![format!("s:{}", state.session), id])?;
+        while let Some(row) = rows.next()? {
+            let bytes = row.get_ref(0)?.as_blob()?;
+            let Some(left) = remaining.checked_sub(bytes.len()) else {
+                return Ok(None);
+            };
+            remaining = left;
+            let other: Checkpoint = serde_json::from_slice(bytes)?;
+            if other.invalid_counts
+                || other
+                    .committed_cursors
+                    .get(&state.session)
+                    .is_some_and(|(at, _)| !strictly_after(first_time, at))
+            {
+                return Ok(None);
+            }
+        }
+        if prior
+            .committed_cursors
+            .get(&state.session)
+            .is_none_or(|(at, _)| !strictly_after(first_time, at))
+        {
+            return Ok(None);
+        }
+        let resolved = read
+            .query_row(
+                "SELECT event_id, payload FROM token_resolved
+             WHERE session_id = ?1 ORDER BY timestamp_ms DESC LIMIT 1",
+                [session],
+                |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?;
+        let Some((anchor_id, anchored)) = resolved else {
+            return Ok(None);
+        };
+        let Some(left) = remaining.checked_sub(anchored.len()) else {
+            return Ok(None);
+        };
+        remaining = left;
+        let anchor: Observation = serde_json::from_slice(&anchored)?;
+        let anchor = anchor.into_event(anchor_id.as_slice().try_into()?, state.session.clone())?;
+        if anchor.date < cutoff
+            || anchor.terminal_response.is_some()
+            || !linear_observation(&state.session, &anchor, None)
+            || prior.previous.map(|c| c.0) != Some(anchor.total)
+        {
+            return Ok(None);
+        }
+
+        // Prove the anchor belongs to this source. Only trailing unchanged counters may follow it.
+        let mut tail = read.prepare_cached(
+            "SELECT event_id, payload, session_id FROM token_observations
+             WHERE source_id = ?1 ORDER BY revision DESC, position DESC",
+        )?;
+        let mut rows = tail.query([id])?;
+        let mut matched = false;
+        while let Some(row) = rows.next()? {
+            let bytes = row.get_ref(1)?.as_blob()?;
+            let Some(left) = remaining.checked_sub(bytes.len()) else {
+                return Ok(None);
+            };
+            remaining = left;
+            let raw_id: [u8; 32] = row.get_ref(0)?.as_blob()?.try_into()?;
+            let raw: Observation = serde_json::from_slice(bytes)?;
+            let raw = raw.into_event(raw_id, state.session.clone())?;
+            if row.get::<_, i64>(2)? != session
+                || raw.terminal_response.is_some()
+                || raw.total != anchor.total
+                || !linear_observation(&state.session, &raw, None)
+            {
+                return Ok(None);
+            }
+            if raw_id == anchor.id && raw.rollout_position == anchor.rollout_position {
+                matched = true;
+                break;
+            }
+            if !strictly_after(&raw.timestamp, &anchor.timestamp) || raw.delta.total_tokens != 0 {
+                return Ok(None);
+            }
+        }
+        if !matched {
+            return Ok(None);
+        }
+        let mut previous = anchor.total;
+        let mut at = anchor.timestamp.as_str();
+        let mut position = last_ordinal;
+        let mut events = Vec::with_capacity(state.events.len());
+        let mut receipt = read.prepare_cached(
+            "SELECT 1 FROM token_observations INDEXED BY token_terminal_claim
+             WHERE session_id = ?1 AND json_type(CAST(payload AS TEXT), '$.terminal_response') = 'text'
+             AND json_extract(CAST(payload AS TEXT), '$.turn') = ?2
+             AND CAST(payload AS TEXT) -> '$.total.i' = ?3
+             AND CAST(payload AS TEXT) -> '$.total.o' = ?4 LIMIT 1",
+        )?;
+        let mut collision = read.prepare_cached("SELECT 1 FROM token_collisions WHERE id = ?1")?;
+        for event in &state.events {
+            let Some((ordinal, start, _)) = event.rollout_position else {
+                return Ok(None);
+            };
+            let unchanged_count = event.total.input_tokens == previous.input_tokens
+                && event.total.output_tokens == previous.output_tokens;
+            if ordinal <= position
+                || start < offset
+                || event.date < cutoff
+                || !event.has_file_baseline
+                || !strictly_after(&event.timestamp, at)
+                || !linear_observation(&state.session, event, None)
+                || (unchanged_count && event.total != previous)
+                || !event.total.is_monotonic_after(previous)
+                || collision.exists([event.original_id.as_slice()])?
+                || receipt.exists(params![
+                    session,
+                    event.turn,
+                    event.total.input_tokens.to_string(),
+                    event.total.output_tokens.to_string()
+                ])?
+            {
+                return Ok(None);
+            }
+            let Some(left) =
+                remaining.checked_sub(serde_json::to_vec(&Observation::capture(event))?.len())
+            else {
+                return Ok(None);
+            };
+            remaining = left;
+            let mut resolved = event.clone();
+            resolved.delta = event.session_delta(Some(previous));
+            resolved.provider =
+                usage_provider(&event.model, &event.provider, provider_names).to_owned();
+            if resolved.delta.total_tokens != 0 {
+                events.push(resolved);
+            }
+            previous = event.total;
+            at = &event.timestamp;
+            position = ordinal;
+        }
+        Ok((state.previous == Some(previous)).then_some(events))
+    }
+
     pub(in super::super) fn prepare<'a>(
         &mut self,
         update: SourceUpdate<'a>,
@@ -672,7 +1020,8 @@ impl Store {
             provider_names,
             ..Index::default()
         };
-        let seeds = links(source, state);
+        // 只有坏累计才会影响没有实际观测的继承会话，见 resolve_counts。
+        let seeds = links(source, state, state.invalid_counts);
         let mut sessions: BTreeSet<_> = seeds
             .iter()
             .filter_map(|link| link.strip_prefix("s:").map(str::to_owned))
@@ -680,6 +1029,28 @@ impl Store {
         let path_key = encode_path(source);
         let seed_json = serde_json::to_string(&seeds)?;
         if !replace && let Some(previous_revision) = previous_revision {
+            if let Some(events) = Self::append_continuation(
+                &read,
+                &update,
+                cutoff,
+                &index.provider_names,
+                input_limit,
+            )? {
+                read.commit()?;
+                return Ok(Prepared {
+                    update,
+                    base_revision,
+                    cutoff,
+                    sessions,
+                    collisions: HashMap::new(),
+                    append: true,
+                    linear: None,
+                    superseded: Vec::new(),
+                    receipt_origins: HashMap::new(),
+                    classification_origins: HashMap::new(),
+                    events,
+                });
+            }
             let tail = read
                 .query_row(
                     "SELECT o.event_id, o.payload, owner.session, l.revision FROM token_sources s
@@ -740,7 +1111,7 @@ impl Store {
                         bytes += serde_json::to_vec(&Observation::capture(raw))?.len();
                         ensure!(
                             bytes <= input_limit,
-                            "Token batch exceeds reconciliation input budget"
+                            ComponentInputLimit
                         );
                         if raw.terminal_response.is_some() {
                             incoming.push(raw);
@@ -784,89 +1155,187 @@ impl Store {
                             linear: Some(linear),
                             superseded,
                             receipt_origins,
+                            classification_origins: HashMap::new(),
                             events,
                         });
                     }
                 }
             }
         }
-        let mut files = 0;
+        let mut has_prior_source = false;
+        let mut same_scope = false;
         {
             // 来源和关联分别去重，避免同一会话的每份副本都重新展开整组来源。
             let mut affected = read.prepare(
                 "WITH RECURSIVE
+                     count_links(source_id, link) AS NOT MATERIALIZED (
+                        SELECT l.source_id, l.link FROM token_source_links l
+                        JOIN token_sources s ON s.id = l.source_id
+                        WHERE (l.link != ?3 OR s.source != ?1)
+                          AND (substr(l.link, 1, 2) = 'r:'
+                           OR substr(l.link, 3) = json_extract(CAST(s.checkpoint AS TEXT), '$.session')
+                           OR json_extract(CAST(s.checkpoint AS TEXT), '$.invalid_counts') = 1
+                           OR EXISTS (SELECT 1 FROM token_observations o
+                               WHERE o.source_id = l.source_id AND o.session_id = (
+                                   SELECT id FROM token_sessions WHERE session = substr(l.link, 3))))
+                     ),
                      component(id, link) AS (
                         SELECT id, NULL FROM token_sources WHERE source = ?1
-                        UNION SELECT NULL, value FROM json_each(?2)
+                        UNION SELECT NULL, value FROM json_each(?2) WHERE value != ?3
                         UNION SELECT NULL, own.link FROM component
-                           JOIN token_source_links own ON own.source_id = component.id
+                           JOIN count_links own ON own.source_id = component.id
                         UNION SELECT neighbor.source_id, NULL FROM component
-                           JOIN token_source_links neighbor ON neighbor.link = component.link
+                           JOIN count_links neighbor ON neighbor.link = component.link
                      )
                  SELECT component.link, s.id, s.source, s.revision, s.offset, s.checkpoint
                  FROM component LEFT JOIN token_sources s ON s.id = component.id",
             )?;
-            let mut observation = read.prepare(
-                "SELECT o.event_id, s.session, o.payload FROM token_observations o
+            // 只传一次相同的计数标记。SQLite 的 JSON 函数会忽略原始 NUL 之后的内容。
+            const FLAGS: &str = "'$.count_uncertain','$.count_incomplete','$.count_pending','$.inherited','$.context_conflicts'";
+            const CLEAR: &[u8] = br#"{"count_uncertain":false,"count_incomplete":false,"count_pending":false,"inherited":false,"context_conflicts":{"model":false,"provider":false,"role":false,"turn":false},"#;
+            let mut observation = read.prepare(&format!(
+                "SELECT o.event_id, s.session,
+                    CASE WHEN typeof(o.payload)!='blob' THEN NULL
+                         WHEN instr(o.payload,x'00')=0 AND json_valid(CAST(o.payload AS TEXT))
+                          AND json_extract(CAST(o.payload AS TEXT),{FLAGS})
+                           ='[false,false,false,false,{{\"model\":false,\"provider\":false,\"role\":false,\"turn\":false}}]'
+                    THEN CASE WHEN json_type(CAST(o.payload AS TEXT),'$.last')='object'
+                               AND json_extract(CAST(o.payload AS TEXT),'$.last')
+                                 = json_extract(CAST(o.payload AS TEXT),'$.delta')
+                         THEN '=' || json_remove(json_replace(CAST(o.payload AS TEXT),'$.last',NULL),{FLAGS})
+                         ELSE json_remove(CAST(o.payload AS TEXT),{FLAGS}) END
+                    ELSE o.payload END
+                 FROM token_observations o
                  JOIN token_sessions s ON s.id = o.session_id
                  WHERE o.source_id = ?1 ORDER BY o.revision, o.position",
-            )?;
+            ))?;
+            let mut restored = Vec::new();
             let mut stored_collision =
                 read.prepare("SELECT 1 FROM token_collisions WHERE id = ?1")?;
-            let mut rows = affected.query(params![path_key, seed_json])?;
             let mut remaining = input_limit;
-            let mut charge = |bytes: usize| -> Result<()> {
-                remaining = remaining.checked_sub(bytes).ok_or_else(|| {
-                    anyhow::anyhow!("Token component exceeds reconciliation input budget")
-                })?;
+            let charge = |remaining: &mut usize, bytes: usize| -> Result<()> {
+                *remaining = remaining
+                    .checked_sub(bytes)
+                    .ok_or_else(|| anyhow::Error::new(ComponentInputLimit))?;
                 Ok(())
             };
-            while let Some(row) = rows.next()? {
-                if let Some(link) = row.get::<_, Option<String>>(0)? {
-                    charge(link.len())?;
-                    if let Some(session) = link.strip_prefix("s:") {
-                        sessions.insert(session.to_owned());
-                    }
-                    continue;
-                }
-                files += 1;
-                ensure!(files <= MAX_FILES, "Token component exceeds source budget");
-                let id: i64 = row.get(1)?;
-                let path = decode_path(row.get(2)?)?;
-                if path == source {
-                    source_revision = Some(row.get(3)?);
-                    ensure!(
-                        source_revision == previous_revision,
-                        "Token source changed before reconciliation"
-                    );
-                    if replace {
+            let (offset, checkpoint) = Checkpoint::capture(state);
+            charge(&mut remaining, serde_json::to_vec(&checkpoint)?.len())?;
+            for event in &state.events {
+                charge(
+                    &mut remaining,
+                    serde_json::to_vec(&Observation::capture(event))?.len(),
+                )?;
+            }
+            let mut parent = if cutoff_key == precise_from {
+                prefix::ParentPrefix::read(&read, update, cutoff, remaining)?
+            } else {
+                None
+            };
+            let probing = parent.is_some();
+            let mut seen_links = HashSet::new();
+            let mut seen_sources = HashSet::new();
+            loop {
+                let skip = parent.as_ref().map_or("", |p| p.link.as_str());
+                let mut rows = affected.query(params![path_key, seed_json, skip])?;
+                while let Some(row) = rows.next()? {
+                    if let Some(link) = row.get::<_, Option<String>>(0)? {
+                        if probing && !seen_links.insert(link.clone()) {
+                            continue;
+                        }
+                        charge(&mut remaining, link.len())?;
+                        if let Some(session) = link.strip_prefix("s:") {
+                            sessions.insert(session.to_owned());
+                        }
                         continue;
                     }
-                }
-                let record = row.get_ref(5)?.as_blob()?;
-                charge(record.len())?;
-                let mut old = serde_json::from_slice::<Checkpoint>(record)?.restore(row.get(4)?);
-                let mut records = observation.query([id])?;
-                while let Some(record) = records.next()? {
-                    let bytes = record.get_ref(2)?.as_blob()?;
-                    charge(bytes.len())?;
-                    let event_id = record.get_ref(0)?.as_blob()?.try_into()?;
-                    let event: Observation = serde_json::from_slice(bytes)?;
-                    if stored_collision.exists([event.original_id.as_slice()])? {
-                        index.collision_families.insert(event.original_id);
+                    let id: i64 = row.get(1)?;
+                    if probing && !seen_sources.insert(id) {
+                        continue;
                     }
-                    old.events.push(event.into_event(event_id, record.get(1)?)?);
+                    has_prior_source = true;
+                    let path = decode_path(row.get(2)?)?;
+                    if path == source {
+                        source_revision = Some(row.get(3)?);
+                        ensure!(
+                            source_revision == previous_revision,
+                            "Token source changed before reconciliation"
+                        );
+                        if replace {
+                            continue;
+                        }
+                    }
+                    let record = row.get_ref(5)?.as_blob()?;
+                    charge(&mut remaining, record.len())?;
+                    let mut old =
+                        serde_json::from_slice::<Checkpoint>(record)?.restore(row.get(4)?);
+                    let mut records = observation.query([id])?;
+                    while let Some(record) = records.next()? {
+                        let field = record.get_ref(2)?;
+                        let (bytes, same_last) = match field {
+                            rusqlite::types::ValueRef::Text(packed) => {
+                                charge(&mut remaining, packed.len())?;
+                                // '=' 表示查询用 null 替换了与 delta 完全相同的 last 对象。
+                                let same = packed.strip_prefix(b"=");
+                                restored.clear();
+                                restored.extend_from_slice(CLEAR);
+                                restored.extend_from_slice(&same.unwrap_or(packed)[1..]);
+                                (&restored[..], same.is_some())
+                            }
+                            value => {
+                                let bytes = value.as_blob()?;
+                                charge(&mut remaining, bytes.len())?;
+                                (bytes, false)
+                            }
+                        };
+                        let event_id = record.get_ref(0)?.as_blob()?.try_into()?;
+                        let mut event: Observation = serde_json::from_slice(bytes)?;
+                        if same_last {
+                            event.last = Some(event.delta);
+                        }
+                        if stored_collision.exists([event.original_id.as_slice()])? {
+                            index.collision_families.insert(event.original_id);
+                        }
+                        old.events.push(event.into_event(event_id, record.get(1)?)?);
+                    }
+                    index.files.insert(path, old);
                 }
-                index.files.insert(path, old);
+                let Some(prefix) = parent.take() else {
+                    break;
+                };
+                if prefix.bytes <= remaining
+                    && !seen_links.contains(&prefix.link)
+                    && prefix.independent(&index.files, update, cutoff)
+                {
+                    index.files.insert(prefix.path, prefix.state);
+                    break;
+                }
+                // Rejoin the original graph, reusing every source already decoded.
             }
             ensure!(
                 source_revision == previous_revision,
                 "Token source changed before reconciliation"
             );
-            let (offset, checkpoint) = Checkpoint::capture(state);
-            charge(serde_json::to_vec(&checkpoint)?.len())?;
             let mut incoming = checkpoint.restore(offset);
             if let Some(old) = index.files.remove(source) {
+                let base = |file: &FileState| {
+                    file.history_base.as_ref().map(|base| {
+                        (base.rollout, base.end_ordinal, base.end_offset)
+                    })
+                };
+                same_scope = !replace
+                    && cutoff_key == precise_from
+                    && old.session == state.session
+                    && !old.identity_conflict
+                    && !state.identity_conflict
+                    && !old.invalid_counts
+                    && !state.invalid_counts
+                    && old.issues == 0
+                    && state.issues == 0
+                    && old.continuation == state.continuation
+                    && base(&old) == base(state)
+                    && old.scope_parent_candidates == state.scope_parent_candidates
+                    && links(source, state, true).is_subset(&links(source, &old, true));
                 if let Some((position, total)) = old.expired_count
                     && incoming
                         .expired_count
@@ -877,7 +1346,6 @@ impl Store {
                 incoming.events = old.events;
             }
             for event in &state.events {
-                charge(serde_json::to_vec(&Observation::capture(event))?.len())?;
                 if stored_collision.exists([event.original_id.as_slice()])? {
                     index.collision_families.insert(event.original_id);
                 }
@@ -885,14 +1353,13 @@ impl Store {
             }
             index.files.insert(source.to_path_buf(), incoming);
         }
-        read.commit()?;
 
         for state in index.files.values_mut() {
             state.expire_observations(cutoff);
         }
 
         let collisions = index.observed_collisions();
-        let linear_candidate = files == 0
+        let linear_candidate = !has_prior_source
             && collisions.is_empty()
             && index.collision_families.is_empty()
             && linear_batch(state, cutoff, None);
@@ -913,6 +1380,18 @@ impl Store {
                 || event.count_incomplete
                 || event.context_conflicts.any()
         });
+        let classification_origins = if same_scope {
+            request_proofs::retain(
+                &read,
+                &cutoff_key,
+                &mut snapshot.events,
+                &index.collision_families,
+                &receipt_origins,
+            )?
+        } else {
+            HashMap::new()
+        };
+        read.commit()?;
         Ok(Prepared {
             update,
             base_revision,
@@ -923,6 +1402,7 @@ impl Store {
             linear: linear.then_some(NativeTail::Advance),
             superseded: Vec::new(),
             receipt_origins,
+            classification_origins,
             events: snapshot.events,
         })
     }
@@ -937,7 +1417,6 @@ impl Store {
         previous_revision: i64,
         cutoff: NaiveDate,
         provider_names: BTreeMap<String, String>,
-        input_limit: usize,
     ) -> Result<i64> {
         let empty = FileState::default();
         let prepared = self.prepare(
@@ -949,7 +1428,7 @@ impl Store {
             },
             cutoff,
             provider_names,
-            input_limit,
+            usize::MAX,
         )?;
         self.publish_source(prepared, true)
     }
@@ -1092,6 +1571,8 @@ impl Store {
             for event in &prepared.events {
                 let mut stored = Observation::capture(event);
                 stored.receipt_count_origin = prepared.receipt_origins.get(&event.id).copied();
+                stored.classification_origin =
+                    prepared.classification_origins.get(&event.id).cloned();
                 insert.execute(params![
                     event.id.as_slice(),
                     event.session,
@@ -1121,9 +1602,11 @@ impl Store {
     }
 
     pub(in super::super) fn recent_sessions(&self, since: i64) -> Result<Vec<(String, i64)>> {
+        // 先按时间取近期记录，避免 SQLite 为 GROUP BY 顺着会话索引遍历全部历史。
         let mut statement = self.db.prepare_cached(
             "SELECT s.session, max(r.timestamp_ms) AS latest
-             FROM token_resolved r JOIN token_sessions s ON s.id = r.session_id
+             FROM token_resolved r INDEXED BY token_resolved_time
+             JOIN token_sessions s ON s.id = r.session_id
              WHERE r.timestamp_ms >= ?1 AND r.day >= (SELECT precise_from FROM token_revision)
              GROUP BY r.session_id ORDER BY latest DESC, s.session",
         )?;
@@ -1148,6 +1631,74 @@ impl Store {
             .optional()?)
     }
 
+    pub(in super::super) fn classification_page(
+        &self,
+        session: &str,
+        earliest: i64,
+        latest: i64,
+        share: usize,
+        available: usize,
+    ) -> Result<Option<(Range<i64>, usize)>> {
+        let left = classification_lookback_ms();
+        let end = latest.saturating_add(1);
+        let mut statement = self.db.prepare_cached(
+            "SELECT timestamp_ms, sum(length(payload)) FROM token_resolved
+             WHERE session_id = (SELECT id FROM token_sessions WHERE session = ?1)
+             AND day >= (SELECT precise_from FROM token_revision)
+             AND timestamp_ms >= ?2 AND timestamp_ms < ?3
+             GROUP BY timestamp_ms ORDER BY timestamp_ms DESC",
+        )?;
+        let mut rows = statement.query(params![
+            session,
+            earliest.saturating_sub(left),
+            end.saturating_add(CLASSIFICATION_RIGHT_MS)
+        ])?;
+        let mut bytes = 0;
+        let mut start = earliest;
+        while let Some(row) = rows.next()? {
+            let at: i64 = row.get(0)?;
+            let next = bytes + row.get::<_, usize>(1)?;
+            // 首个目标的竞争记录必须完整。其余目标按本会话本轮的字节份额分段。
+            if next > share && at < latest.saturating_sub(left) {
+                start = earliest.max(at.saturating_add(left).saturating_add(1));
+                break;
+            }
+            if next > available {
+                return Ok(None);
+            }
+            bytes = next;
+        }
+        Ok(Some((start..end, bytes)))
+    }
+
+    pub(in super::super) fn historical_classification_before(
+        &self,
+        session_id: i64,
+        before: i64,
+        recent_since: i64,
+    ) -> Result<Option<(i64, String, i64)>> {
+        Ok(self
+            .db
+            .prepare_cached(
+                "SELECT s.id, s.session, (
+                SELECT r.timestamp_ms FROM token_resolved r
+                WHERE r.session_id = s.id
+                  AND r.timestamp_ms < CASE WHEN s.id = ?1 THEN min(?2, ?3) ELSE ?3 END
+                  AND r.day >= (SELECT precise_from FROM token_revision)
+                ORDER BY r.timestamp_ms DESC LIMIT 1
+             ) AS latest
+             FROM token_sessions s
+             WHERE s.id >= ?1 AND latest IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM token_resolved current
+                   WHERE current.session_id = s.id AND current.timestamp_ms >= ?3)
+             ORDER BY s.id LIMIT 1",
+            )?
+            .query_row(params![session_id, before, recent_since], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()?)
+    }
+
     /// Re-evaluate a canonical session from its committed native identities, never from
     /// the supplier identities written in the last classification pass.
     #[cfg(test)]
@@ -1163,6 +1714,7 @@ impl Store {
             None,
             input_limit,
             scoped_count_gaps,
+            0,
             |events, aliases, _| classify(events, aliases),
         )
     }
@@ -1173,6 +1725,7 @@ impl Store {
         window: Option<Range<i64>>,
         input_limit: usize,
         scoped_count_gaps: &BTreeSet<PathBuf>,
+        sealed_pending: usize,
         classify: impl FnOnce(
             &mut [UsageEvent],
             &BTreeMap<String, String>,
@@ -1181,16 +1734,21 @@ impl Store {
     ) -> Result<Option<i64>> {
         let read = self.db.transaction()?;
         let base = revision(&read)?;
-        let eligible = read.query_row(
-            "SELECT EXISTS(SELECT 1 FROM token_coverage WHERE revision = ?1
-                           AND pending_sources = 0 AND issues = ?2 AND NOT maintenance_blocked)",
-            params![base, scoped_count_gaps.len()],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if !eligible {
+        let admission = read.query_row(
+            "SELECT CASE WHEN a.singleton IS NULL THEN
+                    c.pending_sources=?3 AND c.issues=?2
+                ELSE a.revision=c.revision AND NOT EXISTS(SELECT 1 FROM json_each(a.blocked_sessions)
+                    WHERE value=(SELECT id FROM token_sessions WHERE session=?4)) END,
+                a.singleton IS NOT NULL
+             FROM token_coverage c LEFT JOIN token_attribution_coverage a USING(singleton)
+             WHERE c.revision=?1 AND NOT c.maintenance_blocked",
+            params![base, scoped_count_gaps.len(), sealed_pending, session],
+            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+        ).optional()?;
+        let Some((true, published_scope)) = admission else {
             return Ok(None);
-        }
-        if !scoped_count_gaps.is_empty() {
+        };
+        if !published_scope && !scoped_count_gaps.is_empty() {
             let mut related = read.prepare_cached(
                 "WITH RECURSIVE component(id, link) AS (
                     SELECT NULL, ?1
@@ -1227,8 +1785,7 @@ impl Store {
                 .earliest()
                 .context("invalid classification retention date")?
                 .timestamp_millis();
-            let left = native_endpoints::WINDOW_MS.max(2 * DELAYED_REQUEST_MATCH_WINDOW_MS);
-            let right = 2 * DELAYED_REQUEST_MATCH_WINDOW_MS;
+            let left = classification_lookback_ms();
             // A clipped competition window cannot certify a supplier or withdraw one.
             let start = window.start.max(first.saturating_add(left));
             if start >= window.end {
@@ -1247,7 +1804,7 @@ impl Store {
             let native_blocked = gateway_blocked || gaps.exists(params![session, cutoff, 0])?;
             (
                 start..window.end,
-                start.saturating_sub(left)..window.end.saturating_add(right),
+                start.saturating_sub(left)..window.end.saturating_add(CLASSIFICATION_RIGHT_MS),
                 gateway_blocked,
                 native_blocked,
             )
@@ -1288,16 +1845,50 @@ impl Store {
                 candidates.push(candidate);
             }
         }
-        read.commit()?;
         if target_rows.is_empty() {
             return Ok(None);
         }
+        let matches_terminal = |event: &UsageEvent, id: &str| -> Result<bool> {
+            if let Some(terminal) = &event.terminal_response {
+                return Ok(terminal.as_ref() == id);
+            }
+            let mut claims = read.prepare_cached(
+                "SELECT event_id, payload FROM token_observations INDEXED BY token_terminal_claim
+                 WHERE session_id = (SELECT id FROM token_sessions WHERE session = ?1)
+                   AND json_type(CAST(payload AS TEXT), '$.terminal_response') = 'text'
+                   AND json_extract(CAST(payload AS TEXT), '$.turn') = ?2
+                   AND CAST(payload AS TEXT) -> '$.total.i' = ?3 AND CAST(payload AS TEXT) -> '$.total.o' = ?4
+                 LIMIT 2",
+            )?;
+            let mut rows = claims.query(params![
+                event.session,
+                event.turn,
+                event.total.input_tokens.to_string(),
+                event.total.output_tokens.to_string()
+            ])?;
+            let Some(row) = rows.next()? else {
+                return Ok(false);
+            };
+            let receipt = serde_json::from_slice::<Observation>(row.get_ref(1)?.as_blob()?)?
+                .into_event(
+                    row.get_ref(0)?.as_blob()?.try_into()?,
+                    event.session.clone(),
+                )?;
+            Ok(rows.next()?.is_none()
+                && receipt.terminal_response.as_deref() == Some(id)
+                && terminal_receipts::wholly_accounted_in_batch(
+                    std::slice::from_ref(&receipt),
+                    std::slice::from_ref(event),
+                ))
+        };
         let attribution = AttributionScope {
             targets: target_rows.clone(),
             gateway_blocked,
             native_blocked,
+            matches_terminal: Some(&matches_terminal),
         };
         classify(&mut candidates, &scope.aliases, &attribution)?;
+        read.commit()?;
         let mut changed = Vec::new();
         let mut changed_days = BTreeSet::new();
         for ((event, origin, receipt_origin), candidate) in previous[target_rows.clone()]
@@ -1350,6 +1941,10 @@ impl Store {
         )?;
         tx.execute(
             "UPDATE token_coverage SET revision = ?1 WHERE revision = ?2",
+            params![next, base],
+        )?;
+        tx.execute(
+            "UPDATE token_attribution_coverage SET revision = ?1 WHERE revision = ?2",
             params![next, base],
         )?;
         tx.commit()?;
@@ -1604,9 +2199,8 @@ impl Store {
     pub(in super::super) fn historical_candidates(
         read: &Connection,
         timestamps: &BTreeSet<i64>,
-    ) -> Result<Vec<UsageEvent>> {
-        let mut events = Vec::new();
-        let mut remaining: usize = 32 * 1024 * 1024;
+        mut visit: impl FnMut(UsageEvent),
+    ) -> Result<()> {
         let mut statement = read.prepare_cached(
             "SELECT r.event_id, s.session, r.payload FROM token_resolved r
              JOIN token_sessions s ON s.id = r.session_id
@@ -1615,15 +2209,11 @@ impl Store {
         for timestamp in timestamps {
             let mut rows = statement.query([timestamp])?;
             while let Some(row) = rows.next()? {
-                let raw = row.get_ref(2)?.as_blob()?;
-                remaining = remaining
-                    .checked_sub(raw.len())
-                    .context("historical classification exceeds candidate budget")?;
-                let event: Observation = serde_json::from_slice(raw)?;
-                events.push(event.into_event(row.get_ref(0)?.as_blob()?.try_into()?, row.get(1)?)?);
+                let event: Observation = serde_json::from_slice(row.get_ref(2)?.as_blob()?)?;
+                visit(event.into_event(row.get_ref(0)?.as_blob()?.try_into()?, row.get(1)?)?);
             }
         }
-        Ok(events)
+        Ok(())
     }
 
     pub(in super::super) fn historical_days(
@@ -1831,6 +2421,7 @@ impl Store {
             .map(|(response, _)| response)
     }
 
+    #[cfg(test)]
     pub(in super::super) fn read_response_with_archive(
         db: &mut Connection,
         query: &Query,
@@ -1841,6 +2432,22 @@ impl Store {
         historical: Option<&Historical>,
     ) -> Result<(Value, Option<ArchiveKey>)> {
         let read = db.transaction()?;
+        let answer = Self::read_snapshot(
+            &read, query, request, requested, provider_names, archived, historical,
+        )?;
+        read.commit()?;
+        Ok(answer)
+    }
+
+    pub(in super::super) fn read_snapshot(
+        read: &Connection,
+        query: &Query,
+        request: &Value,
+        requested: Option<&str>,
+        provider_names: &BTreeMap<String, String>,
+        archived: Option<&ArchiveAnswer>,
+        historical: Option<&Historical>,
+    ) -> Result<(Value, Option<ArchiveKey>)> {
         let bounds = request["startAt"].as_i64().zip(request["endAt"].as_i64());
         let activity_page = request["activityPage"].as_u64().unwrap_or(1).clamp(1, 24) as usize;
         let include_trend = request["includeTrend"] == true;
@@ -2074,7 +2681,6 @@ impl Store {
                 result["activityComplete"] = json!(false);
             }
         }
-        read.commit()?;
         Ok((result, schedule))
     }
 
@@ -2146,6 +2752,7 @@ impl Store {
             session: String,
             identity_conflict: bool,
             scope_parent_candidates: BTreeMap<String, HashSet<Option<String>>>,
+            model_observations: HashMap<String, SessionModelObservation>,
             model: String,
             provider: String,
             role: String,
@@ -2156,6 +2763,7 @@ impl Store {
             read.prepare("SELECT source,checkpoint FROM token_sources ORDER BY source")?;
         let mut rows = sources.query([])?;
         let mut candidates = Vec::new();
+        let mut observations = Vec::new();
         while let Some(row) = rows.next()? {
             let mut saved: ScopeCheckpoint = serde_json::from_slice(row.get_ref(1)?.as_blob()?)?;
             if saved.identity_conflict || saved.session.is_empty() {
@@ -2176,6 +2784,7 @@ impl Store {
             if let Some(parents) = saved.scope_parent_candidates.remove(&saved.session) {
                 candidates.push((saved.session.clone(), parents));
             }
+            observations.extend(saved.model_observations);
             let info = scope
                 .session_info
                 .entry(saved.session.clone())
@@ -2192,6 +2801,11 @@ impl Store {
         for session in &scope.sessions {
             scope.aliases.insert(session.clone(), session.clone());
         }
+        scope.apply_session_models(
+            &RequestSessionAliases::new(&scope.aliases),
+            observations.iter().map(|(session, model)| (session, model)),
+            provider_names,
+        );
         scope.collect_scope_candidates(
             candidates
                 .iter()
@@ -2640,7 +3254,7 @@ impl Store {
             unclassified += groups
                 .iter()
                 .filter(|((model, provider, _, flags), _)| {
-                    *flags & 3 != 0
+                    *flags & (3 | PROVIDER_INFERRED) != 0
                         || unknown_model(model)
                         || unknown_provider(provider)
                         || codex_plus_core::aggregate_catalog::is_aggregate_model(model)

@@ -64,6 +64,1198 @@ fn new_source<'a>(source: &'a Path, state: &'a FileState) -> SourceUpdate<'a> {
 }
 
 #[test]
+fn historical_candidates_stream_all_rows_at_one_timestamp() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let source = dir.path().canonicalize()?.join(format!("rollout-{PARENT}.jsonl"));
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let rows: Vec<_> = std::iter::once(header(PARENT, 0))
+        .chain((1..=33).map(|n| count(n, 1, n as u64, true)))
+        .collect();
+    let state = parse(&source, &rows, cutoff);
+    let expected: BTreeSet<_> = state.events.iter().map(|event| event.id).collect();
+    assert_eq!(expected.len(), 33);
+    let mut store = Store::open(Connection::open_in_memory()?)?;
+    let prepared = store.prepare(new_source(&source, &state), cutoff, BTreeMap::new(), 1 << 20)?;
+    store.publish(prepared)?;
+    let tx = store.db.transaction()?;
+    // 每条记录单独可读，同一毫秒的合法 JSON 合计超过原先的 32 MiB。
+    tx.execute(
+        "UPDATE token_resolved SET payload = CAST(payload || ?1 AS BLOB)",
+        [" ".repeat(1 << 20)],
+    )?;
+    let at = DateTime::parse_from_rfc3339(&state.events[0].timestamp)?.timestamp_millis();
+    let mut visited = BTreeSet::new();
+    Store::historical_candidates(&tx, &BTreeSet::from([at]), |event| {
+        assert!(visited.insert(event.id));
+    })?;
+    assert_eq!(visited, expected);
+    Ok(())
+}
+
+#[test]
+fn reconciles_linked_rollouts_beyond_4096_sources_within_the_input_budget() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let prior_path = root.join("rollout-prior.jsonl");
+    let new_path = root.join("rollout-new.jsonl");
+    let prior = parse(
+        &prior_path,
+        &[header(PARENT, 0), count(1, 1, 1, true)],
+        cutoff,
+    );
+    let incoming = parse(
+        &new_path,
+        &[header(PARENT, 0), count(1, 2, 2, true)],
+        cutoff,
+    );
+    let mut store = Store::open(Connection::open_in_memory()?)?;
+    let tx = store.db.transaction()?;
+    let header_only = FileState {
+        session: PARENT.to_owned(),
+        ..FileState::default()
+    };
+    for index in 0..4096 {
+        let path = root.join(format!("rollout-{index}.jsonl"));
+        Store::stage(&tx, &path, None, &header_only, false)?;
+    }
+    let before = Store::stage(&tx, &prior_path, None, &prior, false)?;
+    tx.commit()?;
+
+    let error = store
+        .prepare(
+            new_source(&new_path, &incoming),
+            cutoff,
+            BTreeMap::new(),
+            64 * 1024,
+        )
+        .err()
+        .expect("the component must exhaust the low input budget");
+    assert!(error.is::<super::store::projection::ComponentInputLimit>());
+    assert!(store.checkpoint(&new_path)?.is_none());
+    let (revision, events) = read(&mut store.db, i64::MIN, i64::MAX);
+    assert_eq!(revision, before);
+    assert!(events.is_empty());
+
+    let prepared = store.prepare(
+        new_source(&new_path, &incoming),
+        cutoff,
+        BTreeMap::new(),
+        32 << 20,
+    )?;
+    assert_eq!(store.publish(prepared)?, before + 1);
+    let (_, events) = read(&mut store.db, i64::MIN, i64::MAX);
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| (event.id, event.total))
+            .collect::<Vec<_>>(),
+        [&prior.events[0], &incoming.events[0]].map(|event| (event.id, event.total))
+    );
+    Ok(())
+}
+
+#[test]
+fn full_component_reads_clear_flags_once_and_keeps_the_stored_observations() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let first = root.join(format!("rollout-{PARENT}.jsonl"));
+    let peer = root.join(format!("rollout-{OTHER}.jsonl"));
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let rows: Vec<_> = std::iter::once(header(PARENT, 0))
+        .chain((1..=40).map(|n| count(n, n, n as u64, true)))
+        .collect();
+    let state = parse(&first, &rows, cutoff);
+    let names = BTreeMap::new();
+    let mut store = Store::open(Connection::open_in_memory()?)?;
+    let prepared = store.prepare(new_source(&first, &state), cutoff, names.clone(), 1 << 20)?;
+    store.publish(prepared)?;
+    let state = parse(&peer, &[header(PARENT, 0), count(1, 41, 41, true)], cutoff);
+    let raw_bytes: usize = store.db.query_row(
+        "SELECT sum(length(payload)) FROM token_observations",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(
+        store
+            .prepare(new_source(&peer, &state), cutoff, names.clone(), 1024)
+            .is_err()
+    );
+    let prepared = store.prepare(new_source(&peer, &state), cutoff, names.clone(), raw_bytes)?;
+    drop(prepared);
+    let explicit: usize = store.db.query_row(
+        "SELECT count(*) FROM token_observations WHERE json_type(CAST(payload AS TEXT),'$.count_pending')='false'",
+        [], |row| row.get(0)
+    )?;
+    assert_eq!(explicit, 40);
+    store.db.execute(
+        "UPDATE token_observations
+         SET payload=CAST(json_set(CAST(payload AS TEXT),'$.unrecognized',1) AS BLOB)",
+        [],
+    )?;
+    let error = store
+        .prepare(new_source(&peer, &state), cutoff, names.clone(), 1 << 20)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("unknown field"));
+    store.db.execute(
+        "UPDATE token_observations
+         SET payload=CAST(json_remove(CAST(payload AS TEXT),'$.unrecognized') || x'006a756e6b' AS BLOB)",
+        [],
+    )?;
+    let error = store
+        .prepare(new_source(&peer, &state), cutoff, names, 1 << 20)
+        .err()
+        .expect("NUL and trailing bytes must reach the strict observation decoder");
+    assert!(error.to_string().contains("trailing characters"));
+    Ok(())
+}
+
+#[test]
+fn full_component_folds_only_identical_last_counts_under_input_limit() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let first = root.join(format!("rollout-{PARENT}.jsonl"));
+    let peer = root.join(format!("rollout-{OTHER}.jsonl"));
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let rows: Vec<_> = std::iter::once(header(PARENT, 0))
+        .chain((1..=120).map(|n| {
+            let mut row = count(n, n % 60, n as u64, true);
+            row["timestamp"] = json!(format!("2026-01-02T12:{:02}:{:02}Z", n / 60, n % 60));
+            row
+        }))
+        .collect();
+    let mut prior = parse(&first, &rows, cutoff);
+    prior.events[1].last = None;
+    prior.events[2].last.as_mut().unwrap().cached_known = false;
+    prior.events[3].last.as_mut().unwrap().reasoning_output_tokens = Some(0);
+    let mut store = Store::open(Connection::open_in_memory()?)?;
+    let initial = store.prepare(new_source(&first, &prior), cutoff, BTreeMap::new(), 1 << 20)?;
+    store.publish(initial)?;
+    let limit = store.db.query_row(
+        "SELECT sum(length(json_remove(CAST(payload AS TEXT), '$.count_uncertain',
+         '$.count_incomplete', '$.count_pending', '$.inherited', '$.context_conflicts')))
+         FROM token_observations", [], |row| row.get::<_, usize>(0),
+    )?;
+    let mut next = count(1, 1, 121, true);
+    next["timestamp"] = json!("2026-01-02T12:02:01Z");
+    let peer_state = parse(&peer, &[header(PARENT, 0), next], cutoff);
+    let prepared = store.prepare(new_source(&peer, &peer_state), cutoff, BTreeMap::new(), limit)?;
+    store.publish(prepared)?;
+    let (_, resolved) = read(&mut store.db, i64::MIN, i64::MAX);
+    assert_eq!(resolved.len(), 121);
+    for (expected, observed) in prior.events.iter().zip(&resolved) {
+        assert_eq!(observed.id, expected.id);
+        assert_eq!(observed.last, expected.last);
+    }
+    // 重复字段也必须经过完整的反序列化检查。
+    store.db.execute(
+        "UPDATE token_observations SET payload=CAST('{\"last\":' ||
+         json_extract(CAST(payload AS TEXT),'$.last') || ',' || substr(CAST(payload AS TEXT),2) AS BLOB)
+         WHERE position=8", [],
+    )?;
+    let other = root.join("another.jsonl");
+    let error = store.prepare(new_source(&other, &peer_state), cutoff, BTreeMap::new(), 1 << 20)
+        .err().expect("duplicate last must be rejected");
+    assert!(error.to_string().contains("duplicate field"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn registered_compressed_prefix_can_introduce_another_sessions_counts_in_its_suffix()
+-> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let archive = root.join(format!("rollout-{CHILD}.jsonl.zst"));
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let first = format!("{}\n{}\n", header(CHILD, 0), count(1, 1, 1, true));
+    let mut fork = header(CHILD, 2);
+    fork["payload"]["forked_from_id"] = json!(PARENT);
+    fork["payload"]["subagent_history_start_ordinal"] = json!(5);
+    let full = format!(
+        "{first}{fork}\n{}\n{}\n",
+        header(PARENT, 3),
+        count(4, 4, 1, true)
+    );
+    fs::write(&archive, zstd::stream::encode_all(full.as_bytes(), 1)?)?;
+    let mut store = Store::open(Connection::open_in_memory()?)?;
+    let mut reader = SourceReader::restore(&store, &archive)?;
+    let mut first_budget = Budget::new(std::iter::empty());
+    first_budget.read_left = first.len() as u64 + 1;
+    assert!(!reader.step(
+        &mut store,
+        cutoff,
+        &mut first_budget,
+        &BTreeMap::new(),
+        1 << 20
+    )?);
+    let (_, first_checkpoint) = store.checkpoint(&archive)?.unwrap();
+    assert!(first_checkpoint.resume_pending);
+    assert_eq!(first_checkpoint.session, CHILD);
+    assert_eq!(first_checkpoint.offset, first.len() as u64);
+    assert_eq!(
+        first_checkpoint.stamp,
+        Some(FileState::source_stamp(&archive)?)
+    );
+    assert!(!first_checkpoint.identity_conflict && !first_checkpoint.invalid_counts);
+    let link_count = |store: &Store| -> rusqlite::Result<i64> {
+        store.db.query_row(
+            "SELECT count(*) FROM token_source_links WHERE link=?",
+            [format!("s:{PARENT}")],
+            |row| row.get(0),
+        )
+    };
+    assert_eq!(link_count(&store)?, 0);
+    let queued = std::slice::from_ref(&archive);
+    assert!(store.sealed_queued_sources(queued)?.0.is_empty());
+    let mut reopened = SourceReader::restore(&store, &archive)?;
+    assert!(reopened.step(
+        &mut store,
+        cutoff,
+        &mut Budget::new(std::iter::empty()),
+        &BTreeMap::new(),
+        1 << 20
+    )?);
+    let (_, closed) = store.checkpoint(&archive)?.unwrap();
+    assert!(!closed.resume_pending && !closed.identity_conflict && !closed.invalid_counts);
+    assert_eq!(closed.session, CHILD);
+    assert_eq!(closed.stamp, first_checkpoint.stamp);
+    assert!(store.sealed_queued_sources(queued)?.0.contains_key(&archive));
+    assert_eq!(link_count(&store)?, 1);
+    assert!(store.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM token_observations o JOIN token_sessions s ON s.id=o.session_id
+         WHERE s.session=?1)",
+        [PARENT], |row| row.get::<_, bool>(0)
+    )?);
+    Ok(())
+}
+
+#[test]
+fn cross_session_parent_prefix_requires_a_unique_committed_native_anchor() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let parent = root.join(format!("rollout-{PHYSICAL_PREFIX}.jsonl"));
+    let child = root.join(format!("rollout-{CHILD}.jsonl"));
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let parent_rows = std::iter::once(header(PARENT, 0))
+        .chain((1..=48).map(|n| count(n, n, n as u64, true)))
+        .collect::<Vec<_>>();
+    let origin = parse(&parent, &parent_rows, cutoff);
+    let offset = origin.events[46].rollout_position.unwrap().2;
+    for case in [
+        "unique",
+        "cache alternate",
+        "physical copy",
+        "overlapping boundary",
+        "graph rejoins",
+    ] {
+        let db = root.join(format!("{case}.sqlite"));
+        let mut store = Store::open(Connection::open(&db)?)?;
+        let ready = store.prepare(
+            new_source(&parent, &origin),
+            cutoff,
+            BTreeMap::new(),
+            1 << 20,
+        )?;
+        store.publish(ready)?;
+        if matches!(case, "cache alternate" | "physical copy" | "graph rejoins") {
+            let other = if case == "physical copy" {
+                root.join(format!("copy-{PHYSICAL_PREFIX}.jsonl"))
+            } else {
+                root.join(format!("other-{OTHER}.jsonl"))
+            };
+            let mut counter = count(1, 47, 47, true);
+            counter["payload"]["info"]["total_token_usage"]["cached_input_tokens"] = json!(2);
+            let mut meta = header(PARENT, 0);
+            if case == "graph rejoins" {
+                meta = header(CHILD, 48);
+                meta["payload"]["history_base"] = json!({"thread_id":PHYSICAL_PREFIX,
+                    "end_ordinal_exclusive":48,"end_byte_offset":offset});
+                counter = count(49, 50, 50, true);
+            }
+            let competing = parse(&other, &[meta, counter], cutoff);
+            let ready = store.prepare(
+                new_source(&other, &competing),
+                cutoff,
+                BTreeMap::new(),
+                1 << 20,
+            )?;
+            store.publish(ready)?;
+        }
+        let mut meta = header(CHILD, 48);
+        meta["payload"]["history_base"] = json!({"thread_id":PHYSICAL_PREFIX,
+            "end_ordinal_exclusive":48,"end_byte_offset":if case=="overlapping boundary" {offset-1} else {offset}});
+        let incoming = parse(&child, &[meta, count(49, 49, 49, false)], cutoff);
+        let update = new_source(&child, &incoming);
+        let small = store.prepare(update, cutoff, BTreeMap::new(), 12_000);
+        if case == "unique" {
+            let mut reference = Store::open(Connection::open_in_memory()?)?;
+            let ready = reference.prepare(
+                new_source(&parent, &origin),
+                cutoff,
+                BTreeMap::new(),
+                1 << 20,
+            )?;
+            reference.publish(ready)?;
+            let full = reference.prepare(
+                SourceUpdate {
+                    replace: true,
+                    ..update
+                },
+                cutoff,
+                BTreeMap::new(),
+                1 << 20,
+            )?;
+            reference.publish(full)?;
+            store.publish(small?)?;
+            drop(store);
+            let mut reopened = Store::open(Connection::open(&db)?)?;
+            let actual = read(&mut reopened.db, i64::MIN, i64::MAX).1;
+            assert_eq!(actual.len(), 49);
+            assert!(actual == read(&mut reference.db, i64::MIN, i64::MAX).1);
+            assert_eq!(
+                actual
+                    .iter()
+                    .find(|e| e.session == CHILD)
+                    .unwrap()
+                    .delta
+                    .total_tokens,
+                220
+            );
+        } else {
+            assert!(
+                small
+                    .err()
+                    .is_some_and(|e| e.to_string().contains("component exceeds")),
+                "{case}"
+            );
+            assert!(store.checkpoint(&child)?.is_none());
+            let ready = store.prepare(update, cutoff, BTreeMap::new(), 1 << 20)?;
+            store.publish(ready)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn tiny_parent_still_fits_the_original_full_read_budget() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let parent = root.join(format!("rollout-{PHYSICAL_PREFIX}.jsonl"));
+    let other = root.join("prior.jsonl");
+    let child = root.join(format!("rollout-{CHILD}.jsonl"));
+    let mut store = Store::open(Connection::open_in_memory()?)?;
+    let origin = parse(&parent, &[header(PARENT, 0), count(1, 1, 1, true)], cutoff);
+    let prior = parse(&other, &[header(CHILD, 0), count(1, 3, 2, true)], cutoff);
+    for (path, state) in [(&parent, &origin), (&other, &prior)] {
+        let ready = store.prepare(new_source(path, state), cutoff, BTreeMap::new(), 1 << 20)?;
+        store.publish(ready)?;
+    }
+    let mut meta = header(CHILD, 2);
+    meta["payload"]["history_base"] = json!({"thread_id":PHYSICAL_PREFIX,
+        "end_ordinal_exclusive":2,"end_byte_offset":origin.offset});
+    let incoming = parse(&child, &[meta, count(3, 4, 3, false)], cutoff);
+    let update = new_source(&child, &incoming);
+    let full = SourceUpdate {
+        replace: true,
+        ..update
+    };
+    let (mut low, mut high) = (0, 1 << 20);
+    while low < high {
+        let middle = (low + high) / 2;
+        match store.prepare(full, cutoff, BTreeMap::new(), middle) {
+            Ok(_) => high = middle,
+            Err(error) if error.to_string().contains("input budget") => low = middle + 1,
+            Err(error) => return Err(error),
+        }
+    }
+    let ready = store.prepare(update, cutoff, BTreeMap::new(), high)?;
+    store.publish(ready)?;
+    assert_eq!(read(&mut store.db, i64::MIN, i64::MAX).1.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn long_continuation_appends_within_budget_after_reopen_and_refuses_a_child() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let file = root.join("index.sqlite");
+    let parent = root.join(format!("rollout-{PHYSICAL_PREFIX}.jsonl"));
+    let leaf = root.join(format!("rollout-{CHILD}.jsonl"));
+    let child = root.join(format!("rollout-{OTHER}.jsonl"));
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let names = BTreeMap::new();
+    let source_budget = 1 << 20;
+    let append_budget = 8192;
+    let head = std::iter::once(header(PARENT, 0))
+        .chain((1..=48).map(|n| count(n, n, n as u64, true)))
+        .collect::<Vec<_>>();
+    let base = parse(&parent, &head, cutoff);
+    let mut meta = header(PARENT, 49);
+    meta["payload"]["history_base"] = json!({"thread_id":PHYSICAL_PREFIX,
+        "end_ordinal_exclusive":49,"end_byte_offset":base.offset});
+    let own = [meta, count(50, 49, 49, true)];
+    let first = parse(&leaf, &own, cutoff);
+    let mut store = Store::open(Connection::open(&file)?)?;
+    for (path, state) in [(&parent, &base), (&leaf, &first)] {
+        let batch = store.prepare(
+            new_source(path, state),
+            cutoff,
+            names.clone(),
+            source_budget,
+        )?;
+        store.publish(batch)?;
+    }
+    let append = |row: &Value| -> std::io::Result<()> {
+        writeln!(fs::OpenOptions::new().append(true).open(&leaf)?, "{row}")
+    };
+    let duplicate = count(51, 50, 49, true);
+    append(&duplicate)?;
+    let mut reader = SourceReader::restore(&store, &leaf)?;
+    assert!(reader.step(
+        &mut store,
+        cutoff,
+        &mut Budget::new(std::iter::empty()),
+        &names,
+        append_budget
+    )?);
+    assert_eq!(read(&mut store.db, i64::MIN, i64::MAX).1.len(), 49);
+    let (committed_revision, committed) = store.checkpoint(&leaf)?.unwrap();
+    drop(store);
+
+    let new_count = count(52, 51, 50, true);
+    append(&new_count)?;
+    let mut store = Store::open(Connection::open(&file)?)?;
+    let mut reader = SourceReader::restore(&store, &leaf)?;
+    store.db.execute_batch(
+        "CREATE TEMP TRIGGER reject_append BEFORE UPDATE ON token_sources
+         BEGIN SELECT RAISE(ABORT, 'fixture append rollback'); END;",
+    )?;
+    let append_next = |reader: &mut SourceReader, store: &mut Store| {
+        reader.step(
+            store,
+            cutoff,
+            &mut Budget::new(std::iter::empty()),
+            &names,
+            append_budget,
+        )
+    };
+    let error = append_next(&mut reader, &mut store).unwrap_err();
+    assert!(error.to_string().contains("fixture append rollback"));
+    let (stored_revision, stored) = store.checkpoint(&leaf)?.unwrap();
+    assert_eq!(
+        (stored_revision, stored.offset),
+        (committed_revision, committed.offset)
+    );
+    store.db.execute_batch("DROP TRIGGER reject_append")?;
+    assert!(append_next(&mut reader, &mut store)?);
+    let (latest_revision, latest) = store.checkpoint(&leaf)?.unwrap();
+    let (_, actual) = read(&mut store.db, i64::MIN, i64::MAX);
+    assert_eq!(actual.len(), 50);
+
+    let reference_file = root.join("reference.jsonl");
+    let reference = parse(
+        &reference_file,
+        &[
+            own[0].clone(),
+            own[1].clone(),
+            duplicate.clone(),
+            new_count.clone(),
+        ],
+        cutoff,
+    );
+    let mut full = Store::open(Connection::open_in_memory()?)?;
+    for (path, state) in [(&parent, &base), (&leaf, &reference)] {
+        let batch = full.prepare(
+            new_source(path, state),
+            cutoff,
+            names.clone(),
+            source_budget,
+        )?;
+        full.publish(batch)?;
+    }
+    let (_, expected) = read(&mut full.db, i64::MIN, i64::MAX);
+    assert!(actual == expected);
+
+    let mut correction = count(53, 52, 50, true);
+    correction["payload"]["info"]["total_token_usage"]["cached_input_tokens"] = json!(999);
+    let mut backdated = count(53, 52, 51, true);
+    backdated["timestamp"] = json!("2026-01-02T13:00:52+02:00"); // 11:00:52Z, before the anchor.
+    for rejected in [correction, backdated] {
+        let mut changed = parse(
+            &reference_file,
+            &[
+                own[0].clone(),
+                own[1].clone(),
+                duplicate.clone(),
+                new_count.clone(),
+                rejected,
+            ],
+            cutoff,
+        );
+        changed.events.drain(..3);
+        let error = store
+            .prepare(
+                SourceUpdate {
+                    source: &leaf,
+                    state: &changed,
+                    previous_revision: Some(latest_revision),
+                    replace: false,
+                },
+                cutoff,
+                names.clone(),
+                append_budget,
+            )
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("Token component exceeds"));
+        let (retained_revision, retained) = store.checkpoint(&leaf)?.unwrap();
+        assert_eq!(
+            (retained_revision, retained.offset),
+            (latest_revision, latest.offset)
+        );
+        assert!(read(&mut store.db, i64::MIN, i64::MAX).1 == actual);
+    }
+
+    let mut child_meta = header(PARENT, 53);
+    child_meta["payload"]["history_base"] = json!({"thread_id":CHILD,
+        "end_ordinal_exclusive":53,"end_byte_offset":latest.offset});
+    let competing = parse(&child, &[child_meta, count(54, 52, 51, true)], cutoff);
+    let batch = store.prepare(
+        new_source(&child, &competing),
+        cutoff,
+        names.clone(),
+        source_budget,
+    )?;
+    store.publish(batch)?;
+    store.record_coverage(
+        Coverage {
+            pending_sources: 0,
+            issues: 0,
+            maintenance_blocked: false,
+        },
+        false,
+    )?;
+    let old = read(&mut store.db, i64::MIN, i64::MAX)
+        .1
+        .into_iter()
+        .min_by_key(|event| event.timestamp.clone())
+        .unwrap();
+    let proof = |events: &mut [UsageEvent], _: &BTreeMap<String, String>| {
+        for event in events {
+            event.provider = "verified-supplier".into();
+            event.model = "verified-model".into();
+            event.provider_source = Some("request-log-exact".into());
+        }
+        Ok(())
+    };
+    assert!(
+        store
+            .reclassify_session(PARENT, source_budget, &BTreeSet::new(), proof)?
+            .is_some()
+    );
+    let mut late = count(53, 53, 52, true);
+    late["timestamp"] = json!("2026-01-02T15:00:53Z");
+    append(&late)?;
+    assert!(!append_next(&mut reader, &mut store)?);
+    let (retained_revision, retained) = store.checkpoint(&leaf)?.unwrap();
+    assert_eq!(
+        (retained_revision, retained.offset),
+        (latest_revision, latest.offset)
+    );
+    let read_leaf = |reader: &mut SourceReader, store: &mut Store| {
+        reader.step(
+            store,
+            cutoff,
+            &mut Budget::new(std::iter::empty()),
+            &names,
+            source_budget,
+        )
+    };
+    let before_failure = read(&mut store.db, i64::MIN, i64::MAX);
+    store.db.execute_batch(
+        "CREATE TEMP TRIGGER abort_day BEFORE INSERT ON token_days
+        BEGIN SELECT RAISE(ABORT, 'fixture day rollback'); END;",
+    )?;
+    assert!(
+        read_leaf(&mut reader, &mut store)
+            .unwrap_err()
+            .to_string()
+            .contains("fixture day rollback")
+    );
+    assert_eq!(store.checkpoint(&leaf)?.unwrap().1.offset, latest.offset);
+    assert!(read(&mut store.db, i64::MIN, i64::MAX) == before_failure);
+    store.db.execute_batch("DROP TRIGGER abort_day")?;
+    assert!(read_leaf(&mut reader, &mut store)?);
+    let (_, rows) = read(&mut store.db, i64::MIN, i64::MAX);
+    let retained = rows.iter().find(|event| event.id == old.id).unwrap();
+    assert_eq!(retained.delta, old.delta);
+    assert_eq!(retained.total, old.total);
+    assert_eq!(
+        retained.provider_source.as_deref(),
+        Some("request-log-exact")
+    );
+    assert_eq!(
+        (&*retained.provider, &*retained.model),
+        ("verified-supplier", "verified-model")
+    );
+    assert!(
+        rows.iter()
+            .any(|event| event.timestamp == "2026-01-02T15:00:53.000Z")
+    );
+    Ok(())
+}
+
+#[test]
+fn reprojected_request_proofs_follow_competing_counts_and_receipt_corrections() -> anyhow::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let source = root.join("rollout-counts.jsonl");
+    let peer = root.join("rollout-peer.jsonl");
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let names = BTreeMap::new();
+    let limit = 1 << 20;
+    let mut store = Store::open(Connection::open_in_memory()?)?;
+    let usage = |n| json!({"input_tokens":100*n,"cached_input_tokens":20*n,"output_tokens":10*n});
+    let counter = |at: &str, n, cached: bool| {
+        let mut row = json!({"type":"event_msg","timestamp":at,"payload":{"type":"token_count",
+            "info":{"last_token_usage":usage(1),"total_token_usage":usage(n)}}});
+        if !cached {
+            for key in ["last_token_usage", "total_token_usage"] {
+                row["payload"]["info"][key]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("cached_input_tokens");
+            }
+        }
+        row
+    };
+    let receipt = |id| {
+        json!({"type":"token_usage_record","timestamp":"2026-01-02T15:00:01Z",
+        "payload":{"thread_id":PARENT,"turn_id":"same","response_id":id,"usage":usage(1),"thread_token_usage":usage(2)}})
+    };
+    let header = json!({"type":"session_meta","timestamp":"2026-01-02T12:00:00Z",
+        "payload":{"id":PARENT,"model_provider":"supplier-a"}});
+    let initial = parse(
+        &source,
+        &[
+            header.clone(),
+            json!({"type":"turn_context","timestamp":"2026-01-02T12:00:00Z",
+            "payload":{"turn_id":"same","model":"fixture"}}),
+            counter("2026-01-02T12:00:01Z", 1, true),
+            counter("2026-01-02T15:00:00Z", 2, false),
+            receipt("claim-one"),
+            counter("2026-01-02T18:00:00Z", 3, true),
+        ],
+        cutoff,
+    );
+    let other = parse(&peer, &[header], cutoff);
+    for (path, state) in [(&source, &initial), (&peer, &other)] {
+        let batch = store.prepare(new_source(path, state), cutoff, names.clone(), limit)?;
+        store.publish(batch)?;
+    }
+    store.record_coverage(
+        Coverage {
+            pending_sources: 0,
+            issues: 0,
+            maintenance_blocked: false,
+        },
+        false,
+    )?;
+    assert!(
+        store
+            .reclassify_session(PARENT, limit, &BTreeSet::new(), |rows, _| {
+                for event in rows {
+                    event.provider = "verified-supplier".into();
+                    event.provider_source = Some("request-log-exact".into());
+                }
+                Ok(())
+            })?
+            .is_some()
+    );
+    let before = read(&mut store.db, i64::MIN, i64::MAX).1;
+    assert_eq!(before.len(), 3);
+    assert!(before[1].delta.cached_known);
+    let mut reader = SourceReader::restore(&store, &source)?;
+    let mut append = |row: &Value, store: &mut Store| -> anyhow::Result<_> {
+        writeln!(fs::OpenOptions::new().append(true).open(&source)?, "{row}")?;
+        assert!(reader.step(
+            store,
+            cutoff,
+            &mut Budget::new(std::iter::empty()),
+            &names,
+            limit
+        )?);
+        Ok(read(&mut store.db, i64::MIN, i64::MAX).1)
+    };
+    let nearby = append(&counter("2026-01-02T18:04:00Z", 4, true), &mut store)?;
+    assert_eq!(nearby.len(), 4);
+    assert!(nearby[0..2] == before[0..2]);
+    assert_eq!(nearby[2].id, before[2].id);
+    assert_eq!(nearby[2].provider_source, None);
+    let corrected = append(&receipt("claim-two"), &mut store)?;
+    assert!(corrected[0] == before[0]);
+    assert_eq!(corrected[1].id, before[1].id);
+    assert_eq!(
+        corrected[1].delta.total_tokens,
+        before[1].delta.total_tokens
+    );
+    assert!(!corrected[1].delta.cached_known);
+    assert_eq!(corrected[1].provider_source, None);
+    let query = Query::parse(&json!({}), cutoff).unwrap();
+    let days = Store::read_selection(&mut store.db, &query, None, None)?.days;
+    let totals: u64 = days
+        .iter()
+        .map(|day| day["usage"]["totalTokens"].as_u64().unwrap())
+        .sum();
+    assert_eq!(totals, 440);
+    let verified: u64 = days
+        .iter()
+        .flat_map(|day| day["breakdowns"].as_array().unwrap())
+        .filter(|group| group["provider"] == "verified-supplier")
+        .map(|group| group["recordCount"].as_u64().unwrap())
+        .sum();
+    assert_eq!(verified, 1);
+    Ok(())
+}
+
+#[test]
+fn continuation_receipts_require_reconciliation_in_the_incoming_or_prior_batch()
+-> anyhow::Result<()> {
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let names = BTreeMap::new();
+    let full_budget = 1 << 20;
+    let append_budget = 8192;
+    for (prior_receipt, incoming_receipt) in [(false, false), (false, true), (true, false)] {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let parent = root.join(format!("rollout-{PHYSICAL_PREFIX}.jsonl"));
+        let leaf = root.join(format!("rollout-{CHILD}.jsonl"));
+        let head = std::iter::once(header(PARENT, 0))
+            .chain((1..=48).map(|n| count(n, n, n as u64, true)))
+            .collect::<Vec<_>>();
+        let base = parse(&parent, &head, cutoff);
+        let mut meta = header(PARENT, 49);
+        meta["payload"]["history_base"] = json!({"thread_id":PHYSICAL_PREFIX,
+            "end_ordinal_exclusive":49,"end_byte_offset":base.offset});
+        let mut rows = vec![
+            meta,
+            json!({"type":"turn_context","ordinal":50,"timestamp":"2026-01-02T12:00:48Z",
+                "payload":{"turn_id":"tail","model":"fixture"}}),
+        ];
+        let receipt = |ordinal: usize, second: usize| {
+            let counter = count(ordinal, second, 50, true);
+            let info = &counter["payload"]["info"];
+            json!({"type":"token_usage_record","ordinal":ordinal,"timestamp":counter["timestamp"],
+                "payload":{"thread_id":PARENT,"turn_id":"tail","response_id":"tail-response",
+                    "usage":info["last_token_usage"],"thread_token_usage":info["total_token_usage"]}})
+        };
+        if prior_receipt {
+            // The receipt precedes the committed anchor: only the raw claim survives.
+            rows.push(receipt(51, 49));
+        }
+        rows.push(count(49 + rows.len(), 50, 49, true));
+        let first = parse(&leaf, &rows, cutoff);
+        let mut store = Store::open(Connection::open_in_memory()?)?;
+        for (source, state) in [(&parent, &base), (&leaf, &first)] {
+            let prepared = store.prepare(
+                new_source(source, state),
+                cutoff,
+                names.clone(),
+                full_budget,
+            )?;
+            store.publish(prepared)?;
+        }
+        let before = read(&mut store.db, i64::MIN, i64::MAX);
+        assert_eq!(before.1.len(), 49);
+        assert!(before.1.iter().all(|e| e.terminal_response.is_none()));
+        assert_eq!(
+            store
+                .observations(&leaf)?
+                .iter()
+                .filter(|e| e.terminal_response.is_some())
+                .count(),
+            usize::from(prior_receipt)
+        );
+        let (revision, checkpoint) = store.checkpoint(&leaf)?.unwrap();
+        let ordinal = 49 + rows.len();
+        let mut native = count(ordinal, 51, 50, true);
+        for key in ["last_token_usage", "total_token_usage"] {
+            native["payload"]["info"][key]
+                .as_object_mut()
+                .unwrap()
+                .remove("cached_input_tokens");
+        }
+        {
+            let mut file = fs::OpenOptions::new().append(true).open(&leaf)?;
+            writeln!(file, "{native}")?;
+            if incoming_receipt {
+                writeln!(file, "{}", receipt(ordinal + 1, 52))?;
+            }
+        }
+        let mut reader = SourceReader::restore(&store, &leaf)?;
+        let step = |reader: &mut SourceReader, store: &mut Store, limit| {
+            reader.step(
+                store,
+                cutoff,
+                &mut Budget::new(std::iter::empty()),
+                &names,
+                limit,
+            )
+        };
+        let bounded = step(&mut reader, &mut store, append_budget);
+        if prior_receipt || incoming_receipt {
+            assert!(!bounded?);
+            assert!(read(&mut store.db, i64::MIN, i64::MAX) == before);
+            let (unchanged, retained) = store.checkpoint(&leaf)?.unwrap();
+            assert_eq!((unchanged, retained.offset), (revision, checkpoint.offset));
+            assert!(step(&mut reader, &mut store, append_budget)?);
+        } else {
+            assert!(bounded?);
+        }
+        let actual = read(&mut store.db, i64::MIN, i64::MAX).1;
+        assert_eq!(actual.len(), 50);
+        let last = actual.last().unwrap();
+        assert!(last.terminal_response.is_none());
+        assert_eq!(last.delta.total_tokens, 110);
+        assert_eq!(last.delta.cached_known, prior_receipt || incoming_receipt);
+        if last.delta.cached_known {
+            assert_eq!(last.delta.cached_input_tokens, 20);
+        }
+        assert_eq!(
+            store.checkpoint(&leaf)?.unwrap().1.offset,
+            fs::metadata(&leaf)?.len()
+        );
+
+        let mut replay = Store::open(Connection::open_in_memory()?)?;
+        for source in [&parent, &leaf] {
+            let mut reader = SourceReader::restore(&replay, source)?;
+            assert!(step(&mut reader, &mut replay, full_budget)?);
+        }
+        assert!(actual == read(&mut replay.db, i64::MIN, i64::MAX).1);
+    }
+    Ok(())
+}
+
+#[test]
+fn legacy_identity_prefix_repairs_zero_issue_rows_and_marks_clean_sources_once() -> anyhow::Result<()> {
+    for affected in ["response", "model", "provider", "unrelated"] {
+        let root = tempfile::tempdir()?;
+        let source = root.path().canonicalize()?.join("rollout-legacy.jsonl");
+        let database = root.path().join("usage.sqlite");
+        let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let long = "x".repeat(310);
+        let context = json!({"type":"turn_context", "ordinal":1, "timestamp":"2026-01-02T12:00:01Z",
+            "payload":{"turn_id":"turn", "model":if affected=="model" {&long} else {"normal"},
+                "model_provider":if affected=="provider" {&long} else {"relay"}}});
+        let second = count(3, 3, 2, true);
+        let info = &second["payload"]["info"];
+        let receipt = json!({"type":"token_usage_record","ordinal":3,"timestamp":"2026-01-02T12:00:03Z",
+            "payload":{"thread_id":PARENT,"turn_id":"turn","response_id":&long,
+                "usage":info["last_token_usage"],"thread_token_usage":info["total_token_usage"]}});
+        let mut rows = vec![header(PARENT, 0), context, count(2, 2, 1, true)];
+        if affected == "response" {
+            rows.push(receipt);
+        } else {
+            rows.push(json!({"type":"response_item","ordinal":3,"timestamp":"2026-01-02T12:00:03Z",
+                "payload":{"type":"message","model":&long,"response_id":&long}}));
+        }
+        let mut old = parse(&source, &rows, cutoff);
+        if affected == "response" {
+            old.events.retain(|event| event.terminal_response.is_none());
+        } else if affected == "model" {
+            old.model.clear();
+            old.model_unavailable = true;
+            old.events[0].model.clear();
+            old.events[0].context_conflicts.model = true;
+        } else if affected == "provider" {
+            old.provider = "supplier-a".into();
+            old.events[0].provider = old.provider.clone();
+        }
+        assert_eq!(old.issues, 0);
+        let mut store = Store::open(Connection::open(&database)?)?;
+        let prepared = store.prepare(new_source(&source, &old), cutoff, BTreeMap::new(), 1 << 20)?;
+        store.publish(prepared)?;
+        store.db.execute("UPDATE token_sources SET checkpoint=CAST(json_remove(checkpoint, '$.legacy_identity_prefix') AS BLOB)", [])?;
+        let before = read(&mut store.db, i64::MIN, i64::MAX);
+        assert!(store.sealed_queued_sources(std::slice::from_ref(&source))?.0.is_empty());
+        drop(store);
+        let mut store = Store::open(Connection::open(&database)?)?;
+        let mut reader = SourceReader::restore(&store, &source)?;
+        let step = |reader: &mut SourceReader, store: &mut Store, bytes| {
+            let mut budget = Budget::new(std::iter::empty());
+            budget.read_left = bytes;
+            reader.step(store, cutoff, &mut budget, &BTreeMap::new(), 1 << 20)
+        };
+        assert!(!step(&mut reader, &mut store, 100)?);
+        assert!(before == read(&mut store.db, i64::MIN, i64::MAX));
+        store.db.pragma_update(None, "query_only", true)?;
+        assert!(step(&mut reader, &mut store, 1 << 20).is_err());
+        assert!(before == read(&mut store.db, i64::MIN, i64::MAX));
+        store.db.pragma_update(None, "query_only", false)?;
+        assert!(step(&mut reader, &mut store, 1 << 20)?);
+        let after = read(&mut store.db, i64::MIN, i64::MAX);
+        let final_state = store.checkpoint(&source)?.unwrap().1;
+        assert_eq!(final_state.legacy_identity_prefix, 0);
+        assert!(store.sealed_queued_sources(std::slice::from_ref(&source))?.0.contains_key(&source));
+        match affected {
+            "response" => assert!(after.1.iter().any(|e| e.terminal_response.as_deref() == Some(&long))),
+            "model" => assert_eq!(after.1[0].model, long),
+            "provider" => assert_eq!(after.1[0].provider, long),
+            _ => assert!(before == after),
+        }
+        drop(store);
+        let mut store = Store::open(Connection::open(&database)?)?;
+        let mut reader = SourceReader::restore(&store, &source)?;
+        assert!(step(&mut reader, &mut store, 1)?);
+        assert!(after == read(&mut store.db, i64::MIN, i64::MAX));
+    }
+    Ok(())
+}
+
+#[test]
+fn legacy_identity_prefix_allows_append_during_check_and_compressed_cold_reopen() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().canonicalize()?.join("rollout-old.jsonl");
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    for compressed in [false, true] {
+        let rows = [header(PARENT, 0), count(1, 1, 1, true),
+            json!({"type":"response_item","ordinal":2,"payload":{"type":"message","content":"x".repeat(1500)}})];
+        let state = parse(&path, &rows, cutoff);
+        let source = if compressed {
+            let archive = path.with_extension("jsonl.zst");
+            fs::write(&archive, zstd::encode_all(fs::File::open(&path)?, 1)?)?;
+            archive
+        } else { path.clone() };
+        let mut state = state;
+        state.stamp = Some(FileState::source_stamp(&source)?);
+        let end = state.offset;
+        let db = root.path().join(if compressed {"compressed.sqlite"} else {"plain.sqlite"});
+        let mut store = Store::open(Connection::open(&db)?)?;
+        let prepared = store.prepare(new_source(&source, &state), cutoff, BTreeMap::new(), 1 << 20)?;
+        store.publish(prepared)?;
+        store.db.execute("UPDATE token_sources SET checkpoint=CAST(json_remove(checkpoint, '$.legacy_identity_prefix') AS BLOB)", [])?;
+        let mut reader = SourceReader::restore(&store, &source)?;
+        let step = |r: &mut SourceReader, s: &mut Store, size| {
+            let mut budget = Budget::new(std::iter::empty());
+            budget.read_left = size;
+            r.step(s, cutoff, &mut budget, &BTreeMap::new(), 1 << 20)
+        };
+        assert!(!step(&mut reader, &mut store, 128)?);
+        if !compressed {
+            writeln!(fs::OpenOptions::new().append(true).open(&source)?, "{}", count(3, 3, 2, true))?;
+            assert!(!step(&mut reader, &mut store, 2048)?);
+            assert_eq!(read(&mut store.db, i64::MIN, i64::MAX).1.len(), 2);
+            assert_eq!(store.checkpoint(&source)?.unwrap().1.legacy_identity_prefix, end);
+        }
+        let before_finish = read(&mut store.db, i64::MIN, i64::MAX);
+        for _ in 0..32 {
+            if step(&mut reader, &mut store, 128)? { break; }
+        }
+        assert_eq!(store.checkpoint(&source)?.unwrap().1.legacy_identity_prefix, 0);
+        drop(store);
+        let mut store = Store::open(Connection::open(&db)?)?;
+        let mut reader = SourceReader::restore(&store, &source)?;
+        assert!(step(&mut reader, &mut store, 1)?);
+        assert!(before_finish == read(&mut store.db, i64::MIN, i64::MAX));
+    }
+    Ok(())
+}
+
+#[test]
+fn legacy_identity_prefix_scan_commits_live_growth_while_an_archive_is_unverified() -> anyhow::Result<()> {
+    use super::scan::Scan;
+
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let sessions = root.join("sessions");
+    let archived = root.join("archived_sessions");
+    fs::create_dir(&sessions)?;
+    fs::create_dir(&archived)?;
+    let live = sessions.join(format!("rollout-{PARENT}.jsonl"));
+    let archive = archived.join(format!("rollout-{OTHER}.jsonl.zst"));
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    parse(&live, &[header(PARENT, 0), count(1, 1, 1, true)], cutoff);
+    let padding = "x".repeat(90 * 1024);
+    let mut z = zstd::Encoder::new(fs::File::create(&archive)?, 1)?;
+    writeln!(z, "{}", header(OTHER, 0))?;
+    writeln!(z, "{}", count(1, 1, 1, true))?;
+    for i in 2..165 {
+        writeln!(z, "{}", json!({"type":"response_item","ordinal":i,
+            "payload":{"type":"message","content":padding}}))?;
+    }
+    z.finish()?;
+    let mut store = Store::open(Connection::open_in_memory()?)?;
+    let mut scan = Scan::default();
+    let round = |scan: &mut Scan, store: &mut Store| {
+        let report = scan.round(store, &root, cutoff, &BTreeMap::new(), 1 << 20);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.maintenance_error.is_none(), "{:?}", report.maintenance_error);
+        report.complete
+    };
+    for _ in 0..12 {
+        if round(&mut scan, &mut store) { break; }
+    }
+    assert_eq!(read(&mut store.db, i64::MIN, i64::MAX).1.len(), 2);
+    store.db.execute("UPDATE token_sources SET checkpoint=CAST(json_remove(checkpoint, '$.legacy_identity_prefix') AS BLOB)", [])?;
+    let mut scan = Scan::default();
+    assert!(!round(&mut scan, &mut store));
+    for n in 2..=3 {
+        writeln!(fs::OpenOptions::new().append(true).open(&live)?, "{}", count(n, n, n as u64, true))?;
+        assert!(!round(&mut scan, &mut store));
+        assert_eq!(read(&mut store.db, i64::MIN, i64::MAX).1.len(), n + 1);
+        assert_ne!(store.checkpoint(&archive)?.unwrap().1.legacy_identity_prefix, 0);
+        assert!(store.sealed_queued_sources(std::slice::from_ref(&archive))?.0.is_empty());
+    }
+    for _ in 0..12 {
+        if round(&mut scan, &mut store) { break; }
+    }
+    assert_eq!(store.checkpoint(&archive)?.unwrap().1.legacy_identity_prefix, 0);
+    assert_eq!(read(&mut store.db, i64::MIN, i64::MAX).1.len(), 4);
+    Ok(())
+}
+
+#[test]
+fn legacy_large_line_issue_replays_once_and_replaces_the_old_snapshot_atomically()
+-> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let source = root.path().canonicalize()?.join("rollout-legacy.jsonl");
+    let database = root.path().join("usage.sqlite");
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let mut second = count(2, 2, 2, true);
+    second["payload"]["extra"] = json!("x".repeat(2 << 20));
+    let mut state = parse(
+        &source,
+        &[header(PARENT, 0), count(1, 1, 1, true), second],
+        cutoff,
+    );
+    state.events.pop();
+    state.previous = Some(state.events[0].total);
+    state.issues = 1;
+    state.rollout_out_of_order = true;
+    let mut store = Store::open(Connection::open(&database)?)?;
+    let prepared = store.prepare(
+        new_source(&source, &state),
+        cutoff,
+        BTreeMap::new(),
+        1 << 20,
+    )?;
+    store.publish(prepared)?;
+    store.db.execute("UPDATE token_sources SET checkpoint = CAST(json_remove(checkpoint, '$.large_meter_checked') AS BLOB)", [])?;
+    let (original_revision, original) = read(&mut store.db, i64::MIN, i64::MAX);
+    assert_eq!(original.len(), 1);
+    drop(store);
+    let mut store = Store::open(Connection::open(&database)?)?;
+    let mut reader = SourceReader::restore(&store, &source)?;
+    store.db.pragma_update(None, "query_only", true)?;
+    assert!(
+        reader
+            .step(
+                &mut store,
+                cutoff,
+                &mut Budget::new(std::iter::empty()),
+                &BTreeMap::new(),
+                1 << 20
+            )
+            .is_err()
+    );
+    assert!(read(&mut store.db, i64::MIN, i64::MAX) == (original_revision, original));
+    store.db.pragma_update(None, "query_only", false)?;
+    assert!(reader.step(
+        &mut store,
+        cutoff,
+        &mut Budget::new(std::iter::empty()),
+        &BTreeMap::new(),
+        1 << 20
+    )?);
+    let (revision, events) = read(&mut store.db, i64::MIN, i64::MAX);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1].delta.input_tokens, 100);
+    assert_eq!(store.checkpoint(&source)?.unwrap().1.issues, 0);
+    let mut reader = SourceReader::restore(&store, &source)?;
+    assert!(reader.step(
+        &mut store,
+        cutoff,
+        &mut Budget::new(std::iter::empty()),
+        &BTreeMap::new(),
+        1 << 20
+    )?);
+    assert!(read(&mut store.db, i64::MIN, i64::MAX) == (revision, events));
+    Ok(())
+}
+
+#[test]
+fn oversized_unfinished_meter_reopens_at_its_start_and_publishes_only_once() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let home = root.path().canonicalize()?;
+    let path = home.join("rollout-partial.jsonl");
+    let database = home.join("usage.sqlite");
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let prefix = format!("{}\n{}\n", header(PARENT, 0), count(1, 1, 1, true));
+    let mut second = count(2, 2, 2, false);
+    second["payload"]["extra"] = json!("x".repeat(5 << 20));
+    fs::write(&path, format!("{prefix}{second}"))?;
+    let mut store = Store::open(Connection::open(&database)?)?;
+    let mut reader = SourceReader::restore(&store, &path)?;
+    for _ in 0..2 {
+        assert!(!reader.step(
+            &mut store,
+            cutoff,
+            &mut Budget::new(std::iter::empty()),
+            &BTreeMap::new(),
+            1 << 20
+        )?);
+    }
+    assert!(reader.waiting_for_newline());
+    assert_eq!(
+        store.checkpoint(&path)?.unwrap().1.offset,
+        prefix.len() as u64
+    );
+    assert_eq!(read(&mut store.db, i64::MIN, i64::MAX).1.len(), 1);
+    drop(reader);
+    drop(store);
+    writeln!(fs::OpenOptions::new().append(true).open(&path)?)?;
+    let mut store = Store::open(Connection::open(&database)?)?;
+    let mut reader = SourceReader::restore(&store, &path)?;
+    for _ in 0..3 {
+        if reader.step(
+            &mut store,
+            cutoff,
+            &mut Budget::new(std::iter::empty()),
+            &BTreeMap::new(),
+            1 << 20,
+        )? {
+            break;
+        }
+    }
+    let events = read(&mut store.db, i64::MIN, i64::MAX).1;
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[1].rollout_position,
+        Some((2, prefix.len() as u64, path.metadata()?.len()))
+    );
+    assert_eq!(events[1].total.input_tokens, 200);
+    assert_eq!(events[1].delta.input_tokens, 100);
+    assert_eq!(
+        store.checkpoint(&path)?.unwrap().1.offset,
+        path.metadata()?.len()
+    );
+    let mut reader = SourceReader::restore(&store, &path)?;
+    assert!(reader.step(
+        &mut store,
+        cutoff,
+        &mut Budget::new(std::iter::empty()),
+        &BTreeMap::new(),
+        1 << 20
+    )?);
+    assert!(events == read(&mut store.db, i64::MIN, i64::MAX).1);
+    Ok(())
+}
+
+#[test]
 fn terminal_usage_persists_across_restart_and_late_count_without_rebasing_the_next_turn() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().canonicalize().unwrap();
@@ -109,10 +1301,17 @@ fn terminal_usage_persists_across_restart_and_late_count_without_rebasing_the_ne
         read(&mut store.db, i64::MIN, i64::MAX).1
     };
     let head = json!({"type":"session_meta","timestamp":at(0),"payload":{"id":PARENT,"model_provider":"fixture-supplier"}});
-    let first = terminal(2, "turn-a", "resp-a", usage(10, 3, 2), usage(10, 3, 2));
-    append(&[head.clone(), context(1, "turn-a"), first.clone()]);
+    let response_id = "resp-a".repeat(100);
+    let mut first = terminal(2, "turn-a", response_id.as_str(), usage(10, 3, 2), usage(10, 3, 2));
+    first["payload"]["extra"] = json!("x".repeat(1100 * 1024));
+    let mut wrong_turn = first.clone();
+    wrong_turn["payload"]["turn_id"] = json!("turn-b");
+    wrong_turn["payload"]["response_id"] = json!("wrong-turn");
+    append(&[head.clone(), context(1, "turn-a"), wrong_turn, first.clone()]);
     let initial = step(&rollout);
     assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].terminal_response.as_deref(), Some(response_id.as_str()));
+    assert!(step(&rollout) == initial);
     assert_eq!(
         initial[0].delta,
         crate::usage_history::Tokens::new(10, 3, 2)
@@ -612,11 +1811,14 @@ fn late_receipt_repairs_a_sealed_counter_and_competition_revokes_only_its_cache(
         assert_eq!(daily[0]["usage"]["totalTokens"], 66 * 110);
         if n == 1 {
             store
-                .record_coverage(Coverage {
-                    pending_sources: 0,
-                    issues: 0,
-                    maintenance_blocked: false,
-                })
+                .record_coverage(
+                    Coverage {
+                        pending_sources: 0,
+                        issues: 0,
+                        maintenance_blocked: false,
+                    },
+                    false,
+                )
                 .unwrap();
             assert!(
                 store
@@ -937,6 +2139,186 @@ fn source_ingest_resumes_a_compressed_prefix_across_bounded_rounds() {
 }
 
 #[test]
+fn context_only_fork_reconciles_within_budget_until_it_affects_parent_counts() -> anyhow::Result<()>
+{
+    use crate::usage_history::structured::{Index, Snapshot};
+
+    let dir = tempfile::tempdir()?;
+    let root = fs::canonicalize(dir.path())?;
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let parent_path = root.join("rollout-parent.jsonl");
+    let child_path = root.join("rollout-child.jsonl");
+    let rows = std::iter::once(header(PARENT, 0))
+        .chain((1..=24).map(|n| count(n, n, n as u64, true)))
+        .collect::<Vec<_>>();
+    let parent = parse(&parent_path, &rows, cutoff);
+    let mut fork = header(CHILD, 0);
+    fork["payload"]["forked_from_id"] = json!(PARENT);
+    fork["payload"]["subagent_history_start_ordinal"] = json!(3);
+    let copied_header = header(PARENT, 1);
+    let child = parse(
+        &child_path,
+        &[fork.clone(), copied_header.clone(), count(3, 53, 1, true)],
+        cutoff,
+    );
+    assert_eq!(child.inherited_contexts[0].session, PARENT);
+    assert_eq!(child.events.len(), 1);
+    assert_eq!(child.events[0].session, CHILD);
+
+    let mut index = Index::default();
+    index.files.insert(parent_path.clone(), parent);
+    index.files.insert(child_path.clone(), child);
+    let mut reference = Snapshot::default();
+    index.select_observations(cutoff, &mut reference, &mut BTreeMap::new(), usize::MAX);
+    index.resolve_counts(&mut reference);
+    let parent = &index.files[&parent_path];
+    let child = &index.files[&child_path];
+
+    let file = root.join("fork.sqlite");
+    let mut store = Store::open(Connection::open(&file)?)?;
+    let ready = store.prepare(
+        new_source(&parent_path, parent),
+        cutoff,
+        BTreeMap::new(),
+        1 << 20,
+    )?;
+    store.publish(ready)?;
+    let ready = store.prepare(
+        new_source(&child_path, child),
+        cutoff,
+        BTreeMap::new(),
+        8192,
+    )?;
+    let mut revision = store.publish(ready)?;
+    drop(store);
+    let mut store = Store::open(Connection::open(&file)?)?;
+    let (_, before) = read(&mut store.db, i64::MIN, i64::MAX);
+    assert_eq!(before.len(), 25);
+    assert!(before == reference.events);
+    assert!(
+        before
+            .iter()
+            .all(|event| event.delta.total_tokens == 110 && !event.count_incomplete)
+    );
+    assert_eq!(
+        store.db.query_row(
+            "SELECT count(*) FROM token_source_links WHERE link = ?1",
+            [format!("s:{PARENT}")],
+            |row| row.get::<_, usize>(0)
+        )?,
+        2
+    );
+    let mut malformed = count(2, 49, 25, true);
+    malformed["payload"]["info"]["total_token_usage"]["input_tokens"] = json!("bad");
+    for (inherited_row, is_bad) in [(count(2, 49, 25, true), false), (malformed, true)] {
+        let contributed = parse(
+            &child_path,
+            &[
+                fork.clone(),
+                copied_header.clone(),
+                inherited_row,
+                count(3, 53, 1, true),
+            ],
+            cutoff,
+        );
+        assert_eq!(contributed.invalid_counts, is_bad);
+        assert_eq!(
+            contributed
+                .events
+                .iter()
+                .any(|event| event.session == PARENT && event.inherited),
+            !is_bad
+        );
+        let update = SourceUpdate {
+            source: &child_path,
+            state: &contributed,
+            previous_revision: Some(revision),
+            replace: true,
+        };
+        assert!(
+            store
+                .prepare(update, cutoff, BTreeMap::new(), 8192)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Token component exceeds")
+        );
+        assert!(read(&mut store.db, i64::MIN, i64::MAX) == (revision, before.clone()));
+        let ready = store.prepare(update, cutoff, BTreeMap::new(), 1 << 20)?;
+        let changed = store.publish(ready)?;
+        let (_, events) = read(&mut store.db, i64::MIN, i64::MAX);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.session == PARENT)
+                .count(),
+            if is_bad { 24 } else { 25 }
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event.session == PARENT)
+                .unwrap()
+                .count_incomplete,
+            is_bad
+        );
+        let restore = SourceUpdate {
+            source: &child_path,
+            state: child,
+            previous_revision: Some(changed),
+            replace: true,
+        };
+        assert!(
+            store
+                .prepare(restore, cutoff, BTreeMap::new(), 8192)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Token component exceeds")
+        );
+        let ready = store.prepare(restore, cutoff, BTreeMap::new(), 1 << 20)?;
+        revision = store.publish(ready)?;
+        assert!(read(&mut store.db, i64::MIN, i64::MAX).1 == before);
+    }
+    store.record_coverage(
+        Coverage {
+            pending_sources: 0,
+            issues: 0,
+            maintenance_blocked: false,
+        },
+        false,
+    )?;
+    assert!(
+        store
+            .reclassify_session(PARENT, 1 << 20, &BTreeSet::new(), |events, _| {
+                events[0].provider = "fixture-proof".into();
+                events[0].provider_source = Some("request-log-exact".into());
+                Ok(())
+            })?
+            .is_some()
+    );
+    let parent_day = |db: &Connection| {
+        db.query_row("SELECT groups FROM token_days d JOIN token_sessions s ON s.id = d.session_id WHERE s.session = ?1", [PARENT], |row| row.get::<_, Vec<u8>>(0))
+    };
+    let day = parent_day(&store.db)?;
+    let (_, classified) = read(&mut store.db, i64::MIN, i64::MAX);
+    store.retire_source(&child_path, revision, cutoff, BTreeMap::new())?;
+    let (_, remaining) = read(&mut store.db, i64::MIN, i64::MAX);
+    assert!(remaining == classified[..24]);
+    assert_eq!(parent_day(&store.db)?, day);
+    let ready = store.prepare(
+        new_source(&child_path, child),
+        cutoff,
+        BTreeMap::new(),
+        8192,
+    )?;
+    store.publish(ready)?;
+    assert!(read(&mut store.db, i64::MIN, i64::MAX).1 == classified);
+    assert_eq!(parent_day(&store.db)?, day);
+    Ok(())
+}
+
+#[test]
 fn late_physical_prefix_repairs_only_affected_sources_and_preserves_reader_revision() {
     let dir = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(dir.path()).unwrap();
@@ -1021,6 +2403,88 @@ fn late_physical_prefix_repairs_only_affected_sources_and_preserves_reader_revis
     let (_, exact) = read(&mut reader, child_ms, child_ms + 1);
     assert!(exact == events[1..2]);
     assert!(read(&mut reader, child_ms + 1, child_ms + 1).1.is_empty());
+}
+
+#[test]
+fn oversized_non_usage_lines_preserve_physical_prefix_across_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    for (case, ordinal, pending) in [("ordered", 2, false), ("gap", 3, true)] {
+        let parent_path = root.join(format!("{case}-prefix-{PHYSICAL_PREFIX}.jsonl"));
+        let child_path = root.join(format!("{case}-child.jsonl"));
+        let initial = parse(
+            &parent_path,
+            &[header(PARENT, 0), count(1, 1, 1, true)],
+            cutoff,
+        );
+        let long_line = format!(
+            "{{\"ordinal\":{ordinal},\"type\":\"event_msg\",\"payload\":{{\"type\":\"agent_message\",\"message\":\"{}\"}}}}\n",
+            "x".repeat(crate::usage_history::structured::MAX_LINE + 128)
+        );
+        let mut bytes = fs::read(&parent_path).unwrap();
+        bytes.extend_from_slice(long_line.as_bytes());
+        fs::write(&parent_path, &bytes).unwrap();
+        let file = root.join(format!("{case}.sqlite3"));
+        let mut store = Store::open(Connection::open(&file).unwrap()).unwrap();
+        let mut reader = SourceReader::restore(&store, &parent_path).unwrap();
+        let mut budget = Budget::new(std::iter::empty());
+        budget.read_left = initial.offset + crate::usage_history::structured::MAX_LINE as u64 + 1;
+        assert!(
+            !reader
+                .step(&mut store, cutoff, &mut budget, &BTreeMap::new(), 8192)
+                .unwrap()
+        );
+        assert!(
+            store.checkpoint(&parent_path).unwrap().is_none(),
+            "the skipped row must not commit before its newline"
+        );
+        assert!(
+            reader
+                .step(
+                    &mut store,
+                    cutoff,
+                    &mut Budget::new(std::iter::empty()),
+                    &BTreeMap::new(),
+                    8192,
+                )
+                .unwrap()
+        );
+        drop(store);
+
+        let mut store = Store::open(Connection::open(&file).unwrap()).unwrap();
+        let (_, checkpoint) = store.checkpoint(&parent_path).unwrap().unwrap();
+        assert_eq!(
+            checkpoint.rollout_extent,
+            Some((0, ordinal as u64, bytes.len() as u64))
+        );
+        assert_eq!(checkpoint.rollout_out_of_order, pending);
+        assert_eq!(checkpoint.issues, 0);
+
+        let mut child_header = header(CHILD, ordinal + 1);
+        child_header["payload"]["history_base"] = json!({"thread_id":PHYSICAL_PREFIX,
+            "end_ordinal_exclusive":ordinal + 1,"end_byte_offset":bytes.len()});
+        let child = parse(
+            &child_path,
+            &[child_header, count(ordinal + 2, 2, 2, false)],
+            cutoff,
+        );
+        let prepared = store
+            .prepare(
+                new_source(&child_path, &child),
+                cutoff,
+                BTreeMap::new(),
+                8192,
+            )
+            .unwrap();
+        store.publish(prepared).unwrap();
+        let (_, events) = read(&mut store.db, i64::MIN, i64::MAX);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].count_pending, pending);
+        if !pending {
+            assert_eq!(events[1].delta.total_tokens, 110);
+        }
+    }
 }
 
 #[test]
@@ -1791,6 +3255,39 @@ fn cross_retention_range_reads_one_revision_without_inventing_partial_days() {
 }
 
 #[test]
+fn history_session_model_uses_context_time_across_sources_after_reopen() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let database = root.join("tokens.sqlite");
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let names = BTreeMap::new();
+    let request = json!({"from":"2026-01-02","to":"2026-01-02"});
+    let query = Query::parse(&request, cutoff).unwrap();
+    let model = "long-model/".repeat(32);
+    for (file, second, value) in [
+        ("rollout-z.jsonl", 1, "first"),
+        ("rollout-a.jsonl", 2, model.as_str()),
+        ("rollout-b.jsonl", 2, "conflicting"),
+        ("rollout-c.jsonl", 3, "last"),
+    ] {
+        let path = root.join(file);
+        let context = json!({"type":"turn_context", "ordinal":1,
+            "timestamp":format!("2026-01-02T12:00:{second:02}Z"),
+            "payload":{"model":value,"model_provider":"supplier-a"}});
+        let state = parse(&path, &[header(PARENT, 0), context], cutoff);
+        let mut store = Store::open(Connection::open(&database)?)?;
+        let prepared = store.prepare(new_source(&path, &state), cutoff, names.clone(), 1 << 16)?;
+        store.publish(prepared)?;
+        drop(store);
+        let mut reader = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let result = Store::read_response(&mut reader, &query, &request, Some(PARENT), &names)?;
+        let expected = if value == "conflicting" { "" } else { value };
+        assert_eq!(result["sessionInfo"][PARENT]["model"], expected, "{file}");
+    }
+    Ok(())
+}
+
+#[test]
 fn reopened_scope_uses_committed_aliases_and_only_unambiguous_descendants() {
     let dir = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(dir.path()).unwrap();
@@ -2065,6 +3562,140 @@ fn selection_preserves_the_known_priceable_subset_across_sessions() {
 }
 
 #[test]
+fn restored_supplier_evidence_keeps_inference_separate_without_changing_counts()
+-> anyhow::Result<()> {
+    for source in ["model-namespace", "session-context-inferred"] {
+        restored_supplier_evidence_for_source(source)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn mixed_supplier_inference_preserves_inferred_flag() {
+    use crate::usage_history::structured::ClassificationEvidence as Evidence;
+    for (a, b) in [
+        (Evidence::NamespaceInferred, Evidence::SessionContextInferred),
+        (Evidence::SessionContextInferred, Evidence::NamespaceInferred),
+    ] {
+        let mut row = json!({});
+        a.intersect(b).write_to(&mut row);
+        assert_eq!(row, json!({"providerInferred":true}));
+        assert_eq!(a.intersect(Evidence::RequestExact), Evidence::None);
+    }
+}
+
+fn restored_supplier_evidence_for_source(inferred_source: &str) -> anyhow::Result<()> {
+    use super::historical::{EvidenceVerifier, Historical};
+    use std::sync::Mutex;
+
+    let dir = tempfile::tempdir()?;
+    let root = fs::canonicalize(dir.path())?;
+    let database = root.join("tokens.sqlite");
+    let settings = root.join("settings.json");
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let mut store = Store::open(Connection::open(&database)?)?;
+    let mut records = Vec::new();
+    for (session, supplier, source) in [
+        (PARENT, "custom", inferred_source),
+        (CHILD, "custom", "request-log-recovered-supplier-only"),
+        (OTHER, "supplier-b", inferred_source),
+    ] {
+        let path = root.join(format!("rollout-{session}.jsonl"));
+        let mut state = parse(&path, &[header(session, 0), count(1, 1, 1, true)], cutoff);
+        let event = &mut state.events[0];
+        event.model = if inferred_source == "session-context-inferred" {
+            "fixture".into()
+        } else {
+            "supplier-a/fixture".into()
+        };
+        event.provider = supplier.into();
+        event.provider_source = (supplier == "supplier-b").then(|| "request-log-exact".into());
+        let prepared = store.prepare(new_source(&path, &state), cutoff, BTreeMap::new(), 8192)?;
+        store.publish(prepared)?;
+        let event = read(&mut store.db, i64::MIN, i64::MAX)
+            .1
+            .into_iter()
+            .find(|event| event.session == session)
+            .unwrap();
+        records.push(json!({
+            "eventId":event.id.map(|byte| format!("{byte:02x}")).concat(),
+            "session":event.session,"timestamp":event.timestamp,"model":event.model,
+            "role":event.role,"input":event.delta.input_tokens,"output":event.delta.output_tokens,
+            "cached":event.delta.cached_input_tokens,"provider":"supplier-a",
+            "providerName":"Supplier A","source":source
+        }));
+    }
+    let query = Query::parse(&json!({}), cutoff).unwrap();
+    let request = json!({});
+    let names = BTreeMap::new();
+    let before = Store::read_response(&mut store.db, &query, &request, None, &names)?;
+    fs::write(
+        settings.with_file_name("usage-provider-evidence.json"),
+        serde_json::to_vec(&json!({"version":1,"records":records}))?,
+    )?;
+    let with_overlay = |store: &mut Store| -> anyhow::Result<Value> {
+        let verifier = Mutex::new(EvidenceVerifier::default());
+        let overlay = Historical::refresh(None, store, &verifier, &settings)?.unwrap();
+        assert_eq!(overlay.overlay.legacy_status["appliedEvents"], 2);
+        let (result, _) = Store::read_response_with_archive(
+            &mut store.db,
+            &query,
+            &request,
+            None,
+            &names,
+            None,
+            Some(&overlay),
+        )?;
+        Ok(result)
+    };
+    let after = with_overlay(&mut store)?;
+    assert_eq!(after["days"][0]["usage"], before["days"][0]["usage"]);
+    assert_eq!(after["days"][0]["recordCount"], 3);
+    let rows = after["days"][0]["breakdowns"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(
+        rows.iter()
+            .any(|row| row["provider"] == "supplier-a" && row["providerInferred"] == true)
+    );
+    assert!(rows.iter().any(|row| row["provider"] == "supplier-a"
+        && row["providerInferred"].is_null()
+        && row["supplierClassificationEvidence"] == "request-log-recovered-supplier-only"));
+    assert!(rows.iter().any(|row| row["provider"] == "supplier-b"
+        && row["classificationEvidence"] == "request-log-exact"));
+    drop(store);
+    let mut reopened = Store::open(Connection::open(&database)?)?;
+    assert_eq!(with_overlay(&mut reopened)?["days"], after["days"]);
+
+    reopened.db.pragma_update(None, "journal_mode", "WAL")?;
+    let overlay = Historical::refresh(
+        None, &mut reopened, &Mutex::new(EvidenceVerifier::default()), &settings,
+    )?.unwrap();
+    let reader = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    reader.execute_batch("BEGIN")?;
+    reader.query_row("SELECT revision FROM token_revision", [], |row| row.get::<_, i64>(0))?;
+    let path = root.join("rollout-appended.jsonl");
+    let state = parse(&path, &[header(PHYSICAL_PREFIX, 0), count(1, 2, 1, true)], cutoff);
+    let prepared = reopened.prepare(new_source(&path, &state), cutoff, BTreeMap::new(), 8192)?;
+    reopened.publish(prepared)?;
+
+    for request in [&request, &json!({"includeFingerprints":false})] {
+        let (during, _) =
+            Store::read_snapshot(&reader, &query, request, None, &names, None, Some(&overlay))?;
+        assert_eq!(during["days"][0]["recordCount"], 3);
+        assert!(during["days"][0]["breakdowns"].as_array().unwrap().iter()
+            .any(|row| row["providerInferred"] == true));
+    }
+    let updated = with_overlay(&mut reopened)?;
+    assert_eq!(updated["days"][0]["recordCount"], 4);
+    assert_eq!(updated["days"][0]["usage"]["totalTokens"], 440);
+    fs::write(settings.with_file_name("usage-provider-evidence.json"), r#"{"version":1,"records":[]}"#)?;
+    let (revoked, _) = Store::read_snapshot(&reader, &query, &json!({}), None, &names, None, Some(&overlay))?;
+    assert_eq!(revoked["days"][0]["recordCount"], 3);
+    assert!(revoked["providerEvidence"].is_null());
+    Ok(())
+}
+
+#[test]
 fn archived_classification_matches_live_rollups_without_promoting_mixed_evidence() {
     use crate::usage_history::structured::{NativeResponseIdentity, REQUEST_SUPPLIER_PROOF, Snapshot};
 
@@ -2211,6 +3842,77 @@ fn attribution_still_waits_for_count_gaps_in_related_or_unidentified_sources() {
             None
         );
     }
+}
+
+#[test]
+fn newly_unidentified_source_withdraws_published_classifications_with_their_days() {
+    use super::scan::Scan;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let sessions = root.join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let db = root.join("index.sqlite");
+    let source = sessions.join("rollout-parent.jsonl");
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    parse(&source, &[header(PARENT, 0), count(1, 1, 1, true)], cutoff);
+    let mut store = Store::open(Connection::open(&db).unwrap()).unwrap();
+    let mut scan = Scan::default();
+    assert!(
+        scan.round(&mut store, &root, cutoff, &BTreeMap::new(), 8192)
+            .complete
+    );
+    let native = read(&mut store.db, i64::MIN, i64::MAX).1.pop().unwrap();
+    let revision = store
+        .reclassify_session(PARENT, 8192, &BTreeSet::new(), |events, _| {
+            events[0].provider = "relay-proof".into();
+            events[0].model = "final-model".into();
+            events[0].provider_source = Some("request-log-exact".into());
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+    fs::write(sessions.join("rollout-unidentified.jsonl.zst"), b"unread").unwrap();
+    store
+        .db
+        .execute_batch(
+            "CREATE TRIGGER fail_day BEFORE UPDATE ON token_days
+        BEGIN SELECT RAISE(ABORT,'failed day write'); END;",
+        )
+        .unwrap();
+    let failed = scan.round(&mut store, &root, cutoff, &BTreeMap::new(), 8192);
+    assert!(
+        failed
+            .maintenance_error
+            .unwrap()
+            .to_string()
+            .contains("failed day write")
+    );
+    let (after_failed, kept) = read(&mut store.db, i64::MIN, i64::MAX);
+    assert_eq!(after_failed, revision);
+    assert_eq!(kept[0].provider, "relay-proof");
+    store.db.execute_batch("DROP TRIGGER fail_day").unwrap();
+    let report = scan.round(&mut store, &root, cutoff, &BTreeMap::new(), 8192);
+    assert_eq!((report.pending_sources, report.issues), (0, 1));
+    let (next, restored) = read(&mut store.db, i64::MIN, i64::MAX);
+    assert!(next > revision);
+    assert_eq!(restored[0].id, native.id);
+    assert_eq!(restored[0].provider, native.provider);
+    assert_eq!(restored[0].provider_source, native.provider_source);
+    assert_eq!(restored[0].model, native.model);
+    assert_eq!(restored[0].delta.value(), native.delta.value());
+    drop(store);
+    let mut store = Store::open(Connection::open(&db).unwrap()).unwrap();
+    let report = Scan::default().round(&mut store, &root, cutoff, &BTreeMap::new(), 8192);
+    assert_eq!((report.pending_sources, report.issues), (0, 1));
+    let query = Query::parse(&json!({}), cutoff).unwrap();
+    let view = Store::read_selection(&mut store.db, &query, None, None).unwrap();
+    assert_eq!(view.revision, next);
+    let day = &view.days[0];
+    assert_eq!(day["recordCount"], 1);
+    assert_eq!(day["usage"]["totalTokens"], 110);
+    assert_ne!(day["breakdowns"][0]["provider"], "relay-proof");
+    assert!(day["breakdowns"][0].get("classificationEvidence").is_none());
 }
 
 #[test]
@@ -2361,6 +4063,101 @@ fn late_gateway_evidence_reclassifies_committed_rows_and_days_atomically() {
 }
 
 #[test]
+fn durable_future_partial_request_needs_ordered_gateway_and_paired_native_response()
+-> anyhow::Result<()> {
+    use super::scan::Scan;
+    use crate::usage_history::structured::{RequestEvidence, RequestEvidenceCache, provider_cache};
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    fs::create_dir(root.join("sessions"))?;
+    let cutoff = Local::now().date_naive().pred_opt().unwrap();
+    let at = Local::now().timestamp_millis();
+    let time = |delta| {
+        DateTime::from_timestamp_millis(at + delta)
+            .unwrap()
+            .to_rfc3339()
+    };
+    let mut head = header(PARENT, 0);
+    head["payload"]["model_provider"] = json!("custom");
+    head["timestamp"] = json!(time(-60_000));
+    let context = json!({"type":"turn_context","timestamp":time(-50_000),"ordinal":1,"payload":{"turn_id":"t","model":"gpt-fixture"}});
+    let mut counter = count(3, 0, 1, true);
+    counter["timestamp"] = json!(time(0));
+    let usage = &counter["payload"]["info"]["last_token_usage"];
+    let receipt = json!({"type":"token_usage_record","ordinal":2,"timestamp":time(-1),"payload":{"thread_id":PARENT,"turn_id":"t","response_id":"id","usage":usage,"thread_token_usage":usage}});
+    parse(
+        &root.join("sessions/rollout-ref.jsonl"),
+        &[head, context, receipt, counter],
+        cutoff,
+    );
+    let db = root.join("index.sqlite");
+    let mut store = Store::open(Connection::open(&db)?)?;
+    assert!(
+        Scan::default()
+            .round(&mut store, &root, cutoff, &BTreeMap::new(), 1 << 20)
+            .complete
+    );
+    let before = read(&mut store.db, at, at + 1).1.remove(0);
+    drop(store);
+    let mut proof_db = provider_cache::ProviderCache::default();
+    proof_db.open(&root.join("requests"), cutoff)?;
+    for (start, end, proof_end, response, expected) in [
+        (102, 12_309, 5, "id", true),
+        (-24_696, -12_489, 5, "id", false),
+        (0, 12_309, 5, "id", false),
+        (1, 12_309, 5, "id", false),
+        (102, 12_309, 5, "other", false),
+        (12_310, 12_309, 5, "id", false),
+        (102, 12_309, -60_000, "id", false),
+    ] {
+        let mut store = Store::open(Connection::open(&db)?)?;
+        let proof: RequestEvidence = serde_json::from_value(
+            json!({"id":"complete","threadId":PARENT,"model":"gpt-fixture","upstreamModel":"gpt-fixture","relayId":"proved","success":true,"state":"success","statusCode":200,
+            "timestampMs":at+proof_end,"startedAtMs":at-70_000,"attempts":1,"autoRetries":0,"finalResponseEvidence":"final-response-v1","finalResponseId":response,
+            "usage":{"inputTokens":100,"cachedTokens":20,"outputTokens":10}}),
+        )?;
+        let mut other = proof.clone();
+        other.id = "partial".into();
+        other.started_at_ms = if start == 0 { 0 } else { at + start };
+        other.timestamp_ms = at + end;
+        other.final_response_id = None;
+        other.final_response_evidence = None;
+        other.usage = None;
+        let mut evidence = RequestEvidenceCache {
+            records: vec![proof, other],
+            ..Default::default()
+        };
+        store.reclassify_window(
+            PARENT,
+            Some(at..at + 1),
+            1 << 20,
+            &BTreeSet::new(),
+            0,
+            |events, aliases, scope| {
+                evidence.attribute_with_cache_scoped(
+                    events,
+                    &mut BTreeMap::new(),
+                    aliases,
+                    &proof_db,
+                    Some(scope),
+                );
+                assert!(evidence.captured_id_check_error.is_none());
+                Ok(())
+            },
+        )?;
+        drop(store);
+        let after = read(&mut Connection::open(&db)?, at, at + 1).1.remove(0);
+        assert_eq!(
+            after.provider == "proved",
+            expected,
+            "start={start} end={end} proof={proof_end} id={response}"
+        );
+        assert_eq!((after.id, after.delta), (before.id, before.delta));
+    }
+    Ok(())
+}
+
+#[test]
 fn bounded_classification_preserves_day_totals_and_counts_competitors_across_the_boundary() {
     use super::scan::Scan;
     use crate::usage_history::structured::{RequestEvidence, RequestEvidenceCache, provider_cache};
@@ -2439,6 +4236,7 @@ fn bounded_classification_preserves_day_totals_and_counts_competitors_across_the
                 Some(start..start + 1),
                 LIMIT,
                 &gaps,
+                0,
                 |events, aliases, scope| {
                     assert_eq!(scope.targets.len(), 1);
                     assert_eq!(events.len(), 2);
@@ -2502,9 +4300,14 @@ fn bounded_classification_preserves_day_totals_and_counts_competitors_across_the
         .timestamp_millis();
     assert!(
         store
-            .reclassify_window(PARENT, Some(oldest..oldest + 1), LIMIT, &gaps, |_, _, _| {
-                panic!("cannot accept a clipped retention boundary")
-            })
+            .reclassify_window(
+                PARENT,
+                Some(oldest..oldest + 1),
+                LIMIT,
+                &gaps,
+                0,
+                |_, _, _| { panic!("cannot accept a clipped retention boundary") }
+            )
             .unwrap()
             .is_none()
     );

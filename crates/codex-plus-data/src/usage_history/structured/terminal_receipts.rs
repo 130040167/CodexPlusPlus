@@ -1,5 +1,33 @@
 use super::*;
 
+pub(super) fn fields(raw: &str) -> serde_json::Result<[(&'static str, Option<&RawValue>); 5]> {
+    #[derive(Deserialize)]
+    struct Fields<'a> {
+        #[serde(borrow)]
+        thread_id: Option<&'a RawValue>,
+        #[serde(borrow)]
+        turn_id: Option<&'a RawValue>,
+        #[serde(borrow)]
+        response_id: Option<&'a RawValue>,
+        #[serde(borrow)]
+        usage: Option<&'a RawValue>,
+        #[serde(borrow)]
+        thread_token_usage: Option<&'a RawValue>,
+    }
+    let fields: Fields<'_> = serde_json::from_str(raw)?;
+    Ok([
+        ("thread_id", fields.thread_id),
+        ("turn_id", fields.turn_id),
+        ("response_id", fields.response_id),
+        ("usage", fields.usage),
+        ("thread_token_usage", fields.thread_token_usage),
+    ])
+}
+
+pub(super) fn valid_response_id(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|c| c.is_ascii_graphic())
+}
+
 pub(super) fn parse(
     state: &FileState,
     payload: &Value,
@@ -12,9 +40,9 @@ pub(super) fn parse(
     {
         return None;
     }
-    let response = payload["response_id"].as_str().filter(|id| {
-        !id.is_empty() && id.len() <= 256 && id.bytes().all(|c| c.is_ascii_graphic())
-    })?;
+    let response = payload["response_id"]
+        .as_str()
+        .filter(|id| valid_response_id(id))?;
     let counts = |key: &str| {
         let value = &payload[key];
         Tokens::parse(value).filter(|tokens| {

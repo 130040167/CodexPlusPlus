@@ -82,9 +82,11 @@ struct Observation {
     count_pending: bool,
     rollout_position: Option<(u64, u64, u64)>,
     provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     provider_source: Option<String>,
     role: String,
     inherited: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     legacy_identity: Option<Box<LegacyIdentity>>,
     context_conflicts: ContextConflicts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,6 +174,8 @@ struct Checkpoint {
     history_base: Option<([u8; 16], u64, u64)>,
     rollout_extent: Option<(u64, u64, u64)>,
     rollout_out_of_order: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nul_padding_end: Option<u64>,
     expired_count: Option<((u64, u64, u64), Counter)>,
     #[serde(default)]
     token_day_span: Option<TokenDaySpan>,
@@ -194,12 +198,26 @@ struct Checkpoint {
     activity_truncated: bool,
     issues: usize,
     skipping: bool,
+    #[serde(default)]
+    large_meter_checked: bool,
+    #[serde(default)]
+    legacy_identity_prefix: Option<u64>,
+    #[serde(default)]
+    large_tools_checked: bool,
+}
+
+fn recheck_prefix(offset: u64, identity_prefix: Option<u64>, large_tools_checked: bool, activity_truncated: bool) -> u64 {
+    if !large_tools_checked && activity_truncated && offset > super::MAX_LINE as u64 {
+        offset
+    } else {
+        identity_prefix.unwrap_or(offset)
+    }
 }
 
 impl Checkpoint {
     fn capture(state: &FileState) -> (u64, Self) {
         // 未处理的尾行留在原会话文件，重开后从该行起点重读。
-        let offset = state.offset - state.pending.len() as u64;
+        let offset = state.committed_offset();
         let mut committed_cursors = BTreeMap::new();
         for event in &state.events {
             let cursor = committed_cursors
@@ -216,7 +234,7 @@ impl Checkpoint {
                 stamp: state.stamp,
                 resume_pending: state.resume_pending
                     || state.reader.is_some()
-                    || !state.pending.is_empty(),
+                    || offset < state.offset,
                 session: state.session.clone(),
                 model: state.model.clone(),
                 model_unavailable: state.model_unavailable,
@@ -233,6 +251,7 @@ impl Checkpoint {
                     .map(|base| (*base.rollout.as_bytes(), base.end_ordinal, base.end_offset)),
                 rollout_extent: state.rollout_extent,
                 rollout_out_of_order: state.rollout_out_of_order,
+                nul_padding_end: state.nul_padding_end,
                 expired_count: state
                     .expired_count
                     .map(|(position, count)| (position, Counter(count))),
@@ -251,15 +270,25 @@ impl Checkpoint {
                 activity_truncated: state.activity_truncated,
                 issues: state.issues,
                 skipping: state.skipping,
+                large_meter_checked: !state.recheck_large_meter,
+                legacy_identity_prefix: Some(if state.legacy_tools_only { 0 } else { state.legacy_identity_prefix }),
+                large_tools_checked: !state.legacy_tools_only,
             },
         )
     }
 
     fn restore(self, offset: u64) -> FileState {
+        let recheck_large_meter = !self.large_meter_checked
+            && offset > super::MAX_LINE as u64
+            && self.issues > self.malformed_token_counts;
+        let prefix = recheck_prefix(offset, self.legacy_identity_prefix, self.large_tools_checked, self.activity_truncated);
         FileState {
             stamp: self.stamp,
             offset,
-            resume_pending: self.resume_pending,
+            resume_pending: self.resume_pending || recheck_large_meter,
+            recheck_large_meter,
+            legacy_identity_prefix: prefix,
+            legacy_tools_only: prefix != 0 && self.legacy_identity_prefix == Some(0),
             session: self.session,
             model: self.model,
             model_unavailable: self.model_unavailable,
@@ -279,6 +308,7 @@ impl Checkpoint {
                 }),
             rollout_extent: self.rollout_extent,
             rollout_out_of_order: self.rollout_out_of_order,
+            nul_padding_end: self.nul_padding_end,
             expired_count: self
                 .expired_count
                 .map(|(position, count)| (position, count.0)),
@@ -311,7 +341,7 @@ mod store;
 mod tests;
 
 mod runtime;
-pub(super) use runtime::{ReadState, Runtime, read_execution_detail, recover_archive};
+pub(super) use runtime::{HistoryReader, ReadState, Runtime, read_execution_detail, recover_archive};
 pub(super) use store::{
     archive::ArchiveKey,
     executions::{DetailQuery, ExecutionQuery},
