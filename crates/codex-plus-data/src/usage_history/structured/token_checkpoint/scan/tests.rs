@@ -1,4 +1,5 @@
 use super::*;
+use crate::usage_history::structured::FileState;
 use rusqlite::Connection;
 use serde_json::json;
 use std::fs;
@@ -210,7 +211,9 @@ fn source_move_and_removal_keep_archived_days_without_duplicating_recent_usage()
     let names = BTreeMap::new();
     assert!(scan.round(&mut store, &root, start, &names, 8192).complete);
 
-    fs::rename(&source, &moved).unwrap();
+    // A new physical file still exercises ingestion-before-retirement, not relocation.
+    fs::copy(&source, &moved).unwrap();
+    fs::remove_file(&source).unwrap();
     store
         .db
         .execute_batch(
@@ -258,6 +261,503 @@ fn source_move_and_removal_keep_archived_days_without_duplicating_recent_usage()
     })
     .unwrap();
     assert_eq!(archived, [(SECOND.into(), 110)]);
+}
+
+#[test]
+fn physical_archive_move_keeps_a_long_sources_committed_index_and_append_baseline() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let active = root.join("sessions");
+    let archived = root.join("archived_sessions");
+    fs::create_dir(&active).unwrap();
+    fs::create_dir(&archived).unwrap();
+    let name = format!("rollout-{FIRST}.jsonl");
+    let source = active.join(&name);
+    let moved = archived.join(&name);
+    let initial = rollout(FIRST);
+    let line = |n: i64| {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-02T12:01:00Z").unwrap()
+            + chrono::Duration::seconds(n);
+        json!({"type":"event_msg","timestamp":at.to_rfc3339(),
+        "payload":{"type":"token_count","info":{
+          "total_token_usage":{"input_tokens":100*n,"cached_input_tokens":20*n,"output_tokens":10*n},
+          "last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10}
+        }}})
+    };
+    fs::write(&source, initial).unwrap();
+    let mut file = fs::OpenOptions::new().append(true).open(&source).unwrap();
+    for n in 2..=80 {
+        writeln!(file, "{}", line(n)).unwrap();
+    }
+    drop(file);
+    let db = root.join("usage.sqlite");
+    let mut store = Store::open(Connection::open(&db).unwrap()).unwrap();
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let names = BTreeMap::new();
+    assert!(
+        Scan::default()
+            .round(&mut store, &root, cutoff, &names, 1 << 20)
+            .complete
+    );
+    let checkpoint = store.checkpoint(&source).unwrap().unwrap();
+    let source_id: i64 = store
+        .db
+        .query_row("SELECT id FROM token_sources", [], |row| row.get(0))
+        .unwrap();
+    let observation_bytes: u64 = store
+        .db
+        .query_row(
+            "SELECT sum(length(payload)) FROM token_observations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    const BUDGET: usize = 8192;
+    assert!(observation_bytes > BUDGET as u64);
+    let read = |store: &mut Store| {
+        let mut counts = Vec::new();
+        let revision = Store::read_committed(&mut store.db, i64::MIN, i64::MAX, |event| {
+            counts.push((event.id, event.delta.total_tokens));
+            Ok(())
+        })
+        .unwrap();
+        (revision, counts)
+    };
+    let before = read(&mut store);
+    assert_eq!(before.1.len(), 80);
+
+    fs::rename(&source, &moved).unwrap();
+    store
+        .db
+        .execute_batch(
+            "CREATE TRIGGER stop_move BEFORE UPDATE OF source ON token_sources
+         BEGIN SELECT RAISE(ABORT, 'test relocation failure'); END;",
+        )
+        .unwrap();
+    let failed = Scan::default().round(&mut store, &root, cutoff, &names, BUDGET);
+    assert_eq!(failed.errors.len(), 1);
+    assert!(
+        failed.errors[0]
+            .1
+            .to_string()
+            .contains("test relocation failure")
+    );
+    assert_eq!(read(&mut store), before);
+    assert!(store.checkpoint(&source).unwrap().is_some());
+    assert!(store.checkpoint(&moved).unwrap().is_none());
+    store.db.execute_batch("DROP TRIGGER stop_move").unwrap();
+    drop(store);
+    let mut store = Store::open(Connection::open(&db).unwrap()).unwrap();
+
+    let mut scan = Scan::default();
+    let report = scan.round(&mut store, &root, cutoff, &names, BUDGET);
+    assert!(report.complete, "{:?}", report.errors);
+    assert!(store.checkpoint(&source).unwrap().is_none());
+    let (source_revision, state) = store.checkpoint(&moved).unwrap().unwrap();
+    assert_eq!(
+        (source_revision, state.offset),
+        (checkpoint.0, checkpoint.1.offset)
+    );
+    let moved_id: i64 = store
+        .db
+        .query_row("SELECT id FROM token_sources", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(moved_id, source_id);
+    let relocated = read(&mut store);
+    assert_eq!(relocated.0, before.0 + 1);
+    assert_eq!(relocated.1, before.1);
+
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&moved).unwrap(),
+        "{}",
+        line(81)
+    )
+    .unwrap();
+    let report = scan.round(&mut store, &root, cutoff, &names, BUDGET);
+    assert!(report.complete, "{:?}", report.errors);
+    let after = read(&mut store).1;
+    assert_eq!(after.len(), 81);
+    assert_eq!(after[..80], before.1);
+    assert_eq!(after[80].1, 110);
+}
+
+#[test]
+fn identical_archive_copy_must_not_stall_the_original_append() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let active = root.join("sessions");
+    let archived = root.join("archived_sessions");
+    fs::create_dir(&active).unwrap();
+    fs::create_dir(&archived).unwrap();
+    let name = format!("rollout-{FIRST}.jsonl");
+    let source = active.join(&name);
+    let copy = archived.join(&name);
+    let initial = rollout(FIRST);
+    let (_, prototype) = initial.split_once('\n').unwrap();
+    let count = |n: i64| {
+        let mut event: serde_json::Value = serde_json::from_str(prototype).unwrap();
+        let at = chrono::DateTime::parse_from_rfc3339("2026-01-02T12:01:00Z").unwrap()
+            + chrono::Duration::seconds(n);
+        event["timestamp"] = json!(at.to_rfc3339());
+        event["payload"]["info"]["total_token_usage"] =
+            json!({"input_tokens":100*n,"cached_input_tokens":20*n,"output_tokens":10*n});
+        event
+    };
+    fs::write(&source, initial.as_bytes()).unwrap();
+    let mut file = fs::OpenOptions::new().append(true).open(&source).unwrap();
+    for n in 2..=80 {
+        writeln!(file, "{}", count(n)).unwrap();
+    }
+    drop(file);
+    let db = root.join("usage.sqlite");
+    let mut store = Store::open(Connection::open(&db).unwrap()).unwrap();
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let names = BTreeMap::new();
+    let mut scan = Scan::default();
+    assert!(
+        scan.round(&mut store, &root, cutoff, &names, 1 << 20)
+            .complete
+    );
+    fs::copy(&source, &copy).unwrap();
+    assert_ne!(
+        FileState::source_stamp(&source).unwrap().2,
+        FileState::source_stamp(&copy).unwrap().2,
+    );
+    store
+        .db
+        .execute_batch(
+            "CREATE TRIGGER refuse_copy BEFORE INSERT ON token_source_copies
+         BEGIN SELECT RAISE(ABORT, 'test copy registration failure'); END;",
+        )
+        .unwrap();
+    const BUDGET: usize = 8192;
+    let failed = scan.round(&mut store, &root, cutoff, &names, BUDGET);
+    assert!(!failed.complete);
+    assert_eq!(failed.errors.len(), 1);
+    assert!(
+        failed.errors[0]
+            .1
+            .to_string()
+            .contains("test copy registration failure")
+    );
+    assert!(store.checkpoint(&copy).unwrap().is_none());
+    store.db.execute_batch("DROP TRIGGER refuse_copy").unwrap();
+    let registered = scan.round(&mut store, &root, cutoff, &names, BUDGET);
+    assert!(registered.complete, "{:?}", registered.errors);
+    assert!(store.checkpoint(&copy).unwrap().is_none());
+    let source_id: i64 = store
+        .db
+        .query_row("SELECT id FROM token_sources", [], |row| row.get(0))
+        .unwrap();
+    let read = |store: &mut Store| {
+        let mut counts = Vec::new();
+        Store::read_committed(&mut store.db, i64::MIN, i64::MAX, |event| {
+            counts.push((event.id, event.delta.total_tokens));
+            Ok(())
+        })
+        .unwrap();
+        counts
+    };
+    let prior = read(&mut store);
+    assert_eq!(prior.len(), 80);
+    drop(store);
+
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&source).unwrap(),
+        "{}",
+        count(81)
+    )
+    .unwrap();
+    let mut store = Store::open(Connection::open(&db).unwrap()).unwrap();
+    let mut scan = Scan::default();
+    let report = scan.round(&mut store, &root, cutoff, &names, BUDGET);
+    assert!(report.complete, "{:?}", report.errors);
+    let after = read(&mut store);
+    assert_eq!(after.len(), 81);
+    assert_eq!(after[..80], prior);
+    assert_eq!(after[80].1, 110);
+
+    fs::copy(&source, &copy).unwrap();
+    let verified = scan.round(&mut store, &root, cutoff, &names, BUDGET);
+    assert!(verified.complete, "{:?}", verified.errors);
+    fs::remove_file(&source).unwrap();
+    drop(store);
+    let mut store = Store::open(Connection::open(&db).unwrap()).unwrap();
+    let mut scan = Scan::default();
+    let promoted = scan.round(&mut store, &root, cutoff, &names, BUDGET);
+    assert!(promoted.complete, "{:?}", promoted.errors);
+    assert_eq!(read(&mut store), after);
+    assert!(store.checkpoint(&source).unwrap().is_none());
+    assert!(store.checkpoint(&copy).unwrap().is_some());
+    assert_eq!(
+        store
+            .db
+            .query_row("SELECT id FROM token_sources", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        source_id,
+    );
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&copy).unwrap(),
+        "{}",
+        count(82)
+    )
+    .unwrap();
+    let appended = scan.round(&mut store, &root, cutoff, &names, BUDGET);
+    assert!(appended.complete, "{:?}", appended.errors);
+    let final_counts = read(&mut store);
+    assert_eq!(final_counts[..81], after);
+    assert_eq!(final_counts.len(), 82);
+    assert_eq!(final_counts[81].1, 110);
+
+    fs::copy(&copy, &source).unwrap();
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&source).unwrap(),
+        "{}",
+        count(83)
+    )
+    .unwrap();
+    let extended = scan.round(&mut store, &root, cutoff, &names, BUDGET);
+    assert!(extended.complete, "{:?}", extended.errors);
+    assert!(store.checkpoint(&copy).unwrap().is_none());
+    assert!(store.checkpoint(&source).unwrap().is_some());
+    let extended_counts = read(&mut store);
+    assert_eq!(extended_counts[..82], final_counts);
+    assert_eq!(extended_counts.len(), 83);
+    assert_eq!(extended_counts[82].1, 110);
+
+    fs::remove_file(&copy).unwrap();
+    fs::rename(&source, &copy).unwrap();
+    let renamed = scan.round(&mut store, &root, cutoff, &names, BUDGET);
+    assert!(renamed.complete, "{:?}", renamed.errors);
+    assert_eq!(read(&mut store), extended_counts);
+    assert_eq!(
+        store
+            .db
+            .query_row("SELECT count(*) FROM token_source_copies", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+
+    // If discovery first sees the copy after the original is gone, the file
+    // name and size alone must not let it inherit the committed cursor.
+    fs::copy(&copy, &source).unwrap();
+    fs::remove_file(&copy).unwrap();
+    drop(store);
+    let mut store = Store::open(Connection::open(&db).unwrap()).unwrap();
+    let unavailable = Scan::default().round(&mut store, &root, cutoff, &names, BUDGET);
+    assert!(!unavailable.complete);
+    assert!(store.checkpoint(&source).unwrap().is_none());
+    assert!(store.checkpoint(&copy).unwrap().is_some());
+    assert_eq!(read(&mut store), extended_counts);
+
+    let reread = Scan::default().round(&mut store, &root, cutoff, &names, 1 << 20);
+    assert!(reread.complete, "{:?}", reread.errors);
+    assert!(store.checkpoint(&source).unwrap().is_some());
+    assert!(store.checkpoint(&copy).unwrap().is_none());
+    assert_eq!(read(&mut store), extended_counts);
+}
+
+#[test]
+fn previously_materialized_copies_recover_a_verified_tail_without_republishing_counts() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let active = root.join("sessions");
+    let archive = root.join("archived_sessions");
+    fs::create_dir(&active).unwrap();
+    fs::create_dir(&archive).unwrap();
+    let name = format!("rollout-{FIRST}.jsonl");
+    let source = active.join(&name);
+    let copy = archive.join(&name);
+    let at = chrono::DateTime::parse_from_rfc3339("2026-01-02T12:01:00Z").unwrap();
+    let row = |n| {
+        json!({"type":"event_msg","timestamp":(at+chrono::Duration::seconds(n)).to_rfc3339(),
+        "payload":{"type":"token_count","info":{
+            "total_token_usage":{"input_tokens":100*n,"cached_input_tokens":20*n,"output_tokens":10*n},
+            "last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10}
+        }}})
+    };
+    let head = rollout(FIRST);
+    fs::write(&source, &head).unwrap();
+    let mut file = fs::OpenOptions::new().append(true).open(&source).unwrap();
+    for n in 2..=80 {
+        writeln!(file, "{}", row(n)).unwrap();
+    }
+    drop(file);
+    let db = root.join("usage.sqlite");
+    let mut store = Store::open(Connection::open(&db).unwrap()).unwrap();
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let names = BTreeMap::new();
+    fs::copy(&source, &copy).unwrap();
+    for path in [&source, &copy] {
+        // Reproduce the old scanner, which ingested both paths before copy proof existed.
+        assert!(
+            SourceReader::restore(&store, path)
+                .unwrap()
+                .step(
+                    &mut store,
+                    cutoff,
+                    &mut Budget::new(std::iter::empty()),
+                    &names,
+                    1 << 20
+                )
+                .unwrap()
+        );
+    }
+    let count_table = |store: &Store, query: &str| {
+        store
+            .db
+            .query_row(query, [], |row| row.get::<_, u64>(0))
+            .unwrap()
+    };
+    assert_eq!(count_table(&store, "SELECT count(*) FROM token_sources"), 2);
+    assert_eq!(
+        count_table(&store, "SELECT count(*) FROM token_linear_sources"),
+        0
+    );
+    let rows = |store: &mut Store| {
+        let mut counts = Vec::new();
+        Store::read_committed(&mut store.db, i64::MIN, i64::MAX, |e| {
+            counts.push((e.id, e.delta));
+            Ok(())
+        })
+        .unwrap();
+        counts
+    };
+    let before = rows(&mut store);
+    assert_eq!(before.len(), 80);
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&source).unwrap(),
+        "{}",
+        row(81)
+    )
+    .unwrap();
+    store
+        .db
+        .execute_batch(
+            "CREATE TRIGGER refuse_collapse BEFORE DELETE ON token_sources
+         BEGIN SELECT RAISE(ABORT, 'test collapse failure'); END;",
+        )
+        .unwrap();
+    let failed = Scan::default().round(&mut store, &root, cutoff, &names, 8192);
+    assert!(!failed.complete);
+    assert!(
+        failed
+            .errors
+            .iter()
+            .any(|(_, error)| error.to_string().contains("test collapse failure"))
+    );
+    assert_eq!(count_table(&store, "SELECT count(*) FROM token_sources"), 2);
+    assert_eq!(
+        count_table(&store, "SELECT count(*) FROM token_linear_sources"),
+        0
+    );
+    assert_eq!(rows(&mut store), before);
+    store
+        .db
+        .execute_batch("DROP TRIGGER refuse_collapse")
+        .unwrap();
+    drop(store);
+    let mut store = Store::open(Connection::open(&db).unwrap()).unwrap();
+    let mut scan = Scan::default();
+    let recovered = scan.round(&mut store, &root, cutoff, &names, 8192);
+    assert!(recovered.complete, "{:?}", recovered.errors);
+    assert_eq!(count_table(&store, "SELECT count(*) FROM token_sources"), 1);
+    assert_eq!(
+        count_table(&store, "SELECT count(*) FROM token_source_copies"),
+        1
+    );
+    let after = rows(&mut store);
+    assert_eq!(after.len(), 81);
+    assert_eq!(after[..80], before);
+    assert_eq!(after[80].1.total_tokens, 110);
+
+    let mut fork = row(82);
+    fork["payload"]["info"]["total_token_usage"]["input_tokens"] = json!(9000);
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&copy).unwrap(),
+        "{fork}"
+    )
+    .unwrap();
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&source).unwrap(),
+        "{}",
+        row(82)
+    )
+    .unwrap();
+    let divergent = scan.round(&mut store, &root, cutoff, &names, 8192);
+    assert!(!divergent.complete);
+    assert_eq!(count_table(&store, "SELECT count(*) FROM token_sources"), 1);
+    let after_fork = rows(&mut store);
+    assert_eq!(after_fork[..81], after);
+    assert_eq!(after_fork.len(), 82);
+    assert_eq!(after_fork[81].1.total_tokens, 110);
+}
+
+#[test]
+fn large_copy_yields_to_other_sessions_and_a_changed_prefix_is_not_admitted_as_a_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let active = root.join("sessions");
+    let archived = root.join("archived_sessions");
+    fs::create_dir(&active).unwrap();
+    fs::create_dir(&archived).unwrap();
+    let name = format!("rollout-{FIRST}.jsonl");
+    let source = active.join(&name);
+    let copy = archived.join(&name);
+    let independent = active.join(format!("rollout-{SECOND}.jsonl"));
+    let padding = format!("{}\n", " ".repeat(512 * 1024)).repeat(3);
+    let bytes = format!("{}{}", rollout(FIRST), padding);
+    fs::write(&source, &bytes).unwrap();
+    let mut store = Store::open(Connection::open_in_memory().unwrap()).unwrap();
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let names = BTreeMap::new();
+    let mut scan = Scan::default();
+    const BUDGET: usize = 8192;
+    assert!(
+        scan.round(&mut store, &root, cutoff, &names, BUDGET)
+            .complete
+    );
+
+    fs::copy(&source, &copy).unwrap();
+    fs::write(&independent, rollout(SECOND)).unwrap();
+    let pending = scan.round(&mut store, &root, cutoff, &names, BUDGET);
+    assert_eq!(pending.pending_sources, 1);
+    assert!(pending.errors.is_empty());
+    assert!(store.checkpoint(&independent).unwrap().is_some());
+    assert!(store.checkpoint(&copy).unwrap().is_none());
+    let ready = scan.round(&mut store, &root, cutoff, &names, BUDGET);
+    assert!(ready.complete, "{:?}", ready.errors);
+    assert!(store.checkpoint(&copy).unwrap().is_none());
+
+    fs::rename(&copy, archived.join("previous.jsonl")).unwrap();
+    fs::write(
+        &copy,
+        bytes.replacen(
+            "\"cached_input_tokens\":20",
+            "\"cached_input_tokens\":19",
+            1,
+        ),
+    )
+    .unwrap();
+    let diverged = scan.round(&mut store, &root, cutoff, &names, BUDGET);
+    assert!(diverged.complete, "{:?}", diverged.errors);
+    assert!(store.checkpoint(&source).unwrap().is_some());
+    assert!(store.checkpoint(&copy).unwrap().is_some());
+    assert_eq!(
+        store
+            .db
+            .query_row("SELECT count(*) FROM token_source_copies", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -446,6 +946,270 @@ fn cold_index_does_not_report_an_empty_archived_day_as_exact() {
 }
 
 #[test]
+fn execution_locators_commit_with_the_source_and_expire_without_losing_the_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let sessions = root.join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let source = sessions.join(format!("rollout-{FIRST}.jsonl"));
+    let now = chrono::Local::now();
+    let at = now - chrono::Duration::seconds(10);
+    let timestamp = at.to_rfc3339();
+    let template = rollout(FIRST);
+    let (meta, token) = template.split_once('\n').unwrap();
+    let token = token.replace("2026-01-02T12:01:00Z", &timestamp);
+    let call = json!({"type":"response_item","timestamp":timestamp,"payload":{
+        "type":"function_call","name":"exec_command","namespace":"functions",
+        "call_id":"example","arguments":"{\"cmd\":\"fixture-body\"}"
+    }});
+    let output = json!({"type":"response_item","timestamp":timestamp,"payload":{
+        "type":"function_call_output","call_id":"example","output":"fixture-output"
+    }});
+    let content = format!("{meta}\n{token}{call}\n{output}\n");
+    fs::write(&source, &content).unwrap();
+    let db = root.join("usage.sqlite");
+    let mut store = Store::open(Connection::open(&db).unwrap()).unwrap();
+    store
+        .db
+        .execute_batch(
+            "CREATE TRIGGER block_execution BEFORE INSERT ON execution_observations
+         BEGIN SELECT RAISE(ABORT, 'execution write failed'); END;",
+        )
+        .unwrap();
+    let names = BTreeMap::new();
+    let cutoff = at.date_naive();
+    let failed = Scan::default().round(&mut store, &root, cutoff, &names, 8192);
+    assert!(!failed.complete);
+    assert!(
+        failed.errors[0]
+            .1
+            .to_string()
+            .contains("execution write failed")
+    );
+    assert!(store.checkpoint(&source).unwrap().is_none());
+    let mut committed = 0;
+    Store::read_committed(&mut store.db, i64::MIN, i64::MAX, |_| {
+        committed += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(committed, 0);
+    store
+        .db
+        .execute_batch("DROP TRIGGER block_execution")
+        .unwrap();
+    drop(store);
+
+    let mut store = Store::open(Connection::open(&db).unwrap()).unwrap();
+    let report = Scan::default().round(&mut store, &root, cutoff, &names, 8192);
+    assert!(report.complete, "{:?}", report.errors);
+    assert_eq!(
+        store.checkpoint(&source).unwrap().unwrap().1.offset,
+        content.len() as u64
+    );
+    {
+        let mut query = store
+            .db
+            .prepare(
+                "SELECT call_id, position, end, name FROM execution_observations ORDER BY position",
+            )
+            .unwrap();
+        let mut rows = query.query([]).unwrap();
+        for (expected, name) in [(call, Some("exec_command")), (output, None)] {
+            let row = rows.next().unwrap().unwrap();
+            let id: String = row.get(0).unwrap();
+            let start: usize = row.get(1).unwrap();
+            let end: usize = row.get(2).unwrap();
+            assert_eq!(id, "example");
+            assert_eq!(row.get::<_, Option<String>>(3).unwrap().as_deref(), name);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&content[start..end]).unwrap(),
+                expected
+            );
+        }
+        assert!(rows.next().unwrap().is_none());
+    }
+    let retained: u64 = store
+        .db
+        .query_row("SELECT count(*) FROM token_activity", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(retained, 0);
+    Store::read_committed(&mut store.db, i64::MIN, i64::MAX, |event| {
+        assert_eq!(event.delta.total_tokens, 110);
+        committed += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(committed, 1);
+    use crate::usage_history::structured::token_checkpoint::{DetailQuery, ExecutionQuery};
+    let page_request = ExecutionQuery::parse(&json!({
+        "startAt":at.timestamp_millis(),"endAt":now.timestamp_millis(),"limit":1,
+        "scopeSessionId":FIRST,
+    }))
+    .unwrap();
+    let page = Store::read_execution_page(
+        &mut store.db,
+        &page_request,
+        now.timestamp_millis(),
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(page["status"], "ok", "{page}");
+    assert_eq!(page["summary"]["tool"], 1);
+    assert_eq!(page["items"][0]["id"], "example");
+    assert!(page["nextCursor"].is_null());
+    let detail_request = DetailQuery::parse(&json!({
+        "sessionId":FIRST,"id":"example","revision":page["revision"]
+    }))
+    .unwrap();
+    let read_detail = |store: &mut Store, now| {
+        Store::read_execution_detail(&mut store.db, &root, &detail_request, || now)
+    };
+    let detail = read_detail(&mut store, now.timestamp_millis()).unwrap();
+    assert_eq!(detail["status"], "partial"); // No terminal shell receipt.
+    assert_eq!(detail["detail"]["input"]["cmd"], "fixture-body");
+    assert_eq!(detail["detail"]["output"], json!(["fixture-output"]));
+    assert_eq!(
+        read_detail(&mut store, at.timestamp_millis() + 86_400_000).unwrap()["status"],
+        "not_found"
+    );
+    fs::rename(&source, root.join("original.jsonl")).unwrap();
+    fs::write(&source, &content).unwrap();
+    assert!(read_detail(&mut store, now.timestamp_millis()).is_err());
+    store
+        .expire_execution_locators(
+            at.timestamp_millis()
+                + crate::usage_history::structured::execution_observations::DETAIL_MS,
+            256,
+        )
+        .unwrap();
+    let remaining: (u32, u32) = store
+        .db
+        .query_row(
+            "SELECT count(*), count(end) FROM execution_observations",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(remaining, (1, 0));
+}
+
+#[test]
+fn detail_follows_a_verified_shell_process_and_rejects_reused_process_ids() {
+    use crate::usage_history::structured::token_checkpoint::DetailQuery;
+    let dir = tempfile::tempdir().unwrap();
+    let home = fs::canonicalize(dir.path()).unwrap();
+    let sessions = home.join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let path = sessions.join(format!("rollout-{FIRST}.jsonl"));
+    let now = chrono::Local::now();
+    let start = now - chrono::Duration::seconds(60);
+    let row = |offset: i64, payload| {
+        json!({
+            "type":"response_item","timestamp":(start + chrono::Duration::milliseconds(offset)).to_rfc3339(),"payload":payload,
+        })
+    };
+    let base = rollout(FIRST);
+    let rows = [
+        row(
+            0,
+            json!({"type":"function_call","name":"functions.exec_command","call_id":"open","arguments":"{\"cmd\":\"example\"}"}),
+        ),
+        row(
+            10,
+            json!({"type":"function_call","name":"functions.write_stdin","call_id":"before","arguments":"{\"session_id\":831}"}),
+        ),
+        row(
+            20,
+            json!({"type":"function_call_output","call_id":"before","output":"Process exited with code 0\nOutput:\nnot owned"}),
+        ),
+        row(
+            30,
+            json!({"type":"function_call_output","call_id":"open","output":format!(
+                "Chunk ID: x\nProcess running with session ID 831\nOutput:\n{}", "x".repeat(8192)
+            )}),
+        ),
+        row(
+            50,
+            json!({"type":"function_call","name":"functions.write_stdin","call_id":"other-poll","arguments":{"session_id":557}}),
+        ),
+        row(
+            60,
+            json!({"type":"function_call_output","call_id":"other-poll","output":"Process exited with code 0\nOutput:\nnot associated"}),
+        ),
+        row(
+            500,
+            json!({"type":"function_call","name":"functions.write_stdin","call_id":"finish","arguments":{"session_id":831}}),
+        ),
+        row(
+            700,
+            json!({"type":"function_call_output","call_id":"finish","output":"Process exited with code 0\nOutput:\nfinished"}),
+        ),
+        row(
+            900,
+            json!({"type":"function_call","name":"functions.write_stdin","call_id":"after","arguments":{"session_id":831}}),
+        ),
+        row(
+            990,
+            json!({"type":"function_call_output","call_id":"after","output":"Process exited with code 0\nOutput:\nnot active"}),
+        ),
+    ];
+    let encode = |rows: &[serde_json::Value]| {
+        rows.iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>()
+    };
+    fs::write(&path, format!("{base}{}", encode(&rows))).unwrap();
+    let db = home.join("usage.sqlite");
+    let mut store = Store::open(Connection::open(&db).unwrap()).unwrap();
+    let cutoff = start.date_naive() - chrono::Days::new(2);
+    let mut scan = Scan::default();
+    let report = scan.round(&mut store, &home, cutoff, &BTreeMap::new(), 1 << 20);
+    assert!(report.complete, "{:?}", report.errors);
+    drop(store);
+    let mut store = Store::open(Connection::open(&db).unwrap()).unwrap();
+    let read = |store: &mut Store| {
+        let revision: i64 = store
+            .db
+            .query_row("SELECT revision FROM token_revision", [], |r| r.get(0))
+            .unwrap();
+        let request =
+            DetailQuery::parse(&json!({"sessionId":FIRST,"id":"open","revision":revision}))
+                .unwrap();
+        Store::read_execution_detail(&mut store.db, &home, &request, || now.timestamp_millis())
+            .unwrap()
+    };
+    let detail = read(&mut store);
+    assert_eq!(detail["status"], "ok", "{detail}");
+    assert_eq!(detail["detail"]["durationMs"], 700);
+    let parts = detail["detail"]["output"].as_array().unwrap();
+    assert_eq!(parts.len(), 2);
+    assert!(parts[1].as_str().unwrap().ends_with("finished"));
+    let competing = [
+        row(
+            1000,
+            json!({"type":"function_call","name":"functions.exec_command","call_id":"other","arguments":"{\"cmd\":\"another\"}"}),
+        ),
+        row(
+            1100,
+            json!({"type":"function_call_output","call_id":"other","output":"Process running with session ID 831\nOutput:\nother"}),
+        ),
+    ];
+    fs::write(
+        &path,
+        format!("{base}{}{}", encode(&rows), encode(&competing)),
+    )
+    .unwrap();
+    let report = scan.round(&mut store, &home, cutoff, &BTreeMap::new(), 1 << 20);
+    assert!(report.complete, "{:?}", report.errors);
+    let ambiguous = read(&mut store);
+    assert_eq!(ambiguous["status"], "partial");
+    assert!(ambiguous["detail"]["durationMs"].is_null());
+    assert_eq!(ambiguous["detail"]["output"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn activity_checkpoint_restarts_polls_and_publishes_only_committed_receipts() {
     use crate::usage_history::Query;
     use std::io::Write;
@@ -480,7 +1244,7 @@ fn activity_checkpoint_restarts_polls_and_publishes_only_committed_receipts() {
     );
     fs::write(&source, format!("{head}{skill}\n{running}\n{poll}\n")).unwrap();
     let names = BTreeMap::from([("custom".into(), "Example Relay".into())]);
-    let request = json!({"includeActivity":true});
+    let request = json!({"includeActivity":true,"includeFingerprints":false});
     let query = Query::parse(&request, cutoff).unwrap();
     let mut store = Store::open(Connection::open(&db).unwrap()).unwrap();
     assert!(

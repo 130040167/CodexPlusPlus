@@ -1,6 +1,10 @@
 use super::{
     ingest::SourceReader,
-    store::{Coverage, Store},
+    store::{
+        Coverage, Store,
+        executions::CompactionCursor,
+        replicas::{Comparison, Probe},
+    },
 };
 use crate::usage_history::structured::{discover, index_budget::Budget};
 use chrono::NaiveDate;
@@ -8,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 const SOURCES_PER_ROUND: usize = 64;
-const RECLAIM_BATCH: u32 = 256;
+pub(super) const RECLAIM_BATCH: u32 = 256;
 
 #[derive(Default)]
 pub(super) struct Scan {
@@ -16,6 +20,7 @@ pub(super) struct Scan {
     missing: VecDeque<(PathBuf, i64)>,
     more_missing: bool,
     active: Option<SourceReader>,
+    comparing: Option<Box<Comparison>>,
     deferred: Option<SourceReader>,
     rescan: bool,
     issues: usize,
@@ -23,6 +28,7 @@ pub(super) struct Scan {
     maintenance_day: Option<NaiveDate>,
     details_pending: bool,
     activity_pending: bool,
+    execution_cursor: Option<CompactionCursor>,
     observation_cursor: Option<(i64, (i64, i64))>,
 }
 
@@ -39,18 +45,24 @@ impl Scan {
         &self.scoped_count_gaps
     }
 
-    fn maintain(&mut self, store: &mut Store, cutoff: NaiveDate) -> anyhow::Result<()> {
+    pub(super) fn maintain(&mut self, store: &mut Store, cutoff: NaiveDate) -> anyhow::Result<()> {
+        let now = chrono::Local::now().timestamp_millis();
+        store.expire_execution_locators(now, RECLAIM_BATCH)?;
+        store.compact_execution_metadata(now, RECLAIM_BATCH)?;
         if self.maintenance_day.is_none_or(|day| day < cutoff) {
             store.advance_retention(cutoff)?;
             self.maintenance_day = Some(cutoff);
             self.details_pending = true;
             self.activity_pending = true;
+            self.execution_cursor = None;
             self.observation_cursor = Some((0, (0, 0)));
         }
         if self.details_pending {
             self.details_pending =
                 store.reclaim_expired_details(RECLAIM_BATCH)? == RECLAIM_BATCH as usize;
         }
+        self.activity_pending |=
+            store.compact_executions(cutoff, &mut self.execution_cursor, RECLAIM_BATCH)? != 0;
         if self.activity_pending {
             self.activity_pending =
                 store.reclaim_expired_activity(cutoff, RECLAIM_BATCH)? == RECLAIM_BATCH as usize;
@@ -73,7 +85,11 @@ impl Scan {
     ) -> Report {
         let maintenance_error = self.maintain(store, cutoff).err();
         let mut errors = Vec::new();
-        if self.active.is_none() && self.remaining.is_empty() && self.missing.is_empty() {
+        if self.active.is_none()
+            && self.comparing.is_none()
+            && self.remaining.is_empty()
+            && self.missing.is_empty()
+        {
             self.issues = 0;
             self.scoped_count_gaps.clear();
             self.more_missing = false;
@@ -102,12 +118,29 @@ impl Scan {
         } else {
             None
         };
-        for _ in 0..SOURCES_PER_ROUND {
+        let mut compared = false;
+        let mut verify_later = Vec::new();
+        'sources: for _ in 0..SOURCES_PER_ROUND {
+            if budget.read_left == 0 || budget.source_left == 0 {
+                break;
+            }
             let mut reader = match self.active.take().or_else(|| retry.take()) {
                 Some(source) => source,
                 None => {
-                    let Some(path) = self.remaining.pop_front() else {
+                    let comparing = if compared {
+                        None
+                    } else {
+                        self.comparing.take()
+                    };
+                    let path = comparing
+                        .as_ref()
+                        .map(|check| check.path().to_owned())
+                        .or_else(|| self.remaining.pop_front());
+                    let Some(path) = path else {
                         // 先摄取完整的新来源，再处理旧路径，避免归档移动产生用量空窗。
+                        if self.comparing.is_some() || !verify_later.is_empty() {
+                            break;
+                        }
                         if self.issues != 0 || self.deferred.is_some() {
                             if !self.missing.is_empty() || self.more_missing {
                                 self.scoped_count_gaps.clear();
@@ -140,6 +173,79 @@ impl Scan {
                         }
                         continue;
                     };
+                    if self
+                        .comparing
+                        .as_ref()
+                        .is_some_and(|probe| probe.holds(&path))
+                    {
+                        verify_later.push(path);
+                        continue;
+                    }
+                    let probe = if let Some(comparing) = comparing {
+                        compared = true;
+                        comparing.step(store, &mut budget)
+                    } else {
+                        for i in 0..self.missing.len() {
+                            let (missing, revision) = &self.missing[i];
+                            match store.relocate_source(missing, *revision, &path) {
+                                Ok(true) => {
+                                    self.missing.remove(i);
+                                    break;
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    self.issues += 1;
+                                    errors.push((path, error));
+                                    continue 'sources;
+                                }
+                            }
+                        }
+                        store.probe_copy(&path).and_then(|probe| match probe {
+                            Probe::Compare(comparison) if !compared => {
+                                compared = true;
+                                comparison.step(store, &mut budget)
+                            }
+                            other => Ok(other),
+                        })
+                    };
+                    match probe {
+                        Ok(Probe::Compare(comparing)) => {
+                            if self.comparing.is_none() {
+                                self.comparing = Some(comparing);
+                            } else {
+                                verify_later.push(path);
+                            }
+                            continue;
+                        }
+                        Ok(Probe::Covered { moved_from }) => {
+                            if let Some(old) = moved_from {
+                                self.missing.retain(|(source, _)| *source != old);
+                            }
+                            continue;
+                        }
+                        Ok(Probe::WaitForOwner(owner)) => {
+                            if let Some(i) = self
+                                .remaining
+                                .iter()
+                                .position(|candidate| *candidate == owner)
+                            {
+                                self.remaining.remove(i);
+                                self.remaining.push_front(path);
+                                self.remaining.push_front(owner);
+                                continue;
+                            }
+                        }
+                        Ok(Probe::ReadSource) => {}
+                        Err(error) => {
+                            self.issues += 1;
+                            errors.push((path, error));
+                            continue;
+                        }
+                    }
+                    if budget.read_left == 0 || budget.source_left == 0 {
+                        self.remaining.push_front(path);
+                        break;
+                    }
                     match SourceReader::restore(store, &path) {
                         Ok(reader) => reader,
                         Err(error) => {
@@ -182,14 +288,13 @@ impl Scan {
                     }
                 }
             }
-            if budget.read_left == 0 || budget.source_left == 0 {
-                break;
-            }
         }
+        self.remaining.extend(verify_later);
         let pending_sources = self.remaining.len()
             + self.missing.len()
             + usize::from(self.more_missing)
             + usize::from(self.active.is_some())
+            + usize::from(self.comparing.is_some())
             + usize::from(self.deferred.is_some());
         let mut issues = self.issues;
         if let Err(error) = store.record_coverage(Coverage {

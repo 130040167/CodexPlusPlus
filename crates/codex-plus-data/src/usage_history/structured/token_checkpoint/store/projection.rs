@@ -5,17 +5,20 @@ use crate::usage_history::structured::token_checkpoint::{
     historical::{EvidenceOverlay, Historical},
 };
 use crate::usage_history::structured::{
-    ClassificationEvidence, DELAYED_REQUEST_MATCH_WINDOW_MS, FileState, Index, MAX_ACTIVITY,
-    MAX_FILES, Query, RequestSessionAliases, Snapshot, UsageEvent, ordered_scope_ids, segments,
-    terminal_receipts, unknown_model, unknown_provider, usage_provider,
+    AttributionScope, ClassificationEvidence, DELAYED_REQUEST_MATCH_WINDOW_MS, FileState, Index,
+    MAX_ACTIVITY, MAX_FILES, Query, RequestSessionAliases, Snapshot, UsageEvent, native_endpoints,
+    ordered_scope_ids, segments, terminal_receipts, unknown_model, unknown_provider,
+    usage_provider,
 };
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Local, NaiveDate, NaiveTime, TimeZone};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 pub(super) fn links(path: &Path, state: &FileState) -> BTreeSet<String> {
@@ -151,7 +154,34 @@ pub(in super::super) struct DayGroup {
     pub(in super::super) totals: DayTotals,
 }
 
-type Groups = BTreeMap<(String, String, String, u8), DayTotals>;
+type GroupKey = (String, String, String, u8);
+type Groups = BTreeMap<GroupKey, DayTotals>;
+
+fn committed_day_groups(db: &Connection, session: &str, day: &str) -> Result<Groups> {
+    let mut read = db.prepare_cached(
+        "SELECT event_id, payload FROM token_resolved
+         WHERE session_id = (SELECT id FROM token_sessions WHERE session = ?1) AND day = ?2",
+    )?;
+    let mut rows = read.query(params![session, day])?;
+    let mut groups = Groups::new();
+    while let Some(row) = rows.next()? {
+        let stored: Observation = serde_json::from_slice(row.get_ref(1)?.as_blob()?)?;
+        let event =
+            stored.into_event(row.get_ref(0)?.as_blob()?.try_into()?, session.to_owned())?;
+        groups
+            .entry(group_key(&event))
+            .or_default()
+            .merge(DayTotals::from_event(&event));
+    }
+    Ok(groups)
+}
+
+#[derive(Default)]
+struct DayFingerprints {
+    summary_only: bool,
+    accounting: Sha256,
+    membership: BTreeMap<GroupKey, Sha256>,
+}
 
 pub(in crate::usage_history::structured) type ArchiveAnswer =
     (ArchiveKey, Result<Recovered, String>);
@@ -315,20 +345,46 @@ fn retract_append_proofs(
     Ok(days)
 }
 
+pub(super) fn linear_source(state: &FileState) -> bool {
+    !state.session.is_empty()
+        && !state.continuation
+        && state.history_base.is_none()
+        && state.inherited_contexts.is_empty()
+        && !state.identity_conflict
+        && !state.invalid_counts
+        && !state.rollout_out_of_order
+        && state.issues == 0
+}
+
+pub(super) fn linear_observation(
+    session: &str,
+    event: &UsageEvent,
+    previous: Option<&UsageEvent>,
+) -> bool {
+    event.session == session
+        && !event.inherited
+        && event.legacy_identity.is_none()
+        && !event.provider.trim().eq_ignore_ascii_case("openai")
+        && !event.context_conflicts.any()
+        && !event.count_uncertain
+        && !event.count_incomplete
+        && !event.count_pending
+        && previous.is_none_or(|before| {
+            // 同一时间戳可能是副本；相同累计输入输出可能是历史缓存修正。
+            DateTime::parse_from_rfc3339(&event.timestamp).unwrap()
+                > DateTime::parse_from_rfc3339(&before.timestamp).unwrap()
+                && event.total.is_monotonic_after(before.total)
+                && (event.total.input_tokens, event.total.output_tokens)
+                    != (before.total.input_tokens, before.total.output_tokens)
+        })
+}
+
 fn linear_batch<'a>(
     state: &'a FileState,
     cutoff: NaiveDate,
     mut previous: Option<&'a UsageEvent>,
 ) -> bool {
-    if state.session.is_empty()
-        || state.continuation
-        || state.history_base.is_some()
-        || !state.inherited_contexts.is_empty()
-        || state.identity_conflict
-        || state.invalid_counts
-        || state.rollout_out_of_order
-        || state.issues != 0
-    {
+    if !linear_source(state) {
         return false;
     }
     for event in state
@@ -336,24 +392,7 @@ fn linear_batch<'a>(
         .iter()
         .filter(|event| event.terminal_response.is_none())
     {
-        if event.session != state.session
-            || event.date < cutoff
-            || event.inherited
-            || event.legacy_identity.is_some()
-            || event.provider.trim().eq_ignore_ascii_case("openai")
-            || event.context_conflicts.any()
-            || event.count_uncertain
-            || event.count_incomplete
-            || event.count_pending
-            || previous.is_some_and(|before| {
-                // 同一时间戳可能是副本；相同累计输入输出可能是历史缓存修正。
-                DateTime::parse_from_rfc3339(&event.timestamp).unwrap()
-                    <= DateTime::parse_from_rfc3339(&before.timestamp).unwrap()
-                    || !event.total.is_monotonic_after(before.total)
-                    || (event.total.input_tokens, event.total.output_tokens)
-                        == (before.total.input_tokens, before.total.output_tokens)
-            })
-        {
+        if event.date < cutoff || !linear_observation(&state.session, event, previous) {
             return false;
         }
         previous = Some(event);
@@ -948,25 +987,11 @@ impl Store {
             }
         }
         let mut days = BTreeMap::new();
-        if !rebuilt.is_empty() {
-            let mut read = tx.prepare_cached(
-                "SELECT event_id, payload FROM token_resolved
-                 WHERE day = ?2 AND session_id = (SELECT id FROM token_sessions WHERE session = ?1)",
-            )?;
-            for day in rebuilt {
-                let mut groups = Groups::new();
-                let mut rows = read.query(params![session, day.to_string()])?;
-                while let Some(row) = rows.next()? {
-                    let stored: Observation = serde_json::from_slice(row.get_ref(1)?.as_blob()?)?;
-                    let event = stored
-                        .into_event(row.get_ref(0)?.as_blob()?.try_into()?, session.to_owned())?;
-                    groups
-                        .entry(group_key(&event))
-                        .or_default()
-                        .merge(DayTotals::from_event(&event));
-                }
-                days.insert((session, day), groups);
-            }
+        for day in rebuilt {
+            days.insert(
+                (session, day),
+                committed_day_groups(&tx, session, &day.to_string())?,
+            );
         }
         let mut prior_day = tx.prepare_cached(
             "SELECT d.groups FROM token_days d JOIN token_sessions s ON s.id = d.session_id
@@ -1095,24 +1120,64 @@ impl Store {
         Ok(next)
     }
 
-    pub(in super::super) fn recent_sessions(&self, since: i64) -> Result<Vec<String>> {
+    pub(in super::super) fn recent_sessions(&self, since: i64) -> Result<Vec<(String, i64)>> {
         let mut statement = self.db.prepare_cached(
-            "SELECT s.session FROM token_resolved r JOIN token_sessions s ON s.id = r.session_id
+            "SELECT s.session, max(r.timestamp_ms) AS latest
+             FROM token_resolved r JOIN token_sessions s ON s.id = r.session_id
              WHERE r.timestamp_ms >= ?1 AND r.day >= (SELECT precise_from FROM token_revision)
-             GROUP BY r.session_id ORDER BY max(r.timestamp_ms) DESC, s.session",
+             GROUP BY r.session_id ORDER BY latest DESC, s.session",
         )?;
-        let sessions = statement.query_map([since], |row| row.get(0))?;
+        let sessions = statement.query_map([since], |row| Ok((row.get(0)?, row.get(1)?)))?;
         Ok(sessions.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub(in super::super) fn classification_before(
+        &self,
+        session: &str,
+        before: i64,
+    ) -> Result<Option<i64>> {
+        Ok(self
+            .db
+            .prepare_cached(
+                "SELECT timestamp_ms FROM token_resolved
+             WHERE session_id = (SELECT id FROM token_sessions WHERE session = ?1)
+             AND timestamp_ms < ?2 AND day >= (SELECT precise_from FROM token_revision)
+             ORDER BY timestamp_ms DESC LIMIT 1",
+            )?
+            .query_row(params![session, before], |row| row.get(0))
+            .optional()?)
     }
 
     /// Re-evaluate a canonical session from its committed native identities, never from
     /// the supplier identities written in the last classification pass.
+    #[cfg(test)]
     pub(in super::super) fn reclassify_session(
         &mut self,
         session: &str,
         input_limit: usize,
         scoped_count_gaps: &BTreeSet<PathBuf>,
         classify: impl FnOnce(&mut [UsageEvent], &BTreeMap<String, String>) -> Result<()>,
+    ) -> Result<Option<i64>> {
+        self.reclassify_window(
+            session,
+            None,
+            input_limit,
+            scoped_count_gaps,
+            |events, aliases, _| classify(events, aliases),
+        )
+    }
+
+    pub(in super::super) fn reclassify_window(
+        &mut self,
+        session: &str,
+        window: Option<Range<i64>>,
+        input_limit: usize,
+        scoped_count_gaps: &BTreeSet<PathBuf>,
+        classify: impl FnOnce(
+            &mut [UsageEvent],
+            &BTreeMap<String, String>,
+            &AttributionScope,
+        ) -> Result<()>,
     ) -> Result<Option<i64>> {
         let read = self.db.transaction()?;
         let base = revision(&read)?;
@@ -1150,22 +1215,66 @@ impl Store {
         {
             return Ok(None);
         }
+        let (targets, bounds, gateway_blocked, native_blocked) = if let Some(window) = window {
+            let cutoff: String =
+                read.query_row("SELECT precise_from FROM token_revision", [], |row| {
+                    row.get(0)
+                })?;
+            let first = cutoff
+                .parse::<NaiveDate>()?
+                .and_time(NaiveTime::MIN)
+                .and_local_timezone(Local)
+                .earliest()
+                .context("invalid classification retention date")?
+                .timestamp_millis();
+            let left = native_endpoints::WINDOW_MS.max(2 * DELAYED_REQUEST_MATCH_WINDOW_MS);
+            let right = 2 * DELAYED_REQUEST_MATCH_WINDOW_MS;
+            // A clipped competition window cannot certify a supplier or withdraw one.
+            let start = window.start.max(first.saturating_add(left));
+            if start >= window.end {
+                return Ok(None);
+            }
+            let mut gaps = read.prepare_cached(
+                "SELECT 1 FROM token_resolved
+                 WHERE session_id = (SELECT id FROM token_sessions WHERE session = ?1)
+                 AND day >= ?2
+                 AND (json_extract(CAST(payload AS TEXT), '$.count_incomplete') = 1
+                      OR json_extract(CAST(payload AS TEXT), '$.delta.k') = 0)
+                 AND (?3 = 0 OR json_extract(CAST(payload AS TEXT), '$.count_incomplete') = 1)
+                 LIMIT 1",
+            )?;
+            let gateway_blocked = gaps.exists(params![session, cutoff, 1])?;
+            let native_blocked = gateway_blocked || gaps.exists(params![session, cutoff, 0])?;
+            (
+                start..window.end,
+                start.saturating_sub(left)..window.end.saturating_add(right),
+                gateway_blocked,
+                native_blocked,
+            )
+        } else {
+            (i64::MIN..i64::MAX, i64::MIN..i64::MAX, false, false)
+        };
         let mut previous = Vec::new();
         let mut candidates = Vec::new();
+        let mut target_rows = 0..0;
         {
             let mut budget = input_limit;
             let mut loaded = read.prepare_cached(
-                "SELECT event_id, payload FROM token_resolved
+                "SELECT event_id, payload, timestamp_ms FROM token_resolved
                  WHERE session_id = (SELECT id FROM token_sessions WHERE session = ?1)
                  AND day >= (SELECT precise_from FROM token_revision)
+                 AND timestamp_ms >= ?2 AND timestamp_ms < ?3
                  ORDER BY timestamp_ms, event_id",
             )?;
-            let mut rows = loaded.query([session])?;
+            let mut rows = loaded.query(params![session, bounds.start, bounds.end])?;
             while let Some(row) = rows.next()? {
+                let at = row.get::<_, i64>(2)?;
+                target_rows.start += usize::from(at < targets.start);
+                target_rows.end += usize::from(at < targets.end);
                 let bytes = row.get_ref(1)?.as_blob()?;
                 budget = budget
                     .checked_sub(bytes.len())
-                    .context("Token classification exceeds session input budget")?;
+                    .context("Token classification window exceeds input budget")?;
                 let stored: Observation = serde_json::from_slice(bytes)?;
                 let origin = stored.classification_origin.clone();
                 let receipt_origin = stored.receipt_count_origin;
@@ -1180,12 +1289,23 @@ impl Store {
             }
         }
         read.commit()?;
-        classify(&mut candidates, &scope.aliases)?;
+        if target_rows.is_empty() {
+            return Ok(None);
+        }
+        let attribution = AttributionScope {
+            targets: target_rows.clone(),
+            gateway_blocked,
+            native_blocked,
+        };
+        classify(&mut candidates, &scope.aliases, &attribution)?;
         let mut changed = Vec::new();
-        let mut changed_days = BTreeMap::<NaiveDate, Groups>::new();
-        for ((event, origin, receipt_origin), candidate) in previous.iter_mut().zip(candidates) {
+        let mut changed_days = BTreeSet::new();
+        for ((event, origin, receipt_origin), candidate) in previous[target_rows.clone()]
+            .iter_mut()
+            .zip(&candidates[target_rows])
+        {
             let prior = EventClassification::of(event);
-            let next = EventClassification::of(&candidate);
+            let next = EventClassification::of(candidate);
             if prior != next {
                 let native = origin.take().unwrap_or(prior);
                 next.apply(event);
@@ -1193,19 +1313,11 @@ impl Store {
                 stored.classification_origin = (native != next).then_some(native);
                 stored.receipt_count_origin = *receipt_origin;
                 changed.push((event.id, serde_json::to_vec(&stored)?));
-                changed_days.entry(event.date).or_default();
+                changed_days.insert(event.date);
             }
         }
         if changed.is_empty() {
             return Ok(None);
-        }
-        for (event, _, _) in &previous {
-            if let Some(groups) = changed_days.get_mut(&event.date) {
-                groups
-                    .entry(group_key(event))
-                    .or_default()
-                    .merge(DayTotals::from_event(event));
-            }
         }
         let tx = self
             .db
@@ -1224,8 +1336,10 @@ impl Store {
                 "UPDATE token_days SET groups = ?3 WHERE day = ?2
                  AND session_id = (SELECT id FROM token_sessions WHERE session = ?1)",
             )?;
-            for (date, groups) in changed_days {
-                update_days.execute(params![session, date.to_string(), encode_groups(groups)?])?;
+            for date in changed_days {
+                let date = date.to_string();
+                let groups = committed_day_groups(&tx, session, &date)?;
+                update_days.execute(params![session, date, encode_groups(groups)?])?;
             }
         }
         let next = tx.query_row(
@@ -1298,8 +1412,11 @@ impl Store {
         let latest = cutoff.and_time(NaiveTime::MIN).and_utc().timestamp_millis() + 86_400_000;
         Ok(self.db.execute(
             "DELETE FROM token_activity WHERE (source_id, session_id, call_id) IN
-             (SELECT source_id, session_id, call_id FROM token_activity
-              WHERE timestamp_ms < ?1 AND day < ?2 ORDER BY timestamp_ms LIMIT ?3)",
+             (SELECT a.source_id, a.session_id, a.call_id FROM token_activity a
+              WHERE a.timestamp_ms < ?1 AND a.day < ?2 AND NOT EXISTS (
+                  SELECT 1 FROM execution_observations e
+                  WHERE e.session_id = a.session_id AND e.call_id = a.call_id AND e.is_output = 0
+              ) ORDER BY a.timestamp_ms LIMIT ?3)",
             params![latest, cutoff.to_string(), batch],
         )?)
     }
@@ -1325,21 +1442,20 @@ impl Store {
         batch: u32,
     ) -> Result<bool> {
         let (after_id, after_row) = *cursor;
-        let id = if after_row == (0, 0) {
-            self.db
-                .query_row(
-                    "SELECT id FROM token_sources WHERE id > ?1 ORDER BY id LIMIT 1",
-                    [after_id],
-                    |row| row.get(0),
-                )
-                .optional()?
-        } else {
-            Some(after_id)
-        };
+        let id = self
+            .db
+            .query_row(
+                "SELECT id FROM token_sources WHERE id > ?1 OR (id = ?1 AND ?2)
+                 ORDER BY id LIMIT 1",
+                params![after_id, after_row != (0, 0)],
+                |row| row.get(0),
+            )
+            .optional()?;
         let Some(id) = id else {
             return Ok(false);
         };
-        let (next, _) = self.reclaim_observations(id, after_row, batch)?;
+        let from = if id == after_id { after_row } else { (0, 0) };
+        let (next, _) = self.reclaim_observations(id, from, batch)?;
         *cursor = (id, next.unwrap_or((0, 0)));
         Ok(true)
     }
@@ -1430,7 +1546,7 @@ impl Store {
     ) -> Result<i64> {
         let read = db.transaction()?;
         let current = revision(&read)?;
-        Self::visit_committed(&read, start_ms, end_ms, None, visit)?;
+        Self::visit_committed(&read, start_ms, end_ms, None, false, visit)?;
         read.commit()?;
         Ok(current)
     }
@@ -1440,9 +1556,15 @@ impl Store {
         start_ms: i64,
         end_ms: i64,
         query: Option<&Query>,
+        event_id_order: bool,
         mut visit: impl FnMut(UsageEvent) -> Result<()>,
     ) -> Result<()> {
-        let mut statement = read.prepare_cached(
+        let order = if event_id_order {
+            "r.event_id"
+        } else {
+            "r.timestamp_ms, r.event_id"
+        };
+        let mut statement = read.prepare_cached(&format!(
             "SELECT r.event_id, s.session, r.payload FROM token_resolved r
                  JOIN token_sessions s ON s.id = r.session_id
                  WHERE r.timestamp_ms >= ?1 AND r.timestamp_ms < ?2
@@ -1451,8 +1573,8 @@ impl Store {
                  AND (?4 IS NULL OR r.day <= ?4)
                  AND (?5 IS NULL OR s.session = ?5)
                  AND (?6 IS NULL OR json_extract(CAST(r.payload AS TEXT), '$.turn') = ?6)
-                 ORDER BY r.timestamp_ms, r.event_id",
-        )?;
+                 ORDER BY {order}",
+        ))?;
         let from = query.and_then(|q| q.from).map(|day| day.to_string());
         let to = query.and_then(|q| q.to).map(|day| day.to_string());
         let session = query.and_then(|q| q.session_id.as_deref());
@@ -1607,6 +1729,7 @@ impl Store {
             &read,
             (start_ms, end_ms),
             None,
+            false,
             visit_detail,
             Some(visit_archived_day),
         )?;
@@ -1618,6 +1741,7 @@ impl Store {
         read: &Connection,
         (start_ms, end_ms): (i64, i64),
         query: Option<&Query>,
+        event_id_order: bool,
         visit_detail: impl FnMut(UsageEvent) -> Result<()>,
         visit_archived_day: Option<impl FnMut(String, NaiveDate, Vec<DayGroup>) -> Result<()>>,
     ) -> Result<bool> {
@@ -1646,7 +1770,7 @@ impl Store {
             }
             needs_source_recovery = start_day < cutoff;
         }
-        Self::visit_committed(read, start_ms, end_ms, query, visit_detail)?;
+        Self::visit_committed(read, start_ms, end_ms, query, event_id_order, visit_detail)?;
         Ok(needs_source_recovery)
     }
 
@@ -1657,7 +1781,8 @@ impl Store {
         sessions: Option<&HashSet<String>>,
     ) -> Result<Selection> {
         let read = db.transaction()?;
-        let [selection] = Self::select(&read, query, bounds, [sessions], false, None, None)?;
+        let [selection] =
+            Self::select(&read, query, bounds, [sessions], (false, false), None, None)?;
         read.commit()?;
         Ok(selection)
     }
@@ -1676,7 +1801,7 @@ impl Store {
             query,
             bounds,
             [None, Some(&sessions)],
-            false,
+            (false, false),
             None,
             None,
         )?;
@@ -1719,6 +1844,7 @@ impl Store {
         let bounds = request["startAt"].as_i64().zip(request["endAt"].as_i64());
         let activity_page = request["activityPage"].as_u64().unwrap_or(1).clamp(1, 24) as usize;
         let include_trend = request["includeTrend"] == true;
+        let include_fingerprints = request["includeFingerprints"] != false;
         let (current_revision, cutoff): (i64, String) = read.query_row(
             "SELECT revision, precise_from FROM token_revision",
             [],
@@ -1798,13 +1924,13 @@ impl Store {
         }
         let scope = Self::scope(&read, provider_names)?;
         let scoped = requested.map(|session| scope.scope_members(session));
-        let (all, scoped_usage) = if let Some((_, sessions)) = &scoped {
+        let (mut all, mut scoped_usage) = if let Some((_, sessions)) = &scoped {
             let [all, usage] = Self::select(
                 &read,
                 query,
                 bounds,
                 [None, Some(sessions)],
-                include_trend,
+                (include_trend, include_fingerprints),
                 recovered,
                 historical,
             )?;
@@ -1815,7 +1941,7 @@ impl Store {
                 query,
                 bounds,
                 [None],
-                include_trend,
+                (include_trend, include_fingerprints),
                 recovered,
                 historical,
             )?;
@@ -1830,6 +1956,27 @@ impl Store {
                 row.get(0)
             })?;
         let coverage = all.range_coverage(query, bounds, complete)?;
+        let archive_evidence = recovered.and_then(|(_, _, evidence)| evidence);
+        let retained_evidence = historical.map(|evidence| &evidence.overlay);
+        let mut names = provider_names.clone();
+        for (id, label) in [retained_evidence, archive_evidence]
+            .into_iter()
+            .flatten()
+            .flat_map(|evidence| &evidence.provider_names)
+        {
+            let name = names.entry(id.clone()).or_default();
+            if name.trim().is_empty() {
+                name.clone_from(label);
+            }
+        }
+        for selection in std::iter::once(&mut all).chain(scoped_usage.iter_mut()) {
+            for day in &mut selection.days {
+                for row in day["breakdowns"].as_array_mut().unwrap() {
+                    let name = names.get(row["provider"].as_str().unwrap());
+                    row["providerName"] = json!(name);
+                }
+            }
+        }
         let mut result = json!({
             "status": if complete {"ok"} else {"partial"},
             "complete":complete,
@@ -1845,33 +1992,21 @@ impl Store {
             "sessionIds":scope.sessions,
             "sessionAliases":scope.aliases,
             "sessionInfo":scope.session_info,
-            "providerNames":provider_names,
+            "providerNames":names,
             "scan":{
                 "ready":all.coverage.is_some(),
                 "pendingFiles":all.coverage.map(|c| c.pending_sources),
-                "malformedRecords":all.coverage.map(|c| c.issues),
+                "sourceIssues":all.coverage.map(|c| c.issues),
                 "storageBlocked":all.coverage.is_some_and(|c| c.maintenance_blocked),
                 "uncertainCountEvents":all.unresolved,
+                "retentionDays":codex_plus_core::settings::default_usage_history_precise_days(),
+                "preciseFrom":(!cutoff.is_empty()).then_some(&cutoff),
             }
         });
         if include_trend {
             result["trend"] = json!(all.trend);
         }
-        let archive_evidence = recovered.and_then(|(_, _, evidence)| evidence);
-        let retained_evidence = historical.map(|evidence| &evidence.overlay);
         if retained_evidence.is_some() || archive_evidence.is_some() {
-            let mut names = provider_names.clone();
-            for (id, label) in [retained_evidence, archive_evidence]
-                .into_iter()
-                .flatten()
-                .flat_map(|evidence| &evidence.provider_names)
-            {
-                let name = names.entry(id.clone()).or_default();
-                if name.trim().is_empty() {
-                    name.clone_from(label);
-                }
-            }
-            result["providerNames"] = json!(names);
             result["classificationRevision"] = json!([
                 retained_evidence.map(|evidence| evidence.updated_at),
                 archive_evidence.map(|evidence| evidence.updated_at)
@@ -2002,7 +2137,10 @@ impl Store {
         Ok(())
     }
 
-    fn scope(read: &Connection, provider_names: &BTreeMap<String, String>) -> Result<Snapshot> {
+    pub(super) fn scope(
+        read: &Connection,
+        provider_names: &BTreeMap<String, String>,
+    ) -> Result<Snapshot> {
         #[derive(Deserialize)]
         struct ScopeCheckpoint {
             session: String,
@@ -2067,7 +2205,7 @@ impl Store {
         query: &Query,
         bounds: Option<(i64, i64)>,
         scopes: [Option<&HashSet<String>>; N],
-        include_trend: bool,
+        (include_trend, include_fingerprints): (bool, bool),
         recovered: Option<(&ArchiveKey, &Recovered, Option<&EvidenceOverlay>)>,
         historical: Option<&Historical>,
     ) -> Result<[Selection; N]> {
@@ -2119,6 +2257,9 @@ impl Store {
         let usage: RefCell<[_; N]> = RefCell::new(std::array::from_fn(|_| {
             BTreeMap::<NaiveDate, Groups>::new()
         }));
+        let fingerprints: RefCell<[_; N]> = RefCell::new(std::array::from_fn(|_| {
+            BTreeMap::<NaiveDate, DayFingerprints>::new()
+        }));
         let trend_bounds = bounds
             .filter(|_| include_trend)
             .map(|(start, end)| {
@@ -2138,27 +2279,27 @@ impl Store {
         let trend: RefCell<[_; N]> = RefCell::new(std::array::from_fn(|_| {
             trend_bounds.map_or_else(Vec::new, |(_, _, _, count)| vec![Groups::new(); count])
         }));
-        let accumulate =
-            |session: &str, day: NaiveDate, key: (String, String, String, u8), totals| {
-                for (groups, scope) in usage.borrow_mut().iter_mut().zip(scopes) {
-                    if scope.is_none_or(|scope| scope.contains(session)) {
-                        groups
-                            .entry(day)
-                            .or_default()
-                            .entry(key.clone())
-                            .or_default()
-                            .merge(totals);
-                    }
+        let accumulate = |session: &str, day: NaiveDate, key: &GroupKey, totals| {
+            for (groups, scope) in usage.borrow_mut().iter_mut().zip(scopes) {
+                if scope.is_none_or(|scope| scope.contains(session)) {
+                    groups
+                        .entry(day)
+                        .or_default()
+                        .entry(key.clone())
+                        .or_default()
+                        .merge(totals);
                 }
-            };
+            }
+        };
         let accumulate_summary = |session: &str, day: NaiveDate, groups: &[DayGroup]| {
+            let mut contributed = false;
             for group in groups {
                 let model = Some(group.model.as_str()).filter(|model| !model.is_empty());
                 if query.accepts_fields(session, "", model, Some(day)) {
                     accumulate(
                         session,
                         day,
-                        (
+                        &(
                             group.model.clone(),
                             group.provider.clone(),
                             group.role.clone(),
@@ -2166,6 +2307,17 @@ impl Store {
                         ),
                         group.totals,
                     );
+                    contributed |= group.totals.records != 0;
+                }
+            }
+            contributed
+        };
+        let mark_summary = |session: &str, day: NaiveDate| {
+            if include_fingerprints {
+                for (days, scope) in fingerprints.borrow_mut().iter_mut().zip(scopes) {
+                    if scope.is_none_or(|scope| scope.contains(session)) {
+                        days.entry(day).or_default().summary_only = true;
+                    }
                 }
             }
         };
@@ -2181,7 +2333,9 @@ impl Store {
             let groups = historical
                 .and_then(|evidence| evidence.days.get(&day)?.get(&session))
                 .unwrap_or(&groups);
-            accumulate_summary(&session, day, groups);
+            if accumulate_summary(&session, day, groups) {
+                mark_summary(&session, day);
+            }
             Ok(())
         };
         let read_event = |event: &UsageEvent, include_totals: bool, classification_agrees: bool| {
@@ -2208,7 +2362,20 @@ impl Store {
                     }
                 }
                 if include_totals {
-                    accumulate(&event.session, event.date, key, totals);
+                    accumulate(&event.session, event.date, &key, totals);
+                }
+                if include_fingerprints && classification_agrees && totals.records != 0 {
+                    for (days, scope) in fingerprints.borrow_mut().iter_mut().zip(scopes) {
+                        if scope.is_none_or(|scope| scope.contains(&event.session)) {
+                            let day = days.entry(event.date).or_default();
+                            if !day.summary_only {
+                                event.update_membership_digest(&mut day.accounting);
+                                event.update_membership_digest(
+                                    day.membership.entry(key.clone()).or_default(),
+                                );
+                            }
+                        }
+                    }
                 }
             }
             Ok(())
@@ -2220,6 +2387,7 @@ impl Store {
             read_event(&event, true, true)
         };
         let whole_days = if !include_trend
+            && !include_fingerprints
             && query.turn_id.is_none()
             && let Some((start, end)) = bounds
         {
@@ -2247,16 +2415,38 @@ impl Store {
                 read,
                 (start, end),
                 Some(query),
+                include_fingerprints,
                 read_retained,
                 // 按日摘要没有回合信息，不能拿它回答某一回合的用量。
                 query.turn_id.is_none().then_some(read_summary),
             )?
-        } else if query.turn_id.is_some() {
-            Self::visit_committed(read, i64::MIN, i64::MAX, Some(query), read_retained)?;
-            !precise_from.is_empty()
-                && query
-                    .from
-                    .is_none_or(|from| from.to_string().as_str() < precise_from.as_str())
+        } else if query.turn_id.is_some() || include_fingerprints {
+            Self::visit_committed(
+                read,
+                i64::MIN,
+                i64::MAX,
+                Some(query),
+                include_fingerprints,
+                read_retained,
+            )?;
+            if precise_from.is_empty() {
+                false
+            } else {
+                let cutoff: NaiveDate = precise_from.parse()?;
+                if query.turn_id.is_none() {
+                    let end = query
+                        .to
+                        .and_then(|day| day.succ_opt())
+                        .map_or(cutoff, |end| end.min(cutoff));
+                    Self::visit_summary(read, query.from, Some(end), read_summary)?;
+                    query
+                        .from
+                        .zip(query.to)
+                        .is_some_and(|(from, _)| from < cutoff)
+                } else {
+                    query.from.is_none_or(|from| from < cutoff)
+                }
+            }
         } else {
             Self::visit_summary(
                 read,
@@ -2340,8 +2530,10 @@ impl Store {
                     preserved.insert((session.clone(), date));
                 }
                 if !counts_agree {
+                    mark_summary(&session, date);
                     blocked.insert((session, date));
                 } else if !groups_agree {
+                    mark_summary(&session, date);
                     if query.model.is_some() || !query.search.is_empty() {
                         blocked.insert((session, date));
                     } else {
@@ -2350,7 +2542,12 @@ impl Store {
                 }
                 Ok(())
             })?;
-            for event in &archive.events {
+            // Archive replay returns original observations, not hashes of day totals.
+            let mut archive_events: Vec<_> = archive.events.iter().collect();
+            if include_fingerprints {
+                archive_events.sort_unstable_by_key(|event| event.id);
+            }
+            for event in archive_events {
                 let at = DateTime::parse_from_rfc3339(&event.timestamp)?.timestamp_millis();
                 let session_day = (event.session.clone(), event.date);
                 if at >= start && at < end && !blocked.contains(&session_day) {
@@ -2372,6 +2569,7 @@ impl Store {
         }
         let mut scopes = scopes.into_iter();
         let mut trends = trend.into_inner().into_iter();
+        let mut proofs = fingerprints.into_inner().into_iter();
         Ok(usage.into_inner().map(|groups| {
             let scope = scopes.next().unwrap();
             let buckets = trends.next().unwrap();
@@ -2388,13 +2586,14 @@ impl Store {
                 &precise_from,
                 needs_source_recovery,
                 groups,
+                include_fingerprints.then(|| proofs.next().unwrap()),
             );
             selection.recovered_archive = recovered.is_some();
             selection.archive_classification_gap = affects(&classification_gaps);
             if let Some((start, end, interval, _)) = trend_bounds.filter(|_| !needs_source_recovery) {
                 let buckets: Vec<_> = buckets.into_iter().enumerate().map(|(i, groups)| {
                     let at = start + i as i64 * interval;
-                    let (mut row, _) = Self::format_day(groups);
+                    let (mut row, _) = Self::format_day(groups, None);
                     row["startAt"] = json!(at);
                     row["endAt"] = json!(at.saturating_add(interval).min(end));
                     row
@@ -2428,6 +2627,7 @@ impl Store {
         precise_from: &str,
         needs_source_recovery: bool,
         usage: BTreeMap<NaiveDate, Groups>,
+        mut fingerprints: Option<BTreeMap<NaiveDate, DayFingerprints>>,
     ) -> Selection {
         let mut unresolved = 0;
         let mut unclassified = 0;
@@ -2447,7 +2647,18 @@ impl Store {
                 })
                 .map(|(_, group)| group.records)
                 .sum::<u64>();
-            let (mut day, uncertain) = Self::format_day(groups);
+            let proof = fingerprints
+                .as_mut()
+                .and_then(|days| days.remove(&date))
+                .filter(|proof| !proof.summary_only && !proof.membership.is_empty());
+            let (mut day, uncertain) = Self::format_day(groups, proof);
+            if fingerprints.is_some() {
+                day["fingerprintCoverage"] = json!(if day.get("accountingFingerprint").is_some() {
+                    "events"
+                } else {
+                    "unavailable"
+                });
+            }
             unresolved += uncertain;
             day["date"] = json!(date.to_string());
             days.push(day);
@@ -2468,12 +2679,13 @@ impl Store {
         }
     }
 
-    fn format_day(groups: Groups) -> (Value, u64) {
+    fn format_day(groups: Groups, mut fingerprints: Option<DayFingerprints>) -> (Value, u64) {
         let mut unresolved = 0;
         let mut totals = DayTotals::default();
         let mut models = BTreeMap::<String, DayTotals>::new();
         let mut breakdowns = Vec::new();
-        for ((model, provider, role, conflicts), group) in groups {
+        for (key, group) in groups {
+            let (model, provider, role, conflicts) = &key;
             unresolved += group.unresolved;
             if group.records == 0 {
                 continue;
@@ -2485,12 +2697,21 @@ impl Store {
             if conflicts & 2 != 0 {
                 row["providerConflict"] = json!(true);
             }
+            if let Some(digest) = fingerprints
+                .as_mut()
+                .and_then(|proof| proof.membership.remove(&key))
+            {
+                row["membershipFingerprint"] = json!(format!("{:x}", digest.finalize()));
+            }
             group.evidence.write_to(&mut row);
             breakdowns.push(row);
-            models.entry(model).or_default().merge(group);
+            models.entry(key.0).or_default().merge(group);
             totals.merge(group);
         }
         let mut day = totals.value();
+        if let Some(proof) = fingerprints {
+            day["accountingFingerprint"] = json!(format!("{:x}", proof.accounting.finalize()));
+        }
         day["models"] = json!(
             models
                 .into_iter()

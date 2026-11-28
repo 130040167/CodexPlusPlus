@@ -5,7 +5,7 @@ use crate::usage_history::structured::{FileState, UsageEvent, index_budget::Budg
 use chrono::{DateTime, Local, NaiveDate, TimeZone};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use std::{fs, io::Write};
 
@@ -632,6 +632,128 @@ fn late_receipt_repairs_a_sealed_counter_and_competition_revokes_only_its_cache(
             );
         }
     }
+}
+
+#[test]
+fn compatibility_fingerprints_bind_the_selected_events_and_allow_a_summary_only_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().canonicalize().unwrap();
+    let first_path = home.join("first.jsonl");
+    let second_path = home.join("second.jsonl");
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let mut store = Store::open(Connection::open_in_memory().unwrap()).unwrap();
+    for (path, session, shift) in [(&first_path, PARENT, 0), (&second_path, CHILD, 4)] {
+        let mut metadata = header(session, 0);
+        if session == CHILD {
+            metadata["payload"]["model_provider"] = json!("supplier-b");
+        }
+        let state = parse(
+            path,
+            &[
+                metadata,
+                count(1, 1 + shift, 1, true),
+                count(2, 2 + shift, 2, true),
+            ],
+            cutoff,
+        );
+        let staged = store
+            .prepare(new_source(path, &state), cutoff, BTreeMap::new(), 8192)
+            .unwrap();
+        store.publish(staged).unwrap();
+    }
+    let events = read(&mut store.db, i64::MIN, i64::MAX).1;
+    let day = events[0].date;
+    let end = day.succ_opt().unwrap();
+    let midnight = |day: NaiveDate| {
+        Local
+            .from_local_datetime(&day.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis()
+    };
+    let old = crate::usage_history::structured::Snapshot {
+        count_cache_available: true,
+        provider_names: BTreeMap::from([(events[0].provider.clone(), "Renamed relay".into())]),
+        events,
+        ..Default::default()
+    };
+    let names = &old.provider_names;
+    let from = old.events[0]
+        .timestamp
+        .parse::<DateTime<chrono::FixedOffset>>()
+        .unwrap()
+        .timestamp_millis();
+    for (request, bounds) in [
+        (json!({"from":day.to_string(),"to":day.to_string()}), None),
+        (
+            json!({"startAt":midnight(day),"endAt":midnight(end)}),
+            Some((midnight(day), midnight(end))),
+        ),
+        (
+            json!({"startAt":from+1,"endAt":from+5000,"includeTrend":true}),
+            Some((from + 1, from + 5000)),
+        ),
+    ] {
+        let query = Query::parse(&request, cutoff).unwrap();
+        let projected =
+            Store::read_response(&mut store.db, &query, &request, Some(PARENT), names).unwrap();
+        assert_eq!(projected["scan"]["retentionDays"], 60);
+        assert_eq!(projected["scan"]["preciseFrom"], cutoff.to_string());
+        assert!(projected["scan"].get("bytesRead").is_none());
+        assert!(projected["scan"].get("indexedFiles").is_none());
+        let selected = HashSet::from([PARENT.to_owned()]);
+        for (actual, expected) in [
+            (&projected["days"][0], old.usage_days(&query, bounds, None)),
+            (
+                &projected["scopedUsage"]["days"][0],
+                old.usage_days(&query, bounds, Some(&selected)),
+            ),
+        ] {
+            assert_eq!(actual["fingerprintCoverage"], "events");
+            assert_eq!(
+                actual["accountingFingerprint"],
+                expected[0]["accountingFingerprint"]
+            );
+            let breakdowns = |day: &Value| {
+                day["breakdowns"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| {
+                        (
+                            row["provider"].as_str().unwrap().to_owned(),
+                            (
+                                row["membershipFingerprint"].clone(),
+                                row["providerName"].clone(),
+                            ),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            };
+            assert_eq!(breakdowns(actual), breakdowns(&expected[0]));
+            assert_eq!(actual["recordCount"], expected[0]["recordCount"]);
+        }
+        let mut fast = request;
+        fast["includeFingerprints"] = json!(false);
+        let result =
+            Store::read_response(&mut store.db, &query, &fast, Some(PARENT), names).unwrap();
+        assert!(result["days"][0].get("fingerprintCoverage").is_none());
+        assert_eq!(result["days"][0]["usage"], projected["days"][0]["usage"]);
+    }
+
+    store.advance_retention(end).unwrap().unwrap();
+    let request = json!({"from":day.to_string(),"to":day.to_string()});
+    let query = Query::parse(&request, cutoff).unwrap();
+    let after = Store::read_response(&mut store.db, &query, &request, None, names).unwrap();
+    assert_eq!(after["scan"]["preciseFrom"], end.to_string());
+    assert_eq!(after["days"][0]["usage"]["totalTokens"], 440);
+    assert_eq!(after["days"][0]["fingerprintCoverage"], "unavailable");
+    assert!(after["days"][0].get("accountingFingerprint").is_none());
+    assert!(
+        after["days"][0]["breakdowns"][0]
+            .get("membershipFingerprint")
+            .is_none()
+    );
 }
 
 #[test]
@@ -2236,6 +2358,156 @@ fn late_gateway_evidence_reclassifies_committed_rows_and_days_atomically() {
     let after = store.checkpoint(&source).unwrap().unwrap();
     assert_eq!(after.0, checkpoint.0);
     assert_eq!(after.1.offset, checkpoint.1.offset);
+}
+
+#[test]
+fn bounded_classification_preserves_day_totals_and_counts_competitors_across_the_boundary() {
+    use super::scan::Scan;
+    use crate::usage_history::structured::{RequestEvidence, RequestEvidenceCache, provider_cache};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    fs::create_dir(root.join("sessions")).unwrap();
+    let source = root.join("sessions/rollout-81.jsonl");
+    let day = Local::now().date_naive();
+    let cutoff = day.pred_opt().unwrap();
+    let point = day
+        .and_hms_opt(12, 0, 0)
+        .unwrap()
+        .and_local_timezone(Local)
+        .single()
+        .unwrap();
+    let at = |seconds| point + chrono::TimeDelta::seconds(seconds);
+    let mut head = header(PARENT, 0);
+    head["timestamp"] = json!(at(-4000).to_rfc3339());
+    head["payload"]["model_provider"] = json!("custom");
+    let context = json!({"type":"turn_context","ordinal":1,"timestamp":at(-4000).to_rfc3339(),
+        "payload":{"turn_id":"turn","model":"gpt-fixture"}});
+    let counter = |index: usize, seconds, input| {
+        let mut row = count(index + 1, 0, input, true);
+        row["timestamp"] = json!(at(seconds).to_rfc3339());
+        row
+    };
+    let mut rows = vec![head, context];
+    rows.extend((1..=80).map(|i| counter(i, -3800 + i as i64, i as u64)));
+    rows.extend([counter(81, -230, 81), counter(82, 0, 82)]);
+    parse(&source, &rows, cutoff);
+    let mut store = Store::open(Connection::open_in_memory().unwrap()).unwrap();
+    let names = BTreeMap::new();
+    let gaps = BTreeSet::new();
+    assert!(
+        Scan::default()
+            .round(&mut store, &root, cutoff, &names, 1 << 20)
+            .complete
+    );
+    const LIMIT: usize = 8192;
+    let rejected = store
+        .reclassify_session(PARENT, LIMIT, &gaps, |_, _| {
+            panic!("the full session should exceed the fixture budget")
+        })
+        .unwrap_err();
+    assert!(rejected.to_string().contains("exceeds input budget"));
+
+    let mut proof_db = provider_cache::ProviderCache::default();
+    proof_db.open(&root.join("proofs"), cutoff).unwrap();
+    let request = |id, relay, seconds| -> RequestEvidence {
+        let time = at(seconds).timestamp_millis();
+        serde_json::from_value(json!({"id":id,"threadId":PARENT,"model":"gpt-fixture",
+            "upstreamModel":"gpt-fixture","relayId":relay,"success":true,"state":"success",
+            "statusCode":200,"timestampMs":time,"startedAtMs":time - 100,"attempts":1,
+            "autoRetries":0,"usage":{"inputTokens":100,"cachedTokens":20,"outputTokens":10}
+        }))
+        .unwrap()
+    };
+    let mut evidence = RequestEvidenceCache::default();
+    let inspect = |store: &mut Store| {
+        read(
+            &mut store.db,
+            at(-240).timestamp_millis(),
+            at(1).timestamp_millis(),
+        )
+        .1
+    };
+    let native = inspect(&mut store);
+    assert_eq!(native.len(), 2);
+    assert_ne!(native[1].provider, "recent-relay");
+    let classify = |store: &mut Store, evidence: &mut RequestEvidenceCache, seconds| {
+        let start = at(seconds).timestamp_millis();
+        store
+            .reclassify_window(
+                PARENT,
+                Some(start..start + 1),
+                LIMIT,
+                &gaps,
+                |events, aliases, scope| {
+                    assert_eq!(scope.targets.len(), 1);
+                    assert_eq!(events.len(), 2);
+                    evidence.attribute_with_cache_scoped(
+                        events,
+                        &mut BTreeMap::new(),
+                        aliases,
+                        &proof_db,
+                        Some(scope),
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap()
+    };
+    let neighbor = request("neighbor", "neighbor-relay", -230);
+    evidence.records = vec![neighbor.clone()];
+    assert!(classify(&mut store, &mut evidence, -230).is_some());
+    assert_eq!(inspect(&mut store)[0].provider, "neighbor-relay");
+    evidence.records = vec![
+        neighbor.clone(),
+        request("other-neighbor", "another-relay", -230),
+        request("recent", "recent-relay", 0),
+    ];
+    assert!(classify(&mut store, &mut evidence, 0).is_some());
+    let assigned = inspect(&mut store);
+    assert_eq!(assigned[0].provider, "neighbor-relay");
+    assert_eq!(assigned[1].provider, "recent-relay");
+    assert!(!evidence.verified[&native[0].id].rejected);
+
+    let mut disputed = RequestEvidenceCache {
+        records: vec![request("ambiguous", "ambiguous-relay", -115)],
+        ..Default::default()
+    };
+    assert!(classify(&mut store, &mut disputed, 0).is_some());
+    let result = inspect(&mut store);
+    assert_eq!(result[0].provider, "neighbor-relay");
+    assert_eq!(result[1].provider, native[1].provider);
+    assert!(disputed.verified.is_empty());
+    assert_eq!(
+        result
+            .iter()
+            .map(|e| (e.id, e.delta.total_tokens))
+            .collect::<Vec<_>>(),
+        native
+            .iter()
+            .map(|e| (e.id, e.delta.total_tokens))
+            .collect::<Vec<_>>()
+    );
+    let request = json!({"from":day.to_string(),"to":day.to_string(),"includeFingerprints":false});
+    let query = Query::parse(&request, day).unwrap();
+    let summary = Store::read_response(&mut store.db, &query, &request, None, &names).unwrap();
+    assert_eq!(summary["days"][0]["recordCount"], 82);
+    assert_eq!(summary["days"][0]["usage"]["totalTokens"], 82 * 110);
+    let oldest = cutoff
+        .and_hms_opt(0, 5, 0)
+        .unwrap()
+        .and_local_timezone(Local)
+        .earliest()
+        .unwrap()
+        .timestamp_millis();
+    assert!(
+        store
+            .reclassify_window(PARENT, Some(oldest..oldest + 1), LIMIT, &gaps, |_, _, _| {
+                panic!("cannot accept a clipped retention boundary")
+            })
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
