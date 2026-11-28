@@ -41,7 +41,8 @@ struct AttributionScope<'a> {
     targets: Range<usize>,
     gateway_blocked: bool,
     native_blocked: bool,
-    matches_terminal: Option<&'a dyn Fn(&UsageEvent, &str) -> anyhow::Result<bool>>,
+    paired_only: bool,
+    resolve_terminal: Option<&'a dyn Fn(&UsageEvent) -> anyhow::Result<Option<Box<str>>>>,
 }
 
 fn observed_file_identity(path: &Path, metadata: &fs::Metadata) -> io::Result<(u64, u64)> {
@@ -721,7 +722,7 @@ impl RequestEvidenceCache {
             !e.context_conflicts.any()
                 && !e.count_uncertain
                 && !e.count_incomplete
-                && (e.delta.cached_known || e.native_response_id.is_some())
+                && (e.delta.cached_known || e.native_response_id.is_some() || scope.is_some())
         }) {
             let Some(session) = aliases.resolve(&event.session) else {
                 continue;
@@ -775,7 +776,7 @@ impl RequestEvidenceCache {
             let mut complete = true;
             let mut floor = 0;
             for source in sources {
-                match cache.captured_proxy(&source, since, until) {
+                match cache.captured_proxy_context(&source, since, until, scope.is_some()) {
                     Ok(batch) => {
                         complete &= batch.complete;
                         floor = floor.max(batch.floor);
@@ -1201,6 +1202,7 @@ impl RequestEvidenceCache {
                     && event
                         .last
                         .is_some_and(|last| last.cached_known && last.same_counts(event.delta));
+                let mut later_request = false;
                 if let Some(records) = uncertain_requests.get(&key.session) {
                     let start = records.partition_point(|record| {
                         record.timestamp_ms < at.saturating_sub(DELAYED_REQUEST_MATCH_WINDOW_MS)
@@ -1208,7 +1210,6 @@ impl RequestEvidenceCache {
                     let end = records.partition_point(|record| {
                         record.timestamp_ms <= at.saturating_add(DELAYED_REQUEST_MATCH_WINDOW_MS)
                     });
-                    let mut later_request = false;
                     for other in records[start..end]
                         .iter()
                         .filter(|r| r.could_fit_counts(key.input, key.output, key.cached))
@@ -1235,34 +1236,32 @@ impl RequestEvidenceCache {
                         }
                         later_request = true;
                     }
-                    if later_request {
-                        // 原生终态与网关最终响应配对后，才用同一网关的先后顺序排除后发请求。
-                        let final_id = request.final_response_id.as_deref()?;
-                        if event.inherited
-                            || event.session != request.thread_id
-                            || request.final_response_evidence.as_deref()
-                                != Some("final-response-v1")
-                            || !request.valid_request_counts()
-                            || !live_receipts::within_receipt_window(
-                                request,
-                                *at,
-                                REQUEST_MATCH_WINDOW_MS,
-                            )
-                            || !event.last.is_some_and(|last| {
-                                last.cached_known && last.same_counts(event.delta)
-                            })
-                        {
+                }
+                if later_request
+                    || scope.is_some_and(|scope| scope.paired_only)
+                        && !self.verified.contains_key(&event.id)
+                {
+                    // 未扫完的来源或后发请求不能仅靠等量计数排除。
+                    let final_id = request.final_response_id.as_deref()?;
+                    if event.inherited
+                        || event.session != request.thread_id
+                        || request.final_response_evidence.as_deref() != Some("final-response-v1")
+                        || !request.valid_request_counts()
+                        || !live_receipts::within_receipt_window(request, *at, REQUEST_MATCH_WINDOW_MS)
+                        || !event.last.is_some_and(|last| {
+                            last.cached_known && last.same_counts(event.delta)
+                        })
+                    {
+                        return None;
+                    }
+                    let resolve = scope?.resolve_terminal?;
+                    match resolve(event) {
+                        Ok(terminal) if terminal.as_deref() == Some(final_id) => {}
+                        Ok(_) => return None,
+                        Err(error) => {
+                            self.captured_id_check_error =
+                                Some(format!("validate native response identity: {error:#}"));
                             return None;
-                        }
-                        let matches = scope?.matches_terminal?;
-                        match matches(event, final_id) {
-                            Ok(true) => {}
-                            Ok(false) => return None,
-                            Err(error) => {
-                                self.captured_id_check_error =
-                                    Some(format!("validate native response identity: {error:#}"));
-                                return None;
-                            }
                         }
                     }
                 }
@@ -1299,6 +1298,38 @@ impl RequestEvidenceCache {
                     && request.attempts == Some(1)
                     && request.auto_retries == Some(0))
                 .then_some((i, true))
+            }).or_else(|| {
+                // 等量请求只会破坏计数唯一性，不能撤回仍能独立复证的原响应。
+                if uncertain_competition || event.inherited {
+                    return None;
+                }
+                let saved = self.verified.get(&event.id).filter(|saved| !saved.rejected)?;
+                let response = saved.request.final_response_id.as_deref()?;
+                let (key, at) = evidence.as_ref()?;
+                let entries = request_index.get(&key.counts_key())?;
+                let i = entries.iter().find_map(|&(_, i)| (requests[i].id == saved.request.id).then_some(i))?;
+                let request = &requests[i];
+                if request.thread_id != event.session
+                    || request.final_response_evidence.as_deref() != Some("final-response-v1")
+                    || request.final_response_id.as_deref() != Some(response)
+                    || !request.valid_request_counts()
+                    || !live_receipts::within_receipt_window(request, *at, REQUEST_MATCH_WINDOW_MS)
+                    || !event.last.is_some_and(|last| last.cached_known && last.same_counts(event.delta))
+                    || requests.iter().chain(&self.records).any(|other| {
+                        other.id != request.id && other.final_response_id.as_deref() == Some(response)
+                    })
+                {
+                    return None;
+                }
+                match scope?.resolve_terminal?(event) {
+                    Ok(terminal) if terminal.as_deref() == Some(response) => Some((i, false)),
+                    Ok(_) => None,
+                    Err(error) => {
+                        self.captured_id_check_error =
+                            Some(format!("validate native response identity: {error:#}"));
+                        None
+                    }
+                }
             });
             if let Some(saved) = self.verified.get_mut(&event.id) {
                 let mut saved_key = saved.key.clone();
@@ -1461,6 +1492,146 @@ impl RequestEvidenceCache {
             "retainedEvents":retained,"conflictedEvents":self.verified.values().filter(|saved| saved.rejected).count(),
             "logReads":self.reads,"logBytesRead":self.bytes_read})
     }
+
+    fn infer_scoped(
+        &self,
+        events: &mut [UsageEvent],
+        names: &mut BTreeMap<String, String>,
+        aliases: &BTreeMap<String, String>,
+        scope: &AttributionScope,
+    ) -> anyhow::Result<()> {
+        #[derive(Default)]
+        struct SessionRequests<'a> {
+            all: Vec<&'a RequestEvidence>,
+            by_model: HashMap<&'a str, Vec<&'a RequestEvidence>>,
+            by_terminal: HashMap<&'a str, Vec<&'a RequestEvidence>>,
+        }
+        let aliases = RequestSessionAliases::new(aliases);
+        let mut sessions = HashMap::<_, SessionRequests>::new();
+        for request in &self.records {
+            if let Some(session) = aliases.resolve(&request.thread_id) {
+                if request.valid_capture() {
+                    sessions.entry(session).or_default().all.push(request);
+                } else if self.captured_rejected.contains(&request.id) {
+                    sessions.entry(session).or_default();
+                }
+            }
+        }
+        for requests in sessions.values_mut() {
+            requests.all.sort_unstable_by_key(|request| request.timestamp_ms);
+            for &request in &requests.all {
+                let model = request_base_model(&request.model);
+                let upstream = request_base_model(&request.upstream_model);
+                requests.by_model.entry(model).or_default().push(request);
+                if upstream != model {
+                    requests.by_model.entry(upstream).or_default().push(request);
+                }
+                if let Some(terminal) = request.final_response_id.as_deref() {
+                    requests.by_terminal.entry(terminal).or_default().push(request);
+                }
+            }
+        }
+        for event in &mut events[scope.targets.clone()] {
+            if !unknown_provider(&event.provider)
+                || event.context_conflicts.any()
+                || event.count_uncertain || event.count_incomplete || event.count_pending
+                || self.collision_families.contains(&event.original_id)
+                || self.verified.get(&event.id).is_some_and(|proof| proof.rejected)
+            {
+                continue;
+            }
+            let Some(session) = aliases.resolve(&event.session) else { continue };
+            let Some(requests) = sessions.get(&session) else {
+                // 请求证据缺失时，已知供应商前缀只作推断，不能证明实际故障转移路由。
+                if let Some((provider, model)) = event.model.split_once('/')
+                    && !unknown_provider(provider)
+                    && !provider.eq_ignore_ascii_case("group")
+                    && !unknown_model(model)
+                    && names.contains_key(provider)
+                {
+                    event.provider = provider.to_owned();
+                    event.provider_source = Some("model-namespace".to_owned());
+                }
+                continue;
+            };
+            let at = DateTime::parse_from_rfc3339(&event.timestamp)?.timestamp_millis();
+            let mut best = (0, std::cmp::Reverse(u64::MAX));
+            let mut supplier: Option<&RequestEvidence> = None;
+            let mut conflict = false;
+            let model = request_base_model(&event.model);
+            // 回执只与这条原生记录有关，不随同会话的请求候选重复查询。
+            let terminal = if !event.inherited
+                && !requests.by_terminal.is_empty()
+                && let Some(resolve) = scope.resolve_terminal
+            {
+                resolve(event)?
+            } else {
+                None
+            };
+            let paired = terminal.as_deref().and_then(|id| requests.by_terminal.get(id));
+            let models = if unknown_model(model) {
+                &[][..]
+            } else {
+                requests.by_model.get(model).map_or(&[][..], Vec::as_slice)
+            };
+            let window = DELAYED_REQUEST_MATCH_WINDOW_MS;
+            let left = models.partition_point(|request| request.timestamp_ms < at.saturating_sub(window));
+            let right = models.partition_point(|request| request.timestamp_ms <= at.saturating_add(window));
+            let near_exact = models[left..right].iter().copied().filter(|request| {
+                request.usage.is_some_and(|usage| {
+                    usage.input_tokens == Some(event.delta.input_tokens)
+                        && usage.output_tokens == Some(event.delta.output_tokens)
+                        && (!event.delta.cached_known
+                            || request.known_cached().is_none_or(|cached| cached == event.delta.cached_input_tokens))
+                })
+            });
+            // 保留每档的全部并列候选，冲突处理不因缩小搜索范围而改变。
+            let candidates = paired.into_iter().flatten().map(|&request| (4, request))
+                .chain(near_exact.map(|request| (3, request)))
+                .chain(nearest_inference_requests(models, at).iter().map(|&request| (2, request)))
+                .chain(nearest_inference_requests(&requests.all, at).iter().map(|&request| (1, request)));
+            for (rank, request) in candidates {
+                // 直接证据之间不能靠时间选一家；推断优先离当前记录最近的同会话请求。
+                let distance = if rank == 4 { 0 } else { request.timestamp_ms.abs_diff(at) };
+                let rank = (rank, std::cmp::Reverse(distance));
+                let rejected = self.captured_rejected.contains(&request.id);
+                if rank > best {
+                    best = rank;
+                    supplier = Some(request);
+                    conflict = rejected;
+                } else if rank == best {
+                    conflict |= rejected || supplier.is_some_and(|prior| prior.relay_id != request.relay_id);
+                }
+            }
+            if let Some(request) = supplier.filter(|_| !conflict) {
+                event.provider.clone_from(&request.relay_id);
+                event.provider_source = Some(if best.0 == 4 {
+                    "request-log-recovered-supplier-only"
+                } else {
+                    "session-context-inferred"
+                }.to_owned());
+                names.entry(request.relay_id.clone())
+                    .or_insert_with(|| request.provider_name().to_owned());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn nearest_inference_requests<'a, 'b>(
+    requests: &'a [&'b RequestEvidence],
+    at: i64,
+) -> &'a [&'b RequestEvidence] {
+    let split = requests.partition_point(|request| request.timestamp_ms < at);
+    let (before, after) = requests.split_at(split);
+    let Some(distance) = before.last().into_iter().chain(after.first())
+        .map(|request| request.timestamp_ms.abs_diff(at)).min()
+    else {
+        return requests;
+    };
+    let start = before.partition_point(|request| request.timestamp_ms.abs_diff(at) > distance);
+    let end = after.partition_point(|request| request.timestamp_ms.abs_diff(at) <= distance);
+    &requests[start..split + end]
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
@@ -1702,10 +1873,14 @@ enum ClassificationEvidence {
 
 impl ClassificationEvidence {
     fn of(event: &UsageEvent) -> Self {
-        if event.context_conflicts.any() {
+        Self::from_source(event.provider_source.as_deref(), event.context_conflicts.any())
+    }
+
+    fn from_source(source: Option<&str>, conflicting: bool) -> Self {
+        if conflicting {
             return Self::None;
         }
-        match event.provider_source.as_deref() {
+        match source {
             Some("upstream-exact-bidirectional") => Self::UpstreamExact,
             Some("request-log-exact") => Self::RequestExact,
             Some("upstream-counter-bidirectional-supplier-only") => Self::SupplierOnly,
@@ -1767,6 +1942,13 @@ struct LegacyProviderEvidence {
 }
 
 impl LegacyProviderEvidence {
+    fn is_direct(&self) -> bool {
+        matches!(
+            self.source.as_str(),
+            "upstream-exact-bidirectional" | "request-log-recovered-supplier-only"
+        )
+    }
+
     fn matches(&self, event: &UsageEvent, legacy: Option<&LegacyIdentity>) -> bool {
         self.session == legacy.map_or(event.session.as_str(), |id| id.session.as_str())
             && self.role == legacy.map_or(event.role.as_str(), |id| id.role.as_str())
@@ -1947,7 +2129,7 @@ struct Cache {
     storage: PathBuf,
     runtime: Option<token_checkpoint::Runtime>,
     snapshot: Arc<token_checkpoint::ReadState>,
-    refresh_reader: Option<token_checkpoint::HistoryReader>,
+    refresh_readers: Option<token_checkpoint::RefreshReaders>,
     active: bool,
     refreshed: Option<Instant>,
     touched: Instant,
@@ -1962,11 +2144,18 @@ struct ArchiveSlot {
         token_checkpoint::ArchiveKey,
         std::thread::JoinHandle<token_checkpoint::ArchiveAnswer>,
     )>,
-    result: Option<(Instant, Arc<token_checkpoint::ArchiveAnswer>)>,
+    results: Vec<(Instant, Arc<token_checkpoint::ArchiveAnswer>)>,
 }
 
 impl ArchiveSlot {
-    fn result(&mut self) -> Option<Arc<token_checkpoint::ArchiveAnswer>> {
+    fn publish(&mut self, answer: token_checkpoint::ArchiveAnswer) {
+        self.results.retain(|(_, prior)| {
+            prior.0 != answer.0 && !(answer.1.is_ok() && answer.0.contains(&prior.0))
+        });
+        self.results.push((Instant::now(), Arc::new(answer)));
+    }
+
+    fn results(&mut self) -> Vec<Arc<token_checkpoint::ArchiveAnswer>> {
         if self
             .worker
             .as_ref()
@@ -1976,14 +2165,13 @@ impl ArchiveSlot {
             let answer = worker
                 .join()
                 .unwrap_or_else(|_| (key, Err("archive worker panicked".into())));
-            self.result = Some((Instant::now(), Arc::new(answer)));
+            self.publish(answer);
         }
-        if self.result.as_ref().is_some_and(|(at, answer)| {
-            at.elapsed() >= Duration::from_secs(if answer.1.is_ok() { 300 } else { 15 })
-        }) {
-            self.result = None;
-        }
-        self.result.as_ref().map(|(_, answer)| Arc::clone(answer))
+        // 成功结果在读取时校验来源和证据；仅给失败回读保留重试间隔。
+        self.results.retain(|(at, answer)| {
+            answer.1.is_ok() || at.elapsed() < Duration::from_secs(15)
+        });
+        self.results.iter().map(|(_, answer)| Arc::clone(answer)).collect()
     }
 }
 
@@ -2220,11 +2408,14 @@ fn query_with_settings(home: &Path, options: &Query, request: &Value, settings: 
     let snapshot = state.snapshot.clone();
     let storage = state.storage.clone();
     let processing = state.active;
-    let archived = state.archive.result();
-    let reader = state.refresh_reader.clone().map_or_else(
-        || token_checkpoint::ReadState::open_reader(&storage),
-        Ok,
-    );
+    let archived = state.archive.results();
+    let reader = match &state.refresh_readers {
+        Some(readers) => Ok(readers.reader(request["includeTrend"] == true
+            || request["includeFingerprints"] != false || options.turn_id.is_some())),
+        None if processing => Err(anyhow::anyhow!("usage refresh has no published snapshot")),
+        None => token_checkpoint::ReadState::open_reader(&storage),
+    };
+    let cold = processing && state.refreshed.is_none() && state.refresh_readers.is_none();
     drop(state);
     let (mut response, schedule) = snapshot.read_with_archive(
         &storage,
@@ -2233,37 +2424,42 @@ fn query_with_settings(home: &Path, options: &Query, request: &Value, settings: 
         request,
         scope_session.as_deref(),
         processing,
-        archived.as_deref(),
+        &archived.iter().map(Arc::as_ref).collect::<Vec<_>>(),
     );
+    if cold
+        && let Some(response_from_disk) =
+            snapshot.read_published_days(&storage, &settings, options, request, scope_session.as_deref())
+    {
+        response = response_from_disk;
+    }
     super::legacy_summary::attach(&mut response, &storage, options, request);
     if let Some(key) = schedule
         && let Ok(mut state) = cache.lock()
         && !state.archive.cancelled.load(Ordering::Relaxed)
         && state.archive.worker.is_none()
-        && !state.archive.result.as_ref().is_some_and(|(_, ready)| {
+        && !state.archive.results.iter().any(|(_, ready)| {
             ready.0 == key
-                && archived
-                    .as_ref()
-                    .is_none_or(|seen| !Arc::ptr_eq(seen, ready))
+                && !archived.iter().any(|seen| Arc::ptr_eq(seen, ready))
         })
     {
         let job = key.clone();
         let home = home.to_owned();
         let settings = state.settings_path.clone();
         let cancelled = state.archive.cancelled.clone();
+        let previous = archived.iter().find(|answer| answer.0 == key).cloned();
         // 同一缓存仅允许一个只读回读；不阻塞前台查询或近期索引写者。
         match std::thread::Builder::new()
             .name("rollout-history-archive".into())
             .spawn(move || {
                 token_checkpoint::recover_archive(
-                    job, &home, &storage, &settings, &snapshot, &cancelled,
+                    job, &home, &storage, &settings, &snapshot, &cancelled, previous.as_deref(),
                 )
             }) {
             Ok(worker) => state.archive.worker = Some((key, worker)),
             Err(error) => {
                 let message = error.to_string();
                 response["archiveRecovery"] = json!({"status":"partial","message":message});
-                state.archive.result = Some((Instant::now(), Arc::new((key, Err(message)))));
+                state.archive.publish((key, Err(message)));
             }
         }
     }
@@ -2287,7 +2483,7 @@ fn touch_history(home: &Path, settings: &Path) -> Result<Arc<Mutex<Cache>>, Valu
             runtime: Some(runtime),
             storage: storage_dir,
             snapshot,
-            refresh_reader: None,
+            refresh_readers: None,
             active: false,
             refreshed: None,
             touched: Instant::now(),
@@ -2323,15 +2519,15 @@ fn touch_history(home: &Path, settings: &Path) -> Result<Arc<Mutex<Cache>>, Valu
             .refreshed
             .is_none_or(|at| at.elapsed() >= REFRESH_INTERVAL)
     {
-        let reader = state.runtime.as_ref().expect("idle worker owns runtime")
-            .pin_refresh_reader(&state.snapshot)
+        let readers = state.runtime.as_ref().expect("idle worker owns runtime")
+            .pin_refresh_readers()
             .map_err(|error| json!({"status":"unavailable","complete":false,"message":error.to_string()}))?;
         let mut runtime = state
             .runtime
             .take()
             .expect("idle usage worker owns its runtime");
         state.active = true;
-        state.refresh_reader = reader;
+        state.refresh_readers = readers;
         let shared = cache.clone();
         let home = home.to_owned();
         match std::thread::Builder::new()
@@ -2345,14 +2541,14 @@ fn touch_history(home: &Path, settings: &Path) -> Result<Arc<Mutex<Cache>>, Valu
                         state.snapshot = Arc::new(snapshot);
                     }
                     state.runtime = Some(runtime);
-                    state.refresh_reader = None;
+                    state.refresh_readers = None;
                     state.active = false;
                     state.refreshed = Some(Instant::now());
                 }
             }) {
             Ok(worker) => state.worker = Some(worker),
             Err(error) => {
-                state.refresh_reader = None;
+                state.refresh_readers = None;
                 state.active = false;
                 state.refreshed = Some(Instant::now());
                 state.runtime = Some(token_checkpoint::Runtime::new(
@@ -2381,8 +2577,11 @@ fn log_file(path: &Path) -> bool {
 }
 
 fn discover(home: &Path, cold_start: bool, errors: &mut usize) -> Vec<PathBuf> {
+    discover_directories(home, vec![home.join("sessions"), home.join("archived_sessions")], cold_start, errors)
+}
+
+fn discover_directories(home: &Path, mut pending: Vec<PathBuf>, cold_start: bool, errors: &mut usize) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    let mut pending = vec![home.join("sessions"), home.join("archived_sessions")];
     while let Some(directory) = pending.pop() {
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
@@ -2494,7 +2693,13 @@ impl Index {
 
 #[derive(Default)]
 struct LegacyEvidenceCache {
-    signatures: HashMap<String, Option<[u8; 32]>>,
+    signatures: HashMap<[u8; 32], Option<LegacyEvidenceSignature>>,
+}
+
+#[derive(Clone, Copy)]
+struct LegacyEvidenceSignature {
+    digest: [u8; 32],
+    inferred: bool,
 }
 
 #[derive(Default)]
@@ -2515,9 +2720,9 @@ impl EvidenceIdentities {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct LegacyMatches {
-    records: HashMap<String, Option<LegacyProviderEvidence>>,
+    records: Arc<HashMap<[u8; 32], Option<LegacyProviderEvidence>>>,
     invalid: usize,
     applied: usize,
     conflicts: usize,
@@ -2532,17 +2737,7 @@ impl LegacyEvidenceCache {
         document: anyhow::Result<Option<LegacyEvidenceDocument>>,
         snapshot: &mut Snapshot,
     ) {
-        let mut records = self.prepare(document);
-        let mut ids = EvidenceIdentities::default();
-        for event in &snapshot.events {
-            ids.observe(event.id, event.legacy_identity.as_ref().map(|old| old.id));
-        }
-        if let Ok(Some(matches)) = &mut records {
-            for event in &mut snapshot.events {
-                matches.apply(event, &ids, &mut snapshot.provider_names);
-            }
-        }
-        snapshot.provider_evidence = LegacyMatches::report(records);
+        LegacyMatches::apply_to_snapshot(self.prepare(document), snapshot);
     }
 
     fn prepare(
@@ -2555,12 +2750,23 @@ impl LegacyEvidenceCache {
         let mut records = HashMap::new();
         let mut invalid = 0usize;
         for record in document.records {
-            let id = record.event_id.to_ascii_lowercase();
-            if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            let text = &record.event_id;
+            if text.len() != 64 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 invalid += 1;
                 continue;
             }
-            let signature: [u8; 32] = Sha256::digest(serde_json::to_vec(&record)?).into();
+            let mut id = [0; 32];
+            for (index, byte) in id.iter_mut().enumerate() {
+                let start = index * 2;
+                *byte = u8::from_str_radix(&text[start..start + 2], 16).unwrap();
+            }
+            let signature = LegacyEvidenceSignature {
+                digest: Sha256::digest(serde_json::to_vec(&record)?).into(),
+                inferred: matches!(
+                    record.source.as_str(),
+                    "model-namespace" | "session-context-inferred"
+                ),
+            };
             let valid = [
                 &record.session,
                 &record.timestamp,
@@ -2573,9 +2779,14 @@ impl LegacyEvidenceCache {
                 && record.provider.trim() == record.provider
                 && record.model.trim() == record.model
                 && !unknown_provider(&record.provider)
-                && !unknown_model(&record.model)
-                && !unknown_model(request_base_model(&record.model))
-                && matches!(record.role.as_str(), "main" | "subagent")
+                && (matches!(
+                    record.source.as_str(),
+                    "request-log-recovered-supplier-only" | "session-context-inferred"
+                ) || (!unknown_model(&record.model)
+                    && !unknown_model(request_base_model(&record.model))))
+                && (matches!(record.role.as_str(), "main" | "subagent")
+                    || (record.role.is_empty()
+                        && record.source == "session-context-inferred"))
                 && matches!(
                     record.source.as_str(),
                     "upstream-exact-bidirectional"
@@ -2599,14 +2810,19 @@ impl LegacyEvidenceCache {
                 && self
                     .signatures
                     .get(&id)
-                    .is_none_or(|previous| *previous == Some(signature));
+                    .is_none_or(|previous| {
+                        previous.is_some_and(|saved| {
+                            saved.digest == signature.digest
+                                || (saved.inferred && record.is_direct())
+                        })
+                    });
             self.signatures
-                .insert(id.clone(), valid.then_some(signature));
+                .insert(id, valid.then_some(signature));
             invalid += usize::from(!valid);
             records.insert(id, valid.then_some(record));
         }
         Ok(Some(LegacyMatches {
-            records,
+            records: Arc::new(records),
             invalid,
             ..Default::default()
         }))
@@ -2614,6 +2830,19 @@ impl LegacyEvidenceCache {
 }
 
 impl LegacyMatches {
+    fn apply_to_snapshot(mut records: anyhow::Result<Option<Self>>, snapshot: &mut Snapshot) {
+        if let Ok(Some(matches)) = &mut records {
+            let mut ids = EvidenceIdentities::default();
+            for event in &snapshot.events {
+                ids.observe(event.id, event.legacy_identity.as_ref().map(|old| old.id));
+            }
+            for event in &mut snapshot.events {
+                matches.apply(event, &ids, &mut snapshot.provider_names);
+            }
+        }
+        snapshot.provider_evidence = Self::report(records);
+    }
+
     fn apply(
         &mut self,
         event: &mut UsageEvent,
@@ -2621,24 +2850,18 @@ impl LegacyMatches {
         names: &mut BTreeMap<String, String>,
     ) {
         let records = &self.records;
-        let id: String = event.id.iter().map(|byte| format!("{byte:02x}")).collect();
-        let direct = records.get(&id).and_then(Option::as_ref);
+        let direct = records.get(&event.id).and_then(Option::as_ref);
         // 只兼容明确复制头形成的旧身份，两端唯一且完整签名一致；不借父供应商推断。
         let legacy = event.legacy_identity.as_ref().and_then(|identity| {
             if ids.seen.contains(&identity.id) || ids.aliases.get(&identity.id) != Some(&1) {
                 return None;
             }
-            let id: String = identity
-                .id
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
             records
-                .get(&id)
+                .get(&identity.id)
                 .and_then(Option::as_ref)
                 .filter(|record| record.matches(event, Some(identity)))
         });
-        if records.get(&id).is_some_and(Option::is_none) {
+        if records.get(&event.id).is_some_and(Option::is_none) {
             return;
         }
         if direct
@@ -2651,10 +2874,18 @@ impl LegacyMatches {
         let Some(record) = direct.or(legacy) else {
             return;
         };
-        if event.context_conflicts.any()
+        if (record.role.is_empty()
+            && event.date >= Local::now().date_naive() - chrono::Months::new(2))
+            || event.context_conflicts.any()
             || event.count_uncertain
             || event.count_incomplete
-            || !event.delta.cached_known
+            || (!event.delta.cached_known
+                && !matches!(
+                    record.source.as_str(),
+                    "request-log-recovered-supplier-only"
+                        | "session-context-inferred"
+                        | "model-namespace"
+                ))
         {
             self.conflicts += 1;
             return;
@@ -2666,11 +2897,18 @@ impl LegacyMatches {
             self.mismatches += 1;
             return;
         }
-        if !unknown_provider(&event.provider) && event.provider != record.provider {
+        let upgrade_inference = matches!(
+            event.provider_source.as_deref(),
+            Some("model-namespace" | "session-context-inferred")
+        ) && record.is_direct();
+        if !upgrade_inference
+            && !unknown_provider(&event.provider)
+            && event.provider != record.provider
+        {
             self.conflicts += 1;
             return;
         }
-        if unknown_provider(&event.provider) {
+        if upgrade_inference || unknown_provider(&event.provider) {
             event.provider.clone_from(&record.provider);
             event.provider_source = Some(record.source.clone());
             self.applied += 1;

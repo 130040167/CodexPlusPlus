@@ -89,6 +89,16 @@ fn historical_candidates_stream_all_rows_at_one_timestamp() -> anyhow::Result<()
         assert!(visited.insert(event.id));
     })?;
     assert_eq!(visited, expected);
+    let sparse = BTreeSet::from([at]);
+    let dense = (at..at + 33).collect();
+    for timestamps in [sparse, dense] {
+        let mut identities = BTreeSet::new();
+        Store::historical_identities(&tx, &timestamps, |id, alias| {
+            assert!(alias.is_none());
+            assert!(identities.insert(id));
+        })?;
+        assert_eq!(identities, expected);
+    }
     Ok(())
 }
 
@@ -432,6 +442,75 @@ fn cross_session_parent_prefix_requires_a_unique_committed_native_anchor() -> an
             assert!(store.checkpoint(&child)?.is_none());
             let ready = store.prepare(update, cutoff, BTreeMap::new(), 1 << 20)?;
             store.publish(ready)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn compressed_parent_duplicate_preserves_child_baseline_and_conflicts_stay_pending() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().canonicalize()?;
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let parent_path = root.join(format!("rollout-{PHYSICAL_PREFIX}.jsonl"));
+    let archive_path = root.join(format!("rollout-{PHYSICAL_PREFIX}.jsonl.zst"));
+    let child_path = root.join(format!("rollout-{CHILD}.jsonl"));
+    let parent = parse(
+        &parent_path,
+        &[header(PARENT, 0), count(1, 1, 1, true), count(2, 2, 2, true)],
+        cutoff,
+    );
+    let mut meta = header(CHILD, 3);
+    meta["payload"]["history_base"] = json!({"thread_id": PHYSICAL_PREFIX,
+        "end_ordinal_exclusive": 3, "end_byte_offset": parent.offset});
+    let child = parse(&child_path, &[meta, count(4, 3, 3, false)], cutoff);
+    fs::write(
+        &archive_path,
+        zstd::stream::encode_all(fs::read(&parent_path)?.as_slice(), 1)?,
+    )?;
+    for case in ["identical", "event identity", "byte boundary", "source issue"] {
+        let database = root.join(format!("{case}.sqlite"));
+        let mut store = Store::open(Connection::open(&database)?)?;
+        for (path, state) in [(&parent_path, &parent), (&child_path, &child)] {
+            let batch = store.prepare(new_source(path, state), cutoff, BTreeMap::new(), 1 << 20)?;
+            store.publish(batch)?;
+        }
+        let expected = read(&mut store.db, i64::MIN, i64::MAX).1;
+        assert_eq!(expected.len(), 3);
+        assert!(!expected.iter().find(|event| event.session == CHILD).unwrap().count_pending);
+        let mut archive = FileState::default();
+        assert!(archive.read_with_budget(
+            &archive_path, cutoff, &mut Budget::new(std::iter::empty())
+        )?);
+        match case {
+            "event identity" => {
+                archive.events[0].id[0] ^= 1;
+                archive.events[0].original_id[0] ^= 1;
+            }
+            "byte boundary" => archive.events[0].rollout_position.as_mut().unwrap().1 += 1,
+            "source issue" => archive.issues = 1,
+            _ => {}
+        }
+        let batch = store.prepare(
+            new_source(&archive_path, &archive), cutoff, BTreeMap::new(), 1 << 20
+        )?;
+        store.publish(batch)?;
+        let actual = read(&mut store.db, i64::MIN, i64::MAX).1;
+        let child_event = actual.iter().find(|event| event.session == CHILD).unwrap();
+        if case == "identical" {
+            assert!(actual == expected);
+            drop(store);
+            store = Store::open(Connection::open(&database)?)?;
+            assert!(read(&mut store.db, i64::MIN, i64::MAX).1 == expected);
+            let revision = store.checkpoint(&parent_path)?.unwrap().0;
+            store.retire_source(&parent_path, revision, cutoff, BTreeMap::new())?;
+            assert!(read(&mut store.db, i64::MIN, i64::MAX).1 == expected);
+        } else {
+            assert!(child_event.count_pending, "{case}");
+            assert!(child_event.count_uncertain, "{case}");
+            let revision = store.checkpoint(&archive_path)?.unwrap().0;
+            store.retire_source(&archive_path, revision, cutoff, BTreeMap::new())?;
+            assert!(read(&mut store.db, i64::MIN, i64::MAX).1 == expected);
         }
     }
     Ok(())
@@ -1256,6 +1335,108 @@ fn oversized_unfinished_meter_reopens_at_its_start_and_publishes_only_once() -> 
 }
 
 #[test]
+fn exclusive_terminal_usage_repairs_only_its_paired_delta_with_a_mixed_prefix() {
+    for cumulative_cache in [420_908_928, 408_736_256] {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().canonicalize().unwrap();
+    let database = home.join("usage.sqlite");
+    let rollout = home.join("rollout-fixture.jsonl");
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let at = |second| format!("2026-01-02T12:00:{second:02}Z");
+    let counts = |input, cache, output, total| json!({"input_tokens":input,
+        "cached_input_tokens":cache,"cache_write_input_tokens":0,"output_tokens":output,"total_tokens":total});
+    let last = counts(126_679, 211_072, 357, 338_108);
+    let cumulative = counts(419_614_180, cumulative_cache, 1_508_615, 450_082_667);
+    let before = counts(419_487_501, cumulative_cache - 211_072, 1_508_258, 449_744_559);
+    let count = |second, last, total| json!({"type":"event_msg","timestamp":at(second),
+        "payload":{"type":"token_count","info":{"last_token_usage":last,"total_token_usage":total}}});
+    let receipt = |second, id, last, total| json!({"type":"token_usage_record","timestamp":at(second),
+        "payload":{"thread_id":PARENT,"turn_id":"turn","response_id":id,"usage":last,"thread_token_usage":total}});
+    let append = |rows: &[Value]| {
+        let mut file = fs::OpenOptions::new().create(true).append(true).open(&rollout).unwrap();
+        for row in rows { writeln!(file, "{row}").unwrap(); }
+    };
+    let step = || {
+        let mut store = Store::open(Connection::open(&database).unwrap()).unwrap();
+        let mut reader = SourceReader::restore(&store, &rollout).unwrap();
+        assert!(reader.step(&mut store, cutoff, &mut Budget::new(std::iter::empty()),
+            &BTreeMap::new(), 1 << 20).unwrap());
+        let receipts: usize = store.db.query_row(
+            "SELECT count(*) FROM token_observations WHERE json_type(CAST(payload AS TEXT),'$.terminal_response')='text'",
+            [], |row| row.get(0)).unwrap();
+        (receipts, read(&mut store.db, i64::MIN, i64::MAX).1)
+    };
+    append(&[
+        header(PARENT, 0),
+        json!({"type":"turn_context","timestamp":at(0),"payload":{"turn_id":"turn","model":"fixture"}}),
+        count(1, counts(100, 20, 10, 110), before),
+        count(3, last.clone(), cumulative.clone()),
+        count(4, last.clone(), cumulative.clone()),
+    ]);
+    let (_, native) = step();
+    assert_eq!(native.len(), 2);
+    assert_eq!(native[1].delta.input_tokens, 126_679);
+    assert!(!native[1].delta.cached_known);
+    assert_eq!(native[1].total.cached_known, cumulative_cache < 419_614_180);
+    append(&[receipt(2, "chat-final", last.clone(), cumulative.clone())]);
+    let (receipts, paired) = step();
+    assert_eq!(receipts, 1, "exclusive-cache terminal receipt was discarded");
+    assert_eq!(paired.len(), 2);
+    assert!(paired[0] == native[0]);
+    assert_eq!(paired[1].total, native[1].total);
+    assert_eq!(paired[1].delta, crate::usage_history::Tokens::new(337_751, 211_072, 357));
+    assert!(step().1 == paired);
+    append(&[receipt(4, "competing-final", last, cumulative)]);
+    let (receipts, withdrawn) = step();
+    assert_eq!(receipts, 2);
+    assert!(withdrawn == native, "a competing claim must withdraw the correction");
+    let next_last = counts(9_105, 168_960, 953, 179_018);
+    let next_total = counts(419_623_285, cumulative_cache + 168_960, 1_509_568, 450_261_685);
+    append(&[
+        receipt(5, "next-final", next_last.clone(), next_total.clone()),
+        count(6, next_last, next_total),
+    ]);
+    let (receipts, next) = step();
+    assert_eq!(receipts, 3);
+    assert_eq!(next.len(), 3);
+    assert!(next[..2] == native);
+    assert_eq!(next[2].delta, crate::usage_history::Tokens::new(178_065, 168_960, 953));
+    assert!(step().1 == next);
+    }
+}
+
+#[test]
+fn exclusive_terminal_usage_normalizes_the_cumulative_and_counts_a_late_pair_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().canonicalize().unwrap().join("rollout-exclusive.jsonl");
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let counts = json!({"input_tokens":10,"cached_input_tokens":40,"cache_write_input_tokens":3,
+        "output_tokens":5,"total_tokens":58});
+    let terminal = json!({"type":"token_usage_record","timestamp":"2026-01-02T12:00:02Z",
+        "payload":{"thread_id":PARENT,"turn_id":"turn","response_id":"exclusive-final",
+            "usage":counts,"thread_token_usage":counts}});
+    let state = parse(&source, &[
+        header(PARENT, 0),
+        json!({"type":"turn_context","timestamp":"2026-01-02T12:00:01Z",
+            "payload":{"turn_id":"turn","model":"fixture"}}),
+        terminal,
+        json!({"type":"event_msg","timestamp":"2026-01-02T12:00:03Z","payload":{
+            "type":"token_count","info":{"last_token_usage":counts,"total_token_usage":counts}}}),
+    ], cutoff);
+    assert_eq!(state.events.len(), 2);
+    assert_eq!(state.events[0].terminal_response.as_deref(), Some("exclusive-final"));
+    let expected = crate::usage_history::Tokens::new(53, 40, 5);
+    assert_eq!(state.events[0].total, expected);
+    assert_eq!(state.events[0].delta, expected);
+    let mut store = Store::open(Connection::open_in_memory().unwrap()).unwrap();
+    let prepared = store.prepare(new_source(&source, &state), cutoff, BTreeMap::new(), 1 << 20).unwrap();
+    store.publish(prepared).unwrap();
+    let events = read(&mut store.db, i64::MIN, i64::MAX).1;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].delta, expected);
+}
+
+#[test]
 fn terminal_usage_persists_across_restart_and_late_count_without_rebasing_the_next_turn() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().canonicalize().unwrap();
@@ -1304,10 +1485,14 @@ fn terminal_usage_persists_across_restart_and_late_count_without_rebasing_the_ne
     let response_id = "resp-a".repeat(100);
     let mut first = terminal(2, "turn-a", response_id.as_str(), usage(10, 3, 2), usage(10, 3, 2));
     first["payload"]["extra"] = json!("x".repeat(1100 * 1024));
+    first["payload"]["usage"]["total_tokens"] = json!(12);
+    first["payload"]["thread_token_usage"]["total_tokens"] = json!(15);
     let mut wrong_turn = first.clone();
     wrong_turn["payload"]["turn_id"] = json!("turn-b");
     wrong_turn["payload"]["response_id"] = json!("wrong-turn");
-    append(&[head.clone(), context(1, "turn-a"), wrong_turn, first.clone()]);
+    let mut wrong_usage = terminal(2, "turn-a", "wrong-usage", usage(10, 3, 2), usage(10, 3, 2));
+    wrong_usage["payload"]["usage"]["total_tokens"] = json!(15);
+    append(&[head.clone(), context(1, "turn-a"), wrong_turn, wrong_usage, first.clone()]);
     let initial = step(&rollout);
     assert_eq!(initial.len(), 1);
     assert_eq!(initial[0].terminal_response.as_deref(), Some(response_id.as_str()));
@@ -3334,6 +3519,24 @@ fn reopened_scope_uses_committed_aliases_and_only_unambiguous_descendants() {
     assert_eq!(all.revision, scoped.usage.revision);
     assert_eq!(all.days[0]["recordCount"], 4);
     assert_eq!(scoped.usage.days[0]["recordCount"], 3);
+    let names = BTreeMap::new();
+    let at = DateTime::parse_from_rfc3339("2026-01-02T12:00:01Z").unwrap().timestamp_millis();
+    let summary_only = |reader: &mut Connection, expect| {
+        for include_trend in [false, true] {
+            let mut request = json!({"startAt":at,"endAt":at+4000,"includeFingerprints":false,"includeTrend":include_trend});
+            let normal = Store::read_response(reader, &query, &request, Some(PHYSICAL_PREFIX), &names).unwrap();
+            request["scopeOnly"] = json!(true);
+            let scoped = Store::read_response(reader, &query, &request, Some(PHYSICAL_PREFIX), &names).unwrap();
+            assert_eq!(scoped["scopedUsage"], normal["scopedUsage"]);
+            assert_eq!(scoped["scopedUsage"]["days"][0]["recordCount"], expect);
+            assert_eq!(scoped["sessionAliases"], json!({PHYSICAL_PREFIX:PARENT}));
+            assert_eq!(scoped["days"], json!([]));
+            assert!(scoped.get("sessionIds").is_none());
+            assert!(scoped.get("sessionInfo").is_none());
+            assert!(scoped.get("trend").is_none());
+        }
+    };
+    summary_only(&mut reader, 3);
 
     let mut writer = Store::open(Connection::open(&db).unwrap()).unwrap();
     let (revision, _) = writer.checkpoint(&child_path).unwrap().unwrap();
@@ -3365,6 +3568,7 @@ fn reopened_scope_uses_committed_aliases_and_only_unambiguous_descendants() {
     assert_eq!(all.days[0]["recordCount"], 4);
     assert_eq!(scoped.session_ids, [PARENT]);
     assert_eq!(scoped.usage.days[0]["recordCount"], 1);
+    summary_only(&mut reader, 1);
 }
 
 #[test]
@@ -3524,6 +3728,183 @@ fn scoped_turn_selection_uses_retained_events_without_returning_archived_day_tot
 }
 
 #[test]
+fn multi_day_partial_range_keeps_exact_boundary_counts_with_daily_summaries() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = fs::canonicalize(dir.path())?;
+    let start = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+    let last = start + chrono::Days::new(2);
+    let local = |day: NaiveDate, hour| {
+        Local.from_local_datetime(&day.and_hms_opt(hour, 0, 0).unwrap()).single().unwrap()
+    };
+    let mut store = Store::open(Connection::open_in_memory()?)?;
+    for session in [PARENT, OTHER] {
+        let path = root.join(format!("rollout-{session}.jsonl"));
+        let mut rows = vec![header(session, 0)];
+        for (index, (day, hour)) in [(start, 9), (start, 15), (start.succ_opt().unwrap(), 12), (last, 10), (last, 16)]
+            .into_iter().enumerate()
+        {
+            let n = index + 1;
+            let mut item = count(n, n, n as u64, true);
+            item["timestamp"] = json!(local(day, hour).to_rfc3339());
+            rows.push(item);
+        }
+        let state = parse(&path, &rows, start);
+        let prepared = store.prepare(new_source(&path, &state), start, BTreeMap::new(), 1 << 16)?;
+        store.publish(prepared)?;
+    }
+    let request = json!({"startAt":local(start, 12).timestamp_millis(),
+        "endAt":local(last, 12).timestamp_millis(), "includeFingerprints":false});
+    let query = Query::parse(&request, start).unwrap();
+    let mut exact_request = request.clone();
+    exact_request["includeTrend"] = json!(true);
+    let exact = Store::read_response(&mut store.db, &query, &exact_request, Some(PARENT), &BTreeMap::new())?;
+    let mut oracle_request = exact_request.clone();
+    oracle_request["includeFingerprints"] = json!(true);
+    let oracle = Store::read_response(&mut store.db, &query, &oracle_request, Some(PARENT), &BTreeMap::new())?;
+    for (fast, raw) in [
+        (&exact, &oracle),
+        (&exact["scopedUsage"], &oracle["scopedUsage"]),
+    ] {
+        assert_eq!(fast["trend"], raw["trend"]);
+        assert!(!fast["trend"]["buckets"].as_array().unwrap().is_empty());
+        for (a, b) in fast["days"].as_array().unwrap().iter().zip(raw["days"].as_array().unwrap()) {
+            assert_eq!(a["usage"], b["usage"]);
+            assert_eq!(a["recordCount"], b["recordCount"]);
+            let mut breakdowns = b["breakdowns"].as_array().unwrap().clone();
+            for row in &mut breakdowns {
+                row.as_object_mut().unwrap().remove("membershipFingerprint");
+            }
+            assert_eq!(a["breakdowns"].as_array().unwrap(), &breakdowns);
+        }
+    }
+    for session in [None, Some(PARENT), Some(PHYSICAL_PREFIX)] {
+        let mut filtered = exact_request.clone();
+        filtered["sessionId"] = json!(session);
+        filtered["includeSessionMetadata"] = json!(false);
+        let query = Query::parse(&filtered, start).unwrap();
+        let compact = Store::read_response(&mut store.db, &query, &filtered, None, &BTreeMap::new())?;
+        let expected = match session {
+            None => &exact,
+            Some(PARENT) => &exact["scopedUsage"],
+            _ => {
+                assert_eq!(compact["days"], json!([]));
+                continue;
+            }
+        };
+        assert_eq!(compact["days"], expected["days"]);
+        assert_eq!(compact["trend"], expected["trend"]);
+    }
+    // 逐笔读取会拒绝这个缺少观察字段的 JSON；整日汇总不应读取它。
+    assert_eq!(store.db.execute("UPDATE token_resolved SET payload = X'7B7D' WHERE day = ?1",
+        [start.succ_opt().unwrap().to_string()])?, 2);
+    let response = Store::read_response(&mut store.db, &query, &request, Some(PARENT), &BTreeMap::new())?;
+    for (fast, slow, records) in [
+        (&response["days"], &exact["days"], 2),
+        (&response["scopedUsage"]["days"], &exact["scopedUsage"]["days"], 1),
+    ] {
+        let fast = fast.as_array().unwrap();
+        let slow = slow.as_array().unwrap();
+        assert_eq!(fast.len(), 3);
+        for (a, b) in fast.iter().zip(slow) {
+            assert_eq!(a["date"], b["date"]);
+            assert_eq!(a["recordCount"], records);
+            assert_eq!(a["recordCount"], b["recordCount"]);
+            assert_eq!(a["usage"], b["usage"]);
+            assert_eq!(a["breakdowns"], b["breakdowns"]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn compact_range_migrates_and_follows_committed_changes() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = fs::canonicalize(dir.path())?;
+    let database = root.join("usage-token-index.sqlite");
+    let date = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+    let source = root.join(format!("rollout-{PARENT}.jsonl"));
+    let state = parse(&source, &[header(PARENT, 0), count(1, 1, 1, true), count(2, 2, 2, true)], date);
+    let mut store = Store::open(Connection::open(&database)?)?;
+    let prepared = store.prepare(new_source(&source, &state), date, BTreeMap::new(), 8192)?;
+    store.publish(prepared)?;
+    let start = DateTime::parse_from_rfc3339("2026-01-02T12:00:00Z")?.timestamp_millis();
+    let request = json!({"startAt":start,"endAt":start + 3_000,"includeFingerprints":false});
+    let query = Query::parse(&request, date).unwrap();
+    let mut precise = request.clone();
+    precise["includeTrend"] = json!(true);
+    let names = BTreeMap::new();
+    let check = |db: &mut Connection| -> anyhow::Result<Value> {
+        let fast = Store::read_response(db, &query, &request, None, &names)?;
+        let slow = Store::read_response(db, &query, &precise, None, &names)?;
+        assert_eq!(fast["days"], slow["days"]);
+        assert_eq!(fast["countStatus"], slow["countStatus"]);
+        Ok(fast)
+    };
+    assert_eq!(check(&mut store.db)?["days"][0]["recordCount"], 2);
+    store.db.execute_batch(
+        "DROP TRIGGER token_range_insert; DROP TRIGGER token_range_update;
+         DROP TRIGGER token_range_delete; DROP TABLE token_range_projection;",
+    )?;
+    drop(store);
+    let mut store = Store::open(Connection::open(&database)?)?;
+    assert_eq!(check(&mut store.db)?["days"][0]["recordCount"], 2);
+    store.db.execute(
+        "UPDATE token_resolved SET payload=CAST(json_set(CAST(payload AS TEXT),
+          '$.provider','supplier-b','$.provider_source','request-log-exact') AS BLOB)
+         WHERE timestamp_ms=?1",
+        [start + 1_000],
+    )?;
+    store.db.execute(
+        "UPDATE token_resolved SET payload=CAST(json_set(CAST(payload AS TEXT),
+          '$.count_uncertain',json('true')) AS BLOB) WHERE timestamp_ms=?1",
+        [start + 2_000],
+    )?;
+    let updated = check(&mut store.db)?;
+    assert_eq!(updated["days"][0]["recordCount"], 1);
+    assert!(updated["days"][0]["breakdowns"].as_array().unwrap().iter().any(|row| {
+        row["provider"] == "supplier-b" && row["classificationEvidence"] == "request-log-exact"
+    }));
+    store.db.execute_batch("BEGIN; DELETE FROM token_resolved; ROLLBACK;")?;
+    assert_eq!(check(&mut store.db)?["days"], updated["days"]);
+    store.db.execute("DELETE FROM token_resolved", [])?;
+    assert_eq!(check(&mut store.db)?["days"], json!([]));
+    Ok(())
+}
+
+#[test]
+fn all_session_summary_can_omit_session_metadata() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = fs::canonicalize(dir.path())?.join(format!("rollout-{PARENT}.jsonl"));
+    let day = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+    let state = parse(&path, &[header(PARENT, 0), count(1, 1, 1, true)], day);
+    let mut store = Store::open(Connection::open_in_memory()?)?;
+    let names = BTreeMap::new();
+    let prepared = store.prepare(new_source(&path, &state), day, names.clone(), 8192)?;
+    store.publish(prepared)?;
+    let mut request = json!({"includeFingerprints":false});
+    let query = Query::parse(&request, day).unwrap();
+    let mut full = Store::read_response(&mut store.db, &query, &request, None, &names)?;
+    assert_eq!(full["sessionIds"], json!([PARENT]));
+    assert_eq!(full["sessionAliases"][PARENT], PARENT);
+    assert!(full["sessionInfo"][PARENT].is_object());
+    assert_eq!(full["days"][0]["recordCount"], 1);
+
+    request["includeSessionMetadata"] = json!(false);
+    let summary = Store::read_response(&mut store.db, &query, &request, None, &names)?;
+    let scoped = Store::read_response(&mut store.db, &query, &request, Some(PARENT), &names)?;
+    assert_eq!(scoped["scopedUsage"]["days"], full["days"]);
+    request["liveReceipts"] = json!([{}]);
+    let receipts = Store::read_response(&mut store.db, &query, &request, None, &names)?;
+    assert_eq!(receipts, full);
+    for key in ["sessionIds", "sessionAliases", "sessionInfo"] {
+        assert_eq!(scoped[key], full[key]);
+        full.as_object_mut().unwrap().remove(key).unwrap();
+    }
+    assert_eq!(summary, full);
+    Ok(())
+}
+
+#[test]
 fn selection_preserves_the_known_priceable_subset_across_sessions() {
     let dir = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(dir.path()).unwrap();
@@ -3678,18 +4059,35 @@ fn restored_supplier_evidence_for_source(inferred_source: &str) -> anyhow::Resul
     let prepared = reopened.prepare(new_source(&path, &state), cutoff, BTreeMap::new(), 8192)?;
     reopened.publish(prepared)?;
 
-    for request in [&request, &json!({"includeFingerprints":false})] {
+    let day = DateTime::parse_from_rfc3339(records[0]["timestamp"].as_str().unwrap())?
+        .with_timezone(&Local)
+        .date_naive();
+    let midnight = |day: NaiveDate| {
+        day.and_hms_opt(0, 0, 0).unwrap().and_local_timezone(Local).single().unwrap()
+    };
+    let range_request = json!({
+        "startAt": (midnight(day) - chrono::Duration::minutes(1)).timestamp_millis(),
+        "endAt": (midnight(day.succ_opt().unwrap()) + chrono::Duration::minutes(1)).timestamp_millis(),
+        "includeFingerprints":false,"includeSessionMetadata":false,
+    });
+    for request in [&request, &json!({"includeFingerprints":false}), &range_request] {
         let (during, _) =
-            Store::read_snapshot(&reader, &query, request, None, &names, None, Some(&overlay))?;
+            Store::read_snapshot(&reader, &query, request, None, &names, &[], Some(&overlay))?;
         assert_eq!(during["days"][0]["recordCount"], 3);
-        assert!(during["days"][0]["breakdowns"].as_array().unwrap().iter()
-            .any(|row| row["providerInferred"] == true));
+        assert_eq!(during["days"][0]["usage"], after["days"][0]["usage"]);
+        let mut expected = after["days"][0]["breakdowns"].clone();
+        if request["includeFingerprints"] == false {
+            for row in expected.as_array_mut().unwrap() {
+                row.as_object_mut().unwrap().remove("membershipFingerprint");
+            }
+        }
+        assert_eq!(during["days"][0]["breakdowns"], expected);
     }
     let updated = with_overlay(&mut reopened)?;
     assert_eq!(updated["days"][0]["recordCount"], 4);
     assert_eq!(updated["days"][0]["usage"]["totalTokens"], 440);
     fs::write(settings.with_file_name("usage-provider-evidence.json"), r#"{"version":1,"records":[]}"#)?;
-    let (revoked, _) = Store::read_snapshot(&reader, &query, &json!({}), None, &names, None, Some(&overlay))?;
+    let (revoked, _) = Store::read_snapshot(&reader, &query, &json!({}), None, &names, &[], Some(&overlay))?;
     assert_eq!(revoked["days"][0]["recordCount"], 3);
     assert!(revoked["providerEvidence"].is_null());
     Ok(())
@@ -4133,6 +4531,7 @@ fn durable_future_partial_request_needs_ordered_gateway_and_paired_native_respon
             1 << 20,
             &BTreeSet::new(),
             0,
+            false,
             |events, aliases, scope| {
                 evidence.attribute_with_cache_scoped(
                     events,
@@ -4237,6 +4636,7 @@ fn bounded_classification_preserves_day_totals_and_counts_competitors_across_the
                 LIMIT,
                 &gaps,
                 0,
+                false,
                 |events, aliases, scope| {
                     assert_eq!(scope.targets.len(), 1);
                     assert_eq!(events.len(), 2);
@@ -4306,6 +4706,7 @@ fn bounded_classification_preserves_day_totals_and_counts_competitors_across_the
                 LIMIT,
                 &gaps,
                 0,
+                false,
                 |_, _, _| { panic!("cannot accept a clipped retention boundary") }
             )
             .unwrap()
@@ -4416,6 +4817,40 @@ fn append_retracts_only_nearby_proofs_in_the_same_transaction_as_the_new_count()
         .find(|row| row["provider"] == "relay-proof")
         .unwrap();
     assert_eq!(exact["recordCount"], 1);
+
+    store
+        .reclassify_session(PARENT, 8192, &BTreeSet::new(), proof)
+        .unwrap()
+        .unwrap();
+    let mut file = fs::OpenOptions::new().append(true).open(&source).unwrap();
+    let with_input = |n, second, total, last| {
+        let mut row = counts_at(n, second);
+        let info = &mut row["payload"]["info"];
+        info["total_token_usage"]["input_tokens"] = json!(total);
+        info["last_token_usage"]["input_tokens"] = json!(last);
+        row
+    };
+    writeln!(file, "{}", with_input(4, 610, 450, 150)).unwrap();
+    assert!(scan.round(&mut store, &root, cutoff, &names, 8192).complete);
+    let (_, distinct) = read(&mut store.db, i64::MIN, i64::MAX);
+    assert_eq!(distinct.len(), 4);
+    assert_eq!(distinct[1].provider, "relay-proof");
+    assert_eq!(distinct[2].provider, "relay-proof");
+
+    store
+        .reclassify_session(PARENT, 8192, &BTreeSet::new(), proof)
+        .unwrap()
+        .unwrap();
+    writeln!(file, "{}", with_input(5, 615, 620, 170)).unwrap();
+    writeln!(file, "{}", with_input(6, 620, 720, 100)).unwrap();
+    assert!(scan.round(&mut store, &root, cutoff, &names, 8192).complete);
+    let (_, competing) = read(&mut store.db, i64::MIN, i64::MAX);
+    assert_eq!(competing.len(), 6);
+    assert_eq!(competing[0].provider, "relay-proof");
+    assert_eq!(competing[1].provider_source, None);
+    assert_eq!(competing[2].provider_source, None);
+    assert_eq!(competing[3].provider, "relay-proof");
+    assert_eq!(competing.iter().map(|e| e.delta.total_tokens).sum::<u64>(), 780);
 }
 
 #[test]

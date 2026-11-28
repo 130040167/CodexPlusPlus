@@ -26,7 +26,7 @@ pub(super) struct SourceReader {
     revision: Option<i64>,
     offset: u64,
     committed_complete: bool,
-    replacing: bool,
+    pub(super) replacing: bool,
     ready: Option<bool>,
     encoding: Encoding,
     identity_probe: Option<Box<FileState>>,
@@ -69,6 +69,13 @@ impl SourceReader {
                 .state
                 .stamp
                 .is_some_and(|(size, _, _)| size == self.state.offset)
+    }
+
+    pub(super) fn waiting_line_has_committed_scope(&self) -> bool {
+        self.revision.is_some()
+            && !self.state.session.is_empty()
+            && !self.replacing
+            && !self.has_count_gap()
     }
 
     pub(super) fn can_yield_plain_batch(&self) -> bool {

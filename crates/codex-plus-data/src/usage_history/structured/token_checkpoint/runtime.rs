@@ -1,4 +1,5 @@
 use super::{
+    disk_full,
     historical::{EvidenceOverlay, EvidenceVerifier, Historical},
     scan::{RECLAIM_BATCH, Scan},
     store::{
@@ -34,6 +35,7 @@ struct RecentClassification {
     latest: i64,
     before: i64,
     older_next: bool,
+    tail_preempted: bool,
 }
 
 pub(in super::super) struct Runtime {
@@ -48,7 +50,10 @@ pub(in super::super) struct Runtime {
     historical_cursor: Option<(i64, i64)>,
     historical: Option<Arc<Historical>>,
     historical_verifier: Arc<Mutex<EvidenceVerifier>>,
+    published_days: Option<(published_days::Publication, Option<Arc<Historical>>)>,
 }
+
+mod published_days;
 
 #[derive(Default)]
 pub(in super::super) struct ReadState {
@@ -64,6 +69,22 @@ pub(in super::super) struct ReadState {
 }
 
 pub(in super::super) type HistoryReader = Arc<Mutex<Connection>>;
+
+pub(in super::super) struct RefreshReaders {
+    summary: HistoryReader,
+    detail: HistoryReader,
+}
+
+impl RefreshReaders {
+    pub(in super::super) fn reader(&self, detailed: bool) -> HistoryReader {
+        Arc::clone(if detailed { &self.detail } else { &self.summary })
+    }
+}
+
+fn pin_reader(db: &Connection) -> Result<i64> {
+    db.execute_batch("BEGIN")?;
+    Ok(db.query_row("SELECT revision FROM token_revision", [], |row| row.get(0))?)
+}
 
 fn open_database(storage: &Path, write: bool) -> Result<Connection> {
     if write {
@@ -113,6 +134,7 @@ impl Runtime {
             historical_cursor: Some((0, i64::MAX)),
             historical: None,
             historical_verifier: Arc::default(),
+            published_days: None,
         }
     }
 
@@ -127,19 +149,29 @@ impl Runtime {
         }
     }
 
-    pub(in super::super) fn pin_refresh_reader(
-        &self,
-        state: &ReadState,
-    ) -> Result<Option<HistoryReader>> {
-        if state.historical.is_none() {
+    pub(in super::super) fn pin_refresh_readers(&self) -> Result<Option<RefreshReaders>> {
+        // 旧进程可能在入库与分类之间退出，冷启动先完成本轮刷新。
+        if self.store.is_none() {
             return Ok(None);
         }
         let budget = u64::from(read_history_settings(&self.settings)?.storage_mib) * 1024 * 1024;
-        // Leave WAL reclamation to the writer before pinning the next round.
-        if working_index_bytes(&self.storage)? >= budget {
+        let used = working_index_bytes(&self.storage)?;
+        if used == 0 || used >= budget {
             return Ok(None);
         }
-        ReadState::open_reader(&self.storage).map(Some)
+        let summary = open_database(&self.storage, false)?;
+        // A read transaction must not block the first transition to WAL.
+        if summary.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))? != "wal" {
+            return Ok(None);
+        }
+        // 在写者启动前固定同一版本，趋势读取不会让前台摘要排队。
+        let revision = pin_reader(&summary)?;
+        let detail = open_database(&self.storage, false)?;
+        ensure!(pin_reader(&detail)? == revision, "usage snapshot changed while opening refresh readers");
+        Ok(Some(RefreshReaders {
+            summary: Arc::new(Mutex::new(summary)),
+            detail: Arc::new(Mutex::new(detail)),
+        }))
     }
 
     fn update_with_request_log(&mut self, home: &Path, request_log: &Path) -> ReadState {
@@ -169,6 +201,7 @@ impl Runtime {
         state
             .provider_names
             .clone_from(&self.evidence.provider_names);
+        let mut attribution_checked = false;
         match self.refresh(
             home,
             cutoff,
@@ -177,9 +210,11 @@ impl Runtime {
         ) {
             Ok(true) if evidence_available => {
                 if let Err(error) =
-                    self.classify_retained(home, proof_cutoff, MAX_RETAINED_BYTES, &mut state)
+                    self.classify_retained(home, proof_cutoff, MAX_RETAINED_BYTES, request_log, &mut state)
                 {
                     state.classification_error = Some(format!("{error:#}"));
+                } else {
+                    attribution_checked = true;
                 }
             }
             Ok(_) if !evidence_available => {
@@ -214,6 +249,15 @@ impl Runtime {
                 request.success = false;
             }
         }
+        if attribution_checked
+            && state.historical_error.is_none()
+            && let Some(store) = &self.store
+            && let Err(error) = published_days::save(
+                store, &self.storage, &self.settings, &state, &mut self.published_days,
+            )
+        {
+            eprintln!("saving published usage days: {error:#}");
+        }
         state
     }
 
@@ -222,13 +266,16 @@ impl Runtime {
         home: &Path,
         cutoff: NaiveDate,
         byte_budget: usize,
+        request_log: &Path,
         state: &mut ReadState,
     ) -> Result<()> {
+        // 扫描期间完成的网关请求也应参与本轮归属，避免已到达的回执要等下一轮。
+        self.evidence.request_evidence.refresh(request_log);
         let store = self
             .store
             .as_mut()
             .expect("successful scan owns a usage index");
-        let recent_since = Local::now().timestamp_millis() - 86_400_000;
+        let recent_since = Local::now().timestamp_millis() - super::RECENT_CLASSIFICATION_MS;
         let sessions = store.recent_sessions(recent_since)?;
         let active: std::collections::BTreeSet<_> = sessions.iter().map(|(id, _)| id).collect();
         self.evidence_before.retain(|id, _| active.contains(id));
@@ -239,23 +286,22 @@ impl Runtime {
         let offset = self.evidence_cursor % slots;
         self.evidence_cursor = offset + 1;
         let index = &mut self.evidence;
-        let mut remaining = byte_budget;
-        let mut classify_page = |store: &mut Store, session: &str, from, to, shares: usize| {
-            if remaining == 0 {
+        let mut classify_page = |store: &mut Store, session: &str, from, to, shares: usize, remaining: &mut usize| {
+            if *remaining == 0 {
                 return Ok(None);
             }
             // 每轮首个窗口可完整读取竞争记录，后续窗口共享剩余预算。
-            let available = if remaining == byte_budget {
+            let available = if *remaining == byte_budget {
                 usize::MAX
             } else {
-                remaining
+                *remaining
             };
             let Some((window, bytes)) =
-                store.classification_page(session, from, to, remaining / shares, available)?
+                store.classification_page(session, from, to, *remaining / shares, available)?
             else {
                 return Ok(None);
             };
-            remaining = remaining.saturating_sub(bytes);
+            *remaining = remaining.saturating_sub(bytes);
             let start = window.start;
             store.reclassify_window(
                 session,
@@ -263,6 +309,7 @@ impl Runtime {
                 bytes,
                 self.scan.scoped_count_gaps(),
                 self.scan.sealed_pending(),
+                self.scan.paired_only,
                 |events, aliases, scope| {
                     ensure!(
                         index.native_evidence.observe_count_conflicts(events, true),
@@ -295,22 +342,27 @@ impl Runtime {
                         Some(scope),
                     );
                     index.native_evidence.apply_count_conflicts(events);
+                    index.request_evidence.infer_scoped(events, &mut state.provider_names, aliases, scope)?;
                     Ok(())
                 },
             )?;
             Ok::<_, anyhow::Error>(Some(start))
         };
         let mut failure = None;
+        let mut remaining = byte_budget;
         for step in 0..slots {
             let slot = (offset + step) % slots;
             let shares = slots - step;
             if let Some((session, latest)) = sessions.get(slot) {
                 let cursor = self.evidence_before.get(session);
-                let older = match cursor.filter(|cursor| cursor.older_next) {
+                let preempt_old = cursor.is_some_and(|cursor| {
+                    cursor.older_next && !cursor.tail_preempted && *latest > cursor.latest
+                });
+                let older = match cursor.filter(|cursor| cursor.older_next && !preempt_old) {
                     Some(cursor) => store.classification_before(session, cursor.before)?,
                     None => None,
                 };
-                // 先覆盖最近一天，再交替回访尾部和向前翻页；每次从真实事件继续。
+                // 新尾部可抢占一次旧页；下次兑现旧页，持续追加也不会饿死历史校验。
                 let (from, to) = match (cursor, older) {
                     (_, Some(at)) => (i64::MIN, at),
                     (Some(cursor), None) => (
@@ -322,10 +374,10 @@ impl Runtime {
                     ),
                     (None, None) => (recent_since, *latest),
                 };
-                match classify_page(store, session, from, to, shares) {
+                match classify_page(store, session, from, to, shares, &mut remaining) {
                     Ok(Some(start)) => {
                         let before = match cursor {
-                            Some(cursor) if !cursor.older_next => cursor.before,
+                            Some(cursor) if !cursor.older_next || preempt_old => cursor.before,
                             _ => start,
                         };
                         self.evidence_before.insert(
@@ -337,6 +389,7 @@ impl Runtime {
                                 },
                                 before,
                                 older_next: older.is_none(),
+                                tail_preempted: preempt_old,
                             },
                         );
                     }
@@ -354,7 +407,7 @@ impl Runtime {
                         self.historical_cursor = None;
                         break;
                     };
-                    match classify_page(store, &session, i64::MIN, at, shares * left) {
+                    match classify_page(store, &session, i64::MIN, at, shares * left, &mut remaining) {
                         Ok(Some(start)) => self.historical_cursor = Some((id, start)),
                         Ok(None) => break,
                         Err(error) => {
@@ -362,6 +415,38 @@ impl Runtime {
                             break;
                         }
                     }
+                }
+            }
+        }
+        // 旧页可以用完本轮份额，但已入库的新尾不能因此等待下一轮。
+        // 独立份额仍逐页读写，不同时保留新旧窗口。
+        let mut live_remaining = byte_budget;
+        for (step, (session, latest)) in sessions
+            .iter()
+            .cycle()
+            .skip(offset)
+            .take(sessions.len())
+            .enumerate()
+        {
+            let Some(cursor) = self
+                .evidence_before
+                .get_mut(session)
+                .filter(|cursor| cursor.latest < *latest)
+            else {
+                continue;
+            };
+            let from = cursor.latest.saturating_sub(classification_lookback_ms());
+            match classify_page(
+                store, session, from, *latest, sessions.len() - step, &mut live_remaining,
+            ) {
+                Ok(Some(_)) => {
+                    cursor.latest = *latest;
+                    cursor.tail_preempted = cursor.older_next;
+                    cursor.older_next = true;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    failure.get_or_insert(error);
                 }
             }
         }
@@ -462,12 +547,6 @@ impl Runtime {
     }
 }
 
-fn disk_full(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<rusqlite::Error>()
-        .is_some_and(|error| error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull))
-}
-
 fn allocated_pages(db: &Connection) -> Result<(u64, u64)> {
     Ok((
         db.pragma_query_value(None, "page_count", |row| row.get(0))?,
@@ -506,8 +585,7 @@ fn checkpoint_if_over_budget(db: &Connection, storage: &Path, budget: u64) -> Re
 impl ReadState {
     pub(in super::super) fn open_reader(storage: &Path) -> Result<HistoryReader> {
         let db = open_database(storage, false)?;
-        db.execute_batch("BEGIN")?;
-        db.query_row("SELECT revision FROM token_revision", [], |row| row.get::<_, i64>(0))?;
+        pin_reader(&db)?;
         Ok(Arc::new(Mutex::new(db)))
     }
 
@@ -546,7 +624,7 @@ impl ReadState {
         processing: bool,
     ) -> Value {
         self.read_with_archive(
-            storage, Self::open_reader(storage), options, request, scope_session, processing, None,
+            storage, Self::open_reader(storage), options, request, scope_session, processing, &[],
         ).0
     }
 
@@ -558,7 +636,7 @@ impl ReadState {
         request: &Value,
         scope_session: Option<&str>,
         processing: bool,
-        archive: Option<&ArchiveAnswer>,
+        archive: &[&ArchiveAnswer],
     ) -> (Value, Option<ArchiveKey>) {
         let (mut response, schedule) = match reader.and_then(|reader| {
             let db = reader.lock().map_err(|_| anyhow::anyhow!("usage snapshot reader panicked"))?;
@@ -652,33 +730,57 @@ pub(in super::super) fn recover_archive(
     settings: &Path,
     snapshot: &ReadState,
     cancelled: &AtomicBool,
+    previous: Option<&ArchiveAnswer>,
 ) -> ArchiveAnswer {
-    let answer = (|| -> Result<Recovered> {
+    let answer = (|| -> Result<(ArchiveKey, Recovered)> {
         let db = open_database(storage, false)?;
-        let mut replay = key.replay(&db, home, snapshot.provider_names.clone())?;
-        loop {
-            ensure!(
-                !cancelled.load(Ordering::Relaxed),
-                "archive replay cancelled"
-            );
-            if replay.step()? {
-                let mut recovered = replay.finish(&db)?;
-                recovered.evidence = Some(
-                    EvidenceOverlay::for_archive(
-                        &snapshot.historical_verifier,
-                        settings,
-                        &recovered.events,
-                        key.session.is_some(),
-                    )
-                    .map_err(|error| format!("{error:#}")),
+        let reused = match previous {
+            Some((cached, Ok(recovered))) if cached == &key => recovered.reuse(&db, &key)?,
+            _ => None,
+        };
+        let reused = match reused {
+            Some(recovered) => Some((key.clone(), recovered)),
+            None => Recovered::load_for(&db, storage, &key)?,
+        };
+        let needs_save = reused.is_none();
+        let (covered, mut recovered) = if let Some(recovered) = reused {
+            recovered
+        } else {
+            let mut replay = key.replay(&db, home, snapshot.provider_names.clone())?;
+            loop {
+                ensure!(
+                    !cancelled.load(Ordering::Relaxed),
+                    "archive replay cancelled"
                 );
-                return Ok(recovered);
+                if replay.step()? {
+                    break (key.clone(), replay.finish(&db)?);
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
-            std::thread::sleep(Duration::from_millis(10));
+        };
+        ensure!(
+            !cancelled.load(Ordering::Relaxed),
+            "archive recovery cancelled"
+        );
+        recovered.evidence = Some(
+            EvidenceOverlay::for_archive(
+                &snapshot.historical_verifier,
+                settings,
+                &recovered.events,
+                covered.session.is_some(),
+            )
+            .map_err(|error| format!("{error:#}")),
+        );
+        if needs_save && let Err(error) = recovered.save(&key, storage) {
+            eprintln!("Usage archive cache write failed: {error:#}");
         }
+        Ok((covered, recovered))
     })()
     .map_err(|error| format!("{error:#}"));
-    (key, answer)
+    match answer {
+        Ok((covered, recovered)) => (covered, Ok(recovered)),
+        Err(error) => (key, Err(error)),
+    }
 }
 
 #[cfg(test)]
@@ -700,6 +802,9 @@ mod tests {
         drop(store);
 
         let storage = root.path().to_owned();
+        let settings = root.path().join("settings.json");
+        fs::write(&settings, r#"{"usageHistoryEnabled":true}"#).unwrap();
+        assert!(Runtime::new(storage.clone(), settings).pin_refresh_readers().unwrap().is_none());
         let (pinned, ready) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
             let mut db = open_database(&storage, false).unwrap();
@@ -1216,8 +1321,8 @@ mod tests {
             let unverified = pass(&mut worker);
             assert!(unverified["scan"]["pendingFiles"].as_u64().unwrap() > 0);
             assert!(
-                !exact(&unverified),
-                "{case}: unverified backlog retained exact evidence"
+                exact(&unverified),
+                "{case}: unrelated queued work must retain a previously verified proof"
             );
             assert_eq!(unverified["days"][0]["usage"], native["days"][0]["usage"]);
             assert_eq!(unverified["sessionCursors"], native["sessionCursors"]);
@@ -1234,9 +1339,10 @@ mod tests {
         active.write_all(b"{").unwrap();
         let mut worker = Runtime::new(storage.clone(), settings.clone());
         let partial = pass(&mut worker);
+        assert!(partial["scan"]["pendingFiles"].as_u64().unwrap() > 0);
         assert!(
-            !exact(&partial),
-            "an unfinished same-session tail retained evidence"
+            exact(&partial),
+            "an unpublished same-session tail must not withdraw an existing proof"
         );
         assert_eq!(partial["days"][0]["usage"], native["days"][0]["usage"]);
         active

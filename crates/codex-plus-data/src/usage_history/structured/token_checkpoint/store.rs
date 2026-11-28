@@ -60,13 +60,13 @@ pub(in super::super) struct Coverage {
 }
 
 impl Store {
-    pub(super) fn open(db: Connection) -> Result<Self> {
+    pub(super) fn open(mut db: Connection) -> Result<Self> {
         db.pragma_update(None, "foreign_keys", true)?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         let compactable_metadata = executions::COMPACTABLE_METADATA;
-        db.execute_batch(&format!(
-            "BEGIN IMMEDIATE;
-             CREATE TABLE IF NOT EXISTS token_revision (
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS token_revision (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 revision INTEGER NOT NULL,
                 precise_from TEXT NOT NULL,
@@ -226,9 +226,10 @@ impl Store {
              ) STRICT;
              INSERT OR IGNORE INTO execution_coverage_start
                 SELECT 1, CASE WHEN EXISTS (SELECT 1 FROM token_sources)
-                    THEN CAST(unixepoch('subsec') * 1000 AS INTEGER) END;
-             COMMIT;",
+                    THEN CAST(unixepoch('subsec') * 1000 AS INTEGER) END;",
         ))?;
+        projection::compact_range::initialize(&tx)?;
+        tx.commit()?;
         Ok(Self { db })
     }
 
@@ -611,25 +612,31 @@ impl Store {
         Ok((missing, false))
     }
 
-    pub(super) fn prioritize_growing(
+    pub(super) fn prioritize_queue(
         &self,
         growing: &BTreeMap<PathBuf, u64>,
+        recent_since: Option<i64>,
         queue: &mut VecDeque<PathBuf>,
     ) -> Result<()> {
         let mut source_id = self.db.prepare_cached("SELECT id FROM token_sources WHERE source=?")?;
         let seeds: Vec<i64> = growing.keys().map(|path| {
             source_id.query_row([encode_path(path)], |r| r.get(0))
         }).collect::<rusqlite::Result<_>>()?;
+        let recent: Vec<_> = match recent_since {
+            Some(since) => self.recent_sessions(since)?.into_iter().map(|(session, _)| session).collect(),
+            None => Vec::new(),
+        };
         let mut statement = self.db.prepare_cached(
             "WITH RECURSIVE component(id,link) AS (
                  SELECT value,NULL FROM json_each(?1)
+                 UNION SELECT NULL,'s:'||value FROM json_each(?2)
                  UNION SELECT NULL,l.link FROM component c JOIN token_source_links l ON l.source_id=c.id
                  UNION SELECT l.source_id,NULL FROM component c JOIN token_source_links l ON l.link=c.link
              )
              SELECT s.source FROM component c JOIN token_sources s ON s.id=c.id
              WHERE COALESCE(json_extract(CAST(s.checkpoint AS TEXT),'$.legacy_identity_prefix'),s.offset)>0",
         )?;
-        let mut rows = statement.query([serde_json::to_string(&seeds)?])?;
+        let mut rows = statement.query([serde_json::to_string(&seeds)?, serde_json::to_string(&recent)?])?;
         let mut linked = HashSet::new();
         while let Some(row) = rows.next()? {
             linked.insert(decode_path(row.get(0)?)?);

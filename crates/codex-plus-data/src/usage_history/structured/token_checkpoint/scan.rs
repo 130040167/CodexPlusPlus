@@ -1,5 +1,6 @@
 use super::{
     SourceStamp,
+    disk_full,
     ingest::SourceReader,
     store::{
         Coverage, Store,
@@ -7,13 +8,20 @@ use super::{
         replicas::{Comparison, Probe},
     },
 };
-use crate::usage_history::structured::{FileState, discover, index_budget::Budget};
+use crate::usage_history::structured::{FileState, discover, discover_directories, index_budget::Budget};
 use chrono::NaiveDate;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 const SOURCES_PER_ROUND: usize = 64;
 pub(super) const RECLAIM_BATCH: u32 = 256;
+
+#[derive(Clone, Copy)]
+struct WaitingLine {
+    stamp: SourceStamp,
+    count_gap: bool,
+    scoped: bool,
+}
 
 #[derive(Default)]
 pub(super) struct Scan {
@@ -25,12 +33,14 @@ pub(super) struct Scan {
     comparing: Option<Box<Comparison>>,
     deferred: Option<SourceReader>,
     rescan: bool,
+    discovered: HashSet<PathBuf>,
     live: BTreeMap<PathBuf, SourceStamp>,
-    waiting_for_newline: BTreeMap<PathBuf, (SourceStamp, bool)>,
+    waiting_for_newline: BTreeMap<PathBuf, WaitingLine>,
     last_revisited: Option<PathBuf>,
     waiting_prefixes: HashSet<PathBuf>,
     issues: usize,
     unknown_count_scope: bool,
+    pub(super) paired_only: bool,
     sealed_queue: HashSet<PathBuf>,
     legacy_prefixes: BTreeMap<PathBuf, (SourceStamp, bool)>,
     scoped_count_gaps: BTreeSet<PathBuf>,
@@ -64,7 +74,7 @@ impl Scan {
             || self.issues != self.scoped_count_gaps.len()
             || self.deferred.is_some()
             || self.revisiting.is_some()
-            || !self.waiting_for_newline.is_empty()
+            || self.waiting_for_newline.values().any(|line| !line.scoped)
     }
 
     pub(super) fn maintain(&mut self, store: &mut Store, cutoff: NaiveDate) -> anyhow::Result<()> {
@@ -128,6 +138,7 @@ impl Scan {
             self.missing.clear();
             self.more_missing = false;
             let paths = discover(home, !self.rescan, &mut self.issues);
+            self.discovered = paths.iter().cloned().collect();
             self.unknown_count_scope = self.issues != 0;
             if self.issues == 0 {
                 match store.missing_sources(&paths, SOURCES_PER_ROUND) {
@@ -147,10 +158,11 @@ impl Scan {
                 .into_iter()
                 .filter(|path| {
                     // 有计数缺口的前缀需从持久检查点恢复诊断，只有干净的半行可以跳过。
-                    if let Some(&(stamp, false)) = waiting.get(path)
-                        && FileState::source_stamp(path).is_ok_and(|current| current == stamp)
+                    if let Some(&line) = waiting.get(path)
+                        && !line.count_gap
+                        && FileState::source_stamp(path).is_ok_and(|current| current == line.stamp)
                     {
-                        self.waiting_for_newline.insert(path.clone(), (stamp, false));
+                        self.waiting_for_newline.insert(path.clone(), line);
                         false
                     } else {
                         true
@@ -185,6 +197,16 @@ impl Scan {
                             self.sealed_queue
                                 .retain(|path| previous_queue.contains(path));
                         }
+                        // 不再增长的近期会话也可能在等待关联归档的旧前缀复核。
+                        let recent_since = self.legacy_prefixes.values().any(|&(_, counts)| counts)
+                            .then(|| chrono::Local::now().timestamp_millis() - super::RECENT_CLASSIFICATION_MS);
+                        if (recent_since.is_some() || self.missing.is_empty() && !growing.is_empty())
+                            && let Err(error) = store.prioritize_queue(&growing, recent_since, &mut self.remaining)
+                        {
+                            self.issues += 1;
+                            self.unknown_count_scope = true;
+                            errors.push((home.to_owned(), error));
+                        }
                         if !self.missing.is_empty() {
                             let names: HashSet<_> = self.missing.iter()
                                 .filter_map(|(path, _)| path.file_name())
@@ -195,25 +217,18 @@ impl Scan {
                                     !path.file_name().is_some_and(|name| names.contains(name)),
                                 )
                             });
-                        } else if !growing.is_empty() {
-                            // 优先解析追加内容，读完并提交后才可按新的计数范围保留归属。
-                            if let Err(error) = store.prioritize_growing(&growing, &mut self.remaining) {
-                                self.issues += 1;
-                                self.unknown_count_scope = true;
-                                errors.push((home.to_owned(), error));
-                            }
-                            if !self.retirement_blocked()
-                                && !self.more_missing
-                                && self.remaining.len() == self.sealed_queue.len() + growing.len()
+                        } else if !growing.is_empty()
+                            && !self.retirement_blocked()
+                            && !self.more_missing
+                            && self.remaining.len() == self.sealed_queue.len() + growing.len()
+                        {
+                            // 再留一个字节探测 EOF；每批仍按普通预算提交。
+                            let observed = growing.values().sum::<u64>().saturating_add(1);
+                            if observed > batch_bytes && observed <= reconciliation_limit as u64
                             {
-                                // 再留一个字节探测 EOF；每批仍按普通预算提交。
-                                let observed = growing.values().sum::<u64>().saturating_add(1);
-                                if observed > batch_bytes && observed <= reconciliation_limit as u64
-                                {
-                                    budget.read_left = observed;
-                                    budget.source_left = observed;
-                                    finish_appends = true;
-                                }
+                                budget.read_left = observed;
+                                budget.source_left = observed;
+                                finish_appends = true;
                             }
                         }
                     }
@@ -246,7 +261,7 @@ impl Scan {
                 {
                     return true;
                 }
-                let stamp = self.waiting_for_newline.get(path).map_or(*stamp, |tail| tail.0);
+                let stamp = self.waiting_for_newline.get(path).map_or(*stamp, |line| line.stamp);
                 match FileState::source_stamp(path) {
                     Ok(current) if current != stamp => {
                         changed.push_back(path.clone());
@@ -266,6 +281,12 @@ impl Scan {
                 let next = changed.partition_point(|path| path <= last);
                 changed.rotate_left(next);
             }
+            // 新会话与已知文件追加共用实时名额，不必等无关归档扫描结束。
+            let mut discovery_errors = 0;
+            let paths = discover_directories(home, vec![sessions_dir.clone()], false, &mut discovery_errors);
+            self.issues += discovery_errors;
+            self.unknown_count_scope |= discovery_errors != 0;
+            changed.extend(paths.into_iter().filter(|path| self.discovered.insert(path.clone())));
         }
         if !changed.is_empty() {
             if self.active.is_none() && retry.is_none() && self.comparing.is_none()
@@ -277,7 +298,7 @@ impl Scan {
             let growing: HashSet<_> = changed.iter().collect();
             self.remaining.retain(|path| !growing.contains(path));
             for path in &changed {
-                let was_waiting = self.waiting_for_newline.remove(path).is_some_and(|(_, gap)| gap);
+                let was_waiting = self.waiting_for_newline.remove(path).is_some_and(|line| line.count_gap);
                 let was_sealed = self.sealed_queue.remove(path);
                 let was_prefix = self.legacy_prefixes.remove(path).is_some();
                 let removed_gap = (was_waiting || was_sealed || was_prefix) && self.scoped_count_gaps.remove(path);
@@ -517,7 +538,11 @@ impl Scan {
                     if !complete {
                         self.waiting_for_newline.insert(
                             reader.source.clone(),
-                            (reader.state.stamp.unwrap(), reader.has_count_gap()),
+                            WaitingLine {
+                                stamp: reader.state.stamp.unwrap(),
+                                count_gap: reader.has_count_gap(),
+                                scoped: reader.waiting_line_has_committed_scope(),
+                            },
                         );
                     }
                     if reader.has_only_malformed_token_counts() {
@@ -628,6 +653,7 @@ impl Scan {
                 }
             }
         }
+        let unscoped_missing = self.more_missing || covered < self.missing.len();
         for path in self.remaining.iter().chain(self.active.iter().chain(&self.revisiting)
             .chain(&self.deferred).map(|reader| &reader.source)) {
             if self.sealed_queue.contains(path) {
@@ -650,28 +676,47 @@ impl Scan {
                 }
             }
         }
-        let unknown = self.unknown_count_scope || pending_sources > covered + unpublished_append;
-        let can_classify = !unknown && unpublished_append == 0 && issues == self.scoped_count_gaps.len();
+        // 普通追加的半行还不是冲突，只暂停该来源关联会话的重新归属。
+        let mut unscoped_line = false;
+        for (path, line) in &self.waiting_for_newline {
+            if line.scoped {
+                covered += 1;
+                rechecking.insert(path.clone());
+            } else {
+                unscoped_line = true;
+            }
+        }
+        let unknown = self.unknown_count_scope || unscoped_missing || unscoped_line
+            || self.active.iter().chain(&self.revisiting).chain(&self.deferred)
+                .any(|reader| reader.replacing || reader.state.issues != 0
+                    || reader.state.invalid_counts || reader.state.identity_conflict);
+        let can_publish_scope = !unknown && issues == self.scoped_count_gaps.len();
+        // A queued source is not a conflict. Until it is read, new exact matches
+        // require an independent response identity, not just matching counts.
+        self.paired_only = pending_sources > covered + unpublished_append;
+        let can_classify = can_publish_scope && unpublished_append == 0;
         let coverage = Coverage { pending_sources, issues, maintenance_blocked: maintenance_error.is_some() };
-        let recorded = if can_classify {
+        let write_blocked = maintenance_error.as_ref().is_some_and(disk_full)
+            || errors.iter().any(|(_, error)| disk_full(error));
+        let recorded = if write_blocked {
+            // 写入失败不是来源冲突，不发布据此推导的撤回。
+            Ok(())
+        } else if can_publish_scope {
             store.record_scoped_coverage(coverage, &affected, &rechecking)
         } else {
             store.record_coverage(coverage, unknown)
         };
-        if let Err(error) = recorded {
-            issues += 1;
-            return Report {
-                complete: false,
-                can_classify: false,
-                pending_sources,
-                issues,
-                errors,
-                maintenance_error: Some(error),
-            };
+        let coverage_error = recorded.err();
+        issues += usize::from(coverage_error.is_some());
+        let maintenance_error = coverage_error.or(maintenance_error);
+        let write_blocked = write_blocked || maintenance_error.as_ref().is_some_and(disk_full);
+        if write_blocked {
+            // 下轮从已提交游标重新盘点，不能让临时错误滞留到旧队列耗尽。
+            *self = Self::default();
         }
         Report {
-            complete: pending_sources == 0 && issues == 0 && maintenance_error.is_none(),
-            can_classify: can_classify && maintenance_error.is_none(),
+            complete: !write_blocked && pending_sources == 0 && issues == 0 && maintenance_error.is_none(),
+            can_classify: !write_blocked && can_classify && maintenance_error.is_none(),
             pending_sources,
             issues,
             errors,

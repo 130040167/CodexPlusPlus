@@ -185,6 +185,167 @@ fn local_evidence_placeholder_is_never_a_verified_model() {
 }
 
 #[test]
+fn supplier_only_evidence_accepts_routing_models_without_resolving_the_model() {
+    for source in ["session-context-inferred", "request-log-recovered-supplier-only"] {
+        for model in ["group/routing", "unknown"] {
+            let mut fixture = Fixture::new();
+            fixture.write_segment(
+                "rollout-a.jsonl",
+                vec![fixture.context(500, model), fixture.usage(1_000, 1)],
+            );
+            let original = fixture.snapshot();
+            let mut record = evidence(&original.events[0], &original.events[0].model);
+            record["source"] = json!(source);
+            fixture.write_evidence(vec![record]);
+            reopen_index(&mut fixture);
+            let repaired = fixture.snapshot();
+            assert_eq!(repaired.events[0].provider, "supplier-a", "{source}/{model}");
+            assert_eq!(repaired.events[0].provider_source.as_deref(), Some(source));
+            assert_eq!(repaired.events[0].model, original.events[0].model);
+            assert_eq!(repaired.events[0].delta, original.events[0].delta);
+            assert_eq!(repaired.events[0].id, original.events[0].id);
+            assert_eq!(repaired.provider_evidence["appliedEvents"], 1);
+            fixture.write_evidence(vec![]);
+            let withdrawn = fixture.snapshot();
+            assert_eq!(withdrawn.events[0].provider, original.events[0].provider);
+        }
+    }
+}
+
+#[test]
+fn supplier_only_evidence_keeps_unknown_cache_and_conflict_boundaries() {
+    for (source, allowed) in [
+        ("session-context-inferred", true),
+        ("request-log-recovered-supplier-only", true),
+        ("model-namespace", true),
+        ("upstream-exact-bidirectional", false),
+        ("user-classified", false),
+        ("user-provider-classification", false),
+    ] {
+        let mut fixture = Fixture::new();
+        let mut row = fixture.usage(1_000, 1);
+        for name in ["total_token_usage", "last_token_usage"] {
+            row["payload"]["info"][name].as_object_mut().unwrap().remove("cached_input_tokens");
+        }
+        fixture.write_segment("rollout-a.jsonl",
+            vec![fixture.context(500, "supplier-a/model-a"), row]);
+        let original = fixture.snapshot();
+        assert!(!original.events[0].delta.cached_known);
+        let mut record = evidence(&original.events[0], &original.events[0].model);
+        record["source"] = json!(source);
+        fixture.write_evidence(vec![record.clone()]);
+        reopen_index(&mut fixture);
+        let mut repaired = fixture.snapshot();
+        assert_eq!(repaired.provider_evidence["appliedEvents"], usize::from(allowed), "{source}");
+        if allowed {
+            assert_eq!(repaired.events[0].provider, "supplier-a", "{source}");
+            assert_eq!(repaired.events[0].provider_source.as_deref(), Some(source));
+            repaired.events[0].provider.clone_from(&original.events[0].provider);
+            repaired.events[0].provider_source.clone_from(&original.events[0].provider_source);
+        }
+        assert!(repaired.events[0] == original.events[0], "{source}: changed raw usage");
+        fixture.write_evidence(vec![]);
+        let withdrawn = fixture.snapshot();
+        assert!(withdrawn.events[0] == original.events[0], "{source}: revocation changed usage");
+        if !allowed {
+            continue;
+        }
+        for conflict in ["context", "uncertain", "incomplete", "provider"] {
+            let mut event = original.events[0].clone();
+            match conflict {
+                "context" => event.context_conflicts.provider = true,
+                "uncertain" => event.count_uncertain = true,
+                "incomplete" => event.count_incomplete = true,
+                "provider" => event.provider = "supplier-b".into(),
+                _ => unreachable!(),
+            }
+            let mut snapshot = Snapshot::default();
+            snapshot.events.push(event.clone());
+            let document = serde_json::from_value(json!({"version":1, "records":[record]})).unwrap();
+            LegacyEvidenceCache::default().apply(Ok(Some(document)), &mut snapshot);
+            assert!(snapshot.events[0] == event, "{source}/{conflict}");
+            assert_eq!(snapshot.provider_evidence["appliedEvents"], 0, "{source}/{conflict}");
+            assert_eq!(snapshot.provider_evidence["conflictedEvents"], 1, "{source}/{conflict}");
+        }
+    }
+}
+
+#[test]
+fn historical_direct_evidence_upgrades_inference_without_overwriting_direct_proof() {
+    let mut fixture = Fixture::new();
+    fixture.write_segment(
+        "rollout-a.jsonl",
+        vec![fixture.context(500, "model-a"), fixture.usage(1_000, 1)],
+    );
+    let original = fixture.snapshot().events.remove(0);
+    for previous_source in [
+        "model-namespace",
+        "session-context-inferred",
+        "request-log-exact",
+        "request-log-recovered-supplier-only",
+    ] {
+        for source in [
+            "upstream-exact-bidirectional",
+            "request-log-recovered-supplier-only",
+            "session-context-inferred",
+        ] {
+            for provider in ["supplier-a", "supplier-b"] {
+                let mut event = original.clone();
+                event.provider = provider.into();
+                event.provider_source = Some(previous_source.into());
+                let mut record = evidence(&event, &event.model);
+                record["source"] = json!(source);
+                let upgrade = matches!(
+                    previous_source,
+                    "model-namespace" | "session-context-inferred"
+                ) && source != "session-context-inferred";
+                let document = serde_json::from_value(
+                    json!({"version":1, "records":[record.clone()]}),
+                ).unwrap();
+                let mut cache = LegacyEvidenceCache::default();
+                let mut snapshot = Snapshot::default();
+                snapshot.events.push(event.clone());
+                cache.apply(Ok(Some(document)), &mut snapshot);
+                let mut expected = event.clone();
+                if upgrade {
+                    expected.provider = "supplier-a".into();
+                    expected.provider_source = Some(source.into());
+                }
+                assert!(snapshot.events[0] == expected, "{previous_source}/{source}/{provider}");
+                assert_eq!(snapshot.provider_evidence["appliedEvents"], usize::from(upgrade));
+                // 历史覆盖从原始快照重建，撤回后恢复原归属和原始计数。
+                snapshot.events = vec![event.clone()];
+                cache.apply(Ok(None), &mut snapshot);
+                assert!(snapshot.events[0] == event);
+                if upgrade {
+                    for conflict in ["context", "signature", "duplicate"] {
+                        let mut rejected = event.clone();
+                        let mut invalid_record = record.clone();
+                        match conflict {
+                            "context" => rejected.context_conflicts.provider = true,
+                            "signature" => invalid_record["output"] = json!(11),
+                            "duplicate" => {}
+                            _ => unreachable!(),
+                        }
+                        let document = serde_json::from_value(
+                            json!({"version":1, "records":[invalid_record]}),
+                        ).unwrap();
+                        let mut snapshot = Snapshot::default();
+                        snapshot.events.push(rejected.clone());
+                        if conflict == "duplicate" {
+                            snapshot.events.push(rejected.clone());
+                        }
+                        LegacyEvidenceCache::default().apply(Ok(Some(document)), &mut snapshot);
+                        assert!(snapshot.events.iter().all(|row| *row == rejected), "{conflict}");
+                        assert_eq!(snapshot.provider_evidence["appliedEvents"], 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn local_missing_initial_baseline_does_not_assign_lifetime_usage_to_today() {
     let mut fixture = Fixture::new();
     let mut segment = fixture.usage(2_000, 100);
@@ -653,6 +814,61 @@ fn mixed_cache_breakdown_only_prices_known_records() {
         assert_eq!(row["recordCount"], 1);
         assert_eq!(row["usage"]["cachedKnown"], known);
         assert!(row.get("priceableUsage").is_none());
+    }
+}
+
+#[test]
+fn warm_legacy_evidence_upgrades_inference_without_replacing_verified_proof() {
+    for source in ["model-namespace", "session-context-inferred"] {
+        let mut fixture = Fixture::new();
+        let model = "supplier-b/gpt-test";
+        fixture.write_segment(
+            "rollout-a.jsonl",
+            vec![fixture.context(500, model), fixture.usage(1_000, 1)],
+        );
+        let initial = fixture.snapshot();
+        let original = snapshot_response(&initial)["days"][0].clone();
+        let direct = evidence(&initial.events[0], model);
+        let mut inferred = direct.clone();
+        inferred["provider"] = json!("supplier-b");
+        inferred["providerName"] = json!("Supplier B");
+        inferred["source"] = json!(source);
+
+        fixture.write_evidence(vec![inferred.clone()]);
+        let warm = fixture.snapshot();
+        assert_eq!(warm.events[0].provider, "supplier-b");
+        assert_eq!(warm.events[0].provider_source.as_deref(), Some(source));
+
+        fixture.write_evidence(vec![direct.clone()]);
+        let updated = fixture.snapshot();
+        assert_eq!(updated.events[0].provider, "supplier-a");
+        assert_eq!(
+            updated.events[0].provider_source.as_deref(),
+            Some("upstream-exact-bidirectional")
+        );
+        assert_eq!(updated.provider_evidence["invalid"], 0);
+        let current = snapshot_response(&updated)["days"][0].clone();
+        assert_eq!(original["usage"], current["usage"]);
+        assert_eq!(
+            original["accountingFingerprint"],
+            current["accountingFingerprint"]
+        );
+        assert_eq!(
+            original["breakdowns"][0]["membershipFingerprint"],
+            current["breakdowns"][0]["membershipFingerprint"]
+        );
+
+        fixture.write_evidence(vec![]);
+        assert_ne!(
+            fixture.snapshot().events[0].provider_source.as_deref(),
+            Some("upstream-exact-bidirectional")
+        );
+        fixture.write_evidence(vec![direct]);
+        assert_eq!(fixture.snapshot().events[0].provider, "supplier-a");
+        fixture.write_evidence(vec![inferred]);
+        let downgraded = fixture.snapshot();
+        assert_eq!(downgraded.provider_evidence["invalid"], 1);
+        assert_ne!(downgraded.events[0].provider_source.as_deref(), Some(source));
     }
 }
 
@@ -1431,6 +1647,65 @@ impl Fixture {
         assert_eq!(snapshot.issues, 0);
         snapshot
     }
+}
+
+#[test]
+fn indexed_context_inference_retains_rank_and_all_tied_suppliers() -> anyhow::Result<()> {
+    let mut fixture = Fixture::new();
+    fixture.write_segment(
+        "rollout-inference.jsonl",
+        vec![fixture.context(500, "gpt-target"), fixture.usage(1_000, 1)],
+    );
+    let event = fixture.snapshot().events.pop().unwrap();
+    let at = DateTime::parse_from_rfc3339(&event.timestamp)?.timestamp_millis();
+    let request = |id: &str, model: &str, offset, input, response: Option<&str>| {
+        serde_json::from_value::<RequestEvidence>(json!({
+            "id":id,"threadId":event.session,"relayId":id,"model":model,"upstreamModel":model,
+            "success":true,"state":"success","statusCode":200,"attempts":1,"autoRetries":0,
+            "timestampMs":at+offset,"startedAtMs":at+offset-1,
+            "finalResponseId":response,
+            "usage":{"inputTokens":input,"outputTokens":10,"cachedTokens":20},
+        })).unwrap()
+    };
+    let resolve = |event: &UsageEvent| Ok(event.terminal_response.clone());
+    let scope = AttributionScope {
+        targets: 0..1, gateway_blocked: false, native_blocked: false,
+        paired_only: false, resolve_terminal: Some(&resolve),
+    };
+    let far = DELAYED_REQUEST_MATCH_WINDOW_MS + 10_000;
+    let cases = [
+        (vec![request("close", "gpt-target", 0, 105, None),
+            request("match", "gpt-target", 1000, 100, None)], None, "match"),
+        (vec![request("other", "gpt-other", 0, 100, None),
+            request("same-model", "gpt-target", -far, 100, None)], None, "same-model"),
+        (vec![request("before", "gpt-other", -1000, 100, None),
+            request("after", "gpt-other", 1000, 100, None)], None, "custom"),
+        (vec![request("before", "gpt-target", -1000, 100, None),
+            request("after", "gpt-target", 1000, 100, None)], None, "custom"),
+        (vec![request("near", "gpt-target", 0, 100, None),
+            request("receipt", "gpt-other", -far, 200, Some("r"))], Some("r"), "receipt"),
+        (vec![request("near", "gpt-target", 0, 100, None),
+            request("receipt-a", "gpt-other", -far, 200, Some("r")),
+            request("receipt-b", "gpt-other", -2 * far, 200, Some("r"))], Some("r"), "custom"),
+    ];
+    for (records, terminal, expected) in cases {
+        let mut observed = event.clone();
+        observed.terminal_response = terminal.map(Into::into);
+        RequestEvidenceCache { records, ..RequestEvidenceCache::default() }.infer_scoped(
+            std::slice::from_mut(&mut observed),
+            &mut BTreeMap::new(),
+            &BTreeMap::new(),
+            &scope,
+        )?;
+        assert_eq!(observed.provider, expected);
+        assert_eq!(observed.delta, event.delta);
+        assert_eq!(observed.provider_source.as_deref(), match expected {
+            "custom" => None,
+            "receipt" => Some("request-log-recovered-supplier-only"),
+            _ => Some("session-context-inferred"),
+        });
+    }
+    Ok(())
 }
 
 fn evidence(event: &UsageEvent, model: &str) -> Value {
@@ -4198,6 +4473,38 @@ fn legacy_child_evidence_migration_is_exact_unique_and_does_not_change_usage() {
     )
     .unwrap();
     assert!(unknown_provider(&fixture.snapshot().events[0].provider));
+}
+
+#[test]
+fn legacy_provider_inference_allows_a_missing_role_only_in_old_history() {
+    let mut fixture = Fixture::new();
+    legacy_child_segment(&fixture, LEGACY_CHILD, true);
+    let base = fixture.snapshot().events.remove(0);
+    for (age, source, role, accepted) in [
+        (90, "session-context-inferred", "", true),
+        (0, "session-context-inferred", "", false),
+        (90, "upstream-exact-bidirectional", "", false),
+        (90, "session-context-inferred", "main", false),
+    ] {
+        let mut event = base.clone();
+        let at = Local::now() - chrono::Duration::days(age);
+        event.timestamp = at.to_rfc3339();
+        event.date = at.date_naive();
+        event.role = role.into();
+        event.legacy_identity = None;
+        let mut record = evidence(&event, &event.model);
+        record["role"] = json!("");
+        record["source"] = json!(source);
+        let mut snapshot = Snapshot { events: vec![event], ..Snapshot::default() };
+        LegacyEvidenceCache::default().apply(
+            Ok(Some(serde_json::from_value(json!({"version":1,"records":[record]})).unwrap())),
+            &mut snapshot,
+        );
+        let result = &snapshot.events[0];
+        assert_eq!(result.provider_source.as_deref(), accepted.then_some(source));
+        assert_eq!(result.id, base.id);
+        assert_eq!(result.delta, base.delta);
+    }
 }
 
 #[test]

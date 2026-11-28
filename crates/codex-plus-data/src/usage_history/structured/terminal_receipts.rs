@@ -43,23 +43,30 @@ pub(super) fn parse(
     let response = payload["response_id"]
         .as_str()
         .filter(|id| valid_response_id(id))?;
-    let counts = |key: &str| {
-        let value = &payload[key];
-        Tokens::parse(value).filter(|tokens| {
-            tokens.cached_known
-                && tokens
-                    .input_tokens
-                    .checked_add(tokens.output_tokens)
-                    .is_some()
-                && (!value
-                    .as_object()
-                    .is_some_and(|obj| obj.contains_key("total_tokens"))
-                    || value["total_tokens"].as_u64() == Some(tokens.total_tokens))
-        })
-    };
-    let last = counts("usage").filter(|tokens| tokens.total_tokens > 0)?;
-    let total = counts("thread_token_usage")?;
-    if !total.is_monotonic_after(last) || total.cached_input_tokens < last.cached_input_tokens {
+    let usage = &payload["usage"];
+    let raw_last = Tokens::parse(usage)?;
+    let last_accounting = CacheAccounting::parse(usage, raw_last);
+    let last = raw_last.normalize_cache_input(last_accounting, None, None);
+    if last.total_tokens == 0
+        || last.input_tokens.checked_add(last.output_tokens).is_none()
+        || (usage.get("total_tokens").is_some()
+            && usage["total_tokens"].as_u64() != Some(last.total_tokens))
+    {
+        return None;
+    }
+    // 跨续接的累计合计可能沿用旧口径；与原生计数一样以累计分项为准。
+    let cumulative = &payload["thread_token_usage"];
+    let raw_total = Tokens::parse(cumulative)?;
+    let total = raw_total.normalize_cache_input(
+        CacheAccounting::parse(cumulative, raw_total),
+        state.previous_cache_accounting.zip(state.previous),
+        last_accounting,
+    );
+    if !total.is_monotonic_after(last)
+        || total.input_tokens.checked_add(total.output_tokens).is_none()
+        || (total.cached_known && last.cached_known
+            && total.cached_input_tokens < last.cached_input_tokens)
+    {
         return None;
     }
     // The same final response has one identity across restarts and copied logs.
@@ -211,7 +218,14 @@ pub(super) fn reconcile<'a>(
     let mut matches = HashMap::new();
     let mut latest = HashMap::<&str, (&str, Tokens)>::new();
     for (i, event) in events.iter().enumerate() {
-        if let Some(signature) = signature(event) {
+        // 原生重复累计产生的已确认零差量不是另一笔回执候选。
+        if (event.delta.total_tokens > 0
+            || event.count_uncertain
+            || event.count_incomplete
+            || event.count_pending
+            || event.context_conflicts.any())
+            && let Some(signature) = signature(event)
+        {
             matches
                 .entry(signature)
                 .and_modify(|row| *row = None)
@@ -282,6 +296,18 @@ pub(super) fn reconcile<'a>(
 }
 
 pub(super) fn apply_receipt_counts(event: &mut UsageEvent, receipt: &UsageEvent) -> bool {
+    // 身份回执可以缺缓存；这种回执不能把未知缓存补成零。
+    if !receipt.delta.cached_known {
+        return false;
+    }
+    // 混合口径使差量失去缓存知识时，唯一回执可证明本次恰好漏了缓存。
+    let omitted_cache = !event.delta.cached_known
+        && event.delta.input_tokens.checked_add(receipt.delta.cached_input_tokens)
+            == Some(receipt.delta.input_tokens)
+        && event.delta.output_tokens == receipt.delta.output_tokens
+        && event.delta.reasoning_output_tokens
+            .zip(receipt.delta.reasoning_output_tokens)
+            .is_none_or(|(a, b)| a == b);
     if signature(event) != signature(receipt)
         || event.count_uncertain
         || event.count_incomplete
@@ -291,11 +317,15 @@ pub(super) fn apply_receipt_counts(event: &mut UsageEvent, receipt: &UsageEvent)
         || !event
             .last
             .is_some_and(|last| compatible(last, receipt.delta))
-        || !compatible(event.delta, receipt.delta)
+        || (!compatible(event.delta, receipt.delta) && !omitted_cache)
     {
         return false;
     }
     let native = event.delta;
+    if omitted_cache {
+        event.delta.input_tokens = receipt.delta.input_tokens;
+        event.delta.total_tokens = receipt.delta.total_tokens;
+    }
     event.delta.cached_input_tokens = receipt.delta.cached_input_tokens;
     event.delta.cached_known = true;
     event.delta.reasoning_output_tokens = event
