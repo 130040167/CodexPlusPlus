@@ -1,13 +1,14 @@
 //! 共享后台索引：正文留在后台，只向拓展提供用量和已完成工具回执。
 use super::{Aggregate, CacheAccounting, Query, Record, Tokens, file_identity};
-use chrono::{DateTime, Duration as Days, Local, NaiveDate};
-use serde::Deserialize;
+use chrono::{DateTime, Datelike, Duration as Days, Local, NaiveDate};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json, value::RawValue};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -19,7 +20,7 @@ mod provider_cache;
 mod provider_capture;
 mod segments;
 mod supplier_evidence;
-#[cfg(test)]
+mod terminal_receipts;
 mod token_checkpoint;
 mod tool_receipts;
 
@@ -1417,6 +1418,7 @@ struct NativeResponseIdentity {
 #[derive(Clone, PartialEq, Eq)]
 struct UsageEvent {
     native_response_id: Option<NativeResponseIdentity>,
+    terminal_response: Option<Box<str>>,
     id: [u8; 32],
     original_id: [u8; 32],
     session: String,
@@ -1738,6 +1740,12 @@ enum PendingUsageReceipt {
     },
 }
 
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+struct TokenDaySpan {
+    first: Option<i32>,
+    last: Option<i32>,
+}
+
 #[derive(Default)]
 struct FileState {
     pending_response: Option<PendingUsageReceipt>,
@@ -1758,12 +1766,14 @@ struct FileState {
     previous: Option<Tokens>,
     previous_cache_accounting: Option<CacheAccounting>,
     invalid_counts: bool,
+    malformed_token_counts: usize,
     identity_conflict: bool,
     continuation: bool,
     history_base: Option<segments::HistoryBase>,
     rollout_extent: Option<(u64, u64, u64)>,
     rollout_out_of_order: bool,
     expired_count: Option<((u64, u64, u64), Tokens)>,
+    token_day_span: Option<TokenDaySpan>,
     events: Vec<UsageEvent>,
     calls: HashMap<String, Call>,
     exec_skills: HashMap<String, ExecSkill>,
@@ -1796,7 +1806,7 @@ struct Index {
     native_cache_loaded: bool,
     native_cache_version: Option<i64>,
     provider_cache: provider_cache::ProviderCache,
-    legacy_signatures: HashMap<String, Option<[u8; 32]>>,
+    legacy_evidence: LegacyEvidenceCache,
 }
 
 #[derive(Default)]
@@ -1830,13 +1840,47 @@ struct Snapshot {
 
 struct Cache {
     settings_path: PathBuf,
-    index: Option<Index>,
-    snapshot: Arc<Snapshot>,
+    storage: PathBuf,
+    runtime: Option<token_checkpoint::Runtime>,
+    snapshot: Arc<token_checkpoint::ReadState>,
     active: bool,
     refreshed: Option<Instant>,
     touched: Instant,
     _collector: Option<provider_capture::ProviderCollector>,
     worker: Option<std::thread::JoinHandle<()>>,
+    archive: ArchiveSlot,
+}
+
+#[derive(Default)]
+struct ArchiveSlot {
+    cancelled: Arc<AtomicBool>,
+    worker: Option<(
+        token_checkpoint::ArchiveKey,
+        std::thread::JoinHandle<token_checkpoint::ArchiveAnswer>,
+    )>,
+    result: Option<(Instant, Arc<token_checkpoint::ArchiveAnswer>)>,
+}
+
+impl ArchiveSlot {
+    fn result(&mut self) -> Option<Arc<token_checkpoint::ArchiveAnswer>> {
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|(_, worker)| worker.is_finished())
+        {
+            let (key, worker) = self.worker.take().expect("finished archive worker");
+            let answer = worker
+                .join()
+                .unwrap_or_else(|_| (key, Err("archive worker panicked".into())));
+            self.result = Some((Instant::now(), Arc::new(answer)));
+        }
+        if self.result.as_ref().is_some_and(|(at, answer)| {
+            at.elapsed() >= Duration::from_secs(if answer.1.is_ok() { 300 } else { 15 })
+        }) {
+            self.result = None;
+        }
+        self.result.as_ref().map(|(_, answer)| Arc::clone(answer))
+    }
 }
 
 type HistoryCaches = Mutex<HashMap<PathBuf, Arc<Mutex<Cache>>>>;
@@ -1847,14 +1891,24 @@ fn homes() -> &'static HistoryCaches {
 }
 
 fn stop_cache(cache: Arc<Mutex<Cache>>) {
-    let (collector, worker) = {
+    let (collector, worker, archive) = {
         let mut state = cache.lock().unwrap_or_else(|error| error.into_inner());
-        (state._collector.take(), state.worker.take())
+        state.archive.cancelled.store(true, Ordering::Relaxed);
+        (
+            state._collector.take(),
+            state.worker.take(),
+            state.archive.worker.take(),
+        )
     };
     // 不持有索引锁等待退出；其他强引用不能延迟后台任务的收尾。
     drop(collector);
     if let Some(worker) = worker {
         let _ = worker.join();
+    }
+    if let Some((_, worker)) = archive {
+        if worker.join().is_err() {
+            eprintln!("usage archive worker panicked while stopping");
+        }
     }
 }
 
@@ -1986,19 +2040,19 @@ fn query_with_settings(home: &Path, options: &Query, request: &Value, settings: 
         cache.clone()
     } else {
         let storage_dir = provider_cache::storage_dir(home, &settings);
+        let runtime = token_checkpoint::Runtime::new(storage_dir.clone(), settings.clone());
+        let snapshot = Arc::new(runtime.initial_state());
         let cache = Arc::new(Mutex::new(Cache {
             settings_path: settings.clone(),
-            index: Some(Index {
-                settings_path: Some(settings.clone()),
-                storage_dir: Some(storage_dir),
-                ..Index::default()
-            }),
-            snapshot: Arc::new(Snapshot::default()),
+            runtime: Some(runtime),
+            storage: storage_dir,
+            snapshot,
             active: false,
             refreshed: None,
             touched: Instant::now(),
             _collector: None,
             worker: None,
+            archive: ArchiveSlot::default(),
         }));
         let weak = Arc::downgrade(&cache);
         let identity = home.to_owned();
@@ -2040,24 +2094,24 @@ fn query_with_settings(home: &Path, options: &Query, request: &Value, settings: 
             .refreshed
             .is_none_or(|at| at.elapsed() >= REFRESH_INTERVAL)
     {
-        let mut index = state.index.take().unwrap_or_else(|| Index {
-            settings_path: Some(state.settings_path.clone()),
-            storage_dir: Some(provider_cache::storage_dir(home, &state.settings_path)),
-            ..Index::default()
-        });
+        let mut runtime = state
+            .runtime
+            .take()
+            .expect("idle usage worker owns its runtime");
         state.active = true;
         let shared = cache.clone();
         let home = home.to_owned();
         match std::thread::Builder::new()
             .name("rollout-history".into())
             .spawn(move || {
-                let snapshot =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| index.update(&home)));
+                let snapshot = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    runtime.update(&home)
+                }));
                 if let Ok(mut state) = shared.lock() {
                     if let Ok(snapshot) = snapshot {
                         state.snapshot = Arc::new(snapshot);
                     }
-                    state.index = Some(index);
+                    state.runtime = Some(runtime);
                     state.active = false;
                     state.refreshed = Some(Instant::now());
                 }
@@ -2066,47 +2120,57 @@ fn query_with_settings(home: &Path, options: &Query, request: &Value, settings: 
             Err(error) => {
                 state.active = false;
                 state.refreshed = Some(Instant::now());
+                state.runtime = Some(token_checkpoint::Runtime::new(
+                    state.storage.clone(),
+                    state.settings_path.clone(),
+                ));
                 return json!({"status":"unavailable","complete":false,"message":error.to_string()});
             }
         }
     }
     let snapshot = state.snapshot.clone();
-    let storage = provider_cache::storage_dir(home, &state.settings_path);
+    let storage = state.storage.clone();
     let processing = state.active;
-    // clear 取得 homes 锁后才能完成关闭；同步读缓存也必须留在这条边界内。
-    let live_attributions = live_receipts::match_captured_receipts(
-        &storage,
-        &snapshot.live_requests,
-        &snapshot.aliases,
-        &request["liveReceipts"],
-    );
+    let archived = state.archive.result();
     drop(state);
     // clear 必须等本次启动登记完成，才能移除缓存并收齐后台任务。
     drop(homes);
-    let mut response = snapshot.response_page(
+    let (mut response, schedule) = snapshot.read_with_archive(
+        &storage,
         options,
+        request,
+        scope_session.as_deref(),
         processing,
-        request["activityPage"].as_u64().unwrap_or(1).clamp(1, 24) as usize,
-        request["activityRevision"].as_i64(),
-        request["startAt"].as_i64().zip(request["endAt"].as_i64()),
+        archived.as_deref(),
     );
-    if let Some(session) = scope_session {
-        response["scopedUsage"] = snapshot.scoped_usage(
-            &session,
-            options,
-            request["startAt"].as_i64().zip(request["endAt"].as_i64()),
-        );
-    }
-    response["liveAttributions"] = live_attributions;
-    if request["includeActivity"] != true {
-        if let Some(response) = response.as_object_mut() {
-            for key in [
-                "activityRecords",
-                "activityPagination",
-                "activityComplete",
-                "activityTruncated",
-            ] {
-                response.remove(key);
+    if let Some(key) = schedule
+        && let Ok(mut state) = cache.lock()
+        && !state.archive.cancelled.load(Ordering::Relaxed)
+        && state.archive.worker.is_none()
+        && !state.archive.result.as_ref().is_some_and(|(_, ready)| {
+            ready.0 == key
+                && archived
+                    .as_ref()
+                    .is_none_or(|seen| !Arc::ptr_eq(seen, ready))
+        })
+    {
+        let job = key.clone();
+        let home = home.to_owned();
+        let settings = state.settings_path.clone();
+        let cancelled = state.archive.cancelled.clone();
+        // 同一缓存仅允许一个只读回读；不阻塞前台查询或近期索引写者。
+        match std::thread::Builder::new()
+            .name("rollout-history-archive".into())
+            .spawn(move || {
+                token_checkpoint::recover_archive(
+                    job, &home, &storage, &settings, &snapshot, &cancelled,
+                )
+            }) {
+            Ok(worker) => state.archive.worker = Some((key, worker)),
+            Err(error) => {
+                let message = error.to_string();
+                response["archiveRecovery"] = json!({"status":"partial","message":message});
+                state.archive.result = Some((Instant::now(), Arc::new((key, Err(message)))));
             }
         }
     }
@@ -2179,54 +2243,87 @@ fn discover(home: &Path, cold_start: bool, errors: &mut usize) -> Vec<PathBuf> {
     files.into_iter().map(|(_, path)| path).collect()
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyEvidenceDocument {
+    version: u32,
+    records: Vec<LegacyProviderEvidence>,
+}
+
+impl LegacyEvidenceDocument {
+    fn read(settings: &Path) -> anyhow::Result<Option<Self>> {
+        const LIMIT: u64 = 32 * 1024 * 1024;
+        let path = settings.with_file_name("usage-provider-evidence.json");
+        let metadata = match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            other => other?,
+        };
+        anyhow::ensure!(
+            metadata.is_file() && metadata.len() <= LIMIT,
+            "evidence size/type"
+        );
+        let stamp = |m: &fs::Metadata| (m.len(), m.modified().ok(), file_identity(m));
+        let file = File::open(&path)?;
+        anyhow::ensure!(
+            stamp(&file.metadata()?) == stamp(&metadata),
+            "evidence replaced"
+        );
+        let mut bytes = Vec::new();
+        file.take(LIMIT + 1).read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() as u64 == metadata.len()
+                && stamp(&fs::symlink_metadata(&path)?) == stamp(&metadata),
+            "evidence changed"
+        );
+        let document: Self = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(
+            document.version == 1 && document.records.len() <= MAX_EVENTS,
+            "evidence version/count"
+        );
+        Ok(Some(document))
+    }
+
+    fn timestamps(&self, times: &mut BTreeSet<i64>) {
+        times.extend(self.records.iter().filter_map(|record| {
+            DateTime::parse_from_rfc3339(&record.timestamp)
+                .ok()
+                .map(|at| at.timestamp_millis())
+        }));
+    }
+}
+
 impl Index {
     fn supplement_legacy_evidence(&mut self, settings: &Path, snapshot: &mut Snapshot) {
-        // 每轮只读重建补证；不写入请求缓存，删除文件即可撤销，改写身份本轮索引内不再信任。
+        self.legacy_evidence
+            .apply(LegacyEvidenceDocument::read(settings), snapshot);
+    }
+}
+
+#[derive(Default)]
+struct LegacyEvidenceCache {
+    signatures: HashMap<String, Option<[u8; 32]>>,
+}
+
+impl LegacyEvidenceCache {
+    fn apply(
+        &mut self,
+        document: anyhow::Result<Option<LegacyEvidenceDocument>>,
+        snapshot: &mut Snapshot,
+    ) {
+        // 不写入请求缓存，删除文件即可撤销，改写身份在本轮索引内不再信任。
         let result = (|| -> anyhow::Result<Value> {
-            const LIMIT: u64 = 32 * 1024 * 1024;
-            #[derive(Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct Document {
-                version: u32,
-                records: Vec<LegacyProviderEvidence>,
-            }
-            let path = settings.with_file_name("usage-provider-evidence.json");
-            let metadata = match fs::symlink_metadata(&path) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return Ok(json!({"status":"absent"}));
-                }
-                other => other?,
+            let Some(document) = document? else {
+                return Ok(json!({"status":"absent"}));
             };
-            anyhow::ensure!(
-                metadata.is_file() && metadata.len() <= LIMIT,
-                "evidence size/type"
-            );
-            let stamp = |m: &fs::Metadata| (m.len(), m.modified().ok(), file_identity(m));
-            let file = File::open(&path)?;
-            anyhow::ensure!(
-                stamp(&file.metadata()?) == stamp(&metadata),
-                "evidence replaced"
-            );
-            let mut bytes = Vec::new();
-            file.take(LIMIT + 1).read_to_end(&mut bytes)?;
-            anyhow::ensure!(
-                bytes.len() as u64 == metadata.len()
-                    && stamp(&fs::symlink_metadata(&path)?) == stamp(&metadata),
-                "evidence changed"
-            );
-            let document: Document = serde_json::from_slice(&bytes)?;
-            anyhow::ensure!(
-                document.version == 1 && document.records.len() <= MAX_EVENTS,
-                "evidence version/count"
-            );
             let mut records = HashMap::new();
             let mut invalid = 0usize;
             for record in document.records {
                 let id = record.event_id.to_ascii_lowercase();
                 if id.len() != 64
                     || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    || (!self.legacy_signatures.contains_key(&id)
-                        && self.legacy_signatures.len() >= MAX_EVENTS)
+                    || (!self.signatures.contains_key(&id) && self.signatures.len() >= MAX_EVENTS)
                 {
                     invalid += 1;
                     continue;
@@ -2263,10 +2360,10 @@ impl Index {
                         .is_some_and(|n| n > 0)
                     && !records.contains_key(&id)
                     && self
-                        .legacy_signatures
+                        .signatures
                         .get(&id)
                         .is_none_or(|previous| *previous == Some(signature));
-                self.legacy_signatures
+                self.signatures
                     .insert(id.clone(), valid.then_some(signature));
                 invalid += usize::from(!valid);
                 records.insert(id, valid.then_some(record));
@@ -2364,7 +2461,9 @@ impl Index {
         })();
         snapshot.provider_evidence = result.unwrap_or_else(|_| json!({"status":"rejected"}));
     }
+}
 
+impl Index {
     fn sync_native_evidence(&mut self, cutoff: NaiveDate) -> anyhow::Result<()> {
         for _ in 0..2 {
             let before = self.provider_cache.data_version()?;
@@ -2496,7 +2595,7 @@ impl Index {
                 }
             }
             for event in &state.events {
-                if event.date < cutoff {
+                if event.date < cutoff || event.terminal_response.is_some() {
                     continue;
                 }
                 if let Some(&position) = seen.get(&event.id) {
@@ -2839,15 +2938,12 @@ impl Index {
         seen
     }
 
-    fn update(&mut self, home: &Path) -> Snapshot {
-        let request_log = codex_plus_core::request_log::request_log_path();
-        self.update_with_request_log(home, &request_log)
-    }
-
-    fn update_with_request_log(&mut self, home: &Path, request_log: &Path) -> Snapshot {
-        let started = Instant::now();
-        let cutoff = Local::now().date_naive() - Days::days(RETENTION_DAYS - 1);
-        let mut snapshot = Snapshot::default();
+    fn load_evidence(
+        &mut self,
+        home: &Path,
+        cutoff: NaiveDate,
+        request_log: &Path,
+    ) -> (bool, bool) {
         let mut cache_available = true;
         let mut cache_opened = false;
         match self
@@ -2881,20 +2977,18 @@ impl Index {
             )
             .unwrap_or(false);
         }
-        snapshot.aliases = self.provider_cache.aliases.clone();
-        let mut current_aliases = BTreeMap::new();
-        let settings = self
-            .settings_path
-            .clone()
-            .unwrap_or_else(codex_plus_core::paths::default_settings_path);
-        let stamp = native_endpoints::config_stamp(&settings);
+        (cache_opened, cache_available)
+    }
+
+    fn refresh_provider_profiles(&mut self, settings: &Path) {
+        let stamp = native_endpoints::config_stamp(settings);
         if self.provider_stamp.as_ref() != Some(&stamp) {
             self.provider_endpoints.clear();
             self.provider_names.clear();
             self.provider_endpoint_since = 0;
             self.provider_stamp = None;
-            if let Ok(profiles) = native_endpoints::profiles(&settings)
-                && native_endpoints::config_stamp(&settings) == stamp
+            if let Ok(profiles) = native_endpoints::profiles(settings)
+                && native_endpoints::config_stamp(settings) == stamp
             {
                 self.provider_endpoints = native_endpoints::endpoints(&profiles);
                 self.provider_endpoint_since = self
@@ -2908,6 +3002,21 @@ impl Index {
                 self.provider_stamp = Some(stamp);
             }
         }
+    }
+
+    #[cfg(test)]
+    fn update_with_request_log(&mut self, home: &Path, request_log: &Path) -> Snapshot {
+        let started = Instant::now();
+        let cutoff = Local::now().date_naive() - Days::days(RETENTION_DAYS - 1);
+        let mut snapshot = Snapshot::default();
+        let (cache_opened, mut cache_available) = self.load_evidence(home, cutoff, request_log);
+        snapshot.aliases = self.provider_cache.aliases.clone();
+        let mut current_aliases = BTreeMap::new();
+        let settings = self
+            .settings_path
+            .clone()
+            .unwrap_or_else(codex_plus_core::paths::default_settings_path);
+        self.refresh_provider_profiles(&settings);
         snapshot.provider_names = self.provider_names.clone();
         let paths = discover(home, self.files.is_empty(), &mut snapshot.errors);
         let existing: HashSet<_> = paths.iter().cloned().collect();
@@ -3192,7 +3301,8 @@ impl FileState {
             if event.date >= cutoff {
                 return true;
             }
-            if let Some(position) = event.rollout_position
+            if event.terminal_response.is_none()
+                && let Some(position) = event.rollout_position
                 && self
                     .expired_count
                     .is_none_or(|(previous, _)| position > previous)
@@ -3334,6 +3444,9 @@ impl FileState {
             *self = Self::default();
             meter = index_budget::Meter::new(self);
             meter.refresh(self, 0);
+        }
+        if self.stamp.is_none() && self.offset == 0 {
+            self.token_day_span = Some(TokenDaySpan::default());
         }
         if self.reader.is_none() {
             if !budget.can_open(self) {
@@ -3557,53 +3670,68 @@ impl FileState {
         }
         let inherited = self.history_boundary.contains(ordinal);
         if envelope.kind == "token_usage_record" {
-            #[derive(Deserialize)]
-            struct Receipt<'a> {
-                thread_id: &'a str,
-                turn_id: &'a str,
-                response_id: &'a str,
-                usage: Value,
-                thread_token_usage: Value,
+            if inherited || line.len() > MAX_NATIVE_RECEIPT_LINE {
+                self.pending_response = Some(PendingUsageReceipt::Unusable);
+                return;
             }
-            // 只为下一条累计用量保留证据，不从回执新增消费或改变累计基线。
+            let (Ok(payload), Some(time)) = (
+                serde_json::from_str::<Value>(envelope.payload.get()),
+                envelope.timestamp.and_then(|at| DateTime::parse_from_rfc3339(at).ok()),
+            ) else {
+                self.pending_response = Some(PendingUsageReceipt::Unusable);
+                return;
+            };
+            // 保留相邻累计记录的供应商证据；持久索引独立配对回执与迟到的计数。
             let parsed = (|| {
                 if self.pending_response.is_some()
-                    || inherited
-                    || line.len() > MAX_NATIVE_RECEIPT_LINE
-                {
-                    return None;
-                }
-                let receipt: Receipt<'_> = serde_json::from_str(envelope.payload.get()).ok()?;
-                if receipt.thread_id != self.session
+                    || payload["thread_id"] != self.session
                     || self.turn.is_empty()
-                    || receipt.turn_id != self.turn
-                    || receipt.response_id.is_empty()
-                    || receipt.response_id.len() > 256
-                    || !receipt
-                        .response_id
-                        .bytes()
-                        .all(|byte| byte.is_ascii_graphic())
+                    || payload["turn_id"] != self.turn
                 {
                     return None;
                 }
-                let at = DateTime::parse_from_rfc3339(envelope.timestamp?)
-                    .ok()?
-                    .timestamp_millis();
-                let usage = Tokens::parse(&receipt.usage)?;
+                let response = payload["response_id"].as_str().filter(|id| {
+                    !id.is_empty() && id.len() <= 256 && id.bytes().all(|byte| byte.is_ascii_graphic())
+                })?;
+                let usage = Tokens::parse(&payload["usage"])?;
                 let usage = usage.normalize_cache_input(
-                    CacheAccounting::parse(&receipt.usage, usage),
+                    CacheAccounting::parse(&payload["usage"], usage),
                     None,
                     None,
                 );
-                let total = Tokens::parse(&receipt.thread_token_usage)?;
                 Some(PendingUsageReceipt::One {
-                    id: receipt.response_id.into(),
-                    at,
+                    id: response.into(),
+                    at: time.timestamp_millis(),
                     usage,
-                    total,
+                    total: Tokens::parse(&payload["thread_token_usage"])?,
                 })
             })();
             self.pending_response = Some(parsed.unwrap_or(PendingUsageReceipt::Unusable));
+            let date = time.with_timezone(&Local).date_naive();
+            if (self.history_boundary.parent.is_none() || ordinal.is_some())
+                && let Some(mut receipt) = terminal_receipts::parse(
+                    self,
+                    &payload,
+                    time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    date,
+                )
+            {
+                self.record_token_day(date);
+                if date >= cutoff {
+                    if self.events.len() >= MAX_EVENTS {
+                        self.issues += 1;
+                    } else {
+                        receipt.rollout_position = ordinal.map(|ordinal| {
+                            (
+                                ordinal,
+                                self.offset.saturating_sub(line.len() as u64),
+                                self.offset,
+                            )
+                        });
+                        self.events.push(receipt);
+                    }
+                }
+            }
             return;
         }
         if matches!(envelope.kind, "session_meta" | "turn_context") {
@@ -3913,11 +4041,16 @@ impl FileState {
         let info = &payload["info"];
         let raw_cumulative = &info["total_token_usage"];
         let raw_request = &info["last_token_usage"];
+        // 先记录范围，再按保留期丢弃明细；冷索引也能找到历史原会话。
+        if !raw_cumulative.is_null() || !raw_request.is_null() {
+            self.record_token_day(date);
+        }
         let Some(raw_total) = Tokens::parse(raw_cumulative) else {
             if info.is_object()
                 && (!info["total_token_usage"].is_null() || !info["last_token_usage"].is_null())
             {
                 self.issues += 1;
+                self.malformed_token_counts += usize::from(!inherited);
                 self.invalid_counts = true;
             }
             return;
@@ -4038,6 +4171,7 @@ impl FileState {
                     && last.is_some_and(|tokens| compatible(tokens, usage)))
                 .then_some(NativeResponseIdentity { id, full_counts })
             }),
+            terminal_response: None,
             id,
             original_id: id,
             session: owner,
@@ -4063,6 +4197,14 @@ impl FileState {
                 ..ContextConflicts::default()
             },
         });
+    }
+
+    fn record_token_day(&mut self, date: NaiveDate) {
+        if let Some(span) = &mut self.token_day_span {
+            let date = date.num_days_from_ce();
+            span.first = Some(span.first.map_or(date, |day| day.min(date)));
+            span.last = Some(span.last.map_or(date, |day| day.max(date)));
+        }
     }
 
     fn accept_tool(&mut self, mut payload: Value, timestamp: String, date: NaiveDate) {
@@ -4364,7 +4506,10 @@ impl Snapshot {
     }
 
     fn scope_members<'a>(&'a self, requested: &'a str) -> (&'a str, HashSet<String>) {
-        let session = self.aliases.get(requested).map_or(requested, String::as_str);
+        let session = self
+            .aliases
+            .get(requested)
+            .map_or(requested, String::as_str);
         let mut sessions = HashSet::new();
         if self.sessions.contains(session) {
             sessions.insert(session.to_owned());

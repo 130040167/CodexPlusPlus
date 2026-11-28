@@ -1,7 +1,7 @@
 use super::{
     CacheAccounting, Call, ContextConflicts, ExecSkill, FileState, InheritedUsageContext,
-    LegacyIdentity, NativeResponseIdentity, SessionModelObservation, Tokens, UsageEvent,
-    segments::HistoryBase,
+    LegacyIdentity, NativeResponseIdentity, SessionModelObservation, TokenDaySpan, Tokens,
+    UsageEvent, segments::HistoryBase,
 };
 use crate::usage_history::UsageHistoryBoundary;
 use chrono::NaiveDate;
@@ -37,6 +37,8 @@ struct EventClassification {
     provider: String,
     provider_source: Option<String>,
     provider_conflict: bool,
+    #[serde(default)]
+    count_uncertain: bool,
 }
 
 impl EventClassification {
@@ -46,6 +48,7 @@ impl EventClassification {
             provider: event.provider.clone(),
             provider_source: event.provider_source.clone(),
             provider_conflict: event.context_conflicts.provider,
+            count_uncertain: event.count_uncertain,
         }
     }
 
@@ -54,12 +57,15 @@ impl EventClassification {
         event.provider.clone_from(&self.provider);
         event.provider_source.clone_from(&self.provider_source);
         event.context_conflicts.provider = self.provider_conflict;
+        event.count_uncertain = self.count_uncertain;
     }
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Observation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_response: Option<Box<str>>,
     original_id: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     native_response_id: Option<NativeResponseIdentity>,
@@ -83,11 +89,14 @@ struct Observation {
     context_conflicts: ContextConflicts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     classification_origin: Option<EventClassification>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    receipt_count_origin: Option<Counter>,
 }
 
 impl Observation {
     fn capture(event: &UsageEvent) -> Self {
         Self {
+            terminal_response: event.terminal_response.clone(),
             original_id: event.original_id,
             native_response_id: event.native_response_id.clone(),
             turn: event.turn.clone(),
@@ -109,11 +118,13 @@ impl Observation {
             legacy_identity: event.legacy_identity.clone(),
             context_conflicts: event.context_conflicts,
             classification_origin: None,
+            receipt_count_origin: None,
         }
     }
 
     fn into_event(self, id: [u8; 32], session: String) -> anyhow::Result<UsageEvent> {
         Ok(UsageEvent {
+            terminal_response: self.terminal_response,
             id,
             original_id: self.original_id,
             native_response_id: self.native_response_id,
@@ -154,12 +165,16 @@ struct Checkpoint {
     previous: Option<Counter>,
     previous_cache_accounting: Option<CacheAccounting>,
     invalid_counts: bool,
+    #[serde(default)]
+    malformed_token_counts: usize,
     identity_conflict: bool,
     continuation: bool,
     history_base: Option<([u8; 16], u64, u64)>,
     rollout_extent: Option<(u64, u64, u64)>,
     rollout_out_of_order: bool,
     expired_count: Option<((u64, u64, u64), Counter)>,
+    #[serde(default)]
+    token_day_span: Option<TokenDaySpan>,
     provider: String,
     role: String,
     history_boundary: UsageHistoryBoundary,
@@ -209,6 +224,7 @@ impl Checkpoint {
                 previous: state.previous.map(Counter),
                 previous_cache_accounting: state.previous_cache_accounting,
                 invalid_counts: state.invalid_counts,
+                malformed_token_counts: state.malformed_token_counts,
                 identity_conflict: state.identity_conflict,
                 continuation: state.continuation,
                 history_base: state
@@ -220,6 +236,7 @@ impl Checkpoint {
                 expired_count: state
                     .expired_count
                     .map(|(position, count)| (position, Counter(count))),
+                token_day_span: state.token_day_span,
                 provider: state.provider.clone(),
                 role: state.role.clone(),
                 history_boundary: state.history_boundary.clone(),
@@ -250,6 +267,7 @@ impl Checkpoint {
             previous: self.previous.map(|value| value.0),
             previous_cache_accounting: self.previous_cache_accounting,
             invalid_counts: self.invalid_counts,
+            malformed_token_counts: self.malformed_token_counts,
             identity_conflict: self.identity_conflict,
             continuation: self.continuation,
             history_base: self
@@ -264,6 +282,7 @@ impl Checkpoint {
             expired_count: self
                 .expired_count
                 .map(|(position, count)| (position, count.0)),
+            token_day_span: self.token_day_span,
             provider: self.provider,
             role: self.role,
             history_boundary: self.history_boundary,
@@ -282,8 +301,15 @@ impl Checkpoint {
     }
 }
 
+mod historical;
 mod ingest;
+#[cfg(test)]
 mod projection_tests;
 mod scan;
 mod store;
+#[cfg(test)]
 mod tests;
+
+mod runtime;
+pub(super) use runtime::{ReadState, Runtime, recover_archive};
+pub(super) use store::{archive::ArchiveKey, projection::ArchiveAnswer};

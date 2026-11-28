@@ -1,11 +1,11 @@
 use super::ingest::SourceReader;
-use super::store::{Store, projection::SourceUpdate};
+use super::store::{Coverage, Store, projection::SourceUpdate};
 use crate::usage_history::Query;
 use crate::usage_history::structured::{FileState, UsageEvent, index_budget::Budget};
 use chrono::{DateTime, Local, NaiveDate, TimeZone};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::{fs, io::Write};
 
@@ -60,6 +60,577 @@ fn new_source<'a>(source: &'a Path, state: &'a FileState) -> SourceUpdate<'a> {
         state,
         previous_revision: None,
         replace: false,
+    }
+}
+
+#[test]
+fn terminal_usage_persists_across_restart_and_late_count_without_rebasing_the_next_turn() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().canonicalize().unwrap();
+    let database = home.join("usage.sqlite");
+    let rollout = home.join("rollout-fixture.jsonl");
+    let copied = home.join("rollout-copy.jsonl");
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let at = |second| format!("2026-01-02T12:00:{second:02}Z");
+    let usage = |input, cached, output| json!({"input_tokens":input,"cached_input_tokens":cached,"output_tokens":output});
+    let context = |second, turn| json!({"type":"turn_context","timestamp":at(second),"payload":{"turn_id":turn,"model":"fixture"}});
+    let terminal = |second, turn, response, last, total| {
+        json!({"type":"token_usage_record","timestamp":at(second),
+        "payload":{"thread_id":PARENT,"turn_id":turn,"response_id":response,"usage":last,"thread_token_usage":total}})
+    };
+    let counter = |second, last, total| {
+        json!({"type":"event_msg","timestamp":at(second),
+        "payload":{"type":"token_count","info":{"last_token_usage":last,"total_token_usage":total}}})
+    };
+    let append = |rows: &[Value]| {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&rollout)
+            .unwrap();
+        for row in rows {
+            writeln!(file, "{row}").unwrap();
+        }
+    };
+    let step = |source: &Path| {
+        let mut store = Store::open(Connection::open(&database).unwrap()).unwrap();
+        let mut reader = SourceReader::restore(&store, source).unwrap();
+        assert!(
+            reader
+                .step(
+                    &mut store,
+                    cutoff,
+                    &mut Budget::new(std::iter::empty()),
+                    &BTreeMap::new(),
+                    1 << 20
+                )
+                .unwrap()
+        );
+        read(&mut store.db, i64::MIN, i64::MAX).1
+    };
+    let head = json!({"type":"session_meta","timestamp":at(0),"payload":{"id":PARENT,"model_provider":"fixture-supplier"}});
+    let first = terminal(2, "turn-a", "resp-a", usage(10, 3, 2), usage(10, 3, 2));
+    append(&[head.clone(), context(1, "turn-a"), first.clone()]);
+    let initial = step(&rollout);
+    assert_eq!(initial.len(), 1);
+    assert_eq!(
+        initial[0].delta,
+        crate::usage_history::Tokens::new(10, 3, 2)
+    );
+
+    let partial = json!({"input_tokens":10,"output_tokens":2});
+    append(&[counter(3, partial.clone(), partial)]);
+    let paired = step(&rollout);
+    assert_eq!(paired.len(), 1);
+    assert_eq!(paired[0].delta, initial[0].delta);
+    assert!(paired[0].terminal_response.is_none());
+
+    // A new response with the same individual token counts still counts.
+    append(&[terminal(
+        4,
+        "turn-a",
+        "resp-b",
+        usage(10, 3, 2),
+        usage(20, 6, 4),
+    )]);
+    let second = step(&rollout);
+    assert_eq!(second.len(), 2);
+    assert_eq!(second[1].terminal_response.as_deref(), Some("resp-b"));
+
+    // The subsequent native delta includes the unreported cumulative portion.
+    // The earlier terminal receipt cannot be added again or become its baseline.
+    append(&[
+        context(5, "turn-b"),
+        counter(6, usage(95, 10, 4), usage(105, 13, 6)),
+    ]);
+    let last = step(&rollout);
+    assert_eq!(last.len(), 2);
+    assert_eq!(last[1].delta, crate::usage_history::Tokens::new(95, 10, 4));
+    fs::write(
+        &copied,
+        format!("{head}\n{}\n{first}\n", context(1, "turn-a")),
+    )
+    .unwrap();
+    let duplicate = step(&copied);
+    assert!(duplicate == last);
+}
+
+#[test]
+fn reconciled_terminal_pairs_append_within_budget_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let source = root.join("rollout-long.jsonl");
+    let database = root.join("tokens.sqlite3");
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let base = DateTime::parse_from_rfc3339("2026-01-02T12:00:00Z").unwrap();
+    let pair = |n: usize, response: String, second_receipt: bool| {
+        let at = |extra| (base + chrono::Duration::seconds(n as i64 * 4 + extra)).to_rfc3339();
+        let turn = format!("turn-{n}");
+        let total = count(0, 0, n as u64, true);
+        let info = &total["payload"]["info"];
+        let mut receipt = json!({
+            "type":"token_usage_record","timestamp":at(2),
+            "payload":{"thread_id":PARENT,"turn_id":turn,"response_id":response,
+                       "usage":info["last_token_usage"],"thread_token_usage":info["total_token_usage"]}
+        });
+        let mut rows = vec![
+            json!({"type":"turn_context","timestamp":at(0),"payload":{"model":"fixture","turn_id":turn}}),
+            json!({"type":"event_msg","timestamp":at(1),"payload":total["payload"]}),
+            receipt.clone(),
+        ];
+        if second_receipt {
+            receipt["timestamp"] = json!(at(3));
+            receipt["payload"]["response_id"] = json!("another-claim");
+            rows.push(receipt);
+        }
+        for (index, row) in rows.iter_mut().enumerate() {
+            row["ordinal"] = json!((n - 1) * 3 + index + 1);
+        }
+        rows
+    };
+    let mut rows = vec![header(PARENT, 0)];
+    for n in 1..=120 {
+        rows.extend(pair(n, format!("receipt-{n}"), false));
+    }
+    let original = parse(&source, &rows, cutoff);
+    let mut store = Store::open(Connection::open(&database).unwrap()).unwrap();
+    let seed = store
+        .prepare(
+            new_source(&source, &original),
+            cutoff,
+            BTreeMap::new(),
+            1 << 20,
+        )
+        .unwrap();
+    let seeded_revision = store.publish(seed).unwrap();
+    let certificate: i64 = store
+        .db
+        .query_row("SELECT revision FROM token_linear_sources", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(certificate, seeded_revision);
+    let used: usize = store
+        .db
+        .query_row(
+            "SELECT sum(length(payload)) FROM token_observations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    const APPEND_BUDGET: usize = 16 * 1024;
+    assert!(used > APPEND_BUDGET);
+
+    for (n, response, another_claim, should_append) in [
+        (121, "receipt-121", false, true),
+        (122, "receipt-122", false, true),
+        (123, "receipt-123", true, false),
+        (123, "receipt-1", false, false),
+    ] {
+        drop(store);
+        let start = fs::metadata(&source).unwrap().len();
+        let batch = pair(n, response.into(), another_claim);
+        let mut file = fs::OpenOptions::new().append(true).open(&source).unwrap();
+        for row in &batch {
+            writeln!(file, "{row}").unwrap();
+        }
+        store = Store::open(Connection::open(&database).unwrap()).unwrap();
+        let (revision, mut state) = store.checkpoint(&source).unwrap().unwrap();
+        assert_eq!(state.offset, start);
+        assert!(
+            state
+                .read_with_budget(&source, cutoff, &mut Budget::new(std::iter::empty()))
+                .unwrap()
+        );
+        let update = SourceUpdate {
+            source: &source,
+            state: &state,
+            previous_revision: Some(revision),
+            replace: false,
+        };
+        let prepared = store.prepare(update, cutoff, BTreeMap::new(), APPEND_BUDGET);
+        if !should_append {
+            assert!(
+                prepared
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("component exceeds reconciliation input budget")
+            );
+            assert_eq!(store.checkpoint(&source).unwrap().unwrap().1.offset, start);
+            drop(file);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&source)
+                .unwrap()
+                .set_len(start)
+                .unwrap();
+            continue;
+        }
+        let committed = store.publish(prepared.unwrap()).unwrap();
+        assert_eq!(
+            store.checkpoint(&source).unwrap().unwrap().1.offset,
+            fs::metadata(&source).unwrap().len()
+        );
+        let certificate: i64 = store
+            .db
+            .query_row("SELECT revision FROM token_linear_sources", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(certificate, committed);
+        rows.extend(batch);
+    }
+
+    let selected = read(&mut store.db, i64::MIN, i64::MAX).1;
+    assert_eq!(selected.len(), 122);
+    assert!(selected.iter().all(|event| event.delta.total_tokens == 110));
+    let mut replay = Store::open(Connection::open_in_memory().unwrap()).unwrap();
+    let full = parse(&source, &rows, cutoff);
+    let prepared = replay
+        .prepare(new_source(&source, &full), cutoff, BTreeMap::new(), 1 << 20)
+        .unwrap();
+    replay.publish(prepared).unwrap();
+    assert!(selected == read(&mut replay.db, i64::MIN, i64::MAX).1);
+
+    let day = full.events[0].date;
+    let retained = day.succ_opt().unwrap();
+    store.advance_retention(retained).unwrap().unwrap();
+    let mut cursor = (0, 0);
+    while let (Some(next), _) = store
+        .reclaim_source_observations(&source, cursor, 32)
+        .unwrap()
+    {
+        cursor = next;
+    }
+    let historical_tail = store.observations(&source).unwrap();
+    assert_eq!(historical_tail.len(), 1);
+    assert!(historical_tail[0].terminal_response.is_none());
+    let (previous_revision, mut next) = store.checkpoint(&source).unwrap().unwrap();
+    {
+        let mut file = fs::OpenOptions::new().append(true).open(&source).unwrap();
+        for mut row in pair(123, "next-day".into(), false) {
+            let at = DateTime::parse_from_rfc3339(row["timestamp"].as_str().unwrap()).unwrap();
+            row["timestamp"] = json!((at + chrono::Duration::days(1)).to_rfc3339());
+            writeln!(file, "{row}").unwrap();
+        }
+    }
+    assert!(
+        next.read_with_budget(&source, retained, &mut Budget::new(std::iter::empty()))
+            .unwrap()
+    );
+    let staged = store
+        .prepare(
+            SourceUpdate {
+                source: &source,
+                state: &next,
+                previous_revision: Some(previous_revision),
+                replace: false,
+            },
+            retained,
+            BTreeMap::new(),
+            APPEND_BUDGET,
+        )
+        .unwrap();
+    store.publish(staged).unwrap();
+    let latest = read(&mut store.db, i64::MIN, i64::MAX).1;
+    assert_eq!(latest.len(), 1);
+    assert_eq!(latest[0].delta.total_tokens, 110);
+    let mut archive = Vec::new();
+    Store::read_days(&mut store.db, day, retained, |_, _, groups| {
+        archive.push(groups[0].totals.counts.0.total_tokens);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(archive, vec![122 * 110]);
+}
+
+#[test]
+fn delayed_counters_replace_committed_receipts_without_reloading_the_long_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().canonicalize().unwrap();
+    let source = home.join("rollout-ordered.jsonl");
+    let database = home.join("tokens.sqlite3");
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let base = DateTime::parse_from_rfc3339("2026-01-02T12:00:00Z").unwrap();
+    let at = |second| (base + chrono::Duration::seconds(second)).to_rfc3339();
+    let usage = |n| json!({"input_tokens":100*n,"cached_input_tokens":20*n,"output_tokens":10*n});
+    let context = |second, turn| json!({"type":"turn_context","timestamp":at(second),"payload":{"turn_id":turn,"model":"fixture"}});
+    let counter = |second, last, total| {
+        json!({"type":"event_msg","timestamp":at(second),
+        "payload":{"type":"token_count","info":{"last_token_usage":last,"total_token_usage":total}}})
+    };
+    let receipt = |second, n, response| {
+        json!({"type":"token_usage_record","timestamp":at(second),
+        "payload":{"thread_id":PARENT,"turn_id":"tail","response_id":response,
+                   "usage":usage(1),"thread_token_usage":usage(n)}})
+    };
+    let mut prefix = vec![
+        json!({"type":"session_meta","timestamp":at(0),
+        "payload":{"id":PARENT,"model_provider":"supplier-a"}}),
+        context(0, "prefix"),
+    ];
+    prefix.extend((1..=64).map(|n| counter(n, usage(1), usage(n))));
+    let initial = parse(&source, &prefix, cutoff);
+    let mut store = Store::open(Connection::open(&database).unwrap()).unwrap();
+    let seed = store
+        .prepare(
+            new_source(&source, &initial),
+            cutoff,
+            BTreeMap::new(),
+            1 << 20,
+        )
+        .unwrap();
+    let first = store.publish(seed).unwrap();
+    let source_bytes: usize = store
+        .db
+        .query_row(
+            "SELECT sum(length(payload)) FROM token_observations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let budget = 8192;
+    assert!(source_bytes > budget);
+    drop(store);
+    let append = |rows: &[Value]| {
+        let mut file = fs::OpenOptions::new().append(true).open(&source).unwrap();
+        for row in rows {
+            writeln!(file, "{row}").unwrap();
+        }
+    };
+    let step = |store: &mut Store| {
+        let mut reader = SourceReader::restore(store, &source).unwrap();
+        reader.step(
+            store,
+            cutoff,
+            &mut Budget::new(std::iter::empty()),
+            &BTreeMap::new(),
+            budget,
+        )
+    };
+    let first_receipt = receipt(65, 65, "receipt-a");
+    let second_receipt = receipt(68, 66, "receipt-b");
+    let noise = json!({"type":"event_msg","timestamp":at(66),"payload":{"type":"agent_message","message":"synthetic"}});
+    for (batch, expected) in [
+        (vec![context(65, "tail"), first_receipt], 65),
+        (vec![noise], 65),
+        (vec![second_receipt], 66),
+    ] {
+        append(&batch);
+        let mut store = Store::open(Connection::open(&database).unwrap()).unwrap();
+        assert!(step(&mut store).unwrap());
+        assert_eq!(read(&mut store.db, i64::MIN, i64::MAX).1.len(), expected);
+        let anchor: i64 = store
+            .db
+            .query_row("SELECT revision FROM token_linear_sources", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            anchor, first,
+            "receipts and cursor-only writes cannot replace the anchor"
+        );
+        prefix.extend(batch);
+    }
+
+    let late = counter(
+        67,
+        json!({"input_tokens":100,"output_tokens":10}),
+        json!({"input_tokens":6500,"output_tokens":650}),
+    );
+    let mut store = Store::open(Connection::open(&database).unwrap()).unwrap();
+    let committed = store.checkpoint(&source).unwrap().unwrap().1.offset;
+    let before = read(&mut store.db, i64::MIN, i64::MAX);
+    append(std::slice::from_ref(&late));
+    prefix.push(late);
+    store
+        .db
+        .execute_batch(
+            "CREATE TRIGGER fail_late_count BEFORE UPDATE ON token_days
+         BEGIN SELECT RAISE(ABORT, 'test rollback'); END;",
+        )
+        .unwrap();
+    assert!(
+        step(&mut store)
+            .unwrap_err()
+            .to_string()
+            .contains("test rollback")
+    );
+    assert_eq!(
+        store.checkpoint(&source).unwrap().unwrap().1.offset,
+        committed
+    );
+    assert!(before == read(&mut store.db, i64::MIN, i64::MAX));
+    store
+        .db
+        .execute_batch("DROP TRIGGER fail_late_count")
+        .unwrap();
+    drop(store);
+    let mut store = Store::open(Connection::open(&database).unwrap()).unwrap();
+    assert!(step(&mut store).unwrap());
+    let (_, paired) = read(&mut store.db, i64::MIN, i64::MAX);
+    assert_eq!(paired.len(), 66);
+    assert!(paired[64].terminal_response.is_none());
+    assert_eq!(paired[64].delta.cached_input_tokens, 20);
+    assert_eq!(paired[65].terminal_response.as_deref(), Some("receipt-b"));
+
+    let next = counter(69, usage(2), usage(67));
+    append(std::slice::from_ref(&next));
+    prefix.push(next);
+    assert!(step(&mut store).unwrap());
+    let actual = read(&mut store.db, i64::MIN, i64::MAX).1;
+    assert_eq!(actual.len(), 66);
+    assert_eq!(actual.last().unwrap().delta.total_tokens, 220);
+    assert!(actual.iter().all(|event| event.terminal_response.is_none()));
+
+    let mut replay = Store::open(Connection::open_in_memory().unwrap()).unwrap();
+    let full = parse(&source, &prefix, cutoff);
+    let staged = replay
+        .prepare(new_source(&source, &full), cutoff, BTreeMap::new(), 1 << 20)
+        .unwrap();
+    replay.publish(staged).unwrap();
+    assert!(actual == read(&mut replay.db, i64::MIN, i64::MAX).1);
+    let query = Query::parse(&json!({}), cutoff).unwrap();
+    let days = Store::read_selection(&mut store.db, &query, None, None)
+        .unwrap()
+        .days;
+    assert_eq!(
+        days,
+        Store::read_selection(&mut replay.db, &query, None, None)
+            .unwrap()
+            .days
+    );
+    assert_eq!(days[0]["usage"]["totalTokens"], 67 * 110);
+}
+
+#[test]
+fn late_receipt_repairs_a_sealed_counter_and_competition_revokes_only_its_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().canonicalize().unwrap();
+    let source = home.join("rollout-sealed.jsonl");
+    let db = home.join("tokens.sqlite3");
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let base = DateTime::parse_from_rfc3339("2026-01-02T12:00:00Z").unwrap();
+    let at = |second| (base + chrono::Duration::seconds(second)).to_rfc3339();
+    let usage = |n| json!({"input_tokens":100*n,"cached_input_tokens":20*n,"output_tokens":10*n});
+    let mut input = vec![
+        json!({"type":"session_meta","timestamp":at(0),"payload":{"id":PARENT,"model_provider":"supplier-a"}}),
+        json!({"type":"turn_context","timestamp":at(0),"payload":{"turn_id":"same-turn","model":"fixture"}}),
+    ];
+    for n in 1..=66 {
+        let mut last = usage(1);
+        let mut total = usage(n);
+        if n == 65 {
+            last.as_object_mut().unwrap().remove("cached_input_tokens");
+            total.as_object_mut().unwrap().remove("cached_input_tokens");
+        }
+        input.push(
+            json!({"type":"event_msg","timestamp":at(n),"payload":{"type":"token_count",
+            "info":{"last_token_usage":last,"total_token_usage":total}}}),
+        );
+    }
+    let initial = parse(&source, &input, cutoff);
+    let mut store = Store::open(Connection::open(&db).unwrap()).unwrap();
+    let staged = store
+        .prepare(
+            new_source(&source, &initial),
+            cutoff,
+            BTreeMap::new(),
+            1 << 20,
+        )
+        .unwrap();
+    let native_revision = store.publish(staged).unwrap();
+    let size: usize = store
+        .db
+        .query_row(
+            "SELECT sum(length(payload)) FROM token_observations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    const BUDGET: usize = 8192;
+    assert!(size > BUDGET);
+    let native = read(&mut store.db, i64::MIN, i64::MAX).1;
+    assert!(!native[64].delta.cached_known);
+    assert!(native[65].delta.cached_known);
+    drop(store);
+
+    for n in 1..=3 {
+        let receipt = json!({"type":"token_usage_record","timestamp":at(66+n),
+            "payload":{"thread_id":PARENT,"turn_id":"same-turn","response_id":format!("claim-{n}"),
+                       "usage":usage(1),"thread_token_usage":usage(65)}});
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&source).unwrap(),
+            "{receipt}"
+        )
+        .unwrap();
+        input.push(receipt);
+        let mut store = Store::open(Connection::open(&db).unwrap()).unwrap();
+        let mut reader = SourceReader::restore(&store, &source).unwrap();
+        assert!(
+            reader
+                .step(
+                    &mut store,
+                    cutoff,
+                    &mut Budget::new(std::iter::empty()),
+                    &BTreeMap::new(),
+                    BUDGET
+                )
+                .unwrap()
+        );
+        let certificate: i64 = store
+            .db
+            .query_row("SELECT revision FROM token_linear_sources", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(certificate, native_revision);
+        let actual = read(&mut store.db, i64::MIN, i64::MAX).1;
+        assert_eq!(actual.len(), 66);
+        assert_eq!(actual[64].id, native[64].id);
+        assert_eq!(actual[64].delta.total_tokens, 110);
+        assert_eq!(actual[64].delta.cached_known, n == 1);
+        let mut replay = Store::open(Connection::open_in_memory().unwrap()).unwrap();
+        let copy = home.join("rollout-replay.jsonl");
+        let full = parse(&copy, &input, cutoff);
+        let staged = replay
+            .prepare(new_source(&copy, &full), cutoff, BTreeMap::new(), 1 << 20)
+            .unwrap();
+        replay.publish(staged).unwrap();
+        assert!(actual == read(&mut replay.db, i64::MIN, i64::MAX).1);
+        let query = Query::parse(&json!({}), cutoff).unwrap();
+        let daily = Store::read_selection(&mut store.db, &query, None, None)
+            .unwrap()
+            .days;
+        assert_eq!(
+            daily,
+            Store::read_selection(&mut replay.db, &query, None, None)
+                .unwrap()
+                .days
+        );
+        assert_eq!(daily[0]["usage"]["totalTokens"], 66 * 110);
+        if n == 1 {
+            store
+                .record_coverage(Coverage {
+                    pending_sources: 0,
+                    issues: 0,
+                    maintenance_blocked: false,
+                })
+                .unwrap();
+            assert!(
+                store
+                    .reclassify_session(PARENT, 1 << 20, &BTreeSet::new(), |rows, _| {
+                        for row in &mut rows[64..] {
+                            row.provider = "fixture-proof".into();
+                            row.provider_source = Some("request-log-exact".into());
+                        }
+                        Ok(())
+                    })
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 }
 
@@ -1473,6 +2044,54 @@ fn archived_classification_matches_live_rollups_without_promoting_mixed_evidence
 }
 
 #[test]
+fn attribution_still_waits_for_count_gaps_in_related_or_unidentified_sources() {
+    use super::scan::Scan;
+
+    let cutoff = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    for (owner, alias, unparsed) in [
+        (PARENT, false, false),
+        (OTHER, true, false),
+        (OTHER, false, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let sessions = root.join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        let parent = sessions.join(format!("rollout-parent-{PHYSICAL_PREFIX}.jsonl"));
+        let parent_state = parse(&parent, &[header(PARENT, 0), count(1, 1, 1, true)], cutoff);
+        let gap = sessions.join("rollout-gap.jsonl");
+        let mut meta = header(owner, if alias { 2 } else { 0 });
+        if alias {
+            meta["payload"]["history_base"] = json!({
+                "thread_id":PHYSICAL_PREFIX,"end_ordinal_exclusive":2,
+                "end_byte_offset":parent_state.offset
+            });
+        }
+        let mut malformed = count(if alias { 3 } else { 1 }, 3, 2, true);
+        malformed["payload"]["info"]["total_token_usage"]["input_tokens"] = json!("invalid");
+        if unparsed {
+            fs::write(&gap, b"{not a JSON envelope}\n").unwrap();
+        } else {
+            parse(&gap, &[meta, malformed], cutoff);
+        }
+        let mut store = Store::open(Connection::open_in_memory().unwrap()).unwrap();
+        let mut scan = Scan::default();
+        let report = scan.round(&mut store, &root, cutoff, &BTreeMap::new(), 8192);
+        assert_eq!(report.pending_sources, 0);
+        assert_eq!(report.issues, 1);
+        assert_eq!(scan.scoped_count_gaps().contains(&gap), !unparsed);
+        assert_eq!(
+            store
+                .reclassify_session(PARENT, 8192, scan.scoped_count_gaps(), |_, _| {
+                    panic!("unresolved source was admitted: {owner}, alias={alias}, unparsed={unparsed}")
+                })
+                .unwrap(),
+            None
+        );
+    }
+}
+
+#[test]
 fn late_gateway_evidence_reclassifies_committed_rows_and_days_atomically() {
     use super::scan::Scan;
     use crate::usage_history::structured::{RequestEvidence, RequestEvidenceCache, provider_cache};
@@ -1526,7 +2145,11 @@ fn late_gateway_evidence_reclassifies_committed_rows_and_days_atomically() {
         evidence.attribute_with_cache(events, &mut BTreeMap::new(), aliases, &proof_db);
         Ok(())
     };
-    assert!(store.reclassify_session(PARENT, 1, &mut classify).is_err());
+    assert!(
+        store
+            .reclassify_session(PARENT, 1, &BTreeSet::new(), &mut classify)
+            .is_err()
+    );
     store
         .db
         .execute_batch(
@@ -1535,7 +2158,7 @@ fn late_gateway_evidence_reclassifies_committed_rows_and_days_atomically() {
         )
         .unwrap();
     let error = store
-        .reclassify_session(PARENT, 8192, &mut classify)
+        .reclassify_session(PARENT, 8192, &BTreeSet::new(), &mut classify)
         .unwrap_err();
     assert!(
         error
@@ -1552,7 +2175,7 @@ fn late_gateway_evidence_reclassifies_committed_rows_and_days_atomically() {
         .unwrap();
 
     let revision = store
-        .reclassify_session(PARENT, 8192, &mut classify)
+        .reclassify_session(PARENT, 8192, &BTreeSet::new(), &mut classify)
         .unwrap()
         .unwrap();
     let query = Query::parse(&json!({"period":"today"}), cutoff).unwrap();
@@ -1584,7 +2207,7 @@ fn late_gateway_evidence_reclassifies_committed_rows_and_days_atomically() {
     };
     assert!(
         store
-            .reclassify_session(PARENT, 8192, &mut classify)
+            .reclassify_session(PARENT, 8192, &BTreeSet::new(), &mut classify)
             .unwrap()
             .is_none()
     );
@@ -1594,7 +2217,7 @@ fn late_gateway_evidence_reclassifies_committed_rows_and_days_atomically() {
     conflict.relay_id = "unverified-relay".into();
     evidence.records = vec![request, conflict];
     let next = store
-        .reclassify_session(PARENT, 8192, |events, aliases| {
+        .reclassify_session(PARENT, 8192, &BTreeSet::new(), |events, aliases| {
             evidence.attribute_with_cache(events, &mut BTreeMap::new(), aliases, &proof_db);
             Ok(())
         })
@@ -1644,7 +2267,7 @@ fn append_retracts_only_nearby_proofs_in_the_same_transaction_as_the_new_count()
         Ok(())
     };
     store
-        .reclassify_session(PARENT, 8192, proof)
+        .reclassify_session(PARENT, 8192, &BTreeSet::new(), proof)
         .unwrap()
         .unwrap();
     writeln!(
@@ -1659,7 +2282,7 @@ fn append_retracts_only_nearby_proofs_in_the_same_transaction_as_the_new_count()
     assert_eq!(distant[0].provider, "relay-proof");
     assert_ne!(distant[1].provider, "relay-proof");
     store
-        .reclassify_session(PARENT, 8192, proof)
+        .reclassify_session(PARENT, 8192, &BTreeSet::new(), proof)
         .unwrap()
         .unwrap();
 

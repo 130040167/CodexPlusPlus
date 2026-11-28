@@ -1,11 +1,13 @@
+use super::archive::{ArchiveKey, Recovered};
 use super::{Coverage, Store, decode_path, encode_path};
 use crate::usage_history::structured::token_checkpoint::{
     Checkpoint, Counter, EventClassification, Observation,
+    historical::{EvidenceOverlay, Historical},
 };
 use crate::usage_history::structured::{
     ClassificationEvidence, DELAYED_REQUEST_MATCH_WINDOW_MS, FileState, Index, MAX_ACTIVITY,
     MAX_FILES, Query, RequestSessionAliases, Snapshot, UsageEvent, ordered_scope_ids, segments,
-    usage_provider,
+    terminal_receipts, unknown_model, unknown_provider, usage_provider,
 };
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Local, NaiveDate, NaiveTime, TimeZone};
@@ -14,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(super) fn links(path: &Path, state: &FileState) -> BTreeSet<String> {
     let mut result = BTreeSet::new();
@@ -46,8 +48,15 @@ pub(in super::super) struct Prepared<'a> {
     sessions: BTreeSet<String>,
     collisions: HashMap<[u8; 32], i64>,
     append: bool,
-    linear: bool,
+    linear: Option<NativeTail>,
+    superseded: Vec<SupersededReceipt>,
+    receipt_origins: HashMap<[u8; 32], Counter>,
     events: Vec<UsageEvent>,
+}
+
+enum NativeTail {
+    Keep(i64),
+    Advance,
 }
 
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
@@ -144,8 +153,15 @@ pub(in super::super) struct DayGroup {
 
 type Groups = BTreeMap<(String, String, String, u8), DayTotals>;
 
+pub(in crate::usage_history::structured) type ArchiveAnswer =
+    (ArchiveKey, Result<Recovered, String>);
+
 fn encode_groups(groups: Groups) -> Result<Vec<u8>> {
-    let groups: Vec<_> = groups
+    Ok(serde_json::to_vec(&day_groups(groups))?)
+}
+
+fn day_groups(groups: Groups) -> Vec<DayGroup> {
+    groups
         .into_iter()
         .map(|((model, provider, role, conflicts), totals)| DayGroup {
             model,
@@ -154,8 +170,7 @@ fn encode_groups(groups: Groups) -> Result<Vec<u8>> {
             conflicts,
             totals,
         })
-        .collect();
-    Ok(serde_json::to_vec(&groups)?)
+        .collect()
 }
 
 pub(in super::super) struct Selection {
@@ -163,11 +178,14 @@ pub(in super::super) struct Selection {
     pub(in super::super) coverage: Option<Coverage>,
     pub(in super::super) days: Vec<Value>,
     pub(in super::super) unresolved: u64,
+    unclassified: u64,
     pub(in super::super) archived: bool,
     pub(in super::super) needs_source_recovery: bool,
     pub(in super::super) session_cursors: Option<Vec<Value>>,
     trend: Option<Value>,
     precise_from: String,
+    recovered_archive: bool,
+    archive_classification_gap: bool,
 }
 
 pub(in super::super) struct ScopedSelection {
@@ -188,7 +206,7 @@ impl Selection {
             let mut day = local_time(start)?
                 .date_naive()
                 .max(query.from.unwrap_or(NaiveDate::MIN));
-            if !self.precise_from.is_empty() {
+            if !self.recovered_archive && !self.precise_from.is_empty() {
                 day = day.max(self.precise_from.parse()?);
             }
             let last = query
@@ -249,10 +267,17 @@ fn local_midnight(time: DateTime<Local>) -> bool {
 fn retract_append_proofs(
     db: &Connection,
     first: &UsageEvent,
-) -> Result<BTreeMap<NaiveDate, Groups>> {
+    correction: bool,
+) -> Result<BTreeSet<NaiveDate>> {
     let at = DateTime::parse_from_rfc3339(&first.timestamp)?.timestamp_millis();
     let lower = at.saturating_sub(2 * DELAYED_REQUEST_MATCH_WINDOW_MS);
-    let mut days = BTreeMap::<NaiveDate, Groups>::new();
+    let upper = if correction {
+        at.saturating_add(2 * DELAYED_REQUEST_MATCH_WINDOW_MS)
+            .saturating_add(1)
+    } else {
+        at
+    };
+    let mut days = BTreeSet::new();
     let mut retracted = Vec::new();
     {
         let mut select = db.prepare_cached(
@@ -262,7 +287,7 @@ fn retract_append_proofs(
              AND day >= (SELECT precise_from FROM token_revision)
              AND json_type(CAST(payload AS TEXT), '$.classification_origin') = 'object'",
         )?;
-        let mut rows = select.query(params![first.session, lower, at])?;
+        let mut rows = select.query(params![first.session, lower, upper])?;
         while let Some(row) = rows.next()? {
             let id: [u8; 32] = row.get_ref(0)?.as_blob()?.try_into()?;
             let mut stored: Observation = serde_json::from_slice(row.get_ref(1)?.as_blob()?)?;
@@ -270,10 +295,13 @@ fn retract_append_proofs(
                 .classification_origin
                 .take()
                 .context("missing classification origin")?;
+            let receipt_origin = stored.receipt_count_origin;
             let mut event = stored.into_event(id, first.session.clone())?;
             origin.apply(&mut event);
-            days.entry(event.date).or_default();
-            retracted.push((id, serde_json::to_vec(&Observation::capture(&event))?));
+            days.insert(event.date);
+            let mut restored = Observation::capture(&event);
+            restored.receipt_count_origin = receipt_origin;
+            retracted.push((id, serde_json::to_vec(&restored)?));
         }
     }
     if retracted.is_empty() {
@@ -283,22 +311,6 @@ fn retract_append_proofs(
         db.prepare_cached("UPDATE token_resolved SET payload = ?2 WHERE event_id = ?1")?;
     for (id, data) in retracted {
         update.execute(params![id.as_slice(), data])?;
-    }
-    let mut read = db.prepare_cached(
-        "SELECT event_id, payload FROM token_resolved
-         WHERE day = ?2 AND session_id = (SELECT id FROM token_sessions WHERE session = ?1)",
-    )?;
-    for (day, groups) in &mut days {
-        let mut rows = read.query(params![first.session, day.to_string()])?;
-        while let Some(row) = rows.next()? {
-            let id = row.get_ref(0)?.as_blob()?.try_into()?;
-            let stored: Observation = serde_json::from_slice(row.get_ref(1)?.as_blob()?)?;
-            let event = stored.into_event(id, first.session.clone())?;
-            groups
-                .entry(group_key(&event))
-                .or_default()
-                .merge(DayTotals::from_event(&event));
-        }
     }
     Ok(days)
 }
@@ -316,11 +328,14 @@ fn linear_batch<'a>(
         || state.invalid_counts
         || state.rollout_out_of_order
         || state.issues != 0
-        || state.events.is_empty()
     {
         return false;
     }
-    for event in &state.events {
+    for event in state
+        .events
+        .iter()
+        .filter(|event| event.terminal_response.is_none())
+    {
         if event.session != state.session
             || event.date < cutoff
             || event.inherited
@@ -343,7 +358,249 @@ fn linear_batch<'a>(
         }
         previous = Some(event);
     }
-    true
+    previous.is_some()
+}
+
+type SupersededReceipt = ([u8; 32], NaiveDate);
+
+fn correct_sealed_counters(
+    read: &Connection,
+    tail: &UsageEvent,
+    cutoff: NaiveDate,
+    incoming: &[&UsageEvent],
+    mut budget: usize,
+) -> Result<Option<Vec<(UsageEvent, Option<Counter>)>>> {
+    let mut targets = BTreeMap::<_, (Observation, Vec<&UsageEvent>)>::new();
+    let cutoff = cutoff.to_string();
+    for &receipt in incoming {
+        let last = receipt.last.expect("terminal receipt has last usage");
+        let same_tail = (tail.total.input_tokens, tail.total.output_tokens)
+            == (receipt.total.input_tokens, receipt.total.output_tokens);
+        let payload = if same_tail {
+            read.query_row(
+                "SELECT event_id, payload FROM token_resolved WHERE event_id = ?1 AND day >= ?2",
+                params![tail.id.as_slice(), cutoff],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?
+        } else {
+            // A certified stream has at most one counter with these cumulative totals.
+            let at = DateTime::parse_from_rfc3339(&receipt.timestamp)?.timestamp_millis();
+            read.query_row(
+                "SELECT event_id, payload FROM token_resolved INDEXED BY token_resolved_time
+                 WHERE timestamp_ms BETWEEN ?1 AND ?2 AND day >= ?3
+                   AND session_id = (SELECT id FROM token_sessions WHERE session = ?4)
+                   AND json_type(CAST(payload AS TEXT), '$.terminal_response') IS NULL
+                   AND json_extract(CAST(payload AS TEXT), '$.turn') = ?5
+                   AND CAST(payload AS TEXT) -> '$.total.i' = ?6
+                   AND CAST(payload AS TEXT) -> '$.total.o' = ?7
+                   AND CAST(payload AS TEXT) -> '$.last.i' = ?8
+                   AND CAST(payload AS TEXT) -> '$.last.o' = ?9",
+                params![
+                    at.saturating_sub(DELAYED_REQUEST_MATCH_WINDOW_MS),
+                    at.saturating_add(DELAYED_REQUEST_MATCH_WINDOW_MS),
+                    cutoff,
+                    tail.session,
+                    receipt.turn,
+                    receipt.total.input_tokens.to_string(),
+                    receipt.total.output_tokens.to_string(),
+                    last.input_tokens.to_string(),
+                    last.output_tokens.to_string(),
+                ],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()?
+        };
+        let Some((id, payload)) = payload else {
+            return Ok(None);
+        };
+        budget = budget
+            .checked_sub(payload.len())
+            .context("Token counter corrections exceed reconciliation input budget")?;
+        let id: [u8; 32] = id.as_slice().try_into()?;
+        let target = serde_json::from_slice::<Observation>(&payload)?;
+        if target.turn != receipt.turn
+            || !target.last.is_some_and(|counter| {
+                (counter.0.input_tokens, counter.0.output_tokens)
+                    == (last.input_tokens, last.output_tokens)
+            })
+        {
+            return Ok(None);
+        }
+        let (_, receipts) = targets.entry(id).or_insert_with(|| (target, Vec::new()));
+        receipts.push(receipt);
+    }
+    let mut corrected = Vec::new();
+    let mut claims = read.prepare_cached(
+        "SELECT 1 FROM token_observations INDEXED BY token_terminal_claim
+         WHERE session_id = (SELECT id FROM token_sessions WHERE session = ?1)
+           AND json_type(CAST(payload AS TEXT), '$.terminal_response') = 'text'
+           AND json_extract(CAST(payload AS TEXT), '$.turn') = ?2
+           AND CAST(payload AS TEXT) -> '$.total.i' = ?3
+           AND CAST(payload AS TEXT) -> '$.total.o' = ?4
+           AND CAST(payload AS TEXT) -> '$.last.i' = ?5
+           AND CAST(payload AS TEXT) -> '$.last.o' = ?6
+           AND json_extract(CAST(payload AS TEXT), '$.date') >= ?7 LIMIT 1",
+    )?;
+    for (id, (mut stored, receipts)) in targets {
+        let receipt = receipts[0];
+        let last = receipt.last.expect("terminal receipt has last usage");
+        let had_claim = claims.exists(params![
+            tail.session,
+            receipt.turn,
+            receipt.total.input_tokens.to_string(),
+            receipt.total.output_tokens.to_string(),
+            last.input_tokens.to_string(),
+            last.output_tokens.to_string(),
+            cutoff,
+        ])?;
+        let before = stored.delta.0;
+        let old_origin = stored.receipt_count_origin;
+        let native = match old_origin {
+            Some(base) => base.0,
+            None if had_claim => {
+                // An index from before origin persistence may already contain an overlay.
+                if id != tail.id
+                    || !terminal_receipts::wholly_accounted_in_batch(
+                        std::slice::from_ref(receipt),
+                        std::slice::from_ref(tail),
+                    )
+                {
+                    return Ok(None);
+                }
+                continue;
+            }
+            None => before,
+        };
+        let classification = stored.classification_origin.take();
+        let mut event = stored.into_event(id, tail.session.clone())?;
+        if let Some(origin) = classification {
+            origin.apply(&mut event);
+        }
+        event.delta = native;
+        let added = !had_claim
+            && receipts.len() == 1
+            && terminal_receipts::apply_receipt_counts(&mut event, receipt);
+        if event.delta != before {
+            corrected.push((
+                event,
+                old_origin.or_else(|| added.then_some(Counter(native))),
+            ));
+        }
+    }
+    Ok(Some(corrected))
+}
+
+fn reconcile_append_receipts(
+    read: &Connection,
+    tail: &UsageEvent,
+    cutoff: NaiveDate,
+    counters: &mut Vec<UsageEvent>,
+    incoming: &[&UsageEvent],
+    provider_names: &BTreeMap<String, String>,
+    origins: &mut HashMap<[u8; 32], Counter>,
+    mut remaining: usize,
+) -> Result<Option<Vec<SupersededReceipt>>> {
+    if counters.is_empty() && incoming.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut open = Vec::new();
+    let mut select = read.prepare_cached(
+        "SELECT event_id, payload FROM token_resolved INDEXED BY token_resolved_open_receipt
+         WHERE session_id = (SELECT id FROM token_sessions WHERE session = ?1)
+         AND day >= ?2 AND json_type(CAST(payload AS TEXT), '$.terminal_response') = 'text'",
+    )?;
+    let mut rows = select.query(params![tail.session, cutoff.to_string()])?;
+    while let Some(row) = rows.next()? {
+        let payload = row.get_ref(1)?.as_blob()?;
+        remaining = remaining
+            .checked_sub(payload.len())
+            .context("Token receipt suffix exceeds reconciliation input budget")?;
+        let mut observation: Observation = serde_json::from_slice(payload)?;
+        let origin = observation.classification_origin.take();
+        let mut event =
+            observation.into_event(row.get_ref(0)?.as_blob()?.try_into()?, tail.session.clone())?;
+        if let Some(origin) = origin {
+            origin.apply(&mut event);
+        }
+        if event.count_uncertain || event.count_incomplete {
+            return Ok(None);
+        }
+        open.push(event);
+    }
+    let mut candidates = open.iter().collect::<Vec<_>>();
+    let mut sealed = Vec::new();
+    for &receipt in incoming {
+        if receipt.session != tail.session || receipt.date < cutoff {
+            return Ok(None);
+        }
+        if tail.total.is_monotonic_after(receipt.total) {
+            sealed.push(receipt);
+        } else if !receipt.total.is_monotonic_after(tail.total) {
+            return Ok(None);
+        } else {
+            candidates.push(receipt);
+        }
+    }
+    if !terminal_receipts::unique_claims(candidates.iter().copied())
+        || incoming
+            .iter()
+            .map(|receipt| receipt.original_id)
+            .collect::<HashSet<_>>()
+            .len()
+            != incoming.len()
+    {
+        return Ok(None);
+    }
+    let latest = counters.last().unwrap_or(tail).total;
+    if !candidates.is_empty() {
+        counters.insert(0, tail.clone());
+        origins.extend(
+            terminal_receipts::reconcile(candidates.iter().copied(), counters, provider_names)
+                .into_iter()
+                .map(|(id, native)| (id, Counter(native))),
+        );
+        counters.remove(0);
+    }
+    let mut emitted = HashSet::new();
+    for event in counters
+        .iter()
+        .filter(|event| event.terminal_response.is_some())
+    {
+        if event.count_uncertain || event.count_incomplete {
+            return Ok(None);
+        }
+        emitted.insert(event.id);
+    }
+    // A hidden receipt beyond the anchor could corroborate a future counter. Never
+    // drop it from the open suffix merely because its time precedes a newer counter.
+    if candidates
+        .iter()
+        .any(|receipt| !emitted.contains(&receipt.id) && !latest.is_monotonic_after(receipt.total))
+    {
+        return Ok(None);
+    }
+    let previous: HashSet<_> = open.iter().map(|event| event.id).collect();
+    counters.retain(|event| !previous.contains(&event.id));
+    let mut superseded: Vec<_> = open
+        .into_iter()
+        .filter(|event| !emitted.contains(&event.id))
+        .map(|event| (event.id, event.date))
+        .collect();
+    if !sealed.is_empty() {
+        let Some(corrected) = correct_sealed_counters(read, tail, cutoff, &sealed, remaining)?
+        else {
+            return Ok(None);
+        };
+        for (event, base) in corrected {
+            superseded.push((event.id, event.date));
+            if let Some(base) = base {
+                origins.insert(event.id, base);
+            }
+            counters.push(event);
+        }
+    }
+    Ok(Some(superseded))
 }
 
 impl Store {
@@ -386,11 +643,12 @@ impl Store {
         if !replace && let Some(previous_revision) = previous_revision {
             let tail = read
                 .query_row(
-                    "SELECT o.event_id, o.payload, owner.session FROM token_sources s
+                    "SELECT o.event_id, o.payload, owner.session, l.revision FROM token_sources s
                  JOIN token_linear_sources l ON s.id = l.source_id
-                 JOIN token_observations o ON o.source_id = s.id
+                 JOIN token_observations o ON o.source_id = s.id AND o.revision = l.revision
                  JOIN token_sessions owner ON owner.id = o.session_id
-                 WHERE s.source = ?1 AND s.revision = ?2 AND l.revision = ?2 AND l.cutoff <= ?3
+                 WHERE s.source = ?1 AND s.revision = ?2 AND l.cutoff <= ?3
+                 AND json_type(CAST(o.payload AS TEXT), '$.terminal_response') IS NULL
                  AND NOT EXISTS (
                     SELECT 1 FROM token_source_links
                     WHERE source_id != s.id AND link IN (SELECT value FROM json_each(?4))
@@ -402,61 +660,94 @@ impl Store {
                             row.get::<_, Vec<u8>>(0)?,
                             row.get::<_, Vec<u8>>(1)?,
                             row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
                         ))
                     },
                 )
                 .optional()?;
-            if let Some((id, payload, owner)) = tail {
+            if let Some((id, payload, owner, native_revision)) = tail {
                 let tail = serde_json::from_slice::<Observation>(&payload)?.into_event(
                     id.try_into()
                         .map_err(|_| anyhow::anyhow!("invalid Token event identity"))?,
                     owner,
                 )?;
-                let mut collision =
-                    read.prepare_cached("SELECT 1 FROM token_collisions WHERE id = ?1")?;
                 let mut eligible =
                     tail.session == state.session && linear_batch(state, cutoff, Some(&tail));
                 if eligible {
+                    let mut collision =
+                        read.prepare_cached("SELECT 1 FROM token_collisions WHERE id = ?1")?;
+                    let mut prior_receipt = read.prepare_cached(
+                        "SELECT 1 FROM token_observations WHERE event_id = ?1
+                         AND json_type(CAST(payload AS TEXT), '$.terminal_response') = 'text'
+                         LIMIT 1",
+                    )?;
                     for event in &state.events {
-                        if collision.exists([event.original_id.as_slice()])? {
+                        let id = [event.original_id.as_slice()];
+                        if collision.exists(id)?
+                            || (event.terminal_response.is_some() && prior_receipt.exists(id)?)
+                        {
                             eligible = false;
                             break;
                         }
                     }
                 }
-                drop(collision);
                 if eligible {
                     let (_, checkpoint) = Checkpoint::capture(state);
                     let mut bytes = serde_json::to_vec(&checkpoint)?.len() + payload.len();
                     let mut previous = tail.total;
-                    let mut events = Vec::with_capacity(state.events.len());
+                    let mut events = Vec::with_capacity(state.events.len().saturating_add(1));
+                    let mut incoming = Vec::new();
                     for raw in &state.events {
                         bytes += serde_json::to_vec(&Observation::capture(raw))?.len();
                         ensure!(
                             bytes <= input_limit,
                             "Token batch exceeds reconciliation input budget"
                         );
+                        if raw.terminal_response.is_some() {
+                            incoming.push(raw);
+                            continue;
+                        }
                         let mut event = raw.clone();
                         event.delta = event.session_delta(Some(previous));
                         event.provider =
                             usage_provider(&event.model, &event.provider, &index.provider_names)
                                 .to_owned();
                         previous = event.total;
-                        if event.delta.total_tokens != 0 {
-                            events.push(event);
-                        }
+                        events.push(event);
                     }
-                    read.commit()?;
-                    return Ok(Prepared {
-                        update,
-                        base_revision,
-                        cutoff,
-                        sessions,
-                        collisions: HashMap::new(),
-                        append: true,
-                        linear: true,
-                        events,
-                    });
+                    let linear = if events.is_empty() {
+                        NativeTail::Keep(native_revision)
+                    } else {
+                        NativeTail::Advance
+                    };
+                    let mut receipt_origins = HashMap::new();
+                    if state.previous == Some(previous)
+                        && let Some(superseded) = reconcile_append_receipts(
+                            &read,
+                            &tail,
+                            cutoff,
+                            &mut events,
+                            &incoming,
+                            &index.provider_names,
+                            &mut receipt_origins,
+                            input_limit.saturating_sub(bytes),
+                        )?
+                    {
+                        events.retain(|event| event.delta.total_tokens != 0);
+                        read.commit()?;
+                        return Ok(Prepared {
+                            update,
+                            base_revision,
+                            cutoff,
+                            sessions,
+                            collisions: HashMap::new(),
+                            append: true,
+                            linear: Some(linear),
+                            superseded,
+                            receipt_origins,
+                            events,
+                        });
+                    }
                 }
             }
         }
@@ -562,7 +853,7 @@ impl Store {
         }
 
         let collisions = index.observed_collisions();
-        let linear = files == 0
+        let linear_candidate = files == 0
             && collisions.is_empty()
             && index.collision_families.is_empty()
             && linear_batch(state, cutoff, None);
@@ -571,6 +862,12 @@ impl Store {
         let mut snapshot = Snapshot::default();
         index.select_observations(cutoff, &mut snapshot, &mut BTreeMap::new(), usize::MAX);
         index.resolve_counts(&mut snapshot);
+        let linear = linear_candidate
+            && terminal_receipts::wholly_accounted_in_batch(&state.events, &snapshot.events);
+        let receipt_origins = terminal_receipts::project(&index, &mut snapshot)
+            .into_iter()
+            .map(|(id, native)| (id, Counter(native)))
+            .collect();
         snapshot.events.retain(|event| {
             event.delta.total_tokens > 0
                 || event.count_uncertain
@@ -584,7 +881,9 @@ impl Store {
             sessions,
             collisions,
             append: false,
-            linear,
+            linear: linear.then_some(NativeTail::Advance),
+            superseded: Vec::new(),
+            receipt_origins,
             events: snapshot.events,
         })
     }
@@ -624,17 +923,51 @@ impl Store {
             revision(&tx)? == prepared.base_revision,
             "Token index changed during reconciliation"
         );
-        let mut days = if prepared.append
-            && let Some(first) = prepared.events.first()
-        {
+        let session = prepared.update.state.session.as_str();
+        let mut rebuilt = BTreeSet::new();
+        if !prepared.superseded.is_empty() {
+            let mut remove = tx.prepare_cached("DELETE FROM token_resolved WHERE event_id = ?1")?;
+            for (id, day) in &prepared.superseded {
+                remove.execute([id.as_slice()])?;
+                rebuilt.insert(*day);
+            }
+        }
+        if prepared.append {
+            let previous: HashSet<_> = prepared.superseded.iter().map(|(id, _)| *id).collect();
+            let mut first_new: Option<&UsageEvent> = None;
+            for event in &prepared.events {
+                if previous.contains(&event.id) {
+                    rebuilt.extend(retract_append_proofs(&tx, event, true)?);
+                } else if first_new.is_none_or(|first| event.timestamp < first.timestamp) {
+                    first_new = Some(event);
+                }
+            }
             // A newly committed competitor can make a nearby request non-unique.
-            retract_append_proofs(&tx, first)?
-                .into_iter()
-                .map(|(day, groups)| ((first.session.as_str(), day), groups))
-                .collect::<BTreeMap<_, _>>()
-        } else {
-            BTreeMap::new()
-        };
+            if let Some(first) = first_new {
+                rebuilt.extend(retract_append_proofs(&tx, first, false)?);
+            }
+        }
+        let mut days = BTreeMap::new();
+        if !rebuilt.is_empty() {
+            let mut read = tx.prepare_cached(
+                "SELECT event_id, payload FROM token_resolved
+                 WHERE day = ?2 AND session_id = (SELECT id FROM token_sessions WHERE session = ?1)",
+            )?;
+            for day in rebuilt {
+                let mut groups = Groups::new();
+                let mut rows = read.query(params![session, day.to_string()])?;
+                while let Some(row) = rows.next()? {
+                    let stored: Observation = serde_json::from_slice(row.get_ref(1)?.as_blob()?)?;
+                    let event = stored
+                        .into_event(row.get_ref(0)?.as_blob()?.try_into()?, session.to_owned())?;
+                    groups
+                        .entry(group_key(&event))
+                        .or_default()
+                        .merge(DayTotals::from_event(&event));
+                }
+                days.insert((session, day), groups);
+            }
+        }
         let mut prior_day = tx.prepare_cached(
             "SELECT d.groups FROM token_days d JOIN token_sessions s ON s.id = d.session_id
              WHERE s.session = ?1 AND d.day = ?2",
@@ -669,7 +1002,12 @@ impl Store {
         drop(prior_day);
         let days = days
             .into_iter()
-            .map(|((session, day), groups)| Ok((session, day.to_string(), encode_groups(groups)?)))
+            .map(|((session, day), groups)| {
+                let bytes = (!groups.is_empty())
+                    .then(|| encode_groups(groups))
+                    .transpose()?;
+                Ok((session, day.to_string(), bytes))
+            })
             .collect::<Result<Vec<_>>>()?;
         let update = prepared.update;
         let next = Self::stage(
@@ -708,11 +1046,15 @@ impl Store {
                     invalidate.execute([format!("s:{session}")])?;
                 }
             }
-            if prepared.linear && !retire {
+            if !retire && let Some(linear) = prepared.linear {
+                let anchor = match linear {
+                    NativeTail::Advance => next,
+                    NativeTail::Keep(revision) => revision,
+                };
                 tx.execute(
                     "INSERT OR REPLACE INTO token_linear_sources
                      SELECT id, ?2, ?3 FROM token_sources WHERE source = ?1",
-                    params![encode_path(update.source), next, cutoff],
+                    params![encode_path(update.source), anchor, cutoff],
                 )?;
             }
             let mut collide = tx.prepare("INSERT OR IGNORE INTO token_collisions VALUES (?1)")?;
@@ -723,24 +1065,44 @@ impl Store {
                 "INSERT INTO token_resolved VALUES (?1, (SELECT id FROM token_sessions WHERE session = ?2), ?3, ?4, ?5)",
             )?;
             for event in &prepared.events {
+                let mut stored = Observation::capture(event);
+                stored.receipt_count_origin = prepared.receipt_origins.get(&event.id).copied();
                 insert.execute(params![
                     event.id.as_slice(),
                     event.session,
                     DateTime::parse_from_rfc3339(&event.timestamp)?.timestamp_millis(),
                     event.date.to_string(),
-                    serde_json::to_vec(&Observation::capture(event))?
+                    serde_json::to_vec(&stored)?
                 ])?;
             }
             let mut insert_day = tx.prepare(
                 "INSERT INTO token_days VALUES ((SELECT id FROM token_sessions WHERE session = ?1), ?2, ?3)
                  ON CONFLICT(session_id, day) DO UPDATE SET groups = excluded.groups",
             )?;
+            let mut remove_day = tx.prepare_cached(
+                "DELETE FROM token_days WHERE day = ?2
+                 AND session_id = (SELECT id FROM token_sessions WHERE session = ?1)",
+            )?;
             for (session, day, groups) in days {
-                insert_day.execute(params![session, day, groups])?;
+                if let Some(groups) = groups {
+                    insert_day.execute(params![session, day, groups])?;
+                } else {
+                    remove_day.execute(params![session, day])?;
+                }
             }
         }
         tx.commit()?;
         Ok(next)
+    }
+
+    pub(in super::super) fn recent_sessions(&self, since: i64) -> Result<Vec<String>> {
+        let mut statement = self.db.prepare_cached(
+            "SELECT s.session FROM token_resolved r JOIN token_sessions s ON s.id = r.session_id
+             WHERE r.timestamp_ms >= ?1 AND r.day >= (SELECT precise_from FROM token_revision)
+             GROUP BY r.session_id ORDER BY max(r.timestamp_ms) DESC, s.session",
+        )?;
+        let sessions = statement.query_map([since], |row| row.get(0))?;
+        Ok(sessions.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Re-evaluate a canonical session from its committed native identities, never from
@@ -749,18 +1111,37 @@ impl Store {
         &mut self,
         session: &str,
         input_limit: usize,
+        scoped_count_gaps: &BTreeSet<PathBuf>,
         classify: impl FnOnce(&mut [UsageEvent], &BTreeMap<String, String>) -> Result<()>,
     ) -> Result<Option<i64>> {
         let read = self.db.transaction()?;
         let base = revision(&read)?;
-        let complete = read.query_row(
+        let eligible = read.query_row(
             "SELECT EXISTS(SELECT 1 FROM token_coverage WHERE revision = ?1
-                           AND pending_sources = 0 AND issues = 0)",
-            [base],
+                           AND pending_sources = 0 AND issues = ?2 AND NOT maintenance_blocked)",
+            params![base, scoped_count_gaps.len()],
             |row| row.get::<_, bool>(0),
         )?;
-        if !complete {
+        if !eligible {
             return Ok(None);
+        }
+        if !scoped_count_gaps.is_empty() {
+            let mut related = read.prepare_cached(
+                "WITH RECURSIVE component(id, link) AS (
+                    SELECT NULL, ?1
+                    UNION SELECT NULL, own.link FROM component
+                        JOIN token_source_links own ON own.source_id = component.id
+                    UNION SELECT neighbor.source_id, NULL FROM component
+                        JOIN token_source_links neighbor ON neighbor.link = component.link
+                 )
+                 SELECT source FROM component JOIN token_sources s ON s.id = component.id",
+            )?;
+            let mut rows = related.query([format!("s:{session}")])?;
+            while let Some(row) = rows.next()? {
+                if scoped_count_gaps.contains(&decode_path(row.get(0)?)?) {
+                    return Ok(None);
+                }
+            }
         }
         let scope = Self::scope(&read, &BTreeMap::new())?;
         let canonical = RequestSessionAliases::new(&scope.aliases);
@@ -787,13 +1168,14 @@ impl Store {
                     .context("Token classification exceeds session input budget")?;
                 let stored: Observation = serde_json::from_slice(bytes)?;
                 let origin = stored.classification_origin.clone();
+                let receipt_origin = stored.receipt_count_origin;
                 let event = stored
                     .into_event(row.get_ref(0)?.as_blob()?.try_into()?, session.to_owned())?;
                 let mut candidate = event.clone();
                 if let Some(origin) = &origin {
                     origin.apply(&mut candidate);
                 }
-                previous.push((event, origin));
+                previous.push((event, origin, receipt_origin));
                 candidates.push(candidate);
             }
         }
@@ -801,7 +1183,7 @@ impl Store {
         classify(&mut candidates, &scope.aliases)?;
         let mut changed = Vec::new();
         let mut changed_days = BTreeMap::<NaiveDate, Groups>::new();
-        for ((event, origin), candidate) in previous.iter_mut().zip(candidates) {
+        for ((event, origin, receipt_origin), candidate) in previous.iter_mut().zip(candidates) {
             let prior = EventClassification::of(event);
             let next = EventClassification::of(&candidate);
             if prior != next {
@@ -809,6 +1191,7 @@ impl Store {
                 next.apply(event);
                 let mut stored = Observation::capture(event);
                 stored.classification_origin = (native != next).then_some(native);
+                stored.receipt_count_origin = *receipt_origin;
                 changed.push((event.id, serde_json::to_vec(&stored)?));
                 changed_days.entry(event.date).or_default();
             }
@@ -816,7 +1199,7 @@ impl Store {
         if changed.is_empty() {
             return Ok(None);
         }
-        for (event, _) in &previous {
+        for (event, _, _) in &previous {
             if let Some(groups) = changed_days.get_mut(&event.date) {
                 groups
                     .entry(group_key(event))
@@ -983,13 +1366,24 @@ impl Store {
         let mut next = None;
         let mut expired = Vec::new();
         {
-            // 复用来源主键，保留最后一条原始观察供有序追加取基线。
+            // 有序来源保护最新提交中的原生累计基线，其他来源仍保护尾记录。
             let mut query = tx.prepare(
                 "SELECT revision, position, payload FROM token_observations
                  WHERE source_id = ?1 AND (revision, position) > (?2, ?3)
-                   AND (revision, position) < (
-                       SELECT revision, position FROM token_observations WHERE source_id = ?1
-                       ORDER BY revision DESC, position DESC LIMIT 1
+                   AND (revision, position) IS NOT (
+                       SELECT tail.revision, tail.position FROM (
+                           SELECT o.revision, o.position FROM token_linear_sources l
+                           JOIN token_observations o ON o.source_id = l.source_id AND o.revision = l.revision
+                           WHERE l.source_id = ?1
+                           AND json_type(CAST(o.payload AS TEXT), '$.terminal_response') IS NULL
+                           ORDER BY o.position DESC LIMIT 1
+                       ) tail
+                       UNION ALL
+                       SELECT tail.revision, tail.position FROM (
+                           SELECT revision, position FROM token_observations
+                           WHERE source_id = ?1 ORDER BY revision DESC, position DESC LIMIT 1
+                       ) tail
+                       WHERE NOT EXISTS (SELECT 1 FROM token_linear_sources WHERE source_id = ?1)
                    )
                  ORDER BY revision, position LIMIT ?4",
             )?;
@@ -1000,7 +1394,8 @@ impl Store {
                 let observation: Observation = serde_json::from_slice(row.get_ref(2)?.as_blob()?)?;
                 if observation.date < cutoff {
                     expired.push(key);
-                    if let Some(position) = observation.rollout_position
+                    if observation.terminal_response.is_none()
+                        && let Some(position) = observation.rollout_position
                         && checkpoint
                             .expired_count
                             .as_ref()
@@ -1082,6 +1477,78 @@ impl Store {
         Self::visit_days(&read, start, end, visit)?;
         read.commit()?;
         Ok(current)
+    }
+
+    pub(in super::super) fn historical_candidates(
+        read: &Connection,
+        timestamps: &BTreeSet<i64>,
+    ) -> Result<Vec<UsageEvent>> {
+        let mut events = Vec::new();
+        let mut remaining: usize = 32 * 1024 * 1024;
+        let mut statement = read.prepare_cached(
+            "SELECT r.event_id, s.session, r.payload FROM token_resolved r
+             JOIN token_sessions s ON s.id = r.session_id
+             WHERE r.timestamp_ms = ?1 AND r.day >= (SELECT precise_from FROM token_revision)",
+        )?;
+        for timestamp in timestamps {
+            let mut rows = statement.query([timestamp])?;
+            while let Some(row) = rows.next()? {
+                let raw = row.get_ref(2)?.as_blob()?;
+                remaining = remaining
+                    .checked_sub(raw.len())
+                    .context("historical classification exceeds candidate budget")?;
+                let event: Observation = serde_json::from_slice(raw)?;
+                events.push(event.into_event(row.get_ref(0)?.as_blob()?.try_into()?, row.get(1)?)?);
+            }
+        }
+        Ok(events)
+    }
+
+    pub(in super::super) fn historical_days(
+        read: &Connection,
+        affected: &BTreeSet<(NaiveDate, String)>,
+        changes: &HashMap<[u8; 32], EventClassification>,
+    ) -> Result<BTreeMap<NaiveDate, HashMap<String, Vec<DayGroup>>>> {
+        let mut days = BTreeMap::<_, HashMap<_, _>>::new();
+        let mut statement = read.prepare_cached(
+            "SELECT r.event_id, r.payload FROM token_resolved r
+             WHERE r.session_id = (SELECT id FROM token_sessions WHERE session = ?1)
+             AND r.timestamp_ms >= ?2 AND r.timestamp_ms < ?3 AND r.day = ?4
+             ORDER BY r.timestamp_ms, r.event_id",
+        )?;
+        for (day, session) in affected {
+            let midnight = |day: NaiveDate| {
+                Local
+                    .from_local_datetime(&day.and_time(NaiveTime::MIN))
+                    .earliest()
+                    .map(|at| at.timestamp_millis())
+                    .context("historical date has no local midnight")
+            };
+            let end = day.succ_opt().context("historical date overflow")?;
+            let mut rows = statement.query(params![
+                session,
+                midnight(*day)?,
+                midnight(end)?,
+                day.to_string()
+            ])?;
+            let mut groups = Groups::new();
+            while let Some(row) = rows.next()? {
+                let raw: Observation = serde_json::from_slice(row.get_ref(1)?.as_blob()?)?;
+                let mut event =
+                    raw.into_event(row.get_ref(0)?.as_blob()?.try_into()?, session.clone())?;
+                if let Some(classification) = changes.get(&event.id) {
+                    classification.apply(&mut event);
+                }
+                groups
+                    .entry(group_key(&event))
+                    .or_default()
+                    .merge(DayTotals::from_event(&event));
+            }
+            days.entry(*day)
+                .or_default()
+                .insert(session.clone(), day_groups(groups));
+        }
+        Ok(days)
     }
 
     fn visit_days(
@@ -1190,7 +1657,7 @@ impl Store {
         sessions: Option<&HashSet<String>>,
     ) -> Result<Selection> {
         let read = db.transaction()?;
-        let [selection] = Self::select(&read, query, bounds, [sessions], false)?;
+        let [selection] = Self::select(&read, query, bounds, [sessions], false, None, None)?;
         read.commit()?;
         Ok(selection)
     }
@@ -1204,7 +1671,15 @@ impl Store {
         let read = db.transaction()?;
         let scope = Self::scope(&read, &BTreeMap::new())?;
         let (session, sessions) = scope.scope_members(requested);
-        let [all, usage] = Self::select(&read, query, bounds, [None, Some(&sessions)], false)?;
+        let [all, usage] = Self::select(
+            &read,
+            query,
+            bounds,
+            [None, Some(&sessions)],
+            false,
+            None,
+            None,
+        )?;
         read.commit()?;
         Ok((
             all,
@@ -1219,6 +1694,7 @@ impl Store {
         ))
     }
 
+    #[cfg(test)]
     pub(in super::super) fn read_response(
         db: &mut Connection,
         query: &Query,
@@ -1226,18 +1702,123 @@ impl Store {
         requested: Option<&str>,
         provider_names: &BTreeMap<String, String>,
     ) -> Result<Value> {
+        Self::read_response_with_archive(db, query, request, requested, provider_names, None, None)
+            .map(|(response, _)| response)
+    }
+
+    pub(in super::super) fn read_response_with_archive(
+        db: &mut Connection,
+        query: &Query,
+        request: &Value,
+        requested: Option<&str>,
+        provider_names: &BTreeMap<String, String>,
+        archived: Option<&ArchiveAnswer>,
+        historical: Option<&Historical>,
+    ) -> Result<(Value, Option<ArchiveKey>)> {
         let read = db.transaction()?;
         let bounds = request["startAt"].as_i64().zip(request["endAt"].as_i64());
         let activity_page = request["activityPage"].as_u64().unwrap_or(1).clamp(1, 24) as usize;
         let include_trend = request["includeTrend"] == true;
+        let (current_revision, cutoff): (i64, String) = read.query_row(
+            "SELECT revision, precise_from FROM token_revision",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut historical_error = None;
+        let historical =
+            historical.and_then(|evidence| match evidence.is_current(current_revision) {
+                Ok(true) => Some(evidence),
+                Ok(false) => None,
+                Err(error) => {
+                    historical_error = Some(format!("{error:#}"));
+                    None
+                }
+            });
+        let archive_key = if let Some((start, end)) = bounds
+            && !cutoff.is_empty()
+        {
+            ensure!(start < end, "invalid Token archive range");
+            let first = local_time(start)?
+                .date_naive()
+                .max(query.from.unwrap_or(NaiveDate::MIN));
+            let last = local_time(end - 1)?
+                .date_naive()
+                .min(query.to.unwrap_or(NaiveDate::MAX));
+            let end = last
+                .succ_opt()
+                .context("archive range end overflow")?
+                .min(cutoff.parse()?);
+            (first < end).then(|| ArchiveKey {
+                first,
+                end,
+                session: query.session_id.clone(),
+            })
+        } else {
+            None
+        };
+        let mut archive_status = None;
+        let mut recovered = None;
+        let mut refresh_archive = false;
+        if let (Some(key), Some((cached, answer))) = (&archive_key, archived)
+            && cached == key
+        {
+            match answer {
+                Ok(answer) => match answer.is_current(&read, current_revision, key) {
+                    Ok(true) => {
+                        let evidence = match answer.evidence.as_ref() {
+                            Some(Ok(evidence)) => match evidence.is_current() {
+                                Ok(true) => Some(evidence),
+                                Ok(false) => {
+                                    refresh_archive = true;
+                                    None
+                                }
+                                Err(error) => {
+                                    historical_error = Some(format!("{error:#}"));
+                                    None
+                                }
+                            },
+                            Some(Err(error)) => {
+                                historical_error = Some(error.clone());
+                                None
+                            }
+                            None => None,
+                        };
+                        recovered = Some((key, answer, evidence));
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        archive_status =
+                            Some(json!({"status":"partial","message":error.to_string()}))
+                    }
+                },
+                Err(message) => {
+                    archive_status = Some(json!({"status":"partial","message":message}))
+                }
+            }
+        }
         let scope = Self::scope(&read, provider_names)?;
         let scoped = requested.map(|session| scope.scope_members(session));
         let (all, scoped_usage) = if let Some((_, sessions)) = &scoped {
-            let [all, usage] =
-                Self::select(&read, query, bounds, [None, Some(sessions)], include_trend)?;
+            let [all, usage] = Self::select(
+                &read,
+                query,
+                bounds,
+                [None, Some(sessions)],
+                include_trend,
+                recovered,
+                historical,
+            )?;
             (all, Some(usage))
         } else {
-            let [all] = Self::select(&read, query, bounds, [None], include_trend)?;
+            let [all] = Self::select(
+                &read,
+                query,
+                bounds,
+                [None],
+                include_trend,
+                recovered,
+                historical,
+            )?;
             (all, None)
         };
         let scan_complete = all.coverage.is_some_and(|coverage| {
@@ -1259,6 +1840,7 @@ impl Store {
             "rangeApplied":bounds.is_some(),
             "coverage":coverage,
             "countStatus":{"complete":complete,"uncertainEvents":all.unresolved},
+            "classificationStatus":{"complete":complete && all.unclassified == 0 && !all.archive_classification_gap,"uncertainEvents":all.unclassified},
             "days":all.days,
             "sessionIds":scope.sessions,
             "sessionAliases":scope.aliases,
@@ -1275,9 +1857,55 @@ impl Store {
         if include_trend {
             result["trend"] = json!(all.trend);
         }
-        if all.needs_source_recovery && include_trend {
-            result["archiveRecovery"] = json!({"status":"unavailable"});
+        let archive_evidence = recovered.and_then(|(_, _, evidence)| evidence);
+        let retained_evidence = historical.map(|evidence| &evidence.overlay);
+        if retained_evidence.is_some() || archive_evidence.is_some() {
+            let mut names = provider_names.clone();
+            for (id, label) in [retained_evidence, archive_evidence]
+                .into_iter()
+                .flatten()
+                .flat_map(|evidence| &evidence.provider_names)
+            {
+                let name = names.entry(id.clone()).or_default();
+                if name.trim().is_empty() {
+                    name.clone_from(label);
+                }
+            }
+            result["providerNames"] = json!(names);
+            result["classificationRevision"] = json!([
+                retained_evidence.map(|evidence| evidence.updated_at),
+                archive_evidence.map(|evidence| evidence.updated_at)
+            ]);
         }
+        if let Some(evidence) = retained_evidence {
+            result["providerEvidence"] = evidence.legacy_status.clone();
+            result["supplierEvidence"] = evidence.supplier_status.clone();
+        }
+        if let Some(error) = historical_error {
+            result["historicalClassificationError"] = json!(error);
+        }
+        let has_recovery = recovered.is_some();
+        let old_activity = archive_key.is_some();
+        let schedule = if let Some(key) = archive_key {
+            if has_recovery && !refresh_archive {
+                result["archiveRecovery"] =
+                    json!({"status":if complete {"complete"} else {"partial"}});
+                None
+            } else if let Some(status) = archive_status {
+                result["archiveRecovery"] = status;
+                None
+            } else {
+                result["archiveRecovery"] = json!({"status":"pending"});
+                all.coverage
+                    .is_some_and(|coverage| coverage.pending_sources == 0)
+                    .then_some(key)
+            }
+        } else {
+            if all.needs_source_recovery && include_trend {
+                result["archiveRecovery"] = json!({"status":"unavailable"});
+            }
+            None
+        };
         if let Some(cursors) = all.session_cursors {
             result["sessionCursors"] = json!(cursors);
         }
@@ -1292,6 +1920,7 @@ impl Store {
                 "coverage":coverage,
                 "complete":count_complete,
                 "countStatus":{"complete":count_complete,"uncertainEvents":usage.unresolved},
+                "classificationStatus":{"complete":count_complete && usage.unclassified == 0 && !usage.archive_classification_gap,"uncertainEvents":usage.unclassified},
             });
             if include_trend {
                 result["scopedUsage"]["trend"] = json!(usage.trend);
@@ -1306,12 +1935,12 @@ impl Store {
                 request["activityRevision"].as_i64() == Some(updated_at),
                 &mut result,
             )?;
-            if all.needs_source_recovery {
+            if old_activity || all.needs_source_recovery {
                 result["activityComplete"] = json!(false);
             }
         }
         read.commit()?;
-        Ok(result)
+        Ok((result, schedule))
     }
 
     fn add_activity(
@@ -1439,6 +2068,8 @@ impl Store {
         bounds: Option<(i64, i64)>,
         scopes: [Option<&HashSet<String>>; N],
         include_trend: bool,
+        recovered: Option<(&ArchiveKey, &Recovered, Option<&EvidenceOverlay>)>,
+        historical: Option<&Historical>,
     ) -> Result<[Selection; N]> {
         let (revision, precise_from): (i64, String) = read.query_row(
             "SELECT revision, precise_from FROM token_revision",
@@ -1520,25 +2151,50 @@ impl Store {
                     }
                 }
             };
-        let read_summary = |session: String, day: NaiveDate, groups: Vec<DayGroup>| {
+        let accumulate_summary = |session: &str, day: NaiveDate, groups: &[DayGroup]| {
             for group in groups {
                 let model = Some(group.model.as_str()).filter(|model| !model.is_empty());
-                if query.accepts_fields(&session, "", model, Some(day)) {
+                if query.accepts_fields(session, "", model, Some(day)) {
                     accumulate(
-                        &session,
+                        session,
                         day,
-                        (group.model, group.provider, group.role, group.conflicts),
+                        (
+                            group.model.clone(),
+                            group.provider.clone(),
+                            group.role.clone(),
+                            group.conflicts,
+                        ),
                         group.totals,
                     );
                 }
             }
+        };
+        let read_summary = |session: String, day: NaiveDate, groups: Vec<DayGroup>| {
+            if recovered.is_some_and(|(key, _, _)| {
+                day >= key.first
+                    && day < key.end
+                    && key.session.as_ref().is_none_or(|id| id == &session)
+            }) {
+                // 先比较回读与原汇总，再决定是否需要重新分组。
+                return Ok(());
+            }
+            let groups = historical
+                .and_then(|evidence| evidence.days.get(&day)?.get(&session))
+                .unwrap_or(&groups);
+            accumulate_summary(&session, day, groups);
             Ok(())
         };
-        let read_event = |event: UsageEvent| {
+        let read_event = |event: &UsageEvent, include_totals: bool, classification_agrees: bool| {
             let model = Some(event.model.as_str()).filter(|model| !model.is_empty());
             if query.accepts_fields(&event.session, &event.turn, model, Some(event.date)) {
-                let key = group_key(&event);
-                let totals = DayTotals::from_event(&event);
+                let mut key = group_key(event);
+                let mut totals = DayTotals::from_event(event);
+                if !classification_agrees {
+                    key.0 = "unknown".into();
+                    key.1 = "unknown".into();
+                    key.3 |= 3;
+                    totals.evidence = ClassificationEvidence::None;
+                }
                 if let Some((start, _, interval, _)) = trend_bounds {
                     let at = DateTime::parse_from_rfc3339(&event.timestamp)?.timestamp_millis();
                     let bucket = ((at - start) / interval) as usize;
@@ -1551,9 +2207,17 @@ impl Store {
                         }
                     }
                 }
-                accumulate(&event.session, event.date, key, totals);
+                if include_totals {
+                    accumulate(&event.session, event.date, key, totals);
+                }
             }
             Ok(())
+        };
+        let read_retained = |mut event: UsageEvent| {
+            if let Some(evidence) = historical {
+                evidence.overlay.apply(&mut event);
+            }
+            read_event(&event, true, true)
         };
         let whole_days = if !include_trend
             && query.turn_id.is_none()
@@ -1583,12 +2247,12 @@ impl Store {
                 read,
                 (start, end),
                 Some(query),
-                read_event,
+                read_retained,
                 // 按日摘要没有回合信息，不能拿它回答某一回合的用量。
                 query.turn_id.is_none().then_some(read_summary),
             )?
         } else if query.turn_id.is_some() {
-            Self::visit_committed(read, i64::MIN, i64::MAX, Some(query), read_event)?;
+            Self::visit_committed(read, i64::MIN, i64::MAX, Some(query), read_retained)?;
             !precise_from.is_empty()
                 && query
                     .from
@@ -1605,11 +2269,119 @@ impl Store {
                 .zip(query.to)
                 .is_some_and(|(from, _)| from.to_string().as_str() < precise_from.as_str())
         };
+        let mut blocked_sessions = HashSet::new();
+        let mut classification_gaps = HashSet::new();
+        if let Some((key, archive, evidence)) = recovered
+            && let Some((start, end)) = bounds
+        {
+            let mut observed = BTreeMap::<_, Groups>::new();
+            let mut affected = HashSet::new();
+            for event in &archive.events {
+                observed
+                    .entry((event.session.as_str(), event.date))
+                    .or_default()
+                    .entry(group_key(event))
+                    .or_default()
+                    .merge(DayTotals::from_event(event));
+                if evidence.is_some_and(|evidence| evidence.contains(event)) {
+                    affected.insert((event.session.as_str(), event.date));
+                }
+            }
+            let start_local = local_time(start)?;
+            let whole_start = start_local.date_naive()
+                + chrono::Days::new(u64::from(!local_midnight(start_local)));
+            let whole_end = local_time(end)?.date_naive();
+            let mut preserved = HashSet::new();
+            let mut blocked = HashSet::new();
+            let mut disagrees = HashSet::new();
+            Self::visit_days(read, key.first, key.end, |session, date, summary| {
+                if key.session.as_ref().is_some_and(|id| id != &session) {
+                    return Ok(());
+                }
+                let mut expected = DayTotals::default();
+                let mut actual = DayTotals::default();
+                let groups = observed.get(&(session.as_str(), date));
+                for group in &summary {
+                    expected.merge(group.totals);
+                }
+                for totals in groups.into_iter().flat_map(BTreeMap::values) {
+                    actual.merge(*totals);
+                }
+                let counts_agree = expected.records == actual.records
+                    && expected.counts.0 == actual.counts.0
+                    && expected.unresolved == actual.unresolved
+                    && expected.priceable == actual.priceable;
+                let groups_agree = groups.is_none_or(|groups| {
+                    summary.len() == groups.len()
+                        && summary.iter().all(|group| {
+                            groups
+                                .get(&(
+                                    group.model.clone(),
+                                    group.provider.clone(),
+                                    group.role.clone(),
+                                    group.conflicts,
+                                ))
+                                .is_some_and(|totals| {
+                                    totals.records == group.totals.records
+                                        && totals.counts.0 == group.totals.counts.0
+                                        && totals.priceable == group.totals.priceable
+                                        && totals.evidence == group.totals.evidence
+                                })
+                        })
+                });
+                if date >= whole_start
+                    && date < whole_end
+                    && query.turn_id.is_none()
+                    && (!counts_agree
+                        || !groups_agree
+                        || !affected.contains(&(session.as_str(), date)))
+                {
+                    accumulate_summary(&session, date, &summary);
+                    preserved.insert((session.clone(), date));
+                }
+                if !counts_agree {
+                    blocked.insert((session, date));
+                } else if !groups_agree {
+                    if query.model.is_some() || !query.search.is_empty() {
+                        blocked.insert((session, date));
+                    } else {
+                        disagrees.insert((session, date));
+                    }
+                }
+                Ok(())
+            })?;
+            for event in &archive.events {
+                let at = DateTime::parse_from_rfc3339(&event.timestamp)?.timestamp_millis();
+                let session_day = (event.session.clone(), event.date);
+                if at >= start && at < end && !blocked.contains(&session_day) {
+                    // 已提交的日归类不证明每个分时桶的归类；只接受可验证的计数。
+                    let agrees = !disagrees.contains(&session_day);
+                    if agrees
+                        && let Some(evidence) = evidence.filter(|evidence| evidence.contains(event))
+                    {
+                        let mut classified = event.clone();
+                        evidence.apply(&mut classified);
+                        read_event(&classified, !preserved.contains(&session_day), true)?;
+                        continue;
+                    }
+                    read_event(event, !preserved.contains(&session_day), agrees)?;
+                }
+            }
+            blocked_sessions.extend(blocked.into_iter().map(|(session, _)| session));
+            classification_gaps.extend(disagrees.into_iter().map(|(session, _)| session));
+        }
         let mut scopes = scopes.into_iter();
         let mut trends = trend.into_inner().into_iter();
         Ok(usage.into_inner().map(|groups| {
             let scope = scopes.next().unwrap();
             let buckets = trends.next().unwrap();
+            let affects = |sessions: &HashSet<String>| !sessions.is_empty()
+                && scope.is_none_or(|scope| !scope.is_disjoint(sessions));
+            let needs_source_recovery = if recovered.is_some() {
+                affects(&blocked_sessions)
+            } else {
+                needs_source_recovery
+            };
             let mut selection = Self::format_selection(
                 revision,
                 coverage,
@@ -1617,6 +2389,8 @@ impl Store {
                 needs_source_recovery,
                 groups,
             );
+            selection.recovered_archive = recovered.is_some();
+            selection.archive_classification_gap = affects(&classification_gaps);
             if let Some((start, end, interval, _)) = trend_bounds.filter(|_| !needs_source_recovery) {
                 let buckets: Vec<_> = buckets.into_iter().enumerate().map(|(i, groups)| {
                     let at = start + i as i64 * interval;
@@ -1656,12 +2430,23 @@ impl Store {
         usage: BTreeMap<NaiveDate, Groups>,
     ) -> Selection {
         let mut unresolved = 0;
+        let mut unclassified = 0;
         let mut days = Vec::new();
         let archived = usage
             .keys()
             .next()
             .is_some_and(|date| date.to_string().as_str() < precise_from);
         for (date, groups) in usage {
+            unclassified += groups
+                .iter()
+                .filter(|((model, provider, _, flags), _)| {
+                    *flags & 3 != 0
+                        || unknown_model(model)
+                        || unknown_provider(provider)
+                        || codex_plus_core::aggregate_catalog::is_aggregate_model(model)
+                })
+                .map(|(_, group)| group.records)
+                .sum::<u64>();
             let (mut day, uncertain) = Self::format_day(groups);
             unresolved += uncertain;
             day["date"] = json!(date.to_string());
@@ -1672,11 +2457,14 @@ impl Store {
             coverage,
             days,
             unresolved,
+            unclassified,
             archived,
             needs_source_recovery,
             session_cursors: None,
             trend: None,
             precise_from: precise_from.to_owned(),
+            recovered_archive: false,
+            archive_classification_gap: false,
         }
     }
 

@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+pub(super) mod archive;
 pub(super) mod projection;
 
 #[cfg(unix)]
@@ -95,6 +96,14 @@ impl Store {
                 payload BLOB NOT NULL,
                 PRIMARY KEY (source_id, revision, position)
              ) WITHOUT ROWID, STRICT;
+             CREATE INDEX IF NOT EXISTS token_terminal_response_identity
+                ON token_observations(event_id)
+                WHERE json_type(CAST(payload AS TEXT), '$.terminal_response') = 'text';
+             CREATE INDEX IF NOT EXISTS token_terminal_claim
+                ON token_observations(session_id,
+                   json_extract(CAST(payload AS TEXT), '$.turn'),
+                   CAST(payload AS TEXT) -> '$.total.i', CAST(payload AS TEXT) -> '$.total.o')
+                WHERE json_type(CAST(payload AS TEXT), '$.terminal_response') = 'text';
              CREATE TABLE IF NOT EXISTS token_source_links (
                 source_id INTEGER NOT NULL REFERENCES token_sources(id),
                 link TEXT NOT NULL,
@@ -117,7 +126,11 @@ impl Store {
                 payload BLOB NOT NULL
              ) WITHOUT ROWID, STRICT;
              CREATE INDEX IF NOT EXISTS token_resolved_time ON token_resolved(timestamp_ms);
-             CREATE INDEX IF NOT EXISTS token_resolved_session ON token_resolved(session_id);
+             CREATE INDEX IF NOT EXISTS token_resolved_session_day ON token_resolved(session_id, day);
+             DROP INDEX IF EXISTS token_resolved_session;
+             CREATE INDEX IF NOT EXISTS token_resolved_open_receipt
+                ON token_resolved(session_id, day)
+                WHERE json_type(CAST(payload AS TEXT), '$.terminal_response') = 'text';
              CREATE INDEX IF NOT EXISTS token_classified_time
                 ON token_resolved(session_id, timestamp_ms)
                 WHERE json_type(CAST(payload AS TEXT), '$.classification_origin') = 'object';
